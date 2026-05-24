@@ -1,0 +1,12 @@
+apscheduler>=3.10
+fastapi>=0.115
+opentelemetry-api>=1.28
+opentelemetry-exporter-otlp>=1.28
+opentelemetry-instrumentation-fastapi>=0.49b0
+opentelemetry-sdk>=1.28
+prometheus-client>=0.21
+psycopg[binary]>=3.2
+pydantic>=2.9
+slowapi>=0.1.9
+sqlalchemy>=2.0
+uvicorn[standard]>=0.32

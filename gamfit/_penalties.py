@@ -71,6 +71,8 @@ __all__ = [
     "SparsityPenalty",
     "ScadMcpPenalty",
     "ARDPenalty",
+    "TopKActivationPenalty",
+    "JumpReLUPenalty",
     "TotalVariationPenalty",
     "NuclearNormPenalty",
     "BlockSparsityPenalty",
@@ -567,6 +569,103 @@ class ARDPenalty:
         return _add_weight_schedule({
             "kind": "ard",
             "target": _target_descriptor(self.target),
+        }, self)
+
+    def to_rust_descriptor(self) -> dict[str, Any]:
+        return self._to_rust_payload()
+
+
+@dataclass(init=False, slots=True)
+class TopKActivationPenalty:
+    """Hard top-k SAE activation mask over a row-major latent block."""
+
+    target: TargetSpec
+    k: int
+    weight: float
+    weight_schedule: ScalarWeightSchedule | dict[str, Any] | None
+
+    def __init__(
+        self,
+        k: int,
+        weight: float = 1.0,
+        *,
+        target: TargetSpec = "t",
+        weight_schedule: ScalarWeightSchedule | dict[str, Any] | None = None,
+    ) -> None:
+        self.target = target
+        self.k = index(k)
+        self.weight = float(weight)
+        self.weight_schedule = weight_schedule
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        if self.k <= 0:
+            raise ValueError(f"TopKActivationPenalty.k must be > 0, got {self.k}")
+        if not np.isfinite(self.weight) or self.weight <= 0.0:
+            raise ValueError(
+                f"TopKActivationPenalty.weight must be finite and > 0, got {self.weight}"
+            )
+
+    def _to_rust_payload(self) -> dict[str, Any]:
+        return _add_weight_schedule({
+            "kind": "topk_activation",
+            "target": _target_descriptor(self.target),
+            "k": int(self.k),
+            "weight": float(self.weight),
+        }, self)
+
+    def to_rust_descriptor(self) -> dict[str, Any]:
+        return self._to_rust_payload()
+
+
+@dataclass(init=False, slots=True)
+class JumpReLUPenalty:
+    """JumpReLU SAE threshold prior with one learnable threshold per atom."""
+
+    target: TargetSpec
+    thresholds: np.ndarray
+    weight: float
+    smoothing_eps: float
+    weight_schedule: ScalarWeightSchedule | dict[str, Any] | None
+
+    def __init__(
+        self,
+        thresholds: Any,
+        weight: float = 1.0,
+        smoothing_eps: float = 1e-3,
+        *,
+        target: TargetSpec = "t",
+        weight_schedule: ScalarWeightSchedule | dict[str, Any] | None = None,
+    ) -> None:
+        self.target = target
+        self.thresholds = np.asarray(thresholds, dtype=float).reshape(-1)
+        self.weight = float(weight)
+        self.smoothing_eps = float(smoothing_eps)
+        self.weight_schedule = weight_schedule
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        if self.thresholds.size == 0:
+            raise ValueError("JumpReLUPenalty.thresholds must be non-empty")
+        if not np.all(np.isfinite(self.thresholds)) or np.any(self.thresholds <= 0.0):
+            raise ValueError("JumpReLUPenalty.thresholds must be finite and > 0")
+        if not np.isfinite(self.weight) or self.weight <= 0.0:
+            raise ValueError(
+                f"JumpReLUPenalty.weight must be finite and > 0, got {self.weight}"
+            )
+        if not np.isfinite(self.smoothing_eps) or self.smoothing_eps <= 0.0:
+            raise ValueError(
+                "JumpReLUPenalty.smoothing_eps must be finite and > 0, "
+                f"got {self.smoothing_eps}"
+            )
+
+    def _to_rust_payload(self) -> dict[str, Any]:
+        return _add_weight_schedule({
+            "kind": "jumprelu",
+            "target": _target_descriptor(self.target),
+            "thresholds": self.thresholds.astype(float).tolist(),
+            "weight": float(self.weight),
+            "smoothing_eps": float(self.smoothing_eps),
         }, self)
 
     def to_rust_descriptor(self) -> dict[str, Any]:
@@ -1604,6 +1703,8 @@ for _penalty_cls in (
     SparsityPenalty,
     ScadMcpPenalty,
     ARDPenalty,
+    TopKActivationPenalty,
+    JumpReLUPenalty,
     TotalVariationPenalty,
     NuclearNormPenalty,
     BlockSparsityPenalty,
@@ -1621,7 +1722,8 @@ for _penalty_cls in (
 # Sum type for type hints on `gamfit.fit(..., penalties=...)` and similar.
 Penalty = (
     "IsometryPenalty | SparsityPenalty | ScadMcpPenalty | ARDPenalty | "
-    "TotalVariationPenalty | NuclearNormPenalty | BlockSparsityPenalty | "
+    "TopKActivationPenalty | JumpReLUPenalty | TotalVariationPenalty | "
+    "NuclearNormPenalty | BlockSparsityPenalty | "
     "MechanismSparsityPenalty | AuxConditionalPriorPenalty | IvaeRidgeMeanGauge | "
     "ParametricAuxConditionalPriorPenalty | OrthogonalityPenalty | IBPAssignmentPenalty | "
     "SoftmaxAssignmentSparsityPenalty"

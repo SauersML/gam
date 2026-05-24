@@ -7490,6 +7490,7 @@ mod tests {
         let rho = array![0.0_f64];
         let v = pen.value(t.view(), rho.view());
         // value = 0.5 · w · 3.0 = 0.5 · 2.5 · 3.0 = 3.75
+        assert!(v.is_finite(), "block-orthogonality value must be finite");
         assert_abs_diff_eq!(v, 3.75, epsilon = 1e-12);
     }
 

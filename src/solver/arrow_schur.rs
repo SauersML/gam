@@ -104,6 +104,11 @@ const DIRECT_SOLVE_MAX_K: usize = 2_000;
 const DEFAULT_PCG_MAX_ITERATIONS: usize = 200;
 const DEFAULT_PCG_RELATIVE_TOLERANCE: f64 = 1e-4;
 const DEFAULT_TRUST_REGION_RADIUS: f64 = f64::INFINITY;
+const DEFAULT_PROXIMAL_INITIAL_RIDGE: f64 = 1e-8;
+const DEFAULT_PROXIMAL_RIDGE_GROWTH: f64 = 10.0;
+const DEFAULT_PROXIMAL_MAX_ATTEMPTS: usize = 16;
+const DEFAULT_ARMIJO_C1: f64 = 1e-4;
+const DEFAULT_GRADIENT_TOLERANCE: f64 = 1e-10;
 const EUCLIDEAN_MANIFOLD_MODE_FINGERPRINT: u64 = 0;
 const ARROW_FACTOR_CACHE_HTBETA_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 
@@ -227,6 +232,46 @@ pub struct ArrowSolveOptions {
     /// Use the Riemannian latent projection before the Schur reduction. The
     /// reduced Steihaug solve itself remains in Euclidean β coordinates.
     pub riemannian_trust_region: bool,
+}
+
+/// Globalization guard for non-convex arrow-Schur inner steps.
+///
+/// The raw Schur solve is exactly Newton. For non-convex analytic penalties,
+/// full Newton can cycle. This controller adds a proximal LM shift `mu I` to
+/// both blocks and accepts only Armijo-decreasing trial points.
+#[derive(Debug, Clone)]
+pub struct ArrowProximalCorrectionOptions {
+    pub initial_ridge: f64,
+    pub ridge_growth: f64,
+    pub max_attempts: usize,
+    pub armijo_c1: f64,
+    pub gradient_tolerance: f64,
+}
+
+impl Default for ArrowProximalCorrectionOptions {
+    fn default() -> Self {
+        Self {
+            initial_ridge: DEFAULT_PROXIMAL_INITIAL_RIDGE,
+            ridge_growth: DEFAULT_PROXIMAL_RIDGE_GROWTH,
+            max_attempts: DEFAULT_PROXIMAL_MAX_ATTEMPTS,
+            armijo_c1: DEFAULT_ARMIJO_C1,
+            gradient_tolerance: DEFAULT_GRADIENT_TOLERANCE,
+        }
+    }
+}
+
+/// Accepted proximal arrow-Schur step and the damping that made it descent.
+#[derive(Debug, Clone)]
+pub struct ArrowAcceptedProximalStep {
+    pub delta_t: Array1<f64>,
+    pub delta_beta: Array1<f64>,
+    pub ridge_t: f64,
+    pub ridge_beta: f64,
+    pub proximal_ridge: f64,
+    pub objective_value: f64,
+    pub trial_objective_value: f64,
+    pub gradient_dot_step: f64,
+    pub attempts: usize,
 }
 
 impl ArrowSolveOptions {
@@ -1118,8 +1163,7 @@ impl StreamingArrowSchur {
     pub fn reset_accumulator(&mut self, ridge_beta: f64) -> Result<(), ArrowSchurError> {
         if self.hbb.dim() != (self.k, self.k) {
             return Err(ArrowSchurError::SchurFactorFailed {
-                reason: "streaming Arrow-Schur requires a dense beta block accumulator"
-                    .to_string(),
+                reason: "streaming Arrow-Schur requires a dense beta block accumulator".to_string(),
             });
         }
         self.s_acc.assign(&self.hbb);
@@ -1366,7 +1410,9 @@ impl std::fmt::Debug for ArrowHtbetaCache {
                 .field("blocks", &blocks.len())
                 .field("estimated_bytes", estimated_bytes)
                 .finish(),
-            Self::Matvec { estimated_bytes, .. } => f
+            Self::Matvec {
+                estimated_bytes, ..
+            } => f
                 .debug_struct("Matvec")
                 .field("estimated_bytes", estimated_bytes)
                 .finish(),
@@ -1383,7 +1429,12 @@ impl ArrowHtbetaCache {
         !matches!(self, Self::Disabled { .. })
     }
 
-    fn apply_row(&self, row: usize, delta_beta: ArrayView1<'_, f64>, out: &mut Array1<f64>) -> bool {
+    fn apply_row(
+        &self,
+        row: usize,
+        delta_beta: ArrayView1<'_, f64>,
+        out: &mut Array1<f64>,
+    ) -> bool {
         match self {
             Self::Dense { blocks, .. } => {
                 let Some(block) = blocks.get(row) else {
@@ -1685,7 +1736,12 @@ pub fn solve_arrow_newton_step_with_options(
         }
     } else if htbeta_estimated_bytes <= ARROW_FACTOR_CACHE_HTBETA_BUDGET_BYTES {
         ArrowHtbetaCache::Dense {
-            blocks: sys.rows.iter().map(|r| r.htbeta.clone()).collect::<Vec<_>>().into(),
+            blocks: sys
+                .rows
+                .iter()
+                .map(|r| r.htbeta.clone())
+                .collect::<Vec<_>>()
+                .into(),
             estimated_bytes: htbeta_estimated_bytes,
         }
     } else {
@@ -1743,6 +1799,149 @@ pub fn solve_arrow_newton_step_core(
     }
     solve_arrow_newton_step_artifacts(sys, ridge_t, ridge_beta, options)
         .map(|step| (step.delta_t, step.delta_beta))
+}
+
+/// Solve a non-convex arrow-Schur step with adaptive proximal damping.
+///
+/// `trial_objective` receives the proposed `(delta_t, delta_beta)` and must
+/// return the true nonlinear objective after applying that step. The function
+/// increases a common proximal ridge until factorization succeeds, the
+/// direction is descent, and Armijo decrease holds.
+pub fn solve_arrow_newton_step_with_proximal_correction<F>(
+    sys: &ArrowSchurSystem,
+    base_ridge_t: f64,
+    base_ridge_beta: f64,
+    current_objective_value: f64,
+    options: &ArrowSolveOptions,
+    correction: &ArrowProximalCorrectionOptions,
+    mut trial_objective: F,
+) -> Result<ArrowAcceptedProximalStep, ArrowSchurError>
+where
+    F: FnMut(ArrayView1<'_, f64>, ArrayView1<'_, f64>) -> f64,
+{
+    if !current_objective_value.is_finite() {
+        return Err(ArrowSchurError::AdaptiveCorrectionFailed {
+            reason: "current objective is not finite".to_string(),
+        });
+    }
+    if !(correction.ridge_growth.is_finite() && correction.ridge_growth > 1.0) {
+        return Err(ArrowSchurError::AdaptiveCorrectionFailed {
+            reason: format!(
+                "ridge_growth must be finite and > 1; got {}",
+                correction.ridge_growth
+            ),
+        });
+    }
+    if !(correction.armijo_c1.is_finite()
+        && correction.armijo_c1 > 0.0
+        && correction.armijo_c1 < 1.0)
+    {
+        return Err(ArrowSchurError::AdaptiveCorrectionFailed {
+            reason: format!("armijo_c1 must be in (0, 1); got {}", correction.armijo_c1),
+        });
+    }
+
+    let grad_norm = arrow_gradient_norm(sys);
+    if grad_norm <= correction.gradient_tolerance.max(0.0) {
+        return Ok(ArrowAcceptedProximalStep {
+            delta_t: Array1::<f64>::zeros(sys.rows.len() * sys.d),
+            delta_beta: Array1::<f64>::zeros(sys.k),
+            ridge_t: base_ridge_t,
+            ridge_beta: base_ridge_beta,
+            proximal_ridge: 0.0,
+            objective_value: current_objective_value,
+            trial_objective_value: current_objective_value,
+            gradient_dot_step: 0.0,
+            attempts: 0,
+        });
+    }
+
+    let mut proximal_ridge = correction.initial_ridge.max(0.0);
+    let mut last_reason = String::from("no attempts were made");
+    for attempt in 0..correction.max_attempts {
+        let ridge_t = base_ridge_t + proximal_ridge;
+        let ridge_beta = base_ridge_beta + proximal_ridge;
+        match solve_arrow_newton_step_core(sys, ridge_t, ridge_beta, options) {
+            Ok((delta_t, delta_beta)) => {
+                let g_dot_p = arrow_gradient_dot_step(sys, delta_t.view(), delta_beta.view());
+                if !(g_dot_p.is_finite() && g_dot_p < 0.0) {
+                    last_reason =
+                        format!("candidate was not a finite descent direction: g·p={g_dot_p}");
+                } else {
+                    let trial_value = trial_objective(delta_t.view(), delta_beta.view());
+                    let armijo_bound =
+                        current_objective_value + correction.armijo_c1 * g_dot_p;
+                    if trial_value.is_finite() && trial_value <= armijo_bound {
+                        return Ok(ArrowAcceptedProximalStep {
+                            delta_t,
+                            delta_beta,
+                            ridge_t,
+                            ridge_beta,
+                            proximal_ridge,
+                            objective_value: current_objective_value,
+                            trial_objective_value: trial_value,
+                            gradient_dot_step: g_dot_p,
+                            attempts: attempt + 1,
+                        });
+                    }
+                    last_reason = format!(
+                        "Armijo rejected trial objective {trial_value}; bound {armijo_bound}"
+                    );
+                }
+            }
+            Err(err) => {
+                last_reason = err.to_string();
+            }
+        }
+        proximal_ridge = next_proximal_ridge(proximal_ridge, correction.ridge_growth);
+    }
+
+    Err(ArrowSchurError::AdaptiveCorrectionFailed {
+        reason: format!(
+            "failed after {} attempts; last rejection: {last_reason}",
+            correction.max_attempts
+        ),
+    })
+}
+
+fn next_proximal_ridge(current: f64, growth: f64) -> f64 {
+    if current > 0.0 {
+        current * growth
+    } else {
+        DEFAULT_PROXIMAL_INITIAL_RIDGE
+    }
+}
+
+fn arrow_gradient_norm(sys: &ArrowSchurSystem) -> f64 {
+    let mut sum = 0.0;
+    for row in sys.rows.iter() {
+        for &v in row.gt.iter() {
+            sum += v * v;
+        }
+    }
+    for &v in sys.gb.iter() {
+        sum += v * v;
+    }
+    sum.sqrt()
+}
+
+fn arrow_gradient_dot_step(
+    sys: &ArrowSchurSystem,
+    delta_t: ArrayView1<'_, f64>,
+    delta_beta: ArrayView1<'_, f64>,
+) -> f64 {
+    debug_assert_eq!(delta_t.len(), sys.rows.len() * sys.d);
+    debug_assert_eq!(delta_beta.len(), sys.k);
+    let mut out = 0.0;
+    for (i, row) in sys.rows.iter().enumerate() {
+        for c in 0..sys.d {
+            out += row.gt[c] * delta_t[i * sys.d + c];
+        }
+    }
+    for a in 0..sys.k {
+        out += sys.gb[a] * delta_beta[a];
+    }
+    out
 }
 
 struct ArrowNewtonStepArtifacts {
@@ -2400,6 +2599,9 @@ pub enum ArrowSchurError {
     /// The BA inexact-step PCG solve failed before producing a usable
     /// Steihaug trust-region step.
     PcgFailed { reason: String },
+    /// Adaptive proximal damping could not produce an Armijo-accepted
+    /// nonlinear step.
+    AdaptiveCorrectionFailed { reason: String },
 }
 
 impl std::fmt::Display for ArrowSchurError {
@@ -2414,6 +2616,9 @@ impl std::fmt::Display for ArrowSchurError {
             }
             ArrowSchurError::PcgFailed { reason } => {
                 write!(f, "arrow-Schur: Schur PCG failed: {reason}")
+            }
+            ArrowSchurError::AdaptiveCorrectionFailed { reason } => {
+                write!(f, "arrow-Schur: adaptive proximal correction failed: {reason}")
             }
         }
     }
@@ -2669,11 +2874,27 @@ pub fn assemble_per_point_data_hessian_block(
             out.dim()
         ));
     }
-    ensure_finite_values("assemble_per_point_data_hessian_block", "phi_jacobian", phi_jacobian.iter())?;
-    ensure_finite_values("assemble_per_point_data_hessian_block", "phi_hessian", phi_hessian.iter())?;
+    ensure_finite_values(
+        "assemble_per_point_data_hessian_block",
+        "phi_jacobian",
+        phi_jacobian.iter(),
+    )?;
+    ensure_finite_values(
+        "assemble_per_point_data_hessian_block",
+        "phi_hessian",
+        phi_hessian.iter(),
+    )?;
     ensure_finite_values("assemble_per_point_data_hessian_block", "beta", beta.iter())?;
-    ensure_finite_values("assemble_per_point_data_hessian_block", "residual", residual.iter())?;
-    ensure_finite_values("assemble_per_point_data_hessian_block", "weight_u", weight_u.iter())?;
+    ensure_finite_values(
+        "assemble_per_point_data_hessian_block",
+        "residual",
+        residual.iter(),
+    )?;
+    ensure_finite_values(
+        "assemble_per_point_data_hessian_block",
+        "weight_u",
+        weight_u.iter(),
+    )?;
     ensure_finite_values("assemble_per_point_data_hessian_block", "out", out.iter())?;
 
     // Gauss-Newton: A then B then BBᵀ.
@@ -2856,10 +3077,26 @@ pub fn assemble_t_beta_cross_tensor_same_block(
         ));
     }
     ensure_finite_values("assemble_t_beta_cross_tensor_same_block", "phi", phi.iter())?;
-    ensure_finite_values("assemble_t_beta_cross_tensor_same_block", "phi_jacobian", phi_jacobian.iter())?;
-    ensure_finite_values("assemble_t_beta_cross_tensor_same_block", "beta", beta.iter())?;
-    ensure_finite_values("assemble_t_beta_cross_tensor_same_block", "residual", residual.iter())?;
-    ensure_finite_values("assemble_t_beta_cross_tensor_same_block", "weight_u", weight_u.iter())?;
+    ensure_finite_values(
+        "assemble_t_beta_cross_tensor_same_block",
+        "phi_jacobian",
+        phi_jacobian.iter(),
+    )?;
+    ensure_finite_values(
+        "assemble_t_beta_cross_tensor_same_block",
+        "beta",
+        beta.iter(),
+    )?;
+    ensure_finite_values(
+        "assemble_t_beta_cross_tensor_same_block",
+        "residual",
+        residual.iter(),
+    )?;
+    ensure_finite_values(
+        "assemble_t_beta_cross_tensor_same_block",
+        "weight_u",
+        weight_u.iter(),
+    )?;
     ensure_finite_values("assemble_t_beta_cross_tensor_same_block", "out", out.iter())?;
 
     if q_i == 0 {
@@ -3016,10 +3253,18 @@ pub fn assemble_t_beta_cross_slab(
         "active_phi_jacobian",
         active_phi_jacobian.iter(),
     )?;
-    ensure_finite_values("assemble_t_beta_cross_slab", "active_beta", active_beta.iter())?;
+    ensure_finite_values(
+        "assemble_t_beta_cross_slab",
+        "active_beta",
+        active_beta.iter(),
+    )?;
     ensure_finite_values("assemble_t_beta_cross_slab", "residual", residual.iter())?;
     ensure_finite_values("assemble_t_beta_cross_slab", "weight_u", weight_u.iter())?;
-    ensure_finite_values("assemble_t_beta_cross_slab", "out_htbeta", out_htbeta.iter())?;
+    ensure_finite_values(
+        "assemble_t_beta_cross_slab",
+        "out_htbeta",
+        out_htbeta.iter(),
+    )?;
 
     if q_i == 0 {
         return Ok(());
@@ -3145,7 +3390,11 @@ pub fn scatter_t_beta_cross_tensor(
         ));
     }
     ensure_finite_values("scatter_t_beta_cross_tensor", "cross", cross.iter())?;
-    ensure_finite_values("scatter_t_beta_cross_tensor", "out_htbeta", out_htbeta.iter())?;
+    ensure_finite_values(
+        "scatter_t_beta_cross_tensor",
+        "out_htbeta",
+        out_htbeta.iter(),
+    )?;
     for a in 0..d_k {
         for gamma in 0..b_k {
             let col_base = beta_block_offset + gamma * p_out;
@@ -3192,7 +3441,11 @@ pub fn beta_beta_low_rank_matvec_row(
     for k in 0..n_blocks {
         let phi_k = phi_row_by_block[k];
         let db_k = delta_beta_blocks[k];
-        ensure_finite_values("beta_beta_low_rank_matvec_row", "phi_row_by_block", phi_k.iter())?;
+        ensure_finite_values(
+            "beta_beta_low_rank_matvec_row",
+            "phi_row_by_block",
+            phi_k.iter(),
+        )?;
         ensure_finite_values(
             "beta_beta_low_rank_matvec_row",
             "delta_beta_blocks",
@@ -3311,8 +3564,7 @@ mod tests {
         sys.gb = array![0.5_f64, -0.3, 0.2];
 
         let (delta_t, delta_beta) = sys.solve(0.0, 0.0).expect("arrow-schur solve");
-        let streaming_options =
-            ArrowSolveOptions::direct().with_streaming_chunk_size(Some(1));
+        let streaming_options = ArrowSolveOptions::direct().with_streaming_chunk_size(Some(1));
         let (delta_t_stream, delta_beta_stream) = sys
             .solve_with_options(0.0, 0.0, &streaming_options)
             .expect("streaming arrow-schur solve");
@@ -3368,5 +3620,56 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn quartic_counterexample_value(t: f64) -> f64 {
+        0.25 * t.powi(4) - t * t + 2.0 * t
+    }
+
+    fn quartic_counterexample_system(t: f64) -> ArrowSchurSystem {
+        let mut sys = ArrowSchurSystem::new(1, 1, 0);
+        sys.rows[0].gt = array![t.powi(3) - 2.0 * t + 2.0];
+        sys.rows[0].htt = array![[3.0 * t * t - 2.0]];
+        sys
+    }
+
+    #[test]
+    fn proximal_correction_breaks_scalar_newton_cycle() {
+        let options = ArrowSolveOptions::direct();
+        let correction = ArrowProximalCorrectionOptions {
+            initial_ridge: 1e-8,
+            ridge_growth: 10.0,
+            max_attempts: 16,
+            armijo_c1: 1e-4,
+            gradient_tolerance: 1e-12,
+        };
+        let mut t = 0.0_f64;
+        let mut previous_value = quartic_counterexample_value(t);
+
+        for _ in 0..32 {
+            let sys = quartic_counterexample_system(t);
+            let accepted = solve_arrow_newton_step_with_proximal_correction(
+                &sys,
+                0.0,
+                0.0,
+                previous_value,
+                &options,
+                &correction,
+                |delta_t, _delta_beta| quartic_counterexample_value(t + delta_t[0]),
+            )
+            .expect("proximal correction should accept a descent step");
+            assert!(
+                accepted.trial_objective_value <= previous_value,
+                "accepted step must not increase the objective"
+            );
+            t += accepted.delta_t[0];
+            previous_value = accepted.trial_objective_value;
+        }
+
+        let final_grad = t.powi(3) - 2.0 * t + 2.0;
+        assert!(
+            final_grad.abs() < 1e-7,
+            "corrected iteration should reach the scalar critical point; t={t}, g={final_grad}"
+        );
     }
 }

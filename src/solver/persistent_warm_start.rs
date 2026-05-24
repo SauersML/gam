@@ -414,9 +414,9 @@ pub enum LatentIftOutcome {
 /// theorem derivation. The cache produced by
 /// [`crate::solver::arrow_schur::solve_arrow_newton_step`] stores both the
 /// damped Newton factor and the undamped IFT factor; this predictor
-    /// dispatches into `predict_delta_t_from_delta_*` which select the latter.
-    /// Callers MUST NOT hand-construct an `ArrowFactorCache` with missing
-    /// undamped factors.
+/// dispatches into `predict_delta_t_from_delta_*` which select the latter.
+/// Callers MUST NOT hand-construct an `ArrowFactorCache` with missing
+/// undamped factors.
 ///
 /// The result is meant to be applied to the existing
 /// [`crate::terms::latent_coord::LatentCoordValues`] block via
