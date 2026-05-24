@@ -7,12 +7,6 @@ pub struct PowerLawFit {
     pub n_points: usize,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BudgetVerdict {
-    Fits,
-    OverBudget,
-}
-
 pub fn fit_power_law(points: &[(f64, f64)]) -> Option<PowerLawFit> {
     if points.len() < 3 {
         return None;
@@ -56,6 +50,12 @@ pub fn fit_power_law(points: &[(f64, f64)]) -> Option<PowerLawFit> {
         max_abs_log_resid,
         n_points: logs.len(),
     })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BudgetVerdict {
+    Fits,
+    OverBudget,
 }
 
 pub fn report_power_law_full(
