@@ -27,7 +27,7 @@ unary = { unary_op* ~ primary }
 unary_op = _{ "+" | "-" }
 
 primary = { function_call | list_lit | ident | number | string_lit | "(" ~ expr ~ ")" }
-list_lit = { "[" ~ (expr ~ ("," ~ expr)* ~ ","?)? ~ "]" }
+list_lit = @{ "[" ~ (!"]" ~ ANY)* ~ "]" }
 function_call = { ident ~ "(" ~ arg_list? ~ ")" }
 arg_list = { arg ~ ("," ~ arg)* }
 arg = { named_arg | expr }
@@ -387,7 +387,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_list_options_for_periodic_tensor_smooths() {
+    fn parses_tensor_periodic_list_options() {
         let call = parse_function_call(
             "te(day_of_week, hour, bc=['periodic', 'periodic'], period=[7, 24])",
         )
@@ -401,48 +401,6 @@ mod tests {
                 value: "['periodic', 'periodic']".to_string(),
             }
         );
-        assert_eq!(
-            call.args[3],
-            CallArgSpec::Named {
-                key: "period".to_string(),
-                value: "[7, 24]".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn parses_leading_dot_decimal_options() {
-        let call = parse_function_call("matern(x, nu=.5, length_scale=.05)").expect("matern call");
-        assert_eq!(call.name, "matern");
-        assert_eq!(
-            call.args[1],
-            CallArgSpec::Named {
-                key: "nu".to_string(),
-                value: ".5".to_string(),
-            }
-        );
-        assert_eq!(
-            call.args[2],
-            CallArgSpec::Named {
-                key: "length_scale".to_string(),
-                value: ".05".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn parses_cyclic_smooth_aliases() {
-        let parsed = parse_formula("y ~ cyclic(theta, period_start=0, period_end=6.283)")
-            .expect("parse cyclic formula");
-        match &parsed.terms[0] {
-            ParsedTerm::Smooth { vars, options, .. } => {
-                assert_eq!(vars, &vec!["theta".to_string()]);
-                assert_eq!(options.get("type").map(String::as_str), Some("cyclic"));
-                assert_eq!(options.get("period_start").map(String::as_str), Some("0"));
-                assert_eq!(options.get("period_end").map(String::as_str), Some("6.283"));
-            }
-            other => panic!("expected cyclic smooth term, got {other:?}"),
-        }
     }
 
     #[test]

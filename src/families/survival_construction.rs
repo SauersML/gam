@@ -1103,7 +1103,7 @@ pub fn build_survival_time_basis(
                         },
                         double_penalty: false,
                         identifiability: BSplineIdentifiability::None,
-                        boundary_conditions: Default::default(),
+                        boundary_condition: Default::default(),
                     },
                 )
                 .map_err(|e| format!("failed to infer survival time knots: {e}"))?;
@@ -1198,7 +1198,7 @@ pub fn build_survival_time_basis(
                     knotspec: BSplineKnotSpec::Provided(knotvec.clone()),
                     double_penalty: false,
                     identifiability: BSplineIdentifiability::None,
-                    boundary_conditions: Default::default(),
+                    boundary_condition: Default::default(),
                 },
             )
             .map_err(|e| format!("failed to build bspline entry basis: {e}"))?;
@@ -1210,7 +1210,7 @@ pub fn build_survival_time_basis(
                     knotspec: BSplineKnotSpec::Provided(knotvec.clone()),
                     double_penalty: false,
                     identifiability: BSplineIdentifiability::None,
-                    boundary_conditions: Default::default(),
+                    boundary_condition: Default::default(),
                 },
             )
             .map_err(|e| format!("failed to build bspline exit basis: {e}"))?;
@@ -1442,7 +1442,7 @@ pub fn build_survival_time_basis(
                     knotspec: BSplineKnotSpec::Provided(knotvec.clone()),
                     double_penalty: false,
                     identifiability: BSplineIdentifiability::None,
-                    boundary_conditions: Default::default(),
+                    boundary_condition: Default::default(),
                 },
             )
             .map_err(|e| format!("failed to build ispline smoothing penalty: {e}"))?;
@@ -1591,7 +1591,7 @@ pub fn evaluate_survival_time_basis_row(
                     knotspec: BSplineKnotSpec::Provided(knots.clone()),
                     double_penalty: false,
                     identifiability: BSplineIdentifiability::None,
-                    boundary_conditions: Default::default(),
+                    boundary_condition: Default::default(),
                 },
             )
             .map_err(|e| format!("failed to evaluate survival bspline anchor row: {e}"))?;
@@ -3014,7 +3014,7 @@ pub fn build_time_varying_survival_covariate_template(
         },
         double_penalty: false,
         identifiability: BSplineIdentifiability::None,
-        boundary_conditions: Default::default(),
+        boundary_condition: Default::default(),
     };
 
     let time_build = build_bspline_basis_1d(log_exit.view(), &time_spec)
@@ -3038,7 +3038,7 @@ pub fn build_time_varying_survival_covariate_template(
             knotspec: BSplineKnotSpec::Provided(knots.clone()),
             double_penalty: false,
             identifiability: BSplineIdentifiability::None,
-            boundary_conditions: Default::default(),
+            boundary_condition: Default::default(),
         },
     )
     .map_err(|e| format!("failed to evaluate {block_name} time-margin basis at entry: {e}"))?;
