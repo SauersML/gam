@@ -131,7 +131,7 @@ pub fn factorize_symmetricwith_fallback(
 }
 
 #[inline]
-fn should_use_faer_matmul(m: usize, n: usize, k: usize) -> bool {
+const fn should_use_faer_matmul(m: usize, n: usize, k: usize) -> bool {
     // Small, centralized dispatch policy:
     // - stay on ndarray for tiny products to avoid setup overhead,
     // - switch to faer GEMM/GEMV for moderate+ sizes.
@@ -1863,7 +1863,7 @@ pub fn rrqr_nullspace_basis<S: Data<Elem = f64>>(
 }
 
 #[inline]
-pub fn default_rrqr_rank_alpha() -> f64 {
+pub const fn default_rrqr_rank_alpha() -> f64 {
     RRQR_RANK_ALPHA
 }
 

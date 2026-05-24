@@ -32,7 +32,7 @@ use crate::estimate::{
     UnifiedFitResult, UnifiedFitResultParts, fit_gamwith_heuristic_lambdas,
     reml::DirectionalHyperParam,
 };
-use crate::faer_ndarray::{FaerEigh, fast_ab, fast_atb, fast_atv};
+use crate::faer_ndarray::{fast_ab, fast_atb, fast_atv};
 use crate::families::strategy::{FamilyStrategy, strategy_for_family};
 use crate::matrix::{
     BlockDesignOperator, CoefficientTransformOperator, DenseDesignOperator, DesignBlock,
@@ -47,7 +47,6 @@ use crate::resource::MatrixMaterializationError;
 use crate::types::{
     InverseLink, LatentCLogLogState, LikelihoodFamily, MixtureLinkState, SasLinkState,
 };
-use faer::Side;
 use faer::sparse::{SparseColMat, Triplet};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut2, s};
 use serde::{Deserialize, Serialize};

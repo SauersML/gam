@@ -598,7 +598,7 @@ fn lookup_cache() -> &'static Mutex<HashMap<LookupCacheKey, CachedLookup>> {
 const LOOKUP_CACHE_MAX_ENTRIES: usize = 128;
 const LOOKUP_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024;
 
-fn cached_lookup_resident_bytes(value: &CachedLookup) -> usize {
+const fn cached_lookup_resident_bytes(value: &CachedLookup) -> usize {
     std::mem::size_of::<CachedLookup>().saturating_add(value.entry.payload.capacity())
 }
 
