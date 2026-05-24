@@ -19573,7 +19573,7 @@ mod tests {
         let beta_h = family.flex_score_beta(&block_states).expect("score beta");
         let beta_w = family.flex_link_beta(&block_states).expect("link beta");
         let (a1, _) = family
-            .solve_row_survival_intercept(q_geom.q1, g, beta_h, beta_w)
+            .solve_row_survival_intercept_with_slot(q_geom.q1, g, beta_h, beta_w, None)
             .expect("solve intercept");
 
         let mut dir_u = Array1::zeros(primary.total);
@@ -20723,7 +20723,7 @@ mod tests {
         ];
 
         let err = family
-            .row_neglog_directional_refs(0, &block_states, &[])
+            .compute_row_primary_gradient_hessian_uncached(0, &block_states)
             .expect_err("censored rows must still enforce the time-derivative domain");
         assert!(
             err.contains("monotonicity violated at row 0"),
@@ -20752,21 +20752,29 @@ mod tests {
         let (nll_closed, grad_closed, hess_closed) = family
             .compute_row_primary_gradient_hessian_uncached(0, &block_states)
             .expect("closed-form row derivatives");
+        let dir0 = unit_primary_direction(0);
         let nll_exact = family
-            .row_neglog_directional_refs(0, &block_states, &[])
+            .row_neglog_directional_jet_batched(0, &block_states, &[dir0.view()])
+            .map(|jet| jet.coeff(0))
             .expect("exact row objective");
         assert_close(nll_closed, nll_exact, 1e-12, "nll");
 
         for a in 0..N_PRIMARY {
             let dir_a = unit_primary_direction(a);
             let grad_exact = family
-                .row_neglog_directional_refs(0, &block_states, &[dir_a.view()])
+                .row_neglog_directional_jet_batched(0, &block_states, &[dir_a.view()])
+                .map(|jet| jet.coeff(jet.full_mask()))
                 .expect("exact row gradient");
             assert_close(grad_closed[a], grad_exact, 1e-10, &format!("grad[{a}]"));
             for b in 0..N_PRIMARY {
                 let dir_b = unit_primary_direction(b);
                 let hess_exact = family
-                    .row_neglog_directional_refs(0, &block_states, &[dir_a.view(), dir_b.view()])
+                    .row_neglog_directional_jet_batched(
+                        0,
+                        &block_states,
+                        &[dir_a.view(), dir_b.view()],
+                    )
+                    .map(|jet| jet.coeff(jet.full_mask()))
                     .expect("exact row hessian");
                 assert_close(
                     hess_closed[[a, b]],

@@ -16,7 +16,7 @@ pub(crate) mod assembly;
 mod cache;
 mod eval;
 mod firth;
-pub(crate) mod hyper;
+pub(super) mod hyper;
 mod inner_strategy;
 pub(crate) mod penalty_logdet;
 pub(crate) mod runtime;

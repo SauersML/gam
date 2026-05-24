@@ -43,10 +43,9 @@ fn cylinder_fit_n_10k_stages() {
     };
 
     // Stage 1: parse + materialize (formula → FitRequest)
-    let mat = time("materialize", || {
+    time("materialize", || {
         materialize(formula, &data, &cfg).expect("materialize")
     });
-    let _ = mat;
 
     // Stage 2: full fit
     let total = Instant::now();
@@ -86,7 +85,7 @@ fn cylinder_fit_n_10k_repeated_for_warmup_amortization() {
     };
     for i in 0..5 {
         let t = Instant::now();
-        let _ = fit_from_formula(formula, &data, &cfg).expect("fit");
+        fit_from_formula(formula, &data, &cfg).expect("fit");
         eprintln!(
             "[scale] cylinder te N=10000 iter {}: {:.3} ms",
             i,

@@ -30,8 +30,7 @@ fn duplicate_x_rows_produces_finite_fit_and_reasonable_predictions() {
     let n = unique.len() * reps;
 
     let f = |t: f64| (2.0 * std::f64::consts::PI * t).sin();
-    let mut headers: Vec<String> = vec!["x".into(), "y".into()];
-    let _ = &mut headers; // keep allocator quiet
+    let headers: Vec<String> = vec!["x".into(), "y".into()];
     let mut rows: Vec<StringRecord> = Vec::with_capacity(n);
     for &xu in &unique {
         for _ in 0..reps {

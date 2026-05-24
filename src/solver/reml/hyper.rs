@@ -1040,7 +1040,7 @@ impl<'a> RemlState<'a> {
         )
     }
 
-    pub(crate) fn compute_joint_hyper_eval_with_order(
+    pub(in crate::solver::estimate) fn compute_joint_hyper_eval_with_order(
         &self,
         theta: &Array1<f64>,
         rho_dim: usize,

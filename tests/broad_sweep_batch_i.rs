@@ -462,6 +462,5 @@ fn sphere_with_method_alias_sos() {
         ..FitConfig::default()
     };
     // sos is an alias for sphere
-    let result = fit_from_formula("y ~ sos(lat, lon, k=15)", &data, &cfg).expect("fit ok");
-    let _ = result;
+    fit_from_formula("y ~ sos(lat, lon, k=15)", &data, &cfg).expect("fit ok");
 }

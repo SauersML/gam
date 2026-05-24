@@ -499,7 +499,7 @@ fn nullspace_component_of_prior_mean_is_invisible() {
 // 10. Length mismatch must be rejected.
 // `CanonicalPenalty::from_dense_root_with_mean` uses `assert_eq!`; the
 // `PenaltyCoordinate` constructors use `assert_eq!` (panicking in release).
-// We probe via a panic catch on a debug-built binary.
+// We probe via a panic catch so the test can verify the constructor contract.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -512,18 +512,12 @@ fn mismatched_prior_mean_length_panics() {
     let bad_mean = Array1::<f64>::zeros(dim + 1);
 
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        let _ = CanonicalPenalty::from_dense_root_with_mean(root.clone(), dim, bad_mean);
+        CanonicalPenalty::from_dense_root_with_mean(root.clone(), dim, bad_mean);
     }));
-    // In release the debug_assert won't fire; we therefore accept either a
-    // panic OR a successfully-constructed (but malformed) penalty. The bug
-    // we want to catch is silent acceptance in *debug* builds, which is what
-    // `cargo test` defaults to.
-    if cfg!(debug_assertions) {
-        assert!(
-            result.is_err(),
-            "mismatched prior_mean length must panic in debug builds"
-        );
-    }
+    assert!(
+        result.is_err(),
+        "mismatched prior_mean length must panic"
+    );
 }
 
 // ---------------------------------------------------------------------------

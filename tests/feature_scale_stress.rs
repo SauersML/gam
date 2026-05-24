@@ -216,7 +216,6 @@ fn sphere_wahba_kernel_at_100k_is_symmetric_on_self_eval() {
 
 #[test]
 fn sphere_harmonic_basis_scales_and_keeps_diag_penalty_at_100k() {
-    use std::f64::consts::PI;
     for n in [1_000usize, 10_000, 100_000] {
         let pts = make_sphere_grid(n);
         let l = 4usize;
@@ -243,7 +242,6 @@ fn sphere_harmonic_basis_scales_and_keeps_diag_penalty_at_100k() {
                 }
             }
         }
-        let _ = PI;
     }
 }
 
