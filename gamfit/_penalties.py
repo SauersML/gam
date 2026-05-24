@@ -533,6 +533,7 @@ class TotalVariationPenalty:
         self.smoothing_eps = float(smoothing_eps)
         self.learnable = bool(learnable)
         self._edges = None
+        self.weight_schedule = None
         self.__post_init__()
 
     def __post_init__(self) -> None:
@@ -587,7 +588,7 @@ class TotalVariationPenalty:
         else:
             payload["difference_op"] = "graph_edges"
             payload["edges"] = self._edges
-        return payload
+        return _add_weight_schedule(payload, self)
 
     def to_rust_descriptor(self) -> dict[str, Any]:
         return self._to_rust_payload()
@@ -641,6 +642,7 @@ class NuclearNormPenalty:
         self.smoothing_eps = float(smoothing_eps)
         self.max_rank = None if max_rank is None else index(max_rank)
         self.learnable = bool(learnable)
+        self.weight_schedule = None
         self.__post_init__()
 
     def __post_init__(self) -> None:
@@ -657,7 +659,7 @@ class NuclearNormPenalty:
             raise ValueError(f"NuclearNormPenalty.max_rank must be > 0, got {self.max_rank}")
 
     def _to_rust_payload(self) -> dict[str, Any]:
-        return {
+        return _add_weight_schedule({
             "kind": "nuclear_norm",
             "target": _target_descriptor(self.target),
             "weight": self.weight,
@@ -665,7 +667,7 @@ class NuclearNormPenalty:
             "smoothing_eps": self.smoothing_eps,
             "max_rank": self.max_rank,
             "learnable": self.learnable,
-        }
+        }, self)
 
     def to_rust_descriptor(self) -> dict[str, Any]:
         return self._to_rust_payload()
@@ -720,6 +722,7 @@ class BlockSparsityPenalty:
         self.n_eff = int(n_eff)
         self.smoothing_eps = float(smoothing_eps)
         self.learnable = bool(learnable)
+        self.weight_schedule = None
         self.__post_init__()
 
     @staticmethod
@@ -771,7 +774,7 @@ class BlockSparsityPenalty:
             )
 
     def _to_rust_payload(self) -> dict[str, Any]:
-        return {
+        return _add_weight_schedule({
             "kind": "block_sparsity",
             "target": _target_descriptor(self.target),
             "groups": self.groups,
@@ -779,7 +782,7 @@ class BlockSparsityPenalty:
             "n_eff": self.n_eff,
             "smoothing_eps": self.smoothing_eps,
             "learnable": self.learnable,
-        }
+        }, self)
 
     def to_rust_descriptor(self) -> dict[str, Any]:
         return self._to_rust_payload()
@@ -830,6 +833,7 @@ class AuxConditionalPriorPenalty:
         self.weight = float(weight)
         self.n_eff = int(n_eff)
         self.learnable = bool(learnable)
+        self.weight_schedule = None
         self.__post_init__()
 
     def __post_init__(self) -> None:
@@ -870,7 +874,7 @@ class AuxConditionalPriorPenalty:
 
     def _to_rust_payload(self) -> dict[str, Any]:
         arr = np.ascontiguousarray(self.lambda_per_row, dtype=float)
-        return {
+        return _add_weight_schedule({
             "kind": "aux_conditional_prior",
             "target": _target_descriptor(self.target),
             "lambda_per_row": arr.reshape(-1).tolist(),
@@ -878,7 +882,7 @@ class AuxConditionalPriorPenalty:
             "weight": self.weight,
             "n_eff": self.n_eff,
             "learnable": self.learnable,
-        }
+        }, self)
 
     def to_rust_descriptor(self) -> dict[str, Any]:
         return self._to_rust_payload()
@@ -944,6 +948,7 @@ class ParametricAuxConditionalPriorPenalty:
         self.weight = float(weight)
         self.n_eff = int(n_eff)
         self.learnable = bool(learnable)
+        self.weight_schedule = None
         self.__post_init__()
 
     def __post_init__(self) -> None:
@@ -1016,7 +1021,7 @@ class ParametricAuxConditionalPriorPenalty:
         alpha = np.ascontiguousarray(self.alpha_init, dtype=float)
         beta = np.ascontiguousarray(self.beta_init, dtype=float)
         mu = np.ascontiguousarray(self.mu_init, dtype=float)
-        return {
+        return _add_weight_schedule({
             "kind": "parametric_aux_conditional_prior",
             "target": _target_descriptor(self.target),
             "aux": aux.reshape(-1).tolist(),
@@ -1028,7 +1033,7 @@ class ParametricAuxConditionalPriorPenalty:
             "weight": self.weight,
             "n_eff": self.n_eff,
             "learnable": self.learnable,
-        }
+        }, self)
 
     def to_rust_descriptor(self) -> dict[str, Any]:
         return self._to_rust_payload()
@@ -1075,6 +1080,7 @@ class OrthogonalityPenalty:
         self.weight = float(weight)
         self.n_eff = int(n_eff)
         self.learnable = bool(learnable)
+        self.weight_schedule = None
         self.__post_init__()
 
     def __post_init__(self) -> None:
@@ -1084,13 +1090,13 @@ class OrthogonalityPenalty:
             raise ValueError(f"OrthogonalityPenalty.n_eff must be > 0, got {self.n_eff}")
 
     def _to_rust_payload(self) -> dict[str, Any]:
-        return {
+        return _add_weight_schedule({
             "kind": "orthogonality",
             "target": _target_descriptor(self.target),
             "weight": self.weight,
             "n_eff": self.n_eff,
             "learnable": self.learnable,
-        }
+        }, self)
 
     def to_rust_descriptor(self) -> dict[str, Any]:
         return self._to_rust_payload()
@@ -1103,6 +1109,7 @@ class IBPAssignmentPenalty:
     alpha: float = 1.0
     tau: float = 1.0
     learnable_alpha: bool = False
+    weight_schedule: ScalarWeightSchedule | dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if self.k_max <= 0:
@@ -1113,14 +1120,14 @@ class IBPAssignmentPenalty:
             raise ValueError(f"IBPAssignmentPenalty.tau must be > 0, got {self.tau}")
 
     def _to_rust_payload(self) -> dict[str, Any]:
-        return {
+        return _add_weight_schedule({
             "kind": "ibp_assignment",
             "target": _target_descriptor(self.target),
             "k_max": int(self.k_max),
             "alpha": float(self.alpha),
             "tau": float(self.tau),
             "learnable_alpha": bool(self.learnable_alpha),
-        }
+        }, self)
 
     def to_rust_descriptor(self) -> dict[str, Any]:
         return self._to_rust_payload()
@@ -1131,6 +1138,7 @@ class SoftmaxAssignmentSparsityPenalty:
     target: TargetSpec
     k_atoms: int
     temperature: float = 1.0
+    weight_schedule: ScalarWeightSchedule | dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if self.k_atoms <= 0:
@@ -1145,12 +1153,12 @@ class SoftmaxAssignmentSparsityPenalty:
             )
 
     def _to_rust_payload(self) -> dict[str, Any]:
-        return {
+        return _add_weight_schedule({
             "kind": "softmax_assignment_sparsity",
             "target": _target_descriptor(self.target),
             "k_atoms": int(self.k_atoms),
             "temperature": float(self.temperature),
-        }
+        }, self)
 
     def to_rust_descriptor(self) -> dict[str, Any]:
         return self._to_rust_payload()
