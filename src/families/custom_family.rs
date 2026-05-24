@@ -11791,7 +11791,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             let mut tr_log_sig: Option<String> = None;
             let mut tr_log_first: usize = 0;
             let mut tr_log_last: usize = 0;
-            let mut accepted_math_diag: Option<JointNewtonMathDiagnostic> = None;
             for trust_attempt in 0..JOINT_TRUST_MAX_ATTEMPTS {
                 line_search_attempts = trust_attempt + 1;
                 accepted_joint_workspace = None;
@@ -11970,27 +11969,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 } else {
                     "reject"
                 };
-                if floor_reached || secondary_ok {
-                    let old_kkt_inf = rhs.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
-                    // With EW-PCG, the linear residual is η_k·‖r‖ by design;
-                    // do NOT certify on it. It is diagnostic/context only:
-                    // convergence certificates below remain gated by the
-                    // actual projected KKT residual at the accepted β.
-                    let linearized_next_kkt_inf = hpen_delta
-                        .iter()
-                        .zip(rhs.iter())
-                        .map(|(h_delta_i, rhs_i)| (h_delta_i - rhs_i).abs())
-                        .fold(0.0_f64, f64::max);
-                    accepted_math_diag = Some(JointNewtonMathDiagnostic {
-                        old_kkt_inf,
-                        linearized_next_kkt_inf,
-                        predicted_reduction,
-                        actual_reduction,
-                        trust_ratio: trust_update.rho,
-                        step_inf: trial_step_inf,
-                        proposal_inf: step_inf,
-                    });
-                }
                 let radius_held =
                     (joint_trust_radius - old_radius).abs() <= 1e-12 * old_radius.abs().max(1.0);
                 let radius_field = if radius_held {
@@ -12714,24 +12692,15 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 converged = true;
                 break;
             }
-            // Carry the objective-stagnation signal into the next
-            // cycle so the line-search-failure path above can pair it
-            // with trust-region collapse to certify a KKT optimum on a
-            // rank-deficient null mode. The residual signal does not
-            // need a carry-over: by the time we reach this assignment
-            // the end-of-cycle test has already confirmed residual is
-            // above its tolerance, so a "previous cycle had small
-            // residual" branch in the failure path could never fire.
-            last_cycle_obj_change_below_tol = objective_change <= objective_tol;
             if objective_change <= objective_tol {
                 consecutive_obj_flat_cycles = consecutive_obj_flat_cycles.saturating_add(1);
             } else {
                 consecutive_obj_flat_cycles = 0;
             }
-            // Carry the KKT-stationarity signal into the next cycle so
-            // the line-search-failure path above can recognise a true
-            // KKT optimum on a rank-deficient null mode. See that path
-            // for the full rationale.
+            // Carry the KKT-stationarity / objective-stagnation signals
+            // into the next cycle so the line-search-failure path above
+            // can recognise a true KKT optimum on a rank-deficient null
+            // mode. See that path for the full rationale.
             last_cycle_residual_below_tol = residual <= residual_tol;
             last_cycle_obj_change_below_tol = objective_change <= objective_tol;
         }
