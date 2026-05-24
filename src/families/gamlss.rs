@@ -25559,6 +25559,7 @@ mod tests {
                 basis: SmoothBasisSpec::Matern {
                     feature_cols: feature_cols.to_vec(),
                     spec: MaternBasisSpec {
+                        periodic: None,
                         center_strategy: CenterStrategy::EqualMass { num_centers: 6 },
                         length_scale,
                         nu: MaternNu::ThreeHalves,
