@@ -102,8 +102,8 @@ use gam::term_builder::{
 };
 use gam::transformation_normal::TransformationNormalConfig;
 use gam::types::{
-    InverseLink, LikelihoodFamily, LikelihoodScaleMetadata, LikelihoodSpec, LinkComponent,
-    LinkFunction, LogLikelihoodNormalization, MixtureLinkSpec, SasLinkSpec, WigglePenaltyConfig,
+    InverseLink, LikelihoodScaleMetadata, LikelihoodSpec, LinkComponent, LinkFunction,
+    LogLikelihoodNormalization, MixtureLinkSpec, ResponseFamily, SasLinkSpec, WigglePenaltyConfig,
 };
 use gam::{
     BernoulliMarginalSlopeFitRequest, BinomialLocationScaleFitRequest, FitRequest, FitResult,
