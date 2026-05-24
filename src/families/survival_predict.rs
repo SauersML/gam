@@ -32,6 +32,7 @@ use crate::inference::model::{
 use crate::inference::predict::{BernoulliMarginalSlopePredictor, PredictInput, predict_gam};
 use crate::linalg::matrix::DesignMatrix;
 use crate::probability::signed_probit_logcdf_and_mills_ratio;
+use crate::solver::mixture_link::inverse_link_jet_for_inverse_link;
 use crate::solver::estimate::{BlockRole, FittedBlock, FittedLinkState, UnifiedFitResult};
 use crate::term_builder::resolve_role_col;
 use crate::terms::smooth::{TermCollectionSpec, build_term_collection_design};
@@ -1851,6 +1852,59 @@ fn location_scale_hazard_from_eta_derivative(
         .map(|(&q, &q_t)| location_scale_hazard_component(q, q_t, inverse_link))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Array1::from_vec(values))
+}
+
+fn location_scale_hazard_component(
+    eta: f64,
+    eta_derivative: f64,
+    inverse_link: &InverseLink,
+) -> Result<f64, String> {
+    if !(eta.is_finite() && eta_derivative.is_finite() && eta_derivative > 0.0) {
+        return Err(format!(
+            "survival location-scale hazard requires finite eta and positive eta_t, got eta={eta}, eta_t={eta_derivative}"
+        ));
+    }
+    match inverse_link {
+        InverseLink::Standard(LinkFunction::Probit) => {
+            let (_, hazard) = probit_survival_hazard_components(eta, eta_derivative)?;
+            Ok(hazard)
+        }
+        InverseLink::Standard(LinkFunction::CLogLog) => {
+            let (_, hazard) = royston_parmar_survival_hazard_components(eta, eta_derivative)?;
+            Ok(hazard)
+        }
+        InverseLink::Standard(LinkFunction::Logit) => {
+            let failure = if eta >= 0.0 {
+                1.0 / (1.0 + (-eta).exp())
+            } else {
+                let exp_eta = eta.exp();
+                exp_eta / (1.0 + exp_eta)
+            };
+            Ok(failure * eta_derivative)
+        }
+        InverseLink::Standard(LinkFunction::Identity) => {
+            let survival = 1.0 - eta;
+            if !(survival.is_finite() && survival > 0.0) {
+                return Err(format!(
+                    "survival location-scale identity link produced invalid survival={survival} at eta={eta}"
+                ));
+            }
+            Ok(eta_derivative / survival)
+        }
+        _ => {
+            let jet = inverse_link_jet_for_inverse_link(inverse_link, eta)
+                .map_err(|err| format!("survival location-scale inverse-link jet failed: {err}"))?;
+            let survival = 1.0 - jet.mu;
+            let hazard = jet.d1 * eta_derivative / survival;
+            if !(survival.is_finite() && survival > 0.0 && hazard.is_finite() && hazard >= 0.0) {
+                return Err(format!(
+                    "survival location-scale inverse link produced invalid hazard components: eta={eta}, eta_t={eta_derivative}, failure={}, d_failure={}, survival={survival}, hazard={hazard}",
+                    jet.mu, jet.d1
+                ));
+            }
+            Ok(hazard)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

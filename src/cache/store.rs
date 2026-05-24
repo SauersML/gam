@@ -758,7 +758,6 @@ fn fresh_run_id() -> String {
 mod tests {
     use super::*;
     use crate::cache::key::Fingerprinter;
-    use std::thread;
 
     fn temp_store() -> (tempfile::TempDir, WarmStartStore) {
         let dir = tempfile::tempdir().unwrap();

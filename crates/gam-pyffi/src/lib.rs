@@ -8907,7 +8907,46 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
         bspline_tensor_input_location_first_derivative,
         module
     )?)?;
+    module.add_function(wrap_pyfunction!(mechanism_sparsity_jacobian, module)?)?;
+    module.add_function(wrap_pyfunction!(conditional_prior_ivae, module)?)?;
     Ok(())
+}
+
+/// Smoothed column-2-norm penalty on a decoder weight matrix W of shape
+/// `(d_obs, k_latent)`. Returns `(value, grad)` where `grad` has the same
+/// shape as `W`.
+#[pyfunction(signature = (weight, epsilon, w))]
+fn mechanism_sparsity_jacobian<'py>(
+    py: Python<'py>,
+    weight: f64,
+    epsilon: f64,
+    w: PyReadonlyArray2<'py, f64>,
+) -> PyResult<(f64, Py<PyArray2<f64>>)> {
+    let pen = gam::identifiability::MechanismSparsityJacobian::new(weight, epsilon)
+        .map_err(py_value_error)?;
+    let (value, grad) = pen.value_and_grad(w.as_array());
+    Ok((value, grad.into_pyarray(py).unbind()))
+}
+
+/// iVAE conditional-Gaussian log-prior. Given per-row `(mean, scale)` arrays
+/// of shape `(n_rows, latent_dim)`, returns the negative log-prior value and
+/// its gradient w.r.t. `t` (same shape as `t`).
+#[pyfunction(signature = (weight, t, mean, scale))]
+fn conditional_prior_ivae<'py>(
+    py: Python<'py>,
+    weight: f64,
+    t: PyReadonlyArray2<'py, f64>,
+    mean: PyReadonlyArray2<'py, f64>,
+    scale: PyReadonlyArray2<'py, f64>,
+) -> PyResult<(f64, Py<PyArray2<f64>>)> {
+    let pen = gam::identifiability::ConditionalPriorIvae::new(
+        mean.as_array().to_owned(),
+        scale.as_array().to_owned(),
+        weight,
+    )
+    .map_err(py_value_error)?;
+    let (value, grad) = pen.value_and_grad(t.as_array());
+    Ok((value, grad.into_pyarray(py).unbind()))
 }
 
 fn py_value_error(message: String) -> PyErr {

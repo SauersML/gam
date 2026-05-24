@@ -1090,6 +1090,25 @@ fn hash_analytic_penalty_kind(
             hasher.write_usize(p.rho_index);
             hash_weight_schedule_option(hasher, &p.weight_schedule);
         }
+        AnalyticPenaltyKind::NestedPrefix(p) => {
+            hasher.write_str("nested-prefix");
+            hash_psi_slice(hasher, &p.target);
+            hasher.write_str(&format!("{:?}", p.target_tier));
+            hasher.write_usize(p.prefix_sizes.len());
+            for &m in &p.prefix_sizes {
+                hasher.write_usize(m);
+            }
+            hasher.write_usize(p.shell_weights.len());
+            for &w in &p.shell_weights {
+                hasher.write_f64(w);
+            }
+            hasher.write_f64(p.eps);
+            hasher.write_usize(p.rho_indices.len());
+            for &idx in &p.rho_indices {
+                hasher.write_usize(idx);
+            }
+            hash_weight_schedule_option(hasher, &p.weight_schedule);
+        }
     }
 }
 

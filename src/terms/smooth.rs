@@ -4772,7 +4772,7 @@ fn build_tensor_bspline_basis(
                 BSplineKnotSpec::Automatic {
                     num_internal_knots, ..
                 } => num_internal_knots.unwrap_or(8) + marginalspec.degree + 1,
-                BSplineKnotSpec::PeriodicUniform { num_basis, .. } => *num_basis,
+                BSplineKnotSpec::PeriodicUniform { num_basis, .. } => num_basis,
             };
             let (basis, penalty, knots) = build_periodic_fourier_margin(
                 data.column(col),

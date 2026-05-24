@@ -352,7 +352,7 @@ fn parse_call_pair(call: Pair<'_, Rule>) -> Result<FunctionCallSpec, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CallArgSpec, ParsedTerm, parse_formula, parse_formula_dsl, parse_function_call,
+        CallArgSpec, parse_formula, parse_formula_dsl, parse_function_call,
         parsed_terms_reference_column, validate_marginal_slope_z_column_exclusion,
     };
 

@@ -6610,6 +6610,9 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
                 self.stochastic_diag_via_matvec()
             }
             AnalyticPenaltyKind::Isometry(_) => self.diag_via_matvec(),
+            AnalyticPenaltyKind::NestedPrefix(p) => p
+                .hessian_diag(self.target.view(), self.rho.view())
+                .expect("NestedPrefix diag"),
         }
     }
 
@@ -6631,7 +6634,8 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
             | AnalyticPenaltyKind::TopKActivation(_)
             | AnalyticPenaltyKind::JumpReLU(_)
             | AnalyticPenaltyKind::Sparsity(_)
-            | AnalyticPenaltyKind::IBPAssignment(_) => {
+            | AnalyticPenaltyKind::IBPAssignment(_)
+            | AnalyticPenaltyKind::NestedPrefix(_) => {
                 let d = self.diag();
                 let mut s = 0.0;
                 for &v in d.iter() {
