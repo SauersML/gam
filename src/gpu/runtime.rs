@@ -4,6 +4,7 @@ use super::device::GpuDeviceInfo;
 use super::policy::GpuDispatchPolicy;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[must_use]
 pub enum GpuProbeError {
     CudaFeatureDisabled,
     DynamicLoaderUnavailable,
@@ -12,6 +13,7 @@ pub enum GpuProbeError {
 }
 
 #[derive(Clone, Debug)]
+#[must_use]
 pub struct GpuRuntime {
     pub device: GpuDeviceInfo,
     pub policy: GpuDispatchPolicy,
@@ -30,6 +32,7 @@ impl GpuRuntime {
         }
     }
 
+    #[must_use]
     pub fn global() -> Option<&'static Self> {
         static RUNTIME: OnceLock<Option<GpuRuntime>> = OnceLock::new();
         RUNTIME
@@ -37,6 +40,7 @@ impl GpuRuntime {
             .as_ref()
     }
 
+    #[must_use]
     pub fn is_available() -> bool {
         Self::global().is_some()
     }
