@@ -1159,6 +1159,11 @@ fn load_parquet_inferred(
         .iter()
         .map(|f| f.name().clone())
         .collect();
+    if all_headers.is_empty() {
+        return Err(DataError::EmptyInput {
+            reason: "parquet file has no columns".to_string(),
+        });
+    }
     let selected_indices = resolve_requested_columns(&all_headers, requested_columns)?;
     let headers = projected_headers(&all_headers, &selected_indices);
     let selected_fields = selected_indices

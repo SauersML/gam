@@ -581,13 +581,12 @@ fn log_det_from_chol_lower(l: &Array2<f64>) -> f64 {
 /// row block is solved with the **undamped** Cholesky factor. Proposal
 /// §2.2 / §7.
 pub fn ift_du_dbeta(cache: &ArrowFactorCache) -> Array2<f64> {
-    assert!(
-        cache.htbeta_available(),
-        "IFT du/dbeta requires cached H_tβ row products"
-    );
     let n = cache.undamped_factor_count();
     let d = cache.d;
     let k = cache.k;
+    if !cache.htbeta_available() {
+        return Array2::<f64>::from_elem((n * d, k), f64::NAN);
+    }
     let mut out = Array2::<f64>::zeros((n * d, k));
     let mut beta_basis = Array1::<f64>::zeros(k);
     let mut rhs = Array1::<f64>::zeros(d);
@@ -602,7 +601,7 @@ pub fn ift_du_dbeta(cache: &ArrowFactorCache) -> Array2<f64> {
             if !cache.apply_htbeta_row(i, beta_basis.view(), &mut rhs) {
                 // SAFETY: reaching `false` means a family declared the cache
                 // available but failed to populate it — contract violation.
-                panic!("IFT du/dbeta requires cached H_tβ row products");
+                return Array2::<f64>::from_elem((n * d, k), f64::NAN);
             }
             let y = chol_lower_solve_vector(factor, &rhs);
             for c in 0..d {
@@ -632,7 +631,9 @@ pub fn ift_dbeta_drho(
     let schur = cache.schur_factor.as_ref()?;
     let k = cache.k;
     let r = dg_red_drho.ncols();
-    debug_assert_eq!(dg_red_drho.nrows(), k);
+    if dg_red_drho.nrows() != k {
+        return None;
+    }
     let mut out = Array2::<f64>::zeros((k, r));
     let mut rhs = Array1::<f64>::zeros(k);
     for a in 0..r {
@@ -661,16 +662,17 @@ pub fn ift_du_drho(
     gu_rho: ArrayView2<'_, f64>,
     dbeta_drho: ArrayView2<'_, f64>,
 ) -> Array2<f64> {
-    assert!(
-        cache.htbeta_available(),
-        "IFT du/drho requires cached H_tβ row products"
-    );
     let n = cache.undamped_factor_count();
     let d = cache.d;
     let k = cache.k;
     let r = dbeta_drho.ncols();
-    debug_assert_eq!(gu_rho.shape(), &[n * d, r]);
-    debug_assert_eq!(dbeta_drho.nrows(), k);
+    if !cache.htbeta_available()
+        || gu_rho.nrows() != n * d
+        || gu_rho.ncols() != r
+        || dbeta_drho.nrows() != k
+    {
+        return Array2::<f64>::from_elem((n * d, r), f64::NAN);
+    }
 
     let mut out = Array2::<f64>::zeros((n * d, r));
     let mut rhs = Array1::<f64>::zeros(d);
@@ -683,7 +685,7 @@ pub fn ift_du_drho(
                 // SAFETY: `false` here means the family declared H_tβ row
                 // products available but did not populate them — contract
                 // violation against the joint-evidence capability surface.
-                panic!("IFT du/drho requires cached H_tβ row products");
+                return Array2::<f64>::from_elem((n * d, r), f64::NAN);
             }
             for c in 0..d {
                 rhs[c] = gu_rho[[i * d + c, a]] + htbeta_delta[c];
@@ -731,11 +733,14 @@ pub fn evidence_ift_gradient_correction(terms: EvidenceIftGradientTerms<'_>) -> 
     let k = terms.dbeta_drho.nrows();
     let nd = terms.du_drho.nrows();
     let r = terms.dbeta_drho.ncols();
-    debug_assert_eq!(terms.du_drho.ncols(), r);
-    debug_assert_eq!(terms.value_beta.len(), k);
-    debug_assert_eq!(terms.logdet_h_beta.len(), k);
-    debug_assert_eq!(terms.value_u.len(), nd);
-    debug_assert_eq!(terms.logdet_h_u.len(), nd);
+    if terms.du_drho.ncols() != r
+        || terms.value_beta.len() != k
+        || terms.logdet_h_beta.len() != k
+        || terms.value_u.len() != nd
+        || terms.logdet_h_u.len() != nd
+    {
+        return Array1::<f64>::from_elem(r, f64::NAN);
+    }
 
     let mut out = Array1::<f64>::zeros(r);
     for a in 0..r {
@@ -794,16 +799,33 @@ pub fn evidence_grad_rho(
     ift_terms: EvidenceIftGradientTerms<'_>,
 ) -> Array1<f64> {
     let r = value_rho.len();
-    assert!(
-        cache.htbeta_available(),
-        "evidence gradient requires cached H_tβ row products"
-    );
     let n = cache.undamped_factor_count();
     let d = cache.d;
     let k = cache.k;
     let mut out = Array1::<f64>::zeros(r);
+    if !cache.htbeta_available()
+        || pen_logdet_drho.len() != r
+        || huu_drho.len() != n
+        || htbeta_drho.len() != n
+        || hbb_drho.len() != r
+        || huu_drho.iter().any(|row| row.len() != r)
+        || htbeta_drho.iter().any(|row| row.len() != r)
+        || hbb_drho.iter().any(|m| m.nrows() != k || m.ncols() != k)
+        || huu_drho
+            .iter()
+            .any(|row| row.iter().any(|m| m.nrows() != d || m.ncols() != d))
+        || htbeta_drho
+            .iter()
+            .any(|row| row.iter().any(|m| m.nrows() != d || m.ncols() != k))
+    {
+        out.fill(f64::NAN);
+        return out;
+    }
     let ift_correction = evidence_ift_gradient_correction(ift_terms);
-    debug_assert_eq!(ift_correction.len(), r);
+    if ift_correction.len() != r || ift_correction.iter().any(|v| v.is_nan()) {
+        out.fill(f64::NAN);
+        return out;
+    }
 
     let schur = match cache.schur_factor.as_ref() {
         Some(s) => s,
@@ -830,7 +852,8 @@ pub fn evidence_grad_rho(
             if !cache.apply_htbeta_row(i, beta_basis.view(), &mut rhs) {
                 // SAFETY: `false` means the family declared the cache
                 // available but did not populate it — contract violation.
-                panic!("evidence gradient requires cached H_tβ row products");
+                out.fill(f64::NAN);
+                return out;
             }
             let v = chol_lower_solve_vector(factor, &rhs);
             for c in 0..d {
