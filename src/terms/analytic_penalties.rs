@@ -66,8 +66,8 @@
 //! kernel-shape paths append ext-coords. The IsometryPenalty owns one `ρ`; the
 //! SparsityPenalty owns either zero (`ε` fixed) or one (`ε` REML-selected) plus
 //! one strength; the ARDPenalty owns `d` (one per latent axis);
-//! NuclearNorm, BlockSparsity, and Orthogonality each own one strength only
-//! when their weight is learnable.
+//! NuclearNorm, BlockSparsity, AuxConditionalPrior, and Orthogonality each own
+//! one strength only when their weight is learnable.
 //!
 //! ## Three-tier landings
 //!
@@ -3188,7 +3188,6 @@ impl AnalyticPenalty for BlockSparsityPenalty {
 /// supervision signal identified in memory `project_ard_gauge_fix_doesnt_help_cogito`.
 #[derive(Debug, Clone)]
 pub struct AuxConditionalPriorPenalty {
-    pub target: PsiSlice,
     pub lambda_per_row: Array3<f64>,
     /// Base strength. If `learnable_weight` is true, the resolved strength is
     /// `weight * exp(rho[rho_index])`; otherwise it is fixed at `weight`.
@@ -3197,6 +3196,7 @@ pub struct AuxConditionalPriorPenalty {
     pub n_eff: usize,
     pub learnable_weight: bool,
     pub rho_index: usize,
+    pub target: PsiSlice,
 }
 
 impl AuxConditionalPriorPenalty {
@@ -3282,12 +3282,12 @@ impl AuxConditionalPriorPenalty {
             }
         }
         Ok(Self {
-            target,
             lambda_per_row,
             weight,
             n_eff,
             learnable_weight,
             rho_index: 0,
+            target,
         })
     }
 
