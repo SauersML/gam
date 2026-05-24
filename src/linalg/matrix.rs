@@ -55,29 +55,13 @@ pub enum MatrixError {
     /// `Array2<f64>` because the active `ResourcePolicy` (size cap or strict
     /// operator-only mode) forbids it.
     DensificationRefused { reason: String },
-    /// A constructor that requires at least one block / channel / marginal was
-    /// called with an empty vector.
-    EmptyInput { reason: String },
-    /// A value that must be finite (e.g. a fully-materialized symmetric matrix
-    /// entry) was `NaN` or `±inf`.
-    NonFiniteEntry { reason: String },
-    /// The requested operation is not supported for the given operator kind
-    /// (e.g. matrix-free PCG only runs for eligible operators).
-    Unsupported { reason: String },
-    /// A numerical procedure failed to produce a usable answer (e.g. PCG
-    /// exhausted its ridge-retry budget).
-    NumericalFailure { reason: String },
 }
 
 impl std::fmt::Display for MatrixError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             MatrixError::DimensionMismatch { reason }
-            | MatrixError::DensificationRefused { reason }
-            | MatrixError::EmptyInput { reason }
-            | MatrixError::NonFiniteEntry { reason }
-            | MatrixError::Unsupported { reason }
-            | MatrixError::NumericalFailure { reason } => f.write_str(reason),
+            | MatrixError::DensificationRefused { reason } => f.write_str(reason),
         }
     }
 }

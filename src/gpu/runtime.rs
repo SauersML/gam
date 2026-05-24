@@ -11,9 +11,6 @@ pub(crate) mod diagnostics;
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[must_use]
 pub enum GpuProbeError {
-    CudaFeatureDisabled,
-    DynamicLoaderUnavailable,
-    NoDevice,
     Driver(String),
 }
 
@@ -94,19 +91,6 @@ impl GpuRuntime {
         &self.device
     }
 
-    #[must_use]
-    pub fn devices(&self) -> &[GpuDeviceInfo] {
-        &self.devices
-    }
-
-    #[must_use]
-    pub fn cpu_reason() -> Option<&'static str> {
-        if Self::global().is_some() {
-            None
-        } else {
-            Some("no CUDA device was probed")
-        }
-    }
 }
 
 pub fn cuda_context_for(ordinal: usize) -> Option<Arc<CudaContext>> {
