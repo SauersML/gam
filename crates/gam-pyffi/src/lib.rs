@@ -5516,7 +5516,7 @@ fn glm_reml_fit_latent_impl(
 ), String> {
     if y.ncols() != 1 {
         return Err(format!(
-            "glm_reml_fit_latent currently requires y with one column; got {}",
+            "glm_reml_fit_latent requires y with one column; got {}",
             y.ncols()
         ));
     }

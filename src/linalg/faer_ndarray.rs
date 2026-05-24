@@ -1687,11 +1687,9 @@ impl<'a> FaerArrayView<'a> {
                 self.col_stride,
             )
         };
-        // SAFETY: pointer/shape/strides either come from a live ndarray view
-        // with positive row and column strides, or from the owned compact copy
-        // stored in this wrapper. ndarray guarantees the addressed elements are
-        // in-bounds, aligned, and initialized, and the shared borrow/private
-        // owned storage prevents mutable aliasing for the returned view lifetime.
+        // SAFETY: ptr/shape/strides come from either a live ndarray view
+        // (positive strides, validated bounds/alignment) or the owned
+        // compact copy held inside this wrapper — no mutable aliasing.
         unsafe { MatRef::from_raw_parts(ptr, rows, cols, row_stride, col_stride) }
     }
 }
@@ -1734,11 +1732,9 @@ impl<'a> FaerColView<'a> {
         } else {
             (self.ptr, self.len, self.stride)
         };
-        // SAFETY: pointer/len/stride either come from a live ndarray column with
-        // positive stride, or from the owned compact copy stored in this wrapper.
-        // ndarray guarantees the addressed elements are in-bounds, aligned, and
-        // initialized; ncols is 1 so the zero column stride addresses no extra
-        // columns, and shared/private storage prevents mutable aliasing.
+        // SAFETY: ptr/len/stride come from either a live ndarray column
+        // (positive stride, validated bounds/alignment) or the owned
+        // compact copy; ncols=1 so the 0 col-stride is unused.
         unsafe { MatRef::from_raw_parts(ptr, len, 1, stride, 0) }
     }
 }
