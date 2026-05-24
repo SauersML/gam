@@ -54,10 +54,12 @@ Otherwise routes to `"independent"`. The threshold is conservative —
 joint is feasible up to ~F=256 in many setups, but the user benefits
 more from independence (and from multi-output support) past F=64.
 
-## Production use: SAE training at F=100K
+## Large-F use: sparse-atom training at F=100K
 
-The Manifold-SAE production training path uses `mode="independent"`
-unconditionally. The architecture is:
+At very large F with TopK-gated per-atom designs, `mode="independent"`
+is the appropriate choice unconditionally: the per-atom REML problems
+decouple, autograd flows through each analytic VJP independently, and
+memory stays linear in F. A representative architecture is:
 
 ```python
 positions = encoder(x)           # (B, F)
@@ -80,10 +82,10 @@ Autograd is preserved through every per-atom REML's analytic VJP. The
 encoder gradient is the sum of F single-smooth backward contributions
 through TopK-gated per-atom designs.
 
-## Empirical timing (CPU, MacOS arm64, single process)
+## Indicative timing (single-process CPU)
 
-These numbers are from a synthetic benchmark on the developer machine;
-expect cluster CPUs to be 2-5x faster.
+These numbers are from a synthetic benchmark on a single laptop-class
+CPU core; server-class CPUs are typically 2-5x faster.
 
 | F     | D    | N    | mode          | dt (s)  |
 | ---   | ---  | ---  | ---           | ---     |
