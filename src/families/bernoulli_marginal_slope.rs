@@ -18006,7 +18006,8 @@ pub fn fit_bernoulli_marginal_slope_terms(
          specs: &[TermCollectionSpec],
          designs: &[TermCollectionDesign],
          eval_mode,
-         _row_set: &crate::families::row_kernel::RowSet| {
+         row_set: &crate::families::row_kernel::RowSet| {
+            drop(row_set);
             use crate::solver::estimate::reml::unified::EvalMode;
             let rho = theta.slice(s![..setup.rho_dim()]).to_owned();
             let blocks = build_blocks(&rho, &designs[0], &designs[1])?;

@@ -47,6 +47,17 @@ use std::sync::Arc;
 // Threading `RowSet` through every `row_kernel_*` function is Agent C's
 // job — this module exposes only the type definition and basic
 // constructors used by the κ-staging schedule in `smooth.rs`.
+/// Row-selection contract for outer-only assembly.
+///
+/// Identifies which observations participate in a given evaluation pass and
+/// how they are weighted. `All` iterates every row `0..n_total` with weight
+/// 1.0 (full-data behaviour). `Subsample { rows, n_full }` walks the pre-built
+/// `WeightedOuterRow` list where each row's `weight` is its Horvitz–Thompson
+/// inverse-inclusion scale `1/π_i`, so any partial sum `Σ_i w_i · f(row_i)`
+/// is an unbiased estimator of the corresponding full-data sum
+/// `Σ_{i=1..n_full} f(row_i)`. Inner-PIRLS and final-covariance passes always
+/// run with `All`; only outer score / gradient hot loops consume a non-`All`
+/// variant.
 #[derive(Clone)]
 pub enum RowSet {
     All,

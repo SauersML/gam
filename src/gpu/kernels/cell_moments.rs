@@ -207,6 +207,9 @@ extern "C" __global__ void cell_moments_kernel(
         .arg(&mut dout)
         .arg(&nc)
         .arg(&nm);
+    // SAFETY: every kernel arg is a device pointer or pod scalar bound above
+    // via `builder.arg(...)`; grid/block dims in `cfg` cover exactly `n_cells`
+    // threads, matching the kernel's indexed bounds check.
     unsafe { builder.launch(cfg) }.map_err(map_drv)?;
 
     let host = stream.memcpy_dtov(&dout).map_err(map_drv)?;

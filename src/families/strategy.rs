@@ -55,12 +55,24 @@ pub trait FamilyStrategy: std::fmt::Debug + Send + Sync {
     ) -> Result<IntegratedMomentsJet, EstimationError>;
 }
 
+/// Default `FamilyStrategy` implementation: bundles a stable
+/// `LikelihoodFamily` identifier with the optional fitted `InverseLink`
+/// state.  All trait methods route through this pair: `inverse_link_*`
+/// dispatches on the stored `InverseLink` if present, otherwise falls back
+/// to the family-default inverse-link routines; `posterior_*` integrates
+/// `p(η) | η ~ N(eta, se_eta²)` via the appropriate exact / quadrature path;
+/// `simulate_noise` extracts the dispersion parameter from `gaussian_scale`
+/// (or rejects when the family needs one and it is missing).
 #[derive(Clone, Debug)]
 pub struct ResolvedFamilyStrategy {
     family: LikelihoodFamily,
     inverse_link: Option<InverseLink>,
 }
 
+/// Construct a `ResolvedFamilyStrategy` from a family identifier and an
+/// optional inverse-link state (cloned).  No validation is performed — the
+/// strategy methods will return `EstimationError::InvalidInput` later if
+/// they need state that this constructor did not supply.
 #[inline]
 pub fn strategy_for_family(
     family: LikelihoodFamily,
@@ -72,6 +84,11 @@ pub fn strategy_for_family(
     }
 }
 
+/// Build a `ResolvedFamilyStrategy` from a fitted result, lifting the
+/// fitted link state (`FittedLinkState`) into an `InverseLink` variant
+/// suitable for predict-time evaluation.  Returns an error when the
+/// recorded link state and the supplied `family` are mutually
+/// inconsistent (propagated from `fit.fitted_link_state`).
 pub fn strategy_from_fit(
     family: LikelihoodFamily,
     fit: &UnifiedFitResult,
