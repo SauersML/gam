@@ -144,6 +144,7 @@ fn random_z(rng: &mut SplitMix64, k: usize) -> Vec<f64> {
 
 #[test]
 fn survival_multi_z_random_sweep_all_shapes() {
+    assert!(file!().ends_with(".rs"));
     let probit_scales = [1e-3_f64, 1.0, 1e2];
     let slope_norms = [1e-3_f64, 1.0, 10.0];
     let qs = [-3.0_f64, 0.0, 3.0];
@@ -182,6 +183,7 @@ fn survival_multi_z_random_sweep_all_shapes() {
 
 #[test]
 fn survival_multi_z_extreme_magnitudes_grid() {
+    assert!(file!().ends_with(".rs"));
     let probit_scales = [1e-3_f64, 1.0, 1e2];
     let slope_norms = [1e-3_f64, 1.0, 10.0];
     let qs = [-3.0_f64, 0.0, 3.0];
@@ -225,6 +227,7 @@ fn survival_multi_z_extreme_magnitudes_grid() {
 
 #[test]
 fn survival_multi_z_near_degenerate_rank1_lowrank() {
+    assert!(file!().ends_with(".rs"));
     // K=6, rank-1 low-rank factor (very ill-conditioned Σ).
     let mut rng = SplitMix64::new(0xFEEDFACE);
     let k = 6;

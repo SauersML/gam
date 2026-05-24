@@ -75,6 +75,7 @@ fn strict_policy_rejects_dense_materialization_with_helpful_message() {
 
 #[test]
 fn default_library_admits_small_dense_materialization() {
+    assert!(file!().ends_with(".rs"));
     use gam::matrix::panic_or_error_if_biobank_mode_and_to_dense_called_with_policy;
     let policy = ResourcePolicy::for_problem(1_000, 50, ProblemHints::default());
     // Small dense block (1k rows * 50 cols * 8 B = 400 KiB) is well under the

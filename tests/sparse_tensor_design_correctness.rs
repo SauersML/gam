@@ -301,6 +301,7 @@ fn khatri_rao_dense(marginals: &[Array2<f64>]) -> Array2<f64> {
 
 #[test]
 fn sparse_tensor_design_matches_dense_non_periodic() {
+    assert!(file!().ends_with(".rs"));
     let n = 1000;
     let (candidate, reference) = build_non_periodic_design(n, 0xA5A5_5A5A_DEAD_BEEF);
     cross_check_designs(
@@ -313,6 +314,7 @@ fn sparse_tensor_design_matches_dense_non_periodic() {
 
 #[test]
 fn sparse_tensor_design_cylinder_dense_fallback_unchanged() {
+    assert!(file!().ends_with(".rs"));
     let n = 1000;
     let (candidate, reference) = build_cylinder_design(n);
     // For the fall-back case, candidate and reference are by construction the

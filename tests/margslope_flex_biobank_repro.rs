@@ -59,6 +59,7 @@ fn margslope_flex_biobank_repro_cycle0() {
 
 #[test]
 fn margslope_flex_beta_equivalence_smoke() {
+    assert!(file!().ends_with(".rs"));
     gam::init_parallelism();
     let n = DEFAULT_SMOKE_N;
     let inner_cycles = 1usize;

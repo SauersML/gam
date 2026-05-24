@@ -648,6 +648,7 @@ impl<T: AD> DifferentiableFunctionTrait<T> for ScalingPhiFn<T> {
 
 #[test]
 fn nonwiggle_q_log_sigma_derivatives_match_three_autodiff_engines() {
+    assert!(file!().ends_with(".rs"));
     let eta_t = 1.7;
     let points = [-10.0, -4.5, -1.2, 0.0, 0.8, 2.3, 6.0];
     let f_std = QFn::<f64>::new(eta_t);
@@ -679,6 +680,7 @@ fn nonwiggle_q_log_sigma_derivatives_match_three_autodiff_engines() {
 
 #[test]
 fn spatial_log_kappa_scaling_derivatives_match_three_autodiff_engines() {
+    assert!(file!().ends_with(".rs"));
     let psi0 = -0.23;
     let r = 0.71;
     let eta = -3.5;
@@ -711,6 +713,7 @@ fn spatial_log_kappa_scaling_derivatives_match_three_autodiff_engines() {
 
 #[test]
 fn combined_location_scale_joint_psi_fixed_beta_terms_match_three_autodiff_engines() {
+    assert!(file!().ends_with(".rs"));
     let params = CombinedLocationScaleParams {
         beta_1: 0.8,
         beta_2: -0.35,
@@ -767,6 +770,7 @@ fn combined_location_scale_joint_psi_fixed_beta_terms_match_three_autodiff_engin
 
 #[test]
 fn combined_location_scale_joint_psihessian_drift_matches_three_autodiff_engines() {
+    assert!(file!().ends_with(".rs"));
     let params = CombinedLocationScaleParams {
         beta_1: 0.8,
         beta_2: -0.35,

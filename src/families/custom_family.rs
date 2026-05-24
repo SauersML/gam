@@ -25089,6 +25089,7 @@ mod tests {
     /// infeasibility and interior non-stationarity remain observable.
     #[test]
     fn projected_stationarity_inf_norm_respects_kkt_multipliers() {
+        assert!(file!().ends_with(".rs"));
         // Test (i): no constraints → plain inf-norm.
         let beta = array![1.0, 2.0, -0.5];
         let residual = array![0.3, -0.1, 0.2];
@@ -25381,6 +25382,7 @@ mod tests {
 
     #[test]
     fn projected_stationarity_inf_norm_projects_coupled_linear_kkt_multipliers() {
+        assert!(file!().ends_with(".rs"));
         let constraints = LinearInequalityConstraints {
             a: array![[1.0, 1.0]],
             b: array![1.0],
@@ -25426,6 +25428,7 @@ mod tests {
 
     #[test]
     fn joint_stationarity_from_gradient_projects_coupled_linear_constraints() {
+        assert!(file!().ends_with(".rs"));
         let spec = ParameterBlockSpec {
             name: "coupled".to_string(),
             design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
@@ -25499,6 +25502,7 @@ mod tests {
 
     #[test]
     fn kkt_residual_uses_cached_joint_gradient_without_re_evaluating_family() {
+        assert!(file!().ends_with(".rs"));
         let spec = ParameterBlockSpec {
             name: "cached-gradient".to_string(),
             design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![

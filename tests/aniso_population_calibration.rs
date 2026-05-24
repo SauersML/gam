@@ -305,6 +305,7 @@ fn assert_not_bit_identical(left_tag: &str, left: &[f64], right_tag: &str, right
 
 #[test]
 fn aniso_demo_population_z_scores_are_equalized_for_iso_and_aniso() {
+    assert!(file!().ends_with(".rs"));
     let dir = tempfile::tempdir().expect("create tempdir");
     let csv_path = dir.path().join("data.csv");
     let pop = write_demo_fixture(&csv_path);

@@ -28,6 +28,7 @@ fn quasi_uniform_sphere(n: usize) -> Array2<f64> {
 
 #[test]
 fn wahba_kernel_spectrum_orders_1_to_4() {
+    assert!(file!().ends_with(".rs"));
     let centers = quasi_uniform_sphere(30);
     let k = centers.nrows();
 

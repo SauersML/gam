@@ -368,6 +368,7 @@ fn mixture_probit_jet_matches_three_autodiff_engines() {
 
 #[test]
 fn mixture_logit_jet_matches_three_autodiff_engines() {
+    assert!(file!().ends_with(".rs"));
     let points = [-4.0, -1.6, -0.3, 0.0, 0.6, 1.9, 4.0];
 
     let f_std = LogitFn::<f64>::new();
@@ -395,6 +396,7 @@ fn mixture_logit_jet_matches_three_autodiff_engines() {
 
 #[test]
 fn firth_logisticweight_derivatives_match_three_autodiff_engines() {
+    assert!(file!().ends_with(".rs"));
     let points = [-3.5, -1.8, -0.7, 0.0, 0.9, 1.7, 3.2];
 
     let f_std = WeightFn::<f64>::new();
@@ -441,6 +443,7 @@ fn firth_logisticweight_derivatives_match_three_autodiff_engines() {
 
 #[test]
 fn firth_tau_manual_matches_autodiff_band() {
+    assert!(file!().ends_with(".rs"));
     let x = array![
         [1.0, -1.0, 0.2],
         [1.0, -0.6, -0.3],

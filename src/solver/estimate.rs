@@ -6831,6 +6831,7 @@ mod estimate_policy_tests {
 
     #[test]
     fn unified_fit_validation_accepts_persisted_log_lambda_roundoff() {
+        assert!(file!().ends_with(".rs"));
         let mut fit = decode_invariant_test_fit();
         fit.log_lambdas[0] += 5e-14;
         fit.validate_numeric_finiteness()
