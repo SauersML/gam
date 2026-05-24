@@ -11,4 +11,3 @@
 # Concurrent branches that both remove markers will produce additive
 # line-level diff conflicts that resolve by union — the next build
 # then re-validates each surviving entry.
-src/terms/basis.rs	pub fn build_bspline_basis_1d( data: ArrayView1<'_, f64>, spec: &BSplineBasisSpec, ) -> Result<BasisBuildResult, BasisError>	unreachable!
