@@ -312,6 +312,26 @@ fn main() {
         });
     }
 
+    if !feature_cfg_offenders.is_empty() {
+        sections.push(Section {
+            title: "#[cfg(feature = ...)] / #[cfg_attr(feature = ...)] (feature gating banned — autoderive paths from problem characteristics; do not branch the codebase on opt-in flags)".to_string(),
+            rows: feature_cfg_offenders
+                .iter()
+                .map(|(r, l, s)| (r.clone(), *l, None, s.clone()))
+                .collect(),
+        });
+    }
+
+    if !cargo_feature_offenders.is_empty() {
+        sections.push(Section {
+            title: "Cargo.toml [features] entry (feature definitions banned — delete the [features] section and the corresponding cfg-gates)".to_string(),
+            rows: cargo_feature_offenders
+                .iter()
+                .map(|(r, l, s)| (r.clone(), *l, None, s.clone()))
+                .collect(),
+        });
+    }
+
     if !should_panic_offenders.is_empty() {
         sections.push(Section {
             title: "#[should_panic] without `expected = \"...\"`".to_string(),
