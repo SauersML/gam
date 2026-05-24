@@ -53,7 +53,7 @@
 //! ```
 //!
 //! and the local Hessian block is `(K + Σ_k d_k) × (K + Σ_k d_k)`,
-//! block-diagonal across `n`. Piece 1's `solve_arrow_newton_step` Schur
+//! block-diagonal across `n`. Piece 1's `solve_arrow_newton_step_with_options` Schur
 //! elimination generalises by:
 //!
 //! 1. Eliminating shared β = `(B_1, …, B_K)` first (the existing inner
@@ -128,7 +128,7 @@
 //!
 //! ## Integration hooks to other pieces
 //!
-//! * Piece 1 (`arrow_schur.rs`, `solve_arrow_newton_step`): consumed by the
+//! * Piece 1 (`arrow_schur.rs`, `solve_arrow_newton_step_with_options`): consumed by the
 //!   first-class SAE-manifold assembler in
 //!   [`crate::terms::sae_manifold::SaeManifoldTerm::assemble_arrow_schur`].
 //! * Piece 4 (`SparsityPenalty`): consumed as a black box via the
