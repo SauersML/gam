@@ -2103,7 +2103,8 @@ impl AnalyticPenalty for SparsityPenalty {
 /// REML-selectable log-precision per axis. Penalty contribution for axis `j`:
 ///
 /// ```text
-///   P_j(t; ρ) = ½ α_j · ‖t[:, j]‖² - (n_eff / 2) · log α_j, α_j = weight · exp(ρ_j)
+///   P_j(t; ρ) = ½ α_j · ‖t[:, j]‖² - (n_eff / 2) · log α_j,
+///   α_j = weight · exp(ρ_j)
 /// ```
 ///
 /// summed over `j ∈ [0, d)`. Under REML, axis `j` whose data evidence is too
