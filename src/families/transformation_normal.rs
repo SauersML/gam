@@ -535,7 +535,9 @@ fn build_transformation_row_derived(
                         ) }.into());
                     }
                 }
-                unreachable!("non-finite branch must have produced an error above");
+                return Err(TransformationNormalError::NonFinite { reason: format!(
+                    "TransformationNormalFamily row_quantities: row {i} entered non-finite branch but no named field was non-finite; h'={hp}",
+                ) }.into());
             }
             Ok((row_ll, q))
         })
@@ -782,7 +784,17 @@ fn factorial(n: usize) -> f64 {
         2 => 2.0,
         3 => 6.0,
         4 => 24.0,
-        _ => unreachable!("CTN normalizer derivatives only need order <= 4"),
+        // CTN normalizer derivatives only need order <= 4; compute generically
+        // as a safe fallback for any unexpected higher orders.
+        other => {
+            let mut acc = 24.0_f64;
+            let mut k = 5usize;
+            while k <= other {
+                acc *= k as f64;
+                k += 1;
+            }
+            acc
+        }
     }
 }
 
