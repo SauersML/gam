@@ -3,7 +3,9 @@ use crate::faer_ndarray::{
     FaerCholesky, FaerEigh, fast_ab, fast_atb, fast_xt_diag_x, fast_xt_diag_y,
 };
 use faer::Side;
-use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayViewMut1, ArrayViewMut2, Axis, s};
+use ndarray::{
+    Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayViewMut1, ArrayViewMut2, Axis, s,
+};
 use rayon::prelude::*;
 use std::sync::Once;
 
@@ -512,18 +514,20 @@ pub fn gaussian_reml_multi_closed_form_batch<'a>(
             dense_xt_diag_x(problem.x.view(), weight.view())
         })
         .collect();
-    // Phase B: one batched cuSOLVER Cholesky (when policy approves uniform p
-    // and K aggregate FLOPs), per-fit Cholesky fallback otherwise.
+    // Phase B: one batched cuSOLVER Cholesky when policy approves uniform p
+    // and K aggregate FLOPs; otherwise the cache builder uses the normal
+    // per-fit non-GPU factorization path.
     let caches =
         build_gaussian_reml_eigen_cache_batched(xtwx_per_problem, penalty.view(), nullspace_dim);
-    // Phase C: par_iter finish each fit with its prebuilt cache, falling
-    // back to a fresh build when the cache build failed for that element.
+    // Phase C: par_iter finish each fit with its prebuilt cache. A cache-build
+    // error is a real per-problem error, not a signal to rebuild through a
+    // second path.
     let fits: Vec<Result<GaussianRemlMultiResult, EstimationError>> = problems
         .par_iter()
         .zip(caches.into_par_iter())
         .map(|(problem, cache_result)| {
             let init_lambda = problem.init_rho.map(f64::exp);
-            let cache = cache_result.ok();
+            let cache = cache_result?;
             gaussian_reml_multi_closed_form_from_parts(
                 problem.x.view(),
                 problem.y.view(),
@@ -531,7 +535,7 @@ pub fn gaussian_reml_multi_closed_form_batch<'a>(
                 nullspace_dim,
                 problem.weights.as_ref().map(|weights| weights.view()),
                 init_lambda,
-                cache.as_ref(),
+                Some(&cache),
             )
         })
         .collect();
@@ -1597,10 +1601,7 @@ pub fn build_gaussian_reml_eigen_cache_batched(
         .collect();
 
     let p = xtwx_matrices[0].nrows();
-    let uniform_square = p > 0
-        && xtwx_matrices
-            .iter()
-            .all(|matrix| matrix.dim() == (p, p));
+    let uniform_square = p > 0 && xtwx_matrices.iter().all(|matrix| matrix.dim() == (p, p));
     if uniform_square && k > 1 {
         let mut lower_matrices = xtwx_matrices.clone();
         if crate::gpu::try_cholesky_batched_lower_inplace(&mut lower_matrices).is_some() {
@@ -1839,11 +1840,12 @@ fn gaussian_reml_eigen_cache_from_lower_with_transform(
         .count();
     let nullity = p - penalty_rank;
     if let Some(expected_nullity) = nullspace_dim
-        && expected_nullity != nullity {
-            return Err(EstimationError::InvalidInput(format!(
-                "Gaussian REML penalty nullspace mismatch: expected {expected_nullity}, inferred {nullity}"
-            )));
-        }
+        && expected_nullity != nullity
+    {
+        return Err(EstimationError::InvalidInput(format!(
+            "Gaussian REML penalty nullspace mismatch: expected {expected_nullity}, inferred {nullity}"
+        )));
+    }
     let logdet_penalty_positive = gaussian_penalty_positive_logdet(penalty, penalty_rank)?;
     let coefficient_basis = solve_upper_triangular_matrix(&lower.t().to_owned(), &eigenvectors)?;
 
@@ -2040,12 +2042,13 @@ fn prepare_gaussian_reml(
             ));
         }
         if let Some(expected_nullity) = nullspace_dim
-            && expected_nullity != cache.nullity {
-                return Err(EstimationError::InvalidInput(format!(
-                    "Gaussian REML eigen cache nullspace mismatch: expected {expected_nullity}, got {}",
-                    cache.nullity
-                )));
-            }
+            && expected_nullity != cache.nullity
+        {
+            return Err(EstimationError::InvalidInput(format!(
+                "Gaussian REML eigen cache nullspace mismatch: expected {expected_nullity}, got {}",
+                cache.nullity
+            )));
+        }
         if n <= cache.nullity {
             return Err(EstimationError::InvalidInput(format!(
                 "Gaussian REML requires n > nullspace dimension; got n={n}, nullity={}",
