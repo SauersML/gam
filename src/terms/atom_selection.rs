@@ -140,7 +140,7 @@
 
 use ndarray::{Array1, Array2, ArrayView1};
 
-use crate::terms::analytic_penalties::SparsityPenalty;
+use crate::terms::analytic_penalties::{AnalyticPenalty, SparsityPenalty};
 use crate::terms::atom_codes::{BitVec, SparseAtomCode, SparseAtomCodes};
 use crate::terms::latent_coord::LatentCoordValues;
 
@@ -491,13 +491,22 @@ impl AtomSelectionStrategy for EntropicSoftmax {
     fn backward(
         &self,
         free_amplitudes_row: ArrayView1<'_, f64>,
-        _: &SparseAtomCode,
+        atom_code: &SparseAtomCode,
         grad_a_row: ArrayView1<'_, f64>,
     ) -> Array1<f64> {
         assert_eq!(
             grad_a_row.len(),
             free_amplitudes_row.len(),
             "EntropicSoftmax backward gradient length mismatch"
+        );
+        assert_eq!(
+            atom_code.k_atoms(),
+            free_amplitudes_row.len(),
+            "EntropicSoftmax backward code/free-amplitude length mismatch"
+        );
+        assert!(
+            atom_code.weights.iter().all(|weight| weight.is_finite()),
+            "EntropicSoftmax backward requires finite assignment weights"
         );
         // Recompute softmax (cheap; alternative is to cache it in the code,
         // but that conflates the masked weights with the *unmasked* softmax
@@ -510,10 +519,19 @@ impl AtomSelectionStrategy for EntropicSoftmax {
 impl AssignmentSparsityCoupling for EntropicSoftmax {
     fn penalty_value_and_grad(
         &self,
-        _: &SparsityPenalty,
+        sparsity_penalty: &SparsityPenalty,
         free_amplitudes_row: ArrayView1<'_, f64>,
-        _: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
     ) -> (f64, Array1<f64>) {
+        assert_eq!(
+            rho.len(),
+            sparsity_penalty.rho_count(),
+            "EntropicSoftmax sparsity rho length mismatch"
+        );
+        assert!(
+            rho.iter().all(|value| value.is_finite()),
+            "EntropicSoftmax sparsity rho must be finite"
+        );
         // Entropic-softmax does not consume the L¹ sparsity penalty
         // directly; the entropy regularisation lives inside the strategy
         // itself. We return zero contribution here (Piece 4 sees nothing
@@ -608,10 +626,20 @@ impl AtomSelectionStrategy for TopK {
 
     fn backward(
         &self,
-        _: ArrayView1<'_, f64>,
+        free_amplitudes_row: ArrayView1<'_, f64>,
         code: &SparseAtomCode,
         grad_a_row: ArrayView1<'_, f64>,
     ) -> Array1<f64> {
+        assert_eq!(
+            free_amplitudes_row.len(),
+            grad_a_row.len(),
+            "TopK backward free-amplitude/gradient length mismatch"
+        );
+        assert_eq!(
+            code.k_atoms(),
+            grad_a_row.len(),
+            "TopK backward code/gradient length mismatch"
+        );
         self.backward_straight_through(code, grad_a_row)
     }
 }
@@ -619,10 +647,19 @@ impl AtomSelectionStrategy for TopK {
 impl AssignmentSparsityCoupling for TopK {
     fn penalty_value_and_grad(
         &self,
-        _: &SparsityPenalty,
+        sparsity_penalty: &SparsityPenalty,
         free_amplitudes_row: ArrayView1<'_, f64>,
-        _: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
     ) -> (f64, Array1<f64>) {
+        assert_eq!(
+            rho.len(),
+            sparsity_penalty.rho_count(),
+            "TopK sparsity rho length mismatch"
+        );
+        assert!(
+            rho.iter().all(|value| value.is_finite()),
+            "TopK sparsity rho must be finite"
+        );
         // Cardinality is enforced structurally; no smooth penalty consumed.
         let k = free_amplitudes_row.len();
         (0.0, Array1::<f64>::zeros(k))
@@ -713,7 +750,6 @@ impl AssignmentSparsityCoupling for L1Relaxed {
         free_amplitudes_row: ArrayView1<'_, f64>,
         rho: ArrayView1<'_, f64>,
     ) -> (f64, Array1<f64>) {
-        use crate::terms::analytic_penalties::AnalyticPenalty;
         // Apply the smoothed-L¹ to the non-negative free amplitudes
         // directly. Negative entries map to zero in the forward pass; for
         // the penalty we evaluate on the *clipped* values to keep the
