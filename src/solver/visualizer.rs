@@ -978,11 +978,6 @@ impl VisualizerSession {
         !matches!(&*lock_state(&self.state), VisualizerState::Disabled)
     }
 
-    #[cfg(test)]
-    pub(crate) fn is_interactive(&self) -> bool {
-        matches!(&*lock_state(&self.state), VisualizerState::Interactive(_))
-    }
-
     pub fn update(
         &mut self,
         cost: f64,
