@@ -14922,7 +14922,7 @@ fn try_exact_joint_spatial_aniso_optimization(
     // optimization for `n > 50_000` and `ψ_dim > 30` instead of forcing the
     // obsolete HybridEFS compatibility path.
     let analytic_outer_hessian_available =
-        exact_joint_spatial_outer_hessian_available(family, baseline_design);
+        exact_joint_spatial_outer_hessian_available(&family, baseline_design);
     if !analytic_outer_hessian_available {
         log::info!(
             "[spatial-aniso-joint] analytic outer Hessian unavailable for family/design; routing without second-order geometry (psi_dim={psi_dim})"
@@ -15277,7 +15277,7 @@ fn try_exact_joint_spatial_isotropic_optimization(
     // `HessianResult::Operator` and routed through ARC's HVP trust-region
     // path instead of being downgraded to HybridEFS.
     let analytic_outer_hessian_available =
-        exact_joint_spatial_outer_hessian_available(family, baseline_design);
+        exact_joint_spatial_outer_hessian_available(&family, baseline_design);
     let prefer_gradient_only = false;
 
     log::trace!(
@@ -24058,10 +24058,10 @@ mod tests {
                 .expect("reused eval");
 
                 let fresh_opts = external_opts_for_design(
-                    LikelihoodSpec::new(
-                ResponseFamily::Gaussian,
-                InverseLink::Standard(LinkFunction::Identity),
-            ),
+                    &LikelihoodSpec::new(
+                        ResponseFamily::Gaussian,
+                        InverseLink::Standard(LinkFunction::Identity),
+                    ),
                     cache.design(),
                     &fit_opts,
                 );
