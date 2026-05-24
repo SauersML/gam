@@ -14119,50 +14119,7 @@ fn validate_lat_lon_matrix(
     Ok(())
 }
 
-// ============================================================================
-// Polylogarithms Li_2, Li_3 for z ∈ [0, 1] (used by Sobolev-kernel closed
-// forms below).  Accuracy: ≤ 1e-13 absolute over the whole domain.
-// ============================================================================
-
-/// Dilogarithm `Li_2(z) = Σ_{k≥1} z^k / k²` for `z ∈ [0, 1]`.
-///
-/// For `z ∈ [0, 1/2]` we sum the series directly (rapid geometric decay).
-/// For `z ∈ (1/2, 1]` we use the Euler reflection
-///   `Li_2(z) = π²/6 − ln(z) · ln(1 − z) − Li_2(1 − z)`
-/// so the series argument is back in `[0, 1/2)`.
-#[inline]
-fn dilog_unit(z: f64) -> f64 {
-    if !z.is_finite() {
-        return f64::NAN;
-    }
-    let z = z.clamp(0.0, 1.0);
-    if z == 0.0 {
-        return 0.0;
-    }
-    if z >= 1.0 {
-        return std::f64::consts::PI * std::f64::consts::PI / 6.0;
-    }
-    if z <= 0.5 {
-        let mut sum = 0.0_f64;
-        let mut zk = z;
-        for k in 1..=200 {
-            let kf = k as f64;
-            let term = zk / (kf * kf);
-            sum += term;
-            if term < 1e-18 {
-                break;
-            }
-            zk *= z;
-        }
-        sum
-    } else {
-        let one_minus_z = 1.0 - z;
-        let pi2_6 = std::f64::consts::PI * std::f64::consts::PI / 6.0;
-        pi2_6 - z.ln() * one_minus_z.ln() - dilog_unit(one_minus_z)
-    }
-}
-
-/// Trilogarithm `Li_3(z) = Σ_{k≥1} z^k / k³` for `z ∈ [0, 1]`.
+/// True Wahba / Sobolev spectral reproducing kernel on S² for general m.
 ///
 /// Direct power series with early exit. For `z ∈ [0, 0.5]` ~50 terms
 /// reach 1e-15; for `z ∈ (0.5, 1)` we raise the cap to 5000, which gives
@@ -14294,62 +14251,23 @@ fn wahba_sphere_kernel_sobolev_spectral(cos_gamma: f64, m: usize) -> f64 {
     sum
 }
 
-// ============================================================================
-// Wahba 1981 pseudo-spline closed forms (mgcv `bs="sos"` compatible).
-// ============================================================================
-//
-// These polynomials in
-//   w = (1 − cos γ) / 2 = sin²(γ/2)
-//   c = 2 sin(γ/2)
-//   a = ln(1 + 1 / sin(γ/2))
-// are the reproducing kernels for the RKHS with Legendre weights
-//   a_l = 2 / [(l+1)(l+2) ··· (l+m+1)]   (l ≥ 1)
-// (decay rate `l^{−(m+1)}`, different from the Sobolev kernel's
-// `l^{−2m}`). The forms are a verbatim port of mgcv's `makeR()` function
-// and are bit-compatible with `bs="sos"` in R.
-
+/// SIMD-vectorised companion to `wahba_sphere_kernel_from_cos`. Each lane of
+/// `cos_gamma` produces one kernel value. Numerical agreement with the
+/// scalar path is exercised by the in-file unit test
+/// `wahba_sphere_kernel_simd_matches_scalar_within_documented_tolerance`.
 #[inline]
-fn wahba_sphere_kernel_pseudo_from_cos(cos_gamma: f64, m: usize) -> f64 {
-    let cg = cos_gamma.clamp(-1.0, 1.0);
-    let z = (1.0 - cg).max(f64::EPSILON * 1.0e-4);
-    let w = 0.5 * z;
-    let c0 = w.sqrt();
-    let a = (1.0 + 1.0 / c0).ln();
-    let c = 2.0 * c0;
-    let two_pi = 2.0 * std::f64::consts::PI;
-    match m {
-        1 => {
-            let q1 = 2.0 * a * w - c + 1.0;
-            (q1 - 0.5) / two_pi
-        }
-        2 => {
-            let w2 = w * w;
-            let q2 = a * (6.0 * w2 - 2.0 * w) - 3.0 * c * w + 3.0 * w + 0.5;
-            (q2 / 2.0 - 1.0 / 6.0) / two_pi
-        }
-        3 => {
-            let w2 = w * w;
-            let w3 = w2 * w;
-            let q3 = (a * (60.0 * w3 - 36.0 * w2) + 30.0 * w2 + c * (8.0 * w - 30.0 * w2)
-                - 3.0 * w
-                + 1.0)
-                / 3.0;
-            (q3 / 6.0 - 1.0 / 24.0) / two_pi
-        }
-        _ => {
-            // m = 4 (and any future m): use the explicit q_4 form from
-            // mgcv `makeR`. q_4 / 24 − 1 / 120, divided by 2π.
-            let w2 = w * w;
-            let w3 = w2 * w;
-            let w4 = w3 * w;
-            let q4 = a * (70.0 * w4 - 60.0 * w3 + 6.0 * w2)
-                + 35.0 * w3 * (1.0 - c)
-                + c * 55.0 * w2 / 3.0
-                - 12.5 * w2
-                - w / 3.0
-                + 0.25;
-            (q4 / 24.0 - 1.0 / 120.0) / two_pi
-        }
+fn wahba_sphere_kernel_from_cos_simd(cos_gamma: wide::f64x4, penalty_order: usize) -> wide::f64x4 {
+    use wide::f64x4;
+    let cg = cos_gamma.fast_max(f64x4::from(-1.0)).fast_min(f64x4::ONE);
+    // Spectral kernel does not benefit from the (1 - cos γ) closed-form
+    // substitution; delegate each lane to the scalar spectral routine.
+    // True SIMD-vectorization of the Legendre recurrence is possible but
+    // not worthwhile for the existing call sites.
+    let lanes = cg.to_array();
+    if (1..=4).contains(&penalty_order) {
+        f64x4::from(lanes.map(|x| wahba_sphere_kernel_spectral(x, penalty_order)))
+    } else {
+        f64x4::from(f64::NAN)
     }
 }
 
