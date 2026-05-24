@@ -6567,6 +6567,106 @@ fn gaussian_reml_fit_formula_table_impl(
     .map_err(|err| err.to_string())
 }
 
+fn gaussian_reml_formula_table_dense_fisher(
+    x: ArrayView2<'_, f64>,
+    y: ArrayView2<'_, f64>,
+    penalty: ArrayView2<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    fisher_w: ArrayView3<'_, f64>,
+) -> Result<gam::gaussian_reml::GaussianRemlMultiResult, String> {
+    let n = x.nrows();
+    let k = x.ncols();
+    let p_out = y.ncols();
+    if y.nrows() != n {
+        return Err(format!(
+            "dense Fisher formula response row mismatch: formula design has {n} rows but Y has {}",
+            y.nrows()
+        ));
+    }
+    validate_dense_fisher_w(n, p_out, fisher_w)?;
+    if weights.len() != n {
+        return Err(format!(
+            "dense Fisher formula weight length mismatch: expected {n}, got {}",
+            weights.len()
+        ));
+    }
+    if weights.iter().any(|v| !v.is_finite() || *v < 0.0) {
+        return Err("dense Fisher formula weights must be finite and non-negative".to_string());
+    }
+
+    let mut x_weighted = Array2::<f64>::zeros((n * p_out, k * p_out));
+    let mut y_weighted = Array2::<f64>::zeros((n * p_out, 1));
+    for row in 0..n {
+        let mut block = fisher_w.slice(s![row, .., ..]).to_owned();
+        for a in 0..p_out {
+            for b in (a + 1)..p_out {
+                let avg = 0.5 * (block[[a, b]] + block[[b, a]]);
+                block[[a, b]] = avg;
+                block[[b, a]] = avg;
+            }
+        }
+        let lower = block
+            .cholesky(Side::Lower)
+            .map_err(|err| {
+                format!("fisher_rao_w row {row} must be positive-definite for dense REML: {err}")
+            })?
+            .lower_triangular();
+        let scale = weights[row].sqrt();
+        for metric_axis in 0..p_out {
+            let stacked_row = row * p_out + metric_axis;
+            let mut y_value = 0.0;
+            for output in 0..p_out {
+                let l_t = scale * lower[[output, metric_axis]];
+                y_value += l_t * y[[row, output]];
+                let col_offset = output * k;
+                for col in 0..k {
+                    x_weighted[[stacked_row, col_offset + col]] = l_t * x[[row, col]];
+                }
+            }
+            y_weighted[[stacked_row, 0]] = y_value;
+        }
+    }
+
+    let mut block_penalty = Array2::<f64>::zeros((k * p_out, k * p_out));
+    for output in 0..p_out {
+        let offset = output * k;
+        for row in 0..k {
+            for col in 0..k {
+                block_penalty[[offset + row, offset + col]] = penalty[[row, col]];
+            }
+        }
+    }
+    let mut fit = gam::gaussian_reml::gaussian_reml_multi_closed_form(
+        x_weighted.view(),
+        y_weighted.view(),
+        block_penalty.view(),
+        None,
+        None,
+    )
+    .map_err(|err| err.to_string())?;
+
+    let mut coefficients = Array2::<f64>::zeros((k, p_out));
+    for output in 0..p_out {
+        for col in 0..k {
+            coefficients[[col, output]] = fit.coefficients[[output * k + col, 0]];
+        }
+    }
+    let fitted = x.dot(&coefficients);
+    let denom = n.saturating_sub(k).max(1) as f64;
+    let mut sigma2 = Array1::<f64>::zeros(p_out);
+    for row in 0..n {
+        for output in 0..p_out {
+            let resid = y[[row, output]] - fitted[[row, output]];
+            sigma2[output] += weights[row] * resid * resid;
+        }
+    }
+    sigma2.mapv_inplace(|v| v / denom);
+    fit.coefficients = coefficients;
+    fit.fitted = fitted;
+    fit.sigma2 = sigma2;
+    Ok(fit)
+}
+
 fn global_penalty_from_block(
     p: usize,
     penalty: &gam::smooth::BlockwisePenalty,

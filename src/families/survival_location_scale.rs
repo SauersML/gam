@@ -10762,7 +10762,7 @@ pub(crate) fn fit_survival_location_scale_terms(
     // pays for a stalled fixed-point attempt before landing on BFGS.
     let outer_policy = {
         let psi_dim = joint_setup.theta0().len() - joint_setup.rho_dim();
-        let _ = psi_dim;
+        drop(psi_dim);
         let capability = if analytic_joint_hessian_available {
             crate::families::custom_family::ExactOuterDerivativeOrder::Second
         } else {
