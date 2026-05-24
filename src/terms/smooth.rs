@@ -15667,7 +15667,6 @@ pub fn get_spatial_length_scale(spec: &TermCollectionSpec, term_idx: usize) -> O
 ///
 /// This is the single canonical freezer — every model-save path should call
 /// this rather than rolling ad-hoc freezing logic.
-
 fn freeze_inner_smooth_basis_from_metadata(
     basis: &mut SmoothBasisSpec,
     metadata: &BasisMetadata,
