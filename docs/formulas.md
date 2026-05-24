@@ -95,22 +95,8 @@ y ~ sz(subject, time)                    # alias for bs="sz"
 y ~ group(subject) + s(subject, time, bs="re")  # random intercept + slope
 ```
 
-`group()` / `re()` adds a random intercept per level of the grouping column.
-The column may be string- or integer-valued, and saved models freeze the observed
-level set so unseen prediction levels contribute zero.
-
-`by=` smooths multiply an ordinary smooth by a numeric column or by factor-level
-indicators. Numeric `by=` terms are a single varying-coefficient smooth. Factor
-`by=` terms create one smooth block per retained level; include the factor main
-effect (for example `+ treatment` or `+ group(subject)`) when level means should
-be estimated separately.
-
-`bs="fs"` builds factor-smooth interactions for hierarchical trajectories: each
-level gets its own curve and the whole block is ridge-penalized, including the
-low-order/null-space components, so per-level intercepts and slopes shrink.
-`bs="sz"` builds sum-to-zero deviations that pair naturally with a population
-main-effect smooth. `bs="re"` on a factor/numeric pair is the random-slope
-special case.
+Adds a random intercept per level of the grouping column. The column may be
+string- or integer-valued. Random slopes are supported with `s(x, group, bs="re")`, usually paired with `group(group)` for random intercepts.
 
 ## Univariate smooths
 
@@ -465,4 +451,15 @@ Pair it with `survival_likelihood=` on `fit()`. See
 "y ~ smooth(x) + group(site)"
 ```
 
-* [Difference smooths](difference-smooths.md)
+
+## Factor smooths and by-smooths
+
+GAM formulas support mgcv-style factor-conditioned smooths:
+
+- `s(x, by=z)` scales one smooth of `x` by numeric covariate `z`.
+- `s(x, by=fac)` creates one smooth block per observed factor level. Unseen prediction levels contribute zero for that by-smooth.
+- `s(x, fac, bs="fs")` (or `fs(x, fac)`) creates ridge-penalized factor smooth interactions for partial-pooling style per-group curves; unseen groups contribute zero from the factor-smooth term.
+- `s(x, fac, bs="sz")` (or `sz(x, fac)`) uses sum-to-zero contrasts across factor levels for deviation smooths that can be paired with a population `s(x)`.
+- `s(x, group, bs="re")` builds a random-slope block; use `group(group)` as a companion term when random intercepts are needed.
+
+These terms preserve frozen factor levels in saved model specifications so prediction does not drift when new data omits a training level or contains an unseen level.
