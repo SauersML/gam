@@ -18602,7 +18602,7 @@ pub fn build_duchon_basis_log_kappa_derivativeswithworkspace(
     spec: &DuchonBasisSpec,
     workspace: &mut BasisWorkspace,
 ) -> Result<BasisPsiDerivativeBundle, BasisError> {
-    if spec.periodic {
+    if spec.periodic.is_some() {
         return build_periodic_duchon_basis_log_kappa_derivativeswithworkspace(
             data, spec, workspace,
         );
@@ -19144,6 +19144,7 @@ fn build_cyclic_duchon_basis_1dwithworkspace(
         metadata: BasisMetadata::Duchon {
             centers,
             length_scale: spec.length_scale,
+            periodic: Some(vec![Some(period)]),
             power: spec.power,
             nullspace_order: DuchonNullspaceOrder::Zero,
             identifiability_transform,
@@ -20318,6 +20319,7 @@ fn build_periodic_duchon_basis_1d(
         metadata: BasisMetadata::Duchon {
             centers,
             length_scale: spec.length_scale,
+            periodic: Some(vec![Some(period)]),
             power: spec.power,
             nullspace_order: effective_nullspace_order,
             identifiability_transform,
@@ -20567,6 +20569,15 @@ fn build_duchon_basis_mixed_periodicity(
         metadata: BasisMetadata::Duchon {
             centers: centers_owned,
             length_scale: None,
+            // `periods[j]` is always present; the metadata convention is
+            // `Some(period)` only for axes the caller marked periodic.
+            periodic: Some(
+                periodic_per_axis
+                    .iter()
+                    .zip(periods.iter())
+                    .map(|(&is_periodic, &period)| if is_periodic { Some(period) } else { None })
+                    .collect(),
+            ),
             power: spec.power,
             nullspace_order: effective_nullspace_order,
             identifiability_transform,
@@ -20649,7 +20660,7 @@ pub fn build_duchon_basiswithworkspace(
     }
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
     assert_spatial_centers_below_biobank_cap(data.nrows(), data.ncols(), centers.view())?;
-    if spec.periodic {
+    if spec.periodic.is_some() {
         return build_periodic_duchon_basis_1d(data, spec, centers, workspace);
     }
     // Auto-degrade the requested null-space order to Zero when the selected
