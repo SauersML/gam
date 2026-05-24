@@ -121,9 +121,10 @@ pub(crate) const fn bytes_for_f64(len: usize) -> usize {
 }
 
 pub(crate) const fn gemm_flops(m: usize, n: usize, k: usize) -> u64 {
+    let k_eff = if k == 0 { 1 } else { k };
     (m as u64)
         .saturating_mul(n as u64)
-        .saturating_mul(k.max(1) as u64)
+        .saturating_mul(k_eff as u64)
         .saturating_mul(2)
 }
 
