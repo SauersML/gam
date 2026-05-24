@@ -102,13 +102,6 @@ gamfit/*.dSYM/
 site/
 .cache/
 
-# Lean/Lake build artifacts
-.lake/
-*.olean
-*.olean.trace
-*.ilean
-*.c
-
 # Agent prompts (local scratch)
 prompts/
 
