@@ -532,6 +532,13 @@ fn banned_substrings() -> &'static [(&'static str, &'static str, bool)] {
         // `assert_eq!` / real predicates, production code uses `Result`.
         ("assert!(true)", "assert!(true)", false),
         ("assert!(false)", "assert!(false)", false),
+        // `file!().ends_with(".rs")` is a tautological assertion (the
+        // compile-time `file!()` macro always returns the `.rs` source
+        // path) commonly used to satisfy `scan_for_useless_tests` without
+        // actually asserting anything about the unit under test. Strict
+        // everywhere — tests must verify a real property.
+        ("file!().ends_with(\".rs\")", "file!().ends_with(\".rs\")", false),
+        ("file!().ends_with(\".rs\"", "file!().ends_with(\".rs\"", false),
         // Process termination bypasses `Drop`. Build.rs uses
         // `std::process::exit(1)` legitimately at end-of-report and is
         // already exempt from every scanner.
@@ -1684,6 +1691,62 @@ fn scan_for_ignored_tests(root: &Path, dir: &Path, offenders: &mut Vec<(PathBuf,
 
 /// Walk `dir` recursively, calling `visitor(rel_path, content)` for every
 /// scannable file. Centralizes the directory-skip and extension rules.
+/// Flag every `vendor/` directory under `root` as a build-stop violation.
+/// Walks the tree manually instead of riding `visit_files` so the
+/// directory walker's own blocklist (which intentionally skips dotfiles,
+/// build artifacts, etc.) does not silence this rule, and so an empty
+/// `vendor/` is still reported.
+fn scan_for_vendor_directories(
+    root: &Path,
+    dir: &Path,
+    offenders: &mut Vec<(PathBuf, usize, String)>,
+) {
+    let read = match fs::read_dir(dir) {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    for entry in read.flatten() {
+        let path = entry.path();
+        let name = path.file_name().and_then(OsStr::to_str).unwrap_or("");
+        // Skip the same housekeeping noise `visit_files` skips, so we don't
+        // descend into `.git`, `target/`, or the lake/python caches just to
+        // chase a phantom `vendor/`.
+        if name.starts_with('.')
+            || name == "target"
+            || name.starts_with("target-")
+            || name == "node_modules"
+            || name == "__pycache__"
+            || name == "pydeps"
+            || name == "site-packages"
+            || name == "venv"
+            || name == "dist"
+            || name == "build"
+            || name == "site"
+        {
+            continue;
+        }
+        if !path.is_dir() {
+            continue;
+        }
+        if name == "vendor" {
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .to_path_buf();
+            offenders.push((
+                rel,
+                1,
+                "vendored crates are forbidden; depend on crates.io or `git = \"…\"` in Cargo.toml"
+                    .to_string(),
+            ));
+            // Don't descend into a forbidden tree — one report per vendor/
+            // root is enough.
+            continue;
+        }
+        scan_for_vendor_directories(root, &path, offenders);
+    }
+}
+
 fn visit_files(root: &Path, dir: &Path, visitor: &mut dyn FnMut(&Path, &str)) {
     let read = match fs::read_dir(dir) {
         Ok(r) => r,
