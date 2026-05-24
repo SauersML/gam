@@ -3993,6 +3993,96 @@ fn body_is_trivial_sentinel(body: &str) -> bool {
     false
 }
 
+/// Strip a leading sequence of "fake validation" statements from a body
+/// expression and return the tail. A statement is consumed if it is
+/// either a complete `assert*!(...);` invocation or an
+/// `if <expr>.is_empty() { return <expr>; }` early-return guard.
+/// Loops until no further prefix matches. Whitespace between statements
+/// is tolerated. If nothing matches, returns the input unchanged so the
+/// caller's existing sentinel check still fires.
+fn strip_validation_prologue(body: &str) -> &str {
+    let mut s = body.trim_start();
+    loop {
+        if let Some(rest) = strip_leading_assert_call(s) {
+            s = rest.trim_start();
+            continue;
+        }
+        if let Some(rest) = strip_leading_empty_check_early_return(s) {
+            s = rest.trim_start();
+            continue;
+        }
+        break;
+    }
+    s
+}
+
+/// Match a leading `assert!(...);` / `assert_eq!(...);` / `assert_ne!(...);`
+/// invocation with balanced parens and a trailing semicolon. Returns the
+/// remainder past the `;`, or `None` if no match.
+fn strip_leading_assert_call(s: &str) -> Option<&str> {
+    for prefix in ["assert!(", "assert_eq!(", "assert_ne!("] {
+        let Some(after_open) = s.strip_prefix(prefix) else {
+            continue;
+        };
+        let bytes = after_open.as_bytes();
+        let mut depth: i32 = 1;
+        let mut i = 0usize;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let after = after_open[i + 1..].trim_start();
+                        return after.strip_prefix(';');
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        return None;
+    }
+    None
+}
+
+/// Match a leading `if <expr>.is_empty() { return <expr>; }` guard, where
+/// the condition mentions `.is_empty()` and the gated block is exactly a
+/// single `return ...;` statement. Returns the remainder past the closing
+/// brace, or `None` if no match.
+fn strip_leading_empty_check_early_return(s: &str) -> Option<&str> {
+    let after_if = s.strip_prefix("if ")?;
+    let open_brace = after_if.find('{')?;
+    let cond = &after_if[..open_brace];
+    if !cond.contains(".is_empty()") {
+        return None;
+    }
+    let rest_after_brace = &after_if[open_brace + 1..];
+    let bytes = rest_after_brace.as_bytes();
+    let mut depth: i32 = 1;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    let inside = rest_after_brace[..i].trim();
+                    if inside.starts_with("return ")
+                        && inside.ends_with(';')
+                    {
+                        return Some(&rest_after_brace[i + 1..]);
+                    }
+                    return None;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
 /// True when `s` looks like a path expression: identifier chars, plus `::`,
 /// `<`, `>`, `,`, whitespace. Catches `Foo`, `path::Foo`, `Foo<T>`,
 /// `crate::path::Bar`.

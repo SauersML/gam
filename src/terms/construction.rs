@@ -263,7 +263,6 @@ fn penalty_from_root_faer(root: &Mat<f64>) -> Mat<f64> {
     sanitize_symmetric_faer(&full)
 }
 
-#[cfg(debug_assertions)]
 fn symmetrize_faer_matrix_in_place(matrix: &mut Mat<f64>) {
     let n = matrix.nrows().min(matrix.ncols());
     for i in 0..n {
@@ -275,7 +274,6 @@ fn symmetrize_faer_matrix_in_place(matrix: &mut Mat<f64>) {
     }
 }
 
-#[cfg(debug_assertions)]
 fn orthogonal_similarity_transform_faer(
     matrix: &Mat<f64>,
     block_dim: usize,
@@ -2180,7 +2178,6 @@ pub fn stable_reparameterizationwith_invariant(
         })
         .collect();
 
-    #[cfg(debug_assertions)]
     {
         // Guardrail: cross-check the primary Rayleigh-quotient contraction
         // against a full orthogonal similarity transform, while staying in
@@ -2229,7 +2226,6 @@ pub fn stable_reparameterizationwith_invariant(
         Par::Seq,
     );
 
-    #[cfg(debug_assertions)]
     {
         // Structural check: transformed S must not leak into declared null coordinates.
         let mut max_null_diag = 0.0_f64;
