@@ -854,7 +854,13 @@ pub fn build_smooth_basis(
             },
             "sz" => FactorSmoothFlavour::Sz,
             "re" => FactorSmoothFlavour::Re,
-            _ => unreachable!(),
+            // Outer `matches!` already restricts to fs/sz/re.
+            other => {
+                return Err(format!(
+                    "internal: factor-smooth flavour dispatch reached unexpected type `{}`",
+                    other
+                ));
+            }
         };
         return Ok(SmoothBasisSpec::FactorSmooth {
             spec: FactorSmoothSpec {

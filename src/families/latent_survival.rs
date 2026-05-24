@@ -1272,6 +1272,12 @@ fn latent_survival_basis_direction(primary_idx: usize) -> LatentSurvivalPrimaryD
             dmu: 0.0,
             dlog_sigma: 1.0,
         },
+        // SAFETY: latent survival has exactly `LATENT_SURVIVAL_PRIMARY_DIM`
+        // (= 5) primary directions, indexed 0..=4 via the module-private
+        // `LATENT_SURVIVAL_PRIMARY_*` constants. All five are matched
+        // above, so this wildcard fires only on an out-of-range index,
+        // which the internal iteration bounds (`0..LATENT_SURVIVAL_PRIMARY_DIM`)
+        // make unreachable.
         _ => panic!("invalid latent survival primary index {primary_idx}"),
     }
 }

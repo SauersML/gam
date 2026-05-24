@@ -3464,7 +3464,10 @@ fn evaluate_cell_state_dispatched<S>(
                     },
                     max_degree,
                 ),
-                ExactCellBranch::Sextic => unreachable!("sextic cannot be a lowered branch"),
+                ExactCellBranch::Sextic => Err(CubicCellKernelError::invalid_cell_shape(
+                    "internal: degenerate_sextic_branch returned Sextic as a lowered branch",
+                )
+                .into()),
             };
         }
     }
@@ -3525,7 +3528,10 @@ pub fn evaluate_cell_derivative_moments_uncached(
                     },
                     max_degree,
                 ),
-                ExactCellBranch::Sextic => unreachable!("sextic cannot be a lowered branch"),
+                ExactCellBranch::Sextic => Err(
+                    "internal: degenerate_sextic_branch returned Sextic as a lowered branch"
+                        .to_string(),
+                ),
             };
         }
     }

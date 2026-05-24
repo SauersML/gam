@@ -15452,6 +15452,12 @@ impl SurvivalMarginalSlopeFamily {
                 match (self, other) {
                     (Self::Dense(lhs), Self::Dense(rhs)) => *lhs += rhs,
                     (Self::Sparse(lhs), Self::Sparse(rhs)) => lhs.add_values(&rhs.values),
+                    // SAFETY: per-block accumulators are constructed from
+                    // the same `marginal_csr`/`logslope_csr` storage decision
+                    // at the top of `family_evaluate_blockwise`, so all
+                    // partial accumulators for one block share the same
+                    // Dense/Sparse variant; a mismatch here would mean a
+                    // newly-introduced partial picked the wrong storage.
                     _ => panic!("blockwise Hessian accumulator kind mismatch"),
                 }
             }
