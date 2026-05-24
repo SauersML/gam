@@ -21,7 +21,7 @@ use crate::custom_family::{ExactNewtonJointGradientEvaluation, ExactNewtonJointH
 use crate::solver::estimate::reml::unified::{
     HyperOperator, ProjectedFactorCache, ProjectedFactorKey,
 };
-use ndarray::{Array1, Array2, ArrayView2};
+use ndarray::{Array1, Array2, ArrayView2, s};
 use rayon::prelude::*;
 use std::sync::Arc;
 
