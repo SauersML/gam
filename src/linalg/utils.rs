@@ -16,7 +16,7 @@ use ndarray::{Array1, Array2, ArrayBase, ArrayView1, Data, Dimension, Zip};
 /// pure-hash flavour (single `u64 -> u64` with no externally retained
 /// state) use [`splitmix64_hash`].
 #[inline]
-pub(crate) fn splitmix64(state: &mut u64) -> u64 {
+pub(crate) const fn splitmix64(state: &mut u64) -> u64 {
     *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
     let mut z = *state;
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
