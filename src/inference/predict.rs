@@ -45,6 +45,104 @@ fn apply_family_inverse_link(
     strategy_for_family(family, link_kind).inverse_link_array(eta.view())
 }
 
+/// Build a `LikelihoodSpec` from a legacy `(LikelihoodFamily, Option<&InverseLink>)`
+/// pair as it appears at call sites in this file. For the parameterized binomial
+/// variants (`BinomialSas`, `BinomialBetaLogistic`, `BinomialMixture`,
+/// `BinomialLatentCLogLog`) the sibling `link_kind` carries the required state;
+/// when it is absent (or carries an inconsistent variant) we fall back to a
+/// `Standard(Logit)` link so downstream `match spec.response` arms still
+/// classify the response correctly. This is purely a local converter used to
+/// drive `match`es on `spec.response` / `spec.link`; no public API in this
+/// file changes shape.
+fn spec_from_family_link(
+    family: LikelihoodFamily,
+    link_kind: Option<&InverseLink>,
+) -> LikelihoodSpec {
+    use crate::types::LinkFunction;
+    match family {
+        LikelihoodFamily::GaussianIdentity => LikelihoodSpec {
+            response: ResponseFamily::Gaussian,
+            link: InverseLink::Standard(LinkFunction::Identity),
+        },
+        LikelihoodFamily::BinomialLogit => LikelihoodSpec {
+            response: ResponseFamily::Binomial,
+            link: InverseLink::Standard(LinkFunction::Logit),
+        },
+        LikelihoodFamily::BinomialProbit => LikelihoodSpec {
+            response: ResponseFamily::Binomial,
+            link: InverseLink::Standard(LinkFunction::Probit),
+        },
+        LikelihoodFamily::BinomialCLogLog => LikelihoodSpec {
+            response: ResponseFamily::Binomial,
+            link: InverseLink::Standard(LinkFunction::CLogLog),
+        },
+        LikelihoodFamily::PoissonLog => LikelihoodSpec {
+            response: ResponseFamily::Poisson,
+            link: InverseLink::Standard(LinkFunction::Log),
+        },
+        LikelihoodFamily::Tweedie { p } => LikelihoodSpec {
+            response: ResponseFamily::Tweedie { p },
+            link: InverseLink::Standard(LinkFunction::Log),
+        },
+        LikelihoodFamily::NegativeBinomial { theta } => LikelihoodSpec {
+            response: ResponseFamily::NegativeBinomial { theta },
+            link: InverseLink::Standard(LinkFunction::Log),
+        },
+        LikelihoodFamily::BetaLogit { phi } => LikelihoodSpec {
+            response: ResponseFamily::Beta { phi },
+            link: InverseLink::Standard(LinkFunction::Logit),
+        },
+        LikelihoodFamily::GammaLog => LikelihoodSpec {
+            response: ResponseFamily::Gamma,
+            link: InverseLink::Standard(LinkFunction::Log),
+        },
+        LikelihoodFamily::RoystonParmar => LikelihoodSpec {
+            response: ResponseFamily::RoystonParmar,
+            link: InverseLink::Standard(LinkFunction::Identity),
+        },
+        LikelihoodFamily::BinomialMixture => {
+            let link = match link_kind {
+                Some(InverseLink::Mixture(state)) => InverseLink::Mixture(state.clone()),
+                _ => InverseLink::Standard(LinkFunction::Logit),
+            };
+            LikelihoodSpec {
+                response: ResponseFamily::Binomial,
+                link,
+            }
+        }
+        LikelihoodFamily::BinomialSas => {
+            let link = match link_kind {
+                Some(InverseLink::Sas(state)) => InverseLink::Sas(state.clone()),
+                _ => InverseLink::Standard(LinkFunction::Logit),
+            };
+            LikelihoodSpec {
+                response: ResponseFamily::Binomial,
+                link,
+            }
+        }
+        LikelihoodFamily::BinomialBetaLogistic => {
+            let link = match link_kind {
+                Some(InverseLink::BetaLogistic(state)) => InverseLink::BetaLogistic(state.clone()),
+                _ => InverseLink::Standard(LinkFunction::Logit),
+            };
+            LikelihoodSpec {
+                response: ResponseFamily::Binomial,
+                link,
+            }
+        }
+        LikelihoodFamily::BinomialLatentCLogLog => {
+            let link = match link_kind {
+                Some(InverseLink::LatentCLogLog(state)) => InverseLink::LatentCLogLog(state.clone()),
+                _ => InverseLink::Standard(LinkFunction::CLogLog),
+            };
+            LikelihoodSpec {
+                response: ResponseFamily::Binomial,
+                link,
+            }
+        }
+    }
+}
+
 fn local_covariances_with_backend<F>(
     backend: &PredictionCovarianceBackend<'_>,
     n_rows: usize,
@@ -801,14 +899,15 @@ impl PredictableModel for StandardPredictor {
         let eta_upper = &pred.eta + &eta_z_se;
         let mut mean_lower = &pred.mean - &mean_z_se;
         let mut mean_upper = &pred.mean + &mean_z_se;
-        let (lo, hi) = match self.family {
-            crate::types::LikelihoodFamily::GaussianIdentity => (f64::NEG_INFINITY, f64::INFINITY),
-            crate::types::LikelihoodFamily::PoissonLog
-            | crate::types::LikelihoodFamily::Tweedie { .. }
-            | crate::types::LikelihoodFamily::NegativeBinomial { .. }
-            | crate::types::LikelihoodFamily::GammaLog => (0.0, f64::INFINITY),
-            crate::types::LikelihoodFamily::BetaLogit { .. } => (1e-10, 1.0 - 1e-10),
-            _ => (1e-10, 1.0 - 1e-10),
+        let spec = spec_from_family_link(self.family, self.link_kind.as_ref());
+        let (lo, hi) = match spec.response {
+            ResponseFamily::Gaussian => (f64::NEG_INFINITY, f64::INFINITY),
+            ResponseFamily::Poisson
+            | ResponseFamily::Tweedie { .. }
+            | ResponseFamily::NegativeBinomial { .. }
+            | ResponseFamily::Gamma => (0.0, f64::INFINITY),
+            ResponseFamily::Beta { .. } => (1e-10, 1.0 - 1e-10),
+            ResponseFamily::Binomial | ResponseFamily::RoystonParmar => (1e-10, 1.0 - 1e-10),
         };
         mean_lower.mapv_inplace(|v| v.clamp(lo, hi));
         mean_upper.mapv_inplace(|v| v.clamp(lo, hi));
@@ -4357,19 +4456,14 @@ pub fn enrich_posterior_mean_bounds(
     );
 
     // Clamp bounded-response families to [0, 1].
+    let spec = spec_from_family_link(family, link_kind);
     if matches!(
-        family,
-        crate::types::LikelihoodFamily::BinomialLogit
-            | crate::types::LikelihoodFamily::BinomialProbit
-            | crate::types::LikelihoodFamily::BinomialCLogLog
-            | crate::types::LikelihoodFamily::BinomialLatentCLogLog
-            | crate::types::LikelihoodFamily::BinomialSas
-            | crate::types::LikelihoodFamily::BinomialBetaLogistic
-            | crate::types::LikelihoodFamily::BinomialMixture
-            | crate::types::LikelihoodFamily::BetaLogit { .. }
-            | crate::types::LikelihoodFamily::RoystonParmar
+        spec.response,
+        ResponseFamily::Binomial
+            | ResponseFamily::Beta { .. }
+            | ResponseFamily::RoystonParmar
     ) {
-        let (lo, hi) = if matches!(family, crate::types::LikelihoodFamily::BetaLogit { .. }) {
+        let (lo, hi) = if matches!(spec.response, ResponseFamily::Beta { .. }) {
             (1e-10, 1.0 - 1e-10)
         } else {
             (0.0, 1.0)
