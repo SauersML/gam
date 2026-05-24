@@ -5291,7 +5291,7 @@ impl JointBetaRhoPosterior {
         &self,
         link_params: ndarray::ArrayView1<'_, f64>,
     ) -> Result<InverseLink, String> {
-        match &self.inverse_link {
+        match &self.likelihood.link {
             InverseLink::Sas(_) => {
                 if link_params.len() != 2 {
                     return Err(format!(
@@ -5325,7 +5325,7 @@ impl JointBetaRhoPosterior {
                 }))
             }
             InverseLink::Standard(_) | InverseLink::LatentCLogLog(_) => {
-                Ok(self.inverse_link.clone())
+                Ok(self.likelihood.link.clone())
             }
         }
     }

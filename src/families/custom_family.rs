@@ -20633,7 +20633,7 @@ mod tests {
     // ── Biobank-shape reproducer for the marginal-slope ρ-saturation
     // failure ────────────────────────────────────────────────────────────
     //
-    // Failure being investigated (see project_biobank_marginal_slope_failure.md):
+    // Failure being investigated:
     //   outer iter=60, |g|=4.18e13, three of four ρ-coords pinned at the
     //   box bound ±10 (`with_rho_bound(10.0)`). The dominant explicit term
     //   ½λβ'Sβ at biobank scale (n≈2e5, p≈60, β'Sβ~10⁴, λ=exp(10)≈22k) is

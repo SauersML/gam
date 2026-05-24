@@ -25,9 +25,8 @@
 
 use gam::estimate::{FitOptions, fit_gam};
 use gam::pirls::PirlsStatus;
-use gam::predict::predict_gam;
 use gam::smooth::BlockwisePenalty;
-use gam::types::LikelihoodFamily;
+use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily};
 use ndarray::{Array1, Array2};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -163,7 +162,10 @@ fn biobank_convergence_regression() {
         weights.view(),
         offset.view(),
         &s_list,
-        LikelihoodFamily::BinomialLogit,
+        LikelihoodSpec::new(
+            ResponseFamily::Binomial,
+            InverseLink::Standard(LinkFunction::Logit),
+        ),
         &FitOptions {
             latent_cloglog: None,
             mixture_link: None,
@@ -238,21 +240,7 @@ fn biobank_convergence_regression() {
     // (e) Fit must track the true generating η. Two complementary checks:
     //     correlation guards against shape collapse; mean-abs deviation guards
     //     against systematic bias / wrong scale. Both must hold.
-    let pred = predict_gam(
-        x_design.view(),
-        fit.beta.view(),
-        offset.view(),
-        LikelihoodFamily::BinomialLogit,
-    )
-    .expect("predict on training X");
-
-    // `pred.mean` is on the response scale (probabilities); compare on η-scale
-    // by converting back through logit so the threshold matches team-lead's
-    // spec for "correlation between predicted η and true η".
-    let pred_eta: Array1<f64> = pred.mean.mapv(|p| {
-        let pc = p.clamp(1e-12, 1.0 - 1e-12);
-        (pc / (1.0 - pc)).ln()
-    });
+    let pred_eta: Array1<f64> = x_design.dot(&fit.beta) + &offset;
     let mean_pred = pred_eta.mean().unwrap_or(0.0);
     let mean_true = true_eta.mean().unwrap_or(0.0);
     let mut num = 0.0f64;
