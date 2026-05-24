@@ -974,7 +974,6 @@ pub fn build_smooth_basis(
             identifiability: BSplineIdentifiability::None,
             boundary_conditions: Default::default(),
             boundary: OneDimensionalBoundary::Open,
-            streaming_chunk_size: None,
         };
         let flavour = match type_opt.as_str() {
             "fs" => FactorSmoothFlavour::Fs {
@@ -1044,7 +1043,6 @@ pub fn build_smooth_basis(
                         start: domain_start,
                         end: domain_start + period,
                     },
-                    streaming_chunk_size: None,
                 },
             })
         }
@@ -1091,8 +1089,6 @@ pub fn build_smooth_basis(
                     "id",
                     "__by_col",
                     "identifiability",
-                    "streaming_chunk_size",
-                    "chunk_size",
                     "by",
                 ],
             )?;
@@ -1177,8 +1173,6 @@ pub fn build_smooth_basis(
                     identifiability: BSplineIdentifiability::default(),
                     boundary,
                     boundary_conditions,
-                    streaming_chunk_size: option_usize(options, "streaming_chunk_size")
-                        .or_else(|| option_usize(options, "chunk_size")),
                 },
             })
         }
@@ -1263,8 +1257,6 @@ pub fn build_smooth_basis(
                     "l",
                     "max_degree",
                     "max-degree",
-                    "streaming_chunk_size",
-                    "chunk_size",
                 ],
             )?;
             if cols.len() != 2 {
@@ -1296,13 +1288,6 @@ pub fn build_smooth_basis(
                     ));
                 }
             };
-            let streaming_chunk_size = option_usize(options, "streaming_chunk_size")
-                .or_else(|| option_usize(options, "chunk_size"));
-            if matches!(method, SphereMethod::Harmonic) && streaming_chunk_size.is_some() {
-                return Err(
-                    "sphere streaming_chunk_size is only supported for Wahba kernels".to_string(),
-                );
-            }
             let max_degree = if matches!(method, SphereMethod::Harmonic) {
                 let degree = option_usize_any(options, &["degree", "l", "max_degree", "max-degree"])
                     .or_else(|| option_usize(options, "centers"))
@@ -1348,7 +1333,6 @@ pub fn build_smooth_basis(
                     method,
                     max_degree,
                     wahba_kernel,
-                    streaming_chunk_size,
                 },
             })
         }
@@ -1380,8 +1364,6 @@ pub fn build_smooth_basis(
                     "identifiability",
                     "by",
                     "scale_dims",
-                    "streaming_chunk_size",
-                    "chunk_size",
                 ],
             )?;
             let plan = plan_spatial_basis(
@@ -1432,8 +1414,6 @@ pub fn build_smooth_basis(
                     identifiability: parse_matern_identifiability(options)
                         .map_err(|e| e.to_string())?,
                     aniso_log_scales,
-                    streaming_chunk_size: option_usize(options, "streaming_chunk_size")
-                        .or_else(|| option_usize(options, "chunk_size")),
                 },
                 input_scales: None,
             })

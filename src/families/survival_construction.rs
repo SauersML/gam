@@ -2881,68 +2881,87 @@ pub fn build_latent_survival_baseline_offsets(
     }
 
     let n = age_entry.len();
+
+    // Per-row 6-tuple is independent. Evaluate in parallel into a Vec and then
+    // unpack into the six Array1 outputs in original order.
+    let rows: Vec<[f64; 6]> = (0..n)
+        .into_par_iter()
+        .map(|i| -> Result<[f64; 6], String> {
+            let entry = age_entry[i];
+            let exit = age_exit[i];
+            if !entry.is_finite()
+                || !exit.is_finite()
+                || entry <= 0.0
+                || exit <= 0.0
+                || exit < entry
+            {
+                return Err(format!(
+                    "latent survival baseline offsets require finite positive entry/exit ages with exit >= entry (row {})",
+                    i + 1
+                ));
+            }
+            match loading {
+                HazardLoading::Full => {
+                    let (eta_entry, _) = evaluate_survival_baseline(entry, cfg)?;
+                    let (eta_exit, derivative_exit) = evaluate_survival_baseline(exit, cfg)?;
+                    Ok([eta_entry, eta_exit, derivative_exit, 0.0, 0.0, 0.0])
+                }
+                HazardLoading::LoadedVsUnloaded => {
+                    if cfg.target != SurvivalBaselineTarget::GompertzMakeham {
+                        return Err(format!(
+                            "HazardLoading::LoadedVsUnloaded requires --baseline-target gompertz-makeham, got {}",
+                            survival_baseline_targetname(cfg.target)
+                        ));
+                    }
+                    let rate = cfg.rate.ok_or_else(|| {
+                        "gompertz-makeham latent survival is missing baseline rate".to_string()
+                    })?;
+                    let shape = cfg.shape.ok_or_else(|| {
+                        "gompertz-makeham latent survival is missing baseline shape".to_string()
+                    })?;
+                    let makeham = cfg.makeham.ok_or_else(|| {
+                        "gompertz-makeham latent survival is missing baseline makeham".to_string()
+                    })?;
+                    let (loaded_entry, _) = gompertz_components(entry, rate, shape);
+                    let (loaded_exit, loaded_hazard) = gompertz_components(exit, rate, shape);
+                    if !(loaded_entry.is_finite()
+                        && loaded_entry > 0.0
+                        && loaded_exit.is_finite()
+                        && loaded_exit > 0.0
+                        && loaded_hazard.is_finite()
+                        && loaded_hazard > 0.0)
+                    {
+                        return Err(format!(
+                            "gompertz-makeham latent loaded component produced a non-positive or non-finite hazard decomposition at row {}",
+                            i + 1
+                        ));
+                    }
+                    Ok([
+                        loaded_entry.ln(),
+                        loaded_exit.ln(),
+                        loaded_hazard / loaded_exit,
+                        makeham * entry,
+                        makeham * exit,
+                        makeham,
+                    ])
+                }
+            }
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
     let mut loaded_eta_entry = Array1::<f64>::zeros(n);
     let mut loaded_eta_exit = Array1::<f64>::zeros(n);
     let mut loaded_derivative_exit = Array1::<f64>::zeros(n);
     let mut unloaded_mass_entry = Array1::<f64>::zeros(n);
     let mut unloaded_mass_exit = Array1::<f64>::zeros(n);
     let mut unloaded_hazard_exit = Array1::<f64>::zeros(n);
-
-    for i in 0..n {
-        let entry = age_entry[i];
-        let exit = age_exit[i];
-        if !entry.is_finite() || !exit.is_finite() || entry <= 0.0 || exit <= 0.0 || exit < entry {
-            return Err(format!(
-                "latent survival baseline offsets require finite positive entry/exit ages with exit >= entry (row {})",
-                i + 1
-            ));
-        }
-        match loading {
-            HazardLoading::Full => {
-                let (eta_entry, _) = evaluate_survival_baseline(entry, cfg)?;
-                let (eta_exit, derivative_exit) = evaluate_survival_baseline(exit, cfg)?;
-                loaded_eta_entry[i] = eta_entry;
-                loaded_eta_exit[i] = eta_exit;
-                loaded_derivative_exit[i] = derivative_exit;
-            }
-            HazardLoading::LoadedVsUnloaded => {
-                if cfg.target != SurvivalBaselineTarget::GompertzMakeham {
-                    return Err(format!(
-                        "HazardLoading::LoadedVsUnloaded requires --baseline-target gompertz-makeham, got {}",
-                        survival_baseline_targetname(cfg.target)
-                    ));
-                }
-                let rate = cfg.rate.ok_or_else(|| {
-                    "gompertz-makeham latent survival is missing baseline rate".to_string()
-                })?;
-                let shape = cfg.shape.ok_or_else(|| {
-                    "gompertz-makeham latent survival is missing baseline shape".to_string()
-                })?;
-                let makeham = cfg.makeham.ok_or_else(|| {
-                    "gompertz-makeham latent survival is missing baseline makeham".to_string()
-                })?;
-                let (loaded_entry, _) = gompertz_components(entry, rate, shape);
-                let (loaded_exit, loaded_hazard) = gompertz_components(exit, rate, shape);
-                if !(loaded_entry.is_finite()
-                    && loaded_entry > 0.0
-                    && loaded_exit.is_finite()
-                    && loaded_exit > 0.0
-                    && loaded_hazard.is_finite()
-                    && loaded_hazard > 0.0)
-                {
-                    return Err(format!(
-                        "gompertz-makeham latent loaded component produced a non-positive or non-finite hazard decomposition at row {}",
-                        i + 1
-                    ));
-                }
-                loaded_eta_entry[i] = loaded_entry.ln();
-                loaded_eta_exit[i] = loaded_exit.ln();
-                loaded_derivative_exit[i] = loaded_hazard / loaded_exit;
-                unloaded_mass_entry[i] = makeham * entry;
-                unloaded_mass_exit[i] = makeham * exit;
-                unloaded_hazard_exit[i] = makeham;
-            }
-        }
+    for (i, row) in rows.into_iter().enumerate() {
+        loaded_eta_entry[i] = row[0];
+        loaded_eta_exit[i] = row[1];
+        loaded_derivative_exit[i] = row[2];
+        unloaded_mass_entry[i] = row[3];
+        unloaded_mass_exit[i] = row[4];
+        unloaded_hazard_exit[i] = row[5];
     }
 
     Ok(LatentSurvivalBaselineOffsets {
@@ -3136,18 +3155,31 @@ pub fn build_time_varying_survival_covariate_template(
     let time_design_entry = time_build_entry.design.to_dense();
     let p_time = time_design_exit.ncols();
     let mut time_design_derivative_exit = Array2::<f64>::zeros((age_exit.len(), p_time));
-    let mut deriv_buf = vec![0.0_f64; p_time];
-    for i in 0..age_exit.len() {
-        deriv_buf.fill(0.0);
-        evaluate_bspline_derivative_scalar(log_exit[i], knots.view(), time_degree, &mut deriv_buf)
+    // Per-row derivative-basis evaluation is independent; each row owns its
+    // own small `deriv_buf`. par_chunks_mut over the (n × p_time) output rows
+    // hands disjoint mutable row-slices to rayon workers.
+    time_design_derivative_exit
+        .as_slice_mut()
+        .expect("zeros are contiguous")
+        .par_chunks_mut(p_time)
+        .enumerate()
+        .try_for_each(|(i, row_out)| -> Result<(), String> {
+            let mut deriv_buf = vec![0.0_f64; p_time];
+            evaluate_bspline_derivative_scalar(
+                log_exit[i],
+                knots.view(),
+                time_degree,
+                &mut deriv_buf,
+            )
             .map_err(|e| {
                 format!("failed to evaluate {block_name} time-margin derivative basis: {e}")
             })?;
-        let chain = 1.0 / age_exit[i].max(1e-12);
-        for j in 0..p_time {
-            time_design_derivative_exit[[i, j]] = deriv_buf[j] * chain;
-        }
-    }
+            let chain = 1.0 / age_exit[i].max(1e-12);
+            for j in 0..p_time {
+                row_out[j] = deriv_buf[j] * chain;
+            }
+            Ok(())
+        })?;
 
     Ok(SurvivalCovariateTermBlockTemplate::TimeVarying {
         time_basis_entry: time_design_entry,

@@ -11,6 +11,10 @@ pub struct UnsupportedLinkError {
 }
 
 impl UnsupportedLinkError {
+    /// Construct an `UnsupportedLinkError` tagged with the response-family
+    /// name (`"binomial"`, `"gaussian"`, ...) and a printable name for the
+    /// offending `InverseLink` variant (extracted via the module-private
+    /// `inverse_link_diagnostic_name`). No allocation beyond the link name.
     #[inline]
     pub fn new(family: &'static str, link: &InverseLink) -> Self {
         Self {
