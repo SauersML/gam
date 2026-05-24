@@ -2127,23 +2127,28 @@ fn scan_for_banned_allow(
                     // valid inside allow/expect anyway). Strip the known
                     // tool prefixes (`clippy::`, `rustc::`, `rustdoc::`) when
                     // labelling so the report shows the bare lint name.
+                    // `clippy::*` lints are exempt from the silencing ban —
+                    // we don't enforce clippy at all in this repo, so silencing
+                    // them is fine. Only non-clippy tokens count as offenders.
                     let mut first_label: Option<String> = None;
-                    let mut any_token = false;
+                    let mut any_non_clippy = false;
                     for tok in inside.split(',') {
                         let trimmed = tok.trim();
                         if trimmed.is_empty() {
                             continue;
                         }
-                        any_token = true;
+                        if trimmed.starts_with("clippy::") {
+                            continue;
+                        }
+                        any_non_clippy = true;
                         if first_label.is_none() {
                             let bare = trimmed
-                                .trim_start_matches("clippy::")
                                 .trim_start_matches("rustc::")
                                 .trim_start_matches("rustdoc::");
                             first_label = Some(bare.to_string());
                         }
                     }
-                    if any_token {
+                    if any_non_clippy {
                         let attr = silencer.trim_end_matches('(');
                         let label = first_label.unwrap_or_else(|| "<empty>".to_string());
                         offenders.push((
