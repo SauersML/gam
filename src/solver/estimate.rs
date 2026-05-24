@@ -2513,7 +2513,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
     /// transformed basis. This is the same matrix the analytic operator
     /// differentiates, so centered finite-difference probes of this H w.r.t.
     /// ψ should match the analytic `B_i + correction`.
-    pub(crate) fn debug_full_h(
+    pub fn debug_full_h(
         &mut self,
         x: &DesignMatrix,
         s_list: &[BlockwisePenalty],
@@ -2552,7 +2552,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
     /// finite difference of it along ψ gives the analytic `d/dψ log|H_proj|`
     /// that the production trace formula computes — i.e. the correct
     /// finite-difference reference for the penalty-subspace projection invariant.
-    pub(crate) fn debug_logdet_h_proj(
+    pub fn debug_logdet_h_proj(
         &mut self,
         x: &DesignMatrix,
         s_list: &[BlockwisePenalty],
@@ -2584,7 +2584,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
     }
 
     /// Debug-only: return `(η, finalweights, solve_c_array)` at this theta.
-    pub(crate) fn debug_full_eta_w_c(
+    pub fn debug_full_eta_w_c(
         &mut self,
         x: &DesignMatrix,
         s_list: &[BlockwisePenalty],
@@ -4929,7 +4929,7 @@ impl UnifiedFitResult {
             inner_cycles,
         })
     }
-    pub(crate) fn new_for_test_unchecked(parts: UnifiedFitResultParts) -> Self {
+    pub fn new_for_test_unchecked(parts: UnifiedFitResultParts) -> Self {
         let beta = flatten_block_betas(&parts.blocks);
         Self {
             blocks: parts.blocks,
@@ -5638,7 +5638,7 @@ pub fn compute_continuous_smoothness_order(
     }
 }
 
-pub(crate) fn try_compute_continuous_smoothness_order(
+fn try_compute_continuous_smoothness_order(
     lambda_tilde: &[f64],
     normalization_scale: &[f64],
     eps: f64,

@@ -4,25 +4,21 @@ use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const CACHE_VERSION: u32 = 1;
-/// On-disk cache schema version.
-///
-/// Bumped manually only when the serialized cache layout changes in a
-/// way that makes prior entries unsafe to consume (struct fields added/
-/// removed, optimization invariants altered, payload semantics shift).
-///
-/// This is **deliberately separate** from `CARGO_PKG_VERSION` so a
-/// routine library version bump does NOT invalidate every user's
-/// warm-start cache. A user upgrading from 0.1.X to 0.1.(X+1) should
-/// see their existing checkpoints still load; only a deliberate schema
-/// change (e.g., reshaping how ρ is encoded) bumps this constant.
-pub(crate) const CACHE_SCHEMA_VERSION: u32 = 2;
 const MAX_ENTRY_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
 const CACHE_TTL_SECS: u64 = 60 * 60 * 24 * 365 * 10;
 
-/// String form of [`CACHE_SCHEMA_VERSION`] for direct use in cache keys.
+/// String tag identifying the on-disk cache schema, embedded directly in
+/// cache keys.
+///
+/// The leading `schema2-` prefix is bumped manually only when the
+/// serialized cache layout changes in a way that makes prior entries
+/// unsafe to consume (struct fields added/removed, optimization
+/// invariants altered, payload semantics shift). This is **deliberately
+/// separate** from `CARGO_PKG_VERSION` so a routine library version bump
+/// does NOT invalidate every user's warm-start cache.
 pub(crate) fn cache_schema_tag() -> String {
-    format!("schema{CACHE_SCHEMA_VERSION}-arrow-schur-streaming-v1")
+    "schema2-arrow-schur-streaming-v1".to_string()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -119,8 +115,8 @@ impl PersistentBlockWarmStartRecord {
             // library version bump that doesn't change the cache schema
             // (the common case for patch / minor releases) should NOT
             // invalidate users' on-disk warm-start caches. Schema-breaking
-            // changes bump `CACHE_SCHEMA_VERSION` which is encoded in
-            // the cache key itself.
+            // changes bump the `schemaN-` prefix in `cache_schema_tag()`,
+            // which is encoded in the cache key itself.
             && self.n_rows == n_rows
             && self.block_names == block_names
             && self.block_dims == block_dims
@@ -167,8 +163,8 @@ impl PersistentWarmStartRecord {
             // library version bump that doesn't change the cache schema
             // (the common case for patch / minor releases) should NOT
             // invalidate users' on-disk warm-start caches. Schema-breaking
-            // changes bump `CACHE_SCHEMA_VERSION` which is encoded in
-            // the cache key itself.
+            // changes bump the `schemaN-` prefix in `cache_schema_tag()`,
+            // which is encoded in the cache key itself.
             && self.n_rows == n_rows
             && self.n_cols == n_cols
             && self.rho.iter().all(|v| v.is_finite())
