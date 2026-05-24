@@ -2091,7 +2091,6 @@ fn validate_joint_hyper_direction_shapes(
 
 pub(crate) struct ExternalJointHyperEvaluator<'a> {
     conditioning: ParametricColumnConditioning,
-    config: Arc<RemlConfig>,
     penalty_shrinkage_floor: Option<f64>,
     kronecker_penalty_system: Option<crate::smooth::KroneckerPenaltySystem>,
     kronecker_factored: Option<crate::basis::KroneckerFactoredBasis>,
@@ -2165,7 +2164,6 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
 
         Ok(Self {
             conditioning,
-            config,
             penalty_shrinkage_floor: opts.penalty_shrinkage_floor,
             kronecker_penalty_system: opts.kronecker_penalty_system.clone(),
             kronecker_factored: opts.kronecker_factored.clone(),
