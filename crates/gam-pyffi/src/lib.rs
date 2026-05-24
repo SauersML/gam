@@ -70,8 +70,9 @@ use gam::terms::sae_manifold::{
 use gam::terms::smooth::BlockwisePenalty;
 use gam::terms::{
     ARDPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry, BlockOrthogonalityPenalty,
-    DifferenceOpKind, IBPAssignmentPenalty, IsometryPenalty, IvaeRidgeMeanGauge, JumpReLUPenalty,
-    MechanismSparsityPenalty, NuclearNormPenalty, OrthogonalityPenalty,
+    DifferenceOpKind, GatedSAEDecoder, IBPAssignmentPenalty, IsometryPenalty,
+    IvaeRidgeMeanGauge, JumpReLUPenalty, MechanismSparsityPenalty, NuclearNormPenalty,
+    OrthogonalityPenalty,
     ParametricRowPrecisionPriorPenalty, PenaltyConcavity, PenaltyTier, PsiSlice,
     RowPrecisionPriorPenalty, ScadMcpPenalty, ScalarWeightSchedule,
     SoftmaxAssignmentSparsityPenalty, SparsityPenalty, TopKActivationPenalty,
@@ -5378,6 +5379,21 @@ fn sae_manifold_fit_ibp<'py>(
     Ok(out.unbind())
 }
 
+#[pyfunction(signature = (x, w_gate, w_amp))]
+fn gated_sae_decode<'py>(
+    py: Python<'py>,
+    x: PyReadonlyArray2<'py, f64>,
+    w_gate: PyReadonlyArray2<'py, f64>,
+    w_amp: PyReadonlyArray2<'py, f64>,
+) -> PyResult<Py<PyArray2<f64>>> {
+    let decoder = GatedSAEDecoder::new(w_gate.as_array().to_owned(), w_amp.as_array().to_owned())
+        .map_err(py_value_error)?;
+    let out = decoder
+        .decode_batch(x.as_array())
+        .map_err(py_value_error)?;
+    Ok(out.into_pyarray(py).unbind())
+}
+
 /// Backward pass: compute `grad_t` and the standard REML adjoint
 /// gradients at the current latent `t`.
 ///
@@ -8786,6 +8802,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(analytic_penalty_value_grad, module)?)?;
     module.add_function(wrap_pyfunction!(riemannian_retract, module)?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_fit_ibp, module)?)?;
+    module.add_function(wrap_pyfunction!(gated_sae_decode, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_fit_latent_backward, module)?)?;
     module.add_function(wrap_pyfunction!(glm_reml_fit_latent, module)?)?;
     module.add_function(wrap_pyfunction!(glm_reml_fit_latent_backward, module)?)?;

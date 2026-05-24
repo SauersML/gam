@@ -105,6 +105,7 @@ def create_steerer(
     )
     session.commit()
     fit_queue.enqueue(steerer.id)
+    session.expire_all()
     refreshed = session.get(Steerer, steerer.id)
     if refreshed is None:
         raise HTTPException(status_code=500, detail="created steerer could not be reloaded")
