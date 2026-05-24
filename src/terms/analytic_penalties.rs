@@ -112,7 +112,7 @@ use crate::terms::basis::{
     duchon_radial_second_derivative_nd, duchon_radial_third_derivative_nd,
 };
 use crate::terms::penalty_op::PenaltyOp;
-use crate::terms::sae_manifold::ScheduleKind;
+use crate::terms::sae_manifold::{GumbelTemperatureSchedule, ScheduleKind};
 use crate::terms::smooth::BlockwisePenalty;
 
 const MIN_CONDITIONAL_PRECISION: f64 = 1.0e-12;
@@ -1595,6 +1595,7 @@ pub struct IBPAssignmentPenalty {
     pub k_max: usize,
     pub alpha: f64,
     pub tau: f64,
+    pub temperature_schedule: Option<GumbelTemperatureSchedule>,
     pub learnable_alpha: bool,
     pub weight: f64,
     pub weight_schedule: Option<ScalarWeightSchedule>,
@@ -1610,10 +1611,18 @@ impl IBPAssignmentPenalty {
             k_max,
             alpha,
             tau,
+            temperature_schedule: None,
             learnable_alpha,
             weight: 1.0,
             weight_schedule: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_temperature_schedule(mut self, schedule: GumbelTemperatureSchedule) -> Self {
+        self.tau = schedule.current_tau(schedule.iter_count);
+        self.temperature_schedule = Some(schedule);
+        self
     }
 
     #[must_use]
@@ -1631,10 +1640,15 @@ impl IBPAssignmentPenalty {
         }
     }
 
-    fn sigmoid_logits(&self, target: ArrayView1<'_, f64>) -> Array1<f64> {
+    fn concrete_temperature(&self) -> f64 {
+        self.tau
+    }
+
+    fn concrete_logits(&self, target: ArrayView1<'_, f64>) -> Array1<f64> {
+        let tau = self.concrete_temperature();
         let mut out = Array1::<f64>::zeros(target.len());
         for i in 0..target.len() {
-            let x = target[i] / self.tau;
+            let x = target[i] / tau;
             out[i] = if x >= 0.0 {
                 1.0 / (1.0 + (-x).exp())
             } else {
@@ -1671,7 +1685,7 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
     fn value(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> f64 {
         let alpha = self.resolved_alpha(rho);
         let a = alpha / self.k_max as f64;
-        let z = self.sigmoid_logits(target);
+        let z = self.concrete_logits(target);
         let pi = self.pi_map(z.view(), alpha);
         let n = z.len() / self.k_max;
         let mut acc = 0.0;
@@ -1696,7 +1710,8 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
         rho: ArrayView1<'_, f64>,
     ) -> Array1<f64> {
         let alpha = self.resolved_alpha(rho);
-        let z = self.sigmoid_logits(target);
+        let tau = self.concrete_temperature();
+        let z = self.concrete_logits(target);
         let pi = self.pi_map(z.view(), alpha);
         let n = z.len() / self.k_max;
         let mut out = Array1::<f64>::zeros(target.len());
@@ -1706,7 +1721,7 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
                 let zk = z[start + k];
                 let pk = pi[k].clamp(1.0e-12, 1.0 - 1.0e-12);
                 let d_p_d_z = ((1.0 - pk) / pk).ln();
-                out[start + k] = self.weight * d_p_d_z * zk * (1.0 - zk) / self.tau;
+                out[start + k] = self.weight * d_p_d_z * zk * (1.0 - zk) / tau;
             }
         }
         out
@@ -1718,11 +1733,12 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
         rho: ArrayView1<'_, f64>,
     ) -> Option<Array1<f64>> {
         let alpha = self.resolved_alpha(rho);
-        let z = self.sigmoid_logits(target);
+        let tau = self.concrete_temperature();
+        let z = self.concrete_logits(target);
         let pi = self.pi_map(z.view(), alpha);
         let n = z.len() / self.k_max;
         let mut out = Array1::<f64>::zeros(target.len());
-        let inv_tau2 = 1.0 / (self.tau * self.tau);
+        let inv_tau2 = 1.0 / (tau * tau);
         for row in 0..n {
             let start = row * self.k_max;
             for k in 0..self.k_max {
@@ -1745,7 +1761,7 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
             return Array1::<f64>::zeros(0);
         }
         let alpha = self.resolved_alpha(rho);
-        let z = self.sigmoid_logits(target);
+        let z = self.concrete_logits(target);
         let pi = self.pi_map(z.view(), alpha);
         let mut sum_log_pi = 0.0;
         for &pk in pi.iter() {
@@ -1765,6 +1781,10 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
     }
 
     fn apply_schedule(&mut self, iter: usize) {
+        if let Some(schedule) = self.temperature_schedule.as_mut() {
+            self.tau = schedule.current_tau(iter);
+            schedule.iter_count = iter + 1;
+        }
         advance_scalar_weight(&mut self.weight, &mut self.weight_schedule, iter);
     }
 }

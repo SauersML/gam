@@ -6597,28 +6597,134 @@ fn add_labeled_rho_prior_to_outer_eval(
     }
     if eval_mode == EvalMode::ValueGradientHessian {
         if let Some(prior_hessian) = hessian {
-            result.outer_hessian = match result.outer_hessian.materialize_dense()? {
-                Some(mut base_hessian) => {
-                    if base_hessian.raw_dim() != prior_hessian.raw_dim() {
-                        return Err(CustomFamilyError::DimensionMismatch {
-                            reason: format!(
-                                "rho prior Hessian shape mismatch: got {}x{}, expected {}x{}",
-                                prior_hessian.nrows(),
-                                prior_hessian.ncols(),
-                                base_hessian.nrows(),
-                                base_hessian.ncols()
-                            ),
-                        }
-                        .into());
-                    }
-                    base_hessian += &prior_hessian;
-                    crate::solver::outer_strategy::HessianResult::Analytic(base_hessian)
-                }
-                None => crate::solver::outer_strategy::HessianResult::Unavailable,
-            };
+            result.outer_hessian.add_rho_block_dense(&prior_hessian)?;
         }
     }
     Ok(result)
+}
+
+fn physical_warm_start_for_labeled(
+    warm_start: Option<&ConstrainedWarmStart>,
+    physical_rho: &Array1<f64>,
+    layout: &PenaltyLabelLayout,
+) -> Option<ConstrainedWarmStart> {
+    if !layout.has_tied_coordinates() {
+        return None;
+    }
+    warm_start.map(|seed| {
+        let mut physical_seed = seed.clone();
+        physical_seed.rho = physical_rho.clone();
+        physical_seed
+    })
+}
+
+fn pullback_labeled_outer_eval(
+    mut result: OuterObjectiveEvalResult,
+    rho: &Array1<f64>,
+    layout: &PenaltyLabelLayout,
+    rho_prior: &crate::types::RhoPrior,
+    eval_mode: EvalMode,
+) -> Result<OuterObjectiveEvalResult, String> {
+    if eval_mode == EvalMode::ValueOnly {
+        result.gradient = Array1::<f64>::zeros(layout.initial_rho.len());
+    } else {
+        result.gradient = aggregate_labeled_gradient(&result.gradient, layout)?;
+    }
+    if eval_mode == EvalMode::ValueGradientHessian {
+        result.outer_hessian = match result.outer_hessian {
+            crate::solver::outer_strategy::HessianResult::Analytic(hessian) => {
+                crate::solver::outer_strategy::HessianResult::Analytic(
+                    aggregate_labeled_hessian(&hessian, layout)?,
+                )
+            }
+            crate::solver::outer_strategy::HessianResult::Operator(operator) => {
+                crate::solver::outer_strategy::HessianResult::Operator(Arc::new(
+                    LabeledOuterHessianOperator::new(operator, layout),
+                ))
+            }
+            crate::solver::outer_strategy::HessianResult::Unavailable => {
+                crate::solver::outer_strategy::HessianResult::Unavailable
+            }
+        };
+    }
+    result.warm_start.rho = rho.clone();
+    add_labeled_rho_prior_to_outer_eval(result, rho, rho_prior, eval_mode)
+}
+
+fn outerobjectivegradienthessian_labeled<F: CustomFamily + Clone + Send + Sync + 'static>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+    options: &BlockwiseFitOptions,
+    layout: &PenaltyLabelLayout,
+    rho: &Array1<f64>,
+    warm_start: Option<&ConstrainedWarmStart>,
+    rho_prior: &crate::types::RhoPrior,
+    eval_mode: EvalMode,
+) -> Result<OuterObjectiveEvalResult, String> {
+    let physical_rho = expand_labeled_log_lambdas(rho, layout)?;
+    let physical_warm_start = physical_warm_start_for_labeled(warm_start, &physical_rho, layout);
+    let base = outerobjectivegradienthessian_internal(
+        family,
+        specs,
+        options,
+        &layout.penalty_counts,
+        &physical_rho,
+        physical_warm_start.as_ref().or(warm_start),
+        crate::types::RhoPrior::Flat,
+        eval_mode,
+    )?;
+    pullback_labeled_outer_eval(base, rho, layout, rho_prior, eval_mode)
+}
+
+fn custom_family_seed_screening_proxy_labeled<
+    F: CustomFamily + Clone + Send + Sync + 'static,
+>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+    options: &BlockwiseFitOptions,
+    layout: &PenaltyLabelLayout,
+    rho: &Array1<f64>,
+    warm_start: Option<&ConstrainedWarmStart>,
+    rho_prior: &crate::types::RhoPrior,
+) -> Result<(f64, ConstrainedWarmStart, bool), String> {
+    let physical_rho = expand_labeled_log_lambdas(rho, layout)?;
+    let per_block = split_log_lambdas(&physical_rho, &layout.penalty_counts)?;
+    let physical_warm_start = physical_warm_start_for_labeled(warm_start, &physical_rho, layout);
+    let mut inner = inner_blockwise_fit(
+        family,
+        specs,
+        &per_block,
+        options,
+        physical_warm_start.as_ref().or(warm_start),
+    )?;
+    refresh_all_block_etas(family, specs, &mut inner.block_states)?;
+    let reml_term = if include_exact_newton_logdet_h(family, options) {
+        0.5 * inner.block_logdet_h
+    } else {
+        0.0
+    } - if include_exact_newton_logdet_s(family, options) {
+        0.5 * inner.block_logdet_s
+    } else {
+        0.0
+    };
+    let prior_terms = rho_prior_cost_gradient_hessian(rho_prior, rho)?;
+    let score = checked_penalizedobjective(
+        inner.log_likelihood,
+        inner.penalty_value,
+        reml_term,
+        "custom-family labeled seed-screening proxy",
+    )? + prior_terms.0;
+    let warm = ConstrainedWarmStart {
+        rho: rho.clone(),
+        block_beta: inner
+            .block_states
+            .iter()
+            .map(|state| state.beta.clone())
+            .collect(),
+        active_sets: inner.active_sets.clone(),
+        cached_inner: Some(cached_inner_mode_from_result(&inner)),
+    };
+    Ok((score, warm, inner.converged))
 }
 
 fn split_log_lambdas(
@@ -9706,7 +9812,7 @@ pub(crate) fn custom_family_outer_derivatives<F: CustomFamily + ?Sized>(
     // from the outer optimizer by a cost-based first-order policy.
     let hessian = if options.use_outer_hessian
         && include_exact_newton_logdet_h(family, options)
-        && order.has_hessian()
+        && policy.capability.has_hessian()
     {
         DeclaredHessianForm::Either
     } else {
@@ -16597,7 +16703,10 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
     // replaced. See `BatchedOuterGradientTerms`.
     let has_configured_rho_prior = !matches!(rho_prior, crate::types::RhoPrior::Flat);
     let mut batched_gradient_override: Option<Array1<f64>> = None;
-    if eval_mode == EvalMode::ValueAndGradient || eval_mode == EvalMode::ValueGradientHessian {
+    if !has_configured_rho_prior
+        && (eval_mode == EvalMode::ValueAndGradient
+            || eval_mode == EvalMode::ValueGradientHessian)
+    {
         let beta_flat_for_batch = flatten_state_betas(&inner.block_states, specs);
         let synced_states_for_batch = synchronized_states_from_flat_beta(
             family,
@@ -16640,24 +16749,23 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                     options,
                     inner.joint_workspace.clone(),
                 )? {
-                    let JointHessianBundle {
-                        source: h_joint_unpen,
-                        beta_flat,
-                        compute_dh,
-                        compute_d2h,
-                        owned_compute_dh: _,
-                        owned_compute_d2h: _,
-                        rho_curvature_scale,
-                        hessian_logdet_correction,
-                        ..
-                    } = joint_bundle_value_only;
-                    let value_only = joint_outer_evaluate(
-                        &inner,
-                        specs,
-                        total,
-                        options,
-                        inner.joint_workspace.clone(),
-                    )? {
+                    let mut gradient = Array1::<f64>::zeros(expected);
+                    for j in 0..expected {
+                        let trace_term = if include_logdet_h {
+                            0.5 * batch.trace_h_inv_hdot[j]
+                        } else {
+                            0.0
+                        };
+                        let det_term = if include_logdet_s {
+                            0.5 * batch.trace_s_pinv_sdot[j]
+                        } else {
+                            0.0
+                        };
+                        gradient[j] = batch.objective_theta[j] + trace_term - det_term;
+                    }
+                    if eval_mode == EvalMode::ValueGradientHessian {
+                        batched_gradient_override = Some(gradient);
+                    } else {
                         let JointHessianBundle {
                             source: h_joint_unpen,
                             beta_flat,
@@ -16706,27 +16814,6 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                             None,
                             None,
                         )?;
-                        // Assemble the gradient via the universal three-term formula:
-                        //   grad[k] = obj_θ[k] + 0.5 * tr(H⁻¹ Ḣ_k) - 0.5 * tr(S⁺ Ṡ_k).
-                        // This matches `outer_gradient_entry` for fixed-dispersion
-                        // families. Profiled-Gaussian families (which scale the
-                        // penalty term by dp_cgrad / profiled_scale) currently fall
-                        // back to the generic path because they should not opt in
-                        // to this hook.
-                        let mut gradient = Array1::<f64>::zeros(expected);
-                        for j in 0..expected {
-                            let trace_term = if include_logdet_h {
-                                0.5 * batch.trace_h_inv_hdot[j]
-                            } else {
-                                0.0
-                            };
-                            let det_term = if include_logdet_s {
-                                0.5 * batch.trace_s_pinv_sdot[j]
-                            } else {
-                                0.0
-                            };
-                            gradient[j] = batch.objective_theta[j] + trace_term - det_term;
-                        }
                         return Ok(OuterObjectiveEvalResult {
                             objective: value_only.objective,
                             gradient,
@@ -16736,32 +16823,6 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                             inner_converged: inner.converged,
                         });
                     }
-                } else {
-                    // VGH mode: stash the batched gradient and let the standard
-                    // joint_outer_evaluate path below build the Hessian. The
-                    // gradient computed there will be overwritten with the
-                    // batched terms after the call.
-                    let mut gradient = Array1::<f64>::zeros(expected);
-                    for j in 0..expected {
-                        let trace_term = if include_logdet_h {
-                            0.5 * batch.trace_h_inv_hdot[j]
-                        } else {
-                            0.0
-                        };
-                        let det_term = if include_logdet_s {
-                            0.5 * batch.trace_s_pinv_sdot[j]
-                        } else {
-                            0.0
-                        };
-                        gradient[j] = batch.objective_theta[j] + trace_term - det_term;
-                    }
-                    return Ok(OuterObjectiveEvalResult {
-                        objective: value_only.objective,
-                        gradient,
-                        outer_hessian: crate::solver::outer_strategy::HessianResult::Unavailable,
-                        warm_start: value_only.warm_start,
-                        inner_converged: inner.converged,
-                    });
                 }
             }
         }
@@ -16823,11 +16884,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
             owned_compute_d2h,
             owned_compute_d2h_many,
             None, // no ext_coords when psi_dim == 0
-            if batched_gradient_override.is_some() && eval_mode == EvalMode::ValueGradientHessian {
-                batched_first_order_trace_skip.take()
-            } else {
-                None
-            },
+            None,
             custom_family_batched_outer_hessian_operator(
                 family,
                 &inner.block_states,
@@ -18966,14 +19023,20 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         };
         let no_pen = vec![Array1::zeros(0); specs.len()];
         let geometry = compute_joint_geometry(family, specs, &inner.block_states, &no_pen)
-            .map_err(CustomFamilyError::Optimization)?;
+            .map_err(|reason| CustomFamilyError::Optimization {
+                context: "fit_custom_family no-smoothing joint geometry",
+                reason,
+            })?;
         let penalized_objective = checked_penalizedobjective(
             inner.log_likelihood,
             inner.penalty_value,
             reml_term,
             "custom-family fit without smoothing parameters",
         )
-        .map_err(CustomFamilyError::Optimization)?;
+        .map_err(|reason| CustomFamilyError::Optimization {
+            context: "fit_custom_family no-smoothing penalized objective",
+            reason,
+        })?;
         let warm_start = constrained_warm_start_from_inner(&rho0, &inner);
         store_persistent_custom_family_warm_start(
             persistent_warm_start_key.as_deref(),
@@ -18998,7 +19061,10 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             },
             specs,
         )
-        .map_err(CustomFamilyError::Optimization);
+        .map_err(|reason| CustomFamilyError::Optimization {
+            context: "fit_custom_family no-smoothing result assembly",
+            reason,
+        });
     }
 
     // Exact Hessians are primary whenever the assembled family can supply them.
@@ -19012,7 +19078,10 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         let per_block = split_log_lambdas(&rho0, &penalty_counts)?;
         let mut inner = inner_blockwise_fit(family, specs, &per_block, options, None)?;
         refresh_all_block_etas(family, specs, &mut inner.block_states)
-            .map_err(CustomFamilyError::Optimization)?;
+            .map_err(|reason| CustomFamilyError::Optimization {
+                context: "fit_custom_family one-cycle eta refresh",
+                reason,
+            })?;
         let penalized_objective = checked_penalizedobjective(
             inner.log_likelihood,
             inner.penalty_value,
@@ -19027,7 +19096,10 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             },
             "custom-family explicit one-cycle inner probe",
         )
-        .map_err(CustomFamilyError::Optimization)?;
+        .map_err(|reason| CustomFamilyError::Optimization {
+            context: "fit_custom_family one-cycle penalized objective",
+            reason,
+        })?;
         let lambdas = rho0.mapv(f64::exp);
         let log_lambdas = lambdas.mapv(|v| v.max(1e-300).ln());
         return blockwise_fit_from_parts(
@@ -19047,7 +19119,10 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             },
             specs,
         )
-        .map_err(CustomFamilyError::Optimization);
+        .map_err(|reason| CustomFamilyError::Optimization {
+            context: "fit_custom_family one-cycle result assembly",
+            reason,
+        });
     }
 
     use crate::estimate::EstimationError;
@@ -19263,7 +19338,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             // exact-Hessian families, forcing every inner solve to start from
             // scratch (5-10 Newton steps instead of 1-2 with warm start).
             let warm_ref = screened_outer_warm_start(outer.warm_cache.as_ref(), rho);
-            match outerobjectivegradienthessian_internal(
+            match outerobjectivegradienthessian_labeled(
                 family,
                 specs,
                 &outer_options,
