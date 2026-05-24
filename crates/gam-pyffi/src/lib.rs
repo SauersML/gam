@@ -210,13 +210,6 @@ struct PyPredictOptions {
     with_uncertainty: bool,
 }
 
-#[derive(Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PyPairedCifOptions {
-    times: Vec<f64>,
-    level: Option<f64>,
-}
-
 #[derive(Serialize)]
 struct SummaryCoefficientRow {
     index: usize,
@@ -330,44 +323,6 @@ struct SurvivalPredictionPayload {
     /// `linear_predictor.len()`.
     #[serde(skip_serializing_if = "Option::is_none")]
     eta_se: Option<Vec<f64>>,
-}
-
-#[derive(Serialize)]
-struct CompetingRisksPredictionPayload {
-    class: &'static str,
-    model_class: String,
-    likelihood_mode: String,
-    endpoint_names: Vec<String>,
-    times: Vec<f64>,
-    hazard: Vec<Vec<Vec<f64>>>,
-    survival: Vec<Vec<Vec<f64>>>,
-    cumulative_hazard: Vec<Vec<Vec<f64>>>,
-    cif: Vec<Vec<Vec<f64>>>,
-    overall_survival: Vec<Vec<f64>>,
-    linear_predictor: Vec<Vec<f64>>,
-    columns: BTreeMap<String, Vec<f64>>,
-}
-
-#[derive(Serialize)]
-struct PairedSamplePayload {
-    class: &'static str,
-    n_draws: usize,
-    target: SamplePayload,
-    competing: SamplePayload,
-}
-
-#[derive(Serialize)]
-struct PairedCifPayload {
-    class: &'static str,
-    level: f64,
-    times: Vec<f64>,
-    n_draws: usize,
-    n_rows: usize,
-    n_times: usize,
-    cif_flat: Vec<f64>,
-    mean_flat: Vec<f64>,
-    lower_flat: Vec<f64>,
-    upper_flat: Vec<f64>,
 }
 
 #[derive(Serialize)]

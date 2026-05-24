@@ -1,0 +1,9 @@
+{
+  "n_events": 395335,
+  "n_tokens": 5499572,
+  "vocab_size": 1443,
+  "n_threads": 9,
+  "total_dwell_ms": 663167.9853329934,
+  "median_stack_depth": 11.0,
+  "p99_stack_depth": 13.0
+}
