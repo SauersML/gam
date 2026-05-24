@@ -349,7 +349,7 @@ pub fn create_basis<O: BasisOutputFormat>(
     match options.basis_family {
         BasisFamily::BSpline => O::build_basis(data, degree, eval_kind, knotvec),
         BasisFamily::MSpline => {
-            if O::IS_SPARSE {
+            if O::LAYOUT.is_sparse() {
                 let sparse = create_mspline_sparse(data, knotvec.view(), degree)?;
                 Ok((O::from_sparse(sparse)?, knotvec))
             } else {
@@ -358,7 +358,7 @@ pub fn create_basis<O: BasisOutputFormat>(
             }
         }
         BasisFamily::ISpline => {
-            if O::IS_SPARSE {
+            if O::LAYOUT.is_sparse() {
                 return Err(BasisError::InvalidInput(
                     "BasisFamily::ISpline does not support sparse output; use Dense".to_string(),
                 ));
@@ -31695,10 +31695,10 @@ mod tests {
             "[op_psi_fd_d1] D0_minus[0..,0..] sample = {:?}",
             ops_minus.d0.row(0).to_vec()
         );
-        eprintln!("[op_psi_fd_d1] fd_D0[0,..] = {:?}", fd_d0.row(0).to_vec());
-        eprintln!("[op_psi_fd_d1] fd_D0 shape={:?}", fd_d0.shape());
         eprintln!(
-            "[op_psi_fd_d1] fd_D0 norm={:.4e}",
+            "[op_psi_fd_d1] fd_D0 shape=({} x {}) norm={:.4e}",
+            fd_d0.nrows(),
+            fd_d0.ncols(),
             fd_d0.iter().map(|v| v * v).sum::<f64>().sqrt()
         );
         eprintln!(
