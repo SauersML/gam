@@ -1951,7 +1951,11 @@ pub trait HyperOperator: Send + Sync {
             .sum()
     }
 
-    fn trace_projected_factor_cached(&self, factor: &Array2<f64>, factor_cache: &ProjectedFactorCache) -> f64 {
+    fn trace_projected_factor_cached(
+        &self,
+        factor: &Array2<f64>,
+        factor_cache: &ProjectedFactorCache,
+    ) -> f64 {
         assert!(std::mem::size_of_val(factor_cache) > 0);
         self.trace_projected_factor(factor)
     }
@@ -2219,81 +2223,6 @@ impl ProjectedFactorCache {
                 total_bytes: 0,
                 budget_bytes,
             }),
-        }
-    }
-
-    /// Number of threads currently parked as waiters on an in-progress slot
-    /// for `key`. Returns 0 if the key has no in-progress computation. Used
-    /// by panic-recovery tests to deterministically synchronize without
-    /// `thread::sleep`.
-    pub fn pending_waiters_for(&self, key: ProjectedFactorKey) -> usize {
-        let inner = self
-            .inner
-            .lock()
-            .expect("projected factor cache lock poisoned");
-        inner
-            .in_progress
-            .get(&key)
-            .map(|m| m.waiter_count.load(std::sync::atomic::Ordering::Acquire))
-            .unwrap_or(0)
-    }
-
-    /// Block (up to `timeout`) until at least one waiter has subscribed to
-    /// the in-progress slot for `key`. Returns `true` if a subscriber was
-    /// observed before the deadline, `false` on timeout. Test-only API used
-    /// by the producer-panic recovery test so it does not need to spin or
-    /// sleep waiting for the subscribe race window to close.
-    pub fn wait_for_subscriber(
-        &self,
-        key: ProjectedFactorKey,
-        timeout: std::time::Duration,
-    ) -> bool {
-        let marker = {
-            let inner = self
-                .inner
-                .lock()
-                .expect("projected factor cache lock poisoned");
-            let Some(m) = inner.in_progress.get(&key) else {
-                return false;
-            };
-            Arc::clone(m)
-        };
-        if marker
-            .waiter_count
-            .load(std::sync::atomic::Ordering::Acquire)
-            > 0
-        {
-            return true;
-        }
-        let (lock, cv) = &marker.subscriber_arrived;
-        let mut guard = lock
-            .lock()
-            .expect("subscriber-arrived notification lock poisoned");
-        let deadline = std::time::Instant::now() + timeout;
-        loop {
-            if marker
-                .waiter_count
-                .load(std::sync::atomic::Ordering::Acquire)
-                > 0
-            {
-                return true;
-            }
-            let now = std::time::Instant::now();
-            if now >= deadline {
-                return false;
-            }
-            let (next_guard, result) = cv
-                .wait_timeout(guard, deadline - now)
-                .expect("subscriber-arrived wait poisoned");
-            guard = next_guard;
-            if result.timed_out()
-                && marker
-                    .waiter_count
-                    .load(std::sync::atomic::Ordering::Acquire)
-                    == 0
-            {
-                return false;
-            }
         }
     }
 
@@ -7822,13 +7751,12 @@ pub fn reml_laml_evaluate(
     // All extended coordinates store canonical fixed-β stationarity
     // derivatives g_i = F_{βi}. IFT gives β_i = -H^{-1}g_i, exactly like
     // the ρ block.
-    // Per-call sink for the EIG-DECOMP diagnostic stash. Under `#[cfg(test)]`
-    // the rayon worker for `ext_idx == 0` populates this with the captured
-    // `TermStash`; after the par_iter completes the calling thread copies
-    // it into its own thread-local via `debug_stash::store_terms`. Building
-    // the stash inside the worker and handing it back through a per-call
-    // sink eliminates the cross-thread overwrites that a process-global
-    // sink suffered under concurrent tests.
+    // Per-call sink for the EIG-DECOMP diagnostic stash. Test builds populate
+    // this on the rayon worker for `ext_idx == 0`; after the par_iter completes
+    // the calling thread copies it into its own thread-local via
+    // `debug_stash::store_terms`. Building the stash inside the worker and
+    // handing it back through a per-call sink eliminates the cross-thread
+    // overwrites that a process-global sink suffered under concurrent tests.
     let ext_stash_sink: std::sync::Arc<std::sync::Mutex<Option<debug_stash::TermStash>>> =
         std::sync::Arc::new(std::sync::Mutex::new(None));
     let ext_stash_sink_for_closure = ext_stash_sink.clone();
@@ -7890,23 +7818,16 @@ pub fn reml_laml_evaluate(
                 }
             };
 
-            // Test-only eigenmode diagnostic of the trace_logdet path.
-            //
-            // Production builds compile this block out entirely. In test
-            // runs we log the unprojected `Σ φ'(σ_j)·(Uᵀ op_total U)_jj`
-            // alongside the production trace `trace_logdet_i`, so the
-            // reader can never mistake one for the other. For Duchon ψ
-            // axes the two values can disagree by orders of magnitude
-            // because the penalty-subspace projection eliminates a
-            // spurious null-space contribution that has no place in the
-            // cost identity. The block runs whenever the Hessian has an
-            // exact dense-spectral view at small p so the stash is
-            // populated regardless of which precomputed-trace path
-            // satisfied `trace_logdet_i` above — relying on the fallback
-            // branch alone misses the case where
-            // `projected_trace_values` or `exact_dense_trace_values` is
-            // already batched, which is the configuration the
-            // projection-pin regression test actually exercises.
+            // Eigenmode diagnostic of the trace_logdet path. This captures the unprojected
+            // `Σ φ'(σ_j)·(Uᵀ op_total U)_jj` alongside the production trace
+            // `trace_logdet_i`, so the reader can never mistake one for the
+            // other. For Duchon ψ axes the two values can disagree by orders of
+            // magnitude because the penalty-subspace projection eliminates a
+            // spurious null-space contribution that has no place in the cost
+            // identity. The block runs whenever the Hessian has an exact
+            // dense-spectral view at small p so the stash is populated
+            // regardless of which precomputed-trace path satisfied
+            // `trace_logdet_i` above.
             if incl_logdet_h
                 && let Some(ds) = hop.as_exact_dense_spectral()
                 && ds.dim() <= 12
@@ -7939,7 +7860,6 @@ pub fn reml_laml_evaluate(
                     let eps_f = (2.22e-16_f64).sqrt() * (p as f64);
                     4.0 * eps_f * eps_f
                 };
-                let mut per_mode = Vec::with_capacity(p);
                 let mut unprojected_tr = 0.0_f64;
                 for j in 0..p {
                     // reg_eigenvalue = r_ε(σ) = ½(σ + √(σ²+4ε²)). Recover σ.
@@ -7947,9 +7867,9 @@ pub fn reml_laml_evaluate(
                     let sigma = r - eps_sq / (4.0 * r); // r = ½(σ + √(σ²+4ε²)) ⇒ σ = r − ε²/r
                     let phi_prime = 1.0 / (sigma * sigma + eps_sq).sqrt();
                     let contrib = phi_prime * proj[[j, j]];
-                    per_mode.push((sigma, proj[[j, j]], contrib));
                     unprojected_tr += contrib;
                 }
+                let projection_active = solution.penalty_subspace_trace.is_some();
                 if ext_idx == 0 {
                     let mut stash = debug_stash::TermStash {
                         unprojected_tr: Some(unprojected_tr),
@@ -17541,6 +17461,61 @@ mod tests {
         assert_eq!(huge[[0, 0]], 1.0);
         assert_eq!(cache.len(), 1);
     }
+
+    fn projected_factor_cache_wait_for_subscriber(
+        cache: &ProjectedFactorCache,
+        key: ProjectedFactorKey,
+        timeout: std::time::Duration,
+    ) -> bool {
+        let marker = {
+            let inner = cache
+                .inner
+                .lock()
+                .expect("projected factor cache lock poisoned");
+            let Some(m) = inner.in_progress.get(&key) else {
+                return false;
+            };
+            Arc::clone(m)
+        };
+        if marker
+            .waiter_count
+            .load(std::sync::atomic::Ordering::Acquire)
+            > 0
+        {
+            return true;
+        }
+        let (lock, cv) = &marker.subscriber_arrived;
+        let mut guard = lock
+            .lock()
+            .expect("subscriber-arrived notification lock poisoned");
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if marker
+                .waiter_count
+                .load(std::sync::atomic::Ordering::Acquire)
+                > 0
+            {
+                return true;
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let (next_guard, result) = cv
+                .wait_timeout(guard, deadline - now)
+                .expect("subscriber-arrived wait poisoned");
+            guard = next_guard;
+            if result.timed_out()
+                && marker
+                    .waiter_count
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    == 0
+            {
+                return false;
+            }
+        }
+    }
+
     #[test]
     fn projected_factor_cache_waiters_wake_when_producer_panics() {
         let cache = Arc::new(ProjectedFactorCache::with_budget(0));
@@ -17580,7 +17555,11 @@ mod tests {
         // has parked inside the Wait branch, then release the producer to
         // panic. No spinning, no sleeping — purely event-driven.
         assert!(
-            cache.wait_for_subscriber(key, std::time::Duration::from_secs(5)),
+            projected_factor_cache_wait_for_subscriber(
+                &cache,
+                key,
+                std::time::Duration::from_secs(5),
+            ),
             "waiter never subscribed to the in-progress slot"
         );
         release_tx.send(()).expect("release producer");
@@ -20351,7 +20330,9 @@ mod tests {
         assert!(!op.logdet_traces_match_hinv_kernel());
         assert!(!can_use_stochastic_logdet_hinv_kernel(&op, 1024, true));
 
-        let block = BlockCoupledOperator::from_joint_hessian(&h).unwrap();
+        let block =
+            BlockCoupledOperator::from_joint_hessian_with_mode(&h, PseudoLogdetMode::Smooth)
+                .unwrap();
         assert!(!block.prefers_stochastic_trace_estimation());
         assert!(!block.logdet_traces_match_hinv_kernel());
         assert!(!can_use_stochastic_logdet_hinv_kernel(&block, 1024, true));

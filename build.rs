@@ -236,8 +236,20 @@ fn main() {
     // because a test names it. Rustc's `dead_code` lint can't see this —
     // the test target counts as a consumer — but lexically it is dead
     // production code. The scan is heuristic and biased toward flagging.
+    // Second category emitted by the same scanner: `pub(crate)` /
+    // `pub(super)` items in `src/` with ZERO consumers anywhere — not in
+    // any other production file and not in any test. Rustc's `dead_code`
+    // lint cannot see these in a library-shaped crate (it assumes such
+    // items might be used by downstream crates, which is not what the
+    // restricted visibility means). Inherent impl methods, free fns,
+    // types, and constants all fall under this rule.
     let mut src_test_only_offenders: Vec<(PathBuf, usize, String, String)> = Vec::new();
-    scan_for_src_items_used_only_by_tests(&manifest_dir, &mut src_test_only_offenders);
+    let mut src_unreferenced_pub_scoped: Vec<(PathBuf, usize, String, String)> = Vec::new();
+    scan_for_src_items_used_only_by_tests(
+        &manifest_dir,
+        &mut src_test_only_offenders,
+        &mut src_unreferenced_pub_scoped,
+    );
 
     let mut sections: Vec<Section> = Vec::new();
 
@@ -510,6 +522,18 @@ fn main() {
                 "src/ item referenced only by tests (production code with no production consumers — implement a real caller, delete the item, or move it into a `#[cfg(test)]` private mod if it's genuinely test-support)"
                     .to_string(),
             rows: src_test_only_offenders
+                .iter()
+                .map(|(r, l, hint, s)| (r.clone(), *l, Some(hint.clone()), s.clone()))
+                .collect(),
+        });
+    }
+
+    if !src_unreferenced_pub_scoped.is_empty() {
+        sections.push(Section {
+            title:
+                "pub(crate)/pub(super) item in src/ with ZERO consumers anywhere (no production caller, no test reference — implement a real caller or delete the item; rustc's `dead_code` lint cannot see this in a library-shaped crate)"
+                    .to_string(),
+            rows: src_unreferenced_pub_scoped
                 .iter()
                 .map(|(r, l, hint, s)| (r.clone(), *l, Some(hint.clone()), s.clone()))
                 .collect(),
@@ -4026,6 +4050,7 @@ fn is_bare_numeric_literal(s: &str) -> bool {
 fn scan_for_src_items_used_only_by_tests(
     root: &Path,
     offenders: &mut Vec<(PathBuf, usize, String, String)>,
+    unreferenced_pub_scoped: &mut Vec<(PathBuf, usize, String, String)>,
 ) {
     const EXEMPT_NAMES: &[&str] = &[
         "new",
@@ -4101,8 +4126,18 @@ fn scan_for_src_items_used_only_by_tests(
         });
     });
 
-    // Extract definitions from src/ files.
-    let mut defs: Vec<(usize, usize, String)> = Vec::new();
+    // Extract definitions from src/ files. Visibility is retained so the
+    // flag step can apply the right rule per item:
+    //   * Private with zero consumers: skipped — rustc's `dead_code`
+    //     lint already covers them; flagging would duplicate.
+    //   * `pub(crate)` / `pub(super)` with zero consumers: flagged as
+    //     unreferenced (the gap rustc cannot see in a library-shaped
+    //     crate, which assumes the items might be used downstream).
+    //   * Any non-`pub` item consumed only by tests: flagged as test-only
+    //     (the original rule).
+    // Bare `pub` items are excluded — their consumers may live in
+    // downstream crates we cannot see.
+    let mut defs: Vec<(usize, usize, String, Visibility)> = Vec::new();
     for (fi, sf) in src_files.iter().enumerate() {
         for (idx, stripped) in sf.stripped.iter().enumerate() {
             if sf.mask.get(idx).copied().unwrap_or(false) {
@@ -4126,7 +4161,7 @@ fn scan_for_src_items_used_only_by_tests(
             if sf.trait_impl.get(idx).copied().unwrap_or(false) {
                 continue;
             }
-            defs.push((fi, idx, ident));
+            defs.push((fi, idx, ident, vis));
         }
     }
 
@@ -4176,10 +4211,6 @@ fn scan_for_src_items_used_only_by_tests(
             test_first_hit.entry(tok).or_insert_with(|| rel.clone());
         }
     }
-    if test_first_hit.is_empty() {
-        return;
-    }
-
     // `pub use` re-exports from src/lib.rs / src/main.rs (and crates/* equivs)
     // count as production usage.
     let mut pub_use_idents: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -4197,13 +4228,11 @@ fn scan_for_src_items_used_only_by_tests(
         }
     }
 
-    for (fi, line_idx, ident) in defs {
+    for (fi, line_idx, ident, vis) in defs {
         if pub_use_idents.contains(&ident) {
             continue;
         }
-        let Some(test_hint) = test_first_hit.get(&ident) else {
-            continue;
-        };
+        let test_hint = test_first_hit.get(&ident).cloned();
         let mut prod_consumer = false;
         for (other_fi, set) in per_file_tokens.iter().enumerate() {
             if other_fi == fi {
@@ -4231,12 +4260,33 @@ fn scan_for_src_items_used_only_by_tests(
         }
         let sf = &src_files[fi];
         let raw = sf.content.lines().nth(line_idx).unwrap_or("").to_string();
-        let hint = format!(
-            "{} (test ref: {})",
-            ident,
-            test_hint.to_string_lossy().replace('\\', "/")
-        );
-        offenders.push((sf.rel.clone(), line_idx + 1, hint, raw));
+        match (test_hint, vis) {
+            (Some(hint_path), _) => {
+                let hint = format!(
+                    "{} (test ref: {})",
+                    ident,
+                    hint_path.to_string_lossy().replace('\\', "/")
+                );
+                offenders.push((sf.rel.clone(), line_idx + 1, hint, raw));
+            }
+            (None, Visibility::PubScoped) => {
+                // Zero consumers anywhere in src/ or tests/, and the
+                // item is `pub(crate)` / `pub(super)` — rustc's
+                // `dead_code` lint cannot see this in a library-shaped
+                // crate. Routed through the dedicated section so the
+                // report is distinct from the test-only finding.
+                unreferenced_pub_scoped.push((
+                    sf.rel.clone(),
+                    line_idx + 1,
+                    ident.clone(),
+                    raw,
+                ));
+            }
+            (None, _) => {
+                // Private with zero consumers — rustc's `dead_code`
+                // already covers this. Skip to avoid duplicate diagnostics.
+            }
+        }
     }
 }
 
