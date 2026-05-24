@@ -9029,22 +9029,16 @@ fn build_model_summary(
             Array1::from_elem(y.len(), baseline)
         }
     };
-    let null_dev = if let Ok(glm_family) = gam::types::GlmFamily::try_from(family) {
-        gam::pirls::calculate_deviance(
-            y,
-            &nullmu,
-            gam::types::GlmLikelihoodSpec::canonical(glm_family),
-            weights,
-        )
-    } else {
-        gam::pirls::calculate_deviance(
-            y,
-            &nullmu,
-            gam::types::GlmLikelihoodSpec::canonical(
-                gam::types::GlmFamily::GaussianIdentity,
-            ),
-            weights,
-        )
+    let null_dev = {
+        let null_likelihood = if family.is_royston_parmar() {
+            gam::types::GlmLikelihoodSpec::canonical(gam::types::LikelihoodSpec::new(
+                gam::types::ResponseFamily::Gaussian,
+                gam::types::InverseLink::Standard(gam::types::LinkFunction::Identity),
+            ))
+        } else {
+            gam::types::GlmLikelihoodSpec::canonical(family.clone())
+        };
+        gam::pirls::calculate_deviance(y, &nullmu, &null_likelihood, weights)
     };
     let deviance_explained = if null_dev.is_finite() && null_dev > 0.0 {
         Some((1.0 - fit.deviance / null_dev).clamp(-9.0, 1.0))
