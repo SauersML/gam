@@ -55,8 +55,6 @@ src/terms/basis.rs	fn unproject(&self, u: &ArrayView1<' match &self.basis	unreac
 src/terms/basis.rs	fn unproject_jet(&self, u: &ArrayView1<' match &self.basis	unreachable!
 src/terms/basis.rs	pub fn apply_sum_to_zero_constraint_sparse( basis_matrix: &SparseColMat<usize, f64>, weights: Option<ArrayView1<f64>>, ) -> Result<(SparseColMat<usize, f64>, Array2<f64>), BasisError>	unreachable!
 src/terms/basis.rs	pub fn build_bspline_basis_1d( data: ArrayView1<' spec: &BSplineBasisSpec, ) -> Result<BasisBuildResult, BasisError>	unreachable!
-src/terms/basis.rs	pub fn center_strategy_kind(strategy: &CenterStrategy) -> CenterStrategyKind	unreachable!
-src/terms/basis.rs	pub fn center_strategy_num_centers(strategy: &CenterStrategy) -> Option<usize>	unreachable!
 src/terms/basis.rs	pub fn center_strategy_with_num_centers( strategy: &CenterStrategy, num_centers: usize, ) -> Result<CenterStrategy, BasisError>	unreachable!
 src/terms/basis.rs	pub fn create_duchon_basis_1d_derivative_dense( t: ArrayView1<' centers: ArrayView1<' power: f64, nullspace_order: DuchonNullspaceOrder, periodic: bool, order: usize, ) -> Result<Array2<f64>, BasisError>	unreachable!
 src/terms/basis.rs	pub fn create_ispline_derivative_dense( data: ArrayView1<' knot_vector: &Array1<f64>, degree: usize, derivative_order: usize, ) -> Result<Array2<f64>, BasisError>	unreachable!
