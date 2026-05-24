@@ -2002,26 +2002,13 @@ fn remap_term_collectionspec_columns(
     for random_effect_term in &mut remapped.random_effect_terms {
         random_effect_term.feature_col = resolve_training_index(random_effect_term.feature_col)?;
     }
-    fn remap_smooth_basis<F>(
-        basis: &mut SmoothBasisSpec,
-        resolve_training_index: &F,
-    ) -> Result<(), String>
+    fn remap_basis<F>(basis: &mut SmoothBasisSpec, resolve: &F) -> Result<(), String>
     where
         F: Fn(usize) -> Result<usize, String>,
     {
         match basis {
-            SmoothBasisSpec::By { inner, by_col, .. } => {
-                *by_col = resolve_training_index(*by_col)?;
-                remap_smooth_basis(inner, resolve_training_index)?;
-            }
-            SmoothBasisSpec::FactorSumToZero {
-                inner, group_col, ..
-            } => {
-                *group_col = resolve_training_index(*group_col)?;
-                remap_smooth_basis(inner, resolve_training_index)?;
-            }
             SmoothBasisSpec::BSpline1D { feature_col, .. } => {
-                *feature_col = resolve_training_index(*feature_col)?;
+                *feature_col = resolve(*feature_col)?;
             }
             SmoothBasisSpec::ThinPlate { feature_cols, .. }
             | SmoothBasisSpec::Sphere { feature_cols, .. }
@@ -2030,43 +2017,18 @@ fn remap_term_collectionspec_columns(
             | SmoothBasisSpec::TensorBSpline { feature_cols, .. }
             | SmoothBasisSpec::Sphere { feature_cols, .. } => {
                 for feature_col in feature_cols.iter_mut() {
-                    *feature_col = resolve_training_index(*feature_col)?;
+                    *feature_col = resolve(*feature_col)?;
                 }
             }
-            SmoothBasisSpec::BySmooth { smooth, by_kind } => {
-                match smooth.as_mut() {
-                    SmoothBasisSpec::BSpline1D { feature_col, .. } => {
-                        *feature_col = resolve_training_index(*feature_col)?
-                    }
-                    SmoothBasisSpec::ThinPlate { feature_cols, .. }
-                    | SmoothBasisSpec::Sphere { feature_cols, .. }
-                    | SmoothBasisSpec::Matern { feature_cols, .. }
-                    | SmoothBasisSpec::Duchon { feature_cols, .. }
-                    | SmoothBasisSpec::TensorBSpline { feature_cols, .. } => {
-                        for feature_col in feature_cols.iter_mut() {
-                            *feature_col = resolve_training_index(*feature_col)?;
-                        }
-                    }
-                    SmoothBasisSpec::BySmooth { .. } | SmoothBasisSpec::FactorSmooth { .. } => {}
-                }
-                match by_kind {
-                    crate::smooth::ByVarKind::Numeric { feature_col }
-                    | crate::smooth::ByVarKind::Factor { feature_col, .. } => {
-                        *feature_col = resolve_training_index(*feature_col)?
-                    }
-                }
-            }
-            SmoothBasisSpec::FactorSmooth { spec } => {
-                for feature_col in spec.continuous_cols.iter_mut() {
-                    *feature_col = resolve_training_index(*feature_col)?;
-                }
-                spec.group_col = resolve_training_index(spec.group_col)?;
+            SmoothBasisSpec::ByVariable { inner, by_col, .. } => {
+                *by_col = resolve(*by_col)?;
+                remap_basis(inner, resolve)?;
             }
         }
         Ok(())
     }
     for smooth_term in &mut remapped.smooth_terms {
-        remap_smooth_basis(&mut smooth_term.basis, &resolve_training_index)?;
+        remap_basis(&mut smooth_term.basis, &resolve_training_index)?;
     }
     Ok(remapped)
 }

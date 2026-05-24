@@ -107,3 +107,5 @@ posterior.save("posterior.npz")
 ## License
 
 AGPL-3.0-or-later. See [LICENSE on GitHub](https://github.com/SauersML/gam/blob/main/LICENSE).
+
+- [Difference smooths](difference-smooths.md)

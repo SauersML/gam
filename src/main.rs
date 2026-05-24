@@ -6727,12 +6727,11 @@ fn smooth_term_primary_column(term: &SmoothTermSpec) -> Option<usize> {
                 None
             }
         }
-        SmoothBasisSpec::BySmooth { smooth, .. } => smooth_term_primary_column(&SmoothTermSpec {
-            name: String::new(),
-            basis: *smooth.clone(),
-            shape: gam::smooth::ShapeConstraint::None,
+        SmoothBasisSpec::ByVariable { inner, .. } => smooth_term_primary_column(&SmoothTermSpec {
+            name: term.name.clone(),
+            basis: (**inner).clone(),
+            shape: term.shape,
         }),
-        SmoothBasisSpec::FactorSmooth { spec } => spec.continuous_cols.first().copied(),
     }
 }
 
@@ -7526,7 +7525,15 @@ fn spatial_basiswarning_family_and_cols(term: &SmoothTermSpec) -> Option<(&'stat
         SmoothBasisSpec::Sphere { feature_cols, .. } => Some(("sphere/sos", feature_cols)),
         SmoothBasisSpec::Matern { feature_cols, .. } => Some(("matern", feature_cols)),
         SmoothBasisSpec::Duchon { feature_cols, .. } => Some(("duchon", feature_cols)),
-        SmoothBasisSpec::By { .. } | SmoothBasisSpec::FactorSumToZero { .. } => None,
+        SmoothBasisSpec::ByVariable { inner, .. } => match inner.as_ref() {
+            SmoothBasisSpec::ThinPlate { feature_cols, .. } => {
+                Some(("thinplate/tps", feature_cols))
+            }
+            SmoothBasisSpec::Sphere { feature_cols, .. } => Some(("sphere/sos", feature_cols)),
+            SmoothBasisSpec::Matern { feature_cols, .. } => Some(("matern", feature_cols)),
+            SmoothBasisSpec::Duchon { feature_cols, .. } => Some(("duchon", feature_cols)),
+            _ => None,
+        },
         SmoothBasisSpec::BSpline1D { .. } | SmoothBasisSpec::TensorBSpline { .. } => None,
     }
 }
@@ -7620,8 +7627,18 @@ fn smooth_term_feature_cols(term: &SmoothTermSpec) -> Vec<usize> {
         | SmoothBasisSpec::Sphere { feature_cols, .. }
         | SmoothBasisSpec::Matern { feature_cols, .. }
         | SmoothBasisSpec::Duchon { feature_cols, .. }
-        | SmoothBasisSpec::TensorBSpline { feature_cols, .. }
-        | SmoothBasisSpec::Sphere { feature_cols, .. } => feature_cols.clone(),
+        | SmoothBasisSpec::TensorBSpline { feature_cols, .. } => feature_cols.clone(),
+        SmoothBasisSpec::ByVariable { inner, by_col, .. } => {
+            let mut cols = smooth_term_feature_cols(&SmoothTermSpec {
+                name: term.name.clone(),
+                basis: (**inner).clone(),
+                shape: term.shape,
+            });
+            cols.push(*by_col);
+            cols.sort_unstable();
+            cols.dedup();
+            cols
+        }
     }
 }
 
@@ -7683,9 +7700,16 @@ fn smooth_basiswarning_family_rank(term: &SmoothTermSpec) -> u8 {
         SmoothBasisSpec::BSpline1D { .. } => 0,
         SmoothBasisSpec::TensorBSpline { .. } => 1,
         SmoothBasisSpec::ThinPlate { .. } => 2,
-        SmoothBasisSpec::Matern { .. } => 3,
-        SmoothBasisSpec::Duchon { .. } => 4,
-        SmoothBasisSpec::Sphere { .. } => 5,
+        SmoothBasisSpec::Sphere { .. } => 3,
+        SmoothBasisSpec::Matern { .. } => 4,
+        SmoothBasisSpec::Duchon { .. } => 5,
+        SmoothBasisSpec::ByVariable { inner, .. } => {
+            smooth_basiswarning_family_rank(&SmoothTermSpec {
+                name: term.name.clone(),
+                basis: (**inner).clone(),
+                shape: term.shape,
+            })
+        }
     }
 }
 
