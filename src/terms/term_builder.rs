@@ -22,8 +22,8 @@ use crate::inference::formula_dsl::{
 use crate::inference::model::ColumnKindTag;
 use crate::resource::ResourcePolicy;
 use crate::smooth::{
-    BySmoothKind, LinearCoefficientGeometry, LinearTermSpec, RandomEffectTermSpec, ShapeConstraint,
-    SmoothBasisSpec, SmoothTermSpec, TensorBSplineIdentifiability, TensorBSplineSpec,
+    BySmoothKind, ByVariableSpec, LinearCoefficientGeometry, LinearTermSpec, RandomEffectTermSpec,
+    ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, TensorBSplineIdentifiability, TensorBSplineSpec,
     TermCollectionSpec,
 };
 
@@ -385,14 +385,7 @@ pub fn build_termspec(
                         format!("internal column-kind lookup failed for by variable '{by_name}'")
                     })? {
                         ColumnKindTag::Categorical => {
-                            let mut levels: Vec<u64> = ds
-                                .values
-                                .column(by_col)
-                                .iter()
-                                .map(|v| v.to_bits())
-                                .collect();
-                            levels.sort_unstable();
-                            levels.dedup();
+                            let levels = encoded_levels_for_column(ds, by_col);
                             // Add an unpenalized treatment-coded fixed main effect for the factor, unless present already.
                             if !random_terms
                                 .iter()
@@ -406,13 +399,17 @@ pub fn build_termspec(
                                     frozen_levels: None,
                                 });
                             }
-                            for level_bits in levels {
+                            for (level_bits, level_label) in levels {
                                 smooth_terms.push(SmoothTermSpec {
                                     name: format!("{}:{}", label, level_bits),
                                     basis: SmoothBasisSpec::ByVariable {
                                         inner: Box::new(inner_basis.clone()),
                                         by_col,
                                         kind: BySmoothKind::Level { level_bits },
+                                        by: ByVariableSpec::Level {
+                                            value_bits: level_bits,
+                                            label: level_label,
+                                        },
                                     },
                                     shape: ShapeConstraint::None,
                                 });
@@ -425,6 +422,7 @@ pub fn build_termspec(
                                     inner: Box::new(inner_basis),
                                     by_col,
                                     kind: BySmoothKind::Numeric,
+                                    by: ByVariableSpec::Numeric,
                                 },
                                 shape: ShapeConstraint::None,
                             });
