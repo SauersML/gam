@@ -3453,6 +3453,7 @@ fn build_standard_latent_analytic_penalty_registry(
                     analytic_descriptor_temperature_schedule(descriptor, &context)?;
                 let learnable_alpha = descriptor
                     .get("learnable_alpha")
+                    .or_else(|| descriptor.get("learnable"))
                     .and_then(JsonValue::as_bool)
                     .unwrap_or(false);
                 let penalty = IBPAssignmentPenalty::new(k_max, alpha, tau, learnable_alpha);

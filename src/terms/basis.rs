@@ -27376,9 +27376,9 @@ mod tests {
         let third =
             Array2::from_shape_vec((2, 2), vec![9.0, 10.0, 11.0, 12.0]).expect("third data");
 
-        let _ = shared_owned_data_matrix(first.view(), &cache);
-        let _ = shared_owned_data_matrix(second.view(), &cache);
-        let _ = shared_owned_data_matrix(third.view(), &cache);
+        drop(shared_owned_data_matrix(first.view(), &cache));
+        drop(shared_owned_data_matrix(second.view(), &cache));
+        drop(shared_owned_data_matrix(third.view(), &cache));
 
         // At most one 2x2 f64 matrix (32 bytes) resident.
         assert!(cache.owned_data.resident_bytes() <= 8 * 2 * 2);
