@@ -64,7 +64,7 @@ pub enum OperationKind {
 }
 
 #[inline]
-pub fn profiling_enabled() -> bool {
+pub const fn profiling_enabled() -> bool {
     false
 }
 
