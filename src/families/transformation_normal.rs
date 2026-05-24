@@ -3575,6 +3575,25 @@ impl TransformationNormalFamily {
         let h_prime = row_quantities.h_prime.as_ref();
         let mut objective_psi = 0.0;
         let mut score_psi = Array1::<f64>::zeros(p_total);
+        let endpoint_basis = [
+            self.response_upper_basis
+                .as_slice()
+                .ok_or_else(|| "SCOP endpoint upper basis is not contiguous".to_string())?,
+            self.response_lower_basis
+                .as_slice()
+                .ok_or_else(|| "SCOP endpoint lower basis is not contiguous".to_string())?,
+        ];
+        let mut gamma = vec![0.0; p_resp];
+        let mut gamma_psi = vec![0.0; p_resp];
+        let mut endpoint_factor = vec![[0.0; 2]; p_resp];
+        let mut endpoint_psi_cov_factor = vec![[0.0; 2]; p_resp];
+        let mut endpoint_psi_psi_factor = vec![[0.0; 2]; p_resp];
+        let mut h_factor = vec![0.0; p_resp];
+        let mut hp_factor = vec![0.0; p_resp];
+        let mut hpsi_cov_factor = vec![0.0; p_resp];
+        let mut hppsi_cov_factor = vec![0.0; p_resp];
+        let mut hpsi_psi_factor = vec![0.0; p_resp];
+        let mut hppsi_psi_factor = vec![0.0; p_resp];
 
         for i in 0..n {
             let cov_row = cov.row(i);
@@ -3589,8 +3608,8 @@ impl TransformationNormalFamily {
             let q = row_quantities.endpoint_q[i];
             let gamma_row = row_quantities.gamma.row(i);
 
-            let mut gamma = vec![0.0; p_resp];
-            let mut gamma_psi = vec![0.0; p_resp];
+            gamma.fill(0.0);
+            gamma_psi.fill(0.0);
             for k in 0..p_resp {
                 gamma[k] = gamma_row[k];
                 gamma_psi[k] = beta_mat.row(k).dot(&psi_row);
@@ -3603,18 +3622,10 @@ impl TransformationNormalFamily {
                 hp_psi += 2.0 * rd[k] * gamma[k] * gamma_psi[k];
             }
 
-            let endpoint_basis = [
-                self.response_upper_basis
-                    .as_slice()
-                    .ok_or_else(|| "SCOP endpoint upper basis is not contiguous".to_string())?,
-                self.response_lower_basis
-                    .as_slice()
-                    .ok_or_else(|| "SCOP endpoint lower basis is not contiguous".to_string())?,
-            ];
             let mut endpoint_psi = [0.0; 2];
-            let mut endpoint_factor = vec![[0.0; 2]; p_resp];
-            let mut endpoint_psi_cov_factor = vec![[0.0; 2]; p_resp];
-            let mut endpoint_psi_psi_factor = vec![[0.0; 2]; p_resp];
+            endpoint_factor.fill([0.0; 2]);
+            endpoint_psi_cov_factor.fill([0.0; 2]);
+            endpoint_psi_psi_factor.fill([0.0; 2]);
             for e in 0..2 {
                 let basis = endpoint_basis[e];
                 endpoint_psi[e] = basis[0] * gamma_psi[0];
@@ -3631,12 +3642,12 @@ impl TransformationNormalFamily {
             objective_psi +=
                 wi * (hi * h_psi - hp_psi * inv_hp + endpoint_chain_first(&q, endpoint_psi));
 
-            let mut h_factor = vec![0.0; p_resp];
-            let mut hp_factor = vec![0.0; p_resp];
-            let mut hpsi_cov_factor = vec![0.0; p_resp];
-            let mut hppsi_cov_factor = vec![0.0; p_resp];
-            let mut hpsi_psi_factor = vec![0.0; p_resp];
-            let mut hppsi_psi_factor = vec![0.0; p_resp];
+            h_factor.fill(0.0);
+            hp_factor.fill(0.0);
+            hpsi_cov_factor.fill(0.0);
+            hppsi_cov_factor.fill(0.0);
+            hpsi_psi_factor.fill(0.0);
+            hppsi_psi_factor.fill(0.0);
             h_factor[0] = rv[0];
             hp_factor[0] = rd[0];
             hpsi_psi_factor[0] = rv[0];
