@@ -15131,13 +15131,16 @@ mod tests {
             "y ~ x".to_string(),
             ModelKind::Standard,
             FittedFamily::Standard {
-                likelihood: LikelihoodFamily::GaussianIdentity,
-                link: Some(LikelihoodFamily::GaussianIdentity.link_function()),
+                likelihood: LikelihoodSpec::new(
+                    ResponseFamily::Gaussian,
+                    InverseLink::Standard(LinkFunction::Identity),
+                ),
+                link: Some(LinkFunction::Identity),
                 latent_cloglog_state: None,
                 mixture_state: None,
                 sas_state: None,
             },
-            LikelihoodFamily::GaussianIdentity.name().to_string(),
+            "gaussian".to_string(),
         ));
         let mismatched_bytes =
             serde_json::to_vec(&model).expect("mismatched model should serialize");
