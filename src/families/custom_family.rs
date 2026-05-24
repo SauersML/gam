@@ -5400,6 +5400,7 @@ pub(crate) fn shared_dense_arc(x: &Array2<f64>) -> Arc<Array2<f64>> {
         if let Some(shared) = guard.get(&key).and_then(Weak::upgrade) {
             return shared;
         }
+        guard.retain(|_, shared| shared.strong_count() > 0);
         let shared = Arc::new(x.clone());
         guard.insert(key, Arc::downgrade(&shared));
         shared

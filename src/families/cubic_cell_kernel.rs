@@ -1079,6 +1079,9 @@ struct TailCellMomentCacheKey {
     max_degree: usize,
 }
 
+const TAIL_CELL_MOMENT_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+const TAIL_CELL_MOMENT_CACHE_MAX_ENTRIES: usize = 262_144;
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct TailCellMomentCacheStats {
     pub hits: usize,
@@ -1109,11 +1112,24 @@ impl TailCellMomentCacheStats {
 /// caller needs deterministic hit/miss bookkeeping that is not polluted by
 /// concurrent traffic on the global memo. The production path uses the
 /// global instance behind [`evaluate_cell_moments`].
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct TailCellMomentCache {
-    moments: std::collections::HashMap<TailCellMomentCacheKey, CellMomentState>,
+    moments: ByteLruCache<TailCellMomentCacheKey, CellMomentState>,
     hits: usize,
     misses: usize,
+}
+
+impl Default for TailCellMomentCache {
+    fn default() -> Self {
+        Self {
+            moments: ByteLruCache::with_max_entries(
+                TAIL_CELL_MOMENT_CACHE_MAX_BYTES,
+                TAIL_CELL_MOMENT_CACHE_MAX_ENTRIES,
+            ),
+            hits: 0,
+            misses: 0,
+        }
+    }
 }
 
 impl TailCellMomentCache {
@@ -1146,12 +1162,8 @@ impl TailCellMomentCache {
     /// miss. Cells outside the affine-tail keyset bypass the cache and run
     /// the uncached evaluator directly without touching the counters.
     ///
-    /// Stat semantics: a **miss** is counted iff the call actually inserted
-    /// a new entry into the cache; every other outcome (key already present
-    /// at lookup time, or another thread inserted the same key between our
-    /// initial probe and the final `entry`) is counted as a **hit**. With
-    /// this contract `stats().misses == stats().entries` holds by
-    /// construction, even when the global cache races between threads.
+    /// Stat semantics: a **miss** is counted iff this call inserted a new
+    /// entry into the bounded LRU; every cache hit increments `hits`.
     pub fn evaluate(
         &mut self,
         cell: DenestedCubicCell,
@@ -1162,7 +1174,7 @@ impl TailCellMomentCache {
         };
         if let Some(state) = self.moments.get(&key) {
             self.hits += 1;
-            return Ok(state.clone());
+            return Ok(state);
         }
         let state = evaluate_cell_moments_uncached(cell, max_degree)?;
         self.misses += 1;
@@ -1234,14 +1246,14 @@ fn evaluate_cell_moments_with_locked_tail_cache(
     if TAIL_CELL_MOMENT_CACHE_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
         && let Some(key) = tail_cell_cache_key(cell, max_degree)
     {
-        if let Some(state) = cache.moments.get(&key).cloned() {
+        if let Some(state) = cache.moments.get(&key) {
             cache.hits += 1;
             return Ok(state);
         }
         cache.misses += 1;
         let state = evaluate_cell_moments_uncached(cell, max_degree)?;
-        let state = cache.moments.entry(key).or_insert_with(|| state.clone());
-        return Ok(state.clone());
+        cache.moments.insert(key, state.clone());
+        return Ok(state);
     }
     evaluate_cell_moments_uncached(cell, max_degree)
 }
@@ -1374,15 +1386,17 @@ impl CachedCellMoments {
 
 impl ResidentBytes for CachedCellMoments {
     fn resident_bytes(&self) -> usize {
-        let spilled_bytes = if self.state.moments.spilled() {
-            self.state
-                .moments
-                .capacity()
-                .saturating_mul(std::mem::size_of::<f64>())
-        } else {
-            0
-        };
-        std::mem::size_of::<Self>().saturating_add(spilled_bytes)
+        let value_bytes = self
+            .state
+            .as_ref()
+            .map_or(0, |state| state.resident_bytes());
+        let derivative_bytes = self
+            .derivative_state
+            .as_ref()
+            .map_or(0, |state| state.resident_bytes());
+        std::mem::size_of::<Self>()
+            .saturating_add(value_bytes)
+            .saturating_add(derivative_bytes)
     }
 }
 
@@ -1434,10 +1448,36 @@ pub struct CellMomentState {
     pub moments: CellMomentVec,
 }
 
+impl ResidentBytes for CellMomentState {
+    fn resident_bytes(&self) -> usize {
+        let spilled_bytes = if self.moments.spilled() {
+            self.moments
+                .capacity()
+                .saturating_mul(std::mem::size_of::<f64>())
+        } else {
+            0
+        };
+        std::mem::size_of::<Self>().saturating_add(spilled_bytes)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct CellDerivativeMomentState {
     pub branch: ExactCellBranch,
     pub moments: CellMomentVec,
+}
+
+impl ResidentBytes for CellDerivativeMomentState {
+    fn resident_bytes(&self) -> usize {
+        let spilled_bytes = if self.moments.spilled() {
+            self.moments
+                .capacity()
+                .saturating_mul(std::mem::size_of::<f64>())
+        } else {
+            0
+        };
+        std::mem::size_of::<Self>().saturating_add(spilled_bytes)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -3333,7 +3373,7 @@ pub fn evaluate_cell_moments(
         let mut cache = tail_cell_moment_cache()
             .lock()
             .expect("tail cell moment cache mutex poisoned");
-        if let Some(state) = cache.moments.get(&key).cloned() {
+        if let Some(state) = cache.moments.get(&key) {
             cache.hits += 1;
             return Ok(state);
         }
@@ -3343,27 +3383,14 @@ pub fn evaluate_cell_moments(
         .lock()
         .expect("tail cell moment cache mutex poisoned");
     let cache = &mut *cache;
-    let result = match cache.moments.entry(key) {
-        std::collections::hash_map::Entry::Occupied(occupied) => {
-            // Another thread inserted the same key while we computed. Our
-            // computed state is discarded; the existing entry is returned.
-            // Counting this as a hit (rather than a miss) keeps the
-            // invariant `misses == entries` true even under contention,
-            // which makes the cache observable to deterministic callers.
-            let value = occupied.get().clone();
-            (false, value)
-        }
-        std::collections::hash_map::Entry::Vacant(vacant) => {
-            let value = vacant.insert(state).clone();
-            (true, value)
-        }
-    };
-    if result.0 {
-        cache.misses += 1;
-    } else {
+    if let Some(value) = cache.moments.get(&key) {
         cache.hits += 1;
+        Ok(value)
+    } else {
+        cache.misses += 1;
+        cache.moments.insert(key, state.clone());
+        Ok(state)
     }
-    Ok(result.1)
 }
 
 /// Evaluate cell moments without consulting the global affine-tail memo.

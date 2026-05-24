@@ -1402,49 +1402,92 @@ fn load_parquet_with_schema(
             column_kinds.push(sc.kind);
             schema_cols.push((*sc).clone());
 
-            // If schema says categorical but inferred data was also categorical,
-            // re-map levels to match the schema's level order.
-            if matches!(sc.kind, ColumnKindTag::Categorical)
-                && matches!(inferred.column_kinds[j], ColumnKindTag::Categorical)
-            {
-                let inferred_col = &inferred.schema.columns[j];
-                // Build mapping: inferred_level_name -> schema_level_index.
-                let schema_level_map: HashMap<&str, f64> = sc
-                    .levels
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, v)| (v.as_str(), idx as f64))
-                    .collect();
-                let inferred_to_schema: Vec<f64> = inferred_col
-                    .levels
-                    .iter()
-                    .map(|lv| {
-                        schema_level_map.get(lv.as_str()).copied().ok_or_else(|| {
-                            DataError::SchemaMismatch {
-                                reason: format!(
-                                    "unseen level '{}' in categorical column '{}'",
-                                    lv, name
-                                ),
-                            }
+            match sc.kind {
+                ColumnKindTag::Continuous => {
+                    if matches!(inferred.column_kinds[j], ColumnKindTag::Categorical) {
+                        return Err(DataError::SchemaMismatch {
+                            reason: format!(
+                                "column '{}' is continuous in schema but parquet column is string/categorical",
+                                name
+                            ),
+                        });
+                    }
+                }
+                ColumnKindTag::Binary => {
+                    if matches!(inferred.column_kinds[j], ColumnKindTag::Categorical) {
+                        return Err(DataError::SchemaMismatch {
+                            reason: format!(
+                                "column '{}' is binary in schema but parquet column is string/categorical",
+                                name
+                            ),
+                        });
+                    }
+                    if let Some(row) = values
+                        .column(j)
+                        .iter()
+                        .position(|value| {
+                            (*value - 0.0).abs() >= 1e-12
+                                && (*value - 1.0).abs() >= 1e-12
                         })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                for i in 0..n {
-                    let old_code = values[[i, j]] as usize;
-                    if old_code >= inferred_to_schema.len() {
-                        match unseen_policy {
-                            UnseenCategoryPolicy::Error => {
-                                return Err(DataError::SchemaMismatch {
+                    {
+                        return Err(DataError::SchemaMismatch {
+                            reason: format!(
+                                "column '{}' is binary in schema but row {} has value {}; expected 0 or 1",
+                                name,
+                                row + 1,
+                                values[[row, j]]
+                            ),
+                        });
+                    }
+                }
+                ColumnKindTag::Categorical => {
+                    if !matches!(inferred.column_kinds[j], ColumnKindTag::Categorical) {
+                        return Err(DataError::SchemaMismatch {
+                            reason: format!(
+                                "column '{}' is categorical in schema but parquet column is numeric",
+                                name
+                            ),
+                        });
+                    }
+                    let inferred_col = &inferred.schema.columns[j];
+                    // Build mapping: inferred_level_name -> schema_level_index.
+                    let schema_level_map: HashMap<&str, f64> = sc
+                        .levels
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, v)| (v.as_str(), idx as f64))
+                        .collect();
+                    let inferred_to_schema: Vec<f64> = inferred_col
+                        .levels
+                        .iter()
+                        .map(|lv| {
+                            schema_level_map.get(lv.as_str()).copied().ok_or_else(|| {
+                                DataError::SchemaMismatch {
                                     reason: format!(
-                                        "unseen categorical code at row {}, column '{}'",
-                                        i + 1,
-                                        name
+                                        "unseen level '{}' in categorical column '{}'",
+                                        lv, name
                                     ),
-                                });
+                                }
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    for i in 0..n {
+                        let old_code = values[[i, j]] as usize;
+                        if old_code >= inferred_to_schema.len() {
+                            match unseen_policy {
+                                UnseenCategoryPolicy::Error => {
+                                    return Err(DataError::SchemaMismatch {
+                                        reason: format!(
+                                            "unseen categorical code at row {}, column '{}'",
+                                            i + 1,
+                                            name
+                                        ),
+                                    });
+                                }
                             }
                         }
+                        values[[i, j]] = inferred_to_schema[old_code];
                     }
-                    values[[i, j]] = inferred_to_schema[old_code];
                 }
             }
         } else {
