@@ -14972,9 +14972,17 @@ impl SingleBlockLatentCoordDesignCache {
         let term_index = self.term_index;
         let analytic_rho_count = self.analytic_rho_count;
         let data = self.data.view();
+        let design_context_digest =
+            crate::solver::latent_cache::latent_design_context_cache_digest(
+                data,
+                &spec,
+                term_index,
+                &self.feature_cols,
+            )
+            .map_err(|e| e.to_string())?;
         let lookup = self
             .latent_design_cache
-            .lookup_or_compute(latent.clone(), basis_kind, || {
+            .lookup_or_compute(latent.clone(), basis_kind, design_context_digest, || {
                 let rebuilt = build_term_collection_design(data, &spec).map_err(|e| {
                     EstimationError::InvalidInput(format!(
                         "failed to rebuild latent-coordinate design: {e}"
