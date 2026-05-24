@@ -26,7 +26,7 @@ use crate::mixture_link::{
 };
 use crate::probability::{normal_cdf, normal_pdf, standard_normal_quantile};
 use crate::quadrature::QuadratureContext;
-use crate::types::{InverseLink, LikelihoodSpec, LikelihoodSpec, ResponseFamily};
+use crate::types::{InverseLink, LikelihoodSpec, ResponseFamily};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
@@ -46,101 +46,15 @@ fn apply_family_inverse_link(
     strategy_for_spec(family).inverse_link_array(eta.view())
 }
 
-/// Build a `LikelihoodSpec` from a legacy `(LikelihoodSpec, Option<&InverseLink>)`
-/// pair as it appears at call sites in this file. For the parameterized binomial
-/// variants (`BinomialSas`, `BinomialBetaLogistic`, `BinomialMixture`,
-/// `BinomialLatentCLogLog`) the sibling `link_kind` carries the required state;
-/// when it is absent (or carries an inconsistent variant) we fall back to a
-/// `Standard(Logit)` link so downstream `match spec.response` arms still
-/// classify the response correctly. This is purely a local converter used to
-/// drive `match`es on `spec.response` / `spec.link`; no public API in this
-/// file changes shape.
+/// Build a `LikelihoodSpec` from a response spec plus an optional fitted
+/// inverse-link state as it appears at call sites in this file.
 fn spec_from_family_link(
     family: LikelihoodSpec,
     link_kind: Option<&InverseLink>,
 ) -> LikelihoodSpec {
-    use crate::types::LinkFunction;
-    match family {
-        LikelihoodSpec::gaussian_identity() => LikelihoodSpec {
-            response: ResponseFamily::Gaussian,
-            link: InverseLink::Standard(LinkFunction::Identity),
-        },
-        LikelihoodSpec::binomial_logit() => LikelihoodSpec {
-            response: ResponseFamily::Binomial,
-            link: InverseLink::Standard(LinkFunction::Logit),
-        },
-        LikelihoodSpec::binomial_probit() => LikelihoodSpec {
-            response: ResponseFamily::Binomial,
-            link: InverseLink::Standard(LinkFunction::Probit),
-        },
-        LikelihoodSpec::binomial_cloglog() => LikelihoodSpec {
-            response: ResponseFamily::Binomial,
-            link: InverseLink::Standard(LinkFunction::CLogLog),
-        },
-        LikelihoodSpec::poisson_log() => LikelihoodSpec {
-            response: ResponseFamily::Poisson,
-            link: InverseLink::Standard(LinkFunction::Log),
-        },
-        LikelihoodSpec::Tweedie { p } => LikelihoodSpec {
-            response: ResponseFamily::Tweedie { p },
-            link: InverseLink::Standard(LinkFunction::Log),
-        },
-        LikelihoodSpec::NegativeBinomial { theta } => LikelihoodSpec {
-            response: ResponseFamily::NegativeBinomial { theta },
-            link: InverseLink::Standard(LinkFunction::Log),
-        },
-        LikelihoodSpec::BetaLogit { phi } => LikelihoodSpec {
-            response: ResponseFamily::Beta { phi },
-            link: InverseLink::Standard(LinkFunction::Logit),
-        },
-        LikelihoodSpec::gamma_log() => LikelihoodSpec {
-            response: ResponseFamily::Gamma,
-            link: InverseLink::Standard(LinkFunction::Log),
-        },
-        LikelihoodSpec::royston_parmar() => LikelihoodSpec {
-            response: ResponseFamily::RoystonParmar,
-            link: InverseLink::Standard(LinkFunction::Identity),
-        },
-        LikelihoodSpec::binomial_link(LinkFunction::Logit) => {
-            let link = match link_kind {
-                Some(InverseLink::Mixture(state)) => InverseLink::Mixture(state.clone()),
-                _ => InverseLink::Standard(LinkFunction::Logit),
-            };
-            LikelihoodSpec {
-                response: ResponseFamily::Binomial,
-                link,
-            }
-        }
-        LikelihoodSpec::binomial_link(LinkFunction::Sas) => {
-            let link = match link_kind {
-                Some(InverseLink::Sas(state)) => InverseLink::Sas(state.clone()),
-                _ => InverseLink::Standard(LinkFunction::Logit),
-            };
-            LikelihoodSpec {
-                response: ResponseFamily::Binomial,
-                link,
-            }
-        }
-        LikelihoodSpec::binomial_link(LinkFunction::BetaLogistic) => {
-            let link = match link_kind {
-                Some(InverseLink::BetaLogistic(state)) => InverseLink::BetaLogistic(state.clone()),
-                _ => InverseLink::Standard(LinkFunction::Logit),
-            };
-            LikelihoodSpec {
-                response: ResponseFamily::Binomial,
-                link,
-            }
-        }
-        LikelihoodSpec::binomial_link(LinkFunction::CLogLog) => {
-            let link = match link_kind {
-                Some(InverseLink::LatentCLogLog(state)) => InverseLink::LatentCLogLog(state.clone()),
-                _ => InverseLink::Standard(LinkFunction::CLogLog),
-            };
-            LikelihoodSpec {
-                response: ResponseFamily::Binomial,
-                link,
-            }
-        }
+    match link_kind {
+        Some(link) => LikelihoodSpec::new(family.response, link.clone()),
+        None => family,
     }
 }
 
@@ -762,7 +676,7 @@ impl PredictableModel for StandardPredictor {
         } else {
             eta_base
         };
-        let strategy = strategy_for_family(self.family, self.link_kind.as_ref());
+        let strategy = strategy_for_family(self.family.clone(), self.link_kind.as_ref());
         let mean = strategy.inverse_link_array(eta.view())?;
         Ok(PredictResult { eta, mean })
     }
@@ -781,7 +695,7 @@ impl PredictableModel for StandardPredictor {
         } else {
             eta_base
         };
-        let strategy = strategy_for_family(self.family, self.link_kind.as_ref());
+        let strategy = strategy_for_family(self.family.clone(), self.link_kind.as_ref());
         // Cache d1 from the same jet that produces mean so we do not recompute it
         // in `delta_method_mean_se` below.
         let (mean, dmu_deta) = inverse_link_mean_and_d1(&strategy, eta.view())?;
@@ -876,7 +790,7 @@ impl PredictableModel for StandardPredictor {
                 input.design.clone(),
                 self.beta.view(),
                 input.offset.view(),
-                spec_from_family_link(self.family, self.link_kind.as_ref()),
+                spec_from_family_link(self.family.clone(), self.link_kind.as_ref()),
                 fit,
                 options,
             );
@@ -900,7 +814,7 @@ impl PredictableModel for StandardPredictor {
         let eta_upper = &pred.eta + &eta_z_se;
         let mut mean_lower = &pred.mean - &mean_z_se;
         let mut mean_upper = &pred.mean + &mean_z_se;
-        let spec = spec_from_family_link(self.family, self.link_kind.as_ref());
+        let spec = spec_from_family_link(self.family.clone(), self.link_kind.as_ref());
         let (lo, hi) = match spec.response {
             ResponseFamily::Gaussian => (f64::NEG_INFINITY, f64::INFINITY),
             ResponseFamily::Poisson
@@ -947,7 +861,7 @@ impl PredictableModel for StandardPredictor {
                         .to_string(),
                 )
             })?;
-            let family = spec_from_family_link(self.family, self.link_kind.as_ref());
+            let family = spec_from_family_link(self.family.clone(), self.link_kind.as_ref());
             let strategy = strategy_from_fit(&family, fit)?;
             predict_gam_posterior_mean_from_backendwith_bc(
                 input.design.clone(),
@@ -1000,7 +914,7 @@ impl PredictableModel for StandardPredictor {
                     .assign(&wiggle_design);
                 Ok(vec![grad])
             })?;
-            let strategy = strategy_for_family(self.family, self.link_kind.as_ref());
+            let strategy = strategy_for_family(self.family.clone(), self.link_kind.as_ref());
             let quadctx = crate::quadrature::QuadratureContext::new();
             let mean = plugin
                 .eta
@@ -1017,7 +931,7 @@ impl PredictableModel for StandardPredictor {
             }
         };
         if let Some(level) = confidence_level {
-            enrich_posterior_mean_bounds(&mut result, level, self.family, self.link_kind.as_ref())?;
+            enrich_posterior_mean_bounds(&mut result, level, self.family.clone(), self.link_kind.as_ref())?;
         }
         Ok(result)
     }

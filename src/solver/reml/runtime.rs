@@ -1332,7 +1332,7 @@ fn reml_supports_firth(likelihood: GlmLikelihoodSpec) -> bool {
 
 #[inline]
 fn reml_fixed_glm_dispersion(likelihood: GlmLikelihoodSpec) -> f64 {
-    let spec = reml_spec(likelihood);
+    let spec = reml_spec(likelihood.clone());
     match (&spec.response, &spec.link) {
         // Beta carries phi inside the response variant under the LikelihoodSpec form.
         (ResponseFamily::Beta { phi }, _) => *phi,
@@ -2935,7 +2935,7 @@ impl<'a> RemlState<'a> {
         mode: super::unified::EvalMode,
         ext_coords: &[super::unified::HyperCoord],
     ) -> Result<TkCorrectionTerms, EstimationError> {
-        if reml_is_gaussian_identity(self.config.likelihood) {
+        if reml_is_gaussian_identity(self.config.likelihood.clone()) {
             return Ok(TkCorrectionTerms {
                 value: 0.0,
                 gradient: None,
@@ -3009,7 +3009,7 @@ impl<'a> RemlState<'a> {
             let lambdas: Vec<f64> = rho.iter().map(|r| r.exp()).collect();
             let beta = self.sparse_exact_beta_original(pirls_result);
             let firth_op = if self.config.firth_bias_reduction
-                && reml_supports_firth(self.config.likelihood)
+                && reml_supports_firth(self.config.likelihood.clone())
             {
                 if let Some(cached) = bundle.firth_dense_operator_original.as_ref() {
                     Some(cached.clone())
@@ -3157,7 +3157,7 @@ impl<'a> RemlState<'a> {
             pirls_result.beta_transformed.as_ref().clone()
         };
         let firth_op =
-            if self.config.firth_bias_reduction && reml_supports_firth(self.config.likelihood) {
+            if self.config.firth_bias_reduction && reml_supports_firth(self.config.likelihood.clone()) {
                 Some(std::sync::Arc::new(Self::build_firth_dense_operator(
                     &x_eff_dense,
                     &pirls_result.final_eta,
@@ -3190,7 +3190,7 @@ impl<'a> RemlState<'a> {
         mode: super::unified::EvalMode,
         ext_coords: &[super::unified::HyperCoord],
     ) -> Result<(), EstimationError> {
-        if reml_is_gaussian_identity(self.config.likelihood)
+        if reml_is_gaussian_identity(self.config.likelihood.clone())
             || !self.config.firth_bias_reduction
             || !compute_gradient_for_tk(mode)
         {
@@ -3757,7 +3757,7 @@ impl<'a> RemlState<'a> {
         // Mixture links advertise `link_function() == Logit` but are
         // non-canonical; route them through the general path below.
         let canonical_logit = {
-            let spec = reml_spec(pirls_result.likelihood);
+            let spec = reml_spec(pirls_result.likelihood.clone());
             matches!(spec.response, ResponseFamily::Binomial)
                 && matches!(spec.link, InverseLink::Standard(LinkFunction::Logit))
         } && self.runtime_mixture_link_state.is_none();
@@ -3785,9 +3785,9 @@ impl<'a> RemlState<'a> {
         // General observed-information path for non-canonical Bernoulli
         // links and other GLM families that support the observed Hessian
         // surface (Probit, CLogLog, SAS, BetaLogistic, Mixture, GammaLog).
-        let likelihood = pirls_result.likelihood;
-        let weight_family = pirls::weight_family_for_glm_likelihood(likelihood);
-        let phi = reml_fixed_glm_dispersion(likelihood);
+        let likelihood = pirls_result.likelihood.clone();
+        let weight_family = pirls::weight_family_for_glm_likelihood(&likelihood);
+        let phi = reml_fixed_glm_dispersion(likelihood.clone());
         let dmu_deta = &pirls_result.solve_dmu_deta;
         let d2mu_deta2 = &pirls_result.solve_d2mu_deta2;
         let d3mu_deta3 = &pirls_result.solve_d3mu_deta3;
@@ -3869,7 +3869,7 @@ impl<'a> RemlState<'a> {
     ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>, Array1<f64>), EstimationError> {
         let (c_array, d_array, e_array) = self.hessian_cde_arrays(pirls_result)?;
         let canonical_logit = {
-            let spec = reml_spec(pirls_result.likelihood);
+            let spec = reml_spec(pirls_result.likelihood.clone());
             matches!(spec.response, ResponseFamily::Binomial)
                 && matches!(spec.link, InverseLink::Standard(LinkFunction::Logit))
         } && self.runtime_mixture_link_state.is_none();

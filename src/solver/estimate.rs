@@ -772,9 +772,10 @@ impl RemlConfig {
         // the outer also tightens the inner), but never coarser than the
         // floor — a coarse outer must not silently pollute the inner mode.
         let pirls_tol = reml_tol.min(PIRLS_INNER_TOLERANCE_FLOOR);
+        let link_kind = InverseLink::Standard(likelihood.link_function());
         Self {
             likelihood,
-            link_kind: InverseLink::Standard(likelihood.link_function()),
+            link_kind,
             pirls_convergence_tolerance: pirls_tol,
             max_iterations: 0,
             reml_convergence_tolerance: reml_tol,
@@ -795,7 +796,7 @@ impl RemlConfig {
 
     fn as_pirls_config(&self) -> pirls::PirlsConfig {
         pirls::PirlsConfig {
-            likelihood: self.likelihood,
+            likelihood: self.likelihood.clone(),
             link_kind: self.link_kind.clone(),
             max_iterations: self.max_iterations,
             convergence_tolerance: self.pirls_convergence_tolerance,
@@ -1969,8 +1970,8 @@ fn resolved_external_config(
     let effective_sas_link = effective_sas_link_for_family(&opts.family, opts.sas_link);
     let (likelihood, firth_active) =
         resolve_external_family(&opts.family, opts.firth_bias_reduction)?;
-    let mut cfg = RemlConfig::external(likelihood, opts.tol, firth_active);
     let link = likelihood.link_function();
+    let mut cfg = RemlConfig::external(likelihood, opts.tol, firth_active);
     cfg.link_kind = resolved_external_inverse_link(
         link,
         opts.latent_cloglog,
@@ -5012,7 +5013,7 @@ impl UnifiedFitResult {
             blocks: self.blocks.clone(),
             log_lambdas: self.log_lambdas.clone(),
             lambdas: self.lambdas.clone(),
-            likelihood_family: self.likelihood_family,
+            likelihood_family: self.likelihood_family.clone(),
             likelihood_scale: self.likelihood_scale,
             log_likelihood_normalization: self.log_likelihood_normalization,
             log_likelihood: self.log_likelihood,
