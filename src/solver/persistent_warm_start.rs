@@ -15,14 +15,14 @@ const CACHE_VERSION: u32 = 1;
 /// warm-start cache. A user upgrading from 0.1.X to 0.1.(X+1) should
 /// see their existing checkpoints still load; only a deliberate schema
 /// change (e.g., reshaping how ρ is encoded) bumps this constant.
-pub(crate) const CACHE_SCHEMA_VERSION: u32 = 1;
+pub(crate) const CACHE_SCHEMA_VERSION: u32 = 2;
 const MAX_ENTRY_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
 const CACHE_TTL_SECS: u64 = 60 * 60 * 24 * 365 * 10;
 
 /// String form of [`CACHE_SCHEMA_VERSION`] for direct use in cache keys.
 pub(crate) fn cache_schema_tag() -> String {
-    format!("schema{CACHE_SCHEMA_VERSION}")
+    format!("schema{CACHE_SCHEMA_VERSION}-arrow-schur-streaming-v1")
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
