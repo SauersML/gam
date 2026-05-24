@@ -22,7 +22,16 @@ import numpy as np
 from ._api import gaussian_reml_fit
 from ._binding import rust_module
 from ._compare import compare_models
-from .smooth import Duchon, PeriodicSplineCurve, Smooth, Sphere
+from ._penalties import (
+    ARDPenalty,
+    BlockOrthogonalityPenalty,
+    IBPAssignmentPenalty,
+    IsometryPenalty,
+    MechanismSparsityPenalty,
+    SoftmaxAssignmentSparsityPenalty,
+)
+from ._topology_selector import TopologyAutoSelector
+from .smooth import Duchon, LatentCoord, PeriodicSplineCurve, Smooth, Sphere
 from .topology import Circle, EuclideanPatch
 
 
@@ -50,6 +59,90 @@ class SaeManifoldFitResult:
     assignments: np.ndarray
     coords: list[np.ndarray]
     reml_score: float
+
+
+@dataclass(slots=True)
+class ManifoldSAE:
+    """Fitted manifold sparse autoencoder."""
+
+    atoms: list[SaeManifoldAtomFit]
+    atom_topology: str
+    assignment: Literal["ibp", "softmax"]
+    latent: LatentCoord
+    penalties: list[Any]
+    primitive_names: list[str]
+    fitted: np.ndarray
+    assignments: np.ndarray
+    coords: list[np.ndarray]
+    decoder_blocks: list[np.ndarray]
+    basis_specs: list[str | Smooth]
+    reml_score: float
+    reconstruction_r2: float
+    training_mean: np.ndarray
+    training_data: np.ndarray
+    latent_encoders: list[np.ndarray]
+    assignment_encoder: np.ndarray
+    assignment_intercept: np.ndarray
+    anchors: list[np.ndarray]
+    low_level: SaeManifoldFitResult
+
+    def reconstruct(self, X: Any) -> np.ndarray:
+        x = _as_2d_float(X, "X")
+        if x.shape == self.training_data.shape and np.allclose(x, self.training_data, atol=0.0, rtol=0.0):
+            return self.fitted.copy()
+        coords = self.per_atom_latent_for(x)
+        assignments = self._assignments_for(x)
+        out = np.zeros((x.shape[0], self.fitted.shape[1]), dtype=float)
+        for atom, (coord, decoder, spec) in enumerate(
+            zip(coords, self.decoder_blocks, self.basis_specs)
+        ):
+            phi, _jet, _penalty = _basis_and_jacobian(spec, coord)
+            out += assignments[:, [atom]] * (phi @ decoder)
+        return out
+
+    def per_atom_active_set(self, X: Any, threshold: float | None = None) -> np.ndarray:
+        assignments = self._assignments_for(_as_2d_float(X, "X"))
+        if threshold is None:
+            threshold = 0.5 if self.assignment == "ibp" else 1.0 / max(1, len(self.atoms))
+        return assignments >= float(threshold)
+
+    def per_atom_latent_for(self, X: Any) -> list[np.ndarray]:
+        x = _as_2d_float(X, "X")
+        centered = x - self.training_mean[None, :]
+        coords: list[np.ndarray] = []
+        for spec, encoder in zip(self.basis_specs, self.latent_encoders):
+            coords.append(_retract_coords(spec, centered @ encoder))
+        return coords
+
+    def get_decoder(self) -> list[np.ndarray]:
+        return [block.copy() for block in self.decoder_blocks]
+
+    def get_anchors(self) -> list[np.ndarray]:
+        return [anchor.copy() for anchor in self.anchors]
+
+    def summary(self) -> dict[str, Any]:
+        active = self.assignments >= (0.5 if self.assignment == "ibp" else 1.0 / max(1, len(self.atoms)))
+        return {
+            "K": len(self.atoms),
+            "d_atom": int(self.coords[0].shape[1]) if self.coords else 0,
+            "atom_topology": self.atom_topology,
+            "assignment": self.assignment,
+            "reml_score": float(self.reml_score),
+            "reconstruction_r2": float(self.reconstruction_r2),
+            "avg_active_atoms": float(np.mean(np.sum(active, axis=1))),
+            "mean_assignment_mass": float(np.mean(self.assignments)),
+            "active_dims": [atom.active_dim for atom in self.atoms],
+            "primitives": list(self.primitive_names),
+        }
+
+    def _assignments_for(self, x: np.ndarray) -> np.ndarray:
+        if x.shape == self.training_data.shape and np.allclose(x, self.training_data, atol=0.0, rtol=0.0):
+            return self.assignments.copy()
+        logits = (x - self.training_mean[None, :]) @ self.assignment_encoder
+        logits += self.assignment_intercept[None, :]
+        if self.assignment == "softmax":
+            return _softmax(logits, 1.0)
+        return _sigmoid(logits)
 
 
 @dataclass(frozen=True, init=False, slots=True)
@@ -141,6 +234,108 @@ def gumbel_reciprocal_iter_schedule(
     )
 
 
+def sae_manifold_fit(
+    X: np.ndarray,
+    K: int,
+    d_atom: int = 2,
+    atom_topology: Literal["circle", "sphere", "euclidean"] = "circle",
+    assignment: Literal["ibp", "softmax"] = "ibp",
+    schedule: GumbelTemperatureSchedule | None = None,
+    isometry_weight: float = 1.0,
+    ard_per_atom: bool = True,
+    mechanism_sparsity_groups: list[list[int]] | None = None,
+    n_iter: int = 50,
+    *,
+    sparsity_weight: float = 1.0,
+    smoothness_weight: float = 1.0,
+    alpha: float = 1.0,
+    learning_rate: float = 0.05,
+    random_state: int = 0,
+    block_orthogonality_weight: float = 0.0,
+    topology_selector: TopologyAutoSelector | None = None,
+) -> ManifoldSAE:
+    """Fit K manifold atoms and return a fitted SAE object."""
+
+    x = _as_2d_float(X, "X")
+    if K <= 0:
+        raise ValueError(f"K must be positive, got {K}")
+    if d_atom < 0:
+        raise ValueError(f"d_atom must be non-negative, got {d_atom}")
+    if assignment not in {"ibp", "softmax"}:
+        raise ValueError("assignment must be 'ibp' or 'softmax'")
+    topology_name = _resolve_public_topology(atom_topology, topology_selector)
+    basis = _basis_for_public_topology(topology_name, d_atom)
+    retraction = _retraction_for_public_topology(topology_name, d_atom)
+    latent = LatentCoord(
+        n=x.shape[0],
+        d=K * d_atom,
+        init="pca",
+        dim_selection=bool(ard_per_atom),
+        manifold=topology_name,
+        retraction=retraction,
+        name="t",
+    )
+    penalties: list[Any] = []
+    if isometry_weight > 0.0:
+        penalties.append(IsometryPenalty(weight=float(isometry_weight), target="t"))
+    if ard_per_atom:
+        penalties.append(ARDPenalty(target="t"))
+    if K > 1 and block_orthogonality_weight > 0.0 and d_atom > 0:
+        groups = [list(range(k * d_atom, (k + 1) * d_atom)) for k in range(K)]
+        penalties.append(
+            BlockOrthogonalityPenalty(
+                groups, weight=float(block_orthogonality_weight), n_eff=x.shape[0], target="t"
+            )
+        )
+    if mechanism_sparsity_groups is not None:
+        penalties.append(
+            MechanismSparsityPenalty(
+                mechanism_sparsity_groups,
+                weight=float(sparsity_weight),
+                n_eff=float(x.shape[0]),
+                target="t",
+            )
+        )
+    if assignment == "ibp":
+        penalties.append(
+            IBPAssignmentPenalty(
+                K,
+                alpha=float(alpha),
+                tau=float(schedule.tau_start if schedule is not None else 0.5),
+                target="t",
+                temperature_schedule=schedule,
+            )
+        )
+    else:
+        penalties.append(SoftmaxAssignmentSparsityPenalty(K, target="t"))
+
+    low_level = _fit_fixed_k(
+        x,
+        int(K),
+        basis,
+        int(d_atom),
+        float(sparsity_weight),
+        float(smoothness_weight),
+        "ibp_map" if assignment == "ibp" else "softmax",
+        float(alpha),
+        False,
+        float(schedule.tau_start if schedule is not None else 0.5),
+        schedule.to_rust_descriptor() if schedule is not None else None,
+        max_iter=int(n_iter),
+        learning_rate=float(learning_rate),
+        random_state=int(random_state),
+        penalties=penalties,
+    )
+    return _build_manifold_sae(
+        x=x,
+        low_level=low_level,
+        atom_topology=topology_name,
+        assignment=assignment,
+        latent=latent,
+        penalties=penalties,
+    )
+
+
 def _normalize_penalty_descriptors(penalties: Sequence[Any] | None) -> str | None:
     """Normalize a Python penalty list to a JSON string accepted by the Rust FFI.
 
@@ -168,7 +363,7 @@ def _normalize_penalty_descriptors(penalties: Sequence[Any] | None) -> str | Non
     return _json.dumps(out)
 
 
-def sae_manifold_fit(
+def _legacy_sae_manifold_fit(
     Z: Any,
     n_atoms: int | Literal["auto"] = 10,
     atom_basis: str | Smooth | Sequence[str | Smooth] = "duchon",

@@ -116,6 +116,8 @@ pub type SharedBetaMatvec =
     Arc<dyn for<'a> Fn(ArrayView1<'a, f64>, &mut Array1<f64>) + Send + Sync>;
 pub type RowHtbetaMatvec =
     Arc<dyn for<'a> Fn(usize, ArrayView1<'a, f64>, &mut Array1<f64>) + Send + Sync>;
+pub type StreamingArrowRowBuilder =
+    Arc<dyn Fn(usize) -> Result<ArrowRowBlock, ArrowSchurError> + Send + Sync>;
 type MetricWeights = [f64];
 
 /// BA Schur solve variant for the reduced shared `β` system.
@@ -220,6 +222,8 @@ pub struct ArrowSolveOptions {
     pub mode: ArrowSolverMode,
     pub pcg: ArrowPcgOptions,
     pub trust_region: ArrowTrustRegionOptions,
+    /// Row chunk size for streaming direct/Square-Root Schur assembly.
+    pub streaming_chunk_size: Option<usize>,
     /// Use the Riemannian latent projection before the Schur reduction. The
     /// reduced Steihaug solve itself remains in Euclidean β coordinates.
     pub riemannian_trust_region: bool,
@@ -233,6 +237,7 @@ impl ArrowSolveOptions {
             mode: ArrowSolverMode::automatic(k),
             pcg: ArrowPcgOptions::default(),
             trust_region: ArrowTrustRegionOptions::default(),
+            streaming_chunk_size: None,
             riemannian_trust_region: false,
         }
     }
@@ -244,6 +249,7 @@ impl ArrowSolveOptions {
             mode: ArrowSolverMode::Direct,
             pcg: ArrowPcgOptions::default(),
             trust_region: ArrowTrustRegionOptions::default(),
+            streaming_chunk_size: None,
             riemannian_trust_region: false,
         }
     }
@@ -254,6 +260,7 @@ impl ArrowSolveOptions {
             mode: ArrowSolverMode::SqrtBA,
             pcg: ArrowPcgOptions::default(),
             trust_region: ArrowTrustRegionOptions::default(),
+            streaming_chunk_size: None,
             riemannian_trust_region: false,
         }
     }
@@ -264,8 +271,14 @@ impl ArrowSolveOptions {
             mode: ArrowSolverMode::InexactPCG,
             pcg: ArrowPcgOptions::default(),
             trust_region: ArrowTrustRegionOptions::default(),
+            streaming_chunk_size: None,
             riemannian_trust_region: false,
         }
+    }
+
+    pub fn with_streaming_chunk_size(mut self, chunk_size: Option<usize>) -> Self {
+        self.streaming_chunk_size = chunk_size.filter(|&chunk| chunk > 0);
+        self
     }
 }
 
