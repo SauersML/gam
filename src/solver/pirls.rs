@@ -8604,8 +8604,8 @@ fn safe_beta_mu(mu: f64) -> f64 {
 }
 
 #[inline]
-fn working_derivatives_unsupported(likelihood: GlmLikelihoodSpec) -> bool {
-    matches!(likelihood.family, GlmLikelihoodFamily::BetaLogit { .. })
+fn working_derivatives_unsupported(_likelihood: GlmLikelihoodSpec) -> bool {
+    false
 }
 
 #[inline]
@@ -8626,6 +8626,72 @@ fn trigamma(mut x: f64) -> f64 {
         - inv2 * inv2 * inv / 30.0
         + inv2 * inv2 * inv2 * inv / 42.0
         - inv2 * inv2 * inv2 * inv2 * inv / 30.0
+}
+
+#[inline]
+fn polygamma2(mut x: f64) -> f64 {
+    if !(x.is_finite() && x > 0.0) {
+        return f64::NAN;
+    }
+    let mut acc = 0.0;
+    while x < 8.0 {
+        acc -= 2.0 / (x * x * x);
+        x += 1.0;
+    }
+    let inv = 1.0 / x;
+    let inv2 = inv * inv;
+    let inv3 = inv2 * inv;
+    acc - inv2 - inv3 - 0.5 * inv2 * inv2 + inv3 * inv3 / 6.0
+        - inv2 * inv3 * inv3 / 6.0
+        + 0.3 * inv2 * inv2 * inv3 * inv3
+        - 5.0 * inv2 * inv2 * inv2 * inv3 * inv3 / 6.0
+}
+
+#[inline]
+fn polygamma3(mut x: f64) -> f64 {
+    if !(x.is_finite() && x > 0.0) {
+        return f64::NAN;
+    }
+    let mut acc = 0.0;
+    while x < 8.0 {
+        acc += 6.0 / (x * x * x * x);
+        x += 1.0;
+    }
+    let inv = 1.0 / x;
+    let inv2 = inv * inv;
+    let inv3 = inv2 * inv;
+    let inv4 = inv2 * inv2;
+    acc + 2.0 * inv3 + 3.0 * inv4 + 2.0 * inv4 * inv - inv4 * inv3
+        + 4.0 * inv4 * inv3 * inv2 / 3.0
+        - 3.0 * inv4 * inv3 * inv4
+        + 10.0 * inv4 * inv4 * inv4 * inv
+}
+
+#[inline]
+fn beta_logit_working_curvature_eta_derivatives(
+    prior_weight: f64,
+    phi: f64,
+    mu: f64,
+    q: f64,
+    a: f64,
+    b: f64,
+    trigamma_sum: f64,
+) -> (f64, f64) {
+    let q_prime = q * (1.0 - 2.0 * mu);
+    let q_double_prime = q * (1.0 - 2.0 * mu) * (1.0 - 2.0 * mu) - 2.0 * q * q;
+    let psi2_diff = polygamma2(a) - polygamma2(b);
+    let psi3_sum = polygamma3(a) + polygamma3(b);
+    let phi_sq = phi * phi;
+    let q_sq = q * q;
+    let c = prior_weight
+        * phi_sq
+        * (2.0 * q * q_prime * trigamma_sum + q_sq * phi * q * psi2_diff);
+    let d = prior_weight
+        * phi_sq
+        * (2.0 * (q_prime * q_prime + q * q_double_prime) * trigamma_sum
+            + 4.0 * q * q_prime * phi * q * psi2_diff
+            + q_sq * (phi * q_prime * psi2_diff + phi_sq * q_sq * psi3_sum));
+    (c, d)
 }
 
 /// Working state for Tweedie with a log link.
@@ -8908,8 +8974,10 @@ fn write_beta_logit_working_state(
                     let b = ((1.0 - mu_i) * phi).max(BETA_MU_EPS);
                     let score_mu =
                         phi * (digamma(b) - digamma(a) + yi.ln() - (1.0 - yi).ln());
-                    let info_mu = phi * phi * (trigamma(a) + trigamma(b));
-                    let raw_weight = priorweights[i].max(0.0) * q * q * info_mu;
+                    let trigamma_sum = trigamma(a) + trigamma(b);
+                    let info_mu = phi * phi * trigamma_sum;
+                    let prior_weight = priorweights[i].max(0.0);
+                    let raw_weight = prior_weight * q * q * info_mu;
                     let floor_active = raw_weight > 0.0 && raw_weight <= MIN_WEIGHT;
                     *mu_o = mu_i;
                     *w_o = if raw_weight > 0.0 {
@@ -8925,8 +8993,17 @@ fn write_beta_logit_working_state(
                         *c_o = 0.0;
                         *d_o = 0.0;
                     } else {
-                        *c_o = 0.0;
-                        *d_o = 0.0;
+                        let (c_i, d_i) = beta_logit_working_curvature_eta_derivatives(
+                            prior_weight,
+                            phi,
+                            mu_i,
+                            q,
+                            a,
+                            b,
+                            trigamma_sum,
+                        );
+                        *c_o = c_i;
+                        *d_o = d_i;
                     }
                 },
             );
@@ -9723,17 +9800,61 @@ fn computeworkingweight_derivatives_from_eta(
                 )?;
         }
         GlmLikelihoodFamily::BetaLogit { phi } => {
+            const MIN_WEIGHT: f64 = 1e-12;
             if !valid_beta_phi(phi) {
                 return Err(EstimationError::InvalidInput(format!(
                     "beta-regression phi must be finite and > 0; got {phi}"
                 )));
             }
-            return Err(EstimationError::InvalidInput(
-                "exact outer derivatives for beta-logit are unsupported: the PIRLS weight \
-                 depends on eta through trigamma(mu * phi) and trigamma((1 - mu) * phi), \
-                 so c/d require polygamma derivatives that are not implemented"
-                    .to_string(),
-            ));
+            let c_s = c.as_slice_mut().expect("c must be contiguous");
+            let d_s = d.as_slice_mut().expect("d must be contiguous");
+            let dmu_s = dmu_deta
+                .as_slice_mut()
+                .expect("dmu_deta must be contiguous");
+            let d2_s = d2mu_deta2
+                .as_slice_mut()
+                .expect("d2mu_deta2 must be contiguous");
+            let d3_s = d3mu_deta3
+                .as_slice_mut()
+                .expect("d3mu_deta3 must be contiguous");
+            c_s.par_iter_mut()
+                .zip(d_s.par_iter_mut())
+                .zip(dmu_s.par_iter_mut())
+                .zip(d2_s.par_iter_mut())
+                .zip(d3_s.par_iter_mut())
+                .enumerate()
+                .for_each(|(i, ((((c_o, d_o), dmu_o), d2_o), d3_o))| {
+                    let eta_raw = eta[i];
+                    let eta_i = eta_raw.clamp(-700.0, 700.0);
+                    let jet = logit_inverse_link_jet5(eta_i);
+                    let mu_i = safe_beta_mu(jet.mu);
+                    let q = (mu_i * (1.0 - mu_i)).max(BETA_MU_EPS);
+                    let a = (mu_i * phi).max(BETA_MU_EPS);
+                    let b = ((1.0 - mu_i) * phi).max(BETA_MU_EPS);
+                    let trigamma_sum = trigamma(a) + trigamma(b);
+                    let prior_weight = priorweights[i].max(0.0);
+                    let raw_weight = prior_weight * q * q * phi * phi * trigamma_sum;
+                    let floor_active = raw_weight > 0.0 && raw_weight <= MIN_WEIGHT;
+                    if floor_active || eta_raw != eta_i {
+                        *c_o = 0.0;
+                        *d_o = 0.0;
+                    } else {
+                        let (c_i, d_i) = beta_logit_working_curvature_eta_derivatives(
+                            prior_weight,
+                            phi,
+                            mu_i,
+                            q,
+                            a,
+                            b,
+                            trigamma_sum,
+                        );
+                        *c_o = c_i;
+                        *d_o = d_i;
+                    }
+                    *dmu_o = q;
+                    *d2_o = q * (1.0 - 2.0 * mu_i);
+                    *d3_o = q * (1.0 - 6.0 * q);
+                });
         }
         GlmLikelihoodFamily::GammaLog => {
             let dmu_s = dmu_deta
