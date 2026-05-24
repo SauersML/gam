@@ -314,7 +314,9 @@ pub trait AnalyticPenalty: Send + Sync {
             }
             return out;
         }
-        unimplemented!("hvp must be implemented for non-diagonal analytic penalties");
+        unreachable!(
+            "AnalyticPenalty::hvp default requires hessian_diag — non-diagonal penalties must override hvp"
+        );
     }
 
     /// Gradient of the penalty value w.r.t. each owned ρ-axis. Length equals
