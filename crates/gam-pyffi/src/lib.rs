@@ -3846,7 +3846,9 @@ fn latent_input_location_jet(
                 jet.view(),
             )))
         }
-        _ => unreachable!("latent_basis_kind returned an unknown normalized kind"),
+        other => Err(format!(
+            "latent_basis_kind returned an unknown normalized kind: {other}"
+        )),
     }
 }
 
@@ -7947,7 +7949,9 @@ fn position_basis_design(
             validate_position_period("duchon", knots_or_centers, periodic, period)?;
             duchon_basis_1d_impl(t, knots_or_centers, basis_order, periodic)
         }
-        _ => unreachable!("normalized_position_basis_kind only returns supported basis names"),
+        other => Err(format!(
+            "normalized_position_basis_kind returned an unsupported basis name: {other}"
+        )),
     }
 }
 
@@ -7967,7 +7971,9 @@ fn position_basis_derivative(
             validate_position_period("duchon", knots_or_centers, periodic, period)?;
             duchon_basis_1d_derivative_impl(t, knots_or_centers, basis_order, 1, periodic)
         }
-        _ => unreachable!("normalized_position_basis_kind only returns supported basis names"),
+        other => Err(format!(
+            "normalized_position_basis_kind returned an unsupported basis name: {other}"
+        )),
     }
 }
 

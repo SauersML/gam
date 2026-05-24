@@ -2230,6 +2230,17 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         })
     }
 
+    pub(crate) fn set_analytic_penalty_registry(
+        &mut self,
+        registry: Option<&crate::terms::AnalyticPenaltyRegistry>,
+    ) {
+        let fingerprint = registry
+            .map(crate::solver::estimate::reml::runtime::analytic_penalty_registry_fingerprint)
+            .unwrap_or(0);
+        self.reml_state
+            .set_analytic_penalty_registry_fingerprint(fingerprint);
+    }
+
     fn prepare_eval_state(
         &mut self,
         x: &DesignMatrix,

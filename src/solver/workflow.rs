@@ -5442,11 +5442,13 @@ fn materialize_survival<'a>(
             &baseline_cfg,
             "workflow survival baseline",
             |candidate| match survival_mode {
-                SurvivalLikelihoodMode::LocationScale => unreachable!(
-                    "location-scale baseline profiling uses analytic chain-rule gradient"
+                SurvivalLikelihoodMode::LocationScale => Err(
+                    "internal: location-scale baseline profiling uses analytic chain-rule gradient and should not reach the workflow scalar profile closure"
+                        .to_string(),
                 ),
-                SurvivalLikelihoodMode::MarginalSlope => unreachable!(
-                    "marginal-slope baseline profiling uses analytic GM-probit gradient"
+                SurvivalLikelihoodMode::MarginalSlope => Err(
+                    "internal: marginal-slope baseline profiling uses analytic GM-probit gradient and should not reach the workflow scalar profile closure"
+                        .to_string(),
                 ),
                 SurvivalLikelihoodMode::Latent => Ok(fit_latent_survival_model(
                     build_latent_survival_request(candidate)?,
@@ -5461,7 +5463,10 @@ fn materialize_survival<'a>(
                 .fit
                 .reml_score),
                 SurvivalLikelihoodMode::Transformation | SurvivalLikelihoodMode::Weibull => {
-                    unreachable!()
+                    Err(
+                        "internal: Transformation/Weibull survival baseline should not enter the workflow scalar profile closure (outer guard filters them above)"
+                            .to_string(),
+                    )
                 }
             },
         )?
