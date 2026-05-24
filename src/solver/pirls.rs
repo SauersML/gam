@@ -1845,7 +1845,7 @@ impl<'a> GamWorkingModel<'a> {
             }
         };
         GamModelFinalState {
-            likelihood: self.likelihood,
+            likelihood: self.likelihood.clone(),
             coordinate_frame,
             finalmu: lastmu,
             finalweights: lasthessian_weights,
@@ -2112,7 +2112,7 @@ impl<'a> GamWorkingModel<'a> {
         if self.likelihood.scale.gamma_shape_is_estimated() {
             let shape =
                 estimate_gamma_shape_from_eta(self.y, &self.workspace.eta_buf, self.priorweights);
-            self.likelihood = self.likelihood.with_gamma_shape(shape);
+            self.likelihood = self.likelihood.clone().with_gamma_shape(shape);
         }
 
         let integrated = self.covariate_se.as_ref().map(|se| IntegratedWorkingInput {
@@ -2210,7 +2210,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         if self.likelihood.scale.gamma_shape_is_estimated() {
             let shape =
                 estimate_gamma_shape_from_eta(self.y, &self.workspace.eta_buf, self.priorweights);
-            self.likelihood = self.likelihood.with_gamma_shape(shape);
+            self.likelihood = self.likelihood.clone().with_gamma_shape(shape);
         }
 
         // Use integrated (GHQ) likelihood if per-observation SE is available.
@@ -6323,7 +6323,7 @@ impl PirlsResult {
 
     pub(crate) fn compact_for_reml_cache(&self) -> Self {
         Self {
-            likelihood: self.likelihood,
+            likelihood: self.likelihood.clone(),
             beta_transformed: self.beta_transformed.clone(),
             penalized_hessian_transformed: self.penalized_hessian_transformed.clone(),
             stabilizedhessian_transformed: self.stabilizedhessian_transformed.clone(),
@@ -6383,7 +6383,7 @@ impl PirlsResult {
 
         let (score_c_array, score_d_array, solve_dmu_deta, solve_d2mu_deta2, solve_d3mu_deta3) =
             computeworkingweight_derivatives_from_eta(
-                self.likelihood,
+                &self.likelihood,
                 inverse_link,
                 &self.final_eta,
                 priorweights,
@@ -6391,7 +6391,7 @@ impl PirlsResult {
         let (finalweights, solve_c_array, solve_d_array) =
             if self.hessian_curvature == HessianCurvatureKind::Observed {
                 compute_observed_hessian_curvature_arrays(
-                    self.likelihood,
+                    &self.likelihood,
                     inverse_link,
                     &self.final_eta,
                     y,
@@ -6408,7 +6408,7 @@ impl PirlsResult {
         // Lazy rehydration: wrap in ReparamOperator instead of materializing X·Qs.
         let qs_arc = Arc::new(self.reparam_result.qs.clone());
         Ok(Self {
-            likelihood: self.likelihood,
+            likelihood: self.likelihood.clone(),
             beta_transformed: self.beta_transformed.clone(),
             penalized_hessian_transformed: self.penalized_hessian_transformed.clone(),
             stabilizedhessian_transformed: self.stabilizedhessian_transformed.clone(),
@@ -6943,7 +6943,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         EstimationError::InvalidInput("non-contiguous lambda storage".to_string())
     })?;
 
-    let likelihood = config.likelihood;
+    let likelihood = &config.likelihood;
     let link_function = config.link_function();
 
     use crate::construction::{
@@ -7205,7 +7205,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         // — anything that would change the right-hand side or the system
         // beyond the additive penalty would invalidate the cache.
         let cache_eligible = gaussian_fixed_cache.is_some()
-            && likelihood.family.is_gaussian_identity()
+            && likelihood.spec.is_gaussian_identity()
             && !config.firth_bias_reduction
             && penalty.coefficient_lower_bounds.is_none()
             && penalty.linear_constraints_original.is_none();
@@ -7329,7 +7329,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
 
         let (solve_c_array, solve_d_array, solve_dmu_deta, solve_d2mu_deta2, solve_d3mu_deta3) =
             computeworkingweight_derivatives_from_eta(
-                config.likelihood,
+                &config.likelihood,
                 &config.link_kind,
                 &final_eta,
                 priorweights_owned.view(),
@@ -7337,7 +7337,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         let reparam_result = materialize_final_reparam_result()?;
         let qs_arc_final = Arc::new(reparam_result.qs.clone());
         let pirls_result = PirlsResult {
-            likelihood: config.likelihood,
+            likelihood: config.likelihood.clone(),
             beta_transformed,
             penalized_hessian_transformed: penalized_hessian,
             stabilizedhessian_transformed: stabilizedhessian,
@@ -7396,7 +7396,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         priorweights,
         penalty_active.clone(),
         workspace,
-        likelihood,
+        likelihood.clone(),
         config.link_kind.clone(),
         config.firth_bias_reduction
             && matches!(
@@ -10296,7 +10296,7 @@ fn compute_observed_hessian_curvature_arrays_into(
 }
 
 fn compute_observed_hessian_curvature_arrays(
-    likelihood: GlmLikelihoodSpec,
+    likelihood: &GlmLikelihoodSpec,
     inverse_link: &InverseLink,
     eta: &Array1<f64>,
     y: ArrayView1<'_, f64>,
