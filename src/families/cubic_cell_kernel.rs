@@ -1463,9 +1463,20 @@ pub struct CellMomentStateRef<'a> {
     pub moments: &'a [f64],
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct CellMomentScratch {
     moments: Vec<f64>,
+}
+
+impl Default for CellMomentScratch {
+    fn default() -> Self {
+        // Pre-size to the codebase's max moment degree so steady-state
+        // `prepare_moments` calls never reallocate. Calls with `len`
+        // exceeding this still reserve lazily.
+        Self {
+            moments: Vec::with_capacity(MAX_AFFINE_ANCHOR_DEGREE + 1),
+        }
+    }
 }
 
 impl CellMomentScratch {
@@ -1483,6 +1494,7 @@ impl CellMomentScratch {
     fn prepare_moments(&mut self, len: usize) -> &mut [f64] {
         if self.moments.capacity() < len {
             CELL_MOMENT_REALLOCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.moments.reserve(len - self.moments.capacity());
         }
         self.moments.resize(len, 0.0);
         self.moments.fill(0.0);
