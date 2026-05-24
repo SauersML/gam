@@ -622,6 +622,60 @@ fn hash_array2(hasher: &mut StableHasher, values: &Array2<f64>) {
     }
 }
 
+fn hash_aux_prior_strength(
+    hasher: &mut StableHasher,
+    strength: crate::terms::latent_coord::AuxPriorStrength,
+) {
+    use crate::terms::latent_coord::AuxPriorStrength;
+    match strength {
+        AuxPriorStrength::Auto => hasher.write_str("auto"),
+        AuxPriorStrength::Fixed(value) => {
+            hasher.write_str("fixed");
+            hasher.write_f64(value);
+        }
+    }
+}
+
+pub(crate) fn latent_id_mode_cache_fingerprint(
+    id_mode: &crate::terms::latent_coord::LatentIdMode,
+) -> u64 {
+    use crate::terms::latent_coord::{AuxPriorFamily, LatentIdMode};
+    let mut hasher = StableHasher::new();
+    hasher.write_str("latent-id-mode-cache-v1");
+    match id_mode {
+        LatentIdMode::AuxPrior {
+            u,
+            family,
+            strength,
+        } => {
+            hasher.write_str("aux-prior");
+            hash_array2(&mut hasher, u);
+            match family {
+                AuxPriorFamily::Ridge => hasher.write_str("ridge"),
+                AuxPriorFamily::Linear => hasher.write_str("linear"),
+            }
+            hash_aux_prior_strength(&mut hasher, *strength);
+        }
+        LatentIdMode::AuxPriorDimSelection {
+            u,
+            family,
+            strength,
+            ..
+        } => {
+            hasher.write_str("aux-prior-dim-selection");
+            hash_array2(&mut hasher, u);
+            match family {
+                AuxPriorFamily::Ridge => hasher.write_str("ridge"),
+                AuxPriorFamily::Linear => hasher.write_str("linear"),
+            }
+            hash_aux_prior_strength(&mut hasher, *strength);
+        }
+        LatentIdMode::DimSelection { .. } => hasher.write_str("dim-selection"),
+        LatentIdMode::None => hasher.write_str("none"),
+    }
+    hasher.finish_u64()
+}
+
 fn hash_array3(hasher: &mut StableHasher, values: &ndarray::Array3<f64>) {
     let (a, b, c) = values.dim();
     hasher.write_usize(a);
@@ -4140,6 +4194,7 @@ impl<'a> RemlState<'a> {
             penalty_block_structural_nullities: RwLock::new(None),
             gaussian_fixed_cache: RwLock::new(None),
             persistent_warm_start_key: RwLock::new(None),
+            persistent_latent_values_fingerprint: None,
             persistent_latent_values_cache: RwLock::new(PersistentLatentValuesCache::default()),
             analytic_penalty_registry_fingerprint: 0,
             persistent_warm_start_loaded: AtomicBool::new(false),
@@ -4253,6 +4308,10 @@ impl<'a> RemlState<'a> {
         *self.persistent_warm_start_key.write().unwrap() = None;
         self.persistent_warm_start_loaded
             .store(false, Ordering::Relaxed);
+    }
+
+    pub(crate) fn set_persistent_latent_values_fingerprint(&mut self, fingerprint: u64) {
+        self.persistent_latent_values_fingerprint = Some(fingerprint);
     }
 
     /// Creates a sanitized cache key from rho values.
@@ -4956,8 +5015,9 @@ impl<'a> RemlState<'a> {
     }
 
     fn persistent_latent_values_cache_key(&self) -> Option<String> {
+        let latent_fingerprint = self.persistent_latent_values_fingerprint?;
         self.persistent_warm_start_cache_key()
-            .map(|key| format!("persistent-latent-values-v1:{key}"))
+            .map(|key| format!("persistent-latent-values-v2:{key}:{latent_fingerprint:016x}"))
     }
 
     pub(crate) fn load_persistent_latent_values(

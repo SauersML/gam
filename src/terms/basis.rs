@@ -2455,7 +2455,6 @@ pub enum BasisMetadata {
         input_scales: Option<Vec<f64>>,
         /// Per-axis anisotropy log-scales η_a, stored for prediction.
         aniso_log_scales: Option<Vec<f64>>,
-    }
     },
     Pca {
         feature_cols: Vec<usize>,
@@ -19525,7 +19524,6 @@ fn build_cyclic_duchon_basis_1dwithworkspace(
             identifiability_transform,
             input_scales: None,
             aniso_log_scales: None,
-        }
         },
         kronecker_factored: None,
         ops,
@@ -20697,7 +20695,6 @@ fn build_periodic_duchon_basis_1d(
             identifiability_transform,
             input_scales: None,
             aniso_log_scales: None,
-        }
         },
         kronecker_factored: None,
     })
@@ -20956,7 +20953,6 @@ fn build_duchon_basis_mixed_periodicity(
             identifiability_transform,
             input_scales: None,
             aniso_log_scales: None,
-        }
         },
         kronecker_factored: None,
     })
@@ -21321,7 +21317,6 @@ pub fn build_duchon_basiswithworkspace(
             identifiability_transform,
             input_scales: None,
             aniso_log_scales: aniso,
-        }
         },
         kronecker_factored: None,
     })
@@ -32147,7 +32142,7 @@ mod tests {
             double_penalty: false,
             identifiability: MaternIdentifiability::CenterSumToZero,
             aniso_log_scales: None,
-        }
+            streaming_chunk_size: None,
         };
         let out = build_matern_basis(data.view(), &spec).expect("Matérn basis should build");
         assert_eq!(out.design.nrows(), data.nrows());
@@ -32182,7 +32177,7 @@ mod tests {
             double_penalty: false,
             identifiability: MaternIdentifiability::CenterSumToZero,
             aniso_log_scales: None,
-        }
+            streaming_chunk_size: None,
         };
         let out = build_matern_basis(data.view(), &spec).expect("Matérn basis should build");
         // (k-1) constrained kernel cols + explicit intercept.
@@ -32204,7 +32199,7 @@ mod tests {
             double_penalty: true,
             identifiability: MaternIdentifiability::CenterSumToZero,
             aniso_log_scales: None,
-        }
+            streaming_chunk_size: None,
         };
         let out = build_matern_basis(data.view(), &spec).expect("Matérn basis should build");
         assert_eq!(out.penalties.len(), 1);
@@ -32227,7 +32222,7 @@ mod tests {
             double_penalty: true,
             identifiability: MaternIdentifiability::CenterSumToZero,
             aniso_log_scales: None,
-        }
+            streaming_chunk_size: None,
         };
         let out = build_matern_basis(data.view(), &spec).expect("Matérn basis should build");
         assert_eq!(out.penalties.len(), 2);
@@ -32254,7 +32249,7 @@ mod tests {
             double_penalty: false,
             identifiability: MaternIdentifiability::CenterSumToZero,
             aniso_log_scales: None,
-        }
+            streaming_chunk_size: None,
         };
         let deriv = build_matern_basis_log_kappa_derivative(data.view(), &spec)
             .expect("analytic Matérn derivative should build");
@@ -32325,7 +32320,7 @@ mod tests {
             double_penalty: true,
             identifiability: MaternIdentifiability::CenterSumToZero,
             aniso_log_scales: None,
-        }
+            streaming_chunk_size: None,
         };
         let deriv = build_matern_basis_log_kappa_derivative(data.view(), &spec)
             .expect("analytic Matérn double-penalty derivative should build");
@@ -33857,7 +33852,7 @@ mod tests {
             double_penalty: false,
             identifiability: MaternIdentifiability::CenterSumToZero,
             aniso_log_scales: None,
-        }
+            streaming_chunk_size: None,
         };
         let analytic = build_matern_basis_log_kappasecond_derivative(data.view(), &spec)
             .expect("analytic Matérn second derivative should build");
@@ -33919,7 +33914,7 @@ mod tests {
             double_penalty: false,
             identifiability: MaternIdentifiability::CenterSumToZero,
             aniso_log_scales: Some(vec![0.1, -0.1]),
-        }
+            streaming_chunk_size: None,
         };
 
         let basis = build_matern_basis(data.view(), &spec).expect("aniso Matérn basis");
