@@ -115,6 +115,8 @@ use crate::terms::penalty_op::PenaltyOp;
 use crate::terms::sae_manifold::ScheduleKind;
 use crate::terms::smooth::BlockwisePenalty;
 
+const MIN_CONDITIONAL_PRECISION: f64 = 1.0e-12;
+
 // ---------------------------------------------------------------------------
 // Common trait
 // ---------------------------------------------------------------------------
@@ -4163,7 +4165,12 @@ impl AnalyticPenalty for IvaeRidgeMeanGauge {
                 acc += t[[n, a]] * residual[[n, a]];
             }
         }
-        0.5 * self.resolved_weight(rho) * acc
+        let weight = self.resolved_weight(rho);
+        let mut value = 0.5 * weight * acc;
+        if self.learnable_weight {
+            value -= 0.5 * target.len() as f64 * weight.ln();
+        }
+        value
     }
 
     fn grad_target(
@@ -4211,8 +4218,13 @@ impl AnalyticPenalty for IvaeRidgeMeanGauge {
         if !self.learnable_weight {
             return Array1::<f64>::zeros(0);
         }
+        if self.target_matrix(target).is_none() {
+            return Array1::<f64>::zeros(1);
+        }
         let mut out = Array1::<f64>::zeros(1);
-        out[self.rho_index] = self.value(target, rho);
+        let weight = self.resolved_weight(rho);
+        out[self.rho_index] =
+            self.value(target, rho) + 0.5 * target.len() as f64 * (weight.ln() - 1.0);
         out
     }
 
@@ -4471,7 +4483,7 @@ impl ParametricRowPrecisionPriorPenalty {
     fn lambda_at(&self, n: usize, k: usize, rho: ArrayView1<'_, f64>) -> f64 {
         let alpha = self.active_log_alpha(k, rho).exp();
         let beta = stable_softplus(self.active_raw_beta(k, rho));
-        alpha + beta * self.dist2(n, k, rho)
+        MIN_CONDITIONAL_PRECISION + alpha + beta * self.dist2(n, k, rho)
     }
 
     fn dist2(&self, n: usize, k: usize, rho: ArrayView1<'_, f64>) -> f64 {
