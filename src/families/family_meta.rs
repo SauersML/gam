@@ -47,11 +47,7 @@ fn inverse_link_diagnostic_name(link: &InverseLink) -> String {
     }
 }
 
-/// Build a `LikelihoodSpec` directly from `(response, link)` without going
-/// through the legacy `LikelihoodFamily` enum. Equivalent to
-/// `LikelihoodSpec::new(response, link)`, exposed here so leaf modules that
-/// migrate first can call this constructor without depending on a separate
-/// `From<LikelihoodFamily>` bridge.
+/// Build a `LikelihoodSpec` directly from `(response, link)`.
 #[inline]
 pub const fn likelihood_spec(response: ResponseFamily, link: InverseLink) -> LikelihoodSpec {
     LikelihoodSpec::new(response, link)
@@ -72,9 +68,7 @@ pub fn inverse_link_to_binomial_spec(
     match link {
         InverseLink::Standard(LinkFunction::Logit)
         | InverseLink::Standard(LinkFunction::Probit)
-        | InverseLink::Standard(LinkFunction::CLogLog)
-        | InverseLink::Standard(LinkFunction::Sas)
-        | InverseLink::Standard(LinkFunction::BetaLogistic) => {
+        | InverseLink::Standard(LinkFunction::CLogLog) => {
             Ok(LikelihoodSpec::new(ResponseFamily::Binomial, link.clone()))
         }
         InverseLink::LatentCLogLog(_)
@@ -84,7 +78,9 @@ pub fn inverse_link_to_binomial_spec(
             Ok(LikelihoodSpec::new(ResponseFamily::Binomial, link.clone()))
         }
         InverseLink::Standard(LinkFunction::Log)
-        | InverseLink::Standard(LinkFunction::Identity) => {
+        | InverseLink::Standard(LinkFunction::Identity)
+        | InverseLink::Standard(LinkFunction::Sas)
+        | InverseLink::Standard(LinkFunction::BetaLogistic) => {
             Err(UnsupportedLinkError::new("binomial", link))
         }
     }
