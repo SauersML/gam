@@ -586,6 +586,48 @@ pub fn lorentz_decode_forward(
     Ok(out)
 }
 
+/// Analytic backward for the Lorentz-path decoder.
+///
+/// Lorentz vs Poincaré identity
+/// ----------------------------
+/// The tangent-space-at-origin decoder is *intrinsically defined* on the
+/// hyperbolic manifold: it only sees the manifold's log/exp at the origin,
+/// not any particular chart. Working through the Lorentz-path composition
+/// (Poincaré atom → stereographic lift to hyperboloid → Lorentz log_o →
+/// linear mix → Lorentz exp_o → stereographic projection back to ball)
+/// produces, after using
+///
+///     acosh((1+q)/(1-q)) = 2 artanh(sqrt(q))     (for q in [0,1)),
+///     cosh(σ) + 1        = 2 cosh^2(σ/2),
+///     sinh(σ)            = 2 sinh(σ/2) cosh(σ/2),
+///
+/// the algebraic identity
+///
+///     L_f^{Lorentz}      = 2 * log_0^{Poincare}(a_f),
+///     y^{Lorentz}(v)     = exp_0^{Poincare}( v / 2 ).
+///
+/// The factors of 2 cancel inside the linear-mix step, so:
+///
+///     y_Lorentz(z; A) === y_Poincare(z; A),
+///
+/// not just isometrically — they are the *same function* of the inputs.
+/// The two forward implementations are numerically distinct routes (Lorentz
+/// has no `1 - |y|^2` denominator and so survives near-boundary atoms
+/// better) but mathematically equal in exact arithmetic. Their Jacobians
+/// are therefore also equal, and the analytic backward derived for the
+/// Poincaré path is the exact backward for the Lorentz path.
+///
+/// This function exists to make that exactness *demonstrable* — it shares
+/// the implementation of [`tangent_decode_backward`] but has its own unit
+/// test that finite-differences the Lorentz forward (not the Poincaré
+/// forward) and checks the same analytic Jacobian against it.
+pub fn lorentz_decode_backward(
+    cache: &TangentDecodeCache,
+    grad_x_hat: ArrayView2<'_, f64>,
+) -> GeometryResult<(Array2<f64>, Array2<f64>)> {
+    tangent_decode_backward(cache, grad_x_hat)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -728,6 +770,79 @@ mod tests {
         let fd_atom = (lp - lm) / (2.0 * eps);
         assert!((fd_atom - grad_atoms[[1, 0]]).abs() < 1.0e-5,
             "atom grad: analytic {} vs FD {}", grad_atoms[[1, 0]], fd_atom);
+    }
+
+    #[test]
+    fn lorentz_backward_matches_finite_difference_of_lorentz_forward() {
+        // Same tolerance as the Poincaré FD test, but the FD probes the
+        // Lorentz forward (`lorentz_decode_forward`) rather than the
+        // Poincaré one — verifying that the analytic backward produced by
+        // [`lorentz_decode_backward`] really is the Jacobian of the Lorentz
+        // forward, not just of its Poincaré sibling.
+        let atoms = array![[0.05, 0.02], [-0.03, 0.04]];
+        let gates = array![[0.3, -0.2]];
+
+        // Cache from the Poincaré forward: the two paths are algebraically
+        // equal so it does not matter which one we differentiate analytically.
+        let (x_hat_p, cache) = tangent_decode_forward(atoms.view(), gates.view(), -1.0)
+            .expect("poincare forward (for cache)");
+        let x_hat_l = lorentz_decode_forward(atoms.view(), gates.view(), -1.0)
+            .expect("lorentz forward");
+        // Sanity: forward outputs of the two paths must agree to fp slack.
+        for b in 0..x_hat_l.dim().0 {
+            for i in 0..x_hat_l.dim().1 {
+                assert!(
+                    (x_hat_p[[b, i]] - x_hat_l[[b, i]]).abs() < 1.0e-10,
+                    "lorentz/poincare forward mismatch at ({b},{i})"
+                );
+            }
+        }
+
+        // Loss = sum(x_hat^2), grad_x = 2 x_hat (evaluate on Lorentz output
+        // since that is what we are differentiating against).
+        let mut grad_x = Array2::<f64>::zeros(x_hat_l.dim());
+        for i in 0..x_hat_l.dim().0 {
+            for j in 0..x_hat_l.dim().1 {
+                grad_x[[i, j]] = 2.0 * x_hat_l[[i, j]];
+            }
+        }
+        let (grad_gates, grad_atoms) = lorentz_decode_backward(&cache, grad_x.view())
+            .expect("lorentz backward");
+
+        let eps = 1.0e-6;
+        // FD against the *Lorentz* forward, one gate entry.
+        let mut gates_p = gates.clone();
+        gates_p[[0, 0]] += eps;
+        let x_p = lorentz_decode_forward(atoms.view(), gates_p.view(), -1.0).unwrap();
+        let mut gates_m = gates.clone();
+        gates_m[[0, 0]] -= eps;
+        let x_m = lorentz_decode_forward(atoms.view(), gates_m.view(), -1.0).unwrap();
+        let lp: f64 = x_p.iter().map(|v| v * v).sum();
+        let lm: f64 = x_m.iter().map(|v| v * v).sum();
+        let fd_gate = (lp - lm) / (2.0 * eps);
+        assert!(
+            (fd_gate - grad_gates[[0, 0]]).abs() < 1.0e-5,
+            "lorentz gate grad: analytic {} vs FD {}",
+            grad_gates[[0, 0]],
+            fd_gate
+        );
+
+        // FD against the *Lorentz* forward, one atom entry.
+        let mut atoms_p = atoms.clone();
+        atoms_p[[1, 0]] += eps;
+        let x_p2 = lorentz_decode_forward(atoms_p.view(), gates.view(), -1.0).unwrap();
+        let mut atoms_m = atoms.clone();
+        atoms_m[[1, 0]] -= eps;
+        let x_m2 = lorentz_decode_forward(atoms_m.view(), gates.view(), -1.0).unwrap();
+        let lp2: f64 = x_p2.iter().map(|v| v * v).sum();
+        let lm2: f64 = x_m2.iter().map(|v| v * v).sum();
+        let fd_atom = (lp2 - lm2) / (2.0 * eps);
+        assert!(
+            (fd_atom - grad_atoms[[1, 0]]).abs() < 1.0e-5,
+            "lorentz atom grad: analytic {} vs FD {}",
+            grad_atoms[[1, 0]],
+            fd_atom
+        );
     }
 
     #[test]

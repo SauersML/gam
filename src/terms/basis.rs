@@ -7792,6 +7792,7 @@ pub fn build_bspline_basis_1d(
             },
             kronecker_factored: None,
             ops,
+            null_eigenvectors,
         });
     }
     // Auto-streaming decision for non-periodic B-spline: we need `p_raw` to
@@ -7910,6 +7911,7 @@ pub fn build_bspline_basis_1d(
             },
             kronecker_factored: None,
             ops,
+            null_eigenvectors,
         });
     }
     let prefer_sparse_design = matches!(
@@ -8207,6 +8209,7 @@ pub fn build_bspline_basis_1d(
         },
         kronecker_factored: None,
         ops,
+        null_eigenvectors,
     })
 }
 
@@ -9376,6 +9379,7 @@ pub fn build_thin_plate_basiswithworkspace(
         nullspace_dims,
         penaltyinfo,
         ops,
+        null_eigenvectors,
         metadata: BasisMetadata::ThinPlate {
             centers: original_centers,
             length_scale: spec.length_scale,
@@ -16037,6 +16041,7 @@ pub fn build_spherical_spline_basis(
         },
         kronecker_factored: None,
         ops,
+        null_eigenvectors,
     })
 }
 
@@ -16278,6 +16283,7 @@ fn build_spherical_harmonic_basis(
         },
         kronecker_factored: None,
         ops,
+        null_eigenvectors,
     })
 }
 
@@ -16504,6 +16510,7 @@ pub fn build_matern_basiswithworkspace(
         },
         kronecker_factored: None,
         ops,
+        null_eigenvectors,
     })
 }
 
@@ -20251,6 +20258,7 @@ fn build_cyclic_duchon_basis_1dwithworkspace(
         },
         kronecker_factored: None,
         ops,
+        null_eigenvectors,
     })
 }
 
@@ -21455,6 +21463,7 @@ fn build_periodic_duchon_basis_1d(
         nullspace_dims,
         penaltyinfo,
         ops,
+        null_eigenvectors,
         metadata: BasisMetadata::Duchon {
             centers,
             length_scale: spec.length_scale,
@@ -21702,6 +21711,7 @@ fn build_duchon_basis_mixed_periodicity(
         nullspace_dims,
         penaltyinfo,
         ops,
+        null_eigenvectors,
         metadata: BasisMetadata::Duchon {
             centers: centers_owned,
             length_scale: None,
@@ -22074,6 +22084,7 @@ pub fn build_duchon_basiswithworkspace(
         nullspace_dims,
         penaltyinfo,
         ops,
+        null_eigenvectors,
         metadata: BasisMetadata::Duchon {
             centers,
             length_scale: spec.length_scale,
