@@ -124,8 +124,12 @@ from ._select_topology import (
     select_topology,
 )
 from ._diagnostics import Diagnostics
+from . import identifiability
 from .identifiability import (
+    IdentifiabilityReport,
+    IdentifiabilityTheoremResult,
     IdentifiableFactorFitResult,
+    check as identifiability_check,
     identifiable_factor_fit,
 )
 from ._equivariant import (
@@ -320,7 +324,11 @@ __all__ = [
     "BlockSparsityPenalty",
     "GatedSAEDecoder",
     "IBPAssignmentPenalty",
+    "IdentifiabilityReport",
+    "IdentifiabilityTheoremResult",
     "IdentifiableFactorFitResult",
+    "identifiability",
+    "identifiability_check",
     "identifiable_factor_fit",
     "IsometryPenalty",
     "IvaeRidgeMeanGauge",
