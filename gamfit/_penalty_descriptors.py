@@ -173,6 +173,19 @@ class _RustPenaltyDescriptor(PenaltyDescriptor):
         g = torch.as_tensor(grad, dtype=t.dtype, device=t.device).reshape_as(t)
         return v, g
 
+    def to_rust_descriptor(self) -> dict[str, Any]:
+        """Return the JSON descriptor consumed by the Rust analytic-penalty
+        registry. Mirrors the formula-API contract used by existing penalty
+        dataclasses so this descriptor can drop into ``gamfit.fit(...,
+        penalties=[...])`` flows."""
+        # Default shape (n=1, d=1) is a placeholder; the formula pipeline
+        # supplies the real shape when the registry is materialized.
+        return self._descriptor(1, 1)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Plain-dict serialization (alias of ``to_rust_descriptor``)."""
+        return self.to_rust_descriptor()
+
     def hvp(self, t: Any, v: Any) -> Any:
         torch = _require_torch()
         if not isinstance(t, torch.Tensor):

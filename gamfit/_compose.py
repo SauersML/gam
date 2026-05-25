@@ -28,11 +28,6 @@ __all__ = [
     "SphereLatent",
     "TorusLatent",
     "CylinderLatent",
-    "Circle",
-    "Sphere",
-    "Torus",
-    "Cylinder",
-    "Euclidean",
     "Basis",
     "Fourier",
     "BSplineBasis",
@@ -136,12 +131,23 @@ class CylinderLatent(Manifold):
         return TensorProduct(marginals=(Fourier(harmonics=3), BSplineBasis()))
 
 
-# Singleton-style manifold tokens — both an instance (usable as default) and a class.
-Circle = CircleLatent
-Sphere = SphereLatent
-Torus = TorusLatent
-Cylinder = CylinderLatent
-Euclidean = EuclideanLatent
+# Singleton-style manifold tokens — kept under explicit "*Latent" names so they
+# do not collide with the ``topology.Circle/Sphere/...`` factory functions that
+# already populate ``gamfit.Circle`` etc. The latter return concrete ``Smooth``
+# instances (closed-loop spline curves); the former describe the latent
+# topology used by the composition layer. ``_coerce_manifold`` accepts either,
+# plus the matching name string, plus a callable that *returns* a topology
+# smooth (so ``latent=gamfit.topology.Circle`` keeps working without import
+# ceremony).
+
+
+_FACTORY_TO_MANIFOLD: dict[Any, type[Manifold]] = {
+    _topology.Circle: CircleLatent,
+    _topology.Sphere: SphereLatent,
+    _topology.Torus: TorusLatent,
+    _topology.Cylinder: CylinderLatent,
+    _topology.EuclideanPatch: EuclideanLatent,
+}
 
 
 def _coerce_manifold(latent: Any) -> Manifold:
@@ -161,8 +167,12 @@ def _coerce_manifold(latent: Any) -> Manifold:
         if key not in lookup:
             raise ValueError(f"unknown manifold name {latent!r}; expected one of {sorted(lookup)}")
         return lookup[key]()
+    if callable(latent) and latent in _FACTORY_TO_MANIFOLD:
+        return _FACTORY_TO_MANIFOLD[latent]()
     raise TypeError(
-        f"latent must be a Manifold instance/class or a manifold name string, got {type(latent).__name__}"
+        f"latent must be a Manifold instance/class, a topology factory "
+        f"(gamfit.topology.Circle/Sphere/Torus/Cylinder/EuclideanPatch), or a "
+        f"manifold name string, got {type(latent).__name__}"
     )
 
 

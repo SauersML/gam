@@ -111,6 +111,11 @@ def _detect_backend(coords: Sequence[Any]) -> str:
     Detection is *non-importing*: we inspect the object's class module
     string before importing the framework. This means a user who only has
     numpy installed never accidentally triggers a torch or jax import.
+
+    NumPy inputs default to the ``"torch"`` backend so that the canonical
+    contract — autograd-connected ``(B, M)`` tensor outputs — holds
+    uniformly. Callers who explicitly want a NumPy return value must pass
+    ``backend="numpy"`` to :meth:`BasisDescriptor.evaluate`.
     """
     for c in coords:
         mod = type(c).__module__
@@ -118,7 +123,7 @@ def _detect_backend(coords: Sequence[Any]) -> str:
             return "torch"
         if mod.startswith("jax") or mod.startswith("jaxlib"):
             return "jax"
-    return "numpy"
+    return "torch"
 
 
 def _normalize_backend(backend: str | None, coords: Sequence[Any]) -> str:

@@ -169,11 +169,19 @@ from ._basis_descriptors import Fourier, PeriodicHarmonic
 from ._composite_penalty import CompositePenalty
 from ._smooth import Smooth, SmoothSum
 from ._penalty_descriptors import (
-    ARDPenalty as ARDPenaltyDescriptor,
+    ARDPenalty as _ARDPenaltyDescriptor,
     BlockOrthogonalityDescriptor,
     IBPPenalty,
     MechanismSparsityDescriptor,
 )
+
+# Promote the torch-aware descriptor classes to the top-level penalty names so
+# `gamfit.ARDPenalty(0.1) + gamfit.IBPPenalty(1.0)` works uniformly through
+# the new BasisDescriptor/PenaltyDescriptor protocol. The original
+# Rust-pyclass descriptors used by the formula pipeline remain reachable as
+# `gamfit._penalties.ARDPenalty`, `gamfit._penalties.BlockOrthogonalityPenalty`,
+# etc., and continue to drive the REML core.
+ARDPenalty = _ARDPenaltyDescriptor
 from . import recipes, topology
 from .recipes import (
     PartialSupervisionFit,
