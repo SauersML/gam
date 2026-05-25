@@ -29,6 +29,63 @@ def _basis_input_dim(basis: BasisDescriptor) -> int | None:
     return int(dim)
 
 
+# Compatibility matrix: which (manifold-kind, basis-kind) pairs are allowed.
+# Each entry is keyed by ``type(manifold).__name__`` and the value is a frozenset
+# of acceptable ``type(basis).__name__`` strings. ``Smooth`` consults the matrix
+# at construction; anything outside it raises ``ValueError``.
+_COMPATIBILITY: dict[str, frozenset[str]] = {
+    "Circle": frozenset({"PeriodicHarmonic", "Fourier"}),
+    "Sphere": frozenset({"PeriodicHarmonic", "Fourier"}),  # placeholder; real SH wiring lives elsewhere
+    "Torus": frozenset({"PeriodicHarmonic", "Fourier"}),
+    "Euclidean": frozenset({"PeriodicHarmonic", "Fourier"}),
+    "CylinderManifold": frozenset({"PeriodicHarmonic", "Fourier"}),
+}
+
+
+def _check_manifold_basis_compatibility(latent: ManifoldDescriptor, basis: BasisDescriptor) -> None:
+    """Reject (Manifold, Basis) pairs that are not in the compatibility matrix.
+
+    Manifolds expose a ``compatible_bases`` class attribute when they want to
+    declare their own contract; otherwise the matrix above is used. ``Fourier``
+    is an alias of ``PeriodicHarmonic`` so both spellings pass.
+    """
+    declared = getattr(type(latent), "compatible_bases", None)
+    basis_name = type(basis).__name__
+    if declared is not None:
+        if basis_name in declared:
+            return
+        raise ValueError(
+            f"{type(basis).__name__} is not compatible with {type(latent).__name__}; "
+            f"compatible bases declared by the manifold: {sorted(declared)}"
+        )
+    allowed = _COMPATIBILITY.get(type(latent).__name__)
+    if allowed is None:
+        return  # unknown manifold class — let downstream dim check handle it
+    if basis_name not in allowed:
+        raise ValueError(
+            f"{basis_name} is not compatible with {type(latent).__name__}; "
+            f"allowed bases: {sorted(allowed)}"
+        )
+
+
+def _default_basis_for(latent: ManifoldDescriptor) -> BasisDescriptor:
+    """Magic-by-default basis pick driven by the latent manifold class."""
+    from ._basis_descriptors import PeriodicHarmonic
+    name = type(latent).__name__
+    if name in {"Circle", "Sphere", "Torus", "CylinderManifold"}:
+        return PeriodicHarmonic(harmonics=3)
+    return PeriodicHarmonic(harmonics=3)
+
+
+def _default_penalty_for(latent: ManifoldDescriptor) -> PenaltyDescriptor | None:
+    """Magic-by-default penalty pick: ARD on the latent axes."""
+    try:
+        from ._penalty_descriptors import ARDPenalty
+        return ARDPenalty(weight=1.0)
+    except Exception:
+        return None
+
+
 class Smooth(BasisDescriptor):
     """A composable smooth term tying latent / basis / penalty together.
 
@@ -156,6 +213,37 @@ class Smooth(BasisDescriptor):
             "penalty": None if self.penalty is None else _penalty_to_dict(self.penalty),
         }
 
+    def to_rust_descriptor(self) -> dict[str, Any]:
+        """Full Rust-engine descriptor for the four-tuple composition.
+
+        Equivalent to :meth:`to_dict`, but routed through each component's own
+        ``to_rust_descriptor()`` first so composite penalties round-trip every
+        child's payload verbatim. The exact key names match what the formula
+        builder consumes on the Rust side.
+        """
+        latent_payload = (
+            self.latent.to_json() if hasattr(self.latent, "to_json")
+            else {"kind": type(self.latent).__name__.lower()}
+        )
+        basis_payload: dict[str, Any]
+        if hasattr(self.basis, "to_dict"):
+            basis_payload = self.basis.to_dict()
+        else:
+            basis_payload = {"kind": type(self.basis).__name__}
+        if self.penalty is None:
+            penalty_payload: dict[str, Any] | None = None
+        elif hasattr(self.penalty, "to_rust_descriptor"):
+            penalty_payload = self.penalty.to_rust_descriptor()
+        else:
+            penalty_payload = _penalty_to_dict(self.penalty)
+        return {
+            "kind": "composed_smooth",
+            "name": self.name,
+            "latent": latent_payload,
+            "basis": basis_payload,
+            "penalty": penalty_payload,
+        }
+
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "Smooth":
         from ._manifold import Circle, Sphere, Torus, Euclidean, CylinderManifold
@@ -192,6 +280,51 @@ class Smooth(BasisDescriptor):
         if self.name is not None:
             parts.append(f"name={self.name!r}")
         return f"Smooth({', '.join(parts)})"
+
+
+def _default_basis_for(latent: ManifoldDescriptor) -> BasisDescriptor:
+    """Magic-by-default basis selection from a manifold.
+
+    The rule is: pick the canonical basis for the latent's topology. Today
+    that's a periodic harmonic basis for circle/1-D-torus. For other latent
+    topologies the user must pass ``basis=...`` explicitly.
+    """
+    from ._manifold import Circle, Torus
+    from ._basis_descriptors import PeriodicHarmonic
+    if isinstance(latent, Circle):
+        return PeriodicHarmonic(harmonics=3)
+    if isinstance(latent, Torus) and latent.dimension == 1:
+        return PeriodicHarmonic(harmonics=3)
+    raise ValueError(
+        f"Smooth: no default basis is registered for latent="
+        f"{type(latent).__name__}(dim={latent.dimension}); pass `basis=...` explicitly."
+    )
+
+
+def _default_penalty_for(latent: ManifoldDescriptor) -> PenaltyDescriptor | None:
+    """Magic-by-default penalty selection. Returns ``None`` so the smooth
+    is unpenalized unless the user opts in."""
+    del latent
+    return None
+
+
+def _check_manifold_basis_compatibility(
+    latent: ManifoldDescriptor, basis: BasisDescriptor
+) -> None:
+    """Eager compatibility check between a manifold and a basis.
+
+    Soft when ``basis.input_dim`` is unknown; loud when it is and does not
+    match ``latent.dimension``.
+    """
+    expected = _basis_input_dim(basis)
+    if expected is None:
+        return
+    if expected != latent.dimension:
+        raise ValueError(
+            f"Smooth: latent={type(latent).__name__}(dim={latent.dimension}) is "
+            f"incompatible with basis={type(basis).__name__}(input_dim={expected}). "
+            "Choose a basis whose input dimension matches the latent manifold."
+        )
 
 
 def _penalty_to_dict(penalty: PenaltyDescriptor) -> dict[str, Any]:
