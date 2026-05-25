@@ -4722,11 +4722,12 @@ fn natural_latent_manifold_for_basis(
 ) -> LatentManifold {
     match basis {
         crate::smooth::SmoothBasisSpec::BSpline1D { spec, .. } => {
-            if matches!(
-                &spec.knotspec,
-                crate::basis::BSplineKnotSpec::PeriodicUniform { .. }
-            ) {
-                LatentManifold::Circle
+            if let crate::basis::BSplineKnotSpec::PeriodicUniform { data_range, .. } =
+                &spec.knotspec
+            {
+                LatentManifold::Circle {
+                    period: data_range.1 - data_range.0,
+                }
             } else {
                 LatentManifold::Euclidean
             }
@@ -4735,18 +4736,24 @@ fn natural_latent_manifold_for_basis(
         crate::smooth::SmoothBasisSpec::Duchon { spec, .. }
             if spec.periodic.is_some() && d == 1 =>
         {
-            LatentManifold::Circle
+            let period = spec
+                .periodic
+                .as_ref()
+                .and_then(|v| v.first().copied().flatten())
+                .unwrap_or(std::f64::consts::TAU);
+            LatentManifold::Circle { period }
         }
         crate::smooth::SmoothBasisSpec::TensorBSpline { spec, .. } => {
             let parts: Vec<LatentManifold> = spec
                 .marginalspecs
                 .iter()
                 .map(|margin| {
-                    if matches!(
-                        &margin.knotspec,
-                        crate::basis::BSplineKnotSpec::PeriodicUniform { .. }
-                    ) {
-                        LatentManifold::Circle
+                    if let crate::basis::BSplineKnotSpec::PeriodicUniform { data_range, .. } =
+                        &margin.knotspec
+                    {
+                        LatentManifold::Circle {
+                            period: data_range.1 - data_range.0,
+                        }
                     } else {
                         LatentManifold::Euclidean
                     }
@@ -5548,7 +5555,7 @@ fn materialize_survival<'a>(
                 offset_entry: prepared.eta_offset_entry.clone(),
                 offset_exit: prepared.eta_offset_exit.clone(),
                 derivative_offset_exit: prepared.derivative_offset_exit.clone(),
-                structural_monotonicity: true,
+                time_monotonicity: crate::families::survival_location_scale::TimeBlockMonotonicity::EnforcedByCoordinateCone,
                 penalties: prepared.time_penalties.clone(),
                 nullspace_dims: prepared.time_nullspace_dims.clone(),
                 initial_log_lambdas: time_initial_log_lambdas,
@@ -5690,7 +5697,7 @@ fn materialize_survival<'a>(
                 offset_entry: prepared.eta_offset_entry.clone(),
                 offset_exit: prepared.eta_offset_exit.clone(),
                 derivative_offset_exit: prepared.derivative_offset_exit.clone(),
-                structural_monotonicity: true,
+                time_monotonicity: crate::families::survival_location_scale::TimeBlockMonotonicity::EnforcedByCoordinateCone,
                 penalties: prepared.time_penalties.clone(),
                 nullspace_dims: prepared.time_nullspace_dims.clone(),
                 initial_log_lambdas: time_initial_log_lambdas,
@@ -5749,7 +5756,7 @@ fn materialize_survival<'a>(
                 offset_entry: prepared.eta_offset_entry.clone(),
                 offset_exit: prepared.eta_offset_exit.clone(),
                 derivative_offset_exit: prepared.derivative_offset_exit.clone(),
-                structural_monotonicity: true,
+                time_monotonicity: crate::families::survival_location_scale::TimeBlockMonotonicity::EnforcedByCoordinateCone,
                 penalties: prepared.time_penalties.clone(),
                 nullspace_dims: prepared.time_nullspace_dims.clone(),
                 initial_log_lambdas: time_initial_log_lambdas,

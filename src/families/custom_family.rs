@@ -11,8 +11,7 @@ use crate::smooth::{
     try_build_spatial_log_kappa_derivativeinfo_list,
 };
 use crate::solver::active_set::{
-    project_stationarity_residual_on_constraint_cone, rank_reduce_rows_pivoted_qr,
-    solve_quadratic_with_linear_constraints,
+    project_stationarity_residual_on_constraint_cone, solve_quadratic_with_linear_constraints,
 };
 use crate::solver::estimate::reml::penalty_logdet::PenaltyPseudologdet;
 use crate::solver::estimate::reml::unified::{
@@ -13151,6 +13150,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 // branches below; computing them up front lets the log line
                 // and the dispatch agree.
                 let floor_reached = trust_update.accepted
+                    && current_stationarity_residual <= residual_tol
                     && joint_objective_floor_reached(
                         old_objective,
                         trialobjective,

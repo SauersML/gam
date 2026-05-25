@@ -293,6 +293,20 @@ pub(crate) fn is_sigma_aux_index(
         && deriv.s_psi_psi.is_none()
 }
 
+/// Predicate used by every marginal-slope family's persistent-warm-start
+/// fingerprint guard: the caller's parameter blocks must each have row count
+/// matching the family's `n`, and the list must be non-empty.
+#[inline]
+pub(crate) fn parameter_block_specs_match_rows(
+    specs: &[ParameterBlockSpec],
+    expected_n: usize,
+) -> bool {
+    !specs.is_empty()
+        && specs
+            .iter()
+            .all(|spec| spec.design.nrows() == expected_n && spec.offset.len() == expected_n)
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct CoeffSupport {
     pub(crate) include_primary: bool,

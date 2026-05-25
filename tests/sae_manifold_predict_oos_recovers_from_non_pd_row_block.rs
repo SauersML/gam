@@ -76,7 +76,7 @@ fn degenerate_oos_term() -> (SaeManifoldTerm, SaeManifoldRho, Array2<f64>) {
     let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
         Array2::<f64>::zeros((3, 1)),
         vec![coords],
-        vec![LatentManifold::Circle],
+        vec![LatentManifold::Circle { period: 1.0 }],
         AssignmentMode::softmax(0.7),
     )
     .expect("build assignment");

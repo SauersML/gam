@@ -4635,7 +4635,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     offset_entry: prepared.eta_offset_entry.clone(),
                     offset_exit: prepared.eta_offset_exit.clone(),
                     derivative_offset_exit: prepared.derivative_offset_exit.clone(),
-                    structural_monotonicity: true,
+                    time_monotonicity: gam::families::survival_location_scale::TimeBlockMonotonicity::EnforcedByCoordinateCone,
                     penalties: prepared.time_penalties.clone(),
                     nullspace_dims: prepared.time_nullspace_dims.clone(),
                     initial_log_lambdas: survival_time_initial_log_lambdas(
@@ -5061,7 +5061,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 offset_entry: prepared.eta_offset_entry.clone(),
                 offset_exit: prepared.eta_offset_exit.clone(),
                 derivative_offset_exit: prepared.derivative_offset_exit.clone(),
-                structural_monotonicity: true,
+                time_monotonicity: gam::families::survival_location_scale::TimeBlockMonotonicity::EnforcedByCoordinateCone,
                 penalties: prepared.time_penalties.clone(),
                 nullspace_dims: prepared.time_nullspace_dims.clone(),
                 initial_log_lambdas: survival_time_initial_log_lambdas(
@@ -5337,7 +5337,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 offset_entry: prepared.eta_offset_entry.clone(),
                 offset_exit: prepared.eta_offset_exit.clone(),
                 derivative_offset_exit: prepared.derivative_offset_exit.clone(),
-                structural_monotonicity: true,
+                time_monotonicity: gam::families::survival_location_scale::TimeBlockMonotonicity::EnforcedByCoordinateCone,
                 penalties: prepared.time_penalties.clone(),
                 nullspace_dims: prepared.time_nullspace_dims.clone(),
                 initial_log_lambdas: time_initial_log_lambdas,

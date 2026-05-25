@@ -5608,6 +5608,16 @@ fn build_single_local_smooth_term(
                 .iter()
                 .map(|ns| ns.saturating_mul(l_minus_one))
                 .collect();
+            // Invariant: `null_eigenvectors[k]` must mirror `penalties[k]`'s
+            // spectral null space. We just rebuilt `inner_built.penalties` from
+            // Kronecker-like `S_big` blocks, so the previously-plumbed
+            // `null_eigenvectors` (still parallel to the OLD per-level penalty)
+            // is stale. Recompute from the rebuilt penalties to restore the
+            // invariant; ditto for the joint-null absorption rotation.
+            inner_built.null_eigenvectors =
+                crate::terms::basis::recompute_null_eigenvectors(&inner_built.penalties)?;
+            inner_built.joint_null_rotation =
+                crate::terms::basis::compute_joint_null_rotation(&inner_built.penalties)?;
             inner_built.kronecker_factored = None;
             return Ok(inner_built);
         }
@@ -6037,6 +6047,16 @@ fn build_single_local_smooth_term(
     let linear_constraints_local =
         merge_linear_constraints_global(shape_linear_constraints, boundary_linear_constraints);
 
+    // Joint-null absorption rotation, computed from the final per-smooth
+    // penalty set after all in-smooth reparameterizations (boundary,
+    // shape, T^T·S·T congruence, etc.) have already been applied. This is
+    // Stage-2 commit B: populate `joint_null_rotation` so downstream
+    // commits (D for fit-side application, plus the Stage-3c prediction
+    // replay) have the rotation to consume. Commit B does *not* apply the
+    // rotation; `design_t` and `penalties_t` flow through unchanged.
+    let joint_null_rotation =
+        crate::terms::basis::compute_joint_null_rotation(&penalties_t)?;
+
     Ok(LocalSmoothTermBuild {
         dim: p_local,
         design: design_t,
@@ -6044,7 +6064,7 @@ fn build_single_local_smooth_term(
         ops: ops_t,
         nullspaces: nullspaces_t,
         null_eigenvectors: null_eigenvectors_t,
-        joint_null_rotation: None,
+        joint_null_rotation,
         penaltyinfo: penaltyinfo_t,
         pre_dropped_penaltyinfo: pre_dropped_penaltyinfo_t,
         metadata,

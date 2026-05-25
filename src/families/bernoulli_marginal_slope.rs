@@ -17,8 +17,8 @@ use crate::families::marginal_slope_shared::{
     build_denested_partition_cells as shared_denested_partition_cells, chunked_row_reduction,
     eval_coeff4_at, is_sigma_aux_index as shared_is_sigma_aux_index,
     observed_denested_cell_partials as shared_observed_denested_cell_partials, outer_row_indices,
-    outer_weighted_rows, probit_frailty_scale, probit_frailty_scale_multi_dir_jet,
-    psi_derivative_location, scale_coeff4,
+    outer_weighted_rows, parameter_block_specs_match_rows, probit_frailty_scale,
+    probit_frailty_scale_multi_dir_jet, psi_derivative_location, scale_coeff4,
 };
 use crate::families::row_kernel::{
     RowKernel, RowKernelHessianWorkspace, build_row_kernel_cache, row_kernel_gradient,
@@ -5272,13 +5272,6 @@ struct BernoulliMarginalSlopeExactNewtonJointPsiWorkspace {
     /// and the second-order / Hessian-drift counterparts to make the cached
     /// ψ calculus subsample-aware.
     options: BlockwiseFitOptions,
-}
-
-fn parameter_block_specs_match_rows(specs: &[ParameterBlockSpec], expected_n: usize) -> bool {
-    !specs.is_empty()
-        && specs
-            .iter()
-            .all(|spec| spec.design.nrows() == expected_n && spec.offset.len() == expected_n)
 }
 
 const BERNOULLI_MARGSLOPE_LINE_SEARCH_EARLY_EXIT_CHUNK_ROWS: usize = 10_000;

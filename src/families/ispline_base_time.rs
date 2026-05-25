@@ -89,8 +89,75 @@
 //!
 //! # Stage status
 //!
-//! This file is the design note (Stage 1). The closed-form C-spline /
-//! I-spline design builders, the enum migration on `TimeBlockInput`, and
-//! the dispatch wiring follow in subsequent stages. Stage 1 lives here so
-//! the module is registered in `src/families/mod.rs` and downstream
-//! teammates can see the intended shape.
+//! Stage 1 (the design note above) and Stage 2 (closed-form C-spline values
+//! plus `build_ispline_base_designs`) live in this file. The enum migration
+//! on `TimeBlockInput` has already landed at `survival_location_scale.rs`
+//! (`TimeBlockMonotonicity`). The dispatch wiring at the marginal-slope
+//! construction sites follows in Stage 3.
+//!
+//! # Closed-form C-spline derivation (Stage 2 math)
+//!
+//! Setup. Knot vector `τ` of length `K`; I-spline degree `k`. I-splines are
+//! built from degree-`(k+1)` B-splines on `τ`:
+//!
+//!   I_j^{(k)}(u) = Σ_{m=j+1}^{N_B-1} B_m^{(k+1)}(u; τ),   j = 0..N_I-1
+//!
+//! where `N_B = K − (k+2)` and `N_I = N_B − 1`, anchored to `I_j(τ[k+1]) = 0`
+//! and `I_j(τ[N_B]) = 1` (the convention `create_ispline_dense` already uses).
+//!
+//! C-spline goal:
+//!
+//!   C_j(u) := ∫_{τ[k+1]}^{u} I_j^{(k)}(v) dv, anchored to C_j(τ[k+1]) = 0.
+//!
+//! Curry-Schoenberg integration identity. For a B-spline of degree `(k+1)`
+//! on `τ`, the antiderivative is a degree-`(k+2)` spline expressible on an
+//! extended knot vector `τ̃` (one extra repeat of `τ[0]` at the left and of
+//! `τ[K-1]` at the right; length `K+2`):
+//!
+//!   ∫_{−∞}^{u} B_m^{(k+1)}(v; τ) dv
+//!       = ((τ[m+k+2] − τ[m])/(k+2)) · T_m^{(k+2)}(u; τ̃)
+//!
+//! where `T_m^{(k+2)}(u; τ̃) := Σ_{i ≥ m} B_i^{(k+2)}(u; τ̃)` is the
+//! degree-`(k+2)` right-cumulative tail. (Equivalent to Marsden / dual-spline
+//! integration; see Schumaker 1981 §4 or de Boor *A Practical Guide to
+//! Splines* eq. X.30 for the right-cumulative form.)
+//!
+//! Substituting and using linearity:
+//!
+//!   C_j(u) = Σ_{m=j+1}^{N_B-1} ((τ[m+k+2] − τ[m])/(k+2))
+//!            · [ T_m^{(k+2)}(u; τ̃) − T_m^{(k+2)}(τ[k+1]; τ̃) ]
+//!
+//! The anchor subtraction `T_m^{(k+2)}(τ[k+1]; τ̃)` is a precomputable vector
+//! of size `N_B`; once cached the per-data-point cost is one degree-`(k+2)`
+//! B-spline evaluation on `τ̃` plus a right-cumulative sweep, identical to
+//! the pattern `create_ispline_dense` already runs at degree `(k+1)`.
+//!
+//! Sanity checks built into the test in Stage 6 (`tests/ispline_base_time.rs`):
+//! * `C_j(τ[k+1]) = 0` by construction (the subtracted anchor cancels).
+//! * `dC_j/du = I_j^{(k)}(u)` pointwise — verified by analytic vs finite-
+//!   difference comparison on a randomized grid of `u`.
+//! * `C_j(u) > 0` strictly on `(τ[k+1], u]` whenever `I_j(u) > 0` on a
+//!   positive-measure subset of `(τ[k+1], u]`.
+//!
+//! # Wiring (Stage 3, briefed here for completeness)
+//!
+//! `build_ispline_base_designs(log_t_entry, log_t_exit, age_entry, age_exit,
+//! knots, internal_degree, derivative_guard)` returns
+//!
+//!   { design_entry, design_exit, design_derivative_exit,
+//!     offset_residual_entry, offset_residual_exit,
+//!     derivative_offset_residual_exit }
+//!
+//! with the conventions:
+//!
+//!   design_entry[i, j]            = C_j^{(k)}(log t_entry[i])
+//!   design_exit[i, j]             = C_j^{(k)}(log t_exit[i])
+//!   design_derivative_exit[i, j]  = (1 / age_exit[i]) · I_j^{(k)}(log t_exit[i])
+//!   offset_residual_entry[i]      = guard · age_entry[i]
+//!   offset_residual_exit[i]       = guard · age_exit[i]
+//!   derivative_offset_residual_exit[i] = guard
+//!
+//! The caller is `prepare_survival_time_stack`, which already merges these
+//! offset residuals additively into the existing offset slots via
+//! `add_survival_time_derivative_guard_offset` — so the existing pipeline
+//! continues to own offset accumulation.
