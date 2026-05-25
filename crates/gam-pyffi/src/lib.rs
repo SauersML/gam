@@ -69,6 +69,7 @@ use gam::terms::sae_manifold::{
     AssignmentMode, GumbelTemperatureSchedule, SaeAtomBasisKind, SaeManifoldRho, ScheduleKind,
     term_from_padded_blocks_with_mode,
 };
+use gam::solver::reml_compare::{RemlCandidate, compare_reml_fits as compare_reml_fits_core};
 use gam::terms::skip_transcoder::{
     SkipTranscoderRemlInputs, skip_transcoder_reml_metrics as skip_transcoder_reml_metrics_core,
 };
@@ -3613,13 +3614,6 @@ const NULL_HESSIAN_LOGDET_KEYS: &[&str] = &[
 ];
 const DIM_KEYS: &[&str] = &["effective_dim", "dim_h", "dim_H", "hessian_dim"];
 
-struct RemlCandidateScore {
-    index: usize,
-    name: String,
-    score: f64,
-    edf: Option<f64>,
-}
-
 enum RemlFitView<'py> {
     SavedSummary(serde_json::Value),
     PythonObject(Bound<'py, PyAny>),
@@ -3679,64 +3673,63 @@ fn compare_reml_fits(
         }
     }
 
-    let mut scored = Vec::with_capacity(fits.len());
+    // Python-specific work: extract scalar score + edf from each PyAny
+    // fit (which may be a saved-summary dict, a Model object, or any
+    // object exposing .evidence). Then the ranking, delta, Bayes-factor,
+    // and evidence-summary logic is delegated to the pure-Rust core in
+    // `gam::solver::reml_compare`, which is identically callable from
+    // the CLI binary.
+    let mut candidates = Vec::with_capacity(fits.len());
     for (index, (name, fit)) in labels.into_iter().zip(fits.iter()).enumerate() {
         let fit = fit.bind(py);
         let view = reml_fit_view(py, fit)?;
-        scored.push(RemlCandidateScore {
+        candidates.push(RemlCandidate {
             index,
             name,
             score: extract_reml_score_from_view(py, &view)?,
             edf: extract_edf_from_view(py, &view)?,
         });
     }
-    scored.sort_by(|left, right| {
-        right
-            .score
-            .partial_cmp(&left.score)
-            .unwrap_or(Ordering::Equal)
-    });
 
-    let best_score = scored[0].score;
-    let winner = scored[0].name.clone();
+    let comparison = compare_reml_fits_core(candidates.clone()).map_err(PyValueError::new_err)?;
+
     let ranking = PyList::empty(py);
+    for row in comparison.ranking.iter() {
+        ranking.append((
+            row.name.as_str(),
+            row.score,
+            row.delta,
+            row.bayes_factor,
+            row.edf,
+        ))?;
+    }
     let score_table = PyList::empty(py);
-    for row in scored.iter() {
-        let delta = row.score - best_score;
-        let bayes_factor = delta.exp();
-        ranking.append((row.name.as_str(), row.score, delta, bayes_factor, row.edf))?;
-
+    for row in comparison.score_table.iter() {
         let table_row = PyDict::new(py);
         table_row.set_item("name", row.name.as_str())?;
-        table_row.set_item("reml_score", row.score)?;
-        table_row.set_item("delta_reml", delta)?;
-        table_row.set_item("bayes_factor_vs_best", bayes_factor)?;
-        table_row.set_item("effective_dof", row.edf)?;
+        table_row.set_item("reml_score", row.reml_score)?;
+        table_row.set_item("delta_reml", row.delta_reml)?;
+        table_row.set_item("bayes_factor_vs_best", row.bayes_factor_vs_best)?;
+        table_row.set_item("effective_dof", row.effective_dof)?;
         score_table.append(table_row)?;
     }
 
-    let summary = if scored.len() >= 2 {
-        let runner_up = &scored[1];
-        let log_bf = best_score - runner_up.score;
-        format!(
-            "{} wins by Bayes factor {} over {}",
-            winner,
-            format_bayes_factor(log_bf),
-            runner_up.name
-        )
-    } else {
-        format!("{winner} (single fit; no comparison)")
-    };
-
     let out = PyDict::new(py);
     out.set_item("ranking", ranking)?;
-    out.set_item("winner", winner)?;
-    out.set_item("evidence_summary", summary)?;
+    out.set_item("winner", &comparison.winner)?;
+    out.set_item("evidence_summary", &comparison.evidence_summary)?;
     out.set_item("score_table", score_table)?;
     if let Some(scores) = cv_scores {
+        // cv_optional walks the ranked order but uses the caller's
+        // original score indices — preserved via `RemlCandidate.index`.
+        let by_name: std::collections::HashMap<&str, usize> = candidates
+            .iter()
+            .map(|c| (c.name.as_str(), c.index))
+            .collect();
         let cv_optional = PyList::empty(py);
-        for row in scored.iter() {
-            cv_optional.append((row.name.as_str(), scores[row.index]))?;
+        for row in comparison.ranking.iter() {
+            let original_index = by_name[row.name.as_str()];
+            cv_optional.append((row.name.as_str(), scores[original_index]))?;
         }
         out.set_item("cv_optional", cv_optional)?;
     }
@@ -3990,43 +3983,6 @@ fn json_output_dim(payload: &serde_json::Value) -> f64 {
         return 1.0;
     };
     first.as_array().map_or(1.0, |row| row.len() as f64)
-}
-
-fn format_bayes_factor(log_bf: f64) -> String {
-    if !log_bf.is_finite() {
-        return "inf".to_string();
-    }
-    if log_bf.abs() >= std::f64::consts::LN_10 * 3.0 {
-        return format!("1e{:+.1}", log_bf / std::f64::consts::LN_10);
-    }
-    format_three_significant(log_bf.exp())
-}
-
-fn format_three_significant(value: f64) -> String {
-    if value == 0.0 {
-        return "0".to_string();
-    }
-    let abs = value.abs();
-    let decimals = if abs >= 100.0 {
-        0
-    } else if abs >= 10.0 {
-        1
-    } else if abs >= 1.0 {
-        2
-    } else {
-        let exponent = abs.log10().floor();
-        (-exponent as i32 + 2).max(0) as usize
-    };
-    let mut formatted = format!("{value:.decimals$}");
-    if formatted.contains('.') {
-        while formatted.ends_with('0') {
-            formatted.pop();
-        }
-        if formatted.ends_with('.') {
-            formatted.pop();
-        }
-    }
-    formatted
 }
 
 #[pyfunction(signature = (x, y, penalty, weights, ridge_lambda))]
