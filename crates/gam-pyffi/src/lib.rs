@@ -12252,6 +12252,240 @@ fn benchmark_prediction_metrics(
     Ok(metrics.unbind())
 }
 
+fn benchmark_pr_auc_score(observed: &[f64], predicted_mean: &[f64]) -> PyResult<f64> {
+    if observed.len() != predicted_mean.len() {
+        return Err(PyValueError::new_err(format!(
+            "pr_auc length mismatch: observed={} predicted={}",
+            observed.len(),
+            predicted_mean.len()
+        )));
+    }
+    let mut pairs: Vec<(f64, bool)> = observed
+        .iter()
+        .zip(predicted_mean.iter())
+        .map(|(&y, &p)| (p, y > 0.5))
+        .collect();
+    let n_pos = pairs.iter().filter(|(_, is_pos)| *is_pos).count();
+    if n_pos == 0 {
+        return Ok(0.0);
+    }
+    pairs.sort_by(|(a, _), (b, _)| b.total_cmp(a));
+    let mut tp = 0usize;
+    let mut fp = 0usize;
+    let mut prev_precision = 1.0;
+    let mut prev_recall = 0.0;
+    let mut area = 0.0;
+    for (_score, is_pos) in pairs {
+        if is_pos {
+            tp += 1;
+        } else {
+            fp += 1;
+        }
+        let precision = tp as f64 / (tp + fp).max(1) as f64;
+        let recall = tp as f64 / n_pos as f64;
+        area += 0.5 * (precision + prev_precision) * (recall - prev_recall);
+        prev_precision = precision;
+        prev_recall = recall;
+    }
+    Ok(area)
+}
+
+fn benchmark_ece_score(observed: &[f64], predicted_mean: &[f64]) -> PyResult<f64> {
+    if observed.len() != predicted_mean.len() {
+        return Err(PyValueError::new_err(format!(
+            "ece length mismatch: observed={} predicted={}",
+            observed.len(),
+            predicted_mean.len()
+        )));
+    }
+    if observed.is_empty() {
+        return Err(PyValueError::new_err("ece requires at least one row"));
+    }
+    let mut bins = vec![(0usize, 0.0, 0.0); 20];
+    for (&y, &p) in observed.iter().zip(predicted_mean.iter()) {
+        let mut idx = (p.clamp(0.0, 1.0) * 20.0).floor() as usize;
+        if idx >= 20 {
+            idx = 19;
+        }
+        bins[idx].0 += 1;
+        bins[idx].1 += y;
+        bins[idx].2 += p;
+    }
+    let n = observed.len() as f64;
+    Ok(bins
+        .into_iter()
+        .filter(|(count, _, _)| *count > 0)
+        .map(|(count, y_sum, p_sum)| {
+            let c = count as f64;
+            (c / n) * ((y_sum / c) - (p_sum / c)).abs()
+        })
+        .sum())
+}
+
+#[pyfunction]
+fn auc_from_predictions(observed: Vec<f64>, predicted_mean: Vec<f64>) -> PyResult<f64> {
+    benchmark_auc_score(&observed, &predicted_mean)
+}
+
+#[pyfunction]
+fn brier_from_predictions(observed: Vec<f64>, predicted_mean: Vec<f64>) -> PyResult<f64> {
+    let diagnostics =
+        gam::inference::diagnostics::diagnostics_from_predictions(&observed, &predicted_mean)
+            .map_err(py_value_error)?;
+    Ok(diagnostics.rmse * diagnostics.rmse)
+}
+
+#[pyfunction(signature = (observed, predicted_mean, eps = 1e-12))]
+fn log_loss_from_predictions(
+    observed: Vec<f64>,
+    predicted_mean: Vec<f64>,
+    eps: f64,
+) -> PyResult<f64> {
+    benchmark_binary_logloss_eps(&observed, &predicted_mean, eps)
+}
+
+#[pyfunction(signature = (observed, predicted_mean, null_mean, eps = 1e-12))]
+fn nagelkerke_r2_from_predictions(
+    observed: Vec<f64>,
+    predicted_mean: Vec<f64>,
+    null_mean: f64,
+    eps: f64,
+) -> PyResult<Option<f64>> {
+    benchmark_nagelkerke_r2_with_null_mean(&observed, &predicted_mean, null_mean, eps)
+}
+
+#[pyfunction]
+fn classification_metrics(
+    py: Python<'_>,
+    observed: Vec<f64>,
+    predicted_mean: Vec<f64>,
+    train_prev: f64,
+) -> PyResult<Py<PyDict>> {
+    let out = PyDict::new(py);
+    out.set_item("auc", benchmark_auc_score(&observed, &predicted_mean)?)?;
+    out.set_item("pr_auc", benchmark_pr_auc_score(&observed, &predicted_mean)?)?;
+    out.set_item("brier", brier_from_predictions(observed.clone(), predicted_mean.clone())?)?;
+    out.set_item(
+        "logloss",
+        benchmark_binary_logloss(&observed, &predicted_mean)?,
+    )?;
+    match benchmark_nagelkerke_r2_with_null_mean(&observed, &predicted_mean, train_prev, 1.0e-12)?
+    {
+        Some(value) => out.set_item("nagelkerke_r2", value)?,
+        None => out.set_item("nagelkerke_r2", py.None())?,
+    }
+    out.set_item("ece", benchmark_ece_score(&observed, &predicted_mean)?)?;
+    Ok(out.unbind())
+}
+
+#[pyfunction]
+fn survival_concordance(
+    event_times: Vec<f64>,
+    risk_score: Vec<f64>,
+    events: Vec<f64>,
+) -> PyResult<f64> {
+    if event_times.len() != risk_score.len() || event_times.len() != events.len() {
+        return Err(PyValueError::new_err(format!(
+            "survival_concordance length mismatch: times={} risk={} events={}",
+            event_times.len(),
+            risk_score.len(),
+            events.len()
+        )));
+    }
+    let mut admissible = 0.0;
+    let mut concordant = 0.0;
+    for i in 0..event_times.len() {
+        for j in (i + 1)..event_times.len() {
+            let ordering = if event_times[i] < event_times[j] && events[i] > 0.5 {
+                Some(risk_score[i].total_cmp(&risk_score[j]))
+            } else if event_times[j] < event_times[i] && events[j] > 0.5 {
+                Some(risk_score[j].total_cmp(&risk_score[i]))
+            } else {
+                None
+            };
+            if let Some(ordering) = ordering {
+                admissible += 1.0;
+                concordant += match ordering {
+                    Ordering::Greater => 1.0,
+                    Ordering::Equal => 0.5,
+                    Ordering::Less => 0.0,
+                };
+            }
+        }
+    }
+    Ok(if admissible == 0.0 {
+        0.5
+    } else {
+        concordant / admissible
+    })
+}
+
+#[pyfunction]
+fn survival_score_grid_from_times<'py>(
+    py: Python<'py>,
+    train_times: Vec<f64>,
+) -> PyResult<Py<PyArray1<f64>>> {
+    let mut times: Vec<f64> = train_times
+        .into_iter()
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .collect();
+    if times.is_empty() {
+        return Ok(Array1::from_vec(vec![0.0, 1.0]).into_pyarray(py).unbind());
+    }
+    times.sort_by(|a, b| a.total_cmp(b));
+    let median = if times.len() % 2 == 1 {
+        times[times.len() / 2]
+    } else {
+        0.5 * (times[times.len() / 2 - 1] + times[times.len() / 2])
+    };
+    let mut grid = vec![0.0, 1.0, 2.0, 5.0, 10.0, median];
+    grid.retain(|value| value.is_finite() && *value >= 0.0);
+    grid.sort_by(|a, b| a.total_cmp(b));
+    grid.dedup_by(|a, b| *a == *b);
+    if grid.is_empty() {
+        grid.push(0.0);
+    }
+    grid[0] = 0.0;
+    if grid.len() == 1 {
+        grid.push(grid[0].max(1.0));
+    }
+    Ok(Array1::from_vec(grid).into_pyarray(py).unbind())
+}
+
+#[pyfunction]
+fn repeat_survival_curve<'py>(
+    py: Python<'py>,
+    survival: Vec<f64>,
+    n_rows: usize,
+) -> PyResult<Py<PyArray2<f64>>> {
+    let mut out = Array2::<f64>::zeros((n_rows, survival.len()));
+    for mut row in out.rows_mut() {
+        for (dst, src) in row.iter_mut().zip(survival.iter()) {
+            *dst = *src;
+        }
+    }
+    Ok(out.into_pyarray(py).unbind())
+}
+
+#[pyfunction]
+fn survival_null_curve_from_train<'py>(
+    py: Python<'py>,
+    train_times: Vec<f64>,
+    train_events: Vec<f64>,
+    grid: Vec<f64>,
+) -> PyResult<Py<PyArray1<f64>>> {
+    if train_times.len() != train_events.len() {
+        return Err(PyValueError::new_err(format!(
+            "survival null curve length mismatch: times={} events={}",
+            train_times.len(),
+            train_events.len()
+        )));
+    }
+    Ok(Array1::from_vec(benchmark_km_curve(&train_times, &train_events, &grid))
+        .into_pyarray(py)
+        .unbind())
+}
+
 fn benchmark_km_curve(times: &[f64], events: &[f64], grid: &[f64]) -> Vec<f64> {
     let mut rows: Vec<(f64, bool)> = times
         .iter()
@@ -16559,6 +16793,15 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(compute_residuals, module)?)?;
     module.add_function(wrap_pyfunction!(diagnostics_from_predictions, module)?)?;
     module.add_function(wrap_pyfunction!(benchmark_prediction_metrics, module)?)?;
+    module.add_function(wrap_pyfunction!(auc_from_predictions, module)?)?;
+    module.add_function(wrap_pyfunction!(brier_from_predictions, module)?)?;
+    module.add_function(wrap_pyfunction!(log_loss_from_predictions, module)?)?;
+    module.add_function(wrap_pyfunction!(nagelkerke_r2_from_predictions, module)?)?;
+    module.add_function(wrap_pyfunction!(classification_metrics, module)?)?;
+    module.add_function(wrap_pyfunction!(survival_concordance, module)?)?;
+    module.add_function(wrap_pyfunction!(survival_score_grid_from_times, module)?)?;
+    module.add_function(wrap_pyfunction!(repeat_survival_curve, module)?)?;
+    module.add_function(wrap_pyfunction!(survival_null_curve_from_train, module)?)?;
     module.add_function(wrap_pyfunction!(
         survival_matrix_from_risk_calibration,
         module
