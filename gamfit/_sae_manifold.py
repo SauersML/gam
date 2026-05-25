@@ -994,7 +994,8 @@ def _basis_kind_name(spec: str | Smooth) -> str:
 
 def _basis_and_jacobian(spec: str | Smooth, t: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     # Dispatch contract: resolve the public basis kind here, then delegate to
-    # the kind-specific helper that owns the Rust-backed Phi/J/Phi-penalty path.
+    # the kind-specific helper; those helpers are the only path into Rust-backed
+    # Phi/J/Phi-penalty evaluation and must not be bypassed with inline NumPy.
     if isinstance(spec, str):
         spec = _basis_from_name(spec)
     if isinstance(spec, PeriodicSplineCurve):
