@@ -214,6 +214,7 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
     if kind == "gated":
         kind = "jumprelu"
     alpha_value = 1.0 if alpha == "auto" else float(alpha)
+<<<<<<< HEAD
     penalties = [n for n, ok in (("IsometryPenalty", isometry_weight > 0.0), ("ARDPenalty", ard_per_atom),
         ("MechanismSparsityPenalty", mechanism_sparsity_groups is not None),
         ("BlockOrthogonalityPenalty", block_orthogonality_weight > 0.0)) if ok]
@@ -223,6 +224,407 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         sparsity_strength=float(sparsity), smoothness=float(smoothness),
         max_iter=int(max_iter_total), learning_rate=float(learning_rate),
         gumbel_schedule=_schedule_payload(gumbel_schedule), random_state=int(random_state),
+=======
+    learnable_alpha = bool(alpha == "auto")
+    schedule_payload = _schedule_payload(gumbel_schedule)
+    penalties = [name for name, enabled in {
+        "IsometryPenalty": isometry_weight > 0.0,
+        "ARDPenalty": ard_per_atom,
+        "MechanismSparsityPenalty": mechanism_sparsity_groups is not None,
+        "BlockOrthogonalityPenalty": block_orthogonality_weight > 0.0,
+    }.items() if enabled]
+
+    rng = np.random.default_rng(int(random_state))
+    n_obs, p_out = x.shape
+
+    # Per-atom basis specs (kind + n_harmonics / centers).
+    atom_specs: list[dict[str, Any]] = []
+    for atom_idx in range(k_atoms):
+        kind = bases[atom_idx].lower()
+        if kind in _PERIODIC_BASES:
+            n_harm = max(1, int(dims[atom_idx]))
+            atom_specs.append({"kind": "periodic", "n_harmonics": n_harm, "m": 1 + 2 * n_harm})
+        elif kind in _DUCHON_BASES:
+            d = max(1, int(dims[atom_idx]))
+            n_centers = max(8, min(n_obs, 32))
+            idx = rng.choice(n_obs, size=n_centers, replace=False) if n_obs >= n_centers else np.arange(n_obs)
+            seed_coords = _pca_seed_coords(x, d, rng)
+            centers = seed_coords[idx, :].copy()
+            atom_specs.append({"kind": "duchon", "centers": centers, "m": n_centers + d + 1})
+        else:
+            raise ValueError(f"unsupported atom basis kind: {bases[atom_idx]!r}")
+
+    m_max = max(spec["m"] for spec in atom_specs)
+    d_max = max(dims) if dims else 1
+
+    # PCA-style coord seeding (in-Python; mirrors what an in-Rust seeder would do).
+    initial_coords = np.zeros((k_atoms, n_obs, d_max), dtype=float)
+    for atom_idx in range(k_atoms):
+        d = dims[atom_idx]
+        if d <= 0:
+            continue
+        spec = atom_specs[atom_idx]
+        if spec["kind"] == "periodic":
+            theta = _pca_periodic_seed(x, rng, atom_idx)
+            initial_coords[atom_idx, :, 0] = theta
+            for axis in range(1, d):
+                initial_coords[atom_idx, :, axis] = _pca_axis(x, axis, rng)
+        else:
+            seed = _pca_seed_coords(x, d, rng)
+            initial_coords[atom_idx, :, :d] = seed
+
+    # Pre-allocate stacked basis arrays.
+    decoder_coefficients = np.zeros((k_atoms, m_max, p_out), dtype=float)
+    smooth_penalties_stack = np.zeros((k_atoms, m_max, m_max), dtype=float)
+    initial_logits = np.zeros((n_obs, k_atoms), dtype=float)
+    basis_sizes = [int(spec["m"]) for spec in atom_specs]
+
+    last_payload: dict[str, Any] | None = None
+    for _ in range(max_iter_total):
+        basis_values, basis_jacobian = _build_basis_stack(
+            atom_specs, initial_coords, dims, m_max, d_max
+        )
+        smooth_penalties_stack = _build_penalty_stack(atom_specs, m_max)
+
+        rust = rust_module()
+        result = rust.sae_manifold_fit(
+            np.ascontiguousarray(x),
+            [spec["kind"] for spec in atom_specs],
+            list(dims),
+            np.ascontiguousarray(basis_values),
+            np.ascontiguousarray(basis_jacobian),
+            list(basis_sizes),
+            np.ascontiguousarray(decoder_coefficients),
+            np.ascontiguousarray(smooth_penalties_stack),
+            np.ascontiguousarray(initial_logits),
+            np.ascontiguousarray(initial_coords),
+            float(alpha_value),
+            float(tau),
+            bool(learnable_alpha),
+            assignment_kind=str(assignment_kind),
+            sparsity_strength=float(sparsity),
+            smoothness=float(smoothness),
+            max_iter=1,
+            learning_rate=float(learning_rate),
+            gumbel_schedule=schedule_payload,
+        )
+        last_payload = dict(result)
+        # Pull updated state for the next iteration.
+        for atom_idx, atom in enumerate(last_payload["atoms"]):
+            new_coords = np.asarray(atom["on_atom_coords_t"], dtype=float)
+            d = dims[atom_idx]
+            if d > 0 and new_coords.size:
+                initial_coords[atom_idx, :, :d] = new_coords[:, :d]
+            decoder = np.asarray(atom["decoder_B"], dtype=float)
+            m = basis_sizes[atom_idx]
+            if decoder.size:
+                decoder_coefficients[atom_idx, :m, :] = decoder[:m, :]
+        if "logits" in last_payload:
+            new_logits = np.asarray(last_payload["logits"], dtype=float)
+            if new_logits.shape == initial_logits.shape:
+                initial_logits = np.ascontiguousarray(new_logits)
+
+    if last_payload is None:
+        raise RuntimeError("sae_manifold_fit produced no iterations")
+
+    return _wrap_payload(
+        x,
+        last_payload,
+        atom_topology,
+        assignment,
+        penalties,
+        atom_specs,
+        dims,
+        basis_sizes,
+    )
+
+
+def _build_basis_stack(
+    atom_specs: list[dict[str, Any]],
+    coords: np.ndarray,
+    dims: list[int],
+    m_max: int,
+    d_max: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    k_atoms = len(atom_specs)
+    n_obs = coords.shape[1]
+    phi_stack = np.zeros((k_atoms, n_obs, m_max), dtype=float)
+    jet_stack = np.zeros((k_atoms, n_obs, m_max, d_max), dtype=float)
+    rust = rust_module()
+    for atom_idx, spec in enumerate(atom_specs):
+        d = dims[atom_idx]
+        if spec["kind"] == "periodic":
+            t = np.ascontiguousarray(coords[atom_idx, :, 0])
+            phi, jet, _penalty = rust.periodic_basis_with_jet(t, int(spec["n_harmonics"]))
+            phi_arr = np.asarray(phi, dtype=float)
+            jet_arr = np.asarray(jet, dtype=float)
+            m = phi_arr.shape[1]
+            phi_stack[atom_idx, :, :m] = phi_arr
+            jet_stack[atom_idx, :, :m, :1] = jet_arr[:, :, :1]
+        else:  # duchon
+            centers = np.ascontiguousarray(spec["centers"])
+            pts = np.ascontiguousarray(coords[atom_idx, :, :d])
+            phi, jet, _penalty = rust.duchon_basis_with_jet(pts, centers, 2)
+            phi_arr = np.asarray(phi, dtype=float)
+            jet_arr = np.asarray(jet, dtype=float)
+            m = phi_arr.shape[1]
+            phi_stack[atom_idx, :, :m] = phi_arr
+            jet_stack[atom_idx, :, :m, :d] = jet_arr[:, :, :d]
+    return phi_stack, jet_stack
+
+
+def _build_penalty_stack(atom_specs: list[dict[str, Any]], m_max: int) -> np.ndarray:
+    k_atoms = len(atom_specs)
+    stack = np.zeros((k_atoms, m_max, m_max), dtype=float)
+    rust = rust_module()
+    for atom_idx, spec in enumerate(atom_specs):
+        if spec["kind"] == "periodic":
+            t_zero = np.zeros(1, dtype=float)
+            _phi, _jet, penalty = rust.periodic_basis_with_jet(t_zero, int(spec["n_harmonics"]))
+            pen = np.asarray(penalty, dtype=float)
+            m = pen.shape[0]
+            stack[atom_idx, :m, :m] = pen
+        else:
+            centers = np.ascontiguousarray(spec["centers"])
+            _phi, _jet, penalty = rust.duchon_basis_with_jet(centers, centers, 2)
+            pen = np.asarray(penalty, dtype=float)
+            m = pen.shape[0]
+            stack[atom_idx, :m, :m] = pen
+    return stack
+
+
+def _pca_periodic_seed(x: np.ndarray, rng: np.random.Generator, atom_idx: int) -> np.ndarray:
+    # PCA seeding: theta = atan2(z @ pc2, z @ pc1) / (2*pi), in [-0.5, 0.5].
+    centered = x - x.mean(axis=0, keepdims=True)
+    try:
+        _u, _s, vt = np.linalg.svd(centered, full_matrices=False)
+    except np.linalg.LinAlgError:
+        return rng.uniform(-0.5, 0.5, size=x.shape[0])
+    if vt.shape[0] < 2:
+        return rng.uniform(-0.5, 0.5, size=x.shape[0])
+    pc1 = vt[0]
+    pc2 = vt[1 + (atom_idx % max(1, vt.shape[0] - 1))] if atom_idx > 0 else vt[1]
+    a = centered @ pc1
+    b = centered @ pc2
+    theta = np.arctan2(b, a) / (2.0 * np.pi)
+    return theta
+
+
+def _pca_axis(x: np.ndarray, axis: int, rng: np.random.Generator) -> np.ndarray:
+    centered = x - x.mean(axis=0, keepdims=True)
+    try:
+        _u, _s, vt = np.linalg.svd(centered, full_matrices=False)
+    except np.linalg.LinAlgError:
+        return rng.normal(scale=0.01, size=x.shape[0])
+    pc = vt[axis % vt.shape[0]]
+    proj = centered @ pc
+    span = float(proj.max() - proj.min())
+    if span <= 0.0:
+        return np.zeros(x.shape[0])
+    return (proj - proj.min()) / span - 0.5
+
+
+def _pca_seed_coords(x: np.ndarray, d: int, rng: np.random.Generator) -> np.ndarray:
+    centered = x - x.mean(axis=0, keepdims=True)
+    try:
+        u, s, _vt = np.linalg.svd(centered, full_matrices=False)
+    except np.linalg.LinAlgError:
+        return rng.normal(scale=0.01, size=(x.shape[0], d))
+    k = min(d, u.shape[1], s.shape[0])
+    coords = np.zeros((x.shape[0], d), dtype=float)
+    coords[:, :k] = u[:, :k] * s[:k]
+    # Normalize each column to roughly unit range.
+    for col in range(d):
+        span = float(coords[:, col].max() - coords[:, col].min())
+        if span > 0.0:
+            coords[:, col] = (coords[:, col] - coords[:, col].min()) / span - 0.5
+    return coords
+
+
+def _oos_reconstruct(model: ManifoldSAE, x_new: np.ndarray) -> np.ndarray:
+    """Out-of-sample reconstruction reusing the trained Rust Newton kernel.
+
+    Routes the held-out rows through the same ``sae_manifold_fit`` per-row
+    Newton update used at training time, with the trained decoder
+    coefficients ``B_k`` clamped (re-overwritten after every Rust step) so
+    only the latent coords ``t_ik`` and the assignment logits move. The
+    inferred ``phi_ik @ B_k`` reconstruction is the fitted matrix returned
+    by the final Newton step — i.e. exactly the same math as training, just
+    with the decoder held fixed.
+    """
+    rust = rust_module()
+    n_new, p_out = x_new.shape
+    k_atoms = len(model.atoms)
+    dims = list(model._atom_dims)
+    basis_sizes = list(model._basis_sizes)
+    basis_kinds = list(model._basis_kinds)
+    n_harmonics = list(model._n_harmonics)
+    duchon_centers = list(model._duchon_centers)
+
+    m_max = max(basis_sizes) if basis_sizes else 1
+    d_max = max(dims) if dims else 1
+
+    # Trained decoder coefficients, padded to (K, m_max, p_out).
+    decoder_coefficients = np.zeros((k_atoms, m_max, p_out), dtype=float)
+    for atom_idx, block in enumerate(model.decoder_blocks):
+        m = basis_sizes[atom_idx]
+        decoder_coefficients[atom_idx, :m, :] = block[:m, :]
+    frozen_decoder = decoder_coefficients.copy()
+
+    # Per-atom basis spec for the existing _build_basis_stack helper.
+    atom_specs: list[dict[str, Any]] = []
+    for atom_idx in range(k_atoms):
+        kind = basis_kinds[atom_idx]
+        if kind == "periodic":
+            n_harm = max(1, n_harmonics[atom_idx])
+            atom_specs.append(
+                {"kind": "periodic", "n_harmonics": n_harm, "m": 1 + 2 * n_harm}
+            )
+        else:  # duchon
+            centers = duchon_centers[atom_idx]
+            if centers is None:
+                raise RuntimeError(
+                    f"OOS reconstruct: duchon atom {atom_idx} missing centers"
+                )
+            atom_specs.append(
+                {"kind": "duchon", "centers": centers, "m": basis_sizes[atom_idx]}
+            )
+
+    # Smoothness penalty stack from trained atom specs.
+    smooth_penalties_stack = _build_penalty_stack(atom_specs, m_max)
+
+    # Seed coords for new rows: PCA in the new data's own frame.
+    rng = np.random.default_rng(0)
+    initial_coords = np.zeros((k_atoms, n_new, d_max), dtype=float)
+    for atom_idx in range(k_atoms):
+        d = dims[atom_idx]
+        if d <= 0:
+            continue
+        spec = atom_specs[atom_idx]
+        if spec["kind"] == "periodic":
+            theta = _pca_periodic_seed(x_new, rng, atom_idx)
+            initial_coords[atom_idx, :, 0] = theta
+            for axis in range(1, d):
+                initial_coords[atom_idx, :, axis] = _pca_axis(x_new, axis, rng)
+        else:
+            seed = _pca_seed_coords(x_new, d, rng)
+            initial_coords[atom_idx, :, :d] = seed
+
+    initial_logits = np.zeros((n_new, k_atoms), dtype=float)
+    if k_atoms == 1 and model.assignment in {"ibp", "ibp_map"}:
+        initial_logits[:, 0] = 4.0  # strong "atom on" prior; trained ibp behaves the same
+
+    max_iter_total = 50
+    assignment_kind = str(
+        {"ibp": "ibp_map"}.get(model.assignment, model.assignment)
+    )
+    if assignment_kind == "gated":
+        assignment_kind = "jumprelu"
+    alpha_value = 1.0
+    tau = 0.5
+
+    last_fitted: np.ndarray | None = None
+    for iter_idx in range(max_iter_total):
+        basis_values, basis_jacobian = _build_basis_stack(
+            atom_specs, initial_coords, dims, m_max, d_max
+        )
+        # Re-clamp the decoder to the trained values so the Newton step
+        # adjusts only the latent coords (and assignments).
+        decoder_coefficients[...] = frozen_decoder
+        result = rust.sae_manifold_fit(
+            np.ascontiguousarray(x_new),
+            [spec["kind"] for spec in atom_specs],
+            list(dims),
+            np.ascontiguousarray(basis_values),
+            np.ascontiguousarray(basis_jacobian),
+            list(basis_sizes),
+            np.ascontiguousarray(decoder_coefficients),
+            np.ascontiguousarray(smooth_penalties_stack),
+            np.ascontiguousarray(initial_logits),
+            np.ascontiguousarray(initial_coords),
+            float(alpha_value),
+            float(tau),
+            False,
+            assignment_kind=assignment_kind,
+            sparsity_strength=1.0,
+            smoothness=1.0,
+            max_iter=1,
+            learning_rate=0.04,
+            gumbel_schedule=None,
+        )
+        payload = dict(result)
+        for atom_idx, atom in enumerate(payload["atoms"]):
+            new_coords = np.asarray(atom["on_atom_coords_t"], dtype=float)
+            d = dims[atom_idx]
+            if d > 0 and new_coords.size:
+                initial_coords[atom_idx, :, :d] = new_coords[:, :d]
+        if "logits" in payload:
+            new_logits = np.asarray(payload["logits"], dtype=float)
+            if new_logits.shape == initial_logits.shape:
+                initial_logits = np.ascontiguousarray(new_logits)
+        last_fitted = np.asarray(payload["fitted"], dtype=float)
+
+    if last_fitted is None:
+        raise RuntimeError("OOS reconstruct produced no Newton step")
+    return last_fitted
+
+
+def _wrap_payload(
+    x: np.ndarray,
+    payload: Mapping[str, Any],
+    topology: str,
+    assignment: str,
+    penalties: list[str],
+    atom_specs: list[dict[str, Any]],
+    dims: list[int],
+    basis_sizes: list[int],
+) -> ManifoldSAE:
+    atoms = [
+        SaeManifoldAtomFit(
+            basis=str(atom.get("basis_kind", "")),
+            decoder_coefficients=np.asarray(atom["decoder_B"], dtype=float),
+            assignments=np.asarray(atom["assignments_z"], dtype=float),
+            coords=np.asarray(atom["on_atom_coords_t"], dtype=float),
+            evidence=float(payload["reml_score"]),
+            active_dim=int(atom.get("active_dim", 0)),
+        )
+        for atom in payload["atoms"]
+    ]
+    fitted = np.asarray(payload["fitted"], dtype=float)
+    assignments = np.asarray(payload["assignments_z"], dtype=float)
+    coords = [atom.coords.copy() for atom in atoms]
+    score = float(payload["reml_score"])
+    low = SaeManifoldFitResult(
+        atoms, len(atoms), {len(atoms): score}, {"winner": f"K={len(atoms)}"},
+        fitted, assignments, coords, score,
+    )
+    n_harmonics = [int(spec.get("n_harmonics", 0)) for spec in atom_specs]
+    duchon_centers: list[np.ndarray | None] = [
+        spec.get("centers").copy() if spec["kind"] == "duchon" else None
+        for spec in atom_specs
+    ]
+    basis_kinds = [spec["kind"] for spec in atom_specs]
+    return ManifoldSAE(
+        atoms=atoms,
+        atom_topology=str(topology),
+        assignment=str(assignment),
+        primitive_names=["rust_module.sae_manifold_fit", *penalties],
+        fitted=fitted,
+        assignments=assignments,
+        coords=coords,
+        decoder_blocks=[atom.decoder_coefficients.copy() for atom in atoms],
+        basis_specs=[atom.basis for atom in atoms],
+        reml_score=score,
+        reconstruction_r2=_r2(x, fitted),
+        training_mean=x.mean(axis=0),
+        training_data=x.copy(),
+        low_level=low,
+        _basis_kinds=basis_kinds,
+        _atom_dims=list(dims),
+        _basis_sizes=list(basis_sizes),
+        _n_harmonics=n_harmonics,
+        _duchon_centers=duchon_centers,
+>>>>>>> tmp-pr-63
     )
     return ManifoldSAE.from_payload(x, dict(payload), atom_topology, assignment, penalties)
 
