@@ -12362,7 +12362,7 @@ fn apply_inverse_link_vec(eta: &[f64], family_kind: &str) -> Result<Vec<f64>, St
         "probit" => {
             let inv_sqrt2 = 1.0 / std::f64::consts::SQRT_2;
             for &e in eta {
-                out.push(0.5 * (1.0 + libm::erf(e * inv_sqrt2)));
+                out.push(0.5 * (1.0 + statrs::function::erf::erf(e * inv_sqrt2)));
             }
         }
         "cloglog" => {
