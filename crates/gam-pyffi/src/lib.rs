@@ -12363,14 +12363,19 @@ fn classification_metrics(
 ) -> PyResult<Py<PyDict>> {
     let out = PyDict::new(py);
     out.set_item("auc", benchmark_auc_score(&observed, &predicted_mean)?)?;
-    out.set_item("pr_auc", benchmark_pr_auc_score(&observed, &predicted_mean)?)?;
-    out.set_item("brier", brier_from_predictions(observed.clone(), predicted_mean.clone())?)?;
+    out.set_item(
+        "pr_auc",
+        benchmark_pr_auc_score(&observed, &predicted_mean)?,
+    )?;
+    out.set_item(
+        "brier",
+        brier_from_predictions(observed.clone(), predicted_mean.clone())?,
+    )?;
     out.set_item(
         "logloss",
         benchmark_binary_logloss(&observed, &predicted_mean)?,
     )?;
-    match benchmark_nagelkerke_r2_with_null_mean(&observed, &predicted_mean, train_prev, 1.0e-12)?
-    {
+    match benchmark_nagelkerke_r2_with_null_mean(&observed, &predicted_mean, train_prev, 1.0e-12)? {
         Some(value) => out.set_item("nagelkerke_r2", value)?,
         None => out.set_item("nagelkerke_r2", py.None())?,
     }
@@ -12481,9 +12486,11 @@ fn survival_null_curve_from_train<'py>(
             train_events.len()
         )));
     }
-    Ok(Array1::from_vec(benchmark_km_curve(&train_times, &train_events, &grid))
-        .into_pyarray(py)
-        .unbind())
+    Ok(
+        Array1::from_vec(benchmark_km_curve(&train_times, &train_events, &grid))
+            .into_pyarray(py)
+            .unbind(),
+    )
 }
 
 fn benchmark_km_curve(times: &[f64], events: &[f64], grid: &[f64]) -> Vec<f64> {
@@ -12917,7 +12924,11 @@ fn synthetic_binomial_columns<'py>(
             x[[i, j]] = rng.standard_normal();
         }
         let eta = -0.25 + 1.1 * x[[i, 0]] - 0.9 * x[[i, 1]] + 0.2 * x[[i, 1]].sin();
-        y[i] = f64::from(rng.bernoulli(sigmoid(eta)));
+        y[i] = if rng.bernoulli(sigmoid(eta)) {
+            1.0
+        } else {
+            0.0
+        };
     }
     let out = PyDict::new(py);
     out.set_item("x", x.into_pyarray(py))?;
@@ -12946,7 +12957,11 @@ fn synthetic_geo_disease_columns<'py>(
             + 0.30 * (2.0 * std::f64::consts::PI * equator * lon).sin();
         let southness = (-lat).clamp(0.0, 1.0);
         let eta = geo_signal + rng.normal(0.0, 0.20 + 0.85 * southness.powf(1.35));
-        y[i] = f64::from(rng.bernoulli(sigmoid(eta)));
+        y[i] = if rng.bernoulli(sigmoid(eta)) {
+            1.0
+        } else {
+            0.0
+        };
         for j in 0..16 {
             let jf = j as f64;
             let a = 0.95 - 0.045 * jf;
@@ -12990,7 +13005,8 @@ fn synthetic_continuous_order_columns<'py>(
                 let phase = rng.uniform_range(0.0, std::f64::consts::TAU);
                 let weight = rng.standard_normal() * amp;
                 for i in 0..n {
-                    latent[i] += weight * (std::f64::consts::TAU * freq * (i as f64 / n as f64) + phase).sin();
+                    latent[i] += weight
+                        * (std::f64::consts::TAU * freq * (i as f64 / n as f64) + phase).sin();
                 }
             }
             standardize_vector(&mut latent);
@@ -13055,9 +13071,17 @@ fn synthetic_thread3_admixture_cliff_columns<'py>(
         for j in 0..4 {
             x[[i, j]] = pcs[j];
         }
-        let cliff_axis = coeffs.iter().zip(pcs.iter()).map(|(a, b)| a * b).sum::<f64>();
+        let cliff_axis = coeffs
+            .iter()
+            .zip(pcs.iter())
+            .map(|(a, b)| a * b)
+            .sum::<f64>();
         let eta = -1.15 + 3.8 * (16.0 * cliff_axis).tanh() + rng.normal(0.0, 0.15);
-        y[i] = f64::from(rng.bernoulli(sigmoid(eta)));
+        y[i] = if rng.bernoulli(sigmoid(eta)) {
+            1.0
+        } else {
+            0.0
+        };
         for j in 0..12 {
             let jf = j as f64;
             let a = 0.45 - 0.02 * jf;
@@ -13104,15 +13128,18 @@ fn synthetic_geo_disease_eas_columns<'py>(
         if eas {
             let lat_e = (lat - 33.5) / 11.0;
             let lon_e = (lon - 120.0) / 10.0;
-            eta += 3.25 * (1.35 * lat_e).sin()
-                - 2.85 * (1.55 * lon_e).cos()
+            eta += 3.25 * (1.35 * lat_e).sin() - 2.85 * (1.55 * lon_e).cos()
                 + 2.50 * (1.10 * lat_e * lon_e).sin()
                 + 1.90 * (1.60 * lat_e + 0.45 * lon_e).cos()
                 + rng.normal(0.0, 0.20);
         } else {
             eta += rng.normal(0.0, 0.08);
         }
-        y[i] = f64::from(rng.bernoulli(sigmoid(eta)));
+        y[i] = if rng.bernoulli(sigmoid(eta)) {
+            1.0
+        } else {
+            0.0
+        };
         let lat_s = lat / 90.0;
         let lon_s = lon / 180.0;
         for j in 0..n_pcs {
@@ -13124,7 +13151,7 @@ fn synthetic_geo_disease_eas_columns<'py>(
             x[[i, j]] = a * lat_s
                 + b * lon_s
                 + c * lat_s * lon_s
-                + d * f64::from(eas)
+                + d * (if eas { 1.0 } else { 0.0 })
                 + rng.normal(0.0, 0.13 + 0.018 * jf);
         }
     }
@@ -13180,7 +13207,11 @@ fn synthetic_papuan_oce_columns<'py>(
             x[[i, j]] = mix + rng.normal(0.0, 0.20 + 0.02 * j as f64);
         }
         let high_risk = group <= 4;
-        y[i] = f64::from(rng.bernoulli(if high_risk { 0.40 } else { 0.02 }));
+        y[i] = if rng.bernoulli(if high_risk { 0.40 } else { 0.02 }) {
+            1.0
+        } else {
+            0.0
+        };
     }
     for j in 0..n_pcs {
         let mut col: Vec<f64> = (0..n).map(|i| x[[i, j]]).collect();
@@ -13230,7 +13261,8 @@ fn synthetic_hgdp_pc_panel_columns<'py>(py: Python<'py>, seed: u64) -> PyResult<
             }
             for _ in 0..rows_per_subpop {
                 let sample_lat = (sub_lat + rng.normal(0.0, 1.2)).clamp(-58.0, 72.0);
-                let sample_lon = ((sub_lon + rng.normal(0.0, 1.8) + 180.0).rem_euclid(360.0)) - 180.0;
+                let sample_lon =
+                    ((sub_lon + rng.normal(0.0, 1.8) + 180.0).rem_euclid(360.0)) - 180.0;
                 let lat_norm = sample_lat / 90.0;
                 let lon_norm = sample_lon / 180.0;
                 let geo_terms = [
@@ -13292,7 +13324,9 @@ fn synthetic_geo_subpop_response<'py>(
     let mut prevalence = vec![0.0; n_groups];
     let mut noise_scale = vec![0.0; n_groups];
     for group in 0..n_groups {
-        prevalence[group] = rng.uniform_range(prevalence_min, prevalence_max).clamp(1.0e-5, 1.0 - 1.0e-5);
+        prevalence[group] = rng
+            .uniform_range(prevalence_min, prevalence_max)
+            .clamp(1.0e-5, 1.0 - 1.0e-5);
         noise_scale[group] = if random_scale {
             rng.uniform_range(noise_scale_min, noise_scale_max)
         } else {
@@ -13303,7 +13337,11 @@ fn synthetic_geo_subpop_response<'py>(
     for (i, &group) in subpop_codes.iter().enumerate() {
         let p = prevalence[group];
         let eta = (p / (1.0 - p)).ln() + rng.normal(0.0, noise_scale[group]);
-        y[i] = f64::from(rng.bernoulli(sigmoid(eta)));
+        y[i] = if rng.bernoulli(sigmoid(eta)) {
+            1.0
+        } else {
+            0.0
+        };
     }
     Ok(y.into_pyarray(py).unbind())
 }
@@ -13320,7 +13358,9 @@ fn synthetic_geo_latlon_response<'py>(
     prevalence_max: f64,
 ) -> PyResult<Py<PyArray1<f64>>> {
     if latitudes.len() != longitudes.len() || latitudes.len() != superpop_codes.len() {
-        return Err(PyValueError::new_err("geo lat/lon response length mismatch"));
+        return Err(PyValueError::new_err(
+            "geo lat/lon response length mismatch",
+        ));
     }
     let mut rng = SplitMixNormalRng::new(seed);
     let n_super = superpop_codes.iter().copied().max().unwrap_or(0) + 1;
@@ -13355,7 +13395,11 @@ fn synthetic_geo_latlon_response<'py>(
         };
         let p = base_prev.clamp(1.0e-5, 1.0 - 1.0e-5);
         let eta = (p / (1.0 - p)).ln() + rng.normal(0.0, noise_sd);
-        y[i] = f64::from(rng.bernoulli(sigmoid(eta)));
+        y[i] = if rng.bernoulli(sigmoid(eta)) {
+            1.0
+        } else {
+            0.0
+        };
     }
     Ok(y.into_pyarray(py).unbind())
 }
@@ -17306,10 +17350,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
         synthetic_thread3_admixture_cliff_columns,
         module
     )?)?;
-    module.add_function(wrap_pyfunction!(
-        synthetic_geo_disease_eas_columns,
-        module
-    )?)?;
+    module.add_function(wrap_pyfunction!(synthetic_geo_disease_eas_columns, module)?)?;
     module.add_function(wrap_pyfunction!(synthetic_papuan_oce_columns, module)?)?;
     module.add_function(wrap_pyfunction!(synthetic_hgdp_pc_panel_columns, module)?)?;
     module.add_function(wrap_pyfunction!(synthetic_geo_subpop_response, module)?)?;

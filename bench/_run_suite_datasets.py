@@ -1104,29 +1104,8 @@ def _load_heart_failure_survival_dataset() -> typing.Any:
 
 
 def _synthetic_binomial_dataset(n: typing.Any, p: typing.Any, seed: typing.Any) -> typing.Any:
-    p = max(int(p), 3)
-    rng = np.random.default_rng(int(seed))
-    x = np.zeros((int(n), p), dtype=float)
-    x[:, 0] = 1.0
-    if p > 1:
-        x[:, 1:] = rng.normal(size=(int(n), p - 1))
-
-    eta = -0.25 + 1.1 * x[:, 1] - 0.9 * x[:, 2] + 0.2 * np.sin(x[:, 2])
-    pr = 1.0 / (1.0 + np.exp(-eta))
-    y = (rng.random(int(n)) < pr).astype(float)
-
-    rows = []
-    for i in range(int(n)):
-        row = {f"x{j}": float(x[i, j]) for j in range(1, p)}
-        row["y"] = float(y[i])
-        rows.append(row)
-
-    return {
-        "family": "binomial",
-        "rows": rows,
-        "features": [f"x{j}" for j in range(1, p)],
-        "target": "y",
-    }
+    columns = _gamfit_rust().synthetic_binomial_columns(int(n), max(int(p), 3), int(seed))
+    return _xy_payload(columns, prefix="x")
 
 
 _CANONICAL_SYNTHETIC_BINOMIAL_SCENARIOS = {
@@ -1137,71 +1116,8 @@ _CANONICAL_SYNTHETIC_BINOMIAL_SCENARIOS = {
 
 
 def _synthetic_geo_disease_dataset(n: typing.Any=4000, seed: typing.Any=20260226) -> typing.Any:
-    n = int(max(500, n))
-    rng = np.random.default_rng(int(seed))
-
-    # Hidden geospatial drivers (never exposed as model features).
-    lat = rng.uniform(-1.0, 1.0, size=n)
-    lon = rng.uniform(-1.0, 1.0, size=n)
-
-    # Disease prevalence is highest near the equator (lat ~= 0).
-    equator_closeness = 1.0 - np.abs(lat)
-    geo_signal = (
-        -1.00
-        + 2.20 * equator_closeness
-        + 0.55 * np.sin(np.pi * lon)
-        + 0.35 * np.cos(2.25 * np.pi * lon)
-        + 0.30 * np.sin(2.0 * np.pi * equator_closeness * lon)
-    )
-
-    # Heteroscedastic latent noise: stronger farther south (lat < 0).
-    southness = np.clip(-lat, 0.0, 1.0)
-    eta_noise_sd = 0.20 + 0.85 * (southness**1.35)
-    eta = geo_signal + rng.normal(0.0, eta_noise_sd, size=n)
-    pr = 1.0 / (1.0 + np.exp(-eta))
-    y = (rng.random(n) < pr).astype(float)
-
-    # PCs are noisy transforms of hidden geo variables.
-    rows = []
-    for i in range(n):
-        row = {}
-        for j in range(16):
-            a = 0.95 - 0.045 * j
-            b = 0.25 + 0.035 * j
-            c = ((-1.0) ** j) * (0.10 + 0.01 * j)
-            noise_sd = 0.15 + 0.015 * j
-            pc = a * lat[i] + b * lon[i] + c * lat[i] * lon[i] + rng.normal(0.0, noise_sd)
-            row[f"pc{j + 1}"] = float(pc)
-        row["y"] = float(y[i])
-        rows.append(row)
-
-    return {
-        "family": "binomial",
-        "rows": rows,
-        "features": [f"pc{i}" for i in range(1, 17)],
-        "target": "y",
-    }
-
-
-def _sample_fractional_spde_1d_field(n: int, *, rng: np.random.Generator, nu: float, kappa2: float) -> np.ndarray:
-    n = int(max(32, n))
-    # Frequency-domain SPDE approximation in 1D:
-    #   S(omega) ∝ (kappa^2 + omega^2)^(-(nu + 1/2))
-    # This yields a stationary fractional field with controllable smoothness.
-    freqs = 2.0 * math.pi * np.fft.rfftfreq(n, d=1.0 / n)
-    spec = (max(float(kappa2), 1e-9) + freqs * freqs) ** (-(float(nu) + 0.5))
-    spec = np.clip(spec, 1e-18, None)
-    coeff = np.zeros(freqs.shape[0], dtype=np.complex128)
-    coeff[0] = rng.normal(0.0, math.sqrt(spec[0]))
-    for j in range(1, coeff.shape[0]):
-        s = math.sqrt(spec[j] * 0.5)
-        coeff[j] = rng.normal(0.0, s) + 1j * rng.normal(0.0, s)
-    field = np.fft.irfft(coeff, n=n).astype(float)
-    field = field - float(np.mean(field))
-    sd = float(np.std(field))
-    if (not np.isfinite(sd)) or sd < 1e-12:
-        return np.zeros(n, dtype=float)
-    return field / sd
+    columns = _gamfit_rust().synthetic_geo_disease_columns(int(n), int(seed))
+    return _xy_payload(columns, prefix="pc")
 
 
 def _synthetic_continuous_order_dataset(
@@ -1212,35 +1128,23 @@ def _synthetic_continuous_order_dataset(
     true_nu: float | None = None,
     true_kappa2: float | None = None,
 ) -> dict[str, typing.Any]:
-    n = int(max(128, n))
-    rng = np.random.default_rng(int(seed))
-    x = np.linspace(-1.0, 1.0, n, dtype=float)
-    if mode == "fractional":
-        nu = float(true_nu if true_nu is not None else 1.8)
-        k2 = float(true_kappa2 if true_kappa2 is not None else 0.7)
-        latent = _sample_fractional_spde_1d_field(n, rng=rng, nu=nu, kappa2=k2)
-        y = latent + rng.normal(0.0, 0.20, size=n)
-        expected = ["Ok", "NonMaternRegime"]
-    elif mode == "rough":
-        # Brownian-like path to stress non-Matern / first-order boundary logic.
-        steps = rng.normal(0.0, 1.0, size=n)
-        latent = np.cumsum(steps)
-        latent = (latent - float(np.mean(latent))) / max(float(np.std(latent)), 1e-12)
-        y = latent + rng.normal(0.0, 0.30, size=n)
-        nu = None
-        k2 = None
-        expected = ["NonMaternRegime", "FirstOrderLimit", "IntrinsicLimit"]
-    elif mode == "smooth":
-        latent = 1.4 * np.sin(2.0 * math.pi * (x + 0.1)) + 0.8 * np.cos(0.5 * math.pi * (x - 0.2))
-        latent = (latent - float(np.mean(latent))) / max(float(np.std(latent)), 1e-12)
-        y = latent + rng.normal(0.0, 0.03, size=n)
-        nu = None
-        k2 = None
-        expected = ["Ok", "IntrinsicLimit"]
-    else:
-        raise RuntimeError(f"unsupported continuous-order synthetic mode '{mode}'")
-
+    columns = _gamfit_rust().synthetic_continuous_order_columns(
+        str(mode),
+        int(n),
+        int(seed),
+        None if true_nu is None else float(true_nu),
+        None if true_kappa2 is None else float(true_kappa2),
+    )
+    x = np.asarray(columns["x"], dtype=float).reshape(-1)
+    y = np.asarray(columns["y"], dtype=float).reshape(-1)
     rows = [{"x": float(xi), "y": float(yi)} for xi, yi in zip(x, y)]
+    expected = {
+        "fractional": ["Ok", "NonMaternRegime"],
+        "rough": ["NonMaternRegime", "FirstOrderLimit", "IntrinsicLimit"],
+        "smooth": ["Ok", "IntrinsicLimit"],
+    }.get(str(mode))
+    if expected is None:
+        raise RuntimeError(f"unsupported continuous-order synthetic mode '{mode}'")
     out: dict[str, typing.Any] = {
         "family": "gaussian",
         "rows": rows,
@@ -1256,134 +1160,28 @@ def _synthetic_continuous_order_dataset(
 
 
 def _synthetic_thread3_admixture_cliff_dataset(n: typing.Any=6000, seed: typing.Any=20260601) -> typing.Any:
-    n = int(max(500, n))
-    rng = np.random.default_rng(int(seed))
-
-    # Correlated ancestry-like latent coordinates.
-    cov = np.array(
-        [
-            [1.00, 0.52, -0.18, 0.10],
-            [0.52, 1.00, 0.22, -0.15],
-            [-0.18, 0.22, 1.00, 0.35],
-            [0.10, -0.15, 0.35, 1.00],
-        ],
-        dtype=float,
-    )
-    core = rng.multivariate_normal(mean=np.zeros(4), cov=cov, size=n)
-    pc1, pc2, pc3, pc4 = core[:, 0], core[:, 1], core[:, 2], core[:, 3]
-
-    # Narrow boundary in admixture-space: almost flat away from the interface.
     coeffs = np.array([1.0, 0.35, -0.20, 0.10], dtype=float)
-    z = coeffs[0] * pc1 + coeffs[1] * pc2 + coeffs[2] * pc3 + coeffs[3] * pc4
-    cliff_jump = 3.8
-    cliff_sharpness = 16.0
-    eta = -1.15 + cliff_jump * np.tanh(cliff_sharpness * z) + rng.normal(0.0, 0.15, size=n)
-    pr = 1.0 / (1.0 + np.exp(-eta))
-    y = (rng.random(n) < pr).astype(float)
-
-    # Add nuisance PCs to match the geo disease benchmark layout.
-    nuisance = np.zeros((n, 12), dtype=float)
-    for j in range(12):
-        a = 0.45 - 0.02 * j
-        b = ((-1.0) ** j) * (0.18 + 0.01 * j)
-        c = 0.12 + 0.02 * (j % 4)
-        sd = 0.18 + 0.02 * j
-        nuisance[:, j] = a * pc1 + b * pc2 + c * pc4 + rng.normal(0.0, sd, size=n)
-
-    rows = []
-    for i in range(n):
-        row = {
-            "pc1": float(pc1[i]),
-            "pc2": float(pc2[i]),
-            "pc3": float(pc3[i]),
-            "pc4": float(pc4[i]),
-        }
-        for j in range(12):
-            row[f"pc{j + 5}"] = float(nuisance[i, j])
-        row["y"] = float(y[i])
-        rows.append(row)
-
-    return {
-        "family": "binomial",
-        "rows": rows,
-        "features": [f"pc{i}" for i in range(1, 17)],
-        "target": "y",
+    out = _xy_payload(
+        _gamfit_rust().synthetic_thread3_admixture_cliff_columns(int(n), int(seed)),
+        prefix="pc",
+    )
+    out.update({
         "thread3_cliff_coefficients": {
             "pc1": float(coeffs[0]),
             "pc2": float(coeffs[1]),
             "pc3": float(coeffs[2]),
             "pc4": float(coeffs[3]),
         },
-        "thread3_cliff_jump": float(cliff_jump),
-        "thread3_cliff_sharpness": float(cliff_sharpness),
-    }
+        "thread3_cliff_jump": 3.8,
+        "thread3_cliff_sharpness": 16.0,
+    })
+    return out
 
 
 def _synthetic_geo_disease_eas_dataset(n: typing.Any=6000, seed: typing.Any=20260301, n_pcs: typing.Any=16) -> typing.Any:
-    n = int(max(5, n))
     n_pcs = int(max(3, n_pcs))
-    rng = np.random.default_rng(int(seed))
-
-    # Hidden superpopulation assignment.
-    eas = rng.random(n) < 0.23
-    n_eas = int(np.sum(eas))
-
-    # Hidden geographic coordinates.
-    lat = rng.uniform(-55.0, 70.0, size=n)
-    lon = rng.uniform(-175.0, 175.0, size=n)
-
-    # East Asia geographic region for the EAS superpopulation.
-    lat[eas] = rng.uniform(15.0, 52.0, size=n_eas)
-    lon[eas] = rng.uniform(95.0, 145.0, size=n_eas)
-
-    eta = np.full(n, math.log(0.02 / 0.98), dtype=float)
-    eta[eas] = math.log(0.10 / 0.90)
-
-    # Massive longitude/latitude effects are EAS-only by construction.
-    lat_e = (lat[eas] - 33.5) / 11.0
-    lon_e = (lon[eas] - 120.0) / 10.0
-    eas_geo_signal = (
-        3.25 * np.sin(1.35 * lat_e)
-        - 2.85 * np.cos(1.55 * lon_e)
-        + 2.50 * np.sin(1.10 * lat_e * lon_e)
-        + 1.90 * np.cos(1.60 * lat_e + 0.45 * lon_e)
-    )
-    eas_geo_signal = eas_geo_signal - float(np.mean(eas_geo_signal))
-    eta[eas] = eta[eas] + eas_geo_signal + rng.normal(0.0, 0.20, size=n_eas)
-    eta[~eas] = eta[~eas] + rng.normal(0.0, 0.08, size=int(np.sum(~eas)))
-
-    pr = 1.0 / (1.0 + np.exp(-eta))
-    y = (rng.random(n) < pr).astype(float)
-
-    lat_s = lat / 90.0
-    lon_s = lon / 180.0
-
-    rows = []
-    for i in range(n):
-        row = {}
-        for j in range(n_pcs):
-            a = 0.98 - 0.05 * j
-            b = 0.26 + 0.03 * j
-            c = ((-1.0) ** j) * (0.12 + 0.01 * j)
-            d = 0.22 if j >= 8 else 0.06
-            noise_sd = 0.13 + 0.018 * j
-            pc = (
-                a * lat_s[i]
-                + b * lon_s[i]
-                + c * lat_s[i] * lon_s[i]
-                + d * float(eas[i])
-                + rng.normal(0.0, noise_sd)
-            )
-            row[f"pc{j + 1}"] = float(pc)
-        row["y"] = float(y[i])
-        rows.append(row)
-
-    return {
-        "family": "binomial",
-        "rows": rows,
-        "features": [f"pc{i}" for i in range(1, n_pcs + 1)],
-        "target": "y",
-    }
+    columns = _gamfit_rust().synthetic_geo_disease_eas_columns(int(n), int(seed), n_pcs)
+    return _xy_payload(columns, prefix="pc")
 
 
 def _geo_disease_eas_scenario_cfg(name: typing.Any) -> typing.Any:
@@ -1493,92 +1291,9 @@ def _papuan_oce_scenario_cfg(name: typing.Any) -> typing.Any:
     }
 
 
-def _compute_pcs_from_genotypes(g: typing.Any, n_pcs: typing.Any=16) -> typing.Any:
-    # Proper PCA from standardized genotype-like matrix using SVD.
-    n = g.shape[0]
-    x = g.astype(float)
-    mu = x.mean(axis=0, keepdims=True)
-    sd = x.std(axis=0, ddof=1, keepdims=True)
-    sd[~np.isfinite(sd) | (sd < 1e-8)] = 1.0
-    x = (x - mu) / sd
-    u, s, _ = np.linalg.svd(x, full_matrices=False)
-    k = min(int(n_pcs), u.shape[1])
-    pcs = u[:, :k] * s[:k]
-    pcs = pcs / max(math.sqrt(max(n - 1, 1)), 1.0)
-    pcs_mu = pcs.mean(axis=0, keepdims=True)
-    pcs_sd = pcs.std(axis=0, ddof=1, keepdims=True)
-    pcs_sd[~np.isfinite(pcs_sd) | (pcs_sd < 1e-8)] = 1.0
-    return (pcs - pcs_mu) / pcs_sd
-
-
 def _synthetic_papuan_oce_dataset(n: typing.Any=6000, seed: typing.Any=20260315, n_pcs: typing.Any=16) -> typing.Any:
-    n = int(max(1200, n))
-    rng = np.random.default_rng(int(seed))
-
-    # Hidden group assignment only; labels are never emitted as model features.
-    groups = [
-        ("Papuan", 0.12),
-        ("Papuan Sepik", 0.08),
-        ("Papuan,Papuan Highlands", 0.06),
-        ("Papuan,Papuan Sepik", 0.06),
-        ("Bougainville", 0.08),
-        ("Han", 0.17),
-        ("Japanese", 0.10),
-        ("CEU", 0.14),
-        ("Yoruba", 0.11),
-        ("Pima", 0.08),
-    ]
-    names = [g[0] for g in groups]
-    probs = np.array([g[1] for g in groups], dtype=float)
-    probs = probs / probs.sum()
-    pop_idx = rng.choice(len(names), size=n, p=probs)
-    pop = np.array([names[i] for i in pop_idx], dtype=object)
-
-    # Latent ancestry coordinates and genotype-like matrix.
-    centers = {
-        "Papuan": np.array([2.7, -0.8, 1.7, 0.7]),
-        "Papuan Sepik": np.array([3.0, -0.6, 1.5, 0.8]),
-        "Papuan,Papuan Highlands": np.array([2.9, -0.3, 1.9, 0.4]),
-        "Papuan,Papuan Sepik": np.array([3.1, -0.5, 1.6, 0.8]),
-        "Bougainville": np.array([2.5, -1.0, 1.8, 0.5]),
-        "Han": np.array([0.4, 2.0, -0.1, 0.2]),
-        "Japanese": np.array([0.7, 1.8, -0.2, 0.1]),
-        "CEU": np.array([-2.1, 0.4, 0.1, -0.2]),
-        "Yoruba": np.array([-1.9, -2.2, 0.5, 0.0]),
-        "Pima": np.array([-0.3, -0.9, -1.6, 0.4]),
-    }
-
-    z = np.zeros((n, 4), dtype=float)
-    for i in range(n):
-        z[i] = centers[str(pop[i])] + rng.normal(0.0, 0.55, size=4)
-
-    n_snps = 700
-    loadings = rng.normal(0.0, 0.28, size=(4, n_snps))
-    logits = -0.2 + z @ loadings + rng.normal(0.0, 0.35, size=(n, n_snps))
-    p = 1.0 / (1.0 + np.exp(-np.clip(logits, -10.0, 10.0)))
-    g = rng.binomial(2, p).astype(float)
-
-    pcs = _compute_pcs_from_genotypes(g, n_pcs=max(3, int(n_pcs)))
-    if pcs.shape[1] < n_pcs:
-        pcs = np.concatenate([pcs, np.zeros((n, n_pcs - pcs.shape[1]), dtype=float)], axis=1)
-
-    # Prevalence: 0.4 in Papuan* and Bougainville; 0.02 in all others.
-    high_risk = np.array([("Papuan" in str(lbl)) or (str(lbl) == "Bougainville") for lbl in pop], dtype=bool)
-    prevalence = np.where(high_risk, 0.40, 0.02)
-    y = (rng.random(n) < prevalence).astype(float)
-
-    rows = []
-    for i in range(n):
-        row = {f"pc{j + 1}": float(pcs[i, j]) for j in range(int(n_pcs))}
-        row["y"] = float(y[i])
-        rows.append(row)
-
-    return {
-        "family": "binomial",
-        "rows": rows,
-        "features": [f"pc{i}" for i in range(1, int(n_pcs) + 1)],
-        "target": "y",
-    }
+    columns = _gamfit_rust().synthetic_papuan_oce_columns(int(n), int(seed), max(3, int(n_pcs)))
+    return _xy_payload(columns, prefix="pc")
 
 
 def _geo_subpop16_scenario_cfg(name: typing.Any) -> typing.Any:
@@ -1643,70 +1358,19 @@ def _synthetic_hgdp_1kg_pc_panel() -> typing.Any:
     if _SYNTHETIC_PC_PANEL is not None:
         return _SYNTHETIC_PC_PANEL.copy()
 
-    rng = np.random.default_rng(_SYNTHETIC_PC_PANEL_SEED)
-    superpop_specs = [
-        {"name": "AFR", "lat": 2.0, "lon": 20.0},
-        {"name": "EUR", "lat": 50.0, "lon": 15.0},
-        {"name": "EAS", "lat": 35.0, "lon": 115.0},
-        {"name": "SAS", "lat": 20.0, "lon": 78.0},
-        {"name": "AMR", "lat": -12.0, "lon": -72.0},
-        {"name": "OCE", "lat": -8.0, "lon": 145.0},
-    ]
-    rows = []
-    sample_idx = 0
+    columns = _gamfit_rust().synthetic_hgdp_pc_panel_columns(_SYNTHETIC_PC_PANEL_SEED)
+    pc = np.asarray(columns["pc"], dtype=float)
     pc_cols = [f"PC{i}" for i in range(1, 17)]
-
-    for spec in superpop_specs:
-        superpop_shift = rng.normal(loc=0.0, scale=0.85, size=16)
-        for sub_idx in range(4):
-            sub_name = f"{spec['name']}_SUB{sub_idx + 1:02d}"
-            sub_lat = float(float(typing.cast(typing.Any, spec["lat"])) + rng.normal(0.0, 5.0))
-            sub_lon = float(float(typing.cast(typing.Any, spec["lon"])) + rng.normal(0.0, 7.5))
-            sub_shift = rng.normal(loc=0.0, scale=0.30, size=16)
-            for _ in range(_SYNTHETIC_PC_PANEL_ROWS_PER_SUBPOP):
-                sample_lat = float(np.clip(sub_lat + rng.normal(0.0, 1.2), -58.0, 72.0))
-                sample_lon = float(((sub_lon + rng.normal(0.0, 1.8) + 180.0) % 360.0) - 180.0)
-                lat_norm = sample_lat / 90.0
-                lon_norm = sample_lon / 180.0
-                geo_terms = np.array(
-                    [
-                        lat_norm,
-                        lon_norm,
-                        lat_norm * lon_norm,
-                        np.sin(np.pi * lat_norm),
-                        np.cos(np.pi * lon_norm),
-                        np.sin(np.pi * (lat_norm + lon_norm) / 2.0),
-                        lat_norm**2,
-                        lon_norm**2,
-                        np.cos(np.pi * lat_norm),
-                        np.sin(np.pi * lon_norm),
-                        lat_norm - lon_norm,
-                        lat_norm + lon_norm,
-                        np.sin(np.pi * lat_norm * lon_norm),
-                        np.cos(np.pi * (lat_norm - lon_norm) / 2.0),
-                        lat_norm**3,
-                        lon_norm**3,
-                    ],
-                    dtype=float,
-                )
-                pcs = (
-                    1.55 * superpop_shift
-                    + 0.90 * sub_shift
-                    + 1.20 * geo_terms
-                    + rng.normal(loc=0.0, scale=0.18, size=16)
-                )
-                row = {
-                    "sample_id": f"sample_{sample_idx:05d}",
-                    "Superpopulation": spec["name"],
-                    "Subpopulation": sub_name,
-                    "Latitude": sample_lat,
-                    "Longitude": sample_lon,
-                }
-                row.update({col: float(pcs[i]) for i, col in enumerate(pc_cols)})
-                rows.append(row)
-                sample_idx += 1
-
-    panel = pd.DataFrame(rows)
+    panel = pd.DataFrame(
+        {
+            "sample_id": list(columns["sample_id"]),
+            "Superpopulation": list(columns["Superpopulation"]),
+            "Subpopulation": list(columns["Subpopulation"]),
+            "Latitude": np.asarray(columns["Latitude"], dtype=float),
+            "Longitude": np.asarray(columns["Longitude"], dtype=float),
+            **{col: pc[:, i] for i, col in enumerate(pc_cols)},
+        }
+    )
     _SYNTHETIC_PC_PANEL = panel
     return panel.copy()
 
@@ -1780,29 +1444,21 @@ def _geo_latlon_dataset(mode_code: typing.Any, seed: typing.Any=20260401, preval
     mode_code = str(mode_code)
     if mode_code not in {"superpopnoise", "equatornoise"}:
         raise RuntimeError(f"unsupported geo_latlon mode: {mode_code}")
-    rng = np.random.default_rng(int(seed))
     d = _load_hgdp_pc_with_imputed_latlon().copy()
-
-    lat_norm = np.clip(np.abs(d["lat_imputed"].to_numpy(dtype=float)) / 90.0, 0.0, 1.0)
-    lon_norm = np.clip((d["lon_imputed"].to_numpy(dtype=float) + 180.0) / 360.0, 0.0, 1.0)
-    westness = 1.0 - lon_norm
-
-    if mode_code == "superpopnoise":
-        risk_latlon = 0.68 * lat_norm + 0.32 * westness
-        base_prev = float(prevalence_min) + (float(prevalence_max) - float(prevalence_min)) * np.clip(risk_latlon, 0.0, 1.0)
-        superpops = sorted(d["Superpopulation"].astype(str).unique().tolist())
-        superpop_noise = {sp: float(rng.uniform(0.10, 0.90)) for sp in superpops}
-        noise_sd = d["Superpopulation"].astype(str).map(superpop_noise).to_numpy(dtype=float)
-    else:
-        edge_risk = np.clip(np.abs(d["lon_imputed"].to_numpy(dtype=float)) / 180.0, 0.0, 1.0)
-        base_prev = float(prevalence_min) + (float(prevalence_max) - float(prevalence_min)) * edge_risk
-        equator_close = 1.0 - lat_norm
-        noise_sd = 0.05 + 1.25 * np.clip(equator_close, 0.0, 1.0)
-
-    base_prev = np.clip(base_prev, 1e-5, 1.0 - 1e-5)
-    eta = np.log(base_prev / (1.0 - base_prev)) + rng.normal(0.0, noise_sd, size=len(d))
-    p = 1.0 / (1.0 + np.exp(-eta))
-    y = (rng.random(len(d)) < p).astype(float)
+    superpops = sorted(d["Superpopulation"].astype(str).unique().tolist())
+    superpop_code = {name: idx for idx, name in enumerate(superpops)}
+    y = np.asarray(
+        _gamfit_rust().synthetic_geo_latlon_response(
+            mode_code,
+            d["Superpopulation"].astype(str).map(superpop_code).to_numpy(dtype=int).tolist(),
+            d["lat_imputed"].to_numpy(dtype=float).tolist(),
+            d["lon_imputed"].to_numpy(dtype=float).tolist(),
+            int(seed),
+            float(prevalence_min),
+            float(prevalence_max),
+        ),
+        dtype=float,
+    )
 
     rows = []
     for pos, row in enumerate(d.itertuples(index=False)):
@@ -1818,7 +1474,6 @@ def _geo_latlon_dataset(mode_code: typing.Any, seed: typing.Any=20260401, preval
 
 
 def _geo_subpop16_dataset(seed: typing.Any=20260330, prevalence_min: typing.Any=0.02, prevalence_max: typing.Any=0.40) -> typing.Any:
-    rng = np.random.default_rng(int(seed))
     raw = _synthetic_hgdp_1kg_pc_panel()
     pc_cols = [f"PC{i}" for i in range(1, 17)]
     required = {"Subpopulation", *pc_cols}
@@ -1835,37 +1490,19 @@ def _geo_subpop16_dataset(seed: typing.Any=20260330, prevalence_min: typing.Any=
     if len(subpops) < 2:
         raise RuntimeError("need at least two subpopulations for prevalence simulation")
 
-    # No broad trend: each subpopulation gets an independent mean prevalence.
-    prevalence_map = {
-        sp: float(rng.uniform(float(prevalence_min), float(prevalence_max))) for sp in subpops
-    }
-    base_prev = d["Subpopulation"].map(prevalence_map).to_numpy(dtype=float)
-    base_prev = np.clip(base_prev, 1e-5, 1.0 - 1e-5)
-    base_eta = np.log(base_prev / (1.0 - base_prev))
-
-    # One noise model per subpopulation; each row inherits its subpopulation's model.
-    noise_types = ["gaussian", "laplace", "student_t"]
-    subpop_noise_kind = {sp: str(rng.choice(noise_types)) for sp in subpops}
-    subpop_noise_scale = {sp: float(rng.uniform(0.25, 0.85)) for sp in subpops}
-    noise_kind = d["Subpopulation"].map(subpop_noise_kind).astype(str).to_numpy()
-    noise_scale = d["Subpopulation"].map(subpop_noise_scale).to_numpy(dtype=float)
-
-    noise = np.zeros(len(d), dtype=float)
-    for kind in noise_types:
-        idx = np.where(noise_kind == kind)[0]
-        if idx.size == 0:
-            continue
-        s = noise_scale[idx]
-        if kind == "gaussian":
-            noise[idx] = rng.normal(0.0, s)
-        elif kind == "laplace":
-            noise[idx] = rng.laplace(0.0, s)
-        else:
-            noise[idx] = rng.standard_t(df=4, size=idx.size) * s
-
-    eta = base_eta + noise
-    p = 1.0 / (1.0 + np.exp(-eta))
-    d["y"] = (rng.random(len(d)) < p).astype(float)
+    subpop_code = {name: idx for idx, name in enumerate(subpops)}
+    d["y"] = np.asarray(
+        _gamfit_rust().synthetic_geo_subpop_response(
+            d["Subpopulation"].map(subpop_code).to_numpy(dtype=int).tolist(),
+            int(seed),
+            float(prevalence_min),
+            float(prevalence_max),
+            0.25,
+            0.85,
+            False,
+        ),
+        dtype=float,
+    )
 
     rows = []
     for _, row in d.iterrows():
@@ -1888,7 +1525,6 @@ def _geo_subpop16_randomprev_randomscale_dataset(
     noise_scale_min: typing.Any=0.25,
     noise_scale_max: typing.Any=0.85,
 ) -> typing.Any:
-    rng = np.random.default_rng(int(seed))
     raw = _synthetic_hgdp_1kg_pc_panel()
     pc_cols = [f"PC{i}" for i in range(1, 17)]
     required = {"Subpopulation", *pc_cols}
@@ -1905,20 +1541,19 @@ def _geo_subpop16_randomprev_randomscale_dataset(
     if len(subpops) < 2:
         raise RuntimeError("need at least two subpopulations for prevalence simulation")
 
-    prevalence_map = {
-        sp: float(rng.uniform(float(prevalence_min), float(prevalence_max))) for sp in subpops
-    }
-    noise_scale_map = {
-        sp: float(rng.uniform(float(noise_scale_min), float(noise_scale_max))) for sp in subpops
-    }
-
-    base_prev = d["Subpopulation"].map(prevalence_map).to_numpy(dtype=float)
-    base_prev = np.clip(base_prev, 1e-5, 1.0 - 1e-5)
-    base_eta = np.log(base_prev / (1.0 - base_prev))
-    noise_scale = d["Subpopulation"].map(noise_scale_map).to_numpy(dtype=float)
-    eta = base_eta + rng.normal(0.0, noise_scale, size=len(d))
-    p = 1.0 / (1.0 + np.exp(-eta))
-    d["y"] = (rng.random(len(d)) < p).astype(float)
+    subpop_code = {name: idx for idx, name in enumerate(subpops)}
+    d["y"] = np.asarray(
+        _gamfit_rust().synthetic_geo_subpop_response(
+            d["Subpopulation"].map(subpop_code).to_numpy(dtype=int).tolist(),
+            int(seed),
+            float(prevalence_min),
+            float(prevalence_max),
+            float(noise_scale_min),
+            float(noise_scale_max),
+            True,
+        ),
+        dtype=float,
+    )
 
     rows = []
     for _, row in d.iterrows():
@@ -2160,5 +1795,3 @@ def dataset_for_scenario(s: typing.Any) -> dict[str, typing.Any]:
         ds["_cv_splits"] = int(s["cv_splits"])
     _validate_dataset_schema(ds, scenario_name=name)
     return ds
-
-
