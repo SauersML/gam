@@ -79,8 +79,9 @@ use gam::terms::{
     DifferenceOpKind, GatedSAEDecoder, IBPAssignmentPenalty,
     IsometryPenalty as CoreIsometryPenalty, IvaeRidgeMeanGauge,
     JumpReLUPenalty as RustJumpReLUPenalty, MaternBasisGradientTarget, MechanismSparsityPenalty,
-    NuclearNormPenalty, OrthogonalityPenalty, ParametricRowPrecisionPriorPenalty, PenaltyConcavity,
-    PenaltyTier, PsiSlice, RowPrecisionPriorPenalty, ScadMcpPenalty, ScalarWeightSchedule,
+    NuclearNormPenalty as CoreNuclearNormPenalty, OrthogonalityPenalty,
+    ParametricRowPrecisionPriorPenalty, PenaltyConcavity, PenaltyTier, PsiSlice,
+    RowPrecisionPriorPenalty, ScadMcpPenalty, ScalarWeightSchedule,
     SoftmaxAssignmentSparsityPenalty, SparsityPenalty as CoreSparsityPenalty,
     StreamingMaternBasisGradientEvaluator,
     TopKActivationPenalty, TotalVariationPenalty,
@@ -381,6 +382,20 @@ struct SurvivalPredictionPayload {
     /// time, when uncertainty was requested.  Length equals
     /// `linear_predictor.len()`.
     #[serde(skip_serializing_if = "Option::is_none")]
+    eta_se: Option<Vec<f64>>,
+}
+
+#[derive(Deserialize)]
+struct SurvivalPredictionJsonPayload {
+    class: String,
+    model_class: Option<String>,
+    times: Option<Vec<f64>>,
+    hazard: Option<Vec<Vec<f64>>>,
+    survival: Option<Vec<Vec<f64>>>,
+    cumulative_hazard: Option<Vec<Vec<f64>>>,
+    linear_predictor: Option<Vec<f64>>,
+    columns: Option<BTreeMap<String, Vec<f64>>>,
+    survival_se: Option<Vec<Vec<f64>>>,
     eta_se: Option<Vec<f64>>,
 }
 
@@ -846,6 +861,109 @@ fn survival_csv_interpolate(
             y0 + (query_value - x0) * (y1 - y0) / (x1 - x0)
         }
     }
+}
+
+fn clip_survival_surface_value(mut value: f64, clip_lo: Option<f64>, clip_hi: Option<f64>) -> f64 {
+    if let Some(lo) = clip_lo {
+        if value < lo {
+            value = lo;
+        }
+    }
+    if let Some(hi) = clip_hi {
+        if value > hi {
+            value = hi;
+        }
+    }
+    value
+}
+
+#[pyfunction]
+fn survival_chunk_iter_collect<'py>(
+    py: Python<'py>,
+    grid: PyReadonlyArray1<'py, f64>,
+    surface: PyReadonlyArray2<'py, f64>,
+    times: PyReadonlyArray1<'py, f64>,
+    kind: &str,
+    clip_lo: Option<f64>,
+    clip_hi: Option<f64>,
+    people_chunk: usize,
+    time_grid_chunk: usize,
+) -> PyResult<Py<PyArray2<f64>>> {
+    match kind {
+        "hazard" | "cumulative_hazard" | "survival" | "survival_se" => {}
+        other => {
+            return Err(py_value_error(format!(
+                "unknown survival surface kind '{other}'"
+            )));
+        }
+    }
+    if people_chunk == 0 {
+        return Err(py_value_error("people_chunk must be positive".to_string()));
+    }
+    if time_grid_chunk == 0 {
+        return Err(py_value_error("time_grid_chunk must be positive".to_string()));
+    }
+    let grid_view = grid.as_array();
+    let surface_view = surface.as_array();
+    let n_grid = grid_view.len();
+    let (n_rows, n_cols) = surface_view.dim();
+    if n_grid == 0 || n_cols != n_grid {
+        return Err(py_value_error(
+            "survival interpolation requires a non-empty grid".to_string(),
+        ));
+    }
+
+    let mut order: Vec<(f64, usize)> = grid_view
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, value)| (value, index))
+        .collect();
+    order.sort_by(|left, right| left.0.partial_cmp(&right.0).unwrap_or(Ordering::Equal));
+    let sorted_grid: Vec<f64> = order.iter().map(|(value, _index)| *value).collect();
+    let sorted_indices: Vec<usize> = order.iter().map(|(_value, index)| *index).collect();
+    let mut surface_values = Vec::with_capacity(n_rows * n_cols);
+    for row_idx in 0..n_rows {
+        for col_idx in 0..n_cols {
+            surface_values.push(surface_view[[row_idx, col_idx]]);
+        }
+    }
+    let times_values: Vec<f64> = times.as_array().iter().copied().collect();
+    let n_times = times_values.len();
+
+    let values = py
+        .detach(move || -> Result<Vec<f64>, String> {
+            let mut values = vec![0.0_f64; n_rows * n_times];
+            for row_start in (0..n_rows).step_by(people_chunk) {
+                let row_stop = (row_start + people_chunk).min(n_rows);
+                for time_start in (0..n_times).step_by(time_grid_chunk) {
+                    let time_stop = (time_start + time_grid_chunk).min(n_times);
+                    for row_idx in row_start..row_stop {
+                        let out_row_start = row_idx * n_times;
+                        for time_idx in time_start..time_stop {
+                            let interpolated = survival_csv_interpolate(
+                                &surface_values,
+                                n_cols,
+                                &sorted_grid,
+                                &sorted_indices,
+                                row_idx,
+                                times_values[time_idx],
+                            );
+                            values[out_row_start + time_idx] =
+                                clip_survival_surface_value(interpolated, clip_lo, clip_hi);
+                        }
+                    }
+                }
+            }
+            Ok(values)
+        })
+        .map_err(py_value_error)?;
+    let out = Array2::from_shape_vec((n_rows, n_times), values).map_err(|err| {
+        py_value_error(format!(
+            "failed to assemble survival chunk result: {err}"
+        ))
+    })?;
+    Ok(out.into_pyarray(py).unbind())
 }
 
 #[pyfunction]
@@ -1691,40 +1809,43 @@ fn competing_risks_cif_from_predictions<'py>(
 ) -> PyResult<(PyObject, PyObject)> {
     if cumulative_hazards.is_empty() {
         return Err(py_value_error(
-            "competing_risks_cif requires at least one endpoint prediction",
+            "competing_risks_cif requires at least one endpoint prediction".to_string(),
         ));
     }
     if endpoint_names.len() != cumulative_hazards.len() {
         return Err(py_value_error(
-            "endpoint_names must match the number of endpoint predictions",
+            "endpoint_names must match the number of endpoint predictions".to_string(),
         ));
     }
     let unique_endpoint_names = endpoint_names.iter().collect::<BTreeSet<_>>();
     if unique_endpoint_names.len() != endpoint_names.len() {
-        return Err(py_value_error("endpoint_names must be unique"));
+        return Err(py_value_error("endpoint_names must be unique".to_string()));
     }
 
     let time_values = times.as_array().to_owned();
     if time_values.iter().any(|time| !time.is_finite()) {
-        return Err(py_value_error("time grid must contain only finite values"));
+        return Err(py_value_error(
+            "time grid must contain only finite values".to_string(),
+        ));
     }
 
     let expected_shape = cumulative_hazards[0].as_array().dim();
     let (n_rows, n_times) = expected_shape;
     if n_rows == 0 || n_times == 0 {
         return Err(py_value_error(
-            "endpoint predictions must have non-empty (n_rows, n_times) shape",
+            "endpoint predictions must have non-empty (n_rows, n_times) shape".to_string(),
         ));
     }
     if time_values.len() != n_times {
         return Err(py_value_error(
-            "time grid length must match endpoint prediction column count",
+            "time grid length must match endpoint prediction column count".to_string(),
         ));
     }
     for cumulative_hazard in cumulative_hazards.iter().skip(1) {
         if cumulative_hazard.as_array().dim() != expected_shape {
             return Err(py_value_error(
-                "all endpoint predictions must return the same (n_rows, n_times) shape",
+                "all endpoint predictions must return the same (n_rows, n_times) shape"
+                    .to_string(),
             ));
         }
     }
@@ -3319,10 +3440,7 @@ fn reml_fit_view<'py>(
 }
 
 fn summary_payload_from_model_bytes(model_bytes: &[u8]) -> PyResult<serde_json::Value> {
-    let payload: serde_json::Value =
-        serde_json::from_str(&summary_json_impl(model_bytes).map_err(PyValueError::new_err)?)
-            .map_err(|err| PyValueError::new_err(format!("invalid model summary JSON: {err}")))?;
-    Ok(payload)
+    summary_payload_value_from_model_bytes(model_bytes).map_err(PyValueError::new_err)
 }
 
 fn py_summary_payload<'py>(
@@ -10878,6 +10996,71 @@ fn summary_json(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<String> {
 }
 
 #[pyfunction]
+fn summary_payload_from_model(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<PyObject> {
+    let payload = detach_py_result(py, "summary_payload_from_model", move || {
+        summary_payload_value_from_model_bytes(&model_bytes)
+    })?;
+    json_object_to_py_dict(py, payload)
+}
+
+fn summary_payload_value_from_model_bytes(
+    model_bytes: &[u8],
+) -> Result<serde_json::Value, String> {
+    let summary_json = summary_json_impl(model_bytes)?;
+    serde_json::from_str(&summary_json).map_err(|err| format!("invalid model summary JSON: {err}"))
+}
+
+fn json_object_to_py_dict(py: Python<'_>, value: serde_json::Value) -> PyResult<PyObject> {
+    let serde_json::Value::Object(items) = value else {
+        return Err(py_value_error(
+            "model summary payload must be a JSON object".to_string(),
+        ));
+    };
+    let out = PyDict::new(py);
+    for (key, value) in items {
+        let py_value = json_value_to_py(py, value)?;
+        out.set_item(key, py_value.bind(py))?;
+    }
+    Ok(out.unbind().into_any())
+}
+
+fn json_value_to_py(py: Python<'_>, value: serde_json::Value) -> PyResult<PyObject> {
+    match value {
+        serde_json::Value::Null => Ok(py.None()),
+        serde_json::Value::Bool(value) => Ok(value.into_pyobject(py)?.unbind().into_any()),
+        serde_json::Value::Number(value) => {
+            if let Some(value) = value.as_i64() {
+                return Ok(value.into_pyobject(py)?.unbind().into_any());
+            }
+            if let Some(value) = value.as_u64() {
+                return Ok(value.into_pyobject(py)?.unbind().into_any());
+            }
+            let value = value
+                .as_f64()
+                .ok_or_else(|| py_value_error("JSON number is not representable".to_string()))?;
+            Ok(value.into_pyobject(py)?.unbind().into_any())
+        }
+        serde_json::Value::String(value) => Ok(value.into_pyobject(py)?.unbind().into_any()),
+        serde_json::Value::Array(values) => {
+            let out = PyList::empty(py);
+            for value in values {
+                let py_value = json_value_to_py(py, value)?;
+                out.append(py_value.bind(py))?;
+            }
+            Ok(out.unbind().into_any())
+        }
+        serde_json::Value::Object(values) => {
+            let out = PyDict::new(py);
+            for (key, value) in values {
+                let py_value = json_value_to_py(py, value)?;
+                out.set_item(key, py_value.bind(py))?;
+            }
+            Ok(out.unbind().into_any())
+        }
+    }
+}
+
+#[pyfunction]
 fn summary_repr(payload: &Bound<'_, PyDict>) -> PyResult<String> {
     let mut fields = Vec::new();
     for key in ["formula", "family_name", "model_class", "deviance", "reml_score"] {
@@ -11248,6 +11431,211 @@ fn diagnostics_from_predictions(
     out.set_item("residuals", PyList::new(py, diagnostics.residuals)?)?;
     out.set_item("metrics", metrics)?;
     Ok(out.unbind())
+}
+
+fn benchmark_auc_score(observed: &[f64], predicted_mean: &[f64]) -> PyResult<f64> {
+    if observed.len() != predicted_mean.len() {
+        return Err(PyValueError::new_err(format!(
+            "auc length mismatch: observed={} predicted={}",
+            observed.len(),
+            predicted_mean.len()
+        )));
+    }
+    let mut pairs: Vec<(f64, bool)> = observed
+        .iter()
+        .zip(predicted_mean.iter())
+        .map(|(&y, &p)| (p, y > 0.5))
+        .collect();
+    let n_pos = pairs.iter().filter(|(_, is_pos)| *is_pos).count();
+    let n_neg = pairs.len().saturating_sub(n_pos);
+    if n_pos == 0 || n_neg == 0 {
+        return Ok(0.5);
+    }
+    pairs.sort_by(|(a, _), (b, _)| a.total_cmp(b));
+
+    let mut concordant = 0.0;
+    let mut negatives_below = 0usize;
+    let mut i = 0usize;
+    while i < pairs.len() {
+        let mut j = i + 1;
+        while j < pairs.len() && pairs[j].0 == pairs[i].0 {
+            j += 1;
+        }
+        let pos_in_group = pairs[i..j]
+            .iter()
+            .filter(|(_, is_pos)| *is_pos)
+            .count();
+        let neg_in_group = (j - i).saturating_sub(pos_in_group);
+        concordant += (pos_in_group * negatives_below) as f64;
+        concordant += 0.5 * (pos_in_group * neg_in_group) as f64;
+        negatives_below += neg_in_group;
+        i = j;
+    }
+    Ok(concordant / ((n_pos * n_neg) as f64))
+}
+
+fn benchmark_binary_logloss(observed: &[f64], predicted_mean: &[f64]) -> PyResult<f64> {
+    if observed.len() != predicted_mean.len() {
+        return Err(PyValueError::new_err(format!(
+            "logloss length mismatch: observed={} predicted={}",
+            observed.len(),
+            predicted_mean.len()
+        )));
+    }
+    if observed.is_empty() {
+        return Err(PyValueError::new_err("logloss requires at least one row"));
+    }
+    let eps = 1.0e-12;
+    let loss_sum = observed
+        .iter()
+        .zip(predicted_mean.iter())
+        .map(|(&y, &p)| {
+            let clipped = p.clamp(eps, 1.0 - eps);
+            -(y * clipped.ln() + (1.0 - y) * (1.0 - clipped).ln())
+        })
+        .sum::<f64>();
+    Ok(loss_sum / observed.len() as f64)
+}
+
+fn benchmark_exp_saturated(x: f64) -> f64 {
+    if x >= 709.0 {
+        f64::INFINITY
+    } else if x <= -745.0 {
+        0.0
+    } else {
+        x.exp()
+    }
+}
+
+fn benchmark_nagelkerke_r2(
+    observed: &[f64],
+    predicted_mean: &[f64],
+    train_observed: &[f64],
+) -> PyResult<Option<f64>> {
+    if observed.len() != predicted_mean.len() {
+        return Err(PyValueError::new_err(format!(
+            "nagelkerke length mismatch: observed={} predicted={}",
+            observed.len(),
+            predicted_mean.len()
+        )));
+    }
+    if observed.is_empty() || train_observed.is_empty() {
+        return Ok(None);
+    }
+    let null_mean = train_observed.iter().sum::<f64>() / train_observed.len() as f64;
+    if !null_mean.is_finite() || null_mean <= 0.0 || null_mean >= 1.0 {
+        return Ok(None);
+    }
+    let eps = 1.0e-12;
+    let log_null = null_mean.ln();
+    let log_not_null = (1.0 - null_mean).ln();
+    let ll_null = observed
+        .iter()
+        .map(|&y| y * log_null + (1.0 - y) * log_not_null)
+        .sum::<f64>();
+    let ll_model = observed
+        .iter()
+        .zip(predicted_mean.iter())
+        .map(|(&y, &p)| {
+            let clipped = p.clamp(eps, 1.0 - eps);
+            y * clipped.ln() + (1.0 - y) * (1.0 - clipped).ln()
+        })
+        .sum::<f64>();
+    let n = observed.len() as f64;
+    let r2_cs = 1.0 - benchmark_exp_saturated((2.0 / n) * (ll_null - ll_model));
+    let max_r2_cs = 1.0 - benchmark_exp_saturated((2.0 / n) * ll_null);
+    if !r2_cs.is_finite() || !max_r2_cs.is_finite() || max_r2_cs <= 0.0 {
+        return Ok(None);
+    }
+    Ok(Some(r2_cs / max_r2_cs))
+}
+
+fn benchmark_gaussian_logloss(
+    observed: &[f64],
+    predicted_mean: &[f64],
+    sigma: &[f64],
+) -> PyResult<f64> {
+    if observed.len() != predicted_mean.len() {
+        return Err(PyValueError::new_err(format!(
+            "gaussian logloss length mismatch: observed={} predicted={}",
+            observed.len(),
+            predicted_mean.len()
+        )));
+    }
+    if observed.is_empty() {
+        return Err(PyValueError::new_err(
+            "gaussian logloss requires at least one row",
+        ));
+    }
+    if sigma.len() != 1 && sigma.len() != observed.len() {
+        return Err(PyValueError::new_err(format!(
+            "sigma length must be 1 or {}, got {}",
+            observed.len(),
+            sigma.len()
+        )));
+    }
+    let eps = 1.0e-12;
+    let two_pi = 2.0 * std::f64::consts::PI;
+    let loss_sum = observed
+        .iter()
+        .zip(predicted_mean.iter())
+        .enumerate()
+        .map(|(idx, (&y, &mu))| {
+            let raw_sigma = if sigma.len() == 1 { sigma[0] } else { sigma[idx] };
+            let sigma_use = raw_sigma.max(eps);
+            let var = sigma_use * sigma_use;
+            0.5 * (two_pi * var).ln() + ((y - mu) * (y - mu)) / (2.0 * var)
+        })
+        .sum::<f64>();
+    Ok(loss_sum / observed.len() as f64)
+}
+
+#[pyfunction]
+fn benchmark_prediction_metrics(
+    py: Python<'_>,
+    family: String,
+    observed: Vec<f64>,
+    predicted_mean: Vec<f64>,
+    train_observed: Vec<f64>,
+    sigma: Option<Vec<f64>>,
+) -> PyResult<Py<PyDict>> {
+    let diagnostics =
+        gam::inference::diagnostics::diagnostics_from_predictions(&observed, &predicted_mean)
+            .map_err(py_value_error)?;
+    let metrics = PyDict::new(py);
+    match family.as_str() {
+        "binomial" => {
+            metrics.set_item("auc", benchmark_auc_score(&observed, &predicted_mean)?)?;
+            metrics.set_item("brier", diagnostics.rmse * diagnostics.rmse)?;
+            metrics.set_item(
+                "logloss",
+                benchmark_binary_logloss(&observed, &predicted_mean)?,
+            )?;
+            if let Some(nagelkerke_r2) =
+                benchmark_nagelkerke_r2(&observed, &predicted_mean, &train_observed)?
+            {
+                metrics.set_item("nagelkerke_r2", nagelkerke_r2)?;
+            }
+        }
+        "gaussian" => {
+            metrics.set_item("r2", diagnostics.r_squared.unwrap_or(0.0))?;
+            metrics.set_item("rmse", diagnostics.rmse)?;
+            metrics.set_item("mae", diagnostics.mae)?;
+            metrics.set_item("mse", diagnostics.rmse * diagnostics.rmse)?;
+            if let Some(sigma_values) = sigma {
+                metrics.set_item(
+                    "logloss",
+                    benchmark_gaussian_logloss(&observed, &predicted_mean, &sigma_values)?,
+                )?;
+            }
+        }
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "unsupported benchmark metric family: {other}"
+            )));
+        }
+    }
+    Ok(metrics.unbind())
 }
 
 // =========================================================================
@@ -12510,6 +12898,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(build_info, module)?)?;
     module.add_function(wrap_pyfunction!(interpolate_survival_surface, module)?)?;
     module.add_function(wrap_pyfunction!(interpolate_rows, module)?)?;
+    module.add_function(wrap_pyfunction!(survival_chunk_iter_collect, module)?)?;
     module.add_function(wrap_pyfunction!(write_survival_csv, module)?)?;
     module.add_function(wrap_pyfunction!(survival_coerce_times, module)?)?;
     module.add_function(wrap_pyfunction!(survival_parameters_matrix, module)?)?;
@@ -12534,6 +12923,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(fit_array, module)?)?;
     module.add_function(wrap_pyfunction!(load_model, module)?)?;
     module.add_function(wrap_pyfunction!(saved_model_payload_string, module)?)?;
+    module.add_function(wrap_pyfunction!(build_extend_group_payload_json, module)?)?;
     module.add_function(wrap_pyfunction!(extend_model_with_group, module)?)?;
     module.add_function(wrap_pyfunction!(validate_formula_json, module)?)?;
     module.add_function(wrap_pyfunction!(
@@ -16466,7 +16856,7 @@ fn build_analytic_penalty_registry_from_json(
                     .get("learnable")
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false);
-                let penalty = NuclearNormPenalty::new(
+                let penalty = CoreNuclearNormPenalty::new(
                     slice,
                     weight,
                     n_eff,
