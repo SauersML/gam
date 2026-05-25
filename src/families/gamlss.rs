@@ -4194,7 +4194,8 @@ fn binomial_neglog_q_derivatives_logit_closed_form(y: f64, weight: f64, q: f64) 
         let eq = q.exp();
         eq / (1.0 + eq)
     };
-    let s = p * (1.0 - p);
+    let p_var = p.clamp(MIN_PROB, 1.0 - MIN_PROB);
+    let s = p_var * (1.0 - p_var);
     // For extreme |q|, s underflows gracefully to 0, which is correct.
 
     let m1 = weight * (p - y);
@@ -4223,7 +4224,8 @@ fn binomial_neglog_q_fourth_derivative_logit_closed_form(x: f64, weight: f64, q:
         let eq = q.exp();
         eq / (1.0 + eq)
     };
-    let s = p * (1.0 - p);
+    let p_var = p.clamp(MIN_PROB, 1.0 - MIN_PROB);
+    let s = p_var * (1.0 - p_var);
     weight * s * (1.0 - 6.0 * s)
 }
 
