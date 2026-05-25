@@ -354,6 +354,58 @@ pub fn identifiable_factor_select_weights(
     })
 }
 
+/// Column-centred thin-SVD scores: returns the leading `k` columns of
+/// `U Σ` for the centred predictor matrix `X − mean(X, axis=0)`.
+///
+/// Used to seed `T_init` for the partial-supervision recipe when the
+/// caller does not supply one. Pure-Rust path (faer SVD via the
+/// `FaerSvd` bridge) so the seeding math lives in the same crate as the
+/// gauge-fix solver.
+pub fn thin_svd_scores(
+    x: ArrayView2<f64>,
+    k: usize,
+) -> Result<Array2<f64>, String> {
+    let (n, p) = x.dim();
+    if k == 0 {
+        return Ok(Array2::<f64>::zeros((n, 0)));
+    }
+    if k > n.min(p) {
+        return Err(format!(
+            "thin_svd_scores: requested {k} components but min(n={n}, p={p}) limits to {}",
+            n.min(p)
+        ));
+    }
+    let mut mean_row = Array1::<f64>::zeros(p);
+    for row in 0..n {
+        for col in 0..p {
+            mean_row[col] += x[[row, col]];
+        }
+    }
+    if n > 0 {
+        let inv_n = 1.0 / (n as f64);
+        for col in 0..p {
+            mean_row[col] *= inv_n;
+        }
+    }
+    let mut xc = Array2::<f64>::zeros((n, p));
+    for row in 0..n {
+        for col in 0..p {
+            xc[[row, col]] = x[[row, col]] - mean_row[col];
+        }
+    }
+    let (u_opt, sigma, _vt_opt) = xc
+        .svd(true, false)
+        .map_err(|e| format!("thin_svd_scores: SVD failed: {e}"))?;
+    let u = u_opt.ok_or_else(|| "thin_svd_scores: SVD did not return U".to_string())?;
+    let mut out = Array2::<f64>::zeros((n, k));
+    for row in 0..n {
+        for col in 0..k {
+            out[[row, col]] = u[[row, col]] * sigma[col];
+        }
+    }
+    Ok(out)
+}
+
 // ---------------------------------------------------------------------------
 // Partial-supervision gauge-fix solver
 // ---------------------------------------------------------------------------

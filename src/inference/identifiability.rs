@@ -274,7 +274,8 @@ pub fn check_ivae(summary: &FitSummary, thr: &Thresholds) -> TheoremResult {
             .map(|(i, _)| i)
             .collect();
         issues.push(format!(
-            "aux axes {zeros:?} are constant across observations (min std \
+            "iVAE identifiability requires auxiliary covariate variation; \
+             aux axes {zeros:?} are constant across observations (min std \
              {min_std:.3e} <= {:.0e}); Khemakhem 2107.10098 Thm. 1 \
              conditioning rank is zero.",
             thr.ivae_aux_var_floor,

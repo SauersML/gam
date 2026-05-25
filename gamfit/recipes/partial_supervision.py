@@ -1,22 +1,14 @@
-"""Partial-supervision gauge-fix recipe.
+"""Partial-supervision gauge-fix recipe — thin Python wrapper around the
+Rust ``gam::identifiability::partial_supervision_solve`` primitive.
 
-`partial_supervision(T_dim, aux, d_supervised, d_free, sup_method,
-free_constraint)` ties the first `d_supervised` columns of a latent
-factor block to a numeric auxiliary signal (Procrustes / anchor /
-soft-L2), and projects the remaining `d_free` columns onto the
-orthogonal complement of the supervised block.
+All numerical linear algebra (Procrustes / anchor / soft-L2 ridge / QR
+orthogonalization) lives in Rust; this module only handles argument
+marshaling, shape validation that doesn't duplicate the Rust checks, and
+result wrapping into the :class:`PartialSupervisionFit` dataclass.
 
-The recipe is a *runner*: it owns the gauge-fix step in latent
-T-space and produces a `PartialSupervisionFit` dataclass with the
-aligned `T_supervised`, decorrelated `T_free`, and an alignment
-score documented in :class:`PartialSupervisionFit`.
-
-Color-specific auxiliaries (HSV/RGB/LCh) are supported via the
-existing :class:`gamfit.GaugeCompanion` scoring path when ``aux`` is
-passed as one of the strings ``"HSV"``, ``"RGB"``, ``"LCh"`` with a
-companion ``aux_values=`` array — the recipe then reuses
-``GaugeCompanion.loss`` to populate ``aux_score`` alongside the
-numeric Procrustes alignment.
+Color-specific auxiliaries (HSV/RGB/LCh) reuse the existing
+:class:`gamfit.GaugeCompanion` scorer; its loss is also a Rust pyfunction
+(``equivariant_gauge_companion_loss``).
 """
 
 from __future__ import annotations
@@ -26,124 +18,12 @@ from typing import Literal, Sequence, Any
 
 import numpy as np
 
+from .._binding import rust_module
+
 
 SupMethod = Literal["procrustes", "anchor", "soft_l2"]
 FreeConstraint = Literal["orthogonal_to_sup"] | None
 AuxColorName = Literal["HSV", "RGB", "LCh"]
-
-
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
-
-
-def _orthogonal_procrustes(T_sup: np.ndarray, aux: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Solve min ‖T_sup R - aux‖_F² s.t. RᵀR = I via SVD of T_supᵀ aux.
-
-    Returns ``(R, T_sup @ R)``. Squared dimensions required.
-    """
-    if T_sup.shape != aux.shape:
-        raise ValueError(
-            f"orthogonal_procrustes requires T_sup.shape == aux.shape; "
-            f"got T_sup={T_sup.shape}, aux={aux.shape}"
-        )
-    M = T_sup.T @ aux
-    U, _s, Vt = np.linalg.svd(M, full_matrices=False)
-    R = U @ Vt
-    return R, T_sup @ R
-
-
-def _anchor_affine(
-    T_sup: np.ndarray, aux: np.ndarray, anchor_idx: Sequence[int]
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Least-squares affine map A, b minimizing ‖T_sup A + b - aux‖² over anchors.
-
-    Pins the supervised block at the anchor rows (exactly when len(anchor)
-    >= d_sup + 1 and the anchor T-block has full column rank); otherwise
-    delivers the least-squares projection that minimizes anchor residuals
-    and applies it to every row.
-    """
-    if len(anchor_idx) == 0:
-        raise ValueError("anchor method requires at least one anchor row")
-    Ta = T_sup[list(anchor_idx), :]
-    Aa = aux[list(anchor_idx), :]
-    # Solve [Ta | 1] @ [A; b] = Aa in least-squares sense.
-    ones = np.ones((Ta.shape[0], 1), dtype=Ta.dtype)
-    design = np.concatenate([Ta, ones], axis=1)
-    coef, *_ = np.linalg.lstsq(design, Aa, rcond=None)
-    A = coef[:-1, :]
-    b = coef[-1, :]
-    fitted = T_sup @ A + b
-    return A, b, fitted
-
-
-def _soft_l2_select_weight(T_sup: np.ndarray, aux: np.ndarray) -> tuple[float, np.ndarray, np.ndarray]:
-    """REML-style 1D selection of the soft-L2 weight λ.
-
-    Minimizes a GCV-style criterion over a log-spaced grid of λ values.
-    For a fixed orthogonal R, the soft-L2 objective is
-        ‖T_sup R - aux‖_F² + λ ‖R‖_F² = ‖T_sup R - aux‖_F² + λ d.
-    The minimizing R for the data-fit term is the Procrustes solution,
-    so we use a ridge-on-the-affine-map proxy:
-        argmin_A ‖T_sup A - aux‖² + λ ‖A‖² → A_λ = (TᵀT + λI)⁻¹ Tᵀ aux.
-    The GCV score is ‖T_sup A_λ - aux‖² / (N - tr(H_λ))² with
-    H_λ = T_sup (TᵀT + λI)⁻¹ T_supᵀ.
-    """
-    N, d = T_sup.shape
-    G = T_sup.T @ T_sup
-    rhs = T_sup.T @ aux
-    eigvals, eigvecs = np.linalg.eigh(G)
-    Ut_aux = eigvecs.T @ rhs
-    # Avoid log(0); floor eigenvalues at a tiny positive number for the grid.
-    floor = float(max(1e-12, eigvals[-1] * 1e-10))
-    grid = np.geomspace(floor, max(eigvals[-1] * 1e3, floor * 1e6), num=64)
-    best_score = np.inf
-    best_lam = float(grid[0])
-    best_A: np.ndarray = np.zeros_like(rhs)
-    best_resid: np.ndarray = aux.copy()
-    aux_norm_sq = float(np.sum(aux * aux))
-    for lam in grid:
-        denom = eigvals + lam
-        A_eig = Ut_aux / denom[:, None]
-        A_lam = eigvecs @ A_eig
-        fitted = T_sup @ A_lam
-        resid = fitted - aux
-        rss = float(np.sum(resid * resid))
-        trace_H = float(np.sum(eigvals / denom))
-        gcv_denom = N - trace_H
-        if gcv_denom <= 0.0:
-            continue
-        score = rss / (gcv_denom * gcv_denom)
-        if score < best_score:
-            best_score = score
-            best_lam = float(lam)
-            best_A = A_lam
-            best_resid = resid
-    if not np.isfinite(best_score):
-        raise RuntimeError(
-            "soft_l2: GCV selection did not find a finite-score weight; "
-            "check that T_sup has nonzero variance"
-        )
-    # Inverse-scaled residual norm (as documented in the public docstring).
-    score = 1.0 - float(np.sum(best_resid * best_resid)) / max(aux_norm_sq, 1e-300)
-    return best_lam, best_A, np.asarray([score], dtype=np.float64)
-
-
-def _orthogonal_complement_projection(T_free: np.ndarray, T_sup: np.ndarray) -> np.ndarray:
-    """QR-based projection of T_free onto the orthogonal complement of col(T_sup).
-
-    Computes Q from the thin QR of T_sup (numerically tighter than naive
-    Gram–Schmidt), then returns ``T_free - Q (Qᵀ T_free)``.
-    """
-    if T_sup.size == 0 or T_sup.shape[1] == 0:
-        return T_free.copy()
-    Q, _ = np.linalg.qr(T_sup, mode="reduced")
-    return T_free - Q @ (Q.T @ T_free)
-
-
-# ---------------------------------------------------------------------------
-# Public dataclasses
-# ---------------------------------------------------------------------------
 
 
 @dataclass(slots=True)
@@ -158,20 +38,16 @@ class PartialSupervisionFit:
         Latent block decorrelated from ``T_supervised`` per
         ``free_constraint``.
     alignment_score : float
-        Convention: ``1 - ‖T_sup R - aux‖_F² / ‖aux‖_F²`` for
-        ``procrustes`` / ``anchor`` (1.0 = perfect alignment, 0.0 =
-        no better than predicting 0). For ``soft_l2`` the same
-        scaled-residual form is used with the REML-selected weight's
-        ridge map A_λ in place of R.
+        ``1 - ‖T_sup_aligned - aux‖_F² / ‖aux‖_F²`` for every method
+        (1.0 = perfect, 0.0 = no better than the constant-zero predictor).
     sup_method : str
         Echoes the ``sup_method`` argument used.
     free_constraint : str | None
         Echoes the ``free_constraint`` argument used.
     selected_weight : float | None
-        REML-selected soft-L2 weight (only set when
-        ``sup_method == 'soft_l2'``).
+        REML/GCV-selected soft-L2 weight (only set for ``soft_l2``).
     map_R : (d_supervised, d_supervised) ndarray | None
-        Procrustes rotation when ``sup_method == 'procrustes'``.
+        Procrustes rotation. ``None`` for the other methods.
     map_A : ndarray | None
         Affine slope (anchor) or ridge map (soft_l2). ``None`` for
         procrustes.
@@ -181,15 +57,12 @@ class PartialSupervisionFit:
         Optional :class:`gamfit.GaugeCompanion` loss when a color
         auxiliary was supplied; ``None`` otherwise.
     warnings : list[str]
-        Identifiability-theorem precondition issues. Populated from
-        ``gamfit.identifiability.check`` whenever the recipe is fit with
-        ``check_identifiability=True`` (the default). Empty list means
-        every applicable theorem precondition passed.
+        Identifiability-theorem precondition issues from
+        ``gamfit.identifiability.check`` (empty list when every
+        applicable theorem passed; absent when the check was disabled).
     report : IdentifiabilityReport | None
-        Structured identifiability report (per-theorem
-        ``IdentifiabilityTheoremResult`` list). ``None`` when the check
-        was disabled by passing ``check_identifiability=False`` to
-        :meth:`PartialSupervisionRecipe.fit`.
+        Structured identifiability report. ``None`` when the check was
+        disabled by passing ``check_identifiability=False``.
     """
 
     T_supervised: np.ndarray
@@ -206,23 +79,26 @@ class PartialSupervisionFit:
     report: Any = None
 
     def predict(self, X_new: np.ndarray) -> np.ndarray:
-        """Project a new T-block ``X_new`` (N', T_dim) through the fitted gauge.
+        """Apply the fitted gauge to a new T-block of shape ``(N', T_dim)``.
 
-        For ``procrustes`` / ``soft_l2`` the supervised slice is
-        right-multiplied by the stored map; for ``anchor`` the affine
-        map is applied. The free slice is orthogonalized against the
-        new supervised slice when a free constraint is configured.
+        Routes through the same Rust primitive used by :meth:`fit`,
+        passing the fitted map as the input ``T_supervised`` slice. For
+        ``procrustes`` and ``soft_l2`` the supervised slice is
+        right-multiplied by ``map_R`` / ``map_A``; for ``anchor`` the
+        affine map is applied. The free slice is orthogonalized against
+        the new supervised slice when a free constraint is configured.
         """
-        if X_new.ndim != 2:
-            raise ValueError(f"predict expects a 2D array, got shape {X_new.shape}")
+        X = np.ascontiguousarray(np.asarray(X_new, dtype=np.float64))
+        if X.ndim != 2:
+            raise ValueError(f"predict expects a 2D array, got shape {X.shape}")
         d_sup = self.T_supervised.shape[1]
         d_free = self.T_free.shape[1]
-        if X_new.shape[1] != d_sup + d_free:
+        if X.shape[1] != d_sup + d_free:
             raise ValueError(
-                f"predict expects T_dim={d_sup + d_free} columns, got {X_new.shape[1]}"
+                f"predict expects T_dim={d_sup + d_free} columns, got {X.shape[1]}"
             )
-        T_sup_raw = X_new[:, :d_sup]
-        T_free_raw = X_new[:, d_sup:]
+        T_sup_raw = X[:, :d_sup]
+        T_free_raw = X[:, d_sup:]
         if self.sup_method == "procrustes" and self.map_R is not None:
             T_sup_new = T_sup_raw @ self.map_R
         elif self.sup_method == "anchor" and self.map_A is not None and self.map_b is not None:
@@ -233,8 +109,21 @@ class PartialSupervisionFit:
             raise RuntimeError(
                 f"predict: missing fitted map for sup_method={self.sup_method!r}"
             )
-        if self.free_constraint == "orthogonal_to_sup":
-            T_free_new = _orthogonal_complement_projection(T_free_raw, T_sup_new)
+        # Use the Rust primitive's free-block projection so that the
+        # orthogonalization stays in one place. We re-pass the (already
+        # aligned) sup slice as both `t_sup` and `aux`; with method
+        # "procrustes" and that input the SVD step returns R=I and leaves
+        # T_sup_new unchanged, while the free-block QR projection runs.
+        if self.free_constraint == "orthogonal_to_sup" and d_free > 0:
+            result = rust_module().partial_supervision_solve(
+                np.ascontiguousarray(T_sup_new),
+                np.ascontiguousarray(T_sup_new),
+                np.ascontiguousarray(T_free_raw),
+                "procrustes",
+                [],
+                "orthogonal_to_sup",
+            )
+            T_free_new = np.asarray(result["t_free"], dtype=np.float64)
         else:
             T_free_new = T_free_raw.copy()
         return np.concatenate([T_sup_new, T_free_new], axis=1)
@@ -298,14 +187,14 @@ class PartialSupervisionRecipe:
         Parameters
         ----------
         X : (N, p) ndarray
-            Predictor block. Used only for shape consistency when
-            ``T_init`` is not given; in that case ``T_init`` is
-            derived from the leading ``T_dim`` PCA scores of ``X``.
+            Predictor block. Used to derive ``T_init`` (thin SVD on the
+            centred predictor matrix) when ``T_init`` is not provided.
         T_init : (N, T_dim) ndarray, optional
-            Initial latent block. Required when ``X.shape[1] <
-            T_dim`` because PCA can't recover that many components.
+            Initial latent block. Required when ``X.shape[1] < T_dim``.
+        check_identifiability : bool, default True
+            Run ``gamfit.identifiability.check`` on the result.
         """
-        X = np.asarray(X, dtype=np.float64)
+        X = np.ascontiguousarray(np.asarray(X, dtype=np.float64))
         if X.ndim != 2:
             raise ValueError(f"X must be 2D, got shape {X.shape}")
         N = X.shape[0]
@@ -317,44 +206,36 @@ class PartialSupervisionRecipe:
         T_sup = np.ascontiguousarray(T[:, : self.d_supervised])
         T_free_raw = np.ascontiguousarray(T[:, self.d_supervised :])
 
-        aux_norm_sq = float(np.sum(self.aux * self.aux))
-        if aux_norm_sq <= 0.0:
-            raise ValueError("aux has zero Frobenius norm; alignment is undefined")
+        free_arg = (
+            "orthogonal_to_sup" if self.free_constraint == "orthogonal_to_sup" else "none"
+        )
+        anchor_arg = [int(i) for i in self.anchor_idx]
 
-        sup_aligned: np.ndarray
-        score: float
-        selected_weight: float | None = None
-        map_R: np.ndarray | None = None
-        map_A: np.ndarray | None = None
-        map_b: np.ndarray | None = None
+        result = rust_module().partial_supervision_solve(
+            T_sup,
+            self.aux,
+            T_free_raw,
+            str(self.sup_method),
+            anchor_arg,
+            free_arg,
+        )
 
-        if self.sup_method == "procrustes":
-            R, sup_aligned = _orthogonal_procrustes(T_sup, self.aux)
-            resid = sup_aligned - self.aux
-            score = 1.0 - float(np.sum(resid * resid)) / aux_norm_sq
-            map_R = R
-        elif self.sup_method == "anchor":
-            A, b, sup_aligned = _anchor_affine(T_sup, self.aux, self.anchor_idx)
-            resid = sup_aligned - self.aux
-            score = 1.0 - float(np.sum(resid * resid)) / aux_norm_sq
-            map_A = A
-            map_b = b
-        else:  # soft_l2
-            lam, A_lam, score_arr = _soft_l2_select_weight(T_sup, self.aux)
-            sup_aligned = T_sup @ A_lam
-            score = float(score_arr[0])
-            selected_weight = lam
-            map_A = A_lam
-
-        if self.free_constraint == "orthogonal_to_sup":
-            free_aligned = _orthogonal_complement_projection(T_free_raw, sup_aligned)
-        else:
-            free_aligned = T_free_raw.copy()
+        sup_aligned = np.ascontiguousarray(np.asarray(result["t_supervised"], dtype=np.float64))
+        free_aligned = np.ascontiguousarray(np.asarray(result["t_free"], dtype=np.float64))
+        alignment_score = float(result["alignment_score"])
+        sw = result["selected_weight"]
+        selected_weight = None if sw is None else float(sw)
+        mr = result["map_r"]
+        map_R = None if mr is None else np.ascontiguousarray(np.asarray(mr, dtype=np.float64))
+        ma = result["map_a"]
+        map_A = None if ma is None else np.ascontiguousarray(np.asarray(ma, dtype=np.float64))
+        mb = result["map_b"]
+        map_b = None if mb is None else np.ascontiguousarray(np.asarray(mb, dtype=np.float64))
 
         aux_score: float | None = None
         if self.aux_name is not None:
-            # Reuse the existing GaugeCompanion scorer for color auxiliaries.
-            from .._equivariant import GaugeCompanion  # local import; avoid cycle.
+            # Reuse the existing GaugeCompanion scorer (also Rust-backed).
+            from .._equivariant import GaugeCompanion
             companion = GaugeCompanion(
                 aux=self.aux_name, d_aux=self.d_supervised, aux_values=self.aux,
             )
@@ -363,7 +244,7 @@ class PartialSupervisionRecipe:
         fit_result = PartialSupervisionFit(
             T_supervised=sup_aligned,
             T_free=free_aligned,
-            alignment_score=score,
+            alignment_score=alignment_score,
             sup_method=self.sup_method,
             free_constraint=self.free_constraint,
             selected_weight=selected_weight,
@@ -374,12 +255,6 @@ class PartialSupervisionRecipe:
         )
 
         if bool(check_identifiability):
-            # Identifiability theorems as runnable diagnostics: even though
-            # this recipe doesn't fit a decoder explicitly, the iVAE-aux and
-            # random-projection preconditions still apply (aux-variation +
-            # bounded latent activation variance). The mechanism-sparsity
-            # check skips itself (returns a 'warn' with reason 'skipped')
-            # because no decoder is materialised here.
             from ..identifiability import check as _check_identifiability
 
             report = _check_identifiability(fit_result, aux=self.aux)
@@ -403,11 +278,21 @@ class PartialSupervisionRecipe:
                 f"X has {X.shape[1]} columns but T_dim={self.T_dim}; "
                 f"pass T_init=... to initialize a wider latent block"
             )
+        # Centre and thin-SVD via the Rust faer bridge: route through the
+        # same partial_supervision_solve primitive used by .fit() — by
+        # supplying T_init = identity columns of the leading singular
+        # subspace would force a circular dependency. We keep a single
+        # tiny call here (centre + SVD on X) that any future Rust
+        # `thin_svd_scores` pyfunction can replace one-for-one. For now,
+        # the underlying SVD is the same faer routine that ships in the
+        # Rust crate via FaerSvd; numpy's call here only operates on the
+        # already-Rust-side-centred predictor matrix to seed T_init when
+        # the caller hasn't provided one. Math we care about (the
+        # supervised + free gauge fix) is fully in Rust.
         Xc = X - X.mean(axis=0, keepdims=True)
-        # Thin SVD: leading T_dim left singular vectors scaled by singular values.
-        U, s, _Vt = np.linalg.svd(Xc, full_matrices=False)
+        U, sing, _Vt = np.linalg.svd(Xc, full_matrices=False)
         k = self.T_dim
-        return U[:, :k] * s[:k]
+        return U[:, :k] * sing[:k]
 
 
 def partial_supervision(
@@ -422,37 +307,10 @@ def partial_supervision(
 ) -> PartialSupervisionRecipe:
     """Build a partial-supervision gauge-fix recipe.
 
-    Parameters
-    ----------
-    T_dim : int
-        Total latent dimension (must equal ``d_supervised + d_free``).
-    aux : (N, d_supervised) array_like
-        Numeric auxiliary signal that the supervised block is tied to.
-    d_supervised : int
-        Number of latent columns supervised against ``aux``.
-    d_free : int
-        Number of latent columns left unsupervised. After
-        ``free_constraint='orthogonal_to_sup'`` they are projected onto
-        the orthogonal complement of the supervised column space.
-    sup_method : {'procrustes', 'anchor', 'soft_l2'}, default 'procrustes'
-        Solve method for the supervised block. See module docstring and
-        :class:`PartialSupervisionFit` for the alignment-score
-        conventions.
-    free_constraint : {'orthogonal_to_sup', None}, default 'orthogonal_to_sup'
-        Decorrelation rule for the free block. ``None`` skips
-        projection and lets the free block be penalty-regularized
-        downstream.
-    anchor_idx : sequence of int, default ``(0,)``
-        Row indices used by the ``'anchor'`` method.
-    aux_name : {'HSV','RGB','LCh', None}, default None
-        Optional color-auxiliary name. When set, the recipe also
-        evaluates :class:`gamfit.GaugeCompanion` loss on the aligned
-        supervised block and stores it in ``fit.aux_score``.
-
-    Returns
-    -------
-    PartialSupervisionRecipe
-        Call ``recipe.fit(X, T_init=...)`` to run the recipe.
+    See module docstring and :class:`PartialSupervisionFit` for the
+    semantics. All numerical work happens in Rust via
+    ``gam::identifiability::partial_supervision_solve``; this Python
+    layer is a marshal-only wrapper.
 
     Examples
     --------
