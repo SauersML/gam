@@ -154,8 +154,9 @@ lower = (S - 1.96 * se).clip(0.0, 1.0)
 ```
 
 Other survival likelihood modes (transformation, Weibull, marginal-slope,
-latent) reject `with_uncertainty=True` at the Rust boundary. For those,
-use `Model.sample(...)` to draw posterior coefficients; note that
+latent, latent-binary) and competing-risks survival reject
+`with_uncertainty=True` at the Rust boundary. For those, use
+`Model.sample(...)` to draw posterior coefficients; note that
 `PosteriorSamples.predict_draws(...)` is restricted to standard
 non-link-wiggle GAMs (see `posterior-sampling.md`).
 
