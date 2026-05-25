@@ -933,8 +933,7 @@ fn survival_chunk_iter_collect<'py>(
     let times_values: Vec<f64> = times.as_array().iter().copied().collect();
     let n_times = times_values.len();
 
-    let values = py
-        .detach(move || -> Result<Vec<f64>, String> {
+    let values = py.detach(move || {
             let mut values = vec![0.0_f64; n_rows * n_times];
             for row_start in (0..n_rows).step_by(people_chunk) {
                 let row_stop = (row_start + people_chunk).min(n_rows);
@@ -957,9 +956,8 @@ fn survival_chunk_iter_collect<'py>(
                     }
                 }
             }
-            Ok(values)
-        })
-        .map_err(py_value_error)?;
+            values
+        });
     let out = Array2::from_shape_vec((n_rows, n_times), values).map_err(|err| {
         py_value_error(format!(
             "failed to assemble survival chunk result: {err}"
