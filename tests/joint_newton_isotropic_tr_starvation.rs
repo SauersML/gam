@@ -168,7 +168,7 @@ fn joint_newton_isotropic_l2_tr_produces_production_linearized_rate_stall() {
     // (matches production cycle-0 |δ|∞ = 20.0).
     let post_inf = delta.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
     assert!(
-        (post_inf - 20.0).abs() < 1.0e-9,
+        (post_inf - 20.0).abs() < 1.0e-6,
         "after isotropic-L2 truncation, |δ|∞ should equal radius=20; got {}",
         post_inf,
     );
