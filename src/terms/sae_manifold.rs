@@ -190,6 +190,98 @@ pub trait SaeBasisEvaluator: Send + Sync + std::fmt::Debug {
     fn evaluate(&self, coords: ArrayView2<'_, f64>) -> Result<(Array2<f64>, Array3<f64>), String>;
 }
 
+/// Periodic harmonic basis evaluator for a single-dimensional circle latent.
+///
+/// Produces `M = 2*num_harmonics + 1` basis functions
+/// `[1, sin(2π·1·t), cos(2π·1·t), …, sin(2π·H·t), cos(2π·H·t)]` where
+/// `H = (M − 1) / 2`. The latent must have `latent_dim == 1`.
+#[derive(Debug, Clone)]
+pub struct PeriodicHarmonicEvaluator {
+    pub num_basis: usize,
+}
+
+impl PeriodicHarmonicEvaluator {
+    pub fn new(num_basis: usize) -> Result<Self, String> {
+        if num_basis == 0 || num_basis % 2 == 0 {
+            return Err(format!(
+                "PeriodicHarmonicEvaluator requires odd num_basis >= 1; got {num_basis}"
+            ));
+        }
+        Ok(Self { num_basis })
+    }
+}
+
+impl SaeBasisEvaluator for PeriodicHarmonicEvaluator {
+    fn evaluate(
+        &self,
+        coords: ArrayView2<'_, f64>,
+    ) -> Result<(Array2<f64>, Array3<f64>), String> {
+        let n = coords.nrows();
+        let d = coords.ncols();
+        if d != 1 {
+            return Err(format!(
+                "PeriodicHarmonicEvaluator: expected latent_dim == 1, got {d}"
+            ));
+        }
+        let m = self.num_basis;
+        let num_harmonics = (m - 1) / 2;
+        let two_pi = 2.0 * std::f64::consts::PI;
+        let mut phi = Array2::<f64>::zeros((n, m));
+        let mut jet = Array3::<f64>::zeros((n, m, 1));
+        for row in 0..n {
+            let t = coords[[row, 0]];
+            phi[[row, 0]] = 1.0;
+            for h in 1..=num_harmonics {
+                let angle = two_pi * (h as f64) * t;
+                let s = angle.sin();
+                let c = angle.cos();
+                let s_idx = 2 * h - 1;
+                let c_idx = 2 * h;
+                phi[[row, s_idx]] = s;
+                phi[[row, c_idx]] = c;
+                jet[[row, s_idx, 0]] = two_pi * (h as f64) * c;
+                jet[[row, c_idx, 0]] = -two_pi * (h as f64) * s;
+            }
+        }
+        Ok((phi, jet))
+    }
+}
+
+/// Static basis evaluator: returns a frozen `(Phi, dPhi/dt)` snapshot regardless
+/// of the supplied coordinates. Lets the multi-step Newton loop compose for
+/// basis kinds whose true refresh routine is not yet wired in Rust — the
+/// Newton step still updates logits, coordinates, and decoder β while the
+/// basis design remains the caller-provided snapshot.
+#[derive(Debug, Clone)]
+pub struct StaticBasisEvaluator {
+    pub phi: Array2<f64>,
+    pub jet: Array3<f64>,
+}
+
+impl StaticBasisEvaluator {
+    pub fn new(phi: Array2<f64>, jet: Array3<f64>) -> Result<Self, String> {
+        let (n, m) = phi.dim();
+        let jet_dim = jet.dim();
+        if jet_dim.0 != n || jet_dim.1 != m {
+            return Err(format!(
+                "StaticBasisEvaluator: jet shape {:?} incompatible with phi shape {:?}",
+                jet_dim,
+                phi.dim()
+            ));
+        }
+        Ok(Self { phi, jet })
+    }
+}
+
+impl SaeBasisEvaluator for StaticBasisEvaluator {
+    fn evaluate(
+        &self,
+        _coords: ArrayView2<'_, f64>,
+    ) -> Result<(Array2<f64>, Array3<f64>), String> {
+        Ok((self.phi.clone(), self.jet.clone()))
+    }
+}
+
 /// One manifold atom.
 ///
 /// `basis_values` is `Phi_k(t_{ik})`, shape `(N, M_k)`.
@@ -1765,6 +1857,11 @@ fn sae_penalty_is_row_block_supported(penalty: &AnalyticPenaltyKind) -> bool {
 /// Helper for padded FFI callers. Arrays use `(K, N, M_max)` and
 /// `(K, N, M_max, D_max)` storage, with `basis_sizes` and `latent_dims`
 /// selecting each atom's active prefix.
+///
+/// `evaluators`, when non-empty, must have length `K`. Each entry attaches an
+/// optional [`SaeBasisEvaluator`] to the matching atom so the Rust Newton
+/// loop can refresh `Phi`/`dPhi/dt` between iterations without rebuilding the
+/// term from Python. An empty slice leaves every atom in snapshot-only mode.
 #[must_use = "build error must be handled"]
 pub fn term_from_padded_blocks_with_mode(
     n_obs: usize,
@@ -1779,10 +1876,17 @@ pub fn term_from_padded_blocks_with_mode(
     logits: ArrayView2<'_, f64>,
     coords: &[Array2<f64>],
     mode: AssignmentMode,
+    evaluators: &[Option<Arc<dyn SaeBasisEvaluator>>],
 ) -> Result<SaeManifoldTerm, String> {
     let k_atoms = basis_sizes.len();
     if latent_dims.len() != k_atoms || basis_kinds.len() != k_atoms || coords.len() != k_atoms {
         return Err("term_from_padded_blocks: K-length metadata mismatch".into());
+    }
+    if !evaluators.is_empty() && evaluators.len() != k_atoms {
+        return Err(format!(
+            "term_from_padded_blocks: evaluators length {} must equal K={k_atoms} or be empty",
+            evaluators.len()
+        ));
     }
     if logits.dim() != (n_obs, k_atoms) {
         return Err(format!(
@@ -1798,7 +1902,7 @@ pub fn term_from_padded_blocks_with_mode(
         let jet = basis_jacobian.slice(s![k, 0..n_obs, 0..m, 0..d]).to_owned();
         let b = decoder_coefficients.slice(s![k, 0..m, 0..p_out]).to_owned();
         let s = smooth_penalties.slice(s![k, 0..m, 0..m]).to_owned();
-        atoms.push(SaeManifoldAtom::new(
+        let atom = SaeManifoldAtom::new(
             format!("atom_{k}"),
             basis_kinds[k].clone(),
             d,
@@ -1806,7 +1910,12 @@ pub fn term_from_padded_blocks_with_mode(
             jet,
             b,
             s,
-        )?);
+        )?;
+        let atom = match evaluators.get(k).and_then(|slot| slot.clone()) {
+            Some(evaluator) => atom.with_basis_evaluator(evaluator),
+            None => atom,
+        };
+        atoms.push(atom);
     }
     let manifolds = basis_kinds
         .iter()
