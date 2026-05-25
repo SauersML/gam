@@ -594,6 +594,7 @@ mod tests {
         idx: usize,
         rho_history: Vec<Array1<f64>>,
         seed_calls: usize,
+        last_seeded_beta_len: Option<usize>,
     }
 
     impl ScriptedObjective {
@@ -604,6 +605,7 @@ mod tests {
                 idx: 0,
                 rho_history: Vec::new(),
                 seed_calls: 0,
+                last_seeded_beta_len: None,
             }
         }
 
@@ -656,10 +658,12 @@ mod tests {
             self.idx = 0;
             self.rho_history.clear();
             self.seed_calls = 0;
+            self.last_seeded_beta_len = None;
         }
 
-        fn seed_inner_state(&mut self, _beta: &Array1<f64>) -> Result<(), EstimationError> {
+        fn seed_inner_state(&mut self, beta: &Array1<f64>) -> Result<(), EstimationError> {
             self.seed_calls += 1;
+            self.last_seeded_beta_len = Some(beta.len());
             Ok(())
         }
     }
@@ -780,8 +784,12 @@ mod tests {
                 ScriptedResponse::Ok,
             ],
         );
-        prime_outer_seed(&mut obj, &target, &upper)
-            .expect("path completes after likelihood shrink");
+        let outcome = prime_outer_seed(&mut obj, &target, &upper);
+        assert!(
+            outcome.is_ok(),
+            "path completes after likelihood shrink, got {:?}",
+            outcome.err(),
+        );
     }
 
     #[test]
