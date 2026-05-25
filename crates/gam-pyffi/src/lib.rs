@@ -82,7 +82,8 @@ use gam::terms::{
     NuclearNormPenalty as CoreNuclearNormPenalty, OrthogonalityPenalty as CoreOrthogonalityPenalty,
     ParametricRowPrecisionPriorPenalty, PenaltyConcavity, PenaltyTier, PsiSlice,
     RowPrecisionPriorPenalty, ScadMcpPenalty as CoreScadMcpPenalty, ScalarWeightSchedule,
-    SoftmaxAssignmentSparsityPenalty, SparsityPenalty as CoreSparsityPenalty,
+    SoftmaxAssignmentSparsityPenalty as CoreSoftmaxAssignmentSparsityPenalty,
+    SparsityPenalty as CoreSparsityPenalty,
     StreamingMaternBasisGradientEvaluator,
     TopKActivationPenalty, TotalVariationPenalty,
 };
@@ -1297,19 +1298,23 @@ fn numeric_matrix_validate<'py>(
         return Err(py_value_error(format!("{label} cannot be empty")));
     }
 
-    let untyped_array = array.cast::<PyUntypedArray>()?;
-    if !untyped_array.dtype().is_equiv_to(&dtype::<f64>(py)) {
-        return Err(PyTypeError::new_err(format!(
-            "{label} must be a float64 numpy array for zero-copy FFI"
-        )));
+    {
+        let untyped_array = array.cast::<PyUntypedArray>()?;
+        if !untyped_array.dtype().is_equiv_to(&dtype::<f64>(py)) {
+            return Err(PyTypeError::new_err(format!(
+                "{label} must be a float64 numpy array for zero-copy FFI"
+            )));
+        }
     }
 
-    let typed_array = array.cast::<PyArray2<f64>>()?;
-    let readonly = typed_array.readonly();
-    if !readonly.as_array().iter().all(|value| value.is_finite()) {
-        return Err(py_value_error(format!(
-            "{label} must contain only finite values"
-        )));
+    {
+        let typed_array = array.cast::<PyArray2<f64>>()?;
+        let readonly = typed_array.readonly();
+        if !readonly.as_array().iter().all(|value| value.is_finite()) {
+            return Err(py_value_error(format!(
+                "{label} must contain only finite values"
+            )));
+        }
     }
 
     array.cast_into::<PyArray2<f64>>()
