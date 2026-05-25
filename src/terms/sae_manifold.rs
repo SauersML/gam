@@ -307,8 +307,7 @@ impl SaeBasisEvaluator for SphereChartEvaluator {
         let mut jet = Array3::<f64>::zeros((n, 7, 2));
         for row in 0..n {
             let raw_lat = coords[[row, 0]];
-            let lat =
-                raw_lat.clamp(-std::f64::consts::FRAC_PI_2, std::f64::consts::FRAC_PI_2);
+            let lat = raw_lat.clamp(-std::f64::consts::FRAC_PI_2, std::f64::consts::FRAC_PI_2);
             // The clamp truncates derivatives w.r.t. the raw input coordinate
             // outside the interior `(-π/2, π/2)`: in the saturated region the
             // phi entries are constant in `coords[[row, 0]]`, so the chain rule
@@ -316,8 +315,8 @@ impl SaeBasisEvaluator for SphereChartEvaluator {
             // to apply this leaks a non-zero analytic gradient where finite
             // differences correctly report zero, sending Newton steps in lat
             // in a direction the loss does not actually decrease along.
-            let lat_active = raw_lat > -std::f64::consts::FRAC_PI_2
-                && raw_lat < std::f64::consts::FRAC_PI_2;
+            let lat_active =
+                raw_lat > -std::f64::consts::FRAC_PI_2 && raw_lat < std::f64::consts::FRAC_PI_2;
             let chain_lat = if lat_active { 1.0 } else { 0.0 };
             let lon = coords[[row, 1]];
             let clat = lat.cos();
