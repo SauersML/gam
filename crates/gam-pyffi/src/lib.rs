@@ -16031,6 +16031,11 @@ fn default_weight_auto_py() -> PyObject {
     Python::attach(|py| pyo3::types::PyString::new(py, "auto").into_any().unbind())
 }
 
+/// Build a `PyObject` containing the default difference-operator sentinel `"forward_1d"`.
+fn default_forward_1d_py() -> PyObject {
+    Python::attach(|py| pyo3::types::PyString::new(py, "forward_1d").into_any().unbind())
+}
+
 fn target_descriptor(py: Python<'_>, target: &Bound<'_, PyAny>) -> PyResult<PyObject> {
     if target.is_instance_of::<PyString>() || target.extract::<isize>().is_ok() {
         return Ok(target.clone().unbind());
@@ -16564,7 +16569,7 @@ impl SoftmaxAssignmentSparsityPenalty {
     fn new(
         py: Python<'_>,
         k_atoms: &Bound<'_, PyAny>,
-        temperature: &Bound<'_, PyAny>,
+        temperature: f64,
         target: PyObject,
         weight_schedule: Option<PyObject>,
     ) -> PyResult<Self> {
@@ -16573,10 +16578,6 @@ impl SoftmaxAssignmentSparsityPenalty {
             .getattr("int")?
             .call1((k_atoms,))?
             .extract::<i64>()?;
-        let temperature = builtins
-            .getattr("float")?
-            .call1((temperature,))?
-            .extract::<f64>()?;
         if k_atoms <= 0 {
             return Err(PyValueError::new_err(format!(
                 "SoftmaxAssignmentSparsityPenalty.k_atoms must be > 0, got {k_atoms}"
@@ -16724,24 +16725,15 @@ impl PyIBPAssignmentPenalty {
     fn new(
         py: Python<'_>,
         k_max: &Bound<'_, PyAny>,
-        alpha: &Bound<'_, PyAny>,
-        tau: &Bound<'_, PyAny>,
-        learnable: &Bound<'_, PyAny>,
+        alpha: f64,
+        tau: f64,
+        learnable: bool,
         target: PyObject,
         temperature_schedule: Option<PyObject>,
         weight_schedule: Option<PyObject>,
     ) -> PyResult<Self> {
         let builtins = PyModule::import(py, "builtins")?;
         let k_max = builtins.getattr("int")?.call1((k_max,))?.extract::<i64>()?;
-        let alpha = builtins
-            .getattr("float")?
-            .call1((alpha,))?
-            .extract::<f64>()?;
-        let tau = builtins.getattr("float")?.call1((tau,))?.extract::<f64>()?;
-        let learnable = builtins
-            .getattr("bool")?
-            .call1((learnable,))?
-            .extract::<bool>()?;
         if k_max <= 0 {
             return Err(PyValueError::new_err(format!(
                 "IBPAssignmentPenalty.k_max must be > 0, got {k_max}"
@@ -16881,7 +16873,7 @@ struct TotalVariationPenalty {
 #[pymethods]
 impl TotalVariationPenalty {
     #[new]
-    #[pyo3(signature = (weight, n_eff, difference_op = "forward_1d".to_string(), smoothing_eps = 1.0e-6, learnable = false, *, target = default_target_py()))]
+    #[pyo3(signature = (weight, n_eff, difference_op = default_forward_1d_py(), smoothing_eps = 1.0e-6, learnable = false, *, target = default_target_py()))]
     fn new(
         py: Python<'_>,
         weight: f64,
@@ -18308,6 +18300,10 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(load_model, module)?)?;
     module.add_function(wrap_pyfunction!(bayes_factor_log_diff, module)?)?;
     module.add_function(wrap_pyfunction!(saved_model_payload_string, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        required_saved_model_payload_string,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(build_extend_group_payload_json, module)?)?;
     module.add_function(wrap_pyfunction!(extend_model_with_group, module)?)?;
     module.add_function(wrap_pyfunction!(validate_formula_json, module)?)?;
@@ -18318,6 +18314,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(formula_validation_repr_json, module)?)?;
     module.add_function(wrap_pyfunction!(formula_validation_html_json, module)?)?;
     module.add_function(wrap_pyfunction!(build_predict_payload_json, module)?)?;
+    module.add_function(wrap_pyfunction!(build_model_predict_payload_json, module)?)?;
     module.add_function(wrap_pyfunction!(predict_table, module)?)?;
     module.add_function(wrap_pyfunction!(predict_array, module)?)?;
     module.add_function(wrap_pyfunction!(competing_risks_cif, module)?)?;
@@ -18453,6 +18450,10 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(apply_inverse_link_array, module)?)?;
     module.add_function(wrap_pyfunction!(summary_json, module)?)?;
     module.add_function(wrap_pyfunction!(summary_payload_from_model, module)?)?;
+    module.add_function(wrap_pyfunction!(smoothing_parameters_from_model, module)?)?;
+    module.add_function(wrap_pyfunction!(model_group_metadata, module)?)?;
+    module.add_function(wrap_pyfunction!(model_deployment_extensions, module)?)?;
+    module.add_function(wrap_pyfunction!(model_evidence, module)?)?;
     module.add_function(wrap_pyfunction!(summary_repr, module)?)?;
     module.add_function(wrap_pyfunction!(summary_html, module)?)?;
     module.add_function(wrap_pyfunction!(coefficient_state_json, module)?)?;
