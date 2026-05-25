@@ -24,12 +24,11 @@ fn log_kappa_derivative_matrix_is_symmetric() {
     };
     let m = build_duchon_basis_log_kappa_derivative(data.view(), &spec)
         .unwrap()
-        .design
-        .to_dense();
+        .design_derivative;
     let skew = (&m - &m.t())
         .mapv(f64::abs)
         .iter()
-        .fold(0.0_f64, |a, &b| a.max(b));
+        .fold(0.0_f64, |a: f64, &b| a.max(b));
     assert!(
         skew < 1e-10,
         "log-kappa derivative matrix should be symmetric because the underlying kernel is symmetric; got max skew {skew}"
