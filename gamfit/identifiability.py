@@ -494,68 +494,6 @@ def _validate_inputs(
     return x_arr, np.ascontiguousarray(aux_arr)
 
 
-def _check_preconditions(
-    aux: np.ndarray,
-    decoder: np.ndarray,
-    n_supervised: int,
-    n_free: int,
-    encoder_depth: int,
-    mech_sparsity_weight: float,
-) -> list[str]:
-    """Verify the iVAE + mechanism-sparsity theorem preconditions.
-
-    Returns a list of human-readable strings, one per failed precondition.
-    """
-
-    issues: list[str] = []
-
-    # 1. aux must vary across rows — a constant aux vector carries no
-    # conditioning information and the iVAE identifiability theorem
-    # collapses to standard (non-identified) ICA.
-    aux_std = np.std(aux, axis=0)
-    if not np.all(aux_std > 1e-9):
-        zero_axes = np.where(aux_std <= 1e-9)[0].tolist()
-        issues.append(
-            f"iVAE identifiability requires auxiliary covariate variation; "
-            f"aux axes {zero_axes} are constant across observations, so the "
-            f"Khemakhem 2107.10098 Theorem 1 conditioning rank fails."
-        )
-
-    # 2. decoder Jacobian on T_free columns must be rank >= n_free.
-    # Decoder is linear here, so the Jacobian is W itself; we check the
-    # rank of its free-block columns directly.
-    free_cols = decoder[:, n_supervised : n_supervised + n_free]
-    rank = int(np.linalg.matrix_rank(free_cols, tol=1e-8))
-    if rank < n_free:
-        issues.append(
-            f"mechanism-sparsity identifiability requires the decoder "
-            f"Jacobian on T_free to be rank >= n_free={n_free}, but the "
-            f"fitted decoder has rank {rank} on those columns. The free "
-            f"block collapsed during fitting."
-        )
-
-    # 3. mechanism-sparsity penalty must be active. A zero weight means
-    # the sparsity prior contributed nothing and Lachapelle 2401.04890
-    # Theorem identification does not apply.
-    if not (mech_sparsity_weight > 0.0):
-        issues.append(
-            "mechanism-sparsity identifiability requires a strictly positive "
-            f"sparsity weight; got {mech_sparsity_weight}."
-        )
-
-    # 4. encoder must be non-trivial. Khemakhem 2107.10098 §3 requires
-    # E to be a "sufficiently expressive" smooth map; a bare linear
-    # encoder does not satisfy this for non-Gaussian sources.
-    if encoder_depth < 2:
-        issues.append(
-            f"iVAE identifiability requires a non-trivial encoder "
-            f"(>= 2 layers per Khemakhem 2107.10098 §3); got encoder depth "
-            f"{encoder_depth}. Use encoder='mlp[w, w]' or deeper."
-        )
-
-    return issues
-
-
 def _build_encoder(
     p_features: int, latent_dim: int, hidden_widths: list[int], torch_mod: Any
 ) -> Any:
@@ -574,16 +512,6 @@ def _build_encoder(
         in_dim = w
     layers.append(nn.Linear(in_dim, latent_dim))
     return nn.Sequential(*layers)
-
-
-def _count_layers(encoder: Any) -> int:
-    """Count ``nn.Linear`` modules — the canonical "layer count" for an MLP."""
-
-    n = 0
-    for module in encoder.modules():
-        if module.__class__.__name__ == "Linear":
-            n += 1
-    return n
 
 
 def _resolve_weight(
@@ -949,11 +877,10 @@ def identifiable_factor_fit(
             for k, v in encoder_module.state_dict().items()
         }
 
-    # `_count_layers` counts nn.Linear modules; "encoder depth" in
-    # Khemakhem's sense is the number of affine layers. A bare 'linear'
-    # encoder has depth 1 (single Linear). MLP[w, w] has depth 3
-    # (Linear-GELU-Linear-GELU-Linear), which clears the >= 2 threshold.
-    enc_depth = _count_layers(encoder_module)
+    # Encoder depth (number of nn.Linear layers) is recovered inside
+    # ``check`` from ``encoder_state`` keys, so we do not duplicate the
+    # _count_layers call here. Rust performs every numerical theorem
+    # precondition test downstream.
 
     result = IdentifiableFactorFitResult(
         T_supervised=t_sup_np,

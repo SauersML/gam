@@ -11183,6 +11183,382 @@ fn block_residual_diagnostic_string(
     )
 }
 
+/// Per-iterate diagnostic snapshot assembled when the joint Newton inner solve
+/// refuses to certify constrained-stationarity. The report breaks the failure
+/// down by block (so the offending smooth can be named), records the H_pen
+/// eigenvalue spectrum (so rank-deficiency in the penalized Hessian is
+/// detectable from logs), and classifies the refusal so downstream tooling
+/// can act without re-deriving the cert math.
+#[derive(Clone, Debug)]
+struct KktRefusalReport {
+    block_names: Vec<String>,
+    block_widths: Vec<usize>,
+    block_beta_inf: Vec<f64>,
+    block_grad_inf: Vec<f64>,
+    block_penalty_grad_inf: Vec<f64>,
+    block_residual_inf: Vec<f64>,
+    block_carrying_residual: Option<usize>,
+
+    hpen_eigenvalues_sorted_desc: Vec<f64>,
+    hpen_min_abs_eigenvalue: f64,
+    hpen_max_abs_eigenvalue: f64,
+    hpen_condition_number: f64,
+    hpen_nullity_at_rank_tol: usize,
+    hpen_rank_tol: f64,
+
+    active_set_rows_total: usize,
+    accepted_step_inf: f64,
+    proposal_step_inf: f64,
+    trust_radius: f64,
+    cycle: usize,
+
+    residual_tol: f64,
+    obj_tol: f64,
+    step_tol: f64,
+
+    linearized_rel: f64,
+    scalar_model_relerr: f64,
+    objective_change: f64,
+    projected_residual_inf: f64,
+
+    diagnosis: KktRefusalDiagnosis,
+}
+
+/// Three-way classification of why the cert refused, computed from the
+/// H_pen spectrum and the projected residual at the refusing iterate.
+/// `RankDeficientHPen` is the regression canary the nullspace lead's
+/// smooth-construction rework is intended to eliminate; keep this variant
+/// intact when extending — it doubles as the user-facing signal for
+/// "an unconstrained polynomial null space slipped past absorption."
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KktRefusalDiagnosis {
+    RankDeficientHPen,
+    PhantomMultiplierWithWellConditionedH,
+    ActiveSetIncomplete,
+}
+
+impl KktRefusalDiagnosis {
+    fn as_str(&self) -> &'static str {
+        match self {
+            KktRefusalDiagnosis::RankDeficientHPen => "rank_deficient_H_pen",
+            KktRefusalDiagnosis::PhantomMultiplierWithWellConditionedH => {
+                "phantom_multiplier_with_well_conditioned_H"
+            }
+            KktRefusalDiagnosis::ActiveSetIncomplete => "active_set_incomplete",
+        }
+    }
+}
+
+/// Relative rank tolerance applied to `|λ|/λ_max` when counting the
+/// nullity of `H_pen`. Matches the threshold the surrounding REML
+/// penalty-rank machinery uses for "structurally zero".
+const KKT_REFUSAL_RANK_TOL: f64 = 1e-10;
+
+#[allow(clippy::too_many_arguments)]
+fn compute_kkt_refusal_report(
+    cycle: usize,
+    states: &[ParameterBlockState],
+    specs: &[ParameterBlockSpec],
+    s_lambdas: &[Array2<f64>],
+    ranges: &[(usize, usize)],
+    cached_joint_gradient: Option<&Array1<f64>>,
+    cached_active_sets: &[Option<Vec<usize>>],
+    block_constraints: &[Option<LinearInequalityConstraints>],
+    joint_hessian_source: &JointHessianSource,
+    total_p: usize,
+    ridge: f64,
+    ridge_policy: RidgePolicy,
+    joint_solver_diagonal_ridge: f64,
+    accepted_step_inf: f64,
+    proposal_step_inf: f64,
+    trust_radius: f64,
+    residual_tol: f64,
+    obj_tol: f64,
+    step_tol: f64,
+    objective_change: f64,
+    projected_residual_inf: f64,
+    math: &JointNewtonMathDiagnostic,
+) -> KktRefusalReport {
+    let block_names: Vec<String> = specs.iter().map(|s| s.name.clone()).collect();
+    let block_widths: Vec<usize> = states.iter().map(|s| s.beta.len()).collect();
+    let block_beta_inf: Vec<f64> = states
+        .iter()
+        .map(|s| s.beta.iter().map(|x: &f64| x.abs()).fold(0.0_f64, f64::max))
+        .collect();
+
+    let block_grad_inf: Vec<f64> = match cached_joint_gradient {
+        Some(joint_grad) => {
+            let mut acc = 0usize;
+            states
+                .iter()
+                .map(|s| {
+                    let n = s.beta.len();
+                    let end = (acc + n).min(joint_grad.len());
+                    let nrm = if acc < end {
+                        joint_grad
+                            .slice(ndarray::s![acc..end])
+                            .iter()
+                            .map(|x: &f64| x.abs())
+                            .fold(0.0_f64, f64::max)
+                    } else {
+                        f64::NAN
+                    };
+                    acc += n;
+                    nrm
+                })
+                .collect()
+        }
+        None => vec![f64::NAN; states.len()],
+    };
+
+    let block_penalty_grad_inf: Vec<f64> = ranges
+        .iter()
+        .enumerate()
+        .map(|(b, _)| {
+            let mut penalty_block = s_lambdas[b].dot(&states[b].beta);
+            if ridge_policy.include_quadratic_penalty && ridge > 0.0 {
+                penalty_block += &states[b].beta.mapv(|v| ridge * v);
+            }
+            penalty_block
+                .iter()
+                .map(|x: &f64| x.abs())
+                .fold(0.0_f64, f64::max)
+        })
+        .collect();
+
+    let residual_vec_opt = cached_joint_gradient.and_then(|joint_grad| {
+        exact_newton_joint_stationarity_vector_from_gradient(
+            joint_grad,
+            states,
+            specs,
+            s_lambdas,
+            ridge,
+            ridge_policy,
+        )
+        .ok()
+    });
+    let block_residual_inf: Vec<f64> = match residual_vec_opt.as_ref() {
+        Some(residual) => ranges
+            .iter()
+            .map(|(start, end)| {
+                residual
+                    .slice(ndarray::s![*start..*end])
+                    .iter()
+                    .map(|x: &f64| x.abs())
+                    .fold(0.0_f64, f64::max)
+            })
+            .collect(),
+        None => vec![f64::NAN; states.len()],
+    };
+    let block_carrying_residual = block_residual_inf
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| v.is_finite())
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(i, _)| i);
+
+    let mut hpen_eigenvalues_sorted_desc: Vec<f64> = Vec::new();
+    let mut hpen_min_abs_eigenvalue = f64::NAN;
+    let mut hpen_max_abs_eigenvalue = f64::NAN;
+    let mut hpen_condition_number = f64::NAN;
+    let mut hpen_nullity_at_rank_tol = 0usize;
+    if total_p > 0
+        && let Ok(mut h_joint) = materialize_joint_hessian_source(
+            joint_hessian_source,
+            total_p,
+            "KKT refusal diagnostic spectrum",
+        )
+    {
+        add_joint_penalty_to_matrix(&mut h_joint, ranges, s_lambdas, joint_solver_diagonal_ridge);
+        symmetrize_dense_in_place(&mut h_joint);
+        if let Ok((evals, _)) = FaerEigh::eigh(&h_joint, Side::Lower) {
+            let mut sorted: Vec<f64> = evals.iter().copied().collect();
+            sorted.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+            let max_abs = sorted
+                .iter()
+                .map(|x: &f64| x.abs())
+                .fold(0.0_f64, f64::max);
+            let min_abs = sorted
+                .iter()
+                .map(|x: &f64| x.abs())
+                .fold(f64::INFINITY, f64::min);
+            let cutoff = KKT_REFUSAL_RANK_TOL * max_abs;
+            hpen_nullity_at_rank_tol = sorted.iter().filter(|x| x.abs() < cutoff).count();
+            hpen_max_abs_eigenvalue = max_abs;
+            hpen_min_abs_eigenvalue = if min_abs.is_finite() { min_abs } else { f64::NAN };
+            hpen_condition_number = if min_abs > 0.0 && min_abs.is_finite() {
+                max_abs / min_abs
+            } else {
+                f64::INFINITY
+            };
+            hpen_eigenvalues_sorted_desc = sorted;
+        }
+    }
+
+    let active_set_rows_total: usize = cached_active_sets
+        .iter()
+        .map(|maybe_rows| maybe_rows.as_ref().map(|v| v.len()).unwrap_or(0))
+        .sum();
+    let any_block_has_constraints = block_constraints.iter().any(|c| c.is_some());
+
+    let diagnosis = if hpen_nullity_at_rank_tol > 0 {
+        KktRefusalDiagnosis::RankDeficientHPen
+    } else if any_block_has_constraints
+        && cached_active_sets.iter().any(|s| s.is_some())
+        && projected_residual_inf > 4.0 * residual_tol
+    {
+        // Well-conditioned H_pen, the user has bound constraints, the current
+        // active set already pinned some rows, yet the projected residual is
+        // still many tolerances above the threshold. The cert refused
+        // *because* the projection captured part of the multiplier but not
+        // all of it — i.e. the active set is missing a row.
+        KktRefusalDiagnosis::ActiveSetIncomplete
+    } else {
+        KktRefusalDiagnosis::PhantomMultiplierWithWellConditionedH
+    };
+
+    KktRefusalReport {
+        block_names,
+        block_widths,
+        block_beta_inf,
+        block_grad_inf,
+        block_penalty_grad_inf,
+        block_residual_inf,
+        block_carrying_residual,
+        hpen_eigenvalues_sorted_desc,
+        hpen_min_abs_eigenvalue,
+        hpen_max_abs_eigenvalue,
+        hpen_condition_number,
+        hpen_nullity_at_rank_tol,
+        hpen_rank_tol: KKT_REFUSAL_RANK_TOL,
+        active_set_rows_total,
+        accepted_step_inf,
+        proposal_step_inf,
+        trust_radius,
+        cycle,
+        residual_tol,
+        obj_tol,
+        step_tol,
+        linearized_rel: math.linearized_rel(),
+        scalar_model_relerr: math.scalar_model_relative_error(),
+        objective_change,
+        projected_residual_inf,
+        diagnosis,
+    }
+}
+
+impl KktRefusalReport {
+    fn carrying_block_label(&self) -> String {
+        match self.block_carrying_residual {
+            Some(idx) => format!(
+                "{} (idx={}, |g|={:.3e}, |Sβ|={:.3e}, |∇L-Sβ|={:.3e}, |β|={:.3e}, width={})",
+                self.block_names.get(idx).map(String::as_str).unwrap_or("?"),
+                idx,
+                self.block_grad_inf.get(idx).copied().unwrap_or(f64::NAN),
+                self.block_penalty_grad_inf
+                    .get(idx)
+                    .copied()
+                    .unwrap_or(f64::NAN),
+                self.block_residual_inf.get(idx).copied().unwrap_or(f64::NAN),
+                self.block_beta_inf.get(idx).copied().unwrap_or(f64::NAN),
+                self.block_widths.get(idx).copied().unwrap_or(0),
+            ),
+            None => "<no block carries finite residual>".to_string(),
+        }
+    }
+
+    fn beta_inf(&self) -> f64 {
+        self.block_beta_inf
+            .iter()
+            .copied()
+            .fold(0.0_f64, f64::max)
+    }
+
+    /// Multi-line structured log emitted at the cert REFUSED site. The
+    /// per-block residual / eigenspectrum / diagnosis breakdown is what
+    /// makes the failure actionable (vs the legacy one-liner that only
+    /// reported aggregate residual + cert math).
+    fn format_structured_log(&self, four_tol: f64) -> String {
+        format!(
+            "[PIRLS/joint-Newton convergence] cycle {:>3} | cert REFUSED: residual={:.3e} > 4·tol={:.3e} (cert)\n  \
+             carrying-block: {}\n  \
+             block_names={:?}, block_widths={:?}, block_grad_inf={:?}, block_penalty_grad_inf={:?}, block_residual_inf={:?}\n  \
+             H_pen spectrum: λ_max={:.3e}, λ_min={:.3e}, cond={:.3e}, nullity@{:.0e}={} (of {} eigenvalues)\n  \
+             cert math: linearized_rel={:.3e}, scalar_relerr={:.3e}, |Δobj|={:.3e} (tol={:.3e}), accepted_step_inf={:.3e} (tol={:.3e}), proposal_step_inf={:.3e}, trust_radius={:.3e}, |β|∞={:.3e}, active_set_rows_total={}\n  \
+             diagnosis: {}",
+            self.cycle,
+            self.projected_residual_inf,
+            four_tol,
+            self.carrying_block_label(),
+            self.block_names,
+            self.block_widths,
+            self.block_grad_inf,
+            self.block_penalty_grad_inf,
+            self.block_residual_inf,
+            self.hpen_max_abs_eigenvalue,
+            self.hpen_min_abs_eigenvalue,
+            self.hpen_condition_number,
+            self.hpen_rank_tol,
+            self.hpen_nullity_at_rank_tol,
+            self.hpen_eigenvalues_sorted_desc.len(),
+            self.linearized_rel,
+            self.scalar_model_relerr,
+            self.objective_change,
+            self.obj_tol,
+            self.accepted_step_inf,
+            self.step_tol,
+            self.proposal_step_inf,
+            self.trust_radius,
+            self.beta_inf(),
+            self.active_set_rows_total,
+            self.diagnosis.as_str(),
+        )
+    }
+
+    /// Single-string formatter used by the bubbled error returned from
+    /// the inner solver, where the caller wants one self-contained line
+    /// even though the data is structured.
+    fn format_bubbled_error(&self) -> String {
+        let carrying = self.carrying_block_label();
+        format!(
+            "cycle={} cert REFUSED: residual={:.3e} > 4·tol={:.3e}; \
+             carrying-block: {}; block_names={:?}, block_widths={:?}, \
+             block_grad_inf={:?}, block_penalty_grad_inf={:?}, block_residual_inf={:?}; \
+             H_pen spectrum: λ_max={:.3e}, λ_min={:.3e}, cond={:.3e}, nullity@{:.0e}={}/{}; \
+             cert math: linearized_rel={:.3e}, scalar_relerr={:.3e}, |Δobj|={:.3e}, \
+             accepted_step_inf={:.3e}, proposal_step_inf={:.3e}, trust_radius={:.3e}, \
+             |β|∞={:.3e}, active_set_rows_total={}; diagnosis: {}; \
+             check whether the named block's penalty has a polynomial null space not \
+             constrained by the data (reduce knots, add identifiability constraint, or \
+             use a basis whose null space is absorbed into the parametric block)",
+            self.cycle,
+            self.projected_residual_inf,
+            4.0 * self.residual_tol,
+            carrying,
+            self.block_names,
+            self.block_widths,
+            self.block_grad_inf,
+            self.block_penalty_grad_inf,
+            self.block_residual_inf,
+            self.hpen_max_abs_eigenvalue,
+            self.hpen_min_abs_eigenvalue,
+            self.hpen_condition_number,
+            self.hpen_rank_tol,
+            self.hpen_nullity_at_rank_tol,
+            self.hpen_eigenvalues_sorted_desc.len(),
+            self.linearized_rel,
+            self.scalar_model_relerr,
+            self.objective_change,
+            self.accepted_step_inf,
+            self.proposal_step_inf,
+            self.trust_radius,
+            self.beta_inf(),
+            self.active_set_rows_total,
+            self.diagnosis.as_str(),
+        )
+    }
+}
+
 const JOINT_PCG_REL_TOL: f64 = 1e-8;
 const PCG_ETA_MAX: f64 = 1.0e-1;
 const PCG_ETA_MIN: f64 = 1.0e-8;

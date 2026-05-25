@@ -126,7 +126,16 @@ def _DuchonRustFn_apply(
     length_scale: float | None,
     periodic_per_axis: Any,
 ) -> Any:
-    """Autograd boundary: forward + FD backward both call the Rust kernel."""
+    """Autograd boundary for Duchon.
+
+    Forward calls the Rust ``duchon_basis`` PyFFI. Backward uses the analytic
+    Rust jet exposed by ``duchon_basis_with_jet`` when the descriptor is the
+    plain m-spline (no ``length_scale``, no ``periodic_per_axis``). For the
+    parameterized variants the closed-form jet isn't on the PyFFI surface
+    today; backward then composes the Rust radial derivative kernel
+    ``duchon_input_location_first_derivative`` with the closed-form
+    ``(t − c) / r`` axis ratio (still all-Rust math).
+    """
     torch = _torch()
     from . import _api
 
@@ -135,6 +144,8 @@ def _DuchonRustFn_apply(
         kwargs["periodic_per_axis"] = tuple(bool(p) for p in periodic_per_axis)
     if length_scale is not None:
         kwargs["length_scale"] = float(length_scale)
+
+    use_jet = periodic_per_axis is None and length_scale is None
 
     class _Fn(torch.autograd.Function):
         @staticmethod
@@ -152,23 +163,41 @@ def _DuchonRustFn_apply(
             (g,) = grads
             (pts,) = ctx.saved_tensors
             pts_np = pts.detach().to(dtype=torch.float64).cpu().numpy()
-            _B, d = pts_np.shape
-            grad_pts = torch.zeros_like(pts)
-            span = np.maximum(pts_np.max(axis=0) - pts_np.min(axis=0), 1.0)
-            for j in range(d):
-                h = 1e-6 * float(span[j])
-                pts_plus = pts_np.copy()
-                pts_minus = pts_np.copy()
-                pts_plus[:, j] += h
-                pts_minus[:, j] -= h
-                phi_plus = _api.duchon_basis(pts_plus, centers, **kwargs)
-                phi_minus = _api.duchon_basis(pts_minus, centers, **kwargs)
-                deriv = torch.as_tensor(
-                    (phi_plus - phi_minus) / (2.0 * h),
-                    dtype=pts.dtype,
-                    device=pts.device,
+            # Centers may be int / None for d=1 auto-quantile; resolve via Rust.
+            d = pts_np.shape[1]
+            if centers is None or isinstance(centers, int):
+                if d != 1:
+                    raise ValueError(
+                        "Duchon backward: auto centers only supported for d=1"
+                    )
+                ctrs_np = _api._resolve_centers(centers, pts_np[:, 0], label="centers").reshape(-1, 1)
+            else:
+                ctrs_np = np.asarray(centers, dtype=float)
+                if ctrs_np.ndim == 1:
+                    ctrs_np = ctrs_np.reshape(-1, 1)
+
+            if use_jet:
+                # Analytic jet (B, M, d) from the Rust core in one call.
+                _phi, jet_np, _pen = _api.rust_module().duchon_basis_with_jet(
+                    pts_np, ctrs_np, int(m),
                 )
-                grad_pts[:, j] = (g * deriv).sum(dim=-1)
+                jet = torch.as_tensor(jet_np, dtype=pts.dtype, device=pts.device)
+                # grad_pts[b, j] = sum_m g[b, m] * jet[b, m, j]
+                grad_pts = torch.einsum("bm,bmj->bj", g, jet)
+                return grad_pts
+
+            # Parameterized path: combine Rust radial derivative φ'(r) with
+            # the axis ratio (t − c)/r. Both pieces come from the Rust core.
+            radial = _api.rust_module().duchon_input_location_first_derivative(
+                pts_np, ctrs_np, length_scale, int(m),
+            )  # (B, K)
+            radial_np = np.asarray(radial, dtype=float)
+            diffs = pts_np[:, None, :] - ctrs_np[None, :, :]  # (B, K, d)
+            r = np.sqrt((diffs * diffs).sum(axis=-1) + 1e-300)  # (B, K)
+            axis_ratio = diffs / r[..., None]  # (B, K, d)
+            jet_np = radial_np[..., None] * axis_ratio
+            jet = torch.as_tensor(jet_np, dtype=pts.dtype, device=pts.device)
+            grad_pts = torch.einsum("bk,bkj->bj", g, jet)
             return grad_pts
 
     return _Fn.apply(points)
@@ -182,21 +211,124 @@ def _DuchonRustFn_apply(
 def matern_evaluate(spec: Any, coords: Any) -> Any:
     """Evaluate a :class:`gamfit.Matern` kernel at ``(B, d)`` coords.
 
-    Currently raises :class:`NotImplementedError`: there is no
-    ``matern_basis`` PyFFI binding on the torch / NumPy path that we can
-    route through, and per the gamfit invariant we will not reimplement
-    the Matern kernel in pure torch. Once the Rust core exposes
-    ``rust_module().matern_basis(points, centers, nu, length_scale, ...)``,
-    this evaluator should wrap it in a :class:`torch.autograd.Function`
-    (forward through Rust; backward via the Rust kernel gradient when
-    available, or a finite-difference-of-Rust fallback).
+    Forward and backward both route through Rust:
+
+    * forward: :func:`gamfit._api.matern_basis` (Rust ``matern_basis``);
+    * backward: :func:`rust_module.matern_input_location_first_derivative`
+      returns the radial derivative ``φ'(r)``, which we combine with the
+      closed-form axis ratio ``(t − c) / r`` (standard tensor algebra,
+      not kernel math) to assemble the per-axis jet.
     """
-    raise NotImplementedError(
-        "Matern.evaluate is not yet wired: the Rust matern_basis PyFFI "
-        "binding for the design matrix has not been exposed to gamfit._api. "
-        "Reimplementing the Matern kernel in pure torch would violate the "
-        "single-source-of-math invariant. Track the matern_basis FFI export "
-        "to enable this path."
+    if spec.centers is None:
+        raise ValueError("Matern.evaluate: centers must be provided")
+    return _MaternRustFn_apply(
+        coords,
+        spec.centers,
+        float(spec.length_scale),
+        _matern_nu_string(float(spec.nu)),
+        spec.aniso_log_scales,
+    )
+
+
+def _matern_nu_string(nu: float) -> str:
+    """Map float ν to the Rust-side half-integer string label."""
+    if abs(nu - 0.5) < 1e-12:
+        return "1/2"
+    if abs(nu - 1.5) < 1e-12:
+        return "3/2"
+    if abs(nu - 2.5) < 1e-12:
+        return "5/2"
+    if abs(nu - 3.5) < 1e-12:
+        return "7/2"
+    if abs(nu - 4.5) < 1e-12:
+        return "9/2"
+    raise ValueError(
+        f"Matern.nu={nu} is not a supported half-integer (1/2, 3/2, 5/2, 7/2, 9/2)"
+    )
+
+
+def _MaternRustFn_apply(
+    points: Any,
+    centers: Any,
+    length_scale: float,
+    nu: str,
+    aniso_log_scales: Any,
+) -> Any:
+    """Autograd boundary for Matern. Forward + analytic backward via Rust."""
+    torch = _torch()
+    from . import _api
+
+    aniso_arg = (
+        None
+        if aniso_log_scales is None
+        else tuple(float(v) for v in aniso_log_scales)
+    )
+
+    class _Fn(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx: Any, pts: Any) -> Any:
+            import numpy as np
+
+            pts_np = pts.detach().to(dtype=torch.float64).cpu().numpy()
+            ctrs_np = np.asarray(centers, dtype=float)
+            if ctrs_np.ndim == 1:
+                ctrs_np = ctrs_np.reshape(-1, 1)
+            basis_np = _api.matern_basis(
+                pts_np,
+                ctrs_np,
+                length_scale=length_scale,
+                nu=nu,
+                aniso_log_scales=None if aniso_arg is None else list(aniso_arg),
+            )
+            basis = torch.as_tensor(basis_np, dtype=pts.dtype, device=pts.device)
+            ctx.save_for_backward(pts)
+            return basis
+
+        @staticmethod
+        def backward(ctx: Any, *grads: Any) -> Any:
+            import numpy as np
+
+            (g,) = grads
+            (pts,) = ctx.saved_tensors
+            pts_np = pts.detach().to(dtype=torch.float64).cpu().numpy()
+            ctrs_np = np.asarray(centers, dtype=float)
+            if ctrs_np.ndim == 1:
+                ctrs_np = ctrs_np.reshape(-1, 1)
+            radial = _api.rust_module().matern_input_location_first_derivative(
+                pts_np, ctrs_np, float(length_scale), str(nu),
+            )  # (B, K)
+            radial_np = np.asarray(radial, dtype=float)
+            diffs = pts_np[:, None, :] - ctrs_np[None, :, :]  # (B, K, d)
+            r = np.sqrt((diffs * diffs).sum(axis=-1) + 1e-300)  # (B, K)
+            axis_ratio = diffs / r[..., None]
+            jet_np = radial_np[..., None] * axis_ratio  # (B, K, d)
+            jet = torch.as_tensor(jet_np, dtype=pts.dtype, device=pts.device)
+            grad_pts = torch.einsum("bk,bkj->bj", g, jet)
+            return grad_pts
+
+    return _Fn.apply(points)
+
+
+def matern_evaluate_numpy(spec: Any, coords: Any) -> Any:
+    """NumPy-backend Matern evaluation. Direct Rust ``matern_basis`` call."""
+    import numpy as np
+
+    from . import _api
+
+    if spec.centers is None:
+        raise ValueError("Matern.evaluate: centers must be provided")
+    ctrs_np = np.asarray(spec.centers, dtype=float)
+    if ctrs_np.ndim == 1:
+        ctrs_np = ctrs_np.reshape(-1, 1)
+    return np.asarray(
+        _api.matern_basis(
+            coords,
+            ctrs_np,
+            length_scale=float(spec.length_scale),
+            nu=_matern_nu_string(float(spec.nu)),
+            aniso_log_scales=spec.aniso_log_scales,
+        ),
+        dtype=np.float64,
     )
 
 

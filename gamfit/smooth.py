@@ -333,13 +333,9 @@ class Matern(Smooth):
         from ._basis_eval import matern_evaluate
         return matern_evaluate(self, coords)
 
-    # Matern.evaluate currently raises NotImplementedError because the
-    # design-matrix Rust kernel (matern_basis) is not yet exposed on the
-    # PyFFI surface. Re-implementing the Matern kernel in pure torch would
-    # violate the single-source-of-math invariant. When the Rust binding
-    # lands, ``matern_evaluate`` in :mod:`gamfit._basis_eval` should route
-    # through it and ``SUPPORTED_BACKENDS`` should grow ``"numpy"``.
-    SUPPORTED_BACKENDS: frozenset[str] = frozenset({"torch"})
+    def _evaluate_numpy(self, coords: Any) -> Any:
+        from ._basis_eval import matern_evaluate_numpy
+        return matern_evaluate_numpy(self, coords)
 
 
 @dataclass(init=False, slots=True)
