@@ -5237,14 +5237,20 @@ where
             // m(δ) = L_old + g'δ + 0.5 δ'Hδ.
             // Reduction = -(g'δ + 0.5 δ'Hδ)
             let predred_start = std::time::Instant::now();
-            let q_term = if let Some(sparse_reg) = cached_sparse_regularized.as_ref() {
-                sparse_symmetric_upper_matvec_public(sparse_reg, direction)
-            } else {
-                regularized.dot(direction)
-            };
-            let quad = 0.5 * direction.dot(&q_term);
             let lin = state.gradient.dot(direction);
-            let predicted_reduction = -(lin + quad);
+            let predicted_reduction = if let Some(arrow_reduction) =
+                pending_arrow_predicted_reduction
+            {
+                arrow_reduction
+            } else {
+                let q_term = if let Some(sparse_reg) = cached_sparse_regularized.as_ref() {
+                    sparse_symmetric_upper_matvec_public(sparse_reg, direction)
+                } else {
+                    regularized.dot(direction)
+                };
+                let quad = 0.5 * direction.dot(&q_term);
+                -(lin + quad)
+            };
             lm_predred_total += predred_start.elapsed();
 
             // 3. Compute Actual Reduction
@@ -5428,10 +5434,8 @@ where
                         // smooth Marquardt update. See `madsen_lm_accept_factor`
                         // for the textbook derivation and canonical values.
                         lambda = (loop_lambda * madsen_lm_accept_factor(rho)).max(1e-9);
-                        // Consume any pending arrow-latent snapshot now that
-                        // we have accepted the LM step; downstream cleanup
-                        // paths still drain via the pending-restore helper
-                        // defensively.
+                        // Accepting commits the latent trial together with β,
+                        // so there is no rejected snapshot left to restore.
                         commit_pending_arrow_latent(&mut pending_arrow_latent_restore);
 
                         // Updates for next iteration. Recycle the previous beta
