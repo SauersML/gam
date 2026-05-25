@@ -185,11 +185,11 @@ impl SaeAtomBasisKind {
             // the optimiser sees a discontinuous landscape.
             Self::Periodic => {
                 if latent_dim == 1 {
-                    LatentManifold::CirclePeriod { period: 1.0 }
+                    LatentManifold::Circle { period: 1.0 }
                 } else {
                     LatentManifold::Product(
                         (0..latent_dim)
-                            .map(|_| LatentManifold::CirclePeriod { period: 1.0 })
+                            .map(|_| LatentManifold::Circle { period: 1.0 })
                             .collect(),
                     )
                 }
@@ -215,11 +215,11 @@ impl SaeAtomBasisKind {
             // per-axis latent wraps modulo `1.0`.
             Self::Torus => {
                 if latent_dim == 1 {
-                    LatentManifold::CirclePeriod { period: 1.0 }
+                    LatentManifold::Circle { period: 1.0 }
                 } else {
                     LatentManifold::Product(
                         (0..latent_dim)
-                            .map(|_| LatentManifold::CirclePeriod { period: 1.0 })
+                            .map(|_| LatentManifold::Circle { period: 1.0 })
                             .collect(),
                     )
                 }

@@ -158,15 +158,13 @@ pub enum LatentManifold {
     /// Unconstrained `R^d` — the current default.
     #[default]
     Euclidean,
-    /// Scalar angular coordinate on `S^1`, represented in radians.
-    Circle,
     /// Scalar periodic coordinate on `S^1` with caller-supplied period.
     ///
-    /// Mirrors [`Self::Circle`] but wraps modulo `period` instead of `2π`,
-    /// for basis evaluators that interpret the latent as a fraction of one
-    /// period (`period = 1.0`) or any other convention. The metric weight
-    /// uses `1/period²` so the trust-region radius respects the chosen unit.
-    CirclePeriod { period: f64 },
+    /// Wraps modulo `period`; pass `period = 2π` for radian conventions and
+    /// `period = 1.0` for basis evaluators that interpret the latent as a
+    /// fraction of one period. The metric weight uses `1/period²` so the
+    /// trust-region radius respects the chosen unit.
+    Circle { period: f64 },
     /// Embedded unit sphere `S^(dim-1)`.
     Sphere { dim: usize },
     /// Closed interval in `R`; the retraction clamps to the boundary.
@@ -192,7 +190,7 @@ impl LatentManifold {
     pub fn ambient_dim(&self, fallback_dim: usize) -> usize {
         match self {
             Self::Euclidean => fallback_dim,
-            Self::Circle | Self::CirclePeriod { .. } | Self::Interval { .. } => 1,
+            Self::Circle { .. } | Self::Interval { .. } => 1,
             Self::Sphere { dim } => *dim,
             Self::Product(parts)
             | Self::ProductWithMetric {
@@ -210,11 +208,10 @@ impl LatentManifold {
     pub fn metric_weights(&self) -> Vec<f64> {
         match self {
             Self::Euclidean => vec![1.0],
-            Self::Circle => vec![1.0 / (TWO_PI * TWO_PI)],
-            Self::CirclePeriod { period } => {
+            Self::Circle { period } => {
                 assert!(
                     period.is_finite() && *period > 0.0,
-                    "LatentManifold::CirclePeriod requires a finite positive period; got {period}"
+                    "LatentManifold::Circle requires a finite positive period; got {period}"
                 );
                 vec![1.0 / (period * period)]
             }
@@ -249,12 +246,7 @@ impl LatentManifold {
     pub fn project_point(&self, t: ArrayView1<'_, f64>) -> Array1<f64> {
         match self {
             Self::Euclidean => t.to_owned(),
-            Self::Circle => {
-                let mut out = Array1::<f64>::zeros(1);
-                out[0] = wrap_angle(t[0]);
-                out
-            }
-            Self::CirclePeriod { period } => {
+            Self::Circle { period } => {
                 let mut out = Array1::<f64>::zeros(1);
                 out[0] = wrap_to_period(t[0], *period);
                 out
@@ -299,12 +291,7 @@ impl LatentManifold {
                 }
                 out
             }
-            Self::Circle => {
-                let mut out = Array1::<f64>::zeros(1);
-                out[0] = wrap_angle(t[0] + xi[0]);
-                out
-            }
-            Self::CirclePeriod { period } => {
+            Self::Circle { period } => {
                 let mut out = Array1::<f64>::zeros(1);
                 out[0] = wrap_to_period(t[0] + xi[0], *period);
                 out
@@ -353,7 +340,7 @@ impl LatentManifold {
     ) -> Array1<f64> {
         assert_eq!(t.len(), v.len());
         match self {
-            Self::Euclidean | Self::Circle | Self::CirclePeriod { .. } => v.to_owned(),
+            Self::Euclidean | Self::Circle { .. } => v.to_owned(),
             Self::Sphere { dim } => {
                 assert_eq!(t.len(), *dim);
                 let tv = dot_views(t, v);
@@ -426,7 +413,7 @@ impl LatentManifold {
         assert_eq!(t.len(), xi.len());
         assert_eq!(t.len(), eh_xi.len());
         match self {
-            Self::Euclidean | Self::Circle | Self::CirclePeriod { .. } | Self::Interval { .. } => {
+            Self::Euclidean | Self::Circle { .. } | Self::Interval { .. } => {
                 self.project_to_tangent(t, eh_xi)
             }
             Self::Sphere { dim } => {
@@ -535,7 +522,7 @@ impl LatentManifold {
                     offset += dim;
                 }
             }
-            Self::Euclidean | Self::Circle | Self::Interval { .. } => {}
+            Self::Euclidean | Self::Circle { .. } | Self::Interval { .. } => {}
         }
     }
 }
@@ -1234,7 +1221,7 @@ mod tests {
         let mut lc = LatentCoordValues::from_matrix_with_manifold(
             m.view(),
             LatentIdMode::None,
-            LatentManifold::Circle,
+            LatentManifold::Circle { period: TWO_PI },
         );
         let delta = Array1::from(vec![1.5_f64]);
         lc.retract_flat_delta(delta.view());

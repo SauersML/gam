@@ -264,55 +264,107 @@ pub(crate) fn project_stationarity_residual_on_constraint_cone(
         return Some((residual.clone(), Array1::zeros(0)));
     }
 
-    let mut active_rows: Vec<usize> = (0..active_a.nrows()).collect();
-    for _ in 0..active_a.nrows().max(1) {
-        let k = active_rows.len();
-        if k == 0 {
-            return Some((residual.clone(), Array1::zeros(active_a.nrows())));
-        }
+    let m = active_a.nrows();
+    let residual_scale = residual
+        .iter()
+        .fold(0.0_f64, |acc, &v| acc.max(v.abs()))
+        .max(1.0);
+    let row_scale = active_a
+        .iter()
+        .fold(0.0_f64, |acc, &v| acc.max(v.abs()))
+        .max(1.0);
+    let tol = 100.0 * f64::EPSILON * (p.max(m).max(1) as f64) * residual_scale * row_scale;
 
-        let mut a_work = Array2::<f64>::zeros((k, p));
-        for (pos, &row) in active_rows.iter().enumerate() {
-            a_work.row_mut(pos).assign(&active_a.row(row));
-        }
-        let gram = a_work.dot(&a_work.t());
-        let rhs = a_work.dot(residual);
-        let mut lambda_work = Array1::<f64>::zeros(k);
-        solve_dense_system_via_pseudoinverse(&gram, &rhs, &mut lambda_work).ok()?;
-        if !array1_is_finite(&lambda_work) {
-            return None;
-        }
+    let mut lambda = Array1::<f64>::zeros(m);
+    let mut passive = vec![false; m];
+    let mut projected = residual.clone();
+    let max_iter = (3 * m * m).max(10);
 
-        let lambda_scale = lambda_work
-            .iter()
-            .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
-        let dual_tol = 1e-10 * lambda_scale.max(1.0);
-        let most_negative = lambda_work
-            .iter()
-            .enumerate()
-            .filter(|(_, value)| **value < -dual_tol)
-            .min_by(|(_, left), (_, right)| {
-                left.partial_cmp(right)
+    for _ in 0..max_iter {
+        let dual = active_a.dot(&projected);
+        let entering = (0..m)
+            .filter(|&idx| !passive[idx] && dual[idx] > tol)
+            .max_by(|&left, &right| {
+                dual[left]
+                    .partial_cmp(&dual[right])
                     .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .map(|(idx, _)| idx);
-        if let Some(pos) = most_negative {
-            active_rows.remove(pos);
-            continue;
-        }
+            });
+        let Some(entering) = entering else {
+            lambda.mapv_inplace(|v| if v > tol { v } else { 0.0 });
+            projected = residual - &active_a.t().dot(&lambda);
+            if !array1_is_finite(&projected) || !array1_is_finite(&lambda) {
+                return None;
+            }
+            return Some((projected, lambda));
+        };
+        passive[entering] = true;
 
-        let projected = residual - &a_work.t().dot(&lambda_work);
-        if !array1_is_finite(&projected) {
-            return None;
+        loop {
+            let passive_rows: Vec<usize> = (0..m).filter(|&idx| passive[idx]).collect();
+            if passive_rows.is_empty() {
+                lambda.fill(0.0);
+                projected.assign(residual);
+                break;
+            }
+
+            let mut a_passive = Array2::<f64>::zeros((passive_rows.len(), p));
+            for (pos, &row) in passive_rows.iter().enumerate() {
+                a_passive.row_mut(pos).assign(&active_a.row(row));
+            }
+            let gram = a_passive.dot(&a_passive.t());
+            let rhs = a_passive.dot(residual);
+            let mut lambda_passive = Array1::<f64>::zeros(passive_rows.len());
+            solve_dense_system_via_pseudoinverse(&gram, &rhs, &mut lambda_passive).ok()?;
+            if !array1_is_finite(&lambda_passive) {
+                return None;
+            }
+
+            let all_positive = lambda_passive.iter().all(|&v| v > tol);
+            if all_positive {
+                lambda.fill(0.0);
+                for (pos, &row) in passive_rows.iter().enumerate() {
+                    lambda[row] = lambda_passive[pos];
+                }
+                projected = residual - &active_a.t().dot(&lambda);
+                break;
+            }
+
+            let mut alpha = f64::INFINITY;
+            for (pos, &row) in passive_rows.iter().enumerate() {
+                let candidate = lambda_passive[pos];
+                if candidate <= tol {
+                    let current = lambda[row];
+                    let denom = current - candidate;
+                    if denom > 0.0 {
+                        alpha = alpha.min(current / denom);
+                    }
+                }
+            }
+            if !alpha.is_finite() {
+                alpha = 0.0;
+            }
+            alpha = alpha.clamp(0.0, 1.0);
+
+            for (pos, &row) in passive_rows.iter().enumerate() {
+                lambda[row] += alpha * (lambda_passive[pos] - lambda[row]);
+                if lambda[row] <= tol {
+                    lambda[row] = 0.0;
+                    passive[row] = false;
+                }
+            }
+            if passive.iter().all(|&is_passive| !is_passive) {
+                projected.assign(residual);
+                break;
+            }
         }
-        let mut lambda_full = Array1::<f64>::zeros(active_a.nrows());
-        for (pos, &row) in active_rows.iter().enumerate() {
-            lambda_full[row] = lambda_work[pos].max(0.0);
-        }
-        return Some((projected, lambda_full));
     }
 
-    Some((residual.clone(), Array1::zeros(active_a.nrows())))
+    let projected = residual - &active_a.t().dot(&lambda);
+    if array1_is_finite(&projected) && array1_is_finite(&lambda) {
+        Some((projected, lambda))
+    } else {
+        None
+    }
 }
 
 pub(crate) fn feasible_point_for_linear_constraints(
