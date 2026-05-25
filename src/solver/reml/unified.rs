@@ -7056,11 +7056,12 @@ pub fn reml_laml_evaluate(
     };
 
     // Add log-barrier cost for monotonicity-constrained coefficients.
+    // `barrier_cost` returns `+∞` on infeasible β by contract (continuous
+    // extension of `−τ Σ log Δ` past the boundary). Propagating that `+∞`
+    // through `cost` lets outer line-search reject the infeasible step by
+    // ordinary scalar comparison — no `Err` channel required.
     if let Some(ref barrier_cfg) = solution.barrier_config {
-        match barrier_cfg.barrier_cost(&solution.beta) {
-            Ok(bc) => cost += bc,
-            Err(e) => return Err(format!("REML/LAML barrier cost is undefined: {e}")),
-        }
+        cost += barrier_cfg.barrier_cost(&solution.beta);
     }
 
     // ─── Implicit-function-theorem cost correction ───
