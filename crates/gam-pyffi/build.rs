@@ -1,4 +1,20 @@
 fn main() {
+    use std::io::Write as _;
+
+    // On macOS, building a Python-extension `cdylib` directly with `cargo
+    // build -p gam-pyffi` (i.e. outside of maturin) links unresolved
+    // `_Py*` symbols against the host. Tell the dynamic linker those
+    // symbols will be resolved at module-load time by the interpreter
+    // (this is exactly what maturin / pip-installed wheels do). Without
+    // this hint plain `cargo build` fails at the link step even though
+    // all of the Rust code compiles cleanly.
+    if cfg!(target_os = "macos") {
+        let mut stdout = std::io::stdout();
+        for arg in ["-undefined", "dynamic_lookup"] {
+            drop(writeln!(stdout, "cargo:rustc-link-arg-cdylib={arg}"));
+        }
+    }
+
     // Only Linux wheels need the `$ORIGIN`-relative rpath probes — that's
     // ELF runtime-loader syntax. macOS uses `@loader_path` and Windows has
     // no rpath, so emitting the directives elsewhere would either be
@@ -10,7 +26,6 @@ fn main() {
         return;
     }
 
-    use std::io::Write as _;
     let mut stdout = std::io::stdout();
     for path in [
         "$ORIGIN/../nvidia/cuda_runtime/lib",
