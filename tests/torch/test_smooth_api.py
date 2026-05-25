@@ -15,13 +15,15 @@ Verifies the user-facing surface in ``gamfit.smooth`` and ``gamfit.torch``:
 
 from __future__ import annotations
 
-import pytest
+import importlib
+from typing import Any
 
-gt = pytest.importorskip("gamfit.torch")
-torch = pytest.importorskip("torch")
+pytest: Any = importlib.import_module("pytest")
+gt: Any = pytest.importorskip("gamfit.torch")
+torch: Any = pytest.importorskip("torch")
 
 
-def _make_centers(k: int = 8) -> torch.Tensor:
+def _make_centers(k: int = 8) -> Any:
     return torch.linspace(0.0, 1.0, k, dtype=torch.float64).unsqueeze(1)
 
 

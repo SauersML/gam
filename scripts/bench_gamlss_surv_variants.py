@@ -5,11 +5,26 @@ import json
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
+from typing import Any, TypedDict
 
 import numpy as np
 
 
-def synth(n: int = 200, seed: int = 17) -> dict[str, list[float]]:
+class FitKwargs(TypedDict, total=False):
+    survival_likelihood: str
+    baseline_target: str
+    baseline_scale: float
+    baseline_shape: float
+    baseline_rate: float
+    baseline_makeham: float
+    config: dict[str, Any]
+
+
+Data = dict[str, list[float]]
+BenchVariant = tuple[str, str, FitKwargs]
+
+
+def synth(n: int = 200, seed: int = 17) -> Data:
     rng = np.random.default_rng(seed)
     bmi = rng.normal(27.0, 4.0, n)
     hba1c = rng.normal(5.8, 0.7, n)
@@ -43,7 +58,7 @@ def synth(n: int = 200, seed: int = 17) -> dict[str, list[float]]:
 
 
 def fit_variant(
-    args: tuple[str, str, dict[str, object], dict[str, list[float]]],
+    args: tuple[str, str, FitKwargs, Data],
 ) -> tuple[str, float, bool, str | None]:
     label, formula, fit_kwargs, data = args
 
@@ -68,7 +83,7 @@ def main() -> None:
     scale_full = "s(bmi) + s(hba1c) + s(ldl)"
     scale_lean = "s(bmi)"
 
-    variants = [
+    variants: list[BenchVariant] = [
         (
             "A: gompertz-makeham + full sigma",
             location_full,

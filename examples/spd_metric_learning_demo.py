@@ -1,38 +1,31 @@
-"""Affine-invariant SPD metric interpolation."""
+"""Fit a response-geometry GAM with an SPD Fisher-Rao metric."""
 
 import numpy as np
+import pandas as pd
 
 import gamfit
 
 
-def spd_power(a, power):
-    vals, vecs = np.linalg.eigh((a + a.T) * 0.5)
-    return (vecs * (vals**power)) @ vecs.T
-
-
-def spd_log(a):
-    vals, vecs = np.linalg.eigh((a + a.T) * 0.5)
-    return (vecs * np.log(vals)) @ vecs.T
-
-
-def spd_exp(a):
-    vals, vecs = np.linalg.eigh((a + a.T) * 0.5)
-    return (vecs * np.exp(vals)) @ vecs.T
-
-
-def geodesic(p, q, t):
-    half = spd_power(p, 0.5)
-    inv_half = spd_power(p, -0.5)
-    middle = inv_half @ q @ inv_half
-    return half @ spd_exp(t * spd_log(middle)) @ half
-
-
-def main():
-    p = np.array([[2.0, 0.3], [0.3, 1.0]])
-    q = np.array([[0.8, -0.2], [-0.2, 2.4]])
-    learned = geodesic(p, q, 0.5)
-    print(gamfit.SpdManifold(2).to_json())
-    print("midpoint eigenvalues", np.round(np.linalg.eigvalsh(learned), 6))
+def main() -> None:
+    n = 64
+    x = np.linspace(0.0, 1.0, n)
+    angle = 2.0 * np.pi * x
+    data = pd.DataFrame(
+        {
+            "x": x,
+            "sx": 0.6 * np.cos(angle),
+            "sy": 0.6 * np.sin(angle),
+            "sz": np.full(n, 0.8),
+        }
+    )
+    model = gamfit.fit(
+        data,
+        "sphere ~ s(x, type='duchon', centers=16)",
+        response_geometry="spherical",
+        response_columns=["sx", "sy", "sz"],
+        fisher_rao_w=np.diag([1.0, 1.5, 2.0]),
+    )
+    print("tangent_dimension", model.summary()["tangent_dimension"])
 
 
 if __name__ == "__main__":

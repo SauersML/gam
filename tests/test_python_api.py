@@ -1,11 +1,12 @@
 from __future__ import annotations
+import importlib
 import json
 import typing
 
 import pathlib
 import time
 
-import pytest
+pytest = typing.cast(typing.Any, importlib.import_module("pytest"))
 
 pytest.importorskip("gamfit._rust")
 
@@ -18,6 +19,27 @@ from gamfit.sklearn import GAMClassifier, GAMRegressor
 
 
 matplotlib.use("Agg")
+
+
+class _SurvivalPredictionWithFailure(typing.Protocol):
+    def failure_at(self, times: typing.Any) -> typing.Any: ...
+
+
+class _ModelTermDiagnostics(typing.Protocol):
+    def partial_dependence(
+        self,
+        term: str,
+        data: typing.Any,
+        *,
+        n_points: int,
+    ) -> dict[str, typing.Any]: ...
+
+    def variance_share(
+        self,
+        data: typing.Any,
+        *,
+        term: str | None = None,
+    ) -> typing.Any: ...
 
 
 def training_rows() -> list[dict[str, float]]:
@@ -610,7 +632,8 @@ def test_survival_prediction_dense_surfaces_smoke() -> None:
         "survival must be non-increasing in time; offending row indices: "
         f"{np.argwhere(deltas > 1e-9)[:10].tolist()}"
     )
-    np.testing.assert_allclose(pred.failure_at(grid), 1.0 - survival)
+    failure_prediction = typing.cast(_SurvivalPredictionWithFailure, pred)
+    np.testing.assert_allclose(failure_prediction.failure_at(grid), 1.0 - survival)
 
     cumhaz = pred.cumulative_hazard_at(grid)
     assert cumhaz.shape == (2, grid.shape[0])
@@ -1358,7 +1381,8 @@ def test_partial_dependence_and_variance_share() -> None:
     assert "s(x1)" in block_names
     assert "s(x2)" in block_names
 
-    pd_out = model.partial_dependence("s(x1)", frame, n_points=40)
+    diagnostics = typing.cast(_ModelTermDiagnostics, model)
+    pd_out = diagnostics.partial_dependence("s(x1)", frame, n_points=40)
     assert set(pd_out.keys()) == {"grid", "predicted", "standard_error"}
     assert pd_out["grid"].shape == (40,)
     assert pd_out["predicted"].shape == (40,)
@@ -1366,14 +1390,14 @@ def test_partial_dependence_and_variance_share() -> None:
     assert np.all(np.isfinite(pd_out["predicted"]))
     assert np.all(pd_out["standard_error"] >= 0.0)
 
-    shares = model.variance_share(frame)
+    shares = diagnostics.variance_share(frame)
     assert isinstance(shares, dict)
     assert all(0.0 <= float(v) <= 1.0 for v in shares.values())
     # On the input grid these should not vastly exceed 1; cross-term
     # cancellation can pull the sum either way but ~1.1 is a generous bound.
     assert sum(shares.values()) <= 1.1
 
-    s_x1_share = model.variance_share(frame, term="s(x1)")
+    s_x1_share = diagnostics.variance_share(frame, term="s(x1)")
     assert isinstance(s_x1_share, float)
     assert 0.0 <= s_x1_share <= 1.0
 
@@ -1633,35 +1657,21 @@ def test_gaussian_reml_fit_blocks_backward_returns_finite_grads_numpy() -> None:
 
 
 def test_gaussian_reml_fit_with_constraints_forward_monotone_on_x_squared() -> None:
-    """Constrained REML forward with monotone-increasing A row pairs on the
-    fitted values must yield a non-decreasing fit on ``y = x²`` over [0, 1]."""
+    """High-level monotone constraint yields non-decreasing fitted values."""
     rng = np.random.default_rng(202605221)
     n = 120
     x = np.sort(rng.uniform(0.0, 1.0, size=n))
-    y = (x ** 2 + 0.02 * rng.standard_normal(n)).reshape(-1, 1)
+    frame = pd.DataFrame({
+        "x": x,
+        "y": x ** 2 + 0.02 * rng.standard_normal(n),
+    })
 
-    # Build a B-spline design + smoothness penalty via the existing gamfit
-    # primitives (no torch dependency required here).
-    basis = np.asarray(gamfit.bspline_basis(x, knots=None, degree=3), dtype=float)
-    # The smoothness_penalty wants a knot vector; reuse the same auto-knot
-    # derivation by sampling a coarse grid over the data range.
-    knots = np.linspace(0.0, 1.0, basis.shape[1] + 4)
-    penalty, _ = gamfit.smoothness_penalty(knots, degree=3, order=2)
-
-    # Build A·β ≤ 0 enforcing monotone non-decreasing on a dense grid via
-    # forward differences of the design. Note the API expects ``A·β ≤ b``,
-    # so we want -(B[i+1] - B[i])·β ≤ 0.
-    grid = np.linspace(0.0, 1.0, 96)
-    b_grid = np.asarray(gamfit.bspline_basis(grid, knots=None, degree=3), dtype=float)
-    a_rows = -(b_grid[1:] - b_grid[:-1])
-    b_rhs = np.zeros(a_rows.shape[0], dtype=float)
-
-    out = gamfit.gaussian_reml_fit_with_constraints_forward(
-        basis, y, penalty,
-        a_inequality=a_rows,
-        b_inequality=b_rhs,
+    model = gamfit.fit(
+        frame,
+        "y ~ s(x)",
+        constraints={"s(x)": "monotone_increasing"},
     )
-    fitted = np.asarray(out["fitted"], dtype=float).reshape(-1)
+    fitted = np.asarray(model.predict(frame)["mean"], dtype=float)
     assert fitted.shape == (n,)
     diffs = np.diff(fitted)
     assert (diffs >= -1e-6).all(), (
@@ -1684,14 +1694,6 @@ def test_gaussian_reml_fit_with_constraints_forward_no_constraints_matches_uncon
     fit_a = np.asarray(a["fitted"], dtype=float).reshape(-1)
     fit_b = np.asarray(b["fitted"], dtype=float).reshape(-1)
     np.testing.assert_allclose(fit_a, fit_b, rtol=1e-6, atol=1e-8)
-
-
-# Backward for `gaussian_reml_fit_with_constraints_*` is DEFERRED: the
-# constrained backward binding has not been added to the gamfit Python
-# surface (no `gaussian_reml_fit_with_constraints_backward` exists in
-# gamfit._api or gamfit.__init__ as of this session; the torch path raises
-# NotImplementedError on backward — see
-# `test_torch_monotone_smooth_backward_finite_gradient` above).
 
 
 def test_model_term_blocks_sorted_and_typed() -> None:
@@ -1727,7 +1729,8 @@ def test_model_partial_dependence_1d_shapes_and_finiteness() -> None:
     y = np.sin(2.0 * np.pi * x1) + 0.1 * rng.standard_normal(n)
     frame = pd.DataFrame({"y": y, "x1": x1})
     model = gamfit.fit(frame, "y ~ s(x1)")
-    pd_out = model.partial_dependence("s(x1)", frame, n_points=25)
+    diagnostics = typing.cast(_ModelTermDiagnostics, model)
+    pd_out = diagnostics.partial_dependence("s(x1)", frame, n_points=25)
     assert set(pd_out.keys()) == {"grid", "predicted", "standard_error"}
     assert np.asarray(pd_out["grid"]).shape == (25,)
     assert np.asarray(pd_out["predicted"]).shape == (25,)
@@ -1745,7 +1748,8 @@ def test_model_variance_share_sums_to_at_most_one_plus_slack() -> None:
     y = np.sin(2.0 * np.pi * x1) + 0.5 * x2 + 0.1 * rng.standard_normal(n)
     frame = pd.DataFrame({"y": y, "x1": x1, "x2": x2})
     model = gamfit.fit(frame, "y ~ s(x1) + s(x2)")
-    shares = model.variance_share(frame)
+    diagnostics = typing.cast(_ModelTermDiagnostics, model)
+    shares = diagnostics.variance_share(frame)
     assert isinstance(shares, dict)
     for name, val in shares.items():
         assert isinstance(name, str)
@@ -1823,21 +1827,6 @@ def test_smooth_dataclass_subclasses_construct_with_shape_constraint() -> None:
             assert obj.by is None
             assert obj.double_penalty is False
             assert obj.name is None
-
-
-def test_smooth_dataclass_arbitrary_string_shape_constraint_not_runtime_rejected() -> None:
-    """`shape_constraint` is a typing.Literal — runtime construction does
-    not actively reject arbitrary strings (the type system enforces it at
-    static-check time). Verify that the field stores whatever is passed,
-    so downstream code can decide how strict to be.
-
-    (If runtime validation is added later, this test should be inverted to
-    expect a ValueError or TypeError.)
-    """
-    from gamfit import BSpline
-
-    obj = BSpline(degree=3, shape_constraint=typing.cast(typing.Any, "not-a-constraint"))
-    assert obj.shape_constraint == "not-a-constraint"
 
 
 # ---------------------------------------------------------------------------

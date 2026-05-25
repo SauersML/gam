@@ -1,4 +1,16 @@
-import pytest
+from __future__ import annotations
+
+from importlib import import_module
+from typing import Any, Protocol, cast
+
+
+class _Pytest(Protocol):
+    def importorskip(self, modname: str) -> Any: ...
+
+    def raises(self, expected_exception: type[BaseException], *, match: str) -> Any: ...
+
+
+pytest = cast(_Pytest, import_module("pytest"))
 
 from gamfit._tables import normalize_table, restore_output_table
 

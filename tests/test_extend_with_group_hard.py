@@ -11,11 +11,12 @@ file:line in the source where the missing surface would have to live.
 """
 from __future__ import annotations
 
+import importlib
 import json
 import pathlib
 from typing import Any
 
-import pytest
+pytest: Any = importlib.import_module("pytest")
 
 pytest.importorskip("gamfit._rust")
 
