@@ -1743,6 +1743,17 @@ fn load_model(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<()> {
 }
 
 #[pyfunction]
+fn bayes_factor_log_diff(model_a_bytes: Vec<u8>, model_b_bytes: Vec<u8>) -> PyResult<f64> {
+    let model_a = load_model_impl(&model_a_bytes).map_err(PyValueError::new_err)?;
+    let model_b = load_model_impl(&model_b_bytes).map_err(PyValueError::new_err)?;
+    let fit_a =
+        fit_result_from_saved_model_for_prediction(&model_a).map_err(PyValueError::new_err)?;
+    let fit_b =
+        fit_result_from_saved_model_for_prediction(&model_b).map_err(PyValueError::new_err)?;
+    Ok(fit_a.reml_score - fit_b.reml_score)
+}
+
+#[pyfunction]
 fn saved_model_payload_string(model_bytes: Vec<u8>, key: &str) -> PyResult<Option<String>> {
     let saved: serde_json::Value = serde_json::from_slice(&model_bytes)
         .map_err(|err| PyValueError::new_err(format!("saved model payload must be JSON: {err}")))?;
