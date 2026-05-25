@@ -1025,11 +1025,11 @@ pub(crate) fn monotone_wiggle_nonnegative_constraints(
     })
 }
 
-pub(crate) fn validate_monotone_wiggle_beta_nonnegative(
-    beta: &Array1<f64>,
+pub(crate) fn validate_monotone_wiggle_beta_nonnegative<'a>(
+    beta: impl IntoIterator<Item = &'a f64>,
     context: &str,
 ) -> Result<(), String> {
-    for (idx, &value) in beta.iter().enumerate() {
+    for (idx, &value) in beta.into_iter().enumerate() {
         if !value.is_finite() {
             return Err(GamlssError::NonFinite {
                 reason: format!("{context} coefficient {idx} is non-finite"),

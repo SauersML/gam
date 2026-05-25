@@ -399,14 +399,11 @@ pub struct SmoothTerm {
     /// (or equivalent) to obtain `X_new = X_new_raw · Q` matching this
     /// term's coefficient system.
     ///
-    /// **Persistence gap (Stage-3c follow-up):** `SmoothTerm` is not
-    /// `Serialize`/`Deserialize` and the fitted-model artifact persists
-    /// via `FittedModelPayload`, so a saved-and-reloaded model loses `Q`.
-    /// Saved models with `joint_null_rotation = Some(...)` will produce
-    /// incorrect predictions on reload until persistence is wired
-    /// (`ndarray-serde` is already in the workspace, so the missing piece
-    /// is the per-family `FittedModelPayload::new` plumbing — not a new
-    /// dependency). In-memory fit→predict in the same process is correct.
+    /// Persistence replay: `freeze_term_collection_from_design` copies this
+    /// rotation into `SmoothTermSpec`, which is serialized with fitted-model
+    /// payloads and reused by the predict-time basis builder. Saved models
+    /// therefore replay the same `X_new_raw · Q` transform as in-memory
+    /// prediction.
     pub joint_null_rotation: Option<crate::terms::basis::JointNullRotation>,
 }
 
