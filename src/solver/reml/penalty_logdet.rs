@@ -691,8 +691,7 @@ impl PenaltyPseudologdet {
             .all(|&lambda| lambda_is_active(lambda, lambda_threshold));
         let structural_nullity = if ridge > 0.0 {
             if all_lambdas_active {
-                structural_nullity
-                    .or(Some(Self::structural_nullity_from_active_sum(&s_total)?))
+                structural_nullity.or(Some(Self::structural_nullity_from_active_sum(&s_total)?))
             } else {
                 Some(Self::structural_nullity_from_active_sum(&s_total)?)
             }
@@ -762,10 +761,7 @@ impl PenaltyPseudologdet {
         let nullity = null_indices.len();
 
         // Value: log|S|₊ = Σ log σ_i for positive eigenvalues.
-        let value: f64 = positive_indices
-            .iter()
-            .map(|&idx| evals[idx].ln())
-            .sum();
+        let value: f64 = positive_indices.iter().map(|&idx| evals[idx].ln()).sum();
 
         // W factor: p × rank, W_{:,j} = u_j / √σ_j for positive eigenvalues.
         let mut w_factor = Array2::<f64>::zeros((p_dim, rank));
@@ -1390,9 +1386,8 @@ mod tests {
             crate::construction::CanonicalPenalty::from_dense_root(array![[0.0, 1.0]], 2),
         ];
 
-        let block_factored =
-            PenaltyPseudologdet::from_penalties(&penalties, &[1.0, 0.0], ridge, 2)
-                .expect("block-factored pseudo-logdet");
+        let block_factored = PenaltyPseudologdet::from_penalties(&penalties, &[1.0, 0.0], ridge, 2)
+            .expect("block-factored pseudo-logdet");
         let assembled = PenaltyPseudologdet::from_assembled_with_nullity(
             array![[1.0 + ridge, 0.0], [0.0, ridge]],
             Some(1),

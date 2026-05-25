@@ -9256,6 +9256,21 @@ fn sae_manifold_predict_oos<'py>(
     let x_view = x_new.as_array();
     let (n_obs, p_out) = x_view.dim();
     let k_atoms = atom_basis.len();
+    if n_obs == 0 || p_out == 0 {
+        return Err(py_value_error(format!(
+            "sae_manifold_predict_oos: x_new must be non-empty; got shape ({n_obs}, {p_out})"
+        )));
+    }
+    if k_atoms == 0 {
+        return Err(py_value_error(
+            "sae_manifold_predict_oos: atom_basis must be non-empty".into(),
+        ));
+    }
+    if !x_view.iter().all(|v| v.is_finite()) {
+        return Err(py_value_error(
+            "sae_manifold_predict_oos: x_new contains non-finite values".into(),
+        ));
+    }
     if atom_dim.len() != k_atoms
         || decoder_blocks.len() != k_atoms
         || duchon_centers.len() != k_atoms
