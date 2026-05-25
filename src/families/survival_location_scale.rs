@@ -27,7 +27,7 @@ use crate::families::scale_design::{
     build_scale_deviation_operator, build_scale_deviation_transform_design,
     infer_non_intercept_start_design,
 };
-use crate::families::sigma_link::{exp_neg_stable, exp_sigma_inverse_from_eta_scalar};
+use crate::families::sigma_link::{EXP_NEG_STABLE_MAX_ARG, exp_sigma_inverse_from_eta_scalar};
 use crate::families::survival::{OffsetChannelCurvatures, OffsetChannelResiduals};
 use crate::matrix::{
     BlockDesignOperator, DenseDesignMatrix, DesignBlock, DesignMatrix, EmbeddedColumnBlock,
