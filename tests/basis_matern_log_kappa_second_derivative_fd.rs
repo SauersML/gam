@@ -11,7 +11,7 @@ fn matern_log_kappa_second_derivative_matches_finite_difference() {
         vec![0.0, 0.0, 0.2, 0.4, 0.7, 0.1, 1.0, 0.8, 1.3, 1.1],
     )
     .unwrap();
-    let rho = 0.3;
+    let rho: f64 = 0.3;
     let spec = MaternBasisSpec {
         center_strategy: CenterStrategy::UserProvided(data.clone()),
         periodic: None,
@@ -24,8 +24,7 @@ fn matern_log_kappa_second_derivative_matches_finite_difference() {
     };
     let analytic = build_matern_basis_log_kappasecond_derivative(data.view(), &spec)
         .unwrap()
-        .design
-        .to_dense();
+        .designsecond_derivative;
     let h = 1e-4;
     let mk = |r: f64| {
         let mut s = spec.clone();
@@ -39,7 +38,7 @@ fn matern_log_kappa_second_derivative_matches_finite_difference() {
     let err = (&analytic - &num)
         .mapv(f64::abs)
         .iter()
-        .fold(0.0_f64, |a, &b| a.max(b));
+        .fold(0.0_f64, |a: f64, &b| a.max(b));
     assert!(
         err < 1e-4,
         "second log-kappa derivative should match finite difference to 1e-4, got max abs error {err}"
