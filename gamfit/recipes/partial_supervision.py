@@ -278,21 +278,9 @@ class PartialSupervisionRecipe:
                 f"X has {X.shape[1]} columns but T_dim={self.T_dim}; "
                 f"pass T_init=... to initialize a wider latent block"
             )
-        # Centre and thin-SVD via the Rust faer bridge: route through the
-        # same partial_supervision_solve primitive used by .fit() — by
-        # supplying T_init = identity columns of the leading singular
-        # subspace would force a circular dependency. We keep a single
-        # tiny call here (centre + SVD on X) that any future Rust
-        # `thin_svd_scores` pyfunction can replace one-for-one. For now,
-        # the underlying SVD is the same faer routine that ships in the
-        # Rust crate via FaerSvd; numpy's call here only operates on the
-        # already-Rust-side-centred predictor matrix to seed T_init when
-        # the caller hasn't provided one. Math we care about (the
-        # supervised + free gauge fix) is fully in Rust.
-        Xc = X - X.mean(axis=0, keepdims=True)
-        U, sing, _Vt = np.linalg.svd(Xc, full_matrices=False)
-        k = self.T_dim
-        return U[:, :k] * sing[:k]
+        # Centre and thin-SVD via the Rust faer bridge.
+        scores = rust_module().thin_svd_scores(np.ascontiguousarray(X), int(self.T_dim))
+        return np.ascontiguousarray(np.asarray(scores, dtype=np.float64))
 
 
 def partial_supervision(

@@ -1414,6 +1414,68 @@ def duchon_basis(
         raise map_exception(exc) from exc
 
 
+def matern_basis(
+    points: Any,
+    centers: Any,
+    *,
+    length_scale: float = 1.0,
+    nu: str = "3/2",
+    aniso_log_scales: Any = None,
+) -> Any:
+    """Evaluate the Matérn kernel basis at ``points`` against ``centers``.
+
+    Pure-Rust forward, exposed through the same PyFFI surface as
+    :func:`duchon_basis`. ``points`` is ``(N, d)``, ``centers`` is ``(K, d)``,
+    and the returned design is ``(N, K)`` (NumPy float64).
+
+    Parameters
+    ----------
+    points : array-like ``(N, d)`` — evaluation locations.
+    centers : array-like ``(K, d)`` — kernel centers.
+    length_scale : positive float — global Matérn range.
+    nu : str — half-integer smoothness order: ``"1/2"``, ``"3/2"``,
+        ``"5/2"``, ``"7/2"``, or ``"9/2"``.
+    aniso_log_scales : optional length-d sequence of per-axis log-scale
+        contrasts (sum-to-zero). ``None`` is isotropic.
+    """
+    import numpy as np
+
+    pts_np = np.asarray(points, dtype=float)
+    if pts_np.ndim == 1:
+        pts_np = pts_np.reshape(-1, 1)
+    if pts_np.ndim != 2:
+        raise ValueError(f"points must be 1D or 2D, got {pts_np.ndim}D")
+    ctrs_np = np.asarray(centers, dtype=float)
+    if ctrs_np.ndim == 1:
+        ctrs_np = ctrs_np.reshape(-1, 1)
+    if ctrs_np.ndim != 2:
+        raise ValueError(f"centers must be 1D or 2D, got {ctrs_np.ndim}D")
+    if pts_np.shape[1] != ctrs_np.shape[1]:
+        raise ValueError(
+            f"points has d={pts_np.shape[1]} but centers has d={ctrs_np.shape[1]}"
+        )
+    if not np.all(np.isfinite(pts_np)) or not np.all(np.isfinite(ctrs_np)):
+        raise ValueError("matern_basis requires finite points and centers")
+    aniso = (
+        None
+        if aniso_log_scales is None
+        else np.asarray(aniso_log_scales, dtype=float)
+    )
+    try:
+        return np.asarray(
+            rust_module().matern_basis(
+                pts_np,
+                ctrs_np,
+                float(length_scale),
+                str(nu),
+                aniso,
+            ),
+            dtype=float,
+        )
+    except Exception as exc:
+        raise map_exception(exc) from exc
+
+
 def sphere_basis(
     points: Any,
     n_centers: int,

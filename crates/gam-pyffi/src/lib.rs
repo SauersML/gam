@@ -20761,6 +20761,27 @@ fn partial_supervision_solve<'py>(
     Ok(out.unbind())
 }
 
+/// Column-centred thin-SVD scores for the leading `k` components.
+///
+/// Returns `U[:, :k] * Σ[:k]` of `X − mean(X, axis=0)`, computed via the
+/// faer SVD bridge. Used by the partial-supervision recipe to seed an
+/// initial latent block when the caller does not provide one.
+#[pyfunction(signature = (x, k))]
+fn thin_svd_scores<'py>(
+    py: Python<'py>,
+    x: PyReadonlyArray2<'py, f64>,
+    k: i64,
+) -> PyResult<Py<PyArray2<f64>>> {
+    if k < 0 {
+        return Err(py_value_error(format!(
+            "thin_svd_scores: k must be non-negative, got {k}"
+        )));
+    }
+    let out =
+        gam::identifiability::thin_svd_scores(x.as_array(), k as usize).map_err(py_value_error)?;
+    Ok(out.into_pyarray(py).unbind())
+}
+
 fn py_value_error(message: String) -> PyErr {
     // Final defensive translation at the Python boundary: convert the
     // cryptic Rust assertion "SurvivalLocationScaleFamily expects N blocks,
