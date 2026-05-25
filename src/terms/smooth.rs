@@ -6348,7 +6348,6 @@ fn build_term_collection_design_inner(
     let mut linear_constraintrows = Vec::<Array1<f64>>::new();
     let mut linear_constraint_b = Vec::<f64>::new();
 
-    let mut penalized_linear_cols = Vec::<usize>::new();
     for (j, linear) in spec.linear_terms.iter().enumerate() {
         let col = p_intercept + j;
         if let Some(lb) = linear.coefficient_min {
@@ -6364,38 +6363,59 @@ fn build_term_collection_design_inner(
             linear_constraint_b.push(-ub);
         }
         if linear.double_penalty {
-            penalized_linear_cols.push(col);
-        }
-    }
+            // Per-term double penalty: each penalized linear term gets two
+            // independent 1x1 ridge blocks on its single column, each labelled
+            // with the term name so keyed Gamma hyperpriors and coefficient
+            // groups can address them. This preserves the mgcv "double
+            // penalty" semantic (two independent shrinkage levers per term)
+            // and avoids collapsing distinct terms into one shared block.
+            let block_range = col..(col + 1);
+            let mut s_base = Array2::<f64>::zeros((1, 1));
+            s_base[[0, 0]] = 1.0;
+            let global_index = penalties.len();
+            penalties.push(BlockwisePenalty::new(block_range.clone(), s_base));
+            nullspace_dims.push(0);
+            penaltyinfo.push(PenaltyBlockInfo {
+                global_index,
+                termname: Some(linear.name.clone()),
+                penalty: PenaltyInfo {
+                    source: PenaltySource::Other(format!(
+                        "LinearTermRidge({})",
+                        linear.name
+                    )),
+                    original_index: j,
+                    active: true,
+                    effective_rank: 1,
+                    dropped_reason: None,
+                    nullspace_dim_hint: 0,
+                    normalization_scale: 1.0,
+                    kronecker_factors: None,
+                },
+            });
 
-    if !penalized_linear_cols.is_empty() {
-        // Build a compact penalty covering the range of penalized linear columns.
-        let min_col = *penalized_linear_cols.iter().min().unwrap();
-        let max_col = *penalized_linear_cols.iter().max().unwrap();
-        let block_range = min_col..(max_col + 1);
-        let block_size = block_range.len();
-        let mut s_local = Array2::<f64>::zeros((block_size, block_size));
-        for &col in &penalized_linear_cols {
-            let local_idx = col - min_col;
-            s_local[[local_idx, local_idx]] = 1.0;
+            let mut s_double = Array2::<f64>::zeros((1, 1));
+            s_double[[0, 0]] = 1.0;
+            let global_index_double = penalties.len();
+            penalties.push(BlockwisePenalty::new(block_range, s_double));
+            nullspace_dims.push(0);
+            penaltyinfo.push(PenaltyBlockInfo {
+                global_index: global_index_double,
+                termname: Some(linear.name.clone()),
+                penalty: PenaltyInfo {
+                    source: PenaltySource::Other(format!(
+                        "LinearTermDoubleRidge({})",
+                        linear.name
+                    )),
+                    original_index: j,
+                    active: true,
+                    effective_rank: 1,
+                    dropped_reason: None,
+                    nullspace_dim_hint: 0,
+                    normalization_scale: 1.0,
+                    kronecker_factors: None,
+                },
+            });
         }
-        let global_index = penalties.len();
-        penalties.push(BlockwisePenalty::new(block_range, s_local));
-        nullspace_dims.push(0);
-        penaltyinfo.push(PenaltyBlockInfo {
-            global_index,
-            termname: Some("linear".to_string()),
-            penalty: PenaltyInfo {
-                source: PenaltySource::Other("LinearDoublePenaltyGroup".to_string()),
-                original_index: 0,
-                active: true,
-                effective_rank: penalized_linear_cols.len(),
-                dropped_reason: None,
-                nullspace_dim_hint: 0,
-                normalization_scale: 1.0,
-                kronecker_factors: None,
-            },
-        });
     }
 
     for (re_idx, (name, range)) in random_effect_ranges.iter().enumerate() {
@@ -12811,7 +12831,12 @@ fn smooth_term_penalty_index(
     if design.smooth.terms[term_idx].penalties_local.is_empty() {
         return None;
     }
-    let linear_penalties = usize::from(spec.linear_terms.iter().any(|t| t.double_penalty));
+    let linear_penalties = spec
+        .linear_terms
+        .iter()
+        .filter(|t| t.double_penalty)
+        .count()
+        * 2;
     let random_penalties = design
         .random_effect_ranges
         .iter()
