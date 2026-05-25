@@ -2664,10 +2664,12 @@ fn basis_with_jet<'py>(
         "periodic" | "periodic_spline" | "circle" => {
             let n_harmonics = required_usize_param(params, "n_harmonics")?;
             let coords = t.as_array();
-            if coords.ncols() == 0 {
-                return Err(py_value_error(
-                    "basis_with_jet periodic basis expects at least one t column".to_string(),
-                ));
+            if coords.ncols() != 1 {
+                return Err(py_value_error(format!(
+                    "basis_with_jet periodic basis is intrinsically 1D and requires t with exactly one column, got shape ({}, {})",
+                    coords.nrows(),
+                    coords.ncols()
+                )));
             }
             if coords.iter().any(|value| !value.is_finite()) {
                 return Err(py_value_error(
