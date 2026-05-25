@@ -333,8 +333,8 @@ def _inverse_softplus(x: np.ndarray) -> np.ndarray:
 
 @dataclass(init=False, slots=True)
 class IsometryPenalty(_AnalyticPenalty):
-    KIND_TAG = "isometry"
     """Pull the decoder's pullback metric toward a reference metric on the
+    KIND_TAG = "isometry"
     latent manifold.
 
     For a decoder ``T : ℝ^d → ℝ^p`` and per-row Jacobian
@@ -392,8 +392,8 @@ class IsometryPenalty(_AnalyticPenalty):
 
 @dataclass(init=False, slots=True)
 class SparsityPenalty(_AnalyticPenalty):
-    KIND_TAG = "sparsity"
     """Smoothed-L¹ / Hoyer / Log sparsifier on a β or t slice.
+    KIND_TAG = "sparsity"
 
     The smoothed-L¹ default is
 
@@ -489,8 +489,8 @@ class SparsityPenalty(_AnalyticPenalty):
 
 @dataclass(init=False, slots=True)
 class ScadMcpPenalty(_AnalyticPenalty):
-    KIND_TAG = "scad_mcp"
     """Concave SCAD/MCP sparsity on latent coordinates.
+    KIND_TAG = "scad_mcp"
 
     ``SparsityPenalty`` uses Huber-smoothed L¹, whose gradient keeps pulling
     large coefficients toward zero. MCP (Zhang 2010) and SCAD (Fan-Li 2001)
@@ -566,8 +566,8 @@ class ScadMcpPenalty(_AnalyticPenalty):
 
 @dataclass(init=False, slots=True)
 class ARDPenalty(_AnalyticPenalty):
-    KIND_TAG = "ard"
     """Automatic Relevance Determination over latent axes.
+    KIND_TAG = "ard"
 
     For a ``LatentCoord`` block ``t ∈ ℝ^{N × d}``, applies one independent
     ridge penalty per axis with its own REML-selectable log-precision:
@@ -616,8 +616,8 @@ class ARDPenalty(_AnalyticPenalty):
 
 @dataclass(init=False, slots=True)
 class TopKActivationPenalty(_AnalyticPenalty):
-    KIND_TAG = "topk_activation"
     """Hard top-k SAE activation mask over a row-major latent block."""
+    KIND_TAG = "topk_activation"
 
     target: TargetSpec
     k: int
@@ -652,8 +652,8 @@ class TopKActivationPenalty(_AnalyticPenalty):
 
 @dataclass(init=False, slots=True)
 class JumpReLUPenalty(_AnalyticPenalty):
-    KIND_TAG = "jumprelu"
     """JumpReLU SAE threshold prior with one learnable threshold per atom."""
+    KIND_TAG = "jumprelu"
 
     target: TargetSpec
     thresholds: np.ndarray
@@ -750,8 +750,8 @@ def _sigmoid_numpy(x: np.ndarray) -> np.ndarray:
 
 @dataclass(init=False, slots=True)
 class TotalVariationPenalty(_AnalyticPenalty):
-    KIND_TAG = "total_variation"
     """Smoothed-L¹ total variation on first differences of a latent block.
+    KIND_TAG = "total_variation"
 
     Uses ``φ(x) = sqrt(x² + ε²) - ε`` on ``D @ T``. ``difference_op`` is either
     ``"forward_1d"`` for adjacent ordered rows or a graph edge list
@@ -858,8 +858,8 @@ class TotalVariationPenalty(_AnalyticPenalty):
 
 @dataclass(init=False, slots=True)
 class NuclearNormPenalty(_AnalyticPenalty):
-    KIND_TAG = "nuclear_norm"
     """Smoothed nuclear norm on a matrix-valued latent block.
+    KIND_TAG = "nuclear_norm"
 
     Uses ``sum_i sqrt(σ_i² + ε²) - ε`` on the singular values of the row-major
     latent matrix. This encourages low rank without requiring useful axes to
@@ -934,8 +934,8 @@ class NuclearNormPenalty(_AnalyticPenalty):
 
 @dataclass(init=False, slots=True)
 class BlockSparsityPenalty(_AnalyticPenalty):
-    KIND_TAG = "block_sparsity"
     """Group-lasso sparsity over predefined latent-axis groups.
+    KIND_TAG = "block_sparsity"
 
     Uses ``sum_g sqrt(||T[:, G_g]||² + ε²)``. This differs from per-element
     L¹ by selecting whole groups, and from ARD by applying L¹ to each group's
@@ -1046,8 +1046,8 @@ class BlockSparsityPenalty(_AnalyticPenalty):
 
 @dataclass(init=False, slots=True)
 class MechanismSparsityPenalty(_AnalyticPenalty):
-    KIND_TAG = "mechanism_sparsity"
     """Per-latent group-lasso sparsity over decoder feature groups."""
+    KIND_TAG = "mechanism_sparsity"
 
     target: TargetSpec
     feature_groups: list[list[int]]
@@ -1136,8 +1136,8 @@ class MechanismSparsityPenalty(_AnalyticPenalty):
 
 @dataclass(init=False, slots=True)
 class BlockOrthogonalityPenalty(_AnalyticPenalty):
-    KIND_TAG = "block_orthogonality"
     """Between-block-only orthogonality over latent-axis groups.
+    KIND_TAG = "block_orthogonality"
 
     Penalizes ``0.5 * weight * sum_{g<h} ||T[:, G_g].T @ T[:, G_h]||²_F``
     while leaving each within-block Gram matrix unconstrained. This codifies
@@ -1242,8 +1242,8 @@ class BlockOrthogonalityPenalty(_AnalyticPenalty):
 
 @dataclass(init=False, slots=True)
 class AuxConditionalPriorPenalty(_AnalyticPenalty):
-    KIND_TAG = "aux_conditional_prior"
     """Fixed-precomputed iVAE-style auxiliary-conditional prior on t.
+    KIND_TAG = "aux_conditional_prior"
 
     Applies ``0.5 * weight * sum_n t_n.T @ Lambda_n @ t_n`` with one
     caller-supplied positive-definite precision matrix per latent row. Python
@@ -1339,8 +1339,8 @@ class AuxConditionalPriorPenalty(_AnalyticPenalty):
 
 @dataclass(init=False, slots=True)
 class IvaeRidgeMeanGauge(_AnalyticPenalty):
-    KIND_TAG = "ivae_ridge_mean_gauge"
     """iVAE conditional-mean gauge penalty on t.
+    KIND_TAG = "ivae_ridge_mean_gauge"
 
     Applies ``0.5 * weight * ||t - U @ inv(U.T @ U + ridge_eps * I) @ U.T @ t||^2``.
     This is the conditional-mean identifiability signal from Khemakhem et al.
@@ -1435,8 +1435,8 @@ class IvaeRidgeMeanGauge(_AnalyticPenalty):
 
 @dataclass(init=False, slots=True)
 class ParametricAuxConditionalPriorPenalty(_AnalyticPenalty):
-    KIND_TAG = "parametric_aux_conditional_prior"
     """Parametric iVAE-style auxiliary-conditional prior on t.
+    KIND_TAG = "parametric_aux_conditional_prior"
 
     Applies diagonal row precision
     ``lambda_k(u_n) = alpha_k + beta_k * ||u_n - mu_k||^2`` with positive
@@ -1583,8 +1583,8 @@ class ParametricAuxConditionalPriorPenalty(_AnalyticPenalty):
 
 @dataclass(init=False, slots=True)
 class OrthogonalityPenalty(_AnalyticPenalty):
-    KIND_TAG = "orthogonality"
     """Gauge-fixing penalty for latent-axis identifiability.
+    KIND_TAG = "orthogonality"
 
     Applies a Frobenius orthogonality penalty to the column-normalized latent
     coordinate matrix, so it breaks the rotation gauge while leaving ARD free

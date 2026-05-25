@@ -10176,6 +10176,17 @@ fn coefficient_state_json(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<Stri
 }
 
 #[pyfunction]
+fn difference_smooth_json(
+    py: Python<'_>,
+    model_bytes: Vec<u8>,
+    request_json: String,
+) -> PyResult<String> {
+    detach_py_result(py, "difference_smooth_json", move || {
+        difference_smooth_json_impl(&model_bytes, &request_json)
+    })
+}
+
+#[pyfunction]
 fn cross_fit_shared_precision_groups_json(
     py: Python<'_>,
     request_json: String,
@@ -10924,6 +10935,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(summary_repr, module)?)?;
     module.add_function(wrap_pyfunction!(summary_html, module)?)?;
     module.add_function(wrap_pyfunction!(coefficient_state_json, module)?)?;
+    module.add_function(wrap_pyfunction!(difference_smooth_json, module)?)?;
     module.add_function(wrap_pyfunction!(
         cross_fit_shared_precision_groups_json,
         module
