@@ -44,13 +44,21 @@ impl GatedSAEDecoder {
                 x.len()
             ));
         }
+        // Gated-SAE gating path: the gate determines *whether* a coordinate
+        // is active, not its sign. Following the Anthropic gated-SAE
+        // formulation we trigger the gate on any non-zero gating pre-activation
+        // (|W_gate x|_i > 0) so that signed dictionary atoms reconstruct
+        // through `W_amp` without losing their negative components. A
+        // strict `> 0` cutoff would incorrectly zero out negative features
+        // even when the dictionary already represents them with signed
+        // coefficients.
         let mut gated = Array1::<f64>::zeros(x.len());
         for gate_row in 0..self.w_gate.nrows() {
             let mut logit = 0.0;
             for col in 0..self.w_gate.ncols() {
                 logit += self.w_gate[[gate_row, col]] * x[col];
             }
-            if logit > 0.0 {
+            if logit != 0.0 {
                 gated[gate_row] = x[gate_row];
             }
         }
