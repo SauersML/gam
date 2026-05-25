@@ -15,6 +15,7 @@ pub mod penalty_op;
 pub mod sae_manifold;
 pub mod smooth;
 pub mod term_builder;
+pub mod torch_dispatch;
 
 pub use analytic_penalties::{
     ARDPenalty, AnalyticPenalty, AnalyticPenaltyKind, AnalyticPenaltyOp, AnalyticPenaltyRegistry,
