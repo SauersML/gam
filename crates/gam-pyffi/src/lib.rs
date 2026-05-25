@@ -87,6 +87,8 @@ use numpy::{
 use pyo3::exceptions::{PyNotImplementedError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBytes, PyDict, PyFloat, PyList, PyTuple};
+use rayon::prelude::*;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -13466,6 +13468,8 @@ fn difference_simultaneous_critical(
 }
 
 fn difference_smooth_json_impl(model_bytes: &[u8], request_json: &str) -> Result<String, String> {
+    use statrs::distribution::ContinuousCDF;
+
     let state_json = coefficient_state_json_impl(model_bytes)?;
     let state: serde_json::Value = serde_json::from_str(&state_json)
         .map_err(|err| format!("failed to parse coefficient state json: {err}"))?;
@@ -13600,8 +13604,9 @@ fn difference_smooth_json_impl(model_bytes: &[u8], request_json: &str) -> Result
     let (cov, cov_kind, cov_corrected) = difference_smooth_covariance(&state, beta.len())?;
     let random_ranges = difference_json_ranges(&state, "random_column_ranges")?;
     let group_ranges = difference_group_ranges(&state, &group)?;
-    let pointwise_crit =
-        gam::inference::probability::standard_normal_quantile(0.5 + request.level / 2.0)?;
+    let normal = statrs::distribution::Normal::new(0.0, 1.0)
+        .map_err(|err| format!("failed to construct standard normal: {err}"))?;
+    let pointwise_crit = normal.inverse_cdf(0.5 + request.level / 2.0);
     let model = load_model_impl(model_bytes)?;
     let mut rows_out = Vec::<serde_json::Value>::new();
 
