@@ -505,7 +505,9 @@ pub trait HessianOperator: Send + Sync {
                 // so it is always a valid sub-range of `x`. A failure here
                 // means the operator violated its row-chunk contract.
                 // SAFETY: row range built from 0..x.nrows(); failure means operator broke its contract.
-                reml_contract_panic(format!("xt_logdet_kernel_x_diagonal: row chunk failed: {err}"))
+                reml_contract_panic(format!(
+                    "xt_logdet_kernel_x_diagonal: row chunk failed: {err}"
+                ))
             });
             let chunk_t = rows.t().to_owned();
             let z_chunk = self.solve_multi(&chunk_t);
@@ -13456,7 +13458,9 @@ impl HessianOperator for DenseSpectralOperator {
                 // so it is always a valid sub-range of `x`. A failure here
                 // means the operator violated its row-chunk contract.
                 // SAFETY: row range built from 0..x.nrows(); failure means operator broke its contract.
-                reml_contract_panic(format!("xt_logdet_kernel_x_diagonal: row chunk failed: {err}"))
+                reml_contract_panic(format!(
+                    "xt_logdet_kernel_x_diagonal: row chunk failed: {err}"
+                ))
             });
             let xg = crate::faer_ndarray::fast_ab(&rows, &self.g_factor);
             for (local, row) in xg.outer_iter().enumerate() {
