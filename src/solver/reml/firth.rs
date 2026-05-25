@@ -2685,6 +2685,32 @@ mod tests {
     }
 
     #[test]
+    fn firth_reduced_fisher_logdet_is_finite_for_barely_pd_matrix() {
+        let fisher = array![[16.0, 0.0], [0.0, 1e-15]];
+        let (k_reduced, half_log_det) =
+            RemlState::reduced_fisher_inverse_and_half_logdet(&fisher)
+                .expect("barely positive-definite reduced fisher");
+        let expected = 0.5 * 16.0_f64.ln();
+
+        assert!(
+            half_log_det.is_finite(),
+            "barely positive-definite reduced fisher produced non-finite half logdet: {half_log_det}"
+        );
+        assert!(
+            (half_log_det - expected).abs() < 1e-12,
+            "near-null Fisher direction should be excluded from pseudo-logdet: got {half_log_det}, expected {expected}"
+        );
+        assert!(
+            k_reduced.iter().all(|value| value.is_finite()),
+            "barely positive-definite reduced fisher produced non-finite inverse entries: {k_reduced:?}"
+        );
+        assert!(
+            k_reduced[[1, 1]].abs() < f64::EPSILON,
+            "near-null Fisher direction should be excluded from pseudo-inverse: {k_reduced:?}"
+        );
+    }
+
+    #[test]
     fn firth_logisticweight_derivatives_match_finite_difference() {
         // Validates op.w[i] (= jet.d1) and op.w1..w4[i] (= jet.d2..jet.d5)
         // against direct central finite differences of the logistic inverse

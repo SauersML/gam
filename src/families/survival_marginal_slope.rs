@@ -21248,14 +21248,13 @@ mod tests {
         assert_eq!(beta, array![0.0, 0.0]);
     }
 
-    /// Reproduces the biobank-scale failure mode: no `time_linear_constraints`
-    /// (no time-wiggle), so the only barrier between PIRLS and the
-    /// `qd1 ≥ derivative_guard` cliff is `project_time_qd1_feasible`.
-    /// The proposed β drives a row's qd1 from feasible (`+0.4`) deep into
-    /// infeasibility (`-0.6`); the projection must pull it back to the
-    /// feasible side with a strictly positive margin.
+    /// Regression guard for the phantom-multiplier failure mode: if a
+    /// hand-constructed family omits the derivative-guard rows from
+    /// `time_linear_constraints`, post-update must not repair the proposed
+    /// time beta by a hidden projection. The KKT system needs those rows; a
+    /// missing-row violation is an error, not a convergence mechanism.
     #[test]
-    fn time_block_post_update_projects_qd1_when_no_linear_constraints() {
+    fn time_block_post_update_rejects_qd1_when_no_linear_constraints() {
         let family = SurvivalMarginalSlopeFamily {
             n: 1,
             event: Arc::new(array![1.0]),
@@ -21306,7 +21305,7 @@ mod tests {
         // qd1 at current = 1.0·0.4 + 0.0·7.0 + 1e-6 ≈ 0.4 (feasible)
         // qd1 at proposed = 1.0·-0.6 + 0.0·-3.0 + 1e-6 ≈ -0.6 (infeasible)
         let proposed = array![-0.6, -3.0];
-        let projected = family
+        let err = family
             .post_update_block_beta(
                 &[ParameterBlockState {
                     beta: current.clone(),
@@ -21316,40 +21315,12 @@ mod tests {
                 &spec,
                 proposed.clone(),
             )
-            .expect("qd1 projection");
-        // Verify: projected sits strictly above the guard, NOT at proposed.
-        let qd1_projected = 1.0 * projected[0] + 0.0 * projected[1] + 1e-6;
+            .expect_err("missing qd1 constraints must not be repaired by projection");
         assert!(
-            qd1_projected >= 1e-6,
-            "projected qd1 must clear guard, got {qd1_projected:.3e}"
-        );
-        assert!(
-            (projected[0] - proposed[0]).abs() > 1e-9,
-            "projection must pull β[0] back from {} (proposed)",
-            proposed[0]
-        );
-        // Bit-exact reproduction of the code path's max-α:
-        //   qd1_current = D·current + offset = 0.4 + 1e-6
-        //   qd1_proposed = D·proposed + offset = -0.6 + 1e-6
-        //   drift = qd1_proposed − qd1_current = −1.0
-        //   row_max = (qd1_current − guard) / −drift = (0.4 + 1e-6 − 1e-6) / 1.0 = 0.4
-        // Then α_safe = 0.995 · 0.4 = 0.398, so β = current + 0.398·(proposed−current).
-        let qd1_current_row = 1.0 * current[0] + 0.0 * current[1] + 1e-6;
-        let qd1_proposed_row = 1.0 * proposed[0] + 0.0 * proposed[1] + 1e-6;
-        let drift = qd1_proposed_row - qd1_current_row;
-        let row_max = (qd1_current_row - 1e-6) / -drift;
-        let alpha_safe = 0.995 * row_max;
-        let expected_beta_0 = current[0] + alpha_safe * (proposed[0] - current[0]);
-        let expected_beta_1 = current[1] + alpha_safe * (proposed[1] - current[1]);
-        assert!(
-            (projected[0] - expected_beta_0).abs() < 1e-12,
-            "projected[0]={:.12} expected={expected_beta_0:.12}",
-            projected[0]
-        );
-        assert!(
-            (projected[1] - expected_beta_1).abs() < 1e-12,
-            "projected[1]={:.12} expected={expected_beta_1:.12}",
-            projected[1]
+            err.contains("violates monotonicity")
+                && err.contains("proposed")
+                && err.contains("time_linear_constraints"),
+            "unexpected error message: {err}"
         );
     }
 

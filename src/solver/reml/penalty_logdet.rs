@@ -654,7 +654,8 @@ impl PenaltyPseudologdet {
             }
         }
 
-        Self::from_assembled_with_nullity(s_total, structural_nullity)
+        let ridge_hint = if ridge > 0.0 { Some(ridge) } else { None };
+        Self::from_assembled_with_nullity(s_total, ridge_hint, structural_nullity)
     }
 
     /// Build from unscaled penalty components with a known structural nullity.
@@ -709,7 +710,8 @@ impl PenaltyPseudologdet {
             }
         }
 
-        Self::from_assembled_with_nullity(s_total, structural_nullity)
+        let ridge_hint = if ridge > 0.0 { Some(ridge) } else { None };
+        Self::from_assembled_with_nullity(s_total, ridge_hint, structural_nullity)
     }
 
     /// Build from a pre-assembled penalty matrix S (already = Σ λ_k S_k + ridge·I).
@@ -1509,8 +1511,9 @@ mod tests {
         for i in 0..2 {
             s_ridged[[i, i]] += ridge;
         }
-        let assembled = PenaltyPseudologdet::from_assembled_with_nullity(s_ridged, Some(1))
-            .expect("assembled pseudo-logdet with structural nullity");
+        let assembled =
+            PenaltyPseudologdet::from_assembled_with_nullity(s_ridged, Some(ridge), Some(1))
+                .expect("assembled pseudo-logdet with structural nullity");
 
         assert_eq!(block_factored.rank(), assembled.rank());
         assert!(
