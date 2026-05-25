@@ -1435,7 +1435,7 @@ struct SurvivalLocationScaleFamily {
     time_wiggle_knots: Option<Array1<f64>>,
     time_wiggle_degree: Option<usize>,
     time_wiggle_ncols: usize,
-    time_coefficient_lower_bounds: Option<Array1<f64>>,
+    time_linear_constraints: Option<LinearInequalityConstraints>,
     /// Exit design for threshold block (always present; used as main design).
     x_threshold: DesignMatrix,
     /// Entry design for threshold block when time-varying.
@@ -4878,6 +4878,7 @@ struct TimeBlockPrepared {
     design_exit: Array2<f64>,
     design_derivative_exit: Array2<f64>,
     coefficient_lower_bounds: Option<Array1<f64>>,
+    linear_constraints: Option<LinearInequalityConstraints>,
     penalties: Vec<Array2<f64>>,
     initial_beta: Option<Array1<f64>>,
     transform: TimeIdentifiabilityTransform,
@@ -4885,6 +4886,34 @@ struct TimeBlockPrepared {
 
 fn lower_bound_constraints(lower_bounds: &Array1<f64>) -> Option<LinearInequalityConstraints> {
     LinearInequalityConstraints::from_per_coordinate_lower_bounds(lower_bounds)
+}
+
+fn append_linear_constraints(
+    first: Option<LinearInequalityConstraints>,
+    second: Option<LinearInequalityConstraints>,
+) -> Result<Option<LinearInequalityConstraints>, String> {
+    match (first, second) {
+        (None, None) => Ok(None),
+        (Some(constraints), None) | (None, Some(constraints)) => Ok(Some(constraints)),
+        (Some(lhs), Some(rhs)) => {
+            if lhs.a.ncols() != rhs.a.ncols() {
+                return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
+                    "time linear constraint width mismatch: left={}, right={}",
+                    lhs.a.ncols(),
+                    rhs.a.ncols()
+                ) }.into());
+            }
+            let rows = lhs.a.nrows() + rhs.a.nrows();
+            let cols = lhs.a.ncols();
+            let mut a = Array2::<f64>::zeros((rows, cols));
+            let mut b = Array1::<f64>::zeros(rows);
+            a.slice_mut(s![..lhs.a.nrows(), ..]).assign(&lhs.a);
+            a.slice_mut(s![lhs.a.nrows().., ..]).assign(&rhs.a);
+            b.slice_mut(s![..lhs.b.len()]).assign(&lhs.b);
+            b.slice_mut(s![lhs.b.len()..]).assign(&rhs.b);
+            Ok(Some(LinearInequalityConstraints::from_paired(a, b)))
+        }
+    }
 }
 
 fn structural_time_coefficient_lower_bounds(
