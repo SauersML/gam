@@ -10919,7 +10919,7 @@ fn shrink_active_joint_block_trust_radii(
     block_radii.iter().copied().fold(0.0_f64, f64::max)
 }
 
-fn apply_block_local_feasibility_limits<F: CustomFamily + ?Sized>(
+fn apply_joint_feasibility_limit<F: CustomFamily + ?Sized>(
     family: &F,
     states: &[ParameterBlockState],
     ranges: &[(usize, usize)],
@@ -12089,7 +12089,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     &joint_trust_metric_diag,
                     &joint_block_trust_radii,
                 );
-                if apply_block_local_feasibility_limits(family, &states, &ranges, &mut trial_delta)
+                if apply_joint_feasibility_limit(family, &states, &ranges, &mut trial_delta)
                     .is_err()
                 {
                     joint_trust_radius = shrink_active_joint_block_trust_radii(
