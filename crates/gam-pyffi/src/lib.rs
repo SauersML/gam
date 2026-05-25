@@ -12328,6 +12328,108 @@ fn classification_metrics(
     Ok(metrics.unbind())
 }
 
+#[pyfunction]
+fn auc_from_predictions(observed: Vec<f64>, predicted_mean: Vec<f64>) -> PyResult<f64> {
+    benchmark_auc_score(&observed, &predicted_mean)
+}
+
+#[pyfunction]
+fn brier_from_predictions(observed: Vec<f64>, predicted_mean: Vec<f64>) -> PyResult<f64> {
+    binary_brier(observed, predicted_mean)
+}
+
+#[pyfunction(signature = (observed, predicted_mean, eps = 1e-12))]
+fn log_loss_from_predictions(
+    observed: Vec<f64>,
+    predicted_mean: Vec<f64>,
+    eps: f64,
+) -> PyResult<f64> {
+    benchmark_binary_logloss_eps(&observed, &predicted_mean, eps)
+}
+
+#[pyfunction(signature = (observed, predicted_mean, null_mean, eps = 1e-12))]
+fn nagelkerke_r2_from_predictions(
+    observed: Vec<f64>,
+    predicted_mean: Vec<f64>,
+    null_mean: f64,
+    eps: f64,
+) -> PyResult<Option<f64>> {
+    benchmark_nagelkerke_r2_with_null_mean(&observed, &predicted_mean, null_mean, eps)
+}
+
+#[pyfunction(signature = (observed, predicted_mean, sigma, eps = 1e-12))]
+fn gaussian_log_loss_from_predictions(
+    observed: Vec<f64>,
+    predicted_mean: Vec<f64>,
+    sigma: Vec<f64>,
+    eps: f64,
+) -> PyResult<f64> {
+    if eps == 1.0e-12 {
+        return benchmark_gaussian_logloss(&observed, &predicted_mean, &sigma);
+    }
+    if observed.len() != predicted_mean.len() {
+        return Err(PyValueError::new_err(format!(
+            "gaussian logloss length mismatch: observed={} predicted={}",
+            observed.len(),
+            predicted_mean.len()
+        )));
+    }
+    if observed.is_empty() {
+        return Err(PyValueError::new_err(
+            "gaussian logloss requires at least one row",
+        ));
+    }
+    if sigma.len() != 1 && sigma.len() != observed.len() {
+        return Err(PyValueError::new_err(format!(
+            "sigma length must be 1 or {}, got {}",
+            observed.len(),
+            sigma.len()
+        )));
+    }
+    let two_pi = 2.0 * std::f64::consts::PI;
+    let loss_sum = observed
+        .iter()
+        .zip(predicted_mean.iter())
+        .enumerate()
+        .map(|(idx, (&y, &mu))| {
+            let raw_sigma = if sigma.len() == 1 {
+                sigma[0]
+            } else {
+                sigma[idx]
+            };
+            let sigma_use = raw_sigma.max(eps);
+            let var = sigma_use * sigma_use;
+            0.5 * (two_pi * var).ln() + ((y - mu) * (y - mu)) / (2.0 * var)
+        })
+        .sum::<f64>();
+    Ok(loss_sum / observed.len() as f64)
+}
+
+#[pyfunction]
+fn gaussian_prediction_scores_from_predictions(
+    py: Python<'_>,
+    observed: Vec<f64>,
+    predicted_mean: Vec<f64>,
+    sigma: Vec<f64>,
+) -> PyResult<Py<PyDict>> {
+    let diagnostics =
+        gam::inference::diagnostics::diagnostics_from_predictions(&observed, &predicted_mean)
+            .map_err(py_value_error)?;
+    let metrics = PyDict::new(py);
+    metrics.set_item(
+        "logloss",
+        benchmark_gaussian_logloss(&observed, &predicted_mean, &sigma)?,
+    )?;
+    metrics.set_item("mse", diagnostics.rmse * diagnostics.rmse)?;
+    metrics.set_item("rmse", diagnostics.rmse)?;
+    metrics.set_item("mae", diagnostics.mae)?;
+    match diagnostics.r_squared {
+        Some(r_squared) => metrics.set_item("r2", r_squared)?,
+        None => metrics.set_item("r2", py.None())?,
+    }
+    Ok(metrics.unbind())
+}
+
 // =========================================================================
 // LatentCoord input-location derivative helpers (thin pyffi wrappers).
 //
@@ -15325,6 +15427,150 @@ impl NuclearNormPenalty {
                 None => "None".to_string(),
             }
         ))
+    }
+}
+
+#[pyclass(module = "gam_pyffi._rust", name = "ScadMcpPenalty")]
+struct ScadMcpPenalty {
+    #[pyo3(get, set)]
+    target: PyObject,
+    #[pyo3(get, set)]
+    weight: f64,
+    #[pyo3(get, set)]
+    n_eff: i64,
+    #[pyo3(get, set)]
+    gamma: f64,
+    #[pyo3(get, set)]
+    variant: String,
+    #[pyo3(get, set)]
+    smoothing_eps: f64,
+    #[pyo3(get, set)]
+    learnable: bool,
+    #[pyo3(get, set)]
+    weight_schedule: Option<PyObject>,
+}
+
+#[pymethods]
+impl ScadMcpPenalty {
+    #[new]
+    #[pyo3(signature = (weight, n_eff, gamma = None, variant = "mcp", smoothing_eps = 1.0e-6, learnable = false, *, target = "t"))]
+    fn new(
+        weight: f64,
+        n_eff: i64,
+        gamma: Option<f64>,
+        variant: String,
+        smoothing_eps: f64,
+        learnable: bool,
+        target: PyObject,
+    ) -> PyResult<Self> {
+        let gamma = match gamma {
+            Some(value) => value,
+            None => match variant.as_str() {
+                "mcp" => 2.5,
+                "scad" => 3.7,
+                _ => {
+                    return Err(PyValueError::new_err(format!(
+                        "ScadMcpPenalty.variant must be 'mcp' or 'scad', got {variant:?}"
+                    )));
+                }
+            },
+        };
+        let penalty = Self {
+            target,
+            weight,
+            n_eff,
+            gamma,
+            variant,
+            smoothing_eps,
+            learnable,
+            weight_schedule: None,
+        };
+        penalty.validate()?;
+        Ok(penalty)
+    }
+
+    #[classattr]
+    const KIND_TAG: &'static str = "scad_mcp";
+
+    fn to_rust_descriptor(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let payload = PyDict::new(py);
+        payload.set_item("kind", Self::KIND_TAG)?;
+        payload.set_item("target", target_descriptor(py, self.target.bind(py))?)?;
+        payload.set_item("weight", self.weight)?;
+        payload.set_item("n_eff", self.n_eff)?;
+        payload.set_item("gamma", self.gamma)?;
+        payload.set_item("variant", &self.variant)?;
+        payload.set_item("smoothing_eps", self.smoothing_eps)?;
+        payload.set_item("learnable", self.learnable)?;
+        if let Some(schedule) = &self.weight_schedule {
+            payload.set_item("weight_schedule", schedule.bind(py))?;
+        }
+        Ok(payload.into())
+    }
+
+    fn _to_rust_payload(&self, py: Python<'_>) -> PyResult<PyObject> {
+        self.to_rust_descriptor(py)
+    }
+
+    fn set_weight_schedule<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        schedule: PyObject,
+    ) -> PyRefMut<'py, Self> {
+        slf.weight_schedule = Some(schedule);
+        slf
+    }
+
+    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        Ok(format!(
+            "ScadMcpPenalty(weight={}, n_eff={}, gamma={}, variant={}, smoothing_eps={}, learnable={}, target={}, weight_schedule={})",
+            self.weight,
+            self.n_eff,
+            self.gamma,
+            self.variant.as_str(),
+            self.smoothing_eps,
+            self.learnable,
+            py_repr(py, self.target.bind(py))?,
+            match &self.weight_schedule {
+                Some(schedule) => py_repr(py, schedule.bind(py))?,
+                None => "None".to_string(),
+            }
+        ))
+    }
+}
+
+impl ScadMcpPenalty {
+    fn validate(&self) -> PyResult<()> {
+        if !self.weight.is_finite() || self.weight <= 0.0 {
+            return Err(PyValueError::new_err(format!(
+                "ScadMcpPenalty.weight must be > 0, got {}",
+                self.weight
+            )));
+        }
+        if self.n_eff <= 0 {
+            return Err(PyValueError::new_err(format!(
+                "ScadMcpPenalty.n_eff must be > 0, got {}",
+                self.n_eff
+            )));
+        }
+        if !self.gamma.is_finite() || self.gamma <= 1.0 {
+            return Err(PyValueError::new_err(format!(
+                "ScadMcpPenalty.gamma must be > 1, got {}",
+                self.gamma
+            )));
+        }
+        if !matches!(self.variant.as_str(), "mcp" | "scad") {
+            return Err(PyValueError::new_err(format!(
+                "ScadMcpPenalty.variant must be 'mcp' or 'scad', got {:?}",
+                self.variant
+            )));
+        }
+        if !self.smoothing_eps.is_finite() || self.smoothing_eps <= 0.0 {
+            return Err(PyValueError::new_err(format!(
+                "ScadMcpPenalty.smoothing_eps must be > 0, got {}",
+                self.smoothing_eps
+            )));
+        }
+        Ok(())
     }
 }
 
