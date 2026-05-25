@@ -8085,8 +8085,16 @@ pub fn build_bspline_basis_1d(
                         })
                     })
                     .collect::<Result<Vec<_>, _>>()?;
+                // `apply_sum_to_zero_constraint_sparse` now returns a dense
+                // constrained basis `B_c = B Z` with orthonormal `Z`. The
+                // densification is the honest cost of using an orthonormal
+                // null-space basis (so that `ZZᵀ` is a true projector); the
+                // post-constraint matrix has `k-1` columns, which is the
+                // smooth's typical working dimension, so this stays small.
                 (
-                    DesignMatrix::Sparse(crate::matrix::SparseDesignMatrix::new(constrained_basis)),
+                    DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Arc::new(
+                        constrained_basis,
+                    ))),
                     transformed_candidates,
                     Some(z),
                 )
@@ -23060,10 +23068,27 @@ pub fn apply_sum_to_zero_constraint(
     Ok((constrained, z))
 }
 
+/// Build a sum-to-zero reparametrization for a sparse basis.
+///
+/// Returns `(B_c, Z)` where `Z` is an **orthonormal** basis for `null(c^T)`
+/// with `c = B^T w` (the weighted column sums of `B`), and
+/// `B_c = B Z` is the constrained design matrix.
+///
+/// Because `Z` has orthonormal columns, `Z Zᵀ` is the canonical
+/// orthogonal projector onto `null(cᵀ)` — i.e. it is idempotent and
+/// `cᵀ Z Zᵀ = 0`, so any vector projected by `Z Zᵀ` still satisfies the
+/// sum-to-zero constraint. The previous "drop the pivot column" trick
+/// produced a valid null-space basis but with non-orthogonal, non-unit
+/// columns, breaking the projector identities downstream code may rely on.
+///
+/// `Z` is dense `(k × (k-1))`; consequently `B_c = B Z` is returned as a
+/// dense matrix even when `B` is sparse. Callers that previously relied on
+/// the constrained basis being sparse should wrap the result in
+/// [`DenseDesignMatrix`].
 pub fn apply_sum_to_zero_constraint_sparse(
     basis_matrix: &SparseColMat<usize, f64>,
     weights: Option<ArrayView1<f64>>,
-) -> Result<(SparseColMat<usize, f64>, Array2<f64>), BasisError> {
+) -> Result<(Array2<f64>, Array2<f64>), BasisError> {
     let n = basis_matrix.nrows();
     let k = basis_matrix.ncols();
     if k < 2 {
@@ -23083,6 +23108,8 @@ pub fn apply_sum_to_zero_constraint_sparse(
         None => Array1::<f64>::ones(n),
     };
 
+    // c = Bᵀ w (k-vector of weighted column sums) computed directly from the
+    // CSC storage.
     let mut c = Array1::<f64>::zeros(k);
     let (symbolic, values) = basis_matrix.parts();
     let col_ptr = symbolic.col_ptr();
@@ -23095,86 +23122,57 @@ pub fn apply_sum_to_zero_constraint_sparse(
         c[col] = sum;
     }
 
-    let (pivot, pivot_abs) = c
-        .iter()
-        .enumerate()
-        .map(|(idx, value)| (idx, value.abs()))
-        .max_by(|lhs, rhs| lhs.1.total_cmp(&rhs.1))
-        .expect("non-empty constraint vector");
-    if pivot_abs <= 1e-12 {
-        return Ok((basis_matrix.clone(), Array2::eye(k)));
+    // Orthonormal basis for null(cᵀ) via a column-pivoted QR of the k×1
+    // constraint matrix — exactly the same construction used by the dense
+    // path `apply_sum_to_zero_constraint`. This guarantees ZᵀZ = I and hence
+    // that ZZᵀ is the canonical orthogonal projector onto null(cᵀ).
+    let mut c_mat = Array2::<f64>::zeros((k, 1));
+    c_mat.column_mut(0).assign(&c);
+    let (z, rank) =
+        rrqr_nullspace_basis(&c_mat, default_rrqr_rank_alpha()).map_err(BasisError::LinalgError)?;
+    if rank >= k {
+        return Err(BasisError::ConstraintNullspaceCollapsed {
+            site: "apply_sum_to_zero_constraint_sparse",
+            cross_rank: rank,
+            coeff_dim: k,
+            cross_frobenius: c.iter().map(|v| v * v).sum::<f64>().sqrt(),
+            constrained_gram_max_eigenvalue: f64::NAN,
+            constrained_gram_min_eigenvalue: f64::NAN,
+            spectral_tolerance: f64::NAN,
+        });
     }
-
-    let pivot_value = c[pivot];
-    let pivot_start = col_ptr[pivot];
-    let pivot_end = col_ptr[pivot + 1];
-    let pivot_rows = &row_idx[pivot_start..pivot_end];
-    let pivot_vals = &values[pivot_start..pivot_end];
-
-    let mut z = Array2::<f64>::zeros((k, k - 1));
-    let mut triplets: Vec<Triplet<usize, usize, f64>> =
-        Vec::with_capacity(values.len() + (k - 1) * pivot_rows.len());
-
-    let mut out_col = 0usize;
-    for src_col in 0..k {
-        if src_col == pivot {
-            continue;
-        }
-        z[[src_col, out_col]] = 1.0;
-        let alpha = -c[src_col] / pivot_value;
-        z[[pivot, out_col]] = alpha;
-
-        let src_start = col_ptr[src_col];
-        let src_end = col_ptr[src_col + 1];
-        let src_rows = &row_idx[src_start..src_end];
-        let src_vals = &values[src_start..src_end];
-
-        let mut src_pos = 0usize;
-        let mut pivot_pos = 0usize;
-        while src_pos < src_rows.len() || pivot_pos < pivot_rows.len() {
-            let (row, value) = match (src_rows.get(src_pos), pivot_rows.get(pivot_pos)) {
-                (Some(&src_row), Some(&pivot_row)) if src_row == pivot_row => {
-                    let value = src_vals[src_pos] + alpha * pivot_vals[pivot_pos];
-                    src_pos += 1;
-                    pivot_pos += 1;
-                    (src_row, value)
-                }
-                (Some(&src_row), Some(&pivot_row)) if src_row < pivot_row => {
-                    let value = src_vals[src_pos];
-                    src_pos += 1;
-                    (src_row, value)
-                }
-                (Some(_), Some(&pivot_row)) => {
-                    let value = alpha * pivot_vals[pivot_pos];
-                    pivot_pos += 1;
-                    (pivot_row, value)
-                }
-                (Some(&src_row), None) => {
-                    let value = src_vals[src_pos];
-                    src_pos += 1;
-                    (src_row, value)
-                }
-                (None, Some(&pivot_row)) => {
-                    let value = alpha * pivot_vals[pivot_pos];
-                    pivot_pos += 1;
-                    (pivot_row, value)
-                }
-                // The `while` condition ensures at least one side still has
-                // elements; this arm is therefore inert. We `break` defensively
-                // rather than panicking so a future refactor that loosens the
-                // loop guard still terminates cleanly.
-                (None, None) => break,
-            };
-            if value.abs() > 1e-12 {
-                triplets.push(Triplet::new(row, out_col, value));
+    if rank == 0 {
+        // Constraint is numerically zero (e.g. weights produced cᵀ ≈ 0):
+        // the basis already lies in null(cᵀ), so the constrained basis is
+        // the dense materialization of B with Z = I.
+        let mut dense_b = Array2::<f64>::zeros((n, k));
+        for col in 0..k {
+            for idx in col_ptr[col]..col_ptr[col + 1] {
+                dense_b[[row_idx[idx], col]] = values[idx];
             }
         }
-        out_col += 1;
+        return Ok((dense_b, Array2::eye(k)));
     }
 
-    let constrained = SparseColMat::try_new_from_triplets(n, k - 1, &triplets).map_err(|_| {
-        BasisError::SparseCreation("failed to build constrained sparse basis".into())
-    })?;
+    // Constrained basis B_c = B Z. Iterate columns of Z and apply B as a
+    // sparse-times-dense-vector product per column. Result is dense
+    // `(n × (k-1))` since Z is dense.
+    let kc = z.ncols();
+    let mut constrained = Array2::<f64>::zeros((n, kc));
+    for out_col in 0..kc {
+        let z_col = z.column(out_col);
+        let mut dst = constrained.column_mut(out_col);
+        for src_col in 0..k {
+            let coeff = z_col[src_col];
+            if coeff == 0.0 {
+                continue;
+            }
+            for idx in col_ptr[src_col]..col_ptr[src_col + 1] {
+                dst[row_idx[idx]] += coeff * values[idx];
+            }
+        }
+    }
+
     Ok((constrained, z))
 }
 
