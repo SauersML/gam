@@ -9,8 +9,7 @@ fn bug_thin_plate_workspace_variant_mismatch() {
     let data = Array2::from_shape_vec(
         (8, 2),
         vec![
-            -1.0, -1.0, -0.5, 0.25, 0.0, 0.0, 0.2, -0.3, 0.75, 0.5, 1.0, -0.25, 1.5, 1.0,
-            -1.2, 0.9,
+            -1.0, -1.0, -0.5, 0.25, 0.0, 0.0, 0.2, -0.3, 0.75, 0.5, 1.0, -0.25, 1.5, 1.0, -1.2, 0.9,
         ],
     )
     .expect("shape");
@@ -32,7 +31,11 @@ fn bug_thin_plate_workspace_variant_mismatch() {
     let a = no_ws.design.to_dense();
     let b = with_ws.design.to_dense();
     assert_eq!(a.dim(), b.dim(), "design shape mismatch");
-    assert_eq!(no_ws.penalties.len(), with_ws.penalties.len(), "penalty count mismatch");
+    assert_eq!(
+        no_ws.penalties.len(),
+        with_ws.penalties.len(),
+        "penalty count mismatch"
+    );
 
     let max_design_diff = a
         .iter()

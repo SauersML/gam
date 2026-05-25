@@ -72,7 +72,12 @@ fn block_metric_norms(
         .collect()
 }
 
-fn truncate_block_metric(delta: &mut Array1<f64>, ranges: &[(usize, usize)], metric_diag: &Array1<f64>, radii: &[f64]) {
+fn truncate_block_metric(
+    delta: &mut Array1<f64>,
+    ranges: &[(usize, usize)],
+    metric_diag: &Array1<f64>,
+    radii: &[f64],
+) {
     for (block_idx, (start, end)) in ranges.iter().copied().enumerate() {
         let metric = metric_diag.slice(ndarray::s![start..end]).to_owned();
         let mut block = delta.slice_mut(ndarray::s![start..end]);
@@ -290,7 +295,11 @@ fn joint_newton_isotropic_l2_tr_produces_production_linearized_rate_stall() {
         "raw concatenated L2 should reproduce the stall; got linearized_rel={linearized_rel:.3e}",
     );
 
-    let ranges = vec![(0, TIME_W), (TIME_W, TIME_W + MARG_W), (TIME_W + MARG_W, h.nrows())];
+    let ranges = vec![
+        (0, TIME_W),
+        (TIME_W, TIME_W + MARG_W),
+        (TIME_W + MARG_W, h.nrows()),
+    ];
     let metric_diag = h.diag().to_owned();
     let full_block_norms = block_metric_norms(&delta_hat, &ranges, &metric_diag);
     let mut fixed_delta = delta_hat.clone();
