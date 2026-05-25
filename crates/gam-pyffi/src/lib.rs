@@ -17521,8 +17521,8 @@ impl IvaeRidgeMeanGauge {
         aux: &Bound<'_, PyAny>,
         weight: &Bound<'_, PyAny>,
         n_eff: &Bound<'_, PyAny>,
-        ridge_eps: &Bound<'_, PyAny>,
-        learnable: &Bound<'_, PyAny>,
+        ridge_eps: f64,
+        learnable: bool,
         target: PyObject,
     ) -> PyResult<Self> {
         let builtins = py.import("builtins")?;
@@ -17531,11 +17531,6 @@ impl IvaeRidgeMeanGauge {
             .call1((weight,))?
             .extract::<f64>()?;
         let n_eff = builtins.getattr("int")?.call1((n_eff,))?.extract::<i64>()?;
-        let ridge_eps = builtins
-            .getattr("float")?
-            .call1((ridge_eps,))?
-            .extract::<f64>()?;
-        let learnable = learnable.is_truthy()?;
         let aux = aux_conditional_prior_float_array(py, aux)?;
         validate_ivae_ridge_mean_gauge_aux(&aux, weight, n_eff, ridge_eps)?;
         Ok(Self {
@@ -18062,7 +18057,7 @@ impl AuxConditionalPriorPenalty {
         lambda_per_row: &Bound<'_, PyAny>,
         weight: &Bound<'_, PyAny>,
         n_eff: &Bound<'_, PyAny>,
-        learnable: &Bound<'_, PyAny>,
+        learnable: bool,
         target: PyObject,
     ) -> PyResult<Self> {
         let builtins = py.import("builtins")?;
@@ -18071,7 +18066,6 @@ impl AuxConditionalPriorPenalty {
             .call1((weight,))?
             .extract::<f64>()?;
         let n_eff = builtins.getattr("int")?.call1((n_eff,))?.extract::<i64>()?;
-        let learnable = learnable.is_truthy()?;
         let lambda_per_row = aux_conditional_prior_float_array(py, lambda_per_row)?;
         validate_aux_conditional_prior_lambda(&lambda_per_row, weight, n_eff)?;
         Ok(Self {
