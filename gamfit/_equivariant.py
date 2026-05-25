@@ -35,19 +35,36 @@ residual semantic structure unsupervisedly in the free block.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Literal
+from dataclasses import dataclass
+from typing import Literal
 
 import numpy as np
 
+from ._binding import rust_module
 from .smooth import Smooth
-from ._penalties import _validate_weight, _add_weight_schedule, ScalarWeightSchedule
+from ._penalties import _validate_weight
 
 
 GroupName = Literal["SO2", "SO3", "R1", "Trivial"]
 
 GROUP_DIM = {"SO2": 1, "SO3": 3, "R1": 1, "Trivial": 0}
 GROUP_REP_DIM = {"SO2": 2, "SO3": 3, "R1": 1, "Trivial": 1}
+
+
+def _scalar_weight(weight: float | str, name: str) -> float:
+    if not isinstance(weight, (int, float)):
+        raise TypeError(f"{name} must be a scalar for direct evaluation")
+    value = float(weight)
+    if not np.isfinite(value) or value <= 0.0:
+        raise ValueError(f"{name} must be finite and > 0, got {value}")
+    return value
+
+
+def _nonnegative_scalar(value: float, name: str) -> float:
+    out = float(value)
+    if not np.isfinite(out) or out < 0.0:
+        raise ValueError(f"{name} must be finite and >= 0, got {out}")
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -186,7 +203,7 @@ class EquivariantPenalty:
     ----------
     target : str | int
         Name or index of the LieAtom block this penalty governs.
-    weight : float | ScalarWeightSchedule
+    weight : float | "auto"
         λ_eq for the commutator residual.
     ard_weight : float
         Weight on the bandwidth ARD term. Set to 0 to disable.
@@ -195,14 +212,13 @@ class EquivariantPenalty:
         constructed independently of the LieAtom spec).
     """
     target: str | int
-    weight: float | ScalarWeightSchedule = 1.0
+    weight: float | str = 1.0
     ard_weight: float = 1e-3
     group: GroupName = "SO2"
-    _weight_schedule: dict[str, Any] | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         _validate_weight(self.weight, "EquivariantPenalty.weight")
-        _validate_weight(self.ard_weight, "EquivariantPenalty.ard_weight")
+        _nonnegative_scalar(self.ard_weight, "EquivariantPenalty.ard_weight")
 
     def __repr__(self) -> str:
         return (f"EquivariantPenalty(target={self.target!r}, weight={self.weight!r}, "
@@ -217,28 +233,17 @@ class EquivariantPenalty:
         log_bandwidth: np.ndarray | None = None,    # (A,)
     ) -> float:
         """Scalar penalty value. Used by the analytic-penalty REML scorer."""
-        A, D, R = W.shape
-        Rg = rho(self.group, g)                                    # (B, A, R, R)
-        # rotated frame, ambient: W_rot[b,a,:,:] = W[a] @ Rg[b,a]
-        W_rot = np.einsum("adr,bars->bads", W, Rg)                 # (B, A, D, R)
-        WtW = np.einsum("adr,ads->ars", W, W) + 1e-6 * np.eye(R)[None]
-        # solve per-atom WtW X = W^T W_rot
-        M = np.einsum("adr,bads->bars", W, W_rot)                  # (B, A, R, R)
-        # use direct solve per (b, a)
-        try:
-            X = np.linalg.solve(WtW[None].repeat(M.shape[0], axis=0).reshape(-1, R, R),
-                                M.reshape(-1, R, R)).reshape(M.shape)
-        except np.linalg.LinAlgError:
-            X = np.linalg.pinv(WtW[None]) @ M
-        proj = np.einsum("adr,bars->bads", W, X)
-        resid = W_rot - proj                                       # (B, A, D, R)
-        r0 = resid[..., 0]                                         # (B, A, D)
-        sq = (r0 ** 2).sum(-1)                                     # (B, A)
-        comm = 0.5 * (z * sq).mean()
-        if log_bandwidth is not None and self.ard_weight > 0:
-            bw = 0.5 * np.log(1e-3 + log_bandwidth ** 2).sum()
-            return float(comm + self.ard_weight * bw)
-        return float(comm)
+        return float(
+            rust_module().equivariant_penalty_value(
+                self.group,
+                np.asarray(W, dtype=np.float64),
+                np.asarray(g, dtype=np.float64),
+                np.asarray(z, dtype=np.float64),
+                _scalar_weight(self.weight, "EquivariantPenalty.weight"),
+                _nonnegative_scalar(self.ard_weight, "EquivariantPenalty.ard_weight"),
+                None if log_bandwidth is None else np.asarray(log_bandwidth, dtype=np.float64),
+            )
+        )
 
 
 # ---------------------------------------------------------------------------

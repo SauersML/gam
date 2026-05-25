@@ -20,13 +20,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal, Sequence
 
-# F-threshold below which mode="auto" uses joint additive REML and above
-# which it falls back to per-atom independent REML. Joint scales as
-# O((F * M_k)^3) for the inner Cholesky; independent scales as
-# O(F * M_k^3). At F ≈ 64 with typical M_k ≈ 8-16, joint is still
-# comfortable; at F ≈ 1024+ (typical SAE) it becomes infeasible.
-_AUTO_MODE_F_THRESHOLD = 64
-
 FitMode = Literal["joint", "independent", "auto"]
 
 import torch
@@ -43,6 +36,13 @@ from ..smooth import (
     TensorBSpline,
 )
 from ._basis import bspline_basis, duchon_basis, periodic_spline_curve_basis, sphere_basis
+from ._dispatch import (
+    resolve_fit_mode,
+    shape_kind_for_smooths_arg,
+    validate_2d_shape,
+    validate_points_list_length,
+    validate_smooths_arg,
+)
 from ._reml import (
     AdditiveRemlOutput,
     GaussianRemlOutput,
@@ -102,10 +102,10 @@ def _to_tensor(value, like: torch.Tensor) -> torch.Tensor:
 
 def _coerce_2d(t: torch.Tensor, name: str) -> torch.Tensor:
     """Promote ``(N,)`` to ``(N, 1)`` and validate 2D shape."""
-    if t.dim() == 1:
+    ndim = t.dim()
+    if ndim == 1:
         return t.unsqueeze(1)
-    if t.dim() != 2:
-        raise ValueError(f"{name} must be 1D or 2D, got {t.dim()}D shape {tuple(t.shape)}")
+    validate_2d_shape(name, ndim, tuple(t.shape))
     return t
 
 
@@ -589,25 +589,7 @@ def fit(
     # the torch path only for a single 1D smooth (BSpline / Duchon with
     # d==1); a multi-smooth list with constraints, or constrained
     # multivariate smooths, are rejected with a clear error.
-    def _shape_kind(s: Smooth) -> str | None:
-        sc = getattr(s, "shape_constraint", None)
-        if sc is None:
-            return None
-        sc_str = str(sc).lower()
-        return None if sc_str == "none" else sc_str
-
-    if isinstance(smooths, Smooth):
-        _shape = _shape_kind(smooths)
-    else:
-        kinds = [_shape_kind(s) for s in smooths if isinstance(s, Smooth)]
-        if any(k is not None for k in kinds):
-            raise NotImplementedError(
-                "shape_constraint on the torch fit path is currently only "
-                "supported for a single Smooth (not a list). For joint "
-                "multi-smooth additive fits with shape constraints use "
-                "gamfit.fit(df, formula, constraints={...})."
-            )
-        _shape = None
+    _shape = shape_kind_for_smooths_arg(smooths)
 
     if isinstance(smooths, Smooth) and _shape is not None:
         if isinstance(points, (list, tuple)):
@@ -667,41 +649,22 @@ def fit(
             smooths=[smooths],
         )
 
-    smooths_list = list(smooths)
-    if len(smooths_list) == 0:
-        raise ValueError("smooths must contain at least one Smooth")
-    if not all(isinstance(s, Smooth) for s in smooths_list):
-        bad = [type(s).__name__ for s in smooths_list if not isinstance(s, Smooth)]
-        raise TypeError(f"all entries must be Smooth, got: {bad}")
+    smooths_list = validate_smooths_arg(smooths)
 
     # Per-smooth points
     if isinstance(points, (list, tuple)):
         points_list = list(points)
-        if len(points_list) != len(smooths_list):
-            raise ValueError(
-                f"got {len(points_list)} points tensors but {len(smooths_list)} smooths"
-            )
+        validate_points_list_length(len(points_list), len(smooths_list))
     else:
         # Same points for every smooth.
         points_list = [points] * len(smooths_list)
 
-    # Mode dispatch — F=100K SAEs route through `independent`; small-F
-    # diagnostics route through `joint`. ``auto`` thresholds at
-    # _AUTO_MODE_F_THRESHOLD; multi-output (D > 1) forces independent
-    # because the multi-block joint backward is currently single-output.
+    # Mode dispatch — large-F additive fits route through `independent`;
+    # small-F diagnostics route through `joint`. ``auto`` thresholding and
+    # joint multi-output rejection are pure dispatch decisions.
     F = len(smooths_list)
     D = response_f64.shape[1]
-    if mode == "auto":
-        effective_mode: FitMode = (
-            "joint" if (F <= _AUTO_MODE_F_THRESHOLD and D == 1) else "independent"
-        )
-    else:
-        effective_mode = mode
-    if effective_mode == "joint" and D > 1:
-        raise NotImplementedError(
-            "mode='joint' currently requires single-output response (D=1); "
-            f"got D={D}. Use mode='independent' or 'auto' for multi-output."
-        )
+    effective_mode = resolve_fit_mode(mode, F, D)
 
     if effective_mode == "independent":
         return _fit_independent(

@@ -63,18 +63,18 @@ class PredictionError(GamError):
 
 
 def map_exception(exc: BaseException) -> BaseException:
-    from ._binding import RustExtensionUnavailableError
+    from ._binding import RustExtensionUnavailableError, rust_module
 
     if isinstance(exc, RustExtensionUnavailableError):
         return exc
     if isinstance(exc, GamError):
         return exc
     message = str(exc)
-    lower = message.lower()
-    if "formula" in lower or "parse" in lower:
+    kind = rust_module().classify_exception_message(message)
+    if kind == "formula":
         return FormulaError(message)
-    if "schema" in lower or "missing required column" in lower or "unknown column" in lower:
+    if kind == "schema_mismatch":
         return SchemaMismatchError(message)
-    if "prediction" in lower or "predict" in lower:
+    if kind == "prediction":
         return PredictionError(message)
     return GamError(message)
