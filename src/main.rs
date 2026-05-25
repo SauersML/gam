@@ -102,8 +102,8 @@ use gam::term_builder::{
 };
 use gam::transformation_normal::TransformationNormalConfig;
 use gam::types::{
-    InverseLink, LikelihoodScaleMetadata, LikelihoodSpec, LinkComponent, LinkFunction,
-    LogLikelihoodNormalization, MixtureLinkSpec, ResponseFamily, SasLinkSpec, WigglePenaltyConfig,
+    InverseLink, LikelihoodScaleMetadata, LikelihoodSpec, LinkFunction, LogLikelihoodNormalization,
+    MixtureLinkSpec, ResponseFamily, SasLinkSpec, WigglePenaltyConfig,
 };
 use gam::{
     BernoulliMarginalSlopeFitRequest, BinomialLocationScaleFitRequest, FitRequest, FitResult,
@@ -15037,16 +15037,18 @@ mod tests {
         // they lack a `LinkFunction` representative, so the previous routing through
         // a degenerate single-component MixtureLinkSpec violated the mixture-link
         // anchor invariant enforced by `validate_mixturespec`.
-        let err = parse_survival_inverse_link(&args)
-            .expect_err("loglog survival link must be rejected without a LinkFunction representative");
+        let err = parse_survival_inverse_link(&args).expect_err(
+            "loglog survival link must be rejected without a LinkFunction representative",
+        );
         assert!(
             err.contains("loglog") || err.to_ascii_lowercase().contains("unsupported"),
             "expected loglog rejection error, got: {err}"
         );
 
         args.link = Some("cauchit".to_string());
-        let err = parse_survival_inverse_link(&args)
-            .expect_err("cauchit survival link must be rejected without a LinkFunction representative");
+        let err = parse_survival_inverse_link(&args).expect_err(
+            "cauchit survival link must be rejected without a LinkFunction representative",
+        );
         assert!(
             err.contains("cauchit") || err.to_ascii_lowercase().contains("unsupported"),
             "expected cauchit rejection error, got: {err}"

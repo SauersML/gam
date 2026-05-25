@@ -2628,7 +2628,7 @@ impl LatentCoordDerivativeOp {
     }
 
     fn materialize_dense(&self) -> &Array2<f64> {
-        self.cached_dense.get_or_init(|| {
+        self.cached_dense.get_or_compute(|| {
             let local = self.materialize_local();
             let mut out = Array2::<f64>::zeros((local.nrows(), self.total_dim));
             out.slice_mut(s![.., self.global_range.clone()])
@@ -2687,7 +2687,7 @@ impl ImplicitDerivativeOp {
     }
 
     fn materialize_dense(&self) -> &Array2<f64> {
-        self.cached_dense.get_or_init(|| {
+        self.cached_dense.get_or_compute(|| {
             let local = self.materialize_local();
             let mut out = Array2::<f64>::zeros((local.nrows(), self.total_dim));
             out.slice_mut(s![.., self.global_range.clone()])

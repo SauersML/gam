@@ -9171,7 +9171,7 @@ impl TransformationNormalPsiDhMatrixFreeOperator {
     }
 
     fn dense_matrix(&self) -> &Array2<f64> {
-        self.dense_cache.get_or_init(|| {
+        self.dense_cache.get_or_compute(|| {
             self.family
                 .scop_psi_hessian_directional_derivative(
                     &self.beta,

@@ -132,7 +132,7 @@ impl ClosedFormPenaltyOperator {
 
     /// Return the cached dense form, building it on first call.
     fn ensure_dense(&self) -> &Array2<f64> {
-        self.cached_dense.get_or_init(|| self.build_dense())
+        self.cached_dense.get_or_compute(|| self.build_dense())
     }
 
     /// Number of raw kernel rows (K).
