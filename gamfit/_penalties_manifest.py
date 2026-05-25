@@ -67,6 +67,12 @@ PENALTY_MANIFEST = (
         "row_block_diagonal": False,
     },
     {
+        "kind": "monotonicity",
+        "rust": "Monotonicity:MonotonicityPenalty",
+        "python": "MonotonicityPenalty",
+        "row_block_diagonal": False,
+    },
+    {
         "kind": "nested_prefix",
         "rust": "NestedPrefix:NestedPrefixPenalty",
         "python": "NestedPrefixPenalty",

@@ -1536,6 +1536,7 @@ mod tests {
             .expect("block-factored pseudo-logdet");
         let assembled = PenaltyPseudologdet::from_assembled_with_nullity(
             array![[1.0 + ridge, 0.0], [0.0, ridge]],
+            Some(ridge),
             Some(1),
         )
         .expect("assembled pseudo-logdet with active structural nullity");
@@ -1583,6 +1584,7 @@ mod tests {
                 [0.0, ridge, 0.0],
                 [0.0, 0.0, ridge],
             ],
+            Some(ridge),
             Some(2),
         )
         .expect("assembled pseudo-logdet with active structural nullity");

@@ -14720,6 +14720,12 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         match exact_newton_joint_gradient_from_eval(&cached_eval, specs, &states)? {
             Some(gradient) => {
                 let block_constraints = collect_block_linear_constraints(family, &states, specs)?;
+                let local_total_p: usize = specs.iter().map(|spec| spec.design.ncols()).sum();
+                let active_set_rows_total: usize = cached_active_sets
+                    .iter()
+                    .map(|maybe| maybe.as_ref().map(|v| v.len()).unwrap_or(0))
+                    .sum();
+                let free_rank_at_cert = local_total_p.saturating_sub(active_set_rows_total);
                 exact_newton_joint_projected_kkt_residual_for_ift_from_gradient(
                     &gradient,
                     specs,
@@ -14730,6 +14736,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     &block_constraints,
                     Some(cached_active_sets.as_slice()),
                 )?
+                .map(|r| r.with_metadata(residual_tol, free_rank_at_cert))
             }
             None => None,
         }

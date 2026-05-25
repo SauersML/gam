@@ -2418,6 +2418,7 @@ pub fn term_from_padded_blocks_with_mode(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use approx::assert_abs_diff_eq;
     use ndarray::array;
 
     #[test]
@@ -3049,6 +3050,52 @@ mod tests {
         assert_eq!(diag.len(), n * k);
         assert!(grad.iter().all(|v| v.is_finite()));
         assert!(diag.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn jumprelu_assignment_prior_hessian_diag_is_psd_over_logit_sweep() {
+        let n = 6usize;
+        let k = 2usize;
+        let temperature = 0.35_f64;
+        let threshold = 0.1_f64;
+        let logits = Array2::<f64>::from_shape_vec(
+            (n, k),
+            vec![-2.0, -0.2, 0.0, 0.05, 0.1, 0.15, 0.4, 0.9, 1.5, 2.5, 4.0, 6.0],
+        )
+        .expect("valid logit grid");
+        let coords: Vec<Array2<f64>> = (0..k).map(|_| Array2::<f64>::zeros((n, 1))).collect();
+        let manifolds = vec![LatentManifold::Circle; k];
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            logits.clone(),
+            coords,
+            manifolds,
+            AssignmentMode::jumprelu(temperature, threshold),
+        )
+        .expect("valid JumpReLU assignment");
+        let rho = SaeManifoldRho::new(0.7_f64.ln(), -6.0, vec![Array1::<f64>::zeros(1); k]);
+        let (grad, diag) = assignment_prior_grad_hdiag(&assignment, &rho)
+            .expect("JumpReLU assignment prior hessian diag");
+        let inv_tau = 1.0 / temperature;
+        let inv_tau2 = inv_tau * inv_tau;
+        let sparsity_strength = rho.log_lambda_sparse.exp();
+
+        assert_eq!(grad.len(), n * k);
+        assert_eq!(diag.len(), n * k);
+        for (idx, &entry) in diag.iter().enumerate() {
+            let logit = logits[[idx / k, idx % k]];
+            let expected = if logit > threshold {
+                let activation = sigmoid_scalar(logit * inv_tau);
+                let slope = activation * (1.0 - activation);
+                sparsity_strength * slope * slope * inv_tau2
+            } else {
+                0.0
+            };
+            assert!(
+                entry.is_finite() && entry >= 0.0,
+                "JumpReLU gated hessian_diag majorizer must be finite and PSD at index {idx}; entry={entry}"
+            );
+            assert_abs_diff_eq!(entry, expected, epsilon = 1e-12);
+        }
     }
 
     /// Regression test for issue #174: K>=2 periodic atoms with zero-init

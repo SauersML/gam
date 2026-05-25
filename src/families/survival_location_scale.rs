@@ -746,22 +746,95 @@ pub(crate) fn structural_time_coefficient_constraints(
     derivative_offset_exit: &Array1<f64>,
     derivative_guard: f64,
 ) -> Result<Option<LinearInequalityConstraints>, String> {
-    if design_derivative_exit.ncols() == 0 {
-        return Ok(None);
-    }
-    // `Ok(None)` from the lower-bounds helper now means "no structural
-    // ridge available" (e.g. degenerate exit-time design at this candidate);
-    // propagate it as "no constraints" so the seed validation path keeps
-    // moving instead of aborting the whole search ladder.
-    let Some(lower_bounds) = structural_time_coefficient_lower_bounds(
+    time_derivative_guard_constraints(
         design_derivative_exit,
         derivative_offset_exit,
         derivative_guard,
-    )?
-    else {
+    )
+}
+
+fn time_derivative_guard_constraints(
+    design_derivative_exit: &DesignMatrix,
+    derivative_offset_exit: &Array1<f64>,
+    derivative_guard: f64,
+) -> Result<Option<LinearInequalityConstraints>, String> {
+    if design_derivative_exit.nrows() != derivative_offset_exit.len() {
+        return Err(SurvivalLocationScaleError::InvalidConfiguration { reason: format!(
+            "time derivative guard constraints require matching rows/offsets: rows={}, offsets={}",
+            design_derivative_exit.nrows(),
+            derivative_offset_exit.len()
+        ) }.into());
+    }
+    if !derivative_guard.is_finite() || derivative_guard < 0.0 {
+        return Err(SurvivalLocationScaleError::ConstraintViolation {
+            reason: format!(
+                "time derivative guard must be finite and >= 0, got {derivative_guard}"
+            ),
+        }
+        .into());
+    }
+
+    if design_derivative_exit.ncols() == 0 {
+        for (row, &offset) in derivative_offset_exit.iter().enumerate() {
+            if !offset.is_finite() {
+                return Err(SurvivalLocationScaleError::ConstraintViolation { reason: format!(
+                    "time derivative guard constraints require finite derivative offsets; found offset[{row}]={offset}"
+                ) }.into());
+            }
+            if offset + 1e-12 * (1.0 + offset.abs().max(derivative_guard.abs()))
+                < derivative_guard
+            {
+                return Err(SurvivalLocationScaleError::ConstraintViolation { reason: format!(
+                    "time derivative guard is infeasible at row {row}: offset={offset:.3e} < guard={derivative_guard:.3e} with no time coefficients"
+                ) }.into());
+            }
+        }
         return Ok(None);
-    };
-    Ok(lower_bound_constraints(&lower_bounds))
+    }
+
+    let dense = design_derivative_exit.to_dense();
+    let p = dense.ncols();
+    let mut active_rows = Vec::new();
+    for row in 0..dense.nrows() {
+        let offset = derivative_offset_exit[row];
+        if !offset.is_finite() {
+            return Err(SurvivalLocationScaleError::ConstraintViolation { reason: format!(
+                "time derivative guard constraints require finite derivative offsets; found offset[{row}]={offset}"
+            ) }.into());
+        }
+        let mut row_norm_sq = 0.0_f64;
+        for col in 0..p {
+            let value = dense[[row, col]];
+            if !value.is_finite() {
+                return Err(SurvivalLocationScaleError::ConstraintViolation { reason: format!(
+                    "time derivative guard constraints require finite derivative design entries; found row {row}, column {col}"
+                ) }.into());
+            }
+            row_norm_sq += value * value;
+        }
+        let required = derivative_guard - offset;
+        if row_norm_sq <= 1e-24 {
+            if required > 1e-12 * (1.0 + offset.abs().max(derivative_guard.abs())) {
+                return Err(SurvivalLocationScaleError::ConstraintViolation { reason: format!(
+                    "time derivative guard is infeasible at row {row}: zero derivative design row with offset={offset:.3e} < guard={derivative_guard:.3e}"
+                ) }.into());
+            }
+            continue;
+        }
+        active_rows.push(row);
+    }
+
+    if active_rows.is_empty() {
+        return Ok(None);
+    }
+
+    let mut a = Array2::<f64>::zeros((active_rows.len(), p));
+    let mut b = Array1::<f64>::zeros(active_rows.len());
+    for (out_row, &src_row) in active_rows.iter().enumerate() {
+        a.row_mut(out_row).assign(&dense.row(src_row));
+        b[out_row] = derivative_guard - derivative_offset_exit[src_row];
+    }
+    Ok(Some(LinearInequalityConstraints::from_paired(a, b)))
 }
 
 #[derive(Clone)]
@@ -1642,30 +1715,11 @@ impl SurvivalLocationScaleFamily {
                 alpha = alpha.min((slack / -drift).clamp(0.0, 1.0));
             }
         }
-        let coefficient_alpha = if alpha >= 1.0 {
-            1.0
+        if alpha >= 1.0 {
+            Ok(Some(1.0))
         } else {
-            (0.995 * alpha).clamp(0.0, 1.0)
-        };
-        let deriv = self.x_time_deriv.as_ref();
-        if deriv.ncols() == beta.len() {
-            let guard = self.derivative_guard;
-            for row in 0..deriv.nrows() {
-                let row_view = deriv.row(row);
-                let current = self.time_derivative_offset_exit[row] + row_view.dot(beta);
-                let drift = row_view.dot(delta);
-                let slack = current - guard;
-                if slack < -1e-10 {
-                    return Err(SurvivalLocationScaleError::ConstraintViolation { reason: format!(
-                        "survival location-scale current time derivative violates guard at row {row}: slack={slack:.3e}"
-                    ) }.into());
-                }
-                if current + drift < guard {
-                    return Ok(Some(0.0));
-                }
-            }
+            Ok(Some((0.995 * alpha).clamp(0.0, 1.0)))
         }
-        Ok(Some(coefficient_alpha))
     }
 
     fn max_feasible_link_wiggle_step(
