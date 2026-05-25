@@ -872,6 +872,8 @@ fn survival_csv_interpolate(
     sorted_indices: &[usize],
     row_idx: usize,
     query_value: f64,
+    left_value: Option<f64>,
+    right_value: Option<f64>,
 ) -> f64 {
     if query_value.is_nan() {
         return f64::NAN;
@@ -879,9 +881,17 @@ fn survival_csv_interpolate(
     let n_grid = sorted_grid.len();
     let row_offset = row_idx * n_cols;
     if query_value <= sorted_grid[0] {
-        surface_values[row_offset + sorted_indices[0]]
+        if query_value < sorted_grid[0] {
+            left_value.unwrap_or(surface_values[row_offset + sorted_indices[0]])
+        } else {
+            surface_values[row_offset + sorted_indices[0]]
+        }
     } else if query_value >= sorted_grid[n_grid - 1] {
-        surface_values[row_offset + sorted_indices[n_grid - 1]]
+        if query_value > sorted_grid[n_grid - 1] {
+            right_value.unwrap_or(surface_values[row_offset + sorted_indices[n_grid - 1]])
+        } else {
+            surface_values[row_offset + sorted_indices[n_grid - 1]]
+        }
     } else {
         let upper = sorted_grid.partition_point(|grid_value| *grid_value <= query_value);
         let lower = upper - 1;
@@ -923,14 +933,22 @@ fn survival_chunk_iter_collect<'py>(
     people_chunk: usize,
     time_grid_chunk: usize,
 ) -> PyResult<Py<PyArray2<f64>>> {
-    match kind {
-        "hazard" | "cumulative_hazard" | "survival" | "survival_se" => {}
+    // Mirror the asymptotic-extrapolation policy in
+    // `gamfit._survival._SURVIVAL_EXTRAPOLATION`: survival surfaces are
+    // continued to S(t<=0)=1 and S(t->inf)=0 outside the modeled grid, and
+    // cumulative hazard mirrors that via H(t<=0)=0. Hazards and standard
+    // errors have no canonical asymptote, so they keep nearest-endpoint
+    // behavior (signaled by `None`/`None`).
+    let (kind_left_value, kind_right_value): (Option<f64>, Option<f64>) = match kind {
+        "survival" => (Some(1.0), Some(0.0)),
+        "cumulative_hazard" => (Some(0.0), None),
+        "hazard" | "survival_se" => (None, None),
         other => {
             return Err(py_value_error(format!(
                 "unknown survival surface kind '{other}'"
             )));
         }
-    }
+    };
     if people_chunk == 0 {
         return Err(py_value_error("people_chunk must be positive".to_string()));
     }
