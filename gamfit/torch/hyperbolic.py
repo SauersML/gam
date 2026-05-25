@@ -163,7 +163,7 @@ class _PoincareLorentzDecode(torch.autograd.Function):
         rust = rust_module()
         atoms_p, gates, v, tangents = ctx.saved_tensors
         grad_np = _np_f64(grad_x_hat)
-        grad_gates_np, grad_atoms_np = rust.poincare_tangent_decode_backward(
+        grad_gates_np, grad_atoms_np = rust.poincare_lorentz_decode_backward(
             np.ascontiguousarray(atoms_p.numpy()),
             np.ascontiguousarray(gates.numpy()),
             np.ascontiguousarray(v.numpy()),
