@@ -8342,7 +8342,14 @@ fn sae_manifold_fit_inner<'py>(
     let mode = match assignment_kind.as_str() {
         "softmax" => AssignmentMode::softmax(tau),
         "ibp_map" => AssignmentMode::ibp_map(tau, alpha, learnable_alpha),
-        "jumprelu" => AssignmentMode::jumprelu(tau, tau),
+        // JumpReLU threshold lives in raw-logit space; coupling it to `tau`
+        // (a temperature on the same logits) is unprincipled and creates a
+        // dead-on-arrival fit when the initial logits sit at or below `tau`,
+        // because both the data-fit JVP and the sparsity prior gradient gate
+        // through `logit > threshold`. A fixed zero threshold preserves the
+        // documented JumpReLU semantics (only logits above zero activate)
+        // while letting positive initial logits seed gradient flow.
+        "jumprelu" => AssignmentMode::jumprelu(tau, 0.0),
         _ => {
             return Err(py_value_error(format!(
                 "assignment_kind must be one of 'softmax', 'ibp_map', or 'jumprelu'; got {assignment_kind}"
@@ -9212,7 +9219,20 @@ fn sae_manifold_fit_auto<'py>(
     let m_max = basis_sizes.iter().copied().max().unwrap_or(1).max(1);
     let p_out = z_view.ncols();
     let decoder_coefficients = Array3::<f64>::zeros((k_atoms, m_max, p_out));
-    let initial_logits = Array2::<f64>::zeros((n_obs, k_atoms));
+    // JumpReLU gates strictly on `logit > threshold` (threshold = 0.0 in the
+    // production inner driver). Zero-initialised logits would leave every
+    // gate closed at step 0, making the data-fit Jacobian, the sparsity
+    // prior gradient, and the assignment-weighted decoder gradient all zero
+    // simultaneously — the fit cannot escape that fixed point. Seed JumpReLU
+    // runs with a small positive constant so every atom starts active and
+    // the fit can learn which atoms to prune. Softmax (translation-invariant)
+    // and IBP-MAP (uses sigmoid prior with stick-breaking) are unaffected by
+    // a uniform logit shift, so zero remains the natural init for those.
+    let initial_logits = if assignment_kind == "jumprelu" {
+        Array2::<f64>::from_elem((n_obs, k_atoms), 1.0)
+    } else {
+        Array2::<f64>::zeros((n_obs, k_atoms))
+    };
     let result_dict = sae_manifold_fit_inner(
         py,
         z_view,

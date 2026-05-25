@@ -19,22 +19,23 @@ when to use which.
 
 ### Joint additive REML
 Assembles `Z = [diag(a_1) X_1 | ... | diag(a_F) X_F]` and Choleskies the
-joint `(F·M_k) × (F·M_k)` inner Hessian. Per-smooth `λ_k` are jointly
-selected by REML's outer Newton iteration with the F×F outer Hessian
-factored together. Statistically the most efficient — atoms see each
-other through the joint design.
+joint `(Σ_k M_k) × (Σ_k M_k)` inner Hessian. Per-smooth `λ_k` are
+jointly selected by REML's outer Newton iteration with the F×F outer
+Hessian factored together. Statistically the most efficient — atoms see
+each other through the joint design.
 
-Cost: `O((F · M_k)³)` per inner Cholesky, `O(F³)` per outer Newton step.
+Cost: `O((Σ_k M_k)³)` per inner Cholesky, `O(F³)` per outer Newton step.
 Feasible for `F ≲ 64`. Infeasible past `F ≳ 1000` — the inner Hessian
-becomes a `(F · M_k)²` dense matrix.
+becomes a `(Σ_k M_k)²` dense matrix.
 
 ### Per-atom independent REML
 For each smooth k, run a separate single-smooth REML fit. Each atom gets
 its own `λ_k` chosen independently of the others. Per-atom fitted
 contributions are summed.
 
-Cost: `O(F · M_k³)` — linear in F. Multi-output `D > 1` supported natively
-because the underlying single-smooth REML primitive supports it.
+Cost: `O(Σ_k M_k³)` — linear in F for fixed per-smooth width. Multi-output
+`D > 1` supported natively because the underlying single-smooth REML
+primitive supports it.
 
 Mathematical caveat: per-atom λ_k are treated as independent. Under
 **TopK sparse gating in an SAE** — where most atoms are zero per row, so
@@ -97,7 +98,8 @@ CPU core; server-class CPUs are typically 2-5x faster.
 | 1024  | 64   | 256  | independent   | 0.35    |
 | 4096  | 64   | 256  | independent   | 1.36    |
 
-Cost scales linearly in F (as predicted by O(F · M_k³)).
+Cost scales linearly in F for fixed per-smooth width (as predicted by
+O(Σ_k M_k³)).
 
 ## Future work: sparse joint REML
 
