@@ -3295,15 +3295,18 @@ fn run_predict_survival(
     noise_offset: &Array1<f64>,
 ) -> Result<(), String> {
     progress.set_stage("predict", "building survival prediction design");
-    let entryname = model
+    // `survival_entry == None` means the training response was the
+    // right-censored shorthand `Surv(time, event)`; entry times are
+    // synthesized as zero at prediction time too.
+    let entry_col: Option<usize> = model
         .survival_entry
-        .as_ref()
-        .ok_or_else(|| "survival model missing entry column metadata".to_string())?;
+        .as_deref()
+        .map(|name| resolve_role_col(col_map, name, "entry"))
+        .transpose()?;
     let exitname = model
         .survival_exit
         .as_ref()
         .ok_or_else(|| "survival model missing exit column metadata".to_string())?;
-    let entry_col = resolve_role_col(col_map, entryname, "entry")?;
     let exit_col = resolve_role_col(col_map, exitname, "exit")?;
     let termspec = resolve_termspec_for_prediction(
         &model.resolved_termspec,
@@ -3328,7 +3331,8 @@ fn run_predict_survival(
     let mut age_entry = Array1::<f64>::zeros(n);
     let mut age_exit = Array1::<f64>::zeros(n);
     for i in 0..n {
-        let (t0, t1) = normalize_survival_time_pair(data[[i, entry_col]], data[[i, exit_col]], i)?;
+        let entry_val = entry_col.map_or(0.0, |idx| data[[i, idx]]);
+        let (t0, t1) = normalize_survival_time_pair(entry_val, data[[i, exit_col]], i)?;
         age_entry[i] = t0;
         age_exit[i] = t1;
     }
@@ -4201,7 +4205,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     let mut progress = gam::visualizer::VisualizerSession::new(true);
     let survival_total_steps = if args.out.is_some() { 5 } else { 4 };
     progress.start_workflow("Survival Fit", survival_total_steps);
-    let response_expr = format!("Surv({}, {}, {})", args.entry, args.exit, args.event);
+    let response_expr = surv_response_expr(args.entry.as_deref(), &args.exit, &args.event);
     let formula = format!("{response_expr} ~ {}", args.formula);
     let parsed = parse_formula(&formula)?;
     progress.set_stage("fit", "loading survival data");
@@ -4210,7 +4214,13 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     progress.advance_workflow(1);
     let col_map = ds.column_map();
 
-    let entry_col = resolve_role_col(&col_map, &args.entry, "entry")?;
+    // `entry_col == None` is the right-censored shorthand `Surv(time, event)`:
+    // entry times are synthesized as zero, no column lookup required.
+    let entry_col: Option<usize> = args
+        .entry
+        .as_deref()
+        .map(|name| resolve_role_col(&col_map, name, "entry"))
+        .transpose()?;
     let exit_col = resolve_role_col(&col_map, &args.exit, "exit")?;
     let event_col = resolve_role_col(&col_map, &args.event, "event")?;
 
@@ -4462,8 +4472,8 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         resolve_offset_column(&ds, &col_map, args.noise_offset_column.as_deref())?;
 
     for i in 0..n {
-        let (t0, t1) =
-            normalize_survival_time_pair(ds.values[[i, entry_col]], ds.values[[i, exit_col]], i)?;
+        let entry_val = entry_col.map_or(0.0, |idx| ds.values[[i, idx]]);
+        let (t0, t1) = normalize_survival_time_pair(entry_val, ds.values[[i, exit_col]], i)?;
         let ev = ds.values[[i, event_col]];
         age_entry[i] = t0;
         age_exit[i] = t1;
@@ -4962,7 +4972,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         let z_column_name = args.z_column.as_ref().ok_or_else(|| {
             "--z-column is required with --survival-likelihood marginal-slope".to_string()
         })?;
-        let response_expr = format!("Surv({}, {}, {})", args.entry, args.exit, args.event);
+        let response_expr = surv_response_expr(args.entry.as_deref(), &args.exit, &args.event);
         let (logslope_formula, parsed_logslope) = parse_matching_auxiliary_formula(
             logslope_formula_raw,
             &response_expr,
@@ -8475,7 +8485,9 @@ fn collect_term_column_names(terms: &[ParsedTerm], out: &mut BTreeSet<String>) {
 fn required_columns_for_formula(parsed: &ParsedFormula) -> Result<Vec<String>, String> {
     let mut out = BTreeSet::<String>::new();
     if let Some((entry, exit, event)) = parse_surv_response(&parsed.response)? {
-        out.insert(entry);
+        if let Some(entry) = entry {
+            out.insert(entry);
+        }
         out.insert(exit);
         out.insert(event);
     } else {
@@ -8533,18 +8545,29 @@ fn required_columns_for_fit(args: &FitArgs, parsed: &ParsedFormula) -> Result<Ve
     Ok(required.into_iter().collect())
 }
 
+/// Format a `Surv(...)` response expression, omitting the entry argument
+/// when the right-censored shorthand `Surv(time, event)` is in use.
+fn surv_response_expr(entry: Option<&str>, exit: &str, event: &str) -> String {
+    match entry {
+        Some(entry) => format!("Surv({entry}, {exit}, {event})"),
+        None => format!("Surv({exit}, {event})"),
+    }
+}
+
 fn required_columns_for_survival(
     args: &SurvivalArgs,
     parsed: &ParsedFormula,
 ) -> Result<Vec<String>, String> {
     let mut required = BTreeSet::<String>::new();
-    required.insert(args.entry.clone());
+    if let Some(entry) = args.entry.as_deref() {
+        required.insert(entry.to_string());
+    }
     required.insert(args.exit.clone());
     required.insert(args.event.clone());
     merge_required_columns(&mut required, required_columns_for_formula(parsed)?);
 
     if let Some(noise_formula_raw) = args.predict_noise.as_deref() {
-        let response_expr = format!("Surv({}, {}, {})", args.entry, args.exit, args.event);
+        let response_expr = surv_response_expr(args.entry.as_deref(), &args.exit, &args.event);
         let (_, parsed_noise) =
             parse_matching_auxiliary_formula(noise_formula_raw, &response_expr, "--predict-noise")?;
         merge_required_columns(&mut required, required_columns_for_formula(&parsed_noise)?);
@@ -16242,7 +16265,7 @@ mod tests {
         assert_eq!(
             surv,
             Some((
-                "entry_time".to_string(),
+                Some("entry_time".to_string()),
                 "exit_time".to_string(),
                 "event".to_string()
             ))
@@ -16250,20 +16273,27 @@ mod tests {
     }
 
     #[test]
-    fn parse_surv_response_rejectswrong_arity() {
-        // 2-arg case: should give the actionable migration hint message
-        // showing the user the exact 3-arg rewrite.
-        let err = parse_surv_response("Surv(exit_time, event)")
-            .expect_err("invalid Surv arity should fail");
-        let err_msg = err.to_string();
-        assert!(
-            err_msg.contains("needs three columns") && err_msg.contains("entry"),
-            "expected actionable 2-arg error, got: {err_msg}"
+    fn parse_surv_response_accepts_two_arg_right_censored_shorthand() {
+        // Surv(time, event): R survival / mgcv default, entry synthesized
+        // as zero downstream. Confirmed by the None in slot 0.
+        let surv =
+            parse_surv_response("Surv(exit_time, event)").expect("parse 2-arg Surv lhs");
+        assert_eq!(
+            surv,
+            Some((None, "exit_time".to_string(), "event".to_string()))
         );
-        // 1-arg, 4-arg, etc still get the generic message
+    }
+
+    #[test]
+    fn parse_surv_response_rejectswrong_arity() {
+        // 1-arg, 4-arg, etc are still rejected.
         let err =
             parse_surv_response("Surv(entry_time)").expect_err("invalid Surv arity should fail");
-        assert!(err.to_string().contains("expects exactly three columns"));
+        assert!(
+            err.to_string().contains("Surv(time, event)")
+                || err.to_string().contains("Surv(entry, exit, event)"),
+            "expected actionable arity error, got: {err}"
+        );
     }
 
     #[test]
