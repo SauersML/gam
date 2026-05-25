@@ -295,3 +295,6 @@ mod policy_tests {
         assert!(err.contains("gpu=force"));
     }
 }
+
+#[cfg(target_os = "linux")]
+pub mod bms_flex;
