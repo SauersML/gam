@@ -327,6 +327,9 @@ def _target_descriptor(target: Any) -> str | int:
     )
 
 
+from ._binding import rust_module as _rust_module; TopKActivationPenalty = _rust_module().TopKActivationPenalty
+
+
 def _inverse_softplus(x: np.ndarray) -> np.ndarray:
     out = np.empty_like(x, dtype=float)
     large = x > 30.0
@@ -521,42 +524,6 @@ class ARDPenalty(_AnalyticPenalty):
 
     def _payload_extras(self) -> dict[str, Any]:
         return {}
-
-
-@dataclass(init=False, slots=True)
-class TopKActivationPenalty(_AnalyticPenalty):
-    """Hard top-k SAE activation mask over a row-major latent block."""
-    KIND_TAG = "topk_activation"
-
-    target: TargetSpec
-    k: int
-    weight: float
-    weight_schedule: ScalarWeightSchedule | dict[str, Any] | None
-
-    def __init__(
-        self,
-        k: int,
-        weight: float = 1.0,
-        *,
-        target: TargetSpec = "t",
-        weight_schedule: ScalarWeightSchedule | dict[str, Any] | None = None,
-    ) -> None:
-        self.target = target
-        self.k = index(k)
-        self.weight = float(weight)
-        self.weight_schedule = weight_schedule
-        self.__post_init__()
-
-    def __post_init__(self) -> None:
-        if self.k <= 0:
-            raise ValueError(f"TopKActivationPenalty.k must be > 0, got {self.k}")
-        if not np.isfinite(self.weight) or self.weight <= 0.0:
-            raise ValueError(
-                f"TopKActivationPenalty.weight must be finite and > 0, got {self.weight}"
-            )
-
-    def _payload_extras(self) -> dict[str, Any]:
-        return {"k": int(self.k), "weight": float(self.weight)}
 
 
 @dataclass(init=False, slots=True)
