@@ -18941,6 +18941,10 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(build_sample_payload_json, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        build_analytic_penalty_registry_json,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(sample_table, module)?)?;
     module.add_function(wrap_pyfunction!(design_matrix_table, module)?)?;
     module.add_function(wrap_pyfunction!(design_matrix_table_dense, module)?)?;
@@ -22692,6 +22696,46 @@ fn descriptor_array2_flat(
     }
     Array2::from_shape_vec((shape[0], shape[1]), flat)
         .map_err(|err| format!("{context}.{data_key} shape reconstruction failed: {err}"))
+}
+
+/// Python-facing wrapper that builds the analytic-penalty registry from a pair
+/// of JSON strings (`latents`, `descriptors`) and returns a JSON array where
+/// each entry exposes its canonical `kind` tag — the same string returned by
+/// `AnalyticPenaltyKind::name()`. This is the round-trip surface exercised by
+/// Python tests to confirm that descriptor JSON travels through the Rust side
+/// without losing identity.
+#[pyfunction]
+fn build_analytic_penalty_registry_json(
+    latents_json: &str,
+    descriptors_json: &str,
+) -> PyResult<String> {
+    let latents: serde_json::Value = serde_json::from_str(latents_json)
+        .map_err(|err| py_value_error(format!("invalid latents json: {err}")))?;
+    let descriptors: serde_json::Value = serde_json::from_str(descriptors_json)
+        .map_err(|err| py_value_error(format!("invalid descriptors json: {err}")))?;
+    let registry = build_analytic_penalty_registry_from_json(Some(&latents), Some(&descriptors))
+        .map_err(py_value_error)?;
+    let entries: Vec<serde_json::Value> = registry
+        .penalties
+        .iter()
+        .map(|penalty| {
+            let mut entry = serde_json::Map::new();
+            entry.insert(
+                "kind".to_string(),
+                serde_json::Value::String(penalty.name().to_string()),
+            );
+            entry.insert(
+                "kind_tag".to_string(),
+                serde_json::Value::String(penalty.kind_tag().to_string()),
+            );
+            serde_json::Value::Object(entry)
+        })
+        .collect();
+    serde_json::to_string(&serde_json::Value::Array(entries)).map_err(|err| {
+        py_value_error(format!(
+            "failed to serialize analytic penalty registry json: {err}"
+        ))
+    })
 }
 
 fn build_analytic_penalty_registry_from_json(
