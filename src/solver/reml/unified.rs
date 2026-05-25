@@ -5283,11 +5283,11 @@ impl ProjectedKktResidual {
                 let tol = self
                     .residual_tol
                     .unwrap_or_else(|| 1e-10 * (1.0 + residual_inf));
-                let gate = 4.0 * tol;
+                let gate = tol;
                 if dropped_inf > gate {
                     return Err(format!(
                         "projected KKT residual contains unresolved mass outside the reduced \
-                         Hessian/penalty range: |r_A - r_R|∞={dropped_inf:.3e} > 4·tol={gate:.3e}; \
+                         Hessian/penalty range: |r_A - r_R|∞={dropped_inf:.3e} > tol={gate:.3e}; \
                          range-projected IFT correction is valid only after the null direction is \
                          explicitly removed/fixed or after the active-projected residual is small"
                     ));
