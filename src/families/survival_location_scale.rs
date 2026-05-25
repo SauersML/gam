@@ -2236,6 +2236,9 @@ impl SurvivalLocationScaleFamily {
             d3_q1,
             d1_qdot1,
             d2_qdot1,
+            grad_time_eta_h0,
+            grad_time_eta_h1,
+            grad_time_eta_d,
             h_time_h0,
             h_time_h1,
             h_time_d,
@@ -13920,11 +13923,10 @@ mod tests {
                 // name: the I-spline-like time block carries structural
                 // lower bounds of zero (see
                 // `structural_time_coefficient_lower_bounds`), and
-                // `post_update_block_beta` projects the iterate onto that
-                // box after every accepted line-search step.  Every
-                // accepted coefficient must therefore satisfy β ≥ 0 — the
-                // precondition for the monotone I-spline reconstruction
-                // the workflow consumes downstream.
+                // the constrained solve/max-step limiter represents that
+                // cone directly. Every accepted coefficient must therefore
+                // satisfy β ≥ 0 — the precondition for the monotone
+                // I-spline reconstruction the workflow consumes downstream.
                 assert!(
                     result.beta_time().iter().all(|&b| b.is_finite()),
                     "structural time coefficients must be finite: {:?}",
@@ -13932,16 +13934,14 @@ mod tests {
                 );
                 assert!(
                     result.beta_time().iter().all(|&b| b >= 0.0),
-                    "structural time coefficients must be non-negative after projection: {:?}",
+                    "structural time coefficients must be non-negative after constrained solve: {:?}",
                     result.beta_time(),
                 );
                 // Parallel invariant for BLOCK_LINK_WIGGLE: monotone-link
-                // wiggle coefficients are structurally non-negative and
-                // `post_update_block_beta` clamps them at zero
-                // (survival_location_scale.rs:8972-8979).  This test
-                // configures `linkwiggle_block: None`, so the block is
-                // absent — but if it is ever enabled here the same
-                // non-negativity invariant must hold.
+                // wiggle coefficients are structurally non-negative. This
+                // test configures `linkwiggle_block: None`, so the block is
+                // absent — but if it is ever enabled here the represented
+                // block constraint must enforce the same invariant.
                 if let Some(beta_link_wiggle) = result.beta_link_wiggle() {
                     assert!(
                         beta_link_wiggle.iter().all(|&b| b.is_finite()),
@@ -13949,7 +13949,7 @@ mod tests {
                     );
                     assert!(
                         beta_link_wiggle.iter().all(|&b| b >= 0.0),
-                        "link-wiggle coefficients must be non-negative after projection: {beta_link_wiggle:?}",
+                        "link-wiggle coefficients must be non-negative after constrained solve: {beta_link_wiggle:?}",
                     );
                 }
             }
