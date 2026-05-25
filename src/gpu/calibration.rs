@@ -275,7 +275,7 @@ pub fn measure_device(ctx: Arc<CudaContext>) -> Result<DeviceCalibration, GpuErr
 /// big servers (1500 GFLOPS Genoa) and under-routed on laptops (~20 GFLOPS).
 pub fn measured_cpu_fp64_gflops() -> f64 {
     static CACHED: crate::resource::RayonSafeOnce<f64> = crate::resource::RayonSafeOnce::new();
-    *CACHED.get_or_init(measure_cpu_fp64_inner)
+    *CACHED.get_or_compute(measure_cpu_fp64_inner)
 }
 
 fn measure_cpu_fp64_inner() -> f64 {

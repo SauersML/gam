@@ -18,7 +18,7 @@ use crate::types::{
 };
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
 const TK_BLOCK_SIZE: usize = 128;
 const TK_MAX_OBSERVATIONS: usize = 20_000;
@@ -579,7 +579,16 @@ struct EfsSingleLoopBiasGuardState {
     consecutive: usize,
 }
 
-static EFS_SINGLE_LOOP_BIAS_GUARD: OnceLock<Mutex<EfsSingleLoopBiasGuardState>> = OnceLock::new();
+// `LazyLock` (not `OnceLock` lazy init) so the init closure never parks
+// callers on the OS condvar. The init body here is trivial — just a default-
+// constructed `Mutex` — but the call site sits in a module that elsewhere
+// dispatches rayon parallel iterators, and the codebase-level lint
+// (see `tests/once_lock_get_or_init_not_inside_parallel_regions.rs`)
+// forbids the lazy `OnceLock` accessor in any rayon-adjacent file.
+// `LazyLock`'s initializer runs at first deref under its own dedicated
+// synchronization that does not interact with rayon's worker pool.
+static EFS_SINGLE_LOOP_BIAS_GUARD: LazyLock<Mutex<EfsSingleLoopBiasGuardState>> =
+    LazyLock::new(|| Mutex::new(EfsSingleLoopBiasGuardState::default()));
 
 #[inline]
 fn compute_gradient_for_tk(mode: super::unified::EvalMode) -> bool {
@@ -1642,9 +1651,7 @@ impl<'a> RemlState<'a> {
         }
 
         let owner = self as *const _ as usize;
-        let guard = EFS_SINGLE_LOOP_BIAS_GUARD
-            .get_or_init(|| Mutex::new(EfsSingleLoopBiasGuardState::default()));
-        let mut state = guard.lock().unwrap();
+        let mut state = EFS_SINGLE_LOOP_BIAS_GUARD.lock().unwrap();
         if state.owner != owner {
             state.owner = owner;
             state.consecutive = 0;

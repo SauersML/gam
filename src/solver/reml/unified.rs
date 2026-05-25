@@ -14782,7 +14782,7 @@ impl MatrixFreeSpdOperator {
 
     fn dense_spectral(&self) -> Option<&DenseSpectralOperator> {
         self.dense_spectral
-            .get_or_init(|| self.materialize_dense_operator())
+            .get_or_compute(|| self.materialize_dense_operator())
             .as_ref()
     }
 
@@ -14950,7 +14950,7 @@ impl HessianOperator for MatrixFreeSpdOperator {
     fn logdet(&self) -> f64 {
         *self
             .cached_logdet
-            .get_or_init(|| self.exact_dense_spectral().logdet())
+            .get_or_compute(|| self.exact_dense_spectral().logdet())
     }
 
     fn as_exact_dense_spectral(&self) -> Option<&DenseSpectralOperator> {
