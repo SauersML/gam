@@ -1337,7 +1337,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     let has_bounded_terms = termspec_has_bounded_terms(&spec);
     validate_cli_firth_configuration(CliFirthValidation {
         enabled: args.firth,
-        family,
+        family: family.clone(),
         predict_noise: args.predict_noise.is_some(),
         has_bounded_terms,
         is_survival: false,
@@ -1426,7 +1426,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             .as_ref()
             .expect("learn_linkwiggle guarantees wiggle config");
         let link_kind = resolve_binomial_inverse_link_for_fit(
-            family,
+            family.clone(),
             effective_link,
             mixture_linkspec.as_ref(),
             sas_linkspec.as_ref(),
