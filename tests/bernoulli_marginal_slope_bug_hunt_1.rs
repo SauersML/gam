@@ -22,8 +22,10 @@ fn bug_marginal_slope_probit_matches_phi_eta_times_deta_dxj_random_x() {
 fn bug_signed_probit_mills_ratio_is_positive_and_saturates_for_large_abs_eta() {
     for &eta in &[-10.0, -2.3, -0.1, 0.0, 0.1, 1.7, 8.0] {
         let (_logcdf, lambda) = signed_probit_logcdf_and_mills_ratio(eta);
-        assert!(lambda.is_finite() && lambda > 0.0,
-            "Mills ratio phi(eta)/Phi(eta) must be strictly positive and finite for finite eta; got lambda={lambda:.17e} at eta={eta}");
+        assert!(
+            lambda.is_finite() && lambda > 0.0,
+            "Mills ratio phi(eta)/Phi(eta) must be strictly positive and finite for finite eta; got lambda={lambda:.17e} at eta={eta}"
+        );
     }
     let (logcdf_pos, lambda_pos) = signed_probit_logcdf_and_mills_ratio(40.0);
     assert!(
@@ -43,7 +45,8 @@ fn bug_exact_kernel_second_and_third_derivatives_match_finite_difference() {
     let x0 = 0.23_f64;
     let h = 1e-4;
     let fpp_fd = (f(x0 + h) - 2.0 * f(x0) + f(x0 - h)) / (h * h);
-    let fppp_fd = (f(x0 + 2.0 * h) - 2.0 * f(x0 + h) + 2.0 * f(x0 - h) - f(x0 - 2.0 * h)) / (2.0 * h * h * h);
+    let fppp_fd =
+        (f(x0 + 2.0 * h) - 2.0 * f(x0 + h) + 2.0 * f(x0 - h) - f(x0 - 2.0 * h)) / (2.0 * h * h * h);
     let fpp_closed = (x0 * x0 - 1.0) * normal_pdf(x0);
     let fppp_closed = (3.0 * x0 - x0 * x0 * x0) * normal_pdf(x0);
     assert!(
@@ -75,10 +78,16 @@ fn bug_frailty_integration_preserves_probability_bounds_and_monotonicity() {
     let mut last = 0.0;
     for (i, eta) in etas.iter().enumerate() {
         let p = normal_cdf(*eta / (1.0_f64 + 0.4_f64 * 0.4_f64).sqrt());
-        assert!(p.is_finite() && p > 0.0 && p < 1.0,
-            "Frailty-integrated probit probability must stay strictly within (0,1); got p={p:.17e} at eta={eta}");
+        assert!(
+            p.is_finite() && p > 0.0 && p < 1.0,
+            "Frailty-integrated probit probability must stay strictly within (0,1); got p={p:.17e} at eta={eta}"
+        );
         if i > 0 {
-            assert!(p >= last, "Frailty-integrated probit probability must be monotone in eta; got p[{i}]={p:.17e} < p[{prev}]={last:.17e}", prev=i-1);
+            assert!(
+                p >= last,
+                "Frailty-integrated probit probability must be monotone in eta; got p[{i}]={p:.17e} < p[{prev}]={last:.17e}",
+                prev = i - 1
+            );
         }
         last = p;
     }
