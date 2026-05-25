@@ -6435,6 +6435,41 @@ impl CustomFamilyWarmStart {
     }
 }
 
+struct CustomOuterState {
+    warm_cache: Option<ConstrainedWarmStart>,
+    reset_warm_cache: Option<ConstrainedWarmStart>,
+    last_error: Option<String>,
+    initial_gradient_norm: Option<f64>,
+}
+
+impl CustomOuterState {
+    fn new(warm_start: Option<ConstrainedWarmStart>) -> Self {
+        Self {
+            warm_cache: warm_start.clone(),
+            reset_warm_cache: warm_start,
+            last_error: None,
+            initial_gradient_norm: None,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.warm_cache = self.reset_warm_cache.clone();
+    }
+
+    fn seed_cached_beta(
+        &mut self,
+        rho_dim: usize,
+        specs: &[ParameterBlockSpec],
+        beta: &Array1<f64>,
+    ) -> Result<(), EstimationError> {
+        let warm_start = constrained_warm_start_from_cached_beta(rho_dim, specs, beta)?;
+        self.reset_warm_cache = Some(warm_start.clone());
+        self.warm_cache = Some(warm_start);
+        self.last_error = None;
+        Ok(())
+    }
+}
+
 pub struct CustomFamilyJointHyperResult {
     pub objective: f64,
     pub gradient: Array1<f64>,
@@ -20816,15 +20851,6 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     use crate::estimate::EstimationError;
     use crate::solver::outer_strategy::{FallbackPolicy, OuterEval, OuterEvalOrder, OuterProblem};
 
-    // Mutable bookkeeping for the outer optimization loop. These fields were
-    // previously behind Mutex because the old optimizer bridge used `Fn`
-    // adapters; `ClosureObjective` uses `FnMut`, so plain fields suffice.
-    struct CustomOuterState {
-        warm_cache: Option<ConstrainedWarmStart>,
-        last_error: Option<String>,
-        initial_gradient_norm: Option<f64>,
-    }
-
     let screening_cap = Arc::new(AtomicUsize::new(0));
     let outer_inner_cap = options
         .outer_inner_max_iterations
@@ -20838,8 +20864,22 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     let n_rho = rho0.len();
     let (cap_gradient, cap_hessian) =
         custom_family_outer_derivatives(family, specs, &outer_options);
+    let derivative_policy = family.outer_derivative_policy(specs, 0, &outer_options);
     let hessian = cap_hessian;
     let need_outer_hessian = hessian.is_analytic();
+    log::info!(
+        "[OUTER] custom family derivative-policy: n_params={} gradient={:?} hessian={:?} capability={:?} requested_outer_hessian={} predicted_gradient_work={} predicted_hessian_work={} inner_hvp_available={} outer_hvp_available={} outer_dense_available={}",
+        n_rho,
+        cap_gradient,
+        hessian,
+        derivative_policy.capability,
+        need_outer_hessian,
+        derivative_policy.predicted_gradient_work,
+        derivative_policy.predicted_hessian_work,
+        family.inner_coefficient_hessian_hvp_available(specs),
+        family.outer_hyper_hessian_hvp_available(specs),
+        family.outer_hyper_hessian_dense_available(specs),
+    );
     let outer_max_iter = cost_gated_first_order_max_iter(
         options.outer_max_iter,
         family.coefficient_gradient_cost(specs),
@@ -21015,11 +21055,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     };
 
     let mut obj = problem.build_objective_with_screening_proxy(
-        CustomOuterState {
-            warm_cache: persistent_warm_start.clone(),
-            last_error: None,
-            initial_gradient_norm: None,
-        },
+        CustomOuterState::new(persistent_warm_start.clone()),
         |outer: &mut CustomOuterState, rho: &Array1<f64>| {
             // Always use warm cache when available — the previous inner solution
             // gives a much better starting point. This was previously disabled for
@@ -21073,7 +21109,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             eval_outer(outer, rho, order)
         },
         Some(|outer: &mut CustomOuterState| {
-            outer.warm_cache = None;
+            outer.reset();
         }),
         Some(|outer: &mut CustomOuterState, rho: &Array1<f64>| {
             if label_layout.has_tied_coordinates() {
@@ -21144,11 +21180,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         },
     )
     .with_seed_inner_state(|outer: &mut CustomOuterState, beta: &Array1<f64>| {
-        outer.warm_cache = Some(constrained_warm_start_from_cached_beta(
-            n_rho, specs, beta,
-        )?);
-        outer.last_error = None;
-        Ok(())
+        outer.seed_cached_beta(n_rho, specs, beta)
     });
 
     let outer_result = problem.run(&mut obj, "custom family");
@@ -22738,6 +22770,117 @@ mod tests {
         assert_eq!(retained.rho, array![0.0, -0.5]);
         assert_eq!(retained.block_beta[0], array![1.0, -1.0]);
         assert_eq!(retained.active_sets[0], None);
+    }
+
+    #[test]
+    fn cached_beta_warm_start_splits_blocks_and_validates_shape() {
+        let mk_spec = |name: &str, p: usize| ParameterBlockSpec {
+            name: name.to_string(),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((
+                3, p,
+            )))),
+            offset: Array1::zeros(3),
+            penalties: Vec::new(),
+            nullspace_dims: Vec::new(),
+            initial_log_lambdas: Array1::zeros(0),
+            initial_beta: None,
+        };
+        let specs = vec![mk_spec("a", 2), mk_spec("b", 3)];
+
+        let warm = constrained_warm_start_from_cached_beta(4, &specs, &array![1., 2., 3., 4., 5.])
+            .expect("matching beta");
+        assert_eq!(warm.rho.len(), 4);
+        assert_eq!(warm.block_beta, vec![array![1., 2.], array![3., 4., 5.]]);
+        assert_eq!(warm.active_sets, vec![None, None]);
+        assert!(warm.cached_inner.is_none());
+
+        let err = match constrained_warm_start_from_cached_beta(4, &specs, &array![1., 2., 3.]) {
+            Ok(_) => panic!("wrong beta length should be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains(
+                "cached inner beta has length 3, but custom-family blocks require length 5"
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn cached_beta_warm_start_rejects_nonfinite_entries() {
+        let spec = ParameterBlockSpec {
+            name: "a".to_string(),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((
+                3, 2,
+            )))),
+            offset: Array1::zeros(3),
+            penalties: Vec::new(),
+            nullspace_dims: Vec::new(),
+            initial_log_lambdas: Array1::zeros(0),
+            initial_beta: None,
+        };
+
+        let err = match constrained_warm_start_from_cached_beta(1, &[spec], &array![1.0, f64::NAN])
+        {
+            Ok(_) => panic!("non-finite beta should be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("cached inner beta contains non-finite entries"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn custom_outer_state_reset_preserves_seeded_cached_beta() {
+        let spec = ParameterBlockSpec {
+            name: "a".to_string(),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((
+                3, 2,
+            )))),
+            offset: Array1::zeros(3),
+            penalties: Vec::new(),
+            nullspace_dims: Vec::new(),
+            initial_log_lambdas: Array1::zeros(0),
+            initial_beta: None,
+        };
+        let mut state = CustomOuterState::new(None);
+        state
+            .seed_cached_beta(1, &[spec], &array![4.0, -2.0])
+            .expect("cached beta seed");
+
+        state.warm_cache = None;
+        state.reset();
+
+        let warm = state
+            .warm_cache
+            .as_ref()
+            .expect("reset should restore cached beta seed");
+        assert_eq!(warm.rho.len(), 1);
+        assert_eq!(warm.block_beta, vec![array![4.0, -2.0]]);
+        assert!(warm.cached_inner.is_none());
+    }
+
+    #[test]
+    fn custom_outer_state_reset_preserves_existing_persistent_warm_start() {
+        let persistent = ConstrainedWarmStart {
+            rho: array![0.25],
+            block_beta: vec![array![1.0, 2.0]],
+            active_sets: vec![None],
+            cached_inner: None,
+        };
+        let mut state = CustomOuterState::new(Some(persistent.clone()));
+
+        state.warm_cache = None;
+        state.reset();
+
+        let warm = state
+            .warm_cache
+            .as_ref()
+            .expect("reset should restore persistent warm start");
+        assert_eq!(warm.rho, persistent.rho);
+        assert_eq!(warm.block_beta, persistent.block_beta);
     }
 
     #[test]

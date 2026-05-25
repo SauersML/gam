@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import ctypes
 import os
+from collections.abc import Mapping
 from functools import lru_cache
 from importlib import util
 from pathlib import Path
@@ -20,6 +21,11 @@ _CUDA_LIBRARY_GROUPS: tuple[tuple[str, tuple[tuple[str, ...], ...]], ...] = (
     ),
     ("cusparse", (("libcusparse.so.12", "libcusparse.so"),)),
     ("cusolver", (("libcusolver.so.12", "libcusolver.so.11", "libcusolver.so"),)),
+)
+
+_CUDA_SUBPROCESS_LIBRARY_GROUPS: tuple[tuple[str, tuple[tuple[str, ...], ...]], ...] = (
+    *_CUDA_LIBRARY_GROUPS,
+    ("cuda_nvrtc", (("libnvrtc.so.12", "libnvrtc.so"),)),
 )
 
 _CUDA_DRIVER_NAMES: tuple[str, ...] = ("libcuda.so.1", "libcuda.so")
@@ -75,6 +81,7 @@ def cuda_diagnostics() -> dict[str, object]:
         "mapped": mapped,
         "conflicts": conflicts,
         "packaged_nvidia_roots": [str(path) for path in _nvidia_roots()],
+        "packaged_cuda_library_dirs": list(cuda_subprocess_library_dirs()),
         "packaged_complete_stacks": [
             [str(path) for path in stack]
             for root in _nvidia_roots()
@@ -123,6 +130,12 @@ def format_cuda_diagnostics() -> str:
         lines.extend(f"    {path}" for path in packaged_roots)
     else:
         lines.append("    <none>")
+    lines.append("  packaged CUDA library dirs for subprocesses:")
+    packaged_dirs = info["packaged_cuda_library_dirs"]
+    if isinstance(packaged_dirs, list) and packaged_dirs:
+        lines.extend(f"    {path}" for path in packaged_dirs)
+    else:
+        lines.append("    <none>")
     lines.append("  complete packaged CUDA stacks:")
     _append_stack_lines(lines, info["packaged_complete_stacks"])
     lines.append("  system CUDA driver libraries:")
@@ -134,6 +147,39 @@ def format_cuda_diagnostics() -> str:
     lines.append("  complete system CUDA stacks:")
     _append_stack_lines(lines, info["system_complete_stacks"])
     return "\n".join(lines)
+
+
+def cuda_subprocess_library_dirs() -> tuple[str, ...]:
+    """Return packaged CUDA wheel library directories for child processes.
+
+    ``prepare_cuda_libraries`` can discover and preload CUDA userspace
+    libraries from pip ``nvidia-*-cu12`` wheels inside the current Python
+    process. A subprocess does not inherit those loaded handles; it only sees
+    the dynamic loader search path. This helper exposes the corresponding
+    wheel ``.../nvidia/<component>/lib`` directories, including
+    ``cuda_nvrtc/lib``, so callers can build a subprocess environment without
+    guessing uv/pip's unpack location.
+    """
+
+    if sys.platform != "linux":
+        return ()
+    dirs: list[Path] = []
+    for root in _nvidia_roots():
+        dirs.extend(_nvidia_component_library_dirs(root))
+    return tuple(str(path) for path in _dedup_resolved(dirs))
+
+
+def cuda_subprocess_env(env: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Return ``env`` with packaged CUDA wheel dirs prepended to LD_LIBRARY_PATH."""
+
+    out = dict(os.environ if env is None else env)
+    dirs = cuda_subprocess_library_dirs()
+    if not dirs:
+        return out
+    existing = out.get("LD_LIBRARY_PATH", "")
+    parts = [*dirs, *(part for part in existing.split(":") if part)]
+    out["LD_LIBRARY_PATH"] = ":".join(_dedup_strings(parts))
+    return out
 
 
 _CUDA_CONFLICT_WARNED: set[str] = set()
@@ -349,6 +395,15 @@ def _complete_nvidia_stack(root: Path) -> list[Path] | None:
     return _dedup_resolved(out)
 
 
+def _nvidia_component_library_dirs(root: Path) -> list[Path]:
+    out: list[Path] = []
+    for component, library_groups in _CUDA_SUBPROCESS_LIBRARY_GROUPS:
+        lib_dir = root / component / "lib"
+        if any(_first_existing(lib_dir, names) is not None for names in library_groups):
+            out.append(lib_dir)
+    return _existing_unique_paths(out)
+
+
 def _complete_system_stack(lib_dir: Path) -> list[Path] | None:
     out: list[Path] = []
     for _, library_groups in _CUDA_LIBRARY_GROUPS:
@@ -387,4 +442,14 @@ def _existing_unique_paths(paths: Iterable[Path]) -> list[Path]:
         if resolved.exists() and resolved not in seen:
             out.append(resolved)
             seen.add(resolved)
+    return out
+
+
+def _dedup_strings(values: Iterable[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if value not in seen:
+            out.append(value)
+            seen.add(value)
     return out

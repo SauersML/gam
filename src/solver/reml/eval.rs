@@ -26,7 +26,7 @@ const AUTO_CUBATURE_RHOVAR_TRIGGER: f64 = 0.1;
 /// `Routine` covers by-design eligibility gates (dimension limits, the
 /// near-boundary/highgrad linearization gate, rank-deficient `V_ρ` where
 /// cubature would inject spurious variance, `n_rho == 0`, etc.). These
-/// log at `debug` and do not count as failures.
+/// log at `info` and do not count as failures.
 ///
 /// `NumericalFailure` covers situations where cubature was requested by
 /// the eligibility logic but a downstream numerical step refused to
@@ -52,9 +52,6 @@ pub enum SmoothingCorrectionFallbackSeverity {
 /// equals `H⁻¹` and no separate additive correction is meaningful, and
 /// for the case where the caller did not supply a base covariance to
 /// upgrade).
-///
-/// The caller is responsible for emitting the canonical
-/// `[smoothing-correction]` log line that summarises which branch ran.
 #[derive(Clone, Debug)]
 pub enum SmoothingCorrectionOutcome {
     /// Cubature upgrade succeeded.
@@ -66,8 +63,7 @@ pub enum SmoothingCorrectionOutcome {
         grad_norm: f64,
         max_rho_var: f64,
     },
-    /// Principled first-order linearization was returned, with a
-    /// machine-readable reason classifying why cubature was not used.
+    /// Principled first-order linearization was returned.
     FirstOrder {
         correction: Option<Array2<f64>>,
         reason: &'static str,
@@ -102,12 +98,10 @@ impl SmoothingCorrectionOutcome {
     }
 }
 
-/// Process-wide count of `NumericalFailure` first-order fallbacks taken
-/// inside [`RemlState::compute_smoothing_correction_auto`]. Incremented
-/// whenever cubature was requested by the eligibility gate but a
-/// downstream numerical step refused to produce a usable second-order
-/// correction. Exposed as a public counter so long-running fits can
-/// surface how often the smoothing correction silently degraded.
+/// Process-wide count of numerical failures inside
+/// [`RemlState::compute_smoothing_correction_auto`]. Incremented whenever
+/// cubature was requested by the eligibility gate but a downstream numerical
+/// step refused to produce a usable second-order correction.
 pub static SMOOTHING_CORRECTION_NUMERICAL_FAILURE_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Process-wide count of cubature upgrades that succeeded inside
@@ -267,9 +261,6 @@ impl<'a> RemlState<'a> {
     ) -> SmoothingCorrectionOutcome {
         use SmoothingCorrectionFallbackSeverity::{NumericalFailure, Routine};
 
-        // Build a Routine first-order outcome with the canonical
-        // linearization correction (may be `None` when n_rho == 0 or the
-        // first-order path itself bailed). Debug-logged at function exit.
         let first_order_routine = |correction: Option<Array2<f64>>, reason: &'static str| {
             SmoothingCorrectionOutcome::FirstOrder {
                 correction,
@@ -277,9 +268,6 @@ impl<'a> RemlState<'a> {
                 severity: Routine,
             }
         };
-        // Build a NumericalFailure first-order outcome. Warn-logged and
-        // counted at function exit so long-running fits surface how
-        // often the second-order upgrade silently degraded.
         let first_order_numerical = |correction: Option<Array2<f64>>, reason: &'static str| {
             SmoothingCorrectionOutcome::FirstOrder {
                 correction,
@@ -320,8 +308,6 @@ impl<'a> RemlState<'a> {
                     );
                 }
             }
-            // n_rho == 0: unified corrected covariance equals H⁻¹; no
-            // additive correction is meaningful at this design.
             return self.finalize_smoothing_outcome(first_order_routine(
                 first_order_correction,
                 "n_rho == 0: unified corrected covariance equals H^{-1}",
@@ -381,13 +367,6 @@ impl<'a> RemlState<'a> {
         if let Some(rank) = first_order.active_rank
             && rank < n_rho
         {
-            log::debug!(
-                "Auto cubature skipped: first-order V_ρ is rank-deficient \
-                     ({}/{}); higher-order propagation would impute spurious \
-                     variance along unidentified directions.",
-                rank,
-                n_rho,
-            );
             return self.finalize_smoothing_outcome(first_order_routine(
                 first_order_correction,
                 "first-order V_rho rank-deficient: cubature would impute spurious variance",
@@ -400,12 +379,7 @@ impl<'a> RemlState<'a> {
         } else {
             match self.compute_lamlhessian_consistent(final_rho) {
                 Ok(h) => h,
-                Err(err) => {
-                    log::warn!(
-                        "Auto cubature: rho Hessian unavailable ({}); \
-                         falling back to first-order correction.",
-                        err
-                    );
+                Err(_) => {
                     return self.finalize_smoothing_outcome(first_order_numerical(
                         first_order_correction,
                         "rho Hessian compute_lamlhessian_consistent failed",
@@ -427,10 +401,6 @@ impl<'a> RemlState<'a> {
         let Some(hessian_rho_inv) =
             matrix_inversewith_regularization(&hessian_rho, "auto cubature rho Hessian")
         else {
-            log::warn!(
-                "Auto cubature: ridged rho-Hessian inversion failed; \
-                 falling back to first-order correction."
-            );
             return self.finalize_smoothing_outcome(first_order_numerical(
                 first_order_correction,
                 "rho Hessian inversion failed after ridge regularization",
@@ -452,12 +422,7 @@ impl<'a> RemlState<'a> {
         use faer::Side;
         let (evals, evecs) = match hessian_rho_inv.eigh(Side::Lower) {
             Ok(x) => x,
-            Err(err) => {
-                log::warn!(
-                    "Auto cubature: eigendecomposition of inverse rho-Hessian failed ({:?}); \
-                     falling back to first-order correction.",
-                    err
-                );
+            Err(_) => {
                 return self.finalize_smoothing_outcome(first_order_numerical(
                     first_order_correction,
                     "eigendecomposition of inverse rho-Hessian failed",
@@ -476,12 +441,6 @@ impl<'a> RemlState<'a> {
             .filter(|(_, v)| v.is_finite() && *v > eigenvalue_floor)
             .collect();
         if eig_pairs.is_empty() {
-            log::warn!(
-                "Auto cubature: inverse rho-Hessian has no positive eigenvalues above the \
-                 numerical floor ({:.3e}); rho-Hessian is non-PD or singular. \
-                 Falling back to first-order correction.",
-                eigenvalue_floor
-            );
             return self.finalize_smoothing_outcome(first_order_numerical(
                 first_order_correction,
                 "inverse rho-Hessian has no positive eigenvalues above numerical floor",
@@ -490,11 +449,6 @@ impl<'a> RemlState<'a> {
         eig_pairs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         let totalvar: f64 = eig_pairs.iter().map(|(_, v)| *v).sum();
         if !totalvar.is_finite() || totalvar <= 0.0 {
-            log::warn!(
-                "Auto cubature: total positive eigenvalue mass non-finite or non-positive \
-                 ({:.3e}); falling back to first-order correction.",
-                totalvar
-            );
             return self.finalize_smoothing_outcome(first_order_numerical(
                 first_order_correction,
                 "positive-eigenvalue total mass non-finite or non-positive",
@@ -520,10 +474,6 @@ impl<'a> RemlState<'a> {
         // NumericalFailure guard rather than a routine fallback so any
         // future regression surfaces visibly.
         if rank == 0 {
-            log::warn!(
-                "Auto cubature: variance-truncation produced rank 0 despite non-empty positive \
-                 eigenvalue set; falling back to first-order correction (unreachable guard)."
-            );
             return self.finalize_smoothing_outcome(first_order_numerical(
                 first_order_correction,
                 "variance-truncation produced rank 0 (unreachable guard)",
@@ -563,10 +513,6 @@ impl<'a> RemlState<'a> {
         // (one positive, one negative) per eigenvector. Treat as a
         // NumericalFailure guard so any future regression surfaces.
         if sigma_points.is_empty() {
-            log::warn!(
-                "Auto cubature: produced empty sigma-point set despite rank >= 1; \
-                 falling back to first-order correction (unreachable guard)."
-            );
             return self.finalize_smoothing_outcome(first_order_numerical(
                 first_order_correction,
                 "empty sigma-point set (unreachable guard)",
@@ -607,14 +553,6 @@ impl<'a> RemlState<'a> {
         };
 
         if point_results.iter().any(|r| r.is_none()) {
-            let failed = point_results.iter().filter(|r| r.is_none()).count();
-            let total = point_results.len();
-            log::warn!(
-                "Auto cubature: {}/{} sigma-point inner PIRLS fits failed; \
-                 falling back to first-order correction.",
-                failed,
-                total
-            );
             return self.finalize_smoothing_outcome(first_order_numerical(
                 first_order_correction,
                 "one or more sigma-point inner PIRLS fits failed",
@@ -646,10 +584,6 @@ impl<'a> RemlState<'a> {
         let mut total_cov = mean_hinv + var_beta;
         enforce_symmetry(&mut total_cov);
         if !total_cov.iter().all(|v| v.is_finite()) {
-            log::warn!(
-                "Auto cubature: assembled total covariance contains non-finite entries; \
-                 falling back to first-order correction."
-            );
             return self.finalize_smoothing_outcome(first_order_numerical(
                 first_order_correction,
                 "assembled total covariance contains non-finite entries",
@@ -705,7 +639,7 @@ impl<'a> RemlState<'a> {
                 let has_matrix = correction.is_some();
                 match severity {
                     SmoothingCorrectionFallbackSeverity::Routine => {
-                        log::debug!(
+                        log::info!(
                             "[smoothing-correction] branch=first-order severity=routine \
                              has_matrix={} reason=\"{}\"",
                             has_matrix,

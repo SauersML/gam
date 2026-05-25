@@ -45,7 +45,7 @@ use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 pub mod deviation_runtime;
 pub(crate) mod exact_kernel;
@@ -4624,6 +4624,35 @@ impl RowCellMomentsBundle {
             .saturating_add(cell_records)
             .saturating_add(moment_payload)
     }
+
+    fn resident_bytes(&self) -> usize {
+        let row_vecs = self
+            .rows
+            .len()
+            .saturating_mul(std::mem::size_of::<Option<Vec<CachedDenestedCellMoments>>>());
+        let cell_records = self
+            .rows
+            .iter()
+            .filter_map(Option::as_ref)
+            .map(|cells| cells.len())
+            .sum::<usize>()
+            .saturating_mul(std::mem::size_of::<CachedDenestedCellMoments>());
+        let required_moments = self.max_degree.saturating_add(1);
+        let moment_payload = if required_moments > exact_kernel::CELL_MOMENT_INLINE_CAPACITY {
+            self.rows
+                .iter()
+                .filter_map(Option::as_ref)
+                .map(|cells| cells.len())
+                .sum::<usize>()
+                .saturating_mul(required_moments)
+                .saturating_mul(std::mem::size_of::<f64>())
+        } else {
+            0
+        };
+        row_vecs
+            .saturating_add(cell_records)
+            .saturating_add(moment_payload)
+    }
 }
 
 #[derive(Clone)]
@@ -4894,10 +4923,113 @@ fn add_weighted_chunk_gram(chunk: &Array2<f64>, weights: &[f64], target: &mut Ar
 /// to avoid retaining O(n * p_primary^2) Hessian storage.
 const ROW_CHUNK_SIZE: usize = 1024;
 const EXACT_WORK_LOG_MIN_ROWS: usize = 50_000;
+const BMS_ROW_PRIMARY_HESSIAN_EXPECTED_REUSE_PASSES: usize = 3;
+const BMS_ROW_PRIMARY_HESSIAN_MIN_REUSE_PASSES: usize = 2;
+const BMS_ROW_PRIMARY_HESSIAN_RUNTIME_BUDGET_DIVISOR: usize = 8;
 
 #[inline]
 fn log_exact_work(n: usize) -> bool {
     n >= EXACT_WORK_LOG_MIN_ROWS
+}
+
+#[cfg(target_os = "linux")]
+fn runtime_available_memory_bytes() -> Option<usize> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    meminfo.lines().find_map(|line| {
+        let rest = line.strip_prefix("MemAvailable:")?;
+        let kb = rest.split_whitespace().next()?.parse::<usize>().ok()?;
+        kb.checked_mul(1024)
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn runtime_available_memory_bytes() -> Option<usize> {
+    None
+}
+
+fn optional_bytes_for_log(bytes: Option<usize>) -> String {
+    bytes
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RowPrimaryHessianCacheReason {
+    ReuseTooLow,
+    RuntimeMemoryInsufficient,
+    WorkspaceBudgetExceeded,
+    ReuseAmortizesBuild,
+}
+
+impl RowPrimaryHessianCacheReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::ReuseTooLow => "reuse_too_low",
+            Self::RuntimeMemoryInsufficient => "runtime_memory_insufficient",
+            Self::WorkspaceBudgetExceeded => "workspace_budget_exceeded",
+            Self::ReuseAmortizesBuild => "reuse_amortizes_build",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RowPrimaryHessianCachePlan {
+    materialize: bool,
+    bytes: usize,
+    workspace_existing_bytes: usize,
+    budget_bytes: usize,
+    policy_operator_budget_bytes: usize,
+    runtime_available_bytes: Option<usize>,
+    expected_reuse_passes: usize,
+    materialized_row_hessian_evals: usize,
+    streamed_row_hessian_evals: usize,
+    reason: RowPrimaryHessianCacheReason,
+}
+
+fn decide_row_primary_hessian_cache(
+    n: usize,
+    r: usize,
+    policy: &crate::resource::ResourcePolicy,
+    workspace_existing_bytes: usize,
+    expected_reuse_passes: usize,
+    runtime_available_bytes: Option<usize>,
+) -> RowPrimaryHessianCachePlan {
+    let bytes = n
+        .saturating_mul(r)
+        .saturating_mul(r)
+        .saturating_mul(std::mem::size_of::<f64>());
+    let runtime_budget_bytes = runtime_available_bytes
+        .map(|available| available / BMS_ROW_PRIMARY_HESSIAN_RUNTIME_BUDGET_DIVISOR);
+    let budget_bytes = runtime_budget_bytes
+        .unwrap_or(policy.max_operator_cache_bytes)
+        .max(policy.max_operator_cache_bytes);
+    let total_workspace_bytes = workspace_existing_bytes.saturating_add(bytes);
+    let runtime_headroom_ok = runtime_available_bytes
+        .map(|available| total_workspace_bytes <= available / 2)
+        .unwrap_or(true);
+    let streamed_row_hessian_evals = n.saturating_mul(expected_reuse_passes);
+    let materialized_row_hessian_evals = n;
+    let reason = if expected_reuse_passes < BMS_ROW_PRIMARY_HESSIAN_MIN_REUSE_PASSES {
+        RowPrimaryHessianCacheReason::ReuseTooLow
+    } else if !runtime_headroom_ok {
+        RowPrimaryHessianCacheReason::RuntimeMemoryInsufficient
+    } else if total_workspace_bytes > budget_bytes {
+        RowPrimaryHessianCacheReason::WorkspaceBudgetExceeded
+    } else {
+        RowPrimaryHessianCacheReason::ReuseAmortizesBuild
+    };
+    RowPrimaryHessianCachePlan {
+        materialize: matches!(reason, RowPrimaryHessianCacheReason::ReuseAmortizesBuild),
+        bytes,
+        workspace_existing_bytes,
+        budget_bytes,
+        policy_operator_budget_bytes: policy.max_operator_cache_bytes,
+        runtime_available_bytes,
+        expected_reuse_passes,
+        materialized_row_hessian_evals,
+        streamed_row_hessian_evals,
+        reason,
+    }
 }
 
 /// Shared precomputed state plus pre-solved per-row contexts. All row
@@ -4948,6 +5080,21 @@ struct BernoulliMarginalSlopeExactEvalCache {
     /// so caching them lets every pair contraction be a 16-multiply 2×2
     /// bilinear instead of a fresh 8-direction empirical jet.
     rigid_fourth_full: crate::resource::RayonSafeOnce<Result<Vec<[[[[f64; 2]; 2]; 2]; 2]>, String>>,
+}
+
+impl BernoulliMarginalSlopeExactEvalCache {
+    fn resident_bytes_before_row_primary_hessians(&self) -> usize {
+        let row_context_bytes = self
+            .row_contexts
+            .len()
+            .saturating_mul(std::mem::size_of::<BernoulliMarginalSlopeRowExactContext>());
+        let row_cell_bytes = self
+            .row_cell_moments
+            .as_ref()
+            .map(RowCellMomentsBundle::resident_bytes)
+            .unwrap_or(0);
+        row_context_bytes.saturating_add(row_cell_bytes)
+    }
 }
 
 // ── RowKernel<2> implementation (rigid path only) ────────────────────
@@ -5309,6 +5456,7 @@ struct BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
     block_states: Vec<ParameterBlockState>,
     cache: Arc<BernoulliMarginalSlopeExactEvalCache>,
     matvec_calls: AtomicUsize,
+    fused_gradient_dense: OnceLock<Result<Arc<ExactNewtonJointFusedDenseEvaluation>, String>>,
     /// Outer-only joint-Hessian directional-derivative options. The
     /// `outer_score_subsample` field is the row mask threaded through the
     /// `_with_options` directional-derivative helpers so the cached joint
@@ -5316,6 +5464,11 @@ struct BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
     /// biobank scale. When `None`, the row iteration is identical to the
     /// legacy full-data path.
     options: BlockwiseFitOptions,
+}
+
+struct ExactNewtonJointFusedDenseEvaluation {
+    gradient: ExactNewtonJointGradientEvaluation,
+    hessian: Array2<f64>,
 }
 
 struct BernoulliMarginalSlopeExactNewtonJointPsiWorkspace {
@@ -7809,7 +7962,7 @@ impl BernoulliMarginalSlopeFamily {
         });
         let context_row_count = selected_context_rows.as_ref().map_or(n, |rows| rows.len());
         let started = std::time::Instant::now();
-        let _heartbeat = crate::heartbeat::scope(format!(
+        let heartbeat_guard = crate::heartbeat::scope(format!(
             "BMS exact-cache build n={n} context_rows={context_row_count} p={} flex={flex_active}",
             slices.total
         ));
@@ -7998,6 +8151,7 @@ impl BernoulliMarginalSlopeFamily {
                 started.elapsed().as_secs_f64()
             );
         }
+        drop(heartbeat_guard);
         Ok(BernoulliMarginalSlopeExactEvalCache {
             slices,
             primary,
@@ -8044,7 +8198,7 @@ impl BernoulliMarginalSlopeFamily {
         }
         let selected_row_count = selected_rows.len();
         let started = std::time::Instant::now();
-        let _heartbeat = crate::heartbeat::scope(format!(
+        let heartbeat_guard = crate::heartbeat::scope(format!(
             "BMS row-cell-moments n={n} selected_rows={selected_row_count} degree={max_degree}"
         ));
         if log_exact_work(n) {
@@ -8131,6 +8285,7 @@ impl BernoulliMarginalSlopeFamily {
                 moment_started.elapsed().as_secs_f64()
             );
         }
+        drop(heartbeat_guard);
         Ok(Some(RowCellMomentsBundle { max_degree, rows }))
     }
 
@@ -8149,28 +8304,56 @@ impl BernoulliMarginalSlopeFamily {
             .saturating_mul(r)
             .saturating_mul(r)
             .saturating_mul(std::mem::size_of::<f64>());
-        if cache_bytes > self.policy.max_single_materialization_bytes {
+        let plan = decide_row_primary_hessian_cache(
+            n,
+            r,
+            &self.policy,
+            cache.resident_bytes_before_row_primary_hessians(),
+            BMS_ROW_PRIMARY_HESSIAN_EXPECTED_REUSE_PASSES,
+            runtime_available_memory_bytes(),
+        );
+        assert_eq!(
+            cache_bytes, plan.bytes,
+            "row-primary Hessian cache byte plan must match the dense row-cache shape"
+        );
+        if !plan.materialize {
             if log_exact_work(n) {
                 log::info!(
-                    "[BMS row-primary-hessian-cache] stream rows n={} r={} bytes={} limit_bytes={}",
+                    "[BMS row-primary-hessian-cache] stream rows n={} r={} bytes={} workspace_existing_bytes={} budget_bytes={} policy_operator_budget_bytes={} runtime_available_bytes={} expected_reuse_passes={} materialized_row_hessian_evals={} streamed_row_hessian_evals={} reason={}",
                     n,
                     r,
-                    cache_bytes,
-                    self.policy.max_single_materialization_bytes
+                    plan.bytes,
+                    plan.workspace_existing_bytes,
+                    plan.budget_bytes,
+                    plan.policy_operator_budget_bytes,
+                    optional_bytes_for_log(plan.runtime_available_bytes),
+                    plan.expected_reuse_passes,
+                    plan.materialized_row_hessian_evals,
+                    plan.streamed_row_hessian_evals,
+                    plan.reason.as_str(),
                 );
             }
             return Ok(None);
         }
         let started = std::time::Instant::now();
-        let _heartbeat = crate::heartbeat::scope(format!(
-            "BMS row-primary-hessian-cache n={n} r={r} bytes={cache_bytes}"
+        let heartbeat_guard = crate::heartbeat::scope(format!(
+            "BMS row-primary-hessian-cache n={n} r={r} bytes={cache_bytes} budget={}",
+            plan.budget_bytes
         ));
         if log_exact_work(n) {
             log::info!(
-                "[BMS row-primary-hessian-cache] build start n={} r={} bytes={}",
+                "[BMS row-primary-hessian-cache] materialize start n={} r={} bytes={} workspace_existing_bytes={} budget_bytes={} policy_operator_budget_bytes={} runtime_available_bytes={} expected_reuse_passes={} materialized_row_hessian_evals={} streamed_row_hessian_evals={} reason={}",
                 n,
                 r,
-                cache_bytes
+                plan.bytes,
+                plan.workspace_existing_bytes,
+                plan.budget_bytes,
+                plan.policy_operator_budget_bytes,
+                optional_bytes_for_log(plan.runtime_available_bytes),
+                plan.expected_reuse_passes,
+                plan.materialized_row_hessian_evals,
+                plan.streamed_row_hessian_evals,
+                plan.reason.as_str(),
             );
         }
         let completed_rows = AtomicUsize::new(0);
@@ -8220,6 +8403,7 @@ impl BernoulliMarginalSlopeFamily {
                 started.elapsed().as_secs_f64()
             );
         }
+        drop(heartbeat_guard);
         Ok(Some(packed))
     }
 
@@ -12433,13 +12617,19 @@ impl BernoulliMarginalSlopeFamily {
         let primary = &cache.primary;
         let n = self.y.len();
         let started = std::time::Instant::now();
-        let _heartbeat =
+        let heartbeat_guard =
             crate::heartbeat::scope(format!("BMS dense-H build n={n} p={}", slices.total));
+        let hessian_source = if cache.row_primary_hessians.is_some() {
+            "row-primary-cache"
+        } else {
+            "row-stream"
+        };
         if log_exact_work(n) {
             log::info!(
-                "[BMS dense-H] build start n={} p={} source=cache",
+                "[BMS dense-H] build start n={} p={} source={} route=workspace-dense",
                 n,
-                slices.total
+                slices.total,
+                hessian_source
             );
         }
         let n_chunks = n.div_ceil(ROW_CHUNK_SIZE);
@@ -12591,13 +12781,274 @@ impl BernoulliMarginalSlopeFamily {
         let dense = acc.to_dense(slices);
         if log_exact_work(n) {
             log::info!(
-                "[BMS dense-H] build done n={} p={} source=cache elapsed={:.3}s",
+                "[BMS dense-H] build done n={} p={} source={} route=workspace-dense elapsed={:.3}s",
+                n,
+                slices.total,
+                hessian_source,
+                started.elapsed().as_secs_f64()
+            );
+        }
+        drop(heartbeat_guard);
+        Ok(dense)
+    }
+
+    fn exact_newton_joint_fused_gradient_dense_from_cache(
+        &self,
+        block_states: &[ParameterBlockState],
+        cache: &BernoulliMarginalSlopeExactEvalCache,
+    ) -> Result<ExactNewtonJointFusedDenseEvaluation, String> {
+        let slices = &cache.slices;
+        let primary = &cache.primary;
+        let n = self.y.len();
+        let started = std::time::Instant::now();
+        let heartbeat_guard = crate::heartbeat::scope(format!(
+            "BMS fused exact-gradient+dense-H n={n} p={}",
+            slices.total
+        ));
+        if log_exact_work(n) {
+            log::info!(
+                "[BMS fused exact-gradient+dense-H] eval start n={} p={} source=cache row_primary_hessian_cache={}",
+                n,
+                slices.total,
+                cache.row_primary_hessians.is_some()
+            );
+        }
+        let make_acc = || {
+            (
+                0.0_f64,
+                Array1::<f64>::zeros(slices.marginal.len()),
+                Array1::<f64>::zeros(slices.logslope.len()),
+                slices
+                    .h
+                    .as_ref()
+                    .map(|range| Array1::<f64>::zeros(range.len())),
+                slices
+                    .w
+                    .as_ref()
+                    .map(|range| Array1::<f64>::zeros(range.len())),
+                BernoulliBlockHessianAccumulator::new(slices),
+            )
+        };
+        let n_chunks = n.div_ceil(ROW_CHUNK_SIZE);
+        let completed_chunks = AtomicUsize::new(0);
+        let progress_step = (n_chunks / 10).max(1);
+        let (log_likelihood, grad_marginal, grad_logslope, grad_h, grad_w, hessian_acc) =
+            (0..n_chunks)
+                .into_par_iter()
+                .try_fold(make_acc, |mut acc, chunk_idx| -> Result<_, String> {
+                    let start = chunk_idx * ROW_CHUNK_SIZE;
+                    let end = (start + ROW_CHUNK_SIZE).min(n);
+                    let chunk_len = end - start;
+                    let mut w_mm = Array1::<f64>::zeros(chunk_len);
+                    let mut w_mg = Array1::<f64>::zeros(chunk_len);
+                    let mut w_gg = Array1::<f64>::zeros(chunk_len);
+                    let mut h_q = primary
+                        .h
+                        .as_ref()
+                        .map(|range| Array2::<f64>::zeros((chunk_len, range.len())));
+                    let mut h_g = primary
+                        .h
+                        .as_ref()
+                        .map(|range| Array2::<f64>::zeros((chunk_len, range.len())));
+                    let mut h_h = primary
+                        .h
+                        .as_ref()
+                        .map(|range| Array2::<f64>::zeros((range.len(), range.len())));
+                    let mut w_q = primary
+                        .w
+                        .as_ref()
+                        .map(|range| Array2::<f64>::zeros((chunk_len, range.len())));
+                    let mut w_g = primary
+                        .w
+                        .as_ref()
+                        .map(|range| Array2::<f64>::zeros((chunk_len, range.len())));
+                    let mut h_w = match (primary.h.as_ref(), primary.w.as_ref()) {
+                        (Some(h_range), Some(w_range)) => {
+                            Some(Array2::<f64>::zeros((h_range.len(), w_range.len())))
+                        }
+                        _ => None,
+                    };
+                    let mut w_w = primary
+                        .w
+                        .as_ref()
+                        .map(|range| Array2::<f64>::zeros((range.len(), range.len())));
+                    let mut scratch = BernoulliMarginalSlopeFlexRowScratch::new(primary.total);
+                    for (local, row) in (start..end).enumerate() {
+                        let row_ctx = Self::row_ctx(cache, row);
+                        let cached_hessian = Self::cached_row_primary_hessian(cache, row);
+                        let row_moments = cache
+                            .row_cell_moments
+                            .as_ref()
+                            .and_then(|bundle| bundle.row(row, 9));
+                        let neglog = self.compute_row_analytic_flex_into_with_moments(
+                            row,
+                            block_states,
+                            primary,
+                            row_ctx,
+                            row_moments,
+                            cached_hessian.is_none(),
+                            &mut scratch,
+                        )?;
+                        acc.0 -= neglog;
+                        {
+                            let mut marginal = acc.1.view_mut();
+                            self.marginal_design.axpy_row_into(
+                                row,
+                                Self::exact_newton_score_component_from_objective_gradient(
+                                    scratch.grad[0],
+                                ),
+                                &mut marginal,
+                            )?;
+                        }
+                        {
+                            let mut logslope = acc.2.view_mut();
+                            self.logslope_design.axpy_row_into(
+                                row,
+                                Self::exact_newton_score_component_from_objective_gradient(
+                                    scratch.grad[1],
+                                ),
+                                &mut logslope,
+                            )?;
+                        }
+                        if let (Some(primary_h), Some(grad_h)) =
+                            (primary.h.as_ref(), acc.3.as_mut())
+                        {
+                            for idx in 0..primary_h.len() {
+                                grad_h[idx] +=
+                                    Self::exact_newton_score_component_from_objective_gradient(
+                                        scratch.grad[primary_h.start + idx],
+                                    );
+                            }
+                        }
+                        if let (Some(primary_w), Some(grad_w)) =
+                            (primary.w.as_ref(), acc.4.as_mut())
+                        {
+                            for idx in 0..primary_w.len() {
+                                grad_w[idx] +=
+                                    Self::exact_newton_score_component_from_objective_gradient(
+                                        scratch.grad[primary_w.start + idx],
+                                    );
+                            }
+                        }
+
+                        let hess_view = cached_hessian.unwrap_or_else(|| scratch.hess.view());
+                        w_mm[local] = hess_view[[0, 0]];
+                        w_mg[local] = hess_view[[0, 1]];
+                        w_gg[local] = hess_view[[1, 1]];
+                        if let Some(primary_h) = primary.h.as_ref() {
+                            if let Some(ref mut hq) = h_q {
+                                hq.row_mut(local)
+                                    .assign(&hess_view.slice(s![0, primary_h.clone()]));
+                            }
+                            if let Some(ref mut hg) = h_g {
+                                hg.row_mut(local)
+                                    .assign(&hess_view.slice(s![1, primary_h.clone()]));
+                            }
+                            if let Some(ref mut hh) = h_h {
+                                hh.scaled_add(
+                                    1.0,
+                                    &hess_view.slice(s![primary_h.clone(), primary_h.clone()]),
+                                );
+                            }
+                        }
+                        if let Some(primary_w) = primary.w.as_ref() {
+                            if let Some(ref mut wq) = w_q {
+                                wq.row_mut(local)
+                                    .assign(&hess_view.slice(s![0, primary_w.clone()]));
+                            }
+                            if let Some(ref mut wg) = w_g {
+                                wg.row_mut(local)
+                                    .assign(&hess_view.slice(s![1, primary_w.clone()]));
+                            }
+                            if let Some(ref mut ww) = w_w {
+                                ww.scaled_add(
+                                    1.0,
+                                    &hess_view.slice(s![primary_w.clone(), primary_w.clone()]),
+                                );
+                            }
+                            if let (Some(primary_h), Some(ref mut hw)) =
+                                (primary.h.as_ref(), h_w.as_mut())
+                            {
+                                hw.scaled_add(
+                                    1.0,
+                                    &hess_view.slice(s![primary_h.clone(), primary_w.clone()]),
+                                );
+                            }
+                        }
+                    }
+                    acc.5
+                        .add_weighted_design_grams(self, start..end, &w_mm, &w_mg, &w_gg)?;
+                    acc.5.add_weighted_hw_cross_terms(
+                        self,
+                        start..end,
+                        slices,
+                        h_q.as_ref(),
+                        h_g.as_ref(),
+                        h_h.as_ref(),
+                        w_q.as_ref(),
+                        w_g.as_ref(),
+                        h_w.as_ref(),
+                        w_w.as_ref(),
+                    )?;
+                    if log_exact_work(n) {
+                        let done = completed_chunks.fetch_add(1, Ordering::Relaxed) + 1;
+                        if done == n_chunks || done % progress_step == 0 {
+                            log::info!(
+                                "[BMS fused exact-gradient+dense-H] progress chunks={}/{} rows={}/{} elapsed={:.3}s",
+                                done,
+                                n_chunks,
+                                (done * ROW_CHUNK_SIZE).min(n),
+                                n,
+                                started.elapsed().as_secs_f64()
+                            );
+                        }
+                    }
+                    Ok(acc)
+                })
+                .try_reduce(make_acc, |mut left, right| -> Result<_, String> {
+                    left.0 += right.0;
+                    left.1 += &right.1;
+                    left.2 += &right.2;
+                    if let (Some(lhs), Some(rhs)) = (left.3.as_mut(), right.3.as_ref()) {
+                        *lhs += rhs;
+                    }
+                    if let (Some(lhs), Some(rhs)) = (left.4.as_mut(), right.4.as_ref()) {
+                        *lhs += rhs;
+                    }
+                    left.5.add(&right.5);
+                    Ok(left)
+                })?;
+
+        let mut gradient = Array1::<f64>::zeros(slices.total);
+        gradient
+            .slice_mut(s![slices.marginal.clone()])
+            .assign(&grad_marginal);
+        gradient
+            .slice_mut(s![slices.logslope.clone()])
+            .assign(&grad_logslope);
+        if let (Some(range), Some(grad_h)) = (slices.h.as_ref(), grad_h.as_ref()) {
+            gradient.slice_mut(s![range.clone()]).assign(grad_h);
+        }
+        if let (Some(range), Some(grad_w)) = (slices.w.as_ref(), grad_w.as_ref()) {
+            gradient.slice_mut(s![range.clone()]).assign(grad_w);
+        }
+        let hessian = hessian_acc.to_dense(slices);
+        if log_exact_work(n) {
+            log::info!(
+                "[BMS fused exact-gradient+dense-H] eval done n={} p={} source=cache elapsed={:.3}s",
                 n,
                 slices.total,
                 started.elapsed().as_secs_f64()
             );
         }
-        Ok(dense)
+        drop(heartbeat_guard);
+        Ok(ExactNewtonJointFusedDenseEvaluation {
+            gradient: ExactNewtonJointGradientEvaluation {
+                log_likelihood,
+                gradient,
+            },
+            hessian,
+        })
     }
 
     fn log_likelihood_from_exact_cache(
@@ -12611,7 +13062,7 @@ impl BernoulliMarginalSlopeFamily {
         }
         let n = self.y.len();
         let started = std::time::Instant::now();
-        let _heartbeat = crate::heartbeat::scope(format!(
+        let heartbeat_guard = crate::heartbeat::scope(format!(
             "BMS exact-loglik eval n={n} p={}",
             cache.slices.total
         ));
@@ -12658,6 +13109,7 @@ impl BernoulliMarginalSlopeFamily {
                 started.elapsed().as_secs_f64()
             );
         }
+        drop(heartbeat_guard);
         Ok(log_likelihood)
     }
 
@@ -12670,7 +13122,7 @@ impl BernoulliMarginalSlopeFamily {
         let primary = &cache.primary;
         let n = self.y.len();
         let started = std::time::Instant::now();
-        let _heartbeat =
+        let heartbeat_guard =
             crate::heartbeat::scope(format!("BMS exact-gradient eval n={n} p={}", slices.total));
         if log_exact_work(n) {
             log::info!(
@@ -12790,6 +13242,7 @@ impl BernoulliMarginalSlopeFamily {
                 started.elapsed().as_secs_f64()
             );
         }
+        drop(heartbeat_guard);
         Ok(ExactNewtonJointGradientEvaluation {
             log_likelihood,
             gradient,
@@ -14123,7 +14576,7 @@ impl BernoulliMarginalSlopeFamily {
         let n_dirs = d_beta_flats.len();
         let flex_active = self.effective_flex_active(block_states)?;
         let bundle_present = cache.row_cell_moments.is_some();
-        let _heartbeat = crate::heartbeat::scope(format!(
+        let heartbeat_guard = crate::heartbeat::scope(format!(
             "BMS batched dH n={n} rows={n_rows} p={} dirs={n_dirs} flex={flex_active} cell_moments_bundle={bundle_present}",
             slices.total
         ));
@@ -14439,10 +14892,12 @@ impl BernoulliMarginalSlopeFamily {
             n_dirs,
             elapsed
         );
-        Ok(accs
+        let operators = accs
             .drain(..)
             .map(|acc| Some(Arc::new(acc.into_operator(slices)) as Arc<dyn HyperOperator>))
-            .collect())
+            .collect();
+        drop(heartbeat_guard);
+        Ok(operators)
     }
 
     fn exact_newton_joint_hessiansecond_directional_derivative_from_cache(
@@ -15071,24 +15526,60 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         use crate::custom_family::ExactOuterDerivativeOrder;
 
         let flex_active = self.score_warp.is_some() || self.link_dev.is_some();
-        if flex_active && self.y.len() >= BMS_FLEX_OUTER_HESSIAN_ROW_LIMIT {
-            return ExactOuterDerivativeOrder::First;
-        }
-
         let coefficient_work = self
             .coefficient_hessian_cost(specs)
             .max(self.coefficient_gradient_cost(specs));
-        if !self.outer_hyper_hessian_dense_available(specs)
-            && !self.outer_hyper_hessian_hvp_available(specs)
-        {
+        let dense_available = self.outer_hyper_hessian_dense_available(specs);
+        let hvp_available = self.outer_hyper_hessian_hvp_available(specs);
+        if !dense_available && !hvp_available {
+            if log_exact_work(self.y.len()) {
+                log::info!(
+                    "[BMS outer-derivative-policy] n={} p={} flex={} order=First reason=no-outer-hessian dense_available={} outer_hvp_available={} coefficient_work={}",
+                    self.y.len(),
+                    specs.iter().map(|spec| spec.design.ncols()).sum::<usize>(),
+                    flex_active,
+                    dense_available,
+                    hvp_available,
+                    coefficient_work,
+                );
+            }
             return ExactOuterDerivativeOrder::First;
         }
 
-        crate::custom_family::exact_outer_order_with_outer_hvp(
+        let order = crate::custom_family::exact_outer_order_with_outer_hvp(
             specs,
             coefficient_work,
-            self.outer_hyper_hessian_hvp_available(specs),
-        )
+            hvp_available,
+        );
+        if log_exact_work(self.y.len()) {
+            let p_total = specs.iter().map(|spec| spec.design.ncols()).sum::<usize>();
+            let matrix_free_inner_requested =
+                crate::custom_family::use_joint_matrix_free_path(p_total, self.y.len());
+            let inner_route = if matrix_free_inner_requested
+                && self.inner_coefficient_hessian_hvp_available(specs)
+            {
+                "workspace-hvp"
+            } else if p_total < 512 {
+                "workspace-dense"
+            } else if self.inner_coefficient_hessian_hvp_available(specs) {
+                "workspace-hvp"
+            } else {
+                "direct-dense"
+            };
+            log::info!(
+                "[BMS outer-derivative-policy] n={} p={} flex={} order={:?} declared_hessian=analytic inner_route={} matrix_free_inner_requested={} dense_available={} outer_hvp_available={} coefficient_work={}",
+                self.y.len(),
+                p_total,
+                flex_active,
+                order,
+                inner_route,
+                matrix_free_inner_requested,
+                dense_available,
+                hvp_available,
+                coefficient_work,
+            );
+        }
+        order
     }
 
     fn outer_seed_config(&self, n_params: usize) -> crate::seeding::SeedConfig {
@@ -15836,7 +16327,7 @@ impl BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
         options: BlockwiseFitOptions,
     ) -> Result<Self, String> {
         let started = std::time::Instant::now();
-        let _heartbeat = crate::heartbeat::scope(format!(
+        let heartbeat_guard = crate::heartbeat::scope(format!(
             "BMS Hessian-workspace build n={} p={} subsample_rows={}",
             family.y.len(),
             block_slices(&family).total,
@@ -15873,7 +16364,9 @@ impl BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
                 started.elapsed().as_secs_f64()
             );
         }
-        Self::from_arc_cache(family, block_states, Arc::new(cache), options)
+        let workspace = Self::from_arc_cache(family, block_states, Arc::new(cache), options);
+        drop(heartbeat_guard);
+        workspace
     }
 
     fn from_arc_cache(
@@ -15887,8 +16380,22 @@ impl BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
             block_states,
             cache,
             matvec_calls: AtomicUsize::new(0),
+            fused_gradient_dense: OnceLock::new(),
             options,
         })
+    }
+
+    fn fused_gradient_dense(&self) -> Result<Arc<ExactNewtonJointFusedDenseEvaluation>, String> {
+        self.fused_gradient_dense
+            .get_or_init(|| {
+                self.family
+                    .exact_newton_joint_fused_gradient_dense_from_cache(
+                        &self.block_states,
+                        &self.cache,
+                    )
+                    .map(Arc::new)
+            })
+            .clone()
     }
 }
 
@@ -15897,9 +16404,8 @@ impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJoint
         if self.cache.slices.total >= 512 {
             return Ok(None);
         }
-        self.family
-            .exact_newton_joint_hessian_dense_from_cache(&self.block_states, &self.cache)
-            .map(Some)
+        self.fused_gradient_dense()
+            .map(|fused| Some(fused.hessian.clone()))
     }
 
     fn joint_log_likelihood_evaluation(&self) -> Result<Option<f64>, String> {
@@ -15911,6 +16417,18 @@ impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJoint
     fn joint_gradient_evaluation(
         &self,
     ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
+        if self.cache.slices.total < 512 {
+            // The only current consumer of workspace-side joint gradients is
+            // the exact joint-Newton path. For bounded dense systems it will
+            // request the dense Hessian in the same cycle, so build the fused
+            // row pass once and let `hessian_dense` reuse it.
+            return self.fused_gradient_dense().map(|fused| {
+                Some(ExactNewtonJointGradientEvaluation {
+                    log_likelihood: fused.gradient.log_likelihood,
+                    gradient: fused.gradient.gradient.clone(),
+                })
+            });
+        }
         self.family
             .exact_newton_joint_gradient_evaluation_from_cache(&self.block_states, &self.cache)
             .map(Some)
@@ -15922,7 +16440,7 @@ impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJoint
         // does not apply here — keep full-data semantics.
         let call = self.matvec_calls.fetch_add(1, Ordering::Relaxed) + 1;
         let started = std::time::Instant::now();
-        let _heartbeat = crate::heartbeat::scope(format!(
+        let heartbeat_guard = crate::heartbeat::scope(format!(
             "BMS Hessian-Hv call={call} n={} p={}",
             self.family.y.len(),
             self.cache.slices.total
@@ -15937,13 +16455,15 @@ impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJoint
             .map(Some);
         if log_exact_work(self.family.y.len()) && (call <= 3 || call.is_power_of_two()) {
             log::info!(
-                "[BMS Hessian-Hv] call={} n={} p={} elapsed={:.3}s",
+                "[BMS Hessian-Hv] call={} n={} p={} primary_hessian_cache={} elapsed={:.3}s",
                 call,
                 self.family.y.len(),
                 self.cache.slices.total,
+                self.cache.row_primary_hessians.is_some(),
                 started.elapsed().as_secs_f64()
             );
         }
+        drop(heartbeat_guard);
         result
     }
 
@@ -21137,7 +21657,20 @@ mod tests {
         assert_eq!(
             large_flex_family
                 .exact_outer_derivative_order(&large_flex_specs, &BlockwiseFitOptions::default()),
-            ExactOuterDerivativeOrder::First
+            ExactOuterDerivativeOrder::Second
+        );
+        let (large_flex_gradient, large_flex_hessian) = custom_family_outer_derivatives(
+            &large_flex_family,
+            &large_flex_specs,
+            &BlockwiseFitOptions::default(),
+        );
+        assert_eq!(
+            large_flex_gradient,
+            crate::solver::outer_strategy::Derivative::Analytic
+        );
+        assert_eq!(
+            large_flex_hessian,
+            crate::solver::outer_strategy::DeclaredHessianForm::Either
         );
 
         let mut large_rigid_family = large_flex_family.clone();
@@ -26991,6 +27524,97 @@ mod tests {
     }
 
     #[test]
+    fn bernoulli_flex_row_primary_hessian_cache_policy_materializes_aou_shape() {
+        let policy = crate::resource::ResourcePolicy::default_library();
+        let plan = decide_row_primary_hessian_cache(
+            195_780,
+            20,
+            &policy,
+            0,
+            BMS_ROW_PRIMARY_HESSIAN_EXPECTED_REUSE_PASSES,
+            None,
+        );
+        assert_eq!(plan.bytes, 626_496_000);
+        assert!(
+            plan.bytes > policy.max_single_materialization_bytes,
+            "test must cover the old fixed per-materialization cutoff"
+        );
+        assert!(
+            plan.materialize,
+            "AoU-sized row-primary Hessian cache should materialize under the default workspace budget"
+        );
+        assert_eq!(
+            plan.reason,
+            RowPrimaryHessianCacheReason::ReuseAmortizesBuild
+        );
+    }
+
+    #[test]
+    fn bernoulli_flex_row_primary_hessian_cache_policy_streams_when_workspace_budget_exceeded() {
+        let mut policy = crate::resource::ResourcePolicy::default_library();
+        policy.max_operator_cache_bytes = 384 * 1024 * 1024;
+        let plan = decide_row_primary_hessian_cache(
+            195_780,
+            20,
+            &policy,
+            0,
+            BMS_ROW_PRIMARY_HESSIAN_EXPECTED_REUSE_PASSES,
+            None,
+        );
+        assert!(!plan.materialize);
+        assert_eq!(
+            plan.reason,
+            RowPrimaryHessianCacheReason::WorkspaceBudgetExceeded
+        );
+    }
+
+    #[test]
+    fn bernoulli_flex_row_primary_hessian_cache_policy_uses_runtime_memory_budget() {
+        let mut policy = crate::resource::ResourcePolicy::default_library();
+        policy.max_operator_cache_bytes = 384 * 1024 * 1024;
+        let plan = decide_row_primary_hessian_cache(
+            195_780,
+            20,
+            &policy,
+            0,
+            BMS_ROW_PRIMARY_HESSIAN_EXPECTED_REUSE_PASSES,
+            Some(16 * 1024 * 1024 * 1024),
+        );
+        assert!(plan.materialize);
+        assert_eq!(plan.budget_bytes, 2 * 1024 * 1024 * 1024);
+        assert_eq!(
+            plan.reason,
+            RowPrimaryHessianCacheReason::ReuseAmortizesBuild
+        );
+    }
+
+    #[test]
+    fn bernoulli_flex_row_primary_hessian_cache_policy_respects_runtime_headroom() {
+        let policy = crate::resource::ResourcePolicy::default_library();
+        let plan = decide_row_primary_hessian_cache(
+            195_780,
+            20,
+            &policy,
+            0,
+            BMS_ROW_PRIMARY_HESSIAN_EXPECTED_REUSE_PASSES,
+            Some(900 * 1024 * 1024),
+        );
+        assert!(!plan.materialize);
+        assert_eq!(
+            plan.reason,
+            RowPrimaryHessianCacheReason::RuntimeMemoryInsufficient
+        );
+    }
+
+    #[test]
+    fn bernoulli_flex_row_primary_hessian_cache_policy_streams_low_reuse() {
+        let policy = crate::resource::ResourcePolicy::default_library();
+        let plan = decide_row_primary_hessian_cache(100, 4, &policy, 0, 1, None);
+        assert!(!plan.materialize);
+        assert_eq!(plan.reason, RowPrimaryHessianCacheReason::ReuseTooLow);
+    }
+
+    #[test]
     fn bernoulli_flex_hvp_cache_matches_uncached_path_small_case() {
         let (family, states) = make_flex_hvp_cache_test_family(12);
         let mut cached = family
@@ -27018,6 +27642,18 @@ mod tests {
             .expect("uncached Hv");
         let rel = rel_diff_array1(&hv_cached, &hv_uncached);
         assert!(rel < 5e-11, "cached Hv drift rel {rel}");
+
+        let dense_cached = family
+            .exact_newton_joint_hessian_dense_from_cache(&states, &cached)
+            .expect("cached dense Hessian");
+        let dense_uncached = family
+            .exact_newton_joint_hessian_dense_from_cache(&states, &uncached)
+            .expect("uncached dense Hessian");
+        let rel_dense = rel_diff_array2(&dense_cached, &dense_uncached);
+        assert!(
+            rel_dense < 5e-11,
+            "cached dense Hessian drift rel {rel_dense}"
+        );
 
         let diag_cached = family
             .exact_newton_joint_hessian_diagonal_from_cache(&states, &cached)

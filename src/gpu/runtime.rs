@@ -57,11 +57,11 @@ impl GpuRuntime {
             // fit fell back to CPU. Keep the preflight completely outside
             // cudarc: use gam's own `libloading` probe first, and only touch
             // cudarc after the platform loader can open `libcuda`.
-            if let Err(err) = crate::gpu::driver::preload_cuda_driver() {
-                let reason = format!("CUDA driver library not present on this host: {err}");
-                Self::record_cpu_reason(reason.clone());
-                diagnostics::log_cuda_disabled(&reason);
-                return Err(GpuProbeError::Driver(reason));
+            if crate::gpu::driver::preload_cuda_driver().is_err() {
+                let reason = "libcuda unavailable";
+                Self::record_cpu_reason(reason);
+                diagnostics::log_cuda_disabled(reason);
+                return Err(GpuProbeError::Driver(reason.to_string()));
             }
 
             let device_count = CudaContext::device_count()

@@ -10,6 +10,8 @@ from typing import Any, overload
 
 from ._binding import RustExtensionUnavailableError, extension_status, rust_module
 from ._cuda import cuda_diagnostics as _cuda_diagnostics
+from ._cuda import cuda_subprocess_env as _cuda_subprocess_env
+from ._cuda import cuda_subprocess_library_dirs as _cuda_subprocess_library_dirs
 from ._cuda import format_cuda_diagnostics as _format_cuda_diagnostics
 from ._exceptions import map_exception
 from ._model import Model
@@ -188,6 +190,18 @@ def cuda_diagnostics() -> dict[str, object]:
     """Return CUDA loader diagnostics without forcing Rust GPU dispatch."""
 
     return _cuda_diagnostics()
+
+
+def cuda_subprocess_library_dirs() -> tuple[str, ...]:
+    """Return packaged CUDA wheel library directories for subprocess launchers."""
+
+    return _cuda_subprocess_library_dirs()
+
+
+def cuda_subprocess_env(env: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Return ``env`` with packaged CUDA wheel dirs prepended to ``LD_LIBRARY_PATH``."""
+
+    return _cuda_subprocess_env(env)
 
 
 def format_cuda_diagnostics() -> str:
