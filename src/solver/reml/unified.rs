@@ -6964,6 +6964,7 @@ pub fn reml_laml_evaluate(
         .map(|lambda| rho_curvature_lambda(solution, lambda))
         .collect();
     let hop = &*solution.hessian_op;
+    let upper_active_rho = active_upper_rho_mask(rho);
 
     // ─── Shared intermediates (computed once, used by both cost and gradient) ───
 
@@ -7290,7 +7291,14 @@ pub fn reml_laml_evaluate(
                 Some(
                     rho_curvature_a_k_betas
                         .iter()
-                        .map(&apply)
+                        .enumerate()
+                        .map(|(idx, a_k_beta)| {
+                            if upper_active_rho[idx] {
+                                Array1::<f64>::zeros(hop.dim())
+                            } else {
+                                apply(a_k_beta)
+                            }
+                        })
                         .collect::<Vec<_>>(),
                 )
             } else {
@@ -7306,8 +7314,10 @@ pub fn reml_laml_evaluate(
             let mut rhs_stack = Array2::<f64>::zeros((dim, total_cols));
             let mut col_idx = 0;
             if need_rho_mode_responses {
-                for a_k_beta in rho_curvature_a_k_betas.iter() {
-                    rhs_stack.column_mut(col_idx).assign(a_k_beta);
+                for (idx, a_k_beta) in rho_curvature_a_k_betas.iter().enumerate() {
+                    if !upper_active_rho[idx] {
+                        rhs_stack.column_mut(col_idx).assign(a_k_beta);
+                    }
                     col_idx += 1;
                 }
             }
@@ -7716,10 +7726,11 @@ pub fn reml_laml_evaluate(
                 solution,
                 hop,
                 &lambdas,
-                &rho_penalty_a_k_betas,
-                r,
-                mode == EvalMode::ValueGradientHessian,
-            )?)
+            &rho_penalty_a_k_betas,
+            r,
+            mode == EvalMode::ValueGradientHessian,
+            &upper_active_rho,
+        )?)
         } else {
             None
         };
