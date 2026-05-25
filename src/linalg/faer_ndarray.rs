@@ -1687,8 +1687,8 @@ mod tests {
             [0.0, 2.0, 0.0],
             [0.0, 0.0, 0.0],
         ];
-        let result = rrqr_with_permutation(&a, default_rrqr_rank_alpha())
-            .expect("RRQR should succeed");
+        let result =
+            rrqr_with_permutation(&a, default_rrqr_rank_alpha()).expect("RRQR should succeed");
         assert_eq!(result.rank, 2);
         assert_eq!(result.column_permutation.len(), 3);
         let demoted = result.column_permutation[result.rank..].to_vec();
@@ -1698,14 +1698,18 @@ mod tests {
         );
         let mut sorted = result.column_permutation.clone();
         sorted.sort();
-        assert_eq!(sorted, vec![0, 1, 2], "permutation must be a valid bijection on 0..n");
+        assert_eq!(
+            sorted,
+            vec![0, 1, 2],
+            "permutation must be a valid bijection on 0..n"
+        );
     }
 
     #[test]
     fn rrqr_with_permutation_full_rank_returns_identity_like_order() {
         let a = array![[1.0, 0.0], [0.0, 2.0], [0.0, 0.0]];
-        let result = rrqr_with_permutation(&a, default_rrqr_rank_alpha())
-            .expect("RRQR should succeed");
+        let result =
+            rrqr_with_permutation(&a, default_rrqr_rank_alpha()).expect("RRQR should succeed");
         assert_eq!(result.rank, 2);
         let mut sorted = result.column_permutation.clone();
         sorted.sort();
