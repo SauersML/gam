@@ -1320,19 +1320,6 @@ fn numeric_matrix_validate<'py>(
 }
 
 #[pyfunction]
-fn numeric_matrix_f64<'py>(
-    py: Python<'py>,
-    values: &Bound<'py, PyAny>,
-    label: &str,
-) -> PyResult<Bound<'py, PyArray2<f64>>> {
-    let np = py.import("numpy")?;
-    let kwargs = PyDict::new(py);
-    kwargs.set_item("dtype", "float")?;
-    let array = np.call_method("asarray", (values,), Some(&kwargs))?;
-    numeric_matrix_validate(py, &array, label)
-}
-
-#[pyfunction]
 fn marginal_slope_clip_probabilities(values: Vec<f64>) -> PyResult<Vec<f64>> {
     Ok(values
         .into_iter()
@@ -16872,7 +16859,6 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(survival_block, module)?)?;
     module.add_function(wrap_pyfunction!(survival_ffi_surface, module)?)?;
     module.add_function(wrap_pyfunction!(numeric_matrix_validate, module)?)?;
-    module.add_function(wrap_pyfunction!(numeric_matrix_f64, module)?)?;
     module.add_function(wrap_pyfunction!(marginal_slope_clip_probabilities, module)?)?;
     module.add_function(wrap_pyfunction!(
         transformation_normal_z_from_columns,
@@ -17039,6 +17025,34 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(compute_residuals, module)?)?;
     module.add_function(wrap_pyfunction!(diagnostics_from_predictions, module)?)?;
     module.add_function(wrap_pyfunction!(benchmark_prediction_metrics, module)?)?;
+    module.add_function(wrap_pyfunction!(binary_auc, module)?)?;
+    module.add_function(wrap_pyfunction!(binary_brier, module)?)?;
+    module.add_function(wrap_pyfunction!(classification_metrics, module)?)?;
+    module.add_function(wrap_pyfunction!(auc_from_predictions, module)?)?;
+    module.add_function(wrap_pyfunction!(brier_from_predictions, module)?)?;
+    module.add_function(wrap_pyfunction!(log_loss_from_predictions, module)?)?;
+    module.add_function(wrap_pyfunction!(nagelkerke_r2_from_predictions, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        gaussian_log_loss_from_predictions,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        gaussian_prediction_scores_from_predictions,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(make_folds_indices, module)?)?;
+    module.add_function(wrap_pyfunction!(zscore_train_test_arrays, module)?)?;
+    module.add_function(wrap_pyfunction!(survival_score_grid_from_times, module)?)?;
+    module.add_function(wrap_pyfunction!(repeat_survival_curve, module)?)?;
+    module.add_function(wrap_pyfunction!(survival_null_curve_from_train, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        survival_matrix_from_risk_calibration,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        survival_lifted_metrics_from_predictions,
+        module
+    )?)?;
     // LatentCoord input-location derivative helpers (one per basis kind).
     module.add_function(wrap_pyfunction!(
         duchon_input_location_first_derivative,
