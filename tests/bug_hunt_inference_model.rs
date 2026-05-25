@@ -1,6 +1,6 @@
 use gam::families::lognormal_kernel::FrailtySpec;
 use gam::inference::model::{
-    FittedFamily, FittedModel, FittedModelPayload, ModelKind, MODEL_PAYLOAD_VERSION,
+    FittedFamily, FittedModel, FittedModelPayload, MODEL_PAYLOAD_VERSION, ModelKind,
 };
 use gam::types::{
     InverseLink, LatentCLogLogState, LikelihoodSpec, LinkComponent, LinkFunction, MixtureLinkState,
@@ -54,8 +54,8 @@ fn fitted_family_all_variants_round_trip_to_identical_json_bytes() {
             .expect("each FittedFamily variant should serialize to JSON bytes");
         let decoded: FittedFamily =
             serde_json::from_slice(&bytes).expect("serialized FittedFamily should deserialize");
-        let reencoded = serde_json::to_vec(&decoded)
-            .expect("deserialized FittedFamily should serialize again");
+        let reencoded =
+            serde_json::to_vec(&decoded).expect("deserialized FittedFamily should serialize again");
         assert_eq!(
             bytes, reencoded,
             "each FittedFamily variant should round-trip to the same JSON bytes"
@@ -141,7 +141,8 @@ fn standard_family_parameterized_link_states_survive_serde_round_trip() {
     };
 
     let bytes = serde_json::to_vec(&original).expect("standard family should serialize");
-    let decoded: FittedFamily = serde_json::from_slice(&bytes).expect("standard family should deserialize");
+    let decoded: FittedFamily =
+        serde_json::from_slice(&bytes).expect("standard family should deserialize");
     assert_eq!(
         serde_json::to_value(original).expect("original family should convert to JSON value"),
         serde_json::to_value(decoded).expect("decoded family should convert to JSON value"),

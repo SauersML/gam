@@ -1,12 +1,12 @@
 use gam::inference::prediction_linalg::PredictionCovarianceBackend;
 use gam::matrix::SymmetricMatrix;
 use gam::predict::{
-    enrich_posterior_mean_bounds, predict_gam_posterior_meanwith_backend,
-    predict_gamwith_uncertainty, InferenceCovarianceMode, MeanIntervalMethod, PredictPosteriorMeanResult,
-    PredictUncertaintyOptions,
+    InferenceCovarianceMode, MeanIntervalMethod, PredictPosteriorMeanResult,
+    PredictUncertaintyOptions, enrich_posterior_mean_bounds,
+    predict_gam_posterior_meanwith_backend, predict_gamwith_uncertainty,
 };
 use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily};
-use ndarray::{array, Array1, Array2};
+use ndarray::{Array1, Array2, array};
 
 fn like(response: ResponseFamily, link: LinkFunction) -> LikelihoodSpec {
     LikelihoodSpec::new(response, InverseLink::Standard(link))
@@ -79,8 +79,18 @@ fn enrich_posterior_mean_bounds_clamps_domains_for_probability_and_count_familie
     )
     .expect("poisson-family bounds should be enrichable");
     assert!(
-        pois_result.mean_lower.as_ref().expect("lower").iter().all(|v| *v >= 0.0)
-            && pois_result.mean_upper.as_ref().expect("upper").iter().all(|v| *v >= 0.0),
+        pois_result
+            .mean_lower
+            .as_ref()
+            .expect("lower")
+            .iter()
+            .all(|v| *v >= 0.0)
+            && pois_result
+                .mean_upper
+                .as_ref()
+                .expect("upper")
+                .iter()
+                .all(|v| *v >= 0.0),
         "Poisson-family bounds should never go below zero"
     );
 }
@@ -92,16 +102,23 @@ fn delta_method_variance_matches_posterior_simulation_for_small_logit_problem() 
     let cov = array![[0.2, 0.05], [0.05, 0.15]];
     let offset = array![0.0];
     let pred = predict_gamwith_uncertainty(
-        x.view(), beta.view(), offset.view(),
+        x.view(),
+        beta.view(),
+        offset.view(),
         like(ResponseFamily::Binomial, LinkFunction::Logit),
         &cov,
-        &PredictUncertaintyOptions { mean_interval_method: MeanIntervalMethod::Delta, covariance_mode: InferenceCovarianceMode::Conditional, ..PredictUncertaintyOptions::default() }
-    ).expect("delta-method prediction should succeed");
+        &PredictUncertaintyOptions {
+            mean_interval_method: MeanIntervalMethod::Delta,
+            covariance_mode: InferenceCovarianceMode::Conditional,
+            ..PredictUncertaintyOptions::default()
+        },
+    )
+    .expect("delta-method prediction should succeed");
     let delta_var = pred.mean_standard_error[0] * pred.mean_standard_error[0];
 
-    let l11 = cov[[0,0]].sqrt();
-    let l21 = cov[[1,0]]/l11;
-    let l22 = (cov[[1,1]] - l21*l21).sqrt();
+    let l11 = cov[[0, 0]].sqrt();
+    let l21 = cov[[1, 0]] / l11;
+    let l22 = (cov[[1, 1]] - l21 * l21).sqrt();
     let mut vals = Vec::new();
     for k in 0..20000 {
         let u1 = ((k * 48271 % 2147483647) as f64) / 2147483647.0;
@@ -116,7 +133,10 @@ fn delta_method_variance_matches_posterior_simulation_for_small_logit_problem() 
     }
     let m = vals.iter().sum::<f64>() / vals.len() as f64;
     let mc_var = vals.iter().map(|v| (v - m) * (v - m)).sum::<f64>() / (vals.len() as f64 - 1.0);
-    assert!((delta_var - mc_var).abs() < 5e-3, "Delta-method variance should match dense posterior simulation within Monte Carlo error");
+    assert!(
+        (delta_var - mc_var).abs() < 5e-3,
+        "Delta-method variance should match dense posterior simulation within Monte Carlo error"
+    );
 }
 
 #[test]
@@ -129,10 +149,27 @@ fn backend_variance_matches_between_dense_and_factorized_backends() {
     let h = Array2::from_diag(&array![1.0 / 0.3, 1.0 / 0.2]);
     let fact = PredictionCovarianceBackend::from_factorized_hessian(SymmetricMatrix::Dense(h))
         .expect("factorized backend should be constructible from diagonal Hessian");
-    let a = predict_gam_posterior_meanwith_backend(x.view(), beta.view(), offset.view(), like(ResponseFamily::Binomial, LinkFunction::Logit), &dense).expect("dense backend should predict");
-    let b = predict_gam_posterior_meanwith_backend(x.view(), beta.view(), offset.view(), like(ResponseFamily::Binomial, LinkFunction::Logit), &fact).expect("factorized backend should predict");
+    let a = predict_gam_posterior_meanwith_backend(
+        x.view(),
+        beta.view(),
+        offset.view(),
+        like(ResponseFamily::Binomial, LinkFunction::Logit),
+        &dense,
+    )
+    .expect("dense backend should predict");
+    let b = predict_gam_posterior_meanwith_backend(
+        x.view(),
+        beta.view(),
+        offset.view(),
+        like(ResponseFamily::Binomial, LinkFunction::Logit),
+        &fact,
+    )
+    .expect("factorized backend should predict");
     for i in 0..a.eta_standard_error.len() {
-        assert!((a.eta_standard_error[i] - b.eta_standard_error[i]).abs() < 1e-9, "Backend-1 and backend-2 should agree on posterior eta variance within 1e-9");
+        assert!(
+            (a.eta_standard_error[i] - b.eta_standard_error[i]).abs() < 1e-9,
+            "Backend-1 and backend-2 should agree on posterior eta variance within 1e-9"
+        );
     }
 }
 
@@ -143,13 +180,19 @@ fn survival_uncertainty_bounds_stay_in_unit_interval() {
     let cov = array![[0.1, 0.0], [0.0, 0.2]];
     let offset = Array1::zeros(3);
     let pred = predict_gamwith_uncertainty(
-        x.view(), beta.view(), offset.view(),
+        x.view(),
+        beta.view(),
+        offset.view(),
         like(ResponseFamily::RoystonParmar, LinkFunction::Log),
         &cov,
         &PredictUncertaintyOptions::default(),
-    ).expect("survival uncertainty prediction should succeed");
+    )
+    .expect("survival uncertainty prediction should succeed");
     for i in 0..pred.mean.len() {
-        assert!(pred.mean_lower[i] >= 0.0 && pred.mean_upper[i] <= 1.0, "Survival probability bounds should stay in [0,1] at every row");
+        assert!(
+            pred.mean_lower[i] >= 0.0 && pred.mean_upper[i] <= 1.0,
+            "Survival probability bounds should stay in [0,1] at every row"
+        );
     }
 }
 
@@ -167,7 +210,13 @@ fn competing_risks_cif_bounds_are_probabilities_and_total_mass_is_valid() {
         let s = assembled.overall_survival[[0, i]];
         let c1 = assembled.cif[0][[0, i]];
         let c2 = assembled.cif[1][[0, i]];
-        assert!((0.0..=1.0).contains(&s) && (0.0..=1.0).contains(&c1) && (0.0..=1.0).contains(&c2), "Each survival/CIF bound should remain a probability in [0,1]");
-        assert!(s + c1 + c2 <= 1.0 + 1e-9, "At each time, competing-risks CIF totals plus survival should not exceed one within tolerance");
+        assert!(
+            (0.0..=1.0).contains(&s) && (0.0..=1.0).contains(&c1) && (0.0..=1.0).contains(&c2),
+            "Each survival/CIF bound should remain a probability in [0,1]"
+        );
+        assert!(
+            s + c1 + c2 <= 1.0 + 1e-9,
+            "At each time, competing-risks CIF totals plus survival should not exceed one within tolerance"
+        );
     }
 }

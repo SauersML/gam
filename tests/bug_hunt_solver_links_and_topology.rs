@@ -1,15 +1,27 @@
-use gam::mixture_link::{inverse_link_jet_for_family, state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
-use gam::topology_selector::{select_topology_with_fit, AutoTopologyKind, TopologyAutoFitEvidence, TopologyAutoSelector};
-use gam::types::{InverseLink, LikelihoodSpec, LinkComponent, LinkFunction, MixtureLinkSpec, ResponseFamily, SasLinkSpec};
+use gam::mixture_link::{
+    inverse_link_jet_for_family, state_from_beta_logisticspec, state_from_sasspec, state_fromspec,
+};
+use gam::topology_selector::{
+    AutoTopologyKind, TopologyAutoFitEvidence, TopologyAutoSelector, select_topology_with_fit,
+};
+use gam::types::{
+    InverseLink, LikelihoodSpec, LinkComponent, LinkFunction, MixtureLinkSpec, ResponseFamily,
+    SasLinkSpec,
+};
 use ndarray::array;
 
 #[test]
 fn mixture_state_fromspec_uses_last_zero_logit_softmax_that_sums_to_one() {
     let spec = MixtureLinkSpec {
-        components: vec![LinkComponent::Probit, LinkComponent::Logit, LinkComponent::CLogLog],
+        components: vec![
+            LinkComponent::Probit,
+            LinkComponent::Logit,
+            LinkComponent::CLogLog,
+        ],
         initial_rho: array![2.0, -1.0],
     };
-    let state = state_fromspec(&spec).expect("MixtureLinkSpec should build a valid MixtureLinkState");
+    let state =
+        state_fromspec(&spec).expect("MixtureLinkSpec should build a valid MixtureLinkState");
     let exp_logits = [2.0_f64.exp(), (-1.0_f64).exp(), 0.0_f64.exp()];
     let z = exp_logits.iter().sum::<f64>();
     let expected = [exp_logits[0] / z, exp_logits[1] / z, exp_logits[2] / z];
@@ -32,7 +44,8 @@ fn sas_state_fromspec_bounds_delta_with_sas_log_delta_bound_transform() {
         initial_epsilon: 0.3,
         initial_log_delta: 100.0,
     };
-    let state = state_from_sasspec(spec).expect("SAS spec with finite parameters should be accepted");
+    let state =
+        state_from_sasspec(spec).expect("SAS spec with finite parameters should be accepted");
     let bound = 12.0_f64;
     let expected_delta = (bound * (spec.initial_log_delta / bound).tanh()).exp();
 
@@ -74,16 +87,22 @@ fn inverse_link_jet_for_family_uses_parameterized_state_for_mixture_and_sas_link
     .expect("SAS spec should build state");
 
     let eta = 0.8;
-    let mix_spec = LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Mixture(mixture_state));
+    let mix_spec = LikelihoodSpec::new(
+        ResponseFamily::Binomial,
+        InverseLink::Mixture(mixture_state),
+    );
     let sas_spec = LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Sas(sas_state));
     let logit_spec = LikelihoodSpec::new(
         ResponseFamily::Binomial,
         InverseLink::Standard(LinkFunction::Logit),
     );
 
-    let mix_jet = inverse_link_jet_for_family(&mix_spec, eta).expect("Mixture inverse-link jet should evaluate");
-    let sas_jet = inverse_link_jet_for_family(&sas_spec, eta).expect("SAS inverse-link jet should evaluate");
-    let logit_jet = inverse_link_jet_for_family(&logit_spec, eta).expect("Logit inverse-link jet should evaluate");
+    let mix_jet = inverse_link_jet_for_family(&mix_spec, eta)
+        .expect("Mixture inverse-link jet should evaluate");
+    let sas_jet =
+        inverse_link_jet_for_family(&sas_spec, eta).expect("SAS inverse-link jet should evaluate");
+    let logit_jet = inverse_link_jet_for_family(&logit_spec, eta)
+        .expect("Logit inverse-link jet should evaluate");
 
     assert!(
         (mix_jet.mu - logit_jet.mu).abs() > 1e-8,
@@ -97,7 +116,10 @@ fn inverse_link_jet_for_family_uses_parameterized_state_for_mixture_and_sas_link
 
 #[test]
 fn topology_selector_picks_highest_score_and_returns_fit_metadata() {
-    let selector = TopologyAutoSelector::new(Some(vec![AutoTopologyKind::Circle, AutoTopologyKind::Sphere]));
+    let selector = TopologyAutoSelector::new(Some(vec![
+        AutoTopologyKind::Circle,
+        AutoTopologyKind::Sphere,
+    ]));
     let out = select_topology_with_fit(&selector, |kind| {
         Ok::<_, String>(match kind {
             AutoTopologyKind::Circle => TopologyAutoFitEvidence {
@@ -123,15 +145,29 @@ fn topology_selector_picks_highest_score_and_returns_fit_metadata() {
     })
     .expect("Topology selection should succeed when at least one candidate fits");
 
-    let winner = out.winner().expect("Topology selection should return a winner");
-    assert_eq!(winner.topology_name, "sphere", "select_topology_with_fit should return the topology with the best score");
-    assert_eq!(winner.fit_handle, 9, "select_topology_with_fit should preserve fit metadata for the winning candidate");
-    assert_eq!(winner.n_obs, 100, "select_topology_with_fit should preserve n_obs metadata for the winning candidate");
+    let winner = out
+        .winner()
+        .expect("Topology selection should return a winner");
+    assert_eq!(
+        winner.topology_name, "sphere",
+        "select_topology_with_fit should return the topology with the best score"
+    );
+    assert_eq!(
+        winner.fit_handle, 9,
+        "select_topology_with_fit should preserve fit metadata for the winning candidate"
+    );
+    assert_eq!(
+        winner.n_obs, 100,
+        "select_topology_with_fit should preserve n_obs metadata for the winning candidate"
+    );
 }
 
 #[test]
 fn topology_selector_breaks_exact_ties_deterministically_by_candidate_order() {
-    let selector = TopologyAutoSelector::new(Some(vec![AutoTopologyKind::Torus, AutoTopologyKind::Cylinder]));
+    let selector = TopologyAutoSelector::new(Some(vec![
+        AutoTopologyKind::Torus,
+        AutoTopologyKind::Cylinder,
+    ]));
     let out = select_topology_with_fit(&selector, |kind| {
         Ok::<_, String>(TopologyAutoFitEvidence {
             topology_name: kind.as_str().to_string(),
@@ -145,6 +181,11 @@ fn topology_selector_breaks_exact_ties_deterministically_by_candidate_order() {
     })
     .expect("Topology selection should succeed on tied candidates");
 
-    let winner = out.winner().expect("Tied topology selection should still produce a winner");
-    assert_eq!(winner.topology_name, "torus", "When topology scores tie exactly, selection should be deterministic and prefer the first candidate in input order");
+    let winner = out
+        .winner()
+        .expect("Tied topology selection should still produce a winner");
+    assert_eq!(
+        winner.topology_name, "torus",
+        "When topology scores tie exactly, selection should be deterministic and prefer the first candidate in input order"
+    );
 }
