@@ -792,11 +792,7 @@ mod tests {
         ];
         let s0 = array![[0.0, 0.0, 0.0], [0.0, 1.1, 0.15], [0.0, 0.15, 0.8],];
         let rho = array![0.0];
-        let cfg = RemlConfig::external(
-            binomial_logit_glm_spec(),
-            1e-10,
-            false,
-        );
+        let cfg = RemlConfig::external(binomial_logit_glm_spec(), 1e-10, false);
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
 
         // Trigger a full outer eval so execute_pirls_if_needed inserts at
@@ -937,11 +933,7 @@ mod tests {
         // Tight inner tolerance: the envelope theorem requires an exact inner
         // P-IRLS optimum; 1e-10 leaves enough residual gradient to cause ~12%
         // V_tau mismatch on this small (n=8) logistic problem.
-        let cfg = RemlConfig::external(
-            binomial_logit_glm_spec(),
-            1e-14,
-            false,
-        );
+        let cfg = RemlConfig::external(binomial_logit_glm_spec(), 1e-14, false);
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
         let bundle = state.obtain_eval_bundle(&rho).expect("bundle");
         let pr = bundle.pirls_result.as_ref();
@@ -1103,12 +1095,8 @@ mod tests {
         let offset = Array1::<f64>::zeros(y.len());
         // Rank-deficient Firth logit needs more inner iterations to converge
         // tightly enough for the envelope-theorem derivative tests.
-        let cfg = RemlConfig::external(
-            binomial_logit_glm_spec(),
-            1e-9,
-            true,
-        )
-        .with_max_iterations(500);
+        let cfg =
+            RemlConfig::external(binomial_logit_glm_spec(), 1e-9, true).with_max_iterations(500);
         let p = x.ncols();
         use crate::estimate::PenaltySpec;
         let specs = vec![PenaltySpec::Dense(s0), PenaltySpec::Dense(s1)];
@@ -1170,12 +1158,8 @@ mod tests {
         ];
         let s0 = array![[0.0, 0.0, 0.0], [0.0, 1.2, 0.1], [0.0, 0.1, 0.7],];
         let s1 = array![[0.0, 0.0, 0.0], [0.0, 0.4, -0.05], [0.0, -0.05, 0.9],];
-        let cfg = RemlConfig::external(
-            binomial_logit_glm_spec(),
-            1e-9,
-            true,
-        )
-        .with_max_iterations(500);
+        let cfg =
+            RemlConfig::external(binomial_logit_glm_spec(), 1e-9, true).with_max_iterations(500);
         let p_dim = x.ncols();
         use crate::estimate::PenaltySpec;
         let specs = vec![PenaltySpec::Dense(s0), PenaltySpec::Dense(s1)];
@@ -1287,11 +1271,7 @@ mod tests {
         // Rank-deficient penalty with clear nullspace on first coordinate.
         let s0 = array![[0.0, 0.0, 0.0], [0.0, 1.1, 0.15], [0.0, 0.15, 0.8],];
         let rho = array![0.0];
-        let cfg = RemlConfig::external(
-            binomial_logit_glm_spec(),
-            1e-10,
-            false,
-        );
+        let cfg = RemlConfig::external(binomial_logit_glm_spec(), 1e-10, false);
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
         let bundle = state.obtain_eval_bundle(&rho).expect("bundle");
         let pr = bundle.pirls_result.as_ref();
@@ -1375,11 +1355,7 @@ mod tests {
         )
         .expect("single-penalty hyper direction");
         let rho = array![0.0];
-        let cfg = RemlConfig::external(
-            binomial_logit_glm_spec(),
-            1e-8,
-            true,
-        );
+        let cfg = RemlConfig::external(binomial_logit_glm_spec(), 1e-8, true);
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
         let gradient = single_directional_tau_gradient(&state, &rho, hyper)
             .expect("Firth penalty-only directional gradient should use analytic TK propagation");
@@ -1436,11 +1412,7 @@ mod tests {
         )
         .expect("single-penalty hyper direction");
         let rho = array![0.0];
-        let cfg = RemlConfig::external(
-            binomial_logit_glm_spec(),
-            1e-8,
-            true,
-        );
+        let cfg = RemlConfig::external(binomial_logit_glm_spec(), 1e-8, true);
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
         let gradient = single_directional_tau_gradient(&state, &rho, hyper)
             .expect("Firth design-moving directional gradient should use analytic TK propagation");
@@ -1481,11 +1453,7 @@ mod tests {
             .expect("design-moving hyper direction"),
         ];
         let rho = array![0.0];
-        let cfg = RemlConfig::external(
-            binomial_logit_glm_spec(),
-            1e-8,
-            true,
-        );
+        let cfg = RemlConfig::external(binomial_logit_glm_spec(), 1e-8, true);
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
 
         let full = state
@@ -1524,12 +1492,8 @@ mod tests {
             [1.0, 1.7, -0.6],
         ];
         let s0 = array![[0.0, 0.0, 0.0], [0.0, 1.2, 0.2], [0.0, 0.2, 0.9],];
-        let cfg = RemlConfig::external(
-            binomial_logit_glm_spec(),
-            1e-10,
-            false,
-        )
-        .with_max_iterations(500);
+        let cfg =
+            RemlConfig::external(binomial_logit_glm_spec(), 1e-10, false).with_max_iterations(500);
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
         let rho = array![0.0];
         let theta = array![0.0, 0.0, 0.0];
@@ -1591,12 +1555,8 @@ mod tests {
             [1.0, 1.7, -0.6],
         ];
         let s0 = array![[0.0, 0.0, 0.0], [0.0, 1.2, 0.2], [0.0, 0.2, 0.9],];
-        let cfg = RemlConfig::external(
-            binomial_logit_glm_spec(),
-            1e-10,
-            false,
-        )
-        .with_max_iterations(500);
+        let cfg =
+            RemlConfig::external(binomial_logit_glm_spec(), 1e-10, false).with_max_iterations(500);
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
         let rho = array![0.0];
         let psi = array![0.7, -0.4];
@@ -1690,11 +1650,7 @@ mod tests {
             [1.0, 0.9, -0.2],
         ];
         let s0 = array![[0.0, 0.0, 0.0], [0.0, 1.0, 0.1], [0.0, 0.1, 0.8],];
-        let cfg = RemlConfig::external(
-            binomial_logit_glm_spec(),
-            1e-10,
-            true,
-        );
+        let cfg = RemlConfig::external(binomial_logit_glm_spec(), 1e-10, true);
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
         let theta = array![0.0, 0.0];
         let hyper_dirs = vec![
@@ -1732,12 +1688,8 @@ mod tests {
             [1.0, 1.7, -0.6],
         ];
         let s0 = array![[0.0, 0.0, 0.0], [0.0, 1.2, 0.2], [0.0, 0.2, 0.9],];
-        let cfg = RemlConfig::external(
-            binomial_logit_glm_spec(),
-            1e-10,
-            false,
-        )
-        .with_max_iterations(500);
+        let cfg =
+            RemlConfig::external(binomial_logit_glm_spec(), 1e-10, false).with_max_iterations(500);
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
         let rho = array![0.0];
         let psi = array![0.0, 0.0];
@@ -1853,11 +1805,7 @@ mod tests {
                 y,
                 x: x.clone(),
                 s0: array![[0.0, 0.0, 0.0], [0.0, 1.2, 0.2], [0.0, 0.2, 0.9]],
-                cfg: RemlConfig::external(
-                    gaussian_identity_glm_spec(),
-                    1e-14,
-                    false,
-                ),
+                cfg: RemlConfig::external(gaussian_identity_glm_spec(), 1e-14, false),
                 rho: array![0.0],
                 x_tau_design: array![
                     [0.0, 1e-3, -2e-3],
@@ -2034,11 +1982,7 @@ mod tests {
             [1.0, 0.3, -0.3],
         ];
         let s0 = array![[0.0, 0.0, 0.0], [0.0, 1.2, 0.2], [0.0, 0.2, 0.9]];
-        let cfg = RemlConfig::external(
-            binomial_logit_glm_spec(),
-            1e-14,
-            false,
-        );
+        let cfg = RemlConfig::external(binomial_logit_glm_spec(), 1e-14, false);
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
         let rho = array![0.0];
 
@@ -2101,11 +2045,7 @@ mod tests {
             [1.0, 0.3, -0.3],
         ];
         let s0 = array![[0.0, 0.0, 0.0], [0.0, 1.2, 0.2], [0.0, 0.2, 0.9]];
-        let cfg = RemlConfig::external(
-            binomial_logit_glm_spec(),
-            1e-14,
-            false,
-        );
+        let cfg = RemlConfig::external(binomial_logit_glm_spec(), 1e-14, false);
         let rho = array![0.0];
 
         // Two directions: one penalty-only, one design-moving.
@@ -2238,11 +2178,7 @@ mod tests {
                 [0.0, 0.05, -0.20, 0.95, 0.12],
                 [0.0, -0.10, 0.08, 0.12, 1.25]
             ];
-            let cfg = RemlConfig::external(
-                binomial_logit_glm_spec(),
-                1e-14,
-                false,
-            );
+            let cfg = RemlConfig::external(binomial_logit_glm_spec(), 1e-14, false);
             // Design-moving direction: perturb covariate columns, leave
             // intercept untouched.
             let x_tau_design = array![

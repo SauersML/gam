@@ -528,7 +528,11 @@ fn stateless_sas_inverse_link_is_rejected() {
     );
     let sas_err = try_inverse_link_array(&likelihood, eta.view())
         .expect_err("SAS inverse-link should require explicit sas_params");
-    assert!(sas_err.to_string().contains("requires explicit SAS link state"));
+    assert!(
+        sas_err
+            .to_string()
+            .contains("requires explicit SAS link state")
+    );
 }
 
 #[test]

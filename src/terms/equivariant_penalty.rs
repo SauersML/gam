@@ -39,7 +39,11 @@ impl EquivariantGroup {
     }
 }
 
-fn dynamic_value(values: &ArrayViewD<'_, f64>, index: &[usize], label: &str) -> Result<f64, String> {
+fn dynamic_value(
+    values: &ArrayViewD<'_, f64>,
+    index: &[usize],
+    label: &str,
+) -> Result<f64, String> {
     values
         .get(IxDyn(index))
         .copied()
@@ -146,11 +150,7 @@ fn equivariant_rotation(
             let ax = ox / angle;
             let ay = oy / angle;
             let az = oz / angle;
-            let k = vec![
-                vec![0.0, -az, ay],
-                vec![az, 0.0, -ax],
-                vec![-ay, ax, 0.0],
-            ];
+            let k = vec![vec![0.0, -az, ay], vec![az, 0.0, -ax], vec![-ay, ax, 0.0]];
             let kk = square_matmul(&k, &k, 3);
             let s = angle.sin();
             let one_minus_c = 1.0 - angle.cos();

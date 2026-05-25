@@ -65,8 +65,8 @@ use crate::terms::{
     TotalVariationPenalty,
 };
 use crate::types::{
-    InverseLink, LatentCLogLogState, LikelihoodSpec, LinkFunction, MixtureLinkSpec,
-    ResponseFamily, SasLinkSpec, WigglePenaltyConfig,
+    InverseLink, LatentCLogLogState, LikelihoodSpec, LinkFunction, MixtureLinkSpec, ResponseFamily,
+    SasLinkSpec, WigglePenaltyConfig,
 };
 
 use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, Axis, s};
@@ -718,10 +718,7 @@ fn resolved_wiggle_inverse_link(
     fit: &UnifiedFitResult,
     fallback: &InverseLink,
 ) -> Result<InverseLink, String> {
-    let resolved = match fit
-        .fitted_link_state(spec)
-        .map_err(|e| e.to_string())?
-    {
+    let resolved = match fit.fitted_link_state(spec).map_err(|e| e.to_string())? {
         FittedLinkState::Standard(Some(link)) => InverseLink::Standard(link),
         FittedLinkState::Standard(None) => fallback.clone(),
         FittedLinkState::LatentCLogLog { state } => InverseLink::LatentCLogLog(state),
@@ -2718,12 +2715,11 @@ pub fn resolve_family(
                     LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Sas(state))
                 }
                 LinkFunction::BetaLogistic => {
-                    let state =
-                        state_from_beta_logisticspec(SasLinkSpec {
-                            initial_epsilon: 0.0,
-                            initial_log_delta: 0.0,
-                        })
-                        .map_err(|err| format!("Beta-Logistic link initial state: {err}"))?;
+                    let state = state_from_beta_logisticspec(SasLinkSpec {
+                        initial_epsilon: 0.0,
+                        initial_log_delta: 0.0,
+                    })
+                    .map_err(|err| format!("Beta-Logistic link initial state: {err}"))?;
                     LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::BetaLogistic(state))
                 }
             }

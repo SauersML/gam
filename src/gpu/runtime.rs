@@ -90,7 +90,6 @@ impl GpuRuntime {
     pub fn selected_device(&self) -> &GpuDeviceInfo {
         &self.device
     }
-
 }
 
 pub fn cuda_context_for(ordinal: usize) -> Option<Arc<CudaContext>> {

@@ -180,7 +180,9 @@ impl RiemannianManifold for SphereManifold {
 fn validate_sphere_matrix(values: ArrayView2<'_, f64>) -> Result<(), String> {
     let (n, d) = values.dim();
     if n == 0 || d < 2 {
-        return Err("spherical values must have at least one row and at least two columns".to_string());
+        return Err(
+            "spherical values must have at least one row and at least two columns".to_string(),
+        );
     }
     if let Some(((row, col), value)) = values.indexed_iter().find(|(_, v)| !v.is_finite()) {
         return Err(format!(

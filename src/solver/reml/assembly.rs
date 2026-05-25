@@ -88,12 +88,12 @@ pub(crate) fn add_row_scaled_dense_into(
     }
 }
 
-fn row_scale_dense_in_place(
-    out: &mut Array2<f64>,
-    scale: &Array1<f64>,
-    mode: DenseRowScaleMode,
-) {
-    assert_eq!(out.nrows(), scale.len(), "scale length must match row count");
+fn row_scale_dense_in_place(out: &mut Array2<f64>, scale: &Array1<f64>, mode: DenseRowScaleMode) {
+    assert_eq!(
+        out.nrows(),
+        scale.len(),
+        "scale length must match row count"
+    );
     let ncols = out.ncols();
     if ncols == 0 {
         return;
@@ -107,7 +107,12 @@ fn row_scale_dense_in_place(
     {
         slice
             .par_chunks_mut(ncols)
-            .zip(scale.as_slice().expect("Array1 must be contiguous").par_iter())
+            .zip(
+                scale
+                    .as_slice()
+                    .expect("Array1 must be contiguous")
+                    .par_iter(),
+            )
             .for_each(|(row_values, &w)| scale_dense_row_values(row_values, w, mode));
         return;
     }

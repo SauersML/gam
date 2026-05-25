@@ -776,5 +776,4 @@ mod tests {
         assert_eq!(code.weights[1], 0.3);
         assert_eq!(code.weights[3], 0.7);
     }
-
 }

@@ -5237,12 +5237,10 @@ mod tests {
         // explicit error path here is `Binomial + LatentCLogLog`, which this
         // dispatcher reports as needing an explicit latent-cloglog state handler.
         let ctx = QuadratureContext::new();
-        let latent = crate::types::LatentCLogLogState::new(0.4)
-            .expect("valid latent cloglog state");
-        let spec = LikelihoodSpec::new(
-            ResponseFamily::Binomial,
-            InverseLink::LatentCLogLog(latent),
-        );
+        let latent =
+            crate::types::LatentCLogLogState::new(0.4).expect("valid latent cloglog state");
+        let spec =
+            LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::LatentCLogLog(latent));
         let err = integrated_family_moments_jet(&ctx, &spec, 0.2, 0.5)
             .expect_err("latent cloglog moments should error in this dispatcher");
         assert!(format!("{err}").contains("LatentCLogLog"));
@@ -5316,8 +5314,10 @@ mod tests {
             initial_rho: ndarray::array![0.35],
         })
         .expect("mixture state should reconstruct from rho");
-        let spec =
-            LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Mixture(state.clone()));
+        let spec = LikelihoodSpec::new(
+            ResponseFamily::Binomial,
+            InverseLink::Mixture(state.clone()),
+        );
         let out = integrated_family_moments_jet(&ctx, &spec, 0.2, 0.5)
             .expect("stateful mixture integrated moments should evaluate");
         let direct = integrated_mixture_jet(&ctx, 0.2, 0.5, &state)

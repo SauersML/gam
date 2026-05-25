@@ -43,7 +43,11 @@ pub(crate) fn cholesky_factor_logdet(factor: MatRef<'_, f64>) -> f64 {
 
 #[inline]
 fn diagonal_log_sum(diagonal: DiagRef<'_, f64>) -> f64 {
-    diagonal.column_vector().iter().map(|&x| x.ln()).sum::<f64>()
+    diagonal
+        .column_vector()
+        .iter()
+        .map(|&x| x.ln())
+        .sum::<f64>()
 }
 
 impl FaerSymmetricFactor {
