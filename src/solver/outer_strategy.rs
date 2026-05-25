@@ -5943,47 +5943,77 @@ fn run_outer_with_plan(
     }
 
     best.ok_or_else(|| {
-        // Build a compact breakdown of why every attempted seed failed so the
-        // caller sees root causes, not just the last-written reason. Earlier
-        // behaviour stored only `Option<String>` and overwrote on every reject,
-        // which erased diagnostic context for the first k-1 seeds — a silent
-        // drift especially bad when analytic-gradient or penalty-rank bugs
-        // systematically break every seed with the same class of error, because
-        // then only the LAST occurrence was visible to the caller.
+        // Drain any remaining unclassified entries in `rejection_reasons`
+        // into the structured mirror so the final accounting reflects
+        // every observed failure regardless of which loop branch pushed
+        // it. Earlier behaviour reported `attempted = min(generated,
+        // budget)` and a single `rejected = N` integer; that confused
+        // "seed eval attempts" with "outer optimiser starts" and lumped
+        // every failure mode together. The new accounting splits
+        // CertRefused / domain / objective / budget rejections via the
+        // `InnerFailure` classifier and names the structural cause when
+        // every seed terminates the same way.
+        while last_classified_reason_idx < rejection_reasons.len() {
+            let (idx, phase, msg) = &rejection_reasons[last_classified_reason_idx];
+            seed_rejections.push(SeedRejection::from_message(*idx, phase, msg.clone()));
+            last_classified_reason_idx += 1;
+        }
+        // `screened` reflects how many seeds we actually iterated. With
+        // the current cheap-screen pipeline (rank_seeds_with_screening
+        // runs upstream), screened equals the size of the consumed
+        // candidate list. `exact_validated` counts every seed that
+        // attempted a full eval — i.e. either reached the rejection
+        // sites in this loop or made it into `started_seeds`.
         let n_generated = seeds.len();
-        let n_attempted = n_generated.min(seed_budget);
-        let n_rejected = rejection_reasons.len();
-        let breakdown = if rejection_reasons.is_empty() {
-            String::new()
-        } else {
-            let joined = rejection_reasons
-                .iter()
-                .map(|(idx, phase, msg)| format!("seed {idx} ({phase}): {msg}"))
-                .collect::<Vec<_>>()
-                .join("; ");
-            format!("; reasons: [{joined}]")
-        };
-        let early_stop_note = if stopped_early_due_to_limit {
+        let n_screened = n_generated;
+        let n_exact_validated = seed_rejections.len() + started_seeds;
+        let stats = StartupStats::from_rejections(
+            n_generated,
+            n_screened,
+            n_exact_validated,
+            started_seeds,
+            &seed_rejections,
+        );
+        let structural = structural_early_exit_key
+            .clone()
+            .or_else(|| uniform_structural_key(&seed_rejections, 1));
+        let early_exit_note = if structural_early_exit_key.is_some() {
+            "early-exit triggered: every observed seed reported the same structural CertRefused".to_string()
+        } else if stopped_early_due_to_limit {
             format!(
-                "; stopped early after {unsuccessful_expensive_seeds} consecutive \
-                 non-converged {:?} seed(s) (expensive_unsuccessful_seed_limit)",
+                "stopped early after {unsuccessful_expensive_seeds} consecutive non-converged \
+                 {:?} seed(s) (expensive_unsuccessful_seed_limit)",
                 the_plan.solver
             )
         } else {
             String::new()
         };
         if started_seeds == 0 {
-            EstimationError::RemlOptimizationFailed(format!(
-                "no candidate seeds passed outer startup validation ({context}); \
-                 generated={n_generated}, attempted={n_attempted}, rejected={n_rejected}{breakdown}"
+            EstimationError::RemlOptimizationFailed(format_no_seeds_passed(
+                context,
+                &stats,
+                &seed_rejections,
+                structural.as_ref(),
+                &early_exit_note,
             ))
         } else {
-            EstimationError::RemlOptimizationFailed(format!(
+            // Mixed outcome: at least one seed started the outer
+            // optimiser but none converged. Keep the structured payload
+            // so the caller sees both the started_seeds count and the
+            // per-rejection breakdown.
+            let header = format!(
                 "all {started_seeds} seed candidates failed ({context}); \
-                 generated={n_generated}, attempted={n_attempted}, \
-                 started_in_solver={started_seeds}, rejected={n_rejected}\
-                 {early_stop_note}{breakdown}"
-            ))
+                 generated={}, screened={}, exact_validated={}, solver_started={}",
+                stats.generated, stats.screened, stats.exact_validated, stats.solver_started,
+            );
+            let body = format_no_seeds_passed(
+                context,
+                &stats,
+                &seed_rejections,
+                structural.as_ref(),
+                &early_exit_note,
+            );
+            EstimationError::RemlOptimizationFailed(format!("{header}\n{body}"))
         }
     })
 }
