@@ -20,32 +20,32 @@ model.predict(
 | Argument | Default | Meaning |
 | --- | --- | --- |
 | `data` | required | Table-like input matching the training schema. |
-| `interval` | `None` | Pointwise Wald-interval coverage probability in `(0, 1)`. Honored by standard GLM families (Gaussian, binomial, Poisson, Gamma) and Gaussian/binomial location-scale models. Ignored by survival, transformation-normal, and bernoulli marginal-slope predictions. |
-| `return_type` | `None` | One of `"dict"`, `"numpy"`, `"pandas"`, `"polars"`, `"pyarrow"`. Defaults to the input table kind, falling back to the training table kind. |
-| `id_column` | `None` | Name of a column in `data` whose values are carried through into the output. |
+| `interval` | `None` | Pointwise Wald-interval coverage probability in `(0, 1)`. Honored by standard GLM families (Gaussian, binomial, Poisson, negative-binomial, Gamma) and Gaussian/binomial location-scale models. Ignored by survival, transformation-normal, and bernoulli marginal-slope predictions. |
+| `return_type` | `None` | One of `"dict"`, `"numpy"`, `"pandas"`, `"polars"`, `"pyarrow"` for table-shaped outputs. Defaults to the input table kind, falling back to the training table kind. |
+| `id_column` | `None` | Name of a column in `data` whose stringified values are carried through into table outputs and `SurvivalPrediction`. |
 | `with_uncertainty` | `False` | Survival location-scale models only. Populates `survival_se` and `eta_se` on the returned `SurvivalPrediction`. |
 
 ## Return value by model class
 
 | Model class | Default return | Columns / fields |
 | --- | --- | --- |
-| Gaussian, binomial, Poisson, Gamma | Table | `eta`, `mean`; adds `effective_se`, `mean_lower`, `mean_upper` when `interval` is set. |
-| Gaussian / binomial location-scale | Table | `eta`, `mean`; adds `effective_se`, `mean_lower`, `mean_upper` when `interval` is set. |
+| Gaussian, binomial, Poisson, negative-binomial, Gamma | Table | `eta`, `mean`; adds `effective_se`, `effective_variance`, `mean_lower`, `mean_upper` when `interval` is set. |
+| Gaussian / binomial location-scale | Table | `eta`, `mean`; adds `effective_se`, `effective_variance`, `mean_lower`, `mean_upper` when `interval` is set. |
 | Transformation-normal | 1-D `numpy.ndarray` | Per-row conditional z-scores. |
 | Bernoulli marginal-slope | 1-D `numpy.ndarray` | Per-row probabilities clipped to `[0, 1]`. |
 | Survival (any likelihood mode) | `SurvivalPrediction` | Per-row hazard / survival evaluators. |
 | Competing-risks survival | `CompetingRisksPrediction` | Endpoint-stacked hazard, survival, CIF, and overall survival arrays. |
 
 For the array-returning classes (transformation-normal and bernoulli
-marginal-slope), passing `id_column=` or `return_type=` switches the
-output to a two-column table: `(id_column, "z")` for transformation-normal
-or `(id_column, "mean")` for bernoulli marginal-slope.
+marginal-slope), passing `return_type=` switches the output to a table with
+`"z"` for transformation-normal or `"mean"` for bernoulli marginal-slope.
+Passing `id_column=` adds that stringified id column first.
 
 ## Wald intervals
 
 ```python
 preds = model.predict(test_df, interval=0.95)
-# columns: eta, mean, effective_se, mean_lower, mean_upper
+# columns: eta, mean, effective_se, effective_variance, mean_lower, mean_upper
 ```
 
 Intervals are computed from the asymptotic covariance of the fitted
@@ -65,8 +65,8 @@ preds = model.predict(
 # preds = {"patient_id": ["P001", "P002"], "eta": [...], "mean": [...]}
 ```
 
-The id column is not used by the model. It is copied through verbatim
-and may be of any type.
+The id column is not used by the model. Values are copied through after
+the same string conversion used for table normalization.
 
 ## SurvivalPrediction
 
@@ -80,7 +80,6 @@ interpolate that surface at arbitrary user times.
 pred = model.predict(test_df)
 
 S = pred.survival_at([1, 5, 10, 20])        # (n_rows, 4) survival probabilities
-F = pred.failure_at([10, 20])               # 1 - S
 h = pred.hazard_at([1, 5, 10, 20])          # hazard rate
 H = pred.cumulative_hazard_at([10, 20])     # cumulative hazard
 ```
@@ -105,12 +104,11 @@ H = pred.cumulative_hazard_at([10, 20])     # cumulative hazard
 pred.hazard_at(times)              # (n_rows, len(times))
 pred.survival_at(times)            # (n_rows, len(times))
 pred.cumulative_hazard_at(times)   # (n_rows, len(times))
-pred.failure_at(times)             # 1 - survival_at(times), clipped to [0, 1]
 pred.survival_se_at(times)         # SE on S(t), or None if not computed
 ```
 
-Each `times` argument is coerced to a 1-D array of finite non-negative
-floats; an empty input is rejected.
+Each `times` argument is coerced to a 1-D array of finite floats; an empty
+input is rejected.
 
 ### Chunked iteration
 
@@ -176,9 +174,9 @@ disease_cif = cif.cif[0]              # (n_rows, 4)
 joint_survival = cif.overall_survival # (n_rows, 4)
 ```
 
-`cif.cif` has shape `(n_endpoints, n_rows, n_times)`. Endpoint names
-are taken from the mapping keys, or supplied via `endpoint_names=` when
-passing a sequence.
+`cif.cif` is an endpoint-ordered sequence of `(n_rows, n_times)` arrays.
+Endpoint names are taken from the mapping keys, or supplied via
+`endpoint_names=` when passing a sequence.
 
 ## Raw design matrix
 
@@ -198,4 +196,4 @@ non-link-wiggle GAMs.
 
 ## Difference-smooth contrasts
 
-Use `Model.difference_smooth(data, group="group", view="x")` for covariance-aware pairwise smooth differences and optional simultaneous bands. See [Difference smooths](difference-smooths.md) for parameterisation choices and interval interpretation.
+Use `Model.difference_smooth(view="x", group="group", data=data)` for covariance-aware pairwise smooth differences and optional simultaneous bands. See [Difference smooths](difference-smooths.md) for parameterisation choices and interval interpretation.
