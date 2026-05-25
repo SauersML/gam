@@ -858,8 +858,11 @@ mod smoothing_correction_outcome_tests {
         for r in reasons.iter() {
             assert!(!r.is_empty(), "classification reason must not be empty");
             let routine = make_first_order(r, SmoothingCorrectionFallbackSeverity::Routine, true);
-            let numerical =
-                make_first_order(r, SmoothingCorrectionFallbackSeverity::NumericalFailure, true);
+            let numerical = make_first_order(
+                r,
+                SmoothingCorrectionFallbackSeverity::NumericalFailure,
+                true,
+            );
             assert_eq!(routine.branch_label(), "first-order (routine)");
             assert_eq!(numerical.branch_label(), "first-order (numerical failure)");
         }

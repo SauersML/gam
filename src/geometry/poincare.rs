@@ -353,7 +353,6 @@ pub fn tangent_decode_backward(
     grad_x_hat: ArrayView2<'_, f64>,
 ) -> GeometryResult<(Array2<f64>, Array2<f64>)> {
     let sqrt_negc = require_negative_curvature(cache.curvature)?;
-    let k = -cache.curvature;
     let (batch, d) = cache.v.dim();
     let n_atoms = cache.tangents.dim().0;
     if grad_x_hat.dim() != (batch, d) {

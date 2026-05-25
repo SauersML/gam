@@ -6977,6 +6977,12 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
                 self.stochastic_diag_via_matvec()
             }
             AnalyticPenaltyKind::SheafConsistency(_) => self.diag_via_matvec(),
+            AnalyticPenaltyKind::Monotonicity(_)
+                if self.dim() > ANALYTIC_LOGDET_DENSE_DIM_THRESHOLD =>
+            {
+                self.stochastic_diag_via_matvec()
+            }
+            AnalyticPenaltyKind::Monotonicity(_) => self.diag_via_matvec(),
         }
     }
 
@@ -7081,13 +7087,19 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
             {
                 self.stochastic_log_det_plus_lambda_i(lambda)
             }
+            AnalyticPenaltyKind::Monotonicity(_)
+                if self.dim() > ANALYTIC_LOGDET_DENSE_DIM_THRESHOLD =>
+            {
+                self.stochastic_log_det_plus_lambda_i(lambda)
+            }
             AnalyticPenaltyKind::NuclearNorm(_)
             | AnalyticPenaltyKind::BlockSparsity(_)
             | AnalyticPenaltyKind::MechanismSparsity(_)
             | AnalyticPenaltyKind::IvaeRidgeMeanGauge(_)
             | AnalyticPenaltyKind::BlockOrthogonality(_)
             | AnalyticPenaltyKind::SoftmaxAssignmentSparsity(_)
-            | AnalyticPenaltyKind::SheafConsistency(_) => {
+            | AnalyticPenaltyKind::SheafConsistency(_)
+            | AnalyticPenaltyKind::Monotonicity(_) => {
                 let dense = self.as_dense();
                 <Array2<f64> as PenaltyOp>::log_det_plus_lambda_i(&dense, lambda)
             }

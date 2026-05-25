@@ -5777,6 +5777,7 @@ pub enum EvalMode {
 }
 
 /// Result of the unified REML/LAML evaluation.
+#[derive(Debug)]
 pub struct RemlLamlResult {
     /// The REML/LAML objective value (to be minimized).
     pub cost: f64,
