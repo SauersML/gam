@@ -331,6 +331,7 @@ pub fn try_solve_upper_triangular_matrix(
 // delegating to cudarc-backed BLAS, solver, and custom kernel implementations.
 // ---------------------------------------------------------------------------
 
+#[cfg(all(feature = "cuda", target_os = "linux"))]
 mod cuda_backend {
     //! CUDA-backed implementations of the dispatch entry points.
     //!
@@ -591,5 +592,108 @@ mod cuda_backend {
         } else {
             None
         }
+    }
+}
+
+#[cfg(not(all(feature = "cuda", target_os = "linux")))]
+mod cuda_backend {
+    use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3};
+
+    use super::super::runtime::GpuRuntime;
+
+    #[inline]
+    pub(super) fn gemm(
+        _runtime: &GpuRuntime,
+        _a: ArrayView2<'_, f64>,
+        _b: ArrayView2<'_, f64>,
+        _trans_a: bool,
+        _trans_b: bool,
+    ) -> Option<Array2<f64>> {
+        None
+    }
+
+    #[inline]
+    pub(super) fn gemv(
+        _runtime: &GpuRuntime,
+        _a: ArrayView2<'_, f64>,
+        _v: ArrayView1<'_, f64>,
+        _trans_a: bool,
+    ) -> Option<Array1<f64>> {
+        None
+    }
+
+    #[inline]
+    pub(super) fn gemm_broadcast_b_batched(
+        _runtime: &GpuRuntime,
+        _a: ArrayView3<'_, f64>,
+        _b: ArrayView2<'_, f64>,
+    ) -> Option<Array3<f64>> {
+        None
+    }
+
+    #[inline]
+    pub(super) fn gemm_abt_strided_batched(
+        _runtime: &GpuRuntime,
+        _a: ArrayView3<'_, f64>,
+        _b: ArrayView3<'_, f64>,
+    ) -> Option<Array3<f64>> {
+        None
+    }
+
+    #[inline]
+    pub(super) fn xt_diag_x(
+        _runtime: &GpuRuntime,
+        _x: ArrayView2<'_, f64>,
+        _w: ArrayView1<'_, f64>,
+    ) -> Option<Array2<f64>> {
+        None
+    }
+
+    #[inline]
+    pub(super) fn xt_diag_y(
+        _runtime: &GpuRuntime,
+        _x: ArrayView2<'_, f64>,
+        _w: ArrayView1<'_, f64>,
+        _y: ArrayView2<'_, f64>,
+    ) -> Option<Array2<f64>> {
+        None
+    }
+
+    #[inline]
+    pub(super) fn joint_hessian_2x2(
+        _runtime: &GpuRuntime,
+        _x_a: ArrayView2<'_, f64>,
+        _x_b: ArrayView2<'_, f64>,
+        _w_aa: ArrayView1<'_, f64>,
+        _w_ab: ArrayView1<'_, f64>,
+        _w_bb: ArrayView1<'_, f64>,
+    ) -> Option<Array2<f64>> {
+        None
+    }
+
+    #[inline]
+    pub(super) fn trsm(
+        _runtime: &GpuRuntime,
+        _triangular: ArrayView2<'_, f64>,
+        _rhs: ArrayView2<'_, f64>,
+        _upper: bool,
+    ) -> Option<Array2<f64>> {
+        None
+    }
+
+    #[inline]
+    pub(super) fn cholesky_lower(
+        _runtime: &GpuRuntime,
+        _a: ArrayView2<'_, f64>,
+    ) -> Option<Array2<f64>> {
+        None
+    }
+
+    #[inline]
+    pub(super) fn cholesky_batched_lower(
+        _runtime: &GpuRuntime,
+        _matrices: &mut [Array2<f64>],
+    ) -> Option<()> {
+        None
     }
 }

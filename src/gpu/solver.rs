@@ -21,6 +21,7 @@ pub fn backend_status() -> BackendStatus {
     }
 }
 
+#[cfg(all(feature = "cuda", target_os = "linux"))]
 mod cuda {
     use crate::gpu::driver::{from_col_major, to_col_major};
     use crate::linalg::faer_ndarray::cholesky_factor_logdet;
@@ -252,6 +253,7 @@ mod cuda {
     }
 }
 
+#[cfg(all(feature = "cuda", target_os = "linux"))]
 pub(crate) use cuda::{
     cholesky_logdet_from_col_major, context_and_stream, pinned_htod, potrf_in_place, potrs_in_place,
 };
@@ -260,6 +262,18 @@ pub fn cholesky_solve_gpu(
     hessian: ArrayView2<'_, f64>,
     rhs: ArrayView2<'_, f64>,
 ) -> Result<(Array2<f64>, f64), String> {
+    #[cfg(not(all(feature = "cuda", target_os = "linux")))]
+    {
+        let (rows, cols) = hessian.dim();
+        return Err(format!(
+            "CUDA support not compiled for Cholesky solve; hessian={rows}x{cols}, rhs={}x{}",
+            rhs.nrows(),
+            rhs.ncols()
+        ));
+    }
+
+    #[cfg(all(feature = "cuda", target_os = "linux"))]
+    {
     if super::runtime::GpuRuntime::global().is_none() {
         let (rows, cols) = hessian.dim();
         return Err(format!(
@@ -269,9 +283,20 @@ pub fn cholesky_solve_gpu(
         ));
     }
     cuda::cholesky_solve(hessian, rhs)
+    }
 }
 
 pub fn cholesky_lower_gpu(hessian: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
+    #[cfg(not(all(feature = "cuda", target_os = "linux")))]
+    {
+        let (rows, cols) = hessian.dim();
+        return Err(format!(
+            "CUDA support not compiled for Cholesky factorization; hessian={rows}x{cols}"
+        ));
+    }
+
+    #[cfg(all(feature = "cuda", target_os = "linux"))]
+    {
     if super::runtime::GpuRuntime::global().is_none() {
         let (rows, cols) = hessian.dim();
         return Err(format!(
@@ -279,4 +304,5 @@ pub fn cholesky_lower_gpu(hessian: ArrayView2<'_, f64>) -> Result<Array2<f64>, S
         ));
     }
     cuda::cholesky_lower(hessian)
+    }
 }

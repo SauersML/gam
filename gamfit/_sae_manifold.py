@@ -358,7 +358,41 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         raise ValueError(f"K/n_atoms must be positive, got {k_atoms}")
     if max_iter_total < 1:
         raise ValueError(f"max_iter must be >= 1, got {max_iter_total}")
+    # Eager n-sample validation (issue #183). One sample yields a
+    # degenerate decoder LSQ system and a near-zero total sum of squares
+    # — the resulting R² can be astronomically negative. Require at least
+    # two observations, and at least as many observations as atoms so the
+    # joint decoder block is identifiable.
+    n_obs = int(x.shape[0])
+    if n_obs < 2:
+        raise ValueError(
+            f"sae_manifold_fit requires n >= 2 observations; got n={n_obs}"
+        )
+    if n_obs <= k_atoms:
+        raise ValueError(
+            f"sae_manifold_fit requires n > K (more observations than atoms); "
+            f"got n={n_obs}, K={k_atoms}"
+        )
     dims = _dims(k_atoms, atom_dim)
+    # Eager d_atom validation (issue #184). A zero-dimensional atom carries
+    # no manifold coordinate, contributes nothing to reconstruction, and
+    # leaves `active_dims = [0, ...]` — that is a silent no-op that should
+    # be a hard error, matching how `K <= 0` and `n_iter <= 0` are
+    # rejected.
+    if any(d < 1 for d in dims):
+        raise ValueError(
+            f"d_atom (atom_dim) must be >= 1 for every atom; got {dims}"
+        )
+    # Eager sparsity_weight validation (issue #184). The signature
+    # advertises `sparsity_weight: float = 1.0`; `0.0` is the canonical
+    # "no sparsity" baseline and must be accepted. Reject only negative,
+    # NaN, and infinite values here so the Rust kernel can apply its own
+    # log-domain floor.
+    if not np.isfinite(sparsity) or sparsity < 0.0:
+        raise ValueError(
+            f"sparsity_weight (sparsity_strength) must be finite and "
+            f"non-negative; got {sparsity}"
+        )
     bases = _bases(k_atoms, atom_basis, atom_topology)
     # Normalize `assignment` and `assignment_prior` through a single alias map.
     # If both are supplied and resolve to different canonical kinds, raise an

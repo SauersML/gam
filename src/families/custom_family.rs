@@ -10915,7 +10915,7 @@ fn joint_trust_region_metric_step_norm_view(
     delta: ArrayView1<f64>,
     metric_diag: ArrayView1<f64>,
 ) -> f64 {
-    debug_assert_eq!(delta.len(), metric_diag.len());
+    assert_eq!(delta.len(), metric_diag.len());
     delta
         .iter()
         .zip(metric_diag.iter())

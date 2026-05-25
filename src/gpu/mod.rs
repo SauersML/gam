@@ -2,10 +2,9 @@
 //!
 //! The module is intentionally callable from CPU-only builds: all public entry
 //! points are available without CUDA, and the runtime reports an unavailable
-//! backend instead of changing numerical results.  CUDA-specific code compiles
-//! unconditionally (cudarc is always linked via `fallback-dynamic-loading`)
-//! and gates its execution on `GpuRuntime::global()` at runtime, so it does
-//! not leak into solver modules.
+//! backend instead of changing numerical results. CUDA-specific code is
+//! compiled only for Linux builds that enable the `cuda` feature, so cudarc is
+//! never loaded by default CPU-only builds.
 
 pub mod blas;
 pub mod cpu_traits;
@@ -201,9 +200,15 @@ impl GpuDecision {
 pub fn log_backend_inventory_once() {
     static LOGGED: OnceLock<()> = OnceLock::new();
     LOGGED.get_or_init(|| {
+        let compiled_backends = if cfg!(all(feature = "cuda", target_os = "linux")) {
+            "cuda-dynamic"
+        } else {
+            "none"
+        };
         log::debug!(
-            "[GPU backend] policy={} compiled_backends=cuda-dynamic kernels=dense-matvec,dense-transpose-matvec,dense-xtwx,candidate-screen,dense-solve,matrix-free-pcg,sparse-assembly,spatial-kernel-operator,marginal-slope-rows,reml-trace,final-inference",
-            global_policy().as_str()
+            "[GPU backend] policy={} compiled_backends={} kernels=dense-matvec,dense-transpose-matvec,dense-xtwx,candidate-screen,dense-solve,matrix-free-pcg,sparse-assembly,spatial-kernel-operator,marginal-slope-rows,reml-trace,final-inference",
+            global_policy().as_str(),
+            compiled_backends
         );
     });
 }
