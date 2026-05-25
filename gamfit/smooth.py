@@ -34,8 +34,11 @@ ShapeConstraintLiteral = Literal[
 ]
 
 
+from ._basis_protocol import BasisDescriptor as _BasisDescriptor
+
+
 @dataclass(slots=True)
-class Smooth:
+class Smooth(_BasisDescriptor):
     """Base class for all smooth-term specs. Don't instantiate directly.
 
     Common fields shared by all smooth kinds:
@@ -91,26 +94,12 @@ class Smooth:
         repr=False,
     )
 
-    def evaluate(self, x: "torch.Tensor") -> "torch.Tensor":
-        """Evaluate this smooth's basis at ``x`` and return a torch tensor.
-
-        The returned tensor carries an autograd path back to ``x`` whenever
-        the underlying Rust kernel exposes an analytic VJP (e.g. 1D
-        B-splines). Forward-only kernels still produce a tensor; gradients
-        with respect to ``x`` are simply zero / unavailable through that
-        primitive — callers needing a differentiable basis should compose
-        with an autograd-supported smooth upstream.
-
-        Subclasses must override this method; the base class is abstract.
-        """
-        raise NotImplementedError(
-            f"{type(self).__name__}.evaluate is abstract; "
-            "instantiate a concrete Smooth subclass instead"
-        )
-
-    def __call__(self, x: "torch.Tensor") -> "torch.Tensor":
-        """Alias for :meth:`evaluate`. See :meth:`Smooth.evaluate`."""
-        return self.evaluate(x)
+    # ------------------------------------------------------------------
+    # Callable-basis protocol is inherited from
+    # :class:`gamfit._basis_protocol.BasisDescriptor`. Concrete subclasses
+    # override at least :meth:`_evaluate_torch` (or the legacy
+    # :meth:`_evaluate_impl`) plus :attr:`intrinsic_dim` / :attr:`basis_size`.
+    # ------------------------------------------------------------------
 
 
 def _as_torch_tensor(x: Any, *, name: str) -> "torch.Tensor":
@@ -180,6 +169,38 @@ class Duchon(Smooth):
     length_scale: float | None = None
     periodic_per_axis: Sequence[bool] | None = None
 
+    @property
+    def intrinsic_dim(self) -> int:
+        """``d`` inferred from :attr:`centers`. Falls back to 1 when None."""
+        if self.centers is None or isinstance(self.centers, int):
+            return 1
+        import numpy as np
+
+        arr = np.asarray(self.centers)
+        if arr.ndim == 1:
+            return 1
+        if arr.ndim == 2:
+            return int(arr.shape[1])
+        raise ValueError(
+            f"Duchon.centers must be 1D or 2D; got {arr.ndim}D"
+        )
+
+    @property
+    def basis_size(self) -> int:
+        """``K`` (the number of centers)."""
+        if self.centers is None:
+            from ._api import _DEFAULT_BASIS_K
+            return int(_DEFAULT_BASIS_K)
+        if isinstance(self.centers, int):
+            return int(self.centers)
+        import numpy as np
+
+        return int(np.asarray(self.centers).shape[0])
+
+    def _evaluate_torch(self, coords: Any) -> Any:
+        from ._basis_eval import duchon_evaluate
+        return duchon_evaluate(self, coords)
+
 
 @dataclass(slots=True)
 class BSpline(Smooth):
@@ -198,6 +219,19 @@ class BSpline(Smooth):
     penalty_order: int = 2
     periodic: bool = False
 
+    @property
+    def intrinsic_dim(self) -> int:
+        return 1
+
+    @property
+    def basis_size(self) -> int:
+        from ._basis_eval import bspline_basis_size
+        return bspline_basis_size(self)
+
+    def _evaluate_torch(self, coords: Any) -> Any:
+        from ._basis_eval import bspline_evaluate
+        return bspline_evaluate(self, coords)
+
 
 @dataclass(slots=True)
 class TensorBSpline(Smooth):
@@ -210,6 +244,22 @@ class TensorBSpline(Smooth):
     """
 
     marginals: list[BSpline] = field(default_factory=list)
+
+    @property
+    def intrinsic_dim(self) -> int:
+        return len(self.marginals)
+
+    @property
+    def basis_size(self) -> int:
+        from ._basis_eval import bspline_basis_size
+        total = 1
+        for marg in self.marginals:
+            total *= bspline_basis_size(marg)
+        return int(total)
+
+    def _evaluate_torch(self, coords: Any) -> Any:
+        from ._basis_eval import tensor_bspline_evaluate
+        return tensor_bspline_evaluate(self, coords)
 
 
 @dataclass(slots=True)
@@ -239,6 +289,31 @@ class Matern(Smooth):
     nu: float = 1.5
     length_scale: float = 1.0
     aniso_log_scales: Sequence[float] | None = None
+
+    @property
+    def intrinsic_dim(self) -> int:
+        if self.centers is None:
+            raise ValueError("Matern.intrinsic_dim: centers must be provided")
+        import numpy as np
+
+        arr = np.asarray(self.centers)
+        if arr.ndim == 1:
+            return 1
+        if arr.ndim == 2:
+            return int(arr.shape[1])
+        raise ValueError(f"Matern.centers must be 1D or 2D; got {arr.ndim}D")
+
+    @property
+    def basis_size(self) -> int:
+        if self.centers is None:
+            raise ValueError("Matern.basis_size: centers must be provided")
+        import numpy as np
+
+        return int(np.asarray(self.centers).shape[0])
+
+    def _evaluate_torch(self, coords: Any) -> Any:
+        from ._basis_eval import matern_evaluate
+        return matern_evaluate(self, coords)
 
 
 @dataclass(init=False, slots=True)
@@ -297,6 +372,28 @@ class Pca(Smooth):
         self.centered = centered
         self.smooth_penalty = smooth_penalty
 
+    @property
+    def intrinsic_dim(self) -> int:
+        if self.basis is None:
+            raise ValueError("Pca.intrinsic_dim: basis must be provided")
+        import numpy as np
+
+        return int(np.asarray(self.basis).shape[0])
+
+    @property
+    def basis_size(self) -> int:
+        if self.basis is not None:
+            import numpy as np
+
+            return int(np.asarray(self.basis).shape[1])
+        if self.K is None:
+            raise ValueError("Pca.basis_size: K or basis must be provided")
+        return int(self.K)
+
+    def _evaluate_torch(self, coords: Any) -> Any:
+        from ._basis_eval import pca_evaluate
+        return pca_evaluate(self, coords)
+
 
 @dataclass(slots=True)
 class Sphere(Smooth):
@@ -346,6 +443,23 @@ class PeriodicSplineCurve(Smooth):
     degree: int = 3
     output_dim: int = 1
     penalty_order: int = 2
+
+    @property
+    def intrinsic_dim(self) -> int:
+        return 1
+
+    @property
+    def basis_size(self) -> int:
+        return int(self.n_knots)
+
+    def _evaluate_torch(self, coords: Any) -> Any:
+        from ._basis_eval import _periodic_curve_basis
+        t = coords[:, 0]
+        # Reduce modulo 1 so the cyclic forward sees t ∈ [0, 1).
+        from ._basis_protocol import _torch
+        torch = _torch()
+        t_mod = t - torch.floor(t)
+        return _periodic_curve_basis(t_mod, int(self.n_knots), int(self.degree))
 
 
 @dataclass(slots=True)

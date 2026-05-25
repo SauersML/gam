@@ -193,6 +193,7 @@ from ._sae_manifold import (
     sae_manifold_fit,
 )
 from ._schema import SchemaCheck, SchemaIssue
+from .sindy import SINDyAtoms
 from ._summary import Summary
 from ._validation import FormulaValidation
 from .geometry import (
@@ -298,6 +299,7 @@ __all__ = [
     "SaeManifoldAtomFit",
     "SaeManifoldFitResult",
     "ScalarWeightSchedule",
+    "SINDyAtoms",
     "SchemaCheck",
     "SchemaIssue",
     "SchemaMismatchError",

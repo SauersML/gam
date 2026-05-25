@@ -96,6 +96,42 @@ A smaller Python-only entry point (a tilted 3-D circle with a localized
 radial spike, fit via `gamfit.fit` directly) is in
 [`scripts/circle_3d_cyclic_demo.py`](https://github.com/SauersML/gam/blob/main/scripts/circle_3d_cyclic_demo.py).
 
+## Torch-side: `gamfit.torch.ManifoldSAE`
+
+`gamfit.torch.ManifoldSAE(cfg)` is a trainable `nn.Module` mirror of the
+closed-form SAE manifold primitive. Atom *i* is a 1-D parametric curve in
+ambient `R^D`, parameterized by a manifold point and a decoder block; a shared
+encoder produces per-atom on-manifold coordinates and amplitudes from each
+input batch.
+
+```python
+import torch
+from gamfit.torch import ManifoldSAE, ManifoldSAEConfig
+
+cfg = ManifoldSAEConfig(
+    input_dim=D, n_atoms=F, intrinsic_rank=1,
+    atom_manifold="circle",
+    atom_basis="fourier", basis_order=2, n_basis_per_atom=K,
+    sparsity={"kind": "ibp_gumbel", "init_alpha": 0.1,
+              "tau_schedule": "linear:4.0->1.0"},
+    decoder={"ortho_weight": 1e-2, "monotonicity_weight": 1e-3},
+    reml={"enabled": True, "select": ["lambda", "tau"]},
+)
+sae = ManifoldSAE(cfg)
+out = sae(x)               # ManifoldSAEOutput(z, x_hat, positions, ...)
+sae.fit(x)                 # delegates to gamfit.sae_manifold_fit
+sae.lock_snapshot()        # freeze REML-selected hypers
+curves = sae.extract_feature_curves(grid_size=128)   # {atom_idx -> Tensor(grid, D)}
+```
+
+**Parity contract.** `ManifoldSAE.fit(...)` and `gamfit.sae_manifold_fit(...)`
+share a Rust kernel. Given equivalent configurations they return identical
+numerics on synthetic data (see `tests/torch/test_manifold_sae_parity.py`).
+
+Supported atom manifolds: `circle`, `cylinder`, `sphere`, `product`. Supported
+bases-on-manifold: `duchon`, `bspline`, `fourier`. Sparsity layers: `ibp_gumbel`,
+`softmax_topk`, `jumprelu`.
+
 ## Related reading
 
 - [Formula DSL — periodic / cyclic smooths](formulas.md#periodic-cyclic-smooths)

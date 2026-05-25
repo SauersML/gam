@@ -392,13 +392,15 @@ def _bspline_basis_1d(
         right_den = (knots[d + 1:] - knots[1:-d]).clamp(min=1e-12)
         b = (left_num / left_den) * b[..., :-1] + (right_num / right_den) * b[..., 1:]
     if periodic:
-        # Wrap: sum overlapping basis columns into the first n_basis columns
         total = b.shape[-1]
         if total > n_basis:
-            wrapped = b[..., :n_basis].clone()
-            for j in range(n_basis, total):
-                wrapped[..., j - n_basis] = wrapped[..., j - n_basis] + b[..., j]
-            b = wrapped
+            head = b[..., :n_basis]
+            tail = b[..., n_basis:]
+            pad_cols = n_basis - tail.shape[-1]
+            if pad_cols > 0:
+                pad = torch.zeros(*tail.shape[:-1], pad_cols, dtype=b.dtype, device=b.device)
+                tail = torch.cat([tail, pad], dim=-1)
+            b = head + tail
     return b[..., :n_basis]
 
 
@@ -541,14 +543,12 @@ class _SparsityLayer(nn.Module):
         if self.kind == "softmax_topk":
             tau = float(self.tau.item())
             probs = torch.softmax(logits / max(tau, 1e-6), dim=-1)
-            # soft top-k via cumulative-rank weighting
-            sorted_probs, sort_idx = torch.sort(probs, dim=-1, descending=True)
-            cum = torch.cumsum(sorted_probs, dim=-1)
-            keep = (cum <= 1.0).to(sorted_probs.dtype)
-            keep[..., : self.target_k] = 1.0
-            sorted_out = sorted_probs * keep
-            assignments = torch.empty_like(probs)
-            assignments.scatter_(-1, sort_idx, sorted_out)
+            # Hard top-k forward with straight-through gradient through probs.
+            _, top_idx = torch.topk(probs, k=self.target_k, dim=-1)
+            mask = torch.zeros_like(probs)
+            mask.scatter_(-1, top_idx, 1.0)
+            hard = probs * mask
+            assignments = probs + (hard - probs).detach()
             return assignments, logits
         # jumprelu
         tau = torch.exp(self.log_threshold).to(logits.dtype)
