@@ -18,11 +18,9 @@ training loop.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Literal
 
 import torch
-import torch.nn.functional as F_torch
 from torch import nn
 
 from .._binding import rust_module

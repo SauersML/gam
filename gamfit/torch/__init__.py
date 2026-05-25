@@ -58,12 +58,17 @@ from .geometry import (
     sphere_frechet_mean,
     sphere_log_map,
 )
-from .modules import (
-    AdaptiveTopK,
-    GatedSAEDecoder,
+from .manifold_sae import (
+    DecoderConfig,
     ManifoldSAE,
     ManifoldSAEConfig,
     ManifoldSAEOutput,
+    RemlConfig,
+    SparsityConfig,
+)
+from .modules import (
+    AdaptiveTopK,
+    GatedSAEDecoder,
     SoftmaxAssignmentSparsityPenalty,
     SparsityPenalty,
     TopKActivationPenalty,
@@ -115,9 +120,12 @@ __all__ = [
     "IvaeRidgeMeanGauge",
     "JumpReLUPenalty",
     "LazyPcaBasis",
+    "DecoderConfig",
     "ManifoldSAE",
     "ManifoldSAEConfig",
     "ManifoldSAEOutput",
+    "RemlConfig",
+    "SparsityConfig",
     "PoincareAtoms",
     "SkipAffineSmooth",
     "SkipTranscoderResult",

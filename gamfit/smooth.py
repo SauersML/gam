@@ -19,7 +19,10 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal, Sequence
+from typing import TYPE_CHECKING, Any, Literal, Sequence
+
+if TYPE_CHECKING:
+    import torch
 
 
 ShapeConstraintLiteral = Literal[
@@ -87,6 +90,42 @@ class Smooth:
         init=False,
         repr=False,
     )
+
+    def evaluate(self, x: "torch.Tensor") -> "torch.Tensor":
+        """Evaluate this smooth's basis at ``x`` and return a torch tensor.
+
+        The returned tensor carries an autograd path back to ``x`` whenever
+        the underlying Rust kernel exposes an analytic VJP (e.g. 1D
+        B-splines). Forward-only kernels still produce a tensor; gradients
+        with respect to ``x`` are simply zero / unavailable through that
+        primitive — callers needing a differentiable basis should compose
+        with an autograd-supported smooth upstream.
+
+        Subclasses must override this method; the base class is abstract.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__}.evaluate is abstract; "
+            "instantiate a concrete Smooth subclass instead"
+        )
+
+    def __call__(self, x: "torch.Tensor") -> "torch.Tensor":
+        """Alias for :meth:`evaluate`. See :meth:`Smooth.evaluate`."""
+        return self.evaluate(x)
+
+
+def _as_torch_tensor(x: Any, *, name: str) -> "torch.Tensor":
+    """Coerce ``x`` to a torch tensor without copying when possible.
+
+    Used by ``Smooth.evaluate`` overrides. We intentionally do not strip a
+    requires_grad flag: routing through the existing
+    :mod:`gamfit.torch._basis` autograd Functions preserves the analytic
+    VJP back to ``x`` for kernels that expose one.
+    """
+    import torch as _torch
+
+    if isinstance(x, _torch.Tensor):
+        return x
+    return _torch.as_tensor(x, dtype=_torch.float64)
 
 
 @dataclass(slots=True)

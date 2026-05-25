@@ -171,33 +171,40 @@ def _poincare_distance(
 def _to_lorentz(x: torch.Tensor, sqrt_negc: float) -> torch.Tensor:
     """Stereographic projection Poincaré-ball -> hyperboloid.
 
-    For a point ``y in B^d`` with ``|y| < 1`` the corresponding point on the
-    hyperboloid ``{x : -x_0^2 + |x_s|^2 = -1/k, x_0 > 0}`` (with ``k = -c``)
-    is ``(x_0, x_s) = (1 + k|y|^2, 2 sqrt(k) y) / (k (1 - k|y|^2)) * ...``.
+    Curvature ``c = -k`` (with ``k = sqrt_negc**2``). The Poincaré ball is
+    ``{y : k |y|^2 < 1}``, i.e. radius ``1/sqrt(k)``. Define rescaled
+    coordinates ``ŷ = sqrt(k) y`` so that ``|ŷ| < 1``. The unit-curvature
+    map sends ``ŷ`` to
 
-    A cleaner equivalent form: starting from the unit-curvature mapping
+        ẑ_0 = (1 + |ŷ|^2) / (1 - |ŷ|^2),   ẑ_s = 2 ŷ / (1 - |ŷ|^2),
 
-        x_0 = (1 + |y|^2) / (1 - |y|^2),   x_s = 2 y / (1 - |y|^2),
-
-    and then rescaling by ``1/sqrt(k)`` so that ``-x_0^2 + |x_s|^2 = -1/k``.
+    on the unit hyperboloid ``-ẑ_0^2 + |ẑ_s|^2 = -1``. Dividing by
+    ``sqrt(k)`` then puts the result on the hyperboloid of curvature ``-k``,
+    i.e. ``-x_0^2 + |x_s|^2 = -1/k``.
     """
 
-    y_sq = (x * x).sum(dim=-1, keepdim=True)
+    yhat = x * sqrt_negc
+    y_sq = (yhat * yhat).sum(dim=-1, keepdim=True)
     denom = (1.0 - y_sq).clamp_min(_EPS)
-    x0 = (1.0 + y_sq) / denom
-    xs = 2.0 * x / denom
-    # Rescale to curvature c = -k.
-    return torch.cat([x0, xs], dim=-1) / sqrt_negc
+    z0 = (1.0 + y_sq) / denom
+    zs = 2.0 * yhat / denom
+    return torch.cat([z0, zs], dim=-1) / sqrt_negc
 
 
 def _from_lorentz(x: torch.Tensor, sqrt_negc: float) -> torch.Tensor:
-    """Inverse stereographic projection hyperboloid -> Poincaré ball."""
+    """Inverse stereographic projection hyperboloid -> Poincaré ball.
 
-    # Undo the 1/sqrt(k) rescale.
-    x = x * sqrt_negc
-    x0 = x[..., :1]
-    xs = x[..., 1:]
-    return xs / (x0 + 1.0).clamp_min(_EPS)
+    Reverses the rescaling/projection in :func:`_to_lorentz`: scale by
+    ``sqrt(k)`` to land on the unit hyperboloid, then ``y = x_s / (x_0 + 1)``
+    in the rescaled coordinates, then scale ``y`` back by ``1/sqrt(k)`` so
+    it lives in the ball of radius ``1/sqrt(k)``.
+    """
+
+    x_scaled = x * sqrt_negc
+    x0 = x_scaled[..., :1]
+    xs = x_scaled[..., 1:]
+    yhat = xs / (x0 + 1.0).clamp_min(_EPS)
+    return yhat / sqrt_negc
 
 
 def _lorentz_inner(u: torch.Tensor, v: torch.Tensor) -> torch.Tensor:

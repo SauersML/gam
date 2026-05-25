@@ -19366,6 +19366,71 @@ impl NuclearNormPenalty {
     }
 }
 
+/// SINDy STLSQ FFI bridge. Marshals NumPy arrays into the core
+/// [`gam::sindy::sindy_stlsq_solve`] / [`gam::sindy::sindy_stlsq_auto_lam`]
+/// solver and returns the resulting `(p, d)` coefficient matrix plus the
+/// rounds-used / converged / chosen-lambda diagnostics. The kind dispatch
+/// mirrors the Python descriptor strings: `"ridge"`, `"scad"`, `"mcp"`.
+#[pyfunction]
+#[pyo3(signature = (theta, dz_dt, tol, max_rounds, lam, kind, concave_a, auto_lam = false))]
+fn sindy_stlsq_solve_array<'py>(
+    py: Python<'py>,
+    theta: PyReadonlyArray2<'py, f64>,
+    dz_dt: PyReadonlyArray2<'py, f64>,
+    tol: f64,
+    max_rounds: usize,
+    lam: f64,
+    kind: &str,
+    concave_a: f64,
+    auto_lam: bool,
+) -> PyResult<(Py<PyArray2<f64>>, usize, bool, f64)> {
+    use gam::solver::sindy::{
+        SindyPenaltyKind, sindy_stlsq_auto_lam, sindy_stlsq_solve,
+    };
+    let kind_lc = kind.to_ascii_lowercase();
+    let penalty_kind = match kind_lc.as_str() {
+        "ridge" | "l2" | "tikhonov" => SindyPenaltyKind::Ridge,
+        "scad" => SindyPenaltyKind::Scad,
+        "mcp" | "scad_mcp" => SindyPenaltyKind::Mcp,
+        other => {
+            return Err(py_value_error(format!(
+                "sindy_stlsq_solve_array: kind must be 'ridge', 'scad', or 'mcp'; got {other:?}"
+            )));
+        }
+    };
+    let theta_view = theta.as_array();
+    let dz_view = dz_dt.as_array();
+    let (lam_used, result) = if auto_lam {
+        sindy_stlsq_auto_lam(
+            theta_view,
+            dz_view,
+            tol,
+            max_rounds,
+            penalty_kind,
+            concave_a,
+        )
+        .map_err(py_value_error)?
+    } else {
+        let res = sindy_stlsq_solve(
+            theta_view,
+            dz_view,
+            tol,
+            max_rounds,
+            lam,
+            penalty_kind,
+            concave_a,
+        )
+        .map_err(py_value_error)?;
+        (lam, res)
+    };
+    Ok((
+        result.coefficients.into_pyarray(py).unbind(),
+        result.rounds_used,
+        result.converged,
+        lam_used,
+    ))
+}
+
 #[pymodule(name = "_rust", gil_used = false)]
 fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     gam::init_parallelism();
@@ -19672,6 +19737,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<TotalVariationPenalty>()?;
     module.add_class::<NuclearNormPenalty>()?;
     module.add_class::<MechanismSparsityPenalty>()?;
+    module.add_function(wrap_pyfunction!(sindy_stlsq_solve_array, module)?)?;
     Ok(())
 }
 
