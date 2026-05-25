@@ -1858,14 +1858,6 @@ fn sigmoid_scalar(x: f64) -> f64 {
     }
 }
 
-fn sigmoid_row(logits: ArrayView1<'_, f64>, temperature: f64) -> Array1<f64> {
-    let mut out = Array1::<f64>::zeros(logits.len());
-    for i in 0..logits.len() {
-        out[i] = sigmoid_scalar(logits[i] / temperature);
-    }
-    out
-}
-
 /// Truncated-IBP stick-breaking prior weights `π_k = (α/(α+1))^k` for
 /// k = 0, .., K-1. Under a Beta(α, 1) stick-breaking construction these are
 /// the prior means of the active-set probabilities, so IBP-MAP assignment
