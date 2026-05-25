@@ -145,13 +145,14 @@ class Model:
         headers, rows, _ = normalize_table(data)
         try:
             ffi = rust_module()
+            options_json = ffi.build_sample_payload_json(
+                samples, warmup, chains, target_accept, seed
+            )
             raw = ffi.sample_table(
                 self._model_bytes,
                 headers,
                 rows,
-                ffi.build_sample_payload_json(
-                    samples, warmup, chains, target_accept, seed
-                ),
+                options_json,
             )
         except Exception as exc:
             raise map_exception(exc) from exc
@@ -198,21 +199,21 @@ class Model:
             if rows:
                 first = rows[0]
                 template = {h: str(first[i]) for i, h in enumerate(headers)}
-        request: dict[str, Any] = {
-            "view": str(view),
-            "group": str(group) if group is not None else None,
-            "pairs": [[str(a), str(b)] for a, b in pairs] if pairs is not None else None,
-            "n": int(n),
-            "level": float(level),
-            "simultaneous": bool(simultaneous),
-            "n_sim": int(n_sim),
-            "seed": int(seed) if seed is not None else None,
-            "marginalise_random": bool(marginalise_random),
-            "group_means": bool(group_means),
-            "template": template or None,
-        }
         try:
-            raw = rust_module().difference_smooth_json(self._model_bytes, json.dumps(request))
+            request_json = rust_module().build_difference_smooth_request_json(
+                str(view),
+                str(group) if group is not None else None,
+                [(str(a), str(b)) for a, b in pairs] if pairs is not None else None,
+                int(n),
+                float(level),
+                bool(simultaneous),
+                int(n_sim),
+                int(seed) if seed is not None else None,
+                bool(marginalise_random),
+                bool(group_means),
+                template or None,
+            )
+            raw = rust_module().difference_smooth_json(self._model_bytes, request_json)
         except Exception as exc:
             raise map_exception(exc) from exc
         rows_out = json.loads(raw)

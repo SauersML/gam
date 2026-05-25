@@ -54,7 +54,7 @@ class SurvivalDataset:
 
 def _parse_f64_opt(v: object) -> float | None:
     try:
-        x = float(v)
+        x = float(typing.cast(typing.Any, v))
     except (TypeError, ValueError):
         return None
     return x if math.isfinite(x) else None
@@ -293,15 +293,17 @@ def _ensure_rust_binary() -> Path:
     raise RuntimeError(f"missing Rust binary at {local_bin}")
 
 
-def _zscore_by_train(df: pd.DataFrame, feature_cols: list[str]) -> pd.DataFrame:
+def _zscore_by_train(df: pd.DataFrame, feature_cols: list[str]) -> tuple[pd.DataFrame, dict[str, tuple[float, float]]]:
     out = df.copy()
+    stats: dict[str, tuple[float, float]] = {}
     for c in feature_cols:
         mu = float(out[c].mean())
         sd = float(out[c].std())
         if (not np.isfinite(sd)) or sd < 1e-8:
             sd = 1.0
         out[c] = (out[c] - mu) / sd
-    return out
+        stats[c] = (mu, sd)
+    return out, stats
 
 
 def _fit_survival_model(
@@ -309,6 +311,7 @@ def _fit_survival_model(
     ds: SurvivalDataset,
     train_df: Path,
     model_path: Path,
+    survival_likelihood: str | None = None,
 ) -> None:
     fit_formula = f"Surv(__entry, {ds.time_col}, {ds.event_col}) ~ {ds.formula}"
     fit_args = [
@@ -321,6 +324,8 @@ def _fit_survival_model(
         str(train_df),
         fit_formula,
     ]
+    if survival_likelihood is not None:
+        fit_args.extend(["--survival-likelihood", survival_likelihood])
     for key, value in ds.fit_opts.items():
         fit_args.extend([f"--{key.replace('_', '-')}", value])
     _run_cmd(fit_args, cwd=ROOT)
@@ -357,6 +362,15 @@ def _predict_survival_curve(
     if np.any(np.diff(s) > 1e-10):
         raise RuntimeError("prediction output is not monotone non-increasing over time")
     return s
+
+
+def _normalize_from_baseline_survival(surv: np.ndarray) -> np.ndarray:
+    if surv.size == 0:
+        return surv
+    s0 = float(max(surv[0], 1e-8))
+    out = np.clip(surv / s0, 0.0, 1.0)
+    out[0] = 1.0
+    return np.minimum.accumulate(out)
 
 
 def _pick_representative_twin(
@@ -593,7 +607,7 @@ def generate_plot_for_dataset(
     raw_df = ds.rows.copy().reset_index(drop=True)
     df = raw_df.copy()
     df["__entry"] = 0.0
-    fit_df = _zscore_by_train(df, ds.features)
+    fit_df, _ = _zscore_by_train(df, ds.features)
 
     with tempfile.TemporaryDirectory(prefix=f"twin_{ds.name}_", dir=str(ROOT / "bench")) as td:
         td_path = Path(td)
@@ -748,7 +762,7 @@ def generate_bmi_sweep_mp4_preview(
         fit_df.to_csv(train_path, index=False)
 
         # Use transformation mode for stable, non-pathological surfaces in sweep animation.
-        _fit_survival_model(rust_bin, ds, train_path, model_path, likelihood="transformation")
+        _fit_survival_model(rust_bin, ds, train_path, model_path, survival_likelihood="transformation")
 
         t_obs = fit_df[ds.time_col].to_numpy(dtype=float)
         t_base = max(float(np.quantile(t_obs, 0.995)), float(np.max(t_obs)), 1.0)
@@ -896,7 +910,7 @@ def generate_icu_sysbp_sweep_mp4(
         train_path = td_path / "train.csv"
         model_path = td_path / "model.json"
         fit_df.to_csv(train_path, index=False)
-        _fit_survival_model(rust_bin, ds, train_path, model_path, likelihood="transformation")
+        _fit_survival_model(rust_bin, ds, train_path, model_path, survival_likelihood="transformation")
 
         t_obs = fit_df[ds.time_col].to_numpy(dtype=float)
         t_base = max(float(np.quantile(t_obs, 0.995)), float(np.max(t_obs)), 1.0)
