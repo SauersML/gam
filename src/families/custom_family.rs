@@ -12200,8 +12200,9 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                             | JointTrustRegionDecision::ShrinkOnMarginalAccept
                             | JointTrustRegionDecision::RejectFloor
                     );
-                for (block_radius, block_step_norm) in
-                    joint_block_trust_radii.iter_mut().zip(block_step_norms.iter())
+                for (block_radius, block_step_norm) in joint_block_trust_radii
+                    .iter_mut()
+                    .zip(block_step_norms.iter())
                 {
                     if shrink_boundary_blocks_only
                         && !joint_block_step_hit_trust_boundary(*block_step_norm, *block_radius)

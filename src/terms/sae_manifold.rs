@@ -2371,6 +2371,7 @@ mod tests {
         );
         let (sphere_phi, sphere_jet) = SphereChartEvaluator.evaluate(sphere_coords.view()).unwrap();
         assert_eq!(sphere_phi.dim(), (sphere_coords.nrows(), 7));
+        assert_eq!(sphere_jet.dim(), (sphere_coords.nrows(), 7, 2));
         for row in 0..sphere_coords.nrows() {
             let lat = sphere_coords[[row, 0]];
             let lon = sphere_coords[[row, 1]];
