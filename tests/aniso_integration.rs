@@ -72,6 +72,7 @@ fn aniso_matern_recovers_signal_axis() {
                 input_scales: None,
             },
             shape: ShapeConstraint::None,
+            joint_null_rotation: None,
         }],
     };
 

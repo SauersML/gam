@@ -101,6 +101,7 @@ fn build_problem(n: usize, flex: bool) -> (Array2<f64>, BernoulliMarginalSlopeTe
             },
         },
         shape: ShapeConstraint::None,
+        joint_null_rotation: None,
     };
     let marginalspec = TermCollectionSpec {
         linear_terms: vec![],

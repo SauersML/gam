@@ -14073,7 +14073,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 block_logdet_s,
                 s_lambdas,
                 joint_workspace: cached_joint_workspace.clone(),
-                kkt_residual,
+                kkt_residual: Some(kkt_residual),
                 active_constraints,
             });
         }
@@ -23367,6 +23367,7 @@ mod tests {
                     input_scales: None,
                 },
                 shape: ShapeConstraint::None,
+                joint_null_rotation: None,
             }],
         };
         let base_design =
@@ -23583,6 +23584,7 @@ mod tests {
                     input_scales: None,
                 },
                 shape: ShapeConstraint::None,
+                joint_null_rotation: None,
             }],
         };
         let base_design =

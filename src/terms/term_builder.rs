@@ -371,6 +371,7 @@ pub fn build_termspec(
                             levels,
                         },
                         shape: ShapeConstraint::None,
+                        joint_null_rotation: None,
                     });
                 } else if let Some(by_name) = by_name {
                     let by_col = resolve_col(col_map, &by_name)?;
@@ -405,6 +406,7 @@ pub fn build_termspec(
                                         },
                                     },
                                     shape: ShapeConstraint::None,
+                                    joint_null_rotation: None,
                                 });
                             }
                         }
@@ -418,6 +420,7 @@ pub fn build_termspec(
                                     by: ByVariableSpec::Numeric,
                                 },
                                 shape: ShapeConstraint::None,
+                                joint_null_rotation: None,
                             });
                         }
                     }
@@ -426,6 +429,7 @@ pub fn build_termspec(
                         name: label.clone(),
                         basis: inner_basis,
                         shape: ShapeConstraint::None,
+                        joint_null_rotation: None,
                     });
                 }
             }

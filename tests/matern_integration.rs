@@ -70,6 +70,7 @@ fn matern_fit_term_collection_gaussian_simulated_10d() {
                 input_scales: None,
             },
             shape: ShapeConstraint::None,
+            joint_null_rotation: None,
         }],
     };
 
@@ -166,6 +167,7 @@ fn matern_fit_term_collection_gaussian_simulated_10dwith_exact_adaptive_regulari
                 input_scales: None,
             },
             shape: ShapeConstraint::None,
+            joint_null_rotation: None,
         }],
     };
 
@@ -307,6 +309,7 @@ fn matern_3d_aniso_fits_successfully() {
                 input_scales: None,
             },
             shape: ShapeConstraint::None,
+            joint_null_rotation: None,
         }],
     };
 

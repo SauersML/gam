@@ -51,6 +51,7 @@ fn tensor_periodic_margin_is_exactly_cyclic_at_period_boundary() {
                 },
             },
             shape: ShapeConstraint::None,
+            joint_null_rotation: None,
         }],
     };
 
@@ -92,6 +93,7 @@ fn radial_periodic_smooth_uses_ghost_centers_but_freezes_original_centers() {
                 input_scales: None,
             },
             shape: ShapeConstraint::None,
+            joint_null_rotation: None,
         }],
     };
 

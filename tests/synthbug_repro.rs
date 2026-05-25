@@ -138,6 +138,7 @@ fn local_synth_copd_like_duchon_orth_to_parametric() {
             input_scales: None,
         },
         shape: ShapeConstraint::None,
+        joint_null_rotation: None,
     };
 
     let spec = TermCollectionSpec {

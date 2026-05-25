@@ -514,9 +514,16 @@ mod tests {
             smooth[[i, 0]] = x[i] * x[i];
             smooth[[i, 1]] = x[i] * x[i] * x[i];
         }
-        let specs = [spec_from_dense("intercept", parametric), spec_from_dense("smooth_x", smooth)];
+        let specs = [
+            spec_from_dense("intercept", parametric),
+            spec_from_dense("smooth_x", smooth),
+        ];
         let audit = audit_identifiability(&specs).expect("audit must succeed on clean specs");
-        assert!(!audit.fatal, "no aliasing must not be fatal: {}", audit.summary);
+        assert!(
+            !audit.fatal,
+            "no aliasing must not be fatal: {}",
+            audit.summary
+        );
         assert!(
             audit.aliased_pairs.is_empty(),
             "expected no alias pairs; got {:?}",
@@ -608,7 +615,11 @@ mod tests {
             spec_from_dense("smooth_b", smooth_b),
         ];
         let audit = audit_identifiability(&specs).expect("audit must succeed");
-        assert!(!audit.fatal, "attributed alias must not be fatal: {}", audit.summary);
+        assert!(
+            !audit.fatal,
+            "attributed alias must not be fatal: {}",
+            audit.summary
+        );
         let cross_linear_pair = audit
             .aliased_pairs
             .iter()
@@ -664,7 +675,10 @@ mod tests {
         );
         // Joint rank = 2 (the three columns span at most {1, x}).
         let total_kept: usize = audit.blocks.iter().map(|b| b.effective_dim).sum();
-        assert_eq!(total_kept, 2, "three-way alias collapses to rank 2; got {total_kept}");
+        assert_eq!(
+            total_kept, 2,
+            "three-way alias collapses to rank 2; got {total_kept}"
+        );
     }
 
     /// Test 5: end-to-end shape on a biobank-like configuration —

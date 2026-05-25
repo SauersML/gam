@@ -25637,6 +25637,7 @@ mod tests {
                     input_scales: None,
                 },
                 shape: ShapeConstraint::None,
+                joint_null_rotation: None,
             }],
         }
     }

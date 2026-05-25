@@ -364,6 +364,7 @@ fn te_xh_design_spec(
                 },
             },
             shape: ShapeConstraint::None,
+            joint_null_rotation: None,
         }],
     }
 }
