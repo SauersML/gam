@@ -1256,7 +1256,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         effectivelinkwiggle_formulaspec(formula_linkwiggle.as_ref(), link_choice.as_ref());
     let learn_linkwiggle = effective_linkwiggle.is_some();
     if learn_linkwiggle {
-        require_likelihood_spec_supports_joint_wiggle(family, "linkwiggle(...)")?;
+        require_likelihood_spec_supports_joint_wiggle(&family, "linkwiggle(...)")?;
         if let Some(choice) = link_choice.as_ref() {
             require_linkchoice_supports_joint_wiggle(choice, "linkwiggle(...)")?;
         }
@@ -1265,7 +1265,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         .as_ref()
         .is_some_and(|choice| matches!(choice.mode, LinkMode::Flexible));
     let mean_only_binomial_linkwiggle = args.predict_noise.is_none()
-        && binomial_mean_linkwiggle_supports_family(family, link_choice.as_ref());
+        && binomial_mean_linkwiggle_supports_family(&family, link_choice.as_ref());
     if learn_linkwiggle
         && args.predict_noise.is_none()
         && !mean_only_flexible_linkwiggle
@@ -6682,7 +6682,7 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
                     &design,
                     &spec,
                     &fit,
-                    family,
+                    family.clone(),
                     y.view(),
                     reportweights.view(),
                 );
@@ -8766,12 +8766,12 @@ fn resolve_binomial_inverse_link_for_fit(
 }
 
 fn binomial_mean_linkwiggle_supports_family(
-    family: LikelihoodSpec,
+    family: &LikelihoodSpec,
     link_choice: Option<&LinkChoice>,
 ) -> bool {
     let standard_binomial = family.is_binomial()
         && matches!(
-            family.link,
+            &family.link,
             InverseLink::Standard(LinkFunction::Logit)
                 | InverseLink::Standard(LinkFunction::Probit)
                 | InverseLink::Standard(LinkFunction::CLogLog)
