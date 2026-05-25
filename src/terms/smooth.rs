@@ -48,6 +48,7 @@ use crate::types::{
     InverseLink, LatentCLogLogState, LikelihoodSpec, LinkFunction, MixtureLinkState,
     ResponseFamily, SasLinkState,
 };
+use crate::util::quantile::quantile_from_sorted;
 use faer::sparse::{SparseColMat, Triplet};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut2, s};
 use serde::{Deserialize, Serialize};
@@ -8440,22 +8441,6 @@ impl SpatialPenaltyExactState {
             self.gradient.norm_signal(),
             self.curvature.norm_signal(),
         )
-    }
-}
-
-fn quantile_from_sorted(sorted: &[f64], q: f64) -> f64 {
-    if sorted.is_empty() {
-        return 0.0;
-    }
-    let qq = q.clamp(0.0, 1.0);
-    let pos = qq * (sorted.len().saturating_sub(1) as f64);
-    let lo = pos.floor() as usize;
-    let hi = pos.ceil() as usize;
-    if lo == hi {
-        sorted[lo]
-    } else {
-        let t = pos - lo as f64;
-        sorted[lo] * (1.0 - t) + sorted[hi] * t
     }
 }
 

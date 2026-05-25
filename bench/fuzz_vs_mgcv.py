@@ -270,6 +270,8 @@ def _standard_deviation_from_model(model: typing.Any) -> float | None:
     if not isinstance(fit_result, dict):
         return None
     sigma = fit_result.get("standard_deviation")
+    if sigma is None:
+        return None
     try:
         sigma_f = float(sigma)
     except (TypeError, ValueError):

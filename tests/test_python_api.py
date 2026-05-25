@@ -405,7 +405,7 @@ def test_predict_rejects_schema_mismatch() -> None:
     try:
         empty_pred = model.predict([])
     except (ValueError, gamfit.SchemaMismatchError, RuntimeError):
-        pass  # explicit rejection is fine
+        return
     else:
         if isinstance(empty_pred, dict):
             n_rows = len(empty_pred.get("mean", []))
@@ -948,11 +948,7 @@ def test_duchon_function_norm_penalty_2d_smoke() -> None:
     s = gamfit.duchon_function_norm_penalty(centers=centers, m=2)
     s = np.asarray(s, dtype=float)
     assert s.shape == (3, 3), f"expected (3, 3) penalty, got {s.shape}"
-    # Symmetry.
-    assert np.allclose(s, s.T, atol=1e-10), "penalty must be symmetric"
-    # PSD: smallest eigenvalue is >= ~0 (small slack for floating point).
-    w = np.linalg.eigvalsh(0.5 * (s + s.T))
-    assert w.min() > -1e-8, f"penalty not PSD; min eigenvalue {w.min()}"
+    _assert_symmetric_psd(s, "2D Duchon penalty")
 
 
 def test_duchon_function_norm_penalty_2d_cylinder_periodic() -> None:
@@ -975,11 +971,7 @@ def test_duchon_function_norm_penalty_2d_cylinder_periodic() -> None:
     )
     s = np.asarray(s, dtype=float)
     assert s.shape == (K, K), f"expected ({K}, {K}) penalty, got {s.shape}"
-    # Symmetry.
-    assert np.allclose(s, s.T, atol=1e-10), "cylinder penalty must be symmetric"
-    # PSD.
-    w = np.linalg.eigvalsh(0.5 * (s + s.T))
-    assert w.min() > -1e-8, f"cylinder penalty not PSD; min eigenvalue {w.min()}"
+    _assert_symmetric_psd(s, "cylinder Duchon penalty")
 
     # Periodic identification on the periodic axis: evaluating the basis at
     # x_1 = 0 and x_1 = 2π (with same x_2) must produce identical basis rows.
@@ -1018,9 +1010,7 @@ def test_duchon_function_norm_penalty_2d_torus_periodic() -> None:
     )
     s = np.asarray(s, dtype=float)
     assert s.shape == (K, K)
-    assert np.allclose(s, s.T, atol=1e-10), "torus penalty must be symmetric"
-    w = np.linalg.eigvalsh(0.5 * (s + s.T))
-    assert w.min() > -1e-8, f"torus penalty not PSD; min eigenvalue {w.min()}"
+    _assert_symmetric_psd(s, "torus Duchon penalty")
 
     # Periodic identification on BOTH axes.
     pts_lo = np.array([[0.0, 1.2]], dtype=float)
@@ -1479,14 +1469,6 @@ def test_gaussian_reml_fit_blocks_torch_roundtrip_lambdas_converge() -> None:
     )
 
 
-# ---------------------------------------------------------------------------
-# Newly authored coverage for session bindings.
-# Tests below this banner were added to cover the Python-facing surface
-# enumerated in the task brief; existing tests above this banner are
-# unchanged.
-# ---------------------------------------------------------------------------
-
-
 def _assert_symmetric_psd(matrix: np.ndarray, label: str, slack: float = 1e-8) -> None:
     """Helper: assert ``matrix`` is symmetric and approximately PSD."""
     assert matrix.ndim == 2 and matrix.shape[0] == matrix.shape[1], (
@@ -1543,10 +1525,7 @@ def test_duchon_function_norm_penalty_hybrid_high_d_psd(d: int) -> None:
     penalty = np.asarray(penalty, dtype=float)
     assert penalty.shape[0] == penalty.shape[1], penalty.shape
     assert np.all(np.isfinite(penalty)), "hybrid penalty has non-finite entries"
-    sym = 0.5 * (penalty + penalty.T)
-    assert np.allclose(penalty, sym, atol=1e-9), "hybrid penalty not symmetric"
-    w = np.linalg.eigvalsh(sym)
-    assert w.min() > -1e-6, f"hybrid penalty not PSD; min eig = {w.min()}"
+    _assert_symmetric_psd(penalty, "hybrid Duchon penalty", slack=1e-6)
 
 
 def test_sphere_basis_each_kernel_shapes_and_psd() -> None:
