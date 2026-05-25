@@ -17133,8 +17133,10 @@ fn validate_parametric_aux_conditional_prior(
 }
 
 fn inverse_softplus_scalar(value: f64) -> f64 {
-    if value > 30.0 {
-        value
+    if value <= 0.0 || value.is_nan() {
+        f64::NAN
+    } else if value > 30.0 {
+        value + (-(-value).exp()).ln_1p()
     } else {
         value.exp_m1().ln()
     }
