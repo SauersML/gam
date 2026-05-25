@@ -1989,22 +1989,91 @@ pub(crate) fn project_monotone_feasible_beta(
         return Ok(proposed.clone());
     }
 
+    let constraints = runtime.structural_monotonicity_constraints();
+    let alpha = max_linear_constraint_segment_alpha(current, proposed, &constraints, label)?;
     let direction = proposed - current;
-    let mut lo = 0.0_f64;
-    let mut hi = 1.0_f64;
-    for _ in 0..64 {
-        let mid = 0.5 * (lo + hi);
-        let candidate = current + &direction.mapv(|value| value * mid);
-        if runtime
-            .monotonicity_feasible(&candidate, &format!("{label} projected beta"))
-            .is_ok()
-        {
-            lo = mid;
-        } else {
-            hi = mid;
+    let candidate = current + &direction.mapv(|value| value * alpha);
+    validate_monotone_structural_feasible(runtime, &candidate, &format!("{label} projected beta"))?;
+    Ok(candidate)
+}
+
+pub(crate) fn validate_monotone_structural_feasible(
+    runtime: &DeviationRuntime,
+    beta: &Array1<f64>,
+    label: &str,
+) -> Result<(), String> {
+    let constraints = runtime.structural_monotonicity_constraints();
+    if beta.len() != constraints.a.ncols() {
+        return Err(format!(
+            "{label} structural monotonicity length mismatch: beta={}, expected={}",
+            beta.len(),
+            constraints.a.ncols()
+        ));
+    }
+    if beta.iter().any(|value| !value.is_finite()) {
+        let bad = beta
+            .iter()
+            .enumerate()
+            .find(|(_, value)| !value.is_finite())
+            .map(|(idx, value)| format!("{label} coefficient {idx} is non-finite ({value})"))
+            .unwrap_or_else(|| format!("{label} coefficient is non-finite"));
+        return Err(bad);
+    }
+    let slack = constraints.a.dot(beta) - &constraints.b;
+    let mut min_slack = f64::INFINITY;
+    let mut min_row = 0usize;
+    for (row, &value) in slack.iter().enumerate() {
+        if value < min_slack {
+            min_slack = value;
+            min_row = row;
         }
     }
-    Ok(current + &direction.mapv(|value| value * lo))
+    if min_slack < -1e-10 {
+        return Err(format!(
+            "{label} violates structural monotonicity row {min_row}: slack={min_slack:.3e}; \
+             deviation monotonicity must be enforced by analytic linear constraints, not post-update projection"
+        ));
+    }
+    runtime.monotonicity_feasible(beta, label)
+}
+
+fn max_linear_constraint_segment_alpha(
+    current: &Array1<f64>,
+    proposed: &Array1<f64>,
+    constraints: &LinearInequalityConstraints,
+    label: &str,
+) -> Result<f64, String> {
+    if current.len() != proposed.len() || current.len() != constraints.a.ncols() {
+        return Err(format!(
+            "{label} linear-constraint segment dimension mismatch: current={}, proposed={}, constraints={}",
+            current.len(),
+            proposed.len(),
+            constraints.a.ncols()
+        ));
+    }
+    if constraints.a.nrows() != constraints.b.len() {
+        return Err(format!(
+            "{label} linear-constraint segment row mismatch: A rows={}, b len={}",
+            constraints.a.nrows(),
+            constraints.b.len()
+        ));
+    }
+    let direction = proposed - current;
+    let mut alpha = 1.0_f64;
+    for row in 0..constraints.a.nrows() {
+        let a_row = constraints.a.row(row);
+        let slack = a_row.dot(current) - constraints.b[row];
+        if slack < -1e-10 {
+            return Err(format!(
+                "{label} current beta violates structural monotonicity row {row}: slack={slack:.3e}"
+            ));
+        }
+        let drift = a_row.dot(&direction);
+        if drift < 0.0 {
+            alpha = alpha.min((slack / -drift).clamp(0.0, 1.0));
+        }
+    }
+    Ok(alpha.clamp(0.0, 1.0))
 }
 
 fn validate_spec(
@@ -15423,7 +15492,9 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
                     beta.len()
                 ));
             }
-            return project_monotone_feasible_beta(runtime, current, &beta, "score_warp_dev");
+            validate_monotone_structural_feasible(runtime, current, "score_warp_dev current")?;
+            validate_monotone_structural_feasible(runtime, &beta, "score_warp_dev proposed")?;
+            return Ok(beta);
         }
         if self.link_block_index().is_some_and(|idx| block_idx == idx)
             && let (Some(runtime), Some(link)) =
@@ -15437,7 +15508,9 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
                     beta.len()
                 ));
             }
-            return project_monotone_feasible_beta(runtime, current, &beta, "link_dev");
+            validate_monotone_structural_feasible(runtime, current, "link_dev current")?;
+            validate_monotone_structural_feasible(runtime, &beta, "link_dev proposed")?;
+            return Ok(beta);
         }
         Ok(beta)
     }

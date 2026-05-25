@@ -7505,6 +7505,60 @@ fn collect_block_linear_constraints<F: CustomFamily + ?Sized>(
     Ok(constraints)
 }
 
+fn reject_constrained_post_update_repair(
+    block_idx: usize,
+    spec: &ParameterBlockSpec,
+    raw_beta: &Array1<f64>,
+    updated_beta: &Array1<f64>,
+    constraints: Option<&LinearInequalityConstraints>,
+) -> Result<(), String> {
+    let Some(constraints) = constraints else {
+        return Ok(());
+    };
+    if raw_beta.len() != updated_beta.len() {
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: format!(
+                "post-update beta length changed for constrained block '{}' (idx {block_idx}): raw={}, updated={}",
+                spec.name,
+                raw_beta.len(),
+                updated_beta.len(),
+            ),
+        }
+        .into());
+    }
+    if raw_beta.len() != constraints.a.ncols() {
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: format!(
+                "post-update constrained block '{}' (idx {block_idx}) width mismatch: beta={}, constraints={}",
+                spec.name,
+                raw_beta.len(),
+                constraints.a.ncols(),
+            ),
+        }
+        .into());
+    }
+    let max_change = raw_beta
+        .iter()
+        .zip(updated_beta.iter())
+        .map(|(left, right)| (left - right).abs())
+        .fold(0.0_f64, f64::max);
+    let raw_scale = raw_beta.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+    let updated_scale = updated_beta.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+    let tol = 1e-10 * (1.0 + raw_scale.max(updated_scale));
+    if max_change > tol {
+        return Err(CustomFamilyError::ConstraintViolation {
+            reason: format!(
+                "post-update hook materially changed constrained block '{}' (idx {block_idx}): \
+                 max |β_post - β_qp|={max_change:.3e} > tol={tol:.3e}; \
+                 constraints must be represented analytically in block_linear_constraints, not repaired after the Newton/QP solve",
+                spec.name,
+            ),
+        }
+        .into());
+    }
+    Ok(())
+}
+
 fn assemble_joint_linear_constraints(
     block_constraints: &[Option<LinearInequalityConstraints>],
     ranges: &[(usize, usize)],
@@ -12825,7 +12879,14 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     let mut trial_beta = old_beta[b].clone();
                     trial_beta += &trial_delta.slice(ndarray::s![start..end]);
                     let projected =
-                        family.post_update_block_beta(&states, b, &specs[b], trial_beta)?;
+                        family.post_update_block_beta(&states, b, &specs[b], trial_beta.clone())?;
+                    reject_constrained_post_update_repair(
+                        b,
+                        &specs[b],
+                        &trial_beta,
+                        &projected,
+                        block_constraints[b].as_ref(),
+                    )?;
                     states[b].beta.assign(&projected);
                 }
                 refresh_all_block_etas(family, specs, &mut states)?;
@@ -14122,7 +14183,14 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 cached_active_sets[b] = Some(active_set);
             }
             let beta_new_raw = update.beta_new_raw;
-            let beta_new = family.post_update_block_beta(&states, b, spec, beta_new_raw)?;
+            let beta_new = family.post_update_block_beta(&states, b, spec, beta_new_raw.clone())?;
+            reject_constrained_post_update_repair(
+                b,
+                spec,
+                &beta_new_raw,
+                &beta_new,
+                linear_constraints.as_ref(),
+            )?;
             let beta_old = states[b].beta.clone();
             let raw_delta = &beta_new - &beta_old;
             // Per-block trust-region radius in the block's local
@@ -14182,6 +14250,13 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 trial_beta_buf.scaled_add(alpha, &delta);
                 let trial_beta =
                     family.post_update_block_beta(&states, b, spec, trial_beta_buf.clone())?;
+                reject_constrained_post_update_repair(
+                    b,
+                    spec,
+                    &trial_beta_buf,
+                    &trial_beta,
+                    linear_constraints.as_ref(),
+                )?;
                 states[b].beta = trial_beta;
                 // Use precomputed X*delta when geometry is static and beta wasn't modified.
                 if let Some(ref xd) = x_delta {
@@ -14333,6 +14408,13 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                                 b,
                                 spec,
                                 trial_beta_buf.clone(),
+                            )?;
+                            reject_constrained_post_update_repair(
+                                b,
+                                spec,
+                                &trial_beta_buf,
+                                &trial_beta,
+                                linear_constraints.as_ref(),
                             )?;
                             states[b].beta = trial_beta;
                             if let Some(ref xd) = x_descent {
@@ -14687,8 +14769,19 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     let (start, end) = ranges_joint[b];
                     let mut trial_beta = old_states[b].beta.clone();
                     trial_beta.scaled_add(alpha, &delta.slice(ndarray::s![start..end]));
-                    let projected =
-                        family.post_update_block_beta(&old_states, b, &specs[b], trial_beta)?;
+                    let projected = family.post_update_block_beta(
+                        &old_states,
+                        b,
+                        &specs[b],
+                        trial_beta.clone(),
+                    )?;
+                    reject_constrained_post_update_repair(
+                        b,
+                        &specs[b],
+                        &trial_beta,
+                        &projected,
+                        block_constraints_now[b].as_ref(),
+                    )?;
                     states[b].beta.assign(&projected);
                 }
                 refresh_all_block_etas(family, specs, &mut states)?;
