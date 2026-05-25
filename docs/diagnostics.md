@@ -5,7 +5,7 @@ A fitted `Model` exposes five inspection methods:
 | Method | Returns | Contents |
 | --- | --- | --- |
 | `summary()` | `Summary` | Formula, family/link name, model class, deviance, REML/LAML score (in the `reml_score` field), per-coefficient table, smoothing parameters (`lambdas`), group metadata, and deployment extensions. |
-| `diagnose(data)` | `Diagnostics` | Observed values, predicted columns, residuals, and aggregate metrics. |
+| `diagnose(data)` | `Diagnostics` | Observed values, predicted columns, residuals, and aggregate metrics for models whose prediction output includes `"mean"`. |
 | `check(data)` | `SchemaCheck` | Schema validation result with structured issues. |
 | `plot(data, x=, kind=)` | `matplotlib.axes.Axes` | Prediction / residual / observed-vs-predicted plot. |
 | `report(path=None)` | `str` | Self-contained HTML report (string, or written path). |
@@ -31,7 +31,6 @@ s.coefficients_frame()         # pandas.DataFrame; requires pandas
 ```
 
 `Summary` supports `__getitem__` and `get(key, default)` like a dict.
-The result is cached on the `Model` after the first call.
 
 `model.smoothing_parameters()` is a thin helper returning a
 `{penalty_index: lambda}` dict derived from `summary()["lambdas"]`.
@@ -61,11 +60,12 @@ Returns a frozen `Diagnostics` dataclass:
 | `observed` | `list[float]` | Observed values. |
 | `residuals` | `list[float]` | `observed - predicted["mean"]`. |
 | `predicted` | `dict[str, list[float]]` | The predict-table columns (at least `"mean"`; with `interval` also `"mean_lower"`, `"mean_upper"`). |
-| `metrics` | `dict[str, float]` | `n_obs`, `mae`, `rmse`, `bias`; adds `r_squared` when the response variance is positive. |
+| `metrics` | `dict[str, int \| float]` | `n_obs`, `mae`, `rmse`, `bias`; adds `r_squared` when the response variance is positive. |
 | `interval_lower`, `interval_upper` | `list[float] \| None` | Aliases for the matching `predicted` columns. |
 
 `diagnose` raises `ValueError` when the response column cannot be
-inferred or is missing from `data`.
+inferred or is missing from `data`. It expects `predict(...,
+return_type="dict")` to return a `"mean"` column.
 
 ## check()
 
@@ -83,7 +83,7 @@ else:
 `SchemaCheck.ok` is `True` when no issues were reported.
 `bool(check)` returns `check.ok`. `SchemaIssue` has three fields:
 `kind`, `column`, `message`; typical kinds include `missing_column`
-and `type_mismatch`.
+and `schema_error`.
 
 ## validate_formula()
 
@@ -92,7 +92,7 @@ v = gamfit.validate_formula(
     data,
     "y ~ s(x) + group(site)",
     family="auto",
-    # additional kwargs mirror gamfit.fit(...)
+    # additional parser/materialization kwargs are accepted
 )
 v["formula"]
 v["model_class"]
@@ -102,9 +102,10 @@ v.supported_by_python      # bool
 ```
 
 Returns a `FormulaValidation` dataclass that wraps the parsed payload.
-Accepts the same keyword arguments as `gamfit.fit` (family, offset,
-weights, transformation/survival/baseline settings, link/logslope
-formula, frailty, adaptive regularization, Firth, etc.) but does no
+Accepts parser/materialization keyword arguments from `gamfit.fit`
+(family, offset, weights, transformation/survival/baseline settings,
+`z_column`, link, logslope formula, frailty, hazard loading, dimension
+scaling, adaptive regularization, Firth, and `config`) but does no
 fitting.
 
 ## plot()
@@ -146,9 +147,10 @@ html = model.report()             # returns the HTML string
 ```
 
 The report is a self-contained HTML document containing the summary
-table, smooth-term plots (per smooth term in the model), and residual
-diagnostics rendered by `src/report.rs`. The HTML is also used as
-`Model._repr_html_` for notebook display.
+table, coefficient table, and EDF-by-block table rendered by
+`src/report.rs`. Python `Model.report()` currently omits data-dependent
+diagnostics and smooth plots. The HTML is also used as `Model._repr_html_`
+for notebook display.
 
 ## Inspecting the model object
 
@@ -159,7 +161,7 @@ model.model_class               # str, e.g. "standard", "survival marginal-slope
 model.is_survival               # bool
 model.is_marginal_slope         # bool
 model.is_transformation_normal  # bool
-model.response_name             # str | None (None for survival Surv(...) formulas)
+model.response_name             # str | None (None for Surv(...) or non-simple lhs formulas)
 model.training_table_kind       # "pandas" | "polars" | "pyarrow" | "numpy" | "mapping" | "records" | "rows" | None
 model.group_metadata            # dict | None, persisted per-group metadata
 model.deployment_extensions     # tuple of dicts, no-refit group extensions

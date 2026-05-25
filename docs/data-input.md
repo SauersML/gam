@@ -13,7 +13,7 @@ before crossing the Rust FFI boundary.
 | `pyarrow.Table` | Columns taken from `table.column_names`. |
 | `numpy.ndarray` (1-D or 2-D) | Columns auto-named `x0`, `x1`, …. 1-D becomes a single column `x0`. |
 | `Mapping[str, sequence]` | Keys are column names, values are 1-D sequences. |
-| `list[Mapping[str, Any]]` | List of records. The full set of keys across rows defines the column order; each row must contain every key. |
+| `Sequence[Mapping[str, Any]]` | Records. The full set of keys across rows defines the column order; each row must contain every key. |
 | `Sequence[Sequence]` (2-D) | Columns auto-named `x0`, `x1`, …. All rows must have the same width. |
 
 pandas/polars/pyarrow are detected at runtime via `_try_import`. They
@@ -66,7 +66,7 @@ the training kind, then to `dict`. Override with `return_type=`:
 
 | `return_type` | Returns |
 | --- | --- |
-| `None` (default) | Input kind, else training kind, else `dict`. |
+| `None` (default) | Input kind for pandas/polars/numpy/pyarrow inputs, else training kind, else `dict`. |
 | `"dict"` | `dict[str, list]`. |
 | `"numpy"` | 2-D `numpy.ndarray` with columns in fixed order. |
 | `"pandas"` | `pandas.DataFrame`. |
@@ -83,21 +83,22 @@ model.predict(test_df, return_type="pandas")
 
 Transformation-normal models and Bernoulli marginal-slope models return
 a 1-D `numpy.ndarray` of shape `(n_samples,)` by default. Passing
-`id_column=` or `return_type=` switches them to a two-column table.
+`id_column=` or `return_type=` switches them to tabular output.
 
 ```python
 # 1-D numpy by default
 z = model.predict(test_df)                       # shape (n,)
 
-# Two-column table when id_column or return_type is set
+# Two-column table when id_column is set
 df = model.predict(test_df, id_column="patient", return_type="pandas")
 z = df["z"].to_numpy()                           # transformation-normal
 ```
 
 The value column is named `z` for transformation-normal output and
-`mean` for Bernoulli marginal-slope output. Flattening the two-column
-table with `np.asarray(...)` produces a shape `(n, 2)` array; extract
-the column explicitly when an array is wanted.
+`mean` for Bernoulli marginal-slope output. Passing `return_type=`
+without `id_column=` produces a one-column table; including
+`id_column=` adds the id column. Extract the value column explicitly
+when a 1-D array is wanted.
 
 ## Identifier columns
 

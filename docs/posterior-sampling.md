@@ -39,7 +39,7 @@ model.sample(
 | `samples` | derived from coefficient count | Post-warmup draws per chain. |
 | `warmup` | matches `samples` | Warmup iterations per chain (discarded). |
 | `chains` | `2` if `p <= 50`, else `4` | Independent chains. |
-| `target_accept` | `0.8` | NUTS step-size adaptation target acceptance; must lie in `(0, 1)`. Ignored by the Laplace and Polya-Gamma Gibbs paths. |
+| `target_accept` | `0.9` | NUTS step-size adaptation target acceptance; NUTS paths require it to lie in `(0, 1)`. Ignored by the Laplace and Polya-Gamma Gibbs paths. |
 | `seed` | `42` | RNG seed consumed by the sampler. |
 
 Total returned draws are `chains * samples`.
@@ -50,9 +50,9 @@ The dispatch is in `src/inference/sample.rs::sample_saved_model`:
 
 | Model class | Sampler |
 | --- | --- |
-| Standard GLM (Gaussian, binomial probit/cloglog, Poisson, Gamma) | NUTS |
-| Bernoulli-logit standard GLM (unit weights, Firth off) | Polya-Gamma Gibbs |
-| Bernoulli-logit standard GLM with weights or Firth | NUTS (fallback) |
+| Standard GLM (Gaussian, binomial probit/cloglog/latent-cloglog, Poisson, Tweedie, negative-binomial, Gamma) | NUTS |
+| Bernoulli-logit standard GLM | Polya-Gamma Gibbs |
+| Standard GLM with beta regression or binomial SAS / beta-logistic / blended links | Not implemented; raises |
 | Standard GLM with link-wiggle | NUTS (joint link-wiggle path) |
 | Survival: Royston-Parmar, Weibull, marginal-slope | NUTS |
 | Survival: latent, latent-binary, location-scale | Laplace |
@@ -64,8 +64,9 @@ The dispatch is in `src/inference/sample.rs::sample_saved_model`:
 Royston-Parmar above refers to the transformation survival
 likelihood; it is unrelated to the transformation-normal class.
 
-The Laplace path draws iid samples from `N(beta_hat, H_penalized^{-1})`
-using the saved penalized Hessian's Cholesky factor. The Python/FFI
+The Laplace path draws iid samples from `N(beta_hat, phi * H_penalized^{-1})`
+using the saved penalized Hessian's Cholesky factor and the saved dispersion
+scale. The Python/FFI
 wrapper sets `method == "laplace"` on these results; the underlying
 Rust `NutsResult` reports `rhat == 1.0`, `ess == chains * samples`, and
 `converged == True` by construction. The `PosteriorSamples` API is
@@ -100,7 +101,7 @@ Frozen dataclass holding the draws and convergence diagnostics.
 | `mean`, `std` | `numpy.ndarray` | Per-coefficient posterior mean and standard deviation. |
 | `rhat` | `float` | Maximum split-Rhat. `1.0` exactly for Laplace draws. |
 | `ess` | `float` | Minimum effective sample size across coefficients. For Laplace draws this is `chains * samples`. |
-| `converged` | `bool` | `rhat < 1.1`. |
+| `converged` | `bool` | Sampler convergence flag. Laplace draws set this to `True`; most NUTS / Gibbs paths require `rhat < 1.1` and enough ESS. |
 | `method` | `str` | `"nuts"` or `"laplace"`. |
 | `model_class` | `str` | Saved-model predictive class. |
 | `family_kind` | `str` | Inverse-link tag (`"identity"`, `"logit"`, `"probit"`, `"cloglog"`, `"log"`, ...). |
@@ -139,15 +140,14 @@ posterior.to_pandas()         # DataFrame with coefficient_names columns
 ### Posterior credible bands on new data
 
 ```python
-bands = posterior.predict(test_df, chunk_size=4096, level=0.95)
+bands = posterior.predict(test_df, level=0.95)
 # {"eta_mean", "eta_lower", "eta_upper",
 #  "mean",     "mean_lower", "mean_upper"}
 ```
 
-`predict` walks chunks of rows through `samples @ X_chunk.T`, collapsing
-each chunk to per-row mean and quantiles. Peak memory is roughly
-`n_draws * chunk_size * 8` bytes. Set `chunk_size=None` to materialize
-the full matrix.
+`predict` builds the saved model's standard design matrix, computes
+`samples @ X.T`, and collapses the resulting link-scale draws to per-row
+mean and quantiles inside Rust.
 
 `predict` raises `RuntimeError` if the `PosteriorSamples` was loaded
 from disk without bundled model bytes. Model classes lacking a
@@ -168,7 +168,7 @@ pp.summary(level=0.95)   # same dict as posterior.predict
 large prediction sets prefer `posterior.predict(...)`.
 
 The response-scale inverse link supports `identity`, `logit`, `probit`,
-`cloglog`, and `log`; other tags raise `NotImplementedError`.
+`cloglog`, and `log`; other tags raise a `gamfit.GamError`.
 
 ### Trace plots
 
@@ -202,18 +202,12 @@ matrix. Model classes that require the full saved-model predict path
 and any model with a custom `predict` pipeline) raise from the FFI;
 use `Model.predict(...)` for those.
 
-## PairedPosteriorSamples
-
-Returned by `Model.sample_paired(...)`. Holds two `PosteriorSamples`
-with draw rows paired by index. Exposes
-`cumulative_incidence(new_data, times, level=0.95)` which returns a
-`CumulativeIncidenceDraws` carrying `(n_draws, n_rows, n_times)`
-target-cause CIF draws plus `mean`, `lower`, `upper` summaries.
-
 ## Convergence
 
 `rhat < 1.01` is typical for well-mixed NUTS chains; `rhat < 1.1` is
-the threshold `converged` reports. If a NUTS run looks unhealthy:
+the split-Rhat threshold used by `converged`. Standard NUTS and
+Polya-Gamma Gibbs paths also require `ess > 100`; survival NUTS currently
+uses the R-hat threshold only. If a NUTS run looks unhealthy:
 
 1. Set `seed=` to retry from a different initialisation.
 2. Increase `warmup` and `samples`.
@@ -230,7 +224,7 @@ from the coefficient count `p`:
 | `n_chains` | `2` if `p <= 50`, else `4`. |
 | `n_samples` | `clamp(floor(100 * p * (1 + 2 * max(1, sqrt(p))) * 1.5), 500, 10_000)`. |
 | `n_warmup` | Same as `n_samples`. |
-| `target_accept` | `0.8`. |
+| `target_accept` | `0.9`. |
 | `seed` | `42` unless `seed=` is passed. |
 
 Every keyword on `Model.sample` overrides the corresponding default.
@@ -240,7 +234,7 @@ Every keyword on `Model.sample` overrides the corresponding default.
 ### Derived quantity (odds ratio)
 
 ```python
-beta_contrast = posterior["beta_treatment"]
+beta_contrast = posterior["beta_1"]
 or_draws = np.exp(beta_contrast)
 or_mean = or_draws.mean()
 or_lo, or_hi = np.quantile(or_draws, [0.025, 0.975])
