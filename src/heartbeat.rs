@@ -143,12 +143,15 @@ fn heartbeat_state() -> Arc<HeartbeatState> {
 
 fn start_heartbeat_thread(state: Arc<HeartbeatState>) {
     let builder = thread::Builder::new().name("gam-heartbeat".to_string());
-    let _ = builder.spawn(move || {
+    match builder.spawn(move || {
         loop {
-            thread::sleep(HEARTBEAT_INTERVAL);
+            thread::park_timeout(HEARTBEAT_INTERVAL);
             state.emit();
         }
-    });
+    }) {
+        Ok(handle) => drop(handle),
+        Err(err) => log::warn!("failed to start heartbeat thread: {err}"),
+    }
 }
 
 fn format_duration(duration: Duration) -> String {
