@@ -92,8 +92,8 @@ use gam::transformation_normal::TransformationNormalFitResult;
 use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily, RhoPrior};
 use gam::{FitConfig, FitRequest, FitResult, fit_model, materialize, resolve_offset_column};
 use ndarray::{
-    Array1, Array2, Array3, Array4, ArrayView1, ArrayView2, ArrayView3, ArrayView4, ArrayViewD,
-    Axis, IxDyn, s,
+    Array1, Array2, Array3, Array4, ArrayD, ArrayView1, ArrayView2, ArrayView3, ArrayView4,
+    ArrayViewD, Axis, IxDyn, s,
 };
 use numpy::{
     IntoPyArray, PyArray1, PyArray2, PyArray3, PyArrayDyn, PyArrayMethods, PyReadonlyArray1,
