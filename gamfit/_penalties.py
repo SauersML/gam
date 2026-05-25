@@ -98,21 +98,197 @@ __all__ = [
 
 
 def _rust_descriptor_class(name: str) -> type[Any]:
+    """Return a Python wrapper class around the Rust pyclass `name`.
+
+    The Rust pyclass is constructed via `__init__` exactly as before, but the
+    Python wrapper composes (not inherits) the inner descriptor and adds two
+    composition-engine entry points required by non-gamfit hosts (torch
+    trainers, JAX, Stan-style HMC):
+
+    * `value_grad(t)` — scalar penalty value and ∂P/∂t. Routes through the
+      same `analytic_penalty_value_grad` Rust kernel that REML uses
+      internally, so the returned `(value, grad)` is bit-for-bit identical
+      to what `gamfit.fit(..., penalties=[pen])` scores during PIRLS.
+    * `hvp(t, v)` — Hessian-vector product (∂²P/∂t²)·v. Routes through the
+      `analytic_penalty_hvp` kernel; every analytic penalty in this module
+      has either a closed-form or analytic-matvec Hessian, so this never
+      falls back to finite differences.
+
+    All other attributes (target, weight, weight_schedule, to_rust_descriptor,
+    __repr__, …) forward to the Rust descriptor via `__getattr__`, so the
+    wrapper is duck-typed-equivalent to the underlying Rust class for every
+    existing consumer.
+    """
     module = _rust_module()
-    cls = getattr(module, name, None)
-    if cls is not None:
-        return cls
+    rust_cls = getattr(module, name, None)
+    if rust_cls is None:
 
-    class _MissingRustDescriptor:
+        class _MissingRustDescriptor:
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                del args, kwargs
+                raise AttributeError(
+                    f"gamfit._rust does not expose {name}; rebuild the local Rust extension"
+                )
+
+        _MissingRustDescriptor.__name__ = name
+        _MissingRustDescriptor.__qualname__ = name
+        return _MissingRustDescriptor
+
+    wrapper = _build_penalty_wrapper(name, rust_cls)
+    return wrapper
+
+
+def _build_penalty_wrapper(name: str, rust_cls: type[Any]) -> type[Any]:
+    """Build a Python composition wrapper around `rust_cls`.
+
+    The wrapper holds an inner Rust descriptor and proxies every attribute
+    access through `__getattr__` so callers see no behavioral difference for
+    the existing surface. The wrapper exposes `value_grad` and `hvp` which
+    forward into the polymorphic Rust evaluators.
+    """
+
+    class _PenaltyWrapper:
+        __slots__ = ("_inner",)
+        _rust_cls = rust_cls
+        _penalty_name = name
+
         def __init__(self, *args: Any, **kwargs: Any) -> None:
-            del args, kwargs
-            raise AttributeError(
-                f"gamfit._rust does not expose {name}; rebuild the local Rust extension"
-            )
+            object.__setattr__(self, "_inner", rust_cls(*args, **kwargs))
 
-    _MissingRustDescriptor.__name__ = name
-    _MissingRustDescriptor.__qualname__ = name
-    return _MissingRustDescriptor
+        @property
+        def inner(self) -> Any:
+            return self._inner
+
+        def to_rust_descriptor(self) -> dict[str, Any]:
+            return self._inner.to_rust_descriptor()
+
+        def set_weight_schedule(self, schedule: Any) -> "_PenaltyWrapper":
+            self._inner.set_weight_schedule(schedule)
+            return self
+
+        def value_grad(self, t: Any) -> tuple[float, np.ndarray]:
+            return _penalty_value_grad_via_rust(self, t)
+
+        def hvp(self, t: Any, v: Any) -> np.ndarray:
+            return _penalty_hvp_via_rust(self, t, v)
+
+        def __getattr__(self, item: str) -> Any:
+            # Called only when normal attribute resolution fails — forward to
+            # the inner Rust descriptor so the wrapper is duck-typed
+            # equivalent for every existing consumer.
+            return getattr(object.__getattribute__(self, "_inner"), item)
+
+        def __repr__(self) -> str:
+            return repr(self._inner)
+
+    _PenaltyWrapper.__name__ = name
+    _PenaltyWrapper.__qualname__ = name
+    return _PenaltyWrapper
+
+
+def _penalty_t_shape(t_array: np.ndarray, name: str) -> tuple[int, int]:
+    """Auto-derive `(n, d)` from `t`'s shape.
+
+    Most analytic penalties live on a latent block `t` of shape
+    `(n_obs, latent_dim)`. `MechanismSparsityPenalty` is the exception:
+    it lives on a decoder weight matrix of shape `(d_latent, p_features)`,
+    so we pass `(n=1, d=d_latent)` and let the Rust dispatch read
+    `p_features` off the descriptor's `feature_groups`.
+    """
+    if name == "MechanismSparsityPenalty":
+        if t_array.ndim != 2:
+            raise ValueError(
+                f"{name}.value_grad expects a 2D decoder weight matrix (d_latent, p_features)"
+            )
+        return 1, int(t_array.shape[0])
+    if t_array.ndim == 2:
+        return int(t_array.shape[0]), int(t_array.shape[1])
+    if t_array.ndim == 1:
+        return int(t_array.shape[0]), 1
+    raise ValueError(f"{name}.value_grad expects t with ndim 1 or 2; got ndim={t_array.ndim}")
+
+
+def _penalty_latents_and_descriptor(
+    wrapper: Any, t_array: np.ndarray
+) -> tuple[str, str]:
+    """Serialize a single-penalty registry payload for the Rust evaluator.
+
+    Returns `(latents_json, penalties_json)` where the latents block is a
+    synthetic single-entry dict keyed by the descriptor's `target` name
+    (defaulting to `"t"`), and the penalties block is a one-element list
+    containing the descriptor produced by the inner Rust class.
+    """
+    import json as _json
+
+    descriptor = wrapper.to_rust_descriptor()
+    if not isinstance(descriptor, Mapping):
+        raise TypeError(
+            f"{type(wrapper).__name__}.to_rust_descriptor() must return a mapping"
+        )
+    descriptor = dict(descriptor)
+    target = descriptor.get("target", "t")
+    target_name = str(target) if isinstance(target, (str, int)) else str(target)
+    if not isinstance(target_name, str) or not target_name:
+        target_name = "t"
+    descriptor["target"] = target_name
+    n, d = _penalty_t_shape(t_array, type(wrapper).__name__)
+    latents = {target_name: {"name": target_name, "n": int(n), "d": int(d)}}
+    return _json.dumps(latents), _json.dumps([descriptor])
+
+
+def _penalty_value_grad_via_rust(
+    wrapper: Any, t: Any
+) -> tuple[float, np.ndarray]:
+    """Evaluate `(P(t), ∂P/∂t)` through the Rust kernel REML uses internally."""
+    rust = _rust_module()
+    eval_fn = getattr(rust, "analytic_penalty_value_grad", None)
+    if eval_fn is None:
+        raise AttributeError(
+            "gamfit._rust does not expose analytic_penalty_value_grad; "
+            "rebuild the local Rust extension"
+        )
+    t_array = np.ascontiguousarray(t, dtype=float)
+    original_shape = t_array.shape
+    flat = t_array.reshape(-1)
+    latents_json, penalties_json = _penalty_latents_and_descriptor(wrapper, t_array)
+    value, grad_target, _grad_rho = eval_fn(
+        latents_json,
+        penalties_json,
+        flat,
+        None,
+    )
+    grad = np.asarray(grad_target, dtype=float).reshape(original_shape)
+    return float(value), grad
+
+
+def _penalty_hvp_via_rust(wrapper: Any, t: Any, v: Any) -> np.ndarray:
+    """Evaluate `H · v = ∂²P/∂t² · v` through the Rust kernel."""
+    rust = _rust_module()
+    eval_fn = getattr(rust, "analytic_penalty_hvp", None)
+    if eval_fn is None:
+        raise NotImplementedError(
+            f"hvp not available for {type(wrapper).__name__}: gamfit._rust does not "
+            "expose analytic_penalty_hvp; rebuild the local Rust extension"
+        )
+    t_array = np.ascontiguousarray(t, dtype=float)
+    v_array = np.ascontiguousarray(v, dtype=float)
+    if v_array.shape != t_array.shape:
+        raise ValueError(
+            f"{type(wrapper).__name__}.hvp: v shape {v_array.shape} does not match "
+            f"t shape {t_array.shape}"
+        )
+    original_shape = t_array.shape
+    flat_t = t_array.reshape(-1)
+    flat_v = v_array.reshape(-1)
+    latents_json, penalties_json = _penalty_latents_and_descriptor(wrapper, t_array)
+    hv = eval_fn(
+        latents_json,
+        penalties_json,
+        flat_t,
+        flat_v,
+        None,
+    )
+    return np.asarray(hv, dtype=float).reshape(original_shape)
 
 
 BlockSparsityPenalty = _rust_descriptor_class("BlockSparsityPenalty")
