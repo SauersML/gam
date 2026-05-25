@@ -5038,8 +5038,7 @@ where
     }
 
     let requested_mode = options.covariance_mode;
-    let (backend, covariance_corrected_used) = selected_uncertainty_backend(
-        fit,
+    let (backend, covariance_corrected_used) = source.select_uncertainty_backend(
         beta.len(),
         requested_mode,
         "predict_gamwith_uncertainty",
@@ -5048,10 +5047,11 @@ where
     let mut eta = x.matrixvectormultiply(&beta.to_owned());
     eta += &offset;
     if options.apply_bias_correction
-        && let Some(bc) = fit.bias_correction_beta()
+        && let Some(bc) = source.resolved_bias_correction_beta()
     {
         if bc.len() == beta.len() {
-            let delta = x.matrixvectormultiply(&bc.clone());
+            let bc_owned = bc.to_owned();
+            let delta = x.matrixvectormultiply(&bc_owned);
             eta += &delta;
         } else {
             log::warn!(
@@ -5062,7 +5062,7 @@ where
             );
         }
     }
-    let fitted_link_state = fit.fitted_link_state(&family).ok();
+    let fitted_link_state = source.resolved_fitted_link_state(&family);
     let mixture_state = match fitted_link_state.as_ref() {
         Some(FittedLinkState::Mixture { state, .. }) => Some(state.clone()),
         _ => None,
@@ -5338,7 +5338,7 @@ where
 
         match &spec.response {
             ResponseFamily::Gaussian => {
-                let obsvar = fit.standard_deviation.max(0.0).powi(2);
+                let obsvar = source.observation_standard_deviation().max(0.0).powi(2);
                 let obs_se = etavar.mapv(|v| (v + obsvar).max(0.0).sqrt());
                 let lower = Array1::from_iter(
                     eta.iter()
@@ -5363,12 +5363,12 @@ where
                 response_observation_bounds(response_var)
             }
             ResponseFamily::Tweedie { p } => {
-                let phi = fit.likelihood_scale.fixed_phi().unwrap_or(1.0);
+                let phi = source.observation_phi().unwrap_or(1.0);
                 let response_var = mean.mapv(|mu| phi * mu.powf(*p));
                 response_observation_bounds(response_var)
             }
             ResponseFamily::Gamma => {
-                let phi = fit.likelihood_scale.fixed_phi().unwrap_or(1.0);
+                let phi = source.observation_phi().unwrap_or(1.0);
                 let response_var = mean.mapv(|mu| phi * mu.powi(2));
                 response_observation_bounds(response_var)
             }
