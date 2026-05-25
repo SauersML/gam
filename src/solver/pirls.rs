@@ -5395,6 +5395,10 @@ where
                         // Preserve the structural ridge computed by the model.
                         // LM damping is a transient solver detail and must not
                         // redefine the objective's stabilization ridge.
+                        final_state_cache_key = Some(PirlsAcceptedStateCacheKey::new(
+                            &beta,
+                            accepted_state.hessian_curvature,
+                        ));
                         final_state = Some(accepted_state);
                         let final_state_ref = final_state
                             .as_ref()
