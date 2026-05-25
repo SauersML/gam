@@ -12190,6 +12190,16 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         // directly. Extra damping must be wired through an accepted/rejected
         // step policy before it belongs here; keep the matvec faithful to the
         // objective until then.
+        //
+        // `last_residual_tol` mirrors the per-cycle KKT tolerance computed at
+        // line ~12648 (`inner_tol · (1 + max(‖∇L‖∞, ‖Sβ‖∞))`). The
+        // post-converged exit block at the bottom of this function feeds the
+        // accepted certificate's `with_metadata` builder, which needs the
+        // same scale-aware tolerance that was actually applied to certify
+        // the cycle. Seed the value at `inner_tol` so a path that exits the
+        // loop before computing a cycle-local tol (e.g. zero cycles) still
+        // records a finite, non-NaN tolerance on the residual carrier.
+        let mut last_residual_tol: f64 = inner_tol;
         for cycle in 0..inner_loop_hard_ceiling {
             if cycle >= inner_max_cycles {
                 break;
@@ -12646,6 +12656,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 .map(|x: &f64| x.abs())
                 .fold(0.0_f64, f64::max);
             let residual_tol = inner_tol * (1.0 + grad_inf.max(penalty_inf));
+            last_residual_tol = residual_tol;
             let current_stationarity_residual = current_kkt_norm;
             // KKT certificate: ‖∇L − Sβ‖_∞ ≤ residual_tol together with
             // ‖δ‖_∞ ≤ step_tol is sufficient first-order optimality of the
@@ -13754,7 +13765,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 .map(|maybe| maybe.as_ref().map(|v| v.len()).unwrap_or(0))
                 .sum();
             let free_rank_at_cert = total_p.saturating_sub(active_set_rows_total);
-            let kkt_residual = kkt_residual.with_metadata(residual_tol, free_rank_at_cert);
+            let kkt_residual = kkt_residual.with_metadata(last_residual_tol, free_rank_at_cert);
             // Build the joint active-constraint block for the unified
             // evaluator's constraint-aware kernel
             // `K_T = K_S − K_S Aᵀ (A K_S Aᵀ)⁻¹ A K_S`. Returns `None` when
@@ -14737,7 +14748,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     &block_constraints,
                     Some(cached_active_sets.as_slice()),
                 )?
-                .map(|r| r.with_metadata(residual_tol, free_rank_at_cert))
+                .map(|r| r.with_metadata(last_residual_tol, free_rank_at_cert))
             }
             None => None,
         }

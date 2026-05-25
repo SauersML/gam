@@ -6741,8 +6741,13 @@ macro_rules! define_analytic_penalty_kind {
             }
 
             pub fn value(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> f64 {
+                // UFCS forces dispatch through the AnalyticPenalty trait so a
+                // wrapper type (e.g. SheafConsistencyPenalty) carrying both an
+                // inherent `value(&self, s)` Python-API helper and the trait's
+                // `value(&self, target, rho)` cannot silently bind the
+                // inherent method here.
                 match self {
-                    $(AnalyticPenaltyKind::$variant(p) => p.value(target, rho),)*
+                    $(AnalyticPenaltyKind::$variant(p) => <$ty as AnalyticPenalty>::value(p, target, rho),)*
                 }
             }
 
@@ -6752,7 +6757,7 @@ macro_rules! define_analytic_penalty_kind {
                 rho: ArrayView1<'_, f64>,
             ) -> Array1<f64> {
                 match self {
-                    $(AnalyticPenaltyKind::$variant(p) => p.grad_target(target, rho),)*
+                    $(AnalyticPenaltyKind::$variant(p) => <$ty as AnalyticPenalty>::grad_target(p, target, rho),)*
                 }
             }
 
@@ -6762,7 +6767,7 @@ macro_rules! define_analytic_penalty_kind {
                 rho: ArrayView1<'_, f64>,
             ) -> Array1<f64> {
                 match self {
-                    $(AnalyticPenaltyKind::$variant(p) => p.grad_rho(target, rho),)*
+                    $(AnalyticPenaltyKind::$variant(p) => <$ty as AnalyticPenalty>::grad_rho(p, target, rho),)*
                 }
             }
 
@@ -6772,7 +6777,7 @@ macro_rules! define_analytic_penalty_kind {
                 rho: ArrayView1<'_, f64>,
             ) -> Option<Array1<f64>> {
                 match self {
-                    $(AnalyticPenaltyKind::$variant(p) => p.hessian_diag(target, rho),)*
+                    $(AnalyticPenaltyKind::$variant(p) => <$ty as AnalyticPenalty>::hessian_diag(p, target, rho),)*
                 }
             }
 
@@ -6783,7 +6788,7 @@ macro_rules! define_analytic_penalty_kind {
                 v: ArrayView1<'_, f64>,
             ) -> Array1<f64> {
                 match self {
-                    $(AnalyticPenaltyKind::$variant(p) => p.hvp(target, rho, v),)*
+                    $(AnalyticPenaltyKind::$variant(p) => <$ty as AnalyticPenalty>::hvp(p, target, rho, v),)*
                 }
             }
         }
