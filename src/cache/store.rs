@@ -526,6 +526,13 @@ impl WarmStartStore {
         }
         let total: u64 = all.iter().map(|e| e.2).sum();
         if total <= self.opts.size_budget_bytes {
+            // Resync the approximate byte counter even when no eviction was
+            // needed. Otherwise the in-memory `byte_total` only grows (it
+            // never observes deletions made by sibling processes or
+            // expiration sweeps), so after enough saves `new_total` exceeds
+            // the budget on every call and triggers a full directory walk
+            // on every save instead of every Nth save.
+            self.byte_total.store(total, Ordering::Relaxed);
             return Ok(());
         }
         all.sort_by_key(|e| e.3);
