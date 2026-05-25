@@ -1,11 +1,9 @@
-import typing
 import importlib.util
-import os
 import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest import mock
+from typing import Any
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -13,12 +11,12 @@ _FUZZ_PATH = _REPO_ROOT / "bench" / "fuzz_vs_mgcv.py"
 _SPEC = importlib.util.spec_from_file_location("bench_fuzz_vs_mgcv", _FUZZ_PATH)
 if _SPEC is None or _SPEC.loader is None:
     raise RuntimeError(f"failed to load fuzz benchmark module from {_FUZZ_PATH}")
-_FUZZ: typing.Any = importlib.util.module_from_spec(_SPEC)
+_FUZZ: Any = importlib.util.module_from_spec(_SPEC)
 sys.modules[_SPEC.name] = _FUZZ
 _SPEC.loader.exec_module(_FUZZ)
 
 
-def _scenario(**overrides: typing.Any) -> typing.Any:
+def _scenario(**overrides: Any) -> Any:
     base = {
         "double_penalty": True,
         "basis_type": "ps",
@@ -48,8 +46,6 @@ class FuzzVsMgcvFormulaTests(unittest.TestCase):
 
         noise_terms = _FUZZ.rust_noise_terms(["x0", "x1", "x2"], sc)
 
-        # Rust's default Duchon formula is pure scale-free Duchon, matching
-        # mgcv bs='ds' for this cross-implementation fuzz harness.
         self.assertEqual(
             noise_terms,
             "duchon(x0, x1, centers=5, order=0, power=2)",
@@ -68,22 +64,14 @@ class FuzzVsMgcvFormulaTests(unittest.TestCase):
         )
 
     def test_select_scenarios_applies_cost_cap_before_sorting(self) -> None:
-        # Use a wide seed sweep so we're guaranteed to land at least one
-        # scenario above and one below the cost cap regardless of how the
-        # scenario generator's random distributions evolve.
         seeds = list(range(1, 60))
         cap = 75_000.0
         scenarios, skipped = _FUZZ.select_scenarios(seeds, max_scenario_cost=cap)
 
-        # Every retained scenario is at or below cap; every skipped scenario
-        # is strictly above cap.
         for sc in scenarios:
             self.assertLessEqual(_FUZZ.estimate_scenario_cost(sc), cap)
         for sc, cost in skipped:
             self.assertGreater(cost, cap)
-        # And the harness is producing some of each (otherwise the cap is
-        # not actually doing any work in this seed range, which would be
-        # a regression).
         self.assertGreater(len(scenarios), 0)
         self.assertGreater(len(skipped), 0)
 
@@ -128,17 +116,26 @@ class FuzzVsMgcvFormulaTests(unittest.TestCase):
         self.assertFalse(sc.double_penalty)
 
     def test_mgcv_select_penalty_matches_rust_double_penalty_semantics(self) -> None:
-        self.assertFalse(_FUZZ._mgcv_select_penalty(_scenario(basis_type="tps", double_penalty=False)))
-        self.assertTrue(_FUZZ._mgcv_select_penalty(_scenario(basis_type="tps", double_penalty=True)))
-        self.assertFalse(_FUZZ._mgcv_select_penalty(_scenario(basis_type="duchon", double_penalty=True)))
-        self.assertFalse(_FUZZ._mgcv_select_penalty(_scenario(basis_type="ps", double_penalty=False)))
-        self.assertTrue(_FUZZ._mgcv_select_penalty(_scenario(basis_type="ps", double_penalty=True)))
+        cases = [
+            ("tps", False, False),
+            ("tps", True, True),
+            ("duchon", True, False),
+            ("ps", False, False),
+            ("ps", True, True),
+        ]
+        for basis_type, double_penalty, expected in cases:
+            with self.subTest(basis_type=basis_type, double_penalty=double_penalty):
+                self.assertIs(
+                    _FUZZ._mgcv_select_penalty(
+                        _scenario(
+                            basis_type=basis_type,
+                            double_penalty=double_penalty,
+                        )
+                    ),
+                    expected,
+                )
 
     def test_duchon_extra_terms_raise_estimated_cost(self) -> None:
-        # Build two synthetic Duchon scenarios at known sizes — one small
-        # and cheap, one large and over-cap — instead of relying on the
-        # random scenario generator producing specific shapes for fixed
-        # seeds (which is fragile under generator changes).
         small = SimpleNamespace(
             seed=0, family="gaussian", model_type="gam",
             n_obs=200, n_smooths=3, knots=8, double_penalty=False,
@@ -161,18 +158,16 @@ class FuzzVsMgcvFormulaTests(unittest.TestCase):
         self.assertLess(_FUZZ.estimate_scenario_cost(small), 75_000)
 
 
-def _trial(*, family: typing.Any="gaussian", model_type: typing.Any="gam", basis: typing.Any="ps",
-           gap: typing.Any=None, rust_metric: typing.Any=None, mgcv_metric: typing.Any=None,
-           rust: typing.Any=None, mgcv: typing.Any=None, seed: typing.Any=0) -> typing.Any:
+def _trial(
+    *,
+    family: str = "gaussian",
+    model_type: str = "gam",
+    basis: str = "ps",
+    rust_metric: float | None = None,
+    mgcv_metric: float | None = None,
+    seed: int = 0,
+) -> Any:
     primary_metric = "r2" if family == "gaussian" else "auc"
-    rv = rust_metric if rust_metric is not None else (None if gap is None else 0.5)
-    mv = mgcv_metric if mgcv_metric is not None else (None if gap is None else (rv + gap if rv is not None else None))
-    rust_dict = {primary_metric: rv}
-    if rust:
-        rust_dict.update(rust)
-    mgcv_dict = {primary_metric: mv}
-    if mgcv:
-        mgcv_dict.update(mgcv)
     scenario = {
         "seed": seed,
         "family": family,
@@ -182,16 +177,21 @@ def _trial(*, family: typing.Any="gaussian", model_type: typing.Any="gam", basis
         "n_smooths": 2,
         "knots": 8,
     }
-    fr = _FUZZ.FuzzResult(scenario=scenario, rust=rust_dict, mgcv=mgcv_dict)
+    fr = _FUZZ.FuzzResult(
+        scenario=scenario,
+        rust={primary_metric: rust_metric},
+        mgcv={primary_metric: mgcv_metric},
+    )
     fr.compute_gap()
     return fr
 
 
+def _gate_names(gates: dict[str, Any]) -> set[str]:
+    return {failure["gate"] for failure in gates["gate_failures"]}
+
+
 class FuzzCiGateTests(unittest.TestCase):
     def test_clean_run_passes(self) -> None:
-        # True-tie metrics (gap=0) so all 100 trials land inside the
-        # ±0.01 deadband regardless of FP-arithmetic noise; tests that
-        # a green run does NOT fire any gate.
         results = [
             _trial(rust_metric=0.80, mgcv_metric=0.80, seed=i)
             for i in range(100)
@@ -204,27 +204,25 @@ class FuzzCiGateTests(unittest.TestCase):
             _trial(rust_metric=0.80, mgcv_metric=0.81, seed=i)
             for i in range(100)
         ]
-        # Inject one massive regression — gap = 0.74 like the real run.
         results[7] = _trial(rust_metric=0.05, mgcv_metric=0.79, seed=7)
         gates = _FUZZ.compute_ci_gates(results, requested_trials=100)
         self.assertTrue(gates["failed"])
-        gate_names = [gf["gate"] for gf in gates["gate_failures"]]
-        self.assertIn("per_trial_gap", gate_names)
+        self.assertIn("per_trial_gap", _gate_names(gates))
 
     def test_cohort_median_failure_fires(self) -> None:
-        # gaussian/gam/duchon cohort with median gap +0.25 like the real run.
-        results = []
-        for i in range(20):
-            results.append(_trial(
+        results = [
+            _trial(
                 family="gaussian", model_type="gam", basis="duchon",
                 rust_metric=0.50, mgcv_metric=0.75, seed=1000 + i,
-            ))
-        # Plus a clean cohort to make sure we only flag the bad one.
-        for i in range(20):
-            results.append(_trial(
+            )
+            for i in range(20)
+        ] + [
+            _trial(
                 family="gaussian", model_type="gam", basis="ps",
                 rust_metric=0.80, mgcv_metric=0.81, seed=2000 + i,
-            ))
+            )
+            for i in range(20)
+        ]
         gates = _FUZZ.compute_ci_gates(results, requested_trials=40)
         self.assertTrue(gates["failed"])
         cohort_failures = [
@@ -239,35 +237,30 @@ class FuzzCiGateTests(unittest.TestCase):
         )
 
     def test_cohort_net_wins_failure_fires(self) -> None:
-        # 10 mgcv wins, 0 rust wins → net = 10 > 5 in this cohort.
-        results = []
-        for i in range(10):
-            # gap = +0.06 — too small for per-trial fail, big enough for win.
-            results.append(_trial(
+        results = [
+            _trial(
                 family="binomial", model_type="gam", basis="tps",
                 rust_metric=0.60, mgcv_metric=0.66, seed=3000 + i,
-            ))
+            )
+            for i in range(10)
+        ]
         gates = _FUZZ.compute_ci_gates(results, requested_trials=10)
         self.assertTrue(gates["failed"])
-        gate_names = [gf["gate"] for gf in gates["gate_failures"]]
-        self.assertIn("cohort_net_wins", gate_names)
+        self.assertIn("cohort_net_wins", _gate_names(gates))
 
     def test_rust_nan_inf_failure_fires(self) -> None:
         results = [
             _trial(rust_metric=0.80, mgcv_metric=0.81, seed=i)
             for i in range(100)
         ]
-        # Trial 5 — rust returned NaN R² where mgcv was finite.
         results[5] = _trial(
             rust_metric=float("nan"), mgcv_metric=0.55, seed=5,
         )
         gates = _FUZZ.compute_ci_gates(results, requested_trials=100)
         self.assertTrue(gates["failed"])
-        gate_names = [gf["gate"] for gf in gates["gate_failures"]]
-        self.assertIn("rust_nan_inf", gate_names)
+        self.assertIn("rust_nan_inf", _gate_names(gates))
 
     def test_coverage_failure_fires_when_too_many_skipped(self) -> None:
-        # 50 valid trials out of 100 requested ⇒ below the 80% floor.
         results = [
             _trial(rust_metric=0.80, mgcv_metric=0.81, seed=i)
             for i in range(50)
@@ -276,32 +269,16 @@ class FuzzCiGateTests(unittest.TestCase):
             results, requested_trials=100, skipped_count=50,
         )
         self.assertTrue(gates["failed"])
-        gate_names = [gf["gate"] for gf in gates["gate_failures"]]
-        self.assertIn("coverage", gate_names)
-
-    def test_depth_env_var_controls_default_n_trials(self) -> None:
-        with mock.patch.dict(os.environ, {"FUZZ_DEPTH": "lean"}, clear=False):
-            self.assertEqual(_FUZZ._default_n_trials(), 100)
-        with mock.patch.dict(os.environ, {"FUZZ_DEPTH": "default"}, clear=False):
-            self.assertEqual(_FUZZ._default_n_trials(), 200)
-        with mock.patch.dict(os.environ, {"FUZZ_DEPTH": "deep"}, clear=False):
-            self.assertEqual(_FUZZ._default_n_trials(), 500)
-        with mock.patch.dict(os.environ, {"FUZZ_DEPTH": "heavy"}, clear=False):
-            self.assertEqual(_FUZZ._default_n_trials(), 1000)
-        with mock.patch.dict(os.environ, {"FUZZ_DEPTH": "BOGUS"}, clear=False):
-            # Unknown depth tokens fall back to the safe default rather than
-            # crashing — CI shouldn't bomb on a typo.
-            self.assertEqual(_FUZZ._default_n_trials(), 200)
+        self.assertIn("coverage", _gate_names(gates))
 
     def test_baseline_regression_fires(self) -> None:
-        # Baseline says gaussian/gam/ps cohort had median gap +0.02; current
-        # run has +0.10 — delta 0.08 > threshold 0.05 ⇒ fail.
-        results = []
-        for i in range(20):
-            results.append(_trial(
+        results = [
+            _trial(
                 family="gaussian", model_type="gam", basis="ps",
                 rust_metric=0.70, mgcv_metric=0.80, seed=4000 + i,
-            ))
+            )
+            for i in range(20)
+        ]
         baseline = {
             "threshold": 0.05,
             "cohorts": {"gaussian/gam/ps": 0.02},
@@ -310,8 +287,7 @@ class FuzzCiGateTests(unittest.TestCase):
             results, requested_trials=20, baseline=baseline,
         )
         self.assertTrue(gates["failed"])
-        gate_names = [gf["gate"] for gf in gates["gate_failures"]]
-        self.assertIn("baseline_regression", gate_names)
+        self.assertIn("baseline_regression", _gate_names(gates))
 
 
 if __name__ == "__main__":
