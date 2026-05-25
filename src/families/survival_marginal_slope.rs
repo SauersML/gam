@@ -5496,7 +5496,9 @@ impl SurvivalMarginalSlopeFamily {
         }
     }
 
-    fn effective_time_linear_constraints(&self) -> Result<Option<LinearInequalityConstraints>, String> {
+    fn effective_time_linear_constraints(
+        &self,
+    ) -> Result<Option<LinearInequalityConstraints>, String> {
         if let Some(constraints) = self.time_linear_constraints.as_ref() {
             return Ok(Some(constraints.clone()));
         }
@@ -16577,7 +16579,8 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
             for coord in 0..self.score_dim() {
                 let range = score_warp_component_range(runtime, coord);
                 let proposed_local = beta.slice(s![range.clone()]).to_owned();
-                runtime.monotonicity_feasible(&proposed_local, &format!("score_warp_dev[z{coord}]"))?;
+                runtime
+                    .monotonicity_feasible(&proposed_local, &format!("score_warp_dev[z{coord}]"))?;
             }
             return Ok(beta);
         }

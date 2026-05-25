@@ -20829,8 +20829,7 @@ fn diagnostics_anchor_consistency<'py>(
             anchor_dominance
         )));
     }
-    let m =
-        gam::diagnostics::anchor_consistency_metrics(assignments.as_array(), anchor_dominance);
+    let m = gam::diagnostics::anchor_consistency_metrics(assignments.as_array(), anchor_dominance);
     let dict = PyDict::new(py);
     dict.set_item("n_rows", m.n_rows)?;
     dict.set_item("n_atoms", m.n_atoms)?;

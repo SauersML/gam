@@ -426,10 +426,9 @@ impl LatentManifold {
         assert_eq!(t.len(), xi.len());
         assert_eq!(t.len(), eh_xi.len());
         match self {
-            Self::Euclidean
-            | Self::Circle
-            | Self::CirclePeriod { .. }
-            | Self::Interval { .. } => self.project_to_tangent(t, eh_xi),
+            Self::Euclidean | Self::Circle | Self::CirclePeriod { .. } | Self::Interval { .. } => {
+                self.project_to_tangent(t, eh_xi)
+            }
             Self::Sphere { dim } => {
                 assert_eq!(t.len(), *dim);
                 let grad_r = self.project_to_tangent(t, eg);

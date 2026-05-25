@@ -858,8 +858,12 @@ mod tests {
     #[test]
     fn conditional_prior_ivae_accepts_when_signature_full_rank() {
         let (mean, scale) = ivae_precondition_pair(7, 3);
-        ConditionalPriorIvae::new(mean, scale, 1.0)
-            .expect("full-rank signature should satisfy Khemakhem Theorem 1");
+        let result = ConditionalPriorIvae::new(mean, scale, 1.0);
+        assert!(
+            result.is_ok(),
+            "full-rank signature should satisfy Khemakhem Theorem 1, got {:?}",
+            result.err(),
+        );
     }
 
     #[test]

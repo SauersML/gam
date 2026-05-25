@@ -4892,11 +4892,14 @@ fn append_linear_constraints(
         (Some(constraints), None) | (None, Some(constraints)) => Ok(Some(constraints)),
         (Some(lhs), Some(rhs)) => {
             if lhs.a.ncols() != rhs.a.ncols() {
-                return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
-                    "time linear constraint width mismatch: left={}, right={}",
-                    lhs.a.ncols(),
-                    rhs.a.ncols()
-                ) }.into());
+                return Err(SurvivalLocationScaleError::DimensionMismatch {
+                    reason: format!(
+                        "time linear constraint width mismatch: left={}, right={}",
+                        lhs.a.ncols(),
+                        rhs.a.ncols()
+                    ),
+                }
+                .into());
             }
             let rows = lhs.a.nrows() + rhs.a.nrows();
             let cols = lhs.a.ncols();
