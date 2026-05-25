@@ -2758,7 +2758,22 @@ pub fn build_survival_marginal_slope_baseline_offsets(
     let triples: Vec<(f64, f64, f64)> = (0..n)
         .into_par_iter()
         .map(|i| -> Result<(f64, f64, f64), String> {
-            let (e0, _) = evaluate_survival_marginal_slope_baseline(age_entry[i], cfg)?;
+            // See `build_survival_baseline_offsets`: origin-entry rows are
+            // gated by `entry_at_origin[i]` in the engine and their entry
+            // channel is multiplied out. `evaluate_survival_marginal_slope_baseline`
+            // forwards an `age <= 0` reject from `survival_cumulative_and_instant_hazard`,
+            // so short-circuit origin entries to a finite placeholder here.
+            let entry_age = age_entry[i];
+            let e0 = if !entry_age.is_finite() {
+                return Err(SurvivalConstructionError::DataValidationFailed {
+                    reason: format!("non-finite entry age at row {i}"),
+                }
+                .into());
+            } else if entry_age <= 0.0 {
+                0.0
+            } else {
+                evaluate_survival_marginal_slope_baseline(entry_age, cfg)?.0
+            };
             let (e1, d1) = evaluate_survival_marginal_slope_baseline(age_exit[i], cfg)?;
             if !e0.is_finite() || !e1.is_finite() || !d1.is_finite() {
                 return Err(SurvivalConstructionError::DataValidationFailed {
