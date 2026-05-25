@@ -9876,9 +9876,9 @@ fn write_survival_binary_prediction_csv(
 mod tests {
     use super::{
         BlockRole, BoundedCoefficientPriorSpec, CliFirthValidation, DataSchema,
-        FAMILY_GAUSSIAN_LOCATION_SCALE, FamilyArg, FittedFamily, InverseLink, LikelihoodScaleMetadata,
-        LikelihoodSpec, LinkChoice, LinkFunction, LinkMode, LogLikelihoodNormalization,
-        MODEL_VERSION, ModelKind, ResidualDistribution, ResponseFamily, SavedFitSummary, SavedModel,
+        FAMILY_GAUSSIAN_LOCATION_SCALE, FamilyArg, FittedFamily, LikelihoodSpec, LinkChoice,
+        LinkMode, MODEL_VERSION, ModelKind, ResidualDistribution, ResponseFamily, SavedFitSummary,
+        SavedModel,
         SurvivalArgs, SurvivalBaselineTarget, SurvivalLikelihoodMode, SurvivalTimeBasisConfig,
         build_survival_time_basis, classify_cli_error, collect_hierarchical_smooth_overlapwarnings,
         collect_linear_smooth_overlapwarnings, collect_spatial_smooth_usagewarnings,
@@ -11557,6 +11557,7 @@ mod tests {
             },
         ];
         fit_result.beta = beta_joint;
+        let family_name = family.name();
         let mut payload = test_payload(
             "y ~ 1",
             ModelKind::Standard,
@@ -11567,7 +11568,7 @@ mod tests {
                 mixture_state: None,
                 sas_state: None,
             },
-            family.name(),
+            family_name,
         );
         payload.fit_result = Some(fit_result);
         payload.link = Some(InverseLink::Standard(link));
