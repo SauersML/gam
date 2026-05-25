@@ -10502,7 +10502,10 @@ impl UnifiedOuterHessianOperator {
             }
             .into());
         };
-        let u = self.hop.solve(rhs);
+        let u = match self.subspace.as_deref() {
+            Some(subspace) => subspace.apply_pseudo_inverse(rhs),
+            None => self.hop.solve(rhs),
+        };
         let Some(term1) = first(&u)? else {
             return Ok(0.0);
         };

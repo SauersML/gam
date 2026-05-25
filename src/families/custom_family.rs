@@ -10843,7 +10843,7 @@ fn joint_trust_region_metric_step_norm(delta: &Array1<f64>, metric_diag: &Array1
     delta
         .iter()
         .zip(metric_diag)
-        .map(|(step, weight)| step * step * weight.abs().max(1.0e-10))
+        .map(|(step, weight)| step * step * positive_joint_diagonal_entry(*weight))
         .sum::<f64>()
         .sqrt()
 }
@@ -18518,7 +18518,7 @@ fn apply_joint_block_penalty_into(
 /// Penalty-aware Jacobi preconditioner used by every matrix-free PCG path
 /// in the inner coefficient solve.
 ///
-/// Builds `|diag(H) + Σ_k diag(S_k(λ)) + ridge|`, clamped at 1e-10. This is
+/// Builds `diag(H) + Σ_k diag(S_k(λ)) + ridge`, clamped at 1e-10. This is
 /// the diagonal of the full penalized joint Hessian `H + Σ_k λ_k S_k`, so it
 /// already incorporates contributions from every penalty operator the model
 /// uses — including the cubic-Duchon `[mass, tension, stiffness]` triple
@@ -18529,15 +18529,26 @@ fn apply_joint_block_penalty_into(
 ///
 /// Callers in the PIRLS inner Newton PCG path feed the result as the diagonal
 /// rescale every CG iteration.
+fn positive_joint_diagonal_entry(value: f64) -> f64 {
+    if value.is_finite() && value > 1.0e-10 {
+        value
+    } else {
+        1.0e-10
+    }
+}
+
 fn joint_penalty_preconditioner_diag(
     base_diagonal: &Array1<f64>,
     ranges: &[(usize, usize)],
     s_lambdas: &[Array2<f64>],
     diagonal_ridge: f64,
 ) -> Array1<f64> {
+    assert!(s_lambdas.len() <= ranges.len());
     let mut diag = base_diagonal.clone();
     for (b, s_lambda) in s_lambdas.iter().enumerate() {
         let (start, end) = ranges[b];
+        assert_eq!(s_lambda.nrows(), end - start);
+        assert_eq!(s_lambda.ncols(), end - start);
         for (local_idx, global_idx) in (start..end).enumerate() {
             diag[global_idx] += s_lambda[[local_idx, local_idx]];
         }
@@ -18547,7 +18558,7 @@ fn joint_penalty_preconditioner_diag(
             *value += diagonal_ridge;
         }
     }
-    diag.mapv(|v| v.abs().max(1e-10))
+    diag.mapv(positive_joint_diagonal_entry)
 }
 
 fn log_joint_pcg_diagnostics(

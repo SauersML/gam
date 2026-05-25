@@ -8557,9 +8557,7 @@ fn sae_periodic_basis_size(n_harmonics: usize) -> Result<usize, String> {
         .checked_mul(2)
         .and_then(|twice| twice.checked_add(1))
         .ok_or_else(|| {
-            format!(
-                "sae_build_periodic_atom: basis size overflows for n_harmonics={n_harmonics}"
-            )
+            format!("sae_build_periodic_atom: basis size overflows for n_harmonics={n_harmonics}")
         })
 }
 
@@ -10854,7 +10852,8 @@ fn global_penalty_from_block(
     p: usize,
     penalty: &gam::smooth::BlockwisePenalty,
 ) -> Result<Array2<f64>, String> {
-    if penalty.col_range.end > p
+    if penalty.col_range.start > penalty.col_range.end
+        || penalty.col_range.end > p
         || penalty.col_range.len() != penalty.local.nrows()
         || penalty.col_range.len() != penalty.local.ncols()
     {
@@ -16138,9 +16137,7 @@ fn py_object_or_string_default(
 ) -> PyObject {
     match value {
         Some(value) => value.clone().unbind(),
-        None => pyo3::types::PyString::new(py, default)
-            .into_any()
-            .unbind(),
+        None => pyo3::types::PyString::new(py, default).into_any().unbind(),
     }
 }
 
@@ -16171,10 +16168,14 @@ struct ARDPenalty {
 #[pymethods]
 impl ARDPenalty {
     #[new]
-    #[pyo3(signature = (*, target = default_target_py(), weight_schedule = None))]
-    fn new(target: PyObject, weight_schedule: Option<PyObject>) -> Self {
+    #[pyo3(signature = (*, target = None, weight_schedule = None))]
+    fn new(
+        py: Python<'_>,
+        target: Option<&Bound<'_, PyAny>>,
+        weight_schedule: Option<PyObject>,
+    ) -> Self {
         Self {
-            target,
+            target: py_object_or_string_default(py, target, "t"),
             weight_schedule,
         }
     }
@@ -16227,11 +16228,12 @@ struct PyTopKActivationPenalty {
 #[pymethods]
 impl PyTopKActivationPenalty {
     #[new]
-    #[pyo3(signature = (k, weight = 1.0, *, target = default_target_py(), weight_schedule = None))]
+    #[pyo3(signature = (k, weight = 1.0, *, target = None, weight_schedule = None))]
     fn new(
+        py: Python<'_>,
         k: &Bound<'_, PyAny>,
         weight: f64,
-        target: PyObject,
+        target: Option<&Bound<'_, PyAny>>,
         weight_schedule: Option<PyObject>,
     ) -> PyResult<Self> {
         let k = k.call_method0("__index__")?.extract::<i64>()?;
@@ -16246,7 +16248,7 @@ impl PyTopKActivationPenalty {
             )));
         }
         Ok(Self {
-            target,
+            target: py_object_or_string_default(py, target, "t"),
             k,
             weight,
             weight_schedule,
@@ -16307,13 +16309,13 @@ struct JumpReLUPenalty {
 #[pymethods]
 impl JumpReLUPenalty {
     #[new]
-    #[pyo3(signature = (thresholds, weight = 1.0, smoothing_eps = 1.0e-3, *, target = default_target_py(), weight_schedule = None))]
+    #[pyo3(signature = (thresholds, weight = 1.0, smoothing_eps = 1.0e-3, *, target = None, weight_schedule = None))]
     fn new(
         py: Python<'_>,
         thresholds: &Bound<'_, PyAny>,
         weight: f64,
         smoothing_eps: f64,
-        target: PyObject,
+        target: Option<&Bound<'_, PyAny>>,
         weight_schedule: Option<PyObject>,
     ) -> PyResult<Self> {
         let numpy = py.import("numpy")?;
@@ -16349,7 +16351,7 @@ impl JumpReLUPenalty {
             )));
         }
         Ok(Self {
-            target,
+            target: py_object_or_string_default(py, target, "t"),
             thresholds,
             weight,
             smoothing_eps,
@@ -16512,14 +16514,15 @@ struct BlockSparsityPenalty {
 #[pymethods]
 impl BlockSparsityPenalty {
     #[new]
-    #[pyo3(signature = (groups, weight, n_eff, smoothing_eps = 1e-6, learnable = false, *, target = default_target_py()))]
+    #[pyo3(signature = (groups, weight, n_eff, smoothing_eps = 1e-6, learnable = false, *, target = None))]
     fn new(
+        py: Python<'_>,
         groups: &Bound<'_, PyAny>,
         weight: f64,
         n_eff: i64,
         smoothing_eps: f64,
         learnable: bool,
-        target: PyObject,
+        target: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         let groups = block_sparsity_coerce_groups(groups)?;
         if weight <= 0.0 {
@@ -16538,7 +16541,7 @@ impl BlockSparsityPenalty {
             )));
         }
         Ok(Self {
-            target,
+            target: py_object_or_string_default(py, target, "t"),
             groups,
             weight,
             n_eff,
@@ -16673,12 +16676,12 @@ struct SoftmaxAssignmentSparsityPenalty {
 #[pymethods]
 impl SoftmaxAssignmentSparsityPenalty {
     #[new]
-    #[pyo3(signature = (k_atoms, temperature = 1.0, *, target = default_target_py(), weight_schedule = None))]
+    #[pyo3(signature = (k_atoms, temperature = 1.0, *, target = None, weight_schedule = None))]
     fn new(
         py: Python<'_>,
         k_atoms: &Bound<'_, PyAny>,
         temperature: f64,
-        target: PyObject,
+        target: Option<&Bound<'_, PyAny>>,
         weight_schedule: Option<PyObject>,
     ) -> PyResult<Self> {
         let builtins = PyModule::import(py, "builtins")?;
@@ -16697,7 +16700,7 @@ impl SoftmaxAssignmentSparsityPenalty {
             )));
         }
         Ok(Self {
-            target,
+            target: py_object_or_string_default(py, target, "t"),
             k_atoms,
             temperature,
             weight_schedule,
@@ -16758,13 +16761,15 @@ struct IsometryPenalty {
 #[pymethods]
 impl IsometryPenalty {
     #[new]
-    #[pyo3(signature = (weight = default_weight_auto_py(), *, target = default_target_py(), weight_schedule = None))]
+    #[pyo3(signature = (weight = None, *, target = None, weight_schedule = None))]
     fn new(
         py: Python<'_>,
-        weight: PyObject,
-        target: PyObject,
+        weight: Option<&Bound<'_, PyAny>>,
+        target: Option<&Bound<'_, PyAny>>,
         weight_schedule: Option<PyObject>,
     ) -> PyResult<Self> {
+        let weight = py_object_or_string_default(py, weight, "auto");
+        let target = py_object_or_string_default(py, target, "t");
         validate_sparsity_weight(py, weight.bind(py), "IsometryPenalty")?;
         Ok(Self {
             target,
@@ -16829,14 +16834,14 @@ struct PyIBPAssignmentPenalty {
 #[pymethods]
 impl PyIBPAssignmentPenalty {
     #[new]
-    #[pyo3(signature = (k_max, alpha = 1.0, tau = 1.0, learnable = false, *, target = default_target_py(), temperature_schedule = None, weight_schedule = None))]
+    #[pyo3(signature = (k_max, alpha = 1.0, tau = 1.0, learnable = false, *, target = None, temperature_schedule = None, weight_schedule = None))]
     fn new(
         py: Python<'_>,
         k_max: &Bound<'_, PyAny>,
         alpha: f64,
         tau: f64,
         learnable: bool,
-        target: PyObject,
+        target: Option<&Bound<'_, PyAny>>,
         temperature_schedule: Option<PyObject>,
         weight_schedule: Option<PyObject>,
     ) -> PyResult<Self> {
@@ -16858,7 +16863,7 @@ impl PyIBPAssignmentPenalty {
             )));
         }
         Ok(Self {
-            target,
+            target: py_object_or_string_default(py, target, "t"),
             k_max,
             alpha,
             tau,
@@ -24927,7 +24932,10 @@ fn compute_null_space_metadata(
     let mut penalty = Array2::<f64>::zeros((p, p));
     for (idx, block) in design.penalties.iter().enumerate() {
         let range = block.col_range.clone();
-        if range.end > p || block.local.nrows() != range.len() || block.local.ncols() != range.len()
+        if range.start > range.end
+            || range.end > p
+            || block.local.nrows() != range.len()
+            || block.local.ncols() != range.len()
         {
             return Err(format!(
                 "null-space Hessian logdet penalty {idx} shape mismatch: range {}..{}, local {}x{}, p={p}",
