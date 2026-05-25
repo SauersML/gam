@@ -326,6 +326,8 @@ def _penalty_hvp_via_rust(wrapper: Any, t: Any, v: Any) -> np.ndarray:
     return np.asarray(hv, dtype=float).reshape(original_shape)
 
 
+from ._sheaf import SheafConsistencyPenalty as SheafConsistencyPenalty
+
 BlockSparsityPenalty = _rust_descriptor_class("BlockSparsityPenalty")
 ParametricAuxConditionalPriorPenalty = _rust_descriptor_class("ParametricAuxConditionalPriorPenalty")
 IBPAssignmentPenalty = _rust_descriptor_class("IBPAssignmentPenalty")
