@@ -183,7 +183,9 @@ from . import recipes, topology
 from .recipes import (
     PartialSupervisionFit,
     PartialSupervisionRecipe,
+    SaeSupervisedFit,
     partial_supervision,
+    sae_supervised,
 )
 from ._exceptions import FormulaError, GamError, PredictionError, SchemaMismatchError
 from ._model import (
@@ -300,7 +302,9 @@ __all__ = [
     "LieAtom",
     "PartialSupervisionFit",
     "PartialSupervisionRecipe",
+    "SaeSupervisedFit",
     "partial_supervision",
+    "sae_supervised",
     "recipes",
     "equivariant_smooth",
     "gauge_companion",

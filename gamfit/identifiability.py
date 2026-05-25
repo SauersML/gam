@@ -32,6 +32,7 @@ about which guarantee no longer formally holds.
 
 from __future__ import annotations
 
+import json
 import math
 import re
 import warnings
@@ -989,7 +990,11 @@ def _one_fit(
         rss = float(recon.detach().cpu().item())
         total_pen = float(aux_val) + float(mech_val)
 
-    # Final-pass true values for the evidence proxy.
+    # Final-pass true (RSS, penalty) used by the Rust weight-selection /
+    # evidence primitive. The Laplace-style log marginal-likelihood proxy
+    # itself is computed entirely in Rust by
+    # ``identifiable_factor_select_weights_array`` — no statistical math
+    # lives in this Python file.
     with torch.no_grad():
         t = encoder(x_t)
         t_sup = t[:, :n_supervised]
@@ -1009,13 +1014,7 @@ def _one_fit(
             )
         )
     total_pen = float(aux_val) + float(mech_val)
-
-    # Laplace-style log marginal-likelihood proxy. The Gaussian-residual
-    # profile log-likelihood is ``-0.5 * N * log(RSS / N)`` (up to additive
-    # constants) and the penalty acts as the log prior. Higher is better.
-    safe_rss = max(rss / max(1, n_obs), 1e-300)
-    evidence = -0.5 * n_obs * math.log(safe_rss) - 0.5 * total_pen
-    return encoder, decoder, rss, total_pen, float(evidence)
+    return encoder, decoder, rss, total_pen
 
 
 def _auto_weight_search(
@@ -1036,9 +1035,11 @@ def _auto_weight_search(
     """Coarse log-grid search over the ``"auto"`` weights.
 
     For each weight set to ``"auto"`` we sweep a 5-point log-spaced grid
-    centred on the seed value. Total candidate count is ``5 ** k`` where
-    ``k`` is the number of ``"auto"`` flags; with ``k <= 2`` this stays at
-    most 25 inner fits.
+    centred on the seed value. Python's only responsibility is to evaluate
+    ``(rss, penalty)`` at each grid cell by running ``_one_fit`` (the torch
+    encoder loop is the legitimate Python escape). The argmax / evidence
+    formula / tie-breaking is delegated to Rust via
+    ``rust_module().identifiable_factor_select_weights_array``.
     """
 
     aux_grid = (
@@ -1050,17 +1051,43 @@ def _auto_weight_search(
         else [mech_w0]
     )
 
-    best: tuple[float, float, Any, Any, float, float, float] | None = None
-    for aw in aux_grid:
-        for mw in mech_grid:
-            encoder, decoder, rss, pen, ev = _one_fit(
+    n_obs = int(x_t.shape[0])
+    g1 = len(aux_grid)
+    g2 = len(mech_grid)
+    rss_grid = np.zeros((g1, g2), dtype=np.float64)
+    pen_grid = np.zeros((g1, g2), dtype=np.float64)
+    cells: list[list[tuple[Any, Any] | None]] = [[None] * g2 for _ in range(g1)]
+    for i, aw in enumerate(aux_grid):
+        for j, mw in enumerate(mech_grid):
+            encoder, decoder, rss, pen = _one_fit(
                 x_t, aux_t, n_supervised, n_free, hidden_widths,
                 aw, mw, max_iter, learning_rate, seed, torch_mod,
             )
-            if best is None or ev > best[6]:
-                best = (aw, mw, encoder, decoder, rss, pen, ev)
-    assert best is not None  # grids are non-empty by construction
-    return best
+            rss_grid[i, j] = rss
+            pen_grid[i, j] = pen
+            cells[i][j] = (encoder, decoder)
+
+    selection = rust_module().identifiable_factor_select_weights_array(
+        np.ascontiguousarray(rss_grid),
+        np.ascontiguousarray(pen_grid),
+        np.ascontiguousarray(np.asarray(aux_grid, dtype=np.float64)),
+        np.ascontiguousarray(np.asarray(mech_grid, dtype=np.float64)),
+        int(n_obs),
+    )
+    bi = int(selection["best_i"])
+    bj = int(selection["best_j"])
+    best_cell = cells[bi][bj]
+    assert best_cell is not None  # populated above
+    encoder, decoder = best_cell
+    return (
+        float(selection["best_lam1"]),
+        float(selection["best_lam2"]),
+        encoder,
+        decoder,
+        float(rss_grid[bi, bj]),
+        float(pen_grid[bi, bj]),
+        float(selection["best_evidence"]),
+    )
 
 
 def identifiable_factor_fit(
@@ -1151,12 +1178,23 @@ def identifiable_factor_fit(
             )
         )
     else:
-        encoder_module, decoder_module, _rss, _pen, evidence = _one_fit(
+        encoder_module, decoder_module, rss_val, pen_val = _one_fit(
             x_t, aux_t, int(n_supervised), int(n_free), hidden_widths,
             aux_w0, mech_w0, int(max_iter), float(learning_rate),
             int(random_state), torch_mod,
         )
         aux_w, mech_w = aux_w0, mech_w0
+        # Route the single-pair evidence through the same Rust primitive as
+        # the grid search so the Laplace evidence formula has a single
+        # source of truth in ``src/identifiability.rs``.
+        selection = rust_module().identifiable_factor_select_weights_array(
+            np.ascontiguousarray(np.array([[rss_val]], dtype=np.float64)),
+            np.ascontiguousarray(np.array([[pen_val]], dtype=np.float64)),
+            np.ascontiguousarray(np.array([aux_w], dtype=np.float64)),
+            np.ascontiguousarray(np.array([mech_w], dtype=np.float64)),
+            int(x_t.shape[0]),
+        )
+        evidence = float(selection["best_evidence"])
 
     with torch_mod.no_grad():
         t = encoder_module(x_t)

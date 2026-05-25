@@ -285,8 +285,6 @@ pub struct SinkhornState {
     pub log_atoms: Array2<f64>,
     /// `(K,)` normalized mixing weights.
     pub weights: Vec<f64>,
-    /// regularization used.
-    pub eps: f64,
 }
 
 /// Run the log-domain Sinkhorn barycenter forward pass and return the
@@ -385,7 +383,6 @@ pub fn sinkhorn_barycenter_forward_state(
         log_kernel,
         log_atoms,
         weights: weights_norm,
-        eps,
     })
 }
 

@@ -437,6 +437,9 @@ impl SheafConsistencyPenalty {
             let l = self.dense_laplacian();
             match l.eigh(Side::Lower) {
                 Ok((evals, _)) => evals.iter().filter(|&&e| e < tol).count(),
+                // SAFETY: dense Laplacian above is symmetric positive semidefinite by construction
+                // (graph Laplacian of an undirected weighted graph), so eigh on the lower triangle
+                // must succeed; any err indicates a corrupted matrix and bailing here is correct.
                 Err(err) => panic!("SheafConsistencyPenalty::harmonic_modes faer eigh failed: {err:?}"),
             }
         } else {
@@ -510,6 +513,10 @@ impl SheafConsistencyPenalty {
         }
         match t.eigh(Side::Lower) {
             Ok((evals, _)) => evals.iter().filter(|&&e| e < tol).count(),
+            // SAFETY: t is built as a symmetric tridiagonal matrix from Lanczos coefficients
+            // (alphas on diagonal, betas on first sub/superdiagonal); eigh on a real symmetric
+            // tridiagonal cannot fail by construction in finite arithmetic, so this is unreachable
+            // outside of corrupted inputs and panicking is the right action.
             Err(err) => panic!("SheafConsistencyPenalty::harmonic_modes Lanczos eigh failed: {err:?}"),
         }
     }

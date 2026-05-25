@@ -79,6 +79,14 @@ use gam::terms::sae_manifold::{
     SaeBasisEvaluator, SaeManifoldRho, ScheduleKind, SphereChartEvaluator, StaticBasisEvaluator,
     TorusHarmonicEvaluator, term_from_padded_blocks_with_mode,
 };
+use gam::terms::interchange_decoder::{
+    InterchangeDecodeForward as CoreInterchangeDecodeForward,
+    InterchangeSwapForward as CoreInterchangeSwapForward,
+    interchange_decode_backward as core_interchange_decode_backward,
+    interchange_decode_forward as core_interchange_decode_forward,
+    interchange_swap_backward as core_interchange_swap_backward,
+    interchange_swap_forward as core_interchange_swap_forward,
+};
 use gam::terms::skip_transcoder::{
     SkipTranscoderRemlInputs, skip_transcoder_reml_metrics as skip_transcoder_reml_metrics_core,
 };
@@ -10169,6 +10177,133 @@ fn gated_sae_decode<'py>(
     Ok(out.into_pyarray(py).unbind())
 }
 
+/// Forward of the per-feature scalar-gate decoder (no swap).
+///
+/// Returns `X̂[i, d] = Σ_f gate[f] · z[i, f] · weights[d, f] + bias[d]`.
+/// `bias` may be `None`. The forward and its analytic gradients are shared
+/// across the Rust library, the CLI, and the PyTorch bridge via the
+/// `gam::terms::interchange_decoder` primitive.
+#[pyfunction(signature = (z, weights, gate, bias = None))]
+fn interchange_decode_forward<'py>(
+    py: Python<'py>,
+    z: PyReadonlyArray2<'py, f64>,
+    weights: PyReadonlyArray2<'py, f64>,
+    gate: PyReadonlyArray1<'py, f64>,
+    bias: Option<PyReadonlyArray1<'py, f64>>,
+) -> PyResult<Py<PyArray2<f64>>> {
+    let bias_view = bias.as_ref().map(|b| b.as_array());
+    let out = core_interchange_decode_forward(CoreInterchangeDecodeForward {
+        z: z.as_array(),
+        weights: weights.as_array(),
+        gate: gate.as_array(),
+        bias: bias_view,
+    })
+    .map_err(py_value_error)?;
+    Ok(out.into_pyarray(py).unbind())
+}
+
+/// Backward of the per-feature scalar-gate decoder.
+///
+/// Returns `(grad_z, grad_weights, grad_gate, grad_bias_or_none)`.
+#[pyfunction(signature = (z, weights, gate, grad_out, with_bias))]
+fn interchange_decode_backward<'py>(
+    py: Python<'py>,
+    z: PyReadonlyArray2<'py, f64>,
+    weights: PyReadonlyArray2<'py, f64>,
+    gate: PyReadonlyArray1<'py, f64>,
+    grad_out: PyReadonlyArray2<'py, f64>,
+    with_bias: bool,
+) -> PyResult<(
+    Py<PyArray2<f64>>,
+    Py<PyArray2<f64>>,
+    Py<PyArray1<f64>>,
+    Option<Py<PyArray1<f64>>>,
+)> {
+    let adjoint = core_interchange_decode_backward(
+        z.as_array(),
+        weights.as_array(),
+        gate.as_array(),
+        grad_out.as_array(),
+        with_bias,
+    )
+    .map_err(py_value_error)?;
+    let grad_bias = adjoint.grad_bias.map(|b| b.into_pyarray(py).unbind());
+    Ok((
+        adjoint.grad_z.into_pyarray(py).unbind(),
+        adjoint.grad_weights.into_pyarray(py).unbind(),
+        adjoint.grad_gate.into_pyarray(py).unbind(),
+        grad_bias,
+    ))
+}
+
+/// Forward of the masked-swap interchange decoder.
+///
+/// `mask` is a 1-D bool array of length F. For atoms with `mask[f] == true`
+/// the corresponding column of `z_a` is used; otherwise the column of `z_b`.
+/// Reconstruction weights and gate are shared.
+#[pyfunction(signature = (z_a, z_b, mask, weights, gate, bias = None))]
+fn interchange_swap_forward<'py>(
+    py: Python<'py>,
+    z_a: PyReadonlyArray2<'py, f64>,
+    z_b: PyReadonlyArray2<'py, f64>,
+    mask: PyReadonlyArray1<'py, bool>,
+    weights: PyReadonlyArray2<'py, f64>,
+    gate: PyReadonlyArray1<'py, f64>,
+    bias: Option<PyReadonlyArray1<'py, f64>>,
+) -> PyResult<Py<PyArray2<f64>>> {
+    let bias_view = bias.as_ref().map(|b| b.as_array());
+    let out = core_interchange_swap_forward(CoreInterchangeSwapForward {
+        z_a: z_a.as_array(),
+        z_b: z_b.as_array(),
+        mask: mask.as_array(),
+        weights: weights.as_array(),
+        gate: gate.as_array(),
+        bias: bias_view,
+    })
+    .map_err(py_value_error)?;
+    Ok(out.into_pyarray(py).unbind())
+}
+
+/// Backward of the masked-swap interchange decoder.
+///
+/// Returns `(grad_z_a, grad_z_b, grad_weights, grad_gate, grad_bias_or_none)`.
+#[pyfunction(signature = (z_a, z_b, mask, weights, gate, grad_out, with_bias))]
+fn interchange_swap_backward<'py>(
+    py: Python<'py>,
+    z_a: PyReadonlyArray2<'py, f64>,
+    z_b: PyReadonlyArray2<'py, f64>,
+    mask: PyReadonlyArray1<'py, bool>,
+    weights: PyReadonlyArray2<'py, f64>,
+    gate: PyReadonlyArray1<'py, f64>,
+    grad_out: PyReadonlyArray2<'py, f64>,
+    with_bias: bool,
+) -> PyResult<(
+    Py<PyArray2<f64>>,
+    Py<PyArray2<f64>>,
+    Py<PyArray2<f64>>,
+    Py<PyArray1<f64>>,
+    Option<Py<PyArray1<f64>>>,
+)> {
+    let adjoint = core_interchange_swap_backward(
+        z_a.as_array(),
+        z_b.as_array(),
+        mask.as_array(),
+        weights.as_array(),
+        gate.as_array(),
+        grad_out.as_array(),
+        with_bias,
+    )
+    .map_err(py_value_error)?;
+    let grad_bias = adjoint.grad_bias.map(|b| b.into_pyarray(py).unbind());
+    Ok((
+        adjoint.grad_z_a.into_pyarray(py).unbind(),
+        adjoint.grad_z_b.into_pyarray(py).unbind(),
+        adjoint.grad_weights.into_pyarray(py).unbind(),
+        adjoint.grad_gate.into_pyarray(py).unbind(),
+        grad_bias,
+    ))
+}
+
 /// Backward pass: compute `grad_t` and the standard REML adjoint
 /// gradients at the current latent `t`.
 ///
@@ -19806,6 +19941,20 @@ fn sindy_stlsq_solve_array<'py>(
     ))
 }
 
+/// Identifiability theorem precondition checks (Principle (f)).
+///
+/// Caller serialises a `gam::inference::identifiability::FitSummary` as
+/// JSON; Rust does all numerical work (min std, faer-SVD rank, decoder
+/// zero-fraction, activation variance bounds) and returns a JSON array of
+/// per-theorem results. This is the *single source of truth* — Python's
+/// `gamfit.identifiability.check`, the CLI, and any future R/Julia binding
+/// all consume this same FFI.
+#[pyfunction]
+fn identifiability_check_json(input: &str) -> PyResult<String> {
+    gam::inference::identifiability::identifiability_check_json(input)
+        .map_err(py_value_error)
+}
+
 #[pymodule(name = "_rust", gil_used = false)]
 fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     gam::init_parallelism();
@@ -19826,6 +19975,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(classify_exception_message, module)?)?;
     module.add_function(wrap_pyfunction!(sklearn_fit_metadata, module)?)?;
     module.add_function(wrap_pyfunction!(build_info, module)?)?;
+    module.add_function(wrap_pyfunction!(identifiability_check_json, module)?)?;
     module.add_function(wrap_pyfunction!(interpolate_survival_surface, module)?)?;
     module.add_function(wrap_pyfunction!(interpolate_rows, module)?)?;
     module.add_function(wrap_pyfunction!(survival_chunk_iter_collect, module)?)?;
@@ -20011,6 +20161,10 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(sae_manifold_reconstruction_r2, module)?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_assignment_summary, module)?)?;
     module.add_function(wrap_pyfunction!(gated_sae_decode, module)?)?;
+    module.add_function(wrap_pyfunction!(interchange_decode_forward, module)?)?;
+    module.add_function(wrap_pyfunction!(interchange_decode_backward, module)?)?;
+    module.add_function(wrap_pyfunction!(interchange_swap_forward, module)?)?;
+    module.add_function(wrap_pyfunction!(interchange_swap_backward, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_fit_latent_backward, module)?)?;
     module.add_function(wrap_pyfunction!(glm_reml_fit_latent, module)?)?;
     module.add_function(wrap_pyfunction!(glm_reml_fit_latent_backward, module)?)?;
@@ -20105,6 +20259,10 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(mechanism_sparsity_jacobian, module)?)?;
     module.add_function(wrap_pyfunction!(conditional_prior_ivae, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        identifiable_factor_select_weights_array,
+        module
+    )?)?;
     module.add_class::<IsometryPenalty>()?;
     module.add_class::<SparsityPenalty>()?;
     module.add_class::<PyTopKActivationPenalty>()?;
@@ -20162,6 +20320,48 @@ fn conditional_prior_ivae<'py>(
     .map_err(py_value_error)?;
     let (value, grad) = pen.value_and_grad(t.as_array());
     Ok((value, grad.into_pyarray(py).unbind()))
+}
+
+/// Generic 2D log-λ weight-selection driver.
+///
+/// Takes a precomputed `(G1, G2)` RSS grid and a matching penalty grid
+/// together with the two 1D weight grids, computes the Laplace-style log
+/// marginal-likelihood proxy on every cell, and returns the maximising
+/// cell with deterministic tie-breaking. Useful for any two-penalty model
+/// (identifiable-factor recipe, double-penalty smooths, IBP + sparsity).
+///
+/// Returns a dict with keys: ``best_i``, ``best_j``, ``best_lam1``,
+/// ``best_lam2``, ``best_evidence``, ``evidence_grid``.
+#[pyfunction(signature = (rss_grid, penalty_grid, lam1_grid, lam2_grid, n_obs))]
+fn identifiable_factor_select_weights_array<'py>(
+    py: Python<'py>,
+    rss_grid: PyReadonlyArray2<'py, f64>,
+    penalty_grid: PyReadonlyArray2<'py, f64>,
+    lam1_grid: PyReadonlyArray1<'py, f64>,
+    lam2_grid: PyReadonlyArray1<'py, f64>,
+    n_obs: i64,
+) -> PyResult<Py<PyDict>> {
+    if n_obs <= 0 {
+        return Err(py_value_error(format!(
+            "identifiable_factor_select_weights_array: n_obs must be > 0, got {n_obs}"
+        )));
+    }
+    let res = gam::identifiability::identifiable_factor_select_weights(
+        rss_grid.as_array(),
+        penalty_grid.as_array(),
+        lam1_grid.as_array(),
+        lam2_grid.as_array(),
+        n_obs as usize,
+    )
+    .map_err(py_value_error)?;
+    let out = PyDict::new(py);
+    out.set_item("best_i", res.best_i)?;
+    out.set_item("best_j", res.best_j)?;
+    out.set_item("best_lam1", res.best_lam1)?;
+    out.set_item("best_lam2", res.best_lam2)?;
+    out.set_item("best_evidence", res.best_evidence)?;
+    out.set_item("evidence_grid", res.evidence_grid.into_pyarray(py))?;
+    Ok(out.unbind())
 }
 
 fn py_value_error(message: String) -> PyErr {
