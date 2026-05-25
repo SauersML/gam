@@ -1551,6 +1551,31 @@ pub fn encode_recordswith_schema(
         .into());
     }
     let p = headers.len();
+    if p == 0 {
+        return Err(DataError::EmptyInput {
+            reason: "table data must have at least one header column".to_string(),
+        }
+        .into());
+    }
+    // Validate the row-width invariant up front. Without this check, records
+    // wider than `headers` would be silently truncated (only the first
+    // `headers.len()` fields per record would be encoded) and records
+    // narrower than `headers` would only fail late when a per-column
+    // `rec.get(j)` lookup returned `None`. Reject both cases explicitly so
+    // callers cannot accidentally drop data via header/record shape skew.
+    for (i, rec) in records.iter().enumerate() {
+        if rec.len() != p {
+            return Err(DataError::SchemaMismatch {
+                reason: format!(
+                    "row width mismatch at row {}: got {} fields, expected {} (one per header)",
+                    i + 1,
+                    rec.len(),
+                    p
+                ),
+            }
+            .into());
+        }
+    }
     let mut values = Array2::<f64>::zeros((n, p));
     let schema_byname: HashMap<&str, &SchemaColumn> = schema
         .columns
