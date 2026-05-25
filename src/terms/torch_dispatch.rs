@@ -71,19 +71,21 @@ mod tests {
     fn known_specs_dispatch() {
         assert_eq!(dispatch_key("Duchon").unwrap(), TorchSmoothEntry::Duchon);
         assert_eq!(dispatch_key("BSpline").unwrap(), TorchSmoothEntry::BSpline);
+        assert_eq!(
+            dispatch_key("TensorBSpline").unwrap(),
+            TorchSmoothEntry::TensorBSpline
+        );
+        assert_eq!(dispatch_key("Matern").unwrap(), TorchSmoothEntry::Matern);
         assert_eq!(dispatch_key("Sphere").unwrap(), TorchSmoothEntry::Sphere);
         assert_eq!(
             dispatch_key("PeriodicSplineCurve").unwrap(),
             TorchSmoothEntry::PeriodicSplineCurve
         );
         assert_eq!(dispatch_key("Pca").unwrap(), TorchSmoothEntry::Pca);
-    }
-
-    #[test]
-    fn known_unsupported_specs_have_helpful_error() {
-        let err = dispatch_key("TensorBSpline").unwrap_err();
-        assert!(err.contains("TensorBSpline"));
-        assert!(err.contains("Currently supported"));
+        assert_eq!(
+            dispatch_key("Categorical").unwrap(),
+            TorchSmoothEntry::Categorical
+        );
     }
 
     #[test]
@@ -98,9 +100,12 @@ mod tests {
         for kind in [
             TorchSmoothEntry::Duchon,
             TorchSmoothEntry::BSpline,
+            TorchSmoothEntry::TensorBSpline,
+            TorchSmoothEntry::Matern,
             TorchSmoothEntry::Sphere,
             TorchSmoothEntry::PeriodicSplineCurve,
             TorchSmoothEntry::Pca,
+            TorchSmoothEntry::Categorical,
         ] {
             assert!(!kind.as_str().is_empty());
         }
