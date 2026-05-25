@@ -71,14 +71,19 @@ fn build_anisotropic_block_fixture() -> (Array2<f64>, Array1<f64>, Array1<f64>) 
     let mut h = Array2::<f64>::zeros((P, P));
     let mut g = Array1::<f64>::zeros(P);
 
-    // Time block: well-conditioned diag with eigenvalues in [1, 5].
-    for i in 0..TIME_W {
+    // Time block: well-conditioned (large eigenvalues, no near-null
+    // direction) but its FIRST coordinate carries the dominant gradient.
+    // Matching production block_grad_inf[time] = 5.6e8: pick H_time[0,0]
+    // such that the unconstrained Newton step in this direction equals
+    // the production block_beta_inf[time] / rescale ≈ 2.5 (i.e., the
+    // unconstrained step is modest; the L2 rescale then crushes it to
+    // O(1e-4) because the OTHER block's near-null direction dominates
+    // the L2 norm). H_time[0,0] = 5.6e8 / 2.5 = 2.24e8.
+    h[[0, 0]] = 2.24e8;
+    g[0] = -5.6e8;
+    for i in 1..TIME_W {
         h[[i, i]] = 1.0 + (i as f64) * 0.3;
-        g[i] = if i == 0 {
-            -1.5
-        } else {
-            -0.3 - 0.07 * (i as f64)
-        };
+        g[i] = -0.3 - 0.07 * (i as f64);
     }
 
     // Marginal block: well-conditioned diag with eigenvalues in [1.2, 3.5].
