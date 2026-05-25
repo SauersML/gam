@@ -28173,4 +28173,91 @@ mod tests {
             assert!((a - b).abs() <= 1.0e-12);
         }
     }
+
+    /// Regression test for issue #174: the joint LSQ seed for K=2 IBP-MAP
+    /// must produce a non-zero decoder and a residual smaller than the
+    /// trivial zero-decoder baseline. Without this seed the joint Newton
+    /// driver collapses A → 0 before any data signal accumulates.
+    #[test]
+    fn sae_decoder_lsq_init_produces_nontrivial_seed() {
+        use ndarray::Array3;
+        let n = 50usize;
+        let p = 4usize;
+        let k = 2usize;
+        let m = 3usize;
+        let mut z = Array2::<f64>::zeros((n, p));
+        for i in 0..n {
+            let a = 2.0 * std::f64::consts::PI * (i as f64) / (n as f64);
+            z[[i, 0]] = a.sin();
+            z[[i, 1]] = a.cos();
+            z[[i, 2]] = (2.0 * a).sin();
+            z[[i, 3]] = (2.0 * a).cos();
+        }
+        // Build padded basis_values (K, N, M_max=m).
+        let mut basis = Array3::<f64>::zeros((k, n, m));
+        for atom_idx in 0..k {
+            let shift = (atom_idx as f64) * 0.21;
+            for i in 0..n {
+                let a = 2.0 * std::f64::consts::PI * ((i as f64) / (n as f64) + shift);
+                basis[[atom_idx, i, 0]] = 1.0;
+                basis[[atom_idx, i, 1]] = a.sin();
+                basis[[atom_idx, i, 2]] = a.cos();
+            }
+        }
+        let basis_sizes = vec![m; k];
+        let logits = Array2::<f64>::zeros((n, k));
+        let decoder = sae_decoder_lsq_init(
+            basis.view(),
+            &basis_sizes,
+            z.view(),
+            logits.view(),
+            "ibp_map",
+            0.7,
+        )
+        .expect("LSQ seed must succeed");
+        assert_eq!(decoder.shape(), &[k, m, p]);
+        let mut max_abs = 0.0_f64;
+        for v in decoder.iter() {
+            assert!(v.is_finite());
+            if v.abs() > max_abs {
+                max_abs = v.abs();
+            }
+        }
+        assert!(
+            max_abs > 1.0e-3,
+            "LSQ-seeded decoder should be non-trivial; max |B| = {max_abs:.6}"
+        );
+
+        // The seeded reconstruction must explain at least some of Z. With
+        // IBP-MAP iter-0 weights a_k = 0.5 for every k, fitted[i,:] =
+        // 0.5 * Σ_k Phi_k[i,:] · B_k.
+        let mut fitted = Array2::<f64>::zeros((n, p));
+        for i in 0..n {
+            for j in 0..p {
+                let mut acc = 0.0;
+                for atom_idx in 0..k {
+                    let mut atom_out = 0.0;
+                    for col in 0..m {
+                        atom_out += basis[[atom_idx, i, col]] * decoder[[atom_idx, col, j]];
+                    }
+                    acc += 0.5 * atom_out;
+                }
+                fitted[[i, j]] = acc;
+            }
+        }
+        let mut ssr = 0.0;
+        let mut sst = 0.0;
+        for i in 0..n {
+            for j in 0..p {
+                let r = z[[i, j]] - fitted[[i, j]];
+                ssr += r * r;
+                sst += z[[i, j]] * z[[i, j]];
+            }
+        }
+        let r2 = 1.0 - ssr / sst.max(1.0e-12);
+        assert!(
+            r2 > 0.5,
+            "LSQ-seeded iter-0 reconstruction R² = {r2:.4} should explain most of the signal"
+        );
+    }
 }

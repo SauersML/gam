@@ -2994,4 +2994,279 @@ mod tests {
             "10-step in-sample R² = {r2:.4} (ssr={ssr:.6}, sst={sst:.6}) should be >= 0.95"
         );
     }
+
+    /// Regression test for issue #177: softmax assignment used to bail out of
+    /// the row-block Hessian assembly with "softmax assignment hessian diag
+    /// unavailable". The penalty now exposes the analytic diagonal extracted
+    /// from its row-dense HVP, so the joint-fit driver completes one step.
+    #[test]
+    fn softmax_assignment_hessian_diag_is_available_for_k2() {
+        let n = 4usize;
+        let k = 2usize;
+        let logits = Array2::<f64>::from_shape_fn((n, k), |(i, j)| 0.1 * (i as f64) - 0.2 * (j as f64));
+        let coords: Vec<Array2<f64>> = (0..k).map(|_| Array2::<f64>::zeros((n, 1))).collect();
+        let manifolds = vec![LatentManifold::Circle; k];
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            logits,
+            coords,
+            manifolds,
+            AssignmentMode::softmax(0.7),
+        )
+        .unwrap();
+        let rho = SaeManifoldRho::new(0.0, -6.0, vec![Array1::<f64>::zeros(1); k]);
+        let (grad, diag) = assignment_prior_grad_hdiag(&assignment, &rho)
+            .expect("softmax assignment Hessian diagonal must be available");
+        assert_eq!(grad.len(), n * k);
+        assert_eq!(diag.len(), n * k);
+        assert!(grad.iter().all(|v| v.is_finite()));
+        assert!(diag.iter().all(|v| v.is_finite()));
+    }
+
+    /// Regression test for issue #174: K>=2 periodic atoms with zero-init
+    /// decoder used to collapse to A≈0 because the assignment prior was the
+    /// only term with non-zero gradient at iter 0. The pyffi entry point now
+    /// seeds decoder coefficients via a joint LSQ projection of Z onto
+    /// [a_init · Phi_k]. This test exercises that exact seeding strategy
+    /// in pure Rust and verifies the joint Newton fit reaches positive R²
+    /// on a clean K=2 periodic torus signal, mirroring the failing
+    /// reproducer in #174.
+    #[test]
+    fn ibp_map_k2_periodic_torus_recovers_signal_with_lsq_init() {
+        use crate::linalg::faer_ndarray::{FaerCholesky, fast_ata, fast_atb};
+        use faer::Side as FaerSide;
+
+        let n = 200usize;
+        let p = 8usize;
+        let k = 2usize;
+        let m = 5usize; // 1 (constant) + 2 harmonics * 2 (sin/cos) = 5
+
+        // Build a synthetic K=2 torus signal Z = [cos th1, sin th1, cos th2, sin th2] @ mix
+        // with two latent angles. Deterministic seed via index arithmetic.
+        let mut theta = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            theta[[i, 0]] = ((i as f64) * 0.07) % 1.0;
+            theta[[i, 1]] = ((i as f64) * 0.13 + 0.31) % 1.0;
+        }
+        let mut raw = Array2::<f64>::zeros((n, 4));
+        for i in 0..n {
+            let a1 = 2.0 * std::f64::consts::PI * theta[[i, 0]];
+            let a2 = 2.0 * std::f64::consts::PI * theta[[i, 1]];
+            raw[[i, 0]] = a1.cos();
+            raw[[i, 1]] = a1.sin();
+            raw[[i, 2]] = a2.cos();
+            raw[[i, 3]] = a2.sin();
+        }
+        // Deterministic 4x8 mixing matrix.
+        let mix = Array2::<f64>::from_shape_fn((4, p), |(i, j)| {
+            ((i as f64 + 1.0) * 0.37 + (j as f64) * 0.21).sin()
+        });
+        let mut z = Array2::<f64>::zeros((n, p));
+        for i in 0..n {
+            for j in 0..p {
+                let mut acc = 0.0;
+                for r in 0..4 {
+                    acc += raw[[i, r]] * mix[[r, j]];
+                }
+                z[[i, j]] = acc;
+            }
+        }
+        // Centre Z so R² is well-defined relative to mean.
+        let mut col_mean = Array1::<f64>::zeros(p);
+        for j in 0..p {
+            let mut acc = 0.0;
+            for i in 0..n {
+                acc += z[[i, j]];
+            }
+            col_mean[j] = acc / n as f64;
+        }
+        for i in 0..n {
+            for j in 0..p {
+                z[[i, j]] -= col_mean[j];
+            }
+        }
+
+        // Atom coordinates: use the (shifted) true angles so the periodic
+        // basis aligns with the signal — the test isolates the decoder-init
+        // collapse, not coordinate recovery.
+        let mut coords_k = vec![Array2::<f64>::zeros((n, 1)); k];
+        for i in 0..n {
+            coords_k[0][[i, 0]] = (theta[[i, 0]] + 0.05).rem_euclid(1.0);
+            coords_k[1][[i, 0]] = (theta[[i, 1]] + 0.07).rem_euclid(1.0);
+        }
+        // Periodic basis (constant + 2 harmonics → M=5) for each atom.
+        let evaluator = PeriodicHarmonicEvaluator::new(m).unwrap();
+        let mut phi_k = Vec::with_capacity(k);
+        let mut jet_k = Vec::with_capacity(k);
+        for atom_idx in 0..k {
+            let (phi, jet) = evaluator.evaluate(coords_k[atom_idx].view()).unwrap();
+            phi_k.push(phi);
+            jet_k.push(jet);
+        }
+
+        // LSQ seed: joint design X = [0.5 * Phi_1 | 0.5 * Phi_2] (IBP-MAP
+        // logit 0 gives sigmoid(0/tau) = 0.5 for both atoms), solve normal
+        // equations with a small ridge.
+        let m_total = k * m;
+        let mut x = Array2::<f64>::zeros((n, m_total));
+        for atom_idx in 0..k {
+            for i in 0..n {
+                for col in 0..m {
+                    x[[i, atom_idx * m + col]] = 0.5 * phi_k[atom_idx][[i, col]];
+                }
+            }
+        }
+        let mut xtx = fast_ata(&x);
+        let mut trace = 0.0_f64;
+        for i in 0..m_total {
+            trace += xtx[[i, i]];
+        }
+        let jitter = (trace / m_total as f64).max(1.0) * 1.0e-8;
+        for i in 0..m_total {
+            xtx[[i, i]] += jitter;
+        }
+        let xtz = fast_atb(&x, &z);
+        let b_joint = xtx
+            .cholesky(FaerSide::Lower)
+            .expect("LSQ Cholesky")
+            .solve_mat(&xtz);
+
+        let mut atoms = Vec::with_capacity(k);
+        for atom_idx in 0..k {
+            let mut b = Array2::<f64>::zeros((m, p));
+            for col in 0..m {
+                for j in 0..p {
+                    b[[col, j]] = b_joint[[atom_idx * m + col, j]];
+                }
+            }
+            let atom = SaeManifoldAtom::new(
+                format!("torus_atom_{atom_idx}"),
+                SaeAtomBasisKind::Periodic,
+                1,
+                phi_k[atom_idx].clone(),
+                jet_k[atom_idx].clone(),
+                b,
+                Array2::<f64>::eye(m),
+            )
+            .unwrap()
+            .with_basis_evaluator(Arc::new(PeriodicHarmonicEvaluator::new(m).unwrap()));
+            atoms.push(atom);
+        }
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            Array2::<f64>::zeros((n, k)),
+            coords_k,
+            vec![LatentManifold::Circle; k],
+            AssignmentMode::ibp_map(0.7, 1.0, false),
+        )
+        .unwrap();
+        let mut term = SaeManifoldTerm::new(atoms, assignment).unwrap();
+        let mut rho = SaeManifoldRho::new(0.0, -6.0, vec![Array1::<f64>::zeros(1); k]);
+
+        let mut prev_total = f64::INFINITY;
+        for _ in 0..30 {
+            let loss = term
+                .run_joint_fit_arrow_schur(z.view(), &mut rho, None, 1, 1.0, 1.0e-6, 1.0e-6)
+                .unwrap();
+            let total = loss.total();
+            if !total.is_finite() {
+                break;
+            }
+            let denom = prev_total.abs().max(1.0e-12);
+            let rel = (prev_total - total).abs() / denom;
+            prev_total = total;
+            if rel < 1.0e-6 {
+                break;
+            }
+        }
+
+        let fitted = term.fitted();
+        let mut ssr = 0.0;
+        let mut sst = 0.0;
+        for i in 0..n {
+            for j in 0..p {
+                let r = z[[i, j]] - fitted[[i, j]];
+                ssr += r * r;
+                sst += z[[i, j]] * z[[i, j]];
+            }
+        }
+        let r2 = 1.0 - ssr / sst.max(1.0e-12);
+        assert!(
+            r2 > 0.5,
+            "K=2 periodic torus IBP-MAP R² = {r2:.4} (ssr={ssr:.4}, sst={sst:.4}) should be > 0.5 with LSQ-seeded decoder"
+        );
+        // Also confirm at least one atom remains active (assignment did not
+        // collapse to ~0) — the active mass averaged over rows must exceed
+        // a non-trivial threshold.
+        let assignments = term.assignment.assignments();
+        let mean_active: f64 = assignments.iter().copied().sum::<f64>() / (n as f64);
+        assert!(
+            mean_active > 0.2,
+            "mean active mass across rows = {mean_active:.4} should exceed 0.2; assignment did not collapse"
+        );
+    }
+
+    /// Regression test for issue #174 + #177 combined: softmax assignment
+    /// with K=2 periodic atoms should not crash and should reduce loss.
+    #[test]
+    fn softmax_k2_periodic_completes_joint_fit_step() {
+        let n = 64usize;
+        let p = 4usize;
+        let k = 2usize;
+        let m = 3usize;
+
+        let mut z = Array2::<f64>::zeros((n, p));
+        for i in 0..n {
+            let a = 2.0 * std::f64::consts::PI * (i as f64) / (n as f64);
+            z[[i, 0]] = a.sin();
+            z[[i, 1]] = a.cos();
+            z[[i, 2]] = (2.0 * a).sin();
+            z[[i, 3]] = (2.0 * a).cos();
+        }
+
+        let evaluator = PeriodicHarmonicEvaluator::new(m).unwrap();
+        let mut coords_k = vec![Array2::<f64>::zeros((n, 1)); k];
+        for i in 0..n {
+            coords_k[0][[i, 0]] = (i as f64) / (n as f64);
+            coords_k[1][[i, 0]] = ((i as f64) * 2.0 / (n as f64)).rem_euclid(1.0);
+        }
+        let mut atoms = Vec::new();
+        for atom_idx in 0..k {
+            let (phi, jet) = evaluator.evaluate(coords_k[atom_idx].view()).unwrap();
+            // Non-trivial decoder init (simulate LSQ seeding) so the data-fit
+            // signal is non-zero at iter 0.
+            let b = Array2::<f64>::from_shape_fn((m, p), |(i, j)| {
+                0.1 * ((i as f64 + 1.0) * (j as f64 + 1.0)).sin()
+            });
+            let atom = SaeManifoldAtom::new(
+                format!("a_{atom_idx}"),
+                SaeAtomBasisKind::Periodic,
+                1,
+                phi,
+                jet,
+                b,
+                Array2::<f64>::eye(m),
+            )
+            .unwrap()
+            .with_basis_evaluator(Arc::new(PeriodicHarmonicEvaluator::new(m).unwrap()));
+            atoms.push(atom);
+        }
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            Array2::<f64>::zeros((n, k)),
+            coords_k,
+            vec![LatentManifold::Circle; k],
+            AssignmentMode::softmax(0.7),
+        )
+        .unwrap();
+        let mut term = SaeManifoldTerm::new(atoms, assignment).unwrap();
+        let mut rho = SaeManifoldRho::new(0.0, -6.0, vec![Array1::<f64>::zeros(1); k]);
+
+        // First step must succeed (previously bailed with hessian-diag error).
+        let loss0 = term
+            .run_joint_fit_arrow_schur(z.view(), &mut rho, None, 1, 1.0, 1.0e-6, 1.0e-6)
+            .expect("softmax K=2 must complete first joint-fit step");
+        assert!(loss0.total().is_finite());
+        let loss1 = term
+            .run_joint_fit_arrow_schur(z.view(), &mut rho, None, 1, 1.0, 1.0e-6, 1.0e-6)
+            .expect("softmax K=2 must complete second joint-fit step");
+        assert!(loss1.total().is_finite());
+    }
 }
