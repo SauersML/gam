@@ -118,12 +118,16 @@ class _PoincareTangentDecode(torch.autograd.Function):
 class _PoincareLorentzDecode(torch.autograd.Function):
     """Autograd shim around the Rust Lorentz-path decoder.
 
-    Lorentz forward is implemented in Rust. Its backward routes through the
-    (isometric) Poincaré analytic backward — the two paths produce outputs
-    that agree to 1e-5 on small inputs (pinned by a Rust unit test), so the
-    gradients agree to the same tolerance. The Lorentz path therefore
-    provides boundary-safe forward arithmetic while reusing the closed-form
-    backward we already have.
+    Both forward (``poincare_lorentz_decode_forward``) and backward
+    (``poincare_lorentz_decode_backward``) live in Rust. The Lorentz and
+    Poincaré tangent-space-at-origin decoders satisfy the algebraic
+    identity ``y_Lorentz(z; A) == y_Poincare(z; A)`` exactly (see the
+    derivation in ``src/geometry/poincare.rs``: the factor-of-two
+    discrepancies in the Lorentz log/exp at the origin cancel inside the
+    linear mix), so the analytic Jacobian of the Lorentz forward is the
+    same closed form derived for the Poincaré path. A dedicated Rust unit
+    test finite-differences the *Lorentz* forward against this backward to
+    pin the agreement at 1e-5.
     """
 
     @staticmethod

@@ -20560,6 +20560,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(poincare_tangent_decode_forward, module)?)?;
     module.add_function(wrap_pyfunction!(poincare_tangent_decode_backward, module)?)?;
     module.add_function(wrap_pyfunction!(poincare_lorentz_decode_forward, module)?)?;
+    module.add_function(wrap_pyfunction!(poincare_lorentz_decode_backward, module)?)?;
     module.add_function(wrap_pyfunction!(response_geometry_simplex_log_map, module)?)?;
     module.add_function(wrap_pyfunction!(response_geometry_simplex_exp_map, module)?)?;
     module.add_function(wrap_pyfunction!(response_geometry_sphere_log_map, module)?)?;
