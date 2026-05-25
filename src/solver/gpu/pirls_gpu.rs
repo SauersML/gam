@@ -308,7 +308,7 @@ pub fn solve_pirls_step_gpu(input: PirlsGpuInput<'_>) -> Result<PirlsGpuStep, St
 mod cpu_fallback {
     use super::{PirlsGpuInput, PirlsGpuStep};
     use crate::linalg::faer_ndarray::FaerCholesky;
-    use crate::solver::reml::assembly::xt_diag_x_dense_into;
+    use crate::solver::estimate::reml::assembly::xt_diag_x_dense_into;
     use faer::Side;
     use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
