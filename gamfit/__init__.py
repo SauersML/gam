@@ -106,6 +106,7 @@ from ._penalties import (
     TopKActivationPenalty,
     TotalVariationPenalty,
 )
+from ._sheaf import SheafConsistencyPenalty
 from .topology import (
     Circle,
     Cylinder,
@@ -343,6 +344,7 @@ __all__ = [
     "AnalyticPenaltyKind",
     "AuxConditionalPriorPenalty",
     "BlockOrthogonalityPenalty",
+    "SheafConsistencyPenalty",
     "BlockSparsityPenalty",
     "GatedSAEDecoder",
     "IBPAssignmentPenalty",
