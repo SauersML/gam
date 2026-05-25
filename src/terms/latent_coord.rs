@@ -753,6 +753,33 @@ impl LatentCoordValues {
         &self.retraction_registry
     }
 
+    /// Effective "is all Euclidean" check used by the inner solver:
+    /// returns `true` only when *both* the declared `LatentManifold` and the
+    /// optional override retraction registry are Euclidean. The registry's
+    /// own `is_all_euclidean` answers a strictly narrower question (was an
+    /// explicit non-Euclidean override installed?) and would silently miss
+    /// non-Euclidean manifolds installed via `from_matrix_with_manifold` /
+    /// `with_manifold`, which left the registry at its `all_euclidean`
+    /// default. See `retract_flat_delta` for the matching update path.
+    pub(crate) fn effective_is_all_euclidean(&self) -> bool {
+        self.manifold.is_euclidean() && self.retraction_registry.is_all_euclidean()
+    }
+
+    /// Effective per-axis trust-region metric weights. When the manifold is
+    /// non-Euclidean it is the authoritative geometric description (it
+    /// covers `Interval` and `ProductWithMetric`, which the registry's
+    /// `RetractionKind` cannot express), so we read weights from it. When
+    /// the manifold is Euclidean but an explicit override retraction was
+    /// supplied (e.g. via the JSON `retraction:` key) the registry's
+    /// weights win.
+    pub(crate) fn effective_metric_weights(&self) -> Vec<f64> {
+        if self.manifold.is_euclidean() {
+            self.retraction_registry.metric_weights(self.latent_dim)
+        } else {
+            self.manifold.metric_weights()
+        }
+    }
+
     pub fn with_manifold(&self, manifold: LatentManifold) -> Self {
         Self::from_flat_with_manifold_and_retraction_and_id(
             self.values.clone(),

@@ -289,6 +289,62 @@ class BlockOrthogonalityPenalty(nn.Module):
         return apply(latent, rho, _latent_json(latent.shape[0], latent.shape[1], name=self.target), _penalty_json(descriptor))
 
 
+class MonotonicityPenalty(nn.Module):
+    """Soft monotonicity penalty along the leading axis of a latent block.
+
+    Routes through the Rust ``monotonicity`` analytic-penalty descriptor.
+    """
+
+    def __init__(
+        self,
+        weight: float,
+        n_eff: int,
+        *,
+        direction: float = 1.0,
+        smoothing_eps: float = 1.0e-3,
+        target: str = "t",
+        learnable: bool = False,
+    ) -> None:
+        super().__init__()
+        if not (np.isfinite(weight) and weight > 0.0):
+            raise ValueError("MonotonicityPenalty.weight must be finite and > 0")
+        if n_eff <= 0:
+            raise ValueError("MonotonicityPenalty.n_eff must be > 0")
+        if not (np.isfinite(direction) and direction != 0.0):
+            raise ValueError("MonotonicityPenalty.direction must be finite and non-zero")
+        if not (np.isfinite(smoothing_eps) and smoothing_eps > 0.0):
+            raise ValueError("MonotonicityPenalty.smoothing_eps must be finite and > 0")
+        self.weight = float(weight)
+        self.n_eff = int(n_eff)
+        self.direction = float(direction)
+        self.smoothing_eps = float(smoothing_eps)
+        self.target = str(target)
+        self.learnable = bool(learnable)
+        if self.learnable:
+            self.log_weight = nn.Parameter(torch.zeros(1))
+
+    def forward(self, latent: torch.Tensor, basis: torch.Tensor | None = None) -> torch.Tensor:
+        del basis
+        latent = _check_matrix(latent, "latent")
+        descriptor = {
+            "kind": "monotonicity",
+            "target": self.target,
+            "weight": self.weight,
+            "n_eff": self.n_eff,
+            "direction": self.direction,
+            "smoothing_eps": self.smoothing_eps,
+            "learnable": self.learnable,
+        }
+        rho = _rho_tensor(getattr(self, "log_weight", None), latent, 1 if self.learnable else 0)
+        apply = cast(Callable[..., torch.Tensor], _RustPenaltyFn.apply)
+        return apply(
+            latent,
+            rho,
+            _latent_json(latent.shape[0], latent.shape[1], name=self.target),
+            _penalty_json(descriptor),
+        )
+
+
 class MechanismSparsityPenalty(nn.Module):
     """Per-latent group-lasso sparsity over decoder feature groups."""
 
