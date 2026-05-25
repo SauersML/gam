@@ -2,14 +2,14 @@
 
 A marginal-slope model fits a standardised risk score `z` whose effect on
 the outcome varies across covariate space. The baseline risk surface and
-the score's log-slope surface live in two separate formulas, so the
+the score's slope surface live in two separate formulas, so the
 baseline does not absorb score-specific signal and vice versa.
 
 ![two-surface marginal-slope viz over a joint Duchon smooth](images/marginal_slope_3d.png)
 
 The vertical gap between the two probability surfaces is the risk
 difference for a unit contrast in `z`. The modelled score effect lives on
-the probit/log-slope scale and varies smoothly with covariates.
+the probit/slope scale and varies smoothly with covariates.
 
 Two families:
 
@@ -18,8 +18,10 @@ Two families:
 - Survival marginal-slope (`survival_likelihood="marginal-slope"`) for
   time-to-event outcomes.
 
-Both assume `z` is approximately `N(0, 1)` conditional on the covariates.
-Use the transformation-normal calibration step to enforce that.
+Both are identified around a latent `z` scale that should be approximately
+`N(0, 1)` conditional on the covariates. By default the fit uses warn-only
+diagnostics for deviations from that target; use the transformation-normal
+calibration step to put `z` on the intended scale.
 
 ## When to use it
 
@@ -61,7 +63,6 @@ model = gamfit.fit(
     df,
     "case ~ s(age) + matern(pc1, pc2, pc3)",
     family="bernoulli-marginal-slope",
-    link="probit",
     z_column="z",
     logslope_formula="matern(pc1, pc2, pc3)",
     scale_dimensions=True,
@@ -72,10 +73,9 @@ probs = model.predict(test_df, return_type="dict")["mean"]
 
 - `family="bernoulli-marginal-slope"` selects the marginal-slope
   likelihood.
-- `link="probit"`: optional. The Bernoulli marginal-slope family
-  defaults to probit when no link is supplied. The kernel is derived
-  for the probit base link and rejects any other link choice,
-  including `flexible(...)`, `blended(...)`, `sas`, and `beta-logistic`.
+- The base link is fixed to probit. `link(type=probit)` is optional in
+  formulas; CLI formula-level non-probit links are rejected. The Python
+  `link=` keyword is not needed for marginal-slope fits.
 - `z_column="z"`: name of the conditional z-score column in both the
   training and prediction tables.
 - `logslope_formula="..."`: formula for the log-slope surface as a
@@ -92,20 +92,7 @@ gam fit data.csv 'case ~ s(age) + matern(pc1, pc2, pc3)' \
     --scale-dimensions --out model.gam
 ```
 
-For vector-valued scores, place the first coordinate in `--z-column` and
-add one `logslope(z_col, ...)` declaration per additional coordinate
-inside `--logslope-formula`:
-
-```bash
-gam fit data.csv 'case ~ s(age) + matern(pc1, pc2, pc3)' \
-    --z-column z1 \
-    --logslope-formula 'matern(pc1, pc2, pc3) + logslope(z2, s(age)) + logslope(z3, matern(pc1, pc2, pc3))' \
-    --scale-dimensions --out model.gam
-```
-
-The unwrapped RHS is the log-slope surface for the first coordinate.
-Each extra `logslope(z_col, ...)` adds a surface for that coordinate
-with its own coefficients and smoothing parameters.
+Bernoulli marginal-slope currently consumes a single `z_column`.
 
 ## Stage 2b: Survival marginal-slope
 
@@ -122,15 +109,18 @@ pred = model.predict(test_df)
 S = pred.survival_at([1, 5, 10])
 ```
 
-The main formula specifies the baseline hazard surface; the score's log
-hazard ratio is a smooth function of covariates given by
-`logslope_formula`.
+The main formula specifies the baseline survival surface; the score's
+slope on the marginal-calibrated probit survival scale is a smooth
+function of covariates given by `logslope_formula`. In the Python API,
+omitting `logslope_formula` reuses the main covariate formula for the
+slope surface; the CLI requires `--logslope-formula`.
 
 ## Frailty in marginal-slope survival
 
-Survival marginal-slope supports only `frailty_kind="gaussian-shift"`
-with a fixed `frailty_sd`. `"hazard-multiplier"` and a learnable
-gaussian-shift sigma are rejected at fit time.
+Survival marginal-slope supports no frailty, or
+`frailty_kind="gaussian-shift"` with a fixed `frailty_sd`.
+`"hazard-multiplier"` and a learnable gaussian-shift sigma are rejected
+at fit time.
 
 ```python
 gamfit.fit(df,
@@ -156,7 +146,7 @@ model.model_class                  # full class string
 ## Notes
 
 - Run Stage 1 (transformation-normal) before Stage 2 so `z_column` is
-  conditionally `N(0, 1)`.
+  close to conditionally `N(0, 1)`.
 - Set `scale_dimensions=True` when calibrating on a handful of PCs so
   anisotropic length scales are learned per axis.
 - Posterior sampling: Bernoulli marginal-slope and transformation-normal
@@ -196,7 +186,6 @@ model = gamfit.fit(
     df,
     "disease ~ matern(pc1, pc2, pc3, centers=20)",
     family="bernoulli-marginal-slope",
-    link="probit",
     z_column="pgs_z",
     logslope_formula="matern(pc1, pc2, pc3, centers=20)",
     scale_dimensions=True,

@@ -297,7 +297,8 @@ gamfit.fit(df, "y ~ matern(pc1, pc2, pc3, pc4)", scale_dimensions=True)
   centered per-axis contrasts.
 - Pure Duchon (no `length_scale`): centered per-axis contrasts only;
   remains scale-free.
-- Thin-plate: per-axis input standardisation.
+- Thin-plate: inputs are automatically standardized; `scale_dims` is
+  not a learned anisotropy knob for this family.
 - Tensor: each margin has its own smoothing parameter without this
   option.
 
@@ -347,7 +348,7 @@ data can correct for link misspecification.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `internal_knots` | ~10 | Interior knots for the offset spline (must be > 0). |
+| `internal_knots` | 8 | Interior knots for the offset spline (must be > 0). |
 | `degree` | 3 | Polynomial degree (>= 1). |
 | `penalty_order` | `all` (1, 2, 3) | Which derivatives to penalise. Comma-separated `slope`, `curvature`, `curvature-change` (or `1`, `2`, `3`), or `all`. |
 | `double_penalty` | `true` | Ridge + main penalty. |
