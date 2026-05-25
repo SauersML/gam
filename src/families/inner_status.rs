@@ -315,4 +315,70 @@ mod tests {
             InnerFailure::Other(_)
         ));
     }
+
+    /// Round-trip test against the diagnostician's
+    /// `KktRefusalReport::format_bubbled_error` output. The report
+    /// formatter lives in `src/families/custom_family.rs` and is
+    /// private; we reproduce its exact text shape here so the parser
+    /// stays pinned even after the bubbled-error swap at line ~13540
+    /// stops calling `block_residual_diagnostic_string` and starts
+    /// calling `KktRefusalReport::format_bubbled_error` directly.
+    ///
+    /// The fixture below is a verbatim copy of the diagnostician's
+    /// format string with concrete values plugged in. Any change to
+    /// the report's text shape that breaks this test must be
+    /// accompanied by a matching update to the parser.
+    #[test]
+    fn round_trip_matches_kkt_refusal_report_bubbled_format() {
+        for (diagnosis_label, expected) in [
+            (
+                "rank_deficient_H_pen",
+                KktRefusalDiagnosis::RankDeficientHPen,
+            ),
+            (
+                "phantom_multiplier_with_well_conditioned_H",
+                KktRefusalDiagnosis::PhantomMultiplierWithWellConditionedH,
+            ),
+            (
+                "active_set_incomplete",
+                KktRefusalDiagnosis::ActiveSetIncomplete,
+            ),
+        ] {
+            let message = format!(
+                "cycle=7 cert REFUSED: residual=5.000e+05 > 4·tol=4.000e+03; \
+                 carrying-block: time_surface (idx=0, |g|=5.000e+05, |Sβ|=1.000e-03, \
+                 |∇L-Sβ|=5.000e+05, |β|=1.000e+00, width=12); \
+                 block_names=[\"time_surface\", \"marginal\", \"logslope\"], \
+                 block_widths=[12, 11, 10], block_grad_inf=[5.0e+05, 1.0e-03, 1.0e-03], \
+                 block_penalty_grad_inf=[1.0e-03, 1.0e-03, 1.0e-03], \
+                 block_residual_inf=[5.0e+05, 1.0e-03, 1.0e-03]; \
+                 H_pen spectrum: λ_max=1.000e+03, λ_min=1.000e-12, cond=1.000e+15, \
+                 nullity@1e-10=2/33; cert math: linearized_rel=9.99e-01, \
+                 scalar_relerr=1.0e-10, |Δobj|=1.0e-09, accepted_step_inf=1.0e+00, \
+                 proposal_step_inf=1.0e+06, trust_radius=1.0e-03, |β|∞=1.0e+00, \
+                 active_set_rows_total=0; diagnosis: {diagnosis_label}; \
+                 check whether the named block's penalty has a polynomial null space"
+            );
+            match classify_inner_error(message) {
+                InnerFailure::CertRefused {
+                    diagnosis,
+                    carrying_block,
+                    ..
+                } => {
+                    assert_eq!(
+                        diagnosis, expected,
+                        "diagnosis label {diagnosis_label} must round-trip"
+                    );
+                    assert_eq!(
+                        carrying_block.as_deref(),
+                        Some("time_surface"),
+                        "carrying-block must survive the round-trip for {diagnosis_label}"
+                    );
+                }
+                other => panic!(
+                    "expected CertRefused for label {diagnosis_label}, got {other:?}"
+                ),
+            }
+        }
+    }
 }

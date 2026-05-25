@@ -427,7 +427,14 @@ impl<'a> RemlState<'a> {
         let Some(hessian_rho_inv) =
             matrix_inversewith_regularization(&hessian_rho, "auto cubature rho Hessian")
         else {
-            return first_order_correction;
+            log::warn!(
+                "Auto cubature: ridged rho-Hessian inversion failed; \
+                 falling back to first-order correction."
+            );
+            return self.finalize_smoothing_outcome(first_order_numerical(
+                first_order_correction,
+                "rho Hessian inversion failed after ridge regularization",
+            ));
         };
 
         let max_rhovar = hessian_rho_inv
@@ -435,14 +442,27 @@ impl<'a> RemlState<'a> {
             .iter()
             .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
         if !near_boundary && !highgrad && max_rhovar < AUTO_CUBATURE_RHOVAR_TRIGGER {
-            return first_order_correction;
+            return self.finalize_smoothing_outcome(first_order_routine(
+                first_order_correction,
+                "post-inversion rho posterior variance below trigger threshold",
+            ));
         }
 
         use crate::faer_ndarray::FaerEigh;
         use faer::Side;
         let (evals, evecs) = match hessian_rho_inv.eigh(Side::Lower) {
             Ok(x) => x,
-            Err(_) => return first_order_correction,
+            Err(err) => {
+                log::warn!(
+                    "Auto cubature: eigendecomposition of inverse rho-Hessian failed ({:?}); \
+                     falling back to first-order correction.",
+                    err
+                );
+                return self.finalize_smoothing_outcome(first_order_numerical(
+                    first_order_correction,
+                    "eigendecomposition of inverse rho-Hessian failed",
+                ));
+            }
         };
         let max_eval = evals
             .iter()
@@ -456,12 +476,29 @@ impl<'a> RemlState<'a> {
             .filter(|(_, v)| v.is_finite() && *v > eigenvalue_floor)
             .collect();
         if eig_pairs.is_empty() {
-            return first_order_correction;
+            log::warn!(
+                "Auto cubature: inverse rho-Hessian has no positive eigenvalues above the \
+                 numerical floor ({:.3e}); rho-Hessian is non-PD or singular. \
+                 Falling back to first-order correction.",
+                eigenvalue_floor
+            );
+            return self.finalize_smoothing_outcome(first_order_numerical(
+                first_order_correction,
+                "inverse rho-Hessian has no positive eigenvalues above numerical floor",
+            ));
         }
         eig_pairs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         let totalvar: f64 = eig_pairs.iter().map(|(_, v)| *v).sum();
         if !totalvar.is_finite() || totalvar <= 0.0 {
-            return first_order_correction;
+            log::warn!(
+                "Auto cubature: total positive eigenvalue mass non-finite or non-positive \
+                 ({:.3e}); falling back to first-order correction.",
+                totalvar
+            );
+            return self.finalize_smoothing_outcome(first_order_numerical(
+                first_order_correction,
+                "positive-eigenvalue total mass non-finite or non-positive",
+            ));
         }
 
         let mut rank = 0usize;
@@ -476,12 +513,32 @@ impl<'a> RemlState<'a> {
                 break;
             }
         }
+        // `rank == 0` would require the truncation loop to not execute
+        // despite a non-empty `eig_pairs`. The loop always runs at least
+        // once when there is at least one positive eigenvalue, so this
+        // branch is unreachable in practice. Treat as a
+        // NumericalFailure guard rather than a routine fallback so any
+        // future regression surfaces visibly.
         if rank == 0 {
-            return first_order_correction;
+            log::warn!(
+                "Auto cubature: variance-truncation produced rank 0 despite non-empty positive \
+                 eigenvalue set; falling back to first-order correction (unreachable guard)."
+            );
+            return self.finalize_smoothing_outcome(first_order_numerical(
+                first_order_correction,
+                "variance-truncation produced rank 0 (unreachable guard)",
+            ));
         }
 
         let Some(base_cov) = base_covariance else {
-            return first_order_correction;
+            // Caller did not supply a base covariance to upgrade. This
+            // is a configuration choice (the caller has nothing to add
+            // the cubature correction onto), not a numerical failure;
+            // the first-order delta is the documented outcome.
+            return self.finalize_smoothing_outcome(first_order_routine(
+                first_order_correction,
+                "no base covariance supplied: nothing for cubature to upgrade",
+            ));
         };
         let p = base_cov.nrows();
         let radius = (rank as f64).sqrt();
@@ -502,8 +559,18 @@ impl<'a> RemlState<'a> {
                 sigma_points.push(rho_point);
             }
         }
+        // Unreachable: `rank >= 1` ensures at least two sigma points
+        // (one positive, one negative) per eigenvector. Treat as a
+        // NumericalFailure guard so any future regression surfaces.
         if sigma_points.is_empty() {
-            return first_order_correction;
+            log::warn!(
+                "Auto cubature: produced empty sigma-point set despite rank >= 1; \
+                 falling back to first-order correction (unreachable guard)."
+            );
+            return self.finalize_smoothing_outcome(first_order_numerical(
+                first_order_correction,
+                "empty sigma-point set (unreachable guard)",
+            ));
         }
 
         // Disable warm-start and PIRLS-cache coupling while evaluating sigma
@@ -540,7 +607,18 @@ impl<'a> RemlState<'a> {
         };
 
         if point_results.iter().any(|r| r.is_none()) {
-            return first_order_correction;
+            let failed = point_results.iter().filter(|r| r.is_none()).count();
+            let total = point_results.len();
+            log::warn!(
+                "Auto cubature: {}/{} sigma-point inner PIRLS fits failed; \
+                 falling back to first-order correction.",
+                failed,
+                total
+            );
+            return self.finalize_smoothing_outcome(first_order_numerical(
+                first_order_correction,
+                "one or more sigma-point inner PIRLS fits failed",
+            ));
         }
 
         let w = 1.0 / (sigma_points.len() as f64);

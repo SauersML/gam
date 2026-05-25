@@ -193,16 +193,18 @@ pub(crate) fn format_no_seeds_passed(
     early_exit_note: &str,
 ) -> String {
     let mut out = String::new();
-    let _ = writeln!(
+    writeln!(
         &mut out,
         "no candidate seeds passed outer startup validation ({context}):"
-    );
-    let _ = writeln!(
+    )
+    .expect("writing to String cannot fail");
+    writeln!(
         &mut out,
         "  generated={}, screened={}, exact_validated={}, solver_started={}",
         stats.generated, stats.screened, stats.exact_validated, stats.solver_started,
-    );
-    let _ = writeln!(
+    )
+    .expect("writing to String cannot fail");
+    writeln!(
         &mut out,
         "  rejection breakdown: rejected_by_kkt={}, rejected_by_domain={}, \
          rejected_by_objective={}, rejected_by_budget={}, rejected_other={} (total={})",
@@ -212,29 +214,33 @@ pub(crate) fn format_no_seeds_passed(
         stats.rejected_by_budget,
         stats.rejected_other,
         stats.total_rejected(),
-    );
+    )
+    .expect("writing to String cannot fail");
     if let Some(key) = structural {
-        let _ = writeln!(
+        writeln!(
             &mut out,
             "  uniform CertRefused: diagnosis={}, carrying-block={}",
             key.0.as_str(),
             key.1.as_deref().unwrap_or("<unknown>"),
-        );
-        let _ = writeln!(&mut out, "  diagnosis: {}", structural_diagnosis_hint(key));
+        )
+        .expect("writing to String cannot fail");
+        writeln!(&mut out, "  diagnosis: {}", structural_diagnosis_hint(key))
+            .expect("writing to String cannot fail");
     }
     if !early_exit_note.is_empty() {
-        let _ = writeln!(&mut out, "  {early_exit_note}");
+        writeln!(&mut out, "  {early_exit_note}").expect("writing to String cannot fail");
     }
     if !rejections.is_empty() {
-        let _ = writeln!(&mut out, "  per-seed reasons:");
+        writeln!(&mut out, "  per-seed reasons:").expect("writing to String cannot fail");
         for rej in rejections {
-            let _ = writeln!(
+            writeln!(
                 &mut out,
                 "    seed {} ({}): {}",
                 rej.seed_idx,
                 rej.phase,
                 rej.failure.message(),
-            );
+            )
+            .expect("writing to String cannot fail");
         }
     }
     // Trim the trailing newline so the message embeds cleanly inside
