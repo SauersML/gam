@@ -13176,7 +13176,7 @@ fn coefficient_state_json_impl(model_bytes: &[u8]) -> Result<String, String> {
 struct DifferenceSmoothRequest {
     view: String,
     group: Option<String>,
-    pairs: Option<Vec<Vec<String>>>,
+    pairs: Option<Vec<(serde_json::Value, serde_json::Value)>>,
     n: usize,
     level: f64,
     simultaneous: bool,
@@ -13194,6 +13194,22 @@ fn json_value_to_row_string(value: &serde_json::Value) -> Option<String> {
         serde_json::Value::Number(number) => Some(number.to_string()),
         serde_json::Value::Bool(flag) => Some(flag.to_string()),
         other => Some(other.to_string()),
+    }
+}
+
+fn json_value_to_difference_level(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => "None".to_string(),
+        serde_json::Value::Bool(flag) => {
+            if *flag {
+                "True".to_string()
+            } else {
+                "False".to_string()
+            }
+        }
+        serde_json::Value::Number(number) => number.to_string(),
+        serde_json::Value::String(text) => text.clone(),
+        other => other.to_string(),
     }
 }
 
@@ -13303,6 +13319,10 @@ fn difference_group_ranges(
             continue;
         };
         if obj
+            .get("kind")
+            .and_then(|raw| raw.as_str())
+            .is_some_and(|kind| kind == "random_effect")
+            && obj
             .get("name")
             .and_then(|raw| raw.as_str())
             .is_some_and(|name| name == group)
@@ -13516,15 +13536,13 @@ fn difference_smooth_json_impl(model_bytes: &[u8], request_json: &str) -> Result
     let pairs = match request.pairs {
         Some(pairs) => pairs
             .into_iter()
-            .enumerate()
-            .map(|(idx, pair)| {
-                if pair.len() != 2 {
-                    Err(format!("difference_smooth pairs[{idx}] must contain two levels"))
-                } else {
-                    Ok((pair[0].clone(), pair[1].clone()))
-                }
+            .map(|(left, right)| {
+                (
+                    json_value_to_difference_level(&left),
+                    json_value_to_difference_level(&right),
+                )
             })
-            .collect::<Result<Vec<_>, _>>()?,
+            .collect::<Vec<_>>(),
         None => {
             let mut out = Vec::new();
             for i in 0..levels.len() {
@@ -13584,9 +13602,8 @@ fn difference_smooth_json_impl(model_bytes: &[u8], request_json: &str) -> Result
     let (cov, cov_kind, cov_corrected) = difference_smooth_covariance(&state, beta.len())?;
     let random_ranges = difference_json_ranges(&state, "random_column_ranges")?;
     let group_ranges = difference_group_ranges(&state, &group)?;
-    let normal = statrs::distribution::Normal::new(0.0, 1.0)
-        .map_err(|err| format!("failed to construct standard normal: {err}"))?;
-    let pointwise_crit = normal.inverse_cdf(0.5 + request.level / 2.0);
+    let pointwise_crit =
+        gam::inference::probability::standard_normal_quantile(0.5 + request.level / 2.0)?;
     let model = load_model_impl(model_bytes)?;
     let mut rows_out = Vec::<serde_json::Value>::new();
 
