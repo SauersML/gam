@@ -343,6 +343,7 @@ def _inverse_softplus(x: np.ndarray) -> np.ndarray:
 
 from ._binding import rust_module as _rust_module; SparsityPenalty = _rust_module().SparsityPenalty
 from ._binding import rust_module as _rust_module; AuxConditionalPriorPenalty = _rust_module().AuxConditionalPriorPenalty
+from ._binding import rust_module as _rust_module; BlockOrthogonalityPenalty = _rust_module().BlockOrthogonalityPenalty
 
 
 @dataclass(init=False, slots=True)
