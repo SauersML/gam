@@ -24291,7 +24291,9 @@ fn required_prediction_columns(model: &FittedModel) -> Result<BTreeSet<String>, 
     add_formula_term_columns(&mut required, &parsed.terms);
 
     if let Some((entry, exit, _event)) = parse_surv_response(parsed.response.as_str())? {
-        required.insert(entry);
+        if let Some(entry) = entry {
+            required.insert(entry);
+        }
         required.insert(exit);
     } else if matches!(
         model.predict_model_class(),
@@ -25572,9 +25574,17 @@ fn build_survival_marginal_slope_ffi_payload(
         .enumerate()
         .map(|(i, h)| (h.clone(), i))
         .collect();
-    let entry_idx = *col_map
-        .get(&entryname)
-        .ok_or_else(|| format!("entry column '{entryname}' not found"))?;
+    // `entryname == None` is the right-censored shorthand `Surv(time, event)`:
+    // entry times are synthesized as zero, no column lookup required.
+    let entry_idx: Option<usize> = entryname
+        .as_deref()
+        .map(|name| {
+            col_map
+                .get(name)
+                .copied()
+                .ok_or_else(|| format!("entry column '{name}' not found"))
+        })
+        .transpose()?;
     let exit_idx = *col_map
         .get(&exitname)
         .ok_or_else(|| format!("exit column '{exitname}' not found"))?;
@@ -25582,8 +25592,9 @@ fn build_survival_marginal_slope_ffi_payload(
     let mut age_entry = Array1::<f64>::zeros(n);
     let mut age_exit = Array1::<f64>::zeros(n);
     for i in 0..n {
+        let entry_val = entry_idx.map_or(0.0, |idx| dataset.values[[i, idx]]);
         let (t0, t1) = gam::families::survival_construction::normalize_survival_time_pair(
-            dataset.values[[i, entry_idx]],
+            entry_val,
             dataset.values[[i, exit_idx]],
             i,
         )?;
@@ -25637,7 +25648,7 @@ fn build_survival_marginal_slope_ffi_payload(
     payload.unified = Some(ms_result.fit.clone());
     payload.fit_result = Some(ms_result.fit);
     payload.data_schema = Some(dataset.schema.clone());
-    payload.survival_entry = Some(entryname);
+    payload.survival_entry = entryname;
     payload.survival_exit = Some(exitname);
     payload.survival_event = Some(eventname);
     payload.survivalspec = Some("net".to_string());
@@ -25714,7 +25725,7 @@ fn build_survival_transformation_ffi_payload(
     payload.unified = Some(rp_result.fit.clone());
     payload.fit_result = Some(rp_result.fit.clone());
     payload.data_schema = Some(dataset.schema.clone());
-    payload.survival_entry = Some(entryname);
+    payload.survival_entry = entryname;
     payload.survival_exit = Some(exitname);
     payload.survival_event = Some(eventname);
     let cause_count = rp_result.fit.blocks.len().max(1);
@@ -25980,9 +25991,15 @@ fn build_survival_location_scale_ffi_payload(
         .enumerate()
         .map(|(i, h)| (h.clone(), i))
         .collect();
-    let entry_idx = *col_map
-        .get(&entryname)
-        .ok_or_else(|| format!("entry column '{entryname}' not found"))?;
+    let entry_idx: Option<usize> = entryname
+        .as_deref()
+        .map(|name| {
+            col_map
+                .get(name)
+                .copied()
+                .ok_or_else(|| format!("entry column '{name}' not found"))
+        })
+        .transpose()?;
     let exit_idx = *col_map
         .get(&exitname)
         .ok_or_else(|| format!("exit column '{exitname}' not found"))?;
@@ -25990,8 +26007,9 @@ fn build_survival_location_scale_ffi_payload(
     let mut age_entry = Array1::<f64>::zeros(n);
     let mut age_exit = Array1::<f64>::zeros(n);
     for i in 0..n {
+        let entry_val = entry_idx.map_or(0.0, |idx| dataset.values[[i, idx]]);
         let (t0, t1) = gam::families::survival_construction::normalize_survival_time_pair(
-            dataset.values[[i, entry_idx]],
+            entry_val,
             dataset.values[[i, exit_idx]],
             i,
         )?;
@@ -26114,7 +26132,7 @@ fn build_survival_location_scale_ffi_payload(
         .as_ref()
         .map(|b| b.to_vec());
     payload.linkwiggle_knots = ls_result.wiggle_knots.as_ref().map(|k| k.to_vec());
-    payload.survival_entry = Some(entryname);
+    payload.survival_entry = entryname;
     payload.survival_exit = Some(exitname);
     payload.survival_event = Some(eventname);
     payload.survivalspec = Some("net".to_string());
@@ -26233,9 +26251,15 @@ fn build_latent_window_ffi_payload(
         .enumerate()
         .map(|(i, h)| (h.clone(), i))
         .collect();
-    let entry_idx = *col_map
-        .get(&entryname)
-        .ok_or_else(|| format!("entry column '{entryname}' not found"))?;
+    let entry_idx: Option<usize> = entryname
+        .as_deref()
+        .map(|name| {
+            col_map
+                .get(name)
+                .copied()
+                .ok_or_else(|| format!("entry column '{name}' not found"))
+        })
+        .transpose()?;
     let exit_idx = *col_map
         .get(&exitname)
         .ok_or_else(|| format!("exit column '{exitname}' not found"))?;
@@ -26243,8 +26267,9 @@ fn build_latent_window_ffi_payload(
     let mut age_entry = Array1::<f64>::zeros(n);
     let mut age_exit = Array1::<f64>::zeros(n);
     for i in 0..n {
+        let entry_val = entry_idx.map_or(0.0, |idx| dataset.values[[i, idx]]);
         let (t0, t1) = gam::families::survival_construction::normalize_survival_time_pair(
-            dataset.values[[i, entry_idx]],
+            entry_val,
             dataset.values[[i, exit_idx]],
             i,
         )?;
@@ -26318,7 +26343,7 @@ fn build_latent_window_ffi_payload(
     payload.unified = Some(fit.clone());
     payload.fit_result = Some(fit.clone());
     payload.data_schema = Some(dataset.schema.clone());
-    payload.survival_entry = Some(entryname);
+    payload.survival_entry = entryname;
     payload.survival_exit = Some(exitname);
     payload.survival_event = Some(eventname);
     payload.survivalspec = Some("net".to_string());

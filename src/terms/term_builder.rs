@@ -28,7 +28,8 @@ use crate::resource::ResourcePolicy;
 use crate::smooth::{
     BySmoothKind, ByVarKind, ByVariableSpec, FactorSmoothFlavour, FactorSmoothSpec,
     LinearCoefficientGeometry, LinearTermSpec, RandomEffectTermSpec, ShapeConstraint,
-    SmoothBasisSpec, SmoothTermSpec, TermCollectionSpec,
+    SmoothBasisSpec, SmoothTermSpec, TensorBSplineIdentifiability, TensorBSplineSpec,
+    TermCollectionSpec,
 };
 
 // ---------------------------------------------------------------------------
@@ -714,6 +715,139 @@ fn parse_period_origins(
         ],
         periodic_axes.len(),
     )
+}
+
+/// Parse a per-axis periodic flag list for tensor smooths. Accepts three forms:
+/// - `periodic=true` / `periodic=false` (scalar applied to every axis),
+/// - `periodic=[true, false, ...]` (one flag per axis, length `dim`), and
+/// - `periodic=[0, 2, ...]` (axis indices that are periodic; others are not).
+///
+/// `boundary=[..., "periodic"/"cyclic"/"cc", ...]` may also flip individual
+/// axes on; non-matching tokens leave the existing flag unchanged.
+fn parse_tensor_periodic_axes(
+    options: &BTreeMap<String, String>,
+    dim: usize,
+) -> Result<Vec<bool>, String> {
+    let mut axes = vec![false; dim];
+    if let Some(raw) = options.get("periodic").or_else(|| options.get("cyclic")) {
+        let lowered = raw.trim().to_ascii_lowercase();
+        match lowered.as_str() {
+            "true" | "yes" | "y" => {
+                axes.fill(true);
+            }
+            "false" | "no" | "n" => {
+                // Already false; allow `boundary=` below to flip axes if set.
+            }
+            _ => {
+                let entries = parse_option_list(raw);
+                let all_bool = !entries.is_empty()
+                    && entries.iter().all(|v| {
+                        matches!(
+                            v.as_str(),
+                            "true" | "yes" | "y" | "false" | "no" | "n" | "none"
+                        )
+                    });
+                if all_bool {
+                    if entries.len() != dim {
+                        return Err(format!(
+                            "periodic list length {} must match smooth dimension {}",
+                            entries.len(),
+                            dim
+                        ));
+                    }
+                    for (i, v) in entries.iter().enumerate() {
+                        axes[i] = matches!(v.as_str(), "true" | "yes" | "y");
+                    }
+                } else {
+                    for axis_raw in entries {
+                        let axis = axis_raw.parse::<usize>().map_err(|err| {
+                            format!("invalid periodic axis '{axis_raw}': {err}")
+                        })?;
+                        if axis >= dim {
+                            return Err(format!(
+                                "periodic axis {axis} out of range for {dim}D smooth"
+                            ));
+                        }
+                        axes[axis] = true;
+                    }
+                }
+            }
+        }
+    }
+    if let Some(raw) = options.get("boundary").or_else(|| options.get("bc")) {
+        let boundary = parse_option_list(raw);
+        if boundary.len() == dim {
+            for (axis, value) in boundary.iter().enumerate() {
+                if matches!(value.as_str(), "periodic" | "cyclic" | "cc") {
+                    axes[axis] = true;
+                }
+            }
+        }
+    }
+    Ok(axes)
+}
+
+/// Parse a per-margin basis dimension list (`k=<scalar>` or `k=[k0, k1, ...]`).
+/// A scalar is broadcast across all axes; `None` returns the heuristic from the
+/// data column.
+fn parse_tensor_k_list(
+    options: &BTreeMap<String, String>,
+    cols: &[usize],
+    ds: &Dataset,
+) -> Result<(Vec<usize>, bool), String> {
+    let raw = options
+        .get("k")
+        .or_else(|| options.get("basis_dim"))
+        .or_else(|| options.get("basis-dim"))
+        .or_else(|| options.get("basisdim"));
+    let Some(raw) = raw else {
+        let inferred = cols
+            .iter()
+            .map(|&c| heuristic_knots_for_column(ds.values.column(c)))
+            .collect();
+        return Ok((inferred, true));
+    };
+    let entries = split_list_option(raw);
+    if entries.len() == 1 {
+        let k: usize = entries[0]
+            .parse()
+            .map_err(|err| format!("invalid tensor k '{}': {err}", entries[0]))?;
+        return Ok((vec![k; cols.len()], false));
+    }
+    if entries.len() != cols.len() {
+        return Err(format!(
+            "tensor k list length {} must match smooth dimension {}",
+            entries.len(),
+            cols.len()
+        ));
+    }
+    let mut out = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let k: usize = entry
+            .parse()
+            .map_err(|err| format!("invalid tensor k '{entry}': {err}"))?;
+        out.push(k);
+    }
+    Ok((out, false))
+}
+
+/// Parse the `identifiability=` option for tensor-product smooths. Mirrors the
+/// vocabulary of the Matern/Duchon parsers so the formula DSL is consistent.
+fn parse_tensor_identifiability(
+    options: &BTreeMap<String, String>,
+) -> Result<TensorBSplineIdentifiability, String> {
+    let Some(raw) = options.get("identifiability").map(String::as_str) else {
+        return Ok(TensorBSplineIdentifiability::default());
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "none" => Ok(TensorBSplineIdentifiability::None),
+        "sum_tozero" | "sum-to-zero" | "center_sum_tozero" | "center-sum-to-zero" | "centered"
+        | "sumtozero" => Ok(TensorBSplineIdentifiability::SumToZero),
+        other => Err(TermBuilderError::unsupported_feature(format!(
+            "invalid tensor identifiability '{other}'; expected one of: none, sum_tozero"
+        ))
+        .to_string()),
+    }
 }
 
 fn bspline_boundary_declares_periodic_axis(options: &BTreeMap<String, String>) -> bool {
@@ -1520,6 +1654,144 @@ pub fn build_smooth_basis(
                     },
                 },
                 input_scales: None,
+            })
+        }
+        "tensor" | "te" | "ti" | "t2" => {
+            validate_known_options(
+                "tensor",
+                options,
+                &[
+                    "type",
+                    "bs",
+                    "by",
+                    "k",
+                    "basis_dim",
+                    "basis-dim",
+                    "basisdim",
+                    "degree",
+                    "penalty_order",
+                    "double_penalty",
+                    "periodic",
+                    "cyclic",
+                    "period",
+                    "periods",
+                    "period_start",
+                    "period_end",
+                    "origin",
+                    "origins",
+                    "period_origin",
+                    "period-origin",
+                    "domain_origin",
+                    "boundary",
+                    "bc",
+                    "identifiability",
+                    "id",
+                    "__by_col",
+                ],
+            )?;
+            if cols.len() < 2 {
+                return Err(TermBuilderError::incompatible_config(format!(
+                    "tensor smooth expects at least 2 variables, got {}",
+                    cols.len()
+                ))
+                .to_string());
+            }
+            let dim = cols.len();
+            let periodic_axes = parse_tensor_periodic_axes(options, dim)?;
+            let periods_opt = parse_periods(options, &periodic_axes)?;
+            let origins_opt = parse_period_origins(options, &periodic_axes)?;
+            let degree = option_usize(options, "degree").unwrap_or(3);
+            let penalty_order =
+                option_usize(options, "penalty_order").unwrap_or(if degree > 1 { 2 } else { 1 });
+            let (mut k_list, k_inferred) = parse_tensor_k_list(options, cols, ds)?;
+            if ds.values.nrows() <= 32 && smooth_coordinate_count >= 5 {
+                for k in &mut k_list {
+                    *k = (*k).min(degree + 2);
+                }
+            }
+            if k_inferred {
+                inference_notes.push(format!(
+                    "Automatically set per-margin basis sizes {:?} for tensor smooth '{}' \
+                     (unique/4 rule per column, clamped to [4, cbrt(unique).max(20)]). \
+                     Override with k=<int> or k=[k0,k1,...].",
+                    k_list,
+                    vars.join(",")
+                ));
+            }
+            let mut margins: Vec<BSplineBasisSpec> = Vec::with_capacity(dim);
+            let mut emitted_periods: Vec<Option<f64>> = Vec::with_capacity(dim);
+            for axis in 0..dim {
+                let c = cols[axis];
+                let (data_min, data_max) = col_minmax(ds.values.column(c))?;
+                let k_axis = k_list[axis];
+                let min_k = degree + 1;
+                if k_axis < min_k {
+                    return Err(TermBuilderError::invalid_option(format!(
+                        "tensor smooth: k[{axis}]={k_axis} too small for degree {degree}; expected k >= {min_k}"
+                    ))
+                    .to_string());
+                }
+                let (knotspec, boundary, axis_period) = if periodic_axes[axis] {
+                    let period_value = periods_opt[axis].ok_or_else(|| {
+                        format!(
+                            "tensor smooth axis {axis} is periodic but no period was supplied; \
+                             pass period=<value> (scalar) or period=[..., <value>, ...]"
+                        )
+                    })?;
+                    if !period_value.is_finite() || period_value <= 0.0 {
+                        return Err(format!(
+                            "tensor smooth axis {axis}: period must be a positive finite value, got {period_value}"
+                        ));
+                    }
+                    let domain_start = origins_opt[axis].unwrap_or(data_min);
+                    let domain_end = domain_start + period_value;
+                    (
+                        BSplineKnotSpec::PeriodicUniform {
+                            data_range: (domain_start, domain_end),
+                            num_basis: k_axis,
+                        },
+                        OneDimensionalBoundary::Cyclic {
+                            start: domain_start,
+                            end: domain_end,
+                        },
+                        Some(period_value),
+                    )
+                } else {
+                    let num_internal_knots = k_axis.saturating_sub(degree + 1).max(1);
+                    (
+                        BSplineKnotSpec::Generate {
+                            data_range: (data_min, data_max),
+                            num_internal_knots,
+                        },
+                        OneDimensionalBoundary::Open,
+                        None,
+                    )
+                };
+                margins.push(BSplineBasisSpec {
+                    degree,
+                    penalty_order,
+                    knotspec,
+                    double_penalty: false,
+                    identifiability: BSplineIdentifiability::None,
+                    boundary,
+                    boundary_conditions: BSplineBoundaryConditions::default(),
+                });
+                emitted_periods.push(axis_period);
+            }
+            let any_periodic = emitted_periods.iter().any(|p| p.is_some());
+            let periods_vec = if any_periodic {
+                emitted_periods
+            } else {
+                Vec::new()
+            };
+            Ok(SmoothBasisSpec::TensorBSpline {
+                feature_cols: cols.to_vec(),
+                spec: TensorBSplineSpec {
+                    marginalspecs: margins,
+                    periods: periods_vec,
+                    double_penalty: smooth_double_penalty,
+                    identifiability: parse_tensor_identifiability(options)?,
+                },
             })
         }
         "pca" => {
