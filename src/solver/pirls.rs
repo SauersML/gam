@@ -4874,6 +4874,7 @@ where
         // Fisher-fallback (different problem, restart the LM trajectory).
         let mut madsen_reject_factor = 2.0_f64;
         let mut pending_arrow_latent_restore: Option<Array1<f64>> = None;
+        let mut pending_arrow_predicted_reduction: Option<f64> = None;
 
         // Copy the hessian into the reusable buffer (avoids allocation after first iteration).
         let mut regularized =
@@ -4888,6 +4889,7 @@ where
         let mut sparse_applied_lambda = 0.0_f64;
         loop {
             restore_pending_arrow_latent_if_needed(options, &mut pending_arrow_latent_restore);
+            pending_arrow_predicted_reduction = None;
             attempts += 1;
             lm_attempts_done += 1;
             let attempt_solve_start = std::time::Instant::now();
