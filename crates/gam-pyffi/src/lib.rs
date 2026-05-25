@@ -13868,8 +13868,8 @@ impl ARDPenalty {
         let payload = PyDict::new(py);
         payload.set_item("kind", Self::KIND_TAG)?;
         payload.set_item("target", target_descriptor(py, self.target.bind(py))?)?;
-        if let Some(schedule) = &self.weight_schedule {
-            payload.set_item("weight_schedule", schedule.bind(py))?;
+        if let Some(schedule) = topk_weight_schedule_descriptor(py, &self.weight_schedule)? {
+            payload.set_item("weight_schedule", schedule)?;
         }
         Ok(payload.into())
     }
