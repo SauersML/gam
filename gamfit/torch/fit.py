@@ -316,9 +316,30 @@ def _build_design_penalty(
             "and Smooth subclass are inconsistent"
         )
 
-    # Defensive raise: the Rust dispatch already rejected unsupported and
-    # unknown specs above. Reaching here means the Rust enumeration grew a new
-    # variant without a matching torch branch, so raise to make the gap visible.
+    # Recognised-but-not-yet-wired entries: the Rust dispatch registers every
+    # `gamfit.torch`-exported Smooth subclass (single source of truth), but
+    # the tensor design/penalty backend for these kinds is not yet bound on
+    # the torch path. Raise the same NotImplementedError-shape the previous
+    # Python cascade used so callers see a consistent message.
+    unwired_entries = {
+        "tensor_bspline": "TensorBSpline",
+        "matern": "Matern",
+        "categorical": "Categorical",
+    }
+    if entry in unwired_entries:
+        kind_name = unwired_entries[entry]
+        raise NotImplementedError(
+            f"{kind_name} is recognised by the torch dispatch but its "
+            "design/penalty tensor backend is not yet wired into "
+            "gamfit.torch.fit; needs a Rust PyO3 binding for the underlying "
+            "basis + penalty. Currently supported on the torch path: "
+            "Duchon (any d for basis; d=1 for penalty), BSpline (d=1), "
+            "Sphere (S²), PeriodicSplineCurve, Pca."
+        )
+
+    # Defensive raise: the Rust dispatch already rejected unknown specs
+    # above. Reaching here means the Rust enumeration grew a new variant
+    # without a matching torch branch, so raise to make the gap visible.
     raise NotImplementedError(
         f"torch fit dispatch returned {entry!r} but no matching branch is "
         f"wired for {type(smooth).__name__}"
