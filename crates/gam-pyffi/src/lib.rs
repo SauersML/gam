@@ -8055,11 +8055,64 @@ fn sae_manifold_fit<'py>(
     gumbel_schedule: Option<&Bound<'py, PyDict>>,
     analytic_penalties: Option<String>,
 ) -> PyResult<Py<PyDict>> {
+    sae_manifold_fit_inner(
+        py,
+        z.as_array(),
+        &atom_basis,
+        atom_dim,
+        basis_values.as_array(),
+        basis_jacobian.as_array(),
+        basis_sizes,
+        decoder_coefficients.as_array(),
+        smooth_penalties.as_array(),
+        initial_logits.as_array(),
+        initial_coords.as_array(),
+        alpha,
+        tau,
+        learnable_alpha,
+        assignment_kind,
+        sparsity_strength,
+        smoothness,
+        lambda_grid,
+        max_iter,
+        learning_rate,
+        ridge_ext_coord,
+        ridge_beta,
+        gumbel_schedule,
+        analytic_penalties,
+    )
+}
+
+fn sae_manifold_fit_inner<'py>(
+    py: Python<'py>,
+    z_view: ArrayView2<'_, f64>,
+    atom_basis: &[String],
+    atom_dim: Vec<usize>,
+    basis_values: ArrayView3<'_, f64>,
+    basis_jacobian: ArrayView4<'_, f64>,
+    basis_sizes: Vec<usize>,
+    decoder_coefficients: ArrayView3<'_, f64>,
+    smooth_penalties: ArrayView3<'_, f64>,
+    initial_logits: ArrayView2<'_, f64>,
+    initial_coords: ArrayView3<'_, f64>,
+    alpha: f64,
+    tau: f64,
+    learnable_alpha: bool,
+    assignment_kind: String,
+    sparsity_strength: f64,
+    smoothness: f64,
+    lambda_grid: Option<Vec<f64>>,
+    max_iter: usize,
+    learning_rate: f64,
+    ridge_ext_coord: f64,
+    ridge_beta: f64,
+    gumbel_schedule: Option<&Bound<'py, PyDict>>,
+    analytic_penalties: Option<String>,
+) -> PyResult<Py<PyDict>> {
     let analytic_penalties: Option<serde_json::Value> = match analytic_penalties {
         Some(s) => Some(serde_json::from_str(&s).map_err(|e| py_value_error(e.to_string()))?),
         None => None,
     };
-    let z_view = z.as_array();
     let (n_obs, p_out) = z_view.dim();
     if n_obs == 0 || p_out == 0 {
         return Err(py_value_error(
@@ -8090,10 +8143,10 @@ fn sae_manifold_fit<'py>(
             "sae_manifold_fit requires max_iter >= 1; got {max_iter}"
         )));
     }
-    if initial_logits.as_array().dim() != (n_obs, k_atoms) {
+    if initial_logits.dim() != (n_obs, k_atoms) {
         return Err(py_value_error(format!(
             "initial_logits must be ({n_obs}, {k_atoms}); got {:?}",
-            initial_logits.as_array().dim()
+            initial_logits.dim()
         )));
     }
     for (name, value) in [
@@ -8130,35 +8183,35 @@ fn sae_manifold_fit<'py>(
         None => vec![smoothness],
     };
 
-    let basis_values_shape = basis_values.as_array().shape().to_vec();
+    let basis_values_shape = basis_values.shape().to_vec();
     if basis_values_shape[0] != k_atoms || basis_values_shape[1] != n_obs {
         return Err(py_value_error(format!(
             "basis_values must start with (K, N)=({k_atoms}, {n_obs}); got {:?}",
             basis_values_shape
         )));
     }
-    let basis_jacobian_shape = basis_jacobian.as_array().shape().to_vec();
+    let basis_jacobian_shape = basis_jacobian.shape().to_vec();
     if basis_jacobian_shape[0] != k_atoms || basis_jacobian_shape[1] != n_obs {
         return Err(py_value_error(format!(
             "basis_jacobian must start with (K, N)=({k_atoms}, {n_obs}); got {:?}",
             basis_jacobian_shape
         )));
     }
-    let decoder_shape = decoder_coefficients.as_array().shape().to_vec();
+    let decoder_shape = decoder_coefficients.shape().to_vec();
     if decoder_shape[0] != k_atoms || decoder_shape[2] != p_out {
         return Err(py_value_error(format!(
             "decoder_coefficients must have shape (K, M_max, p)=({k_atoms}, M_max, {p_out}); got {:?}",
             decoder_shape
         )));
     }
-    let smooth_shape = smooth_penalties.as_array().shape().to_vec();
+    let smooth_shape = smooth_penalties.shape().to_vec();
     if smooth_shape[0] != k_atoms || smooth_shape[1] != smooth_shape[2] {
         return Err(py_value_error(format!(
             "smooth_penalties must have shape (K, M_max, M_max); got {:?}",
             smooth_shape
         )));
     }
-    let coords_view = initial_coords.as_array();
+    let coords_view = initial_coords;
     let coords_shape = coords_view.shape().to_vec();
     if coords_shape[0] != k_atoms || coords_shape[1] != n_obs {
         return Err(py_value_error(format!(
@@ -8215,8 +8268,8 @@ fn sae_manifold_fit<'py>(
         &basis_sizes,
         &atom_dim,
         &coord_blocks,
-        basis_values.as_array(),
-        basis_jacobian.as_array(),
+        basis_values,
+        basis_jacobian,
         n_obs,
     )
     .map_err(py_value_error)?;
@@ -8224,13 +8277,13 @@ fn sae_manifold_fit<'py>(
         n_obs,
         p_out,
         &basis_kinds,
-        basis_values.as_array(),
-        basis_jacobian.as_array(),
+        basis_values,
+        basis_jacobian,
         &basis_sizes,
         &atom_dim,
-        decoder_coefficients.as_array(),
-        smooth_penalties.as_array(),
-        initial_logits.as_array(),
+        decoder_coefficients,
+        smooth_penalties,
+        initial_logits,
         &coord_blocks,
         mode,
         &evaluators,
@@ -8437,6 +8490,697 @@ fn sae_manifold_fit_ibp<'py>(
         gumbel_schedule,
         analytic_penalties,
     )
+}
+
+/// Per-atom basis spec used by [`sae_manifold_build_inputs`] to assemble the
+/// padded `(K, N, M_max)` design plus jacobian, smoothness penalty stack, and
+/// per-atom `basis_sizes`. The Python wrapper passes only `(z, atom_basis,
+/// atom_dim)`; this Rust helper picks `n_harmonics` for periodic atoms and
+/// samples Duchon centers deterministically from the PCA seed.
+#[derive(Debug, Clone)]
+struct SaeAtomBuildPlan {
+    kind: SaeAtomBasisKind,
+    latent_dim: usize,
+    n_harmonics: usize,
+    duchon_centers: Option<Array2<f64>>,
+    basis_size: usize,
+}
+
+fn sae_atom_basis_size(plan: &SaeAtomBuildPlan) -> usize {
+    plan.basis_size
+}
+
+/// PCA seed: returns coords with shape `(k_atoms, n_obs, d_max)`. For periodic
+/// atoms, column 0 is `atan2(Z·v2, Z·v1) / (2π)` (per-atom v2 picked from PCs)
+/// and remaining columns are min-max normalized projections onto subsequent
+/// PCs. For non-periodic atoms, the first `d_k` columns are min-max normalized
+/// `U·diag(s)` from the thin SVD of the centered response.
+fn sae_pca_seed_initial_coords(
+    z: ArrayView2<'_, f64>,
+    basis_kinds: &[SaeAtomBasisKind],
+    atom_dim: &[usize],
+) -> Result<Array3<f64>, String> {
+    let k_atoms = basis_kinds.len();
+    let (n_obs, _p_out) = z.dim();
+    let d_max = atom_dim.iter().copied().max().unwrap_or(1).max(1);
+    let mut out = Array3::<f64>::zeros((k_atoms, n_obs, d_max));
+    if n_obs == 0 {
+        return Ok(out);
+    }
+    let mut col_means = Array1::<f64>::zeros(z.ncols());
+    for col in 0..z.ncols() {
+        let mut acc = 0.0_f64;
+        for row in 0..n_obs {
+            acc += z[[row, col]];
+        }
+        col_means[col] = acc / n_obs as f64;
+    }
+    let mut centered = z.to_owned();
+    for row in 0..n_obs {
+        for col in 0..z.ncols() {
+            centered[[row, col]] -= col_means[col];
+        }
+    }
+    use gam::faer_ndarray::FaerSvd;
+    let (u_opt, s_vals, vt_opt) = centered
+        .svd(true, true)
+        .map_err(|err| format!("sae_pca_seed: SVD failed: {err:?}"))?;
+    let u = u_opt
+        .ok_or_else(|| "sae_pca_seed: SVD returned no U".to_string())?;
+    let vt = vt_opt
+        .ok_or_else(|| "sae_pca_seed: SVD returned no Vt".to_string())?;
+    let vt_rows = vt.nrows();
+    let u_cols = u.ncols();
+    let two_pi = std::f64::consts::TAU;
+    for atom_idx in 0..k_atoms {
+        let d = atom_dim[atom_idx];
+        if d == 0 {
+            continue;
+        }
+        match &basis_kinds[atom_idx] {
+            SaeAtomBasisKind::Periodic => {
+                if vt_rows >= 2 {
+                    let pc1 = vt.row(0);
+                    let pc2_row = if atom_idx == 0 {
+                        1
+                    } else {
+                        1 + atom_idx % vt_rows.saturating_sub(1).max(1)
+                    };
+                    let pc2 = vt.row(pc2_row.min(vt_rows - 1));
+                    for row in 0..n_obs {
+                        let mut a = 0.0_f64;
+                        let mut b = 0.0_f64;
+                        for col in 0..centered.ncols() {
+                            a += centered[[row, col]] * pc1[col];
+                            b += centered[[row, col]] * pc2[col];
+                        }
+                        out[[atom_idx, row, 0]] = b.atan2(a) / two_pi;
+                    }
+                }
+                for axis in 1..d {
+                    if axis >= vt_rows {
+                        break;
+                    }
+                    let pc = vt.row(axis);
+                    let mut proj = Array1::<f64>::zeros(n_obs);
+                    for row in 0..n_obs {
+                        let mut acc = 0.0_f64;
+                        for col in 0..centered.ncols() {
+                            acc += centered[[row, col]] * pc[col];
+                        }
+                        proj[row] = acc;
+                    }
+                    let (min_v, max_v) = proj.iter().fold(
+                        (f64::INFINITY, f64::NEG_INFINITY),
+                        |(lo, hi), &v| (lo.min(v), hi.max(v)),
+                    );
+                    let span = max_v - min_v;
+                    if span > 0.0 {
+                        for row in 0..n_obs {
+                            out[[atom_idx, row, axis]] = (proj[row] - min_v) / span - 0.5;
+                        }
+                    }
+                }
+            }
+            _ => {
+                let k_cols = d.min(u_cols).min(s_vals.len());
+                let mut tmp = Array2::<f64>::zeros((n_obs, d));
+                for col in 0..k_cols {
+                    let s_col = s_vals[col];
+                    for row in 0..n_obs {
+                        tmp[[row, col]] = u[[row, col]] * s_col;
+                    }
+                }
+                for col in 0..d {
+                    let mut min_v = f64::INFINITY;
+                    let mut max_v = f64::NEG_INFINITY;
+                    for row in 0..n_obs {
+                        let v = tmp[[row, col]];
+                        if v < min_v {
+                            min_v = v;
+                        }
+                        if v > max_v {
+                            max_v = v;
+                        }
+                    }
+                    let span = max_v - min_v;
+                    if span > 0.0 {
+                        for row in 0..n_obs {
+                            out[[atom_idx, row, col]] = (tmp[[row, col]] - min_v) / span - 0.5;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Build (phi, jet, penalty) for a periodic 1-D atom — same math as
+/// `periodic_basis_with_jet`, but plain Rust so the helper can be reused by
+/// [`sae_manifold_build_inputs`] without Python in the loop.
+fn sae_build_periodic_atom(
+    t: ArrayView1<'_, f64>,
+    n_harmonics: usize,
+) -> Result<(Array2<f64>, Array3<f64>, Array2<f64>), String> {
+    if t.iter().any(|value| !value.is_finite()) {
+        return Err("sae_build_periodic_atom: t has non-finite entries".into());
+    }
+    let n_rows = t.len();
+    let n_cols = 1 + 2 * n_harmonics;
+    let mut phi = Array2::<f64>::zeros((n_rows, n_cols));
+    let mut jet = Array3::<f64>::zeros((n_rows, n_cols, 1));
+    let mut penalty = Array2::<f64>::zeros((n_cols, n_cols));
+    phi.column_mut(0).fill(1.0);
+    penalty[[0, 0]] = 1.0e-8;
+    for h in 1..=n_harmonics {
+        let h_f = h as f64;
+        let frequency = std::f64::consts::TAU * h_f;
+        let sin_col = 1 + 2 * (h - 1);
+        let cos_col = sin_col + 1;
+        let harmonic_penalty = h_f * h_f * h_f * h_f;
+        penalty[[sin_col, sin_col]] = harmonic_penalty;
+        penalty[[cos_col, cos_col]] = harmonic_penalty;
+        for row in 0..n_rows {
+            let angle = frequency * t[row];
+            let sin_value = angle.sin();
+            let cos_value = angle.cos();
+            phi[[row, sin_col]] = sin_value;
+            phi[[row, cos_col]] = cos_value;
+            jet[[row, sin_col, 0]] = frequency * cos_value;
+            jet[[row, cos_col, 0]] = -frequency * sin_value;
+        }
+    }
+    Ok((phi, jet, penalty))
+}
+
+/// Build (phi, jet, penalty) for a Duchon atom. Mirrors the pure-Rust path
+/// inside `duchon_basis_with_jet` but accepts in-Rust types and returns
+/// owned `(Array2, Array3, Array2)`.
+fn sae_build_duchon_atom(
+    pts: ArrayView2<'_, f64>,
+    centers: ArrayView2<'_, f64>,
+) -> Result<(Array2<f64>, Array3<f64>, Array2<f64>), String> {
+    let m: usize = 2;
+    let requested_nullspace = duchon_nullspace_from_m(m);
+    let spec = DuchonBasisSpec {
+        center_strategy: CenterStrategy::UserProvided(centers.to_owned()),
+        length_scale: None,
+        power: 0.0,
+        nullspace_order: requested_nullspace,
+        identifiability: SpatialIdentifiability::None,
+        aniso_log_scales: None,
+        operator_penalties: Default::default(),
+        periodic: None,
+        boundary: OneDimensionalBoundary::Open,
+    };
+    let built = build_duchon_basis(pts, &spec).map_err(|err| err.to_string())?;
+    let phi = built.design.to_dense();
+    let primary_idx = built
+        .penaltyinfo
+        .iter()
+        .position(|info| matches!(info.source, gam::basis::PenaltySource::Primary))
+        .ok_or_else(|| "sae_build_duchon_atom: primary penalty was not built".to_string())?;
+    let penalty = built.penalties[primary_idx].clone();
+    let effective_nullspace = pyffi_duchon_effective_nullspace_order(centers, requested_nullspace);
+    let radial_transform = pyffi_duchon_kernel_constraint_nullspace(centers, effective_nullspace)
+        .map_err(|err| err.to_string())?;
+    let radial_first = duchon_radial_first_derivative_nd(pts, centers, None, effective_nullspace)
+        .map_err(|err| err.to_string())?;
+    let radial_jet = radial_input_location_jet(pts, centers, radial_first.view())
+        .map_err(|err| err.to_string())?;
+    let poly_jet = duchon_polynomial_first_derivative_nd(pts, effective_nullspace);
+    let n_rows = pts.nrows();
+    let dim = pts.ncols();
+    let n_kernel = radial_transform.ncols();
+    let n_poly = poly_jet.shape()[1];
+    let mut jet = Array3::<f64>::zeros((n_rows, n_kernel + n_poly, dim));
+    for axis in 0..dim {
+        let projected = radial_jet.index_axis(Axis(2), axis).dot(&radial_transform);
+        jet.slice_mut(s![.., ..n_kernel, axis]).assign(&projected);
+    }
+    jet.slice_mut(s![.., n_kernel.., ..]).assign(&poly_jet);
+    if phi.ncols() != jet.shape()[1] {
+        return Err(format!(
+            "sae_build_duchon_atom: phi/jet column mismatch {} vs {}",
+            phi.ncols(),
+            jet.shape()[1]
+        ));
+    }
+    Ok((phi, jet, penalty))
+}
+
+/// Deterministically pick Duchon centers from the PCA-seeded coordinates.
+/// Uses a Lehmer (LCG) walk over `0..n_obs` keyed by `random_state` so the
+/// result is reproducible without a heavy RNG dependency.
+fn sae_pick_duchon_center_indices(n_obs: usize, n_centers: usize, random_state: u64) -> Vec<usize> {
+    let want = n_centers.min(n_obs);
+    if want == 0 || n_obs == 0 {
+        return Vec::new();
+    }
+    if want >= n_obs {
+        return (0..n_obs).collect();
+    }
+    let mut chosen: Vec<usize> = (0..n_obs).collect();
+    let mut state = random_state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    for i in (1..n_obs).rev() {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let j = (state >> 33) as usize % (i + 1);
+        chosen.swap(i, j);
+    }
+    chosen.truncate(want);
+    chosen.sort_unstable();
+    chosen
+}
+
+/// Build the padded `(phi_stack, jet_stack, penalty_stack)` arrays plus
+/// per-atom `basis_sizes` for the given atom plans and seed coords. Returns
+/// `(basis_values, basis_jacobian, smooth_penalties, basis_sizes, coord_blocks)`.
+fn sae_build_padded_basis_stacks(
+    plans: &[SaeAtomBuildPlan],
+    seed_coords: ArrayView3<'_, f64>,
+    n_obs: usize,
+) -> Result<
+    (
+        Array3<f64>,
+        Array4<f64>,
+        Array3<f64>,
+        Vec<usize>,
+        Vec<Array2<f64>>,
+    ),
+    String,
+> {
+    let k_atoms = plans.len();
+    let basis_sizes: Vec<usize> = plans.iter().map(sae_atom_basis_size).collect();
+    let m_max = basis_sizes.iter().copied().max().unwrap_or(1).max(1);
+    let d_max = plans.iter().map(|p| p.latent_dim).max().unwrap_or(1).max(1);
+    let mut phi_stack = Array3::<f64>::zeros((k_atoms, n_obs, m_max));
+    let mut jet_stack = Array4::<f64>::zeros((k_atoms, n_obs, m_max, d_max));
+    let mut penalty_stack = Array3::<f64>::zeros((k_atoms, m_max, m_max));
+    let mut coord_blocks: Vec<Array2<f64>> = Vec::with_capacity(k_atoms);
+    for (atom_idx, plan) in plans.iter().enumerate() {
+        let d = plan.latent_dim;
+        let coords = seed_coords.slice(s![atom_idx, 0..n_obs, 0..d]).to_owned();
+        match &plan.kind {
+            SaeAtomBasisKind::Periodic => {
+                let t = if d >= 1 {
+                    coords.column(0).to_owned()
+                } else {
+                    Array1::<f64>::zeros(n_obs)
+                };
+                let (phi, jet, penalty) = sae_build_periodic_atom(t.view(), plan.n_harmonics)?;
+                let m = phi.ncols();
+                phi_stack
+                    .slice_mut(s![atom_idx, 0..n_obs, 0..m])
+                    .assign(&phi);
+                let jet_d = jet.shape()[2].min(d_max);
+                jet_stack
+                    .slice_mut(s![atom_idx, 0..n_obs, 0..m, 0..jet_d])
+                    .assign(&jet.slice(s![.., .., 0..jet_d]));
+                penalty_stack
+                    .slice_mut(s![atom_idx, 0..m, 0..m])
+                    .assign(&penalty);
+            }
+            _ => {
+                let centers = plan
+                    .duchon_centers
+                    .as_ref()
+                    .ok_or_else(|| {
+                        format!(
+                            "sae_build_padded_basis_stacks: atom {atom_idx} non-periodic atom requires centers"
+                        )
+                    })?;
+                let (phi, jet, penalty) =
+                    sae_build_duchon_atom(coords.view(), centers.view())?;
+                let m = phi.ncols();
+                phi_stack
+                    .slice_mut(s![atom_idx, 0..n_obs, 0..m])
+                    .assign(&phi);
+                let jet_d = jet.shape()[2].min(d_max);
+                jet_stack
+                    .slice_mut(s![atom_idx, 0..n_obs, 0..m, 0..jet_d])
+                    .assign(&jet.slice(s![.., .., 0..jet_d]));
+                penalty_stack
+                    .slice_mut(s![atom_idx, 0..m, 0..m])
+                    .assign(&penalty);
+            }
+        }
+        coord_blocks.push(coords);
+    }
+    Ok((phi_stack, jet_stack, penalty_stack, basis_sizes, coord_blocks))
+}
+
+/// Build [`SaeAtomBuildPlan`]s from `(z, atom_basis, atom_dim)` + per-atom
+/// PCA seed. Periodic atoms get `n_harmonics = max(1, d_atom)`; Duchon atoms
+/// get deterministic center indices from the PCA seed.
+fn sae_build_atom_plans(
+    z: ArrayView2<'_, f64>,
+    atom_basis: &[String],
+    atom_dim: &[usize],
+    seed_coords: ArrayView3<'_, f64>,
+    random_state: u64,
+) -> Result<Vec<SaeAtomBuildPlan>, String> {
+    let k_atoms = atom_basis.len();
+    let n_obs = z.nrows();
+    let mut plans: Vec<SaeAtomBuildPlan> = Vec::with_capacity(k_atoms);
+    for atom_idx in 0..k_atoms {
+        let kind = sae_atom_basis_kind_from_str(&atom_basis[atom_idx]);
+        let d = atom_dim[atom_idx];
+        match kind {
+            SaeAtomBasisKind::Periodic => {
+                let n_harmonics = d.max(1);
+                let basis_size = 1 + 2 * n_harmonics;
+                plans.push(SaeAtomBuildPlan {
+                    kind: SaeAtomBasisKind::Periodic,
+                    latent_dim: d,
+                    n_harmonics,
+                    duchon_centers: None,
+                    basis_size,
+                });
+            }
+            _ => {
+                let n_centers = n_obs.min(32).max(8.min(n_obs));
+                let idx = sae_pick_duchon_center_indices(
+                    n_obs,
+                    n_centers,
+                    random_state.wrapping_add(atom_idx as u64),
+                );
+                let d_local = d.max(1);
+                let mut centers = Array2::<f64>::zeros((idx.len(), d_local));
+                for (out_row, src_row) in idx.iter().copied().enumerate() {
+                    for col in 0..d_local {
+                        centers[[out_row, col]] = seed_coords[[atom_idx, src_row, col]];
+                    }
+                }
+                // Probe one Duchon build to learn the final basis size.
+                let probe_pts = Array2::<f64>::zeros((1, d_local));
+                let (phi, _jet, _penalty) =
+                    sae_build_duchon_atom(probe_pts.view(), centers.view())?;
+                let basis_size = phi.ncols();
+                plans.push(SaeAtomBuildPlan {
+                    kind: kind.clone(),
+                    latent_dim: d,
+                    n_harmonics: 0,
+                    duchon_centers: Some(centers),
+                    basis_size,
+                });
+            }
+        }
+    }
+    Ok(plans)
+}
+
+/// One-shot SAE-manifold fit driver: takes only `(z, atom_basis, atom_dim,
+/// ...scalar hyperparams)` and assembles the full basis + jacobian + penalty
+/// stack + PCA seed coords + zero-init decoder + zero-init logits internally
+/// before delegating to the same end-to-end Rust Newton loop as
+/// [`sae_manifold_fit`]. Returns the same payload dict with one extra key,
+/// `"atom_plans"`, holding the per-atom basis spec so OOS prediction can
+/// rebuild the design without going through Python.
+#[pyfunction(signature = (
+    z,
+    atom_basis,
+    atom_dim,
+    alpha,
+    tau,
+    learnable_alpha,
+    assignment_kind,
+    sparsity_strength = 1.0,
+    smoothness = 1.0,
+    lambda_grid = None,
+    max_iter = 50,
+    learning_rate = 0.05,
+    ridge_ext_coord = 1.0e-6,
+    ridge_beta = 1.0e-6,
+    gumbel_schedule = None,
+    analytic_penalties = None,
+    random_state = 0,
+))]
+fn sae_manifold_fit_auto<'py>(
+    py: Python<'py>,
+    z: PyReadonlyArray2<'py, f64>,
+    atom_basis: Vec<String>,
+    atom_dim: Vec<usize>,
+    alpha: f64,
+    tau: f64,
+    learnable_alpha: bool,
+    assignment_kind: String,
+    sparsity_strength: f64,
+    smoothness: f64,
+    lambda_grid: Option<Vec<f64>>,
+    max_iter: usize,
+    learning_rate: f64,
+    ridge_ext_coord: f64,
+    ridge_beta: f64,
+    gumbel_schedule: Option<&Bound<'py, PyDict>>,
+    analytic_penalties: Option<String>,
+    random_state: u64,
+) -> PyResult<Py<PyDict>> {
+    let z_view = z.as_array();
+    let (n_obs, _p_out) = z_view.dim();
+    let k_atoms = atom_basis.len();
+    if atom_dim.len() != k_atoms {
+        return Err(py_value_error(format!(
+            "sae_manifold_fit_auto: atom_dim length {} must equal atom_basis length {k_atoms}",
+            atom_dim.len()
+        )));
+    }
+    let basis_kinds: Vec<SaeAtomBasisKind> = atom_basis
+        .iter()
+        .map(|kind| sae_atom_basis_kind_from_str(kind))
+        .collect();
+    let seed_coords =
+        sae_pca_seed_initial_coords(z_view, &basis_kinds, &atom_dim).map_err(py_value_error)?;
+    let plans = sae_build_atom_plans(
+        z_view,
+        &atom_basis,
+        &atom_dim,
+        seed_coords.view(),
+        random_state,
+    )
+    .map_err(py_value_error)?;
+    let (basis_values, basis_jacobian, smooth_penalties, basis_sizes, _coord_blocks) =
+        sae_build_padded_basis_stacks(&plans, seed_coords.view(), n_obs)
+            .map_err(py_value_error)?;
+    let m_max = basis_sizes.iter().copied().max().unwrap_or(1).max(1);
+    let p_out = z_view.ncols();
+    let decoder_coefficients = Array3::<f64>::zeros((k_atoms, m_max, p_out));
+    let initial_logits = Array2::<f64>::zeros((n_obs, k_atoms));
+    let result_dict = sae_manifold_fit_inner(
+        py,
+        z_view,
+        &atom_basis,
+        atom_dim.clone(),
+        basis_values.view(),
+        basis_jacobian.view(),
+        basis_sizes.clone(),
+        decoder_coefficients.view(),
+        smooth_penalties.view(),
+        initial_logits.view(),
+        seed_coords.view(),
+        alpha,
+        tau,
+        learnable_alpha,
+        assignment_kind,
+        sparsity_strength,
+        smoothness,
+        lambda_grid,
+        max_iter,
+        learning_rate,
+        ridge_ext_coord,
+        ridge_beta,
+        gumbel_schedule,
+        analytic_penalties,
+    )?;
+    // Attach per-atom build plans so OOS predict can rebuild design without Python.
+    let plans_py = PyList::empty(py);
+    for plan in &plans {
+        let entry = PyDict::new(py);
+        let kind_name: &str = match plan.kind {
+            SaeAtomBasisKind::Periodic => "periodic",
+            SaeAtomBasisKind::Duchon => "duchon",
+            SaeAtomBasisKind::Sphere => "sphere",
+            SaeAtomBasisKind::EuclideanPatch => "euclidean_patch",
+            SaeAtomBasisKind::Precomputed(_) => "precomputed",
+        };
+        entry.set_item("kind", kind_name)?;
+        entry.set_item("latent_dim", plan.latent_dim)?;
+        entry.set_item("n_harmonics", plan.n_harmonics)?;
+        entry.set_item("basis_size", plan.basis_size)?;
+        match &plan.duchon_centers {
+            Some(centers) => {
+                entry.set_item("duchon_centers", centers.clone().into_pyarray(py))?;
+            }
+            None => {
+                entry.set_item("duchon_centers", py.None())?;
+            }
+        }
+        plans_py.append(entry)?;
+    }
+    {
+        let result_bound = result_dict.bind(py);
+        result_bound.set_item("atom_plans", plans_py)?;
+    }
+    Ok(result_dict)
+}
+
+/// Out-of-sample reconstruction: same Newton driver as the fit path, with the
+/// trained decoder blocks held frozen across iterations. `decoder_blocks` is
+/// a per-atom list of `(M_k, p)` arrays; `duchon_centers` is `Some` only for
+/// non-periodic atoms; `n_harmonics_list` is `Some` only for periodic atoms.
+#[pyfunction(signature = (
+    x_new,
+    atom_basis,
+    atom_dim,
+    decoder_blocks,
+    duchon_centers,
+    n_harmonics_list,
+    alpha,
+    tau,
+    assignment_kind,
+    sparsity_strength = 1.0,
+    smoothness = 1.0,
+    max_iter = 50,
+    learning_rate = 0.04,
+    ridge_ext_coord = 1.0e-6,
+    ridge_beta = 1.0e-6,
+    random_state = 0,
+))]
+fn sae_manifold_predict_oos<'py>(
+    py: Python<'py>,
+    x_new: PyReadonlyArray2<'py, f64>,
+    atom_basis: Vec<String>,
+    atom_dim: Vec<usize>,
+    decoder_blocks: Vec<PyReadonlyArray2<'py, f64>>,
+    duchon_centers: Vec<Option<PyReadonlyArray2<'py, f64>>>,
+    n_harmonics_list: Vec<Option<usize>>,
+    alpha: f64,
+    tau: f64,
+    assignment_kind: String,
+    sparsity_strength: f64,
+    smoothness: f64,
+    max_iter: usize,
+    learning_rate: f64,
+    ridge_ext_coord: f64,
+    ridge_beta: f64,
+    random_state: u64,
+) -> PyResult<Py<PyArray2<f64>>> {
+    let x_view = x_new.as_array();
+    let (n_obs, p_out) = x_view.dim();
+    let k_atoms = atom_basis.len();
+    if atom_dim.len() != k_atoms
+        || decoder_blocks.len() != k_atoms
+        || duchon_centers.len() != k_atoms
+        || n_harmonics_list.len() != k_atoms
+    {
+        return Err(py_value_error(format!(
+            "sae_manifold_predict_oos: per-atom metadata lengths must equal K={k_atoms}"
+        )));
+    }
+    let basis_kinds: Vec<SaeAtomBasisKind> = atom_basis
+        .iter()
+        .map(|kind| sae_atom_basis_kind_from_str(kind))
+        .collect();
+    let seed_coords =
+        sae_pca_seed_initial_coords(x_view, &basis_kinds, &atom_dim).map_err(py_value_error)?;
+    let mut plans: Vec<SaeAtomBuildPlan> = Vec::with_capacity(k_atoms);
+    for atom_idx in 0..k_atoms {
+        let kind = basis_kinds[atom_idx].clone();
+        let d = atom_dim[atom_idx];
+        match kind {
+            SaeAtomBasisKind::Periodic => {
+                let n_harmonics = n_harmonics_list[atom_idx].unwrap_or(d.max(1));
+                let basis_size = 1 + 2 * n_harmonics;
+                plans.push(SaeAtomBuildPlan {
+                    kind: SaeAtomBasisKind::Periodic,
+                    latent_dim: d,
+                    n_harmonics,
+                    duchon_centers: None,
+                    basis_size,
+                });
+            }
+            _ => {
+                let centers = duchon_centers[atom_idx]
+                    .as_ref()
+                    .ok_or_else(|| {
+                        py_value_error(format!(
+                            "sae_manifold_predict_oos: atom {atom_idx} (Duchon-like) needs duchon_centers"
+                        ))
+                    })?
+                    .as_array()
+                    .to_owned();
+                let probe_pts = Array2::<f64>::zeros((1, d.max(1)));
+                let (phi, _jet, _penalty) =
+                    sae_build_duchon_atom(probe_pts.view(), centers.view())
+                        .map_err(py_value_error)?;
+                let basis_size = phi.ncols();
+                plans.push(SaeAtomBuildPlan {
+                    kind,
+                    latent_dim: d,
+                    n_harmonics: 0,
+                    duchon_centers: Some(centers),
+                    basis_size,
+                });
+            }
+        }
+    }
+    let (basis_values, basis_jacobian, smooth_penalties, basis_sizes, _coord_blocks) =
+        sae_build_padded_basis_stacks(&plans, seed_coords.view(), n_obs)
+            .map_err(py_value_error)?;
+    let m_max = basis_sizes.iter().copied().max().unwrap_or(1).max(1);
+    // Pad trained decoder blocks into (K, M_max, p)
+    let mut decoder_coefficients = Array3::<f64>::zeros((k_atoms, m_max, p_out));
+    for atom_idx in 0..k_atoms {
+        let block = decoder_blocks[atom_idx].as_array();
+        let m_k = basis_sizes[atom_idx].min(block.nrows());
+        if block.ncols() != p_out {
+            return Err(py_value_error(format!(
+                "sae_manifold_predict_oos: decoder_blocks[{atom_idx}] has p={} but x_new has p={p_out}",
+                block.ncols()
+            )));
+        }
+        decoder_coefficients
+            .slice_mut(s![atom_idx, 0..m_k, 0..p_out])
+            .assign(&block.slice(s![0..m_k, 0..p_out]));
+    }
+    let mut initial_logits = Array2::<f64>::zeros((n_obs, k_atoms));
+    if k_atoms == 1 && assignment_kind == "ibp_map" {
+        for row in 0..n_obs {
+            initial_logits[[row, 0]] = 4.0;
+        }
+    }
+    let result_dict = sae_manifold_fit_inner(
+        py,
+        x_view,
+        &atom_basis,
+        atom_dim,
+        basis_values.view(),
+        basis_jacobian.view(),
+        basis_sizes,
+        decoder_coefficients.view(),
+        smooth_penalties.view(),
+        initial_logits.view(),
+        seed_coords.view(),
+        alpha,
+        tau,
+        false,
+        assignment_kind,
+        sparsity_strength,
+        smoothness,
+        None,
+        max_iter,
+        learning_rate,
+        ridge_ext_coord,
+        ridge_beta,
+        None,
+        None,
+    )?;
+    let bound = result_dict.bind(py);
+    let fitted_any = bound
+        .get_item("fitted")?
+        .ok_or_else(|| py_value_error("sae_manifold_predict_oos: inner fit missing fitted".into()))?;
+    let fitted_arr: Py<PyArray2<f64>> = fitted_any.extract()?;
+    Ok(fitted_arr)
 }
 
 /// Coefficient of determination R^2 = 1 - SSR / SST for a fitted SAE-manifold
@@ -15176,6 +15920,19 @@ fn validate_sparsity_weight(py: Python<'_>, weight: &Bound<'_, PyAny>, name: &st
         "{name}.weight must be 'auto' or a positive float, got {}",
         weight.get_type().name()?
     )))
+}
+
+/// Build a `PyObject` holding the default analytic-penalty target literal `"t"`.
+/// Used as a default-expression sentinel inside `#[pyo3(signature = (...))]` so
+/// the macro-generated default closure produces the correct `PyObject` type
+/// rather than a `&'static str`.
+fn default_target_py() -> PyObject {
+    Python::with_gil(|py| pyo3::types::PyString::new(py, "t").into_any().unbind())
+}
+
+/// Build a `PyObject` containing the default sparsity-weight sentinel `"auto"`.
+fn default_weight_auto_py() -> PyObject {
+    Python::with_gil(|py| pyo3::types::PyString::new(py, "auto").into_any().unbind())
 }
 
 fn target_descriptor(py: Python<'_>, target: &Bound<'_, PyAny>) -> PyResult<PyObject> {
