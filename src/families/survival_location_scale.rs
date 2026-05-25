@@ -2127,6 +2127,9 @@ impl SurvivalLocationScaleFamily {
         let mut d3_q1 = Array1::<f64>::zeros(n);
         let mut d1_qdot1 = Array1::<f64>::zeros(n);
         let mut d2_qdot1 = Array1::<f64>::zeros(n);
+        let mut grad_time_eta_h0 = Array1::<f64>::zeros(n);
+        let mut grad_time_eta_h1 = Array1::<f64>::zeros(n);
+        let mut grad_time_eta_d = Array1::<f64>::zeros(n);
         let mut h_time_h0 = Array1::<f64>::zeros(n);
         let mut h_time_h1 = Array1::<f64>::zeros(n);
         let mut h_time_d = Array1::<f64>::zeros(n);
@@ -2177,6 +2180,9 @@ impl SurvivalLocationScaleFamily {
         let p_d3_q1 = SendPtr(d3_q1.as_mut_ptr());
         let p_d1_qdot1 = SendPtr(d1_qdot1.as_mut_ptr());
         let p_d2_qdot1 = SendPtr(d2_qdot1.as_mut_ptr());
+        let p_grad_time_eta_h0 = SendPtr(grad_time_eta_h0.as_mut_ptr());
+        let p_grad_time_eta_h1 = SendPtr(grad_time_eta_h1.as_mut_ptr());
+        let p_grad_time_eta_d = SendPtr(grad_time_eta_d.as_mut_ptr());
         let p_h_time_h0 = SendPtr(h_time_h0.as_mut_ptr());
         let p_h_time_h1 = SendPtr(h_time_h1.as_mut_ptr());
         let p_h_time_d = SendPtr(h_time_d.as_mut_ptr());
@@ -2214,6 +2220,9 @@ impl SurvivalLocationScaleFamily {
                     p_d3_q1.write(i, row.d3_q1);
                     p_d1_qdot1.write(i, row.d1_qdot1);
                     p_d2_qdot1.write(i, row.d2_qdot1);
+                    p_grad_time_eta_h0.write(i, row.grad_time_eta_h0);
+                    p_grad_time_eta_h1.write(i, row.grad_time_eta_h1);
+                    p_grad_time_eta_d.write(i, row.grad_time_eta_d);
                     p_h_time_h0.write(i, row.h_time_h0);
                     p_h_time_h1.write(i, row.h_time_h1);
                     p_h_time_d.write(i, row.h_time_d);
