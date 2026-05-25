@@ -63,6 +63,7 @@ pub fn init_parallelism() {
 }
 
 pub mod cache;
+pub mod diagnostics;
 pub mod families;
 pub mod geometry;
 pub mod gpu;

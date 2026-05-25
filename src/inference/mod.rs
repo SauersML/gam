@@ -6,6 +6,7 @@ pub mod eta_bands;
 pub mod formula_dsl;
 pub mod generative;
 pub mod hmc;
+pub mod identifiability;
 pub mod model;
 pub mod polya_gamma;
 pub mod posterior;

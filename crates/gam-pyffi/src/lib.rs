@@ -19964,6 +19964,11 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(analytic_penalty_hvp, module)?)?;
     module.add_function(wrap_pyfunction!(equivariant_penalty_value, module)?)?;
     module.add_function(wrap_pyfunction!(riemannian_retract, module)?)?;
+    module.add_function(wrap_pyfunction!(manifold_exp_map, module)?)?;
+    module.add_function(wrap_pyfunction!(manifold_log_map, module)?)?;
+    module.add_function(wrap_pyfunction!(manifold_metric_tensor, module)?)?;
+    module.add_function(wrap_pyfunction!(manifold_dimension, module)?)?;
+    module.add_function(wrap_pyfunction!(manifold_ambient_dimension, module)?)?;
     module.add_function(wrap_pyfunction!(sphere_frechet_mean, module)?)?;
     module.add_function(wrap_pyfunction!(response_geometry_closure, module)?)?;
     module.add_function(wrap_pyfunction!(response_geometry_clr, module)?)?;
@@ -24797,6 +24802,130 @@ fn riemannian_retract<'py>(
         out.row_mut(row).assign(&next);
     }
     Ok(out.into_pyarray(py).unbind())
+}
+
+/// Batched Riemannian exponential map: for each row, return ``exp_p(v)``.
+/// ``points`` has shape ``(N, ambient_dim)`` and ``vecs`` has shape
+/// ``(N, ambient_dim)``. The manifold descriptor is parsed from
+/// ``manifold_json`` using the same schema as :func:`riemannian_retract`.
+#[pyfunction(signature = (manifold_json, points, vecs))]
+fn manifold_exp_map<'py>(
+    py: Python<'py>,
+    manifold_json: &str,
+    points: PyReadonlyArray2<'py, f64>,
+    vecs: PyReadonlyArray2<'py, f64>,
+) -> PyResult<Py<PyArray2<f64>>> {
+    let value: serde_json::Value = serde_json::from_str(manifold_json)
+        .map_err(|err| py_value_error(format!("invalid manifold json: {err}")))?;
+    let kind = parse_manifold_kind(&value).map_err(py_value_error)?;
+    let manifold = kind.build();
+    let p = points.as_array();
+    let v = vecs.as_array();
+    if p.dim() != v.dim() {
+        return Err(py_value_error(format!(
+            "manifold_exp_map: points shape {:?} does not match vecs shape {:?}",
+            p.dim(),
+            v.dim()
+        )));
+    }
+    if p.ncols() != manifold.ambient_dim() {
+        return Err(py_value_error(format!(
+            "manifold_exp_map: points width {} does not match manifold ambient_dim {}",
+            p.ncols(),
+            manifold.ambient_dim()
+        )));
+    }
+    let mut out = Array2::<f64>::zeros(p.dim());
+    for row in 0..p.nrows() {
+        let next = manifold
+            .exp_map(p.row(row), v.row(row))
+            .map_err(|err| py_value_error(err.to_string()))?;
+        out.row_mut(row).assign(&next);
+    }
+    Ok(out.into_pyarray(py).unbind())
+}
+
+/// Batched Riemannian log map: for each row, return ``log_p(q)``.
+#[pyfunction(signature = (manifold_json, p_from, p_to))]
+fn manifold_log_map<'py>(
+    py: Python<'py>,
+    manifold_json: &str,
+    p_from: PyReadonlyArray2<'py, f64>,
+    p_to: PyReadonlyArray2<'py, f64>,
+) -> PyResult<Py<PyArray2<f64>>> {
+    let value: serde_json::Value = serde_json::from_str(manifold_json)
+        .map_err(|err| py_value_error(format!("invalid manifold json: {err}")))?;
+    let kind = parse_manifold_kind(&value).map_err(py_value_error)?;
+    let manifold = kind.build();
+    let p = p_from.as_array();
+    let q = p_to.as_array();
+    if p.dim() != q.dim() {
+        return Err(py_value_error(format!(
+            "manifold_log_map: p_from shape {:?} does not match p_to shape {:?}",
+            p.dim(),
+            q.dim()
+        )));
+    }
+    if p.ncols() != manifold.ambient_dim() {
+        return Err(py_value_error(format!(
+            "manifold_log_map: point width {} does not match manifold ambient_dim {}",
+            p.ncols(),
+            manifold.ambient_dim()
+        )));
+    }
+    let mut out = Array2::<f64>::zeros(p.dim());
+    for row in 0..p.nrows() {
+        let vec = manifold
+            .log_map(p.row(row), q.row(row))
+            .map_err(|err| py_value_error(err.to_string()))?;
+        out.row_mut(row).assign(&vec);
+    }
+    Ok(out.into_pyarray(py).unbind())
+}
+
+/// Metric tensor at a single point: ``(ambient_dim, ambient_dim)`` ndarray.
+#[pyfunction(signature = (manifold_json, point))]
+fn manifold_metric_tensor<'py>(
+    py: Python<'py>,
+    manifold_json: &str,
+    point: PyReadonlyArray1<'py, f64>,
+) -> PyResult<Py<PyArray2<f64>>> {
+    let value: serde_json::Value = serde_json::from_str(manifold_json)
+        .map_err(|err| py_value_error(format!("invalid manifold json: {err}")))?;
+    let kind = parse_manifold_kind(&value).map_err(py_value_error)?;
+    let manifold = kind.build();
+    let p = point.as_array();
+    if p.len() != manifold.ambient_dim() {
+        return Err(py_value_error(format!(
+            "manifold_metric_tensor: point length {} does not match manifold ambient_dim {}",
+            p.len(),
+            manifold.ambient_dim()
+        )));
+    }
+    let g = manifold
+        .metric_tensor(p)
+        .map_err(|err| py_value_error(err.to_string()))?;
+    Ok(g.into_pyarray(py).unbind())
+}
+
+/// Manifold intrinsic dimension parsed from the JSON descriptor.
+#[pyfunction(signature = (manifold_json))]
+fn manifold_dimension(manifold_json: &str) -> PyResult<usize> {
+    let value: serde_json::Value = serde_json::from_str(manifold_json)
+        .map_err(|err| py_value_error(format!("invalid manifold json: {err}")))?;
+    let kind = parse_manifold_kind(&value).map_err(py_value_error)?;
+    let manifold = kind.build();
+    Ok(manifold.dim())
+}
+
+/// Manifold ambient dimension parsed from the JSON descriptor.
+#[pyfunction(signature = (manifold_json))]
+fn manifold_ambient_dimension(manifold_json: &str) -> PyResult<usize> {
+    let value: serde_json::Value = serde_json::from_str(manifold_json)
+        .map_err(|err| py_value_error(format!("invalid manifold json: {err}")))?;
+    let kind = parse_manifold_kind(&value).map_err(py_value_error)?;
+    let manifold = kind.build();
+    Ok(manifold.ambient_dim())
 }
 
 fn parse_fit_config(config_json: Option<&str>) -> Result<FitConfig, String> {

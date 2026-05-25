@@ -26,7 +26,9 @@
 //! standalone to keep the patch surface tight while parallel agents are
 //! editing `analytic_penalties.rs`.
 
-use ndarray::{Array2, ArrayView1, ArrayView2};
+use crate::linalg::faer_ndarray::{FaerEigh, FaerQr, FaerSvd};
+use faer::Side;
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, concatenate, s};
 
 /// Smoothed column-2-norm of the decoder Jacobian.
 ///
@@ -453,5 +455,47 @@ mod tests {
         assert!((out[[1, 0]] - 1.0).abs() < 1e-12);
         assert!((out[[2, 0]] - 2.0).abs() < 1e-12);
         assert!((out[[1, 1]] - 20.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn select_weights_picks_max_evidence() {
+        let rss = array![[10.0, 9.0, 9.5], [8.0, 4.0, 5.0], [9.0, 6.0, 7.0]];
+        let pen = Array2::<f64>::zeros((3, 3));
+        let l1 = Array1::from(vec![0.1, 1.0, 10.0]);
+        let l2 = Array1::from(vec![0.1, 1.0, 10.0]);
+        let res = identifiable_factor_select_weights(
+            rss.view(), pen.view(), l1.view(), l2.view(), 80,
+        )
+        .unwrap();
+        assert_eq!((res.best_i, res.best_j), (1, 1));
+        assert!((res.best_lam1 - 1.0).abs() < 1e-12);
+        assert!((res.best_lam2 - 1.0).abs() < 1e-12);
+        assert!(res.best_evidence.is_finite());
+    }
+
+    #[test]
+    fn select_weights_breaks_ties_by_smallest_log_weight_sum() {
+        let rss = Array2::<f64>::from_elem((2, 2), 4.0);
+        let pen = Array2::<f64>::from_elem((2, 2), 1.0);
+        let l1 = Array1::from(vec![0.1, 10.0]);
+        let l2 = Array1::from(vec![0.1, 10.0]);
+        let res = identifiable_factor_select_weights(
+            rss.view(), pen.view(), l1.view(), l2.view(), 8,
+        )
+        .unwrap();
+        assert_eq!((res.best_i, res.best_j), (0, 0));
+    }
+
+    #[test]
+    fn select_weights_rejects_shape_mismatch() {
+        let rss = Array2::<f64>::zeros((2, 3));
+        let pen = Array2::<f64>::zeros((2, 2));
+        let l1 = Array1::from(vec![1.0, 1.0]);
+        let l2 = Array1::from(vec![1.0, 1.0, 1.0]);
+        let err = identifiable_factor_select_weights(
+            rss.view(), pen.view(), l1.view(), l2.view(), 8,
+        )
+        .unwrap_err();
+        assert!(err.contains("penalty_grid"));
     }
 }
