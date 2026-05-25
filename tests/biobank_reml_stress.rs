@@ -159,6 +159,7 @@ fn duchon_aniso_pc_spec(name: &str, pc_dim: usize, k_centers: usize) -> TermColl
                 input_scales: None,
             },
             shape: ShapeConstraint::None,
+            joint_null_rotation: None,
         }],
     }
 }

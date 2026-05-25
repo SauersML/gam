@@ -90,6 +90,7 @@ fn assert_invalid_pure_duchon_simulated_10d(power: usize, nullspace_order: Ducho
                 input_scales: None,
             },
             shape: ShapeConstraint::None,
+            joint_null_rotation: None,
         }],
     };
 
@@ -171,6 +172,7 @@ fn duchon_fit_term_collection_gaussian_simulated_10dwith_exact_adaptive_regulari
                 input_scales: None,
             },
             shape: ShapeConstraint::None,
+            joint_null_rotation: None,
         }],
     };
 
@@ -296,6 +298,7 @@ fn duchon_2d_aniso_gaussian_fits_successfully() {
                 input_scales: None,
             },
             shape: ShapeConstraint::None,
+            joint_null_rotation: None,
         }],
     };
 
@@ -435,6 +438,7 @@ fn duchon_2d_aniso_binomial_fits_successfully() {
                 input_scales: None,
             },
             shape: ShapeConstraint::None,
+            joint_null_rotation: None,
         }],
     };
 

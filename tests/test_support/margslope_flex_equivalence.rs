@@ -88,6 +88,7 @@ fn age_smooth(feature_col: usize, name: &str) -> SmoothTermSpec {
             },
         },
         shape: ShapeConstraint::None,
+        joint_null_rotation: None,
     }
 }
 
@@ -111,6 +112,7 @@ fn pc16_duchon_smooth(name: &str) -> SmoothTermSpec {
             input_scales: None,
         },
         shape: ShapeConstraint::None,
+        joint_null_rotation: None,
     }
 }
 

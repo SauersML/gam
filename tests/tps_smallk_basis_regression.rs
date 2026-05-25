@@ -253,6 +253,7 @@ fn marginal_tps_spec(num_centers: usize) -> TermCollectionSpec {
                     input_scales: None,
                 },
                 shape: ShapeConstraint::None,
+                joint_null_rotation: None,
             })
             .collect(),
     }

@@ -132,6 +132,7 @@ fn build_problem(n: usize, flex: bool) -> Problem {
             },
         },
         shape: ShapeConstraint::None,
+        joint_null_rotation: None,
     };
     let marginalspec = TermCollectionSpec {
         linear_terms: vec![],

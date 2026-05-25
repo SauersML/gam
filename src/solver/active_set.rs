@@ -359,12 +359,9 @@ pub(crate) fn project_stationarity_residual_on_constraint_cone(
         }
     }
 
-    let projected = residual - &active_a.t().dot(&lambda);
-    if array1_is_finite(&projected) && array1_is_finite(&lambda) {
-        Some((projected, lambda))
-    } else {
-        None
-    }
+    // Exhausting the Lawson-Hanson iterations means we do not have the
+    // normal-cone projection required for a KKT certificate.
+    None
 }
 
 pub(crate) fn feasible_point_for_linear_constraints(
