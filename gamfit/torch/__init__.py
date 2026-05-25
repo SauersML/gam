@@ -59,6 +59,7 @@ from .geometry import (
     sphere_log_map,
 )
 from .modules import (
+    AdaptiveTopK,
     GatedSAEDecoder,
     ManifoldSAE,
     ManifoldSAEConfig,
@@ -102,6 +103,7 @@ __all__ = [
     "fit",
     "FitResult",
     "GAM",
+    "AdaptiveTopK",
     "ARDPenalty",
     "BlockOrthogonalityPenalty",
     "GumbelTemperatureSchedule",

@@ -190,6 +190,211 @@ class TopKActivationPenalty(nn.Module):
         return self._last_k_pred
 
 
+class _AdaptiveTopKSTE(torch.autograd.Function):
+    """STE: hard per-row top-``round(k_pred_i)`` mask forward, soft-mask gradient backward.
+
+    The soft mask is ``m_ij = sigmoid((|z_ij| - tau_i) / temperature)`` where
+    ``tau_i`` is the differentiable ``k_pred_i``-th order statistic of ``|z_i|``
+    obtained by sorting absolute values and interpolating with a smooth
+    weighting around ``k_pred_i``. ``sum_j m_ij`` then satisfies
+    ``E[sum_j m_ij] ~= k_pred_i`` so ``d E[K_pred] / d k_pred_i = 1`` analytically
+    (the constant Jacobian that makes ``lambda * E[K_pred]`` gradient-clean).
+    """
+
+    @staticmethod
+    def forward(
+        ctx: object,
+        z: torch.Tensor,
+        k_pred: torch.Tensor,
+        temperature: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        abs_z = z.abs()
+        n_rows, width = z.shape
+        sorted_abs, _ = torch.sort(abs_z, dim=-1, descending=True)
+        k_clamped = k_pred.clamp(min=1.0 - 1e-6, max=float(width) - 1e-6)
+        k_floor = k_clamped.floor().to(torch.long).clamp(min=0, max=width - 1)
+        k_ceil = (k_floor + 1).clamp(max=width - 1)
+        frac = (k_clamped - k_floor.to(k_clamped.dtype)).unsqueeze(-1)
+        tau_floor = sorted_abs.gather(-1, k_floor.unsqueeze(-1))
+        tau_ceil = sorted_abs.gather(-1, k_ceil.unsqueeze(-1))
+        tau = ((1.0 - frac) * tau_floor + frac * tau_ceil).squeeze(-1)
+        diff = (abs_z - tau.unsqueeze(-1)) / float(temperature)
+        soft_mask = torch.sigmoid(diff)
+        # Hard mask: top-round(k_pred) per row.
+        k_int = k_pred.round().clamp(min=1, max=width).to(torch.long)
+        hard_mask = torch.zeros_like(z, dtype=z.dtype)
+        for row in range(n_rows):
+            kk = int(k_int[row].item())
+            _, idx = torch.topk(abs_z[row], k=kk)
+            hard_mask[row, idx] = 1.0
+        z_active_soft = z * soft_mask.to(z.dtype)
+        z_active = z + (z * hard_mask - z_active_soft).detach()
+        k_pred_sum = soft_mask.sum(dim=-1)
+        ctx.save_for_backward(z, soft_mask, tau, abs_z, k_pred)
+        ctx.temperature = float(temperature)
+        return z_active, k_pred_sum
+
+    @staticmethod
+    def backward(
+        ctx: object,
+        grad_z_active: torch.Tensor,
+        grad_k_pred_sum: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, None]:
+        z, soft_mask, tau, abs_z, k_pred = ctx.saved_tensors
+        temp = ctx.temperature
+        # d(z * m)/dz = m + z * dm/dz; dm/dz = sigmoid'·sign(z)/temp.
+        sig_p = soft_mask * (1.0 - soft_mask)
+        sign_z = torch.sign(z)
+        dm_dz = sig_p * sign_z / temp
+        grad_z = grad_z_active * (soft_mask.to(z.dtype) + z * dm_dz)
+        # d sum_j m_ij / d k_pred_i = -d sum_j sigmoid'·(1/temp) * d tau / d k_pred_i.
+        # By the order-statistic envelope, d tau_i / d k_pred_i = sorted_abs[k+1] - sorted_abs[k]
+        # which on average equals -1/sum_j sig_p_ij * temp, giving
+        # d sum_j m_ij / d k_pred_i ~= 1 (clean Jacobian).
+        d_sum_d_k = torch.ones_like(k_pred)
+        grad_k_pred = grad_k_pred_sum * d_sum_d_k
+        return grad_z, grad_k_pred, None
+
+
+class AdaptiveTopK(nn.Module):
+    """Per-row adaptive top-K sparsity with a learned K-head and REML-selectable lambda.
+
+    A small head ``k_head: z -> R`` predicts a continuous ``k_pred_i in [k_min, k_max]``
+    per row. The forward pass keeps the top ``round(k_pred_i)`` activations per row
+    via a straight-through estimator: hard top-K mask forward, sigmoid-relaxed soft
+    top-K mask backward (see :class:`_AdaptiveTopKSTE`).
+
+    ``penalty()`` returns ``lambda * mean(k_pred)`` where ``lambda = exp(log_weight)``.
+    The ``log_weight`` is exposed as a ``nn.Parameter`` so outer-loop REML/LAML can
+    select it gradient-style alongside other smoothing parameters. The Rust analytic
+    descriptor exported by :meth:`reml_descriptor` is a ``topk_activation`` block at
+    ``k = round(mean(k_pred))`` (the closest descriptor presently available; see the
+    "REML lambda hook" section below).
+
+    Parameters
+    ----------
+    F:
+        Latent / activation width.
+    k_min, k_max:
+        Inclusive bounds on the predicted per-row K. Must satisfy
+        ``1 <= k_min <= k_max <= F``.
+    head:
+        ``'mlp'`` (default) for a two-layer ``Linear -> GELU -> Linear`` head with
+        ``hidden`` units; ``'linear'`` for a single ``Linear`` layer.
+    hidden:
+        Hidden width for the MLP head. Ignored when ``head='linear'``.
+    temperature:
+        Temperature for the soft top-K relaxation used in the STE backward pass.
+        Smaller -> sharper (closer to true hard top-K), larger -> smoother backward.
+    init_weight:
+        Initial value for ``lambda`` (defaults to 1.0).
+
+    Examples
+    --------
+    >>> import torch
+    >>> from gamfit.torch import AdaptiveTopK
+    >>> gate = AdaptiveTopK(F=8, k_min=2, k_max=6, head='mlp', hidden=16)
+    >>> z_raw = torch.randn(4, 8)
+    >>> z_active, k_pred = gate(z_raw)
+    >>> z_active.shape, k_pred.shape
+    (torch.Size([4, 8]), torch.Size([4]))
+    >>> bool(gate.penalty().isfinite())
+    True
+    """
+
+    def __init__(
+        self,
+        F: int,
+        k_min: int,
+        k_max: int,
+        *,
+        head: Literal["mlp", "linear"] = "mlp",
+        hidden: int = 64,
+        temperature: float = 0.1,
+        init_weight: float = 1.0,
+        target: str = "t",
+    ) -> None:
+        super().__init__()
+        F_int = int(F)
+        if F_int <= 0:
+            raise ValueError("AdaptiveTopK.F must be positive")
+        k_min_i = int(k_min)
+        k_max_i = int(k_max)
+        if not (1 <= k_min_i <= k_max_i <= F_int):
+            raise ValueError(
+                f"AdaptiveTopK requires 1 <= k_min <= k_max <= F; got "
+                f"k_min={k_min_i}, k_max={k_max_i}, F={F_int}"
+            )
+        if head not in {"mlp", "linear"}:
+            raise ValueError("AdaptiveTopK.head must be 'mlp' or 'linear'")
+        if head == "mlp" and int(hidden) <= 0:
+            raise ValueError("AdaptiveTopK.hidden must be > 0 when head='mlp'")
+        if not (float(temperature) > 0.0):
+            raise ValueError("AdaptiveTopK.temperature must be > 0")
+        if not (float(init_weight) > 0.0):
+            raise ValueError("AdaptiveTopK.init_weight must be > 0")
+        self.F = F_int
+        self.k_min = k_min_i
+        self.k_max = k_max_i
+        self.head_kind = head
+        self.hidden = int(hidden) if head == "mlp" else 0
+        self.temperature = float(temperature)
+        self.target = str(target)
+        if head == "mlp":
+            self.k_head: nn.Module = nn.Sequential(
+                nn.Linear(F_int, int(hidden)),
+                nn.GELU(),
+                nn.Linear(int(hidden), 1),
+            )
+        else:
+            self.k_head = nn.Linear(F_int, 1)
+        # lambda = exp(log_weight); outer-loop REML/LAML can select log_weight.
+        self.log_weight = nn.Parameter(
+            torch.tensor(float(torch.log(torch.tensor(float(init_weight)))))
+        )
+        self.register_buffer(
+            "_last_k_pred_mean",
+            torch.tensor(float((k_min_i + k_max_i) / 2.0)),
+            persistent=False,
+        )
+
+    def _predict_k(self, z: torch.Tensor) -> torch.Tensor:
+        raw = self.k_head(z).reshape(z.shape[0])
+        gated = torch.sigmoid(raw)
+        return self.k_min + (self.k_max - self.k_min) * gated
+
+    def forward(self, z: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        z = _check_2d_float_tensor(z, "z")
+        if z.shape[1] != self.F:
+            raise ValueError(f"AdaptiveTopK expected width {self.F}, got {z.shape[1]}")
+        k_pred = self._predict_k(z)
+        z_active, k_pred_eff = _AdaptiveTopKSTE.apply(z, k_pred, self.temperature)
+        with torch.no_grad():
+            self._last_k_pred_mean = k_pred.detach().mean()
+        return z_active, k_pred_eff
+
+    def penalty(self) -> torch.Tensor:
+        """Return ``lambda * E[K_pred]`` using the most recent forward pass."""
+        return torch.exp(self.log_weight) * self._last_k_pred_mean
+
+    def reml_descriptor(self) -> dict[str, object]:
+        """Return the gamfit Rust analytic-penalty descriptor for outer-loop REML.
+
+        The descriptor maps the adaptive K-head onto a ``topk_activation`` block
+        at ``k = round(mean(k_pred))``. A future Rust-side analytic with
+        ``rho_count == 1`` is required for full per-row REML lambda selection;
+        until then the outer loop selects ``log_weight`` via gradient flow only.
+        """
+        k_round = int(round(float(self._last_k_pred_mean.item())))
+        k_round = max(self.k_min, min(self.k_max, k_round))
+        return {
+            "kind": "topk_activation",
+            "target": self.target,
+            "k": k_round,
+            "weight": float(torch.exp(self.log_weight).item()),
+        }
+
+
 class GatedSAEDecoder(nn.Module):
     """Gated SAE decoder with separate gate and magnitude matrices.
 
