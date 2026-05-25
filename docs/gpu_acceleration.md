@@ -1,6 +1,6 @@
 # GPU Acceleration
 
-The CUDA path is enabled at compile time with the `cuda` feature and selected at runtime with `Device::Cuda`. CPU remains the default, so existing fits keep the established solver unless the caller explicitly selects CUDA.
+CUDA support is compiled into the crate through the normal `cudarc` dependency and dynamically probes the driver at runtime. Solver-specific CUDA paths are selected with `Device::Cuda`. CPU remains the default, so existing fits keep the established solver unless the caller explicitly selects CUDA.
 
 ```rust
 use gam::solver::gpu::{Device, configure_device};
@@ -8,7 +8,7 @@ use gam::solver::gpu::{Device, configure_device};
 configure_device(Device::Cuda);
 ```
 
-Python callers can pass `device="cuda"` in `PyFitConfig`; `device="cpu"` is the default. The older `gpu` string continues to control policy logging and auto/force/off behavior, while `device` controls the actual solver dispatch.
+Python callers can pass `{"device": "cuda"}` through the `config` dict; `device="cpu"` is the default. The `gpu` config string controls policy logging and auto/force/off behavior, while `device` controls the actual solver dispatch.
 
 ## Accelerated Paths
 
@@ -20,14 +20,13 @@ Python callers can pass `device="cuda"` in `PyFitConfig`; `device="cpu"` is the 
 
 ## Dispatch
 
-The feature gate is additive:
+CUDA is not behind a Cargo feature gate in this crate; `cudarc` is linked with `fallback-dynamic-loading`, and `GpuRuntime::global()` decides at runtime whether a CUDA device is available.
 
 ```toml
-[features]
-cuda = []
+cudarc = { version = "0.19.6", default-features = false, features = ["std", "driver", "runtime", "nvrtc", "cublas", "cublaslt", "cusparse", "cusolver", "cusolvermg", "curand", "nvtx", "cupti", "fallback-dynamic-loading", "cuda-12080"] }
 ```
 
-The runtime switch is:
+The solver runtime switch is:
 
 ```rust
 crate::solver::gpu::configure_device(crate::solver::gpu::Device::Cuda);
@@ -39,7 +38,7 @@ The dense PIRLS path checks `cuda_selected()` before CPU `X'WX` assembly and bef
 
 Host-to-device copies use cudarc pinned allocations and a CUDA stream. The current operations are dependency ordered on one stream because `Ddgmm -> Dgemm -> Dgeam -> Dpotrf -> Dpotrs` is a true data dependency chain. Large biobank inputs amortize transfer cost over `O(N p^2)` GEMM and `O(p^3)` factorization work.
 
-The production solve keeps Hessian assembly, factorization, master weights, and REML traces in `f64` to preserve CPU parity. Mixed precision is reserved for forward-only atom evaluation before the Newton system is assembled; the solver boundary promotes to `f64` before any Cholesky or evidence derivative is evaluated.
+The production solve keeps Hessian assembly, factorization, master weights, and REML traces in `f64` to preserve CPU parity. The GPU dispatch policy currently defaults mixed precision to `Off`, and the solver boundary uses `f64` before any Cholesky or evidence derivative is evaluated.
 
 ## Expected Speedups
 
@@ -59,4 +58,4 @@ Each benchmark builds deterministic biobank-shaped synthetic inputs and reports 
 
 ## Numerical Stability
 
-`tests/gpu_numerical_stability.rs` compares CPU and CUDA outputs across more than 20 deterministic SPD/PIRLS/REML cases. The asserted tolerance is `1e-8` relative-or-absolute for Hessians, directions, log determinants, and REML score components.
+`tests/gpu_numerical_stability.rs` compares CPU and CUDA outputs across more than 20 deterministic SPD/PIRLS/REML cases when CUDA is available. The asserted tolerance is `1e-8` relative-or-absolute for Hessians, directions, log determinants, and REML score components.
