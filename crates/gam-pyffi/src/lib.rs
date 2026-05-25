@@ -24419,7 +24419,15 @@ fn periodic_bspline_basis_dense_via_spec(
             "periodic B-spline domain must be a finite ordered interval; got ({left}, {right})"
         ));
     }
-    let spec = PeriodicBSplineBasisSpec::new(degree, num_basis, period, left, 0);
+    // The FFI returns only the dense basis matrix; the penalty matrix is
+    // not exposed here, so `penalty_order` does not affect the output. Use
+    // 2 (curvature/second-difference) — the same default every internal
+    // call site uses — because `validate_periodic_bspline_spec` rejects
+    // `penalty_order == 0`, which is what we used to pass and which made
+    // every `bspline_basis(..., periodic=True)` call from Python fail with
+    // "Penalty order (0) must be positive and less than the number of
+    // basis functions".
+    let spec = PeriodicBSplineBasisSpec::new(degree, num_basis, period, left, 2);
     build_periodic_bspline_basis_1d(t, &spec)
         .map_err(|err| format!("failed to evaluate periodic B-spline basis: {err}"))
 }
