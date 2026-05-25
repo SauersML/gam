@@ -1279,9 +1279,9 @@ fn latent_survival_basis_direction(primary_idx: usize) -> LatentSurvivalPrimaryD
         // which the internal iteration bounds (`0..LATENT_SURVIVAL_PRIMARY_DIM`)
         // make unreachable.
         // SAFETY: primary_idx is bounded by LATENT_SURVIVAL_PRIMARY_DIM at every internal call site.
-        _ => panic!(
+        _ => std::panic::panic_any(format!(
             "latent survival primary index out of bounds: primary_idx={primary_idx}, primary_dim={LATENT_SURVIVAL_PRIMARY_DIM}"
-        ),
+        )),
     }
 }
 
@@ -1704,7 +1704,7 @@ impl LatentSurvivalFamily {
         slices: &LatentSurvivalJointSlices,
         primary_gradient: &Array1<f64>,
         weight: f64,
-    ) {
+    ) -> Result<(), String> {
         for (primary_idx, time_vec) in [
             (LATENT_SURVIVAL_PRIMARY_Q_ENTRY, self.x_time_entry.row(row)),
             (LATENT_SURVIVAL_PRIMARY_Q_EXIT, self.x_time_exit.row(row)),
@@ -1733,22 +1733,20 @@ impl LatentSurvivalFamily {
                     mean_scale,
                     &mut target.slice_mut(s![slices.mean.clone()]),
                 )
-                .unwrap_or_else(|error| {
-                    // SAFETY: shape contract — `slices.mean`/`target.len()`/
-                    // `x_mean.ncols()` agree by construction; any mismatch
-                    // is caller-side shape drift, surfaced via panic.
-                    panic!(
+                .map_err(|error| {
+                    format!(
                         "latent survival mean gradient pullback dimension mismatch: row={row}, mean_slice={:?}, target_len={}, x_mean_cols={}, error={error}",
                         slices.mean,
                         target.len(),
                         self.x_mean.ncols()
                     )
-                });
+                })?;
         }
 
         if let Some(log_sigma) = &slices.log_sigma {
             target[log_sigma.start] += weight * primary_gradient[LATENT_SURVIVAL_PRIMARY_LOG_SIGMA];
         }
+        Ok(())
     }
 
     fn add_pullback_primary_hessian(
@@ -1757,7 +1755,7 @@ impl LatentSurvivalFamily {
         row: usize,
         slices: &LatentSurvivalJointSlices,
         primary_hessian: &Array2<f64>,
-    ) {
+    ) -> Result<(), String> {
         let time_weights = [
             primary_hessian[[
                 LATENT_SURVIVAL_PRIMARY_Q_ENTRY,
@@ -1817,31 +1815,25 @@ impl LatentSurvivalFamily {
                 mean_weight,
                 target.slice_mut(s![slices.mean.clone(), slices.mean.clone()]),
             )
-            .unwrap_or_else(|error| {
-                // SAFETY: shape contract — `slices.mean` and `target.dim()`
-                // sized to `x_mean.ncols()` at construction. An error
-                // here indicates caller-side shape drift.
-                panic!(
+            .map_err(|error| {
+                format!(
                     "latent survival mean Hessian pullback dimension mismatch: row={row}, mean_slice={:?}, target_dim={:?}, x_mean_cols={}, error={error}",
                     slices.mean,
                     target.dim(),
                     self.x_mean.ncols()
                 )
-            });
+            })?;
 
         let mean_row = self
             .x_mean
             .try_row_chunk(row..row + 1)
-            .unwrap_or_else(|error| {
-                // SAFETY: row index comes from the enclosing `0..n` loop
-                // bound by `self.x_mean.nrows()`, so `row..row+1` is
-                // always a valid single-row chunk.
-                panic!(
+            .map_err(|error| {
+                format!(
                     "latent survival mean pullback row chunk failed: row={row}, x_mean_rows={}, x_mean_cols={}, error={error}",
                     self.x_mean.nrows(),
                     self.x_mean.ncols()
                 )
-            });
+            })?;
         let mean_vec = mean_row.row(0);
         let time_mean_weights = [
             (LATENT_SURVIVAL_PRIMARY_Q_ENTRY, self.x_time_entry.row(row)),
@@ -1916,6 +1908,7 @@ impl LatentSurvivalFamily {
                 }
             }
         }
+        Ok(())
     }
 
     fn evaluate_exact_newton_joint_gradient_dense(
@@ -1971,7 +1964,7 @@ impl LatentSurvivalFamily {
                     &slices,
                     &primary_gradient,
                     wi,
-                );
+                )?;
                 Ok(())
             },
             |total_acc, chunk_acc| {
@@ -1993,7 +1986,7 @@ impl LatentSurvivalFamily {
         time_target: &mut Array2<f64>,
         mean_target: &mut Array2<f64>,
         log_sigma_target: Option<&mut Array2<f64>>,
-    ) {
+    ) -> Result<(), String> {
         let h = primary_hessian;
         // Time block: 3 squared rows + 3 symmetric crosses.
         dense_outer_accumulate(
@@ -2050,16 +2043,13 @@ impl LatentSurvivalFamily {
         let mean_weight = h[[LATENT_SURVIVAL_PRIMARY_MU, LATENT_SURVIVAL_PRIMARY_MU]];
         self.x_mean
             .syr_row_into_view(row, mean_weight, mean_target.view_mut())
-            .unwrap_or_else(|error| {
-                // SAFETY: `mean_target` is sized at construction to match
-                // `x_mean.ncols()`; an error means the caller passed a
-                // mismatched target — a contract violation.
-                panic!(
+            .map_err(|error| {
+                format!(
                     "latent survival mean block-diagonal pullback dimension mismatch: row={row}, mean_target_dim={:?}, x_mean_cols={}, error={error}",
                     mean_target.dim(),
                     self.x_mean.ncols()
                 )
-            });
+            })?;
         // Log-σ block (scalar).
         if let Some(target) = log_sigma_target {
             target[[0, 0]] += h[[
@@ -2067,6 +2057,7 @@ impl LatentSurvivalFamily {
                 LATENT_SURVIVAL_PRIMARY_LOG_SIGMA,
             ]];
         }
+        Ok(())
     }
 
     /// Block-diagonal evaluator used by `evaluate()`. Returns the per-row
