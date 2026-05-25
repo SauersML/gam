@@ -670,8 +670,8 @@ mod tests {
 
     #[test]
     fn distance_matches_textbook_formula_unit_curvature() {
-        let a = array![0.3, 0.1];
-        let b = array![-0.2, 0.4];
+        let a = array![0.3_f64, 0.1];
+        let b = array![-0.2_f64, 0.4];
         let diff_sq: f64 = (0..2).map(|i| (a[i] - b[i]).powi(2)).sum();
         let a_sq: f64 = a.iter().map(|v| v * v).sum();
         let b_sq: f64 = b.iter().map(|v| v * v).sum();

@@ -30,7 +30,7 @@ use std::time::Instant;
 
 // Crate-level imports
 use crate::construction::ReparamInvariant;
-use crate::diagnostics::should_emit_h_min_eig_diag;
+use crate::inference::diagnostics::should_emit_h_min_eig_diag;
 use crate::inference::predict::se_from_covariance;
 use crate::linalg::utils::{
     KahanSum, add_relative_diag_ridge, enforce_symmetry, matrix_inversewith_regularization,

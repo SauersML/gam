@@ -168,7 +168,7 @@ impl PenaltyBlockStructuralNullities {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct PenaltyPseudologdet {
     /// W factor: p × rank, with W W^T = S⁺.
     w_factor: Array2<f64>,
