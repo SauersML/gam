@@ -99,6 +99,7 @@ __all__ = [
 from ._binding import rust_module as _rust_module; BlockSparsityPenalty = _rust_module().BlockSparsityPenalty
 from ._binding import rust_module as _rust_module; IBPAssignmentPenalty = _rust_module().IBPAssignmentPenalty
 from ._binding import rust_module as _rust_module; TotalVariationPenalty = _rust_module().TotalVariationPenalty
+from ._binding import rust_module as _rust_module; SoftmaxAssignmentSparsityPenalty = _rust_module().SoftmaxAssignmentSparsityPenalty
 
 
 class AnalyticPenaltyKind(str, Enum):
@@ -941,47 +942,6 @@ class OrthogonalityPenalty(_AnalyticPenalty):
             "weight": self.weight,
             "n_eff": self.n_eff,
             "learnable": self.learnable,
-        }
-
-
-@dataclass(init=False, slots=True)
-class SoftmaxAssignmentSparsityPenalty(_AnalyticPenalty):
-    KIND_TAG = "softmax_assignment_sparsity"
-    target: TargetSpec
-    k_atoms: int
-    temperature: float = 1.0
-    weight_schedule: ScalarWeightSchedule | dict[str, Any] | None = None
-
-    def __init__(
-        self,
-        k_atoms: int,
-        temperature: float = 1.0,
-        *,
-        target: TargetSpec = "t",
-        weight_schedule: ScalarWeightSchedule | dict[str, Any] | None = None,
-    ) -> None:
-        self.target = target
-        self.k_atoms = int(k_atoms)
-        self.temperature = float(temperature)
-        self.weight_schedule = weight_schedule
-        self.__post_init__()
-
-    def __post_init__(self) -> None:
-        if self.k_atoms <= 0:
-            raise ValueError(
-                "SoftmaxAssignmentSparsityPenalty.k_atoms must be > 0, "
-                f"got {self.k_atoms}"
-            )
-        if self.temperature <= 0.0:
-            raise ValueError(
-                "SoftmaxAssignmentSparsityPenalty.temperature must be > 0, "
-                f"got {self.temperature}"
-            )
-
-    def _payload_extras(self) -> dict[str, Any]:
-        return {
-            "k_atoms": int(self.k_atoms),
-            "temperature": float(self.temperature),
         }
 
 

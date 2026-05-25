@@ -3597,6 +3597,10 @@ impl<K: SpatialKernelEvaluator> ChunkedKernelDesignOperator<K> {
     }
 
     /// Evaluate kernel block for a range of rows: K[rows, :] or K[rows, :] * Z.
+    ///
+    /// This is not a matrix Kronecker product. The center rows are coordinate
+    /// arguments to `kernel.eval(data_row, center_row)`; each output entry is a
+    /// scalar kernel value before the optional column projection.
     fn kernel_chunk(&self, rows: Range<usize>) -> Array2<f64> {
         let chunk_n = rows.end - rows.start;
         let k_raw = self.centers.nrows();
