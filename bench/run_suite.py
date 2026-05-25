@@ -141,6 +141,17 @@ def _gamfit_rust() -> typing.Any:
     return module
 
 
+def _flat_float_list(values: typing.Any) -> list[float]:
+    return np.asarray(values, dtype=float).reshape(-1).tolist()
+
+
+def _sigma_float_list(values: typing.Any) -> list[float]:
+    arr = np.asarray(values, dtype=float)
+    if arr.ndim == 0:
+        return [float(arr)]
+    return arr.reshape(-1).tolist()
+
+
 class _TerminalOutputSanitizer:
     def __init__(self) -> None:
         self._state = "normal"

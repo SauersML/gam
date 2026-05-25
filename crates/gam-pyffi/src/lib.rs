@@ -69,32 +69,32 @@ use gam::terms::sae_manifold::{
     AssignmentMode, GumbelTemperatureSchedule, SaeAtomBasisKind, SaeManifoldRho, ScheduleKind,
     term_from_padded_blocks_with_mode,
 };
-use gam::terms::smooth::BlockwisePenalty;
 use gam::terms::skip_transcoder::{
     SkipTranscoderRemlInputs, skip_transcoder_reml_metrics as skip_transcoder_reml_metrics_core,
 };
+use gam::terms::smooth::BlockwisePenalty;
 use gam::terms::{
     ARDPenalty as CoreARDPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry,
-    BlockOrthogonalityPenalty as CoreBlockOrthogonalityPenalty,
-    DifferenceOpKind, GatedSAEDecoder, IBPAssignmentPenalty as CoreIBPAssignmentPenalty,
-    IsometryPenalty as CoreIsometryPenalty, IvaeRidgeMeanGauge as IvaeRidgeMeanGaugePenalty,
-    JumpReLUPenalty as RustJumpReLUPenalty, MaternBasisGradientTarget,
-    MechanismSparsityPenalty as CoreMechanismSparsityPenalty,
+    BlockOrthogonalityPenalty as CoreBlockOrthogonalityPenalty, DifferenceOpKind, GatedSAEDecoder,
+    IBPAssignmentPenalty as CoreIBPAssignmentPenalty, IsometryPenalty as CoreIsometryPenalty,
+    IvaeRidgeMeanGauge as IvaeRidgeMeanGaugePenalty, JumpReLUPenalty as RustJumpReLUPenalty,
+    MaternBasisGradientTarget, MechanismSparsityPenalty as CoreMechanismSparsityPenalty,
     NuclearNormPenalty as CoreNuclearNormPenalty, OrthogonalityPenalty as CoreOrthogonalityPenalty,
     ParametricRowPrecisionPriorPenalty, PenaltyConcavity, PenaltyTier, PsiSlice,
     RowPrecisionPriorPenalty, ScadMcpPenalty as CoreScadMcpPenalty, ScalarWeightSchedule,
     SoftmaxAssignmentSparsityPenalty as CoreSoftmaxAssignmentSparsityPenalty,
-    SparsityPenalty as CoreSparsityPenalty,
-    StreamingMaternBasisGradientEvaluator,
+    SparsityPenalty as CoreSparsityPenalty, StreamingMaternBasisGradientEvaluator,
     TopKActivationPenalty, TotalVariationPenalty as CoreTotalVariationPenalty,
 };
 use gam::transformation_normal::TransformationNormalFitResult;
 use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily, RhoPrior};
 use gam::{FitConfig, FitRequest, FitResult, fit_model, materialize, resolve_offset_column};
-use ndarray::{Array1, Array2, Array3, Array4, ArrayView1, ArrayView2, ArrayView3, ArrayViewD, Axis, IxDyn, s};
+use ndarray::{
+    Array1, Array2, Array3, Array4, ArrayView1, ArrayView2, ArrayView3, ArrayViewD, Axis, IxDyn, s,
+};
 use numpy::{
-    IntoPyArray, PyArray1, PyArray2, PyArray3, PyArrayMethods, PyReadonlyArray1,
-    PyReadonlyArray2, PyReadonlyArray3, PyReadonlyArray4, PyReadonlyArrayDyn,
+    IntoPyArray, PyArray1, PyArray2, PyArray3, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2,
+    PyReadonlyArray3, PyReadonlyArray4, PyReadonlyArrayDyn,
 };
 use pyo3::IntoPyObjectExt;
 use pyo3::exceptions::{PyKeyError, PyNotImplementedError, PyTypeError, PyValueError};
@@ -678,10 +678,7 @@ fn interpolate_survival_surface<'py>(
         .collect();
     order.sort_by(|left, right| left.0.partial_cmp(&right.0).unwrap_or(Ordering::Equal));
     let sorted_grid: Vec<f64> = order.iter().map(|(value, _index)| *value).collect();
-    let sorted_indices: Vec<usize> = order
-        .iter()
-        .map(|(_value, index)| *index)
-        .collect();
+    let sorted_indices: Vec<usize> = order.iter().map(|(_value, index)| *index).collect();
     let n_query = query_values.len();
     let mut values = vec![0.0_f64; n_rows * n_query];
 
@@ -905,7 +902,9 @@ fn survival_chunk_iter_collect<'py>(
         return Err(py_value_error("people_chunk must be positive".to_string()));
     }
     if time_grid_chunk == 0 {
-        return Err(py_value_error("time_grid_chunk must be positive".to_string()));
+        return Err(py_value_error(
+            "time_grid_chunk must be positive".to_string(),
+        ));
     }
     let grid_view = grid.as_array();
     let surface_view = surface.as_array();
@@ -961,9 +960,7 @@ fn survival_chunk_iter_collect<'py>(
         values
     });
     let out = Array2::from_shape_vec((n_rows, n_times), values).map_err(|err| {
-        py_value_error(format!(
-            "failed to assemble survival chunk result: {err}"
-        ))
+        py_value_error(format!("failed to assemble survival chunk result: {err}"))
     })?;
     Ok(out.into_pyarray(py).unbind())
 }
@@ -984,7 +981,9 @@ fn write_survival_csv(
         return Err(py_value_error("people_chunk must be positive".to_string()));
     }
     if time_grid_chunk == 0 {
-        return Err(py_value_error("time_grid_chunk must be positive".to_string()));
+        return Err(py_value_error(
+            "time_grid_chunk must be positive".to_string(),
+        ));
     }
     let grid_view = grid.as_array();
     let surface_view = surface.as_array();
@@ -1103,17 +1102,15 @@ fn survival_parameters_matrix<'py>(
         1 => {
             let n = view.shape()[0];
             let data: Vec<f64> = view.iter().copied().collect();
-            let out = Array2::from_shape_vec((n, 1), data).map_err(|err| {
-                py_value_error(format!("failed to reshape parameters: {err}"))
-            })?;
+            let out = Array2::from_shape_vec((n, 1), data)
+                .map_err(|err| py_value_error(format!("failed to reshape parameters: {err}")))?;
             Ok(out.into_pyarray(py).unbind())
         }
         2 => {
             let (rows, cols) = (view.shape()[0], view.shape()[1]);
             let data: Vec<f64> = view.iter().copied().collect();
-            let out = Array2::from_shape_vec((rows, cols), data).map_err(|err| {
-                py_value_error(format!("failed to reshape parameters: {err}"))
-            })?;
+            let out = Array2::from_shape_vec((rows, cols), data)
+                .map_err(|err| py_value_error(format!("failed to reshape parameters: {err}")))?;
             Ok(out.into_pyarray(py).unbind())
         }
         other => Err(py_value_error(format!(
@@ -1266,9 +1263,8 @@ fn survival_ffi_surface<'py>(
         return Ok(None);
     }
     let surface_data: Vec<f64> = surf_view.iter().copied().collect();
-    let surface_arr = Array2::from_shape_vec((n_rows, n_cols), surface_data).map_err(|err| {
-        py_value_error(format!("failed to reshape surface: {err}"))
-    })?;
+    let surface_arr = Array2::from_shape_vec((n_rows, n_cols), surface_data)
+        .map_err(|err| py_value_error(format!("failed to reshape surface: {err}")))?;
     let grid_arr = Array1::from_vec(grid);
     Ok(Some((
         grid_arr.into_pyarray(py).unbind(),
@@ -1320,6 +1316,19 @@ fn numeric_matrix_validate<'py>(
 }
 
 #[pyfunction]
+fn numeric_matrix_f64<'py>(
+    py: Python<'py>,
+    values: &Bound<'py, PyAny>,
+    label: &str,
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    let np = py.import("numpy")?;
+    let kwargs = PyDict::new(py);
+    kwargs.set_item("dtype", "float")?;
+    let array = np.call_method("asarray", (values,), Some(&kwargs))?;
+    numeric_matrix_validate(py, &array, label)
+}
+
+#[pyfunction]
 fn marginal_slope_clip_probabilities(values: Vec<f64>) -> PyResult<Vec<f64>> {
     Ok(values
         .into_iter()
@@ -1342,10 +1351,7 @@ fn transformation_normal_z_from_columns(columns_json: &str) -> PyResult<Vec<f64>
 }
 
 #[pyfunction]
-fn column_stack_f64<'py>(
-    py: Python<'py>,
-    columns: Vec<Vec<f64>>,
-) -> PyResult<Py<PyArray2<f64>>> {
+fn column_stack_f64<'py>(py: Python<'py>, columns: Vec<Vec<f64>>) -> PyResult<Py<PyArray2<f64>>> {
     if columns.is_empty() {
         let out = Array2::<f64>::zeros((0, 0));
         return Ok(out.into_pyarray(py).unbind());
@@ -1384,9 +1390,8 @@ fn flat_to_matrix_f64<'py>(
             n_cols
         )));
     }
-    let out = Array2::from_shape_vec((n_rows, n_cols), flat).map_err(|err| {
-        py_value_error(format!("failed to reshape design matrix: {err}"))
-    })?;
+    let out = Array2::from_shape_vec((n_rows, n_cols), flat)
+        .map_err(|err| py_value_error(format!("failed to reshape design matrix: {err}")))?;
     Ok(out.into_pyarray(py).unbind())
 }
 
@@ -1395,10 +1400,7 @@ fn vec_to_array1_f64<'py>(py: Python<'py>, values: Vec<f64>) -> PyResult<Py<PyAr
     Ok(Array1::from_vec(values).into_pyarray(py).unbind())
 }
 
-fn survival_prediction_matrix_from_rows(
-    rows: Vec<Vec<f64>>,
-    label: &str,
-) -> PyResult<Array2<f64>> {
+fn survival_prediction_matrix_from_rows(rows: Vec<Vec<f64>>, label: &str) -> PyResult<Array2<f64>> {
     if rows.is_empty() {
         return Ok(Array2::<f64>::zeros((0, 0)));
     }
@@ -1500,12 +1502,7 @@ fn survival_prediction_payload_from_json(py: Python<'_>, raw: &str) -> PyResult<
     set_survival_prediction_array1(py, &out, "times", payload.times.unwrap_or_default())?;
     set_survival_prediction_matrix(py, &out, "hazard", payload.hazard)?;
     set_survival_prediction_matrix(py, &out, "survival", payload.survival)?;
-    set_survival_prediction_matrix(
-        py,
-        &out,
-        "cumulative_hazard",
-        payload.cumulative_hazard,
-    )?;
+    set_survival_prediction_matrix(py, &out, "cumulative_hazard", payload.cumulative_hazard)?;
 
     let linear_predictor = payload.linear_predictor.unwrap_or_default();
     set_survival_prediction_array1(py, &out, "linear_predictor", linear_predictor.clone())?;
@@ -1517,17 +1514,13 @@ fn survival_prediction_payload_from_json(py: Python<'_>, raw: &str) -> PyResult<
     out.set_item("parameter_names", PyTuple::new(py, parameter_names)?)?;
     out.set_item(
         "parameters",
-        survival_prediction_parameters_from_columns(&columns, &linear_predictor)?
-            .into_pyarray(py),
+        survival_prediction_parameters_from_columns(&columns, &linear_predictor)?.into_pyarray(py),
     )?;
     Ok(out.into_any().unbind())
 }
 
 #[pyfunction]
-fn competing_risks_prediction_payload_from_json(
-    py: Python<'_>,
-    raw: &str,
-) -> PyResult<PyObject> {
+fn competing_risks_prediction_payload_from_json(py: Python<'_>, raw: &str) -> PyResult<PyObject> {
     let payload: serde_json::Value = serde_json::from_str(raw)
         .map_err(|err| py_value_error(format!("invalid competing-risks prediction JSON: {err}")))?;
     let object = payload.as_object().ok_or_else(|| {
@@ -1676,10 +1669,7 @@ fn competing_risks_string_list(
     Ok(out)
 }
 
-fn competing_risks_numeric_list(
-    raw: Option<&serde_json::Value>,
-    key: &str,
-) -> PyResult<Vec<f64>> {
+fn competing_risks_numeric_list(raw: Option<&serde_json::Value>, key: &str) -> PyResult<Vec<f64>> {
     let Some(value) = raw else {
         return Ok(Vec::new());
     };
@@ -1696,10 +1686,7 @@ fn competing_risks_numeric_list(
     Ok(out)
 }
 
-fn competing_risks_flattened_numbers(
-    value: &serde_json::Value,
-    key: &str,
-) -> PyResult<Vec<f64>> {
+fn competing_risks_flattened_numbers(value: &serde_json::Value, key: &str) -> PyResult<Vec<f64>> {
     let mut out = Vec::new();
     competing_risks_flatten_numbers_into(value, key, &mut out)?;
     Ok(out)
@@ -1725,10 +1712,7 @@ fn competing_risks_flatten_numbers_into(
     }
 }
 
-fn competing_risks_numeric_matrix(
-    value: &serde_json::Value,
-    key: &str,
-) -> PyResult<Array2<f64>> {
+fn competing_risks_numeric_matrix(value: &serde_json::Value, key: &str) -> PyResult<Array2<f64>> {
     match competing_risks_array_depth(value, key)? {
         1 => competing_risks_vector_as_matrix(value, key),
         2 => competing_risks_matrix2(value, key),
@@ -1739,10 +1723,7 @@ fn competing_risks_numeric_matrix(
     }
 }
 
-fn competing_risks_vector_as_matrix(
-    value: &serde_json::Value,
-    key: &str,
-) -> PyResult<Array2<f64>> {
+fn competing_risks_vector_as_matrix(value: &serde_json::Value, key: &str) -> PyResult<Array2<f64>> {
     let values = competing_risks_numeric_list(Some(value), key)?;
     let n_rows = values.len();
     Array2::from_shape_vec((n_rows, 1), values)
@@ -1782,10 +1763,7 @@ fn competing_risks_matrix2(value: &serde_json::Value, key: &str) -> PyResult<Arr
         .map_err(|err| py_value_error(format!("failed to reshape {key}: {err}")))
 }
 
-fn competing_risks_stacked_matrix3(
-    value: &serde_json::Value,
-    key: &str,
-) -> PyResult<Array2<f64>> {
+fn competing_risks_stacked_matrix3(value: &serde_json::Value, key: &str) -> PyResult<Array2<f64>> {
     let matrices = value
         .as_array()
         .ok_or_else(|| py_value_error(format!("{key} must be a JSON array")))?;
@@ -1836,7 +1814,9 @@ fn competing_risks_array_depth(value: &serde_json::Value, key: &str) -> PyResult
             Ok(first_depth + 1)
         }
         serde_json::Value::Number(_) => Ok(0),
-        _ => Err(py_value_error(format!("{key} must contain only numeric arrays"))),
+        _ => Err(py_value_error(format!(
+            "{key} must contain only numeric arrays"
+        ))),
     }
 }
 
@@ -2188,9 +2168,7 @@ fn formula_validation_html_json(payload_json: String) -> PyResult<String> {
     let mut rows = String::new();
     for (key, value) in payload.iter() {
         rows.push_str("<tr>");
-        rows.push_str(
-            "<th style='text-align:left;padding:0.25rem 0.75rem 0.25rem 0;'>",
-        );
+        rows.push_str("<th style='text-align:left;padding:0.25rem 0.75rem 0.25rem 0;'>");
         rows.push_str(&escape_html(key));
         rows.push_str("</th><td style='padding:0.25rem 0;'>");
         rows.push_str(&escape_html(&python_str_json_value(value)));
@@ -2324,8 +2302,7 @@ fn competing_risks_cif_from_predictions<'py>(
     for cumulative_hazard in cumulative_hazards.iter().skip(1) {
         if cumulative_hazard.as_array().dim() != expected_shape {
             return Err(py_value_error(
-                "all endpoint predictions must return the same (n_rows, n_times) shape"
-                    .to_string(),
+                "all endpoint predictions must return the same (n_rows, n_times) shape".to_string(),
             ));
         }
     }
@@ -2334,16 +2311,10 @@ fn competing_risks_cif_from_predictions<'py>(
         .iter()
         .map(|hazard| hazard.as_array().to_owned())
         .collect::<Vec<_>>();
-    let (cif, overall_survival) = detach_py_result(
-        py,
-        "competing_risks_cif_from_predictions",
-        move || {
-            competing_risks_cif_from_predictions_impl(
-                time_values.view(),
-                &cumulative_hazard_values,
-            )
-        },
-    )?;
+    let (cif, overall_survival) =
+        detach_py_result(py, "competing_risks_cif_from_predictions", move || {
+            competing_risks_cif_from_predictions_impl(time_values.view(), &cumulative_hazard_values)
+        })?;
     let cif_arrays = PyList::empty(py);
     for endpoint_cif in cif {
         cif_arrays.append(endpoint_cif.into_pyarray(py))?;
@@ -2362,9 +2333,8 @@ fn competing_risks_cif_from_predictions_impl(
         .iter()
         .map(|hazard| hazard.view())
         .collect::<Vec<_>>();
-    let result =
-        gam::survival::assemble_competing_risks_cif_from_endpoints(times, &endpoint_views)
-            .map_err(|err| err.to_string())?;
+    let result = gam::survival::assemble_competing_risks_cif_from_endpoints(times, &endpoint_views)
+        .map_err(|err| err.to_string())?;
     let cif = result
         .cif
         .axis_iter(Axis(0))
@@ -2402,11 +2372,8 @@ fn build_sample_payload_json(
     if let Some(value) = seed {
         payload.insert("seed".to_string(), serde_json::Value::from(value));
     }
-    serde_json::to_string(&serde_json::Value::Object(payload)).map_err(|err| {
-        py_value_error(format!(
-            "failed to serialize sample options json: {err}"
-        ))
-    })
+    serde_json::to_string(&serde_json::Value::Object(payload))
+        .map_err(|err| py_value_error(format!("failed to serialize sample options json: {err}")))
 }
 
 #[pyfunction]
@@ -2499,11 +2466,7 @@ fn periodic_basis_with_jet<'py>(
     py: Python<'py>,
     t: PyReadonlyArray1<'py, f64>,
     n_harmonics: usize,
-) -> PyResult<(
-    Py<PyArray2<f64>>,
-    Py<PyArray3<f64>>,
-    Py<PyArray2<f64>>,
-)> {
+) -> PyResult<(Py<PyArray2<f64>>, Py<PyArray3<f64>>, Py<PyArray2<f64>>)> {
     let t = t.as_array();
     if t.iter().any(|value| !value.is_finite()) {
         return Err(py_value_error(
@@ -2555,11 +2518,7 @@ fn duchon_basis_with_jet<'py>(
     points: PyReadonlyArray2<'py, f64>,
     centers: PyReadonlyArray2<'py, f64>,
     m: usize,
-) -> PyResult<(
-    Py<PyArray2<f64>>,
-    Py<PyArray3<f64>>,
-    Py<PyArray2<f64>>,
-)> {
+) -> PyResult<(Py<PyArray2<f64>>, Py<PyArray3<f64>>, Py<PyArray2<f64>>)> {
     if m == 0 {
         return Err(py_value_error("Duchon m must be at least 1".to_string()));
     }
@@ -2601,14 +2560,13 @@ fn duchon_basis_with_jet<'py>(
         })?;
     let penalty = built.penalties[primary_idx].clone();
 
-    let effective_nullspace =
-        pyffi_duchon_effective_nullspace_order(ctrs, requested_nullspace);
+    let effective_nullspace = pyffi_duchon_effective_nullspace_order(ctrs, requested_nullspace);
     let radial_transform = pyffi_duchon_kernel_constraint_nullspace(ctrs, effective_nullspace)
         .map_err(py_value_error)?;
     let radial_first = duchon_radial_first_derivative_nd(pts, ctrs, None, effective_nullspace)
         .map_err(|err| py_value_error(err.to_string()))?;
-    let radial_jet = radial_input_location_jet(pts, ctrs, radial_first.view())
-        .map_err(py_value_error)?;
+    let radial_jet =
+        radial_input_location_jet(pts, ctrs, radial_first.view()).map_err(py_value_error)?;
     let poly_jet = duchon_polynomial_first_derivative_nd(pts, effective_nullspace);
 
     let n_rows = pts.nrows();
@@ -2659,16 +2617,14 @@ fn basis_with_jet<'py>(
     kind: &str,
     t: PyReadonlyArray2<'py, f64>,
     params: &Bound<'py, PyDict>,
-) -> PyResult<(
-    Py<PyArray2<f64>>,
-    Py<PyArray3<f64>>,
-    Py<PyArray2<f64>>,
-)> {
+) -> PyResult<(Py<PyArray2<f64>>, Py<PyArray3<f64>>, Py<PyArray2<f64>>)> {
     match kind.to_ascii_lowercase().replace('-', "_").as_str() {
         "duchon" | "euclidean" | "euclidean_patch" => {
             let centers = params
                 .get_item("centers")?
-                .ok_or_else(|| py_value_error("basis_with_jet params missing \"centers\"".to_string()))?
+                .ok_or_else(|| {
+                    py_value_error("basis_with_jet params missing \"centers\"".to_string())
+                })?
                 .extract::<PyReadonlyArray2<'py, f64>>()?;
             let m = required_usize_param(params, "m")?;
             duchon_basis_with_jet(py, t, centers, m)
@@ -3151,10 +3107,7 @@ fn sphere_chart_basis_with_jet<'py>(
     let mut phi = Array2::<f64>::zeros((n, 7));
     let mut jet = Array3::<f64>::zeros((n, 7, 2));
     for row in 0..n {
-        let lat = coords[[row, 0]].clamp(
-            -std::f64::consts::FRAC_PI_2,
-            std::f64::consts::FRAC_PI_2,
-        );
+        let lat = coords[[row, 0]].clamp(-std::f64::consts::FRAC_PI_2, std::f64::consts::FRAC_PI_2);
         let lon = coords[[row, 1]];
         let clat = lat.cos();
         let slat = lat.sin();
@@ -3191,9 +3144,7 @@ fn sphere_chart_basis_with_jet<'py>(
         jet[[row, 6, 1]] = dx_dlon * z;
     }
 
-    let penalty = Array2::from_diag(&Array1::from_vec(vec![
-        1e-8, 1.0, 1.0, 1.0, 4.0, 4.0, 4.0,
-    ]));
+    let penalty = Array2::from_diag(&Array1::from_vec(vec![1e-8, 1.0, 1.0, 1.0, 4.0, 4.0, 4.0]));
     Ok((
         phi.into_pyarray(py).unbind(),
         jet.into_pyarray(py).unbind(),
@@ -3300,7 +3251,9 @@ fn gaussian_reml_score<'py>(
 
 fn require_finite_matrix(name: &str, matrix: &ArrayView2<'_, f64>) -> PyResult<()> {
     if matrix.iter().any(|value| !value.is_finite()) {
-        return Err(py_value_error(format!("{name} must contain only finite values")));
+        return Err(py_value_error(format!(
+            "{name} must contain only finite values"
+        )));
     }
     Ok(())
 }
@@ -3629,8 +3582,14 @@ fn rank_topology_candidates(evidence_json: &str) -> PyResult<String> {
         }));
     }
     ranked.sort_by(|lhs, rhs| {
-        let l = lhs.get("tk_score").and_then(|v| v.as_f64()).unwrap_or(f64::NEG_INFINITY);
-        let r = rhs.get("tk_score").and_then(|v| v.as_f64()).unwrap_or(f64::NEG_INFINITY);
+        let l = lhs
+            .get("tk_score")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(f64::NEG_INFINITY);
+        let r = rhs
+            .get("tk_score")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(f64::NEG_INFINITY);
         r.partial_cmp(&l).unwrap_or(std::cmp::Ordering::Equal)
     });
     let out = serde_json::json!({
@@ -3693,7 +3652,9 @@ fn compare_reml_fits(
     cv_scores: Option<Vec<f64>>,
 ) -> PyResult<Py<PyDict>> {
     if fits.is_empty() {
-        return Err(PyValueError::new_err("compare_models requires at least one fit"));
+        return Err(PyValueError::new_err(
+            "compare_models requires at least one fit",
+        ));
     }
     let labels = match names {
         Some(names) => {
@@ -3743,13 +3704,7 @@ fn compare_reml_fits(
     for row in scored.iter() {
         let delta = row.score - best_score;
         let bayes_factor = delta.exp();
-        ranking.append((
-            row.name.as_str(),
-            row.score,
-            delta,
-            bayes_factor,
-            row.edf,
-        ))?;
+        ranking.append((row.name.as_str(), row.score, delta, bayes_factor, row.edf))?;
 
         let table_row = PyDict::new(py);
         table_row.set_item("name", row.name.as_str())?;
@@ -3896,10 +3851,7 @@ fn extract_float_metadata_from_view(
     }
 }
 
-fn reml_fit_view<'py>(
-    py: Python<'py>,
-    fit: &Bound<'py, PyAny>,
-) -> PyResult<RemlFitView<'py>> {
+fn reml_fit_view<'py>(py: Python<'py>, fit: &Bound<'py, PyAny>) -> PyResult<RemlFitView<'py>> {
     if let Ok(model_bytes) = fit.extract::<Vec<u8>>() {
         return Ok(RemlFitView::SavedSummary(summary_payload_from_model_bytes(
             &model_bytes,
@@ -4518,7 +4470,10 @@ fn gaussian_reml_fit_blocks_forward<'py>(
             offset_zero.view(),
             &s_list,
             heuristic_slice,
-            LikelihoodSpec::new(ResponseFamily::Gaussian, InverseLink::Standard(LinkFunction::Identity)),
+            LikelihoodSpec::new(
+                ResponseFamily::Gaussian,
+                InverseLink::Standard(LinkFunction::Identity),
+            ),
             &opts,
         )
     })?;
@@ -5534,7 +5489,10 @@ fn gaussian_reml_fit_with_constraints_forward<'py>(
                 offset_zero.view(),
                 &s_list,
                 heuristic_slice,
-                LikelihoodSpec::new(ResponseFamily::Gaussian, InverseLink::Standard(LinkFunction::Identity)),
+                LikelihoodSpec::new(
+                    ResponseFamily::Gaussian,
+                    InverseLink::Standard(LinkFunction::Identity),
+                ),
                 &opts,
             )
         },
@@ -8266,10 +8224,7 @@ fn sae_manifold_fit<'py>(
             .map_err(py_value_error)?;
     }
 
-    let log_ard: Vec<Array1<f64>> = atom_dim
-        .iter()
-        .map(|&d| Array1::<f64>::zeros(d))
-        .collect();
+    let log_ard: Vec<Array1<f64>> = atom_dim.iter().map(|&d| Array1::<f64>::zeros(d)).collect();
     let mut best_term = None;
     let mut best_rho = None;
     let mut best_loss = None;
@@ -11481,9 +11436,7 @@ fn summary_payload_from_model(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<
     json_object_to_py_dict(py, payload)
 }
 
-fn summary_payload_value_from_model_bytes(
-    model_bytes: &[u8],
-) -> Result<serde_json::Value, String> {
+fn summary_payload_value_from_model_bytes(model_bytes: &[u8]) -> Result<serde_json::Value, String> {
     let summary_json = summary_json_impl(model_bytes)?;
     serde_json::from_str(&summary_json).map_err(|err| format!("invalid model summary JSON: {err}"))
 }
@@ -11541,7 +11494,13 @@ fn json_value_to_py(py: Python<'_>, value: serde_json::Value) -> PyResult<PyObje
 #[pyfunction]
 fn summary_repr(payload: &Bound<'_, PyDict>) -> PyResult<String> {
     let mut fields = Vec::new();
-    for key in ["formula", "family_name", "model_class", "deviance", "reml_score"] {
+    for key in [
+        "formula",
+        "family_name",
+        "model_class",
+        "deviance",
+        "reml_score",
+    ] {
         if let Some(value) = payload.get_item(key)? {
             let repr = value.repr()?.extract::<String>()?;
             fields.push(format!("{key}={repr}"));
@@ -11560,9 +11519,7 @@ fn summary_html(payload: &Bound<'_, PyDict>) -> PyResult<String> {
             continue;
         }
         rows.push_str("<tr>");
-        rows.push_str(
-            "<th style='text-align:left;padding:0.25rem 0.75rem 0.25rem 0;'>",
-        );
+        rows.push_str("<th style='text-align:left;padding:0.25rem 0.75rem 0.25rem 0;'>");
         rows.push_str(&summary_html_escape(&key_text));
         rows.push_str("</th><td style='padding:0.25rem 0;'>");
         rows.push_str(&summary_html_escape(&summary_render_value(&value)?));
@@ -11818,9 +11775,7 @@ fn coefficient_state_json(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<Stri
 }
 
 #[pyfunction]
-fn term_blocks_for_model(
-    model_bytes: Vec<u8>,
-) -> PyResult<Vec<(String, String, usize, usize)>> {
+fn term_blocks_for_model(model_bytes: Vec<u8>) -> PyResult<Vec<(String, String, usize, usize)>> {
     term_blocks_for_model_impl(&model_bytes).map_err(PyValueError::new_err)
 }
 
@@ -11937,10 +11892,7 @@ fn py_list_append_json_value(
     }
 }
 
-fn py_list_append_json_number(
-    list: &Bound<'_, PyList>,
-    value: serde_json::Number,
-) -> PyResult<()> {
+fn py_list_append_json_number(list: &Bound<'_, PyList>, value: serde_json::Number) -> PyResult<()> {
     if let Some(value) = value.as_i64() {
         list.append(value)
     } else if let Some(value) = value.as_u64() {
@@ -12073,10 +12025,7 @@ fn benchmark_auc_score(observed: &[f64], predicted_mean: &[f64]) -> PyResult<f64
         while j < pairs.len() && pairs[j].0 == pairs[i].0 {
             j += 1;
         }
-        let pos_in_group = pairs[i..j]
-            .iter()
-            .filter(|(_, is_pos)| *is_pos)
-            .count();
+        let pos_in_group = pairs[i..j].iter().filter(|(_, is_pos)| *is_pos).count();
         let neg_in_group = (j - i).saturating_sub(pos_in_group);
         concordant += (pos_in_group * negatives_below) as f64;
         concordant += 0.5 * (pos_in_group * neg_in_group) as f64;
@@ -12242,7 +12191,11 @@ fn benchmark_gaussian_logloss(
         .zip(predicted_mean.iter())
         .enumerate()
         .map(|(idx, (&y, &mu))| {
-            let raw_sigma = if sigma.len() == 1 { sigma[0] } else { sigma[idx] };
+            let raw_sigma = if sigma.len() == 1 {
+                sigma[0]
+            } else {
+                sigma[idx]
+            };
             let sigma_use = raw_sigma.max(eps);
             let var = sigma_use * sigma_use;
             0.5 * (two_pi * var).ln() + ((y - mu) * (y - mu)) / (2.0 * var)
@@ -12469,7 +12422,11 @@ fn benchmark_survival_matrix_from_risk(
     }
     let mut out = Array2::<f64>::zeros((test_risk.len(), grid.len()));
     for (row_idx, &risk) in test_risk.iter().enumerate() {
-        let x = if risk.is_finite() { risk - risk_mean } else { 0.0 };
+        let x = if risk.is_finite() {
+            risk - risk_mean
+        } else {
+            0.0
+        };
         let mult = (beta * x).clamp(-50.0, 50.0).exp();
         let mut step_idx = 0usize;
         let mut h0 = 0.0;
@@ -12575,7 +12532,11 @@ fn survival_lifted_metrics_from_predictions<'py>(
         }
         let interval_idx = j.saturating_sub(1);
         let (h_z, h2_int, hcum_z) = if (grid[j] - time).abs() <= 1.0e-12 {
-            (haz[[row, interval_idx]], haz_sq_prefix[[row, j]], cumhaz[[row, j]])
+            (
+                haz[[row, interval_idx]],
+                haz_sq_prefix[[row, j]],
+                cumhaz[[row, j]],
+            )
         } else {
             let elapsed = time - grid[interval_idx];
             let h = haz[[row, interval_idx]];
@@ -12614,7 +12575,8 @@ fn survival_lifted_metrics_from_predictions<'py>(
                             .max(0.0);
                 }
             }
-            let mut null_haz_sq_prefix = Array2::<f64>::zeros((null_surv.nrows(), null_surv.ncols()));
+            let mut null_haz_sq_prefix =
+                Array2::<f64>::zeros((null_surv.nrows(), null_surv.ncols()));
             for row in 0..null_surv.nrows() {
                 for col in 0..null_haz.ncols() {
                     null_haz_sq_prefix[[row, col + 1]] = null_haz_sq_prefix[[row, col]]
@@ -12644,13 +12606,15 @@ fn survival_lifted_metrics_from_predictions<'py>(
                         null_haz_sq_prefix[[row, interval_idx]] + h * h * elapsed,
                     )
                 };
-                null_log_losses[row] =
-                    hcum_z - if obs[row] { h_z.max(eps).ln() } else { 0.0 };
+                null_log_losses[row] = hcum_z - if obs[row] { h_z.max(eps).ln() } else { 0.0 };
                 null_brier_losses[row] = 0.5 * h2_int - if obs[row] { h_z } else { 0.0 };
             }
             let null_logloss = null_log_losses.iter().sum::<f64>() / null_log_losses.len() as f64;
             let null_brier = null_brier_losses.iter().sum::<f64>() / null_brier_losses.len() as f64;
-            out.set_item("lifted_brier", (null_brier - brier) / null_brier.abs().max(eps))?;
+            out.set_item(
+                "lifted_brier",
+                (null_brier - brier) / null_brier.abs().max(eps),
+            )?;
             out.set_item(
                 "lifted_logloss",
                 (null_logloss - logloss) / null_logloss.abs().max(eps),
@@ -13213,9 +13177,7 @@ fn rg_simplex_exp_map_impl(
         }
         RgSimplexCoord::Alr => {
             if tangent.ncols() + 1 != d {
-                return Err(
-                    "ALR tangent dimension must be simplex dimension minus one".to_string(),
-                );
+                return Err("ALR tangent dimension must be simplex dimension minus one".to_string());
             }
             let base_alr = rg_alr_impl(base2.view(), reference)?;
             let n = tangent.nrows();
@@ -13573,9 +13535,7 @@ fn response_geometry_clr<'py>(
     values: PyReadonlyArray2<'py, f64>,
 ) -> PyResult<Py<PyArray2<f64>>> {
     let arr = values.as_array().to_owned();
-    let out = detach_py_result(py, "response_geometry_clr", move || {
-        rg_clr_impl(arr.view())
-    })?;
+    let out = detach_py_result(py, "response_geometry_clr", move || rg_clr_impl(arr.view()))?;
     Ok(out.into_pyarray(py).unbind())
 }
 
@@ -15270,7 +15230,10 @@ fn inverse_softplus_scalar(value: f64) -> f64 {
     }
 }
 
-#[pyclass(module = "gam_pyffi._rust", name = "ParametricAuxConditionalPriorPenalty")]
+#[pyclass(
+    module = "gam_pyffi._rust",
+    name = "ParametricAuxConditionalPriorPenalty"
+)]
 struct ParametricAuxConditionalPriorPenalty {
     #[pyo3(get, set)]
     target: PyObject,
@@ -15336,10 +15299,7 @@ impl ParametricAuxConditionalPriorPenalty {
     const KIND_TAG: &'static str = "parametric_aux_conditional_prior";
 
     fn to_rust_descriptor(&self, py: Python<'_>) -> PyResult<PyObject> {
-        let aux_array = self
-            .aux
-            .bind(py)
-            .extract::<PyReadonlyArrayDyn<'_, f64>>()?;
+        let aux_array = self.aux.bind(py).extract::<PyReadonlyArrayDyn<'_, f64>>()?;
         let alpha_array = self
             .alpha_init
             .bind(py)
@@ -15369,7 +15329,10 @@ impl ParametricAuxConditionalPriorPenalty {
             "log_alpha",
             PyList::new(
                 py,
-                alpha_view.iter().map(|value| value.ln()).collect::<Vec<_>>(),
+                alpha_view
+                    .iter()
+                    .map(|value| value.ln())
+                    .collect::<Vec<_>>(),
             )?,
         )?;
         payload.set_item(
@@ -15676,7 +15639,10 @@ impl IvaeRidgeMeanGauge {
         target: PyObject,
     ) -> PyResult<Self> {
         let builtins = py.import("builtins")?;
-        let weight = builtins.getattr("float")?.call1((weight,))?.extract::<f64>()?;
+        let weight = builtins
+            .getattr("float")?
+            .call1((weight,))?
+            .extract::<f64>()?;
         let n_eff = builtins.getattr("int")?.call1((n_eff,))?.extract::<i64>()?;
         let ridge_eps = builtins
             .getattr("float")?
@@ -16213,7 +16179,10 @@ impl AuxConditionalPriorPenalty {
         target: PyObject,
     ) -> PyResult<Self> {
         let builtins = py.import("builtins")?;
-        let weight = builtins.getattr("float")?.call1((weight,))?.extract::<f64>()?;
+        let weight = builtins
+            .getattr("float")?
+            .call1((weight,))?
+            .extract::<f64>()?;
         let n_eff = builtins.getattr("int")?.call1((n_eff,))?.extract::<i64>()?;
         let learnable = learnable.is_truthy()?;
         let lambda_per_row = aux_conditional_prior_float_array(py, lambda_per_row)?;
@@ -16423,6 +16392,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(survival_block, module)?)?;
     module.add_function(wrap_pyfunction!(survival_ffi_surface, module)?)?;
     module.add_function(wrap_pyfunction!(numeric_matrix_validate, module)?)?;
+    module.add_function(wrap_pyfunction!(numeric_matrix_f64, module)?)?;
     module.add_function(wrap_pyfunction!(marginal_slope_clip_probabilities, module)?)?;
     module.add_function(wrap_pyfunction!(
         transformation_normal_z_from_columns,
@@ -16469,7 +16439,10 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(design_matrix_table, module)?)?;
     module.add_function(wrap_pyfunction!(design_matrix_table_dense, module)?)?;
     module.add_function(wrap_pyfunction!(design_matrix_array, module)?)?;
-    module.add_function(wrap_pyfunction!(build_difference_smooth_request_json, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        build_difference_smooth_request_json,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(bspline_basis, module)?)?;
     module.add_function(wrap_pyfunction!(bspline_basis_derivative, module)?)?;
     module.add_function(wrap_pyfunction!(basis_with_jet, module)?)?;
@@ -16490,10 +16463,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(gaussian_reml_score, module)?)?;
     module.add_function(wrap_pyfunction!(skip_transcoder_reml_metrics, module)?)?;
     module.add_function(wrap_pyfunction!(skip_transcoder_select_reml, module)?)?;
-    module.add_function(wrap_pyfunction!(
-        tierney_kadane_normalized_score,
-        module
-    )?)?;
+    module.add_function(wrap_pyfunction!(tierney_kadane_normalized_score, module)?)?;
     module.add_function(wrap_pyfunction!(torch_smooth_dispatch_key, module)?)?;
     module.add_function(wrap_pyfunction!(assemble_candidate_formula, module)?)?;
     module.add_function(wrap_pyfunction!(ordered_prediction_columns, module)?)?;
@@ -17551,10 +17521,9 @@ fn json_payload_truthy(value: &serde_json::Value) -> bool {
     match value {
         serde_json::Value::Null => false,
         serde_json::Value::Bool(value) => *value,
-        serde_json::Value::Number(value) => value
-            .as_f64()
-            .map(|number| number != 0.0)
-            .unwrap_or(true),
+        serde_json::Value::Number(value) => {
+            value.as_f64().map(|number| number != 0.0).unwrap_or(true)
+        }
         serde_json::Value::String(value) => !value.is_empty(),
         serde_json::Value::Array(value) => !value.is_empty(),
         serde_json::Value::Object(value) => !value.is_empty(),
@@ -18019,14 +17988,8 @@ fn posterior_predict_bands_table_impl(
     // Reuse the existing predict pipeline to get an eta matrix, then collapse
     // to per-row bands inside Rust so the predict() path never materializes
     // the (n_draws, n_rows) matrix on the Python side.
-    let raw = posterior_predict_table_impl(
-        model_bytes,
-        headers,
-        rows,
-        samples_flat,
-        n_draws,
-        n_coeffs,
-    )?;
+    let raw =
+        posterior_predict_table_impl(model_bytes, headers, rows, samples_flat, n_draws, n_coeffs)?;
     let parsed: serde_json::Value = serde_json::from_str(&raw)
         .map_err(|err| format!("failed to parse posterior predict payload: {err}"))?;
     let n_draws_out = parsed
@@ -18802,9 +18765,9 @@ fn difference_group_ranges(
             .and_then(|raw| raw.as_str())
             .is_some_and(|kind| kind == "random_effect")
             && obj
-            .get("name")
-            .and_then(|raw| raw.as_str())
-            .is_some_and(|name| name == group)
+                .get("name")
+                .and_then(|raw| raw.as_str())
+                .is_some_and(|name| name == group)
         {
             let start = obj
                 .get("start")
@@ -18859,23 +18822,6 @@ impl SplitMixNormalRng {
         ((value as f64) + 0.5) * (1.0 / ((1_u64 << 53) as f64))
     }
 
-    fn uniform_usize(&mut self, upper: usize) -> usize {
-        if upper <= 1 {
-            return 0;
-        }
-        (self.next_u64() as usize) % upper
-    }
-
-    fn shuffle<T>(&mut self, values: &mut [T]) {
-        if values.len() <= 1 {
-            return;
-        }
-        for i in (1..values.len()).rev() {
-            let j = self.uniform_usize(i + 1);
-            values.swap(i, j);
-        }
-    }
-
     fn standard_normal(&mut self) -> f64 {
         if let Some(value) = self.spare.take() {
             return value;
@@ -18892,7 +18838,9 @@ impl SplitMixNormalRng {
 fn difference_quantile(mut values: Vec<f64>, level: f64) -> Result<f64, String> {
     values.retain(|value| value.is_finite());
     if values.is_empty() {
-        return Err("simultaneous difference_smooth simulation produced no finite draws".to_string());
+        return Err(
+            "simultaneous difference_smooth simulation produced no finite draws".to_string(),
+        );
     }
     values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
     if values.len() == 1 {
@@ -18920,7 +18868,9 @@ fn difference_simultaneous_critical(
     level: f64,
 ) -> Result<f64, String> {
     if n_sim == 0 {
-        return Err("difference_smooth n_sim must be at least 1 when simultaneous=True".to_string());
+        return Err(
+            "difference_smooth n_sim must be at least 1 when simultaneous=True".to_string(),
+        );
     }
     let sym = (cov.to_owned() + cov.t()) * 0.5;
     let chol = sym
@@ -18987,12 +18937,15 @@ fn difference_smooth_json_impl(model_bytes: &[u8], request_json: &str) -> Result
                 .ok_or_else(|| "saved model schema column is missing name".to_string())
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let view_idx = headers.iter().position(|name| name == &request.view).ok_or_else(|| {
-        format!(
-            "view column {:?} not found in model schema: {:?}",
-            request.view, headers
-        )
-    })?;
+    let view_idx = headers
+        .iter()
+        .position(|name| name == &request.view)
+        .ok_or_else(|| {
+            format!(
+                "view column {:?} not found in model schema: {:?}",
+                request.view, headers
+            )
+        })?;
     let group = match request.group {
         Some(group) => group,
         None => schema_cols
@@ -19007,12 +18960,15 @@ fn difference_smooth_json_impl(model_bytes: &[u8], request_json: &str) -> Result
                     .to_string()
             })?,
     };
-    let group_idx = headers.iter().position(|name| name == &group).ok_or_else(|| {
-        format!(
-            "group column {:?} not found in model schema: {:?}",
-            group, headers
-        )
-    })?;
+    let group_idx = headers
+        .iter()
+        .position(|name| name == &group)
+        .ok_or_else(|| {
+            format!(
+                "group column {:?} not found in model schema: {:?}",
+                group, headers
+            )
+        })?;
     let group_col = &schema_cols[group_idx];
     let levels = group_col
         .get("levels")
@@ -19300,7 +19256,12 @@ fn cross_fit_shared_precision_groups_json_impl(request_json: &str) -> Result<Str
         let mut fit_entries = Vec::<serde_json::Value>::new();
         let mut dims = BTreeSet::<usize>::new();
         let mut quadratic_sum = 0.0;
-        for ((model, state), label) in request.models.iter().zip(states.iter()).zip(group.labels.iter()) {
+        for ((model, state), label) in request
+            .models
+            .iter()
+            .zip(states.iter())
+            .zip(group.labels.iter())
+        {
             let indices = coefficient_indices_for_precision_label_json(state, label)?;
             if indices.is_empty() {
                 continue;
@@ -19309,8 +19270,9 @@ fn cross_fit_shared_precision_groups_json_impl(request_json: &str) -> Result<Str
             let cov_n = state
                 .get("covariance_n")
                 .and_then(|raw| raw.as_u64())
-                .ok_or_else(|| "model coefficient state does not include covariance_n".to_string())?
-                as usize;
+                .ok_or_else(|| {
+                    "model coefficient state does not include covariance_n".to_string()
+                })? as usize;
             let cov_flat = json_f64_vec(state, "covariance_flat")?;
             if beta.len() != cov_n || cov_flat.len() != cov_n * cov_n {
                 return Err(format!(
@@ -20102,8 +20064,9 @@ fn build_analytic_penalty_registry_from_json(
                     .get("learnable")
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false);
-                let penalty = CoreOrthogonalityPenalty::new(slice, target.d, weight, n_eff, learnable)
-                    .map_err(|err| format!("{context}: {err}"))?;
+                let penalty =
+                    CoreOrthogonalityPenalty::new(slice, target.d, weight, n_eff, learnable)
+                        .map_err(|err| format!("{context}: {err}"))?;
                 let penalty = match weight_schedule {
                     Some(schedule) => penalty.with_weight_schedule(schedule),
                     None => penalty,
@@ -22534,10 +22497,7 @@ fn pyffi_duchon_polynomial_block(
     }
 }
 
-fn pyffi_duchon_monomial_exponents(
-    dimension: usize,
-    max_total_degree: usize,
-) -> Vec<Vec<usize>> {
+fn pyffi_duchon_monomial_exponents(dimension: usize, max_total_degree: usize) -> Vec<Vec<usize>> {
     fn recurse(
         axis: usize,
         remaining_degree: usize,
@@ -22777,16 +22737,17 @@ fn build_standard_payload(
     wiggle_degree: Option<usize>,
 ) -> Result<FittedModelPayload, String> {
     let saved_fit = fit_with_null_space_logdet(design, saved_fit)?;
-    let latent_cloglog_state = if matches!(
-        (&family.response, &family.link),
-        (ResponseFamily::Binomial, InverseLink::LatentCLogLog(_))
-    ) {
-        Some(saved_latent_cloglog_state_from_fit(&saved_fit).expect(
-            "latent-cloglog-binomial fit must produce an explicit latent-cloglog state",
-        ))
-    } else {
-        saved_latent_cloglog_state_from_fit(&saved_fit)
-    };
+    let latent_cloglog_state =
+        if matches!(
+            (&family.response, &family.link),
+            (ResponseFamily::Binomial, InverseLink::LatentCLogLog(_))
+        ) {
+            Some(saved_latent_cloglog_state_from_fit(&saved_fit).expect(
+                "latent-cloglog-binomial fit must produce an explicit latent-cloglog state",
+            ))
+        } else {
+            saved_latent_cloglog_state_from_fit(&saved_fit)
+        };
     let family_link = family.link_function();
     let family_name = family.name().to_string();
     let mut payload = FittedModelPayload::new(
