@@ -120,12 +120,21 @@ static POLICY: OnceLock<GpuPolicy> = OnceLock::new();
 
 #[inline]
 pub fn global_policy() -> GpuPolicy {
-    *POLICY.get_or_init(|| GpuPolicy::Auto)
+    // Reading the policy must NOT claim the OnceLock slot: returning the
+    // default `Auto` via `get_or_init` would race against an explicit
+    // `configure_global_policy(...)` made later in the same process and
+    // silently lock the policy to `Auto`.  Keep the slot uninitialized
+    // until explicitly configured so first-writer-wins applies only to
+    // genuine writes, not to incidental reads from probe/dispatch code.
+    POLICY.get().copied().unwrap_or(GpuPolicy::Auto)
 }
 
 /// Configure the process-wide policy before solver kernels are selected.
-/// If a kernel already initialized the policy, the first value wins so
-/// concurrent fits cannot race policy changes.
+/// If a previous explicit configuration already set the policy, the first
+/// value wins so concurrent fits cannot race policy changes.  Reads of
+/// `global_policy()` never claim the slot, so the very first explicit
+/// configuration always sticks even if dispatch code observed the
+/// default `Auto` beforehand.
 pub fn configure_global_policy(policy: GpuPolicy) {
     // First-writer-wins semantics; ignore a redundant late call.
     POLICY.set(policy).ok();
