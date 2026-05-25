@@ -9083,7 +9083,7 @@ fn fit_dataset_impl(
 
     let mut payload = match request {
         FitRequest::Standard(standard_request) => {
-            let family = standard_request.family;
+            let family = standard_request.family.clone();
             let fit_result = fit_model(FitRequest::Standard(standard_request))?;
             let standard_result = match fit_result {
                 FitResult::Standard(standard_result) => standard_result,
