@@ -211,7 +211,7 @@ uses the R-hat threshold only. If a NUTS run looks unhealthy:
 
 1. Set `seed=` to retry from a different initialisation.
 2. Increase `warmup` and `samples`.
-3. Raise `target_accept` (e.g. `0.85` or `0.9`).
+3. Raise `target_accept` (e.g. `0.92` or `0.95`).
 4. Inspect `posterior.plot_trace(...)`.
 
 ## Default sampling parameters
