@@ -3744,7 +3744,10 @@ fn compare_reml_fits(
         table_row.set_item("name", row.name.as_str())?;
         table_row.set_item("reml_score", row.reml_score)?;
         table_row.set_item("delta_reml", row.delta_reml)?;
-        table_row.set_item("bayes_factor_vs_best", row.bayes_factor_vs_best)?;
+        table_row.set_item(
+            "bayes_factor_best_over_model",
+            row.bayes_factor_best_over_model,
+        )?;
         table_row.set_item("effective_dof", row.effective_dof)?;
         score_table.append(table_row)?;
     }
@@ -18131,13 +18134,14 @@ fn block_orthogonality_target_descriptor(target: &Bound<'_, PyAny>) -> PyResult<
 #[pymethods]
 impl BlockOrthogonalityPenalty {
     #[new]
-    #[pyo3(signature = (groups, weight, n_eff, learnable = false, *, target = default_target_py()))]
+    #[pyo3(signature = (groups, weight, n_eff, learnable = false, *, target = None))]
     fn new(
+        py: Python<'_>,
         groups: &Bound<'_, PyAny>,
         weight: f64,
         n_eff: &Bound<'_, PyAny>,
         learnable: bool,
-        target: PyObject,
+        target: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         let groups = block_orthogonality_groups(groups)?;
         let n_eff = n_eff.call_method0("__index__")?.extract::<i64>()?;
@@ -18152,7 +18156,7 @@ impl BlockOrthogonalityPenalty {
             )));
         }
         Ok(Self {
-            target,
+            target: py_object_or_string_default(py, target, "t"),
             groups,
             weight,
             n_eff,
@@ -18224,14 +18228,14 @@ struct AuxConditionalPriorPenalty {
 #[pymethods]
 impl AuxConditionalPriorPenalty {
     #[new]
-    #[pyo3(signature = (lambda_per_row, weight, n_eff, learnable = false, *, target = default_target_py()))]
+    #[pyo3(signature = (lambda_per_row, weight, n_eff, learnable = false, *, target = None))]
     fn new(
         py: Python<'_>,
         lambda_per_row: &Bound<'_, PyAny>,
         weight: &Bound<'_, PyAny>,
         n_eff: &Bound<'_, PyAny>,
         learnable: bool,
-        target: PyObject,
+        target: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         let builtins = py.import("builtins")?;
         let weight = builtins
@@ -18242,7 +18246,7 @@ impl AuxConditionalPriorPenalty {
         let lambda_per_row = aux_conditional_prior_float_array(py, lambda_per_row)?;
         validate_aux_conditional_prior_lambda(&lambda_per_row, weight, n_eff)?;
         Ok(Self {
-            target,
+            target: py_object_or_string_default(py, target, "t"),
             lambda_per_row: lambda_per_row.unbind(),
             weight,
             n_eff,
@@ -18321,14 +18325,15 @@ struct NuclearNormPenalty {
 #[pymethods]
 impl NuclearNormPenalty {
     #[new]
-    #[pyo3(signature = (weight, n_eff, smoothing_eps = 1.0e-6, max_rank = None, learnable = false, *, target = default_target_py()))]
+    #[pyo3(signature = (weight, n_eff, smoothing_eps = 1.0e-6, max_rank = None, learnable = false, *, target = None))]
     fn new(
+        py: Python<'_>,
         weight: f64,
         n_eff: &Bound<'_, PyAny>,
         smoothing_eps: f64,
         max_rank: Option<&Bound<'_, PyAny>>,
         learnable: bool,
-        target: PyObject,
+        target: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         let n_eff = n_eff.call_method0("__index__")?.extract::<i64>()?;
         let max_rank = match max_rank {
@@ -18358,7 +18363,7 @@ impl NuclearNormPenalty {
             }
         }
         Ok(Self {
-            target,
+            target: py_object_or_string_default(py, target, "t"),
             weight,
             n_eff,
             smoothing_eps,

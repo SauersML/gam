@@ -10892,6 +10892,28 @@ fn shrink_joint_block_trust_radii(block_radii: &mut [f64], factor: f64) -> f64 {
     block_radii.iter().copied().fold(0.0_f64, f64::max)
 }
 
+fn joint_block_step_hit_trust_boundary(step_norm: f64, radius: f64) -> bool {
+    step_norm.is_finite() && radius > 0.0 && step_norm >= 0.99 * radius
+}
+
+fn shrink_active_joint_block_trust_radii(
+    block_radii: &mut [f64],
+    block_step_norms: &[f64],
+    factor: f64,
+) -> f64 {
+    assert_eq!(block_radii.len(), block_step_norms.len());
+    let any_boundary_block = block_radii
+        .iter()
+        .zip(block_step_norms)
+        .any(|(radius, step_norm)| joint_block_step_hit_trust_boundary(*step_norm, *radius));
+    for (radius, step_norm) in block_radii.iter_mut().zip(block_step_norms) {
+        if !any_boundary_block || joint_block_step_hit_trust_boundary(*step_norm, *radius) {
+            *radius = (*radius * factor).clamp(1.0e-12, 1.0e6);
+        }
+    }
+    block_radii.iter().copied().fold(0.0_f64, f64::max)
+}
+
 fn apply_block_local_feasibility_limits<F: CustomFamily + ?Sized>(
     family: &F,
     states: &[ParameterBlockState],
