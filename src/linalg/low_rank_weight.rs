@@ -122,8 +122,10 @@ impl<'a> LowRankWeight<'a> {
         if self.is_rank_zero() {
             return out;
         }
-        // U (Vᵀ x): Vᵀ x is r-dim, then U times r-vector.
-        let vtx = fast_atv(&self.v.to_owned(), &x.to_owned());
+        // U (Vᵀ x): Vᵀ x is r-dim, then U times r-vector. The `fast_*`
+        // kernels are generic over `Data<Elem = f64>`, so we pass views
+        // directly — no `.to_owned()` copies of `u`, `v`, or `x`.
+        let vtx = fast_atv(&self.v, &x);
         let uvtx = fast_av(&self.u, &vtx);
         out += &uvtx;
         out
@@ -177,8 +179,9 @@ impl<'a> LowRankWeight<'a> {
             transpose_design_times_dense(design, &self.v)?
         };
 
-        // xtwx += XᵀU · (XᵀV)ᵀ
-        let correction = fast_ab(&xtu, &xtv.t().to_owned());
+        // xtwx += XᵀU · (XᵀV)ᵀ. Use the dedicated A·Bᵀ kernel so we don't
+        // materialise a `r × p` transpose copy of `xtv`.
+        let correction = crate::faer_ndarray::fast_abt(&xtu, &xtv);
         *xtwx += &correction;
         Ok(())
     }
@@ -202,8 +205,8 @@ impl<'a> LowRankWeight<'a> {
         let mut out = design.transpose_vector_multiply(&dy);
 
         if !self.is_rank_zero() {
-            // Vᵀ y, then (XᵀU) · (Vᵀ y)
-            let vty = fast_atv(&self.v.to_owned(), &y.to_owned());
+            // Vᵀ y, then (XᵀU) · (Vᵀ y). Pass views directly — no copies.
+            let vty = fast_atv(&self.v, &y);
             let xtu = transpose_design_times_dense(design, &self.u)?; // p × r
             let correction = xtu.dot(&vty);
             out += &correction;
@@ -232,8 +235,8 @@ impl<'a> LowRankWeight<'a> {
                 dinv_u[[i, k]] *= inv;
             }
         }
-        // Vᵀ (D⁻¹ U)
-        let vtdinv_u = fast_atb(&self.v.to_owned(), &dinv_u);
+        // Vᵀ (D⁻¹ U) — pass `self.v` as a view; no need to clone it.
+        let vtdinv_u = fast_atb(&self.v, &dinv_u);
         cap += &vtdinv_u;
         cap
     }
@@ -311,8 +314,9 @@ fn transpose_design_times_dense(
     }
     // Dense fast path: a single GEMM `Xᵀ M` if X is materialised dense.
     if let Some(dense) = design.as_dense() {
-        // Xᵀ · M  ≡  fast_atb(X, M)
-        let xt_m = fast_atb(&dense.to_owned(), &m.to_owned());
+        // Xᵀ · M  ≡  fast_atb(X, M). The kernel is generic over storage,
+        // so pass `dense` and `m` as views — no `n × p` / `n × r` copies.
+        let xt_m = fast_atb(&dense, m);
         return Ok(xt_m);
     }
     // Generic path: column-by-column applies — preserves whatever
