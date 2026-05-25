@@ -11007,13 +11007,26 @@ pub(crate) fn calculate_loglikelihood_omitting_constants(
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
     let n = y.len();
     match &likelihood.spec.response {
-        ResponseFamily::Gaussian => (0..n)
-            .into_par_iter()
-            .map(|i| {
-                let resid = y[i] - mu[i];
-                -0.5 * priorweights[i] * resid * resid
-            })
-            .sum(),
+        ResponseFamily::Gaussian => {
+            // Gaussian log-likelihood (constants dropped) is
+            //     -0.5 * prior_i * (y_i - mu_i)^2 / phi.
+            // `ProfiledGaussian` returns no fixed phi and falls back to phi=1,
+            // preserving the historical profiled-sigma behaviour. A caller that
+            // fixes phi gets the scaled form that matches the IRLS weights and
+            // the scaled deviance in `calculate_deviance`.
+            let phi = likelihood.scale.fixed_phi().unwrap_or(1.0);
+            if !(phi.is_finite() && phi > 0.0) {
+                return f64::NAN;
+            }
+            let inv_phi = 1.0 / phi;
+            (0..n)
+                .into_par_iter()
+                .map(|i| {
+                    let resid = y[i] - mu[i];
+                    -0.5 * priorweights[i] * resid * resid * inv_phi
+                })
+                .sum()
+        }
         ResponseFamily::Binomial => (0..n)
             .into_par_iter()
             .map(|i| {
