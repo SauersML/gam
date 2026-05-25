@@ -6044,6 +6044,7 @@ fn build_single_local_smooth_term(
         ops: ops_t,
         nullspaces: nullspaces_t,
         null_eigenvectors: null_eigenvectors_t,
+        joint_null_rotation: None,
         penaltyinfo: penaltyinfo_t,
         pre_dropped_penaltyinfo: pre_dropped_penaltyinfo_t,
         metadata,
