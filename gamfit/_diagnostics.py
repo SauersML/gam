@@ -4,6 +4,9 @@ from dataclasses import dataclass
 from html import escape
 from typing import Any
 
+from ._binding import rust_module
+from ._exceptions import map_exception
+
 
 @dataclass(frozen=True, slots=True)
 class Diagnostics:
@@ -84,23 +87,15 @@ class Diagnostics:
         ... ).metrics["mae"]
         0.13333333333333336
         """
-        mean = [float(value) for value in predicted["mean"]]
-        residuals = [obs - pred for obs, pred in zip(observed, mean, strict=True)]
-        n_obs = len(observed)
-        mae = sum(abs(value) for value in residuals) / n_obs
-        rmse = (sum(value * value for value in residuals) / n_obs) ** 0.5
-        bias = sum(residuals) / n_obs
-        observed_mean = sum(observed) / n_obs
-        total_sum_squares = sum((value - observed_mean) ** 2 for value in observed)
-        residual_sum_squares = sum(value * value for value in residuals)
-        metrics = {
-            "n_obs": float(n_obs),
-            "mae": mae,
-            "rmse": rmse,
-            "bias": bias,
-        }
-        if total_sum_squares > 0.0:
-            metrics["r_squared"] = 1.0 - residual_sum_squares / total_sum_squares
+        try:
+            diagnostics = rust_module().diagnostics_from_predictions(
+                observed,
+                predicted["mean"],
+            )
+        except Exception as exc:
+            raise map_exception(exc) from exc
+        residuals = list(diagnostics["residuals"])
+        metrics = dict(diagnostics["metrics"])
         return cls(
             formula=formula,
             response_name=response_name,

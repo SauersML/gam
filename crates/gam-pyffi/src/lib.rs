@@ -9992,7 +9992,7 @@ fn design_matrix_dataset_impl(
         x_flat,
         n_rows,
         n_cols,
-        family_kind: family_link_kind(&model_likelihood_spec(model)).to_string(),
+        family_kind: family_link_kind(&model_likelihood_spec(&model)).to_string(),
         model_class: prediction_model_class_label(model),
         beta: Some(fit.beta.to_vec()),
         covariance_flat,
@@ -10134,7 +10134,7 @@ fn posterior_predict_table_impl(
         n_draws,
         n_rows,
         model_class: prediction_model_class_label(&model),
-        family_kind: family_link_kind(&model_likelihood_spec(model)).to_string(),
+        family_kind: family_link_kind(&model_likelihood_spec(&model)).to_string(),
     };
     serde_json::to_string(&payload)
         .map_err(|err| format!("failed to serialize posterior_predict payload: {err}"))
@@ -10279,7 +10279,7 @@ fn build_sample_payload(model: &FittedModel, nuts: &NutsResult, cfg: &NutsConfig
             seed: cfg.seed,
         },
         model_class: prediction_model_class_label(model),
-        family_kind: family_link_kind(&model_likelihood_spec(model)).to_string(),
+        family_kind: family_link_kind(&model_likelihood_spec(&model)).to_string(),
         method: nuts_method_label(model).to_string(),
     }
 }
