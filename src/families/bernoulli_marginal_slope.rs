@@ -7766,7 +7766,7 @@ impl BernoulliMarginalSlopeFamily {
             row_contexts,
             row_cell_moments,
             row_primary_hessians: None,
-            rigid_third_full: OnceLock::new(),
+            rigid_third_full: crate::resource::RayonSafeOnce::new(),
             rigid_fourth_full: crate::resource::RayonSafeOnce::new(),
         })
     }
@@ -26525,7 +26525,7 @@ mod tests {
             row_contexts: cached.row_contexts.clone(),
             row_cell_moments: None,
             row_primary_hessians: None,
-            rigid_third_full: OnceLock::new(),
+            rigid_third_full: crate::resource::RayonSafeOnce::new(),
             rigid_fourth_full: crate::resource::RayonSafeOnce::new(),
         };
         let direction =
@@ -26572,7 +26572,7 @@ mod tests {
             row_contexts: cached.row_contexts.clone(),
             row_cell_moments: None,
             row_primary_hessians: None,
-            rigid_third_full: OnceLock::new(),
+            rigid_third_full: crate::resource::RayonSafeOnce::new(),
             rigid_fourth_full: crate::resource::RayonSafeOnce::new(),
         };
         let directions: Vec<_> = (0..4)

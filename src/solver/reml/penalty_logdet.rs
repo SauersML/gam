@@ -60,6 +60,21 @@ use rayon::prelude::*;
 
 use crate::faer_ndarray::FaerEigh;
 
+const INACTIVE_LAMBDA_FLOOR: f64 = 1e-300;
+
+fn active_lambda_threshold(lambdas: &[f64]) -> f64 {
+    let max_lambda = lambdas
+        .iter()
+        .copied()
+        .filter(|lambda| lambda.is_finite() && *lambda > 0.0)
+        .fold(0.0, f64::max);
+    (max_lambda * f64::EPSILON).max(INACTIVE_LAMBDA_FLOOR)
+}
+
+fn lambda_is_active(lambda: f64, threshold: f64) -> bool {
+    lambda.is_finite() && lambda > threshold
+}
+
 /// Check whether penalty ranges decompose into independent exact blocks.
 ///
 /// Multiple smoothing components may share the same block (for example tensor
@@ -99,20 +114,29 @@ fn infer_penalty_rank(penalty: &crate::construction::CanonicalPenalty) -> Result
 
 fn structural_nullity_from_penalties(
     penalties: &[crate::construction::CanonicalPenalty],
+    lambdas: &[f64],
     p_total: usize,
 ) -> Result<Option<usize>, String> {
     if penalties.is_empty() {
         return Ok(None);
     }
 
+    let lambda_threshold = active_lambda_threshold(lambdas);
     let mut component_matrices = Vec::with_capacity(penalties.len());
     let mut component_nullities = Vec::with_capacity(penalties.len());
-    for penalty in penalties {
+    for (k, penalty) in penalties.iter().enumerate() {
+        let lambda = lambdas.get(k).copied().unwrap_or(0.0);
+        if !lambda_is_active(lambda, lambda_threshold) {
+            continue;
+        }
         let rank = infer_penalty_rank(penalty)?;
         let mut component = Array2::<f64>::zeros((p_total, p_total));
         penalty.accumulate_weighted(&mut component, 1.0);
         component_matrices.push(component);
         component_nullities.push(p_total.saturating_sub(rank));
+    }
+    if component_matrices.is_empty() {
+        return Ok(Some(p_total));
     }
 
     Ok(Some(super::unified::exact_intersection_nullity(
@@ -274,7 +298,7 @@ impl PenaltyPseudologdet {
             )
         } else {
             let structural_nullity = if ridge > 0.0 {
-                structural_nullity_from_penalties(penalties, p_total)?
+                structural_nullity_from_penalties(penalties, lambdas, p_total)?
             } else {
                 None
             };
@@ -319,9 +343,11 @@ impl PenaltyPseudologdet {
         }
 
         // Group penalties by their exact block range.
+        let lambda_threshold = active_lambda_threshold(lambdas);
         let mut blocks: Vec<BlockData> = Vec::new();
         for (k, cp) in penalties.iter().enumerate() {
             let lambda = if k < lambdas.len() { lambdas[k] } else { 0.0 };
+            let lambda_active = lambda_is_active(lambda, lambda_threshold);
             let r = &cp.col_range;
             let local_rank = infer_penalty_rank(cp)?;
             let local_nullity = cp.block_dim().saturating_sub(local_rank);
@@ -331,20 +357,39 @@ impl PenaltyPseudologdet {
                 .find(|bd| bd.start == r.start && bd.end == r.end)
             {
                 bd.local.scaled_add(lambda, &cp.local);
-                bd.component_matrices.push(cp.local.clone());
-                bd.component_nullities.push(local_nullity);
+                if lambda_active {
+                    bd.component_matrices.push(cp.local.clone());
+                    bd.component_nullities.push(local_nullity);
+                } else {
+                    bd.structural_nullity = None;
+                }
             } else {
                 let bd = cp.block_dim();
                 let mut local = Array2::<f64>::zeros((bd, bd));
                 local.scaled_add(lambda, &cp.local);
                 let idx = blocks.len();
+                let structural_nullity = if lambda_active {
+                    cached_block_nullities.and_then(|cache| cache.get(idx))
+                } else {
+                    None
+                };
+                let component_matrices = if lambda_active {
+                    vec![cp.local.clone()]
+                } else {
+                    Vec::new()
+                };
+                let component_nullities = if lambda_active {
+                    vec![local_nullity]
+                } else {
+                    Vec::new()
+                };
                 blocks.push(BlockData {
                     start: r.start,
                     end: r.end,
                     local,
-                    structural_nullity: cached_block_nullities.and_then(|cache| cache.get(idx)),
-                    component_matrices: vec![cp.local.clone()],
-                    component_nullities: vec![local_nullity],
+                    structural_nullity,
+                    component_matrices,
+                    component_nullities,
                 });
             }
         }
@@ -390,10 +435,14 @@ impl PenaltyPseudologdet {
                 .map(|bd| {
                     let structural_nullity = if ridge > 0.0 {
                         bd.structural_nullity.or_else(|| {
-                            Some(super::unified::exact_intersection_nullity(
-                                &bd.component_matrices,
-                                &bd.component_nullities,
-                            ))
+                            if bd.component_matrices.is_empty() {
+                                Some(bd.end - bd.start)
+                            } else {
+                                Some(super::unified::exact_intersection_nullity(
+                                    &bd.component_matrices,
+                                    &bd.component_nullities,
+                                ))
+                            }
                         })
                     } else {
                         None
@@ -421,10 +470,14 @@ impl PenaltyPseudologdet {
                 .map(|bd| {
                     let structural_nullity = if ridge > 0.0 {
                         bd.structural_nullity.or_else(|| {
-                            Some(super::unified::exact_intersection_nullity(
-                                &bd.component_matrices,
-                                &bd.component_nullities,
-                            ))
+                            if bd.component_matrices.is_empty() {
+                                Some(bd.end - bd.start)
+                            } else {
+                                Some(super::unified::exact_intersection_nullity(
+                                    &bd.component_matrices,
+                                    &bd.component_nullities,
+                                ))
+                            }
                         })
                     } else {
                         None

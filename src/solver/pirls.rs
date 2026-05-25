@@ -4710,14 +4710,20 @@ where
         // (XᵀWX assembly + PD ridge + gradient) — measured 23 s / iter on
         // the biobank duchon60 lane (n=320 K, p_eff=42), where it doubled
         // wall-clock per iter on top of the candidate eval that already paid
-        // the same cost. Reuse `final_state` when the cached curvature kind
-        // matches what this iter requests; otherwise (e.g. force_fisher_for_rest
-        // just engaged, flipping preferred from Observed → Fisher) fall
-        // through to the rebuild path. Iter 1 always rebuilds because no
-        // prior accept has populated `final_state`.
-        let cache_curvature_kind = final_state.as_ref().map(|s| s.hessian_curvature);
-        let cached_state_matches = iter > 1 && cache_curvature_kind == Some(preferred_curvature);
+        // the same cost. Reuse `final_state` only when the cached curvature
+        // kind and exact coefficient bits match what this iter requests; the
+        // Hessian depends on the working weights/linearization point, so
+        // curvature kind alone is not a sufficient freshness predicate.
+        // Otherwise (e.g. force_fisher_for_rest just engaged, flipping
+        // preferred from Observed → Fisher) fall through to the rebuild path.
+        // Iter 1 always rebuilds because no prior accept has populated
+        // `final_state`.
+        let requested_cache_key = PirlsAcceptedStateCacheKey::new(&beta, preferred_curvature);
+        let cached_state_matches = iter > 1
+            && final_state.is_some()
+            && final_state_cache_key.as_ref() == Some(&requested_cache_key);
         let mut state = if cached_state_matches {
+            final_state_cache_key = None;
             final_state
                 .take()
                 .expect("cached_state_matches implies final_state.is_some()")
@@ -4862,7 +4868,7 @@ where
         // rather than rebuilding the regularized matrix each attempt.
         let mut sparse_applied_lambda = 0.0_f64;
         loop {
-            restore_arrow_latent_if_needed(options, pending_arrow_latent_restore.take());
+            restore_pending_arrow_latent_if_needed(options, &mut pending_arrow_latent_restore);
             attempts += 1;
             lm_attempts_done += 1;
             let attempt_solve_start = std::time::Instant::now();
@@ -5059,7 +5065,7 @@ where
                 } else {
                     "PIRLS produced non-finite step direction"
                 };
-                restore_arrow_latent_if_needed(options, pending_arrow_latent_restore.take());
+                restore_pending_arrow_latent_if_needed(options, &mut pending_arrow_latent_restore);
                 return Err(EstimationError::InvalidInput(format!(
                     "{detail} at iteration {iter} with damping λ={loop_lambda:.3e}"
                 )));
@@ -5253,16 +5259,16 @@ where
                                 Ok(state) => state,
                                 Err(err) => {
                                     if !is_lm_retriable_candidate_error(&err) {
-                                        restore_arrow_latent_if_needed(
+                                        restore_pending_arrow_latent_if_needed(
                                             options,
-                                            pending_arrow_latent_restore.take(),
+                                            &mut pending_arrow_latent_restore,
                                         );
                                         return Err(err);
                                     }
                                     if lm_retry_exhausted(loop_lambda, attempts, lm_max_attempts) {
-                                        restore_arrow_latent_if_needed(
+                                        restore_pending_arrow_latent_if_needed(
                                             options,
-                                            pending_arrow_latent_restore.take(),
+                                            &mut pending_arrow_latent_restore,
                                         );
                                         return Err(lm_nonconvergence_error(
                                             options,
@@ -5340,7 +5346,7 @@ where
                         // we have accepted the LM step; downstream cleanup
                         // paths still drain via `pending_arrow_latent_restore
                         // .take()` defensively.
-                        pending_arrow_latent_restore.take();
+                        commit_pending_arrow_latent(&mut pending_arrow_latent_restore);
 
                         // Updates for next iteration. Recycle the previous beta
                         // allocation as the next candidate buffer instead of
@@ -5560,9 +5566,9 @@ where
                                 "[PIRLS] mid-iter Fisher fallback iter={} reason=gain_rejection",
                                 iter,
                             );
-                            restore_arrow_latent_if_needed(
+                            restore_pending_arrow_latent_if_needed(
                                 options,
-                                pending_arrow_latent_restore.take(),
+                                &mut pending_arrow_latent_restore,
                             );
                             let fisher_fallback_start = std::time::Instant::now();
                             state =
@@ -5627,9 +5633,9 @@ where
                             max_abs_eta = inf_norm(state.eta.iter().copied());
                             // `state` is unused after `break 'pirls_loop` — move it
                             // instead of cloning to avoid an n+p² full-state copy.
-                            restore_arrow_latent_if_needed(
+                            restore_pending_arrow_latent_if_needed(
                                 options,
-                                pending_arrow_latent_restore.take(),
+                                &mut pending_arrow_latent_restore,
                             );
                             final_state = Some(state);
                             status = PirlsStatus::StalledAtValidMinimum;
@@ -5680,9 +5686,9 @@ where
                             // Preserve the structural ridge from the model state.
                             // `state` is unused after `break 'pirls_loop` — move it
                             // instead of cloning to avoid an n+p² full-state copy.
-                            restore_arrow_latent_if_needed(
+                            restore_pending_arrow_latent_if_needed(
                                 options,
-                                pending_arrow_latent_restore.take(),
+                                &mut pending_arrow_latent_restore,
                             );
                             final_state = Some(state);
                             break 'pirls_loop;
@@ -5718,9 +5724,9 @@ where
                             "[PIRLS] mid-iter Fisher fallback iter={} reason=candidate_err",
                             iter,
                         );
-                        restore_arrow_latent_if_needed(
+                        restore_pending_arrow_latent_if_needed(
                             options,
-                            pending_arrow_latent_restore.take(),
+                            &mut pending_arrow_latent_restore,
                         );
                         let fisher_err_start = std::time::Instant::now();
                         state = model.update_with_curvature(&beta, HessianCurvatureKind::Fisher)?;
@@ -5737,16 +5743,16 @@ where
                         continue;
                     }
                     if !is_lm_retriable_candidate_error(&err) {
-                        restore_arrow_latent_if_needed(
+                        restore_pending_arrow_latent_if_needed(
                             options,
-                            pending_arrow_latent_restore.take(),
+                            &mut pending_arrow_latent_restore,
                         );
                         return Err(err);
                     }
                     if lm_retry_exhausted(loop_lambda, attempts, lm_max_attempts) {
-                        restore_arrow_latent_if_needed(
+                        restore_pending_arrow_latent_if_needed(
                             options,
-                            pending_arrow_latent_restore.take(),
+                            &mut pending_arrow_latent_restore,
                         );
                         return Err(lm_nonconvergence_error(
                             options,
