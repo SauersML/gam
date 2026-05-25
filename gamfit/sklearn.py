@@ -100,7 +100,7 @@ class _BaseGAMEstimator(BaseEstimator):
         return self.model_.check(X)
 
 
-class GAMRegressor(_BaseGAMEstimator, RegressorMixin):
+class GAMRegressor(RegressorMixin, _BaseGAMEstimator):
     """scikit-learn-compatible regressor wrapping :func:`gamfit.fit`.
 
     Construct with a formula string and (optionally) pipeline kwargs such as
@@ -184,7 +184,7 @@ class GAMRegressor(_BaseGAMEstimator, RegressorMixin):
         return np.asarray(predicted["mean"], dtype=float)
 
 
-class GAMClassifier(_BaseGAMEstimator, ClassifierMixin):
+class GAMClassifier(ClassifierMixin, _BaseGAMEstimator):
     """scikit-learn-compatible binary classifier wrapping :func:`gamfit.fit`.
 
     Same construction and ``fit`` semantics as :class:`GAMRegressor` (see that
