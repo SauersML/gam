@@ -9,7 +9,9 @@ fn torus_wraps_angles_to_principal_interval() {
     let y = manifold
         .retract(x.view(), xi.view())
         .expect("torus retraction should succeed");
-    let in_range = y.iter().all(|v| *v >= -std::f64::consts::PI && *v < std::f64::consts::PI);
+    let in_range = y
+        .iter()
+        .all(|v| *v >= -std::f64::consts::PI && *v < std::f64::consts::PI);
     assert!(
         in_range,
         "Torus manifold should wrap every angle into the canonical interval [-π, π)"

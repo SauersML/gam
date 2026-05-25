@@ -4,7 +4,10 @@ use ndarray::{Array1, ArrayView1, arr1};
 struct Linear;
 
 impl RiemannianObjective for Linear {
-    fn value_gradient(&mut self, point: ArrayView1<'_, f64>) -> gam::GeometryResult<(f64, Array1<f64>)> {
+    fn value_gradient(
+        &mut self,
+        point: ArrayView1<'_, f64>,
+    ) -> gam::GeometryResult<(f64, Array1<f64>)> {
         let g = arr1(&[3.0, 4.0]);
         Ok((point.dot(&g), g))
     }

@@ -1096,7 +1096,24 @@ pub fn append_selected_wiggle_penalty_orders(
         return Ok(());
     }
     for &order in penalty_orders {
-        if order == 0 || order >= p {
+        if order == 0 {
+            continue;
+        }
+        if order >= p {
+            // A k-th order difference operator applied to a length-p coefficient
+            // vector produces a (p-k)-row matrix. When p <= k, that operator has
+            // zero rows and `S = Dᵀ D` is the p×p zero matrix; equivalently,
+            // every length-p sequence is a polynomial of degree < k restricted
+            // to the integer grid, so the entire coefficient space is in the
+            // penalty's null space. Append that degenerate-but-mathematically-
+            // consistent penalty rather than silently dropping the user's
+            // request — silently discarding requested penalty orders hides
+            // misconfiguration and changes the model the caller asked for.
+            let zero_penalty = ndarray::Array2::<f64>::zeros((p, p));
+            block
+                .penalties
+                .push(crate::solver::estimate::PenaltySpec::Dense(zero_penalty));
+            block.nullspace_dims.push(p);
             continue;
         }
         let penalty =
