@@ -40,8 +40,10 @@ def main() -> None:
         response_columns=["y0", "y1", "y2"],
     )
 
-    summary = model.summary()["shared_fit"]
-    print(f"hue circle fit: lambda={float(summary['lambda']):.4g}")
+    shared_fit = model.summary()["shared_fit"]
+    if not isinstance(shared_fit, dict):
+        raise RuntimeError("response geometry fit did not produce a shared tangent fit")
+    print(f"hue circle fit: lambda={float(shared_fit['lambda']):.4g}")
 
 
 if __name__ == "__main__":
