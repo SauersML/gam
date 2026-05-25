@@ -8,8 +8,8 @@ Interpretability." arXiv:2501.18823, 2025.
 A skip-transcoder reconstructs the residual stream at layer L_out using a
 *sparse code computed from* layer L_in plus a *low-rank affine bypass* of L_in:
 
-    z       = JumpReLU(W_enc · x_in + b_enc)        # sparse code, F atoms
-    y_hat   = W_dec · z       + A_skip · x_in + b_out
+    z       = JumpReLU(W_enc * x_in + b_enc)        # sparse code, F atoms
+    y_hat   = W_dec * z       + A_skip * x_in + b_out
               (sparse circuit)   (rank-r bypass)
 
 The skip path lets the dictionary specialize on residual structure that the
@@ -26,10 +26,11 @@ JumpReLU penalty (already in the Rust core) and Pca-style low-rank smooth.
 
 Outer-loop REML
 ---------------
-``skip_transcoder`` runs an outer-loop selection over
-``(λ_sparse, jumprelu_threshold, rank_skip)`` by composing the per-config
-REML score (negative log-marginal-likelihood of the Gaussian) from gamfit's
-closed-form ridge solver. The lowest REML wins.
+``skip_transcoder`` expands an ``(lambda_sparse, jumprelu_threshold,
+rank_skip)`` grid into per-config ``SkipAffineSmooth`` modules. The
+analytic REML score and the argmin selector are computed in the gam Rust
+core (``skip_transcoder_reml_metrics`` / ``skip_transcoder_select_reml``):
+this Python module is a thin marshaling layer.
 """
 from __future__ import annotations
 
@@ -55,8 +56,8 @@ class SkipAffineSmooth(nn.Module):
     The two halves share the same design matrix on the input side (``x_in``)
     but their codomain is a DIFFERENT layer's residual (``y_out``). Sparse
     encode/decode is a width-F atom dictionary gated by ``JumpReLUPenalty``;
-    the bypass is ``A · x_in`` factored as ``U @ V^T`` with ``U ∈ R^(d_out, r)``
-    and ``V ∈ R^(d_in, r)``.
+    the bypass is ``A * x_in`` factored as ``U @ V^T`` with ``U`` in
+    ``R^(d_out, r)`` and ``V`` in ``R^(d_in, r)``.
 
     Parameters
     ----------
@@ -68,7 +69,7 @@ class SkipAffineSmooth(nn.Module):
         Rank of the affine bypass A. 0 disables the skip (degenerates to a
         plain transcoder).
     jumprelu_threshold:
-        Base threshold τ_k for JumpReLU gating (scalar broadcast to F).
+        Base threshold tau_k for JumpReLU gating (scalar broadcast to F).
     learnable_threshold:
         If True, REML can shift the threshold via ``log_threshold`` parameter.
     smoothing_eps:
@@ -147,7 +148,7 @@ class SkipAffineSmooth(nn.Module):
     # --------------------------------------------------------------
 
     def encode(self, x_in: torch.Tensor) -> torch.Tensor:
-        """Pre-gate latents ``z_pre = x_in · W_enc + b_enc``."""
+        """Pre-gate latents ``z_pre = x_in * W_enc + b_enc``."""
         return x_in @ self.W_enc + self.b_enc
 
     def code(self, x_in: torch.Tensor) -> torch.Tensor:
@@ -155,7 +156,7 @@ class SkipAffineSmooth(nn.Module):
         return self.jumprelu.gate(self.encode(x_in))
 
     def skip_term(self, x_in: torch.Tensor) -> torch.Tensor:
-        """Low-rank affine bypass A · x_in.  Returns 0 when rank_skip=0."""
+        """Low-rank affine bypass A * x_in.  Returns 0 when rank_skip=0."""
         if self.skip_U is None:
             return torch.zeros(
                 x_in.shape[0], self.out_dim, device=x_in.device, dtype=x_in.dtype
@@ -171,7 +172,7 @@ class SkipAffineSmooth(nn.Module):
         return y_hat, z
 
     # --------------------------------------------------------------
-    # Convenience: ∂z_out_j / ∂z_in_i contribution for attribution graphs
+    # Convenience: attribution-graph edge weights at JumpReLU-active points
     # --------------------------------------------------------------
 
     @torch.no_grad()
@@ -184,11 +185,11 @@ class SkipAffineSmooth(nn.Module):
         """For a target *output* feature ``j``, return the top-k input atoms
         that drive it on ``x_in``.
 
-        We approximate this as the per-batch product of the decoder column
-        ``W_dec[j, :]`` projected onto the input-atom space via the encoder:
-        ``contrib_i = mean_b z_in_i(b) · (W_dec[:, target] · W_enc[:, i])``.
-        This is the linearized circuit edge weight at the JumpReLU-active
-        points, exactly the quantity Anthropic-style attribution graphs use.
+        Edge weight to ``target_atom`` from upstream atom ``i`` is the
+        per-batch mean activation of ``i`` weighted by the inner-product
+        alignment between its decoder row and the target's decoder row.
+        This is the linearized circuit-edge weight at the JumpReLU-active
+        points that Anthropic-style attribution graphs consume.
         """
         z = self.code(x_in)                                # (B, F)
         z_mean = z.mean(dim=0)                             # (F,)
@@ -238,18 +239,12 @@ def skip_transcoder(
     When all of ``rank_skip``, ``jumprelu_threshold``, ``lambda_sparse`` are
     scalars, this returns a single ``SkipAffineSmooth`` ready for training.
 
-    When any of them is a sequence, the user is opting into the outer-loop
-    REML selector: the caller must train each candidate, then call
-    :func:`select_by_reml` on the resulting list. This module deliberately
-    does not own the training loop — gamfit's job is the composition primitive
-    and the REML score; user owns the optimizer.
-
-    Notes
-    -----
-    The PyFFI signature matches the spec in the task statement: ``in_dim,
-    out_dim, n_atoms, rank_skip, jumprelu_threshold``.
-    ``lambda_sparse`` is added as a kwarg because the L1/L0 sparsity weight
-    is logically part of the sparse-code prior strength.
+    When any of them is a sequence, the caller opts into the outer-loop
+    REML selector: train each returned candidate, then call
+    :func:`score_and_select` to fill the REML/MSE/sparsity/EV fields and
+    pick the best. This module deliberately does not own the training
+    loop — gamfit's job is the composition primitive and the REML score;
+    the user owns the optimizer.
     """
     rank_list = list(rank_skip) if isinstance(rank_skip, (list, tuple)) else [int(rank_skip)]
     thr_list = (
@@ -275,7 +270,6 @@ def skip_transcoder(
             dtype=dtype,
         )
 
-    # Sweep mode — return un-trained candidates the caller will train + score.
     out: list[SkipTranscoderResult] = []
     for r in rank_list:
         for tau in thr_list:
@@ -306,6 +300,14 @@ def skip_transcoder(
     return out
 
 
+def _as_2d_f64_numpy(tensor: torch.Tensor):
+    """Detach, cast to f64, ensure 2-D shape for the Rust metrics call."""
+    t = tensor.detach()
+    if t.dim() == 1:
+        t = t.unsqueeze(-1)
+    return to_numpy_f64(t)
+
+
 def reml_score_skip_transcoder(
     smooth: SkipAffineSmooth,
     x_in: torch.Tensor,
@@ -314,29 +316,71 @@ def reml_score_skip_transcoder(
 ) -> float:
     """Closed-form Gaussian REML score for one trained skip-transcoder.
 
-    Approximation: Rust treats the active decoder rows plus skip output
-    factors as the effective output subspace M(λ_sparse), then computes
-        -REML = 0.5·(n_out · log(σ²_hat) + log|M M^T + λ_sparse·I|).
-    This is the Laplace-marginal-likelihood used by gam's outer loop.
+    Thin marshaling over the Rust ``skip_transcoder_reml_metrics`` driver:
+    the Rust core assembles the effective design (active-atom decoder rows
+    plus skip bypass), Cholesky-factors ``M Mᵀ + lambda_sparse * I``, and
+    returns ``0.5 * (n * log sigma2 + logdet)`` — the Laplace marginal
+    likelihood used by gam's outer loop.
     """
     with torch.no_grad():
         y_hat, z = smooth(x_in)
+        skip_u = None if smooth.skip_U is None else _as_2d_f64_numpy(smooth.skip_U)
+        skip_v = None if smooth.skip_V is None else _as_2d_f64_numpy(smooth.skip_V)
         metrics = rust_module().skip_transcoder_reml_metrics(
-            to_numpy_f64(y_out),
-            to_numpy_f64(y_hat),
-            to_numpy_f64(z),
-            to_numpy_f64(smooth.W_dec),
+            _as_2d_f64_numpy(y_out),
+            _as_2d_f64_numpy(y_hat),
+            _as_2d_f64_numpy(z),
+            _as_2d_f64_numpy(smooth.W_dec),
             float(lambda_sparse),
-            None if smooth.skip_U is None else to_numpy_f64(smooth.skip_U),
-            None if smooth.skip_V is None else to_numpy_f64(smooth.skip_V),
+            skip_u,
+            skip_v,
         )
         return float(metrics["reml_score"])
 
 
 def select_by_reml(results: list[SkipTranscoderResult]) -> SkipTranscoderResult:
-    """Return the candidate with the lowest REML score (best Bayesian fit)."""
-    best_idx = rust_module().skip_transcoder_select_reml([r.reml_score for r in results])
-    return results[int(best_idx)]
+    """Return the candidate with the lowest REML score (best Bayesian fit).
+
+    Thin wrapper over the Rust ``skip_transcoder_select_reml`` argmin,
+    which performs the NaN-skip + raise-on-empty contract.
+    """
+    idx = rust_module().skip_transcoder_select_reml([float(r.reml_score) for r in results])
+    return results[int(idx)]
+
+
+def score_and_select(
+    results: list[SkipTranscoderResult],
+    x_in: torch.Tensor,
+    y_out: torch.Tensor,
+) -> SkipTranscoderResult:
+    """Score each (trained) candidate against ``(x_in, y_out)`` and return
+    the best.
+
+    For every entry in ``results`` this fills ``reml_score``, ``mse``,
+    ``sparsity`` and ``explained_variance`` in place by calling the Rust
+    ``skip_transcoder_reml_metrics`` driver, then picks the argmin REML
+    via ``skip_transcoder_select_reml``.
+    """
+    rm = rust_module()
+    with torch.no_grad():
+        for r in results:
+            y_hat, z = r.smooth(x_in)
+            skip_u = None if r.smooth.skip_U is None else _as_2d_f64_numpy(r.smooth.skip_U)
+            skip_v = None if r.smooth.skip_V is None else _as_2d_f64_numpy(r.smooth.skip_V)
+            m = rm.skip_transcoder_reml_metrics(
+                _as_2d_f64_numpy(y_out),
+                _as_2d_f64_numpy(y_hat),
+                _as_2d_f64_numpy(z),
+                _as_2d_f64_numpy(r.smooth.W_dec),
+                float(r.lambda_sparse),
+                skip_u,
+                skip_v,
+            )
+            r.reml_score = float(m["reml_score"])
+            r.mse = float(m["mse"])
+            r.sparsity = float(m["sparsity"])
+            r.explained_variance = float(m["explained_variance"])
+    return select_by_reml(results)
 
 
 __all__ = [
@@ -345,4 +389,5 @@ __all__ = [
     "skip_transcoder",
     "reml_score_skip_transcoder",
     "select_by_reml",
+    "score_and_select",
 ]

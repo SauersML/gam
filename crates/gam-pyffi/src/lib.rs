@@ -531,6 +531,7 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
             "formula_validation_html",
             "design_matrix_array",
             "basis",
+            "basis_with_jet",
             "duchon_function_norm_penalty",
             "duchon_operator_penalties",
             "thin_plate_penalty",
@@ -990,6 +991,88 @@ fn duchon_basis_with_jet<'py>(
         jet.into_pyarray(py).unbind(),
         penalty.into_pyarray(py).unbind(),
     ))
+}
+
+fn required_usize_param(params: &Bound<'_, PyDict>, key: &str) -> PyResult<usize> {
+    params
+        .get_item(key)?
+        .ok_or_else(|| py_value_error(format!("basis_with_jet params missing {key:?}")))?
+        .extract::<usize>()
+}
+
+#[pyfunction(signature = (kind, t, params))]
+fn basis_with_jet<'py>(
+    py: Python<'py>,
+    kind: &str,
+    t: PyReadonlyArray2<'py, f64>,
+    params: &Bound<'py, PyDict>,
+) -> PyResult<(
+    Py<PyArray2<f64>>,
+    Py<PyArray3<f64>>,
+    Py<PyArray2<f64>>,
+)> {
+    match kind.to_ascii_lowercase().replace('-', "_").as_str() {
+        "duchon" | "euclidean" | "euclidean_patch" => {
+            let centers = params
+                .get_item("centers")?
+                .ok_or_else(|| py_value_error("basis_with_jet params missing \"centers\"".to_string()))?
+                .extract::<PyReadonlyArray2<'py, f64>>()?;
+            let m = required_usize_param(params, "m")?;
+            duchon_basis_with_jet(py, t, centers, m)
+        }
+        "periodic" | "periodic_spline" | "circle" => {
+            let n_harmonics = required_usize_param(params, "n_harmonics")?;
+            let coords = t.as_array();
+            if coords.ncols() == 0 {
+                return Err(py_value_error(
+                    "basis_with_jet periodic basis expects at least one t column".to_string(),
+                ));
+            }
+            if coords.iter().any(|value| !value.is_finite()) {
+                return Err(py_value_error(
+                    "basis_with_jet periodic basis requires finite t values".to_string(),
+                ));
+            }
+
+            let n_rows = coords.nrows();
+            let n_cols = 1 + 2 * n_harmonics;
+            let mut phi = Array2::<f64>::zeros((n_rows, n_cols));
+            let mut jet = Array3::<f64>::zeros((n_rows, n_cols, 1));
+            let mut penalty = Array2::<f64>::zeros((n_cols, n_cols));
+            phi.column_mut(0).fill(1.0);
+            penalty[[0, 0]] = 1.0e-8;
+
+            for h in 1..=n_harmonics {
+                let h_f = h as f64;
+                let frequency = std::f64::consts::TAU * h_f;
+                let sin_col = 1 + 2 * (h - 1);
+                let cos_col = sin_col + 1;
+                let harmonic_penalty = h_f * h_f * h_f * h_f;
+                penalty[[sin_col, sin_col]] = harmonic_penalty;
+                penalty[[cos_col, cos_col]] = harmonic_penalty;
+
+                for row in 0..n_rows {
+                    let angle = frequency * coords[[row, 0]].rem_euclid(1.0);
+                    let sin_value = angle.sin();
+                    let cos_value = angle.cos();
+                    phi[[row, sin_col]] = sin_value;
+                    phi[[row, cos_col]] = cos_value;
+                    jet[[row, sin_col, 0]] = frequency * cos_value;
+                    jet[[row, cos_col, 0]] = -frequency * sin_value;
+                }
+            }
+
+            Ok((
+                phi.into_pyarray(py).unbind(),
+                jet.into_pyarray(py).unbind(),
+                penalty.into_pyarray(py).unbind(),
+            ))
+        }
+        "sphere" => sphere_chart_basis_with_jet(py, t),
+        other => Err(py_value_error(format!(
+            "basis_with_jet unsupported basis kind {other:?}"
+        ))),
+    }
 }
 
 /// Evaluate the Duchon m-spline basis at `points` against K `centers`,
@@ -10028,7 +10111,7 @@ fn summary_format_float(value: f64) -> String {
         summary_normalize_exponent(&raw)
     } else {
         let places = (6 - exponent - 1).max(0) as usize;
-        summary_trim_float(format!("{value:.places$}"))
+        summary_trim_float(format!("{:.*}", places, value))
     };
     if out == "-0" {
         out = "0".to_string();
@@ -10758,6 +10841,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(design_matrix_array, module)?)?;
     module.add_function(wrap_pyfunction!(bspline_basis, module)?)?;
     module.add_function(wrap_pyfunction!(bspline_basis_derivative, module)?)?;
+    module.add_function(wrap_pyfunction!(basis_with_jet, module)?)?;
     module.add_function(wrap_pyfunction!(periodic_basis_with_jet, module)?)?;
     module.add_function(wrap_pyfunction!(duchon_basis_with_jet, module)?)?;
     module.add_function(wrap_pyfunction!(duchon_basis, module)?)?;
@@ -10837,6 +10921,8 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(posterior_credible_interval, module)?)?;
     module.add_function(wrap_pyfunction!(apply_inverse_link_array, module)?)?;
     module.add_function(wrap_pyfunction!(summary_json, module)?)?;
+    module.add_function(wrap_pyfunction!(summary_repr, module)?)?;
+    module.add_function(wrap_pyfunction!(summary_html, module)?)?;
     module.add_function(wrap_pyfunction!(coefficient_state_json, module)?)?;
     module.add_function(wrap_pyfunction!(
         cross_fit_shared_precision_groups_json,
