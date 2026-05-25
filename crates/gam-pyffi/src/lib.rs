@@ -87,6 +87,8 @@ use gam::terms::{
     OrthogonalityPenalty as CoreOrthogonalityPenalty, ParametricRowPrecisionPriorPenalty,
     PenaltyConcavity, PenaltyTier, PsiSlice, RowPrecisionPriorPenalty,
     ScadMcpPenalty as CoreScadMcpPenalty, ScalarWeightSchedule,
+    EdgeRestriction as CoreEdgeRestriction,
+    SheafConsistencyPenalty as CoreSheafConsistencyPenalty,
     SoftmaxAssignmentSparsityPenalty as CoreSoftmaxAssignmentSparsityPenalty,
     SparsityPenalty as CoreSparsityPenalty, StreamingMaternBasisGradientEvaluator,
     TopKActivationPenalty, TotalVariationPenalty as CoreTotalVariationPenalty,

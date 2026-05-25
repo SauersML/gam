@@ -107,11 +107,11 @@ from ._penalties import (
     TotalVariationPenalty,
 )
 from .topology import (
-    Circle as _TopologyCircle,
-    Cylinder as _TopologyCylinder,
+    Circle,
+    Cylinder,
     EuclideanPatch,
     Sphere as TopologySphere,
-    Torus as _TopologyTorus,
+    Torus,
 )
 from ._select_topology import (
     BasisSpec,

@@ -166,11 +166,46 @@ def _build_penalty_wrapper(name: str, rust_cls: type[Any]) -> type[Any]:
             self._inner.set_weight_schedule(schedule)
             return self
 
-        def value_grad(self, t: Any) -> tuple[float, np.ndarray]:
-            return _penalty_value_grad_via_rust(self, t)
+        def value_grad(self, t: Any) -> tuple[Any, Any]:
+            """Compute ``(P(t), ∂P/∂t)`` in the frame of ``t``.
 
-        def hvp(self, t: Any, v: Any) -> np.ndarray:
-            return _penalty_hvp_via_rust(self, t, v)
+            Frame is auto-detected from ``t`` (NumPy / Torch / JAX). The
+            same Rust kernel runs in every frame; only the output wrapping
+            differs. Torch and JAX outputs carry an autograd graph so that
+            ``torch.autograd.grad`` and ``jax.grad`` of ``value`` return
+            ``grad`` consistently with the analytic Rust gradient.
+            """
+            from ._frame import Frame, detect_frame
+
+            frame = detect_frame(t)
+            if frame is Frame.NUMPY:
+                return _penalty_value_grad_via_rust(self, t)
+            if frame is Frame.TORCH:
+                from ._penalty_frames import torch_penalty_value_grad
+
+                return torch_penalty_value_grad(self, t)
+            from ._penalty_frames import jax_penalty_value_grad
+
+            return jax_penalty_value_grad(self, t)
+
+        def hvp(self, t: Any, v: Any) -> Any:
+            """Compute ``∂²P/∂t² · v`` in the frame shared by ``t`` and ``v``.
+
+            Mixed frames raise :class:`TypeError` — both arguments must be
+            in the same frame.
+            """
+            from ._frame import Frame, detect_frame
+
+            frame = detect_frame(t, v)
+            if frame is Frame.NUMPY:
+                return _penalty_hvp_via_rust(self, t, v)
+            if frame is Frame.TORCH:
+                from ._penalty_frames import torch_penalty_hvp
+
+                return torch_penalty_hvp(self, t, v)
+            from ._penalty_frames import jax_penalty_hvp
+
+            return jax_penalty_hvp(self, t, v)
 
         def __getattr__(self, item: str) -> Any:
             # Called only when normal attribute resolution fails — forward to
