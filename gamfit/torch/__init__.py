@@ -58,7 +58,16 @@ from .geometry import (
     sphere_frechet_mean,
     sphere_log_map,
 )
-from .modules import from_fitted
+from .modules import (
+    GatedSAEDecoder,
+    ManifoldSAE,
+    ManifoldSAEConfig,
+    ManifoldSAEOutput,
+    SoftmaxAssignmentSparsityPenalty,
+    SparsityPenalty,
+    TopKActivationPenalty,
+    from_fitted,
+)
 from .penalties import (
     ARDPenalty,
     BlockOrthogonalityPenalty,
@@ -101,11 +110,18 @@ __all__ = [
     "IvaeRidgeMeanGauge",
     "JumpReLUPenalty",
     "LazyPcaBasis",
+    "ManifoldSAE",
+    "ManifoldSAEConfig",
+    "ManifoldSAEOutput",
     "SkipAffineSmooth",
     "SkipTranscoderResult",
     "skip_transcoder",
+    "GatedSAEDecoder",
     "MechanismSparsityPenalty",
     "RiemannianRetraction",
+    "SoftmaxAssignmentSparsityPenalty",
+    "SparsityPenalty",
+    "TopKActivationPenalty",
     "TopologyAutoSelector",
     "Smooth",
     "Duchon",
