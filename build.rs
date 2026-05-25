@@ -3037,6 +3037,15 @@ fn scan_for_useless_tests(root: &Path, dir: &Path, offenders: &mut Vec<(PathBuf,
             }
             if !found {
                 let raw = lines.get(i).copied().unwrap_or("");
+                if rel.to_string_lossy().contains("pyffi_fitted_family_roundtrip_bug") {
+                    eprintln!("DEBUG useless_test: file={} open={} close={}", rel.display(), open, close);
+                    for k in open..=close {
+                        let raw_l = lines.get(k).copied().unwrap_or("");
+                        let strp = stripped_lines.get(k).map(String::as_str).unwrap_or(raw_l);
+                        eprintln!("  L{}: RAW=[{}]", k + 1, raw_l);
+                        eprintln!("       STR=[{}]", strp);
+                    }
+                }
                 offenders.push((rel.to_path_buf(), i + 1, raw.to_string()));
             }
             i = close + 1;
