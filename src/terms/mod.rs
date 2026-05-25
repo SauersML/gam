@@ -4,6 +4,7 @@ pub mod atom_selection;
 pub mod basis;
 pub mod closed_form_operator;
 pub mod construction;
+pub mod equivariant_penalty;
 pub mod gated_decoder;
 pub mod hull;
 pub mod input_loc_derivatives;

@@ -1,1286 +1,83 @@
 #!/usr/bin/env python3
-"""
-Adversarial fuzzer: find datasets where mgcv massively outperforms Rust GAM.
+"""Dataset-backed mgcv comparison harness for gamfit.
 
-Generates extremely diverse regression datasets across multiple model types
-(GAM, GAMLSS, Duchon, multidimensional) and compares Rust vs mgcv, surfacing
-the worst failures with full diagnostic detail.
-
-Model types tested:
-  - gaussian GAM (ps, tps, duchon)
-  - binomial GAM (ps, tps, duchon)
-  - gaussian GAMLSS location-scale (ps, duchon)
-  - mgcv gaulss comparison
-
-Defaults are tuned so a fresh run produces ≥ 80% valid mgcv-vs-rust trials:
-  - Trial count: 200 by default (set FUZZ_DEPTH=deep for 500, FUZZ_DEPTH=heavy
-    for 1000). The CI gate in compute_ci_gates() requires ≥ 80% of requested
-    trials to produce a valid comparison or the run fails.
-  - Scenario cost cap: 200_000 by default. The previous 75_000 cap was
-    skipping ~41% of generated scenarios; that loss now trips the coverage
-    gate.
-  - Noise / signal / x-distribution coverage: every entry in NOISE_FN,
-    SIGNAL_BUILDERS, XDIST_FN, SIGMA_FN is reachable. The scenario generator
-    biases toward pathological combinations (heavy-tail noise, regime
-    changes, near-collinear x, low-dim manifold features).
-  - Sample sizes span n=50 (worst-case small) through n=10_000 (large enough
-    to cross the faer dense-Cholesky threshold) so regressions in either
-    regime are caught.
-  - Knot counts span k=3 (under-smoothed) through k=25 (over-parameterized
-    relative to small n) to stress both ends.
-  - Regression-baseline mode: pass `--baseline-json path/to/baseline.json`
-    to fail the run when any cohort's median gap exceeds the baseline by
-    more than its threshold (default 0.05).
-
-Usage:
-    python bench/fuzz_vs_mgcv.py                        # 200 trials
-    python bench/fuzz_vs_mgcv.py --n-trials 500         # more
-    python bench/fuzz_vs_mgcv.py --resume                # continue
-    python bench/fuzz_vs_mgcv.py --model-type gamlss     # only gamlss
-    python bench/fuzz_vs_mgcv.py --family binomial       # only binomial
-    FUZZ_DEPTH=deep python bench/fuzz_vs_mgcv.py         # 500 trials
-    FUZZ_DEPTH=heavy python bench/fuzz_vs_mgcv.py        # 1000 trials
-    python bench/fuzz_vs_mgcv.py --baseline-json bench/fuzz_baseline.json
+This file intentionally contains no spline, REML, gradient, or synthetic data
+math. It orchestrates existing benchmark scenarios, calls the Python gamfit API
+for the Rust implementation, calls the shared mgcv runner from run_suite, and
+writes the same JSONL-style comparison records used by the old fuzzer.
 """
 
 from __future__ import annotations
-import typing
 
-import sys
 import argparse
-import inspect
 import json
 import math
-import os
 import secrets
+import statistics
 import subprocess
-import tempfile
+import sys
 import time
 import traceback
-from dataclasses import dataclass, asdict
+import typing
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
 import pandas as pd
 
-# Import metrics from the main benchmark suite
+import gamfit
+from gamfit._diagnostics import Diagnostics
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from run_suite import (
+from run_suite import (  # noqa: E402
+    _formula_rhs_from_terms,
+    _mgcv_formula_for_scenario,
+    _rust_formula_for_scenario,
+    _scenario_fit_mapping,
+    _sigma_feature_terms,
     auc_score,
     brier_score,
-    log_loss_score,
-    nagelkerke_r2_score,
-    rmse_score,
-    r2_score,
-    mae_score,
+    dataset_for_scenario,
+    folds_for_dataset,
     gaussian_log_loss_score,
+    log_loss_score,
+    mse_score,
+    nagelkerke_r2_score,
+    run_external_mgcv_cv,
+    run_external_mgcv_gaulss_cv,
     zscore_train_test,
-    make_folds,
 )
 
-# Force unbuffered stdout so per-trial output appears in real time
 typing.cast(typing.Any, sys.stdout).reconfigure(line_buffering=True)
 
 ROOT = Path(__file__).resolve().parent.parent
-RUST_BINARY = ROOT / "target" / "release" / "gam"
-RESULTS_FILE = Path(__file__).resolve().parent / "fuzz_results.jsonl"
-META_FILE = Path(__file__).resolve().parent / "fuzz_results.meta.json"
+BENCH_DIR = ROOT / "bench"
+SCENARIOS_FILE = BENCH_DIR / "scenarios.json"
+RESULTS_FILE = BENCH_DIR / "fuzz_results.jsonl"
+META_FILE = BENCH_DIR / "fuzz_results.meta.json"
 DEFAULT_R_TIMEOUT = 180
 DEFAULT_RUST_TIMEOUT = 180
+DEFAULT_N_TRIALS = 200
 
-# ═══════════════════════════════════════════════════════════════════════════
-# SMOOTH FUNCTION LIBRARY — 35+ functions
-# ═══════════════════════════════════════════════════════════════════════════
 
-def _f_sine(x: typing.Any, rng: typing.Any) -> typing.Any:
-    return np.sin(rng.uniform(0.5, 8) * x + rng.uniform(0, 2*np.pi))
-
-def _f_cosine_beat(x: typing.Any, rng: typing.Any) -> typing.Any:
-    f1, f2 = rng.uniform(2, 6), rng.uniform(5, 10)
-    return np.cos(f1 * x) * np.cos(f2 * x)
-
-def _f_poly(x: typing.Any, rng: typing.Any) -> typing.Any:
-    return np.polyval(rng.randn(rng.randint(2, 7) + 1), x)
-
-def _f_step(x: typing.Any, rng: typing.Any) -> typing.Any:
-    cuts = np.sort(rng.uniform(np.percentile(x, 5), np.percentile(x, 95), rng.randint(1, 8)))
-    levels = rng.randn(len(cuts) + 1) * 2
-    out = np.full_like(x, levels[0])
-    for i, c in enumerate(cuts):
-        out = np.where(x > c, levels[i + 1], out)
-    return out
-
-def _f_spike(x: typing.Any, rng: typing.Any) -> typing.Any:
-    c = rng.uniform(np.percentile(x, 15), np.percentile(x, 85))
-    w = rng.uniform(0.01, 0.2) * (np.ptp(x) + 1e-8)
-    return rng.uniform(2, 10) * np.exp(-0.5 * ((x - c) / w)**2)
-
-def _f_multi_spike(x: typing.Any, rng: typing.Any) -> typing.Any:
-    return sum(_f_spike(x, rng) for _ in range(rng.randint(2, 5)))
-
-def _f_plateau(x: typing.Any, rng: typing.Any) -> typing.Any:
-    lo = rng.uniform(np.percentile(x, 5), np.percentile(x, 40))
-    hi = rng.uniform(np.percentile(x, 60), np.percentile(x, 95))
-    s = rng.uniform(5, 40) / (np.ptp(x) + 1e-8)
-    return rng.uniform(1, 5) * (1/(1+np.exp(-s*(x-lo))) - 1/(1+np.exp(-s*(x-hi))))
-
-def _f_wiggly(x: typing.Any, rng: typing.Any) -> typing.Any:
-    return sum(rng.uniform(.2, 2)*np.sin(rng.uniform(1, 20)*x + rng.uniform(0, 2*np.pi))
-               for _ in range(rng.randint(4, 12)))
-
-def _f_linear(x: typing.Any, rng: typing.Any) -> typing.Any:
-    return rng.uniform(-3, 3) * x
-
-def _f_quadratic(x: typing.Any, rng: typing.Any) -> typing.Any:
-    return rng.randn() * x**2 + rng.randn() * x + rng.randn()
-
-def _f_cubic(x: typing.Any, rng: typing.Any) -> typing.Any:
-    c = rng.randn(4)
-    return c[0]*x**3 + c[1]*x**2 + c[2]*x + c[3]
-
-def _f_sqrt_abs(x: typing.Any, rng: typing.Any) -> typing.Any:
-    return rng.uniform(1, 5) * np.sign(x) * np.sqrt(np.abs(x))
-
-def _f_log_abs(x: typing.Any, rng: typing.Any) -> typing.Any:
-    return rng.uniform(0.5, 3) * np.log1p(np.abs(x))
-
-def _f_sawtooth(x: typing.Any, rng: typing.Any) -> typing.Any:
-    f = rng.uniform(1, 6)
-    return 2 * (f*x/(2*np.pi) - np.floor(0.5 + f*x/(2*np.pi)))
-
-def _f_chirp(x: typing.Any, rng: typing.Any) -> typing.Any:
-    f0, f1 = rng.uniform(0.5, 2), rng.uniform(4, 15)
-    t = (x - x.min()) / (np.ptp(x) + 1e-8)
-    return np.sin(2*np.pi*(f0*t + (f1-f0)*t**2/2))
-
-def _f_runge(x: typing.Any, rng: typing.Any) -> typing.Any:
-    c = rng.uniform(-0.5, 0.5) * np.ptp(x)
-    s = rng.uniform(0.05, 0.3) * np.ptp(x)
-    return 1 / (1 + ((x - c) / s)**2)
-
-def _f_abs_sin(x: typing.Any, rng: typing.Any) -> typing.Any:
-    return np.abs(np.sin(rng.uniform(1, 6) * x))
-
-def _f_piecewise_linear(x: typing.Any, rng: typing.Any) -> typing.Any:
-    breaks = np.sort(rng.uniform(x.min(), x.max(), rng.randint(2, 7)))
-    slopes = rng.randn(len(breaks) + 1) * 2
-    out = np.zeros_like(x)
-    prev = x.min()
-    val = 0.0
-    for i, b in enumerate(breaks):
-        m = (x >= prev) & (x < b)
-        out[m] = val + slopes[i]*(x[m]-prev)
-        val += slopes[i]*(b-prev)
-        prev = b
-    out[x >= prev] = val + slopes[-1]*(x[x >= prev]-prev)
-    return out
-
-def _f_exp_decay(x: typing.Any, rng: typing.Any) -> typing.Any:
-    return rng.uniform(1, 5) * np.exp(-rng.uniform(0.5, 5) * (x - x.min()) / (np.ptp(x)+1e-8))
-
-def _f_logistic(x: typing.Any, rng: typing.Any) -> typing.Any:
-    c = rng.uniform(np.percentile(x, 20), np.percentile(x, 80))
-    s = rng.uniform(0.05, 0.5) * np.ptp(x)
-    return rng.uniform(1, 5) / (1 + np.exp(-(x - c) / s))
-
-def _f_interaction_proxy(x: typing.Any, rng: typing.Any) -> typing.Any:
-    mid = np.median(x)
-    return np.sin(rng.uniform(2, 6)*x)*(x < mid) + rng.uniform(.3, 2)*x*(x >= mid)
-
-def _f_modulated_sine(x: typing.Any, rng: typing.Any) -> typing.Any:
-    return np.sin(rng.uniform(3, 10)*x) * np.cos(rng.uniform(0.5, 2)*x)
-
-def _f_cauchy_bump(x: typing.Any, rng: typing.Any) -> typing.Any:
-    c = rng.uniform(np.percentile(x, 20), np.percentile(x, 80))
-    w = rng.uniform(0.02, 0.15) * np.ptp(x)
-    return rng.uniform(1, 5) / (1 + ((x - c)/w)**2)
-
-def _f_triangle_wave(x: typing.Any, rng: typing.Any) -> typing.Any:
-    f = rng.uniform(1, 6)
-    return 2*np.abs(2*(f*x/(2*np.pi) - np.floor(f*x/(2*np.pi) + 0.5))) - 1
-
-def _f_double_well(x: typing.Any, rng: typing.Any) -> typing.Any:
-    return rng.uniform(0.5, 3) * (x**4 - 2*x**2)
-
-def _f_near_flat_edge(x: typing.Any, rng: typing.Any) -> typing.Any:
-    edge = rng.choice([x.min(), x.max()])
-    w = 0.05 * np.ptp(x)
-    return rng.uniform(3, 10) * np.exp(-((x - edge)/w)**2)
-
-def _f_heterogeneous(x: typing.Any, rng: typing.Any) -> typing.Any:
-    q = np.percentile(x, [25, 50, 75])
-    return (np.sin(5*x)*(x<q[0]) + 2.0*(x>=q[0])*(x<q[1])
-            - 3*(x-q[2])*(x>=q[1])*(x<q[2]) + np.cos(8*x)*(x>=q[2]))
-
-def _f_linear_wiggle(x: typing.Any, rng: typing.Any) -> typing.Any:
-    return rng.uniform(-3, 3)*x + rng.uniform(0.05, 0.3)*np.sin(rng.uniform(5, 15)*x)
-
-def _f_sinc(x: typing.Any, rng: typing.Any) -> typing.Any:
-    s = rng.uniform(2, 8)
-    u = s * x
-    safe_u = np.where(np.abs(u) < 1e-8, 1.0, u)
-    return np.where(np.abs(u) < 1e-8, 1.0, np.sin(safe_u) / safe_u) * rng.uniform(1, 5)
-
-def _f_wavelet(x: typing.Any, rng: typing.Any) -> typing.Any:
-    s = rng.uniform(0.1, 0.5) * np.ptp(x)
-    c = rng.uniform(np.percentile(x, 20), np.percentile(x, 80))
-    t = (x - c) / s
-    return (1 - t**2) * np.exp(-0.5 * t**2) * rng.uniform(2, 8)
-
-def _f_fractal_sum(x: typing.Any, rng: typing.Any) -> typing.Any:
-    """Self-similar multi-scale oscillation."""
-    out = np.zeros_like(x)
-    for k in range(1, rng.randint(4, 8)):
-        out += np.sin(2**k * x + rng.uniform(0, 2*np.pi)) / 2**k
-    return out * rng.uniform(2, 5)
-
-def _f_smooth_then_jump(x: typing.Any, rng: typing.Any) -> typing.Any:
-    jump_at = rng.uniform(np.percentile(x, 30), np.percentile(x, 70))
-    jump_size = rng.uniform(2, 8) * rng.choice([-1, 1])
-    return np.sin(2*x) + jump_size * (x > jump_at).astype(float)
-
-def _f_polynomial_ratio(x: typing.Any, rng: typing.Any) -> typing.Any:
-    return (rng.randn()*x**2 + rng.randn()*x) / (1 + x**2)
-
-SMOOTH_FN = {
-    "sine": _f_sine, "cosine_beat": _f_cosine_beat, "poly": _f_poly,
-    "step": _f_step, "spike": _f_spike, "multi_spike": _f_multi_spike,
-    "plateau": _f_plateau, "wiggly": _f_wiggly, "linear": _f_linear,
-    "quadratic": _f_quadratic, "cubic": _f_cubic, "sqrt_abs": _f_sqrt_abs,
-    "log_abs": _f_log_abs, "sawtooth": _f_sawtooth, "chirp": _f_chirp,
-    "runge": _f_runge, "abs_sin": _f_abs_sin, "piecewise_linear": _f_piecewise_linear,
-    "exp_decay": _f_exp_decay, "logistic": _f_logistic,
-    "interaction_proxy": _f_interaction_proxy, "modulated_sine": _f_modulated_sine,
-    "cauchy_bump": _f_cauchy_bump, "triangle_wave": _f_triangle_wave,
-    "double_well": _f_double_well, "near_flat_edge": _f_near_flat_edge,
-    "heterogeneous": _f_heterogeneous, "linear_wiggle": _f_linear_wiggle,
-    "sinc": _f_sinc, "wavelet": _f_wavelet, "fractal_sum": _f_fractal_sum,
-    "smooth_then_jump": _f_smooth_then_jump, "polynomial_ratio": _f_polynomial_ratio,
-}
-
-# ═══════════════════════════════════════════════════════════════════════════
-# 2D / MULTIDIMENSIONAL SMOOTH FUNCTIONS (for Duchon / TPS)
-# ═══════════════════════════════════════════════════════════════════════════
-
-def _f2d_saddle(x1: typing.Any, x2: typing.Any, rng: typing.Any) -> typing.Any:
-    return rng.uniform(1, 4) * (x1**2 - x2**2)
-
-def _f2d_dome(x1: typing.Any, x2: typing.Any, rng: typing.Any) -> typing.Any:
-    return rng.uniform(2, 6) * np.exp(-0.5*(x1**2 + x2**2))
-
-def _f2d_ridge(x1: typing.Any, x2: typing.Any, rng: typing.Any) -> typing.Any:
-    angle = rng.uniform(0, np.pi)
-    u = np.cos(angle)*x1 + np.sin(angle)*x2
-    return _f_wiggly(u, rng)
-
-def _f2d_spiral(x1: typing.Any, x2: typing.Any, rng: typing.Any) -> typing.Any:
-    r = np.sqrt(x1**2 + x2**2)
-    theta = np.arctan2(x2, x1)
-    return np.sin(rng.uniform(1, 4)*r + theta) * rng.uniform(1, 4)
-
-def _f2d_checkerboard(x1: typing.Any, x2: typing.Any, rng: typing.Any) -> typing.Any:
-    freq = rng.uniform(1, 4)
-    return np.sign(np.sin(freq*np.pi*x1) * np.sin(freq*np.pi*x2))
-
-def _f2d_manifold_1d(x1: typing.Any, x2: typing.Any, rng: typing.Any) -> typing.Any:
-    """Signal lives on a 1D manifold in 2D space."""
-    u = rng.uniform(-1, 1)*x1 + rng.uniform(-1, 1)*x2
-    return _f_wiggly(u, rng)
-
-def _f2d_radial_wave(x1: typing.Any, x2: typing.Any, rng: typing.Any) -> typing.Any:
-    r = np.sqrt(x1**2 + x2**2 + 0.01)
-    return np.sin(rng.uniform(2, 8)*r) / r * rng.uniform(1, 5)
-
-def _f2d_product(x1: typing.Any, x2: typing.Any, rng: typing.Any) -> typing.Any:
-    """Pure interaction: f(x1) * g(x2)."""
-    f1_name = rng.choice(list(SMOOTH_FN.keys()))
-    f2_name = rng.choice(list(SMOOTH_FN.keys()))
-    return SMOOTH_FN[f1_name](x1, rng) * SMOOTH_FN[f2_name](x2, rng)
-
-def _f2d_additive_plus_interaction(x1: typing.Any, x2: typing.Any, rng: typing.Any) -> typing.Any:
-    main1 = SMOOTH_FN[rng.choice(list(SMOOTH_FN.keys()))](x1, rng)
-    main2 = SMOOTH_FN[rng.choice(list(SMOOTH_FN.keys()))](x2, rng)
-    interaction = rng.uniform(0.2, 1.5) * x1 * x2
-    return main1 + main2 + interaction
-
-def _f2d_cliff(x1: typing.Any, x2: typing.Any, rng: typing.Any) -> typing.Any:
-    """Sharp boundary in 2D."""
-    angle = rng.uniform(0, np.pi)
-    u = np.cos(angle)*x1 + np.sin(angle)*x2
-    return rng.uniform(3, 8) / (1 + np.exp(-rng.uniform(5, 30)*u))
-
-def _f2d_volcano(x1: typing.Any, x2: typing.Any, rng: typing.Any) -> typing.Any:
-    r = np.sqrt(x1**2 + x2**2)
-    peak_r = rng.uniform(0.3, 1.5)
-    return rng.uniform(2, 6) * np.exp(-((r - peak_r)/0.3)**2)
-
-SMOOTH_FN_2D = {
-    "saddle": _f2d_saddle, "dome": _f2d_dome, "ridge": _f2d_ridge,
-    "spiral": _f2d_spiral, "checkerboard": _f2d_checkerboard,
-    "manifold_1d": _f2d_manifold_1d, "radial_wave": _f2d_radial_wave,
-    "product": _f2d_product, "additive_interaction": _f2d_additive_plus_interaction,
-    "cliff": _f2d_cliff, "volcano": _f2d_volcano,
-}
-
-# ═══════════════════════════════════════════════════════════════════════════
-# NOISE GENERATORS — 15 types
-# ═══════════════════════════════════════════════════════════════════════════
-
-def _n_gaussian(n: typing.Any, sd: typing.Any, rng: typing.Any, **kw: typing.Any) -> typing.Any:
-    return rng.randn(n) * sd
-def _n_t(n: typing.Any, sd: typing.Any, rng: typing.Any, **kw: typing.Any) -> typing.Any:
-    df = rng.uniform(2.5, 8)
-    return rng.standard_t(df, n) * sd / np.sqrt(df/(df-2))
-def _n_laplace(n: typing.Any, sd: typing.Any, rng: typing.Any, **kw: typing.Any) -> typing.Any:
-    return rng.laplace(0, sd/np.sqrt(2), n)
-def _n_cauchy(n: typing.Any, sd: typing.Any, rng: typing.Any, **kw: typing.Any) -> typing.Any:
-    return rng.standard_cauchy(n) * sd * 0.3
-def _n_skew(n: typing.Any, sd: typing.Any, rng: typing.Any, **kw: typing.Any) -> typing.Any:
-    a = rng.uniform(2, 8)*rng.choice([-1, 1])
-    z = rng.randn(n)
-    u = rng.randn(n)
-    raw = np.where(u < a*z, z, -z)
-    return raw * sd/(np.std(raw)+1e-8)
-def _n_mixture(n: typing.Any, sd: typing.Any, rng: typing.Any, **kw: typing.Any) -> typing.Any:
-    mix = rng.uniform(.1, .4)
-    s2 = rng.uniform(3, 10)
-    noise = rng.randn(n)*sd
-    noise[rng.random(n) < mix] *= s2
-    return noise
-def _n_uniform(n: typing.Any, sd: typing.Any, rng: typing.Any, **kw: typing.Any) -> typing.Any:
-    return rng.uniform(-sd*np.sqrt(3), sd*np.sqrt(3), n)
-def _n_hetero(n: typing.Any, sd: typing.Any, rng: typing.Any, x: typing.Any=None, **kw: typing.Any) -> typing.Any:
-    if x is None:
-        x = np.linspace(0, 1, n)
-    t = (x - x.min())/(np.ptp(x)+1e-8)
-    return rng.randn(n)*sd*(0.2 + 2*t)
-def _n_periodic_het(n: typing.Any, sd: typing.Any, rng: typing.Any, x: typing.Any=None, **kw: typing.Any) -> typing.Any:
-    if x is None:
-        x = np.linspace(0, 1, n)
-    t = (x - x.min())/(np.ptp(x)+1e-8)
-    return rng.randn(n)*sd*(0.5 + np.abs(np.sin(rng.uniform(2, 6)*np.pi*t)))
-def _n_lognormal(n: typing.Any, sd: typing.Any, rng: typing.Any, **kw: typing.Any) -> typing.Any:
-    raw = rng.lognormal(0, 1, n)
-    raw -= raw.mean()
-    return raw*sd/(np.std(raw)+1e-8)
-def _n_sparse_outlier(n: typing.Any, sd: typing.Any, rng: typing.Any, **kw: typing.Any) -> typing.Any:
-    noise = rng.randn(n)*sd
-    k = max(1, int(n*rng.uniform(.01, .05)))
-    noise[rng.choice(n, k, replace=False)] = rng.randn(k)*sd*rng.uniform(10, 50)
-    return noise
-def _n_quantized(n: typing.Any, sd: typing.Any, rng: typing.Any, **kw: typing.Any) -> typing.Any:
-    lev = rng.uniform(5, 20)
-    return np.round(rng.randn(n)*sd*lev)/lev
-def _n_ar1(n: typing.Any, sd: typing.Any, rng: typing.Any, **kw: typing.Any) -> typing.Any:
-    """Autocorrelated noise."""
-    phi = rng.uniform(0.3, 0.95)
-    e = rng.randn(n)*sd*np.sqrt(1-phi**2)
-    out = np.zeros(n)
-    out[0] = e[0]
-    for i in range(1, n):
-        out[i] = phi*out[i-1] + e[i]
-    return out
-def _n_bimodal(n: typing.Any, sd: typing.Any, rng: typing.Any, **kw: typing.Any) -> typing.Any:
-    mask = rng.random(n) < 0.5
-    return np.where(mask, rng.randn(n)*sd - sd*1.5, rng.randn(n)*sd + sd*1.5)
-def _n_contaminated(n: typing.Any, sd: typing.Any, rng: typing.Any, **kw: typing.Any) -> typing.Any:
-    """Normal with 5% contamination from a different mean."""
-    noise = rng.randn(n)*sd
-    k = max(1, int(n*0.05))
-    noise[rng.choice(n, k, replace=False)] += rng.choice([-1, 1])*sd*rng.uniform(5, 15)
-    return noise
-
-NOISE_FN = {
-    "gaussian": _n_gaussian, "t": _n_t, "laplace": _n_laplace,
-    "cauchy": _n_cauchy, "skew": _n_skew, "mixture": _n_mixture,
-    "uniform": _n_uniform, "heteroscedastic": _n_hetero,
-    "periodic_het": _n_periodic_het, "lognormal": _n_lognormal,
-    "sparse_outlier": _n_sparse_outlier, "quantized": _n_quantized,
-    "ar1": _n_ar1, "bimodal": _n_bimodal, "contaminated": _n_contaminated,
-}
-
-# ═══════════════════════════════════════════════════════════════════════════
-# X DISTRIBUTIONS — 12 types
-# ═══════════════════════════════════════════════════════════════════════════
-
-def _x_uniform(n: typing.Any, k: typing.Any, rng: typing.Any) -> typing.Any:
-    return rng.uniform(-1, 1, (n, k))
-def _x_normal(n: typing.Any, k: typing.Any, rng: typing.Any) -> typing.Any:
-    return rng.randn(n, k)
-def _x_skewed(n: typing.Any, k: typing.Any, rng: typing.Any) -> typing.Any:
-    r = rng.exponential(1, (n, k))
-    return r - r.mean(0)
-def _x_heavy(n: typing.Any, k: typing.Any, rng: typing.Any) -> typing.Any:
-    return rng.standard_t(3, (n, k))
-def _x_clustered(n: typing.Any, k: typing.Any, rng: typing.Any) -> typing.Any:
-    nc = rng.randint(2, 6)
-    c = rng.randn(nc, k)*3
-    return c[rng.randint(0, nc, n)] + rng.randn(n, k)*0.3
-def _x_bimodal(n: typing.Any, k: typing.Any, rng: typing.Any) -> typing.Any:
-    m = rng.random((n, k)) < 0.5
-    return np.where(m, rng.randn(n, k)-2, rng.randn(n, k)+2)
-def _x_uniform_wide(n: typing.Any, k: typing.Any, rng: typing.Any) -> typing.Any:
-    return rng.uniform(-10, 10, (n, k))
-def _x_sparse(n: typing.Any, k: typing.Any, rng: typing.Any) -> typing.Any:
-    r = rng.randn(n, k)
-    r[rng.random((n, k)) < 0.8] *= 0.1
-    return r
-def _x_grid(n: typing.Any, k: typing.Any, rng: typing.Any) -> typing.Any:
-    lev = rng.randint(5, 15)
-    return np.round(rng.uniform(-1, 1, (n, k))*lev)/lev
-def _x_correlated(n: typing.Any, k: typing.Any, rng: typing.Any) -> typing.Any:
-    z = rng.randn(n, k)
-    L = rng.randn(k, k)*0.3
-    np.fill_diagonal(L, 1.0)
-    return z @ L
-def _x_low_dim_manifold(n: typing.Any, k: typing.Any, rng: typing.Any) -> typing.Any:
-    """Features live on a low-dimensional manifold (intrinsic dim < k)."""
-    intrinsic = max(1, k // 2)
-    z = rng.randn(n, intrinsic)
-    A = rng.randn(intrinsic, k)
-    return z @ A + rng.randn(n, k) * 0.05
-def _x_mixture_of_lines(n: typing.Any, k: typing.Any, rng: typing.Any) -> typing.Any:
-    """Points clustered along random lines in feature space."""
-    n_lines = rng.randint(2, 5)
-    directions = rng.randn(n_lines, k)
-    directions /= np.linalg.norm(directions, axis=1, keepdims=True) + 1e-8
-    origins = rng.randn(n_lines, k) * 2
-    out = np.zeros((n, k))
-    for i in range(n):
-        line_id = rng.randint(0, n_lines)
-        t = rng.randn() * 2
-        out[i] = origins[line_id] + t * directions[line_id] + rng.randn(k) * 0.1
-    return out
-
-XDIST_FN = {
-    "uniform": _x_uniform, "normal": _x_normal, "skewed": _x_skewed,
-    "heavy_tailed": _x_heavy, "clustered": _x_clustered, "bimodal": _x_bimodal,
-    "uniform_wide": _x_uniform_wide, "sparse": _x_sparse, "grid": _x_grid,
-    "correlated": _x_correlated, "low_dim_manifold": _x_low_dim_manifold,
-    "mixture_of_lines": _x_mixture_of_lines,
-}
-
-# ═══════════════════════════════════════════════════════════════════════════
-# SIGMA (VARIANCE) FUNCTIONS — for GAMLSS
-# ═══════════════════════════════════════════════════════════════════════════
-
-def _sigma_constant(x: typing.Any, rng: typing.Any) -> typing.Any:
-    return np.ones_like(x[:, 0]) * rng.uniform(0.3, 3.0)
-
-def _sigma_linear(x: typing.Any, rng: typing.Any) -> typing.Any:
-    return np.exp(rng.uniform(-1, 1) * x[:, 0])
-
-def _sigma_smooth(x: typing.Any, rng: typing.Any) -> typing.Any:
-    fn = SMOOTH_FN[rng.choice(list(SMOOTH_FN.keys()))]
-    raw = fn(x[:, 0], rng)
-    return np.exp(raw / (np.std(raw) + 1e-8) * 0.5)
-
-def _sigma_bimodal(x: typing.Any, rng: typing.Any) -> typing.Any:
-    mid = np.median(x[:, 0])
-    return np.where(x[:, 0] < mid, rng.uniform(0.3, 1.0), rng.uniform(1.5, 5.0))
-
-def _sigma_periodic(x: typing.Any, rng: typing.Any) -> typing.Any:
-    return np.exp(0.5 * np.sin(rng.uniform(1, 5) * x[:, 0]))
-
-SIGMA_FN = {
-    "constant": _sigma_constant, "linear": _sigma_linear,
-    "smooth": _sigma_smooth, "bimodal": _sigma_bimodal,
-    "periodic": _sigma_periodic,
-}
-
-# ═══════════════════════════════════════════════════════════════════════════
-# SIGNAL STRUCTURE GENERATORS — how smooth components combine
-# ═══════════════════════════════════════════════════════════════════════════
-
-def _build_additive_signal(X: typing.Any, smooth_kinds: typing.Any, rng: typing.Any) -> typing.Any:
-    """Standard additive: f1(x1) + f2(x2) + ..."""
-    eta = np.zeros(X.shape[0])
-    for j, kind in enumerate(smooth_kinds):
-        contrib = SMOOTH_FN[kind](X[:, j % X.shape[1]], rng)
-        s = np.std(contrib)
-        if s > 1e-8:
-            contrib /= s
-        eta += contrib
-    return eta
-
-def _build_additive_with_interactions(X: typing.Any, smooth_kinds: typing.Any, rng: typing.Any) -> typing.Any:
-    """Additive + pairwise interactions."""
-    eta = _build_additive_signal(X, smooth_kinds, rng)
-    k = X.shape[1]
-    if k >= 2:
-        n_inter = min(rng.randint(1, 4), k * (k - 1) // 2)
-        for _ in range(n_inter):
-            i, j = rng.choice(k, 2, replace=False)
-            strength = rng.uniform(0.2, 2.0)
-            eta += strength * X[:, i] * X[:, j]
-    return eta
-
-def _build_2d_surface(X: typing.Any, smooth_kinds: typing.Any, rng: typing.Any) -> typing.Any:
-    """Use 2D smooth functions on pairs of features."""
-    eta = np.zeros(X.shape[0])
-    k = X.shape[1]
-    fn2d_names = list(SMOOTH_FN_2D.keys())
-    # Add 2D surfaces on consecutive pairs
-    for j in range(0, k - 1, 2):
-        fn2d = SMOOTH_FN_2D[rng.choice(fn2d_names)]
-        contrib = fn2d(X[:, j], X[:, j + 1], rng)
-        s = np.std(contrib)
-        if s > 1e-8:
-            contrib /= s
-        eta += contrib
-    # If odd number, add a 1D smooth for the last feature
-    if k % 2 == 1:
-        fn1d = SMOOTH_FN[rng.choice(list(SMOOTH_FN.keys()))]
-        contrib = fn1d(X[:, -1], rng)
-        s = np.std(contrib)
-        if s > 1e-8:
-            contrib /= s
-        eta += contrib
-    return eta
-
-def _build_low_dim_manifold(X: typing.Any, smooth_kinds: typing.Any, rng: typing.Any) -> typing.Any:
-    """Signal depends on a low-dim projection of features."""
-    k = X.shape[1]
-    dim = max(1, min(k // 2, 3))
-    proj = rng.randn(k, dim)
-    proj /= np.linalg.norm(proj, axis=0, keepdims=True) + 1e-8
-    Z = X @ proj
-    eta = np.zeros(X.shape[0])
-    for d in range(dim):
-        fn = SMOOTH_FN[rng.choice(list(SMOOTH_FN.keys()))]
-        contrib = fn(Z[:, d], rng)
-        s = np.std(contrib)
-        if s > 1e-8:
-            contrib /= s
-        eta += contrib
-    return eta
-
-def _build_stacked(X: typing.Any, smooth_kinds: typing.Any, rng: typing.Any) -> typing.Any:
-    """Composition: g(f1(x1) + f2(x2))."""
-    inner = _build_additive_signal(X, smooth_kinds, rng)
-    outer_fn = SMOOTH_FN[rng.choice(list(SMOOTH_FN.keys()))]
-    inner_norm = inner / (np.std(inner) + 1e-8)
-    return outer_fn(inner_norm, rng)
-
-def _build_regime(X: typing.Any, smooth_kinds: typing.Any, rng: typing.Any) -> typing.Any:
-    """Different functions in different regions of feature space."""
-    k = X.shape[1]
-    split_dim = rng.randint(0, k)
-    threshold = np.median(X[:, split_dim])
-    mask = X[:, split_dim] < threshold
-
-    smooth_names = list(SMOOTH_FN.keys())
-    eta = np.zeros(X.shape[0])
-    for j in range(min(k, len(smooth_kinds))):
-        fn_a = SMOOTH_FN[rng.choice(smooth_names)]
-        fn_b = SMOOTH_FN[rng.choice(smooth_names)]
-        ca = fn_a(X[:, j], rng)
-        cb = fn_b(X[:, j], rng)
-        for arr in [ca, cb]:
-            s = np.std(arr)
-            if s > 1e-8:
-                arr /= s
-        eta += np.where(mask, ca, cb)
-    return eta
-
-SIGNAL_BUILDERS = {
-    "additive": _build_additive_signal,
-    "additive_interaction": _build_additive_with_interactions,
-    "surface_2d": _build_2d_surface,
-    "low_dim_manifold": _build_low_dim_manifold,
-    "stacked": _build_stacked,
-    "regime": _build_regime,
-}
-
-# ═══════════════════════════════════════════════════════════════════════════
-# SCENARIO
-# ═══════════════════════════════════════════════════════════════════════════
-
-@dataclass
+@dataclass(frozen=True)
 class FuzzScenario:
+    trial_id: str
     seed: int
-    family: str               # gaussian, binomial
-    model_type: str            # gam, gamlss
+    name: str
+    family: str
+    model_type: str
+    basis_type: str
     n_obs: int
-    n_smooths: int
-    knots: int
-    double_penalty: bool
-    noise_sd: float
-    noise_kind: str
-    smooth_kinds: list[typing.Any]
-    x_distribution: str
-    basis_type: str            # ps, tps, duchon
-    collinear_strength: float
-    signal_structure: str      # additive, additive_interaction, surface_2d, ...
-    sigma_kind: str            # for gamlss: constant, linear, smooth, ...
-    duchon_order: int          # 0 or 1
-    duchon_power: int          # 1 or 2
-    n_duchon_dims: int         # how many features go into the duchon term (2 or 3)
+    n_features: int
+    formula: str
+    mgcv_formula: str
+    noise_formula: str | None = None
 
     def tag(self) -> str:
-        return f"s{self.seed}_{self.family}_{self.model_type}_{self.basis_type}"
+        return self.trial_id
 
-
-def estimate_scenario_cost(sc: FuzzScenario) -> float:
-    cost = float(max(sc.n_obs, 1) * max(sc.n_smooths, 1) * max(sc.knots, 1))
-    if sc.family == "binomial":
-        cost *= 2.0
-    if sc.model_type == "gamlss":
-        cost *= 1.8
-    cost *= {
-        "ps": 1.6,
-        "tps": 3.2,
-        "duchon": 1.2,
-    }[sc.basis_type]
-    if sc.basis_type == "duchon":
-        # Hybrid Duchon scenarios add separate one-dimensional smooth terms
-        # after the joint Duchon block. The REML surface grows with those
-        # extra penalties, not just with raw n * k * knots.
-        extra_terms = max(0, sc.n_smooths - sc.n_duchon_dims)
-        cost *= 1.0 + float(extra_terms * extra_terms)
-    if sc.double_penalty:
-        cost *= 1.15
-    if sc.signal_structure in {"surface_2d", "stacked", "regime"}:
-        cost *= 1.2
-    if sc.noise_kind in {"heteroscedastic", "periodic_het", "lognormal", "sparse_outlier"}:
-        cost *= 1.15
-    return cost
-
-
-def generate_scenario(seed: int, family_filter: typing.Any=None, model_type_filter: typing.Any=None) -> FuzzScenario:
-    rng = np.random.RandomState(seed)
-
-    def choice(values: typing.Sequence[typing.Any]) -> typing.Any:
-        return values[int(rng.randint(0, len(values)))]
-
-    family = family_filter or choice(["gaussian"]*3 + ["binomial"]*2)
-    model_type = model_type_filter or choice(["gam"]*4 + ["gamlss"]*2)
-    if family == "binomial":
-        model_type = "gam"  # no binomial gamlss for now
-
-    # Sample size distribution — keep n=50 well-represented (worst-case
-    # small-data behavior) AND ensure n>=2000 has weight too: that's where
-    # bugs like the fast_xt_diag_x sign bug only surfaced after the faer
-    # dense threshold.
-    # Bias toward small n where p / n ratio is high — under-determined
-    # regime where overfitting and predict-time monotonicity blowups
-    # surface (e.g. CTN h' = -1e15 spikes only happen below ~5*p_total).
-    n_obs = choice([
-        20, 25, 30, 40, 50, 50, 50, 64, 80, 100, 100, 150, 200, 200,
-        500, 500, 1000, 1000, 2000, 2000, 5000, 10000,
-    ])
-    n_smooths = choice([1, 1, 2, 2, 3, 3, 5, 7, 10])
-    # Knot grid spans both very-low (k=3, under-smoothed) and very-high
-    # (k=25, over-parameterized vs small n) so under/over-fit regressions
-    # both surface.
-    knots = choice([3, 3, 4, 5, 7, 8, 10, 12, 15, 18, 20, 25])
-    double_penalty = rng.random() < 0.5
-    # noise_sd is in units of signal_sd. With gaussian noise and additive
-    # signal, the population R² is 1 / (1 + noise_sd²). The previous grid
-    # (0.01 .. 10.0) put two of nine choices at R² < 0.05 (null / unlearnable)
-    # and four at R² > 0.94 (saturated), so most trials carried no useful
-    # discriminative information. Sample a target R² across the learnable
-    # spectrum — weak (~0.15) through very strong (~0.95) — and convert
-    # analytically. Add a small jitter so seeds don't snap to identical
-    # population R² across structures.
-    target_r2 = choice([
-        0.15, 0.20, 0.25, 0.30,        # weak — mostly noise, tests gating
-        0.40, 0.50, 0.60,              # moderate — primary regime
-        0.70, 0.80, 0.85,              # strong
-        0.90, 0.95,                    # very strong, but not saturated
-    ])
-    target_r2 = float(np.clip(target_r2 + rng.uniform(-0.04, 0.04), 0.10, 0.97))
-    noise_sd = float(np.sqrt((1.0 - target_r2) / target_r2))
-    # Bias toward pathological noise distributions (cauchy / contaminated /
-    # sparse_outlier / mixture / periodic_het) that exercise the IRLS
-    # robustness path. Plain gaussian is still reachable but down-weighted.
-    _hard_noise = [
-        "cauchy", "contaminated", "sparse_outlier", "mixture",
-        "periodic_het", "ar1", "lognormal", "bimodal",
-    ]
-    _easy_noise = ["gaussian", "t", "laplace", "skew", "uniform",
-                   "heteroscedastic", "quantized"]
-    noise_kind = (choice(_hard_noise) if rng.random() < 0.55
-                  else choice(_easy_noise))
-    smooth_kinds = [choice(list(SMOOTH_FN.keys())) for _ in range(n_smooths)]
-    # Bias toward harder x distributions (heavy-tailed, low-dim manifold,
-    # near-collinear, mixture-of-lines, clustered) that produce
-    # ill-conditioned design matrices.
-    _hard_x = ["heavy_tailed", "low_dim_manifold", "mixture_of_lines",
-               "clustered", "correlated", "bimodal", "sparse"]
-    _easy_x = ["uniform", "normal", "skewed", "uniform_wide", "grid"]
-    x_distribution = (choice(_hard_x) if rng.random() < 0.55
-                      else choice(_easy_x))
-    basis_type = choice(["ps"]*3 + ["tps"]*2 + ["duchon"]*3)
-    # Push collinearity harder: ~70% of trials now have >0 collinearity, with
-    # near-collinear (0.85+) configurations explicitly represented.
-    collinear_strength = choice([0]*3 + [0.3, 0.5, 0.7, 0.85, 0.9, 0.95])
-    # Signal structure: bias toward the more demanding builders (regime
-    # changes near support boundary, stacked, low-dim manifold, surface_2d).
-    _hard_signal = ["regime", "stacked", "low_dim_manifold",
-                    "additive_interaction", "surface_2d"]
-    signal_structure = (choice(_hard_signal) if rng.random() < 0.55
-                        else choice(list(SIGNAL_BUILDERS.keys())))
-    sigma_kind = choice(list(SIGMA_FN.keys())) if model_type == "gamlss" else "constant"
-    duchon_order = choice([0, 0, 1])
-    duchon_power = choice([1, 2, 2])
-    n_duchon_dims = choice([2, 2, 3]) if n_smooths >= 2 else 2
-
-    # Constraints
-    max_knots = max(3, n_obs // max(n_smooths + 1, 2) - 2)
-    knots = min(knots, max_knots)
-    if family == "binomial":
-        knots = min(knots, max(3, n_obs // 5))
-    if basis_type == "duchon" and n_smooths < 2:
-        n_smooths = 2  # duchon needs at least 2 dims
-        smooth_kinds = [choice(list(SMOOTH_FN.keys())) for _ in range(n_smooths)]
-    if basis_type == "duchon":
-        n_smooths = max(n_smooths, 3)
-        while len(smooth_kinds) < n_smooths:
-            smooth_kinds.append(choice(list(SMOOTH_FN.keys())))
-        n_duchon_dims = 2
-        # Pure scale-free Duchon at d = 2 with rust's triple-operator
-        # collocation penalty has only one admissible configuration:
-        # (nullspace order = Degree(2), power = 0). Rust's
-        # `resolve_duchon_orders` enforces both the kernel-existence /
-        # triple-collocation constraint `2(p + s) > d + 2` and the pure-
-        # mode CPD constraint `2s < d`; in d = 2 these jointly force
-        # `s = 0` and `p ≥ 3`, i.e. order = Degree(2). The previous
-        # (order=Zero, power=2) pairing has p+s=3 but `2s=4 ≥ d=2`, so
-        # rust hard-rejects it ("pure Duchon requires power < dimension/2
-        # for nullspace degree < 1"). order=Degree(2) is encoded as int 2
-        # in the rust formula DSL and as mgcv `m1 = 3` (mgcv m1 =
-        # null-space polynomial order; null space spans polynomials of
-        # total degree ≤ m1 − 1). The mgcv pair is therefore m=c(3, 0).
-        # mgcv accepts m[2]=0 with an "s value reduced" warning, then
-        # builds the same polyharmonic kernel against a cubic null space.
-        duchon_order = 2
-        duchon_power = 0
-        # Rust Duchon smooths intentionally do not implement mgcv-style
-        # `select=TRUE` nullspace shrinkage. Keep Duchon fuzz comparisons on
-        # the shared model surface instead of asking mgcv to fit a strictly
-        # different penalized model.
-        double_penalty = False
-        # The cubic polynomial null space at d = 2 has C(2 + 2, 2) = 6
-        # monomials. Rust requires `centers >= 6` (else
-        # `duchon_effective_nullspace_order` silently auto-degrades to
-        # order=Zero). mgcv `s(..., bs='ds', m=c(3,0), k=...)` requires
-        # `k >= 8` (mgcv adds a 2-column safety margin for the kernel
-        # block; lower values trigger an internal "basis dimension reset"
-        # warning that leaves the fit in a state where `predict()` then
-        # crashes with "'qr' and 'y' must have the same number of rows").
-        min_duchon_centers = 8
-        max_knots = max(min_duchon_centers, n_obs // max(n_smooths + 1, 2) - 2)
-        knots = min(max(knots, min_duchon_centers), max_knots)
-
-    return FuzzScenario(
-        seed=seed, family=family, model_type=model_type, n_obs=n_obs,
-        n_smooths=n_smooths, knots=knots, double_penalty=double_penalty,
-        noise_sd=noise_sd, noise_kind=noise_kind, smooth_kinds=smooth_kinds,
-        x_distribution=x_distribution, basis_type=basis_type,
-        collinear_strength=collinear_strength, signal_structure=signal_structure,
-        sigma_kind=sigma_kind, duchon_order=duchon_order, duchon_power=duchon_power,
-        n_duchon_dims=n_duchon_dims,
-    )
-
-
-def _apply_basis_filter(sc: FuzzScenario, basis_filter: Optional[str]) -> None:
-    if basis_filter is None:
-        return
-    sc.basis_type = basis_filter
-    if basis_filter == "duchon":
-        # Mirror the full duchon branch in generate_scenario: same
-        # configuration (Degree(2), 0), same n_smooths floor, and the same
-        # `min_duchon_centers` clamp on `knots`. Without these, a forced
-        # duchon scenario can be built with too few centers to span the
-        # cubic null space, causing rust to silently auto-degrade to
-        # order=Zero and desync from mgcv.
-        if sc.n_smooths < 3:
-            sc.n_smooths = 3
-            while len(sc.smooth_kinds) < 3:
-                sc.smooth_kinds.append(sc.smooth_kinds[-1] if sc.smooth_kinds else "linear")
-        sc.n_duchon_dims = 2
-        sc.duchon_order = 2
-        sc.duchon_power = 0
-        sc.double_penalty = False
-        min_duchon_centers = 8
-        max_knots = max(min_duchon_centers, sc.n_obs // max(sc.n_smooths + 1, 2) - 2)
-        sc.knots = min(max(sc.knots, min_duchon_centers), max_knots)
-
-
-def select_scenarios(
-    seeds: list[int],
-    family_filter: Optional[str] = None,
-    model_type_filter: Optional[str] = None,
-    basis_filter: Optional[str] = None,
-    max_scenario_cost: Optional[float] = None,
-) -> tuple[list[FuzzScenario], list[tuple[FuzzScenario, float]]]:
-    scenarios: list[FuzzScenario] = []
-    skipped: list[tuple[FuzzScenario, float]] = []
-    for seed in seeds:
-        sc = generate_scenario(seed, family_filter=family_filter, model_type_filter=model_type_filter)
-        _apply_basis_filter(sc, basis_filter)
-        cost = estimate_scenario_cost(sc)
-        if max_scenario_cost is not None and cost > max_scenario_cost:
-            skipped.append((sc, cost))
-            continue
-        scenarios.append(sc)
-    scenarios.sort(key=estimate_scenario_cost)
-    return scenarios, skipped
-
-
-def select_scenarios_backfilled(
-    *,
-    seed_start: int,
-    target_count: int,
-    excluded_seeds: set[int],
-    family_filter: Optional[str] = None,
-    model_type_filter: Optional[str] = None,
-    basis_filter: Optional[str] = None,
-    max_scenario_cost: Optional[float] = None,
-) -> tuple[list[FuzzScenario], list[tuple[FuzzScenario, float]]]:
-    """Select target_count runnable scenarios, extending the seed window as needed."""
-    scenarios: list[FuzzScenario] = []
-    skipped: list[tuple[FuzzScenario, float]] = []
-    seen: set[int] = set(excluded_seeds)
-    seed = seed_start
-    max_examined = max(target_count * 100, 10_000)
-    examined = 0
-
-    while len(scenarios) < target_count and examined < max_examined:
-        if seed in seen:
-            seed += 1
-            continue
-        seen.add(seed)
-        examined += 1
-
-        sc = generate_scenario(
-            seed,
-            family_filter=family_filter,
-            model_type_filter=model_type_filter,
-        )
-        _apply_basis_filter(sc, basis_filter)
-        cost = estimate_scenario_cost(sc)
-        if max_scenario_cost is not None and cost > max_scenario_cost:
-            skipped.append((sc, cost))
-        else:
-            scenarios.append(sc)
-        seed += 1
-
-    scenarios.sort(key=estimate_scenario_cost)
-    if len(scenarios) < target_count:
-        raise RuntimeError(
-            f"only selected {len(scenarios)}/{target_count} scenario(s) after "
-            f"examining {examined} candidate seed(s); filters or cost cap are too restrictive"
-        )
-    return scenarios, skipped
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# DATA GENERATION
-# ═══════════════════════════════════════════════════════════════════════════
-
-def generate_data(sc: FuzzScenario) -> typing.Any:
-    """Returns (train_df, test_df, feature_cols)."""
-    rng = np.random.RandomState(sc.seed)
-    n, k = sc.n_obs, sc.n_smooths
-    cols = [f"x{i}" for i in range(k)]
-
-    X = XDIST_FN[sc.x_distribution](n, k, rng)
-    if sc.collinear_strength > 0 and k >= 2:
-        mix = sc.collinear_strength
-        for j in range(1, k):
-            X[:, j] = mix * X[:, 0] + (1 - mix) * X[:, j]
-
-    builder = SIGNAL_BUILDERS.get(sc.signal_structure, _build_additive_signal)
-    eta = builder(X, sc.smooth_kinds, rng)
-
-    if sc.family == "gaussian":
-        signal_sd = max(np.std(eta), 1e-8)
-        noise_fn = NOISE_FN[sc.noise_kind]
-        sig = inspect.signature(noise_fn)
-        kw = {"x": X[:, 0]} if "x" in sig.parameters else {}
-        noise = noise_fn(n, sc.noise_sd * signal_sd, rng, **kw)
-
-        if sc.model_type == "gamlss":
-            sigma_vals = SIGMA_FN[sc.sigma_kind](X, rng)
-            noise = noise * sigma_vals / (np.std(noise * sigma_vals) + 1e-8) * sc.noise_sd * signal_sd
-
-        y = eta + noise
-    elif sc.family == "binomial":
-        eta = eta - np.mean(eta)
-        eta_sd = max(np.std(eta), 1e-8)
-        # Logit-scale signal strength. Previously hardcoded at 2.0, so every
-        # binomial trial had ~AUC 0.85 — no variation in difficulty. Drive
-        # logit_sd from the same noise_sd field used for gaussian: the
-        # logistic latent has SD π/√3, so logit_sd / (π/√3) plays the role
-        # of SNR. noise_sd ∈ [~0.18, ~2.4] maps to logit_sd ∈ [~0.75, ~10],
-        # spanning weak (AUC ≈ 0.65) through near-perfect (AUC ≈ 0.99)
-        # separability.
-        logit_sd = (np.pi / np.sqrt(3.0)) / max(float(sc.noise_sd), 1e-3)
-        logit_sd = float(np.clip(logit_sd, 0.6, 10.0))
-        eta = eta * logit_sd / eta_sd
-        y = rng.binomial(1, 1 / (1 + np.exp(-eta))).astype(float)
-
-    df = pd.DataFrame(X, columns=cols)
-    df["y"] = y
-    folds = make_folds(y, n_splits=1, seed=sc.seed, stratified=(sc.family == "binomial"))
-    fold = folds[0]
-    train_df = df.iloc[fold.train_idx].reset_index(drop=True)
-    test_df = df.iloc[fold.test_idx].reset_index(drop=True)
-    train_df, test_df = zscore_train_test(train_df, test_df, cols)
-    return train_df, test_df, cols
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# FORMULA GENERATION
-# ═══════════════════════════════════════════════════════════════════════════
-
-def _rhs_from_terms(terms: typing.Any) -> typing.Any:
-    return " + ".join(terms) if terms else "1"
-
-
-def _formula_from_terms(response: typing.Any, terms: typing.Any) -> typing.Any:
-    return f"{response} ~ {_rhs_from_terms(terms)}"
-
-
-def _duchon_dims_for_centers(cols: typing.Any, sc: typing.Any, centers: int) -> int:
-    dims = min(max(int(sc.n_duchon_dims), 2), len(cols))
-    order = int(sc.duchon_order)
-    if order >= 1:
-        # Polynomial null space at order = k in `dims` dimensions has
-        # C(dims + k, k) monomials. Rust auto-degrades to order=Zero when
-        # centers can't span the nullspace, which would silently desync
-        # rust ↔ mgcv; clamp dims so that polynomial-block ≤ centers.
-        while dims >= 2 and math.comb(dims + order, order) > centers:
-            dims -= 1
-        dims = max(2, dims)
-    return dims
-
-
-def _mgcv_ps_basis_dim_from_rust_internal_knots(internal_knots: int, degree: int = 3) -> int:
-    """Rust ps `knots=` is an internal-knot count; mgcv ps `k=` is basis width."""
-    return max(degree + 1, int(internal_knots) + degree + 1)
-
-
-def _mgcv_select_penalty(sc: typing.Any) -> bool:
-    if sc.basis_type == "duchon":
-        return False
-    return bool(sc.double_penalty)
-
-
-def _rust_mean_terms(cols: typing.Any, sc: typing.Any) -> typing.Any:
-    dp = "true" if sc.double_penalty else "false"
-    if sc.basis_type == "duchon":
-        dims = _duchon_dims_for_centers(cols, sc, sc.knots)
-        d_cols = cols[:dims]
-        duchon_term = f"duchon({', '.join(d_cols)}, centers={sc.knots}, order={sc.duchon_order}, power={sc.duchon_power})"
-        extra = [f"s({c}, type=ps, knots={sc.knots}, double_penalty={dp})" for c in cols[dims:]]
-        return [duchon_term] + extra
-    elif sc.basis_type == "tps":
-        return [f"s({c}, type=tps, centers={sc.knots}, double_penalty={dp})" for c in cols]
-    else:
-        return [f"s({c}, type=ps, knots={sc.knots}, double_penalty={dp})" for c in cols]
-
-
-def rust_mean_formula(cols: typing.Any, sc: typing.Any) -> typing.Any:
-    terms = _rust_mean_terms(cols, sc)
-    if sc.family == "binomial":
-        terms = ["link(type=logit)"] + terms
-    return _formula_from_terms("y", terms)
-
-
-def rust_noise_terms(cols: typing.Any, sc: typing.Any) -> typing.Any:
-    """Noise terms for GAMLSS; --predict-noise expects only the RHS."""
-    dp = "true" if sc.double_penalty else "false"
-    if sc.basis_type == "duchon" and len(cols) >= 2:
-        # The noise term uses fewer centers than the mean term but must
-        # still satisfy: (a) polynomial-block-size centers (rust auto-
-        # degrade) and (b) mgcv's k floor (else mgcv silently resets and
-        # predict() crashes). For the hardcoded order=2 / d=2 case the
-        # joint floor is 8 (=poly_block + 2).
-        poly_block = math.comb(2 + int(sc.duchon_order), int(sc.duchon_order))
-        min_centers = poly_block + 2
-        centers = max(min_centers, sc.knots // 2)
-        dims = _duchon_dims_for_centers(cols, sc, centers)
-        d_cols = cols[:dims]
-        return f"duchon({', '.join(d_cols)}, centers={centers}, order={sc.duchon_order}, power={sc.duchon_power})"
-    centers = max(3, sc.knots // 2)
-    if sc.basis_type == "tps":
-        return f"s({cols[0]}, type=tps, centers={centers}, double_penalty={dp})"
-    return f"s({cols[0]}, type=ps, knots={centers}, double_penalty={dp})"
-
-
-def build_rust_fit_cmd(sc: typing.Any, train_csv: typing.Any, model_json: typing.Any, cols: typing.Any) -> typing.Any:
-    fit_cmd = [str(RUST_BINARY), "fit", "--out", model_json]
-    if sc.model_type == "gamlss":
-        fit_cmd += ["--predict-noise", rust_noise_terms(cols, sc)]
-    fit_cmd += [train_csv, rust_mean_formula(cols, sc)]
-    return fit_cmd
-
-
-def mgcv_formula(cols: typing.Any, sc: typing.Any) -> typing.Any:
-    if sc.basis_type == "duchon":
-        dims = _duchon_dims_for_centers(cols, sc, sc.knots)
-        d_cols = cols[:dims]
-        # mgcv `m=c(m1, m2)` for bs='ds' uses m1 = null-space order (so the
-        # null space spans polynomials of total degree ≤ m1−1) and m2 = s,
-        # the spectral power. Rust `order=Zero` ⇒ p=1 ⇒ m1=1; `Linear` ⇒
-        # p=2 ⇒ m1=2; `Degree(k)` ⇒ m1=k+1. Rust `power` is mgcv's m2
-        # directly. Without this conversion the two sides build different
-        # polyharmonic kernels.
-        m_vals = f"c({sc.duchon_order + 1},{sc.duchon_power})"
-        k_val = sc.knots
-        duchon_term = f"s({','.join(d_cols)}, bs='ds', m={m_vals}, k=min({k_val}, nrow(train_df)-1))"
-        ps_k = _mgcv_ps_basis_dim_from_rust_internal_knots(sc.knots)
-        extra = [f"s({c}, bs='ps', k=min({ps_k}, nrow(train_df)-1))" for c in cols[dims:]]
-        return "y ~ " + " + ".join([duchon_term] + extra)
-    elif sc.basis_type == "tps":
-        terms = [f"s({c}, bs='tp', k=min({sc.knots}, nrow(train_df)-1))" for c in cols]
-        return "y ~ " + " + ".join(terms)
-    else:
-        ps_k = _mgcv_ps_basis_dim_from_rust_internal_knots(sc.knots)
-        terms = [f"s({c}, bs='ps', k=min({ps_k}, nrow(train_df)-1))" for c in cols]
-        return "y ~ " + " + ".join(terms)
-
-
-def mgcv_sigma_formula(cols: typing.Any, sc: typing.Any) -> typing.Any:
-    if sc.basis_type == "duchon" and len(cols) >= 2:
-        # Mirror rust_noise_terms: poly-block + 2 floor satisfies both rust
-        # (no auto-degrade) and mgcv (no "basis dimension reset" warning).
-        poly_block = math.comb(2 + int(sc.duchon_order), int(sc.duchon_order))
-        k_val = max(poly_block + 2, sc.knots // 2)
-        dims = _duchon_dims_for_centers(cols, sc, k_val)
-        d_cols = cols[:dims]
-        # mgcv `m=c(m1, m2)` for bs='ds' uses m1 = null-space order (so the
-        # null space spans polynomials of total degree ≤ m1−1) and m2 = s,
-        # the spectral power. Rust `order=Zero` ⇒ p=1 ⇒ m1=1; `Linear` ⇒
-        # p=2 ⇒ m1=2; `Degree(k)` ⇒ m1=k+1. Rust `power` is mgcv's m2
-        # directly. Without this conversion the two sides build different
-        # polyharmonic kernels.
-        m_vals = f"c({sc.duchon_order + 1},{sc.duchon_power})"
-        return f"~ s({','.join(d_cols)}, bs='ds', m={m_vals}, k=min({k_val}, nrow(train_df)-1))"
-    k_val = max(3, sc.knots // 2)
-    bs = "ps" if sc.basis_type == "ps" else "tp"
-    if bs == "ps":
-        k_val = _mgcv_ps_basis_dim_from_rust_internal_knots(k_val)
-    return f"~ s({cols[0]}, bs='{bs}', k=min({k_val}, nrow(train_df)-1))"
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# RUNNERS
-# ═══════════════════════════════════════════════════════════════════════════
-
-def run_rust(sc: typing.Any, train_df: typing.Any, test_df: typing.Any, cols: typing.Any, tmpdir: typing.Any, rust_timeout: typing.Any) -> typing.Any:
-    train_csv = os.path.join(tmpdir, "train.csv")
-    test_csv = os.path.join(tmpdir, "test.csv")
-    model_json = os.path.join(tmpdir, "model.json")
-    pred_csv = os.path.join(tmpdir, "pred.csv")
-    train_df.to_csv(train_csv, index=False)
-    test_df.to_csv(test_csv, index=False)
-
-    y_test = test_df["y"].to_numpy(float)
-    y_train = train_df["y"].to_numpy(float)
-
-    t0 = time.time()
-    try:
-        fit_cmd = build_rust_fit_cmd(sc, train_csv, model_json, cols)
-
-        r = subprocess.run(fit_cmd, capture_output=True, text=True, timeout=rust_timeout)
-        if r.returncode != 0:
-            return {"error": f"fit rc={r.returncode}", "stderr": r.stderr,
-                    "stdout": r.stdout, "cmd": " ".join(fit_cmd), "time": time.time()-t0}
-
-        r = subprocess.run(
-            [str(RUST_BINARY), "predict", model_json, test_csv, "--out", pred_csv],
-            capture_output=True, text=True, timeout=rust_timeout,
-        )
-        if r.returncode != 0:
-            return {"error": f"predict rc={r.returncode}", "stderr": r.stderr,
-                    "stdout": r.stdout, "time": time.time()-t0}
-
-        pred_df = pd.read_csv(pred_csv)
-        preds = pred_df["mean"].to_numpy(float)
-        if len(preds) != len(y_test):
-            return {"error": f"pred count {len(preds)} vs {len(y_test)}", "time": time.time()-t0}
-
-        metrics = _compute_metrics(sc.family, y_test, y_train, preds)
-        metrics["time"] = time.time() - t0
-
-        if sc.family == "gaussian":
-            try:
-                with open(model_json) as f:
-                    model = json.load(f)
-                sigma = model.get("fit_result", {}).get("standard_deviation")
-                if sigma and sigma > 0:
-                    metrics["logloss"] = gaussian_log_loss_score(y_test, preds, sigma)
-            except Exception:
-                pass
-        return metrics
-
-    except subprocess.TimeoutExpired as e:
-        # subprocess.run(capture_output=True) buffers stderr/stdout; on timeout
-        # the TimeoutExpired exception exposes whatever was captured before the
-        # kill. Surface it so diagnostic logs emitted before the 60s wall make
-        # it into fuzz_results.jsonl (otherwise every timeout is opaque and we
-        # can't tell which iteration / function was stuck).
-        return {
-            "error": "timeout",
-            "time": rust_timeout,
-            "stderr": (e.stderr or "") if hasattr(e, "stderr") else "",
-            "stdout": (e.stdout or "") if hasattr(e, "stdout") else "",
-        }
-    except Exception as e:
-        return {"error": str(e), "traceback": traceback.format_exc(), "time": time.time()-t0}
-
-
-def run_mgcv(sc: typing.Any, train_df: typing.Any, test_df: typing.Any, cols: typing.Any, tmpdir: typing.Any, r_timeout: typing.Any) -> typing.Any:
-    train_csv = os.path.join(tmpdir, "mgcv_train.csv")
-    test_csv = os.path.join(tmpdir, "mgcv_test.csv")
-    out_json = os.path.join(tmpdir, "mgcv_out.json")
-    train_df.to_csv(train_csv, index=False)
-    test_df.to_csv(test_csv, index=False)
-
-    mu_formula = mgcv_formula(cols, sc)
-    select_str = "TRUE" if _mgcv_select_penalty(sc) else "FALSE"
-    fam_str = "binomial(link='logit')" if sc.family == "binomial" else "gaussian(link='identity')"
-
-    if sc.model_type == "gamlss" and sc.family == "gaussian":
-        sigma_f = mgcv_sigma_formula(cols, sc)
-        fit_line = f"fit <- gam(list({mu_formula}, {sigma_f}), family=gaulss(), data=train_df, method='REML', select={select_str})"
-        pred_line = """
-pred_raw <- predict(fit, newdata=test_df, type='response')
-if (is.list(pred_raw)) {
-    p <- as.numeric(pred_raw[[1]])
-    inv_sigma <- as.numeric(pred_raw[[2]])
-} else if (is.matrix(pred_raw)) {
-    p <- as.numeric(pred_raw[,1])
-    inv_sigma <- as.numeric(pred_raw[,2])
-} else {
-    p <- as.numeric(pred_raw)
-    inv_sigma <- rep(1.0, length(p))
-}
-sigma_hat <- 1.0 / pmax(inv_sigma, 1e-12)
-"""
-        gaussian_metrics = """
-rmse <- sqrt(mean((y_test - p)^2))
-mae <- mean(abs(y_test - p))
-sst <- sum((y_test - mean(y_test))^2)
-r2 <- if (sst > 0) 1.0 - sum((y_test - p)^2) / sst else 0.0
-logloss <- mean(0.5 * log(2 * pi * sigma_hat^2) + ((y_test - p)^2) / (2 * sigma_hat^2))
-result <- list(status='ok', r2=r2, rmse=rmse, mae=mae, logloss=logloss)
-"""
-    else:
-        fit_line = f"fit <- gam({mu_formula}, family={fam_str}, data=train_df, method='REML', select={select_str})"
-        pred_line = "p <- as.numeric(predict(fit, newdata=test_df, type='response'))"
-        if sc.family == "binomial":
-            gaussian_metrics = """
-p_safe <- pmin(pmax(p, 1e-12), 1 - 1e-12)
-n_pos <- sum(y_test > 0.5); n_neg <- sum(y_test <= 0.5)
-if (n_pos > 0 && n_neg > 0) {
-  ord <- order(p); yy <- y_test[ord]; ranks <- seq_along(yy)
-  auc <- (sum(ranks[yy > 0.5]) - n_pos*(n_pos+1)/2) / (n_pos*n_neg)
-} else { auc <- 0.5 }
-brier <- mean((y_test - p)^2)
-logloss <- mean(-(y_test*log(p_safe) + (1-y_test)*log(1-p_safe)))
-p_mean <- mean(y_train)
-nagelkerke_r2 <- NULL
-if (is.finite(p_mean) && p_mean > 0 && p_mean < 1) {
-  ll_null <- sum(y_test*log(p_mean)+(1-y_test)*log(1-p_mean))
-  ll_model <- sum(y_test*log(p_safe)+(1-y_test)*log(1-p_safe))
-  n_obs <- length(y_test)
-  r2_cs <- 1-exp((2/n_obs)*(ll_null-ll_model))
-  max_r2_cs <- 1-exp((2/n_obs)*ll_null)
-  nagelkerke_r2 <- if (max_r2_cs > 0) r2_cs/max_r2_cs else NULL
-}
-result <- list(status='ok', auc=auc, brier=brier, logloss=logloss, nagelkerke_r2=nagelkerke_r2)
-"""
-        else:
-            gaussian_metrics = """
-sigma_hat <- NA_real_
-fit_scale <- tryCatch(as.numeric(summary(fit)$scale), error=function(e) NA_real_)
-if (is.finite(fit_scale) && fit_scale > 0) { sigma_hat <- sqrt(fit_scale)
-} else { p_train <- as.numeric(predict(fit, newdata=train_df, type='response')); sigma_hat <- sqrt(mean((y_train - p_train)^2)) }
-sigma_hat <- max(as.numeric(sigma_hat), 1e-12)
-rmse <- sqrt(mean((y_test - p)^2))
-mae <- mean(abs(y_test - p))
-sst <- sum((y_test - mean(y_test))^2)
-r2 <- if (sst > 0) 1.0 - sum((y_test - p)^2) / sst else 0.0
-logloss <- mean(0.5 * log(2 * pi * sigma_hat^2) + ((y_test - p)^2) / (2 * sigma_hat^2))
-result <- list(status='ok', r2=r2, rmse=rmse, mae=mae, logloss=logloss)
-"""
-
-    r_script = f"""
-suppressMessages({{ library(mgcv); library(jsonlite) }})
-train_df <- read.csv("{train_csv}")
-test_df <- read.csv("{test_csv}")
-y_test <- test_df$y
-y_train <- train_df$y
-tryCatch({{
-    {fit_line}
-    {pred_line}
-    {gaussian_metrics}
-    writeLines(toJSON(result, auto_unbox=TRUE, null="null"), "{out_json}")
-}}, error=function(e) {{
-    writeLines(toJSON(list(status="error", message=conditionMessage(e)), auto_unbox=TRUE), "{out_json}")
-}})
-"""
-    script_path = os.path.join(tmpdir, "mgcv.R")
-    with open(script_path, "w") as f:
-        f.write(r_script)
-
-    t0 = time.time()
-    try:
-        r = subprocess.run(["Rscript", script_path], capture_output=True, text=True, timeout=r_timeout)
-        elapsed = time.time() - t0
-
-        if not os.path.exists(out_json):
-            return {"error": f"no R output rc={r.returncode}", "stderr": r.stderr,
-                    "stdout": r.stdout, "time": elapsed}
-
-        with open(out_json) as f:
-            out = json.load(f)
-
-        if out.get("status") != "ok":
-            return {"error": out.get("message", "R error"), "stderr": r.stderr, "time": elapsed}
-
-        result = {"time": elapsed}
-        for key in ["r2", "rmse", "mae", "logloss", "auc", "brier", "nagelkerke_r2"]:
-            if key in out and out[key] is not None:
-                result[key] = float(out[key])
-        return result
-
-    except subprocess.TimeoutExpired as e:
-        return {
-            "error": "timeout",
-            "time": r_timeout,
-            "stderr": (e.stderr or "") if hasattr(e, "stderr") else "",
-            "stdout": (e.stdout or "") if hasattr(e, "stdout") else "",
-        }
-    except Exception as e:
-        return {"error": str(e), "traceback": traceback.format_exc(), "time": time.time()-t0}
-
-
-def _compute_metrics(family: typing.Any, y_test: typing.Any, y_train: typing.Any, preds: typing.Any) -> typing.Any:
-    m = {}
-    if family == "gaussian":
-        m["r2"] = r2_score(y_test, preds)
-        m["rmse"] = rmse_score(y_test, preds)
-        m["mae"] = mae_score(y_test, preds)
-    elif family == "binomial":
-        m["auc"] = auc_score(y_test, preds)
-        m["brier"] = brier_score(y_test, preds)
-        m["logloss"] = log_loss_score(y_test, preds)
-        nr2 = nagelkerke_r2_score(y_test, preds, null_mean=float(np.mean(y_train)))
-        if nr2 is not None:
-            m["nagelkerke_r2"] = nr2
-    return m
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# RESULT
-# ═══════════════════════════════════════════════════════════════════════════
 
 @dataclass
 class FuzzResult:
@@ -1291,17 +88,13 @@ class FuzzResult:
     primary_metric: Optional[str] = None
 
     def compute_gap(self) -> None:
-        fam = self.scenario["family"]
-        if fam == "gaussian":
-            self.primary_metric = "r2"
-        else:
-            self.primary_metric = "auc"
+        self.primary_metric = "r2" if self.scenario["family"] == "gaussian" else "auc"
         rv = self.rust.get(self.primary_metric)
         mv = self.mgcv.get(self.primary_metric)
         if rv is not None and mv is not None:
-            self.primary_gap = mv - rv
+            self.primary_gap = float(mv) - float(rv)
         elif mv is not None and rv is None:
-            self.primary_gap = mv + 1.0  # rust failed
+            self.primary_gap = float(mv) + 1.0
 
 
 ABS_GAP_WARN_THRESHOLD = 0.05
@@ -1310,17 +103,323 @@ GAUSSIAN_R2_WARN_FLOOR = 0.01
 GAUSSIAN_R2_FAIL_FLOOR = 0.02
 GAUSSIAN_RMSE_WARN_RATIO = 1.5
 GAUSSIAN_RMSE_FAIL_RATIO = 2.0
+PER_TRIAL_FAIL_GAP = 0.30
+COHORT_MEDIAN_FAIL_GAP = 0.05
+COHORT_MIN_TRIALS = 6
+COHORT_NET_WINS_FAIL = 5
+MIN_VALID_TRIAL_FRACTION = 0.80
+NAN_GATED_METRICS = ("r2", "auc", "rmse", "logloss", "mae", "brier")
+
+
+def _basis_label(raw: typing.Any) -> str:
+    basis = str(raw or "ps").strip().lower()
+    if basis in {"thinplate", "tps", "tp"}:
+        return "tps"
+    if basis in {"duchon", "ds"}:
+        return "duchon"
+    if basis in {"matern", "gp"}:
+        return "matern"
+    return "ps"
+
+
+def _load_scenario_configs() -> list[dict[str, typing.Any]]:
+    obj = json.loads(SCENARIOS_FILE.read_text())
+    scenarios = obj.get("scenarios", [])
+    if not isinstance(scenarios, list):
+        raise RuntimeError(f"{SCENARIOS_FILE} must contain a 'scenarios' list")
+    return [s for s in scenarios if isinstance(s, dict) and isinstance(s.get("name"), str)]
+
+
+def _scenario_cost(sc: FuzzScenario) -> float:
+    multiplier = 1.8 if sc.model_type == "gamlss" else 1.0
+    return float(max(sc.n_obs, 1) * max(sc.n_features, 1) * multiplier)
+
+
+def _materialize_scenario(
+    cfg: dict[str, typing.Any],
+    *,
+    seed: int,
+    model_type: str,
+) -> FuzzScenario | None:
+    name = str(cfg["name"])
+    fit_cfg = _scenario_fit_mapping(name)
+    if fit_cfg is None:
+        return None
+
+    ds = dataset_for_scenario(cfg)
+    family = str(ds["family"])
+    if family not in {"gaussian", "binomial"}:
+        return None
+    if model_type == "gamlss" and family != "gaussian":
+        return None
+
+    basis = _basis_label(fit_cfg.get("smooth_basis", "ps"))
+    rust_family, formula = _rust_formula_for_scenario(name, ds)
+    if model_type == "gamlss":
+        noise_formula = _formula_rhs_from_terms(
+            _sigma_feature_terms(ds, scenario_name=name, backend="rust")
+        )
+        mgcv_formula = _mgcv_formula_for_scenario(name, ds)
+    else:
+        noise_formula = None
+        mgcv_formula = _mgcv_formula_for_scenario(name, ds)
+
+    return FuzzScenario(
+        trial_id=f"{seed}:{name}:{model_type}",
+        seed=seed,
+        name=name,
+        family=family,
+        model_type=model_type,
+        basis_type=basis,
+        n_obs=len(ds["rows"]),
+        n_features=len(ds["features"]),
+        formula=formula,
+        mgcv_formula=mgcv_formula,
+        noise_formula=noise_formula,
+    )
+
+
+def _candidate_scenarios(
+    *,
+    seed_start: int,
+    model_type_filter: Optional[str],
+) -> list[FuzzScenario]:
+    configs = _load_scenario_configs()
+    out: list[FuzzScenario] = []
+    model_types = [model_type_filter] if model_type_filter else ["gam", "gamlss"]
+    for offset, cfg in enumerate(configs):
+        for model_type in model_types:
+            if model_type is None:
+                continue
+            try:
+                sc = _materialize_scenario(cfg, seed=seed_start + offset, model_type=model_type)
+            except Exception as exc:
+                print(f"  [skip] {cfg.get('name', '?')}: {exc}", flush=True)
+                continue
+            if sc is not None:
+                out.append(sc)
+    return out
+
+
+def select_scenarios_backfilled(
+    *,
+    seed_start: int,
+    target_count: int,
+    excluded_ids: set[str],
+    family_filter: Optional[str] = None,
+    model_type_filter: Optional[str] = None,
+    basis_filter: Optional[str] = None,
+    max_scenario_cost: Optional[float] = None,
+) -> tuple[list[FuzzScenario], list[tuple[FuzzScenario, float]]]:
+    candidates = _candidate_scenarios(seed_start=seed_start, model_type_filter=model_type_filter)
+    if not candidates:
+        raise RuntimeError("no dataset-backed scenarios are available")
+
+    start = seed_start % len(candidates)
+    ordered = candidates[start:] + candidates[:start]
+    selected: list[FuzzScenario] = []
+    skipped: list[tuple[FuzzScenario, float]] = []
+
+    for sc in ordered:
+        if sc.trial_id in excluded_ids:
+            continue
+        if family_filter is not None and sc.family != family_filter:
+            continue
+        if model_type_filter is not None and sc.model_type != model_type_filter:
+            continue
+        if basis_filter is not None and sc.basis_type != basis_filter:
+            continue
+        cost = _scenario_cost(sc)
+        if max_scenario_cost is not None and cost > max_scenario_cost:
+            skipped.append((sc, cost))
+            continue
+        selected.append(sc)
+        if len(selected) >= target_count:
+            break
+
+    if len(selected) < target_count:
+        raise RuntimeError(
+            f"only selected {len(selected)}/{target_count} scenario(s); "
+            "filters or cost cap are too restrictive"
+        )
+    return selected, skipped
+
+
+def _prediction_mean(predicted: typing.Any) -> np.ndarray:
+    if isinstance(predicted, pd.DataFrame):
+        return predicted["mean"].to_numpy(dtype=float)
+    if isinstance(predicted, dict):
+        return np.asarray(predicted["mean"], dtype=float)
+    return np.asarray(predicted["mean"], dtype=float)
+
+
+def _prediction_sigma(predicted: typing.Any) -> np.ndarray | None:
+    if isinstance(predicted, pd.DataFrame) and "sigma" in predicted.columns:
+        return predicted["sigma"].to_numpy(dtype=float)
+    if isinstance(predicted, dict) and "sigma" in predicted:
+        return np.asarray(predicted["sigma"], dtype=float)
+    return None
+
+
+def _standard_deviation_from_model(model: typing.Any) -> float | None:
+    try:
+        payload = model._saved_model_payload()
+    except Exception:
+        return None
+    fit_result = payload.get("fit_result")
+    if not isinstance(fit_result, dict):
+        return None
+    sigma = fit_result.get("standard_deviation")
+    try:
+        sigma_f = float(sigma)
+    except (TypeError, ValueError):
+        return None
+    return sigma_f if math.isfinite(sigma_f) and sigma_f > 0.0 else None
+
+
+def _metrics_from_predictions(
+    *,
+    family: str,
+    y_test: np.ndarray,
+    y_train: np.ndarray,
+    pred: np.ndarray,
+    sigma: np.ndarray | float | None = None,
+) -> dict[str, typing.Any]:
+    if family == "binomial":
+        metrics: dict[str, typing.Any] = {
+            "auc": auc_score(y_test, pred),
+            "brier": brier_score(y_test, pred),
+            "logloss": log_loss_score(y_test, pred),
+        }
+        nr2 = nagelkerke_r2_score(y_test, pred, null_mean=float(np.mean(y_train)))
+        if nr2 is not None:
+            metrics["nagelkerke_r2"] = nr2
+        return metrics
+
+    diagnostics = Diagnostics.from_predictions(
+        formula="gamfit",
+        response_name="y",
+        observed=[float(v) for v in y_test],
+        predicted={"mean": [float(v) for v in pred]},
+    )
+    d_metrics = diagnostics.metrics
+    metrics = {
+        "r2": d_metrics.get("r_squared", 0.0),
+        "rmse": d_metrics.get("rmse"),
+        "mae": d_metrics.get("mae"),
+        "mse": mse_score(y_test, pred),
+    }
+    if sigma is not None:
+        metrics["logloss"] = gaussian_log_loss_score(y_test, pred, sigma)
+    return metrics
+
+
+def run_gamfit(
+    sc: FuzzScenario,
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    ds: dict[str, typing.Any],
+    rust_timeout: int,
+) -> dict[str, typing.Any]:
+    del rust_timeout
+    y_test = test_df[ds["target"]].to_numpy(dtype=float)
+    y_train = train_df[ds["target"]].to_numpy(dtype=float)
+    family_arg, formula = _rust_formula_for_scenario(sc.name, ds)
+    config = {"noise_formula": sc.noise_formula} if sc.noise_formula else None
+
+    t0 = time.perf_counter()
+    try:
+        model = gamfit.fit(train_df, formula, family=family_arg, config=config)
+        fit_sec = time.perf_counter() - t0
+        t1 = time.perf_counter()
+        predicted = model.predict(test_df)
+        predict_sec = time.perf_counter() - t1
+        pred = _prediction_mean(predicted)
+        if len(pred) != len(y_test):
+            return {
+                "error": f"prediction count {len(pred)} vs {len(y_test)}",
+                "time": fit_sec + predict_sec,
+            }
+        sigma: np.ndarray | float | None = _prediction_sigma(predicted)
+        if sigma is None and sc.family == "gaussian":
+            sigma = _standard_deviation_from_model(model)
+        metrics = _metrics_from_predictions(
+            family=sc.family,
+            y_test=y_test,
+            y_train=y_train,
+            pred=pred,
+            sigma=sigma,
+        )
+        metrics["fit_sec"] = fit_sec
+        metrics["predict_sec"] = predict_sec
+        metrics["time"] = fit_sec + predict_sec
+        metrics["model_spec"] = formula if not sc.noise_formula else f"mu: {formula}; sigma: {sc.noise_formula}"
+        return metrics
+    except Exception as exc:
+        return {
+            "error": str(exc),
+            "traceback": traceback.format_exc(),
+            "time": time.perf_counter() - t0,
+        }
+
+
+def run_mgcv(
+    sc: FuzzScenario,
+    ds: dict[str, typing.Any],
+    fold: typing.Any,
+    r_timeout: int,
+) -> dict[str, typing.Any]:
+    del r_timeout
+    try:
+        scenario_cfg = {"name": sc.name}
+        row = (
+            run_external_mgcv_gaulss_cv(scenario_cfg, ds=ds, folds=[fold])
+            if sc.model_type == "gamlss"
+            else run_external_mgcv_cv(scenario_cfg, ds=ds, folds=[fold])
+        )
+        if row is None:
+            return {"error": "mgcv runner did not produce a result"}
+        if row.get("status") == "failed":
+            return {"error": row.get("error", "mgcv failed")}
+        out = {k: row.get(k) for k in ("r2", "rmse", "mae", "mse", "logloss", "auc", "brier", "nagelkerke_r2")}
+        out = {k: v for k, v in out.items() if v is not None}
+        fit_sec = float(row.get("fit_sec") or 0.0)
+        predict_sec = float(row.get("predict_sec") or 0.0)
+        out["fit_sec"] = fit_sec
+        out["predict_sec"] = predict_sec
+        out["time"] = fit_sec + predict_sec
+        if row.get("model_spec"):
+            out["model_spec"] = row["model_spec"]
+        return out
+    except Exception as exc:
+        return {"error": str(exc), "traceback": traceback.format_exc()}
+
+
+def run_trial(sc: FuzzScenario, rust_timeout: int, r_timeout: int) -> FuzzResult:
+    ds = dataset_for_scenario({"name": sc.name})
+    folds = folds_for_dataset(ds)
+    if not folds:
+        raise RuntimeError(f"{sc.name}: no folds generated")
+    fold = folds[0]
+    df = pd.DataFrame(ds["rows"])
+    train_df = df.iloc[fold.train_idx].copy()
+    test_df = df.iloc[fold.test_idx].copy()
+    train_df, test_df = zscore_train_test(train_df, test_df, ds["features"])
+
+    rust_out = run_gamfit(sc, train_df, test_df, ds, rust_timeout)
+    mgcv_out = run_mgcv(sc, ds, fold, r_timeout)
+    result = FuzzResult(scenario=asdict(sc), rust=rust_out, mgcv=mgcv_out)
+    result.compute_gap()
+    return result
 
 
 def gaussian_rmse_ratio(result: FuzzResult) -> Optional[float]:
     if result.scenario["family"] != "gaussian":
         return None
-
     rust_rmse = result.rust.get("rmse")
     mgcv_rmse = result.mgcv.get("rmse")
     if rust_rmse is None or mgcv_rmse is None:
         return None
-
     rust_rmse = float(rust_rmse)
     mgcv_rmse = float(mgcv_rmse)
     if not math.isfinite(rust_rmse) or not math.isfinite(mgcv_rmse):
@@ -1336,11 +435,9 @@ def classify_primary_divergence(result: FuzzResult) -> tuple[str, str]:
     gap = result.primary_gap
     if gap is None or gap <= 0:
         return "", ""
-
     metric = result.primary_metric or "metric"
     if gap > ABS_GAP_FAIL_THRESHOLD:
         return "fail", f"{metric}_gap={gap:+.4f}"
-
     if result.scenario["family"] == "gaussian":
         rmse_ratio = gaussian_rmse_ratio(result)
         if rmse_ratio is not None:
@@ -1348,46 +445,9 @@ def classify_primary_divergence(result: FuzzResult) -> tuple[str, str]:
                 return "fail", f"r2_gap={gap:+.4f}, rmse_ratio={rmse_ratio:.2f}x"
             if gap > GAUSSIAN_R2_WARN_FLOOR and rmse_ratio > GAUSSIAN_RMSE_WARN_RATIO:
                 return "warn", f"r2_gap={gap:+.4f}, rmse_ratio={rmse_ratio:.2f}x"
-
     if gap > ABS_GAP_WARN_THRESHOLD:
         return "warn", f"{metric}_gap={gap:+.4f}"
     return "", ""
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# CI GATES
-# ═══════════════════════════════════════════════════════════════════════════
-#
-# Hard regression gates evaluated after all trials complete. The harness
-# prints a per-gate failure summary and exits 1 if any gate fires. These
-# gates are stricter than the per-trial classification used for log
-# decoration (`!!!`, `!!`) — those exist to flag trials at all; gates
-# decide CI conclusion.
-
-# Any individual trial with rust worse than mgcv by this much on its primary
-# metric (R² for gaussian, AUC for binomial) trips the "huge per-trial gap"
-# gate. We expect zero of these on a healthy run.
-PER_TRIAL_FAIL_GAP = 0.30
-
-# Any (family, model_type, basis_type) cohort with median gap worse than
-# this much (rust median behind mgcv) trips the "cohort regression" gate.
-COHORT_MEDIAN_FAIL_GAP = 0.05
-
-# Cohorts with at least this many valid trials are eligible for cohort
-# gates; smaller cohorts are too noisy to reason about.
-COHORT_MIN_TRIALS = 6
-
-# Any cohort where (mgcv wins) - (rust wins) exceeds this many trips the
-# "systematic disadvantage" gate. mgcv/rust win counts use the same
-# ±0.01 deadband as the leaderboard.
-COHORT_NET_WINS_FAIL = 5
-
-# Minimum fraction of requested trials that must produce a comparable
-# mgcv-vs-rust pair. Below this we cannot trust the harness output.
-MIN_VALID_TRIAL_FRACTION = 0.80
-
-# Metrics we check for rust NaN/inf when mgcv produced a finite value.
-NAN_GATED_METRICS = ("r2", "auc", "rmse", "logloss", "mae", "brier")
 
 
 def _metric_is_nonfinite(value: typing.Any) -> bool:
@@ -1416,36 +476,18 @@ def compute_ci_gates(
     skipped_count: int = 0,
     baseline: Optional[dict[str, typing.Any]] = None,
 ) -> dict[str, typing.Any]:
-    """Evaluate the four (or five, with baseline) regression gates.
-
-    Returns a dict with:
-      - failed: bool
-      - gate_failures: list[dict] — per-gate detail (gate, message, offenders)
-    """
     valid_trials = [r for r in results if r.primary_gap is not None]
     valid_count = len(valid_trials)
-
     gate_failures: list[dict[str, typing.Any]] = []
 
-    # Gate 1: per-trial huge-gap regressions.
-    big_gap_offenders = []
-    for r in results:
-        gap = r.primary_gap
-        if gap is None:
-            continue
-        if gap > PER_TRIAL_FAIL_GAP:
-            big_gap_offenders.append(r)
+    big_gap_offenders = [r for r in valid_trials if (r.primary_gap or 0.0) > PER_TRIAL_FAIL_GAP]
     if big_gap_offenders:
         gate_failures.append({
             "gate": "per_trial_gap",
-            "message": (
-                f"{len(big_gap_offenders)} trial(s) with primary-metric gap "
-                f"> {PER_TRIAL_FAIL_GAP:.2f} (rust worse than mgcv)"
-            ),
+            "message": f"{len(big_gap_offenders)} trial(s) with primary-metric gap > {PER_TRIAL_FAIL_GAP:.2f}",
             "offenders": big_gap_offenders,
         })
 
-    # Gate 2: cohort median gap regressions.
     cohorts: dict[tuple[typing.Any, typing.Any, typing.Any], list[FuzzResult]] = {}
     for r in valid_trials:
         cohort = (
@@ -1460,16 +502,12 @@ def compute_ci_gates(
     for cohort, members in cohorts.items():
         if len(members) < COHORT_MIN_TRIALS:
             continue
-        gaps = [r.primary_gap for r in members if r.primary_gap is not None]
+        gaps = [float(r.primary_gap) for r in members if r.primary_gap is not None]
         if not gaps:
             continue
-        median_gap = float(np.median(gaps))
+        median_gap = float(statistics.median(gaps))
         if median_gap > COHORT_MEDIAN_FAIL_GAP:
-            cohort_median_offenders.append({
-                "cohort": cohort,
-                "median_gap": median_gap,
-                "n": len(gaps),
-            })
+            cohort_median_offenders.append({"cohort": cohort, "median_gap": median_gap, "n": len(gaps)})
         mgcv_wins = sum(1 for g in gaps if g > 0.01)
         rust_wins = sum(1 for g in gaps if g < -0.01)
         net = mgcv_wins - rust_wins
@@ -1485,75 +523,60 @@ def compute_ci_gates(
     if cohort_median_offenders:
         gate_failures.append({
             "gate": "cohort_median",
-            "message": (
-                f"{len(cohort_median_offenders)} cohort(s) with median gap "
-                f"> {COHORT_MEDIAN_FAIL_GAP:.2f} (rust median behind mgcv)"
-            ),
+            "message": f"{len(cohort_median_offenders)} cohort(s) with median gap > {COHORT_MEDIAN_FAIL_GAP:.2f}",
             "offenders": cohort_median_offenders,
         })
     if cohort_net_wins_offenders:
         gate_failures.append({
             "gate": "cohort_net_wins",
-            "message": (
-                f"{len(cohort_net_wins_offenders)} cohort(s) with mgcv-wins "
-                f"minus rust-wins > {COHORT_NET_WINS_FAIL}"
-            ),
+            "message": f"{len(cohort_net_wins_offenders)} cohort(s) with net mgcv wins > {COHORT_NET_WINS_FAIL}",
             "offenders": cohort_net_wins_offenders,
         })
 
-    # Gate 3: rust-NaN / rust-inf where mgcv was finite.
     nan_offenders = []
     for r in results:
-        for m in NAN_GATED_METRICS:
-            mv = r.mgcv.get(m)
-            rv = r.rust.get(m)
+        for metric in NAN_GATED_METRICS:
+            mv = r.mgcv.get(metric)
+            rv = r.rust.get(metric)
             if _metric_is_finite(mv) and _metric_is_nonfinite(rv):
-                nan_offenders.append((r, m, rv, mv))
+                nan_offenders.append((r, metric, rv, mv))
                 break
     if nan_offenders:
         gate_failures.append({
             "gate": "rust_nan_inf",
-            "message": (
-                f"{len(nan_offenders)} trial(s) where rust produced NaN/inf "
-                f"on a metric mgcv evaluated finitely"
-            ),
+            "message": f"{len(nan_offenders)} trial(s) where gamfit produced NaN/inf against finite mgcv",
             "offenders": nan_offenders,
         })
 
-    # Gate 4: insufficient valid-comparison coverage.
     min_required = max(1, int(math.ceil(MIN_VALID_TRIAL_FRACTION * requested_trials)))
     if valid_count < min_required:
         gate_failures.append({
             "gate": "coverage",
             "message": (
-                f"only {valid_count}/{requested_trials} trial(s) produced a "
-                f"valid mgcv-vs-rust comparison "
-                f"(skipped above cost cap: {skipped_count}); "
-                f"reduce cap or add coverage. Minimum required: "
-                f"{min_required}"
+                f"only {valid_count}/{requested_trials} trial(s) produced a valid comparison "
+                f"(skipped above cost cap: {skipped_count}); minimum required: {min_required}"
             ),
             "offenders": [],
         })
 
-    # Gate 5 (optional): regression vs prior baseline.
     if baseline:
         baseline_offenders = []
-        baseline_threshold = float(baseline.get("threshold", 0.05))
+        threshold = float(baseline.get("threshold", 0.05))
         cohort_baselines = baseline.get("cohorts", {}) or {}
         for cohort, members in cohorts.items():
-            cohort_key = "/".join(str(part) for part in cohort)
-            base_gap = cohort_baselines.get(cohort_key)
+            key = "/".join(str(part) for part in cohort)
+            base_gap = cohort_baselines.get(key)
             if base_gap is None:
                 continue
-            gaps = [r.primary_gap for r in members if r.primary_gap is not None]
+            gaps = [float(r.primary_gap) for r in members if r.primary_gap is not None]
             if not gaps:
                 continue
-            current_median = float(np.median(gaps))
-            delta = current_median - float(base_gap)
-            if delta > baseline_threshold:
+            current = float(statistics.median(gaps))
+            delta = current - float(base_gap)
+            if delta > threshold:
                 baseline_offenders.append({
                     "cohort": cohort,
-                    "current_median_gap": current_median,
+                    "current_median_gap": current,
                     "baseline_median_gap": float(base_gap),
                     "delta": delta,
                     "n": len(gaps),
@@ -1561,10 +584,7 @@ def compute_ci_gates(
         if baseline_offenders:
             gate_failures.append({
                 "gate": "baseline_regression",
-                "message": (
-                    f"{len(baseline_offenders)} cohort(s) regressed against "
-                    f"baseline by more than {baseline_threshold:.2f}"
-                ),
+                "message": f"{len(baseline_offenders)} cohort(s) regressed against baseline by more than {threshold:.2f}",
                 "offenders": baseline_offenders,
             })
 
@@ -1578,155 +598,105 @@ def compute_ci_gates(
     }
 
 
-def run_trial(sc: typing.Any, rust_timeout: typing.Any, r_timeout: typing.Any) -> typing.Any:
-    train_df, test_df, cols = generate_data(sc)
-    with tempfile.TemporaryDirectory(prefix="gam_fuzz_") as tmpdir:
-        rust_out = run_rust(sc, train_df, test_df, cols, tmpdir, rust_timeout)
-        mgcv_out = run_mgcv(sc, train_df, test_df, cols, tmpdir, r_timeout)
-    result = FuzzResult(scenario=asdict(sc), rust=rust_out, mgcv=mgcv_out)
-    result.compute_gap()
-    return result
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# REPORTING
-# ═══════════════════════════════════════════════════════════════════════════
-
-def print_leaderboard(results: typing.Any, top_n: typing.Any=25) -> None:
+def print_leaderboard(results: typing.Any, top_n: int = 25) -> None:
     groups: dict[tuple[typing.Any, typing.Any, typing.Any], list[typing.Any]] = {}
     for r in results:
         key = (r.scenario["family"], r.scenario["model_type"], r.scenario["basis_type"])
         groups.setdefault(key, []).append(r)
-
-    # Also print overall
     groups[("ALL", "ALL", "ALL")] = results
 
     for (fam, mt, basis), subset in sorted(groups.items()):
         valid = [r for r in subset if r.primary_gap is not None]
         if not valid:
             continue
-        valid.sort(key=lambda r: -(r.primary_gap or 0))
-
+        valid.sort(key=lambda r: -(r.primary_gap or 0.0))
         metric = valid[0].primary_metric or "?"
         label = f"{fam}/{mt}/{basis}" if fam != "ALL" else "ALL TRIALS"
-
         print(f"\n{'=' * 120}")
-        print(f"  {label} — {metric} gap (mgcv - rust)  |  {len(valid)} valid / {len(subset)} total")
+        print(f"  {label} - {metric} gap (mgcv - gamfit) | {len(valid)} valid / {len(subset)} total")
         print("=" * 120)
-        print(f"{'#':>3}  {'gap':>8}  {'rust':>9}  {'mgcv':>9}  {'n':>5}  {'k':>2}  {'kn':>3}  {'dp':>3}  "
-              f"{'noise':>6}  {'noise_t':>12}  {'basis':>6}  {'signal':>15}  {'x_dist':>12}  {'smooths'}")
+        print(f"{'#':>3}  {'gap':>8}  {'gamfit':>9}  {'mgcv':>9}  {'scenario':>36}  {'n':>6}  {'p':>3}")
         print("-" * 120)
-
         for i, r in enumerate(valid[:top_n]):
             s = r.scenario
-            gap_s = f"{r.primary_gap:+.4f}" if r.primary_gap is not None else "  N/A "
-            rv = r.rust.get(r.primary_metric or "r2")
-            mv = r.mgcv.get(r.primary_metric or "r2")
+            rv = r.rust.get(metric)
+            mv = r.mgcv.get(metric)
             rs = f"{rv:.4f}" if rv is not None else "  FAIL"
             ms = f"{mv:.4f}" if mv is not None else "  FAIL"
-            kinds = ",".join(k[:3] for k in s["smooth_kinds"][:4])
-            if len(s["smooth_kinds"]) > 4:
-                kinds += f"+{len(s['smooth_kinds'])-4}"
-            print(f"{i+1:3d}  {gap_s}  {rs:>9}  {ms:>9}  {s['n_obs']:5d}  {s['n_smooths']:2d}  "
-                  f"{s['knots']:3d}  {'Y' if s['double_penalty'] else 'N':>3}  "
-                  f"{s['noise_sd']:6.2f}  {s['noise_kind']:>12}  {s['basis_type']:>6}  "
-                  f"{s['signal_structure']:>15}  {s['x_distribution']:>12}  {kinds}")
-
-        gaps = [r.primary_gap for r in valid]
+            gap_s = f"{r.primary_gap:+.4f}" if r.primary_gap is not None else "  N/A "
+            print(
+                f"{i + 1:3d}  {gap_s}  {rs:>9}  {ms:>9}  "
+                f"{s['name'][:36]:>36}  {s['n_obs']:6d}  {s['n_features']:3d}"
+            )
+        gaps = [float(r.primary_gap) for r in valid if r.primary_gap is not None]
         mgcv_w = sum(1 for g in gaps if g > 0.01)
         rust_w = sum(1 for g in gaps if g < -0.01)
         ties = len(gaps) - mgcv_w - rust_w
-        print(f"\n  mgcv wins: {mgcv_w} | rust wins: {rust_w} | ties: {ties} | median gap: {np.median(gaps):+.4f}")
+        median_gap = statistics.median(gaps)
+        print(f"\n  mgcv wins: {mgcv_w} | gamfit wins: {rust_w} | ties: {ties} | median gap: {median_gap:+.4f}")
 
-    # Failure details
     rust_fails = [r for r in results if r.rust.get("error")]
     mgcv_fails = [r for r in results if r.mgcv.get("error")]
-    # mgcv-chokepoint scenarios: rust evaluated finitely while mgcv hit an
-    # R-side error. These were previously silently dropped from the gap
-    # distribution; they are scenarios mgcv finds harder than rust does
-    # and should be surfaced as positive evidence in the leaderboard.
-    mgcv_chokepoints = [
-        r for r in results
-        if r.mgcv.get("error") and not r.rust.get("error")
-    ]
     if rust_fails or mgcv_fails:
         print(f"\n{'=' * 120}")
-        print(f"  FAILURES — rust: {len(rust_fails)} | mgcv: {len(mgcv_fails)}")
+        print(f"  FAILURES - gamfit: {len(rust_fails)} | mgcv: {len(mgcv_fails)}")
         print("=" * 120)
-        for label, fails in [("RUST", rust_fails), ("MGCV", mgcv_fails)]:
+        for label, fails in [("GAMFIT", rust_fails), ("MGCV", mgcv_fails)]:
             for r in fails[:10]:
                 s = r.scenario
-                err = r.rust.get("error", "") if label == "RUST" else r.mgcv.get("error", "")
-                stderr = r.rust.get("stderr", "") if label == "RUST" else r.mgcv.get("stderr", "")
-                cmd = r.rust.get("cmd", "") if label == "RUST" else ""
-                print(f"  [{label}] seed={s['seed']} {s['family']}/{s['model_type']}/{s['basis_type']} "
-                      f"n={s['n_obs']} k={s['n_smooths']} kn={s['knots']}")
-                print(f"    error: {err[:200]}")
-                if stderr:
-                    print(f"    stderr: {stderr[:200]}")
-                if cmd:
-                    print(f"    cmd: {cmd[:200]}")
-    if mgcv_chokepoints:
-        print(f"\n{'=' * 120}")
-        print(
-            f"  MGCV CHOKEPOINTS — {len(mgcv_chokepoints)} scenario(s) where "
-            f"rust succeeded but mgcv erred"
-        )
-        print("=" * 120)
-        for r in mgcv_chokepoints[:20]:
-            s = r.scenario
-            err = (r.mgcv.get("error", "") or "")[:200]
-            metric = "r2" if s.get("family") == "gaussian" else "auc"
-            rv = r.rust.get(metric)
-            rs = f"{rv:.4f}" if rv is not None else "FAIL"
-            print(
-                f"  [MGCV-CHOKE] seed={s['seed']} "
-                f"{s['family']}/{s['model_type']}/{s['basis_type']} "
-                f"n={s['n_obs']} k={s['n_smooths']} kn={s['knots']} "
-                f"sig={s.get('signal_structure', '?')[:8]} "
-                f"noise={s.get('noise_kind', '?')[:8]} :: "
-                f"rust {metric}={rs} | mgcv error: {err}"
-            )
-    print()
+                out = r.rust if label == "GAMFIT" else r.mgcv
+                print(f"  [{label}] {s['name']} {s['family']}/{s['model_type']}/{s['basis_type']}")
+                print(f"    error: {str(out.get('error', ''))[:300]}")
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# MAIN
-# ═══════════════════════════════════════════════════════════════════════════
+def _load_existing_results() -> tuple[list[FuzzResult], set[str]]:
+    results: list[FuzzResult] = []
+    ids: set[str] = set()
+    if not RESULTS_FILE.exists():
+        return results, ids
+    with open(RESULTS_FILE) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            obj = json.loads(line)
+            fr = FuzzResult(scenario=obj["scenario"], rust=obj["rust"], mgcv=obj["mgcv"])
+            fr.compute_gap()
+            results.append(fr)
+            trial_id = fr.scenario.get("trial_id")
+            if isinstance(trial_id, str):
+                ids.add(trial_id)
+    return results, ids
 
-_DEPTH_DEFAULTS = {
-    "lean": 100,
-    "default": 200,
-    "deep": 500,
-    "heavy": 1000,
-}
+
+def _default_seed_start(args: argparse.Namespace) -> int:
+    if args.seed_start is not None:
+        return int(args.seed_start)
+    if args.resume and META_FILE.exists():
+        try:
+            saved = json.loads(META_FILE.read_text())
+            if isinstance(saved, dict) and isinstance(saved.get("seed_start"), int):
+                return int(saved["seed_start"])
+        except (OSError, json.JSONDecodeError):
+            pass
+    return secrets.randbelow(2**31 - 1) + 1
 
 
-def _default_n_trials() -> int:
-    depth = (os.environ.get("FUZZ_DEPTH") or "default").lower().strip()
-    return _DEPTH_DEFAULTS.get(depth, _DEPTH_DEFAULTS["default"])
+def _check_mgcv_available() -> None:
+    r_check = subprocess.run(
+        ["Rscript", "-e", "suppressPackageStartupMessages(library(mgcv)); cat('ok')"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if "ok" not in (r_check.stdout or ""):
+        raise RuntimeError("R + mgcv not available")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Adversarial fuzzer: Rust GAM vs mgcv")
-    parser.add_argument("--n-trials", type=int, default=_default_n_trials(),
-                        help="Number of trials. Defaults track FUZZ_DEPTH "
-                             "(lean=100 / default=200 / deep=500 / heavy=1000).")
-    parser.add_argument(
-        "--seed-start",
-        type=int,
-        default=None,
-        help=(
-            "Starting integer seed for scenario generation. Each scenario "
-            "seed is fully deterministic (same seed -> same n, basis, signal, "
-            "noise, x distribution, etc.), so passing a specific value "
-            "reproduces the exact set of trials a previous run produced. "
-            "When omitted, the harness chooses a fresh seed from a "
-            "system-entropy source so different invocations explore different "
-            "scenario windows -- the chosen value is printed prominently and "
-            "saved to bench/fuzz_results.meta.json for later replay."
-        ),
-    )
+    parser = argparse.ArgumentParser(description="Dataset-backed gamfit vs mgcv comparison harness")
+    parser.add_argument("--n-trials", type=int, default=DEFAULT_N_TRIALS)
+    parser.add_argument("--seed-start", type=int, default=None)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--top", type=int, default=15)
     parser.add_argument("--family", type=str, default=None, choices=["gaussian", "binomial"])
@@ -1735,75 +705,23 @@ def main() -> None:
     parser.add_argument("--rust-timeout", type=int, default=DEFAULT_RUST_TIMEOUT)
     parser.add_argument("--r-timeout", type=int, default=DEFAULT_R_TIMEOUT)
     parser.add_argument("--max-total-seconds", type=int, default=None)
-    # Cost cap default raised from the historical 75_000 (which skipped ~41%
-    # of generated scenarios) to 200_000 so the harness produces enough
-    # valid mgcv-vs-rust comparisons to satisfy the coverage gate.
     parser.add_argument("--max-scenario-cost", type=float, default=200_000.0)
-    parser.add_argument(
-        "--baseline-json",
-        type=str,
-        default=None,
-        help=(
-            "Optional path to a JSON baseline of expected per-cohort median "
-            "gaps. Format: {\"threshold\": 0.05, \"cohorts\": "
-            "{\"gaussian/gam/duchon\": 0.10, ...}}. When provided, the run "
-            "FAILS if any cohort's current median gap exceeds baseline by "
-            "more than threshold."
-        ),
-    )
+    parser.add_argument("--baseline-json", type=str, default=None)
     args = parser.parse_args()
 
-    if not RUST_BINARY.exists():
-        print(f"Rust binary not found: {RUST_BINARY}\nBuild first: cargo build --release")
-        sys.exit(1)
-    r_check = subprocess.run(["Rscript", "-e", "library(mgcv); cat('ok')"],
-                              capture_output=True, text=True, timeout=30)
-    if "ok" not in (r_check.stdout or ""):
-        print("R + mgcv not available")
+    try:
+        _check_mgcv_available()
+    except Exception as exc:
+        print(str(exc))
         sys.exit(1)
 
-    # Seed-start selection: deterministic when --seed-start is passed,
-    # entropy-driven when omitted. Each invocation that does not pin a value
-    # explores a different scenario window so the harness keeps surfacing
-    # new failure modes over time, but the chosen seed is printed and
-    # persisted to META_FILE so any specific run is exactly replayable via
-    # `--seed-start <value>`.
-    #
-    # Resume semantics: with --resume, fall back to the previously-saved
-    # seed_start in META_FILE so the continuation lands in the same window
-    # the original run was exploring. Re-rolling would shift the resumed
-    # batch onto unrelated scenarios, defeating the point of resume.
     seed_start_explicit = args.seed_start is not None
-    if not seed_start_explicit:
-        if args.resume and META_FILE.exists():
-            try:
-                saved = json.loads(META_FILE.read_text())
-                if isinstance(saved, dict) and isinstance(saved.get("seed_start"), int):
-                    args.seed_start = int(saved["seed_start"])
-            except (OSError, json.JSONDecodeError):
-                pass
-    if args.seed_start is None:
-        # 31-bit positive int: comfortably within numpy.random.RandomState's
-        # accepted range (0..2**32-1) while staying small enough to print
-        # cleanly. Drawn from the OS entropy pool, not time, so two
-        # invocations within the same wallclock second still diverge.
-        args.seed_start = secrets.randbelow(2**31 - 1) + 1
+    args.seed_start = _default_seed_start(args)
 
-    existing_seeds = set()
-    results = []
     if not args.resume and RESULTS_FILE.exists():
         RESULTS_FILE.unlink()
-    if args.resume and RESULTS_FILE.exists():
-        with open(RESULTS_FILE) as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                obj = json.loads(line)
-                fr = FuzzResult(scenario=obj["scenario"], rust=obj["rust"], mgcv=obj["mgcv"])
-                fr.compute_gap()
-                results.append(fr)
-                existing_seeds.add(obj["scenario"]["seed"])
+    results, existing_ids = _load_existing_results() if args.resume else ([], set())
+    if args.resume:
         print(f"Loaded {len(results)} existing results")
 
     target_new_trials = max(0, args.n_trials - len(results))
@@ -1811,29 +729,29 @@ def main() -> None:
         print_leaderboard(results, top_n=args.top)
         return
 
-    seed_origin = "explicit" if seed_start_explicit else "auto (system entropy)"
+    scenarios, skipped_scenarios = select_scenarios_backfilled(
+        seed_start=int(args.seed_start),
+        target_count=target_new_trials,
+        excluded_ids=existing_ids,
+        family_filter=args.family,
+        model_type_filter=args.model_type,
+        basis_filter=args.basis,
+        max_scenario_cost=args.max_scenario_cost,
+    )
+
+    seed_origin = "explicit" if seed_start_explicit else "auto"
     print(f"Running {target_new_trials} trials")
-    print(f"  Seed start:        {args.seed_start}  [{seed_origin}]")
+    print(f"  Seed start:        {args.seed_start} [{seed_origin}]")
     print(f"  Replay this run:   --seed-start {args.seed_start}")
-    print(f"  Smooth functions:  {len(SMOOTH_FN)} 1D + {len(SMOOTH_FN_2D)} 2D")
-    print(f"  Noise types:       {len(NOISE_FN)}")
-    print(f"  X distributions:   {len(XDIST_FN)}")
-    print(f"  Signal structures: {len(SIGNAL_BUILDERS)}")
-    print(f"  Sigma functions:   {len(SIGMA_FN)}")
+    print(f"  Scenario source:   {SCENARIOS_FILE}")
     print(f"  Filters: family={args.family or 'all'} model={args.model_type or 'all'} basis={args.basis or 'all'}")
-    print(f"  Rust timeout:      {args.rust_timeout}s")
+    print(f"  Gamfit timeout:    {args.rust_timeout}s")
     print(f"  R timeout:         {args.r_timeout}s")
     print(f"  Time budget:       {args.max_total_seconds}s" if args.max_total_seconds else "  Time budget:       none")
     print(f"  Scenario cost cap: {args.max_scenario_cost:g}" if args.max_scenario_cost is not None else "  Scenario cost cap: none")
     print(f"  Results: {RESULTS_FILE}")
     print(f"  Metadata: {META_FILE}\n")
 
-    # Persist the chosen seed (and the rest of the invocation) so any local
-    # replay can reproduce the exact set of trials this run produced -- the
-    # CI run prints the seed to logs, but META_FILE is the structured
-    # source of truth that survives log rotation. `--resume` deliberately
-    # uses the existing seed_start written here, so a replayed run
-    # continues from the same window rather than re-rolling.
     META_FILE.write_text(
         json.dumps(
             {
@@ -1854,17 +772,6 @@ def main() -> None:
         + "\n"
     )
 
-    # Pre-generate enough runnable scenarios so cost-capped skips do not
-    # lower coverage below the requested CI sample size.
-    scenarios, skipped_scenarios = select_scenarios_backfilled(
-        seed_start=args.seed_start,
-        target_count=target_new_trials,
-        excluded_seeds=existing_seeds,
-        family_filter=args.family,
-        model_type_filter=args.model_type,
-        basis_filter=args.basis,
-        max_scenario_cost=args.max_scenario_cost,
-    )
     if skipped_scenarios:
         max_skipped = max(cost for _, cost in skipped_scenarios)
         print(
@@ -1872,9 +779,6 @@ def main() -> None:
             f"{args.max_scenario_cost:g}; max skipped cost={max_skipped:.0f}",
             flush=True,
         )
-    if not scenarios:
-        print("No scenarios selected after filters and cost cap")
-        sys.exit(2)
 
     started_at = time.time()
     with open(RESULTS_FILE, "a") as out_f:
@@ -1888,210 +792,120 @@ def main() -> None:
                         flush=True,
                     )
                     break
-            seed = sc.seed
             result = run_trial(sc, args.rust_timeout, args.r_timeout)
-
             results.append(result)
-            out_f.write(json.dumps({"scenario": result.scenario, "rust": result.rust,
-                                     "mgcv": result.mgcv, "primary_gap": result.primary_gap,
-                                     "primary_metric": result.primary_metric}, default=str) + "\n")
+            out_f.write(
+                json.dumps(
+                    {
+                        "scenario": result.scenario,
+                        "rust": result.rust,
+                        "mgcv": result.mgcv,
+                        "primary_gap": result.primary_gap,
+                        "primary_metric": result.primary_metric,
+                    },
+                    default=str,
+                )
+                + "\n"
+            )
             out_f.flush()
 
-            m = result.primary_metric or "?"
-            gap_s = f"{result.primary_gap:+.4f}" if result.primary_gap is not None else " N/A "
-            rv = result.rust.get(m)
-            mv = result.mgcv.get(m)
+            metric = result.primary_metric or "?"
+            rv = result.rust.get(metric)
+            mv = result.mgcv.get(metric)
             rs = f"{rv:.4f}" if rv is not None else " FAIL"
             ms = f"{mv:.4f}" if mv is not None else " FAIL"
-            err_r = " [R:ERR]" if result.rust.get("error") else ""
+            gap_s = f"{result.primary_gap:+.4f}" if result.primary_gap is not None else " N/A "
+            err_r = " [G:ERR]" if result.rust.get("error") else ""
             err_m = " [M:ERR]" if result.mgcv.get("error") else ""
             divergence_level, _ = classify_primary_divergence(result)
             flag = " !!!" if divergence_level == "fail" else (" !!" if divergence_level == "warn" else "")
-            # Per-trial gate marker — if this trial alone trips the
-            # per-trial CI gate, surface that distinct from the warn/fail
-            # decoration above so CI logs are searchable for "[FAIL]".
-            if (
-                result.primary_gap is not None
-                and result.primary_gap > PER_TRIAL_FAIL_GAP
-            ):
+            if result.primary_gap is not None and result.primary_gap > PER_TRIAL_FAIL_GAP:
                 flag += " [FAIL]"
-            # Rust NaN/inf where mgcv is finite is also gate-tripping.
-            for _gm in NAN_GATED_METRICS:
-                _mv = result.mgcv.get(_gm)
-                _rv = result.rust.get(_gm)
-                if _metric_is_finite(_mv) and _metric_is_nonfinite(_rv):
+            for gate_metric in NAN_GATED_METRICS:
+                if _metric_is_finite(result.mgcv.get(gate_metric)) and _metric_is_nonfinite(result.rust.get(gate_metric)):
                     flag += " [FAIL:nan]"
                     break
-            t_rust = result.rust.get("time", 0) or 0
-            t_mgcv = result.mgcv.get("time", 0) or 0
-            time_s = f"  rust={t_rust:.1f}s mgcv={t_mgcv:.1f}s" if max(t_rust, t_mgcv) > 0.5 else ""
+            t_rust = float(result.rust.get("time", 0) or 0)
+            t_mgcv = float(result.mgcv.get("time", 0) or 0)
+            time_s = f"  gamfit={t_rust:.1f}s mgcv={t_mgcv:.1f}s" if max(t_rust, t_mgcv) > 0.5 else ""
             print(
-                f"  [{i+1:3d}/{len(scenarios)}] seed={seed:4d} {sc.family[:4]}/{sc.model_type[:5]}/{sc.basis_type[:5]:5s} "
-                f"{m}:rust={rs} {m}:mgcv={ms} gap={gap_s} "
-                f"n={sc.n_obs:4d} k={sc.n_smooths:2d} kn={sc.knots:2d} "
-                f"sig={sc.signal_structure[:8]:8s} noise={sc.noise_kind[:7]:7s}"
-                f"{err_r}{err_m}{flag}{time_s}",
-                flush=True
+                f"  [{i + 1:3d}/{len(scenarios)}] {sc.name[:30]:30s} "
+                f"{sc.family[:4]}/{sc.model_type[:5]}/{sc.basis_type[:5]:5s} "
+                f"{metric}:gamfit={rs} {metric}:mgcv={ms} gap={gap_s} "
+                f"n={sc.n_obs:6d} p={sc.n_features:3d}{err_r}{err_m}{flag}{time_s}",
+                flush=True,
             )
 
-            # Print full error details immediately on failure
-            for label, out in [("RUST", result.rust), ("MGCV", result.mgcv)]:
+            for label, out in [("GAMFIT", result.rust), ("MGCV", result.mgcv)]:
                 if out.get("error"):
-                    print(f"    ┌── {label} FAILURE ──", flush=True)
-                    print(f"    │ error: {out['error']}", flush=True)
-                    if out.get("stderr"):
-                        print(f"    │ stderr: {out['stderr']}", flush=True)
-                    if out.get("stdout"):
-                        print(f"    │ stdout: {out['stdout']}", flush=True)
-                    if out.get("cmd"):
-                        print(f"    │ cmd: {out['cmd']}", flush=True)
+                    print(f"    -- {label} FAILURE --", flush=True)
+                    print(f"    error: {out['error']}", flush=True)
                     if out.get("traceback"):
-                        print(f"    │ traceback: {out['traceback']}", flush=True)
-                    print("    └──────────────────────", flush=True)
+                        print(f"    traceback: {out['traceback']}", flush=True)
 
     print_leaderboard(results, top_n=args.top)
 
-    # ─── CI fail policy ────────────────────────────────────────────────
-    #
-    # The harness fails non-zero on any of:
-    #   1. rust-only execution failures (rust errored where mgcv didn't);
-    #   2. per-trial primary-metric gap > PER_TRIAL_FAIL_GAP;
-    #   3. cohort median primary-metric gap > COHORT_MEDIAN_FAIL_GAP;
-    #   4. cohort net mgcv-wins minus rust-wins > COHORT_NET_WINS_FAIL;
-    #   5. rust returned NaN/inf on any metric mgcv evaluated finitely;
-    #   6. fewer than MIN_VALID_TRIAL_FRACTION of requested trials produced
-    #      a valid mgcv-vs-rust comparison;
-    #   7. (optional) cohort regression versus a baseline JSON when
-    #      `--baseline-json` is supplied.
-    #
-    # All gates that fire are reported together — we don't short-circuit
-    # after the first — so a single CI run surfaces every regression
-    # category at once.
-    rust_only_failures = [
-        r for r in results
-        if r.rust.get("error") and not r.mgcv.get("error")
-    ]
-
+    rust_only_failures = [r for r in results if r.rust.get("error") and not r.mgcv.get("error")]
     baseline = None
     if args.baseline_json:
         try:
             with open(args.baseline_json) as bf:
                 baseline = json.load(bf)
         except (OSError, json.JSONDecodeError) as exc:
-            print(
-                f"\nCI FAIL: --baseline-json {args.baseline_json!r} could "
-                f"not be loaded: {exc}"
-            )
+            print(f"\nCI FAIL: --baseline-json {args.baseline_json!r} could not be loaded: {exc}")
             sys.exit(1)
-
-    skipped_count = len(skipped_scenarios)
 
     gates = compute_ci_gates(
         results,
         requested_trials=args.n_trials,
-        skipped_count=skipped_count,
+        skipped_count=len(skipped_scenarios),
         baseline=baseline,
     )
-
     any_failure = bool(rust_only_failures) or gates["failed"]
 
     if rust_only_failures:
         print(f"\n{'=' * 120}")
-        print("  CI FAIL: fuzz harness detected Rust execution failures")
+        print("  CI FAIL: harness detected gamfit execution failures")
         print("=" * 120)
-        print(
-            f"  rust-only failures (rust.error set, mgcv.error unset): "
-            f"{len(rust_only_failures)}"
-        )
         for r in rust_only_failures[:20]:
             s = r.scenario
             err = str(r.rust.get("error", ""))[:200]
-            print(
-                f"    [FAIL] seed={s['seed']} {s['family']}/{s['model_type']}/"
-                f"{s['basis_type']} n={s['n_obs']} k={s['n_smooths']} "
-                f"kn={s['knots']} :: {err}"
-            )
+            print(f"    [FAIL] {s['name']} {s['family']}/{s['model_type']}/{s['basis_type']} :: {err}")
 
     if gates["failed"]:
         print(f"\n{'=' * 120}")
-        print("  CI FAIL: fuzz harness tripped regression gates")
+        print("  CI FAIL: harness tripped regression gates")
         print("=" * 120)
         print(
-            f"  trials: {gates['valid_count']}/{gates['requested_trials']} "
-            f"valid (skipped above cost cap: {gates['skipped_count']}; "
-            f"min required: {gates['min_required']})"
+            f"  trials: {gates['valid_count']}/{gates['requested_trials']} valid "
+            f"(skipped above cost cap: {gates['skipped_count']}; min required: {gates['min_required']})"
         )
         for gf in gates["gate_failures"]:
-            print(f"\n  ── gate [{gf['gate']}] ── {gf['message']}")
+            print(f"\n  -- gate [{gf['gate']}] -- {gf['message']}")
             offenders = gf.get("offenders", [])
             if gf["gate"] == "per_trial_gap":
-                offenders_sorted = sorted(
-                    offenders,
-                    key=lambda r: (r.primary_gap or 0),
-                    reverse=True,
-                )
-                for r in offenders_sorted[:20]:
+                for r in sorted(offenders, key=lambda row: (row.primary_gap or 0), reverse=True)[:20]:
                     s = r.scenario
                     rv = r.rust.get(r.primary_metric or "r2")
                     mv = r.mgcv.get(r.primary_metric or "r2")
-                    rs = f"{rv:.4f}" if rv is not None else "FAIL"
-                    ms = f"{mv:.4f}" if mv is not None else "FAIL"
                     print(
-                        f"    [FAIL] seed={s['seed']} "
-                        f"{s['family']}/{s['model_type']}/{s['basis_type']} "
-                        f"n={s['n_obs']} k={s['n_smooths']} "
-                        f"kn={s['knots']} :: {r.primary_metric}: "
-                        f"rust={rs} mgcv={ms} "
-                        f"gap={r.primary_gap:+.4f}"
+                        f"    [FAIL] {s['name']} {s['family']}/{s['model_type']}/{s['basis_type']} "
+                        f"{r.primary_metric}: gamfit={rv!r} mgcv={mv!r} gap={r.primary_gap:+.4f}"
                     )
-            elif gf["gate"] == "cohort_median":
-                for o in offenders:
-                    fam, mt, basis = o["cohort"]
-                    print(
-                        f"    [FAIL] cohort {fam}/{mt}/{basis} "
-                        f"median_gap={o['median_gap']:+.4f} "
-                        f"(n={o['n']})"
-                    )
-            elif gf["gate"] == "cohort_net_wins":
-                for o in offenders:
-                    fam, mt, basis = o["cohort"]
-                    print(
-                        f"    [FAIL] cohort {fam}/{mt}/{basis} "
-                        f"mgcv_wins={o['mgcv_wins']} "
-                        f"rust_wins={o['rust_wins']} "
-                        f"net={o['net']:+d} (n={o['n']})"
-                    )
+            elif gf["gate"] in {"cohort_median", "cohort_net_wins", "baseline_regression"}:
+                for offender in offenders:
+                    print(f"    [FAIL] {offender}")
             elif gf["gate"] == "rust_nan_inf":
                 for r, metric, rv, mv in offenders[:20]:
                     s = r.scenario
-                    print(
-                        f"    [FAIL] seed={s['seed']} "
-                        f"{s['family']}/{s['model_type']}/{s['basis_type']} "
-                        f"n={s['n_obs']} k={s['n_smooths']} "
-                        f"kn={s['knots']} :: rust {metric}={rv!r} "
-                        f"(mgcv {metric}={mv:.4f})"
-                    )
-            elif gf["gate"] == "coverage":
-                # Message already printed above; no per-offender list.
-                pass
-            elif gf["gate"] == "baseline_regression":
-                for o in offenders:
-                    fam, mt, basis = o["cohort"]
-                    print(
-                        f"    [FAIL] cohort {fam}/{mt}/{basis} "
-                        f"current_median={o['current_median_gap']:+.4f} "
-                        f"baseline_median={o['baseline_median_gap']:+.4f} "
-                        f"delta={o['delta']:+.4f} (n={o['n']})"
-                    )
+                    print(f"    [FAIL] {s['name']} gamfit {metric}={rv!r} (mgcv {metric}={mv:.4f})")
 
     if any_failure:
         print(f"\n{'=' * 120}")
         gates_fired = [gf["gate"] for gf in gates["gate_failures"]]
         if rust_only_failures:
-            gates_fired.insert(0, "rust_only_failures")
-        print(
-            f"  CI FAIL: gates fired: {', '.join(gates_fired) or '(none)'}"
-        )
+            gates_fired.insert(0, "gamfit_only_failures")
+        print(f"  CI FAIL: gates fired: {', '.join(gates_fired) or '(none)'}")
         print("=" * 120)
         sys.exit(1)
 

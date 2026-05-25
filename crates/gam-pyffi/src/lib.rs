@@ -40,6 +40,7 @@ use gam::inference::model::{
     SavedDeploymentExtension, SavedLatentZNormalization, SchemaColumn,
     append_deployment_extension_columns,
 };
+use gam::inference::posterior_bands::{self, PosteriorPredictBandsPayload};
 use gam::inference::predict_input::build_predict_input_for_model;
 use gam::report::{CoefficientRow, EdfBlockRow, ReportInput, render_html};
 use gam::smooth::{
@@ -684,6 +685,299 @@ fn interpolate_survival_surface<'py>(
         ))
     })?;
     Ok(out.into_pyarray(py).unbind())
+}
+
+#[pyfunction]
+fn survival_coerce_times<'py>(
+    py: Python<'py>,
+    times: PyReadonlyArrayDyn<'py, f64>,
+) -> PyResult<Py<PyArray1<f64>>> {
+    let values: Vec<f64> = times.as_array().iter().copied().collect();
+    if values.is_empty() {
+        return Err(py_value_error(
+            "survival prediction requires at least one time".to_string(),
+        ));
+    }
+    if !values.iter().all(|value| value.is_finite()) {
+        return Err(py_value_error(
+            "survival prediction times must be finite".to_string(),
+        ));
+    }
+    Ok(Array1::from_vec(values).into_pyarray(py).unbind())
+}
+
+#[pyfunction]
+fn survival_parameters_matrix<'py>(
+    py: Python<'py>,
+    parameters: PyReadonlyArrayDyn<'py, f64>,
+) -> PyResult<Py<PyArray2<f64>>> {
+    let view = parameters.as_array();
+    match view.ndim() {
+        1 => {
+            let n = view.shape()[0];
+            let data: Vec<f64> = view.iter().copied().collect();
+            let out = Array2::from_shape_vec((n, 1), data).map_err(|err| {
+                py_value_error(format!("failed to reshape parameters: {err}"))
+            })?;
+            Ok(out.into_pyarray(py).unbind())
+        }
+        2 => {
+            let (rows, cols) = (view.shape()[0], view.shape()[1]);
+            let data: Vec<f64> = view.iter().copied().collect();
+            let out = Array2::from_shape_vec((rows, cols), data).map_err(|err| {
+                py_value_error(format!("failed to reshape parameters: {err}"))
+            })?;
+            Ok(out.into_pyarray(py).unbind())
+        }
+        other => Err(py_value_error(format!(
+            "survival parameters must be 1D or 2D, got {other}D"
+        ))),
+    }
+}
+
+#[pyfunction]
+fn survival_collect_chunks<'py>(
+    py: Python<'py>,
+    n_rows: usize,
+    n_times: usize,
+    blocks: Vec<(usize, usize, usize, usize, PyReadonlyArray2<'py, f64>)>,
+) -> PyResult<Py<PyArray2<f64>>> {
+    let mut dense = Array2::<f64>::zeros((n_rows, n_times));
+    for (row_start, row_stop, time_start, time_stop, block) in blocks {
+        if row_stop > n_rows || time_stop > n_times {
+            return Err(py_value_error(
+                "survival chunk block exceeds dense matrix bounds".to_string(),
+            ));
+        }
+        let block_view = block.as_array();
+        let (br, bc) = (block_view.shape()[0], block_view.shape()[1]);
+        if br != row_stop - row_start || bc != time_stop - time_start {
+            return Err(py_value_error(
+                "survival chunk block shape mismatch".to_string(),
+            ));
+        }
+        for i in 0..br {
+            for j in 0..bc {
+                dense[[row_start + i, time_start + j]] = block_view[[i, j]];
+            }
+        }
+    }
+    Ok(dense.into_pyarray(py).unbind())
+}
+
+#[pyfunction]
+fn survival_hazard_from_cumulative<'py>(
+    py: Python<'py>,
+    times: PyReadonlyArray1<'py, f64>,
+    cumulative: PyReadonlyArray2<'py, f64>,
+    previous_cumulative: Option<PyReadonlyArray2<'py, f64>>,
+    previous_time: f64,
+) -> PyResult<Py<PyArray2<f64>>> {
+    let cum_view = cumulative.as_array();
+    let times_view = times.as_array();
+    let n_rows = cum_view.shape()[0];
+    let n_times = cum_view.shape()[1];
+    if n_times == 0 || times_view.len() != n_times {
+        return Err(py_value_error(
+            "hazard_from_cumulative requires matching time count".to_string(),
+        ));
+    }
+    let prev_col: Array1<f64> = match previous_cumulative {
+        Some(arr) => {
+            let view = arr.as_array();
+            if view.shape()[0] != n_rows || view.shape()[1] < 1 {
+                return Err(py_value_error(
+                    "previous_cumulative must have one column per row".to_string(),
+                ));
+            }
+            let last = view.shape()[1] - 1;
+            (0..n_rows).map(|i| view[[i, last]]).collect()
+        }
+        None => Array1::<f64>::zeros(n_rows),
+    };
+    let mut out = Array2::<f64>::zeros((n_rows, n_times));
+    for j in 0..n_times {
+        let prev_t = if j == 0 {
+            previous_time
+        } else {
+            times_view[j - 1]
+        };
+        let mut width = times_view[j] - prev_t;
+        if width <= 0.0 {
+            width = 1.0;
+        }
+        for i in 0..n_rows {
+            let prev_h = if j == 0 { prev_col[i] } else { cum_view[[i, j - 1]] };
+            out[[i, j]] = (cum_view[[i, j]] - prev_h) / width;
+        }
+    }
+    Ok(out.into_pyarray(py).unbind())
+}
+
+#[pyfunction]
+fn survival_cumulative_from_survival<'py>(
+    py: Python<'py>,
+    survival: PyReadonlyArray2<'py, f64>,
+) -> PyResult<Py<PyArray2<f64>>> {
+    let view = survival.as_array();
+    let (n_rows, n_cols) = (view.shape()[0], view.shape()[1]);
+    let mut out = Array2::<f64>::zeros((n_rows, n_cols));
+    for i in 0..n_rows {
+        for j in 0..n_cols {
+            let s = view[[i, j]].clamp(1e-12, 1.0);
+            out[[i, j]] = -s.ln();
+        }
+    }
+    Ok(out.into_pyarray(py).unbind())
+}
+
+#[pyfunction]
+fn survival_block_from_anchor<'py>(
+    py: Python<'py>,
+    parameters: PyReadonlyArray2<'py, f64>,
+    times: PyReadonlyArray1<'py, f64>,
+) -> PyResult<Py<PyArray2<f64>>> {
+    let params = parameters.as_array();
+    let times_view = times.as_array();
+    let n_rows = params.shape()[0];
+    let n_times = times_view.len();
+    if params.shape()[1] == 0 {
+        return Err(py_value_error(
+            "survival parameter matrix must have at least one column".to_string(),
+        ));
+    }
+    let mut out = Array2::<f64>::zeros((n_rows, n_times));
+    for i in 0..n_rows {
+        let hazard = params[[i, 0]].exp();
+        for j in 0..n_times {
+            out[[i, j]] = (-hazard * times_view[j]).exp();
+        }
+    }
+    Ok(out.into_pyarray(py).unbind())
+}
+
+#[pyfunction]
+fn survival_ffi_surface<'py>(
+    py: Python<'py>,
+    times: PyReadonlyArrayDyn<'py, f64>,
+    surface: PyReadonlyArrayDyn<'py, f64>,
+) -> PyResult<Option<(Py<PyArray1<f64>>, Py<PyArray2<f64>>)>> {
+    let times_view = times.as_array();
+    let grid: Vec<f64> = times_view.iter().copied().collect();
+    if grid.is_empty() {
+        return Ok(None);
+    }
+    let surf_view = surface.as_array();
+    let (n_rows, n_cols) = match surf_view.ndim() {
+        1 => (surf_view.shape()[0], 1usize),
+        2 => (surf_view.shape()[0], surf_view.shape()[1]),
+        _ => return Ok(None),
+    };
+    if n_cols != grid.len() {
+        return Ok(None);
+    }
+    let surface_data: Vec<f64> = surf_view.iter().copied().collect();
+    let surface_arr = Array2::from_shape_vec((n_rows, n_cols), surface_data).map_err(|err| {
+        py_value_error(format!("failed to reshape surface: {err}"))
+    })?;
+    let grid_arr = Array1::from_vec(grid);
+    Ok(Some((
+        grid_arr.into_pyarray(py).unbind(),
+        surface_arr.into_pyarray(py).unbind(),
+    )))
+}
+
+#[pyfunction]
+fn numeric_matrix_f64<'py>(
+    py: Python<'py>,
+    values: PyReadonlyArrayDyn<'py, f64>,
+    label: String,
+) -> PyResult<Py<PyArray2<f64>>> {
+    let view = values.as_array();
+    let (rows, cols) = match view.ndim() {
+        1 => (view.shape()[0], 1usize),
+        2 => (view.shape()[0], view.shape()[1]),
+        other => {
+            return Err(py_value_error(format!(
+                "{label} must be a 1D or 2D numeric array (got {other}D)"
+            )));
+        }
+    };
+    if rows == 0 || cols == 0 {
+        return Err(py_value_error(format!("{label} cannot be empty")));
+    }
+    let data: Vec<f64> = view.iter().copied().collect();
+    if !data.iter().all(|value| value.is_finite()) {
+        return Err(py_value_error(format!(
+            "{label} must contain only finite values"
+        )));
+    }
+    let out = Array2::from_shape_vec((rows, cols), data).map_err(|err| {
+        py_value_error(format!("failed to reshape {label}: {err}"))
+    })?;
+    Ok(out.into_pyarray(py).unbind())
+}
+
+#[pyfunction]
+fn marginal_slope_clip_probabilities(values: Vec<f64>) -> PyResult<Vec<f64>> {
+    Ok(values
+        .into_iter()
+        .map(|value| value.clamp(0.0, 1.0))
+        .collect())
+}
+
+#[pyfunction]
+fn column_stack_f64<'py>(
+    py: Python<'py>,
+    columns: Vec<Vec<f64>>,
+) -> PyResult<Py<PyArray2<f64>>> {
+    if columns.is_empty() {
+        let out = Array2::<f64>::zeros((0, 0));
+        return Ok(out.into_pyarray(py).unbind());
+    }
+    let n_rows = columns[0].len();
+    for (idx, col) in columns.iter().enumerate() {
+        if col.len() != n_rows {
+            return Err(py_value_error(format!(
+                "column {idx} has length {} but expected {n_rows}",
+                col.len()
+            )));
+        }
+    }
+    let n_cols = columns.len();
+    let mut out = Array2::<f64>::zeros((n_rows, n_cols));
+    for (col_idx, col) in columns.iter().enumerate() {
+        for (row_idx, value) in col.iter().enumerate() {
+            out[[row_idx, col_idx]] = *value;
+        }
+    }
+    Ok(out.into_pyarray(py).unbind())
+}
+
+#[pyfunction]
+fn flat_to_matrix_f64<'py>(
+    py: Python<'py>,
+    flat: Vec<f64>,
+    n_rows: usize,
+    n_cols: usize,
+) -> PyResult<Py<PyArray2<f64>>> {
+    if flat.len() != n_rows * n_cols {
+        return Err(py_value_error(format!(
+            "design matrix FFI payload shape mismatch: got {} floats, expected {} * {}",
+            flat.len(),
+            n_rows,
+            n_cols
+        )));
+    }
+    let out = Array2::from_shape_vec((n_rows, n_cols), flat).map_err(|err| {
+        py_value_error(format!("failed to reshape design matrix: {err}"))
+    })?;
+    Ok(out.into_pyarray(py).unbind())
+}
+
+#[pyfunction]
+fn vec_to_array1_f64<'py>(py: Python<'py>, values: Vec<f64>) -> PyResult<Py<PyArray1<f64>>> {
+    Ok(Array1::from_vec(values).into_pyarray(py).unbind())
 }
 
 #[pyfunction]
@@ -10543,68 +10837,21 @@ fn diagnostics_from_predictions(
     observed: Vec<f64>,
     predicted_mean: Vec<f64>,
 ) -> PyResult<Py<PyDict>> {
-    if observed.is_empty() {
-        return Err(py_value_error(
-            "diagnostics_from_predictions requires at least one observation".to_string(),
-        ));
-    }
-    if observed.len() != predicted_mean.len() {
-        return Err(py_value_error(format!(
-            "diagnostics_from_predictions length mismatch: observed has {} values but predicted mean has {}",
-            observed.len(),
-            predicted_mean.len()
-        )));
-    }
-    if observed.iter().any(|value| !value.is_finite()) {
-        return Err(py_value_error(
-            "observed values must contain only finite numbers".to_string(),
-        ));
-    }
-    if predicted_mean.iter().any(|value| !value.is_finite()) {
-        return Err(py_value_error(
-            "predicted mean values must contain only finite numbers".to_string(),
-        ));
-    }
-
-    let n_obs = observed.len();
-    let n_obs_f = n_obs as f64;
-    let mut residuals = Vec::with_capacity(n_obs);
-    let mut abs_sum = 0.0_f64;
-    let mut residual_sum = 0.0_f64;
-    let mut residual_sum_squares = 0.0_f64;
-    let mut observed_sum = 0.0_f64;
-    for (obs, pred) in observed.iter().zip(predicted_mean.iter()) {
-        let residual = obs - pred;
-        residuals.push(residual);
-        abs_sum += residual.abs();
-        residual_sum += residual;
-        residual_sum_squares += residual * residual;
-        observed_sum += obs;
-    }
-
-    let observed_mean = observed_sum / n_obs_f;
-    let total_sum_squares = observed
-        .iter()
-        .map(|value| {
-            let centered = value - observed_mean;
-            centered * centered
-        })
-        .sum::<f64>();
+    let diagnostics =
+        gam::inference::diagnostics::diagnostics_from_predictions(&observed, &predicted_mean)
+            .map_err(py_value_error)?;
 
     let metrics = PyDict::new(py);
-    metrics.set_item("n_obs", n_obs_f)?;
-    metrics.set_item("mae", abs_sum / n_obs_f)?;
-    metrics.set_item("rmse", (residual_sum_squares / n_obs_f).sqrt())?;
-    metrics.set_item("bias", residual_sum / n_obs_f)?;
-    if total_sum_squares > 0.0 {
-        metrics.set_item(
-            "r_squared",
-            1.0 - residual_sum_squares / total_sum_squares,
-        )?;
+    metrics.set_item("n_obs", diagnostics.n_obs)?;
+    metrics.set_item("mae", diagnostics.mae)?;
+    metrics.set_item("rmse", diagnostics.rmse)?;
+    metrics.set_item("bias", diagnostics.bias)?;
+    if let Some(r_squared) = diagnostics.r_squared {
+        metrics.set_item("r_squared", r_squared)?;
     }
 
     let out = PyDict::new(py);
-    out.set_item("residuals", PyList::new(py, residuals)?)?;
+    out.set_item("residuals", PyList::new(py, diagnostics.residuals)?)?;
     out.set_item("metrics", metrics)?;
     Ok(out.unbind())
 }
@@ -12248,6 +12495,18 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(sklearn_fit_metadata, module)?)?;
     module.add_function(wrap_pyfunction!(build_info, module)?)?;
     module.add_function(wrap_pyfunction!(interpolate_survival_surface, module)?)?;
+    module.add_function(wrap_pyfunction!(survival_coerce_times, module)?)?;
+    module.add_function(wrap_pyfunction!(survival_parameters_matrix, module)?)?;
+    module.add_function(wrap_pyfunction!(survival_collect_chunks, module)?)?;
+    module.add_function(wrap_pyfunction!(survival_hazard_from_cumulative, module)?)?;
+    module.add_function(wrap_pyfunction!(survival_cumulative_from_survival, module)?)?;
+    module.add_function(wrap_pyfunction!(survival_block_from_anchor, module)?)?;
+    module.add_function(wrap_pyfunction!(survival_ffi_surface, module)?)?;
+    module.add_function(wrap_pyfunction!(numeric_matrix_f64, module)?)?;
+    module.add_function(wrap_pyfunction!(marginal_slope_clip_probabilities, module)?)?;
+    module.add_function(wrap_pyfunction!(column_stack_f64, module)?)?;
+    module.add_function(wrap_pyfunction!(flat_to_matrix_f64, module)?)?;
+    module.add_function(wrap_pyfunction!(vec_to_array1_f64, module)?)?;
     module.add_function(wrap_pyfunction!(default_survival_time_grid, module)?)?;
     module.add_function(wrap_pyfunction!(torch_from_fitted, module)?)?;
     module.add_function(wrap_pyfunction!(fit_table, module)?)?;
@@ -13721,124 +13980,20 @@ struct PosteriorPredictPayload {
     family_kind: String,
 }
 
-#[derive(Serialize)]
-struct PosteriorPredictBandsPayload {
-    eta_mean: Vec<f64>,
-    eta_lower: Vec<f64>,
-    eta_upper: Vec<f64>,
-    mean: Vec<f64>,
-    mean_lower: Vec<f64>,
-    mean_upper: Vec<f64>,
-    n_rows: usize,
-    n_draws: usize,
-    model_class: String,
-    family_kind: String,
-}
-
-/// Posterior eta matrix (n_draws x n_rows) -> per-row bands.
-/// Handles empty draws gracefully and uses link quantiles for response-scale
-/// bounds (monotone inverse link preserves quantiles).
 fn eta_bands_from_matrix(
     eta: ArrayView2<'_, f64>,
     family_kind: &str,
     level: f64,
 ) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>), String> {
-    if !(level > 0.0 && level < 1.0) {
-        return Err(format!("interval level must lie in (0, 1); got {level}"));
-    }
-    let alpha = (1.0 - level) / 2.0;
-    let n_draws = eta.nrows();
-    let n_rows = eta.ncols();
-    let (eta_mean, eta_lower, eta_upper) = if n_draws == 0 {
-        (vec![0.0; n_rows], vec![0.0; n_rows], vec![0.0; n_rows])
-    } else {
-        let mut means = vec![0.0_f64; n_rows];
-        let mut lower = vec![0.0_f64; n_rows];
-        let mut upper = vec![0.0_f64; n_rows];
-        let mut column = vec![0.0_f64; n_draws];
-        for j in 0..n_rows {
-            for k in 0..n_draws {
-                column[k] = eta[[k, j]];
-            }
-            let mut sum = 0.0_f64;
-            for v in &column {
-                sum += *v;
-            }
-            means[j] = sum / n_draws as f64;
-            column.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            lower[j] = quantile_from_sorted(&column, alpha);
-            upper[j] = quantile_from_sorted(&column, 1.0 - alpha);
-        }
-        (means, lower, upper)
-    };
-    let mean = apply_inverse_link_vec(&eta_mean, family_kind)?;
-    let mean_lower = apply_inverse_link_vec(&eta_lower, family_kind)?;
-    let mean_upper = apply_inverse_link_vec(&eta_upper, family_kind)?;
-    Ok((eta_mean, eta_lower, eta_upper, mean, mean_lower, mean_upper))
+    posterior_bands::eta_bands_from_matrix(eta, family_kind, level)
 }
 
-/// Linear-interpolation quantile matching numpy.quantile default (method='linear').
 fn quantile_from_sorted(sorted: &[f64], q: f64) -> f64 {
-    let n = sorted.len();
-    if n == 0 {
-        return f64::NAN;
-    }
-    if n == 1 {
-        return sorted[0];
-    }
-    let pos = q.clamp(0.0, 1.0) * (n - 1) as f64;
-    let lo = pos.floor() as usize;
-    let hi = (lo + 1).min(n - 1);
-    let frac = pos - lo as f64;
-    sorted[lo] * (1.0 - frac) + sorted[hi] * frac
+    posterior_bands::quantile_linear_from_sorted(sorted, q)
 }
 
-/// Apply a closed-form inverse link element-wise. Mirrors the family-kind
-/// tags emitted by `family_link_kind`. Rust-side equivalent of the Python
-/// `_apply_inverse_link` helper so the response-scale math never crosses
-/// the FFI boundary as a Python-level numpy op.
 fn apply_inverse_link_vec(eta: &[f64], family_kind: &str) -> Result<Vec<f64>, String> {
-    let kind = family_kind.trim().to_ascii_lowercase();
-    let mut out = Vec::with_capacity(eta.len());
-    match kind.as_str() {
-        "" | "identity" => out.extend_from_slice(eta),
-        "logit" => {
-            for &e in eta {
-                out.push(if e >= 0.0 {
-                    1.0 / (1.0 + (-e).exp())
-                } else {
-                    let ex = e.exp();
-                    ex / (1.0 + ex)
-                });
-            }
-        }
-        "probit" => {
-            let inv_sqrt2 = 1.0 / std::f64::consts::SQRT_2;
-            for &e in eta {
-                out.push(0.5 * (1.0 + statrs::function::erf::erf(e * inv_sqrt2)));
-            }
-        }
-        "cloglog" => {
-            for &e in eta {
-                let clamped = e.clamp(-50.0, 50.0);
-                out.push(1.0 - (-clamped.exp()).exp());
-            }
-        }
-        "log" => {
-            for &e in eta {
-                out.push(e.exp());
-            }
-        }
-        other => {
-            return Err(format!(
-                "posterior fitted-mean draws on response scale are not wired for \
-                 family_kind={other:?}; access posterior.predict_draws(...).eta \
-                 for link-scale draws or use model.predict(new_data, interval=...) \
-                 for class-specific bands."
-            ));
-        }
-    }
-    Ok(out)
+    posterior_bands::apply_inverse_link_response(eta, family_kind)
 }
 
 fn posterior_credible_interval_impl(
@@ -13847,38 +14002,7 @@ fn posterior_credible_interval_impl(
     n_coeffs: usize,
     level: f64,
 ) -> Result<Vec<f64>, String> {
-    if !(level > 0.0 && level < 1.0) {
-        return Err(format!("interval level must lie in (0, 1); got {level}"));
-    }
-    if samples_flat.len() != n_draws * n_coeffs {
-        return Err(format!(
-            "posterior_credible_interval samples shape mismatch: got {} floats, expected {} * {}",
-            samples_flat.len(),
-            n_draws,
-            n_coeffs
-        ));
-    }
-    let alpha = (1.0 - level) / 2.0;
-    // Output: interleaved (lower_j, upper_j) per coefficient — Python reshapes
-    // to (n_coeffs, 2) with column_stack-equivalent ordering.
-    let mut out = Vec::with_capacity(2 * n_coeffs);
-    if n_draws == 0 {
-        for _ in 0..n_coeffs {
-            out.push(0.0);
-            out.push(0.0);
-        }
-        return Ok(out);
-    }
-    let mut column = vec![0.0_f64; n_draws];
-    for j in 0..n_coeffs {
-        for k in 0..n_draws {
-            column[k] = samples_flat[k * n_coeffs + j];
-        }
-        column.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        out.push(quantile_from_sorted(&column, alpha));
-        out.push(quantile_from_sorted(&column, 1.0 - alpha));
-    }
-    Ok(out)
+    posterior_bands::posterior_credible_interval(samples_flat, n_draws, n_coeffs, level)
 }
 
 fn posterior_eta_bands_impl(
@@ -13888,30 +14012,8 @@ fn posterior_eta_bands_impl(
     family_kind: &str,
     level: f64,
 ) -> Result<String, String> {
-    if eta_flat.len() != n_draws * n_rows {
-        return Err(format!(
-            "posterior_eta_bands shape mismatch: got {} floats, expected {} * {}",
-            eta_flat.len(),
-            n_draws,
-            n_rows
-        ));
-    }
-    let eta = Array2::<f64>::from_shape_vec((n_draws, n_rows), eta_flat)
-        .map_err(|err| format!("failed to reshape eta matrix: {err}"))?;
-    let (eta_mean, eta_lower, eta_upper, mean, mean_lower, mean_upper) =
-        eta_bands_from_matrix(eta.view(), family_kind, level)?;
-    let payload = PosteriorPredictBandsPayload {
-        eta_mean,
-        eta_lower,
-        eta_upper,
-        mean,
-        mean_lower,
-        mean_upper,
-        n_rows,
-        n_draws,
-        model_class: String::new(),
-        family_kind: family_kind.to_string(),
-    };
+    let payload =
+        posterior_bands::posterior_eta_bands(eta_flat, n_draws, n_rows, family_kind, level)?;
     serde_json::to_string(&payload)
         .map_err(|err| format!("failed to serialize posterior_eta_bands payload: {err}"))
 }

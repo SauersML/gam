@@ -22591,7 +22591,7 @@ fn build_thin_plate_penalty_psi_derivativeswithworkspace(
     identifiability_transform: Option<&Array2<f64>>,
     workspace: &mut BasisWorkspace,
 ) -> Result<(Array2<f64>, Array2<f64>), BasisError> {
-    // Match build_thin_plate_basis exactly (after the WIP Wood-TPRS rewrite):
+    // Match build_thin_plate_basis exactly (Wood-TPRS path):
     //
     //   M(ψ)        = Z_kernel^T Ω(ψ) Z_kernel
     //   V, Λ(ψ)    = eigh(M)        (or V from spec.radial_reparam, frozen)

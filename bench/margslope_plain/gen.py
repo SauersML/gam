@@ -15,21 +15,10 @@ remaining PCs are nuisance, and prs_z carries a covariate-modulated effect.
 import math
 import random
 import sys
-from pathlib import Path
-
-REPO_ROOT = Path(__file__).resolve().parents[2]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-
-from gamfit._binding import rust_module
-from gamfit._exceptions import map_exception
 
 
-def inverse_link(values: list[float], link: str) -> list[float]:
-    try:
-        return [float(v) for v in rust_module().apply_inverse_link_array(values, link)]
-    except Exception as exc:
-        raise map_exception(exc) from exc
+def probit_probability(eta: float) -> float:
+    return 0.5 * (1.0 + math.erf(eta / math.sqrt(2.0)))
 
 
 def write_csv(n: int, path: str, seed: int = 0xA110CA7E) -> None:
@@ -38,24 +27,15 @@ def write_csv(n: int, path: str, seed: int = 0xA110CA7E) -> None:
     header = ["case", "sex", "prs_z"] + pc_cols
     a0 = -0.4
     b0 = 0.0
-    pending_rows: list[tuple[int, float, list[float]]] = []
-    offsets: list[float] = []
-    log_slopes: list[float] = []
-    for _ in range(n):
-        sex = rng.randint(0, 1)
-        z = rng.gauss(0.0, 1.0)
-        pcs = [rng.gauss(0.0, 1.0) for _ in range(10)]
-        offsets.append(a0 + 0.6 * pcs[0] + 0.4 * math.sin(math.tau * pcs[1] * 0.3) + 0.5 * sex)
-        log_slopes.append(b0 + 0.3 * pcs[0] - 0.2 * pcs[2])
-        pending_rows.append((sex, z, pcs))
-    slopes = inverse_link(log_slopes, "log")
-    probabilities = inverse_link(
-        [offset + slope * z for offset, slope, (_sex, z, _pcs) in zip(offsets, slopes, pending_rows)],
-        "probit",
-    )
     with open(path, "w") as f:
         f.write(",".join(header) + "\n")
-        for (sex, z, pcs), p_y in zip(pending_rows, probabilities):
+        for _ in range(n):
+            sex = rng.randint(0, 1)
+            z = rng.gauss(0.0, 1.0)
+            pcs = [rng.gauss(0.0, 1.0) for _ in range(10)]
+            a = a0 + 0.6 * pcs[0] + 0.4 * math.sin(math.tau * pcs[1] * 0.3) + 0.5 * sex
+            log_b = b0 + 0.3 * pcs[0] - 0.2 * pcs[2]
+            p_y = probit_probability(a + math.exp(log_b) * z)
             y = 1 if rng.random() < p_y else 0
             row = [str(y), str(sex), f"{z:.10g}"] + [f"{v:.10g}" for v in pcs]
             f.write(",".join(row) + "\n")

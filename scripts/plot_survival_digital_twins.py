@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 """Fit Rust GAM survival GAMLSS-style models and render generative digital-twin path plots."""
 from __future__ import annotations
-import typing
 
 import argparse
 import math
-import os
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -15,7 +13,6 @@ from typing import Callable
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from matplotlib.colors import LinearSegmentedColormap
 
 ROOT = Path(__file__).resolve().parent.parent
 DATASET_DIR = ROOT / "bench" / "datasets"
@@ -52,7 +49,7 @@ class SurvivalDataset:
     fit_opts: dict[str, str]
 
 
-def _parse_f64_opt(v: typing.Any) -> float | None:
+def _parse_f64_opt(v: object) -> float | None:
     try:
         x = float(v)
     except (TypeError, ValueError):
@@ -286,33 +283,22 @@ def _run_cmd(cmd: list[str], cwd: Path) -> None:
 
 
 def _ensure_rust_binary() -> Path:
-    env_raw = str(os.environ.get("BENCH_GAM_BIN", "")).strip()
-    if env_raw:
-        env_bin = Path(env_raw).expanduser()
-        if env_bin.exists() and env_bin.is_file():
-            return env_bin.resolve()
-
     local_bin = ROOT / "target" / "release" / "gam"
     if local_bin.exists() and local_bin.is_file():
         return local_bin
 
-    _run_cmd(["cargo", "build", "--release", "--bin", "gam"], cwd=ROOT)
-    if not local_bin.exists():
-        raise RuntimeError(f"missing Rust binary at {local_bin}")
-    return local_bin
+    raise RuntimeError(f"missing Rust binary at {local_bin}")
 
 
-def _zscore_by_train(df: pd.DataFrame, feature_cols: list[str]) -> tuple[pd.DataFrame, dict[str, tuple[float, float]]]:
+def _zscore_by_train(df: pd.DataFrame, feature_cols: list[str]) -> pd.DataFrame:
     out = df.copy()
-    stats: dict[str, tuple[float, float]] = {}
     for c in feature_cols:
         mu = float(out[c].mean())
         sd = float(out[c].std())
         if (not np.isfinite(sd)) or sd < 1e-8:
             sd = 1.0
         out[c] = (out[c] - mu) / sd
-        stats[c] = (mu, sd)
-    return out, stats
+    return out
 
 
 def _fit_survival_model(
@@ -320,7 +306,6 @@ def _fit_survival_model(
     ds: SurvivalDataset,
     train_df: Path,
     model_path: Path,
-    likelihood: str,
 ) -> None:
     fit_formula = f"Surv(__entry, {ds.time_col}, {ds.event_col}) ~ {ds.formula}"
     fit_args = [
@@ -335,15 +320,6 @@ def _fit_survival_model(
     ]
     for key, value in ds.fit_opts.items():
         fit_args.extend([f"--{key.replace('_', '-')}", value])
-
-    if likelihood == "transformation":
-        _run_cmd(fit_args, cwd=ROOT)
-        return
-
-    if likelihood != "location-scale":
-        raise RuntimeError(f"unsupported likelihood mode: {likelihood}")
-    # The dedicated `gam survival` subcommand was removed; fitting now goes
-    # through `gam fit` + `Surv(...)`, including survival location-scale.
     _run_cmd(fit_args, cwd=ROOT)
 
 
@@ -368,26 +344,16 @@ def _predict_survival_curve(
         cwd=ROOT,
     )
     pred = pd.read_csv(pred_out_path)
-    if "survival_prob" in pred.columns:
-        s = pred["survival_prob"].to_numpy(dtype=float)
-    elif "mean" in pred.columns:
-        s = pred["mean"].to_numpy(dtype=float)
-    else:
-        raise RuntimeError("prediction output missing survival_prob/mean")
-    s = np.clip(s, 0.0, 1.0)
-    # Numerically enforce monotone non-increasing survival over time.
-    s = np.minimum.accumulate(s)
+    if "survival_prob" not in pred.columns:
+        raise RuntimeError("prediction output missing survival_prob")
+    s = pred["survival_prob"].to_numpy(dtype=float)
+    if not np.all(np.isfinite(s)):
+        raise RuntimeError("prediction output contains non-finite survival probabilities")
+    if np.any((s < 0.0) | (s > 1.0)):
+        raise RuntimeError("prediction output contains survival probabilities outside [0, 1]")
+    if np.any(np.diff(s) > 1e-10):
+        raise RuntimeError("prediction output is not monotone non-increasing over time")
     return s
-
-
-def _normalize_from_baseline_survival(surv: np.ndarray) -> np.ndarray:
-    if surv.size == 0:
-        return surv
-    s0 = float(max(surv[0], 1e-8))
-    out = np.clip(surv / s0, 0.0, 1.0)
-    out[0] = 1.0
-    out = np.minimum.accumulate(out)
-    return out
 
 
 def _pick_representative_twin(
@@ -407,14 +373,9 @@ def _pick_representative_twin(
     pred_input.to_csv(in_path, index=False)
     _run_cmd([str(rust_bin), "predict", str(model_path), str(in_path), "--out", str(out_path)], cwd=ROOT)
     p = pd.read_csv(out_path)
-    if "failure_prob" in p.columns:
-        risk = p["failure_prob"].to_numpy(dtype=float)
-    elif "risk_score" in p.columns:
-        risk = p["risk_score"].to_numpy(dtype=float)
-    elif "mean" in p.columns:
-        risk = 1.0 - p["mean"].to_numpy(dtype=float)
-    else:
-        raise RuntimeError("prediction output missing risk-compatible column")
+    if "failure_prob" not in p.columns:
+        raise RuntimeError("prediction output missing failure_prob")
+    risk = p["failure_prob"].to_numpy(dtype=float)
     target = float(np.median(risk))
     idx = int(np.argmin(np.abs(risk - target)))
     return idx
@@ -453,46 +414,6 @@ def _simulate_smooth_paths(
         p = np.minimum.accumulate(p)
         paths[i, :] = p
     return paths
-
-
-def _survival_curve_diagnostics(name: str, surv: np.ndarray, paths: np.ndarray) -> None:
-    base_min = float(np.min(surv))
-    base_max = float(np.max(surv))
-    base_range = float(base_max - base_min)
-    base_std = float(np.std(surv))
-    var_t = np.var(paths, axis=0)
-    med_var = float(np.median(var_t))
-    max_var = float(np.max(var_t))
-    end_mean = float(np.mean(paths[:, -1]))
-    near_one = float(np.mean(paths > 0.99))
-    near_zero = float(np.mean(paths < 0.01))
-    print(
-        f"[{name}] base_min={base_min:.4f} base_max={base_max:.4f} base_range={base_range:.4f} "
-        f"base_std={base_std:.4f} path_var_med={med_var:.6f} path_var_max={max_var:.6f} "
-        f"end_mean={end_mean:.4f} frac_gt_0.99={near_one:.4f} frac_lt_0.01={near_zero:.4f}"
-    )
-    if base_range < 0.03 or base_std < 0.01:
-        print(f"[{name}] warning: base survival curve appears nearly flat.")
-    if med_var < 1e-4:
-        print(f"[{name}] warning: simulated path variance is very low.")
-    if near_one > 0.98 or near_zero > 0.98:
-        print(f"[{name}] warning: paths spend almost all mass at an extreme (0 or 1).")
-
-
-def _is_pathological_curve(surv: np.ndarray) -> bool:
-    if surv.size == 0:
-        return True
-    base_range = float(np.max(surv) - np.min(surv))
-    base_std = float(np.std(surv))
-    return (base_range < 0.03) or (base_std < 0.01)
-
-
-def _format_characteristic_value(v: float) -> str:
-    if not np.isfinite(v):
-        return "NA"
-    if abs(v - round(v)) < 1e-9:
-        return f"{int(round(v))}"
-    return f"{v:.3g}"
 
 
 def _fmt_num(v: float, digits: int = 2) -> str:
@@ -573,10 +494,7 @@ def _twin_profile_text(dataset_name: str, twin_profile: dict[str, float]) -> str
             ]
         )
         return "\n".join(lines)
-    # Fallback
-    for name, val in p.items():
-        lines.append(f"{name}: {_format_characteristic_value(float(val))}")
-    return "\n".join(lines)
+    raise RuntimeError(f"unsupported dataset: {dataset_name}")
 
 
 def _convert_time_axis_if_long(times: np.ndarray, x_label: str) -> tuple[np.ndarray, str]:
@@ -610,13 +528,9 @@ def _plot_paths(
     fig.patch.set_facecolor(palette["bg"])
     ax.set_facecolor(palette["bg"])
 
-    x_label, y_label = AXIS_LABELS.get(
-        dataset_name,
-        ("Days since enrollment", "Chance the patient is still alive"),
-    )
+    x_label, y_label = AXIS_LABELS[dataset_name]
     x_vals, x_label = _convert_time_axis_if_long(times, x_label)
 
-    # Simulated smooth digital-twin futures.
     for i in range(sim_paths.shape[0]):
         ax.plot(x_vals, sim_paths[i], color=palette["accent"], alpha=0.060, lw=0.9, solid_capstyle="round", zorder=2)
 
@@ -624,7 +538,6 @@ def _plot_paths(
     q_hi = np.quantile(sim_paths, 0.90, axis=0)
     ax.fill_between(x_vals, q_lo, q_hi, color=palette["glow"], alpha=0.35, zorder=1.5)
 
-    # Model-implied central survival curve.
     ax.plot(x_vals, surv_curve, color=palette["fg"], lw=3.0, alpha=0.98, zorder=4)
 
     ax.set_xlim(float(x_vals[0]), float(x_vals[-1]))
@@ -677,58 +590,42 @@ def generate_plot_for_dataset(
     raw_df = ds.rows.copy().reset_index(drop=True)
     df = raw_df.copy()
     df["__entry"] = 0.0
-    fit_df, _ = _zscore_by_train(df, ds.features)
+    fit_df = _zscore_by_train(df, ds.features)
 
     with tempfile.TemporaryDirectory(prefix=f"twin_{ds.name}_", dir=str(ROOT / "bench")) as td:
         td_path = Path(td)
         train_path = td_path / "train.csv"
         model_path = td_path / "model.json"
         fit_df.to_csv(train_path, index=False)
-        _fit_survival_model(rust_bin, ds, train_path, model_path, likelihood="location-scale")
+        _fit_survival_model(rust_bin, ds, train_path, model_path)
 
-        def build_curve_for_current_model() -> tuple[np.ndarray, np.ndarray, int]:
-            twin_idx_local = _pick_representative_twin(
+        twin_idx = _pick_representative_twin(
+            rust_bin=rust_bin,
+            model_path=model_path,
+            eval_df=fit_df,
+            features=ds.features,
+            time_col=ds.time_col,
+            tmpdir=td_path,
+        )
+        twin_row = fit_df.iloc[twin_idx].copy()
+        t_obs = fit_df[ds.time_col].to_numpy(dtype=float)
+        t_max = max(float(np.quantile(t_obs, 0.995)), float(np.max(t_obs)), 1.0)
+        for _ in range(4):
+            times = np.linspace(0.0, t_max, int(n_grid))
+            surv = _predict_survival_curve(
                 rust_bin=rust_bin,
                 model_path=model_path,
-                eval_df=fit_df,
+                base_row=twin_row,
                 features=ds.features,
                 time_col=ds.time_col,
+                times=times,
                 tmpdir=td_path,
             )
-            twin_row_local = fit_df.iloc[twin_idx_local].copy()
-            t_obs_local = fit_df[ds.time_col].to_numpy(dtype=float)
-            t_base_local = max(float(np.quantile(t_obs_local, 0.995)), float(np.max(t_obs_local)), 1.0)
-            t_max_local = t_base_local
-            surv_local = None
-            for _ in range(4):
-                times_local = np.linspace(0.0, t_max_local, int(n_grid))
-                surv_local = _predict_survival_curve(
-                    rust_bin=rust_bin,
-                    model_path=model_path,
-                    base_row=twin_row_local,
-                    features=ds.features,
-                    time_col=ds.time_col,
-                    times=times_local,
-                    tmpdir=td_path,
-                )
-                surv_local = _normalize_from_baseline_survival(surv_local)
-                if float(surv_local[-1]) <= 0.15:
-                    break
-                t_max_local *= 1.6
-            assert surv_local is not None
-            return times_local, surv_local, twin_idx_local
+            if float(surv[-1]) <= 0.15:
+                break
+            t_max *= 1.6
 
-        times, surv, twin_idx = build_curve_for_current_model()
-        used_likelihood = "location-scale"
-        if _is_pathological_curve(surv):
-            print(f"[{ds.name}] fallback: location-scale curve is pathological, refitting with transformation likelihood.")
-            _fit_survival_model(rust_bin, ds, train_path, model_path, likelihood="transformation")
-            times, surv, twin_idx = build_curve_for_current_model()
-            used_likelihood = "transformation"
-
-        sim_paths = _simulate_smooth_paths(times, surv, n_paths=n_paths, seed=seed + hash(ds.name) % 10000)
-        print(f"[{ds.name}] likelihood_used={used_likelihood}")
-        _survival_curve_diagnostics(ds.name, surv, sim_paths)
+        sim_paths = _simulate_smooth_paths(times, surv, n_paths=n_paths, seed=seed + sum(ds.name.encode()))
         twin_profile = {f: float(raw_df.iloc[twin_idx][f]) for f in ds.features}
 
     out_path = out_dir / f"{ds.name}_digital_twin_paths.png"
