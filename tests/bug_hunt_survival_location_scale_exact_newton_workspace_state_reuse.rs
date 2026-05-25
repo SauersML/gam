@@ -24,8 +24,13 @@ fn fit_theta(data: &gam::inference::data::EncodedDataset) -> Vec<f64> {
     else {
         panic!("expected survival location-scale result")
     };
-    let u=&fit.fit.fit;
-    u.beta_time().iter().chain(u.beta_threshold().iter()).chain(u.beta_log_sigma().iter()).copied().collect()
+    let u = &fit.fit.fit;
+    u.beta_time()
+        .iter()
+        .chain(u.beta_threshold().iter())
+        .chain(u.beta_log_sigma().iter())
+        .copied()
+        .collect()
 }
 
 #[test]

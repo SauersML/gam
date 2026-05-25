@@ -2041,6 +2041,7 @@ fn strip_strings_and_comments_stateful_raw(
     let mut i = 0usize;
     let mut in_str = in_str_in;
     let mut str_quote: u8 = quote_in;
+    let raw_hashes = hashes_in;
     while i < bytes.len() {
         let c = bytes[i];
         if in_str {
@@ -2113,7 +2114,7 @@ fn strip_strings_and_comments_stateful_raw(
         i += 1;
     }
     let s = String::from_utf8(out).unwrap_or_else(|_| line.to_string());
-    (s, in_str, str_quote)
+    (s, in_str, str_quote, raw_hashes)
 }
 
 /// True if `line` contains `kw` as a whole word (boundaries on both sides
