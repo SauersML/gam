@@ -180,6 +180,16 @@ class PartialSupervisionFit:
     aux_score : float | None
         Optional :class:`gamfit.GaugeCompanion` loss when a color
         auxiliary was supplied; ``None`` otherwise.
+    warnings : list[str]
+        Identifiability-theorem precondition issues. Populated from
+        ``gamfit.identifiability.check`` whenever the recipe is fit with
+        ``check_identifiability=True`` (the default). Empty list means
+        every applicable theorem precondition passed.
+    report : IdentifiabilityReport | None
+        Structured identifiability report (per-theorem
+        ``IdentifiabilityTheoremResult`` list). ``None`` when the check
+        was disabled by passing ``check_identifiability=False`` to
+        :meth:`PartialSupervisionRecipe.fit`.
     """
 
     T_supervised: np.ndarray
@@ -192,6 +202,8 @@ class PartialSupervisionFit:
     map_A: np.ndarray | None = None
     map_b: np.ndarray | None = None
     aux_score: float | None = None
+    warnings: list[str] = field(default_factory=list)
+    report: Any = None
 
     def predict(self, X_new: np.ndarray) -> np.ndarray:
         """Project a new T-block ``X_new`` (N', T_dim) through the fitted gauge.
@@ -274,7 +286,13 @@ class PartialSupervisionRecipe:
             )
         self.aux = aux_arr
 
-    def fit(self, X: np.ndarray, T_init: np.ndarray | None = None) -> PartialSupervisionFit:
+    def fit(
+        self,
+        X: np.ndarray,
+        T_init: np.ndarray | None = None,
+        *,
+        check_identifiability: bool = True,
+    ) -> PartialSupervisionFit:
         """Run the gauge-fix recipe.
 
         Parameters
@@ -342,7 +360,7 @@ class PartialSupervisionRecipe:
             )
             aux_score = companion.loss(sup_aligned)
 
-        return PartialSupervisionFit(
+        fit_result = PartialSupervisionFit(
             T_supervised=sup_aligned,
             T_free=free_aligned,
             alignment_score=score,
@@ -354,6 +372,21 @@ class PartialSupervisionRecipe:
             map_b=map_b,
             aux_score=aux_score,
         )
+
+        if bool(check_identifiability):
+            # Identifiability theorems as runnable diagnostics: even though
+            # this recipe doesn't fit a decoder explicitly, the iVAE-aux and
+            # random-projection preconditions still apply (aux-variation +
+            # bounded latent activation variance). The mechanism-sparsity
+            # check skips itself (returns a 'warn' with reason 'skipped')
+            # because no decoder is materialised here.
+            from ..identifiability import check as _check_identifiability
+
+            report = _check_identifiability(fit_result, aux=self.aux)
+            fit_result.report = report
+            fit_result.warnings = report.as_warnings()
+
+        return fit_result
 
     def _resolve_T_init(
         self, X: np.ndarray, T_init: np.ndarray | None, N: int
