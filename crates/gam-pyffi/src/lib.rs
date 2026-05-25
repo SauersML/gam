@@ -9341,9 +9341,53 @@ fn sae_build_padded_basis_stacks(
                     .slice_mut(s![atom_idx, 0..m, 0..m])
                     .assign(&penalty);
             }
-            SaeAtomBasisKind::Duchon
-            | SaeAtomBasisKind::Sphere
-            | SaeAtomBasisKind::EuclideanPatch => {
+            SaeAtomBasisKind::Sphere => {
+                if d != 2 {
+                    return Err(format!(
+                        "sae_build_padded_basis_stacks: atom {atom_idx} Sphere requires latent_dim == 2, got {d}"
+                    ));
+                }
+                let (phi, jet, penalty) = sae_build_sphere_atom(coords.view())?;
+                let m = phi.ncols();
+                if m != basis_sizes[atom_idx] {
+                    return Err(format!(
+                        "sae_build_padded_basis_stacks: atom {atom_idx} Sphere basis size {m} disagrees with declared M={}",
+                        basis_sizes[atom_idx]
+                    ));
+                }
+                phi_stack
+                    .slice_mut(s![atom_idx, 0..n_obs, 0..m])
+                    .assign(&phi);
+                let jet_d = jet.shape()[2].min(d_max);
+                jet_stack
+                    .slice_mut(s![atom_idx, 0..n_obs, 0..m, 0..jet_d])
+                    .assign(&jet.slice(s![.., .., 0..jet_d]));
+                penalty_stack
+                    .slice_mut(s![atom_idx, 0..m, 0..m])
+                    .assign(&penalty);
+            }
+            SaeAtomBasisKind::Torus => {
+                let h = plan.n_harmonics.max(1);
+                let (phi, jet, penalty) = sae_build_torus_atom(coords.view(), d, h)?;
+                let m = phi.ncols();
+                if m != basis_sizes[atom_idx] {
+                    return Err(format!(
+                        "sae_build_padded_basis_stacks: atom {atom_idx} Torus basis size {m} disagrees with declared M={}",
+                        basis_sizes[atom_idx]
+                    ));
+                }
+                phi_stack
+                    .slice_mut(s![atom_idx, 0..n_obs, 0..m])
+                    .assign(&phi);
+                let jet_d = jet.shape()[2].min(d_max);
+                jet_stack
+                    .slice_mut(s![atom_idx, 0..n_obs, 0..m, 0..jet_d])
+                    .assign(&jet.slice(s![.., .., 0..jet_d]));
+                penalty_stack
+                    .slice_mut(s![atom_idx, 0..m, 0..m])
+                    .assign(&penalty);
+            }
+            SaeAtomBasisKind::Duchon | SaeAtomBasisKind::EuclideanPatch => {
                 let centers = plan
                     .duchon_centers
                     .as_ref()
@@ -9474,9 +9518,47 @@ fn sae_build_atom_plans(
                     basis_size,
                 });
             }
-            SaeAtomBasisKind::Duchon
-            | SaeAtomBasisKind::Sphere
-            | SaeAtomBasisKind::EuclideanPatch => {
+            SaeAtomBasisKind::Sphere => {
+                // The (lat, lon) chart fixes latent_dim = 2 and basis_size = 7
+                // regardless of the user-supplied `atom_dim` — the chart
+                // already captures the embedded S² geometry. Reject any
+                // d_atom other than 2 to keep the contract honest.
+                if d != 2 {
+                    return Err(format!(
+                        "sae_build_atom_plans: atom {atom_idx} basis 'sphere' requires atom_dim == 2, got {d}"
+                    ));
+                }
+                plans.push(SaeAtomBuildPlan {
+                    kind: SaeAtomBasisKind::Sphere,
+                    latent_dim: 2,
+                    n_harmonics: 0,
+                    duchon_centers: None,
+                    basis_size: SAE_SPHERE_BASIS_SIZE,
+                });
+            }
+            SaeAtomBasisKind::Torus => {
+                // Torus of dim `d` uses a tensor-product periodic harmonic
+                // basis of size `(2H+1)^d`. The user's `atom_dim` selects
+                // the latent dimension; `n_harmonics` defaults to
+                // `SAE_DEFAULT_TORUS_HARMONICS`. The design grows
+                // exponentially in `d`, so reject runaway combinations.
+                let h = SAE_DEFAULT_TORUS_HARMONICS;
+                let evaluator = TorusHarmonicEvaluator::new(d, h)?;
+                let basis_size = evaluator.basis_size();
+                if basis_size > SAE_MAX_PERIODIC_HARMONICS * 4 {
+                    return Err(format!(
+                        "sae_build_atom_plans: atom {atom_idx} torus basis size {basis_size} = (2*{h}+1)^{d} exceeds the dense limit; reduce atom_dim or harmonics"
+                    ));
+                }
+                plans.push(SaeAtomBuildPlan {
+                    kind: SaeAtomBasisKind::Torus,
+                    latent_dim: d,
+                    n_harmonics: h,
+                    duchon_centers: None,
+                    basis_size,
+                });
+            }
+            SaeAtomBasisKind::Duchon | SaeAtomBasisKind::EuclideanPatch => {
                 let n_centers = n_obs.min(32).max(8.min(n_obs));
                 let idx = sae_pick_duchon_center_indices(
                     n_obs,
@@ -9504,7 +9586,7 @@ fn sae_build_atom_plans(
             }
             SaeAtomBasisKind::Precomputed(name) => {
                 return Err(format!(
-                    "sae_build_atom_plans: unsupported atom_basis {:?}; sae_manifold_fit_auto can build only periodic, duchon, sphere, or euclidean_patch atoms",
+                    "sae_build_atom_plans: unsupported atom_basis {:?}; sae_manifold_fit_auto can build only periodic, duchon, sphere, torus, or euclidean_patch atoms",
                     name
                 ));
             }
@@ -9670,6 +9752,7 @@ fn sae_manifold_fit_auto<'py>(
             SaeAtomBasisKind::Periodic => "periodic",
             SaeAtomBasisKind::Duchon => "duchon",
             SaeAtomBasisKind::Sphere => "sphere",
+            SaeAtomBasisKind::Torus => "torus",
             SaeAtomBasisKind::EuclideanPatch => "euclidean_patch",
             SaeAtomBasisKind::Precomputed(_) => "precomputed",
         };
@@ -9786,6 +9869,33 @@ fn sae_manifold_predict_oos<'py>(
                     kind: SaeAtomBasisKind::Periodic,
                     latent_dim: 1,
                     n_harmonics,
+                    duchon_centers: None,
+                    basis_size,
+                });
+            }
+            SaeAtomBasisKind::Sphere => {
+                if d != 2 {
+                    return Err(py_value_error(format!(
+                        "sae_manifold_predict_oos: atom {atom_idx} basis 'sphere' requires atom_dim == 2, got {d}"
+                    )));
+                }
+                plans.push(SaeAtomBuildPlan {
+                    kind: SaeAtomBasisKind::Sphere,
+                    latent_dim: 2,
+                    n_harmonics: 0,
+                    duchon_centers: None,
+                    basis_size: SAE_SPHERE_BASIS_SIZE,
+                });
+            }
+            SaeAtomBasisKind::Torus => {
+                let h = n_harmonics_list[atom_idx].unwrap_or(SAE_DEFAULT_TORUS_HARMONICS);
+                let evaluator =
+                    TorusHarmonicEvaluator::new(d, h).map_err(py_value_error)?;
+                let basis_size = evaluator.basis_size();
+                plans.push(SaeAtomBuildPlan {
+                    kind: SaeAtomBasisKind::Torus,
+                    latent_dim: d,
+                    n_harmonics: h,
                     duchon_centers: None,
                     basis_size,
                 });
