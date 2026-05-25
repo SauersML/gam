@@ -54,8 +54,8 @@ GAMRegressor(formula="y ~ s(x)").fit(df)          # df contains "y"
 GAMRegressor(formula="y ~ s(x)").fit(df, y="y")   # name a column
 ```
 
-If the formula has no `~`, `y` must be supplied and gamfit prepends
-`<target> ~`.
+If the formula has no `~`, `y` must be supplied as an array-like target or
+response-column name, and gamfit prepends `<target> ~`.
 
 ### Methods
 

@@ -8209,6 +8209,66 @@ fn block_quadratic_penalty(
     value
 }
 
+fn block_penalized_hessian_vector(
+    spec: &ParameterBlockSpec,
+    work: &BlockWorkingSet,
+    s_lambda: &Array2<f64>,
+    direction: &Array1<f64>,
+    ridge: f64,
+    ridge_policy: RidgePolicy,
+) -> Array1<f64> {
+    let mut hpen = match work {
+        BlockWorkingSet::ExactNewton { hessian, .. } => hessian.dot(direction),
+        BlockWorkingSet::Diagonal {
+            working_weights, ..
+        } => {
+            let x_direction = spec.design.matrixvectormultiply(direction);
+            let wx_direction = &x_direction * working_weights;
+            spec.design.transpose_vector_multiply(&wx_direction)
+        }
+    };
+    hpen += &s_lambda.dot(direction);
+    if ridge_policy.include_quadratic_penalty && ridge > 0.0 {
+        hpen.scaled_add(ridge, direction);
+    }
+    hpen
+}
+
+fn block_penalized_metric_norm(
+    spec: &ParameterBlockSpec,
+    work: &BlockWorkingSet,
+    s_lambda: &Array2<f64>,
+    direction: &Array1<f64>,
+    ridge: f64,
+    ridge_policy: RidgePolicy,
+) -> f64 {
+    let hpen_direction =
+        block_penalized_hessian_vector(spec, work, s_lambda, direction, ridge, ridge_policy);
+    let quadratic = direction.dot(&hpen_direction);
+    if quadratic.is_finite() && quadratic > 0.0 {
+        quadratic.sqrt()
+    } else {
+        direction.iter().map(|v| v * v).sum::<f64>().sqrt()
+    }
+}
+
+fn truncate_block_step_to_metric_radius(
+    spec: &ParameterBlockSpec,
+    work: &BlockWorkingSet,
+    s_lambda: &Array2<f64>,
+    delta: Array1<f64>,
+    radius: f64,
+    ridge: f64,
+    ridge_policy: RidgePolicy,
+) -> (Array1<f64>, f64) {
+    let norm = block_penalized_metric_norm(spec, work, s_lambda, &delta, ridge, ridge_policy);
+    if norm.is_finite() && norm > radius && radius > 0.0 {
+        (&delta * (radius / norm), radius)
+    } else {
+        (delta, norm)
+    }
+}
+
 const TOTAL_QUADRATIC_PENALTY_PAR_MIN_BLOCKS: usize = 4;
 // Avoid Rayon overhead for a few tiny blocks; this approximates the dense
 // mat-vec work in βᵀSβ before splitting independent block penalties.
