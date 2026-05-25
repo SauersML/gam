@@ -1,12 +1,12 @@
-#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 use std::collections::HashMap;
 use std::sync::OnceLock;
-#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 use std::sync::{Arc, Mutex};
 
 use super::device::GpuDeviceInfo;
 use super::policy::GpuDispatchPolicy;
-#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 use cudarc::driver::{CudaContext, result, sys};
 
 #[path = "diagnostics.rs"]
@@ -40,7 +40,7 @@ impl GpuRuntime {
             return Ok(None);
         }
 
-        #[cfg(not(all(feature = "cuda", target_os = "linux")))]
+        #[cfg(not(target_os = "linux"))]
         {
             let reason = "CUDA support not compiled into this build";
             Self::record_cpu_reason(reason);
@@ -48,7 +48,7 @@ impl GpuRuntime {
             return Err(GpuProbeError::Driver(reason.to_string()));
         }
 
-        #[cfg(all(feature = "cuda", target_os = "linux"))]
+        #[cfg(target_os = "linux")]
         {
             // `cudarc 0.19`'s entry points lazily initialize the CUDA driver via
             // a process-wide `OnceLock<libloading::Library>`. When the platform
@@ -168,7 +168,7 @@ impl GpuRuntime {
     }
 }
 
-#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 pub fn cuda_context_for(ordinal: usize) -> Option<Arc<CudaContext>> {
     static CONTEXTS: OnceLock<Mutex<HashMap<usize, Arc<CudaContext>>>> = OnceLock::new();
     let contexts = CONTEXTS.get_or_init(|| Mutex::new(HashMap::new()));
@@ -180,7 +180,7 @@ pub fn cuda_context_for(ordinal: usize) -> Option<Arc<CudaContext>> {
     Some(guard.entry(ordinal).or_insert_with(|| ctx.clone()).clone())
 }
 
-#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 fn cuda_device_info(ordinal: usize, ctx: &CudaContext) -> Result<GpuDeviceInfo, GpuProbeError> {
     result::init().map_err(|err| GpuProbeError::Driver(err.to_string()))?;
     let device = result::device::get(
