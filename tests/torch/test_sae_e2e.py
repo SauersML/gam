@@ -9,7 +9,10 @@ Skipped (with reason) if the multi-block REML path is missing.
 
 from __future__ import annotations
 
-import pytest
+from importlib import import_module
+from typing import Any
+
+pytest: Any = import_module("pytest")
 
 gt = pytest.importorskip("gamfit.torch")
 torch = pytest.importorskip("torch")
