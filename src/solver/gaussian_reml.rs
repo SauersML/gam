@@ -1426,11 +1426,13 @@ fn add_edf_vjp(
     //   grad_X += scale · 2 · (W X) · G_A
     //   grad_w_i += scale · (X G_A X^T)_{ii}
     let xg = dense_ab(x, g_a.view());
+    crate::solver::estimate::reml::assembly::add_row_scaled_dense_into(
+        xg.view(),
+        weights,
+        2.0 * scale,
+        grad_x,
+    );
     for i in 0..x.nrows() {
-        let row_scale = 2.0 * scale * weights[i];
-        for k in 0..x.ncols() {
-            grad_x[[i, k]] += row_scale * xg[[i, k]];
-        }
         let mut quad = 0.0;
         for k in 0..x.ncols() {
             quad += x[[i, k]] * xg[[i, k]];
