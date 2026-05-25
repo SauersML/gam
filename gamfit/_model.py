@@ -189,12 +189,16 @@ class Model:
             if rows:
                 first = rows[0]
                 # allow-list (a): FFI payload marshaling.
-                template = {h: str(first[i]) for i, h in enumerate(headers)}
+                template = dict(zip(headers, map(str, first), strict=True))
         try:
             # allow-list (a): FFI optional argument marshaling.
             group_arg = str(group) if group is not None else None
             # allow-list (a): FFI payload sequence marshaling.
-            pairs_arg = [(str(a), str(b)) for a, b in pairs] if pairs is not None else None
+            pairs_arg = (
+                list(map(lambda pair: (str(pair[0]), str(pair[1])), pairs))
+                if pairs is not None
+                else None
+            )
             # allow-list (a): FFI optional argument marshaling.
             seed_arg = int(seed) if seed is not None else None
             # allow-list (a): FFI optional argument marshaling.
