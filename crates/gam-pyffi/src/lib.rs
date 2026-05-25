@@ -98,7 +98,6 @@ use numpy::{
     PyReadonlyArray3, PyReadonlyArray4, PyReadonlyArrayDyn,
 };
 use pyo3::IntoPyObjectExt;
-use pyo3::PyObject;
 use pyo3::exceptions::{PyKeyError, PyNotImplementedError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBytes, PyDict, PyFloat, PyList, PyString, PyTuple};
