@@ -182,6 +182,182 @@ class IdentifiabilityReport:
         }
 
 
+def _gather_fit_summary(
+    fit: Any,
+    *,
+    aux: Any,
+    ground_truth_dim: int | None,
+    thresholds: dict[str, float | int],
+) -> dict[str, Any]:
+    """Collect every numerical artefact the Rust checks need, with zero math.
+
+    The only operation here is ``np.ndarray.tolist()`` reshaping — every
+    statistic (std, rank, zero-fraction, variance) is computed in
+    ``src/inference/identifiability.rs``. This function is therefore a
+    pure marshalling layer per Principle (f).
+    """
+
+    aux_used = aux
+    if aux_used is None:
+        aux_used = getattr(fit, "aux", None)
+    if aux_used is not None:
+        aux_used = np.asarray(aux_used, dtype=float)
+        if aux_used.ndim == 1:
+            aux_used = aux_used.reshape(-1, 1)
+
+    t_sup = getattr(fit, "T_supervised", None)
+    t_free = getattr(fit, "T_free", None)
+    if t_sup is not None:
+        t_sup = np.asarray(t_sup, dtype=float)
+    if t_free is not None:
+        t_free = np.asarray(t_free, dtype=float)
+
+    n_supervised: int | None = None
+    if t_sup is not None and t_sup.ndim == 2:
+        n_supervised = int(t_sup.shape[1])
+    n_free: int | None = None
+    if t_free is not None and t_free.ndim == 2:
+        n_free = int(t_free.shape[1])
+
+    decoder = getattr(fit, "decoder", None)
+    if decoder is not None:
+        decoder = np.asarray(decoder, dtype=float)
+
+    encoder_state = getattr(fit, "encoder_state", None)
+    encoder_depth: int | None = None
+    if isinstance(encoder_state, dict):
+        # ``state_dict`` keys for ``nn.Sequential`` are ``"<idx>.weight"`` /
+        # ``"<idx>.bias"`` — counting unique ``.weight`` keys is "encoder
+        # depth" in Khemakhem 2107.10098 §3's sense.
+        weight_keys = {
+            k.rsplit(".", 1)[0]
+            for k in encoder_state
+            if k.endswith(".weight")
+        }
+        encoder_depth = len(weight_keys) if weight_keys else None
+
+    mech_w = getattr(fit, "mech_sparsity_weight", None)
+
+    activations: np.ndarray | None
+    if t_sup is not None and t_free is not None:
+        activations = np.concatenate([t_sup, t_free], axis=1)
+    elif t_sup is not None:
+        activations = t_sup
+    elif t_free is not None:
+        activations = t_free
+    else:
+        activations = None
+
+    summary: dict[str, Any] = {
+        "aux": aux_used.tolist() if aux_used is not None else None,
+        "n_supervised": int(n_supervised) if n_supervised is not None else None,
+        "n_free": int(n_free) if n_free is not None else None,
+        "decoder": decoder.tolist() if decoder is not None else None,
+        "encoder_depth": (
+            int(encoder_depth) if encoder_depth is not None else None
+        ),
+        "mech_sparsity_weight": (
+            float(mech_w) if mech_w is not None else None
+        ),
+        "activations": (
+            activations.tolist() if activations is not None else None
+        ),
+        "ground_truth_dim": (
+            int(ground_truth_dim) if ground_truth_dim is not None else None
+        ),
+        "thresholds": {
+            "ivae_aux_var_floor": float(thresholds["ivae_aux_var_floor"]),
+            "ivae_aux_rank_rtol": float(thresholds["ivae_aux_rank_rtol"]),
+            "ivae_min_encoder_layers": int(
+                thresholds["ivae_min_encoder_layers"]
+            ),
+            "mech_sparsity_fraction": float(
+                thresholds["mech_sparsity_fraction"]
+            ),
+            "mech_sparsity_zero_tol": float(
+                thresholds["mech_sparsity_zero_tol"]
+            ),
+            "randproj_var_warn": float(thresholds["randproj_var_warn"]),
+            "randproj_var_ceiling": float(thresholds["randproj_var_ceiling"]),
+        },
+    }
+    return summary
+
+
+def check(
+    fit: Any,
+    *,
+    aux: Any = None,
+    ground_truth_dim: int | None = None,
+    aux_var_floor: float = _IVAE_AUX_VAR_FLOOR,
+    aux_rank_rtol: float = _IVAE_AUX_RANK_RTOL,
+    min_encoder_layers: int = _IVAE_MIN_ENCODER_LAYERS,
+    mech_sparsity_zero_tol: float = _MECH_SPARSITY_ZERO_TOL,
+    mech_sparsity_fraction: float = _MECH_SPARSITY_FRACTION,
+    activation_var_warn: float = _RANDPROJ_ACTIVATION_VAR_WARN,
+    activation_var_ceiling: float = _RANDPROJ_ACTIVATION_VAR_CEILING,
+) -> "IdentifiabilityReport":
+    """Run every applicable identifiability theorem check on ``fit``.
+
+    All numerical work — min-std, faer-SVD column-rank, decoder
+    zero-fraction, latent variance bounds — happens in
+    ``gam::inference::identifiability``. This function is the Python
+    marshalling layer: it gathers the relevant tensors off the fit, ships
+    them as JSON to Rust, and rehydrates the resulting
+    :class:`IdentifiabilityReport`.
+
+    ``fit`` may be an :class:`IdentifiableFactorFitResult` (all three
+    theorems are checked), a :class:`gamfit.recipes.PartialSupervisionFit`
+    (iVAE-aux + random projection only — no decoder is fit), or any object
+    duck-typing the attributes ``T_supervised`` / ``T_free`` / ``decoder``
+    / ``encoder_state`` / ``mech_sparsity_weight``.
+
+    Parameters
+    ----------
+    fit : object
+        Fit result to introspect.
+    aux : array-like, optional
+        Aux used at fit time, when not stored on the fit (e.g. for
+        ``PartialSupervisionFit``).
+    ground_truth_dim : int, optional
+        Ground-truth latent dim from a simulator. Enables the
+        ``state_dim >= ground_truth_dim`` precondition.
+    aux_var_floor, aux_rank_rtol, min_encoder_layers,
+    mech_sparsity_zero_tol, mech_sparsity_fraction, activation_var_warn,
+    activation_var_ceiling : float / int
+        Numerical thresholds overriding the paper-cited defaults.
+    """
+
+    thresholds: dict[str, float | int] = {
+        "ivae_aux_var_floor": float(aux_var_floor),
+        "ivae_aux_rank_rtol": float(aux_rank_rtol),
+        "ivae_min_encoder_layers": int(min_encoder_layers),
+        "mech_sparsity_fraction": float(mech_sparsity_fraction),
+        "mech_sparsity_zero_tol": float(mech_sparsity_zero_tol),
+        "randproj_var_warn": float(activation_var_warn),
+        "randproj_var_ceiling": float(activation_var_ceiling),
+    }
+    summary = _gather_fit_summary(
+        fit,
+        aux=aux,
+        ground_truth_dim=ground_truth_dim,
+        thresholds=thresholds,
+    )
+    payload = json.dumps(summary)
+    raw = rust_module().identifiability_check_json(payload)
+    parsed = json.loads(raw)
+    theorems = [
+        IdentifiabilityTheoremResult(
+            theorem_name=str(entry["theorem_name"]),
+            status=str(entry["status"]),
+            reason=str(entry["reason"]),
+            metric={str(k): float(v) for k, v in entry["metric"].items()},
+        )
+        for entry in parsed
+    ]
+    return IdentifiabilityReport(theorems=theorems)
+
+
 def _check_ivae(
     *,
     aux: np.ndarray | None,
