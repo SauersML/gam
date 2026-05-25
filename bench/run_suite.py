@@ -678,71 +678,16 @@ def run_cmd(cmd: typing.Any, cwd: typing.Any=None) -> typing.Any:
 
 
 def make_folds(y: np.ndarray, n_splits: int = 5, seed: int = 42, stratified: bool = False) -> typing.Any:
-    n = int(len(y))
-    if n < n_splits:
-        raise ValueError(f"Need at least {n_splits} rows for {n_splits}-fold CV; got {n}")
-    rng = np.random.default_rng(seed)
-
-    if n_splits == 1:
-        if n < 2:
-            raise ValueError("Need at least 2 rows for a holdout split")
-        test_fraction = 0.2
-        if stratified:
-            classes = np.unique(y)
-            if len(classes) >= 2:
-                test_rows = []
-                for c in classes:
-                    idx = np.where(y == c)[0]
-                    rng.shuffle(idx)
-                    if len(idx) < 2:
-                        raise ValueError(
-                            "Need at least 2 observations in each class for a stratified holdout split"
-                        )
-                    n_test = max(1, int(round(len(idx) * test_fraction)))
-                    n_test = min(n_test, len(idx) - 1)
-                    test_rows.extend(idx[:n_test].tolist())
-                test_idx = np.array(sorted(test_rows), dtype=int)
-                train_mask = np.ones(n, dtype=bool)
-                train_mask[test_idx] = False
-                all_idx = np.arange(n, dtype=int)
-                return [Fold(train_idx=all_idx[train_mask], test_idx=test_idx)]
-        perm = np.arange(n, dtype=int)
-        rng.shuffle(perm)
-        n_test = min(max(1, int(round(n * test_fraction))), n - 1)
-        test_idx = np.sort(perm[:n_test])
-        all_idx = np.arange(n, dtype=int)
-        train_mask = np.ones(n, dtype=bool)
-        train_mask[test_idx] = False
-        return [Fold(train_idx=all_idx[train_mask], test_idx=test_idx)]
-
-    if stratified:
-        classes = np.unique(y)
-        if len(classes) >= 2:
-            fold_bins: list[list[int]] = [[] for _ in range(n_splits)]
-            for c in classes:
-                idx = np.where(y == c)[0]
-                rng.shuffle(idx)
-                for i, row_idx in enumerate(idx.tolist()):
-                    fold_bins[i % n_splits].append(row_idx)
-            all_idx = np.arange(n, dtype=int)
-            folds = []
-            for fold_rows in fold_bins:
-                test_idx = np.array(sorted(fold_rows), dtype=int)
-                train_mask = np.ones(n, dtype=bool)
-                train_mask[test_idx] = False
-                folds.append(Fold(train_idx=all_idx[train_mask], test_idx=test_idx))
-            return folds
-
-    perm = np.arange(n, dtype=int)
-    rng.shuffle(perm)
-    test_parts = np.array_split(perm, n_splits)
-    all_idx = np.arange(n, dtype=int)
-    folds = []
-    for test_idx in test_parts:
-        train_mask = np.ones(n, dtype=bool)
-        train_mask[test_idx] = False
-        folds.append(Fold(train_idx=all_idx[train_mask], test_idx=np.sort(test_idx)))
-    return folds
+    raw_folds = _gamfit_rust().make_folds_indices(
+        np.asarray(y, dtype=float).reshape(-1).tolist(),
+        int(n_splits),
+        int(seed),
+        bool(stratified),
+    )
+    return [
+        Fold(train_idx=np.asarray(train_idx, dtype=int), test_idx=np.asarray(test_idx, dtype=int))
+        for train_idx, test_idx in raw_folds
+    ]
 
 
 def _evaluation_suffix(folds: list[Fold]) -> str:
@@ -760,58 +705,15 @@ def _evaluation_label_for_n_folds(n_folds: int) -> str:
 
 
 def auc_score(y: np.ndarray, p: np.ndarray) -> float:
-    y_bin = (np.asarray(y) > 0.5).astype(int)
-    score = np.asarray(p, dtype=float).reshape(-1)
-    if y_bin.shape != score.shape:
-        raise ValueError(
-            f"auc_score length mismatch: got y={y_bin.shape[0]} and score={score.shape[0]}"
-        )
-    n_pos = int(np.sum(y_bin == 1))
-    n_neg = int(np.sum(y_bin == 0))
-    if n_pos == 0 or n_neg == 0:
-        return 0.5
-    order = np.argsort(score, kind="mergesort")
-    sorted_score = score[order]
-    sorted_y = y_bin[order]
-    concordant = 0.0
-    negatives_below = 0
-    i = 0
-    while i < sorted_score.shape[0]:
-        j = i + 1
-        while j < sorted_score.shape[0] and sorted_score[j] == sorted_score[i]:
-            j += 1
-        group = sorted_y[i:j]
-        pos_in_group = int(np.sum(group == 1))
-        neg_in_group = int(group.shape[0] - pos_in_group)
-        concordant += pos_in_group * negatives_below
-        concordant += 0.5 * pos_in_group * neg_in_group
-        negatives_below += neg_in_group
-        i = j
-    return float(concordant / (n_pos * n_neg))
+    return float(_gamfit_rust().auc_from_predictions(_flat_float_list(y), _flat_float_list(p)))
 
 
 def brier_score(y: np.ndarray, p: np.ndarray) -> float:
-    diagnostics = _gamfit_rust().diagnostics_from_predictions(
-        np.asarray(y, dtype=float).reshape(-1).tolist(),
-        np.asarray(p, dtype=float).reshape(-1).tolist(),
-    )
-    rmse = float(dict(diagnostics["metrics"])["rmse"])
-    return float(rmse * rmse)
+    return float(_gamfit_rust().brier_from_predictions(_flat_float_list(y), _flat_float_list(p)))
 
 
 def log_loss_score(y: np.ndarray, p: np.ndarray, eps: float = 1e-12) -> float:
-    p_clipped = np.clip(p, eps, 1.0 - eps)
-    return float(-np.mean(y * np.log(p_clipped) + (1.0 - y) * np.log(1.0 - p_clipped)))
-
-
-def exp_saturated(x: float) -> float:
-    """Numerically stable exp that saturates instead of raising OverflowError."""
-    # Approximate IEEE-754 f64 exponent bounds.
-    if x >= 709.0:
-        return float("inf")
-    if x <= -745.0:
-        return 0.0
-    return math.exp(x)
+    return float(_gamfit_rust().log_loss_from_predictions(_flat_float_list(y), _flat_float_list(p), float(eps)))
 
 
 def nagelkerke_r2_score(
@@ -821,49 +723,21 @@ def nagelkerke_r2_score(
     null_mean: float,
     eps: float = 1e-12,
 ) -> float | None:
-    y_arr = np.asarray(y, dtype=float).reshape(-1)
-    p_arr = np.clip(np.asarray(p, dtype=float).reshape(-1), eps, 1.0 - eps)
-    if y_arr.shape != p_arr.shape or y_arr.size == 0:
-        return None
-    p_mean = float(null_mean)
-    if not np.isfinite(p_mean) or p_mean <= 0.0 or p_mean >= 1.0:
-        return None
-    ll_null = float(np.sum(y_arr * math.log(p_mean) + (1.0 - y_arr) * math.log(1.0 - p_mean)))
-    ll_model = float(np.sum(y_arr * np.log(p_arr) + (1.0 - y_arr) * np.log(1.0 - p_arr)))
-    n = int(y_arr.size)
-    r2_cs = 1.0 - exp_saturated((2.0 / n) * (ll_null - ll_model))
-    max_r2_cs = 1.0 - exp_saturated((2.0 / n) * ll_null)
-    if not np.isfinite(r2_cs) or not np.isfinite(max_r2_cs) or max_r2_cs <= 0.0:
-        return None
-    return float(r2_cs / max_r2_cs)
+    value = _gamfit_rust().nagelkerke_r2_from_predictions(
+        _flat_float_list(y),
+        _flat_float_list(p),
+        float(null_mean),
+        float(eps),
+    )
+    return None if value is None else float(value)
 
 
 def _survival_score_grid(train_df: pd.DataFrame, time_col: str) -> np.ndarray:
-    """Routine survival calibration horizons in the data's time unit.
-
-    Biobank-scale runs must not allocate all-observed-time survival matrices.
-    Dense curves over every event time are reserved for explicit diagnostics;
-    routine scoring uses 1y, 2y, 5y, 10y, and median follow-up.
-    """
-    train_times = train_df[time_col].to_numpy(dtype=float)
-    times = train_times
-    times = times[np.isfinite(times) & (times > 0.0)]
-    if times.size == 0:
-        return np.array([0.0, 1.0], dtype=float)
-    median_followup = float(np.median(times))
-    grid = np.unique(
-        np.asarray([0.0, 1.0, 2.0, 5.0, 10.0, median_followup], dtype=float)
-    )
-    grid = grid[np.isfinite(grid) & (grid >= 0.0)]
-    grid[0] = 0.0
-    if grid.size == 1:
-        grid = np.array([0.0, max(float(grid[0]), 1.0)], dtype=float)
-    return grid.astype(float, copy=False)
+    return np.asarray(_gamfit_rust().survival_score_grid_from_times(_flat_float_list(train_df[time_col])), dtype=float)
 
 
 def _repeat_survival_curve(surv: np.ndarray, n_rows: int) -> np.ndarray:
-    curve = np.asarray(surv, dtype=float).reshape(1, -1)
-    return np.repeat(curve, n_rows, axis=0)
+    return np.asarray(_gamfit_rust().repeat_survival_curve(_flat_float_list(surv), int(n_rows)), dtype=float)
 
 
 def _survival_matrix_from_risk_calibration(
@@ -876,50 +750,16 @@ def _survival_matrix_from_risk_calibration(
     test_risk: np.ndarray,
     grid: np.ndarray,
 ) -> np.ndarray:
-    CoxPHFitter, KaplanMeierFitter = _require_lifelines_survival_helpers()
-    train_times = train_df[time_col].to_numpy(dtype=float)
-    train_events = (train_df[event_col].to_numpy(dtype=float) > 0.5).astype(float)
-    tr_risk = np.asarray(train_risk, dtype=float).reshape(-1)
-    te_risk = np.asarray(test_risk, dtype=float).reshape(-1)
-    if tr_risk.shape[0] != train_times.shape[0]:
-        raise ValueError(
-            f"train risk length mismatch: got {tr_risk.shape[0]}, expected {train_times.shape[0]}"
-        )
-    if te_risk.shape[0] != len(test_df):
-        raise ValueError(f"test risk length mismatch: got {te_risk.shape[0]}, expected {len(test_df)}")
-
-    finite_mask = np.isfinite(train_times) & np.isfinite(train_events) & np.isfinite(tr_risk) & (train_times > 0.0)
-    if int(np.sum(finite_mask)) == 0:
-        return _repeat_survival_curve(np.ones_like(grid, dtype=float), len(test_df))
-
-    tr_times = train_times[finite_mask]
-    tr_events = train_events[finite_mask]
-    tr_risk = tr_risk[finite_mask]
-    if tr_risk.size < 2 or float(np.nanstd(tr_risk)) < 1e-12:
-        km = KaplanMeierFitter()
-        km.fit(tr_times, event_observed=tr_events)
-        surv = km.predict(grid).to_numpy(dtype=float)
-        surv[0] = 1.0
-        surv = np.clip(surv, 1e-12, 1.0)
-        surv = np.minimum.accumulate(surv)
-        return _repeat_survival_curve(surv, len(test_df))
-
-    calib_train = pd.DataFrame(
-        {
-            "__time": tr_times,
-            "__event": tr_events,
-            "__risk": tr_risk,
-        }
+    return np.asarray(
+        _gamfit_rust().survival_matrix_from_risk_calibration(
+            _flat_float_list(train_df[time_col]),
+            _flat_float_list(train_df[event_col]),
+            _flat_float_list(train_risk),
+            _flat_float_list(test_risk),
+            _flat_float_list(grid),
+        ),
+        dtype=float,
     )
-    calib_test = pd.DataFrame({"__risk": np.asarray(te_risk, dtype=float).reshape(-1)})
-    cph = CoxPHFitter(penalizer=1e-8)
-    cph.fit(calib_train, duration_col="__time", event_col="__event")
-    surv_df = cph.predict_survival_function(calib_test, times=grid)
-    surv = surv_df.to_numpy(dtype=float).T
-    surv[:, 0] = 1.0
-    surv = np.clip(surv, 1e-12, 1.0)
-    surv = np.minimum.accumulate(surv, axis=1)
-    return surv
 
 
 def _survival_null_curve_from_train(
@@ -929,18 +769,14 @@ def _survival_null_curve_from_train(
     event_col: str,
     grid: np.ndarray,
 ) -> np.ndarray:
-    KaplanMeierFitter = _require_lifelines_kaplan_meier()
-    train_times = train_df[time_col].to_numpy(dtype=float)
-    train_events = (train_df[event_col].to_numpy(dtype=float) > 0.5).astype(float)
-    finite_mask = np.isfinite(train_times) & np.isfinite(train_events) & (train_times > 0.0)
-    if int(np.sum(finite_mask)) == 0:
-        return np.ones_like(grid, dtype=float)
-    km = KaplanMeierFitter()
-    km.fit(train_times[finite_mask], event_observed=train_events[finite_mask])
-    surv = km.predict(grid).to_numpy(dtype=float)
-    surv[0] = 1.0
-    surv = np.clip(surv, 1e-12, 1.0)
-    return np.minimum.accumulate(surv)
+    return np.asarray(
+        _gamfit_rust().survival_null_curve_from_train(
+            _flat_float_list(train_df[time_col]),
+            _flat_float_list(train_df[event_col]),
+            _flat_float_list(grid),
+        ),
+        dtype=float,
+    )
 
 
 def survival_lifted_metrics(
@@ -951,87 +787,21 @@ def survival_lifted_metrics(
     null_survival_matrix: np.ndarray | None = None,
     eps: float = 1e-12,
 ) -> dict[str, float | None]:
-    times = np.asarray(event_times, dtype=float).reshape(-1)
-    obs = (np.asarray(events, dtype=float).reshape(-1) > 0.5)
-    surv = np.asarray(survival_matrix, dtype=float)
-    grid = np.asarray(grid, dtype=float).reshape(-1)
-    if surv.ndim != 2 or surv.shape[0] != times.shape[0] or surv.shape[1] != grid.shape[0]:
-        return {"brier": None, "logloss": None, "nagelkerke_r2": None}
-    if grid.shape[0] < 2:
-        return {"brier": None, "logloss": None, "nagelkerke_r2": None}
-    if not np.all(np.diff(grid) > 0.0):
-        return {"brier": None, "logloss": None, "nagelkerke_r2": None}
-
-    surv = np.clip(surv, eps, 1.0)
-    surv[:, 0] = 1.0
-    surv = np.minimum.accumulate(surv, axis=1)
-    cumhaz = -np.log(np.clip(surv, eps, 1.0))
-    dt = np.diff(grid)
-    haz = np.maximum(np.diff(cumhaz, axis=1) / dt.reshape(1, -1), 0.0)
-    haz_sq_prefix = np.concatenate(
-        [np.zeros((surv.shape[0], 1), dtype=float), np.cumsum((haz**2) * dt.reshape(1, -1), axis=1)],
-        axis=1,
-    )
-
-    log_losses = np.empty(times.shape[0], dtype=float)
-    brier_losses = np.empty(times.shape[0], dtype=float)
-    for i, z in enumerate(times):
-        if not np.isfinite(z) or z <= 0.0:
-            return {"brier": None, "logloss": None, "nagelkerke_r2": None}
-        j = int(np.searchsorted(grid, z, side="left"))
-        if j >= grid.shape[0]:
-            j = grid.shape[0] - 1
-        if abs(grid[j] - z) <= 1e-12:
-            interval_idx = max(j - 1, 0)
-            h_z = haz[i, interval_idx]
-            h2_int = haz_sq_prefix[i, j]
-            hcum_z = cumhaz[i, j]
-        else:
-            interval_idx = max(j - 1, 0)
-            elapsed = z - grid[interval_idx]
-            h_z = haz[i, interval_idx]
-            h2_int = haz_sq_prefix[i, interval_idx] + (h_z**2) * elapsed
-            hcum_z = cumhaz[i, interval_idx] + h_z * elapsed
-        log_losses[i] = float(hcum_z - (math.log(max(h_z, eps)) if obs[i] else 0.0))
-        brier_losses[i] = float(0.5 * h2_int - (h_z if obs[i] else 0.0))
-
-    logloss = float(np.mean(log_losses))
-    brier = float(np.mean(brier_losses))
-
-    nagelkerke = None
+    null_matrix = None
     if null_survival_matrix is not None:
-        null_surv = np.asarray(null_survival_matrix, dtype=float)
-        if null_surv.ndim == 1:
-            null_surv = _repeat_survival_curve(null_surv, times.shape[0])
-        if null_surv.shape == surv.shape:
-            null_surv = np.clip(null_surv, eps, 1.0)
-            null_surv[:, 0] = 1.0
-            null_surv = np.minimum.accumulate(null_surv, axis=1)
-            null_cumhaz = -np.log(np.clip(null_surv, eps, 1.0))
-            null_haz = np.maximum(np.diff(null_cumhaz, axis=1) / dt.reshape(1, -1), 0.0)
-            null_log_losses = np.empty(times.shape[0], dtype=float)
-            for i, z in enumerate(times):
-                j = int(np.searchsorted(grid, z, side="left"))
-                if j >= grid.shape[0]:
-                    j = grid.shape[0] - 1
-                if abs(grid[j] - z) <= 1e-12:
-                    interval_idx = max(j - 1, 0)
-                    h_z = null_haz[i, interval_idx]
-                    hcum_z = null_cumhaz[i, j]
-                else:
-                    interval_idx = max(j - 1, 0)
-                    elapsed = z - grid[interval_idx]
-                    h_z = null_haz[i, interval_idx]
-                    hcum_z = null_cumhaz[i, interval_idx] + h_z * elapsed
-                null_log_losses[i] = float(hcum_z - (math.log(max(h_z, eps)) if obs[i] else 0.0))
-            ll_model = float(-np.sum(log_losses))
-            ll_null = float(-np.sum(null_log_losses))
-            n = int(times.shape[0])
-            r2_cs = 1.0 - exp_saturated((2.0 / n) * (ll_null - ll_model))
-            max_r2_cs = 1.0 - exp_saturated((2.0 / n) * ll_null)
-            if np.isfinite(r2_cs) and np.isfinite(max_r2_cs) and max_r2_cs > 0.0:
-                nagelkerke = float(r2_cs / max_r2_cs)
-    return {"brier": brier, "logloss": logloss, "nagelkerke_r2": nagelkerke}
+        null_matrix = np.asarray(null_survival_matrix, dtype=float)
+        if null_matrix.ndim == 1:
+            null_matrix = _repeat_survival_curve(null_matrix, len(np.asarray(event_times).reshape(-1)))
+    return dict(
+        _gamfit_rust().survival_lifted_metrics_from_predictions(
+            _flat_float_list(event_times),
+            _flat_float_list(events),
+            _flat_float_list(grid),
+            np.asarray(survival_matrix, dtype=float),
+            null_matrix,
+            float(eps),
+        )
+    )
 
 
 def score_survival_fold(
@@ -1085,16 +855,7 @@ def score_survival_fold(
 
 
 def gaussian_log_loss_score(y: np.ndarray, mu: np.ndarray, sigma: np.ndarray | float, eps: float = 1e-12) -> float:
-    y_arr = np.asarray(y, dtype=float).reshape(-1)
-    mu_arr = np.asarray(mu, dtype=float).reshape(-1)
-    sigma_arr = np.asarray(sigma, dtype=float)
-    if sigma_arr.ndim == 0:
-        sigma_use = np.full_like(y_arr, float(sigma_arr), dtype=float)
-    else:
-        sigma_use = sigma_arr.reshape(-1)
-    sigma_use = np.maximum(sigma_use, eps)
-    var = sigma_use**2
-    return float(np.mean(0.5 * np.log(2.0 * math.pi * var) + ((y_arr - mu_arr) ** 2) / (2.0 * var)))
+    return float(_gamfit_rust().gaussian_log_loss_from_predictions(_flat_float_list(y), _flat_float_list(mu), _sigma_float_list(sigma), float(eps)))
 
 
 def gaussian_prediction_scores(
@@ -1102,32 +863,19 @@ def gaussian_prediction_scores(
     mu: np.ndarray,
     sigma: np.ndarray | float,
 ) -> dict[str, float | None]:
-    diagnostics = _gamfit_rust().diagnostics_from_predictions(
-        np.asarray(y, dtype=float).reshape(-1).tolist(),
-        np.asarray(mu, dtype=float).reshape(-1).tolist(),
-    )
-    metrics = dict(diagnostics["metrics"])
-    rmse = float(metrics["rmse"])
-    r2 = metrics.get("r_squared")
-    return {
-        "logloss": gaussian_log_loss_score(y, mu, sigma),
-        "mse": float(rmse * rmse),
-        "rmse": rmse,
-        "mae": float(metrics["mae"]),
-        "r2": None if r2 is None else float(r2),
-    }
+    return dict(_gamfit_rust().gaussian_prediction_scores_from_predictions(_flat_float_list(y), _flat_float_list(mu), _sigma_float_list(sigma)))
 
 
 def zscore_train_test(train_df: pd.DataFrame, test_df: pd.DataFrame, feature_cols: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
     tr = train_df.copy()
     te = test_df.copy()
-    for col in feature_cols:
-        mu = float(tr[col].mean())
-        sdv = float(tr[col].std())
-        if (not np.isfinite(sdv)) or sdv < 1e-8:
-            sdv = 1.0
-        tr[col] = (tr[col] - mu) / sdv
-        te[col] = (te[col] - mu) / sdv
+    if feature_cols:
+        tr_values, te_values = _gamfit_rust().zscore_train_test_arrays(
+            tr[feature_cols].to_numpy(dtype=float),
+            te[feature_cols].to_numpy(dtype=float),
+        )
+        tr.loc[:, feature_cols] = np.asarray(tr_values, dtype=float)
+        te.loc[:, feature_cols] = np.asarray(te_values, dtype=float)
     return tr, te
 
 
