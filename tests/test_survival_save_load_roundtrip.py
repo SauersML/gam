@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import multiprocessing as mp
-import os
 import queue
 import tempfile
 import time
 from importlib import import_module
+from pathlib import Path
 from typing import Any, NoReturn, Protocol, cast
 
 
@@ -80,18 +80,12 @@ def _roundtrip_survival(model: Any, sample: pd.DataFrame) -> None:
     assert np.all(np.isfinite(surv_inmem))
     assert np.all((surv_inmem > 0.0) & (surv_inmem <= 1.0))
 
-    fd, tmp_path = tempfile.mkstemp(suffix=".gamfit")
-    os.close(fd)
-    try:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_path = str(Path(tmp_dir) / "model.gamfit")
         model.save(tmp_path)
         reloaded = gamfit.load(tmp_path)
         pred_disk = reloaded.predict(sample)
         surv_disk = np.asarray(pred_disk.survival, dtype=float)
-    finally:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
     np.testing.assert_allclose(surv_inmem, surv_disk, atol=1e-9, rtol=1e-9)
 
 
