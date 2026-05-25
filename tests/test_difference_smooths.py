@@ -1,12 +1,6 @@
-from __future__ import annotations
-
-import importlib
-from typing import Any
-
 import numpy as np
 import pandas as pd
-
-pytest: Any = importlib.import_module("pytest")
+import pytest
 
 pytest.importorskip("gamfit._rust")
 
