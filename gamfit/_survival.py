@@ -40,6 +40,7 @@ _TRANSFORMATION_NORMAL_MODEL_CLASSES = frozenset(
         "transformation-normal",
     }
 )
+_BERNOULLI_FAMILY_PREFIXES = ("bernoulli", "binomial")
 
 
 @dataclass(frozen=True, slots=True)
@@ -572,6 +573,7 @@ def shape_prediction_response(
     table_kind: str | None,
     training_table_kind: str | None,
     fallback_model_class: str,
+    fallback_family: str,
     interval: float | None,
     return_type: str | None,
     id_column: str | None,
@@ -596,6 +598,7 @@ def shape_prediction_response(
     columns_json = json.dumps(parsed["columns"], separators=(",", ":"))
     columns = json.loads(rust_module().ordered_prediction_columns(columns_json))
     model_class = str(parsed.get("model_class") or fallback_model_class)
+    family = str(parsed.get("family") or parsed.get("family_kind") or fallback_family)
 
     if model_class in _TRANSFORMATION_NORMAL_MODEL_CLASSES:
         z = rust_module().vec_to_array1_f64(
@@ -613,7 +616,7 @@ def shape_prediction_response(
             training_kind=training_table_kind,
         )
 
-    if model_class == "bernoulli marginal-slope":
+    if _is_bernoulli_marginal_slope(model_class, family):
         prob_values = rust_module().marginal_slope_clip_probabilities(
             [float(value) for value in columns.get("mean", [])]
         )
@@ -643,6 +646,15 @@ def shape_prediction_response(
         requested=return_type,
         input_kind=table_kind,
         training_kind=training_table_kind,
+    )
+
+
+def _is_bernoulli_marginal_slope(model_class: str, family: str) -> bool:
+    normalized_family = family.strip().lower().replace("_", "-")
+    return (
+        model_class == "bernoulli marginal-slope"
+        or model_class == "marginal-slope"
+        and normalized_family.startswith(_BERNOULLI_FAMILY_PREFIXES)
     )
 
 

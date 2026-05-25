@@ -7183,12 +7183,14 @@ fn smooth_term_primary_column(term: &SmoothTermSpec) -> Option<usize> {
                 name: term.name.clone(),
                 basis: (**inner).clone(),
                 shape: term.shape,
+                joint_null_rotation: None,
             })
         }
         SmoothBasisSpec::BySmooth { smooth, .. } => smooth_term_primary_column(&SmoothTermSpec {
             name: term.name.clone(),
             basis: (**smooth).clone(),
             shape: term.shape,
+            joint_null_rotation: None,
         }),
         SmoothBasisSpec::FactorSmooth { spec } => {
             if spec.continuous_cols.len() == 1 {
@@ -8099,6 +8101,7 @@ fn smooth_term_feature_cols(term: &SmoothTermSpec) -> Vec<usize> {
                 name: term.name.clone(),
                 basis: (**inner).clone(),
                 shape: term.shape,
+                joint_null_rotation: None,
             });
             cols.push(*by_col);
             cols.sort_unstable();
@@ -8117,6 +8120,7 @@ fn smooth_term_feature_cols(term: &SmoothTermSpec) -> Vec<usize> {
                 name: term.name.clone(),
                 basis: (**smooth).clone(),
                 shape: term.shape,
+                joint_null_rotation: None,
             });
             match by_kind {
                 ByVarKind::Numeric { feature_col } | ByVarKind::Factor { feature_col, .. } => {
@@ -8190,6 +8194,7 @@ fn smooth_basiswarning_family_rank(term: &SmoothTermSpec) -> u8 {
                 name: term.name.clone(),
                 basis: (**inner).clone(),
                 shape: term.shape,
+                joint_null_rotation: None,
             })
         }
         SmoothBasisSpec::BSpline1D { .. } => 0,
@@ -8204,6 +8209,7 @@ fn smooth_basiswarning_family_rank(term: &SmoothTermSpec) -> u8 {
                 name: term.name.clone(),
                 basis: (**smooth).clone(),
                 shape: term.shape,
+                joint_null_rotation: None,
             })
         }
         SmoothBasisSpec::FactorSmooth { .. } => 7,
@@ -12154,6 +12160,7 @@ mod tests {
                         input_scales: None,
                     },
                     shape: gam::smooth::ShapeConstraint::None,
+                    joint_null_rotation: None,
                 },
                 SmoothTermSpec {
                     name: "pc2".to_string(),
@@ -12173,6 +12180,7 @@ mod tests {
                         input_scales: None,
                     },
                     shape: gam::smooth::ShapeConstraint::None,
+                    joint_null_rotation: None,
                 },
                 SmoothTermSpec {
                     name: "pc3".to_string(),
@@ -12192,6 +12200,7 @@ mod tests {
                         input_scales: None,
                     },
                     shape: gam::smooth::ShapeConstraint::None,
+                    joint_null_rotation: None,
                 },
             ],
         };
@@ -12231,6 +12240,7 @@ mod tests {
                     input_scales: None,
                 },
                 shape: gam::smooth::ShapeConstraint::None,
+                joint_null_rotation: None,
             }],
         };
         let headers = vec!["pc1".to_string(), "pc2".to_string(), "pc3".to_string()];
@@ -12261,6 +12271,7 @@ mod tests {
                         input_scales: None,
                     },
                     shape: gam::smooth::ShapeConstraint::None,
+                    joint_null_rotation: None,
                 },
                 SmoothTermSpec {
                     name: "pc2".to_string(),
@@ -12277,6 +12288,7 @@ mod tests {
                         input_scales: None,
                     },
                     shape: gam::smooth::ShapeConstraint::None,
+                    joint_null_rotation: None,
                 },
             ],
         };
@@ -12320,6 +12332,7 @@ mod tests {
                     input_scales: None,
                 },
                 shape: gam::smooth::ShapeConstraint::None,
+                joint_null_rotation: None,
             }],
         };
         let headers = vec!["pc1".to_string(), "pc2".to_string(), "pc3".to_string()];
@@ -12358,6 +12371,7 @@ mod tests {
                         input_scales: None,
                     },
                     shape: gam::smooth::ShapeConstraint::None,
+                    joint_null_rotation: None,
                 },
                 SmoothTermSpec {
                     name: "s(pc1)".to_string(),
@@ -12377,6 +12391,7 @@ mod tests {
                         },
                     },
                     shape: gam::smooth::ShapeConstraint::None,
+                    joint_null_rotation: None,
                 },
             ],
         };

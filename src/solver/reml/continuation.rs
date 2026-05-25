@@ -123,9 +123,7 @@ fn classify_action(failure: &InnerFailure) -> FailureAction {
         InnerFailure::CertRefused { diagnosis, .. } => match diagnosis {
             KktRefusalDiagnosis::RankDeficientHPen => FailureAction::ExpandRhoZero,
             KktRefusalDiagnosis::ActiveSetIncomplete => FailureAction::Propagate,
-            KktRefusalDiagnosis::PhantomMultiplierWithWellConditionedH => {
-                FailureAction::ShrinkStep
-            }
+            KktRefusalDiagnosis::PhantomMultiplierWithWellConditionedH => FailureAction::ShrinkStep,
             // Structural cross-block alias surfaced at fit time: no
             // ρ-anneal recovers it. Propagate so the outer driver
             // refuses the fit rather than burning continuation budget.
@@ -278,13 +276,13 @@ fn fit_with_continuation(
     order: OuterEvalOrder,
 ) -> ContinuationResult {
     if target.len() != bounds_upper.len() {
-        return Err(ContinuationFailure::StructuralPropagate(InnerFailure::Other(
-            format!(
+        return Err(ContinuationFailure::StructuralPropagate(
+            InnerFailure::Other(format!(
                 "continuation: target len {} != bounds_upper len {}",
                 target.len(),
                 bounds_upper.len()
-            ),
-        )));
+            )),
+        ));
     }
 
     let mut offset = OVERSMOOTH_OFFSET_INIT;
@@ -540,15 +538,11 @@ mod tests {
         ));
 
         assert!(matches!(
-            classify_action(&InnerFailure::BudgetExhausted {
-                message: "".into()
-            }),
+            classify_action(&InnerFailure::BudgetExhausted { message: "".into() }),
             FailureAction::ShrinkStep
         ));
         assert!(matches!(
-            classify_action(&InnerFailure::TrustRegionFloor {
-                message: "".into()
-            }),
+            classify_action(&InnerFailure::TrustRegionFloor { message: "".into() }),
             FailureAction::ShrinkOrExpand
         ));
         assert!(matches!(
@@ -578,7 +572,7 @@ mod tests {
     // mock records the ρ at each call so step counting can be asserted.
 
     use crate::solver::outer_strategy::{
-        Derivative, DeclaredHessianForm, HessianResult, OuterCapability,
+        DeclaredHessianForm, Derivative, HessianResult, OuterCapability,
     };
 
     /// A response scripted for the next `eval_with_order` call.
@@ -662,6 +656,7 @@ mod tests {
         }
 
         fn seed_inner_state(&mut self, beta: &Array1<f64>) -> Result<(), EstimationError> {
+            assert_eq!(beta.len(), self.n_params);
             self.seed_calls += 1;
             self.last_seeded_beta_len = Some(beta.len());
             Ok(())
@@ -704,9 +699,9 @@ mod tests {
         let mut obj = ScriptedObjective::new(
             1,
             vec![
-                ScriptedResponse::Ok,                                 // ρ₀ accept
-                ScriptedResponse::Fail("inner_max_cycles reached"),   // 1st step refused
-                ScriptedResponse::Fail("inner_max_cycles reached"),   // 2nd step refused
+                ScriptedResponse::Ok,                               // ρ₀ accept
+                ScriptedResponse::Fail("inner_max_cycles reached"), // 1st step refused
+                ScriptedResponse::Fail("inner_max_cycles reached"), // 2nd step refused
                 // After two shrinks α≈0.125; remaining accepts.
                 ScriptedResponse::Ok,
                 ScriptedResponse::Ok,
@@ -718,8 +713,7 @@ mod tests {
                 ScriptedResponse::Ok,
             ],
         );
-        prime_outer_seed(&mut obj, &target, &upper)
-            .expect("path completes via shrink-on-budget");
+        prime_outer_seed(&mut obj, &target, &upper).expect("path completes via shrink-on-budget");
         // Confirm we did execute ρ₀ (the oversmoothed start) before
         // any of the failed attempts — direct evidence that the
         // continuation actually walked a path.
@@ -743,8 +737,8 @@ mod tests {
         let mut obj = ScriptedObjective::new(
             1,
             vec![
-                ScriptedResponse::Ok,                                  // ρ₀
-                ScriptedResponse::Fail("trust-region floor reached"),  // one TR-floor
+                ScriptedResponse::Ok,                                 // ρ₀
+                ScriptedResponse::Fail("trust-region floor reached"), // one TR-floor
                 // Rest: succeeds (intervening accept resets counter).
                 ScriptedResponse::Ok,
                 ScriptedResponse::Ok,
@@ -772,7 +766,7 @@ mod tests {
         let mut obj = ScriptedObjective::new(
             1,
             vec![
-                ScriptedResponse::Ok,                                       // ρ₀
+                ScriptedResponse::Ok, // ρ₀
                 ScriptedResponse::Fail("likelihood evaluation failed: NaN"),
                 ScriptedResponse::Ok,
                 ScriptedResponse::Ok,
@@ -790,6 +784,7 @@ mod tests {
             "path completes after likelihood shrink, got {:?}",
             outcome.err(),
         );
+        assert!(obj.rho_history.len() >= 3);
     }
 
     #[test]
@@ -801,9 +796,9 @@ mod tests {
         let mut obj = ScriptedObjective::new(
             1,
             vec![
-                ScriptedResponse::Ok,                                  // ρ₀ accept
+                ScriptedResponse::Ok, // ρ₀ accept
                 ScriptedResponse::Fail(
-                    "cycle=3 cert REFUSED: residual=1.0e+02 > 4·tol=1.0e+00; \
+                    "cycle=3 cert REFUSED: residual=1.0e+02 > tol=1.0e+00; \
                      carrying-block: time_surface (idx=0); \
                      diagnosis: active_set_incomplete",
                 ),
@@ -855,8 +850,7 @@ mod tests {
             }
         }
         let mut obj = ScriptedObjective::new(1, responses);
-        let err = prime_outer_seed(&mut obj, &target, &upper)
-            .expect_err("schedule must fail");
+        let err = prime_outer_seed(&mut obj, &target, &upper).expect_err("schedule must fail");
         // PhantomMultiplier classifies as ShrinkStep → α-floor →
         // Stuck → ExpandRhoZero (outer) → retries doubled offset →
         // PathStuck after OVERSMOOTH_RETRY_MAX.
@@ -883,12 +877,11 @@ mod tests {
         let mut obj = ScriptedObjective::new(
             1,
             vec![ScriptedResponse::Fail(
-                "cycle=3 cert REFUSED: residual=1.0e+02 > 4·tol=1.0e+00; \
+                "cycle=3 cert REFUSED: residual=1.0e+02 > tol=1.0e+00; \
                  diagnosis: active_set_incomplete",
             )],
         );
-        let err = prime_outer_seed(&mut obj, &target, &upper)
-            .expect_err("propagation expected");
+        let err = prime_outer_seed(&mut obj, &target, &upper).expect_err("propagation expected");
         let msg = err.inner().message();
         assert!(msg.contains("active_set_incomplete"), "msg='{msg}'");
     }

@@ -19931,7 +19931,7 @@ fn projected_linear_constraint_stationarity_vector(
             in_active[row] = true;
         }
     }
-    let mut active_rows: Vec<usize> = (0..n_rows).filter(|&row| in_active[row]).collect();
+    let active_rows: Vec<usize> = (0..n_rows).filter(|&row| in_active[row]).collect();
     if active_rows.is_empty() {
         return Some(residual.clone());
     }
@@ -19942,7 +19942,6 @@ fn projected_linear_constraint_stationarity_vector(
     }
     project_stationarity_residual_on_constraint_cone(residual, &a_active)
         .map(|(projected, _)| projected)
-        .or_else(|| Some(residual.clone()))
 }
 
 fn exact_newton_joint_stationarity_inf_norm<F: CustomFamily + ?Sized>(

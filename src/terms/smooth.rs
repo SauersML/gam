@@ -352,6 +352,16 @@ pub struct SmoothTermSpec {
     pub name: String,
     pub basis: SmoothBasisSpec,
     pub shape: ShapeConstraint,
+    /// Joint-null absorption rotation captured at fit time. `Some(Q)` means
+    /// the fitted coefficient vector lives in `γ`-coordinates with
+    /// `β_raw = Q · γ`; prediction must rotate the raw-basis design via
+    /// `X_new = X_new_raw · Q` to match. `None` means either the smooth had
+    /// no joint null space (penalty already full-rank) or rotation was
+    /// suppressed (smooth carries shape constraints whose cone geometry
+    /// would not survive an arbitrary orthogonal rotation). Persisted so
+    /// `save → load → predict` is bit-equivalent to in-memory prediction.
+    #[serde(default)]
+    pub joint_null_rotation: Option<crate::terms::basis::JointNullRotation>,
 }
 
 #[derive(Debug, Clone)]
@@ -711,6 +721,7 @@ impl TermCollectionSpec {
                         name: st.name.clone(),
                         basis: (**inner).clone(),
                         shape: st.shape,
+                        joint_null_rotation: None,
                     };
                     TermCollectionSpec {
                         linear_terms: Vec::new(),
@@ -839,6 +850,7 @@ impl TermCollectionSpec {
                             name: st.name.clone(),
                             basis: (**smooth).clone(),
                             shape: st.shape,
+                            joint_null_rotation: None,
                         }],
                     };
                     nested.validate_frozen(label)?;
@@ -5585,6 +5597,7 @@ fn build_single_local_smooth_term(
             name: term.name.clone(),
             basis: (**inner).clone(),
             shape: term.shape,
+            joint_null_rotation: None,
         };
         let built = build_single_local_smooth_term(data, &inner_term, workspace)?;
         return apply_by_variable_to_local_build(built, data, *by_col, by, &term.name);
@@ -5621,6 +5634,7 @@ fn build_single_local_smooth_term(
                 name: format!("{}::inner", term.name),
                 basis: (**inner).clone(),
                 shape: ShapeConstraint::None,
+                joint_null_rotation: None,
             };
             let mut inner_built = build_single_local_smooth_term(data, &inner_term, workspace)?;
             let base = inner_built
@@ -6837,6 +6851,7 @@ fn smooth_basis_family_rank(term: &SmoothTermSpec) -> u8 {
                 name: term.name.clone(),
                 basis: (**inner).clone(),
                 shape: term.shape,
+                joint_null_rotation: None,
             })
         }
         SmoothBasisSpec::BSpline1D { .. } => 0,
@@ -6850,6 +6865,7 @@ fn smooth_basis_family_rank(term: &SmoothTermSpec) -> u8 {
             name: term.name.clone(),
             basis: (**smooth).clone(),
             shape: term.shape,
+            joint_null_rotation: None,
         }),
         SmoothBasisSpec::FactorSmooth { .. } => 7,
     }
@@ -6863,6 +6879,7 @@ fn smooth_has_frozen_identifiability(term: &SmoothTermSpec) -> bool {
                 name: term.name.clone(),
                 basis: (**inner).clone(),
                 shape: term.shape,
+                joint_null_rotation: None,
             })
         }
         SmoothBasisSpec::BSpline1D { spec, .. } => {
@@ -15965,6 +15982,14 @@ pub fn freeze_term_collection_from_design(
         .iter_mut()
         .zip(design.smooth.terms.iter())
     {
+        // Persist joint-null absorption rotation captured at fit time so
+        // save → load → predict re-applies `X_new_raw · Q` identically to
+        // in-memory prediction. `None` when the smooth had no joint null
+        // space, or when rotation was suppressed (shape-constrained smooths
+        // whose cone geometry would not survive arbitrary orthogonal
+        // rotation). Without this propagation, models reloaded from disk
+        // produce wrong η at predict-time for any smooth with `Some(Q)`.
+        term.joint_null_rotation = fitted.joint_null_rotation.clone();
         // Auto-promotion: when canonical TPS is mathematically infeasible at
         // the requested (d, k), `build_thin_plate_basis_with_workspace`
         // delegates to `build_duchon_basis_with_workspace` and returns
@@ -18961,6 +18986,7 @@ mod tests {
                 },
             },
             shape: ShapeConstraint::None,
+            joint_null_rotation: None,
         };
         let design = build_smooth_design(data.view(), &[spec]).expect("boundary design");
         let constraints = design
@@ -19030,6 +19056,7 @@ mod tests {
                 },
             },
             shape: ShapeConstraint::None,
+            joint_null_rotation: None,
         };
         let design = build_smooth_design(data.view(), &[spec]).expect("boundary design");
         let constraints = design
@@ -19463,6 +19490,7 @@ mod tests {
                     },
                 },
                 shape: ShapeConstraint::None,
+                joint_null_rotation: None,
             },
             SmoothTermSpec {
                 name: "tps_x1x2".to_string(),
@@ -19479,6 +19507,7 @@ mod tests {
                     input_scales: None,
                 },
                 shape: ShapeConstraint::None,
+                joint_null_rotation: None,
             },
         ];
 
@@ -19524,6 +19553,7 @@ mod tests {
                 input_scales: None,
             },
             shape: ShapeConstraint::MonotoneIncreasing,
+            joint_null_rotation: None,
         }];
 
         let err = build_smooth_design(data.view(), &terms).expect_err("shape should be rejected");
@@ -19556,6 +19586,7 @@ mod tests {
                 input_scales: None,
             },
             shape: ShapeConstraint::MonotoneIncreasing,
+            joint_null_rotation: None,
         }];
         let sd = build_smooth_design(data.view(), &terms).expect("shape-constrained thin-plate");
         assert!(sd.coefficient_lower_bounds.is_none());
@@ -19596,6 +19627,7 @@ mod tests {
                 input_scales: None,
             },
             shape: ShapeConstraint::None,
+            joint_null_rotation: None,
         }];
 
         let sd = build_smooth_design(data.view(), &terms)
@@ -19649,6 +19681,7 @@ mod tests {
                     input_scales: None,
                 },
                 shape: ShapeConstraint::None,
+                joint_null_rotation: None,
             }],
         };
 
@@ -19711,6 +19744,7 @@ mod tests {
                 input_scales: None,
             },
             shape: ShapeConstraint::MonotoneIncreasing,
+            joint_null_rotation: None,
         }];
         let sd = build_smooth_design(data.view(), &terms).expect("shape-constrained Matérn");
         assert!(sd.coefficient_lower_bounds.is_none());
@@ -19744,6 +19778,7 @@ mod tests {
                 input_scales: None,
             },
             shape: ShapeConstraint::MonotoneIncreasing,
+            joint_null_rotation: None,
         }];
         let sd = build_smooth_design(data.view(), &terms).expect("shape-constrained Duchon");
         assert!(sd.coefficient_lower_bounds.is_none());
@@ -19777,6 +19812,7 @@ mod tests {
                 },
             },
             shape: ShapeConstraint::MonotoneIncreasing,
+            joint_null_rotation: None,
         }];
         let sd = build_smooth_design(data.view(), &terms).expect("shape-constrained bspline");
         let lb = sd
@@ -19825,6 +19861,7 @@ mod tests {
                     input_scales: None,
                 },
                 shape: ShapeConstraint::None,
+                joint_null_rotation: None,
             }],
         };
         let design = build_term_collection_design(data.view(), &spec).unwrap();
@@ -19871,6 +19908,7 @@ mod tests {
                     },
                 },
                 shape: ShapeConstraint::None,
+                joint_null_rotation: None,
             }],
         };
 
@@ -19911,6 +19949,7 @@ mod tests {
                     input_scales: None,
                 },
                 shape: ShapeConstraint::None,
+                joint_null_rotation: None,
             }],
         };
 
@@ -19967,6 +20006,7 @@ mod tests {
                     input_scales: None,
                 },
                 shape: ShapeConstraint::None,
+                joint_null_rotation: None,
             }],
         };
 
@@ -20028,6 +20068,7 @@ mod tests {
                     input_scales: None,
                 },
                 shape: ShapeConstraint::None,
+                joint_null_rotation: None,
             }],
         };
 
@@ -20103,6 +20144,7 @@ mod tests {
                         input_scales: None,
                     },
                     shape: ShapeConstraint::None,
+                    joint_null_rotation: None,
                 })
                 .collect(),
         };
@@ -20171,6 +20213,7 @@ mod tests {
                         input_scales: None,
                     },
                     shape: ShapeConstraint::None,
+                    joint_null_rotation: None,
                 },
                 SmoothTermSpec {
                     name: "tps_pc2".to_string(),
@@ -20187,6 +20230,7 @@ mod tests {
                         input_scales: None,
                     },
                     shape: ShapeConstraint::None,
+                    joint_null_rotation: None,
                 },
             ],
         };
@@ -20242,6 +20286,7 @@ mod tests {
                     },
                 },
                 shape: ShapeConstraint::None,
+                joint_null_rotation: None,
             }],
         };
 
@@ -20277,6 +20322,7 @@ mod tests {
                 input_scales: None,
             },
             shape: ShapeConstraint::None,
+            joint_null_rotation: None,
         };
         let spec = TermCollectionSpec {
             linear_terms: vec![],
@@ -20317,6 +20363,7 @@ mod tests {
                 input_scales: None,
             },
             shape: ShapeConstraint::None,
+            joint_null_rotation: None,
         };
         let linear_terms = vec![LinearTermSpec {
             name: "x0".to_string(),
@@ -20369,6 +20416,7 @@ mod tests {
                 },
             },
             shape: ShapeConstraint::None,
+            joint_null_rotation: None,
         };
         let duchon_term = SmoothTermSpec {
             name: "duchon_xy".to_string(),
@@ -20388,6 +20436,7 @@ mod tests {
                 input_scales: None,
             },
             shape: ShapeConstraint::None,
+            joint_null_rotation: None,
         };
 
         let spec_a = TermCollectionSpec {
@@ -20500,6 +20549,7 @@ mod tests {
                         input_scales: None,
                     },
                     shape: ShapeConstraint::None,
+                    joint_null_rotation: None,
                 },
                 SmoothTermSpec {
                     name: "s_x".to_string(),
@@ -20519,6 +20569,7 @@ mod tests {
                         },
                     },
                     shape: ShapeConstraint::None,
+                    joint_null_rotation: None,
                 },
             ],
         };
@@ -20580,6 +20631,7 @@ mod tests {
                     input_scales: None,
                 },
                 shape: ShapeConstraint::None,
+                joint_null_rotation: None,
             }],
         };
 
@@ -20633,6 +20685,7 @@ mod tests {
                     input_scales: None,
                 },
                 shape: ShapeConstraint::None,
+                joint_null_rotation: None,
             }],
         };
         let fit_design = build_term_collection_design(data.view(), &fitspec).unwrap();
@@ -20671,6 +20724,7 @@ mod tests {
                     input_scales: None,
                 },
                 shape: ShapeConstraint::None,
+                joint_null_rotation: None,
             }],
         };
         let frozen_design = build_term_collection_design(data.view(), &frozenspec).unwrap();
@@ -20731,6 +20785,7 @@ mod tests {
                     input_scales: None,
                 },
                 shape: ShapeConstraint::None,
+                joint_null_rotation: None,
             }],
         };
         assert_frozen_replay_matches_fit(data.view(), &tps_spec, "thin-plate");
@@ -20755,6 +20810,7 @@ mod tests {
                     input_scales: None,
                 },
                 shape: ShapeConstraint::None,
+                joint_null_rotation: None,
             }],
         };
         assert_frozen_replay_matches_fit(data.view(), &matern_spec, "matern");
@@ -20780,6 +20836,7 @@ mod tests {
                     input_scales: None,
                 },
                 shape: ShapeConstraint::None,
+                joint_null_rotation: None,
             }],
         };
         assert_frozen_replay_matches_fit(data.view(), &duchon_spec, "duchon");
@@ -20849,6 +20906,7 @@ mod tests {
                 input_scales: None,
             },
             shape: ShapeConstraint::None,
+            joint_null_rotation: None,
         }];
 
         let sd = build_smooth_design(data.view(), &terms).unwrap();
@@ -20904,6 +20962,7 @@ mod tests {
                 input_scales: None,
             },
             shape: ShapeConstraint::None,
+            joint_null_rotation: None,
         }];
 
         let sd = build_smooth_design(data.view(), &terms).unwrap();
@@ -20942,6 +21001,7 @@ mod tests {
                 input_scales: None,
             },
             shape: ShapeConstraint::None,
+            joint_null_rotation: None,
         }];
 
         let sd = build_smooth_design(data.view(), &terms).expect("joint duchon build");
@@ -20992,6 +21052,7 @@ mod tests {
                     input_scales: None,
                 },
                 shape: ShapeConstraint::None,
+                joint_null_rotation: None,
             }],
         };
 
@@ -21046,6 +21107,7 @@ mod tests {
                     input_scales: None,
                 },
                 shape: ShapeConstraint::None,
+                joint_null_rotation: None,
             }],
         };
 
@@ -21092,6 +21154,7 @@ mod tests {
                     input_scales: None,
                 },
                 shape: ShapeConstraint::None,
+                joint_null_rotation: None,
             }],
         };
 
@@ -21135,6 +21198,7 @@ mod tests {
                     input_scales: None,
                 },
                 shape: ShapeConstraint::None,
+                joint_null_rotation: None,
             }],
         };
 
@@ -21195,6 +21259,7 @@ mod tests {
                 },
             },
             shape: ShapeConstraint::None,
+            joint_null_rotation: None,
         }];
 
         let sd = build_smooth_design(data.view(), &terms).unwrap();
@@ -21262,6 +21327,7 @@ mod tests {
                 },
             },
             shape: ShapeConstraint::None,
+            joint_null_rotation: None,
         };
         let spec = TermCollectionSpec {
             linear_terms: vec![],
@@ -21368,6 +21434,7 @@ mod tests {
                     },
                 },
                 shape: ShapeConstraint::None,
+                joint_null_rotation: None,
             }],
         };
         let design = build_term_collection_design(data.view(), &spec_collection)
@@ -21451,6 +21518,7 @@ mod tests {
                 },
             },
             shape: ShapeConstraint::None,
+            joint_null_rotation: None,
         };
         let got = build_smooth_design(data.view(), &[term])
             .unwrap()
@@ -21512,6 +21580,7 @@ mod tests {
                 },
             },
             shape: ShapeConstraint::None,
+            joint_null_rotation: None,
         };
 
         let design = build_smooth_design(data.view(), &[term])
@@ -21574,6 +21643,7 @@ mod tests {
                 },
             },
             shape: ShapeConstraint::None,
+            joint_null_rotation: None,
         };
 
         let sd = build_smooth_design(data.view(), &[tensor_term.clone()]).unwrap();
@@ -21640,6 +21710,7 @@ mod tests {
                     input_scales: None,
                 },
                 shape: ShapeConstraint::None,
+                joint_null_rotation: None,
             }],
         };
         let fit_opts = FitOptions {
@@ -21752,6 +21823,7 @@ mod tests {
                 input_scales: None,
             },
             shape: ShapeConstraint::None,
+            joint_null_rotation: None,
         };
 
         let meanspec = TermCollectionSpec {
@@ -21936,6 +22008,7 @@ mod tests {
                     input_scales: None,
                 },
                 shape: ShapeConstraint::None,
+                joint_null_rotation: None,
             }],
         };
         let fit_opts = FitOptions {
@@ -22103,6 +22176,7 @@ mod tests {
                     input_scales: None,
                 },
                 shape: ShapeConstraint::None,
+                joint_null_rotation: None,
             }],
         };
         let fit_opts = FitOptions {
@@ -22366,6 +22440,7 @@ mod tests {
                 name: "variant_1d".to_string(),
                 basis,
                 shape: ShapeConstraint::None,
+                joint_null_rotation: None,
             }],
         };
         let fit_opts = FitOptions {
@@ -22683,6 +22758,7 @@ mod tests {
                     input_scales: None,
                 },
                 shape: ShapeConstraint::None,
+                joint_null_rotation: None,
             }],
         };
         let fit_opts = FitOptions {
@@ -22914,6 +22990,7 @@ mod tests {
                     input_scales: None,
                 },
                 shape: ShapeConstraint::None,
+                joint_null_rotation: None,
             }],
         };
         let fit_opts = FitOptions {
@@ -23169,6 +23246,7 @@ mod tests {
                     input_scales: None,
                 },
                 shape: ShapeConstraint::None,
+                joint_null_rotation: None,
             }],
         };
         let fit_opts = FitOptions {
@@ -23310,6 +23388,7 @@ mod tests {
                     },
                 },
                 shape: ShapeConstraint::None,
+                joint_null_rotation: None,
             }],
         };
         let design = build_term_collection_design(data.view(), &spec).expect("design");
@@ -23354,6 +23433,7 @@ mod tests {
                     input_scales: None,
                 },
                 shape: ShapeConstraint::None,
+                joint_null_rotation: None,
             }],
         };
         let design = build_term_collection_design(data.view(), &spec_orig).expect("design");
@@ -23511,6 +23591,7 @@ mod tests {
                 input_scales: None,
             },
             shape: ShapeConstraint::None,
+            joint_null_rotation: None,
         };
 
         let marginalspec = TermCollectionSpec {
@@ -23583,6 +23664,7 @@ mod tests {
                 },
             },
             shape: ShapeConstraint::None,
+            joint_null_rotation: None,
         };
         let random_effect = RandomEffectTermSpec {
             name: "grp".to_string(),
@@ -23745,6 +23827,7 @@ mod tests {
                         input_scales: None,
                     },
                     shape: ShapeConstraint::None,
+                    joint_null_rotation: None,
                 },
                 SmoothTermSpec {
                     name: "mono".to_string(),
@@ -23764,6 +23847,7 @@ mod tests {
                         },
                     },
                     shape: ShapeConstraint::MonotoneIncreasing,
+                    joint_null_rotation: None,
                 },
             ],
         };
@@ -23880,6 +23964,7 @@ mod tests {
                 input_scales: None,
             },
             shape: ShapeConstraint::None,
+            joint_null_rotation: None,
         };
 
         let meanspec = TermCollectionSpec {
@@ -24017,6 +24102,7 @@ mod tests {
                     input_scales: None,
                 },
                 shape: ShapeConstraint::None,
+                joint_null_rotation: None,
             }],
         };
 
@@ -24120,6 +24206,7 @@ mod tests {
                     },
                 },
                 shape: ShapeConstraint::None,
+                joint_null_rotation: None,
             }],
         };
         let design = build_term_collection_design(data.view(), &spec).expect("design");
@@ -24224,6 +24311,7 @@ mod tests {
                     input_scales: None,
                 },
                 shape: ShapeConstraint::None,
+                joint_null_rotation: None,
             }],
         };
         let weights = Array1::ones(n);
@@ -24454,6 +24542,7 @@ mod tests {
                     input_scales: None,
                 },
                 shape: ShapeConstraint::None,
+                joint_null_rotation: None,
             }],
         };
 
@@ -24519,6 +24608,7 @@ mod tests {
                     input_scales: None,
                 },
                 shape: ShapeConstraint::None,
+                joint_null_rotation: None,
             }],
         };
 
@@ -24629,6 +24719,7 @@ mod tests {
                     input_scales: None,
                 },
                 shape: ShapeConstraint::None,
+                joint_null_rotation: None,
             }],
         };
 
@@ -24741,6 +24832,7 @@ mod tests {
                     input_scales: None,
                 },
                 shape: ShapeConstraint::None,
+                joint_null_rotation: None,
             }],
         };
         let fit_opts = FitOptions {
@@ -24863,6 +24955,7 @@ mod tests {
                     input_scales: None,
                 },
                 shape: ShapeConstraint::None,
+                joint_null_rotation: None,
             }],
         };
         let fit_opts = FitOptions {
@@ -24977,6 +25070,7 @@ mod tests {
                     input_scales: None,
                 },
                 shape: ShapeConstraint::None,
+                joint_null_rotation: None,
             }],
         };
 
@@ -25075,6 +25169,7 @@ mod tests {
                     input_scales: None,
                 },
                 shape: ShapeConstraint::None,
+                joint_null_rotation: None,
             }],
         };
 
@@ -25117,6 +25212,7 @@ mod tests {
                     input_scales: None,
                 },
                 shape: ShapeConstraint::None,
+                joint_null_rotation: None,
             }],
         };
 
@@ -25166,6 +25262,7 @@ mod tests {
                     input_scales: None,
                 },
                 shape: ShapeConstraint::None,
+                joint_null_rotation: None,
             }],
         };
 
@@ -25209,6 +25306,7 @@ mod tests {
                         input_scales: None,
                     },
                     shape: ShapeConstraint::None,
+                    joint_null_rotation: None,
                 },
                 SmoothTermSpec {
                     name: "matern_iso".to_string(),
@@ -25231,6 +25329,7 @@ mod tests {
                         input_scales: None,
                     },
                     shape: ShapeConstraint::None,
+                    joint_null_rotation: None,
                 },
             ],
         };
@@ -25278,6 +25377,7 @@ mod tests {
                     input_scales: None,
                 },
                 shape: ShapeConstraint::None,
+                joint_null_rotation: None,
             }],
         };
         let options = SpatialLengthScaleOptimizationOptions {
@@ -25358,6 +25458,7 @@ mod tests {
                     input_scales: None,
                 },
                 shape: ShapeConstraint::None,
+                joint_null_rotation: None,
             }],
         };
 
@@ -25441,6 +25542,7 @@ mod tests {
                     input_scales: Some(vec![1.0, 1.0]),
                 },
                 shape: ShapeConstraint::None,
+                joint_null_rotation: None,
             }],
         };
         let spatial_terms = spatial_length_scale_term_indices(&spec);
@@ -25558,6 +25660,7 @@ mod tests {
                     input_scales: None,
                 },
                 shape: ShapeConstraint::None,
+                joint_null_rotation: None,
             }],
         };
 
@@ -25631,6 +25734,7 @@ mod tests {
                     },
                 },
                 shape: ShapeConstraint::None,
+                joint_null_rotation: None,
             }],
         };
         let fit_opts = FitOptions {
@@ -25714,6 +25818,7 @@ mod tests {
                 input_scales: None,
             },
             shape: ShapeConstraint::None,
+            joint_null_rotation: None,
         };
 
         let meanspec = TermCollectionSpec {
@@ -25854,6 +25959,7 @@ mod tests {
                 input_scales: None,
             },
             shape: ShapeConstraint::None,
+            joint_null_rotation: None,
         };
 
         let meanspec = TermCollectionSpec {
@@ -26522,6 +26628,7 @@ mod tests {
                     input_scales: None,
                 },
                 shape: ShapeConstraint::None,
+                joint_null_rotation: None,
             }],
         };
         let fit = fit_term_collection_forspec(
@@ -26610,6 +26717,7 @@ mod tests {
                     input_scales: None,
                 },
                 shape: ShapeConstraint::None,
+                joint_null_rotation: None,
             }],
         };
 
@@ -26711,6 +26819,7 @@ mod tests {
                     input_scales: None,
                 },
                 shape: ShapeConstraint::None,
+                joint_null_rotation: None,
             }],
         };
         let fit = fit_term_collection_forspec(
@@ -26800,6 +26909,7 @@ mod tests {
                     input_scales: None,
                 },
                 shape: ShapeConstraint::None,
+                joint_null_rotation: None,
             }],
         };
         let baseline = fit_term_collection_forspec(
@@ -27029,6 +27139,7 @@ mod tests {
                     input_scales: None,
                 },
                 shape: ShapeConstraint::None,
+                joint_null_rotation: None,
             }],
         };
         let baseline = fit_term_collection_forspec(
@@ -27214,6 +27325,7 @@ mod tests {
                     input_scales: None,
                 },
                 shape: ShapeConstraint::None,
+                joint_null_rotation: None,
             }],
         };
 
@@ -27399,6 +27511,7 @@ mod tests {
                     input_scales: None,
                 },
                 shape: ShapeConstraint::None,
+                joint_null_rotation: None,
             }],
         };
 
@@ -27486,6 +27599,7 @@ mod tests {
                     input_scales: None,
                 },
                 shape: ShapeConstraint::None,
+                joint_null_rotation: None,
             }],
         };
 
