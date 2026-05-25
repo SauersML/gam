@@ -6054,8 +6054,7 @@ fn build_single_local_smooth_term(
     // commits (D for fit-side application, plus the Stage-3c prediction
     // replay) have the rotation to consume. Commit B does *not* apply the
     // rotation; `design_t` and `penalties_t` flow through unchanged.
-    let joint_null_rotation =
-        crate::terms::basis::compute_joint_null_rotation(&penalties_t)?;
+    let joint_null_rotation = crate::terms::basis::compute_joint_null_rotation(&penalties_t)?;
 
     Ok(LocalSmoothTermBuild {
         dim: p_local,

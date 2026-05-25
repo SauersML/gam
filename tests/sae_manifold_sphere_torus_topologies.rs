@@ -114,7 +114,9 @@ fn sphere_topology_recovers_synthetic_signal() {
             lo: -FRAC_PI_2,
             hi: FRAC_PI_2,
         },
-        LatentManifold::Circle { period: std::f64::consts::TAU },
+        LatentManifold::Circle {
+            period: std::f64::consts::TAU,
+        },
     ]);
     let fitted = fit_single_atom(&z, atom, true_coords, latent, 12);
     let r2 = reconstruction_r2(&z, &fitted);

@@ -177,9 +177,9 @@ impl SaeAtomBasisKind {
         match self {
             // `Periodic` uses [`PeriodicHarmonicEvaluator`], whose basis
             // functions are `cos(2π·h·t), sin(2π·h·t)` — i.e. `t` is a
-            // fraction of one period, not radians. The latent manifold must
-            // wrap modulo `1.0` to match this convention; wrapping modulo
-            // `2π` (as `LatentManifold::Circle` does) would scramble the
+            // fraction of one period, not radians. The latent manifold
+            // wraps modulo `period = 1.0` to match this convention.
+            // Wrapping modulo `2π` instead would scramble the
             // fraction-of-period interpretation and cause #174-style
             // failures where Newton updates push `t` outside `[0, 1)` and
             // the optimiser sees a discontinuous landscape.

@@ -1220,8 +1220,8 @@ pub(crate) fn solve_quadratic_with_linear_constraints(
 #[cfg(test)]
 mod tests {
     use super::{
-        LinearInequalityConstraints, rank_reduce_rows_pivoted_qr,
-        solve_newton_direction_with_linear_constraints_impl,
+        LinearInequalityConstraints, project_stationarity_residual_on_constraint_cone,
+        rank_reduce_rows_pivoted_qr, solve_newton_direction_with_linear_constraints_impl,
     };
     use approx::assert_relative_eq;
     use ndarray::{Array1, array};
@@ -1265,5 +1265,41 @@ mod tests {
         assert_eq!(a_out.ncols(), 2);
         assert_eq!(b_out.len(), 0);
         assert!(groups_out.is_empty());
+    }
+
+    #[test]
+    fn cone_projection_solves_nonnegative_least_squares_not_one_way_pruning() {
+        let active_a = array![
+            [0.85258593, -0.77270261],
+            [-1.22152485, 2.05129351],
+            [0.22794844, 1.56987265],
+        ];
+        let residual = array![-0.50524761, -1.10104911];
+
+        let (projected, multipliers) =
+            project_stationarity_residual_on_constraint_cone(&residual, &active_a)
+                .expect("cone projection should solve");
+
+        let row0 = active_a.row(0);
+        let expected_mu0 = row0.dot(&residual) / row0.dot(&row0);
+        assert_relative_eq!(multipliers[0], expected_mu0, epsilon = 1e-8);
+        assert_relative_eq!(multipliers[1], 0.0, epsilon = 1e-10);
+        assert_relative_eq!(multipliers[2], 0.0, epsilon = 1e-10);
+
+        let raw_norm2 = residual.dot(&residual);
+        let projected_norm2 = projected.dot(&projected);
+        assert!(
+            projected_norm2 < raw_norm2 - 0.1,
+            "NNLS projection should keep the improving active row: raw={raw_norm2:.6e}, projected={projected_norm2:.6e}"
+        );
+        let dual = active_a.dot(&projected);
+        for (idx, (&mu, &w)) in multipliers.iter().zip(dual.iter()).enumerate() {
+            if mu <= 1e-10 {
+                assert!(
+                    w <= 1e-8,
+                    "inactive cone generator {idx} has positive reduced gradient {w:.3e}"
+                );
+            }
+        }
     }
 }
