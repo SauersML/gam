@@ -979,6 +979,29 @@ pub fn weighted_blockwise_penalty_sum(
     p_total: usize,
 ) -> Array2<f64> {
     assert_eq!(penalties.len(), lambdas.len());
+    // Smoothing parameters λ_k must be non-negative and finite. A negative
+    // λ would flip the sign of the corresponding block S_k, turning the
+    // total penalty matrix indefinite and silently corrupting every
+    // downstream Cholesky / PIRLS / REML / pseudo-logdet computation that
+    // assumes S_λ ⪰ 0. Catch this at the boundary rather than after it
+    // has propagated.
+    for (idx, &lam) in lambdas.iter().enumerate() {
+        assert!(
+            lam.is_finite() && lam >= 0.0,
+            "weighted_blockwise_penalty_sum: lambdas[{idx}] = {lam} is invalid (must be finite and non-negative; negative smoothing parameters violate S_λ ⪰ 0)",
+        );
+    }
+    // Block column ranges must also fit inside the declared total parameter
+    // dimension; an out-of-bounds slice would otherwise panic from ndarray
+    // with a far less informative message.
+    for (idx, bp) in penalties.iter().enumerate() {
+        let r = &bp.col_range;
+        assert!(
+            r.end <= p_total,
+            "weighted_blockwise_penalty_sum: penalties[{idx}] col_range {:?} exceeds p_total = {p_total}",
+            r,
+        );
+    }
     let mut out = Array2::<f64>::zeros((p_total, p_total));
     for (bp, &lam) in penalties.iter().zip(lambdas.iter()) {
         let r = &bp.col_range;
