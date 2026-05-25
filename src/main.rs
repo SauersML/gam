@@ -9945,8 +9945,8 @@ mod tests {
         heuristic_knots_for_column, parse_duchon_order, parse_duchon_power, unique_count_column,
     };
     use gam::types::{
-        InverseLink, LikelihoodScaleMetadata, LinkComponent, LinkFunction,
-        LogLikelihoodNormalization, WigglePenaltyConfig,
+        InverseLink, LikelihoodScaleMetadata, LinkFunction, LogLikelihoodNormalization,
+        WigglePenaltyConfig,
     };
     use ndarray::{Array1, Array2, ArrayViewMut2, array, s};
     use rand::SeedableRng;
