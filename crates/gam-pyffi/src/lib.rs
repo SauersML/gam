@@ -20672,6 +20672,10 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(mechanism_sparsity_jacobian, module)?)?;
     module.add_function(wrap_pyfunction!(conditional_prior_ivae, module)?)?;
+    module.add_function(wrap_pyfunction!(diagnostics_aux_richness, module)?)?;
+    module.add_function(wrap_pyfunction!(diagnostics_jacobian_sparsity, module)?)?;
+    module.add_function(wrap_pyfunction!(diagnostics_anchor_consistency, module)?)?;
+    module.add_function(wrap_pyfunction!(diagnostics_concat_decoder_blocks, module)?)?;
     module.add_function(wrap_pyfunction!(partial_supervision_solve, module)?)?;
     module.add_function(wrap_pyfunction!(thin_svd_scores, module)?)?;
     module.add_function(wrap_pyfunction!(
@@ -20735,6 +20739,117 @@ fn conditional_prior_ivae<'py>(
     .map_err(py_value_error)?;
     let (value, grad) = pen.value_and_grad(t.as_array());
     Ok((value, grad.into_pyarray(py).unbind()))
+}
+
+/// iVAE auxiliary-richness metrics (Khemakhem et al. 2020 Theorem 1).
+///
+/// Returns a dict with keys:
+/// `aux_observed` (bool), `n_nonfinite_aux` (int), `aux_dim` (int),
+/// `latent_dim` (int), `n_rows` (int), `constant_columns` (list[int]),
+/// `aux_is_discrete` (bool), `n_distinct_levels` (int),
+/// `jacobian_rank` (int), `jacobian_rank_estimated` (bool).
+#[pyfunction(signature = (aux, latents))]
+fn diagnostics_aux_richness<'py>(
+    py: Python<'py>,
+    aux: PyReadonlyArray2<'py, f64>,
+    latents: PyReadonlyArray2<'py, f64>,
+) -> PyResult<Py<PyDict>> {
+    let m = gam::diagnostics::aux_richness_metrics(aux.as_array(), latents.as_array());
+    let dict = PyDict::new(py);
+    dict.set_item("aux_observed", m.aux_observed)?;
+    dict.set_item("n_nonfinite_aux", m.n_nonfinite_aux)?;
+    dict.set_item("aux_dim", m.aux_dim)?;
+    dict.set_item("latent_dim", m.latent_dim)?;
+    dict.set_item("n_rows", m.n_rows)?;
+    dict.set_item("constant_columns", m.constant_columns)?;
+    dict.set_item("aux_is_discrete", m.aux_is_discrete)?;
+    dict.set_item("n_distinct_levels", m.n_distinct_levels)?;
+    // Map usize::MAX sentinel to Python None when rank not estimated.
+    if m.jacobian_rank_estimated {
+        dict.set_item("jacobian_rank", m.jacobian_rank)?;
+    } else {
+        dict.set_item("jacobian_rank", py.None())?;
+    }
+    dict.set_item("jacobian_rank_estimated", m.jacobian_rank_estimated)?;
+    Ok(dict.unbind())
+}
+
+/// Decoder-Jacobian sparsity metrics (Hyvarinen-Morioka 2017; Lachapelle 2024).
+///
+/// `jacobians_flat` has shape `(n_samples * P, latent_dim)`. Returns a dict
+/// with keys: `n_samples`, `p_features`, `latent_dim`, `mean_sparsity`,
+/// `max_abs`, `ranks` (list[int] of length n_samples).
+#[pyfunction(signature = (jacobians_flat, n_samples, zero_threshold))]
+fn diagnostics_jacobian_sparsity<'py>(
+    py: Python<'py>,
+    jacobians_flat: PyReadonlyArray2<'py, f64>,
+    n_samples: usize,
+    zero_threshold: f64,
+) -> PyResult<Py<PyDict>> {
+    if n_samples == 0 {
+        return Err(py_value_error(
+            "diagnostics_jacobian_sparsity: n_samples must be >= 1".into(),
+        ));
+    }
+    let (rows, _) = jacobians_flat.as_array().dim();
+    if rows % n_samples != 0 {
+        return Err(py_value_error(format!(
+            "diagnostics_jacobian_sparsity: rows {} not divisible by n_samples {}",
+            rows, n_samples
+        )));
+    }
+    let m = gam::diagnostics::jacobian_sparsity_metrics(
+        jacobians_flat.as_array(),
+        n_samples,
+        zero_threshold,
+    );
+    let dict = PyDict::new(py);
+    dict.set_item("n_samples", m.n_samples)?;
+    dict.set_item("p_features", m.p_features)?;
+    dict.set_item("latent_dim", m.latent_dim)?;
+    dict.set_item("mean_sparsity", m.mean_sparsity)?;
+    dict.set_item("max_abs", m.max_abs)?;
+    dict.set_item("ranks", m.ranks)?;
+    Ok(dict.unbind())
+}
+
+/// Anchor-consistency metrics for a manifold-SAE assignment matrix.
+///
+/// `assignments` has shape `(N, K)`. Returns a dict with keys:
+/// `n_rows`, `n_atoms`, `n_anchors`, `anchors_per_atom` (list[int] length K).
+#[pyfunction(signature = (assignments, anchor_dominance))]
+fn diagnostics_anchor_consistency<'py>(
+    py: Python<'py>,
+    assignments: PyReadonlyArray2<'py, f64>,
+    anchor_dominance: f64,
+) -> PyResult<Py<PyDict>> {
+    if !(anchor_dominance > 0.0 && anchor_dominance <= 1.0) {
+        return Err(py_value_error(format!(
+            "diagnostics_anchor_consistency: anchor_dominance must be in (0, 1]; got {}",
+            anchor_dominance
+        )));
+    }
+    let m =
+        gam::diagnostics::anchor_consistency_metrics(assignments.as_array(), anchor_dominance);
+    let dict = PyDict::new(py);
+    dict.set_item("n_rows", m.n_rows)?;
+    dict.set_item("n_atoms", m.n_atoms)?;
+    dict.set_item("n_anchors", m.n_anchors)?;
+    dict.set_item("anchors_per_atom", m.anchors_per_atom)?;
+    Ok(dict.unbind())
+}
+
+/// Concatenate a list of `(basis_size_k, P)` per-atom decoder blocks into a
+/// single `(P, sum_k basis_size_k)` Jacobian matrix. Saves a numpy
+/// concatenation in the Python diagnostics dispatcher.
+#[pyfunction(signature = (blocks))]
+fn diagnostics_concat_decoder_blocks<'py>(
+    py: Python<'py>,
+    blocks: Vec<PyReadonlyArray2<'py, f64>>,
+) -> PyResult<Py<PyArray2<f64>>> {
+    let views: Vec<_> = blocks.iter().map(|b| b.as_array()).collect();
+    let out = gam::diagnostics::concat_decoder_blocks(&views).map_err(py_value_error)?;
+    Ok(out.into_pyarray(py).unbind())
 }
 
 /// Generic 2D log-λ weight-selection driver.
