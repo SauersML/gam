@@ -18882,11 +18882,14 @@ fn evaluate_custom_family_joint_hyper_efs_internal_shared<
                 for (k, s) in spec.penalties.iter().enumerate() {
                     s.add_scaled_to(lambdas[k], &mut s_lambda);
                 }
-                if options.ridge_policy.include_penalty_logdet {
+                let ridge_hint = if options.ridge_policy.include_penalty_logdet {
                     for d in 0..p {
                         s_lambda[[d, d]] += ridge;
                     }
-                }
+                    Some(ridge)
+                } else {
+                    None
+                };
                 let structural_nullity = if !spec.nullspace_dims.is_empty()
                     && spec.nullspace_dims.len() == spec.penalties.len()
                 {
@@ -18902,7 +18905,11 @@ fn evaluate_custom_family_joint_hyper_efs_internal_shared<
                 } else {
                     None
                 };
-                PenaltyPseudologdet::from_assembled_with_nullity(s_lambda, structural_nullity)
+                PenaltyPseudologdet::from_assembled_with_nullity(
+                    s_lambda,
+                    ridge_hint,
+                    structural_nullity,
+                )
             })
             .collect();
         let blocks: Result<Vec<_>, _> = block_results.into_iter().collect();

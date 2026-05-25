@@ -388,7 +388,10 @@ impl<'a> RemlState<'a> {
                 rank,
                 n_rho,
             );
-            return first_order_correction;
+            return self.finalize_smoothing_outcome(first_order_routine(
+                first_order_correction,
+                "first-order V_rho rank-deficient: cubature would impute spurious variance",
+            ));
         }
 
         // Build V_rho from the outer Hessian around rho_hat.
@@ -398,8 +401,15 @@ impl<'a> RemlState<'a> {
             match self.compute_lamlhessian_consistent(final_rho) {
                 Ok(h) => h,
                 Err(err) => {
-                    log::debug!("Auto cubature skipped: rho Hessian unavailable ({}).", err);
-                    return first_order_correction;
+                    log::warn!(
+                        "Auto cubature: rho Hessian unavailable ({}); \
+                         falling back to first-order correction.",
+                        err
+                    );
+                    return self.finalize_smoothing_outcome(first_order_numerical(
+                        first_order_correction,
+                        "rho Hessian compute_lamlhessian_consistent failed",
+                    ));
                 }
             }
         };

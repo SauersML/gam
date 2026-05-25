@@ -231,7 +231,7 @@ impl<'a, A: ArrowSystemAssembler> LatentInnerSolver<'a, A> {
                 let solve_options = latent_arrow_solve_options(
                     &system,
                     &opts,
-                    !self.latent.retraction_registry().is_all_euclidean(),
+                    !self.latent.effective_is_all_euclidean(),
                 );
                 if let Ok((_, _, cache)) = solve_arrow_newton_step_with_options(
                     &system,
@@ -250,7 +250,7 @@ impl<'a, A: ArrowSystemAssembler> LatentInnerSolver<'a, A> {
             let solve_options = latent_arrow_solve_options(
                 &system,
                 &opts,
-                !self.latent.retraction_registry().is_all_euclidean(),
+                !self.latent.effective_is_all_euclidean(),
             );
             let step_result =
                 solve_arrow_newton_step_with_options(&system, ridge_t, ridge_beta, &solve_options);
@@ -394,9 +394,7 @@ fn limit_delta_to_riemannian_trust_region(
     if !enabled || !radius.is_finite() || radius <= 0.0 {
         return delta_t;
     }
-    let row_weights = latent
-        .retraction_registry()
-        .metric_weights(latent.latent_dim());
+    let row_weights = latent.effective_metric_weights();
     assert_eq!(row_weights.len(), latent.latent_dim());
     let mut norm_sq = 0.0_f64;
     for n in 0..latent.n_obs() {
