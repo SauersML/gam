@@ -1,7 +1,7 @@
 use gam::solver::mixture_link::inverse_link_mu_d1_for_inverse_link;
 use gam::types::{InverseLink, SasLinkState};
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 #[test]
 fn sas_inverse_link_is_monotone_and_bounded_as_cdf() {
