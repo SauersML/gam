@@ -223,7 +223,7 @@ fn cuda_device_info(ordinal: usize, ctx: &CudaContext) -> Result<GpuDeviceInfo, 
     })
 }
 
-#[cfg(all(test, feature = "cuda", target_os = "linux"))]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
 
