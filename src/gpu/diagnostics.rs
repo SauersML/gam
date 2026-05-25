@@ -1,5 +1,6 @@
 use super::super::device::GpuDeviceInfo;
 use super::super::policy::GpuDispatchPolicy;
+use super::GpuRuntime;
 
 pub(crate) fn log_cuda_enabled(device: &GpuDeviceInfo, policy: &GpuDispatchPolicy) {
     log::info!(
@@ -43,6 +44,7 @@ pub(crate) fn log_cuda_pool(devices: &[GpuDeviceInfo]) {
 }
 
 pub(crate) fn log_cuda_disabled(reason: &str) {
+    let reason = GpuRuntime::cpu_reason().unwrap_or(reason);
     log::info!(
         "[GPU] CUDA acceleration disabled\n  backend: CPU (faer + Rayon)\n  reason: {}",
         reason

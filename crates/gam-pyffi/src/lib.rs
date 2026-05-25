@@ -10,7 +10,8 @@ use gam::estimate::{
     saved_mixture_state_from_fit, saved_sas_state_from_fit,
 };
 use gam::faer_ndarray::{
-    FaerCholesky, FaerEigh, array2_to_matmut, factorize_symmetricwith_fallback, fast_xt_diag_x,
+    FaerCholesky, FaerEigh, FaerSvd, array2_to_matmut, factorize_symmetricwith_fallback,
+    fast_xt_diag_x,
 };
 use gam::families::family_meta::inverse_link_to_binomial_spec;
 use gam::families::inverse_link::apply_inverse_link_vec;
@@ -1316,7 +1317,7 @@ fn numeric_matrix_validate<'py>(
         }
     }
 
-    array.cast_into::<PyArray2<f64>>()
+    array.cast_into::<PyArray2<f64>>().map_err(PyErr::from)
 }
 
 #[pyfunction]
@@ -2088,6 +2089,19 @@ fn saved_model_payload_string(model_bytes: Vec<u8>, key: &str) -> PyResult<Optio
     }))
 }
 
+fn required_saved_model_payload_string_value(model_bytes: &[u8], key: &str) -> PyResult<String> {
+    saved_model_payload_string(model_bytes.to_vec(), key)?.ok_or_else(|| {
+        py_value_error(format!(
+            "saved model payload is missing {key}"
+        ))
+    })
+}
+
+#[pyfunction]
+fn required_saved_model_payload_string(model_bytes: Vec<u8>, key: &str) -> PyResult<String> {
+    required_saved_model_payload_string_value(&model_bytes, key)
+}
+
 #[pyfunction]
 fn build_extend_group_payload_json(
     spec_json: &str,
@@ -2198,6 +2212,20 @@ fn build_predict_payload_json(
     };
     serde_json::to_string(&payload)
         .map_err(|err| py_value_error(format!("failed to serialize predict payload: {err}")))
+}
+
+#[pyfunction]
+fn build_model_predict_payload_json(
+    model_bytes: Vec<u8>,
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+    interval: Option<f64>,
+    with_uncertainty: bool,
+) -> PyResult<String> {
+    let model_class = required_saved_model_payload_string_value(&model_bytes, "model_kind")?;
+    let formula = required_saved_model_payload_string_value(&model_bytes, "formula")?;
+    let time_grid = default_survival_time_grid(&model_class, &formula, headers, rows)?;
+    build_predict_payload_json(interval, with_uncertainty, time_grid)
 }
 
 #[pyfunction]
@@ -8541,14 +8569,11 @@ fn sae_pca_seed_initial_coords(
             centered[[row, col]] -= col_means[col];
         }
     }
-    use gam::faer_ndarray::FaerSvd;
     let (u_opt, s_vals, vt_opt) = centered
         .svd(true, true)
         .map_err(|err| format!("sae_pca_seed: SVD failed: {err:?}"))?;
-    let u = u_opt
-        .ok_or_else(|| "sae_pca_seed: SVD returned no U".to_string())?;
-    let vt = vt_opt
-        .ok_or_else(|| "sae_pca_seed: SVD returned no Vt".to_string())?;
+    let u = u_opt.ok_or_else(|| "sae_pca_seed: SVD returned no U".to_string())?;
+    let vt = vt_opt.ok_or_else(|| "sae_pca_seed: SVD returned no Vt".to_string())?;
     let vt_rows = vt.nrows();
     let u_cols = u.ncols();
     let two_pi = std::f64::consts::TAU;
@@ -8590,10 +8615,11 @@ fn sae_pca_seed_initial_coords(
                         }
                         proj[row] = acc;
                     }
-                    let (min_v, max_v) = proj.iter().fold(
-                        (f64::INFINITY, f64::NEG_INFINITY),
-                        |(lo, hi), &v| (lo.min(v), hi.max(v)),
-                    );
+                    let (min_v, max_v) = proj
+                        .iter()
+                        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &v| {
+                            (lo.min(v), hi.max(v))
+                        });
                     let span = max_v - min_v;
                     if span > 0.0 {
                         for row in 0..n_obs {
@@ -8742,9 +8768,13 @@ fn sae_pick_duchon_center_indices(n_obs: usize, n_centers: usize, random_state: 
         return (0..n_obs).collect();
     }
     let mut chosen: Vec<usize> = (0..n_obs).collect();
-    let mut state = random_state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    let mut state = random_state
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
     for i in (1..n_obs).rev() {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let j = (state >> 33) as usize % (i + 1);
         chosen.swap(i, j);
     }
@@ -8810,8 +8840,7 @@ fn sae_build_padded_basis_stacks(
                             "sae_build_padded_basis_stacks: atom {atom_idx} non-periodic atom requires centers"
                         )
                     })?;
-                let (phi, jet, penalty) =
-                    sae_build_duchon_atom(coords.view(), centers.view())?;
+                let (phi, jet, penalty) = sae_build_duchon_atom(coords.view(), centers.view())?;
                 let m = phi.ncols();
                 phi_stack
                     .slice_mut(s![atom_idx, 0..n_obs, 0..m])
@@ -8827,7 +8856,13 @@ fn sae_build_padded_basis_stacks(
         }
         coord_blocks.push(coords);
     }
-    Ok((phi_stack, jet_stack, penalty_stack, basis_sizes, coord_blocks))
+    Ok((
+        phi_stack,
+        jet_stack,
+        penalty_stack,
+        basis_sizes,
+        coord_blocks,
+    ))
 }
 
 /// Build [`SaeAtomBuildPlan`]s from `(z, atom_basis, atom_dim)` + per-atom
@@ -8960,8 +8995,7 @@ fn sae_manifold_fit_auto<'py>(
     )
     .map_err(py_value_error)?;
     let (basis_values, basis_jacobian, smooth_penalties, basis_sizes, _coord_blocks) =
-        sae_build_padded_basis_stacks(&plans, seed_coords.view(), n_obs)
-            .map_err(py_value_error)?;
+        sae_build_padded_basis_stacks(&plans, seed_coords.view(), n_obs).map_err(py_value_error)?;
     let m_max = basis_sizes.iter().copied().max().unwrap_or(1).max(1);
     let p_out = z_view.ncols();
     let decoder_coefficients = Array3::<f64>::zeros((k_atoms, m_max, p_out));
@@ -8996,7 +9030,7 @@ fn sae_manifold_fit_auto<'py>(
     let plans_py = PyList::empty(py);
     for plan in &plans {
         let entry = PyDict::new(py);
-        let kind_name: &str = match plan.kind {
+        let kind_name: &str = match &plan.kind {
             SaeAtomBasisKind::Periodic => "periodic",
             SaeAtomBasisKind::Duchon => "duchon",
             SaeAtomBasisKind::Sphere => "sphere",
@@ -9110,9 +9144,8 @@ fn sae_manifold_predict_oos<'py>(
                     .as_array()
                     .to_owned();
                 let probe_pts = Array2::<f64>::zeros((1, d.max(1)));
-                let (phi, _jet, _penalty) =
-                    sae_build_duchon_atom(probe_pts.view(), centers.view())
-                        .map_err(py_value_error)?;
+                let (phi, _jet, _penalty) = sae_build_duchon_atom(probe_pts.view(), centers.view())
+                    .map_err(py_value_error)?;
                 let basis_size = phi.ncols();
                 plans.push(SaeAtomBuildPlan {
                     kind,
@@ -9125,8 +9158,7 @@ fn sae_manifold_predict_oos<'py>(
         }
     }
     let (basis_values, basis_jacobian, smooth_penalties, basis_sizes, _coord_blocks) =
-        sae_build_padded_basis_stacks(&plans, seed_coords.view(), n_obs)
-            .map_err(py_value_error)?;
+        sae_build_padded_basis_stacks(&plans, seed_coords.view(), n_obs).map_err(py_value_error)?;
     let m_max = basis_sizes.iter().copied().max().unwrap_or(1).max(1);
     // Pad trained decoder blocks into (K, M_max, p)
     let mut decoder_coefficients = Array3::<f64>::zeros((k_atoms, m_max, p_out));
@@ -9176,9 +9208,9 @@ fn sae_manifold_predict_oos<'py>(
         None,
     )?;
     let bound = result_dict.bind(py);
-    let fitted_any = bound
-        .get_item("fitted")?
-        .ok_or_else(|| py_value_error("sae_manifold_predict_oos: inner fit missing fitted".into()))?;
+    let fitted_any = bound.get_item("fitted")?.ok_or_else(|| {
+        py_value_error("sae_manifold_predict_oos: inner fit missing fitted".into())
+    })?;
     let fitted_arr: Py<PyArray2<f64>> = fitted_any.extract()?;
     Ok(fitted_arr)
 }
@@ -12311,6 +12343,70 @@ fn summary_payload_from_model(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<
         summary_payload_value_from_model_bytes(&model_bytes)
     })?;
     json_object_to_py_dict(py, payload)
+}
+
+#[pyfunction]
+fn smoothing_parameters_from_model(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<PyObject> {
+    let payload = summary_payload_from_model_bytes(&model_bytes)?;
+    let out = PyDict::new(py);
+    let Some(lambdas) = payload
+        .get("lambdas")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Ok(out.unbind().into_any());
+    };
+    for (idx, value) in lambdas.iter().enumerate() {
+        let lambda = value.as_f64().ok_or_else(|| {
+            py_value_error(format!(
+                "summary lambdas[{idx}] must be a JSON number"
+            ))
+        })?;
+        out.set_item(idx, lambda)?;
+    }
+    Ok(out.unbind().into_any())
+}
+
+#[pyfunction]
+fn model_group_metadata(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<PyObject> {
+    let payload = summary_payload_from_model_bytes(&model_bytes)?;
+    match payload.get("group_metadata") {
+        Some(value @ serde_json::Value::Object(_)) => json_value_to_py(py, value.clone()),
+        _ => Ok(py.None()),
+    }
+}
+
+#[pyfunction]
+fn model_deployment_extensions(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<PyObject> {
+    let payload = summary_payload_from_model_bytes(&model_bytes)?;
+    let out = PyList::empty(py);
+    let Some(extensions) = payload
+        .get("deployment_extensions")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Ok(out.unbind().into_any());
+    };
+    for extension in extensions {
+        if matches!(extension, serde_json::Value::Object(_)) {
+            let py_value = json_value_to_py(py, extension.clone())?;
+            out.append(py_value.bind(py))?;
+        }
+    }
+    Ok(out.unbind().into_any())
+}
+
+#[pyfunction]
+fn model_evidence(model_bytes: Vec<u8>) -> PyResult<f64> {
+    let payload = summary_payload_from_model_bytes(&model_bytes)?;
+    let value = payload
+        .get("reml_score")
+        .and_then(serde_json::Value::as_f64)
+        .ok_or_else(|| py_value_error("saved model payload is missing reml_score".to_string()))?;
+    if !value.is_finite() {
+        return Err(py_value_error(
+            "saved model payload reml_score must be finite".to_string(),
+        ));
+    }
+    Ok(value)
 }
 
 fn summary_payload_value_from_model_bytes(model_bytes: &[u8]) -> Result<serde_json::Value, String> {
@@ -15816,7 +15912,7 @@ struct SparsityPenalty {
 #[pymethods]
 impl SparsityPenalty {
     #[new]
-    #[pyo3(signature = (kind = "smooth_l1", weight = "auto", eps = 1.0e-3, eps_weight = "fixed", *, target = "t", weight_schedule = None))]
+    #[pyo3(signature = (kind = "smooth_l1".to_string(), weight = default_weight_auto_py(), eps = 1.0e-3, eps_weight = "fixed".to_string(), *, target = default_target_py(), weight_schedule = None))]
     fn new(
         py: Python<'_>,
         kind: String,
@@ -15927,12 +16023,12 @@ fn validate_sparsity_weight(py: Python<'_>, weight: &Bound<'_, PyAny>, name: &st
 /// the macro-generated default closure produces the correct `PyObject` type
 /// rather than a `&'static str`.
 fn default_target_py() -> PyObject {
-    Python::with_gil(|py| pyo3::types::PyString::new(py, "t").into_any().unbind())
+    Python::attach(|py| pyo3::types::PyString::new(py, "t").into_any().unbind())
 }
 
 /// Build a `PyObject` containing the default sparsity-weight sentinel `"auto"`.
 fn default_weight_auto_py() -> PyObject {
-    Python::with_gil(|py| pyo3::types::PyString::new(py, "auto").into_any().unbind())
+    Python::attach(|py| pyo3::types::PyString::new(py, "auto").into_any().unbind())
 }
 
 fn target_descriptor(py: Python<'_>, target: &Bound<'_, PyAny>) -> PyResult<PyObject> {
@@ -15962,7 +16058,7 @@ struct ARDPenalty {
 #[pymethods]
 impl ARDPenalty {
     #[new]
-    #[pyo3(signature = (*, target = "t", weight_schedule = None))]
+    #[pyo3(signature = (*, target = default_target_py(), weight_schedule = None))]
     fn new(target: PyObject, weight_schedule: Option<PyObject>) -> Self {
         Self {
             target,
@@ -16018,7 +16114,7 @@ struct PyTopKActivationPenalty {
 #[pymethods]
 impl PyTopKActivationPenalty {
     #[new]
-    #[pyo3(signature = (k, weight = 1.0, *, target = "t", weight_schedule = None))]
+    #[pyo3(signature = (k, weight = 1.0, *, target = default_target_py(), weight_schedule = None))]
     fn new(
         k: &Bound<'_, PyAny>,
         weight: f64,
@@ -16098,7 +16194,7 @@ struct JumpReLUPenalty {
 #[pymethods]
 impl JumpReLUPenalty {
     #[new]
-    #[pyo3(signature = (thresholds, weight = 1.0, smoothing_eps = 1.0e-3, *, target = "t", weight_schedule = None))]
+    #[pyo3(signature = (thresholds, weight = 1.0, smoothing_eps = 1.0e-3, *, target = default_target_py(), weight_schedule = None))]
     fn new(
         py: Python<'_>,
         thresholds: &Bound<'_, PyAny>,
@@ -16303,7 +16399,7 @@ struct BlockSparsityPenalty {
 #[pymethods]
 impl BlockSparsityPenalty {
     #[new]
-    #[pyo3(signature = (groups, weight, n_eff, smoothing_eps = 1e-6, learnable = false, *, target = "t"))]
+    #[pyo3(signature = (groups, weight, n_eff, smoothing_eps = 1e-6, learnable = false, *, target = default_target_py()))]
     fn new(
         groups: &Bound<'_, PyAny>,
         weight: f64,
@@ -16464,7 +16560,7 @@ struct SoftmaxAssignmentSparsityPenalty {
 #[pymethods]
 impl SoftmaxAssignmentSparsityPenalty {
     #[new]
-    #[pyo3(signature = (k_atoms, temperature = 1.0, *, target = "t", weight_schedule = None))]
+    #[pyo3(signature = (k_atoms, temperature = 1.0, *, target = default_target_py(), weight_schedule = None))]
     fn new(
         py: Python<'_>,
         k_atoms: &Bound<'_, PyAny>,
@@ -16553,7 +16649,7 @@ struct IsometryPenalty {
 #[pymethods]
 impl IsometryPenalty {
     #[new]
-    #[pyo3(signature = (weight = "auto", *, target = "t", weight_schedule = None))]
+    #[pyo3(signature = (weight = default_weight_auto_py(), *, target = default_target_py(), weight_schedule = None))]
     fn new(
         py: Python<'_>,
         weight: PyObject,
@@ -16624,7 +16720,7 @@ struct PyIBPAssignmentPenalty {
 #[pymethods]
 impl PyIBPAssignmentPenalty {
     #[new]
-    #[pyo3(signature = (k_max, alpha = 1.0, tau = 1.0, learnable = false, *, target = "t", temperature_schedule = None, weight_schedule = None))]
+    #[pyo3(signature = (k_max, alpha = 1.0, tau = 1.0, learnable = false, *, target = default_target_py(), temperature_schedule = None, weight_schedule = None))]
     fn new(
         py: Python<'_>,
         k_max: &Bound<'_, PyAny>,
@@ -16785,7 +16881,7 @@ struct TotalVariationPenalty {
 #[pymethods]
 impl TotalVariationPenalty {
     #[new]
-    #[pyo3(signature = (weight, n_eff, difference_op = "forward_1d", smoothing_eps = 1.0e-6, learnable = false, *, target = "t"))]
+    #[pyo3(signature = (weight, n_eff, difference_op = "forward_1d".to_string(), smoothing_eps = 1.0e-6, learnable = false, *, target = default_target_py()))]
     fn new(
         py: Python<'_>,
         weight: f64,
@@ -17057,7 +17153,7 @@ struct ParametricAuxConditionalPriorPenalty {
 #[pymethods]
 impl ParametricAuxConditionalPriorPenalty {
     #[new]
-    #[pyo3(signature = (aux, alpha_init, beta_init, mu_init, weight, n_eff, learnable = false, *, target = "t"))]
+    #[pyo3(signature = (aux, alpha_init, beta_init, mu_init, weight, n_eff, learnable = false, *, target = default_target_py()))]
     fn new(
         py: Python<'_>,
         aux: &Bound<'_, PyAny>,
@@ -17202,7 +17298,7 @@ struct OrthogonalityPenalty {
 #[pymethods]
 impl OrthogonalityPenalty {
     #[new]
-    #[pyo3(signature = (weight, n_eff, learnable = false, *, target = "t"))]
+    #[pyo3(signature = (weight, n_eff, learnable = false, *, target = default_target_py()))]
     fn new(weight: f64, n_eff: i64, learnable: bool, target: PyObject) -> PyResult<Self> {
         if weight <= 0.0 {
             return Err(PyValueError::new_err(format!(
@@ -17285,7 +17381,7 @@ struct ScadMcpPenalty {
 #[pymethods]
 impl ScadMcpPenalty {
     #[new]
-    #[pyo3(signature = (weight, n_eff, gamma = None, variant = "mcp", smoothing_eps = 1.0e-6, learnable = false, *, target = "t"))]
+    #[pyo3(signature = (weight, n_eff, gamma = None, variant = "mcp".to_string(), smoothing_eps = 1.0e-6, learnable = false, *, target = default_target_py()))]
     fn new(
         weight: f64,
         n_eff: i64,
@@ -17427,7 +17523,7 @@ struct IvaeRidgeMeanGauge {
 #[pymethods]
 impl IvaeRidgeMeanGauge {
     #[new]
-    #[pyo3(signature = (aux, weight, n_eff, ridge_eps = 1.0e-6, learnable = false, *, target = "t"))]
+    #[pyo3(signature = (aux, weight, n_eff, ridge_eps = 1.0e-6, learnable = false, *, target = default_target_py()))]
     fn new(
         py: Python<'_>,
         aux: &Bound<'_, PyAny>,
@@ -17593,7 +17689,7 @@ impl MechanismSparsityPenalty {
             smoothing_eps = 1.0e-6,
             learnable = false,
             *,
-            target = "t"
+            target = default_target_py()
         ),
         text_signature = "(feature_groups, weight, n_eff, smoothing_eps=1e-06, learnable=False, *, target='t')"
     )]
@@ -17875,7 +17971,7 @@ fn block_orthogonality_target_descriptor(target: &Bound<'_, PyAny>) -> PyResult<
 #[pymethods]
 impl BlockOrthogonalityPenalty {
     #[new]
-    #[pyo3(signature = (groups, weight, n_eff, learnable = false, *, target = "t"))]
+    #[pyo3(signature = (groups, weight, n_eff, learnable = false, *, target = default_target_py()))]
     fn new(
         groups: &Bound<'_, PyAny>,
         weight: f64,
@@ -17968,7 +18064,7 @@ struct AuxConditionalPriorPenalty {
 #[pymethods]
 impl AuxConditionalPriorPenalty {
     #[new]
-    #[pyo3(signature = (lambda_per_row, weight, n_eff, learnable = false, *, target = "t"))]
+    #[pyo3(signature = (lambda_per_row, weight, n_eff, learnable = false, *, target = default_target_py()))]
     fn new(
         py: Python<'_>,
         lambda_per_row: &Bound<'_, PyAny>,
@@ -18066,7 +18162,7 @@ struct NuclearNormPenalty {
 #[pymethods]
 impl NuclearNormPenalty {
     #[new]
-    #[pyo3(signature = (weight, n_eff, smoothing_eps = 1.0e-6, max_rank = None, learnable = false, *, target = "t"))]
+    #[pyo3(signature = (weight, n_eff, smoothing_eps = 1.0e-6, max_rank = None, learnable = false, *, target = default_target_py()))]
     fn new(
         weight: f64,
         n_eff: &Bound<'_, PyAny>,
@@ -18339,6 +18435,8 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(equivariant_gauge_companion_loss, module)?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_fit, module)?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_fit_ibp, module)?)?;
+    module.add_function(wrap_pyfunction!(sae_manifold_fit_auto, module)?)?;
+    module.add_function(wrap_pyfunction!(sae_manifold_predict_oos, module)?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_reconstruction_r2, module)?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_assignment_summary, module)?)?;
     module.add_function(wrap_pyfunction!(gated_sae_decode, module)?)?;
@@ -19874,8 +19972,16 @@ fn require_len(actual: usize, expected: usize, label: &str) -> Result<(), String
 fn posterior_samples_summary_json_impl(request_json: &str) -> Result<String, String> {
     let request: PosteriorSamplesSummaryRequest = serde_json::from_str(request_json)
         .map_err(|err| format!("posterior_samples_summary_json: parse request: {err}"))?;
-    require_len(request.posterior_mean.len(), request.n_coeffs, "posterior_mean")?;
-    require_len(request.posterior_std.len(), request.n_coeffs, "posterior_std")?;
+    require_len(
+        request.posterior_mean.len(),
+        request.n_coeffs,
+        "posterior_mean",
+    )?;
+    require_len(
+        request.posterior_std.len(),
+        request.n_coeffs,
+        "posterior_std",
+    )?;
     let ci = posterior_credible_interval_impl(
         request.samples_flat,
         request.n_draws,
