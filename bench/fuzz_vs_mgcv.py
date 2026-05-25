@@ -27,7 +27,7 @@ import numpy as np
 import pandas as pd
 
 import gamfit
-from gamfit._diagnostics import Diagnostics
+from gamfit._binding import rust_module
 
 ROOT = Path(__file__).resolve().parent.parent
 BENCH_DIR = ROOT / "bench"
@@ -38,13 +38,8 @@ from bench.run_suite import (  # noqa: E402
     _rust_formula_for_scenario,
     _scenario_fit_mapping,
     _sigma_feature_terms,
-    auc_score,
-    brier_score,
     dataset_for_scenario,
     folds_for_dataset,
-    gaussian_log_loss_score,
-    log_loss_score,
-    nagelkerke_r2_score,
     run_external_mgcv_cv,
     run_external_mgcv_gaulss_cv,
     zscore_train_test,
@@ -278,6 +273,15 @@ def _standard_deviation_from_model(model: typing.Any) -> float | None:
     return sigma_f if math.isfinite(sigma_f) and sigma_f > 0.0 else None
 
 
+def _sigma_payload(sigma: np.ndarray | float | None) -> list[float] | None:
+    if sigma is None:
+        return None
+    arr = np.asarray(sigma, dtype=float)
+    if arr.ndim == 0:
+        return [float(arr)]
+    return [float(v) for v in arr.reshape(-1)]
+
+
 def _metrics_from_predictions(
     *,
     family: str,
@@ -286,33 +290,15 @@ def _metrics_from_predictions(
     pred: np.ndarray,
     sigma: np.ndarray | float | None = None,
 ) -> dict[str, typing.Any]:
-    if family == "binomial":
-        metrics: dict[str, typing.Any] = {
-            "auc": auc_score(y_test, pred),
-            "brier": brier_score(y_test, pred),
-            "logloss": log_loss_score(y_test, pred),
-        }
-        nr2 = nagelkerke_r2_score(y_test, pred, null_mean=float(np.mean(y_train)))
-        if nr2 is not None:
-            metrics["nagelkerke_r2"] = nr2
-        return metrics
-
-    diagnostics = Diagnostics.from_predictions(
-        formula="gamfit",
-        response_name="y",
-        observed=[float(v) for v in y_test],
-        predicted={"mean": [float(v) for v in pred]},
+    return dict(
+        rust_module().benchmark_prediction_metrics(
+            family,
+            [float(v) for v in np.asarray(y_test, dtype=float).reshape(-1)],
+            [float(v) for v in np.asarray(pred, dtype=float).reshape(-1)],
+            [float(v) for v in np.asarray(y_train, dtype=float).reshape(-1)],
+            _sigma_payload(sigma),
+        )
     )
-    d_metrics = diagnostics.metrics
-    metrics = {
-        "r2": d_metrics.get("r_squared", 0.0),
-        "rmse": d_metrics.get("rmse"),
-        "mae": d_metrics.get("mae"),
-        "mse": float(np.mean((y_test - pred) ** 2)),
-    }
-    if sigma is not None:
-        metrics["logloss"] = gaussian_log_loss_score(y_test, pred, sigma)
-    return metrics
 
 
 def run_gamfit(

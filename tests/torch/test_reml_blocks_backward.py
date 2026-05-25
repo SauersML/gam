@@ -93,7 +93,7 @@ def test_public_blocks_gradcheck() -> None:
     )
 
     def fit_loss(*args: torch.Tensor) -> torch.Tensor:
-        split = len(args) // 2
+        split = (len(args) - 1) // 2
         return _scalar_loss(
             gt.gaussian_reml_fit_blocks(
                 list(args[:split]),

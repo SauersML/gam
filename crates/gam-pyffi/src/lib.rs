@@ -85,7 +85,7 @@ use gam::terms::{
     SoftmaxAssignmentSparsityPenalty as CoreSoftmaxAssignmentSparsityPenalty,
     SparsityPenalty as CoreSparsityPenalty,
     StreamingMaternBasisGradientEvaluator,
-    TopKActivationPenalty, TotalVariationPenalty,
+    TopKActivationPenalty, TotalVariationPenalty as CoreTotalVariationPenalty,
 };
 use gam::transformation_normal::TransformationNormalFitResult;
 use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily, RhoPrior};
@@ -98,7 +98,7 @@ use numpy::{
 };
 use pyo3::exceptions::{PyKeyError, PyNotImplementedError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyBytes, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
+use pyo3::types::{PyAny, PyBytes, PyDict, PyFloat, PyList, PyString, PyTuple};
 use rayon::prelude::*;
 use regex::Regex;
 use serde::de::{MapAccess, Visitor};
@@ -1518,6 +1518,333 @@ fn flat_to_matrix_f64<'py>(
 #[pyfunction]
 fn vec_to_array1_f64<'py>(py: Python<'py>, values: Vec<f64>) -> PyResult<Py<PyArray1<f64>>> {
     Ok(Array1::from_vec(values).into_pyarray(py).unbind())
+}
+
+#[pyfunction]
+fn competing_risks_prediction_payload_from_json(
+    py: Python<'_>,
+    raw: &str,
+) -> PyResult<PyObject> {
+    let payload: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|err| py_value_error(format!("invalid competing-risks prediction JSON: {err}")))?;
+    let object = payload.as_object().ok_or_else(|| {
+        py_value_error("competing-risks prediction payload must be a JSON object".to_string())
+    })?;
+    match object.get("class").and_then(serde_json::Value::as_str) {
+        Some("competing_risks_prediction") => {}
+        Some(other) => {
+            return Err(py_value_error(format!(
+                "expected competing_risks_prediction payload, got {other}"
+            )));
+        }
+        None => {
+            return Err(py_value_error(
+                "competing-risks prediction payload is missing class".to_string(),
+            ));
+        }
+    }
+
+    let out = PyDict::new(py);
+    out.set_item(
+        "model_class",
+        object
+            .get("model_class")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("competing risks survival"),
+    )?;
+    out.set_item(
+        "likelihood_mode",
+        object
+            .get("likelihood_mode")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(""),
+    )?;
+    out.set_item(
+        "endpoint_names",
+        competing_risks_string_list(object.get("endpoint_names"), "endpoint_names")?,
+    )?;
+    out.set_item(
+        "times",
+        Array1::from_vec(competing_risks_numeric_list(object.get("times"), "times")?)
+            .into_pyarray(py),
+    )?;
+    set_optional_competing_risks_matrix(py, &out, "hazard", object.get("hazard"))?;
+    set_optional_competing_risks_matrix(py, &out, "survival", object.get("survival"))?;
+    set_optional_competing_risks_matrix(
+        py,
+        &out,
+        "cumulative_hazard",
+        object.get("cumulative_hazard"),
+    )?;
+    set_optional_competing_risks_matrix(py, &out, "cif", object.get("cif"))?;
+    set_optional_competing_risks_matrix(
+        py,
+        &out,
+        "overall_survival",
+        object.get("overall_survival"),
+    )?;
+    set_optional_competing_risks_vector(
+        py,
+        &out,
+        "linear_predictor",
+        object.get("linear_predictor"),
+    )?;
+
+    let columns = PyDict::new(py);
+    for (name, values) in competing_risks_columns(object.get("columns"))? {
+        columns.set_item(name, values)?;
+    }
+    out.set_item("columns", columns)?;
+    Ok(out.into_any().unbind())
+}
+
+fn set_optional_competing_risks_vector<'py>(
+    py: Python<'py>,
+    out: &Bound<'py, PyDict>,
+    key: &str,
+    raw: Option<&serde_json::Value>,
+) -> PyResult<()> {
+    match raw {
+        Some(serde_json::Value::Null) | None => out.set_item(key, py.None()),
+        Some(value) => out.set_item(
+            key,
+            Array1::from_vec(competing_risks_flattened_numbers(value, key)?).into_pyarray(py),
+        ),
+    }
+}
+
+fn set_optional_competing_risks_matrix<'py>(
+    py: Python<'py>,
+    out: &Bound<'py, PyDict>,
+    key: &str,
+    raw: Option<&serde_json::Value>,
+) -> PyResult<()> {
+    match raw {
+        Some(serde_json::Value::Null) | None => out.set_item(key, py.None()),
+        Some(value) => out.set_item(
+            key,
+            competing_risks_numeric_matrix(value, key)?.into_pyarray(py),
+        ),
+    }
+}
+
+fn competing_risks_columns(
+    raw: Option<&serde_json::Value>,
+) -> PyResult<BTreeMap<String, Vec<f64>>> {
+    let Some(value) = raw else {
+        return Ok(BTreeMap::new());
+    };
+    if value.is_null() {
+        return Ok(BTreeMap::new());
+    }
+    let object = value
+        .as_object()
+        .ok_or_else(|| py_value_error("columns must be a JSON object".to_string()))?;
+    let mut columns = BTreeMap::new();
+    for (name, values) in object {
+        columns.insert(
+            name.clone(),
+            competing_risks_numeric_list(Some(values), &format!("columns.{name}"))?,
+        );
+    }
+    Ok(columns)
+}
+
+fn competing_risks_string_list(
+    raw: Option<&serde_json::Value>,
+    key: &str,
+) -> PyResult<Vec<String>> {
+    let Some(value) = raw else {
+        return Ok(Vec::new());
+    };
+    if value.is_null() {
+        return Ok(Vec::new());
+    }
+    let items = value
+        .as_array()
+        .ok_or_else(|| py_value_error(format!("{key} must be a JSON array")))?;
+    let mut out = Vec::with_capacity(items.len());
+    for (idx, item) in items.iter().enumerate() {
+        let text = item
+            .as_str()
+            .ok_or_else(|| py_value_error(format!("{key}[{idx}] must be a string")))?;
+        out.push(text.to_string());
+    }
+    Ok(out)
+}
+
+fn competing_risks_numeric_list(
+    raw: Option<&serde_json::Value>,
+    key: &str,
+) -> PyResult<Vec<f64>> {
+    let Some(value) = raw else {
+        return Ok(Vec::new());
+    };
+    if value.is_null() {
+        return Ok(Vec::new());
+    }
+    let items = value
+        .as_array()
+        .ok_or_else(|| py_value_error(format!("{key} must be a JSON array")))?;
+    let mut out = Vec::with_capacity(items.len());
+    for (idx, item) in items.iter().enumerate() {
+        out.push(competing_risks_number(item, &format!("{key}[{idx}]"))?);
+    }
+    Ok(out)
+}
+
+fn competing_risks_flattened_numbers(
+    value: &serde_json::Value,
+    key: &str,
+) -> PyResult<Vec<f64>> {
+    let mut out = Vec::new();
+    competing_risks_flatten_numbers_into(value, key, &mut out)?;
+    Ok(out)
+}
+
+fn competing_risks_flatten_numbers_into(
+    value: &serde_json::Value,
+    key: &str,
+    out: &mut Vec<f64>,
+) -> PyResult<()> {
+    match value {
+        serde_json::Value::Number(_) => {
+            out.push(competing_risks_number(value, key)?);
+            Ok(())
+        }
+        serde_json::Value::Array(items) => {
+            for (idx, item) in items.iter().enumerate() {
+                competing_risks_flatten_numbers_into(item, &format!("{key}[{idx}]"), out)?;
+            }
+            Ok(())
+        }
+        _ => Err(py_value_error(format!("{key} must contain only numbers"))),
+    }
+}
+
+fn competing_risks_numeric_matrix(
+    value: &serde_json::Value,
+    key: &str,
+) -> PyResult<Array2<f64>> {
+    match competing_risks_array_depth(value, key)? {
+        1 => competing_risks_vector_as_matrix(value, key),
+        2 => competing_risks_matrix2(value, key),
+        3 => competing_risks_stacked_matrix3(value, key),
+        depth => Err(py_value_error(format!(
+            "{key} must be a vector, matrix, or list of matrices; got array depth {depth}"
+        ))),
+    }
+}
+
+fn competing_risks_vector_as_matrix(
+    value: &serde_json::Value,
+    key: &str,
+) -> PyResult<Array2<f64>> {
+    let values = competing_risks_numeric_list(Some(value), key)?;
+    let n_rows = values.len();
+    Array2::from_shape_vec((n_rows, 1), values)
+        .map_err(|err| py_value_error(format!("failed to reshape {key}: {err}")))
+}
+
+fn competing_risks_matrix2(value: &serde_json::Value, key: &str) -> PyResult<Array2<f64>> {
+    let rows = value
+        .as_array()
+        .ok_or_else(|| py_value_error(format!("{key} must be a JSON array")))?;
+    if rows.is_empty() {
+        return Ok(Array2::<f64>::zeros((0, 1)));
+    }
+    let first_row = rows[0]
+        .as_array()
+        .ok_or_else(|| py_value_error(format!("{key}[0] must be a JSON array")))?;
+    let n_cols = first_row.len();
+    let mut flat = Vec::with_capacity(rows.len() * n_cols);
+    for (row_idx, row) in rows.iter().enumerate() {
+        let cells = row
+            .as_array()
+            .ok_or_else(|| py_value_error(format!("{key}[{row_idx}] must be a JSON array")))?;
+        if cells.len() != n_cols {
+            return Err(py_value_error(format!(
+                "{key}[{row_idx}] has length {}, expected {n_cols}",
+                cells.len()
+            )));
+        }
+        for (col_idx, cell) in cells.iter().enumerate() {
+            flat.push(competing_risks_number(
+                cell,
+                &format!("{key}[{row_idx}][{col_idx}]"),
+            )?);
+        }
+    }
+    Array2::from_shape_vec((rows.len(), n_cols), flat)
+        .map_err(|err| py_value_error(format!("failed to reshape {key}: {err}")))
+}
+
+fn competing_risks_stacked_matrix3(
+    value: &serde_json::Value,
+    key: &str,
+) -> PyResult<Array2<f64>> {
+    let matrices = value
+        .as_array()
+        .ok_or_else(|| py_value_error(format!("{key} must be a JSON array")))?;
+    if matrices.is_empty() {
+        return Ok(Array2::<f64>::zeros((0, 1)));
+    }
+    let mut n_cols = None;
+    let mut n_rows = 0usize;
+    let mut flat = Vec::new();
+    for (matrix_idx, matrix_value) in matrices.iter().enumerate() {
+        let matrix_key = format!("{key}[{matrix_idx}]");
+        let matrix = competing_risks_matrix2(matrix_value, &matrix_key)?;
+        match n_cols {
+            Some(expected) if matrix.ncols() != expected => {
+                return Err(py_value_error(format!(
+                    "{matrix_key} has {} columns, expected {expected}",
+                    matrix.ncols()
+                )));
+            }
+            Some(_) => {}
+            None => {
+                n_cols = Some(matrix.ncols());
+            }
+        }
+        n_rows += matrix.nrows();
+        flat.extend(matrix.iter().copied());
+    }
+    let cols = n_cols.unwrap_or(1);
+    Array2::from_shape_vec((n_rows, cols), flat)
+        .map_err(|err| py_value_error(format!("failed to reshape {key}: {err}")))
+}
+
+fn competing_risks_array_depth(value: &serde_json::Value, key: &str) -> PyResult<usize> {
+    match value {
+        serde_json::Value::Array(items) => {
+            if items.is_empty() {
+                return Ok(1);
+            }
+            let first_depth = competing_risks_array_depth(&items[0], &format!("{key}[0]"))?;
+            for (idx, item) in items.iter().enumerate().skip(1) {
+                let depth = competing_risks_array_depth(item, &format!("{key}[{idx}]"))?;
+                if depth != first_depth {
+                    return Err(py_value_error(format!(
+                        "{key} has inconsistent array depth at index {idx}: got {depth}, expected {first_depth}"
+                    )));
+                }
+            }
+            Ok(first_depth + 1)
+        }
+        serde_json::Value::Number(_) => Ok(0),
+        _ => Err(py_value_error(format!("{key} must contain only numeric arrays"))),
+    }
+}
+
+fn competing_risks_number(value: &serde_json::Value, key: &str) -> PyResult<f64> {
+    let number = value
+        .as_f64()
+        .ok_or_else(|| py_value_error(format!("{key} must be a finite number")))?;
+    if !number.is_finite() {
+        return Err(py_value_error(format!("{key} must be finite")));
+    }
+    Ok(number)
 }
 
 #[pyfunction]
@@ -13010,6 +13337,276 @@ fn equivariant_gauge_companion_loss<'py>(
     })
 }
 
+#[pyclass(module = "gam_pyffi._rust", name = "EuclideanManifold")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct EuclideanManifold {
+    #[pyo3(get, set)]
+    dim: i64,
+}
+
+#[pymethods]
+impl EuclideanManifold {
+    #[new]
+    fn new(dim: i64) -> Self {
+        Self { dim }
+    }
+
+    fn __repr__(&self) -> String {
+        format!("EuclideanManifold(dim={})", self.dim)
+    }
+
+    fn __eq__(&self, other: &Self) -> bool {
+        self == other
+    }
+
+    fn to_json(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let out = PyDict::new(py);
+        out.set_item("kind", "euclidean")?;
+        out.set_item("dim", self.dim)?;
+        Ok(out.into_any().unbind())
+    }
+}
+
+#[pyclass(module = "gam_pyffi._rust", name = "CircleManifold")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CircleManifold {}
+
+#[pymethods]
+impl CircleManifold {
+    #[new]
+    fn new() -> Self {
+        Self {}
+    }
+
+    fn __repr__(&self) -> String {
+        "CircleManifold()".to_owned()
+    }
+
+    fn __eq__(&self, other: &Self) -> bool {
+        self == other
+    }
+
+    fn to_json(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let out = PyDict::new(py);
+        out.set_item("kind", "circle")?;
+        Ok(out.into_any().unbind())
+    }
+}
+
+#[pyclass(module = "gam_pyffi._rust", name = "SphereManifold")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SphereManifold {
+    #[pyo3(get, set)]
+    intrinsic_dim: i64,
+}
+
+#[pymethods]
+impl SphereManifold {
+    #[new]
+    fn new(intrinsic_dim: i64) -> Self {
+        Self { intrinsic_dim }
+    }
+
+    fn __repr__(&self) -> String {
+        format!("SphereManifold(intrinsic_dim={})", self.intrinsic_dim)
+    }
+
+    fn __eq__(&self, other: &Self) -> bool {
+        self == other
+    }
+
+    fn to_json(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let out = PyDict::new(py);
+        out.set_item("kind", "sphere")?;
+        out.set_item("intrinsic_dim", self.intrinsic_dim)?;
+        Ok(out.into_any().unbind())
+    }
+}
+
+#[pyclass(module = "gam_pyffi._rust", name = "TorusManifold")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TorusManifold {
+    #[pyo3(get, set)]
+    dim: i64,
+}
+
+#[pymethods]
+impl TorusManifold {
+    #[new]
+    fn new(dim: i64) -> Self {
+        Self { dim }
+    }
+
+    fn __repr__(&self) -> String {
+        format!("TorusManifold(dim={})", self.dim)
+    }
+
+    fn __eq__(&self, other: &Self) -> bool {
+        self == other
+    }
+
+    fn to_json(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let out = PyDict::new(py);
+        out.set_item("kind", "torus")?;
+        out.set_item("dim", self.dim)?;
+        Ok(out.into_any().unbind())
+    }
+}
+
+#[pyclass(module = "gam_pyffi._rust", name = "GrassmannManifold")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GrassmannManifold {
+    #[pyo3(get, set)]
+    k: i64,
+    #[pyo3(get, set)]
+    n: i64,
+}
+
+#[pymethods]
+impl GrassmannManifold {
+    #[new]
+    fn new(k: i64, n: i64) -> Self {
+        Self { k, n }
+    }
+
+    fn __repr__(&self) -> String {
+        format!("GrassmannManifold(k={}, n={})", self.k, self.n)
+    }
+
+    fn __eq__(&self, other: &Self) -> bool {
+        self == other
+    }
+
+    fn to_json(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let out = PyDict::new(py);
+        out.set_item("kind", "grassmann")?;
+        out.set_item("k", self.k)?;
+        out.set_item("n", self.n)?;
+        Ok(out.into_any().unbind())
+    }
+}
+
+#[pyclass(module = "gam_pyffi._rust", name = "StiefelManifold")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StiefelManifold {
+    #[pyo3(get, set)]
+    k: i64,
+    #[pyo3(get, set)]
+    n: i64,
+}
+
+#[pymethods]
+impl StiefelManifold {
+    #[new]
+    fn new(k: i64, n: i64) -> Self {
+        Self { k, n }
+    }
+
+    fn __repr__(&self) -> String {
+        format!("StiefelManifold(k={}, n={})", self.k, self.n)
+    }
+
+    fn __eq__(&self, other: &Self) -> bool {
+        self == other
+    }
+
+    fn to_json(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let out = PyDict::new(py);
+        out.set_item("kind", "stiefel")?;
+        out.set_item("k", self.k)?;
+        out.set_item("n", self.n)?;
+        Ok(out.into_any().unbind())
+    }
+}
+
+#[pyclass(module = "gam_pyffi._rust", name = "SpdManifold")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SpdManifold {
+    #[pyo3(get, set)]
+    n: i64,
+}
+
+#[pymethods]
+impl SpdManifold {
+    #[new]
+    fn new(n: i64) -> Self {
+        Self { n }
+    }
+
+    fn __repr__(&self) -> String {
+        format!("SpdManifold(n={})", self.n)
+    }
+
+    fn __eq__(&self, other: &Self) -> bool {
+        self == other
+    }
+
+    fn to_json(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let out = PyDict::new(py);
+        out.set_item("kind", "spd")?;
+        out.set_item("n", self.n)?;
+        Ok(out.into_any().unbind())
+    }
+}
+
+#[pyclass(module = "gam_pyffi._rust", name = "ProductManifold")]
+struct ProductManifold {
+    #[pyo3(get, set)]
+    parts: Vec<PyObject>,
+}
+
+#[pymethods]
+impl ProductManifold {
+    #[new]
+    #[pyo3(signature = (*parts))]
+    fn new(_py: Python<'_>, parts: &Bound<'_, PyTuple>) -> Self {
+        Self {
+            parts: parts.iter().map(|part| part.clone().unbind()).collect(),
+        }
+    }
+
+    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        let mut reprs = Vec::with_capacity(self.parts.len());
+        for part in &self.parts {
+            reprs.push(part.bind(py).repr()?.to_str()?.to_owned());
+        }
+        let tuple_repr = match reprs.as_slice() {
+            [] => "()".to_owned(),
+            [only] => format!("({},)", only),
+            many => format!("({})", many.join(", ")),
+        };
+        Ok(format!("ProductManifold(parts={})", tuple_repr))
+    }
+
+    fn __eq__(&self, other: &Self, py: Python<'_>) -> PyResult<bool> {
+        if self.parts.len() != other.parts.len() {
+            return Ok(false);
+        }
+        for (left, right) in self.parts.iter().zip(other.parts.iter()) {
+            if !left.bind(py).eq(right.bind(py))? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn to_json(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let out = PyDict::new(py);
+        let parts = PyList::empty(py);
+        for part in &self.parts {
+            let part_bound = part.bind(py);
+            if part_bound.hasattr("to_json")? {
+                parts.append(part_bound.getattr("to_json")?.call0()?)?;
+            } else {
+                parts.append(part_bound)?;
+            }
+        }
+        out.set_item("kind", "product")?;
+        out.set_item("parts", parts)?;
+        Ok(out.into_any().unbind())
+    }
+}
+
 #[pyclass(module = "gam_pyffi._rust", name = "SparsityPenalty")]
 struct SparsityPenalty {
     #[pyo3(get, set)]
@@ -13302,6 +13899,169 @@ fn topk_weight_schedule_descriptor(
     ))
 }
 
+fn aux_conditional_prior_float_array<'py>(
+    py: Python<'py>,
+    value: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let numpy = py.import("numpy")?;
+    let kwargs = PyDict::new(py);
+    kwargs.set_item("dtype", "float")?;
+    numpy.call_method("asarray", (value,), Some(&kwargs))
+}
+
+fn validate_aux_conditional_prior_lambda(
+    lambda_per_row: &Bound<'_, PyAny>,
+    weight: f64,
+    n_eff: i64,
+) -> PyResult<()> {
+    if weight <= 0.0 {
+        return Err(PyValueError::new_err(format!(
+            "AuxConditionalPriorPenalty.weight must be > 0, got {weight}"
+        )));
+    }
+    if n_eff <= 0 {
+        return Err(PyValueError::new_err(format!(
+            "AuxConditionalPriorPenalty.n_eff must be > 0, got {n_eff}"
+        )));
+    }
+
+    let array = lambda_per_row.extract::<PyReadonlyArrayDyn<'_, f64>>()?;
+    let view = array.as_array();
+    let shape = view.shape();
+    if view.ndim() != 3 {
+        return Err(PyValueError::new_err(format!(
+            "AuxConditionalPriorPenalty.lambda_per_row must have shape (N, d, d), got ndim={}",
+            view.ndim()
+        )));
+    }
+
+    let n_obs = shape[0];
+    let rows = shape[1];
+    let cols = shape[2];
+    if n_obs as i64 != n_eff {
+        return Err(PyValueError::new_err(format!(
+            "AuxConditionalPriorPenalty.lambda_per_row first dimension must equal n_eff={n_eff}, got {n_obs}"
+        )));
+    }
+    if rows == 0 || cols == 0 || rows != cols {
+        return Err(PyValueError::new_err(format!(
+            "AuxConditionalPriorPenalty.lambda_per_row must have square non-empty row matrices, got shape ({n_obs}, {rows}, {cols})"
+        )));
+    }
+    if !view.iter().all(|value| value.is_finite()) {
+        return Err(PyValueError::new_err(
+            "AuxConditionalPriorPenalty.lambda_per_row must be finite",
+        ));
+    }
+
+    let mut max_asym = 0.0_f64;
+    for obs in 0..n_obs {
+        for row in 0..rows {
+            for col in 0..cols {
+                let asym = (view[IxDyn(&[obs, row, col])] - view[IxDyn(&[obs, col, row])]).abs();
+                if asym > max_asym {
+                    max_asym = asym;
+                }
+            }
+        }
+    }
+    if max_asym >= 1.0e-10 {
+        return Err(PyValueError::new_err(format!(
+            "AuxConditionalPriorPenalty.lambda_per_row matrices must be symmetric within 1e-10; max asymmetry is {max_asym:.3e}"
+        )));
+    }
+    Ok(())
+}
+
+#[pyclass(module = "gam_pyffi._rust", name = "AuxConditionalPriorPenalty")]
+struct AuxConditionalPriorPenalty {
+    #[pyo3(get, set)]
+    target: PyObject,
+    #[pyo3(get, set)]
+    lambda_per_row: PyObject,
+    #[pyo3(get, set)]
+    weight: f64,
+    #[pyo3(get, set)]
+    n_eff: i64,
+    #[pyo3(get, set)]
+    learnable: bool,
+    #[pyo3(get, set)]
+    weight_schedule: Option<PyObject>,
+}
+
+#[pymethods]
+impl AuxConditionalPriorPenalty {
+    #[new]
+    #[pyo3(signature = (lambda_per_row, weight, n_eff, learnable = false, *, target = "t"))]
+    fn new(
+        py: Python<'_>,
+        lambda_per_row: &Bound<'_, PyAny>,
+        weight: f64,
+        n_eff: i64,
+        learnable: bool,
+        target: PyObject,
+    ) -> PyResult<Self> {
+        let lambda_per_row = aux_conditional_prior_float_array(py, lambda_per_row)?;
+        validate_aux_conditional_prior_lambda(&lambda_per_row, weight, n_eff)?;
+        Ok(Self {
+            target,
+            lambda_per_row: lambda_per_row.unbind(),
+            weight,
+            n_eff,
+            learnable,
+            weight_schedule: None,
+        })
+    }
+
+    #[classattr]
+    const KIND_TAG: &'static str = "aux_conditional_prior";
+
+    fn to_rust_descriptor(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let payload = PyDict::new(py);
+        payload.set_item("kind", Self::KIND_TAG)?;
+        payload.set_item("target", target_descriptor(py, self.target.bind(py))?)?;
+
+        let array = self
+            .lambda_per_row
+            .bind(py)
+            .extract::<PyReadonlyArrayDyn<'_, f64>>()?;
+        let view = array.as_array();
+        let flattened = view.iter().copied().collect::<Vec<_>>();
+        payload.set_item("lambda_per_row", PyList::new(py, flattened)?)?;
+        payload.set_item("lambda_per_row_shape", PyList::new(py, view.shape())?)?;
+        payload.set_item("weight", self.weight)?;
+        payload.set_item("n_eff", self.n_eff)?;
+        payload.set_item("learnable", self.learnable)?;
+        if let Some(schedule) = topk_weight_schedule_descriptor(py, &self.weight_schedule)? {
+            payload.set_item("weight_schedule", schedule)?;
+        }
+        Ok(payload.into())
+    }
+
+    fn set_weight_schedule<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        schedule: PyObject,
+    ) -> PyRefMut<'py, Self> {
+        slf.weight_schedule = Some(schedule);
+        slf
+    }
+
+    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        Ok(format!(
+            "AuxConditionalPriorPenalty(lambda_per_row={}, weight={}, n_eff={}, learnable={}, target={}, weight_schedule={})",
+            py_repr(py, self.lambda_per_row.bind(py))?,
+            self.weight,
+            self.n_eff,
+            self.learnable,
+            py_repr(py, self.target.bind(py))?,
+            match &self.weight_schedule {
+                Some(schedule) => py_repr(py, schedule.bind(py))?,
+                None => "None".to_string(),
+            }
+        ))
+    }
+}
+
 #[pymodule(name = "_rust", gil_used = false)]
 fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     gam::init_parallelism();
@@ -13311,6 +14071,14 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     gam::visualizer::init_logging();
     module.add("__doc__", "PyO3 boundary for the gam Rust engine.")?;
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
+    module.add_class::<EuclideanManifold>()?;
+    module.add_class::<CircleManifold>()?;
+    module.add_class::<SphereManifold>()?;
+    module.add_class::<TorusManifold>()?;
+    module.add_class::<GrassmannManifold>()?;
+    module.add_class::<StiefelManifold>()?;
+    module.add_class::<SpdManifold>()?;
+    module.add_class::<ProductManifold>()?;
     module.add_function(wrap_pyfunction!(classify_exception_message, module)?)?;
     module.add_function(wrap_pyfunction!(sklearn_fit_metadata, module)?)?;
     module.add_function(wrap_pyfunction!(build_info, module)?)?;
@@ -13355,6 +14123,10 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(predict_table, module)?)?;
     module.add_function(wrap_pyfunction!(predict_array, module)?)?;
     module.add_function(wrap_pyfunction!(competing_risks_cif, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        competing_risks_prediction_payload_from_json,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(
         competing_risks_cif_from_predictions,
         module
@@ -13473,6 +14245,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(coefficient_state_json, module)?)?;
     module.add_function(wrap_pyfunction!(term_blocks_for_model, module)?)?;
     module.add_function(wrap_pyfunction!(difference_smooth_json, module)?)?;
+    module.add_function(wrap_pyfunction!(difference_smooth_rows, module)?)?;
     module.add_function(wrap_pyfunction!(
         cross_fit_shared_precision_groups_json,
         module
@@ -13512,6 +14285,8 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(conditional_prior_ivae, module)?)?;
     module.add_class::<SparsityPenalty>()?;
     module.add_class::<PyTopKActivationPenalty>()?;
+    module.add_class::<ARDPenalty>()?;
+    module.add_class::<AuxConditionalPriorPenalty>()?;
     Ok(())
 }
 
@@ -17195,7 +17970,7 @@ fn build_analytic_penalty_registry_from_json(
                 )?;
                 let k_atoms = descriptor_usize(descriptor, "k_atoms", target.d)?;
                 let temperature = descriptor_f64(descriptor, "temperature", 1.0)?;
-                let penalty = SoftmaxAssignmentSparsityPenalty::new(k_atoms, temperature);
+                let penalty = CoreSoftmaxAssignmentSparsityPenalty::new(k_atoms, temperature);
                 let penalty = match weight_schedule {
                     Some(schedule) => penalty.with_weight_schedule(schedule),
                     None => penalty,
@@ -17228,7 +18003,7 @@ fn build_analytic_penalty_registry_from_json(
                     .get("learnable")
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false);
-                let penalty = TotalVariationPenalty::new(
+                let penalty = CoreTotalVariationPenalty::new(
                     weight,
                     n_eff,
                     difference_op,
