@@ -1,10 +1,10 @@
 use gam::terms::basis::{
-    bspline_tensor_first_derivative, build_bspline_basis, build_matern_basis,
-    build_matern_basis_log_kappa_derivative, periodic_bspline_first_derivative_nd,
-    sphere_first_derivative_nd, BsplineBasisSpec, CenterStrategy, MaternBasisSpec,
-    MaternIdentifiability, MaternNu,
+    bspline_tensor_first_derivative, build_matern_basis,
+    build_matern_basis_log_kappa_derivative, build_periodic_bspline_basis_1d,
+    periodic_bspline_first_derivative_nd, sphere_first_derivative_nd, CenterStrategy,
+    MaternBasisSpec, MaternIdentifiability, MaternNu, PeriodicBSplineBasisSpec,
 };
-use ndarray::{array, Array1, Array2};
+use ndarray::{array, Array1};
 
 #[test]
 fn periodic_radial_input_loc_grad_1d_is_continuous_at_period_boundary() {
