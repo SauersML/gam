@@ -745,6 +745,7 @@ fn interpolate_survival_surface<'py>(
 }
 
 #[pyfunction]
+#[pyo3(signature = (grid, surface, query, clip_lo, clip_hi, left_value = None, right_value = None))]
 fn interpolate_rows<'py>(
     py: Python<'py>,
     grid: PyReadonlyArray1<'py, f64>,
@@ -752,6 +753,8 @@ fn interpolate_rows<'py>(
     query: PyReadonlyArray1<'py, f64>,
     clip_lo: Option<f64>,
     clip_hi: Option<f64>,
+    left_value: Option<f64>,
+    right_value: Option<f64>,
 ) -> PyResult<Bound<'py, PyArray2<f64>>> {
     let grid_view = grid.as_array();
     let surface_view = surface.as_array();
@@ -788,9 +791,28 @@ fn interpolate_rows<'py>(
                 let mut interpolated = if query_value.is_nan() {
                     f64::NAN
                 } else if query_value <= sorted_grid[0] {
-                    surface_row[sorted_indices[0]]
+                    // Below-grid extrapolation: callers (e.g. survival surfaces)
+                    // can supply an explicit asymptotic `left_value` so that
+                    // extrapolating before the modeled support returns the
+                    // theoretically correct boundary (S(t)=1 for t<=0). The
+                    // exact-equality case still uses the grid value to remain
+                    // continuous at the boundary; only strict left extrapolation
+                    // honors the override.
+                    if query_value < sorted_grid[0] {
+                        left_value.unwrap_or(surface_row[sorted_indices[0]])
+                    } else {
+                        surface_row[sorted_indices[0]]
+                    }
                 } else if query_value >= sorted_grid[n_grid - 1] {
-                    surface_row[sorted_indices[n_grid - 1]]
+                    // Above-grid extrapolation: same idea, with `right_value`
+                    // expressing the asymptote (S(inf)=0 for survival). Use
+                    // strict inequality so the grid endpoint itself remains
+                    // continuous.
+                    if query_value > sorted_grid[n_grid - 1] {
+                        right_value.unwrap_or(surface_row[sorted_indices[n_grid - 1]])
+                    } else {
+                        surface_row[sorted_indices[n_grid - 1]]
+                    }
                 } else {
                     let upper =
                         sorted_grid.partition_point(|grid_value| *grid_value <= query_value);

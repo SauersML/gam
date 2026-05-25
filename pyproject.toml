@@ -104,7 +104,7 @@ module-name = "gamfit._rust"
 # make ``tests/torch/`` discoverable as a top-level package named ``torch``,
 # which silently shadows the real PyTorch library and breaks every test
 # that does ``pytest.importorskip("torch")``.
-importmode = "importlib"
+addopts = "--import-mode=importlib"
 testpaths = ["tests"]
 
 [tool.mypy]
