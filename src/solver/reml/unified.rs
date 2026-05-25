@@ -7726,11 +7726,11 @@ pub fn reml_laml_evaluate(
                 solution,
                 hop,
                 &lambdas,
-            &rho_penalty_a_k_betas,
-            r,
-            mode == EvalMode::ValueGradientHessian,
-            &upper_active_rho,
-        )?)
+                &rho_penalty_a_k_betas,
+                r,
+                mode == EvalMode::ValueGradientHessian,
+                &upper_active_rho,
+            )?)
         } else {
             None
         };
@@ -17788,11 +17788,13 @@ mod tests {
         let hessian = corrections.hessian.expect("hessian requested");
         for idx in 0..2 {
             assert_eq!(
-                hessian[[1, idx]], 0.0,
+                hessian[[1, idx]],
+                0.0,
                 "upper-bound rho row must be zeroed in IFT residual Hessian correction"
             );
             assert_eq!(
-                hessian[[idx, 1]], 0.0,
+                hessian[[idx, 1]],
+                0.0,
                 "upper-bound rho column must be zeroed in IFT residual Hessian correction"
             );
         }

@@ -12108,7 +12108,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                             &joint_hessian_source,
                             &ranges,
                             &s_lambdas,
-                            trace_diagonal_ridge,
+                            joint_solver_diagonal_ridge,
                             &rhs,
                         ) {
                             Ok(descent_delta) => {

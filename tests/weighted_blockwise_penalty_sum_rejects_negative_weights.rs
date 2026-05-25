@@ -1,4 +1,4 @@
-use gam::terms::smooth::{weighted_blockwise_penalty_sum, BlockwisePenalty};
+use gam::terms::smooth::{BlockwisePenalty, weighted_blockwise_penalty_sum};
 use ndarray::array;
 
 #[test]

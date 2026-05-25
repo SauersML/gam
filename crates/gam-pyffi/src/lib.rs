@@ -3744,7 +3744,10 @@ fn compare_reml_fits(
         table_row.set_item("name", row.name.as_str())?;
         table_row.set_item("reml_score", row.reml_score)?;
         table_row.set_item("delta_reml", row.delta_reml)?;
-        table_row.set_item("bayes_factor_vs_best", row.bayes_factor_vs_best)?;
+        table_row.set_item(
+            "bayes_factor_best_over_model",
+            row.bayes_factor_best_over_model,
+        )?;
         table_row.set_item("effective_dof", row.effective_dof)?;
         score_table.append(table_row)?;
     }
