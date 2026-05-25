@@ -94,7 +94,7 @@ fn next_gauss(state: &mut u64) -> f64 {
 }
 
 fn next_gamma_alpha_ge_one(state: &mut u64, alpha: f64, scale: f64) -> f64 {
-    debug_assert!(alpha >= 1.0);
+    assert!(alpha >= 1.0);
     let d = alpha - 1.0 / 3.0;
     let c = (1.0 / (9.0 * d)).sqrt();
     loop {
