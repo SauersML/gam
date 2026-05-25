@@ -1,13 +1,5 @@
 #!/usr/bin/env python3
-"""
-Standalone figure generator for benchmark results.
-
-Usage:
-    python3 bench/generate_figures.py bench/results.nightly.json bench/figures bench/figures.zip
-
-Reads a merged results JSON, generates one PNG per scenario, and bundles
-them into a single .zip for easy download from GitHub Actions.
-"""
+"""Generate benchmark result figures and zip them for GitHub Actions artifacts."""
 from __future__ import annotations
 
 import json
@@ -20,25 +12,22 @@ from typing import Any
 
 
 def _metric_display_config(family: str) -> list[tuple[str, str, bool]]:
+    binary_metrics = [
+        ("auc", "AUC", True),
+        ("logloss", "Log-Loss", False),
+        ("brier", "Brier Score", False),
+        ("nagelkerke_r2", "Nagelkerke R²", True),
+    ]
     if family == "binomial":
-        return [
-            ("auc", "AUC", True),
-            ("logloss", "Log-Loss", False),
-            ("brier", "Brier Score", False),
-            ("nagelkerke_r2", "Nagelkerke R²", True),
-        ]
+        return binary_metrics
     if family == "survival":
         return [
-            ("auc", "C-Index", True),
-            ("logloss", "Partial Log-Loss", False),
-            ("brier", "Partial Brier", False),
-            ("nagelkerke_r2", "Nagelkerke R²", True),
+            ("auc", "C-Index", True), ("logloss", "Partial Log-Loss", False),
+            ("brier", "Partial Brier", False), ("nagelkerke_r2", "Nagelkerke R²", True),
         ]
     return [
-        ("rmse", "RMSE", False),
-        ("r2", "R²", True),
-        ("logloss", "Gaussian Log-Loss", False),
-        ("mae", "MAE", False),
+        ("rmse", "RMSE", False), ("r2", "R²", True),
+        ("logloss", "Gaussian Log-Loss", False), ("mae", "MAE", False),
     ]
 
 
@@ -57,22 +46,10 @@ BG_CARD = "#161b22"
 TEXT_COLOR = "#c9d1d9"
 GRID_COLOR = "#21262d"
 ACCENT_COLORS = [
-    "#58a6ff",
-    "#3fb950",
-    "#d29922",
-    "#f85149",
-    "#bc8cff",
-    "#79c0ff",
-    "#56d364",
-    "#e3b341",
-    "#ff7b72",
-    "#d2a8ff",
-    "#a5d6ff",
-    "#7ee787",
-    "#f2cc60",
-    "#ffa198",
-    "#cabffd",
-    "#b1bac4",
+    "#58a6ff", "#3fb950", "#d29922", "#f85149",
+    "#bc8cff", "#79c0ff", "#56d364", "#e3b341",
+    "#ff7b72", "#d2a8ff", "#a5d6ff", "#7ee787",
+    "#f2cc60", "#ffa198", "#cabffd", "#b1bac4",
 ]
 
 
@@ -105,19 +82,6 @@ def _style_axis(ax: Any) -> None:
     ax.xaxis.label.set_color(TEXT_COLOR)
     ax.yaxis.label.set_color(TEXT_COLOR)
     ax.title.set_color(TEXT_COLOR)
-
-
-def _label_bar(ax: Any, bar: Any, text: str, *, fontsize: float) -> None:
-    ax.text(
-        bar.get_width() + ax.get_xlim()[1] * 0.01,
-        bar.get_y() + bar.get_height() / 2,
-        text,
-        va="center",
-        ha="left",
-        fontsize=fontsize,
-        color=TEXT_COLOR,
-        alpha=0.85,
-    )
 
 
 def generate_scenario_figures(results: list[dict[str, Any]], out_dir: Path) -> list[Path]:
@@ -154,8 +118,7 @@ def generate_scenario_figures(results: list[dict[str, Any]], out_dir: Path) -> l
 
         fig_height = max(3.2, 1.2 + 0.42 * n_contenders) * (n_metrics + 1)
         fig, axes = plt.subplots(
-            n_metrics + 1,
-            1,
+            n_metrics + 1, 1,
             figsize=(10, min(fig_height, 28)),
             facecolor=BG_DARK,
             gridspec_kw={"hspace": 0.45},
@@ -195,28 +158,23 @@ def generate_scenario_figures(results: list[dict[str, Any]], out_dir: Path) -> l
 
             for bar, value in zip(bars, metric_values):
                 if value is not None:
-                    _label_bar(ax, bar, _format_value(value), fontsize=7.5)
+                    ax.text(
+                        bar.get_width() + ax.get_xlim()[1] * 0.01,
+                        bar.get_y() + bar.get_height() / 2,
+                        _format_value(value), va="center", ha="left",
+                        fontsize=7.5, color=TEXT_COLOR, alpha=0.85,
+                    )
 
         ax_time = axes[-1]
         fit_times = [_finite_float(row.get("fit_sec")) or 0.0 for row in rows]
         predict_times = [_finite_float(row.get("predict_sec")) or 0.0 for row in rows]
         bars_fit = ax_time.barh(
-            y_pos,
-            fit_times,
-            height=0.42,
-            label="Fit",
-            color="#58a6ff",
-            alpha=0.8,
-            zorder=3,
+            y_pos, fit_times, height=0.42, label="Fit",
+            color="#58a6ff", alpha=0.8, zorder=3,
         )
         bars_predict = ax_time.barh(
-            [y + 0.42 for y in y_pos],
-            predict_times,
-            height=0.42,
-            label="Predict",
-            color="#3fb950",
-            alpha=0.8,
-            zorder=3,
+            [y + 0.42 for y in y_pos], predict_times, height=0.42,
+            label="Predict", color="#3fb950", alpha=0.8, zorder=3,
         )
         ax_time.set_yticks([y + 0.21 for y in y_pos])
         ax_time.set_yticklabels(short_labels, fontsize=8.5)
@@ -224,44 +182,40 @@ def generate_scenario_figures(results: list[dict[str, Any]], out_dir: Path) -> l
         ax_time.set_title("Fit + Predict Time  (↓ lower is better)", fontsize=10, loc="left", pad=8)
         ax_time.grid(axis="x", color=GRID_COLOR, linewidth=0.5, zorder=0)
         ax_time.legend(
-            loc="lower right",
-            fontsize=8,
-            facecolor=BG_CARD,
-            edgecolor=GRID_COLOR,
-            labelcolor=TEXT_COLOR,
+            loc="lower right", fontsize=8,
+            facecolor=BG_CARD, edgecolor=GRID_COLOR, labelcolor=TEXT_COLOR,
         )
         for bar, value in zip(bars_fit, fit_times):
             if value > 0.0:
-                _label_bar(ax_time, bar, f"{value:.2f}s", fontsize=7)
+                ax_time.text(
+                    bar.get_width() + ax_time.get_xlim()[1] * 0.01,
+                    bar.get_y() + bar.get_height() / 2,
+                    f"{value:.2f}s", va="center", ha="left",
+                    fontsize=7, color=TEXT_COLOR, alpha=0.85,
+                )
         for bar, value in zip(bars_predict, predict_times):
             if value > 0.0:
-                _label_bar(ax_time, bar, f"{value:.2f}s", fontsize=7)
+                ax_time.text(
+                    bar.get_width() + ax_time.get_xlim()[1] * 0.01,
+                    bar.get_y() + bar.get_height() / 2,
+                    f"{value:.2f}s", va="center", ha="left",
+                    fontsize=7, color=TEXT_COLOR, alpha=0.85,
+                )
 
         fig.suptitle(
             f"Benchmark: {scenario_name}",
-            fontsize=14,
-            fontweight="bold",
-            color="#f0f6fc",
-            y=0.995,
+            fontsize=14, fontweight="bold", color="#f0f6fc", y=0.995,
         )
         fig.text(
-            0.5,
-            0.002,
+            0.5, 0.002,
             f"family={family}  •  {evaluation}  •  {n_contenders} contenders",
-            ha="center",
-            fontsize=8,
-            color=TEXT_COLOR,
-            alpha=0.6,
+            ha="center", fontsize=8, color=TEXT_COLOR, alpha=0.6,
         )
 
         out_path = out_dir / f"{scenario_name}.png"
         fig.savefig(
-            out_path,
-            dpi=180,
-            facecolor=BG_DARK,
-            edgecolor="none",
-            bbox_inches="tight",
-            pad_inches=0.4,
+            out_path, dpi=180, facecolor=BG_DARK, edgecolor="none",
+            bbox_inches="tight", pad_inches=0.4,
         )
         plt.close(fig)
         paths.append(out_path)
