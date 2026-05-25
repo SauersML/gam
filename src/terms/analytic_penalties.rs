@@ -3124,6 +3124,230 @@ impl AnalyticPenalty for TotalVariationPenalty {
 }
 
 // ---------------------------------------------------------------------------
+// Monotonicity penalty (1D shape constraint)
+// ---------------------------------------------------------------------------
+
+/// Soft monotonicity penalty over a row-major `(n_eff, d)` latent block.
+///
+/// For each adjacent pair `(a, a+1)` along the leading axis and each output
+/// column `j`, the penalty contribution is
+///
+///     softplus(-direction * (target[a+1, j] - target[a, j]) / smoothing_eps)
+///     * smoothing_eps
+///
+/// which is the smoothed hinge that hits zero when the slope agrees with
+/// `direction` (+1 ⇒ non-decreasing, -1 ⇒ non-increasing) and grows
+/// approximately linearly when it disagrees. The Hessian is positive
+/// semidefinite (softplus is convex) so the penalty composes cleanly with
+/// PIRLS/REML.
+///
+/// `n_eff` is the number of latent rows along the constrained axis; the
+/// remaining `target.len() / n_eff` columns are penalized independently and
+/// summed.
+#[derive(Debug, Clone)]
+pub struct MonotonicityPenalty {
+    pub weight: f64,
+    pub n_eff: usize,
+    /// `+1.0` for non-decreasing, `-1.0` for non-increasing along the leading axis.
+    pub direction: f64,
+    pub smoothing_eps: f64,
+    pub learnable_weight: bool,
+    pub rho_index: usize,
+    pub weight_schedule: Option<ScalarWeightSchedule>,
+}
+
+impl MonotonicityPenalty {
+    #[must_use = "build error must be handled"]
+    pub fn new(
+        weight: f64,
+        n_eff: usize,
+        direction: f64,
+        smoothing_eps: f64,
+        learnable_weight: bool,
+    ) -> Result<Self, String> {
+        if !(weight.is_finite() && weight > 0.0) {
+            return Err(format!(
+                "MonotonicityPenalty::new requires finite weight > 0, got {weight}"
+            ));
+        }
+        if n_eff == 0 {
+            return Err("MonotonicityPenalty::new requires n_eff > 0".to_string());
+        }
+        if !(direction.is_finite() && direction.abs() > 0.0) {
+            return Err(format!(
+                "MonotonicityPenalty::new requires finite non-zero direction (+1 or -1), got {direction}"
+            ));
+        }
+        if !(smoothing_eps.is_finite() && smoothing_eps > 0.0) {
+            return Err(format!(
+                "MonotonicityPenalty::new requires finite smoothing_eps > 0, got {smoothing_eps}"
+            ));
+        }
+        Ok(Self {
+            weight,
+            n_eff,
+            direction: direction.signum(),
+            smoothing_eps,
+            learnable_weight,
+            rho_index: 0,
+            weight_schedule: None,
+        })
+    }
+
+    #[must_use]
+    pub fn with_weight_schedule(mut self, schedule: ScalarWeightSchedule) -> Self {
+        self.weight = schedule.current_weight(schedule.iter_count);
+        self.weight_schedule = Some(schedule);
+        self
+    }
+
+    fn resolved_weight(&self, rho: ArrayView1<'_, f64>) -> f64 {
+        if self.learnable_weight {
+            self.weight * rho[self.rho_index].exp()
+        } else {
+            self.weight
+        }
+    }
+
+    fn latent_dim(&self, target_len: usize) -> Option<usize> {
+        if self.n_eff == 0 || !target_len.is_multiple_of(self.n_eff) {
+            return None;
+        }
+        Some(target_len / self.n_eff)
+    }
+
+    /// Smoothed-hinge contribution for a single edge `(a, b)` and column `j`.
+    fn edge_value(&self, target: ArrayView1<'_, f64>, d: usize, a: usize, b: usize) -> f64 {
+        let eps = self.smoothing_eps;
+        let mut acc = 0.0;
+        for j in 0..d {
+            let slope = target[b * d + j] - target[a * d + j];
+            let z = -self.direction * slope / eps;
+            // softplus(z) * eps, computed in a numerically stable form.
+            let sp = if z > 0.0 { z + (-z).exp().ln_1p() } else { z.exp().ln_1p() };
+            acc += sp * eps;
+        }
+        acc
+    }
+
+    /// d softplus(-dir * slope / eps) * eps / d target = -dir * sigma(-dir*slope/eps).
+    fn edge_grad(
+        &self,
+        target: ArrayView1<'_, f64>,
+        out: &mut Array1<f64>,
+        d: usize,
+        a: usize,
+        b: usize,
+        weight: f64,
+    ) {
+        let eps = self.smoothing_eps;
+        for j in 0..d {
+            let slope = target[b * d + j] - target[a * d + j];
+            let z = -self.direction * slope / eps;
+            // Stable sigmoid(z).
+            let sigma = if z > 0.0 {
+                1.0 / (1.0 + (-z).exp())
+            } else {
+                let ez = z.exp();
+                ez / (1.0 + ez)
+            };
+            let g = weight * (-self.direction) * sigma;
+            out[a * d + j] -= g;
+            out[b * d + j] += g;
+        }
+    }
+}
+
+impl AnalyticPenalty for MonotonicityPenalty {
+    fn tier(&self) -> PenaltyTier {
+        PenaltyTier::Psi
+    }
+
+    fn value(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> f64 {
+        let Some(d) = self.latent_dim(target.len()) else {
+            return 0.0;
+        };
+        if self.n_eff < 2 {
+            return 0.0;
+        }
+        let weight = self.resolved_weight(rho);
+        let mut acc = 0.0;
+        for a in 0..self.n_eff.saturating_sub(1) {
+            acc += self.edge_value(target, d, a, a + 1);
+        }
+        weight * acc
+    }
+
+    fn grad_target(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> Array1<f64> {
+        let Some(d) = self.latent_dim(target.len()) else {
+            return Array1::<f64>::zeros(target.len());
+        };
+        let weight = self.resolved_weight(rho);
+        let mut out = Array1::<f64>::zeros(target.len());
+        for a in 0..self.n_eff.saturating_sub(1) {
+            self.edge_grad(target, &mut out, d, a, a + 1, weight);
+        }
+        out
+    }
+
+    fn hvp(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+        v: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        assert_eq!(target.len(), v.len(), "hvp dimension mismatch");
+        let Some(d) = self.latent_dim(target.len()) else {
+            return Array1::<f64>::zeros(target.len());
+        };
+        let weight = self.resolved_weight(rho);
+        let eps = self.smoothing_eps;
+        let mut out = Array1::<f64>::zeros(target.len());
+        for a in 0..self.n_eff.saturating_sub(1) {
+            let b = a + 1;
+            for j in 0..d {
+                let slope = target[b * d + j] - target[a * d + j];
+                let z = -self.direction * slope / eps;
+                let sigma = if z > 0.0 {
+                    1.0 / (1.0 + (-z).exp())
+                } else {
+                    let ez = z.exp();
+                    ez / (1.0 + ez)
+                };
+                // d/dz sigmoid(z) = sigma*(1-sigma); chain through z = -dir*slope/eps
+                // gives second-derivative coefficient = (1/eps) * sigma * (1-sigma).
+                let h = weight * sigma * (1.0 - sigma) / eps;
+                let dv = v[b * d + j] - v[a * d + j];
+                out[a * d + j] += h * dv * 1.0;
+                out[b * d + j] -= h * dv * 1.0;
+            }
+        }
+        out
+    }
+
+    fn grad_rho(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> Array1<f64> {
+        if !self.learnable_weight {
+            return Array1::<f64>::zeros(0);
+        }
+        let mut out = Array1::<f64>::zeros(1);
+        out[self.rho_index] = self.value(target, rho);
+        out
+    }
+
+    fn rho_count(&self) -> usize {
+        usize::from(self.learnable_weight)
+    }
+
+    fn name(&self) -> &str {
+        "monotonicity"
+    }
+
+    fn apply_schedule(&mut self, iter: usize) {
+        advance_scalar_weight(&mut self.weight, &mut self.weight_schedule, iter);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Nuclear norm penalty
 // ---------------------------------------------------------------------------
 
