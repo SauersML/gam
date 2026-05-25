@@ -1103,12 +1103,17 @@ impl SaeManifoldTerm {
         let p = self.output_dim();
         let k_atoms = self.k_atoms();
         let mut out = Array2::<f64>::zeros((n, p));
+        // Reuse a single scratch buffer across all (row, atom) pairs instead of
+        // allocating a fresh `Array1<f64>` of length p per call.
+        let mut g_buf = vec![0.0_f64; p];
         for row in 0..n {
             let a = self.assignment.try_assignments_row(row)?;
             for atom_idx in 0..k_atoms {
-                let g = self.atoms[atom_idx].decoded_row(row);
+                self.atoms[atom_idx].fill_decoded_row(row, &mut g_buf);
+                let a_k = a[atom_idx];
+                let mut out_row = out.row_mut(row);
                 for out_col in 0..p {
-                    out[[row, out_col]] += a[atom_idx] * g[out_col];
+                    out_row[out_col] += a_k * g_buf[out_col];
                 }
             }
         }
@@ -1277,14 +1282,16 @@ impl SaeManifoldTerm {
             let assignments = self.assignment.try_assignments_row(row)?;
             fitted.fill(0.0);
             for atom_idx in 0..k_atoms {
-                let decoded_row_slice = decoded
-                    .row_mut(atom_idx)
-                    .into_slice()
-                    .expect("decoded matrix is contiguous");
-                self.atoms[atom_idx].fill_decoded_row(row, decoded_row_slice);
                 let a_k = assignments[atom_idx];
-                for out_col in 0..p {
-                    fitted[out_col] += a_k * decoded[[atom_idx, out_col]];
+                {
+                    let decoded_row_slice = decoded
+                        .row_mut(atom_idx)
+                        .into_slice()
+                        .expect("decoded matrix is contiguous");
+                    self.atoms[atom_idx].fill_decoded_row(row, decoded_row_slice);
+                    for out_col in 0..p {
+                        fitted[out_col] += a_k * decoded_row_slice[out_col];
+                    }
                 }
             }
             for out_col in 0..p {
