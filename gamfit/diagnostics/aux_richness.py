@@ -4,19 +4,11 @@ Reference: Khemakhem, I., Kingma, D., Monti, R., Hyvarinen, A. (2020).
 "Variational autoencoders and nonlinear ICA: a unifying framework."
 AISTATS 2020. arXiv:1907.04809; see also arXiv:2107.10098.
 
-The iVAE identifiability theorem (Khemakhem 2020 Theorem 1) requires the
-auxiliary covariate ``u`` to induce a sufficiently rich conditional family
-``p(z | u)`` over latents ``z``. In practice that requires three things:
-
-1. ``u`` is fully observed across rows (no missing values).
-2. The dimension of ``u`` is at least the latent dimension (necessary
-   for the Jacobian-rank precondition; not sufficient).
-3. If ``u`` is discrete, it must take at least as many distinct values as
-   the number of latent components / mixture components.
-4. The pushforward Jacobian ``∂ E[z | u] / ∂ u`` evaluated at the fitted
-   posterior latents must have rank equal to ``latent_dim``. We estimate
-   this rank from the empirical Jacobian of the regression
-   ``latents ~ aux``.
+All numeric work (constant-column detection, discreteness check, joint
+distinct-level counting, empirical Jacobian rank) lives in the Rust
+``gam::diagnostics`` module. This Python file is a thin wrapper that
+turns the metrics dict into an :class:`IdentifiabilityReport` with
+concrete violations and recommendations.
 """
 
 from __future__ import annotations
@@ -25,40 +17,22 @@ from typing import Any
 
 import numpy as np
 
+from .._binding import rust_module
 from ._report import IdentifiabilityReport
 
 __all__ = ["check_aux_richness"]
 
 
-def _is_discrete(u: np.ndarray) -> bool:
-    """Heuristic: treat aux as discrete if every column has <= 64 unique values
-    AND every entry is integer-valued. Otherwise continuous."""
-    if u.size == 0:
-        return False
-    if not np.all(np.isfinite(u)):
-        return False
-    if not np.all(u == np.round(u)):
-        return False
-    for j in range(u.shape[1]):
-        if len(np.unique(u[:, j])) > 64:
-            return False
-    return True
-
-
-def _jacobian_rank(aux: np.ndarray, latents: np.ndarray, tol: float | None = None) -> int:
-    """Rank of the linear regression ``latents = aux @ B + c`` Jacobian.
-
-    The fitted slope ``B`` (shape ``(aux_dim, latent_dim)``) *is* the
-    ``∂z/∂u`` Jacobian for the linear-Gaussian limit of the iVAE prior.
-    For non-linear models this is a first-order surrogate; the diagnostic
-    flags rank deficiency that no amount of nonlinear post-processing can
-    fix.
-    """
-    a = aux - aux.mean(axis=0, keepdims=True)
-    z = latents - latents.mean(axis=0, keepdims=True)
-    # Solve least-squares for B
-    b_hat, _residuals, _rank, _sv = np.linalg.lstsq(a, z, rcond=None)
-    return int(np.linalg.matrix_rank(b_hat, tol=tol))
+def _as_2d(arr: Any, name: str) -> np.ndarray:
+    """Coerce array-like to a contiguous f64 2-D array. 1-D becomes (N, 1)."""
+    a = np.ascontiguousarray(np.asarray(arr, dtype=float))
+    if a.ndim == 1:
+        a = a.reshape(-1, 1)
+    if a.ndim != 2:
+        raise ValueError(
+            f"{name} must be shape (N,) or (N, dim); got shape {a.shape}"
+        )
+    return np.ascontiguousarray(a)
 
 
 def check_aux_richness(
@@ -67,22 +41,17 @@ def check_aux_richness(
     *,
     n_mixture_components: int | None = None,
 ) -> IdentifiabilityReport:
-    """Check the iVAE auxiliary-richness preconditions.
+    """Check the iVAE auxiliary-richness preconditions via the Rust kernel.
 
     Parameters
     ----------
     aux : array-like, shape ``(N,)`` or ``(N, aux_dim)``
-        Auxiliary covariate that was supplied to the identifiable-factor
-        recipe. Missing values are not allowed; the diagnostic flags
-        non-finite entries.
+        Auxiliary covariate. Missing values are not allowed.
     latents : array-like, shape ``(N, latent_dim)``
-        Fitted latents (e.g. ``T_supervised`` from
-        :class:`IdentifiableFactorFitResult`).
+        Fitted latents.
     n_mixture_components : int, optional
-        If the prior is a finite mixture with ``K`` components, the
-        diagnostic also verifies that the discrete aux variable attains at
-        least ``K`` distinct levels. Defaults to ``None`` (no mixture
-        precondition).
+        If a discrete aux is used as a K-component mixture indicator, the
+        diagnostic checks that aux attains ``>= K`` distinct levels.
 
     Returns
     -------
@@ -91,31 +60,12 @@ def check_aux_richness(
     name = "aux_richness"
     theorem = "Khemakhem et al. 2020 (iVAE) Theorem 1"
 
-    aux_arr = np.asarray(aux, dtype=float)
-    if aux_arr.ndim == 1:
-        aux_arr = aux_arr.reshape(-1, 1)
-    z_arr = np.asarray(latents, dtype=float)
-    if z_arr.ndim == 1:
-        z_arr = z_arr.reshape(-1, 1)
-
     preconditions: dict[str, bool] = {}
     violations: list[str] = []
     recommendations: list[str] = []
 
-    if aux_arr.ndim != 2 or z_arr.ndim != 2:
-        # Pathological shape; emit a single violation and bail.
-        preconditions["valid_shapes"] = False
-        violations.append(
-            f"aux must be shape (N,) or (N, aux_dim) and latents must be (N, latent_dim); "
-            f"got aux={aux_arr.shape}, latents={z_arr.shape}."
-        )
-        recommendations.append(
-            "Reshape aux to (N, aux_dim) and latents to (N, latent_dim) before calling."
-        )
-        return IdentifiabilityReport(
-            name=name, theorem=theorem,
-            preconditions=preconditions, violations=violations, recommendations=recommendations,
-        )
+    aux_arr = _as_2d(aux, "aux")
+    z_arr = _as_2d(latents, "latents")
 
     if aux_arr.shape[0] != z_arr.shape[0]:
         preconditions["row_count_matches"] = False
@@ -127,17 +77,21 @@ def check_aux_richness(
         )
         return IdentifiabilityReport(
             name=name, theorem=theorem,
-            preconditions=preconditions, violations=violations, recommendations=recommendations,
+            preconditions=preconditions, violations=violations,
+            recommendations=recommendations,
         )
 
-    aux_dim = aux_arr.shape[1]
-    latent_dim = z_arr.shape[1]
+    rust = rust_module()
+    metrics = rust.diagnostics_aux_richness(aux_arr, z_arr)
 
-    # Precondition 1: aux is fully observed.
-    finite_ok = bool(np.all(np.isfinite(aux_arr)))
-    preconditions["aux_observed"] = finite_ok
-    if not finite_ok:
-        n_bad = int(np.sum(~np.isfinite(aux_arr)))
+    aux_dim = int(metrics["aux_dim"])
+    latent_dim = int(metrics["latent_dim"])
+
+    # Precondition 1: aux fully observed.
+    aux_observed = bool(metrics["aux_observed"])
+    preconditions["aux_observed"] = aux_observed
+    if not aux_observed:
+        n_bad = int(metrics["n_nonfinite_aux"])
         violations.append(
             f"aux contains {n_bad} non-finite entr{'y' if n_bad == 1 else 'ies'}; "
             f"iVAE Theorem 1 requires the auxiliary to be fully observed."
@@ -160,16 +114,11 @@ def check_aux_richness(
             f"or reduce factor_dim to <= {aux_dim}."
         )
 
-    # Precondition 3: variation across rows (no constant axes).
-    if finite_ok:
-        col_std = aux_arr.std(axis=0)
-        constant_cols = [int(j) for j in np.where(col_std <= 1e-12)[0]]
-        no_constant = len(constant_cols) == 0
-    else:
-        no_constant = False
-        constant_cols = []
+    # Precondition 3: no constant columns.
+    constant_cols = [int(j) for j in metrics["constant_columns"]]
+    no_constant = aux_observed and len(constant_cols) == 0
     preconditions["aux_varies_across_rows"] = no_constant
-    if not no_constant:
+    if aux_observed and constant_cols:
         violations.append(
             f"aux column(s) {constant_cols} are constant across observations; "
             f"a constant aux carries no conditioning information."
@@ -178,13 +127,11 @@ def check_aux_richness(
             f"Drop constant aux column(s) {constant_cols} or replace with a covariate that varies."
         )
 
-    # Precondition 4: discrete aux has enough distinct levels.
-    discrete = _is_discrete(aux_arr) if finite_ok else False
+    # Precondition 4: discrete-level count vs n_mixture_components.
+    discrete = bool(metrics["aux_is_discrete"])
+    n_levels = int(metrics["n_distinct_levels"])
     K = int(n_mixture_components) if n_mixture_components is not None else int(latent_dim)
-    if discrete and finite_ok:
-        # Use the joint distinct levels across all aux columns.
-        rows_as_tuples = {tuple(row) for row in aux_arr.tolist()}
-        n_levels = len(rows_as_tuples)
+    if discrete and aux_observed:
         levels_ok = n_levels >= K
         preconditions["aux_has_at_least_K_levels"] = levels_ok
         if not levels_ok:
@@ -197,9 +144,11 @@ def check_aux_richness(
                 f"or reduce the number of mixture components to <= {n_levels}."
             )
 
-    # Precondition 5: empirical Jacobian rank equals latent_dim.
-    if finite_ok and np.all(np.isfinite(z_arr)) and aux_arr.shape[0] >= max(aux_dim, latent_dim) + 1:
-        rank = _jacobian_rank(aux_arr, z_arr)
+    # Precondition 5: empirical Jacobian rank == latent_dim.
+    rank_estimated = bool(metrics["jacobian_rank_estimated"])
+    rank_value = metrics["jacobian_rank"]
+    if rank_estimated:
+        rank = int(rank_value)
         rank_ok = rank >= latent_dim
         preconditions["jacobian_rank_full"] = rank_ok
         if not rank_ok:
@@ -213,21 +162,24 @@ def check_aux_richness(
             )
     else:
         preconditions["jacobian_rank_full"] = False
-        if not finite_ok:
-            # Already complained about non-finite aux; do not double-flag.
-            pass
-        else:
+        if aux_observed:
+            need = max(aux_dim, latent_dim) + 1
             violations.append(
-                "Insufficient rows to estimate the empirical Jacobian rank "
-                f"(need N >= {max(aux_dim, latent_dim) + 1})."
+                f"Insufficient rows to estimate the empirical Jacobian rank "
+                f"(need N >= {need})."
             )
             recommendations.append(
-                f"Collect at least {max(aux_dim, latent_dim) + 1} rows before relying on iVAE identifiability."
+                f"Collect at least {need} rows before relying on iVAE identifiability."
             )
 
-    details = {"aux_dim": aux_dim, "latent_dim": latent_dim, "discrete": discrete}
+    details = {
+        "aux_dim": aux_dim,
+        "latent_dim": latent_dim,
+        "discrete": discrete,
+        "n_distinct_levels": n_levels,
+    }
     return IdentifiabilityReport(
         name=name, theorem=theorem,
-        preconditions=preconditions, violations=violations, recommendations=recommendations,
-        details=details,
+        preconditions=preconditions, violations=violations,
+        recommendations=recommendations, details=details,
     )

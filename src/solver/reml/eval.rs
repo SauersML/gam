@@ -646,20 +646,85 @@ impl<'a> RemlState<'a> {
         let mut total_cov = mean_hinv + var_beta;
         enforce_symmetry(&mut total_cov);
         if !total_cov.iter().all(|v| v.is_finite()) {
-            return first_order_correction;
+            log::warn!(
+                "Auto cubature: assembled total covariance contains non-finite entries; \
+                 falling back to first-order correction."
+            );
+            return self.finalize_smoothing_outcome(first_order_numerical(
+                first_order_correction,
+                "assembled total covariance contains non-finite entries",
+            ));
         }
 
         let mut corr = total_cov - base_cov;
         enforce_symmetry(&mut corr);
 
-        log::debug!(
-            "Using adaptive cubature smoothing correction (rank={}, points={}, near_boundary={}, grad_norm={:.2e}, maxvar={:.2e})",
+        self.finalize_smoothing_outcome(SmoothingCorrectionOutcome::Cubature {
+            correction: corr,
             rank,
-            2 * rank,
+            n_points: sigma_points.len(),
             near_boundary,
             grad_norm,
-            max_rhovar
-        );
-        Some(corr)
+            max_rho_var: max_rhovar,
+        })
+    }
+
+    /// Emit the canonical `[smoothing-correction]` log line, update the
+    /// process-wide counters, and return the outcome unchanged.
+    fn finalize_smoothing_outcome(
+        &self,
+        outcome: SmoothingCorrectionOutcome,
+    ) -> SmoothingCorrectionOutcome {
+        match &outcome {
+            SmoothingCorrectionOutcome::Cubature {
+                rank,
+                n_points,
+                near_boundary,
+                grad_norm,
+                max_rho_var,
+                ..
+            } => {
+                SMOOTHING_CORRECTION_CUBATURE_COUNT.fetch_add(1, Ordering::Relaxed);
+                log::info!(
+                    "[smoothing-correction] branch=cubature rank={} points={} near_boundary={} \
+                     grad_norm={:.3e} max_rho_var={:.3e}",
+                    rank,
+                    n_points,
+                    near_boundary,
+                    grad_norm,
+                    max_rho_var,
+                );
+            }
+            SmoothingCorrectionOutcome::FirstOrder {
+                reason,
+                severity,
+                correction,
+            } => {
+                let has_matrix = correction.is_some();
+                match severity {
+                    SmoothingCorrectionFallbackSeverity::Routine => {
+                        log::debug!(
+                            "[smoothing-correction] branch=first-order severity=routine \
+                             has_matrix={} reason=\"{}\"",
+                            has_matrix,
+                            reason
+                        );
+                    }
+                    SmoothingCorrectionFallbackSeverity::NumericalFailure => {
+                        SMOOTHING_CORRECTION_NUMERICAL_FAILURE_COUNT
+                            .fetch_add(1, Ordering::Relaxed);
+                        log::warn!(
+                            "[smoothing-correction] branch=first-order severity=numerical-failure \
+                             has_matrix={} reason=\"{}\" failure_count={}",
+                            has_matrix,
+                            reason,
+                            SMOOTHING_CORRECTION_NUMERICAL_FAILURE_COUNT
+                                .load(Ordering::Relaxed),
+                        );
+                    }
+                }
+            }
+        }
+        outcome
     }
 }

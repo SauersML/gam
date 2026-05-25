@@ -22714,4 +22714,196 @@ mod tests {
             );
         }
     }
+
+    // ─── Issue #200 regression: cost and gradient agree under
+    // `rho_curvature_scale != 1` when the documented contract is met.
+    //
+    // The contract (see `InnerSolution::rho_curvature_scale`):
+    //   1. `hessian_op` is the rescaled curvature `H_op = s · (H_unp + Σ λ_k S_k)`.
+    //   2. `hessian_logdet_correction = −p · log(s)` so that
+    //      `hop.logdet() + correction = log|H_unp + Σ λ_k S_k|` (unscaled).
+    //   3. Gradient drift uses `curvature_lambdas = s · λ_k`, matching
+    //      `∂H_op/∂ρ_k = s · λ_k S_k`.
+    //
+    // With these three terms wired consistently, `dV/dρ_k` matches the
+    // finite-difference of the cost surface to 1e-6 — the test below
+    // checks this end-to-end at `s = 2.0` to pin the convention.
+    //
+    // Pre-fix (issue #200 head), this test passed too because all three
+    // sites were already aligned in the survival path; what the fix adds
+    // is the documented contract on the public field plus a runtime guard
+    // that refuses `rho_curvature_scale ≤ 0 / non-finite` (would silently
+    // corrupt both cost and gradient).  The test pins the contract so
+    // any future change that breaks the trio is caught immediately.
+    fn build_scaled_curvature_solution(
+        rho: &[f64],
+        s: f64,
+    ) -> InnerSolution<'static> {
+        // 2×2 unpenalized Hessian (SPD).
+        let h_unp = array![[3.0_f64, 0.5], [0.5, 5.0]];
+        // Single penalty S = I (2×2), so root = I.
+        let s_root = Array2::<f64>::eye(2);
+        let penalty_coord = PenaltyCoordinate::from_dense_root(s_root.clone());
+        let s_mat = s_root.dot(&s_root.t());
+        // Build H_op = s · (H_unp + λ · S) for the given ρ.
+        assert_eq!(rho.len(), 1, "single-ρ scaled-curvature test");
+        let lambda = rho[0].exp();
+        let mut h_op_dense = &h_unp + &(&s_mat * lambda);
+        h_op_dense.mapv_inplace(|v| s * v);
+        let hop = Arc::new(
+            DenseSpectralOperator::from_symmetric(&h_op_dense)
+                .expect("scaled H_op is SPD"),
+        );
+        let p = h_op_dense.nrows() as f64;
+        // Contract: subtract p·log(s) so cost evaluates log|H_unp + λS|.
+        let hessian_logdet_correction = -p * s.ln();
+
+        InnerSolution {
+            // β = 0 isolates the log|H| term — penalty quadratic and its
+            // ρ-derivative vanish independently of λ, leaving the gradient
+            // entirely a `0.5 · tr(K · ∂H/∂ρ)` test.
+            log_likelihood: 0.0,
+            penalty_quadratic: 0.0,
+            hessian_op: hop,
+            beta: array![0.0_f64, 0.0],
+            penalty_coords: vec![penalty_coord],
+            penalty_logdet: PenaltyLogdetDerivs {
+                // S = I has log|S|_+ = 0 with ρ-derivative `rank(S) = p = 2`,
+                // independent of ρ.  We disable the log|S| term via
+                // `include_logdet_s = false` below so neither value nor
+                // first derivative enter the cost or gradient.
+                value: 0.0,
+                first: array![2.0],
+                second: Some(array![[0.0]]),
+            },
+            deriv_provider: Box::new(GaussianDerivatives),
+            tk_correction: 0.0,
+            tk_gradient: None,
+            firth: None,
+            hessian_logdet_correction,
+            penalty_subspace_trace: None,
+            rho_curvature_scale: s,
+            rho_prior: crate::types::RhoPrior::Flat,
+            n_observations: 10,
+            nullspace_dim: 0.0,
+            // Fixed-dispersion with logdet_h on, logdet_s off makes the
+            // cost reduce to `0.5 · (hop.logdet() + correction)` plus
+            // ρ-independent constants.  Pure log|H| derivative test.
+            dispersion: DispersionHandling::Fixed {
+                phi: 1.0,
+                include_logdet_h: true,
+                include_logdet_s: false,
+            },
+            ext_coords: Vec::new(),
+            ext_coord_pair_fn: None,
+            rho_ext_pair_fn: None,
+            fixed_drift_deriv: None,
+            barrier_config: None,
+            kkt_residual: None,
+            active_constraints: None,
+            stochastic_trace_state: Arc::new(Mutex::new(StochasticTraceState::default())),
+        }
+    }
+
+    #[test]
+    fn issue_200_cost_gradient_agree_under_rho_curvature_scale() {
+        let s = 2.0_f64;
+        let rho0 = vec![0.3_f64];
+
+        // Analytic gradient at ρ₀ via the unified evaluator.
+        let solution_center = build_scaled_curvature_solution(&rho0, s);
+        let result = reml_laml_evaluate(
+            &solution_center,
+            &rho0,
+            EvalMode::ValueAndGradient,
+            None,
+        )
+        .expect("center evaluation");
+        let analytic = result
+            .gradient
+            .expect("gradient returned for fixed-dispersion path")[0];
+
+        // Finite-difference the cost surface: rebuild H_op at ρ₀±ε so the
+        // scaling convention is met at every probe point.
+        let eps = 1e-6_f64;
+        let mut rho_plus = rho0.clone();
+        rho_plus[0] += eps;
+        let mut rho_minus = rho0.clone();
+        rho_minus[0] -= eps;
+        let cost_plus = reml_laml_evaluate(
+            &build_scaled_curvature_solution(&rho_plus, s),
+            &rho_plus,
+            EvalMode::ValueOnly,
+            None,
+        )
+        .expect("forward evaluation")
+        .cost;
+        let cost_minus = reml_laml_evaluate(
+            &build_scaled_curvature_solution(&rho_minus, s),
+            &rho_minus,
+            EvalMode::ValueOnly,
+            None,
+        )
+        .expect("backward evaluation")
+        .cost;
+        let fd = (cost_plus - cost_minus) / (2.0 * eps);
+
+        // 1e-6 tolerance per the issue.  At ρ=0.3, λ=exp(0.3)≈1.35; the
+        // gradient is `0.5 · tr((H_unp + λS)⁻¹ · λ S)` on the order of 0.3,
+        // so the absolute tolerance pins ≥6 matching decimals.
+        assert!(
+            (analytic - fd).abs() < 1e-6,
+            "issue #200: cost/gradient must agree under rho_curvature_scale={s} \
+             (analytic={analytic:.10e}, fd={fd:.10e}, |diff|={:.3e})",
+            (analytic - fd).abs(),
+        );
+    }
+
+    #[test]
+    fn issue_200_rejects_non_positive_rho_curvature_scale() {
+        // Build a baseline solution then mutate `rho_curvature_scale` to an
+        // invalid value.  The evaluator must reject rather than silently
+        // emit a corrupt cost/gradient pair.
+        let mut solution = build_scaled_curvature_solution(&[0.0_f64], 1.0);
+        solution.rho_curvature_scale = 0.0;
+        let err = reml_laml_evaluate(
+            &solution,
+            &[0.0_f64],
+            EvalMode::ValueOnly,
+            None,
+        )
+        .expect_err("zero curvature scale must be rejected");
+        assert!(
+            format!("{err}").contains("rho_curvature_scale"),
+            "error message must name the offending field, got: {err}",
+        );
+
+        let mut solution = build_scaled_curvature_solution(&[0.0_f64], 1.0);
+        solution.rho_curvature_scale = -1.5;
+        let err = reml_laml_evaluate(
+            &solution,
+            &[0.0_f64],
+            EvalMode::ValueOnly,
+            None,
+        )
+        .expect_err("negative curvature scale must be rejected");
+        assert!(
+            format!("{err}").contains("rho_curvature_scale"),
+            "error message must name the offending field, got: {err}",
+        );
+
+        let mut solution = build_scaled_curvature_solution(&[0.0_f64], 1.0);
+        solution.rho_curvature_scale = f64::NAN;
+        let err = reml_laml_evaluate(
+            &solution,
+            &[0.0_f64],
+            EvalMode::ValueOnly,
+            None,
+        )
+        .expect_err("NaN curvature scale must be rejected");
+        assert!(
+            format!("{err}").contains("rho_curvature_scale"),
+            "error message must name the offending field, got: {err}",
+        );
+    }
 }

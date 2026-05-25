@@ -5511,6 +5511,38 @@ impl SurvivalMarginalSlopeFamily {
         )
     }
 
+    fn score_warp_linear_constraints(
+        &self,
+        runtime: &DeviationRuntime,
+    ) -> Result<LinearInequalityConstraints, String> {
+        let scalar = runtime.structural_monotonicity_constraints();
+        let basis_dim = runtime.basis_dim();
+        if scalar.a.ncols() != basis_dim {
+            return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+                reason: format!(
+                    "survival score-warp scalar constraint width mismatch: constraints={}, basis={basis_dim}",
+                    scalar.a.ncols()
+                ),
+            }
+            .into());
+        }
+        let score_dim = self.score_dim();
+        let rows_per_coord = scalar.a.nrows();
+        let total_rows = rows_per_coord * score_dim;
+        let total_cols = basis_dim * score_dim;
+        let mut a = Array2::<f64>::zeros((total_rows, total_cols));
+        let mut b = Array1::<f64>::zeros(total_rows);
+        for coord in 0..score_dim {
+            let row_start = coord * rows_per_coord;
+            let col_range = score_warp_component_range(runtime, coord);
+            a.slice_mut(s![row_start..row_start + rows_per_coord, col_range])
+                .assign(&scalar.a);
+            b.slice_mut(s![row_start..row_start + rows_per_coord])
+                .assign(&scalar.b);
+        }
+        Ok(LinearInequalityConstraints::from_paired(a, b))
+    }
+
     fn validate_time_qd1_feasible(&self, beta: &Array1<f64>, label: &str) -> Result<(), String> {
         if beta.is_empty() {
             return Ok(());
@@ -16460,13 +16492,14 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         assert!(block_states.len() <= isize::MAX as usize);
         assert!(!block_spec.name.is_empty());
         if block_idx == 0 {
-            return Ok(self.time_linear_constraints.clone());
+            return self.effective_time_linear_constraints();
         }
         if self.score_warp.is_some() && block_idx == 3 {
-            return Ok(self
+            return self
                 .score_warp
                 .as_ref()
-                .map(DeviationRuntime::structural_monotonicity_constraints));
+                .map(|runtime| self.score_warp_linear_constraints(runtime))
+                .transpose();
         }
         let link_block_idx = if self.score_warp.is_some() { 4 } else { 3 };
         if self.link_dev.is_some() && block_idx == link_block_idx {
@@ -16509,15 +16542,10 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
             .into());
         }
         if block_idx == 0 {
-            let proposed = if let Some(constraints) = self.time_linear_constraints.as_ref() {
-                project_onto_linear_constraints(beta.len(), constraints, Some(&beta))
-            } else {
-                beta
-            };
             let current = &block_states[0].beta;
             self.validate_time_qd1_feasible(current, "current")?;
-            self.validate_time_qd1_feasible(&proposed, "proposed")?;
-            return Ok(proposed);
+            self.validate_time_qd1_feasible(&beta, "proposed")?;
+            return Ok(beta);
         }
         if self.score_warp.is_some()
             && block_idx == 3
@@ -16546,20 +16574,12 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
                     }
                     .into());
             }
-            let mut projected = Array1::<f64>::zeros(beta.len());
             for coord in 0..self.score_dim() {
                 let range = score_warp_component_range(runtime, coord);
-                let current_local = current.slice(s![range.clone()]).to_owned();
                 let proposed_local = beta.slice(s![range.clone()]).to_owned();
-                let local = project_monotone_feasible_beta(
-                    runtime,
-                    &current_local,
-                    &proposed_local,
-                    &format!("score_warp_dev[z{coord}]"),
-                )?;
-                projected.slice_mut(s![range]).assign(&local);
+                runtime.monotonicity_feasible(&proposed_local, &format!("score_warp_dev[z{coord}]"))?;
             }
-            return Ok(projected);
+            return Ok(beta);
         }
         let link_block_idx = if self.score_warp.is_some() { 4 } else { 3 };
         if self.link_dev.is_some()
@@ -16580,7 +16600,9 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
                     }
                     .into());
             }
-            return project_monotone_feasible_beta(runtime, current, &beta, "link_dev");
+            runtime.monotonicity_feasible(current, "link_dev current")?;
+            runtime.monotonicity_feasible(&beta, "link_dev proposed")?;
+            return Ok(beta);
         }
         Ok(beta)
     }

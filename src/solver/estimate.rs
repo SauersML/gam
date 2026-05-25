@@ -3736,12 +3736,13 @@ where
             beta_covariance_frequentist = Some(ve);
         }
 
-        smoothing_correction = reml_state.compute_smoothing_correction_auto(
+        let smoothing_outcome = reml_state.compute_smoothing_correction_auto(
             &final_rho,
             &pirls_res,
             beta_covariance_unscaled.as_ref(),
             finalgrad_norm,
         );
+        smoothing_correction = smoothing_outcome.into_correction();
         beta_standard_errors = beta_covariance
             .as_ref()
             .map(|c| se_from_covariance(c.as_array()));

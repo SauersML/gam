@@ -1681,35 +1681,30 @@ impl SurvivalLocationScaleFamily {
         beta: &Array1<f64>,
         delta: &Array1<f64>,
     ) -> Result<Option<f64>, String> {
-        let Some(lower_bounds) = self.time_coefficient_lower_bounds.as_ref() else {
+        let Some(constraints) = self.time_linear_constraints.as_ref() else {
             return Err(SurvivalLocationScaleError::InvalidConfiguration {
-                reason:
-                    "survival location-scale time block missing structural coefficient lower bounds"
-                        .to_string(),
+                reason: "survival location-scale time block missing linear constraints".to_string(),
             }
             .into());
         };
-        if beta.len() != lower_bounds.len() || delta.len() != lower_bounds.len() {
+        if beta.len() != constraints.a.ncols() || delta.len() != constraints.a.ncols() {
             return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
-                "survival location-scale time-step lower-bound dimension mismatch: beta={}, delta={}, bounds={}",
+                "survival location-scale time-step constraint dimension mismatch: beta={}, delta={}, constraints={}",
                 beta.len(),
                 delta.len(),
-                lower_bounds.len()
+                constraints.a.ncols()
             ) }.into());
         }
         let mut alpha = 1.0f64;
-        for j in 0..lower_bounds.len() {
-            let lower_bound = lower_bounds[j];
-            if !lower_bound.is_finite() {
-                continue;
-            }
-            let slack = beta[j] - lower_bound;
+        for row in 0..constraints.a.nrows() {
+            let a_row = constraints.a.row(row);
+            let slack = a_row.dot(beta) - constraints.b[row];
             if slack < -1e-10 {
                 return Err(SurvivalLocationScaleError::ConstraintViolation { reason: format!(
-                    "survival location-scale current time coefficient violates structural lower bound at coefficient {j}: slack={slack:.3e}"
+                    "survival location-scale current time block violates linear constraint at row {row}: slack={slack:.3e}"
                 ) }.into());
             }
-            let drift = delta[j];
+            let drift = a_row.dot(delta);
             if drift < 0.0 {
                 alpha = alpha.min((slack / -drift).clamp(0.0, 1.0));
             }
@@ -4530,7 +4525,7 @@ fn prepare_survival_location_scale_model(
         time_wiggle_knots: spec.timewiggle_block.as_ref().map(|w| w.knots.clone()),
         time_wiggle_degree: spec.timewiggle_block.as_ref().map(|w| w.degree),
         time_wiggle_ncols: protected_timewiggle_cols,
-        time_coefficient_lower_bounds: time_prepared.coefficient_lower_bounds.clone(),
+        time_linear_constraints: time_prepared.linear_constraints.clone(),
         x_threshold: threshold_design,
         x_threshold_entry: threshold_entry_design,
         x_threshold_deriv: threshold_deriv_design,
@@ -5155,7 +5150,14 @@ fn prepare_identified_time_block(
         "structural time block requires derivative offsets to encode the derivative guard and a non-negative derivative basis"
             .to_string()
     })?;
-    let linear_constraints = lower_bound_constraints(&coefficient_lower_bounds);
+    let coefficient_constraints = lower_bound_constraints(&coefficient_lower_bounds);
+    let derivative_constraints = time_derivative_guard_constraints(
+        &input.design_derivative_exit,
+        &input.derivative_offset_exit,
+        derivative_guard,
+    )?;
+    let linear_constraints =
+        append_linear_constraints(coefficient_constraints.clone(), derivative_constraints)?;
     let initial_beta = match (linear_constraints.as_ref(), input.initial_beta.as_ref()) {
         (Some(constraints), Some(beta0)) => {
             Some(project_onto_linear_constraints(p, constraints, Some(beta0)))
@@ -5169,6 +5171,7 @@ fn prepare_identified_time_block(
         design_exit,
         design_derivative_exit,
         coefficient_lower_bounds: Some(coefficient_lower_bounds),
+        linear_constraints,
         penalties,
         initial_beta,
         transform: TimeIdentifiabilityTransform { z: Array2::eye(p) },
@@ -9017,10 +9020,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         if block_idx != Self::BLOCK_TIME {
             return Ok(None);
         }
-        Ok(self
-            .time_coefficient_lower_bounds
-            .as_ref()
-            .and_then(lower_bound_constraints))
+        Ok(self.time_linear_constraints.clone())
     }
 
     fn max_feasible_step_size(
@@ -9049,21 +9049,16 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         assert!(block_states.len() <= isize::MAX as usize);
         assert!(!block_spec.name.is_empty());
         if block_idx == Self::BLOCK_TIME
-            && let Some(lower_bounds) = self.time_coefficient_lower_bounds.as_ref()
+            && let Some(constraints) = self.time_linear_constraints.as_ref()
         {
-            if beta.len() != lower_bounds.len() {
+            if beta.len() != constraints.a.ncols() {
                 return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
-                    "survival location-scale time post-update dimension mismatch: beta={}, bounds={}",
+                    "survival location-scale time post-update dimension mismatch: beta={}, constraints={}",
                     beta.len(),
-                    lower_bounds.len()
+                    constraints.a.ncols()
                 ) }.into());
             }
-            for j in 0..beta.len() {
-                let lb = lower_bounds[j];
-                if lb.is_finite() && beta[j] < lb {
-                    beta[j] = lb;
-                }
-            }
+            beta = project_onto_linear_constraints(beta.len(), constraints, Some(&beta));
         } else if block_idx == Self::BLOCK_LINK_WIGGLE && self.x_link_wiggle.is_some() {
             for j in 0..beta.len() {
                 if beta[j] < 0.0 {
