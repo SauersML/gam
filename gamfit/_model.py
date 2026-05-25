@@ -916,16 +916,7 @@ class Model:
             return rows_out
 
     def save(self, path: str | Path) -> None:
-        """Serialise the fitted model to ``path``.
-
-        Writes a self-contained binary ``.gam`` file that
-        :func:`gamfit.load` round-trips.
-
-        Examples
-        --------
-        >>> model.save("model.gam")
-        >>> loaded = gamfit.load("model.gam")
-        """
+        """Serialise the fitted model to ``path`` (round-trips via :func:`gamfit.load`)."""
         Path(path).write_bytes(self._model_bytes)
 
     def extend_with_group(
