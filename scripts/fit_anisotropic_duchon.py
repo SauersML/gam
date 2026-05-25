@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fit a multidimensional anisotropic Duchon model via the gam CLI with the large-data preprocessing path (pilot subsample + final joint fit)."""
+"""Fit a multidimensional anisotropic Duchon model via the gam CLI."""
 from __future__ import annotations
 
 import argparse
@@ -108,18 +108,25 @@ def build_duchon_term(
     return f"duchon({', '.join(parts)})"
 
 
-def maybe_add_linkwiggle(terms: list[str], knots: int | None) -> None:
-    if knots is not None:
-        terms.append(f"linkwiggle(internal_knots={knots})")
-
-
 def build_formulas(args: argparse.Namespace) -> tuple[str, str | None]:
     features = dedup_columns(args.features)
     logslope_features = dedup_columns(args.logslope_features or features)
     centers = args.centers if args.centers is not None else default_centers(len(features))
-    length_scale = resolved_length_scale(args, len(features))
-    order = resolved_order(args, len(features), length_scale)
-    power = resolved_power(args, len(features), length_scale)
+    length_scale = None if args.length_scale is None else float(args.length_scale)
+
+    if args.order is not None:
+        order = int(args.order)
+    elif length_scale is not None:
+        order = 1
+    else:
+        order = 0
+
+    if args.power is not None:
+        power = int(args.power)
+    elif length_scale is not None:
+        power = max(1, len(features) // 2)
+    else:
+        power = 1
 
     main_terms = [
         build_duchon_term(
@@ -130,7 +137,8 @@ def build_formulas(args: argparse.Namespace) -> tuple[str, str | None]:
             length_scale=length_scale,
         )
     ]
-    maybe_add_linkwiggle(main_terms, args.main_linkwiggle_knots)
+    if args.main_linkwiggle_knots is not None:
+        main_terms.append(f"linkwiggle(internal_knots={args.main_linkwiggle_knots})")
     main_formula = f"{args.response} ~ {' + '.join(main_terms)}"
 
     if args.z_column is None:
@@ -145,30 +153,9 @@ def build_formulas(args: argparse.Namespace) -> tuple[str, str | None]:
             length_scale=length_scale,
         )
     ]
-    maybe_add_linkwiggle(logslope_terms, args.score_warp_knots)
+    if args.score_warp_knots is not None:
+        logslope_terms.append(f"linkwiggle(internal_knots={args.score_warp_knots})")
     return main_formula, " + ".join(logslope_terms)
-
-
-def resolved_length_scale(args: argparse.Namespace, num_features: int) -> float | None:
-    if args.length_scale is not None:
-        return float(args.length_scale)
-    return None
-
-
-def resolved_order(args: argparse.Namespace, num_features: int, length_scale: float | None) -> int:
-    if args.order is not None:
-        return int(args.order)
-    if length_scale is not None and num_features >= 2:
-        return 1
-    return 0
-
-
-def resolved_power(args: argparse.Namespace, num_features: int, length_scale: float | None) -> int:
-    if args.power is not None:
-        return int(args.power)
-    if length_scale is not None and num_features >= 2:
-        return max(1, num_features // 2)
-    return 1
 
 
 def run_checked(cmd: list[str]) -> None:
