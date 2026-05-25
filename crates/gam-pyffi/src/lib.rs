@@ -9423,6 +9423,16 @@ fn sae_manifold_reconstruction_r2(
             "sae_manifold_reconstruction_r2: observed and fitted must be non-empty".into(),
         ));
     }
+    if !observed.iter().all(|v| v.is_finite()) {
+        return Err(py_value_error(
+            "sae_manifold_reconstruction_r2: observed contains non-finite values".into(),
+        ));
+    }
+    if !fitted.iter().all(|v| v.is_finite()) {
+        return Err(py_value_error(
+            "sae_manifold_reconstruction_r2: fitted contains non-finite values".into(),
+        ));
+    }
     let mut col_means = vec![0.0_f64; n_cols];
     for col in 0..n_cols {
         let mut acc = 0.0;
@@ -9440,6 +9450,12 @@ fn sae_manifold_reconstruction_r2(
             let dm = observed[[row, col]] - col_means[col];
             sst += dm * dm;
         }
+    }
+    if !ssr.is_finite() || !sst.is_finite() {
+        return Err(py_value_error(
+            "sae_manifold_reconstruction_r2: SSR/SST overflowed; inputs have extreme magnitudes"
+                .into(),
+        ));
     }
     if sst == 0.0 {
         return Ok(f64::NAN);
