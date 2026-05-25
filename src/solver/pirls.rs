@@ -5265,10 +5265,25 @@ where
             let direction: &Array1<f64> = &newton_direction;
 
             // 2. Compute Predicted Reduction
-            // Pred = -g'δ - 0.5 * δ'(H)δ
-            // Actually, we should check against the model: m(0) - m(δ)
-            // m(δ) = L_old + g'δ + 0.5 δ'Hδ.
-            // Reduction = -(g'δ + 0.5 δ'Hδ)
+            // The quadratic model of the penalized objective F at the current
+            // β uses the BARE (penalized) Hessian H — the LM damping λ·I is
+            // a solver-internal regularizer, not part of F. So:
+            //     m(δ) = F(β) + g'δ + 0.5 δ'Hδ
+            //     Reduction = m(0) − m(δ) = -(g'δ + 0.5 δ'Hδ)
+            // The cached `regularized` / `cached_sparse_regularized` matrices
+            // are H + loop_lambda·I (built for the LM step solve), so
+            //     δ'(H+λI)δ = δ'Hδ + λ‖δ‖²    ⇒    δ'Hδ = δ'(H+λI)δ − λ‖δ‖².
+            // Subtracting `0.5·λ·‖δ‖²` from the regularized-matrix quadratic
+            // recovers the bare-H quadratic without re-doing the matvec on
+            // `state.hessian`. (Equivalently, the Madsen-Nielsen-Tingleff
+            // closed form when (H+λI)δ = −g gives Reduction = ½(λ‖δ‖² − g'δ);
+            // for the geodesic-corrected direction that identity no longer
+            // holds, so we keep the explicit matvec form.) Previously the
+            // damped matrix was used directly, which under-predicted the
+            // reduction by exactly ½λ‖δ‖² and biased the LM gain ratio
+            // downward — increasingly so as loop_lambda grew during
+            // rejection-driven damping escalation, causing avoidable
+            // step rejections in the damped regime.
             let predred_start = std::time::Instant::now();
             let lin = state.gradient.dot(direction);
             let predicted_reduction =
@@ -5280,7 +5295,9 @@ where
                     } else {
                         regularized.dot(direction)
                     };
-                    let quad = 0.5 * direction.dot(&q_term);
+                    let dir_sq_norm = direction.dot(direction);
+                    // δ'(H+λI)δ − λ‖δ‖² = δ'Hδ
+                    let quad = 0.5 * (direction.dot(&q_term) - loop_lambda * dir_sq_norm);
                     -(lin + quad)
                 };
             lm_predred_total += predred_start.elapsed();
