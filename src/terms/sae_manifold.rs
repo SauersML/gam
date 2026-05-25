@@ -29,10 +29,7 @@
 use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3, ArrayView4, s};
 use std::sync::Arc;
 
-use crate::solver::arrow_schur::{
-    ArrowRowBlock, ArrowSchurError, ArrowSchurSystem, DEFAULT_PROXIMAL_INITIAL_RIDGE,
-    DEFAULT_PROXIMAL_MAX_ATTEMPTS, DEFAULT_PROXIMAL_RIDGE_GROWTH,
-};
+use crate::solver::arrow_schur::{ArrowRowBlock, ArrowSchurError, ArrowSchurSystem};
 use crate::terms::analytic_penalties::{
     ARDPenalty, AnalyticPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry,
     IBPAssignmentPenalty, PenaltyTier, PsiSlice, SoftmaxAssignmentSparsityPenalty,
@@ -1768,7 +1765,13 @@ impl SaeManifoldTerm {
         let sys = self
             .assemble_arrow_schur(target, rho, analytic_penalties)
             .map_err(|reason| ArrowSchurError::SchurFactorFailed { reason })?;
-        sys.solve(ridge_ext_coord, ridge_beta)
+        // Self-heal against non-PD per-row blocks produced by PCA-seeded
+        // latent coordinates on subset / out-of-sample data (#163, #175):
+        // route every Newton-step solve through the Ceres-style LM ridge
+        // escalation, reusing the caller-supplied Tikhonov ridges
+        // (`ridge_ext_coord`, `ridge_beta`) as the base damping. No new
+        // tuning knobs — just the existing proximal-correction schedule.
+        sys.solve_with_lm_escalation(ridge_ext_coord, ridge_beta)
     }
 
     pub fn apply_newton_step(
@@ -1886,47 +1889,9 @@ impl SaeManifoldTerm {
             // factor-failure error variants so legitimate, non-recoverable
             // errors (PCG divergence with no factor failure, adaptive-step
             // exhaustion, …) still surface immediately.
-            let (delta_ext_coord, delta_beta) = {
-                let mut proximal_ridge = 0.0_f64;
-                let mut last_err: Option<ArrowSchurError> = None;
-                let mut step: Option<(Array1<f64>, Array1<f64>)> = None;
-                for attempt in 0..=DEFAULT_PROXIMAL_MAX_ATTEMPTS {
-                    let damped_ridge_t = ridge_ext_coord + proximal_ridge;
-                    let damped_ridge_beta = ridge_beta + proximal_ridge;
-                    match sys.solve(damped_ridge_t, damped_ridge_beta) {
-                        Ok(pair) => {
-                            step = Some(pair);
-                            break;
-                        }
-                        Err(err) => {
-                            let recoverable = matches!(
-                                err,
-                                ArrowSchurError::PerRowFactorFailed { .. }
-                                    | ArrowSchurError::SchurFactorFailed { .. }
-                            );
-                            last_err = Some(err);
-                            if !recoverable {
-                                break;
-                            }
-                            if attempt == DEFAULT_PROXIMAL_MAX_ATTEMPTS {
-                                break;
-                            }
-                            proximal_ridge = if proximal_ridge == 0.0 {
-                                DEFAULT_PROXIMAL_INITIAL_RIDGE
-                            } else {
-                                proximal_ridge * DEFAULT_PROXIMAL_RIDGE_GROWTH
-                            };
-                        }
-                    }
-                }
-                match step {
-                    Some(pair) => pair,
-                    None => {
-                        let err = last_err.expect("escalation loop set last_err on failure");
-                        return Err(format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}"));
-                    }
-                }
-            };
+            let (delta_ext_coord, delta_beta) = sys
+                .solve_with_lm_escalation(ridge_ext_coord, ridge_beta)
+                .map_err(|err| format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}"))?;
             let directional_decrease = sae_manifold_newton_directional_decrease(
                 &sys,
                 delta_ext_coord.view(),
@@ -2573,6 +2538,58 @@ mod tests {
         assert!(
             result.is_ok(),
             "run_joint_fit_arrow_schur should recover from degenerate H_tt via LM ridge escalation; got: {result:?}",
+        );
+    }
+
+    /// Regression test for https://github.com/SauersML/gam/issues/163 and #175.
+    ///
+    /// `ManifoldSAE.reconstruct(X_oos)` (and `.predict(X_subset)`) reach the
+    /// Rust core via `sae_manifold_predict_oos` → `sae_manifold_fit_inner` →
+    /// the same `run_joint_fit_arrow_schur` Newton driver. The driver in turn
+    /// calls `solve_newton_step` for single-shot refinement; before this fix
+    /// that path invoked `sys.solve(...)` directly, bypassing the LM ridge
+    /// escalation and surfacing the per-row Cholesky failure to the Python
+    /// caller as `"row N H_tt was non-PD at ridge_t=0.000001"`. The fix routes
+    /// `solve_newton_step` through `solve_with_lm_escalation` so every entry
+    /// point — including OOS predict — geometrically grows the proximal ridge
+    /// from the caller's nominal `ridge_ext_coord` / `ridge_beta` until the
+    /// factor succeeds.
+    #[test]
+    fn solve_newton_step_escalates_ridge_on_non_pd_row_block() {
+        // Same degenerate-H_tt construction as the predict/reconstruct
+        // reproducer: zero assignment mass + zero smoothness penalty means
+        // the only mass on H_tt comes from `ridge_t·I`, and at the nominal
+        // 1e-6 the Cholesky still finds a tiny negative pivot from rounding.
+        let coords = array![[0.1], [0.4], [0.7]];
+        let (phi, jet) = periodic_basis(&coords);
+        let atom = SaeManifoldAtom::new(
+            "periodic",
+            SaeAtomBasisKind::Periodic,
+            1,
+            phi,
+            jet,
+            array![[0.05], [-0.05], [0.05]],
+            Array2::<f64>::zeros((3, 3)),
+        )
+        .unwrap();
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            Array2::<f64>::zeros((3, 1)),
+            vec![coords],
+            vec![LatentManifold::Circle],
+            AssignmentMode::softmax(0.7),
+        )
+        .unwrap();
+        let term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
+        let target = array![[0.20], [-0.10], [0.45]];
+        let rho = SaeManifoldRho::new(0.0, -20.0, vec![Array1::<f64>::zeros(1)]);
+
+        // Direct `solve_newton_step` call (the predict path's single-shot
+        // refinement entry). Must Ok via LM escalation, not bubble up the
+        // raw per-row factor failure.
+        let result = term.solve_newton_step(target.view(), &rho, None, 1.0e-6, 1.0e-6);
+        assert!(
+            result.is_ok(),
+            "solve_newton_step should recover from degenerate H_tt via LM ridge escalation; got: {result:?}",
         );
     }
 
