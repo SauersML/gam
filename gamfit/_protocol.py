@@ -156,6 +156,16 @@ class PenaltyDescriptor(ABC):
         (g,) = torch.autograd.grad(v, t_t, create_graph=t_t.requires_grad)
         return v, g
 
+    def grad(self, t: Any) -> Any:
+        """First-order gradient ``dP/dt`` at ``t``. Same shape as ``t``.
+
+        Convenience accessor: returns the second element of
+        :meth:`value_grad`. Subclasses with a cheap gradient-only path
+        may override.
+        """
+        _value, gradient = self.value_grad(t)
+        return gradient
+
     @abstractmethod
     def hvp(self, t: Any, v: Any) -> Any:
         """Hessian-vector product ``H · v`` at ``t``. Same shape as ``t``."""
