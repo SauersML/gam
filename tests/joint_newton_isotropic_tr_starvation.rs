@@ -422,24 +422,25 @@ fn rejected_step_shrinks_only_boundary_block_radii() {
 }
 
 // ────────────────────────────────────────────────────────────────────
-// Mechanism C: feasibility limiting must be block-local.
+// Mechanism C: feasibility limiting must preserve the joint Newton direction.
 //
-// Setup: time block's `max_feasible_time_step` returns α = 1e-4 (because
-// the unconstrained δ_time would cross a monotonicity guard). The old
-// global-alpha behavior multiplied every block by α and starved unrelated
-// blocks. The fixed behavior limits only the constrained block.
+// Setup: one block's feasibility guard returns α < 1. Scaling only that
+// block mutates δ̂ into a different direction. With coupled blocks, that
+// direction can be an ascent direction for the quadratic model even though
+// the original Newton direction is descent. The principled feasibility
+// operation is therefore a scalar α applied to the whole joint step; the
+// block-local trust-region metric above is what prevents unrelated blocks
+// from being starved by near-null curvature.
 // ────────────────────────────────────────────────────────────────────
 
 #[test]
-fn feasibility_alpha_limits_only_the_constrained_block() {
-    // Build a tiny 2-block problem where the Newton step is δ̂ = (1, 1)
-    // and the time-block feasibility forces α_time = 0.01 (so δ_time
-    // becomes 0.01 instead of 1) while the other block stays at δ_other = 1.
-    // Block 0: time, well-conditioned, H = 1, g = -1, so δ̂_time = 1
-    // Block 1: other,                 H = 1, g = -1, so δ̂_other = 1
-    let h = ndarray::array![[1.0_f64, 0.0_f64], [0.0_f64, 1.0_f64]];
-    let g = ndarray::array![-1.0_f64, -1.0_f64];
-    let delta_hat = ndarray::array![1.0_f64, 1.0_f64];
+fn feasibility_alpha_preserves_the_joint_newton_direction() {
+    // SPD Hessian with strong cross-block coupling. The exact Newton
+    // direction is intentionally mixed-sign; this makes per-block scaling
+    // mathematically different from a line search along δ̂.
+    let h = ndarray::array![[1.0_f64, 0.99_f64], [0.99_f64, 1.0_f64]];
+    let delta_hat = ndarray::array![50.0_f64, -1.0_f64];
+    let g = -h.dot(&delta_hat);
 
     // Sanity: full Newton kills g exactly.
     let exact_residual = &g + &h.dot(&delta_hat);
@@ -448,24 +449,24 @@ fn feasibility_alpha_limits_only_the_constrained_block() {
         "unconstrained Newton must be exact on this 2-block linear system"
     );
 
-    // Simulate the fixed block-local feasibility shrink on block 0.
-    let alpha_time = 0.01_f64;
-    let mut delta = delta_hat.clone();
-    delta[0] *= alpha_time;
+    let alpha = 0.01_f64;
+    let global_alpha_delta = alpha * &delta_hat;
+    let mut block_local_delta = delta_hat.clone();
+    block_local_delta[0] *= alpha;
 
-    let residual = &g + &h.dot(&delta);
-    let linearized_rel = residual.iter().map(|v| v.abs()).fold(0.0_f64, f64::max)
-        / (1.0 + g.iter().map(|v| v.abs()).fold(0.0_f64, f64::max));
-    let global_alpha_delta = ndarray::array![alpha_time, alpha_time];
-    let global_alpha_residual = &g + &h.dot(&global_alpha_delta);
+    // Linearized objective change for q(δ) = g'δ + 0.5 δ'Hδ.
+    let predicted_change =
+        |step: &Array1<f64>| -> f64 { g.dot(step) + 0.5 * step.dot(&h.dot(step)) };
+    let global_change = predicted_change(&global_alpha_delta);
+    let block_local_change = predicted_change(&block_local_delta);
+
     assert!(
-        residual[1].abs() < 1.0e-12,
-        "unconstrained block must keep its Newton update under block-local \
-         feasibility limiting; got residual={linearized_rel:.3e}",
+        global_change < 0.0,
+        "global α preserves the Newton descent direction; got model change {global_change:.3e}",
     );
     assert!(
-        global_alpha_residual[1].abs() > 0.9,
-        "a global alpha would starve the unrelated block and leave its KKT \
-         residual unresolved",
+        block_local_change > 0.0,
+        "block-local feasibility scaling can turn a coupled Newton direction \
+         into ascent; got model change {block_local_change:.3e}",
     );
 }
