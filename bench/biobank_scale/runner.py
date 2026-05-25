@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import importlib
 import json
 import math
 import os
@@ -23,6 +22,8 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+from gamfit._binding import rust_module
 
 
 BENCH_DIR = Path(__file__).resolve().parent
@@ -155,6 +156,18 @@ def _append_routing_lines(path: Path, captured_stderr: str) -> None:
 ROUTINE_SURVIVAL_HORIZONS = (1.0, 2.0, 5.0, 10.0)
 SURVIVAL_ENTRY_COLUMN = "__entry"
 F64_BYTES = 8
+_RUST: Any | None = None
+
+
+def _rust() -> Any:
+    global _RUST
+    if _RUST is None:
+        _RUST = rust_module()
+    return _RUST
+
+
+def _f64_list(values: np.ndarray) -> list[float]:
+    return np.asarray(values, dtype=float).reshape(-1).tolist()
 
 
 def _detect_host_memory_bytes() -> int:
