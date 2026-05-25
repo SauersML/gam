@@ -5347,8 +5347,43 @@ pub struct InnerSolution<'dp> {
     /// [`PenaltySubspaceTrace`] for the full derivation.
     pub penalty_subspace_trace: Option<Arc<PenaltySubspaceTrace>>,
 
-    /// Uniform scale applied to rho-coordinate penalty derivatives only in the
+    /// Uniform scale `s` applied to rho-coordinate penalty derivatives in the
     /// H-dependent trace / solve parts of the outer calculus.
+    ///
+    /// ## Contract (CRITICAL — gradient/cost consistency)
+    ///
+    /// `rho_curvature_scale` is NOT a free knob.  It encodes the convention
+    /// that the supplied `hessian_op` represents the **rescaled** curvature
+    /// `H_op = s · (∇²(-ℓ) + Σ_k e^{ρ_k} S_k)`, i.e. every contribution to
+    /// the curvature (likelihood Hessian AND penalty `λ_k S_k`) has been
+    /// uniformly multiplied by `s` before reaching the evaluator.  Under this
+    /// convention:
+    ///
+    /// * `∂H_op/∂ρ_k = s · λ_k S_k` (matches the `curvature_lambdas = s · λ`
+    ///   drift used inside the gradient's trace term),
+    /// * `K = H_op⁻¹ = (1/s) · (∇²(-ℓ) + λS)⁻¹`,
+    /// * `tr(K · ∂H_op/∂ρ_k) = tr((∇²(-ℓ) + λS)⁻¹ · λ_k S_k)` (the analytic
+    ///   gradient of the **unscaled** `log|H|`),
+    /// * `log|H_op| = log|∇²(-ℓ) + λS| + p · log(s)`, which the caller MUST
+    ///   un-scale by supplying `hessian_logdet_correction += −p · log(s)` so
+    ///   that `hop.logdet() + hessian_logdet_correction` evaluates the same
+    ///   unscaled `log|H|` whose derivative the gradient trace computes.
+    ///
+    /// Callers that set `rho_curvature_scale ≠ 1` without ALSO pre-scaling
+    /// `hessian_op` AND adding the matching `−p·log(s)` term to
+    /// `hessian_logdet_correction` will get a gradient that is off by the
+    /// factor `s` from `dV/dρ_k`.  The unified evaluator does **not** scale
+    /// `hop` for the caller — that would defeat the purpose of the
+    /// curvature-conditioning trick survival families use to keep the
+    /// outer eigendecomposition numerically stable.
+    ///
+    /// See `survival_location_scale::exact_newton_outer_curvature` for the
+    /// canonical example: `rho_curvature_scale = exp(-log_scale)` paired with
+    /// `hessian_logdet_correction = p · log_scale = −p · log(scale)`.
+    ///
+    /// The evaluator enforces `rho_curvature_scale > 0` and finite; pass
+    /// `1.0` (the documented default) when no curvature conditioning is in
+    /// play.
     pub rho_curvature_scale: f64,
 
     /// Configured prior over rho coordinates. The evaluator receives the
