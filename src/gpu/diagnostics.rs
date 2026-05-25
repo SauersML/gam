@@ -1,7 +1,10 @@
+#[cfg(target_os = "linux")]
 use super::super::device::GpuDeviceInfo;
+#[cfg(target_os = "linux")]
 use super::super::policy::GpuDispatchPolicy;
 use super::GpuRuntime;
 
+#[cfg(target_os = "linux")]
 pub(crate) fn log_cuda_enabled(device: &GpuDeviceInfo, policy: &GpuDispatchPolicy) {
     log::info!(
         "[GPU] CUDA acceleration enabled\n  device: {} '{}' | memory={}\n  libraries: CUDA driver ready; cuBLAS/cuSOLVER/cuSPARSE load on first use\n  dispatch: xtwx_rows>={} gemm>={}flop spmv_nnz>={} chol_p>={} syevd_p>={}",
@@ -16,6 +19,7 @@ pub(crate) fn log_cuda_enabled(device: &GpuDeviceInfo, policy: &GpuDispatchPolic
     );
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) fn log_cuda_pool(devices: &[GpuDeviceInfo]) {
     if devices.len() <= 1 {
         return;
@@ -51,6 +55,7 @@ pub(crate) fn log_cuda_disabled(reason: &str) {
     );
 }
 
+#[cfg(target_os = "linux")]
 fn format_count(value: u64) -> String {
     if value == u64::MAX {
         return "never".to_string();
@@ -68,6 +73,7 @@ fn format_count(value: u64) -> String {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn format_bytes(bytes: usize) -> String {
     const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
     const MIB: f64 = 1024.0 * 1024.0;

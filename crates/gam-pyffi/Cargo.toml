@@ -11,10 +11,6 @@ license = "AGPL-3.0-or-later"
 name = "gam_pyffi"
 crate-type = ["cdylib"]
 
-[features]
-default = []
-cuda = ["gam/cuda"]
-
 [dependencies]
 gam = { path = "../.." }
 pyo3 = { version = "0.28.3", features = ["abi3-py310", "extension-module"] }
