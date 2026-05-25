@@ -5642,6 +5642,7 @@ where
                                 options,
                                 &mut pending_arrow_latent_restore,
                             );
+                            final_state_cache_key = None;
                             final_state = Some(state);
                             status = PirlsStatus::StalledAtValidMinimum;
                             break 'pirls_loop;
@@ -5695,6 +5696,7 @@ where
                                 options,
                                 &mut pending_arrow_latent_restore,
                             );
+                            final_state_cache_key = None;
                             final_state = Some(state);
                             break 'pirls_loop;
                         }

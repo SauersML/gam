@@ -34,9 +34,9 @@ pub struct RemlComparison {
 pub struct RankedRow {
     pub name: String,
     pub score: f64,
-    /// Log-evidence gap from the winning model: `best_score - score`.
+    /// Log Bayes factor for this row against the winning model: `score - best_score`.
     pub delta: f64,
-    /// Bayes factor in favor of the winning model over this row.
+    /// Bayes factor for this row against the winning model.
     pub bayes_factor: f64,
     pub edf: Option<f64>,
 }
@@ -45,10 +45,10 @@ pub struct RankedRow {
 pub struct ScoreRow {
     pub name: String,
     pub reml_score: f64,
-    /// Log-evidence gap from the winning model: `best_score - reml_score`.
+    /// Log Bayes factor for this row against the winning model: `reml_score - best_score`.
     pub delta_reml: f64,
-    /// Bayes factor in favor of the winning model over this row.
-    pub bayes_factor_best_over_model: f64,
+    /// Bayes factor for this row against the winning model.
+    pub bayes_factor_vs_best: f64,
     pub effective_dof: Option<f64>,
 }
 
@@ -70,7 +70,7 @@ pub fn compare_reml_fits(mut candidates: Vec<RemlCandidate>) -> Result<RemlCompa
     let mut score_table = Vec::with_capacity(candidates.len());
 
     for row in candidates.iter() {
-        let delta = best_score - row.score;
+        let delta = row.score - best_score;
         let bayes_factor = delta.exp();
         ranking.push(RankedRow {
             name: row.name.clone(),
@@ -83,7 +83,7 @@ pub fn compare_reml_fits(mut candidates: Vec<RemlCandidate>) -> Result<RemlCompa
             name: row.name.clone(),
             reml_score: row.score,
             delta_reml: delta,
-            bayes_factor_best_over_model: bayes_factor,
+            bayes_factor_vs_best: bayes_factor,
             effective_dof: row.edf,
         });
     }
@@ -175,11 +175,12 @@ mod tests {
         assert_eq!(comparison.winner, "higher");
         assert_eq!(comparison.ranking[0].delta, 0.0);
         assert_eq!(comparison.ranking[0].bayes_factor, 1.0);
-        assert_eq!(comparison.ranking[1].delta, -3.0);
-        assert!((comparison.ranking[1].bayes_factor - (-3.0_f64).exp()).abs() < 1e-12);
-        assert_eq!(comparison.score_table[1].delta_reml, -3.0);
+        assert_eq!(comparison.ranking[1].delta, 3.0);
+        assert!((comparison.ranking[1].bayes_factor - 3.0_f64.exp()).abs() < 1e-12);
+        assert_eq!(comparison.score_table[1].delta_reml, 3.0);
         assert!(
-            (comparison.score_table[1].bayes_factor_vs_best - (-3.0_f64).exp()).abs() < 1e-12
+            (comparison.score_table[1].bayes_factor_best_over_model - 3.0_f64.exp()).abs()
+                < 1e-12
         );
     }
 }

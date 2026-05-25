@@ -17725,6 +17725,7 @@ mod tests {
             &penalty_a_k_betas,
             &zero_residual,
             true,
+            &[false, false],
         )
         .expect("kkt correction must succeed at zero residual");
 
