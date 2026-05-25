@@ -5242,9 +5242,11 @@ fn prepare_identified_time_block(
     monotone_time_wiggle_ncols: usize,
 ) -> Result<TimeBlockPrepared, String> {
     let p = input.design_exit.ncols();
-    if !input.structural_monotonicity {
-        return Err(SurvivalLocationScaleError::InvalidConfiguration { reason: "time_block requires structural monotonicity by construction; non-structural time transforms are no longer supported"
-                .to_string(), }.into());
+    if !input.time_monotonicity.is_coordinate_cone() {
+        return Err(SurvivalLocationScaleError::InvalidConfiguration { reason: format!(
+            "time_block requires a coordinate-cone monotonicity strategy by construction; got {:?}",
+            input.time_monotonicity
+        ) }.into());
     }
     // Materialize to dense at the location-scale boundary — the hot path
     // uses dense matrix operations (scale_dense_rows, weighted_crossprod_dense).
@@ -10440,7 +10442,7 @@ pub(crate) fn fit_survival_location_scale_terms(
                 offset_entry: spec.time_block.offset_entry.clone(),
                 offset_exit: spec.time_block.offset_exit.clone(),
                 derivative_offset_exit: spec.time_block.derivative_offset_exit.clone(),
-                structural_monotonicity: spec.time_block.structural_monotonicity,
+                time_monotonicity: spec.time_block.time_monotonicity,
                 penalties: spec.time_block.penalties.clone(),
                 nullspace_dims: spec.time_block.nullspace_dims.clone(),
                 initial_log_lambdas: Some(layout.time_from(rho)),
