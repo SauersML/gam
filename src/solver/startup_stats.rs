@@ -178,6 +178,12 @@ pub(crate) fn structural_diagnosis_hint(key: &StructuralKey) -> String {
              outer cascade cannot grow the active set further without changing the \
              smooth's constraint family."
         ),
+        KktRefusalDiagnosis::AliasingDetectedAtFit => format!(
+            "cross-block identifiability aliasing surfaced at {carrying_label} during the \
+             inner solve — a binding active set or λ-dependent direction created an alias \
+             the pre-fit audit could not see. Structural fix only: drop or reparameterise \
+             the aliased block; no rho-anneal will recover."
+        ),
     }
 }
 

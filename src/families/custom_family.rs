@@ -6717,6 +6717,19 @@ pub enum CustomFamilyError {
     UnsupportedConfiguration { reason: String },
     #[error("{reason}")]
     BasisDecompositionFailed { reason: String },
+    /// Pre-fit cross-block identifiability audit refused the fit. The
+    /// joint design across `ParameterBlockSpec`s carries a rank
+    /// deficiency that the post-`joint_null_rotation` absorption did
+    /// not resolve: two or more blocks contribute the same direction,
+    /// or a structural >2-way alias was detected without per-pair
+    /// attribution. The full `IdentifiabilityAudit` is held so
+    /// consumers (logs, structured-error sinks, the seed driver's
+    /// classifier) can extract the alias pairs and the summary string
+    /// without reparsing.
+    #[error("identifiability audit refused the fit: {}", audit.summary)]
+    IdentifiabilityFailure {
+        audit: crate::solver::identifiability_audit::IdentifiabilityAudit,
+    },
 }
 
 impl From<String> for CustomFamilyError {
@@ -11294,6 +11307,12 @@ pub(crate) enum KktRefusalDiagnosis {
     RankDeficientHPen,
     PhantomMultiplierWithWellConditionedH,
     ActiveSetIncomplete,
+    /// Cross-block identifiability aliasing surfaced mid-inner-solve
+    /// (e.g., a binding active set materialised a 2-way alias that
+    /// the pre-fit audit could not see at the cold design). The fix
+    /// is structural — drop or reparameterise the aliased block;
+    /// rho-anneal will not recover.
+    AliasingDetectedAtFit,
 }
 
 impl KktRefusalDiagnosis {
@@ -11304,6 +11323,7 @@ impl KktRefusalDiagnosis {
                 "phantom_multiplier_with_well_conditioned_H"
             }
             KktRefusalDiagnosis::ActiveSetIncomplete => "active_set_incomplete",
+            KktRefusalDiagnosis::AliasingDetectedAtFit => "aliasing_detected_at_fit",
         }
     }
 
@@ -11323,6 +11343,7 @@ impl KktRefusalDiagnosis {
                 Some(KktRefusalDiagnosis::PhantomMultiplierWithWellConditionedH)
             }
             "active_set_incomplete" => Some(KktRefusalDiagnosis::ActiveSetIncomplete),
+            "aliasing_detected_at_fit" => Some(KktRefusalDiagnosis::AliasingDetectedAtFit),
             _ => None,
         }
     }
@@ -11646,7 +11667,7 @@ fn compute_kkt_refusal_report(
         KktRefusalDiagnosis::RankDeficientHPen
     } else if any_block_has_constraints
         && cached_active_sets.iter().any(|s| s.is_some())
-        && projected_residual_inf > 4.0 * residual_tol
+        && projected_residual_inf > residual_tol
     {
         // Well-conditioned H_pen, the user has bound constraints, the current
         // active set already pinned some rows, yet the projected residual is
@@ -11740,7 +11761,7 @@ impl KktRefusalReport {
     /// reported aggregate residual + cert math).
     fn format_structured_log(&self, four_tol: f64) -> String {
         format!(
-            "[PIRLS/joint-Newton convergence] cycle {:>3} | cert REFUSED: residual={:.3e} > 4·tol={:.3e} (cert)\n  \
+            "[PIRLS/joint-Newton convergence] cycle {:>3} | cert REFUSED: residual={:.3e} > tol={:.3e} (cert)\n  \
              carrying-block: {}\n  \
              block_names={:?}, block_widths={:?}, block_grad_inf={:?}, block_penalty_grad_inf={:?}, block_residual_inf={:?}\n  \
              H_pen spectrum: λ_max={:.3e}, λ_min={:.3e}, cond={:.3e}, nullity@{:.0e}={} (of {} eigenvalues)\n  \
@@ -11783,7 +11804,7 @@ impl KktRefusalReport {
     fn format_bubbled_error(&self) -> String {
         let carrying = self.carrying_block_label();
         format!(
-            "cycle={} cert REFUSED: residual={:.3e} > 4·tol={:.3e}; \
+            "cycle={} cert REFUSED: residual={:.3e} > tol={:.3e}; \
              carrying-block: {}; block_names={:?}, block_widths={:?}, \
              block_grad_inf={:?}, block_penalty_grad_inf={:?}, block_residual_inf={:?}; \
              H_pen spectrum: λ_max={:.3e}, λ_min={:.3e}, cond={:.3e}, nullity@{:.0e}={}/{}; \
@@ -12105,7 +12126,7 @@ fn constrained_stationary_certificate_decision(
     // small tolerance band is intentionally tied to the inner residual
     // tolerance, because this branch is allowed to certify convergence only
     // when the active-set projection has actually captured the multiplier.
-    let cert_residual_factor = 4.0;
+    let cert_residual_factor = 1.0;
     if residual.is_finite() && residual <= cert_residual_factor * residual_tol {
         ConstrainedStationaryCertificate::Accept
     } else {
@@ -20606,11 +20627,11 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     //
     // Contract: specs arrive *after* `nullspace-lead`'s
     // `joint_null_rotation` absorption — the audit inspects rotated
-    // columns only. A clean audit returns `Reparameterised`-equivalent
-    // (`fatal=false`, possibly with logged alias pairs); a fatal audit
-    // returns `CustomFamilyError::DimensionMismatch` carrying the
-    // audit summary. Per the panic-vs-Err contract: never panic
-    // mid-construction.
+    // columns only. A clean audit returns `fatal=false` (possibly with
+    // logged alias pairs); a fatal audit returns
+    // `CustomFamilyError::IdentifiabilityFailure { audit }` carrying
+    // the full structured report. Per the panic-vs-Err contract:
+    // never panic mid-construction.
     let audit =
         crate::solver::identifiability_audit::audit_identifiability(specs).map_err(|reason| {
             CustomFamilyError::DimensionMismatch {
@@ -20618,12 +20639,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             }
         })?;
     if audit.fatal {
-        return Err(CustomFamilyError::DimensionMismatch {
-            reason: format!(
-                "pre-fit identifiability audit refused the fit: {summary}",
-                summary = audit.summary,
-            ),
-        });
+        return Err(CustomFamilyError::IdentifiabilityFailure { audit });
     }
     if !audit.aliased_pairs.is_empty() {
         log::info!("[identifiability audit] {}", audit.summary);

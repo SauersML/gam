@@ -380,9 +380,15 @@ pub struct SmoothTerm {
     /// (`γ`) coordinate system, with `β_raw = Q · γ` recovering the raw
     /// pre-rotation parameterization. `None` means either no joint null
     /// space (penalty already full-rank) or rotation was suppressed —
-    /// see `should_apply_joint_null_rotation` for the latter conditions.
+    /// suppression fires when the smooth carries shape constraints
+    /// (lower bounds or local linear inequalities) that would lose their
+    /// cone geometry under a general orthogonal rotation.
     ///
-    /// Prediction-side `X_new_raw · Q` replay uses this field at runtime.
+    /// Prediction-side replay: callers building a new-data design `X_new_raw`
+    /// from the *raw* basis must call [`SmoothTerm::apply_rotation_to_predict`]
+    /// (or equivalent) to obtain `X_new = X_new_raw · Q` matching this
+    /// term's coefficient system.
+    ///
     /// **Persistence gap (Stage-3c follow-up):** `SmoothTerm` is not
     /// `Serialize`/`Deserialize` and the fitted-model artifact persists
     /// via `FittedModelPayload`, so a saved-and-reloaded model loses `Q`.
@@ -392,6 +398,47 @@ pub struct SmoothTerm {
     /// is the per-family `FittedModelPayload::new` plumbing — not a new
     /// dependency). In-memory fit→predict in the same process is correct.
     pub joint_null_rotation: Option<crate::terms::basis::JointNullRotation>,
+}
+
+impl SmoothTerm {
+    /// Apply the joint-null absorption rotation to a raw new-data design
+    /// matrix, returning `X_new_raw · Q` when this term was rotated at
+    /// fit time, or `X_new_raw` unchanged when no rotation was applied.
+    ///
+    /// Callers in the prediction path: after building the smooth's basis
+    /// at new data via the *raw* basis builder (the same builder used at
+    /// fit time, applied to `x_new` instead of the training rows), call
+    /// this method on the resulting matrix before forming `X · β`. The
+    /// fitted `β` lives in `γ`-coordinates if Q was applied; multiplying
+    /// the un-rotated `X_new_raw` by `β` would give a wrong η.
+    ///
+    /// Returns an error if the raw design's column count does not match
+    /// the rotation's `p_local`. The width invariant must hold: the raw
+    /// basis builder MUST emit the same `p_local` columns that the
+    /// fit-time builder did, and the rotation is `(p_local × p_local)`.
+    pub fn apply_rotation_to_predict(
+        &self,
+        x_new_raw: Array2<f64>,
+    ) -> Result<Array2<f64>, BasisError> {
+        let Some(rot) = self.joint_null_rotation.as_ref() else {
+            return Ok(x_new_raw);
+        };
+        let p_local = rot.rotation.nrows();
+        if x_new_raw.ncols() != p_local {
+            return Err(BasisError::DimensionMismatch(format!(
+                "joint-null rotation replay for term '{}': raw design has {} columns, \
+                 rotation expects {} (the raw basis builder must emit the same column \
+                 count as at fit time)",
+                self.name,
+                x_new_raw.ncols(),
+                p_local,
+            )));
+        }
+        Ok(crate::linalg::faer_ndarray::fast_ab(
+            &x_new_raw,
+            &rot.rotation,
+        ))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
