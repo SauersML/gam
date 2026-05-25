@@ -60,19 +60,35 @@ class Smooth(BasisDescriptor):
     def __init__(
         self,
         *,
-        latent: ManifoldDescriptor,
-        basis: BasisDescriptor,
+        latent: ManifoldDescriptor | type,
+        basis: BasisDescriptor | type | None = None,
         penalty: PenaltyDescriptor | None = None,
         name: str | None = None,
     ) -> None:
+        # Magic-by-default: accept the class form ``latent=Circle`` (auto-
+        # instantiate), and auto-pick a sensible basis + penalty when omitted.
+        if isinstance(latent, type) and issubclass(latent, ManifoldDescriptor):
+            latent = latent()
         if not isinstance(latent, ManifoldDescriptor):
             raise TypeError(
-                f"Smooth.latent must be a ManifoldDescriptor, got {type(latent).__name__}"
+                f"Smooth.latent must be a ManifoldDescriptor (class or instance), "
+                f"got {type(latent).__name__}"
             )
+
+        if basis is None:
+            basis = _default_basis_for(latent)
+        elif isinstance(basis, type) and issubclass(basis, BasisDescriptor):
+            basis = basis()
         if not isinstance(basis, BasisDescriptor):
             raise TypeError(
-                f"Smooth.basis must be a BasisDescriptor, got {type(basis).__name__}"
+                f"Smooth.basis must be a BasisDescriptor (class or instance), "
+                f"got {type(basis).__name__}"
             )
+
+        _check_manifold_basis_compatibility(latent, basis)
+
+        if penalty is None:
+            penalty = _default_penalty_for(latent)
         if penalty is not None and not isinstance(penalty, PenaltyDescriptor):
             raise TypeError(
                 f"Smooth.penalty must be a PenaltyDescriptor or None, "

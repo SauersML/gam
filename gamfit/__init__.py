@@ -154,20 +154,15 @@ from .smooth import (
     PeriodicSplineCurve,
     ShapeConstraintLiteral,
     Smooth as SmoothSpec,
-    Sphere as SphereSpline,
+    Sphere,
     TensorBSpline,
 )
 from ._protocol import BasisDescriptor, ManifoldDescriptor, PenaltyDescriptor
-from ._manifold import (
-    Circle as Circle,
-    CylinderManifold as CylinderManifold,
-    Euclidean as Euclidean,
-    Sphere as Sphere,
-    Torus as Torus,
-)
+from . import manifolds  # noqa: F401  expose gamfit.manifolds.Circle, …
 from ._basis_descriptors import Fourier, PeriodicHarmonic
 from ._composite_penalty import CompositePenalty
-from ._smooth import Smooth, SmoothSum
+from ._smooth import Smooth, SmoothSum  # compositional Smooth(latent=..., basis=..., penalty=...)
+ComposedSmooth = Smooth  # explicit alias for callers preferring the descriptive name
 from ._penalty_descriptors import (
     ARDPenalty as _ARDPenaltyDescriptor,
     BlockOrthogonalityDescriptor,
