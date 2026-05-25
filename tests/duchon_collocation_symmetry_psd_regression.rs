@@ -1,6 +1,4 @@
-use gam::terms::basis::{
-    DuchonNullspaceOrder, build_duchon_operator_penalty_matrices,
-};
+use gam::terms::basis::{DuchonNullspaceOrder, build_duchon_operator_penalty_matrices};
 use ndarray::Array2;
 
 #[test]

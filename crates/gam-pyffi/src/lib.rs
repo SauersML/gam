@@ -82,10 +82,10 @@ use gam::terms::{
     IBPAssignmentPenalty as CoreIBPAssignmentPenalty, IsometryPenalty as CoreIsometryPenalty,
     IvaeRidgeMeanGauge as IvaeRidgeMeanGaugePenalty, JumpReLUPenalty as RustJumpReLUPenalty,
     MaternBasisGradientTarget, MechanismSparsityPenalty as CoreMechanismSparsityPenalty,
-    NestedPrefixPenalty as CoreNestedPrefixPenalty,
-    NuclearNormPenalty as CoreNuclearNormPenalty, OrthogonalityPenalty as CoreOrthogonalityPenalty,
-    ParametricRowPrecisionPriorPenalty, PenaltyConcavity, PenaltyTier, PsiSlice,
-    RowPrecisionPriorPenalty, ScadMcpPenalty as CoreScadMcpPenalty, ScalarWeightSchedule,
+    NestedPrefixPenalty as CoreNestedPrefixPenalty, NuclearNormPenalty as CoreNuclearNormPenalty,
+    OrthogonalityPenalty as CoreOrthogonalityPenalty, ParametricRowPrecisionPriorPenalty,
+    PenaltyConcavity, PenaltyTier, PsiSlice, RowPrecisionPriorPenalty,
+    ScadMcpPenalty as CoreScadMcpPenalty, ScalarWeightSchedule,
     SoftmaxAssignmentSparsityPenalty as CoreSoftmaxAssignmentSparsityPenalty,
     SparsityPenalty as CoreSparsityPenalty, StreamingMaternBasisGradientEvaluator,
     TopKActivationPenalty, TotalVariationPenalty as CoreTotalVariationPenalty,
@@ -2091,11 +2091,8 @@ fn saved_model_payload_string(model_bytes: Vec<u8>, key: &str) -> PyResult<Optio
 }
 
 fn required_saved_model_payload_string_value(model_bytes: &[u8], key: &str) -> PyResult<String> {
-    saved_model_payload_string(model_bytes.to_vec(), key)?.ok_or_else(|| {
-        py_value_error(format!(
-            "saved model payload is missing {key}"
-        ))
-    })
+    saved_model_payload_string(model_bytes.to_vec(), key)?
+        .ok_or_else(|| py_value_error(format!("saved model payload is missing {key}")))
 }
 
 #[pyfunction]
@@ -9273,23 +9270,44 @@ fn sae_manifold_assignment_summary(
     assignments: PyReadonlyArray2<'_, f64>,
     threshold: f64,
 ) -> PyResult<(f64, f64)> {
+    if !threshold.is_finite() {
+        return Err(py_value_error(
+            "sae_manifold_assignment_summary: threshold must be finite".into(),
+        ));
+    }
     let a = assignments.as_array();
     let (n_rows, k) = a.dim();
     if n_rows == 0 || k == 0 {
-        return Ok((0.0, 0.0));
+        return Err(py_value_error(
+            "sae_manifold_assignment_summary: assignments must be non-empty".into(),
+        ));
     }
+    let n_entries = n_rows.checked_mul(k).ok_or_else(|| {
+        py_value_error("sae_manifold_assignment_summary: assignments shape is too large".into())
+    })?;
     let mut active_total = 0_usize;
     let mut mass_total = 0.0_f64;
     for row in 0..n_rows {
         for col in 0..k {
-            mass_total += a[[row, col]];
-            if a[[row, col]] >= threshold {
+            let assignment = a[[row, col]];
+            if !assignment.is_finite() {
+                return Err(py_value_error(format!(
+                    "sae_manifold_assignment_summary: non-finite assignment at ({row}, {col})"
+                )));
+            }
+            mass_total += assignment;
+            if !mass_total.is_finite() {
+                return Err(py_value_error(
+                    "sae_manifold_assignment_summary: assignment mass overflowed".into(),
+                ));
+            }
+            if assignment >= threshold {
                 active_total += 1;
             }
         }
     }
     let avg_active = active_total as f64 / n_rows as f64;
-    let mean_mass = mass_total / (n_rows * k) as f64;
+    let mean_mass = mass_total / n_entries as f64;
     Ok((avg_active, mean_mass))
 }
 
@@ -12357,17 +12375,12 @@ fn summary_payload_from_model(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<
 fn smoothing_parameters_from_model(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<PyObject> {
     let payload = summary_payload_from_model_bytes(&model_bytes)?;
     let out = PyDict::new(py);
-    let Some(lambdas) = payload
-        .get("lambdas")
-        .and_then(serde_json::Value::as_array)
-    else {
+    let Some(lambdas) = payload.get("lambdas").and_then(serde_json::Value::as_array) else {
         return Ok(out.unbind().into_any());
     };
     for (idx, value) in lambdas.iter().enumerate() {
         let lambda = value.as_f64().ok_or_else(|| {
-            py_value_error(format!(
-                "summary lambdas[{idx}] must be a JSON number"
-            ))
+            py_value_error(format!("summary lambdas[{idx}] must be a JSON number"))
         })?;
         out.set_item(idx, lambda)?;
     }
@@ -16039,7 +16052,11 @@ fn default_weight_auto_py() -> PyObject {
 
 /// Build a `PyObject` containing the default difference-operator sentinel `"forward_1d"`.
 fn default_forward_1d_py() -> PyObject {
-    Python::attach(|py| pyo3::types::PyString::new(py, "forward_1d").into_any().unbind())
+    Python::attach(|py| {
+        pyo3::types::PyString::new(py, "forward_1d")
+            .into_any()
+            .unbind()
+    })
 }
 
 fn target_descriptor(py: Python<'_>, target: &Bound<'_, PyAny>) -> PyResult<PyObject> {

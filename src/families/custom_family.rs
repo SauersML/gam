@@ -11919,8 +11919,11 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // constraints and the adaptive trust radius remain the safeguards
             // against runaway proposals.
             if cycle == 0 {
-                let initial_block_norms =
-                    joint_trust_region_block_metric_norms(&delta, &ranges, &joint_trust_metric_diag);
+                let initial_block_norms = joint_trust_region_block_metric_norms(
+                    &delta,
+                    &ranges,
+                    &joint_trust_metric_diag,
+                );
                 for (radius, norm) in joint_block_trust_radii.iter_mut().zip(initial_block_norms) {
                     if norm.is_finite() && norm > *radius {
                         *radius = norm;
@@ -12021,20 +12024,18 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     &joint_trust_metric_diag,
                     &joint_block_trust_radii,
                 );
-                if apply_block_local_feasibility_limits(
-                    family,
-                    &states,
-                    &ranges,
-                    &mut trial_delta,
-                )
-                .is_err()
+                if apply_block_local_feasibility_limits(family, &states, &ranges, &mut trial_delta)
+                    .is_err()
                 {
                     joint_trust_radius =
                         shrink_joint_block_trust_radii(&mut joint_block_trust_radii, 0.25);
                     continue;
                 }
-                block_step_norms =
-                    joint_trust_region_block_metric_norms(&trial_delta, &ranges, &joint_trust_metric_diag);
+                block_step_norms = joint_trust_region_block_metric_norms(
+                    &trial_delta,
+                    &ranges,
+                    &joint_trust_metric_diag,
+                );
                 let step_norm = block_step_norms.iter().copied().fold(0.0_f64, f64::max);
                 let trial_step_inf = trial_delta
                     .iter()
@@ -12045,9 +12046,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     .iter()
                     .zip(&joint_block_trust_radii)
                     .any(|(step_norm, radius)| {
-                        step_norm.is_finite()
-                            && *radius > 0.0
-                            && *step_norm >= 0.99 * *radius
+                        step_norm.is_finite() && *radius > 0.0 && *step_norm >= 0.99 * *radius
                     });
                 let mut hpen_delta = Array1::<f64>::zeros(total_p);
                 // Predicted reduction must use the TRUE penalized Hessian
@@ -12182,8 +12181,9 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     old_objective,
                 );
                 let old_radius = joint_trust_radius;
-                for (block_radius, block_step_norm) in
-                    joint_block_trust_radii.iter_mut().zip(block_step_norms.iter().copied())
+                for (block_radius, block_step_norm) in joint_block_trust_radii
+                    .iter_mut()
+                    .zip(block_step_norms.iter().copied())
                 {
                     *block_radius = update_joint_trust_region_radius(
                         *block_radius,
