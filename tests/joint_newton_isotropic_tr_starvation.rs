@@ -315,3 +315,179 @@ fn joint_newton_isotropic_l2_tr_produces_production_linearized_rate_stall() {
         "block-local curvature metric should remove the starvation mechanism; got {fixed_linearized_rel:.3e}",
     );
 }
+
+// ────────────────────────────────────────────────────────────────────
+// MISTAKE B: per-block trust radii share the joint scalar ρ.
+//
+// Setup: two blocks. Block A's δ would reduce the objective. Block B's δ
+// would increase it. The JOINT actual-reduction sums both → can be small
+// or negative even though Block A made real progress. gam's update loop
+// then shrinks BOTH block radii by the same factor (since they both see
+// the same actual_reduction and predicted_reduction inputs).
+//
+// The right behaviour: keep / grow Block A's radius, shrink Block B's.
+// The current code can't because the per-block ρ is not separable
+// without per-block likelihood/penalty contribution accounting.
+// ────────────────────────────────────────────────────────────────────
+
+/// Mirror of gam's `update_joint_trust_region_radius` signature: returns
+/// the new radius given a step norm and the JOINT actual/predicted
+/// reduction. (Inlined here so this test is independent of the test
+/// support module that currently does not compile.)
+fn update_radius_joint_rho(
+    old_radius: f64,
+    step_norm: f64,
+    actual_reduction: f64,
+    predicted_reduction: f64,
+) -> f64 {
+    let rho = if predicted_reduction > 0.0 {
+        actual_reduction / predicted_reduction
+    } else if actual_reduction >= 0.0 {
+        1.0
+    } else {
+        f64::NEG_INFINITY
+    };
+    let accepted = rho.is_finite() && rho > 0.0;
+    let mut radius = old_radius;
+    if !accepted {
+        radius *= 0.25;
+        if step_norm.is_finite() && step_norm > 0.0 {
+            radius = radius.min(0.5 * step_norm);
+        }
+    } else if rho < 0.25 {
+        radius *= 0.25;
+    } else if rho > 0.75 && step_norm >= 0.99 * old_radius {
+        radius *= 2.0;
+    }
+    radius.clamp(1.0e-12, 1.0e6)
+}
+
+#[test]
+fn mistake_b_per_block_radii_share_joint_rho_punishes_progressing_block() {
+    // Block A: tiny well-chosen step gives actual_a = 100, predicted_a = 100.
+    // Block B: large badly-chosen step gives actual_b = -200, predicted_b = +20.
+    let actual_a = 100.0_f64;
+    let predicted_a = 100.0_f64;
+    let actual_b = -200.0_f64;
+    let predicted_b = 20.0_f64;
+
+    // Per-block ρ (the "ideal" view)
+    let rho_a = actual_a / predicted_a; //  +1.00
+    let rho_b = actual_b / predicted_b; //  −10.00 — bad
+    assert!(rho_a >= 0.75 && rho_b <= 0.0);
+
+    // JOINT view (what gam actually feeds the radius update):
+    let actual_joint = actual_a + actual_b; //  −100
+    let predicted_joint = predicted_a + predicted_b; //  +120
+    let rho_joint = actual_joint / predicted_joint; //  −0.83
+
+    let r_a_old = 1.0;
+    let r_b_old = 5.0;
+    let step_a = 0.1; // tiny progressive step in block A
+    let step_b = 4.9; // large bad step in block B
+
+    let r_a_new = update_radius_joint_rho(r_a_old, step_a, actual_joint, predicted_joint);
+    let r_b_new = update_radius_joint_rho(r_b_old, step_b, actual_joint, predicted_joint);
+
+    eprintln!(
+        "[mistake-B] rho_per_block = (A={:.2}, B={:.2}) but rho_joint = {:.2}",
+        rho_a, rho_b, rho_joint
+    );
+    eprintln!(
+        "[mistake-B] r_A: {:.3} -> {:.3} (block A made real progress, radius MUST not shrink)",
+        r_a_old, r_a_new
+    );
+    eprintln!(
+        "[mistake-B] r_B: {:.3} -> {:.3} (block B caused damage, radius SHOULD shrink)",
+        r_b_old, r_b_new
+    );
+
+    // PROGRESSING block must not be punished by another block's failure.
+    // Currently gam's loop applies the joint ρ to every block → A shrinks.
+    assert!(
+        r_a_new >= r_a_old,
+        "MISTAKE B: progressing block A had ρ_per_block = +1.00 (perfect Newton step) \
+         but joint ρ = {:.2} dragged its trust radius from {:.3} down to {:.3}. \
+         A well-conditioned block making real progress must NOT have its trust \
+         radius collapsed because an unrelated block (B, ρ={:.2}) overshot. The \
+         per-block radii in `joint_block_trust_radii` are nominally independent, \
+         but they are updated using the JOINT scalar (actual_reduction, \
+         predicted_reduction) at custom_family.rs:12184-12196, which couples \
+         them. The fix is to compute per-block (actual, predicted) reductions \
+         and update each radius with its OWN ρ.",
+        rho_joint, r_a_old, r_a_new, rho_b,
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────
+// MISTAKE C: survival_marginal_slope's per-block feasibility shrinks one
+// block while leaving others at their unconstrained Newton magnitude.
+//
+// Setup: time block's `max_feasible_time_step` returns α = 1e-4 (because
+// the unconstrained δ_time would cross a monotonicity guard). gam's
+// `apply_block_local_feasibility_limits` multiplies ONLY the time block
+// by α → time goes to ~0, logslope and marginal blocks keep their full
+// unconstrained δ.
+//
+// The "joint" step the line search evaluates is then:
+//   δ = (≈0 time, large marg, huge logslope)
+// which is NOT a Newton step on the joint objective. The line search ρ
+// is dominated by whatever marg/logslope do; the time-block descent
+// direction is effectively lost. Production observes exactly this:
+// time stays at 2.3e-4 forever.
+// ────────────────────────────────────────────────────────────────────
+
+#[test]
+fn mistake_c_per_block_feasibility_alpha_destroys_joint_newton_direction() {
+    // Build a tiny 2-block problem where the Newton step is δ̂ = (1, 1)
+    // and the time-block feasibility forces α_time = 0.01 (so δ_time
+    // becomes 0.01 instead of 1) while the other block stays at δ_other = 1.
+    // Block 0: time, well-conditioned, H = 1, g = -1, so δ̂_time = 1
+    // Block 1: other,                 H = 1, g = -1, so δ̂_other = 1
+    let h = ndarray::array![[1.0, 0.0], [0.0, 1.0]];
+    let g = ndarray::array![-1.0, -1.0];
+    let delta_hat = ndarray::array![1.0, 1.0];
+
+    // Sanity: full Newton kills g exactly.
+    let exact_residual = &g + &h.dot(&delta_hat);
+    assert!(
+        exact_residual.iter().all(|v| v.abs() < 1e-12),
+        "unconstrained Newton must be exact on this 2-block linear system"
+    );
+
+    // Now apply gam's per-block-only feasibility shrink to block 0.
+    let alpha_time = 0.01_f64;
+    let mut delta = delta_hat.clone();
+    delta[0] *= alpha_time;
+
+    let residual = &g + &h.dot(&delta);
+    let linearized_rel = residual.iter().map(|v| v.abs()).fold(0.0_f64, f64::max)
+        / (1.0 + g.iter().map(|v| v.abs()).fold(0.0_f64, f64::max));
+    eprintln!(
+        "[mistake-C] delta after per-block α_time={:.0e}: ({:.3e}, {:.3e})",
+        alpha_time, delta[0], delta[1]
+    );
+    eprintln!("[mistake-C] linearized_rel = {:.3e}", linearized_rel);
+
+    // The "joint" step δ = (0.01, 1) is NOT the joint Newton direction.
+    // The time-block gradient (which was -1) is only reduced by 0.01
+    // because Hδ_time = 0.01 → g_time + Hδ_time = -1 + 0.01 = -0.99.
+    // The compatible joint Newton step that respects time's feasibility
+    // would be α · δ̂ = (0.01, 0.01), which keeps the directions
+    // co-linear. The current implementation breaks co-linearity.
+    assert!(
+        delta[0].abs() < 0.1 * delta[1].abs(),
+        "MISTAKE C: after per-block feasibility, time block is crushed ({:.3e}) \
+         while other block keeps its full step ({:.3e}). Their ratio is {:.1}×, \
+         not 1× as the joint Newton direction requires. This is the production \
+         signature: time block barely moves, gradient in time direction NEVER \
+         reduced. The joint linearised residual stays at the time-direction \
+         gradient magnitude forever. Fix: when a block's feasibility forces \
+         α < 1, scale the JOINT step by α (preserving Newton direction), or \
+         re-solve the QP with that block's hyperplane added — never multiply \
+         one block in isolation.",
+        delta[0],
+        delta[1],
+        delta[1].abs() / delta[0].abs(),
+    );
+}

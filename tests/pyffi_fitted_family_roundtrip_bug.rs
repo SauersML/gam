@@ -2,7 +2,30 @@ use gam::inference::model::FittedFamily;
 
 #[test]
 fn fitted_family_marginal_slope_deserializes_without_base_link_for_backward_compat() {
-    let raw = r#"{\"family_kind\":\"marginal-slope\",\"likelihood\":{\"response\":\"Binomial\",\"inverse\":{\"Standard\":\"Logit\"},\"scale\":\"Fixed\"},\"frailty\":{\"kind\":\"none\"}}"#;
+    // Saved fits produced before `base_link` was added to FittedFamily::MarginalSlope
+    // omit that field entirely. Deserialization must still succeed so older artifacts
+    // remain loadable; the field defaults to `None`.
+    let raw = r#"{
+        "family_kind": "marginal-slope",
+        "likelihood": {
+            "response": "Binomial",
+            "link": { "Standard": "Logit" }
+        },
+        "frailty": { "frailty_kind": "none" }
+    }"#;
     let parsed: Result<FittedFamily, _> = serde_json::from_str(raw);
-    assert_eq!(parsed.is_ok(), true);
+    assert!(
+        parsed.is_ok(),
+        "expected backward-compat deserialization to succeed, got {:?}",
+        parsed.err()
+    );
+    match parsed.unwrap() {
+        FittedFamily::MarginalSlope { base_link, .. } => {
+            assert!(
+                base_link.is_none(),
+                "missing base_link must default to None"
+            );
+        }
+        other => panic!("expected FittedFamily::MarginalSlope, got {other:?}"),
+    }
 }

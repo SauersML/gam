@@ -22997,6 +22997,82 @@ fn build_analytic_penalty_registry_from_json(
                     ),
                 );
             }
+            "nested_prefix" | "nestedprefix" => {
+                descriptor_no_unknown_keys(
+                    descriptor,
+                    &context,
+                    &[
+                        "kind",
+                        "target",
+                        "prefix_sizes",
+                        "shell_weights",
+                        "eps",
+                        "tier",
+                        "weight_schedule",
+                    ],
+                )?;
+                let prefix_values = descriptor
+                    .get("prefix_sizes")
+                    .and_then(serde_json::Value::as_array)
+                    .ok_or_else(|| {
+                        format!(
+                            "{context}.prefix_sizes must be a non-empty array of positive integers"
+                        )
+                    })?;
+                if prefix_values.is_empty() {
+                    return Err(format!("{context}.prefix_sizes must be non-empty"));
+                }
+                let mut prefix_sizes: Vec<usize> = Vec::with_capacity(prefix_values.len());
+                for (idx, raw) in prefix_values.iter().enumerate() {
+                    let cell = raw.as_u64().ok_or_else(|| {
+                        format!("{context}.prefix_sizes[{idx}] must be a positive integer")
+                    })?;
+                    prefix_sizes.push(json_positive_u64_to_usize(
+                        cell,
+                        &format!("{context}.prefix_sizes[{idx}]"),
+                    )?);
+                }
+                let shell_array = descriptor_array1_flat(descriptor, "shell_weights", &context)?;
+                if shell_array.len() != prefix_sizes.len() {
+                    return Err(format!(
+                        "{context}.shell_weights length {} must equal prefix_sizes length {}",
+                        shell_array.len(),
+                        prefix_sizes.len()
+                    ));
+                }
+                let shell_weights: Vec<f64> = shell_array.to_vec();
+                let eps = descriptor_f64(descriptor, "eps", 1.0e-6)?;
+                let tier_str = descriptor
+                    .get("tier")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("psi")
+                    .to_ascii_lowercase();
+                let tier = match tier_str.as_str() {
+                    "psi" => PenaltyTier::Psi,
+                    "beta" => PenaltyTier::Beta,
+                    "rho" => PenaltyTier::Rho,
+                    other => {
+                        return Err(format!(
+                            "{context}.tier must be one of 'psi', 'beta', 'rho'; got {other:?}"
+                        ));
+                    }
+                };
+                let penalty = CoreNestedPrefixPenalty::new(
+                    slice,
+                    tier,
+                    prefix_sizes,
+                    shell_weights,
+                    eps,
+                )
+                .map_err(|err| format!("{context}: {err}"))?;
+                let penalty = match weight_schedule {
+                    Some(schedule) => penalty.with_weight_schedule(schedule),
+                    None => penalty,
+                };
+                registry.push(gam::terms::AnalyticPenaltyKind::NestedPrefix(
+                    std::sync::Arc::new(penalty),
+                ));
+            }
             other => {
                 return Err(format!(
                     "{context}.kind has unsupported analytic penalty {other:?}"
