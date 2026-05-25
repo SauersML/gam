@@ -96,6 +96,8 @@ __all__ = [
     "Penalty",
 ]
 
+from ._binding import rust_module as _rust_module; BlockSparsityPenalty = _rust_module().BlockSparsityPenalty
+
 
 class AnalyticPenaltyKind(str, Enum):
     """Stable Python names for Rust analytic penalty descriptor kinds."""
@@ -758,119 +760,6 @@ class NuclearNormPenalty(_AnalyticPenalty):
             "max_rank": self.max_rank,
             "learnable": self.learnable,
         }
-
-
-@dataclass(init=False, slots=True)
-class BlockSparsityPenalty(_AnalyticPenalty):
-    """Group-lasso sparsity over predefined latent-axis groups.
-    KIND_TAG = "block_sparsity"
-
-    Uses ``sum_g sqrt(||T[:, G_g]||² + ε²)``. This differs from per-element
-    L¹ by selecting whole groups, and from ARD by applying L¹ to each group's
-    L² norm rather than an independent axis precision. Pair with
-    ``LatentIdMode.AuxPriorDimSelection`` when auxiliary classes should select
-    active latent groups.
-
-    Parameters
-    ----------
-    groups
-        Partition of latent column indices, e.g. ``[[0, 1], [2, 3]]``.
-    weight
-        Fixed base weight, or the base multiplier when ``learnable=True``.
-    n_eff
-        Number of rows in the row-major latent coefficient block.
-    smoothing_eps
-        Positive smoothing scale ``ε`` for group norms near zero.
-    learnable
-        If true, expose one REML-selectable log-weight ``ρ``.
-    target
-        The ``LatentCoord`` block name/object. Defaults to ``"t"``.
-    """
-
-    target: TargetSpec
-    groups: list[list[int]]
-    weight: float
-    n_eff: int
-    smoothing_eps: float
-    learnable: bool
-    weight_schedule: ScalarWeightSchedule | dict[str, Any] | None
-
-    def __init__(
-        self,
-        groups: Any,
-        weight: float,
-        n_eff: int,
-        smoothing_eps: float = 1e-6,
-        learnable: bool = False,
-        *,
-        target: TargetSpec = "t",
-    ) -> None:
-        self.target = target
-        self.groups = self._coerce_groups(groups)
-        self.weight = float(weight)
-        self.n_eff = int(n_eff)
-        self.smoothing_eps = float(smoothing_eps)
-        self.learnable = bool(learnable)
-        self.weight_schedule = None
-        self.__post_init__()
-
-    @staticmethod
-    def _coerce_groups(groups: Any) -> list[list[int]]:
-        try:
-            coerced = [[index(axis) for axis in group] for group in groups]
-        except TypeError as exc:
-            raise TypeError(
-                "BlockSparsityPenalty.groups must be a sequence of integer sequences"
-            ) from exc
-        if not coerced:
-            raise ValueError("BlockSparsityPenalty.groups must not be empty")
-        seen: set[int] = set()
-        for group_idx, group in enumerate(coerced):
-            if not group:
-                raise ValueError(
-                    f"BlockSparsityPenalty.groups[{group_idx}] must not be empty"
-                )
-            for axis in group:
-                if axis < 0:
-                    raise ValueError(
-                        "BlockSparsityPenalty.groups entries must be non-negative; "
-                        f"got {axis}"
-                    )
-                if axis in seen:
-                    raise ValueError(
-                        f"BlockSparsityPenalty.groups axis {axis} appears more than once"
-                    )
-                seen.add(axis)
-        max_axis = max(seen)
-        missing = set(range(max_axis + 1)) - seen
-        if missing:
-            first = min(missing)
-            raise ValueError(
-                "BlockSparsityPenalty.groups must partition contiguous axes from 0; "
-                f"missing axis {first}"
-            )
-        return coerced
-
-    def __post_init__(self) -> None:
-        if not self.weight > 0.0:
-            raise ValueError(f"BlockSparsityPenalty.weight must be > 0, got {self.weight}")
-        if self.n_eff <= 0:
-            raise ValueError(f"BlockSparsityPenalty.n_eff must be > 0, got {self.n_eff}")
-        if not self.smoothing_eps > 0.0:
-            raise ValueError(
-                "BlockSparsityPenalty.smoothing_eps must be > 0, "
-                f"got {self.smoothing_eps}"
-            )
-
-    def _payload_extras(self) -> dict[str, Any]:
-        return {
-            "groups": self.groups,
-            "weight": self.weight,
-            "n_eff": self.n_eff,
-            "smoothing_eps": self.smoothing_eps,
-            "learnable": self.learnable,
-        }
-
 
 @dataclass(init=False, slots=True)
 class MechanismSparsityPenalty(_AnalyticPenalty):
