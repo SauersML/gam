@@ -67,8 +67,8 @@ use gam::terms::basis::{
 use gam::terms::input_loc_derivatives::contract_input_loc_gradient;
 use gam::terms::latent_coord::{AuxPriorFamily, aux_prior_targets};
 use gam::terms::sae_manifold::{
-    AssignmentMode, GumbelTemperatureSchedule, SaeAtomBasisKind, SaeManifoldRho, ScheduleKind,
-    term_from_padded_blocks_with_mode,
+    AssignmentMode, GumbelTemperatureSchedule, SaeAtomBasisKind, SaeBasisEvaluator,
+    SaeManifoldRho, ScheduleKind, term_from_padded_blocks_with_mode,
 };
 use gam::terms::skip_transcoder::{
     SkipTranscoderRemlInputs, skip_transcoder_reml_metrics as skip_transcoder_reml_metrics_core,
@@ -8158,6 +8158,9 @@ fn sae_manifold_fit<'py>(
             )));
         }
     };
+    let evaluators =
+        build_sae_basis_evaluators(&basis_kinds, &basis_sizes, &atom_dim, &coord_blocks)
+            .map_err(py_value_error)?;
     let mut base_term = term_from_padded_blocks_with_mode(
         n_obs,
         p_out,
@@ -8171,6 +8174,7 @@ fn sae_manifold_fit<'py>(
         initial_logits.as_array(),
         &coord_blocks,
         mode,
+        &evaluators,
     )
     .map_err(py_value_error)?;
     if let Some(schedule) =
