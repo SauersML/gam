@@ -1641,7 +1641,7 @@ pub fn rrqr_with_permutation<S: Data<Elem = f64>>(
         * leading_diag.max(1.0);
     let rank = (0..diag_len).filter(|&i| r[(i, i)].abs() > tol).count();
     let (forward, _inverse) = qr.P().arrays();
-    let column_permutation: Vec<usize> = forward.iter().map(|idx| *idx).collect();
+    let column_permutation: Vec<usize> = forward.iter().copied().map(|idx| idx.unbound()).collect();
     Ok(RrqrWithPermutation {
         rank,
         column_permutation,

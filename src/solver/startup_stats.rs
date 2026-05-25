@@ -85,6 +85,11 @@ impl StartupStats {
                 InnerFailure::BudgetExhausted { .. } | InnerFailure::TrustRegionFloor { .. } => {
                     stats.rejected_by_budget += 1
                 }
+                // A pre-fit identifiability failure is structural in
+                // the same shape as a KKT cert refusal — bucket it
+                // with `rejected_by_kkt` so the seed-screening
+                // structural early-exit accounting sees it.
+                InnerFailure::IdentifiabilityFailure { .. } => stats.rejected_by_kkt += 1,
                 InnerFailure::Other(msg) => {
                     if msg.contains("non-finite")
                         || msg.contains("not finite")

@@ -27232,7 +27232,7 @@ mod tests {
 
         // The projected residual still rules out accepting convergence, but
         // the large step rules out terminal refusal. The loop must continue.
-        assert!(residual > 4.0 * residual_tol);
+        assert!(residual > residual_tol);
         assert_eq!(
             constrained_stationary_certificate_decision(
                 &math,
@@ -27270,7 +27270,7 @@ mod tests {
                 objective_tol,
                 step_tol,
                 None,
-                4.0 * residual_tol,
+                residual_tol,
                 residual_tol,
             ),
             ConstrainedStationaryCertificate::Accept,
@@ -27282,7 +27282,7 @@ mod tests {
                 objective_tol,
                 step_tol,
                 None,
-                4.0 * residual_tol + 1.0e-12,
+                residual_tol + 1.0e-12,
                 residual_tol,
             ),
             ConstrainedStationaryCertificate::RefusePhantomMultiplier,
@@ -28275,7 +28275,7 @@ mod tests {
         );
         assert!(
             report
-                .format_structured_log(4.0 * residual_tol)
+                .format_structured_log(residual_tol)
                 .contains("rank_deficient_H_pen"),
             "structured log must surface the diagnosis label",
         );
@@ -28306,7 +28306,7 @@ mod tests {
             // emits it (label at the very end after `; diagnosis: `).
             let synthetic_error = format!(
                 "coupled exact-joint inner solve exited the joint Newton path before convergence \
-                 — cycle=7 cert REFUSED: residual=1.0e-2 > 4·tol=4.0e-6; \
+                 — cycle=7 cert REFUSED: residual=1.0e-2 > tol=1.0e-6; \
                  diagnosis: {label}"
             );
             let parsed = KktRefusalDiagnosis::parse_from_error(&synthetic_error);
