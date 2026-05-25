@@ -184,9 +184,22 @@ impl<'a> StableSolver<'a> {
             return None;
         }
 
+        // Scale the ridge by the matrix's diagonal magnitude so it is
+        // *rank-revealing* rather than absolute. A fixed `baseridge = 1e-10`
+        // is meaningless for a Hessian whose largest diagonal is `O(1e8)`
+        // (relative perturbation `1e-18` — well below f64 round-off) and
+        // simultaneously over-regularises a diagonal of `O(1e-5)`. Anchoring
+        // the ridge to `max_abs_diag(H)` makes the relative regularisation
+        // strength independent of how the family scales its likelihood, so
+        // null directions (eigenvalues < ridge) get treated consistently
+        // across blocks. Without this, the joint-Newton solver returns
+        // proposals with `|prop|∞ ≈ |g|/σ_min(H) = O(1e5–1e12)` because the
+        // absolute `1e-10` ridge cannot reach the smallest eigenvalue of an
+        // O(1e-5)-scale block while the largest block has `σ_max = 1e8`.
+        let diag_scale = max_abs_diag(matrix);
         for retry in 0..MAX_SOLVE_RETRIES {
             let ridge = if baseridge > 0.0 {
-                baseridge * 10f64.powi(retry as i32)
+                baseridge * diag_scale * 10f64.powi(retry as i32)
             } else {
                 0.0
             };
