@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
 import typing
-import csv
+
+import gamfit
 import numpy as np
 import matplotlib.pyplot as plt
-import subprocess
-import tempfile
 from pathlib import Path
-from sklearn.preprocessing import SplineTransformer
-from scipy.optimize import minimize
 
 
 def true_surface(x: typing.Any, y: typing.Any) -> typing.Any:
@@ -20,248 +17,25 @@ def true_surface(x: typing.Any, y: typing.Any) -> typing.Any:
     )
 
 
-def tps_kernel(r: typing.Any) -> typing.Any:
-    out = np.zeros_like(r)
-    mask = r > 0
-    rr = r[mask]
-    out[mask] = (rr**2) * np.log(rr)
-    return out
+def xy_table(xy: typing.Any, z: typing.Any | None = None) -> dict[str, typing.Any]:
+    table: dict[str, typing.Any] = {
+        "x": np.asarray(xy[:, 0], dtype=float).tolist(),
+        "y": np.asarray(xy[:, 1], dtype=float).tolist(),
+    }
+    if z is not None:
+        table["z"] = np.asarray(z, dtype=float).tolist()
+    return table
 
 
-def pairwise_dist(a: typing.Any, b: typing.Any) -> typing.Any:
-    d = a[:, None, :] - b[None, :, :]
-    return np.sqrt(np.sum(d * d, axis=2))
-
-
-def farthest_point_centers(xy: typing.Any, m: typing.Any) -> typing.Any:
-    n = xy.shape[0]
-    m = min(max(2, m), n)
-    first = np.argmin(np.sum((xy - np.mean(xy, axis=0)) ** 2, axis=1))
-    selected: list[int] = [int(first)]
-    min_d2 = np.sum((xy - xy[first]) ** 2, axis=1)
-    for _ in range(1, m):
-        idx = np.argmax(min_d2)
-        selected.append(int(idx))
-        d2_new = np.sum((xy - xy[idx]) ** 2, axis=1)
-        min_d2 = np.minimum(min_d2, d2_new)
-    return xy[np.array(selected)]
-
-
-def diff_penalty(n: typing.Any, order: typing.Any=2) -> typing.Any:
-    d = np.eye(n)
-    for _ in range(order):
-        d = d[1:, :] - d[:-1, :]
-    return d.T @ d
-
-
-def nullspace_of_pt(p: typing.Any) -> typing.Any:
-    # returns Z such that P^T Z = 0
-    u, s, vt = np.linalg.svd(p.T, full_matrices=True)
-    tol = max(p.shape) * np.finfo(float).eps * (s[0] if s.size else 1.0)
-    rank = np.sum(s > tol)
-    v = vt.T
-    return v[:, rank:]
-
-
-def fit_gaussian_reml(X: typing.Any, y: typing.Any, S_list: typing.Any, maxiter: typing.Any=120) -> typing.Any:
-    n, p = X.shape
-    XtX = X.T @ X
-    Xty = X.T @ y
-
-    def objective(rho: typing.Any) -> typing.Any:
-        lambdas = np.exp(rho)
-        S = np.zeros((p, p))
-        for lam, sk in zip(lambdas, S_list):
-            S += lam * sk
-
-        A = XtX + S + 1e-8 * np.eye(p)
-        try:
-            beta = np.linalg.solve(A, Xty)
-        except np.linalg.LinAlgError:
-            return 1e30
-
-        resid = y - X @ beta
-        rss = float(resid @ resid)
-        if not np.isfinite(rss) or rss <= 0:
-            return 1e30
-
-        try:
-            Ainv_XtX = np.linalg.solve(A, XtX)
-        except np.linalg.LinAlgError:
-            return 1e30
-        edf = float(np.trace(Ainv_XtX))
-        df = max(n - edf, 1e-6)
-        sigma2 = rss / df
-
-        signA, logdetA = np.linalg.slogdet(A)
-        if signA <= 0 or not np.isfinite(logdetA):
-            return 1e30
-
-        eigS = np.linalg.eigvalsh(0.5 * (S + S.T))
-        tol = 1e-10 * max(1.0, np.max(np.abs(eigS)))
-        pos = eigS[eigS > tol]
-        if pos.size == 0:
-            return 1e30
-        logdetS = float(np.sum(np.log(pos)))
-
-        # REML-like objective (constant terms dropped)
-        val = 0.5 * (df * np.log(sigma2) + logdetA - logdetS)
-        if not np.isfinite(val):
-            return 1e30
-        return val
-
-    x0 = np.array([-1.0, -5.0], dtype=float)
-    opt = minimize(objective, x0=x0, method="L-BFGS-B", options={"maxiter": maxiter})
-
-    rho = opt.x if np.all(np.isfinite(opt.x)) else x0
-    lam = np.exp(rho)
-    S = np.zeros((p, p))
-    for lam_i, sk in zip(lam, S_list):
-        S += lam_i * sk
-    A = XtX + S + 1e-8 * np.eye(p)
-    beta = np.linalg.solve(A, Xty)
-    return beta, lam, opt
-
-
-def build_tensor_bspline_train_eval(train_xy: typing.Any, eval_xy: typing.Any) -> typing.Any:
-    sx = SplineTransformer(degree=3, n_knots=8, include_bias=True)
-    sy = SplineTransformer(degree=3, n_knots=8, include_bias=True)
-
-    bx = sx.fit_transform(train_xy[:, [0]])
-    by = sy.fit_transform(train_xy[:, [1]])
-    X_train = np.einsum("ni,nj->nij", bx, by).reshape(len(train_xy), -1)
-
-    gx = sx.transform(eval_xy[:, [0]])
-    gy = sy.transform(eval_xy[:, [1]])
-    X_eval = np.einsum("ni,nj->nij", gx, gy).reshape(len(eval_xy), -1)
-
-    qx, qy = bx.shape[1], by.shape[1]
-    Sx = np.kron(np.eye(qy), diff_penalty(qx, order=2))
-    Sy = np.kron(diff_penalty(qy, order=2), np.eye(qx))
-    S1 = Sx + Sy
-    S2 = np.eye(S1.shape[0])
-    return X_train, X_eval, [S1, S2]
-
-
-def build_tps_train_eval(train_xy: typing.Any, eval_xy: typing.Any, centers: typing.Any) -> typing.Any:
-    r_train = pairwise_dist(train_xy, centers)
-    K_train = tps_kernel(r_train)
-    P_train = np.c_[np.ones(len(train_xy)), train_xy]
-
-    r_cc = pairwise_dist(centers, centers)
-    Omega = tps_kernel(r_cc)
-    Pc = np.c_[np.ones(len(centers)), centers]
-    Z = nullspace_of_pt(Pc)
-
-    Kc_train = K_train @ Z
-    Omega_c = Z.T @ Omega @ Z
-
-    X_train = np.c_[Kc_train, P_train]
-    q = Kc_train.shape[1]
-    pp = P_train.shape[1]
-
-    S1 = np.zeros((q + pp, q + pp))
-    S1[:q, :q] = Omega_c
-    S2 = np.eye(q + pp)
-
-    r_eval = pairwise_dist(eval_xy, centers)
-    K_eval = tps_kernel(r_eval) @ Z
-    P_eval = np.c_[np.ones(len(eval_xy)), eval_xy]
-    X_eval = np.c_[K_eval, P_eval]
-    return X_train, X_eval, [S1, S2]
-
-
-def ensure_rust_bin() -> typing.Any:
-    root = Path(__file__).resolve().parents[1]
-    candidate = root / "target" / "release" / "gam"
-    if candidate.exists():
-        return candidate
-    subprocess.run(
-        ["cargo", "build", "--release", "--bin", "gam"],
-        cwd=root,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    if not candidate.exists():
-        raise RuntimeError(f"missing Rust binary at {candidate}")
-    return candidate
-
-
-def write_xy_csv(path: typing.Any, xy: typing.Any, y: typing.Any=None) -> None:
-    with path.open("w", newline="") as f:
-        w = csv.writer(f)
-        if y is None:
-            w.writerow(["x", "y"])
-            for (xv, yv) in xy:
-                w.writerow([float(xv), float(yv)])
-        else:
-            w.writerow(["x", "y", "z"])
-            for (xv, yv), zv in zip(xy, y):
-                w.writerow([float(xv), float(yv), float(zv)])
-
-
-def read_mean_predictions(path: typing.Any) -> typing.Any:
-    out = []
-    with path.open("r", newline="") as f:
-        rdr = csv.DictReader(f)
-        if "mean" not in (rdr.fieldnames or []):
-            raise RuntimeError(f"prediction output missing 'mean' column: {path}")
-        for row in rdr:
-            out.append(float(row["mean"]))
-    return np.asarray(out, dtype=float)
-
-
-def native_surface_predict(train_xy: typing.Any, z_obs: typing.Any, eval_xy: typing.Any, basis_type: typing.Any, centers: typing.Any=30, ell: typing.Any=0.55) -> typing.Any:
-    rust_bin = ensure_rust_bin()
-    root = Path(__file__).resolve().parents[1]
-
-    if basis_type == "matern":
-        smooth = (
-            f"s(x, y, type=matern, centers={int(centers)}, nu=5/2, "
-            f"length_scale={float(ell)}, double_penalty=true)"
-        )
-    elif basis_type == "duchon":
-        smooth = (
-            f"s(x, y, type=duchon, centers={int(centers)}, power=1, order=0, "
-            f"length_scale={float(ell)}, double_penalty=true)"
-        )
-    else:
-        raise ValueError(f"unsupported basis_type: {basis_type}")
-
-    formula = f"z ~ {smooth}"
-    with tempfile.TemporaryDirectory(prefix="surface_native_", dir=str(root / "bench")) as td:
-        td_path = Path(td)
-        train_csv = td_path / "train.csv"
-        eval_csv = td_path / "eval.csv"
-        model_json = td_path / "model.json"
-        pred_csv = td_path / "pred.csv"
-
-        write_xy_csv(train_csv, train_xy, z_obs)
-        write_xy_csv(eval_csv, eval_xy)
-
-        fit_cmd = [
-            str(rust_bin),
-            "fit",
-            "--family",
-            "gaussian",
-            "--out",
-            str(model_json),
-            str(train_csv),
-            formula,
-        ]
-        subprocess.run(fit_cmd, cwd=root, check=True, capture_output=True, text=True)
-
-        pred_cmd = [
-            str(rust_bin),
-            "predict",
-            str(model_json),
-            str(eval_csv),
-            "--out",
-            str(pred_csv),
-        ]
-        subprocess.run(pred_cmd, cwd=root, check=True, capture_output=True, text=True)
-        return read_mean_predictions(pred_csv)
+def gamfit_surface_predict(
+    train_xy: typing.Any,
+    z_obs: typing.Any,
+    eval_xy: typing.Any,
+    formula: str,
+) -> typing.Any:
+    model = gamfit.fit(xy_table(train_xy, z_obs), formula, family="gaussian")
+    pred = model.predict(xy_table(eval_xy), return_type="dict")
+    return np.asarray(pred["mean"], dtype=float)
 
 
 def main() -> None:
@@ -283,21 +57,30 @@ def main() -> None:
     grid_xy = np.c_[xx.ravel(), yy.ravel()]
     zz_true = true_surface(xx, yy)
 
-    centers = farthest_point_centers(xy, m=30)
-
-    Xtr_bs, Xev_bs, S_bs = build_tensor_bspline_train_eval(xy, grid_xy)
-    b_bs, _, _ = fit_gaussian_reml(Xtr_bs, z_obs, S_bs)
-    zz_bs = (Xev_bs @ b_bs).reshape(xx.shape)
-
-    Xtr_tps, Xev_tps, S_tps = build_tps_train_eval(xy, grid_xy, centers)
-    b_tps, _, _ = fit_gaussian_reml(Xtr_tps, z_obs, S_tps)
-    zz_tps = (Xev_tps @ b_tps).reshape(xx.shape)
-
-    zz_mat = native_surface_predict(
-        xy, z_obs, grid_xy, basis_type="matern", centers=len(centers), ell=0.55
+    centers = 30
+    zz_bs = gamfit_surface_predict(
+        xy,
+        z_obs,
+        grid_xy,
+        "z ~ te(x, y, knots=8, double_penalty=true)",
     ).reshape(xx.shape)
-    zz_du = native_surface_predict(
-        xy, z_obs, grid_xy, basis_type="duchon", centers=len(centers), ell=0.55
+    zz_tps = gamfit_surface_predict(
+        xy,
+        z_obs,
+        grid_xy,
+        f"z ~ thinplate(x, y, centers={centers}, double_penalty=true)",
+    ).reshape(xx.shape)
+    zz_mat = gamfit_surface_predict(
+        xy,
+        z_obs,
+        grid_xy,
+        f"z ~ matern(x, y, centers={centers}, nu=5/2, length_scale=0.55, double_penalty=true)",
+    ).reshape(xx.shape)
+    zz_du = gamfit_surface_predict(
+        xy,
+        z_obs,
+        grid_xy,
+        f"z ~ duchon(x, y, centers={centers}, power=1, order=0, length_scale=0.55)",
     ).reshape(xx.shape)
 
     vmin = min(np.min(zz_true), np.min(zz_bs), np.min(zz_tps), np.min(zz_mat), np.min(zz_du))
@@ -319,7 +102,7 @@ def main() -> None:
         "Tensor B-Spline (REML + double penalty)",
         "Thin Plate Spline (REML + double penalty)",
         "Matérn (REML + double penalty)",
-        "Duchon p=1 (native; double penalty)",
+        "Duchon p=1 (REML)",
     ]
     fields = [zz_true, zz_bs, zz_tps, zz_mat, zz_du]
     shared_cmap = "viridis"
@@ -351,7 +134,7 @@ def main() -> None:
         ax.set_zlabel("Height")
 
     fig.suptitle(
-        "3D Surface Comparison (All Methods: Gaussian REML + Double Penalty)",
+        "3D Surface Comparison (gamfit Gaussian REML)",
         fontsize=14.5,
         weight="bold",
     )
