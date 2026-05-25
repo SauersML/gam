@@ -1,5 +1,7 @@
 use gam::solver::pirls::{calculate_deviance, update_glmvectors_by_family};
-use gam::types::{GlmLikelihoodSpec, InverseLink, LikelihoodScaleMetadata, LikelihoodSpec, ResponseFamily};
+use gam::types::{
+    GlmLikelihoodSpec, InverseLink, LikelihoodScaleMetadata, LikelihoodSpec, ResponseFamily,
+};
 use ndarray::array;
 
 #[test]
@@ -19,8 +21,16 @@ fn gaussian_fixed_dispersion_should_scale_working_weight_and_deviance() {
     let mut w = array![0.0];
     let mut z = array![0.0];
 
-    update_glmvectors_by_family(y.view(), &eta, &likelihood, prior.view(), &mut mu, &mut w, &mut z)
-        .expect("Gaussian IRLS update should succeed");
+    update_glmvectors_by_family(
+        y.view(),
+        &eta,
+        &likelihood,
+        prior.view(),
+        &mut mu,
+        &mut w,
+        &mut z,
+    )
+    .expect("Gaussian IRLS update should succeed");
 
     let expected_weight = prior[0] / 4.0;
     assert!(

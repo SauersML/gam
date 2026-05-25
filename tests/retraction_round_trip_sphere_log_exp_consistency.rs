@@ -6,7 +6,9 @@ fn retraction_round_trip_sphere_log_exp_consistency() {
     let manifold = SphereManifold::new(2);
     let x = arr1(&[1.0, 0.0, 0.0]);
     let xi = arr1(&[0.0, 0.12, -0.07]);
-    let y = manifold.retract(x.view(), xi.view()).expect("sphere retract should succeed");
+    let y = manifold
+        .retract(x.view(), xi.view())
+        .expect("sphere retract should succeed");
     let xi_back = manifold
         .log_map(x.view(), y.view())
         .expect("sphere inverse retraction should succeed");

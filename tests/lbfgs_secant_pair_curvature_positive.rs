@@ -4,7 +4,10 @@ use ndarray::{Array1, ArrayView1, arr1};
 struct Quadratic;
 
 impl RiemannianObjective for Quadratic {
-    fn value_gradient(&mut self, point: ArrayView1<'_, f64>) -> gam::GeometryResult<(f64, Array1<f64>)> {
+    fn value_gradient(
+        &mut self,
+        point: ArrayView1<'_, f64>,
+    ) -> gam::GeometryResult<(f64, Array1<f64>)> {
         let value = 0.5 * point.dot(&point);
         Ok((value, point.to_owned()))
     }

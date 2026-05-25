@@ -1,6 +1,6 @@
 use gam::solver::outer_strategy::{
-    plan, plan_with_class, DeclaredHessianForm, Derivative, HessianSource, OuterCapability,
-    Solver, SolverClass,
+    DeclaredHessianForm, Derivative, HessianSource, OuterCapability, Solver, SolverClass, plan,
+    plan_with_class,
 };
 
 fn cap(
