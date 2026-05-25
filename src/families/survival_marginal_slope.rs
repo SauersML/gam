@@ -18739,7 +18739,7 @@ mod tests {
 
         let err = validate_spec(&spec).expect_err("non-structural time block should fail");
         assert!(
-            err.contains("requires structural time monotonicity"),
+            err.contains("requires a row-constraint or structural-I-spline time block"),
             "unexpected error: {err}"
         );
     }

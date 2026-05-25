@@ -682,11 +682,8 @@ fn write_latent_manifold(hasher: &mut StableHasher, manifold: &LatentManifold) {
         LatentManifold::Euclidean => {
             hasher.write_str("euclidean");
         }
-        LatentManifold::Circle => {
+        LatentManifold::Circle { period } => {
             hasher.write_str("circle");
-        }
-        LatentManifold::CirclePeriod { period } => {
-            hasher.write_str("circle-period");
             hasher.write_f64(*period);
         }
         LatentManifold::Sphere { dim } => {
@@ -722,11 +719,7 @@ fn write_latent_manifold(hasher: &mut StableHasher, manifold: &LatentManifold) {
 fn append_latent_metric_weights(out: &mut Vec<f64>, manifold: &LatentManifold) {
     match manifold {
         LatentManifold::Euclidean => out.push(1.0),
-        LatentManifold::Circle => {
-            let scale = std::f64::consts::PI * 2.0;
-            out.push(1.0 / (scale * scale));
-        }
-        LatentManifold::CirclePeriod { period } => {
+        LatentManifold::Circle { period } => {
             out.push(1.0 / (period * period));
         }
         LatentManifold::Sphere { dim } => {

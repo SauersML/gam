@@ -2845,8 +2845,8 @@ mod tests {
             Array2::<f64>::zeros((n, 1)),
             vec![true_coords],
             vec![LatentManifold::Product(vec![
-                LatentManifold::Circle,
-                LatentManifold::Circle,
+                LatentManifold::Circle { period: 1.0 },
+                LatentManifold::Circle { period: 1.0 },
             ])],
             AssignmentMode::softmax(0.5),
         )
@@ -3050,7 +3050,7 @@ mod tests {
         let logits =
             Array2::<f64>::from_shape_fn((n, k), |(i, j)| 0.1 * (i as f64) - 0.2 * (j as f64));
         let coords: Vec<Array2<f64>> = (0..k).map(|_| Array2::<f64>::zeros((n, 1))).collect();
-        let manifolds = vec![LatentManifold::Circle; k];
+        let manifolds = vec![LatentManifold::Circle { period: 1.0 }; k];
         let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
             logits,
             coords,
@@ -3081,7 +3081,7 @@ mod tests {
         )
         .expect("valid logit grid");
         let coords: Vec<Array2<f64>> = (0..k).map(|_| Array2::<f64>::zeros((n, 1))).collect();
-        let manifolds = vec![LatentManifold::Circle; k];
+        let manifolds = vec![LatentManifold::Circle { period: 1.0 }; k];
         let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
             logits.clone(),
             coords,
@@ -3247,7 +3247,7 @@ mod tests {
         let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
             Array2::<f64>::zeros((n, k)),
             coords_k,
-            vec![LatentManifold::Circle; k],
+            vec![LatentManifold::Circle { period: 1.0 }; k],
             AssignmentMode::ibp_map(0.7, 1.0, false),
         )
         .unwrap();
@@ -3345,7 +3345,7 @@ mod tests {
         let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
             Array2::<f64>::zeros((n, k)),
             coords_k,
-            vec![LatentManifold::Circle; k],
+            vec![LatentManifold::Circle { period: 1.0 }; k],
             AssignmentMode::softmax(0.7),
         )
         .unwrap();

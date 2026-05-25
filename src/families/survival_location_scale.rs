@@ -1614,6 +1614,15 @@ struct SurvivalJointQuantities {
     /// Exit-only derivatives of ell w.r.t. qdot1 = dq/dt.
     d1_qdot1: Array1<f64>,
     d2_qdot1: Array1<f64>,
+    /// First-order gradient drivers for the time, log-σ, and time-derivative
+    /// (η_d) sub-blocks. Scaled by the same `deriv_log_scale` as `d1_q*`:
+    /// the row formulas `w * r0`, `w * event_mix(d, dlogphi1, -r1)`, and
+    /// `w * d * d_log_g` reuse the rescaled kernel quantities, so callers
+    /// that supply a nonzero `deriv_log_scale` see these fields uniformly
+    /// rescaled. `evaluate()` always calls with `deriv_log_scale = 0`.
+    grad_time_eta_h0: Array1<f64>,
+    grad_time_eta_h1: Array1<f64>,
+    grad_time_eta_d: Array1<f64>,
     h_time_h0: Array1<f64>,
     h_time_h1: Array1<f64>,
     h_time_d: Array1<f64>,

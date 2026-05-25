@@ -537,11 +537,8 @@ fn hash_latent_manifold(manifold: &LatentManifold, hasher: &mut CacheDigestBuild
         LatentManifold::Euclidean => {
             hasher.write_usize(0);
         }
-        LatentManifold::Circle => {
+        LatentManifold::Circle { period } => {
             hasher.write_usize(1);
-        }
-        LatentManifold::CirclePeriod { period } => {
-            hasher.write_usize(6);
             hasher.write_f64(*period);
         }
         LatentManifold::Sphere { dim } => {
