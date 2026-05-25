@@ -2997,7 +2997,7 @@ mod tests {
     fn factor_one_row_rejects_barely_pd_block() {
         let d = 2;
         let k = 2;
-        let mut row = ArrowRowBlock::zeros(d, k);
+        let mut row = ArrowRowBlock::new(d, k);
         // Matrix from the issue body: PD by an exact ε along the second
         // direction. Cholesky succeeds, but κ ≈ 1e14.
         row.htt = array![[1.0_f64, 1.0], [1.0, 1.0 + 1e-14]];
@@ -3022,7 +3022,7 @@ mod tests {
 
         // Sanity: a well-conditioned block at the same dimension still
         // factors successfully.
-        let mut row_ok = ArrowRowBlock::zeros(d, k);
+        let mut row_ok = ArrowRowBlock::new(d, k);
         row_ok.htt = array![[2.0_f64, 0.1], [0.1, 3.0]];
         row_ok.htbeta = array![[1.0_f64, 0.0], [0.0, 1.0]];
         row_ok.gt = array![0.0_f64, 0.0];

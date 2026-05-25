@@ -22254,6 +22254,70 @@ mod tests {
         }
     }
 
+    /// Regression test for issue #197.
+    ///
+    /// When ρ_k is pinned at its upper bound the IFT block
+    /// (`compute_kkt_residual_rho_corrections`) already projects out the
+    /// gradient (sets it to 0). Prior to the #197 fix the main envelope
+    /// block kept the trace term `½·tr(K·λ_k S_k)`, the penalty quadratic
+    /// `½·λ_k β'S_kβ` and the `½·∂log|S|/∂ρ_k` term — yielding a non-zero
+    /// outer gradient component along a frozen axis (mixing constrained
+    /// `v_k = 0` with unconstrained λ_k-active terms).
+    ///
+    /// Contract: at an active upper bound the FULL ρ-gradient component
+    /// (envelope + IFT correction) must be exactly 0.0 — the
+    /// gradient-projection convention used by the box-constrained outer
+    /// solver. This holds for both the no-residual envelope path and the
+    /// with-residual IFT-correction path.
+    #[test]
+    fn rho_gradient_at_upper_bound_is_zero_envelope_and_ift_consistent_issue_197() {
+        // Coord 0 pinned at +RHO_BOUND, coord 1 free.
+        let rho: Vec<f64> = vec![crate::solver::estimate::RHO_BOUND, -0.5];
+
+        // Use a β perturbed away from β* so that the with-residual path
+        // exercises a non-zero IFT correction on the free coordinate, but
+        // the active coord must still come out exactly 0.
+        let beta_hat = array![0.7, -0.4, 0.2];
+
+        // Envelope path (no residual attached).
+        let sol_envelope = build_gaussian_solution_at_beta(&rho, beta_hat.clone(), false);
+        let result_env =
+            reml_laml_evaluate(&sol_envelope, &rho, EvalMode::ValueAndGradient, None).unwrap();
+        let grad_env = result_env.gradient.unwrap();
+        assert_eq!(
+            grad_env[0], 0.0,
+            "envelope ρ-gradient at active upper bound must be exactly 0.0 \
+             (gradient-projection convention, see #197); got {:+.6e}",
+            grad_env[0]
+        );
+
+        // IFT path (with KKT residual at perturbed β̂).
+        let sol_with_residual = build_gaussian_solution_at_beta(&rho, beta_hat, true);
+        let result_ift =
+            reml_laml_evaluate(&sol_with_residual, &rho, EvalMode::ValueAndGradient, None).unwrap();
+        let grad_ift = result_ift.gradient.unwrap();
+        assert_eq!(
+            grad_ift[0], 0.0,
+            "IFT-corrected ρ-gradient at active upper bound must be exactly 0.0 \
+             — envelope and IFT-correction blocks must agree (#197); got {:+.6e}",
+            grad_ift[0]
+        );
+
+        // Free coordinate must remain non-zero — otherwise the test would
+        // trivially pass by zeroing everything. (Tolerance is loose; the
+        // point is the active-mask doesn't accidentally freeze coord 1.)
+        assert!(
+            grad_env[1].abs() > 1e-8,
+            "free-coord envelope gradient should be non-trivial: got {:+.6e}",
+            grad_env[1]
+        );
+        assert!(
+            grad_ift[1].abs() > 1e-8,
+            "free-coord IFT-corrected gradient should be non-trivial: got {:+.6e}",
+            grad_ift[1]
+        );
+    }
+
     /// With β̂ perturbed off β* and the matching r attached, the IFT-corrected
     /// gradient must match a re-solved FD reference much better than the
     /// uncorrected envelope formula evaluated at the perturbed β̂.

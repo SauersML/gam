@@ -26,12 +26,6 @@ Parity contract
 shells out to ``sae_manifold_fit_minimal`` in Rust. Identical numerics to the
 closed-form path are structural.
 
-Deferred
---------
-The Rust ``monotonicity`` analytic descriptor does not exist yet, so
-``DecoderConfig.monotonicity_weight`` is accepted but unused. Adding a
-Rust kernel + descriptor is a follow-up; until then the field is recorded
-and reported via :attr:`DecoderConfig.monotonicity_supported`.
 """
 
 from __future__ import annotations
@@ -53,7 +47,12 @@ from .._sae_manifold import (
     sae_manifold_fit as _closed_form_sae_manifold_fit,
 )
 from ._coerce import from_numpy_like, to_numpy_f64
-from .penalties import BlockOrthogonalityPenalty, IBPAssignmentPenalty, JumpReLUPenalty
+from .penalties import (
+    BlockOrthogonalityPenalty,
+    IBPAssignmentPenalty,
+    JumpReLUPenalty,
+    MonotonicityPenalty,
+)
 
 
 # ---------------------------------------------------------------------------

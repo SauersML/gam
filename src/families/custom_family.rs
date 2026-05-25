@@ -13744,6 +13744,16 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             )?;
             let kkt_residual =
                 require_projected_kkt_residual(kkt_residual, "joint-Newton converged exit")?;
+            // Thread the cert tolerance + free subspace rank through to
+            // the unified evaluator's certificate so the outer
+            // optimiser's InnerStatus carrier sees honest numbers
+            // instead of NaN / None.
+            let active_set_rows_total: usize = cached_active_sets
+                .iter()
+                .map(|maybe| maybe.as_ref().map(|v| v.len()).unwrap_or(0))
+                .sum();
+            let free_rank_at_cert = total_p.saturating_sub(active_set_rows_total);
+            let kkt_residual = kkt_residual.with_metadata(residual_tol, free_rank_at_cert);
             // Build the joint active-constraint block for the unified
             // evaluator's constraint-aware kernel
             // `K_T = K_S − K_S Aᵀ (A K_S Aᵀ)⁻¹ A K_S`. Returns `None` when

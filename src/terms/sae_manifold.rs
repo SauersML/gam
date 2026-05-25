@@ -2316,7 +2316,7 @@ fn assignment_prior_grad_hdiag(
                 let activation = sigmoid_scalar(logit * inv_tau);
                 let slope = activation * (1.0 - activation);
                 grad[idx] = sparsity_strength * slope * inv_tau;
-                diag[idx] = sparsity_strength * slope * (1.0 - 2.0 * activation) * inv_tau2;
+                diag[idx] = sparsity_strength * slope * slope * inv_tau2;
             }
             Ok((grad, diag))
         }
