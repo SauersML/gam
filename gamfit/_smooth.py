@@ -159,13 +159,11 @@ class Smooth(BasisDescriptor):
                 f"got {type(penalty).__name__}"
             )
 
-        expected = _basis_input_dim(basis)
-        if expected is not None and expected != latent.dimension:
-            raise ValueError(
-                f"Smooth: latent.dimension ({latent.dimension}) does not match "
-                f"basis input_dim ({expected}). For {type(latent).__name__} use "
-                f"a basis that accepts {latent.dimension}-D inputs."
-            )
+        # Compatibility check already done above via
+        # :func:`_check_manifold_basis_compatibility`, which delegates to the
+        # Rust validator with a soft ``input_dim`` fallback. Touching
+        # ``latent.dimension`` here would force the Rust manifold-dim oracle
+        # to be present in every wheel.
 
         self.latent = latent
         self.basis = basis
@@ -320,15 +318,40 @@ def _check_manifold_basis_compatibility(
 ) -> None:
     """Eager compatibility check between a manifold and a basis.
 
-    Soft when ``basis.input_dim`` is unknown; loud when it is and does not
-    match ``latent.dimension``.
+    Marshals manifold + basis kind tags to the Rust validator when the local
+    extension exposes one; falls back to a soft ``input_dim`` match otherwise.
+    All policy lives in Rust (see ``crates/gam-pyffi`` ``validate_smooth_composition``).
     """
+    latent_kind = None
+    if hasattr(latent, "to_json"):
+        try:
+            latent_kind = str(latent.to_json().get("kind", ""))
+        except Exception:
+            latent_kind = None
+    basis_kind = None
+    if hasattr(basis, "to_dict"):
+        try:
+            basis_kind = str(basis.to_dict().get("kind", ""))
+        except Exception:
+            basis_kind = None
+    if latent_kind and basis_kind:
+        from ._binding import rust_module
+        validator = getattr(rust_module(), "validate_smooth_composition", None)
+        if validator is not None:
+            validator(latent_kind, basis_kind)
+            return
     expected = _basis_input_dim(basis)
     if expected is None:
         return
-    if expected != latent.dimension:
+    try:
+        latent_dim = int(latent.dimension)
+    except Exception:
+        # Rust dimension oracle not yet exposed by the local extension; the
+        # Rust core will reject incompatible specs again at fit time.
+        return
+    if expected != latent_dim:
         raise ValueError(
-            f"Smooth: latent={type(latent).__name__}(dim={latent.dimension}) is "
+            f"Smooth: latent={type(latent).__name__}(dim={latent_dim}) is "
             f"incompatible with basis={type(basis).__name__}(input_dim={expected}). "
             "Choose a basis whose input dimension matches the latent manifold."
         )

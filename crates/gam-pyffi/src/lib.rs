@@ -2708,6 +2708,69 @@ fn duchon_basis_with_jet<'py>(
     ))
 }
 
+/// Evaluate the Matérn kernel basis design matrix at `points` against `centers`.
+///
+/// `points` is `(N, d)`, `centers` is `(K, d)`. `nu` accepted as `"1/2"`,
+/// `"3/2"`, `"5/2"`, `"7/2"`, or `"9/2"` (also accepts `"0.5"`/etc). Forward
+/// only; gradients with respect to `points` are exposed via
+/// `matern_input_location_first_derivative` (returns `φ'(r)`, to be paired
+/// with `(t − c) / r` per axis at the call site).
+#[pyfunction(signature = (points, centers, length_scale = 1.0, nu = "3/2", aniso_log_scales = None))]
+fn matern_basis<'py>(
+    py: Python<'py>,
+    points: PyReadonlyArray2<'py, f64>,
+    centers: PyReadonlyArray2<'py, f64>,
+    length_scale: f64,
+    nu: &str,
+    aniso_log_scales: Option<PyReadonlyArray1<'py, f64>>,
+) -> PyResult<Py<PyArray2<f64>>> {
+    let pts = points.as_array();
+    let ctrs = centers.as_array();
+    if pts.ncols() != ctrs.ncols() {
+        return Err(py_value_error(format!(
+            "matern_basis: points has d={} but centers has d={}",
+            pts.ncols(),
+            ctrs.ncols()
+        )));
+    }
+    if !length_scale.is_finite() || length_scale <= 0.0 {
+        return Err(py_value_error(format!(
+            "matern_basis: length_scale must be finite and > 0, got {length_scale}"
+        )));
+    }
+    if pts.iter().any(|value| !value.is_finite())
+        || ctrs.iter().any(|value| !value.is_finite())
+    {
+        return Err(py_value_error(
+            "matern_basis: points and centers must be finite".to_string(),
+        ));
+    }
+    let nu_parsed = parse_matern_nu_py("matern_basis", nu)?;
+    let aniso_vec = aniso_log_scales
+        .as_ref()
+        .map(|values| values.as_slice())
+        .transpose()
+        .map_err(|err| py_value_error(format!("aniso_log_scales must be contiguous: {err}")))?
+        .map(|slice| slice.to_vec());
+    let spec = MaternBasisSpec {
+        center_strategy: CenterStrategy::UserProvided(ctrs.to_owned()),
+        length_scale,
+        nu: nu_parsed,
+        include_intercept: false,
+        double_penalty: false,
+        identifiability: MaternIdentifiability::None,
+        aniso_log_scales: aniso_vec,
+        periodic: None,
+    };
+    let built = build_matern_basis(pts, &spec)
+        .map_err(|err| py_value_error(err.to_string()))?;
+    let design = built
+        .design
+        .try_to_dense_by_chunks("matern_basis")
+        .map_err(|err| py_value_error(err.to_string()))?;
+    Ok(design.into_pyarray(py).unbind())
+}
+
 fn required_usize_param(params: &Bound<'_, PyDict>, key: &str) -> PyResult<usize> {
     params
         .get_item(key)?
@@ -20067,6 +20130,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(periodic_basis_with_jet, module)?)?;
     module.add_function(wrap_pyfunction!(duchon_basis_with_jet, module)?)?;
     module.add_function(wrap_pyfunction!(duchon_basis, module)?)?;
+    module.add_function(wrap_pyfunction!(matern_basis, module)?)?;
     module.add_function(wrap_pyfunction!(smoothness_penalty, module)?)?;
     module.add_function(wrap_pyfunction!(duchon_function_norm_penalty, module)?)?;
     module.add_function(wrap_pyfunction!(duchon_operator_penalties, module)?)?;
