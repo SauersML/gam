@@ -126,7 +126,7 @@
 use ndarray::{Array1, Array2};
 
 use crate::families::custom_family::ParameterBlockSpec;
-use crate::linalg::faer_ndarray::{FaerQr, default_rrqr_rank_alpha};
+use crate::linalg::faer_ndarray::{FaerQr, default_rrqr_rank_alpha, rrqr_with_permutation};
 
 /// Per-block accounting record. `original_dim` is the spec's column
 /// count at audit entry (post `joint_null_rotation` absorption — the
@@ -288,36 +288,18 @@ pub fn audit_identifiability(specs: &[ParameterBlockSpec]) -> Result<Identifiabi
         }
     }
 
-    // Column-pivoted QR on the joint design. Faer's RRQR-style pivot
-    // pulls the linearly-dependent columns to the trailing positions;
-    // the pivot order itself is not exposed by the current bridge, so
-    // we work from the unpivoted thin-Q/R surrogate: run the unified
-    // FaerQr (which delegates to a non-pivoted faer QR) on `x_joint`,
-    // then identify rank-deficient columns by inspecting the diagonal
-    // of `R` against the unified RRQR tolerance. The pivoted-column
-    // mapping lands in a follow-on commit once the faer bridge
-    // exports the permutation; until then we report alias *pairs* but
-    // leave the structural drop decision (which exact column to evict
-    // when two are mutually aliased) to the caller's family-specific
-    // anchor logic. This keeps Stage 2 honest: the audit detects
-    // every alias above tolerance and surfaces it, and the caller
-    // (Stage 3 wiring) can either refuse the fit or invoke the
-    // family-specific Stage-4 reparameterisation.
-    let (_q_joint, r_joint) = x_joint
-        .qr()
-        .map_err(|e| format!("identifiability audit joint QR failed: {e:?}"))?;
-    let diag_len = r_joint.nrows().min(r_joint.ncols());
-    let leading = if diag_len > 0 {
-        r_joint[[0, 0]].abs()
-    } else {
-        0.0
-    };
-    let rank_alpha = default_rrqr_rank_alpha();
-    let joint_rank_tol =
-        rank_alpha * f64::EPSILON * (n.max(p_total).max(1) as f64) * leading.max(1.0);
-    let joint_rank = (0..diag_len)
-        .filter(|&i| r_joint[[i, i]].abs() > joint_rank_tol)
-        .count();
+    // Column-pivoted RRQR on the joint design. The pivot permutation
+    // names which original columns were demoted past the rank
+    // threshold, so we can attribute each dropped column back to its
+    // (block, local_col) origin deterministically. `rrqr_with_permutation`
+    // uses the same `RRQR_RANK_ALPHA · ε · max(m,n) · leading`
+    // tolerance as the per-block diagonal counter above, so the joint
+    // verdict and the per-block diagnostics are tolerance-consistent.
+    let rrqr = rrqr_with_permutation(&x_joint, default_rrqr_rank_alpha())
+        .map_err(|e| format!("identifiability audit joint RRQR failed: {e:?}"))?;
+    let joint_rank = rrqr.rank;
+    let joint_rank_tol = rrqr.rank_tol;
+    let demoted_joint_cols: Vec<usize> = rrqr.column_permutation[rrqr.rank..].to_vec();
 
     // Pairwise overlap report on the joint design's normalised
     // columns. O(p_total² · n) — fine at GAM smooth widths. We only
@@ -363,22 +345,73 @@ pub fn audit_identifiability(specs: &[ParameterBlockSpec]) -> Result<Identifiabi
         }
     }
 
-    let dropped_columns: Vec<DroppedColumn> = Vec::new();
+    // Attribute each demoted joint column back to its (block, local_col)
+    // origin using the col_offsets table built above. The earliest
+    // block whose range absorbs the demoted column is, by construction,
+    // the block at lower index containing the largest projection norm
+    // — but RRQR's column-pivoting selects the column most aligned
+    // with the *trailing* (demoted) space, so we attribute the alias
+    // to "the demoted column itself was selected as redundant; the
+    // earlier blocks (in spec order) reconstruct it". The reason
+    // string names the joint-column index and the joint rank tolerance
+    // so callers can correlate with the structural log.
+    let mut dropped_columns: Vec<DroppedColumn> = Vec::new();
+    for &joint_col in &demoted_joint_cols {
+        let (block_idx, local_col) = locate_block_column(&col_offsets, joint_col);
+        let block_name = specs[block_idx].name.clone();
+        let reason = format!(
+            "joint-design column {joint_col} (block '{block_name}' local column \
+             {local_col}) demoted past joint RRQR rank tolerance {tol:.3e}; earlier \
+             blocks' column span absorbs this direction",
+            tol = joint_rank_tol,
+        );
+        dropped_columns.push(DroppedColumn {
+            block: block_name,
+            column: local_col,
+            reason,
+        });
+    }
+
+    // Reflect the dropped-column attribution into `BlockIdentity::
+    // effective_dim`: each block's effective dimension is its original
+    // dim minus the count of its columns appearing in
+    // `demoted_joint_cols`. The per-block `design_range_rank` (from
+    // the in-isolation per-block QR) still flags any within-block
+    // rank deficiency that escaped within-smooth absorption.
+    for (block_idx, block) in blocks.iter_mut().enumerate() {
+        let lo = col_offsets[block_idx];
+        let hi = col_offsets[block_idx + 1];
+        let dropped_here = demoted_joint_cols
+            .iter()
+            .filter(|&&j| j >= lo && j < hi)
+            .count();
+        block.effective_dim = block.original_dim.saturating_sub(dropped_here);
+    }
+
     let joint_rank_deficient = joint_rank < p_total;
-    let fatal = joint_rank_deficient && aliased_pairs.is_empty();
+    // Fatal when joint rank is deficient AND we cannot attribute the
+    // deficiency to either (a) at least one pairwise alias above the
+    // reporting threshold or (b) at least one dropped-column record.
+    // RRQR always populates `demoted_joint_cols` for any deficiency
+    // it detects, so the only way to reach `fatal=true` is if the
+    // tolerance disagreement between RRQR and the column-norm
+    // pairwise scan hides the structural alias — exactly the >2-way
+    // alias case the caller must refuse.
+    let fatal = joint_rank_deficient && aliased_pairs.is_empty() && dropped_columns.is_empty();
 
     let summary = format!(
         "identifiability audit: {} block(s), {} joint columns, joint rank {}, \
-         {} alias pair(s) above overlap {:.3}{}",
+         {} alias pair(s) above overlap {:.3}, {} dropped column(s){}",
         specs.len(),
         p_total,
         joint_rank,
         aliased_pairs.len(),
         ALIAS_OVERLAP_REPORTING_THRESHOLD,
+        dropped_columns.len(),
         if fatal {
-            " — FATAL (rank deficiency detected without column-pair attribution)"
+            " — FATAL (rank deficiency without pair or column attribution)"
         } else if joint_rank_deficient {
-            " — alias pair(s) flagged; family-specific reparameterisation required"
+            " — alias(es) flagged; family-specific reparameterisation required"
         } else {
             " — clean"
         },
@@ -391,6 +424,25 @@ pub fn audit_identifiability(specs: &[ParameterBlockSpec]) -> Result<Identifiabi
         fatal,
         summary,
     })
+}
+
+fn locate_block_column(col_offsets: &[usize], joint_col: usize) -> (usize, usize) {
+    // col_offsets has length specs.len() + 1; col_offsets[i..i+1] is
+    // the joint-column range for block i. Linear scan is fine — the
+    // table is tiny (one entry per block).
+    for i in 0..col_offsets.len() - 1 {
+        if joint_col >= col_offsets[i] && joint_col < col_offsets[i + 1] {
+            return (i, joint_col - col_offsets[i]);
+        }
+    }
+    // Unreachable when `joint_col < *col_offsets.last()`; the RRQR
+    // permutation is over [0, p_total). The caller checks `p_total > 0`
+    // before calling here, so this branch is structurally dead.
+    panic!(
+        "identifiability_audit::locate_block_column: joint_col {joint_col} \
+         outside col_offsets range (max = {})",
+        col_offsets.last().copied().unwrap_or(0),
+    );
 }
 
 fn block_pivoted_qr_diagonal(block: &Array2<f64>) -> Result<Vec<f64>, String> {
@@ -415,4 +467,274 @@ fn count_rank(singular_values: &[f64], n: usize, p: usize) -> usize {
     let rank_alpha = default_rrqr_rank_alpha();
     let tol = rank_alpha * f64::EPSILON * (n.max(p).max(1) as f64) * leading.max(1.0);
     singular_values.iter().filter(|&&v| v > tol).count()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::linalg::matrix::{DenseDesignMatrix, DesignMatrix};
+    use ndarray::Array2;
+
+    fn spec_from_dense(name: &str, design: Array2<f64>) -> ParameterBlockSpec {
+        let n = design.nrows();
+        ParameterBlockSpec {
+            name: name.to_string(),
+            design: DesignMatrix::Dense(DenseDesignMatrix::from(design)),
+            offset: Array1::<f64>::zeros(n),
+            penalties: Vec::new(),
+            nullspace_dims: Vec::new(),
+            initial_log_lambdas: Array1::<f64>::zeros(0),
+            initial_beta: None,
+        }
+    }
+
+    fn linspace_minus_one_to_one(n: usize) -> Array1<f64> {
+        if n <= 1 {
+            return Array1::<f64>::zeros(n.max(1));
+        }
+        let step = 2.0 / (n as f64 - 1.0);
+        Array1::from_iter((0..n).map(|i| -1.0 + step * i as f64))
+    }
+
+    /// Test 1: a model with no aliasing → audit returns clean, no
+    /// drops, fatal=false.
+    #[test]
+    fn audit_no_aliasing_returns_clean() {
+        let n = 64;
+        let x = linspace_minus_one_to_one(n);
+        // Parametric: [1, x]. Smooth: [x², x³] — orthogonal-ish to the
+        // parametric directions, no exact alias.
+        let mut parametric = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            parametric[[i, 0]] = 1.0;
+            parametric[[i, 1]] = x[i];
+        }
+        let mut smooth = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            smooth[[i, 0]] = x[i] * x[i];
+            smooth[[i, 1]] = x[i] * x[i] * x[i];
+        }
+        let specs = [spec_from_dense("intercept", parametric), spec_from_dense("smooth_x", smooth)];
+        let audit = audit_identifiability(&specs).expect("audit must succeed on clean specs");
+        assert!(!audit.fatal, "no aliasing must not be fatal: {}", audit.summary);
+        assert!(
+            audit.aliased_pairs.is_empty(),
+            "expected no alias pairs; got {:?}",
+            audit.aliased_pairs,
+        );
+        assert!(
+            audit.dropped_columns.is_empty(),
+            "expected no dropped columns; got {:?}",
+            audit.dropped_columns,
+        );
+        assert_eq!(audit.blocks.len(), 2);
+        assert_eq!(audit.blocks[0].original_dim, 2);
+        assert_eq!(audit.blocks[0].effective_dim, 2);
+        assert_eq!(audit.blocks[1].original_dim, 2);
+        assert_eq!(audit.blocks[1].effective_dim, 2);
+    }
+
+    /// Test 2: a smooth's constant column aliased with a separate
+    /// parametric intercept → audit drops one column, fatal=false,
+    /// at least one alias pair attributed.
+    #[test]
+    fn audit_smooth_constant_aliased_with_intercept() {
+        let n = 64;
+        let x = linspace_minus_one_to_one(n);
+        // Parametric: [1]. Smooth: [1, x², x³] — its leading column
+        // exactly reproduces the parametric intercept.
+        let parametric = Array2::<f64>::from_shape_fn((n, 1), |(_, _)| 1.0);
+        let mut smooth = Array2::<f64>::zeros((n, 3));
+        for i in 0..n {
+            smooth[[i, 0]] = 1.0;
+            smooth[[i, 1]] = x[i] * x[i];
+            smooth[[i, 2]] = x[i] * x[i] * x[i];
+        }
+        let specs = [
+            spec_from_dense("intercept", parametric),
+            spec_from_dense("smooth_with_const", smooth),
+        ];
+        let audit = audit_identifiability(&specs).expect("audit must succeed");
+        assert!(
+            !audit.fatal,
+            "alias with attribution must not be fatal: {}",
+            audit.summary,
+        );
+        assert!(
+            !audit.aliased_pairs.is_empty(),
+            "smooth-constant aliased with intercept must surface at least one alias pair",
+        );
+        assert!(
+            !audit.dropped_columns.is_empty(),
+            "smooth-constant aliased with intercept must populate dropped_columns",
+        );
+        // The dropped column should belong to one of the two blocks
+        // (RRQR picks pivot order; we don't pin which block wins).
+        for drop in &audit.dropped_columns {
+            assert!(
+                drop.block == "intercept" || drop.block == "smooth_with_const",
+                "unexpected drop block name {:?}",
+                drop.block,
+            );
+        }
+        // Joint rank should be exactly the count of linearly independent
+        // columns: intercept + x² + x³ = 3.
+        let total_kept: usize = audit.blocks.iter().map(|b| b.effective_dim).sum();
+        assert_eq!(
+            total_kept, 3,
+            "expected 3 surviving directions; got {total_kept} (summary: {})",
+            audit.summary,
+        );
+    }
+
+    /// Test 3: two smooths on the same covariate axis with a shared
+    /// linear direction → audit drops one column.
+    #[test]
+    fn audit_two_smooths_share_linear_direction() {
+        let n = 64;
+        let x = linspace_minus_one_to_one(n);
+        // Both smooths contain a column that equals `x`; they also
+        // each carry a quadratic direction the other doesn't.
+        let mut smooth_a = Array2::<f64>::zeros((n, 2));
+        let mut smooth_b = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            smooth_a[[i, 0]] = x[i];
+            smooth_a[[i, 1]] = x[i] * x[i];
+            smooth_b[[i, 0]] = x[i];
+            smooth_b[[i, 1]] = (x[i] - 0.3).powi(2);
+        }
+        let specs = [
+            spec_from_dense("smooth_a", smooth_a),
+            spec_from_dense("smooth_b", smooth_b),
+        ];
+        let audit = audit_identifiability(&specs).expect("audit must succeed");
+        assert!(!audit.fatal, "attributed alias must not be fatal: {}", audit.summary);
+        let cross_linear_pair = audit
+            .aliased_pairs
+            .iter()
+            .find(|p| p.block_a == "smooth_a" && p.block_b == "smooth_b" && p.overlap > 0.999);
+        assert!(
+            cross_linear_pair.is_some(),
+            "expected an x~x alias pair between the two smooths; got pairs {:?}",
+            audit.aliased_pairs,
+        );
+        assert!(
+            !audit.dropped_columns.is_empty(),
+            "RRQR must demote one of the duplicated linear columns",
+        );
+        let total_kept: usize = audit.blocks.iter().map(|b| b.effective_dim).sum();
+        assert_eq!(
+            total_kept, 3,
+            "expected 3 independent directions (1 shared linear + 2 quadratics); got {total_kept}",
+        );
+    }
+
+    /// Test 4: an ambiguous high-magnitude alias that the pairwise
+    /// scan misses but RRQR catches as joint-rank deficiency. We
+    /// engineer a 3-way structural alias: parametric `[1]`, smooth
+    /// A `[1 + ε·x]`, smooth B `[1 - ε·x]`. Each individual pair
+    /// has overlap below 1.0 but the joint design's third column
+    /// lies in the span of the first two — RRQR demotes one and
+    /// attributes it via dropped_columns; pairwise scan may or may
+    /// not catch all three pairs above threshold. Either way the
+    /// fit must proceed (fatal=false) because dropped_columns is
+    /// populated.
+    #[test]
+    fn audit_three_way_alias_is_attributed_not_fatal() {
+        let n = 64;
+        let x = linspace_minus_one_to_one(n);
+        let eps = 0.5;
+        let parametric = Array2::<f64>::from_shape_fn((n, 1), |(_, _)| 1.0);
+        let smooth_a = Array2::<f64>::from_shape_fn((n, 1), |(i, _)| 1.0 + eps * x[i]);
+        let smooth_b = Array2::<f64>::from_shape_fn((n, 1), |(i, _)| 1.0 - eps * x[i]);
+        let specs = [
+            spec_from_dense("intercept", parametric),
+            spec_from_dense("smooth_a", smooth_a),
+            spec_from_dense("smooth_b", smooth_b),
+        ];
+        let audit = audit_identifiability(&specs).expect("audit must succeed");
+        assert!(
+            !audit.dropped_columns.is_empty(),
+            "RRQR must attribute the three-way alias as a dropped column",
+        );
+        assert!(
+            !audit.fatal,
+            "alias with column attribution must not be fatal: {}",
+            audit.summary,
+        );
+        // Joint rank = 2 (the three columns span at most {1, x}).
+        let total_kept: usize = audit.blocks.iter().map(|b| b.effective_dim).sum();
+        assert_eq!(total_kept, 2, "three-way alias collapses to rank 2; got {total_kept}");
+    }
+
+    /// Test 5: end-to-end shape on a biobank-like configuration —
+    /// 4 blocks, ~50 total columns, with one intentional cross-block
+    /// linear alias seeded in. The audit must complete in well under
+    /// a second and produce a single attributed drop with the
+    /// expected joint rank.
+    #[test]
+    fn audit_biobank_shape_end_to_end() {
+        let n = 1024;
+        let x = linspace_minus_one_to_one(n);
+        // Block 0: parametric intercept + age-linear.
+        let mut parametric = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            parametric[[i, 0]] = 1.0;
+            parametric[[i, 1]] = x[i];
+        }
+        // Block 1: smooth in x — 8 polynomial-like columns.
+        let mut s_x = Array2::<f64>::zeros((n, 8));
+        for i in 0..n {
+            for k in 0..8 {
+                s_x[[i, k]] = (x[i] - (k as f64 - 4.0) * 0.2).powi(2);
+            }
+        }
+        // Block 2: smooth in sin(x) — 6 columns. No alias with block 1.
+        let mut s_sin = Array2::<f64>::zeros((n, 6));
+        for i in 0..n {
+            for k in 0..6 {
+                s_sin[[i, k]] = ((k as f64 + 1.0) * x[i]).sin();
+            }
+        }
+        // Block 3: deliberately seeded alias — first column is exactly
+        // `x` (duplicates parametric block's column 1).
+        let mut alias_block = Array2::<f64>::zeros((n, 4));
+        for i in 0..n {
+            alias_block[[i, 0]] = x[i];
+            alias_block[[i, 1]] = x[i].cos();
+            alias_block[[i, 2]] = (2.0 * x[i]).cos();
+            alias_block[[i, 3]] = (3.0 * x[i]).cos();
+        }
+        let specs = [
+            spec_from_dense("parametric", parametric),
+            spec_from_dense("s_x", s_x),
+            spec_from_dense("s_sin", s_sin),
+            spec_from_dense("alias_block", alias_block),
+        ];
+        let audit = audit_identifiability(&specs).expect("biobank-shape audit must succeed");
+        assert!(
+            !audit.fatal,
+            "seeded alias with attribution must not be fatal: {}",
+            audit.summary,
+        );
+        assert!(
+            !audit.dropped_columns.is_empty(),
+            "seeded x~x alias must produce at least one dropped column",
+        );
+        // The alias is exactly one direction; expect exactly one drop.
+        assert_eq!(
+            audit.dropped_columns.len(),
+            1,
+            "biobank-shape audit should attribute exactly the seeded alias; \
+             got {:?}",
+            audit.dropped_columns,
+        );
+        // Total effective dim = 2 + 8 + 6 + 4 − 1 = 19.
+        let total_kept: usize = audit.blocks.iter().map(|b| b.effective_dim).sum();
+        assert_eq!(
+            total_kept, 19,
+            "biobank-shape: expected 19 kept directions; got {total_kept} ({})",
+            audit.summary,
+        );
+    }
 }

@@ -69,6 +69,7 @@ class Model:
             table_kind=table_kind,
             training_table_kind=self._training_table_kind,
             fallback_model_class=self._model_class_from_payload(),
+            fallback_family=self._family_from_payload(),
             interval=interval,
             return_type=return_type,
             id_column=id_column,
@@ -340,6 +341,11 @@ class Model:
     def _model_class_from_payload(self) -> str:
         return rust_module().required_saved_model_payload_string(
             self._model_bytes, "model_kind"
+        )
+
+    def _family_from_payload(self) -> str:
+        return rust_module().required_saved_model_payload_string(
+            self._model_bytes, "family"
         )
 
     def diagnose(
