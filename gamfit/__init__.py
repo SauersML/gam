@@ -26,7 +26,7 @@ See https://github.com/SauersML/gam for the full guide.
 """
 
 # Source-vs-wheel skew note:
-# This Python source expects the Rust extension from gam-pyffi >= 0.1.122.
+# This Python source expects the Rust extension from gam-pyffi >= 0.1.123.
 # Wheels published before that extension version may lack these pyfunctions:
 # - sae_manifold_reconstruction_r2
 # - sae_manifold_assignment_summary
