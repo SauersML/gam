@@ -17524,15 +17524,16 @@ struct ScadMcpPenalty {
 #[pymethods]
 impl ScadMcpPenalty {
     #[new]
-    #[pyo3(signature = (weight, n_eff, gamma = None, variant = "mcp".to_string(), smoothing_eps = 1.0e-6, learnable = false, *, target = default_target_py()))]
+    #[pyo3(signature = (weight, n_eff, gamma = None, variant = "mcp".to_string(), smoothing_eps = 1.0e-6, learnable = false, *, target = None))]
     fn new(
+        py: Python<'_>,
         weight: f64,
         n_eff: i64,
         gamma: Option<f64>,
         variant: String,
         smoothing_eps: f64,
         learnable: bool,
-        target: PyObject,
+        target: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         let gamma = match gamma {
             Some(value) => value,
@@ -17547,7 +17548,7 @@ impl ScadMcpPenalty {
             },
         };
         let penalty = Self {
-            target,
+            target: py_object_or_string_default(py, target, "t"),
             weight,
             n_eff,
             gamma,
@@ -17666,7 +17667,7 @@ struct IvaeRidgeMeanGauge {
 #[pymethods]
 impl IvaeRidgeMeanGauge {
     #[new]
-    #[pyo3(signature = (aux, weight, n_eff, ridge_eps = 1.0e-6, learnable = false, *, target = default_target_py()))]
+    #[pyo3(signature = (aux, weight, n_eff, ridge_eps = 1.0e-6, learnable = false, *, target = None))]
     fn new(
         py: Python<'_>,
         aux: &Bound<'_, PyAny>,
@@ -17674,7 +17675,7 @@ impl IvaeRidgeMeanGauge {
         n_eff: &Bound<'_, PyAny>,
         ridge_eps: f64,
         learnable: bool,
-        target: PyObject,
+        target: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         let builtins = py.import("builtins")?;
         let weight = builtins
@@ -17685,7 +17686,7 @@ impl IvaeRidgeMeanGauge {
         let aux = aux_conditional_prior_float_array(py, aux)?;
         validate_ivae_ridge_mean_gauge_aux(&aux, weight, n_eff, ridge_eps)?;
         Ok(Self {
-            target,
+            target: py_object_or_string_default(py, target, "t"),
             aux: aux.unbind(),
             ridge_eps,
             weight,
