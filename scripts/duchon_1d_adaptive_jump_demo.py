@@ -6,7 +6,6 @@ import argparse
 import csv
 import math
 import subprocess
-import sys
 import tempfile
 from pathlib import Path
 
@@ -75,8 +74,7 @@ def write_csv(path: Path, rows: list[tuple[float, ...]], header: list[str]) -> N
 
 
 def run(cmd: list[str | Path]) -> None:
-    rendered = [str(part) for part in cmd]
-    subprocess.run(rendered, cwd=REPO_ROOT, check=True)
+    subprocess.run([str(part) for part in cmd], cwd=REPO_ROOT, check=True)
 
 
 def read_mean_predictions(pred_path: Path, expected_rows: int, label: str) -> np.ndarray:
@@ -387,8 +385,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    try:
-        raise SystemExit(main())
-    except subprocess.CalledProcessError as exc:
-        print(f"command failed with exit code {exc.returncode}: {exc.cmd}", file=sys.stderr)
-        raise
+    raise SystemExit(main())
