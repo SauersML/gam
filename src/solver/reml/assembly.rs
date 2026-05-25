@@ -15,7 +15,7 @@ use super::unified::{
     RemlLamlResult, penalty_matrix_root, reml_laml_evaluate,
 };
 use crate::faer_ndarray::fast_xt_diag_y;
-use ndarray::{Array1, Array2};
+use ndarray::{Array1, Array2, ArrayView2};
 use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
 use rayon::slice::{ParallelSlice, ParallelSliceMut};
 use std::sync::Arc;
@@ -68,6 +68,22 @@ pub(crate) fn row_scale_dense_in_place_by_inverse_positive_or_zero(
     scale: &Array1<f64>,
 ) {
     row_scale_dense_in_place(out, scale, DenseRowScaleMode::InversePositiveOrZero);
+}
+
+pub(crate) fn add_row_scaled_dense_into(
+    x: ArrayView2<'_, f64>,
+    scale: &Array1<f64>,
+    leading_scale: f64,
+    out: &mut Array2<f64>,
+) {
+    assert_eq!(x.nrows(), scale.len(), "scale length must match row count");
+    assert_eq!(out.raw_dim(), x.raw_dim(), "output shape must match input");
+    for i in 0..x.nrows() {
+        let row_scale = leading_scale * scale[i];
+        for k in 0..x.ncols() {
+            out[[i, k]] += row_scale * x[[i, k]];
+        }
+    }
 }
 
 fn row_scale_dense_in_place(

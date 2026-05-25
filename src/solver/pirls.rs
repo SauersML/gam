@@ -1903,7 +1903,7 @@ impl<'a> GamWorkingModel<'a> {
                         &mut workspace.hessian_buf,
                     );
                 } else {
-                    // All weights are non-negative; the signed-streaming path
+                    // All weights are non-negative; the shared dense helper
                     // computes Xᵀ·diag(w)·X directly without sqrt/clip.
                     PirlsWorkspace::add_dense_xtwx_signed(
                         weights,
@@ -2892,6 +2892,10 @@ fn accumulate_outer_upper(
         .expect("dense XᵀWX accumulator is row-major and contiguous");
 
     for i in rows {
+        // Sparse PIRLS precompute deliberately clips to Fisher-style
+        // nonnegative weights before the row outer product. The shared REML
+        // dense helper preserves signed observed-Hessian weights exactly, so
+        // routing this sparse path through it would change curvature semantics.
         let w_i = weights[i].max(0.0);
         if w_i == 0.0 {
             continue;
@@ -7771,7 +7775,7 @@ fn solve_penalized_least_squares_implicit(
     // assembly here and adopt the cached matrix as-is.
     let weights_owned = weights.to_owned();
     let xtwx_orig = match x_original {
-        // Only materialized dense designs can use the streaming-BLAS path.
+        // Only materialized dense designs can use the shared dense assembly path.
         // Lazy operator-backed dense designs route to diag_xtw_x like sparse.
         DesignMatrix::Dense(x_dense) if x_dense.is_materialized_dense() => {
             let p = x_dense.ncols();
@@ -11590,12 +11594,11 @@ mod tests {
         let mut workspace = PirlsWorkspace::new(x.nrows(), x.ncols(), 0, 0);
         let mut streamed = Array2::<f64>::zeros((x.ncols(), x.ncols()).f());
 
-        PirlsWorkspace::add_dense_xtwx_streaming_signed(
+        PirlsWorkspace::add_dense_xtwx_signed(
             &weights,
             &mut workspace.weighted_x_chunk,
             &x,
             &mut streamed,
-            faer::Par::Seq,
         );
 
         let wx = Array2::from_shape_fn(x.raw_dim(), |(i, j)| weights[i] * x[[i, j]]);
@@ -14189,17 +14192,16 @@ mod root_cause_tests {
     }
 
     #[test]
-    fn dense_xtwx_signed_streaming_preserves_negative_weights() {
+    fn dense_xtwx_signed_assembly_preserves_negative_weights() {
         let x = array![[1.0, 2.0], [3.0, -1.0], [0.5, 4.0]];
         let weights = array![2.0, -3.0, 0.25];
         let mut chunk = Array2::<f64>::zeros((0, 0));
         let mut got = Array2::<f64>::zeros((2, 2));
-        PirlsWorkspace::add_dense_xtwx_streaming_signed(
+        PirlsWorkspace::add_dense_xtwx_signed(
             &weights,
             &mut chunk,
             &x,
             &mut got,
-            faer::Par::Seq,
         );
 
         let mut expected = Array2::<f64>::zeros((2, 2));

@@ -103,6 +103,7 @@ from ._binding import rust_module as _rust_module; TotalVariationPenalty = _rust
 from ._binding import rust_module as _rust_module; SoftmaxAssignmentSparsityPenalty = _rust_module().SoftmaxAssignmentSparsityPenalty
 from ._binding import rust_module as _rust_module; OrthogonalityPenalty = _rust_module().OrthogonalityPenalty
 from ._binding import rust_module as _rust_module; IvaeRidgeMeanGauge = _rust_module().IvaeRidgeMeanGauge
+from ._binding import rust_module as _rust_module; MechanismSparsityPenalty = _rust_module().MechanismSparsityPenalty
 
 
 class AnalyticPenaltyKind(str, Enum):
