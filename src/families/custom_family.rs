@@ -20384,7 +20384,7 @@ fn exact_newton_joint_projected_kkt_residual_for_ift_from_gradient(
         block_active_sets,
     )?;
     if residual.iter().all(|v| v.is_finite()) {
-        Ok(Some(ProjectedKktResidual::from_projected(residual)))
+        Ok(Some(ProjectedKktResidual::from_active_projected(residual)))
     } else {
         // Surface this clearly: a non-finite projected residual reaches the
         // unified evaluator as `kkt_residual = None`, which then makes the
@@ -27661,6 +27661,39 @@ mod tests {
         assert!((poor.rho - 0.1).abs() < 1.0e-12);
         assert!((poor.radius - 0.25).abs() < 1.0e-12);
         assert_eq!(poor.decision.label(), "shrink_marginal_accept");
+    }
+
+    #[test]
+    fn spectral_joint_newton_step_uses_pseudoinverse_when_null_gradient_is_zero() {
+        let h = array![[4.0, 0.0], [0.0, 0.0]];
+        let rhs = array![8.0, 0.0];
+        let step = solve_joint_newton_step_on_spectral_range(&h, &rhs, 1.0e-10, 1.0e-12)
+            .expect("range-only RHS should have a minimum-norm Newton step");
+
+        assert_relative_eq!(step.delta[0], 2.0, epsilon = 1.0e-12);
+        assert_relative_eq!(step.delta[1], 0.0, epsilon = 1.0e-12);
+        assert_eq!(step.nullity, 1);
+        assert_relative_eq!(step.null_rhs_inf, 0.0, epsilon = 1.0e-12);
+
+        let residual = h.dot(&step.delta) - &rhs;
+        assert!(
+            residual.iter().all(|v| v.abs() <= 1.0e-12),
+            "range RHS should satisfy Hδ = rhs, residual={residual:?}"
+        );
+    }
+
+    #[test]
+    fn spectral_joint_newton_step_rejects_nonzero_null_gradient() {
+        let h = array![[4.0, 0.0], [0.0, 0.0]];
+        let rhs = array![8.0, 0.25];
+        let err = solve_joint_newton_step_on_spectral_range(&h, &rhs, 1.0e-10, 1.0e-12)
+            .expect_err("nonzero null RHS means no stationary quadratic minimizer");
+
+        assert!(
+            err.contains("nonzero gradient in Hessian nullspace"),
+            "unexpected error: {err}"
+        );
+        assert!(err.contains("|P0 rhs|"));
     }
 
     #[test]
