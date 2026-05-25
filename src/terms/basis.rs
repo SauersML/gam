@@ -7778,7 +7778,7 @@ pub fn build_bspline_basis_1d(
                     identifiability_transform,
                 )
             };
-        let (penalties, nullspace_dims, penaltyinfo, ops) =
+        let (penalties, nullspace_dims, penaltyinfo, null_eigenvectors, ops) =
             filter_active_penalty_candidates_with_ops(transformed_candidates)?;
         return Ok(BasisBuildResult {
             design,
@@ -7896,7 +7896,7 @@ pub fn build_bspline_basis_1d(
                 penalties_raw_mats,
                 Some(chunk),
             )?;
-        let (penalties, nullspace_dims, penaltyinfo, ops) =
+        let (penalties, nullspace_dims, penaltyinfo, null_eigenvectors, ops) =
             filter_active_penalty_candidates_with_ops(transformed_candidates)?;
         return Ok(BasisBuildResult {
             design,
@@ -8193,7 +8193,7 @@ pub fn build_bspline_basis_1d(
             identifiability_transform,
         )
     };
-    let (penalties, nullspace_dims, penaltyinfo, ops) =
+    let (penalties, nullspace_dims, penaltyinfo, null_eigenvectors, ops) =
         filter_active_penalty_candidates_with_ops(transformed_candidates)?;
     Ok(BasisBuildResult {
         design,
@@ -9368,7 +9368,7 @@ pub fn build_thin_plate_basiswithworkspace(
             })
             .collect::<Result<Vec<_>, _>>()?;
     }
-    let (penalties, nullspace_dims, penaltyinfo, ops) =
+    let (penalties, nullspace_dims, penaltyinfo, null_eigenvectors, ops) =
         filter_active_penalty_candidates_with_ops(candidates)?;
     Ok(BasisBuildResult {
         design,
@@ -16020,7 +16020,7 @@ pub fn build_spherical_spline_basis(
             op: None,
         });
     }
-    let (penalties, nullspace_dims, penaltyinfo, ops) =
+    let (penalties, nullspace_dims, penaltyinfo, null_eigenvectors, ops) =
         filter_active_penalty_candidates_with_ops(candidates)?;
     Ok(BasisBuildResult {
         design,
@@ -16261,7 +16261,7 @@ fn build_spherical_harmonic_basis(
             op: None,
         });
     }
-    let (penalties, nullspace_dims, penaltyinfo, ops) =
+    let (penalties, nullspace_dims, penaltyinfo, null_eigenvectors, ops) =
         filter_active_penalty_candidates_with_ops(candidates)?;
     Ok(BasisBuildResult {
         design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(design)),
@@ -16485,7 +16485,7 @@ pub fn build_matern_basiswithworkspace(
         };
         (design, candidates)
     };
-    let (penalties, nullspace_dims, penaltyinfo, ops) =
+    let (penalties, nullspace_dims, penaltyinfo, null_eigenvectors, ops) =
         filter_active_penalty_candidates_with_ops(candidates)?;
     Ok(BasisBuildResult {
         design,
@@ -20232,7 +20232,7 @@ fn build_cyclic_duchon_basis_1dwithworkspace(
         kronecker_factors: None,
         op: None,
     }];
-    let (penalties, nullspace_dims, penaltyinfo, ops) =
+    let (penalties, nullspace_dims, penaltyinfo, null_eigenvectors, ops) =
         filter_active_penalty_candidates_with_ops(candidates)?;
     Ok(BasisBuildResult {
         design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(design_matrix)),
@@ -21447,7 +21447,7 @@ fn build_periodic_duchon_basis_1d(
         1,
         PenaltySource::Primary,
     )];
-    let (penalties, nullspace_dims, penaltyinfo, ops) =
+    let (penalties, nullspace_dims, penaltyinfo, null_eigenvectors, ops) =
         filter_active_penalty_candidates_with_ops(candidates)?;
     Ok(BasisBuildResult {
         design,
@@ -21694,7 +21694,7 @@ fn build_duchon_basis_mixed_periodicity(
         1,
         PenaltySource::Primary,
     )];
-    let (penalties, nullspace_dims, penaltyinfo, ops) =
+    let (penalties, nullspace_dims, penaltyinfo, null_eigenvectors, ops) =
         filter_active_penalty_candidates_with_ops(candidates)?;
     Ok(BasisBuildResult {
         design,
@@ -22066,7 +22066,7 @@ pub fn build_duchon_basiswithworkspace(
         }
         candidates
     };
-    let (penalties, nullspace_dims, penaltyinfo, ops) =
+    let (penalties, nullspace_dims, penaltyinfo, null_eigenvectors, ops) =
         filter_active_penalty_candidates_with_ops(candidates)?;
     Ok(BasisBuildResult {
         design,
