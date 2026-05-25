@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Geometric smooths demo — recover six shapes from noisy 3D point clouds.
 
-Generates a trefoil knot, a latent-free wiggly loop, a wobbly cylinder, a
-lumpy sphere, a bumpy torus, and a 4π-periodic double-cover of a Möbius
+Generates a trefoil knot, a wiggly loop, a wobbly cylinder, a lumpy sphere,
+a bumpy torus, and a 4π-periodic double-cover of a Möbius
 embedding. Each shape is sampled with
 known (latent) parameters; we observe noisy (x, y, z) and fit one geometric
 smooth per coordinate using the `gam` CLI. The recovered surfaces / curves
@@ -201,74 +201,61 @@ def write_csvs() -> None:
     np.savetxt(DATA / "mob.csv", np.column_stack([u, v, x, y, z]),
                delimiter=",", header="u,v,x,y,z", comments="", fmt="%.6f")
 
-    # Loop (param = t, but we discard t and infer it from the cloud via PCA)
-    t_true, coords, sig = gen_loop()
+    # Loop (param = t)
+    t, coords, sig = gen_loop()
     xn, yn, zn = add_noise(coords, sig)
-    pts_c = np.column_stack([xn, yn, zn])
-    pts_c -= pts_c.mean(0)
-    Vt = np.linalg.svd(pts_c, full_matrices=False)[2]
-    proj = pts_c @ Vt[:2].T
-    t_est = (np.arctan2(proj[:, 1], proj[:, 0]) + TAU) % TAU
-    np.savetxt(DATA / "loop.csv", np.column_stack([t_est, xn, yn, zn]),
+    np.savetxt(DATA / "loop.csv", np.column_stack([t, xn, yn, zn]),
                delimiter=",", header="t,x,y,z", comments="", fmt="%.6f")
-    # Truth for visual reference only — never used by the fit
-    T_dense = np.linspace(0, TAU, 800, endpoint=False)
-    np.save(DATA / "loop_t_true.npy", t_true)
-    np.save(DATA / "loop_truth.npy", np.column_stack([
-        np.cos(T_dense) + 0.10 * np.sin(3 * T_dense),
-        np.sin(T_dense) + 0.10 * np.cos(4 * T_dense),
-        0.45 * np.sin(2 * T_dense) + 0.15 * np.cos(T_dense),
-    ]))
 
 
 # ---------------------------------------------------------------------------
 # Step 2: fit + predict via the gam CLI
 # ---------------------------------------------------------------------------
 FITS = [
-    # (name, csv, formula, grid_columns)
+    # (name, csv, formula)
     ("tref_x", "tref.csv",
-     "x ~ s(t, periodic=true, period=6.283185307, k=24)", None),
+     "x ~ s(t, periodic=true, period=6.283185307, k=24)"),
     ("tref_y", "tref.csv",
-     "y ~ s(t, periodic=true, period=6.283185307, k=24)", None),
+     "y ~ s(t, periodic=true, period=6.283185307, k=24)"),
     ("tref_z", "tref.csv",
-     "z ~ s(t, periodic=true, period=6.283185307, k=24)", None),
+     "z ~ s(t, periodic=true, period=6.283185307, k=24)"),
     ("loop_x", "loop.csv",
-     "x ~ s(t, periodic=true, period=6.283185307, k=18)", None),
+     "x ~ s(t, periodic=true, period=6.283185307, k=18)"),
     ("loop_y", "loop.csv",
-     "y ~ s(t, periodic=true, period=6.283185307, k=18)", None),
+     "y ~ s(t, periodic=true, period=6.283185307, k=18)"),
     ("loop_z", "loop.csv",
-     "z ~ s(t, periodic=true, period=6.283185307, k=18)", None),
+     "z ~ s(t, periodic=true, period=6.283185307, k=18)"),
     ("cyl_x", "cyl.csv",
-     "x ~ te(theta, h, periodic=[0], period=[6.283185307, None], k=[26,12])", None),
+     "x ~ te(theta, h, periodic=[0], period=[6.283185307, None], k=[26,12])"),
     ("cyl_y", "cyl.csv",
-     "y ~ te(theta, h, periodic=[0], period=[6.283185307, None], k=[26,12])", None),
+     "y ~ te(theta, h, periodic=[0], period=[6.283185307, None], k=[26,12])"),
     ("cyl_z", "cyl.csv",
-     "z ~ te(theta, h, periodic=[0], period=[6.283185307, None], k=[26,12])", None),
+     "z ~ te(theta, h, periodic=[0], period=[6.283185307, None], k=[26,12])"),
     ("sph_x", "sph.csv",
-     "x ~ sphere(lat, lon, radians=true, k=100)", None),
+     "x ~ sphere(lat, lon, radians=true, k=100)"),
     ("sph_y", "sph.csv",
-     "y ~ sphere(lat, lon, radians=true, k=100)", None),
+     "y ~ sphere(lat, lon, radians=true, k=100)"),
     ("sph_z", "sph.csv",
-     "z ~ sphere(lat, lon, radians=true, k=100)", None),
+     "z ~ sphere(lat, lon, radians=true, k=100)"),
     ("tor_x", "tor.csv",
-     "x ~ te(u, v, periodic=[0,1], period=[6.283185307, 6.283185307], k=[20,16])", None),
+     "x ~ te(u, v, periodic=[0,1], period=[6.283185307, 6.283185307], k=[20,16])"),
     ("tor_y", "tor.csv",
-     "y ~ te(u, v, periodic=[0,1], period=[6.283185307, 6.283185307], k=[20,16])", None),
+     "y ~ te(u, v, periodic=[0,1], period=[6.283185307, 6.283185307], k=[20,16])"),
     ("tor_z", "tor.csv",
-     "z ~ te(u, v, periodic=[0,1], period=[6.283185307, 6.283185307], k=[20,16])", None),
+     "z ~ te(u, v, periodic=[0,1], period=[6.283185307, 6.283185307], k=[20,16])"),
     ("mob_x", "mob.csv",
-     "x ~ te(u, v, periodic=[0], period=[12.566370614, None], k=[32,10])", None),
+     "x ~ te(u, v, periodic=[0], period=[12.566370614, None], k=[32,10])"),
     ("mob_y", "mob.csv",
-     "y ~ te(u, v, periodic=[0], period=[12.566370614, None], k=[32,10])", None),
+     "y ~ te(u, v, periodic=[0], period=[12.566370614, None], k=[32,10])"),
     ("mob_z", "mob.csv",
-     "z ~ te(u, v, periodic=[0], period=[12.566370614, None], k=[32,10])", None),
+     "z ~ te(u, v, periodic=[0], period=[12.566370614, None], k=[32,10])"),
 ]
 
 
 def fit_all() -> None:
     if not GAM.exists():
         sys.exit(f"missing release binary: {GAM} — run `cargo build --release`")
-    for name, csv, formula, _ in FITS:
+    for name, csv, formula in FITS:
         model = DATA / f"{name}.model"
         if model.exists():
             print(f"  skip  {name:8s} (cached)")
@@ -571,144 +558,6 @@ def update_depth_scalars(
 
 
 # ---------------------------------------------------------------------------
-# Fit quality (RMSE / R² against the noise-free analytic truth)
-# ---------------------------------------------------------------------------
-def quality_report() -> None:
-    """Print per-shape RMSE / R² between predicted (x, y, z) and the
-    noise-free analytic truth, evaluated on the dense prediction grid.
-
-    Treats the joint (x, y, z) prediction as a 3-vector field over the
-    latent grid, so a single RMSE per shape captures how well the
-    manifold itself is recovered (not three independent coordinate
-    errors).  The quality report is informational — it always prints,
-    never gates rendering."""
-
-    def stats(pred_xyz: np.ndarray, truth_xyz: np.ndarray) -> tuple[float, float]:
-        """Pointwise RMSE / R² when latent parameters align between
-        truth and prediction (true for everything except the loop)."""
-        err = pred_xyz - truth_xyz
-        rmse = float(np.sqrt(np.mean(err * err)))
-        var = float(np.mean((truth_xyz - truth_xyz.mean(0)) ** 2))
-        r2 = 1.0 - float(np.mean(err * err)) / var if var > 0 else float("nan")
-        return rmse, r2
-
-    def chamfer(A: np.ndarray, B: np.ndarray) -> float:
-        """Symmetric mean nearest-neighbor distance between two 3-D
-        point sets. Use when the latent parameterisation is unknown,
-        unique only up to rotation / reflection, or otherwise not
-        comparable pointwise (the latent-free loop hits all three)."""
-        d2 = ((A[:, None, :] - B[None, :, :]) ** 2).sum(-1)
-        da = float(np.sqrt(d2.min(axis=1).mean()))
-        db = float(np.sqrt(d2.min(axis=0).mean()))
-        return 0.5 * (da + db)
-
-    rows: list[tuple[str, str, float, float]] = []
-
-    # Curves: trefoil + loop — both have a 1-D parameter grid.
-    T = np.loadtxt(DATA / "grid_1d.csv", delimiter=",", skiprows=1)
-    tref_truth = np.column_stack([
-        np.sin(T) + 2 * np.sin(2 * T),
-        np.cos(T) - 2 * np.cos(2 * T),
-        -np.sin(3 * T),
-    ])
-    tref_pred = np.column_stack([
-        load_pred("tref_x"), load_pred("tref_y"), load_pred("tref_z"),
-    ])
-    rows.append(("trefoil", "pointwise", *stats(tref_pred, tref_truth)))
-
-    loop_truth = np.load(DATA / "loop_truth.npy")
-    loop_pred = np.column_stack([
-        load_pred("loop_x"), load_pred("loop_y"), load_pred("loop_z"),
-    ])
-    # Loop t was inferred via PCA atan2, unique only up to rotation /
-    # reflection — pointwise comparison at t is meaningless.  Report
-    # Chamfer distance between the predicted and truth curves as
-    # point sets in R³ instead.
-    loop_cham = chamfer(loop_pred, loop_truth)
-    rows.append(("loop", "chamfer", loop_cham, float("nan")))
-
-    # Cylinder
-    NTH, NH = np.load(DATA / "grid_cyl_shape.npy")
-    g = np.loadtxt(DATA / "grid_cyl.csv", delimiter=",", skiprows=1)
-    th, h = g[:, 0], g[:, 1]
-    r = 1.0 + 0.18 * np.sin(4 * th + 3 * np.pi * h)
-    cyl_truth = np.column_stack(
-        [r * np.cos(th), r * np.sin(th), 2 * (h - 0.5)]
-    )
-    cyl_pred = np.column_stack([
-        load_pred("cyl_x"), load_pred("cyl_y"), load_pred("cyl_z"),
-    ])
-    rows.append(("cylinder", "pointwise", *stats(cyl_pred, cyl_truth)))
-
-    # Sphere (matches gen_sph)
-    g = np.loadtxt(DATA / "grid_sph.csv", delimiter=",", skiprows=1)
-    lat, lon = g[:, 0], g[:, 1]
-    def gd(lat0: float, lon0: float) -> np.ndarray:
-        c = (np.sin(lat) * np.sin(lat0)
-             + np.cos(lat) * np.cos(lat0) * np.cos(lon - lon0))
-        return np.asarray(np.arccos(np.clip(c, -1, 1)))
-    rr: float | np.ndarray = 1.0
-    rr = rr + 0.55 * np.exp(-(gd(0.95, 0.30) / 0.45) ** 2)
-    rr = rr + 0.42 * np.exp(-(gd(-0.55, 2.50) / 0.50) ** 2)
-    rr = rr - 0.40 * np.exp(-(gd(0.05, 4.20) / 0.55) ** 2)
-    rr = rr + 0.32 * np.exp(-(gd(-1.20, 5.70) / 0.38) ** 2)
-    rr = rr + 0.22 * np.sin(4 * lon) * np.cos(3 * lat)
-    rr = rr + 0.10 * np.sin(6 * lon + 2 * lat)
-    sph_truth = np.column_stack([
-        rr * np.cos(lat) * np.cos(lon),
-        rr * np.cos(lat) * np.sin(lon),
-        rr * np.sin(lat),
-    ])
-    sph_pred = np.column_stack([
-        load_pred("sph_x"), load_pred("sph_y"), load_pred("sph_z"),
-    ])
-    rows.append(("sphere", "pointwise", *stats(sph_pred, sph_truth)))
-
-    # Torus
-    g = np.loadtxt(DATA / "grid_tor.csv", delimiter=",", skiprows=1)
-    u, v = g[:, 0], g[:, 1]
-    R = 2.0 + 0.18 * np.sin(3 * v + 2 * u)
-    r = 0.65 + 0.10 * np.cos(4 * u)
-    tor_truth = np.column_stack([
-        (R + r * np.cos(v)) * np.cos(u),
-        (R + r * np.cos(v)) * np.sin(u),
-        r * np.sin(v),
-    ])
-    tor_pred = np.column_stack([
-        load_pred("tor_x"), load_pred("tor_y"), load_pred("tor_z"),
-    ])
-    rows.append(("torus", "pointwise", *stats(tor_pred, tor_truth)))
-
-    # 4π-periodic Möbius double-cover
-    g = np.loadtxt(DATA / "grid_mob.csv", delimiter=",", skiprows=1)
-    u, v = g[:, 0], g[:, 1]
-    rim = 1 + 0.5 * v * np.cos(u / 2)
-    mob_truth = np.column_stack([
-        rim * np.cos(u), rim * np.sin(u), 0.5 * v * np.sin(u / 2),
-    ])
-    mob_pred = np.column_stack([
-        load_pred("mob_x"), load_pred("mob_y"), load_pred("mob_z"),
-    ])
-    rows.append(("mobius-double-cover", "pointwise", *stats(mob_pred, mob_truth)))
-
-    print("[quality] recovery error vs analytic truth")
-    print("           shape        n_grid    metric         error         R²")
-    nrow_lookup = {
-        "trefoil":  len(T),
-        "loop":     len(T),
-        "cylinder": NTH * NH,
-        "sphere":   len(sph_truth),
-        "torus":    len(tor_truth),
-        "mobius-double-cover": len(mob_truth),
-    }
-    for name, metric, err, r2 in rows:
-        nrows = nrow_lookup[name]
-        r2_str = "      —" if np.isnan(r2) else f"  {r2:7.4f}"
-        print(f"           {name:9s}    {nrows:6d}    {metric:9s}     "
-              f"{err:8.4f}  {r2_str}")
-
-
-# ---------------------------------------------------------------------------
 # Render outputs
 # ---------------------------------------------------------------------------
 def render_still(shapes: dict[str, dict[str, Any]], out_path: Path) -> None:
@@ -826,7 +675,6 @@ def main() -> None:
             print("[3/3] all predictions cached")
 
     shapes = build_shapes()
-    quality_report()
     base = SCRIPT.parent / "geometric_shapes_demo"
     if args.still:
         print("[render] still PNG (4000×3000)")
