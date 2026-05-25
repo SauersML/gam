@@ -16,7 +16,8 @@ use super::unified::{
 };
 use crate::faer_ndarray::fast_xt_diag_y;
 use ndarray::{Array1, Array2};
-use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
+use rayon::slice::{ParallelSlice, ParallelSliceMut};
 use std::sync::Arc;
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -28,6 +29,13 @@ use std::sync::Arc;
 /// stream rows through rayon-local accumulation buffers to avoid materializing
 /// weighted n×p design copies at biobank scale.
 const DENSE_WEIGHTED_PRODUCT_PAR_FLOPS: usize = 8_000_000;
+const DENSE_ROW_SCALE_PAR_CELLS: usize = 64 * 1024;
+
+#[derive(Clone, Copy)]
+enum DenseRowScaleMode {
+    Direct,
+    InversePositiveOrZero,
+}
 
 #[inline]
 fn dense_weighted_chunk_rows(cols: usize) -> usize {
@@ -49,13 +57,84 @@ pub(crate) fn row_scale_dense_into(x: &Array2<f64>, scale: &Array1<f64>, out: &m
     if out.raw_dim() != x.raw_dim() {
         *out = Array2::<f64>::zeros(x.raw_dim());
     }
+    out.assign(x);
+    row_scale_dense_in_place(out, scale, DenseRowScaleMode::Direct);
+}
+
+/// Scale each row of `out` by `1 / scale[row]`, writing zero rows where
+/// `scale[row] <= 0`.
+pub(crate) fn row_scale_dense_in_place_by_inverse_positive_or_zero(
+    out: &mut Array2<f64>,
+    scale: &Array1<f64>,
+) {
+    row_scale_dense_in_place(out, scale, DenseRowScaleMode::InversePositiveOrZero);
+}
+
+fn row_scale_dense_in_place(
+    out: &mut Array2<f64>,
+    scale: &Array1<f64>,
+    mode: DenseRowScaleMode,
+) {
+    assert_eq!(out.nrows(), scale.len(), "scale length must match row count");
+    let ncols = out.ncols();
+    if ncols == 0 {
+        return;
+    }
+
+    let cells = out.nrows().saturating_mul(ncols);
+    if cells >= DENSE_ROW_SCALE_PAR_CELLS
+        && rayon::current_num_threads() > 1
+        && out.is_standard_layout()
+        && let Some(slice) = out.as_slice_memory_order_mut()
+    {
+        slice
+            .par_chunks_mut(ncols)
+            .zip(scale.as_slice().expect("Array1 must be contiguous").par_iter())
+            .for_each(|(row_values, &w)| scale_dense_row_values(row_values, w, mode));
+        return;
+    }
+
     ndarray::Zip::from(out.rows_mut())
-        .and(x.rows())
         .and(scale.view())
-        .for_each(|mut dst, src, &w| {
-            dst.assign(&src);
-            dst *= w;
+        .for_each(|mut row, &w| {
+            if let Some(row_values) = row.as_slice_mut() {
+                scale_dense_row_values(row_values, w, mode);
+            } else {
+                match mode {
+                    DenseRowScaleMode::Direct => row *= w,
+                    DenseRowScaleMode::InversePositiveOrZero => {
+                        if w > 0.0 {
+                            row *= w.recip();
+                        } else {
+                            row.fill(0.0);
+                        }
+                    }
+                }
+            }
         });
+}
+
+#[inline]
+fn scale_dense_row_values(row_values: &mut [f64], scale: f64, mode: DenseRowScaleMode) {
+    match mode {
+        DenseRowScaleMode::Direct => {
+            for value in row_values {
+                *value *= scale;
+            }
+        }
+        DenseRowScaleMode::InversePositiveOrZero => {
+            if scale > 0.0 {
+                let inv = scale.recip();
+                for value in row_values {
+                    *value *= inv;
+                }
+            } else {
+                for value in row_values {
+                    *value = 0.0;
+                }
+            }
+        }
+    }
 }
 
 fn accumulate_weighted_cross_rows(

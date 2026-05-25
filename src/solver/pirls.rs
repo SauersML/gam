@@ -2617,12 +2617,18 @@ struct DenseOuterState {
 /// State for the sparse-SpGEMM backend (faer numeric matmul scratch and the
 /// pre-scaled (√W)·X factors that feed it).
 ///
-/// `sqrt_weights` caches `√max(0, wᵢ)` for each row of X. Without it, the
-/// right-factor loop would recompute the same sqrt once per nonzero of X
-/// (each row weight gets read by every column that has a nonzero in that
-/// row), so for an n=400 K · avg-nnz-per-row=10 design that's 4 M sqrts
-/// per PIRLS iteration. Precomputing once collapses that to n sqrts and
-/// the inner loop becomes a pure multiply.
+/// `sqrt_weights` caches `√wᵢ` for each finite nonnegative PIRLS working
+/// weight row of X. Without it, the right-factor loop would recompute the same
+/// sqrt once per nonzero of X (each row weight gets read by every column that
+/// has a nonzero in that row), so for an n=400 K · avg-nnz-per-row=10 design
+/// that's 4 M sqrts per PIRLS iteration. Precomputing once collapses that to n
+/// sqrts and the inner loop becomes a pure multiply.
+///
+/// This is deliberately separate from REML/Firth's fixed
+/// `observation_weight_sqrt` handling in `solver/reml/firth.rs`: this cache
+/// materializes the current working-weight Gram factors, while Firth stores
+/// case-weight roots so reduced designs can later be mapped back with
+/// reciprocal roots.
 struct SparseSpGemmState {
     wxvalues: Vec<f64>,
     wx_tvalues: Vec<f64>,
