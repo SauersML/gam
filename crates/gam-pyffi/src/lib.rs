@@ -16578,6 +16578,120 @@ impl AuxConditionalPriorPenalty {
     }
 }
 
+#[pyclass(module = "gam_pyffi._rust", name = "NuclearNormPenalty")]
+struct NuclearNormPenalty {
+    #[pyo3(get, set)]
+    target: PyObject,
+    #[pyo3(get, set)]
+    weight: f64,
+    #[pyo3(get, set)]
+    n_eff: i64,
+    #[pyo3(get, set)]
+    smoothing_eps: f64,
+    #[pyo3(get, set)]
+    max_rank: Option<i64>,
+    #[pyo3(get, set)]
+    learnable: bool,
+    #[pyo3(get, set)]
+    weight_schedule: Option<PyObject>,
+}
+
+#[pymethods]
+impl NuclearNormPenalty {
+    #[new]
+    #[pyo3(signature = (weight, n_eff, smoothing_eps = 1.0e-6, max_rank = None, learnable = false, *, target = "t"))]
+    fn new(
+        weight: f64,
+        n_eff: &Bound<'_, PyAny>,
+        smoothing_eps: f64,
+        max_rank: Option<&Bound<'_, PyAny>>,
+        learnable: bool,
+        target: PyObject,
+    ) -> PyResult<Self> {
+        let n_eff = n_eff.call_method0("__index__")?.extract::<i64>()?;
+        let max_rank = match max_rank {
+            Some(rank) => Some(rank.call_method0("__index__")?.extract::<i64>()?),
+            None => None,
+        };
+        if weight <= 0.0 {
+            return Err(PyValueError::new_err(format!(
+                "NuclearNormPenalty.weight must be > 0, got {weight}"
+            )));
+        }
+        if n_eff <= 0 {
+            return Err(PyValueError::new_err(format!(
+                "NuclearNormPenalty.n_eff must be > 0, got {n_eff}"
+            )));
+        }
+        if smoothing_eps <= 0.0 {
+            return Err(PyValueError::new_err(format!(
+                "NuclearNormPenalty.smoothing_eps must be > 0, got {smoothing_eps}"
+            )));
+        }
+        if let Some(rank) = max_rank {
+            if rank <= 0 {
+                return Err(PyValueError::new_err(format!(
+                    "NuclearNormPenalty.max_rank must be > 0, got {rank}"
+                )));
+            }
+        }
+        Ok(Self {
+            target,
+            weight,
+            n_eff,
+            smoothing_eps,
+            max_rank,
+            learnable,
+            weight_schedule: None,
+        })
+    }
+
+    #[classattr]
+    const KIND_TAG: &'static str = "nuclear_norm";
+
+    fn to_rust_descriptor(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let payload = PyDict::new(py);
+        payload.set_item("kind", Self::KIND_TAG)?;
+        payload.set_item("target", target_descriptor(py, self.target.bind(py))?)?;
+        payload.set_item("weight", self.weight)?;
+        payload.set_item("n_eff", self.n_eff)?;
+        payload.set_item("smoothing_eps", self.smoothing_eps)?;
+        payload.set_item("max_rank", self.max_rank)?;
+        payload.set_item("learnable", self.learnable)?;
+        if let Some(schedule) = topk_weight_schedule_descriptor(py, &self.weight_schedule)? {
+            payload.set_item("weight_schedule", schedule)?;
+        }
+        Ok(payload.into())
+    }
+
+    fn set_weight_schedule<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        schedule: PyObject,
+    ) -> PyRefMut<'py, Self> {
+        slf.weight_schedule = Some(schedule);
+        slf
+    }
+
+    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        Ok(format!(
+            "NuclearNormPenalty(weight={}, n_eff={}, smoothing_eps={}, max_rank={}, learnable={}, target={}, weight_schedule={})",
+            self.weight,
+            self.n_eff,
+            self.smoothing_eps,
+            match self.max_rank {
+                Some(rank) => rank.to_string(),
+                None => "None".to_string(),
+            },
+            self.learnable,
+            py_repr(py, self.target.bind(py))?,
+            match &self.weight_schedule {
+                Some(schedule) => py_repr(py, schedule.bind(py))?,
+                None => "None".to_string(),
+            }
+        ))
+    }
+}
+
 #[pymodule(name = "_rust", gil_used = false)]
 fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     gam::init_parallelism();
@@ -16819,6 +16933,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyIBPAssignmentPenalty>()?;
     module.add_class::<ScadMcpPenalty>()?;
     module.add_class::<TotalVariationPenalty>()?;
+    module.add_class::<MechanismSparsityPenalty>()?;
     Ok(())
 }
 
@@ -20721,7 +20836,7 @@ fn build_analytic_penalty_registry_from_json(
                     .get("learnable")
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false);
-                let penalty = MechanismSparsityPenalty::new(
+                let penalty = CoreMechanismSparsityPenalty::new(
                     mechanism_slice,
                     feature_groups,
                     weight,
