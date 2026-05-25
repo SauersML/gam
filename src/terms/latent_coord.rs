@@ -160,6 +160,13 @@ pub enum LatentManifold {
     Euclidean,
     /// Scalar angular coordinate on `S^1`, represented in radians.
     Circle,
+    /// Scalar periodic coordinate on `S^1` with caller-supplied period.
+    ///
+    /// Mirrors [`Self::Circle`] but wraps modulo `period` instead of `2π`,
+    /// for basis evaluators that interpret the latent as a fraction of one
+    /// period (`period = 1.0`) or any other convention. The metric weight
+    /// uses `1/period²` so the trust-region radius respects the chosen unit.
+    CirclePeriod { period: f64 },
     /// Embedded unit sphere `S^(dim-1)`.
     Sphere { dim: usize },
     /// Closed interval in `R`; the retraction clamps to the boundary.
@@ -185,7 +192,7 @@ impl LatentManifold {
     pub fn ambient_dim(&self, fallback_dim: usize) -> usize {
         match self {
             Self::Euclidean => fallback_dim,
-            Self::Circle | Self::Interval { .. } => 1,
+            Self::Circle | Self::CirclePeriod { .. } | Self::Interval { .. } => 1,
             Self::Sphere { dim } => *dim,
             Self::Product(parts)
             | Self::ProductWithMetric {
@@ -204,6 +211,13 @@ impl LatentManifold {
         match self {
             Self::Euclidean => vec![1.0],
             Self::Circle => vec![1.0 / (TWO_PI * TWO_PI)],
+            Self::CirclePeriod { period } => {
+                assert!(
+                    period.is_finite() && *period > 0.0,
+                    "LatentManifold::CirclePeriod requires a finite positive period; got {period}"
+                );
+                vec![1.0 / (period * period)]
+            }
             Self::Sphere { dim } => {
                 let w = 1.0 / (std::f64::consts::PI * std::f64::consts::PI);
                 vec![w; *dim]
@@ -238,6 +252,11 @@ impl LatentManifold {
             Self::Circle => {
                 let mut out = Array1::<f64>::zeros(1);
                 out[0] = wrap_angle(t[0]);
+                out
+            }
+            Self::CirclePeriod { period } => {
+                let mut out = Array1::<f64>::zeros(1);
+                out[0] = wrap_to_period(t[0], *period);
                 out
             }
             Self::Sphere { dim } => {
@@ -285,6 +304,11 @@ impl LatentManifold {
                 out[0] = wrap_angle(t[0] + xi[0]);
                 out
             }
+            Self::CirclePeriod { period } => {
+                let mut out = Array1::<f64>::zeros(1);
+                out[0] = wrap_to_period(t[0] + xi[0], *period);
+                out
+            }
             Self::Sphere { dim } => {
                 assert_eq!(t.len(), *dim);
                 let mut y = Array1::<f64>::zeros(*dim);
@@ -329,7 +353,7 @@ impl LatentManifold {
     ) -> Array1<f64> {
         assert_eq!(t.len(), v.len());
         match self {
-            Self::Euclidean | Self::Circle => v.to_owned(),
+            Self::Euclidean | Self::Circle | Self::CirclePeriod { .. } => v.to_owned(),
             Self::Sphere { dim } => {
                 assert_eq!(t.len(), *dim);
                 let tv = dot_views(t, v);
@@ -402,9 +426,10 @@ impl LatentManifold {
         assert_eq!(t.len(), xi.len());
         assert_eq!(t.len(), eh_xi.len());
         match self {
-            Self::Euclidean | Self::Circle | Self::Interval { .. } => {
-                self.project_to_tangent(t, eh_xi)
-            }
+            Self::Euclidean
+            | Self::Circle
+            | Self::CirclePeriod { .. }
+            | Self::Interval { .. } => self.project_to_tangent(t, eh_xi),
             Self::Sphere { dim } => {
                 assert_eq!(t.len(), *dim);
                 let grad_r = self.project_to_tangent(t, eg);
@@ -986,6 +1011,15 @@ impl LatentCoordValues {
 fn wrap_angle(x: f64) -> f64 {
     let y = x.rem_euclid(TWO_PI);
     if y == TWO_PI { 0.0 } else { y }
+}
+
+fn wrap_to_period(x: f64, period: f64) -> f64 {
+    assert!(
+        period.is_finite() && period > 0.0,
+        "wrap_to_period requires a finite positive period; got {period}"
+    );
+    let y = x.rem_euclid(period);
+    if y == period { 0.0 } else { y }
 }
 
 fn normalize_or_axis(v: ArrayView1<'_, f64>, dim: usize) -> Array1<f64> {
