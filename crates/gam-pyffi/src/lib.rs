@@ -13466,8 +13466,6 @@ fn difference_simultaneous_critical(
 }
 
 fn difference_smooth_json_impl(model_bytes: &[u8], request_json: &str) -> Result<String, String> {
-    use statrs::distribution::ContinuousCDF;
-
     let state_json = coefficient_state_json_impl(model_bytes)?;
     let state: serde_json::Value = serde_json::from_str(&state_json)
         .map_err(|err| format!("failed to parse coefficient state json: {err}"))?;
