@@ -4977,6 +4977,13 @@ impl PenaltySubspaceTrace {
         proj_a.dot(&h_proj_inv_b)
     }
 
+    /// Euclidean projection onto the retained penalty/Hessian range used by
+    /// this projected kernel: `P_S a = U_S U_Sᵀ a`.
+    pub fn project_onto_subspace(&self, a: &Array1<f64>) -> Array1<f64> {
+        let proj_a = crate::faer_ndarray::fast_atv(&self.u_s, a);
+        crate::faer_ndarray::fast_av(&self.u_s, &proj_a)
+    }
+
     /// Apply the projected pseudo-inverse `K = U_S · H_proj⁻¹ · U_Sᵀ` to a
     /// vector `a`, returning the minimum-norm solution `v = K · a` of the
     /// system `H v = a` restricted to `range(S₊)`.
@@ -5165,31 +5172,36 @@ impl<'a> ConstrainedSubspaceKernel<'a> {
     }
 }
 
-/// KKT residual `r = ∇_β L_pen(β̂)` at the converged inner iterate, already
-/// projected onto the *free subspace* — i.e. with the Lagrange-multiplier
-/// component along the active inequality-constraint normals stripped out.
+/// Subspace represented by a stored KKT residual.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KktResidualSubspace {
+    /// Residual after active-constraint normal components have been stripped:
+    /// `r_A = P_T(Sβ + Γβ - ∇ℓ)`.
+    ActiveProjected,
+    /// Residual additionally projected into the retained identifiable range:
+    /// `r_R = R Rᵀ r_A`.
+    ReducedRange,
+}
+
+/// KKT residual `r = ∇_β L_pen(β̂)` at the converged inner iterate, with its
+/// exact represented subspace tagged.
 ///
 /// The IFT correction `−½ rᵀ H⁻¹ r` in `reml_laml_evaluate` requires `r` to
-/// lie in `range(H_free)` so that `H⁻¹·r` is well-conditioned. At a
-/// constrained-stationary point the unprojected residual carries multiplier
-/// mass *outside* that range; feeding it through `H⁻¹` amplifies floating-
-/// point noise by `1/σ_min(H_active_normal)` (≈10¹² on rank-deficient inner
-/// Hessians) and the resulting gradient explodes to ~10¹⁵ — the envelope
-/// tripwire then suppresses the gradient and the outer optimizer can make no
-/// progress (the biobank survival marginal-slope failure mode).
+/// be in the same reduced range as the inverse kernel. An active-projected
+/// residual is sufficient for the full-H path when the Hessian is nonsingular.
+/// When the projected pseudo-inverse path is active, the evaluator converts it
+/// to `ReducedRange` before assembling the IFT cost/gradient/Hessian.
 ///
 /// This newtype lifts the projection contract into the type system: a value
-/// of this type can only be produced by the projection-aware constructors,
-/// so callers cannot accidentally hand an unprojected residual to the
-/// unified evaluator. The free-function helpers in `families::custom_family`
-/// (`exact_newton_joint_kkt_residual_for_ift`) take active-set information
-/// and emit values of this type; the unified evaluator consumes it via the
-/// borrowing accessor.
+/// of this type can only be produced by projection-aware constructors, and the
+/// stored subspace says whether the residual is merely active-projected or has
+/// also been reduced into the identifiable range.
 #[derive(Clone, Debug)]
 pub struct ProjectedKktResidual {
     /// The free-space residual vector. Same length as the unprojected
     /// gradient minus the number of pinned active-set rows.
     residual: Array1<f64>,
+    subspace: KktResidualSubspace,
     /// The KKT-stationarity tolerance the inner solver compared the
     /// residual against when the certificate fired. `None` for legacy
     /// construction sites that haven't been threaded yet; downstream
@@ -5203,16 +5215,23 @@ pub struct ProjectedKktResidual {
 }
 
 impl ProjectedKktResidual {
-    /// Construct from a vector that the caller guarantees has already been
-    /// projected onto the free subspace. Crate-private so the projection
-    /// invariant cannot be bypassed by downstream callers. The
-    /// `residual_tol` / `free_rank` metadata is left unset; callers that
-    /// have those numbers in scope should use [`with_metadata`].
-    ///
-    /// [`with_metadata`]: ProjectedKktResidual::with_metadata
-    pub(crate) fn from_projected(residual: Array1<f64>) -> Self {
+    /// Construct from `r_A = P_T(Sβ + Γβ - ∇ℓ)`, with active constraint
+    /// multipliers removed but before any reduced-range projection.
+    pub(crate) fn from_active_projected(residual: Array1<f64>) -> Self {
         Self {
             residual,
+            subspace: KktResidualSubspace::ActiveProjected,
+            residual_tol: None,
+            free_rank: None,
+        }
+    }
+
+    /// Construct from `r_R = R Rᵀ r_A`, where `R` is the actual reduced
+    /// identifiable basis used by the projected inverse kernel.
+    pub(crate) fn from_reduced_range(residual: Array1<f64>) -> Self {
+        Self {
+            residual,
+            subspace: KktResidualSubspace::ReducedRange,
             residual_tol: None,
             free_rank: None,
         }
@@ -5232,6 +5251,10 @@ impl ProjectedKktResidual {
     /// its ρ-derivatives.
     pub fn as_array(&self) -> &Array1<f64> {
         &self.residual
+    }
+
+    pub fn subspace(&self) -> KktResidualSubspace {
+        self.subspace
     }
 
     /// The KKT-stationarity tolerance the inner solver applied at the
