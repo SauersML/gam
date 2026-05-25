@@ -161,3 +161,315 @@
 //! offset residuals additively into the existing offset slots via
 //! `add_survival_time_derivative_guard_offset` — so the existing pipeline
 //! continues to own offset accumulation.
+
+use ndarray::{Array1, Array2, ArrayView1};
+
+use crate::terms::basis::{
+    BasisOptions, KnotSource, SplineScratch, create_basis, evaluate_bspline_basis_scalar,
+};
+
+/// Errors emitted by the I-spline base-time design builders.
+#[derive(Debug, thiserror::Error)]
+pub enum ISplineBaseTimeError {
+    /// The I-spline / C-spline degree must be `≥ 1` (B-splines of degree
+    /// `k+1` must be well-defined).
+    #[error("ispline_base_time: I-spline degree must be >= 1, got {degree}")]
+    InvalidDegree { degree: usize },
+    /// Knot vector too short for the requested degree.
+    #[error(
+        "ispline_base_time: knot vector of length {provided} is too short for I-spline degree {degree}; need >= {required}"
+    )]
+    InsufficientKnots {
+        degree: usize,
+        required: usize,
+        provided: usize,
+    },
+    /// Entry and exit length mismatch when building paired designs.
+    #[error(
+        "ispline_base_time: entry/exit length mismatch (entry={entry}, exit={exit})"
+    )]
+    EntryExitMismatch { entry: usize, exit: usize },
+    /// Bubbled error from the underlying spline routines.
+    #[error("ispline_base_time: spline routine failed: {reason}")]
+    Spline { reason: String },
+    /// A requested time coordinate is non-finite or non-positive.
+    #[error(
+        "ispline_base_time: time coordinate at row {row} is not finite-and-positive (got {value})"
+    )]
+    InvalidTime { row: usize, value: f64 },
+}
+
+/// Result of `build_ispline_base_designs`: dense entry/exit/derivative designs
+/// in the C-spline / scaled-I-spline basis, plus the additive `guard·t`
+/// residuals that the caller folds into the existing offset slots.
+#[derive(Debug, Clone)]
+pub struct ISplineBaseDesigns {
+    pub design_entry: Array2<f64>,
+    pub design_exit: Array2<f64>,
+    pub design_derivative_exit: Array2<f64>,
+    pub offset_residual_entry: Array1<f64>,
+    pub offset_residual_exit: Array1<f64>,
+    pub derivative_offset_residual_exit: Array1<f64>,
+}
+
+/// Closed-form C-spline values `C_j^{(k)}(u) = ∫_{τ[k+1]}^{u} I_j^{(k)}(v) dv`
+/// evaluated at the rows of `data`, for I-spline degree `k = degree` on the
+/// knot vector `knots`.
+///
+/// Implementation follows the derivation in this module's doc comment:
+/// integrates each constituent B-spline of degree `k+1` via the Curry-
+/// Schoenberg formula, yielding a closed-form expression in degree-`(k+2)`
+/// B-splines on the extended knot vector `τ̃`. The right-cumulative sweep
+/// across `m` is the same shape `create_ispline_dense` already uses one
+/// degree lower.
+///
+/// Returns an `(n_data, N_I)` matrix where `N_I = K − (k+3)` matches the
+/// number of I-splines that `create_basis::<Dense>(.., BasisOptions::i_spline())`
+/// produces on the same `(knots, degree)`.
+pub fn cspline_basis_values(
+    data: ArrayView1<'_, f64>,
+    knots: &Array1<f64>,
+    degree: usize,
+) -> Result<Array2<f64>, ISplineBaseTimeError> {
+    if degree < 1 {
+        return Err(ISplineBaseTimeError::InvalidDegree { degree });
+    }
+    let k = degree;
+    // The I-spline of degree k builds on B-splines of degree (k+1) over
+    // `knots`, requiring at least 2*(k+2) knots; the C-spline integrates
+    // those into degree-(k+2) B-splines on the *extended* knot vector
+    // (one extra repeat at each boundary, length |knots| + 2). The
+    // degree-(k+2) basis on the extended vector requires
+    //   |knots| + 2 >= 2*(k+3) <=> |knots| >= 2*k + 4 = 2*(k+2).
+    // i.e. exactly the same lower bound the I-spline already enforces.
+    let required = 2 * (k + 2);
+    if knots.len() < required {
+        return Err(ISplineBaseTimeError::InsufficientKnots {
+            degree: k,
+            required,
+            provided: knots.len(),
+        });
+    }
+    // Extended knot vector τ̃: prepend τ[0] and append τ[K-1].
+    let kk = knots.len();
+    let mut tau_ext = Array1::<f64>::zeros(kk + 2);
+    tau_ext[0] = knots[0];
+    for i in 0..kk {
+        tau_ext[i + 1] = knots[i];
+    }
+    tau_ext[kk + 1] = knots[kk - 1];
+
+    let bs_deg = k + 2;
+    // Number of degree-(k+2) B-splines on τ̃: |τ̃| − (bs_deg + 1).
+    let n_b_ext = tau_ext.len() - (bs_deg + 1);
+    // Number of degree-(k+1) B-splines on τ: same as `num_bspline_basis`
+    // inside `create_ispline_dense`. This is the `m` index range used
+    // below for the right-cumulative sum.
+    let n_b_inner = knots.len() - (k + 2);
+    // Number of I-splines (and therefore C-splines): one less than
+    // the inner B-spline count, matching `create_ispline_dense`.
+    let n_i = n_b_inner.saturating_sub(1);
+    if n_i == 0 {
+        return Ok(Array2::zeros((data.len(), 0)));
+    }
+
+    // Coefficient α_m = (τ[m+k+2] − τ[m]) / (k+2) for m = 0..n_b_inner-1.
+    // This is the Curry-Schoenberg integration weight for B_m^{(k+1)}(·; τ).
+    let mut alpha = Array1::<f64>::zeros(n_b_inner);
+    for m in 0..n_b_inner {
+        let lo = knots[m];
+        let hi = knots[m + k + 2];
+        alpha[m] = (hi - lo) / ((k + 2) as f64);
+    }
+
+    // Anchor: T_m^{(k+2)}(τ[k+1]; τ̃) for m = 0..n_b_inner-1.
+    //
+    // Evaluate degree-(k+2) B-spline values on τ̃ at the anchor point
+    // `τ[k+1]` (the left boundary of the I-spline support), then form
+    // right-cumulative tails of length n_b_inner. The tail at index `m`
+    // is Σ_{i ≥ m} B_i^{(k+2)}(τ[k+1]; τ̃); we only need `m` up to
+    // n_b_inner − 1 because that's the range we sum over below.
+    let anchor_u = knots[k + 1];
+    let mut anchor_b = vec![0.0_f64; n_b_ext];
+    let mut anchor_scratch = SplineScratch::new(bs_deg);
+    evaluate_bspline_basis_scalar(
+        anchor_u,
+        tau_ext.view(),
+        bs_deg,
+        &mut anchor_b,
+        &mut anchor_scratch,
+    )
+    .map_err(|e| ISplineBaseTimeError::Spline {
+        reason: format!("anchor evaluation failed: {e}"),
+    })?;
+    // Right-cumulative T_m^{(k+2)}(anchor) at the anchor: sum over i ≥ m.
+    // We need indices m = 0..n_b_inner-1 inclusive; the index `i` ranges
+    // over 0..n_b_ext. For correctness we cap at n_b_ext (the full degree-
+    // (k+2) basis), then index by m below.
+    let mut anchor_tail = vec![0.0_f64; n_b_ext.max(n_b_inner)];
+    let mut running = 0.0_f64;
+    for i in (0..n_b_ext).rev() {
+        running += anchor_b[i];
+        anchor_tail[i] = running;
+    }
+    // Tails for i ≥ n_b_ext are vacuously 0; the buffer's extra slots stay
+    // at their initial zero, which is what we want.
+
+    // Working buffers per data row.
+    let mut row_b = vec![0.0_f64; n_b_ext];
+    let mut row_scratch = SplineScratch::new(bs_deg);
+
+    let mut out = Array2::<f64>::zeros((data.len(), n_i));
+    for (row_idx, &u) in data.iter().enumerate() {
+        if !u.is_finite() {
+            return Err(ISplineBaseTimeError::InvalidTime {
+                row: row_idx,
+                value: u,
+            });
+        }
+        // Evaluate degree-(k+2) B-splines on τ̃ at u.
+        for slot in row_b.iter_mut() {
+            *slot = 0.0;
+        }
+        evaluate_bspline_basis_scalar(
+            u,
+            tau_ext.view(),
+            bs_deg,
+            &mut row_b,
+            &mut row_scratch,
+        )
+        .map_err(|e| ISplineBaseTimeError::Spline {
+            reason: format!("row {row_idx} evaluation failed: {e}"),
+        })?;
+        // Right-cumulative T_m^{(k+2)}(u) for m = 0..n_b_inner-1, computed
+        // in the same backward sweep as the anchor.
+        let mut running_u = 0.0_f64;
+        // Antiderivative-of-B per-m value: A_m(u) = α_m · (T_m(u) − T_m(anchor)).
+        // Then I-spline cumulative gives:
+        //   C_j(u) = Σ_{m = j+1}^{n_b_inner - 1} A_m(u),
+        // which is the right-cumulative tail of A across `m` indexed by `j`.
+        let mut a_running = 0.0_f64;
+        // Walk i (and therefore m) from high to low so we can build both
+        // running sums in one pass.
+        // First, accumulate the T_m(u) tail for i = n_b_ext-1 down to 0.
+        // Then for i < n_b_inner we form A_m(u) and accumulate the j-tail.
+        // We keep a separate running tail per role: `running_u` over i
+        // (degree-(k+2) basis), `a_running` over m (= i restricted to the
+        // inner range, used to fill C_j).
+        for i in (0..n_b_ext).rev() {
+            running_u += row_b[i];
+            if i < n_b_inner {
+                let m = i;
+                let t_m_u = running_u;
+                let t_m_anchor = anchor_tail[m];
+                let a_m = alpha[m] * (t_m_u - t_m_anchor);
+                a_running += a_m;
+                // C_j with j = m - 1 (since the inner sum runs m = j+1..)
+                if m >= 1 {
+                    let j = m - 1;
+                    if j < n_i {
+                        out[[row_idx, j]] = a_running;
+                    }
+                }
+            }
+        }
+    }
+
+    // Numerical floor matching `create_ispline_dense` / `create_ispline_derivative_dense`.
+    for val in out.iter_mut() {
+        if val.abs() <= 1e-15 {
+            *val = 0.0;
+        }
+    }
+    Ok(out)
+}
+
+/// Build the structurally-monotone time-block designs for a survival time
+/// axis. Entry/exit values use the C-spline basis at `log t`; the exit
+/// derivative is `(1/t) · I-spline(log t)`; the additive `guard·t` linear
+/// part is returned as offset residuals for the caller to fold into the
+/// existing offset slots (e.g. via `add_survival_time_derivative_guard_offset`
+/// in the survival construction pipeline).
+///
+/// `age_entry` / `age_exit` are clock times (in the same units the
+/// derivative guard is expressed in). `knots` lives on the `log t` axis
+/// and must already include the clamped-boundary repeats expected by
+/// `create_basis::<Dense>(.., BasisOptions::i_spline())`.
+pub fn build_ispline_base_designs(
+    age_entry: ArrayView1<'_, f64>,
+    age_exit: ArrayView1<'_, f64>,
+    log_floor: f64,
+    knots: &Array1<f64>,
+    degree: usize,
+    derivative_guard: f64,
+) -> Result<ISplineBaseDesigns, ISplineBaseTimeError> {
+    let n_entry = age_entry.len();
+    let n_exit = age_exit.len();
+    if n_entry != n_exit {
+        return Err(ISplineBaseTimeError::EntryExitMismatch {
+            entry: n_entry,
+            exit: n_exit,
+        });
+    }
+    let n = n_entry;
+    let mut log_entry = Array1::<f64>::zeros(n);
+    let mut log_exit = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        let t_in = age_entry[i];
+        let t_out = age_exit[i];
+        if !t_in.is_finite() || t_in < 0.0 {
+            return Err(ISplineBaseTimeError::InvalidTime {
+                row: i,
+                value: t_in,
+            });
+        }
+        if !t_out.is_finite() || t_out < 0.0 {
+            return Err(ISplineBaseTimeError::InvalidTime {
+                row: i,
+                value: t_out,
+            });
+        }
+        log_entry[i] = t_in.max(log_floor).ln();
+        log_exit[i] = t_out.max(log_floor).ln();
+    }
+
+    let design_entry = cspline_basis_values(log_entry.view(), knots, degree)?;
+    let design_exit = cspline_basis_values(log_exit.view(), knots, degree)?;
+    // I-spline values at exit; derivative wrt clock time picks up the
+    // chain-rule factor 1/t. `create_basis` returns dense via Arc.
+    let (ispline_arc, _) = create_basis::<crate::terms::basis::Dense>(
+        log_exit.view(),
+        KnotSource::Provided(knots.view()),
+        degree,
+        BasisOptions::i_spline(),
+    )
+    .map_err(|e| ISplineBaseTimeError::Spline {
+        reason: format!("I-spline value evaluation failed at exit: {e}"),
+    })?;
+    let mut design_derivative_exit = ispline_arc.as_ref().clone();
+    for i in 0..n {
+        let chain = 1.0 / age_exit[i].max(log_floor);
+        for j in 0..design_derivative_exit.ncols() {
+            design_derivative_exit[[i, j]] *= chain;
+        }
+    }
+
+    // Offset residuals: the `guard·t` and `guard` linear pieces.
+    let mut offset_residual_entry = Array1::<f64>::zeros(n);
+    let mut offset_residual_exit = Array1::<f64>::zeros(n);
+    let mut derivative_offset_residual_exit = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        offset_residual_entry[i] = derivative_guard * age_entry[i];
+        offset_residual_exit[i] = derivative_guard * age_exit[i];
+        derivative_offset_residual_exit[i] = derivative_guard;
+    }
+
+    Ok(ISplineBaseDesigns {
+        design_entry,
+        design_exit,
+        design_derivative_exit,
+        offset_residual_entry,
+        offset_residual_exit,
+        derivative_offset_residual_exit,
+    })
+}
