@@ -7,12 +7,6 @@ import pytest
 gt = pytest.importorskip("gamfit.torch")
 torch = pytest.importorskip("torch")
 
-if not hasattr(gt, "gaussian_reml_fit_blocks"):
-    pytest.skip(
-        "gamfit.torch.gaussian_reml_fit_blocks is not present in this build",
-        allow_module_level=True,
-    )
-
 
 def _smooth_block(n: int, k: int, phase: float) -> tuple[torch.Tensor, torch.Tensor]:
     t = torch.remainder(torch.arange(n, dtype=torch.float64) / n + phase, 1.0)
