@@ -2119,6 +2119,45 @@ mod tests {
     }
 
     #[test]
+    fn family_pg_dispatch_rejects_non_bernoulli_response() {
+        let x = array![[1.0], [1.0]];
+        let y = array![2.0, 0.0];
+        let w = array![1.0, 1.0];
+        let penalty = array![[0.1]];
+        let mode = array![0.0];
+        let non_spd_hessian = array![[0.0]];
+        let cfg = NutsConfig {
+            n_samples: 1,
+            nwarmup: 1,
+            n_chains: 1,
+            target_accept: 0.8,
+            seed: 321,
+        };
+
+        let result = run_nuts_sampling_flattened_family(
+            LikelihoodSpec::binomial_logit(),
+            FamilyNutsInputs::Glm(GlmFlatInputs {
+                x: x.view(),
+                y: y.view(),
+                weights: w.view(),
+                penalty_matrix: penalty.view(),
+                mode: mode.view(),
+                hessian: non_spd_hessian.view(),
+                gamma_shape: None,
+                dispersion: crate::solver::estimate::Dispersion::Known(1.0),
+                firth_bias_reduction: false,
+            }),
+            &cfg,
+        );
+
+        let err = result.err().expect("PG dispatch should reject count rows");
+        assert!(
+            err.contains("response must be exactly 0 or 1"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn family_dispatch_uses_pg_gibbs_for_standard_logit() {
         let x = array![[1.0, 0.2], [1.0, -0.1], [1.0, 1.2], [1.0, -0.7]];
         let y = array![1.0, 0.0, 1.0, 0.0];
@@ -2776,6 +2815,41 @@ mod tests {
         assert_eq!(rb.len(), 1);
         assert!(rb[0].is_finite());
         assert!(rb[0] >= 0.0);
+    }
+
+    #[test]
+    fn logit_pg_rao_blackwell_rejects_non_bernoulli_response() {
+        let x = array![[1.0], [1.0]];
+        let y = array![0.25, 1.0];
+        let w = array![1.0, 1.0];
+        let penalty = array![[0.1]];
+        let mode = array![0.0];
+        let roots = vec![array![[0.1_f64.sqrt()]]];
+        let cfg = NutsConfig {
+            n_samples: 1,
+            nwarmup: 1,
+            n_chains: 1,
+            target_accept: 0.8,
+            seed: 654,
+        };
+
+        let result = super::estimate_logit_pg_rao_blackwell_terms(
+            x.view(),
+            y.view(),
+            w.view(),
+            penalty.view(),
+            mode.view(),
+            &roots,
+            &cfg,
+        );
+
+        let err = result
+            .err()
+            .expect("PG Rao-Blackwell should reject proportion rows");
+        assert!(
+            err.contains("response must be exactly 0 or 1"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
