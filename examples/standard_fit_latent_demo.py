@@ -1,3 +1,5 @@
+"""Fit a standard GAM with a learned latent coordinate."""
+
 import numpy as np
 import pandas as pd
 
@@ -19,7 +21,7 @@ def main() -> None:
     data = pd.DataFrame({"y": y})
     data.rgb_array = rgb
 
-    gamfit.fit(
+    model = gamfit.fit(
         data,
         "y ~ s(t, type='duchon', centers=32)",
         latents={
@@ -31,6 +33,8 @@ def main() -> None:
             )
         },
     )
+    summary = model.summary()
+    print(f"family={summary['family_name']} reml={summary['reml_score']:.6g}")
 
 
 if __name__ == "__main__":
