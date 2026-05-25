@@ -10908,9 +10908,17 @@ fn joint_objective_floor_reached(
 
 fn joint_trust_region_metric_step_norm(delta: &Array1<f64>, metric_diag: &Array1<f64>) -> f64 {
     assert_eq!(delta.len(), metric_diag.len());
+    joint_trust_region_metric_step_norm_view(delta.view(), metric_diag.view())
+}
+
+fn joint_trust_region_metric_step_norm_view(
+    delta: ArrayView1<f64>,
+    metric_diag: ArrayView1<f64>,
+) -> f64 {
+    debug_assert_eq!(delta.len(), metric_diag.len());
     delta
         .iter()
-        .zip(metric_diag)
+        .zip(metric_diag.iter())
         .map(|(step, weight)| step * step * positive_joint_diagonal_entry(*weight))
         .sum::<f64>()
         .sqrt()
@@ -10925,9 +10933,9 @@ fn joint_trust_region_block_metric_norms(
     ranges
         .iter()
         .map(|(start, end)| {
-            joint_trust_region_metric_step_norm(
-                &delta.slice(s![*start..*end]).to_owned(),
-                &metric_diag.slice(s![*start..*end]).to_owned(),
+            joint_trust_region_metric_step_norm_view(
+                delta.slice(s![*start..*end]),
+                metric_diag.slice(s![*start..*end]),
             )
         })
         .collect()
@@ -10943,9 +10951,9 @@ fn truncate_joint_step_to_block_metric_radii(
     assert_eq!(delta.len(), metric_diag.len());
     let mut norms = Vec::with_capacity(ranges.len());
     for (block_idx, (start, end)) in ranges.iter().copied().enumerate() {
-        let metric = metric_diag.slice(s![start..end]).to_owned();
+        let metric_view = metric_diag.slice(s![start..end]);
         let mut block = delta.slice_mut(s![start..end]);
-        let norm = joint_trust_region_metric_step_norm(&block.to_owned(), &metric);
+        let norm = joint_trust_region_metric_step_norm_view(block.view(), metric_view);
         let radius = block_radii[block_idx];
         if norm.is_finite() && norm > radius && radius > 0.0 {
             block.mapv_inplace(|v| v * (radius / norm));
