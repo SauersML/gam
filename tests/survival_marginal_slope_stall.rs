@@ -202,7 +202,7 @@ fn survival_marginal_slope_stall_reproduces_residual_stall_early_exit() {
             request.options.inner_max_cycles = 2;
             fit_model(FitRequest::SurvivalMarginalSlope(request))
         }
-        other => panic!("expected survival marginal-slope request, got {}", other.model_class()),
+        _ => panic!("expected survival marginal-slope request"),
     };
     let elapsed = start.elapsed();
     eprintln!(
@@ -211,7 +211,10 @@ fn survival_marginal_slope_stall_reproduces_residual_stall_early_exit() {
         outcome.is_ok()
     );
 
-    let err = outcome.expect_err("expected exact startup validation failure");
+    let err = match outcome {
+        Ok(_) => panic!("expected exact startup validation failure"),
+        Err(err) => err,
+    };
     let message = err.to_string();
     assert!(
         message.contains("outer smoothing optimization failed after exhausting strategy fallbacks"),
