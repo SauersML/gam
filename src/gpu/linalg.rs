@@ -167,7 +167,7 @@ pub fn try_fast_ab(a: ArrayView2<'_, f64>, b: ArrayView2<'_, f64>) -> Option<Arr
     let runtime = route_through_gpu(DispatchOp::Gemm { m, n, k });
     let used_gpu = runtime.is_some();
     super::profile::record(super::profile::KernelStat {
-        name: super::GpuKernel::DenseMatvec.as_str(),
+        name: "try_fast_ab",
         n: m,
         p: n,
         k,
