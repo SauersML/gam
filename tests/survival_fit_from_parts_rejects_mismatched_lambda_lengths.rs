@@ -1,5 +1,5 @@
-use gam::survival_location_scale::{survival_fit_from_parts, SurvivalLocationScaleFitResultParts};
-use ndarray::{array, Array2};
+use gam::survival_location_scale::{SurvivalLocationScaleFitResultParts, survival_fit_from_parts};
+use ndarray::{Array2, array};
 
 #[test]
 fn survival_fit_from_parts_rejects_mismatched_lambda_lengths() {
