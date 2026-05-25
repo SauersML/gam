@@ -339,6 +339,8 @@ impl SaeManifoldAtom {
 pub enum AssignmentMode {
     /// Row-wise simplex assignment with entropy sparsity.
     Softmax { temperature: f64, sparsity: f64 },
+    /// Row-wise simplex assignment restricted to the top-k logits.
+    TopK { temperature: f64, k: usize },
     /// Deterministic concrete relaxation of a truncated IBP active set.
     IBPMap {
         temperature: f64,
@@ -347,6 +349,8 @@ pub enum AssignmentMode {
     },
     /// Independent sigmoid activations with a hard JumpReLU active gate.
     JumpReLU { temperature: f64, threshold: f64 },
+    /// Independent gated activations with an L1 prior on gate probabilities.
+    Gated { temperature: f64, gate_l1: f64 },
 }
 
 impl AssignmentMode {
@@ -356,6 +360,11 @@ impl AssignmentMode {
             temperature,
             sparsity: 1.0,
         }
+    }
+
+    #[must_use]
+    pub fn topk(temperature: f64, k: usize) -> Self {
+        Self::TopK { temperature, k }
     }
 
     #[must_use]
@@ -375,11 +384,21 @@ impl AssignmentMode {
         }
     }
 
+    #[must_use]
+    pub fn gated(temperature: f64, gate_l1: f64) -> Self {
+        Self::Gated {
+            temperature,
+            gate_l1,
+        }
+    }
+
     pub fn temperature(&self) -> f64 {
         match *self {
             AssignmentMode::Softmax { temperature, .. }
+            | AssignmentMode::TopK { temperature, .. }
             | AssignmentMode::IBPMap { temperature, .. }
-            | AssignmentMode::JumpReLU { temperature, .. } => temperature,
+            | AssignmentMode::JumpReLU { temperature, .. }
+            | AssignmentMode::Gated { temperature, .. } => temperature,
         }
     }
 
@@ -391,8 +410,10 @@ impl AssignmentMode {
         }
         match self {
             AssignmentMode::Softmax { temperature, .. }
+            | AssignmentMode::TopK { temperature, .. }
             | AssignmentMode::IBPMap { temperature, .. }
-            | AssignmentMode::JumpReLU { temperature, .. } => {
+            | AssignmentMode::JumpReLU { temperature, .. }
+            | AssignmentMode::Gated { temperature, .. } => {
                 *temperature = new_temperature;
             }
         }
@@ -414,6 +435,11 @@ impl AssignmentMode {
                     ));
                 }
             }
+            AssignmentMode::TopK { k, .. } => {
+                if k == 0 {
+                    return Err("AssignmentMode::TopK: k must be positive".into());
+                }
+            }
             AssignmentMode::IBPMap { alpha, .. } => {
                 if !(alpha.is_finite() && alpha > 0.0) {
                     return Err(format!(
@@ -428,6 +454,13 @@ impl AssignmentMode {
                     ));
                 }
             }
+            AssignmentMode::Gated { gate_l1, .. } => {
+                if !(gate_l1.is_finite() && gate_l1 >= 0.0) {
+                    return Err(format!(
+                        "AssignmentMode::Gated: gate_l1 must be finite and non-negative; got {gate_l1}"
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -436,8 +469,9 @@ impl AssignmentMode {
 /// Per-row latent assignment state.
 ///
 /// The free assignment parameter is `logits`; non-negative assignments are
-/// derived by row-wise softmax or by independent IBP-MAP sigmoid active
-/// indicators. `coords[k]` holds `t_{.,k}` for atom `k`.
+/// derived by row-wise softmax, top-k softmax, independent IBP-MAP sigmoid
+/// active indicators, JumpReLU gates, or gated activations. `coords[k]` holds
+/// `t_{.,k}` for atom `k`.
 #[derive(Debug, Clone)]
 pub struct SaeAssignment {
     pub logits: Array2<f64>,
@@ -468,6 +502,13 @@ impl SaeAssignment {
             return Err(format!(
                 "SaeAssignment::new: coords length {} must equal K={k}",
                 coords.len()
+            ));
+        }
+        if let AssignmentMode::TopK { k: top_k, .. } = mode
+            && top_k > k
+        {
+            return Err(format!(
+                "SaeAssignment::new: TopK k={top_k} cannot exceed atom count K={k}"
             ));
         }
         for (atom, coord) in coords.iter().enumerate() {
@@ -548,6 +589,9 @@ impl SaeAssignment {
             AssignmentMode::Softmax { temperature, .. } => {
                 Ok(softmax_row(self.logits.row(row), temperature))
             }
+            AssignmentMode::TopK { temperature, k } => {
+                Ok(topk_softmax_row(self.logits.row(row), temperature, k))
+            }
             AssignmentMode::IBPMap { temperature, .. } => {
                 Ok(sigmoid_row(self.logits.row(row), temperature))
             }
@@ -559,6 +603,9 @@ impl SaeAssignment {
                 temperature,
                 threshold,
             )),
+            AssignmentMode::Gated { temperature, .. } => {
+                Ok(gated_assignment_row(self.logits.row(row), temperature))
+            }
         }
     }
 
@@ -640,8 +687,8 @@ impl SaeAssignment {
 /// REML-selected continuous hyperparameters for SAE-manifold.
 #[derive(Debug, Clone)]
 pub struct SaeManifoldRho {
-    /// `log(lambda_sparse)` for softmax entropy, or the learnable `log(alpha)`
-    /// offset for IBP-MAP assignment.
+    /// `log(lambda_sparse)` for softmax entropy or JumpReLU gated L1, or the
+    /// learnable `log(alpha)` offset for IBP-MAP assignment.
     pub log_lambda_sparse: f64,
     /// `log(lambda_smooth)` shared by the per-atom decoder penalties.
     pub log_lambda_smooth: f64,
@@ -1008,6 +1055,7 @@ impl SaeManifoldTerm {
             let mut local_jac = Array2::<f64>::zeros((q, p));
             fill_assignment_logit_jvp_rows(
                 self.assignment.mode,
+                self.assignment.logits.row(row),
                 assignments.view(),
                 &decoded,
                 fitted.view(),
@@ -1471,6 +1519,11 @@ impl SaeManifoldTerm {
                     SoftmaxAssignmentSparsityPenalty::new(self.k_atoms(), temperature),
                 ))
             }
+            AssignmentMode::TopK { temperature, .. } => {
+                AnalyticPenaltyKind::SoftmaxAssignmentSparsity(Arc::new(
+                    SoftmaxAssignmentSparsityPenalty::new(self.k_atoms(), temperature),
+                ))
+            }
             AssignmentMode::IBPMap {
                 temperature,
                 alpha,
@@ -1522,6 +1575,39 @@ fn softmax_row(logits: ArrayView1<'_, f64>, temperature: f64) -> Array1<f64> {
     out
 }
 
+fn topk_indices(logits: ArrayView1<'_, f64>, k: usize) -> Vec<usize> {
+    assert!(k > 0 && k <= logits.len());
+    let mut indices: Vec<usize> = (0..logits.len()).collect();
+    indices.sort_by(|&left, &right| {
+        logits[right]
+            .total_cmp(&logits[left])
+            .then_with(|| left.cmp(&right))
+    });
+    indices.truncate(k);
+    indices
+}
+
+fn topk_softmax_row(logits: ArrayView1<'_, f64>, temperature: f64, k: usize) -> Array1<f64> {
+    let selected = topk_indices(logits, k);
+    let inv_tau = 1.0 / temperature;
+    let mut max_logit = f64::NEG_INFINITY;
+    for &idx in &selected {
+        max_logit = max_logit.max(logits[idx]);
+    }
+    let mut out = Array1::<f64>::zeros(logits.len());
+    let mut sum = 0.0;
+    for &idx in &selected {
+        let value = ((logits[idx] - max_logit) * inv_tau).exp();
+        out[idx] = value;
+        sum += value;
+    }
+    assert!(sum.is_finite() && sum > 0.0);
+    for &idx in &selected {
+        out[idx] /= sum;
+    }
+    out
+}
+
 fn validate_finite_logits(logits: ArrayView1<'_, f64>, row: usize) -> Result<(), String> {
     for (col, &v) in logits.iter().enumerate() {
         if !v.is_finite() {
@@ -1562,13 +1648,14 @@ fn jumprelu_row(logits: ArrayView1<'_, f64>, temperature: f64, threshold: f64) -
 
 fn fill_assignment_logit_jvp_rows(
     mode: AssignmentMode,
+    logits: ArrayView1<'_, f64>,
     assignments: ArrayView1<'_, f64>,
     decoded: &[Array1<f64>],
     fitted: ArrayView1<'_, f64>,
     local_jac: &mut Array2<f64>,
 ) {
     match mode {
-        AssignmentMode::Softmax { temperature, .. } => {
+        AssignmentMode::Softmax { temperature, .. } | AssignmentMode::TopK { temperature, .. } => {
             // da_k/dl_j = a_k (1[k=j] - a_j) / tau, contracted against
             // the assignment-weighted fitted row.
             let inv_tau = 1.0 / temperature;
@@ -1580,38 +1667,49 @@ fn fill_assignment_logit_jvp_rows(
                 }
             }
         }
-                AssignmentMode::IBPMap { temperature, .. } => {
-                    // Independent concrete-Bernoulli active indicators:
-                    // dz_k/dl_k = z_k(1-z_k)/tau.
-                    let inv_tau = 1.0 / temperature;
+        AssignmentMode::TopK { temperature, .. } => {
+            // Within the selected support this is the same softmax derivative;
+            // unselected logits have zero local derivative away from support
+            // boundary ties.
+            let inv_tau = 1.0 / temperature;
+            for logit_col in 0..assignments.len() {
+                for out_col in 0..fitted.len() {
+                    local_jac[[logit_col, out_col]] = assignments[logit_col]
+                        * (decoded[logit_col][out_col] - fitted[out_col])
+                        * inv_tau;
+                }
+            }
+        }
+        AssignmentMode::IBPMap { temperature, .. } => {
+            // Independent concrete-Bernoulli active indicators:
+            // dz_k/dl_k = z_k(1-z_k)/tau.
+            let inv_tau = 1.0 / temperature;
             for logit_col in 0..assignments.len() {
                 let dz = assignments[logit_col] * (1.0 - assignments[logit_col]) * inv_tau;
                 for out_col in 0..fitted.len() {
                     local_jac[[logit_col, out_col]] = dz * decoded[logit_col][out_col];
-                        }
-                    }
-                }
-                AssignmentMode::JumpReLU {
-                    temperature,
-                    threshold,
-                } => {
-                    // Standard STE for the hard gate: the sigmoid derivative
-                    // contributes only on logits above the JumpReLU threshold.
-                    let inv_tau = 1.0 / temperature;
-                    for logit_col in 0..k_atoms {
-                        if self.assignment.logits[[row, logit_col]] <= threshold {
-                            continue;
-                        }
-                        let dz = sigmoid_scalar(
-                            self.assignment.logits[[row, logit_col]] * inv_tau,
-                        );
-                        let da = dz * (1.0 - dz) * inv_tau;
-                        for out_col in 0..p {
-                            local_jac[[logit_col, out_col]] = da * decoded[logit_col][out_col];
-                        }
-                    }
                 }
             }
+        }
+        AssignmentMode::JumpReLU {
+            temperature,
+            threshold,
+        } => {
+            // Standard STE for the hard gate: the sigmoid derivative
+            // contributes only on logits above the JumpReLU threshold.
+            let inv_tau = 1.0 / temperature;
+            for logit_col in 0..assignments.len() {
+                if logits[logit_col] <= threshold {
+                    continue;
+                }
+                let activation = sigmoid_scalar(logits[logit_col] * inv_tau);
+                let da = activation * (1.0 - activation) * inv_tau;
+                for out_col in 0..fitted.len() {
+                    local_jac[[logit_col, out_col]] = da * decoded[logit_col][out_col];
+                }
+            }
+        }
+    }
 }
 
 fn flat_logits(logits: ArrayView2<'_, f64>) -> Array1<f64> {
@@ -1639,6 +1737,9 @@ fn assignment_prior_value(assignment: &SaeAssignment, rho: &SaeManifoldRho) -> f
             let penalty = SoftmaxAssignmentSparsityPenalty::new(assignment.k_atoms(), temperature);
             let rho_view = Array1::from_vec(vec![rho.log_lambda_sparse + sparsity.ln()]);
             penalty.value(target.view(), rho_view.view())
+        }
+        AssignmentMode::TopK { temperature, k } => {
+            topk_assignment_prior_value(assignment.logits.view(), temperature, k, rho)
         }
         AssignmentMode::IBPMap {
             temperature,
@@ -1695,6 +1796,12 @@ fn assignment_prior_grad_hdiag(
                 .ok_or_else(|| "softmax assignment hessian diag unavailable".to_string())?;
             Ok((grad, diag))
         }
+        AssignmentMode::TopK { temperature, k } => Ok(topk_assignment_prior_grad_hdiag(
+            assignment.logits.view(),
+            temperature,
+            k,
+            rho,
+        )),
         AssignmentMode::IBPMap {
             temperature,
             alpha,
@@ -1739,6 +1846,66 @@ fn assignment_prior_grad_hdiag(
             Ok((grad, diag))
         }
     }
+}
+
+fn topk_assignment_prior_value(
+    logits: ArrayView2<'_, f64>,
+    temperature: f64,
+    k: usize,
+    rho: &SaeManifoldRho,
+) -> f64 {
+    let lambda = rho.lambda_sparse();
+    let mut acc = 0.0;
+    for row in 0..logits.nrows() {
+        let assignments = topk_softmax_row(logits.row(row), temperature, k);
+        for value in assignments.iter().copied() {
+            if value > 0.0 {
+                acc += -value * value.ln();
+            }
+        }
+    }
+    lambda * acc
+}
+
+fn topk_assignment_prior_grad_hdiag(
+    logits: ArrayView2<'_, f64>,
+    temperature: f64,
+    k: usize,
+    rho: &SaeManifoldRho,
+) -> (Array1<f64>, Array1<f64>) {
+    let lambda = rho.lambda_sparse();
+    let k_atoms = logits.ncols();
+    let mut grad = Array1::<f64>::zeros(logits.len());
+    let mut diag = Array1::<f64>::zeros(logits.len());
+    let inv_tau = 1.0 / temperature;
+    let hess_scale = lambda * inv_tau * inv_tau;
+    for row in 0..logits.nrows() {
+        let assignments = topk_softmax_row(logits.row(row), temperature, k);
+        let start = row * k_atoms;
+        let mut mean_log_plus_one = 0.0;
+        for atom in 0..k_atoms {
+            let assignment = assignments[atom];
+            if assignment > 0.0 {
+                mean_log_plus_one += assignment * (assignment.ln() + 1.0);
+            }
+        }
+        for atom in 0..k_atoms {
+            let assignment = assignments[atom];
+            if assignment == 0.0 {
+                continue;
+            }
+            let log_plus_one = assignment.ln() + 1.0;
+            grad[start + atom] = lambda
+                * assignment
+                * (mean_log_plus_one - log_plus_one)
+                * inv_tau;
+            diag[start + atom] = hess_scale
+                * assignment
+                * ((1.0 - assignment) * (mean_log_plus_one - log_plus_one - 1.0)
+                    + assignment * (log_plus_one - mean_log_plus_one));
+        }
+    }
+    (grad, diag)
 }
 
 fn sae_penalty_is_row_block_supported(penalty: &AnalyticPenaltyKind) -> bool {

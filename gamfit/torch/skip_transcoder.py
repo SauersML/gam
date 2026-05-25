@@ -34,11 +34,13 @@ closed-form ridge solver. The lowest REML wins.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Sequence
 
 import torch
 from torch import nn
 
+from .._binding import rust_module
+from ._coerce import to_numpy_f64
 from .penalties import JumpReLUPenalty
 
 
@@ -189,16 +191,6 @@ class SkipAffineSmooth(nn.Module):
         points, exactly the quantity Anthropic-style attribution graphs use.
         """
         z = self.code(x_in)                                # (B, F)
-        col = self.W_dec[:, target_atom] if False else None
-        # We compute contribution: (sum_b z_b) ⊙ (W_enc^T @ W_dec[:, j])
-        # = how much each upstream atom's activation pushes through to j.
-        dec_col = self.W_dec[target_atom]                  # (out_dim,)  rows = atoms
-        # Wait: W_dec is (n_atoms, out_dim) — so target atom is a ROW.
-        # Edge weight to that atom from input atom i is
-        # ⟨W_enc[:, i], decoder direction of i⟩ projected through to the
-        # subspace spanned by atom j. Simpler operational definition: the
-        # per-batch mean activation of i, weighted by inner-product
-        # alignment between i's decoder row and j's decoder row.
         z_mean = z.mean(dim=0)                             # (F,)
         dec = self.W_dec                                   # (F, out_dim)
         align = dec @ dec[target_atom]                     # (F,)
@@ -322,37 +314,29 @@ def reml_score_skip_transcoder(
 ) -> float:
     """Closed-form Gaussian REML score for one trained skip-transcoder.
 
-    Approximation: we treat the linear bypass + active-atom subspace as the
-    effective design matrix M(λ_sparse), then compute
-        -REML = 0.5·(n_out · log(σ²_hat) + log|M^T M + λ_sparse·I|).
+    Approximation: Rust treats the active decoder rows plus skip output
+    factors as the effective output subspace M(λ_sparse), then computes
+        -REML = 0.5·(n_out · log(σ²_hat) + log|M M^T + λ_sparse·I|).
     This is the Laplace-marginal-likelihood used by gam's outer loop.
     """
     with torch.no_grad():
         y_hat, z = smooth(x_in)
-        resid = y_out - y_hat
-        n = y_out.numel()
-        sigma2 = float(resid.pow(2).mean().clamp(min=1e-12).item())
-        # Effective design: stack active-atom decoder rows + skip-bypass.
-        active = (z.abs() > 1e-8).any(dim=0)               # (F,)
-        D_active = smooth.W_dec[active].to(torch.float64)  # (F_a, out)
-        if smooth.skip_U is not None:
-            sk = (smooth.skip_U @ smooth.skip_V.t()).to(torch.float64)  # (out, in)
-            M = torch.cat([D_active, sk], dim=0)
-        else:
-            M = D_active
-        ridge = float(lambda_sparse) * torch.eye(M.shape[0], dtype=torch.float64, device=M.device)
-        gram = M @ M.t() + ridge
-        sign, logabs = torch.linalg.slogdet(gram)
-        return float(0.5 * (n * (sigma2 + 1e-12) ** 0.0 * torch.log(torch.tensor(sigma2)).item()
-                            + logabs.item()))
+        metrics = rust_module().skip_transcoder_reml_metrics(
+            to_numpy_f64(y_out),
+            to_numpy_f64(y_hat),
+            to_numpy_f64(z),
+            to_numpy_f64(smooth.W_dec),
+            float(lambda_sparse),
+            None if smooth.skip_U is None else to_numpy_f64(smooth.skip_U),
+            None if smooth.skip_V is None else to_numpy_f64(smooth.skip_V),
+        )
+        return float(metrics["reml_score"])
 
 
 def select_by_reml(results: list[SkipTranscoderResult]) -> SkipTranscoderResult:
     """Return the candidate with the lowest REML score (best Bayesian fit)."""
-    scored = [r for r in results if r.reml_score == r.reml_score]  # filter NaN
-    if not scored:
-        raise ValueError("No scored candidates; call reml_score_skip_transcoder first.")
-    return min(scored, key=lambda r: r.reml_score)
+    best_idx = rust_module().skip_transcoder_select_reml([r.reml_score for r in results])
+    return results[int(best_idx)]
 
 
 __all__ = [

@@ -79,7 +79,7 @@ use gam::terms::{
 use gam::transformation_normal::TransformationNormalFitResult;
 use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily, RhoPrior};
 use gam::{FitConfig, FitRequest, FitResult, fit_model, materialize, resolve_offset_column};
-use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3, ArrayViewD, Axis, IxDyn, s};
+use ndarray::{Array1, Array2, Array3, Array4, ArrayView1, ArrayView2, ArrayView3, ArrayViewD, Axis, IxDyn, s};
 use numpy::{
     IntoPyArray, PyArray1, PyArray2, PyArray3, PyReadonlyArray1, PyReadonlyArray2,
     PyReadonlyArray3, PyReadonlyArray4, PyReadonlyArrayDyn,
@@ -1394,279 +1394,6 @@ fn sphere_basis<'py>(
     ))
 }
 
-const SPHERE_ANTIPODAL_TOL: f64 = 1.0e-12;
-
-fn validate_response_sphere(values: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
-    let (n, d) = values.dim();
-    if n == 0 || d < 2 {
-        return Err(
-            "spherical values must have at least one row and at least two columns".to_string(),
-        );
-    }
-    let mut out = Array2::<f64>::zeros((n, d));
-    for row in 0..n {
-        let mut norm_sq = 0.0_f64;
-        for col in 0..d {
-            let value = values[[row, col]];
-            if !value.is_finite() {
-                return Err("spherical values must contain only finite values".to_string());
-            }
-            norm_sq += value * value;
-        }
-        let norm = norm_sq.sqrt();
-        if norm <= 0.0 {
-            return Err("spherical rows must have non-zero norm".to_string());
-        }
-        for col in 0..d {
-            out[[row, col]] = values[[row, col]] / norm;
-        }
-    }
-    Ok(out)
-}
-
-fn normalized_response_weights(
-    n: usize,
-    weights: Option<ArrayView1<'_, f64>>,
-) -> Result<Array1<f64>, String> {
-    match weights {
-        None => Ok(Array1::from_elem(n, 1.0 / n as f64)),
-        Some(w) => {
-            if w.len() != n {
-                return Err("weights length must match the number of rows".to_string());
-            }
-            let mut total = 0.0_f64;
-            for row in 0..n {
-                let value = w[row];
-                if !value.is_finite() || value < 0.0 {
-                    return Err(
-                        "weights must be finite, non-negative, and have positive total".to_string(),
-                    );
-                }
-                total += value;
-            }
-            if total <= 0.0 {
-                return Err(
-                    "weights must be finite, non-negative, and have positive total".to_string(),
-                );
-            }
-            Ok(w.to_owned() / total)
-        }
-    }
-}
-
-fn append_sphere_candidate(candidates: &mut Vec<Array1<f64>>, candidate: ArrayView1<'_, f64>) {
-    let mut norm_sq = 0.0_f64;
-    for col in 0..candidate.len() {
-        let value = candidate[col];
-        if !value.is_finite() {
-            return;
-        }
-        norm_sq += value * value;
-    }
-    let norm = norm_sq.sqrt();
-    if norm <= 0.0 {
-        return;
-    }
-    let c = candidate.to_owned() / norm;
-    for existing in candidates.iter() {
-        let dot = existing.dot(&c);
-        if dot.abs() > 1.0 - 1.0e-10 {
-            return;
-        }
-    }
-    candidates.push(c);
-}
-
-fn sphere_orthogonal_unit(vector: ArrayView1<'_, f64>) -> Result<Array1<f64>, String> {
-    let mut anchor = 0usize;
-    let mut min_abs = f64::INFINITY;
-    for col in 0..vector.len() {
-        let value = vector[col].abs();
-        if value < min_abs {
-            min_abs = value;
-            anchor = col;
-        }
-    }
-    let mut tangent = Array1::<f64>::zeros(vector.len());
-    tangent[anchor] = 1.0;
-    let dot = tangent.dot(&vector);
-    for col in 0..vector.len() {
-        tangent[col] -= dot * vector[col];
-    }
-    let norm = tangent.dot(&tangent).sqrt();
-    if norm <= 0.0 {
-        return Err("cannot construct a tangent direction for the spherical mean".to_string());
-    }
-    Ok(tangent / norm)
-}
-
-fn sphere_mean_candidates(
-    values: ArrayView2<'_, f64>,
-    weights: ArrayView1<'_, f64>,
-) -> Result<Vec<Array1<f64>>, String> {
-    let (n, d) = values.dim();
-    let mut candidates: Vec<Array1<f64>> = Vec::new();
-    let mut extrinsic = Array1::<f64>::zeros(d);
-    for row in 0..n {
-        for col in 0..d {
-            extrinsic[col] += weights[row] * values[[row, col]];
-        }
-    }
-    append_sphere_candidate(&mut candidates, extrinsic.view());
-
-    let mut moment = Array2::<f64>::zeros((d, d));
-    for row in 0..n {
-        for left in 0..d {
-            let weighted = weights[row] * values[[row, left]];
-            for right in 0..d {
-                moment[[left, right]] += weighted * values[[row, right]];
-            }
-        }
-    }
-    let (_eigs, eigvecs) = moment
-        .eigh(Side::Lower)
-        .map_err(|_| "spherical Fréchet mean eigendecomposition failed".to_string())?;
-    for col in 0..d {
-        let vec = eigvecs.column(col).to_owned();
-        append_sphere_candidate(&mut candidates, vec.view());
-        append_sphere_candidate(&mut candidates, (-&vec).view());
-    }
-
-    for row in 0..n.min(16) {
-        append_sphere_candidate(&mut candidates, values.row(row));
-    }
-
-    if candidates.is_empty() {
-        candidates.push(sphere_orthogonal_unit(values.row(0))?);
-    }
-    Ok(candidates)
-}
-
-fn response_sphere_log_map_one(
-    values: ArrayView2<'_, f64>,
-    base: ArrayView1<'_, f64>,
-) -> Result<Array2<f64>, String> {
-    let (n, d) = values.dim();
-    let mut out = Array2::<f64>::zeros((n, d));
-    for row in 0..n {
-        let y = values.row(row);
-        let dot = y.dot(&base).clamp(-1.0, 1.0);
-        if dot <= -1.0 + SPHERE_ANTIPODAL_TOL {
-            return Err("spherical log map is undefined at antipodal points".to_string());
-        }
-        let theta = dot.acos();
-        if theta < 1.0e-12 {
-            continue;
-        }
-        let sin_theta = theta.sin();
-        let scale = if sin_theta > 1.0e-12 {
-            theta / sin_theta
-        } else {
-            1.0
-        };
-        for col in 0..d {
-            out[[row, col]] = (y[col] - dot * base[col]) * scale;
-        }
-    }
-    Ok(out)
-}
-
-fn response_sphere_exp_map_one(
-    tangent: ArrayView1<'_, f64>,
-    base: ArrayView1<'_, f64>,
-) -> Result<Array1<f64>, String> {
-    let d = base.len();
-    let dot = tangent.dot(&base);
-    let mut projected = tangent.to_owned();
-    for col in 0..d {
-        projected[col] -= dot * base[col];
-    }
-    let radius = projected.dot(&projected).sqrt();
-    let mut out = Array1::<f64>::zeros(d);
-    if radius < 1.0e-12 {
-        for col in 0..d {
-            out[col] = base[col] + projected[col];
-        }
-    } else {
-        let scale = radius.sin() / radius;
-        for col in 0..d {
-            out[col] = radius.cos() * base[col] + scale * projected[col];
-        }
-    }
-    let norm = out.dot(&out).sqrt();
-    if norm <= 0.0 {
-        return Err("spherical rows must have non-zero norm".to_string());
-    }
-    Ok(out / norm)
-}
-
-fn response_sphere_frechet_objective(
-    values: ArrayView2<'_, f64>,
-    weights: ArrayView1<'_, f64>,
-    base: ArrayView1<'_, f64>,
-) -> f64 {
-    let mut out = 0.0_f64;
-    for row in 0..values.nrows() {
-        let theta = values.row(row).dot(&base).clamp(-1.0, 1.0).acos();
-        out += weights[row] * theta * theta;
-    }
-    out
-}
-
-#[pyfunction(signature = (values, weights = None, tol = 1.0e-12, max_iter = 256))]
-fn sphere_frechet_mean<'py>(
-    py: Python<'py>,
-    values: PyReadonlyArray2<'py, f64>,
-    weights: Option<PyReadonlyArray1<'py, f64>>,
-    tol: f64,
-    max_iter: usize,
-) -> PyResult<Py<PyArray1<f64>>> {
-    let y = validate_response_sphere(values.as_array()).map_err(py_value_error)?;
-    let w = normalized_response_weights(y.nrows(), weights.as_ref().map(|raw| raw.as_array()))
-        .map_err(py_value_error)?;
-    let candidates = sphere_mean_candidates(y.view(), w.view()).map_err(py_value_error)?;
-    let mut best_mu: Option<Array1<f64>> = None;
-    let mut best_obj = f64::INFINITY;
-    for candidate in candidates {
-        let mut mu = candidate;
-        let mut failed = false;
-        for _ in 0..max_iter {
-            let logs = match response_sphere_log_map_one(y.view(), mu.view()) {
-                Ok(value) => value,
-                Err(_) => {
-                    failed = true;
-                    break;
-                }
-            };
-            let mut step = Array1::<f64>::zeros(y.ncols());
-            for row in 0..y.nrows() {
-                for col in 0..y.ncols() {
-                    step[col] += w[row] * logs[[row, col]];
-                }
-            }
-            let step_norm = step.dot(&step).sqrt();
-            if step_norm < tol {
-                break;
-            }
-            mu = response_sphere_exp_map_one(step.view(), mu.view()).map_err(py_value_error)?;
-        }
-        if failed {
-            continue;
-        }
-        let obj = response_sphere_frechet_objective(y.view(), w.view(), mu.view());
-        if obj < best_obj {
-            best_obj = obj;
-            best_mu = Some(mu);
-        }
-    }
-    match best_mu {
-        Some(mu) => Ok(mu.into_pyarray(py).unbind()),
-        None => Err(py_value_error(
-            "spherical Fréchet mean is not identifiable for these points".to_string(),
-        )),
-    }
-}
-
 /// Chart-local seven-column sphere basis with analytic lat/lon jet.
 ///
 /// `t` is an `(N, 2)` array of latitude/longitude pairs in radians. The
@@ -2065,6 +1792,447 @@ fn tierney_kadane_normalized_score(
         gam::solver::evidence::TopologyScoreScale::PerObservation,
     )
     .map_err(PyValueError::new_err)
+}
+
+const REML_SCORE_KEYS: &[&str] = &["reml_score", "evidence", "laml", "score"];
+const EDF_KEYS: &[&str] = &["edf_total", "edf", "effective_dof"];
+const PENALTY_RANK_KEYS: &[&str] = &["penalty_rank", "rank_s", "rank_S", "cache_penalty_rank"];
+const NULL_DIM_KEYS: &[&str] = &["null_dim"];
+const NULLITY_KEYS: &[&str] = &["nullity", "penalty_nullity", "cache_nullity"];
+const NULL_HESSIAN_LOGDET_KEYS: &[&str] = &[
+    "null_space_logdet",
+    "null_hessian_logdet",
+    "h_null_logdet",
+    "logdet_h_null",
+];
+const DIM_KEYS: &[&str] = &["effective_dim", "dim_h", "dim_H", "hessian_dim"];
+
+struct RemlCandidateScore {
+    index: usize,
+    name: String,
+    score: f64,
+    edf: Option<f64>,
+}
+
+enum RemlFitView<'py> {
+    SavedSummary(serde_json::Value),
+    PythonObject(Bound<'py, PyAny>),
+}
+
+#[pyfunction]
+fn extract_reml_score(py: Python<'_>, fit: Py<PyAny>) -> PyResult<f64> {
+    let fit = fit.bind(py);
+    extract_reml_score_impl(py, fit)
+}
+
+#[pyfunction]
+fn extract_reml_score_raw(py: Python<'_>, fit: Py<PyAny>) -> PyResult<f64> {
+    let fit = fit.bind(py);
+    extract_reml_score_raw_impl(py, fit)
+}
+
+#[pyfunction]
+fn extract_reml_edf(py: Python<'_>, fit: Py<PyAny>) -> PyResult<Option<f64>> {
+    let fit = fit.bind(py);
+    let view = reml_fit_view(py, fit)?;
+    extract_edf_from_view(py, &view)
+}
+
+#[pyfunction(signature = (fits, names = None, cv_scores = None))]
+fn compare_reml_fits(
+    py: Python<'_>,
+    fits: Vec<Py<PyAny>>,
+    names: Option<Vec<String>>,
+    cv_scores: Option<Vec<f64>>,
+) -> PyResult<Py<PyDict>> {
+    if fits.is_empty() {
+        return Err(PyValueError::new_err("compare_models requires at least one fit"));
+    }
+    let labels = match names {
+        Some(names) => {
+            if names.len() != fits.len() {
+                return Err(PyValueError::new_err(format!(
+                    "len(names)={} does not match len(fits)={}",
+                    names.len(),
+                    fits.len()
+                )));
+            }
+            names
+        }
+        None => (0..fits.len()).map(|idx| format!("fit_{idx}")).collect(),
+    };
+    if let Some(scores) = cv_scores.as_ref() {
+        if scores.len() != fits.len() {
+            return Err(PyValueError::new_err(format!(
+                "len(cv_scores)={} does not match len(fits)={}",
+                scores.len(),
+                fits.len()
+            )));
+        }
+    }
+
+    let mut scored = Vec::with_capacity(fits.len());
+    for (index, (name, fit)) in labels.into_iter().zip(fits.iter()).enumerate() {
+        let fit = fit.bind(py);
+        let view = reml_fit_view(py, fit)?;
+        scored.push(RemlCandidateScore {
+            index,
+            name,
+            score: extract_reml_score_from_view(py, &view)?,
+            edf: extract_edf_from_view(py, &view)?,
+        });
+    }
+    scored.sort_by(|left, right| {
+        right
+            .score
+            .partial_cmp(&left.score)
+            .unwrap_or(Ordering::Equal)
+    });
+
+    let best_score = scored[0].score;
+    let winner = scored[0].name.clone();
+    let ranking = PyList::empty(py);
+    let score_table = PyList::empty(py);
+    for row in scored.iter() {
+        let delta = row.score - best_score;
+        let bayes_factor = delta.exp();
+        ranking.append((
+            row.name.as_str(),
+            row.score,
+            delta,
+            bayes_factor,
+            row.edf,
+        ))?;
+
+        let table_row = PyDict::new(py);
+        table_row.set_item("name", row.name.as_str())?;
+        table_row.set_item("reml_score", row.score)?;
+        table_row.set_item("delta_reml", delta)?;
+        table_row.set_item("bayes_factor_vs_best", bayes_factor)?;
+        table_row.set_item("effective_dof", row.edf)?;
+        score_table.append(table_row)?;
+    }
+
+    let summary = if scored.len() >= 2 {
+        let runner_up = &scored[1];
+        let log_bf = best_score - runner_up.score;
+        format!(
+            "{} wins by Bayes factor {} over {}",
+            winner,
+            format_bayes_factor(log_bf),
+            runner_up.name
+        )
+    } else {
+        format!("{winner} (single fit; no comparison)")
+    };
+
+    let out = PyDict::new(py);
+    out.set_item("ranking", ranking)?;
+    out.set_item("winner", winner)?;
+    out.set_item("evidence_summary", summary)?;
+    out.set_item("score_table", score_table)?;
+    if let Some(scores) = cv_scores {
+        let cv_optional = PyList::empty(py);
+        for row in scored.iter() {
+            cv_optional.append((row.name.as_str(), scores[row.index]))?;
+        }
+        out.set_item("cv_optional", cv_optional)?;
+    }
+    Ok(out.unbind())
+}
+
+fn extract_reml_score_impl(py: Python<'_>, fit: &Bound<'_, PyAny>) -> PyResult<f64> {
+    let view = reml_fit_view(py, fit)?;
+    extract_reml_score_from_view(py, &view)
+}
+
+fn extract_reml_score_from_view(py: Python<'_>, view: &RemlFitView<'_>) -> PyResult<f64> {
+    let raw = extract_reml_score_raw_from_view(view)?;
+    with_tierney_kadane_normalizer_from_view(py, view, raw)
+}
+
+fn extract_reml_score_raw_impl(py: Python<'_>, fit: &Bound<'_, PyAny>) -> PyResult<f64> {
+    let view = reml_fit_view(py, fit)?;
+    extract_reml_score_raw_from_view(&view)
+}
+
+fn extract_reml_score_raw_from_view(view: &RemlFitView<'_>) -> PyResult<f64> {
+    if let Some(score) = extract_float_metadata_from_view(view, REML_SCORE_KEYS)? {
+        return Ok(score);
+    }
+    match view {
+        RemlFitView::SavedSummary(_) => Err(PyValueError::new_err(
+            "Model summary is missing a reml_score / evidence field",
+        )),
+        RemlFitView::PythonObject(fit) => Err(PyTypeError::new_err(format!(
+            "compare_models: cannot extract reml_score from {}; pass a gamfit.Model, \
+             a dict with 'reml_score', or an object exposing .evidence",
+            fit.get_type().name()?
+        ))),
+    }
+}
+
+fn with_tierney_kadane_normalizer_from_view(
+    py: Python<'_>,
+    view: &RemlFitView<'_>,
+    score: f64,
+) -> PyResult<f64> {
+    let Some(null_dim) = extract_null_dim_from_view(py, view)? else {
+        return Ok(score);
+    };
+    tierney_kadane_normalized_score(
+        score,
+        null_dim,
+        extract_float_metadata_from_view(view, NULL_HESSIAN_LOGDET_KEYS)?,
+    )
+}
+
+fn extract_null_dim_from_view(py: Python<'_>, view: &RemlFitView<'_>) -> PyResult<Option<f64>> {
+    if let Some(null_dim) = extract_float_metadata_from_view(view, NULL_DIM_KEYS)? {
+        return Ok(Some(null_dim));
+    }
+    if let Some(nullity) = extract_float_metadata_from_view(view, NULLITY_KEYS)? {
+        return Ok(Some(nullity * extract_output_dim_from_view(py, view)?));
+    }
+    let dim_h = extract_float_metadata_from_view(view, DIM_KEYS)?;
+    let penalty_rank = extract_float_metadata_from_view(view, PENALTY_RANK_KEYS)?;
+    Ok(match (dim_h, penalty_rank) {
+        (Some(dim_h), Some(penalty_rank)) => Some(dim_h - penalty_rank),
+        _ => None,
+    })
+}
+
+fn extract_output_dim_from_view(py: Python<'_>, view: &RemlFitView<'_>) -> PyResult<f64> {
+    match view {
+        RemlFitView::SavedSummary(payload) => Ok(json_output_dim(payload)),
+        RemlFitView::PythonObject(_) => {
+            let Some(coefficients) = extract_py_metadata_value(py, view, &["coefficients"])? else {
+                return Ok(1.0);
+            };
+            let Ok(shape) = coefficients.getattr("shape") else {
+                return Ok(1.0);
+            };
+            let dims: Vec<usize> = shape.extract()?;
+            if dims.len() >= 2 {
+                Ok(dims[1] as f64)
+            } else {
+                Ok(1.0)
+            }
+        }
+    }
+}
+
+fn extract_edf_from_view(py: Python<'_>, view: &RemlFitView<'_>) -> PyResult<Option<f64>> {
+    match view {
+        RemlFitView::SavedSummary(payload) => Ok(json_lookup_edf(payload, EDF_KEYS)),
+        RemlFitView::PythonObject(_) => {
+            let Some(value) = extract_py_metadata_value(py, view, EDF_KEYS)? else {
+                return Ok(None);
+            };
+            py_value_to_float_or_sum(&value).map(Some)
+        }
+    }
+}
+
+fn extract_float_metadata_from_view(
+    view: &RemlFitView<'_>,
+    keys: &[&str],
+) -> PyResult<Option<f64>> {
+    match view {
+        RemlFitView::SavedSummary(payload) => Ok(json_lookup_f64(payload, keys)),
+        RemlFitView::PythonObject(fit) => {
+            let Some(value) = extract_py_metadata_value(fit.py(), view, keys)? else {
+                return Ok(None);
+            };
+            value.extract::<f64>().map(Some)
+        }
+    }
+}
+
+fn reml_fit_view<'py>(
+    py: Python<'py>,
+    fit: &Bound<'py, PyAny>,
+) -> PyResult<RemlFitView<'py>> {
+    if let Ok(model_bytes) = fit.extract::<Vec<u8>>() {
+        return Ok(RemplFitView::SavedSummary(summary_payload_from_model_bytes(
+            &model_bytes,
+        )?));
+    }
+    if fit.hasattr("_model_bytes")? {
+        let model_bytes: Vec<u8> = fit.getattr("_model_bytes")?.extract()?;
+        return Ok(RemplFitView::SavedSummary(summary_payload_from_model_bytes(
+            &model_bytes,
+        )?));
+    }
+    if let Some(payload) = py_summary_payload(py, fit)? {
+        return Ok(RemplFitView::PythonObject(payload));
+    }
+    Ok(RemplFitView::PythonObject(fit.clone()))
+}
+
+fn summary_payload_from_model_bytes(model_bytes: &[u8]) -> PyResult<serde_json::Value> {
+    let payload: serde_json::Value =
+        serde_json::from_str(&summary_json_impl(model_bytes).map_err(PyValueError::new_err)?)
+            .map_err(|err| PyValueError::new_err(format!("invalid model summary JSON: {err}")))?;
+    Ok(payload)
+}
+
+fn py_summary_payload<'py>(
+    _py: Python<'py>,
+    fit: &Bound<'py, PyAny>,
+) -> PyResult<Option<Bound<'py, PyAny>>> {
+    if !fit.hasattr("summary")? {
+        return Ok(None);
+    }
+    let summary_method = fit.getattr("summary")?;
+    if !summary_method.is_callable() {
+        return Ok(None);
+    }
+    let summary = fit.call_method0("summary")?;
+    if summary.hasattr("payload")? {
+        return summary.getattr("payload").map(Some);
+    }
+    Ok(Some(summary))
+}
+
+fn extract_py_metadata_value<'py>(
+    py: Python<'py>,
+    view: &RemlFitView<'py>,
+    keys: &[&str],
+) -> PyResult<Option<Bound<'py, PyAny>>> {
+    let RemlFitView::PythonObject(fit) = view else {
+        return Ok(None);
+    };
+    if let Some(value) = extract_py_get_value(fit, keys)? {
+        return Ok(Some(value));
+    }
+    for key in keys {
+        if fit.hasattr(*key)? {
+            let value = fit.getattr(*key)?;
+            if !value.is_none() {
+                return Ok(Some(value));
+            }
+        }
+    }
+    let _ = py;
+    Ok(None)
+}
+
+fn extract_py_get_value<'py>(
+    target: &Bound<'py, PyAny>,
+    keys: &[&str],
+) -> PyResult<Option<Bound<'py, PyAny>>> {
+    if !target.hasattr("get")? {
+        return Ok(None);
+    }
+    let get_method = target.getattr("get")?;
+    if !get_method.is_callable() {
+        return Ok(None);
+    }
+    for key in keys {
+        let value = target.call_method1("get", (*key,))?;
+        if !value.is_none() {
+            return Ok(Some(value));
+        }
+    }
+    Ok(None)
+}
+
+fn py_value_to_float_or_sum(value: &Bound<'_, PyAny>) -> PyResult<f64> {
+    if let Ok(scalar) = value.extract::<f64>() {
+        return Ok(scalar);
+    }
+    let mut total = 0.0;
+    for item in value.try_iter()? {
+        total += item?.extract::<f64>()?;
+    }
+    Ok(total)
+}
+
+fn json_lookup_f64(payload: &serde_json::Value, keys: &[&str]) -> Option<f64> {
+    let object = payload.as_object()?;
+    for key in keys {
+        if let Some(value) = object.get(*key) {
+            if let Some(value) = json_number_to_f64(value) {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
+fn json_lookup_edf(payload: &serde_json::Value, keys: &[&str]) -> Option<f64> {
+    let object = payload.as_object()?;
+    for key in keys {
+        if let Some(value) = object.get(*key) {
+            if let Some(scalar) = json_number_to_f64(value) {
+                return Some(scalar);
+            }
+            if let Some(values) = value.as_array() {
+                return values.iter().try_fold(0.0, |acc, value| {
+                    json_number_to_f64(value).map(|number| acc + number)
+                });
+            }
+        }
+    }
+    None
+}
+
+fn json_number_to_f64(value: &serde_json::Value) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_i64().map(|value| value as f64))
+        .or_else(|| value.as_u64().map(|value| value as f64))
+}
+
+fn json_output_dim(payload: &serde_json::Value) -> f64 {
+    let Some(coefficients) = payload.get("coefficients") else {
+        return 1.0;
+    };
+    let Some(rows) = coefficients.as_array() else {
+        return 1.0;
+    };
+    let Some(first) = rows.first() else {
+        return 1.0;
+    };
+    first.as_array().map_or(1.0, |row| row.len() as f64)
+}
+
+fn format_bayes_factor(log_bf: f64) -> String {
+    if !log_bf.is_finite() {
+        return "inf".to_string();
+    }
+    if log_bf.abs() >= std::f64::consts::LN_10 * 3.0 {
+        return format!("1e{:+.1}", log_bf / std::f64::consts::LN_10);
+    }
+    format_three_significant(log_bf.exp())
+}
+
+fn format_three_significant(value: f64) -> String {
+    if value == 0.0 {
+        return "0".to_string();
+    }
+    let abs = value.abs();
+    let decimals = if abs >= 100.0 {
+        0
+    } else if abs >= 10.0 {
+        1
+    } else if abs >= 1.0 {
+        2
+    } else {
+        let exponent = abs.log10().floor();
+        (-exponent as i32 + 2).max(0) as usize
+    };
+    let mut formatted = format!("{value:.decimals$}");
+    if formatted.contains('.') {
+        while formatted.ends_with('0') {
+            formatted.pop();
+        }
+        if formatted.ends_with('.') {
+            formatted.pop();
+        }
+    }
+    formatted
 }
 
 #[pyfunction(signature = (x, y, penalty, weights, ridge_lambda))]
@@ -6226,9 +6394,10 @@ fn sae_manifold_fit<'py>(
     let mode = match assignment_kind.as_str() {
         "softmax" => AssignmentMode::softmax(tau),
         "ibp_map" => AssignmentMode::ibp_map(tau, alpha, learnable_alpha),
+        "jumprelu" => AssignmentMode::jumprelu(tau, tau),
         _ => {
             return Err(py_value_error(format!(
-                "assignment_kind must be one of 'softmax' or 'ibp_map'; got {assignment_kind}"
+                "assignment_kind must be one of 'softmax', 'ibp_map', or 'jumprelu'; got {assignment_kind}"
             )));
         }
     };
@@ -6269,14 +6438,14 @@ fn sae_manifold_fit<'py>(
             SaeManifoldRho::new(sparsity_strength.ln(), lambda_smooth.ln(), log_ard.clone());
         let candidate_loss = candidate_term
             .run_single_external_basis_refresh_step_arrow_schur(
-            z_view,
+                z_view,
                 &mut candidate_rho,
-            Some(&registry),
-            learning_rate,
-            ridge_ext_coord,
-            ridge_beta,
-        )
-        .map_err(py_value_error)?;
+                Some(&registry),
+                learning_rate,
+                ridge_ext_coord,
+                ridge_beta,
+            )
+            .map_err(py_value_error)?;
         let candidate_score = candidate_loss.evidence_proxy();
         if candidate_score > best_score {
             best_score = candidate_score;
@@ -6366,6 +6535,7 @@ fn sae_manifold_fit<'py>(
     learnable_alpha,
     sparsity_strength = 1.0,
     smoothness = 1.0,
+    lambda_grid = None,
     max_iter = 12,
     learning_rate = 1.0,
     ridge_ext_coord = 1.0e-6,
@@ -6390,6 +6560,7 @@ fn sae_manifold_fit_ibp<'py>(
     learnable_alpha: bool,
     sparsity_strength: f64,
     smoothness: f64,
+    lambda_grid: Option<Vec<f64>>,
     max_iter: usize,
     learning_rate: f64,
     ridge_ext_coord: f64,
@@ -6415,6 +6586,7 @@ fn sae_manifold_fit_ibp<'py>(
         "ibp_map".to_string(),
         sparsity_strength,
         smoothness,
+        lambda_grid,
         max_iter,
         learning_rate,
         ridge_ext_coord,
@@ -10387,6 +10559,10 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(posterior_predict_table, module)?)?;
+    module.add_function(wrap_pyfunction!(posterior_predict_bands_table, module)?)?;
+    module.add_function(wrap_pyfunction!(posterior_eta_bands, module)?)?;
+    module.add_function(wrap_pyfunction!(posterior_credible_interval, module)?)?;
+    module.add_function(wrap_pyfunction!(apply_inverse_link_array, module)?)?;
     module.add_function(wrap_pyfunction!(summary_json, module)?)?;
     module.add_function(wrap_pyfunction!(coefficient_state_json, module)?)?;
     module.add_function(wrap_pyfunction!(
