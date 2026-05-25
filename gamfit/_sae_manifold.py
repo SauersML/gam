@@ -337,7 +337,13 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
     if src is None:
         raise TypeError("sae_manifold_fit requires Z= (or X=) input array")
     x = _as_2d_float(src, "Z")
-    k_atoms = int(kwargs.pop("n_atoms", K if K is not None else 0))
+    n_atoms_kw = kwargs.pop("n_atoms", None)
+    if n_atoms_kw is not None and K is not None and int(n_atoms_kw) != int(K):
+        raise ValueError(
+            f"sae_manifold_fit: K and n_atoms both supplied with different values "
+            f"({int(K)} vs {int(n_atoms_kw)}); pass only one (they are aliases)."
+        )
+    k_atoms = int(n_atoms_kw if n_atoms_kw is not None else (K if K is not None else 0))
     atom_basis = kwargs.pop("atom_basis", None)
     atom_dim = kwargs.pop("atom_dim", d_atom)
     assignment_prior = kwargs.pop("assignment_prior", None)
@@ -354,9 +360,22 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         raise ValueError(f"max_iter must be >= 1, got {max_iter_total}")
     dims = _dims(k_atoms, atom_dim)
     bases = _bases(k_atoms, atom_basis, atom_topology)
-    kind = str(assignment_prior or {"ibp": "ibp_map"}.get(assignment, assignment))
-    if kind == "gated":
-        kind = "jumprelu"
+    # Normalize `assignment` and `assignment_prior` through a single alias map.
+    # If both are supplied and resolve to different canonical kinds, raise an
+    # eager argument-conflict error rather than letting Rust crash in the
+    # Schur path.
+    canonical_assignment = _canonical_assignment(assignment, "assignment")
+    if assignment_prior is not None:
+        canonical_prior = _canonical_assignment(assignment_prior, "assignment_prior")
+        if canonical_prior != canonical_assignment:
+            raise ValueError(
+                f"sae_manifold_fit: assignment={assignment!r} and assignment_prior={assignment_prior!r} "
+                f"resolve to different kinds ({canonical_assignment!r} vs {canonical_prior!r}); "
+                f"pass only one (they are aliases)."
+            )
+        kind = canonical_prior
+    else:
+        kind = canonical_assignment
     alpha_value = 1.0 if alpha == "auto" else float(alpha)
     # Magic-by-default learning rate: the SAE Newton kernel is a damped
     # Gauss-Newton step against a quadratic local model with Armijo
@@ -393,7 +412,10 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         int(top_k) if top_k is not None else 0,
         gumbel_schedule=_schedule_payload(gumbel_schedule),
     )
-    return ManifoldSAE.from_payload(x, dict(payload), atom_topology, assignment, penalties)
+    return ManifoldSAE.from_payload(
+        x, dict(payload), atom_topology, assignment, penalties,
+        alpha=float(alpha_value), learnable_alpha=bool(alpha == "auto"),
+    )
 
 
 def _as_2d_float(value: Any, name: str) -> np.ndarray:
@@ -425,12 +447,60 @@ def _bases(k_atoms: int, atom_basis: Any, atom_topology: str) -> list[str]:
     return [str(v) for v in raw]
 
 
+def _validate_gumbel_schedule_fields(
+    *, tau_start: float, tau_min: float, decay: str,
+    rate: float | None, steps: int | None, iter_count: int,
+) -> None:
+    if not (np.isfinite(tau_start) and tau_start > 0.0):
+        raise ValueError(f"GumbelTemperatureSchedule: tau_start must be finite and positive; got {tau_start}")
+    if not (np.isfinite(tau_min) and tau_min > 0.0):
+        raise ValueError(f"GumbelTemperatureSchedule: tau_min must be finite and positive; got {tau_min}")
+    if tau_min > tau_start:
+        raise ValueError(
+            f"GumbelTemperatureSchedule: tau_min ({tau_min}) cannot exceed tau_start ({tau_start})"
+        )
+    if decay not in {"geometric", "linear", "reciprocal_iter"}:
+        raise ValueError(f"GumbelTemperatureSchedule: unknown decay {decay!r}")
+    if rate is not None and (not np.isfinite(rate) or rate <= 0.0 or rate >= 1.0):
+        raise ValueError(f"GumbelTemperatureSchedule: rate must be in (0, 1); got {rate}")
+    if steps is not None and int(steps) < 1:
+        raise ValueError(f"GumbelTemperatureSchedule: steps must be >= 1; got {steps}")
+    if int(iter_count) < 0:
+        raise ValueError(f"GumbelTemperatureSchedule: iter_count must be >= 0; got {iter_count}")
+
+
 def _schedule_payload(schedule: Any) -> dict[str, Any] | None:
     if schedule is None:
         return None
     if isinstance(schedule, GumbelTemperatureSchedule):
         return schedule.to_rust_descriptor()
-    return dict(schedule)
+    descriptor = dict(schedule)
+    decay = str(descriptor.get("decay", "geometric")).lower().replace("-", "_")
+    if decay == "exponential":
+        decay = "geometric"
+    if "tau_start" not in descriptor:
+        raise ValueError("GumbelTemperatureSchedule (dict form): missing 'tau_start'")
+    tau_start = float(descriptor["tau_start"])
+    if "tau_min" in descriptor:
+        tau_min = float(descriptor["tau_min"])
+    elif "tau_end" in descriptor:
+        tau_min = float(descriptor["tau_end"])
+    else:
+        raise ValueError("GumbelTemperatureSchedule (dict form): missing 'tau_min' (or 'tau_end')")
+    rate = descriptor.get("rate")
+    steps = descriptor.get("steps")
+    iter_count = int(descriptor.get("iter_count", 0))
+    _validate_gumbel_schedule_fields(
+        tau_start=tau_start, tau_min=tau_min, decay=decay,
+        rate=None if rate is None else float(rate),
+        steps=None if steps is None else int(steps),
+        iter_count=iter_count,
+    )
+    descriptor["decay"] = decay
+    descriptor["tau_min"] = tau_min
+    descriptor["tau_start"] = tau_start
+    descriptor["iter_count"] = iter_count
+    return descriptor
 
 
 def _schedule_tau_start(schedule: Any, default: float) -> float:

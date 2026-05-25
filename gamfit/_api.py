@@ -1031,10 +1031,13 @@ def fit_array(
     return Model(_model_bytes=model_bytes, _training_table_kind="numpy")
 
 
-def load(path: str | Path) -> Model:
-    """Load a fitted :class:`Model` previously written with :meth:`Model.save`.
+def load(path: str | Path) -> Any:
+    """Load a fitted model previously written with :func:`gamfit.save`.
 
-    Reads the raw bytes from ``path`` and dispatches to :func:`loads`.
+    Auto-detects format: JSON files containing a ``gamfit.ManifoldSAE/v1``
+    schema header are returned as :class:`gamfit.ManifoldSAE`; everything
+    else is treated as a binary :class:`Model` archive and dispatched to
+    :func:`loads`.
 
     Parameters
     ----------
@@ -1043,21 +1046,37 @@ def load(path: str | Path) -> Model:
 
     Returns
     -------
-    Model
+    Model or ManifoldSAE
         Fitted model ready for prediction.
-
-    Raises
-    ------
-    GamError
-        If the file cannot be decoded by the Rust engine.
 
     Examples
     --------
     >>> model = gamfit.load("model.gam")
     >>> model.predict(test_df)
     """
-    model_bytes = Path(path).read_bytes()
-    return loads(model_bytes)
+    raw = Path(path).read_bytes()
+    # Cheap sniff: only ManifoldSAE payloads are JSON with the schema tag.
+    head = raw[:256].lstrip()
+    if head.startswith(b"{") and b"gamfit.ManifoldSAE" in raw[:512]:
+        from ._sae_manifold import ManifoldSAE  # local import avoids cycle
+
+        return ManifoldSAE.from_dict(json.loads(raw.decode("utf-8")))
+    return loads(raw)
+
+
+def save(model: Any, path: str | Path) -> None:
+    """Write a fitted model to ``path``. Symmetric with :func:`gamfit.load`.
+
+    Dispatches to ``model.save(path)`` for any object that exposes the method
+    (covers :class:`Model` binary archives and :class:`ManifoldSAE` JSON
+    payloads alike).
+    """
+    saver = getattr(model, "save", None)
+    if not callable(saver):
+        raise TypeError(
+            f"gamfit.save: {type(model).__name__} has no .save(path) method"
+        )
+    saver(path)
 
 
 def loads(model_bytes: bytes) -> Model:
