@@ -79,6 +79,17 @@ def run(cmd: list[str | Path]) -> None:
     subprocess.run(rendered, cwd=REPO_ROOT, check=True)
 
 
+def read_mean_predictions(pred_path: Path, expected_rows: int, label: str) -> np.ndarray:
+    with pred_path.open() as handle:
+        reader = csv.DictReader(handle)
+        mean = [float(row["mean"]) for row in reader]
+    if len(mean) != expected_rows:
+        raise RuntimeError(
+            f"{label} prediction row mismatch: got {len(mean)}, expected {expected_rows}"
+        )
+    return np.asarray(mean)
+
+
 def build_demo_data(
     workdir: Path,
     seed: int,
@@ -98,157 +109,22 @@ def build_demo_data(
     return train_csv, grid_csv, x_train, y_train, x_grid, y_grid
 
 
-def fit_and_predict(
-    gam_bin: Path,
-    workdir: Path,
-    train_csv: Path,
-    grid_csv: Path,
-    adaptive_regularization: bool,
-    expected_rows: int,
-) -> np.ndarray:
-    label = "true" if adaptive_regularization else "false"
-    model_path = workdir / f"duchon_1d_adaptive_{label}.json"
-    pred_path = workdir / f"duchon_1d_adaptive_{label}.csv"
-    formula = "y ~ s(x, type=duchon, centers=31)"
-
-    run(
-        [
-            gam_bin,
-            "fit",
-            train_csv,
-            formula,
-            "--adaptive-regularization",
-            label,
-            "--out",
-            model_path,
-        ]
-    )
-    run([gam_bin, "predict", model_path, grid_csv, "--out", pred_path])
-
-    with pred_path.open() as handle:
-        reader = csv.DictReader(handle)
-        mean = [float(row["mean"]) for row in reader]
-    if len(mean) != expected_rows:
-        raise RuntimeError(
-            f"prediction row mismatch for adaptive_regularization={label}: "
-            f"got {len(mean)}, expected {expected_rows}"
-        )
-    return np.asarray(mean)
-
-
-def fit_and_predict_rust_pspline(
+def fit_and_predict_gam(
     gam_bin: Path,
     workdir: Path,
     train_csv: Path,
     grid_csv: Path,
     expected_rows: int,
+    *,
+    label: str,
+    formula: str,
+    extra_fit_args: list[str] | None = None,
 ) -> np.ndarray:
-    model_path = workdir / "rust_pspline.json"
-    pred_path = workdir / "rust_pspline.csv"
-    formula = "y ~ s(x, type=ps, knots=31)"
-
-    run(
-        [
-            gam_bin,
-            "fit",
-            train_csv,
-            formula,
-            "--out",
-            model_path,
-        ]
-    )
+    model_path = workdir / f"{label}.json"
+    pred_path = workdir / f"{label}.csv"
+    run([gam_bin, "fit", train_csv, formula, *(extra_fit_args or []), "--out", model_path])
     run([gam_bin, "predict", model_path, grid_csv, "--out", pred_path])
-
-    with pred_path.open() as handle:
-        reader = csv.DictReader(handle)
-        mean = [float(row["mean"]) for row in reader]
-    if len(mean) != expected_rows:
-        raise RuntimeError(
-            f"rust p-spline prediction row mismatch: got {len(mean)}, expected {expected_rows}"
-        )
-    return np.asarray(mean)
-
-
-def fit_and_predict_rust_tps(
-    gam_bin: Path,
-    workdir: Path,
-    train_csv: Path,
-    grid_csv: Path,
-    expected_rows: int,
-) -> np.ndarray:
-    model_path = workdir / "rust_tps.json"
-    pred_path = workdir / "rust_tps.csv"
-    formula = "y ~ s(x, type=tps, centers=31)"
-
-    run(
-        [
-            gam_bin,
-            "fit",
-            train_csv,
-            formula,
-            "--out",
-            model_path,
-        ]
-    )
-    run([gam_bin, "predict", model_path, grid_csv, "--out", pred_path])
-
-    with pred_path.open() as handle:
-        reader = csv.DictReader(handle)
-        mean = [float(row["mean"]) for row in reader]
-    if len(mean) != expected_rows:
-        raise RuntimeError(
-            f"rust TPS prediction row mismatch: got {len(mean)}, expected {expected_rows}"
-        )
-    return np.asarray(mean)
-
-
-def fit_and_predict_rust_matern(
-    gam_bin: Path,
-    workdir: Path,
-    train_csv: Path,
-    grid_csv: Path,
-    expected_rows: int,
-) -> np.ndarray:
-    model_path = workdir / "rust_matern.json"
-    pred_path = workdir / "rust_matern.csv"
-    formula = "y ~ s(x, type=matern, centers=31)"
-
-    run(
-        [
-            gam_bin,
-            "fit",
-            train_csv,
-            formula,
-            "--out",
-            model_path,
-        ]
-    )
-    run([gam_bin, "predict", model_path, grid_csv, "--out", pred_path])
-
-    with pred_path.open() as handle:
-        reader = csv.DictReader(handle)
-        mean = [float(row["mean"]) for row in reader]
-    if len(mean) != expected_rows:
-        raise RuntimeError(
-            f"rust Matérn prediction row mismatch: got {len(mean)}, expected {expected_rows}"
-        )
-    return np.asarray(mean)
-
-
-def fit_and_predict_mgcv_duchon(
-    workdir: Path,
-    train_csv: Path,
-    grid_csv: Path,
-    expected_rows: int,
-) -> np.ndarray:
-    return fit_and_predict_mgcv(
-        workdir,
-        train_csv,
-        grid_csv,
-        expected_rows,
-        label="duchon",
-        smooth_term="s(x, bs='ds', m=c(1,0), k=min(31, nrow(train_df)-1))",
-    )
+    return read_mean_predictions(pred_path, expected_rows, label)
 
 
 def fit_and_predict_mgcv(
@@ -276,62 +152,7 @@ def fit_and_predict_mgcv(
         + "\n"
     )
     run(["Rscript", r_script])
-    with pred_path.open() as handle:
-        reader = csv.DictReader(handle)
-        mean = [float(row["mean"]) for row in reader]
-    if len(mean) != expected_rows:
-        raise RuntimeError(
-            f"mgcv {label} prediction row mismatch: got {len(mean)}, expected {expected_rows}"
-        )
-    return np.asarray(mean)
-
-
-def fit_and_predict_mgcv_matern(
-    workdir: Path,
-    train_csv: Path,
-    grid_csv: Path,
-    expected_rows: int,
-) -> np.ndarray:
-    return fit_and_predict_mgcv(
-        workdir,
-        train_csv,
-        grid_csv,
-        expected_rows,
-        label="matern",
-        smooth_term="s(x, bs='gp', m=c(-4,1.0), k=min(31, nrow(train_df)-1))",
-    )
-
-
-def fit_and_predict_mgcv_pspline(
-    workdir: Path,
-    train_csv: Path,
-    grid_csv: Path,
-    expected_rows: int,
-) -> np.ndarray:
-    return fit_and_predict_mgcv(
-        workdir,
-        train_csv,
-        grid_csv,
-        expected_rows,
-        label="pspline",
-        smooth_term="s(x, bs='ps', k=min(35, nrow(train_df)-1))",
-    )
-
-
-def fit_and_predict_mgcv_tps(
-    workdir: Path,
-    train_csv: Path,
-    grid_csv: Path,
-    expected_rows: int,
-) -> np.ndarray:
-    return fit_and_predict_mgcv(
-        workdir,
-        train_csv,
-        grid_csv,
-        expected_rows,
-        label="tps",
-        smooth_term="s(x, bs='tp', k=min(31, nrow(train_df)-1))",
-    )
+    return read_mean_predictions(pred_path, expected_rows, f"mgcv {label}")
 
 
 def make_plot(
@@ -340,15 +161,7 @@ def make_plot(
     y_train: np.ndarray,
     x_grid: np.ndarray,
     y_true: np.ndarray,
-    y_adaptive_true: np.ndarray,
-    y_adaptive_false: np.ndarray,
-    y_mgcv: np.ndarray,
-    y_mgcv_matern: np.ndarray,
-    y_mgcv_pspline: np.ndarray,
-    y_mgcv_tps: np.ndarray,
-    y_rust_pspline: np.ndarray,
-    y_rust_tps: np.ndarray,
-    y_rust_matern: np.ndarray,
+    series: list[tuple[np.ndarray, str, str, float, float]],
 ) -> None:
     plt.rcParams.update(
         {
@@ -383,78 +196,8 @@ def make_plot(
         alpha=0.9,
         label="true curve",
     )
-    ax.plot(
-        x_grid,
-        y_adaptive_true,
-        color="#d1495b",
-        linewidth=3.0,
-        alpha=0.78,
-        label="--adaptive-regularization true",
-    )
-    ax.plot(
-        x_grid,
-        y_adaptive_false,
-        color="#00798c",
-        linewidth=3.0,
-        alpha=0.78,
-        label="--adaptive-regularization false",
-    )
-    ax.plot(
-        x_grid,
-        y_mgcv,
-        color="#edae49",
-        linewidth=2.8,
-        alpha=0.82,
-        label="mgcv duchon",
-    )
-    ax.plot(
-        x_grid,
-        y_mgcv_matern,
-        color="#f4a261",
-        linewidth=2.3,
-        alpha=0.72,
-        label="mgcv Matérn",
-    )
-    ax.plot(
-        x_grid,
-        y_mgcv_pspline,
-        color="#2a9d8f",
-        linewidth=2.3,
-        alpha=0.72,
-        label="mgcv p-spline",
-    )
-    ax.plot(
-        x_grid,
-        y_mgcv_tps,
-        color="#264653",
-        linewidth=2.3,
-        alpha=0.72,
-        label="mgcv TPS",
-    )
-    ax.plot(
-        x_grid,
-        y_rust_pspline,
-        color="#4f772d",
-        linewidth=2.6,
-        alpha=0.8,
-        label="rust p-spline",
-    )
-    ax.plot(
-        x_grid,
-        y_rust_tps,
-        color="#5e548e",
-        linewidth=2.5,
-        alpha=0.78,
-        label="rust TPS",
-    )
-    ax.plot(
-        x_grid,
-        y_rust_matern,
-        color="#bc6c25",
-        linewidth=2.5,
-        alpha=0.78,
-        label="rust Matérn",
-    )
+    for values, label, color, linewidth, alpha in series:
+        ax.plot(x_grid, values, color=color, linewidth=linewidth, alpha=alpha, label=label)
     ax.axvline(0.5, color="#8a817c", linewidth=1.2, linestyle="--", alpha=0.45)
     ax.set_title("1D Duchon Fit With and Without Adaptive Regularization", pad=16)
     ax.set_xlabel("x")
@@ -494,67 +237,137 @@ def main() -> int:
             args.n_train,
             args.n_grid,
         )
-        y_adaptive_true = fit_and_predict(
-            args.gam_bin,
-            workdir,
-            train_csv,
-            grid_csv,
-            adaptive_regularization=True,
-            expected_rows=args.n_grid,
-        )
-        y_adaptive_false = fit_and_predict(
-            args.gam_bin,
-            workdir,
-            train_csv,
-            grid_csv,
-            adaptive_regularization=False,
-            expected_rows=args.n_grid,
-        )
-        y_mgcv = fit_and_predict_mgcv_duchon(
-            workdir,
-            train_csv,
-            grid_csv,
-            expected_rows=args.n_grid,
-        )
-        y_mgcv_matern = fit_and_predict_mgcv_matern(
-            workdir,
-            train_csv,
-            grid_csv,
-            expected_rows=args.n_grid,
-        )
-        y_mgcv_pspline = fit_and_predict_mgcv_pspline(
-            workdir,
-            train_csv,
-            grid_csv,
-            expected_rows=args.n_grid,
-        )
-        y_mgcv_tps = fit_and_predict_mgcv_tps(
-            workdir,
-            train_csv,
-            grid_csv,
-            expected_rows=args.n_grid,
-        )
-        y_rust_pspline = fit_and_predict_rust_pspline(
-            args.gam_bin,
-            workdir,
-            train_csv,
-            grid_csv,
-            expected_rows=args.n_grid,
-        )
-        y_rust_tps = fit_and_predict_rust_tps(
-            args.gam_bin,
-            workdir,
-            train_csv,
-            grid_csv,
-            expected_rows=args.n_grid,
-        )
-        y_rust_matern = fit_and_predict_rust_matern(
-            args.gam_bin,
-            workdir,
-            train_csv,
-            grid_csv,
-            expected_rows=args.n_grid,
-        )
+        duchon_formula = "y ~ s(x, type=duchon, centers=31)"
+        series = []
+        for label, plot_label, color, linewidth, alpha, extra_fit_args in [
+            (
+                "duchon_1d_adaptive_true",
+                "--adaptive-regularization true",
+                "#d1495b",
+                3.0,
+                0.78,
+                ["--adaptive-regularization", "true"],
+            ),
+            (
+                "duchon_1d_adaptive_false",
+                "--adaptive-regularization false",
+                "#00798c",
+                3.0,
+                0.78,
+                ["--adaptive-regularization", "false"],
+            ),
+        ]:
+            series.append(
+                (
+                    fit_and_predict_gam(
+                        args.gam_bin,
+                        workdir,
+                        train_csv,
+                        grid_csv,
+                        args.n_grid,
+                        label=label,
+                        formula=duchon_formula,
+                        extra_fit_args=extra_fit_args,
+                    ),
+                    plot_label,
+                    color,
+                    linewidth,
+                    alpha,
+                )
+            )
+        for label, plot_label, color, linewidth, alpha, smooth_term in [
+            (
+                "duchon",
+                "mgcv duchon",
+                "#edae49",
+                2.8,
+                0.82,
+                "s(x, bs='ds', m=c(1,0), k=min(31, nrow(train_df)-1))",
+            ),
+            (
+                "matern",
+                "mgcv Matérn",
+                "#f4a261",
+                2.3,
+                0.72,
+                "s(x, bs='gp', m=c(-4,1.0), k=min(31, nrow(train_df)-1))",
+            ),
+            (
+                "pspline",
+                "mgcv p-spline",
+                "#2a9d8f",
+                2.3,
+                0.72,
+                "s(x, bs='ps', k=min(35, nrow(train_df)-1))",
+            ),
+            (
+                "tps",
+                "mgcv TPS",
+                "#264653",
+                2.3,
+                0.72,
+                "s(x, bs='tp', k=min(31, nrow(train_df)-1))",
+            ),
+        ]:
+            series.append(
+                (
+                    fit_and_predict_mgcv(
+                        workdir,
+                        train_csv,
+                        grid_csv,
+                        args.n_grid,
+                        label=label,
+                        smooth_term=smooth_term,
+                    ),
+                    plot_label,
+                    color,
+                    linewidth,
+                    alpha,
+                )
+            )
+        for label, plot_label, color, linewidth, alpha, formula in [
+            (
+                "rust_pspline",
+                "rust p-spline",
+                "#4f772d",
+                2.6,
+                0.8,
+                "y ~ s(x, type=ps, knots=31)",
+            ),
+            (
+                "rust_tps",
+                "rust TPS",
+                "#5e548e",
+                2.5,
+                0.78,
+                "y ~ s(x, type=tps, centers=31)",
+            ),
+            (
+                "rust_matern",
+                "rust Matérn",
+                "#bc6c25",
+                2.5,
+                0.78,
+                "y ~ s(x, type=matern, centers=31)",
+            ),
+        ]:
+            series.append(
+                (
+                    fit_and_predict_gam(
+                        args.gam_bin,
+                        workdir,
+                        train_csv,
+                        grid_csv,
+                        args.n_grid,
+                        label=label,
+                        formula=formula,
+                    ),
+                    plot_label,
+                    color,
+                    linewidth,
+                    alpha,
+                )
+            )
         if len(x_grid) != args.n_grid or len(y_true) != args.n_grid:
             raise RuntimeError(
                 f"grid construction mismatch: len(x_grid)={len(x_grid)}, "
@@ -566,15 +379,7 @@ def main() -> int:
             y_train,
             x_grid,
             y_true,
-            y_adaptive_true,
-            y_adaptive_false,
-            y_mgcv,
-            y_mgcv_matern,
-            y_mgcv_pspline,
-            y_mgcv_tps,
-            y_rust_pspline,
-            y_rust_tps,
-            y_rust_matern,
+            series,
         )
 
     print(args.out)

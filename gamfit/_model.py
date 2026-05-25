@@ -160,53 +160,14 @@ def competing_risks_cif(
 class SurvivalPrediction:
     """Per-row survival functions evaluated on demand.
 
-    Returned by :meth:`Model.predict` for survival-family models. The
-    ``*_at`` helpers (:meth:`hazard_at`, :meth:`cumulative_hazard_at`,
-    :meth:`survival_at`, :meth:`failure_at`) evaluate the fitted hazard
-    surface at any user-supplied time grid.
+    Returned by :meth:`Model.predict` for survival models. The ``*_at``
+    helpers interpolate the FFI hazard/survival/cumulative-hazard surface
+    (or fall back to a plug-in piecewise-constant hazard from
+    ``parameters``). For very large queries the dense matrix is assembled
+    from ``*_at_chunks``; :meth:`write_survival_at_csv` streams to disk.
 
-    When the FFI produced a dense ``(n_samples, n_times)`` grid of
-    hazard / survival / cumulative-hazard values, the ``*_at`` helpers
-    linearly interpolate against that grid. Otherwise they fall back to
-    the legacy plug-in piecewise-constant hazard reconstructed from
-    ``parameters`` so bare-dataclass construction keeps working.
-
-    For very large queries (``n_rows * n_times`` exceeds roughly one
-    million cells), the ``*_at`` helpers internally evaluate the surface
-    in blocks via the matching ``*_at_chunks`` generator and then
-    assemble the dense result; callers that want to avoid the dense
-    allocation can iterate the chunk generators directly or stream a CSV
-    with :meth:`write_survival_at_csv`.
-
-    Attributes
-    ----------
-    model_class : str
-        The fitted model class string (e.g. ``"survival marginal-slope"``).
-    parameters : ndarray
-        Flat per-row parameters returned by the FFI. Shape
-        ``(n_samples, n_params_per_row)``. The exact column semantics
-        depend on ``model_class``; callers should treat this as opaque
-        and prefer the ``*_at`` helpers.
-    parameter_names : tuple of str
-        Column names corresponding to ``parameters``, in order.
-    times : ndarray or None
-        Shared 1-D time grid at which the hazard surfaces were evaluated.
-    hazard : ndarray or None
-        ``(n_samples, len(times))`` dense hazard surface from the FFI.
-    survival : ndarray or None
-        ``(n_samples, len(times))`` dense survival surface from the FFI.
-    cumulative_hazard:
-        ``(n_samples, len(times))`` dense cumulative-hazard surface from the FFI.
-    linear_predictor:
-        ``(n_samples,)`` per-row linear predictor at each row's own exit time.
-    survival_se:
-        ``(n_samples, len(times))`` delta-method standard errors on the
-        survival surface (response scale).  ``None`` unless the prediction
-        was issued with ``with_uncertainty=True``; then populated for
-        location-scale survival models.
-    eta_se:
-        ``(n_samples,)`` delta-method SE on the linear predictor at each
-        row's own exit time, under the same conditions as ``survival_se``.
+    ``survival_se`` / ``eta_se`` are populated only when
+    :meth:`Model.predict` was called with ``with_uncertainty=True``.
     """
 
     model_class: str
@@ -1053,40 +1014,14 @@ class Model:
 
     @property
     def evidence(self) -> float:
-        """REML / LAML log marginal-likelihood score for this fit.
-
-        Alias for ``summary()["reml_score"]``. This is the same scalar the
-        outer REML loop maximizes to select smoothing parameters; because the
-        LAML approximation already folds in the ``log|H| − log|S|_+`` Occam
-        factors, differences between two fits' ``evidence`` are log Bayes
-        factors with model-complexity already penalised. Use
-        :func:`gamfit.compare_models` to rank multiple fits, or
-        :meth:`bayes_factor_vs` for a pairwise comparison.
-        """
+        """REML/LAML log marginal-likelihood (alias for ``summary()["reml_score"]``)."""
         value = self.summary().get("reml_score")
         if value is None:
             raise ValueError("saved model payload is missing reml_score")
         return float(value)
 
     def bayes_factor_vs(self, other: "Model") -> float:
-        """Bayes factor of this fit against ``other``.
-
-        Returns ``exp(self.evidence - other.evidence)``. A value greater than
-        one means this fit is favoured; less than one means ``other`` is. For
-        large differences the result may overflow — use ``self.evidence -
-        other.evidence`` directly on the log scale in that case.
-
-        Parameters
-        ----------
-        other : Model
-            Competing fit, typically on the same response with a different
-            basis topology or penalty structure.
-
-        Examples
-        --------
-        >>> circle.bayes_factor_vs(torus)
-        1234.5
-        """
+        """Bayes factor ``exp(self.evidence - other.evidence)`` against ``other``."""
         if not isinstance(other, Model):
             raise TypeError(
                 f"bayes_factor_vs expects a gamfit.Model, got {type(other).__name__}"
@@ -1382,23 +1317,18 @@ def _interpolate_rows(
     """
     import numpy as np
 
-    grid = np.asarray(grid, dtype=float).reshape(-1)
-    query = np.asarray(query, dtype=float).reshape(-1)
-    surface = np.asarray(surface, dtype=float)
-    if grid.size == 0 or surface.shape[1] != grid.size:
+    grid_arr = np.asarray(grid, dtype=float).reshape(-1)
+    query_arr = np.asarray(query, dtype=float).reshape(-1)
+    surface_arr = np.ascontiguousarray(np.asarray(surface, dtype=float))
+    if grid_arr.size == 0 or surface_arr.shape[1] != grid_arr.size:
         raise ValueError("survival interpolation requires a non-empty grid")
-
-    order = np.argsort(grid, kind="stable")
-    sorted_grid = grid[order]
-    sorted_surface = surface[:, order]
-
-    out = np.empty((sorted_surface.shape[0], query.size), dtype=float)
-    for row_idx in range(sorted_surface.shape[0]):
-        out[row_idx, :] = np.interp(query, sorted_grid, sorted_surface[row_idx, :])
     lo, hi = clip
-    if lo is not None or hi is not None:
-        out = np.clip(out, lo if lo is not None else -np.inf, hi if hi is not None else np.inf)
-    return out
+    return np.asarray(
+        rust_module().interpolate_survival_surface(
+            grid_arr, surface_arr, query_arr, lo, hi
+        ),
+        dtype=float,
+    )
 
 
 __all__ = [
