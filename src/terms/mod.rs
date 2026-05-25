@@ -7,6 +7,7 @@ pub mod construction;
 pub mod equivariant_penalty;
 pub mod gated_decoder;
 pub mod hull;
+pub mod interchange_decoder;
 pub mod input_loc_derivatives;
 pub mod latent_coord;
 pub mod layout;
@@ -35,6 +36,11 @@ pub use atom_selection::{
     L1Relaxed, ShapeRef, TopK,
 };
 pub use gated_decoder::GatedSAEDecoder;
+pub use interchange_decoder::{
+    InterchangeDecodeBackward, InterchangeDecodeForward, InterchangeSwapBackward,
+    InterchangeSwapForward, interchange_decode_backward, interchange_decode_forward,
+    interchange_swap_backward, interchange_swap_forward,
+};
 pub use latent_coord::{
     AuxPriorFamily, AuxPriorStrength, InputLocationDerivative, LatentCoordValues, LatentIdMode,
     LatentManifold,

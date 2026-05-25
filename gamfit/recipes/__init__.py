@@ -13,9 +13,15 @@ from .partial_supervision import (
     PartialSupervisionRecipe,
     partial_supervision,
 )
+from .sae_supervised import (
+    SaeSupervisedFit,
+    sae_supervised,
+)
 
 __all__ = [
     "PartialSupervisionFit",
     "PartialSupervisionRecipe",
     "partial_supervision",
+    "SaeSupervisedFit",
+    "sae_supervised",
 ]

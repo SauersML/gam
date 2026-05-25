@@ -108,4 +108,10 @@ PENALTY_MANIFEST = (
         "python": "OrthogonalityPenalty",
         "row_block_diagonal": False,
     },
+    {
+        "kind": "sheaf_consistency",
+        "rust": "SheafConsistency:SheafConsistencyPenalty",
+        "python": "SheafConsistencyPenalty",
+        "row_block_diagonal": False,
+    },
 )

@@ -4,6 +4,7 @@ pub mod grassmann;
 pub mod integrator;
 pub mod manifold;
 pub mod optimizer;
+pub mod poincare;
 pub mod product;
 pub mod simplex;
 pub mod spd;
