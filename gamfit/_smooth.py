@@ -79,11 +79,8 @@ def _default_basis_for(latent: ManifoldDescriptor) -> BasisDescriptor:
 
 def _default_penalty_for(latent: ManifoldDescriptor) -> PenaltyDescriptor | None:
     """Magic-by-default penalty pick: ARD on the latent axes."""
-    try:
-        from ._penalty_descriptors import ARDPenalty
-        return ARDPenalty(weight=1.0)
-    except Exception:
-        return None
+    from ._penalty_descriptors import ARDPenalty
+    return ARDPenalty(weight=1.0)
 
 
 class Smooth(BasisDescriptor):
