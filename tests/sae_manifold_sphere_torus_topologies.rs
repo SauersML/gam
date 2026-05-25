@@ -184,3 +184,108 @@ fn torus_topology_recovers_synthetic_signal() {
         "torus SAE reconstruction R² too low: {r2:.4} (n={n}, p={p})"
     );
 }
+
+/// Issue #174: K=2 independent 1-D periodic atoms must recover a torus
+/// signal whose phases live in `[0, 1)`. Before the fix,
+/// `LatentManifold::Circle` wrapped modulo `2π` (radians) while
+/// `PeriodicHarmonicEvaluator` interprets the latent as a fraction of one
+/// period (basis `cos(2π·h·t)`), so Newton updates landed at the wrong
+/// principal interval and the optimiser stalled near R² ≈ 0. The fix
+/// collapses the variant to `Circle { period: f64 }` and
+/// `SaeAtomBasisKind::Periodic` constructs it with `period = 1.0` so the
+/// manifold wrap matches the basis convention.
+#[test]
+fn k2_periodic_atoms_recover_torus_signal() {
+    let n = 600usize;
+    let p = 8usize;
+    let k = 2usize;
+    let m = 11usize;
+
+    let mut z = Array2::<f64>::zeros((n, p));
+    let mut true_coords_per_atom: Vec<Array2<f64>> = Vec::with_capacity(k);
+    for _ in 0..k {
+        true_coords_per_atom.push(Array2::<f64>::zeros((n, 1)));
+    }
+    for i in 0..n {
+        let t1 = ((i as f64) * 0.137).rem_euclid(1.0);
+        let t2 = ((i as f64) * 0.241 + 0.13).rem_euclid(1.0);
+        true_coords_per_atom[0][[i, 0]] = t1;
+        true_coords_per_atom[1][[i, 0]] = t2;
+        let a1 = std::f64::consts::TAU * t1;
+        let a2 = std::f64::consts::TAU * t2;
+        let raw = [a1.cos(), a1.sin(), a2.cos(), a2.sin()];
+        for j in 0..p {
+            let mut acc = 0.0;
+            for (r_idx, r_val) in raw.iter().enumerate() {
+                acc += r_val * (1.0 / (1.0 + ((j + r_idx) % 7) as f64));
+            }
+            z[[i, j]] = acc;
+        }
+    }
+
+    let evaluator = PeriodicHarmonicEvaluator::new(m).expect("periodic evaluator");
+    let mut atoms: Vec<SaeManifoldAtom> = Vec::with_capacity(k);
+    let mut coords_init: Vec<Array2<f64>> = Vec::with_capacity(k);
+    for ai in 0..k {
+        let mut init = Array2::<f64>::zeros((n, 1));
+        for i in 0..n {
+            init[[i, 0]] =
+                (true_coords_per_atom[ai][[i, 0]] + 0.27 * (ai as f64 + 1.0)).rem_euclid(1.0);
+        }
+        let (phi0, jet0) = evaluator
+            .evaluate(init.view())
+            .expect("periodic atom evaluation");
+        let mut penalty = Array2::<f64>::eye(m);
+        penalty *= 1.0e-4;
+        let atom = SaeManifoldAtom::new(
+            &format!("periodic_atom_{ai}"),
+            SaeAtomBasisKind::Periodic,
+            1,
+            phi0,
+            jet0,
+            Array2::<f64>::zeros((m, p)),
+            penalty,
+        )
+        .expect("periodic atom")
+        .with_basis_evaluator(Arc::new(
+            PeriodicHarmonicEvaluator::new(m).expect("periodic evaluator clone"),
+        ) as Arc<dyn SaeBasisEvaluator>);
+        atoms.push(atom);
+        coords_init.push(init);
+    }
+
+    let manifolds: Vec<LatentManifold> = (0..k)
+        .map(|_| LatentManifold::Circle { period: 1.0 })
+        .collect();
+    let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+        Array2::<f64>::zeros((n, k)),
+        coords_init,
+        manifolds,
+        AssignmentMode::softmax(0.5),
+    )
+    .expect("assignment construction");
+    let mut term = SaeManifoldTerm::new(atoms, assignment).expect("term construction");
+    let mut rho = SaeManifoldRho::new(0.0, -4.0, vec![Array1::<f64>::zeros(1); k]);
+    let ridge = 1.0e-6;
+    let mut prev = f64::INFINITY;
+    for _ in 0..40 {
+        let loss = term
+            .run_joint_fit_arrow_schur(z.view(), &mut rho, None, 1, 1.0, ridge, ridge)
+            .expect("Newton step");
+        let total = loss.total();
+        if !total.is_finite() {
+            break;
+        }
+        if (prev - total).abs() < 1.0e-6 * prev.abs().max(1.0e-12) {
+            break;
+        }
+        prev = total;
+    }
+
+    let fitted = term.fitted();
+    let r2 = reconstruction_r2(&z, &fitted);
+    assert!(
+        r2 >= 0.5,
+        "issue #174: K=2 periodic-torus R² too low: {r2:.4} (n={n}, p={p}, k={k})"
+    );
+}
