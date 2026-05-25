@@ -4660,17 +4660,30 @@ fn tensor_product_design_from_marginals(
                     let q = b.ncols();
                     next.clear();
                     next.resize(cur.len() * q, 0.0);
+                    // Hoist the row view out of the inner `col` loop so the
+                    // q reads per `a_idx` reuse a single contiguous slice
+                    // instead of recomputing `b[[i, col]]` strides per cell.
+                    let b_row = b.row(i);
+                    let b_slice = b_row.as_slice().expect(
+                        "Array2 row from outer_iter is contiguous",
+                    );
                     for (a_idx, &aval) in cur.iter().enumerate() {
                         let off = a_idx * q;
+                        let dst = &mut next[off..off + q];
                         for col in 0..q {
-                            next[off + col] = aval * b[[i, col]];
+                            dst[col] = aval * b_slice[col];
                         }
                     }
                     std::mem::swap(&mut cur, &mut next);
                 }
-                for (j, &v) in cur.iter().enumerate() {
-                    out_row[j] = v;
-                }
+                // `out_row` is a row of the contiguous C-major `design`
+                // Array2, so it is backed by a contiguous slice. Use a
+                // bulk slice copy instead of an element-by-element write
+                // loop.
+                let out_slice = out_row.as_slice_mut().expect(
+                    "design row is contiguous in C-major Array2",
+                );
+                out_slice.copy_from_slice(&cur);
             }
         });
     Ok(design)
