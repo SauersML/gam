@@ -330,6 +330,23 @@ const LOGIT_MAX_TERMS: usize = 160;
 const LOGIT_ERFCX_ACCURACY_TARGET: f64 = 1.0e-11;
 const CLOGLOG_MILES_ALPHA: f64 = 60.0;
 const CLOGLOG_MILES_MAX_TERMS: usize = 256;
+// Upper bound on the (log of the) peak Miles-series term magnitude under which
+// the alternating cancellation still leaves a usable result in f64.
+//
+// The Miles series for S(mu, sigma) has term magnitudes whose log peaks at
+// `peak_log(mu, sigma) ≈ α − (mu − ln α)² / (2 σ²)` near n = α. The final S is
+// O(1), so a peak of `exp(peak_log)` is summed with alternating signs and must
+// cancel down to ~1. f64 has ~53 bits, so after losing roughly peak_log/ln(2)
+// bits to cancellation, the residual carries `53 − peak_log/ln(2)` bits of
+// precision. Setting the cap at 0 means the peak term magnitude is bounded by
+// 1, so the alternating sum never reaches into regions where bits get spent on
+// cancellation at all. Outside this gate the caller drops down to CC / Gamma /
+// GHQ, which evaluate the same survival object on numerically stable grids and
+// do not depend on telescoping huge cancellations. The exit from "Miles
+// reliable" to "fall back" therefore happens at peak terms of size 1, so the
+// two backends already agree on the boundary at full f64 precision and the
+// integrated cloglog mean remains monotone in `mu` as the routing switches.
+const CLOGLOG_MILES_PEAK_LOG_MAX: f64 = 0.0;
 const CLOGLOG_GAMMA_K_REF: f64 = 0.5;
 const CLOGLOG_GAMMA_T_MAX_REF: f64 = 24.0;
 const CLOGLOG_GAMMA_H_REF: f64 = 0.01;
@@ -1609,7 +1626,7 @@ fn cloglog_survival_term_controlled(
     if let Some(out) = cloglog_survival_extreme_asymptotic(mu, sigma) {
         return out;
     }
-    if (mu.abs() / sigma) >= 3.0
+    if cloglog_survival_miles_is_reliable(mu, sigma)
         && let Ok(out) = cloglog_survival_miles(mu, sigma)
     {
         return (
@@ -1738,7 +1755,8 @@ fn cloglog_survival_pair_controlled(
     // on one approximation surface instead of mixing, for example, CC for the
     // base term with Gamma for the shifted term. If a paired attempt fails, we
     // fall back to the usual independent routing.
-    if (mu.abs() / sigma) >= 3.0
+    if cloglog_survival_miles_is_reliable(mu, sigma)
+        && cloglog_survival_miles_is_reliable(shiftedmu, sigma)
         && let (Ok(base), Ok(shifted)) = (
             cloglog_survival_miles(mu, sigma),
             cloglog_survival_miles(shiftedmu, sigma),
@@ -1858,6 +1876,56 @@ fn log_half_erfc_stable(u: f64) -> f64 {
     } else {
         (0.5 * erfc(u)).ln()
     }
+}
+
+/// True when the Miles erfc-gated lognormal-Laplace series can be summed in
+/// f64 without the alternating-cancellation transient destroying the result.
+///
+/// Background. The Miles representation of `S(mu, sigma) = E[exp(-exp(eta))]`
+/// is a real series
+///
+/// ```text
+///   S = Σ_{n≥0} (-1)^n / n! · exp(mu n + ½ σ² n²) · ½ erfc(u_n)
+///   u_n = (mu − ln α + σ² n) / (√2 σ).
+/// ```
+///
+/// For large positive `u_n`, `½ erfc(u_n)` decays like `exp(-u_n²) / (√(2π) u_n)`.
+/// Substituting the asymptotic and using Stirling on `ln n!`, the log of the
+/// `n`-th term magnitude reduces to
+///
+/// ```text
+///   log|t_n| ≈ n ln(α / n) + n − ½ (mu − ln α)² / σ²,
+/// ```
+///
+/// which is maximised at `n = α` with peak value
+///
+/// ```text
+///   peak_log(mu, sigma) = α − ½ (mu − ln α)² / σ².
+/// ```
+///
+/// The series telescopes down to `S ∈ [0, 1]`, so once `peak_log` exceeds
+/// `CLOGLOG_MILES_PEAK_LOG_MAX` the partial sums sweep through magnitudes
+/// `exp(peak_log)` and the residual after cancellation no longer carries enough
+/// f64 precision to be a reliable answer. The fixed `|mu|/σ ≥ 3` gate that
+/// used to guard the Miles call was a proxy for "tail-dominated", not for
+/// "series reliable" — it misses precisely the band `mu ∈ (ln α − √(2 α σ²),
+/// ln α + √(2 α σ²))` where the peak term blows up, and several values of mu in
+/// that band were already empirically returning a clamped-but-wrong S
+/// (e.g. the latent cloglog inverse link was producing μ = 0.94 instead of
+/// μ ≈ 0.07 for `mu ≈ −3.2, σ = 1`).
+///
+/// This predicate replaces the proxy with the actual reliability condition.
+/// Callers should drop to the CC / Gamma / GHQ branches when it returns false,
+/// which all evaluate the same survival object on numerically stable grids.
+#[inline]
+fn cloglog_survival_miles_is_reliable(mu: f64, sigma: f64) -> bool {
+    if !(mu.is_finite() && sigma.is_finite() && sigma > 0.0) {
+        return false;
+    }
+    let alpha_ln = CLOGLOG_MILES_ALPHA.ln();
+    let shifted = mu - alpha_ln;
+    let peak_log = CLOGLOG_MILES_ALPHA - 0.5 * shifted * shifted / (sigma * sigma);
+    peak_log.is_finite() && peak_log <= CLOGLOG_MILES_PEAK_LOG_MAX
 }
 
 fn cloglog_survival_miles(mu: f64, sigma: f64) -> Result<f64, EstimationError> {
