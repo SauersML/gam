@@ -1,6 +1,6 @@
 //! JumpReLU STE (straight-through estimator) numeric-vs-analytic agreement.
 //!
-//! These tests pin down the analytic value / gradient / Hessian-diag of
+//! These tests pin down the analytic value / gradient / HVP of
 //! `JumpReLUPenalty` against central-difference numerical references, which is
 //! exactly what the gamfit composition engine needs to remain trustworthy as a
 //! drop-in for outer-loop REML. Companion to the Python-side
@@ -63,10 +63,9 @@ fn jumprelu_ste_grad_matches_numeric_central_difference() {
     }
 }
 
-/// Test 2 — analytic Hessian-diag vs central-difference of the analytic
-/// gradient (full Newton self-consistency).
+/// Test 2 — analytic HVP vs central-difference of the analytic gradient.
 #[test]
-fn jumprelu_ste_hessian_diag_matches_numeric_grad_diff() {
+fn jumprelu_ste_hvp_matches_numeric_grad_diff() {
     let thresholds = vec![0.20, 0.40];
     let d = thresholds.len();
     let n_obs = 5;
@@ -82,9 +81,8 @@ fn jumprelu_ste_hessian_diag_matches_numeric_grad_diff() {
     }
     let rho = Array1::<f64>::zeros(d);
 
-    let analytic_diag = penalty
-        .hessian_diag(target.view(), rho.view())
-        .expect("hessian_diag");
+    let probe = Array1::<f64>::from_elem(target.len(), 1.0);
+    let analytic_hv = penalty.hvp(target.view(), rho.view(), probe.view());
 
     let h = 1e-5;
     for i in 0..target.len() {
@@ -95,12 +93,12 @@ fn jumprelu_ste_hessian_diag_matches_numeric_grad_diff() {
         let g_plus = penalty.grad_target(t_plus.view(), rho.view())[i];
         let g_minus = penalty.grad_target(t_minus.view(), rho.view())[i];
         let numeric_diag = (g_plus - g_minus) / (2.0 * h);
-        let a = analytic_diag[i];
+        let a = analytic_hv[i];
         let denom = numeric_diag.abs().max(a.abs()).max(1e-6);
         let rel = (numeric_diag - a).abs() / denom;
         assert!(
             rel < 5e-3,
-            "hessian-diag mismatch at i={i}: analytic={a:.6e} numeric={numeric_diag:.6e} rel={rel:.3e}"
+            "hvp mismatch at i={i}: analytic={a:.6e} numeric={numeric_diag:.6e} rel={rel:.3e}"
         );
     }
 }

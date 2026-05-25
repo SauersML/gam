@@ -783,29 +783,53 @@ mod tests {
         assert!(MechanismSparsityJacobian::new(1.0, 0.0).is_err());
     }
 
+    /// Build a `(n, d)` `(mean, scale)` pair whose stacked signature
+    /// `[μ ‖ log σ]` has full rank `2d` (so it satisfies the Khemakhem
+    /// Theorem 1 precondition baked into `ConditionalPriorIvae::new`).
+    fn ivae_precondition_pair(n: usize, d: usize) -> (Array2<f64>, Array2<f64>) {
+        assert!(n >= 2 * d + 1, "need at least 2d+1 rows");
+        let mut mean = Array2::<f64>::zeros((n, d));
+        let mut scale = Array2::<f64>::from_elem((n, d), 1.0);
+        for r in 0..n {
+            let t = r as f64;
+            for c in 0..d {
+                let k = c as f64;
+                // sin/cos with distinct phases makes the 2d columns linearly
+                // independent for any reasonably-sized n ≥ 2d+1.
+                mean[[r, c]] = (0.7 * t + 0.3 * k).sin();
+                scale[[r, c]] = (0.4 * (0.5 * t + 0.9 * k).cos()).exp();
+            }
+        }
+        (mean, scale)
+    }
+
     #[test]
     fn conditional_prior_ivae_zero_mean_unit_scale_matches_standard_gaussian() {
-        let n = 4;
+        // Use varying (μ, log σ) so the identifiability precondition holds,
+        // then evaluate at a `t` that matches `μ` to recover the closed-form
+        // Gaussian normaliser ½·n·d·log 2π + Σ log σ.
+        let n = 7;
         let d = 3;
-        let mean = Array2::<f64>::zeros((n, d));
-        let scale = Array2::<f64>::ones((n, d));
+        let (mean, scale) = ivae_precondition_pair(n, d);
+        let t = mean.clone();
+        let log_norm: f64 = scale.iter().map(|s| s.ln()).sum();
         let pen = ConditionalPriorIvae::new(mean, scale, 1.0).unwrap();
-        let t = Array2::<f64>::from_elem((n, d), 0.5);
         let (v, g) = pen.value_and_grad(t.view());
-        // Expected ½ Σ t² + (n*d/2) log 2π
-        let expected_quad: f64 = 0.5 * t.iter().map(|x| x * x).sum::<f64>();
-        let expected = expected_quad + 0.5 * (n * d) as f64 * (2.0 * std::f64::consts::PI).ln();
-        assert!((v - expected).abs() < 1e-9);
+        let expected = log_norm + 0.5 * (n * d) as f64 * (2.0 * std::f64::consts::PI).ln();
+        assert!((v - expected).abs() < 1e-9, "value {v} vs expected {expected}");
         for &gv in g.iter() {
-            assert!((gv - 0.5).abs() < 1e-12);
+            assert!(gv.abs() < 1e-12);
         }
     }
 
     #[test]
     fn conditional_prior_ivae_grad_matches_finite_diff() {
-        let mean = array![[0.1_f64, -0.2], [0.3, 0.0]];
-        let scale = array![[0.5_f64, 2.0], [1.0, 0.7]];
-        let t = array![[0.4_f64, -0.1], [1.2, 0.6]];
+        let (mean, scale) = ivae_precondition_pair(5, 2);
+        let mut t = mean.clone();
+        for r in 0..5 {
+            t[[r, 0]] += 0.4;
+            t[[r, 1]] -= 0.3;
+        }
         let pen = ConditionalPriorIvae::new(mean, scale, 1.7).unwrap();
         let (_, g) = pen.value_and_grad(t.view());
         let h = 1.0e-5;
@@ -829,6 +853,63 @@ mod tests {
         let mut scale = Array2::<f64>::ones((2, 2));
         scale[[0, 0]] = -0.1;
         assert!(ConditionalPriorIvae::new(mean, scale, 1.0).is_err());
+    }
+
+    #[test]
+    fn conditional_prior_ivae_accepts_when_signature_full_rank() {
+        let (mean, scale) = ivae_precondition_pair(7, 3);
+        ConditionalPriorIvae::new(mean, scale, 1.0)
+            .expect("full-rank signature should satisfy Khemakhem Theorem 1");
+    }
+
+    #[test]
+    fn conditional_prior_ivae_rejects_trivial_constant_prior() {
+        // All rows identical → unconditional N(μ, σ²), non-identifiable.
+        let n = 9;
+        let d = 3;
+        let mean = Array2::<f64>::from_elem((n, d), 0.25);
+        let scale = Array2::<f64>::from_elem((n, d), 1.5);
+        let err = ConditionalPriorIvae::new(mean, scale, 1.0).unwrap_err();
+        assert!(
+            err.contains("trivial unconditional") && err.contains("Khemakhem"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn conditional_prior_ivae_rejects_too_few_auxiliary_states() {
+        // n_rows = 4, latent_dim = 3 → need ≥ 2·3+1 = 7 rows.
+        let (full_mean, full_scale) = ivae_precondition_pair(7, 3);
+        let mean = full_mean.slice(s![..4, ..]).to_owned();
+        let scale = full_scale.slice(s![..4, ..]).to_owned();
+        let err = ConditionalPriorIvae::new(mean, scale, 1.0).unwrap_err();
+        assert!(
+            err.contains("2k+1") && err.contains("Khemakhem"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn conditional_prior_ivae_rejects_rank_deficient_signature() {
+        // Enough rows (n = 9 ≥ 2·3+1 = 7) and rows are NOT all identical,
+        // but the stacked [μ ‖ log σ] matrix lies in a strict subspace of
+        // ℝ^{2d}: column 0 of μ equals column 0 of log σ, and columns 1,2
+        // of both μ and σ are zero / one. So the signature has rank 1, far
+        // below the required 2·3 = 6.
+        let n = 9;
+        let d = 3;
+        let mut mean = Array2::<f64>::zeros((n, d));
+        let mut scale = Array2::<f64>::from_elem((n, d), 1.0);
+        for r in 0..n {
+            let v = ((r as f64) * 0.5).sin();
+            mean[[r, 0]] = v;
+            scale[[r, 0]] = v.exp(); // log σ column 0 = v = μ column 0
+        }
+        let err = ConditionalPriorIvae::new(mean, scale, 1.0).unwrap_err();
+        assert!(
+            err.contains("numerical rank") && err.contains("Khemakhem"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

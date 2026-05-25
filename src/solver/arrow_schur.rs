@@ -455,13 +455,62 @@ fn factor_one_row(
     for a in 0..d {
         block[[a, a]] += ridge_t;
     }
-    cholesky_lower(&block).map_err(|e| ArrowSchurError::PerRowFactorFailed {
+    let factor = cholesky_lower(&block).map_err(|e| ArrowSchurError::PerRowFactorFailed {
         row: row_idx,
         reason: format!(
             "row {row_idx} H_tt was non-PD at ridge_t={ridge_t}; \
              cholesky error: {e}"
         ),
-    })
+    })?;
+    // Cholesky succeeded, but barely-PD H_tt^(i) (pivots on the order of
+    // ε·trace) yield an inverse with condition number ~1/ε. Plugging that
+    // inverse into the Schur reduction
+    //     S = H_ββ + ridge_β·I − Σ_i H_tβ^(i)ᵀ (H_tt^(i))⁻¹ H_tβ^(i)
+    // contaminates S by spectral terms scaled by κ_i, while still letting
+    // the outer Cholesky on S succeed. Treat that case as functionally
+    // equivalent to a PSD failure so LM escalation lifts ridge_t.
+    //
+    // Diagonal-ratio condition-number proxy: for a Cholesky factor L,
+    //     κ(L Lᵀ) ≈ (max_i L_ii / min_i L_ii)².
+    // (Golub & Van Loan, "Matrix Computations" 4th ed., §4.2.4 — the
+    // ratio of diagonal entries of the Cholesky factor bounds the
+    // 2-norm condition number of the SPD matrix.)
+    //
+    // Near-singularity threshold for double precision at dimension d:
+    //     κ_max = 1 / (sqrt(DBL_EPS) · max(d, 1)).
+    // This is the classic Higham (Higham, "Accuracy and Stability of
+    // Numerical Algorithms" 2nd ed., §10.1) rule: a system is treated
+    // as numerically rank-deficient once κ · ε approaches 1/sqrt(ε),
+    // scaled by problem dimension.
+    let mut min_diag = f64::INFINITY;
+    let mut max_diag = 0.0_f64;
+    for a in 0..d {
+        let v = factor[[a, a]];
+        if v < min_diag {
+            min_diag = v;
+        }
+        if v > max_diag {
+            max_diag = v;
+        }
+    }
+    if min_diag > 0.0 && max_diag.is_finite() {
+        let ratio = max_diag / min_diag;
+        let kappa_est = ratio * ratio;
+        let d_scale = (d as f64).max(1.0);
+        let kappa_max = 1.0 / (f64::EPSILON.sqrt() * d_scale);
+        if !kappa_est.is_finite() || kappa_est > kappa_max {
+            return Err(ArrowSchurError::PerRowFactorIllConditioned {
+                row: row_idx,
+                kappa_estimate: kappa_est,
+            });
+        }
+    } else {
+        return Err(ArrowSchurError::PerRowFactorIllConditioned {
+            row: row_idx,
+            kappa_estimate: f64::INFINITY,
+        });
+    }
+    Ok(factor)
 }
 
 fn manifold_mode_fingerprint(latent: &LatentCoordValues) -> u64 {
@@ -1831,9 +1880,11 @@ pub fn solve_arrow_newton_step_core(
 
 /// LM-style ridge escalation around `solve_arrow_newton_step_core`.
 ///
-/// On `PerRowFactorFailed` / `SchurFactorFailed` (the factorization-level
-/// failure modes triggered when a per-row `H_tt + ridge_t·I` block or the
-/// reduced Schur complement has a non-PD pivot at the nominal ridge),
+/// On `PerRowFactorFailed` / `PerRowFactorIllConditioned` /
+/// `SchurFactorFailed` (the factorization-level failure modes triggered
+/// when a per-row `H_tt + ridge_t·I` block is non-PD, barely-PD with a
+/// condition estimate above the safe Schur threshold, or the reduced
+/// Schur complement has a non-PD pivot at the nominal ridge),
 /// geometrically grow a `proximal_ridge` on top of the caller-supplied
 /// `ridge_t` / `ridge_beta` and retry, exactly as the Ceres-style proximal
 /// correction the Newton driver in `run_joint_fit_arrow_schur` does around
@@ -1860,6 +1911,7 @@ pub fn solve_with_lm_escalation_inner(
                 let recoverable = matches!(
                     err,
                     ArrowSchurError::PerRowFactorFailed { .. }
+                        | ArrowSchurError::PerRowFactorIllConditioned { .. }
                         | ArrowSchurError::SchurFactorFailed { .. }
                 );
                 last_err = Some(err);

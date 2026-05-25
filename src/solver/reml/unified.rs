@@ -5186,20 +5186,70 @@ impl<'a> ConstrainedSubspaceKernel<'a> {
 /// and emit values of this type; the unified evaluator consumes it via the
 /// borrowing accessor.
 #[derive(Clone, Debug)]
-pub struct ProjectedKktResidual(Array1<f64>);
+pub struct ProjectedKktResidual {
+    /// The free-space residual vector. Same length as the unprojected
+    /// gradient minus the number of pinned active-set rows.
+    residual: Array1<f64>,
+    /// The KKT-stationarity tolerance the inner solver compared the
+    /// residual against when the certificate fired. `None` for legacy
+    /// construction sites that haven't been threaded yet; downstream
+    /// consumers fall back to `f64::NAN` in that case.
+    residual_tol: Option<f64>,
+    /// `total_p - active_set_size` at the producing iterate. Records
+    /// the dimensionality of the subspace on which the residual is
+    /// stationary, which the outer optimiser uses when scoring the
+    /// joint-Newton certificate's strength.
+    free_rank: Option<usize>,
+}
 
 impl ProjectedKktResidual {
     /// Construct from a vector that the caller guarantees has already been
     /// projected onto the free subspace. Crate-private so the projection
-    /// invariant cannot be bypassed by downstream callers.
+    /// invariant cannot be bypassed by downstream callers. The
+    /// `residual_tol` / `free_rank` metadata is left unset; callers that
+    /// have those numbers in scope should use [`with_metadata`].
+    ///
+    /// [`with_metadata`]: ProjectedKktResidual::with_metadata
     pub(crate) fn from_projected(residual: Array1<f64>) -> Self {
-        Self(residual)
+        Self {
+            residual,
+            residual_tol: None,
+            free_rank: None,
+        }
+    }
+
+    /// Attach the KKT tolerance and free-subspace rank to a previously
+    /// constructed residual. Builder-style so the legacy construction
+    /// path (`from_projected` then `with_metadata`) reads as a single
+    /// inline expression at the call site.
+    pub(crate) fn with_metadata(
+        mut self,
+        residual_tol: f64,
+        free_rank: usize,
+    ) -> Self {
+        self.residual_tol = Some(residual_tol);
+        self.free_rank = Some(free_rank);
+        self
     }
 
     /// Borrow the underlying free-space residual for the H⁻¹·r solve and
     /// its ρ-derivatives.
     pub fn as_array(&self) -> &Array1<f64> {
-        &self.0
+        &self.residual
+    }
+
+    /// The KKT-stationarity tolerance the inner solver applied at the
+    /// producing iterate. Returns `None` when the residual was built
+    /// from a legacy site that hasn't been threaded yet; downstream
+    /// consumers should substitute `f64::NAN` in that case.
+    pub fn residual_tol(&self) -> Option<f64> {
+        self.residual_tol
+    }
+
+    /// Dimensionality of the free subspace: `total_p - active_set_size`
+    /// at the producing iterate. `None` from legacy construction sites.
+    pub fn free_rank(&self) -> Option<usize> {
+        self.free_rank
     }
 }
 

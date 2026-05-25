@@ -705,23 +705,44 @@ impl PenaltyPseudologdet {
 
     /// Build from a pre-assembled penalty matrix S (already = Σ λ_k S_k + ridge·I).
     pub fn from_assembled(s_total: Array2<f64>) -> Result<Self, String> {
-        Self::from_assembled_inner(s_total, None)
+        Self::from_assembled_inner(s_total, None, None)
     }
 
     /// Build from a pre-assembled penalty matrix with a known structural nullity.
     ///
-    /// When `structural_nullity` is provided, the bottom `m0` eigenvalues are
-    /// treated as the nullspace even if ridge regularization makes them
-    /// numerically positive.
+    /// `s_total` must be `Σ_k λ_k S_k` plus, if `ridge` is `Some(r)`, an additive
+    /// `r·I` already applied to the diagonal. The caller is expected to have
+    /// assembled the matrix in exactly that form.
+    ///
+    /// When `structural_nullity` is `Some(m0)`, the function identifies the
+    /// `m0`-dimensional structural nullspace and excludes it from `log|S|₊`.
+    /// The detection rule depends on whether `ridge` is supplied:
+    ///
+    /// * If `ridge` is `Some(r)`, a direction is "structurally null" iff its
+    ///   eigenvalue is within tolerance of `r` — concretely
+    ///   `eval ≤ r · (1 + √ε · max(p_dim, 1))`. The function checks that this
+    ///   eigenvalue-based criterion identifies exactly `m0` directions and
+    ///   returns an error otherwise; this protects against the positional
+    ///   misclassification where a barely-active eigenvalue
+    ///   `λ_k σ_k(S_k) < r` would otherwise sort below a ridge-inflated null
+    ///   (see issue #192).
+    /// * If `ridge` is `None`, the function falls back to the legacy positional
+    ///   rule: the bottom `m0` eigenvalues are treated as the nullspace.
+    ///
+    /// Callers that assemble the ridged matrix `Σ_k λ_k S_k + r·I` SHOULD pass
+    /// `Some(r)` so that eigenvalue-based detection runs; this is the only
+    /// principled rule when active eigenvalues can dip below `r`.
     pub fn from_assembled_with_nullity(
         s_total: Array2<f64>,
+        ridge: Option<f64>,
         structural_nullity: Option<usize>,
     ) -> Result<Self, String> {
-        Self::from_assembled_inner(s_total, structural_nullity)
+        Self::from_assembled_inner(s_total, ridge, structural_nullity)
     }
 
     fn from_assembled_inner(
         s_total: Array2<f64>,
+        ridge: Option<f64>,
         structural_nullity: Option<usize>,
     ) -> Result<Self, String> {
         let p_dim = s_total.nrows();
@@ -745,12 +766,48 @@ impl PenaltyPseudologdet {
         let structural_nullity = structural_nullity.map(|m0| m0.min(p_dim));
         let mut positive_indices = Vec::with_capacity(p_dim);
         let mut null_indices = Vec::with_capacity(p_dim);
-        for (idx, &eval) in evals.iter().enumerate() {
-            let structurally_null = structural_nullity.is_some_and(|m0| idx < m0);
-            if !structurally_null && eval > threshold {
-                positive_indices.push(idx);
-            } else {
-                null_indices.push(idx);
+
+        // Eigenvalue-based null-direction detection (issue #192). The assembled
+        // matrix is Σ_k λ_k S_k + r·I, so structurally-null directions have
+        // eigenvalue exactly `r`, while every active direction has eigenvalue
+        // `r + λ_k σ_k > r`. We classify by proximity to `r` rather than by
+        // sort position so that a barely-active eigenvalue `λ_k σ_k < r` is
+        // not confused with a ridge-inflated structural null.
+        let ridged_null_threshold = match (ridge, structural_nullity) {
+            (Some(r), Some(_)) if r > 0.0 => {
+                let scale = 1.0 + (f64::EPSILON.sqrt() * (p_dim.max(1) as f64));
+                Some(r * scale)
+            }
+            _ => None,
+        };
+        if let (Some(m0), Some(null_threshold)) = (structural_nullity, ridged_null_threshold) {
+            // Count eigenvalues that look like ridge-only directions.
+            let null_like_count = evals.iter().filter(|&&e| e <= null_threshold).count();
+            if null_like_count != m0 {
+                return Err(format!(
+                    "PenaltyPseudologdet: structural nullity invariant violated — expected {m0} \
+                     eigenvalue(s) at or below ridge threshold {null_threshold:.6e}, but found \
+                     {null_like_count}. This usually means an active penalty contributes an \
+                     eigenvalue λ_k σ_k below the ridge, so positional null detection would \
+                     misclassify directions (issue #192). Eigenvalues (ascending): {:?}",
+                    evals.as_slice().unwrap()
+                ));
+            }
+            for (idx, &eval) in evals.iter().enumerate() {
+                if eval <= null_threshold {
+                    null_indices.push(idx);
+                } else {
+                    positive_indices.push(idx);
+                }
+            }
+        } else {
+            for (idx, &eval) in evals.iter().enumerate() {
+                let structurally_null = structural_nullity.is_some_and(|m0| idx < m0);
+                if !structurally_null && eval > threshold {
+                    positive_indices.push(idx);
+                } else {
+                    null_indices.push(idx);
+                }
             }
         }
         let rank = positive_indices.len();

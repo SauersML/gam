@@ -326,6 +326,7 @@ impl<'a, A: ArrowSystemAssembler> LatentInnerSolver<'a, A> {
                     }
                 }
                 Err(err @ ArrowSchurError::PerRowFactorFailed { .. })
+                | Err(err @ ArrowSchurError::PerRowFactorIllConditioned { .. })
                 | Err(err @ ArrowSchurError::SchurFactorFailed { .. })
                 | Err(err @ ArrowSchurError::PcgFailed { .. })
                 | Err(err @ ArrowSchurError::AdaptiveCorrectionFailed { .. }) => {
