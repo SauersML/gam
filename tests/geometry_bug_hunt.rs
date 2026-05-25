@@ -68,12 +68,12 @@ fn grassmann_retract_should_be_right_orthogonally_invariant() {
     let y_r = {
         let y_mat = Array2::from_shape_vec((4, 2), y.to_vec()).unwrap();
         let r_mat = Array2::from_shape_vec((2, 2), r.to_vec()).unwrap();
-        (y_mat.dot(&r_mat)).into_raw_vec()
+        (y_mat.dot(&r_mat)).into_raw_vec_and_offset().0
     };
     let xi_r = {
         let xi_mat = Array2::from_shape_vec((4, 2), xi.to_vec()).unwrap();
         let r_mat = Array2::from_shape_vec((2, 2), r.to_vec()).unwrap();
-        (xi_mat.dot(&r_mat)).into_raw_vec()
+        (xi_mat.dot(&r_mat)).into_raw_vec_and_offset().0
     };
     let a = m
         .retract(

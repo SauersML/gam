@@ -82,8 +82,9 @@ impl StartupStats {
             match &rej.failure {
                 InnerFailure::CertRefused { .. } => stats.rejected_by_kkt += 1,
                 InnerFailure::LikelihoodFailure(_) => stats.rejected_by_domain += 1,
-                InnerFailure::BudgetExhausted { .. }
-                | InnerFailure::TrustRegionFloor { .. } => stats.rejected_by_budget += 1,
+                InnerFailure::BudgetExhausted { .. } | InnerFailure::TrustRegionFloor { .. } => {
+                    stats.rejected_by_budget += 1
+                }
                 InnerFailure::Other(msg) => {
                     if msg.contains("non-finite")
                         || msg.contains("not finite")
@@ -282,7 +283,10 @@ mod tests {
 
     #[test]
     fn startup_stats_categorises_cert_refused() {
-        let rejections = vec![cert_refused(0, "time_surface"), cert_refused(1, "time_surface")];
+        let rejections = vec![
+            cert_refused(0, "time_surface"),
+            cert_refused(1, "time_surface"),
+        ];
         let stats = StartupStats::from_rejections(5, 5, 5, 0, &rejections);
         assert_eq!(stats.generated, 5);
         assert_eq!(stats.solver_started, 0);
@@ -305,10 +309,7 @@ mod tests {
 
     #[test]
     fn uniform_structural_key_rejects_mixed_blocks() {
-        let rejections = vec![
-            cert_refused(0, "time_surface"),
-            cert_refused(1, "marginal"),
-        ];
+        let rejections = vec![cert_refused(0, "time_surface"), cert_refused(1, "marginal")];
         assert!(uniform_structural_key(&rejections, 2).is_none());
     }
 
@@ -432,7 +433,10 @@ mod tests {
 
     #[test]
     fn format_no_seeds_passed_emits_structured_payload() {
-        let rejections = vec![cert_refused(0, "time_surface"), cert_refused(1, "time_surface")];
+        let rejections = vec![
+            cert_refused(0, "time_surface"),
+            cert_refused(1, "time_surface"),
+        ];
         let stats = StartupStats::from_rejections(5, 5, 5, 0, &rejections);
         let key = uniform_structural_key(&rejections, 2);
         let msg = format_no_seeds_passed("custom family", &stats, &rejections, key.as_ref(), "");

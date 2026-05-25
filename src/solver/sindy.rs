@@ -114,13 +114,17 @@ pub fn sindy_stlsq_solve(
         ));
     }
     if !(tol.is_finite() && tol >= 0.0) {
-        return Err(format!("sindy_stlsq_solve requires finite tol >= 0, got {tol}"));
+        return Err(format!(
+            "sindy_stlsq_solve requires finite tol >= 0, got {tol}"
+        ));
     }
     if max_rounds == 0 {
         return Err("sindy_stlsq_solve requires max_rounds >= 1".to_string());
     }
     if !(lam.is_finite() && lam >= 0.0) {
-        return Err(format!("sindy_stlsq_solve requires finite lam >= 0, got {lam}"));
+        return Err(format!(
+            "sindy_stlsq_solve requires finite lam >= 0, got {lam}"
+        ));
     }
     if matches!(kind, SindyPenaltyKind::Scad) && !(concave_a.is_finite() && concave_a > 2.0) {
         return Err(format!(
@@ -256,9 +260,9 @@ fn ridge_diag_solve(
         gram[(i, i)] += d;
     }
     let rhs = theta.t().dot(&dz_dt);
-    let chol = gram.cholesky(Side::Lower).map_err(|err| {
-        format!("sindy_stlsq_solve ridge Cholesky failed: {err}")
-    })?;
+    let chol = gram
+        .cholesky(Side::Lower)
+        .map_err(|err| format!("sindy_stlsq_solve ridge Cholesky failed: {err}"))?;
     let mut sol = rhs;
     chol.solve_mat_in_place(&mut sol);
     Ok(sol)
@@ -302,9 +306,8 @@ pub fn sindy_stlsq_auto_lam(
             best = Some((lam, bic, res));
         }
     }
-    let (lam, _bic, res) = best.ok_or_else(|| {
-        "sindy_stlsq_auto_lam: empty grid produced no candidates".to_string()
-    })?;
+    let (lam, _bic, res) =
+        best.ok_or_else(|| "sindy_stlsq_auto_lam: empty grid produced no candidates".to_string())?;
     Ok((lam, res))
 }
 

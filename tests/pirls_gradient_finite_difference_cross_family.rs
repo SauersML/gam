@@ -1,10 +1,14 @@
+use gam::families::strategy::{FamilyStrategy, strategy_for_spec};
 use gam::solver::pirls::update_glmvectors_by_family;
 use gam::types::{GlmLikelihoodSpec, LikelihoodSpec, ResponseFamily};
 use ndarray::{Array1, Array2, array};
 use statrs::function::gamma::ln_gamma;
 
 fn loglik(y: &Array1<f64>, eta: &Array1<f64>, spec: &GlmLikelihoodSpec, w: &Array1<f64>) -> f64 {
-    let mu = eta.mapv(|e| spec.spec.inverse_link().inverse_link(e));
+    let strategy = strategy_for_spec(&spec.spec);
+    let mu = strategy
+        .inverse_link_array(eta.view())
+        .expect("inverse-link evaluation must succeed on closed-form GLM links");
     match spec.spec.response {
         ResponseFamily::Gaussian => y
             .iter()

@@ -1,6 +1,4 @@
-use gam::gpu::{
-    self, DeviceCsrMatrix, DeviceMatrix, DeviceVector, GpuKernel, GpuPolicy, GpuRuntime,
-};
+use gam::gpu::{self, DeviceCsrMatrix, DeviceMatrix, DeviceVector, GpuKernel, GpuRuntime};
 use ndarray::{Array2, array};
 use std::thread;
 

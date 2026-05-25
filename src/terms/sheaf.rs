@@ -233,7 +233,7 @@ impl SheafConsistencyPenalty {
     fn vertex_slice<'a>(&self, s: ArrayView1<'a, f64>, v: usize) -> ArrayView1<'a, f64> {
         let start = self.stalk_offsets[v];
         let end = self.stalk_offsets[v + 1];
-        s.slice(ndarray::s![start..end])
+        s.slice_move(ndarray::s![start..end])
     }
 
     /// Apply `δ` to a stacked-stalk vector `s`. Returns a `Vec<Array1<f64>>`
@@ -269,7 +269,11 @@ impl SheafConsistencyPenalty {
     /// Apply `δᵀ` to per-edge discrepancies `y`. Returns the stacked-stalk
     /// vector `δᵀ y ∈ R^{Σ d_v}`.
     fn delta_transpose(&self, y: &[Array1<f64>]) -> Array1<f64> {
-        assert_eq!(y.len(), self.edges.len(), "delta_transpose edge count mismatch");
+        assert_eq!(
+            y.len(),
+            self.edges.len(),
+            "delta_transpose edge count mismatch"
+        );
         let mut out = Array1::<f64>::zeros(self.total_dim());
         for (e, &(u, v)) in self.edges.iter().enumerate() {
             let restriction = &self.restrictions[e];
@@ -440,7 +444,9 @@ impl SheafConsistencyPenalty {
                 // SAFETY: dense Laplacian above is symmetric positive semidefinite by construction
                 // (graph Laplacian of an undirected weighted graph), so eigh on the lower triangle
                 // must succeed; any err indicates a corrupted matrix and bailing here is correct.
-                Err(err) => panic!("SheafConsistencyPenalty::harmonic_modes faer eigh failed: {err:?}"),
+                Err(err) => {
+                    panic!("SheafConsistencyPenalty::harmonic_modes faer eigh failed: {err:?}")
+                }
             }
         } else {
             self.harmonic_modes_lanczos(tol)
@@ -471,7 +477,9 @@ impl SheafConsistencyPenalty {
             z ^= z >> 31;
             q_curr[i] = (z as f64 / u64::MAX as f64) - 0.5;
         }
-        let nrm = (q_curr.iter().map(|x| x * x).sum::<f64>()).sqrt().max(1e-300);
+        let nrm = (q_curr.iter().map(|x| x * x).sum::<f64>())
+            .sqrt()
+            .max(1e-300);
         q_curr.mapv_inplace(|x| x / nrm);
 
         let mut alphas = Vec::with_capacity(k);
@@ -517,7 +525,9 @@ impl SheafConsistencyPenalty {
             // (alphas on diagonal, betas on first sub/superdiagonal); eigh on a real symmetric
             // tridiagonal cannot fail by construction in finite arithmetic, so this is unreachable
             // outside of corrupted inputs and panicking is the right action.
-            Err(err) => panic!("SheafConsistencyPenalty::harmonic_modes Lanczos eigh failed: {err:?}"),
+            Err(err) => {
+                panic!("SheafConsistencyPenalty::harmonic_modes Lanczos eigh failed: {err:?}")
+            }
         }
     }
 }
@@ -548,11 +558,7 @@ impl AnalyticPenalty for SheafConsistencyPenalty {
         SheafConsistencyPenalty::value(self, target)
     }
 
-    fn grad_target(
-        &self,
-        target: ArrayView1<'_, f64>,
-        rho: ArrayView1<'_, f64>,
-    ) -> Array1<f64> {
+    fn grad_target(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> Array1<f64> {
         assert!(
             rho.iter().all(|x| x.is_finite()),
             "SheafConsistencyPenalty: rho must be finite (got {rho:?})",
@@ -585,11 +591,7 @@ impl AnalyticPenalty for SheafConsistencyPenalty {
         SheafConsistencyPenalty::hvp(self, target, v)
     }
 
-    fn grad_rho(
-        &self,
-        target: ArrayView1<'_, f64>,
-        rho: ArrayView1<'_, f64>,
-    ) -> Array1<f64> {
+    fn grad_rho(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> Array1<f64> {
         // No learnable hyperparameter axes: rho_count == 0.
         assert_eq!(
             rho.len(),
@@ -678,8 +680,8 @@ mod tests {
             EdgeRestriction::paired(r01_uv, r01_vu),
             EdgeRestriction::paired(r12_uv, r12_vu),
         ];
-        let pen = SheafConsistencyPenalty::new(edges, restrictions, 1.0, vec![2, 2, 2])
-            .expect("build");
+        let pen =
+            SheafConsistencyPenalty::new(edges, restrictions, 1.0, vec![2, 2, 2]).expect("build");
         // Reconstruct L densely via 6 matvecs.
         let l_dense = pen.dense_laplacian();
         let n = pen.total_dim();

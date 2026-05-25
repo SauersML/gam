@@ -4424,10 +4424,8 @@ fn build_tensor_bspline_basis(
             // 1D builder produced one) before densifying for the dense
             // marginal cache used by `tensor_product_design_from_marginals`
             // and `TensorProductDesignOperator`.
-            let sparse_view: Option<SparseColMat<usize, f64>> = built
-                .design
-                .as_sparse()
-                .map(|sd| {
+            let sparse_view: Option<SparseColMat<usize, f64>> =
+                built.design.as_sparse().map(|sd| {
                     let inner: &SparseColMat<usize, f64> = sd;
                     inner.clone()
                 });
@@ -4665,9 +4663,9 @@ fn tensor_product_design_from_marginals(
                     // q reads per `a_idx` reuse a single contiguous slice
                     // instead of recomputing `b[[i, col]]` strides per cell.
                     let b_row = b.row(i);
-                    let b_slice = b_row.as_slice().expect(
-                        "Array2 row from outer_iter is contiguous",
-                    );
+                    let b_slice = b_row
+                        .as_slice()
+                        .expect("Array2 row from outer_iter is contiguous");
                     for (a_idx, &aval) in cur.iter().enumerate() {
                         let off = a_idx * q;
                         let dst = &mut next[off..off + q];
@@ -4681,9 +4679,9 @@ fn tensor_product_design_from_marginals(
                 // Array2, so it is backed by a contiguous slice. Use a
                 // bulk slice copy instead of an element-by-element write
                 // loop.
-                let out_slice = out_row.as_slice_mut().expect(
-                    "design row is contiguous in C-major Array2",
-                );
+                let out_slice = out_row
+                    .as_slice_mut()
+                    .expect("design row is contiguous in C-major Array2");
                 out_slice.copy_from_slice(&cur);
             }
         });

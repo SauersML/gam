@@ -95,7 +95,10 @@ fn dot(a: ArrayView1<'_, f64>, b: ArrayView1<'_, f64>) -> f64 {
 ///
 /// Returns `y` unchanged when it is already strictly inside; otherwise it
 /// is rescaled along the radial direction. Always finite, never NaN.
-pub fn project_into_ball(point: ArrayView1<'_, f64>, curvature: f64) -> GeometryResult<Array1<f64>> {
+pub fn project_into_ball(
+    point: ArrayView1<'_, f64>,
+    curvature: f64,
+) -> GeometryResult<Array1<f64>> {
     let sqrt_negc = require_negative_curvature(curvature)?;
     let mut out = point.to_owned();
     let norm = out.iter().map(|v| v * v).sum::<f64>().sqrt();
@@ -244,7 +247,10 @@ fn check_atoms_shape(atoms: ArrayView2<'_, f64>, gates: ArrayView2<'_, f64>) -> 
 }
 
 /// Project every atom into the ball, then take `log_0` row-wise.
-fn project_and_log(atoms: ArrayView2<'_, f64>, curvature: f64) -> GeometryResult<(Array2<f64>, Array2<f64>)> {
+fn project_and_log(
+    atoms: ArrayView2<'_, f64>,
+    curvature: f64,
+) -> GeometryResult<(Array2<f64>, Array2<f64>)> {
     let sqrt_negc = require_negative_curvature(curvature)?;
     let max_norm = (1.0 - BOUNDARY_EPS) / sqrt_negc;
     let (f_atoms, d) = atoms.dim();
@@ -261,7 +267,10 @@ fn project_and_log(atoms: ArrayView2<'_, f64>, curvature: f64) -> GeometryResult
         for i in 0..d {
             projected[[f, i]] = row[i] * scale;
         }
-        let nrm_proj = (0..d).map(|i| projected[[f, i]] * projected[[f, i]]).sum::<f64>().sqrt();
+        let nrm_proj = (0..d)
+            .map(|i| projected[[f, i]] * projected[[f, i]])
+            .sum::<f64>()
+            .sqrt();
         if nrm_proj <= ORIGIN_EPS {
             // log_0(0) = 0; row stays zero.
             continue;
@@ -455,9 +464,7 @@ pub fn to_lorentz(y: ArrayView1<'_, f64>, curvature: f64) -> GeometryResult<Arra
     let sqrt_negc = require_negative_curvature(curvature)?;
     let d = y.len();
     if d == 0 {
-        return Err(GeometryError::InvalidPoint(
-            "to_lorentz requires d >= 1",
-        ));
+        return Err(GeometryError::InvalidPoint("to_lorentz requires d >= 1"));
     }
     let yhat_sq: f64 = y.iter().map(|v| (sqrt_negc * v).powi(2)).sum();
     let denom = (1.0 - yhat_sq).max(ORIGIN_EPS);
@@ -518,7 +525,10 @@ pub fn lorentz_log_origin(x: ArrayView1<'_, f64>, curvature: f64) -> GeometryRes
 }
 
 /// Lorentz exp at the origin from a spatial tangent vector.
-pub fn lorentz_exp_origin(v_spatial: ArrayView1<'_, f64>, curvature: f64) -> GeometryResult<Array1<f64>> {
+pub fn lorentz_exp_origin(
+    v_spatial: ArrayView1<'_, f64>,
+    curvature: f64,
+) -> GeometryResult<Array1<f64>> {
     let sqrt_negc = require_negative_curvature(curvature)?;
     let d = v_spatial.len();
     let norm_sq: f64 = v_spatial.iter().map(|x| x * x).sum();
@@ -667,7 +677,10 @@ mod tests {
         let b_sq: f64 = b.iter().map(|v| v * v).sum();
         let expected = (1.0 + 2.0 * diff_sq / ((1.0 - a_sq) * (1.0 - b_sq))).acosh();
         let got = poincare_distance(a.view(), b.view(), -1.0).expect("distance");
-        assert!((got - expected).abs() < 1.0e-12, "got {got}, expected {expected}");
+        assert!(
+            (got - expected).abs() < 1.0e-12,
+            "got {got}, expected {expected}"
+        );
     }
 
     #[test]
@@ -676,7 +689,12 @@ mod tests {
         let v = log_origin(y.view(), -1.0).expect("log");
         let back = exp_origin(v.view(), -1.0).expect("exp");
         for i in 0..4 {
-            assert!((back[i] - y[i]).abs() < 1.0e-12, "round trip mismatch at {i}: {} vs {}", back[i], y[i]);
+            assert!(
+                (back[i] - y[i]).abs() < 1.0e-12,
+                "round trip mismatch at {i}: {} vs {}",
+                back[i],
+                y[i]
+            );
         }
     }
 
@@ -695,15 +713,19 @@ mod tests {
         // ε-close to the Euclidean linear mixing z @ atoms.
         let atoms = array![[0.001, 0.0, 0.0], [0.0, -0.001, 0.0]];
         let gates = array![[0.5, -0.3]];
-        let (x_hat, cache) = tangent_decode_forward(atoms.view(), gates.view(), -1.0)
-            .expect("forward");
+        let (x_hat, cache) =
+            tangent_decode_forward(atoms.view(), gates.view(), -1.0).expect("forward");
         // Touch the cache so the binding is observed by the type system
         // (Rust forbids underscore-prefixed lets in this crate).
         assert_eq!(cache.tangents.dim(), (2, 3));
         let linear = gates.dot(&atoms);
         for i in 0..3 {
-            assert!((x_hat[[0, i]] - linear[[0, i]]).abs() < 1.0e-6,
-                "x_hat[{i}] = {} vs linear {}", x_hat[[0, i]], linear[[0, i]]);
+            assert!(
+                (x_hat[[0, i]] - linear[[0, i]]).abs() < 1.0e-6,
+                "x_hat[{i}] = {} vs linear {}",
+                x_hat[[0, i]],
+                linear[[0, i]]
+            );
         }
     }
 
@@ -715,15 +737,20 @@ mod tests {
             [0.01, -0.02, 0.04],
         ];
         let gates = array![[0.3, -0.2, 0.1], [-0.1, 0.4, 0.05]];
-        let (x_p, cache) = tangent_decode_forward(atoms.view(), gates.view(), -1.0)
-            .expect("poincare forward");
+        let (x_p, cache) =
+            tangent_decode_forward(atoms.view(), gates.view(), -1.0).expect("poincare forward");
         assert_eq!(cache.tangents.dim(), (3, 3));
-        let x_l = lorentz_decode_forward(atoms.view(), gates.view(), -1.0)
-            .expect("lorentz forward");
+        let x_l =
+            lorentz_decode_forward(atoms.view(), gates.view(), -1.0).expect("lorentz forward");
         for b in 0..2 {
             for i in 0..3 {
                 let diff = (x_p[[b, i]] - x_l[[b, i]]).abs();
-                assert!(diff < 1.0e-5, "p vs l mismatch at ({b},{i}): {} vs {}", x_p[[b, i]], x_l[[b, i]]);
+                assert!(
+                    diff < 1.0e-5,
+                    "p vs l mismatch at ({b},{i}): {} vs {}",
+                    x_p[[b, i]],
+                    x_l[[b, i]]
+                );
             }
         }
     }
@@ -732,8 +759,8 @@ mod tests {
     fn tangent_backward_matches_finite_difference() {
         let atoms = array![[0.05, 0.02], [-0.03, 0.04]];
         let gates = array![[0.3, -0.2]];
-        let (x_hat, cache) = tangent_decode_forward(atoms.view(), gates.view(), -1.0)
-            .expect("forward");
+        let (x_hat, cache) =
+            tangent_decode_forward(atoms.view(), gates.view(), -1.0).expect("forward");
         // Loss = sum(x_hat^2). Gradient w.r.t. x_hat = 2 x_hat.
         let mut grad_x = Array2::<f64>::zeros(x_hat.dim());
         for i in 0..x_hat.dim().0 {
@@ -741,8 +768,8 @@ mod tests {
                 grad_x[[i, j]] = 2.0 * x_hat[[i, j]];
             }
         }
-        let (grad_gates, grad_atoms) = tangent_decode_backward(&cache, grad_x.view())
-            .expect("backward");
+        let (grad_gates, grad_atoms) =
+            tangent_decode_backward(&cache, grad_x.view()).expect("backward");
 
         let eps = 1.0e-6;
         // Finite-difference one gate entry.
@@ -755,8 +782,12 @@ mod tests {
         let loss_p: f64 = x_p.iter().map(|v| v * v).sum();
         let loss_m: f64 = x_m.iter().map(|v| v * v).sum();
         let fd_gate = (loss_p - loss_m) / (2.0 * eps);
-        assert!((fd_gate - grad_gates[[0, 0]]).abs() < 1.0e-5,
-            "gate grad: analytic {} vs FD {}", grad_gates[[0, 0]], fd_gate);
+        assert!(
+            (fd_gate - grad_gates[[0, 0]]).abs() < 1.0e-5,
+            "gate grad: analytic {} vs FD {}",
+            grad_gates[[0, 0]],
+            fd_gate
+        );
 
         // Finite-difference one atom entry.
         let mut atoms_p = atoms.clone();
@@ -768,8 +799,12 @@ mod tests {
         let lp: f64 = x_p2.iter().map(|v| v * v).sum();
         let lm: f64 = x_m2.iter().map(|v| v * v).sum();
         let fd_atom = (lp - lm) / (2.0 * eps);
-        assert!((fd_atom - grad_atoms[[1, 0]]).abs() < 1.0e-5,
-            "atom grad: analytic {} vs FD {}", grad_atoms[[1, 0]], fd_atom);
+        assert!(
+            (fd_atom - grad_atoms[[1, 0]]).abs() < 1.0e-5,
+            "atom grad: analytic {} vs FD {}",
+            grad_atoms[[1, 0]],
+            fd_atom
+        );
     }
 
     #[test]
@@ -786,8 +821,8 @@ mod tests {
         // equal so it does not matter which one we differentiate analytically.
         let (x_hat_p, cache) = tangent_decode_forward(atoms.view(), gates.view(), -1.0)
             .expect("poincare forward (for cache)");
-        let x_hat_l = lorentz_decode_forward(atoms.view(), gates.view(), -1.0)
-            .expect("lorentz forward");
+        let x_hat_l =
+            lorentz_decode_forward(atoms.view(), gates.view(), -1.0).expect("lorentz forward");
         // Sanity: forward outputs of the two paths must agree to fp slack.
         for b in 0..x_hat_l.dim().0 {
             for i in 0..x_hat_l.dim().1 {
@@ -806,8 +841,8 @@ mod tests {
                 grad_x[[i, j]] = 2.0 * x_hat_l[[i, j]];
             }
         }
-        let (grad_gates, grad_atoms) = lorentz_decode_backward(&cache, grad_x.view())
-            .expect("lorentz backward");
+        let (grad_gates, grad_atoms) =
+            lorentz_decode_backward(&cache, grad_x.view()).expect("lorentz backward");
 
         let eps = 1.0e-6;
         // FD against the *Lorentz* forward, one gate entry.

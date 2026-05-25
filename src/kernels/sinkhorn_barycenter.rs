@@ -185,11 +185,7 @@ fn softmax_1d(log_x: ArrayView1<'_, f64>) -> Result<Array1<f64>, String> {
 fn safe_log_simplex(row: ArrayView1<'_, f64>) -> Array1<f64> {
     let mut out = Array1::<f64>::zeros(row.len());
     for (i, &v) in row.iter().enumerate() {
-        out[i] = if v <= 0.0 {
-            LOG_ZERO_SENTINEL
-        } else {
-            v.ln()
-        };
+        out[i] = if v <= 0.0 { LOG_ZERO_SENTINEL } else { v.ln() };
     }
     out
 }
@@ -221,9 +217,7 @@ fn validate_inputs(
         ));
     }
     if !(eps.is_finite() && eps >= MIN_EPS) {
-        return Err(format!(
-            "eps must be finite and >= {MIN_EPS:e}, got {eps}"
-        ));
+        return Err(format!("eps must be finite and >= {MIN_EPS:e}, got {eps}"));
     }
     if n_iter == 0 {
         return Err("n_iter must be at least 1".to_string());
@@ -506,8 +500,7 @@ pub fn sinkhorn_barycenter_vjp(
         let mut q_mat = Array2::<f64>::zeros((m, m));
         for i in 0..m {
             for j in 0..m {
-                let logp =
-                    state.log_kernel[[i, j]] + state.log_u[[ki, i]] + state.log_v[[ki, j]];
+                let logp = state.log_kernel[[i, j]] + state.log_u[[ki, i]] + state.log_v[[ki, j]];
                 let p_val = (logp - state.log_a[j]).exp();
                 let q_val = (logp - state.log_atoms[[ki, i]]).exp();
                 p_mat[[i, j]] = p_val;
@@ -791,7 +784,7 @@ pub fn geodesic_sphere_cost(directions: ArrayView2<'_, f64>) -> Result<Array2<f6
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::{array, Array1, Array2};
+    use ndarray::{Array1, Array2, array};
 
     fn approx_simplex_eq(actual: &Array1<f64>, expected: &Array1<f64>, tol: f64) {
         assert_eq!(actual.len(), expected.len());
@@ -832,8 +825,7 @@ mod tests {
     #[test]
     fn k_eq_2_mean_is_between() {
         let m = 32;
-        let points: Array2<f64> =
-            Array2::from_shape_fn((m, 1), |(i, _)| i as f64 / (m - 1) as f64);
+        let points: Array2<f64> = Array2::from_shape_fn((m, 1), |(i, _)| i as f64 / (m - 1) as f64);
         let mut atom_a = Array1::<f64>::zeros(m);
         let mut atom_b = Array1::<f64>::zeros(m);
         // Two Gaussian-like bumps on the line, centred at 0.2 and 0.8.
@@ -862,8 +854,12 @@ mod tests {
         let bary =
             sinkhorn_barycenter(atoms.view(), weights.view(), cost.view(), 0.005, 200).unwrap();
 
-        let mean_a: f64 = (0..m).map(|j| (j as f64 / (m - 1) as f64) * atom_a[j]).sum();
-        let mean_b: f64 = (0..m).map(|j| (j as f64 / (m - 1) as f64) * atom_b[j]).sum();
+        let mean_a: f64 = (0..m)
+            .map(|j| (j as f64 / (m - 1) as f64) * atom_a[j])
+            .sum();
+        let mean_b: f64 = (0..m)
+            .map(|j| (j as f64 / (m - 1) as f64) * atom_b[j])
+            .sum();
         let mean_bary: f64 = (0..m).map(|j| (j as f64 / (m - 1) as f64) * bary[j]).sum();
         let expected_mean = 0.5 * (mean_a + mean_b);
         assert!(
@@ -972,8 +968,7 @@ mod tests {
         let weights = Array1::<f64>::from_elem(k, 1.0 / k as f64);
         let cost = circular_cost(m);
         let t0 = std::time::Instant::now();
-        let bary =
-            sinkhorn_barycenter(atoms.view(), weights.view(), cost.view(), 0.1, 20).unwrap();
+        let bary = sinkhorn_barycenter(atoms.view(), weights.view(), cost.view(), 0.1, 20).unwrap();
         let dt = t0.elapsed();
         assert!(
             dt.as_secs_f64() < 5.0,
@@ -1037,7 +1032,7 @@ mod tests {
         let n_iter = 100;
 
         // Cotangent: dot the barycenter with a fixed vector r.
-        let r = Array1::<f64>::from_shape_fn(m, |j| (j as f64 - (m as f64 - 1.0) / 2.0));
+        let r = Array1::<f64>::from_shape_fn(m, |j| j as f64 - (m as f64 - 1.0) / 2.0);
 
         let vjp = sinkhorn_barycenter_vjp(
             atoms_norm.view(),
@@ -1056,22 +1051,12 @@ mod tests {
         let mut atoms_minus = atoms_norm.clone();
         atoms_plus[[ki, j]] += h;
         atoms_minus[[ki, j]] -= h;
-        let b_plus = sinkhorn_barycenter(
-            atoms_plus.view(),
-            weights.view(),
-            cost.view(),
-            eps,
-            n_iter,
-        )
-        .unwrap();
-        let b_minus = sinkhorn_barycenter(
-            atoms_minus.view(),
-            weights.view(),
-            cost.view(),
-            eps,
-            n_iter,
-        )
-        .unwrap();
+        let b_plus =
+            sinkhorn_barycenter(atoms_plus.view(), weights.view(), cost.view(), eps, n_iter)
+                .unwrap();
+        let b_minus =
+            sinkhorn_barycenter(atoms_minus.view(), weights.view(), cost.view(), eps, n_iter)
+                .unwrap();
         let mut fd = 0.0_f64;
         for i in 0..m {
             fd += r[i] * (b_plus[i] - b_minus[i]) / (2.0 * h);
