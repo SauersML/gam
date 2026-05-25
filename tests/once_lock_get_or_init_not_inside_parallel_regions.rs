@@ -27,7 +27,10 @@ fn once_lock_get_or_init_not_inside_parallel_regions() {
                     let start = i.saturating_sub(80);
                     let end = (i + 80).min(lines.len().saturating_sub(1));
                     let window = &lines[start..=end];
-                    if window.iter().any(|l| l.contains(".par_iter(") || l.contains(".into_par_iter(")) {
+                    if window
+                        .iter()
+                        .any(|l| l.contains(".par_iter(") || l.contains(".into_par_iter("))
+                    {
                         offenders.push(format!("{}:{}", path.display(), i + 1));
                     }
                 }

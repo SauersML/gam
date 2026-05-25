@@ -69,6 +69,7 @@ from typing import Any, Literal, TypeAlias
 import numpy as np
 
 from ._penalties_manifest import PENALTY_MANIFEST
+from ._binding import rust_module as _rust_module
 
 __all__ = [
     "PENALTY_MANIFEST",
@@ -95,14 +96,33 @@ __all__ = [
     "Penalty",
 ]
 
-from ._binding import rust_module as _rust_module; BlockSparsityPenalty = _rust_module().BlockSparsityPenalty
-from ._binding import rust_module as _rust_module; ParametricAuxConditionalPriorPenalty = _rust_module().ParametricAuxConditionalPriorPenalty
-from ._binding import rust_module as _rust_module; IBPAssignmentPenalty = _rust_module().IBPAssignmentPenalty
-from ._binding import rust_module as _rust_module; TotalVariationPenalty = _rust_module().TotalVariationPenalty
-from ._binding import rust_module as _rust_module; SoftmaxAssignmentSparsityPenalty = _rust_module().SoftmaxAssignmentSparsityPenalty
-from ._binding import rust_module as _rust_module; OrthogonalityPenalty = _rust_module().OrthogonalityPenalty
-from ._binding import rust_module as _rust_module; IvaeRidgeMeanGauge = _rust_module().IvaeRidgeMeanGauge
-from ._binding import rust_module as _rust_module; MechanismSparsityPenalty = _rust_module().MechanismSparsityPenalty
+
+def _rust_descriptor_class(name: str) -> type[Any]:
+    module = _rust_module()
+    cls = getattr(module, name, None)
+    if cls is not None:
+        return cls
+
+    class _MissingRustDescriptor:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            del args, kwargs
+            raise AttributeError(
+                f"gamfit._rust does not expose {name}; rebuild the local Rust extension"
+            )
+
+    _MissingRustDescriptor.__name__ = name
+    _MissingRustDescriptor.__qualname__ = name
+    return _MissingRustDescriptor
+
+
+BlockSparsityPenalty = _rust_descriptor_class("BlockSparsityPenalty")
+ParametricAuxConditionalPriorPenalty = _rust_descriptor_class("ParametricAuxConditionalPriorPenalty")
+IBPAssignmentPenalty = _rust_descriptor_class("IBPAssignmentPenalty")
+TotalVariationPenalty = _rust_descriptor_class("TotalVariationPenalty")
+SoftmaxAssignmentSparsityPenalty = _rust_descriptor_class("SoftmaxAssignmentSparsityPenalty")
+OrthogonalityPenalty = _rust_descriptor_class("OrthogonalityPenalty")
+IvaeRidgeMeanGauge = _rust_descriptor_class("IvaeRidgeMeanGauge")
+MechanismSparsityPenalty = _rust_descriptor_class("MechanismSparsityPenalty")
 
 
 class AnalyticPenaltyKind(str, Enum):
@@ -335,22 +355,26 @@ def _target_descriptor(target: Any) -> str | int:
     )
 
 
-from ._binding import rust_module as _rust_module; ARDPenalty = _rust_module().ARDPenalty
-from ._binding import rust_module as _rust_module; TopKActivationPenalty = _rust_module().TopKActivationPenalty
-from ._binding import rust_module as _rust_module; JumpReLUPenalty = _rust_module().JumpReLUPenalty
+ARDPenalty = _rust_descriptor_class("ARDPenalty")
+TopKActivationPenalty = _rust_descriptor_class("TopKActivationPenalty")
+JumpReLUPenalty = _rust_descriptor_class("JumpReLUPenalty")
 
 
 def _inverse_softplus(x: np.ndarray) -> np.ndarray:
     # Numerics live in Rust (see crates/gam-pyffi `numerics_inverse_softplus`).
-    return _rust_module().numerics_inverse_softplus(np.ascontiguousarray(x, dtype=float))
+    arr = np.ascontiguousarray(x, dtype=float)
+    inverse = getattr(_rust_module(), "numerics_inverse_softplus", None)
+    if inverse is not None:
+        return inverse(arr)
+    return np.log(np.expm1(arr))
 
 
-from ._binding import rust_module as _rust_module; SparsityPenalty = _rust_module().SparsityPenalty
-from ._binding import rust_module as _rust_module; AuxConditionalPriorPenalty = _rust_module().AuxConditionalPriorPenalty
-from ._binding import rust_module as _rust_module; BlockOrthogonalityPenalty = _rust_module().BlockOrthogonalityPenalty
-from ._binding import rust_module as _rust_module; IsometryPenalty = _rust_module().IsometryPenalty
-from ._binding import rust_module as _rust_module; ScadMcpPenalty = _rust_module().ScadMcpPenalty
-from ._binding import rust_module as _rust_module; NuclearNormPenalty = _rust_module().NuclearNormPenalty
+SparsityPenalty = _rust_descriptor_class("SparsityPenalty")
+AuxConditionalPriorPenalty = _rust_descriptor_class("AuxConditionalPriorPenalty")
+BlockOrthogonalityPenalty = _rust_descriptor_class("BlockOrthogonalityPenalty")
+IsometryPenalty = _rust_descriptor_class("IsometryPenalty")
+ScadMcpPenalty = _rust_descriptor_class("ScadMcpPenalty")
+NuclearNormPenalty = _rust_descriptor_class("NuclearNormPenalty")
 
 
 @dataclass(frozen=True, slots=True)
@@ -394,7 +418,11 @@ class GatedSAEDecoder:
 
 def _sigmoid_numpy(x: np.ndarray) -> np.ndarray:
     # Numerics live in Rust (see crates/gam-pyffi `numerics_sigmoid_stable`).
-    return _rust_module().numerics_sigmoid_stable(np.ascontiguousarray(x, dtype=float))
+    arr = np.ascontiguousarray(x, dtype=float)
+    sigmoid = getattr(_rust_module(), "numerics_sigmoid_stable", None)
+    if sigmoid is not None:
+        return sigmoid(arr)
+    return np.where(arr >= 0.0, 1.0 / (1.0 + np.exp(-arr)), np.exp(arr) / (1.0 + np.exp(arr)))
 
 
 # Sum type for type hints on `gamfit.fit(..., penalties=...)` and similar.

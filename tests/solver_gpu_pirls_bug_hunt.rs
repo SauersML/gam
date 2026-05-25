@@ -1,8 +1,13 @@
-use gam::solver::gpu::{GpuDispatch, GpuOperation, dense_pirls_dispatch};
 use gam::solver::gpu::pirls_gpu::{PirlsGpuInput, solve_pirls_step_gpu, weighted_crossprod_gpu};
-use ndarray::{arr1, arr2, Array2};
+use gam::solver::gpu::{GpuDispatch, GpuOperation, dense_pirls_dispatch};
+use ndarray::{Array2, arr1, arr2};
 
-fn tiny_case() -> (Array2<f64>, ndarray::Array1<f64>, Array2<f64>, ndarray::Array1<f64>) {
+fn tiny_case() -> (
+    Array2<f64>,
+    ndarray::Array1<f64>,
+    Array2<f64>,
+    ndarray::Array1<f64>,
+) {
     let x = arr2(&[[1.0, 0.5], [0.2, -0.3], [0.7, 1.1]]);
     let w = arr1(&[1.0, 0.8, 1.2]);
     let penalty = arr2(&[[0.4, 0.0], [0.0, 0.9]]);
@@ -21,7 +26,11 @@ fn gpu_pirls_step_falls_back_to_cpu_and_matches_beta_update_when_cuda_unavailabl
         lm_ridge: 0.0,
     })
     .expect("PIRLS GPU path should fall back to CPU and produce the same beta update when CUDA is unavailable");
-    assert_eq!(step.direction.len(), gradient.len(), "Fallback PIRLS direction must preserve coefficient dimension");
+    assert_eq!(
+        step.direction.len(),
+        gradient.len(),
+        "Fallback PIRLS direction must preserve coefficient dimension"
+    );
 }
 
 #[test]

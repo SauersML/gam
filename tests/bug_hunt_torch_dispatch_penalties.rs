@@ -49,8 +49,8 @@ fn torch_dispatch_spec_round_trip_preserves_dispatch_result() {
         smooth_class_name: "TensorBSpline".to_string(),
     };
 
-    let encoded = serde_json::to_string(&original)
-        .expect("Expected TorchDispatchSpec to serialize to JSON");
+    let encoded =
+        serde_json::to_string(&original).expect("Expected TorchDispatchSpec to serialize to JSON");
     let decoded: TorchDispatchSpec = serde_json::from_str(&encoded)
         .expect("Expected TorchDispatchSpec JSON to deserialize back to struct");
 

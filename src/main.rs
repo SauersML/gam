@@ -16276,8 +16276,7 @@ mod tests {
     fn parse_surv_response_accepts_two_arg_right_censored_shorthand() {
         // Surv(time, event): R survival / mgcv default, entry synthesized
         // as zero downstream. Confirmed by the None in slot 0.
-        let surv =
-            parse_surv_response("Surv(exit_time, event)").expect("parse 2-arg Surv lhs");
+        let surv = parse_surv_response("Surv(exit_time, event)").expect("parse 2-arg Surv lhs");
         assert_eq!(
             surv,
             Some((None, "exit_time".to_string(), "event".to_string()))

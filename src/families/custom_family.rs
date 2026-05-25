@@ -8234,6 +8234,57 @@ fn block_penalized_hessian_vector(
     hpen
 }
 
+fn symmetric_matrix_diagonal(matrix: &SymmetricMatrix) -> Array1<f64> {
+    match matrix {
+        SymmetricMatrix::Dense(mat) => mat.diag().to_owned(),
+        SymmetricMatrix::Sparse(mat) => {
+            let mut out = Array1::<f64>::zeros(mat.ncols());
+            let (symbolic, values) = mat.parts();
+            let col_ptr = symbolic.col_ptr();
+            let row_idx = symbolic.row_idx();
+            for col in 0..mat.ncols() {
+                for idx in col_ptr[col]..col_ptr[col + 1] {
+                    if row_idx[idx] == col {
+                        out[col] += values[idx];
+                    }
+                }
+            }
+            out
+        }
+    }
+}
+
+fn block_penalized_metric_diagonal(
+    spec: &ParameterBlockSpec,
+    work: &BlockWorkingSet,
+    s_lambda: &Array2<f64>,
+    ridge: f64,
+    ridge_policy: RidgePolicy,
+) -> Result<Array1<f64>, String> {
+    let mut diagonal = match work {
+        BlockWorkingSet::ExactNewton { hessian, .. } => symmetric_matrix_diagonal(hessian),
+        BlockWorkingSet::Diagonal {
+            working_weights, ..
+        } => spec.design.diag_gram(working_weights)?,
+    };
+    if diagonal.len() != s_lambda.nrows() || s_lambda.nrows() != s_lambda.ncols() {
+        return Err(format!(
+            "block penalized metric diagonal shape mismatch: diag={}, S={}x{}",
+            diagonal.len(),
+            s_lambda.nrows(),
+            s_lambda.ncols()
+        ));
+    }
+    for j in 0..diagonal.len() {
+        diagonal[j] += s_lambda[[j, j]];
+        if ridge_policy.include_quadratic_penalty && ridge > 0.0 {
+            diagonal[j] += ridge;
+        }
+        diagonal[j] = positive_joint_diagonal_entry(diagonal[j]);
+    }
+    Ok(diagonal)
+}
+
 fn block_penalized_metric_norm(
     spec: &ParameterBlockSpec,
     work: &BlockWorkingSet,
@@ -8241,15 +8292,16 @@ fn block_penalized_metric_norm(
     direction: &Array1<f64>,
     ridge: f64,
     ridge_policy: RidgePolicy,
-) -> f64 {
-    let hpen_direction =
-        block_penalized_hessian_vector(spec, work, s_lambda, direction, ridge, ridge_policy);
-    let quadratic = direction.dot(&hpen_direction);
-    if quadratic.is_finite() && quadratic > 0.0 {
-        quadratic.sqrt()
-    } else {
-        direction.iter().map(|v| v * v).sum::<f64>().sqrt()
+) -> Result<f64, String> {
+    let diagonal = block_penalized_metric_diagonal(spec, work, s_lambda, ridge, ridge_policy)?;
+    if diagonal.len() != direction.len() {
+        return Err(format!(
+            "block penalized metric direction length mismatch: direction={}, diag={}",
+            direction.len(),
+            diagonal.len()
+        ));
     }
+    Ok(joint_trust_region_metric_step_norm(direction, &diagonal))
 }
 
 fn truncate_block_step_to_metric_radius(
@@ -8260,12 +8312,12 @@ fn truncate_block_step_to_metric_radius(
     radius: f64,
     ridge: f64,
     ridge_policy: RidgePolicy,
-) -> (Array1<f64>, f64) {
-    let norm = block_penalized_metric_norm(spec, work, s_lambda, &delta, ridge, ridge_policy);
+) -> Result<(Array1<f64>, f64), String> {
+    let norm = block_penalized_metric_norm(spec, work, s_lambda, &delta, ridge, ridge_policy)?;
     if norm.is_finite() && norm > radius && radius > 0.0 {
-        (&delta * (radius / norm), radius)
+        Ok((&delta * (radius / norm), radius))
     } else {
-        (delta, norm)
+        Ok((delta, norm))
     }
 }
 
@@ -13744,7 +13796,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 block_cap,
                 ridge,
                 options.ridge_policy,
-            );
+            )?;
             let step_hit_trust_boundary =
                 joint_block_step_hit_trust_boundary(step_metric_norm, block_cap);
             trust_boundary_hit_in_cycle |= step_hit_trust_boundary;
@@ -13916,7 +13968,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         block_cap,
                         ridge,
                         options.ridge_policy,
-                    );
+                    )?;
                     trust_boundary_hit_in_cycle |=
                         joint_block_step_hit_trust_boundary(descent_metric_norm, block_cap);
                     let dir_norm = descent_dir.iter().fold(0.0_f64, |m, &v| m.max(v.abs()));
@@ -27265,7 +27317,8 @@ mod tests {
             radius,
             0.0,
             RidgePolicy::explicit_stabilization_pospart(),
-        );
+        )
+        .expect("block metric truncation should succeed");
         assert!(
             metric_norm < radius,
             "the near-null coordinate is large in beta-space but small in the block's penalized-Hessian metric"
@@ -27275,6 +27328,56 @@ mod tests {
                 && (metric_delta[1] + 1.0).abs() < 1.0e-12
                 && (metric_delta[2] - 2.0e5).abs() < 1.0e-6,
             "blockwise trust regions must size steps in objective curvature units, not raw coefficient units"
+        );
+    }
+
+    #[test]
+    fn blockwise_trust_region_never_reverts_to_raw_beta_norm_on_indefinite_curvature() {
+        let spec = ParameterBlockSpec {
+            name: "single_block".to_string(),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::<f64>::zeros((1, 3)),
+            )),
+            offset: Array1::zeros(1),
+            penalties: vec![],
+            nullspace_dims: vec![],
+            initial_log_lambdas: Array1::zeros(0),
+            initial_beta: None,
+        };
+        let h: Array2<f64> = array![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, -1.0e-8]];
+        let work = BlockWorkingSet::ExactNewton {
+            gradient: array![0.0, 0.0, 0.0],
+            hessian: SymmetricMatrix::Dense(h),
+        };
+        let s_lambda = Array2::<f64>::zeros((3, 3));
+        let raw_delta: Array1<f64> = array![2.0, -1.0, 2.0e5];
+        let radius = 20.0_f64;
+
+        let old_quadratic = raw_delta.dot(&array![2.0, -1.0, -2.0e-3]);
+        assert!(
+            old_quadratic < 0.0,
+            "fixture must hit the historical non-SPD branch"
+        );
+
+        let (metric_delta, metric_norm) = truncate_block_step_to_metric_radius(
+            &spec,
+            &work,
+            &s_lambda,
+            raw_delta,
+            radius,
+            0.0,
+            RidgePolicy::explicit_stabilization_pospart(),
+        )
+        .expect("block metric truncation should succeed");
+        assert!(
+            metric_norm < radius,
+            "indefinite curvature must still use the positive penalized diagonal metric, not raw beta length"
+        );
+        assert!(
+            (metric_delta[0] - 2.0).abs() < 1.0e-12
+                && (metric_delta[1] + 1.0).abs() < 1.0e-12
+                && (metric_delta[2] - 2.0e5).abs() < 1.0e-6,
+            "non-SPD local curvature must not resurrect coefficient-space trust-region scaling"
         );
     }
 

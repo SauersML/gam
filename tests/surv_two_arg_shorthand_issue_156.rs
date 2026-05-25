@@ -30,15 +30,18 @@ fn surv_two_arg_response_parses_to_implicit_zero_entry() {
     assert_eq!(parsed.2, "event");
 
     // Three-arg form is unchanged.
-    let parsed3 =
-        parse_surv_response("Surv(entry, exit, event)").unwrap().unwrap();
+    let parsed3 = parse_surv_response("Surv(entry, exit, event)")
+        .unwrap()
+        .unwrap();
     assert_eq!(parsed3.0.as_deref(), Some("entry"));
     assert_eq!(parsed3.1, "exit");
     assert_eq!(parsed3.2, "event");
 
     // 1-arg or 4-arg Surv(...) is still rejected, with a message that mentions
     // both supported forms.
-    let err = parse_surv_response("Surv(t)").err().expect("1-arg rejected");
+    let err = parse_surv_response("Surv(t)")
+        .err()
+        .expect("1-arg rejected");
     let msg = format!("{err}");
     assert!(msg.contains("Surv(time, event)"));
     assert!(msg.contains("Surv(entry, exit, event)"));

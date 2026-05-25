@@ -4,11 +4,12 @@ use gam::terms::sae_manifold::{
     AssignmentMode, GumbelTemperatureSchedule, SaeAssignment, SaeManifoldAtom, SaeManifoldRho,
     SaeManifoldTerm, ScheduleKind,
 };
-use ndarray::{array, Array1, Array2, Array3};
+use ndarray::{Array1, Array2, Array3, array};
 
 #[test]
 fn latent_coord_assignment_decode_roundtrip_matches_dictionary_atom() {
-    let coords = LatentCoordValues::from_matrix(array![[0.3, -0.7], [1.2, 0.5]].view(), LatentIdMode::None);
+    let coords =
+        LatentCoordValues::from_matrix(array![[0.3, -0.7], [1.2, 0.5]].view(), LatentIdMode::None);
     let logits = array![[20.0, -20.0], [-20.0, 20.0]];
     let assignment = SaeAssignment::from_blocks_with_mode(
         logits,
@@ -52,7 +53,11 @@ fn latent_coord_assignment_decode_roundtrip_matches_dictionary_atom() {
 
 #[test]
 fn sae_assignment_modes_softmax_ibp_jumprelu_follow_documented_behavior() {
-    let coord_blocks = vec![array![[0.0], [0.0]], array![[0.0], [0.0]], array![[0.0], [0.0]]];
+    let coord_blocks = vec![
+        array![[0.0], [0.0]],
+        array![[0.0], [0.0]],
+        array![[0.0], [0.0]],
+    ];
 
     let soft = SaeAssignment::from_blocks_with_mode(
         array![[1.0, 0.0, -1.0], [3.0, 2.0, 1.0]],
@@ -61,9 +66,14 @@ fn sae_assignment_modes_softmax_ibp_jumprelu_follow_documented_behavior() {
     )
     .expect("softmax assignment should build");
     for row in 0..soft.n_obs() {
-        let w = soft.try_assignments_row(row).expect("softmax row should evaluate");
+        let w = soft
+            .try_assignments_row(row)
+            .expect("softmax row should evaluate");
         let s: f64 = w.iter().sum();
-        assert!((s - 1.0).abs() < 1e-10, "Softmax assignments must be normalized and sum to one for every row.");
+        assert!(
+            (s - 1.0).abs() < 1e-10,
+            "Softmax assignments must be normalized and sum to one for every row."
+        );
     }
 
     let ibp = SaeAssignment::from_blocks_with_mode(
@@ -84,7 +94,9 @@ fn sae_assignment_modes_softmax_ibp_jumprelu_follow_documented_behavior() {
         AssignmentMode::jumprelu(0.5, 0.5),
     )
     .expect("jumprelu assignment should build");
-    let jump_row = jump.try_assignments_row(0).expect("jumprelu row should evaluate");
+    let jump_row = jump
+        .try_assignments_row(0)
+        .expect("jumprelu row should evaluate");
     assert!(
         jump_row[0] == 0.0 && jump_row[2] == 0.0 && jump_row[1] > 0.0,
         "JumpReLU should return sparse assignments with only logits above threshold receiving non-zero activation."
@@ -93,7 +105,8 @@ fn sae_assignment_modes_softmax_ibp_jumprelu_follow_documented_behavior() {
 
 #[test]
 fn gated_sae_decoder_reconstructs_dictionary_atom_at_zero_residual() {
-    let decoder = GatedSAEDecoder::new(Array2::eye(3), Array2::eye(3)).expect("decoder should build");
+    let decoder =
+        GatedSAEDecoder::new(Array2::eye(3), Array2::eye(3)).expect("decoder should build");
     let x = array![1.2, -0.8, 0.4];
     let y = decoder.decode_row(x.view()).expect("decode must succeed");
     assert!(
@@ -123,13 +136,15 @@ fn update_ard_reml_matches_documented_map_rule() {
     .expect("atom should build");
     let term = SaeManifoldTerm::new(vec![atom], assignment).expect("term should build");
     let mut rho = SaeManifoldRho::new(0.0, 0.0, vec![Array1::zeros(2)]);
-    term.update_ard_reml(&mut rho).expect("ARD update should succeed");
+    term.update_ard_reml(&mut rho)
+        .expect("ARD update should succeed");
 
     let n = 2.0;
     let expected0 = (n / (1.0_f64.powi(2) + 3.0_f64.powi(2))).ln();
     let expected1 = (n / (2.0_f64.powi(2) + 4.0_f64.powi(2))).ln();
     assert!(
-        (rho.log_ard[0][0] - expected0).abs() < 1e-12 && (rho.log_ard[0][1] - expected1).abs() < 1e-12,
+        (rho.log_ard[0][0] - expected0).abs() < 1e-12
+            && (rho.log_ard[0][1] - expected1).abs() < 1e-12,
         "ARD update must apply the documented MAP precision rule alpha_j = n / sum_i t_ij^2 for each latent axis."
     );
 }
@@ -176,10 +191,11 @@ fn temperature_schedule_is_applied_each_iteration_and_near_zero_behaves_like_arg
         AssignmentMode::softmax(1e-6),
     )
     .expect("near-zero temperature assignment should build");
-    let w = near_zero.try_assignments_row(0).expect("assignments should evaluate");
+    let w = near_zero
+        .try_assignments_row(0)
+        .expect("assignments should evaluate");
     assert!(
         w[0] > 1.0 - 1e-8 && w[1] < 1e-8 && w[2] < 1e-8,
         "As temperature approaches zero, assignment should collapse to argmax on the largest logit."
     );
 }
-

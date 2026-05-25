@@ -597,10 +597,15 @@ mod cuda_backend {
 
 #[cfg(not(all(feature = "cuda", target_os = "linux")))]
 mod cuda_backend {
+    //! CPU-only fallback stubs. Returning `None` from each entry point
+    //! signals "GPU unavailable on this build target" — callers route
+    //! through the CPU faer path. The bodies look like sentinels because
+    //! they ARE sentinels: this is the documented CPU-fallback contract.
     use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3};
 
     use super::super::runtime::GpuRuntime;
 
+    /// CPU-only build: no GPU `gemm`, route to faer.
     #[inline]
     pub(super) fn gemm(
         _runtime: &GpuRuntime,
@@ -609,9 +614,11 @@ mod cuda_backend {
         _trans_a: bool,
         _trans_b: bool,
     ) -> Option<Array2<f64>> {
+        log::trace!("cuda_backend::gemm called on CPU-only build; CPU fallback active");
         None
     }
 
+    /// CPU-only build: no GPU `gemv`, route to faer.
     #[inline]
     pub(super) fn gemv(
         _runtime: &GpuRuntime,
@@ -619,36 +626,44 @@ mod cuda_backend {
         _v: ArrayView1<'_, f64>,
         _trans_a: bool,
     ) -> Option<Array1<f64>> {
+        log::trace!("cuda_backend::gemv called on CPU-only build; CPU fallback active");
         None
     }
 
+    /// CPU-only build: no batched GPU gemm, route to faer.
     #[inline]
     pub(super) fn gemm_broadcast_b_batched(
         _runtime: &GpuRuntime,
         _a: ArrayView3<'_, f64>,
         _b: ArrayView2<'_, f64>,
     ) -> Option<Array3<f64>> {
+        log::trace!("cuda_backend::gemm_broadcast_b_batched called on CPU-only build; CPU fallback active");
         None
     }
 
+    /// CPU-only build: no strided-batched GPU gemm, route to faer.
     #[inline]
     pub(super) fn gemm_abt_strided_batched(
         _runtime: &GpuRuntime,
         _a: ArrayView3<'_, f64>,
         _b: ArrayView3<'_, f64>,
     ) -> Option<Array3<f64>> {
+        log::trace!("cuda_backend::gemm_abt_strided_batched called on CPU-only build; CPU fallback active");
         None
     }
 
+    /// CPU-only build: no GPU XᵀWX, route to faer.
     #[inline]
     pub(super) fn xt_diag_x(
         _runtime: &GpuRuntime,
         _x: ArrayView2<'_, f64>,
         _w: ArrayView1<'_, f64>,
     ) -> Option<Array2<f64>> {
+        log::trace!("cuda_backend::xt_diag_x called on CPU-only build; CPU fallback active");
         None
     }
 
+    /// CPU-only build: no GPU XᵀWY, route to faer.
     #[inline]
     pub(super) fn xt_diag_y(
         _runtime: &GpuRuntime,
@@ -656,9 +671,11 @@ mod cuda_backend {
         _w: ArrayView1<'_, f64>,
         _y: ArrayView2<'_, f64>,
     ) -> Option<Array2<f64>> {
+        log::trace!("cuda_backend::xt_diag_y called on CPU-only build; CPU fallback active");
         None
     }
 
+    /// CPU-only build: no GPU joint 2×2 Hessian, route to faer.
     #[inline]
     pub(super) fn joint_hessian_2x2(
         _runtime: &GpuRuntime,
@@ -668,9 +685,11 @@ mod cuda_backend {
         _w_ab: ArrayView1<'_, f64>,
         _w_bb: ArrayView1<'_, f64>,
     ) -> Option<Array2<f64>> {
+        log::trace!("cuda_backend::joint_hessian_2x2 called on CPU-only build; CPU fallback active");
         None
     }
 
+    /// CPU-only build: no GPU triangular solve, route to faer.
     #[inline]
     pub(super) fn trsm(
         _runtime: &GpuRuntime,
@@ -678,22 +697,27 @@ mod cuda_backend {
         _rhs: ArrayView2<'_, f64>,
         _upper: bool,
     ) -> Option<Array2<f64>> {
+        log::trace!("cuda_backend::trsm called on CPU-only build; CPU fallback active");
         None
     }
 
+    /// CPU-only build: no GPU Cholesky, route to faer.
     #[inline]
     pub(super) fn cholesky_lower(
         _runtime: &GpuRuntime,
         _a: ArrayView2<'_, f64>,
     ) -> Option<Array2<f64>> {
+        log::trace!("cuda_backend::cholesky_lower called on CPU-only build; CPU fallback active");
         None
     }
 
+    /// CPU-only build: no batched GPU Cholesky, route to faer.
     #[inline]
     pub(super) fn cholesky_batched_lower(
         _runtime: &GpuRuntime,
         _matrices: &mut [Array2<f64>],
     ) -> Option<()> {
+        log::trace!("cuda_backend::cholesky_batched_lower called on CPU-only build; CPU fallback active");
         None
     }
 }

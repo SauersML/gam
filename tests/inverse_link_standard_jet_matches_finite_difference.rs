@@ -39,9 +39,18 @@ fn inverse_link_standard_jet_matches_finite_difference() {
             let d2_fd = second_fd(f, eta, 1e-4);
             let d3_fd = third_fd(f, eta, 1e-3);
 
-            assert!((jet.d1 - d1_fd).abs() < 1e-6, "d1 mismatch for {link:?} @ {eta}");
-            assert!((jet.d2 - d2_fd).abs() < 5e-5, "d2 mismatch for {link:?} @ {eta}");
-            assert!((jet.d3 - d3_fd).abs() < 5e-3, "d3 mismatch for {link:?} @ {eta}");
+            assert!(
+                (jet.d1 - d1_fd).abs() < 1e-6,
+                "d1 mismatch for {link:?} @ {eta}"
+            );
+            assert!(
+                (jet.d2 - d2_fd).abs() < 5e-5,
+                "d2 mismatch for {link:?} @ {eta}"
+            );
+            assert!(
+                (jet.d3 - d3_fd).abs() < 5e-3,
+                "d3 mismatch for {link:?} @ {eta}"
+            );
         }
     }
 }

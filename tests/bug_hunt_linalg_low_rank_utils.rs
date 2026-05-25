@@ -1,17 +1,12 @@
 use gam::inference::probability::signed_log_sum_exp;
 use gam::linalg::low_rank_weight::LowRankWeight;
 use gam::linalg::utils::solve_spd_pcg;
-use ndarray::{array, Array1, Array2};
+use ndarray::{Array1, Array2, array};
 
 #[test]
 fn low_rank_weight_apply_matches_dense_symmetry_case() {
     let diag = array![1.5, 0.7, 2.3, 0.9];
-    let u = array![
-        [0.5, -1.0],
-        [1.2, 0.3],
-        [-0.7, 0.8],
-        [0.4, -0.2],
-    ];
+    let u = array![[0.5, -1.0], [1.2, 0.3], [-0.7, 0.8], [0.4, -0.2],];
     let v = array![0.2, -1.1, 0.7, 2.0];
 
     let w = LowRankWeight::symmetric(diag.view(), u.view()).expect("valid low-rank weight");
@@ -54,11 +49,7 @@ fn signed_log_sum_exp_matches_two_term_logsumexp_wide_range() {
 
 #[test]
 fn solve_spd_pcg_recovers_solution_with_residual_tolerance() {
-    let a = array![
-        [6.0, 2.0, 1.0],
-        [2.0, 5.0, 1.0],
-        [1.0, 1.0, 4.0],
-    ];
+    let a = array![[6.0, 2.0, 1.0], [2.0, 5.0, 1.0], [1.0, 1.0, 4.0],];
     let x_true = array![1.0, -2.0, 0.5];
     let b = a.dot(&x_true);
     let m = array![a[[0, 0]], a[[1, 1]], a[[2, 2]]];

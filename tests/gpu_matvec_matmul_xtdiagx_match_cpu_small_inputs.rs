@@ -17,7 +17,10 @@ fn gpu_paths_match_cpu_to_1e8_when_available_for_small_matrices() {
         let ab_cpu = a.dot(&b);
         for i in 0..ab_cpu.nrows() {
             for j in 0..ab_cpu.ncols() {
-                assert!(close(ab_gpu[[i, j]], ab_cpu[[i, j]], 1e-8), "GPU matmul should match CPU matmul to within 1e-8 for the same small input.");
+                assert!(
+                    close(ab_gpu[[i, j]], ab_cpu[[i, j]], 1e-8),
+                    "GPU matmul should match CPU matmul to within 1e-8 for the same small input."
+                );
             }
         }
     }
@@ -25,7 +28,10 @@ fn gpu_paths_match_cpu_to_1e8_when_available_for_small_matrices() {
     if let Some(av_gpu) = gpu::try_fast_av(a.view(), v.view()) {
         let av_cpu = a.dot(&v);
         for i in 0..av_cpu.len() {
-            assert!(close(av_gpu[i], av_cpu[i], 1e-8), "GPU matvec should match CPU matvec to within 1e-8 for the same small input.");
+            assert!(
+                close(av_gpu[i], av_cpu[i], 1e-8),
+                "GPU matvec should match CPU matvec to within 1e-8 for the same small input."
+            );
         }
     }
 
@@ -40,7 +46,10 @@ fn gpu_paths_match_cpu_to_1e8_when_available_for_small_matrices() {
         }
         for i in 0..xtwx_cpu.nrows() {
             for j in 0..xtwx_cpu.ncols() {
-                assert!(close(xtwx_gpu[[i, j]], xtwx_cpu[[i, j]], 1e-8), "GPU xt_diag_x should match CPU xt_diag_x to within 1e-8 for the same small input.");
+                assert!(
+                    close(xtwx_gpu[[i, j]], xtwx_cpu[[i, j]], 1e-8),
+                    "GPU xt_diag_x should match CPU xt_diag_x to within 1e-8 for the same small input."
+                );
             }
         }
     }

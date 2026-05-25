@@ -1,4 +1,6 @@
-use gam::estimate::{fit_gam, fit_gam_with_penalty_specs, fit_gamwith_heuristic_lambdas, FitOptions, PenaltySpec};
+use gam::estimate::{
+    FitOptions, PenaltySpec, fit_gam, fit_gam_with_penalty_specs, fit_gamwith_heuristic_lambdas,
+};
 use gam::terms::smooth::BlockwisePenalty;
 use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily};
 use ndarray::array;
@@ -10,10 +12,48 @@ fn fit_family_rejects_all_zero_weights() {
     let w = array![0.0, 0.0, 0.0];
     let offset = array![0.0, 0.0, 0.0];
     let s_list: Vec<BlockwisePenalty> = vec![];
-    let fam = LikelihoodSpec::new(ResponseFamily::Gaussian, InverseLink::Standard(LinkFunction::Identity));
+    let fam = LikelihoodSpec::new(
+        ResponseFamily::Gaussian,
+        InverseLink::Standard(LinkFunction::Identity),
+    );
     let opts = FitOptions::default();
 
-    assert!(fit_gam(x.view(), y.view(), w.view(), offset.view(), &s_list, fam.clone(), &opts).is_err());
-    assert!(fit_gamwith_heuristic_lambdas(x.view(), y.view(), w.view(), offset.view(), &s_list, None, fam.clone(), &opts).is_err());
-    assert!(fit_gam_with_penalty_specs(x.view(), y.view(), w.view(), offset.view(), Vec::<PenaltySpec>::new(), vec![], fam, &opts).is_err());
+    assert!(
+        fit_gam(
+            x.view(),
+            y.view(),
+            w.view(),
+            offset.view(),
+            &s_list,
+            fam.clone(),
+            &opts
+        )
+        .is_err()
+    );
+    assert!(
+        fit_gamwith_heuristic_lambdas(
+            x.view(),
+            y.view(),
+            w.view(),
+            offset.view(),
+            &s_list,
+            None,
+            fam.clone(),
+            &opts
+        )
+        .is_err()
+    );
+    assert!(
+        fit_gam_with_penalty_specs(
+            x.view(),
+            y.view(),
+            w.view(),
+            offset.view(),
+            Vec::<PenaltySpec>::new(),
+            vec![],
+            fam,
+            &opts
+        )
+        .is_err()
+    );
 }

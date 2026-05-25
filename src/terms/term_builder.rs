@@ -760,9 +760,9 @@ fn parse_tensor_periodic_axes(
                     }
                 } else {
                     for axis_raw in entries {
-                        let axis = axis_raw.parse::<usize>().map_err(|err| {
-                            format!("invalid periodic axis '{axis_raw}': {err}")
-                        })?;
+                        let axis = axis_raw
+                            .parse::<usize>()
+                            .map_err(|err| format!("invalid periodic axis '{axis_raw}': {err}"))?;
                         if axis >= dim {
                             return Err(format!(
                                 "periodic axis {axis} out of range for {dim}D smooth"

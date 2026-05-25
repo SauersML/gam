@@ -44,18 +44,18 @@ fn cpu_cholesky_solve(h: &Array2<f64>, rhs: &Array2<f64>) -> Array2<f64> {
 
 #[test]
 fn gpu_solver_matches_cpu_to_numeric_tolerance_on_small_input() {
-    let h = Array2::from_shape_vec(
-        (3, 3),
-        vec![4.0, 1.0, 0.5, 1.0, 3.0, 0.2, 0.5, 0.2, 2.0],
-    )
-    .expect("shape should be valid");
+    let h = Array2::from_shape_vec((3, 3), vec![4.0, 1.0, 0.5, 1.0, 3.0, 0.2, 0.5, 0.2, 2.0])
+        .expect("shape should be valid");
     let rhs = Array2::from_shape_vec((3, 1), vec![1.0, -2.0, 0.5]).expect("shape should be valid");
 
     let cpu_sol = cpu_cholesky_solve(&h, &rhs);
 
     if let Ok((gpu_sol, _)) = gam::gpu::solver::cholesky_solve_gpu(h.view(), rhs.view()) {
         for i in 0..cpu_sol.nrows() {
-            assert!(close(gpu_sol[[i, 0]], cpu_sol[[i, 0]], 1e-8), "GPU solver output should match CPU solver output to within numeric tolerance on a small SPD input.");
+            assert!(
+                close(gpu_sol[[i, 0]], cpu_sol[[i, 0]], 1e-8),
+                "GPU solver output should match CPU solver output to within numeric tolerance on a small SPD input."
+            );
         }
     }
 }

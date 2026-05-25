@@ -9929,8 +9929,7 @@ fn sae_manifold_predict_oos<'py>(
             }
             SaeAtomBasisKind::Torus => {
                 let h = n_harmonics_list[atom_idx].unwrap_or(SAE_DEFAULT_TORUS_HARMONICS);
-                let evaluator =
-                    TorusHarmonicEvaluator::new(d, h).map_err(py_value_error)?;
+                let evaluator = TorusHarmonicEvaluator::new(d, h).map_err(py_value_error)?;
                 let basis_size = evaluator.basis_size();
                 plans.push(SaeAtomBuildPlan {
                     kind: SaeAtomBasisKind::Torus,
