@@ -7,8 +7,9 @@ response ~ term + term + ... + option(...)
 ```
 
 Terms are joined with `+`. `*` and `:` are not supported — interactions come
-from multivariate smooths (`s(x1, x2)`, `te(x1, x2)`, `matern(...)`,
-`duchon(...)`), and intrinsic sphere smooths (`sphere(lat, lon)`).
+from multivariate smooths (`s(x1, x2)`, `matern(...)`, `duchon(...)`),
+and intrinsic sphere smooths (`sphere(lat, lon)`). Tensor-product
+formula terms are parsed but not currently built; see below.
 
 This page lists each right-hand-side term, its options, and the
 formula-level configuration terms (`link(...)`, `linkwiggle(...)`,
@@ -166,8 +167,6 @@ y ~ thin_plate(x1, x2)       # alias
 y ~ matern(x1, x2, x3)
 y ~ duchon(x1, x2, x3)
 y ~ sphere(lat, lon)                # intrinsic S² smooth
-y ~ te(x, z)                        # tensor product
-y ~ tensor(x, z)                    # alias
 ```
 
 ### Thin-plate (`tps`, `thinplate`, multivariate `s(...)`)
@@ -241,11 +240,10 @@ the poles.
 
 ### Tensor product (`te`, `tensor`, `interaction`) {#periodic-cyclic-smooths}
 
-Kronecker product of univariate B-spline bases. Each axis has its own
-smoothing parameter. Use when axes have different units (space × time).
-Per-margin `periodic=[...]` with `period=[...]` selects cyclic margins;
-the same options apply to univariate `s(x, periodic=true, period=2*pi)`
-and to 1-D `duchon(...)`.
+The formula parser accepts `te(...)`, `tensor(...)`, and
+`interaction(...)`, but the current Rust term builder does not construct
+a tensor-product smooth from formula terms. These terms currently fail
+with `unsupported smooth type 'tensor'`.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
@@ -267,7 +265,7 @@ value are broadcast across all margins.
 | --- | --- |
 | One covariate | `s(x)` |
 | Two coordinates, same units | `s(x, y)` or `matern(x, y)` |
-| Coordinates in different units | `te(x, t)` |
+| Coordinates in different units | Add separate terms or use a radial smooth with suitable scaling. |
 | Three or more coordinates | `duchon(...)` with `scale_dims=true`, or `matern(...)` |
 | Direct control of wiggliness | `matern(..., nu=...)` |
 | Scale-free behaviour | `duchon(...)` without `length_scale` |
@@ -279,7 +277,7 @@ value are broadcast across all margins.
 | One covariate | `s(x)` (P-spline). |
 | Two coordinates on a sphere (lat, lon) | `sphere(lat, lon)`. |
 | Two Euclidean coordinates in the same units | `s(x, y)` (thin-plate) or `matern(x, y)`. |
-| Coordinates in different units (space × time) | `te(x, t)`. |
+| Coordinates in different units (space × time) | Add separate terms or use a radial smooth with suitable scaling. |
 | 3+ coordinates, especially in different units | `duchon(...)` with `scale_dims=true`, or `matern(...)`. |
 | You want to control wiggliness directly | `matern(...)` with `nu`. |
 | You want scale-free behaviour | `duchon(...)` without `length_scale`. |
@@ -300,8 +298,7 @@ gamfit.fit(df, "y ~ matern(pc1, pc2, pc3, pc4)", scale_dimensions=True)
   remains scale-free.
 - Thin-plate: inputs are automatically standardized; `scale_dims` is
   not a learned anisotropy knob for this family.
-- Tensor: each margin has its own smoothing parameter without this
-  option.
+- Tensor-product formula terms are parsed but not currently built.
 
 ## Link function
 
@@ -400,9 +397,6 @@ Pair it with `survival_likelihood=` on `fit()`. See
 
 # Spatial smooth with per-axis anisotropy
 "z ~ matern(lat, lon, scale_dims=true)"
-
-# Tensor of space x time
-"y ~ te(x_coord, time, k=8)"
 
 # 4-D scale-free Duchon
 "y ~ duchon(pc1, pc2, pc3, pc4, centers=50)"

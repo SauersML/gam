@@ -33,7 +33,7 @@ Pass one of the following via `survival_likelihood=`:
 | --- | --- |
 | `"transformation"` | I-spline monotone log-cumulative-hazard baseline with linear or smooth covariate effects. CLI default. |
 | `"weibull"` | Weibull parametric baseline with linear covariate effects on the log hazard. |
-| `"location-scale"` | Joint location and log-scale survival model; requires a `noise_formula`. See [location-scale.md](location-scale.md). |
+| `"location-scale"` | Joint location and log-scale survival model; `noise_formula` can override the log-scale terms. See [location-scale.md](location-scale.md). |
 | `"marginal-slope"` | Separates a calibrated risk-score effect from the baseline. See [marginal-slope.md](marginal-slope.md). |
 | `"latent"` | Parametric baseline with latent-Gaussian frailty integration. |
 | `"latent-binary"` | Binary response under the same latent-Gaussian framework as `"latent"`. |
@@ -204,7 +204,12 @@ model = gamfit.fit(df,
     baseline_target="weibull",
 )
 
-grid_df = pd.DataFrame({"age": [50, 60, 70], "bmi": [25, 27, 29]})
+grid_df = pd.DataFrame({
+    "entry": [0, 0, 0],
+    "exit": [20, 20, 20],
+    "age": [50, 60, 70],
+    "bmi": [25, 27, 29],
+})
 pred = model.predict(grid_df)
 print(pred.survival_at([1, 5, 10, 20]))
 ```
