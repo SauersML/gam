@@ -706,6 +706,10 @@ impl SaeManifoldRho {
         }
     }
 
+    pub fn lambda_sparse(&self) -> f64 {
+        self.log_lambda_sparse.exp()
+    }
+
     pub fn lambda_smooth(&self) -> f64 {
         self.log_lambda_smooth.exp()
     }

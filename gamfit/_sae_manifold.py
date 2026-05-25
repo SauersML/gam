@@ -289,21 +289,11 @@ def _schedule_payload(schedule: GumbelTemperatureSchedule | Mapping[str, Any] | 
 
 
 def _schedule_tau_start(schedule: Any, default: float) -> float:
-    payload = _schedule_payload(schedule)
-    return default if payload is None else float(payload["tau_start"])
+    return default if (payload := _schedule_payload(schedule)) is None else float(payload["tau_start"])
 
 
 def _r2(x: np.ndarray, fitted: np.ndarray) -> float:
     return 1.0 - float(np.sum((x - fitted) ** 2)) / max(float(np.sum((x - x.mean(axis=0)) ** 2)), 1e-12)
 
 
-__all__ = [
-    "GumbelTemperatureSchedule",
-    "ManifoldSAE",
-    "SaeManifoldAtomFit",
-    "SaeManifoldFitResult",
-    "gumbel_geometric_schedule",
-    "gumbel_linear_schedule",
-    "gumbel_reciprocal_iter_schedule",
-    "sae_manifold_fit",
-]
+__all__ = ["GumbelTemperatureSchedule", "ManifoldSAE", "SaeManifoldAtomFit", "SaeManifoldFitResult", "gumbel_geometric_schedule", "gumbel_linear_schedule", "gumbel_reciprocal_iter_schedule", "sae_manifold_fit"]

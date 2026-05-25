@@ -7,11 +7,11 @@ device-local. NumPy callers use :mod:`gamfit._response_geometry` directly.
 
 from __future__ import annotations
 
-from typing import Any
-
 import torch
 
+from .._binding import rust_module
 from . import _torch_compat as _tc
+from ._coerce import from_numpy_like, to_numpy_f64
 
 
 def _matrix(value: torch.Tensor, *, label: str) -> torch.Tensor:
@@ -181,58 +181,6 @@ def simplex_exp_map(
 _SPHERE_ANTIPODAL_TOL = 1e-12
 
 
-def _append_sphere_candidate(
-    candidates: list[torch.Tensor], candidate: torch.Tensor
-) -> None:
-    c = candidate.reshape(-1)
-    norm = torch.linalg.norm(c)
-    if bool((~_tc.isfinite(norm)).any()) or float(norm) <= 0.0:
-        return
-    c = c / norm
-    for existing in candidates:
-        if abs(float(torch.dot(existing, c))) > 1.0 - 1e-10:
-            return
-    candidates.append(c)
-
-
-def _sphere_orthogonal_unit(vector: torch.Tensor) -> torch.Tensor:
-    v = vector.reshape(-1)
-    axis = _tc.zeros_like(v)
-    axis[int(torch.argmin(v.abs()).item())] = 1.0
-    tangent = axis - torch.dot(axis, v) * v
-    norm = torch.linalg.norm(tangent)
-    if float(norm) <= 0.0:
-        raise ValueError("cannot construct a tangent direction for the spherical mean")
-    return tangent / norm
-
-
-def _sphere_frechet_objective(
-    values: torch.Tensor, weights: torch.Tensor, base: torch.Tensor
-) -> torch.Tensor:
-    dots = (values @ base).clamp(-1.0, 1.0)
-    theta = dots.acos()
-    return (weights * theta * theta).sum()
-
-
-def _sphere_mean_candidates(values: torch.Tensor, weights: torch.Tensor) -> list[torch.Tensor]:
-    candidates: list[torch.Tensor] = []
-    extrinsic = (values * weights[:, None]).sum(dim=0)
-    _append_sphere_candidate(candidates, extrinsic)
-
-    moment = (values * weights[:, None]).transpose(0, 1) @ values
-    _, eigvecs = torch.linalg.eigh(moment)
-    for j in range(eigvecs.shape[1]):
-        _append_sphere_candidate(candidates, eigvecs[:, j])
-        _append_sphere_candidate(candidates, -eigvecs[:, j])
-
-    for row in values[: min(values.shape[0], 16)]:
-        _append_sphere_candidate(candidates, row)
-
-    if not candidates:
-        candidates.append(_sphere_orthogonal_unit(values[0]))
-    return candidates
-
-
 def sphere_frechet_mean(
     values: torch.Tensor,
     weights: torch.Tensor | None = None,
@@ -247,27 +195,13 @@ def sphere_frechet_mean(
     """
     y = _normalize_sphere_tensor(values)
     w = _normalized_weights_tensor(y.shape[0], weights, y)
-    best_mu = None
-    best_obj = float("inf")
-    for candidate in _sphere_mean_candidates(y, w):
-        mu = candidate.clone()
-        try:
-            for _ in range(max_iter):
-                logs = sphere_log_map(y, mu)
-                step = (logs * w[:, None]).sum(dim=0)
-                step_norm = torch.linalg.norm(step)
-                if bool(step_norm < tol):
-                    break
-                mu = sphere_exp_map(step.reshape(1, -1), mu)[0]
-        except ValueError:
-            continue
-        obj = float(_sphere_frechet_objective(y, w, mu))
-        if obj < best_obj:
-            best_obj = obj
-            best_mu = mu
-    if best_mu is None:
-        raise ValueError("spherical Fréchet mean is not identifiable for these points")
-    return best_mu
+    out = rust_module().sphere_frechet_mean(
+        to_numpy_f64(y),
+        to_numpy_f64(w),
+        float(tol),
+        int(max_iter),
+    )
+    return from_numpy_like(out, y)
 
 
 def sphere_log_map(values: torch.Tensor, base: torch.Tensor) -> torch.Tensor:
