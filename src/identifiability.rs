@@ -145,6 +145,65 @@ impl ConditionalPriorIvae {
                 return Err("ConditionalPriorIvae: mean contains non-finite entry".to_string());
             }
         }
+
+        // Khemakhem et al. (arXiv:2107.10098) Theorem 1 identifiability
+        // precondition for the exponential-family conditional prior:
+        // the auxiliary index `u` must yield 2k+1 distinct conditional
+        // priors `p(t|u)` whose sufficient-statistic parameters
+        // `(η_1(u), η_2(u)) = (μ(u)/σ(u)², −1/(2σ(u)²))` span a
+        // 2k-dimensional set. For the diagonal Gaussian family this is
+        // equivalent (an invertible reparameterisation) to requiring that
+        // the stacked signature `S = [μ(u) ‖ log σ(u)]` of shape
+        // (n_rows, 2k) have rank 2k, with at least 2k+1 distinct rows.
+        let (n_rows, latent_dim) = mean.dim();
+        let needed_rows = 2 * latent_dim + 1;
+        if n_rows < needed_rows {
+            return Err(format!(
+                "ConditionalPriorIvae: Khemakhem (arXiv:2107.10098) Theorem 1 \
+                 precondition violated: need at least 2k+1 = {needed_rows} distinct \
+                 auxiliary states for latent_dim k = {latent_dim}, got n_rows = {n_rows}"
+            ));
+        }
+        let signature = {
+            let mut s = Array2::<f64>::zeros((n_rows, 2 * latent_dim));
+            for r in 0..n_rows {
+                for c in 0..latent_dim {
+                    s[[r, c]] = mean[[r, c]];
+                    s[[r, latent_dim + c]] = scale[[r, c]].ln();
+                }
+            }
+            s
+        };
+        let first = signature.row(0).to_owned();
+        let all_identical = signature
+            .outer_iter()
+            .all(|row| row.iter().zip(first.iter()).all(|(a, b)| a == b));
+        if all_identical {
+            return Err(format!(
+                "ConditionalPriorIvae: Khemakhem (arXiv:2107.10098) Theorem 1 \
+                 precondition violated: all {n_rows} rows of the stacked auxiliary \
+                 signature [μ ‖ log σ] are identical, so the conditional prior is the \
+                 trivial unconditional N(μ, σ²) — provably non-identifiable (no \
+                 auxiliary information)"
+            ));
+        }
+        let (_u, sv, _vt) = signature
+            .svd(false, false)
+            .map_err(|e| format!("ConditionalPriorIvae: SVD of auxiliary signature failed: {e}"))?;
+        let max_sv = sv.iter().cloned().fold(0.0_f64, f64::max);
+        let tol = max_sv * (n_rows.max(2 * latent_dim) as f64) * f64::EPSILON;
+        let numerical_rank = sv.iter().filter(|&&s| s > tol).count();
+        let required = 2 * latent_dim;
+        if numerical_rank < required {
+            return Err(format!(
+                "ConditionalPriorIvae: Khemakhem (arXiv:2107.10098) Theorem 1 \
+                 precondition violated: stacked auxiliary signature [μ ‖ log σ] has \
+                 numerical rank {numerical_rank} < 2·latent_dim = {required} \
+                 (tolerance {tol:.3e}); the family `p(t|u)` does not span a \
+                 2k-dimensional set of natural parameters"
+            ));
+        }
+
         Ok(Self {
             mean,
             scale,

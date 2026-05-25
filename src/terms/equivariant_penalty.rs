@@ -175,6 +175,13 @@ fn equivariant_rotation(
     }
 }
 
+/// Computes a weighted projection residual for each atom and batch:
+/// 0.5 * z[b, a] * ||P_perp W_a rho(g_ba)||_F^2, where
+/// P_perp = I - W_a (W_a^T W_a + eps I)^-1 W_a^T.
+///
+/// This is not the commutator W rho(g) - rho(g) W. It measures the
+/// Frobenius-norm energy in the rotated basis columns that falls outside the
+/// column space of W_a.
 pub fn equivariant_penalty_value(
     group: &str,
     w: ArrayView3<'_, f64>,
@@ -219,7 +226,7 @@ pub fn equivariant_penalty_value(
         }
     }
 
-    let mut comm_total = 0.0_f64;
+    let mut projection_total = 0.0_f64;
     for atom in 0..n_atoms {
         let mut wtw = vec![vec![0.0_f64; rep_dim]; rep_dim];
         for r1 in 0..rep_dim {
@@ -260,18 +267,20 @@ pub fn equivariant_penalty_value(
             let solve = square_matmul(&inv, &cross, rep_dim);
             let mut sq = 0.0_f64;
             for d in 0..ambient_dim {
-                let mut projection_col0 = 0.0_f64;
-                for r_col in 0..rep_dim {
-                    projection_col0 += w[[atom, d, r_col]] * solve[r_col][0];
+                for s_col in 0..rep_dim {
+                    let mut projection = 0.0_f64;
+                    for r_col in 0..rep_dim {
+                        projection += w[[atom, d, r_col]] * solve[r_col][s_col];
+                    }
+                    let residual = w_rot[d][s_col] - projection;
+                    sq += residual * residual;
                 }
-                let residual = w_rot[d][0] - projection_col0;
-                sq += residual * residual;
             }
-            comm_total += 0.5 * z[[batch, atom]] * sq;
+            projection_total += 0.5 * z[[batch, atom]] * sq;
         }
     }
 
-    let mut value = weight * comm_total / ((batches * n_atoms) as f64);
+    let mut value = weight * projection_total / ((batches * n_atoms) as f64);
     if let Some(log_bw) = log_bandwidth {
         if ard_weight > 0.0 {
             let mut bw_value = 0.0_f64;
