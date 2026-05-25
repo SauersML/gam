@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from html import escape
-from typing import Any
+from types import MappingProxyType
+from typing import Any, Mapping
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,7 +25,10 @@ class FormulaValidation:
     True
     """
 
-    payload: dict[str, Any]
+    payload: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "payload", MappingProxyType(dict(self.payload)))
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "FormulaValidation":
@@ -32,7 +36,7 @@ class FormulaValidation:
 
         Parameters
         ----------
-        payload : dict
+        payload : Mapping
             Mapping of validation keys to values, as produced by the Rust
             validator.
 
