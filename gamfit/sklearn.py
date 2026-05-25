@@ -7,9 +7,10 @@ import numpy as np
 from sklearn.base import BaseEstimator, ClassifierMixin, RegressorMixin
 from sklearn.utils.validation import check_is_fitted
 
+from ._binding import rust_module
 from ._api import fit as fit_model
 from ._model import Model
-from ._tables import attach_target, response_column_name, table_columns
+from ._tables import attach_target, table_columns
 
 __all__ = ["GAMClassifier", "GAMRegressor"]
 
@@ -23,35 +24,34 @@ _BaseT = TypeVar("_BaseT", bound="_BaseGAMEstimator")
 # the SurvivalPrediction object returned by Model.predict.
 
 
-def _resolved_formula(formula: str, target_name: str) -> str:
-    if "~" in formula:
-        _lhs, rhs = formula.split("~", 1)
-        return f"{target_name} ~ {rhs.strip()}"
-    return f"{target_name} ~ {formula.strip()}"
-
-
 def _prepare_fit_input(X: Any, y: Any, formula: str) -> tuple[Any, str, list[str]]:
+    rust = rust_module()
     if isinstance(y, str):
         columns, _kind = table_columns(X)
-        if y not in columns:
-            raise ValueError(f"target column '{y}' is missing from the training table")
-        feature_names = [name for name in columns if name != y]
-        return X, _resolved_formula(formula, y), feature_names
+        fit_formula, feature_names, _target_name = rust.sklearn_fit_metadata(
+            list(columns),
+            formula,
+            y,
+            False,
+        )
+        return X, fit_formula, list(feature_names)
+    columns, _kind = table_columns(X)
     if y is None:
-        target_name = response_column_name(formula)
-        if target_name is None:
-            raise ValueError("formula must include a response when y is not provided")
-        columns, _kind = table_columns(X)
-        if target_name not in columns:
-            raise ValueError(
-                f"response column '{target_name}' is missing from the training table"
-            )
-        feature_names = [name for name in columns if name != target_name]
-        return X, formula, feature_names
-    target_name = response_column_name(formula) or "y"
+        fit_formula, feature_names, _target_name = rust.sklearn_fit_metadata(
+            list(columns),
+            formula,
+            None,
+            False,
+        )
+        return X, fit_formula, list(feature_names)
+    fit_formula, feature_names, target_name = rust.sklearn_fit_metadata(
+        list(columns),
+        formula,
+        None,
+        True,
+    )
     bound_columns, _kind = attach_target(X, y, target_name=target_name)
-    feature_names = [name for name in bound_columns if name != target_name]
-    return bound_columns, _resolved_formula(formula, target_name), feature_names
+    return bound_columns, fit_formula, list(feature_names)
 
 
 @dataclass
