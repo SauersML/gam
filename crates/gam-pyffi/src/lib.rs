@@ -13602,8 +13602,8 @@ impl SparsityPenalty {
         payload.set_item("weight", self.weight.bind(py))?;
         payload.set_item("eps", self.eps)?;
         payload.set_item("eps_weight", &self.eps_weight)?;
-        if let Some(schedule) = &self.weight_schedule {
-            payload.set_item("weight_schedule", schedule.bind(py))?;
+        if let Some(schedule) = topk_weight_schedule_descriptor(py, &self.weight_schedule)? {
+            payload.set_item("weight_schedule", schedule)?;
         }
         Ok(payload.into())
     }
@@ -13944,7 +13944,7 @@ fn validate_aux_conditional_prior_lambda(
     weight: f64,
     n_eff: i64,
 ) -> PyResult<()> {
-    if weight <= 0.0 {
+    if !(weight > 0.0) {
         return Err(PyValueError::new_err(format!(
             "AuxConditionalPriorPenalty.weight must be > 0, got {weight}"
         )));
@@ -14026,11 +14026,15 @@ impl AuxConditionalPriorPenalty {
     fn new(
         py: Python<'_>,
         lambda_per_row: &Bound<'_, PyAny>,
-        weight: f64,
-        n_eff: i64,
-        learnable: bool,
+        weight: &Bound<'_, PyAny>,
+        n_eff: &Bound<'_, PyAny>,
+        learnable: &Bound<'_, PyAny>,
         target: PyObject,
     ) -> PyResult<Self> {
+        let builtins = py.import("builtins")?;
+        let weight = builtins.getattr("float")?.call1((weight,))?.extract::<f64>()?;
+        let n_eff = builtins.getattr("int")?.call1((n_eff,))?.extract::<i64>()?;
+        let learnable = learnable.is_truthy()?;
         let lambda_per_row = aux_conditional_prior_float_array(py, lambda_per_row)?;
         validate_aux_conditional_prior_lambda(&lambda_per_row, weight, n_eff)?;
         Ok(Self {
