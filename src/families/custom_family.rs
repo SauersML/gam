@@ -11468,7 +11468,6 @@ fn compute_kkt_refusal_report(
     total_p: usize,
     ridge: f64,
     ridge_policy: RidgePolicy,
-    joint_solver_diagonal_ridge: f64,
     accepted_step_inf: f64,
     proposal_step_inf: f64,
     trust_radius: f64,
@@ -11527,13 +11526,15 @@ fn compute_kkt_refusal_report(
         .collect();
 
     let residual_vec_opt = cached_joint_gradient.and_then(|joint_grad| {
-        exact_newton_joint_stationarity_vector_from_gradient(
+        exact_newton_joint_projected_stationarity_vector_from_gradient(
             joint_grad,
             states,
             specs,
             s_lambdas,
             ridge,
             ridge_policy,
+            block_constraints,
+            Some(cached_active_sets),
         )
         .ok()
     });
@@ -11572,7 +11573,12 @@ fn compute_kkt_refusal_report(
             "KKT refusal diagnostic spectrum",
         )
     {
-        add_joint_penalty_to_matrix(&mut h_joint, ranges, s_lambdas, joint_solver_diagonal_ridge);
+        let model_diagonal_ridge = if ridge_policy.include_quadratic_penalty && ridge > 0.0 {
+            ridge
+        } else {
+            0.0
+        };
+        add_joint_penalty_to_matrix(&mut h_joint, ranges, s_lambdas, model_diagonal_ridge);
         symmetrize_dense_in_place(&mut h_joint);
         if let Ok((evals, evecs)) = FaerEigh::eigh(&h_joint, Side::Lower) {
             let mut sorted: Vec<f64> = evals.iter().copied().collect();
@@ -12564,257 +12570,265 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             let solve_joint_constraints_dense = joint_constraints.is_some()
                 || !matrix_free_joint_requested
                 || joint_hessian_is_dense;
-            let (candidate_beta, joint_active_set, joint_step_spectral_nullity) = if solve_joint_constraints_dense
-                && let Some(constraints) = joint_constraints.as_ref()
-            {
-                let mut lhs = match materialize_joint_hessian_source(
-                    &joint_hessian_source,
-                    total_p,
-                    "joint Newton inner constrained Hessian materialization",
-                ) {
-                    Ok(matrix) => matrix,
-                    Err(_) => break,
-                };
-                add_joint_penalty_to_matrix(&mut lhs, &ranges, &s_lambdas, trace_diagonal_ridge);
-                if joint_solver_diagonal_ridge != trace_diagonal_ridge {
-                    for d in 0..lhs.nrows() {
-                        lhs[[d, d]] += joint_solver_diagonal_ridge - trace_diagonal_ridge;
-                    }
-                }
-                check_linear_feasibility(&beta_joint, constraints, 1e-8)
-                    .map_err(|e| format!("joint Newton constrained solve: {e}"))?;
-                let warm_joint_active =
-                    flatten_joint_active_set(&cached_active_sets, &block_constraints);
-                let lower_bounds = match extract_simple_lower_bounds(constraints, total_p) {
-                    Ok(bounds) => bounds,
-                    Err(_) => break,
-                };
-                // Newton IRLS step in absolute-β space:
-                //
-                //   β_new = H_pen⁻¹ (H_L β + ∇ℓ)
-                //
-                // where H_pen = H_L + S, derived from Newton's update
-                //   β_new = β + H_pen⁻¹(∇ℓ − Sβ)
-                //         = H_pen⁻¹(H_pen β + ∇ℓ − Sβ)
-                //         = H_pen⁻¹(H_L β + ∇ℓ).
-                //
-                // The QP `min 0.5 β' H_pen β − rhs_beta' β` has unconstrained
-                // optimum β = H_pen⁻¹ rhs_beta, so rhs_beta = H_pen β + (∇ℓ − Sβ)
-                // gives the correct Newton update. Passing raw grad_joint (=∇ℓ)
-                // would collapse to β = H_pen⁻¹ ∇ℓ, which at the true optimum
-                // (∇ℓ = Sβ̂) gives H_pen⁻¹ Sβ̂ ≠ β̂ — wrong fixed point.
-                let penalty_beta_joint = apply_joint_block_penalty(
-                    &ranges,
-                    &s_lambdas,
-                    &beta_joint,
-                    joint_mode_diagonal_ridge,
-                );
-                let rhs_step = &grad_joint - &penalty_beta_joint;
-                let rhs_beta = &lhs.dot(&beta_joint) + &rhs_step;
-                let solve_result = if let Some(bounds) = lower_bounds.as_ref() {
-                    solve_quadratic_with_simple_lower_bounds(
-                        &lhs,
-                        &rhs_beta,
-                        &beta_joint,
-                        bounds,
-                        warm_joint_active.as_deref(),
-                    )
-                } else {
-                    solve_quadratic_with_linear_constraints(
-                        &lhs,
-                        &rhs_beta,
-                        &beta_joint,
-                        constraints,
-                        warm_joint_active.as_deref(),
-                    )
-                    .map_err(|e| e.to_string())
-                };
-                match solve_result {
-                    Ok((beta_new, active_set)) => (beta_new, Some(active_set), 0usize),
-                    Err(_) => break,
-                }
-            } else {
-                // Stationarity residual: r = S*beta - gradient (for penalized NLL)
-                let penalty_beta = apply_joint_block_penalty(
-                    &ranges,
-                    &s_lambdas,
-                    &beta_joint,
-                    joint_mode_diagonal_ridge,
-                );
-                let rhs = &grad_joint - &penalty_beta;
-                let grad_inf_for_solve = grad_joint
-                    .iter()
-                    .map(|x: &f64| x.abs())
-                    .fold(0.0_f64, f64::max);
-                let penalty_inf_for_solve = penalty_beta
-                    .iter()
-                    .map(|x: &f64| x.abs())
-                    .fold(0.0_f64, f64::max);
-                let residual_tol_for_solve =
-                    inner_tol * (1.0 + grad_inf_for_solve.max(penalty_inf_for_solve));
-                let pcg_started = std::time::Instant::now();
-                let pcg_requested = matrix_free_joint_requested && !joint_hessian_is_dense;
-                let mut spectral_nullity_for_step = 0usize;
-                let mut delta = if pcg_requested {
-                    let preconditioner_diag = match &joint_hessian_source {
-                        JointHessianSource::Dense(h_joint) => joint_penalty_preconditioner_diag(
-                            &h_joint.diag().to_owned(),
-                            &ranges,
-                            &s_lambdas,
-                            joint_solver_diagonal_ridge,
-                        ),
-                        JointHessianSource::Operator { diagonal, .. } => {
-                            joint_penalty_preconditioner_diag(
-                                diagonal,
-                                &ranges,
-                                &s_lambdas,
-                                joint_solver_diagonal_ridge,
-                            )
-                        }
-                    };
-                    // Pre-allocate the penalty workspace ONCE outside the
-                    // PCG closure so each CG iter (called hundreds-to-
-                    // thousands of times per outer iter at biobank scale)
-                    // reuses the buffer instead of allocating per call.
-                    // RefCell because solve_spd_pcg* expects `Fn` (immutable
-                    // borrow of captures) and we need interior mutability
-                    // to write into the workspace.
-                    let penalty_workspace = RefCell::new(Array1::<f64>::zeros(total_p));
-                    match &joint_hessian_source {
-                        JointHessianSource::Dense(h_joint) => {
-                            crate::linalg::utils::solve_spd_pcg_with_info_into(
-                                |v, out| {
-                                    // h_joint * v -> out (faer-backed, no alloc)
-                                    crate::faer_ndarray::fast_av_view_into(
-                                        h_joint,
-                                        v,
-                                        out.view_mut(),
-                                    );
-                                    let mut pen = penalty_workspace.borrow_mut();
-                                    apply_joint_block_penalty_into(
-                                        &ranges,
-                                        &s_lambdas,
-                                        v,
-                                        joint_solver_diagonal_ridge,
-                                        &mut pen,
-                                    );
-                                    *out += &*pen;
-                                },
-                                &rhs,
-                                &preconditioner_diag,
-                                pcg_rel_tol,
-                                JOINT_PCG_MAX_ITER_MULTIPLIER * total_p.max(1),
-                            )
-                            .map(|(solution, info)| {
-                                log_joint_pcg_diagnostics(
-                                    cycle,
-                                    total_p,
-                                    total_joint_n,
-                                    &preconditioner_diag,
-                                    &info,
-                                );
-                                solution
-                            })
-                        }
-                        JointHessianSource::Operator { apply_into, .. } => {
-                            let apply_h_into = Arc::clone(apply_into);
-                            crate::linalg::utils::solve_spd_pcg_with_info_into(
-                                |v, out| {
-                                    if let Err(error) = apply_h_into(v, out) {
-                                        log::warn!(
-                                            "joint Newton inner operator matvec failed: {error}"
-                                        );
-                                        out.fill(0.0);
-                                    }
-                                    let mut pen = penalty_workspace.borrow_mut();
-                                    apply_joint_block_penalty_into(
-                                        &ranges,
-                                        &s_lambdas,
-                                        v,
-                                        joint_solver_diagonal_ridge,
-                                        &mut pen,
-                                    );
-                                    *out += &*pen;
-                                },
-                                &rhs,
-                                &preconditioner_diag,
-                                pcg_rel_tol,
-                                JOINT_PCG_MAX_ITER_MULTIPLIER * total_p.max(1),
-                            )
-                            .map(|(solution, info)| {
-                                log_joint_pcg_diagnostics(
-                                    cycle,
-                                    total_p,
-                                    total_joint_n,
-                                    &preconditioner_diag,
-                                    &info,
-                                );
-                                solution
-                            })
-                        }
-                    }
-                } else {
-                    None
-                };
-                if pcg_requested {
-                    log::info!(
-                        "[PIRLS/joint-PCG] cycle {:>3} | n={} p={} solved={} elapsed={:.3}s",
-                        cycle,
-                        total_joint_n,
-                        total_p,
-                        delta.is_some(),
-                        pcg_started.elapsed().as_secs_f64()
-                    );
-                }
-                if delta.is_none() {
-                    if pcg_requested {
-                        break;
-                    }
-                    let mut lhs_true = match materialize_joint_hessian_source(
+            let (candidate_beta, joint_active_set, joint_step_spectral_nullity) =
+                if solve_joint_constraints_dense
+                    && let Some(constraints) = joint_constraints.as_ref()
+                {
+                    let mut lhs = match materialize_joint_hessian_source(
                         &joint_hessian_source,
                         total_p,
-                        "joint Newton inner dense fallback Hessian materialization",
+                        "joint Newton inner constrained Hessian materialization",
                     ) {
                         Ok(matrix) => matrix,
                         Err(_) => break,
                     };
                     add_joint_penalty_to_matrix(
-                        &mut lhs_true,
+                        &mut lhs,
                         &ranges,
                         &s_lambdas,
+                        trace_diagonal_ridge,
+                    );
+                    if joint_solver_diagonal_ridge != trace_diagonal_ridge {
+                        for d in 0..lhs.nrows() {
+                            lhs[[d, d]] += joint_solver_diagonal_ridge - trace_diagonal_ridge;
+                        }
+                    }
+                    check_linear_feasibility(&beta_joint, constraints, 1e-8)
+                        .map_err(|e| format!("joint Newton constrained solve: {e}"))?;
+                    let warm_joint_active =
+                        flatten_joint_active_set(&cached_active_sets, &block_constraints);
+                    let lower_bounds = match extract_simple_lower_bounds(constraints, total_p) {
+                        Ok(bounds) => bounds,
+                        Err(_) => break,
+                    };
+                    // Newton IRLS step in absolute-β space:
+                    //
+                    //   β_new = H_pen⁻¹ (H_L β + ∇ℓ)
+                    //
+                    // where H_pen = H_L + S, derived from Newton's update
+                    //   β_new = β + H_pen⁻¹(∇ℓ − Sβ)
+                    //         = H_pen⁻¹(H_pen β + ∇ℓ − Sβ)
+                    //         = H_pen⁻¹(H_L β + ∇ℓ).
+                    //
+                    // The QP `min 0.5 β' H_pen β − rhs_beta' β` has unconstrained
+                    // optimum β = H_pen⁻¹ rhs_beta, so rhs_beta = H_pen β + (∇ℓ − Sβ)
+                    // gives the correct Newton update. Passing raw grad_joint (=∇ℓ)
+                    // would collapse to β = H_pen⁻¹ ∇ℓ, which at the true optimum
+                    // (∇ℓ = Sβ̂) gives H_pen⁻¹ Sβ̂ ≠ β̂ — wrong fixed point.
+                    let penalty_beta_joint = apply_joint_block_penalty(
+                        &ranges,
+                        &s_lambdas,
+                        &beta_joint,
                         joint_mode_diagonal_ridge,
                     );
-                    let spectral_step = solve_joint_newton_step_on_spectral_range(
-                        &lhs_true,
-                        &rhs,
-                        KKT_REFUSAL_RANK_TOL,
-                        residual_tol_for_solve,
-                    )?;
-                    spectral_nullity_for_step = spectral_step.nullity;
-                    if spectral_step.nullity > 0 {
-                        log::debug!(
-                            "[PIRLS/joint-Newton] spectral reduced solve: nullity@{:.0e}={}/{} \
-                             |P0 rhs|∞={:.3e} |P+ rhs|∞={:.3e} λ_min+={:.3e} λ_max={:.3e}",
-                            spectral_step.rank_tol,
-                            spectral_step.nullity,
+                    let rhs_step = &grad_joint - &penalty_beta_joint;
+                    let rhs_beta = &lhs.dot(&beta_joint) + &rhs_step;
+                    let solve_result = if let Some(bounds) = lower_bounds.as_ref() {
+                        solve_quadratic_with_simple_lower_bounds(
+                            &lhs,
+                            &rhs_beta,
+                            &beta_joint,
+                            bounds,
+                            warm_joint_active.as_deref(),
+                        )
+                    } else {
+                        solve_quadratic_with_linear_constraints(
+                            &lhs,
+                            &rhs_beta,
+                            &beta_joint,
+                            constraints,
+                            warm_joint_active.as_deref(),
+                        )
+                        .map_err(|e| e.to_string())
+                    };
+                    match solve_result {
+                        Ok((beta_new, active_set)) => (beta_new, Some(active_set), 0usize),
+                        Err(_) => break,
+                    }
+                } else {
+                    // Stationarity residual: r = S*beta - gradient (for penalized NLL)
+                    let penalty_beta = apply_joint_block_penalty(
+                        &ranges,
+                        &s_lambdas,
+                        &beta_joint,
+                        joint_mode_diagonal_ridge,
+                    );
+                    let rhs = &grad_joint - &penalty_beta;
+                    let grad_inf_for_solve = grad_joint
+                        .iter()
+                        .map(|x: &f64| x.abs())
+                        .fold(0.0_f64, f64::max);
+                    let penalty_inf_for_solve = penalty_beta
+                        .iter()
+                        .map(|x: &f64| x.abs())
+                        .fold(0.0_f64, f64::max);
+                    let residual_tol_for_solve =
+                        inner_tol * (1.0 + grad_inf_for_solve.max(penalty_inf_for_solve));
+                    let pcg_started = std::time::Instant::now();
+                    let pcg_requested = matrix_free_joint_requested && !joint_hessian_is_dense;
+                    let mut spectral_nullity_for_step = 0usize;
+                    let mut delta = if pcg_requested {
+                        let preconditioner_diag = match &joint_hessian_source {
+                            JointHessianSource::Dense(h_joint) => {
+                                joint_penalty_preconditioner_diag(
+                                    &h_joint.diag().to_owned(),
+                                    &ranges,
+                                    &s_lambdas,
+                                    joint_solver_diagonal_ridge,
+                                )
+                            }
+                            JointHessianSource::Operator { diagonal, .. } => {
+                                joint_penalty_preconditioner_diag(
+                                    diagonal,
+                                    &ranges,
+                                    &s_lambdas,
+                                    joint_solver_diagonal_ridge,
+                                )
+                            }
+                        };
+                        // Pre-allocate the penalty workspace ONCE outside the
+                        // PCG closure so each CG iter (called hundreds-to-
+                        // thousands of times per outer iter at biobank scale)
+                        // reuses the buffer instead of allocating per call.
+                        // RefCell because solve_spd_pcg* expects `Fn` (immutable
+                        // borrow of captures) and we need interior mutability
+                        // to write into the workspace.
+                        let penalty_workspace = RefCell::new(Array1::<f64>::zeros(total_p));
+                        match &joint_hessian_source {
+                            JointHessianSource::Dense(h_joint) => {
+                                crate::linalg::utils::solve_spd_pcg_with_info_into(
+                                    |v, out| {
+                                        // h_joint * v -> out (faer-backed, no alloc)
+                                        crate::faer_ndarray::fast_av_view_into(
+                                            h_joint,
+                                            v,
+                                            out.view_mut(),
+                                        );
+                                        let mut pen = penalty_workspace.borrow_mut();
+                                        apply_joint_block_penalty_into(
+                                            &ranges,
+                                            &s_lambdas,
+                                            v,
+                                            joint_solver_diagonal_ridge,
+                                            &mut pen,
+                                        );
+                                        *out += &*pen;
+                                    },
+                                    &rhs,
+                                    &preconditioner_diag,
+                                    pcg_rel_tol,
+                                    JOINT_PCG_MAX_ITER_MULTIPLIER * total_p.max(1),
+                                )
+                                .map(|(solution, info)| {
+                                    log_joint_pcg_diagnostics(
+                                        cycle,
+                                        total_p,
+                                        total_joint_n,
+                                        &preconditioner_diag,
+                                        &info,
+                                    );
+                                    solution
+                                })
+                            }
+                            JointHessianSource::Operator { apply_into, .. } => {
+                                let apply_h_into = Arc::clone(apply_into);
+                                crate::linalg::utils::solve_spd_pcg_with_info_into(
+                                    |v, out| {
+                                        if let Err(error) = apply_h_into(v, out) {
+                                            log::warn!(
+                                                "joint Newton inner operator matvec failed: {error}"
+                                            );
+                                            out.fill(0.0);
+                                        }
+                                        let mut pen = penalty_workspace.borrow_mut();
+                                        apply_joint_block_penalty_into(
+                                            &ranges,
+                                            &s_lambdas,
+                                            v,
+                                            joint_solver_diagonal_ridge,
+                                            &mut pen,
+                                        );
+                                        *out += &*pen;
+                                    },
+                                    &rhs,
+                                    &preconditioner_diag,
+                                    pcg_rel_tol,
+                                    JOINT_PCG_MAX_ITER_MULTIPLIER * total_p.max(1),
+                                )
+                                .map(|(solution, info)| {
+                                    log_joint_pcg_diagnostics(
+                                        cycle,
+                                        total_p,
+                                        total_joint_n,
+                                        &preconditioner_diag,
+                                        &info,
+                                    );
+                                    solution
+                                })
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    if pcg_requested {
+                        log::info!(
+                            "[PIRLS/joint-PCG] cycle {:>3} | n={} p={} solved={} elapsed={:.3}s",
+                            cycle,
+                            total_joint_n,
                             total_p,
-                            spectral_step.null_rhs_inf,
-                            spectral_step.range_rhs_inf,
-                            spectral_step.lambda_min_positive,
-                            spectral_step.lambda_max_abs,
+                            delta.is_some(),
+                            pcg_started.elapsed().as_secs_f64()
                         );
                     }
-                    delta = Some(spectral_step.delta);
-                }
+                    if delta.is_none() {
+                        if pcg_requested {
+                            break;
+                        }
+                        let mut lhs_true = match materialize_joint_hessian_source(
+                            &joint_hessian_source,
+                            total_p,
+                            "joint Newton inner dense fallback Hessian materialization",
+                        ) {
+                            Ok(matrix) => matrix,
+                            Err(_) => break,
+                        };
+                        add_joint_penalty_to_matrix(
+                            &mut lhs_true,
+                            &ranges,
+                            &s_lambdas,
+                            joint_mode_diagonal_ridge,
+                        );
+                        let spectral_step = solve_joint_newton_step_on_spectral_range(
+                            &lhs_true,
+                            &rhs,
+                            KKT_REFUSAL_RANK_TOL,
+                            residual_tol_for_solve,
+                        )?;
+                        spectral_nullity_for_step = spectral_step.nullity;
+                        if spectral_step.nullity > 0 {
+                            log::debug!(
+                                "[PIRLS/joint-Newton] spectral reduced solve: nullity@{:.0e}={}/{} \
+                             |P0 rhs|∞={:.3e} |P+ rhs|∞={:.3e} λ_min+={:.3e} λ_max={:.3e}",
+                                spectral_step.rank_tol,
+                                spectral_step.nullity,
+                                total_p,
+                                spectral_step.null_rhs_inf,
+                                spectral_step.range_rhs_inf,
+                                spectral_step.lambda_min_positive,
+                                spectral_step.lambda_max_abs,
+                            );
+                        }
+                        delta = Some(spectral_step.delta);
+                    }
 
-                let Some(delta) = delta else {
-                    break; // Fall back to blockwise
+                    let Some(delta) = delta else {
+                        break; // Fall back to blockwise
+                    };
+                    if !delta.iter().all(|v| v.is_finite()) {
+                        break; // Fall back to blockwise
+                    }
+                    (beta_joint.clone() + &delta, None, spectral_nullity_for_step)
                 };
-                if !delta.iter().all(|v| v.is_finite()) {
-                    break; // Fall back to blockwise
-                }
-                (beta_joint.clone() + &delta, None, spectral_nullity_for_step)
-            };
             // Hessian-source build (and any QP solve immediately above) are
             // done by the time we reach `delta`. Capture the wall-clock
             // before the line-search phase so the end-of-cycle summary can
@@ -13815,7 +13829,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         total_p,
                         ridge,
                         options.ridge_policy,
-                        joint_solver_diagonal_ridge,
                         accepted_step_inf,
                         step_inf,
                         joint_trust_radius,

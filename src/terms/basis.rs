@@ -9438,6 +9438,7 @@ pub fn build_thin_plate_basiswithworkspace(
         penaltyinfo,
         ops,
         null_eigenvectors,
+        joint_null_rotation: None,
         metadata: BasisMetadata::ThinPlate {
             centers: original_centers,
             length_scale: spec.length_scale,
@@ -21520,6 +21521,7 @@ fn build_periodic_duchon_basis_1d(
         penaltyinfo,
         ops,
         null_eigenvectors,
+        joint_null_rotation: None,
         metadata: BasisMetadata::Duchon {
             centers,
             length_scale: spec.length_scale,
@@ -21768,6 +21770,7 @@ fn build_duchon_basis_mixed_periodicity(
         penaltyinfo,
         ops,
         null_eigenvectors,
+        joint_null_rotation: None,
         metadata: BasisMetadata::Duchon {
             centers: centers_owned,
             length_scale: None,
@@ -22141,6 +22144,7 @@ pub fn build_duchon_basiswithworkspace(
         penaltyinfo,
         ops,
         null_eigenvectors,
+        joint_null_rotation: None,
         metadata: BasisMetadata::Duchon {
             centers,
             length_scale: spec.length_scale,

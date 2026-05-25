@@ -27,6 +27,7 @@ use crate::families::scale_design::{
     build_scale_deviation_operator, build_scale_deviation_transform_design,
     infer_non_intercept_start_design,
 };
+use crate::families::sigma_link::{exp_neg_stable, exp_sigma_inverse_from_eta_scalar};
 use crate::families::survival::{OffsetChannelCurvatures, OffsetChannelResiduals};
 use crate::matrix::{
     BlockDesignOperator, DenseDesignMatrix, DesignBlock, DesignMatrix, EmbeddedColumnBlock,
@@ -175,28 +176,13 @@ fn softplus(x: f64) -> f64 {
 // to large finite values that the monotonicity floor and penalty then control.
 // ---------------------------------------------------------------------------
 
-/// Maximum exponent argument for overflow-safe exp in the survival chain.
-/// exp(500) ≈ 1.4e217 leaves ~91 orders of magnitude of headroom before
-/// reaching MAX ≈ 1.8e308, sufficient for any reasonable multiplicative chain.
-const EXP_NEG_STABLE_MAX_ARG: f64 = 500.0;
-
-/// Overflow-safe exp(-x): guards against overflow when x is very negative
-/// (i.e. exp(-x) very large) by capping the exponent at +500, but allows
-/// natural IEEE 754 underflow to 0.0 when x is very positive.
-///
-/// The one-sided guard is critical: for x = 701 the correct value is
-/// exp(-701) ≈ 5e-305 (essentially zero), NOT exp(-500) ≈ 7e-218.
-/// A two-sided clamp would return the latter, which is ~1e87× too large
-/// and destroys far-tail exact derivatives.
-#[inline]
-fn exp_neg_stable(x: f64) -> f64 {
-    (-x).min(EXP_NEG_STABLE_MAX_ARG).exp()
-}
-
-#[inline]
-fn exp_sigma_inverse_from_eta_scalar(eta: f64) -> f64 {
-    exp_neg_stable(eta)
-}
+// Layer 1 (one-sided overflow guard on the inverse-sigma link), its
+// helper `exp_neg_stable`, and `exp_sigma_inverse_from_eta_scalar` now
+// live in `crate::families::sigma_link` so every consumer — solver
+// internals here, `main.rs` callers, and any Rust↔Python boundary
+// code — picks up the same clamp. Keeping a local copy here previously
+// allowed silent semantic divergence between the canonical sigma_link
+// version (unclamped) and the survival-local clamped version.
 
 /// Layer 3 defense: clamp products that overflow to ±inf back to ±MAX.
 /// With layer 1 (exp_neg_stable) active this should not trigger in normal
@@ -9162,25 +9148,25 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         block_states: &[ParameterBlockState],
         block_idx: usize,
         block_spec: &ParameterBlockSpec,
-        mut beta: Array1<f64>,
+        beta: Array1<f64>,
     ) -> Result<Array1<f64>, String> {
         assert!(block_states.len() <= isize::MAX as usize);
         assert!(!block_spec.name.is_empty());
         if block_idx == Self::BLOCK_TIME
             && let Some(constraints) = self.time_linear_constraints.as_ref()
         {
-            if beta.len() != constraints.a.ncols() {
-                return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
-                    "survival location-scale time post-update dimension mismatch: beta={}, constraints={}",
-                    beta.len(),
-                    constraints.a.ncols()
-                ) }.into());
-            }
-            beta = project_onto_linear_constraints(beta.len(), constraints, Some(&beta));
+            validate_linear_constraints("time post-update", &beta, constraints)?;
         } else if block_idx == Self::BLOCK_LINK_WIGGLE && self.x_link_wiggle.is_some() {
             for j in 0..beta.len() {
-                if beta[j] < 0.0 {
-                    beta[j] = 0.0;
+                let tol = 1e-10 * beta[j].abs().max(1.0);
+                if !beta[j].is_finite() || beta[j] < -tol {
+                    return Err(SurvivalLocationScaleError::ConstraintViolation {
+                        reason: format!(
+                            "survival location-scale link-wiggle post-update violates represented nonnegativity at coefficient {j}: value={:.3e}, tol={:.3e}",
+                            beta[j], tol
+                        ),
+                    }
+                    .into());
                 }
             }
         }
@@ -11174,17 +11160,9 @@ mod tests {
 
     #[test]
     fn time_block_post_update_leaves_beta_unchanged() {
-        // The time block carries structural lower bounds (see
-        // `structural_time_coefficient_lower_bounds`).  `post_update_block_beta`
-        // projects the accepted line-search β onto the feasible box so the
-        // *next* `max_feasible_time_step` call never sees an ulp-level
-        // infeasibility.  The projection must satisfy two invariants:
-        //   (i)  feasible β is returned unchanged (idempotence on the feasible
-        //        set),
-        //   (ii) β projected from outside the feasible set lies on the feasible
-        //        set (every coefficient is ≥ its lower bound).
-        // The test family has `time_coefficient_lower_bounds = [0.0]`, matching
-        // the single structural time column in `x_time_exit`.
+        // The QP owns feasibility. The post-update hook may validate the
+        // accepted beta, but it must not silently repair a missing constraint
+        // row after the solver has produced a step.
         let family = survival_exact_newton_test_family();
         let spec = ParameterBlockSpec {
             name: "time_transform".to_string(),
@@ -11196,7 +11174,6 @@ mod tests {
             initial_beta: None,
         };
 
-        // Feasible β: already ≥ the 0.0 bound, so the projection is a no-op.
         let feasible = family
             .post_update_block_beta(
                 &[ParameterBlockState {
@@ -11210,11 +11187,7 @@ mod tests {
             .expect("return time beta");
         assert_eq!(feasible, array![0.5]);
 
-        // Infeasible β: -2.0 sits below the 0.0 lower bound, so the projection
-        // clamps it back onto the feasible set.  The invariant the test asserts
-        // is "every coefficient is ≥ its structural lower bound" — the exact
-        // returned value is the projection-to-box fixed point.
-        let projected = family
+        let err = family
             .post_update_block_beta(
                 &[ParameterBlockState {
                     beta: array![0.0],
@@ -11224,8 +11197,11 @@ mod tests {
                 &spec,
                 array![-2.0],
             )
-            .expect("return time beta");
-        assert!(projected[0] >= 0.0);
+            .expect_err("post-update must reject, not repair, infeasible time beta");
+        assert!(
+            err.contains("outside registered linear constraints"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -11268,8 +11244,26 @@ mod tests {
         .expect("exact derivative guard constraints")
         .expect("nonzero derivative rows");
 
-        assert_eq!(constraints.a, array![[1.0, 1.0], [2.0, -1.0]]);
-        assert_eq!(constraints.b, array![0.75, 0.25]);
+        let scale0 = 2.0_f64.sqrt();
+        let scale1 = 5.0_f64.sqrt();
+        let expected_a = array![[1.0 / scale0, 1.0 / scale0], [2.0 / scale1, -1.0 / scale1]];
+        let expected_b = array![0.75 / scale0, 0.25 / scale1];
+        assert!(
+            (&constraints.a - &expected_a)
+                .iter()
+                .all(|v| v.abs() <= 1e-12),
+            "scaled A mismatch: got {:?}, expected {:?}",
+            constraints.a,
+            expected_a
+        );
+        assert!(
+            (&constraints.b - &expected_b)
+                .iter()
+                .all(|v| v.abs() <= 1e-12),
+            "scaled b mismatch: got {:?}, expected {:?}",
+            constraints.b,
+            expected_b
+        );
     }
 
     #[test]
