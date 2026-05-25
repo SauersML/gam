@@ -4049,6 +4049,18 @@ fn build_survival_time_initial_beta(
     exact_derivative_guard: f64,
     prepared: &PreparedSurvivalTimeStack,
 ) -> Array1<f64> {
+    let p = prepared.time_design_exit.ncols();
+    // The marginal-slope time block runs on `TimeBlockMonotonicity::StructuralISpline`:
+    // q(t) is monotone iff γ ≥ 0, and `add_survival_time_derivative_guard_offset`
+    // has already absorbed `guard·t` into the offsets — so γ = 0 is the
+    // canonical structurally-feasible seed (q reduces to the guard-linear
+    // baseline, q'(t) = guard exactly). Projecting onto the row-wise
+    // `D γ + o ≥ guard` constraint set would produce a γ that violates
+    // γ ≥ 0 because that projection has no nonnegativity awareness; the
+    // safe seed is the zero vector.
+    if likelihood_mode == SurvivalLikelihoodMode::MarginalSlope {
+        return Array1::zeros(p);
+    }
     let time_initial_constraints = if likelihood_mode != SurvivalLikelihoodMode::Weibull {
         gam::pirls::LinearInequalityConstraints::new(
             prepared.time_design_derivative_exit.to_dense(),
@@ -4061,10 +4073,8 @@ fn build_survival_time_initial_beta(
         None
     };
     time_initial_constraints.as_ref().map_or_else(
-        || Array1::zeros(prepared.time_design_exit.ncols()),
-        |constraints| {
-            project_onto_linear_constraints(prepared.time_design_exit.ncols(), constraints, None)
-        },
+        || Array1::zeros(p),
+        |constraints| project_onto_linear_constraints(p, constraints, None),
     )
 }
 
@@ -5062,7 +5072,14 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 offset_entry: prepared.eta_offset_entry.clone(),
                 offset_exit: prepared.eta_offset_exit.clone(),
                 derivative_offset_exit: prepared.derivative_offset_exit.clone(),
-                time_monotonicity: gam::families::survival_location_scale::TimeBlockMonotonicity::EnforcedByRowConstraint,
+                // The marginal-slope time block runs on `SurvivalTimeBasisConfig::ISpline`
+                // (the survival CLI default and the only basis `parse_survival_time_basis_config`
+                // accepts under `require_structural_survival_time_basis`), so `q(t)` is
+                // structurally monotone whenever `γ ≥ 0`. Declaring `StructuralISpline`
+                // tells the family to skip the row-wise `D β + o ≥ guard` constraint
+                // generator (vacuous on this basis) and rely on the γ-cone coordinate
+                // bound instead. See `src/families/ispline_base_time.rs` for the why.
+                time_monotonicity: gam::families::survival_location_scale::TimeBlockMonotonicity::StructuralISpline,
                 penalties: prepared.time_penalties.clone(),
                 nullspace_dims: prepared.time_nullspace_dims.clone(),
                 initial_log_lambdas: survival_time_initial_log_lambdas(
