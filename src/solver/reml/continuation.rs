@@ -324,7 +324,14 @@ fn run_path(
         }
 
         let rho_next = step_toward(&state.last_rho, target, alpha);
-        beta_seed = state.last_beta.clone();
+        // Prefer the previous eval's published inner-β hint over our
+        // own carried β. The objective itself knows its converged β at
+        // ρ_k; if it surfaces it, that is the best warm-start for ρ_{k+1}.
+        beta_seed = state
+            .last_eval
+            .inner_beta_hint
+            .clone()
+            .unwrap_or_else(|| state.last_beta.clone());
 
         match eval_step(obj, &rho_next, &beta_seed, order) {
             Ok(eval) => {
