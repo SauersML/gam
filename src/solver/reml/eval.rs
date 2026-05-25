@@ -264,7 +264,30 @@ impl<'a> RemlState<'a> {
         final_fit: &PirlsResult,
         base_covariance: Option<&Array2<f64>>,
         finalgrad_norm: f64,
-    ) -> Option<Array2<f64>> {
+    ) -> SmoothingCorrectionOutcome {
+        use SmoothingCorrectionFallbackSeverity::{NumericalFailure, Routine};
+
+        // Build a Routine first-order outcome with the canonical
+        // linearization correction (may be `None` when n_rho == 0 or the
+        // first-order path itself bailed). Debug-logged at function exit.
+        let first_order_routine = |correction: Option<Array2<f64>>, reason: &'static str| {
+            SmoothingCorrectionOutcome::FirstOrder {
+                correction,
+                reason,
+                severity: Routine,
+            }
+        };
+        // Build a NumericalFailure first-order outcome. Warn-logged and
+        // counted at function exit so long-running fits surface how
+        // often the second-order upgrade silently degraded.
+        let first_order_numerical = |correction: Option<Array2<f64>>, reason: &'static str| {
+            SmoothingCorrectionOutcome::FirstOrder {
+                correction,
+                reason,
+                severity: NumericalFailure,
+            }
+        };
+
         // Always compute the fast first-order correction first.
         let first_order = super::compute_smoothing_correction(self, final_rho, final_fit);
         let first_order_correction = first_order.correction.clone();
@@ -297,13 +320,24 @@ impl<'a> RemlState<'a> {
                     );
                 }
             }
-            return first_order_correction;
+            // n_rho == 0: unified corrected covariance equals H⁻¹; no
+            // additive correction is meaningful at this design.
+            return self.finalize_smoothing_outcome(first_order_routine(
+                first_order_correction,
+                "n_rho == 0: unified corrected covariance equals H^{-1}",
+            ));
         }
         if n_rho > AUTO_CUBATURE_MAX_RHO_DIM {
-            return first_order_correction;
+            return self.finalize_smoothing_outcome(first_order_routine(
+                first_order_correction,
+                "n_rho exceeds AUTO_CUBATURE_MAX_RHO_DIM: cubature cost prohibitive",
+            ));
         }
         if final_fit.beta_transformed.len() > AUTO_CUBATURE_MAX_BETA_DIM {
-            return first_order_correction;
+            return self.finalize_smoothing_outcome(first_order_routine(
+                first_order_correction,
+                "beta dimension exceeds AUTO_CUBATURE_MAX_BETA_DIM: cubature cost prohibitive",
+            ));
         }
         let near_boundary = final_rho
             .iter()

@@ -11112,7 +11112,7 @@ mod tests {
             )
             .expect("time step ceiling")
             .expect("time step should be bounded");
-        assert_relative_eq!(alpha, 0.04975, epsilon = 1e-12);
+        assert!((alpha - 0.04975).abs() <= 1e-12);
         let feasible = states[0].beta[0] + alpha * -2.0;
         assert!(feasible >= 0.0);
     }

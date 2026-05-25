@@ -120,9 +120,8 @@ def test_extract_feature_curves_grid_shape():
 
 
 def test_decoder_ortho_routes_through_rust():
-    # Decoder ortho is the only torch-side regularizer wired today; the
-    # monotonicity descriptor is a deferred Rust kernel. Verify the ortho
-    # path engages when weight > 0 and short-circuits to zero otherwise.
+    # Both ortho (block_orthogonality) and monotonicity descriptors now route
+    # through Rust analytic_penalty_value_grad; nothing remains deferred.
     cfg = gt.ManifoldSAEConfig(
         input_dim=4, n_atoms=3, intrinsic_rank=1, n_basis_per_atom=4,
         decoder={"ortho_weight": 1e-2},
@@ -135,6 +134,37 @@ def test_decoder_ortho_routes_through_rust():
     )
     sae0 = gt.ManifoldSAE(cfg0)
     assert sae0.decoder_ortho_penalty().item() == 0.0
+
+
+def test_decoder_monotonicity_routes_through_rust():
+    cfg = gt.ManifoldSAEConfig(
+        input_dim=4, n_atoms=2, intrinsic_rank=1, n_basis_per_atom=5,
+        decoder={"monotonicity_weight": 1e-2, "monotonicity_direction": 1.0},
+    )
+    sae = gt.ManifoldSAE(cfg)
+    assert sae.decoder_monotonicity_penalty().item() > 0.0
+    cfg0 = gt.ManifoldSAEConfig(
+        input_dim=4, n_atoms=2, intrinsic_rank=1, n_basis_per_atom=5,
+        decoder={"monotonicity_weight": 0.0},
+    )
+    sae0 = gt.ManifoldSAE(cfg0)
+    assert sae0.decoder_monotonicity_penalty().item() == 0.0
+
+
+def test_bspline_basis_routes_through_rust():
+    # Cylinder + bspline now reaches the Rust bspline arm of basis_with_jet
+    # (open uniform). Forward and backward must both succeed without falling
+    # back to the Duchon path.
+    cfg = gt.ManifoldSAEConfig(
+        input_dim=5, n_atoms=2, intrinsic_rank=2, atom_manifold="cylinder",
+        atom_basis="bspline", basis_order=2, n_basis_per_atom=6,
+    )
+    sae = gt.ManifoldSAE(cfg)
+    x = torch.randn(3, 5, dtype=torch.float64, requires_grad=True)
+    out = sae(x)
+    assert torch.isfinite(out.x_hat).all()
+    out.x_hat.sum().backward()
+    assert x.grad is not None and torch.isfinite(x.grad).all()
 
 
 def test_basis_eval_matches_rust_basis_with_jet():

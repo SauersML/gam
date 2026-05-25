@@ -1187,4 +1187,73 @@ mod tests {
         assert_eq!(lc.row(0), &[1.0, 2.0]);
         assert_eq!(lc.row(1), &[3.0, 4.0]);
     }
+
+    /// Regression for issue #191 (and the K=2 periodic case of #174):
+    /// `from_matrix_with_manifold(Circle)` must produce a value whose
+    /// update path wraps into `[0, 2π)` even though the override
+    /// `LatentRetractionRegistry` is left at its `all_euclidean` default.
+    /// Before the fix, the retraction silently decayed to Euclidean and
+    /// values drifted outside the circle on every Newton step.
+    #[test]
+    fn circle_manifold_update_wraps_into_canonical_interval() {
+        let near_top = 6.2_f64;
+        let m = array![[near_top]];
+        let mut lc = LatentCoordValues::from_matrix_with_manifold(
+            m.view(),
+            LatentIdMode::None,
+            LatentManifold::Circle,
+        );
+        let delta = Array1::from(vec![1.5_f64]);
+        lc.retract_flat_delta(delta.view());
+        let updated = lc.row(0)[0];
+        let expected = wrap_angle(near_top + 1.5);
+        assert!(
+            (0.0..TWO_PI).contains(&updated),
+            "Circle retraction did not wrap into [0, 2π): got {updated}",
+        );
+        assert!(
+            (updated - expected).abs() < 1e-12,
+            "Circle retraction value mismatch: got {updated}, expected {expected}",
+        );
+
+        let large_delta = Array1::from(vec![10.0 * TWO_PI + 0.25_f64]);
+        lc.retract_flat_delta(large_delta.view());
+        let after_big = lc.row(0)[0];
+        assert!(
+            (0.0..TWO_PI).contains(&after_big),
+            "Circle retraction did not wrap a large delta: got {after_big}",
+        );
+    }
+
+    /// Mirror of the Circle regression for `LatentManifold::Sphere`: the
+    /// per-row update must preserve unit norm. Before the fix the registry
+    /// stayed Euclidean and the additive update broke the constraint.
+    #[test]
+    fn sphere_manifold_update_preserves_unit_norm() {
+        let m = array![[1.0_f64, 0.0, 0.0]];
+        let mut lc = LatentCoordValues::from_matrix_with_manifold(
+            m.view(),
+            LatentIdMode::None,
+            LatentManifold::Sphere { dim: 3 },
+        );
+        let delta = Array1::from(vec![0.3_f64, 0.7, -0.2]);
+        lc.retract_flat_delta(delta.view());
+        let row = lc.row(0);
+        let norm_sq: f64 = row.iter().map(|x| x * x).sum();
+        assert!(
+            (norm_sq.sqrt() - 1.0).abs() < 1e-12,
+            "Sphere retraction did not preserve unit norm: ||t|| = {}",
+            norm_sq.sqrt(),
+        );
+
+        let big_delta = Array1::from(vec![50.0_f64, -25.0, 13.0]);
+        lc.retract_flat_delta(big_delta.view());
+        let row2 = lc.row(0);
+        let norm_sq2: f64 = row2.iter().map(|x| x * x).sum();
+        assert!(
+            (norm_sq2.sqrt() - 1.0).abs() < 1e-12,
+            "Sphere retraction failed to renormalize after large delta: ||t|| = {}",
+            norm_sq2.sqrt(),
+        );
+    }
 }

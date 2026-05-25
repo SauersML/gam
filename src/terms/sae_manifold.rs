@@ -3060,7 +3060,9 @@ mod tests {
         let threshold = 0.1_f64;
         let logits = Array2::<f64>::from_shape_vec(
             (n, k),
-            vec![-2.0, -0.2, 0.0, 0.05, 0.1, 0.15, 0.4, 0.9, 1.5, 2.5, 4.0, 6.0],
+            vec![
+                -2.0, -0.2, 0.0, 0.05, 0.1, 0.15, 0.4, 0.9, 1.5, 2.5, 4.0, 6.0,
+            ],
         )
         .expect("valid logit grid");
         let coords: Vec<Array2<f64>> = (0..k).map(|_| Array2::<f64>::zeros((n, 1))).collect();

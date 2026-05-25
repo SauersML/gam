@@ -30,8 +30,15 @@ echo "pid=$PID n=$N budget=${BUDGET}s sample=${SAMPLE_SEC}s"
 # Warm-up
 sleep 5
 
-# Concurrent sample profile
-echo ***REDACTED*** | sudo -S sample "$PID" "$SAMPLE_SEC" 10 -mayDie -file "$RUNS/dch_$N.sample.txt" >/dev/null 2>&1 || true
+# Concurrent sample profile. Reads sudo password from SUDO_PW env var; do NOT
+# hardcode credentials here (the secret was previously embedded + shipped to a
+# public repo — sanitised; rotate the password). Usage:
+#   SUDO_PW=... ./run_with_sample.sh
+if [ -z "${SUDO_PW:-}" ]; then
+  echo "set SUDO_PW to enable concurrent 'sample' profile (otherwise skipped)" >&2
+else
+  printf '%s\n' "$SUDO_PW" | sudo -S sample "$PID" "$SAMPLE_SEC" 10 -mayDie -file "$RUNS/dch_$N.sample.txt" >/dev/null 2>&1 || true
+fi
 
 # Wait for the fit to finish or hit the budget
 START=$(date +%s)
