@@ -1,11 +1,5 @@
 #!/usr/bin/env python3
-"""End-to-end PIT pipeline: transformation-normal fit -> predict z -> marginal-slope fits.
-
-Duchon smooths throughout, main-formula linkwiggle, logslope score-warp via
-logslope-formula linkwiggle, and timewiggle — no linear terms. PIT is done
-entirely by the gam binary via --transformation-normal.
-"""
-import typing
+"""End-to-end PIT pipeline through the gam binary."""
 
 import csv
 import math
@@ -19,7 +13,7 @@ import time
 GAM_BIN = os.path.join(os.path.dirname(__file__), "..", "target", "release", "gam")
 
 
-def generate_reference(n: typing.Any=40, seed: typing.Any=1) -> typing.Any:
+def generate_reference(n=40, seed=1):
     """Reference panel with Gaussian location-scale structure."""
     rng = random.Random(seed)
     rows = []
@@ -38,7 +32,7 @@ def generate_reference(n: typing.Any=40, seed: typing.Any=1) -> typing.Any:
     return rows
 
 
-def generate_study(n: typing.Any=40, seed: typing.Any=2) -> typing.Any:
+def generate_study(n=40, seed=2):
     """Study cohort with binary + survival outcomes."""
     rng = random.Random(seed)
     rows = []
@@ -80,26 +74,19 @@ def generate_study(n: typing.Any=40, seed: typing.Any=2) -> typing.Any:
     return rows
 
 
-def write_csv(rows: typing.Any, path: typing.Any) -> None:
+def write_csv(rows, path) -> None:
     with open(path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         writer.writeheader()
         writer.writerows(rows)
 
 
-def read_csv(path: typing.Any) -> typing.Any:
+def read_csv(path):
     with open(path, newline="") as f:
         return list(csv.DictReader(f))
 
 
-def merge_z_into_study(study_csv: typing.Any, pred_csv: typing.Any, out_csv: typing.Any) -> None:
-    """Read predict output (eta column = PIT z), merge as 'z' into study data.
-
-    The merged z scores should be approximately N(0, 1) under conditional
-    Gaussianization on the PC manifold. We assert this here so a regression
-    that produced biased or improperly scaled z-scores would be flagged
-    immediately rather than silently propagating through downstream fits.
-    """
+def merge_z_into_study(study_csv, pred_csv, out_csv) -> None:
     study = read_csv(study_csv)
     preds = read_csv(pred_csv)
     if len(preds) != len(study):
@@ -115,47 +102,29 @@ def merge_z_into_study(study_csv: typing.Any, pred_csv: typing.Any, out_csv: typ
     z_sd = (sum((z - z_mean) ** 2 for z in zs) / n) ** 0.5
     print(f"  PIT z: n={n}, mean={z_mean:.4f}, sd={z_sd:.4f}, range=[{min(zs):.3f}, {max(zs):.3f}]")
 
-    # Numeric contracts on the PIT z-scores. Failures raise so the pipeline
-    # script returns non-zero — silent drift toward a bias of 0.5 or
-    # collapse to a near-constant z would otherwise flow into fits 2 and 4
-    # and corrupt downstream metrics.
-    if not all(_finite(z) for z in zs):
+    if not all(math.isfinite(z) for z in zs):
         raise RuntimeError(
             f"PIT z column contained non-finite values; first non-finite: "
-            f"{[(i, zs[i]) for i in range(n) if not _finite(zs[i])][:3]}"
+            f"{[(i, zs[i]) for i in range(n) if not math.isfinite(zs[i])][:3]}"
         )
-    # Mean should be near 0 and standard deviation should be near 1. The
-    # tolerance is loose because the test datasets are small (~40 rows),
-    # but a runaway bias or near-constant prediction would still fail.
     if abs(z_mean) > 0.5:
         raise RuntimeError(
             f"PIT z mean {z_mean:.4f} drifted too far from zero; expected |mean| < 0.5"
         )
     if not (0.5 < z_sd < 1.8):
         raise RuntimeError(
-            f"PIT z sd {z_sd:.4f} outside expected (0.5, 1.8); expected ≈ 1.0"
+            f"PIT z sd {z_sd:.4f} outside expected (0.5, 1.8); expected about 1.0"
         )
 
-    # Spread sanity: at least 60% of z values should sit within ±2.5 of zero
-    # (true under N(0,1) for >98%, but small-sample noise + tail outliers
-    # justify a permissive band).
     inliers = sum(1 for z in zs if abs(z) < 2.5)
     if inliers < 0.6 * n:
         raise RuntimeError(
-            f"only {inliers}/{n} PIT z values lie within ±2.5; distribution does "
+            f"only {inliers}/{n} PIT z values lie within +/-2.5; distribution does "
             "not look like N(0,1)"
         )
 
 
-def _finite(v: typing.Any) -> typing.Any:
-    try:
-        f = float(v)
-    except (TypeError, ValueError):
-        return False
-    return f == f and f not in (float("inf"), float("-inf"))
-
-
-def run(args: typing.Any, label: typing.Any, timeout: typing.Any=300) -> typing.Any:
+def run(args, label, timeout=300):
     cmd = [GAM_BIN] + args
     print(f"\n{'=' * 70}\n{label}\n{'=' * 70}")
     print(f"  cmd: gam {' '.join(args)}")
@@ -182,7 +151,7 @@ def run(args: typing.Any, label: typing.Any, timeout: typing.Any=300) -> typing.
     return True, elapsed
 
 
-def skip(label: typing.Any, reason: typing.Any) -> typing.Any:
+def skip(label, reason):
     print(f"\n{'=' * 70}\n{label}\n{'=' * 70}")
     print(f"  SKIP ({reason})")
     return False, 0.0
@@ -207,12 +176,15 @@ def main() -> None:
     n_event = sum(int(row["event"]) for row in study_rows)
     n_study = len(study_rows)
     print(f"Reference: {len(ref_rows)} rows")
-    print(f"Study: {n_study} rows, {n_case} cases ({100.0 * n_case / n_study:.1f}%), {n_event} events ({100.0 * n_event / n_study:.1f}%)")
+    print(
+        f"Study: {n_study} rows, {n_case} cases "
+        f"({100.0 * n_case / n_study:.1f}%), {n_event} events "
+        f"({100.0 * n_event / n_study:.1f}%)"
+    )
 
     timings = {}
     results = {}
 
-    # ── Fit 1: PIT via transformation-normal (Duchon on PCs) ─────────
     fit1_model = os.path.join(tmpdir, "pgs_pit.json")
     ok, elapsed = run([
         "fit", ref_csv,
@@ -224,7 +196,6 @@ def main() -> None:
     results["fit1_pit"] = ok
     timings["fit1_pit"] = elapsed
 
-    # ── Predict: PIT z-scores on study data ──────────────────────────
     fit1_pred_csv = os.path.join(tmpdir, "fit1_pred.csv")
     if results["fit1_pit"]:
         ok, elapsed = run([
@@ -239,11 +210,8 @@ def main() -> None:
     results["pred_pit"] = ok
     timings["pred_pit"] = elapsed
 
-    # ── Merge z into study CSV ───────────────────────────────────────
     enriched_csv = os.path.join(tmpdir, "study_with_z.csv")
     if not results["pred_pit"]:
-        fit2_model = os.path.join(tmpdir, "bernoulli.json")
-        fit4_model = os.path.join(tmpdir, "survival.json")
         results["fit2_bern_ms"], timings["fit2_bern_ms"] = skip(
             "Fit 2: Bernoulli marginal-slope",
             "PIT z-scores were not produced",
@@ -255,7 +223,6 @@ def main() -> None:
     else:
         merge_z_into_study(study_csv, fit1_pred_csv, enriched_csv)
 
-        # ── Fit 2: Bernoulli marginal-slope (Duchon + linkwiggle + score-warp)
         fit2_model = os.path.join(tmpdir, "bernoulli.json")
         ok, elapsed = run([
             "fit", enriched_csv,
@@ -269,7 +236,6 @@ def main() -> None:
         results["fit2_bern_ms"] = ok
         timings["fit2_bern_ms"] = elapsed
 
-        # ── Fit 4: Survival marginal-slope (Duchon + linkwiggle + score-warp + timewiggle)
         fit4_model = os.path.join(tmpdir, "survival.json")
         ok, elapsed = run([
             "fit", enriched_csv,
@@ -285,7 +251,6 @@ def main() -> None:
         results["fit4_surv_ms"] = ok
         timings["fit4_surv_ms"] = elapsed
 
-    # ── Summary ───────────────────────────────────────────────────────
     print(f"\n{'=' * 70}\nSUMMARY\n{'=' * 70}")
     total = 0.0
     for name in results:
