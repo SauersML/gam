@@ -52,12 +52,11 @@ pub(crate) mod exact_kernel;
 pub use deviation_runtime::DeviationRuntime;
 pub use deviation_runtime::ParametricAnchorBlock;
 
-/// Row count where flexible marginal-slope outer-Hessian calculus stops being
-/// a useful optimizer acceleration. Above this gate the exact profiled Hessian
-/// spends most of its time in third/fourth β-derivative contractions over the
-/// FLEX cell kernel; exact value/gradient evaluations keep the same likelihood,
-/// calibration, and inner Newton solve without paying that curvature bill.
-const BMS_FLEX_OUTER_HESSIAN_ROW_LIMIT: usize = 50_000;
+/// Above this size, FLEX spatial length-scale optimization uses the pilot
+/// geometry initializer and skips the iterative joint κ/ψ outer loop. This is
+/// a spatial-optimizer policy only; it must not gate exact outer Hessian
+/// capability or row-cell moment materialization.
+const BMS_FLEX_SPATIAL_OUTER_PILOT_ROW_THRESHOLD: usize = 50_000;
 
 #[derive(Clone, Debug)]
 pub struct DeviationBlockConfig {
@@ -7103,6 +7102,18 @@ impl BernoulliMarginalSlopeFamily {
         )
     }
 
+    fn max_denested_partition_cells_per_row(&self) -> usize {
+        let score_splits = self
+            .score_warp
+            .as_ref()
+            .map_or(0usize, |runtime| runtime.breakpoints().len());
+        let link_splits = self
+            .link_dev
+            .as_ref()
+            .map_or(0usize, |runtime| runtime.breakpoints().len());
+        score_splits.saturating_add(link_splits).saturating_add(1)
+    }
+
     #[inline]
     fn evaluate_cell_moments_lru(
         &self,
@@ -8125,15 +8136,8 @@ impl BernoulliMarginalSlopeFamily {
             .and_then(|opts| opts.outer_score_subsample.as_ref())
             .map(|subsample| subsample.mask.as_slice());
         let row_cell_started = std::time::Instant::now();
-        let row_cell_moments = match row_cell_mask {
-            Some(mask) => {
-                self.build_row_cell_moments_bundle(block_states, &row_contexts, 21, Some(mask))?
-            }
-            None if n < BMS_FLEX_OUTER_HESSIAN_ROW_LIMIT => {
-                self.build_row_cell_moments_bundle(block_states, &row_contexts, 21, None)?
-            }
-            None => None,
-        };
+        let row_cell_moments =
+            self.build_row_cell_moments_bundle(block_states, &row_contexts, 21, row_cell_mask)?;
         if log_exact_work(n) {
             log::info!(
                 "[BMS exact-cache] row-cell phase done n={} selected_rows={} built={} elapsed={:.3}s",
@@ -8197,6 +8201,23 @@ impl BernoulliMarginalSlopeFamily {
             return Ok(None);
         }
         let selected_row_count = selected_rows.len();
+        let max_cells = self.max_denested_partition_cells_per_row();
+        let max_n_cells = selected_row_count.saturating_mul(max_cells);
+        let upper_bound_bytes =
+            RowCellMomentsBundle::estimated_resident_bytes(n, max_n_cells, max_degree);
+        let limit_bytes = self.policy.max_operator_cache_bytes;
+        if upper_bound_bytes > limit_bytes {
+            log::info!(
+                "[BMS row-cell-moments] skip precompute n={} selected_rows={} max_cells_per_row={} degree={} upper_bound_bytes={} limit_bytes={}",
+                n,
+                selected_row_count,
+                max_cells,
+                max_degree,
+                upper_bound_bytes,
+                limit_bytes
+            );
+            return Ok(None);
+        }
         let started = std::time::Instant::now();
         let heartbeat_guard = crate::heartbeat::scope(format!(
             "BMS row-cell-moments n={n} selected_rows={selected_row_count} degree={max_degree}"
@@ -8237,7 +8258,6 @@ impl BernoulliMarginalSlopeFamily {
         }
         let estimated_bytes =
             RowCellMomentsBundle::estimated_resident_bytes(n, n_cells, max_degree);
-        let limit_bytes = self.policy.max_operator_cache_bytes;
         if estimated_bytes > limit_bytes {
             log::warn!(
                 "[BMS row-cell-moments] skip precompute n={} selected_rows={} cells={} degree={} estimated_bytes={} limit_bytes={}",
@@ -17895,10 +17915,10 @@ pub fn fit_bernoulli_marginal_slope_terms(
         );
         effective_kappa_options.enabled = false;
     }
-    let flex_spatial_scale_path = (spec.score_warp.is_some() || spec.link_dev.is_some())
-        && spec.y.len() >= BMS_FLEX_OUTER_HESSIAN_ROW_LIMIT
+    let flex_spatial_pilot_path = (spec.score_warp.is_some() || spec.link_dev.is_some())
+        && spec.y.len() >= BMS_FLEX_SPATIAL_OUTER_PILOT_ROW_THRESHOLD
         && effective_kappa_options.enabled;
-    if flex_spatial_scale_path {
+    if flex_spatial_pilot_path {
         let marginal_terms = spatial_length_scale_term_indices(&spec.marginalspec);
         let logslope_terms = spatial_length_scale_term_indices(&spec.logslopespec);
         let marginal_updates = apply_spatial_anisotropy_pilot_initializer(
@@ -17917,7 +17937,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
         );
         effective_kappa_options.enabled = false;
         log::info!(
-            "[BMS spatial] n={} flex=true pilot_geometry_updates={} iterative_spatial_outer=false",
+            "[BMS spatial] n={} flex=true pilot_geometry_updates={} iterative_spatial_outer=false reason=large-flex-spatial-pilot",
             spec.y.len(),
             marginal_updates + logslope_updates,
         );
@@ -21644,7 +21664,7 @@ mod tests {
         );
         assert!(family.exact_newton_joint_psi_workspace_for_first_order_terms());
 
-        let n_large = BMS_FLEX_OUTER_HESSIAN_ROW_LIMIT;
+        let n_large = 50_000;
         let mut large_flex_family = family.clone();
         large_flex_family.y = Arc::new(Array1::zeros(n_large));
         large_flex_family.weights = Arc::new(Array1::ones(n_large));
