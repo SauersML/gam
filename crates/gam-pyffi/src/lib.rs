@@ -2289,7 +2289,9 @@ fn competing_risks_cif_impl(
         ndarray::stack(Axis(0), &endpoint_views).map_err(|err| err.to_string())?;
     let result = gam::survival::assemble_competing_risks_cif(times, cumulative_hazard.view())
         .map_err(|err| err.to_string())?;
-    Ok((result.cif, result.overall_survival))
+    let cif_views = result.cif.iter().map(|m| m.view()).collect::<Vec<_>>();
+    let cif_stacked = ndarray::stack(Axis(0), &cif_views).map_err(|err| err.to_string())?;
+    Ok((cif_stacked, result.overall_survival))
 }
 
 #[pyfunction]
