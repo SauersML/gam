@@ -2666,7 +2666,8 @@ impl JumpReLUPenalty {
     }
 
     fn psd_hessian_diag_entry(&self, tau: f64, gate: f64) -> f64 {
-        self.weight * tau * gate * (1.0 - gate) / (self.smoothing_eps * self.smoothing_eps)
+        let slope = gate * (1.0 - gate);
+        self.weight * tau * slope * slope / (self.smoothing_eps * self.smoothing_eps)
     }
 }
 
@@ -7908,26 +7909,34 @@ mod tests {
     }
 
     #[test]
-    fn jumprelu_hessian_diag_majorizer_is_psd_above_threshold() {
-        let tau = 0.25_f64;
+    fn jumprelu_hessian_diag_majorizer_is_psd_over_logit_sweep() {
+        let thresholds = array![0.25_f64, 0.8];
+        let rho = array![0.0_f64, 1.5_f64.ln()];
         let eps = 0.04_f64;
         let weight = 1.3_f64;
-        let target_values =
-            Array1::from_vec((1..=5).map(|step| tau + step as f64 * eps).collect());
-        let slice = PsiSlice::full(target_values.len(), Some(1));
-        let pen = JumpReLUPenalty::new(slice, array![tau], weight, eps)
+        let scaled_thresholds = [thresholds[0] * rho[0].exp(), thresholds[1] * rho[1].exp()];
+        let offsets = [-5.0_f64, -2.0, -0.5, -0.05, 0.0, 0.05, 0.5, 2.0, 5.0];
+        let mut values = Vec::with_capacity(offsets.len() * thresholds.len());
+        for &offset in &offsets {
+            values.push(scaled_thresholds[0] + offset);
+            values.push(scaled_thresholds[1] + offset);
+        }
+        let target_values = Array1::from_vec(values);
+        let slice = PsiSlice::full(target_values.len(), Some(thresholds.len()));
+        let pen = JumpReLUPenalty::new(slice, thresholds, weight, eps)
             .expect("valid JumpReLU penalty");
-        let rho = array![0.0_f64];
         let diag = pen
             .hessian_diag(target_values.view(), rho.view())
             .expect("JumpReLU exposes a PSD diagonal majorizer");
 
-        for (&x, &entry) in target_values.iter().zip(diag.iter()) {
-            let gate = pen.sigmoid_gate((x - tau) / eps);
-            let expected = weight * tau * gate * (1.0 - gate) / (eps * eps);
+        for (idx, &entry) in diag.iter().enumerate() {
+            let axis = idx % thresholds.len();
+            let gate = pen.sigmoid_gate((target_values[idx] - scaled_thresholds[axis]) / eps);
+            let slope = gate * (1.0 - gate);
+            let expected = weight * scaled_thresholds[axis] * slope * slope / (eps * eps);
             assert!(
-                x > tau && x <= tau + 5.0 * eps && entry.is_finite() && entry >= 0.0,
-                "JumpReLU hessian_diag majorizer must be finite and PSD above tau; x={x}, entry={entry}"
+                entry.is_finite() && entry >= 0.0,
+                "JumpReLU hessian_diag majorizer must be finite and PSD at index {idx}; entry={entry}"
             );
             assert_abs_diff_eq!(entry, expected, epsilon = 1e-12);
         }
