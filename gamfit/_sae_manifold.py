@@ -502,7 +502,7 @@ def _oos_reconstruct(model: ManifoldSAE, x_new: np.ndarray) -> np.ndarray:
     if k_atoms == 1 and model.assignment in {"ibp", "ibp_map"}:
         initial_logits[:, 0] = 4.0  # strong "atom on" prior; trained ibp behaves the same
 
-    max_iter_total = max(1, int(np.asarray(model.coords[0]).shape[0] >= 0) * 50)
+    max_iter_total = 50
     assignment_kind = str(
         {"ibp": "ibp_map"}.get(model.assignment, model.assignment)
     )
