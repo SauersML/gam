@@ -16665,11 +16665,12 @@ impl ARDPenalty {
         py: Python<'_>,
         target: Option<&Bound<'_, PyAny>>,
         weight_schedule: Option<PyObject>,
-    ) -> Self {
-        Self {
+    ) -> PyResult<Self> {
+        validate_target_eager(py, "ARDPenalty", target)?;
+        Ok(Self {
             target: py_object_or_string_default(py, target, "t"),
             weight_schedule,
-        }
+        })
     }
 
     #[classattr]
