@@ -12156,6 +12156,149 @@ fn benchmark_prediction_metrics(
     Ok(metrics.unbind())
 }
 
+fn benchmark_pr_auc_score(observed: &[f64], predicted_mean: &[f64]) -> PyResult<f64> {
+    if observed.len() != predicted_mean.len() {
+        return Err(PyValueError::new_err(format!(
+            "pr_auc length mismatch: observed={} predicted={}",
+            observed.len(),
+            predicted_mean.len()
+        )));
+    }
+    let mut pairs: Vec<(f64, bool)> = observed
+        .iter()
+        .zip(predicted_mean.iter())
+        .map(|(&y, &p)| (p, y > 0.5))
+        .collect();
+    let n_pos = pairs.iter().filter(|(_, is_pos)| *is_pos).count();
+    if n_pos == 0 {
+        return Ok(0.0);
+    }
+    pairs.sort_by(|(a, _), (b, _)| b.total_cmp(a));
+    let mut tp = 0usize;
+    let mut fp = 0usize;
+    let mut prev_precision = 1.0;
+    let mut prev_recall = 0.0;
+    let mut area = 0.0;
+    for (_score, is_pos) in pairs {
+        if is_pos {
+            tp += 1;
+        } else {
+            fp += 1;
+        }
+        let precision = tp as f64 / (tp + fp).max(1) as f64;
+        let recall = tp as f64 / n_pos as f64;
+        area += 0.5 * (precision + prev_precision) * (recall - prev_recall);
+        prev_precision = precision;
+        prev_recall = recall;
+    }
+    Ok(area)
+}
+
+fn benchmark_ece_score(observed: &[f64], predicted_mean: &[f64], n_bins: usize) -> PyResult<f64> {
+    if observed.len() != predicted_mean.len() {
+        return Err(PyValueError::new_err(format!(
+            "ece length mismatch: observed={} predicted={}",
+            observed.len(),
+            predicted_mean.len()
+        )));
+    }
+    if observed.is_empty() {
+        return Err(PyValueError::new_err("ece requires at least one row"));
+    }
+    let mut bins = vec![(0usize, 0.0, 0.0); n_bins.max(1)];
+    let bins_len = bins.len();
+    for (&y, &p) in observed.iter().zip(predicted_mean.iter()) {
+        if !y.is_finite() || !p.is_finite() {
+            return Err(PyValueError::new_err("ece inputs must be finite"));
+        }
+        let mut idx = (p.clamp(0.0, 1.0) * bins_len as f64).floor() as usize;
+        if idx >= bins_len {
+            idx = bins_len - 1;
+        }
+        bins[idx].0 += 1;
+        bins[idx].1 += y;
+        bins[idx].2 += p;
+    }
+    let n = observed.len() as f64;
+    Ok(bins
+        .into_iter()
+        .filter(|(count, _, _)| *count > 0)
+        .map(|(count, y_sum, p_sum)| {
+            let c = count as f64;
+            (c / n) * ((y_sum / c) - (p_sum / c)).abs()
+        })
+        .sum())
+}
+
+#[pyfunction]
+fn binary_auc(observed: Vec<f64>, predicted_mean: Vec<f64>) -> PyResult<f64> {
+    benchmark_auc_score(&observed, &predicted_mean)
+}
+
+#[pyfunction]
+fn binary_brier(observed: Vec<f64>, predicted_mean: Vec<f64>) -> PyResult<f64> {
+    let diagnostics =
+        gam::inference::diagnostics::diagnostics_from_predictions(&observed, &predicted_mean)
+            .map_err(py_value_error)?;
+    Ok(diagnostics.rmse * diagnostics.rmse)
+}
+
+#[pyfunction]
+fn classification_metrics(
+    py: Python<'_>,
+    observed: Vec<f64>,
+    predicted_mean: Vec<f64>,
+    train_prev: f64,
+) -> PyResult<Py<PyDict>> {
+    if observed.len() != predicted_mean.len() {
+        return Err(PyValueError::new_err(format!(
+            "classification_metrics length mismatch: observed={} predicted={}",
+            observed.len(),
+            predicted_mean.len()
+        )));
+    }
+    let diagnostics =
+        gam::inference::diagnostics::diagnostics_from_predictions(&observed, &predicted_mean)
+            .map_err(py_value_error)?;
+    let metrics = PyDict::new(py);
+    metrics.set_item("auc", benchmark_auc_score(&observed, &predicted_mean)?)?;
+    metrics.set_item("pr_auc", benchmark_pr_auc_score(&observed, &predicted_mean)?)?;
+    metrics.set_item("brier", diagnostics.rmse * diagnostics.rmse)?;
+    metrics.set_item(
+        "logloss",
+        benchmark_binary_logloss(&observed, &predicted_mean)?,
+    )?;
+    if train_prev > 0.0 && train_prev < 1.0 {
+        let train_observed = vec![train_prev];
+        let null_mean = train_observed[0];
+        let eps = 1.0e-12;
+        let ll_null = observed
+            .iter()
+            .map(|&y| y * null_mean.ln() + (1.0 - y) * (1.0 - null_mean).ln())
+            .sum::<f64>();
+        let ll_model = observed
+            .iter()
+            .zip(predicted_mean.iter())
+            .map(|(&y, &p)| {
+                let clipped = p.clamp(eps, 1.0 - eps);
+                y * clipped.ln() + (1.0 - y) * (1.0 - clipped).ln()
+            })
+            .sum::<f64>();
+        let n = observed.len() as f64;
+        let r2_cs = 1.0 - benchmark_exp_saturated((2.0 / n) * (ll_null - ll_model));
+        let max_r2_cs = 1.0 - benchmark_exp_saturated((2.0 / n) * ll_null);
+        if r2_cs.is_finite() && max_r2_cs.is_finite() && max_r2_cs > 0.0 {
+            metrics.set_item("nagelkerke_r2", r2_cs / max_r2_cs)?;
+        } else {
+            metrics.set_item("nagelkerke_r2", py.None())?;
+        }
+    } else {
+        metrics.set_item("nagelkerke_r2", py.None())?;
+    }
+    metrics.set_item("ece", benchmark_ece_score(&observed, &predicted_mean, 20)?)?;
+    Ok(metrics.unbind())
+}
+
 // =========================================================================
 // LatentCoord input-location derivative helpers (thin pyffi wrappers).
 //
