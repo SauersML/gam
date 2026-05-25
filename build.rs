@@ -2106,8 +2106,7 @@ fn strip_strings_and_comments_stateful_raw(
         // Detect both `r` and `br` prefixes followed by zero or more `#` and
         // then `"`. Use a word-boundary check so we don't trigger on
         // identifiers like `foo_r"..."` (illegal Rust anyway, but be safe).
-        let prev_is_ident = i > 0
-            && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+        let prev_is_ident = i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
         if !prev_is_ident
             && (c == b'r' || (c == b'b' && i + 1 < bytes.len() && bytes[i + 1] == b'r'))
         {
