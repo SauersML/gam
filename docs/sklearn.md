@@ -42,10 +42,11 @@ All five arguments are surfaced as `get_params()` keys, so they work with
 
 ### Binding the response
 
-If the formula contains `~`, the LHS column is the response. If `y` is an
-array-like, it is bound to `X` under the response name implied by the
-formula (defaulting to `y`). If `y` is a string, it names a column already
-present in `X`. If `y` is `None`, `X` must already contain the response.
+If the formula contains `~`, the LHS column is the response unless `y` is a
+string, in which case `y` names the response column already present in `X`
+and replaces the formula LHS for fitting. If `y` is an array-like, it is
+bound to `X` under the response name implied by the formula (defaulting to
+`y`). If `y` is `None`, `X` must already contain the response.
 
 ```python
 GAMRegressor(formula="y ~ s(x)").fit(X, y)        # array y
@@ -53,7 +54,8 @@ GAMRegressor(formula="y ~ s(x)").fit(df)          # df contains "y"
 GAMRegressor(formula="y ~ s(x)").fit(df, y="y")   # name a column
 ```
 
-If the formula has no `~`, gamfit prepends `<target> ~`.
+If the formula has no `~`, `y` must be supplied and gamfit prepends
+`<target> ~`.
 
 ### Methods
 
@@ -78,13 +80,13 @@ est = GAMClassifier(formula="y ~ s(x)", family="binomial")
 est.fit(X, y)
 
 probs = est.predict_proba(X)   # (n, 2): [P(y=0), P(y=1)]
-hard  = est.predict(X)         # (n,) int, threshold 0.5
+hard  = est.predict(X)         # (n,) int, highest-probability class
 acc   = est.score(X, y)        # accuracy_score
 ```
 
 `classes_` is `np.array([0, 1])` after `fit()`. `predict_proba()` clips the
-positive-class probability to `[0, 1]` and stacks `[1 - p, p]`. The
-threshold for `predict()` is hardcoded to `0.5`.
+positive-class probability to `[0, 1]` and stacks `[1 - p, p]`.
+`predict()` returns `classes_[argmax(predict_proba(X), axis=1)]`.
 
 ## Pipeline
 
@@ -100,8 +102,10 @@ pipe.fit(X, y)
 preds = pipe.predict(X_test)
 ```
 
-The GAM step accepts a `pandas.DataFrame`, a numpy array, a dict of
-columns, or a list of records.
+The GAM step accepts a `pandas.DataFrame`, `polars.DataFrame`,
+`pyarrow.Table`, numpy array, dict of columns, list of records, or 2-D row
+sequence. Numpy arrays and 2-D row sequences use generated feature names
+`x0`, `x1`, ...
 
 ## Cross-validation
 

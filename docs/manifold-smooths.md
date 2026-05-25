@@ -34,7 +34,7 @@ The script writes a full-length MP4 alongside the GIF and PNG. See
 | Shape | Latent params | Formula |
 | --- | --- | --- |
 | Trefoil knot (closed curve in ℝ³) | `t` ∈ [0, 2π) | `x ~ s(t, periodic=true, period=2*pi, k=24)` |
-| Latent-free loop (closed curve, `t` inferred from PCA + atan2) | inferred `t` ∈ [0, 2π) | `x ~ s(t, periodic=true, period=2*pi, k=18)` |
+| Wiggly loop (closed curve) | `t` ∈ [0, 2π) | `x ~ s(t, periodic=true, period=2*pi, k=18)` |
 | Wobbly cylinder (one periodic axis, one open axis) | `θ` ∈ [0, 2π), `h` ∈ [0, 1] | `x ~ te(theta, h, periodic=[0], period=[2*pi, None], k=[26,12])` |
 | Lumpy sphere (intrinsic S²) | `lat`, `lon` (radians) | `x ~ sphere(lat, lon, radians=true, k=100)` |
 | Bumpy torus (two periodic axes) | `u`, `v` ∈ [0, 2π) | `x ~ te(u, v, periodic=[0,1], period=[2*pi, 2*pi], k=[20,16])` |
@@ -46,10 +46,9 @@ consequence of the basis and penalty on the latent manifold.
 
 ### Notes
 
-- Latent-free loop. When the latent parameter is not observed, the demo
-  estimates `t` from the noisy points via the angle of the first two
-  principal components. This is preprocessing, not a special API. The
-  cyclic boundary removes the seam.
+- Wiggly loop. The demo samples and fits the observed latent parameter
+  `t`; there is no latent-coordinate inference step. The cyclic
+  boundary removes the seam.
 - Sphere. The intrinsic `sphere(lat, lon)` smooth uses Wahba's
   reproducing kernel on S² (rotation-invariant, no pole artefacts). A
   spherical-harmonic alternative is available as
@@ -60,7 +59,7 @@ consequence of the basis and penalty on the latent manifold.
   ½v sin(u/2))`, which satisfies `F(u+2π, v) = F(u, −v)` and
   `F(u+4π, v) = F(u, v)`. The smoother is given the latter, ordinary
   periodicity (period `4π` in `u`), so the predictor manifold is the
-  orientable cylinder `S¹ × [−v, v]`. The fitted surface in ℝ³ looks
+  orientable cylinder `S¹ × [−0.8, 0.8]`. The fitted surface in ℝ³ looks
   Möbius because the embedding is Möbius; the basis and penalty do not
   encode the twisted identification `(u, v) ∼ (u+2π, −v)`. A true
   Möbius basis is not exposed by the formula DSL.
