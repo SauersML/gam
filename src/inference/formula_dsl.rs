@@ -1445,8 +1445,29 @@ pub fn parse_formula(formula: &str) -> Result<ParsedFormula, FormulaDslError> {
                     .to_string(),
             });
         }
-        // Normalize whitespace so `smooth(x)` and `smooth( x )` match.
-        let key: String = t.split_whitespace().collect();
+        // Normalize whitespace so `smooth(x)` and `smooth( x )` match,
+        // but preserve whitespace inside string literals so that
+        // `bs="a b"` and `bs="ab"` do not collide.
+        let key: String = {
+            let mut acc = String::with_capacity(t.len());
+            let mut in_single = false;
+            let mut in_double = false;
+            for ch in t.chars() {
+                match ch {
+                    '\'' if !in_double => {
+                        in_single = !in_single;
+                        acc.push(ch);
+                    }
+                    '"' if !in_single => {
+                        in_double = !in_double;
+                        acc.push(ch);
+                    }
+                    c if c.is_whitespace() && !in_single && !in_double => {}
+                    _ => acc.push(ch),
+                }
+            }
+            acc
+        };
         if !seen_term_keys.insert(key.clone()) {
             return Err(FormulaDslError::IncompatibleTerm {
                 reason: format!(

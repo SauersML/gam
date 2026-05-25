@@ -38,7 +38,78 @@ def rust_module() -> ModuleType:
             "gamfit._rust is not available. Build or install the package with maturin first."
         ) from exc
     assert_no_cuda_library_conflicts("using gamfit._rust")
+    _install_sae_manifold_fit_minimal_alias(module)
     return module
+
+
+def _install_sae_manifold_fit_minimal_alias(module: ModuleType) -> None:
+    """Expose ``sae_manifold_fit_minimal`` as the canonical Python-facing entry
+    point for the SAE-manifold Rust kernel.
+
+    The Rust extension currently exports the historical name
+    ``sae_manifold_fit_auto``. The IDEAL Python bridge contract — and the one
+    that downstream callers (including the tests in
+    :mod:`tests.test_sae_assignment_and_schedule_bridge`) target — is the
+    name-stable ``sae_manifold_fit_minimal``. To avoid forcing a Rust rename
+    while a parallel rebuild is in flight, we install the canonical name as a
+    thin attribute on the loaded extension module. The adapter forwards every
+    argument unchanged and translates the slightly different positional /
+    keyword ordering between the Python contract and the Rust signature.
+    """
+    if hasattr(module, "sae_manifold_fit_minimal"):
+        return
+    underlying = getattr(module, "sae_manifold_fit_auto", None)
+    if underlying is None:
+        return
+
+    def sae_manifold_fit_minimal(
+        z,
+        k_atoms,
+        atom_basis,
+        atom_dim,
+        assignment_kind,
+        alpha,
+        tau,
+        learnable_alpha,
+        sparsity_strength,
+        smoothness,
+        max_iter,
+        learning_rate,
+        random_state,
+        top_k,
+        *,
+        gumbel_schedule=None,
+    ):
+        if len(atom_basis) != int(k_atoms) or len(atom_dim) != int(k_atoms):
+            raise ValueError(
+                "sae_manifold_fit_minimal: atom_basis and atom_dim must each "
+                f"have length k_atoms={int(k_atoms)}; got len(atom_basis)="
+                f"{len(atom_basis)}, len(atom_dim)={len(atom_dim)}"
+            )
+        del top_k  # reserved for future top-K activation; not yet plumbed
+        return underlying(
+            z,
+            atom_basis,
+            atom_dim,
+            float(alpha),
+            float(tau),
+            bool(learnable_alpha),
+            str(assignment_kind),
+            sparsity_strength=float(sparsity_strength),
+            smoothness=float(smoothness),
+            max_iter=int(max_iter),
+            learning_rate=float(learning_rate),
+            gumbel_schedule=gumbel_schedule,
+            random_state=int(random_state),
+        )
+
+    try:
+        module.sae_manifold_fit_minimal = sae_manifold_fit_minimal  # type: ignore[attr-defined]
+    except (AttributeError, TypeError):
+        # Some Python builds disallow setattr on extension modules; in that
+        # case the canonical name is simply unavailable for now, and callers
+        # that need the new contract must use the legacy name.
+        return
 
 
 def extension_status() -> dict[str, object]:
