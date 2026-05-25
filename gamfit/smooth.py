@@ -94,6 +94,19 @@ class Smooth(_BasisDescriptor):
         repr=False,
     )
 
+    def __new__(cls, *args: Any, **kwargs: Any):
+        # Four-tuple composition dispatch: ``Smooth(latent=..., basis=...,
+        # penalty=...)`` lowers through :func:`gamfit._compose.compose_smooth`
+        # to a :class:`ComposedSmooth` (a ``Smooth`` subclass). Subclass paths
+        # (Duchon, BSpline, ...) are untouched — their generated dataclass
+        # ``__init__`` runs after this returns a fresh blank instance via
+        # ``object.__new__``.
+        if cls is Smooth and "latent" in kwargs:
+            from ._compose import compose_smooth
+            latent = kwargs.pop("latent")
+            return compose_smooth(latent, *args, **kwargs)
+        return object.__new__(cls)
+
     # ------------------------------------------------------------------
     # Callable-basis protocol is inherited from
     # :class:`gamfit._basis_protocol.BasisDescriptor`. Concrete subclasses
@@ -201,6 +214,12 @@ class Duchon(Smooth):
         from ._basis_eval import duchon_evaluate
         return duchon_evaluate(self, coords)
 
+    def _evaluate_numpy(self, coords: Any) -> Any:
+        from ._basis_eval import duchon_evaluate_numpy
+        return duchon_evaluate_numpy(self, coords)
+
+    SUPPORTED_BACKENDS: frozenset[str] = frozenset({"torch", "numpy", "jax"})
+
 
 @dataclass(slots=True)
 class BSpline(Smooth):
@@ -232,6 +251,12 @@ class BSpline(Smooth):
         from ._basis_eval import bspline_evaluate
         return bspline_evaluate(self, coords)
 
+    def _evaluate_numpy(self, coords: Any) -> Any:
+        from ._basis_eval import bspline_evaluate_numpy
+        return bspline_evaluate_numpy(self, coords)
+
+    SUPPORTED_BACKENDS: frozenset[str] = frozenset({"torch", "numpy", "jax"})
+
 
 @dataclass(slots=True)
 class TensorBSpline(Smooth):
@@ -260,6 +285,12 @@ class TensorBSpline(Smooth):
     def _evaluate_torch(self, coords: Any) -> Any:
         from ._basis_eval import tensor_bspline_evaluate
         return tensor_bspline_evaluate(self, coords)
+
+    def _evaluate_numpy(self, coords: Any) -> Any:
+        from ._basis_eval import tensor_bspline_evaluate_numpy
+        return tensor_bspline_evaluate_numpy(self, coords)
+
+    SUPPORTED_BACKENDS: frozenset[str] = frozenset({"torch", "numpy", "jax"})
 
 
 @dataclass(slots=True)
@@ -314,6 +345,12 @@ class Matern(Smooth):
     def _evaluate_torch(self, coords: Any) -> Any:
         from ._basis_eval import matern_evaluate
         return matern_evaluate(self, coords)
+
+    # Matern is pure-torch math (half-integer ν fast path), not a Rust FFI
+    # path. NumPy and JAX backends are not wired; declare torch-only so
+    # ``evaluate(..., backend='numpy')`` raises a clean error instead of
+    # silently dropping autograd.
+    SUPPORTED_BACKENDS: frozenset[str] = frozenset({"torch"})
 
 
 @dataclass(init=False, slots=True)
@@ -394,6 +431,12 @@ class Pca(Smooth):
         from ._basis_eval import pca_evaluate
         return pca_evaluate(self, coords)
 
+    def _evaluate_numpy(self, coords: Any) -> Any:
+        from ._basis_eval import pca_evaluate_numpy
+        return pca_evaluate_numpy(self, coords)
+
+    SUPPORTED_BACKENDS: frozenset[str] = frozenset({"torch", "numpy", "jax"})
+
 
 @dataclass(slots=True)
 class Sphere(Smooth):
@@ -422,6 +465,50 @@ class Sphere(Smooth):
     penalty_order: int = 2
     kernel: str = "sobolev"
     radians: bool = False
+
+    @property
+    def intrinsic_dim(self) -> int:
+        return 2
+
+    @property
+    def basis_size(self) -> int:
+        # Determined by the Rust ``sphere_basis`` call shape. Probe with two
+        # dummy points and cache.
+        cached = getattr(self, "_cached_basis_size", None)
+        if cached is not None:
+            return cached
+        import numpy as np
+
+        from . import _api
+
+        probe = np.zeros((2, 2), dtype=np.float64)
+        if not self.radians:
+            probe[1, 0] = 1.0
+        design, _ = _api.rust_module().sphere_basis(
+            probe,
+            int(self.n_centers),
+            int(self.penalty_order),
+            str(self.kernel),
+            bool(self.radians),
+        )
+        size = int(np.asarray(design).shape[1])
+        object.__setattr__(self, "_cached_basis_size", size)
+        return size
+
+    def _evaluate_numpy(self, coords: Any) -> Any:
+        from ._basis_eval import sphere_evaluate_numpy
+        return sphere_evaluate_numpy(self, coords)
+
+    def _evaluate_torch(self, coords: Any) -> Any:
+        from ._basis_eval import sphere_evaluate_numpy
+        from ._basis_protocol import _torch
+
+        torch = _torch()
+        pts_np = coords.detach().cpu().double().numpy()
+        design = sphere_evaluate_numpy(self, pts_np)
+        return torch.as_tensor(design, dtype=coords.dtype, device=coords.device)
+
+    SUPPORTED_BACKENDS: frozenset[str] = frozenset({"torch", "numpy", "jax"})
 
 
 @dataclass(slots=True)
@@ -460,6 +547,19 @@ class PeriodicSplineCurve(Smooth):
         torch = _torch()
         t_mod = t - torch.floor(t)
         return _periodic_curve_basis(t_mod, int(self.n_knots), int(self.degree))
+
+    def _evaluate_numpy(self, coords: Any) -> Any:
+        import numpy as np
+
+        from ._basis_eval import periodic_curve_evaluate_numpy
+
+        coords_np = np.asarray(coords, dtype=np.float64)
+        # Match the torch path: reduce t modulo 1 before evaluating.
+        coords_np = coords_np.copy()
+        coords_np[:, 0] = coords_np[:, 0] - np.floor(coords_np[:, 0])
+        return periodic_curve_evaluate_numpy(self, coords_np)
+
+    SUPPORTED_BACKENDS: frozenset[str] = frozenset({"torch", "numpy", "jax"})
 
 
 @dataclass(slots=True)

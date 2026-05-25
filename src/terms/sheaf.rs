@@ -338,7 +338,9 @@ impl SheafConsistencyPenalty {
             self.total_dim(),
             "stacked stalk vector has wrong length",
         );
-        let _ = s; // L is constant in s; argument retained for trait-style symmetry.
+        // L is constant in s; the argument is retained only for trait-style symmetry
+        // (other penalties take target as the first arg). The shape assertion above
+        // exercises that input.
         let mut diag = Array1::<f64>::zeros(self.total_dim());
         for (e, &(u, v)) in self.edges.iter().enumerate() {
             let restriction = &self.restrictions[e];
