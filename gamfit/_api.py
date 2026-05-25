@@ -111,25 +111,6 @@ def _shared_group_label(group: SharedPrecisionGroup, model_key: str | int) -> st
     )
 
 
-def _coefficient_indices_for_precision_label(state: Mapping[str, Any], label: str) -> list[int]:
-    provenance = state.get("coefficient_provenance")
-    if not isinstance(provenance, list):
-        raise ValueError("model coefficient state does not include coefficient provenance")
-    matches: list[int] = []
-    for fallback_index, item in enumerate(provenance):
-        if not isinstance(item, Mapping):
-            continue
-        index = int(item.get("index", fallback_index))
-        candidates = (
-            item.get("term"),
-            item.get("column"),
-            item.get("label"),
-        )
-        if any(str(candidate) == label for candidate in candidates if candidate is not None):
-            matches.append(index)
-    return matches
-
-
 def cross_fit_shared_precision_groups(
     models: Sequence[Model] | Mapping[str, Model],
     groups: Sequence[SharedPrecisionGroup | Mapping[str, Any]] | Mapping[str, Any],
@@ -3143,31 +3124,6 @@ def _resolve_basis_locations(
     if kind in {"duchon", "duchonspline"}:
         return _resolve_centers(arg, t_arr, label=label)
     return _resolve_knots(arg, t_arr, label=label, degree=degree)
-
-
-def _position_basis_dim(
-    knots_or_centers: Any,
-    basis_kind: str,
-    basis_order: int,
-    periodic: bool,
-) -> int:
-    """Return the basis dimension (= design ncols) for a position basis.
-
-    Used to size a default identity penalty when the caller omits one.
-    """
-    kind = str(basis_kind).strip().lower().replace("_", "").replace("-", "")
-    n = int(knots_or_centers.shape[0])
-    if kind in {"duchon", "duchonspline"}:
-        # The REML position path uses only the radial-basis block; the
-        # polynomial nullspace is carried as an unpenalised side channel
-        # and is not part of the penalty matrix. So the penalty must be
-        # sized to the number of centers.
-        return n
-    # Clamped B-spline: ncols = len(knots) - degree - 1. The Rust impl
-    # uses the same convention for the periodic variant; rely on the
-    # engine to reject mismatches if a periodic caller supplies a custom
-    # penalty themselves.
-    return max(n - int(basis_order) - 1, 0)
 
 
 def _attach_basis_state(
