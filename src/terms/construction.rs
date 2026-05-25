@@ -338,6 +338,34 @@ fn trace_penalty_in_orthogonal_basis(
     trace.sum()
 }
 
+pub(crate) fn trace_reduced_penalty_covariance(
+    reduced_penalty: &Array2<f64>,
+    covariance_basis: &Array2<f64>,
+) -> f64 {
+    assert_eq!(
+        reduced_penalty.dim(),
+        covariance_basis.dim(),
+        "trace_reduced_penalty_covariance dimension mismatch"
+    );
+    let r = covariance_basis.nrows();
+    let mut trace = KahanSum::default();
+    for i in 0..r {
+        for j in 0..r {
+            trace.add(covariance_basis[[i, j]] * reduced_penalty[[j, i]]);
+        }
+    }
+    trace.sum()
+}
+
+pub(crate) fn trace_penalty_covariance_in_orthogonal_basis(
+    matrix: &Array2<f64>,
+    orthogonal: &Array2<f64>,
+    covariance_basis: &Array2<f64>,
+) -> f64 {
+    let reduced = crate::faer_ndarray::fast_ab(&crate::faer_ndarray::fast_atb(orthogonal, matrix), orthogonal);
+    trace_reduced_penalty_covariance(&reduced, covariance_basis)
+}
+
 /// Strict spectral classifier used as a final guard on penalty eigendecompositions.
 ///
 /// Penalty matrices fed to the GAM solver are required to be PSD by construction.

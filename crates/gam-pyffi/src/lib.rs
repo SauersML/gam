@@ -12557,6 +12557,280 @@ fn gaussian_prediction_scores_from_predictions(
     Ok(metrics.unbind())
 }
 
+#[pyfunction]
+fn make_folds_indices(
+    py: Python<'_>,
+    y: Vec<f64>,
+    n_splits: usize,
+    seed: u64,
+    stratified: bool,
+) -> PyResult<Py<PyList>> {
+    let n = y.len();
+    if n < n_splits {
+        return Err(PyValueError::new_err(format!(
+            "Need at least {n_splits} rows for {n_splits}-fold CV; got {n}"
+        )));
+    }
+    let mut rng = SplitMixNormalRng::new(seed);
+    let all_idx: Vec<usize> = (0..n).collect();
+    let folds = PyList::empty(py);
+    let append_fold =
+        |folds: &Bound<'_, PyList>, test_idx: Vec<usize>, all_idx: &[usize]| -> PyResult<()> {
+            let test_set: BTreeSet<usize> = test_idx.iter().copied().collect();
+            let train_idx: Vec<usize> = all_idx
+                .iter()
+                .copied()
+                .filter(|idx| !test_set.contains(idx))
+                .collect();
+            folds.append((train_idx, test_idx))
+        };
+
+    if n_splits == 1 {
+        if n < 2 {
+            return Err(PyValueError::new_err(
+                "Need at least 2 rows for a holdout split",
+            ));
+        }
+        if stratified {
+            let mut classes: Vec<u64> = y.iter().map(|value| value.to_bits()).collect();
+            classes.sort_unstable();
+            classes.dedup();
+            if classes.len() >= 2 {
+                let mut test_rows = Vec::new();
+                for class_bits in classes {
+                    let mut idx: Vec<usize> = y
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, value)| (value.to_bits() == class_bits).then_some(i))
+                        .collect();
+                    rng.shuffle(&mut idx);
+                    if idx.len() < 2 {
+                        return Err(PyValueError::new_err(
+                            "Need at least 2 observations in each class for a stratified holdout split",
+                        ));
+                    }
+                    let n_test = (((idx.len() as f64) * 0.2).round() as usize)
+                        .max(1)
+                        .min(idx.len() - 1);
+                    test_rows.extend_from_slice(&idx[..n_test]);
+                }
+                test_rows.sort_unstable();
+                append_fold(&folds, test_rows, &all_idx)?;
+                return Ok(folds.unbind());
+            }
+        }
+        let mut perm = all_idx.clone();
+        rng.shuffle(&mut perm);
+        let n_test = (((n as f64) * 0.2).round() as usize).max(1).min(n - 1);
+        let mut test_idx = perm[..n_test].to_vec();
+        test_idx.sort_unstable();
+        append_fold(&folds, test_idx, &all_idx)?;
+        return Ok(folds.unbind());
+    }
+
+    if stratified {
+        let mut classes: Vec<u64> = y.iter().map(|value| value.to_bits()).collect();
+        classes.sort_unstable();
+        classes.dedup();
+        if classes.len() >= 2 {
+            let mut fold_bins = vec![Vec::<usize>::new(); n_splits];
+            for class_bits in classes {
+                let mut idx: Vec<usize> = y
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, value)| (value.to_bits() == class_bits).then_some(i))
+                    .collect();
+                rng.shuffle(&mut idx);
+                for (i, row_idx) in idx.into_iter().enumerate() {
+                    fold_bins[i % n_splits].push(row_idx);
+                }
+            }
+            for mut test_idx in fold_bins {
+                test_idx.sort_unstable();
+                append_fold(&folds, test_idx, &all_idx)?;
+            }
+            return Ok(folds.unbind());
+        }
+    }
+
+    let mut perm = all_idx.clone();
+    rng.shuffle(&mut perm);
+    for fold in 0..n_splits {
+        let start = (fold * n) / n_splits;
+        let end = ((fold + 1) * n) / n_splits;
+        let mut test_idx = perm[start..end].to_vec();
+        test_idx.sort_unstable();
+        append_fold(&folds, test_idx, &all_idx)?;
+    }
+    Ok(folds.unbind())
+}
+
+#[pyfunction]
+fn zscore_train_test_arrays<'py>(
+    py: Python<'py>,
+    train: PyReadonlyArray2<'py, f64>,
+    test: PyReadonlyArray2<'py, f64>,
+) -> PyResult<(Py<PyArray2<f64>>, Py<PyArray2<f64>>)> {
+    let train_view = train.as_array();
+    let test_view = test.as_array();
+    if train_view.ncols() != test_view.ncols() {
+        return Err(PyValueError::new_err(format!(
+            "zscore column mismatch: train={} test={}",
+            train_view.ncols(),
+            test_view.ncols()
+        )));
+    }
+    let mut tr = train_view.to_owned();
+    let mut te = test_view.to_owned();
+    for col in 0..tr.ncols() {
+        let n = tr.nrows();
+        let mean = if n == 0 {
+            0.0
+        } else {
+            tr.column(col).iter().sum::<f64>() / n as f64
+        };
+        let variance = if n > 1 {
+            tr.column(col)
+                .iter()
+                .map(|value| {
+                    let centered = *value - mean;
+                    centered * centered
+                })
+                .sum::<f64>()
+                / (n - 1) as f64
+        } else {
+            0.0
+        };
+        let mut sd = variance.sqrt();
+        if !sd.is_finite() || sd < 1e-8 {
+            sd = 1.0;
+        }
+        for value in tr.column_mut(col).iter_mut() {
+            *value = (*value - mean) / sd;
+        }
+        for value in te.column_mut(col).iter_mut() {
+            *value = (*value - mean) / sd;
+        }
+    }
+    Ok((tr.into_pyarray(py).unbind(), te.into_pyarray(py).unbind()))
+}
+
+#[pyfunction]
+fn survival_score_grid_from_times<'py>(
+    py: Python<'py>,
+    train_times: Vec<f64>,
+) -> PyResult<Py<PyArray1<f64>>> {
+    let mut times: Vec<f64> = train_times
+        .into_iter()
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .collect();
+    if times.is_empty() {
+        return Ok(Array1::from_vec(vec![0.0, 1.0]).into_pyarray(py).unbind());
+    }
+    times.sort_by(|a, b| a.total_cmp(b));
+    let median = if times.len() % 2 == 1 {
+        times[times.len() / 2]
+    } else {
+        0.5 * (times[times.len() / 2 - 1] + times[times.len() / 2])
+    };
+    let mut grid = vec![0.0, 1.0, 2.0, 5.0, 10.0, median];
+    grid.retain(|value| value.is_finite() && *value >= 0.0);
+    grid.sort_by(|a, b| a.total_cmp(b));
+    grid.dedup_by(|a, b| *a == *b);
+    if grid.is_empty() {
+        grid.push(0.0);
+    }
+    grid[0] = 0.0;
+    if grid.len() == 1 {
+        grid.push(grid[0].max(1.0));
+    }
+    Ok(Array1::from_vec(grid).into_pyarray(py).unbind())
+}
+
+#[pyfunction]
+fn repeat_survival_curve<'py>(
+    py: Python<'py>,
+    survival: Vec<f64>,
+    n_rows: usize,
+) -> PyResult<Py<PyArray2<f64>>> {
+    let mut out = Array2::<f64>::zeros((n_rows, survival.len()));
+    for mut row in out.rows_mut() {
+        for (dst, src) in row.iter_mut().zip(survival.iter()) {
+            *dst = *src;
+        }
+    }
+    Ok(out.into_pyarray(py).unbind())
+}
+
+fn benchmark_km_curve(times: &[f64], events: &[f64], grid: &[f64]) -> Vec<f64> {
+    let mut rows: Vec<(f64, bool)> = times
+        .iter()
+        .zip(events.iter())
+        .filter_map(|(&time, &event)| {
+            (time.is_finite() && event.is_finite() && time > 0.0).then_some((time, event > 0.5))
+        })
+        .collect();
+    if rows.is_empty() {
+        return vec![1.0; grid.len()];
+    }
+    rows.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut steps = Vec::<(f64, f64)>::new();
+    let mut at_risk = rows.len() as f64;
+    let mut survival = 1.0;
+    let mut i = 0usize;
+    while i < rows.len() {
+        let time = rows[i].0;
+        let mut j = i + 1;
+        let mut events_at_time = usize::from(rows[i].1);
+        while j < rows.len() && rows[j].0 == time {
+            events_at_time += usize::from(rows[j].1);
+            j += 1;
+        }
+        if events_at_time > 0 && at_risk > 0.0 {
+            survival *= ((at_risk - events_at_time as f64) / at_risk).max(0.0);
+            steps.push((time, survival));
+        }
+        at_risk -= (j - i) as f64;
+        i = j;
+    }
+    let mut out = Vec::with_capacity(grid.len());
+    let mut step_idx = 0usize;
+    let mut current = 1.0;
+    for &time in grid {
+        while step_idx < steps.len() && steps[step_idx].0 <= time {
+            current = steps[step_idx].1;
+            step_idx += 1;
+        }
+        out.push(current.clamp(1.0e-12, 1.0));
+    }
+    if let Some(first) = out.first_mut() {
+        *first = 1.0;
+    }
+    for idx in 1..out.len() {
+        out[idx] = out[idx].min(out[idx - 1]);
+    }
+    out
+}
+
+#[pyfunction]
+fn survival_null_curve_from_train<'py>(
+    py: Python<'py>,
+    train_times: Vec<f64>,
+    train_events: Vec<f64>,
+    grid: Vec<f64>,
+) -> PyResult<Py<PyArray1<f64>>> {
+    if train_times.len() != train_events.len() {
+        return Err(PyValueError::new_err(format!(
+            "survival null curve length mismatch: times={} events={}",
+            train_times.len(),
+            train_events.len()
+        )));
+    }
+    Ok(Array1::from_vec(benchmark_km_curve(&train_times, &train_events, &grid))
+        .into_pyarray(py)
+        .unbind())
+}
+
 // =========================================================================
 // LatentCoord input-location derivative helpers (thin pyffi wrappers).
 //
@@ -14404,99 +14678,6 @@ fn validate_aux_conditional_prior_lambda(
     Ok(())
 }
 
-#[pyclass(module = "gam_pyffi._rust", name = "AuxConditionalPriorPenalty")]
-struct AuxConditionalPriorPenalty {
-    #[pyo3(get, set)]
-    target: PyObject,
-    #[pyo3(get, set)]
-    lambda_per_row: PyObject,
-    #[pyo3(get, set)]
-    weight: f64,
-    #[pyo3(get, set)]
-    n_eff: i64,
-    #[pyo3(get, set)]
-    learnable: bool,
-    #[pyo3(get, set)]
-    weight_schedule: Option<PyObject>,
-}
-
-#[pymethods]
-impl AuxConditionalPriorPenalty {
-    #[new]
-    #[pyo3(signature = (lambda_per_row, weight, n_eff, learnable = false, *, target = "t"))]
-    fn new(
-        py: Python<'_>,
-        lambda_per_row: &Bound<'_, PyAny>,
-        weight: &Bound<'_, PyAny>,
-        n_eff: &Bound<'_, PyAny>,
-        learnable: &Bound<'_, PyAny>,
-        target: PyObject,
-    ) -> PyResult<Self> {
-        let builtins = py.import("builtins")?;
-        let weight = builtins.getattr("float")?.call1((weight,))?.extract::<f64>()?;
-        let n_eff = builtins.getattr("int")?.call1((n_eff,))?.extract::<i64>()?;
-        let learnable = learnable.is_truthy()?;
-        let lambda_per_row = aux_conditional_prior_float_array(py, lambda_per_row)?;
-        validate_aux_conditional_prior_lambda(&lambda_per_row, weight, n_eff)?;
-        Ok(Self {
-            target,
-            lambda_per_row: lambda_per_row.unbind(),
-            weight,
-            n_eff,
-            learnable,
-            weight_schedule: None,
-        })
-    }
-
-    #[classattr]
-    const KIND_TAG: &'static str = "aux_conditional_prior";
-
-    fn to_rust_descriptor(&self, py: Python<'_>) -> PyResult<PyObject> {
-        let payload = PyDict::new(py);
-        payload.set_item("kind", Self::KIND_TAG)?;
-        payload.set_item("target", target_descriptor(py, self.target.bind(py))?)?;
-
-        let array = self
-            .lambda_per_row
-            .bind(py)
-            .extract::<PyReadonlyArrayDyn<'_, f64>>()?;
-        let view = array.as_array();
-        let flattened = view.iter().copied().collect::<Vec<_>>();
-        payload.set_item("lambda_per_row", PyList::new(py, flattened)?)?;
-        payload.set_item("lambda_per_row_shape", PyList::new(py, view.shape())?)?;
-        payload.set_item("weight", self.weight)?;
-        payload.set_item("n_eff", self.n_eff)?;
-        payload.set_item("learnable", self.learnable)?;
-        if let Some(schedule) = topk_weight_schedule_descriptor(py, &self.weight_schedule)? {
-            payload.set_item("weight_schedule", schedule)?;
-        }
-        Ok(payload.into())
-    }
-
-    fn set_weight_schedule<'py>(
-        mut slf: PyRefMut<'py, Self>,
-        schedule: PyObject,
-    ) -> PyRefMut<'py, Self> {
-        slf.weight_schedule = Some(schedule);
-        slf
-    }
-
-    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
-        Ok(format!(
-            "AuxConditionalPriorPenalty(lambda_per_row={}, weight={}, n_eff={}, learnable={}, target={}, weight_schedule={})",
-            py_repr(py, self.lambda_per_row.bind(py))?,
-            self.weight,
-            self.n_eff,
-            self.learnable,
-            py_repr(py, self.target.bind(py))?,
-            match &self.weight_schedule {
-                Some(schedule) => py_repr(py, schedule.bind(py))?,
-                None => "None".to_string(),
-            }
-        ))
-    }
-}
-
 #[pyclass(module = "gam_pyffi._rust", name = "BlockSparsityPenalty")]
 struct BlockSparsityPenalty {
     #[pyo3(get, set)]
@@ -15759,6 +15940,226 @@ fn validate_ivae_ridge_mean_gauge_aux(
         ));
     }
     Ok(())
+}
+
+#[pyclass(module = "gam_pyffi._rust", name = "MechanismSparsityPenalty")]
+struct MechanismSparsityPenalty {
+    #[pyo3(get, set)]
+    target: PyObject,
+    #[pyo3(get, set)]
+    feature_groups: Vec<Vec<usize>>,
+    #[pyo3(get, set)]
+    weight: f64,
+    #[pyo3(get, set)]
+    smoothing_eps: f64,
+    #[pyo3(get, set)]
+    n_eff: f64,
+    #[pyo3(get, set)]
+    learnable: bool,
+    #[pyo3(get, set)]
+    weight_schedule: Option<PyObject>,
+}
+
+#[pymethods]
+impl MechanismSparsityPenalty {
+    #[new]
+    #[pyo3(
+        signature = (
+            feature_groups,
+            weight,
+            n_eff,
+            smoothing_eps = 1.0e-6,
+            learnable = false,
+            *,
+            target = None
+        ),
+        text_signature = "(feature_groups, weight, n_eff, smoothing_eps=1e-06, learnable=False, *, target='t')"
+    )]
+    fn new(
+        py: Python<'_>,
+        feature_groups: &Bound<'_, PyAny>,
+        weight: f64,
+        n_eff: f64,
+        smoothing_eps: f64,
+        learnable: bool,
+        target: Option<PyObject>,
+    ) -> PyResult<Self> {
+        if weight <= 0.0 {
+            return Err(PyValueError::new_err(format!(
+                "MechanismSparsityPenalty.weight must be > 0, got {weight}"
+            )));
+        }
+        if smoothing_eps <= 0.0 {
+            return Err(PyValueError::new_err(format!(
+                "MechanismSparsityPenalty.smoothing_eps must be > 0, got {smoothing_eps}"
+            )));
+        }
+        if !n_eff.is_finite() || n_eff <= 0.0 {
+            return Err(PyValueError::new_err(format!(
+                "MechanismSparsityPenalty.n_eff must be > 0, got {n_eff}"
+            )));
+        }
+        let target = match target {
+            Some(target) => target,
+            None => "t".into_pyobject(py)?.unbind().into_any(),
+        };
+        Ok(Self {
+            target,
+            feature_groups: coerce_mechanism_feature_groups(feature_groups)?,
+            weight,
+            smoothing_eps,
+            n_eff,
+            learnable,
+            weight_schedule: None,
+        })
+    }
+
+    #[classattr]
+    const KIND_TAG: &'static str = "mechanism_sparsity";
+
+    fn to_rust_descriptor(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let payload = PyDict::new(py);
+        payload.set_item("kind", Self::KIND_TAG)?;
+        set_mechanism_target_descriptor(py, &payload, &self.target)?;
+        payload.set_item("feature_groups", self.feature_groups.clone())?;
+        payload.set_item("weight", self.weight)?;
+        payload.set_item("smoothing_eps", self.smoothing_eps)?;
+        payload.set_item("n_eff", self.n_eff)?;
+        payload.set_item("learnable", self.learnable)?;
+        if let Some(schedule) = &self.weight_schedule {
+            let schedule = mechanism_weight_schedule_descriptor(py, schedule)?;
+            payload.set_item("weight_schedule", schedule)?;
+        }
+        Ok(payload.unbind().into_any())
+    }
+
+    fn set_weight_schedule<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        schedule: PyObject,
+    ) -> PyRefMut<'py, Self> {
+        slf.weight_schedule = Some(schedule);
+        slf
+    }
+
+    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        let target_repr = self.target.bind(py).repr()?.extract::<String>()?;
+        let schedule_repr = match &self.weight_schedule {
+            Some(schedule) => schedule.bind(py).repr()?.extract::<String>()?,
+            None => "None".to_string(),
+        };
+        let learnable = if self.learnable { "True" } else { "False" };
+        Ok(format!(
+            "MechanismSparsityPenalty(target={target_repr}, feature_groups={:?}, weight={}, smoothing_eps={}, n_eff={}, learnable={learnable}, weight_schedule={schedule_repr})",
+            self.feature_groups, self.weight, self.smoothing_eps, self.n_eff
+        ))
+    }
+}
+
+fn coerce_mechanism_feature_groups(feature_groups: &Bound<'_, PyAny>) -> PyResult<Vec<Vec<usize>>> {
+    let groups_iter = feature_groups.try_iter().map_err(|_| {
+        PyTypeError::new_err(
+            "MechanismSparsityPenalty.feature_groups must be a sequence of integer sequences",
+        )
+    })?;
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut max_feature = None::<usize>;
+    for (group_idx, raw_group) in groups_iter.enumerate() {
+        let raw_group = raw_group?;
+        let features_iter = raw_group.try_iter().map_err(|_| {
+            PyTypeError::new_err(
+                "MechanismSparsityPenalty.feature_groups must be a sequence of integer sequences",
+            )
+        })?;
+        let mut group = Vec::new();
+        for raw_feature in features_iter {
+            let raw_feature = raw_feature?;
+            let indexed = raw_feature.call_method0("__index__").map_err(|_| {
+                PyTypeError::new_err(
+                    "MechanismSparsityPenalty.feature_groups must be a sequence of integer sequences",
+                )
+            })?;
+            let feature = indexed.extract::<isize>().map_err(|_| {
+                PyTypeError::new_err(
+                    "MechanismSparsityPenalty.feature_groups must be a sequence of integer sequences",
+                )
+            })?;
+            if feature < 0 {
+                return Err(PyValueError::new_err(format!(
+                    "MechanismSparsityPenalty.feature_groups entries must be non-negative; got {feature}"
+                )));
+            }
+            let feature = usize::try_from(feature).map_err(|_| {
+                PyValueError::new_err(format!(
+                    "MechanismSparsityPenalty.feature_groups entries must be non-negative; got {feature}"
+                ))
+            })?;
+            if !seen.insert(feature) {
+                return Err(PyValueError::new_err(format!(
+                    "MechanismSparsityPenalty.feature_groups feature {feature} appears more than once"
+                )));
+            }
+            max_feature = Some(max_feature.map_or(feature, |current| current.max(feature)));
+            group.push(feature);
+        }
+        if group.is_empty() {
+            return Err(PyValueError::new_err(format!(
+                "MechanismSparsityPenalty.feature_groups[{group_idx}] must not be empty"
+            )));
+        }
+        out.push(group);
+    }
+    if out.is_empty() {
+        return Err(PyValueError::new_err(
+            "MechanismSparsityPenalty.feature_groups must not be empty",
+        ));
+    }
+    if let Some(max_feature) = max_feature {
+        for feature in 0..=max_feature {
+            if !seen.contains(&feature) {
+                return Err(PyValueError::new_err(format!(
+                    "MechanismSparsityPenalty.feature_groups must partition contiguous features from 0; missing feature {feature}"
+                )));
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn set_mechanism_target_descriptor(
+    py: Python<'_>,
+    payload: &Bound<'_, PyDict>,
+    target: &PyObject,
+) -> PyResult<()> {
+    let target = target.bind(py);
+    if let Ok(target_name) = target.extract::<String>() {
+        payload.set_item("target", target_name)?;
+        return Ok(());
+    }
+    if let Ok(target_index) = target.extract::<isize>() {
+        payload.set_item("target", target_index)?;
+        return Ok(());
+    }
+    if let Ok(name) = target.getattr("name") {
+        payload.set_item("target", name.str()?.to_str()?)?;
+        return Ok(());
+    }
+    Err(PyTypeError::new_err(
+        "analytic penalty target must be a latent block name, latent block index, or object exposing a 'name' attribute",
+    ))
+}
+
+fn mechanism_weight_schedule_descriptor(py: Python<'_>, schedule: &PyObject) -> PyResult<PyObject> {
+    let schedule = schedule.bind(py);
+    if schedule.hasattr("to_rust_descriptor")? {
+        return Ok(schedule.call_method0("to_rust_descriptor")?.unbind());
+    }
+    if schedule.downcast::<PyDict>().is_ok() {
+        return Ok(schedule.clone().unbind());
+    }
+    Err(PyTypeError::new_err(
+        "weight_schedule must be ScalarWeightSchedule, a mapping, or None",
+    ))
 }
 
 #[pymodule(name = "_rust", gil_used = false)]
