@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from html import escape
 from typing import Any
+
+_HTML_EXCLUDED_KEYS = frozenset({"coefficients", "covariance_flat"})
+_HTML_COEFFICIENT_LIMIT = 50
+_VALUE_PREVIEW_LIMIT = 6
 
 
 @dataclass(frozen=True, slots=True)
@@ -16,7 +21,7 @@ class Summary:
 
     The payload typically contains keys such as ``formula``, ``family_name``,
     ``model_class``, ``deviance``, ``reml_score``, and ``coefficients`` (a list
-    of per-term dictionaries). Use :meth:`coefficients_frame` to view the
+    of per-coefficient dictionaries). Use :meth:`coefficients_frame` to view the
     coefficient table as a pandas DataFrame.
 
     Examples
@@ -93,18 +98,18 @@ class Summary:
 
     @property
     def coefficients(self) -> list[dict[str, Any]]:
-        """List of per-term coefficient records.
+        """List of per-coefficient records.
 
         Returns
         -------
         list of dict
-            One record per fitted term, each with keys such as ``term``,
-            ``estimate``, ``std_error``, and ``edf`` depending on the model.
+            One record per fitted coefficient, each with keys such as
+            ``index``, ``estimate``, and ``std_error`` depending on the model.
 
         Examples
         --------
-        >>> summary.coefficients[0]["term"]
-        '(Intercept)'
+        >>> summary.coefficients[0]["index"]
+        0
         """
         return list(self.payload.get("coefficients", []))
 
@@ -114,14 +119,14 @@ class Summary:
         Returns
         -------
         pandas.DataFrame
-            One row per term, columns mirror the keys in
+            One row per coefficient, columns mirror the keys in
             :attr:`coefficients` records.
 
         Examples
         --------
         >>> frame = summary.coefficients_frame()
         >>> frame.columns.tolist()[:2]
-        ['term', 'estimate']
+        ['index', 'estimate']
         """
         import pandas as pd
 
@@ -141,12 +146,14 @@ class Summary:
             f"<td style='padding:0.25rem 0;'>{escape(_render_value(value))}</td>"
             "</tr>"
             for key, value in self.payload.items()
-            if key != "coefficients"
+            if key not in _HTML_EXCLUDED_KEYS
         )
+        coefficient_table = _render_coefficients_html(self.coefficients)
         return (
             "<div style='font-family: ui-sans-serif, system-ui, sans-serif;'>"
             "<h3 style='margin:0 0 0.5rem 0;'>Model Summary</h3>"
             f"<table style='border-collapse:collapse;'>{rows}</table>"
+            f"{coefficient_table}"
             "</div>"
         )
 
@@ -154,4 +161,74 @@ class Summary:
 def _render_value(value: Any) -> str:
     if isinstance(value, float):
         return f"{value:.6g}"
+    if isinstance(value, Mapping):
+        return _render_mapping_value(value)
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return _render_sequence_value(value)
     return str(value)
+
+
+def _render_mapping_value(value: Mapping[Any, Any]) -> str:
+    if not value:
+        return "{}"
+    items = list(value.items())
+    preview = ", ".join(
+        f"{key}: {_render_value(item_value)}"
+        for key, item_value in items[:_VALUE_PREVIEW_LIMIT]
+    )
+    suffix = "" if len(items) <= _VALUE_PREVIEW_LIMIT else f", ... ({len(items)} total)"
+    return "{" + preview + suffix + "}"
+
+
+def _render_sequence_value(value: Sequence[Any]) -> str:
+    if not value:
+        return "[]"
+    preview = ", ".join(_render_value(item) for item in value[:_VALUE_PREVIEW_LIMIT])
+    suffix = "" if len(value) <= _VALUE_PREVIEW_LIMIT else f", ... ({len(value)} total)"
+    return "[" + preview + suffix + "]"
+
+
+def _render_coefficients_html(coefficients: list[dict[str, Any]]) -> str:
+    if not coefficients:
+        return ""
+    columns = _coefficient_columns(coefficients)
+    header_cells = "".join(
+        "<th style='text-align:right;padding:0.25rem 0.75rem;"
+        f"border-bottom:1px solid #ddd;'>{escape(column)}</th>"
+        for column in columns
+    )
+    body_rows = "".join(
+        "<tr>"
+        + "".join(
+            "<td style='text-align:right;padding:0.25rem 0.75rem;'>"
+            f"{escape(_render_value(row.get(column, '')))}</td>"
+            for column in columns
+        )
+        + "</tr>"
+        for row in coefficients[:_HTML_COEFFICIENT_LIMIT]
+    )
+    omitted = len(coefficients) - _HTML_COEFFICIENT_LIMIT
+    note = (
+        "<p style='margin:0.25rem 0 0 0;color:#666;'>"
+        f"Showing first {_HTML_COEFFICIENT_LIMIT} of {len(coefficients)} "
+        "coefficients.</p>"
+        if omitted > 0
+        else ""
+    )
+    return (
+        "<h4 style='margin:1rem 0 0.35rem 0;'>Coefficients</h4>"
+        "<table style='border-collapse:collapse;'>"
+        f"<thead><tr>{header_cells}</tr></thead>"
+        f"<tbody>{body_rows}</tbody>"
+        "</table>"
+        f"{note}"
+    )
+
+
+def _coefficient_columns(coefficients: list[dict[str, Any]]) -> list[str]:
+    columns: list[str] = []
+    for row in coefficients:
+        for key in row:
+            if key not in columns:
+                columns.append(key)
+    return columns
