@@ -10848,6 +10848,23 @@ fn joint_trust_region_metric_step_norm(delta: &Array1<f64>, metric_diag: &Array1
         .sqrt()
 }
 
+fn joint_trust_region_block_metric_norms(
+    delta: &Array1<f64>,
+    ranges: &[(usize, usize)],
+    metric_diag: &Array1<f64>,
+) -> Vec<f64> {
+    assert_eq!(delta.len(), metric_diag.len());
+    ranges
+        .iter()
+        .map(|(start, end)| {
+            joint_trust_region_metric_step_norm(
+                &delta.slice(s![*start..*end]).to_owned(),
+                &metric_diag.slice(s![*start..*end]).to_owned(),
+            )
+        })
+        .collect()
+}
+
 fn truncate_joint_step_to_radius(delta: &mut Array1<f64>, radius: f64) -> f64 {
     let norm = joint_trust_region_step_norm(delta);
     if norm.is_finite() && norm > radius && radius > 0.0 {
@@ -10858,18 +10875,28 @@ fn truncate_joint_step_to_radius(delta: &mut Array1<f64>, radius: f64) -> f64 {
     }
 }
 
-fn truncate_joint_step_to_metric_radius(
+fn truncate_joint_step_to_block_metric_radii(
     delta: &mut Array1<f64>,
-    radius: f64,
+    ranges: &[(usize, usize)],
     metric_diag: &Array1<f64>,
-) -> f64 {
-    let norm = joint_trust_region_metric_step_norm(delta, metric_diag);
-    if norm.is_finite() && norm > radius && radius > 0.0 {
-        delta.mapv_inplace(|v| v * (radius / norm));
-        radius
-    } else {
-        norm
+    block_radii: &[f64],
+) -> Vec<f64> {
+    assert_eq!(ranges.len(), block_radii.len());
+    assert_eq!(delta.len(), metric_diag.len());
+    let mut norms = Vec::with_capacity(ranges.len());
+    for (block_idx, (start, end)) in ranges.iter().copied().enumerate() {
+        let metric = metric_diag.slice(s![start..end]).to_owned();
+        let mut block = delta.slice_mut(s![start..end]);
+        let norm = joint_trust_region_metric_step_norm(&block.to_owned(), &metric);
+        let radius = block_radii[block_idx];
+        if norm.is_finite() && norm > radius && radius > 0.0 {
+            block.mapv_inplace(|v| v * (radius / norm));
+            norms.push(radius);
+        } else {
+            norms.push(norm);
+        }
     }
+    norms
 }
 
 fn apply_block_local_feasibility_limits<F: CustomFamily + ?Sized>(
