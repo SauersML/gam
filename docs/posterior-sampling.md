@@ -2,9 +2,9 @@
 
 `gamfit` fits smoothing parameters by REML / LAML (a point estimate)
 and then draws from the posterior of the coefficients conditional on
-those smoothing parameters. The sampler dispatches between NUTS and a
-Gaussian Laplace approximation based on model class; see
-[When NUTS, when Laplace](#when-nuts-when-laplace) below.
+those smoothing parameters. The sampler dispatches among NUTS,
+Polya-Gamma Gibbs, and a Gaussian Laplace approximation based on model
+class; see [Sampler dispatch](#sampler-dispatch) below.
 
 ## Quick start
 
@@ -44,7 +44,7 @@ model.sample(
 
 Total returned draws are `chains * samples`.
 
-## When NUTS, when Laplace
+## Sampler dispatch
 
 The dispatch is in `src/inference/sample.rs::sample_saved_model`:
 
@@ -66,9 +66,9 @@ likelihood; it is unrelated to the transformation-normal class.
 
 The Laplace path draws iid samples from `N(beta_hat, phi * H_penalized^{-1})`
 using the saved penalized Hessian's Cholesky factor and the saved dispersion
-scale. The Python/FFI
-wrapper sets `method == "laplace"` on these results; the underlying
-Rust `NutsResult` reports `rhat == 1.0`, `ess == chains * samples`, and
+scale. The Python/FFI wrapper sets `method == "laplace"` on these
+results; the underlying Rust `NutsResult` reports `rhat == 1.0`,
+`ess == chains * samples`, and
 `converged == True` by construction. The `PosteriorSamples` API is
 identical either way. The Polya-Gamma Gibbs path also surfaces under
 `method == "nuts"` in the current build.
