@@ -124,6 +124,10 @@ from ._select_topology import (
     select_topology,
 )
 from ._diagnostics import Diagnostics
+from .identifiability import (
+    IdentifiableFactorFitResult,
+    identifiable_factor_fit,
+)
 from ._equivariant import (
     EquivariantPenalty,
     GaugeCompanion,
@@ -148,7 +152,12 @@ from .smooth import (
     Sphere,
     TensorBSpline,
 )
-from . import topology
+from . import recipes, topology
+from .recipes import (
+    PartialSupervisionFit,
+    PartialSupervisionRecipe,
+    partial_supervision,
+)
 from ._exceptions import FormulaError, GamError, PredictionError, SchemaMismatchError
 from ._model import (
     CompetingRisksCIF,
@@ -216,6 +225,9 @@ def __getattr__(name: str):
     if name == "Crosscoder":
         from .crosscoder import Crosscoder as _Crosscoder
         return _Crosscoder
+    if name == "InterchangeSwapDecoder":
+        from .torch.interchange import InterchangeSwapDecoder as _InterchangeSwapDecoder
+        return _InterchangeSwapDecoder
     raise AttributeError(f"module 'gamfit' has no attribute {name!r}")
 
 
@@ -249,9 +261,14 @@ __all__ = [
     "AdaptiveTopK",
     "Crosscoder",
     "Diagnostics",
+    "InterchangeSwapDecoder",
     "EquivariantPenalty",
     "GaugeCompanion",
     "LieAtom",
+    "PartialSupervisionFit",
+    "PartialSupervisionRecipe",
+    "partial_supervision",
+    "recipes",
     "equivariant_smooth",
     "gauge_companion",
     "rho_so2",
@@ -297,6 +314,8 @@ __all__ = [
     "BlockSparsityPenalty",
     "GatedSAEDecoder",
     "IBPAssignmentPenalty",
+    "IdentifiableFactorFitResult",
+    "identifiable_factor_fit",
     "IsometryPenalty",
     "IvaeRidgeMeanGauge",
     "MechanismSparsityPenalty",
