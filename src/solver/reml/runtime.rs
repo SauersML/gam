@@ -10111,6 +10111,24 @@ mod ift_warm_start_tests {
     use crate::linalg::matrix::SymmetricMatrix;
     use ndarray::Array2;
 
+    #[test]
+    fn joint_ift_cache_rejects_pending_theta_when_extended_hyperparameters_change() {
+        let cache = super::IftJointModeResponseRuntimeCache {
+            theta: Array1::from_vec(vec![0.1, -0.2, 0.5]),
+            rho_dim: 2,
+            beta_original: Array1::from_vec(vec![1.0]),
+            mode_response_cols: Array2::zeros((1, 3)),
+            active_constraints: false,
+        };
+        let pending_theta = Array1::from_vec(vec![0.1, -0.2, 0.9]);
+        let new_rho = Array1::from_vec(vec![0.1, -0.2]);
+
+        assert!(
+            !super::joint_ift_cache_matches_theta(&cache, &pending_theta, &new_rho),
+            "extended hyperparameters must participate in joint IFT cache validity"
+        );
+    }
+
     /// Test-only entry into `predict_warm_start_beta_ift_inner_with_outcome`
     /// that drops the outcome — the production
     /// `RemlState::predict_warm_start_beta_ift_with_outcome` path uses the

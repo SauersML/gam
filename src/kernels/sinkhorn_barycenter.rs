@@ -942,6 +942,26 @@ mod tests {
     }
 
     #[test]
+    fn sentinel_saturated_log_a_returns_error() {
+        let m = 3;
+        let atoms = Array2::<f64>::from_elem((1, m), 1.0 / m as f64);
+        let weights = array![1.0];
+        let cost = Array2::<f64>::from_elem((m, m), 1.0e288);
+        let err = sinkhorn_barycenter(
+            atoms.view(),
+            weights.view(),
+            cost.view(),
+            MIN_EPS,
+            1,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("all log_a saturated to sentinel"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn batch_kbig_runs_quick() {
         let m = 64;
         let k = 128;

@@ -7815,6 +7815,26 @@ mod tests {
     }
 
     #[test]
+    fn jumprelu_hessian_diag_majorizer_is_psd_above_threshold() {
+        let tau = 0.25_f64;
+        let eps = 0.04_f64;
+        let target = Array1::from_vec((1..=5).map(|step| tau + step as f64 * eps).collect());
+        let slice = PsiSlice::full(target.len(), Some(1));
+        let pen = JumpReLUPenalty::new(slice, array![tau], 1.3, eps)
+            .expect("valid JumpReLU penalty");
+        let rho = array![0.0_f64];
+        let diag = pen
+            .hessian_diag(target.view(), rho.view())
+            .expect("JumpReLU exposes a PSD diagonal majorizer");
+        for (&x, &entry) in target.iter().zip(diag.iter()) {
+            assert!(
+                x > tau && entry >= 0.0 && entry.is_finite(),
+                "JumpReLU hessian_diag majorizer must be finite and PSD above tau; x={x}, entry={entry}"
+            );
+        }
+    }
+
+    #[test]
     fn ard_rho_grad_includes_occam_log_det_term() {
         let d = 2;
         let t = array![1.0_f64, 0.0, 0.0, 2.0];

@@ -801,8 +801,27 @@ impl LatentCoordValues {
     pub fn retract_flat_delta(&mut self, delta: ArrayView1<'_, f64>) {
         assert_eq!(delta.len(), self.values.len());
         if self.retraction_registry.is_all_euclidean() {
-            for (t, dt) in self.values.iter_mut().zip(delta.iter()) {
-                *t += *dt;
+            if self.manifold.is_euclidean() {
+                for (t, dt) in self.values.iter_mut().zip(delta.iter()) {
+                    *t += *dt;
+                }
+                return;
+            }
+            assert_eq!(
+                self.manifold.ambient_dim(self.latent_dim),
+                self.latent_dim,
+                "LatentCoordValues::retract_flat_delta: manifold ambient dim does not match latent_dim",
+            );
+            for n in 0..self.n_obs {
+                let start = n * self.latent_dim;
+                let end = start + self.latent_dim;
+                let next = self.manifold.retract(
+                    self.values.slice(ndarray::s![start..end]),
+                    delta.slice(ndarray::s![start..end]),
+                );
+                for a in 0..self.latent_dim {
+                    self.values[start + a] = next[a];
+                }
             }
             return;
         }

@@ -20910,19 +20910,16 @@ pub fn sphere_first_derivative_nd(
     Ok(out)
 }
 
-/// N-D periodic-cyclic-B-spline first-derivative jet `∂Φ/∂t` per row.
+/// N-D periodic-cyclic-B-spline first-derivative jet `∂Φ̃/∂t` per row.
 ///
 /// One-dimensional periodic B-spline basis (one latent axis). `t` is the
 /// `(n_rows, 1)` latent matrix; each row evaluates a length-`num_basis`
 /// derivative stencil w.r.t. the scalar latent coordinate. The result is
-/// `(n_rows, num_basis, 1)`. This is the analytic uniform-cardinal
-/// derivative used by [`create_periodic_bspline_derivative_dense`]; the
+/// `(n_rows, num_basis, 1)`. This is the derivative of the row-normalized
+/// design returned by [`build_periodic_bspline_basis_1d`]. The raw
 /// derivative formula `B'_i(x) = (B_{i,k−1}(x) − B_{i+1,k−1}(x)) / h` is
-/// exact at every `x` (closed-form by the standard `cardinal_bspline`
-/// recurrence). Periodic wraparound is handled by `rem_euclid` on the
-/// integer index — derivative values do **not** suffer the jump that the
-/// pointwise basis values do at knot collisions because the cardinal
-/// derivative is itself a continuous function (degree − 1).
+/// evaluated alongside the unnormalized basis row `Φ`; the returned row uses
+/// the quotient rule for `Φ̃ = Φ / S`, where `S = Σ_j Φ_j`.
 pub fn periodic_bspline_first_derivative_nd(
     t: ArrayView2<'_, f64>,
     data_range: (f64, f64),
@@ -20952,19 +20949,11 @@ pub fn periodic_bspline_first_derivative_nd(
         )));
     }
     let period = end - start;
-    let m = num_basis as f64;
-    let h = period / m;
     let n_rows = t.nrows();
     let t_col = t.column(0);
 
-    // Closed-form derivative of the periodized cardinal B-spline:
-    //   B_i(x) = Σ_κ N_d(τ − i + κ·m)
-    //   B'_i(x) = (1/h) · Σ_κ [N_{d−1}(τ − i + κ·m) − N_{d−1}(τ − i + κ·m − 1)]
-    // where τ = wrap(x; start, period) / h, d = degree, m = num_basis,
-    // and N_d is the cardinal B-spline of degree d. The κ-window matches the
-    // value path in `build_periodic_bspline_basis_1d`; degree d − 1 means
-    // support [0, d], so the κ bounds widen by exactly one m-period at each
-    // end of the support compared to the value computation.
+    let mut phi = vec![0.0_f64; num_basis];
+    let mut dphi = vec![0.0_f64; num_basis];
     let mut out = Array3::<f64>::zeros((n_rows, num_basis, 1));
     for row in 0..n_rows {
         let xi = t_col[row];
@@ -20973,18 +20962,23 @@ pub fn periodic_bspline_first_derivative_nd(
                 "periodic_bspline_first_derivative_nd: non-finite latent at row {row}"
             )));
         }
-        let tau = wrap_periodic_phase(xi, start, period) / h;
+        let rowsum =
+            fill_periodic_bspline_unnormalized_value_row(xi, start, period, degree, &mut phi);
+        if !rowsum.is_finite() || rowsum <= 0.0 {
+            return Err(BasisError::InvalidInput(format!(
+                "periodic_bspline_first_derivative_nd: non-positive rowsum at row {row}: {rowsum}"
+            )));
+        }
+        let rowsum_derivative =
+            fill_periodic_bspline_unnormalized_derivative_row(xi, start, period, degree, &mut dphi);
+        if !rowsum_derivative.is_finite() {
+            return Err(BasisError::InvalidInput(format!(
+                "periodic_bspline_first_derivative_nd: non-finite rowsum derivative at row {row}: {rowsum_derivative}"
+            )));
+        }
+        let rowsum_squared = rowsum * rowsum;
         for i in 0..num_basis {
-            let base = tau - i as f64;
-            let k_min = ((-base) / m).floor() as isize - 1;
-            let k_max = (((degree + 1) as f64 - base) / m).ceil() as isize + 1;
-            let mut value = 0.0_f64;
-            for k in k_min..=k_max {
-                let x_arg = base + (k as f64) * m;
-                value += cardinal_bspline_value(x_arg, degree - 1)
-                    - cardinal_bspline_value(x_arg - 1.0, degree - 1);
-            }
-            out[[row, i, 0]] = value / h;
+            out[[row, i, 0]] = dphi[i] / rowsum - phi[i] * rowsum_derivative / rowsum_squared;
         }
     }
     Ok(out)
@@ -24031,6 +24025,61 @@ fn cardinal_bspline_value(x: f64, degree: usize) -> f64 {
         + (((degree + 1) as f64 - x) / p) * cardinal_bspline_value(x - 1.0, degree - 1)
 }
 
+fn fill_periodic_bspline_unnormalized_value_row(
+    u: f64,
+    origin: f64,
+    period: f64,
+    degree: usize,
+    row: &mut [f64],
+) -> f64 {
+    let m = row.len();
+    let m_f = m as f64;
+    let h = period / m_f;
+    let t = wrap_periodic_phase(u, origin, period) / h;
+    let mut rowsum = 0.0_f64;
+    for (col, value_slot) in row.iter_mut().enumerate() {
+        let base = t - col as f64;
+        let k_min = ((-base) / m_f).floor() as isize - 1;
+        let k_max = (((degree + 1) as f64 - base) / m_f).ceil() as isize + 1;
+        let mut value = 0.0_f64;
+        for k in k_min..=k_max {
+            value += cardinal_bspline_value(base + (k as f64) * m_f, degree);
+        }
+        *value_slot = value;
+        rowsum += value;
+    }
+    rowsum
+}
+
+fn fill_periodic_bspline_unnormalized_derivative_row(
+    u: f64,
+    origin: f64,
+    period: f64,
+    degree: usize,
+    row: &mut [f64],
+) -> f64 {
+    let m = row.len();
+    let m_f = m as f64;
+    let h = period / m_f;
+    let tau = wrap_periodic_phase(u, origin, period) / h;
+    let mut rowsum_derivative = 0.0_f64;
+    for (col, value_slot) in row.iter_mut().enumerate() {
+        let base = tau - col as f64;
+        let k_min = ((-base) / m_f).floor() as isize - 1;
+        let k_max = (((degree + 1) as f64 - base) / m_f).ceil() as isize + 1;
+        let mut value = 0.0_f64;
+        for k in k_min..=k_max {
+            let x_arg = base + (k as f64) * m_f;
+            value += cardinal_bspline_value(x_arg, degree - 1)
+                - cardinal_bspline_value(x_arg - 1.0, degree - 1);
+        }
+        let derivative = value / h;
+        *value_slot = derivative;
+        rowsum_derivative += derivative;
+    }
+    rowsum_derivative
+}
+
 /// Build a dense periodic cardinal B-spline design for one circular parameter.
 ///
 /// Row `i` contains `num_basis` periodic basis functions evaluated at `u[i]`.
@@ -24051,28 +24100,23 @@ pub fn build_periodic_bspline_basis_1d(
 
     let n = u.len();
     let m = spec.num_basis;
-    let h = spec.period / m as f64;
     let mut out = Array2::<f64>::zeros((n, m));
+    let mut value_row = vec![0.0_f64; m];
     for (row_idx, &ui) in u.iter().enumerate() {
-        let t = wrap_periodic_phase(ui, spec.origin, spec.period) / h;
-        for col in 0..m {
-            // Periodized cardinal B-spline: only nearby copies can overlap the
-            // compact support [0, degree+1]. Checking a tiny k-window is both
-            // faster and avoids cancellation from irrelevant far copies.
-            let mut value = 0.0;
-            let base = t - col as f64;
-            let k_min = ((-base) / m as f64).floor() as isize - 1;
-            let k_max = (((spec.degree + 1) as f64 - base) / m as f64).ceil() as isize + 1;
-            for k in k_min..=k_max {
-                value += cardinal_bspline_value(base + (k as f64) * (m as f64), spec.degree);
-            }
-            out[[row_idx, col]] = value;
+        let rowsum = fill_periodic_bspline_unnormalized_value_row(
+            ui,
+            spec.origin,
+            spec.period,
+            spec.degree,
+            &mut value_row,
+        );
+        if !rowsum.is_finite() || rowsum <= 0.0 {
+            return Err(BasisError::InvalidInput(format!(
+                "periodic B-spline row has non-positive rowsum at row {row_idx}: {rowsum}"
+            )));
         }
-        let rowsum = out.row(row_idx).sum();
-        if rowsum.is_finite() && rowsum > 0.0 {
-            for col in 0..m {
-                out[[row_idx, col]] /= rowsum;
-            }
+        for col in 0..m {
+            out[[row_idx, col]] = value_row[col] / rowsum;
         }
     }
     Ok(out)
