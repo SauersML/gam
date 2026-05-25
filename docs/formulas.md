@@ -28,10 +28,11 @@ The family is inferred from the response. When `link(type=log)` is set,
 Poisson vs Gamma is chosen by whether `y` is integer-valued — `family=`
 is optional in that case. `family=` accepts `gaussian`, `binomial`
 (aliases `binomial-logit`, `binomial-probit`, `binomial-cloglog`),
-`latent-cloglog-binomial`, `poisson`, and `gamma`. Survival,
-transformation-normal, and Bernoulli marginal-slope families are
-selected through `Surv(...)` or dedicated CLI flags rather than
-`family=`.
+`latent-cloglog-binomial`, `poisson`, `negative-binomial` (aliases
+`nb`, `negbin`, `negative_binomial`), `gamma`, and `beta` /
+`beta-regression`. Survival, transformation-normal, and Bernoulli
+marginal-slope families are selected through `Surv(...)` or dedicated
+fit options rather than `family=`.
 
 ## Linear and constrained coefficients
 
@@ -379,11 +380,12 @@ Surv(entry, exit, event) ~ age + survmodel(distribution=gaussian)
 
 | Option | Meaning |
 | --- | --- |
+| `spec` | Survival estimand. Default and only supported value is `net`; `crude` is rejected by the one-hazard fitter. |
 | `distribution` | Residual distribution. Case-insensitive. Accepted: `gaussian`/`probit`, `gumbel`/`cloglog`, `logistic`/`logit`. |
 
 Survival likelihood and baseline target are selected via CLI flags
-(`--survival-likelihood`, `--baseline-target`), not through `spec=` on
-`survmodel(...)`.
+(`--survival-likelihood`, `--baseline-target`) or Python fit options,
+not through `survmodel(...)`.
 
 `survmodel()` requires at least one named option and takes named
 arguments only. Only one `survmodel(...)` term is allowed per formula.
