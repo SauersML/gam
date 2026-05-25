@@ -653,8 +653,10 @@ def _is_bernoulli_marginal_slope(model_class: str, family: str) -> bool:
     normalized_family = family.strip().lower().replace("_", "-")
     return (
         model_class == "bernoulli marginal-slope"
-        or model_class == "marginal-slope"
-        and normalized_family.startswith(_BERNOULLI_FAMILY_PREFIXES)
+        or (
+            model_class == "marginal-slope"
+            and normalized_family.startswith(_BERNOULLI_FAMILY_PREFIXES)
+        )
     )
 
 

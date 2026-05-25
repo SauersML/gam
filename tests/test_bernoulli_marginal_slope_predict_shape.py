@@ -55,3 +55,34 @@ def test_bernoulli_marginal_slope_saved_kind_returns_1d_probabilities(
     arr = np.asarray(out, dtype=float)
     assert arr.shape == (3,)
     np.testing.assert_allclose(arr, [0.2, 0.5, 0.8])
+
+
+def test_survival_marginal_slope_saved_kind_keeps_table_shape(monkeypatch: Any) -> None:
+    raw = json.dumps(
+        {
+            "columns": {
+                "eta": [-1.0, 0.0, 1.0],
+                "mean": [0.2, 0.5, 0.8],
+            }
+        }
+    )
+    rust = _FakeRust()
+    monkeypatch.setattr(_survival, "rust_module", lambda: rust)
+
+    out = _survival.shape_prediction_response(
+        raw,
+        headers=[],
+        rows=[],
+        table_kind="pandas",
+        training_table_kind="pandas",
+        fallback_model_class="marginal-slope",
+        fallback_family="royston-parmar",
+        interval=None,
+        return_type=None,
+        id_column=None,
+        row_ids=None,
+        restore=restore_output_table,
+    )
+
+    arr = np.asarray(out, dtype=float)
+    assert arr.shape == (3, 2)
