@@ -109,6 +109,10 @@ use std::sync::{Arc, Condvar, Mutex};
 use crate::faer_ndarray::FaerEigh;
 use crate::linalg::matrix::DesignMatrix;
 
+fn reml_contract_panic(message: impl Into<String>) -> ! {
+    std::panic::panic_any(message.into())
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  Typed errors for the unified REML/LAML evaluator.
 //
@@ -2244,6 +2248,7 @@ impl ProjectedFactorCache {
                     .waiter_count
                     .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                 let (lock, cv) = &marker.subscriber_arrived;
+                // release-early-on-purpose: drop the arrival mutex before notifying the producer.
                 drop(
                     lock.lock()
                         .expect("subscriber-arrived notification lock poisoned"),
@@ -2301,6 +2306,7 @@ impl ProjectedFactorCache {
                             .lock()
                             .expect("projected factor cache lock poisoned");
                         inner.in_progress.remove(&key);
+                        // release-early-on-purpose: avoid holding the cache mutex while publishing failure.
                         drop(inner);
 
                         let mut guard = marker
@@ -2354,6 +2360,7 @@ impl ProjectedFactorCache {
                     computed
                 };
                 inner.in_progress.remove(&key);
+                // release-early-on-purpose: avoid holding the cache mutex while notifying waiters.
                 drop(inner);
 
                 let mut guard = marker

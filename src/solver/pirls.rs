@@ -5313,7 +5313,7 @@ where
                         // we have accepted the LM step; downstream cleanup
                         // paths still drain via `pending_arrow_latent_restore
                         // .take()` defensively.
-                        drop(pending_arrow_latent_restore.take());
+                        let _ = pending_arrow_latent_restore.take();
 
                         // Updates for next iteration. Recycle the previous beta
                         // allocation as the next candidate buffer instead of

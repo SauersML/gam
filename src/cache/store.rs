@@ -193,8 +193,8 @@ impl WarmStartStore {
                 }
                 lookup_cache_invalidate(&cache_key);
                 let bin = hit.meta_path.with_extension("bin");
-                drop(fs::remove_file(&hit.meta_path));
-                drop(fs::remove_file(&bin));
+                let _ = fs::remove_file(&hit.meta_path);
+                let _ = fs::remove_file(&bin);
                 return Ok(None);
             }
             lookup_cache_invalidate(&cache_key);
@@ -221,7 +221,7 @@ impl WarmStartStore {
             let meta = match read_meta(&path) {
                 Ok(m) => m,
                 Err(_) => {
-                    drop(fs::remove_file(&path));
+                    let _ = fs::remove_file(&path);
                     continue;
                 }
             };
@@ -231,7 +231,7 @@ impl WarmStartStore {
             // Ensure the .bin sibling exists; otherwise treat as corrupt.
             let bin = path.with_extension("bin");
             if !bin.exists() {
-                drop(fs::remove_file(&path));
+                let _ = fs::remove_file(&path);
                 continue;
             }
             // Drop entries past TTL on the lookup path itself, not only in
@@ -245,8 +245,8 @@ impl WarmStartStore {
                 self.opts.ttl,
                 now_nanos,
             ) {
-                drop(fs::remove_file(&path));
-                drop(fs::remove_file(&bin));
+                let _ = fs::remove_file(&path);
+                let _ = fs::remove_file(&bin);
                 continue;
             }
             let take = match best {
@@ -271,8 +271,8 @@ impl WarmStartStore {
         };
         // Validate checksum
         if checksum_hex(&payload) != meta.checksum_hex {
-            drop(fs::remove_file(&meta_path));
-            drop(fs::remove_file(&bin_path));
+            let _ = fs::remove_file(&meta_path);
+            let _ = fs::remove_file(&bin_path);
             lookup_cache_invalidate(&cache_key);
             return Ok(None);
         }
@@ -358,7 +358,7 @@ impl WarmStartStore {
         {
             let mut f = fs::File::create(&bin_tmp)?;
             f.write_all(payload)?;
-            drop(f.sync_all());
+            let _ = f.sync_all();
         }
         // 2. Compute checksum from payload.
         let checksum = checksum_hex(payload);
@@ -378,21 +378,21 @@ impl WarmStartStore {
             let json = serde_json::to_vec_pretty(&meta)?;
             let mut f = fs::File::create(&meta_tmp)?;
             f.write_all(&json)?;
-            drop(f.sync_all());
+            let _ = f.sync_all();
         }
         // 4. Atomic renames. .bin first so a meta-pointing-to-missing-bin
         // window is impossible on the happy path. A reader that catches
         // .bin-missing treats the entry as corrupt and cleans it up.
         let bin_rename = fs::rename(&bin_tmp, &bin_final);
         if let Err(e) = bin_rename {
-            drop(fs::remove_file(&bin_tmp));
-            drop(fs::remove_file(&meta_tmp));
+            let _ = fs::remove_file(&bin_tmp);
+            let _ = fs::remove_file(&meta_tmp);
             return Err(StoreError::Io(e));
         }
         if let Err(e) = fs::rename(&meta_tmp, &meta_final) {
             // Roll back the bin we just promoted to avoid orphaning it.
-            drop(fs::remove_file(&bin_final));
-            drop(fs::remove_file(&meta_tmp));
+            let _ = fs::remove_file(&bin_final);
+            let _ = fs::remove_file(&meta_tmp);
             return Err(StoreError::Io(e));
         }
         // 5. Best-effort eviction; failure here is non-fatal. Throttle the
@@ -410,7 +410,7 @@ impl WarmStartStore {
         let n = self.save_counter.fetch_add(1, Ordering::Relaxed);
         let over_budget = new_total > self.opts.size_budget_bytes;
         if n == 0 || over_budget || n.is_multiple_of(EVICT_EVERY_N_SAVES) {
-            drop(self.evict_overflow());
+            let _ = self.evict_overflow();
         }
         Ok(())
     }
@@ -459,7 +459,7 @@ impl WarmStartStore {
                     if let Some(pid) = parse_tmp_pid(&name)
                         && pid != std::process::id()
                     {
-                        drop(fs::remove_file(&p));
+                        let _ = fs::remove_file(&p);
                     }
                     continue;
                 }
@@ -475,15 +475,15 @@ impl WarmStartStore {
                     Ok(m) => m,
                     Err(_) => {
                         // Orphan meta — clean it up.
-                        drop(fs::remove_file(&p));
+                        let _ = fs::remove_file(&p);
                         continue;
                     }
                 };
                 let meta = match read_meta(&p) {
                     Ok(m) => m,
                     Err(_) => {
-                        drop(fs::remove_file(&p));
-                        drop(fs::remove_file(&bin));
+                        let _ = fs::remove_file(&p);
+                        let _ = fs::remove_file(&bin);
                         continue;
                     }
                 };
@@ -495,8 +495,8 @@ impl WarmStartStore {
                     self.opts.ttl,
                     now_nanos,
                 ) {
-                    drop(fs::remove_file(&p));
-                    drop(fs::remove_file(&bin));
+                    let _ = fs::remove_file(&p);
+                    let _ = fs::remove_file(&bin);
                     continue;
                 }
                 let total_bytes = meta_md.len() + bin_md.len();
@@ -507,7 +507,7 @@ impl WarmStartStore {
                 .map(|mut it| it.next().is_none())
                 .unwrap_or(false)
             {
-                drop(fs::remove_dir(&key_dir));
+                let _ = fs::remove_dir(&key_dir);
             }
         }
         let total: u64 = all.iter().map(|e| e.2).sum();
@@ -520,8 +520,8 @@ impl WarmStartStore {
             if remaining <= self.opts.size_budget_bytes {
                 break;
             }
-            drop(fs::remove_file(&meta));
-            drop(fs::remove_file(&bin));
+            let _ = fs::remove_file(&meta);
+            let _ = fs::remove_file(&bin);
             remaining = remaining.saturating_sub(bytes);
         }
         // Resync the approximate byte counter to ground truth. Subsequent

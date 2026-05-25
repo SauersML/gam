@@ -5332,6 +5332,7 @@ impl<'a> RemlState<'a> {
                 );
                 Arc::clone(arc)
             } else {
+                // release-early-on-purpose: upgrade from read access to write access without deadlocking.
                 drop(read_guard);
                 let factorize_start = std::time::Instant::now();
                 let new_factor = match cache.penalized_hessian_transformed.factorize() {
