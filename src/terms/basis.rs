@@ -1314,7 +1314,21 @@ pub fn create_cyclic_difference_penalty_matrix(
 
 #[inline]
 fn wrap_to_period(x: f64, start: f64, period: f64) -> f64 {
-    start + (x - start).rem_euclid(period)
+    // Keep wrapped values numerically inside the half-open period
+    // `[start, start + period)`. `rem_euclid` can return exactly `period`
+    // after extreme-roundoff cancellation (e.g. `(start + period - eps - start)`
+    // rounding up to `period`), which lifts the result to `start + period`
+    // and pushes basis evaluators that assume `x < start + period` over the
+    // right knot. Fold that boundary back to `start` so every caller — the
+    // dense cyclic B-spline evaluator, the periodic Duchon kernel matrix,
+    // and the cylinder/torus tensor margins — agrees with the
+    // `wrap_periodic_phase` convention used by the derivative path.
+    let offset = (x - start).rem_euclid(period);
+    if offset >= period {
+        start
+    } else {
+        start + offset
+    }
 }
 
 #[inline]
