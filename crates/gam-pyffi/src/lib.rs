@@ -30,6 +30,19 @@ use gam::gaussian_reml::{
     gaussian_reml_multi_closed_form_backward_batch,
     gaussian_reml_multi_closed_form_backward_from_fit, gaussian_reml_multi_closed_form_with_cache,
 };
+use gam::geometry::poincare::{
+    exp_origin as poincare_exp_origin_impl, from_lorentz as poincare_from_lorentz_impl,
+    log_origin as poincare_log_origin_impl,
+    lorentz_decode_forward as poincare_lorentz_decode_forward_impl,
+    lorentz_exp_origin as poincare_lorentz_exp_origin_impl,
+    lorentz_log_origin as poincare_lorentz_log_origin_impl,
+    mobius_add as poincare_mobius_add_impl,
+    poincare_distance as poincare_distance_impl,
+    project_into_ball as poincare_project_into_ball_impl,
+    tangent_decode_backward as poincare_tangent_decode_backward_impl,
+    tangent_decode_forward as poincare_tangent_decode_forward_impl,
+    to_lorentz as poincare_to_lorentz_impl,
+};
 use gam::geometry::simplex::simplex_frechet_mean;
 use gam::kernels::sinkhorn_barycenter::{
     circular_cost as sinkhorn_circular_cost_impl,
@@ -20259,6 +20272,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(mechanism_sparsity_jacobian, module)?)?;
     module.add_function(wrap_pyfunction!(conditional_prior_ivae, module)?)?;
+    module.add_function(wrap_pyfunction!(partial_supervision_solve, module)?)?;
     module.add_function(wrap_pyfunction!(
         identifiable_factor_select_weights_array,
         module
