@@ -10931,7 +10931,7 @@ mod tests {
             time_wiggle_knots: None,
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
-            time_coefficient_lower_bounds: Some(array![0.0]),
+            time_linear_constraints: lower_bound_constraints(&array![0.0]),
             x_threshold: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
                 [1.0],
                 [0.4],
@@ -13848,7 +13848,7 @@ mod tests {
             time_wiggle_knots: None,
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
-            time_coefficient_lower_bounds: Some(array![0.0, 0.0]),
+            time_linear_constraints: lower_bound_constraints(&array![0.0, 0.0]),
             x_threshold: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::ones(
                 (n, 1),
             ))),
@@ -13980,7 +13980,7 @@ mod tests {
             time_wiggle_knots: None,
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
-            time_coefficient_lower_bounds: Some(array![0.0]),
+            time_linear_constraints: lower_bound_constraints(&array![0.0]),
             x_threshold: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::ones(
                 (n, 1),
             ))),

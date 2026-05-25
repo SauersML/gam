@@ -1,19 +1,16 @@
 """Anchor-consistency diagnostic for manifold-SAE atom identifiability.
 
 Reference: the project's own atom-anchor convention (see
-``gamfit._sae_manifold``). A manifold-SAE with ``K`` atoms is identified
-up to permutation of atoms only when the assignment matrix
-``A in R^{N x K}`` contains a sufficient number of *anchor* rows — rows
-where one atom dominates (``a_max / sum(|a|) >= anchor_dominance``).
-Anchor rows are how the recipe disambiguates rotations / permutations
-inside the K-dimensional atom space. Too few anchors and the recovered
+``gamfit._sae_manifold`` / ``gam::diagnostics::anchor_consistency_metrics``).
+A manifold-SAE with ``K`` atoms is identified up to permutation of atoms
+only when the assignment matrix ``A in R^{N x K}`` contains a sufficient
+number of *anchor* rows — rows where one atom dominates
+(``a_max / sum|a| >= anchor_dominance``). Too few anchors and the recovered
 atoms are only identified up to a linear transformation in atom space.
 
-The required minimum number of anchor rows is :math:`K`, the number of
-atoms — analogous to a basis: a set of anchors covering all atoms is the
-minimal certificate that the atom labels are well-separated. The
-diagnostic also requires anchors to be spread across atoms (``>= 1``
-anchor per atom).
+The numeric kernel (anchor counts per atom, total anchor count) lives in
+the Rust ``gam::diagnostics`` module; this Python file is a thin
+extraction-and-reporting wrapper.
 """
 
 from __future__ import annotations
@@ -22,21 +19,19 @@ from typing import Any
 
 import numpy as np
 
+from .._binding import rust_module
 from ._report import IdentifiabilityReport
 
 __all__ = ["check_anchor_consistency"]
 
 
 def _extract_assignments(model: Any) -> np.ndarray:
-    """Return the ``(N, K)`` assignment matrix from a manifold-SAE-like model.
-
-    Raises :class:`TypeError` if no recognizable assignment matrix is found.
-    """
+    """Return the ``(N, K)`` assignment matrix from a manifold-SAE-like model."""
     if hasattr(model, "assignments"):
-        A = np.asarray(model.assignments, dtype=float)
+        A = np.ascontiguousarray(np.asarray(model.assignments, dtype=float))
         if A.ndim == 1:
             A = A.reshape(-1, 1)
-        return A
+        return np.ascontiguousarray(A)
     raise TypeError(
         f"Cannot extract atom assignments from object of type "
         f"{type(model).__name__}; expected a `.assignments` attribute "
@@ -54,12 +49,9 @@ def check_anchor_consistency(
     Parameters
     ----------
     model : object with ``.assignments`` of shape ``(N, K)``
-        Fitted manifold-SAE (or any model exposing an atom-assignment
-        matrix). Each row is the soft / hard assignment of one sample to
-        each of the ``K`` atoms.
     anchor_dominance : float in ``(0, 1]``, default ``0.95``
-        A row is an *anchor* if its largest entry contributes at least
-        this fraction of the row's L1 mass.
+        A row is an *anchor* if its largest entry contributes at least this
+        fraction of the row's L1 mass.
 
     Returns
     -------
@@ -83,7 +75,8 @@ def check_anchor_consistency(
         )
         return IdentifiabilityReport(
             name=name, theorem=theorem,
-            preconditions=preconditions, violations=violations, recommendations=recommendations,
+            preconditions=preconditions, violations=violations,
+            recommendations=recommendations,
         )
 
     if A.ndim != 2 or A.shape[1] < 1:
@@ -96,7 +89,8 @@ def check_anchor_consistency(
         )
         return IdentifiabilityReport(
             name=name, theorem=theorem,
-            preconditions=preconditions, violations=violations, recommendations=recommendations,
+            preconditions=preconditions, violations=violations,
+            recommendations=recommendations,
         )
     preconditions["assignments_available"] = True
     preconditions["assignments_2d"] = True
@@ -108,30 +102,25 @@ def check_anchor_consistency(
             f"anchor_dominance must be in (0, 1]; got {anchor_dominance!r}"
         )
 
-    abs_A = np.abs(A)
-    row_mass = abs_A.sum(axis=1)
-    # Guard against zero rows: they are *not* anchors.
-    safe_mass = np.where(row_mass > 0.0, row_mass, 1.0)
-    dominance = abs_A.max(axis=1) / safe_mass
-    is_anchor = (dominance >= float(anchor_dominance)) & (row_mass > 0.0)
-    n_anchors = int(is_anchor.sum())
+    rust = rust_module()
+    metrics = rust.diagnostics_anchor_consistency(A, float(anchor_dominance))
+    n_anchors = int(metrics["n_anchors"])
+    anchors_per_atom = [int(c) for c in metrics["anchors_per_atom"]]
 
-    # K=1 atom: identifiability is trivial (no rotation freedom).
     if K == 1:
         preconditions["enough_anchors_total"] = True
         preconditions["anchors_cover_all_atoms"] = True
         details = {
             "n_samples": n, "K": K, "n_anchors": n_anchors,
             "anchor_fraction": float(n_anchors) / max(n, 1),
-            "anchors_per_atom": [n_anchors],
+            "anchors_per_atom": anchors_per_atom,
         }
         return IdentifiabilityReport(
             name=name, theorem=theorem,
-            preconditions=preconditions, violations=violations, recommendations=recommendations,
-            details=details,
+            preconditions=preconditions, violations=violations,
+            recommendations=recommendations, details=details,
         )
 
-    # Anchor count: need >= K anchors.
     enough_anchors = n_anchors >= K
     preconditions["enough_anchors_total"] = enough_anchors
     if not enough_anchors:
@@ -146,12 +135,7 @@ def check_anchor_consistency(
             f"more anchor-like rows where a single atom dominates."
         )
 
-    # Per-atom coverage: each atom must claim at least one anchor.
-    anchor_atom = abs_A.argmax(axis=1)
-    anchors_per_atom = np.zeros(K, dtype=int)
-    for j in anchor_atom[is_anchor]:
-        anchors_per_atom[int(j)] += 1
-    uncovered = [int(j) for j in range(K) if anchors_per_atom[j] == 0]
+    uncovered = [int(j) for j, c in enumerate(anchors_per_atom) if c == 0]
     cover_ok = len(uncovered) == 0
     preconditions["anchors_cover_all_atoms"] = cover_ok
     if not cover_ok:
@@ -168,10 +152,10 @@ def check_anchor_consistency(
     details = {
         "n_samples": n, "K": K, "n_anchors": n_anchors,
         "anchor_fraction": float(n_anchors) / max(n, 1),
-        "anchors_per_atom": [int(c) for c in anchors_per_atom],
+        "anchors_per_atom": anchors_per_atom,
     }
     return IdentifiabilityReport(
         name=name, theorem=theorem,
-        preconditions=preconditions, violations=violations, recommendations=recommendations,
-        details=details,
+        preconditions=preconditions, violations=violations,
+        recommendations=recommendations, details=details,
     )

@@ -21082,6 +21082,114 @@ mod tests {
     }
 
     #[test]
+    fn time_block_constraints_synthesize_qd1_rows_when_stored_constraints_missing() {
+        let family = SurvivalMarginalSlopeFamily {
+            n: 1,
+            event: Arc::new(array![1.0]),
+            weights: Arc::new(array![1.0]),
+            z: Arc::new(array![0.0].insert_axis(Axis(1))),
+            score_covariance: unit_score_covariance(),
+            gaussian_frailty_sd: None,
+            derivative_guard: 1e-6,
+            design_entry: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[
+                0.0, 0.0
+            ]])),
+            design_exit: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[
+                0.0, 0.0
+            ]])),
+            design_derivative_exit: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                array![[1.0, 0.0]],
+            )),
+            offset_entry: Arc::new(array![0.0]),
+            offset_exit: Arc::new(array![0.0]),
+            derivative_offset_exit: Arc::new(array![1e-6]),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((1, 0)),
+            )),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((1, 0)),
+            )),
+            logslope_surface_ranges: empty_logslope_surface_ranges(),
+            score_warp: None,
+            link_dev: None,
+            time_linear_constraints: None,
+            time_wiggle_knots: None,
+            time_wiggle_degree: None,
+            time_wiggle_ncols: 0,
+            intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+        };
+        let spec = ParameterBlockSpec {
+            name: "time_surface".to_string(),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[0.0, 0.0]])),
+            offset: Array1::zeros(1),
+            penalties: Vec::new(),
+            nullspace_dims: Vec::new(),
+            initial_log_lambdas: Array1::zeros(0),
+            initial_beta: None,
+        };
+
+        let constraints = family
+            .block_linear_constraints(&[], 0, &spec)
+            .expect("synthesized constraints")
+            .expect("qd1 row");
+        assert_eq!(constraints.a, array![[1.0, 0.0]]);
+        assert_eq!(constraints.b, array![0.0]);
+    }
+
+    #[test]
+    fn time_block_max_feasible_step_uses_synthesized_qd1_rows() {
+        let family = SurvivalMarginalSlopeFamily {
+            n: 1,
+            event: Arc::new(array![1.0]),
+            weights: Arc::new(array![1.0]),
+            z: Arc::new(array![0.0].insert_axis(Axis(1))),
+            score_covariance: unit_score_covariance(),
+            gaussian_frailty_sd: None,
+            derivative_guard: 1e-6,
+            design_entry: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[
+                0.0, 0.0
+            ]])),
+            design_exit: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[
+                0.0, 0.0
+            ]])),
+            design_derivative_exit: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                array![[1.0, 0.0]],
+            )),
+            offset_entry: Arc::new(array![0.0]),
+            offset_exit: Arc::new(array![0.0]),
+            derivative_offset_exit: Arc::new(array![1e-6]),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((1, 0)),
+            )),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((1, 0)),
+            )),
+            logslope_surface_ranges: empty_logslope_surface_ranges(),
+            score_warp: None,
+            link_dev: None,
+            time_linear_constraints: None,
+            time_wiggle_knots: None,
+            time_wiggle_degree: None,
+            time_wiggle_ncols: 0,
+            intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+        };
+        let states = vec![ParameterBlockState {
+            beta: array![0.4, 7.0],
+            eta: array![0.0],
+        }];
+        let alpha = family
+            .max_feasible_step_size(&states, 0, &array![-1.0, -10.0])
+            .expect("synthesized qd1 step ceiling")
+            .expect("binding synthesized qd1 row");
+
+        assert_relative_eq!(alpha, 0.398, epsilon = 1e-12);
+    }
+
+    #[test]
     fn coupled_qd1_guard_limits_time_step_before_post_update_projection() {
         let constraints = time_derivative_guard_constraints(
             &DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0, 1.0]])),
@@ -21212,7 +21320,7 @@ mod tests {
     }
 
     #[test]
-    fn time_block_post_update_projects_derivative_guard_and_timewiggle_constraints() {
+    fn time_block_post_update_rejects_infeasible_beta_instead_of_projecting() {
         let family = SurvivalMarginalSlopeFamily {
             n: 1,
             event: Arc::new(array![0.0]),
@@ -21271,7 +21379,7 @@ mod tests {
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
         };
-        let beta = family
+        let err = family
             .post_update_block_beta(
                 &[ParameterBlockState {
                     beta: array![0.0, 0.0],
@@ -21281,8 +21389,11 @@ mod tests {
                 &spec,
                 array![-0.3, -0.2],
             )
-            .expect("return time beta");
-        assert_eq!(beta, array![0.0, 0.0]);
+            .expect_err("post-update must not project an infeasible time beta");
+        assert!(
+            err.contains("violates monotonicity") && err.contains("proposed"),
+            "unexpected error message: {err}"
+        );
     }
 
     /// Regression guard for the phantom-multiplier failure mode: if a

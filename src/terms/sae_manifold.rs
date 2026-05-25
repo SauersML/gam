@@ -175,18 +175,29 @@ pub enum SaeAtomBasisKind {
 impl SaeAtomBasisKind {
     fn latent_manifold(&self, latent_dim: usize) -> LatentManifold {
         match self {
+            // `Periodic` uses [`PeriodicHarmonicEvaluator`], whose basis
+            // functions are `cos(2π·h·t), sin(2π·h·t)` — i.e. `t` is a
+            // fraction of one period, not radians. The latent manifold must
+            // wrap modulo `1.0` to match this convention; wrapping modulo
+            // `2π` (as `LatentManifold::Circle` does) would scramble the
+            // fraction-of-period interpretation and cause #174-style
+            // failures where Newton updates push `t` outside `[0, 1)` and
+            // the optimiser sees a discontinuous landscape.
             Self::Periodic => {
                 if latent_dim == 1 {
-                    LatentManifold::Circle
+                    LatentManifold::CirclePeriod { period: 1.0 }
                 } else {
                     LatentManifold::Product(
-                        (0..latent_dim).map(|_| LatentManifold::Circle).collect(),
+                        (0..latent_dim)
+                            .map(|_| LatentManifold::CirclePeriod { period: 1.0 })
+                            .collect(),
                     )
                 }
             }
             // `Sphere` is parameterised via a (lat, lon) intrinsic chart; the
             // chart evaluator already enforces sphere geometry through its
-            // cos/sin terms, so the latent optimiser sees a 2-D product
+            // cos/sin terms (in radians, multiplying lat/lon directly into
+            // `sin`/`cos`), so the latent optimiser sees a 2-D product
             // manifold: lat is a bounded interval `[-π/2, π/2]` (clamped by
             // the chart) and lon is an `S^1` angle wrapped modulo `2π`.
             // Treating it as `LatentManifold::Sphere { dim: 2 }` would
@@ -198,14 +209,18 @@ impl SaeAtomBasisKind {
                 },
                 LatentManifold::Circle,
             ]),
-            // `Torus` of dim d is the product T^d = (S^1)^d; the per-axis
-            // angular coordinate is `S^1` wrapped modulo `2π`.
+            // `Torus` uses [`TorusHarmonicEvaluator`], which shares the
+            // fraction-of-period convention with `PeriodicHarmonicEvaluator`
+            // (basis is `cos(2π·h·t)`, `sin(2π·h·t)` on each axis). Each
+            // per-axis latent wraps modulo `1.0`.
             Self::Torus => {
                 if latent_dim == 1 {
-                    LatentManifold::Circle
+                    LatentManifold::CirclePeriod { period: 1.0 }
                 } else {
                     LatentManifold::Product(
-                        (0..latent_dim).map(|_| LatentManifold::Circle).collect(),
+                        (0..latent_dim)
+                            .map(|_| LatentManifold::CirclePeriod { period: 1.0 })
+                            .collect(),
                     )
                 }
             }
