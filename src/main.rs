@@ -4812,7 +4812,10 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 formula,
                 ModelKind::Survival,
                 FittedFamily::Survival {
-                    likelihood: LikelihoodSpec::new(ResponseFamily::RoystonParmar, InverseLink::Standard(LinkFunction::Identity)),
+                    likelihood: LikelihoodSpec::new(
+                        ResponseFamily::RoystonParmar,
+                        InverseLink::Standard(LinkFunction::Identity),
+                    ),
                     survival_likelihood: Some(
                         survival_likelihood_modename(likelihood_mode).to_string(),
                     ),
@@ -5203,7 +5206,10 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 formula,
                 ModelKind::Survival,
                 FittedFamily::Survival {
-                    likelihood: LikelihoodSpec::new(ResponseFamily::RoystonParmar, InverseLink::Standard(LinkFunction::Identity)),
+                    likelihood: LikelihoodSpec::new(
+                        ResponseFamily::RoystonParmar,
+                        InverseLink::Standard(LinkFunction::Identity),
+                    ),
                     survival_likelihood: Some(
                         survival_likelihood_modename(likelihood_mode).to_string(),
                     ),
@@ -5667,7 +5673,10 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 formula,
                 ModelKind::Survival,
                 FittedFamily::Survival {
-                    likelihood: LikelihoodSpec::new(ResponseFamily::RoystonParmar, InverseLink::Standard(LinkFunction::Identity)),
+                    likelihood: LikelihoodSpec::new(
+                        ResponseFamily::RoystonParmar,
+                        InverseLink::Standard(LinkFunction::Identity),
+                    ),
                     survival_likelihood: Some(
                         survival_likelihood_modename(likelihood_mode).to_string(),
                     ),
@@ -6100,7 +6109,10 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             formula,
             ModelKind::Survival,
             FittedFamily::Survival {
-                likelihood: LikelihoodSpec::new(ResponseFamily::RoystonParmar, InverseLink::Standard(LinkFunction::Identity)),
+                likelihood: LikelihoodSpec::new(
+                    ResponseFamily::RoystonParmar,
+                    InverseLink::Standard(LinkFunction::Identity),
+                ),
                 survival_likelihood: Some(
                     survival_likelihood_modename(likelihood_mode).to_string(),
                 ),
@@ -7725,7 +7737,10 @@ fn build_transformation_normal_saved_model(
         formula,
         ModelKind::TransformationNormal,
         FittedFamily::TransformationNormal {
-            likelihood: LikelihoodSpec::new(ResponseFamily::Gaussian, InverseLink::Standard(LinkFunction::Identity)),
+            likelihood: LikelihoodSpec::new(
+                ResponseFamily::Gaussian,
+                InverseLink::Standard(LinkFunction::Identity),
+            ),
         },
         FAMILY_TRANSFORMATION_NORMAL.to_string(),
     );
@@ -8613,7 +8628,9 @@ fn resolve_family(
                 LinkFunction::Probit => LikelihoodSpec::binomial_probit(),
                 LinkFunction::CLogLog => LikelihoodSpec::binomial_cloglog(),
                 LinkFunction::Sas => LikelihoodSpec::binomial_link(LinkFunction::Sas),
-                LinkFunction::BetaLogistic => LikelihoodSpec::binomial_link(LinkFunction::BetaLogistic),
+                LinkFunction::BetaLogistic => {
+                    LikelihoodSpec::binomial_link(LinkFunction::BetaLogistic)
+                }
             }
         };
         if let Some(explicit) = explicit_family.as_ref() {
@@ -8668,7 +8685,9 @@ fn family_from_arg(arg: FamilyArg, negative_binomial_theta: f64) -> Option<Likel
         FamilyArg::BinomialLogit => Some(LikelihoodSpec::binomial_logit()),
         FamilyArg::BinomialProbit => Some(LikelihoodSpec::binomial_probit()),
         FamilyArg::BinomialCloglog => Some(LikelihoodSpec::binomial_cloglog()),
-        FamilyArg::LatentCloglogBinomial => Some(LikelihoodSpec::binomial_link(LinkFunction::CLogLog)),
+        FamilyArg::LatentCloglogBinomial => {
+            Some(LikelihoodSpec::binomial_link(LinkFunction::CLogLog))
+        }
         FamilyArg::PoissonLog => Some(LikelihoodSpec::poisson_log()),
         FamilyArg::NegativeBinomial => Some(LikelihoodSpec::negative_binomial_log(
             negative_binomial_theta,
@@ -8776,7 +8795,8 @@ fn binomial_mean_linkwiggle_supports_family(
                 | InverseLink::Standard(LinkFunction::Probit)
                 | InverseLink::Standard(LinkFunction::CLogLog)
         );
-    standard_binomial && !link_choice.is_some_and(|choice| matches!(choice.mode, LinkMode::Flexible))
+    standard_binomial
+        && !link_choice.is_some_and(|choice| matches!(choice.mode, LinkMode::Flexible))
 }
 
 fn survival_link_usage() -> &'static str {
@@ -9878,19 +9898,18 @@ mod tests {
         BlockRole, BoundedCoefficientPriorSpec, CliFirthValidation, DataSchema,
         FAMILY_GAUSSIAN_LOCATION_SCALE, FamilyArg, FittedFamily, LikelihoodSpec, LinkChoice,
         LinkMode, MODEL_VERSION, ModelKind, ResidualDistribution, ResponseFamily, SavedFitSummary,
-        SavedModel,
-        SurvivalArgs, SurvivalBaselineTarget, SurvivalLikelihoodMode, SurvivalTimeBasisConfig,
-        build_survival_time_basis, classify_cli_error, collect_hierarchical_smooth_overlapwarnings,
-        collect_linear_smooth_overlapwarnings, collect_spatial_smooth_usagewarnings,
-        compact_fit_result_for_batch, compact_saved_multiblock_fit_result,
-        compute_probit_q0_from_eta, core_saved_fit_result, covariance_from_model,
-        effectivelinkwiggle_formulaspec, exact_kernel, fit_result_from_external,
-        load_dataset_projected, parse_formula, parse_link_choice, parse_matching_auxiliary_formula,
-        parse_surv_response, parse_survival_inverse_link, parse_survival_time_basis_config,
-        predict_gam, prepend_id_column_to_prediction_csv, required_columns_for_fit, resolve_family,
-        summarizewiggle_domain, validate_cli_firth_configuration,
-        write_gaussian_location_scale_prediction_csv, write_prediction_csv,
-        write_survival_binary_prediction_csv, write_survival_prediction_csv,
+        SavedModel, SurvivalArgs, SurvivalBaselineTarget, SurvivalLikelihoodMode,
+        SurvivalTimeBasisConfig, build_survival_time_basis, classify_cli_error,
+        collect_hierarchical_smooth_overlapwarnings, collect_linear_smooth_overlapwarnings,
+        collect_spatial_smooth_usagewarnings, compact_fit_result_for_batch,
+        compact_saved_multiblock_fit_result, compute_probit_q0_from_eta, core_saved_fit_result,
+        covariance_from_model, effectivelinkwiggle_formulaspec, exact_kernel,
+        fit_result_from_external, load_dataset_projected, parse_formula, parse_link_choice,
+        parse_matching_auxiliary_formula, parse_surv_response, parse_survival_inverse_link,
+        parse_survival_time_basis_config, predict_gam, prepend_id_column_to_prediction_csv,
+        required_columns_for_fit, resolve_family, summarizewiggle_domain,
+        validate_cli_firth_configuration, write_gaussian_location_scale_prediction_csv,
+        write_prediction_csv, write_survival_binary_prediction_csv, write_survival_prediction_csv,
     };
     use super::{
         Cli, Command, CovarianceModeArg, FitArgs, PredictArgs, PredictModeArg, run_fit,
@@ -10778,7 +10797,10 @@ mod tests {
             "Surv(entry, exit, event) ~ 1",
             ModelKind::Survival,
             FittedFamily::Survival {
-                likelihood: LikelihoodSpec::new(ResponseFamily::RoystonParmar, InverseLink::Standard(LinkFunction::Identity)),
+                likelihood: LikelihoodSpec::new(
+                    ResponseFamily::RoystonParmar,
+                    InverseLink::Standard(LinkFunction::Identity),
+                ),
                 survival_likelihood: Some("location-scale".to_string()),
                 survival_distribution: Some(ResidualDistribution::Gaussian),
                 frailty: gam::families::lognormal_kernel::FrailtySpec::None,
@@ -11067,9 +11089,9 @@ mod tests {
             None,
             SavedFitSummary {
                 likelihood_family: Some(LikelihoodSpec::new(
-                ResponseFamily::Binomial,
-                InverseLink::Standard(LinkFunction::Probit),
-            )),
+                    ResponseFamily::Binomial,
+                    InverseLink::Standard(LinkFunction::Probit),
+                )),
                 likelihood_scale: LikelihoodScaleMetadata::Unspecified,
                 log_likelihood_normalization: LogLikelihoodNormalization::UserProvided,
                 ..saved_fit_summary_fixture()
@@ -11174,7 +11196,10 @@ mod tests {
             "y ~ x".to_string(),
             ModelKind::Standard,
             FittedFamily::Standard {
-                likelihood: LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Logit)),
+                likelihood: LikelihoodSpec::new(
+                    ResponseFamily::Binomial,
+                    InverseLink::Standard(LinkFunction::Logit),
+                ),
                 link: Some(LinkFunction::Logit),
                 latent_cloglog_state: None,
                 mixture_state: None,
@@ -11445,7 +11470,10 @@ mod tests {
             "y ~ 1",
             ModelKind::LocationScale,
             FittedFamily::LocationScale {
-                likelihood: LikelihoodSpec::new(ResponseFamily::Gaussian, InverseLink::Standard(LinkFunction::Identity)),
+                likelihood: LikelihoodSpec::new(
+                    ResponseFamily::Gaussian,
+                    InverseLink::Standard(LinkFunction::Identity),
+                ),
                 base_link: None,
             },
             FAMILY_GAUSSIAN_LOCATION_SCALE,
@@ -11503,7 +11531,10 @@ mod tests {
             "y ~ 1",
             ModelKind::LocationScale,
             FittedFamily::LocationScale {
-                likelihood: LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Probit)),
+                likelihood: LikelihoodSpec::new(
+                    ResponseFamily::Binomial,
+                    InverseLink::Standard(LinkFunction::Probit),
+                ),
                 base_link: Some(InverseLink::Standard(LinkFunction::Probit)),
             },
             "binomial-location-scale",
@@ -11953,9 +11984,9 @@ mod tests {
             None,
             SavedFitSummary {
                 likelihood_family: Some(LikelihoodSpec::new(
-                ResponseFamily::Gaussian,
-                InverseLink::Standard(LinkFunction::Identity),
-            )),
+                    ResponseFamily::Gaussian,
+                    InverseLink::Standard(LinkFunction::Identity),
+                )),
                 likelihood_scale: LikelihoodScaleMetadata::ProfiledGaussian,
                 log_likelihood_normalization: LogLikelihoodNormalization::Full,
                 log_likelihood: -0.75,
@@ -12704,9 +12735,9 @@ mod tests {
             None,
             SavedFitSummary {
                 likelihood_family: Some(LikelihoodSpec::new(
-                ResponseFamily::Binomial,
-                InverseLink::Standard(LinkFunction::Probit),
-            )),
+                    ResponseFamily::Binomial,
+                    InverseLink::Standard(LinkFunction::Probit),
+                )),
                 likelihood_scale: LikelihoodScaleMetadata::Unspecified,
                 log_likelihood_normalization: LogLikelihoodNormalization::UserProvided,
                 ..saved_fit_summary_fixture()
@@ -12807,7 +12838,10 @@ mod tests {
             "Surv(entry, exit, event) ~ 1",
             ModelKind::Survival,
             FittedFamily::Survival {
-                likelihood: LikelihoodSpec::new(ResponseFamily::RoystonParmar, InverseLink::Standard(LinkFunction::Identity)),
+                likelihood: LikelihoodSpec::new(
+                    ResponseFamily::RoystonParmar,
+                    InverseLink::Standard(LinkFunction::Identity),
+                ),
                 survival_likelihood: Some("marginal-slope".to_string()),
                 survival_distribution: Some(ResidualDistribution::Gaussian),
                 frailty: gam::families::lognormal_kernel::FrailtySpec::None,
@@ -13637,7 +13671,10 @@ mod tests {
             "Surv(start, stop, event) ~ x",
             ModelKind::Survival,
             FittedFamily::Survival {
-                likelihood: LikelihoodSpec::new(ResponseFamily::RoystonParmar, InverseLink::Standard(LinkFunction::Identity)),
+                likelihood: LikelihoodSpec::new(
+                    ResponseFamily::RoystonParmar,
+                    InverseLink::Standard(LinkFunction::Identity),
+                ),
                 survival_likelihood: Some("transformation".to_string()),
                 survival_distribution: Some(ResidualDistribution::Gaussian),
                 frailty: gam::families::lognormal_kernel::FrailtySpec::None,
@@ -13695,7 +13732,10 @@ mod tests {
             "Surv(start, stop, event) ~ x",
             ModelKind::Survival,
             FittedFamily::Survival {
-                likelihood: LikelihoodSpec::new(ResponseFamily::RoystonParmar, InverseLink::Standard(LinkFunction::Identity)),
+                likelihood: LikelihoodSpec::new(
+                    ResponseFamily::RoystonParmar,
+                    InverseLink::Standard(LinkFunction::Identity),
+                ),
                 survival_likelihood: Some("marginal-slope".to_string()),
                 survival_distribution: Some(ResidualDistribution::Gaussian),
                 frailty: gam::families::lognormal_kernel::FrailtySpec::None,
@@ -13914,7 +13954,10 @@ mod tests {
             "Surv(entry, exit, event) ~ x1 + x2",
             ModelKind::Survival,
             FittedFamily::Survival {
-                likelihood: LikelihoodSpec::new(ResponseFamily::RoystonParmar, InverseLink::Standard(LinkFunction::Identity)),
+                likelihood: LikelihoodSpec::new(
+                    ResponseFamily::RoystonParmar,
+                    InverseLink::Standard(LinkFunction::Identity),
+                ),
                 survival_likelihood: Some("marginal-slope".to_string()),
                 survival_distribution: Some(ResidualDistribution::Gaussian),
                 frailty: gam::families::lognormal_kernel::FrailtySpec::None,
@@ -14057,7 +14100,10 @@ mod tests {
             "Surv(entry, exit, event) ~ 1",
             ModelKind::Survival,
             FittedFamily::Survival {
-                likelihood: LikelihoodSpec::new(ResponseFamily::RoystonParmar, InverseLink::Standard(LinkFunction::Identity)),
+                likelihood: LikelihoodSpec::new(
+                    ResponseFamily::RoystonParmar,
+                    InverseLink::Standard(LinkFunction::Identity),
+                ),
                 survival_likelihood: Some("marginal-slope".to_string()),
                 survival_distribution: Some(ResidualDistribution::Gaussian),
                 frailty: gam::families::lognormal_kernel::FrailtySpec::None,
@@ -14190,7 +14236,10 @@ mod tests {
             "Surv(entry, exit, event) ~ timewiggle(degree=3, internal_knots=5)",
             ModelKind::Survival,
             FittedFamily::Survival {
-                likelihood: LikelihoodSpec::new(ResponseFamily::RoystonParmar, InverseLink::Standard(LinkFunction::Identity)),
+                likelihood: LikelihoodSpec::new(
+                    ResponseFamily::RoystonParmar,
+                    InverseLink::Standard(LinkFunction::Identity),
+                ),
                 survival_likelihood: Some("transformation".to_string()),
                 survival_distribution: Some(ResidualDistribution::Gaussian),
                 frailty: gam::families::lognormal_kernel::FrailtySpec::None,
@@ -14260,7 +14309,10 @@ mod tests {
             "Surv(entry, exit, event) ~ timewiggle(degree=3, internal_knots=4)",
             ModelKind::Survival,
             FittedFamily::Survival {
-                likelihood: LikelihoodSpec::new(ResponseFamily::RoystonParmar, InverseLink::Standard(LinkFunction::Identity)),
+                likelihood: LikelihoodSpec::new(
+                    ResponseFamily::RoystonParmar,
+                    InverseLink::Standard(LinkFunction::Identity),
+                ),
                 survival_likelihood: Some("transformation".to_string()),
                 survival_distribution: Some(ResidualDistribution::Gaussian),
                 frailty: gam::families::lognormal_kernel::FrailtySpec::None,
@@ -14561,7 +14613,10 @@ mod tests {
             "Surv(entry, exit, event) ~ timewiggle(degree=3, internal_knots=4)",
             ModelKind::Survival,
             FittedFamily::Survival {
-                likelihood: LikelihoodSpec::new(ResponseFamily::RoystonParmar, InverseLink::Standard(LinkFunction::Identity)),
+                likelihood: LikelihoodSpec::new(
+                    ResponseFamily::RoystonParmar,
+                    InverseLink::Standard(LinkFunction::Identity),
+                ),
                 survival_likelihood: Some("transformation".to_string()),
                 survival_distribution: Some(ResidualDistribution::Gaussian),
                 frailty: gam::families::lognormal_kernel::FrailtySpec::None,
@@ -16100,7 +16155,10 @@ mod tests {
             "y ~ x",
             ModelKind::LocationScale,
             FittedFamily::LocationScale {
-                likelihood: LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Probit)),
+                likelihood: LikelihoodSpec::new(
+                    ResponseFamily::Binomial,
+                    InverseLink::Standard(LinkFunction::Probit),
+                ),
                 base_link: Some(InverseLink::Standard(LinkFunction::Probit)),
             },
             "binomial-location-scale",
@@ -16292,7 +16350,10 @@ mod tests {
             "y ~ x",
             ModelKind::LocationScale,
             FittedFamily::LocationScale {
-                likelihood: LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Probit)),
+                likelihood: LikelihoodSpec::new(
+                    ResponseFamily::Binomial,
+                    InverseLink::Standard(LinkFunction::Probit),
+                ),
                 base_link: Some(InverseLink::Standard(LinkFunction::Probit)),
             },
             "binomial-location-scale",
@@ -16309,7 +16370,10 @@ mod tests {
             "y ~ x",
             ModelKind::LocationScale,
             FittedFamily::LocationScale {
-                likelihood: LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Probit)),
+                likelihood: LikelihoodSpec::new(
+                    ResponseFamily::Binomial,
+                    InverseLink::Standard(LinkFunction::Probit),
+                ),
                 base_link: Some(InverseLink::Standard(LinkFunction::Probit)),
             },
             "binomial-location-scale",

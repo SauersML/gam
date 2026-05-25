@@ -33,10 +33,7 @@
 //! anisotropic TR), the assertion `outer_converged == true` will pass.
 
 use csv::StringRecord;
-use gam::{
-    FitConfig, FitRequest, encode_recordswith_inferred_schema, fit_model, init_parallelism,
-    materialize,
-};
+use gam::{FitConfig, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism};
 use std::sync::Once;
 use std::time::Instant;
 
@@ -97,11 +94,15 @@ fn next_gauss(state: &mut u64) -> f64 {
     r * theta.cos()
 }
 
-/// Build a small synthetic biobank-shape survival dataset whose time block
-/// is structurally ill-conditioned: most events occur in the lower part
-/// of the age window, leaving the upper-time basis columns with very
-/// little Fisher information.  This mirrors a real survey/cohort where
-/// the upper age strata are thinly sampled relative to the spline density.
+/// Build the same frame shape and first-order column statistics as the
+/// failing biobank survival-marginal-slope run:
+///
+///   rows=195,780 columns=[entry_age, exit_age, event, sex, prs_z, PC1..PC3]
+///   event mean=0.5, sex mean≈0.391, entry_age mean≈45, exit_age mean≈53
+///
+/// This deliberately avoids the old low-event synthetic fixture, which
+/// reaches a different startup-validation error before the coupled
+/// exact-joint residual-stall path.
 fn build_dataset() -> gam::inference::data::EncodedDataset {
     let mut headers = vec![
         "entry_age".to_string(),
@@ -117,36 +118,37 @@ fn build_dataset() -> gam::inference::data::EncodedDataset {
     let mut state = SEED;
     let mut rows: Vec<StringRecord> = Vec::with_capacity(N);
 
-    for _ in 0..N {
-        let sex = if next_unit(&mut state) < 0.5 { 1.0_f64 } else { 0.0_f64 };
-        // Age window [40, 80] but heavily back-loaded entries
-        let entry_age: f64 = 40.0 + 30.0 * next_unit(&mut state);
-        // Exit-age increment is short and skewed small so events cluster
-        // in the lower-mid age band — the time basis sees a flat tail.
-        let dt = 0.5 + 5.0 * next_unit(&mut state).powf(2.0);
-        let exit_age = (entry_age + dt).min(80.0);
+    for i in 0..N {
+        let sex = if next_unit(&mut state) < 0.391_184 {
+            1.0_f64
+        } else {
+            0.0_f64
+        };
+        // Match the wide observed age range and mean from the production
+        // diagnostics. U^1.76 has mean about 0.362, giving entry_age≈45.
+        let entry_age: f64 = 1.546_89 + 120.416 * next_unit(&mut state).powf(1.76);
+        let follow_up = 0.45 + 14.30 * next_unit(&mut state);
+        let exit_age = (entry_age + follow_up).min(122.47);
 
-        // Latent prs_z and 10 PCs, all standard normal.
+        // Exactly balanced events, matching the case/control sampled
+        // production frame. Shuffle by RNG order rather than row halves.
+        let event = if splitmix64(&mut state).wrapping_add(i as u64) & 1 == 0 {
+            1.0
+        } else {
+            0.0
+        };
+
+        // Latent prs_z and 3 PCs.
         let prs_z = next_gauss(&mut state);
         let mut pcs = [0.0_f64; N_PCS];
         for j in 0..N_PCS {
-            pcs[j] = next_gauss(&mut state);
+            let center = match j {
+                0 => 0.024_352_2,
+                1 => 0.080_796_3,
+                _ => -0.008_917_45,
+            };
+            pcs[j] = center + 0.045 * next_gauss(&mut state);
         }
-        // Build a hazard that depends weakly on sex/prs/pcs.  Keep the
-        // marginal event-rate low (≈ 4–6 %) so the time-block Fisher
-        // matrix is structurally rank-deficient at the high-knot density
-        // configured below.  This is the regime that triggers the
-        // production failure: huge unconstrained Newton step in the
-        // time block dominates the joint L2 trust-region clamp.
-        let pc_signal: f64 = pcs.iter().enumerate()
-            .map(|(j, p)| p * ((j + 1) as f64).recip() * if j % 2 == 0 { 1.0 } else { -1.0 })
-            .sum();
-        let log_hazard = -3.2 + 0.15 * sex + 0.10 * prs_z + 0.03 * pc_signal
-            + 0.04 * (entry_age - 60.0);
-        let lambda = log_hazard.exp().min(5e-2);
-        // Sample event indicator from per-unit-time hazard over dt.
-        let p_event = 1.0 - (-lambda * dt).exp();
-        let event = if next_unit(&mut state) < p_event { 1.0 } else { 0.0 };
 
         let mut record: Vec<String> = vec![
             entry_age.to_string(),
@@ -196,14 +198,7 @@ fn survival_marginal_slope_stall_reproduces_residual_stall_early_exit() {
     );
 
     let start = Instant::now();
-    let materialized = materialize(&formula, &data, &config).expect("materialize survival marginal-slope");
-    let outcome = match materialized.request {
-        FitRequest::SurvivalMarginalSlope(mut request) => {
-            request.options.inner_max_cycles = 2;
-            fit_model(FitRequest::SurvivalMarginalSlope(request))
-        }
-        _ => panic!("expected survival marginal-slope request"),
-    };
+    let outcome = fit_from_formula(&formula, &data, &config);
     let elapsed = start.elapsed();
     eprintln!(
         "[SURVIVAL-MGS-STALL] fit_from_formula returned in {:.3}s ok={}",
@@ -225,7 +220,9 @@ fn survival_marginal_slope_stall_reproduces_residual_stall_early_exit() {
         "missing seed validation error: {message}"
     );
     assert!(
-        message.contains("coupled exact-joint inner solve exited the joint Newton path before convergence"),
+        message.contains(
+            "coupled exact-joint inner solve exited the joint Newton path before convergence"
+        ),
         "missing coupled exact-joint convergence error: {message}"
     );
     panic!("replicated exact production startup-validation error: {message}");

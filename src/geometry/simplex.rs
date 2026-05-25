@@ -15,10 +15,7 @@ fn validate_simplex_array(points: ArrayView2<'_, f64>) -> Result<(), String> {
     Ok(())
 }
 
-fn normalize_weights(
-    n: usize,
-    weights: Option<ArrayView1<'_, f64>>,
-) -> Result<Vec<f64>, String> {
+fn normalize_weights(n: usize, weights: Option<ArrayView1<'_, f64>>) -> Result<Vec<f64>, String> {
     match weights {
         None => Ok(vec![1.0 / n as f64; n]),
         Some(w) => {
@@ -29,8 +26,7 @@ fn normalize_weights(
             for value in w.iter() {
                 if !value.is_finite() || *value < 0.0 {
                     return Err(
-                        "weights must be finite, non-negative, and have positive total"
-                            .to_string(),
+                        "weights must be finite, non-negative, and have positive total".to_string(),
                     );
                 }
                 total += *value;

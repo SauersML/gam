@@ -1324,12 +1324,8 @@ fn evaluate_rp_row_with_beta(
         ResponseFamily::RoystonParmar,
         InverseLink::Standard(LinkFunction::Identity),
     );
-    let eta = predict_royston_parmar_eta(
-        x_exit.view(),
-        beta.view(),
-        offset_view.view(),
-        &likelihood,
-    )?[0];
+    let eta =
+        predict_royston_parmar_eta(x_exit.view(), beta.view(), offset_view.view(), &likelihood)?[0];
     let (cum, haz) = royston_parmar_survival_hazard_components(eta, eta_derivative)?;
     Ok((eta, cum, haz))
 }
@@ -1344,7 +1340,10 @@ where
     X: Into<DesignMatrix>,
 {
     if !matches!(likelihood.response, ResponseFamily::RoystonParmar)
-        || !matches!(likelihood.link, InverseLink::Standard(LinkFunction::Identity))
+        || !matches!(
+            likelihood.link,
+            InverseLink::Standard(LinkFunction::Identity)
+        )
     {
         return Err(SurvivalPredictError::UnsupportedConfiguration {
             reason: "survival prediction requires RoystonParmar with identity link".to_string(),

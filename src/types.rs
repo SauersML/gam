@@ -305,10 +305,7 @@ impl LikelihoodSpec {
 
     #[inline]
     pub const fn binomial_latent_cloglog(state: LatentCLogLogState) -> Self {
-        Self::new(
-            ResponseFamily::Binomial,
-            InverseLink::LatentCLogLog(state),
-        )
+        Self::new(ResponseFamily::Binomial, InverseLink::LatentCLogLog(state))
     }
 
     #[inline]
@@ -459,16 +456,10 @@ impl LikelihoodSpec {
             (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::CLogLog)) => {
                 "Binomial CLogLog"
             }
-            (ResponseFamily::Binomial, InverseLink::LatentCLogLog(_)) => {
-                "Latent CLogLog Binomial"
-            }
+            (ResponseFamily::Binomial, InverseLink::LatentCLogLog(_)) => "Latent CLogLog Binomial",
             (ResponseFamily::Binomial, InverseLink::Sas(_)) => "Binomial SAS",
-            (ResponseFamily::Binomial, InverseLink::BetaLogistic(_)) => {
-                "Binomial Beta-Logistic"
-            }
-            (ResponseFamily::Binomial, InverseLink::Mixture(_)) => {
-                "Binomial Blended Inverse-Link"
-            }
+            (ResponseFamily::Binomial, InverseLink::BetaLogistic(_)) => "Binomial Beta-Logistic",
+            (ResponseFamily::Binomial, InverseLink::Mixture(_)) => "Binomial Blended Inverse-Link",
             (ResponseFamily::Binomial, InverseLink::Standard(_)) => "Binomial Logit",
         }
     }
@@ -493,16 +484,10 @@ impl LikelihoodSpec {
             (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::CLogLog)) => {
                 "binomial-cloglog"
             }
-            (ResponseFamily::Binomial, InverseLink::LatentCLogLog(_)) => {
-                "latent-cloglog-binomial"
-            }
+            (ResponseFamily::Binomial, InverseLink::LatentCLogLog(_)) => "latent-cloglog-binomial",
             (ResponseFamily::Binomial, InverseLink::Sas(_)) => "binomial-sas",
-            (ResponseFamily::Binomial, InverseLink::BetaLogistic(_)) => {
-                "binomial-beta-logistic"
-            }
-            (ResponseFamily::Binomial, InverseLink::Mixture(_)) => {
-                "binomial-blended-inverse-link"
-            }
+            (ResponseFamily::Binomial, InverseLink::BetaLogistic(_)) => "binomial-beta-logistic",
+            (ResponseFamily::Binomial, InverseLink::Mixture(_)) => "binomial-blended-inverse-link",
             (ResponseFamily::Binomial, InverseLink::Standard(_)) => "binomial-logit",
         }
     }
@@ -512,7 +497,6 @@ impl LikelihoodSpec {
         matches!(self.response, ResponseFamily::Binomial)
             && matches!(self.link, InverseLink::Standard(LinkFunction::Logit))
     }
-
 }
 
 #[inline]
@@ -621,9 +605,7 @@ impl GlmLikelihoodSpec {
                 LikelihoodScaleMetadata::EstimatedGammaShape { shape }
             }
             other => match &self.spec.response {
-                ResponseFamily::Gamma => {
-                    LikelihoodScaleMetadata::EstimatedGammaShape { shape }
-                }
+                ResponseFamily::Gamma => LikelihoodScaleMetadata::EstimatedGammaShape { shape },
                 _ => other,
             },
         };

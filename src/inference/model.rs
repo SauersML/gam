@@ -20,8 +20,8 @@ use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec};
 use crate::smooth::{AdaptiveRegularizationDiagnostics, TermCollectionSpec};
 use crate::span::span_index_for_breakpoints;
 use crate::types::{
-    InverseLink, LatentCLogLogState, LikelihoodSpec, LinkFunction, MixtureLinkState,
-    SasLinkSpec, SasLinkState,
+    InverseLink, LatentCLogLogState, LikelihoodSpec, LinkFunction, MixtureLinkState, SasLinkSpec,
+    SasLinkState,
 };
 use ndarray::{Array1, Array2};
 use serde::{Deserialize, Serialize};
@@ -2308,9 +2308,7 @@ impl FittedModel {
             | FittedFamily::LatentBinary { .. } => PredictModelClass::Survival,
             FittedFamily::MarginalSlope { .. } => PredictModelClass::BernoulliMarginalSlope,
             FittedFamily::TransformationNormal { .. } => PredictModelClass::TransformationNormal,
-            FittedFamily::LocationScale { likelihood, .. }
-                if likelihood.is_gaussian_identity() =>
-            {
+            FittedFamily::LocationScale { likelihood, .. } if likelihood.is_gaussian_identity() => {
                 PredictModelClass::GaussianLocationScale
             }
             FittedFamily::LocationScale { .. } => PredictModelClass::BinomialLocationScale,
@@ -2740,10 +2738,15 @@ impl FittedModel {
                 let beta = if runtime.link_wiggle.is_some() {
                     fit.block_by_role(BlockRole::Mean)?.beta.clone()
                 } else if let Some(unified) = self.unified() {
-                    StandardPredictor::from_unified(unified, family.clone(), link_kind.clone(), None)
-                        .ok()
-                        .map(|p| p.beta)
-                        .unwrap_or_else(|| fit.beta.clone())
+                    StandardPredictor::from_unified(
+                        unified,
+                        family.clone(),
+                        link_kind.clone(),
+                        None,
+                    )
+                    .ok()
+                    .map(|p| p.beta)
+                    .unwrap_or_else(|| fit.beta.clone())
                 } else {
                     fit.beta.clone()
                 };

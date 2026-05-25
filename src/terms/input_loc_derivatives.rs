@@ -263,5 +263,4 @@ mod tests {
             "expected large |q| for TPS dim=2 near r=0, got {q}"
         );
     }
-
 }

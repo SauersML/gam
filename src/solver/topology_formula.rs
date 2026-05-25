@@ -61,7 +61,14 @@ struct TopologyTerm {
     required_dim: Option<usize>,
 }
 
-const SIZE_OPTION_KEYS: &[&str] = &["k", "basis_dim", "basis-dim", "basisdim", "centers", "knots"];
+const SIZE_OPTION_KEYS: &[&str] = &[
+    "k",
+    "basis_dim",
+    "basis-dim",
+    "basisdim",
+    "centers",
+    "knots",
+];
 const STRUCTURAL_OPTION_KEYS: &[&str] = &[
     "periodic", "cyclic", "bc", "period", "periods", "origin", "origins",
 ];
@@ -99,9 +106,8 @@ pub fn assemble_candidate_formula(
             return Ok(None);
         }
     }
-    let mut candidate_args: Vec<String> = Vec::with_capacity(
-        vars.len() + user_options.len() + topo_term.options.len(),
-    );
+    let mut candidate_args: Vec<String> =
+        Vec::with_capacity(vars.len() + user_options.len() + topo_term.options.len());
     candidate_args.extend(vars.iter().cloned());
     candidate_args.extend(user_options.iter().cloned());
     candidate_args.extend(topo_term.options.iter().cloned());
@@ -569,8 +575,9 @@ mod tests {
             degree: 3,
             penalty_order: 2,
         };
-        let out =
-            assemble_candidate_formula("y ~ s(t, type=AUTO)", &candidate, true).unwrap().unwrap();
+        let out = assemble_candidate_formula("y ~ s(t, type=AUTO)", &candidate, true)
+            .unwrap()
+            .unwrap();
         assert_eq!(out, "y ~ s(t, type=cyclic, k=20)");
     }
 
@@ -582,10 +589,9 @@ mod tests {
             kernel: "sobolev".to_string(),
             radians: false,
         };
-        let out =
-            assemble_candidate_formula("y ~ s(lat, lon, type=AUTO)", &candidate, true)
-                .unwrap()
-                .unwrap();
+        let out = assemble_candidate_formula("y ~ s(lat, lon, type=AUTO)", &candidate, true)
+            .unwrap()
+            .unwrap();
         assert_eq!(out, "y ~ s(lat, lon, type=sphere, centers=64)");
     }
 
@@ -596,10 +602,9 @@ mod tests {
             periodic: vec![true, true],
             periods: None,
         };
-        let out =
-            assemble_candidate_formula("y ~ s(theta, phi, type=AUTO)", &candidate, true)
-                .unwrap()
-                .unwrap();
+        let out = assemble_candidate_formula("y ~ s(theta, phi, type=AUTO)", &candidate, true)
+            .unwrap()
+            .unwrap();
         assert!(out.starts_with("y ~ te(theta, phi, k=[12, 12], periodic=[true, true]"));
         assert!(out.contains("identifiability=sum_tozero"));
     }
@@ -649,10 +654,9 @@ mod tests {
             degree: 3,
             penalty_order: 2,
         };
-        let out =
-            assemble_candidate_formula("y ~ s(t, k=8, type=AUTO)", &candidate, true)
-                .unwrap()
-                .unwrap();
+        let out = assemble_candidate_formula("y ~ s(t, k=8, type=AUTO)", &candidate, true)
+            .unwrap()
+            .unwrap();
         // The user's `k=8` is preserved and the candidate does not re-add `k=20`.
         assert!(out.contains("k=8"));
         assert!(!out.contains("k=20"));
@@ -665,8 +669,7 @@ mod tests {
             degree: 3,
             penalty_order: 2,
         };
-        let err =
-            assemble_candidate_formula("y ~ s(t, k=8)", &candidate, true).unwrap_err();
+        let err = assemble_candidate_formula("y ~ s(t, k=8)", &candidate, true).unwrap_err();
         assert!(err.contains("type=AUTO"));
     }
 }

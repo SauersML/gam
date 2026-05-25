@@ -320,9 +320,7 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
             (ResponseFamily::Beta { .. }, _) => {
                 Ok(logit_posterior_meanvariance(quadctx, eta, se_eta).0)
             }
-            (ResponseFamily::RoystonParmar, _) => {
-                Ok(survival_posterior_mean(quadctx, eta, se_eta))
-            }
+            (ResponseFamily::RoystonParmar, _) => Ok(survival_posterior_mean(quadctx, eta, se_eta)),
         }
     }
 
@@ -422,8 +420,7 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
     ) -> Result<NoiseModel, EstimationError> {
         match &self.spec.response {
             ResponseFamily::Gaussian => {
-                let sigma =
-                    require_noise_parameter(&self.spec, "Gaussian sigma", gaussian_scale)?;
+                let sigma = require_noise_parameter(&self.spec, "Gaussian sigma", gaussian_scale)?;
                 if sigma < 0.0 {
                     return Err(EstimationError::InvalidInput(format!(
                         "Gaussian Identity generative sampling requires Gaussian sigma >= 0; got {sigma}"
@@ -470,11 +467,7 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
                 Ok(NoiseModel::Beta { phi })
             }
             ResponseFamily::Gamma => Ok(NoiseModel::Gamma {
-                shape: require_positive_noise_parameter(
-                    &self.spec,
-                    "Gamma shape",
-                    gaussian_scale,
-                )?,
+                shape: require_positive_noise_parameter(&self.spec, "Gamma shape", gaussian_scale)?,
             }),
             ResponseFamily::RoystonParmar => Err(EstimationError::InvalidInput(
                 "RoystonParmar generative sampling is not exposed via generic family strategy"
@@ -501,11 +494,6 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
                 mode: jet.mode,
             });
         }
-        integrated_family_moments_jet(
-            quadctx,
-            &self.spec,
-            eta,
-            se_eta,
-        )
+        integrated_family_moments_jet(quadctx, &self.spec, eta, se_eta)
     }
 }

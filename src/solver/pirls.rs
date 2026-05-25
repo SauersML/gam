@@ -16,8 +16,8 @@ use crate::probability::standard_normal_quantile;
 use crate::solver::active_set;
 use crate::types::{Coefficients, LinearPredictor, LogSmoothingParamsView};
 use crate::types::{
-    GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkFunction, MixtureLinkState,
-    ResponseFamily, RidgePassport, RidgePolicy, SasLinkState, is_valid_tweedie_power,
+    GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkFunction, MixtureLinkState, ResponseFamily,
+    RidgePassport, RidgePolicy, SasLinkState, is_valid_tweedie_power,
 };
 use dyn_stack::{MemBuffer, MemStack};
 use faer::sparse::linalg::matmul::{
@@ -30,9 +30,7 @@ use faer::sparse::{
 };
 use faer::{Accum, Par, Side, Unbind, get_global_parallelism};
 use log;
-use ndarray::{
-    Array1, Array2, ArrayView1, ArrayView2, ArrayView3, ShapeBuilder, Zip, s,
-};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayView3, ShapeBuilder, Zip, s};
 use rayon::iter::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
 use statrs::function::gamma::{digamma, ln_gamma};
@@ -10041,7 +10039,9 @@ pub fn weight_family_for_glm_likelihood(likelihood: &GlmLikelihoodSpec) -> Weigh
         ResponseFamily::Gaussian => WeightFamily::Gaussian,
         ResponseFamily::Poisson => WeightFamily::Poisson,
         ResponseFamily::Tweedie { p } => WeightFamily::Tweedie { p: *p },
-        ResponseFamily::NegativeBinomial { theta } => WeightFamily::NegativeBinomial { theta: *theta },
+        ResponseFamily::NegativeBinomial { theta } => {
+            WeightFamily::NegativeBinomial { theta: *theta }
+        }
         ResponseFamily::Beta { phi } => WeightFamily::Beta { phi: *phi },
         ResponseFamily::Gamma => WeightFamily::Gamma,
         ResponseFamily::Binomial => WeightFamily::Binomial,
@@ -13898,9 +13898,9 @@ mod root_cause_tests {
                 .collect();
             let config = PirlsConfig {
                 likelihood: GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
-                ResponseFamily::Binomial,
-                InverseLink::Standard(LinkFunction::Logit),
-            )),
+                    ResponseFamily::Binomial,
+                    InverseLink::Standard(LinkFunction::Logit),
+                )),
                 link_kind: InverseLink::Standard(LinkFunction::Logit),
                 max_iterations: 100,
                 convergence_tolerance: 1e-8,
@@ -14197,12 +14197,7 @@ mod root_cause_tests {
         let weights = array![2.0, -3.0, 0.25];
         let mut chunk = Array2::<f64>::zeros((0, 0));
         let mut got = Array2::<f64>::zeros((2, 2));
-        PirlsWorkspace::add_dense_xtwx_signed(
-            &weights,
-            &mut chunk,
-            &x,
-            &mut got,
-        );
+        PirlsWorkspace::add_dense_xtwx_signed(&weights, &mut chunk, &x, &mut got);
 
         let mut expected = Array2::<f64>::zeros((2, 2));
         for i in 0..x.nrows() {

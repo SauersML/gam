@@ -20957,26 +20957,20 @@ mod tests {
                     &beta_flat.slice(s![0..p_time]).to_owned(),
                 )),
             0.5 * lams[1]
-                * beta_flat
-                    .slice(s![p_time..p_time + p_marg])
-                    .dot(&fast_av(
-                        &s_marg_0,
-                        &beta_flat.slice(s![p_time..p_time + p_marg]).to_owned(),
-                    )),
+                * beta_flat.slice(s![p_time..p_time + p_marg]).dot(&fast_av(
+                    &s_marg_0,
+                    &beta_flat.slice(s![p_time..p_time + p_marg]).to_owned(),
+                )),
             0.5 * lams[2]
-                * beta_flat
-                    .slice(s![p_time..p_time + p_marg])
-                    .dot(&fast_av(
-                        &s_marg_1,
-                        &beta_flat.slice(s![p_time..p_time + p_marg]).to_owned(),
-                    )),
+                * beta_flat.slice(s![p_time..p_time + p_marg]).dot(&fast_av(
+                    &s_marg_1,
+                    &beta_flat.slice(s![p_time..p_time + p_marg]).to_owned(),
+                )),
             0.5 * lams[3]
-                * beta_flat
-                    .slice(s![p_time + p_marg..p_total])
-                    .dot(&fast_av(
-                        &s_logs,
-                        &beta_flat.slice(s![p_time + p_marg..p_total]).to_owned(),
-                    )),
+                * beta_flat.slice(s![p_time + p_marg..p_total]).dot(&fast_av(
+                    &s_logs,
+                    &beta_flat.slice(s![p_time + p_marg..p_total]).to_owned(),
+                )),
         ];
         assert_eq!(
             projected.gradient.len(),

@@ -362,7 +362,10 @@ pub(crate) fn trace_penalty_covariance_in_orthogonal_basis(
     orthogonal: &Array2<f64>,
     covariance_basis: &Array2<f64>,
 ) -> f64 {
-    let reduced = crate::faer_ndarray::fast_ab(&crate::faer_ndarray::fast_atb(orthogonal, matrix), orthogonal);
+    let reduced = crate::faer_ndarray::fast_ab(
+        &crate::faer_ndarray::fast_atb(orthogonal, matrix),
+        orthogonal,
+    );
     trace_reduced_penalty_covariance(&reduced, covariance_basis)
 }
 

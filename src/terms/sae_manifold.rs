@@ -554,11 +554,7 @@ impl SaeAssignment {
             AssignmentMode::JumpReLU {
                 temperature,
                 threshold,
-            } => Ok(jumprelu_row(
-                self.logits.row(row),
-                temperature,
-                threshold,
-            )),
+            } => Ok(jumprelu_row(self.logits.row(row), temperature, threshold)),
         }
     }
 
