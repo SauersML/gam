@@ -5198,8 +5198,9 @@ pub enum KktResidualSubspace {
 /// also been reduced into the identifiable range.
 #[derive(Clone, Debug)]
 pub struct ProjectedKktResidual {
-    /// The free-space residual vector. Same length as the unprojected
-    /// gradient minus the number of pinned active-set rows.
+    /// The residual vector in the full coefficient coordinates. Active and
+    /// reduced-range projection zero out excluded directions rather than
+    /// shortening the vector, so its length remains `p`.
     residual: Array1<f64>,
     subspace: KktResidualSubspace,
     /// The KKT-stationarity tolerance the inner solver compared the
@@ -5238,8 +5239,8 @@ impl ProjectedKktResidual {
     }
 
     /// Attach the KKT tolerance and free-subspace rank to a previously
-    /// constructed residual. Builder-style so the legacy construction
-    /// path (`from_projected` then `with_metadata`) reads as a single
+    /// constructed residual. Builder-style so the construction path
+    /// (`from_active_projected` / `from_reduced_range` then `with_metadata`) reads as a single
     /// inline expression at the call site.
     pub(crate) fn with_metadata(mut self, residual_tol: f64, free_rank: usize) -> Self {
         self.residual_tol = Some(residual_tol);
@@ -5255,6 +5256,18 @@ impl ProjectedKktResidual {
 
     pub fn subspace(&self) -> KktResidualSubspace {
         self.subspace
+    }
+
+    fn projected_into_reduced_range(&self, kernel: &PenaltySubspaceTrace) -> Self {
+        match self.subspace {
+            KktResidualSubspace::ReducedRange => self.clone(),
+            KktResidualSubspace::ActiveProjected => {
+                let mut reduced = Self::from_reduced_range(kernel.project_onto_subspace(&self.residual));
+                reduced.residual_tol = self.residual_tol;
+                reduced.free_rank = self.free_rank;
+                reduced
+            }
+        }
     }
 
     /// The KKT-stationarity tolerance the inner solver applied at the
@@ -6922,10 +6935,7 @@ fn try_tangent_projected_evaluate(
     // `-½ rᵀ q` and `-aᵀ_k q + ½ qᵀ A_k q` are the same as the p-space
     // formulas (Zᵀ cancels through the operator wrapper). We pass r in
     // p-space; the wrapper does the projection internally.
-    let projected_kkt = solution
-        .kkt_residual
-        .as_ref()
-        .map(|r| ProjectedKktResidual::from_projected(r.as_array().clone()));
+    let projected_kkt = solution.kkt_residual.clone();
     let m_tangent = z.ncols();
     let wrapper = TangentProjectedHessianOperator {
         z: z.clone(),
@@ -7228,7 +7238,8 @@ pub fn reml_laml_evaluate(
     // here is the length match against the Hessian operator. `None` means the
     // caller is presenting an exact-KKT mode and the envelope identities are
     // already valid.
-    let kkt_residual_vec: Option<&Array1<f64>> = match solution.kkt_residual.as_ref() {
+    let kkt_residual_vec: Option<std::borrow::Cow<'_, Array1<f64>>> =
+        match solution.kkt_residual.as_ref() {
         Some(residual) => {
             let r = residual.as_array();
             if r.len() != hop.dim() {
@@ -7241,7 +7252,12 @@ pub fn reml_laml_evaluate(
                 }
                 .into());
             }
-            Some(r)
+            if let Some(kernel) = solution.penalty_subspace_trace.as_ref() {
+                let reduced = residual.projected_into_reduced_range(kernel);
+                Some(std::borrow::Cow::Owned(reduced.as_array().clone()))
+            } else {
+                Some(std::borrow::Cow::Borrowed(r))
+            }
         }
         None => None,
     };
@@ -7251,8 +7267,9 @@ pub fn reml_laml_evaluate(
     // spam normal runs but is immediately greppable when debugging an
     // envelope-gradient consistency failure (search for `[ift-gate]`).
     log::debug!(
-        "[ift-gate] kkt_residual.is_some()={} dispersion={} correction_active={} subspace_trace.is_some()={} hop.dim()={} k={}",
+        "[ift-gate] kkt_residual.is_some()={} kkt_residual.subspace={:?} dispersion={} correction_active={} subspace_trace.is_some()={} hop.dim()={} k={}",
         solution.kkt_residual.is_some(),
+        solution.kkt_residual.as_ref().map(ProjectedKktResidual::subspace),
         match &solution.dispersion {
             DispersionHandling::Fixed { .. } => "Fixed",
             DispersionHandling::ProfiledGaussian => "ProfiledGaussian",
@@ -7264,7 +7281,11 @@ pub fn reml_laml_evaluate(
     );
     let mut ift_residual_energy: Option<f64> = None;
     let mut inner_polish_step: Option<Array1<f64>> = None;
-    if let Some(r) = kkt_residual_vec.filter(|_| kkt_residual_correction_active) {
+    if let Some(r) = kkt_residual_vec
+        .as_ref()
+        .filter(|_| kkt_residual_correction_active)
+        .map(|r| r.as_ref())
+    {
         // Cost-side IFT correction `−½ rᵀ H⁻¹ r`. When the rank-deficient
         // LAML fix is active (`penalty_subspace_trace = Some`), the
         // mathematically correct inverse here is the Moore-Penrose
@@ -7906,7 +7927,11 @@ pub fn reml_laml_evaluate(
     // the residual correction is in the actual S(λ) basis, and the curvature
     // scale only applies to the H-dependent trace terms.
     let kkt_rho_corrections =
-        if let Some(r) = kkt_residual_vec.filter(|_| kkt_residual_correction_active && k > 0) {
+        if let Some(r) = kkt_residual_vec
+            .as_ref()
+            .filter(|_| kkt_residual_correction_active && k > 0)
+            .map(|r| r.as_ref())
+        {
             Some(compute_kkt_residual_rho_corrections(
                 solution,
                 hop,
@@ -18031,7 +18056,7 @@ mod tests {
             rho_ext_pair_fn: None,
             fixed_drift_deriv: None,
             barrier_config: None,
-            kkt_residual: Some(ProjectedKktResidual::from_projected(array![0.0, 0.0])),
+            kkt_residual: Some(ProjectedKktResidual::from_active_projected(array![0.0, 0.0])),
             active_constraints: None,
             stochastic_trace_state: Arc::new(Mutex::new(StochasticTraceState::default())),
         };
@@ -22149,7 +22174,7 @@ mod tests {
         // ⇒ r = (λ₁S₁+λ₂S₂)β̂ − (X'y − X'Xβ̂) = Hβ̂ − X'y.
         // At β* = H⁻¹X'y this is identically zero.
         let kkt_residual = if attach_residual {
-            Some(ProjectedKktResidual::from_projected(
+            Some(ProjectedKktResidual::from_active_projected(
                 &h.dot(&beta_hat) - &xty,
             ))
         } else {
@@ -22269,7 +22294,7 @@ mod tests {
             include_logdet_h: true,
             include_logdet_s: true,
         };
-        sol.kkt_residual = Some(ProjectedKktResidual::from_projected(array![0.0, 0.0]));
+        sol.kkt_residual = Some(ProjectedKktResidual::from_active_projected(array![0.0, 0.0]));
 
         let err = match reml_laml_evaluate(&sol, &rho, EvalMode::ValueAndGradient, None) {
             Ok(_) => panic!("wrong-length projected KKT residual must be rejected"),

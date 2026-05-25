@@ -4117,24 +4117,33 @@ fn parse_latent_manifold(
         match name.to_ascii_lowercase().as_str() {
             "euclidean" | "r" | "real" => Ok(LatentManifold::Euclidean),
             "circle" | "s1" | "periodic" => {
+                let radians = LatentManifold::Circle {
+                    period: std::f64::consts::TAU,
+                };
                 if d == 1 {
-                    Ok(LatentManifold::Circle)
+                    Ok(radians)
                 } else {
                     Ok(LatentManifold::Product(
-                        (0..d).map(|_| LatentManifold::Circle).collect(),
+                        (0..d).map(|_| radians.clone()).collect(),
                     ))
                 }
             }
             "sphere" | "sn" => Ok(LatentManifold::Sphere { dim: d }),
             "torus" => Ok(LatentManifold::Product(
-                (0..d).map(|_| LatentManifold::Circle).collect(),
+                (0..d)
+                    .map(|_| LatentManifold::Circle {
+                        period: std::f64::consts::TAU,
+                    })
+                    .collect(),
             )),
             "cylinder" => {
                 if d < 2 {
                     return Err(format!("{context}='cylinder' requires d >= 2"));
                 }
                 let mut parts = Vec::with_capacity(d);
-                parts.push(LatentManifold::Circle);
+                parts.push(LatentManifold::Circle {
+                    period: std::f64::consts::TAU,
+                });
                 for _ in 1..d {
                     parts.push(LatentManifold::Euclidean);
                 }
