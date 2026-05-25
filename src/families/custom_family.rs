@@ -13685,12 +13685,17 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     if options.ridge_policy.include_quadratic_penalty && ridge > 0.0 {
                         raw_descent -= &beta_old.mapv(|v| ridge * v);
                     }
-                    let raw_norm = raw_descent.iter().fold(0.0_f64, |m, &v| m.max(v.abs()));
-                    let descent_dir = if raw_norm > block_cap {
-                        &raw_descent * (block_cap / raw_norm)
-                    } else {
-                        raw_descent
-                    };
+                    let (descent_dir, descent_metric_norm) = truncate_block_step_to_metric_radius(
+                        spec,
+                        work,
+                        s_lambda,
+                        raw_descent,
+                        block_cap,
+                        ridge,
+                        options.ridge_policy,
+                    );
+                    trust_boundary_hit_in_cycle |=
+                        joint_block_step_hit_trust_boundary(descent_metric_norm, block_cap);
                     let dir_norm = descent_dir.iter().fold(0.0_f64, |m, &v| m.max(v.abs()));
                     if dir_norm > inner_tol {
                         // Precompute X * descent_dir once for incremental eta updates.

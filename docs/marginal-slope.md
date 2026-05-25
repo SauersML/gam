@@ -78,7 +78,7 @@ probs = model.predict(test_df, return_type="dict")["mean"]
   `link=` keyword is not needed for marginal-slope fits.
 - `z_column="z"`: name of the conditional z-score column in both the
   training and prediction tables.
-- `logslope_formula="..."`: formula for the log-slope surface as a
+- `logslope_formula="..."`: formula for the slope surface as a
   function of covariates.
 
 The main formula controls the baseline risk; `logslope_formula` controls
