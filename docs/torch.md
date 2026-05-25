@@ -88,7 +88,7 @@ workloads, prefer `gamfit.torch.fit` or the batched and additive primitives
 | Group | Symbols |
 | --- | --- |
 | High-level fitting | `fit`, `FitResult`, `GAM` |
-| Smooth specs | `Smooth`, `Duchon`, `BSpline`, `TensorBSpline`, `Matern`, `Pca`, `PeriodicSplineCurve`, `Sphere`, `Categorical` |
+| Smooth specs | `Smooth`, `Duchon`, `BSpline`, `TensorBSpline`, `Matern`, `Pca`, `PeriodicSplineCurve`, `ShapeConstraintLiteral`, `Sphere`, `Categorical` |
 | Closed-form REML | `gaussian_reml_fit`, `gaussian_reml_fit_batched`, `gaussian_reml_fit_additive`, `gaussian_reml_fit_blocks`, `GaussianRemlOutput`, `AdditiveRemlOutput` |
 | Basis evaluations | `bspline_basis`, `bspline_basis_derivative`, `duchon_basis`, `periodic_spline_curve_basis`, `sphere_basis` |
 | Penalty / ridge | `smoothness_penalty`, `gaussian_weighted_ridge`, `gaussian_weighted_ridge_batch` |
