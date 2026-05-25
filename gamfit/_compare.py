@@ -20,6 +20,7 @@ import math
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from ._binding import rust_module
 from ._model import Model
 
 
@@ -35,7 +36,6 @@ _NULL_HESSIAN_LOGDET_KEYS = (
     "logdet_h_null",
 )
 _DIM_KEYS = ("effective_dim", "dim_h", "dim_H", "hessian_dim")
-_TK_LOG_2PI = math.log(2.0 * math.pi)
 
 
 def _extract_reml_score(fit: Any) -> float:
@@ -77,18 +77,16 @@ def _extract_reml_score_raw(fit: Any) -> float:
 
 
 def _with_tierney_kadane_normalizer(fit: Any, score: float) -> float:
-    """Apply the full null-space Tierney-Kadane correction when available."""
+    """Apply Rust's null-space Tierney-Kadane correction when available."""
     null_dim = _extract_null_dim(fit)
     if null_dim is None:
         return float(score)
-    if not math.isfinite(null_dim) or null_dim < -1e-9:
-        raise ValueError(
-            "compare_models: invalid Tierney-Kadane null dimension "
-            f"{null_dim!r}"
+    return float(
+        rust_module().tierney_kadane_normalized_score(
+            float(score),
+            float(null_dim),
+            _extract_null_hessian_logdet(fit),
         )
-    return float(score) + _tierney_kadane_normalizer_from_null_dim(
-        null_dim,
-        _extract_null_hessian_logdet(fit),
     )
 
 
@@ -96,26 +94,13 @@ def _tierney_kadane_normalizer_from_null_dim(
     null_dim: float,
     null_hessian_logdet: float | None = None,
 ) -> float:
-    if not math.isfinite(null_dim) or null_dim < -1e-9:
-        raise ValueError(
-            "compare_models: invalid Tierney-Kadane null dimension "
-            f"{null_dim!r}"
+    return float(
+        rust_module().tierney_kadane_normalized_score(
+            0.0,
+            float(null_dim),
+            null_hessian_logdet,
         )
-    null_dim = max(0.0, float(null_dim))
-    if null_dim == 0.0:
-        return 0.0
-    if null_hessian_logdet is None:
-        raise NotImplementedError(
-            "Tierney-Kadane normalization for a positive null space requires "
-            "null-space Hessian logdet metadata; expected one of "
-            + ", ".join(_NULL_HESSIAN_LOGDET_KEYS)
-        )
-    if not math.isfinite(null_hessian_logdet):
-        raise ValueError(
-            "compare_models: invalid Tierney-Kadane null-space Hessian logdet "
-            f"{null_hessian_logdet!r}"
-        )
-    return -0.5 * null_dim * _TK_LOG_2PI + 0.5 * float(null_hessian_logdet)
+    )
 
 
 def _extract_null_hessian_logdet(fit: Any) -> float | None:
