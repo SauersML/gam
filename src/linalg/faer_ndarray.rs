@@ -6,7 +6,7 @@ pub use faer::linalg::solvers::{
 };
 use faer::linalg::svd::{self, ComputeSvdVectors};
 use faer::prelude::ReborrowMut;
-use faer::{Conj, Mat, MatMut, MatRef, Par, Side, get_global_parallelism};
+use faer::{Conj, Mat, MatMut, MatRef, Par, Side, Unbind, get_global_parallelism};
 use ndarray::{Array1, Array2, ArrayBase, ArrayViewMut1, Data, Ix1, Ix2};
 use std::marker::PhantomData;
 use std::panic::{AssertUnwindSafe, catch_unwind};
