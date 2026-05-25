@@ -5151,10 +5151,50 @@ fn run_outer_with_plan(
     // `expensive_unsuccessful_seed_limit` so the aggregate error can
     // distinguish "all generated seeds tried" from "stopped early".
     let mut stopped_early_due_to_limit = false;
+    // Structured mirror of `rejection_reasons` used for honest seed
+    // accounting + structural early-exit. Populated lazily at the top of
+    // each iteration from any reasons accumulated during the previous
+    // pass, so individual push sites don't need to be touched.
+    let mut seed_rejections: Vec<SeedRejection> = Vec::new();
+    let mut last_classified_reason_idx: usize = 0;
+    // Set to `Some(key)` when every observed rejection so far carries
+    // the same `(KktRefusalDiagnosis, carrying_block)` pair AND we've
+    // seen at least `STRUCTURAL_EARLY_EXIT_MIN_COUNT` consistent
+    // failures. Once set, the remaining ρ candidates are skipped.
+    let mut structural_early_exit_key: Option<(
+        crate::families::custom_family::KktRefusalDiagnosis,
+        Option<String>,
+    )> = None;
+    const STRUCTURAL_EARLY_EXIT_MIN_COUNT: usize = 2;
 
     'seed_attempts: for (seed_idx, seed) in seeds.iter().enumerate() {
         if started_seeds == seed_budget {
             break;
+        }
+        // Lazy structured classification: convert any new entries in
+        // `rejection_reasons` into `SeedRejection`s and probe whether
+        // the seed cascade has slipped into a uniform structural
+        // failure mode that the remaining candidates can't escape.
+        while last_classified_reason_idx < rejection_reasons.len() {
+            let (idx, phase, msg) = &rejection_reasons[last_classified_reason_idx];
+            seed_rejections.push(SeedRejection::from_message(*idx, phase, msg.clone()));
+            last_classified_reason_idx += 1;
+        }
+        if structural_early_exit_key.is_none() {
+            if let Some(key) =
+                uniform_structural_key(&seed_rejections, STRUCTURAL_EARLY_EXIT_MIN_COUNT)
+            {
+                log::warn!(
+                    "[OUTER] {context}: structural early-exit after {} uniform CertRefused \
+                     rejections (diagnosis={}, carrying-block={}); skipping remaining {} seed(s)",
+                    seed_rejections.len(),
+                    key.0.as_str(),
+                    key.1.as_deref().unwrap_or("<unknown>"),
+                    seeds.len().saturating_sub(seed_idx),
+                );
+                structural_early_exit_key = Some(key);
+                break;
+            }
         }
         crate::solver::estimate::reml::runtime::record_current_outer_iter_for_ift(0);
         obj.reset();

@@ -4547,7 +4547,7 @@ fn build_tensor_bspline_basis(
             .collect::<Result<Vec<_>, _>>()?;
     }
 
-    let (penalties, nullspace_dims, penaltyinfo, ops) =
+    let (penalties, nullspace_dims, penaltyinfo, null_eigenvectors, ops) =
         filter_active_penalty_candidates_with_ops(candidates)?;
     let identifiability_is_none =
         matches!(spec.identifiability, TensorBSplineIdentifiability::None);
@@ -5337,7 +5337,7 @@ fn build_pca_smooth_basis(
         let k = op.ncols;
         let mut penalty = Array2::<f64>::eye(k);
         penalty.mapv_inplace(|v| v * smooth_penalty);
-        let (penalties, nullspace_dims, penaltyinfo, ops) =
+        let (penalties, nullspace_dims, penaltyinfo, null_eigenvectors, ops) =
             filter_active_penalty_candidates_with_ops(vec![PenaltyCandidate {
                 matrix: penalty,
                 nullspace_dim_hint: 0,
@@ -5389,7 +5389,7 @@ fn build_pca_smooth_basis(
     let k = basis_matrix.ncols();
     let mut penalty = Array2::<f64>::eye(k);
     penalty.mapv_inplace(|v| v * smooth_penalty);
-    let (penalties, nullspace_dims, penaltyinfo, ops) =
+    let (penalties, nullspace_dims, penaltyinfo, null_eigenvectors, ops) =
         filter_active_penalty_candidates_with_ops(vec![PenaltyCandidate {
             matrix: penalty,
             nullspace_dim_hint: 0,
@@ -5987,7 +5987,7 @@ fn build_single_local_smooth_term(
             },
         )
         .collect::<Result<Vec<_>, _>>()?;
-    let (penalties_t, nullspaces_t, penaltyinfo_t, ops_t) =
+    let (penalties_t, nullspaces_t, penaltyinfo_t, null_eigenvectors_t, ops_t) =
         crate::terms::basis::filter_active_penalty_candidates_with_ops(penalty_candidates)?;
     let shape_linear_constraints = if term.shape != ShapeConstraint::None && !use_box_reparam {
         let axis = shape_axis_col.ok_or_else(|| {

@@ -39,7 +39,6 @@ use crate::families::row_kernel::{
 use crate::families::survival::{OffsetChannelCurvatures, OffsetChannelResiduals};
 use crate::families::survival_location_scale::{
     TimeBlockInput, TimeWiggleBlockInput, project_onto_linear_constraints,
-    structural_time_coefficient_constraints,
 };
 use crate::matrix::{DesignMatrix, SymmetricMatrix};
 use crate::pirls::LinearInequalityConstraints;
@@ -16686,6 +16685,108 @@ fn inner_fit(
     options: &BlockwiseFitOptions,
 ) -> Result<UnifiedFitResult, String> {
     fit_custom_family(family, blocks, options).map_err(|e| e.to_string())
+}
+
+fn time_derivative_guard_constraints(
+    design_derivative_exit: &DesignMatrix,
+    derivative_offset_exit: &Array1<f64>,
+    derivative_guard: f64,
+) -> Result<Option<LinearInequalityConstraints>, String> {
+    if design_derivative_exit.nrows() != derivative_offset_exit.len() {
+        return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+            reason: format!(
+                "survival marginal-slope derivative guard constraints require matching rows/offsets: rows={}, offsets={}",
+                design_derivative_exit.nrows(),
+                derivative_offset_exit.len()
+            ),
+        }
+        .into());
+    }
+    if !derivative_guard.is_finite() || derivative_guard <= 0.0 {
+        return Err(SurvivalMarginalSlopeError::InvalidInput {
+            reason: format!(
+                "survival marginal-slope derivative guard must be finite and > 0, got {derivative_guard}"
+            ),
+        }
+        .into());
+    }
+
+    let p = design_derivative_exit.ncols();
+    if p == 0 {
+        for (row, &offset) in derivative_offset_exit.iter().enumerate() {
+            if !offset.is_finite() {
+                return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
+                    reason: format!(
+                        "survival marginal-slope derivative guard constraints require finite derivative offsets; found offset[{row}]={offset}"
+                    ),
+                }
+                .into());
+            }
+            if offset + survival_derivative_guard_tolerance(offset, derivative_guard)
+                < derivative_guard
+            {
+                return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
+                    reason: format!(
+                        "survival marginal-slope derivative guard is infeasible at row {row}: offset={offset:.3e} < guard={derivative_guard:.3e} with no time coefficients"
+                    ),
+                }
+                .into());
+            }
+        }
+        return Ok(None);
+    }
+
+    let dense = design_derivative_exit.to_dense();
+    let mut kept_rows: Vec<usize> = Vec::new();
+    for row in 0..dense.nrows() {
+        let offset = derivative_offset_exit[row];
+        if !offset.is_finite() {
+            return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
+                reason: format!(
+                    "survival marginal-slope derivative guard constraints require finite derivative offsets; found offset[{row}]={offset}"
+                ),
+            }
+            .into());
+        }
+        let mut row_norm_sq = 0.0_f64;
+        for col in 0..p {
+            let value = dense[[row, col]];
+            if !value.is_finite() {
+                return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
+                    reason: format!(
+                        "survival marginal-slope derivative guard constraints require finite derivative design entries; found row {row}, column {col}"
+                    ),
+                }
+                .into());
+            }
+            row_norm_sq += value * value;
+        }
+        let bound = derivative_guard - offset;
+        if row_norm_sq <= 1e-24 {
+            if bound > survival_derivative_guard_tolerance(offset, derivative_guard) {
+                return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
+                    reason: format!(
+                        "survival marginal-slope derivative guard is infeasible at row {row}: zero derivative design row with offset={offset:.3e} < guard={derivative_guard:.3e}"
+                    ),
+                }
+                .into());
+            }
+            continue;
+        }
+        kept_rows.push(row);
+    }
+
+    if kept_rows.is_empty() {
+        return Ok(None);
+    }
+
+    let mut a = Array2::<f64>::zeros((kept_rows.len(), p));
+    let mut b = Array1::<f64>::zeros(kept_rows.len());
+    for (out_row, &src_row) in kept_rows.iter().enumerate() {
+        a.row_mut(out_row).assign(&dense.row(src_row));
+        b[out_row] = derivative_guard - derivative_offset_exit[src_row];
+    }
+    Ok(Some(LinearInequalityConstraints::from_paired(a, b)))
 }
 
 fn append_timewiggle_tail_nonnegative_constraints(
