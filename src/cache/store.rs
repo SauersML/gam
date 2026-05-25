@@ -362,13 +362,18 @@ impl WarmStartStore {
         }
         // 2. Compute checksum from payload.
         let checksum = checksum_hex(payload);
-        // 3. Write meta JSON.
+        // 3. Write meta JSON. Sanitize NaN/Inf objectives — `serde_json`
+        // hard-errors on non-finite f64 by default, which would abort the
+        // entire checkpoint write and lose warm-start progress. A
+        // non-finite objective is no better than "unknown" for ranking
+        // purposes, so collapse it to `None` rather than failing the save.
+        let objective_finite = objective.filter(|o| o.is_finite());
         let (secs, subsec_nanos) = unix_now_parts();
         let meta = OnDiskMeta {
             schema_version: SCHEMA_VERSION,
             written_unix_secs: secs,
             written_nanos: subsec_nanos,
-            objective,
+            objective: objective_finite,
             iteration,
             kind,
             checksum_hex: checksum,

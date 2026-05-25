@@ -7846,19 +7846,11 @@ impl CustomFamily for GaussianLocationScaleFamily {
     /// When `options.outer_score_subsample` is `Some`, only the sampled rows
     /// contribute; each row's per-row log-likelihood term is multiplied by
     /// `WeightedOuterRow.weight`, the Horvitz–Thompson inverse-inclusion
-<<<<<<< Updated upstream
     /// factor 1/π_i (uniform or stratified sampling both supported), so the
     /// partial sum is an unbiased estimator of the full-data log-likelihood.
     /// When `None`, this returns the full-data `log_likelihood_only`. Inner
     /// PIRLS line searches never install the subsample option, so they
     /// continue to score the exact full-data log-likelihood.
-=======
-    /// factor, so the partial sum is an unbiased estimator of the full-data
-    /// log-likelihood. When `None`, this is byte-identical to
-    /// `log_likelihood_only`. Inner PIRLS line searches never install the
-    /// subsample option, so they continue to score the exact full-data
-    /// log-likelihood.
->>>>>>> Stashed changes
     fn log_likelihood_only_with_options(
         &self,
         block_states: &[ParameterBlockState],
@@ -7886,15 +7878,7 @@ impl CustomFamily for GaussianLocationScaleFamily {
             .into());
         }
         let ln2pi = (2.0 * std::f64::consts::PI).ln();
-<<<<<<< Updated upstream
         use rayon::iter::ParallelIterator;
-=======
-        let y_view = self.y.view();
-        let w_view = self.weights.view();
-        let mu_view = etamu.view();
-        let ls_view = eta_log_sigma.view();
-        use rayon::iter::{IntoParallelIterator, ParallelIterator};
->>>>>>> Stashed changes
         let ll: f64 = subsample
             .rows
             .par_iter()
