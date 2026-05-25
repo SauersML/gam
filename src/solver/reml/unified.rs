@@ -5837,6 +5837,22 @@ fn penalty_a_k_quadratic(coord: &PenaltyCoordinate, beta: &Array1<f64>, lambda: 
     coord.shifted_quadratic(beta, lambda)
 }
 
+/// Apply the curvature-conditioning scale `s = rho_curvature_scale` to a
+/// raw ρ-coordinate `λ_k = exp(ρ_k)`.
+///
+/// Returns `s · λ_k`, which is the per-coordinate drift coefficient
+/// `∂H_op/∂ρ_k = s · λ_k · S_k` under the convention documented on
+/// [`InnerSolution::rho_curvature_scale`].  The matching
+/// `hessian_logdet_correction = −p · log(s)` (additive in ρ, derivative
+/// zero) cancels the `p · log(s)` term in `log|H_op|` so that the cost
+/// the evaluator reports and the trace `tr(K · s·λ_k·S_k)` (with
+/// `K = H_op⁻¹ = (1/s) · H_orig⁻¹`) both correspond to the SAME unscaled
+/// `log|H_orig|` and its analytic derivative `tr(H_orig⁻¹ · λ_k S_k)`.
+///
+/// If you change this scaling, you MUST also update the corresponding
+/// `hessian_logdet_correction` in every caller that sets
+/// `rho_curvature_scale ≠ 1`, or the cost and gradient will disagree by
+/// a factor `s` — see issue #200 for the failure mode.
 #[inline]
 fn rho_curvature_lambda(solution: &InnerSolution<'_>, lambda: f64) -> f64 {
     solution.rho_curvature_scale * lambda
@@ -7059,6 +7075,24 @@ pub fn reml_laml_evaluate(
         return Ok(result);
     }
     let cost_phase_start = std::time::Instant::now();
+    // Enforce the `rho_curvature_scale` contract documented on
+    // `InnerSolution::rho_curvature_scale`.  A non-positive or non-finite
+    // scale silently corrupts BOTH the cost (through `hessian_logdet_correction`
+    // chosen to match `−p·log(s)`) and the gradient trace (through
+    // `curvature_lambdas = s · λ`); refuse to evaluate rather than emit a
+    // garbage outer-derivative pair.  See issue #200.
+    if !solution.rho_curvature_scale.is_finite() || solution.rho_curvature_scale <= 0.0 {
+        return Err(RemlError::NonFiniteValue {
+            reason: format!(
+                "rho_curvature_scale must be strictly positive and finite (got {}); the \
+                 unified evaluator scales the gradient drift by this factor and relies on \
+                 the caller having scaled `hessian_op` by the same factor with a matching \
+                 `hessian_logdet_correction = −p·log(scale)` — see issue #200",
+                solution.rho_curvature_scale,
+            ),
+        }
+        .into());
+    }
     let k = rho.len();
     let lambdas: Vec<f64> = rho.iter().map(|&r| r.exp()).collect();
     let curvature_lambdas: Vec<f64> = lambdas

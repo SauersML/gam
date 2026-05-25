@@ -7915,14 +7915,15 @@ mod tests {
         let eps = 0.04_f64;
         let weight = 1.3_f64;
         let scaled_thresholds = [thresholds[0] * rho[0].exp(), thresholds[1] * rho[1].exp()];
+        let latent_dim = thresholds.len();
         let offsets = [-5.0_f64, -2.0, -0.5, -0.05, 0.0, 0.05, 0.5, 2.0, 5.0];
-        let mut values = Vec::with_capacity(offsets.len() * thresholds.len());
+        let mut values = Vec::with_capacity(offsets.len() * latent_dim);
         for &offset in &offsets {
             values.push(scaled_thresholds[0] + offset);
             values.push(scaled_thresholds[1] + offset);
         }
         let target_values = Array1::from_vec(values);
-        let slice = PsiSlice::full(target_values.len(), Some(thresholds.len()));
+        let slice = PsiSlice::full(target_values.len(), Some(latent_dim));
         let pen = JumpReLUPenalty::new(slice, thresholds, weight, eps)
             .expect("valid JumpReLU penalty");
         let diag = pen
@@ -7930,7 +7931,7 @@ mod tests {
             .expect("JumpReLU exposes a PSD diagonal majorizer");
 
         for (idx, &entry) in diag.iter().enumerate() {
-            let axis = idx % thresholds.len();
+            let axis = idx % latent_dim;
             let gate = pen.sigmoid_gate((target_values[idx] - scaled_thresholds[axis]) / eps);
             let slope = gate * (1.0 - gate);
             let expected = weight * scaled_thresholds[axis] * slope * slope / (eps * eps);

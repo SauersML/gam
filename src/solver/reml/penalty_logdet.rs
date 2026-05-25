@@ -785,7 +785,7 @@ impl PenaltyPseudologdet {
         // sort position so that a barely-active eigenvalue `λ_k σ_k < r` is
         // not confused with a ridge-inflated structural null.
         let ridged_null_threshold = match (ridge, structural_nullity) {
-            (Some(r), Some(_)) if r > 0.0 => {
+            (Some(r), Some(m0)) if r > 0.0 && m0 > 0 => {
                 let scale = 1.0 + (f64::EPSILON.sqrt() * (p_dim.max(1) as f64));
                 Some(r * scale)
             }
