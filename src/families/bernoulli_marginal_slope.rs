@@ -1780,6 +1780,65 @@ pub(crate) fn enforce_cross_block_identifiability_for_flex_block(
         out
     };
 
+    // Stage-4 delegation: hand the W-scaled anchor stack and W-scaled
+    // candidate basis to the family-agnostic identifiability audit.
+    // The audit's joint column-pivoted QR sees the same metric the
+    // PIRLS Hessian will see (because both sides are pre-multiplied
+    // by sqrt(W)), so its `fatal` verdict on the joint design is the
+    // canonical "the candidate carries zero independent directions"
+    // signal that the existing post-eigendecomposition `k_kept == 0`
+    // check below was duplicating. Keep the W-metric eigendecomposition
+    // intact: it is what constructs the (V, M) reparameterisation
+    // matrices the audit cannot generalise. The audit owns *detection*;
+    // the eigendecomposition owns *construction*.
+    {
+        use crate::custom_family::ParameterBlockSpec;
+        use crate::linalg::matrix::{DenseDesignMatrix, DesignMatrix};
+        let anchor_spec = ParameterBlockSpec {
+            name: "bms_cross_block_audit__parametric_anchors".to_string(),
+            design: DesignMatrix::Dense(DenseDesignMatrix::from(n_train_sqw.clone())),
+            offset: Array1::<f64>::zeros(n),
+            penalties: Vec::new(),
+            nullspace_dims: Vec::new(),
+            initial_log_lambdas: Array1::<f64>::zeros(0),
+            initial_beta: None,
+        };
+        let candidate_spec = ParameterBlockSpec {
+            name: "bms_cross_block_audit__candidate_flex".to_string(),
+            design: DesignMatrix::Dense(DenseDesignMatrix::from(c_sqw.clone())),
+            offset: Array1::<f64>::zeros(n),
+            penalties: Vec::new(),
+            nullspace_dims: Vec::new(),
+            initial_log_lambdas: Array1::<f64>::zeros(0),
+            initial_beta: None,
+        };
+        let audit = crate::solver::identifiability_audit::audit_identifiability(&[
+            anchor_spec,
+            candidate_spec,
+        ])
+        .map_err(|reason| format!("BMS cross-block audit delegation failed: {reason}"))?;
+        let candidate_block = audit.blocks.get(1).ok_or_else(|| {
+            "BMS cross-block audit delegation: missing candidate block in audit report"
+                .to_string()
+        })?;
+        if audit.fatal && candidate_block.design_range_rank == 0 {
+            let reason = format!(
+                "candidate flex basis ({p_c} cols) is fully aliased under the W-metric \
+                 joint design with the parametric anchor union ({d_local} cols, n={n}). \
+                 The audit's joint column-pivoted QR collapses the candidate to zero \
+                 independent directions: every direction in span(C) is reproducible by \
+                 the parametric anchors up to numerical tolerance. Drop the flex block \
+                 or remove the parametric term that exactly reproduces its argument. \
+                 Audit summary: {summary}",
+                p_c = p_candidate,
+                d_local = d_total,
+                n = n,
+                summary = audit.summary,
+            );
+            return Ok(CrossBlockIdentifiabilityOutcome::FullyAliased { reason });
+        }
+    }
+
     // G_N = N^T W N (in sqrt-W frame: N_sqwᵀ N_sqw).
     let g_n = crate::faer_ndarray::fast_atb(&n_train_sqw, &n_train_sqw);
     let (g_n_evals, g_n_evecs) = g_n
@@ -1856,25 +1915,24 @@ pub(crate) fn enforce_cross_block_identifiability_for_flex_block(
         .collect();
     let k_kept = pos_indices.len();
     if k_kept == 0 {
-        // Every direction in span(C) is reproducible by the anchor union
-        // up to numerical tolerance — the candidate flex block carries
-        // zero independent directions. Return `FullyAliased` so the
-        // caller can drop the block with a structured warning instead of
-        // aborting the fit; keeping a zero-rank block is mathematically
-        // meaningless and would only push the failure further into the
-        // inner solver.
+        // Tolerance-disagreement fallback. The Stage-4 upfront
+        // delegation to `audit_identifiability` already declared the
+        // candidate non-fully-aliased under the joint column-pivoted
+        // QR's RRQR tolerance, but the W-metric eigendecomposition's
+        // `drop_tol` (which anchors to `max(λ_max_c, ‖c_sqw‖²_F) ·
+        // 64 n ε`) is tighter on some configurations and can still
+        // collapse every direction. Emit the same `FullyAliased`
+        // outcome with both tolerance numbers in the reason so the
+        // upstream warning can flag the disagreement.
         let reason = format!(
             "candidate flex basis ({p_c} cols) has zero directions remaining after \
-             residualisation against the unpenalised null-space of the anchor union \
-             ({d_local} parametric anchor cols, weighted training-row rank {r}). The \
-             residualised basis (I - P_A) C has numerical rank zero at the {n} training \
-             rows under the joint-Hessian row metric, so every direction in span(C) is \
-             reproducible by the parametric anchors up to numerical tolerance \
-             {drop_tol:.3e}. The candidate flex block carries no information the \
-             parametric blocks do not already capture in their unpenalised span; \
-             disable this flex block or drop a parametric term that exactly reproduces \
-             the flex argument. Knot count is NOT the relevant lever for this failure \
-             mode.",
+             W-metric residualisation against the anchor union ({d_local} parametric \
+             anchor cols, weighted training-row rank {r}) at the {n} training rows. \
+             Joint column-pivoted QR (RRQR rank tolerance) admitted the candidate, but \
+             the W-metric eigendecomposition's drop tolerance ({drop_tol:.3e}) \
+             collapses every direction. Drop the flex block or remove the parametric \
+             term that reproduces its argument; knot count is NOT the relevant lever \
+             for this failure mode.",
             p_c = p_candidate,
             d_local = d_total,
             r = r,
