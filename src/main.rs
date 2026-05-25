@@ -1470,7 +1470,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             offset.view(),
             design.penalties.clone(),
             &ExternalOptimOptions {
-                family,
+                family: family.clone(),
                 latent_cloglog: None,
                 mixture_link: None,
                 optimize_mixture: true,
@@ -1513,7 +1513,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             weights: weights.clone(),
             offset: offset.clone(),
             spec: spec.clone(),
-            family,
+            family: family.clone(),
             options: base_fit_options,
             kappa_options: kappa_options.clone(),
             wiggle: standard_wiggle,
@@ -1635,7 +1635,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             formula_text,
             ModelKind::Standard,
             FittedFamily::Standard {
-                likelihood: family,
+                likelihood: family.clone(),
                 link: Some(effective_link),
                 latent_cloglog_state,
                 mixture_state: saved_mixture_state_from_fit(&saved_fit),
