@@ -33,11 +33,6 @@ def main() -> None:
     )
 
     print("winner:", result.winner[0])
-    for topology_name, tk_score, raw_reml, effective_dim, n_obs, _fit in result.ranked:
-        print(
-            f"{topology_name:9s} tk={tk_score:.6g} "
-            f"raw_reml={raw_reml:.6g} edf={effective_dim:.3f} n={n_obs}"
-        )
 
 
 if __name__ == "__main__":
