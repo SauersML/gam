@@ -4763,7 +4763,6 @@ where
             && final_state.is_some()
             && final_state_cache_key.as_ref() == Some(&requested_cache_key);
         let mut state = if cached_state_matches {
-            final_state_cache_key = None;
             final_state
                 .take()
                 .expect("cached_state_matches implies final_state.is_some()")
@@ -4849,7 +4848,6 @@ where
         if !current_grad_finite {
             lastgradient_norm = f64::INFINITY;
             max_abs_eta = inf_norm(state.eta.iter().copied());
-            final_state_cache_key = None;
             final_state = Some(state);
             // Non-finite-gradient rescue is deviance-plateau based, not a KKT certificate.
             if last_deviance_change.abs() < options.convergence_tolerance {
@@ -5706,7 +5704,6 @@ where
                                 options,
                                 &mut pending_arrow_latent_restore,
                             );
-                            final_state_cache_key = None;
                             final_state = Some(state);
                             status = PirlsStatus::StalledAtValidMinimum;
                             break 'pirls_loop;
@@ -5760,7 +5757,6 @@ where
                                 options,
                                 &mut pending_arrow_latent_restore,
                             );
-                            final_state_cache_key = None;
                             final_state = Some(state);
                             break 'pirls_loop;
                         }
