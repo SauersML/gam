@@ -2021,9 +2021,8 @@ fn strip_strings_and_comments_stateful(
     in_str_in: bool,
     quote_in: u8,
 ) -> (String, bool, u8) {
-    let (s, in_str, quote, _hashes) =
-        strip_strings_and_comments_stateful_raw(line, in_str_in, quote_in, 0);
-    (s, in_str, quote)
+    let result = strip_strings_and_comments_stateful_raw(line, in_str_in, quote_in, 0);
+    (result.0, result.1, result.2)
 }
 
 /// Raw-string-aware variant. Tracks Rust raw strings `r#"..."#` so the
