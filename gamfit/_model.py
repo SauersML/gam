@@ -1074,154 +1074,27 @@ class Model:
         posterior coefficient simulation using the max standardized deviation
         across the whole grid.
         """
-        import math
-        import statistics
-        import numpy as np
-
-        if not (0.0 < float(level) < 1.0):
-            raise ValueError("difference_smooth level must be in (0, 1)")
-        if int(n) < 2:
-            raise ValueError("difference_smooth n must be at least 2")
-        try:
-            state = json.loads(rust_module().coefficient_state_json(self._model_bytes))
-        except Exception as exc:
-            raise map_exception(exc) from exc
-        schema_cols = list((state.get("schema") or {}).get("columns") or [])
-        if not schema_cols:
-            raise ValueError("difference_smooth requires a saved model schema")
-        names = [str(c.get("name")) for c in schema_cols]
-        if view not in names:
-            raise ValueError(f"view column {view!r} not found in model schema: {names}")
-        if group is None:
-            cats = [c for c in schema_cols if c.get("kind") == "categorical" and c.get("name") != view]
-            if not cats:
-                raise ValueError("difference_smooth could not infer a categorical group column; pass group=")
-            group = str(cats[0].get("name"))
-        if group not in names:
-            raise ValueError(f"group column {group!r} not found in model schema: {names}")
-        group_col = next(c for c in schema_cols if c.get("name") == group)
-        levels = [str(v) for v in group_col.get("levels") or []]
-        if len(levels) < 2:
-            raise ValueError(f"group column {group!r} must have at least two saved levels")
-        if pairs is None:
-            pairs = [(levels[i], levels[j]) for i in range(len(levels)) for j in range(i + 1, len(levels))]
-        ranges = state.get("training_feature_ranges") or []
-        view_idx = names.index(view)
-        if view_idx < len(ranges):
-            lo, hi = map(float, ranges[view_idx])
-        else:
-            lo, hi = 0.0, 1.0
-        if not (math.isfinite(lo) and math.isfinite(hi)) or lo == hi:
-            lo, hi = 0.0, 1.0
-        grid = np.linspace(lo, hi, int(n))
-
-        template: dict[str, Any] = {}
+        request: dict[str, Any] = {
+            "view": view,
+            "group": group,
+            "pairs": [[str(a), str(b)] for a, b in pairs] if pairs is not None else None,
+            "n": int(n),
+            "level": float(level),
+            "simultaneous": bool(simultaneous),
+            "n_sim": int(n_sim),
+            "seed": seed,
+            "marginalise_random": bool(marginalise_random),
+            "group_means": bool(group_means),
+        }
         if data is not None:
             headers, rows, _ = normalize_table(data)
             if rows:
-                first = rows[0]
-                template.update({h: first[i] for i, h in enumerate(headers)})
-        for idx, col in enumerate(schema_cols):
-            name = str(col.get("name"))
-            if name in template:
-                continue
-            if col.get("kind") == "categorical":
-                vals = col.get("levels") or ["0"]
-                template[name] = str(vals[0])
-            elif idx < len(ranges):
-                a, b = map(float, ranges[idx])
-                template[name] = str(0.5 * (a + b))
-            else:
-                template[name] = "0"
-
-        beta = np.asarray(state.get("beta", []), dtype=float)
-        cov_kind = "conditional"
-        cov_n = int(state.get("covariance_n", 0))
-        cov_flat = np.asarray(state.get("covariance_flat", []), dtype=float)
-        if (
-            state.get("covariance_corrected_flat") is not None
-            or state.get("covariance_corrected_n") is not None
-        ):
-            cov_kind = "corrected"
-            cov_n = int(state.get("covariance_corrected_n", 0))
-            cov_flat = np.asarray(
-                state.get("covariance_corrected_flat", []), dtype=float
-            )
-        if cov_flat.size != cov_n * cov_n or beta.size != cov_n:
-            raise ValueError("coefficient covariance payload has inconsistent dimensions")
-        cov = cov_flat.reshape(cov_n, cov_n)
-        z = statistics.NormalDist().inv_cdf(0.5 + float(level) / 2.0)
-        rng = np.random.default_rng(seed)
-        rows_out: list[dict[str, Any]] = []
-        random_ranges = [(int(a), int(b)) for a, b in state.get("random_column_ranges", [])]
-        # Categorical group columns are represented as `random_effect` term
-        # blocks; isolate the ones whose term name matches the contrast
-        # group so `group_means=False` can drop only that group's level
-        # offsets and not (e.g.) some unrelated random intercept term.
-        group_random_ranges = [
-            (int(block["start"]), int(block["end"]))
-            for block in state["term_blocks"]
-            if block["kind"] == "random_effect" and block["name"] == group
-        ]
-
-        for a, b in pairs:
-            left_level = str(a)
-            right_level = str(b)
-            data_left = []
-            data_right = []
-            for x in grid:
-                row_l = dict(template)
-                row_r = dict(template)
-                row_l[view] = str(float(x))
-                row_r[view] = str(float(x))
-                row_l[group] = left_level
-                row_r[group] = right_level
-                data_left.append(row_l)
-                data_right.append(row_r)
-            xl = self.design_matrix(data_left)
-            xr = self.design_matrix(data_right)
-            xd = xr - xl
-            if marginalise_random:
-                for start, stop in random_ranges:
-                    xd[:, start:stop] = 0.0
-            if not group_means:
-                # Drop the contrast group's parametric / random-effect level
-                # offsets so the contrast carries only the per-group SMOOTH
-                # shape difference, not the group-level mean step. Under
-                # `marginalise_random=True` this is a strict subset of the
-                # already-zeroed ranges and is redundant; under
-                # `marginalise_random=False` it isolates the group of
-                # interest from any other random terms in the model.
-                for start, stop in group_random_ranges:
-                    xd[:, start:stop] = 0.0
-            diff = xd @ beta
-            var = np.einsum("ij,jk,ik->i", xd, cov, xd)
-            se = np.sqrt(np.maximum(var, 0.0))
-            crit = z
-            if simultaneous:
-                draws = rng.multivariate_normal(beta, cov, size=int(n_sim), check_valid="ignore")
-                draw_diff = draws @ xd.T
-                denom = np.where(se > 0.0, se, np.inf)
-                max_dev = np.max(np.abs((draw_diff - diff.reshape(1, -1)) / denom.reshape(1, -1)), axis=1)
-                crit = float(np.quantile(max_dev[np.isfinite(max_dev)], float(level)))
-            lower = diff - crit * se
-            upper = diff + crit * se
-            for x, d, s_e, lo_b, hi_b in zip(grid, diff, se, lower, upper, strict=True):
-                rows_out.append({
-                    view: float(x),
-                    "group": group,
-                    "level_1": left_level,
-                    "level_2": right_level,
-                    "diff": float(d),
-                    "se": float(s_e),
-                    "lower": float(lo_b),
-                    "upper": float(hi_b),
-                    "level": float(level),
-                    "simultaneous": bool(simultaneous),
-                    "critical": float(crit),
-                    "covariance_kind": cov_kind,
-                    "covariance_corrected": cov_kind == "corrected",
-                })
+                request["template"] = {h: rows[0][i] for i, h in enumerate(headers)}
+        try:
+            raw = rust_module().difference_smooth_json(self._model_bytes, json.dumps(request))
+        except Exception as exc:
+            raise map_exception(exc) from exc
+        rows_out = json.loads(raw)
         if return_type == "list":
             return rows_out
         try:
