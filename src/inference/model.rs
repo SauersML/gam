@@ -2865,18 +2865,62 @@ impl FittedModel {
         let normalized = self.clone().with_synchronized_stateful_link_metadata();
         normalized.validate_for_persistence()?;
         normalized.validate_numeric_finiteness()?;
-        let file = fs::File::create(path).map_err(|e| FittedModelError::PayloadCorrupt {
-            reason: format!("failed to write model '{}': {e}", path.display()),
+        // Write to a sibling temp file, fsync, then rename into place so a
+        // crash mid-write never corrupts the user's existing saved fit.
+        // Concurrent writers to the same path each have a distinct temp
+        // suffix (pid + nanos), so neither stomps the other's in-flight
+        // bytes; the rename winner is last-rename-wins, which is the
+        // expected last-write-wins semantics for a single canonical path.
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let file_name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("model.json");
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tmp = parent.join(format!(".{file_name}.tmp.{pid}.{nanos:x}"));
+        let file = fs::File::create(&tmp).map_err(|e| FittedModelError::PayloadCorrupt {
+            reason: format!("failed to write model '{}': {e}", tmp.display()),
         })?;
         let mut writer = std::io::BufWriter::new(file);
-        serde_json::to_writer(&mut writer, &normalized).map_err(|e| {
-            FittedModelError::PayloadCorrupt {
+        let ser_result = serde_json::to_writer(&mut writer, &normalized);
+        if let Err(e) = ser_result {
+            // Best-effort temp cleanup on serialization failure. flush
+            // returns io::Result<()>; discarding via `.ok()` is enough.
+            std::io::Write::flush(&mut writer).ok();
+            drop(writer);
+            fs::remove_file(&tmp).ok();
+            return Err(FittedModelError::PayloadCorrupt {
                 reason: format!("failed to serialize model: {e}"),
-            }
-        })?;
+            });
+        }
         std::io::Write::flush(&mut writer).map_err(|e| FittedModelError::PayloadCorrupt {
-            reason: format!("failed to write model '{}': {e}", path.display()),
+            reason: format!("failed to write model '{}': {e}", tmp.display()),
         })?;
+        // Recover the underlying File to fsync its contents before rename.
+        let inner = writer
+            .into_inner()
+            .map_err(|e| FittedModelError::PayloadCorrupt {
+                reason: format!("failed to flush model '{}': {}", tmp.display(), e.error()),
+            })?;
+        inner.sync_all().ok();
+        drop(inner);
+        if let Err(e) = fs::rename(&tmp, path) {
+            fs::remove_file(&tmp).ok();
+            return Err(FittedModelError::PayloadCorrupt {
+                reason: format!("failed to publish model '{}': {e}", path.display()),
+            });
+        }
+        // fsync the parent directory so the rename itself is durable
+        // across a crash; without this, the rename can be lost even though
+        // file contents reached disk. Best-effort on platforms that don't
+        // support opening a directory for fsync.
+        if let Ok(d) = fs::File::open(parent) {
+            d.sync_all().ok();
+        }
         Ok(())
     }
 
