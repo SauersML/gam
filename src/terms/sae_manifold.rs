@@ -1922,12 +1922,19 @@ fn fill_assignment_logit_jvp_rows(
                 }
             }
         }
-        AssignmentMode::IBPMap { temperature, .. } => {
-            // Independent concrete-Bernoulli active indicators:
-            // dz_k/dl_k = z_k(1-z_k)/tau.
+        AssignmentMode::IBPMap {
+            temperature, alpha, ..
+        } => {
+            // Truncated-IBP concrete relaxation: z_k = σ(l_k/τ) · π_k where
+            // π_k is the stick-breaking prior. Thus
+            // dz_k/dl_k = σ(l/τ)(1-σ(l/τ))/τ · π_k = a_k(π_k - a_k)/(π_k τ).
             let inv_tau = 1.0 / temperature;
+            let prior = ibp_stick_breaking_prior(assignments.len(), alpha);
             for logit_col in 0..assignments.len() {
-                let dz = assignments[logit_col] * (1.0 - assignments[logit_col]) * inv_tau;
+                let pi_k = prior[logit_col];
+                let a_k = assignments[logit_col];
+                let sig = if pi_k > 0.0 { a_k / pi_k } else { 0.0 };
+                let dz = sig * (1.0 - sig) * inv_tau * pi_k;
                 for out_col in 0..fitted.len() {
                     local_jac[[logit_col, out_col]] = dz * decoded[logit_col][out_col];
                 }
