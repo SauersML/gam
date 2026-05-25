@@ -33,7 +33,10 @@
 //! anisotropic TR), the assertion `outer_converged == true` will pass.
 
 use csv::StringRecord;
-use gam::{FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism};
+use gam::{
+    FitConfig, FitRequest, encode_recordswith_inferred_schema, fit_model, init_parallelism,
+    materialize,
+};
 use std::sync::Once;
 use std::time::Instant;
 
@@ -177,12 +180,6 @@ fn survival_marginal_slope_stall_reproduces_residual_stall_early_exit() {
     // `duchon(PC1, PC2, PC3, centers=10, order=1)` on both sides.
     let pcs: Vec<String> = (0..N_PCS).map(|i| format!("PC{}", i + 1)).collect();
     let duchon_term = format!("duchon({}, centers=10, order=1)", pcs.join(", "));
-    // Time block configured to be over-parameterised relative to the
-    // event-bearing portion of the age window: 12 internal knots over
-    // a 40-unit range with a near-flat tail produces a near-singular
-    // exit-time design.  `time_smooth_lambda = 1e-8` disables the
-    // structural penalty's stabilising contribution so the bug is not
-    // hidden by the prior.
     let formula = format!("Surv(entry_age, exit_age, event) ~ {} + sex", duchon_term);
 
     let config = FitConfig {
@@ -190,20 +187,23 @@ fn survival_marginal_slope_stall_reproduces_residual_stall_early_exit() {
         z_column: Some("prs_z".to_string()),
         logslope_formula: Some(duchon_term),
         baseline_target: "linear".to_string(),
-        time_basis: "ispline".to_string(),
-        time_degree: 3,
-        time_num_internal_knots: 12,
-        time_smooth_lambda: 1e-8,
         ..FitConfig::default()
     };
 
     eprintln!(
-        "[SURVIVAL-MGS-STALL] starting fit: n={} time_internal_knots={} time_smooth_lambda={:.1e} formula={:?}",
-        N, config.time_num_internal_knots, config.time_smooth_lambda, formula
+        "[SURVIVAL-MGS-STALL] starting exact startup-failure repro: n={} formula={:?}",
+        N, formula
     );
 
     let start = Instant::now();
-    let outcome = fit_from_formula(&formula, &data, &config);
+    let materialized = materialize(&formula, &data, &config).expect("materialize survival marginal-slope");
+    let outcome = match materialized.request {
+        FitRequest::SurvivalMarginalSlope(mut request) => {
+            request.options.inner_max_cycles = 2;
+            fit_model(FitRequest::SurvivalMarginalSlope(request))
+        }
+        other => panic!("expected survival marginal-slope request, got {}", other.model_class()),
+    };
     let elapsed = start.elapsed();
     eprintln!(
         "[SURVIVAL-MGS-STALL] fit_from_formula returned in {:.3}s ok={}",
@@ -211,30 +211,19 @@ fn survival_marginal_slope_stall_reproduces_residual_stall_early_exit() {
         outcome.is_ok()
     );
 
-    let result = outcome
-        .expect("survival marginal-slope fit returned an integration error (not the stall we're hunting)");
-
-    let FitResult::SurvivalMarginalSlope(fit) = result else {
-        panic!("expected SurvivalMarginalSlope FitResult variant");
-    };
-
-    let unified = &fit.fit;
-    eprintln!(
-        "[SURVIVAL-MGS-STALL] outer_converged={} outer_iters={} inner_cycles={} pirls_status={:?}",
-        unified.outer_converged,
-        unified.outer_iterations,
-        unified.inner_cycles,
-        unified.pirls_status
-    );
-
-    // RED ASSERTION: we expect the inner PIRLS joint-Newton stall to
-    // make `outer_converged == false`.  When the isotropic-TR bug is
-    // fixed, this assertion will pass.
+    let err = outcome.expect_err("expected exact startup validation failure");
+    let message = err.to_string();
     assert!(
-        unified.outer_converged,
-        "expected the survival marginal-slope fit to converge; got outer_converged=false \
-         (pirls_status={:?}, outer_iters={}, inner_cycles={}) — this reproduces the \
-         production joint-Newton residual-stall early-exit.",
-        unified.pirls_status, unified.outer_iterations, unified.inner_cycles
+        message.contains("outer smoothing optimization failed after exhausting strategy fallbacks"),
+        "missing outer fallback exhaustion error: {message}"
     );
+    assert!(
+        message.contains("no candidate seeds passed outer startup validation (custom family)"),
+        "missing seed validation error: {message}"
+    );
+    assert!(
+        message.contains("coupled exact-joint inner solve exited the joint Newton path before convergence"),
+        "missing coupled exact-joint convergence error: {message}"
+    );
+    panic!("replicated exact production startup-validation error: {message}");
 }
