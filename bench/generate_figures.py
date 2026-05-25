@@ -11,24 +11,28 @@ from pathlib import Path
 from typing import Any
 
 
+BINOMIAL_METRICS = [
+    ("auc", "AUC", True),
+    ("logloss", "Log-Loss", False),
+    ("brier", "Brier Score", False),
+    ("nagelkerke_r2", "Nagelkerke R²", True),
+]
+SURVIVAL_METRICS = [
+    ("auc", "C-Index", True), ("logloss", "Partial Log-Loss", False),
+    ("brier", "Partial Brier", False), ("nagelkerke_r2", "Nagelkerke R²", True),
+]
+GAUSSIAN_METRICS = [
+    ("rmse", "RMSE", False), ("r2", "R²", True),
+    ("logloss", "Gaussian Log-Loss", False), ("mae", "MAE", False),
+]
+
+
 def _metric_display_config(family: str) -> list[tuple[str, str, bool]]:
-    binary_metrics = [
-        ("auc", "AUC", True),
-        ("logloss", "Log-Loss", False),
-        ("brier", "Brier Score", False),
-        ("nagelkerke_r2", "Nagelkerke R²", True),
-    ]
     if family == "binomial":
-        return binary_metrics
+        return BINOMIAL_METRICS
     if family == "survival":
-        return [
-            ("auc", "C-Index", True), ("logloss", "Partial Log-Loss", False),
-            ("brier", "Partial Brier", False), ("nagelkerke_r2", "Nagelkerke R²", True),
-        ]
-    return [
-        ("rmse", "RMSE", False), ("r2", "R²", True),
-        ("logloss", "Gaussian Log-Loss", False), ("mae", "MAE", False),
-    ]
+        return SURVIVAL_METRICS
+    return GAUSSIAN_METRICS
 
 
 def _short_contender_label(name: str) -> str:
