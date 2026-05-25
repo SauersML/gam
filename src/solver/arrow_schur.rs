@@ -442,6 +442,15 @@ fn factor_one_row(
             ),
         });
     }
+    if row.gt.len() != d {
+        return Err(ArrowSchurError::PerRowFactorFailed {
+            row: row_idx,
+            reason: format!(
+                "row {row_idx} g_t length {} does not match latent dimension {d}",
+                row.gt.len()
+            ),
+        });
+    }
     let mut block = row.htt.clone();
     for a in 0..d {
         block[[a, a]] += ridge_t;
