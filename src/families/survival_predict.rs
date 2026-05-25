@@ -805,16 +805,16 @@ pub fn predict_competing_risks_survival(
     } else {
         Array1::from_vec(eval_times.clone())
     };
-    let endpoint_hazards = cumulative_hazard
-        .iter()
-        .map(|hazard| hazard.view())
-        .collect::<Vec<_>>();
     let assembled =
-        assemble_competing_risks_cif_from_endpoints(assembly_times.view(), &endpoint_hazards)
+        assemble_competing_risks_cif_from_endpoints(assembly_times.view(), &cumulative_hazard)
             .map_err(|err| err.to_string())?;
-    let cif = (0..cause_count)
-        .map(|cause| assembled.cif.slice(s![cause, .., ..]).to_owned())
-        .collect::<Vec<_>>();
+    if assembled.cif.len() != cause_count {
+        return Err(format!(
+            "competing-risks CIF assembly produced {} endpoint matrices, expected {cause_count}",
+            assembled.cif.len()
+        ));
+    }
+    let cif = assembled.cif;
     let overall_survival = assembled.overall_survival;
     let times_out = if per_row_eval {
         age_exit.to_vec()
