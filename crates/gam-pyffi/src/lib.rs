@@ -13404,6 +13404,39 @@ fn synthetic_geo_latlon_response<'py>(
     Ok(y.into_pyarray(py).unbind())
 }
 
+#[pyfunction]
+fn thread3_cliff_gradient_magnitude<'py>(
+    py: Python<'py>,
+    collocation_points: PyReadonlyArray2<'py, f64>,
+    coefficients: Vec<f64>,
+    jump: f64,
+    sharpness: f64,
+) -> PyResult<Option<Py<PyArray1<f64>>>> {
+    let points = collocation_points.as_array();
+    if points.nrows() == 0 || points.ncols() != coefficients.len() {
+        return Ok(None);
+    }
+    let coeff_norm = coefficients
+        .iter()
+        .map(|value| value * value)
+        .sum::<f64>()
+        .sqrt();
+    if coeff_norm < 1.0e-12 {
+        return Ok(None);
+    }
+    let mut out = Array1::<f64>::zeros(points.nrows());
+    for row in 0..points.nrows() {
+        let mut z = 0.0;
+        for col in 0..points.ncols() {
+            z += points[[row, col]] * coefficients[col];
+        }
+        let az = (sharpness * z).abs().clamp(0.0, 50.0);
+        let sech2 = 1.0 / az.cosh().powi(2);
+        out[row] = (jump * sharpness).abs() * sech2 * coeff_norm;
+    }
+    Ok(Some(out.into_pyarray(py).unbind()))
+}
+
 // =========================================================================
 // LatentCoord input-location derivative helpers (thin pyffi wrappers).
 //
@@ -17355,6 +17388,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(synthetic_hgdp_pc_panel_columns, module)?)?;
     module.add_function(wrap_pyfunction!(synthetic_geo_subpop_response, module)?)?;
     module.add_function(wrap_pyfunction!(synthetic_geo_latlon_response, module)?)?;
+    module.add_function(wrap_pyfunction!(thread3_cliff_gradient_magnitude, module)?)?;
     // LatentCoord input-location derivative helpers (one per basis kind).
     module.add_function(wrap_pyfunction!(
         duchon_input_location_first_derivative,
