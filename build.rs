@@ -2041,9 +2041,48 @@ fn strip_strings_and_comments_stateful_raw(
     let mut i = 0usize;
     let mut in_str = in_str_in;
     let mut str_quote: u8 = quote_in;
-    let raw_hashes = hashes_in;
+    let mut raw_hashes: u8 = hashes_in;
+    // Raw-string mode is signaled by `raw_hashes > 0` *or* by `in_str` with
+    // `str_quote == b'"'` and a sentinel; here we use `raw_hashes` separately
+    // for the hash count and treat any `raw_hashes != 0` together with
+    // `in_str` to mean "inside a raw string with that hash count". Raw
+    // strings with zero hashes (`r"..."`) use `raw_hashes = 0` but a
+    // distinct in-raw flag tracked via `str_quote == 0` won't work; instead
+    // we encode "inside raw with N hashes" as `in_str && str_quote == b'r'`,
+    // with `raw_hashes` holding N (including 0).
     while i < bytes.len() {
         let c = bytes[i];
+        if in_str && str_quote == b'r' {
+            // Inside a raw string. Close only on `"` followed by exactly
+            // `raw_hashes` `#` bytes (greedy match is fine — Rust's tokenizer
+            // requires exact match, but for a stripper any `"` followed by
+            // at least N `#` ends the literal at this position).
+            if c == b'"' {
+                let need = raw_hashes as usize;
+                let mut k = i + 1;
+                let mut count = 0usize;
+                while k < bytes.len() && bytes[k] == b'#' && count < need {
+                    k += 1;
+                    count += 1;
+                }
+                if count == need {
+                    in_str = false;
+                    str_quote = 0;
+                    raw_hashes = 0;
+                    // Emit the closing `"` and the `#`s verbatim so the
+                    // stripped line keeps positional structure.
+                    out.push(b'"');
+                    for _ in 0..need {
+                        out.push(b'#');
+                    }
+                    i = k;
+                    continue;
+                }
+            }
+            out.push(b' ');
+            i += 1;
+            continue;
+        }
         if in_str {
             if c == b'\\' && i + 1 < bytes.len() {
                 out.push(b' ');
@@ -2062,6 +2101,35 @@ fn strip_strings_and_comments_stateful_raw(
         }
         if c == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
             break;
+        }
+        // Raw string opener: `r"..."`, `r#"..."#`, `br"..."`, `br#"..."#`.
+        // Detect both `r` and `br` prefixes followed by zero or more `#` and
+        // then `"`. Use a word-boundary check so we don't trigger on
+        // identifiers like `foo_r"..."` (illegal Rust anyway, but be safe).
+        let prev_is_ident = i > 0
+            && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+        if !prev_is_ident
+            && (c == b'r' || (c == b'b' && i + 1 < bytes.len() && bytes[i + 1] == b'r'))
+        {
+            let prefix_len = if c == b'b' { 2usize } else { 1usize };
+            let mut k = i + prefix_len;
+            let mut hashes = 0usize;
+            while k < bytes.len() && bytes[k] == b'#' {
+                k += 1;
+                hashes += 1;
+            }
+            if k < bytes.len() && bytes[k] == b'"' && hashes <= u8::MAX as usize {
+                // Enter raw-string mode.
+                in_str = true;
+                str_quote = b'r';
+                raw_hashes = hashes as u8;
+                // Emit `r`/`br`, the `#`s, and the opening `"` verbatim.
+                for j in i..=k {
+                    out.push(bytes[j]);
+                }
+                i = k + 1;
+                continue;
+            }
         }
         if c == b'"' {
             in_str = true;
