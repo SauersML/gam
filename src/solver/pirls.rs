@@ -4733,6 +4733,8 @@ where
         // not a sufficient freshness predicate.
         // Otherwise (e.g. force_fisher_for_rest just engaged, flipping
         // preferred from Observed → Fisher) fall through to the rebuild path.
+        // Smoothing ρ/λ and penalty structure are fixed for this PIRLS call;
+        // outer REML constructs a new working model when they change.
         // Iter 1 always rebuilds because no prior accept has populated
         // `final_state`.
         let requested_cache_key =
