@@ -372,6 +372,26 @@ pub struct SmoothTerm {
     /// Optional factored tensor-product representation preserved for operator-backed
     /// assembly in the main design builder.
     pub kronecker_factored: Option<KroneckerFactoredBasis>,
+    /// Joint-null absorption rotation. `Some(Q)` records the orthonormal
+    /// `(p_local × p_local)` matrix that was applied to this term's design
+    /// and per-block penalties at construction time:
+    /// `term_design ← X_raw · Q`, `penalties_local[k] ← Qᵀ · S_raw · Q`.
+    /// The smooth's coefficient vector therefore lives in the rotated
+    /// (`γ`) coordinate system, with `β_raw = Q · γ` recovering the raw
+    /// pre-rotation parameterization. `None` means either no joint null
+    /// space (penalty already full-rank) or rotation was suppressed —
+    /// see `should_apply_joint_null_rotation` for the latter conditions.
+    ///
+    /// Prediction-side `X_new_raw · Q` replay uses this field at runtime.
+    /// **Persistence gap (Stage-3c follow-up):** `SmoothTerm` is not
+    /// `Serialize`/`Deserialize` and the fitted-model artifact persists
+    /// via `FittedModelPayload`, so a saved-and-reloaded model loses `Q`.
+    /// Saved models with `joint_null_rotation = Some(...)` will produce
+    /// incorrect predictions on reload until persistence is wired
+    /// (`ndarray-serde` is already in the workspace, so the missing piece
+    /// is the per-family `FittedModelPayload::new` plumbing — not a new
+    /// dependency). In-memory fit→predict in the same process is correct.
+    pub joint_null_rotation: Option<crate::terms::basis::JointNullRotation>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -6146,6 +6166,66 @@ fn build_smooth_design_withworkspace_unvalidated(
             None
         };
 
+        // Stage-2 joint-null absorption rotation. Fired *before* the
+        // penalty / design / global aggregation loops below so that every
+        // subsequent reference to `built.penalties`, `built.design`, and
+        // `built.ops` sees the post-rotation values.
+        //
+        // The math: when the smooth's joint penalty `Σ_k S_k` has a
+        // non-trivial null space, eigh selects `Q = [U_range | U_null]`
+        // with null columns at the tail. Setting `β_raw = Q · γ` and
+        // applying:
+        //     design        ← X · Q
+        //     penalties[k]  ← Qᵀ · S_k · Q   (block-diag, zero null tail)
+        // yields a model whose fitted γ is invariant to the rotation
+        // (since likelihood depends only on `X · β_raw = X · Q · γ`), but
+        // whose penalty is full-rank on the range columns. The biobank
+        // failing case (cert refusal in the joint-Newton inner solve)
+        // resolves because `H_pen = H_loglik + S` becomes full rank on
+        // the smooth's range columns.
+        //
+        // Rotation is suppressed when the smooth carries coordinate-wise
+        // shape constraints (`lb_local` or `built.linear_constraints`):
+        // those encode a cone in the original coordinate system and a
+        // general orthogonal rotation breaks the cone geometry. Smooths
+        // with shape constraints typically have full-rank joint penalty
+        // (their structural shape comes from the cone, not from null
+        // directions in the penalty), so suppression is rarely a loss.
+        //
+        // `applied_rotation` carries the Q that was applied (or `None`
+        // if no rotation fired). It is persisted onto `SmoothTerm` below
+        // so prediction-side `X_new_raw · Q` replay can reproduce the
+        // exact rotation. Persistence through the saved-model artifact
+        // is a follow-up — see the doc on `SmoothTerm.joint_null_rotation`.
+        let applied_rotation: Option<crate::terms::basis::JointNullRotation> = match (
+            built.joint_null_rotation.take(),
+            lb_local.is_some(),
+            built.linear_constraints.is_some(),
+        ) {
+            (Some(rot), false, false) => {
+                let q = &rot.rotation;
+                let dense = built
+                    .design
+                    .try_to_dense_by_chunks("joint-null absorption rotation")
+                    .map_err(BasisError::InvalidInput)?;
+                let rotated = crate::linalg::faer_ndarray::fast_ab(&dense, q);
+                built.design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(rotated));
+                built.penalties = built
+                    .penalties
+                    .into_iter()
+                    .map(|s_local| {
+                        let qt_s = crate::linalg::faer_ndarray::fast_atb(q, &s_local);
+                        crate::linalg::faer_ndarray::fast_ab(&qt_s, q)
+                    })
+                    .collect();
+                built.ops = vec![None; built.penalties.len()];
+                built.kronecker_factored = None;
+                Some(rot)
+            }
+            (Some(_), _, _) => None,
+            (None, _, _) => None,
+        };
+
         let activeinfos = built
             .penaltyinfo
             .iter()
@@ -6220,6 +6300,7 @@ fn build_smooth_design_withworkspace_unvalidated(
             lower_bounds_local: lb_local,
             linear_constraints_local: built.linear_constraints,
             kronecker_factored: built.kronecker_factored.take(),
+            joint_null_rotation: applied_rotation,
         });
 
         col_start = col_end;
@@ -7192,6 +7273,14 @@ fn apply_global_smooth_identifiability(
             linear_constraints_local: local_linear_constraints[idx].clone(),
             // Global orthogonality transforms break Kronecker structure.
             kronecker_factored: None,
+            // Joint-null absorption rotation: the global orthogonality
+            // rebuild path above re-applies an orthogonalizing transform to
+            // `local_penalties`/`local_designs`, which would compose with
+            // any previously-applied joint-null Q in a non-trivial way.
+            // Stage-2 scope drops the cached Q on this path; rebuild-time
+            // re-application is a Stage-3+ follow-up and rebuilt models
+            // skip absorption-based prediction replay until then.
+            joint_null_rotation: None,
         });
         if let Some(lin_local) = &local_linear_constraints[idx] {
             for r in 0..lin_local.a.nrows() {
@@ -16301,6 +16390,43 @@ fn wrap_local_build_as_realization(
         });
     }
 
+    // Stage-2 joint-null absorption rotation, same logic as the main
+    // aggregation loop in `build_smooth_design_withworkspace_unvalidated`:
+    // apply Q when Some AND the smooth has no shape constraints.
+    let applied_rotation: Option<crate::terms::basis::JointNullRotation> = match (
+        local.joint_null_rotation.take(),
+        lb_local.is_some(),
+        local.linear_constraints.is_some(),
+    ) {
+        (Some(rot), false, false) => {
+            let q = &rot.rotation;
+            let dense = local
+                .design
+                .try_to_dense_by_chunks("joint-null absorption rotation (single realization)")
+                .map_err(|e| {
+                    format!(
+                        "joint-null absorption rotation: dense conversion failed for term '{}': {}",
+                        termspec.name, e
+                    )
+                })?;
+            let rotated = crate::linalg::faer_ndarray::fast_ab(&dense, q);
+            local.design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(rotated));
+            local.penalties = local
+                .penalties
+                .into_iter()
+                .map(|s_local| {
+                    let qt_s = crate::linalg::faer_ndarray::fast_atb(q, &s_local);
+                    crate::linalg::faer_ndarray::fast_ab(&qt_s, q)
+                })
+                .collect();
+            local.ops = vec![None; local.penalties.len()];
+            local.kronecker_factored = None;
+            Some(rot)
+        }
+        (Some(_), _, _) => None,
+        (None, _, _) => None,
+    };
+
     let smooth_term = SmoothTerm {
         name: termspec.name.clone(),
         coeff_range: 0..p_local,
@@ -16312,6 +16438,7 @@ fn wrap_local_build_as_realization(
         lower_bounds_local: lb_local,
         linear_constraints_local: local.linear_constraints.clone(),
         kronecker_factored: local.kronecker_factored.take(),
+        joint_null_rotation: applied_rotation,
     };
 
     Ok(SingleSmoothTermRealization {
@@ -16908,6 +17035,7 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
             metadata,
             lower_bounds_local,
             linear_constraints_local,
+            joint_null_rotation,
             ..
         } = term;
         let coeff_range = self
@@ -17044,6 +17172,7 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
         target_term.metadata = metadata;
         target_term.lower_bounds_local = lower_bounds_local;
         target_term.linear_constraints_local = linear_constraints_local;
+        target_term.joint_null_rotation = joint_null_rotation;
         self.dropped_penaltyinfo_by_term[term_idx] = dropped_penaltyinfo;
         log::info!(
             "[STAGE] smooth basis rebuild (term {}, '{}', cols={}): {:.3}s",
