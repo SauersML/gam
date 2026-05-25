@@ -16,7 +16,7 @@ pub struct PirlsGpuStep {
     pub logdet: f64,
 }
 
-#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 mod cuda {
     use super::{PirlsGpuInput, PirlsGpuStep};
     use crate::gpu::driver::{from_col_major, to_col_major};
@@ -286,12 +286,12 @@ pub fn weighted_crossprod_gpu(
     x: ArrayView2<'_, f64>,
     weights: ArrayView1<'_, f64>,
 ) -> Result<Array2<f64>, String> {
-    #[cfg(not(all(feature = "cuda", target_os = "linux")))]
+    #[cfg(not(target_os = "linux"))]
     {
         return cpu_fallback::weighted_crossprod_cpu(x, weights);
     }
 
-    #[cfg(all(feature = "cuda", target_os = "linux"))]
+    #[cfg(target_os = "linux")]
     {
         if crate::gpu::runtime::GpuRuntime::global().is_none() {
             return cpu_fallback::weighted_crossprod_cpu(x, weights);
@@ -301,12 +301,12 @@ pub fn weighted_crossprod_gpu(
 }
 
 pub fn solve_pirls_step_gpu(input: PirlsGpuInput<'_>) -> Result<PirlsGpuStep, String> {
-    #[cfg(not(all(feature = "cuda", target_os = "linux")))]
+    #[cfg(not(target_os = "linux"))]
     {
         return cpu_fallback::solve_step_cpu(input);
     }
 
-    #[cfg(all(feature = "cuda", target_os = "linux"))]
+    #[cfg(target_os = "linux")]
     {
         if crate::gpu::runtime::GpuRuntime::global().is_none() {
             return cpu_fallback::solve_step_cpu(input);
