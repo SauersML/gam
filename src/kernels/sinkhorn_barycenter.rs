@@ -804,6 +804,7 @@ mod tests {
         let bary =
             sinkhorn_barycenter(atoms.view(), weights.view(), cost.view(), 0.05, 60).unwrap();
         approx_simplex_eq(&bary, &atom, 5.0e-3);
+        assert_eq!(bary.len(), atom.len(), "barycenter length mismatch");
     }
 
     #[test]
