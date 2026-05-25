@@ -32,18 +32,24 @@ def normalize_table(data: Any) -> tuple[list[str], list[list[str]], str]:
 def table_columns(data: Any) -> tuple[dict[str, list[Any]], str]:
     kind = detect_table_kind(data)
     if kind == "pandas":
+        names = [str(column) for column in data.columns]
+        reject_duplicate_column_names(names, kind)
         return (
-            {str(column): data[column].tolist() for column in data.columns},
+            {name: data.iloc[:, index].tolist() for index, name in enumerate(names)},
             kind,
         )
     if kind == "polars":
+        names = [str(column) for column in data.columns]
+        reject_duplicate_column_names(names, kind)
         return (
-            {str(column): data[column].to_list() for column in data.columns},
+            {name: data[name].to_list() for name in names},
             kind,
         )
     if kind == "pyarrow":
+        names = [str(name) for name in data.column_names]
+        reject_duplicate_column_names(names, kind)
         return (
-            {str(name): data.column(name).to_pylist() for name in data.column_names},
+            {name: data.column(index).to_pylist() for index, name in enumerate(names)},
             kind,
         )
     if kind == "numpy":
@@ -190,6 +196,21 @@ def numpy_table_columns(array: Any) -> dict[str, list[Any]]:
         raise ValueError("numpy input must be 1D or 2D")
     headers = [f"x{index}" for index in range(values.shape[1])]
     return {header: values[:, index].tolist() for index, header in enumerate(headers)}
+
+
+def reject_duplicate_column_names(names: Sequence[str], kind: str) -> None:
+    seen: dict[str, int] = {}
+    duplicates: list[str] = []
+    for name in names:
+        seen[name] = seen.get(name, 0) + 1
+        if seen[name] == 2:
+            duplicates.append(name)
+    if duplicates:
+        listed = ", ".join(repr(name) for name in duplicates)
+        raise ValueError(
+            f"{kind} input has duplicate column names ({listed}); "
+            "every column must have a unique name"
+        )
 
 
 def validate_column_lengths(columns: Mapping[str, Sequence[Any]]) -> None:
