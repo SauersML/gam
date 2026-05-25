@@ -16615,6 +16615,36 @@ fn target_descriptor(py: Python<'_>, target: &Bound<'_, PyAny>) -> PyResult<PyOb
     ))
 }
 
+/// Eagerly validate that an analytic-penalty `target` keyword argument is well
+/// formed at construction time, rather than deferring the check until
+/// `to_rust_descriptor` is invoked. This lets users see configuration errors
+/// at the moment they create the penalty object, with the offending class
+/// named in the message so the source of the bad target is obvious.
+fn validate_target_eager(
+    py: Python<'_>,
+    class_name: &str,
+    target: Option<&Bound<'_, PyAny>>,
+) -> PyResult<()> {
+    let Some(target) = target else {
+        return Ok(());
+    };
+    if target.is_none() {
+        return Ok(());
+    }
+    if target.is_instance_of::<PyString>() || target.extract::<isize>().is_ok() {
+        return Ok(());
+    }
+    if let Ok(name) = target.getattr("name") {
+        // Require that `.name` actually resolves to a string-coercible value.
+        name.str()?.into_pyobject(py)?;
+        return Ok(());
+    }
+    Err(PyTypeError::new_err(format!(
+        "{class_name}.target must be a latent block name (str), index (int), or object exposing a 'name' attribute; got {}",
+        target.get_type().name()?
+    )))
+}
+
 fn py_repr(_py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<String> {
     value.repr()?.extract()
 }
