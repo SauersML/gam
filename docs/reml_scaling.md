@@ -63,8 +63,9 @@ decouple, autograd flows through each analytic VJP independently, and
 memory stays linear in F. A representative architecture is:
 
 ```python
-positions = encoder(x)           # (B, F)
-amps = topk_amps(encoder(x))     # (B, F), sparse
+codes = encoder(x)               # (B, F)
+positions = codes                # (B, F)
+amps = topk_amps(codes)          # (B, F), sparse
 result = gamfit.torch.fit(
     points=[positions[:, k:k+1] for k in range(F)],
     response=x_centered,          # (B, D)
