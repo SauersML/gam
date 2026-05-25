@@ -78,7 +78,8 @@ use gam::terms::{
     BlockOrthogonalityPenalty as CoreBlockOrthogonalityPenalty,
     DifferenceOpKind, GatedSAEDecoder, IBPAssignmentPenalty as CoreIBPAssignmentPenalty,
     IsometryPenalty as CoreIsometryPenalty, IvaeRidgeMeanGauge,
-    JumpReLUPenalty as RustJumpReLUPenalty, MaternBasisGradientTarget, MechanismSparsityPenalty,
+    JumpReLUPenalty as RustJumpReLUPenalty, MaternBasisGradientTarget,
+    MechanismSparsityPenalty as CoreMechanismSparsityPenalty,
     NuclearNormPenalty as CoreNuclearNormPenalty, OrthogonalityPenalty as CoreOrthogonalityPenalty,
     ParametricRowPrecisionPriorPenalty, PenaltyConcavity, PenaltyTier, PsiSlice,
     RowPrecisionPriorPenalty, ScadMcpPenalty as CoreScadMcpPenalty, ScalarWeightSchedule,
@@ -11972,6 +11973,21 @@ fn check_json(
 }
 
 #[pyfunction]
+fn check_payload_from_model(
+    py: Python<'_>,
+    model_bytes: Vec<u8>,
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+) -> PyResult<PyObject> {
+    let payload = detach_py_result(py, "check_payload_from_model", move || {
+        let check_json = check_json_impl(&model_bytes, headers, rows)?;
+        serde_json::from_str::<serde_json::Value>(&check_json)
+            .map_err(|err| format!("invalid schema check JSON: {err}"))
+    })?;
+    json_object_to_py_dict(py, payload)
+}
+
+#[pyfunction]
 fn report_html(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<String> {
     detach_py_result(py, "report_html", move || report_html_impl(&model_bytes))
 }
@@ -14060,6 +14076,173 @@ impl AuxConditionalPriorPenalty {
     }
 }
 
+#[pyclass(module = "gam_pyffi._rust", name = "BlockSparsityPenalty")]
+struct BlockSparsityPenalty {
+    #[pyo3(get, set)]
+    target: PyObject,
+    #[pyo3(get, set)]
+    groups: Vec<Vec<usize>>,
+    #[pyo3(get, set)]
+    weight: f64,
+    #[pyo3(get, set)]
+    n_eff: i64,
+    #[pyo3(get, set)]
+    smoothing_eps: f64,
+    #[pyo3(get, set)]
+    learnable: bool,
+    #[pyo3(get, set)]
+    weight_schedule: Option<PyObject>,
+}
+
+#[pymethods]
+impl BlockSparsityPenalty {
+    #[new]
+    #[pyo3(signature = (groups, weight, n_eff, smoothing_eps = 1e-6, learnable = false, *, target = "t"))]
+    fn new(
+        groups: &Bound<'_, PyAny>,
+        weight: f64,
+        n_eff: i64,
+        smoothing_eps: f64,
+        learnable: bool,
+        target: PyObject,
+    ) -> PyResult<Self> {
+        let groups = block_sparsity_coerce_groups(groups)?;
+        if weight <= 0.0 {
+            return Err(PyValueError::new_err(format!(
+                "BlockSparsityPenalty.weight must be > 0, got {weight}"
+            )));
+        }
+        if n_eff <= 0 {
+            return Err(PyValueError::new_err(format!(
+                "BlockSparsityPenalty.n_eff must be > 0, got {n_eff}"
+            )));
+        }
+        if smoothing_eps <= 0.0 {
+            return Err(PyValueError::new_err(format!(
+                "BlockSparsityPenalty.smoothing_eps must be > 0, got {smoothing_eps}"
+            )));
+        }
+        Ok(Self {
+            target,
+            groups,
+            weight,
+            n_eff,
+            smoothing_eps,
+            learnable,
+            weight_schedule: None,
+        })
+    }
+
+    #[classattr]
+    const KIND_TAG: &'static str = "block_sparsity";
+
+    fn to_rust_descriptor(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let payload = PyDict::new(py);
+        payload.set_item("kind", Self::KIND_TAG)?;
+        payload.set_item("target", target_descriptor(py, self.target.bind(py))?)?;
+        payload.set_item("groups", self.groups.clone())?;
+        payload.set_item("weight", self.weight)?;
+        payload.set_item("n_eff", self.n_eff)?;
+        payload.set_item("smoothing_eps", self.smoothing_eps)?;
+        payload.set_item("learnable", self.learnable)?;
+        if let Some(schedule) = topk_weight_schedule_descriptor(py, &self.weight_schedule)? {
+            payload.set_item("weight_schedule", schedule)?;
+        }
+        Ok(payload.into())
+    }
+
+    fn set_weight_schedule<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        schedule: PyObject,
+    ) -> PyRefMut<'py, Self> {
+        slf.weight_schedule = Some(schedule);
+        slf
+    }
+
+    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        Ok(format!(
+            "BlockSparsityPenalty(groups={:?}, weight={}, n_eff={}, smoothing_eps={}, learnable={}, target={}, weight_schedule={})",
+            self.groups,
+            self.weight,
+            self.n_eff,
+            self.smoothing_eps,
+            self.learnable,
+            py_repr(py, self.target.bind(py))?,
+            match &self.weight_schedule {
+                Some(schedule) => py_repr(py, schedule.bind(py))?,
+                None => "None".to_string(),
+            }
+        ))
+    }
+}
+
+fn block_sparsity_groups_type_error() -> PyErr {
+    PyTypeError::new_err("BlockSparsityPenalty.groups must be a sequence of integer sequences")
+}
+
+fn block_sparsity_coerce_groups(groups: &Bound<'_, PyAny>) -> PyResult<Vec<Vec<usize>>> {
+    let group_iter = groups
+        .try_iter()
+        .map_err(|_| block_sparsity_groups_type_error())?;
+    let mut coerced = Vec::new();
+    for group in group_iter {
+        let group = group.map_err(|_| block_sparsity_groups_type_error())?;
+        let axis_iter = group
+            .try_iter()
+            .map_err(|_| block_sparsity_groups_type_error())?;
+        let mut axes = Vec::new();
+        for axis in axis_iter {
+            let axis = axis.map_err(|_| block_sparsity_groups_type_error())?;
+            axes.push(
+                axis.call_method0("__index__")
+                    .and_then(|value| value.extract::<isize>())
+                    .map_err(|_| block_sparsity_groups_type_error())?,
+            );
+        }
+        coerced.push(axes);
+    }
+    if coerced.is_empty() {
+        return Err(PyValueError::new_err(
+            "BlockSparsityPenalty.groups must not be empty",
+        ));
+    }
+
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::with_capacity(coerced.len());
+    for (group_idx, group) in coerced.into_iter().enumerate() {
+        if group.is_empty() {
+            return Err(PyValueError::new_err(format!(
+                "BlockSparsityPenalty.groups[{group_idx}] must not be empty"
+            )));
+        }
+        let mut out_group = Vec::with_capacity(group.len());
+        for axis in group {
+            if axis < 0 {
+                return Err(PyValueError::new_err(format!(
+                    "BlockSparsityPenalty.groups entries must be non-negative; got {axis}"
+                )));
+            }
+            let axis = axis as usize;
+            if !seen.insert(axis) {
+                return Err(PyValueError::new_err(format!(
+                    "BlockSparsityPenalty.groups axis {axis} appears more than once"
+                )));
+            }
+            out_group.push(axis);
+        }
+        out.push(out_group);
+    }
+    let max_axis = seen.iter().next_back().copied().unwrap_or(0);
+    for axis in 0..=max_axis {
+        if !seen.contains(&axis) {
+            return Err(PyValueError::new_err(format!(
+                "BlockSparsityPenalty.groups must partition contiguous axes from 0; missing axis {axis}"
+            )));
+        }
+    }
+    Ok(out)
+}
+
 #[pymodule(name = "_rust", gil_used = false)]
 fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     gam::init_parallelism();
@@ -14098,6 +14281,10 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(column_stack_f64, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        survival_prediction_payload_from_json,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(flat_to_matrix_f64, module)?)?;
     module.add_function(wrap_pyfunction!(vec_to_array1_f64, module)?)?;
     module.add_function(wrap_pyfunction!(extract_row_ids, module)?)?;
@@ -14249,6 +14436,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(check_json, module)?)?;
+    module.add_function(wrap_pyfunction!(check_payload_from_model, module)?)?;
     module.add_function(wrap_pyfunction!(report_html, module)?)?;
     module.add_function(wrap_pyfunction!(compute_residuals, module)?)?;
     module.add_function(wrap_pyfunction!(diagnostics_from_predictions, module)?)?;

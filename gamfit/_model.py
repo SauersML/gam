@@ -111,7 +111,7 @@ class Model:
         """Validate ``data`` against the model's training schema."""
         headers, rows, _ = normalize_table(data)
         try:
-            payload = json.loads(rust_module().check_json(self._model_bytes, headers, rows))
+            payload = rust_module().check_payload_from_model(self._model_bytes, headers, rows)
         except Exception as exc:
             raise map_exception(exc) from exc
         return SchemaCheck.from_dict(payload)
@@ -207,10 +207,9 @@ class Model:
                 bool(group_means),
                 template or None,
             )
-            raw = rust_module().difference_smooth_json(self._model_bytes, request_json)
+            rows_out = rust_module().difference_smooth_rows(self._model_bytes, request_json)
         except Exception as exc:
             raise map_exception(exc) from exc
-        rows_out = json.loads(raw)
         if return_type == "list":
             return rows_out
         try:
