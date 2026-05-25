@@ -5258,15 +5258,38 @@ impl ProjectedKktResidual {
         self.subspace
     }
 
-    fn projected_into_reduced_range(&self, kernel: &PenaltySubspaceTrace) -> Self {
+    fn projected_into_reduced_range(&self, kernel: &PenaltySubspaceTrace) -> Result<Self, String> {
         match self.subspace {
-            KktResidualSubspace::ReducedRange => self.clone(),
+            KktResidualSubspace::ReducedRange => Ok(self.clone()),
             KktResidualSubspace::ActiveProjected => {
-                let mut reduced =
-                    Self::from_reduced_range(kernel.project_onto_subspace(&self.residual));
+                let reduced_residual = kernel.project_onto_subspace(&self.residual);
+                let dropped_inf = self
+                    .residual
+                    .iter()
+                    .zip(reduced_residual.iter())
+                    .map(|(full, reduced)| (full - reduced).abs())
+                    .fold(0.0_f64, f64::max);
+                let residual_inf = self
+                    .residual
+                    .iter()
+                    .map(|value| value.abs())
+                    .fold(0.0_f64, f64::max);
+                let tol = self
+                    .residual_tol
+                    .unwrap_or_else(|| 1e-10 * (1.0 + residual_inf));
+                let gate = 4.0 * tol;
+                if dropped_inf > gate {
+                    return Err(format!(
+                        "projected KKT residual contains unresolved mass outside the reduced \
+                         Hessian/penalty range: |r_A - r_R|∞={dropped_inf:.3e} > 4·tol={gate:.3e}; \
+                         range-projected IFT correction is valid only after the null direction is \
+                         explicitly removed/fixed or after the active-projected residual is small"
+                    ));
+                }
+                let mut reduced = Self::from_reduced_range(reduced_residual);
                 reduced.residual_tol = self.residual_tol;
                 reduced.free_rank = self.free_rank;
-                reduced
+                Ok(reduced)
             }
         }
     }
@@ -7254,7 +7277,9 @@ pub fn reml_laml_evaluate(
                     .into());
                 }
                 if let Some(kernel) = solution.penalty_subspace_trace.as_ref() {
-                    let reduced = residual.projected_into_reduced_range(kernel);
+                    let reduced = residual.projected_into_reduced_range(kernel).map_err(|reason| {
+                        RemlError::ContractViolation { reason }
+                    })?;
                     Some(std::borrow::Cow::Owned(reduced.as_array().clone()))
                 } else {
                     Some(std::borrow::Cow::Borrowed(r))

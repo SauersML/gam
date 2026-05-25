@@ -8659,6 +8659,116 @@ impl SurvivalLocationScaleFamily {
 
         Ok((ll, block_gradients))
     }
+
+    /// Assemble per-block coefficient gradients from a precomputed
+    /// `SurvivalJointQuantities` + `SurvivalDynamicGeometry`. Bit-identical
+    /// to the post-row matvec block in
+    /// [`Self::evaluate_log_likelihood_and_block_gradients_masked`] when
+    /// invoked with `row_mask = None`: every retained operation is the same
+    /// op on the same scalar inputs.
+    ///
+    /// This is the fused-path entry point used by `evaluate()`. The mask-
+    /// aware branch is not replicated here because no external caller wires
+    /// HT-subsampling through the joint gradient row loop; the `_masked`
+    /// plumbing in the legacy gradient pass is dead code that will be
+    /// removed when the legacy entry point is retired.
+    fn evaluate_block_gradients_from_quantities(
+        &self,
+        q: &SurvivalJointQuantities,
+        dynamic: &SurvivalDynamicGeometry,
+    ) -> Vec<Array1<f64>> {
+        let n = self.n;
+
+        let grad_time = dynamic.time_jac_entry.t().dot(&q.grad_time_eta_h0)
+            + dynamic.time_jac_exit.t().dot(&q.grad_time_eta_h1)
+            + dynamic.time_jac_deriv.t().dot(&q.grad_time_eta_d);
+
+        let mut scratch = Array1::<f64>::zeros(n);
+
+        let grad_t = if let (Some(x_t_entry), Some(x_t_deriv)) = (
+            self.x_threshold_entry.as_ref(),
+            self.x_threshold_deriv.as_ref(),
+        ) {
+            ndarray::Zip::from(&mut scratch)
+                .and(&q.d1_q1)
+                .and(&dynamic.dq_t_exit)
+                .and(&q.d1_qdot1)
+                .and(&dynamic.dqdot_t)
+                .for_each(|s, &a, &b, &c, &d| *s = a * b + c * d);
+            let mut out = self.x_threshold.transpose_vector_multiply(&scratch);
+            ndarray::Zip::from(&mut scratch)
+                .and(&q.d1_q0)
+                .and(&dynamic.dq_t_entry)
+                .for_each(|s, &a, &b| *s = a * b);
+            out = out + x_t_entry.transpose_vector_multiply(&scratch);
+            ndarray::Zip::from(&mut scratch)
+                .and(&q.d1_qdot1)
+                .and(&dynamic.dqdot_td)
+                .for_each(|s, &a, &b| *s = a * b);
+            out + x_t_deriv.transpose_vector_multiply(&scratch)
+        } else {
+            ndarray::Zip::from(&mut scratch)
+                .and(&q.d1_q1)
+                .and(&dynamic.dq_t_exit)
+                .and(&q.d1_q0)
+                .and(&dynamic.dq_t_entry)
+                .for_each(|s, &a, &b, &c, &d| *s = a * b + c * d);
+            ndarray::Zip::from(&mut scratch)
+                .and(&q.d1_qdot1)
+                .and(&dynamic.dqdot_t)
+                .for_each(|s, &a, &b| *s += a * b);
+            self.x_threshold.transpose_vector_multiply(&scratch)
+        };
+
+        let grad_ls = if let (Some(x_ls_entry), Some(x_ls_deriv)) = (
+            self.x_log_sigma_entry.as_ref(),
+            self.x_log_sigma_deriv.as_ref(),
+        ) {
+            ndarray::Zip::from(&mut scratch)
+                .and(&q.d1_q1)
+                .and(&dynamic.dq_ls_exit)
+                .and(&q.d1_qdot1)
+                .and(&dynamic.dqdot_ls)
+                .for_each(|s, &a, &b, &c, &d| *s = a * b + c * d);
+            let mut out = self.x_log_sigma.transpose_vector_multiply(&scratch);
+            ndarray::Zip::from(&mut scratch)
+                .and(&q.d1_q0)
+                .and(&dynamic.dq_ls_entry)
+                .for_each(|s, &a, &b| *s = a * b);
+            out = out + x_ls_entry.transpose_vector_multiply(&scratch);
+            ndarray::Zip::from(&mut scratch)
+                .and(&q.d1_qdot1)
+                .and(&dynamic.dqdot_lsd)
+                .for_each(|s, &a, &b| *s = a * b);
+            out + x_ls_deriv.transpose_vector_multiply(&scratch)
+        } else {
+            ndarray::Zip::from(&mut scratch)
+                .and(&q.d1_q1)
+                .and(&dynamic.dq_ls_exit)
+                .and(&q.d1_q0)
+                .and(&dynamic.dq_ls_entry)
+                .for_each(|s, &a, &b, &c, &d| *s = a * b + c * d);
+            ndarray::Zip::from(&mut scratch)
+                .and(&q.d1_qdot1)
+                .and(&dynamic.dqdot_ls)
+                .for_each(|s, &a, &b| *s += a * b);
+            self.x_log_sigma.transpose_vector_multiply(&scratch)
+        };
+
+        let mut block_gradients = vec![grad_time, grad_t, grad_ls];
+        if let (Some(xw_exit), Some(xw_entry), Some(xw_qdot)) = (
+            dynamic.wiggle_basis_exit.as_ref(),
+            dynamic.wiggle_basis_entry.as_ref(),
+            dynamic.wiggle_qdot_basis_exit.as_ref(),
+        ) {
+            let gradw = xw_exit.t().dot(&q.d1_q1)
+                + xw_entry.t().dot(&q.d1_q0)
+                + xw_qdot.t().dot(&q.d1_qdot1);
+            block_gradients.push(gradw);
+        }
+
+        block_gradients
+    }
 }
 
 /// Observed vs expected information: The survival location-scale family uses

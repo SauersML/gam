@@ -5219,18 +5219,34 @@ fn run_outer_with_plan(
         // seed; route the underlying InnerFailure through the same
         // SeedRejection accounting any other pre-validation rejection
         // would take, then continue to the next seed.
-        if let Err(cf) = crate::solver::estimate::reml::continuation::prime_outer_seed(
+        let prewarm_start = std::time::Instant::now();
+        match crate::solver::estimate::reml::continuation::prime_outer_seed(
             obj,
             seed,
             &bounds_template.1,
         ) {
-            let msg = format!(
-                "continuation pre-warm refused before seed eval: {}",
-                cf.inner().message()
-            );
-            log::warn!("[OUTER] {context}: rejecting seed {seed_idx} (continuation): {msg}");
-            rejection_reasons.push((seed_idx, "validation", msg));
-            continue 'seed_attempts;
+            Ok(summary) => {
+                // Skip the log line on collapse — that's the
+                // zero-overhead easy-fit case and a log per seed would
+                // be noise. Anything else is a real anneal worth
+                // surfacing so biobank-scale runs are diagnosable.
+                if !summary.collapsed {
+                    log::info!(
+                        "[OUTER] {context}: continuation pre-warm seed {seed_idx} steps={} elapsed={:.3}s",
+                        summary.steps_accepted,
+                        prewarm_start.elapsed().as_secs_f64(),
+                    );
+                }
+            }
+            Err(cf) => {
+                let msg = format!(
+                    "continuation pre-warm refused before seed eval: {}",
+                    cf.inner().message()
+                );
+                log::warn!("[OUTER] {context}: rejecting seed {seed_idx} (continuation): {msg}");
+                rejection_reasons.push((seed_idx, "validation", msg));
+                continue 'seed_attempts;
+            }
         }
         let t_seed_start = std::time::Instant::now();
         let seed_slot;
