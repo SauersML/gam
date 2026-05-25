@@ -2695,6 +2695,25 @@ pub fn resolve_family(
                     ),
                     false,
                 ),
+                // Tweedie compound-Poisson-Gamma family. The variance power
+                // p must lie strictly in (1, 2); we default to mgcv's
+                // canonical p = 1.5. The link is fixed to log (the only link
+                // wired through the Tweedie working-response and dispersion
+                // machinery). "tw" matches mgcv's family alias.
+                "tweedie" | "tw" => (
+                    LikelihoodSpec::new(
+                        ResponseFamily::Tweedie { p: 1.5 },
+                        InverseLink::Standard(LinkFunction::Log),
+                    ),
+                    false,
+                ),
+                "tweedie-log" => (
+                    LikelihoodSpec::new(
+                        ResponseFamily::Tweedie { p: 1.5 },
+                        InverseLink::Standard(LinkFunction::Log),
+                    ),
+                    true,
+                ),
                 _ => {
                     return Err(WorkflowError::InvalidConfig {
                         reason: format!("unknown family '{name}'"),

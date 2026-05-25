@@ -4853,7 +4853,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     .slice(s![time_build.x_exit_time.ncols()..])
                     .to_vec()
             });
-            payload.survival_entry = Some(args.entry);
+            payload.survival_entry = args.entry;
             payload.survival_exit = Some(args.exit);
             payload.survival_event = Some(args.event);
             payload.survivalspec = Some(effectivespec.clone());
@@ -5225,7 +5225,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             payload.unified = Some(fit.fit.clone());
             payload.fit_result = Some(fit.fit.clone());
             payload.data_schema = Some(ds.schema.clone());
-            payload.survival_entry = Some(args.entry);
+            payload.survival_entry = args.entry;
             payload.survival_exit = Some(args.exit);
             payload.survival_event = Some(args.event);
             payload.survivalspec = Some(effectivespec.clone());
@@ -5553,7 +5553,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             payload.unified = Some(fit.clone());
             payload.fit_result = Some(fit.clone());
             payload.data_schema = Some(ds.schema.clone());
-            payload.survival_entry = Some(args.entry);
+            payload.survival_entry = args.entry;
             payload.survival_exit = Some(args.exit);
             payload.survival_event = Some(args.event);
             payload.survivalspec = Some(effectivespec.clone());
@@ -5692,7 +5692,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             payload.unified = Some(fit.fit.clone());
             payload.fit_result = Some(fit.fit.clone());
             payload.data_schema = Some(ds.schema.clone());
-            payload.survival_entry = Some(args.entry);
+            payload.survival_entry = args.entry;
             payload.survival_exit = Some(args.exit);
             payload.survival_event = Some(args.event);
             payload.survivalspec = Some(effectivespec);
@@ -6128,7 +6128,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         payload.unified = Some(fit_result.clone());
         payload.fit_result = Some(fit_result);
         payload.data_schema = Some(ds.schema.clone());
-        payload.survival_entry = Some(args.entry);
+        payload.survival_entry = args.entry;
         payload.survival_exit = Some(args.exit);
         payload.survival_event = Some(args.event);
         payload.survivalspec = Some(effectivespec);

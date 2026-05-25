@@ -361,6 +361,7 @@ __all__ = [
     "load",
     "load_posterior",
     "loads",
+    "save",
     "mechanism_sparsity_jacobian",
     "periodic_spline_curve_basis",
     "sphere_basis",
