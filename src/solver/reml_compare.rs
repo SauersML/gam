@@ -178,8 +178,7 @@ mod tests {
         assert!((comparison.ranking[1].bayes_factor - 3.0_f64.exp()).abs() < 1e-12);
         assert_eq!(comparison.score_table[1].delta_reml, 3.0);
         assert!(
-            (comparison.score_table[1].bayes_factor_best_over_model - 3.0_f64.exp()).abs()
-                < 1e-12
+            (comparison.score_table[1].bayes_factor_best_over_model - 3.0_f64.exp()).abs() < 1e-12
         );
     }
 }

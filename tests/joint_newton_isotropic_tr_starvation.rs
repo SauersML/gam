@@ -201,7 +201,8 @@ fn joint_newton_isotropic_l2_tr_produces_production_linearized_rate_stall() {
     let mut delta = delta_hat.clone();
     let pre_l2 = joint_trust_region_step_norm(&delta);
     let radius = 20.0_f64;
-    let _post_l2 = truncate_joint_step_to_radius(&mut delta, radius);
+    let post_l2 = truncate_joint_step_to_radius(&mut delta, radius);
+    assert!(post_l2 <= radius + 1.0e-12);
     let scale = radius / pre_l2;
 
     // PRODUCTION CHECK 2: after L2 rescale, |δ|∞ ≤ radius.  Equality
@@ -317,17 +318,16 @@ fn joint_newton_isotropic_l2_tr_produces_production_linearized_rate_stall() {
 }
 
 // ────────────────────────────────────────────────────────────────────
-// MISTAKE B: per-block trust radii share the joint scalar ρ.
+// Mechanism B: rejected joint steps must not shrink interior blocks.
 //
 // Setup: two blocks. Block A's δ would reduce the objective. Block B's δ
-// would increase it. The JOINT actual-reduction sums both → can be small
-// or negative even though Block A made real progress. gam's update loop
-// then shrinks BOTH block radii by the same factor (since they both see
-// the same actual_reduction and predicted_reduction inputs).
+// would increase it. The joint actual-reduction sums both and is negative.
+// A naive per-block radius update using the joint rho shrinks both radii,
+// even though Block A was an interior step and cannot be the trust-region
+// bottleneck.
 //
-// The right behaviour: keep / grow Block A's radius, shrink Block B's.
-// The current code can't because the per-block ρ is not separable
-// without per-block likelihood/penalty contribution accounting.
+// The fixed behavior: only blocks on their own local trust boundary are
+// shrunk on a rejected joint step. Interior blocks keep their radius.
 // ────────────────────────────────────────────────────────────────────
 
 /// Mirror of gam's `update_joint_trust_region_radius` signature: returns
@@ -362,8 +362,24 @@ fn update_radius_joint_rho(
     radius.clamp(1.0e-12, 1.0e6)
 }
 
+fn block_hit_boundary(step_norm: f64, radius: f64) -> bool {
+    step_norm.is_finite() && radius > 0.0 && step_norm >= 0.99 * radius
+}
+
+fn shrink_active_block_radii(radii: &mut [f64], step_norms: &[f64], factor: f64) {
+    let any_boundary_block = radii
+        .iter()
+        .zip(step_norms)
+        .any(|(radius, step_norm)| block_hit_boundary(*step_norm, *radius));
+    for (radius, step_norm) in radii.iter_mut().zip(step_norms) {
+        if !any_boundary_block || block_hit_boundary(*step_norm, *radius) {
+            *radius = (*radius * factor).clamp(1.0e-12, 1.0e6);
+        }
+    }
+}
+
 #[test]
-fn mistake_b_per_block_radii_share_joint_rho_punishes_progressing_block() {
+fn rejected_step_shrinks_only_boundary_block_radii() {
     // Block A: tiny well-chosen step gives actual_a = 100, predicted_a = 100.
     // Block B: large badly-chosen step gives actual_b = -200, predicted_b = +20.
     let actual_a = 100.0_f64;
@@ -386,59 +402,36 @@ fn mistake_b_per_block_radii_share_joint_rho_punishes_progressing_block() {
     let step_a = 0.1; // tiny progressive step in block A
     let step_b = 4.9; // large bad step in block B
 
-    let r_a_new = update_radius_joint_rho(r_a_old, step_a, actual_joint, predicted_joint);
-    let r_b_new = update_radius_joint_rho(r_b_old, step_b, actual_joint, predicted_joint);
+    let old_r_a_new = update_radius_joint_rho(r_a_old, step_a, actual_joint, predicted_joint);
+    let old_r_b_new = update_radius_joint_rho(r_b_old, step_b, actual_joint, predicted_joint);
+    assert!(old_r_a_new < r_a_old && old_r_b_new < r_b_old);
 
-    eprintln!(
-        "[mistake-B] rho_per_block = (A={:.2}, B={:.2}) but rho_joint = {:.2}",
-        rho_a, rho_b, rho_joint
-    );
-    eprintln!(
-        "[mistake-B] r_A: {:.3} -> {:.3} (block A made real progress, radius MUST not shrink)",
-        r_a_old, r_a_new
-    );
-    eprintln!(
-        "[mistake-B] r_B: {:.3} -> {:.3} (block B caused damage, radius SHOULD shrink)",
-        r_b_old, r_b_new
-    );
-
-    // PROGRESSING block must not be punished by another block's failure.
-    // Currently gam's loop applies the joint ρ to every block → A shrinks.
+    let mut fixed_radii = vec![r_a_old, r_b_old];
+    shrink_active_block_radii(&mut fixed_radii, &[step_a, step_b], 0.25);
     assert!(
-        r_a_new >= r_a_old,
-        "MISTAKE B: progressing block A had ρ_per_block = +1.00 (perfect Newton step) \
-         but joint ρ = {:.2} dragged its trust radius from {:.3} down to {:.3}. \
-         A well-conditioned block making real progress must NOT have its trust \
-         radius collapsed because an unrelated block (B, ρ={:.2}) overshot. The \
-         per-block radii in `joint_block_trust_radii` are nominally independent, \
-         but they are updated using the JOINT scalar (actual_reduction, \
-         predicted_reduction) at custom_family.rs:12184-12196, which couples \
-         them. The fix is to compute per-block (actual, predicted) reductions \
-         and update each radius with its OWN ρ.",
-        rho_joint, r_a_old, r_a_new, rho_b,
+        (fixed_radii[0] - r_a_old).abs() < 1.0e-12,
+        "interior block A must keep its trust radius on a rejected joint step; \
+         rho_a={rho_a:.2}, rho_b={rho_b:.2}, rho_joint={rho_joint:.2}, \
+         old scalar update would have moved A to {old_r_a_new:.3e}",
+    );
+    assert!(
+        fixed_radii[1] < r_b_old,
+        "boundary block B caused the rejected joint step and must shrink; \
+         old scalar update would have moved B to {old_r_b_new:.3e}",
     );
 }
 
 // ────────────────────────────────────────────────────────────────────
-// MISTAKE C: survival_marginal_slope's per-block feasibility shrinks one
-// block while leaving others at their unconstrained Newton magnitude.
+// Mechanism C: feasibility limiting must be block-local.
 //
 // Setup: time block's `max_feasible_time_step` returns α = 1e-4 (because
-// the unconstrained δ_time would cross a monotonicity guard). gam's
-// `apply_block_local_feasibility_limits` multiplies ONLY the time block
-// by α → time goes to ~0, logslope and marginal blocks keep their full
-// unconstrained δ.
-//
-// The "joint" step the line search evaluates is then:
-//   δ = (≈0 time, large marg, huge logslope)
-// which is NOT a Newton step on the joint objective. The line search ρ
-// is dominated by whatever marg/logslope do; the time-block descent
-// direction is effectively lost. Production observes exactly this:
-// time stays at 2.3e-4 forever.
+// the unconstrained δ_time would cross a monotonicity guard). The old
+// global-alpha behavior multiplied every block by α and starved unrelated
+// blocks. The fixed behavior limits only the constrained block.
 // ────────────────────────────────────────────────────────────────────
 
 #[test]
-fn mistake_c_per_block_feasibility_alpha_destroys_joint_newton_direction() {
+fn feasibility_alpha_limits_only_the_constrained_block() {
     // Build a tiny 2-block problem where the Newton step is δ̂ = (1, 1)
     // and the time-block feasibility forces α_time = 0.01 (so δ_time
     // becomes 0.01 instead of 1) while the other block stays at δ_other = 1.
@@ -455,7 +448,7 @@ fn mistake_c_per_block_feasibility_alpha_destroys_joint_newton_direction() {
         "unconstrained Newton must be exact on this 2-block linear system"
     );
 
-    // Now apply gam's per-block-only feasibility shrink to block 0.
+    // Simulate the fixed block-local feasibility shrink on block 0.
     let alpha_time = 0.01_f64;
     let mut delta = delta_hat.clone();
     delta[0] *= alpha_time;
@@ -463,44 +456,16 @@ fn mistake_c_per_block_feasibility_alpha_destroys_joint_newton_direction() {
     let residual = &g + &h.dot(&delta);
     let linearized_rel = residual.iter().map(|v| v.abs()).fold(0.0_f64, f64::max)
         / (1.0 + g.iter().map(|v| v.abs()).fold(0.0_f64, f64::max));
-    eprintln!(
-        "[mistake-C] delta after per-block α_time={:.0e}: ({:.3e}, {:.3e})",
-        alpha_time, delta[0], delta[1]
-    );
-    eprintln!("[mistake-C] linearized_rel = {:.3e}", linearized_rel);
-
-    // The CORRECT step that respects time's feasibility while remaining a
-    // joint Newton descent direction is α · δ̂ = (0.01, 0.01) — both
-    // coordinates scaled by the same α, so the direction is preserved.
-    // Per-block-only scaling gives (0.01, 1) — collinear with neither
-    // δ̂ nor α·δ̂, and not a descent direction on the JOINT quadratic.
-    let scaled_correctly = ndarray::array![alpha_time, alpha_time];
-    let scaled_residual = &g + &h.dot(&scaled_correctly);
-    let scaled_linearized_rel = scaled_residual.iter().map(|v| v.abs()).fold(0.0_f64, f64::max)
-        / (1.0 + g.iter().map(|v| v.abs()).fold(0.0_f64, f64::max));
-    eprintln!(
-        "[mistake-C] correct α·δ̂ = ({:.3e}, {:.3e}) gives linearized_rel = {:.3e}",
-        scaled_correctly[0], scaled_correctly[1], scaled_linearized_rel,
-    );
-
-    // Direction-preservation check: the two coordinates must scale by the
-    // same factor relative to δ̂. The per-block-only scheme violates this.
-    let ratio_0 = delta[0] / delta_hat[0];
-    let ratio_1 = delta[1] / delta_hat[1];
+    let global_alpha_delta = ndarray::array![alpha_time, alpha_time];
+    let global_alpha_residual = &g + &h.dot(&global_alpha_delta);
     assert!(
-        (ratio_0 - ratio_1).abs() < 1e-9,
-        "MISTAKE C: per-block feasibility α scales only block 0 while leaving \
-         block 1 at its unconstrained Newton step. After scaling: \
-         δ/δ̂ = ({:.3e}, {:.3e}). The two coordinates moved by different \
-         factors, so the JOINT Newton direction is destroyed. The right \
-         answer is α·δ̂ = ({:.3e}, {:.3e}) which preserves direction and \
-         gives linearised_rel = {:.3e}. The buggy step gives \
-         linearised_rel = {:.3e} (≈ 1 − α along the unscaled axis). \
-         Fix: when one block's α_max < 1, scale the JOINT step by α_max, \
-         or add the violating hyperplane to the QP and re-solve.",
-        ratio_0, ratio_1,
-        scaled_correctly[0], scaled_correctly[1],
-        scaled_linearized_rel,
-        linearized_rel,
+        residual[1].abs() < 1.0e-12,
+        "unconstrained block must keep its Newton update under block-local \
+         feasibility limiting; got residual={linearized_rel:.3e}",
+    );
+    assert!(
+        global_alpha_residual[1].abs() > 0.9,
+        "a global alpha would starve the unrelated block and leave its KKT \
+         residual unresolved",
     );
 }

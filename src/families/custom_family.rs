@@ -10913,7 +10913,30 @@ fn apply_block_local_feasibility_limits<F: CustomFamily + ?Sized>(
     ranges: &[(usize, usize)],
     trial_delta: &mut Array1<f64>,
 ) -> Result<bool, String> {
-    let mut limited = false;
+    // Collect each block's feasibility α and apply the *minimum* to the
+    // JOINT trial step, not to each block in isolation.
+    //
+    // The joint Newton direction δ̂ = H⁻¹(−g) is the unique descent direction
+    // for the local quadratic model up to a positive scalar; any α·δ̂ with
+    // α ∈ (0, 1] is still a descent direction on the joint objective.
+    // Scaling ONLY one block by α produces (α·δ̂_A, δ̂_B, …), which is
+    // neither δ̂ nor α·δ̂ and is not, in general, a descent direction on
+    // the joint quadratic.
+    //
+    // Production survival_marginal_slope failure mode at biobank scale:
+    // the time block returned α ≈ 1e-4 (monotonicity guard); per-block
+    // scaling crushed δ_time to ~2.3e-4 while logslope kept its full
+    // unconstrained Newton step. The joint step was no longer a Newton
+    // direction; the time-block gradient stayed at ‖g_time‖ ≈ 5.6e8 for
+    // the next 15+ cycles, triggering the linearized-rate stall
+    // early-exit on every outer seed.
+    //
+    // Scaling the joint step by min α preserves Newton direction; the
+    // trust-region/line-search already chooses the appropriate step size
+    // within direction, this barrier check just enforces feasibility on
+    // top of that direction.
+    let mut joint_alpha = 1.0_f64;
+    let mut limiting_block: Option<usize> = None;
     for (block_idx, (start, end)) in ranges.iter().copied().enumerate() {
         let block_delta = trial_delta.slice(s![start..end]).to_owned();
         if let Some(alpha_max) = family.max_feasible_step_size(states, block_idx, &block_delta)? {
@@ -10922,15 +10945,23 @@ fn apply_block_local_feasibility_limits<F: CustomFamily + ?Sized>(
                     "joint Newton block {block_idx} has no positive feasible step"
                 ));
             }
-            if alpha_max < 1.0 {
-                trial_delta
-                    .slice_mut(s![start..end])
-                    .mapv_inplace(|v| alpha_max * v);
-                limited = true;
+            if alpha_max < joint_alpha {
+                joint_alpha = alpha_max;
+                limiting_block = Some(block_idx);
             }
         }
     }
-    Ok(limited)
+    if joint_alpha < 1.0 {
+        trial_delta.mapv_inplace(|v| joint_alpha * v);
+        log::debug!(
+            "[PIRLS/joint-Newton] feasibility scaled joint step by α={:.3e} (block {:?} binding)",
+            joint_alpha,
+            limiting_block,
+        );
+        Ok(true)
+    } else {
+        Ok(false)
+    }
 }
 
 fn joint_inner_kkt_converged(residual: f64, residual_tol: f64) -> bool {
