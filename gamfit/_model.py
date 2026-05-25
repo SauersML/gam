@@ -29,7 +29,6 @@ from ._survival import (
     competing_risks_cif,
     default_survival_time_grid,
     extract_row_ids,
-    numeric_matrix,
     shape_prediction_response,
     term_blocks_for_model,
 )
@@ -81,15 +80,12 @@ class Model:
 
     def predict_array(self, X: Any, *, interval: float | None = None) -> Any:
         """Predict directly from a numeric NumPy-compatible feature matrix."""
-        import numpy as np
-
-        X_arr = numeric_matrix(X, "X")
         try:
-            return np.asarray(
-                rust_module().predict_array(
-                    self._model_bytes, X_arr, json.dumps({"interval": interval})
-                ),
-                dtype=float,
+            rust = rust_module()
+            return rust.predict_array(
+                self._model_bytes,
+                rust.numeric_matrix_f64(X, "X"),
+                json.dumps({"interval": interval}),
             )
         except Exception as exc:
             raise map_exception(exc) from exc
@@ -165,13 +161,11 @@ class Model:
 
     def design_matrix_array(self, X: Any) -> Any:
         """Materialised design matrix for a numeric feature matrix."""
-        import numpy as np
-
-        X_arr = numeric_matrix(X, "X")
         try:
-            return np.asarray(
-                rust_module().design_matrix_array(self._model_bytes, X_arr),
-                dtype=float,
+            rust = rust_module()
+            return rust.design_matrix_array(
+                self._model_bytes,
+                rust.numeric_matrix_f64(X, "X"),
             )
         except Exception as exc:
             raise map_exception(exc) from exc
@@ -335,7 +329,10 @@ class Model:
             raise TypeError(
                 f"bayes_factor_vs expects a gamfit.Model, got {type(other).__name__}"
             )
-        return math.exp(self.evidence - other.evidence)
+        log_diff = rust_module().bayes_factor_log_diff(
+            self._model_bytes, other._model_bytes
+        )
+        return math.exp(log_diff)
 
     def _model_class_from_payload(self) -> str:
         value = self._saved_payload_string("model_kind")
