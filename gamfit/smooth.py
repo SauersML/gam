@@ -346,10 +346,12 @@ class Matern(Smooth):
         from ._basis_eval import matern_evaluate
         return matern_evaluate(self, coords)
 
-    # Matern is pure-torch math (half-integer ν fast path), not a Rust FFI
-    # path. NumPy and JAX backends are not wired; declare torch-only so
-    # ``evaluate(..., backend='numpy')`` raises a clean error instead of
-    # silently dropping autograd.
+    # Matern.evaluate currently raises NotImplementedError because the
+    # design-matrix Rust kernel (matern_basis) is not yet exposed on the
+    # PyFFI surface. Re-implementing the Matern kernel in pure torch would
+    # violate the single-source-of-math invariant. When the Rust binding
+    # lands, ``matern_evaluate`` in :mod:`gamfit._basis_eval` should route
+    # through it and ``SUPPORTED_BACKENDS`` should grow ``"numpy"``.
     SUPPORTED_BACKENDS: frozenset[str] = frozenset({"torch"})
 
 
@@ -500,13 +502,8 @@ class Sphere(Smooth):
         return sphere_evaluate_numpy(self, coords)
 
     def _evaluate_torch(self, coords: Any) -> Any:
-        from ._basis_eval import sphere_evaluate_numpy
-        from ._basis_protocol import _torch
-
-        torch = _torch()
-        pts_np = coords.detach().cpu().double().numpy()
-        design = sphere_evaluate_numpy(self, pts_np)
-        return torch.as_tensor(design, dtype=coords.dtype, device=coords.device)
+        from ._basis_eval import sphere_evaluate
+        return sphere_evaluate(self, coords)
 
     SUPPORTED_BACKENDS: frozenset[str] = frozenset({"torch", "numpy", "jax"})
 

@@ -112,18 +112,20 @@ def _detect_backend(coords: Sequence[Any]) -> str:
     string before importing the framework. This means a user who only has
     numpy installed never accidentally triggers a torch or jax import.
 
-    NumPy inputs default to the ``"torch"`` backend so that the canonical
-    contract — autograd-connected ``(B, M)`` tensor outputs — holds
-    uniformly. Callers who explicitly want a NumPy return value must pass
-    ``backend="numpy"`` to :meth:`BasisDescriptor.evaluate`.
+    Cross-frame dispatch contract (see :mod:`gamfit._frame`):
+
+    * Pure NumPy inputs return :class:`numpy.ndarray` — the default frame
+      is NumPy so ``import gamfit`` works with just NumPy installed.
+    * Torch inputs return :class:`torch.Tensor` with autograd connected.
+    * JAX inputs return :class:`jax.Array`, safe under ``jit``/``vmap``.
+    * Mixed frames (a torch tensor and a jax array in the same call) raise
+      :class:`TypeError` with a clear "inputs must be in the same frame"
+      message — there is no implicit conversion that would silently drop
+      one frame's autograd graph.
     """
-    for c in coords:
-        mod = type(c).__module__
-        if mod.startswith("torch"):
-            return "torch"
-        if mod.startswith("jax") or mod.startswith("jaxlib"):
-            return "jax"
-    return "torch"
+    from ._frame import detect_frame
+
+    return detect_frame(*coords).value
 
 
 def _normalize_backend(backend: str | None, coords: Sequence[Any]) -> str:

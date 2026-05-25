@@ -579,8 +579,8 @@ mod tests {
         let pen = SheafConsistencyPenalty::new(edges, restrictions, 1.0, vec![2, 2, 2])
             .expect("build");
         // Reconstruct L densely via 6 matvecs.
-        let n = pen.total_dim();
         let l_dense = pen.dense_laplacian();
+        let n = pen.total_dim();
         let s = array![0.1_f64, -0.2, 0.3, 0.4, -0.5, 0.6];
         let v = array![0.7_f64, 0.2, -0.1, 0.5, 0.3, -0.4];
         let hv = pen.hvp(s.view(), v.view());

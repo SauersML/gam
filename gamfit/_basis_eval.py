@@ -274,11 +274,6 @@ def tensor_bspline_evaluate(spec: Any, coords: Any) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# Sphere descriptor evaluator
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
 # NumPy backend evaluators (no autograd; route straight to the Rust FFI)
 # ---------------------------------------------------------------------------
 
@@ -405,3 +400,46 @@ def sphere_evaluate(spec: Any, coords: Any) -> Any:
         radians=bool(spec.radians),
     )
     return design
+
+
+def sphere_evaluate_numpy(spec: Any, coords: Any) -> Any:
+    """NumPy-backend Sphere evaluation. Direct Rust ``sphere_basis``."""
+    import numpy as np
+
+    from . import _api
+
+    pts = np.asarray(coords, dtype=np.float64)
+    if pts.ndim != 2 or pts.shape[1] != 2:
+        raise ValueError(
+            f"Sphere.evaluate expects (B, 2) coords [lat, lon]; "
+            f"got shape {tuple(pts.shape)}"
+        )
+    design, _ = _api.sphere_basis(
+        pts,
+        int(spec.n_centers),
+        penalty_order=int(spec.penalty_order),
+        kernel=str(spec.kernel),
+        radians=bool(spec.radians),
+    )
+    return np.asarray(design, dtype=np.float64)
+
+
+def periodic_curve_evaluate_numpy(spec: Any, coords: Any) -> Any:
+    """NumPy-backend PeriodicSplineCurve evaluation. Direct Rust FFI."""
+    import numpy as np
+
+    from . import _api
+
+    coords_np = np.asarray(coords, dtype=np.float64)
+    if coords_np.ndim != 2 or coords_np.shape[1] != 1:
+        raise ValueError(
+            f"PeriodicSplineCurve.evaluate: 1D-only; got shape "
+            f"{tuple(coords_np.shape)}"
+        )
+    basis_np, _ = _api.periodic_spline_curve_basis(
+        coords_np[:, 0],
+        int(spec.n_knots),
+        degree=int(spec.degree),
+        penalty_order=int(spec.penalty_order),
+    )
+    return np.asarray(basis_np, dtype=np.float64)
