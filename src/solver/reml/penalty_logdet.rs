@@ -215,10 +215,6 @@ impl PenaltyPseudologdet {
         total
     }
 
-    fn pseudo_inverse_dense(&self) -> Array2<f64> {
-        self.w_factor.dot(&self.w_factor.t())
-    }
-
     /// Build from block-local `Penalty` values and current lambdas.
     ///
     /// When all penalties have disjoint column ranges, the eigendecomposition
@@ -1087,17 +1083,26 @@ impl PenaltyPseudologdet {
             return 0.0;
         }
 
-        let s_pinv = self.pseudo_inverse_dense();
+        // Reduced-space Y_i = W^T S_{τ_i} W (rank × rank); avoids materializing
+        // the dense p×p pseudo-inverse and the p×p×p×p×p chain
+        // `S⁺ · S_{τ_i} · S⁺`.  Identities used:
+        //   tr(S⁺ M)              = tr(W^T M W) = tr(Y_M)
+        //   tr(S⁺ S_τi S⁺ S_τj)   = tr((W^T S_τi W)(W^T S_τj W))  [cyclic on S⁺=WW^T]
+        // Both Y_τi and Y_τj are symmetric (S_τi, S_τj symmetric), so
+        // tr(Y_i Y_j) = tr(Y_i Y_j^T) = `trace_dense_product`.
+        let y_i = self.reduced(s_tau_i);
+        let y_j = self.reduced(s_tau_j);
 
-        // tr(S⁺ S_{τ_i τ_j})
+        // tr(S⁺ S_{τ_i τ_j}) = tr(W^T S_{ij} W).
         let linear = if let Some(s_ij) = s_tau_ij {
-            Self::trace_dense_product(&s_pinv, s_ij)
+            let y_ij = self.reduced(s_ij);
+            (0..self.rank).map(|r| y_ij[[r, r]]).sum::<f64>()
         } else {
             0.0
         };
 
-        // tr(S⁺ S_{τ_i} S⁺ S_{τ_j})
-        let quad = Self::trace_dense_product(&s_pinv.dot(s_tau_i).dot(&s_pinv), s_tau_j);
+        // tr(S⁺ S_{τ_i} S⁺ S_{τ_j}) = tr(Y_i Y_j).
+        let quad = Self::trace_dense_product(&y_i, &y_j);
 
         // Moving-nullspace correction: 2 tr(Σ₊⁻² L_i L_j^T).
         let nullspace_correction = if self.u_null.is_some() {
@@ -1145,13 +1150,21 @@ impl PenaltyPseudologdet {
             return 0.0;
         }
 
-        let s_pinv = self.pseudo_inverse_dense();
+        // Reduced-space form (see `tau_hessian_component`):
+        //   tr(S⁺ M)            = tr(W^T M W)
+        //   tr(S⁺ S_k S⁺ S_τi)  = tr((W^T S_k W)(W^T S_τi W))
+        // This avoids materializing the p×p pseudo-inverse and the
+        // cubic `S⁺ · S_k · S⁺` chain.
+        let y_k = self.reduced(s_k);
+        let y_tau_i = self.reduced(s_tau_i);
 
-        // −λ_k tr(S⁺ S_k S⁺ S_{τ_i})
-        let quad = Self::trace_dense_product(&s_pinv.dot(s_k).dot(&s_pinv), s_tau_i);
+        // tr(S⁺ S_k S⁺ S_{τ_i}) = tr(Y_k Y_τi).  Both Y_k and Y_τi are
+        // symmetric, so the product trace matches `trace_dense_product`.
+        let quad = Self::trace_dense_product(&y_k, &y_tau_i);
 
         let linear = if let Some(dsk) = ds_k_dtau_i {
-            Self::trace_dense_product(&s_pinv, dsk)
+            let y_dsk = self.reduced(dsk);
+            (0..self.rank).map(|r| y_dsk[[r, r]]).sum::<f64>()
         } else {
             0.0
         };
