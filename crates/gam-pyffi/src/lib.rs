@@ -8867,7 +8867,7 @@ fn sae_build_padded_basis_stacks(
                         basis_sizes[atom_idx]
                     ));
                 }
-                if jet.shape() != [n_obs, m, 1] {
+                if jet.shape() != &[n_obs, m, 1] {
                     return Err(format!(
                         "sae_build_padded_basis_stacks: atom {atom_idx} periodic jet shape {:?} disagrees with expected ({n_obs}, {m}, 1)",
                         jet.shape()
@@ -8914,7 +8914,7 @@ fn sae_build_padded_basis_stacks(
                         basis_sizes[atom_idx]
                     ));
                 }
-                if jet.shape() != [n_obs, m, d] {
+                if jet.shape() != &[n_obs, m, d] {
                     return Err(format!(
                         "sae_build_padded_basis_stacks: atom {atom_idx} Duchon jet shape {:?} disagrees with expected ({n_obs}, {m}, {d})",
                         jet.shape()
@@ -8961,13 +8961,37 @@ fn sae_build_atom_plans(
 ) -> Result<Vec<SaeAtomBuildPlan>, String> {
     let k_atoms = atom_basis.len();
     let n_obs = z.nrows();
+    let seed_shape = seed_coords.shape();
+    if atom_dim.len() != k_atoms {
+        return Err(format!(
+            "sae_build_atom_plans: atom_dim length {} must equal atom_basis length {k_atoms}",
+            atom_dim.len()
+        ));
+    }
+    if seed_shape[0] != k_atoms || seed_shape[1] != n_obs {
+        return Err(format!(
+            "sae_build_atom_plans: seed_coords must start with (K, N)=({k_atoms}, {n_obs}); got {:?}",
+            seed_shape
+        ));
+    }
     let mut plans: Vec<SaeAtomBuildPlan> = Vec::with_capacity(k_atoms);
     for atom_idx in 0..k_atoms {
         let kind = sae_atom_basis_kind_from_str(&atom_basis[atom_idx]);
         let d = atom_dim[atom_idx];
-        match kind {
+        if d == 0 {
+            return Err(format!(
+                "sae_build_atom_plans: atom_dim[{atom_idx}] must be positive"
+            ));
+        }
+        if d > seed_shape[2] {
+            return Err(format!(
+                "sae_build_atom_plans: atom_dim[{atom_idx}]={d} exceeds seed_coords D_max={}",
+                seed_shape[2]
+            ));
+        }
+        match &kind {
             SaeAtomBasisKind::Periodic => {
-                let n_harmonics = d.max(1);
+                let n_harmonics = d;
                 let basis_size = sae_periodic_basis_size(n_harmonics)?;
                 plans.push(SaeAtomBuildPlan {
                     kind: SaeAtomBasisKind::Periodic,
@@ -8977,32 +9001,39 @@ fn sae_build_atom_plans(
                     basis_size,
                 });
             }
-            _ => {
+            SaeAtomBasisKind::Duchon
+            | SaeAtomBasisKind::Sphere
+            | SaeAtomBasisKind::EuclideanPatch => {
                 let n_centers = n_obs.min(32).max(8.min(n_obs));
                 let idx = sae_pick_duchon_center_indices(
                     n_obs,
                     n_centers,
                     random_state.wrapping_add(atom_idx as u64),
                 );
-                let d_local = d.max(1);
-                let mut centers = Array2::<f64>::zeros((idx.len(), d_local));
+                let mut centers = Array2::<f64>::zeros((idx.len(), d));
                 for (out_row, src_row) in idx.iter().copied().enumerate() {
-                    for col in 0..d_local {
+                    for col in 0..d {
                         centers[[out_row, col]] = seed_coords[[atom_idx, src_row, col]];
                     }
                 }
                 // Probe one Duchon build to learn the final basis size.
-                let probe_pts = Array2::<f64>::zeros((1, d_local));
+                let probe_pts = Array2::<f64>::zeros((1, d));
                 let (phi, _jet, _penalty) =
                     sae_build_duchon_atom(probe_pts.view(), centers.view())?;
                 let basis_size = phi.ncols();
                 plans.push(SaeAtomBuildPlan {
-                    kind: kind.clone(),
+                    kind,
                     latent_dim: d,
                     n_harmonics: 0,
                     duchon_centers: Some(centers),
                     basis_size,
                 });
+            }
+            SaeAtomBasisKind::Precomputed(name) => {
+                return Err(format!(
+                    "sae_build_atom_plans: unsupported atom_basis {:?}; sae_manifold_fit_auto can build only periodic, duchon, sphere, or euclidean_patch atoms",
+                    name
+                ));
             }
         }
     }

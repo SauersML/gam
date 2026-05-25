@@ -2230,6 +2230,63 @@ mod tests {
         assert!(basis_delta > 1.0e-10);
     }
 
+    #[test]
+    fn sae_arrow_schur_beta_quadratic_model_matches_penalized_loss_change() {
+        let coords = array![[0.10], [0.35], [0.80]];
+        let (phi, jet) = periodic_basis(&coords);
+        let atom = SaeManifoldAtom::new(
+            "periodic",
+            SaeAtomBasisKind::Periodic,
+            1,
+            phi,
+            jet,
+            array![[0.65], [-0.45], [0.25]],
+            array![[3.0, 0.4, -0.2], [0.1, 2.5, 0.3], [-0.5, 0.2, 1.8]],
+        )
+        .unwrap();
+        let assignment = SaeAssignment::from_blocks_with_mode(
+            Array2::<f64>::zeros((3, 1)),
+            vec![coords],
+            AssignmentMode::softmax(0.7),
+        )
+        .unwrap();
+        let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
+        let target = array![[0.20], [-0.10], [0.45]];
+        let rho = SaeManifoldRho::new(0.0, 1.3_f64.ln(), vec![array![0.9_f64.ln()]]);
+        let sys = term
+            .assemble_arrow_schur(target.view(), &rho, None)
+            .unwrap();
+
+        let beta0 = term.flatten_beta();
+        let loss0 = term.loss(target.view(), &rho).unwrap().total();
+        let mut direction = sys.gb.mapv(|v| -v);
+        let direction_norm = direction.iter().map(|v| v * v).sum::<f64>().sqrt();
+        assert!(direction_norm > 1.0e-12);
+        for value in direction.iter_mut() {
+            *value /= direction_norm;
+        }
+
+        let epsilon = 1.0e-3;
+        let delta = direction.mapv(|v| epsilon * v);
+        let beta_trial = beta0 + &delta;
+        term.set_flat_beta(beta_trial.view()).unwrap();
+        let actual = term.loss(target.view(), &rho).unwrap().total() - loss0;
+
+        let linear = sys.gb.dot(&delta);
+        let mut quadratic = 0.0;
+        for row in 0..delta.len() {
+            for col in 0..delta.len() {
+                quadratic += 0.5 * delta[row] * sys.hbb[[row, col]] * delta[col];
+            }
+        }
+        let predicted = linear + quadratic;
+        let error = (actual - predicted).abs();
+        assert!(
+            error <= 1.0e-4,
+            "actual={actual:.12e}, predicted={predicted:.12e}, error={error:.12e}"
+        );
+    }
+
     #[derive(Debug)]
     struct TestPeriodicEvaluator;
 
