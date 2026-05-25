@@ -265,6 +265,7 @@ __all__ = [
     "AuxConditionalPriorPenalty",
     "BlockOrthogonalityPenalty",
     "BlockSparsityPenalty",
+    "GatedSAEDecoder",
     "IBPAssignmentPenalty",
     "IsometryPenalty",
     "IvaeRidgeMeanGauge",

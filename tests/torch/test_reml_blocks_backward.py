@@ -16,12 +16,14 @@ All inputs are float64. Tests are skipped (with reason) when the installed
 
 from __future__ import annotations
 
+import importlib
 import math
+from typing import Any, TypeAlias
 
-import pytest
-
+pytest: Any = importlib.import_module("pytest")
 gt = pytest.importorskip("gamfit.torch")
 torch = pytest.importorskip("torch")
+Tensor: TypeAlias = Any
 
 # Skip the whole module if the multi-block path isn't available.
 if not hasattr(gt, "gaussian_reml_fit_blocks"):
@@ -32,7 +34,7 @@ if not hasattr(gt, "gaussian_reml_fit_blocks"):
     )
 
 
-def _make_radial_basis(n: int, k: int, seed: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
+def _make_radial_basis(n: int, k: int, seed: int = 0) -> tuple[Tensor, Tensor]:
     """Build a smooth (N, K) design and a SPD (K, K) penalty for a Duchon-like
     radial basis: φ_{ij} = exp(-‖xᵢ − cⱼ‖²/2). Returns (X, P) with P = R^T R
     where R is the kernel Gram on centers (SPD by construction).
@@ -114,30 +116,30 @@ def test_A_f1_matches_single_smooth_forward_and_backward():
 
 def _build_three_block_setup(
     n: int = 50, k: int = 6, seed: int = 3,
-) -> tuple[list[torch.Tensor], list[torch.Tensor], torch.Tensor]:
-    designs: list[torch.Tensor] = []
-    penalties: list[torch.Tensor] = []
+) -> tuple[list[Tensor], list[Tensor], Tensor]:
+    designs: list[Tensor] = []
+    penalties: list[Tensor] = []
     for f in range(3):
         X, P = _make_radial_basis(n, k, seed=seed + f)
         designs.append(X)
         penalties.append(P)
     g = torch.Generator().manual_seed(seed + 100)
     coefs_true = [torch.randn(k, 1, generator=g, dtype=torch.float64) for _ in range(3)]
-    y = sum(d @ c for d, c in zip(designs, coefs_true)).squeeze(1)
+    y = torch.stack([d @ c for d, c in zip(designs, coefs_true)], dim=0).sum(dim=0).squeeze(1)
     y = y + 0.05 * torch.randn(n, generator=g, dtype=torch.float64)
     return designs, penalties, y
 
 
-def _scalar_loss(result) -> torch.Tensor:
+def _scalar_loss(result) -> Tensor:
     c0 = result.coefficients[0]
     c1 = result.coefficients[1]
     return c0.sum() + 0.5 * c1.pow(2).sum() + result.fitted.sum()
 
 
 def _fd_grad(
-    designs: list[torch.Tensor],
-    penalties: list[torch.Tensor],
-    y: torch.Tensor,
+    designs: list[Tensor],
+    penalties: list[Tensor],
+    y: Tensor,
     target: str,
     block: int,
     indices: list[tuple[int, ...]],
@@ -284,8 +286,8 @@ def test_C_gradcheck_on_blocks_fn():
     from gamfit.torch._reml import _GaussianRemlFitBlocksFn
 
     N, K, F = 30, 5, 3
-    designs: list[torch.Tensor] = []
-    penalties: list[torch.Tensor] = []
+    designs: list[Tensor] = []
+    penalties: list[Tensor] = []
     for f in range(F):
         X, P = _make_radial_basis(N, K, seed=11 + f)
         designs.append(X.clone().detach().requires_grad_(True))
@@ -325,8 +327,8 @@ def test_C_gradcheck_on_blocks_fn():
 def test_D_multioutput_D10_gradient_sanity():
     N, K, F = 50, 6, 3
     D = 10
-    designs: list[torch.Tensor] = []
-    penalties: list[torch.Tensor] = []
+    designs: list[Tensor] = []
+    penalties: list[Tensor] = []
     for f in range(F):
         X, P = _make_radial_basis(N, K, seed=21 + f)
         designs.append(X.clone().detach().requires_grad_(True))

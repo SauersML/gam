@@ -88,7 +88,6 @@ class _FakeRustModule:
 def test_ibp_driver_refreshes_basis_between_rust_steps(monkeypatch):
     fake = _FakeRustModule()
     monkeypatch.setattr(sae, "rust_module", lambda: fake)
-    assert callable(sae.rust_module().sae_manifold_fit_ibp)
     z = np.array([[0.0, 0.2], [0.3, -0.1], [0.8, 0.5], [1.1, 0.9]])
 
     fit = sae.sae_manifold_fit(

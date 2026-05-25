@@ -1,20 +1,4 @@
-"""Round-trip integration tests: fit → save → load → predict → compare.
-
-These tests guard the class of bug where the pyffi save path for a
-particular survival likelihood mode forgets to populate a field that
-load+predict needs. The bug class is invisible to fit-only and
-predict-only tests because the in-memory model carries the full state;
-only a roundtrip through disk exposes the omission.
-
-A regression here would catch e.g. the survival-marginal-slope payload
-omitting ``survival_time_basis`` / ``survival_time_anchor`` — the exact
-shape of the bug fixed in
-``crates/gam-pyffi`` commit fa7f7b6c. With that fix in place,
-``FittedModel::save_to_path`` runs ``validate_for_persistence`` before
-writing bytes, so a regression would fail at the ``model.save`` step
-rather than the ``gamfit.load`` step — either way, this test is the
-canary.
-"""
+"""Round-trip survival models through save, load, and predict."""
 
 from __future__ import annotations
 
@@ -34,11 +18,6 @@ import pandas as pd
 
 import gamfit
 
-
-# ── synthetic-data helpers ────────────────────────────────────────────
-# Mirror the fixtures used by tests/test_survival_api_regressions.py so
-# the roundtrip tests exercise the same shapes as the existing fit-only
-# tests, just with an added save+load+predict step.
 
 def make_weibull(n: int = 600, seed: int = 42) -> pd.DataFrame:
     rng = np.random.default_rng(seed)
@@ -67,9 +46,6 @@ def make_weibull(n: int = 600, seed: int = 42) -> pd.DataFrame:
 
 
 def prediction_rows() -> pd.DataFrame:
-    # entry > 0 so baseline targets that require positive ages (transformation
-    # / weibull) accept the rows; the default time grid for predict is built
-    # from these entry/exit columns.
     return pd.DataFrame(
         {
             "entry": [1.0, 1.0, 1.0],
@@ -83,15 +59,6 @@ def prediction_rows() -> pd.DataFrame:
 
 
 def _roundtrip_survival(model: Any, sample: pd.DataFrame) -> None:
-    """Save → load → predict → assert survival surface matches in-memory.
-
-    Compares the ``SurvivalPrediction.survival`` matrix (shape
-    ``(n_rows, n_grid_points)`` on gamfit's default time grid derived from
-    the prediction frame). The surface depends on every field the predict
-    path reads from the saved payload (time basis, anchor, baseline
-    target/parameters, link wiggle, …), so a missing field manifests as
-    either a load error or a numerical mismatch.
-    """
     pred_inmem = model.predict(sample)
     surv_inmem = np.asarray(pred_inmem.survival, dtype=float)
     assert surv_inmem.shape[0] == len(sample), surv_inmem.shape
@@ -113,8 +80,6 @@ def _roundtrip_survival(model: Any, sample: pd.DataFrame) -> None:
     np.testing.assert_allclose(surv_inmem, surv_disk, atol=1e-9, rtol=1e-9)
 
 
-# ── transformation + location-scale: run inline (cheap fits) ──────────
-
 def test_survival_transformation_save_load_predict_roundtrips() -> None:
     model = gamfit.fit(
         make_weibull(260),
@@ -133,48 +98,16 @@ def test_survival_location_scale_save_load_predict_roundtrips() -> None:
     _roundtrip_survival(model, prediction_rows())
 
 
-# ── marginal-slope: subprocess + time budget (matches the existing
-#   fit-only regression test pattern) ─────────────────────────────────
-
 def _marginal_slope_roundtrip_worker(result_queue: Any) -> None:
     try:
-        import numpy as _np
-        import tempfile as _tf
-        df = make_weibull(220)
         model = gamfit.fit(
-            df,
+            make_weibull(220),
             "Surv(entry, exit, event) ~ bmi + hba1c",
             survival_likelihood="marginal-slope",
             z_column="age",
             logslope_formula="bmi + hba1c",
         )
-        sample = prediction_rows()
-        pred_inmem = model.predict(sample)
-        surv_inmem = _np.asarray(pred_inmem.survival, dtype=float)
-
-        fd, tmp_path = _tf.mkstemp(suffix=".gamfit")
-        os.close(fd)
-        try:
-            model.save(tmp_path)
-            reloaded = gamfit.load(tmp_path)
-            pred_disk = reloaded.predict(sample)
-            surv_disk = _np.asarray(pred_disk.survival, dtype=float)
-        finally:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-
-        if not _np.allclose(surv_inmem, surv_disk, atol=1e-9, rtol=1e-9):
-            result_queue.put(
-                (
-                    "error",
-                    "RoundtripMismatch",
-                    "survival surface differs between in-memory and reloaded "
-                    "model",
-                )
-            )
-            return
+        _roundtrip_survival(model, prediction_rows())
     except BaseException as exc:  # pragma: no cover - child process reporting
         result_queue.put(("error", type(exc).__name__, str(exc)))
     else:
@@ -183,9 +116,7 @@ def _marginal_slope_roundtrip_worker(result_queue: Any) -> None:
 
 def test_survival_marginal_slope_save_load_predict_roundtrips() -> None:
     result_queue: mp.Queue = mp.Queue()
-    proc = mp.Process(
-        target=_marginal_slope_roundtrip_worker, args=(result_queue,)
-    )
+    proc = mp.Process(target=_marginal_slope_roundtrip_worker, args=(result_queue,))
     start = time.monotonic()
     proc.start()
     proc.join(60.0)

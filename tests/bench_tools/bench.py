@@ -11,13 +11,47 @@ import subprocess
 import sys
 import webbrowser
 from html import escape
+from importlib import util
 from pathlib import Path
+from typing import NotRequired, Protocol, TypedDict, cast
 
 import pandas as pd
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-sys.path.insert(0, str(SCRIPT_DIR))
-import mgcv
+
+
+class MgcvModule(Protocol):
+    N_SAMPLES_TRAIN: int
+    NOISE_BLEND_FACTOR: float
+
+    def generate_data(
+        self,
+        n_samples: int,
+        alpha: float,
+        linear_mode: bool = False,
+        noise_mode: bool = False,
+    ) -> pd.DataFrame: ...
+
+
+class ProfileSection(TypedDict):
+    tag: str
+    perf_data: Path
+    report: str
+    flame_svg: NotRequired[Path | None]
+
+
+def load_mgcv() -> MgcvModule:
+    module_path = SCRIPT_DIR / "mgcv.py"
+    spec = util.spec_from_file_location("bench_tools_mgcv", module_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Unable to load mgcv helper from {module_path}")
+
+    module = util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return cast(MgcvModule, module)
+
+
+mgcv = load_mgcv()
 
 
 WORKSPACE_ROOT = SCRIPT_DIR.parent.parent
@@ -69,7 +103,7 @@ def build_profiling_binary() -> None:
     run(["cargo", "build", "--profile", "profiling"])
 
 
-def profile_training(train_tsv: Path, tag: str) -> dict[str, object]:
+def profile_training(train_tsv: Path, tag: str) -> ProfileSection:
     perf_data = WORKDIR / f"perf_{tag}.data"
     cmd = [
         "perf",
@@ -127,7 +161,7 @@ def generate_flamegraph(perf_data: Path, tag: str) -> Path | None:
     return svg_path
 
 
-def write_report(section: dict[str, object]) -> Path:
+def write_report(section: ProfileSection) -> Path:
     html_path = WORKDIR / "report.html"
     flame_svg = section["flame_svg"]
 

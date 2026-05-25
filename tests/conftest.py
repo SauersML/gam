@@ -3,11 +3,21 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from importlib import import_module
 from math import erf, sqrt
+from typing import Protocol, TypeVar, cast
 
 import numpy as np
 import pandas as pd
-import pytest
+
+_Fixture = TypeVar("_Fixture", bound=Callable[..., object])
+
+
+class _Pytest(Protocol):
+    def fixture(self, fixture_function: _Fixture) -> _Fixture: ...
+
+
+pytest = cast(_Pytest, import_module("pytest"))
 
 SyntheticBiobankFactory = Callable[[int, int], pd.DataFrame]
 

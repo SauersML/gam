@@ -8,22 +8,22 @@ backward is consistent with finite differences taken through the forward.
 from __future__ import annotations
 
 from typing import cast
+from unittest import SkipTest
 
 import numpy as np
-import pytest
 
 try:
     import torch
     import gamfit.torch as gt
-except ImportError:
-    pytest.skip("torch dependency unavailable", allow_module_level=True)
+except ImportError as exc:
+    raise SkipTest("torch dependency unavailable") from exc
 
 
 def _require_ffi(name: str) -> None:
     from gamfit._binding import rust_module
 
     if not hasattr(rust_module(), name):
-        pytest.skip(f"engine missing FFI export `{name}`")
+        raise SkipTest(f"engine missing FFI export `{name}`")
 
 
 # Conservative tolerances: f64 throughout, but the underlying solves are
