@@ -82,6 +82,7 @@ use gam::terms::{
     IBPAssignmentPenalty as CoreIBPAssignmentPenalty, IsometryPenalty as CoreIsometryPenalty,
     IvaeRidgeMeanGauge as IvaeRidgeMeanGaugePenalty, JumpReLUPenalty as RustJumpReLUPenalty,
     MaternBasisGradientTarget, MechanismSparsityPenalty as CoreMechanismSparsityPenalty,
+    NestedPrefixPenalty as CoreNestedPrefixPenalty,
     NuclearNormPenalty as CoreNuclearNormPenalty, OrthogonalityPenalty as CoreOrthogonalityPenalty,
     ParametricRowPrecisionPriorPenalty, PenaltyConcavity, PenaltyTier, PsiSlice,
     RowPrecisionPriorPenalty, ScadMcpPenalty as CoreScadMcpPenalty, ScalarWeightSchedule,
