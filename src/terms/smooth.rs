@@ -6220,8 +6220,6 @@ fn build_term_collection_design_inner(
                     spec.random_effect_terms
                         .par_iter()
                         .map(|term| build_random_effect_block(data, term))
-                        .collect::<Vec<_>>()
-                        .into_iter()
                         .collect::<Result<Vec<_>, _>>()
                 },
                 || -> Result<Option<Array2<f64>>, BasisError> {
@@ -6241,8 +6239,6 @@ fn build_term_collection_design_inner(
                             }
                             Ok(data.column(linear.feature_col).to_owned())
                         })
-                        .collect::<Vec<_>>()
-                        .into_iter()
                         .collect::<Result<Vec<_>, _>>()?;
 
                     let mut out = Array2::<f64>::zeros((n, p_lin));

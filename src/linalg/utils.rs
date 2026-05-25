@@ -218,6 +218,113 @@ impl<'a> StableSolver<'a> {
         None
     }
 
+    /// Solve `matrix · δ = rhs` with a rank-revealing fallback for the
+    /// case where `matrix` has a near-null subspace aligned with `rhs`.
+    ///
+    /// First attempts the regularised Cholesky path
+    /// (`solvevectorwithridge_retries`). If the produced δ satisfies the
+    /// linear equation well (`‖matrix·δ − rhs‖∞ / (1 + ‖rhs‖∞) < rel_tol`),
+    /// returns it. Otherwise the matrix has a real null subspace and the
+    /// Tikhonov-regularised Newton step leaves a residual of magnitude
+    /// ≈ ‖rhs_null‖ — the joint-Newton convergence test then fails
+    /// (`linearized_rel ≈ 1`) and the seed is rejected.
+    ///
+    /// In that case we fall back to the truncated-eigendecomposition
+    /// pseudoinverse:
+    ///
+    ///     δ = Σ_k (uₖᵀ rhs / λₖ) · uₖ      for k with |λₖ| > cutoff
+    ///
+    /// where `(λₖ, uₖ)` are the eigenpairs of `matrix` (assumed symmetric).
+    /// Components in `null(matrix)` (i.e. |λₖ| ≤ cutoff) are *excluded* from
+    /// the sum. This is the unique minimum-norm least-squares solution to
+    /// `matrix · δ ≈ rhs`. For components of `rhs` in `range(matrix)`, δ
+    /// solves the equation exactly; for components in `null(matrix)`, δ has
+    /// zero contribution (no spurious huge step) and the joint-Newton's
+    /// constrained-stationary certificate sees a *correctly small*
+    /// projected residual.
+    ///
+    /// The cutoff is `rank_tol × max(|λ|)`, the standard rank-revealing
+    /// threshold. For p ≲ a few hundred (joint Newton at biobank scale
+    /// has p = 33) the eigendecomposition is sub-millisecond and saves
+    /// the entire outer optimisation from rejecting ill-conditioned ρ.
+    pub(crate) fn solve_with_pseudoinverse_fallback(
+        &self,
+        matrix: &Array2<f64>,
+        rhs: &Array1<f64>,
+        baseridge: f64,
+        rel_tol: f64,
+        rank_tol: f64,
+    ) -> Option<Array1<f64>> {
+        use crate::faer_ndarray::FaerEigh;
+        use faer::Side;
+
+        let p = matrix.nrows();
+        if matrix.ncols() != p || rhs.len() != p {
+            return None;
+        }
+
+        // First try the regularised Cholesky path.
+        let delta = self.solvevectorwithridge_retries(matrix, rhs, baseridge)?;
+
+        // Compute the linear residual ‖matrix·δ − rhs‖∞ / (1 + ‖rhs‖∞)
+        // — the same quantity the joint-Newton convergence test reads off as
+        // `linearized_next_kkt_inf` / (1 + `old_kkt_inf`).
+        let matrix_delta = matrix.dot(&delta);
+        let residual_inf = matrix_delta
+            .iter()
+            .zip(rhs.iter())
+            .map(|(h, r)| (h - r).abs())
+            .fold(0.0_f64, f64::max);
+        let rhs_inf = rhs.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+        let rel = residual_inf / (1.0 + rhs_inf);
+
+        if rel.is_finite() && rel < rel_tol {
+            return Some(delta);
+        }
+
+        // Rank-deficient. Use truncated eigendecomposition pseudoinverse.
+        let (eigvals, eigvecs) = matrix.eigh(Side::Lower).ok()?;
+        let max_abs_eig = eigvals.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+        if !max_abs_eig.is_finite() || max_abs_eig <= 0.0 {
+            return Some(delta);
+        }
+        let cutoff = rank_tol * max_abs_eig;
+
+        let mut pseudo = Array1::<f64>::zeros(p);
+        let mut excluded = 0usize;
+        for k in 0..p {
+            let lam = eigvals[k];
+            if !lam.is_finite() || lam.abs() <= cutoff {
+                excluded += 1;
+                continue;
+            }
+            let u_k = eigvecs.column(k);
+            let proj = u_k.iter().zip(rhs.iter()).map(|(u, r)| u * r).sum::<f64>();
+            let scale = proj / lam;
+            for i in 0..p {
+                pseudo[i] += scale * u_k[i];
+            }
+        }
+
+        if !pseudo.iter().all(|v| v.is_finite()) {
+            return Some(delta);
+        }
+
+        log::debug!(
+            "[{}] pseudoinverse fallback engaged: rel = {:.3e} > rel_tol = {:.3e}, \
+             excluded {} of {} eigenvalues below cutoff = {:.3e} × max |λ| = {:.3e}",
+            self.label,
+            rel,
+            rel_tol,
+            excluded,
+            p,
+            rank_tol,
+            max_abs_eig,
+        );
+
+        Some(pseudo)
+    }
+
     fn factorize_with_ridge_plan(
         &self,
         matrix: &Array2<f64>,
