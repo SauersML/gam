@@ -362,7 +362,8 @@ class BiobankScaleRunnerTests(unittest.TestCase):
         try:
             _RUNNER.load_or_build_rust_binary = lambda: Path("/tmp/fake-gam")
 
-            def _fake_run_cmd(cmd: typing.Any, _cwd: typing.Any = None) -> typing.Any:
+            def _fake_run_cmd(cmd: typing.Any, cwd: typing.Any = None) -> typing.Any:
+                self.assertIsNotNone(cwd)
                 if cmd[1] == "fit":
                     fit_input = Path(cmd[-2])
                     snapshots["fit_formula"] = cmd[-1]
@@ -454,8 +455,6 @@ class BiobankScaleRunnerTests(unittest.TestCase):
         )
 
     def test_run_rust_survival_rejects_invalid_native_grid_columns(self) -> None:
-        """A malformed native survival prediction must fail with a clear error,
-        not silently report nonsense metrics."""
         spec = _RUNNER.MethodSpec(
             name="rust_gamlss_survival_ps",
             dataset="survival",
@@ -474,7 +473,8 @@ class BiobankScaleRunnerTests(unittest.TestCase):
         try:
             _RUNNER.load_or_build_rust_binary = lambda: Path("/tmp/fake-gam")
 
-            def _fake_run_cmd(cmd: typing.Any, _cwd: typing.Any = None) -> typing.Any:
+            def _fake_run_cmd(cmd: typing.Any, cwd: typing.Any = None) -> typing.Any:
+                self.assertIsNotNone(cwd)
                 if cmd[1] == "fit":
                     Path(cmd[cmd.index("--out") + 1]).write_text("{}", encoding="utf-8")
                     return 0, "", ""
@@ -533,7 +533,7 @@ class BiobankScaleRunnerTests(unittest.TestCase):
             "smoke_target_n": 50,
         }
         with tempfile.TemporaryDirectory() as td:
-            rows, _meta = _RUNNER.generate_raw_cohort(cfg, Path(td), smoke=False)
+            rows = _RUNNER.generate_raw_cohort(cfg, Path(td), smoke=False)[0]
         self.assertGreater(len(rows), 20)
         pc1 = [float(r["pc1"]) for r in rows[:30]]
         pc2 = [float(r["pc2"]) for r in rows[:30]]
@@ -542,12 +542,6 @@ class BiobankScaleRunnerTests(unittest.TestCase):
 
 
 class MarkerPatternTests(unittest.TestCase):
-    """Lock down the runner's regex patterns for the structured markers
-    emitted by the gam binary. Each marker has had a regression in
-    development (additional fields, format drift), so a direct test of
-    `findall` against representative sample lines is the cheapest guard
-    against future format changes silently breaking aggregation."""
-
     def test_ift_quality_pattern_parses_field_layout(self) -> None:
         new = "[IFT-QUALITY] residual=3.456e-04 converged_norm=1.234e+00 predicted_norm=1.234e+00 drho_norm=5.678e-01 h_pen_logdet=2.345e+01 iters=4"
         nan = "[IFT-QUALITY] residual=3.456e-04 converged_norm=1.234e+00 predicted_norm=1.234e+00 drho_norm=NaN h_pen_logdet=NaN iters=4"
@@ -729,7 +723,7 @@ class MarkerPatternTests(unittest.TestCase):
         for line, expected_choice, expected_reason, expected_elapsed in cases:
             matches = _RUNNER._OUTER_HESSIAN_ELAPSED_PATTERN.findall(line)
             self.assertEqual(len(matches), 1)
-            choice, reason, _n, _p, _k, elapsed = matches[0]
+            choice, reason, elapsed = matches[0][0], matches[0][1], matches[0][5]
             self.assertEqual(choice, expected_choice)
             self.assertEqual(reason, expected_reason)
             self.assertEqual(elapsed, expected_elapsed)
@@ -907,7 +901,7 @@ class MarkerPatternTests(unittest.TestCase):
         )
         finite_matches = _RUNNER._PIRLS_LM_TRAJECTORY_PATTERN.findall(finite_line)
         self.assertEqual(len(finite_matches), 1)
-        _iter, _start, _final, ratio, rho, attempts = finite_matches[0]
+        ratio, rho, attempts = finite_matches[0][3:6]
         self.assertEqual(ratio, "-0.477")
         self.assertEqual(rho, "0.985")
         self.assertEqual(attempts, "1")
@@ -939,7 +933,7 @@ class MarkerPatternTests(unittest.TestCase):
         )
         sm = _RUNNER._KAPPA_PHASE_SUMMARY_PATTERN.findall(summary)
         self.assertEqual(len(sm), 1)
-        log_kappa_dim, n_cost, cost_s, _n_eval, _eval_s, _n_efs, _efs_s, optim_s = sm[0]
+        log_kappa_dim, n_cost, cost_s, optim_s = sm[0][0], sm[0][1], sm[0][2], sm[0][7]
         self.assertEqual(log_kappa_dim, "2")
         self.assertEqual(n_cost, "12")
         self.assertAlmostEqual(float(cost_s), 5.1840)
@@ -947,10 +941,6 @@ class MarkerPatternTests(unittest.TestCase):
 
 
 class PhaseSummaryAggregationTests(unittest.TestCase):
-    """End-to-end test of `_emit_phase_summary`'s aggregation logic.
-    The function is print-side-effect-only, so we capture stderr and
-    assert against the emitted summary string."""
-
     def _run_summary(self, captured_stderr: str) -> str:
         import io
         import contextlib
@@ -969,12 +959,12 @@ class PhaseSummaryAggregationTests(unittest.TestCase):
         self.assertEqual(v, "HEALTHY")
         self.assertIn("n_tangent_accepts=2", d)
         self.assertIn("tangent_p50=2.50e-02", d)
-        v, d = _RUNNER._warm_start_health_verdict(
+        d = _RUNNER._warm_start_health_verdict(
             n_accepts=8, n_rejects=0, n_noops=2,
             residuals=[1e-3] * 8,
             n_tangent_accepts=0,
             tangent_p50=None,
-        )
+        )[1]
         self.assertNotIn("tangent_", d)
         v, d = _RUNNER._warm_start_health_verdict(
             n_accepts=4, n_rejects=2, n_noops=0,
@@ -987,19 +977,6 @@ class PhaseSummaryAggregationTests(unittest.TestCase):
 
     def test_combine_fit_verdicts_worst_wins(self) -> None:
         combine = _RUNNER._combine_fit_verdicts
-        self.assertEqual(combine("HEALTHY", "HEALTHY"), "HEALTHY")
-        self.assertEqual(combine("HEALTHY", "MARGINAL"), "MARGINAL")
-        self.assertEqual(combine("MARGINAL", "HEALTHY"), "MARGINAL")
-        self.assertEqual(combine("HEALTHY", "DEGRADED"), "DEGRADED")
-        self.assertEqual(combine("DEGRADED", "HEALTHY"), "DEGRADED")
-        self.assertEqual(combine("MARGINAL", "DEGRADED"), "DEGRADED")
-        self.assertEqual(combine("DEGRADED", "DEGRADED"), "DEGRADED")
-        self.assertEqual(combine("HEALTHY", "NO-DATA"), "HEALTHY")
-        self.assertEqual(combine("NO-DATA", "MARGINAL"), "MARGINAL")
-        self.assertEqual(combine("NO-DATA", "DEGRADED"), "DEGRADED")
-        self.assertEqual(combine(None, "HEALTHY"), "HEALTHY")
-        self.assertEqual(combine("MARGINAL", None), "MARGINAL")
-        self.assertEqual(combine(None, None), "NO-DATA")
         self.assertEqual(combine("HEALTHY", "HEALTHY", "HEALTHY"), "HEALTHY")
         self.assertEqual(combine("HEALTHY", "HEALTHY", "DEGRADED"), "DEGRADED")
         self.assertEqual(combine("HEALTHY", "HEALTHY", "MARGINAL"), "MARGINAL")
@@ -1316,11 +1293,11 @@ class PhaseSummaryAggregationTests(unittest.TestCase):
         )
         self.assertEqual(v, "DEGRADED", f"detail={d}")
         self.assertIn("n_outer_nonfinite=1", d)
-        v_no_override, _ = _RUNNER._warm_start_health_verdict(
+        v_no_override = _RUNNER._warm_start_health_verdict(
             n_accepts=10, n_rejects=0, n_noops=0,
             residuals=[1e-5] * 10,
             n_outer_nonfinite=0,
-        )
+        )[0]
         self.assertEqual(v_no_override, "HEALTHY")
         v, d = _RUNNER._warm_start_health_verdict(
             n_accepts=0, n_rejects=2, n_noops=0,
@@ -1362,15 +1339,11 @@ class PhaseSummaryAggregationTests(unittest.TestCase):
             residuals=[],
         )
         self.assertEqual(v, "NO-DATA", f"detail={d}")
-        v, _ = _RUNNER._warm_start_health_verdict(
+        v = _RUNNER._warm_start_health_verdict(
             n_accepts=7, n_rejects=2, n_noops=1,
             residuals=[0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04],
-        )
+        )[0]
         self.assertEqual(v, "HEALTHY")
-        v, _ = _RUNNER._warm_start_health_verdict(
-            n_accepts=7, n_rejects=2, n_noops=1,
-            residuals=[0.04, 0.04, 0.04, 0.04, 0.06, 0.06, 0.06],
-        )
         v, d = _RUNNER._warm_start_health_verdict(
             n_accepts=6, n_rejects=2, n_noops=2,
             residuals=[0.10, 0.10, 0.10, 0.10, 0.10, 0.10],

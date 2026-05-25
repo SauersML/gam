@@ -657,6 +657,162 @@ def _coerce_matrix(value: Any) -> Any | None:
     return arr
 
 
+def shape_prediction_response(
+    parsed: dict[str, Any],
+    *,
+    headers: list[str],
+    rows: list[list[str]],
+    table_kind: str | None,
+    training_table_kind: str | None,
+    fallback_model_class: str,
+    interval: float | None,
+    return_type: str | None,
+    id_column: str | None,
+    row_ids: list[str] | None,
+    restore: Any,
+) -> Any:
+    """Convert a ``predict_table`` payload into the public return shape."""
+    import numpy as np
+
+    if parsed.get("class") == "survival_prediction":
+        return survival_prediction_from_ffi_payload(
+            parsed, id_column=id_column, row_ids=row_ids
+        )
+    if parsed.get("class") == "competing_risks_prediction":
+        return competing_risks_prediction_from_ffi_payload(parsed)
+
+    columns = ordered_prediction_columns(parsed["columns"])
+    model_class = str(parsed.get("model_class") or fallback_model_class)
+
+    if model_class in _TRANSFORMATION_NORMAL_MODEL_CLASSES:
+        z = np.asarray(transformation_normal_z(columns), dtype=float)
+        if id_column is None and return_type is None:
+            return z
+        out_columns: dict[str, list[Any]] = {"z": z.tolist()}
+        if id_column is not None:
+            out_columns = {id_column: list(row_ids or []), **out_columns}
+        return restore(
+            out_columns,
+            requested=return_type,
+            input_kind=table_kind,
+            training_kind=training_table_kind,
+        )
+
+    if model_class == "bernoulli marginal-slope":
+        probs = np.clip(np.asarray(columns.get("mean", []), dtype=float), 0.0, 1.0)
+        if id_column is None and return_type is None:
+            return probs
+        out_columns = {"mean": probs.tolist()}
+        if id_column is not None:
+            out_columns = {id_column: list(row_ids or []), **out_columns}
+        return restore(
+            out_columns,
+            requested=return_type,
+            input_kind=table_kind,
+            training_kind=training_table_kind,
+        )
+
+    if model_class in _SURVIVAL_MODEL_CLASSES:
+        return survival_prediction_from_columns(
+            model_class, columns, id_column=id_column, row_ids=row_ids
+        )
+
+    out_columns_any: dict[str, list[Any]] = dict(columns)
+    if id_column is not None:
+        out_columns_any = {id_column: list(row_ids or []), **out_columns_any}
+    return restore(
+        out_columns_any,
+        requested=return_type,
+        input_kind=table_kind,
+        training_kind=training_table_kind,
+    )
+
+
+def default_survival_time_grid(
+    model_class: str,
+    formula: str,
+    headers: list[str],
+    rows: list[list[str]],
+) -> list[float] | None:
+    """Default uniform time grid spanning the survival window of ``rows``."""
+    import numpy as np
+    import re
+
+    if model_class not in _SURVIVAL_TIME_GRID_MODEL_CLASSES:
+        return None
+    match = re.match(
+        r"\s*Surv\s*\(\s*([^\s,]+)\s*,\s*([^\s,]+)\s*,\s*[^\s,]+\s*\)", formula
+    )
+    if not match:
+        return None
+    entry_name, exit_name = match.group(1), match.group(2)
+    header_to_index = {name: i for i, name in enumerate(headers)}
+    entry_idx = header_to_index.get(entry_name)
+    exit_idx = header_to_index.get(exit_name)
+    if entry_idx is None or exit_idx is None:
+        missing = [
+            name
+            for name, idx in ((entry_name, entry_idx), (exit_name, exit_idx))
+            if idx is None
+        ]
+        raise ValueError(
+            "survival prediction data is missing required time column(s): "
+            + ", ".join(missing)
+        )
+    entry_vals: list[float] = []
+    exit_vals: list[float] = []
+    for row_index, row in enumerate(rows):
+        try:
+            entry_vals.append(float(row[entry_idx]))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"survival entry column {entry_name!r} has a non-numeric value "
+                f"at row {row_index + 1}: {row[entry_idx]!r}"
+            ) from exc
+        try:
+            exit_vals.append(float(row[exit_idx]))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"survival exit column {exit_name!r} has a non-numeric value "
+                f"at row {row_index + 1}: {row[exit_idx]!r}"
+            ) from exc
+    if not entry_vals or not exit_vals:
+        return None
+    lo = float(np.min(entry_vals))
+    hi = float(np.max(exit_vals))
+    if not np.isfinite(lo) or not np.isfinite(hi):
+        raise ValueError("survival time columns must contain only finite values")
+    if hi <= lo:
+        raise ValueError(
+            f"survival exit times must extend beyond entry times; got min entry {lo} and max exit {hi}"
+        )
+    span = hi - lo
+    hi_padded = hi + max(span * 1e-6, 1e-9)
+    return list(np.linspace(lo, hi_padded, 64))
+
+
+def term_blocks_from_state(state: dict[str, Any]) -> tuple[TermBlock, ...]:
+    """Parse ``coefficient_state_json``'s ``term_blocks`` into :class:`TermBlock`."""
+    raw_blocks = state.get("term_blocks")
+    if not isinstance(raw_blocks, list):
+        raise ValueError("coefficient state payload is missing term_blocks")
+    blocks: list[TermBlock] = []
+    for idx, raw_block in enumerate(raw_blocks):
+        if not isinstance(raw_block, dict):
+            raise ValueError(f"term block {idx} must be an object")
+        try:
+            name = str(raw_block["name"])
+            kind = str(raw_block["kind"])
+            start = int(raw_block["start"])
+            end = int(raw_block["end"])
+        except KeyError as exc:
+            raise ValueError(f"term block {idx} is missing {exc.args[0]!r}") from exc
+        if start < 0 or end < start:
+            raise ValueError(f"term block {idx} has invalid range [{start}, {end})")
+        blocks.append(TermBlock(name=name, kind=kind, start=start, end=end))
+    return tuple(blocks)
+
+
 def _interpolate_rows(
     grid: Any,
     surface: Any,
