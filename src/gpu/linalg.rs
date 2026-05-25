@@ -117,23 +117,18 @@ pub fn try_fast_ab_broadcast_b_batched(
     a: ArrayView3<'_, f64>,
     b: ArrayView2<'_, f64>,
 ) -> Option<Array3<f64>> {
-    let (_batch, _m, k) = a.dim();
-    let (bk, _n) = b.dim();
-    if k != bk {
+    let (batch, m, k) = a.dim();
+    let (bk, n) = b.dim();
+    if k != bk || batch == 0 || m == 0 || n == 0 {
         return None;
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(all(feature = "cuda", target_os = "linux")))]
     {
         return None;
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(all(feature = "cuda", target_os = "linux"))]
     {
-        let runtime = route_through_gpu(DispatchOp::BatchedGemm {
-            batch: _batch,
-            m: _m,
-            n: _n,
-            k,
-        })?;
+        let runtime = route_through_gpu(DispatchOp::BatchedGemm { batch, m, n, k })?;
         cuda_backend::gemm_broadcast_b_batched(runtime, a, b)
     }
 }
@@ -144,23 +139,18 @@ pub fn try_fast_abt_strided_batched(
     a: ArrayView3<'_, f64>,
     b: ArrayView3<'_, f64>,
 ) -> Option<Array3<f64>> {
-    let (_batch, _m, k) = a.dim();
-    let (batch_b, _n, k_b) = b.dim();
-    if _batch != batch_b || k != k_b {
+    let (batch, m, k) = a.dim();
+    let (batch_b, n, k_b) = b.dim();
+    if batch != batch_b || k != k_b || batch == 0 || m == 0 || n == 0 {
         return None;
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(all(feature = "cuda", target_os = "linux")))]
     {
         return None;
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(all(feature = "cuda", target_os = "linux"))]
     {
-        let runtime = route_through_gpu(DispatchOp::BatchedGemm {
-            batch: _batch,
-            m: _m,
-            n: _n,
-            k,
-        })?;
+        let runtime = route_through_gpu(DispatchOp::BatchedGemm { batch, m, n, k })?;
         cuda_backend::gemm_abt_strided_batched(runtime, a, b)
     }
 }
@@ -199,11 +189,11 @@ pub fn try_fast_ab(a: ArrayView2<'_, f64>, b: ArrayView2<'_, f64>) -> Option<Arr
         gpu_ms: if used_gpu { Some(0.0) } else { None },
         ..Default::default()
     });
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(all(feature = "cuda", target_os = "linux")))]
     {
         None
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(all(feature = "cuda", target_os = "linux"))]
     {
         let runtime = runtime?;
         cuda_backend::gemm(runtime, a, b, false, false)
@@ -215,14 +205,14 @@ pub fn try_fast_ab(a: ArrayView2<'_, f64>, b: ArrayView2<'_, f64>) -> Option<Arr
 pub fn try_fast_atb(a: ArrayView2<'_, f64>, b: ArrayView2<'_, f64>) -> Option<Array2<f64>> {
     let (n_a, _p) = a.dim();
     let (n_b, _q) = b.dim();
-    if n_a != n_b {
+    if n_a != n_b || p == 0 || q == 0 {
         return None;
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(all(feature = "cuda", target_os = "linux")))]
     {
         return None;
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(all(feature = "cuda", target_os = "linux"))]
     {
         let runtime = route_through_gpu(DispatchOp::Gemm {
             m: _p,
@@ -236,17 +226,17 @@ pub fn try_fast_atb(a: ArrayView2<'_, f64>, b: ArrayView2<'_, f64>) -> Option<Ar
 #[inline]
 #[must_use]
 pub fn try_fast_av(a: ArrayView2<'_, f64>, v: ArrayView1<'_, f64>) -> Option<Array1<f64>> {
-    let (_m, k) = a.dim();
-    if k != v.len() {
+    let (m, k) = a.dim();
+    if k != v.len() || m == 0 || k == 0 {
         return None;
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(all(feature = "cuda", target_os = "linux")))]
     {
         return None;
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(all(feature = "cuda", target_os = "linux"))]
     {
-        let runtime = route_through_gpu(DispatchOp::Gemv { m: _m, k })?;
+        let runtime = route_through_gpu(DispatchOp::Gemv { m, k })?;
         cuda_backend::gemv(runtime, a, v, false)
     }
 }
@@ -255,14 +245,14 @@ pub fn try_fast_av(a: ArrayView2<'_, f64>, v: ArrayView1<'_, f64>) -> Option<Arr
 #[must_use]
 pub fn try_fast_atv(a: ArrayView2<'_, f64>, v: ArrayView1<'_, f64>) -> Option<Array1<f64>> {
     let (n, _p) = a.dim();
-    if n != v.len() {
+    if n != v.len() || n == 0 || p == 0 {
         return None;
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(all(feature = "cuda", target_os = "linux")))]
     {
         return None;
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(all(feature = "cuda", target_os = "linux"))]
     {
         let runtime = route_through_gpu(DispatchOp::Gemv { m: _p, k: n })?;
         cuda_backend::gemv(runtime, a, v, true)
@@ -273,14 +263,14 @@ pub fn try_fast_atv(a: ArrayView2<'_, f64>, v: ArrayView1<'_, f64>) -> Option<Ar
 #[must_use]
 pub fn try_fast_xt_diag_x(x: ArrayView2<'_, f64>, w: ArrayView1<'_, f64>) -> Option<Array2<f64>> {
     let (n, _p) = x.dim();
-    if n != w.len() {
+    if n != w.len() || n == 0 || p == 0 {
         return None;
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(all(feature = "cuda", target_os = "linux")))]
     {
         return None;
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(all(feature = "cuda", target_os = "linux"))]
     {
         let runtime = route_through_gpu(DispatchOp::XtDiagX { n, p: _p })?;
         cuda_backend::xt_diag_x(runtime, x, w)
@@ -296,14 +286,14 @@ pub fn try_fast_xt_diag_y(
 ) -> Option<Array2<f64>> {
     let (n, _px) = x.dim();
     let (n_y, _q) = y.dim();
-    if n != n_y || n != w.len() {
+    if n != n_y || n != w.len() || n == 0 || px == 0 || q == 0 {
         return None;
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(all(feature = "cuda", target_os = "linux")))]
     {
         return None;
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(all(feature = "cuda", target_os = "linux"))]
     {
         let runtime = route_through_gpu(DispatchOp::XtDiagY { n, px: _px, q: _q })?;
         cuda_backend::xt_diag_y(runtime, x, w, y)
@@ -319,21 +309,21 @@ pub fn try_fast_joint_hessian_2x2(
     w_ab: ArrayView1<'_, f64>,
     w_bb: ArrayView1<'_, f64>,
 ) -> Option<Array2<f64>> {
-    let (n, _pa) = x_a.dim();
-    let (n_b, _pb) = x_b.dim();
-    if n != n_b || n != w_aa.len() || n != w_ab.len() || n != w_bb.len() {
+    let (n, pa) = x_a.dim();
+    let (n_b, pb) = x_b.dim();
+    if n != n_b || n != w_aa.len() || n != w_ab.len() || n != w_bb.len() || pa + pb == 0 {
         return None;
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(all(feature = "cuda", target_os = "linux")))]
     {
         return None;
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(all(feature = "cuda", target_os = "linux"))]
     {
         let runtime = route_through_gpu(DispatchOp::JointHessian2x2 {
             n,
-            pa: _pa,
-            pb: _pb,
+            pa,
+            pb,
         })?;
         cuda_backend::joint_hessian_2x2(runtime, x_a, x_b, w_aa, w_ab, w_bb)
     }
@@ -364,11 +354,11 @@ pub fn try_cholesky_lower_inplace(a: &mut Array2<f64>) -> Option<()> {
     if p != a.ncols() {
         return None;
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(all(feature = "cuda", target_os = "linux")))]
     {
         return None;
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(all(feature = "cuda", target_os = "linux"))]
     {
         let runtime = route_through_gpu(DispatchOp::Potrf { p, batch: 1 })?;
         let lower = cuda_backend::cholesky_lower(runtime, a.view())?;
@@ -385,11 +375,11 @@ pub fn try_cholesky_batched_lower_inplace(matrices: &mut [Array2<f64>]) -> Optio
     if p == 0 || first.ncols() != p || matrices.iter().any(|matrix| matrix.dim() != (p, p)) {
         return None;
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(all(feature = "cuda", target_os = "linux")))]
     {
         return None;
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(all(feature = "cuda", target_os = "linux"))]
     {
         let runtime = route_through_gpu(DispatchOp::Potrf {
             p,
@@ -405,17 +395,17 @@ pub fn try_solve_lower_triangular_matrix(
     lower: ArrayView2<'_, f64>,
     rhs: ArrayView2<'_, f64>,
 ) -> Option<Array2<f64>> {
-    let (m, _n) = rhs.dim();
-    if lower.nrows() != m {
+    let (m, n) = rhs.dim();
+    if m == 0 || n == 0 || lower.nrows() != m {
         return None;
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(all(feature = "cuda", target_os = "linux")))]
     {
         return None;
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(all(feature = "cuda", target_os = "linux"))]
     {
-        let runtime = route_through_gpu(DispatchOp::Trsm { m, n: _n })?;
+        let runtime = route_through_gpu(DispatchOp::Trsm { m, n })?;
         cuda_backend::trsm(runtime, lower, rhs, false)
     }
 }
@@ -426,17 +416,17 @@ pub fn try_solve_upper_triangular_matrix(
     upper: ArrayView2<'_, f64>,
     rhs: ArrayView2<'_, f64>,
 ) -> Option<Array2<f64>> {
-    let (m, _n) = rhs.dim();
-    if upper.nrows() != m {
+    let (m, n) = rhs.dim();
+    if m == 0 || n == 0 || upper.nrows() != m {
         return None;
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(all(feature = "cuda", target_os = "linux")))]
     {
         return None;
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(all(feature = "cuda", target_os = "linux"))]
     {
-        let runtime = route_through_gpu(DispatchOp::Trsm { m, n: _n })?;
+        let runtime = route_through_gpu(DispatchOp::Trsm { m, n })?;
         cuda_backend::trsm(runtime, upper, rhs, true)
     }
 }
@@ -446,7 +436,7 @@ pub fn try_solve_upper_triangular_matrix(
 // delegating to cudarc-backed BLAS, solver, and custom kernel implementations.
 // ---------------------------------------------------------------------------
 
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "cuda", target_os = "linux"))]
 mod cuda_backend {
     //! CUDA-backed implementations of the dispatch entry points.
     //!
