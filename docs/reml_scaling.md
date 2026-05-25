@@ -76,7 +76,7 @@ result = gamfit.torch.fit(
 )
 recon = result.fitted + b_dec    # (B, D)
 loss = ((recon - x) ** 2).mean()
-loss.backward()                  # autograd flows back to encoder
+loss.backward()                  # gradient flows through TopK amplitudes
 ```
 
 Autograd is preserved through every per-atom REML's analytic VJP to the

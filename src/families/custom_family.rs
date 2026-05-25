@@ -13392,16 +13392,18 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
     // call returns Err / +∞, BFGS κ-optim backs off the divergent ρ
     // region, and the outer loop progresses instead of grinding.
 
-    // Per-block trust-region radius in β-space. Updated each cycle by
-    // `update_joint_trust_region_radius` (the same function the
-    // joint-Newton path uses) on a real model-vs-truth rho computed
-    // from each block's penalized quadratic. The η-overflow safety
-    // half of the previous static `MAX_NEWTON_STEP = 20.0` is owned by
-    // the family's `max_feasible_step_size` barrier check, called by
-    // the line search below; this variable handles only the
-    // algorithmic trust-region half. The initial seed value is the
-    // family-declared safe step for a fresh fit; the function then
-    // adapts it freely (clamped to [1e-12, 1e6] by the function
+    // Per-block trust-region radius in the block's penalized-Hessian metric.
+    // Updated each cycle by `update_joint_trust_region_radius` (the same
+    // function the joint-Newton path uses) on a real model-vs-truth rho
+    // computed from each block's penalized quadratic. Using the curvature
+    // metric here avoids the same starvation mechanism fixed in the joint
+    // path: one near-null coordinate in a block must not raw-rescale every
+    // other coordinate in that block. The η-overflow safety half of the
+    // previous static `MAX_NEWTON_STEP = 20.0` is owned by the family's
+    // `max_feasible_step_size` barrier check, called by the line search below;
+    // this variable handles only the algorithmic trust-region half. The
+    // initial seed value is the family-declared safe step for a fresh fit; the
+    // function then adapts it freely (clamped to [1e-12, 1e6] by the function
     // itself, same as the joint path).
     const BLOCK_NEWTON_STEP_INITIAL: f64 = 20.0;
     let mut block_max_step: Vec<f64> = vec![BLOCK_NEWTON_STEP_INITIAL; specs.len()];
@@ -13420,10 +13422,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
     // and require that `step_clamped` was observed AT LEAST ONCE inside
     // the frozen run (rather than EVERY cycle).
     let mut clamped_step_in_frozen_run: bool = false;
-    // Mirrors the `MAX_NEWTON_STEP` const used by the inner ExactNewton
-    // path lower in this function. Hoisted here so the divergence check
-    // does not need to reach into a nested scope.
-    const NEWTON_STEP_CAP_FOR_DIVERGENCE: f64 = 20.0;
     const DIVERGENCE_FROZEN_LOGLIK_CYCLES: usize = 8;
 
     let is_dynamic = family.block_geometry_is_dynamic();
@@ -13442,6 +13440,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         );
         let mut max_proposed_beta_step = 0.0_f64;
         let mut max_accepted_beta_step = 0.0_f64;
+        let mut trust_boundary_hit_in_cycle = false;
 
         let mut objective_cycle_prev = lastobjective;
         // Reuse cached evaluation from end of previous cycle (or initial eval).
@@ -13503,23 +13502,23 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             let beta_new = family.post_update_block_beta(&states, b, spec, beta_new_raw)?;
             let beta_old = states[b].beta.clone();
             let raw_delta = &beta_new - &beta_old;
-            // Per-block trust-region radius in β-space. The cap is the
-            // current value of `block_max_step[b]`, updated below via
-            // `update_joint_trust_region_radius` (the same function the
-            // joint-Newton path uses) once we know rho. No hand-rolled
-            // step-sizing logic here.
+            // Per-block trust-region radius in the block's local
+            // penalized-Hessian metric. The cap is the current value of
+            // `block_max_step[b]`, updated below via
+            // `update_joint_trust_region_radius` once we know rho.
             let block_cap = block_max_step[b];
-            let raw_step_inf = raw_delta
-                .iter()
-                .copied()
-                .map(f64::abs)
-                .fold(0.0_f64, f64::max);
-            let delta = if raw_step_inf > block_cap {
-                &raw_delta * (block_cap / raw_step_inf)
-            } else {
-                raw_delta
-            };
-            let step_inf = raw_step_inf.min(block_cap);
+            let (delta, step_metric_norm) = truncate_block_step_to_metric_radius(
+                spec,
+                work,
+                s_lambda,
+                raw_delta,
+                block_cap,
+                ridge,
+                options.ridge_policy,
+            );
+            let step_hit_trust_boundary =
+                joint_block_step_hit_trust_boundary(step_metric_norm, block_cap);
+            trust_boundary_hit_in_cycle |= step_hit_trust_boundary;
             // Capture the objective at the start of this block update so
             // we can compute the true `actual_reduction` once the line
             // search has finished. `objective_cycle_prev` is the running
@@ -13528,9 +13527,9 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             let obj_before_block = objective_cycle_prev;
             let old_block_penalty =
                 block_quadratic_penalty(&beta_old, s_lambda, ridge, options.ridge_policy);
-            let step = delta.iter().copied().map(f64::abs).fold(0.0, f64::max);
-            max_proposed_beta_step = max_proposed_beta_step.max(step);
-            if step <= inner_tol {
+            let step_beta_inf = delta.iter().copied().map(f64::abs).fold(0.0, f64::max);
+            max_proposed_beta_step = max_proposed_beta_step.max(step_beta_inf);
+            if step_beta_inf <= inner_tol {
                 continue;
             }
 
@@ -13618,39 +13617,50 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 0.0
             };
             let (rhs_block, hpen_delta_full): (Array1<f64>, Array1<f64>) = match work {
-                BlockWorkingSet::ExactNewton { gradient, hessian } => {
+                BlockWorkingSet::ExactNewton { gradient, .. } => {
                     let mut rhs = gradient - &s_lambda.dot(&beta_old);
-                    let mut hpen = hessian.dot(&delta);
-                    hpen += &s_lambda.dot(&delta);
                     if options.ridge_policy.include_quadratic_penalty && ridge > 0.0 {
                         rhs.scaled_add(-ridge, &beta_old);
-                        hpen.scaled_add(ridge, &delta);
                     }
+                    let hpen = block_penalized_hessian_vector(
+                        spec,
+                        work,
+                        s_lambda,
+                        &delta,
+                        ridge,
+                        options.ridge_policy,
+                    );
                     (rhs, hpen)
                 }
                 BlockWorkingSet::Diagonal {
                     working_response,
-                    working_weights,
+                    ..
                 } => {
                     // IRLS local-quadratic gradient and Hessian:
                     //   rhs = X^T W (z − Xβ) − Sβ
                     //   H_pen δ = X^T W X δ + Sδ
                     let xb = spec.design.matrixvectormultiply(&beta_old);
                     let resid = working_response - &xb;
+                    let working_weights = match work {
+                        BlockWorkingSet::Diagonal {
+                            working_weights, ..
+                        } => working_weights,
+                        BlockWorkingSet::ExactNewton { .. } => unreachable!(),
+                    };
                     let w_resid = &resid * working_weights;
                     let mut rhs = spec.design.transpose_vector_multiply(&w_resid);
                     rhs -= &s_lambda.dot(&beta_old);
-                    let xd_local: Array1<f64> = match &x_delta {
-                        Some(xd) => xd.clone(),
-                        None => spec.design.matrixvectormultiply(&delta),
-                    };
-                    let wxd = &xd_local * working_weights;
-                    let mut hpen = spec.design.transpose_vector_multiply(&wxd);
-                    hpen += &s_lambda.dot(&delta);
                     if options.ridge_policy.include_quadratic_penalty && ridge > 0.0 {
                         rhs.scaled_add(-ridge, &beta_old);
-                        hpen.scaled_add(ridge, &delta);
                     }
+                    let hpen = block_penalized_hessian_vector(
+                        spec,
+                        work,
+                        s_lambda,
+                        &delta,
+                        ridge,
+                        options.ridge_policy,
+                    );
                     (rhs, hpen)
                 }
             };
@@ -13661,7 +13671,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             let actual_reduction = obj_before_block - objective_cycle_prev;
             let trust_update = update_joint_trust_region_radius(
                 block_max_step[b],
-                alpha_accepted * step_inf,
+                alpha_accepted * step_metric_norm,
                 actual_reduction,
                 predicted_reduction,
                 obj_before_block,

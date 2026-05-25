@@ -149,13 +149,11 @@ anchor value).
 y ~ s(x, bc=clamped)                       # zero slope at both endpoints
 y ~ s(x, bc_left=clamped)                  # zero slope at the start, free at end
 y ~ s(x, bc_left=anchored, anchor_left=0)  # endpoint value pinned to 0
-y ~ s(x, start_bc=clamped, end_bc=anchored, end_anchor=0)
+y ~ s(x, start_bc=clamped, end_bc=anchored, anchor_right=0)
 ```
 
-`bc(x)` (aliases `boundary(x)`, `boundary_conditioned(x)`) is sugar for
-`s(x, bc=clamped)`; if any anchor option is set, it defaults to
-`bc=anchored`. Per-side overrides are read directly by the smooth
-builder.
+Use `s(x, bc=clamped)` for the boundary-conditioned form. Per-side
+overrides are read directly by the smooth builder.
 
 ## Multivariate smooths
 
@@ -178,9 +176,9 @@ Radial-basis surface smooth with thin-plate kernel.
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `centers` (`k`, `basis_dim`) | auto | Number of radial centres. |
-| `length_scale` | auto (data-derived) | Global length-scale init. |
+| `length_scale` | `1.0` | Global length-scale init. |
 | `double_penalty` | `true` | Ridge + main penalty. |
-| `scale_dims` | `false` | Per-axis input standardisation. |
+| `scale_dims` | `false` | Derivative-planning hint; inputs are automatically standardized. |
 | `include_intercept` | `false` | Append a constant column. |
 | `by`, `identifiability` | — | See common options above. |
 
@@ -191,7 +189,7 @@ Radial basis with Matérn covariance kernel.
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `centers` (`k`, `basis_dim`) | auto | Number of centres. |
-| `length_scale` | auto | Global length-scale init. |
+| `length_scale` | `1.0` | Global length-scale init. |
 | `nu` | `5/2` | Smoothness, one of `1/2`, `3/2`, `5/2`, `7/2`, `9/2`. |
 | `include_intercept` | `false` | Append a constant column. |
 | `double_penalty` | `true` | Ridge + main penalty. |
@@ -208,8 +206,8 @@ stiffness). Scale-free unless `length_scale` is given.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `order` (`nullspace_order`) | auto | Polynomial nullspace order `p`. Polynomial block has `C(d + p, d)` columns (`p=0` → constant only, `p=1` (Linear) → `d+1` columns, `p=2` → `(d+1)(d+2)/2`). |
-| `power` (`p`) | auto | Riesz fractional smoothness `s`. Auto-resolved against `d` and the active operator penalties. |
+| `order` | `0`, auto-escalated when required | Polynomial nullspace order `p`. Polynomial block has `C(d + p, d)` columns (`p=0` → constant only, `p=1` (Linear) → `d+1` columns, `p=2` → `(d+1)(d+2)/2`). |
+| `power` | auto | Riesz fractional smoothness `s`. Auto-resolved against `d` and the active operator penalties. |
 | `centers` (`k`, `basis_dim`) | auto | Number of centres. |
 | `length_scale` | none (scale-free) | Optional global scale. Without it, the kernel is pure polyharmonic; with it, the kernel is the hybrid Duchon-Matérn (κ = 1/length_scale). |
 | `scale_dims` | `false` | Per-axis contrasts. |
@@ -219,18 +217,23 @@ stiffness). Scale-free unless `length_scale` is given.
 (mass, tension, stiffness) each get their own smoothing parameter
 under REML.
 
-### Sphere (`sphere`, `s2`, `sos`) {#intrinsic-s2-sphere-smooth}
+### Sphere (`sphere`, `sos`, `spherical`) {#intrinsic-s2-sphere-smooth}
 
-Intrinsic S² smooth for latitude/longitude data on a sphere. The implementation
-uses real spherical harmonics through degree `L`, drops the global constant so
+Intrinsic S² smooth for latitude/longitude data on a sphere. The default
+implementation uses Wahba/Sobolev spherical spline kernels with radial centers.
+Set `method=harmonic` (or `kernel=harmonic`) for the real spherical-harmonic
+engine, which uses harmonics through degree `L`, drops the global constant so
 the ordinary model intercept remains identifiable, and applies a diagonal
-curvature penalty proportional to `[l(l+1)]²` by harmonic degree. This makes the
-longitude seam periodic and removes artificial boundary conditions at the poles.
+curvature penalty proportional to `[l(l+1)]²` by harmonic degree. Both methods
+make the longitude seam periodic and remove artificial boundary conditions at
+the poles.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `degree` / `max_degree` | auto | Maximum spherical harmonic degree `L`; basis width is `L(L+2)`. |
-| `k` / `basis_dim` | auto | Alternative target basis dimension; resolved to the smallest `L` with `L(L+2) >= k`. |
+| `kernel` / `method` | `sobolev` | `sobolev`/`wahba`, `pseudo`/`mgcv`/`sos`, or `harmonic`/`spherical_harmonic`/`spherical-harmonic`. |
+| `centers` / `k` / `basis_dim` | auto | Number of Wahba radial centers. For `method=harmonic`, `k` is instead resolved to the smallest `L` with `L(L+2) >= k`. |
+| `degree` / `max_degree` | auto | Harmonic-only maximum spherical harmonic degree `L`; basis width is `L(L+2)`. |
+| `penalty_order` / `m` | `2` | Wahba penalty order. |
 | `radians` | `false` | Treat latitude/longitude as radians instead of degrees. |
 | `units` | `degrees` | Set `units=radians` as an alias for `radians=true`. |
 | `double_penalty` | `true` | Add a ridge penalty alongside the curvature penalty. |
