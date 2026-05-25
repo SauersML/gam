@@ -16,6 +16,7 @@ pub mod reml_compare;
 pub mod riemannian;
 pub mod riemannian_retraction;
 pub mod seeding;
+pub mod sindy;
 pub mod topology_formula;
 pub mod topology_selector;
 pub mod visualizer;

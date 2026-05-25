@@ -83,6 +83,7 @@ from .penalties import (
     TopologyAutoSelector,
 )
 from .interchange import InterchangeSwapDecoder
+from .hyperbolic import PoincareAtoms
 from .skip_transcoder import SkipAffineSmooth, SkipTranscoderResult, skip_transcoder
 from ..smooth import (
     BSpline,
@@ -117,6 +118,7 @@ __all__ = [
     "ManifoldSAE",
     "ManifoldSAEConfig",
     "ManifoldSAEOutput",
+    "PoincareAtoms",
     "SkipAffineSmooth",
     "SkipTranscoderResult",
     "skip_transcoder",

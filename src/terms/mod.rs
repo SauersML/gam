@@ -14,6 +14,7 @@ pub mod matern_gradient;
 pub mod penalties;
 pub mod penalty_op;
 pub mod sae_manifold;
+pub mod sheaf;
 pub mod skip_transcoder;
 pub mod smooth;
 pub mod term_builder;
@@ -39,6 +40,7 @@ pub use latent_coord::{
     LatentManifold,
 };
 pub use matern_gradient::{MaternBasisGradientTarget, StreamingMaternBasisGradientEvaluator};
+pub use sheaf::{EdgeRestriction, SheafConsistencyPenalty};
 pub use sae_manifold::{
     AssignmentMode, GumbelTemperatureSchedule, SaeAssignment, SaeAtomBasisKind, SaeBasisEvaluator,
     SaeManifoldAtom, SaeManifoldLoss, SaeManifoldRho, SaeManifoldTerm, ScheduleKind,

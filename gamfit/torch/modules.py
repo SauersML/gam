@@ -32,28 +32,6 @@ if TYPE_CHECKING:
     from .._model import Model
 
 
-@dataclass(frozen=True, slots=True)
-class ManifoldSAEConfig:
-    """Configuration for :class:`ManifoldSAE`."""
-
-    D: int
-    F: int
-    K: int
-    bias: bool = True
-    init_scale: float = 0.02
-
-
-@dataclass(frozen=True, slots=True)
-class ManifoldSAEOutput:
-    """Output bundle returned by :class:`ManifoldSAE.forward`."""
-
-    z: torch.Tensor
-    x_hat: torch.Tensor
-    theta: torch.Tensor
-    amp: torch.Tensor
-    gate: torch.Tensor
-
-
 def _check_2d_float_tensor(value: torch.Tensor, name: str) -> torch.Tensor:
     if not isinstance(value, torch.Tensor):
         raise TypeError(f"{name} must be a torch.Tensor")
