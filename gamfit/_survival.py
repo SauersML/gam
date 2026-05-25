@@ -9,6 +9,7 @@ those FFI payloads.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -499,13 +500,10 @@ def numeric_matrix(values: Any, label: str) -> Any:
 
 
 def transformation_normal_z(columns: dict[str, list[float]]) -> list[float]:
-    for candidate in ("z", "z_score", "transformed", "eta"):
-        if candidate in columns:
-            return list(columns[candidate])
-    if "mean" in columns:
-        return list(columns["mean"])
-    raise KeyError(
-        "transformation-normal prediction payload is missing a z-score column"
+    if not isinstance(columns, dict):
+        raise TypeError("columns must be a dict")
+    return list(
+        rust_module().transformation_normal_z_from_columns(json.dumps(columns))
     )
 
 
@@ -723,26 +721,12 @@ def default_survival_time_grid(
     return list(result) if result is not None else None
 
 
-def term_blocks_from_state(state: dict[str, Any]) -> tuple[TermBlock, ...]:
-    """Parse ``coefficient_state_json``'s ``term_blocks`` into :class:`TermBlock`."""
-    raw_blocks = state.get("term_blocks")
-    if not isinstance(raw_blocks, list):
-        raise ValueError("coefficient state payload is missing term_blocks")
-    blocks: list[TermBlock] = []
-    for idx, raw_block in enumerate(raw_blocks):
-        if not isinstance(raw_block, dict):
-            raise ValueError(f"term block {idx} must be an object")
-        try:
-            name = str(raw_block["name"])
-            kind = str(raw_block["kind"])
-            start = int(raw_block["start"])
-            end = int(raw_block["end"])
-        except KeyError as exc:
-            raise ValueError(f"term block {idx} is missing {exc.args[0]!r}") from exc
-        if start < 0 or end < start:
-            raise ValueError(f"term block {idx} has invalid range [{start}, {end})")
-        blocks.append(TermBlock(name=name, kind=kind, start=start, end=end))
-    return tuple(blocks)
+def term_blocks_for_model(model_bytes: bytes) -> tuple[TermBlock, ...]:
+    """Return per-term coefficient column ranges for a saved model."""
+    return tuple(
+        TermBlock(name=str(name), kind=str(kind), start=int(start), end=int(end))
+        for name, kind, start, end in rust_module().term_blocks_for_model(model_bytes)
+    )
 
 
 def _interpolate_rows(

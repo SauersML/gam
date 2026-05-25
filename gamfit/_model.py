@@ -31,7 +31,7 @@ from ._survival import (
     extract_row_ids,
     numeric_matrix,
     shape_prediction_response,
-    term_blocks_from_state,
+    term_blocks_for_model,
 )
 from ._tables import normalize_table, response_column_name, restore_output_table
 
@@ -147,17 +147,15 @@ class Model:
     ) -> PosteriorSamples:
         """Draw from the model's posterior with NUTS."""
         headers, rows, _ = normalize_table(data)
-        payload: dict[str, Any] = {}
-        for key, value in (
-            ("samples", samples), ("warmup", warmup), ("chains", chains), ("seed", seed),
-        ):
-            if value is not None:
-                payload[key] = int(value)
-        if target_accept is not None:
-            payload["target_accept"] = float(target_accept)
         try:
+            ffi = rust_module()
             raw = rust_module().sample_table(
-                self._model_bytes, headers, rows, json.dumps(payload)
+                self._model_bytes,
+                headers,
+                rows,
+                ffi.build_sample_payload_json(
+                    samples, warmup, chains, target_accept, seed
+                ),
             )
         except Exception as exc:
             raise map_exception(exc) from exc
@@ -264,18 +262,11 @@ class Model:
         """Return the serialised model as raw bytes."""
         return self._model_bytes
 
-    def _saved_model_payload(self) -> dict[str, Any]:
-        saved = json.loads(self._model_bytes)
-        if not isinstance(saved, dict):
-            raise ValueError("saved model payload must be a JSON object")
-        payload = saved.get("payload")
-        if not isinstance(payload, dict):
-            raise ValueError("saved model payload is missing its payload object")
-        return payload
-
     def _saved_payload_string(self, key: str) -> str | None:
-        value = self._saved_model_payload().get(key)
-        return str(value) if value is not None else None
+        try:
+            return rust_module().saved_model_payload_string(self._model_bytes, key)
+        except Exception as exc:
+            raise map_exception(exc) from exc
 
     @property
     def formula(self) -> str:
@@ -328,10 +319,9 @@ class Model:
     def term_blocks(self) -> tuple[TermBlock, ...]:
         """Per-term coefficient column ranges in fitted coefficient order."""
         try:
-            state = json.loads(rust_module().coefficient_state_json(self._model_bytes))
+            return term_blocks_for_model(self._model_bytes)
         except Exception as exc:
             raise map_exception(exc) from exc
-        return term_blocks_from_state(state)
 
     @property
     def evidence(self) -> float:

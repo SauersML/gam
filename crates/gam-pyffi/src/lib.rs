@@ -226,6 +226,20 @@ struct PyPredictOptions {
     with_uncertainty: bool,
 }
 
+#[derive(Serialize)]
+struct PyPredictOptionsPayload {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    interval: Option<f64>,
+    #[serde(skip_serializing_if = "bool_is_false")]
+    with_uncertainty: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    time_grid: Option<Vec<f64>>,
+}
+
+fn bool_is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PySharedPrecisionRequest {
@@ -527,6 +541,7 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
             "torch_from_fitted",
             "predict",
             "predict_array",
+            "build_predict_payload_json",
             "interpolate_survival_surface",
             "write_survival_csv",
             "default_survival_time_grid",
@@ -1696,6 +1711,42 @@ fn competing_risks_cif_from_predictions_impl(
         .map(|endpoint_cif| endpoint_cif.to_owned())
         .collect::<Vec<_>>();
     Ok((cif, result.overall_survival))
+}
+
+#[pyfunction]
+fn build_sample_payload_json(
+    samples: Option<i64>,
+    warmup: Option<i64>,
+    chains: Option<i64>,
+    target_accept: Option<f64>,
+    seed: Option<i64>,
+) -> PyResult<String> {
+    let mut payload = serde_json::Map::new();
+    if let Some(value) = samples {
+        payload.insert("samples".to_string(), serde_json::Value::from(value));
+    }
+    if let Some(value) = warmup {
+        payload.insert("warmup".to_string(), serde_json::Value::from(value));
+    }
+    if let Some(value) = chains {
+        payload.insert("chains".to_string(), serde_json::Value::from(value));
+    }
+    if let Some(value) = target_accept {
+        let number = serde_json::Number::from_f64(value)
+            .ok_or_else(|| py_value_error("target_accept must be finite".to_string()))?;
+        payload.insert(
+            "target_accept".to_string(),
+            serde_json::Value::Number(number),
+        );
+    }
+    if let Some(value) = seed {
+        payload.insert("seed".to_string(), serde_json::Value::from(value));
+    }
+    serde_json::to_string(&serde_json::Value::Object(payload)).map_err(|err| {
+        py_value_error(format!(
+            "failed to serialize sample options json: {err}"
+        ))
+    })
 }
 
 #[pyfunction]
@@ -12196,6 +12247,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
         competing_risks_cif_from_predictions,
         module
     )?)?;
+    module.add_function(wrap_pyfunction!(build_sample_payload_json, module)?)?;
     module.add_function(wrap_pyfunction!(sample_table, module)?)?;
     module.add_function(wrap_pyfunction!(design_matrix_table, module)?)?;
     module.add_function(wrap_pyfunction!(design_matrix_table_dense, module)?)?;
