@@ -101,6 +101,7 @@ from ._binding import rust_module as _rust_module; ParametricAuxConditionalPrior
 from ._binding import rust_module as _rust_module; IBPAssignmentPenalty = _rust_module().IBPAssignmentPenalty
 from ._binding import rust_module as _rust_module; TotalVariationPenalty = _rust_module().TotalVariationPenalty
 from ._binding import rust_module as _rust_module; SoftmaxAssignmentSparsityPenalty = _rust_module().SoftmaxAssignmentSparsityPenalty
+from ._binding import rust_module as _rust_module; OrthogonalityPenalty = _rust_module().OrthogonalityPenalty
 
 
 class AnalyticPenaltyKind(str, Enum):
@@ -350,83 +351,7 @@ from ._binding import rust_module as _rust_module; SparsityPenalty = _rust_modul
 from ._binding import rust_module as _rust_module; AuxConditionalPriorPenalty = _rust_module().AuxConditionalPriorPenalty
 from ._binding import rust_module as _rust_module; BlockOrthogonalityPenalty = _rust_module().BlockOrthogonalityPenalty
 from ._binding import rust_module as _rust_module; IsometryPenalty = _rust_module().IsometryPenalty
-
-
-@dataclass(init=False, slots=True)
-class ScadMcpPenalty(_AnalyticPenalty):
-    """Concave SCAD/MCP sparsity on latent coordinates.
-    KIND_TAG = "scad_mcp"
-
-    ``SparsityPenalty`` uses Huber-smoothed L¹, whose gradient keeps pulling
-    large coefficients toward zero. MCP (Zhang 2010) and SCAD (Fan-Li 2001)
-    flatten that gradient for large coefficients, giving less-biased true
-    signals while still shrinking near-zero noise.
-    Default ``gamma``: MCP uses 2.5 (Zhang 2010 §3);
-    SCAD uses 3.7 (Fan-Li 2001 §3.1).
-    """
-
-    target: TargetSpec
-    weight: float
-    n_eff: int
-    gamma: float
-    variant: Literal["mcp", "scad"]
-    smoothing_eps: float
-    learnable: bool
-    weight_schedule: ScalarWeightSchedule | dict[str, Any] | None
-
-    def __init__(
-        self,
-        weight: float,
-        n_eff: int,
-        gamma: float | None = None,
-        variant: Literal["mcp", "scad"] = "mcp",
-        smoothing_eps: float = 1e-6,
-        learnable: bool = False,
-        *,
-        target: TargetSpec = "t",
-    ) -> None:
-        self.target = target
-        self.weight = float(weight)
-        self.n_eff = int(n_eff)
-        self.variant = variant
-        if gamma is None:
-            if self.variant not in ("mcp", "scad"):
-                raise ValueError(
-                    f"ScadMcpPenalty.variant must be 'mcp' or 'scad', got {self.variant!r}"
-                )
-            gamma = {"mcp": 2.5, "scad": 3.7}[self.variant]
-        self.gamma = float(gamma)
-        self.smoothing_eps = float(smoothing_eps)
-        self.learnable = bool(learnable)
-        self.weight_schedule = None
-        self.__post_init__()
-
-    def __post_init__(self) -> None:
-        if not np.isfinite(self.weight) or not self.weight > 0.0:
-            raise ValueError(f"ScadMcpPenalty.weight must be > 0, got {self.weight}")
-        if self.n_eff <= 0:
-            raise ValueError(f"ScadMcpPenalty.n_eff must be > 0, got {self.n_eff}")
-        if not np.isfinite(self.gamma) or not self.gamma > 1.0:
-            raise ValueError(f"ScadMcpPenalty.gamma must be > 1, got {self.gamma}")
-        if self.variant not in ("mcp", "scad"):
-            raise ValueError(
-                f"ScadMcpPenalty.variant must be 'mcp' or 'scad', got {self.variant!r}"
-            )
-        if not np.isfinite(self.smoothing_eps) or not self.smoothing_eps > 0.0:
-            raise ValueError(
-                "ScadMcpPenalty.smoothing_eps must be > 0, "
-                f"got {self.smoothing_eps}"
-            )
-
-    def _payload_extras(self) -> dict[str, Any]:
-        return {
-            "weight": self.weight,
-            "n_eff": self.n_eff,
-            "gamma": self.gamma,
-            "variant": self.variant,
-            "smoothing_eps": self.smoothing_eps,
-            "learnable": self.learnable,
-        }
+from ._binding import rust_module as _rust_module; ScadMcpPenalty = _rust_module().ScadMcpPenalty
 
 
 @dataclass(frozen=True, slots=True)

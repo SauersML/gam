@@ -1320,19 +1320,6 @@ fn numeric_matrix_validate<'py>(
 }
 
 #[pyfunction]
-fn numeric_matrix_f64<'py>(
-    py: Python<'py>,
-    values: &Bound<'py, PyAny>,
-    label: &str,
-) -> PyResult<Bound<'py, PyArray2<f64>>> {
-    let np = py.import("numpy")?;
-    let kwargs = PyDict::new(py);
-    kwargs.set_item("dtype", "float")?;
-    let array = np.call_method("asarray", (values,), Some(&kwargs))?;
-    numeric_matrix_validate(py, &array, label)
-}
-
-#[pyfunction]
 fn marginal_slope_clip_probabilities(values: Vec<f64>) -> PyResult<Vec<f64>> {
     Ok(values
         .into_iter()
@@ -15133,22 +15120,26 @@ fn total_variation_coerce_edges(edges: &Bound<'_, PyAny>) -> PyResult<Vec<(i64, 
     let mut out = Vec::new();
     for edge in edge_iter {
         let edge = edge.map_err(|_| total_variation_difference_op_type_error())?;
-        let tuple = edge
-            .downcast::<PyTuple>()
+        let mut endpoints = edge
+            .try_iter()
             .map_err(|_| total_variation_difference_op_type_error())?;
-        if tuple.len() != 2 {
+        let a = endpoints
+            .next()
+            .ok_or_else(total_variation_difference_op_type_error)?
+            .map_err(|_| total_variation_difference_op_type_error())?
+            .call_method0("__index__")
+            .and_then(|value| value.extract::<i64>())
+            .map_err(|_| total_variation_difference_op_type_error())?;
+        let b = endpoints
+            .next()
+            .ok_or_else(total_variation_difference_op_type_error)?
+            .map_err(|_| total_variation_difference_op_type_error())?
+            .call_method0("__index__")
+            .and_then(|value| value.extract::<i64>())
+            .map_err(|_| total_variation_difference_op_type_error())?;
+        if endpoints.next().is_some() {
             return Err(total_variation_difference_op_type_error());
         }
-        let a = tuple
-            .get_item(0)?
-            .call_method0("__index__")
-            .and_then(|value| value.extract::<i64>())
-            .map_err(|_| total_variation_difference_op_type_error())?;
-        let b = tuple
-            .get_item(1)?
-            .call_method0("__index__")
-            .and_then(|value| value.extract::<i64>())
-            .map_err(|_| total_variation_difference_op_type_error())?;
         out.push((a, b));
     }
     Ok(out)
@@ -16162,6 +16153,176 @@ fn mechanism_weight_schedule_descriptor(py: Python<'_>, schedule: &PyObject) -> 
     ))
 }
 
+#[pyclass(module = "gam_pyffi._rust", name = "BlockOrthogonalityPenalty")]
+struct BlockOrthogonalityPenalty {
+    #[pyo3(get, set)]
+    target: PyObject,
+    #[pyo3(get, set)]
+    groups: Vec<Vec<i64>>,
+    #[pyo3(get, set)]
+    weight: f64,
+    #[pyo3(get, set)]
+    n_eff: i64,
+    #[pyo3(get, set)]
+    learnable: bool,
+    #[pyo3(get, set)]
+    weight_schedule: Option<PyObject>,
+}
+
+fn block_orthogonality_groups(groups: &Bound<'_, PyAny>) -> PyResult<Vec<Vec<i64>>> {
+    let group_iter = groups.try_iter().map_err(|_| {
+        PyTypeError::new_err(
+            "BlockOrthogonalityPenalty.groups must be a sequence of integer sequences",
+        )
+    })?;
+    let mut coerced = Vec::new();
+    for group in group_iter {
+        let group = group.map_err(|_| {
+            PyTypeError::new_err(
+                "BlockOrthogonalityPenalty.groups must be a sequence of integer sequences",
+            )
+        })?;
+        let axis_iter = group.try_iter().map_err(|_| {
+            PyTypeError::new_err(
+                "BlockOrthogonalityPenalty.groups must be a sequence of integer sequences",
+            )
+        })?;
+        let mut axes = Vec::new();
+        for axis in axis_iter {
+            let axis = axis.map_err(|_| {
+                PyTypeError::new_err(
+                    "BlockOrthogonalityPenalty.groups must be a sequence of integer sequences",
+                )
+            })?;
+            axes.push(axis.call_method0("__index__")?.extract::<i64>()?);
+        }
+        coerced.push(axes);
+    }
+    if coerced.len() < 2 {
+        return Err(PyValueError::new_err(
+            "BlockOrthogonalityPenalty.groups must contain at least two groups",
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    for (group_idx, group) in coerced.iter().enumerate() {
+        if group.is_empty() {
+            return Err(PyValueError::new_err(format!(
+                "BlockOrthogonalityPenalty.groups[{group_idx}] must not be empty"
+            )));
+        }
+        for &axis in group {
+            if axis < 0 {
+                return Err(PyValueError::new_err(format!(
+                    "BlockOrthogonalityPenalty.groups entries must be non-negative; got {axis}"
+                )));
+            }
+            if !seen.insert(axis) {
+                return Err(PyValueError::new_err(format!(
+                    "BlockOrthogonalityPenalty.groups axis {axis} appears more than once"
+                )));
+            }
+        }
+    }
+    let max_axis = seen.iter().next_back().copied().unwrap_or(0);
+    for axis in 0..=max_axis {
+        if !seen.contains(&axis) {
+            return Err(PyValueError::new_err(format!(
+                "BlockOrthogonalityPenalty.groups must partition contiguous axes from 0; missing axis {axis}"
+            )));
+        }
+    }
+    Ok(coerced)
+}
+
+fn block_orthogonality_target_descriptor(target: &Bound<'_, PyAny>) -> PyResult<PyObject> {
+    if target.is_instance_of::<PyString>() || target.extract::<isize>().is_ok() {
+        return Ok(target.clone().unbind());
+    }
+    if target.hasattr("to_rust_descriptor")? {
+        return Ok(target.call_method0("to_rust_descriptor")?.unbind().into());
+    }
+    Err(PyTypeError::new_err(
+        "target must be a string, integer, or object with to_rust_descriptor()",
+    ))
+}
+
+#[pymethods]
+impl BlockOrthogonalityPenalty {
+    #[new]
+    #[pyo3(signature = (groups, weight, n_eff, learnable = false, *, target = "t"))]
+    fn new(
+        groups: &Bound<'_, PyAny>,
+        weight: f64,
+        n_eff: &Bound<'_, PyAny>,
+        learnable: bool,
+        target: PyObject,
+    ) -> PyResult<Self> {
+        let groups = block_orthogonality_groups(groups)?;
+        let n_eff = n_eff.call_method0("__index__")?.extract::<i64>()?;
+        if weight <= 0.0 {
+            return Err(PyValueError::new_err(format!(
+                "BlockOrthogonalityPenalty.weight must be > 0, got {weight}"
+            )));
+        }
+        if n_eff <= 0 {
+            return Err(PyValueError::new_err(format!(
+                "BlockOrthogonalityPenalty.n_eff must be > 0, got {n_eff}"
+            )));
+        }
+        Ok(Self {
+            target,
+            groups,
+            weight,
+            n_eff,
+            learnable,
+            weight_schedule: None,
+        })
+    }
+
+    #[classattr]
+    const KIND_TAG: &'static str = "block_orthogonality";
+
+    fn to_rust_descriptor(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let payload = PyDict::new(py);
+        payload.set_item("kind", Self::KIND_TAG)?;
+        payload.set_item(
+            "target",
+            block_orthogonality_target_descriptor(self.target.bind(py))?,
+        )?;
+        payload.set_item("groups", &self.groups)?;
+        payload.set_item("weight", self.weight)?;
+        payload.set_item("n_eff", self.n_eff)?;
+        payload.set_item("learnable", self.learnable)?;
+        if let Some(schedule) = topk_weight_schedule_descriptor(py, &self.weight_schedule)? {
+            payload.set_item("weight_schedule", schedule)?;
+        }
+        Ok(payload.into())
+    }
+
+    fn set_weight_schedule<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        schedule: PyObject,
+    ) -> PyRefMut<'py, Self> {
+        slf.weight_schedule = Some(schedule);
+        slf
+    }
+
+    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        Ok(format!(
+            "BlockOrthogonalityPenalty(target={}, groups={:?}, weight={}, n_eff={}, learnable={}, weight_schedule={})",
+            py_repr(py, self.target.bind(py))?,
+            self.groups,
+            self.weight,
+            self.n_eff,
+            self.learnable,
+            match &self.weight_schedule {
+                Some(schedule) => py_repr(py, schedule.bind(py))?,
+                None => "None".to_string(),
+            }
+        ))
+    }
+}
+
 #[pymodule(name = "_rust", gil_used = false)]
 fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     gam::init_parallelism();
@@ -16395,6 +16556,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<JumpReLUPenalty>()?;
     module.add_class::<ARDPenalty>()?;
     module.add_class::<AuxConditionalPriorPenalty>()?;
+    module.add_class::<IvaeRidgeMeanGauge>()?;
     module.add_class::<ParametricAuxConditionalPriorPenalty>()?;
     module.add_class::<BlockSparsityPenalty>()?;
     module.add_class::<BlockOrthogonalityPenalty>()?;
