@@ -98,6 +98,8 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fs::File;
+use std::io::{BufWriter, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
@@ -772,6 +774,158 @@ fn interpolate_rows<'py>(
     Ok(out.into_pyarray(py))
 }
 
+fn write_csv_field(writer: &mut BufWriter<File>, value: &str) -> std::io::Result<()> {
+    let needs_quotes = value
+        .bytes()
+        .any(|byte| matches!(byte, b',' | b'"' | b'\n' | b'\r'));
+    if !needs_quotes {
+        writer.write_all(value.as_bytes())?;
+        return Ok(());
+    }
+    writer.write_all(b"\"")?;
+    for byte in value.bytes() {
+        if byte == b'"' {
+            writer.write_all(b"\"\"")?;
+        } else {
+            writer.write_all(&[byte])?;
+        }
+    }
+    writer.write_all(b"\"")
+}
+
+fn survival_csv_interpolate(
+    surface_values: &[f64],
+    n_cols: usize,
+    sorted_grid: &[f64],
+    sorted_indices: &[usize],
+    row_idx: usize,
+    query_value: f64,
+) -> f64 {
+    if query_value.is_nan() {
+        return f64::NAN;
+    }
+    let n_grid = sorted_grid.len();
+    let row_offset = row_idx * n_cols;
+    if query_value <= sorted_grid[0] {
+        surface_values[row_offset + sorted_indices[0]]
+    } else if query_value >= sorted_grid[n_grid - 1] {
+        surface_values[row_offset + sorted_indices[n_grid - 1]]
+    } else {
+        let upper = sorted_grid.partition_point(|grid_value| *grid_value <= query_value);
+        let lower = upper - 1;
+        let x0 = sorted_grid[lower];
+        let x1 = sorted_grid[upper];
+        let y0 = surface_values[row_offset + sorted_indices[lower]];
+        let y1 = surface_values[row_offset + sorted_indices[upper]];
+        if x1 == x0 {
+            y1
+        } else {
+            y0 + (query_value - x0) * (y1 - y0) / (x1 - x0)
+        }
+    }
+}
+
+#[pyfunction]
+fn write_survival_csv(
+    py: Python<'_>,
+    path: &str,
+    grid: PyReadonlyArray1<'_, f64>,
+    surface: PyReadonlyArray2<'_, f64>,
+    times: PyReadonlyArray1<'_, f64>,
+    id_column: Option<String>,
+    row_ids: Option<Vec<String>>,
+    people_chunk: usize,
+    time_grid_chunk: usize,
+) -> PyResult<String> {
+    if people_chunk == 0 {
+        return Err(py_value_error("people_chunk must be positive".to_string()));
+    }
+    if time_grid_chunk == 0 {
+        return Err(py_value_error("time_grid_chunk must be positive".to_string()));
+    }
+    let grid_view = grid.as_array();
+    let surface_view = surface.as_array();
+    let n_grid = grid_view.len();
+    let (n_rows, n_cols) = surface_view.dim();
+    if n_grid == 0 || n_cols != n_grid {
+        return Err(py_value_error(
+            "survival interpolation requires a non-empty grid".to_string(),
+        ));
+    }
+    if id_column.is_some() {
+        match row_ids.as_ref() {
+            Some(ids) if ids.len() >= n_rows => {}
+            Some(ids) => {
+                return Err(py_value_error(format!(
+                    "row_ids length {} is smaller than survival row count {n_rows}",
+                    ids.len()
+                )));
+            }
+            None => {
+                return Err(py_value_error(
+                    "row_ids are required when id_column is set".to_string(),
+                ));
+            }
+        }
+    }
+
+    let mut order: Vec<(f64, usize)> = grid_view
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, value)| (value, index))
+        .collect();
+    order.sort_by(|left, right| left.0.partial_cmp(&right.0).unwrap_or(Ordering::Equal));
+    let sorted_grid: Vec<f64> = order.iter().map(|(value, _index)| *value).collect();
+    let sorted_indices: Vec<usize> = order.iter().map(|(_value, index)| *index).collect();
+    let surface_values: Vec<f64> = surface_view.iter().copied().collect();
+    let times_values: Vec<f64> = times.as_array().iter().copied().collect();
+    let path_owned = path.to_string();
+
+    Ok(py.detach(move || -> std::io::Result<String> {
+        let file = File::create(&path_owned)?;
+        let mut writer = BufWriter::new(file);
+        match id_column.as_ref() {
+            Some(column) => {
+                writer.write_all(b"row,")?;
+                write_csv_field(&mut writer, column)?;
+                writer.write_all(b",time,survival\n")?;
+            }
+            None => writer.write_all(b"row,time,survival\n")?,
+        }
+
+        for row_start in (0..n_rows).step_by(people_chunk) {
+            let row_stop = (row_start + people_chunk).min(n_rows);
+            for time_start in (0..times_values.len()).step_by(time_grid_chunk) {
+                let time_stop = (time_start + time_grid_chunk).min(times_values.len());
+                for row_idx in row_start..row_stop {
+                    for query_value in &times_values[time_start..time_stop] {
+                        let survival = survival_csv_interpolate(
+                            &surface_values,
+                            n_cols,
+                            &sorted_grid,
+                            &sorted_indices,
+                            row_idx,
+                            *query_value,
+                        )
+                        .clamp(0.0, 1.0);
+                        match (id_column.as_ref(), row_ids.as_ref()) {
+                            (Some(_column), Some(ids)) => {
+                                write!(writer, "{row_idx},")?;
+                                write_csv_field(&mut writer, &ids[row_idx])?;
+                                writeln!(writer, ",{query_value},{survival}")?;
+                            }
+                            _ => writeln!(writer, "{row_idx},{query_value},{survival}")?,
+                        }
+                    }
+                }
+            }
+        }
+        writer.flush()?;
+        Ok(path_owned)
+    })?)
+}
+
 #[pyfunction]
 fn survival_coerce_times<'py>(
     py: Python<'py>,
@@ -1069,10 +1223,19 @@ fn vec_to_array1_f64<'py>(py: Python<'py>, values: Vec<f64>) -> PyResult<Py<PyAr
 
 #[pyfunction]
 fn default_survival_time_grid(
+    model_class: &str,
     formula: &str,
     headers: Vec<String>,
     rows: Vec<Vec<String>>,
 ) -> PyResult<Option<Vec<f64>>> {
+    match model_class {
+        "survival"
+        | "competing risks survival"
+        | "survival marginal-slope"
+        | "survival location-scale" => {}
+        _ => return Ok(None),
+    }
+
     let re = Regex::new(r"^\s*Surv\s*\(\s*([^\s,]+)\s*,\s*([^\s,]+)\s*,\s*[^\s,]+\s*\)")
         .map_err(|err| py_value_error(format!("invalid survival formula regex: {err}")))?;
     let Some(captures) = re.captures(formula) else {

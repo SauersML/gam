@@ -2,6 +2,7 @@ pub mod alo;
 pub mod data;
 pub mod diagnostics;
 pub mod dispersion_cov;
+pub mod eta_bands;
 pub mod formula_dsl;
 pub mod generative;
 pub mod hmc;

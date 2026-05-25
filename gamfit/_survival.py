@@ -205,15 +205,9 @@ class SurvivalPrediction:
         previous_cumulative: Any | None = None,
         previous_time: float = 0.0,
     ) -> Any:
-        import numpy as np
-
-        if previous_cumulative is None:
-            previous_cumulative = np.zeros((cumulative.shape[0], 1), dtype=float)
-        grid = np.concatenate([[float(previous_time)], times_arr])
-        widths = np.diff(grid)
-        widths = np.where(widths <= 0.0, 1.0, widths)
-        cumulative_full = np.concatenate([previous_cumulative, cumulative], axis=1)
-        return np.diff(cumulative_full, axis=1) / widths.reshape(1, -1)
+        return rust_module().hazard_from_cumulative(
+            times_arr, cumulative, previous_cumulative, previous_time
+        )
 
     def hazard_at(self, times: Any) -> Any:
         times_arr = self._coerce_times(times)
@@ -729,61 +723,10 @@ def default_survival_time_grid(
     headers: list[str],
     rows: list[list[str]],
 ) -> list[float] | None:
-    """Default uniform time grid spanning the survival window of ``rows``."""
-    import numpy as np
-    import re
+    from ._binding import rust_module
 
-    if model_class not in _SURVIVAL_TIME_GRID_MODEL_CLASSES:
-        return None
-    match = re.match(
-        r"\s*Surv\s*\(\s*([^\s,]+)\s*,\s*([^\s,]+)\s*,\s*[^\s,]+\s*\)", formula
-    )
-    if not match:
-        return None
-    entry_name, exit_name = match.group(1), match.group(2)
-    header_to_index = {name: i for i, name in enumerate(headers)}
-    entry_idx = header_to_index.get(entry_name)
-    exit_idx = header_to_index.get(exit_name)
-    if entry_idx is None or exit_idx is None:
-        missing = [
-            name
-            for name, idx in ((entry_name, entry_idx), (exit_name, exit_idx))
-            if idx is None
-        ]
-        raise ValueError(
-            "survival prediction data is missing required time column(s): "
-            + ", ".join(missing)
-        )
-    entry_vals: list[float] = []
-    exit_vals: list[float] = []
-    for row_index, row in enumerate(rows):
-        try:
-            entry_vals.append(float(row[entry_idx]))
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                f"survival entry column {entry_name!r} has a non-numeric value "
-                f"at row {row_index + 1}: {row[entry_idx]!r}"
-            ) from exc
-        try:
-            exit_vals.append(float(row[exit_idx]))
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                f"survival exit column {exit_name!r} has a non-numeric value "
-                f"at row {row_index + 1}: {row[exit_idx]!r}"
-            ) from exc
-    if not entry_vals or not exit_vals:
-        return None
-    lo = float(np.min(entry_vals))
-    hi = float(np.max(exit_vals))
-    if not np.isfinite(lo) or not np.isfinite(hi):
-        raise ValueError("survival time columns must contain only finite values")
-    if hi <= lo:
-        raise ValueError(
-            f"survival exit times must extend beyond entry times; got min entry {lo} and max exit {hi}"
-        )
-    span = hi - lo
-    hi_padded = hi + max(span * 1e-6, 1e-9)
-    return list(np.linspace(lo, hi_padded, 64))
+    result = rust_module().default_survival_time_grid(model_class, formula, list(headers), [list(r) for r in rows])
+    return list(result) if result is not None else None
 
 
 def term_blocks_from_state(state: dict[str, Any]) -> tuple[TermBlock, ...]:

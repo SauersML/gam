@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import importlib
+from typing import Any
+
 import numpy as np
 import pandas as pd
-import pytest
+
+pytest: Any = importlib.import_module("pytest")
 
 pytest.importorskip("gamfit._rust")
 
@@ -25,4 +29,3 @@ def test_unordered_by_factor_smooth_and_difference_api_smoke() -> None:
     assert np.all(np.isfinite(out["diff"]))
     assert np.all(out["se"] >= 0)
     assert float(out["critical"].iloc[0]) >= 1.0
-

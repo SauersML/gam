@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import sys
 
 from matplotlib.axes import Axes
 import matplotlib.pyplot as plt
@@ -79,6 +80,7 @@ def main() -> None:
     if args.input:
         df = pd.read_csv(Path(args.input), sep="\t")
     else:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
         from run_suite import _synthetic_hgdp_1kg_pc_panel
 
         df = _synthetic_hgdp_1kg_pc_panel()
