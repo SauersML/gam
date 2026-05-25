@@ -2,6 +2,8 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 #[cfg(target_os = "linux")]
+use std::panic::{self, AssertUnwindSafe, catch_unwind};
+#[cfg(target_os = "linux")]
 use std::sync::{Arc, Mutex};
 
 use super::device::GpuDeviceInfo;
@@ -32,6 +34,34 @@ pub struct GpuRuntime {
 
 static CPU_REASON: OnceLock<String> = OnceLock::new();
 
+/// Install a process-wide panic hook (idempotent) that drops cudarc's
+/// `panic_no_lib_found` message instead of writing it to stderr. All other
+/// panics flow to the previously installed hook unchanged. The site cudarc
+/// 0.19 panics from is `cudarc-0.19.7/src/lib.rs:200` inside its dynamic
+/// loader; messages from that path start with `Unable to dynamically load`.
+/// Caller code wraps the same cudarc entry points in `catch_unwind`, so the
+/// panic is recovered — this hook just prevents the stderr noise that made
+/// operators think the fit had crashed.
+#[cfg(target_os = "linux")]
+fn install_cudarc_panic_filter() {
+    static HOOK_INSTALLED: OnceLock<()> = OnceLock::new();
+    HOOK_INSTALLED.get_or_init(|| {
+        let prior = panic::take_hook();
+        panic::set_hook(Box::new(move |info| {
+            let payload = info.payload();
+            let message = payload
+                .downcast_ref::<&'static str>()
+                .copied()
+                .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("");
+            if message.starts_with("Unable to dynamically load") {
+                return;
+            }
+            prior(info);
+        }));
+    });
+}
+
 impl GpuRuntime {
     pub fn probe() -> Result<Option<Self>, GpuProbeError> {
         if super::global_policy() == super::GpuPolicy::Off {
@@ -57,14 +87,33 @@ impl GpuRuntime {
             // fit fell back to CPU. Keep the preflight completely outside
             // cudarc: use gam's own `libloading` probe first, and only touch
             // cudarc after the platform loader can open `libcuda`.
+            //
+            // The preflight does not always agree with cudarc's own loader
+            // candidate list (e.g. AoU workbench images expose CUDA *runtime*
+            // stub libraries under `/usr/local/cuda-*/targets/.../lib` but no
+            // driver `libcuda.so` in any loader path), so we additionally
+            // install a panic-hook filter that suppresses cudarc's
+            // `panic_no_lib_found` message and wrap every cudarc entry point
+            // below in `catch_unwind` to convert the panic into a typed
+            // `GpuProbeError::Driver` instead.
+            install_cudarc_panic_filter();
             if crate::gpu::driver::preload_cuda_driver().is_err() {
                 let reason = "libcuda unavailable";
                 Self::record_cpu_reason(reason);
+                log::info!("[GPU] CUDA acceleration disabled: {reason}");
                 diagnostics::log_cuda_disabled(reason);
                 return Err(GpuProbeError::Driver(reason.to_string()));
             }
 
-            let device_count = CudaContext::device_count()
+            // cudarc 0.19's `culib()` panics via `panic_no_lib_found` when its
+            // own (separate from gam's) dynamic-loader candidate list cannot
+            // find libcuda — this can happen even after our `preload_cuda_driver`
+            // succeeds, for example if our probe loaded a CUDA stub library but
+            // cudarc's loader searches a disjoint set of names. Convert any such
+            // panic into a typed probe failure so the runtime cleanly disables
+            // CUDA and the CPU fallback proceeds without alarming stderr noise.
+            let device_count = catch_unwind(AssertUnwindSafe(CudaContext::device_count))
+                .map_err(|_| GpuProbeError::Driver("libcuda unavailable".to_string()))?
                 .map_err(|err| GpuProbeError::Driver(err.to_string()))?;
             if device_count <= 0 {
                 let reason = "CUDA driver reported no devices";
@@ -87,9 +136,13 @@ impl GpuRuntime {
                         "failed to create CUDA context for device {ordinal}"
                     ))
                 })?;
-                ctx.bind_to_thread()
+                catch_unwind(AssertUnwindSafe(|| ctx.bind_to_thread()))
+                    .map_err(|_| GpuProbeError::Driver("libcuda unavailable".to_string()))?
                     .map_err(|err| GpuProbeError::Driver(err.to_string()))?;
-                devices.push(cuda_device_info(ordinal, &ctx)?);
+                devices.push(
+                    catch_unwind(AssertUnwindSafe(|| cuda_device_info(ordinal, &ctx)))
+                        .map_err(|_| GpuProbeError::Driver("libcuda unavailable".to_string()))??,
+                );
             }
 
             devices.sort_by(|a, b| b.score().total_cmp(&a.score()));
@@ -160,7 +213,12 @@ pub fn cuda_context_for(ordinal: usize) -> Option<Arc<CudaContext>> {
     if let Some(ctx) = contexts.lock().ok()?.get(&ordinal).cloned() {
         return Some(ctx);
     }
-    let ctx = CudaContext::new(ordinal).ok()?;
+    // cudarc 0.19 panics from `panic_no_lib_found` if its loader fails to
+    // locate libcuda. Demote that to `None` so the runtime probe surfaces a
+    // typed `DriverUnavailable` rather than tearing down the worker thread.
+    let ctx = catch_unwind(AssertUnwindSafe(|| CudaContext::new(ordinal)))
+        .ok()?
+        .ok()?;
     let mut guard = contexts.lock().ok()?;
     Some(guard.entry(ordinal).or_insert_with(|| ctx.clone()).clone())
 }
