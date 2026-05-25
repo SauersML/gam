@@ -1,7 +1,7 @@
 use gam::terms::basis::{SplineScratch, evaluate_bspline_basis_scalar};
 use ndarray::Array1;
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 fn clamped_uniform_knots(degree: usize, num_basis: usize) -> Array1<f64> {
     let interior_count = num_basis.saturating_sub(degree + 1);
