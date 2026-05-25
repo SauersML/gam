@@ -616,16 +616,20 @@ fn infer_delimited_column(
 
     if matches!(kind, ColumnKindTag::Categorical) {
         // A column is categorical only if at least one row failed numeric
-        // parsing. For sample-window rows, the path that succeeded numeric
-        // parsing stored the *raw f64* in `values` without adding the raw
-        // string to `level_index`. After the post-sample window decides the
-        // column is categorical, those numeric rows must be recoded as level
-        // indices using their original raw string, treating them as
-        // categorical levels alongside the non-numeric ones. Without this
-        // pass, a column like "0, 0, ..., 0, foo" silently mixes raw doubles
-        // (the literal 0.0 from the sample window) with level codes from the
-        // post-window rows, breaking the categorical encoding invariant.
-        for row_idx in 0..sample_count {
+        // parsing. Two failure modes used to silently corrupt the encoded
+        // values for such columns:
+        //   1. Sample-window rows that parsed as numbers stored the raw f64
+        //      (e.g. 0.0) in `values` without adding the raw string to
+        //      `level_index`.
+        //   2. Post-window rows that parsed as numbers stored the raw f64
+        //      directly without consulting `level_index`.
+        // After the column is declared categorical, those rows must be
+        // recoded as level indices using their original raw strings, treating
+        // every distinct raw string as a categorical level (including the
+        // numeric ones). Without this pass, a column like
+        // "0, 0, ..., 0, foo" mixes raw doubles with level codes, breaking
+        // the categorical encoding invariant.
+        for row_idx in 0..total_rows {
             let raw = raw_fields[row_idx * n_cols + col].as_str();
             let idx = *level_index.entry(raw.to_string()).or_insert_with(|| {
                 let new_idx = levels.len();
