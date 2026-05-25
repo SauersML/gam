@@ -179,7 +179,7 @@ class GaugeCompanion:
             self.aux_values = np.ascontiguousarray(np.asarray(self.aux_values, dtype=np.float64))
 
     def loss(self, theta: np.ndarray) -> float:
-        """Circular MSE for hue + cos-alignment for sat/val."""
+        """Hue circular MSE + sat/val cos-alignment."""
         return float(
             rust_module().equivariant_gauge_companion_loss(
                 self.aux_values,
