@@ -11231,20 +11231,40 @@ struct KktRefusalReport {
 /// intact when extending — it doubles as the user-facing signal for
 /// "an unconstrained polynomial null space slipped past absorption."
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum KktRefusalDiagnosis {
+pub(crate) enum KktRefusalDiagnosis {
     RankDeficientHPen,
     PhantomMultiplierWithWellConditionedH,
     ActiveSetIncomplete,
 }
 
 impl KktRefusalDiagnosis {
-    fn as_str(&self) -> &'static str {
+    pub(crate) fn as_str(&self) -> &'static str {
         match self {
             KktRefusalDiagnosis::RankDeficientHPen => "rank_deficient_H_pen",
             KktRefusalDiagnosis::PhantomMultiplierWithWellConditionedH => {
                 "phantom_multiplier_with_well_conditioned_H"
             }
             KktRefusalDiagnosis::ActiveSetIncomplete => "active_set_incomplete",
+        }
+    }
+
+    /// Parse the textual `diagnosis:` field embedded in the structured
+    /// bubbled error string. Returns `None` when no recognised label is
+    /// present (legacy / non-cert-refusal error strings).
+    pub(crate) fn parse_from_error(message: &str) -> Option<Self> {
+        let marker = "diagnosis: ";
+        let start = message.rfind(marker)? + marker.len();
+        let tail = &message[start..];
+        let end = tail
+            .find(|c: char| c == ';' || c == '\n' || c == ' ')
+            .unwrap_or(tail.len());
+        match &tail[..end] {
+            "rank_deficient_H_pen" => Some(KktRefusalDiagnosis::RankDeficientHPen),
+            "phantom_multiplier_with_well_conditioned_H" => {
+                Some(KktRefusalDiagnosis::PhantomMultiplierWithWellConditionedH)
+            }
+            "active_set_incomplete" => Some(KktRefusalDiagnosis::ActiveSetIncomplete),
+            _ => None,
         }
     }
 }
@@ -12138,6 +12158,11 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         let mut cycles_since_residual_improved: usize = 0;
         let mut tr_clamped_during_stall: bool = false;
         let mut last_joint_math: Option<JointNewtonMathDiagnostic> = None;
+        // Stash for the structured cert-REFUSED report computed inside the
+        // cycle loop, so the post-loop bubbled error (`coupled exact-joint
+        // inner solve exited the joint Newton path …`) can emit the same
+        // per-block + spectrum breakdown without re-materializing H_pen.
+        let mut last_kkt_refusal_report: Option<KktRefusalReport> = None;
         let mut prev_kkt_norm: Option<f64> = None;
         // Plateau detector: count consecutive cycles whose |Δobj| sits
         // below `objective_tol`; when the streak hits the threshold

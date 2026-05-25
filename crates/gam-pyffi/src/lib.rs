@@ -20401,6 +20401,8 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(manifold_metric_tensor, module)?)?;
     module.add_function(wrap_pyfunction!(manifold_dimension, module)?)?;
     module.add_function(wrap_pyfunction!(manifold_ambient_dimension, module)?)?;
+    module.add_function(wrap_pyfunction!(periodic_harmonic_basis, module)?)?;
+    module.add_function(wrap_pyfunction!(periodic_harmonic_basis_derivative, module)?)?;
     module.add_function(wrap_pyfunction!(sphere_frechet_mean, module)?)?;
     module.add_function(wrap_pyfunction!(response_geometry_closure, module)?)?;
     module.add_function(wrap_pyfunction!(response_geometry_clr, module)?)?;
@@ -25544,6 +25546,51 @@ fn manifold_ambient_dimension(manifold_json: &str) -> PyResult<usize> {
     let kind = parse_manifold_kind(&value).map_err(py_value_error)?;
     let manifold = kind.build();
     Ok(manifold.ambient_dim())
+}
+
+/// Evaluate the periodic harmonic (Fourier) basis at angles ``theta`` (radians).
+/// Returns ``(N, 2*harmonics + 1)`` ndarray with columns
+/// ``[1, cos(theta), sin(theta), cos(2 theta), sin(2 theta), ...]``.
+#[pyfunction(signature = (theta, harmonics))]
+fn periodic_harmonic_basis<'py>(
+    py: Python<'py>,
+    theta: PyReadonlyArray1<'py, f64>,
+    harmonics: usize,
+) -> PyResult<Py<PyArray2<f64>>> {
+    let t = theta.as_array();
+    let n = t.len();
+    let width = 2 * harmonics + 1;
+    let mut out = Array2::<f64>::zeros((n, width));
+    for (row, &angle) in t.iter().enumerate() {
+        out[(row, 0)] = 1.0;
+        for h in 1..=harmonics {
+            let arg = (h as f64) * angle;
+            out[(row, 2 * h - 1)] = arg.cos();
+            out[(row, 2 * h)] = arg.sin();
+        }
+    }
+    Ok(out.into_pyarray(py).unbind())
+}
+
+/// Derivative of :func:`periodic_harmonic_basis` with respect to ``theta``.
+#[pyfunction(signature = (theta, harmonics))]
+fn periodic_harmonic_basis_derivative<'py>(
+    py: Python<'py>,
+    theta: PyReadonlyArray1<'py, f64>,
+    harmonics: usize,
+) -> PyResult<Py<PyArray2<f64>>> {
+    let t = theta.as_array();
+    let n = t.len();
+    let width = 2 * harmonics + 1;
+    let mut out = Array2::<f64>::zeros((n, width));
+    for (row, &angle) in t.iter().enumerate() {
+        for h in 1..=harmonics {
+            let arg = (h as f64) * angle;
+            out[(row, 2 * h - 1)] = -(h as f64) * arg.sin();
+            out[(row, 2 * h)] = (h as f64) * arg.cos();
+        }
+    }
+    Ok(out.into_pyarray(py).unbind())
 }
 
 fn parse_fit_config(config_json: Option<&str>) -> Result<FitConfig, String> {

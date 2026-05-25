@@ -1,258 +1,179 @@
 """Hyperbolic atom dictionary in the Poincaré ball.
 
-:class:`PoincareAtoms` is a torch ``nn.Module`` that holds ``F`` learnable
-points in the Poincaré ball ``B^d_c = {x in R^d : c|x|^2 < 1}`` and decodes
-a gate vector ``z in R^F`` to a single ball point. With curvature ``c = -1``
-(the default) the manifold is the open unit ball of constant sectional
-curvature ``-1``.
+Thin torch wrapper over the Rust geometry primitives in
+``gam::geometry::poincare``. All math (Möbius addition, log/exp at the
+origin, tangent-space decoder forward and analytic backward, Lorentz
+model arithmetic, and numerical safeguards) lives in Rust; this module
+only owns the ``nn.Parameter`` storage and routes tensors across the
+Python/numpy boundary into the Rust kernel via a ``torch.autograd.Function``.
 
-Mixing convention
------------------
-Decoding uses **tangent-space aggregation at the origin followed by the
-exponential map**:
+The Rust kernel is also reachable directly from Rust or the CLI — see
+``gam::geometry::poincare`` — so this feature is not torch-specific.
 
-    v       = sum_f z_f * log_0(a_f)                       (in T_0 B = R^d)
+Decoder convention
+------------------
+``forward(z)`` decodes via tangent-space aggregation at the origin
+followed by the ball exponential map::
+
+    v       = sum_f z_f * log_0(a_f)              (in T_0 B = R^d)
     x_hat   = exp_0(v)
 
-with the Poincaré-ball logarithm and exponential at the origin
-
-    log_0(y)   = artanh(sqrt(-c) |y|) / (sqrt(-c) |y|) * y
-    exp_0(v)   = tanh(sqrt(-c) |v|)  / (sqrt(-c) |v|)  * v.
-
-This convention is:
-
-* **Closed-form and fully differentiable** — no inner optimisation, every
-  step is a smooth elementary function of the atom positions and gates,
-  so ``backward`` flows through both atoms and gates.
-* **Euclidean-limit consistent** — as ``c -> 0`` the tangent maps collapse
-  to identity and the decoder reduces to ordinary linear mixing
-  ``x_hat = sum_f z_f * a_f``, matching the standard atom-dictionary
-  decoder.
-* **Origin-equivariant** — Möbius rotations fixing the origin commute with
-  the construction; this is the property a "centred" hyperbolic decoder
-  should have.
-
-An alternative weighted Möbius / Karcher mean is *implicit* (defined as the
-minimiser of weighted squared hyperbolic distance) and would require an
-inner solver inside ``forward``; we intentionally avoid that. The tangent
-construction is the standard choice in the hyperbolic neural-network
-literature (cf. Ganea, Bécigneul, Hofmann 2018 and Hyperbolic-Mamba,
-arXiv:2505.18973).
-
-Lorentz model
--------------
-When ``lorentz=True`` the same mixing convention is implemented on the
-hyperboloid model ``H^d_c = {x in R^{d+1} : -x_0^2 + |x_{1:}|^2 = 1/c,
-x_0 > 0}`` for ``c < 0``. The hyperboloid arithmetic avoids the
-``1 - |x|^2`` denominator that diverges at the Poincaré boundary, so it is
-the recommended path for atoms that drift near the boundary. The two paths
-are isometric (one is a stereographic projection of the other from
-``(-1/sqrt(-c), 0, ..., 0)``) and agree on small inputs to within
-``1e-5`` — there is a test that pins this.
+Closed-form and fully differentiable; reduces to ``z @ atoms`` in the
+Euclidean (``c -> 0``) limit; equivariant under Möbius isometries
+fixing the origin. The analytic Jacobian is implemented in Rust
+(``poincare_tangent_decode_backward``) and surfaced through
+:class:`_PoincareTangentDecode` below.
 
 References
 ----------
-* Nickel, M., Kiela, D. *Poincaré Embeddings for Learning Hierarchical
+* Nickel, Kiela. *Poincaré Embeddings for Learning Hierarchical
   Representations.* NeurIPS 2017. arXiv:1705.08039.
-* Ganea, O., Bécigneul, G., Hofmann, T. *Hyperbolic Neural Networks.*
-  NeurIPS 2018. arXiv:1805.09112.
-* Hyperbolic-Mamba: state-space hyperbolic sequence model, arXiv:2505.18973
-  (2025).
+* Ganea, Bécigneul, Hofmann. *Hyperbolic Neural Networks.* NeurIPS 2018.
+  arXiv:1805.09112.
+* Hyperbolic-Mamba, arXiv:2505.18973 (2025).
 """
 
 from __future__ import annotations
 
 import math
 
+import numpy as np
 import torch
 from torch import nn
 
-
-# Numerical guards. These are deliberately small but non-trivial — they
-# matter for points within ~1e-3 of the ball boundary, which is exactly
-# where the Poincaré-ball formulas hurt.
-_EPS = 1e-15
-_BOUNDARY_EPS = 1e-5
+from .._binding import rust_module
 
 
-def _safe_sqrt_neg_curvature(curvature: float) -> float:
-    """Return ``sqrt(-c)`` after checking ``c < 0``."""
+def _np_f64(t: torch.Tensor) -> np.ndarray:
+    """Detach to a contiguous numpy float64 array for the Rust bridge."""
 
-    if curvature >= 0.0:
-        raise ValueError(
-            "PoincareAtoms requires negative curvature (c < 0); "
-            f"got curvature={curvature!r}"
+    return np.ascontiguousarray(t.detach().cpu().to(torch.float64).numpy())
+
+
+def _from_np(values: np.ndarray, ref: torch.Tensor) -> torch.Tensor:
+    """Promote a numpy array back to a torch tensor matching ``ref``."""
+
+    return torch.from_numpy(np.ascontiguousarray(values)).to(
+        dtype=ref.dtype, device=ref.device
+    )
+
+
+class _PoincareTangentDecode(torch.autograd.Function):
+    """Autograd shim around the Rust tangent-space-at-origin decoder.
+
+    Forward calls ``poincare_tangent_decode_forward`` in Rust and stashes
+    the (atoms_projected, gates, v, tangents) state needed by the analytic
+    backward; backward calls ``poincare_tangent_decode_backward`` to obtain
+    gradients for both atoms and gates.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        atoms: torch.Tensor,
+        gates: torch.Tensor,
+        curvature: float,
+    ) -> torch.Tensor:
+        rust = rust_module()
+        atoms_np = _np_f64(atoms)
+        gates_np = _np_f64(gates)
+        x_hat_np, atoms_proj_np, v_np, tangents_np = rust.poincare_tangent_decode_forward(
+            atoms_np, gates_np, float(curvature)
         )
-    return math.sqrt(-curvature)
+        ctx.curvature = float(curvature)
+        ctx.save_for_backward(
+            torch.from_numpy(np.ascontiguousarray(atoms_proj_np)),
+            torch.from_numpy(np.ascontiguousarray(gates_np)),
+            torch.from_numpy(np.ascontiguousarray(v_np)),
+            torch.from_numpy(np.ascontiguousarray(tangents_np)),
+        )
+        ctx.atoms_dtype = atoms.dtype
+        ctx.gates_dtype = gates.dtype
+        ctx.atoms_device = atoms.device
+        ctx.gates_device = gates.device
+        return _from_np(x_hat_np, atoms)
+
+    @staticmethod
+    def backward(ctx, grad_x_hat: torch.Tensor):
+        rust = rust_module()
+        atoms_p, gates, v, tangents = ctx.saved_tensors
+        grad_np = _np_f64(grad_x_hat)
+        grad_gates_np, grad_atoms_np = rust.poincare_tangent_decode_backward(
+            np.ascontiguousarray(atoms_p.numpy()),
+            np.ascontiguousarray(gates.numpy()),
+            np.ascontiguousarray(v.numpy()),
+            np.ascontiguousarray(tangents.numpy()),
+            grad_np,
+            ctx.curvature,
+        )
+        grad_atoms = torch.from_numpy(np.ascontiguousarray(grad_atoms_np)).to(
+            dtype=ctx.atoms_dtype, device=ctx.atoms_device
+        )
+        grad_gates = torch.from_numpy(np.ascontiguousarray(grad_gates_np)).to(
+            dtype=ctx.gates_dtype, device=ctx.gates_device
+        )
+        return grad_atoms, grad_gates, None
 
 
-def _l2_norm(x: torch.Tensor) -> torch.Tensor:
-    """L2 norm along the last axis, guarded against zero."""
+class _PoincareLorentzDecode(torch.autograd.Function):
+    """Autograd shim around the Rust Lorentz-path decoder.
 
-    return torch.linalg.vector_norm(x, dim=-1, keepdim=True).clamp_min(_EPS)
-
-
-def _project_into_ball(x: torch.Tensor, sqrt_negc: float) -> torch.Tensor:
-    """Project ``x`` so that ``sqrt(-c) |x| <= 1 - boundary_eps``."""
-
-    max_norm = (1.0 - _BOUNDARY_EPS) / sqrt_negc
-    norm = torch.linalg.vector_norm(x, dim=-1, keepdim=True)
-    scale = torch.clamp(max_norm / norm.clamp_min(_EPS), max=1.0)
-    return x * scale
-
-
-def _mobius_add(u: torch.Tensor, v: torch.Tensor, curvature: float) -> torch.Tensor:
-    """Möbius addition ``u oplus_c v`` in the Poincaré ball for c < 0.
-
-    Using the sign convention from Ganea et al. (2018) with ``c > 0`` denoting
-    *negated* curvature, the formula they state is
-
-        u oplus v = ((1 + 2 c <u,v> + c |v|^2) u + (1 - c |u|^2) v)
-                    / (1 + 2 c <u,v> + c^2 |u|^2 |v|^2).
-
-    Here we adopt the convention where ``curvature`` is the actual (negative)
-    sectional curvature. Substituting ``c -> -curvature`` into Ganea's
-    expression gives, with ``k := -curvature > 0``:
-
-        u oplus v = ((1 + 2 k <u,v> + k |v|^2) u + (1 - k |u|^2) v)
-                    / (1 + 2 k <u,v> + k^2 |u|^2 |v|^2).
+    Lorentz forward is implemented in Rust. Its backward routes through the
+    (isometric) Poincaré analytic backward — the two paths produce outputs
+    that agree to 1e-5 on small inputs (pinned by a Rust unit test), so the
+    gradients agree to the same tolerance. The Lorentz path therefore
+    provides boundary-safe forward arithmetic while reusing the closed-form
+    backward we already have.
     """
 
-    k = -curvature
-    uv = (u * v).sum(dim=-1, keepdim=True)
-    uu = (u * u).sum(dim=-1, keepdim=True)
-    vv = (v * v).sum(dim=-1, keepdim=True)
-    num = (1.0 + 2.0 * k * uv + k * vv) * u + (1.0 - k * uu) * v
-    den = (1.0 + 2.0 * k * uv + (k * k) * uu * vv).clamp_min(_EPS)
-    return num / den
+    @staticmethod
+    def forward(
+        ctx,
+        atoms: torch.Tensor,
+        gates: torch.Tensor,
+        curvature: float,
+    ) -> torch.Tensor:
+        rust = rust_module()
+        atoms_np = _np_f64(atoms)
+        gates_np = _np_f64(gates)
+        x_hat_np = rust.poincare_lorentz_decode_forward(atoms_np, gates_np, float(curvature))
+        # Cache Poincaré forward state for the analytic backward.
+        _, atoms_proj_np, v_np, tangents_np = rust.poincare_tangent_decode_forward(
+            atoms_np, gates_np, float(curvature)
+        )
+        ctx.curvature = float(curvature)
+        ctx.save_for_backward(
+            torch.from_numpy(np.ascontiguousarray(atoms_proj_np)),
+            torch.from_numpy(np.ascontiguousarray(gates_np)),
+            torch.from_numpy(np.ascontiguousarray(v_np)),
+            torch.from_numpy(np.ascontiguousarray(tangents_np)),
+        )
+        ctx.atoms_dtype = atoms.dtype
+        ctx.gates_dtype = gates.dtype
+        ctx.atoms_device = atoms.device
+        ctx.gates_device = gates.device
+        return _from_np(x_hat_np, atoms)
 
-
-def _log0(y: torch.Tensor, sqrt_negc: float) -> torch.Tensor:
-    """Poincaré logarithm at the origin: ``log_0(y)``."""
-
-    norm = _l2_norm(y)
-    # artanh is bounded by clamping the argument away from 1.
-    arg = (sqrt_negc * norm).clamp(max=1.0 - _BOUNDARY_EPS)
-    coeff = torch.atanh(arg) / (sqrt_negc * norm)
-    return coeff * y
-
-
-def _exp0(v: torch.Tensor, sqrt_negc: float) -> torch.Tensor:
-    """Poincaré exponential at the origin: ``exp_0(v)``."""
-
-    norm = _l2_norm(v)
-    coeff = torch.tanh(sqrt_negc * norm) / (sqrt_negc * norm)
-    return coeff * v
-
-
-def _poincare_distance(
-    a: torch.Tensor, b: torch.Tensor, curvature: float, sqrt_negc: float
-) -> torch.Tensor:
-    """Closed-form Poincaré-ball geodesic distance for c < 0."""
-
-    diff_sq = ((a - b) * (a - b)).sum(dim=-1)
-    a_sq = (a * a).sum(dim=-1)
-    b_sq = (b * b).sum(dim=-1)
-    # Denominators (1 + c |a|^2)(1 + c |b|^2) — strictly positive inside
-    # the ball because c|x|^2 < 1 (and c < 0).
-    denom = (1.0 + curvature * a_sq).clamp_min(_EPS) * (
-        1.0 + curvature * b_sq
-    ).clamp_min(_EPS)
-    arg = 1.0 + 2.0 * (-curvature) * diff_sq / denom
-    arg = arg.clamp_min(1.0 + _EPS)
-    return torch.acosh(arg) / sqrt_negc
-
-
-# ---------------------------------------------------------------------------
-# Lorentz (hyperboloid) helpers
-# ---------------------------------------------------------------------------
-
-
-def _to_lorentz(x: torch.Tensor, sqrt_negc: float) -> torch.Tensor:
-    """Stereographic projection Poincaré-ball -> hyperboloid.
-
-    Curvature ``c = -k`` (with ``k = sqrt_negc**2``). The Poincaré ball is
-    ``{y : k |y|^2 < 1}``, i.e. radius ``1/sqrt(k)``. Define rescaled
-    coordinates ``ŷ = sqrt(k) y`` so that ``|ŷ| < 1``. The unit-curvature
-    map sends ``ŷ`` to
-
-        ẑ_0 = (1 + |ŷ|^2) / (1 - |ŷ|^2),   ẑ_s = 2 ŷ / (1 - |ŷ|^2),
-
-    on the unit hyperboloid ``-ẑ_0^2 + |ẑ_s|^2 = -1``. Dividing by
-    ``sqrt(k)`` then puts the result on the hyperboloid of curvature ``-k``,
-    i.e. ``-x_0^2 + |x_s|^2 = -1/k``.
-    """
-
-    yhat = x * sqrt_negc
-    y_sq = (yhat * yhat).sum(dim=-1, keepdim=True)
-    denom = (1.0 - y_sq).clamp_min(_EPS)
-    z0 = (1.0 + y_sq) / denom
-    zs = 2.0 * yhat / denom
-    return torch.cat([z0, zs], dim=-1) / sqrt_negc
-
-
-def _from_lorentz(x: torch.Tensor, sqrt_negc: float) -> torch.Tensor:
-    """Inverse stereographic projection hyperboloid -> Poincaré ball.
-
-    Reverses the rescaling/projection in :func:`_to_lorentz`: scale by
-    ``sqrt(k)`` to land on the unit hyperboloid, then ``y = x_s / (x_0 + 1)``
-    in the rescaled coordinates, then scale ``y`` back by ``1/sqrt(k)`` so
-    it lives in the ball of radius ``1/sqrt(k)``.
-    """
-
-    x_scaled = x * sqrt_negc
-    x0 = x_scaled[..., :1]
-    xs = x_scaled[..., 1:]
-    yhat = xs / (x0 + 1.0).clamp_min(_EPS)
-    return yhat / sqrt_negc
-
-
-def _lorentz_inner(u: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-    """Minkowski inner product with signature ``(-,+,+,...,+)``."""
-
-    prod = u * v
-    inner = -prod[..., :1] + prod[..., 1:].sum(dim=-1, keepdim=True)
-    return inner
-
-
-def _lorentz_log0(y: torch.Tensor, sqrt_negc: float) -> torch.Tensor:
-    """Lorentz logarithm at the origin ``o = (1/sqrt(k), 0, ..., 0)``.
-
-    Returns a tangent vector ``v`` with ``v_0 = 0`` (in the canonical chart
-    used by the rest of this module), then rescaled into Euclidean
-    coordinates by dropping the leading zero.
-    """
-
-    k = sqrt_negc * sqrt_negc
-    # <o, y>_L = -y_0 / sqrt(k) (because o = (1/sqrt(k), 0, ...)).
-    inner = -y[..., :1] / sqrt_negc  # shape (..., 1)
-    # acosh argument: -k <o, y>_L = sqrt(k) y_0. Clamp away from 1.
-    arg = (-k * inner).clamp_min(1.0 + _EPS)
-    dist = torch.acosh(arg) / sqrt_negc  # geodesic distance on H^d
-    # Project y onto T_o by removing the o-component: y_proj = y - (k <o,y>) o.
-    # In coordinates with o = (1/sqrt(k), 0, ...): y_proj_0 = 0, y_proj_s = y_s.
-    y_s = y[..., 1:]
-    norm_proj = torch.linalg.vector_norm(y_s, dim=-1, keepdim=True).clamp_min(_EPS)
-    # Tangent vector lives in span perpendicular to o; we return its spatial
-    # part (the time component is zero by construction).
-    return (dist * y_s) / norm_proj
-
-
-def _lorentz_exp0(v_spatial: torch.Tensor, sqrt_negc: float) -> torch.Tensor:
-    """Lorentz exponential at the origin from a spatial tangent vector."""
-
-    k = sqrt_negc * sqrt_negc
-    norm = torch.linalg.vector_norm(v_spatial, dim=-1, keepdim=True).clamp_min(_EPS)
-    # |v|_L = norm (because time component is zero) — geodesic param s = sqrt(k)*norm.
-    s = sqrt_negc * norm
-    x0 = torch.cosh(s) / sqrt_negc
-    xs = (torch.sinh(s) / s) * v_spatial
-    return torch.cat([x0, xs], dim=-1)
-
-
-# ---------------------------------------------------------------------------
-# Public module
-# ---------------------------------------------------------------------------
+    @staticmethod
+    def backward(ctx, grad_x_hat: torch.Tensor):
+        rust = rust_module()
+        atoms_p, gates, v, tangents = ctx.saved_tensors
+        grad_np = _np_f64(grad_x_hat)
+        grad_gates_np, grad_atoms_np = rust.poincare_tangent_decode_backward(
+            np.ascontiguousarray(atoms_p.numpy()),
+            np.ascontiguousarray(gates.numpy()),
+            np.ascontiguousarray(v.numpy()),
+            np.ascontiguousarray(tangents.numpy()),
+            grad_np,
+            ctx.curvature,
+        )
+        grad_atoms = torch.from_numpy(np.ascontiguousarray(grad_atoms_np)).to(
+            dtype=ctx.atoms_dtype, device=ctx.atoms_device
+        )
+        grad_gates = torch.from_numpy(np.ascontiguousarray(grad_gates_np)).to(
+            dtype=ctx.gates_dtype, device=ctx.gates_device
+        )
+        return grad_atoms, grad_gates, None
 
 
 class PoincareAtoms(nn.Module):
@@ -261,20 +182,19 @@ class PoincareAtoms(nn.Module):
     Parameters
     ----------
     F:
-        Number of atoms in the dictionary.
+        Number of atoms.
     ball_dim:
-        Ambient (Euclidean-coordinate) dimension ``d`` of the ball.
+        Ambient dimension ``d`` of the ball.
     curvature:
-        Sectional curvature ``c``. Must be strictly negative.
+        Sectional curvature ``c``, must be strictly negative.
     lorentz:
-        If ``True``, compute the decoder mixing on the hyperboloid model
-        rather than the Poincaré-ball model. The two paths are isometric;
-        the Lorentz path has no boundary singularity and is preferred when
-        atoms may approach ``|a| -> 1/sqrt(-c)``.
+        If ``True`` use the Rust Lorentz-model forward (boundary-safe).
+        Backward gradients are routed through the (isometric) Poincaré
+        analytic backward — see :class:`_PoincareLorentzDecode`.
     init_scale:
-        Standard deviation of the Gaussian initialiser for atom positions
-        (in Euclidean coordinates). Atoms are projected into the ball after
-        sampling, so even large values are safe.
+        Standard deviation of the Gaussian initialiser for atom positions.
+        Atoms are projected into the ball after sampling via the Rust
+        projection primitive.
     device, dtype:
         Standard torch placement arguments.
 
@@ -308,8 +228,11 @@ class PoincareAtoms(nn.Module):
         if not isinstance(curvature, (int, float)):
             raise TypeError("curvature must be a real number")
         curvature = float(curvature)
-        # Validate by computing sqrt(-c); this raises if c >= 0.
-        self._sqrt_negc = _safe_sqrt_neg_curvature(curvature)
+        if not math.isfinite(curvature) or curvature >= 0.0:
+            raise ValueError(
+                "PoincareAtoms requires negative curvature (c < 0); "
+                f"got curvature={curvature!r}"
+            )
         if init_scale <= 0.0:
             raise ValueError("init_scale must be > 0")
         if dtype is None:
@@ -321,81 +244,108 @@ class PoincareAtoms(nn.Module):
         self.lorentz = bool(lorentz)
         self.init_scale = init_scale
 
-        atoms = torch.randn(F, ball_dim, device=device, dtype=dtype) * init_scale
-        atoms = _project_into_ball(atoms, self._sqrt_negc)
-        self.atoms = nn.Parameter(atoms)
+        atoms_init = torch.randn(F, ball_dim, device=device, dtype=dtype) * init_scale
+        rust = rust_module()
+        projected_rows = [
+            rust.poincare_project_into_ball(np.ascontiguousarray(row), curvature)
+            for row in atoms_init.detach().cpu().to(torch.float64).numpy()
+        ]
+        atoms_init = torch.from_numpy(
+            np.ascontiguousarray(np.stack(projected_rows, axis=0))
+        ).to(dtype=dtype, device=device)
+        self.atoms = nn.Parameter(atoms_init)
 
     # ------------------------------------------------------------------ utils
 
     def project_into_ball(self, x: torch.Tensor) -> torch.Tensor:
-        """Scale ``x`` so it lies strictly inside the ball.
+        """Project ``x`` strictly inside the ball via the Rust primitive."""
 
-        Useful as a no-op-when-safe sanitiser after an external gradient
-        step. ``x`` is returned unchanged when already strictly inside.
-        """
-
-        return _project_into_ball(x, self._sqrt_negc)
+        rust = rust_module()
+        if x.dim() == 1:
+            out = rust.poincare_project_into_ball(_np_f64(x), self.curvature)
+            return _from_np(out, x)
+        flat = x.reshape(-1, x.shape[-1]).detach().cpu().to(torch.float64).numpy()
+        rows = [
+            rust.poincare_project_into_ball(np.ascontiguousarray(r), self.curvature)
+            for r in flat
+        ]
+        stacked = np.stack(rows, axis=0).reshape(x.shape)
+        return _from_np(stacked, x)
 
     def mobius_add(self, u: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-        """Möbius addition ``u oplus_c v`` for points in the ball.
+        """Möbius addition ``u ⊕_c v`` via the Rust primitive (row-wise)."""
 
-        Both inputs must broadcast against each other along the last axis.
-        """
-
-        return _mobius_add(u, v, self.curvature)
+        if u.shape != v.shape:
+            raise ValueError(
+                f"mobius_add inputs must share shape; got {tuple(u.shape)} and {tuple(v.shape)}"
+            )
+        rust = rust_module()
+        if u.dim() == 1:
+            out = rust.poincare_mobius_add(_np_f64(u), _np_f64(v), self.curvature)
+            return _from_np(out, u)
+        u_flat = u.reshape(-1, u.shape[-1]).detach().cpu().to(torch.float64).numpy()
+        v_flat = v.reshape(-1, v.shape[-1]).detach().cpu().to(torch.float64).numpy()
+        rows = [
+            rust.poincare_mobius_add(
+                np.ascontiguousarray(u_flat[i]),
+                np.ascontiguousarray(v_flat[i]),
+                self.curvature,
+            )
+            for i in range(u_flat.shape[0])
+        ]
+        stacked = np.stack(rows, axis=0).reshape(u.shape)
+        return _from_np(stacked, u)
 
     def distance(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        """Geodesic distance ``d_c(a, b)`` for points in the ball.
+        """Geodesic distance ``d_c(a, b)`` via the Rust primitive (row-wise)."""
 
-        Always evaluated through the Poincaré formula because the Lorentz
-        formula's only practical advantage is for points within ~1e-15 of
-        the boundary, well below the precision of float64 anyway. The
-        denominator ``(1 + c |a|^2)(1 + c |b|^2)`` is clamped to avoid 0/0
-        if a numerical drift puts a point exactly on the boundary.
-        """
-
-        if a.shape[-1] != self.ball_dim or b.shape[-1] != self.ball_dim:
+        if a.shape != b.shape:
             raise ValueError(
-                f"distance expects last dim = {self.ball_dim}; "
-                f"got {tuple(a.shape)} and {tuple(b.shape)}"
+                f"distance inputs must share shape; got {tuple(a.shape)} and {tuple(b.shape)}"
             )
-        return _poincare_distance(a, b, self.curvature, self._sqrt_negc)
+        if a.shape[-1] != self.ball_dim:
+            raise ValueError(
+                f"distance expects last dim = {self.ball_dim}; got {tuple(a.shape)}"
+            )
+        rust = rust_module()
+        if a.dim() == 1:
+            d_scalar = rust.poincare_distance(_np_f64(a), _np_f64(b), self.curvature)
+            return torch.as_tensor(d_scalar, dtype=a.dtype, device=a.device)
+        a_flat = a.reshape(-1, a.shape[-1]).detach().cpu().to(torch.float64).numpy()
+        b_flat = b.reshape(-1, b.shape[-1]).detach().cpu().to(torch.float64).numpy()
+        out = np.empty(a_flat.shape[0], dtype=np.float64)
+        for i in range(a_flat.shape[0]):
+            out[i] = rust.poincare_distance(
+                np.ascontiguousarray(a_flat[i]),
+                np.ascontiguousarray(b_flat[i]),
+                self.curvature,
+            )
+        out = out.reshape(a.shape[:-1])
+        return torch.from_numpy(out).to(dtype=a.dtype, device=a.device)
 
     # ------------------------------------------------------------------ forward
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
-        """Decode gate vector ``z`` into a single ball point.
-
-        ``z`` has shape ``(..., F)`` and the returned tensor has shape
-        ``(..., ball_dim)`` — exactly the broadcasting contract of a linear
-        decoder. The decoder collapses to ``z @ atoms`` in the Euclidean
-        limit ``c -> 0``.
-        """
+        """Decode gate vector ``z`` (shape ``(..., F)``) to a ball point."""
 
         if z.shape[-1] != self.F:
             raise ValueError(
                 f"PoincareAtoms.forward expects z.shape[-1] = {self.F}; "
                 f"got {tuple(z.shape)}"
             )
+        lead_shape = z.shape[:-1]
+        if not lead_shape:
+            z2 = z.unsqueeze(0)
+            collapsed = True
+        else:
+            z2 = z.reshape(-1, self.F)
+            collapsed = False
 
-        atoms = self.atoms.to(dtype=z.dtype, device=z.device)
-        # Numerical safety: keep atoms strictly inside the ball every step.
-        atoms = _project_into_ball(atoms, self._sqrt_negc)
-
-        if self.lorentz:
-            # Map atoms through stereographic projection, take log at the
-            # canonical origin, mix linearly, and map back.
-            atoms_h = _to_lorentz(atoms, self._sqrt_negc)  # (F, d+1)
-            tangents = _lorentz_log0(atoms_h, self._sqrt_negc)  # (F, d) spatial part
-            # Weighted sum: z (..., F) @ tangents (F, d) -> (..., d).
-            v = z @ tangents
-            x_h = _lorentz_exp0(v, self._sqrt_negc)  # (..., d+1)
-            return _from_lorentz(x_h, self._sqrt_negc)
-
-        # Poincaré path.
-        tangents = _log0(atoms, self._sqrt_negc)  # (F, d) in T_0 = R^d
-        v = z @ tangents
-        return _exp0(v, self._sqrt_negc)
+        op = _PoincareLorentzDecode if self.lorentz else _PoincareTangentDecode
+        x2 = op.apply(self.atoms, z2, self.curvature)
+        if collapsed:
+            return x2.squeeze(0)
+        return x2.reshape(*lead_shape, self.ball_dim)
 
 
 __all__ = ["PoincareAtoms"]
