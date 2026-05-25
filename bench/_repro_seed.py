@@ -8,12 +8,10 @@ import sys
 from dataclasses import asdict
 from pathlib import Path
 
-import pandas as pd
-
 BENCH_DIR = Path(__file__).resolve().parent
 REPO_DIR = BENCH_DIR.parent
 sys.path.insert(0, str(REPO_DIR))
-from bench.fuzz_vs_mgcv import select_scenarios_backfilled
+from bench.fuzz_vs_mgcv import pd, select_scenarios_backfilled
 from bench.run_suite import dataset_for_scenario, folds_for_dataset, zscore_train_test
 
 

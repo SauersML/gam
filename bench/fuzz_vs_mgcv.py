@@ -29,8 +29,10 @@ import pandas as pd
 import gamfit
 from gamfit._diagnostics import Diagnostics
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from run_suite import (  # noqa: E402
+ROOT = Path(__file__).resolve().parent.parent
+BENCH_DIR = ROOT / "bench"
+sys.path.insert(0, str(ROOT))
+from bench.run_suite import (  # noqa: E402
     _formula_rhs_from_terms,
     _mgcv_formula_for_scenario,
     _rust_formula_for_scenario,
@@ -51,8 +53,6 @@ from run_suite import (  # noqa: E402
 
 typing.cast(typing.Any, sys.stdout).reconfigure(line_buffering=True)
 
-ROOT = Path(__file__).resolve().parent.parent
-BENCH_DIR = ROOT / "bench"
 SCENARIOS_FILE = BENCH_DIR / "scenarios.json"
 RESULTS_FILE = BENCH_DIR / "fuzz_results.jsonl"
 META_FILE = BENCH_DIR / "fuzz_results.meta.json"

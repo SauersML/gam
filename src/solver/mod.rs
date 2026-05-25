@@ -12,6 +12,9 @@ pub mod outer_strategy;
 pub(crate) mod persistent_warm_start;
 pub mod pirls;
 pub mod protocol;
+pub mod reml {
+    pub mod compare;
+}
 pub mod riemannian;
 pub mod riemannian_retraction;
 pub mod seeding;

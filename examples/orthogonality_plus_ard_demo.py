@@ -15,11 +15,11 @@ def main() -> None:
     d = 6
     t0 = rng.normal(size=(n, d))
     y = np.sin(t0[:, 0]) + 0.35 * t0[:, 1] + 0.12 * rng.normal(size=n)
-    data = pd.DataFrame({"y": y})
+    data = pd.DataFrame(data={"y": y})
 
     gamfit.fit(
-        data,
-        "y ~ s(t, type='duchon', centers=32)",
+        data=data,
+        formula="y ~ s(t, type='duchon', centers=32)",
         latents={"t": gamfit.LatentCoord(n=n, d=d, init=t0)},
         penalties=[
             gamfit.OrthogonalityPenalty(weight=1.0, n_eff=n, target="t"),

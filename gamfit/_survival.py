@@ -28,14 +28,6 @@ _SURVIVAL_MODEL_CLASSES = frozenset(
         "latent survival",
     }
 )
-_SURVIVAL_TIME_GRID_MODEL_CLASSES = frozenset(
-    {
-        "survival",
-        "competing risks survival",
-        "survival marginal-slope",
-        "survival location-scale",
-    }
-)
 _MARGINAL_SLOPE_MODEL_CLASSES = frozenset(
     {
         "bernoulli marginal-slope",
@@ -97,49 +89,38 @@ def competing_risks_cif(
     import numpy as np
 
     if isinstance(predictions, Mapping):
-        names = tuple(str(name) for name in predictions)
         prediction_seq = tuple(predictions.values())
-        if endpoint_names is not None and tuple(endpoint_names) != names:
-            raise ValueError("endpoint_names must match the supplied prediction mapping keys")
+        default_names = tuple(str(name) for name in predictions)
     else:
         prediction_seq = tuple(predictions)
-        names = (
-            tuple(f"endpoint_{idx + 1}" for idx in range(len(prediction_seq)))
-            if endpoint_names is None
-            else tuple(str(name) for name in endpoint_names)
-        )
-    if not prediction_seq:
-        raise ValueError("competing_risks_cif requires at least one endpoint prediction")
-    if len(names) != len(prediction_seq):
-        raise ValueError("endpoint_names must match the number of endpoint predictions")
-    if len(set(names)) != len(names):
-        raise ValueError("endpoint_names must be unique")
+        default_names = tuple(f"endpoint_{idx + 1}" for idx in range(len(prediction_seq)))
+    names = (
+        default_names
+        if endpoint_names is None
+        else tuple(str(name) for name in endpoint_names)
+    )
+
+    times_arr = np.asarray(times, dtype=float).reshape(-1)
+    cumulative_hazards = []
     for idx, prediction in enumerate(prediction_seq):
         if not isinstance(prediction, SurvivalPrediction):
             raise TypeError(
                 "competing_risks_cif expects SurvivalPrediction objects; "
                 f"endpoint {idx} has type {type(prediction).__name__}"
             )
-
-    times_arr = np.asarray(times, dtype=float).reshape(-1)
-    cumulative_hazards = tuple(
-        np.asarray(prediction.cumulative_hazard_at(times_arr), dtype=float)
-        for prediction in prediction_seq
+        cumulative_hazards.append(
+            np.asarray(prediction.cumulative_hazard_at(times_arr), dtype=float)
+        )
+    cif, overall_survival = rust_module().competing_risks_cif_from_predictions(
+        times_arr,
+        cumulative_hazards,
+        names,
     )
-    expected_shape = cumulative_hazards[0].shape
-    if len(expected_shape) != 2:
-        raise ValueError("endpoint predictions must return 2D cumulative hazard arrays")
-    for cumulative_hazard in cumulative_hazards[1:]:
-        if cumulative_hazard.shape != expected_shape:
-            raise ValueError(
-                "all endpoint predictions must return the same (n_rows, n_times) shape"
-            )
-    cif, overall_survival = rust_module().competing_risks_cif(times_arr, cumulative_hazards)
     return CompetingRisksCIF(
         times=times_arr,
         cif=np.asarray(cif, dtype=float),
         overall_survival=np.asarray(overall_survival, dtype=float),
-        cumulative_hazard=cumulative_hazards,
+        cumulative_hazard=tuple(cumulative_hazards),
         endpoint_names=names,
     )
 
@@ -437,9 +418,25 @@ class SurvivalPrediction:
         people_chunk: int = DEFAULT_SURVIVAL_PEOPLE_CHUNK,
         time_grid_chunk: int = DEFAULT_SURVIVAL_TIME_GRID_CHUNK,
     ) -> str:
+        times_arr = self._coerce_times(times)
+        grid, surface = self._ffi_surface("survival")
+        if grid is not None and surface is not None:
+            include_ids = self.id_column is not None and self.row_ids is not None
+            return str(
+                rust_module().write_survival_csv(
+                    str(path),
+                    grid,
+                    surface,
+                    times_arr,
+                    self.id_column if include_ids else None,
+                    list(self.row_ids) if include_ids else None,
+                    people_chunk,
+                    time_grid_chunk,
+                )
+            )
+
         import csv
 
-        times_arr = self._coerce_times(times)
         with Path(path).open("w", newline="", encoding="utf-8") as handle:
             writer = csv.writer(handle)
             if self.id_column is not None and self.row_ids is not None:
@@ -725,7 +722,9 @@ def default_survival_time_grid(
 ) -> list[float] | None:
     from ._binding import rust_module
 
-    result = rust_module().default_survival_time_grid(model_class, formula, list(headers), [list(r) for r in rows])
+    result = rust_module().default_survival_time_grid(
+        model_class, formula, list(headers), [list(r) for r in rows]
+    )
     return list(result) if result is not None else None
 
 
@@ -788,6 +787,5 @@ __all__ = [
     "transformation_normal_z",
     "_MARGINAL_SLOPE_MODEL_CLASSES",
     "_SURVIVAL_MODEL_CLASSES",
-    "_SURVIVAL_TIME_GRID_MODEL_CLASSES",
     "_TRANSFORMATION_NORMAL_MODEL_CLASSES",
 ]

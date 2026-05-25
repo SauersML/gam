@@ -115,6 +115,17 @@ def _coerce_2d(t: torch.Tensor, name: str) -> torch.Tensor:
     return t
 
 
+def _torch_smooth_dispatch_key(class_name: str) -> str:
+    from .._binding import rust_module
+
+    dispatch_key = getattr(rust_module(), "torch_smooth_dispatch_key", None)
+    if not callable(dispatch_key):
+        raise RuntimeError(
+            "gamfit._rust is missing torch_smooth_dispatch_key; rebuild gamfit"
+        )
+    return str(dispatch_key(class_name))
+
+
 def _build_design_penalty(
     smooth: Smooth, points: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -127,7 +138,6 @@ def _build_design_penalty(
     Returns (design (N, M), penalty (M, M)) as float64 torch tensors.
     """
     from .. import duchon_function_norm_penalty
-    from .. import _rust
 
     points = _coerce_2d(points, "points")
     N = points.shape[0]
@@ -139,7 +149,7 @@ def _build_design_penalty(
     # `points`, `centers`, and `by`; ``isinstance`` is used so pyright narrows
     # ``smooth`` to the matching subclass on each branch.
     try:
-        entry = _rust.torch_smooth_dispatch_key(type(smooth).__name__)
+        entry = _torch_smooth_dispatch_key(type(smooth).__name__)
     except ValueError as exc:
         # Recognised-but-unsupported specs raise NotImplementedError to match
         # the previous Python cascade. Truly unknown class names raise
@@ -185,17 +195,17 @@ def _build_design_penalty(
                 f"BSpline is 1D-only; got points with d={points.shape[1]}. "
                 "Use TensorBSpline for multi-d with different units, or Duchon for radial."
             )
-        knots_spec = smooth.knots
-        degree = smooth.degree
-        periodic = smooth.periodic
-        penalty_order = smooth.penalty_order
+        bspline_knots = smooth.knots
+        bspline_degree = smooth.degree
+        bspline_periodic = smooth.periodic
+        bspline_penalty_order = smooth.penalty_order
         knots = (
-            _to_tensor(knots_spec, points).reshape(-1)
-            if knots_spec is not None
+            _to_tensor(bspline_knots, points).reshape(-1)
+            if bspline_knots is not None
             else None
         )
         design = bspline_basis(
-            points.squeeze(1), knots, degree=degree, periodic=periodic,
+            points.squeeze(1), knots, degree=bspline_degree, periodic=bspline_periodic,
         )
         from .._api import smoothness_penalty as _smoothness_penalty
         if knots is not None:
@@ -205,10 +215,10 @@ def _build_design_penalty(
             knots_np = _resolve_knots(
                 None,
                 points.squeeze(1).detach().cpu().to(torch.float64).numpy(),
-                label="knots", degree=degree,
+                label="knots", degree=bspline_degree,
             )
         penalty_np, _null_basis = _smoothness_penalty(
-            knots_np, degree=degree, order=penalty_order,
+            knots_np, degree=bspline_degree, order=bspline_penalty_order,
         )
         penalty = torch.as_tensor(penalty_np, dtype=torch.float64, device=points.device)
         return design.to(torch.float64), penalty

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Callable, Sequence, cast
+from typing import Any, Callable, Protocol, Sequence, cast, runtime_checkable
 
 import numpy as np
 import torch
@@ -14,6 +14,11 @@ from torch.optim import Optimizer
 from .._binding import rust_module
 from .._select_topology import TopologyAutoSelector
 from ._coerce import from_numpy_like, to_numpy_f64
+
+
+@runtime_checkable
+class _ManifoldJson(Protocol):
+    def to_json(self) -> dict[str, Any]: ...
 
 
 def _check_matrix(value: torch.Tensor, name: str) -> torch.Tensor:
@@ -542,7 +547,7 @@ class GumbelTemperatureSchedule:
 class RiemannianRetraction(Optimizer):
     """Optimizer that retracts Euclidean gradient steps onto a manifold."""
 
-    def __init__(self, params: Any, manifold: str | dict[str, Any], lr: float = 1e-2, inner_steps: int = 1) -> None:
+    def __init__(self, params: Any, manifold: str | dict[str, Any] | _ManifoldJson, lr: float = 1e-2, inner_steps: int = 1) -> None:
         if lr <= 0.0:
             raise ValueError("lr must be > 0")
         if inner_steps <= 0:
@@ -554,7 +559,7 @@ class RiemannianRetraction(Optimizer):
     @torch.no_grad()
     def step(self, closure: Callable[[], torch.Tensor] | None = None) -> torch.Tensor | None:
         loss = closure() if closure is not None else None
-        manifold_spec = self.manifold.to_json() if hasattr(self.manifold, "to_json") else self.manifold
+        manifold_spec = self.manifold.to_json() if isinstance(self.manifold, _ManifoldJson) else self.manifold
         manifold_json = json.dumps(manifold_spec if isinstance(manifold_spec, dict) else {"kind": manifold_spec})
         for group in self.param_groups:
             lr = float(group["lr"])
