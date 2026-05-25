@@ -134,18 +134,18 @@ def test_curved_circle_atom_oos_r2():
     # Reuse the trained atom to score held-out rows. The fit result must
     # expose enough state for this — a working engine offers a `predict`
     # or `reconstruct` method on the fit object.
+    assert hasattr(fit, "reconstruct") or hasattr(fit, "predict"), (
+        "SaeManifoldFitResult must expose an OOS prediction method "
+        "(`reconstruct` or `predict`); neither is implemented. "
+        "In-sample R^2 was {:.4f} so training works, but held-out scoring "
+        "is impossible without a predict surface — this is a regression.".format(
+            in_sample
+        )
+    )
     if hasattr(fit, "reconstruct"):
         oos_fitted = fit.reconstruct(z_test)
-    elif hasattr(fit, "predict"):
-        oos_fitted = fit.predict(z_test)
     else:
-        pytest.skip(
-            "SaeManifoldFitResult does not expose an OOS prediction method; "
-            "the in-sample R^2 was {:.4f} so the training side works, but "
-            "we cannot score held-out rows without a predict surface.".format(
-                in_sample
-            )
-        )
+        oos_fitted = fit.predict(z_test)
 
     oos = _r2(z_test, oos_fitted)
     assert oos >= 0.85, (
