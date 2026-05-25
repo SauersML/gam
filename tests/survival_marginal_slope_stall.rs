@@ -58,6 +58,8 @@ static LOGGER: StderrInfoLogger = StderrInfoLogger;
 static INIT_LOGGER: Once = Once::new();
 
 fn init() {
+    #[cfg(target_os = "macos")]
+    gam::gpu::configure_global_policy(gam::gpu::GpuPolicy::Off);
     init_parallelism();
     INIT_LOGGER.call_once(|| {
         if log::set_logger(&LOGGER).is_ok() {
