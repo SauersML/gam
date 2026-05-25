@@ -2358,16 +2358,33 @@ mod tests {
             1.0e-6,
         );
 
+        let sphere_coords = array![
+            [-0.7, -1.2],
+            [-0.25, 0.0],
+            [0.35, 0.9],
+            [0.8, 2.1]
+        ];
         assert_jacobian_matches_central_difference(
             &SphereChartEvaluator,
-            array![
-                [-0.7, -1.2],
-                [-0.25, 0.0],
-                [0.35, 0.9],
-                [0.8, 2.1]
-            ],
+            sphere_coords.clone(),
             1.0e-6,
         );
+        let (sphere_phi, sphere_jet) = SphereChartEvaluator.evaluate(sphere_coords.view()).unwrap();
+        assert_eq!(sphere_phi.dim(), (sphere_coords.nrows(), 7));
+        for row in 0..sphere_coords.nrows() {
+            let lat = sphere_coords[[row, 0]];
+            let lon = sphere_coords[[row, 1]];
+            let clat = lat.cos();
+            let slat = lat.sin();
+            let clon = lon.cos();
+            let slon = lon.sin();
+            let z = slat;
+            let dx_dlon = -clat * slon;
+            let dy_dlon = clat * clon;
+            assert_eq!(sphere_jet[[row, 3, 1]], 0.0);
+            assert!((sphere_jet[[row, 5, 1]] - dy_dlon * z).abs() <= 1.0e-12);
+            assert!((sphere_jet[[row, 6, 1]] - dx_dlon * z).abs() <= 1.0e-12);
+        }
 
         assert_jacobian_matches_central_difference(
             &AffineCoordinateEvaluator::new(3),

@@ -746,31 +746,31 @@ impl PenaltyPseudologdet {
             .eigh(Side::Lower)
             .map_err(|e| format!("PenaltyPseudologdet eigendecomposition failed: {e}"))?;
 
-        let (rank, nullity) = if let Some(m0) = structural_nullity {
-            let m0 = m0.min(p_dim);
-            (p_dim - m0, m0)
-        } else {
-            let threshold =
-                super::unified::positive_eigenvalue_threshold(evals.as_slice().unwrap());
-            let rank = evals.iter().filter(|&&e| e > threshold).count();
-            (rank, p_dim - rank)
-        };
+        let threshold = super::unified::positive_eigenvalue_threshold(evals.as_slice().unwrap());
+        let structural_nullity = structural_nullity.map(|m0| m0.min(p_dim));
+        let mut positive_indices = Vec::with_capacity(p_dim);
+        let mut null_indices = Vec::with_capacity(p_dim);
+        for (idx, &eval) in evals.iter().enumerate() {
+            let structurally_null = structural_nullity.is_some_and(|m0| idx < m0);
+            if !structurally_null && eval > threshold {
+                positive_indices.push(idx);
+            } else {
+                null_indices.push(idx);
+            }
+        }
+        let rank = positive_indices.len();
+        let nullity = null_indices.len();
 
         // Value: log|S|₊ = Σ log σ_i for positive eigenvalues.
-        // Eigenvalues are ascending, so the last `rank` are the positive ones.
-        let value: f64 = evals
+        let value: f64 = positive_indices
             .iter()
-            .rev()
-            .take(rank)
-            .map(|&e| e.max(1e-300).ln())
+            .map(|&idx| evals[idx].ln())
             .sum();
 
         // W factor: p × rank, W_{:,j} = u_j / √σ_j for positive eigenvalues.
-        // Eigenvalues are ascending, so positive eigenvalues are the last `rank`.
         let mut w_factor = Array2::<f64>::zeros((p_dim, rank));
         let mut inv_evals_sq = Array1::<f64>::zeros(rank);
-        for col in 0..rank {
-            let idx = nullity + col;
+        for (col, &idx) in positive_indices.iter().enumerate() {
             let ev = evals[idx];
             let scale = 1.0 / ev.sqrt();
             inv_evals_sq[col] = 1.0 / (ev * ev);
@@ -779,12 +779,13 @@ impl PenaltyPseudologdet {
             }
         }
 
-        // Null-space eigenvectors U₀: first `nullity` columns.
+        // Null-space eigenvectors U₀: structural nulls plus values below the
+        // dimension-aware positive-eigenvalue threshold.
         let u_null = if nullity > 0 {
             let mut u0 = Array2::<f64>::zeros((p_dim, nullity));
-            for col in 0..nullity {
+            for (col, &idx) in null_indices.iter().enumerate() {
                 for row in 0..p_dim {
-                    u0[[row, col]] = evecs[[row, col]];
+                    u0[[row, col]] = evecs[[row, idx]];
                 }
             }
             Some(u0)

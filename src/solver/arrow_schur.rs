@@ -1873,6 +1873,54 @@ where
     })
 }
 
+/// Predicted reduction of the damped joint Arrow-Schur quadratic model.
+///
+/// The cross term deliberately uses the same stored `H_tβ` block sign as the
+/// Schur reduction and back-substitution:
+///
+/// `m(δ) - m(0) = gᵀδ + 0.5 δᵀ(H + ridge)δ`.
+pub fn arrow_quadratic_model_reduction(
+    sys: &ArrowSchurSystem,
+    delta_t: ArrayView1<'_, f64>,
+    delta_beta: ArrayView1<'_, f64>,
+    ridge_t: f64,
+    ridge_beta: f64,
+) -> Result<f64, ArrowSchurError> {
+    assert_eq!(delta_t.len(), sys.rows.len() * sys.d);
+    assert_eq!(delta_beta.len(), sys.k);
+    let mut lin = sys.gb.dot(&delta_beta);
+    let mut quad = ridge_beta * delta_beta.dot(&delta_beta);
+
+    let mut hbb_delta = Array1::<f64>::zeros(sys.k);
+    if let Some(hbb_matvec) = sys.hbb_matvec.as_ref() {
+        hbb_matvec(delta_beta, &mut hbb_delta);
+    } else if sys.hbb.dim() == (sys.k, sys.k) {
+        hbb_delta.assign(&sys.hbb.dot(&delta_beta));
+    } else {
+        return Err(ArrowSchurError::SchurFactorFailed {
+            reason: "Arrow-Schur predicted reduction requires a dense H_ββ block or matrix-free H_ββ operator".to_string(),
+        });
+    }
+    quad += delta_beta.dot(&hbb_delta);
+
+    for (i, row) in sys.rows.iter().enumerate() {
+        let base = i * sys.d;
+        for c in 0..sys.d {
+            let dt_c = delta_t[base + c];
+            lin += row.gt[c] * dt_c;
+            quad += ridge_t * dt_c * dt_c;
+            for r in 0..sys.d {
+                quad += dt_c * row.htt[[c, r]] * delta_t[base + r];
+            }
+            for b in 0..sys.k {
+                quad += 2.0 * dt_c * row.htbeta[[c, b]] * delta_beta[b];
+            }
+        }
+    }
+
+    Ok(-(lin + 0.5 * quad))
+}
+
 fn next_proximal_ridge(current: f64, growth: f64) -> f64 {
     if current > 0.0 {
         current * growth
