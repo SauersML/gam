@@ -90,7 +90,8 @@ pub fn compare_reml_fits(mut candidates: Vec<RemlCandidate>) -> Result<RemlCompa
 
     let evidence_summary = if candidates.len() >= 2 {
         let runner_up = &candidates[1];
-        let best_log_bayes_factor_vs_runner_up = best_score - runner_up.score;
+        let runner_up_log_bayes_factor_vs_best = runner_up.score - best_score;
+        let best_log_bayes_factor_vs_runner_up = -runner_up_log_bayes_factor_vs_best;
         format!(
             "{} wins by Bayes factor {} over {}",
             winner,
@@ -177,6 +178,8 @@ mod tests {
         assert_eq!(comparison.ranking[1].delta, -3.0);
         assert!((comparison.ranking[1].bayes_factor - (-3.0_f64).exp()).abs() < 1e-12);
         assert_eq!(comparison.score_table[1].delta_reml, -3.0);
-        assert!((comparison.score_table[1].bayes_factor_vs_best - (-3.0_f64).exp()).abs() < 1e-12);
+        assert!(
+            (comparison.score_table[1].bayes_factor_vs_best - (-3.0_f64).exp()).abs() < 1e-12
+        );
     }
 }
