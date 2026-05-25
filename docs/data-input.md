@@ -61,8 +61,9 @@ encoded by the engine.
 
 ## What `predict()` returns
 
-By default, the return container matches the input kind, falling back to
-the training kind, then to `dict`. Override with `return_type=`:
+By default, pandas/polars/numpy/pyarrow prediction inputs return the
+same kind, while other inputs fall back to the training kind, then to
+`dict`. Override with `return_type=`:
 
 | `return_type` | Returns |
 | --- | --- |
