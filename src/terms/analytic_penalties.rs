@@ -7912,7 +7912,8 @@ mod tests {
         let tau = 0.25_f64;
         let eps = 0.04_f64;
         let weight = 1.3_f64;
-        let target_values = Array1::from_vec((1..=5).map(|step| tau + step as f64 * eps).collect());
+        let target_values =
+            Array1::from_vec((1..=5).map(|step| tau + step as f64 * eps).collect());
         let slice = PsiSlice::full(target_values.len(), Some(1));
         let pen = JumpReLUPenalty::new(slice, array![tau], weight, eps)
             .expect("valid JumpReLU penalty");
