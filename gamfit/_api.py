@@ -1484,6 +1484,29 @@ def smoothness_penalty(
     return np.asarray(penalty, dtype=float), np.asarray(null_basis, dtype=float)
 
 
+def mechanism_sparsity_jacobian(weight: float, epsilon: float, w: Any) -> tuple[float, Any]:
+    """Evaluate the Rust mechanism-sparsity Jacobian penalty and gradient."""
+
+    try:
+        return rust_module().mechanism_sparsity_jacobian(float(weight), float(epsilon), w)
+    except Exception as exc:
+        raise map_exception(exc) from exc
+
+
+def conditional_prior_ivae(
+    weight: float,
+    t: Any,
+    mean: Any,
+    scale: Any,
+) -> tuple[float, Any]:
+    """Evaluate the Rust iVAE conditional-prior penalty and gradient."""
+
+    try:
+        return rust_module().conditional_prior_ivae(float(weight), t, mean, scale)
+    except Exception as exc:
+        raise map_exception(exc) from exc
+
+
 def periodic_spline_curve_basis(
     t: Any,
     n_knots: int,
