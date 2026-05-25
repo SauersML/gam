@@ -16108,12 +16108,20 @@ impl IvaeRidgeMeanGauge {
     fn new(
         py: Python<'_>,
         aux: &Bound<'_, PyAny>,
-        weight: f64,
-        n_eff: i64,
-        ridge_eps: f64,
-        learnable: bool,
+        weight: &Bound<'_, PyAny>,
+        n_eff: &Bound<'_, PyAny>,
+        ridge_eps: &Bound<'_, PyAny>,
+        learnable: &Bound<'_, PyAny>,
         target: PyObject,
     ) -> PyResult<Self> {
+        let builtins = py.import("builtins")?;
+        let weight = builtins.getattr("float")?.call1((weight,))?.extract::<f64>()?;
+        let n_eff = builtins.getattr("int")?.call1((n_eff,))?.extract::<i64>()?;
+        let ridge_eps = builtins
+            .getattr("float")?
+            .call1((ridge_eps,))?
+            .extract::<f64>()?;
+        let learnable = learnable.is_truthy()?;
         let aux = aux_conditional_prior_float_array(py, aux)?;
         validate_ivae_ridge_mean_gauge_aux(&aux, weight, n_eff, ridge_eps)?;
         Ok(Self {
@@ -16184,7 +16192,7 @@ fn validate_ivae_ridge_mean_gauge_aux(
     n_eff: i64,
     ridge_eps: f64,
 ) -> PyResult<()> {
-    if weight <= 0.0 {
+    if !(weight > 0.0) {
         return Err(PyValueError::new_err(format!(
             "IvaeRidgeMeanGauge.weight must be > 0, got {weight}"
         )));
