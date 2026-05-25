@@ -2582,6 +2582,20 @@ pub struct BasisBuildResult {
     /// penalties. Downstream consumers route through the `Some` entries to
     /// avoid materializing dense `p x p` Grams in exact operator algebra.
     pub ops: Vec<Option<std::sync::Arc<dyn crate::terms::penalty_op::PenaltyOp>>>,
+    /// Per-active-penalty null-space eigenvector matrices (parallel to
+    /// `penalties`). Each entry is `Some(U_null)` with `U_null.ncols() ==
+    /// nullspace_dims[k]` when the active block has a non-trivial null space
+    /// (eigenvalues ≤ spectral tolerance), and `None` when the block is
+    /// already full-rank. The columns of `U_null` are the eigenvectors of
+    /// `sym_penalty` at the (near-)zero eigenvalues — i.e., an orthonormal
+    /// basis of `null(S_block)` in the block's own coordinate system.
+    ///
+    /// This is the raw spectral data that the construction pipeline uses to
+    /// absorb each smooth's penalty null space into the parametric block
+    /// (reparameterize-and-split). Without absorption the inner Newton solve
+    /// cannot converge on data whose unpenalized signal lies along a null
+    /// direction of `S` (phantom-multiplier refusal at the KKT certificate).
+    pub null_eigenvectors: Vec<Option<Array2<f64>>>,
 }
 
 impl std::fmt::Debug for BasisBuildResult {
@@ -2600,6 +2614,20 @@ impl std::fmt::Debug for BasisBuildResult {
                     self.ops
                         .iter()
                         .map(|o| if o.is_some() { "Some" } else { "None" })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            )
+            .field(
+                "null_eigenvectors",
+                &format_args!(
+                    "[{}]",
+                    self.null_eigenvectors
+                        .iter()
+                        .map(|u| match u {
+                            Some(m) => format!("Some({}x{})", m.nrows(), m.ncols()),
+                            None => "None".to_string(),
+                        })
                         .collect::<Vec<_>>()
                         .join(", ")
                 ),
