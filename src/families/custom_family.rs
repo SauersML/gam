@@ -26716,6 +26716,75 @@ mod tests {
     }
 
     #[test]
+    fn joint_trust_region_block_metric_does_not_starve_unrelated_blocks() {
+        const TIME_W: usize = 12;
+        const MARG_W: usize = 11;
+        const LOG_W: usize = 10;
+        const P: usize = TIME_W + MARG_W + LOG_W;
+
+        let mut h = Array2::<f64>::zeros((P, P));
+        let mut g = Array1::<f64>::zeros(P);
+        h[[0, 0]] = 2.24e8;
+        g[0] = -5.6e8;
+        for i in 1..TIME_W {
+            h[[i, i]] = 1.0 + 0.3 * i as f64;
+            g[i] = -0.3 - 0.07 * i as f64;
+        }
+        for j in 0..MARG_W {
+            let idx = TIME_W + j;
+            h[[idx, idx]] = 1.2 + 0.2 * j as f64;
+            g[idx] = -0.9;
+        }
+        let log0 = TIME_W + MARG_W;
+        h[[log0, log0]] = 1.0e-5;
+        g[log0] = -2.173;
+        for k in 1..LOG_W {
+            let idx = log0 + k;
+            h[[idx, idx]] = 1.5 + 0.1 * k as f64;
+            g[idx] = -0.4;
+        }
+
+        let mut newton = Array1::<f64>::zeros(P);
+        for i in 0..P {
+            newton[i] = -g[i] / h[[i, i]];
+        }
+
+        let mut raw_global = newton.clone();
+        truncate_joint_step_to_radius(&mut raw_global, 20.0);
+        let raw_linearized = (&g + &h.dot(&raw_global))
+            .iter()
+            .map(|v| v.abs())
+            .fold(0.0_f64, f64::max)
+            / (1.0 + g.iter().map(|v| v.abs()).fold(0.0_f64, f64::max));
+        assert!(
+            raw_linearized > 0.99,
+            "raw concatenated L2 truncation should reproduce the starvation mechanism"
+        );
+
+        let ranges = vec![(0, TIME_W), (TIME_W, TIME_W + MARG_W), (TIME_W + MARG_W, P)];
+        let metric_diag = h.diag().to_owned();
+        let full_block_norms =
+            joint_trust_region_block_metric_norms(&newton, &ranges, &metric_diag);
+        let mut block_metric = newton.clone();
+        let block_radii = vec![full_block_norms[0], full_block_norms[1], 20.0];
+        truncate_joint_step_to_block_metric_radii(
+            &mut block_metric,
+            &ranges,
+            &metric_diag,
+            &block_radii,
+        );
+        let block_linearized = (&g + &h.dot(&block_metric))
+            .iter()
+            .map(|v| v.abs())
+            .fold(0.0_f64, f64::max)
+            / (1.0 + g.iter().map(|v| v.abs()).fold(0.0_f64, f64::max));
+        assert!(
+            block_linearized < 1.0e-6,
+            "block-local curvature metric must let the time block neutralize its KKT defect; got {block_linearized:.3e}"
+        );
+    }
+
+    #[test]
     fn joint_trust_region_rosenbrock_like_quadratic_is_armijo_safe() {
         // Local Rosenbrock-at-the-valley quadratic in variables (x, y):
         // f ≈ 0.5 * [dx, dy]' H [dx, dy], H = [[802, -400], [-400, 200]].
