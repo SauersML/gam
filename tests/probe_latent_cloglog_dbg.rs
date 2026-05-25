@@ -14,16 +14,23 @@ fn probe_latent_cloglog_values() {
     let mut prev = f64::NEG_INFINITY;
     for x in &eta {
         let (mu, _) = inverse_link_mu_d1_for_inverse_link(&link, *x).unwrap();
-        if mu < prev || mu > 1.0 || mu < 0.0 {
-            eprintln!("ANOMALY eta={:.6} mu={:.10} prev={:.10}", x, mu, prev);
-        }
-        if (*x > -5.0 && *x < -3.0) || mu > 0.5 && *x < -3.0 {
-            eprintln!("trace eta={:.6} mu={:.10}", x, mu);
-        }
+        assert!(
+            mu >= 0.0 && mu <= 1.0,
+            "mu out of [0,1] at eta={x}: mu={mu}"
+        );
+        assert!(
+            mu + 1e-12 >= prev,
+            "mu non-monotone at eta={x}: mu={mu} prev={prev}"
+        );
         prev = mu;
     }
-    for &x in &[-40.0_f64, -20.0, -15.0, -10.0, -7.0, -5.0, -4.0, -3.5, -3.17, -3.0, -2.0, 0.0, 3.0] {
+    for &x in &[
+        -40.0_f64, -20.0, -15.0, -10.0, -7.0, -5.0, -4.0, -3.5, -3.17, -3.0, -2.0, 0.0, 3.0,
+    ] {
         let (mu, _) = inverse_link_mu_d1_for_inverse_link(&link, x).unwrap();
-        eprintln!("probe eta={} mu={}", x, mu);
+        assert!(
+            mu.is_finite() && (0.0..=1.0).contains(&mu),
+            "probe eta={x} mu={mu} invalid"
+        );
     }
 }
