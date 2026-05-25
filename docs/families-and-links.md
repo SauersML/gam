@@ -1,7 +1,7 @@
 # Families and link functions
 
-`gamfit` supports Gaussian, binomial, Poisson, Gamma, and Royston-Parmar
-GLM-style likelihoods, plus survival ([survival.md](survival.md)),
+`gamfit` supports Gaussian, binomial, Poisson, negative-binomial, beta,
+Gamma, and Royston-Parmar likelihoods, plus survival ([survival.md](survival.md)),
 conditional transformation-normal ([marginal-slope.md](marginal-slope.md)),
 location-scale ([location-scale.md](location-scale.md)) and
 marginal-slope families. The family is inferred from the response unless
@@ -14,41 +14,41 @@ overridden via `family=`.
 | Binary `{0, 1}` | binomial | logit |
 | Continuous numeric | Gaussian | identity |
 | Non-negative integer with `link(type=log)` | Poisson | log |
-| Positive non-integer with `link(type=log)` | Gamma | log |
+| Otherwise, with `link(type=log)` | Gamma | log |
 | `Surv(entry, exit, event)` | survival | depends on `survival_likelihood` |
 
-When `link(type=log)` is set, Poisson vs Gamma is chosen automatically
+When the log link is set, Poisson vs Gamma is chosen automatically
 by whether the response is integer-valued — `family=` is optional:
 
 ```python
-gamfit.fit(df, "y ~ s(x) + link(type=log)")     # auto-routes Poisson/Gamma
-gamfit.fit(df, "y ~ s(x) + link(type=log)", family="poisson")  # explicit
+gamfit.fit(df, "y ~ s(x)", link="log")     # auto-routes Poisson/Gamma
+gamfit.fit(df, "y ~ s(x)", family="poisson", link="log")  # explicit
 ```
 
 ## Setting family and link
 
 The `family=` kwarg accepts `"gaussian"`, `"binomial"` (aliases
 `"binomial-logit"`, `"binomial-probit"`, `"binomial-cloglog"`),
-`"latent-cloglog-binomial"`, `"poisson"`, and `"gamma"`. Omitting
+`"latent-cloglog-binomial"`, `"poisson"`, `"negative-binomial"`
+(aliases `"nb"`, `"negbin"`), `"beta"` (alias `"beta-regression"`),
+and `"gamma"`. Omitting
 `family=` triggers auto-detection. Survival, transformation-normal,
 and Bernoulli marginal-slope families are selected via `Surv(...)` or
-dedicated flags (`--transformation-normal`, `--z-column`/`--logslope-formula`),
-not via `family=`. The link can be set in the formula via
-`link(type=...)` or with the `link=` kwarg. If both are set, the formula
-specification takes precedence.
+dedicated fit options (Python: `transformation_normal=True`,
+`z_column=`/`logslope_formula=`; CLI: `--transformation-normal`,
+`--z-column`/`--logslope-formula`). In `gamfit`, set standard-family
+links with the `link=` kwarg. In the CLI, set them in the formula via
+`link(type=...)`.
 
 ```python
-# Formula
-gamfit.fit(df, "case ~ s(age) + link(type=probit)")
-
-# Kwarg
 gamfit.fit(df, "case ~ s(age)", link="probit")
 ```
 
 ## Link functions
 
-The engine recognises the following link types in `link(type=...)` and
-`--link`:
+The engine recognises the following link types in formula `link(type=...)`
+and the Python `link=` kwarg. There is no top-level `gam fit --link`
+flag; CLI fits use formula-level `link(...)`.
 
 ### `identity`
 
@@ -75,7 +75,7 @@ Inverse link `exp(eta)`. Pair with `family="poisson"` for counts and
 
 ```python
 gamfit.fit(df, "count ~ s(time) + link(type=log)",
-           family="poisson", offset="log_exposure")
+           family="poisson", link="log", offset="log_exposure")
 ```
 
 Pass the offset column via `offset=`; do not include it on the formula RHS.
@@ -132,7 +132,8 @@ See [formulas.md](formulas.md#linkwiggle-flexible-link-offset) for
 
 `firth=True` activates Firth's bias-reduced estimator. The shared
 implementation is available only for the standard logit binomial family
-(`LikelihoodFamily::BinomialLogit`); other families reject `firth=True`.
+(`LikelihoodSpec::binomial_logit()`, i.e. binomial response with standard
+logit inverse link); other families reject `firth=True`.
 Firth is not compatible with survival models, location-scale fitting, or
 the Bernoulli marginal-slope family.
 
@@ -144,8 +145,9 @@ gamfit.fit(df, "rare_event ~ s(x)", family="binomial-logit", firth=True)
 
 ```python
 gamfit.fit(df,
-    "count ~ s(age) + link(type=log)",
+    "count ~ s(age)",
     family="poisson",
+    link="log",
     offset="log_exposure",
     weights="freq",
 )

@@ -44,8 +44,9 @@ print(gamfit.build_info())
 ```
 
 `build_info()` returns a dict. `available: True` means the Rust
-extension loaded. On `available: False`, call
-`gamfit.explain_error(...)` for a diagnostic.
+extension loaded. On `available: False`, inspect the `reason` field;
+`gamfit.explain_error(exc)` gives hints for exceptions raised by
+Rust-backed calls.
 
 ## First model
 
@@ -92,14 +93,14 @@ For pointwise Wald intervals, pass `interval=`:
 
 ```python
 preds = model.predict([{"x": 1.5}, {"x": 2.5}], interval=0.95)
-# Columns: eta, mean, effective_se, mean_lower, mean_upper
+# Columns: eta, mean, effective_se, effective_variance, mean_lower, mean_upper
 ```
 
 Transformation-normal and Bernoulli marginal-slope models return a 1-D
 NumPy array by default; passing `id_column=` or `return_type=` switches
 them to the table form. Survival models return a `SurvivalPrediction`
 object with `.hazard_at(...)`, `.survival_at(...)`,
-`.cumulative_hazard_at(...)`, and `.failure_at(...)`.
+`.cumulative_hazard_at(...)`, chunk iterators, and CSV writers.
 
 See [predictions.md](predictions.md) for details on `return_type`,
 `id_column`, and `SurvivalPrediction`.
@@ -108,7 +109,7 @@ See [predictions.md](predictions.md) for details on `return_type`,
 
 ```python
 model.summary()                     # Summary object
-model.diagnose(train).metrics       # n_obs, mae, rmse, bias, r_squared
+model.diagnose(train).metrics       # n_obs, mae, rmse, bias, optional r_squared
 model.check(test).ok                # schema check against training
 model.plot(train, x="x")            # matplotlib (requires gamfit[plot])
 model.report("out.html")            # standalone HTML report
@@ -116,9 +117,9 @@ model.report("out.html")            # standalone HTML report
 
 `Model.summary()` returns a `Summary` carrying the formula, family
 name, model class, deviance, REML/LAML criterion (in the `reml_score`
-field), per-coefficient estimates with standard errors and
-credible-interval bounds, smoothing parameters, and group metadata.
-The summary is cached after the first call.
+field), per-coefficient estimates with optional standard errors,
+smoothing parameters, covariance metadata, deployment extensions, and
+group metadata.
 
 See [diagnostics.md](diagnostics.md) for the full list.
 
@@ -142,7 +143,7 @@ posterior of the coefficients conditional on those estimates:
 posterior = model.sample(train, seed=42)
 print(posterior)
 # PosteriorSamples(n_draws=..., n_coeffs=8, method='nuts',
-#                  rhat=1.004, ess=..., converged=True)
+#                  rhat=1.0040, ess=..., converged=True)
 
 bands = posterior.predict(test, level=0.95)
 ```
