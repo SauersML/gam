@@ -1154,12 +1154,77 @@ def test_torch_monotone_increasing_smooth() -> None:
     )
 
 
+<<<<<<< Updated upstream
 def test_torch_convex_smooth() -> None:
     """Constrained BSpline fit through gamfit.torch.fit enforces convexity
     (second differences ≥ 0) on x ∈ [0, 1]."""
     torch = pytest.importorskip("torch")
     from gamfit import BSpline
     from gamfit.torch import fit as torch_fit
+=======
+def _fit_monotone_or_convex_smooth(
+    *,
+    y_of_x: typing.Callable[[np.ndarray], np.ndarray],
+    constraint: str,
+    n: int = 80,
+    noise: float = 0.05,
+    seed: int = 0,
+) -> tuple[np.ndarray, np.ndarray]:
+    rng = np.random.default_rng(seed)
+    x = np.linspace(0.0, 1.0, n)
+    y = y_of_x(x) + noise * rng.standard_normal(n)
+    df = pd.DataFrame({"x": x, "y": y})
+    model = gamfit.fit(
+        df, "y ~ s(x)", constraints={"s(x)": constraint}
+    )
+    grid = pd.DataFrame({"x": np.linspace(0.0, 1.0, 200)})
+    predicted = model.predict(grid)
+    fitted = np.asarray(predicted["mean"], dtype=float)
+    return np.asarray(grid["x"], dtype=float), fitted
+
+
+def test_shape_constraint_monotone_increasing_via_formula() -> None:
+    _, fitted = _fit_monotone_or_convex_smooth(
+        y_of_x=lambda x: x**2, constraint="monotone_increasing"
+    )
+    diffs = np.diff(fitted)
+    # Tiny numerical slack for active-set boundary residuals.
+    assert diffs.min() >= -1e-6, (
+        f"fitted curve is not monotone increasing: min diff = {diffs.min():.3e}"
+    )
+
+
+def test_shape_constraint_monotone_decreasing_via_formula() -> None:
+    _, fitted = _fit_monotone_or_convex_smooth(
+        y_of_x=lambda x: -(x**2), constraint="monotone_decreasing"
+    )
+    diffs = np.diff(fitted)
+    assert diffs.max() <= 1e-6, (
+        f"fitted curve is not monotone decreasing: max diff = {diffs.max():.3e}"
+    )
+
+
+def test_shape_constraint_convex_via_formula() -> None:
+    _, fitted = _fit_monotone_or_convex_smooth(
+        y_of_x=lambda x: (x - 0.5) ** 2, constraint="convex"
+    )
+    second_diffs = np.diff(fitted, n=2)
+    assert second_diffs.min() >= -1e-6, (
+        f"fitted curve is not convex: min second-diff = {second_diffs.min():.3e}"
+    )
+
+
+def test_per_smooth_lambda_not_in_torch_additive_pending_rust_refactor() -> None:
+    # The torch additive REML path is structurally single-λ because the
+    # closed-form Gaussian REML kernel in
+    # crates/gam-core/src/solver/gaussian_reml.rs only handles one scalar λ.
+    # Per-smooth λ requires extending that Rust kernel to multi-block
+    # (multi-d outer optimisation + analytic VJP through the F×F Hessian +
+    # per-block eigendecomposition routing). This test tracks the gap.
+    #
+    # delete this test when the multi-block closed-form REML kernel ships
+    from gamfit.torch._multi_lambda_status import MULTI_LAMBDA_SUPPORTED
+>>>>>>> Stashed changes
 
     rng = np.random.default_rng(1)
     n = 240
