@@ -1001,6 +1001,8 @@ fn survival_chunk_iter_collect<'py>(
                             &sorted_indices,
                             row_idx,
                             times_values[time_idx],
+                            kind_left_value,
+                            kind_right_value,
                         );
                         values[out_row_start + time_idx] =
                             clip_survival_surface_value(interpolated, clip_lo, clip_hi);
