@@ -3744,10 +3744,7 @@ fn compare_reml_fits(
         table_row.set_item("name", row.name.as_str())?;
         table_row.set_item("reml_score", row.reml_score)?;
         table_row.set_item("delta_reml", row.delta_reml)?;
-        table_row.set_item(
-            "bayes_factor_best_over_model",
-            row.bayes_factor_best_over_model,
-        )?;
+        table_row.set_item("bayes_factor_vs_best", row.bayes_factor_vs_best)?;
         table_row.set_item("effective_dof", row.effective_dof)?;
         score_table.append(table_row)?;
     }
@@ -9131,6 +9128,23 @@ fn sae_manifold_fit_auto<'py>(
     let z_view = z.as_array();
     let (n_obs, _p_out) = z_view.dim();
     let k_atoms = atom_basis.len();
+    if n_obs == 0 || z_view.ncols() == 0 {
+        return Err(py_value_error(format!(
+            "sae_manifold_fit_auto: z must be non-empty; got shape ({}, {})",
+            n_obs,
+            z_view.ncols()
+        )));
+    }
+    if k_atoms == 0 {
+        return Err(py_value_error(
+            "sae_manifold_fit_auto: atom_basis must be non-empty".into(),
+        ));
+    }
+    if !z_view.iter().all(|v| v.is_finite()) {
+        return Err(py_value_error(
+            "sae_manifold_fit_auto: z contains non-finite values".into(),
+        ));
+    }
     if atom_dim.len() != k_atoms {
         return Err(py_value_error(format!(
             "sae_manifold_fit_auto: atom_dim length {} must equal atom_basis length {k_atoms}",
