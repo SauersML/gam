@@ -11040,6 +11040,89 @@ fn joint_inner_kkt_converged(residual: f64, residual_tol: f64) -> bool {
     residual.is_finite() && residual_tol.is_finite() && residual <= residual_tol
 }
 
+/// Format a one-line diagnostic naming which block carries the dominant
+/// unresolved KKT residual when the joint Newton refuses to certify
+/// convergence. This is the actionable signal a user needs to recognise
+/// model ill-posedness — the rejected fit is the *symptom*, the block
+/// with the unresolved gradient is the *cause*. Embedded in the error
+/// string returned by the inner solver so the cause survives serialisation
+/// through the outer optimiser, the seed-validation cascade, and gamfit.
+fn block_residual_diagnostic_string(
+    cached_joint_gradient: Option<&Array1<f64>>,
+    states: &[ParameterBlockState],
+    specs: &[ParameterBlockSpec],
+    s_lambdas: &[Array2<f64>],
+    ridge: f64,
+    ridge_policy: RidgePolicy,
+) -> String {
+    let Some(joint_grad) = cached_joint_gradient else {
+        return "no joint gradient available for block diagnostic".to_string();
+    };
+    let block_widths: Vec<usize> = states.iter().map(|s| s.beta.len()).collect();
+    let block_beta_inf: Vec<f64> = states
+        .iter()
+        .map(|s| s.beta.iter().map(|x: &f64| x.abs()).fold(0.0_f64, f64::max))
+        .collect();
+    let mut acc = 0usize;
+    let block_grad_inf: Vec<f64> = states
+        .iter()
+        .map(|s| {
+            let n = s.beta.len();
+            let end = (acc + n).min(joint_grad.len());
+            let nrm = if acc < end {
+                joint_grad
+                    .slice(ndarray::s![acc..end])
+                    .iter()
+                    .map(|x: &f64| x.abs())
+                    .fold(0.0_f64, f64::max)
+            } else {
+                f64::NAN
+            };
+            acc += n;
+            nrm
+        })
+        .collect();
+    let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+    let exit_kkt_inf = exact_newton_joint_stationarity_vector_from_gradient(
+        joint_grad,
+        states,
+        specs,
+        s_lambdas,
+        ridge,
+        ridge_policy,
+    )
+    .ok()
+    .map(|residual| {
+        residual
+            .iter()
+            .map(|x: &f64| x.abs())
+            .fold(0.0_f64, f64::max)
+    })
+    .unwrap_or(f64::NAN);
+    let dominant_idx = block_grad_inf
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(i, _)| i);
+    let dominant = if let Some(i) = dominant_idx {
+        format!(
+            "block '{}' carries the dominant unresolved KKT gradient (|g_block|∞ = {:.3e})",
+            names.get(i).copied().unwrap_or("?"),
+            block_grad_inf[i],
+        )
+    } else {
+        "<no blocks>".to_string()
+    };
+    format!(
+        "{dominant}; |∇L − Sβ|∞ = {exit_kkt_inf:.3e}, block_widths = {block_widths:?}, \
+         block_names = {names:?}, block_beta_inf = {block_beta_inf:?}, \
+         block_grad_inf = {block_grad_inf:?}; check whether the named block's \
+         penalty has a polynomial null space not constrained by the data \
+         (reduce knots, add identifiability constraint, or use a basis whose \
+         null space is absorbed into the parametric block)"
+    )
+}
+
 const JOINT_PCG_REL_TOL: f64 = 1e-8;
 const PCG_ETA_MAX: f64 = 1.0e-1;
 const PCG_ETA_MIN: f64 = 1.0e-8;
@@ -13360,10 +13443,30 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             });
         }
         if coupled_exact_joint_required {
-            return Err(
-                "coupled exact-joint inner solve exited the joint Newton path before convergence"
-                    .to_string(),
+            // Compute per-block residual diagnostic so the bubbled error names
+            // which block carries the unresolved KKT mass, instead of leaving
+            // the caller with an opaque "exited before convergence" string.
+            //
+            // When the joint Newton refuses to certify and the constrained-
+            // stationary cert refused with "phantom multiplier" (i.e. the
+            // active set doesn't capture the gradient mass), the math says
+            // either the active set is incomplete OR H_pen is genuinely
+            // rank-deficient in the direction of g (a polynomial null space
+            // of the smooth's penalty that the likelihood Hessian doesn't
+            // constrain). Naming the offending block lets the user act:
+            // reduce knots on that smooth, add an identifiability constraint,
+            // or change the basis.
+            let block_diag = block_residual_diagnostic_string(
+                cached_joint_gradient.as_ref(),
+                &states,
+                specs,
+                &s_lambdas,
+                ridge,
+                options.ridge_policy,
             );
+            return Err(format!(
+                "coupled exact-joint inner solve exited the joint Newton path before convergence — {block_diag}"
+            ));
         }
         // Otherwise fall through to blockwise iteration below.
     }
