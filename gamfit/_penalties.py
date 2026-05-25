@@ -278,6 +278,39 @@ def _set_weight_schedule(self: Any, schedule: ScalarWeightSchedule | dict[str, A
     return self
 
 
+class _AnalyticPenalty:
+    """Shared boilerplate for analytic penalty dataclasses.
+
+    Subclasses declare ``KIND_TAG`` (the string Rust expects under the ``"kind"``
+    descriptor key) and override ``_payload_extras`` to return the
+    kind-specific descriptor fields. The base class handles the common
+    ``target``/``kind``/``weight_schedule`` plumbing and exposes
+    ``set_weight_schedule`` so every analytic penalty supports fluent
+    weight-schedule assignment without per-class patching.
+    """
+
+    KIND_TAG = ""
+
+    def _payload_extras(self) -> dict[str, Any]:
+        raise NotImplementedError
+
+    def _to_rust_payload(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "kind": type(self).KIND_TAG,
+            "target": _target_descriptor(self.target),
+        }
+        payload.update(self._payload_extras())
+        return _add_weight_schedule(payload, self)
+
+    def to_rust_descriptor(self) -> dict[str, Any]:
+        return self._to_rust_payload()
+
+    def set_weight_schedule(
+        self, schedule: ScalarWeightSchedule | dict[str, Any]
+    ) -> "_AnalyticPenalty":
+        return _set_weight_schedule(self, schedule)
+
+
 def _target_descriptor(target: Any) -> str | int:
     if isinstance(target, (str, int)):
         return target
@@ -299,7 +332,8 @@ def _inverse_softplus(x: np.ndarray) -> np.ndarray:
 
 
 @dataclass(init=False, slots=True)
-class IsometryPenalty:
+class IsometryPenalty(_AnalyticPenalty):
+    KIND_TAG = "isometry"
     """Pull the decoder's pullback metric toward a reference metric on the
     latent manifold.
 
@@ -352,25 +386,13 @@ class IsometryPenalty:
     def __post_init__(self) -> None:
         _validate_weight(self.weight, "IsometryPenalty")
 
-    def _to_rust_payload(self) -> dict[str, Any]:
-        """Spec for the Rust `AnalyticPenaltyRegistry::push` builder.
-
-        The Rust side reads this dict and constructs the corresponding
-        `terms::analytic_penalties::IsometryPenalty` instance. Kept as a dict
-        rather than a typed handle so the Python surface stays import-light.
-        """
-        return _add_weight_schedule({
-            "kind": "isometry",
-            "target": _target_descriptor(self.target),
-            "weight": self.weight,
-        }, self)
-
-    def to_rust_descriptor(self) -> dict[str, Any]:
-        return self._to_rust_payload()
+    def _payload_extras(self) -> dict[str, Any]:
+        return {"weight": self.weight}
 
 
 @dataclass(init=False, slots=True)
-class SparsityPenalty:
+class SparsityPenalty(_AnalyticPenalty):
+    KIND_TAG = "sparsity"
     """Smoothed-L¹ / Hoyer / Log sparsifier on a β or t slice.
 
     The smoothed-L¹ default is
@@ -456,22 +478,18 @@ class SparsityPenalty:
                 f"got {self.eps_weight!r}"
             )
 
-    def _to_rust_payload(self) -> dict[str, Any]:
-        return _add_weight_schedule({
-            "kind": "sparsity",
-            "target": _target_descriptor(self.target),
+    def _payload_extras(self) -> dict[str, Any]:
+        return {
             "sparsity_kind": self.kind,
             "weight": self.weight,
             "eps": float(self.eps),
             "eps_weight": self.eps_weight,
-        }, self)
-
-    def to_rust_descriptor(self) -> dict[str, Any]:
-        return self._to_rust_payload()
+        }
 
 
 @dataclass(init=False, slots=True)
-class ScadMcpPenalty:
+class ScadMcpPenalty(_AnalyticPenalty):
+    KIND_TAG = "scad_mcp"
     """Concave SCAD/MCP sparsity on latent coordinates.
 
     ``SparsityPenalty`` uses Huber-smoothed L¹, whose gradient keeps pulling
@@ -535,24 +553,20 @@ class ScadMcpPenalty:
                 f"got {self.smoothing_eps}"
             )
 
-    def _to_rust_payload(self) -> dict[str, Any]:
-        return _add_weight_schedule({
-            "kind": "scad_mcp",
-            "target": _target_descriptor(self.target),
+    def _payload_extras(self) -> dict[str, Any]:
+        return {
             "weight": self.weight,
             "n_eff": self.n_eff,
             "gamma": self.gamma,
             "variant": self.variant,
             "smoothing_eps": self.smoothing_eps,
             "learnable": self.learnable,
-        }, self)
-
-    def to_rust_descriptor(self) -> dict[str, Any]:
-        return self._to_rust_payload()
+        }
 
 
 @dataclass(init=False, slots=True)
-class ARDPenalty:
+class ARDPenalty(_AnalyticPenalty):
+    KIND_TAG = "ard"
     """Automatic Relevance Determination over latent axes.
 
     For a ``LatentCoord`` block ``t ∈ ℝ^{N × d}``, applies one independent
@@ -596,18 +610,13 @@ class ARDPenalty:
     def __post_init__(self) -> None:
         pass
 
-    def _to_rust_payload(self) -> dict[str, Any]:
-        return _add_weight_schedule({
-            "kind": "ard",
-            "target": _target_descriptor(self.target),
-        }, self)
-
-    def to_rust_descriptor(self) -> dict[str, Any]:
-        return self._to_rust_payload()
+    def _payload_extras(self) -> dict[str, Any]:
+        return {}
 
 
 @dataclass(init=False, slots=True)
-class TopKActivationPenalty:
+class TopKActivationPenalty(_AnalyticPenalty):
+    KIND_TAG = "topk_activation"
     """Hard top-k SAE activation mask over a row-major latent block."""
 
     target: TargetSpec
@@ -637,20 +646,13 @@ class TopKActivationPenalty:
                 f"TopKActivationPenalty.weight must be finite and > 0, got {self.weight}"
             )
 
-    def _to_rust_payload(self) -> dict[str, Any]:
-        return _add_weight_schedule({
-            "kind": "topk_activation",
-            "target": _target_descriptor(self.target),
-            "k": int(self.k),
-            "weight": float(self.weight),
-        }, self)
-
-    def to_rust_descriptor(self) -> dict[str, Any]:
-        return self._to_rust_payload()
+    def _payload_extras(self) -> dict[str, Any]:
+        return {"k": int(self.k), "weight": float(self.weight)}
 
 
 @dataclass(init=False, slots=True)
-class JumpReLUPenalty:
+class JumpReLUPenalty(_AnalyticPenalty):
+    KIND_TAG = "jumprelu"
     """JumpReLU SAE threshold prior with one learnable threshold per atom."""
 
     target: TargetSpec
@@ -690,17 +692,12 @@ class JumpReLUPenalty:
                 f"got {self.smoothing_eps}"
             )
 
-    def _to_rust_payload(self) -> dict[str, Any]:
-        return _add_weight_schedule({
-            "kind": "jumprelu",
-            "target": _target_descriptor(self.target),
+    def _payload_extras(self) -> dict[str, Any]:
+        return {
             "thresholds": self.thresholds.astype(float).tolist(),
             "weight": float(self.weight),
             "smoothing_eps": float(self.smoothing_eps),
-        }, self)
-
-    def to_rust_descriptor(self) -> dict[str, Any]:
-        return self._to_rust_payload()
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -752,7 +749,8 @@ def _sigmoid_numpy(x: np.ndarray) -> np.ndarray:
 
 
 @dataclass(init=False, slots=True)
-class TotalVariationPenalty:
+class TotalVariationPenalty(_AnalyticPenalty):
+    KIND_TAG = "total_variation"
     """Smoothed-L¹ total variation on first differences of a latent block.
 
     Uses ``φ(x) = sqrt(x² + ε²) - ε`` on ``D @ T``. ``difference_op`` is either
@@ -843,28 +841,24 @@ class TotalVariationPenalty:
                 raise ValueError(f"TotalVariationPenalty graph edge {(a, b)} is self-referential")
         self._edges = edges
 
-    def _to_rust_payload(self) -> dict[str, Any]:
-        payload = {
-            "kind": "total_variation",
-            "target": _target_descriptor(self.target),
+    def _payload_extras(self) -> dict[str, Any]:
+        extras: dict[str, Any] = {
             "weight": self.weight,
             "n_eff": self.n_eff,
             "smoothing_eps": self.smoothing_eps,
             "learnable": self.learnable,
         }
         if self._edges is None:
-            payload["difference_op"] = "forward_1d"
+            extras["difference_op"] = "forward_1d"
         else:
-            payload["difference_op"] = "graph_edges"
-            payload["edges"] = self._edges
-        return _add_weight_schedule(payload, self)
-
-    def to_rust_descriptor(self) -> dict[str, Any]:
-        return self._to_rust_payload()
+            extras["difference_op"] = "graph_edges"
+            extras["edges"] = self._edges
+        return extras
 
 
 @dataclass(init=False, slots=True)
-class NuclearNormPenalty:
+class NuclearNormPenalty(_AnalyticPenalty):
+    KIND_TAG = "nuclear_norm"
     """Smoothed nuclear norm on a matrix-valued latent block.
 
     Uses ``sum_i sqrt(σ_i² + ε²) - ε`` on the singular values of the row-major
@@ -928,23 +922,19 @@ class NuclearNormPenalty:
         if self.max_rank is not None and self.max_rank <= 0:
             raise ValueError(f"NuclearNormPenalty.max_rank must be > 0, got {self.max_rank}")
 
-    def _to_rust_payload(self) -> dict[str, Any]:
-        return _add_weight_schedule({
-            "kind": "nuclear_norm",
-            "target": _target_descriptor(self.target),
+    def _payload_extras(self) -> dict[str, Any]:
+        return {
             "weight": self.weight,
             "n_eff": self.n_eff,
             "smoothing_eps": self.smoothing_eps,
             "max_rank": self.max_rank,
             "learnable": self.learnable,
-        }, self)
-
-    def to_rust_descriptor(self) -> dict[str, Any]:
-        return self._to_rust_payload()
+        }
 
 
 @dataclass(init=False, slots=True)
-class BlockSparsityPenalty:
+class BlockSparsityPenalty(_AnalyticPenalty):
+    KIND_TAG = "block_sparsity"
     """Group-lasso sparsity over predefined latent-axis groups.
 
     Uses ``sum_g sqrt(||T[:, G_g]||² + ε²)``. This differs from per-element
@@ -1044,23 +1034,19 @@ class BlockSparsityPenalty:
                 f"got {self.smoothing_eps}"
             )
 
-    def _to_rust_payload(self) -> dict[str, Any]:
-        return _add_weight_schedule({
-            "kind": "block_sparsity",
-            "target": _target_descriptor(self.target),
+    def _payload_extras(self) -> dict[str, Any]:
+        return {
             "groups": self.groups,
             "weight": self.weight,
             "n_eff": self.n_eff,
             "smoothing_eps": self.smoothing_eps,
             "learnable": self.learnable,
-        }, self)
-
-    def to_rust_descriptor(self) -> dict[str, Any]:
-        return self._to_rust_payload()
+        }
 
 
 @dataclass(init=False, slots=True)
-class MechanismSparsityPenalty:
+class MechanismSparsityPenalty(_AnalyticPenalty):
+    KIND_TAG = "mechanism_sparsity"
     """Per-latent group-lasso sparsity over decoder feature groups."""
 
     target: TargetSpec
@@ -1138,23 +1124,19 @@ class MechanismSparsityPenalty:
         if not np.isfinite(self.n_eff) or self.n_eff <= 0.0:
             raise ValueError(f"MechanismSparsityPenalty.n_eff must be > 0, got {self.n_eff}")
 
-    def _to_rust_payload(self) -> dict[str, Any]:
-        return _add_weight_schedule({
-            "kind": "mechanism_sparsity",
-            "target": _target_descriptor(self.target),
+    def _payload_extras(self) -> dict[str, Any]:
+        return {
             "feature_groups": self.feature_groups,
             "weight": self.weight,
             "smoothing_eps": self.smoothing_eps,
             "n_eff": self.n_eff,
             "learnable": self.learnable,
-        }, self)
-
-    def to_rust_descriptor(self) -> dict[str, Any]:
-        return self._to_rust_payload()
+        }
 
 
 @dataclass(init=False, slots=True)
-class BlockOrthogonalityPenalty:
+class BlockOrthogonalityPenalty(_AnalyticPenalty):
+    KIND_TAG = "block_orthogonality"
     """Between-block-only orthogonality over latent-axis groups.
 
     Penalizes ``0.5 * weight * sum_{g<h} ||T[:, G_g].T @ T[:, G_h]||²_F``
@@ -1249,22 +1231,18 @@ class BlockOrthogonalityPenalty:
                 f"BlockOrthogonalityPenalty.n_eff must be > 0, got {self.n_eff}"
             )
 
-    def _to_rust_payload(self) -> dict[str, Any]:
-        return _add_weight_schedule({
-            "kind": "block_orthogonality",
-            "target": _target_descriptor(self.target),
+    def _payload_extras(self) -> dict[str, Any]:
+        return {
             "groups": self.groups,
             "weight": self.weight,
             "n_eff": self.n_eff,
             "learnable": self.learnable,
-        }, self)
-
-    def to_rust_descriptor(self) -> dict[str, Any]:
-        return self._to_rust_payload()
+        }
 
 
 @dataclass(init=False, slots=True)
-class AuxConditionalPriorPenalty:
+class AuxConditionalPriorPenalty(_AnalyticPenalty):
+    KIND_TAG = "aux_conditional_prior"
     """Fixed-precomputed iVAE-style auxiliary-conditional prior on t.
 
     Applies ``0.5 * weight * sum_n t_n.T @ Lambda_n @ t_n`` with one

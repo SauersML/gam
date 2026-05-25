@@ -1,13 +1,9 @@
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from html import escape
 from typing import Any
 
-_HTML_EXCLUDED_KEYS = frozenset({"coefficients", "covariance_flat"})
-_HTML_COEFFICIENT_LIMIT = 50
-_VALUE_PREVIEW_LIMIT = 6
+from ._binding import rust_module
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,102 +129,7 @@ class Summary:
         return pd.DataFrame(self.coefficients)
 
     def __repr__(self) -> str:
-        fields = []
-        for key in ("formula", "family_name", "model_class", "deviance", "reml_score"):
-            if key in self.payload:
-                fields.append(f"{key}={self.payload[key]!r}")
-        return f"Summary({', '.join(fields)})"
+        return rust_module().summary_repr(self.payload)
 
     def _repr_html_(self) -> str:
-        rows = "".join(
-            "<tr>"
-            f"<th style='text-align:left;padding:0.25rem 0.75rem 0.25rem 0;'>{escape(str(key))}</th>"
-            f"<td style='padding:0.25rem 0;'>{escape(_render_value(value))}</td>"
-            "</tr>"
-            for key, value in self.payload.items()
-            if key not in _HTML_EXCLUDED_KEYS
-        )
-        coefficient_table = _render_coefficients_html(self.coefficients)
-        return (
-            "<div style='font-family: ui-sans-serif, system-ui, sans-serif;'>"
-            "<h3 style='margin:0 0 0.5rem 0;'>Model Summary</h3>"
-            f"<table style='border-collapse:collapse;'>{rows}</table>"
-            f"{coefficient_table}"
-            "</div>"
-        )
-
-
-def _render_value(value: Any) -> str:
-    if isinstance(value, float):
-        return f"{value:.6g}"
-    if isinstance(value, Mapping):
-        return _render_mapping_value(value)
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-        return _render_sequence_value(value)
-    return str(value)
-
-
-def _render_mapping_value(value: Mapping[Any, Any]) -> str:
-    if not value:
-        return "{}"
-    items = list(value.items())
-    preview = ", ".join(
-        f"{key}: {_render_value(item_value)}"
-        for key, item_value in items[:_VALUE_PREVIEW_LIMIT]
-    )
-    suffix = "" if len(items) <= _VALUE_PREVIEW_LIMIT else f", ... ({len(items)} total)"
-    return "{" + preview + suffix + "}"
-
-
-def _render_sequence_value(value: Sequence[Any]) -> str:
-    if not value:
-        return "[]"
-    preview = ", ".join(_render_value(item) for item in value[:_VALUE_PREVIEW_LIMIT])
-    suffix = "" if len(value) <= _VALUE_PREVIEW_LIMIT else f", ... ({len(value)} total)"
-    return "[" + preview + suffix + "]"
-
-
-def _render_coefficients_html(coefficients: list[dict[str, Any]]) -> str:
-    if not coefficients:
-        return ""
-    columns = _coefficient_columns(coefficients)
-    header_cells = "".join(
-        "<th style='text-align:right;padding:0.25rem 0.75rem;"
-        f"border-bottom:1px solid #ddd;'>{escape(column)}</th>"
-        for column in columns
-    )
-    body_rows = "".join(
-        "<tr>"
-        + "".join(
-            "<td style='text-align:right;padding:0.25rem 0.75rem;'>"
-            f"{escape(_render_value(row.get(column, '')))}</td>"
-            for column in columns
-        )
-        + "</tr>"
-        for row in coefficients[:_HTML_COEFFICIENT_LIMIT]
-    )
-    omitted = len(coefficients) - _HTML_COEFFICIENT_LIMIT
-    note = (
-        "<p style='margin:0.25rem 0 0 0;color:#666;'>"
-        f"Showing first {_HTML_COEFFICIENT_LIMIT} of {len(coefficients)} "
-        "coefficients.</p>"
-        if omitted > 0
-        else ""
-    )
-    return (
-        "<h4 style='margin:1rem 0 0.35rem 0;'>Coefficients</h4>"
-        "<table style='border-collapse:collapse;'>"
-        f"<thead><tr>{header_cells}</tr></thead>"
-        f"<tbody>{body_rows}</tbody>"
-        "</table>"
-        f"{note}"
-    )
-
-
-def _coefficient_columns(coefficients: list[dict[str, Any]]) -> list[str]:
-    columns: list[str] = []
-    for row in coefficients:
-        for key in row:
-            if key not in columns:
-                columns.append(key)
-    return columns
+        return rust_module().summary_html(self.payload)
