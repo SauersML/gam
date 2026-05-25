@@ -26,9 +26,12 @@ pub struct GpuRuntime {
     pub memory_budget_bytes: usize,
 }
 
+static CPU_REASON: OnceLock<String> = OnceLock::new();
+
 impl GpuRuntime {
     pub fn probe() -> Result<Option<Self>, GpuProbeError> {
         if super::global_policy() == super::GpuPolicy::Off {
+            Self::record_cpu_reason("GPU policy is off");
             diagnostics::log_cuda_disabled("GPU policy is off");
             return Ok(None);
         }
@@ -36,6 +39,7 @@ impl GpuRuntime {
         let device_count =
             CudaContext::device_count().map_err(|err| GpuProbeError::Driver(err.to_string()))?;
         if device_count <= 0 {
+            Self::record_cpu_reason("CUDA driver reported no devices");
             diagnostics::log_cuda_disabled("CUDA driver reported no devices");
             return Ok(None);
         }
@@ -56,6 +60,7 @@ impl GpuRuntime {
 
         devices.sort_by(|a, b| b.score().total_cmp(&a.score()));
         let Some(device) = devices.first().cloned() else {
+            Self::record_cpu_reason("CUDA driver reported no usable devices");
             diagnostics::log_cuda_disabled("CUDA driver reported no usable devices");
             return Ok(None);
         };
@@ -77,7 +82,14 @@ impl GpuRuntime {
     pub fn global() -> Option<&'static Self> {
         static RUNTIME: OnceLock<Option<GpuRuntime>> = OnceLock::new();
         RUNTIME
-            .get_or_init(|| Self::probe().unwrap_or(None))
+            .get_or_init(|| match Self::probe() {
+                Ok(runtime) => runtime,
+                Err(GpuProbeError::Driver(reason)) => {
+                    Self::record_cpu_reason(reason.clone());
+                    diagnostics::log_cuda_disabled(&reason);
+                    None
+                }
+            })
             .as_ref()
     }
 
@@ -94,6 +106,15 @@ impl GpuRuntime {
     #[must_use]
     pub fn selected_device(&self) -> &GpuDeviceInfo {
         &self.device
+    }
+
+    #[must_use]
+    pub(crate) fn cpu_reason() -> Option<&'static str> {
+        CPU_REASON.get().map(String::as_str)
+    }
+
+    fn record_cpu_reason(reason: impl Into<String>) {
+        CPU_REASON.set(reason.into()).ok();
     }
 }
 
