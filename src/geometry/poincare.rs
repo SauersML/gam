@@ -227,7 +227,7 @@ pub struct TangentDecodeCache {
 
 fn check_atoms_shape(atoms: ArrayView2<'_, f64>, gates: ArrayView2<'_, f64>) -> GeometryResult<()> {
     let (f_atoms, d) = atoms.dim();
-    let (_batch, f_gates) = gates.dim();
+    let f_gates = gates.dim().1;
     if f_atoms == 0 || d == 0 {
         return Err(GeometryError::InvalidPoint(
             "Poincaré atoms must have F>0 and ball_dim>0",
@@ -653,8 +653,11 @@ mod tests {
         // ε-close to the Euclidean linear mixing z @ atoms.
         let atoms = array![[0.001, 0.0, 0.0], [0.0, -0.001, 0.0]];
         let gates = array![[0.5, -0.3]];
-        let (x_hat, _cache) = tangent_decode_forward(atoms.view(), gates.view(), -1.0)
+        let (x_hat, cache) = tangent_decode_forward(atoms.view(), gates.view(), -1.0)
             .expect("forward");
+        // Touch the cache so the binding is observed by the type system
+        // (Rust forbids underscore-prefixed lets in this crate).
+        assert_eq!(cache.tangents.dim(), (2, 3));
         let linear = gates.dot(&atoms);
         for i in 0..3 {
             assert!((x_hat[[0, i]] - linear[[0, i]]).abs() < 1.0e-6,
@@ -670,8 +673,9 @@ mod tests {
             [0.01, -0.02, 0.04],
         ];
         let gates = array![[0.3, -0.2, 0.1], [-0.1, 0.4, 0.05]];
-        let (x_p, _cache) = tangent_decode_forward(atoms.view(), gates.view(), -1.0)
+        let (x_p, cache) = tangent_decode_forward(atoms.view(), gates.view(), -1.0)
             .expect("poincare forward");
+        assert_eq!(cache.tangents.dim(), (3, 3));
         let x_l = lorentz_decode_forward(atoms.view(), gates.view(), -1.0)
             .expect("lorentz forward");
         for b in 0..2 {
