@@ -19,8 +19,9 @@ blob   = model.dumps()              # bytes
 loaded = gamfit.loads(blob)
 ```
 
-The `.gam` file is the JSON serialisation of the Rust `Model` struct
-(produced by `serde_json::to_writer`). It contains:
+The `.gam` file is the JSON serialisation of the Rust `FittedModel`
+enum (`model_type` plus `payload`; the Rust save path writes it with
+`serde_json::to_writer`). It contains:
 
 - coefficients, smoothing parameters, basis specifications;
 - formula and family / link metadata;
@@ -64,8 +65,8 @@ The archive (written via `numpy.savez`) contains:
 `PosteriorSamples.load` requires `allow_pickle=True` to round-trip the
 metadata object array; only load archives produced by `save`.
 
-Because the model bytes are bundled, `predict()` and `predict_draws()`
-work after a round-trip:
+Because the model bytes are bundled, posterior prediction keeps its
+usual model-class support after a round-trip:
 
 ```python
 restored = gamfit.load_posterior("posterior.npz")
@@ -75,8 +76,8 @@ bands    = restored.predict(test, level=0.95)
 ## Version compatibility
 
 `.gam` payloads are version-gated by the Rust loader
-(`validate_for_persistence`). Models written by an older release may
-fail to load in a newer release if a required field has been added. For
+(`validate_for_persistence`). The payload `version` must match the
+current `MODEL_PAYLOAD_VERSION`; a schema mismatch fails to load. For
 long-term archival, pin the `gamfit` version or refit after upgrades.
 
 ## Patterns
@@ -89,7 +90,7 @@ model.sample(train, seed=42).save("posterior.npz")
 ```
 
 The posterior archive carries the model bytes, so loading just the
-posterior is enough to call `predict()`.
+posterior is enough to call `predict()` for supported model classes.
 
 ### Inspect a model without the training data
 
