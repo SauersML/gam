@@ -11112,9 +11112,23 @@ mod tests {
             )
             .expect("time step ceiling")
             .expect("time step should be bounded");
-        assert_eq!(alpha, 0.0);
+        assert_relative_eq!(alpha, 0.04975, epsilon = 1e-12);
         let feasible = states[0].beta[0] + alpha * -2.0;
         assert!(feasible >= 0.0);
+    }
+
+    #[test]
+    fn latent_time_constraints_use_exact_derivative_guard_rows() {
+        let constraints = structural_time_coefficient_constraints(
+            &DesignMatrix::from(array![[1.0, 1.0], [2.0, -1.0]]),
+            &array![0.25, 0.75],
+            1.0,
+        )
+        .expect("exact derivative guard constraints")
+        .expect("nonzero derivative rows");
+
+        assert_eq!(constraints.a, array![[1.0, 1.0], [2.0, -1.0]]);
+        assert_eq!(constraints.b, array![0.75, 0.25]);
     }
 
     #[test]

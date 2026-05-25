@@ -144,6 +144,15 @@ fn certificate_from_result(result: &BlockwiseInnerResult) -> KktCertificate {
                 .fold(0.0_f64, f64::max)
         })
         .unwrap_or(f64::NAN);
+    let residual_tol = result
+        .kkt_residual
+        .as_ref()
+        .and_then(|kkt| kkt.residual_tol())
+        .unwrap_or(f64::NAN);
+    let free_rank = result
+        .kkt_residual
+        .as_ref()
+        .and_then(|kkt| kkt.free_rank());
     let active_set_size: usize = result
         .active_sets
         .iter()
@@ -151,9 +160,9 @@ fn certificate_from_result(result: &BlockwiseInnerResult) -> KktCertificate {
         .sum();
     KktCertificate {
         projected_residual_inf,
-        residual_tol: f64::NAN,
+        residual_tol,
         active_set_size,
-        free_rank: None,
+        free_rank,
         accepted_step_inf: f64::NAN,
         obj_change: f64::NAN,
     }

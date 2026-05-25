@@ -1678,8 +1678,9 @@ mod tests {
             [0.0, lambdas[1] + ridge, 0.0],
             [0.0, 0.0, ridge]
         ];
-        let assembled = PenaltyPseudologdet::from_assembled_with_nullity(s_ridged, Some(1))
-            .expect("assembled pseudo-logdet with structural nullity");
+        let assembled =
+            PenaltyPseudologdet::from_assembled_with_nullity(s_ridged, Some(ridge), Some(1))
+                .expect("assembled pseudo-logdet with structural nullity");
 
         assert_eq!(overlapping.rank(), assembled.rank());
         assert!(

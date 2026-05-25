@@ -569,6 +569,18 @@ class ManifoldSAE(nn.Module):
         else:
             self._ortho_penalty = None
 
+        # Decoder monotonicity penalty: Rust ``monotonicity`` descriptor over
+        # the per-atom basis-coefficient axis (K rows of a (K, D) decoder block).
+        if cfg.decoder.monotonicity_weight > 0.0:
+            self._monotonicity_penalty: MonotonicityPenalty | None = MonotonicityPenalty(
+                weight=float(cfg.decoder.monotonicity_weight),
+                n_eff=K,
+                direction=float(cfg.decoder.monotonicity_direction),
+                smoothing_eps=float(cfg.decoder.monotonicity_smoothing_eps),
+            )
+        else:
+            self._monotonicity_penalty = None
+
         self._snapshot: dict[str, Any] = {}
         self._snapshot_locked: bool = False
         self._last_fit: _ClosedFormManifoldSAE | None = None
