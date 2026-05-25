@@ -15,7 +15,7 @@ if not hasattr(gt, "gaussian_reml_fit_blocks"):
 
 
 def _smooth_block(n: int, k: int, phase: float) -> tuple[torch.Tensor, torch.Tensor]:
-    t = torch.remainder(torch.linspace(0.0, 1.0, n, dtype=torch.float64) + phase, 1.0)
+    t = torch.remainder(torch.arange(n, dtype=torch.float64) / n + phase, 1.0)
     return gt.periodic_spline_curve_basis(t, k)
 
 
