@@ -7,14 +7,13 @@ import math
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Literal, TypeAlias
+from typing import Any, Literal, Protocol, TypeAlias, cast
 
 from . import topology
 from ._api import fit
+from ._binding import rust_module
 from ._compare import (
     _extract_edf,
-    _extract_null_dim,
-    _extract_null_hessian_logdet,
     _extract_reml_score_raw,
     _tierney_kadane_normalizer_from_null_dim,
     compare_models,
@@ -44,6 +43,17 @@ class _Candidate:
     topology: Smooth
 
 
+class _TopologyRustModule(Protocol):
+    def assemble_candidate_formula(
+        self,
+        formula: str,
+        candidate_json: str,
+        strict_dimension: bool,
+    ) -> str | None: ...
+
+    def rank_topology_candidates(self, evidence_json: str) -> str: ...
+
+
 BasisSpec: TypeAlias = Smooth
 ScoreKind: TypeAlias = Literal["reml", "laml", "bic", "tk"]
 ScoreScale: TypeAlias = Literal["per_observation", "per_effective_dim", "raw"]
@@ -59,6 +69,13 @@ _DEFAULT_TOPOLOGY_NAMES: tuple[TopologyName, ...] = (
     "sphere",
     "torus",
     "cylinder",
+)
+
+_NULL_HESSIAN_LOGDET_KEYS: tuple[str, ...] = (
+    "null_space_logdet",
+    "null_hessian_logdet",
+    "h_null_logdet",
+    "logdet_h_null",
 )
 
 
@@ -305,11 +322,10 @@ def _formula_for_candidate(
     # The `auto` argument is kept for backwards-compatible signature; the
     # Rust assembler does its own AUTO scan and the sentinel carries no state.
     del auto
-    from . import _rust
 
     payload = _candidate_to_rust_payload(candidate)
     try:
-        result = _rust.assemble_candidate_formula(
+        result = _topology_rust().assemble_candidate_formula(
             formula,
             json.dumps(payload),
             strict_dimension,
@@ -317,6 +333,10 @@ def _formula_for_candidate(
     except ValueError as exc:
         raise ValueError(str(exc)) from exc
     return result
+
+
+def _topology_rust() -> _TopologyRustModule:
+    return cast(_TopologyRustModule, rust_module())
 
 
 def _candidate_to_rust_payload(candidate: _Candidate) -> dict[str, Any]:
@@ -520,6 +540,56 @@ def _tk_normalizer_for_fit(fit_obj: Any, null_dim: float) -> float:
         null_dim,
         _extract_null_hessian_logdet(fit_obj),
     )
+
+
+def _extract_null_dim(fit_obj: Any) -> float | None:
+    null_dim = _extract_float_field(fit_obj, ("null_dim",))
+    if null_dim is not None:
+        return null_dim
+
+    nullity = _extract_float_field(
+        fit_obj,
+        ("nullity", "penalty_nullity", "cache_nullity"),
+    )
+    if nullity is not None:
+        return nullity * _extract_output_dim(fit_obj)
+
+    dim_h = _extract_float_field(
+        fit_obj,
+        ("effective_dim", "dim_h", "dim_H", "hessian_dim"),
+    )
+    penalty_rank = _extract_float_field(
+        fit_obj,
+        ("penalty_rank", "rank_s", "rank_S", "cache_penalty_rank"),
+    )
+    if dim_h is not None and penalty_rank is not None:
+        return dim_h - penalty_rank
+    return None
+
+
+def _extract_null_hessian_logdet(fit_obj: Any) -> float | None:
+    return _extract_float_field(fit_obj, _NULL_HESSIAN_LOGDET_KEYS)
+
+
+def _extract_output_dim(fit_obj: Any) -> float:
+    coefficients = _coefficients_metadata(fit_obj)
+    shape = getattr(coefficients, "shape", None)
+    if shape is not None and len(shape) >= 2:
+        return float(shape[1])
+    return 1.0
+
+
+def _coefficients_metadata(fit_obj: Any) -> Any | None:
+    payload = _summary_payload(fit_obj)
+    if payload is not None:
+        coefficients = payload.get("coefficients")
+        if coefficients is not None:
+            return coefficients
+    if isinstance(fit_obj, Mapping):
+        coefficients = fit_obj.get("coefficients")
+        if coefficients is not None:
+            return coefficients
+    return getattr(fit_obj, "coefficients", None)
 
 
 def _comparison_score(score: float, score_kind: ScoreKind) -> float:
@@ -784,8 +854,6 @@ class TopologyAutoSelector:
         penalties: Sequence[Any] | None = None,
         **fit_kwargs: Any,
     ) -> TopologyAutoSelectorResult:
-        from . import _rust
-
         latent_name, latent = _single_latent(latents, self.latent)
         n_obs = _n_obs(data, latent_name, latent)
         auto = _maybe_auto_smooth(formula)
@@ -840,7 +908,7 @@ class TopologyAutoSelector:
                 + (f" ({detail})" if detail else "")
             )
 
-        ranking_json = _rust.rank_topology_candidates(
+        ranking_json = _topology_rust().rank_topology_candidates(
             json.dumps(
                 {
                     "score_scale": self.score_scale,

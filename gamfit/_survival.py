@@ -521,12 +521,7 @@ def extract_row_ids(
     rows: list[list[str]],
     id_column: str | None,
 ) -> list[str] | None:
-    if id_column is None:
-        return None
-    if id_column not in headers:
-        raise ValueError(f"id_column '{id_column}' is missing from prediction data")
-    index = headers.index(id_column)
-    return [row[index] for row in rows]
+    return rust_module().extract_row_ids(headers, rows, id_column)
 
 
 def survival_prediction_from_columns(
