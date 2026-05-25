@@ -4497,10 +4497,7 @@ where
             if !array1_is_finite(&self.beta_accel) {
                 return None;
             }
-<<<<<<< Updated upstream
             // The caller copies this borrow into its candidate buffer before the next AA mutation.
-=======
->>>>>>> Stashed changes
             Some(&self.beta_accel)
         }
 
