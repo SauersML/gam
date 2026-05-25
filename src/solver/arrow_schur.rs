@@ -427,7 +427,21 @@ fn factor_one_row(
     d: usize,
     row_idx: usize,
 ) -> Result<Array2<f64>, ArrowSchurError> {
-    assert_eq!(row.htt.dim(), (d, d), "row {row_idx} H_tt shape != (d,d)");
+    // Dimension mismatches in caller-supplied row blocks must surface as a
+    // typed error rather than aborting the process. The BA/SAE assembler can
+    // mis-size a row (for instance when latent_dim disagrees between the
+    // design and the term that materialized the block), and downstream code
+    // — including the LM outer loop — needs to recover by escalating ridge
+    // or rebuilding the system, not by panicking.
+    if row.htt.dim() != (d, d) {
+        return Err(ArrowSchurError::PerRowFactorFailed {
+            row: row_idx,
+            reason: format!(
+                "row {row_idx} H_tt shape {:?} does not match per_point_hessian_block dimension ({d}, {d})",
+                row.htt.dim()
+            ),
+        });
+    }
     let mut block = row.htt.clone();
     for a in 0..d {
         block[[a, a]] += ridge_t;
