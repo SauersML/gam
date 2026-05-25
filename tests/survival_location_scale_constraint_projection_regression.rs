@@ -1,4 +1,4 @@
-use gam::solver::active_set::LinearInequalityConstraints;
+use gam::solver::pirls::LinearInequalityConstraints;
 use gam::survival_location_scale::project_onto_linear_constraints;
 use ndarray::{Array1, array};
 
@@ -10,11 +10,12 @@ fn project_onto_linear_constraints_should_project_onto_equalities_not_only_inequ
     };
     let v = Array1::from_vec(vec![2.5, 3.5]);
 
-    let projected = project_onto_linear_constraints(2, &constraints, Some(&v));
+    let projected: Array1<f64> = project_onto_linear_constraints(2, &constraints, Some(&v));
 
+    let r0: f64 = projected.dot(&constraints.a.row(0));
+    let r1: f64 = projected.dot(&constraints.a.row(1));
     assert!(
-        projected.dot(&constraints.a.row(0)).abs() <= 1e-12
-            && projected.dot(&constraints.a.row(1)).abs() <= 1e-12,
+        r0.abs() <= 1e-12 && r1.abs() <= 1e-12,
         "Expected projector to enforce C v* = 0 for all supplied linear constraints, but got projected={projected:?}"
     );
 }
