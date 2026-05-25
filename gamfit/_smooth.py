@@ -212,6 +212,16 @@ class Smooth(BasisDescriptor):
         else:
             raise ValueError(f"Smooth.from_dict: unknown basis kind {bkind!r}")
 
+        # Penalty deserialization is not yet implemented for the full
+        # descriptor zoo; rather than silently discard a penalty that the
+        # caller serialized, refuse to round-trip and tell them explicitly.
+        if payload.get("penalty") is not None:
+            raise NotImplementedError(
+                "Smooth.from_dict cannot reconstruct penalty descriptors yet; "
+                "round-tripping a penalised Smooth would silently drop it. "
+                "Reconstruct the penalty manually and pass it to Smooth(...)."
+            )
+
         return cls(latent=latent, basis=basis, penalty=None, name=payload.get("name"))
 
     def __repr__(self) -> str:
