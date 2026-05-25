@@ -4809,6 +4809,7 @@ where
         if !current_grad_finite {
             lastgradient_norm = f64::INFINITY;
             max_abs_eta = inf_norm(state.eta.iter().copied());
+            final_state_cache_key = None;
             final_state = Some(state);
             // Non-finite-gradient rescue is deviance-plateau based, not a KKT certificate.
             if last_deviance_change.abs() < options.convergence_tolerance {
