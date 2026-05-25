@@ -3744,10 +3744,7 @@ fn compare_reml_fits(
         table_row.set_item("name", row.name.as_str())?;
         table_row.set_item("reml_score", row.reml_score)?;
         table_row.set_item("delta_reml", row.delta_reml)?;
-        table_row.set_item(
-            "bayes_factor_best_over_model",
-            row.bayes_factor_best_over_model,
-        )?;
+        table_row.set_item("bayes_factor_vs_best", row.bayes_factor_vs_best)?;
         table_row.set_item("effective_dof", row.effective_dof)?;
         score_table.append(table_row)?;
     }
@@ -8755,14 +8752,33 @@ fn sae_build_duchon_atom(
         periodic: None,
         boundary: OneDimensionalBoundary::Open,
     };
-    let built = build_duchon_basis(pts, &spec).map_err(|err| err.to_string())?;
-    let phi = built.design.to_dense();
+    let built = if pts.nrows() == 0 {
+        let probe_pts = Array2::<f64>::zeros((1, pts.ncols()));
+        build_duchon_basis(probe_pts.view(), &spec).map_err(|err| err.to_string())?
+    } else {
+        build_duchon_basis(pts, &spec).map_err(|err| err.to_string())?
+    };
+    let built_phi = built.design.to_dense();
+    let phi = if pts.nrows() == 0 {
+        Array2::<f64>::zeros((0, built_phi.ncols()))
+    } else {
+        built_phi
+    };
     let primary_idx = built
         .penaltyinfo
         .iter()
         .position(|info| matches!(info.source, gam::basis::PenaltySource::Primary))
         .ok_or_else(|| "sae_build_duchon_atom: primary penalty was not built".to_string())?;
-    let penalty = built.penalties[primary_idx].clone();
+    let penalty = built
+        .penalties
+        .get(primary_idx)
+        .ok_or_else(|| {
+            format!(
+                "sae_build_duchon_atom: primary penalty index {primary_idx} exceeds {} penalty matrices",
+                built.penalties.len()
+            )
+        })?
+        .clone();
     let effective_nullspace = pyffi_duchon_effective_nullspace_order(centers, requested_nullspace);
     let radial_transform = pyffi_duchon_kernel_constraint_nullspace(centers, effective_nullspace)
         .map_err(|err| err.to_string())?;

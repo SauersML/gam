@@ -1655,6 +1655,11 @@ impl SaeManifoldTerm {
         ridge_ext_coord: f64,
         ridge_beta: f64,
     ) -> Result<SaeManifoldLoss, String> {
+        if !(step_size.is_finite() && step_size > 0.0) {
+            return Err(format!(
+                "SaeManifoldTerm::run_joint_fit_arrow_schur: step_size must be finite and positive; got {step_size}"
+            ));
+        }
         for _ in 0..max_iter {
             self.advance_temperature_schedule()?;
             self.update_ard_reml(rho)?;
@@ -1874,8 +1879,10 @@ fn fill_assignment_logit_jvp_rows(
     local_jac: &mut Array2<f64>,
 ) {
     if assignments.len() == 1 {
-        for out_col in 0..fitted.len() {
-            local_jac[[0, out_col]] = 0.0;
+        for logit_col in 0..assignments.len() {
+            for out_col in 0..fitted.len() {
+                local_jac[[logit_col, out_col]] = 0.0;
+            }
         }
         return;
     }

@@ -12036,8 +12036,11 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 if apply_block_local_feasibility_limits(family, &states, &ranges, &mut trial_delta)
                     .is_err()
                 {
-                    joint_trust_radius =
-                        shrink_joint_block_trust_radii(&mut joint_block_trust_radii, 0.25);
+                    joint_trust_radius = shrink_active_joint_block_trust_radii(
+                        &mut joint_block_trust_radii,
+                        &block_step_norms,
+                        0.25,
+                    );
                     continue;
                 }
                 block_step_norms = joint_trust_region_block_metric_norms(
@@ -12055,7 +12058,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     .iter()
                     .zip(&joint_block_trust_radii)
                     .any(|(step_norm, radius)| {
-                        step_norm.is_finite() && *radius > 0.0 && *step_norm >= 0.99 * *radius
+                        joint_block_step_hit_trust_boundary(*step_norm, *radius)
                     });
                 let mut hpen_delta = Array1::<f64>::zeros(total_p);
                 // Predicted reduction must use the TRUE penalized Hessian
@@ -12119,16 +12122,20 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                                 search_delta = descent_delta;
                             }
                             Err(_) => {
-                                joint_trust_radius = shrink_joint_block_trust_radii(
+                                joint_trust_radius = shrink_active_joint_block_trust_radii(
                                     &mut joint_block_trust_radii,
+                                    &block_step_norms,
                                     0.25,
                                 );
                             }
                         }
                         tried_preconditioned_descent = true;
                     } else {
-                        joint_trust_radius =
-                            shrink_joint_block_trust_radii(&mut joint_block_trust_radii, 0.25);
+                        joint_trust_radius = shrink_active_joint_block_trust_radii(
+                            &mut joint_block_trust_radii,
+                            &block_step_norms,
+                            0.25,
+                        );
                     }
                     continue;
                 }
@@ -12175,8 +12182,11 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                             states[b].beta.assign(old);
                         }
                         refresh_all_block_etas(family, specs, &mut states)?;
-                        joint_trust_radius =
-                            shrink_joint_block_trust_radii(&mut joint_block_trust_radii, 0.25);
+                        joint_trust_radius = shrink_active_joint_block_trust_radii(
+                            &mut joint_block_trust_radii,
+                            &block_step_norms,
+                            0.25,
+                        );
                         continue;
                     }
                 };
@@ -12190,13 +12200,24 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     old_objective,
                 );
                 let old_radius = joint_trust_radius;
-                for (block_radius, block_step_norm) in joint_block_trust_radii
-                    .iter_mut()
-                    .zip(block_step_norms.iter().copied())
+                let shrink_boundary_blocks_only = step_hit_trust_boundary
+                    && matches!(
+                        trust_update.decision,
+                        JointTrustRegionDecision::ShrinkOnRejection
+                            | JointTrustRegionDecision::ShrinkOnMarginalAccept
+                            | JointTrustRegionDecision::RejectFloor
+                    );
+                for (block_radius, block_step_norm) in
+                    joint_block_trust_radii.iter_mut().zip(block_step_norms.iter())
                 {
+                    if shrink_boundary_blocks_only
+                        && !joint_block_step_hit_trust_boundary(*block_step_norm, *block_radius)
+                    {
+                        continue;
+                    }
                     *block_radius = update_joint_trust_region_radius(
                         *block_radius,
-                        block_step_norm,
+                        *block_step_norm,
                         actual_reduction,
                         predicted_reduction,
                         old_objective,
