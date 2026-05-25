@@ -2986,4 +2986,79 @@ mod tests {
             "corrected iteration should reach the scalar critical point; t={t}, g={final_grad}"
         );
     }
+
+    /// Issue #195: a per-row block that is barely-PD (smallest pivot on
+    /// the order of ε·trace) factors successfully but is unsafe to use in
+    /// the Schur reduction. `factor_one_row` must detect this via the
+    /// diagonal-ratio condition estimate and surface
+    /// `PerRowFactorIllConditioned` rather than silently contaminating
+    /// `S = H_ββ + ridge_β·I − Σ_i H_tβ^(i)ᵀ (H_tt^(i))⁻¹ H_tβ^(i)`.
+    #[test]
+    fn factor_one_row_rejects_barely_pd_block() {
+        let d = 2;
+        let k = 2;
+        let mut row = ArrowRowBlock::zeros(d, k);
+        // Matrix from the issue body: PD by an exact ε along the second
+        // direction. Cholesky succeeds, but κ ≈ 1e14.
+        row.htt = array![[1.0_f64, 1.0], [1.0, 1.0 + 1e-14]];
+        row.htbeta = array![[1.0_f64, 0.0], [0.0, 1.0]];
+        row.gt = array![0.0_f64, 0.0];
+
+        let err = factor_one_row(&row, 0.0, d, 0)
+            .expect_err("barely-PD H_tt must be rejected by the condition check");
+        match err {
+            ArrowSchurError::PerRowFactorIllConditioned {
+                row: r,
+                kappa_estimate,
+            } => {
+                assert_eq!(r, 0);
+                assert!(
+                    kappa_estimate > 1e10,
+                    "kappa estimate should reflect the barely-PD block; got {kappa_estimate:e}"
+                );
+            }
+            other => panic!("expected PerRowFactorIllConditioned, got {other:?}"),
+        }
+
+        // Sanity: a well-conditioned block at the same dimension still
+        // factors successfully.
+        let mut row_ok = ArrowRowBlock::zeros(d, k);
+        row_ok.htt = array![[2.0_f64, 0.1], [0.1, 3.0]];
+        row_ok.htbeta = array![[1.0_f64, 0.0], [0.0, 1.0]];
+        row_ok.gt = array![0.0_f64, 0.0];
+        factor_one_row(&row_ok, 0.0, d, 0)
+            .expect("well-conditioned block must still factor at ridge_t=0");
+    }
+
+    /// Issue #195 follow-up: when the per-row block is barely-PD at
+    /// `ridge_t = 0`, `solve_with_lm_escalation_inner` must escalate
+    /// `ridge_t` and produce a successful solve at a higher ridge.
+    #[test]
+    fn lm_escalation_recovers_from_ill_conditioned_row() {
+        let n = 1;
+        let d = 2;
+        let k = 2;
+        let mut sys = ArrowSchurSystem::new(n, d, k);
+        // Same barely-PD row as the issue body.
+        sys.rows[0].htt = array![[1.0_f64, 1.0], [1.0, 1.0 + 1e-14]];
+        sys.rows[0].htbeta = array![[1.0_f64, 0.0], [0.0, 1.0]];
+        sys.rows[0].gt = array![0.1_f64, -0.2];
+        sys.hbb = array![[4.0_f64, 0.2], [0.2, 5.0]];
+        sys.gb = array![0.3_f64, -0.1];
+
+        // Direct factor at ridge_t=0 must report ill-conditioning.
+        let direct = factor_one_row(&sys.rows[0], 0.0, d, 0);
+        assert!(matches!(
+            direct,
+            Err(ArrowSchurError::PerRowFactorIllConditioned { .. })
+        ));
+
+        // But the LM-escalating wrapper must recover by lifting ridge_t.
+        let options = ArrowSolveOptions::direct();
+        let (delta_t, delta_beta) = solve_with_lm_escalation_inner(&sys, 0.0, 0.0, &options)
+            .expect("LM escalation must recover from PerRowFactorIllConditioned");
+        for v in delta_t.iter().chain(delta_beta.iter()) {
+            assert!(v.is_finite(), "recovered step must be finite: {v}");
+        }
+    }
 }

@@ -80,6 +80,78 @@ impl<'a> RemlState<'a> {
         (jet.d1, jet.d2, jet.d3, jet.d4, jet.d5)
     }
 
+    #[inline]
+    fn cholesky_pivots_are_numerically_resolved(chol_diag: &Array1<f64>) -> bool {
+        let mut min_pivot_sq = f64::INFINITY;
+        let mut max_pivot_sq = 0.0_f64;
+        for &pivot in chol_diag {
+            if !pivot.is_finite() || pivot <= 0.0 {
+                return false;
+            }
+            let pivot_sq = pivot * pivot;
+            min_pivot_sq = min_pivot_sq.min(pivot_sq);
+            max_pivot_sq = max_pivot_sq.max(pivot_sq);
+        }
+        if !min_pivot_sq.is_finite() {
+            return false;
+        }
+        let scale = max_pivot_sq.max(1.0);
+        let floor = (chol_diag.len().max(1) as f64) * f64::EPSILON * scale;
+        min_pivot_sq > floor
+    }
+
+    fn reduced_fisher_inverse_and_half_logdet(
+        fisher_reduced: &Array2<f64>,
+    ) -> Result<(Array2<f64>, f64), EstimationError> {
+        let r = fisher_reduced.nrows();
+        assert_eq!(r, fisher_reduced.ncols());
+        let mut k_reduced = Array2::<f64>::zeros((r, r));
+        if r == 0 {
+            return Ok((k_reduced, 0.0));
+        }
+
+        if let Ok(chol) = fisher_reduced.cholesky(Side::Lower) {
+            let chol_diag = chol.diag();
+            if Self::cholesky_pivots_are_numerically_resolved(&chol_diag) {
+                let half_log_det = chol_diag.iter().map(|d| d.ln()).sum::<f64>();
+                for col in 0..r {
+                    let mut e_col = Array1::<f64>::zeros(r);
+                    e_col[col] = 1.0;
+                    let solved = chol.solvevec(&e_col);
+                    k_reduced.column_mut(col).assign(&solved);
+                }
+                return Ok((k_reduced, half_log_det));
+            }
+        }
+
+        let (evals_ir, evecs_ir) = fisher_reduced
+            .eigh(Side::Lower)
+            .map_err(EstimationError::EigendecompositionFailed)?;
+        let max_eval = evals_ir.iter().copied().fold(0.0_f64, f64::max).max(1.0);
+        let tol = (r.max(1) as f64) * f64::EPSILON * max_eval;
+        let mut kept_positive_direction = false;
+        let mut half_log_det = 0.0_f64;
+        for (eig_idx, &eig) in evals_ir.iter().enumerate() {
+            if eig > tol {
+                kept_positive_direction = true;
+                half_log_det += 0.5 * eig.ln();
+                let inv = eig.recip();
+                let vec = evecs_ir.column(eig_idx).to_owned();
+                for row in 0..r {
+                    for col in 0..r {
+                        k_reduced[[row, col]] += inv * vec[row] * vec[col];
+                    }
+                }
+            }
+        }
+        if !kept_positive_direction {
+            return Err(EstimationError::ModelIsIllConditioned {
+                condition_number: f64::INFINITY,
+            });
+        }
+        Ok((k_reduced, half_log_det))
+    }
+
     fn fill_logit_fisher_weight_derivative_arrays(
         eta: &Array1<f64>,
         w: &mut Array1<f64>,
@@ -500,10 +572,8 @@ impl FirthDenseOperator {
             }
         }
 
-        let mut k_reduced = Array2::<f64>::zeros((r, r));
         let mut x_metric_reduced_inv_diag = Array1::<f64>::zeros(r);
-        let mut half_log_det = 0.0_f64;
-        if r > 0 {
+        let (k_reduced, mut half_log_det) = if r > 0 {
             // The fixed-Q identifiable-space value is the generalized
             // determinant 0.5(log|I_r| - log|S_r|), which is equivalent to
             // evaluating W on the orthonormalized design U = X_r S_r^{-1/2}.
@@ -514,42 +584,11 @@ impl FirthDenseOperator {
             // Prefer the fast SPD path for I_r, but when I_r is only
             // numerically semidefinite after projection, keep the exact
             // positive eigenspace instead of failing outright.
-            if let Ok(chol) = fisher_reduced.cholesky(Side::Lower) {
-                half_log_det = chol.diag().iter().map(|d| d.ln()).sum::<f64>();
-                for col in 0..r {
-                    let mut e_col = Array1::<f64>::zeros(r);
-                    e_col[col] = 1.0;
-                    let solved = chol.solvevec(&e_col);
-                    k_reduced.column_mut(col).assign(&solved);
-                }
-            } else {
-                let (evals_ir, evecs_ir) = fisher_reduced
-                    .eigh(Side::Lower)
-                    .map_err(EstimationError::EigendecompositionFailed)?;
-                let max_eval = evals_ir.iter().copied().fold(0.0_f64, f64::max).max(1.0);
-                let tol = (r.max(1) as f64) * f64::EPSILON * max_eval;
-                let keep: Vec<usize> = evals_ir
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, &v)| if v > tol { Some(i) } else { None })
-                    .collect();
-                if keep.is_empty() {
-                    return Err(EstimationError::ModelIsIllConditioned {
-                        condition_number: f64::INFINITY,
-                    });
-                }
-                for &eig_idx in &keep {
-                    let eig = evals_ir[eig_idx];
-                    half_log_det += 0.5 * eig.ln();
-                    let inv = eig.recip();
-                    let vec = evecs_ir.column(eig_idx).to_owned();
-                    for row in 0..r {
-                        for col in 0..r {
-                            k_reduced[[row, col]] += inv * vec[row] * vec[col];
-                        }
-                    }
-                }
-            }
+            RemlState::reduced_fisher_inverse_and_half_logdet(&fisher_reduced)?
+        } else {
+            (Array2::<f64>::zeros((r, r)), 0.0)
+        };
+        if r > 0 {
             for col in 0..r {
                 let metric_eig = metric_spectrum[col];
                 half_log_det -= 0.5 * metric_eig.ln();

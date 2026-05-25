@@ -28073,6 +28073,47 @@ mod tests {
     }
 
     #[test]
+    fn periodic_bspline_derivative_matches_normalized_basis_finite_difference() {
+        let spec = PeriodicBSplineBasisSpec::new(3, 11, 4.7, -0.35, 2);
+        let u = array![
+            spec.origin + 1.0e-4,
+            spec.origin + 0.37,
+            spec.origin + 1.41,
+            spec.origin + spec.period - 2.0e-4,
+        ];
+        let t = u.clone().insert_axis(Axis(1));
+        let analytic = periodic_bspline_first_derivative_nd(
+            t.view(),
+            (spec.origin, spec.origin + spec.period),
+            spec.degree,
+            spec.num_basis,
+        )
+        .expect("periodic derivative")
+        .index_axis(Axis(2), 0)
+        .to_owned();
+
+        let step = 1.0e-6;
+        let plus = u.mapv(|v| v + step);
+        let minus = u.mapv(|v| v - step);
+        let basis_plus =
+            build_periodic_bspline_basis_1d(plus.view(), &spec).expect("plus periodic basis");
+        let basis_minus =
+            build_periodic_bspline_basis_1d(minus.view(), &spec).expect("minus periodic basis");
+        let finite_difference = (&basis_plus - &basis_minus).mapv(|v| v / (2.0 * step));
+
+        for row in 0..u.len() {
+            assert_abs_diff_eq!(analytic.row(row).sum(), 0.0, epsilon = 5.0e-12);
+            for col in 0..spec.num_basis {
+                assert_abs_diff_eq!(
+                    analytic[[row, col]],
+                    finite_difference[[row, col]],
+                    epsilon = 3.0e-7
+                );
+            }
+        }
+    }
+
+    #[test]
     fn periodic_multioutput_fit_recovers_anisotropic_ellipse_and_oval() {
         let n = 240;
         let u = Array1::from_iter((0..n).map(|i| std::f64::consts::TAU * i as f64 / n as f64));
