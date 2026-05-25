@@ -22735,10 +22735,7 @@ mod tests {
     // that refuses `rho_curvature_scale ≤ 0 / non-finite` (would silently
     // corrupt both cost and gradient).  The test pins the contract so
     // any future change that breaks the trio is caught immediately.
-    fn build_scaled_curvature_solution(
-        rho: &[f64],
-        s: f64,
-    ) -> InnerSolution<'static> {
+    fn build_scaled_curvature_solution(rho: &[f64], s: f64) -> InnerSolution<'static> {
         // 2×2 unpenalized Hessian (SPD).
         let h_unp = array![[3.0_f64, 0.5], [0.5, 5.0]];
         // Single penalty S = I (2×2), so root = I.
@@ -22751,8 +22748,7 @@ mod tests {
         let mut h_op_dense = &h_unp + &(&s_mat * lambda);
         h_op_dense.mapv_inplace(|v| s * v);
         let hop = Arc::new(
-            DenseSpectralOperator::from_symmetric(&h_op_dense)
-                .expect("scaled H_op is SPD"),
+            DenseSpectralOperator::from_symmetric(&h_op_dense).expect("scaled H_op is SPD"),
         );
         let p = h_op_dense.nrows() as f64;
         // Contract: subtract p·log(s) so cost evaluates log|H_unp + λS|.
@@ -22812,13 +22808,8 @@ mod tests {
 
         // Analytic gradient at ρ₀ via the unified evaluator.
         let solution_center = build_scaled_curvature_solution(&rho0, s);
-        let result = reml_laml_evaluate(
-            &solution_center,
-            &rho0,
-            EvalMode::ValueAndGradient,
-            None,
-        )
-        .expect("center evaluation");
+        let result = reml_laml_evaluate(&solution_center, &rho0, EvalMode::ValueAndGradient, None)
+            .expect("center evaluation");
         let analytic = result
             .gradient
             .expect("gradient returned for fixed-dispersion path")[0];
@@ -22866,13 +22857,8 @@ mod tests {
         // emit a corrupt cost/gradient pair.
         let mut solution = build_scaled_curvature_solution(&[0.0_f64], 1.0);
         solution.rho_curvature_scale = 0.0;
-        let err = reml_laml_evaluate(
-            &solution,
-            &[0.0_f64],
-            EvalMode::ValueOnly,
-            None,
-        )
-        .expect_err("zero curvature scale must be rejected");
+        let err = reml_laml_evaluate(&solution, &[0.0_f64], EvalMode::ValueOnly, None)
+            .expect_err("zero curvature scale must be rejected");
         assert!(
             format!("{err}").contains("rho_curvature_scale"),
             "error message must name the offending field, got: {err}",
@@ -22880,13 +22866,8 @@ mod tests {
 
         let mut solution = build_scaled_curvature_solution(&[0.0_f64], 1.0);
         solution.rho_curvature_scale = -1.5;
-        let err = reml_laml_evaluate(
-            &solution,
-            &[0.0_f64],
-            EvalMode::ValueOnly,
-            None,
-        )
-        .expect_err("negative curvature scale must be rejected");
+        let err = reml_laml_evaluate(&solution, &[0.0_f64], EvalMode::ValueOnly, None)
+            .expect_err("negative curvature scale must be rejected");
         assert!(
             format!("{err}").contains("rho_curvature_scale"),
             "error message must name the offending field, got: {err}",
@@ -22894,13 +22875,8 @@ mod tests {
 
         let mut solution = build_scaled_curvature_solution(&[0.0_f64], 1.0);
         solution.rho_curvature_scale = f64::NAN;
-        let err = reml_laml_evaluate(
-            &solution,
-            &[0.0_f64],
-            EvalMode::ValueOnly,
-            None,
-        )
-        .expect_err("NaN curvature scale must be rejected");
+        let err = reml_laml_evaluate(&solution, &[0.0_f64], EvalMode::ValueOnly, None)
+            .expect_err("NaN curvature scale must be rejected");
         assert!(
             format!("{err}").contains("rho_curvature_scale"),
             "error message must name the offending field, got: {err}",

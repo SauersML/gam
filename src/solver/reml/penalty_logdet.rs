@@ -1374,9 +1374,8 @@ mod tests {
         // [r, r + 1e-10], which is exactly what the new detection rule expects.
         let s = array![[ridge + active_eval, 0.0], [0.0, ridge]];
 
-        let pld =
-            PenaltyPseudologdet::from_assembled_with_nullity(s.clone(), Some(ridge), Some(1))
-                .expect("ridged assembled with structural nullity");
+        let pld = PenaltyPseudologdet::from_assembled_with_nullity(s.clone(), Some(ridge), Some(1))
+            .expect("ridged assembled with structural nullity");
 
         assert_eq!(pld.rank(), 1, "rank must equal p_dim − m0");
         let expected = (ridge + active_eval).ln();
@@ -1402,12 +1401,8 @@ mod tests {
         // invariant violation rather than silently discarding an active
         // direction.
         let s_no_null = array![[1.0 + ridge, 0.0], [0.0, 2.0 + ridge]];
-        let err = PenaltyPseudologdet::from_assembled_with_nullity(
-            s_no_null,
-            Some(ridge),
-            Some(1),
-        )
-        .expect_err("must error when no eigenvalue clusters near ridge");
+        let err = PenaltyPseudologdet::from_assembled_with_nullity(s_no_null, Some(ridge), Some(1))
+            .expect_err("must error when no eigenvalue clusters near ridge");
         assert!(
             err.contains("structural nullity invariant violated"),
             "unexpected error message: {err}"

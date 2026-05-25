@@ -6966,6 +6966,12 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
             AnalyticPenaltyKind::NestedPrefix(p) => p
                 .hessian_diag(self.target.view(), self.rho.view())
                 .expect("NestedPrefix diag"),
+            AnalyticPenaltyKind::SheafConsistency(_)
+                if self.dim() > ANALYTIC_LOGDET_DENSE_DIM_THRESHOLD =>
+            {
+                self.stochastic_diag_via_matvec()
+            }
+            AnalyticPenaltyKind::SheafConsistency(_) => self.diag_via_matvec(),
         }
     }
 
@@ -7065,12 +7071,18 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
                 let dense = self.as_dense();
                 <Array2<f64> as PenaltyOp>::log_det_plus_lambda_i(&dense, lambda)
             }
+            AnalyticPenaltyKind::SheafConsistency(_)
+                if self.dim() > ANALYTIC_LOGDET_DENSE_DIM_THRESHOLD =>
+            {
+                self.stochastic_log_det_plus_lambda_i(lambda)
+            }
             AnalyticPenaltyKind::NuclearNorm(_)
             | AnalyticPenaltyKind::BlockSparsity(_)
             | AnalyticPenaltyKind::MechanismSparsity(_)
             | AnalyticPenaltyKind::IvaeRidgeMeanGauge(_)
             | AnalyticPenaltyKind::BlockOrthogonality(_)
-            | AnalyticPenaltyKind::SoftmaxAssignmentSparsity(_) => {
+            | AnalyticPenaltyKind::SoftmaxAssignmentSparsity(_)
+            | AnalyticPenaltyKind::SheafConsistency(_) => {
                 let dense = self.as_dense();
                 <Array2<f64> as PenaltyOp>::log_det_plus_lambda_i(&dense, lambda)
             }
@@ -7924,8 +7936,8 @@ mod tests {
         }
         let target_values = Array1::from_vec(values);
         let slice = PsiSlice::full(target_values.len(), Some(latent_dim));
-        let pen = JumpReLUPenalty::new(slice, thresholds, weight, eps)
-            .expect("valid JumpReLU penalty");
+        let pen =
+            JumpReLUPenalty::new(slice, thresholds, weight, eps).expect("valid JumpReLU penalty");
         let diag = pen
             .hessian_diag(target_values.view(), rho.view())
             .expect("JumpReLU exposes a PSD diagonal majorizer");

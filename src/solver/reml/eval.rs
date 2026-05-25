@@ -718,8 +718,7 @@ impl<'a> RemlState<'a> {
                              has_matrix={} reason=\"{}\" failure_count={}",
                             has_matrix,
                             reason,
-                            SMOOTHING_CORRECTION_NUMERICAL_FAILURE_COUNT
-                                .load(Ordering::Relaxed),
+                            SMOOTHING_CORRECTION_NUMERICAL_FAILURE_COUNT.load(Ordering::Relaxed),
                         );
                     }
                 }

@@ -12313,8 +12313,9 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             )?;
             let pcg_rel_tol = joint_pcg_eisenstat_walker_forcing(prev_kkt_norm, current_kkt_norm);
 
-            let solve_joint_constraints_dense =
-                joint_constraints.is_some() || !matrix_free_joint_requested || joint_hessian_is_dense;
+            let solve_joint_constraints_dense = joint_constraints.is_some()
+                || !matrix_free_joint_requested
+                || joint_hessian_is_dense;
             let (candidate_beta, joint_active_set) = if solve_joint_constraints_dense
                 && let Some(constraints) = joint_constraints.as_ref()
             {
@@ -28073,11 +28074,8 @@ mod tests {
     /// parametric block, the marginal-slope synthetic above (rewritten
     /// to use a full-rank reparameterized basis with the absorbed null
     /// columns moved into a separate identifiable block) should fit
-    /// without any cert refusal. This half is `#[ignore]`d until that
-    /// rework lands; flipping the attribute off is the regression
-    /// signal that the rework worked.
+    /// without any cert refusal.
     #[test]
-    #[ignore = "fires until nullspace-lead lands smooth-construction null-space absorption"]
     fn rank_deficient_hpen_canary_disappears_after_nullspace_absorption() {
         let block_widths = [4usize, 4, 4];
         let total_p: usize = block_widths.iter().sum();

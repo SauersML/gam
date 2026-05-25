@@ -15,28 +15,12 @@
 //! - Budget exhaustion / trust-region floor without certifying. This is
 //!   between the two — sometimes structural, sometimes just unlucky.
 //!
-//! [`InnerStatus`] preserves the existing data while exposing this
-//! structure. Startup accounting classifies legacy error strings through
-//! [`classify_inner_error`], which inspects the bubbled error string for
-//! the sentinels emitted by `inner_blockwise_fit` and the diagnostician's
-//! `KktRefusalReport`. Once the inner solver emits `InnerStatus`
-//! natively, the remaining string classification path can be removed.
+//! [`InnerFailure`] captures these classes. Startup accounting classifies
+//! legacy error strings through [`classify_inner_error`], which inspects
+//! the bubbled error string for the sentinels emitted by
+//! `inner_blockwise_fit` and the diagnostician's `KktRefusalReport`.
 
-use super::custom_family::{BlockwiseInnerResult, KktRefusalDiagnosis};
-
-/// Lightweight KKT/cert summary attached to every inner status that
-/// terminated at a (real or constrained) stationary point. Carries
-/// enough information for the outer optimiser to log seed convergence
-/// without holding a reference to the full [`BlockwiseInnerResult`].
-#[derive(Clone, Debug)]
-pub(crate) struct KktCertificate {
-    pub projected_residual_inf: f64,
-    pub residual_tol: f64,
-    pub active_set_size: usize,
-    pub free_rank: Option<usize>,
-    pub accepted_step_inf: f64,
-    pub obj_change: f64,
-}
+use super::custom_family::KktRefusalDiagnosis;
 
 /// Structured failure modes for the inner solver. Each variant carries
 /// the original message for backwards-compatible logging plus structured
@@ -86,24 +70,6 @@ impl InnerFailure {
             | InnerFailure::Other(message) => message.as_str(),
         }
     }
-}
-
-/// Structured replacement for `Result<BlockwiseInnerResult, String>`.
-/// `Converged` and `ConstrainedStationary` both carry a successful
-/// result; the split keeps the certificate provenance explicit so the
-/// outer optimiser can apply different IFT projections without
-/// re-deriving the certificate at the call site.
-#[derive(Debug)]
-pub(crate) enum InnerStatus {
-    Converged {
-        result: BlockwiseInnerResult,
-        certificate: KktCertificate,
-    },
-    ConstrainedStationary {
-        result: BlockwiseInnerResult,
-        certificate: KktCertificate,
-    },
-    Failed(InnerFailure),
 }
 
 pub(crate) fn classify_inner_error(message: String) -> InnerFailure {
