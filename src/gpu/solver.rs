@@ -127,9 +127,7 @@ mod cuda {
         // stages pageable copies internally via its own pinned pool, and that
         // path does not block the issuing host thread for unrelated stream
         // work. Issue a direct async H2D from the pageable buffer instead.
-        stream
-            .clone_htod(src)
-            .map_err(|e| format!("cuda H2D: {e}"))
+        stream.clone_htod(src).map_err(|e| format!("cuda H2D: {e}"))
     }
 
     pub(crate) fn potrf_in_place(

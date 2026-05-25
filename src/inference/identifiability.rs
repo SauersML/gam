@@ -116,7 +116,11 @@ impl TheoremStatus {
         }
     }
     fn worse(self, other: TheoremStatus) -> TheoremStatus {
-        if other.rank() > self.rank() { other } else { self }
+        if other.rank() > self.rank() {
+            other
+        } else {
+            self
+        }
     }
 }
 
@@ -228,8 +232,7 @@ pub fn check_ivae(summary: &FitSummary, thr: &Thresholds) -> TheoremResult {
             return TheoremResult {
                 theorem_name: "iVAE".to_string(),
                 status: TheoremStatus::Warn,
-                reason: "iVAE check skipped: no aux provided in fit summary."
-                    .to_string(),
+                reason: "iVAE check skipped: no aux provided in fit summary.".to_string(),
                 metric,
             };
         }
@@ -264,9 +267,7 @@ pub fn check_ivae(summary: &FitSummary, thr: &Thresholds) -> TheoremResult {
         "aux_min_std".to_string(),
         if stds.is_empty() { 0.0 } else { min_std },
     );
-    if stds.is_empty()
-        || stds.iter().any(|s| *s <= thr.ivae_aux_var_floor)
-    {
+    if stds.is_empty() || stds.iter().any(|s| *s <= thr.ivae_aux_var_floor) {
         let zeros: Vec<usize> = stds
             .iter()
             .enumerate()
@@ -316,9 +317,7 @@ pub fn check_ivae(summary: &FitSummary, thr: &Thresholds) -> TheoremResult {
         Some(depth) => {
             metric.insert("encoder_depth".to_string(), depth as f64);
             if depth < 1 {
-                issues.push(format!(
-                    "encoder depth {depth} < 1; no encoder is present."
-                ));
+                issues.push(format!("encoder depth {depth} < 1; no encoder is present."));
                 status = status.worse(TheoremStatus::Fail);
             } else if depth == 1 {
                 issues.push(
@@ -353,10 +352,7 @@ pub fn check_ivae(summary: &FitSummary, thr: &Thresholds) -> TheoremResult {
 }
 
 /// Lachapelle 2401.04890 Theorem preconditions.
-pub fn check_mechanism_sparsity(
-    summary: &FitSummary,
-    thr: &Thresholds,
-) -> TheoremResult {
+pub fn check_mechanism_sparsity(summary: &FitSummary, thr: &Thresholds) -> TheoremResult {
     let mut metric: BTreeMap<String, f64> = BTreeMap::new();
     let mut issues: Vec<String> = Vec::new();
     let mut status = TheoremStatus::Pass;
@@ -367,9 +363,7 @@ pub fn check_mechanism_sparsity(
             return TheoremResult {
                 theorem_name: "MechanismSparsity".to_string(),
                 status: TheoremStatus::Warn,
-                reason:
-                    "MechanismSparsity skipped: no decoder in fit summary."
-                        .to_string(),
+                reason: "MechanismSparsity skipped: no decoder in fit summary.".to_string(),
                 metric,
             };
         }
@@ -381,8 +375,7 @@ pub fn check_mechanism_sparsity(
             return TheoremResult {
                 theorem_name: "MechanismSparsity".to_string(),
                 status: TheoremStatus::Warn,
-                reason:
-                    "MechanismSparsity skipped: n_free missing.".to_string(),
+                reason: "MechanismSparsity skipped: n_free missing.".to_string(),
                 metric,
             };
         }
@@ -430,8 +423,7 @@ pub fn check_mechanism_sparsity(
     let mut col_max = vec![0.0_f64; free_cols.ncols()];
     for col_idx in 0..free_cols.ncols() {
         let col = free_cols.column(col_idx);
-        col_max[col_idx] =
-            col.iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
+        col_max[col_idx] = col.iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
     }
     let mut zeros: u64 = 0;
     let mut total: u64 = 0;
@@ -536,10 +528,7 @@ pub fn check_mechanism_sparsity(
 }
 
 /// Random-projection identifiability precondition (Khemakhem App. A.3).
-pub fn check_random_projection(
-    summary: &FitSummary,
-    thr: &Thresholds,
-) -> TheoremResult {
+pub fn check_random_projection(summary: &FitSummary, thr: &Thresholds) -> TheoremResult {
     let mut metric: BTreeMap<String, f64> = BTreeMap::new();
 
     let act_rows = match summary.activations.as_ref() {
@@ -548,9 +537,7 @@ pub fn check_random_projection(
             return TheoremResult {
                 theorem_name: "RandomProjection".to_string(),
                 status: TheoremStatus::Warn,
-                reason:
-                    "RandomProjection skipped: no activations provided."
-                        .to_string(),
+                reason: "RandomProjection skipped: no activations provided.".to_string(),
                 metric,
             };
         }
@@ -583,10 +570,9 @@ pub fn check_random_projection(
         return TheoremResult {
             theorem_name: "RandomProjection".to_string(),
             status: TheoremStatus::Fail,
-            reason:
-                "activations contain non-finite variance; Khemakhem App. A.3 \
+            reason: "activations contain non-finite variance; Khemakhem App. A.3 \
                  requires bounded variance."
-                    .to_string(),
+                .to_string(),
             metric,
         };
     }
@@ -636,8 +622,8 @@ pub fn identifiability_check(summary: &FitSummary) -> Vec<TheoremResult> {
 /// `TheoremResult`. The single FFI surface — Python, the CLI, and any
 /// future binding all consume this.
 pub fn identifiability_check_json(input: &str) -> Result<String, String> {
-    let summary: FitSummary = serde_json::from_str(input)
-        .map_err(|e| format!("invalid FitSummary JSON: {e}"))?;
+    let summary: FitSummary =
+        serde_json::from_str(input).map_err(|e| format!("invalid FitSummary JSON: {e}"))?;
     let report = identifiability_check(&summary);
     serde_json::to_string(&report).map_err(|e| format!("serialise: {e}"))
 }
@@ -654,10 +640,7 @@ mod tests {
             n_free: Some(2),
             encoder_depth: Some(3),
             mech_sparsity_weight: Some(1.0),
-            decoder: Some(vec![
-                vec![1.0, 0.5, 0.0, 0.0, 0.0];
-                12
-            ]),
+            decoder: Some(vec![vec![1.0, 0.5, 0.0, 0.0, 0.0]; 12]),
             activations: Some(vec![vec![0.0; 3]; 32]),
             ground_truth_dim: None,
             thresholds: None,
@@ -681,10 +664,7 @@ mod tests {
             encoder_depth: Some(3),
             mech_sparsity_weight: Some(1.0),
             decoder: Some(vec![vec![1.0, 0.0, 1.0], vec![0.0, 1.0, 1.0]]),
-            activations: Some(vec![
-                vec![0.1, 0.2, 0.3],
-                vec![0.4, 0.5, 0.6],
-            ]),
+            activations: Some(vec![vec![0.1, 0.2, 0.3], vec![0.4, 0.5, 0.6]]),
             ground_truth_dim: None,
             thresholds: None,
         };

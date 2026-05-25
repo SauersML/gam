@@ -36,8 +36,7 @@ use gam::geometry::poincare::{
     lorentz_decode_backward as poincare_lorentz_decode_backward_impl,
     lorentz_decode_forward as poincare_lorentz_decode_forward_impl,
     lorentz_exp_origin as poincare_lorentz_exp_origin_impl,
-    lorentz_log_origin as poincare_lorentz_log_origin_impl,
-    mobius_add as poincare_mobius_add_impl,
+    lorentz_log_origin as poincare_lorentz_log_origin_impl, mobius_add as poincare_mobius_add_impl,
     poincare_distance as poincare_distance_impl,
     project_into_ball as poincare_project_into_ball_impl,
     tangent_decode_backward as poincare_tangent_decode_backward_impl,
@@ -45,13 +44,6 @@ use gam::geometry::poincare::{
     to_lorentz as poincare_to_lorentz_impl,
 };
 use gam::geometry::simplex::simplex_frechet_mean;
-use gam::kernels::sinkhorn_barycenter::{
-    circular_cost as sinkhorn_circular_cost_impl,
-    euclidean_cost as sinkhorn_euclidean_cost_impl,
-    geodesic_sphere_cost as sinkhorn_geodesic_sphere_cost_impl,
-    sinkhorn_barycenter as sinkhorn_barycenter_impl,
-    sinkhorn_barycenter_vjp as sinkhorn_barycenter_vjp_impl,
-};
 use gam::hmc::{NutsConfig, NutsResult};
 use gam::inference::data::{
     EncodedDataset, UnseenCategoryPolicy, encode_recordswith_inferred_schema,
@@ -66,6 +58,12 @@ use gam::inference::model::{
 };
 use gam::inference::posterior_bands::{self, PosteriorPredictBandsPayload};
 use gam::inference::predict_input::build_predict_input_for_model;
+use gam::kernels::sinkhorn_barycenter::{
+    circular_cost as sinkhorn_circular_cost_impl, euclidean_cost as sinkhorn_euclidean_cost_impl,
+    geodesic_sphere_cost as sinkhorn_geodesic_sphere_cost_impl,
+    sinkhorn_barycenter as sinkhorn_barycenter_impl,
+    sinkhorn_barycenter_vjp as sinkhorn_barycenter_vjp_impl,
+};
 use gam::report::{CoefficientRow, EdfBlockRow, ReportInput, render_html};
 use gam::smooth::{
     TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
@@ -87,12 +85,6 @@ use gam::terms::basis::{
     sphere_first_derivative_nd,
 };
 use gam::terms::input_loc_derivatives::contract_input_loc_gradient;
-use gam::terms::latent_coord::{AuxPriorFamily, aux_prior_targets};
-use gam::terms::sae_manifold::{
-    AssignmentMode, GumbelTemperatureSchedule, PeriodicHarmonicEvaluator, SaeAtomBasisKind,
-    SaeBasisEvaluator, SaeManifoldRho, ScheduleKind, SphereChartEvaluator, StaticBasisEvaluator,
-    TorusHarmonicEvaluator, term_from_padded_blocks_with_mode,
-};
 use gam::terms::interchange_decoder::{
     InterchangeDecodeForward as CoreInterchangeDecodeForward,
     InterchangeSwapForward as CoreInterchangeSwapForward,
@@ -101,14 +93,20 @@ use gam::terms::interchange_decoder::{
     interchange_swap_backward as core_interchange_swap_backward,
     interchange_swap_forward as core_interchange_swap_forward,
 };
+use gam::terms::latent_coord::{AuxPriorFamily, aux_prior_targets};
+use gam::terms::sae_manifold::{
+    AssignmentMode, GumbelTemperatureSchedule, PeriodicHarmonicEvaluator, SaeAtomBasisKind,
+    SaeBasisEvaluator, SaeManifoldRho, ScheduleKind, SphereChartEvaluator, StaticBasisEvaluator,
+    TorusHarmonicEvaluator, term_from_padded_blocks_with_mode,
+};
 use gam::terms::skip_transcoder::{
     SkipTranscoderRemlInputs, skip_transcoder_reml_metrics as skip_transcoder_reml_metrics_core,
 };
 use gam::terms::smooth::BlockwisePenalty;
 use gam::terms::{
     ARDPenalty as CoreARDPenalty, AnalyticPenalty as AnalyticPenaltyTrait, AnalyticPenaltyKind,
-    AnalyticPenaltyRegistry,
-    BlockOrthogonalityPenalty as CoreBlockOrthogonalityPenalty, DifferenceOpKind, GatedSAEDecoder,
+    AnalyticPenaltyRegistry, BlockOrthogonalityPenalty as CoreBlockOrthogonalityPenalty,
+    DifferenceOpKind, EdgeRestriction as CoreEdgeRestriction, GatedSAEDecoder,
     IBPAssignmentPenalty as CoreIBPAssignmentPenalty, IsometryPenalty as CoreIsometryPenalty,
     IvaeRidgeMeanGauge as IvaeRidgeMeanGaugePenalty, JumpReLUPenalty as RustJumpReLUPenalty,
     MaternBasisGradientTarget, MechanismSparsityPenalty as CoreMechanismSparsityPenalty,
@@ -117,7 +115,6 @@ use gam::terms::{
     OrthogonalityPenalty as CoreOrthogonalityPenalty, ParametricRowPrecisionPriorPenalty,
     PenaltyConcavity, PenaltyTier, PsiSlice, RowPrecisionPriorPenalty,
     ScadMcpPenalty as CoreScadMcpPenalty, ScalarWeightSchedule,
-    EdgeRestriction as CoreEdgeRestriction,
     SheafConsistencyPenalty as CoreSheafConsistencyPenalty,
     SoftmaxAssignmentSparsityPenalty as CoreSoftmaxAssignmentSparsityPenalty,
     SparsityPenalty as CoreSparsityPenalty, StreamingMaternBasisGradientEvaluator,
@@ -2740,9 +2737,7 @@ fn matern_basis<'py>(
             "matern_basis: length_scale must be finite and > 0, got {length_scale}"
         )));
     }
-    if pts.iter().any(|value| !value.is_finite())
-        || ctrs.iter().any(|value| !value.is_finite())
-    {
+    if pts.iter().any(|value| !value.is_finite()) || ctrs.iter().any(|value| !value.is_finite()) {
         return Err(py_value_error(
             "matern_basis: points and centers must be finite".to_string(),
         ));
@@ -2764,8 +2759,7 @@ fn matern_basis<'py>(
         aniso_log_scales: aniso_vec,
         periodic: None,
     };
-    let built = build_matern_basis(pts, &spec)
-        .map_err(|err| py_value_error(err.to_string()))?;
+    let built = build_matern_basis(pts, &spec).map_err(|err| py_value_error(err.to_string()))?;
     let design = built
         .design
         .try_to_dense_by_chunks("matern_basis")
@@ -2879,7 +2873,10 @@ fn basis_with_jet<'py>(
                 .transpose()?
                 .unwrap_or(false);
             let knots_array: Array1<f64> = match params.get_item("knots")? {
-                Some(obj) => obj.extract::<PyReadonlyArray1<'py, f64>>()?.as_array().to_owned(),
+                Some(obj) => obj
+                    .extract::<PyReadonlyArray1<'py, f64>>()?
+                    .as_array()
+                    .to_owned(),
                 None => {
                     let n_basis = params
                         .get_item("n_basis")?
@@ -2942,8 +2939,8 @@ fn basis_with_jet<'py>(
                     jet[[row, col, 0]] = deriv[[row, col]];
                 }
             }
-            let (penalty, _null) =
-                smoothness_penalty_impl(knots_array.view(), degree, order).map_err(py_value_error)?;
+            let (penalty, _null) = smoothness_penalty_impl(knots_array.view(), degree, order)
+                .map_err(py_value_error)?;
             Ok((
                 phi.into_pyarray(py).unbind(),
                 jet.into_pyarray(py).unbind(),
@@ -16615,8 +16612,7 @@ fn poincare_distance<'py>(
     let a_owned = a.as_array().to_owned();
     let b_owned = b.as_array().to_owned();
     detach_py_result(py, "poincare_distance", move || {
-        poincare_distance_impl(a_owned.view(), b_owned.view(), curvature)
-            .map_err(|e| e.to_string())
+        poincare_distance_impl(a_owned.view(), b_owned.view(), curvature).map_err(|e| e.to_string())
     })
 }
 
@@ -16768,8 +16764,7 @@ fn poincare_tangent_decode_backward<'py>(
             tangents: tangents_owned,
             curvature,
         };
-        poincare_tangent_decode_backward_impl(&cache, grad_owned.view())
-            .map_err(|e| e.to_string())
+        poincare_tangent_decode_backward_impl(&cache, grad_owned.view()).map_err(|e| e.to_string())
     })?;
     Ok((gg.into_pyarray(py).unbind(), ga.into_pyarray(py).unbind()))
 }
@@ -16818,8 +16813,7 @@ fn poincare_lorentz_decode_backward<'py>(
             tangents: tangents_owned,
             curvature,
         };
-        poincare_lorentz_decode_backward_impl(&cache, grad_owned.view())
-            .map_err(|e| e.to_string())
+        poincare_lorentz_decode_backward_impl(&cache, grad_owned.view()).map_err(|e| e.to_string())
     })?;
     Ok((gg.into_pyarray(py).unbind(), ga.into_pyarray(py).unbind()))
 }
@@ -16904,10 +16898,7 @@ fn response_geometry_sphere_normalize_base<'py>(
 }
 
 #[pyfunction]
-fn sinkhorn_circular_cost<'py>(
-    py: Python<'py>,
-    m: usize,
-) -> PyResult<Py<PyArray2<f64>>> {
+fn sinkhorn_circular_cost<'py>(py: Python<'py>, m: usize) -> PyResult<Py<PyArray2<f64>>> {
     let out = py.detach(move || sinkhorn_circular_cost_impl(m));
     Ok(out.into_pyarray(py).unbind())
 }
@@ -18839,10 +18830,7 @@ impl ParametricAuxConditionalPriorPenalty {
                 "ParametricAuxConditionalPriorPenalty.value_grad: t must have latent_dim > 0",
             ));
         }
-        let aux_array = self
-            .aux
-            .bind(py)
-            .extract::<PyReadonlyArray2<'_, f64>>()?;
+        let aux_array = self.aux.bind(py).extract::<PyReadonlyArray2<'_, f64>>()?;
         let aux_owned: Array2<f64> = aux_array.as_array().to_owned();
         let alpha_array = self
             .alpha_init
@@ -19819,9 +19807,7 @@ fn sheaf_extract_restrictions(
     restrictions: &Bound<'_, PyAny>,
 ) -> PyResult<Vec<CoreEdgeRestriction>> {
     let iter = restrictions.try_iter().map_err(|_| {
-        PyTypeError::new_err(
-            "SheafConsistencyPenalty.restriction_ops must be a sequence",
-        )
+        PyTypeError::new_err("SheafConsistencyPenalty.restriction_ops must be a sequence")
     })?;
     let mut out = Vec::new();
     for (e, item) in iter.enumerate() {
@@ -19863,14 +19849,14 @@ fn sheaf_extract_restrictions(
 
 fn sheaf_extract_stalk_dims(stalk_dims: &Bound<'_, PyAny>) -> PyResult<Vec<usize>> {
     let iter = stalk_dims.try_iter().map_err(|_| {
-        PyTypeError::new_err("SheafConsistencyPenalty.stalk_dims must be a sequence of positive integers")
+        PyTypeError::new_err(
+            "SheafConsistencyPenalty.stalk_dims must be a sequence of positive integers",
+        )
     })?;
     let mut out = Vec::new();
     for item in iter {
         let item = item.map_err(|_| {
-            PyTypeError::new_err(
-                "SheafConsistencyPenalty.stalk_dims entries must be integers",
-            )
+            PyTypeError::new_err("SheafConsistencyPenalty.stalk_dims entries must be integers")
         })?;
         let d = item.call_method0("__index__")?.extract::<i64>()?;
         if d <= 0 {
@@ -19903,9 +19889,8 @@ impl SheafConsistencyPenalty {
         let edges = sheaf_extract_edges(edges)?;
         let restrictions = sheaf_extract_restrictions(restriction_ops)?;
         let stalk_dims = sheaf_extract_stalk_dims(stalk_dims)?;
-        let inner =
-            CoreSheafConsistencyPenalty::new(edges, restrictions, weight, stalk_dims)
-                .map_err(PyValueError::new_err)?;
+        let inner = CoreSheafConsistencyPenalty::new(edges, restrictions, weight, stalk_dims)
+            .map_err(PyValueError::new_err)?;
         let target_obj = py_object_or_string_default(py, target, "z");
         Ok(Self {
             inner,
@@ -20156,14 +20141,9 @@ impl AuxConditionalPriorPenalty {
                 self.n_eff
             ))
         })?;
-        let penalty = RowPrecisionPriorPenalty::new(
-            slice,
-            lambda_owned,
-            self.weight,
-            n_eff_usize,
-            false,
-        )
-        .map_err(py_value_error)?;
+        let penalty =
+            RowPrecisionPriorPenalty::new(slice, lambda_owned, self.weight, n_eff_usize, false)
+                .map_err(py_value_error)?;
         let flat: Array1<f64> = view.iter().copied().collect();
         let rho = Array1::<f64>::zeros(0);
         let value = penalty.value(flat.view(), rho.view());
@@ -20312,9 +20292,7 @@ fn sindy_stlsq_solve_array<'py>(
     concave_a: f64,
     auto_lam: bool,
 ) -> PyResult<(Py<PyArray2<f64>>, usize, bool, f64)> {
-    use gam::solver::sindy::{
-        SindyPenaltyKind, sindy_stlsq_auto_lam, sindy_stlsq_solve,
-    };
+    use gam::solver::sindy::{SindyPenaltyKind, sindy_stlsq_auto_lam, sindy_stlsq_solve};
     let kind_lc = kind.to_ascii_lowercase();
     let penalty_kind = match kind_lc.as_str() {
         "ridge" | "l2" | "tikhonov" => SindyPenaltyKind::Ridge,
@@ -20369,8 +20347,7 @@ fn sindy_stlsq_solve_array<'py>(
 /// all consume this same FFI.
 #[pyfunction]
 fn identifiability_check_json(input: &str) -> PyResult<String> {
-    gam::inference::identifiability::identifiability_check_json(input)
-        .map_err(py_value_error)
+    gam::inference::identifiability::identifiability_check_json(input).map_err(py_value_error)
 }
 
 #[pymodule(name = "_rust", gil_used = false)]
@@ -20539,7 +20516,10 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(manifold_dimension, module)?)?;
     module.add_function(wrap_pyfunction!(manifold_ambient_dimension, module)?)?;
     module.add_function(wrap_pyfunction!(periodic_harmonic_basis, module)?)?;
-    module.add_function(wrap_pyfunction!(periodic_harmonic_basis_derivative, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        periodic_harmonic_basis_derivative,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(sphere_frechet_mean, module)?)?;
     module.add_function(wrap_pyfunction!(response_geometry_closure, module)?)?;
     module.add_function(wrap_pyfunction!(response_geometry_clr, module)?)?;

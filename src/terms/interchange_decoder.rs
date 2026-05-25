@@ -157,9 +157,7 @@ pub fn interchange_decode_forward(
 }
 
 /// Masked-swap forward.
-pub fn interchange_swap_forward(
-    inputs: InterchangeSwapForward<'_>,
-) -> Result<Array2<f64>, String> {
+pub fn interchange_swap_forward(inputs: InterchangeSwapForward<'_>) -> Result<Array2<f64>, String> {
     if inputs.z_a.dim() != inputs.z_b.dim() {
         return Err(format!(
             "interchange_swap: z_a {:?} and z_b {:?} must have the same shape",
@@ -346,7 +344,7 @@ pub fn interchange_swap_backward(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::{array, Array1, Array2};
+    use ndarray::{Array1, Array2, array};
 
     fn approx_eq(a: &Array2<f64>, b: &Array2<f64>, tol: f64) -> bool {
         if a.dim() != b.dim() {
@@ -442,14 +440,8 @@ mod tests {
         let bias = array![0.05, -0.01];
         let grad_out = array![[1.0, -0.5], [0.3, 0.8]];
 
-        let an = interchange_decode_backward(
-            z.view(),
-            w.view(),
-            g.view(),
-            grad_out.view(),
-            true,
-        )
-        .unwrap();
+        let an = interchange_decode_backward(z.view(), w.view(), g.view(), grad_out.view(), true)
+            .unwrap();
 
         // L = sum(grad_out * forward(z, w, g, bias))
         // ∂L/∂z[i,j] via finite differences

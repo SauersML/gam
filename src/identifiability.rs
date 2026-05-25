@@ -420,10 +420,7 @@ pub fn identifiable_factor_select_weights(
 /// caller does not supply one. Pure-Rust path (faer SVD via the
 /// `FaerSvd` bridge) so the seeding math lives in the same crate as the
 /// gauge-fix solver.
-pub fn thin_svd_scores(
-    x: ArrayView2<f64>,
-    k: usize,
-) -> Result<Array2<f64>, String> {
+pub fn thin_svd_scores(x: ArrayView2<f64>, k: usize) -> Result<Array2<f64>, String> {
     let (n, p) = x.dim();
     if k == 0 {
         return Ok(Array2::<f64>::zeros((n, 0)));
@@ -929,10 +926,9 @@ mod tests {
         let pen = Array2::<f64>::zeros((3, 3));
         let l1 = Array1::from(vec![0.1, 1.0, 10.0]);
         let l2 = Array1::from(vec![0.1, 1.0, 10.0]);
-        let res = identifiable_factor_select_weights(
-            rss.view(), pen.view(), l1.view(), l2.view(), 80,
-        )
-        .unwrap();
+        let res =
+            identifiable_factor_select_weights(rss.view(), pen.view(), l1.view(), l2.view(), 80)
+                .unwrap();
         assert_eq!((res.best_i, res.best_j), (1, 1));
         assert!((res.best_lam1 - 1.0).abs() < 1e-12);
         assert!((res.best_lam2 - 1.0).abs() < 1e-12);
@@ -945,10 +941,9 @@ mod tests {
         let pen = Array2::<f64>::from_elem((2, 2), 1.0);
         let l1 = Array1::from(vec![0.1, 10.0]);
         let l2 = Array1::from(vec![0.1, 10.0]);
-        let res = identifiable_factor_select_weights(
-            rss.view(), pen.view(), l1.view(), l2.view(), 8,
-        )
-        .unwrap();
+        let res =
+            identifiable_factor_select_weights(rss.view(), pen.view(), l1.view(), l2.view(), 8)
+                .unwrap();
         assert_eq!((res.best_i, res.best_j), (0, 0));
     }
 
@@ -958,10 +953,9 @@ mod tests {
         let pen = Array2::<f64>::zeros((2, 2));
         let l1 = Array1::from(vec![1.0, 1.0]);
         let l2 = Array1::from(vec![1.0, 1.0, 1.0]);
-        let err = identifiable_factor_select_weights(
-            rss.view(), pen.view(), l1.view(), l2.view(), 8,
-        )
-        .unwrap_err();
+        let err =
+            identifiable_factor_select_weights(rss.view(), pen.view(), l1.view(), l2.view(), 8)
+                .unwrap_err();
         assert!(err.contains("penalty_grid"));
     }
 
@@ -1015,18 +1009,8 @@ mod tests {
 
     #[test]
     fn partial_supervision_anchor_pins_exact_anchors_when_full_rank() {
-        let aux = array![
-            [1.0_f64, 2.0],
-            [-1.0, 0.5],
-            [3.0, -2.0],
-            [0.7, 1.2],
-        ];
-        let t_sup = array![
-            [0.5_f64, 1.0],
-            [-0.5, 0.25],
-            [1.5, -1.0],
-            [0.35, 0.6],
-        ];
+        let aux = array![[1.0_f64, 2.0], [-1.0, 0.5], [3.0, -2.0], [0.7, 1.2],];
+        let t_sup = array![[0.5_f64, 1.0], [-0.5, 0.25], [1.5, -1.0], [0.35, 0.6],];
         let t_free = Array2::<f64>::zeros((4, 1));
         let result = partial_supervision_solve(
             t_sup.view(),

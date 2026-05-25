@@ -7,8 +7,8 @@ pub mod construction;
 pub mod equivariant_penalty;
 pub mod gated_decoder;
 pub mod hull;
-pub mod interchange_decoder;
 pub mod input_loc_derivatives;
+pub mod interchange_decoder;
 pub mod latent_coord;
 pub mod layout;
 pub mod matern_gradient;
@@ -47,9 +47,9 @@ pub use latent_coord::{
     LatentManifold,
 };
 pub use matern_gradient::{MaternBasisGradientTarget, StreamingMaternBasisGradientEvaluator};
-pub use sheaf::{EdgeRestriction, SheafConsistencyPenalty};
 pub use sae_manifold::{
     AssignmentMode, GumbelTemperatureSchedule, SaeAssignment, SaeAtomBasisKind, SaeBasisEvaluator,
     SaeManifoldAtom, SaeManifoldLoss, SaeManifoldRho, SaeManifoldTerm, ScheduleKind,
     SphereChartEvaluator, TorusHarmonicEvaluator,
 };
+pub use sheaf::{EdgeRestriction, SheafConsistencyPenalty};

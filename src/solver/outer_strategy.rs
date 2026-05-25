@@ -15,10 +15,10 @@
 
 use crate::cache::{LoadSource, Session as CacheSession};
 use crate::estimate::EstimationError;
+use crate::solver::estimate::reml::unified::BarrierConfig;
 use crate::solver::startup_stats::{
     SeedRejection, StartupStats, format_no_seeds_passed, uniform_structural_key,
 };
-use crate::solver::estimate::reml::unified::BarrierConfig;
 use ::opt::{
     Arc as ArcOptimizer, ArcError, Bfgs, BfgsError, Bounds, FallbackPolicy as OptFallbackPolicy,
     FirstOrderObjective, FirstOrderSample, FixedPoint, FixedPointError, FixedPointObjective,
@@ -5978,7 +5978,8 @@ fn run_outer_with_plan(
             .clone()
             .or_else(|| uniform_structural_key(&seed_rejections, 1));
         let early_exit_note = if structural_early_exit_key.is_some() {
-            "early-exit triggered: every observed seed reported the same structural CertRefused".to_string()
+            "early-exit triggered: every observed seed reported the same structural CertRefused"
+                .to_string()
         } else if stopped_early_due_to_limit {
             format!(
                 "stopped early after {unsuccessful_expensive_seeds} consecutive non-converged \

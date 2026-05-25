@@ -11394,10 +11394,7 @@ fn compute_kkt_refusal_report(
         if let Ok((evals, _)) = FaerEigh::eigh(&h_joint, Side::Lower) {
             let mut sorted: Vec<f64> = evals.iter().copied().collect();
             sorted.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-            let max_abs = sorted
-                .iter()
-                .map(|x: &f64| x.abs())
-                .fold(0.0_f64, f64::max);
+            let max_abs = sorted.iter().map(|x: &f64| x.abs()).fold(0.0_f64, f64::max);
             let min_abs = sorted
                 .iter()
                 .map(|x: &f64| x.abs())
@@ -11405,7 +11402,11 @@ fn compute_kkt_refusal_report(
             let cutoff = KKT_REFUSAL_RANK_TOL * max_abs;
             hpen_nullity_at_rank_tol = sorted.iter().filter(|x| x.abs() < cutoff).count();
             hpen_max_abs_eigenvalue = max_abs;
-            hpen_min_abs_eigenvalue = if min_abs.is_finite() { min_abs } else { f64::NAN };
+            hpen_min_abs_eigenvalue = if min_abs.is_finite() {
+                min_abs
+            } else {
+                f64::NAN
+            };
             hpen_condition_number = if min_abs > 0.0 && min_abs.is_finite() {
                 max_abs / min_abs
             } else {
@@ -11479,7 +11480,10 @@ impl KktRefusalReport {
                     .get(idx)
                     .copied()
                     .unwrap_or(f64::NAN),
-                self.block_residual_inf.get(idx).copied().unwrap_or(f64::NAN),
+                self.block_residual_inf
+                    .get(idx)
+                    .copied()
+                    .unwrap_or(f64::NAN),
                 self.block_beta_inf.get(idx).copied().unwrap_or(f64::NAN),
                 self.block_widths.get(idx).copied().unwrap_or(0),
             ),
@@ -11488,10 +11492,7 @@ impl KktRefusalReport {
     }
 
     fn beta_inf(&self) -> f64 {
-        self.block_beta_inf
-            .iter()
-            .copied()
-            .fold(0.0_f64, f64::max)
+        self.block_beta_inf.iter().copied().fold(0.0_f64, f64::max)
     }
 
     /// Multi-line structured log emitted at the cert REFUSED site. The
@@ -27862,7 +27863,9 @@ mod tests {
             "carrying-block name should be the third block",
         );
         assert!(
-            report.format_structured_log(4.0 * residual_tol).contains("rank_deficient_H_pen"),
+            report
+                .format_structured_log(4.0 * residual_tol)
+                .contains("rank_deficient_H_pen"),
             "structured log must surface the diagnosis label",
         );
         assert!(

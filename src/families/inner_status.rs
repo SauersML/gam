@@ -113,9 +113,7 @@ pub(crate) enum InnerStatus {
 /// On success, packages the `BlockwiseInnerResult.kkt_residual` (if
 /// any) into a [`KktCertificate`] and splits `Converged` vs
 /// `ConstrainedStationary` on the `converged` flag.
-pub(crate) fn classify_inner_result(
-    raw: Result<BlockwiseInnerResult, String>,
-) -> InnerStatus {
+pub(crate) fn classify_inner_result(raw: Result<BlockwiseInnerResult, String>) -> InnerStatus {
     match raw {
         Ok(result) => {
             let certificate = certificate_from_result(&result);
@@ -232,7 +230,11 @@ fn parse_legacy_carrying_block(message: &str) -> Option<String> {
     let tail = &message[start..];
     let end = tail.find('\'')?;
     let name = &tail[..end];
-    if name.is_empty() { None } else { Some(name.to_string()) }
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
 }
 
 #[cfg(test)]

@@ -13530,7 +13530,7 @@ mod tests {
     fn parse_survival_time_basis_accepts_ispline() {
         let args = SurvivalArgs {
             data: std::path::PathBuf::from("dummy.csv"),
-            entry: "entry".to_string(),
+            entry: Some("entry".to_string()),
             exit: "exit".to_string(),
             event: "event".to_string(),
             formula: "1".to_string(),
@@ -13582,7 +13582,7 @@ mod tests {
     fn parse_survival_time_basis_rejects_nonstructural_bases() {
         let mut args = SurvivalArgs {
             data: std::path::PathBuf::from("dummy.csv"),
-            entry: "entry".to_string(),
+            entry: Some("entry".to_string()),
             exit: "exit".to_string(),
             event: "event".to_string(),
             formula: "1".to_string(),
@@ -14839,7 +14839,7 @@ mod tests {
     fn parse_survival_inverse_link_accepts_sas_init() {
         let mut args = SurvivalArgs {
             data: std::path::PathBuf::from("dummy.csv"),
-            entry: "entry".to_string(),
+            entry: Some("entry".to_string()),
             exit: "exit".to_string(),
             event: "event".to_string(),
             formula: "1".to_string(),
@@ -14898,7 +14898,7 @@ mod tests {
     fn survival_args_for_inverse_link_test() -> SurvivalArgs {
         SurvivalArgs {
             data: std::path::PathBuf::from("dummy.csv"),
-            entry: "entry".to_string(),
+            entry: Some("entry".to_string()),
             exit: "exit".to_string(),
             event: "event".to_string(),
             formula: "1".to_string(),
@@ -15022,7 +15022,7 @@ mod tests {
     fn parse_survival_inverse_link_supports_loglog_and_cauchit() {
         let mut args = SurvivalArgs {
             data: std::path::PathBuf::from("dummy.csv"),
-            entry: "entry".to_string(),
+            entry: Some("entry".to_string()),
             exit: "exit".to_string(),
             event: "event".to_string(),
             formula: "1".to_string(),
@@ -15099,7 +15099,7 @@ mod tests {
     fn parse_survival_inverse_link_accepts_flexible_standard_links() {
         let mut args = SurvivalArgs {
             data: std::path::PathBuf::from("dummy.csv"),
-            entry: "entry".to_string(),
+            entry: Some("entry".to_string()),
             exit: "exit".to_string(),
             event: "event".to_string(),
             formula: "1".to_string(),
@@ -15146,7 +15146,7 @@ mod tests {
     fn parse_survival_inverse_link_rejects_flexible_blended_links() {
         let mut args = SurvivalArgs {
             data: std::path::PathBuf::from("dummy.csv"),
-            entry: "entry".to_string(),
+            entry: Some("entry".to_string()),
             exit: "exit".to_string(),
             event: "event".to_string(),
             formula: "1".to_string(),
@@ -15195,7 +15195,7 @@ mod tests {
     fn parse_survival_inverse_link_reports_survival_specific_supported_links() {
         let mut args = SurvivalArgs {
             data: std::path::PathBuf::from("dummy.csv"),
-            entry: "entry".to_string(),
+            entry: Some("entry".to_string()),
             exit: "exit".to_string(),
             event: "event".to_string(),
             formula: "1".to_string(),
@@ -15595,7 +15595,7 @@ mod tests {
         .expect("write csv");
         let args = SurvivalArgs {
             data: csv_path,
-            entry: "entry".to_string(),
+            entry: Some("entry".to_string()),
             exit: "exit".to_string(),
             event: "event".to_string(),
             formula: "1".to_string(),
@@ -15660,7 +15660,7 @@ mod tests {
         .expect("write csv");
         let args = SurvivalArgs {
             data: csv_path,
-            entry: "entry".to_string(),
+            entry: Some("entry".to_string()),
             exit: "exit".to_string(),
             event: "event".to_string(),
             formula: "timewiggle(degree=3, internal_knots=4)".to_string(),
@@ -15723,7 +15723,7 @@ mod tests {
         .expect("write csv");
         let err = super::run_survival(SurvivalArgs {
             data: csv_path,
-            entry: "entry".to_string(),
+            entry: Some("entry".to_string()),
             exit: "exit".to_string(),
             event: "event".to_string(),
             formula: "1 + linkwiggle(degree=2, internal_knots=2)".to_string(),
@@ -15786,7 +15786,7 @@ mod tests {
         .expect("write csv");
         super::run_survival(SurvivalArgs {
             data: csv_path,
-            entry: "entry".to_string(),
+            entry: Some("entry".to_string()),
             exit: "exit".to_string(),
             event: "event".to_string(),
             formula: "1 + linkwiggle(degree=2, internal_knots=2)".to_string(),

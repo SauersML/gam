@@ -56,10 +56,7 @@ pub struct AuxRichnessMetrics {
 /// Jacobian is the linear-regression slope ``B`` of ``Z ~ A`` (centred). For
 /// a non-linear iVAE encoder this is a first-order surrogate; a deficient
 /// rank here forecloses identifiability regardless of nonlinear postproc.
-pub fn aux_richness_metrics(
-    aux: ArrayView2<f64>,
-    latents: ArrayView2<f64>,
-) -> AuxRichnessMetrics {
+pub fn aux_richness_metrics(aux: ArrayView2<f64>, latents: ArrayView2<f64>) -> AuxRichnessMetrics {
     let (n, aux_dim) = aux.dim();
     let (n_z, latent_dim) = latents.dim();
     assert_eq!(n, n_z, "aux and latents must share row count");
@@ -547,7 +544,12 @@ mod tests {
     #[test]
     fn jacobian_sparsity_passes_on_diagonal() {
         // P=4, K=3, n_samples=1; mostly zero.
-        let j = array![[1.0_f64, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0, 0.0]];
+        let j = array![
+            [1.0_f64, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [0.0, 0.0, 0.0]
+        ];
         let m = jacobian_sparsity_metrics(j.view(), 1, 1.0e-3);
         assert_eq!(m.p_features, 4);
         assert_eq!(m.latent_dim, 3);
