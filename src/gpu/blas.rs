@@ -28,6 +28,7 @@ pub fn backend_status() -> BackendStatus {
     }
 }
 
+#[cfg(all(feature = "cuda", target_os = "linux"))]
 mod cuda_impl {
     use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3, Axis};
 
@@ -510,6 +511,7 @@ mod cuda_impl {
     }
 }
 
+#[cfg(all(feature = "cuda", target_os = "linux"))]
 pub(crate) use cuda_impl::{
     gemm_abt_strided_batched_cuda, gemm_broadcast_b_batched_cuda, gemm_cuda, gemv_cuda,
     joint_hessian_2x2_cuda, trsm_cuda, xt_diag_x_cuda, xt_diag_y_cuda,
