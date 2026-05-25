@@ -14385,6 +14385,55 @@ fn rg_rho_so3_jvp_impl(
     Ok(out)
 }
 
+fn rg_rho_impl(group: &str, g: ArrayViewD<'_, f64>) -> Result<ArrayD<f64>, String> {
+    match group {
+        "SO2" => {
+            let mut out_shape = g.shape().to_vec();
+            out_shape.push(2);
+            out_shape.push(2);
+            let flat = Array1::from_vec(g.iter().copied().collect());
+            rg_rho_so2_impl(flat.view())
+                .into_shape(IxDyn(&out_shape))
+                .map_err(|err| format!("failed to reshape SO(2) representation: {err}"))
+        }
+        "SO3" => {
+            let shape = g.shape().to_vec();
+            if shape.last().copied() != Some(3) {
+                return Err("SO(3) rep input requires last axis of length 3".to_string());
+            }
+            let n = g.len() / 3;
+            let flat = g
+                .to_owned()
+                .into_shape((n, 3))
+                .map_err(|err| format!("failed to flatten SO(3) representation input: {err}"))?;
+            let mut out_shape = shape[..shape.len() - 1].to_vec();
+            out_shape.push(3);
+            out_shape.push(3);
+            rg_rho_so3_impl(flat.view())?
+                .into_shape(IxDyn(&out_shape))
+                .map_err(|err| format!("failed to reshape SO(3) representation: {err}"))
+        }
+        "R1" => {
+            let mut out_shape = g.shape().to_vec();
+            out_shape.push(1);
+            out_shape.push(1);
+            Ok(ArrayD::<f64>::from_elem(IxDyn(&out_shape), 1.0))
+        }
+        "Trivial" => {
+            let shape = g.shape();
+            let mut out_shape = if shape.is_empty() {
+                Vec::new()
+            } else {
+                shape[..shape.len() - 1].to_vec()
+            };
+            out_shape.push(1);
+            out_shape.push(1);
+            Ok(ArrayD::<f64>::from_elem(IxDyn(&out_shape), 1.0))
+        }
+        other => Err(format!("unknown equivariant group {other:?}")),
+    }
+}
+
 fn rg_gauge_companion_loss_impl(
     aux_values: ArrayView2<'_, f64>,
     theta: ArrayView2<'_, f64>,
@@ -14401,6 +14450,9 @@ fn rg_gauge_companion_loss_impl(
         return Err("aux_values and theta must agree in row count".to_string());
     }
     let n = aux_values.nrows();
+    if n == 0 {
+        return Ok(0.0);
+    }
     let n_f = n as f64;
     let mut terms: Vec<f64> = Vec::new();
     let two_pi = std::f64::consts::TAU;
@@ -14629,6 +14681,24 @@ fn sphere_frechet_mean<'py>(
 }
 
 #[pyfunction]
+fn equivariant_rho<'py>(
+    py: Python<'py>,
+    group: String,
+    g: PyReadonlyArrayDyn<'py, f64>,
+) -> PyResult<Py<PyArrayDyn<f64>>> {
+    let g_owned = g.as_array().to_owned();
+    let out = detach_py_result(py, "equivariant_rho", move || {
+        rg_rho_impl(group.as_str(), g_owned.view())
+    })?;
+    Ok(out.into_pyarray(py).unbind())
+}
+
+#[pyfunction]
+fn equivariant_aux_enabled(aux: Option<String>) -> bool {
+    aux.is_some()
+}
+
+#[pyfunction]
 fn equivariant_rho_so2<'py>(
     py: Python<'py>,
     theta: PyReadonlyArray1<'py, f64>,
@@ -14681,11 +14751,14 @@ fn equivariant_rho_so3_jvp<'py>(
 #[pyfunction(signature = (aux_values, theta, d_aux, weight = 1.0))]
 fn equivariant_gauge_companion_loss<'py>(
     py: Python<'py>,
-    aux_values: PyReadonlyArray2<'py, f64>,
+    aux_values: Option<PyReadonlyArray2<'py, f64>>,
     theta: PyReadonlyArray2<'py, f64>,
     d_aux: usize,
     weight: f64,
 ) -> PyResult<f64> {
+    let Some(aux_values) = aux_values else {
+        return Ok(0.0);
+    };
     let aux_owned = aux_values.as_array().to_owned();
     let theta_owned = theta.as_array().to_owned();
     detach_py_result(py, "equivariant_gauge_companion_loss", move || {
@@ -17483,6 +17556,8 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
         response_geometry_normalize_fisher_rao,
         module
     )?)?;
+    module.add_function(wrap_pyfunction!(equivariant_rho, module)?)?;
+    module.add_function(wrap_pyfunction!(equivariant_aux_enabled, module)?)?;
     module.add_function(wrap_pyfunction!(equivariant_rho_so2, module)?)?;
     module.add_function(wrap_pyfunction!(equivariant_rho_so2_jvp, module)?)?;
     module.add_function(wrap_pyfunction!(equivariant_rho_so3, module)?)?;
