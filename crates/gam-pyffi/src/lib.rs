@@ -8518,6 +8518,78 @@ fn report_html(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<String> {
     detach_py_result(py, "report_html", move || report_html_impl(&model_bytes))
 }
 
+#[pyfunction]
+fn diagnostics_from_predictions(
+    py: Python<'_>,
+    observed: Vec<f64>,
+    predicted_mean: Vec<f64>,
+) -> PyResult<Py<PyDict>> {
+    if observed.is_empty() {
+        return Err(py_value_error(
+            "diagnostics_from_predictions requires at least one observation".to_string(),
+        ));
+    }
+    if observed.len() != predicted_mean.len() {
+        return Err(py_value_error(format!(
+            "diagnostics_from_predictions length mismatch: observed has {} values but predicted mean has {}",
+            observed.len(),
+            predicted_mean.len()
+        )));
+    }
+    if observed.iter().any(|value| !value.is_finite()) {
+        return Err(py_value_error(
+            "observed values must contain only finite numbers".to_string(),
+        ));
+    }
+    if predicted_mean.iter().any(|value| !value.is_finite()) {
+        return Err(py_value_error(
+            "predicted mean values must contain only finite numbers".to_string(),
+        ));
+    }
+
+    let n_obs = observed.len();
+    let n_obs_f = n_obs as f64;
+    let mut residuals = Vec::with_capacity(n_obs);
+    let mut abs_sum = 0.0_f64;
+    let mut residual_sum = 0.0_f64;
+    let mut residual_sum_squares = 0.0_f64;
+    let mut observed_sum = 0.0_f64;
+    for (obs, pred) in observed.iter().zip(predicted_mean.iter()) {
+        let residual = obs - pred;
+        residuals.push(residual);
+        abs_sum += residual.abs();
+        residual_sum += residual;
+        residual_sum_squares += residual * residual;
+        observed_sum += obs;
+    }
+
+    let observed_mean = observed_sum / n_obs_f;
+    let total_sum_squares = observed
+        .iter()
+        .map(|value| {
+            let centered = value - observed_mean;
+            centered * centered
+        })
+        .sum::<f64>();
+
+    let metrics = PyDict::new(py);
+    metrics.set_item("n_obs", n_obs_f)?;
+    metrics.set_item("mae", abs_sum / n_obs_f)?;
+    metrics.set_item("rmse", (residual_sum_squares / n_obs_f).sqrt())?;
+    metrics.set_item("bias", residual_sum / n_obs_f)?;
+    if total_sum_squares > 0.0 {
+        metrics.set_item(
+            "r_squared",
+            1.0 - residual_sum_squares / total_sum_squares,
+        )?;
+    }
+
+    let out = PyDict::new(py);
+    out.set_item("residuals", PyList::new(py, residuals)?)?;
+    out.set_item("metrics", metrics)?;
+    Ok(out.unbind())
+}
+
 // =========================================================================
 // LatentCoord input-location derivative helpers (thin pyffi wrappers).
 //
@@ -8860,6 +8932,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(coefficient_state_json, module)?)?;
     module.add_function(wrap_pyfunction!(check_json, module)?)?;
     module.add_function(wrap_pyfunction!(report_html, module)?)?;
+    module.add_function(wrap_pyfunction!(diagnostics_from_predictions, module)?)?;
     // LatentCoord input-location derivative helpers (one per basis kind).
     module.add_function(wrap_pyfunction!(
         duchon_input_location_first_derivative,
