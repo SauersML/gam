@@ -4,8 +4,6 @@ from __future__ import annotations
 import argparse
 import csv
 import importlib
-import importlib.machinery
-import importlib.util
 import json
 import math
 import os
@@ -35,7 +33,6 @@ HEARTBEAT_INITIAL_WINDOW_SEC = 2.0
 HEARTBEAT_INITIAL_INTERVAL_SEC = 0.25
 MAX_CAPTURE_CHARS = 200000
 _OUTPUT_LOCK = threading.Lock()
-_GAMFIT_RUST: Any | None = None
 
 
 class _TerminalOutputSanitizer:
@@ -1028,28 +1025,6 @@ def zscore_train_test(train: np.ndarray, test: np.ndarray) -> tuple[np.ndarray, 
     return (train - mu) / sd, (test - mu) / sd, mu, sd
 
 
-def _gamfit_rust_module() -> Any:
-    global _GAMFIT_RUST
-    if _GAMFIT_RUST is None:
-        rust_path = ROOT / "gamfit" / "_rust.abi3.so"
-        loader = importlib.machinery.ExtensionFileLoader("_rust", str(rust_path))
-        spec = importlib.util.spec_from_file_location("_rust", rust_path, loader=loader)
-        if spec is None:
-            raise RuntimeError(f"failed to load gamfit Rust extension at {rust_path}")
-        module = importlib.util.module_from_spec(spec)
-        loader.exec_module(module)
-        _GAMFIT_RUST = module
-    return _GAMFIT_RUST
-
-
-def _gamfit_residual_metrics(observed: np.ndarray, predicted: np.ndarray) -> dict[str, float]:
-    diagnostics = _gamfit_rust_module().diagnostics_from_predictions(
-        np.asarray(observed, dtype=float).reshape(-1).tolist(),
-        np.asarray(predicted, dtype=float).reshape(-1).tolist(),
-    )
-    return {str(key): float(value) for key, value in dict(diagnostics["metrics"]).items()}
-
-
 def compute_auc(y_true: np.ndarray, y_score: np.ndarray) -> float:
     y = (np.asarray(y_true, dtype=float) > 0.5).astype(int)
     p = np.asarray(y_score, dtype=float)
@@ -1081,32 +1056,6 @@ def compute_pr_auc(y_true: np.ndarray, y_score: np.ndarray) -> float:
     return float(np.trapezoid(precision, recall))
 
 
-def classification_confusion_metrics(y_true: np.ndarray, y_prob: np.ndarray) -> dict[str, float]:
-    y = (np.asarray(y_true, dtype=float) > 0.5).astype(int)
-    p = np.asarray(y_prob, dtype=float)
-    threshold = 0.5
-    pred = (p >= threshold).astype(int)
-    tp = int(np.sum((pred == 1) & (y == 1)))
-    tn = int(np.sum((pred == 0) & (y == 0)))
-    fp = int(np.sum((pred == 1) & (y == 0)))
-    fn = int(np.sum((pred == 0) & (y == 1)))
-    sensitivity = tp / max(tp + fn, 1)
-    specificity = tn / max(tn + fp, 1)
-    precision = tp / max(tp + fp, 1)
-    recall = sensitivity
-    f1 = 2.0 * precision * recall / max(precision + recall, 1e-12)
-    accuracy = (tp + tn) / max(len(y), 1)
-    balanced_accuracy = 0.5 * (sensitivity + specificity)
-    return {
-        "accuracy": float(accuracy),
-        "balanced_accuracy": float(balanced_accuracy),
-        "sensitivity": float(sensitivity),
-        "specificity": float(specificity),
-        "precision": float(precision),
-        "f1": float(f1),
-    }
-
-
 def compute_logloss(y_true: np.ndarray, y_prob: np.ndarray, eps: float = 1e-12) -> float:
     y = np.asarray(y_true, dtype=float)
     p = np.clip(np.asarray(y_prob, dtype=float), eps, 1.0 - eps)
@@ -1114,8 +1063,9 @@ def compute_logloss(y_true: np.ndarray, y_prob: np.ndarray, eps: float = 1e-12) 
 
 
 def compute_brier(y_true: np.ndarray, y_prob: np.ndarray) -> float:
-    metrics = _gamfit_residual_metrics(y_true, y_prob)
-    return float(metrics["rmse"] ** 2)
+    y = np.asarray(y_true, dtype=float)
+    p = np.asarray(y_prob, dtype=float)
+    return float(np.mean((y - p) ** 2))
 
 
 def compute_nagelkerke(y_true: np.ndarray, y_prob: np.ndarray, null_mean: float) -> float | None:
@@ -1336,10 +1286,7 @@ def classification_metrics(y_true: np.ndarray, y_prob: np.ndarray, train_prev: f
         "logloss": compute_logloss(y_true, y_prob),
         "nagelkerke_r2": compute_nagelkerke(y_true, y_prob, train_prev),
         "ece": ece_score(y_true, y_prob),
-        "mean_pred": float(np.mean(y_prob)),
-        "mean_obs": float(np.mean(y_true)),
     }
-    metrics.update(classification_confusion_metrics(y_true, y_prob))
     return metrics
 
 
@@ -1357,10 +1304,6 @@ def survival_metrics(
     surv = calibrated_survival_matrix(train_times, train_events, train_risk, test_risk, grid)
     null_curve = _survival_null_curve(train_times, train_events, grid)
     proper = survival_lifted_metrics(test_times, test_events, grid, surv, _repeat_survival_curve(null_curve, len(test_rows)))
-    horizon = float(np.median(train_times))
-    horizon_idx = min(int(np.searchsorted(grid, horizon, side="left")), grid.shape[0] - 1)
-    horizon_surv = surv[:, horizon_idx]
-    y_horizon = ((test_events > 0.5) & (test_times <= horizon)).astype(float)
     return {
         "c_index": _lifelines_concordance(test_times, test_risk, test_events),
         "auc": _lifelines_concordance(test_times, test_risk, test_events),
@@ -1369,10 +1312,6 @@ def survival_metrics(
         "lifted_brier": proper["lifted_brier"],
         "lifted_logloss": proper["lifted_logloss"],
         "nagelkerke_r2": proper["nagelkerke_r2"],
-        "horizon_years": horizon,
-        "horizon_auc": compute_auc(y_horizon, 1.0 - horizon_surv),
-        "horizon_brier": compute_brier(y_horizon, 1.0 - horizon_surv),
-        "event_rate": float(np.mean(test_events)),
     }
 
 
@@ -1402,9 +1341,7 @@ def survival_metrics_from_native_probabilities(
     )
     horizon = float(np.median(train_times))
     horizon_idx = min(int(np.searchsorted(grid, horizon, side="left")), grid.shape[0] - 1)
-    horizon_surv = surv[:, horizon_idx]
-    native_failure = 1.0 - horizon_surv
-    y_horizon = ((test_events > 0.5) & (test_times <= horizon)).astype(float)
+    native_failure = 1.0 - surv[:, horizon_idx]
     return {
         "c_index": _lifelines_concordance(test_times, native_failure, test_events),
         "auc": _lifelines_concordance(test_times, native_failure, test_events),
@@ -1413,10 +1350,6 @@ def survival_metrics_from_native_probabilities(
         "lifted_brier": proper["lifted_brier"],
         "lifted_logloss": proper["lifted_logloss"],
         "nagelkerke_r2": proper["nagelkerke_r2"],
-        "horizon_years": horizon,
-        "horizon_auc": compute_auc(y_horizon, native_failure),
-        "horizon_brier": compute_brier(y_horizon, native_failure),
-        "event_rate": float(np.mean(test_events)),
     }
 
 
