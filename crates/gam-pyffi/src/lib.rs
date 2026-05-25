@@ -14868,6 +14868,287 @@ impl TotalVariationPenalty {
     }
 }
 
+fn validate_parametric_aux_conditional_prior(
+    aux: &Bound<'_, PyAny>,
+    alpha_init: &Bound<'_, PyAny>,
+    beta_init: &Bound<'_, PyAny>,
+    mu_init: &Bound<'_, PyAny>,
+    weight: f64,
+    n_eff: i64,
+) -> PyResult<()> {
+    if weight <= 0.0 {
+        return Err(PyValueError::new_err(format!(
+            "ParametricAuxConditionalPriorPenalty.weight must be > 0, got {weight}"
+        )));
+    }
+    if n_eff <= 0 {
+        return Err(PyValueError::new_err(format!(
+            "ParametricAuxConditionalPriorPenalty.n_eff must be > 0, got {n_eff}"
+        )));
+    }
+
+    let aux_array = aux.extract::<PyReadonlyArrayDyn<'_, f64>>()?;
+    let alpha_array = alpha_init.extract::<PyReadonlyArrayDyn<'_, f64>>()?;
+    let beta_array = beta_init.extract::<PyReadonlyArrayDyn<'_, f64>>()?;
+    let mu_array = mu_init.extract::<PyReadonlyArrayDyn<'_, f64>>()?;
+    let aux_view = aux_array.as_array();
+    let alpha_view = alpha_array.as_array();
+    let beta_view = beta_array.as_array();
+    let mu_view = mu_array.as_array();
+
+    if aux_view.ndim() != 2 {
+        return Err(PyValueError::new_err(format!(
+            "ParametricAuxConditionalPriorPenalty.aux must have shape (N, du), got ndim={}",
+            aux_view.ndim()
+        )));
+    }
+    if alpha_view.ndim() != 1 {
+        return Err(PyValueError::new_err(format!(
+            "ParametricAuxConditionalPriorPenalty.alpha_init must have shape (d,), got ndim={}",
+            alpha_view.ndim()
+        )));
+    }
+    if beta_view.ndim() != 1 {
+        return Err(PyValueError::new_err(format!(
+            "ParametricAuxConditionalPriorPenalty.beta_init must have shape (d,), got ndim={}",
+            beta_view.ndim()
+        )));
+    }
+    if mu_view.ndim() != 2 {
+        return Err(PyValueError::new_err(format!(
+            "ParametricAuxConditionalPriorPenalty.mu_init must have shape (d, du), got ndim={}",
+            mu_view.ndim()
+        )));
+    }
+
+    let aux_shape = aux_view.shape();
+    let alpha_shape = alpha_view.shape();
+    let beta_shape = beta_view.shape();
+    let mu_shape = mu_view.shape();
+    let n_obs = aux_shape[0];
+    let aux_dim = aux_shape[1];
+    let latent_dim = alpha_shape[0];
+    if n_obs as i64 != n_eff {
+        return Err(PyValueError::new_err(format!(
+            "ParametricAuxConditionalPriorPenalty.aux first dimension must equal n_eff={n_eff}, got {n_obs}"
+        )));
+    }
+    if aux_dim == 0 {
+        return Err(PyValueError::new_err(
+            "ParametricAuxConditionalPriorPenalty.aux must have du > 0",
+        ));
+    }
+    if latent_dim == 0 {
+        return Err(PyValueError::new_err(
+            "ParametricAuxConditionalPriorPenalty.alpha_init must be non-empty",
+        ));
+    }
+    if beta_shape[0] != latent_dim {
+        return Err(PyValueError::new_err(format!(
+            "ParametricAuxConditionalPriorPenalty.beta_init shape must match alpha_init shape ({latent_dim},), got ({},)",
+            beta_shape[0]
+        )));
+    }
+    if mu_shape[0] != latent_dim || mu_shape[1] != aux_dim {
+        return Err(PyValueError::new_err(format!(
+            "ParametricAuxConditionalPriorPenalty.mu_init must have shape ({latent_dim}, {aux_dim}), got ({}, {})",
+            mu_shape[0], mu_shape[1]
+        )));
+    }
+    if !aux_view.iter().all(|value| value.is_finite()) {
+        return Err(PyValueError::new_err(
+            "ParametricAuxConditionalPriorPenalty.aux must be finite",
+        ));
+    }
+    if !alpha_view.iter().all(|value| value.is_finite()) {
+        return Err(PyValueError::new_err(
+            "ParametricAuxConditionalPriorPenalty.alpha_init must be finite",
+        ));
+    }
+    if !beta_view.iter().all(|value| value.is_finite()) {
+        return Err(PyValueError::new_err(
+            "ParametricAuxConditionalPriorPenalty.beta_init must be finite",
+        ));
+    }
+    if !mu_view.iter().all(|value| value.is_finite()) {
+        return Err(PyValueError::new_err(
+            "ParametricAuxConditionalPriorPenalty.mu_init must be finite",
+        ));
+    }
+    if !alpha_view.iter().all(|value| *value > 0.0) {
+        return Err(PyValueError::new_err(
+            "ParametricAuxConditionalPriorPenalty.alpha_init must be > 0",
+        ));
+    }
+    if !beta_view.iter().all(|value| *value > 0.0) {
+        return Err(PyValueError::new_err(
+            "ParametricAuxConditionalPriorPenalty.beta_init must be > 0",
+        ));
+    }
+    Ok(())
+}
+
+fn inverse_softplus_scalar(value: f64) -> f64 {
+    if value > 30.0 {
+        value
+    } else {
+        value.exp_m1().ln()
+    }
+}
+
+#[pyclass(module = "gam_pyffi._rust", name = "ParametricAuxConditionalPriorPenalty")]
+struct ParametricAuxConditionalPriorPenalty {
+    #[pyo3(get, set)]
+    target: PyObject,
+    #[pyo3(get, set)]
+    aux: PyObject,
+    #[pyo3(get, set)]
+    alpha_init: PyObject,
+    #[pyo3(get, set)]
+    beta_init: PyObject,
+    #[pyo3(get, set)]
+    mu_init: PyObject,
+    #[pyo3(get, set)]
+    weight: f64,
+    #[pyo3(get, set)]
+    n_eff: i64,
+    #[pyo3(get, set)]
+    learnable: bool,
+    #[pyo3(get, set)]
+    weight_schedule: Option<PyObject>,
+}
+
+#[pymethods]
+impl ParametricAuxConditionalPriorPenalty {
+    #[new]
+    #[pyo3(signature = (aux, alpha_init, beta_init, mu_init, weight, n_eff, learnable = false, *, target = "t"))]
+    fn new(
+        py: Python<'_>,
+        aux: &Bound<'_, PyAny>,
+        alpha_init: &Bound<'_, PyAny>,
+        beta_init: &Bound<'_, PyAny>,
+        mu_init: &Bound<'_, PyAny>,
+        weight: f64,
+        n_eff: i64,
+        learnable: bool,
+        target: PyObject,
+    ) -> PyResult<Self> {
+        let aux = aux_conditional_prior_float_array(py, aux)?;
+        let alpha_init = aux_conditional_prior_float_array(py, alpha_init)?;
+        let beta_init = aux_conditional_prior_float_array(py, beta_init)?;
+        let mu_init = aux_conditional_prior_float_array(py, mu_init)?;
+        validate_parametric_aux_conditional_prior(
+            &aux,
+            &alpha_init,
+            &beta_init,
+            &mu_init,
+            weight,
+            n_eff,
+        )?;
+        Ok(Self {
+            target,
+            aux: aux.unbind(),
+            alpha_init: alpha_init.unbind(),
+            beta_init: beta_init.unbind(),
+            mu_init: mu_init.unbind(),
+            weight,
+            n_eff,
+            learnable,
+            weight_schedule: None,
+        })
+    }
+
+    #[classattr]
+    const KIND_TAG: &'static str = "parametric_aux_conditional_prior";
+
+    fn to_rust_descriptor(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let aux_array = self
+            .aux
+            .bind(py)
+            .extract::<PyReadonlyArrayDyn<'_, f64>>()?;
+        let alpha_array = self
+            .alpha_init
+            .bind(py)
+            .extract::<PyReadonlyArrayDyn<'_, f64>>()?;
+        let beta_array = self
+            .beta_init
+            .bind(py)
+            .extract::<PyReadonlyArrayDyn<'_, f64>>()?;
+        let mu_array = self
+            .mu_init
+            .bind(py)
+            .extract::<PyReadonlyArrayDyn<'_, f64>>()?;
+        let aux_view = aux_array.as_array();
+        let alpha_view = alpha_array.as_array();
+        let beta_view = beta_array.as_array();
+        let mu_view = mu_array.as_array();
+
+        let payload = PyDict::new(py);
+        payload.set_item("kind", Self::KIND_TAG)?;
+        payload.set_item("target", target_descriptor(py, self.target.bind(py))?)?;
+        payload.set_item(
+            "aux",
+            PyList::new(py, aux_view.iter().copied().collect::<Vec<_>>())?,
+        )?;
+        payload.set_item("aux_shape", PyList::new(py, aux_view.shape())?)?;
+        payload.set_item(
+            "log_alpha",
+            PyList::new(
+                py,
+                alpha_view.iter().map(|value| value.ln()).collect::<Vec<_>>(),
+            )?,
+        )?;
+        payload.set_item(
+            "raw_beta",
+            PyList::new(
+                py,
+                beta_view
+                    .iter()
+                    .map(|value| inverse_softplus_scalar(*value))
+                    .collect::<Vec<_>>(),
+            )?,
+        )?;
+        payload.set_item(
+            "mu",
+            PyList::new(py, mu_view.iter().copied().collect::<Vec<_>>())?,
+        )?;
+        payload.set_item("mu_shape", PyList::new(py, mu_view.shape())?)?;
+        payload.set_item("weight", self.weight)?;
+        payload.set_item("n_eff", self.n_eff)?;
+        payload.set_item("learnable", self.learnable)?;
+        if let Some(schedule) = topk_weight_schedule_descriptor(py, &self.weight_schedule)? {
+            payload.set_item("weight_schedule", schedule)?;
+        }
+        Ok(payload.into())
+    }
+
+    fn set_weight_schedule<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        schedule: PyObject,
+    ) -> PyRefMut<'py, Self> {
+        slf.weight_schedule = Some(schedule);
+        slf
+    }
+
+    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        Ok(format!(
+            "ParametricAuxConditionalPriorPenalty(aux={}, alpha_init={}, beta_init={}, mu_init={}, weight={}, n_eff={}, learnable={}, target={}, weight_schedule={})",
+            py_repr(py, self.aux.bind(py))?,
+            py_repr(py, self.alpha_init.bind(py))?,
+            py_repr(py, self.beta_init.bind(py))?,
+            py_repr(py, self.mu_init.bind(py))?,
+            self.weight,
+            self.n_eff,
+            self.learnable,
+            py_repr(py, self.target.bind(py))?,
+            match &self.weight_schedule {
+                Some(schedule) => py_repr(py, schedule.bind(py))?,
+                None => "None".to_string(),
+            }
+        ))
+    }
+}
+
 #[pymodule(name = "_rust", gil_used = false)]
 fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     gam::init_parallelism();
