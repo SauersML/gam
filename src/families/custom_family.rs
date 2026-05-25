@@ -11449,6 +11449,8 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         let mut last_cycle_obj_change_below_tol = false;
 
         let mut joint_trust_radius = 1.0_f64;
+        let mut joint_block_trust_radii = vec![1.0_f64; ranges.len()];
+        let mut last_accepted_hit_joint_trust_boundary = false;
         // Hard upper bound for the for-loop's range. The cap is fixed at
         // `inner_max_cycles` for the lifetime of this outer call (the
         // earlier mid-loop cap extension was removed in favor of the
@@ -11911,10 +11913,19 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // constraints and the adaptive trust radius remain the safeguards
             // against runaway proposals.
             if cycle == 0 {
-                let initial_step_norm =
-                    joint_trust_region_metric_step_norm(&delta, &joint_trust_metric_diag);
-                if initial_step_norm.is_finite() && initial_step_norm > joint_trust_radius {
-                    joint_trust_radius = initial_step_norm;
+                let initial_block_norms =
+                    joint_trust_region_block_metric_norms(&delta, &ranges, &joint_trust_metric_diag);
+                for (radius, norm) in joint_block_trust_radii.iter_mut().zip(initial_block_norms) {
+                    if norm.is_finite() && norm > *radius {
+                        *radius = norm;
+                    }
+                }
+                joint_trust_radius = joint_block_trust_radii
+                    .iter()
+                    .copied()
+                    .fold(0.0_f64, f64::max);
+                if !joint_trust_radius.is_finite() || joint_trust_radius <= 0.0 {
+                    joint_trust_radius = 1.0;
                 }
             }
 
@@ -11998,16 +12009,12 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 line_search_attempts = trust_attempt + 1;
                 accepted_joint_workspace = None;
                 let mut trial_delta = search_delta.clone();
-                truncate_joint_step_to_metric_radius(
+                let mut block_step_norms = truncate_joint_step_to_block_metric_radii(
                     &mut trial_delta,
-                    joint_trust_radius,
+                    &ranges,
                     &joint_trust_metric_diag,
+                    &joint_block_trust_radii,
                 );
-                let trial_step_inf = trial_delta
-                    .iter()
-                    .copied()
-                    .map(f64::abs)
-                    .fold(0.0_f64, f64::max);
                 if apply_block_local_feasibility_limits(
                     family,
                     &states,
@@ -12019,8 +12026,22 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     joint_trust_radius = (0.25 * joint_trust_radius).max(1.0e-12);
                     continue;
                 }
-                let step_norm =
-                    joint_trust_region_metric_step_norm(&trial_delta, &joint_trust_metric_diag);
+                block_step_norms =
+                    joint_trust_region_block_metric_norms(&trial_delta, &ranges, &joint_trust_metric_diag);
+                let step_norm = block_step_norms.iter().copied().fold(0.0_f64, f64::max);
+                let trial_step_inf = trial_delta
+                    .iter()
+                    .copied()
+                    .map(f64::abs)
+                    .fold(0.0_f64, f64::max);
+                let step_hit_trust_boundary = block_step_norms
+                    .iter()
+                    .zip(&joint_block_trust_radii)
+                    .any(|(step_norm, radius)| {
+                        step_norm.is_finite()
+                            && *radius > 0.0
+                            && *step_norm >= 0.99 * *radius
+                    });
                 let mut hpen_delta = Array1::<f64>::zeros(total_p);
                 // Predicted reduction must use the TRUE penalized Hessian
                 // (the one that appears in `f(β) = -ℓ + ½βᵀSβ + ½·joint_mode_diagonal_ridge·‖β‖²`),
@@ -12149,7 +12170,23 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     old_objective,
                 );
                 let old_radius = joint_trust_radius;
-                joint_trust_radius = trust_update.radius;
+                let old_block_radii = joint_block_trust_radii.clone();
+                for (block_radius, block_step_norm) in
+                    joint_block_trust_radii.iter_mut().zip(block_step_norms.iter().copied())
+                {
+                    *block_radius = update_joint_trust_region_radius(
+                        *block_radius,
+                        block_step_norm,
+                        actual_reduction,
+                        predicted_reduction,
+                        old_objective,
+                    )
+                    .radius;
+                }
+                joint_trust_radius = joint_block_trust_radii
+                    .iter()
+                    .copied()
+                    .fold(0.0_f64, f64::max);
                 // Classify the outcome of this attempt so the diagnostic line
                 // says *why* the step was taken or rejected rather than just
                 // dumping numbers. The four phases partition the post-log
@@ -12264,6 +12301,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                             scatter_joint_active_set(joint_active_set, &block_constraints);
                     }
                     last_joint_math = Some(joint_math);
+                    last_accepted_hit_joint_trust_boundary = step_hit_trust_boundary;
                     accepted = true;
                     break;
                 }
