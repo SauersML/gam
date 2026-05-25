@@ -17760,6 +17760,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn ift_rho_upper_bound_masks_residual_correction_direction() {
+        let h = Array2::eye(3);
+        let hop = DenseSpectralOperator::from_symmetric(&h).unwrap();
+        let solution = build_gaussian_solution_at_beta(&[0.0, 0.0], array![0.5, -0.25, 0.1], false);
+
+        let lambdas = [1.0_f64, 1.0_f64];
+        let penalty_a_k_betas = vec![array![0.3, -0.7, 0.0], array![0.0, 0.0, 0.5]];
+        let residual = array![0.2, -0.3, 0.4];
+
+        let corrections = compute_kkt_residual_rho_corrections(
+            &solution,
+            &hop,
+            &lambdas,
+            &penalty_a_k_betas,
+            &residual,
+            true,
+            &[false, true],
+        )
+        .expect("kkt correction must succeed with a masked upper-bound coordinate");
+
+        assert_eq!(
+            corrections.gradient[1], 0.0,
+            "upper-bound rho direction must not receive IFT residual gradient correction"
+        );
+        let hessian = corrections.hessian.expect("hessian requested");
+        for idx in 0..2 {
+            assert_eq!(
+                hessian[[1, idx]], 0.0,
+                "upper-bound rho row must be zeroed in IFT residual Hessian correction"
+            );
+            assert_eq!(
+                hessian[[idx, 1]], 0.0,
+                "upper-bound rho column must be zeroed in IFT residual Hessian correction"
+            );
+        }
+    }
+
     /// BUG-2 regression: cert exit with r_proj = 0 must not pass an inflated
     /// `|g|∞ = 1e20` gradient through the envelope tripwire. Contract under
     /// test: either suppress (gradient=None) or produce a numerically honest
