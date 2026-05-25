@@ -18497,9 +18497,15 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(numeric_matrix_validate, module)?)?;
     module.add_function(wrap_pyfunction!(numeric_matrix_f64, module)?)?;
     module.add_function(wrap_pyfunction!(marginal_slope_clip_probabilities, module)?)?;
-    module.add_function(wrap_pyfunction!(transformation_normal_z_from_columns, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        transformation_normal_z_from_columns,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(column_stack_f64, module)?)?;
-    module.add_function(wrap_pyfunction!(survival_prediction_payload_from_json, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        survival_prediction_payload_from_json,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(flat_to_matrix_f64, module)?)?;
     module.add_function(wrap_pyfunction!(vec_to_array1_f64, module)?)?;
     module.add_function(wrap_pyfunction!(extract_row_ids, module)?)?;
@@ -18510,11 +18516,17 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(load_model, module)?)?;
     module.add_function(wrap_pyfunction!(bayes_factor_log_diff, module)?)?;
     module.add_function(wrap_pyfunction!(saved_model_payload_string, module)?)?;
-    module.add_function(wrap_pyfunction!(required_saved_model_payload_string, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        required_saved_model_payload_string,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(build_extend_group_payload_json, module)?)?;
     module.add_function(wrap_pyfunction!(extend_model_with_group, module)?)?;
     module.add_function(wrap_pyfunction!(validate_formula_json, module)?)?;
-    module.add_function(wrap_pyfunction!(formula_validation_supported_by_python_json, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        formula_validation_supported_by_python_json,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(formula_validation_repr_json, module)?)?;
     module.add_function(wrap_pyfunction!(formula_validation_html_json, module)?)?;
     module.add_function(wrap_pyfunction!(build_predict_payload_json, module)?)?;
@@ -18522,14 +18534,23 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(predict_table, module)?)?;
     module.add_function(wrap_pyfunction!(predict_array, module)?)?;
     module.add_function(wrap_pyfunction!(competing_risks_cif, module)?)?;
-    module.add_function(wrap_pyfunction!(competing_risks_prediction_payload_from_json, module)?)?;
-    module.add_function(wrap_pyfunction!(competing_risks_cif_from_predictions, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        competing_risks_prediction_payload_from_json,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        competing_risks_cif_from_predictions,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(build_sample_payload_json, module)?)?;
     module.add_function(wrap_pyfunction!(sample_table, module)?)?;
     module.add_function(wrap_pyfunction!(design_matrix_table, module)?)?;
     module.add_function(wrap_pyfunction!(design_matrix_table_dense, module)?)?;
     module.add_function(wrap_pyfunction!(design_matrix_array, module)?)?;
-    module.add_function(wrap_pyfunction!(build_difference_smooth_request_json, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        build_difference_smooth_request_json,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(bspline_basis, module)?)?;
     module.add_function(wrap_pyfunction!(bspline_basis_derivative, module)?)?;
     module.add_function(wrap_pyfunction!(basis_with_jet, module)?)?;
@@ -18564,14 +18585,32 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(gaussian_reml_fit_formula_table, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_fit_blocks_forward, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_fit_blocks_backward, module)?)?;
-    module.add_function(wrap_pyfunction!(gaussian_reml_fit_with_constraints_forward, module)?)?;
-    module.add_function(wrap_pyfunction!(gaussian_reml_fit_with_constraints_backward, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        gaussian_reml_fit_with_constraints_forward,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        gaussian_reml_fit_with_constraints_backward,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_fit_batched, module)?)?;
-    module.add_function(wrap_pyfunction!(gaussian_reml_fit_batched_backward, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        gaussian_reml_fit_batched_backward,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_fit_positions, module)?)?;
-    module.add_function(wrap_pyfunction!(gaussian_reml_fit_positions_backward, module)?)?;
-    module.add_function(wrap_pyfunction!(gaussian_reml_fit_positions_batched, module)?)?;
-    module.add_function(wrap_pyfunction!(gaussian_reml_fit_positions_batched_backward, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        gaussian_reml_fit_positions_backward,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        gaussian_reml_fit_positions_batched,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        gaussian_reml_fit_positions_batched_backward,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_fit_latent, module)?)?;
     module.add_function(wrap_pyfunction!(register_analytic_penalties, module)?)?;
     module.add_function(wrap_pyfunction!(analytic_penalty_value_grad, module)?)?;
@@ -18582,15 +18621,24 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(response_geometry_clr, module)?)?;
     module.add_function(wrap_pyfunction!(response_geometry_alr, module)?)?;
     module.add_function(wrap_pyfunction!(response_geometry_inverse_alr, module)?)?;
-    module.add_function(wrap_pyfunction!(response_geometry_simplex_frechet_mean, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        response_geometry_simplex_frechet_mean,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(response_geometry_simplex_log_map, module)?)?;
     module.add_function(wrap_pyfunction!(response_geometry_simplex_exp_map, module)?)?;
     module.add_function(wrap_pyfunction!(response_geometry_sphere_log_map, module)?)?;
     module.add_function(wrap_pyfunction!(response_geometry_sphere_exp_map, module)?)?;
-    module.add_function(wrap_pyfunction!(response_geometry_sphere_normalize_base, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        response_geometry_sphere_normalize_base,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(numerics_sigmoid_stable, module)?)?;
     module.add_function(wrap_pyfunction!(numerics_inverse_softplus, module)?)?;
-    module.add_function(wrap_pyfunction!(response_geometry_normalize_fisher_rao, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        response_geometry_normalize_fisher_rao,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(equivariant_rho, module)?)?;
     module.add_function(wrap_pyfunction!(equivariant_aux_enabled, module)?)?;
     module.add_function(wrap_pyfunction!(equivariant_rho_so2, module)?)?;
@@ -18628,7 +18676,10 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(term_blocks_for_model, module)?)?;
     module.add_function(wrap_pyfunction!(difference_smooth_json, module)?)?;
     module.add_function(wrap_pyfunction!(difference_smooth_rows, module)?)?;
-    module.add_function(wrap_pyfunction!(cross_fit_shared_precision_groups_json, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        cross_fit_shared_precision_groups_json,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(check_json, module)?)?;
     module.add_function(wrap_pyfunction!(check_payload_from_model, module)?)?;
     module.add_function(wrap_pyfunction!(report_html, module)?)?;
@@ -18644,12 +18695,24 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(survival_score_grid_from_times, module)?)?;
     module.add_function(wrap_pyfunction!(repeat_survival_curve, module)?)?;
     module.add_function(wrap_pyfunction!(survival_null_curve_from_train, module)?)?;
-    module.add_function(wrap_pyfunction!(survival_matrix_from_risk_calibration, module)?)?;
-    module.add_function(wrap_pyfunction!(survival_lifted_metrics_from_predictions, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        survival_matrix_from_risk_calibration,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        survival_lifted_metrics_from_predictions,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(synthetic_binomial_columns, module)?)?;
     module.add_function(wrap_pyfunction!(synthetic_geo_disease_columns, module)?)?;
-    module.add_function(wrap_pyfunction!(synthetic_continuous_order_columns, module)?)?;
-    module.add_function(wrap_pyfunction!(synthetic_thread3_admixture_cliff_columns, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        synthetic_continuous_order_columns,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        synthetic_thread3_admixture_cliff_columns,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(synthetic_geo_disease_eas_columns, module)?)?;
     module.add_function(wrap_pyfunction!(synthetic_papuan_oce_columns, module)?)?;
     module.add_function(wrap_pyfunction!(synthetic_hgdp_pc_panel_columns, module)?)?;
@@ -18657,13 +18720,31 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(synthetic_geo_latlon_response, module)?)?;
     module.add_function(wrap_pyfunction!(thread3_cliff_gradient_magnitude, module)?)?;
     // LatentCoord input-location derivative helpers (one per basis kind).
-    module.add_function(wrap_pyfunction!(duchon_input_location_first_derivative, module)?)?;
-    module.add_function(wrap_pyfunction!(duchon_polynomial_input_location_first_derivative, module)?)?;
-    module.add_function(wrap_pyfunction!(matern_input_location_first_derivative, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        duchon_input_location_first_derivative,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        duchon_polynomial_input_location_first_derivative,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        matern_input_location_first_derivative,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(matern_basis_gradient_streaming, module)?)?;
-    module.add_function(wrap_pyfunction!(sphere_input_location_first_derivative, module)?)?;
-    module.add_function(wrap_pyfunction!(periodic_bspline_input_location_first_derivative, module)?)?;
-    module.add_function(wrap_pyfunction!(bspline_tensor_input_location_first_derivative, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        sphere_input_location_first_derivative,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        periodic_bspline_input_location_first_derivative,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        bspline_tensor_input_location_first_derivative,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(mechanism_sparsity_jacobian, module)?)?;
     module.add_function(wrap_pyfunction!(conditional_prior_ivae, module)?)?;
     module.add_class::<IsometryPenalty>()?;
