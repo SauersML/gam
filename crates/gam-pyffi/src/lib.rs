@@ -584,6 +584,7 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
             "default_survival_time_grid",
             "competing_risks_cif",
             "competing_risks_cif_from_predictions",
+            "survival_prediction_payload_from_json",
             "competing_risks_prediction_payload_from_json",
             "sample",
             "summary",
@@ -15384,6 +15385,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<AuxConditionalPriorPenalty>()?;
     module.add_class::<BlockSparsityPenalty>()?;
     module.add_class::<BlockOrthogonalityPenalty>()?;
+    module.add_class::<PyIBPAssignmentPenalty>()?;
     module.add_class::<TotalVariationPenalty>()?;
     Ok(())
 }
