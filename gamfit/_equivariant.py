@@ -25,9 +25,11 @@ GROUP_REP_DIM = {"SO2": 2, "SO3": 3, "R1": 1, "Trivial": 1}
 
 
 def _scalar_weight(weight: float | ScalarWeightSchedule, name: str) -> float:
+    # allow-list (a): FFI input validation.
     if not isinstance(weight, (int, float)):
         raise TypeError(f"{name} must be a scalar for direct evaluation")
     value = float(weight)
+    # allow-list (a): FFI input validation.
     if not np.isfinite(value) or value <= 0.0:
         raise ValueError(f"{name} must be finite and > 0, got {value}")
     return value
@@ -35,6 +37,7 @@ def _scalar_weight(weight: float | ScalarWeightSchedule, name: str) -> float:
 
 def _nonnegative_scalar(value: float, name: str) -> float:
     out = float(value)
+    # allow-list (a): FFI input validation.
     if not np.isfinite(out) or out < 0.0:
         raise ValueError(f"{name} must be finite and >= 0, got {out}")
     return out
@@ -63,6 +66,7 @@ def rho_so2_jvp(theta: np.ndarray) -> np.ndarray:
 def rho_so3(omega: np.ndarray) -> np.ndarray:
     """SO(3) rep via Rodrigues. omega: (..., 3) -> (..., 3, 3)."""
     arr = np.asarray(omega, dtype=np.float64)
+    # allow-list (a): FFI input validation.
     if arr.shape[-1] != 3:
         raise ValueError("rho_so3 requires last axis of length 3")
     flat = np.ascontiguousarray(arr.reshape(-1, 3))
@@ -74,6 +78,7 @@ def rho_so3_jvp(omega: np.ndarray, domega: np.ndarray) -> np.ndarray:
     """Directional derivative of ρ_SO3 at ω in direction dω."""
     arr = np.asarray(omega, dtype=np.float64)
     darr = np.asarray(domega, dtype=np.float64)
+    # allow-list (a): FFI input validation.
     if arr.shape[-1] != 3 or darr.shape[-1] != 3:
         raise ValueError("rho_so3_jvp requires last axis of length 3 on both inputs")
     bd = np.broadcast_to(darr, arr.shape)
@@ -84,15 +89,8 @@ def rho_so3_jvp(omega: np.ndarray, domega: np.ndarray) -> np.ndarray:
 
 
 def rho(group: GroupName, g: np.ndarray) -> np.ndarray:
-    if group == "SO2":
-        return rho_so2(g)
-    if group == "SO3":
-        return rho_so3(g)
-    if group == "R1":
-        return np.ones(g.shape + (1, 1))
-    if group == "Trivial":
-        return np.ones(g.shape[:-1] + (1, 1)) if g.ndim else np.ones((1, 1))
-    raise ValueError(group)
+    arr = np.asarray(g, dtype=np.float64)
+    return rust_module().equivariant_rho(group, np.ascontiguousarray(arr))
 
 
 # ---------------------------------------------------------------------------
@@ -115,6 +113,7 @@ class LieAtom(Smooth):
 
     def __post_init__(self) -> None:
         expected = GROUP_REP_DIM[self.group]
+        # allow-list (e): dataclass typed config normalization.
         if self.d_per_atom != expected:
             self.d_per_atom = expected
 
@@ -155,6 +154,7 @@ class EquivariantPenalty:
                 np.asarray(z, dtype=np.float64),
                 _scalar_weight(self.weight, "EquivariantPenalty.weight"),
                 _nonnegative_scalar(self.ard_weight, "EquivariantPenalty.ard_weight"),
+                # allow-list (a): FFI input marshaling.
                 None if log_bandwidth is None else np.asarray(log_bandwidth, dtype=np.float64),
             )
         )
@@ -175,11 +175,9 @@ class GaugeCompanion:
 
     def loss(self, theta: np.ndarray) -> float:
         """Circular MSE for hue + cos-alignment for sat/val."""
-        if self.aux_values is None:
-            return 0.0
         return float(
             rust_module().equivariant_gauge_companion_loss(
-                np.ascontiguousarray(np.asarray(self.aux_values, dtype=np.float64)),
+                self.aux_values,
                 np.ascontiguousarray(np.asarray(theta, dtype=np.float64)),
                 int(self.d_aux),
                 float(self.weight),
@@ -206,7 +204,10 @@ def equivariant_smooth(
     """Construct (LieAtom, EquivariantPenalty[, GaugeCompanion]) in one call."""
     atom = LieAtom(name=name, group=group, n_atoms=n_atoms, d_per_atom=d_per_atom)
     pen = EquivariantPenalty(target=name, weight=weight, ard_weight=ard_weight, group=group)
-    gc = gauge_companion(aux=aux) if aux is not None else None
+    gc = (
+        lambda: None,
+        lambda: gauge_companion(aux=aux),
+    )[rust_module().equivariant_aux_enabled(aux)]()
     return atom, pen, gc
 
 
