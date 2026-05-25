@@ -1,4 +1,6 @@
-use gam::terms::basis::{evaluate_bspline_basis_scalar, evaluate_bspline_derivative_scalar, SplineScratch};
+use gam::terms::basis::{
+    SplineScratch, evaluate_bspline_basis_scalar, evaluate_bspline_derivative_scalar,
+};
 use ndarray::array;
 
 #[test]
@@ -11,8 +13,14 @@ fn bug_first_derivative_matches_analytic_difference_identity_including_multiplic
     for &x in &xs {
         let mut b_km1 = vec![0.0; knots.len() - (degree - 1) - 1];
         let mut db = vec![0.0; n];
-        evaluate_bspline_basis_scalar(x, knots.view(), degree - 1, &mut b_km1, &mut SplineScratch::new(degree - 1))
-            .expect("B_{k-1}");
+        evaluate_bspline_basis_scalar(
+            x,
+            knots.view(),
+            degree - 1,
+            &mut b_km1,
+            &mut SplineScratch::new(degree - 1),
+        )
+        .expect("B_{k-1}");
         evaluate_bspline_derivative_scalar(x, knots.view(), degree, &mut db).expect("dB");
 
         for i in 0..n {

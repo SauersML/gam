@@ -10,15 +10,27 @@ fn cyclic_bspline_first_derivative_periodicity_breaks() {
     let period = end - start;
     let h = period / num_basis as f64;
     let total_knots = num_basis + 2 * degree + 1;
-    let knots = ndarray::Array1::from_iter((0..total_knots).map(|i| start + (i as f64 - degree as f64) * h));
+    let knots = ndarray::Array1::from_iter(
+        (0..total_knots).map(|i| start + (i as f64 - degree as f64) * h),
+    );
 
     let x = array![0.123456789, 0.876543211];
     let x_shifted = x.mapv(|v| v + period);
 
-    let (b0, _) = create_basis::<Dense>(x.view(), KnotSource::Provided(knots.view()), degree, BasisOptions::first_derivative())
-        .expect("basis should build at x");
-    let (b1, _) = create_basis::<Dense>(x_shifted.view(), KnotSource::Provided(knots.view()), degree, BasisOptions::first_derivative())
-        .expect("basis should build at x+period");
+    let (b0, _) = create_basis::<Dense>(
+        x.view(),
+        KnotSource::Provided(knots.view()),
+        degree,
+        BasisOptions::first_derivative(),
+    )
+    .expect("basis should build at x");
+    let (b1, _) = create_basis::<Dense>(
+        x_shifted.view(),
+        KnotSource::Provided(knots.view()),
+        degree,
+        BasisOptions::first_derivative(),
+    )
+    .expect("basis should build at x+period");
 
     for i in 0..b0.nrows() {
         for j in 0..num_basis {
