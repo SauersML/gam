@@ -617,15 +617,33 @@ impl CandidateEvaluation {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PirlsAcceptedStateCacheKey {
     curvature: HessianCurvatureKind,
-    firth_bias_reduction: bool,
+    firth_active: bool,
     beta_bits: Vec<u64>,
     arrow_latent_bits: Option<Vec<u64>>,
 }
 
 impl PirlsAcceptedStateCacheKey {
+    fn requested(
+        beta: &Coefficients,
+        curvature: HessianCurvatureKind,
+        options: &WorkingModelPirlsOptions,
+    ) -> Self {
+        Self::new(beta, curvature, options.firth_bias_reduction, options)
+    }
+
+    fn accepted(beta: &Coefficients, state: &WorkingState, options: &WorkingModelPirlsOptions) -> Self {
+        Self::new(
+            beta,
+            state.hessian_curvature,
+            matches!(state.firth, FirthDiagnostics::Active { .. }),
+            options,
+        )
+    }
+
     fn new(
         beta: &Coefficients,
         curvature: HessianCurvatureKind,
+        firth_active: bool,
         options: &WorkingModelPirlsOptions,
     ) -> Self {
         let arrow_latent_bits = options.arrow_schur.as_ref().map(|arrow_cfg| {
@@ -638,7 +656,7 @@ impl PirlsAcceptedStateCacheKey {
         });
         Self {
             curvature,
-            firth_bias_reduction: options.firth_bias_reduction,
+            firth_active,
             beta_bits: beta.as_ref().iter().map(|value| value.to_bits()).collect(),
             arrow_latent_bits,
         }

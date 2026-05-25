@@ -1117,6 +1117,46 @@ pub fn survival_fit_from_parts(
         lambdas_log_sigma.iter().copied(),
     )
     .map_err(|e| e.to_string())?;
+    // Each block's smoothing-parameter count counts the number of distinct
+    // penalty terms acting on that block's coefficients. A penalty term cannot
+    // outnumber the coefficients it penalizes, so reject `lambdas_<block>`
+    // vectors longer than the corresponding `beta_<block>`. This catches stale
+    // / misaligned lambda slices that would otherwise propagate silently into
+    // downstream inference where the per-block penalty bookkeeping is
+    // unrecoverable.
+    if lambdas_time.len() > beta_time.len() {
+        return Err(SurvivalLocationScaleError::DimensionMismatch {
+            reason: format!(
+                "survival_fit.lambdas_time has {} entries but beta_time has only {} \
+                 coefficients; each lambda corresponds to a penalty term on this block",
+                lambdas_time.len(),
+                beta_time.len()
+            ),
+        }
+        .into());
+    }
+    if lambdas_threshold.len() > beta_threshold.len() {
+        return Err(SurvivalLocationScaleError::DimensionMismatch {
+            reason: format!(
+                "survival_fit.lambdas_threshold has {} entries but beta_threshold has only {} \
+                 coefficients; each lambda corresponds to a penalty term on this block",
+                lambdas_threshold.len(),
+                beta_threshold.len()
+            ),
+        }
+        .into());
+    }
+    if lambdas_log_sigma.len() > beta_log_sigma.len() {
+        return Err(SurvivalLocationScaleError::DimensionMismatch {
+            reason: format!(
+                "survival_fit.lambdas_log_sigma has {} entries but beta_log_sigma has only {} \
+                 coefficients; each lambda corresponds to a penalty term on this block",
+                lambdas_log_sigma.len(),
+                beta_log_sigma.len()
+            ),
+        }
+        .into());
+    }
     if let Some(lambdas_wiggle) = lambdas_linkwiggle.as_ref() {
         if beta_link_wiggle.is_none() {
             return Err(SurvivalLocationScaleError::InvalidConfiguration {
@@ -1129,6 +1169,18 @@ pub fn survival_fit_from_parts(
             lambdas_wiggle.iter().copied(),
         )
         .map_err(|e| e.to_string())?;
+        let wiggle_len = beta_link_wiggle.as_ref().map_or(0, |beta| beta.len());
+        if lambdas_wiggle.len() > wiggle_len {
+            return Err(SurvivalLocationScaleError::DimensionMismatch {
+                reason: format!(
+                    "survival_fit.lambdas_linkwiggle has {} entries but beta_link_wiggle has \
+                     only {} coefficients; each lambda corresponds to a penalty term on this block",
+                    lambdas_wiggle.len(),
+                    wiggle_len
+                ),
+            }
+            .into());
+        }
     }
     ensure_finite_scalar_estimation("survival_fit.log_likelihood", log_likelihood)
         .map_err(|e| e.to_string())?;
