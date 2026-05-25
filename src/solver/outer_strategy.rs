@@ -2016,6 +2016,7 @@ pub struct ClosureObjective<
     Fefs = fn(&mut S, &Array1<f64>) -> Result<EfsEval, EstimationError>,
     Feo = fn(&mut S, &Array1<f64>, OuterEvalOrder) -> Result<OuterEval, EstimationError>,
     Fsp = fn(&mut S, &Array1<f64>) -> Result<f64, EstimationError>,
+    Fseed = fn(&mut S, &Array1<f64>) -> Result<(), EstimationError>,
 > {
     pub(crate) state: S,
     pub(crate) cap: OuterCapability,
@@ -2033,10 +2034,13 @@ pub struct ClosureObjective<
     /// `eval_screening_proxy()` falls back to `eval_cost()` (the trait
     /// default), preserving legacy behavior for non-REML objectives.
     pub(crate) screening_proxy_fn: Option<Fsp>,
+    /// Optional inner-state seeding closure. Objectives with PIRLS / Newton
+    /// inner state install cached β here before the first outer eval.
+    pub(crate) seed_fn: Option<Fseed>,
 }
 
-impl<S, Fc, Fe, Fr, Fefs, Feo, Fsp> OuterObjective
-    for ClosureObjective<S, Fc, Fe, Fr, Fefs, Feo, Fsp>
+impl<S, Fc, Fe, Fr, Fefs, Feo, Fsp, Fseed> OuterObjective
+    for ClosureObjective<S, Fc, Fe, Fr, Fefs, Feo, Fsp, Fseed>
 where
     Fc: FnMut(&mut S, &Array1<f64>) -> Result<f64, EstimationError>,
     Fe: FnMut(&mut S, &Array1<f64>) -> Result<OuterEval, EstimationError>,
@@ -2044,6 +2048,7 @@ where
     Fefs: FnMut(&mut S, &Array1<f64>) -> Result<EfsEval, EstimationError>,
     Feo: FnMut(&mut S, &Array1<f64>, OuterEvalOrder) -> Result<OuterEval, EstimationError>,
     Fsp: FnMut(&mut S, &Array1<f64>) -> Result<f64, EstimationError>,
+    Fseed: FnMut(&mut S, &Array1<f64>) -> Result<(), EstimationError>,
 {
     fn capability(&self) -> OuterCapability {
         self.cap.clone()
@@ -2091,18 +2096,50 @@ where
 
     fn seed_inner_state(&mut self, beta: &Array1<f64>) -> Result<(), EstimationError> {
         if beta.is_empty() {
-            Ok(())
-        } else {
-            Err(EstimationError::InvalidInput(format!(
-                "cached inner beta has length {}, but this objective does not expose an inner-state seeding hook",
-                beta.len()
-            )))
+            return Ok(());
         }
+        if let Some(f) = self.seed_fn.as_mut() {
+            return f(&mut self.state, beta);
+        }
+        Err(EstimationError::InvalidInput(format!(
+            "cached inner beta has length {}, but this objective does not expose an inner-state seeding hook",
+            beta.len()
+        )))
     }
 
     fn reset(&mut self) {
         if let Some(f) = self.reset_fn.as_mut() {
             f(&mut self.state);
+        }
+    }
+}
+
+impl<S, Fc, Fe, Fr, Fefs, Feo, Fsp> ClosureObjective<S, Fc, Fe, Fr, Fefs, Feo, Fsp>
+where
+    Fc: FnMut(&mut S, &Array1<f64>) -> Result<f64, EstimationError>,
+    Fe: FnMut(&mut S, &Array1<f64>) -> Result<OuterEval, EstimationError>,
+    Fr: FnMut(&mut S),
+    Fefs: FnMut(&mut S, &Array1<f64>) -> Result<EfsEval, EstimationError>,
+    Feo: FnMut(&mut S, &Array1<f64>, OuterEvalOrder) -> Result<OuterEval, EstimationError>,
+    Fsp: FnMut(&mut S, &Array1<f64>) -> Result<f64, EstimationError>,
+{
+    pub fn with_seed_inner_state<Fseed>(
+        self,
+        seed_fn: Fseed,
+    ) -> ClosureObjective<S, Fc, Fe, Fr, Fefs, Feo, Fsp, Fseed>
+    where
+        Fseed: FnMut(&mut S, &Array1<f64>) -> Result<(), EstimationError>,
+    {
+        ClosureObjective {
+            state: self.state,
+            cap: self.cap,
+            cost_fn: self.cost_fn,
+            eval_fn: self.eval_fn,
+            eval_order_fn: self.eval_order_fn,
+            reset_fn: self.reset_fn,
+            efs_fn: self.efs_fn,
+            screening_proxy_fn: self.screening_proxy_fn,
+            seed_fn: Some(seed_fn),
         }
     }
 }
@@ -4422,6 +4459,7 @@ impl OuterProblem {
             reset_fn,
             efs_fn,
             screening_proxy_fn: None::<fn(&mut S, &Array1<f64>) -> Result<f64, EstimationError>>,
+            seed_fn: None::<fn(&mut S, &Array1<f64>) -> Result<(), EstimationError>>,
         }
     }
 
@@ -4456,6 +4494,7 @@ impl OuterProblem {
             reset_fn,
             efs_fn,
             screening_proxy_fn: None::<fn(&mut S, &Array1<f64>) -> Result<f64, EstimationError>>,
+            seed_fn: None::<fn(&mut S, &Array1<f64>) -> Result<(), EstimationError>>,
         }
     }
 
@@ -4492,6 +4531,7 @@ impl OuterProblem {
             reset_fn,
             efs_fn,
             screening_proxy_fn: Some(screening_proxy_fn),
+            seed_fn: None::<fn(&mut S, &Array1<f64>) -> Result<(), EstimationError>>,
         }
     }
 
@@ -6559,9 +6599,56 @@ mod tests {
             }),
             efs_fn: None::<fn(&mut i32, &Array1<f64>) -> Result<EfsEval, EstimationError>>,
             screening_proxy_fn: None::<fn(&mut i32, &Array1<f64>) -> Result<f64, EstimationError>>,
+            seed_fn: None::<fn(&mut i32, &Array1<f64>) -> Result<(), EstimationError>>,
         };
         assert_eq!(obj.capability().n_params, 1);
         assert_eq!(obj.eval_cost(&Array1::zeros(1)).unwrap(), 1.0);
+    }
+
+    #[test]
+    fn closure_objective_seed_inner_state_delegates_when_hook_present() {
+        let mut obj = ClosureObjective {
+            state: Vec::<f64>::new(),
+            cap: OuterCapability {
+                gradient: Derivative::Analytic,
+                hessian: DeclaredHessianForm::Unavailable,
+                n_params: 1,
+                psi_dim: 0,
+                fixed_point_available: false,
+                barrier_config: None,
+                prefer_gradient_only: false,
+                disable_fixed_point: false,
+            },
+            cost_fn: |_: &mut Vec<f64>, _: &Array1<f64>| Ok(0.0),
+            eval_fn: |_: &mut Vec<f64>, _: &Array1<f64>| {
+                Ok(OuterEval {
+                    cost: 0.0,
+                    gradient: Array1::zeros(1),
+                    hessian: HessianResult::Unavailable,
+                    inner_beta_hint: None,
+                })
+            },
+            eval_order_fn: None::<
+                fn(
+                    &mut Vec<f64>,
+                    &Array1<f64>,
+                    OuterEvalOrder,
+                ) -> Result<OuterEval, EstimationError>,
+            >,
+            reset_fn: None::<fn(&mut Vec<f64>)>,
+            efs_fn: None::<fn(&mut Vec<f64>, &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+            screening_proxy_fn: None::<
+                fn(&mut Vec<f64>, &Array1<f64>) -> Result<f64, EstimationError>,
+            >,
+            seed_fn: None::<fn(&mut Vec<f64>, &Array1<f64>) -> Result<(), EstimationError>>,
+        }
+        .with_seed_inner_state(|state: &mut Vec<f64>, beta: &Array1<f64>| {
+            state.extend(beta.iter().copied());
+            Ok(())
+        });
+
+        obj.seed_inner_state(&array![1.5, -2.0]).unwrap();
+        assert_eq!(obj.state, vec![1.5, -2.0]);
     }
 
     #[test]
@@ -6615,6 +6702,7 @@ mod tests {
                 })
             }),
             screening_proxy_fn: None::<fn(&mut (), &Array1<f64>) -> Result<f64, EstimationError>>,
+            seed_fn: None::<fn(&mut (), &Array1<f64>) -> Result<(), EstimationError>>,
         };
         let mut bridge = OuterFixedPointBridge {
             obj: &mut obj,
