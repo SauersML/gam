@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Build a 1D ordering of subpopulation centroids in 16-PC space and plot:
+Plot an ordered view of subpopulation centroids in 16-PC space:
 1) PC1/PC2 centroid map color-coded by assigned prevalence
 2) Full ordered list table on the same figure
 """
@@ -12,75 +12,11 @@ from pathlib import Path
 
 from matplotlib.axes import Axes
 import matplotlib.pyplot as plt
-import numpy as np
 import pandas as pd
 
 
-def pairwise_dist(x: np.ndarray) -> np.ndarray:
-    # Squared-distance expansion with clipping for numerical noise.
-    s = np.sum(x * x, axis=1, keepdims=True)
-    d2 = s + s.T - 2.0 * (x @ x.T)
-    np.maximum(d2, 0.0, out=d2)
-    return np.asarray(np.sqrt(d2), dtype=float)
-
-
-def path_length(path: np.ndarray, d: np.ndarray) -> float:
-    if len(path) <= 1:
-        return 0.0
-    return float(np.sum(d[path[:-1], path[1:]]))
-
-
-def nearest_neighbor_path(d: np.ndarray, start: int) -> np.ndarray:
-    n = d.shape[0]
-    unused = set(range(n))
-    unused.remove(start)
-    path = [start]
-    while unused:
-        cur = path[-1]
-        nxt = min(unused, key=lambda j: d[cur, j])
-        path.append(nxt)
-        unused.remove(nxt)
-    return np.array(path, dtype=int)
-
-
-def two_opt_open(path: np.ndarray, d: np.ndarray, max_passes: int = 20) -> np.ndarray:
-    n = len(path)
-    if n < 4:
-        return np.asarray(path.copy(), dtype=int)
-    p = path.copy()
-    for _ in range(max_passes):
-        improved = False
-        for i in range(n - 3):
-            a, b = p[i], p[i + 1]
-            for j in range(i + 2, n - 1):
-                c, e = p[j], p[j + 1]
-                before = d[a, b] + d[c, e]
-                after = d[a, c] + d[b, e]
-                if after + 1e-12 < before:
-                    p[i + 1 : j + 1] = p[i + 1 : j + 1][::-1]
-                    improved = True
-        if not improved:
-            break
-    return np.asarray(p, dtype=int)
-
-
-def best_order(d: np.ndarray) -> np.ndarray:
-    n = d.shape[0]
-    best = None
-    best_len = np.inf
-    for s in range(n):
-        p0 = nearest_neighbor_path(d, s)
-        p1 = two_opt_open(p0, d)
-        path_len = path_length(p1, d)
-        if path_len < best_len:
-            best_len = path_len
-            best = p1
-    assert best is not None
-    return best
-
-
 def draw_table_text(
-    ax: Axes, ordered_names: list[str], prevalence: np.ndarray, n_cols: int = 3
+    ax: Axes, ordered_names: list[str], prevalence: list[float], n_cols: int = 3
 ) -> None:
     lines = [
         f"{i+1:>3}. {name:<30} prev={prevalence[i]:.3f}"
@@ -98,7 +34,11 @@ def draw_table_text(
 
     ax.axis("off")
     ax.set_title("Full 1D Subpopulation Order", loc="left", fontsize=11, pad=6)
-    x_positions = np.linspace(0.0, 0.68, len(col_blocks))
+    if len(col_blocks) <= 1:
+        x_positions = [0.0]
+    else:
+        step = 0.68 / (len(col_blocks) - 1)
+        x_positions = [step * i for i in range(len(col_blocks))]
     for x, block in zip(x_positions, col_blocks):
         ax.text(
             x,
@@ -154,14 +94,32 @@ def main() -> None:
         .dropna()
         .reset_index()
     )
-    x = centroids[pc_cols].to_numpy(dtype=float)
-    d = pairwise_dist(x)
-    order_idx = best_order(d)
+    if "order" in df.columns:
+        input_order = (
+            df[["Subpopulation", "order"]]
+            .dropna()
+            .drop_duplicates(subset=["Subpopulation"], keep="first")
+        )
+        centroids = centroids.merge(input_order, on="Subpopulation", how="left")
+        if centroids["order"].isna().any():
+            missing_order = centroids.loc[
+                centroids["order"].isna(), "Subpopulation"
+            ].astype(str)
+            raise RuntimeError(
+                "Missing order for subpopulation(s): "
+                + ", ".join(sorted(missing_order.tolist()))
+            )
+        centroids = centroids.sort_values(["order", "Subpopulation"], kind="stable")
+    else:
+        centroids = centroids.sort_values("Subpopulation", kind="stable")
 
-    ordered = centroids.iloc[order_idx].reset_index(drop=True)
+    ordered = centroids.drop(columns=["order"], errors="ignore").reset_index(drop=True)
     n = len(ordered)
-    prevalence = np.linspace(0.02, 0.40, n)  # synthetic monotone low->high risk
-    ordered["order"] = np.arange(1, n + 1)
+    prevalence = [
+        0.02 if n <= 1 else 0.02 + (0.40 - 0.02) * i / (n - 1)
+        for i in range(n)
+    ]
+    ordered["order"] = list(range(1, n + 1))
     ordered["assigned_prevalence"] = prevalence
     ordered.to_csv(out_csv, index=False)
 
@@ -170,8 +128,8 @@ def main() -> None:
     ax = fig.add_subplot(gs[0, 0])
     ax_tbl = fig.add_subplot(gs[0, 1])
 
-    p1 = ordered["PC1"].to_numpy()
-    p2 = ordered["PC2"].to_numpy()
+    p1 = ordered["PC1"].tolist()
+    p2 = ordered["PC2"].tolist()
     sc = ax.scatter(
         p1,
         p2,
@@ -198,7 +156,7 @@ def main() -> None:
     cbar.set_label("Assigned disease prevalence", fontsize=10)
 
     ax.set_title(
-        "Subpopulation Centroids in 16-PC Space\n1D order projected on PC1/PC2 (numbers = order)",
+        "Subpopulation Centroids in 16-PC Space\nOrdered list projected on PC1/PC2 (numbers = order)",
         fontsize=13,
     )
     ax.set_xlabel("PC1")
@@ -209,7 +167,7 @@ def main() -> None:
     draw_table_text(ax_tbl, ordered_names, prevalence, n_cols=3)
 
     fig.suptitle(
-        "Centroid-based 1D Ordering of Subpopulations (16-PC Euclidean, NN + 2-opt path)",
+        "Centroid-based Ordering of Subpopulations",
         fontsize=15,
         y=1.02,
     )
