@@ -59,12 +59,19 @@ fn arrow_schur_block_solve_matches_dense_identity() {
     let mut rhs = Array1::<f64>::zeros(6);
     for a in 0..2 {
         for b in 0..2 { m[[a, b]] = sys.hbb[[a, b]]; }
-        rhs[a] = sys.gb[a];
+        // Newton convention: M * [Δt; Δβ] = [-g_t; -g_β]. See the docstring
+        // on `gam::solver::arrow_schur::ArrowSchurSystem::solve`.
+        rhs[a] = -sys.gb[a];
     }
     for i in 0..2 {
         let off = 2 + i * 2;
         for a in 0..2 {
-            rhs[off + a] = sys.rows[i].gt[a];
+            // ArrowSchurSystem::solve documents the Newton convention
+            // M * [Δt; Δβ] = [-g_t; -g_β]; build the dense reference RHS
+            // with the matching sign so `dense` and the returned (dt, db)
+            // are directly comparable. See the docstring on
+            // `gam::solver::arrow_schur::ArrowSchurSystem::solve`.
+            rhs[off + a] = -sys.rows[i].gt[a];
             for b in 0..2 { m[[off + a, off + b]] = sys.rows[i].htt[[a, b]]; }
             for b in 0..2 {
                 m[[off + a, b]] = sys.rows[i].htbeta[[a, b]];
@@ -72,6 +79,7 @@ fn arrow_schur_block_solve_matches_dense_identity() {
             }
         }
     }
+    for a in 0..2 { rhs[a] = -sys.gb[a]; }
     let l = cholesky_lower(&m);
     let dense = chol_solve(&l, &rhs);
 
