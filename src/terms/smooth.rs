@@ -4363,7 +4363,7 @@ fn build_tensor_bspline_basis(
     // shape (n, ∏ q_j) up front. When any marginal lacks a sparse form (e.g.
     // periodic B-splines currently realize a dense Array2), we fall back to the
     // existing dense Khatri-Rao path.
-    let marginal_sparse =
+    let mut marginal_sparse =
         Vec::<Option<SparseColMat<usize, f64>>>::with_capacity(feature_cols.len());
 
     // Reuse the robust 1D builder to ensure the same knot validation and
@@ -4401,6 +4401,10 @@ fn build_tensor_bspline_basis(
             marginalnum_basis.push(basis.ncols());
             marginal_designs.push(basis);
             marginal_penalties.push(penalty);
+            // Periodic Fourier margins are realized densely; no sparse form
+            // is available, so record `None` and force the dense fall-back
+            // for the tensor product if any dimension is periodic.
+            marginal_sparse.push(None);
         } else {
             let mut marginal_unconstrained = marginalspec.clone();
             marginal_unconstrained.identifiability = BSplineIdentifiability::None;
@@ -4416,6 +4420,18 @@ fn build_tensor_bspline_basis(
             marginal_knots.push(knots);
             marginal_degrees.push(marginalspec.degree);
             marginalnum_basis.push(built.design.ncols());
+            // Capture the sparse representation of this marginal (when the
+            // 1D builder produced one) before densifying for the dense
+            // marginal cache used by `tensor_product_design_from_marginals`
+            // and `TensorProductDesignOperator`.
+            let sparse_view: Option<SparseColMat<usize, f64>> = built
+                .design
+                .as_sparse()
+                .map(|sd| {
+                    let inner: &SparseColMat<usize, f64> = sd;
+                    inner.clone()
+                });
+            marginal_sparse.push(sparse_view);
             marginal_designs.push(built.design.to_dense());
             marginal_penalties.push(
                 built
