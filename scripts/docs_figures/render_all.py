@@ -1,4 +1,4 @@
-"""Render the README + docs figure portfolio from real `gamfit` fits.
+"""Render README and docs figures from real `gamfit` fits.
 
 Outputs land in docs/images/:
 
@@ -8,15 +8,11 @@ Outputs land in docs/images/:
   surface_3d_wireframe.png   3D wireframe over the noisy point cloud
   surface_3d_compare.png     3D side-by-side: matern vs duchon
   marginal_slope_3d.png      Two-surface marginal-slope viz (baseline + score)
-
-Each render is wrapped in try/except so one failure doesn't take the rest
-down. Output is unbuffered. Run with .venv313/bin/python -u.
 """
 from __future__ import annotations
 
-import traceback
 from pathlib import Path
-from typing import Any, Callable, TypeVar
+from typing import Any
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
@@ -27,16 +23,11 @@ from matplotlib import colormaps
 
 import gamfit
 
-T = TypeVar("T")
-
 
 def log(msg: str) -> None:
     print(msg, flush=True)
 
 
-# ---------------------------------------------------------------------------
-# Editorial style. Helvetica is reliable on macOS; falls back to sans-serif.
-# ---------------------------------------------------------------------------
 mpl.rcParams.update(
     {
         "figure.facecolor": "white",
@@ -69,11 +60,7 @@ DOCS_IMAGES = Path(__file__).resolve().parents[2] / "docs" / "images"
 DOCS_IMAGES.mkdir(parents=True, exist_ok=True)
 
 
-# ---------------------------------------------------------------------------
-# Shared helpers
-# ---------------------------------------------------------------------------
 def truth_2d(x1: np.ndarray, x2: np.ndarray) -> np.ndarray:
-    """A richer landscape: three peaks + saddle + ripple."""
     peak_a = 1.4 * np.exp(-((x1 - 0.25) ** 2 + (x2 - 0.70) ** 2) / 0.06)
     peak_b = -1.1 * np.exp(-((x1 - 0.75) ** 2 + (x2 - 0.25) ** 2) / 0.05)
     peak_c = 0.7 * np.exp(-((x1 - 0.80) ** 2 + (x2 - 0.78) ** 2) / 0.04)
@@ -146,9 +133,6 @@ def style_3d_axes(
     ax.grid(False)
 
 
-# ---------------------------------------------------------------------------
-# Figure 1: 2D three-panel hero
-# ---------------------------------------------------------------------------
 def render_hero(
     data: dict[str, list[float]], model: Any
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -196,9 +180,6 @@ def render_hero(
     return gx, gy, mean
 
 
-# ---------------------------------------------------------------------------
-# Figure 2: 2D zoo
-# ---------------------------------------------------------------------------
 def render_zoo(
     data: dict[str, list[float]], matern_mean: np.ndarray
 ) -> dict[str, np.ndarray]:
@@ -217,13 +198,10 @@ def render_zoo(
     ]
     for name, formula in specs:
         log(f"[zoo] fit {name}")
-        try:
-            m = gamfit.fit(data, formula)
-            _, _, mean, _ = grid_eval(m, side=side, with_se=False)
-            surfaces.append((name, gx, gy, mean))
-            log(f"[zoo] {name} done")
-        except Exception as exc:
-            log(f"[zoo] {name} FAILED: {exc!s}")
+        m = gamfit.fit(data, formula)
+        _, _, mean, _ = grid_eval(m, side=side, with_se=False)
+        surfaces.append((name, gx, gy, mean))
+        log(f"[zoo] {name} done")
 
     order = ["thin-plate", "Matérn", "Duchon", "tensor"]
     surfaces.sort(key=lambda t: order.index(t[0]) if t[0] in order else 99)
@@ -259,9 +237,6 @@ def render_zoo(
     return {name: surf for name, _, _, surf in surfaces}
 
 
-# ---------------------------------------------------------------------------
-# Figure 3: 3D shaded surface
-# ---------------------------------------------------------------------------
 def render_3d_shaded(gx: np.ndarray, gy: np.ndarray, mean: np.ndarray) -> None:
     fig = plt.figure(figsize=(8.4, 6.0))
     ax = fig.add_subplot(111, projection="3d")
@@ -288,9 +263,6 @@ def render_3d_shaded(gx: np.ndarray, gy: np.ndarray, mean: np.ndarray) -> None:
     log(f"wrote {out}")
 
 
-# ---------------------------------------------------------------------------
-# Figure 4: 3D wireframe + scatter
-# ---------------------------------------------------------------------------
 def render_3d_wireframe(
     data: dict[str, list[float]],
     gx: np.ndarray,
@@ -321,14 +293,7 @@ def render_3d_wireframe(
     log(f"wrote {out}")
 
 
-# ---------------------------------------------------------------------------
-# Figure 5: 3D side-by-side Matérn vs Duchon
-# ---------------------------------------------------------------------------
 def render_3d_compare(surfaces: dict[str, np.ndarray]) -> None:
-    if "Matérn" not in surfaces or "Duchon" not in surfaces:
-        log("[compare] skipping (missing matern/duchon)")
-        return
-
     side = surfaces["Matérn"].shape[0]
     g = np.linspace(0.0, 1.0, side)
     gx, gy = np.meshgrid(g, g)
@@ -365,14 +330,6 @@ def render_3d_compare(surfaces: dict[str, np.ndarray]) -> None:
     log(f"wrote {out}")
 
 
-# ---------------------------------------------------------------------------
-# Figure 6: Marginal-slope-style two-surface viz over (pc1, pc2)
-#
-# The visual uses a regular binomial GAM whose RHS is a joint Duchon smooth
-# over (pc1, pc2, z), then evaluates the fitted surface at two score values.
-# The vertical gap between the two surfaces shows the spatially-varying score
-# effect that marginal-slope models expose explicitly.
-# ---------------------------------------------------------------------------
 def render_marginal_slope_3d() -> None:
     log("[marginal-slope] generating synthetic data")
     rng = np.random.default_rng(2026)
@@ -381,18 +338,12 @@ def render_marginal_slope_3d() -> None:
     pc2 = rng.uniform(-1.0, 1.0, n)
     z = rng.standard_normal(n)
 
-    # Baseline log-odds: three peaks + a valley.  Gives the lower
-    # surface a clearly non-flat landscape.
     baseline = (
         -0.6
         + 1.4 * np.exp(-((pc1 - 0.30) ** 2 + (pc2 + 0.15) ** 2) / 0.14)
         - 1.0 * np.exp(-((pc1 + 0.50) ** 2 + (pc2 - 0.55) ** 2) / 0.12)
         + 0.8 * np.exp(-((pc1 + 0.15) ** 2 + (pc2 + 0.60) ** 2) / 0.10)
     )
-    # Spatially-varying slope-of-z: always positive but a sharp wedge,
-    # ≈ 0.2 in the bottom-left to ≈ 2.6 in the top-right.  Pulls the
-    # elevated surface farther from the baseline in one corner than the
-    # other without making them cross.
     slope = 0.2 + 2.4 / (1.0 + np.exp(-3.0 * (pc1 + pc2 - 0.0)))
     eta = baseline + slope * z
     prob = 1.0 / (1.0 + np.exp(-eta))
@@ -458,15 +409,10 @@ def render_marginal_slope_3d() -> None:
     ax.set_xlim(-1, 1)
     ax.set_ylim(-1, 1)
     ax.set_zlim(vmin - 0.02, vmax + 0.04)
-    # `set_zlabel` gets clipped at this camera angle.  Annotate the
-    # z-quantity as a figure-coord label instead, on the same row as the
-    # two colour chips.
     style_3d_axes(ax, xlabel="pc1", ylabel="pc2", zlabel="")
     ax.view_init(elev=22, azim=-62)
     ax.set_box_aspect((1.0, 1.0, 0.65))
 
-    # Top-row annotations: quantity name on the left, two colour chips
-    # on the right, tightly grouped.
     fig.text(0.08, 0.94, "P(case)",
              fontsize=11, fontweight="semibold", color="#0f172a",
              va="center")
@@ -485,20 +431,6 @@ def render_marginal_slope_3d() -> None:
     log(f"wrote {out}")
 
 
-# ---------------------------------------------------------------------------
-# main
-# ---------------------------------------------------------------------------
-def safe(
-    label: str, fn: Callable[..., T], *args: Any, **kwargs: Any
-) -> T | None:
-    try:
-        return fn(*args, **kwargs)
-    except Exception:
-        log(f"[{label}] FAILED")
-        traceback.print_exc()
-        return None
-
-
 def main() -> None:
     log("=== render_all start ===")
     data = make_regression()
@@ -506,22 +438,12 @@ def main() -> None:
     model = gamfit.fit(data, "y ~ matern(x1, x2)")
     log("[main] hero Matérn fit done")
 
-    result = safe("hero", render_hero, data, model)
-    if result is None:
-        log("[main] hero failed, aborting downstream 3D")
-        gx = gy = mean = None
-    else:
-        gx, gy, mean = result
-
-    surfaces = safe("zoo", render_zoo, data, mean)
-
-    if gx is not None and mean is not None:
-        safe("3d_shaded", render_3d_shaded, gx, gy, mean)
-        safe("3d_wireframe", render_3d_wireframe, data, gx, gy, mean)
-    if surfaces is not None:
-        safe("3d_compare", render_3d_compare, surfaces)
-
-    safe("marginal_slope", render_marginal_slope_3d)
+    gx, gy, mean = render_hero(data, model)
+    surfaces = render_zoo(data, mean)
+    render_3d_shaded(gx, gy, mean)
+    render_3d_wireframe(data, gx, gy, mean)
+    render_3d_compare(surfaces)
+    render_marginal_slope_3d()
 
     log("=== render_all done ===")
 

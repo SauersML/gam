@@ -884,12 +884,10 @@ class Model:
         posterior coefficient simulation using the max standardized deviation
         across the whole grid.
         """
-        import json
-
         request: dict[str, Any] = {
             "view": view,
             "group": group,
-            "pairs": pairs,
+            "pairs": [[str(a), str(b)] for a, b in pairs] if pairs is not None else None,
             "n": int(n),
             "level": float(level),
             "simultaneous": bool(simultaneous),
