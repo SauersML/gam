@@ -5210,6 +5210,28 @@ fn run_outer_with_plan(
         }
         crate::solver::estimate::reml::runtime::record_current_outer_iter_for_ift(0);
         obj.reset();
+        // Magic-by-default continuation pre-warm. On hard fits this
+        // walks ρ from an oversmoothing ρ₀ down to `seed`, leaving the
+        // objective's inner state warm at `seed`. On easy fits (ρ₀
+        // collapses to seed inside the bounds box) this is a single
+        // pre-screen comparison with no inner call, no allocation. A
+        // failure here means continuation could not even *reach* the
+        // seed; route the underlying InnerFailure through the same
+        // SeedRejection accounting any other pre-validation rejection
+        // would take, then continue to the next seed.
+        if let Err(cf) = crate::solver::estimate::reml::continuation::prime_outer_seed(
+            obj,
+            seed,
+            &bounds_template.1,
+        ) {
+            let msg = format!(
+                "continuation pre-warm refused before seed eval: {}",
+                cf.inner().message()
+            );
+            log::warn!("[OUTER] {context}: rejecting seed {seed_idx} (continuation): {msg}");
+            rejection_reasons.push((seed_idx, "validation", msg));
+            continue 'seed_attempts;
+        }
         let t_seed_start = std::time::Instant::now();
         let seed_slot;
         let result: Result<OuterResult, EstimationError> = match the_plan.solver {

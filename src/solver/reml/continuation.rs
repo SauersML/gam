@@ -188,6 +188,55 @@ fn eval_step(
 
 pub(crate) type ContinuationResult = Result<ContinuationState, ContinuationFailure>;
 
+/// Prime the outer optimizer's seed by walking a continuation path from
+/// an oversmoothing ρ₀ down to `seed`. Designed for the
+/// `run_outer_with_plan` per-seed loop: a successful call leaves the
+/// objective's inner state warm at `seed`, so the subsequent
+/// `eval_with_order(seed, …)` from the regular cold-eval path converges
+/// from a near-optimal β instead of cold β=0.
+///
+/// Returns `Ok(())` (no work performed) when ρ₀ collapses to ρ* — i.e.,
+/// the fit is "easy" in the sense that the bound clamps ρ₀ back to the
+/// target. In that case the regular cold eval is already the right
+/// thing to do, and continuation imposes zero overhead.
+///
+/// On failure, the underlying `ContinuationFailure` is returned with
+/// its inner `InnerFailure` preserved so the caller can route it
+/// through the existing `SeedRejection::from_message` accounting.
+///
+/// `seed` is the per-iteration ρ candidate (the loop variable in
+/// `run_outer_with_plan`). `bounds_upper` is the legal upper bound on ρ.
+pub(crate) fn prime_outer_seed(
+    obj: &mut dyn OuterObjective,
+    seed: &Array1<f64>,
+    bounds_upper: &Array1<f64>,
+) -> Result<(), ContinuationFailure> {
+    // Pre-screen: if ρ₀ would clamp to ρ*, skip entirely. No inner
+    // call, no allocation, no log line — continuation is invisible on
+    // easy fits, satisfying the "magic by default" zero-overhead bar.
+    let rho_zero = build_rho_zero(seed, bounds_upper, OVERSMOOTH_OFFSET_INIT);
+    if rho_zero_is_target(&rho_zero, seed) {
+        return Ok(());
+    }
+
+    // Empty β: the objective's `seed_inner_state` contract is to treat
+    // a zero-length slice as "no warm-start available, use your own
+    // cold default". Continuation then carries β forward step-to-step
+    // via `OuterEval::inner_beta_hint` from each accepted eval.
+    let empty_beta: Array1<f64> = Array1::zeros(0);
+
+    match fit_with_continuation(
+        obj,
+        seed,
+        bounds_upper,
+        &empty_beta,
+        OuterEvalOrder::ValueAndGradient,
+    ) {
+        Ok(_state) => Ok(()),
+        Err(failure) => Err(failure),
+    }
+}
+
 /// Run the continuation path from an oversmoothing ρ₀ down to `target`.
 /// `initial_beta` seeds the inner solve at ρ₀ (zero vector is fine —
 /// ρ₀ is in the strongly-convex regime). `bounds_upper` clamps ρ₀ to
