@@ -76,7 +76,8 @@ use gam::terms::skip_transcoder::{
 use gam::terms::{
     ARDPenalty as CoreARDPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry,
     BlockOrthogonalityPenalty as CoreBlockOrthogonalityPenalty,
-    DifferenceOpKind, GatedSAEDecoder, IBPAssignmentPenalty, IsometryPenalty, IvaeRidgeMeanGauge,
+    DifferenceOpKind, GatedSAEDecoder, IBPAssignmentPenalty,
+    IsometryPenalty as CoreIsometryPenalty, IvaeRidgeMeanGauge,
     JumpReLUPenalty as RustJumpReLUPenalty, MaternBasisGradientTarget, MechanismSparsityPenalty,
     NuclearNormPenalty, OrthogonalityPenalty, ParametricRowPrecisionPriorPenalty, PenaltyConcavity,
     PenaltyTier, PsiSlice, RowPrecisionPriorPenalty, ScadMcpPenalty, ScalarWeightSchedule,
@@ -12554,6 +12555,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(design_matrix_table, module)?)?;
     module.add_function(wrap_pyfunction!(design_matrix_table_dense, module)?)?;
     module.add_function(wrap_pyfunction!(design_matrix_array, module)?)?;
+    module.add_function(wrap_pyfunction!(build_difference_smooth_request_json, module)?)?;
     module.add_function(wrap_pyfunction!(bspline_basis, module)?)?;
     module.add_function(wrap_pyfunction!(bspline_basis_derivative, module)?)?;
     module.add_function(wrap_pyfunction!(basis_with_jet, module)?)?;
@@ -12580,6 +12582,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(torch_smooth_dispatch_key, module)?)?;
     module.add_function(wrap_pyfunction!(assemble_candidate_formula, module)?)?;
+    module.add_function(wrap_pyfunction!(ordered_prediction_columns, module)?)?;
     module.add_function(wrap_pyfunction!(rank_topology_candidates, module)?)?;
     module.add_function(wrap_pyfunction!(extract_reml_score, module)?)?;
     module.add_function(wrap_pyfunction!(extract_reml_score_raw, module)?)?;
@@ -16069,7 +16072,7 @@ fn build_analytic_penalty_registry_from_json(
                 )?;
                 let weight = descriptor_weight_scalar(descriptor, &context)?;
                 let p_out = descriptor_usize(descriptor, "p_out", target.d)?;
-                let mut penalty = IsometryPenalty::new_euclidean(slice, p_out);
+                let mut penalty = CoreIsometryPenalty::new_euclidean(slice, p_out);
                 penalty.scalar_weight = weight;
                 let penalty = match weight_schedule {
                     Some(schedule) => penalty.with_weight_schedule(schedule),
