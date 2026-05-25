@@ -22305,4 +22305,66 @@ mod tests {
             hessian_envelope, hessian_ift, fd_hessian
         );
     }
+
+    #[test]
+    fn bug_hunt_penalty_matrix_root_reconstructs_with_effective_rank() {
+        let s = ndarray::arr2(&[
+            [2.0_f64, 1.0, 0.0, 0.0],
+            [1.0, 2.0, 0.0, 0.0],
+            [0.0, 0.0, 1e-14, 0.0],
+            [0.0, 0.0, 0.0, 0.0],
+        ]);
+        let l = penalty_matrix_root(&s)
+            .expect("penalty matrix root should be computable for semidefinite inputs");
+        let recon = l.dot(&l.t());
+        let frob_s = s.iter().map(|x| x * x).sum::<f64>().sqrt();
+        let frob_err = (&recon - &s).iter().map(|x| x * x).sum::<f64>().sqrt();
+        let rel = frob_err / frob_s.max(1.0);
+        assert!(
+            rel < 1e-9,
+            "Penalty root must reconstruct S_lambda to numerical tolerance, but relative Frobenius error was {rel:.3e}.",
+        );
+    }
+
+    #[test]
+    fn bug_hunt_block_penalty_logdet_derivs_match_finite_difference_shared_columns() {
+        let s1 = ndarray::arr2(&[[2.0_f64, 1.0], [1.0, 1.0]]);
+        let s2 = ndarray::arr2(&[[1.0_f64, 0.5], [0.5, 2.0]]);
+        let rho = ndarray::arr1(&[0.2_f64, -0.4]);
+        let delta = 1e-6_f64;
+        let per_block_rho = vec![rho.clone()];
+        let penalties_block = vec![s1.clone(), s2.clone()];
+        let per_block_penalties: Vec<&[Array2<f64>]> = vec![penalties_block.as_slice()];
+        let null_dims = vec![0usize, 0usize];
+        let per_block_nullspace_dims: Vec<&[usize]> = vec![null_dims.as_slice()];
+        let out = compute_block_penalty_logdet_derivs(
+            &per_block_rho,
+            &per_block_penalties,
+            &per_block_nullspace_dims,
+            delta,
+        )
+        .expect("logdet derivs should be finite");
+        let f = |r: &Array1<f64>| -> f64 {
+            let l1 = r[0].exp();
+            let l2 = r[1].exp();
+            let s = s1.mapv(|x| x * l1) + s2.mapv(|x| x * l2) + Array2::<f64>::eye(2) * delta;
+            let op = DenseSpectralOperator::from_symmetric(&s).expect("spd for fd");
+            op.logdet()
+        };
+        let eps = 1e-5_f64;
+        for k in 0..2 {
+            let mut rp = rho.clone();
+            rp[k] += eps;
+            let mut rm = rho.clone();
+            rm[k] -= eps;
+            let fd = (f(&rp) - f(&rm)) / (2.0 * eps);
+            assert!(
+                (out.first[k] - fd).abs() < 1e-5,
+                "First derivative with shared penalty columns must match finite differences; coord {k} analytic={:.8e} finite_diff={:.8e}.",
+                out.first[k],
+                fd
+            );
+        }
+    }
+
 }
