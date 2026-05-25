@@ -1596,6 +1596,60 @@ pub const fn default_rrqr_rank_alpha() -> f64 {
     RRQR_RANK_ALPHA
 }
 
+/// Result of a column-pivoted QR with rank detection and column permutation.
+///
+/// `A · P = Q · R` where the permutation `P` is exposed as the forward index
+/// array: column `j` of `A · P` corresponds to original column
+/// `column_permutation[j]` of `A`. With rank `r < min(m, n)`, the trailing
+/// `min(m, n) - r` entries of `column_permutation` name the columns that the
+/// pivoted QR demoted past the rank threshold — i.e., the columns identified
+/// as redundant. Identifiability auditors (`solver/identifiability_audit.rs`)
+/// use that suffix to attribute `DroppedColumn` entries to specific original
+/// columns.
+pub struct RrqrWithPermutation {
+    pub rank: usize,
+    pub column_permutation: Vec<usize>,
+    pub leading_diag_abs: f64,
+    pub rank_tol: f64,
+}
+
+/// Column-pivoted rank-revealing QR returning the rank, the column permutation,
+/// and the rank-detection tolerance. Use this when callers need to name which
+/// columns the pivoted QR demoted past the rank threshold.
+///
+/// The rank cutoff matches [`rrqr_nullspace_basis`]: a column-pivoted QR is
+/// computed on `a`; columns with `|R[i, i]| > tol` count toward the rank,
+/// where `tol = rank_alpha · eps · max(m, n, 1) · max(|R[0, 0]|, 1)`. Returns
+/// `Err` when `a` has zero rows.
+pub fn rrqr_with_permutation<S: Data<Elem = f64>>(
+    a: &ArrayBase<S, Ix2>,
+    rank_alpha: f64,
+) -> Result<RrqrWithPermutation, FaerLinalgError> {
+    if a.nrows() == 0 {
+        return Err(FaerLinalgError::FactorizationFailed {
+            context: "rrqr_with_permutation: input has zero rows",
+        });
+    }
+    let faerview = FaerArrayView::new(a);
+    let qr = faerview.as_ref().col_piv_qr();
+    let r = qr.thin_R();
+    let diag_len = r.nrows().min(r.ncols());
+    let leading_diag = if diag_len > 0 { r[(0, 0)].abs() } else { 0.0 };
+    let tol = rank_alpha
+        * f64::EPSILON
+        * (a.nrows().max(a.ncols()).max(1) as f64)
+        * leading_diag.max(1.0);
+    let rank = (0..diag_len).filter(|&i| r[(i, i)].abs() > tol).count();
+    let (forward, _inverse) = qr.P().arrays();
+    let column_permutation: Vec<usize> = forward.iter().map(|idx| *idx).collect();
+    Ok(RrqrWithPermutation {
+        rank,
+        column_permutation,
+        leading_diag_abs: leading_diag,
+        rank_tol: tol,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1620,6 +1674,48 @@ mod tests {
         let residual = a.t().dot(&z);
         let resid_max = residual.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
         assert!(resid_max < 1e-10, "A^T Z residual too large: {resid_max:e}");
+    }
+
+    #[test]
+    fn rrqr_with_permutation_attributes_redundant_column() {
+        // 3 columns, column 2 is a duplicate of column 0 → rank 2, column 2
+        // is the redundant one that the pivoted QR should demote past the
+        // rank threshold. (Column 1 contributes a different direction.)
+        let a = array![
+            [1.0, 0.0, 1.0],
+            [1.0, 0.0, 1.0],
+            [0.0, 2.0, 0.0],
+            [0.0, 0.0, 0.0],
+        ];
+        let result = rrqr_with_permutation(&a, default_rrqr_rank_alpha())
+            .expect("RRQR should succeed");
+        assert_eq!(result.rank, 2);
+        assert_eq!(result.column_permutation.len(), 3);
+        let demoted = result.column_permutation[result.rank..].to_vec();
+        assert!(
+            demoted.contains(&2) || demoted.contains(&0),
+            "demoted suffix should include one of the aliased columns (0 or 2), got {demoted:?}"
+        );
+        let mut sorted = result.column_permutation.clone();
+        sorted.sort();
+        assert_eq!(sorted, vec![0, 1, 2], "permutation must be a valid bijection on 0..n");
+    }
+
+    #[test]
+    fn rrqr_with_permutation_full_rank_returns_identity_like_order() {
+        let a = array![[1.0, 0.0], [0.0, 2.0], [0.0, 0.0]];
+        let result = rrqr_with_permutation(&a, default_rrqr_rank_alpha())
+            .expect("RRQR should succeed");
+        assert_eq!(result.rank, 2);
+        let mut sorted = result.column_permutation.clone();
+        sorted.sort();
+        assert_eq!(sorted, vec![0, 1]);
+    }
+
+    #[test]
+    fn rrqr_with_permutation_rejects_zero_rows() {
+        let a = Array2::<f64>::zeros((0, 3));
+        assert!(rrqr_with_permutation(&a, default_rrqr_rank_alpha()).is_err());
     }
 
     #[test]
