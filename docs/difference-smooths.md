@@ -5,19 +5,19 @@ Difference smooths compare trajectories between groups without asking users to d
 ## Parameterisations
 
 * **Unordered by-factor smooths**: `y ~ s(x, by=group)` expands to one centred smooth per categorical level. The implementation also adds an unpenalized treatment-coded factor main effect, because centred level smooths cannot absorb vertical offsets.
-* **Ordered/reference difference smooths**: fit a reference smooth plus a categorical-by smooth (for example `y ~ s(x) + s(x, by=group)`) when a scientific baseline is meaningful. Post-fit contrasts use the same covariance-aware API.
+* **Reference-plus-by smooths**: fit an overall smooth plus categorical by-factor smooths (for example `y ~ s(x) + s(x, by=group)`) when a shared trajectory is useful. Post-fit contrasts use the same covariance-aware API.
 * **Binary numeric by-smooths**: `y ~ s(x) + s(x, by=treated)` multiplies the smooth basis by a numeric 0/1 column. This term is not level-centred, matching the mgcv idiom for a combined level-and-shape treatment contrast.
 * **Sum-to-zero factor smooths**: `y ~ s(x) + s(group, x, bs=sz)` estimates coefficient-wise group deviations that sum to zero across levels. This is the recommended symmetric default when no level should be privileged as the reference.
 
 ## Inference API
 
-`Model.difference_smooth(data, group="group", view="x")` builds two design matrices on a grid, forms `X_B - X_A`, and computes the contrast standard error from the joint coefficient covariance. `simultaneous=True` uses posterior simulation of the maximum standardized deviation over the grid to return a simultaneous band for regional claims.
+`model.difference_smooth(data=data, group="group", view="x")` builds two design matrices on a grid, forms `X_B - X_A`, and computes the contrast standard error from the joint coefficient covariance. `simultaneous=True` uses posterior simulation of the maximum standardized deviation over the grid to return a simultaneous band for regional claims.
 
-By default the returned contrast includes the parametric group offset (`group_means=True`), because that is usually the substantive full-trajectory difference. The current public method raises a clear error for `group_means=False` until term-role metadata is exposed in the Python FFI.
+By default `difference_smooth` marginalises saved random-effect blocks (`marginalise_random=True`). The treatment-coded factor main effect added for categorical `by=` smooths is stored in that block layout, so pass `marginalise_random=False` when the returned contrast should include the parametric group offset. With random-effect blocks retained, `group_means=False` zeros the saved group main-effect block to return the smooth-shape contrast without that offset.
 
 ## Choosing among them
 
-Use unordered by-factor smooths when groups are scientifically independent and each group should get its own smoothing parameter. Use a reference/difference setup when a baseline is central to the question. Use binary by-smooths for two-group treatment indicators when level and shape differences need not be separated. Use `bs=sz` for three or more peer groups because it estimates deviations around a population mean without privileging any level.
+Use unordered by-factor smooths when groups are scientifically independent and each group should get its own smoothing parameter. Use an overall-plus-by setup when a shared trend is central to the question. Use binary by-smooths for two-group treatment indicators when level and shape differences need not be separated. Use `bs=sz` for three or more peer groups because it estimates deviations around a population mean without privileging any level.
 
 ## References
 
