@@ -17128,7 +17128,7 @@ fn validate_spec(spec: &SurvivalMarginalSlopeTermSpec) -> Result<(), String> {
         .into());
     }
     if let Some(beta0) = &spec.time_block.initial_beta {
-        let derivative_constraints = structural_time_coefficient_constraints(
+        let derivative_constraints = time_derivative_guard_constraints(
             &spec.time_block.design_derivative_exit,
             &spec.time_block.derivative_offset_exit,
             spec.derivative_guard,
@@ -17149,7 +17149,7 @@ fn validate_spec(spec: &SurvivalMarginalSlopeTermSpec) -> Result<(), String> {
                 if slack < -1e-10 {
                     return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
                         reason: format!(
-                            "survival-marginal-slope time_block initial_beta violates structural coefficient non-negativity at row {row}: slack={slack:.3e}"
+                        "survival-marginal-slope time_block initial_beta violates derivative guard constraint at row {row}: slack={slack:.3e}"
                         ),
                     }
                     .into());
@@ -17654,13 +17654,13 @@ pub fn fit_survival_marginal_slope_terms(
         .as_ref()
         .map(|timewiggle| time_wiggle_basis_ncols(&timewiggle.knots, timewiggle.degree))
         .transpose()?;
-    let structural_time_constraints = structural_time_coefficient_constraints(
+    let derivative_guard_constraints = time_derivative_guard_constraints(
         &design_derivative_exit,
         derivative_offset_exit.as_ref(),
         derivative_guard,
     )?;
     let time_linear_constraints = append_timewiggle_tail_nonnegative_constraints(
-        structural_time_constraints,
+        derivative_guard_constraints,
         design_exit.ncols(),
         derived_time_wiggle_ncols.unwrap_or(0),
     )?;
