@@ -61,7 +61,6 @@ class GAM(nn.Module):
         self.smooths: list[Smooth] = list(smooths)
         # Frozen coefficients (set by .freeze()).
         self._frozen_coefs: list[torch.Tensor] | None = None
-        self._frozen_lambdas: torch.Tensor | None = None
         self.last_fit: FitResult | None = None
 
     # ------------------------------------------------------------------
@@ -111,7 +110,6 @@ class GAM(nn.Module):
             self._frozen_coefs = [c.detach() for c in result.coefficients]
         else:
             self._frozen_coefs = [result.coefficients.detach()]
-        self._frozen_lambdas = result.lambdas.detach()
         self.last_fit = result
         self.eval()
 
