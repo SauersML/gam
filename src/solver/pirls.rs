@@ -778,6 +778,27 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
                     z,
                     None,
                 )?;
+                // For Gaussian identity, the canonical IRLS working weight is
+                //     w_i = prior_i * (dmu/deta)^2 / Var(Y_i | mu_i) = prior_i / phi.
+                // When the scale metadata explicitly fixes phi (rather than
+                // profiling sigma out), the working weights must include 1/phi
+                // so that PIRLS minimises the scaled deviance / scaled negative
+                // log-likelihood that the calibrator and downstream variance
+                // calculations expect. `ProfiledGaussian` returns `None` here,
+                // preserving the historical "weights == prior" behaviour for
+                // the default profiled case.
+                if let Some(phi) = self.scale.fixed_phi() {
+                    if !(phi.is_finite() && phi > 0.0) {
+                        return Err(EstimationError::InvalidInput(format!(
+                            "Gaussian fixed dispersion phi must be finite and positive (got {})",
+                            phi
+                        )));
+                    }
+                    if phi != 1.0 {
+                        let inv_phi = 1.0 / phi;
+                        weights.mapv_inplace(|w| w * inv_phi);
+                    }
+                }
                 Ok(())
             }
             (ResponseFamily::Poisson, _, _) => {
@@ -10880,11 +10901,25 @@ pub fn calculate_deviance(
                 .sum();
             2.0 * total_residual
         }
-        ResponseFamily::Gaussian => ndarray::Zip::from(y)
-            .and(mu)
-            .and(priorweights)
-            .map_collect(|&yi, &mui, &wi| wi * (yi - mui) * (yi - mui))
-            .sum(),
+        ResponseFamily::Gaussian => {
+            // Scaled Gaussian deviance is sum(prior_i * (y_i - mu_i)^2 / phi).
+            // The default `ProfiledGaussian` metadata reports no fixed phi and
+            // we keep the historical unscaled form (phi == 1) so that profiled
+            // sigma fits remain unchanged. When the caller fixes phi explicitly
+            // we divide by it so the deviance lines up with the IRLS working
+            // weights (`prior_i / phi`) and with the canonical exponential-
+            // family scaled deviance used elsewhere.
+            let phi = likelihood.scale.fixed_phi().unwrap_or(1.0);
+            if !(phi.is_finite() && phi > 0.0) {
+                return f64::NAN;
+            }
+            let raw: f64 = ndarray::Zip::from(y)
+                .and(mu)
+                .and(priorweights)
+                .map_collect(|&yi, &mui, &wi| wi * (yi - mui) * (yi - mui))
+                .sum();
+            raw / phi
+        }
         ResponseFamily::Poisson => {
             use rayon::iter::{IntoParallelIterator, ParallelIterator};
             let total: f64 = (0..y.len())
