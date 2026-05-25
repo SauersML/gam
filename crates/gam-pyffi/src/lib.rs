@@ -1877,6 +1877,129 @@ fn tierney_kadane_normalized_score(
     .map_err(PyValueError::new_err)
 }
 
+/// String dispatch for the torch fit entry — translate a Python `Smooth`
+/// subclass name into the matching torch entry kind string.
+#[pyfunction]
+fn torch_smooth_dispatch_key(spec_kind: &str) -> PyResult<String> {
+    gam::terms::torch_dispatch::dispatch_key(spec_kind)
+        .map(|entry| entry.as_str().to_string())
+        .map_err(PyValueError::new_err)
+}
+
+/// Replace the unique `s(..., type=AUTO)` term in `base_formula` with the
+/// candidate-specific smooth term described by `candidate_json`. The JSON
+/// payload is a typed `CandidateTopology` (tag = "kind").
+///
+/// Returns `Ok(Some(formula))` when the substitution succeeds, `Ok(None)`
+/// when the candidate's required dimension does not match the AUTO term and
+/// `strict_dimension` is false, and `Err(...)` on any other failure (missing
+/// AUTO term, dimension mismatch in strict mode, malformed JSON, etc.).
+#[pyfunction(signature = (base_formula, candidate_json, strict_dimension = true))]
+fn assemble_candidate_formula(
+    base_formula: &str,
+    candidate_json: &str,
+    strict_dimension: bool,
+) -> PyResult<Option<String>> {
+    let candidate: gam::solver::topology_formula::CandidateTopology =
+        serde_json::from_str(candidate_json).map_err(|err| {
+            py_value_error(format!(
+                "assemble_candidate_formula: failed to parse candidate JSON: {err}"
+            ))
+        })?;
+    gam::solver::topology_formula::assemble_candidate_formula(
+        base_formula,
+        &candidate,
+        strict_dimension,
+    )
+    .map_err(PyValueError::new_err)
+}
+
+/// Rank a set of topology candidates by their TK-normalized REML score.
+///
+/// Input JSON shape:
+/// ```json
+/// {"score_scale": "per_effective_dim" | "per_observation",
+///  "candidates": [
+///     {"name": "...", "raw_reml": ..., "null_dim": ...,
+///      "null_space_logdet": ..., "effective_dim": ..., "n_obs": ...},
+///     ...
+///  ]}
+/// ```
+/// Output JSON: `{"ranked": [...], "winner_index": 0}` with entries sorted
+/// descending by `tk_score`.
+#[pyfunction]
+fn rank_topology_candidates(evidence_json: &str) -> PyResult<String> {
+    #[derive(Deserialize)]
+    struct CandidateEvidence {
+        name: String,
+        raw_reml: f64,
+        null_dim: f64,
+        null_space_logdet: Option<f64>,
+        effective_dim: f64,
+        n_obs: usize,
+    }
+    #[derive(Deserialize)]
+    struct EvidenceBundle {
+        score_scale: String,
+        candidates: Vec<CandidateEvidence>,
+    }
+    let bundle: EvidenceBundle = serde_json::from_str(evidence_json).map_err(|err| {
+        py_value_error(format!(
+            "rank_topology_candidates: failed to parse evidence JSON: {err}"
+        ))
+    })?;
+    let score_scale = match bundle
+        .score_scale
+        .trim()
+        .to_ascii_lowercase()
+        .replace('-', "_")
+        .as_str()
+    {
+        "per_observation" => gam::solver::evidence::TopologyScoreScale::PerObservation,
+        "per_effective_dim" => gam::solver::evidence::TopologyScoreScale::PerEffectiveDim,
+        other => {
+            return Err(py_value_error(format!(
+                "rank_topology_candidates: score_scale must be per_effective_dim or per_observation; got {other:?}"
+            )));
+        }
+    };
+    if bundle.candidates.is_empty() {
+        return Err(py_value_error(
+            "rank_topology_candidates: at least one candidate is required".to_string(),
+        ));
+    }
+    let mut ranked: Vec<serde_json::Value> = Vec::with_capacity(bundle.candidates.len());
+    for entry in &bundle.candidates {
+        let tk = gam::solver::topology_selector::tk_normalized_score(
+            entry.raw_reml,
+            entry.null_dim,
+            entry.null_space_logdet,
+            entry.effective_dim,
+            entry.n_obs,
+            score_scale,
+        )
+        .map_err(PyValueError::new_err)?;
+        ranked.push(serde_json::json!({
+            "name": entry.name,
+            "tk_score": tk,
+            "raw_reml": entry.raw_reml,
+            "effective_dim": entry.effective_dim,
+            "n_obs": entry.n_obs,
+        }));
+    }
+    ranked.sort_by(|lhs, rhs| {
+        let l = lhs.get("tk_score").and_then(|v| v.as_f64()).unwrap_or(f64::NEG_INFINITY);
+        let r = rhs.get("tk_score").and_then(|v| v.as_f64()).unwrap_or(f64::NEG_INFINITY);
+        r.partial_cmp(&l).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let out = serde_json::json!({
+        "ranked": ranked,
+        "winner_index": 0_usize,
+    });
+    serde_json::to_string(&out)
+        .map_err(|err| py_value_error(format!("rank_topology_candidates: serialise: {err}")))
+}
+
 const REML_SCORE_KEYS: &[&str] = &["reml_score", "evidence", "laml", "score"];
 const EDF_KEYS: &[&str] = &["edf_total", "edf", "effective_dof"];
 const PENALTY_RANK_KEYS: &[&str] = &["penalty_rank", "rank_s", "rank_S", "cache_penalty_rank"];
@@ -10874,6 +10997,9 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
         tierney_kadane_normalized_score,
         module
     )?)?;
+    module.add_function(wrap_pyfunction!(torch_smooth_dispatch_key, module)?)?;
+    module.add_function(wrap_pyfunction!(assemble_candidate_formula, module)?)?;
+    module.add_function(wrap_pyfunction!(rank_topology_candidates, module)?)?;
     module.add_function(wrap_pyfunction!(extract_reml_score, module)?)?;
     module.add_function(wrap_pyfunction!(extract_reml_score_raw, module)?)?;
     module.add_function(wrap_pyfunction!(extract_reml_edf, module)?)?;
@@ -13044,6 +13170,516 @@ fn coefficient_state_json_impl(model_bytes: &[u8]) -> Result<String, String> {
     };
     serde_json::to_string(&out)
         .map_err(|err| format!("failed to serialize coefficient state: {err}"))
+}
+
+#[derive(Deserialize)]
+struct DifferenceSmoothRequest {
+    view: String,
+    group: Option<String>,
+    pairs: Option<Vec<Vec<String>>>,
+    n: usize,
+    level: f64,
+    simultaneous: bool,
+    n_sim: usize,
+    seed: Option<u64>,
+    marginalise_random: bool,
+    group_means: bool,
+    template: Option<BTreeMap<String, serde_json::Value>>,
+}
+
+fn json_value_to_row_string(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(text) => Some(text.clone()),
+        serde_json::Value::Number(number) => Some(number.to_string()),
+        serde_json::Value::Bool(flag) => Some(flag.to_string()),
+        other => Some(other.to_string()),
+    }
+}
+
+fn difference_schema_columns<'a>(
+    state: &'a serde_json::Value,
+) -> Result<&'a Vec<serde_json::Value>, String> {
+    state
+        .get("schema")
+        .and_then(|schema| schema.get("columns"))
+        .and_then(|columns| columns.as_array())
+        .ok_or_else(|| "difference_smooth requires a saved model schema".to_string())
+}
+
+fn difference_json_ranges(
+    state: &serde_json::Value,
+    key: &str,
+) -> Result<Vec<(usize, usize)>, String> {
+    let Some(raw_ranges) = state.get(key).and_then(|raw| raw.as_array()) else {
+        return Ok(Vec::new());
+    };
+    raw_ranges
+        .iter()
+        .enumerate()
+        .map(|(idx, raw)| {
+            let values = raw
+                .as_array()
+                .ok_or_else(|| format!("{key}[{idx}] must be a two-element array"))?;
+            if values.len() != 2 {
+                return Err(format!("{key}[{idx}] must be a two-element array"));
+            }
+            let start = values[0]
+                .as_u64()
+                .ok_or_else(|| format!("{key}[{idx}][0] must be an unsigned integer"))?
+                as usize;
+            let end = values[1]
+                .as_u64()
+                .ok_or_else(|| format!("{key}[{idx}][1] must be an unsigned integer"))?
+                as usize;
+            Ok((start, end))
+        })
+        .collect()
+}
+
+fn difference_training_ranges(state: &serde_json::Value) -> Vec<(f64, f64)> {
+    state
+        .get("training_feature_ranges")
+        .and_then(|raw| raw.as_array())
+        .map(|ranges| {
+            ranges
+                .iter()
+                .map(|raw| {
+                    let pair = raw.as_array();
+                    let lo = pair
+                        .and_then(|values| values.first())
+                        .and_then(|value| value.as_f64())
+                        .unwrap_or(0.0);
+                    let hi = pair
+                        .and_then(|values| values.get(1))
+                        .and_then(|value| value.as_f64())
+                        .unwrap_or(1.0);
+                    (lo, hi)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn difference_smooth_covariance(
+    state: &serde_json::Value,
+    beta_len: usize,
+) -> Result<(Array2<f64>, String, bool), String> {
+    let corrected = state.get("covariance_corrected_flat").is_some()
+        || state.get("covariance_corrected_n").is_some();
+    let (flat_key, n_key, kind) = if corrected {
+        (
+            "covariance_corrected_flat",
+            "covariance_corrected_n",
+            "corrected",
+        )
+    } else {
+        ("covariance_flat", "covariance_n", "conditional")
+    };
+    let cov_n = state
+        .get(n_key)
+        .and_then(|raw| raw.as_u64())
+        .ok_or_else(|| format!("model coefficient state does not include {n_key}"))?
+        as usize;
+    let cov_flat = json_f64_vec(state, flat_key)?;
+    if cov_flat.len() != cov_n * cov_n || beta_len != cov_n {
+        return Err("coefficient covariance payload has inconsistent dimensions".to_string());
+    }
+    let cov = Array2::from_shape_vec((cov_n, cov_n), cov_flat)
+        .map_err(|err| format!("failed to reshape coefficient covariance: {err}"))?;
+    Ok((cov, kind.to_string(), corrected))
+}
+
+fn difference_group_ranges(
+    state: &serde_json::Value,
+    group: &str,
+) -> Result<Vec<(usize, usize)>, String> {
+    let Some(blocks) = state.get("term_blocks").and_then(|raw| raw.as_array()) else {
+        return Ok(Vec::new());
+    };
+    let mut ranges = Vec::new();
+    for block in blocks {
+        let Some(obj) = block.as_object() else {
+            continue;
+        };
+        if obj
+            .get("name")
+            .and_then(|raw| raw.as_str())
+            .is_some_and(|name| name == group)
+        {
+            let start = obj
+                .get("start")
+                .and_then(|raw| raw.as_u64())
+                .ok_or_else(|| "term_blocks entry is missing start".to_string())?
+                as usize;
+            let end = obj
+                .get("end")
+                .and_then(|raw| raw.as_u64())
+                .ok_or_else(|| "term_blocks entry is missing end".to_string())?
+                as usize;
+            ranges.push((start, end));
+        }
+    }
+    Ok(ranges)
+}
+
+fn zero_design_ranges(x: &mut Array2<f64>, ranges: &[(usize, usize)]) {
+    let ncols = x.ncols();
+    for &(start, end) in ranges {
+        let start = start.min(ncols);
+        let end = end.min(ncols);
+        if start < end {
+            x.slice_mut(s![.., start..end]).fill(0.0);
+        }
+    }
+}
+
+struct SplitMixNormalRng {
+    state: u64,
+    spare: Option<f64>,
+}
+
+impl SplitMixNormalRng {
+    fn new(seed: u64) -> Self {
+        Self {
+            state: seed,
+            spare: None,
+        }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    fn uniform_open01(&mut self) -> f64 {
+        let value = self.next_u64() >> 11;
+        ((value as f64) + 0.5) * (1.0 / ((1_u64 << 53) as f64))
+    }
+
+    fn standard_normal(&mut self) -> f64 {
+        if let Some(value) = self.spare.take() {
+            return value;
+        }
+        let u1 = self.uniform_open01();
+        let u2 = self.uniform_open01();
+        let radius = (-2.0 * u1.ln()).sqrt();
+        let angle = std::f64::consts::TAU * u2;
+        self.spare = Some(radius * angle.sin());
+        radius * angle.cos()
+    }
+}
+
+fn difference_quantile(mut values: Vec<f64>, level: f64) -> Result<f64, String> {
+    values.retain(|value| value.is_finite());
+    if values.is_empty() {
+        return Err("simultaneous difference_smooth simulation produced no finite draws".to_string());
+    }
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+    if values.len() == 1 {
+        return Ok(values[0]);
+    }
+    let pos = level * ((values.len() - 1) as f64);
+    let lo = pos.floor() as usize;
+    let hi = pos.ceil() as usize;
+    if lo == hi {
+        Ok(values[lo])
+    } else {
+        let weight = pos - (lo as f64);
+        Ok(values[lo] * (1.0 - weight) + values[hi] * weight)
+    }
+}
+
+fn difference_simultaneous_critical(
+    beta: &Array1<f64>,
+    cov: &Array2<f64>,
+    xd: &Array2<f64>,
+    diff: &Array1<f64>,
+    se: &Array1<f64>,
+    n_sim: usize,
+    seed: u64,
+    level: f64,
+) -> Result<f64, String> {
+    if n_sim == 0 {
+        return Err("difference_smooth n_sim must be at least 1 when simultaneous=True".to_string());
+    }
+    let sym = (cov + &cov.t()) * 0.5;
+    let chol = sym
+        .cholesky(Side::Lower)
+        .map_err(|err| format!("coefficient covariance Cholesky failed: {err}"))?;
+    let lower = chol.lower_triangular();
+    let n_coeff = beta.len();
+    let n_rows = xd.nrows();
+    let mut rng = SplitMixNormalRng::new(seed);
+    let mut z = vec![0.0; n_coeff];
+    let mut draw = vec![0.0; n_coeff];
+    let mut max_devs = Vec::with_capacity(n_sim);
+    for _ in 0..n_sim {
+        for value in &mut z {
+            *value = rng.standard_normal();
+        }
+        for row in 0..n_coeff {
+            let mut value = beta[row];
+            for col in 0..=row {
+                value += lower[[row, col]] * z[col];
+            }
+            draw[row] = value;
+        }
+        let mut max_dev = 0.0_f64;
+        for i in 0..n_rows {
+            let denom = if se[i] > 0.0 { se[i] } else { f64::INFINITY };
+            let mut draw_diff = 0.0;
+            for j in 0..n_coeff {
+                draw_diff += draw[j] * xd[[i, j]];
+            }
+            let dev = ((draw_diff - diff[i]) / denom).abs();
+            if dev.is_finite() && dev > max_dev {
+                max_dev = dev;
+            }
+        }
+        max_devs.push(max_dev);
+    }
+    difference_quantile(max_devs, level)
+}
+
+fn difference_smooth_json_impl(model_bytes: &[u8], request_json: &str) -> Result<String, String> {
+    let state_json = coefficient_state_json_impl(model_bytes)?;
+    let state: serde_json::Value = serde_json::from_str(&state_json)
+        .map_err(|err| format!("failed to parse coefficient state json: {err}"))?;
+    let request: DifferenceSmoothRequest = serde_json::from_str(request_json)
+        .map_err(|err| format!("failed to parse difference_smooth request json: {err}"))?;
+    if !(0.0 < request.level && request.level < 1.0) {
+        return Err("difference_smooth level must be in (0, 1)".to_string());
+    }
+    if request.n < 2 {
+        return Err("difference_smooth n must be at least 2".to_string());
+    }
+
+    let schema_cols = difference_schema_columns(&state)?;
+    let headers = schema_cols
+        .iter()
+        .map(|column| {
+            column
+                .get("name")
+                .and_then(|raw| raw.as_str())
+                .map(|name| name.to_string())
+                .ok_or_else(|| "saved model schema column is missing name".to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let view_idx = headers.iter().position(|name| name == &request.view).ok_or_else(|| {
+        format!(
+            "view column {:?} not found in model schema: {:?}",
+            request.view, headers
+        )
+    })?;
+    let group = match request.group {
+        Some(group) => group,
+        None => schema_cols
+            .iter()
+            .find_map(|column| {
+                let name = column.get("name").and_then(|raw| raw.as_str())?;
+                let kind = column.get("kind").and_then(|raw| raw.as_str())?;
+                (kind == "categorical" && name != request.view).then(|| name.to_string())
+            })
+            .ok_or_else(|| {
+                "difference_smooth could not infer a categorical group column; pass group="
+                    .to_string()
+            })?,
+    };
+    let group_idx = headers.iter().position(|name| name == &group).ok_or_else(|| {
+        format!(
+            "group column {:?} not found in model schema: {:?}",
+            group, headers
+        )
+    })?;
+    let group_col = &schema_cols[group_idx];
+    let levels = group_col
+        .get("levels")
+        .and_then(|raw| raw.as_array())
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(json_value_to_row_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if levels.len() < 2 {
+        return Err(format!(
+            "group column {group:?} must have at least two saved levels"
+        ));
+    }
+    let pairs = match request.pairs {
+        Some(pairs) => pairs
+            .into_iter()
+            .enumerate()
+            .map(|(idx, pair)| {
+                if pair.len() != 2 {
+                    Err(format!("difference_smooth pairs[{idx}] must contain two levels"))
+                } else {
+                    Ok((pair[0].clone(), pair[1].clone()))
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        None => {
+            let mut out = Vec::new();
+            for i in 0..levels.len() {
+                for j in (i + 1)..levels.len() {
+                    out.push((levels[i].clone(), levels[j].clone()));
+                }
+            }
+            out
+        }
+    };
+
+    let ranges = difference_training_ranges(&state);
+    let (mut lo, mut hi) = ranges.get(view_idx).copied().unwrap_or((0.0, 1.0));
+    if !(lo.is_finite() && hi.is_finite()) || lo == hi {
+        lo = 0.0;
+        hi = 1.0;
+    }
+    let step = (hi - lo) / ((request.n - 1) as f64);
+    let grid = (0..request.n)
+        .map(|idx| lo + step * (idx as f64))
+        .collect::<Vec<_>>();
+
+    let mut template = request
+        .template
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(key, value)| json_value_to_row_string(&value).map(|text| (key, text)))
+        .collect::<BTreeMap<_, _>>();
+    for (idx, column) in schema_cols.iter().enumerate() {
+        let name = &headers[idx];
+        if template.contains_key(name) {
+            continue;
+        }
+        if column
+            .get("kind")
+            .and_then(|raw| raw.as_str())
+            .is_some_and(|kind| kind == "categorical")
+        {
+            let value = column
+                .get("levels")
+                .and_then(|raw| raw.as_array())
+                .and_then(|values| values.first())
+                .and_then(json_value_to_row_string)
+                .unwrap_or_else(|| "0".to_string());
+            template.insert(name.clone(), value);
+        } else {
+            let value = ranges
+                .get(idx)
+                .map(|(a, b)| 0.5 * (a + b))
+                .filter(|value| value.is_finite())
+                .unwrap_or(0.0);
+            template.insert(name.clone(), value.to_string());
+        }
+    }
+
+    let beta = Array1::from_vec(json_f64_vec(&state, "beta")?);
+    let (cov, cov_kind, cov_corrected) = difference_smooth_covariance(&state, beta.len())?;
+    let random_ranges = difference_json_ranges(&state, "random_column_ranges")?;
+    let group_ranges = difference_group_ranges(&state, &group)?;
+    let normal = statrs::distribution::Normal::new(0.0, 1.0)
+        .map_err(|err| format!("failed to construct standard normal: {err}"))?;
+    let pointwise_crit =
+        statrs::distribution::ContinuousCDF::inverse_cdf(&normal, 0.5 + request.level / 2.0);
+    let model = load_model_impl(model_bytes)?;
+    let mut rows_out = Vec::<serde_json::Value>::new();
+
+    for (level_1, level_2) in pairs {
+        let mut rows_left = Vec::with_capacity(grid.len());
+        let mut rows_right = Vec::with_capacity(grid.len());
+        for x in &grid {
+            let mut row_left = template.clone();
+            let mut row_right = template.clone();
+            row_left.insert(request.view.clone(), x.to_string());
+            row_right.insert(request.view.clone(), x.to_string());
+            row_left.insert(group.clone(), level_1.clone());
+            row_right.insert(group.clone(), level_2.clone());
+            rows_left.push(
+                headers
+                    .iter()
+                    .map(|header| row_left.get(header).cloned().unwrap_or_default())
+                    .collect::<Vec<_>>(),
+            );
+            rows_right.push(
+                headers
+                    .iter()
+                    .map(|header| row_right.get(header).cloned().unwrap_or_default())
+                    .collect::<Vec<_>>(),
+            );
+        }
+        let dataset_left = dataset_with_model_schema(&model, &headers, &rows_left)?;
+        let dataset_right = dataset_with_model_schema(&model, &headers, &rows_right)?;
+        let xl = design_matrix_dense(&model, dataset_left)?;
+        let xr = design_matrix_dense(&model, dataset_right)?;
+        let mut xd = &xr - &xl;
+        if request.marginalise_random {
+            zero_design_ranges(&mut xd, &random_ranges);
+        }
+        if !request.group_means {
+            zero_design_ranges(&mut xd, &group_ranges);
+        }
+        let diff = xd.dot(&beta);
+        let tmp = xd.dot(&cov);
+        let mut var = Array1::<f64>::zeros(xd.nrows());
+        for i in 0..xd.nrows() {
+            let mut value = 0.0;
+            for j in 0..xd.ncols() {
+                value += tmp[[i, j]] * xd[[i, j]];
+            }
+            var[i] = value;
+        }
+        let se = var.mapv(|value| value.max(0.0).sqrt());
+        let crit = if request.simultaneous {
+            difference_simultaneous_critical(
+                &beta,
+                &cov,
+                &xd,
+                &diff,
+                &se,
+                request.n_sim,
+                request.seed.unwrap_or(12345),
+                request.level,
+            )?
+        } else {
+            pointwise_crit
+        };
+        for (idx, x) in grid.iter().enumerate() {
+            let lower = diff[idx] - crit * se[idx];
+            let upper = diff[idx] + crit * se[idx];
+            let mut row = serde_json::Map::new();
+            row.insert(request.view.clone(), serde_json::json!(x));
+            row.insert("group".to_string(), serde_json::json!(group));
+            row.insert("level_1".to_string(), serde_json::json!(level_1));
+            row.insert("level_2".to_string(), serde_json::json!(level_2));
+            row.insert("diff".to_string(), serde_json::json!(diff[idx]));
+            row.insert("se".to_string(), serde_json::json!(se[idx]));
+            row.insert("lower".to_string(), serde_json::json!(lower));
+            row.insert("upper".to_string(), serde_json::json!(upper));
+            row.insert("level".to_string(), serde_json::json!(request.level));
+            row.insert(
+                "simultaneous".to_string(),
+                serde_json::json!(request.simultaneous),
+            );
+            row.insert("critical".to_string(), serde_json::json!(crit));
+            row.insert(
+                "covariance_kind".to_string(),
+                serde_json::json!(cov_kind),
+            );
+            row.insert(
+                "covariance_corrected".to_string(),
+                serde_json::json!(cov_corrected),
+            );
+            rows_out.push(serde_json::Value::Object(row));
+        }
+    }
+
+    serde_json::to_string(&rows_out)
+        .map_err(|err| format!("failed to serialize difference_smooth rows: {err}"))
 }
 
 fn json_f64_vec(value: &serde_json::Value, key: &str) -> Result<Vec<f64>, String> {

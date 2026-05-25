@@ -121,11 +121,27 @@ def _build_design_penalty(
     Returns (design (N, M), penalty (M, M)) as float64 torch tensors.
     """
     from .. import duchon_function_norm_penalty
+    from .. import _rust
 
     points = _coerce_2d(points, "points")
     N = points.shape[0]
 
-    if isinstance(smooth, Duchon):
+    # Dispatch decision (which Rust entry to call) lives in Rust as the single
+    # source of truth for supported torch-fit specs. The tensor construction
+    # under each branch stays here because torch autograd VJP must flow back
+    # through `points`, `centers`, and `by`.
+    try:
+        entry = _rust.torch_smooth_dispatch_key(type(smooth).__name__)
+    except ValueError as exc:
+        # Recognised-but-unsupported specs raise NotImplementedError to match
+        # the previous Python cascade. Truly unknown class names raise
+        # TypeError below.
+        message = str(exc)
+        if message.startswith("unknown Smooth subclass"):
+            raise TypeError(message) from exc
+        raise NotImplementedError(message) from exc
+
+    if entry == "duchon":
         centers = _coerce_2d(_to_tensor(smooth.centers, points), "Duchon.centers")
         if centers.shape[1] != points.shape[1]:
             raise ValueError(
@@ -151,7 +167,7 @@ def _build_design_penalty(
         penalty = torch.as_tensor(penalty_np, dtype=torch.float64, device=points.device)
         return design.to(torch.float64), penalty
 
-    if isinstance(smooth, BSpline):
+    if entry == "bspline":
         if points.shape[1] != 1:
             raise ValueError(
                 f"BSpline is 1D-only; got points with d={points.shape[1]}. "
