@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import importlib.util
 import re
 import typing
 from pathlib import Path
@@ -14,6 +15,49 @@ CV_SPLITS = 5
 _SYNTHETIC_PC_PANEL_SEED = 20260329
 _SYNTHETIC_PC_PANEL_ROWS_PER_SUBPOP = 40
 _SYNTHETIC_PC_PANEL: pd.DataFrame | None = None
+
+
+_GAMFIT_RUST_MODULE: typing.Any | None = None
+
+
+def _gamfit_rust() -> typing.Any:
+    global _GAMFIT_RUST_MODULE
+    if _GAMFIT_RUST_MODULE is not None:
+        return _GAMFIT_RUST_MODULE
+    rust_candidates = sorted((ROOT / "gamfit").glob("_rust*.so"))
+    if not rust_candidates:
+        rust_candidates = sorted((ROOT / "gamfit").glob("_rust*.pyd"))
+    if not rust_candidates:
+        raise RuntimeError("gamfit Rust extension is not built")
+    spec = importlib.util.spec_from_file_location("_rust", rust_candidates[0])
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"failed to load gamfit Rust extension from {rust_candidates[0]}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    _GAMFIT_RUST_MODULE = module
+    return module
+
+
+def _matrix_rows(matrix: typing.Any, y: typing.Any, prefix: str = "pc") -> list[dict[str, float]]:
+    x = np.asarray(matrix, dtype=float)
+    y_arr = np.asarray(y, dtype=float).reshape(-1)
+    rows = []
+    for i in range(x.shape[0]):
+        row = {f"{prefix}{j + 1}": float(x[i, j]) for j in range(x.shape[1])}
+        row["y"] = float(y_arr[i])
+        rows.append(row)
+    return rows
+
+
+def _xy_payload(columns: typing.Any, *, prefix: str, family: str = "binomial") -> dict[str, typing.Any]:
+    x = np.asarray(columns["x"], dtype=float)
+    return {
+        "family": family,
+        "rows": _matrix_rows(x, columns["y"], prefix=prefix),
+        "features": [f"{prefix}{i}" for i in range(1, x.shape[1] + 1)],
+        "target": "y",
+    }
+
 
 def _coerce_positive_survival_times(df: pd.DataFrame, time_col: str, dataset_name: str) -> pd.DataFrame:
     time_vals = pd.to_numeric(df[time_col], errors="coerce")
@@ -2116,6 +2160,5 @@ def dataset_for_scenario(s: typing.Any) -> dict[str, typing.Any]:
         ds["_cv_splits"] = int(s["cv_splits"])
     _validate_dataset_schema(ds, scenario_name=name)
     return ds
-
 
 
