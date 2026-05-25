@@ -27953,11 +27953,7 @@ mod tests {
         let mut states: Vec<ParameterBlockState> = Vec::with_capacity(block_count);
         let mut s_lambdas: Vec<Array2<f64>> = Vec::with_capacity(block_count);
         let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(block_count);
-        let names = [
-            "location_block",
-            "scale_block",
-            "marginal_slope_block",
-        ];
+        let names = ["location_block", "scale_block", "marginal_slope_block"];
         let mut offset = 0usize;
         for (b, &width) in block_widths.iter().enumerate() {
             let start = offset;
@@ -28115,8 +28111,7 @@ mod tests {
         let source = JointHessianSource::Dense(h);
         let joint_grad = Array1::<f64>::zeros(total_p);
         let cached_active_sets: Vec<Option<Vec<usize>>> = vec![None; block_count];
-        let block_constraints: Vec<Option<LinearInequalityConstraints>> =
-            vec![None; block_count];
+        let block_constraints: Vec<Option<LinearInequalityConstraints>> = vec![None; block_count];
         let math = JointNewtonMathDiagnostic {
             old_kkt_inf: 0.0,
             linearized_next_kkt_inf: 0.0,
