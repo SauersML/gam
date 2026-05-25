@@ -3,6 +3,7 @@ pub mod cubic_cell_kernel;
 pub mod custom_family;
 pub mod family_meta;
 pub mod gamlss;
+pub mod inner_status;
 pub mod inverse_link;
 pub mod jet_partitions;
 pub mod latent_survival;
