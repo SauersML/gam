@@ -5281,26 +5281,26 @@ impl UnifiedFitResult {
 
     /// Resolve the fitted link state for a given family.
     ///
-    /// For standard (non-adaptive) link families, this enriches the stored
-    /// `FittedLinkState::Standard` with the concrete `LinkFunction` derived
-    /// from the family.  For adaptive links (SAS, BetaLogistic, Mixture) it
-    /// validates that the stored state matches the family and clones it out.
+    /// For standard (non-adaptive) link families, no extra state is fitted, so
+    /// this returns the bare `FittedLinkState::Standard(None)` payload — the
+    /// concrete `LinkFunction` lives on the family/spec and is not duplicated
+    /// into the fitted-link record.  For adaptive links (SAS, BetaLogistic,
+    /// Mixture, LatentCLogLog) it validates that the stored state matches the
+    /// family and clones it out.
     pub fn fitted_link_state(
         &self,
         family: &crate::types::LikelihoodSpec,
     ) -> Result<FittedLinkState, EstimationError> {
         match (&family.response, &family.link) {
-            (ResponseFamily::Gaussian, _) => {
-                Ok(FittedLinkState::Standard(Some(LinkFunction::Identity)))
-            }
+            (ResponseFamily::Gaussian, _) => Ok(FittedLinkState::Standard(None)),
             (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Logit)) => {
-                Ok(FittedLinkState::Standard(Some(LinkFunction::Logit)))
+                Ok(FittedLinkState::Standard(None))
             }
             (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Probit)) => {
-                Ok(FittedLinkState::Standard(Some(LinkFunction::Probit)))
+                Ok(FittedLinkState::Standard(None))
             }
             (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::CLogLog)) => {
-                Ok(FittedLinkState::Standard(Some(LinkFunction::CLogLog)))
+                Ok(FittedLinkState::Standard(None))
             }
             (ResponseFamily::Binomial, InverseLink::LatentCLogLog(_)) => match &self.fitted_link {
                 FittedLinkState::LatentCLogLog { state } => {
@@ -5346,10 +5346,8 @@ impl UnifiedFitResult {
             (ResponseFamily::Poisson, _)
             | (ResponseFamily::Tweedie { .. }, _)
             | (ResponseFamily::NegativeBinomial { .. }, _)
-            | (ResponseFamily::Gamma, _) => Ok(FittedLinkState::Standard(Some(LinkFunction::Log))),
-            (ResponseFamily::Beta { .. }, _) => {
-                Ok(FittedLinkState::Standard(Some(LinkFunction::Logit)))
-            }
+            | (ResponseFamily::Gamma, _) => Ok(FittedLinkState::Standard(None)),
+            (ResponseFamily::Beta { .. }, _) => Ok(FittedLinkState::Standard(None)),
             (ResponseFamily::RoystonParmar, _) => Ok(FittedLinkState::Standard(None)),
         }
     }
