@@ -7,9 +7,24 @@ import os
 import queue
 import tempfile
 import time
-from typing import Any
+from importlib import import_module
+from typing import Any, NoReturn, Protocol, cast
 
-import pytest
+
+class _Pytest(Protocol):
+    def importorskip(
+        self,
+        modname: str,
+        minversion: str | None = None,
+        reason: str | None = None,
+        *,
+        exc_type: type[ImportError] | None = None,
+    ) -> Any: ...
+
+    def fail(self, reason: str = "", pytrace: bool = True) -> NoReturn: ...
+
+
+pytest = cast(_Pytest, import_module("pytest"))
 
 pytest.importorskip("gamfit._rust")
 

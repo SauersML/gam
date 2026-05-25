@@ -167,8 +167,12 @@ class ScalarWeightSchedule:
             "iter_count": int(self.iter_count),
         }
         if self.kind == "geometric":
+            if self.rate is None:
+                raise ValueError("ScalarWeightSchedule geometric rate must be in (0, 1)")
             payload["rate"] = float(self.rate)
         if self.kind == "linear":
+            if self.steps is None:
+                raise ValueError("ScalarWeightSchedule linear steps must be positive")
             payload["steps"] = int(self.steps)
         return payload
 
@@ -297,7 +301,7 @@ class _AnalyticPenalty:
     def _to_rust_payload(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "kind": type(self).KIND_TAG,
-            "target": _target_descriptor(self.target),
+            "target": _target_descriptor(getattr(self, "target")),
         }
         payload.update(self._payload_extras())
         return _add_weight_schedule(payload, self)

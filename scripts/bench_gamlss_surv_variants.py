@@ -65,7 +65,18 @@ def fit_variant(
     t0 = time.perf_counter()
     try:
         import gamfit
-        gamfit.fit(data, formula, **fit_kwargs)
+
+        gamfit.fit(
+            data,
+            formula,
+            survival_likelihood=fit_kwargs.get("survival_likelihood"),
+            baseline_target=fit_kwargs.get("baseline_target"),
+            baseline_scale=fit_kwargs.get("baseline_scale"),
+            baseline_shape=fit_kwargs.get("baseline_shape"),
+            baseline_rate=fit_kwargs.get("baseline_rate"),
+            baseline_makeham=fit_kwargs.get("baseline_makeham"),
+            config=fit_kwargs.get("config"),
+        )
         dt = time.perf_counter() - t0
         return label, dt, True, None
     except Exception as exc:

@@ -527,8 +527,10 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
             "predict",
             "predict_array",
             "interpolate_survival_surface",
+            "write_survival_csv",
             "default_survival_time_grid",
             "competing_risks_cif",
+            "competing_risks_prediction_payload_from_json",
             "sample",
             "summary",
             "summary_html",
@@ -567,7 +569,6 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
             "skip_transcoder_select_reml",
             "_block_diag",
             "tierney_kadane_normalized_score",
-            "arrow_schur_newton_step",
             "gaussian_reml_fit_formula_table",
             "gaussian_reml_fit_with_constraints_forward",
             "gaussian_reml_fit_with_constraints_backward",
@@ -878,7 +879,12 @@ fn write_survival_csv(
     order.sort_by(|left, right| left.0.partial_cmp(&right.0).unwrap_or(Ordering::Equal));
     let sorted_grid: Vec<f64> = order.iter().map(|(value, _index)| *value).collect();
     let sorted_indices: Vec<usize> = order.iter().map(|(_value, index)| *index).collect();
-    let surface_values: Vec<f64> = surface_view.iter().copied().collect();
+    let mut surface_values = Vec::with_capacity(n_rows * n_cols);
+    for row_idx in 0..n_rows {
+        for col_idx in 0..n_cols {
+            surface_values.push(surface_view[[row_idx, col_idx]]);
+        }
+    }
     let times_values: Vec<f64> = times.as_array().iter().copied().collect();
     let path_owned = path.to_string();
 
@@ -1221,6 +1227,37 @@ fn vec_to_array1_f64<'py>(py: Python<'py>, values: Vec<f64>) -> PyResult<Py<PyAr
     Ok(Array1::from_vec(values).into_pyarray(py).unbind())
 }
 
+fn python_string_repr(value: &str) -> String {
+    let quote = if value.contains('\'') && !value.contains('"') {
+        '"'
+    } else {
+        '\''
+    };
+    let mut repr = String::with_capacity(value.len() + 2);
+    repr.push(quote);
+    for ch in value.chars() {
+        match ch {
+            '\\' => repr.push_str("\\\\"),
+            '\t' => repr.push_str("\\t"),
+            '\n' => repr.push_str("\\n"),
+            '\r' => repr.push_str("\\r"),
+            '\'' if quote == '\'' => repr.push_str("\\'"),
+            '"' if quote == '"' => repr.push_str("\\\""),
+            other => repr.push(other),
+        }
+    }
+    repr.push(quote);
+    repr
+}
+
+fn python_float_display(value: f64) -> String {
+    if value.is_finite() && value.fract() == 0.0 && value.abs() < 1.0e16 {
+        format!("{value:.1}")
+    } else {
+        value.to_string()
+    }
+}
+
 #[pyfunction]
 fn default_survival_time_grid(
     model_class: &str,
@@ -1273,31 +1310,35 @@ fn default_survival_time_grid(
     let entry_idx = entry_idx.unwrap();
     let exit_idx = exit_idx.unwrap();
 
+    let entry_name_repr = python_string_repr(entry_name);
+    let exit_name_repr = python_string_repr(exit_name);
     let mut lo = f64::INFINITY;
     let mut hi = f64::NEG_INFINITY;
     let mut observed = false;
     for (row_index, row) in rows.iter().enumerate() {
         let entry_cell = row.get(entry_idx).ok_or_else(|| {
             py_value_error(format!(
-                "survival entry column {entry_name:?} is missing at row {}",
+                "survival entry column {entry_name_repr} is missing at row {}",
                 row_index + 1
             ))
         })?;
         let exit_cell = row.get(exit_idx).ok_or_else(|| {
             py_value_error(format!(
-                "survival exit column {exit_name:?} is missing at row {}",
+                "survival exit column {exit_name_repr} is missing at row {}",
                 row_index + 1
             ))
         })?;
-        let entry_value = entry_cell.parse::<f64>().map_err(|_err| {
+        let entry_value = entry_cell.parse::<f64>().map_err(|_| {
+            let entry_cell_repr = python_string_repr(entry_cell);
             py_value_error(format!(
-                "survival entry column {entry_name:?} has a non-numeric value at row {}: {entry_cell:?}",
+                "survival entry column {entry_name_repr} has a non-numeric value at row {}: {entry_cell_repr}",
                 row_index + 1
             ))
         })?;
-        let exit_value = exit_cell.parse::<f64>().map_err(|_err| {
+        let exit_value = exit_cell.parse::<f64>().map_err(|_| {
+            let exit_cell_repr = python_string_repr(exit_cell);
             py_value_error(format!(
-                "survival exit column {exit_name:?} has a non-numeric value at row {}: {exit_cell:?}",
+                "survival exit column {exit_name_repr} has a non-numeric value at row {}: {exit_cell_repr}",
                 row_index + 1
             ))
         })?;
@@ -1314,8 +1355,10 @@ fn default_survival_time_grid(
         return Ok(None);
     }
     if hi <= lo {
+        let lo_display = python_float_display(lo);
+        let hi_display = python_float_display(hi);
         return Err(py_value_error(format!(
-            "survival exit times must extend beyond entry times; got min entry {lo} and max exit {hi}"
+            "survival exit times must extend beyond entry times; got min entry {lo_display} and max exit {hi_display}"
         )));
     }
     let span = hi - lo;
@@ -1514,6 +1557,85 @@ fn competing_risks_cif_impl(
     let result = gam::survival::assemble_competing_risks_cif(times, cumulative_hazard.view())
         .map_err(|err| err.to_string())?;
     Ok((result.cif, result.overall_survival))
+}
+
+#[pyfunction]
+fn competing_risks_cif_from_predictions<'py>(
+    py: Python<'py>,
+    times: PyReadonlyArray1<'py, f64>,
+    cumulative_hazards: Vec<PyReadonlyArray2<'py, f64>>,
+    endpoint_names: Vec<String>,
+) -> PyResult<(PyObject, PyObject)> {
+    if cumulative_hazards.is_empty() {
+        return Err(py_value_error(
+            "competing_risks_cif requires at least one endpoint prediction",
+        ));
+    }
+    if endpoint_names.len() != cumulative_hazards.len() {
+        return Err(py_value_error(
+            "endpoint_names must match the number of endpoint predictions",
+        ));
+    }
+    let unique_endpoint_names = endpoint_names.iter().collect::<BTreeSet<_>>();
+    if unique_endpoint_names.len() != endpoint_names.len() {
+        return Err(py_value_error("endpoint_names must be unique"));
+    }
+
+    let time_values = times.as_array().to_owned();
+    if time_values.iter().any(|time| !time.is_finite()) {
+        return Err(py_value_error("time grid must contain only finite values"));
+    }
+
+    let expected_shape = cumulative_hazards[0].as_array().dim();
+    for cumulative_hazard in cumulative_hazards.iter().skip(1) {
+        if cumulative_hazard.as_array().dim() != expected_shape {
+            return Err(py_value_error(
+                "all endpoint predictions must return the same (n_rows, n_times) shape",
+            ));
+        }
+    }
+
+    let cumulative_hazard_values = cumulative_hazards
+        .iter()
+        .map(|hazard| hazard.as_array().to_owned())
+        .collect::<Vec<_>>();
+    let (cif, overall_survival) = detach_py_result(
+        py,
+        "competing_risks_cif_from_predictions",
+        move || {
+            competing_risks_cif_from_predictions_impl(
+                time_values.view(),
+                &cumulative_hazard_values,
+            )
+        },
+    )?;
+    let cif_arrays = PyList::empty(py);
+    for endpoint_cif in cif {
+        cif_arrays.append(endpoint_cif.into_pyarray(py))?;
+    }
+    Ok((
+        cif_arrays.unbind().into_any(),
+        overall_survival.into_pyarray(py).unbind().into_any(),
+    ))
+}
+
+fn competing_risks_cif_from_predictions_impl(
+    times: ArrayView1<'_, f64>,
+    cumulative_hazards: &[Array2<f64>],
+) -> Result<(Vec<Array2<f64>>, Array2<f64>), String> {
+    let endpoint_views = cumulative_hazards
+        .iter()
+        .map(|hazard| hazard.view())
+        .collect::<Vec<_>>();
+    let result =
+        gam::survival::assemble_competing_risks_cif_from_endpoints(times, &endpoint_views)
+            .map_err(|err| err.to_string())?;
+    let cif = result
+        .cif
+        .axis_iter(Axis(0))
+        .map(|endpoint_cif| endpoint_cif.to_owned())
+        .collect::<Vec<_>>();
+    Ok((cif, result.overall_survival))
 }
 
 #[pyfunction]
@@ -2904,7 +3026,7 @@ fn extract_float_metadata_from_view(
 ) -> PyResult<Option<f64>> {
     match view {
         RemlFitView::SavedSummary(payload) => Ok(json_lookup_f64(payload, keys)),
-        RemlFitView::PythonObject(fit) => {
+        RemlFitView::PythonObject(_) => {
             let Some(value) = extract_py_metadata_value(view, keys)? else {
                 return Ok(None);
             };
@@ -8344,191 +8466,6 @@ fn glm_reml_fit_latent_backward<'py>(
     Ok(out.unbind())
 }
 
-// ---------------------------------------------------------------------------
-// Arrow-Schur joint (t, β) Newton step — thin pyffi wrapper
-// ---------------------------------------------------------------------------
-//
-// See `src/solver/arrow_schur.rs` (and `proposals/latent_coord.md` §4 +
-// `proposals/composition_engine.md` §7 audit revisions).
-//
-// Exposes the per-observation arrow-Schur Newton-direction solver to
-// Python for testing and for downstream prototypes to validate the
-// inner-loop math before the full REML driver wires up auto-dispatch.
-// The bordered system is supplied as packed arrays:
-//
-//   * `htt_blocks`    — shape `(N, d, d)` per-row latent Hessian blocks.
-//   * `htbeta_blocks` — shape `(N, d, K)` per-row cross-blocks.
-//   * `gt_blocks`     — shape `(N, d)` per-row latent gradient.
-//   * `hbb`           — shape `(K, K)` β Hessian.
-//   * `gb`            — shape `(K,)` β gradient.
-//
-// Returns `delta_t (N*d,)` and `delta_beta (K,)` — the *negated*
-// solutions of `H · x = -g`, matching the sign convention of
-// `solve_newton_direction_dense`.
-#[pyfunction(signature = (
-    htt_blocks,
-    htbeta_blocks,
-    gt_blocks,
-    hbb,
-    gb,
-    ridge_t = 0.0,
-    ridge_beta = 0.0,
-))]
-fn arrow_schur_newton_step<'py>(
-    py: Python<'py>,
-    htt_blocks: PyReadonlyArray3<'py, f64>,
-    htbeta_blocks: PyReadonlyArray3<'py, f64>,
-    gt_blocks: PyReadonlyArray2<'py, f64>,
-    hbb: PyReadonlyArray2<'py, f64>,
-    gb: PyReadonlyArray1<'py, f64>,
-    ridge_t: f64,
-    ridge_beta: f64,
-) -> PyResult<Py<PyDict>> {
-    use gam::solver::arrow_schur::{
-        ArrowRowBlock, ArrowSchurSystem, ArrowSolveOptions, solve_arrow_newton_step_core,
-    };
-    let htt = htt_blocks.as_array();
-    let htb = htbeta_blocks.as_array();
-    let gt = gt_blocks.as_array();
-    let hbb_v = hbb.as_array();
-    let gb_v = gb.as_array();
-    let n = htt.shape()[0];
-    let d = htt.shape()[1];
-    let k = hbb_v.shape()[0];
-    if htt.shape()[2] != d {
-        return Err(py_value_error(format!(
-            "htt_blocks must be (N, d, d); got {:?}",
-            htt.shape()
-        )));
-    }
-    if htb.shape() != [n, d, k] {
-        return Err(py_value_error(format!(
-            "htbeta_blocks must be ({n}, {d}, {k}); got {:?}",
-            htb.shape()
-        )));
-    }
-    if gt.shape() != [n, d] {
-        return Err(py_value_error(format!(
-            "gt_blocks must be ({n}, {d}); got {:?}",
-            gt.shape()
-        )));
-    }
-    if hbb_v.shape() != [k, k] {
-        return Err(py_value_error(format!(
-            "hbb must be ({k}, {k}); got {:?}",
-            hbb_v.shape()
-        )));
-    }
-    if gb_v.len() != k {
-        return Err(py_value_error(format!(
-            "gb length {} must equal K = {}",
-            gb_v.len(),
-            k
-        )));
-    }
-    let mut sys = ArrowSchurSystem::new(n, d, k);
-    for i in 0..n {
-        let mut block = ArrowRowBlock::new(d, k);
-        for a in 0..d {
-            for b in 0..d {
-                block.htt[[a, b]] = htt[[i, a, b]];
-            }
-            for j in 0..k {
-                block.htbeta[[a, j]] = htb[[i, a, j]];
-            }
-            block.gt[a] = gt[[i, a]];
-        }
-        sys.rows[i] = block;
-    }
-    for a in 0..k {
-        for b in 0..k {
-            sys.hbb[[a, b]] = hbb_v[[a, b]];
-        }
-        sys.gb[a] = gb_v[a];
-    }
-    let solve_options = ArrowSolveOptions::automatic(sys.k);
-    let (delta_t, delta_beta) =
-        solve_arrow_newton_step_core(&sys, ridge_t, ridge_beta, &solve_options)
-            .map_err(|e| py_value_error(format!("arrow-Schur solve: {e}")))?;
-    let out = PyDict::new(py);
-    out.set_item("delta_t", delta_t.into_pyarray(py))?;
-    out.set_item("delta_beta", delta_beta.into_pyarray(py))?;
-    Ok(out.unbind())
-}
-
-#[pyfunction(signature = (
-    n_obs = 10_000,
-    n_atoms = 100_000,
-    latent_dim = 2,
-    beta_dim = 8,
-    chunk_size = 4096,
-))]
-fn streaming_arrow_schur_synthetic_demo<'py>(
-    py: Python<'py>,
-    n_obs: usize,
-    n_atoms: usize,
-    latent_dim: usize,
-    beta_dim: usize,
-    chunk_size: usize,
-) -> PyResult<Py<PyDict>> {
-    use gam::solver::arrow_schur::{
-        ArrowRowBlock, ArrowSolveOptions, ArrowSolverMode, StreamingArrowRowBuilder,
-        StreamingArrowSchur,
-    };
-    if n_obs == 0 || n_atoms == 0 || latent_dim == 0 || beta_dim == 0 || chunk_size == 0 {
-        return Err(py_value_error(
-            "streaming Arrow-Schur demo dimensions must be positive".to_string(),
-        ));
-    }
-    let hbb = Array2::<f64>::eye(beta_dim).mapv(|v| v * (n_obs as f64 + 10.0));
-    let mut gb = Array1::<f64>::zeros(beta_dim);
-    for j in 0..beta_dim {
-        gb[j] = ((j + 1) as f64).sin() * 0.01;
-    }
-    let row_builder: StreamingArrowRowBuilder = std::sync::Arc::new(move |atom| {
-        let mut row = ArrowRowBlock::new(latent_dim, beta_dim);
-        let scale = 1.0 + (atom % n_obs) as f64 / n_obs as f64;
-        for a in 0..latent_dim {
-            row.htt[[a, a]] = 2.0 + scale + 0.05 * a as f64;
-            row.gt[a] = ((atom + a + 1) as f64 * 0.001).sin() * 0.001;
-            for b in 0..a {
-                let v = 0.01 / ((a + b + 1) as f64);
-                row.htt[[a, b]] = v;
-                row.htt[[b, a]] = v;
-            }
-            for j in 0..beta_dim {
-                let phase = ((atom + 1) * (j + 3) + a + 5) as f64;
-                row.htbeta[[a, j]] = 0.002 * phase.sin();
-            }
-        }
-        Ok(row)
-    });
-    let mut streaming = StreamingArrowSchur::new(
-        n_atoms,
-        latent_dim,
-        beta_dim,
-        hbb,
-        gb,
-        row_builder,
-        chunk_size,
-    );
-    let mut options = ArrowSolveOptions::direct();
-    options.mode = ArrowSolverMode::Direct;
-    options.streaming_chunk_size = Some(chunk_size);
-    let (delta_t, delta_beta, _) = streaming
-        .solve(1.0e-6, 1.0e-6, &options)
-        .map_err(|e| py_value_error(format!("streaming Arrow-Schur demo: {e}")))?;
-    let out = PyDict::new(py);
-    out.set_item("n_obs", n_obs)?;
-    out.set_item("n_atoms", n_atoms)?;
-    out.set_item("latent_dim", latent_dim)?;
-    out.set_item("beta_dim", beta_dim)?;
-    out.set_item("chunk_size", chunk_size)?;
-    out.set_item("delta_t_norm", delta_t.dot(&delta_t).sqrt())?;
-    out.set_item("delta_beta_norm", delta_beta.dot(&delta_beta).sqrt())?;
-    Ok(out.unbind())
-}
-
 fn gaussian_reml_result_to_pydict<'py>(
     py: Python<'py>,
     fit: gam::gaussian_reml::GaussianRemlMultiResult,
@@ -11339,36 +11276,6 @@ fn rg_normalize_sphere_matrix(values: ArrayView2<'_, f64>) -> Result<Array2<f64>
     Ok(out)
 }
 
-fn rg_normalize_weights(
-    n: usize,
-    weights: Option<ArrayView1<'_, f64>>,
-) -> Result<Array1<f64>, String> {
-    match weights {
-        None => Ok(Array1::from_elem(n, 1.0 / n as f64)),
-        Some(w) => {
-            if w.len() != n {
-                return Err("weights length must match the number of rows".to_string());
-            }
-            let mut total = 0.0_f64;
-            for value in w.iter() {
-                if !value.is_finite() || *value < 0.0 {
-                    return Err(
-                        "weights must be finite, non-negative, and have positive total"
-                            .to_string(),
-                    );
-                }
-                total += *value;
-            }
-            if total <= 0.0 {
-                return Err(
-                    "weights must be finite, non-negative, and have positive total".to_string(),
-                );
-            }
-            Ok(w.mapv(|v| v / total))
-        }
-    }
-}
-
 fn rg_closure_impl(values: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
     rg_validate_array(values, "simplex values")?;
     let (n, d) = values.dim();
@@ -12169,6 +12076,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(build_info, module)?)?;
     module.add_function(wrap_pyfunction!(interpolate_survival_surface, module)?)?;
     module.add_function(wrap_pyfunction!(interpolate_rows, module)?)?;
+    module.add_function(wrap_pyfunction!(write_survival_csv, module)?)?;
     module.add_function(wrap_pyfunction!(survival_coerce_times, module)?)?;
     module.add_function(wrap_pyfunction!(survival_parameters_matrix, module)?)?;
     module.add_function(wrap_pyfunction!(survival_collect_chunks, module)?)?;
@@ -12197,6 +12105,10 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(predict_table, module)?)?;
     module.add_function(wrap_pyfunction!(predict_array, module)?)?;
     module.add_function(wrap_pyfunction!(competing_risks_cif, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        competing_risks_cif_from_predictions,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(sample_table, module)?)?;
     module.add_function(wrap_pyfunction!(design_matrix_table, module)?)?;
     module.add_function(wrap_pyfunction!(design_matrix_array, module)?)?;
@@ -12295,11 +12207,6 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(gaussian_reml_fit_latent_backward, module)?)?;
     module.add_function(wrap_pyfunction!(glm_reml_fit_latent, module)?)?;
     module.add_function(wrap_pyfunction!(glm_reml_fit_latent_backward, module)?)?;
-    module.add_function(wrap_pyfunction!(arrow_schur_newton_step, module)?)?;
-    module.add_function(wrap_pyfunction!(
-        streaming_arrow_schur_synthetic_demo,
-        module
-    )?)?;
     module.add_function(wrap_pyfunction!(posterior_predict_table, module)?)?;
     module.add_function(wrap_pyfunction!(posterior_predict_bands_table, module)?)?;
     module.add_function(wrap_pyfunction!(posterior_eta_bands, module)?)?;
@@ -13672,7 +13579,7 @@ fn posterior_credible_interval_impl(
     n_coeffs: usize,
     level: f64,
 ) -> Result<Vec<f64>, String> {
-    posterior_bands::posterior_credible_interval(samples_flat, n_draws, n_coeffs, level)
+    gam::inference::posterior::credible_interval(&samples_flat, n_draws, n_coeffs, level)
 }
 
 fn posterior_eta_bands_impl(

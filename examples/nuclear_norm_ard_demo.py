@@ -18,7 +18,7 @@ def main() -> None:
         family="gaussian",
         latents={"t": gamfit.LatentCoord(n=n, d=4, init=t)},
         penalties=[
-            gamfit.NuclearNormPenalty(1.0, n_eff=n, target="t"),
+            gamfit.NuclearNormPenalty(weight=1.0, n_eff=n, target="t"),
             gamfit.ARDPenalty(target="t"),
         ],
     )

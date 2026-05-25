@@ -7,30 +7,13 @@ class _FakeRustModule:
     def __init__(self):
         self.assignment_kinds = []
 
-    def periodic_basis_with_jet(self, t, n_harmonics):
-        x = np.mod(np.asarray(t, dtype=float), 1.0)
-        cols = [np.ones_like(x)]
-        dcols = [np.zeros_like(x)]
-        penalty_diag = [1e-8]
-        for h in range(1, int(n_harmonics) + 1):
-            angle = 2.0 * np.pi * h * x
-            cols.extend([np.sin(angle), np.cos(angle)])
-            dcols.extend([2.0 * np.pi * h * np.cos(angle), -2.0 * np.pi * h * np.sin(angle)])
-            penalty_diag.extend([float(h**4), float(h**4)])
-        return np.stack(cols, axis=1), np.stack(dcols, axis=1)[:, :, None], np.diag(penalty_diag)
-
-    def sae_manifold_fit(
+    def sae_manifold_fit_minimal(
         self,
         z,
+        k_atoms,
         atom_basis,
         atom_dim,
-        basis_values,
-        basis_jacobian,
-        basis_sizes,
-        decoder_coefficients,
-        smooth_penalties,
-        initial_logits,
-        initial_coords,
+        assignment_kind,
         alpha,
         tau,
         learnable_alpha,
@@ -38,28 +21,30 @@ class _FakeRustModule:
         smoothness,
         max_iter,
         learning_rate,
+        random_state,
+        top_k,
         *,
-        assignment_kind=None,
         gumbel_schedule=None,
-        analytic_penalties=None,
     ):
+        assert k_atoms == 2
         assert assignment_kind == "softmax"
+        assert learnable_alpha is False
         assert max_iter == 1
+        assert random_state == 4
+        assert top_k is None
+        assert gumbel_schedule is None
         self.assignment_kinds.append(assignment_kind)
-        logits = np.asarray(initial_logits, dtype=float)
+        logits = np.array([[0.2, -0.1], [0.4, 0.0], [-0.2, 0.5], [0.1, 0.3]], dtype=float)
         weights = np.exp(logits / float(tau))
         assignments = weights / weights.sum(axis=1, keepdims=True)
         atoms = []
         for atom, dim in enumerate(atom_dim):
-            m = int(basis_sizes[atom])
-            decoder = np.asarray(decoder_coefficients[atom, :m, :], dtype=float).copy()
-            if not np.any(decoder):
-                decoder[:, :] = 0.1 * float(atom + 1)
+            decoder = np.full((2, z.shape[1]), 0.1 * float(atom + 1))
             atoms.append(
                 {
                     "decoder_B": decoder,
                     "basis_kind": atom_basis[atom],
-                    "on_atom_coords_t": np.asarray(initial_coords[atom, :, :dim], dtype=float).copy(),
+                    "on_atom_coords_t": np.full((z.shape[0], dim), 0.1 * float(atom + 1)),
                     "assignments_z": assignments[:, atom],
                     "active_dim": int(dim),
                 }
@@ -83,24 +68,19 @@ def test_softmax_fixed_k_dispatches_to_rust(monkeypatch):
     monkeypatch.setattr(sae, "rust_module", lambda: fake)
     z = np.array([[0.0, 0.2], [0.3, -0.1], [0.8, 0.5], [1.1, 0.9]])
 
-    fit = sae._fit_fixed_k(
+    fit = sae.sae_manifold_fit(
         z,
-        2,
-        "periodic",
-        1,
-        1.0,
-        1.0,
-        "softmax",
-        1.0,
-        False,
-        0.7,
-        None,
+        K=2,
+        atom_topology="periodic",
+        d_atom=1,
+        assignment="softmax",
+        alpha=1.0,
+        tau=0.7,
         max_iter=1,
         learning_rate=0.1,
         random_state=4,
-        penalties=None,
     )
 
     assert fake.assignment_kinds == ["softmax"]
-    assert fit.chosen_k == 2
+    assert fit.low_level.chosen_k == 2
     assert fit.assignments.shape == (z.shape[0], 2)

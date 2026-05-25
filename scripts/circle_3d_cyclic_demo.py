@@ -35,7 +35,7 @@ def make_circle_3d(n: int = 220, seed: int = 0) -> tuple[np.ndarray, ...]:
     return theta, noisy[0], noisy[1], noisy[2], clean[0], clean[1], clean[2]
 
 
-def predict_curve(models: list[object], n_grid: int = 401) -> tuple[np.ndarray, ...]:
+def predict_curve(models: list[gamfit.Model], n_grid: int = 401) -> tuple[np.ndarray, ...]:
     grid = np.linspace(0.0, 2.0 * np.pi, n_grid)
     payload = {"theta": grid.tolist()}
     fits = [
