@@ -11529,6 +11529,23 @@ fn posterior_credible_interval(
 }
 
 #[pyfunction]
+fn posterior_coefficient_names_json(request_json: &str) -> PyResult<String> {
+    posterior_coefficient_names_json_impl(request_json).map_err(py_value_error)
+}
+
+#[pyfunction]
+fn posterior_samples_summary_json(py: Python<'_>, request_json: String) -> PyResult<String> {
+    detach_py_result(py, "posterior_samples_summary_json", move || {
+        posterior_samples_summary_json_impl(&request_json)
+    })
+}
+
+#[pyfunction]
+fn posterior_trace_selection_json(request_json: &str) -> PyResult<String> {
+    posterior_trace_selection_json_impl(request_json).map_err(py_value_error)
+}
+
+#[pyfunction]
 fn apply_inverse_link_array(
     py: Python<'_>,
     eta: Vec<f64>,
