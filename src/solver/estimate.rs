@@ -3890,6 +3890,29 @@ pub struct FitOptions {
     pub kronecker_factored: Option<crate::basis::KroneckerFactoredBasis>,
 }
 
+impl Default for FitOptions {
+    fn default() -> Self {
+        Self {
+            latent_cloglog: None,
+            mixture_link: None,
+            optimize_mixture: false,
+            sas_link: None,
+            optimize_sas: false,
+            compute_inference: true,
+            max_iter: 100,
+            tol: 1e-6,
+            nullspace_dims: Vec::new(),
+            linear_constraints: None,
+            firth_bias_reduction: false,
+            adaptive_regularization: None,
+            penalty_shrinkage_floor: Some(1e-6),
+            rho_prior: crate::types::RhoPrior::default(),
+            kronecker_penalty_system: None,
+            kronecker_factored: None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AdaptiveRegularizationOptions {
     pub enabled: bool,
