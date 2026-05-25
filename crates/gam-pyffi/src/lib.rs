@@ -79,7 +79,8 @@ use gam::terms::{
     JumpReLUPenalty, MaternBasisGradientTarget, MechanismSparsityPenalty, NuclearNormPenalty,
     OrthogonalityPenalty, ParametricRowPrecisionPriorPenalty, PenaltyConcavity, PenaltyTier,
     PsiSlice, RowPrecisionPriorPenalty, ScadMcpPenalty, ScalarWeightSchedule,
-    SoftmaxAssignmentSparsityPenalty, SparsityPenalty, StreamingMaternBasisGradientEvaluator,
+    SoftmaxAssignmentSparsityPenalty, SparsityPenalty as CoreSparsityPenalty,
+    StreamingMaternBasisGradientEvaluator,
     TopKActivationPenalty, TotalVariationPenalty,
 };
 use gam::transformation_normal::TransformationNormalFitResult;
@@ -90,9 +91,9 @@ use numpy::{
     IntoPyArray, PyArray1, PyArray2, PyArray3, PyReadonlyArray1, PyReadonlyArray2,
     PyReadonlyArray3, PyReadonlyArray4, PyReadonlyArrayDyn,
 };
-use pyo3::exceptions::{PyNotImplementedError, PyTypeError, PyValueError};
+use pyo3::exceptions::{PyKeyError, PyNotImplementedError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyBytes, PyDict, PyFloat, PyList, PyTuple};
+use pyo3::types::{PyAny, PyBytes, PyDict, PyFloat, PyList, PyString, PyTuple};
 use rayon::prelude::*;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -1174,6 +1175,20 @@ fn marginal_slope_clip_probabilities(values: Vec<f64>) -> PyResult<Vec<f64>> {
 }
 
 #[pyfunction]
+fn transformation_normal_z_from_columns(columns_json: &str) -> PyResult<Vec<f64>> {
+    let columns: BTreeMap<String, Vec<f64>> = serde_json::from_str(columns_json)
+        .map_err(|err| py_value_error(format!("invalid prediction columns json: {err}")))?;
+    for key in ["z", "z_score", "transformed", "eta", "mean"] {
+        if let Some(values) = columns.get(key) {
+            return Ok(values.clone());
+        }
+    }
+    Err(PyKeyError::new_err(
+        "transformation-normal prediction payload is missing a z-score column",
+    ))
+}
+
+#[pyfunction]
 fn column_stack_f64<'py>(
     py: Python<'py>,
     columns: Vec<Vec<f64>>,
@@ -1302,7 +1317,7 @@ fn default_survival_time_grid(
         _ => return Ok(None),
     }
 
-    let re = Regex::new(r"^\s*Surv\s*\(\s*([^\s,]+)\s*,\s*([^\s,]+)\s*,\s*[^\s,]+\s*\)")
+    let re = Regex::new(r"\s*Surv\s*\(\s*([^\s,]+)\s*,\s*([^\s,]+)\s*,\s*[^\s,]+\s*\)")
         .map_err(|err| py_value_error(format!("invalid survival formula regex: {err}")))?;
     let Some(captures) = re.captures(formula) else {
         return Ok(None);
@@ -1452,6 +1467,22 @@ fn load_model(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<()> {
     detach_py_result(py, "load_model", move || {
         load_model_impl(&model_bytes).map(drop)
     })
+}
+
+#[pyfunction]
+fn saved_model_payload_string(model_bytes: Vec<u8>, key: &str) -> PyResult<Option<String>> {
+    let saved: serde_json::Value = serde_json::from_slice(&model_bytes)
+        .map_err(|err| PyValueError::new_err(format!("saved model payload must be JSON: {err}")))?;
+    let payload = saved
+        .get("payload")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| {
+            PyValueError::new_err("saved model payload is missing its payload object")
+        })?;
+    Ok(payload.get(key).map(|value| match value {
+        serde_json::Value::String(text) => text.clone(),
+        other => other.to_string(),
+    }))
 }
 
 #[pyfunction]
@@ -10938,6 +10969,13 @@ fn coefficient_state_json(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<Stri
 }
 
 #[pyfunction]
+fn term_blocks_for_model(
+    model_bytes: Vec<u8>,
+) -> PyResult<Vec<(String, String, usize, usize)>> {
+    term_blocks_for_model_impl(&model_bytes).map_err(PyValueError::new_err)
+}
+
+#[pyfunction]
 fn difference_smooth_json(
     py: Python<'_>,
     model_bytes: Vec<u8>,
@@ -12129,6 +12167,10 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(survival_ffi_surface, module)?)?;
     module.add_function(wrap_pyfunction!(numeric_matrix_f64, module)?)?;
     module.add_function(wrap_pyfunction!(marginal_slope_clip_probabilities, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        transformation_normal_z_from_columns,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(column_stack_f64, module)?)?;
     module.add_function(wrap_pyfunction!(flat_to_matrix_f64, module)?)?;
     module.add_function(wrap_pyfunction!(vec_to_array1_f64, module)?)?;
@@ -12138,6 +12180,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(fit_table, module)?)?;
     module.add_function(wrap_pyfunction!(fit_array, module)?)?;
     module.add_function(wrap_pyfunction!(load_model, module)?)?;
+    module.add_function(wrap_pyfunction!(saved_model_payload_string, module)?)?;
     module.add_function(wrap_pyfunction!(extend_model_with_group, module)?)?;
     module.add_function(wrap_pyfunction!(validate_formula_json, module)?)?;
     module.add_function(wrap_pyfunction!(
@@ -12261,6 +12304,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(summary_repr, module)?)?;
     module.add_function(wrap_pyfunction!(summary_html, module)?)?;
     module.add_function(wrap_pyfunction!(coefficient_state_json, module)?)?;
+    module.add_function(wrap_pyfunction!(term_blocks_for_model, module)?)?;
     module.add_function(wrap_pyfunction!(difference_smooth_json, module)?)?;
     module.add_function(wrap_pyfunction!(
         cross_fit_shared_precision_groups_json,
@@ -13979,12 +14023,17 @@ struct CoefficientStatePayload {
     group_metadata: Option<GroupMetadata>,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 struct TermBlock {
     name: String,
     kind: String,
     start: usize,
     end: usize,
+}
+
+#[derive(Deserialize)]
+struct TermBlocksPayload {
+    term_blocks: Vec<TermBlock>,
 }
 
 #[derive(Serialize)]
@@ -14231,6 +14280,25 @@ fn coefficient_state_json_impl(model_bytes: &[u8]) -> Result<String, String> {
     };
     serde_json::to_string(&out)
         .map_err(|err| format!("failed to serialize coefficient state: {err}"))
+}
+
+fn term_blocks_for_model_impl(
+    model_bytes: &[u8],
+) -> Result<Vec<(String, String, usize, usize)>, String> {
+    let state_json = coefficient_state_json_impl(model_bytes)?;
+    let payload: TermBlocksPayload = serde_json::from_str(&state_json)
+        .map_err(|err| format!("failed to parse coefficient state json: {err}"))?;
+    let mut blocks = Vec::with_capacity(payload.term_blocks.len());
+    for (idx, block) in payload.term_blocks.into_iter().enumerate() {
+        if block.end < block.start {
+            return Err(format!(
+                "term block {idx} has invalid range [{}, {})",
+                block.start, block.end
+            ));
+        }
+        blocks.push((block.name, block.kind, block.start, block.end));
+    }
+    Ok(blocks)
 }
 
 #[derive(Deserialize)]
@@ -15707,10 +15775,10 @@ fn build_analytic_penalty_registry_from_json(
                     .replace('-', "_");
                 let mut penalty = match sparsity_kind.as_str() {
                     "smooth_l1" | "smoothed_l1" => {
-                        SparsityPenalty::smoothed_l1(PenaltyTier::Psi, eps)
+                        CoreSparsityPenalty::smoothed_l1(PenaltyTier::Psi, eps)
                     }
-                    "log" => SparsityPenalty::log(PenaltyTier::Psi, eps),
-                    "hoyer" => Ok(SparsityPenalty::hoyer(PenaltyTier::Psi)),
+                    "log" => CoreSparsityPenalty::log(PenaltyTier::Psi, eps),
+                    "hoyer" => Ok(CoreSparsityPenalty::hoyer(PenaltyTier::Psi)),
                     other => Err(format!(
                         "{context}.sparsity_kind must be smooth_l1, hoyer, or log; got {other:?}"
                     )),

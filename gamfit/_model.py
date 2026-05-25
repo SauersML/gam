@@ -165,23 +165,8 @@ class Model:
 
     def design_matrix(self, data: Any) -> Any:
         """Materialised design matrix for ``data`` against the saved model."""
-        import numpy as np
-
         headers, rows, _ = normalize_table(data)
-        try:
-            raw = rust_module().design_matrix_table(self._model_bytes, headers, rows)
-        except Exception as exc:
-            raise map_exception(exc) from exc
-        parsed = json.loads(raw)
-        n_rows = int(parsed["n_rows"])
-        n_cols = int(parsed["n_cols"])
-        flat = np.asarray(parsed.get("x_flat", []), dtype=float)
-        if flat.size != n_rows * n_cols:
-            raise ValueError(
-                "design matrix FFI payload shape mismatch: "
-                f"got {flat.size} floats, expected {n_rows} * {n_cols}"
-            )
-        return flat.reshape(n_rows, n_cols)
+        return rust_module().design_matrix_table_dense(self._model_bytes, headers, rows)
 
     def design_matrix_array(self, X: Any) -> Any:
         """Materialised design matrix for a numeric feature matrix."""
