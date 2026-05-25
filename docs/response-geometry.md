@@ -35,5 +35,5 @@ summary = model.summary()           # includes base_point, coordinates, and shar
 
 Pass `response_coordinates="alr"` (or `response_geometry="alr"`) to fit
 a `D − 1` dimensional ALR chart instead of the default `D`-column CLR
-representation. `response_reference=` selects the ALR denominator
-component and defaults to the last response column.
+representation. `response_reference=` selects the ALR denominator by
+integer component index and defaults to the last response-column position.
