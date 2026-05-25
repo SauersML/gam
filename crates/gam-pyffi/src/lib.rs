@@ -3168,9 +3168,7 @@ impl<'de> Deserialize<'de> for OrderedPredictionColumnEntries {
                 M: MapAccess<'de>,
             {
                 let mut entries = Vec::with_capacity(access.size_hint().unwrap_or(0));
-                while let Some((key, value)) =
-                    access.next_entry::<String, serde_json::Value>()?
-                {
+                while let Some((key, value)) = access.next_entry::<String, serde_json::Value>()? {
                     entries.push((key, value));
                 }
                 Ok(OrderedPredictionColumnEntries(entries))
@@ -11503,6 +11501,125 @@ fn difference_smooth_json(
 }
 
 #[pyfunction]
+fn difference_smooth_rows(
+    py: Python<'_>,
+    model_bytes: Vec<u8>,
+    request_json: String,
+) -> PyResult<PyObject> {
+    let rows = detach_py_result(py, "difference_smooth_rows", move || {
+        let raw = difference_smooth_json_impl(&model_bytes, &request_json)?;
+        serde_json::from_str::<Vec<serde_json::Map<String, serde_json::Value>>>(&raw)
+            .map_err(|err| format!("failed to parse difference_smooth rows json: {err}"))
+    })?;
+    difference_smooth_rows_to_py(py, rows)
+}
+
+fn difference_smooth_rows_to_py(
+    py: Python<'_>,
+    rows: Vec<serde_json::Map<String, serde_json::Value>>,
+) -> PyResult<PyObject> {
+    let out = PyList::empty(py);
+    for row in rows {
+        let py_row = PyDict::new(py);
+        for (key, value) in row {
+            py_dict_set_json_value(py, &py_row, &key, value)?;
+        }
+        out.append(py_row)?;
+    }
+    Ok(out.unbind().into_any())
+}
+
+fn py_dict_set_json_value(
+    py: Python<'_>,
+    dict: &Bound<'_, PyDict>,
+    key: &str,
+    value: serde_json::Value,
+) -> PyResult<()> {
+    match value {
+        serde_json::Value::Null => dict.set_item(key, py.None()),
+        serde_json::Value::Bool(value) => dict.set_item(key, value),
+        serde_json::Value::Number(value) => py_dict_set_json_number(dict, key, value),
+        serde_json::Value::String(value) => dict.set_item(key, value),
+        serde_json::Value::Array(values) => {
+            let list = PyList::empty(py);
+            for value in values {
+                py_list_append_json_value(py, &list, value)?;
+            }
+            dict.set_item(key, list)
+        }
+        serde_json::Value::Object(values) => {
+            let nested = PyDict::new(py);
+            for (nested_key, nested_value) in values {
+                py_dict_set_json_value(py, &nested, &nested_key, nested_value)?;
+            }
+            dict.set_item(key, nested)
+        }
+    }
+}
+
+fn py_dict_set_json_number(
+    dict: &Bound<'_, PyDict>,
+    key: &str,
+    value: serde_json::Number,
+) -> PyResult<()> {
+    if let Some(value) = value.as_i64() {
+        dict.set_item(key, value)
+    } else if let Some(value) = value.as_u64() {
+        dict.set_item(key, value)
+    } else if let Some(value) = value.as_f64() {
+        dict.set_item(key, value)
+    } else {
+        Err(PyValueError::new_err(
+            "difference_smooth row contains an unsupported JSON number",
+        ))
+    }
+}
+
+fn py_list_append_json_value(
+    py: Python<'_>,
+    list: &Bound<'_, PyList>,
+    value: serde_json::Value,
+) -> PyResult<()> {
+    match value {
+        serde_json::Value::Null => list.append(py.None()),
+        serde_json::Value::Bool(value) => list.append(value),
+        serde_json::Value::Number(value) => py_list_append_json_number(list, value),
+        serde_json::Value::String(value) => list.append(value),
+        serde_json::Value::Array(values) => {
+            let nested = PyList::empty(py);
+            for value in values {
+                py_list_append_json_value(py, &nested, value)?;
+            }
+            list.append(nested)
+        }
+        serde_json::Value::Object(values) => {
+            let nested = PyDict::new(py);
+            for (nested_key, nested_value) in values {
+                py_dict_set_json_value(py, &nested, &nested_key, nested_value)?;
+            }
+            list.append(nested)
+        }
+    }
+}
+
+fn py_list_append_json_number(
+    list: &Bound<'_, PyList>,
+    value: serde_json::Number,
+) -> PyResult<()> {
+    if let Some(value) = value.as_i64() {
+        list.append(value)
+    } else if let Some(value) = value.as_u64() {
+        list.append(value)
+    } else if let Some(value) = value.as_f64() {
+        list.append(value)
+    } else {
+        Err(PyValueError::new_err(
+            "difference_smooth row contains an unsupported JSON number",
+        ))
+    }
+}
+
+#[pyfunction]
 fn cross_fit_shared_precision_groups_json(
     py: Python<'_>,
     request_json: String,
@@ -13029,6 +13146,58 @@ fn py_repr(_py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<String> {
     value.repr()?.extract()
 }
 
+#[pyclass(module = "gam_pyffi._rust", name = "ARDPenalty")]
+struct ARDPenalty {
+    #[pyo3(get, set)]
+    target: PyObject,
+    #[pyo3(get, set)]
+    weight_schedule: Option<PyObject>,
+}
+
+#[pymethods]
+impl ARDPenalty {
+    #[new]
+    #[pyo3(signature = (*, target = "t", weight_schedule = None))]
+    fn new(target: PyObject, weight_schedule: Option<PyObject>) -> Self {
+        Self {
+            target,
+            weight_schedule,
+        }
+    }
+
+    #[classattr]
+    const KIND_TAG: &'static str = "ard";
+
+    fn to_rust_descriptor(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let payload = PyDict::new(py);
+        payload.set_item("kind", Self::KIND_TAG)?;
+        payload.set_item("target", target_descriptor(py, self.target.bind(py))?)?;
+        if let Some(schedule) = &self.weight_schedule {
+            payload.set_item("weight_schedule", schedule.bind(py))?;
+        }
+        Ok(payload.into())
+    }
+
+    fn set_weight_schedule<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        schedule: PyObject,
+    ) -> PyRefMut<'py, Self> {
+        slf.weight_schedule = Some(schedule);
+        slf
+    }
+
+    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        Ok(format!(
+            "ARDPenalty(target={}, weight_schedule={})",
+            py_repr(py, self.target.bind(py))?,
+            match &self.weight_schedule {
+                Some(schedule) => py_repr(py, schedule.bind(py))?,
+                None => "None".to_string(),
+            }
+        ))
+    }
+}
+
 #[pyclass(module = "gam_pyffi._rust", name = "TopKActivationPenalty")]
 struct PyTopKActivationPenalty {
     #[pyo3(get, set)]
@@ -13166,6 +13335,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(fit_table, module)?)?;
     module.add_function(wrap_pyfunction!(fit_array, module)?)?;
     module.add_function(wrap_pyfunction!(load_model, module)?)?;
+    module.add_function(wrap_pyfunction!(bayes_factor_log_diff, module)?)?;
     module.add_function(wrap_pyfunction!(saved_model_payload_string, module)?)?;
     module.add_function(wrap_pyfunction!(build_extend_group_payload_json, module)?)?;
     module.add_function(wrap_pyfunction!(extend_model_with_group, module)?)?;
