@@ -12488,6 +12488,8 @@ fn survival_lifted_metrics_from_predictions<'py>(
     let none_result = |out: &Bound<'_, PyDict>| -> PyResult<Py<PyDict>> {
         out.set_item("brier", py.None())?;
         out.set_item("logloss", py.None())?;
+        out.set_item("lifted_brier", py.None())?;
+        out.set_item("lifted_logloss", py.None())?;
         out.set_item("nagelkerke_r2", py.None())?;
         Ok(out.clone().unbind())
     };
@@ -12575,23 +12577,47 @@ fn survival_lifted_metrics_from_predictions<'py>(
                             .max(0.0);
                 }
             }
+            let mut null_haz_sq_prefix = Array2::<f64>::zeros((null_surv.nrows(), null_surv.ncols()));
+            for row in 0..null_surv.nrows() {
+                for col in 0..null_haz.ncols() {
+                    null_haz_sq_prefix[[row, col + 1]] = null_haz_sq_prefix[[row, col]]
+                        + null_haz[[row, col]] * null_haz[[row, col]] * dt[col];
+                }
+            }
             let mut null_log_losses = vec![0.0; event_times.len()];
+            let mut null_brier_losses = vec![0.0; event_times.len()];
             for (row, &time) in event_times.iter().enumerate() {
                 let mut j = grid.partition_point(|value| *value < time);
                 if j >= grid.len() {
                     j = grid.len() - 1;
                 }
                 let interval_idx = j.saturating_sub(1);
-                let (h_z, hcum_z) = if (grid[j] - time).abs() <= 1.0e-12 {
-                    (null_haz[[row, interval_idx]], null_cumhaz[[row, j]])
+                let (h_z, hcum_z, h2_int) = if (grid[j] - time).abs() <= 1.0e-12 {
+                    (
+                        null_haz[[row, interval_idx]],
+                        null_cumhaz[[row, j]],
+                        null_haz_sq_prefix[[row, j]],
+                    )
                 } else {
                     let elapsed = time - grid[interval_idx];
                     let h = null_haz[[row, interval_idx]];
-                    (h, null_cumhaz[[row, interval_idx]] + h * elapsed)
+                    (
+                        h,
+                        null_cumhaz[[row, interval_idx]] + h * elapsed,
+                        null_haz_sq_prefix[[row, interval_idx]] + h * h * elapsed,
+                    )
                 };
                 null_log_losses[row] =
                     hcum_z - if obs[row] { h_z.max(eps).ln() } else { 0.0 };
+                null_brier_losses[row] = 0.5 * h2_int - if obs[row] { h_z } else { 0.0 };
             }
+            let null_logloss = null_log_losses.iter().sum::<f64>() / null_log_losses.len() as f64;
+            let null_brier = null_brier_losses.iter().sum::<f64>() / null_brier_losses.len() as f64;
+            out.set_item("lifted_brier", (null_brier - brier) / null_brier.abs().max(eps))?;
+            out.set_item(
+                "lifted_logloss",
+                (null_logloss - logloss) / null_logloss.abs().max(eps),
+            )?;
             let ll_model = -log_losses.iter().sum::<f64>();
             let ll_null = -null_log_losses.iter().sum::<f64>();
             let n = event_times.len() as f64;
@@ -12601,6 +12627,10 @@ fn survival_lifted_metrics_from_predictions<'py>(
                 nagelkerke = Some(r2_cs / max_r2_cs);
             }
         }
+    }
+    if !out.contains("lifted_brier")? {
+        out.set_item("lifted_brier", py.None())?;
+        out.set_item("lifted_logloss", py.None())?;
     }
     match nagelkerke {
         Some(value) => out.set_item("nagelkerke_r2", value)?,
@@ -14303,7 +14333,7 @@ impl JumpReLUPenalty {
                 "JumpReLUPenalty.thresholds must be finite and > 0",
             ));
         }
-        if !weight.is_finite() || weight <= 0.0 {
+        if !(weight > 0.0) {
             return Err(PyValueError::new_err(format!(
                 "JumpReLUPenalty.weight must be finite and > 0, got {weight}"
             )));
@@ -16255,7 +16285,7 @@ impl NuclearNormPenalty {
                 "NuclearNormPenalty.n_eff must be > 0, got {n_eff}"
             )));
         }
-        if !smoothing_eps.is_finite() || smoothing_eps <= 0.0 {
+        if !(smoothing_eps > 0.0) {
             return Err(PyValueError::new_err(format!(
                 "NuclearNormPenalty.smoothing_eps must be > 0, got {smoothing_eps}"
             )));
@@ -16523,26 +16553,6 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(compute_residuals, module)?)?;
     module.add_function(wrap_pyfunction!(diagnostics_from_predictions, module)?)?;
     module.add_function(wrap_pyfunction!(benchmark_prediction_metrics, module)?)?;
-    module.add_function(wrap_pyfunction!(binary_auc, module)?)?;
-    module.add_function(wrap_pyfunction!(binary_brier, module)?)?;
-    module.add_function(wrap_pyfunction!(classification_metrics, module)?)?;
-    module.add_function(wrap_pyfunction!(auc_from_predictions, module)?)?;
-    module.add_function(wrap_pyfunction!(brier_from_predictions, module)?)?;
-    module.add_function(wrap_pyfunction!(log_loss_from_predictions, module)?)?;
-    module.add_function(wrap_pyfunction!(nagelkerke_r2_from_predictions, module)?)?;
-    module.add_function(wrap_pyfunction!(
-        gaussian_log_loss_from_predictions,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(
-        gaussian_prediction_scores_from_predictions,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(make_folds_indices, module)?)?;
-    module.add_function(wrap_pyfunction!(zscore_train_test_arrays, module)?)?;
-    module.add_function(wrap_pyfunction!(survival_score_grid_from_times, module)?)?;
-    module.add_function(wrap_pyfunction!(repeat_survival_curve, module)?)?;
-    module.add_function(wrap_pyfunction!(survival_null_curve_from_train, module)?)?;
     module.add_function(wrap_pyfunction!(
         survival_matrix_from_risk_calibration,
         module
