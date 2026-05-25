@@ -10838,6 +10838,16 @@ fn joint_trust_region_step_norm(delta: &Array1<f64>) -> f64 {
     delta.iter().map(|v| v * v).sum::<f64>().sqrt()
 }
 
+fn joint_trust_region_metric_step_norm(delta: &Array1<f64>, metric_diag: &Array1<f64>) -> f64 {
+    assert_eq!(delta.len(), metric_diag.len());
+    delta
+        .iter()
+        .zip(metric_diag)
+        .map(|(step, weight)| step * step * weight.abs().max(1.0e-10))
+        .sum::<f64>()
+        .sqrt()
+}
+
 fn truncate_joint_step_to_radius(delta: &mut Array1<f64>, radius: f64) -> f64 {
     let norm = joint_trust_region_step_norm(delta);
     if norm.is_finite() && norm > radius && radius > 0.0 {
@@ -10846,6 +10856,46 @@ fn truncate_joint_step_to_radius(delta: &mut Array1<f64>, radius: f64) -> f64 {
     } else {
         norm
     }
+}
+
+fn truncate_joint_step_to_metric_radius(
+    delta: &mut Array1<f64>,
+    radius: f64,
+    metric_diag: &Array1<f64>,
+) -> f64 {
+    let norm = joint_trust_region_metric_step_norm(delta, metric_diag);
+    if norm.is_finite() && norm > radius && radius > 0.0 {
+        delta.mapv_inplace(|v| v * (radius / norm));
+        radius
+    } else {
+        norm
+    }
+}
+
+fn apply_block_local_feasibility_limits<F: CustomFamily + ?Sized>(
+    family: &F,
+    states: &[ParameterBlockState],
+    ranges: &[(usize, usize)],
+    trial_delta: &mut Array1<f64>,
+) -> Result<bool, String> {
+    let mut limited = false;
+    for (block_idx, (start, end)) in ranges.iter().copied().enumerate() {
+        let block_delta = trial_delta.slice(s![start..end]).to_owned();
+        if let Some(alpha_max) = family.max_feasible_step_size(states, block_idx, &block_delta)? {
+            if !alpha_max.is_finite() || alpha_max <= 0.0 {
+                return Err(format!(
+                    "joint Newton block {block_idx} has no positive feasible step"
+                ));
+            }
+            if alpha_max < 1.0 {
+                trial_delta
+                    .slice_mut(s![start..end])
+                    .mapv_inplace(|v| alpha_max * v);
+                limited = true;
+            }
+        }
+    }
+    Ok(limited)
 }
 
 fn joint_inner_kkt_converged(residual: f64, residual_tol: f64) -> bool {
