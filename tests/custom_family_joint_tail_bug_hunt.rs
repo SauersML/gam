@@ -1,11 +1,11 @@
 use gam::custom_family::{
-    build_psi_hyper_coords, build_psi_pair_callbacks, BlockWorkingSet, CustomFamily,
-    CustomFamilyBlockPsiDerivative, ExactNewtonJointPsiSecondOrderTerms, FamilyEvaluation,
-    ParameterBlockSpec, ParameterBlockState, PenaltyMatrix,
+    BlockWorkingSet, CustomFamily, CustomFamilyBlockPsiDerivative,
+    ExactNewtonJointPsiSecondOrderTerms, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
+    PenaltyMatrix, build_psi_hyper_coords, build_psi_pair_callbacks,
 };
 use gam::linalg::matrix::DesignMatrix;
 use gam::matrix::DenseDesignMatrix;
-use ndarray::{array, Array1, Array2};
+use ndarray::{Array1, Array2, array};
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -30,7 +30,13 @@ impl CustomFamily for TinyFamily {
         psi_i: usize,
         psi_j: usize,
     ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
-        let _ = (synced_states.len(), specs.len(), derivative_blocks.len(), psi_i, psi_j);
+        let _ = (
+            synced_states.len(),
+            specs.len(),
+            derivative_blocks.len(),
+            psi_i,
+            psi_j,
+        );
         Ok(None)
     }
 }
@@ -72,11 +78,16 @@ fn bug_hunt_build_psi_hyper_coords_covers_each_penalty_axis_once_without_duplica
     )
     .expect("HyperCoord coverage should include every penalty axis exactly once with no gaps or duplicates");
 
-    assert_eq!(coords.len(), 2, "HyperCoord coverage should include every penalty axis exactly once with no gaps or duplicates");
+    assert_eq!(
+        coords.len(),
+        2,
+        "HyperCoord coverage should include every penalty axis exactly once with no gaps or duplicates"
+    );
 }
 
 #[test]
-fn bug_hunt_build_psi_pair_callbacks_out_of_registry_returns_documented_sentinel_instead_of_panicking() {
+fn bug_hunt_build_psi_pair_callbacks_out_of_registry_returns_documented_sentinel_instead_of_panicking()
+ {
     let deriv = CustomFamilyBlockPsiDerivative::new(
         Some(0),
         Array2::zeros((2, 2)),
