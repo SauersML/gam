@@ -5,14 +5,16 @@ fn fitted_family_marginal_slope_deserializes_without_base_link_for_backward_comp
     // Saved fits produced before `base_link` was added to FittedFamily::MarginalSlope
     // omit that field entirely. Deserialization must still succeed so older artifacts
     // remain loadable; the field defaults to `None`.
-    let raw = r#"{
-        "family_kind": "marginal-slope",
-        "likelihood": {
-            "response": "Binomial",
-            "link": { "Standard": "Logit" }
-        },
-        "frailty": { "frailty_kind": "none" }
-    }"#;
+    let raw = concat!(
+        "{",
+        "\"family_kind\": \"marginal-slope\",",
+        "\"likelihood\": {",
+        "\"response\": \"Binomial\",",
+        "\"link\": { \"Standard\": \"Logit\" }",
+        "},",
+        "\"frailty\": { \"frailty_kind\": \"none\" }",
+        "}",
+    );
     let parsed: Result<FittedFamily, _> = serde_json::from_str(raw);
     assert!(
         parsed.is_ok(),
