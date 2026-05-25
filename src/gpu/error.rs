@@ -8,8 +8,7 @@
 //! the prior `format!` / `to_string` payloads so logged messages are
 //! byte-equivalent to the pre-refactor strings.
 //!
-//! Only the variants actually constructed by the GPU layer are kept; no
-//! `#[allow(dead_code)]` placeholders.
+//! Only the variants actually constructed by the GPU layer are kept.
 
 /// Typed error for `src/gpu/*.rs` operations.
 #[derive(Debug, Clone)]
