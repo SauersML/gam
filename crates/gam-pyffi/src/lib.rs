@@ -617,7 +617,6 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
             "_block_diag",
             "tierney_kadane_normalized_score",
             "gaussian_reml_fit_formula_table",
-<<<<<<< Updated upstream
             "gaussian_reml_fit_with_constraints_forward",
             "gaussian_reml_fit_with_constraints_backward",
             "sphere_frechet_mean",
@@ -636,10 +635,6 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
             "equivariant_rho_so3",
             "equivariant_rho_so3_jvp",
             "equivariant_gauge_companion_loss",
-=======
-            "gaussian_reml_fit_blocks_forward",
-            "gaussian_reml_fit_additive",
->>>>>>> Stashed changes
         ],
     )?;
     info.set_item(
@@ -4306,7 +4301,6 @@ fn gaussian_reml_fit_formula_table<'py>(
     gaussian_reml_result_to_pydict(py, result)
 }
 
-<<<<<<< Updated upstream
 /// Multi-block Gaussian REML forward fit with per-smooth λ_k.
 ///
 /// Programmatic (formula-API-bypass) entry into the same joint multi-smooth
@@ -4324,54 +4318,24 @@ fn gaussian_reml_fit_formula_table<'py>(
 /// Returns a dict with `coefficients` `(P_total, 1)`, `fitted` `(N, 1)`,
 /// `lambdas` `(F,)`, `reml_score` (scalar), `edf` `(F,)`, `col_offsets`
 /// `(F+1,)`.
-=======
-/// Per-smooth Gaussian REML fit: jointly selects one λ_k per smooth block.
-///
-/// Programmatic (formula-API-bypass) entry into the same joint multi-smooth
-/// REML driver used by `gamfit.fit(data, "y ~ s(x1) + s(x2)")`. Concatenates
-/// per-smooth designs into a global X, assembles a `BlockwisePenalty` list
-/// from the per-smooth penalties, then runs `fit_gam` with one λ_k per block.
-///
-/// For multi-output `y` (shape `(N, D)` with `D > 1`) only the first column
-/// is used for λ selection. The torch wrapper's contract is a length-F λ
-/// vector shared across outputs.
->>>>>>> Stashed changes
 #[pyfunction(signature = (
     designs,
     penalties,
     y,
-<<<<<<< Updated upstream
     weights = None,
     init_rhos = None
 ))]
 fn gaussian_reml_fit_blocks_forward<'py>(
-=======
-    bys = None,
-    weights = None,
-    init_lambdas = None
-))]
-fn gaussian_reml_fit_additive<'py>(
->>>>>>> Stashed changes
     py: Python<'py>,
     designs: Vec<PyReadonlyArray2<'py, f64>>,
     penalties: Vec<PyReadonlyArray2<'py, f64>>,
     y: PyReadonlyArray2<'py, f64>,
-<<<<<<< Updated upstream
     weights: Option<PyReadonlyArray1<'py, f64>>,
     init_rhos: Option<PyReadonlyArray1<'py, f64>>,
 ) -> PyResult<Py<PyDict>> {
     if designs.is_empty() {
         return Err(py_value_error(
             "gaussian_reml_fit_blocks_forward requires at least one block".to_string(),
-=======
-    bys: Option<Vec<Option<PyReadonlyArray1<'py, f64>>>>,
-    weights: Option<PyReadonlyArray1<'py, f64>>,
-    init_lambdas: Option<Vec<f64>>,
-) -> PyResult<Py<PyDict>> {
-    if designs.is_empty() {
-        return Err(py_value_error(
-            "gaussian_reml_fit_additive requires at least one smooth".to_string(),
->>>>>>> Stashed changes
         ));
     }
     if designs.len() != penalties.len() {
@@ -4381,18 +4345,6 @@ fn gaussian_reml_fit_additive<'py>(
             penalties.len(),
         )));
     }
-<<<<<<< Updated upstream
-=======
-    if let Some(b) = bys.as_ref() {
-        if b.len() != designs.len() {
-            return Err(py_value_error(format!(
-                "bys must have one entry per smooth; got {} for {} smooths",
-                b.len(),
-                designs.len(),
-            )));
-        }
-    }
->>>>>>> Stashed changes
 
     let n_rows = designs[0].as_array().nrows();
     let mut col_offsets: Vec<usize> = vec![0];
@@ -4406,7 +4358,6 @@ fn gaussian_reml_fit_additive<'py>(
                 n_rows,
             )));
         }
-<<<<<<< Updated upstream
         if let Some(((row, col), value)) = view.indexed_iter().find(|(_, value)| !value.is_finite())
         {
             return Err(py_value_error(format!(
@@ -4427,46 +4378,6 @@ fn gaussian_reml_fit_additive<'py>(
         joint_x
             .slice_mut(s![.., col_offsets[i]..col_offsets[i + 1]])
             .assign(&d.as_array());
-=======
-        col_offsets.push(col_offsets[i] + view.ncols());
-    }
-    let p_total = *col_offsets.last().unwrap();
-
-    let mut joint_x: ndarray::Array2<f64> = ndarray::Array2::zeros((n_rows, p_total));
-    for (i, d) in designs.iter().enumerate() {
-        let view = d.as_array();
-        let block_start = col_offsets[i];
-        let block_end = col_offsets[i + 1];
-        let by_for_block: Option<ndarray::ArrayView1<'_, f64>> = match bys.as_ref() {
-            Some(b_list) => match b_list[i].as_ref() {
-                Some(b_arr) => {
-                    let bv = b_arr.as_array();
-                    if bv.len() != n_rows {
-                        return Err(py_value_error(format!(
-                            "bys[{}].len={} does not match N={}",
-                            i,
-                            bv.len(),
-                            n_rows,
-                        )));
-                    }
-                    Some(bv)
-                }
-                None => None,
-            },
-            None => None,
-        };
-        let mut block = joint_x.slice_mut(ndarray::s![.., block_start..block_end]);
-        if let Some(bv) = by_for_block {
-            for r in 0..n_rows {
-                let scale = bv[r];
-                for c in 0..view.ncols() {
-                    block[[r, c]] = view[[r, c]] * scale;
-                }
-            }
-        } else {
-            block.assign(&view);
-        }
->>>>>>> Stashed changes
     }
 
     let mut s_list: Vec<gam::smooth::BlockwisePenalty> = Vec::with_capacity(designs.len());
@@ -4482,14 +4393,11 @@ fn gaussian_reml_fit_additive<'py>(
                 k,
             )));
         }
-<<<<<<< Updated upstream
         if let Some(((row, col), value)) = pv.indexed_iter().find(|(_, value)| !value.is_finite()) {
             return Err(py_value_error(format!(
                 "penalties[{i}][{row},{col}] must be finite; got {value}"
             )));
         }
-=======
->>>>>>> Stashed changes
         s_list.push(gam::smooth::BlockwisePenalty::new(
             col_offsets[i]..col_offsets[i + 1],
             pv.to_owned(),
@@ -4504,7 +4412,6 @@ fn gaussian_reml_fit_additive<'py>(
             n_rows,
         )));
     }
-<<<<<<< Updated upstream
     if y_arr.ncols() != 1 {
         return Err(py_value_error(format!(
             "gaussian_reml_fit_blocks_forward requires y of shape (N, 1); got (N, {})",
@@ -4515,17 +4422,10 @@ fn gaussian_reml_fit_additive<'py>(
         return Err(py_value_error(format!(
             "y[{row},{col}] must be finite; got {value}"
         )));
-=======
-    if y_arr.ncols() == 0 {
-        return Err(py_value_error(
-            "y must have at least one column".to_string(),
-        ));
->>>>>>> Stashed changes
     }
     let y_col: ndarray::Array1<f64> = y_arr.column(0).to_owned();
 
     let weights_owned: ndarray::Array1<f64> = match weights.as_ref() {
-<<<<<<< Updated upstream
         Some(w) => {
             let wa = w.as_array();
             if wa.len() != n_rows {
@@ -5598,13 +5498,6 @@ fn gaussian_reml_fit_with_constraints_forward<'py>(
         0..p_cols,
         penalty_view.to_owned(),
     )];
-=======
-        Some(w) => w.as_array().to_owned(),
-        None => ndarray::Array1::from_elem(n_rows, 1.0),
-    };
-    let offset_zero: ndarray::Array1<f64> = ndarray::Array1::zeros(n_rows);
-    let heuristic_owned: Option<Vec<f64>> = init_lambdas.clone();
->>>>>>> Stashed changes
 
     let opts = gam::estimate::FitOptions {
         latent_cloglog: None,
@@ -5615,13 +5508,8 @@ fn gaussian_reml_fit_with_constraints_forward<'py>(
         compute_inference: true,
         max_iter: 200,
         tol: 1e-7,
-<<<<<<< Updated upstream
         nullspace_dims: vec![0; s_list.len()],
         linear_constraints: constraints_opt.clone(),
-=======
-        nullspace_dims: vec![],
-        linear_constraints: None,
->>>>>>> Stashed changes
         firth_bias_reduction: false,
         adaptive_regularization: None,
         penalty_shrinkage_floor: Some(1e-6),
@@ -5630,7 +5518,6 @@ fn gaussian_reml_fit_with_constraints_forward<'py>(
         kronecker_factored: None,
     };
 
-<<<<<<< Updated upstream
     let heuristic_owned: Option<Vec<f64>> = init_log_lambda.map(|rho| vec![rho.exp()]);
 
     let x_owned = x_view.to_owned();
@@ -5642,20 +5529,11 @@ fn gaussian_reml_fit_with_constraints_forward<'py>(
             let heuristic_slice = heuristic_owned.as_ref().map(|v| v.as_slice());
             gam::estimate::fit_gamwith_heuristic_lambdas(
                 x_owned,
-=======
-    let joint_x_clone = joint_x.clone();
-    let fit = py
-        .detach(move || {
-            let heuristic_slice = heuristic_owned.as_ref().map(|v| v.as_slice());
-            gam::estimate::fit_gamwith_heuristic_lambdas(
-                joint_x_clone,
->>>>>>> Stashed changes
                 y_col.view(),
                 weights_owned.view(),
                 offset_zero.view(),
                 &s_list,
                 heuristic_slice,
-<<<<<<< Updated upstream
                 LikelihoodSpec::new(
                     ResponseFamily::Gaussian,
                     InverseLink::Standard(LinkFunction::Identity),
@@ -5894,41 +5772,6 @@ fn gaussian_reml_fit_with_constraints_backward<'py>(
     out.set_item("grad_y", backward.grad_y.into_pyarray(py))?;
     out.set_item("grad_penalty", backward.grad_penalty.into_pyarray(py))?;
     out.set_item("grad_weights", backward.grad_weights.into_pyarray(py))?;
-=======
-                gam::types::LikelihoodFamily::GaussianIdentity,
-                &opts,
-            )
-        })
-        .map_err(|e| py_value_error(e.to_string()))?;
-
-    let lambdas: ndarray::Array1<f64> = fit.lambdas.clone();
-    let log_lambdas: ndarray::Array1<f64> = fit.log_lambdas.clone();
-    let edf_vec: Vec<f64> = fit
-        .inference
-        .as_ref()
-        .map(|inf| inf.edf_by_block.clone())
-        .unwrap_or_else(|| vec![0.0; lambdas.len()]);
-    let edf_arr = if edf_vec.len() == lambdas.len() {
-        ndarray::Array1::from_vec(edf_vec)
-    } else {
-        ndarray::Array1::zeros(lambdas.len())
-    };
-    let beta_global = fit.beta.clone();
-    let fitted_vec: ndarray::Array1<f64> = joint_x.dot(&beta_global);
-    let fitted_2d = fitted_vec.insert_axis(ndarray::Axis(1));
-
-    let out = PyDict::new(py);
-    out.set_item("lambda", lambdas.into_pyarray(py))?;
-    out.set_item("log_lambda", log_lambdas.into_pyarray(py))?;
-    out.set_item("edf", edf_arr.into_pyarray(py))?;
-    out.set_item("reml_score", fit.reml_score)?;
-    out.set_item("coefficients_global", beta_global.into_pyarray(py))?;
-    out.set_item(
-        "col_offsets",
-        ndarray::Array1::from_iter(col_offsets.into_iter().map(|v| v as u64)).into_pyarray(py),
-    )?;
-    out.set_item("fitted", fitted_2d.into_pyarray(py))?;
->>>>>>> Stashed changes
     Ok(out.unbind())
 }
 
@@ -10617,185 +10460,6 @@ fn gaussian_reml_result_to_pydict<'py>(
 ) -> PyResult<Py<PyDict>> {
     let out = PyDict::new(py);
     set_ok_gaussian_reml_items(py, &out, fit)?;
-    Ok(out.unbind())
-}
-
-/// Forward-only multi-block Gaussian REML wrapper.
-///
-/// Concatenates `design_blocks` horizontally into a wide design `X`, builds a
-/// `Vec<BlockwisePenalty>` (one penalty per block, with its column range), and
-/// drives `optimize_external_design` (Gaussian identity link) through its
-/// existing outer Newton / EFS loop. Returns per-block λ and per-block EDF.
-///
-/// Forward only: `.backward()` through this path is NotImplemented at the
-/// Python layer.
-#[pyfunction]
-#[pyo3(signature = (design_blocks, penalty_blocks, y, weights = None, init_rhos = None))]
-fn gaussian_reml_fit_blocks_forward<'py>(
-    py: Python<'py>,
-    design_blocks: Vec<PyReadonlyArray2<'py, f64>>,
-    penalty_blocks: Vec<PyReadonlyArray2<'py, f64>>,
-    y: PyReadonlyArray2<'py, f64>,
-    weights: Option<PyReadonlyArray1<'py, f64>>,
-    init_rhos: Option<PyReadonlyArray1<'py, f64>>,
-) -> PyResult<Py<PyDict>> {
-    if design_blocks.is_empty() {
-        return Err(py_value_error(
-            "gaussian_reml_fit_blocks_forward requires at least one design block".to_string(),
-        ));
-    }
-    if design_blocks.len() != penalty_blocks.len() {
-        return Err(py_value_error(format!(
-            "design_blocks and penalty_blocks must have equal length; got {} vs {}",
-            design_blocks.len(),
-            penalty_blocks.len()
-        )));
-    }
-    let y_view = y.as_array();
-    if y_view.ncols() != 1 {
-        return Err(py_value_error(format!(
-            "gaussian_reml_fit_blocks_forward currently requires y of shape (N, 1); got ({}, {})",
-            y_view.nrows(),
-            y_view.ncols()
-        )));
-    }
-    let n_rows = y_view.nrows();
-    let y_vec = y_view.column(0).to_owned();
-
-    // Build column ranges, total p, and validate per-block shapes.
-    let mut col_ranges: Vec<std::ops::Range<usize>> = Vec::with_capacity(design_blocks.len());
-    let mut cursor: usize = 0;
-    for (k, (dk, pk)) in design_blocks.iter().zip(penalty_blocks.iter()).enumerate() {
-        let d = dk.as_array();
-        let p_mat = pk.as_array();
-        if d.nrows() != n_rows {
-            return Err(py_value_error(format!(
-                "design_blocks[{k}] has {} rows but y has {n_rows}",
-                d.nrows()
-            )));
-        }
-        let bp = d.ncols();
-        if p_mat.nrows() != bp || p_mat.ncols() != bp {
-            return Err(py_value_error(format!(
-                "penalty_blocks[{k}] must be ({bp}, {bp}); got ({}, {})",
-                p_mat.nrows(),
-                p_mat.ncols()
-            )));
-        }
-        col_ranges.push(cursor..(cursor + bp));
-        cursor += bp;
-    }
-    let p_total = cursor;
-
-    // Concatenate design blocks horizontally into a single (N, p_total) matrix.
-    let mut x_joint = Array2::<f64>::zeros((n_rows, p_total));
-    for (dk, range) in design_blocks.iter().zip(col_ranges.iter()) {
-        let d = dk.as_array();
-        x_joint
-            .slice_mut(s![.., range.start..range.end])
-            .assign(&d);
-    }
-
-    // Build BlockwisePenalty list.
-    let s_list: Vec<gam::smooth::BlockwisePenalty> = penalty_blocks
-        .iter()
-        .zip(col_ranges.iter())
-        .map(|(pk, range)| {
-            gam::smooth::BlockwisePenalty::new(range.clone(), pk.as_array().to_owned())
-        })
-        .collect();
-
-    // Weights / offset.
-    let w_vec: Array1<f64> = match weights.as_ref() {
-        Some(w) => {
-            let wa = w.as_array();
-            if wa.len() != n_rows {
-                return Err(py_value_error(format!(
-                    "weights length {} does not match N={}",
-                    wa.len(),
-                    n_rows
-                )));
-            }
-            wa.to_owned()
-        }
-        None => Array1::<f64>::ones(n_rows),
-    };
-    let offset_vec = Array1::<f64>::zeros(n_rows);
-
-    // Heuristic λ warm-start from init_rhos (log-λ space) if provided.
-    let lambdas_init: Option<Vec<f64>> = init_rhos.as_ref().map(|r| {
-        r.as_array()
-            .iter()
-            .map(|rho| rho.exp())
-            .collect::<Vec<_>>()
-    });
-
-    if let Some(lams) = lambdas_init.as_ref() {
-        if lams.len() != s_list.len() {
-            return Err(py_value_error(format!(
-                "init_rhos length {} does not match number of blocks {}",
-                lams.len(),
-                s_list.len()
-            )));
-        }
-    }
-
-    let opts = gam::estimate::ExternalOptimOptions {
-        family: LikelihoodFamily::GaussianIdentity,
-        latent_cloglog: None,
-        mixture_link: None,
-        optimize_mixture: false,
-        sas_link: None,
-        optimize_sas: false,
-        compute_inference: true,
-        max_iter: 200,
-        tol: 1e-6,
-        nullspace_dims: vec![0; s_list.len()],
-        linear_constraints: None,
-        firth_bias_reduction: Some(false),
-        penalty_shrinkage_floor: Some(1e-6),
-        rho_prior: Default::default(),
-        kronecker_penalty_system: None,
-        kronecker_factored: None,
-    };
-
-    let ext = py
-        .detach(|| {
-            gam::estimate::optimize_external_designwith_heuristic_lambdas(
-                y_vec.view(),
-                w_vec.view(),
-                &x_joint,
-                offset_vec.view(),
-                s_list,
-                lambdas_init.as_deref(),
-                &opts,
-            )
-        })
-        .map_err(|e: EstimationError| py_value_error(e.to_string()))?;
-
-    let beta = ext.beta.clone();
-    let fitted = x_joint.dot(&beta);
-
-    let lambdas = ext.lambdas.clone();
-    let log_lambdas: Array1<f64> = lambdas.mapv(|v| v.max(1e-300).ln());
-
-    // Per-block EDF (when inference is computed).
-    let edf_per_block: Array1<f64> = ext
-        .inference
-        .as_ref()
-        .map(|inf| Array1::from_vec(inf.edf_by_block.clone()))
-        .unwrap_or_else(|| Array1::<f64>::zeros(col_ranges.len()));
-
-    let out = PyDict::new(py);
-    // Coefficients returned as (p_total, 1) for parity with the single-λ API.
-    let coef_2d = beta.insert_axis(ndarray::Axis(1));
-    let fitted_2d = fitted.insert_axis(ndarray::Axis(1));
-    out.set_item("coefficients", coef_2d.into_pyarray(py))?;
-    out.set_item("fitted", fitted_2d.into_pyarray(py))?;
-    out.set_item("lambdas", lambdas.into_pyarray(py))?;
-    out.set_item("log_lambdas", log_lambdas.into_pyarray(py))?;
-    out.set_item("reml_score", ext.reml_score)?;
-    out.set_item("edf", edf_per_block.into_pyarray(py))?;
     Ok(out.unbind())
 }
 
@@ -19029,7 +18693,6 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(gaussian_reml_fit, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_fit_backward, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_fit_formula_table, module)?)?;
-<<<<<<< Updated upstream
     module.add_function(wrap_pyfunction!(gaussian_reml_fit_blocks_forward, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_fit_blocks_backward, module)?)?;
     module.add_function(wrap_pyfunction!(
@@ -19040,9 +18703,6 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
         gaussian_reml_fit_with_constraints_backward,
         module
     )?)?;
-=======
-    module.add_function(wrap_pyfunction!(gaussian_reml_fit_additive, module)?)?;
->>>>>>> Stashed changes
     module.add_function(wrap_pyfunction!(gaussian_reml_fit_batched, module)?)?;
     module.add_function(wrap_pyfunction!(
         gaussian_reml_fit_batched_backward,
@@ -19061,7 +18721,6 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
         gaussian_reml_fit_positions_batched_backward,
         module
     )?)?;
-<<<<<<< Updated upstream
     module.add_function(wrap_pyfunction!(gaussian_reml_fit_latent, module)?)?;
     module.add_function(wrap_pyfunction!(register_analytic_penalties, module)?)?;
     module.add_function(wrap_pyfunction!(analytic_penalty_value_grad, module)?)?;
@@ -19107,9 +18766,6 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(gaussian_reml_fit_latent_backward, module)?)?;
     module.add_function(wrap_pyfunction!(glm_reml_fit_latent, module)?)?;
     module.add_function(wrap_pyfunction!(glm_reml_fit_latent_backward, module)?)?;
-=======
-    module.add_function(wrap_pyfunction!(gaussian_reml_fit_blocks_forward, module)?)?;
->>>>>>> Stashed changes
     module.add_function(wrap_pyfunction!(posterior_predict_table, module)?)?;
     module.add_function(wrap_pyfunction!(posterior_predict_bands_table, module)?)?;
     module.add_function(wrap_pyfunction!(posterior_eta_bands, module)?)?;

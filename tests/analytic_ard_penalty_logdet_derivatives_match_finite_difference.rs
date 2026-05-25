@@ -1,5 +1,5 @@
 use approx::assert_abs_diff_eq;
-use gam::terms::analytic_penalties::{AnalyticPenaltyKind, ARDPenalty, PsiSlice};
+use gam::terms::analytic_penalties::{ARDPenalty, AnalyticPenaltyKind, PsiSlice};
 use ndarray::array;
 use std::sync::Arc;
 
@@ -17,11 +17,11 @@ fn analytic_ard_penalty_logdet_derivatives_match_finite_difference() {
     let dense = frozen.as_dense();
     for i in 0..dense.nrows() {
         for j in 0..dense.ncols() {
-            assert_abs_diff_eq!(
-                dense[[i, j]],
-                dense[[j, i]],
-                epsilon = 1e-12            );
-            assert!( (dense[[i,j]]-dense[[j,i]]).abs() <= 1e-12, "ARD Hessian must be symmetric" );
+            assert_abs_diff_eq!(dense[[i, j]], dense[[j, i]], epsilon = 1e-12);
+            assert!(
+                (dense[[i, j]] - dense[[j, i]]).abs() <= 1e-12,
+                "ARD Hessian must be symmetric"
+            );
         }
     }
     for i in 0..dense.nrows() {
@@ -33,21 +33,34 @@ fn analytic_ard_penalty_logdet_derivatives_match_finite_difference() {
 
     let lambda = 1.37_f64;
     let eps = 1e-6;
-    let f = |l: f64| frozen.log_det_plus_lambda_i(l).expect("log-det should exist for λ>0");
+    let f = |l: f64| {
+        frozen
+            .log_det_plus_lambda_i(l)
+            .expect("log-det should exist for λ>0")
+    };
     let d1_fd = (f(lambda + eps) - f(lambda - eps)) / (2.0 * eps);
     let d1_analytic = {
         let diag = frozen.diag();
         diag.iter().map(|&d| 1.0 / (d + lambda)).sum::<f64>()
     };
     assert_abs_diff_eq!(d1_analytic, d1_fd, epsilon = 1e-5);
-    assert!((d1_analytic-d1_fd).abs() <= 1e-5, "log|S+λI| first derivative should match finite differences");
+    assert!(
+        (d1_analytic - d1_fd).abs() <= 1e-5,
+        "log|S+λI| first derivative should match finite differences"
+    );
 
     let eps2 = 1e-4;
     let d2_fd = (f(lambda + eps2) - 2.0 * f(lambda) + f(lambda - eps2)) / (eps2 * eps2);
     let d2_analytic = {
         let diag = frozen.diag();
-        -diag.iter().map(|&d| 1.0 / ((d + lambda) * (d + lambda))).sum::<f64>()
+        -diag
+            .iter()
+            .map(|&d| 1.0 / ((d + lambda) * (d + lambda)))
+            .sum::<f64>()
     };
     assert_abs_diff_eq!(d2_analytic, d2_fd, epsilon = 1e-3);
-    assert!((d2_analytic-d2_fd).abs() <= 1e-3, "log|S+λI| second derivative should match finite differences");
+    assert!(
+        (d2_analytic - d2_fd).abs() <= 1e-3,
+        "log|S+λI| second derivative should match finite differences"
+    );
 }
