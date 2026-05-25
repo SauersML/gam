@@ -151,9 +151,8 @@ def _build_design_penalty(
     try:
         entry = _torch_smooth_dispatch_key(type(smooth).__name__)
     except ValueError as exc:
-        # Recognised-but-unsupported specs raise NotImplementedError to match
-        # the previous Python cascade. Truly unknown class names raise
-        # TypeError below.
+        # The Rust dispatch only errors for truly unknown subclass names;
+        # surface those as TypeError to match the previous Python cascade.
         message = str(exc)
         if message.startswith("unknown Smooth subclass"):
             raise TypeError(message) from exc
