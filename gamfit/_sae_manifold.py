@@ -134,7 +134,7 @@ class ManifoldSAE:
             np.ascontiguousarray(x), list(self._basis_kinds), list(self._atom_dims),
             [np.ascontiguousarray(b) for b in self.decoder_blocks],
             [None if c is None else np.ascontiguousarray(c) for c in self._duchon_centers],
-            [(int(h) if k == "periodic" else None) for k, h in zip(self._basis_kinds, self._n_harmonics)],
+            [(int(h) if k in {"periodic", "torus"} else None) for k, h in zip(self._basis_kinds, self._n_harmonics)],
             alpha=1.0, tau=0.5, assignment_kind=str(kind),
             sparsity_strength=1.0, smoothness=1.0, max_iter=50, learning_rate=0.04, random_state=0,
         ), dtype=float)
@@ -440,7 +440,7 @@ def _dims(k_atoms: int, atom_dim: Any) -> list[int]:
 
 def _bases(k_atoms: int, atom_basis: Any, atom_topology: str) -> list[str]:
     if atom_basis is None:
-        atom_basis = {"circle": "periodic", "periodic": "periodic", "sphere": "sphere", "euclidean": "duchon"}.get(str(atom_topology), atom_topology)
+        atom_basis = {"circle": "periodic", "periodic": "periodic", "sphere": "sphere", "torus": "torus", "euclidean": "duchon"}.get(str(atom_topology), atom_topology)
     raw = [atom_basis] * k_atoms if isinstance(atom_basis, str) else list(atom_basis)
     if len(raw) != k_atoms:
         raise ValueError("atom_basis must provide one basis per atom")
