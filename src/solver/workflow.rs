@@ -2317,8 +2317,9 @@ use crate::term_builder::{
 /// Non-formula configuration for model fitting. All fields have sensible defaults.
 #[derive(Clone, Debug)]
 pub struct FitConfig {
-    /// Family: "gaussian", "binomial", "poisson", "negative-binomial", "gamma",
-    /// or None for auto-detect.
+    /// Family: "gaussian", "binomial", "poisson", "negative-binomial",
+    /// "gamma", "tweedie" (alias "tw"; variance power fixed at p = 1.5), or
+    /// None for auto-detect.
     pub family: Option<String>,
     /// Fixed size/overdispersion parameter for `family="negative-binomial"`.
     pub negative_binomial_theta: Option<f64>,

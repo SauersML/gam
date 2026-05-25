@@ -170,6 +170,7 @@ pub enum SaeAtomBasisKind {
     Duchon,
     Periodic,
     Sphere,
+    Torus,
     EuclideanPatch,
     Precomputed(String),
 }
@@ -186,7 +187,31 @@ impl SaeAtomBasisKind {
                     )
                 }
             }
-            Self::Sphere => LatentManifold::Sphere { dim: latent_dim },
+            // `Sphere` is parameterised via a (lat, lon) intrinsic chart; the
+            // chart evaluator already enforces sphere geometry through its
+            // cos/sin terms, so the latent optimiser sees a 2-D product
+            // manifold: lat is a bounded interval `[-π/2, π/2]` (clamped by
+            // the chart) and lon is an `S^1` angle wrapped modulo `2π`.
+            // Treating it as `LatentManifold::Sphere { dim: 2 }` would
+            // require ambient unit-vectors of length 2 (impossible for S^2).
+            Self::Sphere => LatentManifold::Product(vec![
+                LatentManifold::Interval {
+                    lo: -std::f64::consts::FRAC_PI_2,
+                    hi: std::f64::consts::FRAC_PI_2,
+                },
+                LatentManifold::Circle,
+            ]),
+            // `Torus` of dim d is the product T^d = (S^1)^d; the per-axis
+            // angular coordinate is `S^1` wrapped modulo `2π`.
+            Self::Torus => {
+                if latent_dim == 1 {
+                    LatentManifold::Circle
+                } else {
+                    LatentManifold::Product(
+                        (0..latent_dim).map(|_| LatentManifold::Circle).collect(),
+                    )
+                }
+            }
             Self::Duchon | Self::EuclideanPatch | Self::Precomputed(_) => LatentManifold::Euclidean,
         }
     }
@@ -353,6 +378,123 @@ impl SaeBasisEvaluator for SphereChartEvaluator {
             jet[[row, 5, 1]] = dy_dlon * z;
             jet[[row, 6, 0]] = dx_dlat * z + x * dz_dlat;
             jet[[row, 6, 1]] = dx_dlon * z;
+        }
+        Ok((phi, jet))
+    }
+}
+
+/// Tensor-product periodic harmonic evaluator for a `d`-dimensional torus
+/// `T^d = (S^1)^d`. The basis is the tensor product over each axis of the
+/// 1-D circle basis
+/// `[1, cos(2π·1·t), sin(2π·1·t), …, cos(2π·H·t), sin(2π·H·t)]`
+/// (each axis contributes `2H+1` factors, so the total basis size is
+/// `(2H+1)^d`). The latent coords are angular phases in `[0, 1)` (consistent
+/// with the periodic 1-D atoms).
+#[derive(Debug, Clone)]
+pub struct TorusHarmonicEvaluator {
+    pub latent_dim: usize,
+    pub num_harmonics: usize,
+}
+
+impl TorusHarmonicEvaluator {
+    pub fn new(latent_dim: usize, num_harmonics: usize) -> Result<Self, String> {
+        if latent_dim == 0 {
+            return Err("TorusHarmonicEvaluator requires latent_dim >= 1".to_string());
+        }
+        if num_harmonics == 0 {
+            return Err("TorusHarmonicEvaluator requires num_harmonics >= 1".to_string());
+        }
+        Ok(Self {
+            latent_dim,
+            num_harmonics,
+        })
+    }
+
+    pub fn axis_basis_size(&self) -> usize {
+        2 * self.num_harmonics + 1
+    }
+
+    pub fn basis_size(&self) -> usize {
+        // (2H+1)^d — computed iteratively to surface overflow.
+        let axis_m = self.axis_basis_size();
+        let mut total: usize = 1;
+        for _ in 0..self.latent_dim {
+            total = total
+                .checked_mul(axis_m)
+                .expect("TorusHarmonicEvaluator: basis size overflowed usize");
+        }
+        total
+    }
+}
+
+impl SaeBasisEvaluator for TorusHarmonicEvaluator {
+    fn evaluate(&self, coords: ArrayView2<'_, f64>) -> Result<(Array2<f64>, Array3<f64>), String> {
+        let d = self.latent_dim;
+        if coords.ncols() != d {
+            return Err(format!(
+                "TorusHarmonicEvaluator: expected latent_dim {d}, got {}",
+                coords.ncols()
+            ));
+        }
+        let n = coords.nrows();
+        let axis_m = self.axis_basis_size();
+        let m = self.basis_size();
+        let h_max = self.num_harmonics;
+        let two_pi = 2.0 * std::f64::consts::PI;
+        let mut phi = Array2::<f64>::zeros((n, m));
+        let mut jet = Array3::<f64>::zeros((n, m, d));
+        // Per-axis evaluation buffer: phi_axis[axis][col] and dphi_axis[axis][col].
+        let mut phi_axis = vec![vec![0.0_f64; axis_m]; d];
+        let mut dphi_axis = vec![vec![0.0_f64; axis_m]; d];
+        for row in 0..n {
+            for axis in 0..d {
+                let t = coords[[row, axis]];
+                phi_axis[axis][0] = 1.0;
+                dphi_axis[axis][0] = 0.0;
+                for h in 1..=h_max {
+                    let freq = two_pi * (h as f64);
+                    let angle = freq * t;
+                    let s = angle.sin();
+                    let c = angle.cos();
+                    let s_idx = 2 * h - 1;
+                    let c_idx = 2 * h;
+                    phi_axis[axis][s_idx] = s;
+                    phi_axis[axis][c_idx] = c;
+                    dphi_axis[axis][s_idx] = freq * c;
+                    dphi_axis[axis][c_idx] = -freq * s;
+                }
+            }
+            // Enumerate the Cartesian product of per-axis indices in
+            // lexicographic order (axis 0 is the slowest).
+            let mut idx = vec![0usize; d];
+            for flat in 0..m {
+                let mut val = 1.0_f64;
+                for axis in 0..d {
+                    val *= phi_axis[axis][idx[axis]];
+                }
+                phi[[row, flat]] = val;
+                // ∂/∂coords[row, axis_target] = product over axes, replacing
+                // phi_axis[axis_target] with its derivative.
+                for axis_target in 0..d {
+                    let mut deriv = 1.0_f64;
+                    for axis in 0..d {
+                        deriv *= if axis == axis_target {
+                            dphi_axis[axis][idx[axis]]
+                        } else {
+                            phi_axis[axis][idx[axis]]
+                        };
+                    }
+                    jet[[row, flat, axis_target]] = deriv;
+                }
+                // Increment lexicographic index (last axis fastest).
+                for axis in (0..d).rev() {
+                    idx[axis] += 1;
+                    if idx[axis] < axis_m {
+                        break;
+                    }
+                    idx[axis] = 0;
+                }
+            }
         }
         Ok((phi, jet))
     }

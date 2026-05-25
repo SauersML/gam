@@ -8743,6 +8743,190 @@ fn sae_pca_seed_initial_coords(
     Ok(out)
 }
 
+/// Seed each atom's decoder coefficient block via a joint ridge-regularized
+/// least-squares projection of `Z` onto the atom design `[a_init * Phi_1, ...,
+/// a_init * Phi_K]`, where `a_init` is the soft-assignment that the inner
+/// Newton driver will produce at iteration 0 from the supplied
+/// `initial_logits`.
+///
+/// Zero-initialised decoder coefficients leave the joint-fit Arrow-Schur
+/// system in a degenerate fixed point on multi-atom configurations: the
+/// data-fit Jacobian, the assignment-weighted decoder gradient, and the
+/// sparsity-prior gradient cannot all be zero simultaneously, but the
+/// assignment prior (IBP-MAP stick-breaking or softmax entropy) is the only
+/// term with a non-zero gradient at iter 0. The optimizer then collapses the
+/// assignments to zero before any data signal has accumulated, even on
+/// trivially-separable signals such as the K=2 periodic torus reproducer in
+/// issue #174. Seeding with a closed-form LSQ projection eliminates the
+/// degeneracy: at iter 0 the residual already carries the data information
+/// the atoms need, so the assignment update has both a sparsity-prior pull
+/// and a data-fit push to balance against.
+///
+/// Returns the padded `(K, M_max, p_out)` decoder array directly.
+fn sae_decoder_lsq_init(
+    basis_values: ArrayView3<'_, f64>,
+    basis_sizes: &[usize],
+    z: ArrayView2<'_, f64>,
+    initial_logits: ArrayView2<'_, f64>,
+    assignment_kind: &str,
+    tau: f64,
+) -> Result<Array3<f64>, String> {
+    let k_atoms = basis_sizes.len();
+    let (n_obs, p_out) = z.dim();
+    let m_max = basis_sizes.iter().copied().max().unwrap_or(1).max(1);
+    let mut out = Array3::<f64>::zeros((k_atoms, m_max, p_out));
+    if n_obs == 0 || p_out == 0 || k_atoms == 0 {
+        return Ok(out);
+    }
+    if basis_values.shape()[0] != k_atoms || basis_values.shape()[1] != n_obs {
+        return Err(format!(
+            "sae_decoder_lsq_init: basis_values must start with (K, N)=({k_atoms}, {n_obs}); got {:?}",
+            basis_values.shape()
+        ));
+    }
+    if initial_logits.dim() != (n_obs, k_atoms) {
+        return Err(format!(
+            "sae_decoder_lsq_init: initial_logits must be ({n_obs}, {k_atoms}); got {:?}",
+            initial_logits.dim()
+        ));
+    }
+    if !tau.is_finite() || tau <= 0.0 {
+        return Err(format!(
+            "sae_decoder_lsq_init: tau must be finite and positive; got {tau}"
+        ));
+    }
+    // Compute per-row, per-atom assignment weight a_init that matches the
+    // forward map of `assignment_kind` evaluated at `initial_logits`.
+    let mut a_init = Array2::<f64>::zeros((n_obs, k_atoms));
+    let inv_tau = 1.0 / tau;
+    match assignment_kind {
+        "softmax" => {
+            for row in 0..n_obs {
+                let mut max_logit = f64::NEG_INFINITY;
+                for k in 0..k_atoms {
+                    let v = initial_logits[[row, k]];
+                    if v > max_logit {
+                        max_logit = v;
+                    }
+                }
+                let mut sum = 0.0_f64;
+                let mut buf = vec![0.0_f64; k_atoms];
+                for k in 0..k_atoms {
+                    let v = ((initial_logits[[row, k]] - max_logit) * inv_tau).exp();
+                    buf[k] = v;
+                    sum += v;
+                }
+                if sum > 0.0 && sum.is_finite() {
+                    for k in 0..k_atoms {
+                        a_init[[row, k]] = buf[k] / sum;
+                    }
+                }
+            }
+        }
+        "ibp_map" => {
+            for row in 0..n_obs {
+                for k in 0..k_atoms {
+                    let x = initial_logits[[row, k]] * inv_tau;
+                    let a = if x >= 0.0 {
+                        1.0 / (1.0 + (-x).exp())
+                    } else {
+                        let ex = x.exp();
+                        ex / (1.0 + ex)
+                    };
+                    a_init[[row, k]] = a;
+                }
+            }
+        }
+        "jumprelu" => {
+            // Inner driver uses zero threshold; gate via `logit > 0`.
+            for row in 0..n_obs {
+                for k in 0..k_atoms {
+                    let logit = initial_logits[[row, k]];
+                    if logit > 0.0 {
+                        let x = logit * inv_tau;
+                        let a = if x >= 0.0 {
+                            1.0 / (1.0 + (-x).exp())
+                        } else {
+                            let ex = x.exp();
+                            ex / (1.0 + ex)
+                        };
+                        a_init[[row, k]] = a;
+                    }
+                }
+            }
+        }
+        other => {
+            return Err(format!(
+                "sae_decoder_lsq_init: unsupported assignment_kind {other:?}"
+            ));
+        }
+    }
+    // Build joint design X = [a_init[:,0] * Phi_1 | ... | a_init[:,K-1] * Phi_K]
+    // with column count M_total = sum_k basis_sizes[k]. If every atom has zero
+    // weight on a row, that row contributes nothing — but with all the
+    // supported initial logits we use, a_init has at least one non-zero
+    // column per row. Solve (X^T X + ridge I) B = X^T Z, then split.
+    let offsets: Vec<usize> = {
+        let mut acc = 0usize;
+        let mut v = Vec::with_capacity(k_atoms + 1);
+        v.push(0);
+        for &m in basis_sizes {
+            acc += m;
+            v.push(acc);
+        }
+        v
+    };
+    let m_total = offsets[k_atoms];
+    if m_total == 0 {
+        return Ok(out);
+    }
+    let mut x = Array2::<f64>::zeros((n_obs, m_total));
+    for atom_idx in 0..k_atoms {
+        let m_k = basis_sizes[atom_idx];
+        let off = offsets[atom_idx];
+        for row in 0..n_obs {
+            let w = a_init[[row, atom_idx]];
+            if w == 0.0 {
+                continue;
+            }
+            for basis_col in 0..m_k {
+                x[[row, off + basis_col]] = w * basis_values[[atom_idx, row, basis_col]];
+            }
+        }
+    }
+    // Symmetric normal-equations matrix and rhs.
+    let mut xtx = fast_ata(&x);
+    // Diagonal jitter: relative to the trace so the conditioning is
+    // dimensionless. The data-fit Newton step adds its own ridge later; this
+    // ridge only needs to keep the seed projection well-posed.
+    let mut trace = 0.0_f64;
+    for i in 0..m_total {
+        trace += xtx[[i, i]];
+    }
+    let jitter = (trace / m_total as f64).max(1.0).max(1.0e-12) * 1.0e-8;
+    for i in 0..m_total {
+        xtx[[i, i]] += jitter;
+    }
+    let xtz = fast_atb(&x, &z.to_owned());
+    let factor = xtx
+        .cholesky(Side::Lower)
+        .map_err(|err| format!("sae_decoder_lsq_init: Cholesky failed: {err:?}"))?;
+    let b_joint = factor.solve_mat(&xtz);
+    if !b_joint.iter().all(|v| v.is_finite()) {
+        return Err("sae_decoder_lsq_init: non-finite LSQ solution".to_string());
+    }
+    for atom_idx in 0..k_atoms {
+        let m_k = basis_sizes[atom_idx];
+        let off = offsets[atom_idx];
+        for basis_col in 0..m_k {
+            for out_col in 0..p_out {
+                out[[atom_idx, basis_col, out_col]] = b_joint[[off + basis_col, out_col]];
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Build (phi, jet, penalty) for a periodic 1-D atom — same math as
 /// `periodic_basis_with_jet`, but plain Rust so the helper can be reused by
 /// [`sae_manifold_build_inputs`] without Python in the loop.
@@ -9232,7 +9416,6 @@ fn sae_manifold_fit_auto<'py>(
         sae_build_padded_basis_stacks(&plans, seed_coords.view(), n_obs).map_err(py_value_error)?;
     let m_max = basis_sizes.iter().copied().max().unwrap_or(1).max(1);
     let p_out = z_view.ncols();
-    let decoder_coefficients = Array3::<f64>::zeros((k_atoms, m_max, p_out));
     // JumpReLU gates strictly on `logit > threshold` (threshold = 0.0 in the
     // production inner driver). Zero-initialised logits would leave every
     // gate closed at step 0, making the data-fit Jacobian, the sparsity
@@ -9247,6 +9430,20 @@ fn sae_manifold_fit_auto<'py>(
     } else {
         Array2::<f64>::zeros((n_obs, k_atoms))
     };
+    // Seed each atom's decoder block by least-squares projection of Z onto
+    // the joint atom design weighted by the iter-0 soft assignments. Without
+    // this, multi-atom fits collapse to A=0 because the assignment prior
+    // dominates a zero-decoder fit — see [`sae_decoder_lsq_init`] for the
+    // full diagnosis (issue #174).
+    let decoder_coefficients = sae_decoder_lsq_init(
+        basis_values.view(),
+        &basis_sizes,
+        z_view,
+        initial_logits.view(),
+        assignment_kind.as_str(),
+        tau,
+    )
+    .map_err(py_value_error)?;
     // The optimizer's latent dimension per atom must match `plan.latent_dim`,
     // not the user-supplied `atom_dim` — for periodic atoms `atom_dim` carries
     // a harmonic count, not a coord-block width. Periodic atoms have
