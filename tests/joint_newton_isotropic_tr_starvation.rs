@@ -256,23 +256,23 @@ fn joint_newton_isotropic_l2_tr_produces_production_linearized_rate_stall() {
     let old_kkt_inf = g.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
     let linearized_rel = linearized_next_kkt_inf / (1.0 + old_kkt_inf);
 
-    eprintln!(
+    println!(
         "[isotropic-TR-repro] |prop|₂ = {:.3e}  radius = {:.1}  rescale = {:.3e}",
         pre_l2, radius, scale,
     );
-    eprintln!(
+    println!(
         "[isotropic-TR-repro] time  block |δ|∞: {:.3e} -> {:.3e}  ({:.4}% retained)",
         pre_time_inf,
         post_time_inf,
         100.0 * post_time_inf / pre_time_inf,
     );
-    eprintln!(
+    println!(
         "[isotropic-TR-repro] marg  block |δ|∞: {:.3e} -> {:.3e}  ({:.4}% retained)",
         pre_marg_inf,
         post_marg_inf,
         100.0 * post_marg_inf / pre_marg_inf,
     );
-    eprintln!(
+    println!(
         "[isotropic-TR-repro] production-style PIRLS/JN/math line:\n  \
          old_kkt_inf=‖g‖∞={:.3e}  linearized_next_kkt_inf=‖g+Hδ‖∞={:.3e}  \
          linearized_rel = {:.3e}  (LINEARIZED_STALL_REL_THRESHOLD = 0.9)",
