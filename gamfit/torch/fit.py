@@ -100,6 +100,13 @@ def _to_tensor(value, like: torch.Tensor) -> torch.Tensor:
     return torch.as_tensor(value, dtype=torch.float64, device=like.device)
 
 
+def _smooth_by_tensor(smooth: Smooth, design: torch.Tensor) -> torch.Tensor | None:
+    by = smooth.by
+    if by is None:
+        return None
+    return _to_tensor(by, design).reshape(-1)
+
+
 def _coerce_2d(t: torch.Tensor, name: str) -> torch.Tensor:
     """Promote ``(N,)`` to ``(N, 1)`` and validate 2D shape."""
     ndim = t.dim()
@@ -175,13 +182,17 @@ def _build_design_penalty(
                 f"BSpline is 1D-only; got points with d={points.shape[1]}. "
                 "Use TensorBSpline for multi-d with different units, or Duchon for radial."
             )
+        knots_spec = smooth.knots
+        degree = smooth.degree
+        periodic = smooth.periodic
+        penalty_order = smooth.penalty_order
         knots = (
-            _to_tensor(smooth.knots, points).reshape(-1)
-            if smooth.knots is not None
+            _to_tensor(knots_spec, points).reshape(-1)
+            if knots_spec is not None
             else None
         )
         design = bspline_basis(
-            points.squeeze(1), knots, degree=smooth.degree, periodic=smooth.periodic,
+            points.squeeze(1), knots, degree=degree, periodic=periodic,
         )
         from .._api import smoothness_penalty as _smoothness_penalty
         if knots is not None:
@@ -191,10 +202,10 @@ def _build_design_penalty(
             knots_np = _resolve_knots(
                 None,
                 points.squeeze(1).detach().cpu().to(torch.float64).numpy(),
-                label="knots", degree=smooth.degree,
+                label="knots", degree=degree,
             )
         penalty_np, _null_basis = _smoothness_penalty(
-            knots_np, degree=smooth.degree, order=smooth.penalty_order,
+            knots_np, degree=degree, order=penalty_order,
         )
         penalty = torch.as_tensor(penalty_np, dtype=torch.float64, device=points.device)
         return design.to(torch.float64), penalty
