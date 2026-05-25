@@ -969,6 +969,8 @@ def _duchon_basis_local(t: np.ndarray, spec: Duchon) -> tuple[np.ndarray, np.nda
         centers = _latent_grid_centers(t, int(n_centers))
     else:
         centers = _as_2d_float(n_centers, "Duchon.centers")
+    if hasattr(rust_module(), "duchon_basis_with_jet"):
+        return rust_module().duchon_basis_with_jet(t, centers, int(spec.m))
     m = int(spec.m)
     power = max(1, 2 * m - d)
     diff = t[:, None, :] - centers[None, :, :]
@@ -1011,6 +1013,8 @@ def _periodic_fourier_basis(t: np.ndarray, n_harmonics: int) -> tuple[np.ndarray
 
 
 def _sphere_chart_basis(t: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if hasattr(rust_module(), "sphere_chart_basis_with_jet"):
+        return rust_module().sphere_chart_basis_with_jet(t)
     lat = np.clip(t[:, 0], -np.pi / 2.0, np.pi / 2.0)
     lon = t[:, 1] if t.shape[1] > 1 else np.zeros_like(lat)
     clat = np.cos(lat)
