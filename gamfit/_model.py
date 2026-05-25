@@ -748,24 +748,7 @@ class Model:
             raise map_exception(exc) from exc
 
     def summary(self) -> Summary:
-        """Return the model summary (coefficients, family, deviance, REML score).
-
-        Returns
-        -------
-        Summary
-            A dict-like :class:`Summary` containing the fitted formula,
-            family / link name, model class, deviance, REML or LAML score,
-            iteration count, and the per-coefficient table (estimates,
-            standard errors, credible-interval bounds).  The summary is
-            cached on first call.
-
-        Examples
-        --------
-        >>> model = gamfit.fit(train, "y ~ s(x)")
-        >>> s = model.summary()
-        >>> print(s["family_name"], s["deviance"])
-        >>> s.coefficients_frame()      # pandas DataFrame, requires pandas
-        """
+        """Return the model :class:`Summary` (coefficients, family, deviance, REML score)."""
         if self._summary_cache is None:
             try:
                 payload = json.loads(rust_module().summary_json(self._model_bytes))
@@ -782,33 +765,7 @@ class Model:
         return {idx: float(value) for idx, value in enumerate(lambdas)}
 
     def check(self, data: Any) -> SchemaCheck:
-        """Validate ``data`` against the model's training schema.
-
-        Inexpensive: runs the schema validator only, no prediction.  Use
-        this before :meth:`predict` to surface column-name or type issues
-        as structured :class:`SchemaIssue` records rather than as a raised
-        :class:`SchemaMismatchError`.
-
-        Parameters
-        ----------
-        data:
-            Any table-like input (pandas DataFrame, dict of columns, list
-            of records, numpy array, etc.).
-
-        Returns
-        -------
-        SchemaCheck
-            ``check.ok`` is ``True`` when the data matches the training
-            schema; otherwise ``check.issues`` enumerates the problems.
-            ``check.raise_for_error()`` raises ``ValueError`` on failure.
-
-        Examples
-        --------
-        >>> check = model.check(test_df)
-        >>> if not check:
-        ...     for issue in check.issues:
-        ...         print(issue.kind, issue.column, issue.message)
-        """
+        """Validate ``data`` against the training schema (no prediction)."""
         headers, rows, _table_kind = normalize_table(data)
         try:
             payload = json.loads(rust_module().check_json(self._model_bytes, headers, rows))
