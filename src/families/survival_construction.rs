@@ -2348,10 +2348,30 @@ pub fn evaluate_survival_baseline(
     age: f64,
     cfg: &SurvivalBaselineConfig,
 ) -> Result<(f64, f64), String> {
-    if !age.is_finite() || age <= 0.0 {
+    if !age.is_finite() || age < 0.0 {
         return Err(
-            "survival ages must be finite and positive for baseline target evaluation".to_string(),
+            "survival ages must be finite and non-negative for baseline target evaluation"
+                .to_string(),
         );
+    }
+
+    // At t = 0 every parametric cumulative-hazard target satisfies H(0) = 0
+    // exactly (this is the defining property of a cumulative hazard:
+    // S(0) = 1 ⇒ H(0) = -log S(0) = 0). The log-cumulative-hazard offset is
+    // therefore eta(0) = log H(0) = -inf, and we report a zero log-derivative
+    // since `exp(eta(0)) = H(0) = 0` is the only physically valid value.
+    // Returning `Ok((-inf, 0.0))` keeps the baseline cumulative hazard exactly
+    // zero at the origin; downstream callers that need to multiply this offset
+    // into a linear predictor are responsible for handling the origin row via
+    // the `entry_at_origin` / `exit_at_origin` gating already wired through the
+    // engine.
+    if age == 0.0 {
+        return match cfg.target {
+            SurvivalBaselineTarget::Linear => Ok((0.0, 0.0)),
+            SurvivalBaselineTarget::Weibull
+            | SurvivalBaselineTarget::Gompertz
+            | SurvivalBaselineTarget::GompertzMakeham => Ok((f64::NEG_INFINITY, 0.0)),
+        };
     }
 
     match cfg.target {
