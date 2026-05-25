@@ -27,7 +27,6 @@ from ._survival import (
     _SURVIVAL_MODEL_CLASSES,
     _TRANSFORMATION_NORMAL_MODEL_CLASSES,
     competing_risks_cif,
-    default_survival_time_grid,
     extract_row_ids,
     shape_prediction_response,
     term_blocks_for_model,
@@ -36,12 +35,11 @@ from ._tables import normalize_table, response_column_name, restore_output_table
 
 
 class Model:
-    __slots__ = ("_model_bytes", "_training_table_kind", "_summary_cache")
+    __slots__ = ("_model_bytes", "_training_table_kind")
 
     def __init__(self, *, _model_bytes: bytes, _training_table_kind: str | None = None) -> None:
         self._model_bytes = _model_bytes
         self._training_table_kind = _training_table_kind
-        self._summary_cache: Summary | None = None
 
     def predict(
         self,
@@ -55,9 +53,9 @@ class Model:
         """Predict from ``data``."""
         headers, rows, table_kind = normalize_table(data)
         row_ids = extract_row_ids(headers, rows, id_column)
-        grid = default_survival_time_grid(self.model_class, self.formula, headers, rows) \
-            if self.is_survival else None
-        opts_json = rust_module().build_predict_payload_json(interval, with_uncertainty, grid)
+        opts_json = rust_module().build_model_predict_payload_json(
+            self._model_bytes, headers, rows, interval, with_uncertainty
+        )
         try:
             raw = rust_module().predict_table(
                 self._model_bytes, headers, rows, opts_json
@@ -92,20 +90,15 @@ class Model:
 
     def summary(self) -> Summary:
         """Return the model summary (coefficients, family, deviance, REML score)."""
-        if self._summary_cache is None:
-            try:
-                payload = rust_module().summary_payload_from_model(self._model_bytes)
-            except Exception as exc:
-                raise map_exception(exc) from exc
-            self._summary_cache = Summary.from_dict(payload)
-        return self._summary_cache
+        try:
+            payload = rust_module().summary_payload_from_model(self._model_bytes)
+        except Exception as exc:
+            raise map_exception(exc) from exc
+        return Summary.from_dict(payload)
 
     def smoothing_parameters(self) -> dict[int, float]:
         """Return fitted smoothing/precision parameters by penalty index."""
-        lambdas = self.summary().get("lambdas")
-        if not isinstance(lambdas, list):
-            return {}
-        return {idx: float(value) for idx, value in enumerate(lambdas)}
+        return dict(rust_module().smoothing_parameters_from_model(self._model_bytes))
 
     def check(self, data: Any) -> SchemaCheck:
         """Validate ``data`` against the model's training schema."""
@@ -122,6 +115,7 @@ class Model:
             html = rust_module().report_html(self._model_bytes)
         except Exception as exc:
             raise map_exception(exc) from exc
+        # allow-list (a): FFI response marshaling for optional file output.
         if path is None:
             return str(html)
         Path(path).write_text(html, encoding="utf-8")
@@ -188,30 +182,42 @@ class Model:
     ) -> Any:
         """Covariance-aware pairwise difference smooths (Rust-backed)."""
         template: dict[str, str] = {}
+        # allow-list (a): FFI input marshaling for an optional template row.
         if data is not None:
             headers, rows, _ = normalize_table(data)
+            # allow-list (a): FFI input marshaling for empty prediction tables.
             if rows:
                 first = rows[0]
+                # allow-list (a): FFI payload marshaling.
                 template = {h: str(first[i]) for i, h in enumerate(headers)}
         try:
+            # allow-list (a): FFI optional argument marshaling.
+            group_arg = str(group) if group is not None else None
+            # allow-list (a): FFI payload sequence marshaling.
+            pairs_arg = [(str(a), str(b)) for a, b in pairs] if pairs is not None else None
+            # allow-list (a): FFI optional argument marshaling.
+            seed_arg = int(seed) if seed is not None else None
+            # allow-list (a): FFI optional argument marshaling.
+            template_arg = None if not template else template
             request_json = rust_module().build_difference_smooth_request_json(
                 str(view),
-                str(group) if group is not None else None,
-                [(str(a), str(b)) for a, b in pairs] if pairs is not None else None,
+                group_arg,
+                pairs_arg,
                 int(n),
                 float(level),
                 bool(simultaneous),
                 int(n_sim),
-                int(seed) if seed is not None else None,
+                seed_arg,
                 bool(marginalise_random),
                 bool(group_means),
-                template or None,
+                template_arg,
             )
             rows_out = rust_module().difference_smooth_rows(
                 self._model_bytes, request_json
             )
         except Exception as exc:
             raise map_exception(exc) from exc
+        # allow-list (a): FFI response marshaling for requested output type.
         if return_type == "list":
             return rows_out
         try:
@@ -232,14 +238,19 @@ class Model:
         prior: Any | None = None,
     ) -> "Model":
         """Return a no-refit model extended with deployment-time group levels."""
+        # allow-list (a): FFI input validation.
         if not isinstance(new_group_spec, dict):
             raise TypeError("new_group_spec must be a dict")
         try:
             rust = rust_module()
+            # allow-list (a): FFI optional argument marshaling.
+            metadata_json = json.dumps(metadata) if metadata is not None else None
+            # allow-list (a): FFI optional argument marshaling.
+            prior_json = json.dumps(prior) if prior is not None else None
             payload_json = rust.build_extend_group_payload_json(
                 json.dumps(new_group_spec),
-                json.dumps(metadata) if metadata is not None else None,
-                json.dumps(prior) if prior is not None else None,
+                metadata_json,
+                prior_json,
             )
             model_bytes = bytes(
                 rust.extend_model_with_group(self._model_bytes, payload_json)
@@ -255,18 +266,11 @@ class Model:
         """Return the serialised model as raw bytes."""
         return self._model_bytes
 
-    def _saved_payload_string(self, key: str) -> str | None:
-        try:
-            return rust_module().saved_model_payload_string(self._model_bytes, key)
-        except Exception as exc:
-            raise map_exception(exc) from exc
-
     @property
     def formula(self) -> str:
-        value = self._saved_payload_string("formula")
-        if value is None:
-            raise ValueError("saved model payload is missing formula")
-        return value
+        return rust_module().required_saved_model_payload_string(
+            self._model_bytes, "formula"
+        )
 
     @property
     def family_name(self) -> str:
@@ -298,15 +302,11 @@ class Model:
 
     @property
     def group_metadata(self) -> dict[str, Any] | None:
-        value = self.summary().get("group_metadata")
-        return dict(value) if isinstance(value, dict) else None
+        return rust_module().model_group_metadata(self._model_bytes)
 
     @property
     def deployment_extensions(self) -> tuple[dict[str, Any], ...]:
-        value = self.summary().get("deployment_extensions")
-        if not isinstance(value, list):
-            return ()
-        return tuple(dict(item) for item in value if isinstance(item, dict))
+        return tuple(rust_module().model_deployment_extensions(self._model_bytes))
 
     @property
     def term_blocks(self) -> tuple[TermBlock, ...]:
@@ -319,13 +319,11 @@ class Model:
     @property
     def evidence(self) -> float:
         """REML / LAML log marginal-likelihood score for this fit."""
-        value = self.summary().get("reml_score")
-        if value is None:
-            raise ValueError("saved model payload is missing reml_score")
-        return float(value)
+        return float(rust_module().model_evidence(self._model_bytes))
 
     def bayes_factor_vs(self, other: "Model") -> float:
         """Bayes factor of this fit against ``other``."""
+        # allow-list (a): FFI input validation.
         if not isinstance(other, Model):
             raise TypeError(
                 f"bayes_factor_vs expects a gamfit.Model, got {type(other).__name__}"
@@ -336,10 +334,9 @@ class Model:
         return math.exp(log_diff)
 
     def _model_class_from_payload(self) -> str:
-        value = self._saved_payload_string("model_kind")
-        if value is None:
-            raise ValueError("saved model payload is missing model_kind")
-        return value
+        return rust_module().required_saved_model_payload_string(
+            self._model_bytes, "model_kind"
+        )
 
     def diagnose(
         self,
@@ -369,9 +366,11 @@ class Model:
         return _plot(self, data, x=x, y=y, interval=interval, kind=kind, ax=ax)
 
     def __repr__(self) -> str:
-        parts = [f"formula={self.formula!r}", f"family_name={self.family_name!r}"]
-        if self._training_table_kind is not None:
-            parts.append(f"training_table_kind={self._training_table_kind!r}")
+        parts = [
+            f"formula={self.formula!r}",
+            f"family_name={self.family_name!r}",
+            f"training_table_kind={self._training_table_kind!r}",
+        ]
         return f"Model({', '.join(parts)})"
 
     def _repr_html_(self) -> str:
