@@ -603,27 +603,11 @@ class Model:
     ) -> Any:
         """Predict from ``data``.
 
-        Default return (when ``id_column`` and ``return_type`` are both
-        omitted) depends on the fitted model class:
-
-        * Gaussian / Binomial / Standard models: a table (dict, pandas
-          DataFrame, pyarrow Table, ...) matching the training table kind
-          with an ``eta`` and ``mean`` column (plus interval columns when
-          ``interval`` is given).
-        * Transformation-normal models: returns the per-row transformed
-          z-score as a numpy array of shape ``(n_samples,)``.
-        * Bernoulli marginal-slope: returns a calibrated probability array in
-          ``(0, 1)`` of shape ``(n_samples,)``.
-        * Survival models: returns a :class:`SurvivalPrediction` whose
-          ``.hazard_at``, ``.survival_at``, and ``.cumulative_hazard_at``
-          helpers evaluate the fitted hazard surface on a user-supplied time
-          grid.
-
-        ``with_uncertainty`` (survival only): when ``True``, the returned
-        :class:`SurvivalPrediction` also carries delta-method standard
-        errors on the survival surface (``survival_se``) and the linear
-        predictor (``eta_se``).  Currently honored for the location-scale
-        survival likelihood mode.
+        Returns a table (standard/Gaussian/Binomial), z-score array
+        (transformation-normal), probability array (bernoulli-marginal-slope),
+        or :class:`SurvivalPrediction` (survival models). When
+        ``with_uncertainty=True`` (survival only) the prediction carries
+        delta-method ``survival_se`` and ``eta_se``.
         """
         headers, rows, table_kind = normalize_table(data)
         row_ids = _extract_row_ids(headers, rows, id_column)
