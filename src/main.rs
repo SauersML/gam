@@ -8800,7 +8800,7 @@ fn binomial_mean_linkwiggle_supports_family(
 }
 
 fn survival_link_usage() -> &'static str {
-    "use identity|logit|probit|cloglog|loglog|cauchit|sas|beta-logistic|blended(...)/mixture(...) or flexible(...)"
+    "use identity|logit|probit|cloglog|sas|beta-logistic|blended(...)/mixture(...) or flexible(...)"
 }
 
 fn parse_survival_inverse_link(args: &SurvivalArgs) -> Result<InverseLink, String> {
@@ -15033,26 +15033,24 @@ mod tests {
             frailty_sd: None,
             hazard_loading: None,
         };
-        let link = parse_survival_inverse_link(&args).expect("loglog survival link");
-        match link {
-            InverseLink::Mixture(state) => {
-                assert_eq!(state.components, vec![LinkComponent::LogLog]);
-                assert_eq!(state.rho.len(), 0);
-                assert_eq!(state.pi.len(), 1);
-            }
-            _ => panic!("expected mixture-backed loglog survival link"),
-        }
+        // `loglog` and `cauchit` are no longer accepted as survival --link values:
+        // they lack a `LinkFunction` representative, so the previous routing through
+        // a degenerate single-component MixtureLinkSpec violated the mixture-link
+        // anchor invariant enforced by `validate_mixturespec`.
+        let err = parse_survival_inverse_link(&args)
+            .expect_err("loglog survival link must be rejected without a LinkFunction representative");
+        assert!(
+            err.contains("loglog") || err.to_ascii_lowercase().contains("unsupported"),
+            "expected loglog rejection error, got: {err}"
+        );
 
         args.link = Some("cauchit".to_string());
-        let link = parse_survival_inverse_link(&args).expect("cauchit survival link");
-        match link {
-            InverseLink::Mixture(state) => {
-                assert_eq!(state.components, vec![LinkComponent::Cauchit]);
-                assert_eq!(state.rho.len(), 0);
-                assert_eq!(state.pi.len(), 1);
-            }
-            _ => panic!("expected mixture-backed cauchit survival link"),
-        }
+        let err = parse_survival_inverse_link(&args)
+            .expect_err("cauchit survival link must be rejected without a LinkFunction representative");
+        assert!(
+            err.contains("cauchit") || err.to_ascii_lowercase().contains("unsupported"),
+            "expected cauchit rejection error, got: {err}"
+        );
     }
 
     #[test]
