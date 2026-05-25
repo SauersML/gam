@@ -214,7 +214,6 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
     if kind == "gated":
         kind = "jumprelu"
     alpha_value = 1.0 if alpha == "auto" else float(alpha)
-<<<<<<< HEAD
     penalties = [n for n, ok in (("IsometryPenalty", isometry_weight > 0.0), ("ARDPenalty", ard_per_atom),
         ("MechanismSparsityPenalty", mechanism_sparsity_groups is not None),
         ("BlockOrthogonalityPenalty", block_orthogonality_weight > 0.0)) if ok]

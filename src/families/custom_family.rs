@@ -11595,6 +11595,20 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 trace_diagonal_ridge,
                 options.ridge_floor,
             );
+            let joint_trust_metric_diag = match &joint_hessian_source {
+                JointHessianSource::Dense(h_joint) => joint_penalty_preconditioner_diag(
+                    &h_joint.diag().to_owned(),
+                    &ranges,
+                    &s_lambdas,
+                    joint_solver_diagonal_ridge,
+                ),
+                JointHessianSource::Operator { diagonal, .. } => joint_penalty_preconditioner_diag(
+                    diagonal,
+                    &ranges,
+                    &s_lambdas,
+                    joint_solver_diagonal_ridge,
+                ),
+            };
             let current_kkt_norm = exact_newton_joint_stationarity_inf_norm_from_gradient(
                 &grad_joint,
                 &states,
@@ -11870,7 +11884,8 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // constraints and the adaptive trust radius remain the safeguards
             // against runaway proposals.
             if cycle == 0 {
-                let initial_step_norm = joint_trust_region_step_norm(&delta);
+                let initial_step_norm =
+                    joint_trust_region_metric_step_norm(&delta, &joint_trust_metric_diag);
                 if initial_step_norm.is_finite() && initial_step_norm > joint_trust_radius {
                     joint_trust_radius = initial_step_norm;
                 }
@@ -11956,29 +11971,29 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 line_search_attempts = trust_attempt + 1;
                 accepted_joint_workspace = None;
                 let mut trial_delta = search_delta.clone();
-                truncate_joint_step_to_radius(&mut trial_delta, joint_trust_radius);
+                truncate_joint_step_to_metric_radius(
+                    &mut trial_delta,
+                    joint_trust_radius,
+                    &joint_trust_metric_diag,
+                );
                 let trial_step_inf = trial_delta
                     .iter()
                     .copied()
                     .map(f64::abs)
                     .fold(0.0_f64, f64::max);
-                let mut barrier_ceiling = 1.0_f64;
-                for (block_idx, (start, end)) in ranges.iter().copied().enumerate() {
-                    let block_delta = trial_delta.slice(s![start..end]).to_owned();
-                    if let Some(alpha_max) =
-                        family.max_feasible_step_size(&states, block_idx, &block_delta)?
-                    {
-                        barrier_ceiling = barrier_ceiling.min(alpha_max);
-                    }
-                }
-                if !barrier_ceiling.is_finite() || barrier_ceiling <= 0.0 {
+                if apply_block_local_feasibility_limits(
+                    family,
+                    &states,
+                    &ranges,
+                    &mut trial_delta,
+                )
+                .is_err()
+                {
                     joint_trust_radius = (0.25 * joint_trust_radius).max(1.0e-12);
                     continue;
                 }
-                if barrier_ceiling < 1.0 {
-                    trial_delta.mapv_inplace(|v| v * barrier_ceiling);
-                }
-                let step_norm = joint_trust_region_step_norm(&trial_delta);
+                let step_norm =
+                    joint_trust_region_metric_step_norm(&trial_delta, &joint_trust_metric_diag);
                 let mut hpen_delta = Array1::<f64>::zeros(total_p);
                 // Predicted reduction must use the TRUE penalized Hessian
                 // (the one that appears in `f(β) = -ℓ + ½βᵀSβ + ½·joint_mode_diagonal_ridge·‖β‖²`),
