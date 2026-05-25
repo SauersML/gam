@@ -197,7 +197,7 @@ def _build_design_penalty(
         penalty = torch.as_tensor(penalty_np, dtype=torch.float64, device=points.device)
         return design.to(torch.float64), penalty
 
-    if isinstance(smooth, Sphere):
+    if entry == "sphere":
         if points.shape[1] != 2:
             raise ValueError(
                 f"Sphere expects points of shape (N, 2) [lat, lon]; got d={points.shape[1]}"
@@ -226,7 +226,7 @@ def _build_design_penalty(
         )
         return design.to(torch.float64), penalty.to(torch.float64)
 
-    if isinstance(smooth, PeriodicSplineCurve):
+    if entry == "periodic_spline_curve":
         if points.shape[1] != 1:
             raise ValueError(
                 f"PeriodicSplineCurve expects 1D parameter t with shape (N,) or "
@@ -241,7 +241,7 @@ def _build_design_penalty(
         )
         return design.to(torch.float64), penalty.to(torch.float64)
 
-    if isinstance(smooth, Pca):
+    if entry == "pca":
         if smooth.lazy_path is not None:
             raise NotImplementedError("Pca lazy_path is available on the Rust formula path")
         if smooth.basis is None:
@@ -269,15 +269,13 @@ def _build_design_penalty(
         ) * float(smooth.smooth_penalty)
         return design, penalty
 
-    if isinstance(smooth, (TensorBSpline, Matern, Categorical)):
-        raise NotImplementedError(
-            f"{type(smooth).__name__} not yet wired to gamfit.torch.fit; "
-            "needs Rust PyO3 binding for the underlying basis + penalty. "
-            "Currently supported: Duchon (any d for basis; d=1 for penalty), "
-            "BSpline (d=1), Sphere (S²)."
-        )
-
-    raise TypeError(f"unknown Smooth subclass: {type(smooth).__name__}")
+    # Defensive fallback: the Rust dispatch already rejected unsupported and
+    # unknown specs above. Reaching here means the Rust enumeration grew a new
+    # variant without a matching torch branch — raise so the gap is visible.
+    raise NotImplementedError(
+        f"torch fit dispatch returned {entry!r} but no matching branch is "
+        f"wired for {type(smooth).__name__}"
+    )
 
 
 # ---------------------------------------------------------------------------
