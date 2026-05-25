@@ -13113,134 +13113,15 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         converged = true;
                         break;
                     }
-                    // Range-projected stationarity certificate (the
-                    // mathematically honest acceptance arm for genuinely
-                    // rank-deficient H_pen).
-                    //
-                    // The constrained-stationary cert above refuses when the
-                    // active-set-projected residual is still large. The two
-                    // possible causes are:
-                    //   (a) the active set doesn't capture all multipliers
-                    //   (b) H_pen has a real null subspace aligned with g
-                    //
-                    // Case (b) is the survival_marginal_slope failure: the
-                    // smooth's penalty has a polynomial null direction that
-                    // the likelihood Hessian doesn't constrain (data-sparse
-                    // age range, or duchon constant null aligned with mean
-                    // event score). For (b), Newton CAN'T reduce g_null —
-                    // the objective f(β + t·u) is linear in t along u, with
-                    // slope u^T g. No β* makes ∇f = 0 in the original
-                    // parameter space.
-                    //
-                    // What IS well-defined: the gradient PROJECTED onto
-                    // range(H_pen). If that projected residual is at
-                    // tolerance, β is a stationary point of the REDUCED
-                    // problem on the data-identifiable subspace — exactly
-                    // what gam's outer IFT correction is set up to handle
-                    // via the existing `penalty_subspace_trace` /
-                    // U_S·H_proj⁻¹·U_Sᵀ pseudoinverse routing (see the
-                    // 0dc469bd resolved-failure note in MEMORY.md).
-                    //
-                    // The envelope identity dV/dρ = ∂f/∂ρ holds for the
-                    // restricted-to-range(H_pen) problem (codex math
-                    // review): if β*(ρ) satisfies U_range^T ∇f = 0 with
-                    // FIXED U_range, then dV/dρ = ∂f/∂ρ because the
-                    // null-space coordinates don't move with ρ. The fixed
-                    // U_range comes from eigh(H_pen) at the *current* β
-                    // and ρ; we recompute it each cycle but only certify
-                    // when the test is stable across the last accepted
-                    // step, ensuring the range subspace is the one the
-                    // outer IFT will use.
-                    //
-                    // Compute eigh(H_pen + ridge·I) at this cycle's H and
-                    // check whether the residual lies in null(H_pen). If
-                    // yes, accept with `converged=true` and document the
-                    // projected stationarity to the outer.
-                    let range_projection = {
-                        use crate::faer_ndarray::FaerEigh;
-                        use faer::Side;
-                        materialize_joint_hessian_source(
-                            &joint_hessian_source,
-                            total_p,
-                            "constrained-stationary range projection",
-                        )
-                        .ok()
-                        .and_then(|mut h_mat| {
-                            add_joint_penalty_to_matrix(
-                                &mut h_mat,
-                                &ranges,
-                                &s_lambdas,
-                                joint_solver_diagonal_ridge,
-                            );
-                            FaerEigh::eigh(&h_mat, Side::Lower).ok()
-                        })
-                        .and_then(|(eigvals, eigvecs)| {
-                            let lam_max = eigvals.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
-                            if !lam_max.is_finite() || lam_max <= 0.0 {
-                                return None;
-                            }
-                            let rank_tol = 1.0e-10_f64;
-                            let cutoff = rank_tol * lam_max;
-                            // Compute u_kᵀ · g for each eigvec; null
-                            // eigenvalues' contribution is the
-                            // unprojected null-residual mass.
-                            let mut range_inf = 0.0_f64;
-                            let mut null_inf = 0.0_f64;
-                            let mut null_count = 0usize;
-                            for k in 0..eigvals.len() {
-                                let u_k = eigvecs.column(k);
-                                let proj = u_k
-                                    .iter()
-                                    .zip(grad_joint.iter())
-                                    .map(|(u, gi)| u * gi)
-                                    .sum::<f64>()
-                                    .abs();
-                                if eigvals[k].abs() > cutoff {
-                                    range_inf = range_inf.max(proj);
-                                } else {
-                                    null_inf = null_inf.max(proj);
-                                    null_count += 1;
-                                }
-                            }
-                            Some((range_inf, null_inf, null_count, lam_max))
-                        })
-                    };
-                    if let Some((range_inf, null_inf, null_count, lam_max)) = range_projection
-                        && null_count > 0
-                        && range_inf <= cert_residual_factor * residual_tol
-                    {
-                        log::info!(
-                            "[PIRLS/joint-Newton convergence] cycle {:>3} | range-projected stationarity certificate: \
-                             H_pen has {} null eigenvalue(s) below {:.3e}×λ_max={:.3e}; \
-                             range-projected residual ‖U_range^T g‖∞ = {:.3e} ≤ {:.1}×tol = {:.3e}; \
-                             null-projected residual ‖U_null^T g‖∞ = {:.3e} (unresolvable — model has \
-                             unconstrained polynomial null space); scalar_relerr={:.3e}; |Δobjective|={:.3e}, \
-                             obj_tol={:.3e}; certifying convergence on the data-identifiable subspace. \
-                             The outer IFT correction routes through U_S·H_proj⁻¹·U_Sᵀ (penalty_subspace_trace) \
-                             so the envelope identity dV/dρ = ∂f/∂ρ holds for the reduced problem.",
-                            cycle,
-                            null_count,
-                            1.0e-10_f64,
-                            lam_max,
-                            range_inf,
-                            cert_residual_factor,
-                            cert_residual_factor * residual_tol,
-                            null_inf,
-                            scalar_model_relerr,
-                            objective_change,
-                            objective_tol,
-                        );
-                        converged = true;
-                        break;
-                    }
                     log::warn!(
                         "[PIRLS/joint-Newton convergence] cycle {:>3} | constrained-stationary cert REFUSED: \
                          linearized_rel={:.3e} and scalar_relerr={:.3e} are individually consistent with a \
                          Lagrange multiplier, but the projected residual={:.3e} > {:.1}×tol={:.3e} proves the \
                          multiplier claim is phantom — the active-set system does not represent whatever is \
-                         pinning g, AND no fixed null subspace of H_pen captures the residual either (range \
-                         projection attempted, did not certify). Returning unconverged so the outer optimizer \
-                         rejects this ρ; |Δobjective|={:.3e}, obj_tol={:.3e}",
+                         pinning g. Certifying range-projected stationarity here would solve a different \
+                         reduced problem and would break the full-space IFT/envelope identity used by the \
+                         outer optimizer. Returning unconverged so the outer optimizer rejects this ρ; \
+                         |Δobjective|={:.3e}, obj_tol={:.3e}",
                         cycle,
                         linearized_rel,
                         scalar_model_relerr,
