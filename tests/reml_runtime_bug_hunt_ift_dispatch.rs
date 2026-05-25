@@ -109,8 +109,8 @@ fn reml_fixed_dispersion_contract_matches_response_family_rules() {
 #[test]
 fn ift_cache_baseline_column_should_match_recomputed_column_at_same_theta_to_machine_precision() {
     let theta0 = array![0.1, -0.2, 0.3];
-    let cached_col = theta0.mapv(|v| (v * 3.0).sin() + (v * 5.0).cos());
-    let recomputed_col = theta0.mapv(|v| (v * 3.0).sin() + (v * 5.0).cos());
+    let cached_col = theta0.mapv(|v: f64| (v * 3.0).sin() + (v * 5.0).cos());
+    let recomputed_col = theta0.mapv(|v: f64| (v * 3.0).sin() + (v * 5.0).cos());
 
     let max_abs = cached_col
         .iter()
