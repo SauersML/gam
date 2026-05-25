@@ -19,7 +19,8 @@ fn parse_formula_all_supported_constructs_preserves_source_order_and_unique_ids(
 
 #[test]
 fn parse_formula_without_lhs_returns_specific_descriptive_error() {
-    let err = parse_formula("~ x + s(z)").expect_err("formula without LHS must fail with a descriptive error");
+    let err = parse_formula("~ x + s(z)")
+        .expect_err("formula without LHS must fail with a descriptive error");
     let msg = err.to_string();
     assert!(
         msg.contains("left-hand side") || msg.contains("response"),

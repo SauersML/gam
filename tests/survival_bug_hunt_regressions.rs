@@ -3,7 +3,7 @@ use gam::families::survival_construction::{
     SurvivalBaselineConfig, SurvivalBaselineTarget, SurvivalLikelihoodMode,
     build_survival_time_offsets_for_likelihood,
 };
-use ndarray::{array, Array2};
+use ndarray::{Array2, array};
 
 #[test]
 fn baseline_cumulative_hazard_is_exactly_zero_at_time_zero() {
@@ -36,7 +36,10 @@ fn competing_risks_cif_plus_survival_is_one_at_every_time() {
     let times = array![0.0, 0.2, 0.7, 1.4, 2.5];
     let h1 = array![0.0, 0.08, 0.22, 0.45, 0.9];
     let h2 = array![0.0, 0.04, 0.12, 0.31, 0.6];
-    let endpoints = vec![h1.clone().insert_axis(ndarray::Axis(0)), h2.clone().insert_axis(ndarray::Axis(0))];
+    let endpoints = vec![
+        h1.clone().insert_axis(ndarray::Axis(0)),
+        h2.clone().insert_axis(ndarray::Axis(0)),
+    ];
 
     let assembled = assemble_competing_risks_cif_from_endpoints(times.view(), &endpoints)
         .expect("CIF assembly should succeed for monotone cumulative hazards");
@@ -62,7 +65,10 @@ fn competing_risks_cif_is_bounded_between_zero_and_one() {
     let times = array![0.0, 0.5, 1.0, 2.0, 4.0];
     let h1 = array![0.0, 0.4, 1.1, 2.0, 4.2];
     let h2 = array![0.0, 0.3, 0.9, 1.7, 3.6];
-    let endpoints = vec![h1.insert_axis(ndarray::Axis(0)), h2.insert_axis(ndarray::Axis(0))];
+    let endpoints = vec![
+        h1.insert_axis(ndarray::Axis(0)),
+        h2.insert_axis(ndarray::Axis(0)),
+    ];
 
     let assembled = assemble_competing_risks_cif_from_endpoints(times.view(), &endpoints)
         .expect("CIF assembly should succeed for monotone cumulative hazards");
