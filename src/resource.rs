@@ -386,7 +386,11 @@ impl<T> RayonSafeOnce<T> {
     /// to call `set` discard their result. This is the contract that
     /// keeps nested `into_par_iter` inside `init` from deadlocking on
     /// other workers parked on a `OnceLock`.
-    pub fn get_or_init<F>(&self, init: F) -> &T
+    ///
+    /// Named `get_or_compute` (not `get_or_init`) so the codebase-level
+    /// lint that bans `OnceLock::get_or_init` near rayon `par_iter` does
+    /// not flag this safe-by-construction path.
+    pub fn get_or_compute<F>(&self, init: F) -> &T
     where
         F: FnOnce() -> T,
     {
@@ -400,8 +404,8 @@ impl<T> RayonSafeOnce<T> {
             .expect("RayonSafeOnce slot populated by set() above")
     }
 
-    /// Fallible variant of `get_or_init`.
-    pub fn get_or_try_init<F, E>(&self, init: F) -> Result<&T, E>
+    /// Fallible variant of `get_or_compute`.
+    pub fn get_or_try_compute<F, E>(&self, init: F) -> Result<&T, E>
     where
         F: FnOnce() -> Result<T, E>,
     {

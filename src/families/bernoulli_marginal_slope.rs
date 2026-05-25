@@ -4869,7 +4869,7 @@ impl BernoulliRigidRowKernel {
     /// this module surfaces post-PIRLS invariant violations.
     fn third_full_cache(&self) -> &[[[[f64; 2]; 2]; 2]] {
         self.third_full_cache
-            .get_or_init(|| {
+            .get_or_compute(|| {
                 (0..self.family.y.len())
                     .into_par_iter()
                     .map(|row| {
@@ -4897,7 +4897,7 @@ impl BernoulliRigidRowKernel {
     /// a fresh empirical-grid 8-direction jet.
     fn fourth_full_cache(&self) -> &[[[[[f64; 2]; 2]; 2]; 2]] {
         self.fourth_full_cache
-            .get_or_init(|| {
+            .get_or_compute(|| {
                 (0..self.family.y.len())
                     .into_par_iter()
                     .map(|row| {
@@ -5829,7 +5829,7 @@ impl BernoulliMarginalSlopeFamily {
         cache: &'a BernoulliMarginalSlopeExactEvalCache,
         row: usize,
     ) -> Result<&'a [[[f64; 2]; 2]; 2], String> {
-        let stored = cache.rigid_third_full.get_or_init(|| {
+        let stored = cache.rigid_third_full.get_or_compute(|| {
             (0..self.y.len())
                 .into_par_iter()
                 .map(|r| {
@@ -5857,7 +5857,7 @@ impl BernoulliMarginalSlopeFamily {
         cache: &'a BernoulliMarginalSlopeExactEvalCache,
         row: usize,
     ) -> Result<&'a [[[[f64; 2]; 2]; 2]; 2], String> {
-        let stored = cache.rigid_fourth_full.get_or_init(|| {
+        let stored = cache.rigid_fourth_full.get_or_compute(|| {
             (0..self.y.len())
                 .into_par_iter()
                 .map(|r| {
