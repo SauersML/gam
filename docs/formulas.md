@@ -219,7 +219,7 @@ stiffness). Scale-free unless `length_scale` is given.
 (mass, tension, stiffness) each get their own smoothing parameter
 under REML.
 
-### Sphere (`sphere`, `s2`, `sos`)
+### Sphere (`sphere`, `s2`, `sos`) {#intrinsic-s2-sphere-smooth}
 
 Intrinsic S² smooth for latitude/longitude data on a sphere. The implementation
 uses real spherical harmonics through degree `L`, drops the global constant so
@@ -235,12 +235,13 @@ longitude seam periodic and removes artificial boundary conditions at the poles.
 | `units` | `degrees` | Set `units=radians` as an alias for `radians=true`. |
 | `double_penalty` | `true` | Add a ridge penalty alongside the curvature penalty. |
 
-### Tensor product (`te`, `tensor`)
-
-### Tensor product (`te`, `tensor`, `interaction`)
+### Tensor product (`te`, `tensor`, `interaction`) {#periodic-cyclic-smooths}
 
 Kronecker product of univariate B-spline bases. Each axis has its own
 smoothing parameter. Use when axes have different units (space × time).
+Per-margin `periodic=[...]` with `period=[...]` selects cyclic margins;
+the same options apply to univariate `s(x, periodic=true, period=2*pi)`
+and to 1-D `duchon(...)`.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
