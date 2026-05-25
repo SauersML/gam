@@ -17129,6 +17129,24 @@ mod tests {
         InsideRangeSPlus,
     }
 
+    #[test]
+    fn active_projected_kkt_residual_is_reduced_before_projected_ift() {
+        let kernel = PenaltySubspaceTrace {
+            u_s: array![[1.0], [0.0]],
+            h_proj_inverse: array![[0.25]],
+        };
+        let active = ProjectedKktResidual::from_active_projected(array![3.0, 4.0])
+            .with_metadata(1.0e-6, 1);
+
+        let reduced = active.projected_into_reduced_range(&kernel);
+
+        assert_eq!(reduced.subspace(), KktResidualSubspace::ReducedRange);
+        assert_relative_eq!(reduced.as_array()[0], 3.0, epsilon = 1e-12);
+        assert_relative_eq!(reduced.as_array()[1], 0.0, epsilon = 1e-12);
+        assert_eq!(reduced.residual_tol(), Some(1.0e-6));
+        assert_eq!(reduced.free_rank(), Some(1));
+    }
+
     /// Build a `PenaltySubspaceTrace` from a full H + U_S pair, using the
     /// exact same formula the production code uses: `H_proj⁻¹ = (U_Sᵀ H
     /// U_S)⁻¹`. Inverts the projected matrix analytically for the test.
