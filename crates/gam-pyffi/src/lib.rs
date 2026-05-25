@@ -20378,6 +20378,107 @@ fn identifiable_factor_select_weights_array<'py>(
     Ok(out.unbind())
 }
 
+/// Partial-supervision gauge-fix solver.
+///
+/// Single-call FFI for the supervised + free latent-block gauge fix used by
+/// `gamfit.recipes.partial_supervision` (and reusable from the CLI / R /
+/// Julia bindings). All linear-algebra work — orthogonal Procrustes via
+/// SVD, anchor least-squares via SVD pseudo-inverse, soft-L2 ridge map via
+/// symmetric eigendecomposition with a GCV grid, and the orthogonal-
+/// complement projection via thin QR — runs in Rust through the faer
+/// bridge.
+///
+/// Parameters
+/// ----------
+/// t_sup, aux : (N, d_sup) f64 arrays
+///     Initial supervised block and the auxiliary target it aligns to.
+/// t_free : (N, d_free) f64 array
+///     Free block; ``d_free`` may be zero.
+/// method : {"procrustes", "anchor", "soft_l2"}
+///     Supervised-block alignment method.
+/// anchor_idx : Vec<i64>
+///     Anchor rows for the ``anchor`` method (ignored otherwise).
+/// free_constraint : {"orthogonal_to_sup", "none"}
+///     Decorrelation rule for the free block.
+///
+/// Returns a dict with keys: ``t_supervised``, ``t_free``,
+/// ``alignment_score``, ``selected_weight``, ``map_r``, ``map_a``,
+/// ``map_b``. Values not produced by the chosen method are returned as
+/// Python ``None``.
+#[pyfunction(signature = (t_sup, aux, t_free, method, anchor_idx, free_constraint))]
+fn partial_supervision_solve<'py>(
+    py: Python<'py>,
+    t_sup: PyReadonlyArray2<'py, f64>,
+    aux: PyReadonlyArray2<'py, f64>,
+    t_free: PyReadonlyArray2<'py, f64>,
+    method: &str,
+    anchor_idx: Vec<i64>,
+    free_constraint: &str,
+) -> PyResult<Py<PyDict>> {
+    let method_enum = match method {
+        "procrustes" => gam::identifiability::PartialSupervisionSupMethod::Procrustes,
+        "anchor" => gam::identifiability::PartialSupervisionSupMethod::Anchor,
+        "soft_l2" => gam::identifiability::PartialSupervisionSupMethod::SoftL2,
+        other => {
+            return Err(py_value_error(format!(
+                "partial_supervision_solve: method must be 'procrustes', 'anchor' or \
+                 'soft_l2'; got {other:?}"
+            )));
+        }
+    };
+    let free_enum = match free_constraint {
+        "orthogonal_to_sup" => {
+            gam::identifiability::PartialSupervisionFreeConstraint::OrthogonalToSup
+        }
+        "none" => gam::identifiability::PartialSupervisionFreeConstraint::None,
+        other => {
+            return Err(py_value_error(format!(
+                "partial_supervision_solve: free_constraint must be 'orthogonal_to_sup' or \
+                 'none'; got {other:?}"
+            )));
+        }
+    };
+    let mut anchor_usize: Vec<usize> = Vec::with_capacity(anchor_idx.len());
+    for idx in &anchor_idx {
+        if *idx < 0 {
+            return Err(py_value_error(format!(
+                "partial_supervision_solve: anchor_idx entries must be non-negative; got {idx}"
+            )));
+        }
+        anchor_usize.push(*idx as usize);
+    }
+    let result = gam::identifiability::partial_supervision_solve(
+        t_sup.as_array(),
+        aux.as_array(),
+        t_free.as_array(),
+        method_enum,
+        &anchor_usize,
+        free_enum,
+    )
+    .map_err(py_value_error)?;
+    let out = PyDict::new(py);
+    out.set_item("t_supervised", result.t_supervised.into_pyarray(py))?;
+    out.set_item("t_free", result.t_free.into_pyarray(py))?;
+    out.set_item("alignment_score", result.alignment_score)?;
+    match result.selected_weight {
+        Some(v) => out.set_item("selected_weight", v)?,
+        None => out.set_item("selected_weight", py.None())?,
+    }
+    match result.map_r {
+        Some(arr) => out.set_item("map_r", arr.into_pyarray(py))?,
+        None => out.set_item("map_r", py.None())?,
+    }
+    match result.map_a {
+        Some(arr) => out.set_item("map_a", arr.into_pyarray(py))?,
+        None => out.set_item("map_a", py.None())?,
+    }
+    match result.map_b {
+        Some(arr) => out.set_item("map_b", arr.into_pyarray(py))?,
+        None => out.set_item("map_b", py.None())?,
+    }
+    Ok(out.unbind())
+}
+
 fn py_value_error(message: String) -> PyErr {
     // Final defensive translation at the Python boundary: convert the
     // cryptic Rust assertion "SurvivalLocationScaleFamily expects N blocks,
