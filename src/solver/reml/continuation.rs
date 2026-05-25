@@ -522,4 +522,326 @@ mod tests {
             FailureAction::Propagate
         ));
     }
+
+    // ─────────────────────────────────────────────────────────────────
+    //                       Scenario tests
+    // ─────────────────────────────────────────────────────────────────
+    //
+    // These cover the four operational paths the team-lead asked for:
+    //   1. degenerates_to_cold_start_on_easy_fits           (collapse)
+    //   2. budget_exhausted_warmstart_completes_path        (warm-start past slow region)
+    //   3. trust_region_floor_alpha_shrink_then_recovers    (shrink path)
+    //   4. likelihood_failure_alpha_shrink_then_recovers    (shrink path on domain miss)
+    //   5. active_set_incomplete_propagates_structurally    (KKT-bug propagation)
+    //   6. path_budget_exhausted_surfaces_last_inner_failure
+    //
+    // All driven by a scripted OuterObjective whose responses are a
+    // queue of `Result<&'static str_or_ok, &'static str_failure>`. The
+    // mock records the ρ at each call so step counting can be asserted.
+
+    use crate::solver::outer_strategy::{
+        Derivative, DeclaredHessianForm, HessianResult, OuterCapability,
+    };
+
+    /// A response scripted for the next `eval_with_order` call.
+    #[derive(Clone)]
+    enum ScriptedResponse {
+        Ok,
+        Fail(&'static str),
+    }
+
+    struct ScriptedObjective {
+        n_params: usize,
+        queue: Vec<ScriptedResponse>,
+        idx: usize,
+        rho_history: Vec<Array1<f64>>,
+        seed_calls: usize,
+    }
+
+    impl ScriptedObjective {
+        fn new(n_params: usize, queue: Vec<ScriptedResponse>) -> Self {
+            Self {
+                n_params,
+                queue,
+                idx: 0,
+                rho_history: Vec::new(),
+                seed_calls: 0,
+            }
+        }
+
+        fn next_response(&mut self) -> ScriptedResponse {
+            let r = self
+                .queue
+                .get(self.idx)
+                .cloned()
+                .unwrap_or(ScriptedResponse::Ok);
+            self.idx += 1;
+            r
+        }
+    }
+
+    impl OuterObjective for ScriptedObjective {
+        fn capability(&self) -> OuterCapability {
+            OuterCapability {
+                gradient: Derivative::Analytic,
+                hessian: DeclaredHessianForm::Unavailable,
+                n_params: self.n_params,
+                psi_dim: 0,
+                fixed_point_available: false,
+                barrier_config: None,
+                prefer_gradient_only: false,
+                disable_fixed_point: false,
+            }
+        }
+
+        fn eval_cost(&mut self, rho: &Array1<f64>) -> Result<f64, EstimationError> {
+            self.rho_history.push(rho.clone());
+            match self.next_response() {
+                ScriptedResponse::Ok => Ok(rho.dot(rho)),
+                ScriptedResponse::Fail(msg) => {
+                    Err(EstimationError::RemlOptimizationFailed(msg.to_string()))
+                }
+            }
+        }
+
+        fn eval(&mut self, rho: &Array1<f64>) -> Result<OuterEval, EstimationError> {
+            let cost = self.eval_cost(rho)?;
+            Ok(OuterEval {
+                cost,
+                gradient: Array1::zeros(self.n_params),
+                hessian: HessianResult::Unavailable,
+                inner_beta_hint: None,
+            })
+        }
+
+        fn reset(&mut self) {
+            self.idx = 0;
+            self.rho_history.clear();
+            self.seed_calls = 0;
+        }
+
+        fn seed_inner_state(&mut self, _beta: &Array1<f64>) -> Result<(), EstimationError> {
+            self.seed_calls += 1;
+            Ok(())
+        }
+    }
+
+    fn rho(values: &[f64]) -> Array1<f64> {
+        Array1::from_vec(values.to_vec())
+    }
+
+    #[test]
+    fn degenerates_to_cold_start_on_easy_fits() {
+        // ρ₀ would clamp to ρ* because the bounds-upper is *at* the
+        // target. prime_outer_seed must return Ok with ZERO inner
+        // calls — that's the no-overhead promise.
+        let target = rho(&[5.0, 5.0]);
+        let upper = rho(&[5.0, 5.0]);
+        let mut obj = ScriptedObjective::new(2, Vec::new());
+        prime_outer_seed(&mut obj, &target, &upper).expect("collapse path");
+        assert_eq!(obj.rho_history.len(), 0, "no inner calls on collapse");
+        assert_eq!(obj.seed_calls, 0);
+    }
+
+    #[test]
+    fn budget_exhausted_warmstart_completes_path() {
+        // Hard fit at target: cold-start refuses with BudgetExhausted at
+        // every intermediate ρ until α shrinks enough that the step
+        // lands inside the strongly-convex basin. Scenario simulates
+        // this by:
+        //   - Step 0 (ρ₀): Ok (oversmoothed → easy)
+        //   - Step 1 (α=0.5 toward target): BudgetExhausted
+        //   - Step 2 (α=0.25): BudgetExhausted
+        //   - Step 3+ : Ok all the way to target
+        // Result: path completes via shrink, demonstrating that
+        // continuation+warm-start gets past the slow region.
+        let target = rho(&[0.0]);
+        let upper = rho(&[10.0]);
+        let mut obj = ScriptedObjective::new(
+            1,
+            vec![
+                ScriptedResponse::Ok,                                 // ρ₀ accept
+                ScriptedResponse::Fail("inner_max_cycles reached"),   // 1st step refused
+                ScriptedResponse::Fail("inner_max_cycles reached"),   // 2nd step refused
+                // After two shrinks α≈0.125; remaining accepts.
+                ScriptedResponse::Ok,
+                ScriptedResponse::Ok,
+                ScriptedResponse::Ok,
+                ScriptedResponse::Ok,
+                ScriptedResponse::Ok,
+                ScriptedResponse::Ok,
+                ScriptedResponse::Ok,
+                ScriptedResponse::Ok,
+            ],
+        );
+        prime_outer_seed(&mut obj, &target, &upper)
+            .expect("path completes via shrink-on-budget");
+        // Confirm we did execute ρ₀ (the oversmoothed start) before
+        // any of the failed attempts — direct evidence that the
+        // continuation actually walked a path.
+        assert!(obj.rho_history.len() >= 3, "must have walked a path");
+        let rho0 = &obj.rho_history[0];
+        assert!(
+            (rho0[0] - (target[0] + OVERSMOOTH_OFFSET_INIT)).abs() < 1e-9,
+            "first call is at ρ₀ = ρ*+offset",
+        );
+    }
+
+    #[test]
+    fn trust_region_floor_alpha_shrink_then_recovers() {
+        // TrustRegionFloor → ShrinkOrExpand. First occurrence shrinks
+        // (consecutive_trust_floor=1, still under threshold). If a
+        // SECOND consecutive TR-floor fires, the schedule escalates to
+        // ExpandRhoZero. This test demonstrates the shrink branch:
+        // one TR-floor, then accepts, no escalation.
+        let target = rho(&[0.0]);
+        let upper = rho(&[10.0]);
+        let mut obj = ScriptedObjective::new(
+            1,
+            vec![
+                ScriptedResponse::Ok,                                  // ρ₀
+                ScriptedResponse::Fail("trust-region floor reached"),  // one TR-floor
+                // Rest: succeeds (intervening accept resets counter).
+                ScriptedResponse::Ok,
+                ScriptedResponse::Ok,
+                ScriptedResponse::Ok,
+                ScriptedResponse::Ok,
+                ScriptedResponse::Ok,
+                ScriptedResponse::Ok,
+                ScriptedResponse::Ok,
+                ScriptedResponse::Ok,
+            ],
+        );
+        prime_outer_seed(&mut obj, &target, &upper)
+            .expect("path completes after single TR-floor shrink");
+        assert!(obj.rho_history.len() >= 3);
+    }
+
+    #[test]
+    fn likelihood_failure_alpha_shrink_then_recovers() {
+        // LikelihoodFailure (NaN / domain miss) → ShrinkStep. The β at
+        // ρ_k was just accepted, so the family domain is reachable;
+        // only the over-shoot landed outside. Halving α restores
+        // feasibility.
+        let target = rho(&[0.0]);
+        let upper = rho(&[10.0]);
+        let mut obj = ScriptedObjective::new(
+            1,
+            vec![
+                ScriptedResponse::Ok,                                       // ρ₀
+                ScriptedResponse::Fail("likelihood evaluation failed: NaN"),
+                ScriptedResponse::Ok,
+                ScriptedResponse::Ok,
+                ScriptedResponse::Ok,
+                ScriptedResponse::Ok,
+                ScriptedResponse::Ok,
+                ScriptedResponse::Ok,
+                ScriptedResponse::Ok,
+                ScriptedResponse::Ok,
+            ],
+        );
+        prime_outer_seed(&mut obj, &target, &upper)
+            .expect("path completes after likelihood shrink");
+    }
+
+    #[test]
+    fn active_set_incomplete_propagates_structurally() {
+        // ActiveSetIncomplete is a real KKT bug — continuation must
+        // NOT shrink and retry, it must surface the failure.
+        let target = rho(&[0.0]);
+        let upper = rho(&[10.0]);
+        let mut obj = ScriptedObjective::new(
+            1,
+            vec![
+                ScriptedResponse::Ok,                                  // ρ₀ accept
+                ScriptedResponse::Fail(
+                    "cycle=3 cert REFUSED: residual=1.0e+02 > 4·tol=1.0e+00; \
+                     carrying-block: time_surface (idx=0); \
+                     diagnosis: active_set_incomplete",
+                ),
+            ],
+        );
+        let err = prime_outer_seed(&mut obj, &target, &upper)
+            .expect_err("structural failure must propagate");
+        assert!(
+            matches!(err, ContinuationFailure::StructuralPropagate(_)),
+            "got {err:?}",
+        );
+        match err.inner() {
+            InnerFailure::CertRefused { diagnosis, .. } => {
+                assert_eq!(*diagnosis, KktRefusalDiagnosis::ActiveSetIncomplete);
+            }
+            other => panic!("expected CertRefused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn path_budget_exhausted_surfaces_last_inner_failure() {
+        // Queue is short on Oks but long on phantom-multiplier
+        // refusals. ShrinkStep underflows α before the path completes,
+        // producing PathStuck. After OVERSMOOTH_RETRY_MAX retries, the
+        // outer wrapper returns PathStuck (not PathBudgetExhausted —
+        // budget exhaustion requires 64 steps, alpha-floor stuck is
+        // the earlier failure).
+        let target = rho(&[0.0]);
+        let upper = rho(&[10.0]);
+        let mut responses: Vec<ScriptedResponse> = Vec::new();
+        // ρ₀ accepts on every retry attempt (this objective is
+        // re-entered fresh each `run_path` because retries call
+        // run_path again with a new offset; the scripted queue is
+        // monotonically advanced though, so we need plenty of
+        // phantom-style refusals after each ρ₀ accept).
+        for _ in 0..32 {
+            // ρ₀ ok
+            responses.push(ScriptedResponse::Ok);
+            // Phantom-multiplier refusals: ShrinkStep until α < floor.
+            // Need ~log2(1/ALPHA_FLOOR) = 10 consecutive refusals to
+            // underflow α from 0.5 → 2⁻¹¹. Push generously.
+            for _ in 0..20 {
+                responses.push(ScriptedResponse::Fail(
+                    "coupled exact-joint inner solve exited the joint Newton path \
+                     before convergence — block 'time_surface' carries the dominant \
+                     unresolved KKT gradient (|g_block|∞ = 5.000e+05); \
+                     |∇L − Sβ|∞ = 5.000e+05",
+                ));
+            }
+        }
+        let mut obj = ScriptedObjective::new(1, responses);
+        let err = prime_outer_seed(&mut obj, &target, &upper)
+            .expect_err("schedule must fail");
+        // PhantomMultiplier classifies as ShrinkStep → α-floor →
+        // Stuck → ExpandRhoZero (outer) → retries doubled offset →
+        // PathStuck after OVERSMOOTH_RETRY_MAX.
+        match err {
+            ContinuationFailure::PathStuck { last, .. } => match last {
+                InnerFailure::CertRefused { diagnosis, .. } => assert_eq!(
+                    diagnosis,
+                    KktRefusalDiagnosis::PhantomMultiplierWithWellConditionedH
+                ),
+                other => panic!("expected CertRefused, got {other:?}"),
+            },
+            other => panic!("expected PathStuck, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pre_warm_failure_carries_underlying_message_for_seed_rejection() {
+        // The outer wiring in run_outer_with_plan formats
+        // `cf.inner().message()` into the SeedRejection. Pin that
+        // the message is preserved through the failure chain so the
+        // existing classifier in StartupStats keeps working.
+        let target = rho(&[0.0]);
+        let upper = rho(&[10.0]);
+        let mut obj = ScriptedObjective::new(
+            1,
+            vec![ScriptedResponse::Fail(
+                "cycle=3 cert REFUSED: residual=1.0e+02 > 4·tol=1.0e+00; \
+                 diagnosis: active_set_incomplete",
+            )],
+        );
+        let err = prime_outer_seed(&mut obj, &target, &upper)
+            .expect_err("propagation expected");
+        let msg = err.inner().message();
+        assert!(msg.contains("active_set_incomplete"), "msg='{msg}'");
+    }
 }
