@@ -126,7 +126,10 @@ pub fn global_policy() -> GpuPolicy {
     // silently lock the policy to `Auto`.  Keep the slot uninitialized
     // until explicitly configured so first-writer-wins applies only to
     // genuine writes, not to incidental reads from probe/dispatch code.
-    POLICY.get().copied().unwrap_or(GpuPolicy::Auto)
+    match POLICY.get() {
+        Some(p) => *p,
+        None => GpuPolicy::Auto,
+    }
 }
 
 /// Configure the process-wide policy before solver kernels are selected.
