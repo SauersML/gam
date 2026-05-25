@@ -1505,6 +1505,18 @@ impl SaeManifoldTerm {
             }
 
             // Beta gradient/Hessian and local-beta cross block.
+            //
+            // The per-row beta Jacobian is
+            //   J_β[out_col, beta_idx] = a_k · phi_k[basis_col]   if out_col == out_col(beta_idx)
+            //                            0                         otherwise
+            // so the data-fit Gauss-Newton beta-Hessian factors as a rank-`p`
+            // sum of outer products. We pre-compute the per-(atom, basis_col)
+            // scalar `a_k · phi_k` once and reuse it across the `out_col`,
+            // `local_col`, and inner `(atom_j, basis_col2)` loops. This keeps
+            // the asymptotic O((K·M)² · P) work but removes a P-factor of
+            // redundant scalar arithmetic and ndarray indexing in the hot
+            // inner Hessian assembly.
+            let mut a_phi: Vec<(usize, f64)> = Vec::with_capacity(k_atoms * 4);
             for atom_idx in 0..k_atoms {
                 let atom = &self.atoms[atom_idx];
                 let atom_beta_off = beta_offsets[atom_idx];
@@ -1512,25 +1524,26 @@ impl SaeManifoldTerm {
                 let a_k = assignments[atom_idx];
                 for basis_col in 0..m {
                     let phi = atom.basis_values[[row, basis_col]];
-                    for out_col in 0..p {
-                        let beta_idx = atom_beta_off + basis_col * p + out_col;
-                        let j_beta = a_k * phi;
-                        sys.gb[beta_idx] += j_beta * error[out_col];
-                        for local_col in 0..q {
-                            block.htbeta[[local_col, beta_idx]] +=
-                                local_jac[[local_col, out_col]] * j_beta;
-                        }
-                        for atom_j in 0..k_atoms {
-                            let atom2 = &self.atoms[atom_j];
-                            let m2 = atom2.basis_size();
-                            let off2 = beta_offsets[atom_j];
-                            let a_j = assignments[atom_j];
-                            for basis_col2 in 0..m2 {
-                                let beta_j = off2 + basis_col2 * p + out_col;
-                                sys.hbb[[beta_idx, beta_j]] +=
-                                    j_beta * a_j * atom2.basis_values[[row, basis_col2]];
-                            }
-                        }
+                    a_phi.push((atom_beta_off + basis_col * p, a_k * phi));
+                }
+            }
+            for &(beta_base_i, j_beta_i) in a_phi.iter() {
+                if j_beta_i == 0.0 {
+                    // Skip rank-1 outer product whose left factor is zero;
+                    // saves a full (q + Σ M) · p pass for masked / inactive
+                    // atoms (e.g. assignment exactly zeroed by JumpReLU).
+                    continue;
+                }
+                for out_col in 0..p {
+                    let beta_idx = beta_base_i + out_col;
+                    sys.gb[beta_idx] += j_beta_i * error[out_col];
+                    for local_col in 0..q {
+                        block.htbeta[[local_col, beta_idx]] +=
+                            local_jac[[local_col, out_col]] * j_beta_i;
+                    }
+                    for &(beta_base_j, j_beta_j) in a_phi.iter() {
+                        let beta_j = beta_base_j + out_col;
+                        sys.hbb[[beta_idx, beta_j]] += j_beta_i * j_beta_j;
                     }
                 }
             }
