@@ -11503,6 +11503,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         const RESIDUAL_STALL_NO_IMPROVE_CYCLES: usize = 30;
         const RESIDUAL_STALL_MIN_CYCLES: usize = 40;
         const RESIDUAL_STALL_IMPROVEMENT_FACTOR: f64 = 0.9;
+        const RESIDUAL_STALL_BLOCK_GRADIENT_FACTOR: f64 = 50.0;
         let mut best_residual_seen: f64 = f64::INFINITY;
         let mut cycles_since_residual_improved: usize = 0;
         let mut tr_clamped_during_stall: bool = false;
@@ -12512,6 +12513,35 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     .fold(0.0_f64, f64::max)
             };
             let residual_tol = inner_tol * (1.0 + grad_inf.max(pen_inf));
+            let block_stationarity_norms = {
+                let projected = exact_newton_joint_projected_stationarity_vector_from_gradient(
+                    gradient,
+                    &states,
+                    specs,
+                    &s_lambdas,
+                    ridge,
+                    options.ridge_policy,
+                    &block_constraints,
+                    Some(cached_active_sets.as_slice()),
+                )?;
+                let mut offset = 0usize;
+                states
+                    .iter()
+                    .map(|state| {
+                        let start = offset;
+                        let end = start + state.beta.len();
+                        offset = end;
+                        projected
+                            .slice(ndarray::s![start..end])
+                            .iter()
+                            .map(|x: &f64| x.abs())
+                            .fold(0.0_f64, f64::max)
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let all_block_stationarity_small = block_stationarity_norms.iter().all(|norm| {
+                norm.is_finite() && *norm <= RESIDUAL_STALL_BLOCK_GRADIENT_FACTOR * residual_tol
+            });
             let near_convergence = residual <= 10.0 * residual_tol;
             let signed_obj_change = lastobjective - old_objective;
             let objective_change = signed_obj_change.abs();
@@ -12866,14 +12896,14 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // Track the best residual seen so far and the number of
             // cycles since any meaningful improvement (≥ 10 % drop). Once
             // the inner has burned at least RESIDUAL_STALL_MIN_CYCLES
-            // without progress AND the accepted step kept hitting the
-            // trust-region clamp, return `converged = false` with the
-            // current finite β. The outer wrapper will see the same
-            // non-converged signal it would have at inner_max_cycles —
-            // but now it sees it after ~40 cycles instead of 100, and
-            // (more importantly) without the bridge's stale-gradient
-            // amplification, because the inner mode cache has not yet
-            // been "blessed" as same-ρ converged.
+            // without progress, the accepted step kept hitting the
+            // trust-region clamp, AND every block is already inside a
+            // loose stationarity band, return `converged = false` with
+            // the current finite β. The per-block gate is essential for
+            // block-metric trust regions: an aggregate residual plateau
+            // dominated by one near-singular block must not hide an
+            // unresolved marginal block that can still make progress under
+            // its own radius.
             if residual.is_finite() {
                 if residual < RESIDUAL_STALL_IMPROVEMENT_FACTOR * best_residual_seen {
                     best_residual_seen = residual;
@@ -12890,6 +12920,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             if cycle + 1 >= RESIDUAL_STALL_MIN_CYCLES
                 && cycles_since_residual_improved >= RESIDUAL_STALL_NO_IMPROVE_CYCLES
                 && tr_clamped_during_stall
+                && all_block_stationarity_small
             {
                 let last_math_summary = last_joint_math
                     .as_ref()
@@ -12908,13 +12939,14 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     })
                     .unwrap_or_else(|| "last_newton_math=<none>".to_string());
                 log::warn!(
-                    "[PIRLS/joint-Newton convergence] cycle {:>3} | residual-stall early-exit: residual={:.3e} best_seen={:.3e} no_improve_cycles={} accepted_step_inf={:.3e} trust_radius={:.3e} {}; returning unconverged with finite β so the outer optimizer rejects this ρ evaluation before inner_max_cycles.",
+                    "[PIRLS/joint-Newton convergence] cycle {:>3} | residual-stall early-exit: residual={:.3e} best_seen={:.3e} no_improve_cycles={} accepted_step_inf={:.3e} trust_radius={:.3e} block_stationarity_inf={:?} {}; returning unconverged with finite β so the outer optimizer rejects this ρ evaluation before inner_max_cycles.",
                     cycle,
                     residual,
                     best_residual_seen,
                     cycles_since_residual_improved,
                     accepted_step_inf,
                     joint_trust_radius,
+                    block_stationarity_norms,
                     last_math_summary,
                 );
                 converged = false;
