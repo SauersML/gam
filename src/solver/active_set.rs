@@ -1068,15 +1068,14 @@ fn solve_newton_direction_with_linear_constraints_impl(
     let kkt_strong_ok = (working_kkt.stationarity <= 2e-6 || stationarity_rel <= 2e-6)
         && working_kkt.complementarity <= 1e-6;
     let model_descent_ok = predicted_delta <= -1e-10 * (1.0 + grad_inf * step_inf);
-    let near_null_step_ok = step_inf <= 1e-10;
     let degenerate_boundary_ok = compressed_working.is_degenerate_face()
         && worst <= 1e-8
         && working_kkt.primal_feasibility <= 1e-8
         && working_kkt.complementarity <= 1e-6
-        && (working_kkt.stationarity <= 1e-3 || stationarity_rel <= 2e-6 || near_null_step_ok);
+        && (working_kkt.stationarity <= 1e-3 || stationarity_rel <= 2e-6);
     if worst <= 1e-8
         && ((working_kkt.dual_feasibility <= 1e-8
-            && (kkt_strong_ok || model_descent_ok || near_null_step_ok))
+            && (kkt_strong_ok || model_descent_ok))
             || degenerate_boundary_ok)
     {
         if let Some(hint) = active_hint {

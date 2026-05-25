@@ -44,9 +44,34 @@ pub fn exp_sigma_from_eta_scalar(eta: f64) -> f64 {
     safe_exp(eta)
 }
 
+/// Maximum exponent argument for the one-sided overflow guard on the
+/// inverse sigma link. exp(500) ≈ 1.4e217 leaves ~91 orders of magnitude
+/// of headroom before reaching f64::MAX ≈ 1.8e308, sufficient for any
+/// reasonable downstream multiplicative chain.
+pub const EXP_NEG_STABLE_MAX_ARG: f64 = 500.0;
+
+/// Overflow-safe `exp(-x)`: guards against overflow when `x` is very
+/// negative (so `exp(-x)` would overflow to +inf) by capping the exponent
+/// at +500, but allows natural IEEE 754 underflow to 0.0 when `x` is
+/// very positive.
+///
+/// The one-sided guard is critical: for `x = 701` the correct value is
+/// `exp(-701) ≈ 5e-305` (essentially zero), NOT `exp(-500) ≈ 7e-218`.
+/// A two-sided clamp would return the latter, which is ~1e87× too large
+/// and destroys far-tail exact derivatives.
+#[inline]
+pub fn exp_neg_stable(x: f64) -> f64 {
+    (-x).min(EXP_NEG_STABLE_MAX_ARG).exp()
+}
+
+/// Inverse exp-link `1/σ = exp(-η)` with the one-sided overflow guard
+/// from [`exp_neg_stable`]. Required by every solver path that forms
+/// products like `t · exp(-η_ls)` — without the guard, very negative
+/// η_ls produces `+inf`, which propagates as `NaN` through subsequent
+/// multiplications and breaks the monotonicity floor / penalty chain.
 #[inline]
 pub fn exp_sigma_inverse_from_eta_scalar(eta: f64) -> f64 {
-    (-eta).exp()
+    exp_neg_stable(eta)
 }
 
 #[inline]

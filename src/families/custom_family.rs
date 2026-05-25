@@ -11,7 +11,8 @@ use crate::smooth::{
     try_build_spatial_log_kappa_derivativeinfo_list,
 };
 use crate::solver::active_set::{
-    rank_reduce_rows_pivoted_qr, solve_quadratic_with_linear_constraints,
+    project_stationarity_residual_on_constraint_cone, rank_reduce_rows_pivoted_qr,
+    solve_quadratic_with_linear_constraints,
 };
 use crate::solver::estimate::reml::penalty_logdet::PenaltyPseudologdet;
 use crate::solver::estimate::reml::unified::{
@@ -11261,6 +11262,9 @@ struct KktRefusalReport {
     hpen_condition_number: f64,
     hpen_nullity_at_rank_tol: usize,
     hpen_rank_tol: f64,
+    hpen_null_gradient_inf: f64,
+    hpen_null_vector_block_inf: Vec<f64>,
+    hpen_null_vector_carrying_block: Option<usize>,
 
     active_set_rows_total: usize,
     accepted_step_inf: f64,
@@ -11558,6 +11562,9 @@ fn compute_kkt_refusal_report(
     let mut hpen_max_abs_eigenvalue = f64::NAN;
     let mut hpen_condition_number = f64::NAN;
     let mut hpen_nullity_at_rank_tol = 0usize;
+    let mut hpen_null_gradient_inf = f64::NAN;
+    let mut hpen_null_vector_block_inf = Vec::new();
+    let mut hpen_null_vector_carrying_block = None;
     if total_p > 0
         && let Ok(mut h_joint) = materialize_joint_hessian_source(
             joint_hessian_source,
@@ -11567,7 +11574,7 @@ fn compute_kkt_refusal_report(
     {
         add_joint_penalty_to_matrix(&mut h_joint, ranges, s_lambdas, joint_solver_diagonal_ridge);
         symmetrize_dense_in_place(&mut h_joint);
-        if let Ok((evals, _)) = FaerEigh::eigh(&h_joint, Side::Lower) {
+        if let Ok((evals, evecs)) = FaerEigh::eigh(&h_joint, Side::Lower) {
             let mut sorted: Vec<f64> = evals.iter().copied().collect();
             sorted.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
             let max_abs = sorted.iter().map(|x: &f64| x.abs()).fold(0.0_f64, f64::max);
@@ -11588,6 +11595,38 @@ fn compute_kkt_refusal_report(
             } else {
                 f64::INFINITY
             };
+            if let Some(residual) = residual_vec_opt.as_ref()
+                && residual.len() == total_p
+                && hpen_nullity_at_rank_tol > 0
+            {
+                let mut best_component = 0.0_f64;
+                let mut best_block_inf = vec![0.0_f64; ranges.len()];
+                for k in 0..evals.len() {
+                    if evals[k].abs() >= cutoff {
+                        continue;
+                    }
+                    let component = evecs.column(k).dot(residual).abs();
+                    if component > best_component {
+                        best_component = component;
+                        best_block_inf.clear();
+                        best_block_inf.extend(ranges.iter().map(|(start, end)| {
+                            evecs
+                                .slice(ndarray::s![*start..*end, k])
+                                .iter()
+                                .map(|x: &f64| x.abs())
+                                .fold(0.0_f64, f64::max)
+                        }));
+                    }
+                }
+                hpen_null_gradient_inf = best_component;
+                hpen_null_vector_block_inf = best_block_inf;
+                hpen_null_vector_carrying_block = hpen_null_vector_block_inf
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, v)| v.is_finite())
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|(i, _)| i);
+            }
             hpen_eigenvalues_sorted_desc = sorted;
         }
     }
@@ -11628,6 +11667,9 @@ fn compute_kkt_refusal_report(
         hpen_condition_number,
         hpen_nullity_at_rank_tol,
         hpen_rank_tol: KKT_REFUSAL_RANK_TOL,
+        hpen_null_gradient_inf,
+        hpen_null_vector_block_inf,
+        hpen_null_vector_carrying_block,
         active_set_rows_total,
         accepted_step_inf,
         proposal_step_inf,
@@ -11671,6 +11713,22 @@ impl KktRefusalReport {
         self.block_beta_inf.iter().copied().fold(0.0_f64, f64::max)
     }
 
+    fn null_direction_label(&self) -> String {
+        match self.hpen_null_vector_carrying_block {
+            Some(idx) => format!(
+                "{} (idx={}, |u_block|∞={:.3e}, |uᵀg_proj|={:.3e})",
+                self.block_names.get(idx).map(String::as_str).unwrap_or("?"),
+                idx,
+                self.hpen_null_vector_block_inf
+                    .get(idx)
+                    .copied()
+                    .unwrap_or(f64::NAN),
+                self.hpen_null_gradient_inf,
+            ),
+            None => format!("none (|uᵀg_proj|={:.3e})", self.hpen_null_gradient_inf),
+        }
+    }
+
     /// Multi-line structured log emitted at the cert REFUSED site. The
     /// per-block residual / eigenspectrum / diagnosis breakdown is what
     /// makes the failure actionable (vs the legacy one-liner that only
@@ -11681,6 +11739,7 @@ impl KktRefusalReport {
              carrying-block: {}\n  \
              block_names={:?}, block_widths={:?}, block_grad_inf={:?}, block_penalty_grad_inf={:?}, block_residual_inf={:?}\n  \
              H_pen spectrum: λ_max={:.3e}, λ_min={:.3e}, cond={:.3e}, nullity@{:.0e}={} (of {} eigenvalues)\n  \
+             free-null diagnostic: {}\n  \
              cert math: linearized_rel={:.3e}, scalar_relerr={:.3e}, |Δobj|={:.3e} (tol={:.3e}), accepted_step_inf={:.3e} (tol={:.3e}), proposal_step_inf={:.3e}, trust_radius={:.3e}, |β|∞={:.3e}, active_set_rows_total={}\n  \
              diagnosis: {}",
             self.cycle,
@@ -11698,6 +11757,7 @@ impl KktRefusalReport {
             self.hpen_rank_tol,
             self.hpen_nullity_at_rank_tol,
             self.hpen_eigenvalues_sorted_desc.len(),
+            self.null_direction_label(),
             self.linearized_rel,
             self.scalar_model_relerr,
             self.objective_change,
@@ -11722,6 +11782,7 @@ impl KktRefusalReport {
              carrying-block: {}; block_names={:?}, block_widths={:?}, \
              block_grad_inf={:?}, block_penalty_grad_inf={:?}, block_residual_inf={:?}; \
              H_pen spectrum: λ_max={:.3e}, λ_min={:.3e}, cond={:.3e}, nullity@{:.0e}={}/{}; \
+             free-null diagnostic: {}; \
              cert math: linearized_rel={:.3e}, scalar_relerr={:.3e}, |Δobj|={:.3e}, \
              accepted_step_inf={:.3e}, proposal_step_inf={:.3e}, trust_radius={:.3e}, \
              |β|∞={:.3e}, active_set_rows_total={}; diagnosis: {}; \
@@ -11743,6 +11804,7 @@ impl KktRefusalReport {
             self.hpen_rank_tol,
             self.hpen_nullity_at_rank_tol,
             self.hpen_eigenvalues_sorted_desc.len(),
+            self.null_direction_label(),
             self.linearized_rel,
             self.scalar_model_relerr,
             self.objective_change,
@@ -12502,7 +12564,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             let solve_joint_constraints_dense = joint_constraints.is_some()
                 || !matrix_free_joint_requested
                 || joint_hessian_is_dense;
-            let (candidate_beta, joint_active_set) = if solve_joint_constraints_dense
+            let (candidate_beta, joint_active_set, joint_step_spectral_nullity) = if solve_joint_constraints_dense
                 && let Some(constraints) = joint_constraints.as_ref()
             {
                 let mut lhs = match materialize_joint_hessian_source(
@@ -12568,7 +12630,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     .map_err(|e| e.to_string())
                 };
                 match solve_result {
-                    Ok((beta_new, active_set)) => (beta_new, Some(active_set)),
+                    Ok((beta_new, active_set)) => (beta_new, Some(active_set), 0usize),
                     Err(_) => break,
                 }
             } else {
@@ -12580,8 +12642,19 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     joint_mode_diagonal_ridge,
                 );
                 let rhs = &grad_joint - &penalty_beta;
+                let grad_inf_for_solve = grad_joint
+                    .iter()
+                    .map(|x: &f64| x.abs())
+                    .fold(0.0_f64, f64::max);
+                let penalty_inf_for_solve = penalty_beta
+                    .iter()
+                    .map(|x: &f64| x.abs())
+                    .fold(0.0_f64, f64::max);
+                let residual_tol_for_solve =
+                    inner_tol * (1.0 + grad_inf_for_solve.max(penalty_inf_for_solve));
                 let pcg_started = std::time::Instant::now();
                 let pcg_requested = matrix_free_joint_requested && !joint_hessian_is_dense;
+                let mut spectral_nullity_for_step = 0usize;
                 let mut delta = if pcg_requested {
                     let preconditioner_diag = match &joint_hessian_source {
                         JointHessianSource::Dense(h_joint) => joint_penalty_preconditioner_diag(
@@ -12697,7 +12770,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     if pcg_requested {
                         break;
                     }
-                    let mut lhs = match materialize_joint_hessian_source(
+                    let mut lhs_true = match materialize_joint_hessian_source(
                         &joint_hessian_source,
                         total_p,
                         "joint Newton inner dense fallback Hessian materialization",
@@ -12706,37 +12779,32 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         Err(_) => break,
                     };
                     add_joint_penalty_to_matrix(
-                        &mut lhs,
+                        &mut lhs_true,
                         &ranges,
                         &s_lambdas,
-                        joint_solver_diagonal_ridge,
+                        joint_mode_diagonal_ridge,
                     );
-                    let solver = crate::linalg::utils::StableSolver::new("joint Newton inner");
-                    // Use the rank-revealing pseudoinverse fallback rather than the
-                    // pure ridge-Cholesky solve.  When H_pen has a real null subspace
-                    // (penalty nullspace direction not constrained by the likelihood),
-                    // (H_pen + λI)⁻¹·rhs leaves residual ≈ rhs in null(H_pen), driving
-                    // `linearized_rel ≈ 1` for the next 15+ cycles and triggering the
-                    // stall early-exit on every outer seed.  The truncated-eigh
-                    // pseudoinverse projects rhs onto range(H_pen) before inverting,
-                    // so δ has no spurious component in null(H_pen) and the joint
-                    // Newton's KKT certificate reads an honest projected residual.
-                    //
-                    // `rel_tol = 1e-3`: a regularised Newton step whose linear residual
-                    // is below 0.1% of `‖rhs‖∞` is good enough; otherwise rank
-                    // deficiency is real and pseudoinverse is correct.
-                    //
-                    // `rank_tol = 1e-10`: eigenvalues below `1e-10 · max|λ|` are
-                    // numerically null relative to the rest of the spectrum.  This is
-                    // the standard rank-revealing threshold (LAPACK SVD uses the
-                    // same constant for double precision).
-                    delta = solver.solve_with_pseudoinverse_fallback(
-                        &lhs,
+                    let spectral_step = solve_joint_newton_step_on_spectral_range(
+                        &lhs_true,
                         &rhs,
-                        JOINT_TRACE_STABILITY_RIDGE,
-                        1.0e-3,
-                        1.0e-10,
-                    );
+                        KKT_REFUSAL_RANK_TOL,
+                        residual_tol_for_solve,
+                    )?;
+                    spectral_nullity_for_step = spectral_step.nullity;
+                    if spectral_step.nullity > 0 {
+                        log::debug!(
+                            "[PIRLS/joint-Newton] spectral reduced solve: nullity@{:.0e}={}/{} \
+                             |P0 rhs|∞={:.3e} |P+ rhs|∞={:.3e} λ_min+={:.3e} λ_max={:.3e}",
+                            spectral_step.rank_tol,
+                            spectral_step.nullity,
+                            total_p,
+                            spectral_step.null_rhs_inf,
+                            spectral_step.range_rhs_inf,
+                            spectral_step.lambda_min_positive,
+                            spectral_step.lambda_max_abs,
+                        );
+                    }
+                    delta = Some(spectral_step.delta);
                 }
 
                 let Some(delta) = delta else {
@@ -12745,7 +12813,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 if !delta.iter().all(|v| v.is_finite()) {
                     break; // Fall back to blockwise
                 }
-                (beta_joint.clone() + &delta, None)
+                (beta_joint.clone() + &delta, None, spectral_nullity_for_step)
             };
             // Hessian-source build (and any QP solve immediately above) are
             // done by the time we reach `delta`. Capture the wall-clock
@@ -12782,7 +12850,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // shrink/expand for subsequent cycles. Family feasibility
             // constraints and the adaptive trust radius remain the safeguards
             // against runaway proposals.
-            if cycle == 0 {
+            if cycle == 0 && joint_step_spectral_nullity == 0 {
                 let initial_block_norms = joint_trust_region_block_metric_norms(
                     &delta,
                     &ranges,
@@ -19840,70 +19908,13 @@ fn projected_linear_constraint_stationarity_vector(
         return Some(residual.clone());
     }
 
-    for _ in 0..constraints.a.nrows().max(1) {
-        let k = active_rows.len();
-        if k == 0 {
-            return Some(residual.clone());
-        }
-        let mut a_active = Array2::<f64>::zeros((k, p));
-        let mut b_active = Array1::<f64>::zeros(k);
-        let groups = (0..k).map(|idx| vec![idx]).collect::<Vec<_>>();
-        for (pos, &row) in active_rows.iter().enumerate() {
-            a_active.row_mut(pos).assign(&constraints.a.row(row));
-            b_active[pos] = constraints.b[row];
-        }
-        let (a_reduced, _, groups_reduced) =
-            rank_reduce_rows_pivoted_qr(a_active, b_active, groups);
-        let k_reduced = a_reduced.nrows();
-        if k_reduced == 0 {
-            return Some(residual.clone());
-        }
-
-        let mut gram = a_reduced.dot(&a_reduced.t());
-        let rhs = a_reduced.dot(residual);
-        let ridge_scale = gram.diag().iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
-        let ridge = f64::EPSILON * ridge_scale.max(1.0);
-        for i in 0..k_reduced {
-            gram[[i, i]] += ridge;
-        }
-        let factor =
-            match StableSolver::new("linear constraint KKT residual projection").factorize(&gram) {
-                Ok(factor) => factor,
-                Err(_) => return Some(residual.clone()),
-            };
-        let mut lambda = rhs;
-        {
-            let mut lambda_col = crate::faer_ndarray::array1_to_col_matmut(&mut lambda);
-            factor.solve_in_place(lambda_col.as_mut());
-        }
-        if !lambda.iter().all(|v| v.is_finite()) {
-            return Some(residual.clone());
-        }
-        let lambda_scale = lambda.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
-        let dual_tol = 1e-8 * lambda_scale.max(1.0);
-        let most_negative = lambda
-            .iter()
-            .enumerate()
-            .filter(|(_, value)| **value < -dual_tol)
-            .min_by(|(_, left), (_, right)| {
-                left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .map(|(idx, _)| idx);
-        if let Some(reduced_idx) = most_negative {
-            let mut remove_positions = groups_reduced[reduced_idx].clone();
-            remove_positions.sort_unstable_by(|left, right| right.cmp(left));
-            for pos in remove_positions {
-                if pos < active_rows.len() {
-                    active_rows.remove(pos);
-                }
-            }
-            continue;
-        }
-
-        return Some(residual - &a_reduced.t().dot(&lambda));
+    let mut a_active = Array2::<f64>::zeros((active_rows.len(), p));
+    for (pos, &row) in active_rows.iter().enumerate() {
+        a_active.row_mut(pos).assign(&constraints.a.row(row));
     }
-
-    Some(residual.clone())
+    project_stationarity_residual_on_constraint_cone(residual, &a_active)
+        .map(|(projected, _)| projected)
+        .or_else(|| Some(residual.clone()))
 }
 
 fn exact_newton_joint_stationarity_inf_norm<F: CustomFamily + ?Sized>(
