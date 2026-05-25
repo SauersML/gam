@@ -6,9 +6,9 @@ log-scale of the response distribution — as its own smooth function of
 covariates.
 
 The engine implements two-parameter location-scale fits for Gaussian
-responses (mean and log-σ), Binomial responses (logit-p and a
-variance-modulating log-scale term), and survival responses (log-hazard
-location and log-scale). It is not a full multi-parameter GAMLSS
+responses (mean and scale), Binomial responses (threshold and scale),
+and survival responses (time/threshold survival index and scale). It is
+not a full multi-parameter GAMLSS
 implementation: no separate skewness or kurtosis submodels.
 
 Use it when:
@@ -30,9 +30,10 @@ gamfit.fit(
 )
 ```
 
-The main formula models the location. `noise_formula` models the
-log-scale. Both formulas refer to columns of the same input table. The
-CLI flag is `--predict-noise`:
+The main formula models the location/threshold. `noise_formula` models
+the scale predictor. Pass only the right-hand side terms, not a full
+`response ~ terms` formula. Both formulas refer to columns of the same
+input table. The CLI flag is `--predict-noise`:
 
 ```bash
 gam fit data.csv 'y ~ s(x1) + s(x2)' --predict-noise 's(x1)' --out model.gam
@@ -40,8 +41,10 @@ gam fit data.csv 'y ~ s(x1) + s(x2)' --predict-noise 's(x1)' --out model.gam
 
 This is supported for:
 
-- Gaussian location-scale: joint mean and log-σ.
-- Binomial location-scale: joint logit-p and a log-scale variance term.
+- Gaussian location-scale: joint mean and scale.
+- Binomial location-scale: joint threshold and scale. The default
+  inverse link is logit; explicit links such as probit/cloglog use the
+  same threshold-scale parameterization.
 - Survival location-scale: pair with `survival_likelihood="location-scale"`:
 
 ```python
@@ -58,17 +61,18 @@ gamfit.fit(
 
 ## Prediction
 
-A Gaussian location-scale fit returns the same columns as a standard
-Gaussian fit:
+A Gaussian location-scale fit returns the same Python prediction columns
+as a standard Gaussian fit:
 
 ```python
 preds = model.predict(test_df, interval=0.95)
-# Columns: eta, mean, effective_se, mean_lower, mean_upper
+# Columns: eta, mean, effective_se, effective_variance, mean_lower, mean_upper
 ```
 
 `effective_se` is the delta-method standard error on the linear
-predictor. `mean_lower` / `mean_upper` are response-scale pointwise Wald
-bands at the requested `interval`.
+predictor, and `effective_variance` is its square. `mean_lower` /
+`mean_upper` are response-scale pointwise Wald bands at the requested
+`interval`.
 
 For survival location-scale, predictions return a
 [`SurvivalPrediction`](predictions.md#survivalprediction). Pass
