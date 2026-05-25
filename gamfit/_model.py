@@ -56,16 +56,12 @@ class Model:
         """Predict from ``data``."""
         headers, rows, table_kind = normalize_table(data)
         row_ids = extract_row_ids(headers, rows, id_column)
-        payload: dict[str, Any] = {"interval": interval}
-        if with_uncertainty:
-            payload["with_uncertainty"] = True
         grid = default_survival_time_grid(self.model_class, self.formula, headers, rows) \
             if self.is_survival else None
-        if grid is not None:
-            payload["time_grid"] = [float(t) for t in grid]
+        opts_json = rust_module().build_predict_payload_json(interval, with_uncertainty, grid)
         try:
             raw = rust_module().predict_table(
-                self._model_bytes, headers, rows, json.dumps(payload)
+                self._model_bytes, headers, rows, opts_json
             )
         except Exception as exc:
             raise map_exception(exc) from exc
