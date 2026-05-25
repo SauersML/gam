@@ -48,7 +48,7 @@ pub struct ScoreRow {
     /// Log-evidence gap from the winning model: `best_score - reml_score`.
     pub delta_reml: f64,
     /// Bayes factor in favor of the winning model over this row.
-    pub bayes_factor_vs_best: f64,
+    pub bayes_factor_best_over_model: f64,
     pub effective_dof: Option<f64>,
 }
 
@@ -83,18 +83,19 @@ pub fn compare_reml_fits(mut candidates: Vec<RemlCandidate>) -> Result<RemlCompa
             name: row.name.clone(),
             reml_score: row.score,
             delta_reml: delta,
-            bayes_factor_vs_best: bayes_factor,
+            bayes_factor_best_over_model: bayes_factor,
             effective_dof: row.edf,
         });
     }
 
     let evidence_summary = if candidates.len() >= 2 {
         let runner_up = &candidates[1];
-        let log_bf = best_score - runner_up.score;
+        let runner_up_log_bayes_factor_vs_best = runner_up.score - best_score;
+        let best_log_bayes_factor_vs_runner_up = -runner_up_log_bayes_factor_vs_best;
         format!(
             "{} wins by Bayes factor {} over {}",
             winner,
-            format_bayes_factor(log_bf),
+            format_bayes_factor(best_log_bayes_factor_vs_runner_up),
             runner_up.name
         )
     } else {
