@@ -13,19 +13,22 @@ is working.
 from __future__ import annotations
 
 import csv
-import subprocess
+import sys
 from pathlib import Path
 from typing import Sequence
 
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.axes import Axes
-from scipy.stats import gaussian_kde
 from sklearn.cluster import KMeans
 
 ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+import gamfit
+
 DEMO = ROOT / "bench" / "aniso_demo"
-GAM = ROOT / "target" / "release" / "gam"
 
 N = 300
 SEED = 7
@@ -67,6 +70,11 @@ def write_csv(path: Path, pcs: np.ndarray, pgs_raw: np.ndarray) -> None:
             w.writerow([f"{pgs_raw[i]:.6f}"] + [f"{pcs[i, j]:.6f}" for j in range(PC_DIM)])
 
 
+def load_csv_records(path: Path) -> list[dict[str, str]]:
+    with path.open(newline="") as fh:
+        return list(csv.DictReader(fh))
+
+
 def formula() -> str:
     pc_cols = ", ".join(f"pc{i+1}_std" for i in range(PC_DIM))
     return (
@@ -79,25 +87,26 @@ def run_fit_predict(tag: str, scale_dims: bool, csv_in: Path) -> np.ndarray:
     model = DEMO / f"model_{tag}.json"
     pred = DEMO / f"pred_{tag}.csv"
     log = DEMO / f"fit_{tag}.log"
-    cmd = [str(GAM), "fit", "--transformation-normal"]
-    if scale_dims:
-        cmd.append("--scale-dimensions")
-    cmd += ["--out", str(model), str(csv_in), formula()]
-    print(f"[fit:{tag}] {' '.join(cmd)}")
+    data = load_csv_records(csv_in)
+    print(f"[fit:{tag}] gamfit.fit(transformation_normal=True, scale_dimensions={scale_dims})")
+    fitted = gamfit.fit(
+        data,
+        formula(),
+        transformation_normal=True,
+        scale_dimensions=scale_dims,
+    )
+    fitted.save(model)
     with log.open("w") as fh:
-        rc = subprocess.run(cmd, cwd=ROOT, stdout=fh, stderr=subprocess.STDOUT).returncode
-    if rc != 0:
-        raise RuntimeError(f"fit {tag} failed; see {log}")
-    cmd_p = [str(GAM), "predict", str(model), str(csv_in), "--out", str(pred)]
-    print(f"[predict:{tag}] {' '.join(cmd_p)}")
-    rc = subprocess.run(cmd_p, cwd=ROOT).returncode
-    if rc != 0:
-        raise RuntimeError(f"predict {tag} failed")
-    rows = list(csv.DictReader(pred.open()))
-    for key in ("z", "z_score", "transformed", "eta", "mean"):
-        if rows and key in rows[0]:
-            return np.array([float(r[key]) for r in rows])
-    raise RuntimeError(f"no z column in {pred}; keys = {list(rows[0].keys()) if rows else []}")
+        fh.write(str(fitted.summary()))
+        fh.write("\n")
+    print(f"[predict:{tag}] Model.predict -> {pred}")
+    z = np.asarray(fitted.predict(data), dtype=float)
+    with pred.open("w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["z"])
+        for value in z:
+            w.writerow([f"{value:.12g}"])
+    return z
 
 
 def raincloud(
@@ -107,39 +116,33 @@ def raincloud(
     labels: list[str],
     title: str,
 ) -> None:
-    """Half-violin (KDE) above, jittered strip + box below, per population."""
+    """Jittered strip + box summary per population."""
     rng = np.random.default_rng(0)
     n = len(values_by_pop)
-    xs_grid = np.linspace(
-        min(v.min() for v in values_by_pop) - 0.3,
-        max(v.max() for v in values_by_pop) + 0.3,
-        400,
+    positions = [-k for k in range(n)]
+    boxes = ax.boxplot(
+        values_by_pop,
+        vert=False,
+        positions=positions,
+        widths=0.22,
+        patch_artist=True,
+        showfliers=False,
     )
-    width = 0.45
+    for patch, color in zip(boxes["boxes"], colors, strict=True):
+        patch.set_facecolor(color)
+        patch.set_alpha(0.45)
+    for key in ("boxes", "whiskers", "caps", "medians"):
+        for artist in boxes[key]:
+            artist.set_color("black")
+            artist.set_linewidth(1.0)
     for k in range(n):
         v = values_by_pop[k]
-        y0 = -k  # rows go downward so pop 0 sits at top
-        # KDE half-violin (upward).
-        kde = gaussian_kde(v)
-        density = kde(xs_grid)
-        density = density / density.max() * width * 0.95
-        ax.fill_between(xs_grid, y0, y0 + density, color=colors[k], alpha=0.55, linewidth=0)
-        ax.plot(xs_grid, y0 + density, color=colors[k], lw=1.0)
-        # Jittered scatter strip below the row baseline.
-        jitter = rng.uniform(-0.10, -0.02, size=v.size)
-        ax.scatter(v, np.full_like(v, y0) + jitter, s=2, color=colors[k], alpha=0.18, linewidths=0)
-        # Box: median + IQR.
-        q1, med, q3 = np.percentile(v, [25, 50, 75])
-        ax.plot([q1, q3], [y0 - 0.18, y0 - 0.18], color="black", lw=2.5, solid_capstyle="butt")
-        ax.scatter([med], [y0 - 0.18], color="white", edgecolors="black", s=22, zorder=5)
-    # Reference standard normal curve at top.
-    sn = np.exp(-0.5 * xs_grid ** 2) / np.sqrt(2 * np.pi)
-    sn = sn / sn.max() * width * 0.95
-    ax.plot(xs_grid, 1 + sn, color="black", lw=1.2, ls="--", label="N(0,1) target")
-    ax.set_yticks([1] + [-k for k in range(n)])
-    ax.set_yticklabels(["N(0,1)"] + labels)
-    ax.set_xlim(xs_grid[0], xs_grid[-1])
-    ax.set_ylim(-n, 1.6)
+        y0 = positions[k]
+        jitter = rng.uniform(-0.16, 0.16, size=v.size)
+        ax.scatter(v, np.full_like(v, y0) + jitter, s=3, color=colors[k], alpha=0.22, linewidths=0)
+    ax.set_yticks(positions)
+    ax.set_yticklabels(labels)
+    ax.set_ylim(-n + 0.5, 0.5)
     ax.axvline(0, color="grey", lw=0.6, alpha=0.5)
     ax.set_title(title)
 
