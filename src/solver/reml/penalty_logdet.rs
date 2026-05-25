@@ -1383,6 +1383,32 @@ mod tests {
     }
 
     #[test]
+    fn test_block_factored_ridge_ignores_inactive_lambda_for_structural_nullity() {
+        let ridge = 1e-4_f64;
+        let penalties = [
+            crate::construction::CanonicalPenalty::from_dense_root(array![[1.0, 0.0]], 2),
+            crate::construction::CanonicalPenalty::from_dense_root(array![[0.0, 1.0]], 2),
+        ];
+
+        let block_factored =
+            PenaltyPseudologdet::from_penalties(&penalties, &[1.0, 0.0], ridge, 2)
+                .expect("block-factored pseudo-logdet");
+        let assembled = PenaltyPseudologdet::from_assembled_with_nullity(
+            array![[1.0 + ridge, 0.0], [0.0, ridge]],
+            Some(1),
+        )
+        .expect("assembled pseudo-logdet with active structural nullity");
+
+        assert_eq!(block_factored.rank(), assembled.rank());
+        assert!(
+            (block_factored.value() - assembled.value()).abs() < 1e-12,
+            "inactive lambda leaked into structural nullity: block={}, assembled={}",
+            block_factored.value(),
+            assembled.value()
+        );
+    }
+
+    #[test]
     fn test_block_factored_rho_derivatives_match_dense_without_cross_block_work() {
         let p_total = 6;
         let lambdas = [1.7_f64, 0.4_f64, 2.3_f64];
