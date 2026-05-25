@@ -148,12 +148,20 @@ pub fn configure_global_policy(policy: GpuPolicy) {
 /// returns an error at the call site through [`GpuDecision::require_supported`].
 pub fn decide(kernel: GpuKernel, supported: bool, large_enough: bool) -> GpuDecision {
     let policy = global_policy();
+    // Auto must consult the actual probed runtime, not only the
+    // compile-time `supported` flag. Without this, `decide()` would claim
+    // GPU when the kernel is "compiled in" even though `GpuRuntime::global()`
+    // observed no device — silently producing CPU work via failed dispatch
+    // and hiding the cpu_reason from callers wanting to log fallback cause.
+    let runtime_available = runtime::GpuRuntime::is_available();
     let (use_gpu, reason) = match policy {
-        GpuPolicy::Off => (false, "gpu-policy-off"),
-        GpuPolicy::Auto if !supported => (false, "gpu-backend-not-compiled"),
-        GpuPolicy::Auto if !large_enough => (false, "workload-below-gpu-threshold"),
+        GpuPolicy::Off => (false, "cpu-gpu-policy-off"),
+        GpuPolicy::Auto if !supported => (false, "cpu-gpu-backend-not-compiled"),
+        GpuPolicy::Auto if !runtime_available => (false, "cpu-gpu-runtime-unavailable"),
+        GpuPolicy::Auto if !large_enough => (false, "cpu-workload-below-gpu-threshold"),
         GpuPolicy::Auto => (true, "gpu-auto-supported"),
-        GpuPolicy::Force if !supported => (false, "gpu-force-unsupported"),
+        GpuPolicy::Force if !supported => (false, "cpu-gpu-force-unsupported"),
+        GpuPolicy::Force if !runtime_available => (false, "cpu-gpu-force-runtime-unavailable"),
         GpuPolicy::Force => (true, "gpu-force-supported"),
     };
     GpuDecision {
