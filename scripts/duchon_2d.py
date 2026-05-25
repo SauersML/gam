@@ -6,9 +6,7 @@ import argparse
 import csv
 import math
 import subprocess
-import sys
 import tempfile
-from dataclasses import dataclass
 from pathlib import Path
 
 import matplotlib
@@ -23,24 +21,9 @@ DEFAULT_GAM_BIN = REPO_ROOT / "target" / "release" / "gam"
 SMOOTH_RESOLUTION = 150
 
 
-@dataclass(frozen=True)
-class RustDuchonSurfaceConfig:
-    label: str
-    adaptive_regularization: bool
-    color: str
-
-
-CONFIGS: list[RustDuchonSurfaceConfig] = [
-    RustDuchonSurfaceConfig(
-        label="adaptive order=0 power=2",
-        adaptive_regularization=True,
-        color="#d1495b",
-    ),
-    RustDuchonSurfaceConfig(
-        label="non-adaptive order=0 power=2",
-        adaptive_regularization=False,
-        color="#118ab2",
-    ),
+CONFIGS: list[tuple[str, bool, str]] = [
+    ("adaptive order=0 power=2", True, "#d1495b"),
+    ("non-adaptive order=0 power=2", False, "#118ab2"),
 ]
 
 
@@ -183,7 +166,9 @@ def build_demo_data(
     return train_csv, test_csv, grid_csv, x_train, z_train, y_train, x_test, z_test, y_test, xx, zz, y_grid
 
 
-def read_prediction_mean(path: Path, expected_rows: int, grid_shape: tuple[int, int]) -> np.ndarray:
+def read_prediction(
+    path: Path, expected_rows: int, grid_shape: tuple[int, int] | None = None
+) -> np.ndarray:
     with path.open() as handle:
         reader = csv.DictReader(handle)
         mean = [float(row["mean"]) for row in reader]
@@ -191,18 +176,10 @@ def read_prediction_mean(path: Path, expected_rows: int, grid_shape: tuple[int, 
         raise RuntimeError(
             f"prediction row mismatch for {path.name}: got {len(mean)}, expected {expected_rows}"
         )
-    return np.asarray(mean).reshape(grid_shape)
-
-
-def read_prediction_vector(path: Path, expected_rows: int) -> np.ndarray:
-    with path.open() as handle:
-        reader = csv.DictReader(handle)
-        mean = [float(row["mean"]) for row in reader]
-    if len(mean) != expected_rows:
-        raise RuntimeError(
-            f"prediction row mismatch for {path.name}: got {len(mean)}, expected {expected_rows}"
-        )
-    return np.asarray(mean)
+    values = np.asarray(mean)
+    if grid_shape is None:
+        return values
+    return values.reshape(grid_shape)
 
 
 def r2_score(y_true: np.ndarray, y_pred: np.ndarray) -> float:
@@ -251,8 +228,8 @@ def fit_mgcv_surface(
     )
     run(["Rscript", r_script])
     return (
-        read_prediction_mean(pred_path, expected_rows, grid_shape),
-        read_prediction_vector(test_pred_path, n_test_rows),
+        read_prediction(pred_path, expected_rows, grid_shape),
+        read_prediction(test_pred_path, n_test_rows),
     )
 
 
@@ -262,12 +239,13 @@ def fit_rust_surface(
     train_csv: Path,
     test_csv: Path,
     grid_csv: Path,
-    cfg: RustDuchonSurfaceConfig,
+    label: str,
+    adaptive_regularization: bool,
     expected_rows: int,
     n_test_rows: int,
     grid_shape: tuple[int, int],
 ) -> tuple[np.ndarray, np.ndarray]:
-    slug = cfg.label.lower().replace(" ", "_").replace("=", "").replace(",", "")
+    slug = label.lower().replace(" ", "_").replace("=", "").replace(",", "")
     model_path = workdir / f"{slug}.json"
     pred_path = workdir / f"{slug}.csv"
     test_pred_path = workdir / f"{slug}_test.csv"
@@ -279,7 +257,7 @@ def fit_rust_surface(
             train_csv,
             formula,
             "--adaptive-regularization",
-            "true" if cfg.adaptive_regularization else "false",
+            "true" if adaptive_regularization else "false",
             "--out",
             model_path,
         ]
@@ -287,8 +265,8 @@ def fit_rust_surface(
     run([gam_bin, "predict", model_path, grid_csv, "--out", pred_path])
     run([gam_bin, "predict", model_path, test_csv, "--out", test_pred_path])
     return (
-        read_prediction_mean(pred_path, expected_rows, grid_shape),
-        read_prediction_vector(test_pred_path, n_test_rows),
+        read_prediction(pred_path, expected_rows, grid_shape),
+        read_prediction(test_pred_path, n_test_rows),
     )
 
 
@@ -300,6 +278,7 @@ def make_plot(
     x_test: np.ndarray,
     z_test: np.ndarray,
     y_test: np.ndarray,
+    true_r2: float,
     xx: np.ndarray,
     zz: np.ndarray,
     y_true: np.ndarray,
@@ -322,7 +301,10 @@ def make_plot(
         fig.add_subplot(1, 4, 4, projection="3d"),
     ]
 
-    plotted = [("true surface", y_true, "Greys", r2_score(y_test, true_surface(x_test, z_test))), *[(label, y_hat, None, r2) for label, y_hat, _, r2 in surfaces]]
+    plotted = [
+        ("true surface", y_true, "Greys", true_r2),
+        *[(label, y_hat, None, r2) for label, y_hat, _, r2 in surfaces],
+    ]
     color_lookup = {label: color for label, _, color, _ in surfaces}
 
     vmin = min(np.min(y_true), *(np.min(y_hat) for _, y_hat, _, _ in surfaces))
@@ -407,73 +389,83 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory(prefix="duchon_2d_surface_") as tmpdir:
         workdir = Path(tmpdir)
-        train_csv, test_csv, grid_csv, x_train, z_train, y_train, x_test, z_test, y_test, xx, zz, y_true = build_demo_data(
-            workdir, args.seed, args.n_train, args.n_test, args.grid_size
-        )
+        (
+            train_csv,
+            test_csv,
+            grid_csv,
+            x_train,
+            z_train,
+            y_train,
+            x_test,
+            z_test,
+            y_test,
+            xx,
+            zz,
+            y_true,
+        ) = build_demo_data(workdir, args.seed, args.n_train, args.n_test, args.grid_size)
         expected_rows = args.grid_size * args.grid_size
         grid_shape = xx.shape
         surfaces: list[tuple[str, np.ndarray, str, float]] = []
         metrics: list[tuple[str, float, float, float]] = []
-        skipped: list[str] = []
         n_test_rows = len(y_test)
-        true_r2 = r2_score(y_test, true_surface(x_test, z_test))
-        true_rmse = rmse(y_test, true_surface(x_test, z_test))
-        true_mae = mae(y_test, true_surface(x_test, z_test))
+        y_test_true = true_surface(x_test, z_test)
+        true_r2 = r2_score(y_test, y_test_true)
+        true_rmse = rmse(y_test, y_test_true)
+        true_mae = mae(y_test, y_test_true)
         metrics.append(("true surface", true_r2, true_rmse, true_mae))
-        for cfg in CONFIGS:
-            try:
-                y_hat, y_test_hat = fit_rust_surface(
-                    args.gam_bin,
-                    workdir,
-                    train_csv,
-                    test_csv,
-                    grid_csv,
-                    cfg,
-                    expected_rows,
-                    n_test_rows,
-                    grid_shape,
-                )
-            except subprocess.CalledProcessError as exc:
-                skipped.append(f"{cfg.label} (exit {exc.returncode})")
-                continue
-            r2 = r2_score(y_test, y_test_hat)
-            rmse_val = rmse(y_test, y_test_hat)
-            mae_val = mae(y_test, y_test_hat)
-            surfaces.append((cfg.label, y_hat, cfg.color, r2))
-            metrics.append((cfg.label, r2, rmse_val, mae_val))
-        try:
-            y_mgcv, y_mgcv_test = fit_mgcv_surface(
+        for label, adaptive_regularization, color in CONFIGS:
+            y_hat, y_test_hat = fit_rust_surface(
+                args.gam_bin,
                 workdir,
                 train_csv,
                 test_csv,
                 grid_csv,
+                label,
+                adaptive_regularization,
                 expected_rows,
                 n_test_rows,
                 grid_shape,
             )
-            r2 = r2_score(y_test, y_mgcv_test)
-            rmse_val = rmse(y_test, y_mgcv_test)
-            mae_val = mae(y_test, y_mgcv_test)
-            surfaces.append(("mgcv duchon", y_mgcv, "#edae49", r2))
-            metrics.append(("mgcv duchon", r2, rmse_val, mae_val))
-        except subprocess.CalledProcessError as exc:
-            skipped.append(f"mgcv duchon (exit {exc.returncode})")
+            r2 = r2_score(y_test, y_test_hat)
+            rmse_val = rmse(y_test, y_test_hat)
+            mae_val = mae(y_test, y_test_hat)
+            surfaces.append((label, y_hat, color, r2))
+            metrics.append((label, r2, rmse_val, mae_val))
+        y_mgcv, y_mgcv_test = fit_mgcv_surface(
+            workdir,
+            train_csv,
+            test_csv,
+            grid_csv,
+            expected_rows,
+            n_test_rows,
+            grid_shape,
+        )
+        r2 = r2_score(y_test, y_mgcv_test)
+        rmse_val = rmse(y_test, y_mgcv_test)
+        mae_val = mae(y_test, y_mgcv_test)
+        surfaces.append(("mgcv duchon", y_mgcv, "#edae49", r2))
+        metrics.append(("mgcv duchon", r2, rmse_val, mae_val))
         if len(surfaces) != 3:
-            raise RuntimeError(f"expected 3 fitted surfaces, got {len(surfaces)}; skipped={skipped}")
-        make_plot(args.out, x_train, z_train, y_train, x_test, z_test, y_test, xx, zz, y_true, surfaces)
+            raise RuntimeError(f"expected 3 fitted surfaces, got {len(surfaces)}")
+        make_plot(
+            args.out,
+            x_train,
+            z_train,
+            y_train,
+            x_test,
+            z_test,
+            y_test,
+            true_r2,
+            xx,
+            zz,
+            y_true,
+            surfaces,
+        )
         print_metrics_report(metrics)
 
-    if skipped:
-        print("skipped configs:")
-        for item in skipped:
-            print(f"- {item}")
     print(args.out)
     return 0
 
 
 if __name__ == "__main__":
-    try:
-        raise SystemExit(main())
-    except subprocess.CalledProcessError as exc:
-        print(f"command failed with exit code {exc.returncode}: {exc.cmd}", file=sys.stderr)
-        raise
+    raise SystemExit(main())
