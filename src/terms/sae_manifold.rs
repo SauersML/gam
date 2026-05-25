@@ -2516,6 +2516,68 @@ mod tests {
         assert!(basis_delta > 1.0e-10);
     }
 
+    /// Regression test for https://github.com/SauersML/gam/issues/163.
+    ///
+    /// `ManifoldSAE.predict(X_subset)` reseeds the latent coordinates via PCA
+    /// on a possibly small batch (here: a strict subset of the training data),
+    /// which can produce a per-row `H_tt + ridge_t·I` that is not
+    /// positive-definite at the caller's nominal `ridge_t = 1e-6`. The fit
+    /// path tolerates this via the proximal LM correction outer wrapper;
+    /// previously, `run_joint_fit_arrow_schur` invoked `sys.solve(...)`
+    /// directly and surfaced the per-row Cholesky failure to the caller. The
+    /// fix routes recoverable factor failures through a Levenberg-Marquardt
+    /// damping schedule (mirrors the `proximal_correction` outer loop),
+    /// so an inner step with a degenerate Hessian no longer aborts the
+    /// Newton driver.
+    #[test]
+    fn run_joint_fit_arrow_schur_escalates_ridge_on_non_pd_row_block() {
+        // Construct a periodic atom whose row block is rank-deficient when
+        // the assignment column is zero — `H_tt` is then driven entirely by
+        // the smoothness penalty / external coord ridge and floats just
+        // above zero. At ridge_t = 1e-6 the per-row Cholesky finds a tiny
+        // negative pivot from rounding error; the escalation loop should
+        // recover.
+        let coords = array![[0.1], [0.4], [0.7]];
+        let (phi, jet) = periodic_basis(&coords);
+        let atom = SaeManifoldAtom::new(
+            "periodic",
+            SaeAtomBasisKind::Periodic,
+            1,
+            phi,
+            jet,
+            // Decoder that maps to a single output dim with small magnitude
+            array![[0.05], [-0.05], [0.05]],
+            // No external smoothness penalty on the decoder, so the only
+            // regularization on `t` comes from `ridge_ext_coord`.
+            Array2::<f64>::zeros((3, 3)),
+        )
+        .unwrap();
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            // Zero assignment mass → H_tt has zero data contribution.
+            Array2::<f64>::zeros((3, 1)),
+            vec![coords],
+            vec![LatentManifold::Circle],
+            AssignmentMode::softmax(0.7),
+        )
+        .unwrap();
+        let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
+        let target = array![[0.20], [-0.10], [0.45]];
+        // log_lambda_smooth driven low so the analytic penalty contributes
+        // essentially nothing to H_tt either.
+        let mut rho = SaeManifoldRho::new(0.0, -20.0, vec![Array1::<f64>::zeros(1)]);
+
+        // The Python-side `predict` default. Before the fix this returned
+        // `Err(... per-row H_tt^(?) Cholesky failed ... non-PD pivot ...)`;
+        // afterward the escalation loop bumps ridge_t until the per-row
+        // factor succeeds, and run_joint_fit_arrow_schur returns Ok.
+        let result =
+            term.run_joint_fit_arrow_schur(target.view(), &mut rho, None, 1, 1.0, 1.0e-6, 1.0e-6);
+        assert!(
+            result.is_ok(),
+            "run_joint_fit_arrow_schur should recover from degenerate H_tt via LM ridge escalation; got: {result:?}",
+        );
+    }
+
     #[test]
     fn sae_arrow_schur_beta_quadratic_model_matches_penalized_loss_change() {
         let coords = array![[0.10], [0.35], [0.80]];
