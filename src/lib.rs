@@ -104,6 +104,8 @@ pub use solver::{
 };
 pub use terms::{basis, construction, hull, layout, smooth, term_builder};
 
+pub use kernels::sinkhorn_barycenter as sinkhorn_barycenter_kernel;
+
 pub use families::bernoulli_marginal_slope;
 pub use families::custom_family;
 pub use families::gamlss;

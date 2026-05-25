@@ -11439,6 +11439,7 @@ fn constrained_stationary_certificate_decision(
     math: &JointNewtonMathDiagnostic,
     objective_change: f64,
     objective_tol: f64,
+    step_tol: f64,
     geometric_tail_bound: Option<f64>,
     residual: f64,
     residual_tol: f64,
@@ -11447,8 +11448,14 @@ fn constrained_stationary_certificate_decision(
     let scalar_model_relerr = math.scalar_model_relative_error();
     let objective_exhausted = objective_change <= objective_tol
         || geometric_tail_bound.is_some_and(|tail| tail <= objective_tol);
+    let step_exhausted =
+        math.step_inf.is_finite() && step_tol.is_finite() && math.step_inf <= step_tol;
 
-    if !(objective_exhausted && linearized_rel >= 0.5 && scalar_model_relerr <= 1e-3) {
+    if !(objective_exhausted
+        && step_exhausted
+        && linearized_rel >= 0.5
+        && scalar_model_relerr <= 1e-3)
+    {
         return ConstrainedStationaryCertificate::NotCandidate;
     }
 
@@ -13049,6 +13056,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     math,
                     objective_change,
                     objective_tol,
+                    step_tol,
                     geometric_tail_bound,
                     residual,
                     residual_tol,
@@ -26419,16 +26427,13 @@ mod tests {
         );
     }
 
-    /// Reproduces the specific seed-rejection mechanism from the biobank
-    /// trace: the scalar Newton model and plateau tests alone look like a
-    /// constrained-stationary point, but the projected KKT residual is still
-    /// hundreds of times above tolerance. Older code accepted this as
-    /// convergence, populated the downstream inner result as if the remaining
-    /// gradient were pure multiplier mass, and the REML envelope-gradient
-    /// consistency gate later rejected every seed after the IFT correction
-    /// input was missing or contaminated.
+    /// Reproduces the post-diagnostic biobank trace: the scalar Newton model
+    /// and objective plateau tests alone look like a constrained-stationary
+    /// point, but the projected KKT residual is hundreds of times above
+    /// tolerance and the accepted Newton step is still macroscopic. That is
+    /// not a terminal certificate; it is a normal in-progress Newton cycle.
     #[test]
-    fn constrained_stationary_certificate_rejects_aou_phantom_multiplier() {
+    fn constrained_stationary_certificate_keeps_iterating_when_step_is_large() {
         let math = JointNewtonMathDiagnostic {
             old_kkt_inf: 2.708e4,
             linearized_next_kkt_inf: 2.707e4,
@@ -26442,45 +26447,47 @@ mod tests {
         let objective_tol = 3.479e-1;
         let residual = 8.102;
         let residual_tol = 2.707e-2;
+        let step_tol = 1.2e-5;
 
-        // These are the three conditions the buggy certificate used. They all
-        // hold for the failure log at cycle 303.
+        // These are the three non-step conditions that made 0.1.126 reject a
+        // seed as soon as objective change touched tolerance.
         let linearized_rel = math.linearized_next_kkt_inf / (1.0 + math.old_kkt_inf);
         assert!(linearized_rel >= 0.5);
         assert!(math.scalar_model_relative_error() <= 1e-3);
         assert!(objective_change <= objective_tol);
+        assert!(math.step_inf > step_tol);
 
-        // The missing fourth condition: after active-set projection, the KKT
-        // residual must actually be at the inner tolerance scale. In the
-        // failure trace it is ~300x tolerance, so treating the leftover
-        // gradient as multiplier mass is the bug.
+        // The projected residual still rules out accepting convergence, but
+        // the large step rules out terminal refusal. The loop must continue.
         assert!(residual > 4.0 * residual_tol);
         assert_eq!(
             constrained_stationary_certificate_decision(
                 &math,
                 objective_change,
                 objective_tol,
+                step_tol,
                 None,
                 residual,
                 residual_tol,
             ),
-            ConstrainedStationaryCertificate::RefusePhantomMultiplier,
+            ConstrainedStationaryCertificate::NotCandidate,
         );
     }
 
     #[test]
-    fn constrained_stationary_certificate_accepts_only_projected_residual_band() {
+    fn constrained_stationary_certificate_refuses_only_when_step_is_exhausted() {
         let math = JointNewtonMathDiagnostic {
             old_kkt_inf: 2.708e4,
             linearized_next_kkt_inf: 2.707e4,
             predicted_reduction: 3.421e-1,
             actual_reduction: 3.421e-1,
             trust_ratio: 1.0,
-            step_inf: 2.891e-2,
-            proposal_inf: 2.891e-2,
+            step_inf: 2.891e-7,
+            proposal_inf: 2.891e-7,
         };
         let objective_change = 3.421e-1;
         let objective_tol = 3.479e-1;
+        let step_tol = 1.0e-6;
         let residual_tol = 2.707e-2;
 
         assert_eq!(
@@ -26488,6 +26495,7 @@ mod tests {
                 &math,
                 objective_change,
                 objective_tol,
+                step_tol,
                 None,
                 4.0 * residual_tol,
                 residual_tol,
@@ -26499,6 +26507,7 @@ mod tests {
                 &math,
                 objective_change,
                 objective_tol,
+                step_tol,
                 None,
                 4.0 * residual_tol + 1.0e-12,
                 residual_tol,

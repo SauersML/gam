@@ -31,6 +31,13 @@ use gam::gaussian_reml::{
     gaussian_reml_multi_closed_form_backward_from_fit, gaussian_reml_multi_closed_form_with_cache,
 };
 use gam::geometry::simplex::simplex_frechet_mean;
+use gam::kernels::sinkhorn_barycenter::{
+    circular_cost as sinkhorn_circular_cost_impl,
+    euclidean_cost as sinkhorn_euclidean_cost_impl,
+    geodesic_sphere_cost as sinkhorn_geodesic_sphere_cost_impl,
+    sinkhorn_barycenter as sinkhorn_barycenter_impl,
+    sinkhorn_barycenter_vjp as sinkhorn_barycenter_vjp_impl,
+};
 use gam::hmc::{NutsConfig, NutsResult};
 use gam::inference::data::{
     EncodedDataset, UnseenCategoryPolicy, encode_recordswith_inferred_schema,
@@ -16344,6 +16351,92 @@ fn response_geometry_sphere_normalize_base<'py>(
 }
 
 #[pyfunction]
+fn sinkhorn_circular_cost<'py>(
+    py: Python<'py>,
+    m: usize,
+) -> PyResult<Py<PyArray2<f64>>> {
+    let out = py.detach(move || sinkhorn_circular_cost_impl(m));
+    Ok(out.into_pyarray(py).unbind())
+}
+
+#[pyfunction]
+fn sinkhorn_euclidean_cost<'py>(
+    py: Python<'py>,
+    points: PyReadonlyArray2<'py, f64>,
+) -> PyResult<Py<PyArray2<f64>>> {
+    let owned = points.as_array().to_owned();
+    let out = detach_py_result(py, "sinkhorn_euclidean_cost", move || {
+        sinkhorn_euclidean_cost_impl(owned.view())
+    })?;
+    Ok(out.into_pyarray(py).unbind())
+}
+
+#[pyfunction]
+fn sinkhorn_geodesic_sphere_cost<'py>(
+    py: Python<'py>,
+    directions: PyReadonlyArray2<'py, f64>,
+) -> PyResult<Py<PyArray2<f64>>> {
+    let owned = directions.as_array().to_owned();
+    let out = detach_py_result(py, "sinkhorn_geodesic_sphere_cost", move || {
+        sinkhorn_geodesic_sphere_cost_impl(owned.view())
+    })?;
+    Ok(out.into_pyarray(py).unbind())
+}
+
+#[pyfunction]
+fn sinkhorn_barycenter_forward<'py>(
+    py: Python<'py>,
+    atoms: PyReadonlyArray2<'py, f64>,
+    weights: PyReadonlyArray1<'py, f64>,
+    cost: PyReadonlyArray2<'py, f64>,
+    eps: f64,
+    n_iter: usize,
+) -> PyResult<Py<PyArray1<f64>>> {
+    let atoms_owned = atoms.as_array().to_owned();
+    let weights_owned = weights.as_array().to_owned();
+    let cost_owned = cost.as_array().to_owned();
+    let out = detach_py_result(py, "sinkhorn_barycenter_forward", move || {
+        sinkhorn_barycenter_impl(
+            atoms_owned.view(),
+            weights_owned.view(),
+            cost_owned.view(),
+            eps,
+            n_iter,
+        )
+    })?;
+    Ok(out.into_pyarray(py).unbind())
+}
+
+#[pyfunction]
+fn sinkhorn_barycenter_vjp<'py>(
+    py: Python<'py>,
+    atoms: PyReadonlyArray2<'py, f64>,
+    weights: PyReadonlyArray1<'py, f64>,
+    cost: PyReadonlyArray2<'py, f64>,
+    eps: f64,
+    n_iter: usize,
+    cotangent: PyReadonlyArray1<'py, f64>,
+) -> PyResult<(Py<PyArray2<f64>>, Py<PyArray1<f64>>)> {
+    let atoms_owned = atoms.as_array().to_owned();
+    let weights_owned = weights.as_array().to_owned();
+    let cost_owned = cost.as_array().to_owned();
+    let cot_owned = cotangent.as_array().to_owned();
+    let result = detach_py_result(py, "sinkhorn_barycenter_vjp", move || {
+        sinkhorn_barycenter_vjp_impl(
+            atoms_owned.view(),
+            weights_owned.view(),
+            cost_owned.view(),
+            eps,
+            n_iter,
+            cot_owned.view(),
+        )
+    })?;
+    let d_atoms = result.d_atoms.into_pyarray(py).unbind();
+    let d_weights = result.d_weights.into_pyarray(py).unbind();
+    Ok((d_atoms, d_weights))
+}
+
+#[pyfunction]
 fn numerics_sigmoid_stable<'py>(
     py: Python<'py>,
     x: PyReadonlyArrayDyn<'py, f64>,
@@ -19888,6 +19981,11 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
         response_geometry_sphere_normalize_base,
         module
     )?)?;
+    module.add_function(wrap_pyfunction!(sinkhorn_circular_cost, module)?)?;
+    module.add_function(wrap_pyfunction!(sinkhorn_euclidean_cost, module)?)?;
+    module.add_function(wrap_pyfunction!(sinkhorn_geodesic_sphere_cost, module)?)?;
+    module.add_function(wrap_pyfunction!(sinkhorn_barycenter_forward, module)?)?;
+    module.add_function(wrap_pyfunction!(sinkhorn_barycenter_vjp, module)?)?;
     module.add_function(wrap_pyfunction!(numerics_sigmoid_stable, module)?)?;
     module.add_function(wrap_pyfunction!(numerics_inverse_softplus, module)?)?;
     module.add_function(wrap_pyfunction!(
