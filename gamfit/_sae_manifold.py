@@ -8,6 +8,7 @@ bases, invokes Rust-backed fits, and ranks evidence with
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from typing import Any, Literal, Sequence
@@ -694,7 +695,7 @@ def _fit_fixed_k(
             grad_a[:, atom] = -np.einsum("np,np->n", residual, decoded[atom])
         grad_logits = _assignment_jvp(assignments, grad_a, assignment_prior, tau_iter)
         prior_grad = _assignment_prior_grad_logits(
-            assignments, assignment_prior, lambda_sparse, effective_alpha, tau_iter
+            logits, assignments, assignment_prior, lambda_sparse, effective_alpha, tau_iter
         )
         logits -= learning_rate * (grad_logits + prior_grad)
 
@@ -1316,6 +1317,7 @@ def _assignment_prior_value(
 
 
 def _assignment_prior_grad_logits(
+    logits: np.ndarray,
     assignments: np.ndarray,
     assignment_prior: Literal["softmax", "ibp_map", "topk", "jumprelu", "gated"],
     lambda_sparse: float,
@@ -1323,14 +1325,48 @@ def _assignment_prior_grad_logits(
     tau: float,
 ) -> np.ndarray:
     if assignment_prior == "softmax":
-        d_h_da = -lambda_sparse * (np.log(np.clip(assignments, 1e-300, 1.0)) + 1.0)
-        mean = np.sum(assignments * d_h_da, axis=1, keepdims=True)
-        return assignments * (d_h_da - mean) / tau
+        return _rust_assignment_prior_grad_logits(
+            logits,
+            {
+                "kind": "softmax_assignment_sparsity",
+                "target": "t",
+                "k_atoms": int(logits.shape[1]),
+                "temperature": float(tau),
+            },
+            [float(np.log(lambda_sparse))],
+        )
     if assignment_prior in {"topk", "jumprelu", "gated"}:
         return lambda_sparse * np.sign(assignments) * (assignments != 0.0)
-    pi = np.clip(_ibp_pi_map(assignments, alpha), 1e-12, 1.0 - 1e-12)
-    d_p_d_z = np.log((1.0 - pi) / pi)[None, :]
-    return d_p_d_z * assignments * (1.0 - assignments) / tau
+    return _rust_assignment_prior_grad_logits(
+        logits,
+        {
+            "kind": "ibp_assignment",
+            "target": "t",
+            "k_max": int(logits.shape[1]),
+            "alpha": float(alpha),
+            "tau": float(tau),
+            "learnable": False,
+        },
+        [],
+    )
+
+
+def _rust_assignment_prior_grad_logits(
+    logits: np.ndarray,
+    descriptor: Mapping[str, Any],
+    rho: Sequence[float],
+) -> np.ndarray:
+    logits_arr = np.ascontiguousarray(logits, dtype=float)
+    n_obs, latent_dim = logits_arr.shape
+    latents_json = json.dumps({"t": {"name": "t", "n": int(n_obs), "d": int(latent_dim)}})
+    penalties_json = json.dumps([dict(descriptor)])
+    _value, grad, _grad_rho = rust_module().analytic_penalty_value_grad(
+        latents_json,
+        penalties_json,
+        logits_arr.reshape(-1),
+        np.asarray(rho, dtype=float),
+    )
+    return np.asarray(grad, dtype=float).reshape(logits_arr.shape)
 
 
 def _ibp_pi_map(assignments: np.ndarray, alpha: float) -> np.ndarray:
