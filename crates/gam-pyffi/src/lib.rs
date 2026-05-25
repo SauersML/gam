@@ -388,20 +388,6 @@ struct SurvivalPredictionPayload {
     eta_se: Option<Vec<f64>>,
 }
 
-#[derive(Deserialize)]
-struct SurvivalPredictionJsonPayload {
-    class: String,
-    model_class: Option<String>,
-    times: Option<Vec<f64>>,
-    hazard: Option<Vec<Vec<f64>>>,
-    survival: Option<Vec<Vec<f64>>>,
-    cumulative_hazard: Option<Vec<Vec<f64>>>,
-    linear_predictor: Option<Vec<f64>>,
-    columns: Option<BTreeMap<String, Vec<f64>>>,
-    survival_se: Option<Vec<Vec<f64>>>,
-    eta_se: Option<Vec<f64>>,
-}
-
 #[derive(Serialize)]
 struct ValidationPayload {
     formula: String,
