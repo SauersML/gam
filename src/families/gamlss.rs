@@ -22850,6 +22850,24 @@ mod tests {
     }
 
     #[test]
+    fn logit_binomial_tail_derivatives_clip_probability_variance() {
+        let q = 50.0;
+        let (_, m2, m3) = binomial_neglog_q_derivatives_logit_closed_form(1.0, 1.0, q);
+        let m4 = binomial_neglog_q_fourth_derivative_logit_closed_form(1.0, 1.0, q);
+        let expected_variance = MIN_PROB * (1.0 - MIN_PROB);
+
+        assert!(
+            (m2 - expected_variance).abs() <= 1e-20,
+            "logit curvature should use clipped p*(1-p) in the saturated tail; got {m2}"
+        );
+        assert!(m3.is_finite());
+        assert!(
+            (m4 - expected_variance * (1.0 - 6.0 * expected_variance)).abs() <= 1e-20,
+            "logit fourth derivative should use clipped p*(1-p) in the saturated tail; got {m4}"
+        );
+    }
+
+    #[test]
     fn probit_binomial_incompatible_tail_keeps_mills_score() {
         let q = 40.0;
         let (m1, m2, m3) = binomial_neglog_q_derivatives_probit_closed_form(0.0, 1.0, q);

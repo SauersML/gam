@@ -10885,13 +10885,6 @@ fn truncate_joint_step_to_block_metric_radii(
     norms
 }
 
-fn shrink_joint_block_trust_radii(block_radii: &mut [f64], factor: f64) -> f64 {
-    for radius in block_radii {
-        *radius = (*radius * factor).clamp(1.0e-12, 1.0e6);
-    }
-    block_radii.iter().copied().fold(0.0_f64, f64::max)
-}
-
 fn joint_block_step_hit_trust_boundary(step_norm: f64, radius: f64) -> bool {
     step_norm.is_finite() && radius > 0.0 && step_norm >= 0.99 * radius
 }
@@ -12508,40 +12501,35 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // would accept at one site and reject at the other, and on
             // marginal-slope models where Sβ is the larger term it shrank
             // the post-accept tolerance below the achievable FP floor.
-            let grad_inf = gradient
-                .iter()
-                .map(|x: &f64| x.abs())
-                .fold(0.0_f64, f64::max);
-            let pen_inf = {
-                let mut beta_joint =
-                    Array1::<f64>::zeros(states.iter().map(|s| s.beta.len()).sum::<usize>());
-                let mut offset = 0usize;
-                for state in &states {
-                    let len = state.beta.len();
-                    beta_joint
-                        .slice_mut(s![offset..offset + len])
-                        .assign(&state.beta);
-                    offset += len;
-                }
-                let block_ranges: Vec<(usize, usize)> = {
-                    let mut acc = 0usize;
-                    states
+            let mut block_gradient_norms = Vec::with_capacity(states.len());
+            let mut block_penalty_norms = Vec::with_capacity(states.len());
+            for (block_idx, (start, end)) in ranges.iter().copied().enumerate() {
+                block_gradient_norms.push(
+                    gradient
+                        .slice(s![start..end])
                         .iter()
-                        .map(|s| {
-                            let start = acc;
-                            acc += s.beta.len();
-                            (start, acc)
-                        })
-                        .collect()
-                };
-                let pen_vec =
-                    apply_joint_block_penalty(&block_ranges, &s_lambdas, &beta_joint, 0.0);
-                pen_vec
-                    .iter()
-                    .map(|x: &f64| x.abs())
-                    .fold(0.0_f64, f64::max)
-            };
+                        .map(|x: &f64| x.abs())
+                        .fold(0.0_f64, f64::max),
+                );
+                let mut penalty_block = s_lambdas[block_idx].dot(&states[block_idx].beta);
+                if options.ridge_policy.include_quadratic_penalty && ridge > 0.0 {
+                    penalty_block += &states[block_idx].beta.mapv(|v| ridge * v);
+                }
+                block_penalty_norms.push(
+                    penalty_block
+                        .iter()
+                        .map(|x: &f64| x.abs())
+                        .fold(0.0_f64, f64::max),
+                );
+            }
+            let grad_inf = block_gradient_norms.iter().copied().fold(0.0_f64, f64::max);
+            let pen_inf = block_penalty_norms.iter().copied().fold(0.0_f64, f64::max);
             let residual_tol = inner_tol * (1.0 + grad_inf.max(pen_inf));
+            let block_stationarity_tolerances = block_gradient_norms
+                .iter()
+                .zip(&block_penalty_norms)
+                .map(|(grad_norm, penalty_norm)| inner_tol * (1.0 + grad_norm.max(*penalty_norm)))
+                .collect::<Vec<_>>();
             let block_stationarity_norms = {
                 let projected = exact_newton_joint_projected_stationarity_vector_from_gradient(
                     gradient,
@@ -12568,9 +12556,14 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     })
                     .collect::<Vec<_>>()
             };
-            let all_block_stationarity_small = block_stationarity_norms.iter().all(|norm| {
-                norm.is_finite() && *norm <= RESIDUAL_STALL_BLOCK_GRADIENT_FACTOR * residual_tol
-            });
+            let all_block_stationarity_small = block_stationarity_norms
+                .iter()
+                .zip(&block_stationarity_tolerances)
+                .all(|(norm, tol)| {
+                    norm.is_finite()
+                        && tol.is_finite()
+                        && *norm <= RESIDUAL_STALL_BLOCK_GRADIENT_FACTOR * *tol
+                });
             let near_convergence = residual <= 10.0 * residual_tol;
             let signed_obj_change = lastobjective - old_objective;
             let objective_change = signed_obj_change.abs();
@@ -18557,7 +18550,9 @@ fn apply_joint_block_penalty_into(
 /// preconditioner shared by all PCG callsites.
 ///
 /// Callers in the PIRLS inner Newton PCG path feed the result as the diagonal
-/// rescale every CG iteration.
+/// rescale every CG iteration: PCG applies `M^{-1}` to residuals directly.
+/// Do not square-root or trace-normalize these entries, and do not apply a
+/// second preconditioner-side rescale to the returned Newton step.
 fn positive_joint_diagonal_entry(value: f64) -> f64 {
     if value.is_finite() && value > 1.0e-10 {
         value

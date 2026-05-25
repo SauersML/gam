@@ -9333,13 +9333,26 @@ fn sae_manifold_predict_oos<'py>(
     let mut decoder_coefficients = Array3::<f64>::zeros((k_atoms, m_max, p_out));
     for atom_idx in 0..k_atoms {
         let block = decoder_blocks[atom_idx].as_array();
-        let m_k = basis_sizes[atom_idx].min(block.nrows());
         if block.ncols() != p_out {
             return Err(py_value_error(format!(
                 "sae_manifold_predict_oos: decoder_blocks[{atom_idx}] has p={} but x_new has p={p_out}",
                 block.ncols()
             )));
         }
+        if block.nrows() != basis_sizes[atom_idx] {
+            return Err(py_value_error(format!(
+                "sae_manifold_predict_oos: decoder_blocks[{atom_idx}] has M={} but rebuilt basis has M={}; \
+                 atom_basis / atom_dim / n_harmonics_list / duchon_centers must match the trained design",
+                block.nrows(),
+                basis_sizes[atom_idx]
+            )));
+        }
+        if !block.iter().all(|v| v.is_finite()) {
+            return Err(py_value_error(format!(
+                "sae_manifold_predict_oos: decoder_blocks[{atom_idx}] contains non-finite values"
+            )));
+        }
+        let m_k = basis_sizes[atom_idx];
         decoder_coefficients
             .slice_mut(s![atom_idx, 0..m_k, 0..p_out])
             .assign(&block.slice(s![0..m_k, 0..p_out]));
