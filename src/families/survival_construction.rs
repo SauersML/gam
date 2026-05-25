@@ -2890,7 +2890,17 @@ pub fn build_latent_survival_baseline_offsets(
 
     fn gompertz_components(age: f64, rate: f64, shape: f64) -> (f64, f64) {
         if shape.abs() < 1e-10 {
-            return (rate * age, rate);
+            // Taylor at shape=0 matching `gompertz_hazard_components`:
+            //   H_G(t) = rate·t·(1 + (shape·t)/2 + (shape·t)²/6)
+            //   h_G(t) = rate·(1 + shape·t + (shape·t)²/2)
+            // Dropping the higher-order `shape*t` corrections silently
+            // diverges this helper from its sibling for non-zero shape near
+            // the cutoff and gives inconsistent loaded-vs-unloaded offsets.
+            let x = shape * age;
+            return (
+                rate * age * (1.0 + 0.5 * x + x * x / 6.0),
+                rate * (1.0 + x + 0.5 * x * x),
+            );
         }
         let shape_age = shape * age;
         let cumulative_hazard = (rate / shape) * shape_age.exp_m1();
