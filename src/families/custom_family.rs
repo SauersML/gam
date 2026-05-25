@@ -20595,6 +20595,49 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     rho_prior: crate::types::RhoPrior,
 ) -> Result<crate::solver::estimate::UnifiedFitResult, CustomFamilyError> {
     let penalty_counts = validate_blockspecs(specs)?;
+
+    // Pre-fit cross-block identifiability audit. Every blockwise fit
+    // path in the tree (standard, gaussian/binomial location-scale,
+    // survival, BMS, transformation-normal, custom families) reaches
+    // this entry point with a finalised `ParameterBlockSpec` list, so
+    // wiring the audit here covers all four `solver::workflow.rs`
+    // entry points plus every direct caller of `fit_custom_family`
+    // without each family needing its own audit hook.
+    //
+    // Contract: specs arrive *after* `nullspace-lead`'s
+    // `joint_null_rotation` absorption — the audit inspects rotated
+    // columns only. A clean audit returns `Reparameterised`-equivalent
+    // (`fatal=false`, possibly with logged alias pairs); a fatal audit
+    // returns `CustomFamilyError::DimensionMismatch` carrying the
+    // audit summary. Per the panic-vs-Err contract: never panic
+    // mid-construction.
+    let audit = crate::solver::identifiability_audit::audit_identifiability(specs).map_err(
+        |reason| CustomFamilyError::DimensionMismatch {
+            reason: format!("pre-fit identifiability audit failed: {reason}"),
+        },
+    )?;
+    if audit.fatal {
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: format!(
+                "pre-fit identifiability audit refused the fit: {summary}",
+                summary = audit.summary,
+            ),
+        });
+    }
+    if !audit.aliased_pairs.is_empty() {
+        log::info!("[identifiability audit] {}", audit.summary);
+        for pair in &audit.aliased_pairs {
+            log::info!(
+                "[identifiability audit] alias: {}[{}] ~ {}[{}] (overlap={:.4})",
+                pair.block_a,
+                pair.direction_a,
+                pair.block_b,
+                pair.direction_b,
+                pair.overlap,
+            );
+        }
+    }
+
     let label_layout = penalty_label_layout(specs, penalty_counts.clone())?;
     let rho0 = label_layout.initial_rho.clone();
     let (persistent_warm_start_key, persistent_warm_start) =
