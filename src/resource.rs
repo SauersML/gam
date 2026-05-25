@@ -394,7 +394,7 @@ impl<T> RayonSafeOnce<T> {
             return v;
         }
         let candidate = init();
-        drop(self.slot.set(candidate));
+        let _ = self.slot.set(candidate);
         self.slot
             .get()
             .expect("RayonSafeOnce slot populated by set() above")
@@ -409,7 +409,7 @@ impl<T> RayonSafeOnce<T> {
             return Ok(v);
         }
         let candidate = init()?;
-        drop(self.slot.set(candidate));
+        let _ = self.slot.set(candidate);
         Ok(self
             .slot
             .get()
@@ -427,7 +427,7 @@ impl<T: Clone> Clone for RayonSafeOnce<T> {
     fn clone(&self) -> Self {
         let cloned = Self::new();
         if let Some(value) = self.slot.get() {
-            drop(cloned.slot.set(value.clone()));
+            let _ = cloned.slot.set(value.clone());
         }
         cloned
     }

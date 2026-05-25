@@ -6369,6 +6369,7 @@ impl<T> ExactNewtonJointPsiDirectCache<T> {
                 .map_err(|_| "joint psi direct cache poisoned".to_string())?;
             if let Some(cached) = guard.as_ref() {
                 let cached = cached.clone();
+                // release-early-on-purpose: update LRU after releasing the entry mutex.
                 drop(guard);
                 self.touch_lru(index)?;
                 return Ok(cached);
@@ -6381,6 +6382,7 @@ impl<T> ExactNewtonJointPsiDirectCache<T> {
             .map_err(|_| "joint psi direct cache poisoned".to_string())?;
         let cached = guard.get_or_insert_with(|| computed.clone());
         let out = cached.clone();
+        // release-early-on-purpose: update LRU after releasing the entry mutex.
         drop(guard);
         self.touch_lru(index)?;
         Ok(out)
