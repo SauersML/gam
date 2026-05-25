@@ -3432,10 +3432,27 @@ fn find_enclosing_fn(lines: &[&str], at_line: usize) -> Option<(String, (usize, 
 /// normalized signature text — everything from `fn_line` up to (and
 /// excluding) the body's opening `{`, whitespace-collapsed.
 fn find_fn_body_at(lines: &[&str], fn_line: usize) -> Option<(String, (usize, usize))> {
+    // Stateful stripping across lines so multi-line raw strings (`r#"..."#`),
+    // raw strings spanning newlines, and plain `"..."` continuations cannot
+    // leak braces into the depth counter and falsely close the body early.
+    let mut stripped: Vec<String> = Vec::with_capacity(lines.len() - fn_line);
+    {
+        let mut in_str = false;
+        let mut quote: u8 = 0;
+        let mut hashes: u8 = 0;
+        for line in &lines[fn_line..] {
+            let (s, ns, nq, nh) =
+                strip_strings_and_comments_stateful_raw(line, in_str, quote, hashes);
+            stripped.push(s);
+            in_str = ns;
+            quote = nq;
+            hashes = nh;
+        }
+    }
     let mut depth: i32 = 0;
     let mut body_open: Option<usize> = None;
-    for j in fn_line..lines.len() {
-        let s = strip_strings_and_comments(lines[j]);
+    for (rel, s) in stripped.iter().enumerate() {
+        let j = fn_line + rel;
         for b in s.bytes() {
             match b {
                 b'{' => {
@@ -3450,8 +3467,8 @@ fn find_fn_body_at(lines: &[&str], fn_line: usize) -> Option<(String, (usize, us
                         && let Some(open) = body_open
                     {
                         let mut sig = String::new();
-                        for (k, line) in lines.iter().enumerate().take(open + 1).skip(fn_line) {
-                            let ss = strip_strings_and_comments(line);
+                        for k in fn_line..=open {
+                            let ss = &stripped[k - fn_line];
                             let cut = if k == open {
                                 ss.find('{').unwrap_or(ss.len())
                             } else {
