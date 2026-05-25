@@ -38,8 +38,8 @@ use std::sync::Once;
 use std::time::Instant;
 
 const SEED: u64 = 0xC0FF_EE15_F00D_BA75;
-const N: usize = 60_000;
-const N_PCS: usize = 10;
+const N: usize = 195_780;
+const N_PCS: usize = 3;
 
 struct StderrInfoLogger;
 
@@ -172,10 +172,11 @@ fn survival_marginal_slope_stall_reproduces_residual_stall_early_exit() {
 
     let data = build_dataset();
 
-    // Build the PC-Duchon log-slope formula (same shape as the failing
-    // biobank fit: `duchon(PC1..PCk, centers=24, order=1)` on both sides).
+    // Build the PC-Duchon log-slope formula with the same PC dimensionality
+    // and center count as the failing biobank fit:
+    // `duchon(PC1, PC2, PC3, centers=10, order=1)` on both sides.
     let pcs: Vec<String> = (0..N_PCS).map(|i| format!("PC{}", i + 1)).collect();
-    let duchon_term = format!("duchon({}, centers=24, order=1)", pcs.join(", "));
+    let duchon_term = format!("duchon({}, centers=10, order=1)", pcs.join(", "));
     // Time block configured to be over-parameterised relative to the
     // event-bearing portion of the age window: 12 internal knots over
     // a 40-unit range with a near-flat tail produces a near-singular
