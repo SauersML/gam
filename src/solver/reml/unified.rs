@@ -505,7 +505,7 @@ pub trait HessianOperator: Send + Sync {
                 // so it is always a valid sub-range of `x`. A failure here
                 // means the operator violated its row-chunk contract.
                 // SAFETY: row range built from 0..x.nrows(); failure means operator broke its contract.
-                panic!("xt_logdet_kernel_x_diagonal: row chunk failed: {err}")
+                reml_contract_panic(format!("xt_logdet_kernel_x_diagonal: row chunk failed: {err}"))
             });
             let chunk_t = rows.t().to_owned();
             let z_chunk = self.solve_multi(&chunk_t);
@@ -2277,7 +2277,7 @@ impl ProjectedFactorCache {
                             // downstream REML/PIRLS computation that depends
                             // on it.
                             // SAFETY: producer thread panicked; propagating to waiters avoids returning corrupted factor.
-                            panic!("projected factor cache producer panicked")
+                            reml_contract_panic("projected factor cache producer panicked")
                         }
                         None => {
                             guard = marker
@@ -3651,7 +3651,9 @@ impl ImplicitHyperOperator {
                 // operator broke its row-chunk contract.
                 .unwrap_or_else(|err| {
                     // SAFETY: row range is a valid sub-range of x_design; failure means operator broke contract.
-                    panic!("ImplicitHyperOperator::compute_xf row chunk failed: {err}")
+                    reml_contract_panic(format!(
+                        "ImplicitHyperOperator::compute_xf row chunk failed: {err}"
+                    ))
                 });
             let block = crate::faer_ndarray::fast_ab(&rows, factor);
             xf.slice_mut(ndarray::s![start..end, ..]).assign(&block);
@@ -4272,8 +4274,8 @@ impl PenaltyCoordinate {
                 // `has_root()`, so reaching this arm means a caller
                 // invoked the rooted-only API on a rootless variant.
                 // SAFETY: KroneckerMarginal has no root; callers must gate on has_root() before apply_root.
-                panic!(
-                    "apply_root not supported for KroneckerMarginal; use apply_penalty directly"
+                reml_contract_panic(
+                    "apply_root not supported for KroneckerMarginal; use apply_penalty directly",
                 );
             }
         }
@@ -4911,7 +4913,9 @@ impl PenaltySubspaceTrace {
                 // so it is always a valid sub-range of `x`. Failure means
                 // the operator broke its row-chunk contract.
                 // SAFETY: row range built from 0..x.nrows(); failure means operator broke its contract.
-                panic!("xt_projected_kernel_x_diagonal: row chunk failed: {err}")
+                reml_contract_panic(format!(
+                    "xt_projected_kernel_x_diagonal: row chunk failed: {err}"
+                ))
             });
             // Z_chunk = rows · U_S  ((end-start) × r).
             let z_chunk = crate::faer_ndarray::fast_ab(&rows, &self.u_s);
@@ -13452,7 +13456,7 @@ impl HessianOperator for DenseSpectralOperator {
                 // so it is always a valid sub-range of `x`. A failure here
                 // means the operator violated its row-chunk contract.
                 // SAFETY: row range built from 0..x.nrows(); failure means operator broke its contract.
-                panic!("xt_logdet_kernel_x_diagonal: row chunk failed: {err}")
+                reml_contract_panic(format!("xt_logdet_kernel_x_diagonal: row chunk failed: {err}"))
             });
             let xg = crate::faer_ndarray::fast_ab(&rows, &self.g_factor);
             for (local, row) in xg.outer_iter().enumerate() {
@@ -13749,7 +13753,9 @@ impl SparseCholeskyOperator {
                 // the cached factor was corrupted after construction —
                 // a hard invariant violation.
                 // SAFETY: self.factor is validated SPD; sparse-SPD solve only fails on factor corruption.
-                panic!("SparseCholeskyOperator exact trace_hinv_operator solve failed: {e}")
+                reml_contract_panic(format!(
+                    "SparseCholeskyOperator exact trace_hinv_operator solve failed: {e}"
+                ))
             });
             start = end;
         }
@@ -13876,7 +13882,9 @@ impl SparseCholeskyOperator {
                 // corruption, which `SparseCholeskyOperator`'s
                 // construction invariant forbids.
                 // SAFETY: self.factor is validated SPD; block-local solve only fails on factor corruption.
-                panic!("SparseCholeskyOperator exact block-local trace solve failed: {e}")
+                reml_contract_panic(format!(
+                    "SparseCholeskyOperator exact block-local trace solve failed: {e}"
+                ))
             });
             local_col_start += cols;
         }
