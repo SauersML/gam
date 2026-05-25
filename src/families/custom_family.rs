@@ -26607,6 +26607,11 @@ mod tests {
         assert!(trial_objective < old_objective);
     }
 
+    // Inline RED REPRO moved to tests/joint_newton_isotropic_tr_starvation.rs
+    // so it survives in-progress refactors of the surrounding test
+    // support module (this `mod tests { }` currently does not compile due
+    // to `crate::test_support::*` / `test_outerobjective_andgradient` WIP).
+    #[cfg(any())]
     /// RED REPRO: joint-Newton trust-region L2 rescale starves well-conditioned
     /// blocks when ONE block has a near-singular curvature direction.
     ///
