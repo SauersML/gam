@@ -430,8 +430,10 @@ impl LikelihoodSpec {
             ResponseFamily::Binomial
             | ResponseFamily::Poisson
             | ResponseFamily::Tweedie { .. }
-            | ResponseFamily::NegativeBinomial { .. }
-            | ResponseFamily::Beta { .. } => LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 },
+            | ResponseFamily::NegativeBinomial { .. } => {
+                LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 }
+            }
+            ResponseFamily::Beta { phi } => LikelihoodScaleMetadata::FixedDispersion { phi: *phi },
             ResponseFamily::RoystonParmar => LikelihoodScaleMetadata::Unspecified,
         }
     }
@@ -496,6 +498,34 @@ impl LikelihoodSpec {
     pub const fn supports_firth(&self) -> bool {
         matches!(self.response, ResponseFamily::Binomial)
             && matches!(self.link, InverseLink::Standard(LinkFunction::Logit))
+    }
+
+    /// Family-level fixed-dispersion contract. Returns the dispersion parameter
+    /// `phi` that the GLM log-likelihood / weight expressions treat as fixed
+    /// for the given `ResponseFamily`, or `None` when the family carries no
+    /// fixed scale (profiled or jointly estimated).
+    ///
+    /// - `Gaussian` and `Gamma` profile/estimate the scale jointly with the
+    ///   mean, so no fixed `phi` is exposed here.
+    /// - `Binomial`, `Poisson`, `Tweedie`, and `NegativeBinomial` are
+    ///   unit-scale exponential-family fits (overdispersion in NB is encoded
+    ///   in `theta`, not in `phi`), so the contract is `Some(1.0)`.
+    /// - `Beta { phi }` carries its precision parameter directly on the family
+    ///   variant; the contract returns that exact value rather than the
+    ///   placeholder used elsewhere for unit-scale GLMs.
+    /// - `RoystonParmar` has no GLM-style dispersion slot.
+    #[inline]
+    pub const fn fixed_dispersion(&self) -> Option<f64> {
+        match self.response {
+            ResponseFamily::Gaussian | ResponseFamily::Gamma | ResponseFamily::RoystonParmar => {
+                None
+            }
+            ResponseFamily::Binomial
+            | ResponseFamily::Poisson
+            | ResponseFamily::Tweedie { .. }
+            | ResponseFamily::NegativeBinomial { .. } => Some(1.0),
+            ResponseFamily::Beta { phi } => Some(phi),
+        }
     }
 }
 
