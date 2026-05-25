@@ -415,8 +415,7 @@ fn block_centered_penalties_sum_to_joint_quadratic() {
 
 // ---------------------------------------------------------------------------
 // 8. REML invariance under (μ, β-init) joint shift.
-// Requires a public REML driver; we cannot launch a real fit from this file
-// without entangling with the build-red WIP. The test is written against the
+// Rather than launch a full REML fit, the test is written against the
 // invariant directly: shifting both μ and a hypothetical converged β by the
 // same vector δ leaves the centered quadratic — the only place μ enters the
 // REML/PIRLS objective — unchanged.

@@ -190,6 +190,79 @@ impl fmt::Display for DualRidgeResult {
     }
 }
 
+/// Residual diagnostics for observed values and predicted means.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PredictionDiagnostics {
+    pub n_obs: f64,
+    pub mae: f64,
+    pub rmse: f64,
+    pub bias: f64,
+    pub r_squared: Option<f64>,
+    pub residuals: Vec<f64>,
+}
+
+/// Compute prediction residual diagnostics from observed values and predicted means.
+pub fn diagnostics_from_predictions(
+    observed: &[f64],
+    predicted_mean: &[f64],
+) -> Result<PredictionDiagnostics, String> {
+    if observed.is_empty() {
+        return Err("diagnostics_from_predictions requires at least one observation".to_string());
+    }
+    if observed.len() != predicted_mean.len() {
+        return Err(format!(
+            "diagnostics_from_predictions length mismatch: observed has {} values but predicted mean has {}",
+            observed.len(),
+            predicted_mean.len()
+        ));
+    }
+    if observed.iter().any(|value| !value.is_finite()) {
+        return Err("observed values must contain only finite numbers".to_string());
+    }
+    if predicted_mean.iter().any(|value| !value.is_finite()) {
+        return Err("predicted mean values must contain only finite numbers".to_string());
+    }
+
+    let n_obs = observed.len();
+    let n_obs_f = n_obs as f64;
+    let mut residuals = Vec::with_capacity(n_obs);
+    let mut abs_sum = 0.0_f64;
+    let mut residual_sum = 0.0_f64;
+    let mut residual_sum_squares = 0.0_f64;
+    let mut observed_sum = 0.0_f64;
+    for (obs, pred) in observed.iter().zip(predicted_mean.iter()) {
+        let residual = obs - pred;
+        residuals.push(residual);
+        abs_sum += residual.abs();
+        residual_sum += residual;
+        residual_sum_squares += residual * residual;
+        observed_sum += obs;
+    }
+
+    let observed_mean = observed_sum / n_obs_f;
+    let total_sum_squares = observed
+        .iter()
+        .map(|value| {
+            let centered = value - observed_mean;
+            centered * centered
+        })
+        .sum::<f64>();
+    let r_squared = if total_sum_squares > 0.0 {
+        Some(1.0 - residual_sum_squares / total_sum_squares)
+    } else {
+        None
+    };
+
+    Ok(PredictionDiagnostics {
+        n_obs: n_obs_f,
+        mae: abs_sum / n_obs_f,
+        rmse: (residual_sum_squares / n_obs_f).sqrt(),
+        bias: residual_sum / n_obs_f,
+        r_squared,
+        residuals,
+    })
+}
+
 /// Complete diagnostic report for a gradient evaluation
 #[derive(Clone, Debug, Default)]
 pub struct GradientDiagnosticReport {
@@ -425,5 +498,53 @@ mod tests {
 
         assert!(result.has_mismatch);
         assert!(result.message.contains("Ridge Mismatch detected"));
+    }
+
+    #[test]
+    fn diagnostics_from_predictions_computes_residual_metrics() {
+        let observed = [1.0, 2.0, 4.0];
+        let predicted = [1.5, 1.5, 3.0];
+
+        let result = diagnostics_from_predictions(&observed, &predicted).unwrap();
+
+        assert_eq!(result.residuals, vec![-0.5, 0.5, 1.0]);
+        assert_eq!(result.n_obs, 3.0);
+        assert_eq!(result.mae, 2.0 / 3.0);
+        assert_eq!(result.bias, 1.0 / 3.0);
+        assert_eq!(result.rmse, (1.5_f64 / 3.0).sqrt());
+        assert_eq!(result.r_squared, Some(1.0 - 1.5 / (14.0 / 3.0)));
+    }
+
+    #[test]
+    fn diagnostics_from_predictions_omits_r_squared_for_constant_observed() {
+        let observed = [2.0, 2.0];
+        let predicted = [1.0, 3.0];
+
+        let result = diagnostics_from_predictions(&observed, &predicted).unwrap();
+
+        assert_eq!(result.r_squared, None);
+    }
+
+    #[test]
+    fn diagnostics_from_predictions_rejects_invalid_inputs() {
+        assert_eq!(
+            diagnostics_from_predictions(&[], &[]),
+            Err("diagnostics_from_predictions requires at least one observation".to_string())
+        );
+        assert_eq!(
+            diagnostics_from_predictions(&[1.0], &[1.0, 2.0]),
+            Err(
+                "diagnostics_from_predictions length mismatch: observed has 1 values but predicted mean has 2"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            diagnostics_from_predictions(&[f64::NAN], &[1.0]),
+            Err("observed values must contain only finite numbers".to_string())
+        );
+        assert_eq!(
+            diagnostics_from_predictions(&[1.0], &[f64::INFINITY]),
+            Err("predicted mean values must contain only finite numbers".to_string())
+        );
     }
 }

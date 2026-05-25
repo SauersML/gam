@@ -124,7 +124,6 @@ impl VectorResponseTarget {
     }
 
     pub fn with_row_weights(mut self, w: Array1<f64>) -> Result<Self, EstimationError> {
-        // TODO(coverage): add test exercising non-finite and negative row-weight rejection
         validate_row_weights(&w, self.y.nrows())?;
         self.row_weights = Some(w);
         Ok(self)
@@ -199,7 +198,6 @@ pub struct GaussianVectorLikelihood {
 
 impl GaussianVectorLikelihood {
     pub fn from_target(target: &VectorResponseTarget) -> Result<Self, EstimationError> {
-        // TODO(coverage): add test exercising low-rank factor shape and non-finite entries
         if let Some(weights) = target.row_weights.as_ref() {
             validate_row_weights(weights, target.n())?;
         }
@@ -350,3 +348,157 @@ impl VectorLikelihood for GaussianVectorLikelihood {
 // ─────────────────────────────────────────────────────────────────────────────
 // Piece 5 / Piece 1 row-block support
 // ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::{array, Array1, Array2};
+
+    fn expect_invalid_input<T>(
+        result: Result<T, EstimationError>,
+        needle: &str,
+    ) -> String {
+        match result {
+            Ok(_) => panic!("expected EstimationError::InvalidInput containing `{needle}`, got Ok"),
+            Err(EstimationError::InvalidInput(msg)) => {
+                assert!(
+                    msg.contains(needle),
+                    "InvalidInput message `{msg}` does not contain `{needle}`"
+                );
+                msg
+            }
+            Err(other) => panic!(
+                "expected EstimationError::InvalidInput containing `{needle}`, got {other:?}"
+            ),
+        }
+    }
+
+    fn dummy_target(n: usize, m: usize) -> VectorResponseTarget {
+        VectorResponseTarget::new(
+            Array2::<f64>::zeros((n, m)),
+            VectorNoise::Isotropic(1.0),
+        )
+    }
+
+    #[test]
+    fn with_row_weights_rejects_wrong_length() {
+        let target = dummy_target(4, 2);
+        let weights = Array1::from(vec![1.0, 1.0, 1.0]);
+        expect_invalid_input(target.with_row_weights(weights), "row_weights length");
+    }
+
+    #[test]
+    fn with_row_weights_rejects_negative_entry() {
+        let target = dummy_target(3, 2);
+        let weights = Array1::from(vec![1.0, -0.5, 2.0]);
+        expect_invalid_input(
+            target.with_row_weights(weights),
+            "must be finite and non-negative",
+        );
+    }
+
+    #[test]
+    fn with_row_weights_rejects_nan_entry() {
+        let target = dummy_target(3, 2);
+        let weights = Array1::from(vec![1.0, f64::NAN, 2.0]);
+        expect_invalid_input(
+            target.with_row_weights(weights),
+            "must be finite and non-negative",
+        );
+    }
+
+    #[test]
+    fn with_row_weights_rejects_infinite_entry() {
+        let target = dummy_target(3, 2);
+        let weights = Array1::from(vec![1.0, f64::INFINITY, 2.0]);
+        expect_invalid_input(
+            target.with_row_weights(weights),
+            "must be finite and non-negative",
+        );
+    }
+
+    #[test]
+    fn with_row_weights_accepts_zero_and_positive() {
+        let target = dummy_target(3, 2);
+        let weights = Array1::from(vec![0.0, 1.5, 3.0]);
+        let weighted = target
+            .with_row_weights(weights)
+            .expect("zero / positive weights should be accepted");
+        assert!(weighted.row_weights.is_some());
+    }
+
+    #[test]
+    fn from_target_rejects_low_rank_factor_with_wrong_row_count() {
+        let n = 4;
+        let m = 3;
+        // factor has 2 rows instead of M = 3.
+        let factor = Array2::from_shape_vec((2, 2), vec![0.1, 0.2, 0.3, 0.4]).unwrap();
+        let target = VectorResponseTarget::new(
+            Array2::<f64>::zeros((n, m)),
+            VectorNoise::LowRank {
+                diag: Array1::from(vec![1.0; m]),
+                factor,
+            },
+        );
+        expect_invalid_input(
+            GaussianVectorLikelihood::from_target(&target),
+            "factor has",
+        );
+    }
+
+    #[test]
+    fn from_target_rejects_non_finite_low_rank_factor_entry() {
+        let n = 4;
+        let m = 3;
+        let mut factor = Array2::<f64>::zeros((m, 2));
+        factor[[1, 0]] = f64::NAN;
+        let target = VectorResponseTarget::new(
+            Array2::<f64>::zeros((n, m)),
+            VectorNoise::LowRank {
+                diag: Array1::from(vec![1.0; m]),
+                factor,
+            },
+        );
+        expect_invalid_input(
+            GaussianVectorLikelihood::from_target(&target),
+            "must be finite",
+        );
+    }
+
+    #[test]
+    fn from_target_accepts_well_formed_low_rank_factor() {
+        let n = 2;
+        let m = 3;
+        let factor = Array2::from_shape_vec((m, 2), vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6]).unwrap();
+        let target = VectorResponseTarget::new(
+            array![[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+            VectorNoise::LowRank {
+                diag: Array1::from(vec![1.0; m]),
+                factor: factor.clone(),
+            },
+        );
+        let lik = GaussianVectorLikelihood::from_target(&target)
+            .expect("well-formed low-rank factor should be accepted");
+        let stored = lik.factor.expect("low-rank factor should be carried");
+        assert_eq!(stored.dim(), (m, 2));
+        for ((i, j), v) in stored.indexed_iter() {
+            assert_eq!(*v, factor[[i, j]]);
+        }
+        assert_eq!(n, lik.precision.len().max(n));
+    }
+
+    #[test]
+    fn from_target_propagates_row_weight_length_mismatch() {
+        let n = 3;
+        let m = 2;
+        let target = VectorResponseTarget {
+            y: Array2::<f64>::zeros((n, m)),
+            noise: VectorNoise::Isotropic(1.0),
+            row_weights: Some(Array1::from(vec![1.0, 1.0])),
+        };
+        expect_invalid_input(
+            GaussianVectorLikelihood::from_target(&target),
+            "row_weights length",
+        );
+    }
+}

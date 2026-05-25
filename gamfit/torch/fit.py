@@ -127,9 +127,11 @@ def _build_design_penalty(
     N = points.shape[0]
 
     # Dispatch decision (which Rust entry to call) lives in Rust as the single
-    # source of truth for supported torch-fit specs. The tensor construction
-    # under each branch stays here because torch autograd VJP must flow back
-    # through `points`, `centers`, and `by`.
+    # source of truth for supported torch-fit specs — the Rust call validates
+    # the spec is recognised and supported. The tensor construction under each
+    # branch stays here because torch autograd VJP must flow back through
+    # `points`, `centers`, and `by`; ``isinstance`` is used so pyright narrows
+    # ``smooth`` to the matching subclass on each branch.
     try:
         entry = _rust.torch_smooth_dispatch_key(type(smooth).__name__)
     except ValueError as exc:
@@ -141,7 +143,7 @@ def _build_design_penalty(
             raise TypeError(message) from exc
         raise NotImplementedError(message) from exc
 
-    if entry == "duchon":
+    if entry == "duchon" and isinstance(smooth, Duchon):
         centers = _coerce_2d(_to_tensor(smooth.centers, points), "Duchon.centers")
         if centers.shape[1] != points.shape[1]:
             raise ValueError(
@@ -167,7 +169,7 @@ def _build_design_penalty(
         penalty = torch.as_tensor(penalty_np, dtype=torch.float64, device=points.device)
         return design.to(torch.float64), penalty
 
-    if entry == "bspline":
+    if entry == "bspline" and isinstance(smooth, BSpline):
         if points.shape[1] != 1:
             raise ValueError(
                 f"BSpline is 1D-only; got points with d={points.shape[1]}. "
@@ -197,7 +199,7 @@ def _build_design_penalty(
         penalty = torch.as_tensor(penalty_np, dtype=torch.float64, device=points.device)
         return design.to(torch.float64), penalty
 
-    if entry == "sphere":
+    if entry == "sphere" and isinstance(smooth, Sphere):
         if points.shape[1] != 2:
             raise ValueError(
                 f"Sphere expects points of shape (N, 2) [lat, lon]; got d={points.shape[1]}"
@@ -226,7 +228,7 @@ def _build_design_penalty(
         )
         return design.to(torch.float64), penalty.to(torch.float64)
 
-    if entry == "periodic_spline_curve":
+    if entry == "periodic_spline_curve" and isinstance(smooth, PeriodicSplineCurve):
         if points.shape[1] != 1:
             raise ValueError(
                 f"PeriodicSplineCurve expects 1D parameter t with shape (N,) or "
@@ -241,7 +243,7 @@ def _build_design_penalty(
         )
         return design.to(torch.float64), penalty.to(torch.float64)
 
-    if entry == "pca":
+    if entry == "pca" and isinstance(smooth, Pca):
         if smooth.lazy_path is not None:
             raise NotImplementedError("Pca lazy_path is available on the Rust formula path")
         if smooth.basis is None:
