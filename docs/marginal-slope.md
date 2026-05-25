@@ -76,9 +76,9 @@ probs = model.predict(test_df, return_type="dict")["mean"]
 - `family="bernoulli-marginal-slope"` names the likelihood; `z_column=`
   and `logslope_formula=` route the Python fit onto the marginal-slope
   path.
-- The base link is fixed to probit. `link(type=probit)` is optional in
-  formulas; CLI formula-level non-probit links are rejected. The Python
-  `link=` keyword is not needed for marginal-slope fits.
+- The base link is fixed to probit. In the CLI, `link(type=probit)` is
+  optional and non-probit formula links are rejected. The Python `link=`
+  keyword is not needed for marginal-slope fits.
 - `z_column="z"`: name of the conditional z-score column in both the
   training and prediction tables.
 - `logslope_formula="..."`: formula for the slope surface as a
