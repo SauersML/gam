@@ -5214,8 +5214,7 @@ impl JointBetaRhoPosterior {
             }
         }
 
-        validate_firth_likelihood_support(&likelihood, firth_enabled)
-            .map_err(String::from)?;
+        validate_firth_likelihood_support(&likelihood, firth_enabled).map_err(String::from)?;
         if matches!(likelihood.response, ResponseFamily::NegativeBinomial { .. }) {
             validate_count_responses("negative-binomial joint HMC", &y, &weights)
                 .map_err(String::from)?;

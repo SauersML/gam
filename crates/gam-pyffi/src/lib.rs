@@ -49,6 +49,7 @@ use gam::smooth::{
     TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
     freeze_term_collection_from_design,
 };
+use gam::solver::reml_compare::{RemlCandidate, compare_reml_fits as compare_reml_fits_core};
 use gam::survival_marginal_slope::SurvivalMarginalSlopeFitResult;
 use gam::terms::basis::{
     BasisOptions, CenterStrategy, Dense, DuchonBasisSpec, DuchonNullspaceOrder, MaternBasisSpec,
@@ -69,7 +70,6 @@ use gam::terms::sae_manifold::{
     AssignmentMode, GumbelTemperatureSchedule, SaeAtomBasisKind, SaeManifoldRho, ScheduleKind,
     term_from_padded_blocks_with_mode,
 };
-use gam::solver::reml_compare::{RemlCandidate, compare_reml_fits as compare_reml_fits_core};
 use gam::terms::skip_transcoder::{
     SkipTranscoderRemlInputs, skip_transcoder_reml_metrics as skip_transcoder_reml_metrics_core,
 };

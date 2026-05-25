@@ -42,9 +42,9 @@ use crate::pirls::{self, PirlsResult};
 use crate::seeding::{SeedConfig, SeedRiskProfile};
 use crate::terms::smooth::BlockwisePenalty;
 use crate::types::{
-    Coefficients, GlmLikelihoodSpec, InverseLink, LatentCLogLogState,
-    LikelihoodScaleMetadata, LikelihoodSpec, LinkFunction, LogLikelihoodNormalization,
-    LogSmoothingParamsView, MixtureLinkState, ResponseFamily, RidgePassport, SasLinkState,
+    Coefficients, GlmLikelihoodSpec, InverseLink, LatentCLogLogState, LikelihoodScaleMetadata,
+    LikelihoodSpec, LinkFunction, LogLikelihoodNormalization, LogSmoothingParamsView,
+    MixtureLinkState, ResponseFamily, RidgePassport, SasLinkState,
 };
 use crate::types::{MixtureLinkSpec, SasLinkSpec};
 
@@ -5346,9 +5346,7 @@ impl UnifiedFitResult {
             (ResponseFamily::Poisson, _)
             | (ResponseFamily::Tweedie { .. }, _)
             | (ResponseFamily::NegativeBinomial { .. }, _)
-            | (ResponseFamily::Gamma, _) => {
-                Ok(FittedLinkState::Standard(Some(LinkFunction::Log)))
-            }
+            | (ResponseFamily::Gamma, _) => Ok(FittedLinkState::Standard(Some(LinkFunction::Log))),
             (ResponseFamily::Beta { .. }, _) => {
                 Ok(FittedLinkState::Standard(Some(LinkFunction::Logit)))
             }
@@ -6000,11 +5998,13 @@ where
             | InverseLink::Standard(LinkFunction::Probit)
             | InverseLink::Standard(LinkFunction::CLogLog)
             | InverseLink::Mixture(_) => {
-                let mixture_state =
-                    crate::mixture_link::state_fromspec(mix_spec).map_err(|e| {
-                        EstimationError::InvalidInput(format!("invalid mixture link: {e}"))
-                    })?;
-                LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Mixture(mixture_state))
+                let mixture_state = crate::mixture_link::state_fromspec(mix_spec).map_err(|e| {
+                    EstimationError::InvalidInput(format!("invalid mixture link: {e}"))
+                })?;
+                LikelihoodSpec::new(
+                    ResponseFamily::Binomial,
+                    InverseLink::Mixture(mixture_state),
+                )
             }
             _ => {
                 return Err(EstimationError::InvalidInput(
@@ -6026,12 +6026,13 @@ where
             | InverseLink::Sas(_)
             | InverseLink::BetaLogistic(_) => {
                 if use_beta_logistic {
-                    let st = crate::mixture_link::state_from_beta_logisticspec(sas_spec)
-                        .map_err(|e| {
+                    let st = crate::mixture_link::state_from_beta_logisticspec(sas_spec).map_err(
+                        |e| {
                             EstimationError::InvalidInput(format!(
                                 "invalid Beta-Logistic link: {e}"
                             ))
-                        })?;
+                        },
+                    )?;
                     LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::BetaLogistic(st))
                 } else {
                     let st = crate::mixture_link::state_from_sasspec(sas_spec).map_err(|e| {
@@ -6758,7 +6759,7 @@ mod estimate_policy_tests {
             ),
             Some(true),
         )
-            .expect_err("Poisson fitting should reject unsupported Firth requests explicitly");
+        .expect_err("Poisson fitting should reject unsupported Firth requests explicitly");
         assert!(
             err.to_string()
                 .contains("firth_bias_reduction is currently implemented only for"),

@@ -352,7 +352,7 @@ impl VectorLikelihood for GaussianVectorLikelihood {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::{array, Array1, Array2};
+    use ndarray::{Array1, Array2, array};
 
     // Macro (not fn) so the assertion / panic tokens are inlined into each
     // caller's test body, satisfying the build.rs scanner that looks for
@@ -361,9 +361,9 @@ mod tests {
         ($result:expr, $needle:expr $(,)?) => {{
             let needle: &str = $needle;
             match $result {
-                Ok(_) => panic!(
-                    "expected EstimationError::InvalidInput containing `{needle}`, got Ok"
-                ),
+                Ok(_) => {
+                    panic!("expected EstimationError::InvalidInput containing `{needle}`, got Ok")
+                }
                 Err(EstimationError::InvalidInput(msg)) => {
                     assert!(
                         msg.contains(needle),
@@ -379,10 +379,7 @@ mod tests {
     }
 
     fn dummy_target(n: usize, m: usize) -> VectorResponseTarget {
-        VectorResponseTarget::new(
-            Array2::<f64>::zeros((n, m)),
-            VectorNoise::Isotropic(1.0),
-        )
+        VectorResponseTarget::new(Array2::<f64>::zeros((n, m)), VectorNoise::Isotropic(1.0))
     }
 
     #[test]
@@ -445,10 +442,7 @@ mod tests {
                 factor,
             },
         );
-        expect_invalid_input!(
-            GaussianVectorLikelihood::from_target(&target),
-            "factor has",
-        );
+        expect_invalid_input!(GaussianVectorLikelihood::from_target(&target), "factor has",);
     }
 
     #[test]

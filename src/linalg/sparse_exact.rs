@@ -741,7 +741,6 @@ pub fn assemble_and_factor_sparse_penalized_system(
     })
 }
 
-
 /// Build sparse penalty blocks from canonical penalties, avoiding redundant
 /// block-range scanning and eigendecomposition. Uses the pre-computed col_range
 /// and positive_eigenvalues from `CanonicalPenalty`.

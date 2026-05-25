@@ -931,7 +931,12 @@ impl PredictableModel for StandardPredictor {
             }
         };
         if let Some(level) = confidence_level {
-            enrich_posterior_mean_bounds(&mut result, level, self.family.clone(), self.link_kind.as_ref())?;
+            enrich_posterior_mean_bounds(
+                &mut result,
+                level,
+                self.family.clone(),
+                self.link_kind.as_ref(),
+            )?;
         }
         Ok(result)
     }
@@ -4375,9 +4380,7 @@ pub fn enrich_posterior_mean_bounds(
     // Clamp bounded-response families to [0, 1].
     if matches!(
         spec.response,
-        ResponseFamily::Binomial
-            | ResponseFamily::Beta { .. }
-            | ResponseFamily::RoystonParmar
+        ResponseFamily::Binomial | ResponseFamily::Beta { .. } | ResponseFamily::RoystonParmar
     ) {
         let (lo, hi) = if matches!(spec.response, ResponseFamily::Beta { .. }) {
             (1e-10, 1.0 - 1e-10)
@@ -5204,9 +5207,7 @@ where
     let spec = &likelihood;
     if matches!(
         &spec.response,
-        ResponseFamily::Binomial
-            | ResponseFamily::Beta { .. }
-            | ResponseFamily::RoystonParmar
+        ResponseFamily::Binomial | ResponseFamily::Beta { .. } | ResponseFamily::RoystonParmar
     ) {
         let (lo, hi) = if matches!(&spec.response, ResponseFamily::Beta { .. }) {
             (1e-10, 1.0 - 1e-10)
