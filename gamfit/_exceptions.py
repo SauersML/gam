@@ -67,6 +67,8 @@ def map_exception(exc: BaseException) -> BaseException:
 
     if isinstance(exc, RustExtensionUnavailableError):
         return exc
+    if isinstance(exc, GamError):
+        return exc
     message = str(exc)
     lower = message.lower()
     if "formula" in lower or "parse" in lower:
