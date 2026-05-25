@@ -1397,12 +1397,34 @@ impl BarrierConfig {
         Ok(())
     }
 
-    /// Compute the barrier cost −τ Σ log(Δ_j).
-    pub fn barrier_cost(&self, beta: &Array1<f64>) -> Result<f64, String> {
-        let slacks = self
-            .slacks(beta)
-            .ok_or_else(|| "Barrier: infeasible point (slack ≤ 0)".to_string())?;
-        Ok(-self.tau * slacks.iter().map(|&d| d.ln()).sum::<f64>())
+    /// Compute the barrier cost `−τ Σ log(Δ_j)`.
+    ///
+    /// **Contract.** The log-barrier objective is, by construction, a
+    /// real-valued function of β on the feasible interior that diverges to
+    /// `+∞` as any slack `Δ_j = s_j β_j − b_j` approaches `0⁺`. We extend it
+    /// continuously to the closed exterior `Δ_j ≤ 0` by the same limit:
+    /// `barrier_cost(β) = +∞` whenever any constrained coordinate has reached
+    /// or crossed its bound. This makes the barrier objective composable with
+    /// generic line-search / trust-region code that compares scalar
+    /// objectives — an infeasible trial step is automatically rejected by
+    /// monotonicity, with no special-cased `Err` branch in every call site.
+    ///
+    /// We never return NaN: at `Δ_j = 0` exactly we shortcut to `+∞` rather
+    /// than evaluating `ln(0) = −∞` (which would multiply with `−τ` to give
+    /// `+∞` but only after a non-finite intermediate); at `Δ_j < 0` we
+    /// shortcut to `+∞` rather than computing `ln(negative) = NaN`.
+    pub fn barrier_cost(&self, beta: &Array1<f64>) -> f64 {
+        let mut total = 0.0_f64;
+        for (ci, &idx) in self.constrained_indices.iter().enumerate() {
+            let sign = self.bound_signs[ci];
+            let delta = sign * beta[idx] - self.lower_bounds[ci];
+            if delta <= 0.0 {
+                return f64::INFINITY;
+            }
+            // Δ > 0 here, so ln(Δ) is finite; contribution is finite real.
+            total += delta.ln();
+        }
+        -self.tau * total
     }
 
     /// Detection of barrier-dominated geometry, where EFS — which assumes
