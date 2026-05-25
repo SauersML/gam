@@ -11913,10 +11913,30 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         joint_solver_diagonal_ridge,
                     );
                     let solver = crate::linalg::utils::StableSolver::new("joint Newton inner");
-                    delta = solver.solvevectorwithridge_retries(
+                    // Use the rank-revealing pseudoinverse fallback rather than the
+                    // pure ridge-Cholesky solve.  When H_pen has a real null subspace
+                    // (penalty nullspace direction not constrained by the likelihood),
+                    // (H_pen + λI)⁻¹·rhs leaves residual ≈ rhs in null(H_pen), driving
+                    // `linearized_rel ≈ 1` for the next 15+ cycles and triggering the
+                    // stall early-exit on every outer seed.  The truncated-eigh
+                    // pseudoinverse projects rhs onto range(H_pen) before inverting,
+                    // so δ has no spurious component in null(H_pen) and the joint
+                    // Newton's KKT certificate reads an honest projected residual.
+                    //
+                    // `rel_tol = 1e-3`: a regularised Newton step whose linear residual
+                    // is below 0.1% of `‖rhs‖∞` is good enough; otherwise rank
+                    // deficiency is real and pseudoinverse is correct.
+                    //
+                    // `rank_tol = 1e-10`: eigenvalues below `1e-10 · max|λ|` are
+                    // numerically null relative to the rest of the spectrum.  This is
+                    // the standard rank-revealing threshold (LAPACK SVD uses the
+                    // same constant for double precision).
+                    delta = solver.solve_with_pseudoinverse_fallback(
                         &lhs,
                         &rhs,
                         JOINT_TRACE_STABILITY_RIDGE,
+                        1.0e-3,
+                        1.0e-10,
                     );
                 }
 
