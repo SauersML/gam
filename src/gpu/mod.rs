@@ -7,6 +7,7 @@
 //! never loaded by default CPU-only builds.
 
 pub mod blas;
+pub mod bms_flex;
 pub mod cpu_traits;
 pub mod device;
 pub mod driver;
