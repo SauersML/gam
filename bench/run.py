@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-import typing
 import argparse
 import json
 import os
@@ -26,14 +25,14 @@ SERIAL_ENV_OVERRIDES = {
 }
 
 
-def run_cmd(cmd: typing.Any) -> typing.Any:
+def run_cmd(cmd: list[str]) -> tuple[int, str, str]:
     env = os.environ.copy()
     env.update(SERIAL_ENV_OVERRIDES)
     proc = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, env=env)
     return proc.returncode, proc.stdout, proc.stderr
 
 
-def fmt(v: typing.Any) -> typing.Any:
+def fmt(v: object) -> str:
     if v is None:
         return "-"
     if isinstance(v, float):
@@ -41,7 +40,7 @@ def fmt(v: typing.Any) -> typing.Any:
     return str(v)
 
 
-def main() -> typing.Any:
+def main() -> int:
     p = argparse.ArgumentParser(
     )
     p.add_argument(
@@ -60,49 +59,55 @@ def main() -> typing.Any:
 
     out_path = args.out
     td: tempfile.TemporaryDirectory[str] | None = None
-    cleanup = False
     if out_path is None:
         td = tempfile.TemporaryDirectory(prefix="gam_magic_bench_")
-        cleanup = True
         out_path = Path(td.name) / "results.json"
 
-    cmd = [sys.executable, str(RUN_SUITE), "--scenarios", str(SCENARIOS), "--out", str(out_path)]
-    for s in args.scenarios or []:
-        cmd.extend(["--scenario-name", s])
+    try:
+        cmd = [
+            sys.executable,
+            str(RUN_SUITE),
+            "--scenarios",
+            str(SCENARIOS),
+            "--out",
+            str(out_path),
+        ]
+        for s in args.scenarios or []:
+            cmd.extend(["--scenario-name", s])
 
-    code, out, err = run_cmd(cmd)
-    if code != 0:
-        print(err.strip() or out.strip(), file=sys.stderr)
-        return code
+        code, out, err = run_cmd(cmd)
+        if code != 0:
+            print(err.strip() or out.strip(), file=sys.stderr)
+            return code
 
-    payload = json.loads(out_path.read_text())
-    rows = payload.get("results", [])
+        payload = json.loads(out_path.read_text())
+        rows = payload.get("results", [])
 
-    print("-" * 78)
-    for r in rows:
-        metric = r.get("auc")
-        if metric is None:
-            metric = r.get("c_index")
-        print(
-            f"{r.get('contender','-')} | "
-            f"{r.get('scenario_name','-')} | "
-            f"{r.get('status','-')} | "
-            f"{fmt(metric)} | "
-            f"{fmt(r.get('brier'))} | "
-            f"{fmt(r.get('logloss'))} | "
-            f"{fmt(r.get('nagelkerke_r2'))} | "
-            f"{fmt(r.get('mse'))} | "
-            f"{fmt(r.get('rmse'))} | "
-            f"{fmt(r.get('r2'))}"
-        )
+        print("-" * 78)
+        for r in rows:
+            metric = r.get("auc")
+            if metric is None:
+                metric = r.get("c_index")
+            print(
+                f"{r.get('contender','-')} | "
+                f"{r.get('scenario_name','-')} | "
+                f"{r.get('status','-')} | "
+                f"{fmt(metric)} | "
+                f"{fmt(r.get('brier'))} | "
+                f"{fmt(r.get('logloss'))} | "
+                f"{fmt(r.get('nagelkerke_r2'))} | "
+                f"{fmt(r.get('mse'))} | "
+                f"{fmt(r.get('rmse'))} | "
+                f"{fmt(r.get('r2'))}"
+            )
 
-    if args.out is not None:
-        print(f"\nWrote: {out_path}")
+        if args.out is not None:
+            print(f"\nWrote: {out_path}")
 
-    if cleanup:
+        return 0
+    finally:
         if td is not None:
             td.cleanup()
-    return 0
 
 
 if __name__ == "__main__":
