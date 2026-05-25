@@ -3,7 +3,7 @@ use gam::geometry::{
     RiemannianLBFGS, RiemannianManifold, RiemannianObjective, RiemannianTrustRegion, SpdManifold,
     SphereManifold, StiefelManifold, TorusManifold,
 };
-use ndarray::{array, Array1, Array2};
+use ndarray::{Array1, Array2, array};
 
 fn norm(v: &Array1<f64>) -> f64 {
     v.iter().map(|x| x * x).sum::<f64>().sqrt()
@@ -18,8 +18,12 @@ fn manifold_trait_log_exp_identity_should_hold_on_sphere() {
     let m = SphereManifold::new(2);
     let p = array![1.0, 0.0, 0.0];
     let q = array![0.0, 1.0, 0.0];
-    let v = m.log_map(p.view(), q.view()).expect("log_map should succeed");
-    let q_back = m.exp_map(p.view(), v.view()).expect("exp_map should succeed");
+    let v = m
+        .log_map(p.view(), q.view())
+        .expect("log_map should succeed");
+    let q_back = m
+        .exp_map(p.view(), v.view())
+        .expect("exp_map should succeed");
     assert!(
         norm(&(q_back - q)) < 1.0e-8,
         "RiemannianManifold contract requires exp_p(log_p(q)) to recover q on sphere"
@@ -31,7 +35,9 @@ fn sphere_tangent_projection_should_be_orthogonal_to_base() {
     let m = SphereManifold::new(2);
     let p = array![1.0, 0.0, 0.0];
     let v = array![2.0, -3.0, 4.0];
-    let tv = m.project_tangent(p.view(), v.view()).expect("projection should succeed");
+    let tv = m
+        .project_tangent(p.view(), v.view())
+        .expect("projection should succeed");
     let dot = p.dot(&tv);
     assert!(
         dot.abs() < 1.0e-10,
@@ -43,7 +49,9 @@ fn sphere_tangent_projection_should_be_orthogonal_to_base() {
 fn spd_affine_metric_tensor_should_be_symmetric() {
     let m = SpdManifold::new(2);
     let p = array![2.0, 0.2, 0.2, 1.5];
-    let g = m.metric_tensor(p.view()).expect("metric tensor should exist");
+    let g = m
+        .metric_tensor(p.view())
+        .expect("metric tensor should exist");
     let asym = &g - &g.t();
     assert!(
         frob(&asym) < 1.0e-10,
@@ -54,18 +62,8 @@ fn spd_affine_metric_tensor_should_be_symmetric() {
 #[test]
 fn grassmann_retract_should_be_right_orthogonally_invariant() {
     let m = GrassmannManifold::new(2, 4);
-    let y = array![
-        1.0, 0.0,
-        0.0, 1.0,
-        0.0, 0.0,
-        0.0, 0.0
-    ];
-    let xi = array![
-        0.0, 0.0,
-        0.0, 0.0,
-        0.2, -0.1,
-        -0.1, 0.2
-    ];
+    let y = array![1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0];
+    let xi = array![0.0, 0.0, 0.0, 0.0, 0.2, -0.1, -0.1, 0.2];
     let r = array![0.0, -1.0, 1.0, 0.0];
     let y_r = {
         let y_mat = Array2::from_shape_vec((4, 2), y.to_vec()).unwrap();
@@ -77,8 +75,15 @@ fn grassmann_retract_should_be_right_orthogonally_invariant() {
         let r_mat = Array2::from_shape_vec((2, 2), r.to_vec()).unwrap();
         (xi_mat.dot(&r_mat)).into_raw_vec()
     };
-    let a = m.retract(Array1::from_vec(y.to_vec()).view(), Array1::from_vec(xi.to_vec()).view()).unwrap();
-    let b = m.retract(Array1::from_vec(y_r).view(), Array1::from_vec(xi_r).view()).unwrap();
+    let a = m
+        .retract(
+            Array1::from_vec(y.to_vec()).view(),
+            Array1::from_vec(xi.to_vec()).view(),
+        )
+        .unwrap();
+    let b = m
+        .retract(Array1::from_vec(y_r).view(), Array1::from_vec(xi_r).view())
+        .unwrap();
     let a_mat = Array2::from_shape_vec((4, 2), a.to_vec()).unwrap();
     let b_mat = Array2::from_shape_vec((4, 2), b.to_vec()).unwrap();
     let proj_a = a_mat.dot(&a_mat.t());
@@ -92,18 +97,8 @@ fn grassmann_retract_should_be_right_orthogonally_invariant() {
 #[test]
 fn stiefel_tangent_projection_should_satisfy_skew_constraint() {
     let m = StiefelManifold::new(2, 4);
-    let y = array![
-        1.0, 0.0,
-        0.0, 1.0,
-        0.0, 0.0,
-        0.0, 0.0
-    ];
-    let z = array![
-        0.1, 0.2,
-        0.3, 0.4,
-        0.5, 0.6,
-        0.7, 0.8
-    ];
+    let y = array![1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0];
+    let z = array![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8];
     let pz = m.project_tangent(y.view(), z.view()).unwrap();
     let y_mat = Array2::from_shape_vec((4, 2), y.to_vec()).unwrap();
     let pz_mat = Array2::from_shape_vec((4, 2), pz.to_vec()).unwrap();
@@ -150,7 +145,12 @@ fn product_retract_should_equal_componentwise_retracts() {
     let base = array![1.0, -2.0, 2.9];
     let xi = array![0.5, 0.5, 0.5];
     let out = p.retract(base.view(), xi.view()).unwrap();
-    let expected = array![1.5, -1.5, ((2.9 + 0.5 + std::f64::consts::PI).rem_euclid(2.0*std::f64::consts::PI)-std::f64::consts::PI)];
+    let expected = array![
+        1.5,
+        -1.5,
+        ((2.9 + 0.5 + std::f64::consts::PI).rem_euclid(2.0 * std::f64::consts::PI)
+            - std::f64::consts::PI)
+    ];
     assert!(
         norm(&(out - expected)) < 1.0e-12,
         "Product manifold retract should be the Cartesian product of factor retractions"
@@ -162,7 +162,10 @@ struct QuadObjective {
 }
 
 impl RiemannianObjective for QuadObjective {
-    fn value_gradient(&mut self, point: ndarray::ArrayView1<'_, f64>) -> gam::geometry::GeometryResult<(f64, Array1<f64>)> {
+    fn value_gradient(
+        &mut self,
+        point: ndarray::ArrayView1<'_, f64>,
+    ) -> gam::geometry::GeometryResult<(f64, Array1<f64>)> {
         let hp = self.h.dot(&point.to_owned());
         Ok((0.5 * point.dot(&hp), hp))
     }
@@ -171,8 +174,14 @@ impl RiemannianObjective for QuadObjective {
 #[test]
 fn lbfgs_inverse_hessian_should_converge_to_true_hessian_inverse_for_quadratic() {
     let m = EuclideanManifold::new(2);
-    let mut obj = QuadObjective { h: array![[10.0, 0.0], [0.0, 1.0]] };
-    let opt = RiemannianLBFGS { max_iter: 50, step_size: 0.1, ..Default::default() };
+    let mut obj = QuadObjective {
+        h: array![[10.0, 0.0], [0.0, 1.0]],
+    };
+    let opt = RiemannianLBFGS {
+        max_iter: 50,
+        step_size: 0.1,
+        ..Default::default()
+    };
     let x0 = array![1.0, 1.0];
     let x_star = opt.minimize(&m, &mut obj, x0.view()).unwrap();
     assert!(
@@ -184,8 +193,14 @@ fn lbfgs_inverse_hessian_should_converge_to_true_hessian_inverse_for_quadratic()
 #[test]
 fn trust_region_step_should_never_exceed_radius() {
     let m = EuclideanManifold::new(2);
-    let mut obj = QuadObjective { h: array![[1.0, 0.0], [0.0, 1.0]] };
-    let opt = RiemannianTrustRegion { radius: 0.05, max_iter: 1, grad_tol: 0.0 };
+    let mut obj = QuadObjective {
+        h: array![[1.0, 0.0], [0.0, 1.0]],
+    };
+    let opt = RiemannianTrustRegion {
+        radius: 0.05,
+        max_iter: 1,
+        grad_tol: 0.0,
+    };
     let x0 = array![1.0, 0.0];
     let x1 = opt.minimize(&m, &mut obj, x0.view()).unwrap();
     let step = &x1 - &x0;
@@ -198,7 +213,10 @@ fn trust_region_step_should_never_exceed_radius() {
 #[test]
 fn geodesic_integrator_should_approximately_conserve_energy_on_sphere() {
     let m = SphereManifold::new(2);
-    let g = GeodesicIntegrator { steps: 200, step_size: 0.01 };
+    let g = GeodesicIntegrator {
+        steps: 200,
+        step_size: 0.01,
+    };
     let p = array![1.0, 0.0, 0.0];
     let v = array![0.0, 0.4, 0.0];
     let e0 = 0.5 * v.dot(&v);

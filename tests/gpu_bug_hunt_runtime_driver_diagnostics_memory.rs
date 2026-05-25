@@ -1,5 +1,7 @@
-use gam::gpu::{self, DeviceCsrMatrix, DeviceMatrix, DeviceVector, GpuKernel, GpuPolicy, GpuRuntime};
-use ndarray::{array, Array2};
+use gam::gpu::{
+    self, DeviceCsrMatrix, DeviceMatrix, DeviceVector, GpuKernel, GpuPolicy, GpuRuntime,
+};
+use ndarray::{Array2, array};
 use std::thread;
 
 #[test]
@@ -29,7 +31,8 @@ fn gpu_device_info_device_count_matches_underlying_driver_count() {
     let runtime = GpuRuntime::probe().expect("runtime probe should not fail").expect(
         "runtime probe should return a runtime snapshot even when device_count is zero so count can be reported",
     );
-    let device_count = i32::try_from(runtime.devices.len()).expect("device vec length should fit i32");
+    let device_count =
+        i32::try_from(runtime.devices.len()).expect("device vec length should fit i32");
     let raw_count = cudarc::driver::CudaContext::device_count()
         .expect("driver device count should be queryable once probe succeeded");
     assert_eq!(
@@ -50,8 +53,16 @@ fn device_memory_representations_guard_against_invalid_csr_and_double_free_style
         values: gpu::DeviceBuffer::from_host_shadow(vec![1.0]),
     };
 
-    assert_eq!(dense.data.len(), 6, "dense allocation size should match rows*cols");
-    assert_eq!(vec.data.len(), 3, "vector allocation size should match input length");
+    assert_eq!(
+        dense.data.len(),
+        6,
+        "dense allocation size should match rows*cols"
+    );
+    assert_eq!(
+        vec.data.len(),
+        3,
+        "vector allocation size should match input length"
+    );
     assert_eq!(
         csr.rowptr.len(),
         csr.rows + 1,

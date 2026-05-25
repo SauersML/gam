@@ -1923,9 +1923,7 @@ impl SaeManifoldTerm {
                     Some(pair) => pair,
                     None => {
                         let err = last_err.expect("escalation loop set last_err on failure");
-                        return Err(format!(
-                            "SaeManifoldTerm::run_joint_fit_arrow_schur: {err}"
-                        ));
+                        return Err(format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}"));
                     }
                 }
             };
@@ -2178,8 +2176,8 @@ fn fill_assignment_logit_jvp_rows(
             // π_k is the stick-breaking prior. Thus
             // dz_k/dl_k = σ(l/τ)(1-σ(l/τ))/τ · π_k = a_k(π_k - a_k)/(π_k τ).
             let inv_tau = 1.0 / temperature;
-            let prior =
-                ibp_prior.expect("fill_assignment_logit_jvp_rows: IBPMap requires precomputed prior");
+            let prior = ibp_prior
+                .expect("fill_assignment_logit_jvp_rows: IBPMap requires precomputed prior");
             for logit_col in 0..assignments.len() {
                 let pi_k = prior[logit_col];
                 let a_k = assignments[logit_col];
@@ -3003,7 +3001,8 @@ mod tests {
     fn softmax_assignment_hessian_diag_is_available_for_k2() {
         let n = 4usize;
         let k = 2usize;
-        let logits = Array2::<f64>::from_shape_fn((n, k), |(i, j)| 0.1 * (i as f64) - 0.2 * (j as f64));
+        let logits =
+            Array2::<f64>::from_shape_fn((n, k), |(i, j)| 0.1 * (i as f64) - 0.2 * (j as f64));
         let coords: Vec<Array2<f64>> = (0..k).map(|_| Array2::<f64>::zeros((n, 1))).collect();
         let manifolds = vec![LatentManifold::Circle; k];
         let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(

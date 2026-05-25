@@ -28,7 +28,9 @@ fn make_spd_from_banded(seed_shift: f64, n: usize) -> Array2<f64> {
 }
 
 fn dense_inverse_spd(a: &Array2<f64>) -> Array2<f64> {
-    let chol = a.cholesky(Side::Lower).expect("dense SPD inverse reference requires Cholesky");
+    let chol = a
+        .cholesky(Side::Lower)
+        .expect("dense SPD inverse reference requires Cholesky");
     let n = a.nrows();
     let mut identity = Array2::<f64>::zeros((n, n));
     for i in 0..n {
@@ -40,8 +42,10 @@ fn dense_inverse_spd(a: &Array2<f64>) -> Array2<f64> {
 #[test]
 fn sparse_cholesky_reconstructs_random_spd_within_1e9() {
     let a = make_spd_from_banded(0.4, 8);
-    let a_sparse = dense_to_sparse_symmetric_upper(&a, 0.0).expect("upper sparse conversion should succeed");
-    let factor = factorize_sparse_spd(&a_sparse).expect("sparse Cholesky factorization should succeed for SPD matrix");
+    let a_sparse =
+        dense_to_sparse_symmetric_upper(&a, 0.0).expect("upper sparse conversion should succeed");
+    let factor = factorize_sparse_spd(&a_sparse)
+        .expect("sparse Cholesky factorization should succeed for SPD matrix");
     let reconstructed = gam::linalg::sparse_exact::assemble_sparse_factor_h_dense(&factor)
         .expect("reconstructing dense matrix from sparse Cholesky factor should succeed");
 
@@ -60,11 +64,16 @@ fn sparse_cholesky_reconstructs_random_spd_within_1e9() {
 #[test]
 fn sparse_cholesky_logdet_matches_dense_two_sum_log_diag_l() {
     let a = make_spd_from_banded(0.9, 7);
-    let a_sparse = dense_to_sparse_symmetric_upper(&a, 0.0).expect("upper sparse conversion should succeed");
-    let factor = factorize_sparse_spd(&a_sparse).expect("sparse Cholesky factorization should succeed for SPD matrix");
-    let sparse_logdet = logdet_from_factor(&factor).expect("logdet from sparse factor should be available");
+    let a_sparse =
+        dense_to_sparse_symmetric_upper(&a, 0.0).expect("upper sparse conversion should succeed");
+    let factor = factorize_sparse_spd(&a_sparse)
+        .expect("sparse Cholesky factorization should succeed for SPD matrix");
+    let sparse_logdet =
+        logdet_from_factor(&factor).expect("logdet from sparse factor should be available");
 
-    let chol = a.cholesky(Side::Lower).expect("dense Cholesky should succeed for SPD reference");
+    let chol = a
+        .cholesky(Side::Lower)
+        .expect("dense Cholesky should succeed for SPD reference");
     let dense_logdet = 2.0 * chol.diag().iter().map(|d| d.ln()).sum::<f64>();
 
     assert!(
@@ -77,9 +86,12 @@ fn sparse_cholesky_logdet_matches_dense_two_sum_log_diag_l() {
 #[test]
 fn takahashi_inverse_diagonal_matches_dense_inverse_diagonal_random_spd() {
     let a = make_spd_from_banded(1.1, 9);
-    let a_sparse = dense_to_sparse_symmetric_upper(&a, 0.0).expect("upper sparse conversion should succeed");
-    let simplicial = factorize_simplicial(&a_sparse).expect("simplicial sparse factorization should succeed for SPD matrix");
-    let taka = TakahashiInverse::compute(&simplicial).expect("Takahashi selected inverse should compute for SPD matrix");
+    let a_sparse =
+        dense_to_sparse_symmetric_upper(&a, 0.0).expect("upper sparse conversion should succeed");
+    let simplicial = factorize_simplicial(&a_sparse)
+        .expect("simplicial sparse factorization should succeed for SPD matrix");
+    let taka = TakahashiInverse::compute(&simplicial)
+        .expect("Takahashi selected inverse should compute for SPD matrix");
 
     let dense_inv = dense_inverse_spd(&a);
     let dense_diag = dense_inv.diag().to_owned();
@@ -108,11 +120,14 @@ fn takahashi_trace_hinv_sk_matches_dense_trace_small_problem() {
         [0.0, 0.0, 0.0, 0.4, 1.2, 0.2],
         [0.0, 0.0, 0.0, 0.0, 0.2, 0.9],
     ];
-    let h_sparse = dense_to_sparse_symmetric_upper(&h, 0.0).expect("upper sparse conversion should succeed");
+    let h_sparse =
+        dense_to_sparse_symmetric_upper(&h, 0.0).expect("upper sparse conversion should succeed");
     let s_sparse = dense_to_sparse(&s_k, 0.0).expect("dense sparse conversion should succeed");
 
-    let simplicial = factorize_simplicial(&h_sparse).expect("simplicial factorization should succeed");
-    let taka = TakahashiInverse::compute(&simplicial).expect("Takahashi selected inverse should compute");
+    let simplicial =
+        factorize_simplicial(&h_sparse).expect("simplicial factorization should succeed");
+    let taka =
+        TakahashiInverse::compute(&simplicial).expect("Takahashi selected inverse should compute");
     let sparse_trace = taka.trace_product_sparse(&s_sparse);
 
     let dense_inv = dense_inverse_spd(&h);
@@ -141,13 +156,18 @@ fn canonical_penalty_blocks_return_some_for_nonoverlap_and_none_for_overlap() {
     non_overlap_adjusted[1].local = array![[2.0, 0.0, 0.0], [0.0, 1.2, 0.1], [0.0, 0.1, 0.9]];
     non_overlap_adjusted[1].positive_eigenvalues = vec![2.0, 1.2, 0.9];
 
-    let maybe_blocks = build_sparse_penalty_blocks_from_canonical(&non_overlap_adjusted, p)
-        .expect("building sparse penalty blocks for non-overlapping canonical penalties should succeed");
-    let blocks = maybe_blocks.expect("non-overlapping canonical penalties should return Some(blocks)");
+    let maybe_blocks = build_sparse_penalty_blocks_from_canonical(&non_overlap_adjusted, p).expect(
+        "building sparse penalty blocks for non-overlapping canonical penalties should succeed",
+    );
+    let blocks =
+        maybe_blocks.expect("non-overlapping canonical penalties should return Some(blocks)");
 
     assert_eq!(blocks[0].p_start, 0, "first block should start at column 0");
     assert_eq!(blocks[0].p_end, 2, "first block should end at column 2");
-    assert_eq!(blocks[1].p_start, 4, "second block should start at column 4");
+    assert_eq!(
+        blocks[1].p_start, 4,
+        "second block should start at column 4"
+    );
     assert_eq!(blocks[1].p_end, 7, "second block should end at column 7");
 
     let mut overlap = non_overlap_adjusted.clone();
@@ -163,7 +183,8 @@ fn canonical_penalty_blocks_return_some_for_nonoverlap_and_none_for_overlap() {
 #[test]
 fn sparse_penalty_block_invariants_hold_for_constructed_blocks() {
     let p = 7;
-    let mut cp = CanonicalPenalty::from_dense_root_with_mean(array![[1.0, 0.0, 0.0]], p, Array1::zeros(p));
+    let mut cp =
+        CanonicalPenalty::from_dense_root_with_mean(array![[1.0, 0.0, 0.0]], p, Array1::zeros(p));
     cp.col_range = 2..5;
     cp.local = array![[1.0, 0.2, 0.0], [0.2, 1.5, 0.1], [0.0, 0.1, 2.0]];
     cp.positive_eigenvalues = vec![1.0, 1.2, 2.3];
@@ -173,7 +194,10 @@ fn sparse_penalty_block_invariants_hold_for_constructed_blocks() {
         .expect("single non-overlapping canonical penalty should return Some(blocks)");
     let block = &blocks[0];
 
-    assert!(block.p_start <= block.p_end, "SparsePenaltyBlock must satisfy p_start <= p_end");
+    assert!(
+        block.p_start <= block.p_end,
+        "SparsePenaltyBlock must satisfy p_start <= p_end"
+    );
     assert!(
         block.positive_eigenvalues.iter().all(|&ev| ev > 0.0),
         "SparsePenaltyBlock positive_eigenvalues should all be strictly positive"
@@ -187,7 +211,11 @@ fn sparse_penalty_block_invariants_hold_for_constructed_blocks() {
         for idx in col_ptr[col]..col_ptr[col + 1] {
             if values[idx].abs() > 0.0 {
                 let row = row_idx[idx];
-                if !(block.p_start <= row && row < block.p_end && block.p_start <= col && col < block.p_end) {
+                if !(block.p_start <= row
+                    && row < block.p_end
+                    && block.p_start <= col
+                    && col < block.p_end)
+                {
                     all_inside_block = false;
                 }
             }
@@ -195,8 +223,7 @@ fn sparse_penalty_block_invariants_hold_for_constructed_blocks() {
     }
 
     assert_eq!(
-        block.block_support_strict,
-        all_inside_block,
+        block.block_support_strict, all_inside_block,
         "SparsePenaltyBlock block_support_strict should be true iff all non-zero entries lie within [p_start, p_end)"
     );
 }

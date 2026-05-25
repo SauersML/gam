@@ -9,7 +9,9 @@ fn probe_latent_cloglog_diagnostic_dump() {
         LatentCLogLogState::new(1.0).expect("valid latent cloglog state"),
     );
     let mut rng = StdRng::seed_from_u64(0xBEEF_CAFE_D00D_4242);
-    let mut eta: Vec<f64> = (0..1000).map(|_| rng.random_range(-40.0_f64..40.0_f64)).collect();
+    let mut eta: Vec<f64> = (0..1000)
+        .map(|_| rng.random_range(-40.0_f64..40.0_f64))
+        .collect();
     eta.sort_by(|a, b| a.total_cmp(b));
     let mut prev = f64::NEG_INFINITY;
     let mut anomalies: Vec<(f64, f64, f64)> = Vec::new();

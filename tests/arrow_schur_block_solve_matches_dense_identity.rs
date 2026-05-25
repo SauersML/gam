@@ -1,5 +1,5 @@
 use gam::solver::arrow_schur::ArrowSchurSystem;
-use ndarray::{array, Array1, Array2};
+use ndarray::{Array1, Array2, array};
 
 fn cholesky_lower(a: &Array2<f64>) -> Array2<f64> {
     let n = a.nrows();
@@ -58,7 +58,9 @@ fn arrow_schur_block_solve_matches_dense_identity() {
     let mut m = Array2::<f64>::zeros((6, 6));
     let mut rhs = Array1::<f64>::zeros(6);
     for a in 0..2 {
-        for b in 0..2 { m[[a, b]] = sys.hbb[[a, b]]; }
+        for b in 0..2 {
+            m[[a, b]] = sys.hbb[[a, b]];
+        }
         // Newton convention: M * [Δt; Δβ] = [-g_t; -g_β]. See the docstring
         // on `gam::solver::arrow_schur::ArrowSchurSystem::solve`.
         rhs[a] = -sys.gb[a];
@@ -67,7 +69,9 @@ fn arrow_schur_block_solve_matches_dense_identity() {
         let off = 2 + i * 2;
         for a in 0..2 {
             rhs[off + a] = -sys.rows[i].gt[a];
-            for b in 0..2 { m[[off + a, off + b]] = sys.rows[i].htt[[a, b]]; }
+            for b in 0..2 {
+                m[[off + a, off + b]] = sys.rows[i].htt[[a, b]];
+            }
             for b in 0..2 {
                 m[[off + a, b]] = sys.rows[i].htbeta[[a, b]];
                 m[[b, off + a]] = sys.rows[i].htbeta[[a, b]];
@@ -77,6 +81,10 @@ fn arrow_schur_block_solve_matches_dense_identity() {
     let l = cholesky_lower(&m);
     let dense = chol_solve(&l, &rhs);
 
-    for j in 0..2 { assert!((db[j] - dense[j]).abs() <= 1e-9); }
-    for i in 0..4 { assert!((dt[i] - dense[2 + i]).abs() <= 1e-9); }
+    for j in 0..2 {
+        assert!((db[j] - dense[j]).abs() <= 1e-9);
+    }
+    for i in 0..4 {
+        assert!((dt[i] - dense[2 + i]).abs() <= 1e-9);
+    }
 }

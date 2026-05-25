@@ -1,4 +1,6 @@
-use gam::estimate::{fit_gam, fit_gam_with_penalty_specs, fit_gamwith_heuristic_lambdas, FitOptions, PenaltySpec};
+use gam::estimate::{
+    FitOptions, PenaltySpec, fit_gam, fit_gam_with_penalty_specs, fit_gamwith_heuristic_lambdas,
+};
 use gam::types::LikelihoodSpec;
 use ndarray::array;
 
@@ -11,12 +13,42 @@ fn empty_smooth_collection_is_handled_or_rejected_cleanly() {
     let fam = LikelihoodSpec::gaussian_identity();
     let opts = FitOptions::default();
 
-    let r1 = fit_gam(x.view(), y.view(), w.view(), offset.view(), &[], fam.clone(), &opts);
-    let r2 = fit_gamwith_heuristic_lambdas(x.view(), y.view(), w.view(), offset.view(), &[], None, fam.clone(), &opts);
-    let r3 = fit_gam_with_penalty_specs(x.view(), y.view(), w.view(), offset.view(), Vec::<PenaltySpec>::new(), vec![], fam, &opts);
+    let r1 = fit_gam(
+        x.view(),
+        y.view(),
+        w.view(),
+        offset.view(),
+        &[],
+        fam.clone(),
+        &opts,
+    );
+    let r2 = fit_gamwith_heuristic_lambdas(
+        x.view(),
+        y.view(),
+        w.view(),
+        offset.view(),
+        &[],
+        None,
+        fam.clone(),
+        &opts,
+    );
+    let r3 = fit_gam_with_penalty_specs(
+        x.view(),
+        y.view(),
+        w.view(),
+        offset.view(),
+        Vec::<PenaltySpec>::new(),
+        vec![],
+        fam,
+        &opts,
+    );
     for r in [r1, r2, r3] {
         if let Ok(fit) = r {
-            assert_eq!(fit.lambdas.len(), 0, "pure parametric fit should carry zero smooth lambdas");
+            assert_eq!(
+                fit.lambdas.len(),
+                0,
+                "pure parametric fit should carry zero smooth lambdas"
+            );
         }
     }
 }

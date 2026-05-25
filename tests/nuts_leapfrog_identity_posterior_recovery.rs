@@ -1,7 +1,7 @@
 use gam::inference::hmc::{NUTSMassMatrixConfig, NutsConfig};
 use general_mcmc::generic_hmc::HamiltonianTarget;
 use general_mcmc::generic_nuts::GenericNUTS;
-use ndarray::{arr1, arr2, Array1, Array2, Axis};
+use ndarray::{Array1, Array2, Axis, arr1, arr2};
 
 #[derive(Clone)]
 struct GaussianTarget {
@@ -61,7 +61,11 @@ fn nuts_leapfrog_identity_and_gaussian_posterior_recovery() {
         (qf, pf) = leapfrog_step(&target, &qf, &pf, -eps);
     }
     let rev_err = (&qf - &q0).mapv(f64::abs).sum() + (&pf - &p0).mapv(f64::abs).sum();
-    assert!(rev_err < 1e-10, "leapfrog reversibility violated: {}", rev_err);
+    assert!(
+        rev_err < 1e-10,
+        "leapfrog reversibility violated: {}",
+        rev_err
+    );
 
     let mut qd = q0.clone();
     let mut pd = p0.clone();
@@ -78,7 +82,11 @@ fn nuts_leapfrog_identity_and_gaussian_posterior_recovery() {
         .into_iter()
         .map(|h| (h - h0).abs())
         .fold(0.0_f64, f64::max);
-    assert!(max_drift < 0.05 * eps * eps, "energy drift too large: {}", max_drift);
+    assert!(
+        max_drift < 0.05 * eps * eps,
+        "energy drift too large: {}",
+        max_drift
+    );
 
     let theta_minus = arr1(&[-2.0, -2.0]);
     let theta_plus = arr1(&[2.0, 2.0]);
@@ -89,7 +97,10 @@ fn nuts_leapfrog_identity_and_gaussian_posterior_recovery() {
     assert!(!should_uturn, "constructed non-U-turn state misclassified");
     let r_minus_uturn = arr1(&[-1.0, -1.0]);
     let should_uturn_now = delta.dot(&r_minus_uturn) <= 0.0 || delta.dot(&r_plus) <= 0.0;
-    assert!(should_uturn_now, "U-turn condition did not fire when expected");
+    assert!(
+        should_uturn_now,
+        "U-turn condition did not fire when expected"
+    );
 
     let n = 5000usize;
     let initial = vec![arr1(&[0.0, 0.0])];

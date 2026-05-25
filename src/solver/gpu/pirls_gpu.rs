@@ -293,10 +293,10 @@ pub fn weighted_crossprod_gpu(
 
     #[cfg(all(feature = "cuda", target_os = "linux"))]
     {
-    if crate::gpu::runtime::GpuRuntime::global().is_none() {
-        return cpu_fallback::weighted_crossprod_cpu(x, weights);
-    }
-    cuda::weighted_crossprod(x, weights)
+        if crate::gpu::runtime::GpuRuntime::global().is_none() {
+            return cpu_fallback::weighted_crossprod_cpu(x, weights);
+        }
+        cuda::weighted_crossprod(x, weights)
     }
 }
 
@@ -308,10 +308,10 @@ pub fn solve_pirls_step_gpu(input: PirlsGpuInput<'_>) -> Result<PirlsGpuStep, St
 
     #[cfg(all(feature = "cuda", target_os = "linux"))]
     {
-    if crate::gpu::runtime::GpuRuntime::global().is_none() {
-        return cpu_fallback::solve_step_cpu(input);
-    }
-    cuda::solve_step(input)
+        if crate::gpu::runtime::GpuRuntime::global().is_none() {
+            return cpu_fallback::solve_step_cpu(input);
+        }
+        cuda::solve_step(input)
     }
 }
 

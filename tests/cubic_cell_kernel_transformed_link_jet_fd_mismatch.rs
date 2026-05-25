@@ -34,10 +34,7 @@ fn cubic_cell_kernel_transformed_link_returns_polynomial_coefficients_in_z() {
 
     // `d0 = f(0)` exactly (no rounding aside from one evaluate call).
     let f0 = span.evaluate(a);
-    assert!(
-        (d0 - f0).abs() < 1e-14,
-        "d0={d0} should equal f(0)={f0}"
-    );
+    assert!((d0 - f0).abs() < 1e-14, "d0={d0} should equal f(0)={f0}");
 
     // Reconstruct `f(z)` from the polynomial coefficients at a handful of
     // points and compare to the direct cubic evaluation. Any factor-of-`k!`
@@ -58,7 +55,16 @@ fn cubic_cell_kernel_transformed_link_returns_polynomial_coefficients_in_z() {
     let expected_d1 = b * (span.c1 + 2.0 * span.c2 * shift + 3.0 * span.c3 * shift * shift);
     let expected_d2 = b * b * (span.c2 + 3.0 * span.c3 * shift);
     let expected_d3 = span.c3 * b * b * b;
-    assert!((d1 - expected_d1).abs() < 1e-14, "d1={d1} expected {expected_d1}");
-    assert!((d2 - expected_d2).abs() < 1e-14, "d2={d2} expected {expected_d2}");
-    assert!((d3 - expected_d3).abs() < 1e-14, "d3={d3} expected {expected_d3}");
+    assert!(
+        (d1 - expected_d1).abs() < 1e-14,
+        "d1={d1} expected {expected_d1}"
+    );
+    assert!(
+        (d2 - expected_d2).abs() < 1e-14,
+        "d2={d2} expected {expected_d2}"
+    );
+    assert!(
+        (d3 - expected_d3).abs() < 1e-14,
+        "d3={d3} expected {expected_d3}"
+    );
 }

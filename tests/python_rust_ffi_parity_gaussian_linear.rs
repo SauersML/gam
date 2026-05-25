@@ -1,5 +1,5 @@
 use csv::StringRecord;
-use gam::{encode_recordswith_inferred_schema, fit_model, materialize, FitConfig, FitResult};
+use gam::{FitConfig, FitResult, encode_recordswith_inferred_schema, fit_model, materialize};
 use serde_json::Value;
 use std::process::Command;
 
@@ -15,10 +15,15 @@ fn python_rust_ffi_parity_gaussian_linear_case() {
     let headers = vec!["x".to_string(), "y".to_string()];
     let data = encode_recordswith_inferred_schema(headers, rows).expect("encode");
 
-    let cfg = FitConfig { family: Some("gaussian".to_string()), ..FitConfig::default() };
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
     let mat = materialize("y ~ x", &data, &cfg).expect("materialize");
     let fit = fit_model(mat.request).expect("fit");
-    let FitResult::Standard(sf) = fit else { panic!("expected standard fit") };
+    let FitResult::Standard(sf) = fit else {
+        panic!("expected standard fit")
+    };
 
     let beta_rust: Vec<f64> = sf.fit.beta.to_vec();
     let ll_rust = sf.fit.log_likelihood;
@@ -49,15 +54,27 @@ print(json.dumps(out))
         .arg(py)
         .output()
         .expect("run python");
-    assert!(out.status.success(), "python failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "python failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let v: Value = serde_json::from_slice(&out.stdout).expect("json");
-    let beta_py: Vec<f64> = v["beta"].as_array().unwrap().iter().map(|x| x.as_f64().unwrap()).collect();
+    let beta_py: Vec<f64> = v["beta"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_f64().unwrap())
+        .collect();
     let reml_py = v["reml"].as_f64().unwrap();
 
     assert_eq!(beta_rust.len(), beta_py.len());
-    for (i,(a,b)) in beta_rust.iter().zip(beta_py.iter()).enumerate() {
-        assert!((a-b).abs() <= 1e-9, "beta[{i}] rust={a} py={b}");
+    for (i, (a, b)) in beta_rust.iter().zip(beta_py.iter()).enumerate() {
+        assert!((a - b).abs() <= 1e-9, "beta[{i}] rust={a} py={b}");
     }
-    assert!((reml_rust - reml_py).abs() <= 1e-9, "reml rust={reml_rust} py={reml_py}");
+    assert!(
+        (reml_rust - reml_py).abs() <= 1e-9,
+        "reml rust={reml_rust} py={reml_py}"
+    );
     let _ = ll_rust;
 }

@@ -1,5 +1,5 @@
-use gam::faer_ndarray::{fast_ab, fast_ata, fast_atv, fast_av, fast_xt_diag_y, FaerEigh};
 use faer::Side;
+use gam::faer_ndarray::{FaerEigh, fast_ab, fast_ata, fast_atv, fast_av, fast_xt_diag_y};
 use ndarray::{Array1, Array2, Axis, s};
 
 fn max_abs_diff(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
@@ -27,7 +27,10 @@ fn bug_fast_ab_matches_ndarray_dot_random_like_inputs() {
     let got = fast_ab(&a, &b);
     let expected = a.dot(&b);
     let err = max_abs_diff(&got, &expected);
-    assert!(err <= 1e-9, "fast_ab should match ndarray dot within 1e-9, max error was {err:e}");
+    assert!(
+        err <= 1e-9,
+        "fast_ab should match ndarray dot within 1e-9, max error was {err:e}"
+    );
 }
 
 #[test]
@@ -36,7 +39,10 @@ fn bug_fast_ata_matches_transpose_product_random_like_input() {
     let got = fast_ata(&a);
     let expected = a.t().dot(&a);
     let err = max_abs_diff(&got, &expected);
-    assert!(err <= 1e-9, "fast_ata should match A^T A within 1e-9, max error was {err:e}");
+    assert!(
+        err <= 1e-9,
+        "fast_ata should match A^T A within 1e-9, max error was {err:e}"
+    );
 }
 
 #[test]
@@ -46,7 +52,10 @@ fn bug_fast_av_matches_matrix_vector_product() {
     let got = fast_av(&a, &v);
     let expected = a.dot(&v);
     let err = max_abs_diff_vec(&got, &expected);
-    assert!(err <= 1e-9, "fast_av should match A v within 1e-9, max error was {err:e}");
+    assert!(
+        err <= 1e-9,
+        "fast_av should match A v within 1e-9, max error was {err:e}"
+    );
 }
 
 #[test]
@@ -56,7 +65,10 @@ fn bug_fast_atv_matches_transpose_vector_product() {
     let got = fast_atv(&a, &v);
     let expected = a.t().dot(&v);
     let err = max_abs_diff_vec(&got, &expected);
-    assert!(err <= 1e-9, "fast_atv should match A^T v within 1e-9, max error was {err:e}");
+    assert!(
+        err <= 1e-9,
+        "fast_atv should match A^T v within 1e-9, max error was {err:e}"
+    );
 }
 
 #[test]
@@ -68,7 +80,10 @@ fn bug_fast_xt_diag_y_matches_naive_weighted_crossprod() {
     let expected = x.t().dot(&wy);
     let got = fast_xt_diag_y(&x, &w, &y);
     let err = max_abs_diff(&got, &expected);
-    assert!(err <= 1e-9, "fast_xt_diag_y should match X^T diag(w) Y within 1e-9, max error was {err:e}");
+    assert!(
+        err <= 1e-9,
+        "fast_xt_diag_y should match X^T diag(w) Y within 1e-9, max error was {err:e}"
+    );
 }
 
 #[test]
@@ -90,7 +105,10 @@ fn bug_chunked_gram_matches_sum_of_per_chunk_grams() {
     }
 
     let err = max_abs_diff(&full, &sum);
-    assert!(err <= 1e-9, "chunked Gram aggregation should equal dense one-block result within 1e-9, max error was {err:e}");
+    assert!(
+        err <= 1e-9,
+        "chunked Gram aggregation should equal dense one-block result within 1e-9, max error was {err:e}"
+    );
 }
 
 #[test]
@@ -101,11 +119,19 @@ fn bug_faer_eigh_spd_positive_and_reconstructs_matrix() {
         a[[i, i]] += 1e-2;
     }
 
-    let (evals, evecs) = a.eigh(Side::Lower).expect("eigh should succeed on SPD input");
-    assert!(evals.iter().all(|&v| v > 0.0), "all eigenvalues should be positive for SPD matrix");
+    let (evals, evecs) = a
+        .eigh(Side::Lower)
+        .expect("eigh should succeed on SPD input");
+    assert!(
+        evals.iter().all(|&v| v > 0.0),
+        "all eigenvalues should be positive for SPD matrix"
+    );
 
     let d = Array2::from_diag(&evals);
     let recon = evecs.dot(&d).dot(&evecs.t());
     let err = max_abs_diff(&recon, &a);
-    assert!(err <= 1e-9, "U Λ U^T should reconstruct SPD input within 1e-9, max error was {err:e}");
+    assert!(
+        err <= 1e-9,
+        "U Λ U^T should reconstruct SPD input within 1e-9, max error was {err:e}"
+    );
 }

@@ -1733,7 +1733,11 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
                 let bs_is_re = options
                     .get("bs")
                     .or_else(|| options.get("type"))
-                    .map(|v| v.trim().trim_matches(|c| c == '\'' || c == '"').to_ascii_lowercase())
+                    .map(|v| {
+                        v.trim()
+                            .trim_matches(|c| c == '\'' || c == '"')
+                            .to_ascii_lowercase()
+                    })
                     .as_deref()
                     == Some("re");
                 if bs_is_re && vars.len() == 1 {

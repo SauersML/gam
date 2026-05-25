@@ -47,81 +47,81 @@ impl GpuRuntime {
 
         #[cfg(all(feature = "cuda", target_os = "linux"))]
         {
-        // `cudarc 0.19`'s entry points lazily initialize the CUDA driver via
-        // a process-wide `OnceLock<libloading::Library>`. When the platform
-        // has no CUDA driver (e.g. macOS hosts where there is no
-        // `libcuda.dylib`, or Linux hosts without an NVIDIA runtime), the
-        // first call to any driver API — including `device_count()` — panics
-        // unconditionally from inside the cudarc-generated `culib()` helper
-        // (`cudarc/src/lib.rs::panic_no_lib_found`). Because the panic
-        // happens inside `OnceLock::get_or_init`, even catching the unwind
-        // here is fragile (and was observed not to catch in the 0.1.123 PyPI
-        // wheel, causing every `gamfit.fit` on macOS to abort at the
-        // Rust/Python boundary). The principled fix is to never call a
-        // function that may panic in the first place: cudarc exposes a
-        // `is_culib_present()` probe that returns `false` instead of
-        // panicking when no candidate dynamic library can be opened. Gate
-        // every other cudarc driver entry point on that check.
-        //
-        // SAFETY: `is_culib_present` only attempts a series of
-        // `libloading::Library::new(name)` calls, returns `true` on the
-        // first success and `false` if all fail. It has no preconditions
-        // and no state-changing side effects beyond the libloading load
-        // attempts themselves.
-        let culib_present = unsafe { sys::is_culib_present() };
-        if !culib_present {
-            let reason = "CUDA driver library not present on this host";
-            Self::record_cpu_reason(reason);
-            diagnostics::log_cuda_disabled(reason);
-            return Err(GpuProbeError::Driver(reason.to_string()));
-        }
+            // `cudarc 0.19`'s entry points lazily initialize the CUDA driver via
+            // a process-wide `OnceLock<libloading::Library>`. When the platform
+            // has no CUDA driver (e.g. macOS hosts where there is no
+            // `libcuda.dylib`, or Linux hosts without an NVIDIA runtime), the
+            // first call to any driver API — including `device_count()` — panics
+            // unconditionally from inside the cudarc-generated `culib()` helper
+            // (`cudarc/src/lib.rs::panic_no_lib_found`). Because the panic
+            // happens inside `OnceLock::get_or_init`, even catching the unwind
+            // here is fragile (and was observed not to catch in the 0.1.123 PyPI
+            // wheel, causing every `gamfit.fit` on macOS to abort at the
+            // Rust/Python boundary). The principled fix is to never call a
+            // function that may panic in the first place: cudarc exposes a
+            // `is_culib_present()` probe that returns `false` instead of
+            // panicking when no candidate dynamic library can be opened. Gate
+            // every other cudarc driver entry point on that check.
+            //
+            // SAFETY: `is_culib_present` only attempts a series of
+            // `libloading::Library::new(name)` calls, returns `true` on the
+            // first success and `false` if all fail. It has no preconditions
+            // and no state-changing side effects beyond the libloading load
+            // attempts themselves.
+            let culib_present = unsafe { sys::is_culib_present() };
+            if !culib_present {
+                let reason = "CUDA driver library not present on this host";
+                Self::record_cpu_reason(reason);
+                diagnostics::log_cuda_disabled(reason);
+                return Err(GpuProbeError::Driver(reason.to_string()));
+            }
 
-        let device_count =
-            CudaContext::device_count().map_err(|err| GpuProbeError::Driver(err.to_string()))?;
-        if device_count <= 0 {
-            let reason = "CUDA driver reported no devices";
-            Self::record_cpu_reason(reason);
-            diagnostics::log_cuda_disabled(reason);
-            // Surface the no-device state as a structured `Driver(_)` so that
-            // callers wanting a CPU-reason marker can distinguish "policy off"
-            // (Ok(None)) from "driver present but no usable hardware"
-            // (Err(Driver)). This keeps `GpuRuntime::probe()` honest: a
-            // successful `Ok` always carries at least one device.
-            return Err(GpuProbeError::Driver(reason.to_string()));
-        }
-
-        let mut devices = Vec::new();
-        for ordinal in 0..usize::try_from(device_count)
-            .map_err(|_| GpuProbeError::Driver("negative CUDA device count".into()))?
-        {
-            let ctx = cuda_context_for(ordinal).ok_or_else(|| {
-                GpuProbeError::Driver(format!(
-                    "failed to create CUDA context for device {ordinal}"
-                ))
-            })?;
-            ctx.bind_to_thread()
+            let device_count = CudaContext::device_count()
                 .map_err(|err| GpuProbeError::Driver(err.to_string()))?;
-            devices.push(cuda_device_info(ordinal, &ctx)?);
-        }
+            if device_count <= 0 {
+                let reason = "CUDA driver reported no devices";
+                Self::record_cpu_reason(reason);
+                diagnostics::log_cuda_disabled(reason);
+                // Surface the no-device state as a structured `Driver(_)` so that
+                // callers wanting a CPU-reason marker can distinguish "policy off"
+                // (Ok(None)) from "driver present but no usable hardware"
+                // (Err(Driver)). This keeps `GpuRuntime::probe()` honest: a
+                // successful `Ok` always carries at least one device.
+                return Err(GpuProbeError::Driver(reason.to_string()));
+            }
 
-        devices.sort_by(|a, b| b.score().total_cmp(&a.score()));
-        let Some(device) = devices.first().cloned() else {
-            Self::record_cpu_reason("CUDA driver reported no usable devices");
-            diagnostics::log_cuda_disabled("CUDA driver reported no usable devices");
-            return Ok(None);
-        };
+            let mut devices = Vec::new();
+            for ordinal in 0..usize::try_from(device_count)
+                .map_err(|_| GpuProbeError::Driver("negative CUDA device count".into()))?
+            {
+                let ctx = cuda_context_for(ordinal).ok_or_else(|| {
+                    GpuProbeError::Driver(format!(
+                        "failed to create CUDA context for device {ordinal}"
+                    ))
+                })?;
+                ctx.bind_to_thread()
+                    .map_err(|err| GpuProbeError::Driver(err.to_string()))?;
+                devices.push(cuda_device_info(ordinal, &ctx)?);
+            }
 
-        let policy = GpuDispatchPolicy::default();
-        let memory_budget_bytes = device.free_mem_bytes.min(device.total_mem_bytes / 2);
-        diagnostics::log_cuda_enabled(&device, &policy);
-        diagnostics::log_cuda_pool(&devices);
+            devices.sort_by(|a, b| b.score().total_cmp(&a.score()));
+            let Some(device) = devices.first().cloned() else {
+                Self::record_cpu_reason("CUDA driver reported no usable devices");
+                diagnostics::log_cuda_disabled("CUDA driver reported no usable devices");
+                return Ok(None);
+            };
 
-        Ok(Some(Self {
-            device,
-            devices,
-            policy,
-            memory_budget_bytes,
-        }))
+            let policy = GpuDispatchPolicy::default();
+            let memory_budget_bytes = device.free_mem_bytes.min(device.total_mem_bytes / 2);
+            diagnostics::log_cuda_enabled(&device, &policy);
+            diagnostics::log_cuda_pool(&devices);
+
+            Ok(Some(Self {
+                device,
+                devices,
+                policy,
+                memory_budget_bytes,
+            }))
         }
     }
 

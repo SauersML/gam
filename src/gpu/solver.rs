@@ -274,15 +274,15 @@ pub fn cholesky_solve_gpu(
 
     #[cfg(all(feature = "cuda", target_os = "linux"))]
     {
-    if super::runtime::GpuRuntime::global().is_none() {
-        let (rows, cols) = hessian.dim();
-        return Err(format!(
-            "CUDA runtime unavailable for Cholesky solve; hessian={rows}x{cols}, rhs={}x{}",
-            rhs.nrows(),
-            rhs.ncols()
-        ));
-    }
-    cuda::cholesky_solve(hessian, rhs)
+        if super::runtime::GpuRuntime::global().is_none() {
+            let (rows, cols) = hessian.dim();
+            return Err(format!(
+                "CUDA runtime unavailable for Cholesky solve; hessian={rows}x{cols}, rhs={}x{}",
+                rhs.nrows(),
+                rhs.ncols()
+            ));
+        }
+        cuda::cholesky_solve(hessian, rhs)
     }
 }
 
@@ -297,12 +297,12 @@ pub fn cholesky_lower_gpu(hessian: ArrayView2<'_, f64>) -> Result<Array2<f64>, S
 
     #[cfg(all(feature = "cuda", target_os = "linux"))]
     {
-    if super::runtime::GpuRuntime::global().is_none() {
-        let (rows, cols) = hessian.dim();
-        return Err(format!(
-            "CUDA runtime unavailable for Cholesky factorization; hessian={rows}x{cols}"
-        ));
-    }
-    cuda::cholesky_lower(hessian)
+        if super::runtime::GpuRuntime::global().is_none() {
+            let (rows, cols) = hessian.dim();
+            return Err(format!(
+                "CUDA runtime unavailable for Cholesky factorization; hessian={rows}x{cols}"
+            ));
+        }
+        cuda::cholesky_lower(hessian)
     }
 }

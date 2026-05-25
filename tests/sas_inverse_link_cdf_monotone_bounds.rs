@@ -17,13 +17,25 @@ fn sas_inverse_link_is_monotone_and_bounded_as_cdf() {
     let mut prev = f64::NEG_INFINITY;
     for x in eta {
         let (mu, _) = inverse_link_mu_d1_for_inverse_link(&link, x).expect("sas inverse link");
-        assert!(mu >= prev, "SAS inverse-link is not monotone at eta={x}: prev={prev}, mu={mu}");
-        assert!((0.0..=1.0).contains(&mu), "SAS inverse-link left [0,1] at eta={x}: mu={mu}");
+        assert!(
+            mu >= prev,
+            "SAS inverse-link is not monotone at eta={x}: prev={prev}, mu={mu}"
+        );
+        assert!(
+            (0.0..=1.0).contains(&mu),
+            "SAS inverse-link left [0,1] at eta={x}: mu={mu}"
+        );
         prev = mu;
     }
 
     let (mu_lo, _) = inverse_link_mu_d1_for_inverse_link(&link, -1.0e6).expect("sas low tail");
     let (mu_hi, _) = inverse_link_mu_d1_for_inverse_link(&link, 1.0e6).expect("sas high tail");
-    assert!(mu_lo <= 1.0e-12, "SAS inverse-link low tail is not near 0: mu(-1e6)={mu_lo}");
-    assert!(mu_hi >= 1.0 - 1.0e-12, "SAS inverse-link high tail is not near 1: mu(1e6)={mu_hi}");
+    assert!(
+        mu_lo <= 1.0e-12,
+        "SAS inverse-link low tail is not near 0: mu(-1e6)={mu_lo}"
+    );
+    assert!(
+        mu_hi >= 1.0 - 1.0e-12,
+        "SAS inverse-link high tail is not near 1: mu(1e6)={mu_hi}"
+    );
 }

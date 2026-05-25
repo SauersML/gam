@@ -20,8 +20,7 @@ use ndarray::{Array1, Array2};
 
 use gam::terms::{
     AssignmentMode, LatentManifold, SaeAssignment, SaeAtomBasisKind, SaeBasisEvaluator,
-    SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm, SphereChartEvaluator,
-    TorusHarmonicEvaluator,
+    SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm, SphereChartEvaluator, TorusHarmonicEvaluator,
 };
 
 /// Newton loop driver shared by both topology tests. Mirrors the inner loop

@@ -74,9 +74,7 @@ fn synth_categorical_dataset(n: usize, seed: u64) -> gam::inference::data::Encod
         let g = i % n_groups;
         // Use string labels so the column is inferred as Categorical.
         let group = format!("g{g}");
-        let y = (2.0 * std::f64::consts::PI * x).sin()
-            + group_effects[g]
-            + noise.sample(&mut rng);
+        let y = (2.0 * std::f64::consts::PI * x).sin() + group_effects[g] + noise.sample(&mut rng);
         rows.push(StringRecord::from(vec![
             x.to_string(),
             group,
@@ -98,8 +96,8 @@ fn fit_factor_group_recovers_group_means() {
 
     // End-to-end: `factor(group)` must reach a Standard fit (no panic, no
     // "unknown term function") and PIRLS must converge.
-    let result = fit_from_formula("y ~ s(x) + factor(group)", &data, &cfg)
-        .expect("factor(group) must fit");
+    let result =
+        fit_from_formula("y ~ s(x) + factor(group)", &data, &cfg).expect("factor(group) must fit");
     let FitResult::Standard(fit) = result else {
         panic!("expected standard fit");
     };

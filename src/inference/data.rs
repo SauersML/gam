@@ -887,13 +887,11 @@ fn load_delimited_with_schema(
                 // collide with real level codes.
                 for (row_idx, raw) in &infer_strings[j] {
                     let levels_ref = &mut infer_levels[j];
-                    let code = *infer_level_index[j]
-                        .entry(raw.clone())
-                        .or_insert_with(|| {
-                            let new_idx = levels_ref.len();
-                            levels_ref.push(raw.clone());
-                            new_idx
-                        });
+                    let code = *infer_level_index[j].entry(raw.clone()).or_insert_with(|| {
+                        let new_idx = levels_ref.len();
+                        levels_ref.push(raw.clone());
+                        new_idx
+                    });
                     col_vecs[j][*row_idx] = code as f64;
                 }
                 col_meta[j].schema_col.levels = infer_levels[j].clone();

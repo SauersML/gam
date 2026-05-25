@@ -75,7 +75,10 @@ fn resolve_family_accepts_tweedie() {
         .expect("tweedie family should be recognized");
     match resolved.response {
         ResponseFamily::Tweedie { p } => {
-            assert!(p > 1.0 && p < 2.0, "default tweedie p should lie in (1, 2); got {p}");
+            assert!(
+                p > 1.0 && p < 2.0,
+                "default tweedie p should lie in (1, 2); got {p}"
+            );
         }
         other => panic!("expected Tweedie response family, got {other:?}"),
     }

@@ -73,3 +73,36 @@ def test_sae_fit_is_deterministic_for_fixed_seed():
             rtol=0.0,
             atol=1e-10,
         )
+
+
+def test_sae_fit_random_state_changes_output():
+    """Distinct `random_state` values must produce observably different fits
+    (issue #178). With the seed wired into the assignment-logit init, any two
+    seeds should perturb the Newton trajectory enough to change the final
+    decoder and assignment posterior past trivial precision."""
+    z = _synthetic_one_harmonic(noise=0.08)
+    common = dict(
+        Z=z,
+        n_atoms=2,
+        atom_basis="periodic",
+        atom_dim=2,
+        assignment_prior="ibp_map",
+        max_iter=30,
+        learning_rate=0.2,
+    )
+    fit_0 = gamfit.sae_manifold_fit(**common, random_state=0)
+    fit_1 = gamfit.sae_manifold_fit(**common, random_state=1)
+    fit_2 = gamfit.sae_manifold_fit(**common, random_state=42)
+
+    fitted_diff_01 = float(np.max(np.abs(fit_0.fitted - fit_1.fitted)))
+    fitted_diff_02 = float(np.max(np.abs(fit_0.fitted - fit_2.fitted)))
+    assign_diff_01 = float(np.max(np.abs(fit_0.assignments - fit_1.assignments)))
+    assert fitted_diff_01 > 1e-6, (
+        f"random_state ignored: rs=0 vs rs=1 fitted max-abs diff = {fitted_diff_01:.2e}"
+    )
+    assert fitted_diff_02 > 1e-6, (
+        f"random_state ignored: rs=0 vs rs=42 fitted max-abs diff = {fitted_diff_02:.2e}"
+    )
+    assert assign_diff_01 > 1e-6, (
+        f"random_state ignored on assignments: rs=0 vs rs=1 max-abs diff = {assign_diff_01:.2e}"
+    )

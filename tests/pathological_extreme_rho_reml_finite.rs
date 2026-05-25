@@ -1,4 +1,4 @@
-use gam::estimate::{fit_gamwith_heuristic_lambdas, FitOptions};
+use gam::estimate::{FitOptions, fit_gamwith_heuristic_lambdas};
 use gam::terms::smooth::BlockwisePenalty;
 use gam::types::LikelihoodSpec;
 use ndarray::array;
@@ -16,8 +16,19 @@ fn extreme_rho_bounds_keep_reml_finite() {
     for rho in [-20.0_f64, 20.0_f64] {
         let lambdas = [rho.exp()];
         let fit = fit_gamwith_heuristic_lambdas(
-            x.view(), y.view(), w.view(), offset.view(), &s_list, Some(&lambdas), fam.clone(), &opts,
-        ).expect("fit should complete at extreme rho");
-        assert!(fit.reml_score.is_finite(), "REML score must be finite at rho={rho}");
+            x.view(),
+            y.view(),
+            w.view(),
+            offset.view(),
+            &s_list,
+            Some(&lambdas),
+            fam.clone(),
+            &opts,
+        )
+        .expect("fit should complete at extreme rho");
+        assert!(
+            fit.reml_score.is_finite(),
+            "REML score must be finite at rho={rho}"
+        );
     }
 }
