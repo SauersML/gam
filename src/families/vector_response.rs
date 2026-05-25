@@ -358,7 +358,7 @@ mod tests {
     // caller's test body, satisfying the build.rs scanner that looks for
     // `assert!(` / `panic!(` directly in the `#[test]` function.
     macro_rules! expect_invalid_input {
-        ($result:expr, $needle:expr) => {{
+        ($result:expr, $needle:expr $(,)?) => {{
             let needle: &str = $needle;
             match $result {
                 Ok(_) => panic!(
