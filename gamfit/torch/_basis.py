@@ -37,22 +37,6 @@ def _resolve_knots_tensor(
     return from_numpy_like(resolved, t)
 
 
-def _resolve_basis_locations_tensor(
-    t: torch.Tensor,
-    knots_or_centers: Any,
-    *,
-    basis_kind: str,
-    degree: int,
-) -> torch.Tensor:
-    """Dispatch :func:`_resolve_centers_tensor`/:func:`_resolve_knots_tensor`."""
-    if isinstance(knots_or_centers, torch.Tensor):
-        return knots_or_centers
-    kind = str(basis_kind).strip().lower().replace("_", "").replace("-", "")
-    if kind in {"duchon", "duchonspline"}:
-        return _resolve_centers_tensor(t, knots_or_centers)
-    return _resolve_knots_tensor(t, knots_or_centers, degree=degree)
-
-
 class _BsplineBasisFn(torch.autograd.Function):
     """Autograd Function evaluating the Rust B-spline basis with grad wrt ``t``."""
 

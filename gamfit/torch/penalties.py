@@ -455,11 +455,21 @@ class JumpReLUPenalty(nn.Module):
         """
         del basis
         latent = _check_matrix(latent, "latent")
-        tau = self.effective_thresholds(latent.dtype).to(latent.device)
-        diff = (latent - tau.unsqueeze(0)) / float(self.smoothing_eps)
-        gate = torch.sigmoid(diff)
-        per_axis = (tau.unsqueeze(0) * gate).sum()
-        return float(self.weight) * per_axis
+        descriptor = {
+            "kind": "jumprelu",
+            "target": self.target,
+            "thresholds": to_numpy_f64(self.thresholds).reshape(-1).tolist(),
+            "weight": self.weight,
+            "smoothing_eps": self.smoothing_eps,
+        }
+        rho = self.log_threshold.to(device=latent.device, dtype=latent.dtype)
+        apply = cast(Callable[..., torch.Tensor], _RustPenaltyFn.apply)
+        return apply(
+            latent,
+            rho,
+            _latent_json(latent.shape[0], latent.shape[1], name=self.target),
+            _penalty_json(descriptor),
+        )
 
 
 class _JumpReLUSTEFn(torch.autograd.Function):

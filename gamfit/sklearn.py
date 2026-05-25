@@ -5,7 +5,6 @@ from typing import Any, TypeVar
 
 import numpy as np
 from sklearn.base import BaseEstimator, ClassifierMixin, RegressorMixin
-from sklearn.metrics import accuracy_score, r2_score
 from sklearn.utils.validation import check_is_fitted
 
 from ._api import fit as fit_model
@@ -184,36 +183,6 @@ class GAMRegressor(_BaseGAMEstimator, RegressorMixin):
         predicted = self.model_.predict(X, return_type="dict")
         return np.asarray(predicted["mean"], dtype=float)
 
-    def score(self, X: Any, y: Any, sample_weight: Any = None) -> float:
-        """Return the coefficient of determination :math:`R^2`.
-
-        Parameters
-        ----------
-        X : Any
-            Test feature table.
-        y : array-like
-            True response values.
-        sample_weight : array-like or None, optional
-            Per-row weights forwarded to :func:`sklearn.metrics.r2_score`.
-
-        Returns
-        -------
-        float
-            :math:`R^2` of the predictions.
-
-        Examples
-        --------
-        >>> reg.score(X_test, y_test)
-        0.87
-        """
-        return float(
-            r2_score(
-                np.asarray(y, dtype=float),
-                self.predict(X),
-                sample_weight=sample_weight,
-            )
-        )
-
 
 class GAMClassifier(_BaseGAMEstimator, ClassifierMixin):
     """scikit-learn-compatible binary classifier wrapping :func:`gamfit.fit`.
@@ -299,34 +268,3 @@ class GAMClassifier(_BaseGAMEstimator, ClassifierMixin):
         array([1, 0, 1, 1, 0])
         """
         return (self.predict_proba(X)[:, 1] >= 0.5).astype(int)
-
-    def score(self, X: Any, y: Any, sample_weight: Any = None) -> float:
-        """Return classification accuracy.
-
-        Parameters
-        ----------
-        X : Any
-            Test feature table.
-        y : array-like
-            True binary labels.
-        sample_weight : array-like or None, optional
-            Per-row weights forwarded to
-            :func:`sklearn.metrics.accuracy_score`.
-
-        Returns
-        -------
-        float
-            Accuracy in ``[0, 1]``.
-
-        Examples
-        --------
-        >>> clf.score(X_test, y_test)
-        0.91
-        """
-        return float(
-            accuracy_score(
-                np.asarray(y, dtype=int),
-                self.predict(X),
-                sample_weight=sample_weight,
-            )
-        )
