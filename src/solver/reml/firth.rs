@@ -2,10 +2,8 @@ use super::*;
 use crate::linalg::utils::enforce_symmetry;
 use crate::mixture_link::logit_inverse_link_jet5;
 use ndarray::Zip;
-use rayon::slice::ParallelSliceMut;
 
 const FIRTH_DERIVATIVE_PARALLEL_MIN_N: usize = 16_384;
-const FIRTH_ROW_SCALE_PARALLEL_MIN_CELLS: usize = 200_000;
 
 impl<'a> RemlState<'a> {
     pub(crate) fn xt_diag_x_dense_into(
@@ -21,25 +19,9 @@ impl<'a> RemlState<'a> {
         n >= FIRTH_DERIVATIVE_PARALLEL_MIN_N && rayon::current_num_threads() > 1
     }
 
-    #[inline]
-    fn parallelize_firth_row_scale(n: usize, p: usize) -> bool {
-        n.saturating_mul(p) >= FIRTH_ROW_SCALE_PARALLEL_MIN_CELLS
-            && rayon::current_num_threads() > 1
-    }
-
     pub(crate) fn row_scale(x: &Array2<f64>, scale: &Array1<f64>) -> Array2<f64> {
-        let (n, p) = x.dim();
-        let mut out = x.clone();
-        let rows = out.rows_mut();
-        if Self::parallelize_firth_row_scale(n, p) {
-            Zip::from(rows)
-                .and(scale.view())
-                .par_for_each(|mut row, w| row *= *w);
-        } else {
-            Zip::from(rows)
-                .and(scale.view())
-                .for_each(|mut row, w| row *= *w);
-        }
+        let mut out = Array2::<f64>::zeros(x.raw_dim());
+        super::assembly::row_scale_dense_into(x, scale, &mut out);
         out
     }
 
@@ -73,6 +55,14 @@ impl<'a> RemlState<'a> {
         total_flop_scale >= JOIN_MIN_TOTAL_FLOP_SCALE
     }
 
+    /// Undo the fixed observation-weight row scale used by Firth reduced
+    /// designs.
+    ///
+    /// Keep this distinct from PIRLS's sparse-SpGEMM `sqrt_weights` cache in
+    /// `solver/pirls.rs`: PIRLS materializes roots of the current working
+    /// weights for a Gram factorization, while this uses stored fixed
+    /// case-weight roots and their reciprocals to map reduced design
+    /// derivatives back to raw design space.
     #[inline]
     fn scale_rows_by_inverse_observation_weight_sqrt(
         out: &mut Array2<f64>,
@@ -81,49 +71,7 @@ impl<'a> RemlState<'a> {
         let Some(scale) = observation_weight_sqrt else {
             return;
         };
-        assert_eq!(out.nrows(), scale.len());
-        let ncols = out.ncols();
-        if ncols == 0 {
-            return;
-        }
-        const PAR_MIN_CELLS: usize = 64 * 1024;
-        let cells = out.nrows().saturating_mul(ncols);
-        if cells >= PAR_MIN_CELLS
-            && rayon::current_num_threads() > 1
-            && out.is_standard_layout()
-            && let Some(slice) = out.as_slice_memory_order_mut()
-        {
-            slice
-                .par_chunks_mut(ncols)
-                .enumerate()
-                .for_each(|(row, row_values)| {
-                    let s = scale[row];
-                    if s > 0.0 {
-                        let inv = s.recip();
-                        for value in row_values {
-                            *value *= inv;
-                        }
-                    } else {
-                        for value in row_values {
-                            *value = 0.0;
-                        }
-                    }
-                });
-            return;
-        }
-        for row in 0..out.nrows() {
-            let s = scale[row];
-            if s > 0.0 {
-                let inv = s.recip();
-                for col in 0..ncols {
-                    out[[row, col]] *= inv;
-                }
-            } else {
-                for col in 0..ncols {
-                    out[[row, col]] = 0.0;
-                }
-            }
-        }
+        super::assembly::row_scale_dense_in_place_by_inverse_positive_or_zero(out, scale);
     }
 
     #[inline]
