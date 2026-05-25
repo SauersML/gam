@@ -212,10 +212,7 @@ impl PeriodicHarmonicEvaluator {
 }
 
 impl SaeBasisEvaluator for PeriodicHarmonicEvaluator {
-    fn evaluate(
-        &self,
-        coords: ArrayView2<'_, f64>,
-    ) -> Result<(Array2<f64>, Array3<f64>), String> {
+    fn evaluate(&self, coords: ArrayView2<'_, f64>) -> Result<(Array2<f64>, Array3<f64>), String> {
         let n = coords.nrows();
         let d = coords.ncols();
         if d != 1 {
@@ -268,10 +265,7 @@ impl RawPeriodicCircleEvaluator {
 }
 
 impl SaeBasisEvaluator for RawPeriodicCircleEvaluator {
-    fn evaluate(
-        &self,
-        coords: ArrayView2<'_, f64>,
-    ) -> Result<(Array2<f64>, Array3<f64>), String> {
+    fn evaluate(&self, coords: ArrayView2<'_, f64>) -> Result<(Array2<f64>, Array3<f64>), String> {
         if coords.ncols() != self.latent_dim {
             return Err(format!(
                 "RawPeriodicCircleEvaluator: expected latent_dim {}, got {}",
@@ -298,10 +292,7 @@ impl SaeBasisEvaluator for RawPeriodicCircleEvaluator {
 pub struct SphereChartEvaluator;
 
 impl SaeBasisEvaluator for SphereChartEvaluator {
-    fn evaluate(
-        &self,
-        coords: ArrayView2<'_, f64>,
-    ) -> Result<(Array2<f64>, Array3<f64>), String> {
+    fn evaluate(&self, coords: ArrayView2<'_, f64>) -> Result<(Array2<f64>, Array3<f64>), String> {
         if coords.ncols() != 2 {
             return Err(format!(
                 "SphereChartEvaluator expects latent_dim == 2, got {}",
@@ -364,10 +355,7 @@ impl AffineCoordinateEvaluator {
 }
 
 impl SaeBasisEvaluator for AffineCoordinateEvaluator {
-    fn evaluate(
-        &self,
-        coords: ArrayView2<'_, f64>,
-    ) -> Result<(Array2<f64>, Array3<f64>), String> {
+    fn evaluate(&self, coords: ArrayView2<'_, f64>) -> Result<(Array2<f64>, Array3<f64>), String> {
         if coords.ncols() != self.latent_dim {
             return Err(format!(
                 "AffineCoordinateEvaluator: expected latent_dim {}, got {}",
@@ -417,10 +405,7 @@ impl StaticBasisEvaluator {
 }
 
 impl SaeBasisEvaluator for StaticBasisEvaluator {
-    fn evaluate(
-        &self,
-        coords: ArrayView2<'_, f64>,
-    ) -> Result<(Array2<f64>, Array3<f64>), String> {
+    fn evaluate(&self, coords: ArrayView2<'_, f64>) -> Result<(Array2<f64>, Array3<f64>), String> {
         if coords.nrows() != self.phi.nrows() {
             return Err(format!(
                 "StaticBasisEvaluator expected {} rows, got {}",
@@ -2227,15 +2212,7 @@ mod tests {
         let mut prev_total = f64::INFINITY;
         for _ in 0..max_iter {
             let loss = term
-                .run_joint_fit_arrow_schur(
-                    z.view(),
-                    &mut rho,
-                    None,
-                    1,
-                    learning_rate,
-                    ridge,
-                    ridge,
-                )
+                .run_joint_fit_arrow_schur(z.view(), &mut rho, None, 1, learning_rate, ridge, ridge)
                 .unwrap();
             let total = loss.total();
             if !total.is_finite() {
