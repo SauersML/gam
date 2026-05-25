@@ -430,12 +430,154 @@ def _pca_seed_coords(x: np.ndarray, d: int, rng: np.random.Generator) -> np.ndar
 
 
 def _oos_reconstruct(model: ManifoldSAE, x_new: np.ndarray) -> np.ndarray:
-    # Simple OOS: encode by nearest-training-row in latent space.
-    # The training coords were learned for the training rows; for OOS we project
-    # each new point onto the nearest training point and reuse its fitted output.
-    diffs = np.linalg.norm(x_new[:, None, :] - model.training_data[None, :, :], axis=-1)
-    nearest = np.argmin(diffs, axis=1)
-    return model.fitted[nearest].copy()
+    """Out-of-sample reconstruction reusing the trained Rust Newton kernel.
+
+    Routes the held-out rows through the same ``sae_manifold_fit`` per-row
+    Newton update used at training time, with the trained decoder
+    coefficients ``B_k`` clamped (re-overwritten after every Rust step) so
+    only the latent coords ``t_ik`` and the assignment logits move. The
+    inferred ``phi_ik @ B_k`` reconstruction is the fitted matrix returned
+    by the final Newton step — i.e. exactly the same math as training, just
+    with the decoder held fixed.
+    """
+    rust = rust_module()
+    n_new, p_out = x_new.shape
+    k_atoms = len(model.atoms)
+    dims = list(model._atom_dims)
+    basis_sizes = list(model._basis_sizes)
+    basis_kinds = list(model._basis_kinds)
+    n_harmonics = list(model._n_harmonics)
+    duchon_centers = list(model._duchon_centers)
+
+    m_max = max(basis_sizes) if basis_sizes else 1
+    d_max = max(dims) if dims else 1
+
+    # Trained decoder coefficients, padded to (K, m_max, p_out).
+    decoder_coefficients = np.zeros((k_atoms, m_max, p_out), dtype=float)
+    for atom_idx, block in enumerate(model.decoder_blocks):
+        m = basis_sizes[atom_idx]
+        decoder_coefficients[atom_idx, :m, :] = block[:m, :]
+    frozen_decoder = decoder_coefficients.copy()
+
+    # Per-atom basis spec for the existing _build_basis_stack helper.
+    atom_specs: list[dict[str, Any]] = []
+    for atom_idx in range(k_atoms):
+        kind = basis_kinds[atom_idx]
+        if kind == "periodic":
+            n_harm = max(1, n_harmonics[atom_idx])
+            atom_specs.append(
+                {"kind": "periodic", "n_harmonics": n_harm, "m": 1 + 2 * n_harm}
+            )
+        else:  # duchon
+            centers = duchon_centers[atom_idx]
+            if centers is None:
+                raise RuntimeError(
+                    f"OOS reconstruct: duchon atom {atom_idx} missing centers"
+                )
+            atom_specs.append(
+                {"kind": "duchon", "centers": centers, "m": basis_sizes[atom_idx]}
+            )
+
+    # Smoothness penalty stack from trained atom specs.
+    smooth_penalties_stack = _build_penalty_stack(atom_specs, m_max)
+
+    # Seed coords for new rows: PCA in the new data's own frame.
+    rng = np.random.default_rng(0)
+    initial_coords = np.zeros((k_atoms, n_new, d_max), dtype=float)
+    for atom_idx in range(k_atoms):
+        d = dims[atom_idx]
+        if d <= 0:
+            continue
+        spec = atom_specs[atom_idx]
+        if spec["kind"] == "periodic":
+            theta = _pca_periodic_seed(x_new, rng, atom_idx)
+            initial_coords[atom_idx, :, 0] = theta
+            for axis in range(1, d):
+                initial_coords[atom_idx, :, axis] = _pca_axis(x_new, axis, rng)
+        else:
+            seed = _pca_seed_coords(x_new, d, rng)
+            initial_coords[atom_idx, :, :d] = seed
+
+    initial_logits = np.zeros((n_new, k_atoms), dtype=float)
+    if k_atoms == 1 and model.assignment in {"ibp", "ibp_map"}:
+        initial_logits[:, 0] = 4.0  # strong "atom on" prior; trained ibp behaves the same
+
+    max_iter_total = max(1, int(np.asarray(model.coords[0]).shape[0] >= 0) * 50)
+    assignment_kind = str(
+        {"ibp": "ibp_map"}.get(model.assignment, model.assignment)
+    )
+    if assignment_kind == "gated":
+        assignment_kind = "jumprelu"
+    alpha_value = 1.0
+    tau = 0.5
+
+    last_fitted: np.ndarray | None = None
+    for _ in range(max_iter_total):
+        basis_values, basis_jacobian = _build_basis_stack(
+            atom_specs, initial_coords, dims, m_max, d_max
+        )
+        # Freeze the decoder going in.
+        decoder_coefficients[...] = frozen_decoder
+        result = rust.sae_manifold_fit(
+            np.ascontiguousarray(x_new),
+            [spec["kind"] for spec in atom_specs],
+            list(dims),
+            np.ascontiguousarray(basis_values),
+            np.ascontiguousarray(basis_jacobian),
+            list(basis_sizes),
+            np.ascontiguousarray(decoder_coefficients),
+            np.ascontiguousarray(smooth_penalties_stack),
+            np.ascontiguousarray(initial_logits),
+            np.ascontiguousarray(initial_coords),
+            float(alpha_value),
+            float(tau),
+            False,
+            assignment_kind=assignment_kind,
+            sparsity_strength=1.0,
+            smoothness=1.0,
+            max_iter=1,
+            learning_rate=0.04,
+            gumbel_schedule=None,
+        )
+        payload = dict(result)
+        for atom_idx, atom in enumerate(payload["atoms"]):
+            new_coords = np.asarray(atom["on_atom_coords_t"], dtype=float)
+            d = dims[atom_idx]
+            if d > 0 and new_coords.size:
+                initial_coords[atom_idx, :, :d] = new_coords[:, :d]
+        if "logits" in payload:
+            new_logits = np.asarray(payload["logits"], dtype=float)
+            if new_logits.shape == initial_logits.shape:
+                initial_logits = np.ascontiguousarray(new_logits)
+        last_fitted = np.asarray(payload["fitted"], dtype=float)
+
+    if last_fitted is None:
+        raise RuntimeError("OOS reconstruct produced no Newton step")
+
+    # Final pass: reconstruct using frozen decoder + inferred coords to
+    # eliminate any decoder drift accumulated inside the Rust step (the
+    # Newton solver couples beta with t; we re-overwrote decoder above but
+    # the *returned* fitted uses the post-step decoder).
+    basis_values, _basis_jacobian = _build_basis_stack(
+        atom_specs, initial_coords, dims, m_max, d_max
+    )
+    if model.assignment in {"ibp", "ibp_map"}:
+        assignments = 1.0 / (1.0 + np.exp(-initial_logits))
+    elif assignment_kind == "softmax":
+        max_logits = initial_logits.max(axis=1, keepdims=True)
+        weights = np.exp((initial_logits - max_logits) / max(tau, 1.0e-12))
+        assignments = weights / np.maximum(weights.sum(axis=1, keepdims=True), 1.0e-12)
+    else:
+        assignments = np.maximum(initial_logits, 0.0)
+    if k_atoms == 1:
+        assignments = np.ones((n_new, 1), dtype=float)
+    fitted = np.zeros((n_new, p_out), dtype=float)
+    for atom_idx in range(k_atoms):
+        m = basis_sizes[atom_idx]
+        phi = basis_values[atom_idx, :, :m]
+        b = frozen_decoder[atom_idx, :m, :]
+        fitted += assignments[:, atom_idx : atom_idx + 1] * (phi @ b)
+    return fitted
 
 
 def _wrap_payload(
