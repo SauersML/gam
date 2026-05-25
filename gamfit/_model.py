@@ -207,7 +207,9 @@ class Model:
                 bool(group_means),
                 template or None,
             )
-            rows_out = rust_module().difference_smooth_rows(self._model_bytes, request_json)
+            rows_out = rust_module().difference_smooth_rows(
+                self._model_bytes, request_json
+            )
         except Exception as exc:
             raise map_exception(exc) from exc
         if return_type == "list":

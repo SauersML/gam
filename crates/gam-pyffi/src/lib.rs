@@ -77,7 +77,7 @@ use gam::terms::{
     ARDPenalty as CoreARDPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry,
     BlockOrthogonalityPenalty as CoreBlockOrthogonalityPenalty,
     DifferenceOpKind, GatedSAEDecoder, IBPAssignmentPenalty as CoreIBPAssignmentPenalty,
-    IsometryPenalty as CoreIsometryPenalty, IvaeRidgeMeanGauge,
+    IsometryPenalty as CoreIsometryPenalty, IvaeRidgeMeanGauge as IvaeRidgeMeanGaugePenalty,
     JumpReLUPenalty as RustJumpReLUPenalty, MaternBasisGradientTarget,
     MechanismSparsityPenalty as CoreMechanismSparsityPenalty,
     NuclearNormPenalty as CoreNuclearNormPenalty, OrthogonalityPenalty as CoreOrthogonalityPenalty,
@@ -921,30 +921,30 @@ fn survival_chunk_iter_collect<'py>(
     let n_times = times_values.len();
 
     let values = py.detach(move || {
-            let mut values = vec![0.0_f64; n_rows * n_times];
-            for row_start in (0..n_rows).step_by(people_chunk) {
-                let row_stop = (row_start + people_chunk).min(n_rows);
-                for time_start in (0..n_times).step_by(time_grid_chunk) {
-                    let time_stop = (time_start + time_grid_chunk).min(n_times);
-                    for row_idx in row_start..row_stop {
-                        let out_row_start = row_idx * n_times;
-                        for time_idx in time_start..time_stop {
-                            let interpolated = survival_csv_interpolate(
-                                &surface_values,
-                                n_cols,
-                                &sorted_grid,
-                                &sorted_indices,
-                                row_idx,
-                                times_values[time_idx],
-                            );
-                            values[out_row_start + time_idx] =
-                                clip_survival_surface_value(interpolated, clip_lo, clip_hi);
-                        }
+        let mut values = vec![0.0_f64; n_rows * n_times];
+        for row_start in (0..n_rows).step_by(people_chunk) {
+            let row_stop = (row_start + people_chunk).min(n_rows);
+            for time_start in (0..n_times).step_by(time_grid_chunk) {
+                let time_stop = (time_start + time_grid_chunk).min(n_times);
+                for row_idx in row_start..row_stop {
+                    let out_row_start = row_idx * n_times;
+                    for time_idx in time_start..time_stop {
+                        let interpolated = survival_csv_interpolate(
+                            &surface_values,
+                            n_cols,
+                            &sorted_grid,
+                            &sorted_indices,
+                            row_idx,
+                            times_values[time_idx],
+                        );
+                        values[out_row_start + time_idx] =
+                            clip_survival_surface_value(interpolated, clip_lo, clip_hi);
                     }
                 }
             }
-            values
-        });
+        }
+        values
+    });
     let out = Array2::from_shape_vec((n_rows, n_times), values).map_err(|err| {
         py_value_error(format!(
             "failed to assemble survival chunk result: {err}"
@@ -13802,6 +13802,112 @@ impl PyTopKActivationPenalty {
     }
 }
 
+#[pyclass(module = "gam_pyffi._rust", name = "JumpReLUPenalty")]
+struct JumpReLUPenalty {
+    #[pyo3(get, set)]
+    target: PyObject,
+    #[pyo3(get, set)]
+    thresholds: Vec<f64>,
+    #[pyo3(get, set)]
+    weight: f64,
+    #[pyo3(get, set)]
+    smoothing_eps: f64,
+    #[pyo3(get, set)]
+    weight_schedule: Option<PyObject>,
+}
+
+#[pymethods]
+impl JumpReLUPenalty {
+    #[new]
+    #[pyo3(signature = (thresholds, weight = 1.0, smoothing_eps = 1.0e-3, *, target = "t", weight_schedule = None))]
+    fn new(
+        py: Python<'_>,
+        thresholds: &Bound<'_, PyAny>,
+        weight: f64,
+        smoothing_eps: f64,
+        target: PyObject,
+        weight_schedule: Option<PyObject>,
+    ) -> PyResult<Self> {
+        let numpy = py.import("numpy")?;
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("dtype", "float")?;
+        let thresholds_array = numpy
+            .call_method("asarray", (thresholds,), Some(&kwargs))?
+            .call_method1("reshape", (-1,))?;
+        let thresholds = thresholds_array
+            .call_method0("tolist")?
+            .extract::<Vec<f64>>()?;
+        if thresholds.is_empty() {
+            return Err(PyValueError::new_err(
+                "JumpReLUPenalty.thresholds must be non-empty",
+            ));
+        }
+        if thresholds
+            .iter()
+            .any(|threshold| !threshold.is_finite() || *threshold <= 0.0)
+        {
+            return Err(PyValueError::new_err(
+                "JumpReLUPenalty.thresholds must be finite and > 0",
+            ));
+        }
+        if !weight.is_finite() || weight <= 0.0 {
+            return Err(PyValueError::new_err(format!(
+                "JumpReLUPenalty.weight must be finite and > 0, got {weight}"
+            )));
+        }
+        if !smoothing_eps.is_finite() || smoothing_eps <= 0.0 {
+            return Err(PyValueError::new_err(format!(
+                "JumpReLUPenalty.smoothing_eps must be finite and > 0, got {smoothing_eps}"
+            )));
+        }
+        Ok(Self {
+            target,
+            thresholds,
+            weight,
+            smoothing_eps,
+            weight_schedule,
+        })
+    }
+
+    #[classattr]
+    const KIND_TAG: &'static str = "jumprelu";
+
+    fn to_rust_descriptor(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let payload = PyDict::new(py);
+        payload.set_item("kind", Self::KIND_TAG)?;
+        payload.set_item("target", target_descriptor(py, self.target.bind(py))?)?;
+        payload.set_item("thresholds", self.thresholds.clone())?;
+        payload.set_item("weight", self.weight)?;
+        payload.set_item("smoothing_eps", self.smoothing_eps)?;
+        if let Some(schedule) = topk_weight_schedule_descriptor(py, &self.weight_schedule)? {
+            payload.set_item("weight_schedule", schedule)?;
+        }
+        Ok(payload.into())
+    }
+
+    fn set_weight_schedule<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        schedule: PyObject,
+    ) -> PyRefMut<'py, Self> {
+        slf.weight_schedule = Some(schedule);
+        slf
+    }
+
+    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        Ok(format!(
+            "JumpReLUPenalty(thresholds={:?}, weight={}, smoothing_eps={}, target={}, weight_schedule={})",
+            self.thresholds,
+            self.weight,
+            self.smoothing_eps,
+            py_repr(py, self.target.bind(py))?,
+            match &self.weight_schedule {
+                Some(schedule) => py_repr(py, schedule.bind(py))?,
+                None => "None".to_string(),
+            }
+        ))
+    }
+}
+
 fn topk_weight_schedule_descriptor(
     _py: Python<'_>,
     schedule: &Option<PyObject>,
@@ -14244,6 +14350,69 @@ impl SoftmaxAssignmentSparsityPenalty {
     }
 }
 
+#[pyclass(module = "gam_pyffi._rust", name = "IsometryPenalty")]
+struct IsometryPenalty {
+    #[pyo3(get, set)]
+    target: PyObject,
+    #[pyo3(get, set)]
+    weight: PyObject,
+    #[pyo3(get, set)]
+    weight_schedule: Option<PyObject>,
+}
+
+#[pymethods]
+impl IsometryPenalty {
+    #[new]
+    #[pyo3(signature = (weight = "auto", *, target = "t", weight_schedule = None))]
+    fn new(
+        py: Python<'_>,
+        weight: PyObject,
+        target: PyObject,
+        weight_schedule: Option<PyObject>,
+    ) -> PyResult<Self> {
+        validate_sparsity_weight(py, weight.bind(py), "IsometryPenalty")?;
+        Ok(Self {
+            target,
+            weight,
+            weight_schedule,
+        })
+    }
+
+    #[classattr]
+    const KIND_TAG: &'static str = "isometry";
+
+    fn to_rust_descriptor(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let payload = PyDict::new(py);
+        payload.set_item("kind", Self::KIND_TAG)?;
+        payload.set_item("target", target_descriptor(py, self.target.bind(py))?)?;
+        payload.set_item("weight", self.weight.bind(py))?;
+        if let Some(schedule) = &self.weight_schedule {
+            payload.set_item("weight_schedule", schedule.bind(py))?;
+        }
+        Ok(payload.into())
+    }
+
+    fn set_weight_schedule<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        schedule: PyObject,
+    ) -> PyRefMut<'py, Self> {
+        slf.weight_schedule = Some(schedule);
+        slf
+    }
+
+    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        Ok(format!(
+            "IsometryPenalty(weight={}, target={}, weight_schedule={})",
+            py_repr(py, self.weight.bind(py))?,
+            py_repr(py, self.target.bind(py))?,
+            match &self.weight_schedule {
+                Some(schedule) => py_repr(py, schedule.bind(py))?,
+                None => "None".to_string(),
+            }
+        ))
+    }
+}
+
 #[pymodule(name = "_rust", gil_used = false)]
 fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     gam::init_parallelism();
@@ -14474,6 +14643,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyTopKActivationPenalty>()?;
     module.add_class::<ARDPenalty>()?;
     module.add_class::<AuxConditionalPriorPenalty>()?;
+    module.add_class::<BlockSparsityPenalty>()?;
     Ok(())
 }
 
