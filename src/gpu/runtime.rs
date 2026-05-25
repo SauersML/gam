@@ -28,6 +28,11 @@ pub struct GpuRuntime {
 
 impl GpuRuntime {
     pub fn probe() -> Result<Option<Self>, GpuProbeError> {
+        if super::global_policy() == super::GpuPolicy::Off {
+            diagnostics::log_cuda_disabled("GPU policy is off");
+            return Ok(None);
+        }
+
         let device_count =
             CudaContext::device_count().map_err(|err| GpuProbeError::Driver(err.to_string()))?;
         if device_count <= 0 {
