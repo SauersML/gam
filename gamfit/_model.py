@@ -794,50 +794,9 @@ class Model:
         target_accept: float | None = None,
         seed: int | None = None,
     ) -> PosteriorSamples:
-        """Draw from the model's posterior with NUTS.
+        """Draw NUTS posterior samples; returns :class:`PosteriorSamples`.
 
-        Returns a :class:`PosteriorSamples` object carrying the raw
-        ``(n_draws, n_coeffs)`` numpy matrix, per-coefficient mean / std /
-        credible intervals, and convergence diagnostics (``rhat``,
-        ``ess``, ``converged``).
-
-        Defaults are dimension-aware — leaving every keyword unset gives
-        you a chain count, warmup length, and total sample budget tuned
-        to the fitted coefficient size (see
-        :func:`gam::hmc::NutsConfig::for_dimension` on the Rust side).
-        That heuristic already covers most usage; the keywords are there
-        for power users who want a longer run, a different acceptance
-        target, or a fixed seed for reproducibility.
-
-        Parameters
-        ----------
-        data:
-            Table-like input matching the model's training schema; the
-            same input formats accepted by :meth:`predict` are supported
-            here.  For survival models, the entry/exit/event columns are
-            consumed in addition to covariates.
-        samples:
-            Posterior draws per chain *after* warmup.  When omitted,
-            chosen automatically from the coefficient count.
-        warmup:
-            Warmup iterations per chain (defaults to ``samples`` when both
-            are left unset, otherwise to the adaptive default).
-        chains:
-            Number of independent chains.  Defaults adaptively to 2 or 4.
-        target_accept:
-            Target HMC acceptance rate in ``(0, 1)``.  Higher values give
-            smaller leapfrog steps and slower-but-more-robust mixing.
-        seed:
-            RNG seed for deterministic chain initialisation.
-
-        Notes
-        -----
-        Sampling currently supports standard GLM family models (Gaussian,
-        Binomial logit/probit/cloglog, Poisson, Gamma — with or without a
-        link-wiggle component) and survival likelihood modes other than
-        the latent and location-scale variants.  Unsupported model
-        classes raise :class:`gamfit.GamError` with a message mirroring
-        the CLI's ``gam sample`` behaviour.
+        Defaults are dimension-aware (see ``gam::hmc::NutsConfig::for_dimension``).
         """
         headers, rows, _table_kind = normalize_table(data)
         payload: dict[str, Any] = {}
@@ -869,18 +828,7 @@ class Model:
         return PosteriorSamples.from_ffi_json(raw, model_bytes=self._model_bytes)
 
     def design_matrix(self, data: Any) -> Any:
-        """Materialised design matrix for ``data`` against the saved model.
-
-        Returns an ``(n_rows, n_coeffs)`` numpy array — exactly the
-        matrix the engine uses internally for linear-predictor
-        evaluation.  Useful for custom posterior reasoning (e.g.
-        feeding draws into your own predictive routine) or for
-        debugging term layouts.
-
-        Currently restricted to standard non-link-wiggle GAM models;
-        other classes raise a clear error pointing at
-        :meth:`Model.predict` for the class-specific prediction path.
-        """
+        """Return the ``(n_rows, n_coeffs)`` design matrix for ``data`` (standard models only)."""
         import numpy as np
 
         headers, rows, _ = normalize_table(data)
@@ -936,12 +884,10 @@ class Model:
         posterior coefficient simulation using the max standardized deviation
         across the whole grid.
         """
-        import json
-
         request: dict[str, Any] = {
             "view": view,
             "group": group,
-            "pairs": pairs,
+            "pairs": [[str(a), str(b)] for a, b in pairs] if pairs is not None else None,
             "n": int(n),
             "level": float(level),
             "simultaneous": bool(simultaneous),
