@@ -176,6 +176,8 @@ def geometry_log_map(
             # Normalize a single base row via the sphere_log_map FFI by mapping
             # the base to itself: the impl normalizes its base argument internally.
             base_point = np.asarray(base, dtype=float).reshape(-1)
+            # Category (b): one-line norm + scalar guard on the user-supplied base
+            # point before handing off to sphere_log_map (which renormalizes internally).
             norm = float(np.linalg.norm(base_point))
             if norm <= 0.0:
                 raise ValueError("spherical base point must have non-zero norm")
