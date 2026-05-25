@@ -316,7 +316,7 @@ fn transpose_design_times_dense(
     if let Some(dense) = design.as_dense() {
         // Xᵀ · M  ≡  fast_atb(X, M). The kernel is generic over storage,
         // so pass `dense` and `m` as views — no `n × p` / `n × r` copies.
-        let xt_m = fast_atb(&dense, m);
+        let xt_m = fast_atb(dense, m);
         return Ok(xt_m);
     }
     // Generic path: column-by-column applies — preserves whatever
