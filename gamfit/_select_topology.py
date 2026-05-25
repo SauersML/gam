@@ -44,13 +44,6 @@ class _Candidate:
     topology: Smooth
 
 
-@dataclass(frozen=True, slots=True)
-class _TopologyTerm:
-    call: str
-    options: tuple[str, ...]
-    required_dim: int | None
-
-
 BasisSpec: TypeAlias = Smooth
 ScoreKind: TypeAlias = Literal["reml", "laml", "bic", "tk"]
 ScoreScale: TypeAlias = Literal["per_observation", "per_effective_dim", "raw"]
@@ -282,101 +275,17 @@ def _formula_from_response(data: Any, response: str) -> tuple[str, int, int]:
 
 
 def _find_auto_smooth_call(formula: str) -> tuple[int, int, str]:
-    match = _SMOOTH_CALL_RE.search(formula)
-    while match is not None:
-        open_paren = match.end() - 1
-        close_paren = _matching_paren(formula, open_paren)
-        term = formula[match.start() : close_paren + 1]
-        if _AUTO_RE.search(term):
-            return match.start(), close_paren + 1, term
-        match = _SMOOTH_CALL_RE.search(formula, close_paren + 1)
+    """Return a sentinel triple when `formula` contains a `type=AUTO` smooth.
+
+    The Rust formula assembler does its own AUTO scan, paren matching, and
+    argument splitting; this Python wrapper only needs to signal presence vs.
+    absence. The returned tuple's interior is intentionally a sentinel — the
+    sole consumer (`_formula_for_candidate`) ignores it and routes through
+    the Rust pyfunction.
+    """
+    if _AUTO_RE.search(formula):
+        return _AUTO_PRESENT
     raise ValueError("select_topology requires one s(..., type=AUTO) smooth term")
-
-
-def _matching_paren(text: str, open_paren: int) -> int:
-    depth = 1
-    quote: str | None = None
-    i = open_paren + 1
-    while i < len(text):
-        ch = text[i]
-        if quote is not None:
-            if ch == quote:
-                quote = None
-        elif ch in {"'", '"'}:
-            quote = ch
-        elif ch == "(":
-            depth += 1
-        elif ch == ")":
-            depth -= 1
-            if depth == 0:
-                return i
-        i += 1
-    raise ValueError("select_topology: AUTO smooth has unbalanced parentheses")
-
-
-def _split_top_level_args(arg_text: str) -> list[str]:
-    args: list[str] = []
-    start = 0
-    depth = 0
-    quote: str | None = None
-    for i, ch in enumerate(arg_text):
-        if quote is not None:
-            if ch == quote:
-                quote = None
-        elif ch in {"'", '"'}:
-            quote = ch
-        elif ch in "([{":
-            depth += 1
-        elif ch in ")]}":
-            depth -= 1
-        elif ch == "," and depth == 0:
-            args.append(arg_text[start:i].strip())
-            start = i + 1
-    tail = arg_text[start:].strip()
-    if tail:
-        args.append(tail)
-    return args
-
-
-def _auto_call_parts(term: str) -> tuple[list[str], list[str], set[str]]:
-    open_paren = term.index("(")
-    arg_text = term[open_paren + 1 : -1]
-    args = _split_top_level_args(arg_text)
-    vars: list[str] = []
-    options: list[str] = []
-    option_keys: set[str] = set()
-    for arg in args:
-        key = _named_arg_key(arg)
-        if key is None:
-            vars.append(arg)
-            continue
-        if key == "type":
-            continue
-        option_keys.add(key)
-        if key in {"periodic", "cyclic", "bc", "period", "periods", "origin", "origins"}:
-            continue
-        options.append(arg)
-    if not vars:
-        raise ValueError("select_topology: AUTO smooth must have at least one covariate")
-    return vars, options, option_keys
-
-
-def _named_arg_key(arg: str) -> str | None:
-    depth = 0
-    quote: str | None = None
-    for ch in arg:
-        if quote is not None:
-            if ch == quote:
-                quote = None
-        elif ch in {"'", '"'}:
-            quote = ch
-        elif ch in "([{":
-            depth += 1
-        elif ch in ")]}":
-            depth -= 1
-        elif ch == "=" and depth == 0:
-            return arg.split("=", 1)[0].strip().lower()
-    return None
 
 
 def _formula_for_candidate(
@@ -386,91 +295,85 @@ def _formula_for_candidate(
     *,
     strict_dimension: bool,
 ) -> str | None:
-    start, end, term = auto
-    vars, user_options, option_keys = _auto_call_parts(term)
-    topo_term = _topology_term(candidate, option_keys)
-    if topo_term.required_dim is not None and len(vars) != topo_term.required_dim:
-        message = (
-            f"{candidate.name} needs {topo_term.required_dim}-D covariate; "
-            f"AUTO smooth has {len(vars)} covariate"
-            f"{'' if len(vars) == 1 else 's'} ({', '.join(vars)})"
+    """Replace the `type=AUTO` term in `formula` with the candidate-specific term.
+
+    The formula-string surgery (paren matching, comma splitting, option
+    emission, dimension checks) lives in Rust. This wrapper translates the
+    Python `Smooth` subclass instance into a typed JSON description and
+    invokes the Rust assembler.
+    """
+    # The `auto` argument is kept for backwards-compatible signature; the
+    # Rust assembler does its own AUTO scan and the sentinel carries no state.
+    del auto
+    from . import _rust
+
+    payload = _candidate_to_rust_payload(candidate)
+    try:
+        result = _rust.assemble_candidate_formula(
+            formula,
+            json.dumps(payload),
+            strict_dimension,
         )
-        if strict_dimension:
-            raise ValueError(message)
-        return None
-    candidate_args = vars + user_options + list(topo_term.options)
-    candidate_term = f"{topo_term.call}({', '.join(candidate_args)})"
-    return formula[:start] + candidate_term + formula[end:]
+    except ValueError as exc:
+        raise ValueError(str(exc)) from exc
+    return result
 
 
-def _topology_term(candidate: _Candidate, option_keys: set[str]) -> _TopologyTerm:
+def _candidate_to_rust_payload(candidate: _Candidate) -> dict[str, Any]:
+    """Translate a Python `Smooth` topology into the typed JSON shape the
+    Rust formula assembler consumes.
+    """
     topo = candidate.topology
-    has_size = bool(_SIZE_OPTION_KEYS & option_keys)
     if isinstance(topo, PeriodicSplineCurve):
-        options = ["type=cyclic"]
-        if not has_size:
-            options.append(f"k={topo.n_knots}")
-        if topo.degree != 3:
-            options.append(f"degree={topo.degree}")
-        if topo.penalty_order != 2:
-            options.append(f"penalty_order={topo.penalty_order}")
-        return _TopologyTerm("s", tuple(options), 1)
+        return {
+            "kind": "periodic_spline_curve",
+            "n_knots": int(topo.n_knots),
+            "degree": int(topo.degree),
+            "penalty_order": int(topo.penalty_order),
+        }
     if isinstance(topo, Sphere):
-        options = ["type=sphere"]
-        if not has_size:
-            options.append(f"centers={topo.n_centers}")
-        if topo.penalty_order != 2:
-            options.append(f"penalty_order={topo.penalty_order}")
-        if topo.kernel != "sobolev":
-            options.append(f"kernel={_quote(topo.kernel)}")
-        if topo.radians:
-            options.append("radians=true")
-        return _TopologyTerm("s", tuple(options), 2)
+        return {
+            "kind": "sphere",
+            "n_centers": int(topo.n_centers),
+            "penalty_order": int(topo.penalty_order),
+            "kernel": str(topo.kernel),
+            "radians": bool(topo.radians),
+        }
     if isinstance(topo, TensorBSpline):
-        options: list[str] = []
-        k = getattr(topo, "_gamfit_tensor_k", None)
-        if not has_size and k is not None:
-            options.append(f"k={_format_int_list(k)}")
-        periodic = tuple(bool(marginal.periodic) for marginal in topo.marginals)
-        if any(periodic):
-            options.append(f"periodic={_format_bool_list(periodic)}")
-            periods = getattr(
-                topo,
-                "_gamfit_tensor_periods",
-                tuple("2*pi" if value else None for value in periodic),
-            )
-            options.append(f"period={_format_period_list(periods)}")
-        options.append("identifiability=sum_tozero")
-        return _TopologyTerm("te", tuple(options), len(topo.marginals))
+        k_attr = getattr(topo, "_gamfit_tensor_k", None)
+        periodic = [bool(marginal.periodic) for marginal in topo.marginals]
+        periods_attr = getattr(topo, "_gamfit_tensor_periods", None)
+        periods_payload: list[str | None] | None
+        if periods_attr is None:
+            periods_payload = None
+        else:
+            periods_payload = [
+                None if value is None else str(value)
+                for value in periods_attr
+            ]
+        return {
+            "kind": "tensor",
+            "k": [int(value) for value in (k_attr or ())],
+            "periodic": periodic,
+            "periods": periods_payload,
+        }
     if isinstance(topo, Duchon):
-        periodic = tuple(bool(v) for v in topo.periodic_per_axis or ())
-        if periodic:
-            raise ValueError(
-                "select_topology cannot fit per-axis periodic Duchon candidates "
-                "through the formula AUTO path; use topology.Cylinder or "
-                "topology.Torus tensor candidates"
-            )
-        options = ["type=duchon", f"order={_duchon_formula_order(topo)}"]
-        if not has_size and isinstance(topo.centers, int):
-            options.append(f"centers={topo.centers}")
-        if topo.length_scale is not None:
-            options.append(f"length_scale={float(topo.length_scale)!r}")
-        required_dim = _candidate_required_dim(topo)
-        return _TopologyTerm("s", tuple(options), required_dim)
+        per_axis_periodic = bool(
+            any(bool(v) for v in (topo.periodic_per_axis or ()))
+        )
+        centers_int = int(topo.centers) if isinstance(topo.centers, int) else None
+        length_scale = (
+            None if topo.length_scale is None else float(topo.length_scale)
+        )
+        return {
+            "kind": "duchon",
+            "m": int(topo.m),
+            "centers_int": centers_int,
+            "per_axis_periodic": per_axis_periodic,
+            "length_scale": length_scale,
+            "required_dim": _candidate_required_dim(topo),
+        }
     raise TypeError(f"unsupported topology candidate {type(topo).__name__}")
-
-
-def _format_int_list(values: Sequence[Any]) -> str:
-    return "[" + ", ".join(str(int(value)) for value in values) + "]"
-
-
-def _format_bool_list(values: Sequence[bool]) -> str:
-    return "[" + ", ".join("true" if value else "false" for value in values) + "]"
-
-
-def _format_period_list(values: Sequence[Any]) -> str:
-    parts = ["None" if value is None else str(value) for value in values]
-    return "[" + ", ".join(parts) + "]"
 
 
 def _candidate_required_dim(topo: Smooth) -> int | None:
@@ -571,11 +474,6 @@ def _infer_candidate_name(topo: Smooth) -> str | None:
             return "Torus"
         return "EuclideanPatch"
     return None
-
-
-def _quote(value: str) -> str:
-    escaped = value.replace("\\", "\\\\").replace("'", "\\'")
-    return f"'{escaped}'"
 
 
 def _normalize_score_kind(score: str) -> ScoreKind:
@@ -886,15 +784,18 @@ class TopologyAutoSelector:
         penalties: Sequence[Any] | None = None,
         **fit_kwargs: Any,
     ) -> TopologyAutoSelectorResult:
+        from . import _rust
+
         latent_name, latent = _single_latent(latents, self.latent)
         n_obs = _n_obs(data, latent_name, latent)
         auto = _maybe_auto_smooth(formula)
         normalized = _normalize_selector_candidates(self.candidates, latent.d)
 
-        ranks: list[TopologyAutoSelectorRank] = []
+        evidence_inputs: list[dict[str, Any]] = []
+        models_by_name: dict[str, Any] = {}
+        raw_reml_by_name: dict[str, float] = {}
+        effective_dim_by_name: dict[str, float] = {}
         errors: dict[str, str] = {}
-        comparison_fits: list[dict[str, float]] = []
-        comparison_names: list[str] = []
 
         for candidate in normalized:
             try:
@@ -909,42 +810,61 @@ class TopologyAutoSelector:
                 )
                 raw_reml = _extract_reml_score_raw(model)
                 effective_dim = _effective_dim(model)
-                tk_score = _tk_normalized_score(
-                    model,
-                    raw_reml,
-                    effective_dim,
-                    n_obs,
-                    self.score_scale,
-                )
-                rank = (
-                    candidate.name,
-                    tk_score,
-                    raw_reml,
-                    effective_dim,
-                    n_obs,
-                    model,
-                )
+                null_dim = _extract_null_dim(model)
+                if null_dim is None:
+                    raise ValueError(
+                        "TopologyAutoSelector requires TK null-dimension metadata; "
+                        "fit summary is missing null_dim"
+                    )
             except Exception as exc:
                 errors[candidate.name] = str(exc)
                 continue
-            ranks.append(rank)
-            comparison_names.append(candidate.name)
-            comparison_fits.append({"reml_score": tk_score, "edf": effective_dim})
+            models_by_name[candidate.name] = model
+            raw_reml_by_name[candidate.name] = float(raw_reml)
+            effective_dim_by_name[candidate.name] = float(effective_dim)
+            evidence_inputs.append(
+                {
+                    "name": candidate.name,
+                    "raw_reml": float(raw_reml),
+                    "null_dim": float(null_dim),
+                    "null_space_logdet": _extract_null_hessian_logdet(model),
+                    "effective_dim": float(effective_dim),
+                    "n_obs": int(n_obs),
+                }
+            )
 
-        if not ranks:
+        if not evidence_inputs:
             detail = "; ".join(f"{name}: {err}" for name, err in errors.items())
             raise ValueError(
                 "TopologyAutoSelector found no fittable topology candidates"
                 + (f" ({detail})" if detail else "")
             )
 
-        compared = compare_models(comparison_fits, names=comparison_names)
-        order = [name for name, *_ in compared["ranking"]]
-        by_name = {rank[0]: rank for rank in ranks}
-        ranked = [by_name[name] for name in order]
+        ranking_json = _rust.rank_topology_candidates(
+            json.dumps(
+                {
+                    "score_scale": self.score_scale,
+                    "candidates": evidence_inputs,
+                }
+            )
+        )
+        ranking = json.loads(ranking_json)
+        ranked: list[TopologyAutoSelectorRank] = []
+        for entry in ranking["ranked"]:
+            name = entry["name"]
+            ranked.append(
+                (
+                    name,
+                    float(entry["tk_score"]),
+                    raw_reml_by_name[name],
+                    effective_dim_by_name[name],
+                    int(entry["n_obs"]),
+                    models_by_name[name],
+                )
+            )
         return TopologyAutoSelectorResult(
             ranked=ranked,
-            winner=ranked[0],
+            winner=ranked[ranking["winner_index"]],
             errors=errors,
         )
 
@@ -1086,26 +1006,6 @@ def _latent_for_topology(latent: LatentCoord, name: str) -> LatentCoord:
         retraction=getattr(latent, "retraction", "euclidean"),
         name=latent.name,
     )
-
-
-def _tk_normalized_score(
-    model: Any,
-    raw_reml: float,
-    effective_dim: float,
-    n_obs: int,
-    score_scale: TopologyScoreScale,
-) -> float:
-    null_dim = _extract_null_dim(model)
-    if null_dim is None:
-        raise ValueError(
-            "TopologyAutoSelector requires TK null-dimension metadata; "
-            "fit summary is missing null_dim"
-        )
-    score = raw_reml + _tierney_kadane_normalizer_from_null_dim(
-        null_dim,
-        _extract_null_hessian_logdet(model),
-    )
-    return _scale_score(score, score_scale, n_obs, effective_dim)
 
 
 def _normalize_selector_score_scale(score_scale: str) -> TopologyScoreScale:

@@ -12,10 +12,6 @@ from typing import Any
 from ._binding import rust_module
 
 
-def _extract_reml_score(fit: Any) -> float:
-    return float(rust_module().extract_reml_score(fit))
-
-
 def _extract_reml_score_raw(fit: Any) -> float:
     return float(rust_module().extract_reml_score_raw(fit))
 
