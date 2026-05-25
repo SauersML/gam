@@ -8,11 +8,12 @@ and returns predictions on the user's original device and dtype.
 Limitation. The forward pass crosses the numpy / Rust boundary, so PyTorch's
 autograd cannot construct an analytic gradient with respect to the input
 features. Gradients flowing back to ``X`` are therefore *not* supported in
-this v1 implementation; the module is frozen by design (model coefficients are
-registered as buffers, not parameters). A future revision can re-evaluate the
-smooths inside torch to enable input-gradient flow; until then, use this when
-the GAM is a fixed feature transform and you want a small torch ``nn.Module``
-that can sit alongside other modules in your training loop.
+this v1 implementation; the module is frozen by design because it exposes no
+trainable parameters and delegates prediction to the fitted model. A future
+revision can re-evaluate the smooths inside torch to enable input-gradient
+flow; until then, use this when the GAM is a fixed feature transform and you
+want a small torch ``nn.Module`` that can sit alongside other modules in your
+training loop.
 """
 
 from __future__ import annotations
