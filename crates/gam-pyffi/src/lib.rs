@@ -33,6 +33,7 @@ use gam::gaussian_reml::{
 use gam::geometry::poincare::{
     exp_origin as poincare_exp_origin_impl, from_lorentz as poincare_from_lorentz_impl,
     log_origin as poincare_log_origin_impl,
+    lorentz_decode_backward as poincare_lorentz_decode_backward_impl,
     lorentz_decode_forward as poincare_lorentz_decode_forward_impl,
     lorentz_exp_origin as poincare_lorentz_exp_origin_impl,
     lorentz_log_origin as poincare_lorentz_log_origin_impl,
@@ -16786,6 +16787,40 @@ fn poincare_lorentz_decode_forward<'py>(
             .map_err(|e| e.to_string())
     })?;
     Ok(out.into_pyarray(py).unbind())
+}
+
+/// Backward pass for the Lorentz-path decoder. Consumes the cache returned
+/// by `poincare_tangent_decode_forward` (the Poincaré and Lorentz tangent
+/// decoders are algebraically the same function of the inputs, so the
+/// Poincaré cache is the right state to differentiate from). Returns
+/// `(grad_gates, grad_atoms)`.
+#[pyfunction]
+fn poincare_lorentz_decode_backward<'py>(
+    py: Python<'py>,
+    atoms_projected: PyReadonlyArray2<'py, f64>,
+    gates: PyReadonlyArray2<'py, f64>,
+    v: PyReadonlyArray2<'py, f64>,
+    tangents: PyReadonlyArray2<'py, f64>,
+    grad_x_hat: PyReadonlyArray2<'py, f64>,
+    curvature: f64,
+) -> PyResult<(Py<PyArray2<f64>>, Py<PyArray2<f64>>)> {
+    let atoms_p = atoms_projected.as_array().to_owned();
+    let gates_owned = gates.as_array().to_owned();
+    let v_owned = v.as_array().to_owned();
+    let tangents_owned = tangents.as_array().to_owned();
+    let grad_owned = grad_x_hat.as_array().to_owned();
+    let (gg, ga) = detach_py_result(py, "poincare_lorentz_decode_backward", move || {
+        let cache = gam::geometry::poincare::TangentDecodeCache {
+            atoms_projected: atoms_p,
+            gates: gates_owned,
+            v: v_owned,
+            tangents: tangents_owned,
+            curvature,
+        };
+        poincare_lorentz_decode_backward_impl(&cache, grad_owned.view())
+            .map_err(|e| e.to_string())
+    })?;
+    Ok((gg.into_pyarray(py).unbind(), ga.into_pyarray(py).unbind()))
 }
 
 #[pyfunction(signature = (values, base, coordinates, reference = -1))]
