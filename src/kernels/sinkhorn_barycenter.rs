@@ -146,6 +146,8 @@ fn log_vector_is_sentinel_saturated(log_x: ArrayView1<'_, f64>) -> bool {
 
 /// Numerically-stable softmax of a 1-D log-vector. Subtracts the max
 /// before `exp`, then re-normalizes. Returns a simplex (sums to 1).
+/// Sentinel-saturated vectors are rejected instead of normalized into
+/// a misleading uniform distribution.
 fn softmax_1d(log_x: ArrayView1<'_, f64>) -> Result<Array1<f64>, String> {
     let m = log_x.len();
     if m == 0 {

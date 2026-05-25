@@ -84,6 +84,7 @@ from .penalties import (
     JumpReLUPenalty,
     LazyPcaBasis,
     MechanismSparsityPenalty,
+    MonotonicityPenalty,
     RiemannianRetraction,
     TopologyAutoSelector,
 )
@@ -132,6 +133,7 @@ __all__ = [
     "skip_transcoder",
     "GatedSAEDecoder",
     "MechanismSparsityPenalty",
+    "MonotonicityPenalty",
     "RiemannianRetraction",
     "SoftmaxAssignmentSparsityPenalty",
     "SparsityPenalty",

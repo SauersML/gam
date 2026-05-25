@@ -1349,6 +1349,71 @@ mod tests {
         assert!(pld.u_null.is_none());
     }
 
+    /// Regression test for issue #192.
+    ///
+    /// Constructs an assembled penalty matrix with one structurally-null direction
+    /// and one barely-active eigenvalue whose unridged magnitude (`λ_k σ_k = 1e-10`)
+    /// is many orders of magnitude smaller than the ridge (`r = 1e-4`).
+    ///
+    /// In the assembled matrix `S_active + r·I`, the eigenvalues are
+    /// `[r, r + 1e-10]` (ascending). The structural-null direction is the one
+    /// with eigenvalue `r`; the barely-active direction is at `r + 1e-10`.
+    /// Both lie well below the "positive eigenvalue threshold" used by the
+    /// generic `from_assembled` heuristic, so without a structural-nullity
+    /// hint, both would be discarded.
+    ///
+    /// The fix routes through eigenvalue-based detection: with `ridge = 1e-4`
+    /// and `m0 = 1`, we identify only the eigenvalue within tolerance of `r`
+    /// as null, and keep `r + 1e-10` in `log|S|₊`.
+    #[test]
+    fn test_assembled_eigenvalue_based_null_detection_issue_192() {
+        let ridge = 1e-4_f64;
+        let active_eval = 1e-10_f64; // λ_k σ_k strictly less than ridge.
+        // Diagonal assembled matrix: structural null at index 1, active at index 0.
+        // After eigendecomposition the sorted (ascending) eigenvalues are
+        // [r, r + 1e-10], which is exactly what the new detection rule expects.
+        let s = array![[ridge + active_eval, 0.0], [0.0, ridge]];
+
+        let pld =
+            PenaltyPseudologdet::from_assembled_with_nullity(s.clone(), Some(ridge), Some(1))
+                .expect("ridged assembled with structural nullity");
+
+        assert_eq!(pld.rank(), 1, "rank must equal p_dim − m0");
+        let expected = (ridge + active_eval).ln();
+        assert!(
+            (pld.value() - expected).abs() < 1e-14,
+            "log|S|₊ should retain the barely-active eigenvalue {} but got {}",
+            expected,
+            pld.value()
+        );
+
+        // Sanity: the U₀ direction must align with the structurally-null axis
+        // (the second canonical basis vector here, since that eigenvalue is r).
+        let u0 = pld.u_null.as_ref().expect("nullspace basis present");
+        assert_eq!(u0.ncols(), 1);
+        let aligned = u0[[1, 0]].abs();
+        assert!(
+            aligned > 0.999,
+            "null direction should align with e_1 (eigenvalue r); got |u0[1,0]| = {aligned}"
+        );
+
+        // If the caller lies about the nullity (e.g. claims m0 = 1 when no
+        // eigenvalue lies near the ridge), the new rule must surface the
+        // invariant violation rather than silently discarding an active
+        // direction.
+        let s_no_null = array![[1.0 + ridge, 0.0], [0.0, 2.0 + ridge]];
+        let err = PenaltyPseudologdet::from_assembled_with_nullity(
+            s_no_null,
+            Some(ridge),
+            Some(1),
+        )
+        .expect_err("must error when no eigenvalue clusters near ridge");
+        assert!(
+            err.contains("structural nullity invariant violated"),
+            "unexpected error message: {err}"
+        );
+    }
+
     /// Verify that the pseudo-logdet of a rank-deficient matrix
     /// ignores the null eigenvalues.
     #[test]

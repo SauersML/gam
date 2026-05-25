@@ -2687,9 +2687,8 @@ mod tests {
     #[test]
     fn firth_reduced_fisher_logdet_is_finite_for_barely_pd_matrix() {
         let fisher = array![[16.0, 0.0], [0.0, 1e-15]];
-        let (k_reduced, half_log_det) =
-            RemlState::reduced_fisher_inverse_and_half_logdet(&fisher)
-                .expect("barely positive-definite reduced fisher");
+        let (k_reduced, half_log_det) = RemlState::reduced_fisher_inverse_and_half_logdet(&fisher)
+            .expect("barely positive-definite reduced fisher");
         let expected = 0.5 * 16.0_f64.ln();
 
         assert!(

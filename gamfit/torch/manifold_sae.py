@@ -778,13 +778,24 @@ class ManifoldSAE(nn.Module):
         flat = self.decoder_blocks.reshape(-1, self.cfg.input_dim)
         return self._ortho_penalty(flat)
 
+    def decoder_monotonicity_penalty(self) -> torch.Tensor:
+        """Rust ``monotonicity`` descriptor along each atom's basis-coefficient axis."""
+        if self._monotonicity_penalty is None:
+            return self.decoder_blocks.new_zeros(())
+        # The Rust penalty walks adjacent rows along the leading axis of a
+        # row-major (n_eff, d) block. We apply it per-atom by summing.
+        total = self.decoder_blocks.new_zeros(())
+        for i in range(int(self.cfg.n_atoms)):
+            total = total + self._monotonicity_penalty(self.decoder_blocks[i])
+        return total
+
     def sparsity_penalty(self, logits: torch.Tensor) -> torch.Tensor:
         """Rust-backed sparsity penalty value at ``logits``."""
         return self.sparsity.penalty(logits)
 
     def regularization(self, logits: torch.Tensor | None = None) -> torch.Tensor:
         """Sum of Rust-backed regularizers used by the loss."""
-        reg = self.decoder_ortho_penalty()
+        reg = self.decoder_ortho_penalty() + self.decoder_monotonicity_penalty()
         if logits is not None:
             reg = reg + self.sparsity_penalty(logits)
         return reg
