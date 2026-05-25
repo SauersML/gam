@@ -248,16 +248,21 @@ class SurvivalPrediction:
         if grid is None or surface is None:
             return None
         if self._should_auto_chunk_dense(surface.shape[0], times_arr.size):
-            return self._collect_chunks(
-                self._ffi_surface_at_chunks(
-                    kind,
+            import numpy as np
+
+            clip_lo, clip_hi = clip
+            return np.asarray(
+                rust_module().survival_chunk_iter_collect(
+                    grid,
+                    surface,
                     times_arr,
-                    clip=clip,
-                    people_chunk=DEFAULT_SURVIVAL_PEOPLE_CHUNK,
-                    time_grid_chunk=DEFAULT_SURVIVAL_TIME_GRID_CHUNK,
+                    kind,
+                    clip_lo,
+                    clip_hi,
+                    DEFAULT_SURVIVAL_PEOPLE_CHUNK,
+                    DEFAULT_SURVIVAL_TIME_GRID_CHUNK,
                 ),
-                n_rows=surface.shape[0],
-                n_times=times_arr.size,
+                dtype=float,
             )
         return _interpolate_rows(grid, surface, times_arr, clip=clip)
 
