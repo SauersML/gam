@@ -5458,7 +5458,7 @@ impl SurvivalMarginalSlopeFamily {
         beta: &Array1<f64>,
         delta: &Array1<f64>,
     ) -> Result<Option<f64>, String> {
-        let Some(constraints) = self.time_linear_constraints.as_ref() else {
+        let Some(constraints) = self.effective_time_linear_constraints()? else {
             return Ok(None);
         };
         if beta.len() != constraints.a.ncols() || delta.len() != constraints.a.ncols() {
@@ -5494,6 +5494,21 @@ impl SurvivalMarginalSlopeFamily {
         } else {
             Ok(Some((0.995 * alpha).clamp(0.0, 1.0)))
         }
+    }
+
+    fn effective_time_linear_constraints(&self) -> Result<Option<LinearInequalityConstraints>, String> {
+        if let Some(constraints) = self.time_linear_constraints.as_ref() {
+            return Ok(Some(constraints.clone()));
+        }
+        append_timewiggle_tail_nonnegative_constraints(
+            time_derivative_guard_constraints(
+                &self.design_derivative_exit,
+                self.derivative_offset_exit.as_ref(),
+                self.derivative_guard,
+            )?,
+            self.design_exit.ncols(),
+            self.time_wiggle_ncols,
+        )
     }
 
     fn validate_time_qd1_feasible(&self, beta: &Array1<f64>, label: &str) -> Result<(), String> {

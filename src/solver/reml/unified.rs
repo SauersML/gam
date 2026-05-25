@@ -5222,11 +5222,7 @@ impl ProjectedKktResidual {
     /// constructed residual. Builder-style so the legacy construction
     /// path (`from_projected` then `with_metadata`) reads as a single
     /// inline expression at the call site.
-    pub(crate) fn with_metadata(
-        mut self,
-        residual_tol: f64,
-        free_rank: usize,
-    ) -> Self {
+    pub(crate) fn with_metadata(mut self, residual_tol: f64, free_rank: usize) -> Self {
         self.residual_tol = Some(residual_tol);
         self.free_rank = Some(free_rank);
         self

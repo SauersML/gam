@@ -781,8 +781,7 @@ fn time_derivative_guard_constraints(
                     "time derivative guard constraints require finite derivative offsets; found offset[{row}]={offset}"
                 ) }.into());
             }
-            if offset + 1e-12 * (1.0 + offset.abs().max(derivative_guard.abs()))
-                < derivative_guard
+            if offset + 1e-12 * (1.0 + offset.abs().max(derivative_guard.abs())) < derivative_guard
             {
                 return Err(SurvivalLocationScaleError::ConstraintViolation { reason: format!(
                     "time derivative guard is infeasible at row {row}: offset={offset:.3e} < guard={derivative_guard:.3e} with no time coefficients"

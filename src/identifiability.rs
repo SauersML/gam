@@ -813,7 +813,10 @@ mod tests {
         let pen = ConditionalPriorIvae::new(mean, scale, 1.0).unwrap();
         let (v, g) = pen.value_and_grad(t.view());
         let expected = log_norm + 0.5 * (n * d) as f64 * (2.0 * std::f64::consts::PI).ln();
-        assert!((v - expected).abs() < 1e-9, "value {v} vs expected {expected}");
+        assert!(
+            (v - expected).abs() < 1e-9,
+            "value {v} vs expected {expected}"
+        );
         for &gv in g.iter() {
             assert!(gv.abs() < 1e-12);
         }

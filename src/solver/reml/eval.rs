@@ -363,7 +363,10 @@ impl<'a> RemlState<'a> {
         let highgrad = grad_norm > HIGHGRAD_REL_TOL * cost_scale;
         if !near_boundary && !highgrad {
             // Keep the hot path cheap when the local linearization is likely sufficient.
-            return first_order_correction;
+            return self.finalize_smoothing_outcome(first_order_routine(
+                first_order_correction,
+                "linearization sufficient: not near boundary and outer gradient is small",
+            ));
         }
 
         // If the first-order path used a rank-deficient pseudo-inverse, the
