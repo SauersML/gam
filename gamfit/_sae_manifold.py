@@ -994,6 +994,8 @@ def _duchon_basis_local(t: np.ndarray, spec: Duchon) -> tuple[np.ndarray, np.nda
 
 
 def _periodic_fourier_basis(t: np.ndarray, n_harmonics: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if hasattr(rust_module(), "periodic_basis_with_jet"):
+        return rust_module().periodic_basis_with_jet(t, n_harmonics)
     x = np.mod(t, 1.0)
     cols = [np.ones_like(x)]
     dcols = [np.zeros_like(x)]
