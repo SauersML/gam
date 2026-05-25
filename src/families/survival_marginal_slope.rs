@@ -17110,11 +17110,17 @@ fn validate_spec(spec: &SurvivalMarginalSlopeTermSpec) -> Result<(), String> {
         }
         .into());
     }
-    if !spec.time_block.structural_monotonicity {
+    if !spec.time_block.time_monotonicity.requires_row_constraints()
+        && !matches!(
+            spec.time_block.time_monotonicity,
+            crate::families::survival_location_scale::TimeBlockMonotonicity::StructuralISpline
+        )
+    {
         return Err(SurvivalMarginalSlopeError::UnsupportedConfiguration {
-            reason:
-                "survival-marginal-slope requires structural time monotonicity by construction; non-structural time transforms are no longer supported"
-                    .to_string(),
+            reason: format!(
+                "survival-marginal-slope requires a row-constraint or structural-I-spline time block; got {:?}",
+                spec.time_block.time_monotonicity
+            ),
         }
         .into());
     }
