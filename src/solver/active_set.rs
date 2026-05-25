@@ -220,26 +220,12 @@ pub(crate) fn compute_constraint_kkt_diagnostics(
         for (r, &idx) in active_idx.iter().enumerate() {
             a_active.row_mut(r).assign(&constraints.a.row(idx));
         }
-        let mut gram = a_active.dot(&a_active.t());
-        let mut rhs = a_active.dot(gradient);
-        let ridge_scale = gram.diag().iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
-        // The ridge only exists to let the SPD solve succeed when active
-        // rows of A are linearly dependent (singular Gram). A larger ridge
-        // biases the Lagrange multipliers and manifests as a stationarity
-        // residual of the same magnitude at perfectly-conditioned active
-        // constraints. Use a ULP-scale floor instead so stationarity
-        // vanishes to machine precision when Gram is well-conditioned.
-        let ridge = f64::EPSILON * ridge_scale.max(1.0);
-        for i in 0..n_active {
-            gram[[i, i]] += ridge;
-        }
-        let mut lambda_active = Array1::<f64>::zeros(n_active);
-        if solve_symmetric_system(&gram, &rhs, &mut lambda_active).is_ok() {
+        if let Some((_, lambda_active)) =
+            project_stationarity_residual_on_constraint_cone(gradient, &a_active)
+        {
             for (r, &idx) in active_idx.iter().enumerate() {
                 lambda[idx] = lambda_active[r];
             }
-        } else {
-            rhs.fill(0.0);
         }
     }
 
@@ -264,6 +250,69 @@ pub(crate) fn compute_constraint_kkt_diagnostics(
         stationarity,
         active_tolerance,
     }
+}
+
+pub(crate) fn project_stationarity_residual_on_constraint_cone(
+    residual: &Array1<f64>,
+    active_a: &Array2<f64>,
+) -> Option<(Array1<f64>, Array1<f64>)> {
+    let p = residual.len();
+    if active_a.ncols() != p {
+        return None;
+    }
+    if active_a.nrows() == 0 {
+        return Some((residual.clone(), Array1::zeros(0)));
+    }
+
+    let mut active_rows: Vec<usize> = (0..active_a.nrows()).collect();
+    for _ in 0..active_a.nrows().max(1) {
+        let k = active_rows.len();
+        if k == 0 {
+            return Some((residual.clone(), Array1::zeros(active_a.nrows())));
+        }
+
+        let mut a_work = Array2::<f64>::zeros((k, p));
+        for (pos, &row) in active_rows.iter().enumerate() {
+            a_work.row_mut(pos).assign(&active_a.row(row));
+        }
+        let gram = a_work.dot(&a_work.t());
+        let rhs = a_work.dot(residual);
+        let mut lambda_work = Array1::<f64>::zeros(k);
+        solve_dense_system_via_pseudoinverse(&gram, &rhs, &mut lambda_work).ok()?;
+        if !array1_is_finite(&lambda_work) {
+            return None;
+        }
+
+        let lambda_scale = lambda_work
+            .iter()
+            .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+        let dual_tol = 1e-10 * lambda_scale.max(1.0);
+        let most_negative = lambda_work
+            .iter()
+            .enumerate()
+            .filter(|(_, value)| **value < -dual_tol)
+            .min_by(|(_, left), (_, right)| {
+                left.partial_cmp(right)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(idx, _)| idx);
+        if let Some(pos) = most_negative {
+            active_rows.remove(pos);
+            continue;
+        }
+
+        let projected = residual - &a_work.t().dot(&lambda_work);
+        if !array1_is_finite(&projected) {
+            return None;
+        }
+        let mut lambda_full = Array1::<f64>::zeros(active_a.nrows());
+        for (pos, &row) in active_rows.iter().enumerate() {
+            lambda_full[row] = lambda_work[pos].max(0.0);
+        }
+        return Some((projected, lambda_full));
+    }
+
+    Some((residual.clone(), Array1::zeros(active_a.nrows())))
 }
 
 pub(crate) fn feasible_point_for_linear_constraints(

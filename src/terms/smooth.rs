@@ -4589,6 +4589,7 @@ fn build_tensor_bspline_basis(
         penaltyinfo,
         ops,
         null_eigenvectors,
+        joint_null_rotation: None,
         metadata: BasisMetadata::TensorBSpline {
             feature_cols: feature_cols.to_vec(),
             knots: marginal_knots,
@@ -4941,6 +4942,13 @@ struct LocalSmoothTermBuild {
     /// consumes this to absorb the smooth's null space into the parametric
     /// block at `TermCollectionDesign` construction.
     null_eigenvectors: Vec<Option<Array2<f64>>>,
+    /// Joint-null absorption rotation for this smooth. `Some(rotation)`
+    /// records `Q = [U_range | U_null]` spanning `null(Σ_k penalties[k])`,
+    /// the joint null across all active penalty blocks on this smooth.
+    /// `None` means the joint penalty is full-rank (joint nullity = 0) or
+    /// there are no penalties. Stage-2 commit A: plumbing only — populated
+    /// by commit B, applied by commit D.
+    joint_null_rotation: Option<crate::terms::basis::JointNullRotation>,
     penaltyinfo: Vec<PenaltyInfo>,
     pre_dropped_penaltyinfo: Vec<PenaltyInfo>,
     metadata: BasisMetadata,
@@ -5360,6 +5368,7 @@ fn build_pca_smooth_basis(
             penaltyinfo,
             ops,
             null_eigenvectors,
+            joint_null_rotation: None,
             metadata: BasisMetadata::Pca {
                 feature_cols: feature_cols.to_vec(),
                 basis_matrix: basis_matrix.clone(),
@@ -5413,6 +5422,7 @@ fn build_pca_smooth_basis(
         penaltyinfo,
         ops,
         null_eigenvectors,
+        joint_null_rotation: None,
         metadata: BasisMetadata::Pca {
             feature_cols: feature_cols.to_vec(),
             basis_matrix: basis_matrix.clone(),

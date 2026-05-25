@@ -2596,6 +2596,60 @@ pub struct BasisBuildResult {
     /// cannot converge on data whose unpenalized signal lies along a null
     /// direction of `S` (phantom-multiplier refusal at the KKT certificate).
     pub null_eigenvectors: Vec<Option<Array2<f64>>>,
+    /// Joint-null absorption rotation for this basis, when the basis carries
+    /// any penalties with a non-trivial joint null space.
+    ///
+    /// `Some(rotation)` records `Q = [U_range | U_null]` where `U_null` spans
+    /// the joint null space `null(Σ_k S_k)` over this basis's active
+    /// penalties (unscaled — the structural joint null is independent of
+    /// `λ`). After the basis pipeline applies this rotation, the design
+    /// becomes `X · Q` and each penalty becomes `Qᵀ S_k Q`, block-diagonal
+    /// with a guaranteed-zero null tail. The same `Q` must be replayed at
+    /// prediction time, so it is persisted in the fitted model. `None`
+    /// indicates either no penalties on this basis, or a full-rank joint
+    /// penalty (joint nullity = 0). A `Some` value is never recorded with
+    /// `joint_nullity == 0` — the `None` discriminant is canonical for
+    /// "nothing to absorb".
+    ///
+    /// Stage-2 commit A: this field is plumbed into the struct but neither
+    /// computed nor applied yet. Stage-2 commit B populates it; Stage-2
+    /// commit D applies the rotation to `design` and `penalties`.
+    pub joint_null_rotation: Option<JointNullRotation>,
+}
+
+/// Joint-null absorption rotation, attached to a smooth's basis when the
+/// basis's joint penalty `Σ_k S_k` has a non-trivial null space.
+///
+/// The `rotation` field stores the orthonormal eigenvector matrix
+/// `Q = [U_range | U_null]` of the symmetric joint penalty: the first
+/// `range_dim = rotation.ncols() - joint_nullity` columns span
+/// `range(Σ_k S_k)`; the remaining `joint_nullity` columns span
+/// `null(Σ_k S_k)`. After the pipeline applies the rotation, the smooth's
+/// coefficient vector satisfies `β = Q · γ`, the design becomes `X · Q`,
+/// and each per-block penalty `S_k` becomes `Qᵀ S_k Q`, which is guaranteed
+/// block-diagonal with a zero `(joint_nullity × joint_nullity)` tail
+/// (because the joint null annihilates every active `S_k`).
+#[derive(Clone)]
+pub struct JointNullRotation {
+    /// `(p_smooth × p_smooth)` orthonormal matrix; range columns first,
+    /// joint-null columns last.
+    pub rotation: Array2<f64>,
+    /// Number of columns at the tail of `rotation` that span the joint
+    /// null space. Always `> 0` when wrapped in `Some` — the value `0`
+    /// is encoded as `None`.
+    pub joint_nullity: usize,
+}
+
+impl std::fmt::Debug for JointNullRotation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JointNullRotation")
+            .field(
+                "rotation",
+                &format_args!("{}×{}", self.rotation.nrows(), self.rotation.ncols()),
+            )
+            .field("joint_nullity", &self.joint_nullity)
+            .finish()
+    }
 }
 
 impl std::fmt::Debug for BasisBuildResult {
@@ -2632,6 +2686,7 @@ impl std::fmt::Debug for BasisBuildResult {
                         .join(", ")
                 ),
             )
+            .field("joint_null_rotation", &self.joint_null_rotation)
             .finish()
     }
 }
@@ -7793,6 +7848,7 @@ pub fn build_bspline_basis_1d(
             kronecker_factored: None,
             ops,
             null_eigenvectors,
+            joint_null_rotation: None,
         });
     }
     // Auto-streaming decision for non-periodic B-spline: we need `p_raw` to
@@ -7912,6 +7968,7 @@ pub fn build_bspline_basis_1d(
             kronecker_factored: None,
             ops,
             null_eigenvectors,
+            joint_null_rotation: None,
         });
     }
     let prefer_sparse_design = matches!(
@@ -8210,6 +8267,7 @@ pub fn build_bspline_basis_1d(
         kronecker_factored: None,
         ops,
         null_eigenvectors,
+        joint_null_rotation: None,
     })
 }
 
@@ -16042,6 +16100,7 @@ pub fn build_spherical_spline_basis(
         kronecker_factored: None,
         ops,
         null_eigenvectors,
+        joint_null_rotation: None,
     })
 }
 
@@ -16284,6 +16343,7 @@ fn build_spherical_harmonic_basis(
         kronecker_factored: None,
         ops,
         null_eigenvectors,
+        joint_null_rotation: None,
     })
 }
 
@@ -16511,6 +16571,7 @@ pub fn build_matern_basiswithworkspace(
         kronecker_factored: None,
         ops,
         null_eigenvectors,
+        joint_null_rotation: None,
     })
 }
 
@@ -20259,6 +20320,7 @@ fn build_cyclic_duchon_basis_1dwithworkspace(
         kronecker_factored: None,
         ops,
         null_eigenvectors,
+        joint_null_rotation: None,
     })
 }
 

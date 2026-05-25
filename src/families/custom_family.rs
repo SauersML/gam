@@ -11177,52 +11177,54 @@ fn block_residual_diagnostic_string(
         .iter()
         .map(|s| s.beta.iter().map(|x: &f64| x.abs()).fold(0.0_f64, f64::max))
         .collect();
-    let mut acc = 0usize;
-    let block_grad_inf: Vec<f64> = states
-        .iter()
-        .map(|s| {
-            let n = s.beta.len();
-            let end = (acc + n).min(joint_grad.len());
-            let nrm = if acc < end {
-                joint_grad
-                    .slice(ndarray::s![acc..end])
-                    .iter()
-                    .map(|x: &f64| x.abs())
-                    .fold(0.0_f64, f64::max)
-            } else {
-                f64::NAN
-            };
-            acc += n;
-            nrm
-        })
-        .collect();
     let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
-    let exit_kkt_inf = exact_newton_joint_stationarity_vector_from_gradient(
+    let stationarity = exact_newton_joint_stationarity_vector_from_gradient(
         joint_grad,
         states,
         specs,
         s_lambdas,
         ridge,
         ridge_policy,
-    )
-    .ok()
-    .map(|residual| {
-        residual
-            .iter()
-            .map(|x: &f64| x.abs())
-            .fold(0.0_f64, f64::max)
-    })
-    .unwrap_or(f64::NAN);
-    let dominant_idx = block_grad_inf
+    );
+    let (block_residual_inf, exit_kkt_inf) = match stationarity {
+        Ok(residual) => {
+            let mut acc = 0usize;
+            let by_block = states
+                .iter()
+                .map(|s| {
+                    let n = s.beta.len();
+                    let end = (acc + n).min(residual.len());
+                    let nrm = if acc < end {
+                        residual
+                            .slice(ndarray::s![acc..end])
+                            .iter()
+                            .map(|x: &f64| x.abs())
+                            .fold(0.0_f64, f64::max)
+                    } else {
+                        f64::NAN
+                    };
+                    acc += n;
+                    nrm
+                })
+                .collect::<Vec<_>>();
+            let joint = residual
+                .iter()
+                .map(|x: &f64| x.abs())
+                .fold(0.0_f64, f64::max);
+            (by_block, joint)
+        }
+        Err(_) => (vec![f64::NAN; states.len()], f64::NAN),
+    };
+    let dominant_idx = block_residual_inf
         .iter()
         .enumerate()
         .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
         .map(|(i, _)| i);
     let dominant = if let Some(i) = dominant_idx {
         format!(
-            "block '{}' carries the dominant unresolved KKT gradient (|g_block|∞ = {:.3e})",
+            "block '{}' carries the dominant penalized stationarity residual (|Sβ − ∇L|∞ = {:.3e})",
             names.get(i).copied().unwrap_or("?"),
-            block_grad_inf[i],
+            block_residual_inf[i],
         )
     } else {
         "<no blocks>".to_string()
@@ -11230,7 +11232,7 @@ fn block_residual_diagnostic_string(
     format!(
         "{dominant}; |∇L − Sβ|∞ = {exit_kkt_inf:.3e}, block_widths = {block_widths:?}, \
          block_names = {names:?}, block_beta_inf = {block_beta_inf:?}, \
-         block_grad_inf = {block_grad_inf:?}; check whether the named block's \
+         block_residual_inf = {block_residual_inf:?}; check whether the named block's \
          penalty has a polynomial null space not constrained by the data \
          (reduce knots, add identifiability constraint, or use a basis whose \
          null space is absorbed into the parametric block)"
@@ -11327,6 +11329,126 @@ impl KktRefusalDiagnosis {
 /// nullity of `H_pen`. Matches the threshold the surrounding REML
 /// penalty-rank machinery uses for "structurally zero".
 const KKT_REFUSAL_RANK_TOL: f64 = 1e-10;
+
+#[derive(Clone, Debug)]
+struct JointSpectralNewtonStep {
+    delta: Array1<f64>,
+    range_rhs_inf: f64,
+    null_rhs_inf: f64,
+    lambda_max_abs: f64,
+    lambda_min_positive: f64,
+    nullity: usize,
+    rank_tol: f64,
+}
+
+fn solve_joint_newton_step_on_spectral_range(
+    h_pen: &Array2<f64>,
+    rhs: &Array1<f64>,
+    rank_tol: f64,
+    null_tol: f64,
+) -> Result<JointSpectralNewtonStep, String> {
+    let p = h_pen.nrows();
+    if h_pen.ncols() != p || rhs.len() != p {
+        return Err(format!(
+            "joint Newton spectral solve dimension mismatch: H={}x{}, rhs={}",
+            h_pen.nrows(),
+            h_pen.ncols(),
+            rhs.len()
+        ));
+    }
+    if p == 0 {
+        return Ok(JointSpectralNewtonStep {
+            delta: Array1::zeros(0),
+            range_rhs_inf: 0.0,
+            null_rhs_inf: 0.0,
+            lambda_max_abs: 0.0,
+            lambda_min_positive: f64::INFINITY,
+            nullity: 0,
+            rank_tol,
+        });
+    }
+
+    let (evals, evecs) = FaerEigh::eigh(h_pen, Side::Lower)
+        .map_err(|e| format!("joint Newton spectral solve eigendecomposition failed: {e}"))?;
+    let lambda_max_abs = evals.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+    if !lambda_max_abs.is_finite() || lambda_max_abs <= 0.0 {
+        let rhs_inf = rhs.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+        if rhs_inf <= null_tol {
+            return Ok(JointSpectralNewtonStep {
+                delta: Array1::zeros(p),
+                range_rhs_inf: 0.0,
+                null_rhs_inf: rhs_inf,
+                lambda_max_abs,
+                lambda_min_positive: f64::INFINITY,
+                nullity: p,
+                rank_tol,
+            });
+        }
+        return Err(format!(
+            "joint Newton model-space error: penalized Hessian is numerically zero but \
+             stationarity RHS has |P0 rhs|∞={rhs_inf:.3e} > tol={null_tol:.3e}; no finite \
+             Newton/KKT stationary point exists in the current parameterization"
+        ));
+    }
+
+    let cutoff = rank_tol * lambda_max_abs;
+    let mut delta = Array1::<f64>::zeros(p);
+    let mut range_rhs_inf = 0.0_f64;
+    let mut null_rhs_inf = 0.0_f64;
+    let mut lambda_min_positive = f64::INFINITY;
+    let mut nullity = 0usize;
+    let mut most_negative = 0.0_f64;
+
+    for k in 0..p {
+        let lambda = evals[k];
+        let u_k = evecs.column(k);
+        let component = u_k.iter().zip(rhs.iter()).map(|(u, r)| u * r).sum::<f64>();
+        if !lambda.is_finite() || lambda.abs() <= cutoff {
+            nullity += 1;
+            null_rhs_inf = null_rhs_inf.max(component.abs());
+            continue;
+        }
+        if lambda < 0.0 {
+            most_negative = most_negative.min(lambda);
+            continue;
+        }
+        range_rhs_inf = range_rhs_inf.max(component.abs());
+        lambda_min_positive = lambda_min_positive.min(lambda);
+        let scale = component / lambda;
+        for i in 0..p {
+            delta[i] += scale * u_k[i];
+        }
+    }
+
+    if most_negative < -cutoff {
+        return Err(format!(
+            "joint Newton model-space error: reduced penalized Hessian is indefinite \
+             (λ_min={most_negative:.3e}, cutoff={cutoff:.3e}); exact Newton requires a \
+             positive-semidefinite quadratic model in the free space"
+        ));
+    }
+    if null_rhs_inf > null_tol {
+        return Err(format!(
+            "joint Newton model-space error: nonzero gradient in Hessian nullspace \
+             (|P0 rhs|∞={null_rhs_inf:.3e} > tol={null_tol:.3e}, |P+ rhs|∞={range_rhs_inf:.3e}, \
+             λ_min+={lambda_min_positive:.3e}, λ_max={lambda_max_abs:.3e}, nullity@{rank_tol:.0e}={nullity}/{p}); \
+             remove/fix the null coordinates or add an explicit model-level regularizer"
+        ));
+    }
+    if !delta.iter().all(|v| v.is_finite()) {
+        return Err("joint Newton spectral solve produced non-finite step".to_string());
+    }
+
+    Ok(JointSpectralNewtonStep {
+        delta,
+        range_rhs_inf,
+        null_rhs_inf,
+        lambda_max_abs,
+        lambda_min_positive,
+        nullity,
+        rank_tol,
+    })
+}
 
 #[allow(clippy::too_many_arguments)]
 fn compute_kkt_refusal_report(
@@ -19591,13 +19713,11 @@ fn synchronized_states_from_flat_beta<F: CustomFamily + Clone + Send + Sync + 's
 /// special case; coupled derivative-guard rows must use the same KKT geometry.
 ///
 /// `known_active_rows`, when provided, seeds the working set with the QP
-/// solver's authoritative active rows. The post-update feasibility projections
-/// (`project_onto_linear_constraints`, `project_time_qd1_feasible`,
-/// `project_monotone_feasible_beta`) can leave the resulting β with row
-/// slacks slightly above the slack tolerance even though the QP identified
-/// the row as binding — slack-based detection alone then misses the row and
-/// leaves its Lagrange-multiplier mass in the projected residual, masking a
-/// valid KKT point. Seeding from the QP's active set is exact; the
+/// solver's authoritative active rows. Trust-region damping and finite
+/// precision can leave the committed β with row slacks slightly above the slack
+/// tolerance even though the QP identified the row as binding; slack-based
+/// detection alone then misses the row and leaves its Lagrange-multiplier mass
+/// in the projected residual. Seeding from the QP's active set is exact; the
 /// non-negative-multiplier iteration below then removes any seeded row whose
 /// least-squares multiplier turns out to be strictly negative, so the union
 /// of (QP active) ∪ (slack-detected) never declares false convergence.
@@ -20015,11 +20135,11 @@ fn exact_newton_joint_stationarity_inf_norm_from_gradient(
     // The optional `block_active_sets` arrives from the joint-Newton inner
     // loop's `cached_active_sets` and carries the QP solver's authoritative
     // active rows per block. Threading it through is what makes the
-    // stationarity test correctly fire at the constrained optimum: the
-    // post-update feasibility projections leave β with row slacks slightly
-    // above the slack tolerance even though the QP identified the rows as
-    // binding, and slack-based detection alone then misses the rows and
-    // leaves the Lagrange-multiplier mass in the residual.
+    // stationarity test correctly fire at the constrained optimum: a damped
+    // constrained step may commit β with row slacks slightly above the slack
+    // tolerance even though the QP identified the rows as binding, and
+    // slack-based detection alone then misses the rows and leaves the
+    // Lagrange-multiplier mass in the residual.
     let mut inf_norm = 0.0_f64;
     let mut offset = 0usize;
     for b in 0..states.len() {

@@ -725,6 +725,62 @@ fn inverse_link_pdffourth_derivative(
     }
 }
 
+/// How a time block's parameterization enforces the derivative-guard
+/// monotonicity `q'(t) ≥ guard`.
+///
+/// The constraint set fed to the inner active-set / KKT machinery depends on
+/// the variant; consuming families dispatch on this to choose the right
+/// constraint shape and to refuse a mismatched parameterization (e.g.
+/// `survival_marginal_slope` cannot ride a coordinate-cone-only basis
+/// without re-introducing the phantom-multiplier bug it solved with the
+/// row-wise representation; `survival_location_scale` cannot ride a
+/// row-wise representation without making its reduced KKT system
+/// rank-deficient on the cone basis).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimeBlockMonotonicity {
+    /// The time block's coefficients are constrained by a per-coordinate
+    /// cone `β_j ≥ 0` (with appropriate offsets handled by the family).
+    /// Used by location-scale / latent paths whose bases produce a
+    /// non-negative derivative whenever the cone holds.
+    EnforcedByCoordinateCone,
+    /// The time block's coefficients are constrained by row-wise
+    /// `D β + o ≥ guard` over every observation row; needed when the
+    /// basis admits negative-derivative directions that no coordinate
+    /// cone can encode without leaving phantom KKT multipliers when a
+    /// row binds. Used by `survival_marginal_slope` under the additive
+    /// base.
+    EnforcedByRowConstraint,
+    /// The base is a structurally-monotone parameterization (e.g.
+    /// `q'(t) = guard + I(t)·γ` with `γ ≥ 0`). Monotonicity holds
+    /// pointwise from the cone; the family treats this exactly as a
+    /// coordinate cone for constraint generation but the geometric
+    /// claim is stronger and is recorded here for diagnostics and for
+    /// future fast paths (e.g. skipping per-row validation).
+    StructuralISpline,
+}
+
+impl TimeBlockMonotonicity {
+    /// True when the variant can be enforced by a coordinate cone alone
+    /// (no row-wise constraints required). Both `EnforcedByCoordinateCone`
+    /// and `StructuralISpline` satisfy this; only `EnforcedByRowConstraint`
+    /// requires the row-wise `D β ≥ b` constraint matrix.
+    #[inline]
+    pub fn is_coordinate_cone(self) -> bool {
+        matches!(
+            self,
+            Self::EnforcedByCoordinateCone | Self::StructuralISpline
+        )
+    }
+
+    /// True when row-wise `D β + o ≥ guard` constraints must be emitted
+    /// for the inner active-set/KKT machinery to capture binding
+    /// multipliers correctly.
+    #[inline]
+    pub fn requires_row_constraints(self) -> bool {
+        matches!(self, Self::EnforcedByRowConstraint)
+    }
+}
+
 #[derive(Clone)]
 pub struct TimeBlockInput {
     pub design_entry: DesignMatrix,
@@ -733,7 +789,10 @@ pub struct TimeBlockInput {
     pub offset_entry: Array1<f64>,
     pub offset_exit: Array1<f64>,
     pub derivative_offset_exit: Array1<f64>,
-    pub structural_monotonicity: bool,
+    /// How the time block enforces `q'(t) ≥ guard`. The consuming family
+    /// dispatches the constraint shape on this and refuses a mismatch
+    /// rather than silently producing a degenerate KKT system.
+    pub time_monotonicity: TimeBlockMonotonicity,
     pub penalties: Vec<Array2<f64>>,
     /// Structural nullspace dimension of each penalty matrix.
     pub nullspace_dims: Vec<usize>,
@@ -4808,9 +4867,11 @@ fn validate_time_block(
             reason: "time_block design column mismatch across entry/exit/derivative".to_string(),
         });
     }
-    if !b.structural_monotonicity {
-        return Err(SurvivalLocationScaleError::InvalidConfiguration { reason: "time_block requires structural monotonicity by construction; non-structural time transforms are no longer supported"
-                .to_string(), });
+    if !b.time_monotonicity.is_coordinate_cone() {
+        return Err(SurvivalLocationScaleError::InvalidConfiguration { reason: format!(
+            "time_block requires a coordinate-cone monotonicity strategy by construction; got {:?}",
+            b.time_monotonicity
+        ) });
     }
     structural_time_coefficient_lower_bounds_with_monotone_time_wiggle(
         &b.design_derivative_exit,
@@ -5125,6 +5186,54 @@ pub fn project_onto_linear_constraints(
         }
     }
     beta
+}
+
+fn validate_linear_constraints(
+    label: &str,
+    beta: &Array1<f64>,
+    constraints: &LinearInequalityConstraints,
+) -> Result<(), String> {
+    if beta.len() != constraints.a.ncols() {
+        return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
+            "survival location-scale {label} constraint dimension mismatch: beta={}, constraints={}",
+            beta.len(),
+            constraints.a.ncols()
+        ) }.into());
+    }
+    if constraints.a.nrows() != constraints.b.len() {
+        return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
+            "survival location-scale {label} constraint row mismatch: A rows={}, b len={}",
+            constraints.a.nrows(),
+            constraints.b.len()
+        ) }.into());
+    }
+
+    let mut worst_row = None;
+    let mut worst_slack = 0.0_f64;
+    let mut worst_tol = 0.0_f64;
+    for row in 0..constraints.a.nrows() {
+        let a_row = constraints.a.row(row);
+        let slack = a_row.dot(beta) - constraints.b[row];
+        let scale = a_row
+            .iter()
+            .zip(beta.iter())
+            .map(|(a, b)| (a * b).abs())
+            .sum::<f64>()
+            .max(constraints.b[row].abs())
+            .max(1.0);
+        let tol = 1e-10 * scale;
+        if slack < -tol && (worst_row.is_none() || slack < worst_slack) {
+            worst_row = Some(row);
+            worst_slack = slack;
+            worst_tol = tol;
+        }
+    }
+    if let Some(row) = worst_row {
+        return Err(SurvivalLocationScaleError::ConstraintViolation { reason: format!(
+            "survival location-scale {label} violates represented linear constraint at row {row}: slack={worst_slack:.3e}, tol={worst_tol:.3e}"
+        ) }.into());
+    }
+    Ok(())
 }
 
 fn prepare_identified_time_block(
