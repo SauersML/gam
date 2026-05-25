@@ -1690,64 +1690,6 @@ def duchon_function_norm_penalty(
     return np.asarray(penalty, dtype=float)
 
 
-def _thin_plate_penalty(
-    centers: Any,
-    *,
-    m: int = 2,
-    length_scale: float = 1.0,
-) -> Any:
-    """Internal thin-plate bending-energy penalty constructor."""
-    import numpy as np
-
-    try:
-        penalty = rust_module().thin_plate_penalty(
-            _numeric_matrix(centers, "centers"),
-            int(m),
-            float(length_scale),
-        )
-    except Exception as exc:
-        raise map_exception(exc) from exc
-    return np.asarray(penalty, dtype=float)
-
-
-def _gaussian_reml_score(
-    X: Any,
-    Y: Any,
-    coefficients: Any,
-    log_lambda: float,
-    penalty: Any,
-    *,
-    weights: Any | None = None,
-    by: Any | None = None,
-    by_start_col: int = 0,
-) -> dict[str, Any]:
-    """Internal free-coefficient REML score evaluator."""
-    import numpy as np
-
-    try:
-        out = rust_module().gaussian_reml_score(
-            _numeric_matrix(X, "X"),
-            _numeric_matrix(Y, "Y"),
-            _numeric_matrix(coefficients, "coefficients"),
-            float(log_lambda),
-            _numeric_matrix(penalty, "penalty"),
-            None if weights is None else _numeric_vector(weights, "weights"),
-            None if by is None else _numeric_vector(by, "by"),
-            int(by_start_col),
-        )
-    except Exception as exc:
-        raise map_exception(exc) from exc
-    result = dict(out)
-    for key in ("grad_coefficients", "grad_penalty", "fitted", "sigma2"):
-        # ``grad_penalty`` is only populated when the Rust kernel has built
-        # the VJP through ``S``. The closed-form path always returns the
-        # others; leaving ``grad_penalty`` absent keeps the Python surface
-        # forward-compatible with older builds.
-        if key in result:
-            result[key] = np.asarray(result[key], dtype=float)
-    return result
-
-
 def gaussian_weighted_ridge(
     X: Any,
     Y: Any,
