@@ -13527,24 +13527,46 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         converged = true;
                         break;
                     }
-                    log::warn!(
-                        "[PIRLS/joint-Newton convergence] cycle {:>3} | constrained-stationary cert REFUSED: \
-                         linearized_rel={:.3e} and scalar_relerr={:.3e} are individually consistent with a \
-                         Lagrange multiplier, but the projected residual={:.3e} > {:.1}×tol={:.3e} proves the \
-                         multiplier claim is phantom — the active-set system does not represent whatever is \
-                         pinning g. Certifying range-projected stationarity here would solve a different \
-                         reduced problem and would break the full-space IFT/envelope identity used by the \
-                         outer optimizer. Returning unconverged so the outer optimizer rejects this ρ; \
-                         |Δobjective|={:.3e}, obj_tol={:.3e}",
+                    // Structured per-block + per-spectrum refusal report.
+                    // The legacy one-line refusal log printed only aggregate
+                    // numbers (linearized_rel, scalar_relerr, residual,
+                    // |Δobj|) and was not actionable on models with many
+                    // blocks: it could not identify WHICH smooth carried
+                    // the unresolved mass, nor whether H_pen was genuinely
+                    // rank-deficient (the "polynomial null space slipped
+                    // past absorption" pathology). Cost: one dense
+                    // materialize + symmetric eigh on H_pen at this β,
+                    // sub-millisecond for typical p, executed once per
+                    // refusal (the loop breaks immediately after).
+                    let report = compute_kkt_refusal_report(
                         cycle,
-                        linearized_rel,
-                        scalar_model_relerr,
-                        residual,
-                        cert_residual_factor,
-                        cert_residual_factor * residual_tol,
-                        objective_change,
+                        &states,
+                        specs,
+                        &s_lambdas,
+                        &ranges,
+                        cached_joint_gradient.as_ref(),
+                        &cached_active_sets,
+                        &block_constraints,
+                        &joint_hessian_source,
+                        total_p,
+                        ridge,
+                        options.ridge_policy,
+                        joint_solver_diagonal_ridge,
+                        accepted_step_inf,
+                        step_inf,
+                        joint_trust_radius,
+                        residual_tol,
                         objective_tol,
+                        step_tol,
+                        objective_change,
+                        residual,
+                        math,
                     );
+                    log::warn!(
+                        "{}",
+                        report.format_structured_log(cert_residual_factor * residual_tol)
+                    );
+                    last_kkt_refusal_report = Some(report);
                     converged = false;
                     break;
                 }
@@ -13916,27 +13938,29 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             });
         }
         if coupled_exact_joint_required {
-            // Compute per-block residual diagnostic so the bubbled error names
-            // which block carries the unresolved KKT mass, instead of leaving
-            // the caller with an opaque "exited before convergence" string.
-            //
-            // When the joint Newton refuses to certify and the constrained-
-            // stationary cert refused with "phantom multiplier" (i.e. the
-            // active set doesn't capture the gradient mass), the math says
-            // either the active set is incomplete OR H_pen is genuinely
-            // rank-deficient in the direction of g (a polynomial null space
-            // of the smooth's penalty that the likelihood Hessian doesn't
-            // constrain). Naming the offending block lets the user act:
-            // reduce knots on that smooth, add an identifiability constraint,
-            // or change the basis.
-            let block_diag = block_residual_diagnostic_string(
-                cached_joint_gradient.as_ref(),
-                &states,
-                specs,
-                &s_lambdas,
-                ridge,
-                options.ridge_policy,
-            );
+            // Bubble the structured KKT refusal report (per-block residual
+            // breakdown + H_pen spectrum + diagnosis) so the cause of the
+            // refusal survives serialization through the outer optimizer,
+            // the seed-validation cascade, and gamfit. When the cert
+            // refused inside the cycle loop we already computed a
+            // `KktRefusalReport` at the refusing iterate; reuse it
+            // verbatim — recomputing here would lose the spectrum at the
+            // actual failing β and double the eigh cost. When the loop
+            // never reached the cert refusal site (e.g. exited via a
+            // different early-exit path), fall back to the legacy one-line
+            // per-block diagnostic so the bubbled error still names the
+            // offending block.
+            let block_diag = match last_kkt_refusal_report.as_ref() {
+                Some(report) => report.format_bubbled_error(),
+                None => block_residual_diagnostic_string(
+                    cached_joint_gradient.as_ref(),
+                    &states,
+                    specs,
+                    &s_lambdas,
+                    ridge,
+                    options.ridge_policy,
+                ),
+            };
             return Err(format!(
                 "coupled exact-joint inner solve exited the joint Newton path before convergence — {block_diag}"
             ));

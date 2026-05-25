@@ -125,11 +125,23 @@ class _RustManifold(ManifoldDescriptor):
 
     @property
     def dimension(self) -> int:
-        return int(_rust_module().manifold_dimension(self.manifold_json))
+        """Intrinsic dimension. Routes through Rust when the extension
+        exposes ``manifold_dimension``; otherwise falls back to the
+        descriptor's locally cached ``_dim`` (set by each subclass at
+        construction). The Rust path is the canonical source of truth."""
+        fn = getattr(_rust_module(), "manifold_dimension", None)
+        if fn is not None:
+            return int(fn(self.manifold_json))
+        return int(self._dim)
 
     @property
     def ambient_dim(self) -> int:
-        return int(_rust_module().manifold_ambient_dimension(self.manifold_json))
+        """Ambient embedding dimension. Same Rust-first / Python-fallback
+        pattern as :attr:`dimension`."""
+        fn = getattr(_rust_module(), "manifold_ambient_dimension", None)
+        if fn is not None:
+            return int(fn(self.manifold_json))
+        return int(getattr(self, "_ambient_dim", self._dim))
 
     def exp(self, p: Any, v: Any) -> Any:
         torch_mod = _maybe_import_torch()
@@ -175,6 +187,8 @@ class Euclidean(_RustManifold):
         if int(dim) <= 0:
             raise ValueError("Euclidean.dim must be > 0")
         self.json = {"kind": "euclidean", "dim": int(dim)}
+        self._dim = int(dim)
+        self._ambient_dim = int(dim)
 
     def __repr__(self) -> str:
         return f"Euclidean(dim={self.json['dim']})"
@@ -190,6 +204,8 @@ class Circle(_RustManifold):
 
     def __init__(self) -> None:
         self.json = {"kind": "circle"}
+        self._dim = 1
+        self._ambient_dim = 2
 
     def __repr__(self) -> str:
         return "Circle()"

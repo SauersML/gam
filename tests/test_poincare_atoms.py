@@ -16,6 +16,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 gamfit = pytest.importorskip("gamfit")
+pytest.importorskip("gamfit._rust")
 
 
 def _atoms(**kwargs):
