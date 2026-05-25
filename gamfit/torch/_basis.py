@@ -1,12 +1,10 @@
 """Differentiable basis, penalty, and closed-form ridge primitives for torch.
 
-These wrappers mirror the NumPy entry points in :mod:`gamfit._api`. The
-basis evaluators ``bspline_basis`` and ``duchon_basis`` carry an analytic
-backward with respect to ``t`` (resp. ``points``) implemented through
-:class:`torch.autograd.Function` subclasses; the derivative evaluators,
-penalty constructor, and closed-form ridge solves are forward-only and
-produced via the detach-cast-call-numpy-wrap path in
-:mod:`gamfit.torch._coerce`.
+These wrappers mirror the NumPy entry points in :mod:`gamfit._api`.
+``bspline_basis`` carries an analytic backward with respect to ``t`` through
+a :class:`torch.autograd.Function` subclass. The Duchon, derivative,
+penalty, and closed-form ridge paths are forward-only and produced via the
+detach-cast-call-numpy-wrap path in :mod:`gamfit.torch._coerce`.
 """
 
 from __future__ import annotations
@@ -185,7 +183,7 @@ def duchon_basis(
     m: int = 2,
     periodic_per_axis: tuple[bool, ...] | None = None,
 ) -> torch.Tensor:
-    """Evaluate the Duchon m-spline basis at ``points`` with grad wrt ``points``.
+    """Evaluate the Duchon m-spline basis at ``points``.
 
     Multi-dimensional: ``points`` is ``(N, d)``, ``centers`` is ``(K, d)``.
     For 1D, pass shape ``(N,)`` or ``(N, 1)`` — auto-promoted.
@@ -194,8 +192,8 @@ def duchon_basis(
     ----------
     points : torch.Tensor
         Evaluation locations, shape ``(N, d)`` or ``(N,)`` for d=1.
-        Differentiable input (backward via the analytic derivative basis
-        in 1D; not yet exposed for d > 1).
+        Treated as structural: no gradient is propagated through
+        ``points``.
     centers : torch.Tensor or int or None
         Center locations, shape ``(K, d)``. Auto-derived from ``points``
         for d=1 if None or an int.
