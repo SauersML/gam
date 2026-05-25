@@ -1266,9 +1266,19 @@ impl WorkingModelSurvival {
     fn derivative_guard_numerical(&self) -> f64 {
         let derivative_guard = self.derivative_guard();
         if derivative_guard <= 0.0 {
-            // For structural monotonicity (guard = 0), allow tiny negative
-            // values from floating-point arithmetic.
-            -1e-10
+            // For structural monotonicity (guard = 0), tiny negative derivs are
+            // tolerated because `stabilized_structural_derivative` lifts the
+            // value back to a small positive floor before any `ln`/`1/deriv`
+            // use. For *non-structural* monotonicity with tolerance == 0 the
+            // raw derivative flows straight through into the event-row
+            // `deriv.ln()` and `1.0 / deriv`, so any non-positive value would
+            // produce NaN / huge negative weights. Keep the slack only when
+            // the structural stabilizer is active.
+            if self.structurally_monotonic {
+                -1e-10
+            } else {
+                1e-12
+            }
         } else {
             (derivative_guard - (1e-10_f64).min(0.01 * derivative_guard)).max(1e-12)
         }
