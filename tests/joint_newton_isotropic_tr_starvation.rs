@@ -400,7 +400,7 @@ fn rejected_step_shrinks_only_boundary_block_radii() {
     let r_a_old = 1.0;
     let r_b_old = 5.0;
     let step_a = 0.1; // tiny progressive step in block A
-    let step_b = 4.9; // large bad step in block B
+    let step_b = 5.0; // large bad step on block B's trust boundary
 
     let old_r_a_new = update_radius_joint_rho(r_a_old, step_a, actual_joint, predicted_joint);
     let old_r_b_new = update_radius_joint_rho(r_b_old, step_b, actual_joint, predicted_joint);
