@@ -4590,6 +4590,7 @@ fn build_tensor_bspline_basis(
         nullspace_dims,
         penaltyinfo,
         ops,
+        null_eigenvectors,
         metadata: BasisMetadata::TensorBSpline {
             feature_cols: feature_cols.to_vec(),
             knots: marginal_knots,
@@ -5360,6 +5361,7 @@ fn build_pca_smooth_basis(
             nullspace_dims,
             penaltyinfo,
             ops,
+            null_eigenvectors,
             metadata: BasisMetadata::Pca {
                 feature_cols: feature_cols.to_vec(),
                 basis_matrix: basis_matrix.clone(),
@@ -5412,6 +5414,7 @@ fn build_pca_smooth_basis(
         nullspace_dims,
         penaltyinfo,
         ops,
+        null_eigenvectors,
         metadata: BasisMetadata::Pca {
             feature_cols: feature_cols.to_vec(),
             basis_matrix: basis_matrix.clone(),
