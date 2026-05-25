@@ -28,80 +28,65 @@ The subpackage is an optional extra: ``pip install gamfit[torch]``. Importing
 :mod:`gamfit` itself does not pull in torch.
 """
 
-from __future__ import annotations
-
-# Re-exporting the public surface below transitively imports ``torch`` via the
-# submodules, so a missing optional ``torch`` dependency surfaces here as an
-# :class:`ImportError`. Translate that into a user-actionable message before any
-# downstream consumer sees a raw ``No module named 'torch'``.
-try:
-    from ._basis import (
-        bspline_basis,
-        bspline_basis_derivative,
-        duchon_basis,
-        gaussian_weighted_ridge,
-        gaussian_weighted_ridge_batch,
-        periodic_spline_curve_basis,
-        smoothness_penalty,
-        sphere_basis,
-    )
-    from ._reml import (
-        AdditiveRemlOutput,
-        GaussianRemlOutput,
-        gaussian_reml_fit,
-        gaussian_reml_fit_additive,
-        gaussian_reml_fit_batched,
-        gaussian_reml_fit_blocks,
-    )
-    from .geometry import (
-        alr,
-        closure,
-        clr,
-        inverse_alr,
-        simplex_exp_map,
-        simplex_frechet_mean,
-        simplex_log_map,
-        sphere_exp_map,
-        sphere_frechet_mean,
-        sphere_log_map,
-    )
-    from .modules import from_fitted
-    from .penalties import (
-        ARDPenalty,
-        BlockOrthogonalityPenalty,
-        GumbelTemperatureSchedule,
-        IBPAssignmentPenalty,
-        IsometryPenalty,
-        IvaeRidgeMeanGauge,
-        JumpReLUPenalty,
-        LazyPcaBasis,
-        MechanismSparsityPenalty,
-        RiemannianRetraction,
-        TopologyAutoSelector,
-    )
-    from .skip_transcoder import SkipAffineSmooth, skip_transcoder, SkipTranscoderResult
-    # New unified Smooth/fit API — the recommended user-facing surface.
-    from ..smooth import (
-        BSpline,
-        Categorical,
-        Duchon,
-        Matern,
-        Pca,
-        PeriodicSplineCurve,
-        ShapeConstraintLiteral,
-        Smooth,
-        Sphere,
-        TensorBSpline,
-    )
-    from .fit import FitResult, fit
-    from .module import GAM
-except ImportError as _exc:  # pragma: no cover - import-time guard
-    if _exc.name == "torch":
-        raise ImportError(
-            "gamfit.torch requires the optional `torch` dependency. "
-            "Install via `pip install gamfit[torch]` or `pip install torch`."
-        ) from _exc
-    raise
+from ._basis import (
+    bspline_basis,
+    bspline_basis_derivative,
+    duchon_basis,
+    gaussian_weighted_ridge,
+    gaussian_weighted_ridge_batch,
+    periodic_spline_curve_basis,
+    smoothness_penalty,
+    sphere_basis,
+)
+from ._reml import (
+    AdditiveRemlOutput,
+    GaussianRemlOutput,
+    gaussian_reml_fit,
+    gaussian_reml_fit_additive,
+    gaussian_reml_fit_batched,
+    gaussian_reml_fit_blocks,
+)
+from .geometry import (
+    alr,
+    closure,
+    clr,
+    inverse_alr,
+    simplex_exp_map,
+    simplex_frechet_mean,
+    simplex_log_map,
+    sphere_exp_map,
+    sphere_frechet_mean,
+    sphere_log_map,
+)
+from .modules import from_fitted
+from .penalties import (
+    ARDPenalty,
+    BlockOrthogonalityPenalty,
+    GumbelTemperatureSchedule,
+    IBPAssignmentPenalty,
+    IsometryPenalty,
+    IvaeRidgeMeanGauge,
+    JumpReLUPenalty,
+    LazyPcaBasis,
+    MechanismSparsityPenalty,
+    RiemannianRetraction,
+    TopologyAutoSelector,
+)
+from .skip_transcoder import SkipAffineSmooth, SkipTranscoderResult, skip_transcoder
+from ..smooth import (
+    BSpline,
+    Categorical,
+    Duchon,
+    Matern,
+    Pca,
+    PeriodicSplineCurve,
+    ShapeConstraintLiteral,
+    Smooth,
+    Sphere,
+    TensorBSpline,
+)
+from .fit import FitResult, fit
+from .module import GAM
 
 __all__ = [
     # Recommended user-facing API
