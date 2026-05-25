@@ -8257,7 +8257,6 @@ fn sae_manifold_fit_inner<'py>(
     for (name, value) in [
         ("alpha", alpha),
         ("tau", tau),
-        ("sparsity_strength", sparsity_strength),
         ("smoothness", smoothness),
         ("learning_rate", learning_rate),
         ("ridge_ext_coord", ridge_ext_coord),
@@ -8269,6 +8268,24 @@ fn sae_manifold_fit_inner<'py>(
             )));
         }
     }
+    // `sparsity_strength == 0.0` is the canonical "no sparsity" baseline
+    // (issue #184). Accept it and floor to a tiny positive sentinel before
+    // taking the log so the log-rho parametrisation stays finite. The
+    // resulting `lambda_sparse = exp(log(SPARSITY_DISABLED_FLOOR))` is
+    // numerically equivalent to zero relative to the data-fit Hessian for
+    // any realistic problem scale. Negatives, infinities, and NaN remain
+    // rejected.
+    if !sparsity_strength.is_finite() || sparsity_strength < 0.0 {
+        return Err(py_value_error(format!(
+            "sparsity_strength must be finite and non-negative; got {sparsity_strength}"
+        )));
+    }
+    const SPARSITY_DISABLED_FLOOR: f64 = 1.0e-300;
+    let sparsity_strength = if sparsity_strength == 0.0 {
+        SPARSITY_DISABLED_FLOOR
+    } else {
+        sparsity_strength
+    };
     let lambda_candidates = match lambda_grid {
         Some(grid) => {
             if grid.is_empty() {
@@ -9694,11 +9711,34 @@ fn sae_manifold_fit_auto<'py>(
     // the fit can learn which atoms to prune. Softmax (translation-invariant)
     // and IBP-MAP (uses sigmoid prior with stick-breaking) are unaffected by
     // a uniform logit shift, so zero remains the natural init for those.
-    let initial_logits = if assignment_kind == "jumprelu" {
+    let mut initial_logits = if assignment_kind == "jumprelu" {
         Array2::<f64>::from_elem((n_obs, k_atoms), 1.0)
     } else {
         Array2::<f64>::zeros((n_obs, k_atoms))
     };
+    // Wire `random_state` into the optimizer init: jitter the initial
+    // assignment logits with a tiny, seed-keyed deterministic perturbation
+    // so different seeds explore different Newton trajectories (issue #178).
+    // The jitter is uniform in `±SAE_RANDOM_STATE_LOGIT_JITTER` and uses the
+    // same Lehmer LCG pattern as the Duchon-center picker, keyed by
+    // `random_state`. Fixed seeds still produce bit-identical fits.
+    if n_obs > 0 && k_atoms > 0 {
+        const SAE_RANDOM_STATE_LOGIT_JITTER: f64 = 1.0e-3;
+        let mut state = random_state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        for row in 0..n_obs {
+            for atom_idx in 0..k_atoms {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                // Map top 53 bits to a double in [0, 1), then to [-1, 1).
+                let u = ((state >> 11) as f64) * f64::from_bits(0x3CA0000000000000);
+                let signed = 2.0 * u - 1.0;
+                initial_logits[[row, atom_idx]] += SAE_RANDOM_STATE_LOGIT_JITTER * signed;
+            }
+        }
+    }
     // Seed each atom's decoder block by least-squares projection of Z onto
     // the joint atom design weighted by the iter-0 soft assignments. Without
     // this, multi-atom fits collapse to A=0 because the assignment prior
