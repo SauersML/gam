@@ -12349,6 +12349,47 @@ mod tests {
     }
 
     #[test]
+    fn noncanonical_binomial_working_state_clamps_saturating_standard_links() {
+        for link in [LinkFunction::Probit, LinkFunction::CLogLog] {
+            let y = array![1.0];
+            let eta = array![30.0];
+            let priorweights = array![1.0];
+            let inverse_link = InverseLink::Standard(link);
+            let mut mu = Array1::zeros(1);
+            let mut weights = Array1::zeros(1);
+            let mut z = Array1::zeros(1);
+
+            update_glmvectors(
+                y.view(),
+                &eta,
+                &inverse_link,
+                priorweights.view(),
+                &mut mu,
+                &mut weights,
+                &mut z,
+                None,
+            )
+            .expect("noncanonical binomial working state");
+
+            assert!(
+                mu[0] > 0.0 && mu[0] < 1.0,
+                "{link:?} working mu must stay inside (0,1) before variance evaluation; got {}",
+                mu[0]
+            );
+            assert!(
+                weights[0].is_finite() && weights[0] > 0.0,
+                "{link:?} working weight must remain positive finite at saturated eta; got {}",
+                weights[0]
+            );
+            assert!(
+                z[0].is_finite(),
+                "{link:?} working response must remain finite at saturated eta; got {}",
+                z[0]
+            );
+        }
+    }
+
+    #[test]
     fn gamma_log_deviance_uses_gamma_formula() {
         assert!(file!().ends_with(".rs"));
         let y = array![2.0, 5.0];

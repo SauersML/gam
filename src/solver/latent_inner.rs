@@ -47,7 +47,7 @@ use ndarray::{Array1, ArrayView1};
 
 use crate::solver::arrow_schur::{
     ArrowFactorCache, ArrowSchurError, ArrowSchurSystem, ArrowSolveOptions, ArrowSolverMode,
-    solve_arrow_newton_step_with_options,
+    arrow_quadratic_model_reduction, solve_arrow_newton_step_with_options,
 };
 use crate::terms::latent_coord::LatentCoordValues;
 
@@ -262,13 +262,16 @@ impl<'a, A: ArrowSystemAssembler> LatentInnerSolver<'a, A> {
                         solve_options.riemannian_trust_region,
                         solve_options.trust_region.radius,
                     );
-                    let predicted_reduction = arrow_predicted_reduction(
+                    let predicted_reduction = arrow_quadratic_model_reduction(
                         &system,
                         delta_t.view(),
                         delta_beta.view(),
                         ridge_t,
                         ridge_beta,
-                    );
+                    )
+                    .map_err(|e| {
+                        format!("LatentInnerSolver: predicted reduction failed at iter {iter}: {e}")
+                    })?;
                     let beta_before = self.beta.clone();
                     let t_before = self.latent.as_flat().clone();
                     for (b, db) in self.beta.iter_mut().zip(delta_beta.iter()) {
@@ -435,46 +438,6 @@ fn iterate_norm(beta: ArrayView1<'_, f64>, t: ArrayView1<'_, f64>) -> f64 {
         acc += v * v;
     }
     acc.sqrt()
-}
-
-fn arrow_predicted_reduction(
-    sys: &ArrowSchurSystem,
-    delta_t: ArrayView1<'_, f64>,
-    delta_beta: ArrayView1<'_, f64>,
-    ridge_t: f64,
-    ridge_beta: f64,
-) -> f64 {
-    assert_eq!(delta_t.len(), sys.rows.len() * sys.d);
-    assert_eq!(delta_beta.len(), sys.k);
-    let mut lin = sys.gb.dot(&delta_beta);
-    let mut quad = ridge_beta * delta_beta.dot(&delta_beta);
-
-    let mut hbb_delta = Array1::<f64>::zeros(sys.k);
-    if let Some(hbb_matvec) = sys.hbb_matvec.as_ref() {
-        hbb_matvec(delta_beta, &mut hbb_delta);
-    } else if sys.hbb.dim() == (sys.k, sys.k) {
-        hbb_delta.assign(&sys.hbb.dot(&delta_beta));
-    } else {
-        return f64::NAN;
-    }
-    quad += delta_beta.dot(&hbb_delta);
-
-    for (i, row) in sys.rows.iter().enumerate() {
-        let base = i * sys.d;
-        for c in 0..sys.d {
-            let dt_c = delta_t[base + c];
-            lin += row.gt[c] * dt_c;
-            quad += ridge_t * dt_c * dt_c;
-            for r in 0..sys.d {
-                quad += dt_c * row.htt[[c, r]] * delta_t[base + r];
-            }
-            for b in 0..sys.k {
-                quad += 2.0 * dt_c * row.htbeta[[c, b]] * delta_beta[b];
-            }
-        }
-    }
-
-    -(lin + 0.5 * quad)
 }
 
 #[cfg(test)]
