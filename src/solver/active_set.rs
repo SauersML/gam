@@ -1126,8 +1126,7 @@ fn solve_newton_direction_with_linear_constraints_impl(
         && working_kkt.complementarity <= 1e-6
         && (working_kkt.stationarity <= 1e-3 || stationarity_rel <= 2e-6);
     if worst <= 1e-8
-        && ((working_kkt.dual_feasibility <= 1e-8
-            && (kkt_strong_ok || model_descent_ok))
+        && ((working_kkt.dual_feasibility <= 1e-8 && (kkt_strong_ok || model_descent_ok))
             || degenerate_boundary_ok)
     {
         if let Some(hint) = active_hint {

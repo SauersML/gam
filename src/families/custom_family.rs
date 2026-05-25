@@ -12036,9 +12036,9 @@ fn load_joint_gradient_evaluation<F: CustomFamily + Clone + Send + Sync + 'stati
 fn require_projected_kkt_residual(
     residual: Option<ProjectedKktResidual>,
     context: &str,
-) -> Result<Option<ProjectedKktResidual>, String> {
+) -> Result<ProjectedKktResidual, String> {
     match residual {
-        Some(residual) => Ok(Some(residual)),
+        Some(residual) => Ok(residual),
         None => Err(CustomFamilyError::UnsupportedConfiguration { reason: format!(
             "{context}: converged joint-Newton exact inner solve did not produce a projected KKT \
              residual; refusing to assemble REML/LAML derivatives without the IFT correction input"
@@ -12291,6 +12291,17 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
     // sees principal blocks, so it drops the cross-block curvature that makes
     // the joint problem well conditioned near saturated optima.
 
+    // `last_residual_tol` mirrors the per-cycle KKT tolerance computed inside
+    // the joint-Newton loop (`inner_tol · (1 + max(‖∇L‖∞, ‖Sβ‖∞))`). It must
+    // live at function scope so both the post-converged exit block inside
+    // `if use_joint_newton` AND the post-block-fit IFT residual builder
+    // outside that branch can thread the same tolerance into the
+    // `ProjectedKktResidual::with_metadata(...)` builder. Seed at `inner_tol`
+    // so a path that skips the loop entirely (no joint-Newton, or zero
+    // cycles) still records a finite, non-NaN tolerance on the residual
+    // carrier rather than NaN.
+    let mut last_residual_tol: f64 = inner_tol;
+
     if use_joint_newton {
         // Build block ranges for the joint system.
         let ranges: Vec<(usize, usize)> = {
@@ -12433,16 +12444,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         // directly. Extra damping must be wired through an accepted/rejected
         // step policy before it belongs here; keep the matvec faithful to the
         // objective until then.
-        //
-        // `last_residual_tol` mirrors the per-cycle KKT tolerance computed at
-        // line ~12648 (`inner_tol · (1 + max(‖∇L‖∞, ‖Sβ‖∞))`). The
-        // post-converged exit block at the bottom of this function feeds the
-        // accepted certificate's `with_metadata` builder, which needs the
-        // same scale-aware tolerance that was actually applied to certify
-        // the cycle. Seed the value at `inner_tol` so a path that exits the
-        // loop before computing a cycle-local tol (e.g. zero cycles) still
-        // records a finite, non-NaN tolerance on the residual carrier.
-        let mut last_residual_tol: f64 = inner_tol;
         for cycle in 0..inner_loop_hard_ceiling {
             if cycle >= inner_max_cycles {
                 break;

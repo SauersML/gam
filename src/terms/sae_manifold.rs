@@ -207,7 +207,9 @@ impl SaeAtomBasisKind {
                     lo: -std::f64::consts::FRAC_PI_2,
                     hi: std::f64::consts::FRAC_PI_2,
                 },
-                LatentManifold::Circle { period: std::f64::consts::TAU },
+                LatentManifold::Circle {
+                    period: std::f64::consts::TAU,
+                },
             ]),
             // `Torus` uses [`TorusHarmonicEvaluator`], which shares the
             // fraction-of-period convention with `PeriodicHarmonicEvaluator`
@@ -2927,7 +2929,9 @@ mod tests {
                     lo: -std::f64::consts::FRAC_PI_2,
                     hi: std::f64::consts::FRAC_PI_2,
                 },
-                LatentManifold::Circle { period: std::f64::consts::TAU },
+                LatentManifold::Circle {
+                    period: std::f64::consts::TAU,
+                },
             ])],
             AssignmentMode::softmax(0.5),
         )

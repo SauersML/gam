@@ -1176,6 +1176,25 @@ fn hash_analytic_penalty_kind(
             }
             hash_weight_schedule_option(hasher, &p.weight_schedule);
         }
+        AnalyticPenaltyKind::Monotonicity(p) => {
+            hasher.write_str("monotonicity");
+            hasher.write_f64(p.weight);
+            hasher.write_usize(p.n_eff);
+            hasher.write_f64(p.direction);
+            hasher.write_f64(p.smoothing_eps);
+            hasher.write_bool(p.learnable_weight);
+            hasher.write_usize(p.rho_index);
+            hash_weight_schedule_option(hasher, &p.weight_schedule);
+        }
+        AnalyticPenaltyKind::SheafConsistency(p) => {
+            hasher.write_str("sheaf-consistency");
+            hasher.write_f64(p.weight());
+            let dims = p.stalk_dims();
+            hasher.write_usize(dims.len());
+            for &d in dims {
+                hasher.write_usize(d);
+            }
+        }
     }
 }
 
