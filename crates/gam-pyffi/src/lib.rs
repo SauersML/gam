@@ -19102,6 +19102,286 @@ impl BlockOrthogonalityPenalty {
     }
 }
 
+// ---------------------------------------------------------------------------
+// SheafConsistencyPenalty — cellular-sheaf consistency loss.
+// ---------------------------------------------------------------------------
+
+#[pyclass(module = "gam_pyffi._rust", name = "SheafConsistencyPenalty")]
+struct SheafConsistencyPenalty {
+    inner: CoreSheafConsistencyPenalty,
+    #[pyo3(get)]
+    weight: f64,
+    #[pyo3(get)]
+    target: PyObject,
+}
+
+fn sheaf_extract_edges(edges: &Bound<'_, PyAny>) -> PyResult<Vec<(usize, usize)>> {
+    let iter = edges.try_iter().map_err(|_| {
+        PyTypeError::new_err(
+            "SheafConsistencyPenalty.edges must be a sequence of (u, v) integer pairs",
+        )
+    })?;
+    let mut out = Vec::new();
+    for item in iter {
+        let item = item.map_err(|_| {
+            PyTypeError::new_err(
+                "SheafConsistencyPenalty.edges must be a sequence of (u, v) integer pairs",
+            )
+        })?;
+        let pair = item.try_iter().map_err(|_| {
+            PyTypeError::new_err(
+                "SheafConsistencyPenalty.edges entries must be (u, v) sequences of length 2",
+            )
+        })?;
+        let pair_vec: Vec<i64> = pair
+            .map(|x| {
+                x.and_then(|v| v.call_method0("__index__")?.extract::<i64>())
+                    .map_err(|_| {
+                        PyTypeError::new_err(
+                            "SheafConsistencyPenalty.edges entries must contain integers",
+                        )
+                    })
+            })
+            .collect::<PyResult<_>>()?;
+        if pair_vec.len() != 2 {
+            return Err(PyValueError::new_err(format!(
+                "SheafConsistencyPenalty.edges entries must have length 2, got {}",
+                pair_vec.len()
+            )));
+        }
+        if pair_vec[0] < 0 || pair_vec[1] < 0 {
+            return Err(PyValueError::new_err(
+                "SheafConsistencyPenalty.edges entries must be non-negative",
+            ));
+        }
+        out.push((pair_vec[0] as usize, pair_vec[1] as usize));
+    }
+    Ok(out)
+}
+
+fn sheaf_extract_array2(obj: &Bound<'_, PyAny>, label: &str) -> PyResult<Array2<f64>> {
+    let arr = obj.downcast::<PyArray2<f64>>().map_err(|_| {
+        PyTypeError::new_err(format!(
+            "SheafConsistencyPenalty: {label} must be a 2-D numpy.ndarray of float64"
+        ))
+    })?;
+    let readonly = arr.readonly();
+    Ok(readonly.as_array().to_owned())
+}
+
+fn sheaf_extract_restrictions(
+    restrictions: &Bound<'_, PyAny>,
+) -> PyResult<Vec<CoreEdgeRestriction>> {
+    let iter = restrictions.try_iter().map_err(|_| {
+        PyTypeError::new_err(
+            "SheafConsistencyPenalty.restriction_ops must be a sequence",
+        )
+    })?;
+    let mut out = Vec::new();
+    for (e, item) in iter.enumerate() {
+        let item = item.map_err(|_| {
+            PyTypeError::new_err(
+                "SheafConsistencyPenalty.restriction_ops entries must be numpy arrays or (W_uv, W_vu) tuples",
+            )
+        })?;
+        // Try direct 2-D array first → single-restriction edge.
+        if item.downcast::<PyArray2<f64>>().is_ok() {
+            let r = sheaf_extract_array2(&item, &format!("restriction_ops[{e}]"))?;
+            out.push(CoreEdgeRestriction::single(r));
+            continue;
+        }
+        // Otherwise expect a (W_uv, W_vu) pair.
+        let pair = item.try_iter().map_err(|_| {
+            PyTypeError::new_err(format!(
+                "SheafConsistencyPenalty.restriction_ops[{e}] must be a 2-D ndarray or a (W_uv, W_vu) tuple"
+            ))
+        })?;
+        let parts: Vec<Bound<'_, PyAny>> = pair.collect::<PyResult<_>>()?;
+        if parts.len() != 2 {
+            return Err(PyValueError::new_err(format!(
+                "SheafConsistencyPenalty.restriction_ops[{e}] tuple must have length 2, got {}",
+                parts.len()
+            )));
+        }
+        let r_uv = sheaf_extract_array2(&parts[0], &format!("restriction_ops[{e}].W_uv"))?;
+        // Allow None for the second slot via Python's None object.
+        if parts[1].is_none() {
+            out.push(CoreEdgeRestriction::single(r_uv));
+        } else {
+            let r_vu = sheaf_extract_array2(&parts[1], &format!("restriction_ops[{e}].W_vu"))?;
+            out.push(CoreEdgeRestriction::paired(r_uv, r_vu));
+        }
+    }
+    Ok(out)
+}
+
+fn sheaf_extract_stalk_dims(stalk_dims: &Bound<'_, PyAny>) -> PyResult<Vec<usize>> {
+    let iter = stalk_dims.try_iter().map_err(|_| {
+        PyTypeError::new_err("SheafConsistencyPenalty.stalk_dims must be a sequence of positive integers")
+    })?;
+    let mut out = Vec::new();
+    for item in iter {
+        let item = item.map_err(|_| {
+            PyTypeError::new_err(
+                "SheafConsistencyPenalty.stalk_dims entries must be integers",
+            )
+        })?;
+        let d = item.call_method0("__index__")?.extract::<i64>()?;
+        if d <= 0 {
+            return Err(PyValueError::new_err(format!(
+                "SheafConsistencyPenalty.stalk_dims entries must be > 0, got {d}"
+            )));
+        }
+        out.push(d as usize);
+    }
+    Ok(out)
+}
+
+#[pymethods]
+impl SheafConsistencyPenalty {
+    #[new]
+    #[pyo3(signature = (edges, restriction_ops, stalk_dims, weight = 1.0, *, target = None))]
+    fn new(
+        py: Python<'_>,
+        edges: &Bound<'_, PyAny>,
+        restriction_ops: &Bound<'_, PyAny>,
+        stalk_dims: &Bound<'_, PyAny>,
+        weight: f64,
+        target: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Self> {
+        if !(weight.is_finite() && weight > 0.0) {
+            return Err(PyValueError::new_err(format!(
+                "SheafConsistencyPenalty.weight must be > 0, got {weight}"
+            )));
+        }
+        let edges = sheaf_extract_edges(edges)?;
+        let restrictions = sheaf_extract_restrictions(restriction_ops)?;
+        let stalk_dims = sheaf_extract_stalk_dims(stalk_dims)?;
+        let inner =
+            CoreSheafConsistencyPenalty::new(edges, restrictions, weight, stalk_dims)
+                .map_err(PyValueError::new_err)?;
+        let target_obj = py_object_or_string_default(py, target, "z");
+        Ok(Self {
+            inner,
+            weight,
+            target: target_obj,
+        })
+    }
+
+    #[classattr]
+    const KIND_TAG: &'static str = "sheaf_consistency";
+
+    #[getter]
+    fn total_dim(&self) -> usize {
+        self.inner.total_dim()
+    }
+
+    #[getter]
+    fn num_edges(&self) -> usize {
+        self.inner.num_edges()
+    }
+
+    #[getter]
+    fn num_vertices(&self) -> usize {
+        self.inner.num_vertices()
+    }
+
+    #[getter]
+    fn stalk_dims(&self) -> Vec<usize> {
+        self.inner.stalk_dims().to_vec()
+    }
+
+    fn __call__<'py>(&self, s: PyReadonlyArray1<'py, f64>) -> PyResult<f64> {
+        let view = s.as_array();
+        if view.len() != self.inner.total_dim() {
+            return Err(PyValueError::new_err(format!(
+                "SheafConsistencyPenalty: input length {} != total stalk dim {}",
+                view.len(),
+                self.inner.total_dim()
+            )));
+        }
+        Ok(self.inner.value(view))
+    }
+
+    fn value<'py>(&self, s: PyReadonlyArray1<'py, f64>) -> PyResult<f64> {
+        self.__call__(s)
+    }
+
+    fn gradient<'py>(
+        &self,
+        py: Python<'py>,
+        s: PyReadonlyArray1<'py, f64>,
+    ) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        let view = s.as_array();
+        if view.len() != self.inner.total_dim() {
+            return Err(PyValueError::new_err(format!(
+                "SheafConsistencyPenalty.gradient: input length {} != total stalk dim {}",
+                view.len(),
+                self.inner.total_dim()
+            )));
+        }
+        let g = self.inner.gradient(view);
+        Ok(g.into_pyarray(py))
+    }
+
+    fn hessian_diag<'py>(
+        &self,
+        py: Python<'py>,
+        s: PyReadonlyArray1<'py, f64>,
+    ) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        let view = s.as_array();
+        if view.len() != self.inner.total_dim() {
+            return Err(PyValueError::new_err(format!(
+                "SheafConsistencyPenalty.hessian_diag: input length {} != total stalk dim {}",
+                view.len(),
+                self.inner.total_dim()
+            )));
+        }
+        let h = self.inner.hessian_diag(view);
+        Ok(h.into_pyarray(py))
+    }
+
+    fn hvp<'py>(
+        &self,
+        py: Python<'py>,
+        s: PyReadonlyArray1<'py, f64>,
+        v: PyReadonlyArray1<'py, f64>,
+    ) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        let sv = s.as_array();
+        let vv = v.as_array();
+        if sv.len() != self.inner.total_dim() || vv.len() != self.inner.total_dim() {
+            return Err(PyValueError::new_err(format!(
+                "SheafConsistencyPenalty.hvp: input lengths ({}, {}) != total stalk dim {}",
+                sv.len(),
+                vv.len(),
+                self.inner.total_dim()
+            )));
+        }
+        let hv = self.inner.hvp(sv, vv);
+        Ok(hv.into_pyarray(py))
+    }
+
+    #[pyo3(signature = (tol = 1e-8))]
+    fn harmonic_modes(&self, tol: f64) -> PyResult<usize> {
+        if !(tol.is_finite() && tol >= 0.0) {
+            return Err(PyValueError::new_err(format!(
+                "SheafConsistencyPenalty.harmonic_modes: tol must be finite and >= 0, got {tol}"
+            )));
+        }
+        Ok(self.inner.harmonic_modes(tol))
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "SheafConsistencyPenalty(K={}, edges={}, total_dim={}, weight={})",
+            self.inner.num_vertices(),
+            self.inner.num_edges(),
+            self.inner.total_dim(),
+            self.weight,
+        )
+    }
+}
+
 #[pyclass(module = "gam_pyffi._rust", name = "AuxConditionalPriorPenalty")]
 struct AuxConditionalPriorPenalty {
     #[pyo3(get, set)]
@@ -19733,6 +20013,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<BlockSparsityPenalty>()?;
     module.add_class::<BlockOrthogonalityPenalty>()?;
     module.add_class::<OrthogonalityPenalty>()?;
+    module.add_class::<SheafConsistencyPenalty>()?;
     module.add_class::<SoftmaxAssignmentSparsityPenalty>()?;
     module.add_class::<PyIBPAssignmentPenalty>()?;
     module.add_class::<ScadMcpPenalty>()?;
