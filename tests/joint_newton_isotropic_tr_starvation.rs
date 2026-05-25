@@ -437,9 +437,9 @@ fn feasibility_alpha_limits_only_the_constrained_block() {
     // becomes 0.01 instead of 1) while the other block stays at δ_other = 1.
     // Block 0: time, well-conditioned, H = 1, g = -1, so δ̂_time = 1
     // Block 1: other,                 H = 1, g = -1, so δ̂_other = 1
-    let h = ndarray::array![[1.0, 0.0], [0.0, 1.0]];
-    let g = ndarray::array![-1.0, -1.0];
-    let delta_hat = ndarray::array![1.0, 1.0];
+    let h = ndarray::array![[1.0_f64, 0.0_f64], [0.0_f64, 1.0_f64]];
+    let g = ndarray::array![-1.0_f64, -1.0_f64];
+    let delta_hat = ndarray::array![1.0_f64, 1.0_f64];
 
     // Sanity: full Newton kills g exactly.
     let exact_residual = &g + &h.dot(&delta_hat);
