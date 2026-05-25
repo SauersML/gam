@@ -81,19 +81,18 @@ def _call_hvp(
 
 
 def _infer_shape(t: Any) -> tuple[int, int]:
-    torch = _require_torch()
-    if isinstance(t, torch.Tensor):
-        if t.dim() == 1:
-            return int(t.shape[0]), 1
-        if t.dim() == 2:
-            return int(t.shape[0]), int(t.shape[1])
-        raise ValueError(f"penalty target must be 1-D or 2-D, got {t.dim()}-D")
-    arr = np.asarray(t)
-    if arr.ndim == 1:
-        return int(arr.shape[0]), 1
-    if arr.ndim == 2:
-        return int(arr.shape[0]), int(arr.shape[1])
-    raise ValueError(f"penalty target must be 1-D or 2-D, got {arr.ndim}-D")
+    # Avoid importing torch eagerly: most non-torch frames (numpy / jax)
+    # expose a stable ``.shape`` tuple we can read directly.
+    shape = getattr(t, "shape", None)
+    if shape is None:
+        arr = np.asarray(t)
+        shape = arr.shape
+    ndim = len(shape)
+    if ndim == 1:
+        return int(shape[0]), 1
+    if ndim == 2:
+        return int(shape[0]), int(shape[1])
+    raise ValueError(f"penalty target must be 1-D or 2-D, got {ndim}-D")
 
 
 class _PenaltyValueFn:
@@ -149,6 +148,21 @@ class _RustPenaltyDescriptor(PenaltyDescriptor):
         raise NotImplementedError
 
     def value(self, t: Any) -> Any:
+        """Penalty value ``P(t)`` in the frame of ``t``.
+
+        Frame is auto-detected (numpy / torch / jax). The Rust kernel runs
+        once; the output type matches the input frame. Torch / JAX outputs
+        carry an autograd graph back to ``t``.
+        """
+        from ._frame import Frame, detect_frame
+
+        frame = detect_frame(t)
+        if frame is Frame.NUMPY:
+            v, _g = self.value_grad(t)
+            return v
+        if frame is Frame.JAX:
+            v, _g = self.value_grad(t)
+            return v
         torch = _require_torch()
         if not isinstance(t, torch.Tensor):
             t = torch.as_tensor(t, dtype=torch.float64)
@@ -160,6 +174,26 @@ class _RustPenaltyDescriptor(PenaltyDescriptor):
         return fn.apply(t.contiguous(), n, d, self.target_name, json.dumps(descriptor))
 
     def value_grad(self, t: Any) -> tuple[Any, Any]:
+        """``(value, ∂value/∂t)`` in the frame of ``t``.
+
+        See :meth:`value` for the frame-dispatch contract.
+        """
+        from ._frame import Frame, detect_frame
+
+        frame = detect_frame(t)
+        if frame is Frame.NUMPY:
+            t_np = np.ascontiguousarray(np.asarray(t, dtype=np.float64))
+            n, d = _infer_shape(t_np)
+            descriptor = self._descriptor(n, d)
+            value, grad, _ = _call_value_grad(
+                t_np.reshape(-1), n, d, self.target_name, descriptor
+            )
+            return float(value), grad.reshape(t_np.shape)
+        if frame is Frame.JAX:
+            from ._penalty_frames import jax_penalty_value_grad
+
+            # Reuse the wrapper helper by adapting the rust call signature.
+            return _jax_value_grad_via_rust(self, t)
         torch = _require_torch()
         if not isinstance(t, torch.Tensor):
             t = torch.as_tensor(t, dtype=torch.float64)
@@ -187,6 +221,37 @@ class _RustPenaltyDescriptor(PenaltyDescriptor):
         return self.to_rust_descriptor()
 
     def hvp(self, t: Any, v: Any) -> Any:
+        """Hessian-vector product ``H · v`` in the frame shared by ``t`` and ``v``.
+
+        Both arguments must be in the same frame; a mismatch raises
+        :class:`TypeError` (see :func:`gamfit._frame.detect_frame`).
+        """
+        from ._frame import Frame, detect_frame
+
+        frame = detect_frame(t, v)
+        if frame is Frame.NUMPY:
+            t_np = np.ascontiguousarray(np.asarray(t, dtype=np.float64))
+            v_np = np.ascontiguousarray(np.asarray(v, dtype=np.float64))
+            if t_np.shape != v_np.shape:
+                raise ValueError(
+                    f"hvp target shape {t_np.shape} must match v shape {v_np.shape}"
+                )
+            n, d = _infer_shape(t_np)
+            descriptor = self._descriptor(n, d)
+            out = _call_hvp(
+                t_np.reshape(-1), v_np.reshape(-1), n, d, self.target_name, descriptor
+            )
+            return out.reshape(t_np.shape)
+        if frame is Frame.JAX:
+            from ._frame_jax import from_numpy_like, to_numpy_f64
+
+            t_np = to_numpy_f64(t).reshape(-1)
+            v_np = to_numpy_f64(v).reshape(-1)
+            shape = tuple(int(s) for s in getattr(t, "shape", (t_np.size,)))
+            n, d = _infer_shape(np.asarray(t, dtype=np.float64))
+            descriptor = self._descriptor(n, d)
+            out = _call_hvp(t_np, v_np, n, d, self.target_name, descriptor)
+            return from_numpy_like(out.reshape(shape), t)
         torch = _require_torch()
         if not isinstance(t, torch.Tensor):
             t = torch.as_tensor(t, dtype=torch.float64)
@@ -202,6 +267,59 @@ class _RustPenaltyDescriptor(PenaltyDescriptor):
         v_np = _to_numpy_f64(v)
         out = _call_hvp(t_np, v_np, n, d, self.target_name, descriptor)
         return torch.as_tensor(out, dtype=t.dtype, device=t.device).reshape_as(t)
+
+
+def _jax_value_grad_via_rust(descriptor_obj: Any, t: Any) -> tuple[Any, Any]:
+    """JAX-frame ``(value, grad)`` for a :class:`_RustPenaltyDescriptor`.
+
+    The forward call dispatches through :func:`jax.pure_callback` so the
+    same Rust kernel runs unchanged; the backward route is a
+    :class:`jax.custom_vjp` consulting the kernel's analytic gradient.
+    """
+    from ._frame import import_jax
+    from ._frame_jax import from_numpy_like, to_numpy_f64
+
+    jax, jnp = import_jax()
+
+    t_np = to_numpy_f64(t)
+    shape = tuple(int(s) for s in t.shape)
+    n, d = _infer_shape(t_np)
+    descriptor = descriptor_obj._descriptor(n, d)
+    target_name = descriptor_obj.target_name
+
+    value_spec = jax.ShapeDtypeStruct((), jnp.float64)
+    grad_spec = jax.ShapeDtypeStruct(shape, jnp.float64)
+
+    def _host_val(x: Any) -> np.ndarray:
+        x_np = np.asarray(x, dtype=np.float64).reshape(-1)
+        v, _g, _ = _call_value_grad(x_np, n, d, target_name, descriptor)
+        return np.asarray(v, dtype=np.float64)
+
+    def _host_grad(args: Any) -> np.ndarray:
+        x, gout = args
+        x_np = np.asarray(x, dtype=np.float64).reshape(-1)
+        _v, g, _ = _call_value_grad(x_np, n, d, target_name, descriptor)
+        return np.ascontiguousarray(
+            (np.asarray(g, dtype=np.float64) * float(np.asarray(gout))).reshape(shape)
+        )
+
+    @jax.custom_vjp
+    def _val(x: Any) -> Any:
+        return jax.pure_callback(_host_val, value_spec, x)
+
+    def _val_fwd(x: Any) -> tuple[Any, Any]:
+        return _val(x), x
+
+    def _val_bwd(res: Any, g: Any) -> tuple[Any]:
+        return (jax.pure_callback(_host_grad, grad_spec, (res, g)),)
+
+    _val.defvjp(_val_fwd, _val_bwd)
+
+    value_j = _val(t)
+    # Analytic gradient (no autograd needed) for the second return slot.
+    _v0, g0, _ = _call_value_grad(t_np.reshape(-1), n, d, target_name, descriptor)
+    grad_j = from_numpy_like(np.asarray(g0, dtype=np.float64).reshape(shape), t)
+    return value_j, grad_j
 
 
 class ARDPenalty(_RustPenaltyDescriptor):
