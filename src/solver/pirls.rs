@@ -4876,7 +4876,7 @@ where
         // Fisher-fallback (different problem, restart the LM trajectory).
         let mut madsen_reject_factor = 2.0_f64;
         let mut pending_arrow_latent_restore: Option<Array1<f64>> = None;
-        let mut pending_arrow_predicted_reduction: Option<f64> = None;
+        let mut pending_arrow_predicted_reduction: Option<f64>;
 
         // Copy the hessian into the reusable buffer (avoids allocation after first iteration).
         let mut regularized =
