@@ -45,7 +45,7 @@ use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 pub mod deviation_runtime;
 pub(crate) mod exact_kernel;
@@ -4809,10 +4809,10 @@ struct BernoulliMarginalSlopeExactEvalCache {
     /// callers reduce to a 2×2 [`contract_third_full`].
     ///
     /// Stored as `Result` because the build is fallible (per-row jet may
-    /// surface a non-finite value). Wrapping in `OnceLock` ensures the
-    /// expensive build runs exactly once across all concurrent threads;
-    /// failure is sticky and propagated identically to every caller.
-    rigid_third_full: OnceLock<Result<Vec<[[[f64; 2]; 2]; 2]>, String>>,
+    /// surface a non-finite value). `RayonSafeOnce` keeps lazy initialization
+    /// safe when the first caller is already inside a Rayon row pass; failure
+    /// is sticky and propagated identically to every caller.
+    rigid_third_full: crate::resource::RayonSafeOnce<Result<Vec<[[[f64; 2]; 2]; 2]>, String>>,
 
     /// Per-row uncontracted fourth-derivative tensor in the rigid path —
     /// the second-order analogue of `rigid_third_full`. The outer-Hessian
@@ -4837,14 +4837,14 @@ struct BernoulliRigidRowKernel {
     /// runs at most once per row across the full ext-dim sweep, instead of
     /// once per (row, ψ-axis) pair. Per-axis `row_third_contracted` becomes
     /// a 2×2 bilinear contraction against the cached tensor.
-    third_full_cache: OnceLock<Vec<[[[f64; 2]; 2]; 2]>>,
+    third_full_cache: crate::resource::RayonSafeOnce<Vec<[[[f64; 2]; 2]; 2]>>,
     /// Per-row uncontracted fourth-derivative tensor — the outer-Hessian
     /// analogue of `third_full_cache`. The second-directional-derivative
     /// operator's trace path touches every row × (u, v) pair; with this
     /// cache the heavy 8-direction empirical jet (or closed-form 5-component
     /// build) runs at most once per row, leaving each pair with a cheap
     /// [`contract_fourth_full`] bilinear.
-    fourth_full_cache: OnceLock<Vec<[[[[f64; 2]; 2]; 2]; 2]>>,
+    fourth_full_cache: crate::resource::RayonSafeOnce<Vec<[[[[f64; 2]; 2]; 2]; 2]>>,
 }
 
 impl BernoulliRigidRowKernel {
@@ -4854,8 +4854,8 @@ impl BernoulliRigidRowKernel {
             family,
             block_states,
             slices,
-            third_full_cache: OnceLock::new(),
-            fourth_full_cache: OnceLock::new(),
+            third_full_cache: crate::resource::RayonSafeOnce::new(),
+            fourth_full_cache: crate::resource::RayonSafeOnce::new(),
         }
     }
 

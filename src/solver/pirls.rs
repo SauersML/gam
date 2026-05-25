@@ -1256,6 +1256,17 @@ fn restore_arrow_latent_if_needed(
     }
 }
 
+fn restore_pending_arrow_latent_if_needed(
+    options: &WorkingModelPirlsOptions,
+    pending_snapshot: &mut Option<Array1<f64>>,
+) {
+    restore_arrow_latent_if_needed(options, pending_snapshot.take());
+}
+
+fn commit_pending_arrow_latent(pending_snapshot: &mut Option<Array1<f64>>) {
+    drop(pending_snapshot.take());
+}
+
 #[inline]
 fn effective_kkt_tolerance(options: &WorkingModelPirlsOptions) -> f64 {
     match options.adaptive_kkt_tolerance {
@@ -4557,6 +4568,7 @@ where
         options.coefficient_lower_bounds.is_some() || options.linear_constraints.is_some();
     let mut min_penalized_deviance = f64::INFINITY;
     let mut final_state: Option<WorkingState> = None;
+    let mut final_state_cache_key: Option<PirlsAcceptedStateCacheKey> = None;
     // Initial gradient norm captured at iter 1 so the post-loop
     // `[PIRLS solve-end]` summary can report the geometric reduction
     // factor `(g_end / g_start)^(1/iters)` — the per-iter convergence

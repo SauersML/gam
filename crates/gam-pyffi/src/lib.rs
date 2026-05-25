@@ -16986,15 +16986,15 @@ struct TotalVariationPenalty {
 #[pymethods]
 impl TotalVariationPenalty {
     #[new]
-    #[pyo3(signature = (weight, n_eff, difference_op = default_forward_1d_py(), smoothing_eps = 1.0e-6, learnable = false, *, target = default_target_py()))]
+    #[pyo3(signature = (weight, n_eff, difference_op = None, smoothing_eps = 1.0e-6, learnable = false, *, target = None))]
     fn new(
         py: Python<'_>,
         weight: f64,
         n_eff: i64,
-        difference_op: PyObject,
+        difference_op: Option<&Bound<'_, PyAny>>,
         smoothing_eps: f64,
         learnable: bool,
-        target: PyObject,
+        target: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         if weight <= 0.0 {
             return Err(PyValueError::new_err(format!(
@@ -17012,6 +17012,8 @@ impl TotalVariationPenalty {
             )));
         }
 
+        let difference_op = py_object_or_string_default(py, difference_op, "forward_1d");
+        let target = py_object_or_string_default(py, target, "t");
         let bound_difference_op = difference_op.bind(py);
         let edges = if let Ok(op) = bound_difference_op.extract::<String>() {
             if op != "forward_1d" {

@@ -1691,17 +1691,15 @@ impl SaeManifoldTerm {
                         trial_step_size,
                     )
                     .and_then(|()| self.loss(target, rho));
-                match trial_result {
-                    Ok(post_step_loss) => {
-                        let post_step_total = post_step_loss.total();
-                        let armijo_bound = pre_step_total
+                if let Ok(post_step_loss) = trial_result {
+                    let post_step_total = post_step_loss.total();
+                    let armijo_bound =
+                        pre_step_total
                             - SAE_MANIFOLD_ARMIJO_C1 * trial_step_size * directional_decrease;
-                        if post_step_total.is_finite() && post_step_total <= armijo_bound {
-                            accepted = true;
-                            break;
-                        }
+                    if post_step_total.is_finite() && post_step_total <= armijo_bound {
+                        accepted = true;
+                        break;
                     }
-                    Err(_) => {}
                 }
                 trial_step_size *= 0.5;
             }
@@ -1786,6 +1784,26 @@ impl SaeManifoldTerm {
         }
         (assignment, ard)
     }
+}
+
+fn sae_manifold_newton_directional_decrease(
+    sys: &ArrowSchurSystem,
+    delta_ext_coord: ArrayView1<'_, f64>,
+    delta_beta: ArrayView1<'_, f64>,
+) -> f64 {
+    assert_eq!(delta_ext_coord.len(), sys.rows.len() * sys.d);
+    assert_eq!(delta_beta.len(), sys.k);
+    let mut gradient_dot_step = 0.0;
+    for (row_idx, row) in sys.rows.iter().enumerate() {
+        let row_base = row_idx * sys.d;
+        for axis in 0..sys.d {
+            gradient_dot_step += row.gt[axis] * delta_ext_coord[row_base + axis];
+        }
+    }
+    for idx in 0..sys.k {
+        gradient_dot_step += sys.gb[idx] * delta_beta[idx];
+    }
+    -gradient_dot_step
 }
 
 fn softmax_row(logits: ArrayView1<'_, f64>, temperature: f64) -> Array1<f64> {
