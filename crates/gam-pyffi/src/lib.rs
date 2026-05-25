@@ -564,6 +564,21 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
             "gaussian_reml_fit_with_constraints_forward",
             "gaussian_reml_fit_with_constraints_backward",
             "sphere_frechet_mean",
+            "response_geometry_closure",
+            "response_geometry_clr",
+            "response_geometry_alr",
+            "response_geometry_inverse_alr",
+            "response_geometry_simplex_frechet_mean",
+            "response_geometry_simplex_log_map",
+            "response_geometry_simplex_exp_map",
+            "response_geometry_sphere_log_map",
+            "response_geometry_sphere_exp_map",
+            "response_geometry_normalize_fisher_rao",
+            "equivariant_rho_so2",
+            "equivariant_rho_so2_jvp",
+            "equivariant_rho_so3",
+            "equivariant_rho_so3_jvp",
+            "equivariant_gauge_companion_loss",
         ],
     )?;
     info.set_item(
@@ -11129,6 +11144,1097 @@ fn equivariant_penalty_value<'py>(
     Ok(value)
 }
 
+// ===========================================================================
+// Response-geometry transforms (simplex + sphere) and equivariant rho/jvp +
+// gauge-companion loss — rustified from gamfit/_response_geometry.py and
+// gamfit/_equivariant.py. Each pyfunction is a thin marshalled entrypoint
+// that delegates to a pure-Rust impl on ndarray views.
+// ===========================================================================
+
+fn rg_vector_norm(v: ArrayView1<'_, f64>) -> f64 {
+    v.iter().map(|x| x * x).sum::<f64>().sqrt()
+}
+
+fn rg_validate_array(values: ArrayView2<'_, f64>, label: &str) -> Result<(), String> {
+    let (n, d) = values.dim();
+    if n == 0 || d < 2 {
+        return Err(format!(
+            "{label} must have at least one row and at least two columns"
+        ));
+    }
+    if let Some(((row, col), value)) = values.indexed_iter().find(|(_, v)| !v.is_finite()) {
+        return Err(format!(
+            "{label} must contain only finite values; got {value} at ({row}, {col})"
+        ));
+    }
+    Ok(())
+}
+
+fn rg_normalize_sphere_matrix(values: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
+    rg_validate_array(values, "spherical values")?;
+    let (n, d) = values.dim();
+    let mut out = Array2::<f64>::zeros((n, d));
+    for row in 0..n {
+        let norm = rg_vector_norm(values.row(row));
+        if norm <= 0.0 {
+            return Err("spherical rows must have non-zero norm".to_string());
+        }
+        for col in 0..d {
+            out[[row, col]] = values[[row, col]] / norm;
+        }
+    }
+    Ok(out)
+}
+
+fn rg_normalize_weights(
+    n: usize,
+    weights: Option<ArrayView1<'_, f64>>,
+) -> Result<Array1<f64>, String> {
+    match weights {
+        None => Ok(Array1::from_elem(n, 1.0 / n as f64)),
+        Some(w) => {
+            if w.len() != n {
+                return Err("weights length must match the number of rows".to_string());
+            }
+            let mut total = 0.0_f64;
+            for value in w.iter() {
+                if !value.is_finite() || *value < 0.0 {
+                    return Err(
+                        "weights must be finite, non-negative, and have positive total"
+                            .to_string(),
+                    );
+                }
+                total += *value;
+            }
+            if total <= 0.0 {
+                return Err(
+                    "weights must be finite, non-negative, and have positive total".to_string(),
+                );
+            }
+            Ok(w.mapv(|v| v / total))
+        }
+    }
+}
+
+fn rg_closure_impl(values: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
+    rg_validate_array(values, "simplex values")?;
+    let (n, d) = values.dim();
+    let mut out = Array2::<f64>::zeros((n, d));
+    for row in 0..n {
+        let mut total = 0.0_f64;
+        for col in 0..d {
+            let v = values[[row, col]];
+            if v < 0.0 {
+                return Err("simplex values must be non-negative".to_string());
+            }
+            total += v;
+        }
+        if total <= 0.0 {
+            return Err("simplex rows must have positive total mass".to_string());
+        }
+        for col in 0..d {
+            out[[row, col]] = values[[row, col]] / total;
+        }
+    }
+    Ok(out)
+}
+
+fn rg_require_positive(comp: ArrayView2<'_, f64>, label: &str) -> Result<(), String> {
+    for value in comp.iter() {
+        if *value <= 0.0 {
+            return Err(format!("{label} require strictly positive simplex values"));
+        }
+    }
+    Ok(())
+}
+
+fn rg_clr_impl(values: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
+    let comp = rg_closure_impl(values)?;
+    rg_require_positive(comp.view(), "CLR coordinates")?;
+    let (n, d) = comp.dim();
+    let mut out = Array2::<f64>::zeros((n, d));
+    for row in 0..n {
+        let mut sum_log = 0.0_f64;
+        for col in 0..d {
+            let lg = comp[[row, col]].ln();
+            out[[row, col]] = lg;
+            sum_log += lg;
+        }
+        let mean = sum_log / (d as f64);
+        for col in 0..d {
+            out[[row, col]] -= mean;
+        }
+    }
+    Ok(out)
+}
+
+fn rg_resolve_reference(reference: isize, d: usize) -> usize {
+    let d_i = d as isize;
+    let mut r = reference % d_i;
+    if r < 0 {
+        r += d_i;
+    }
+    r as usize
+}
+
+fn rg_alr_impl(values: ArrayView2<'_, f64>, reference: isize) -> Result<Array2<f64>, String> {
+    let comp = rg_closure_impl(values)?;
+    rg_require_positive(comp.view(), "ALR coordinates")?;
+    let (n, d) = comp.dim();
+    let ref_idx = rg_resolve_reference(reference, d);
+    let mut out = Array2::<f64>::zeros((n, d - 1));
+    for row in 0..n {
+        let log_ref = comp[[row, ref_idx]].ln();
+        let mut k = 0usize;
+        for col in 0..d {
+            if col == ref_idx {
+                continue;
+            }
+            out[[row, k]] = comp[[row, col]].ln() - log_ref;
+            k += 1;
+        }
+    }
+    Ok(out)
+}
+
+fn rg_inverse_alr_impl(
+    coords: ArrayView2<'_, f64>,
+    reference: isize,
+) -> Result<Array2<f64>, String> {
+    let (n, dm1) = coords.dim();
+    if !coords.iter().all(|v| v.is_finite()) {
+        return Err("ALR coordinates must contain only finite values".to_string());
+    }
+    let d = dm1 + 1;
+    let ref_idx = rg_resolve_reference(reference, d);
+    let mut out = Array2::<f64>::zeros((n, d));
+    for row in 0..n {
+        let mut max_v = f64::NEG_INFINITY;
+        let mut k = 0usize;
+        for col in 0..d {
+            let v = if col == ref_idx {
+                0.0
+            } else {
+                let val = coords[[row, k]];
+                k += 1;
+                val
+            };
+            out[[row, col]] = v;
+            if v > max_v {
+                max_v = v;
+            }
+        }
+        let mut total = 0.0_f64;
+        for col in 0..d {
+            let e = (out[[row, col]] - max_v).exp();
+            out[[row, col]] = e;
+            total += e;
+        }
+        for col in 0..d {
+            out[[row, col]] /= total;
+        }
+    }
+    Ok(out)
+}
+
+fn rg_simplex_frechet_mean_impl(
+    values: ArrayView2<'_, f64>,
+    weights: Option<ArrayView1<'_, f64>>,
+) -> Result<Array1<f64>, String> {
+    let comp = rg_closure_impl(values)?;
+    rg_require_positive(comp.view(), "simplex Fréchet mean")?;
+    let (n, d) = comp.dim();
+    let w = rg_normalize_weights(n, weights)?;
+    let mut mean_log = Array1::<f64>::zeros(d);
+    for row in 0..n {
+        for col in 0..d {
+            mean_log[col] += w[row] * comp[[row, col]].ln();
+        }
+    }
+    let mut max_v = f64::NEG_INFINITY;
+    for &v in mean_log.iter() {
+        if v > max_v {
+            max_v = v;
+        }
+    }
+    let mut total = 0.0_f64;
+    let mut out = Array1::<f64>::zeros(d);
+    for col in 0..d {
+        let e = (mean_log[col] - max_v).exp();
+        out[col] = e;
+        total += e;
+    }
+    for col in 0..d {
+        out[col] /= total;
+    }
+    Ok(out)
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum RgSimplexCoord {
+    Clr,
+    Alr,
+}
+
+fn rg_parse_simplex_coord(coordinates: &str) -> Result<RgSimplexCoord, String> {
+    match coordinates.to_ascii_lowercase().as_str() {
+        "simplex" | "clr" => Ok(RgSimplexCoord::Clr),
+        "alr" => Ok(RgSimplexCoord::Alr),
+        other => Err(format!(
+            "simplex coordinates must be 'clr' or 'alr'; got {other:?}"
+        )),
+    }
+}
+
+fn rg_simplex_log_map_impl(
+    values: ArrayView2<'_, f64>,
+    base: ArrayView1<'_, f64>,
+    coord: RgSimplexCoord,
+    reference: isize,
+) -> Result<Array2<f64>, String> {
+    let comp = rg_closure_impl(values)?;
+    let base2 = Array2::from_shape_fn((1, base.len()), |(_, j)| base[j]);
+    let base_comp = rg_closure_impl(base2.view())?;
+    if comp.ncols() != base_comp.ncols() {
+        return Err("simplex values and base point have different dimensions".to_string());
+    }
+    rg_require_positive(comp.view(), "simplex log map")?;
+    rg_require_positive(base_comp.view(), "simplex log map")?;
+    match coord {
+        RgSimplexCoord::Clr => {
+            let values_clr = rg_clr_impl(values)?;
+            let base_clr = rg_clr_impl(base2.view())?;
+            let (n, d) = values_clr.dim();
+            let mut out = Array2::<f64>::zeros((n, d));
+            for row in 0..n {
+                for col in 0..d {
+                    out[[row, col]] = values_clr[[row, col]] - base_clr[[0, col]];
+                }
+            }
+            Ok(out)
+        }
+        RgSimplexCoord::Alr => {
+            let values_alr = rg_alr_impl(values, reference)?;
+            let base_alr = rg_alr_impl(base2.view(), reference)?;
+            let (n, dm1) = values_alr.dim();
+            let mut out = Array2::<f64>::zeros((n, dm1));
+            for row in 0..n {
+                for col in 0..dm1 {
+                    out[[row, col]] = values_alr[[row, col]] - base_alr[[0, col]];
+                }
+            }
+            Ok(out)
+        }
+    }
+}
+
+fn rg_simplex_exp_map_impl(
+    tangent: ArrayView2<'_, f64>,
+    base: ArrayView1<'_, f64>,
+    coord: RgSimplexCoord,
+    reference: isize,
+) -> Result<Array2<f64>, String> {
+    let base2 = Array2::from_shape_fn((1, base.len()), |(_, j)| base[j]);
+    let base_comp = rg_closure_impl(base2.view())?;
+    let d = base_comp.ncols();
+    match coord {
+        RgSimplexCoord::Clr => {
+            if tangent.ncols() != d {
+                return Err("CLR tangent dimension must equal simplex dimension".to_string());
+            }
+            let n = tangent.nrows();
+            let mut out = Array2::<f64>::zeros((n, d));
+            for row in 0..n {
+                let mut max_v = f64::NEG_INFINITY;
+                for col in 0..d {
+                    let lg = base_comp[[0, col]].ln() + tangent[[row, col]];
+                    out[[row, col]] = lg;
+                    if lg > max_v {
+                        max_v = lg;
+                    }
+                }
+                let mut total = 0.0_f64;
+                for col in 0..d {
+                    let e = (out[[row, col]] - max_v).exp();
+                    out[[row, col]] = e;
+                    total += e;
+                }
+                for col in 0..d {
+                    out[[row, col]] /= total;
+                }
+            }
+            Ok(out)
+        }
+        RgSimplexCoord::Alr => {
+            if tangent.ncols() + 1 != d {
+                return Err(
+                    "ALR tangent dimension must be simplex dimension minus one".to_string(),
+                );
+            }
+            let base_alr = rg_alr_impl(base2.view(), reference)?;
+            let n = tangent.nrows();
+            let dm1 = d - 1;
+            let mut shifted = Array2::<f64>::zeros((n, dm1));
+            for row in 0..n {
+                for col in 0..dm1 {
+                    shifted[[row, col]] = base_alr[[0, col]] + tangent[[row, col]];
+                }
+            }
+            rg_inverse_alr_impl(shifted.view(), reference)
+        }
+    }
+}
+
+fn rg_sphere_log_map_impl(
+    values: ArrayView2<'_, f64>,
+    base: ArrayView1<'_, f64>,
+) -> Result<Array2<f64>, String> {
+    let y = rg_normalize_sphere_matrix(values)?;
+    let base2 = Array2::from_shape_fn((1, base.len()), |(_, j)| base[j]);
+    let b_mat = rg_normalize_sphere_matrix(base2.view())?;
+    let (n, d) = y.dim();
+    if d != b_mat.ncols() {
+        return Err("spherical values and base point have different dimensions".to_string());
+    }
+    let mut out = Array2::<f64>::zeros((n, d));
+    for row in 0..n {
+        let mut dot = 0.0_f64;
+        for col in 0..d {
+            dot += y[[row, col]] * b_mat[[0, col]];
+        }
+        dot = dot.clamp(-1.0, 1.0);
+        if dot <= -1.0 + 1.0e-12 {
+            return Err("spherical log map is undefined at antipodal points".to_string());
+        }
+        let theta = dot.acos();
+        let sin_theta = theta.sin();
+        let scale = if sin_theta > 1.0e-12 {
+            theta / sin_theta
+        } else {
+            1.0
+        };
+        if theta < 1.0e-12 {
+            for col in 0..d {
+                out[[row, col]] = 0.0;
+            }
+        } else {
+            for col in 0..d {
+                out[[row, col]] = (y[[row, col]] - dot * b_mat[[0, col]]) * scale;
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn rg_sphere_exp_map_impl(
+    tangent: ArrayView2<'_, f64>,
+    base: ArrayView1<'_, f64>,
+) -> Result<Array2<f64>, String> {
+    let base2 = Array2::from_shape_fn((1, base.len()), |(_, j)| base[j]);
+    let b_mat = rg_normalize_sphere_matrix(base2.view())?;
+    let (n, d) = tangent.dim();
+    if d != b_mat.ncols() {
+        return Err("spherical tangent and base point have different dimensions".to_string());
+    }
+    if !tangent.iter().all(|v| v.is_finite()) {
+        return Err("spherical tangent must contain only finite values".to_string());
+    }
+    let mut out = Array2::<f64>::zeros((n, d));
+    for row in 0..n {
+        let mut radial = 0.0_f64;
+        for col in 0..d {
+            radial += tangent[[row, col]] * b_mat[[0, col]];
+        }
+        let mut z = vec![0.0_f64; d];
+        let mut r_sq = 0.0_f64;
+        for col in 0..d {
+            let v = tangent[[row, col]] - radial * b_mat[[0, col]];
+            z[col] = v;
+            r_sq += v * v;
+        }
+        let r = r_sq.sqrt();
+        let mut norm_sq = 0.0_f64;
+        if r < 1.0e-12 {
+            for col in 0..d {
+                let v = b_mat[[0, col]] + z[col];
+                out[[row, col]] = v;
+                norm_sq += v * v;
+            }
+        } else {
+            let cos_r = r.cos();
+            let sin_scale = r.sin() / r;
+            for col in 0..d {
+                let v = cos_r * b_mat[[0, col]] + sin_scale * z[col];
+                out[[row, col]] = v;
+                norm_sq += v * v;
+            }
+        }
+        let norm = norm_sq.sqrt();
+        if !norm.is_finite() || norm <= 0.0 {
+            return Err("spherical exponential map produced a non-finite point".to_string());
+        }
+        for col in 0..d {
+            out[[row, col]] /= norm;
+        }
+    }
+    Ok(out)
+}
+
+fn rg_sphere_orthogonal_unit(vector: ArrayView1<'_, f64>) -> Result<Array1<f64>, String> {
+    let mut min_index = 0;
+    let mut min_abs = vector[0].abs();
+    for (index, value) in vector.iter().enumerate().skip(1) {
+        let candidate = value.abs();
+        if candidate < min_abs {
+            min_abs = candidate;
+            min_index = index;
+        }
+    }
+    let axis_dot = vector[min_index];
+    let mut tangent = Array1::<f64>::zeros(vector.len());
+    tangent[min_index] = 1.0;
+    for col in 0..vector.len() {
+        tangent[col] -= axis_dot * vector[col];
+    }
+    let norm = rg_vector_norm(tangent.view());
+    if norm <= 0.0 {
+        return Err("cannot construct a tangent direction for the spherical mean".to_string());
+    }
+    Ok(tangent.mapv(|v| v / norm))
+}
+
+fn rg_sphere_mean_candidates(
+    values: ArrayView2<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+) -> Result<Vec<Array1<f64>>, String> {
+    let (n, d) = values.dim();
+    let mut candidates: Vec<Array1<f64>> = Vec::new();
+    let mut extrinsic = Array1::<f64>::zeros(d);
+    for row in 0..n {
+        for col in 0..d {
+            extrinsic[col] += weights[row] * values[[row, col]];
+        }
+    }
+    let ex_norm = rg_vector_norm(extrinsic.view());
+    if ex_norm > 0.0 {
+        candidates.push(extrinsic.mapv(|v| v / ex_norm));
+    }
+    let mut moment = Array2::<f64>::zeros((d, d));
+    for row in 0..n {
+        for r in 0..d {
+            for c in 0..d {
+                moment[[r, c]] += weights[row] * values[[row, r]] * values[[row, c]];
+            }
+        }
+    }
+    let mut v = Array1::<f64>::from_elem(d, 1.0 / (d as f64).sqrt());
+    for _ in 0..64 {
+        let mut nv = Array1::<f64>::zeros(d);
+        for r in 0..d {
+            let mut acc = 0.0;
+            for c in 0..d {
+                acc += moment[[r, c]] * v[c];
+            }
+            nv[r] = acc;
+        }
+        let nrm = rg_vector_norm(nv.view());
+        if nrm <= 0.0 {
+            break;
+        }
+        nv.mapv_inplace(|x| x / nrm);
+        v = nv;
+    }
+    let v_norm = rg_vector_norm(v.view());
+    if v_norm > 0.0 {
+        let unit = v.mapv(|x| x / v_norm);
+        candidates.push(unit.clone());
+        candidates.push(unit.mapv(|x| -x));
+    }
+    Ok(candidates)
+}
+
+fn rg_sphere_weighted_log_step(
+    values: ArrayView2<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    base: ArrayView1<'_, f64>,
+) -> Result<Array1<f64>, String> {
+    let mut step = Array1::<f64>::zeros(base.len());
+    for row in 0..values.nrows() {
+        let mut dot = 0.0_f64;
+        for col in 0..base.len() {
+            dot += values[[row, col]] * base[col];
+        }
+        let dot = dot.clamp(-1.0, 1.0);
+        if dot <= -1.0 + 1.0e-12 {
+            return Err("spherical log map is undefined at antipodal points".to_string());
+        }
+        let theta = dot.acos();
+        if theta < 1.0e-12 {
+            continue;
+        }
+        let sin_theta = theta.sin();
+        let scale = if sin_theta > 1.0e-12 {
+            theta / sin_theta
+        } else {
+            1.0
+        };
+        for col in 0..base.len() {
+            step[col] += weights[row] * (values[[row, col]] - dot * base[col]) * scale;
+        }
+    }
+    Ok(step)
+}
+
+fn rg_sphere_exp_single(
+    tangent: ArrayView1<'_, f64>,
+    base: ArrayView1<'_, f64>,
+) -> Result<Array1<f64>, String> {
+    let mut radial = 0.0_f64;
+    for i in 0..base.len() {
+        radial += tangent[i] * base[i];
+    }
+    let mut z = Array1::<f64>::zeros(base.len());
+    for col in 0..base.len() {
+        z[col] = tangent[col] - radial * base[col];
+    }
+    let r = rg_vector_norm(z.view());
+    let mut out = Array1::<f64>::zeros(base.len());
+    if r < 1.0e-12 {
+        for col in 0..base.len() {
+            out[col] = base[col] + z[col];
+        }
+    } else {
+        let cos_r = r.cos();
+        let sin_scale = r.sin() / r;
+        for col in 0..base.len() {
+            out[col] = cos_r * base[col] + sin_scale * z[col];
+        }
+    }
+    let norm = rg_vector_norm(out.view());
+    if !norm.is_finite() || norm <= 0.0 {
+        return Err("spherical exponential map produced a non-finite point".to_string());
+    }
+    Ok(out.mapv(|v| v / norm))
+}
+
+fn rg_sphere_frechet_objective(
+    values: ArrayView2<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    base: ArrayView1<'_, f64>,
+) -> f64 {
+    let mut obj = 0.0_f64;
+    for row in 0..values.nrows() {
+        let mut dot = 0.0_f64;
+        for col in 0..base.len() {
+            dot += values[[row, col]] * base[col];
+        }
+        let dot = dot.clamp(-1.0, 1.0);
+        let theta = dot.acos();
+        obj += weights[row] * theta * theta;
+    }
+    obj
+}
+
+fn rg_sphere_frechet_mean_impl(
+    values: ArrayView2<'_, f64>,
+    weights: Option<ArrayView1<'_, f64>>,
+    tol: f64,
+    max_iter: usize,
+) -> Result<Array1<f64>, String> {
+    if !(tol.is_finite() && tol >= 0.0) {
+        return Err(
+            "spherical Fréchet mean tolerance must be finite and non-negative".to_string(),
+        );
+    }
+    let y = rg_normalize_sphere_matrix(values)?;
+    let w = rg_normalize_weights(y.nrows(), weights)?;
+    let mut candidates = rg_sphere_mean_candidates(y.view(), w.view())?;
+    if candidates.is_empty() {
+        candidates.push(rg_sphere_orthogonal_unit(y.row(0))?);
+    }
+    let mut best_mu: Option<Array1<f64>> = None;
+    let mut best_obj = f64::INFINITY;
+    for candidate in candidates {
+        let mut mu = candidate;
+        let mut failed = false;
+        for _ in 0..max_iter {
+            let step = match rg_sphere_weighted_log_step(y.view(), w.view(), mu.view()) {
+                Ok(step) => step,
+                Err(_) => {
+                    failed = true;
+                    break;
+                }
+            };
+            let step_norm = rg_vector_norm(step.view());
+            if step_norm < tol {
+                break;
+            }
+            mu = rg_sphere_exp_single(step.view(), mu.view())?;
+        }
+        if failed {
+            continue;
+        }
+        let obj = rg_sphere_frechet_objective(y.view(), w.view(), mu.view());
+        if obj < best_obj {
+            best_obj = obj;
+            best_mu = Some(mu);
+        }
+    }
+    best_mu.ok_or_else(|| {
+        "spherical Fréchet mean is not identifiable for these points".to_string()
+    })
+}
+
+fn rg_normalize_fisher_rao_impl(
+    arr: ArrayViewD<'_, f64>,
+    n_rows: usize,
+    dim: usize,
+) -> Result<Array3<f64>, String> {
+    if !arr.iter().all(|v| v.is_finite()) {
+        return Err("fisher_rao_w must contain only finite values".to_string());
+    }
+    let shape = arr.shape().to_vec();
+    let out: Array3<f64> = match arr.ndim() {
+        1 => {
+            if shape[0] != n_rows {
+                return Err(format!(
+                    "fisher_rao_w vector must have length {n_rows}; got {}",
+                    shape[0]
+                ));
+            }
+            let mut block = Array3::<f64>::zeros((n_rows, dim, dim));
+            for row in 0..n_rows {
+                let value = arr[IxDyn(&[row])];
+                for d in 0..dim {
+                    block[[row, d, d]] = value;
+                }
+            }
+            block
+        }
+        2 => {
+            if shape[0] != dim || shape[1] != dim {
+                return Err(format!(
+                    "fisher_rao_w matrix must have shape ({dim}, {dim}); got ({}, {})",
+                    shape[0], shape[1]
+                ));
+            }
+            let mut block = Array3::<f64>::zeros((n_rows, dim, dim));
+            for row in 0..n_rows {
+                for r in 0..dim {
+                    for c in 0..dim {
+                        block[[row, r, c]] = arr[IxDyn(&[r, c])];
+                    }
+                }
+            }
+            block
+        }
+        3 => {
+            if shape[0] != n_rows || shape[1] != dim || shape[2] != dim {
+                return Err(format!(
+                    "fisher_rao_w must have shape ({n_rows}, {dim}, {dim}); got ({}, {}, {})",
+                    shape[0], shape[1], shape[2]
+                ));
+            }
+            let mut block = Array3::<f64>::zeros((n_rows, dim, dim));
+            for row in 0..n_rows {
+                for r in 0..dim {
+                    for c in 0..dim {
+                        block[[row, r, c]] = arr[IxDyn(&[row, r, c])];
+                    }
+                }
+            }
+            block
+        }
+        _ => return Err("fisher_rao_w must be a 1-D, 2-D, or 3-D numeric array".to_string()),
+    };
+    for row in 0..n_rows {
+        for r in 0..dim {
+            for c in 0..dim {
+                let a = out[[row, r, c]];
+                let b = out[[row, c, r]];
+                if (a - b).abs() > 1.0e-10 * (1.0 + a.abs() + b.abs()) {
+                    return Err("fisher_rao_w must be symmetric in every row block".to_string());
+                }
+            }
+            if out[[row, r, r]] < 0.0 {
+                return Err("fisher_rao_w diagonal entries must be non-negative".to_string());
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn rg_rho_so2_impl(theta: ArrayView1<'_, f64>) -> Array3<f64> {
+    let n = theta.len();
+    let mut out = Array3::<f64>::zeros((n, 2, 2));
+    for (i, &t) in theta.iter().enumerate() {
+        let (s, c) = t.sin_cos();
+        out[[i, 0, 0]] = c;
+        out[[i, 0, 1]] = -s;
+        out[[i, 1, 0]] = s;
+        out[[i, 1, 1]] = c;
+    }
+    out
+}
+
+fn rg_rho_so2_jvp_impl(theta: ArrayView1<'_, f64>) -> Array3<f64> {
+    let n = theta.len();
+    let mut out = Array3::<f64>::zeros((n, 2, 2));
+    for (i, &t) in theta.iter().enumerate() {
+        let (s, c) = t.sin_cos();
+        out[[i, 0, 0]] = -s;
+        out[[i, 0, 1]] = -c;
+        out[[i, 1, 0]] = c;
+        out[[i, 1, 1]] = -s;
+    }
+    out
+}
+
+fn rg_rho_so3_single(ox: f64, oy: f64, oz: f64) -> [[f64; 3]; 3] {
+    let angle = (ox * ox + oy * oy + oz * oz).sqrt().max(1.0e-12);
+    let ax = ox / angle;
+    let ay = oy / angle;
+    let az = oz / angle;
+    let k = [[0.0, -az, ay], [az, 0.0, -ax], [-ay, ax, 0.0]];
+    let mut kk = [[0.0_f64; 3]; 3];
+    for i in 0..3 {
+        for j in 0..3 {
+            let mut acc = 0.0;
+            for r in 0..3 {
+                acc += k[i][r] * k[r][j];
+            }
+            kk[i][j] = acc;
+        }
+    }
+    let s = angle.sin();
+    let one_minus_c = 1.0 - angle.cos();
+    let mut out = [[0.0_f64; 3]; 3];
+    for i in 0..3 {
+        for j in 0..3 {
+            let id = if i == j { 1.0 } else { 0.0 };
+            out[i][j] = id + s * k[i][j] + one_minus_c * kk[i][j];
+        }
+    }
+    out
+}
+
+fn rg_rho_so3_impl(omega: ArrayView2<'_, f64>) -> Result<Array3<f64>, String> {
+    if omega.ncols() != 3 {
+        return Err(format!(
+            "SO(3) rep input must have shape (N, 3); got {}",
+            omega.ncols()
+        ));
+    }
+    let n = omega.nrows();
+    let mut out = Array3::<f64>::zeros((n, 3, 3));
+    for row in 0..n {
+        let r = rg_rho_so3_single(omega[[row, 0]], omega[[row, 1]], omega[[row, 2]]);
+        for i in 0..3 {
+            for j in 0..3 {
+                out[[row, i, j]] = r[i][j];
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn rg_rho_so3_jvp_impl(
+    omega: ArrayView2<'_, f64>,
+    domega: ArrayView2<'_, f64>,
+) -> Result<Array3<f64>, String> {
+    if omega.ncols() != 3 || domega.ncols() != 3 {
+        return Err("SO(3) rep JVP requires (N, 3) inputs".to_string());
+    }
+    if omega.nrows() != domega.nrows() {
+        return Err("SO(3) rep JVP omega/domega must agree in row count".to_string());
+    }
+    let n = omega.nrows();
+    let mut out = Array3::<f64>::zeros((n, 3, 3));
+    for row in 0..n {
+        let rg = rg_rho_so3_single(omega[[row, 0]], omega[[row, 1]], omega[[row, 2]]);
+        let sx = domega[[row, 0]];
+        let sy = domega[[row, 1]];
+        let sz = domega[[row, 2]];
+        let kd = [[0.0, -sz, sy], [sz, 0.0, -sx], [-sy, sx, 0.0]];
+        for i in 0..3 {
+            for j in 0..3 {
+                let mut acc = 0.0;
+                for r in 0..3 {
+                    acc += rg[i][r] * kd[r][j];
+                }
+                out[[row, i, j]] = acc;
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn rg_gauge_companion_loss_impl(
+    aux_values: ArrayView2<'_, f64>,
+    theta: ArrayView2<'_, f64>,
+    d_aux: usize,
+    weight: f64,
+) -> Result<f64, String> {
+    if !weight.is_finite() {
+        return Err("gauge companion weight must be finite".to_string());
+    }
+    if aux_values.ncols() < 1 {
+        return Err("aux_values must have at least one column".to_string());
+    }
+    if theta.nrows() != aux_values.nrows() {
+        return Err("aux_values and theta must agree in row count".to_string());
+    }
+    let n = aux_values.nrows();
+    let n_f = n as f64;
+    let mut terms: Vec<f64> = Vec::new();
+    let two_pi = std::f64::consts::TAU;
+    let mut term0 = 0.0_f64;
+    for row in 0..n {
+        let h_rad = aux_values[[row, 0]] * two_pi;
+        term0 += 1.0 - (theta[[row, 0]] - h_rad).cos();
+    }
+    terms.push(term0 / n_f);
+    if d_aux >= 2 && theta.ncols() >= 2 && aux_values.ncols() >= 2 {
+        let mut term1 = 0.0_f64;
+        for row in 0..n {
+            let diff = theta[[row, 1]].cos() - (2.0 * aux_values[[row, 1]] - 1.0);
+            term1 += diff * diff;
+        }
+        terms.push(term1 / n_f);
+    }
+    if d_aux >= 3 && theta.ncols() >= 3 && aux_values.ncols() >= 3 {
+        let mut term2 = 0.0_f64;
+        for row in 0..n {
+            let diff = theta[[row, 2]].cos() - (2.0 * aux_values[[row, 2]] - 1.0);
+            term2 += diff * diff;
+        }
+        terms.push(term2 / n_f);
+    }
+    let total: f64 = terms.iter().sum();
+    Ok(weight * total / (terms.len() as f64))
+}
+
+#[pyfunction]
+fn response_geometry_closure<'py>(
+    py: Python<'py>,
+    values: PyReadonlyArray2<'py, f64>,
+) -> PyResult<Py<PyArray2<f64>>> {
+    let arr = values.as_array().to_owned();
+    let out = detach_py_result(py, "response_geometry_closure", move || {
+        rg_closure_impl(arr.view())
+    })?;
+    Ok(out.into_pyarray(py).unbind())
+}
+
+#[pyfunction]
+fn response_geometry_clr<'py>(
+    py: Python<'py>,
+    values: PyReadonlyArray2<'py, f64>,
+) -> PyResult<Py<PyArray2<f64>>> {
+    let arr = values.as_array().to_owned();
+    let out = detach_py_result(py, "response_geometry_clr", move || {
+        rg_clr_impl(arr.view())
+    })?;
+    Ok(out.into_pyarray(py).unbind())
+}
+
+#[pyfunction(signature = (values, reference = -1))]
+fn response_geometry_alr<'py>(
+    py: Python<'py>,
+    values: PyReadonlyArray2<'py, f64>,
+    reference: isize,
+) -> PyResult<Py<PyArray2<f64>>> {
+    let arr = values.as_array().to_owned();
+    let out = detach_py_result(py, "response_geometry_alr", move || {
+        rg_alr_impl(arr.view(), reference)
+    })?;
+    Ok(out.into_pyarray(py).unbind())
+}
+
+#[pyfunction(signature = (coords, reference = -1))]
+fn response_geometry_inverse_alr<'py>(
+    py: Python<'py>,
+    coords: PyReadonlyArray2<'py, f64>,
+    reference: isize,
+) -> PyResult<Py<PyArray2<f64>>> {
+    let arr = coords.as_array().to_owned();
+    let out = detach_py_result(py, "response_geometry_inverse_alr", move || {
+        rg_inverse_alr_impl(arr.view(), reference)
+    })?;
+    Ok(out.into_pyarray(py).unbind())
+}
+
+#[pyfunction(signature = (values, weights = None))]
+fn response_geometry_simplex_frechet_mean<'py>(
+    py: Python<'py>,
+    values: PyReadonlyArray2<'py, f64>,
+    weights: Option<PyReadonlyArray1<'py, f64>>,
+) -> PyResult<Py<PyArray1<f64>>> {
+    let arr = values.as_array().to_owned();
+    let w_owned = weights.as_ref().map(|w| w.as_array().to_owned());
+    let out = detach_py_result(py, "response_geometry_simplex_frechet_mean", move || {
+        rg_simplex_frechet_mean_impl(arr.view(), w_owned.as_ref().map(|w| w.view()))
+    })?;
+    Ok(out.into_pyarray(py).unbind())
+}
+
+#[pyfunction(signature = (values, base, coordinates, reference = -1))]
+fn response_geometry_simplex_log_map<'py>(
+    py: Python<'py>,
+    values: PyReadonlyArray2<'py, f64>,
+    base: PyReadonlyArray1<'py, f64>,
+    coordinates: String,
+    reference: isize,
+) -> PyResult<Py<PyArray2<f64>>> {
+    let arr = values.as_array().to_owned();
+    let base_owned = base.as_array().to_owned();
+    let out = detach_py_result(py, "response_geometry_simplex_log_map", move || {
+        let coord = rg_parse_simplex_coord(&coordinates)?;
+        rg_simplex_log_map_impl(arr.view(), base_owned.view(), coord, reference)
+    })?;
+    Ok(out.into_pyarray(py).unbind())
+}
+
+#[pyfunction(signature = (tangent, base, coordinates, reference = -1))]
+fn response_geometry_simplex_exp_map<'py>(
+    py: Python<'py>,
+    tangent: PyReadonlyArray2<'py, f64>,
+    base: PyReadonlyArray1<'py, f64>,
+    coordinates: String,
+    reference: isize,
+) -> PyResult<Py<PyArray2<f64>>> {
+    let t_owned = tangent.as_array().to_owned();
+    let base_owned = base.as_array().to_owned();
+    let out = detach_py_result(py, "response_geometry_simplex_exp_map", move || {
+        let coord = rg_parse_simplex_coord(&coordinates)?;
+        rg_simplex_exp_map_impl(t_owned.view(), base_owned.view(), coord, reference)
+    })?;
+    Ok(out.into_pyarray(py).unbind())
+}
+
+#[pyfunction]
+fn response_geometry_sphere_log_map<'py>(
+    py: Python<'py>,
+    values: PyReadonlyArray2<'py, f64>,
+    base: PyReadonlyArray1<'py, f64>,
+) -> PyResult<Py<PyArray2<f64>>> {
+    let arr = values.as_array().to_owned();
+    let base_owned = base.as_array().to_owned();
+    let out = detach_py_result(py, "response_geometry_sphere_log_map", move || {
+        rg_sphere_log_map_impl(arr.view(), base_owned.view())
+    })?;
+    Ok(out.into_pyarray(py).unbind())
+}
+
+#[pyfunction]
+fn response_geometry_sphere_exp_map<'py>(
+    py: Python<'py>,
+    tangent: PyReadonlyArray2<'py, f64>,
+    base: PyReadonlyArray1<'py, f64>,
+) -> PyResult<Py<PyArray2<f64>>> {
+    let t_owned = tangent.as_array().to_owned();
+    let base_owned = base.as_array().to_owned();
+    let out = detach_py_result(py, "response_geometry_sphere_exp_map", move || {
+        rg_sphere_exp_map_impl(t_owned.view(), base_owned.view())
+    })?;
+    Ok(out.into_pyarray(py).unbind())
+}
+
+#[pyfunction]
+fn response_geometry_normalize_fisher_rao<'py>(
+    py: Python<'py>,
+    value: PyReadonlyArrayDyn<'py, f64>,
+    n_rows: usize,
+    dim: usize,
+) -> PyResult<Py<PyArray3<f64>>> {
+    let arr = value.as_array().to_owned();
+    let out = detach_py_result(py, "response_geometry_normalize_fisher_rao", move || {
+        rg_normalize_fisher_rao_impl(arr.view(), n_rows, dim)
+    })?;
+    Ok(out.into_pyarray(py).unbind())
+}
+
+#[pyfunction(signature = (values, weights = None, tol = 1.0e-12, max_iter = 256))]
+fn sphere_frechet_mean<'py>(
+    py: Python<'py>,
+    values: PyReadonlyArray2<'py, f64>,
+    weights: Option<PyReadonlyArray1<'py, f64>>,
+    tol: f64,
+    max_iter: usize,
+) -> PyResult<Py<PyArray1<f64>>> {
+    let arr = values.as_array().to_owned();
+    let w_owned = weights.as_ref().map(|w| w.as_array().to_owned());
+    let mean = detach_py_result(py, "sphere_frechet_mean", move || {
+        rg_sphere_frechet_mean_impl(arr.view(), w_owned.as_ref().map(|w| w.view()), tol, max_iter)
+    })?;
+    Ok(mean.into_pyarray(py).unbind())
+}
+
+#[pyfunction]
+fn equivariant_rho_so2<'py>(
+    py: Python<'py>,
+    theta: PyReadonlyArray1<'py, f64>,
+) -> PyResult<Py<PyArray3<f64>>> {
+    let theta_owned = theta.as_array().to_owned();
+    let out = detach_py_result(py, "equivariant_rho_so2", move || {
+        Ok(rg_rho_so2_impl(theta_owned.view()))
+    })?;
+    Ok(out.into_pyarray(py).unbind())
+}
+
+#[pyfunction]
+fn equivariant_rho_so2_jvp<'py>(
+    py: Python<'py>,
+    theta: PyReadonlyArray1<'py, f64>,
+) -> PyResult<Py<PyArray3<f64>>> {
+    let theta_owned = theta.as_array().to_owned();
+    let out = detach_py_result(py, "equivariant_rho_so2_jvp", move || {
+        Ok(rg_rho_so2_jvp_impl(theta_owned.view()))
+    })?;
+    Ok(out.into_pyarray(py).unbind())
+}
+
+#[pyfunction]
+fn equivariant_rho_so3<'py>(
+    py: Python<'py>,
+    omega: PyReadonlyArray2<'py, f64>,
+) -> PyResult<Py<PyArray3<f64>>> {
+    let omega_owned = omega.as_array().to_owned();
+    let out = detach_py_result(py, "equivariant_rho_so3", move || {
+        rg_rho_so3_impl(omega_owned.view())
+    })?;
+    Ok(out.into_pyarray(py).unbind())
+}
+
+#[pyfunction]
+fn equivariant_rho_so3_jvp<'py>(
+    py: Python<'py>,
+    omega: PyReadonlyArray2<'py, f64>,
+    domega: PyReadonlyArray2<'py, f64>,
+) -> PyResult<Py<PyArray3<f64>>> {
+    let o_owned = omega.as_array().to_owned();
+    let d_owned = domega.as_array().to_owned();
+    let out = detach_py_result(py, "equivariant_rho_so3_jvp", move || {
+        rg_rho_so3_jvp_impl(o_owned.view(), d_owned.view())
+    })?;
+    Ok(out.into_pyarray(py).unbind())
+}
+
+#[pyfunction(signature = (aux_values, theta, d_aux, weight = 1.0))]
+fn equivariant_gauge_companion_loss<'py>(
+    py: Python<'py>,
+    aux_values: PyReadonlyArray2<'py, f64>,
+    theta: PyReadonlyArray2<'py, f64>,
+    d_aux: usize,
+    weight: f64,
+) -> PyResult<f64> {
+    let aux_owned = aux_values.as_array().to_owned();
+    let theta_owned = theta.as_array().to_owned();
+    detach_py_result(py, "equivariant_gauge_companion_loss", move || {
+        rg_gauge_companion_loss_impl(aux_owned.view(), theta_owned.view(), d_aux, weight)
+    })
+}
+
 #[pymodule(name = "_rust", gil_used = false)]
 fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     gam::init_parallelism();
@@ -11229,6 +12335,27 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(equivariant_penalty_value, module)?)?;
     module.add_function(wrap_pyfunction!(riemannian_retract, module)?)?;
     module.add_function(wrap_pyfunction!(sphere_frechet_mean, module)?)?;
+    module.add_function(wrap_pyfunction!(response_geometry_closure, module)?)?;
+    module.add_function(wrap_pyfunction!(response_geometry_clr, module)?)?;
+    module.add_function(wrap_pyfunction!(response_geometry_alr, module)?)?;
+    module.add_function(wrap_pyfunction!(response_geometry_inverse_alr, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        response_geometry_simplex_frechet_mean,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(response_geometry_simplex_log_map, module)?)?;
+    module.add_function(wrap_pyfunction!(response_geometry_simplex_exp_map, module)?)?;
+    module.add_function(wrap_pyfunction!(response_geometry_sphere_log_map, module)?)?;
+    module.add_function(wrap_pyfunction!(response_geometry_sphere_exp_map, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        response_geometry_normalize_fisher_rao,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(equivariant_rho_so2, module)?)?;
+    module.add_function(wrap_pyfunction!(equivariant_rho_so2_jvp, module)?)?;
+    module.add_function(wrap_pyfunction!(equivariant_rho_so3, module)?)?;
+    module.add_function(wrap_pyfunction!(equivariant_rho_so3_jvp, module)?)?;
+    module.add_function(wrap_pyfunction!(equivariant_gauge_companion_loss, module)?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_fit, module)?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_fit_ibp, module)?)?;
     module.add_function(wrap_pyfunction!(gated_sae_decode, module)?)?;
