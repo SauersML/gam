@@ -388,6 +388,20 @@ struct SurvivalPredictionPayload {
     eta_se: Option<Vec<f64>>,
 }
 
+#[derive(Deserialize)]
+struct SurvivalPredictionJsonPayload {
+    class: String,
+    model_class: Option<String>,
+    times: Option<Vec<f64>>,
+    hazard: Option<Vec<Vec<f64>>>,
+    survival: Option<Vec<Vec<f64>>>,
+    cumulative_hazard: Option<Vec<Vec<f64>>>,
+    linear_predictor: Option<Vec<f64>>,
+    columns: Option<BTreeMap<String, Vec<f64>>>,
+    survival_se: Option<Vec<Vec<f64>>>,
+    eta_se: Option<Vec<f64>>,
+}
+
 #[derive(Serialize)]
 struct ValidationPayload {
     formula: String,
@@ -14786,11 +14800,13 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(mechanism_sparsity_jacobian, module)?)?;
     module.add_function(wrap_pyfunction!(conditional_prior_ivae, module)?)?;
+    module.add_class::<IsometryPenalty>()?;
     module.add_class::<SparsityPenalty>()?;
     module.add_class::<PyTopKActivationPenalty>()?;
     module.add_class::<ARDPenalty>()?;
     module.add_class::<AuxConditionalPriorPenalty>()?;
     module.add_class::<BlockSparsityPenalty>()?;
+    module.add_class::<BlockOrthogonalityPenalty>()?;
     Ok(())
 }
 
@@ -18773,7 +18789,7 @@ fn build_analytic_penalty_registry_from_json(
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false);
                 let penalty =
-                    IvaeRidgeMeanGauge::new(slice, aux, ridge_eps, weight, n_eff, learnable)
+                    IvaeRidgeMeanGaugePenalty::new(slice, aux, ridge_eps, weight, n_eff, learnable)
                         .map_err(|err| format!("{context}: {err}"))?;
                 let penalty = match weight_schedule {
                     Some(schedule) => penalty.with_weight_schedule(schedule),
