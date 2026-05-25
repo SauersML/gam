@@ -69,7 +69,8 @@ class ManifoldSAE:
         assigns = np.asarray(payload["assignments_z"], dtype=float)
         coords = [atom.coords.copy() for atom in atoms]
         score = float(payload["reml_score"])
-        low = SaeManifoldFitResult(atoms, len(atoms), {len(atoms): score}, {"winner": f"K={len(atoms)}"}, fitted, assigns, coords, score)
+        chosen_k = int(payload["chosen_k"]) if "chosen_k" in payload else len(atoms)
+        low = SaeManifoldFitResult(atoms, chosen_k, {chosen_k: score}, {"winner": f"K={chosen_k}"}, fitted, assigns, coords, score)
         kinds = [str(p.get("kind", atoms[i].basis)) for i, p in enumerate(plans)] if plans else [a.basis for a in atoms]
         dims = [int(p.get("latent_dim", 0)) for p in plans] if plans else [a.coords.shape[1] if a.coords.ndim == 2 else 0 for a in atoms]
         sizes = [int(p.get("basis_size", 0)) for p in plans] if plans else [int(a.decoder_coefficients.shape[0]) for a in atoms]
@@ -77,7 +78,7 @@ class ManifoldSAE:
         centers: list[np.ndarray | None] = [(None if p.get("duchon_centers") is None else np.asarray(p["duchon_centers"], dtype=float)) for p in plans] if plans else [None for _ in atoms]
         return cls(
             atoms=atoms, atom_topology=str(topology), assignment=str(assignment),
-            primitive_names=["rust_module.sae_manifold_fit_auto", *penalties],
+            primitive_names=["rust_module.sae_manifold_fit_minimal", *penalties],
             fitted=fitted, assignments=assigns, coords=coords,
             decoder_blocks=[a.decoder_coefficients.copy() for a in atoms],
             basis_specs=kinds, reml_score=score,
@@ -217,12 +218,22 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
     penalties = [n for n, ok in (("IsometryPenalty", isometry_weight > 0.0), ("ARDPenalty", ard_per_atom),
         ("MechanismSparsityPenalty", mechanism_sparsity_groups is not None),
         ("BlockOrthogonalityPenalty", block_orthogonality_weight > 0.0)) if ok]
-    payload = rust_module().sae_manifold_fit_auto(
-        np.ascontiguousarray(x), [str(b) for b in bases], [int(d) for d in dims],
-        float(alpha_value), float(tau), bool(alpha == "auto"), str(kind),
-        sparsity_strength=float(sparsity), smoothness=float(smoothness),
-        max_iter=int(max_iter_total), learning_rate=float(learning_rate),
-        gumbel_schedule=_schedule_payload(gumbel_schedule), random_state=int(random_state),
+    payload = rust_module().sae_manifold_fit_minimal(
+        np.ascontiguousarray(x),
+        int(k_atoms),
+        [str(b) for b in bases],
+        [int(d) for d in dims],
+        str(kind),
+        float(alpha_value),
+        float(tau),
+        bool(alpha == "auto"),
+        float(sparsity),
+        float(smoothness),
+        int(max_iter_total),
+        float(learning_rate),
+        int(random_state),
+        int(top_k) if top_k is not None else 0,
+        gumbel_schedule=_schedule_payload(gumbel_schedule),
     )
     return ManifoldSAE.from_payload(x, dict(payload), atom_topology, assignment, penalties)
 
