@@ -16,14 +16,14 @@ This test pins that behavior end-to-end through the torch wrapper.
 
 from __future__ import annotations
 
-import pytest
+import unittest
 
 try:
     import torch
 
     from gamfit.torch import gaussian_reml_fit
 except ImportError:  # pragma: no cover - env-dependent
-    pytest.skip("torch / gamfit unavailable", allow_module_level=True)
+    raise unittest.SkipTest("torch / gamfit unavailable")
 
 
 _F64 = torch.float64

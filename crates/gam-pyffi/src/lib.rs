@@ -13,6 +13,7 @@ use gam::faer_ndarray::{
     FaerCholesky, FaerEigh, array2_to_matmut, factorize_symmetricwith_fallback, fast_xt_diag_x,
 };
 use gam::families::family_meta::inverse_link_to_binomial_spec;
+use gam::families::inverse_link::apply_inverse_link_vec;
 use gam::families::scale_design::{build_scale_deviation_transform, infer_non_intercept_start};
 use gam::families::survival_construction::{SavedSurvivalTimeBasis, survival_likelihood_modename};
 use gam::families::survival_location_scale::{
@@ -28,6 +29,7 @@ use gam::gaussian_reml::{
     gaussian_reml_multi_closed_form_backward_batch,
     gaussian_reml_multi_closed_form_backward_from_fit, gaussian_reml_multi_closed_form_with_cache,
 };
+use gam::geometry::simplex::simplex_frechet_mean;
 use gam::hmc::{NutsConfig, NutsResult};
 use gam::inference::data::{
     EncodedDataset, UnseenCategoryPolicy, encode_recordswith_inferred_schema,
@@ -68,6 +70,9 @@ use gam::terms::sae_manifold::{
     term_from_padded_blocks_with_mode,
 };
 use gam::terms::smooth::BlockwisePenalty;
+use gam::terms::skip_transcoder::{
+    SkipTranscoderRemlInputs, skip_transcoder_reml_metrics as skip_transcoder_reml_metrics_core,
+};
 use gam::terms::{
     ARDPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry, BlockOrthogonalityPenalty,
     DifferenceOpKind, GatedSAEDecoder, IBPAssignmentPenalty, IsometryPenalty, IvaeRidgeMeanGauge,
@@ -688,6 +693,86 @@ fn interpolate_survival_surface<'py>(
 }
 
 #[pyfunction]
+fn interpolate_rows<'py>(
+    py: Python<'py>,
+    grid: PyReadonlyArray1<'py, f64>,
+    surface: PyReadonlyArray2<'py, f64>,
+    query: PyReadonlyArray1<'py, f64>,
+    clip_lo: Option<f64>,
+    clip_hi: Option<f64>,
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    let grid_view = grid.as_array();
+    let surface_view = surface.as_array();
+    let query_values: Vec<f64> = query.as_array().iter().copied().collect();
+    let n_grid = grid_view.len();
+    let (n_rows, n_cols) = surface_view.dim();
+    if n_grid == 0 || n_cols != n_grid {
+        return Err(py_value_error(
+            "survival interpolation requires a non-empty grid".to_string(),
+        ));
+    }
+
+    let mut order: Vec<(f64, usize)> = grid_view
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, value)| (value, index))
+        .collect();
+    order.sort_by(|left, right| left.0.partial_cmp(&right.0).unwrap_or(Ordering::Equal));
+    let sorted_grid: Vec<f64> = order.iter().map(|(value, _index)| *value).collect();
+    let sorted_indices: Vec<usize> = order.iter().map(|(_value, index)| *index).collect();
+    let n_query = query_values.len();
+    let mut values = vec![0.0_f64; n_rows * n_query];
+
+    values
+        .par_chunks_mut(n_query.max(1))
+        .enumerate()
+        .for_each(|(row_idx, out_row)| {
+            if n_query == 0 {
+                return;
+            }
+            let surface_row = surface_view.row(row_idx);
+            for (query_idx, query_value) in query_values.iter().copied().enumerate() {
+                let mut interpolated = if query_value.is_nan() {
+                    f64::NAN
+                } else if query_value <= sorted_grid[0] {
+                    surface_row[sorted_indices[0]]
+                } else if query_value >= sorted_grid[n_grid - 1] {
+                    surface_row[sorted_indices[n_grid - 1]]
+                } else {
+                    let upper =
+                        sorted_grid.partition_point(|grid_value| *grid_value <= query_value);
+                    let lower = upper - 1;
+                    let x0 = sorted_grid[lower];
+                    let x1 = sorted_grid[upper];
+                    let y0 = surface_row[sorted_indices[lower]];
+                    let y1 = surface_row[sorted_indices[upper]];
+                    if x1 == x0 {
+                        y1
+                    } else {
+                        y0 + (query_value - x0) * (y1 - y0) / (x1 - x0)
+                    }
+                };
+                if let Some(lo) = clip_lo {
+                    if interpolated < lo {
+                        interpolated = lo;
+                    }
+                }
+                if let Some(hi) = clip_hi {
+                    if interpolated > hi {
+                        interpolated = hi;
+                    }
+                }
+                out_row[query_idx] = interpolated;
+            }
+        });
+
+    let out = Array2::from_shape_vec((n_rows, n_query), values)
+        .map_err(|err| py_value_error(format!("failed to assemble interpolation result: {err}")))?;
+    Ok(out.into_pyarray(py))
+}
+
+#[pyfunction]
 fn survival_coerce_times<'py>(
     py: Python<'py>,
     times: PyReadonlyArrayDyn<'py, f64>,
@@ -766,34 +851,32 @@ fn survival_collect_chunks<'py>(
 }
 
 #[pyfunction]
-fn survival_hazard_from_cumulative<'py>(
+fn hazard_from_cumulative<'py>(
     py: Python<'py>,
     times: PyReadonlyArray1<'py, f64>,
     cumulative: PyReadonlyArray2<'py, f64>,
     previous_cumulative: Option<PyReadonlyArray2<'py, f64>>,
     previous_time: f64,
-) -> PyResult<Py<PyArray2<f64>>> {
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
     let cum_view = cumulative.as_array();
     let times_view = times.as_array();
-    let n_rows = cum_view.shape()[0];
-    let n_times = cum_view.shape()[1];
-    if n_times == 0 || times_view.len() != n_times {
+    let (n_rows, n_times) = cum_view.dim();
+    if times_view.len() != n_times {
         return Err(py_value_error(
             "hazard_from_cumulative requires matching time count".to_string(),
         ));
     }
-    let prev_col: Array1<f64> = match previous_cumulative {
+    let previous = match previous_cumulative {
         Some(arr) => {
             let view = arr.as_array();
-            if view.shape()[0] != n_rows || view.shape()[1] < 1 {
+            if view.dim() != (n_rows, 1) {
                 return Err(py_value_error(
                     "previous_cumulative must have one column per row".to_string(),
                 ));
             }
-            let last = view.shape()[1] - 1;
-            (0..n_rows).map(|i| view[[i, last]]).collect()
+            view.to_owned()
         }
-        None => Array1::<f64>::zeros(n_rows),
+        None => Array2::<f64>::zeros((n_rows, 1)),
     };
     let mut out = Array2::<f64>::zeros((n_rows, n_times));
     for j in 0..n_times {
@@ -807,11 +890,15 @@ fn survival_hazard_from_cumulative<'py>(
             width = 1.0;
         }
         for i in 0..n_rows {
-            let prev_h = if j == 0 { prev_col[i] } else { cum_view[[i, j - 1]] };
+            let prev_h = if j == 0 {
+                previous[[i, 0]]
+            } else {
+                cum_view[[i, j - 1]]
+            };
             out[[i, j]] = (cum_view[[i, j]] - prev_h) / width;
         }
     }
-    Ok(out.into_pyarray(py).unbind())
+    Ok(out.into_pyarray(py))
 }
 
 #[pyfunction]
@@ -832,12 +919,12 @@ fn survival_cumulative_from_survival<'py>(
 }
 
 #[pyfunction]
-fn survival_block_from_anchor<'py>(
+fn survival_block<'py>(
     py: Python<'py>,
-    parameters: PyReadonlyArray2<'py, f64>,
+    params: PyReadonlyArray2<'py, f64>,
     times: PyReadonlyArray1<'py, f64>,
-) -> PyResult<Py<PyArray2<f64>>> {
-    let params = parameters.as_array();
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    let params = params.as_array();
     let times_view = times.as_array();
     let n_rows = params.shape()[0];
     let n_times = times_view.len();
@@ -853,7 +940,7 @@ fn survival_block_from_anchor<'py>(
             out[[i, j]] = (-hazard * times_view[j]).exp();
         }
     }
-    Ok(out.into_pyarray(py).unbind())
+    Ok(out.into_pyarray(py))
 }
 
 #[pyfunction]
@@ -1184,6 +1271,7 @@ fn formula_validation_repr_json(payload_json: String) -> PyResult<String> {
 
 #[pyfunction]
 fn formula_validation_html_json(payload_json: String) -> PyResult<String> {
+    // Pure presentation layer; no math.
     let payload = parse_formula_validation_payload_json(&payload_json).map_err(py_value_error)?;
     let mut rows = String::new();
     for (key, value) in payload.iter() {
@@ -2231,111 +2319,23 @@ fn skip_transcoder_reml_metrics<'py>(
         ));
     }
 
-    let mut active_atoms = Vec::new();
-    let mut nonzero_entries = 0_usize;
-    for atom in 0..z.ncols() {
-        let mut active = false;
-        for row in 0..z.nrows() {
-            if z[[row, atom]].abs() > 1.0e-8 {
-                active = true;
-                nonzero_entries += 1;
-            }
-        }
-        if active {
-            active_atoms.push(atom);
-        }
-    }
-
-    let skip_rank = skip_u_view.as_ref().map_or(0, |value| value.ncols());
-    let feature_count = active_atoms.len() + skip_rank;
-    let mut gram = Array2::<f64>::zeros((feature_count, feature_count));
-
-    for (i, &atom_i) in active_atoms.iter().enumerate() {
-        let row_i = w_dec.row(atom_i);
-        for (j, &atom_j) in active_atoms.iter().enumerate().take(i + 1) {
-            let value = row_i.dot(&w_dec.row(atom_j));
-            gram[[i, j]] = value;
-            gram[[j, i]] = value;
-        }
-    }
-    if let Some(skip_u) = skip_u_view.as_ref() {
-        let offset = active_atoms.len();
-        for (i, &atom_i) in active_atoms.iter().enumerate() {
-            let row_i = w_dec.row(atom_i);
-            for rank in 0..skip_rank {
-                let value = row_i.dot(&skip_u.column(rank));
-                gram[[i, offset + rank]] = value;
-                gram[[offset + rank, i]] = value;
-            }
-        }
-        for rank_i in 0..skip_rank {
-            let col_i = skip_u.column(rank_i);
-            for rank_j in 0..=rank_i {
-                let value = col_i.dot(&skip_u.column(rank_j));
-                gram[[offset + rank_i, offset + rank_j]] = value;
-                gram[[offset + rank_j, offset + rank_i]] = value;
-            }
-        }
-    }
-    for diag in 0..feature_count {
-        gram[[diag, diag]] += lambda_sparse;
-    }
-
-    let logdet = if feature_count == 0 {
-        0.0
-    } else {
-        let sym = (&gram + &gram.t()) * 0.5;
-        let chol = sym.cholesky(Side::Lower).map_err(|err| {
-            py_value_error(format!("skip_transcoder_reml_metrics logdet failed: {err}"))
-        })?;
-        let value = 2.0 * chol.diag().iter().map(|diag| diag.ln()).sum::<f64>();
-        if !value.is_finite() {
-            return Err(py_value_error(format!(
-                "skip_transcoder_reml_metrics logdet is not finite: {value}"
-            )));
-        }
-        value
-    };
-
-    let n_total = y_out.len() as f64;
-    let mut sse = 0.0_f64;
-    let mut y_sum = 0.0_f64;
-    for row in 0..n_rows {
-        for col in 0..out_dim {
-            let resid = y_out[[row, col]] - y_hat[[row, col]];
-            sse += resid * resid;
-            y_sum += y_out[[row, col]];
-        }
-    }
-    let mse = sse / n_total;
-    let sigma2 = mse.max(1.0e-12);
-    let y_mean = y_sum / n_total;
-    let mut sst = 0.0_f64;
-    for value in y_out.iter() {
-        let centered = value - y_mean;
-        sst += centered * centered;
-    }
-    let explained_variance = if sst > 0.0 {
-        1.0 - sse / sst
-    } else if sse == 0.0 {
-        1.0
-    } else {
-        0.0
-    };
-    let sparsity = if z.is_empty() {
-        0.0
-    } else {
-        nonzero_entries as f64 / z.len() as f64
-    };
-    let reml_score = 0.5 * (n_total * sigma2.ln() + logdet);
+    let metrics = skip_transcoder_reml_metrics_core(SkipTranscoderRemlInputs {
+        y_out,
+        y_hat,
+        z,
+        w_dec,
+        lambda_sparse,
+        skip_u: skip_u_view,
+    })
+    .map_err(py_value_error)?;
 
     let out = PyDict::new(py);
-    out.set_item("reml_score", reml_score)?;
-    out.set_item("mse", mse)?;
-    out.set_item("sparsity", sparsity)?;
-    out.set_item("explained_variance", explained_variance)?;
-    out.set_item("active_atoms", active_atoms.len())?;
-    out.set_item("effective_rank", feature_count)?;
+    out.set_item("reml_score", metrics.reml_score)?;
+    out.set_item("mse", metrics.mse)?;
+    out.set_item("sparsity", metrics.sparsity)?;
+    out.set_item("explained_variance", metrics.explained_variance)?;
+    out.set_item("active_atoms", metrics.active_atoms)?;
+    out.set_item("effective_rank", metrics.effective_rank)?;
     Ok(out.unbind())
 }
 
@@ -10529,6 +10529,7 @@ fn summary_repr(payload: &Bound<'_, PyDict>) -> PyResult<String> {
 
 #[pyfunction]
 fn summary_html(payload: &Bound<'_, PyDict>) -> PyResult<String> {
+    // Pure presentation layer; no math.
     let mut rows = String::new();
     for (key, value) in payload.iter() {
         let key_text = key.str()?.extract::<String>()?;
@@ -11110,149 +11111,6 @@ fn bspline_tensor_input_location_first_derivative<'py>(
     Ok(jet.into_pyarray(py).unbind())
 }
 
-fn invert_small_matrix(matrix: &[Vec<f64>], context: &str) -> Result<Vec<Vec<f64>>, String> {
-    let n = matrix.len();
-    if n == 0 {
-        return Err(format!("{context}: matrix must not be empty"));
-    }
-    let mut aug = vec![vec![0.0_f64; 2 * n]; n];
-    for i in 0..n {
-        if matrix[i].len() != n {
-            return Err(format!("{context}: matrix must be square"));
-        }
-        for j in 0..n {
-            let value = matrix[i][j];
-            if !value.is_finite() {
-                return Err(format!("{context}: matrix entry [{i},{j}] is not finite"));
-            }
-            aug[i][j] = value;
-        }
-        aug[i][n + i] = 1.0;
-    }
-    for col in 0..n {
-        let mut pivot = col;
-        let mut pivot_abs = aug[col][col].abs();
-        for row in (col + 1)..n {
-            let candidate = aug[row][col].abs();
-            if candidate > pivot_abs {
-                pivot = row;
-                pivot_abs = candidate;
-            }
-        }
-        if pivot_abs <= 1.0e-12 {
-            return Err(format!("{context}: matrix is singular at pivot {col}"));
-        }
-        if pivot != col {
-            aug.swap(pivot, col);
-        }
-        let scale = aug[col][col];
-        for item in &mut aug[col] {
-            *item /= scale;
-        }
-        for row in 0..n {
-            if row == col {
-                continue;
-            }
-            let factor = aug[row][col];
-            if factor == 0.0 {
-                continue;
-            }
-            for j in 0..(2 * n) {
-                aug[row][j] -= factor * aug[col][j];
-            }
-        }
-    }
-    let mut inverse = vec![vec![0.0_f64; n]; n];
-    for i in 0..n {
-        for j in 0..n {
-            inverse[i][j] = aug[i][n + j];
-        }
-    }
-    Ok(inverse)
-}
-
-fn square_matmul(left: &[Vec<f64>], right: &[Vec<f64>], n: usize) -> Vec<Vec<f64>> {
-    let mut out = vec![vec![0.0_f64; n]; n];
-    for i in 0..n {
-        for k in 0..n {
-            let left_ik = left[i][k];
-            for j in 0..n {
-                out[i][j] += left_ik * right[k][j];
-            }
-        }
-    }
-    out
-}
-
-fn dynamic_value(
-    values: &ArrayViewD<'_, f64>,
-    index: &[usize],
-    label: &str,
-) -> Result<f64, String> {
-    values
-        .get(IxDyn(index))
-        .copied()
-        .ok_or_else(|| format!("{label}: index {index:?} out of bounds"))
-}
-
-fn equivariant_rotation(
-    group: &str,
-    g: &ArrayViewD<'_, f64>,
-    batch: usize,
-    atom: usize,
-) -> Result<Vec<Vec<f64>>, String> {
-    match group {
-        "SO2" => {
-            if g.ndim() != 2 {
-                return Err("SO2 group coordinates must have shape (B, A)".to_string());
-            }
-            let theta = dynamic_value(g, &[batch, atom], "SO2 group coordinates")?;
-            let (s, c) = theta.sin_cos();
-            Ok(vec![vec![c, -s], vec![s, c]])
-        }
-        "SO3" => {
-            if g.ndim() != 3 || g.shape()[2] != 3 {
-                return Err("SO3 group coordinates must have shape (B, A, 3)".to_string());
-            }
-            let ox = dynamic_value(g, &[batch, atom, 0], "SO3 group coordinates")?;
-            let oy = dynamic_value(g, &[batch, atom, 1], "SO3 group coordinates")?;
-            let oz = dynamic_value(g, &[batch, atom, 2], "SO3 group coordinates")?;
-            let angle = (ox * ox + oy * oy + oz * oz).sqrt().max(1.0e-12);
-            let ax = ox / angle;
-            let ay = oy / angle;
-            let az = oz / angle;
-            let k = vec![
-                vec![0.0, -az, ay],
-                vec![az, 0.0, -ax],
-                vec![-ay, ax, 0.0],
-            ];
-            let kk = square_matmul(&k, &k, 3);
-            let s = angle.sin();
-            let one_minus_c = 1.0 - angle.cos();
-            let mut out = vec![vec![0.0_f64; 3]; 3];
-            for i in 0..3 {
-                for j in 0..3 {
-                    out[i][j] = if i == j { 1.0 } else { 0.0 }
-                        + s * k[i][j]
-                        + one_minus_c * kk[i][j];
-                }
-            }
-            Ok(out)
-        }
-        "R1" | "TRIVIAL" => {
-            if g.ndim() != 2 {
-                return Err(format!(
-                    "{group} group coordinates must have shape (B, A)"
-                ));
-            }
-            Ok(vec![vec![1.0]])
-        }
-        other => Err(format!(
-            "group must be 'SO2', 'SO3', 'R1', or 'Trivial'; got {other:?}"
-        )),
-    }
-}
-
 #[pyfunction(signature = (group, w, g, z, weight, ard_weight, log_bandwidth = None))]
 fn equivariant_penalty_value<'py>(
     group: String,
@@ -11263,132 +11121,17 @@ fn equivariant_penalty_value<'py>(
     ard_weight: f64,
     log_bandwidth: Option<PyReadonlyArray1<'py, f64>>,
 ) -> PyResult<f64> {
-    if !(weight.is_finite() && weight > 0.0) {
-        return Err(py_value_error(format!(
-            "weight must be finite and > 0, got {weight}"
-        )));
-    }
-    if !(ard_weight.is_finite() && ard_weight >= 0.0) {
-        return Err(py_value_error(format!(
-            "ard_weight must be finite and >= 0, got {ard_weight}"
-        )));
-    }
-    let group = match group.as_str() {
-        "SO2" => "SO2",
-        "SO3" => "SO3",
-        "R1" => "R1",
-        "Trivial" | "TRIVIAL" => "TRIVIAL",
-        other => {
-            return Err(py_value_error(format!(
-                "group must be 'SO2', 'SO3', 'R1', or 'Trivial'; got {other:?}"
-            )));
-        }
-    };
-    let expected_r = match group {
-        "SO2" => 2,
-        "SO3" => 3,
-        "R1" | "TRIVIAL" => 1,
-        _ => unreachable!(),
-    };
-    let w_view = w.as_array();
-    let g_view = g.as_array();
-    let z_view = z.as_array();
-    let (n_atoms, ambient_dim, rep_dim) = (w_view.shape()[0], w_view.shape()[1], w_view.shape()[2]);
-    if rep_dim != expected_r {
-        return Err(py_value_error(format!(
-            "{group} requires W.shape[2] == {expected_r}; got {rep_dim}"
-        )));
-    }
-    if z_view.ncols() != n_atoms {
-        return Err(py_value_error(format!(
-            "z has {} atoms but W has {n_atoms}",
-            z_view.ncols()
-        )));
-    }
-    let batches = z_view.nrows();
-    if g_view.ndim() < 2 || g_view.shape()[0] != batches || g_view.shape()[1] != n_atoms {
-        return Err(py_value_error(format!(
-            "g leading dimensions must match z shape ({batches}, {n_atoms})"
-        )));
-    }
-    if let Some(log_bw) = log_bandwidth.as_ref() {
-        if log_bw.as_array().len() != n_atoms {
-            return Err(py_value_error(format!(
-                "log_bandwidth length {} must equal atom count {n_atoms}",
-                log_bw.as_array().len()
-            )));
-        }
-    }
-
-    let mut comm_total = 0.0_f64;
-    for atom in 0..n_atoms {
-        let mut wtw = vec![vec![0.0_f64; rep_dim]; rep_dim];
-        for r1 in 0..rep_dim {
-            for r2 in 0..rep_dim {
-                let mut acc = 0.0_f64;
-                for d in 0..ambient_dim {
-                    acc += w_view[[atom, d, r1]] * w_view[[atom, d, r2]];
-                }
-                if r1 == r2 {
-                    acc += 1.0e-6;
-                }
-                wtw[r1][r2] = acc;
-            }
-        }
-        let inv = invert_small_matrix(&wtw, "equivariant_penalty_value WtW")
-            .map_err(py_value_error)?;
-        for batch in 0..batches {
-            let rotation =
-                equivariant_rotation(group, &g_view, batch, atom).map_err(py_value_error)?;
-            let mut w_rot = vec![vec![0.0_f64; rep_dim]; ambient_dim];
-            for d in 0..ambient_dim {
-                for s_col in 0..rep_dim {
-                    let mut acc = 0.0_f64;
-                    for r_col in 0..rep_dim {
-                        acc += w_view[[atom, d, r_col]] * rotation[r_col][s_col];
-                    }
-                    w_rot[d][s_col] = acc;
-                }
-            }
-            let mut cross = vec![vec![0.0_f64; rep_dim]; rep_dim];
-            for r_col in 0..rep_dim {
-                for s_col in 0..rep_dim {
-                    let mut acc = 0.0_f64;
-                    for d in 0..ambient_dim {
-                        acc += w_view[[atom, d, r_col]] * w_rot[d][s_col];
-                    }
-                    cross[r_col][s_col] = acc;
-                }
-            }
-            let solve = square_matmul(&inv, &cross, rep_dim);
-            let mut sq = 0.0_f64;
-            for d in 0..ambient_dim {
-                let mut projection_col0 = 0.0_f64;
-                for r_col in 0..rep_dim {
-                    projection_col0 += w_view[[atom, d, r_col]] * solve[r_col][0];
-                }
-                let residual = w_rot[d][0] - projection_col0;
-                sq += residual * residual;
-            }
-            comm_total += 0.5 * z_view[[batch, atom]] * sq;
-        }
-    }
-    let mut value = weight * comm_total / ((batches * n_atoms) as f64);
-    if let Some(log_bw) = log_bandwidth.as_ref() {
-        if ard_weight > 0.0 {
-            let mut bw_value = 0.0_f64;
-            for bandwidth in log_bw.as_array().iter().copied() {
-                if !bandwidth.is_finite() {
-                    return Err(py_value_error(
-                        "log_bandwidth entries must be finite".to_string(),
-                    ));
-                }
-                bw_value += 0.5 * (1.0e-3 + bandwidth * bandwidth).ln();
-            }
-            value += ard_weight * bw_value;
-        }
-    }
-    Ok(value)
+    let log_bandwidth = log_bandwidth.as_ref().map(|values| values.as_array());
+    gam::terms::equivariant_penalty::equivariant_penalty_value(
+        group.as_str(),
+        w.as_array(),
+        g.as_array(),
+        z.as_array(),
+        weight,
+        ard_weight,
+        log_bandwidth,
+    )
+    .map_err(py_value_error)
 }
 
 // ===========================================================================
@@ -11580,39 +11323,6 @@ fn rg_inverse_alr_impl(
         for col in 0..d {
             out[[row, col]] /= total;
         }
-    }
-    Ok(out)
-}
-
-fn rg_simplex_frechet_mean_impl(
-    values: ArrayView2<'_, f64>,
-    weights: Option<ArrayView1<'_, f64>>,
-) -> Result<Array1<f64>, String> {
-    let comp = rg_closure_impl(values)?;
-    rg_require_positive(comp.view(), "simplex Fréchet mean")?;
-    let (n, d) = comp.dim();
-    let w = rg_normalize_weights(n, weights)?;
-    let mut mean_log = Array1::<f64>::zeros(d);
-    for row in 0..n {
-        for col in 0..d {
-            mean_log[col] += w[row] * comp[[row, col]].ln();
-        }
-    }
-    let mut max_v = f64::NEG_INFINITY;
-    for &v in mean_log.iter() {
-        if v > max_v {
-            max_v = v;
-        }
-    }
-    let mut total = 0.0_f64;
-    let mut out = Array1::<f64>::zeros(d);
-    for col in 0..d {
-        let e = (mean_log[col] - max_v).exp();
-        out[col] = e;
-        total += e;
-    }
-    for col in 0..d {
-        out[col] /= total;
     }
     Ok(out)
 }
@@ -11825,211 +11535,6 @@ fn rg_sphere_exp_map_impl(
         }
     }
     Ok(out)
-}
-
-fn rg_sphere_orthogonal_unit(vector: ArrayView1<'_, f64>) -> Result<Array1<f64>, String> {
-    let mut min_index = 0;
-    let mut min_abs = vector[0].abs();
-    for (index, value) in vector.iter().enumerate().skip(1) {
-        let candidate = value.abs();
-        if candidate < min_abs {
-            min_abs = candidate;
-            min_index = index;
-        }
-    }
-    let axis_dot = vector[min_index];
-    let mut tangent = Array1::<f64>::zeros(vector.len());
-    tangent[min_index] = 1.0;
-    for col in 0..vector.len() {
-        tangent[col] -= axis_dot * vector[col];
-    }
-    let norm = rg_vector_norm(tangent.view());
-    if norm <= 0.0 {
-        return Err("cannot construct a tangent direction for the spherical mean".to_string());
-    }
-    Ok(tangent.mapv(|v| v / norm))
-}
-
-fn rg_sphere_mean_candidates(
-    values: ArrayView2<'_, f64>,
-    weights: ArrayView1<'_, f64>,
-) -> Result<Vec<Array1<f64>>, String> {
-    let (n, d) = values.dim();
-    let mut candidates: Vec<Array1<f64>> = Vec::new();
-    let mut extrinsic = Array1::<f64>::zeros(d);
-    for row in 0..n {
-        for col in 0..d {
-            extrinsic[col] += weights[row] * values[[row, col]];
-        }
-    }
-    let ex_norm = rg_vector_norm(extrinsic.view());
-    if ex_norm > 0.0 {
-        candidates.push(extrinsic.mapv(|v| v / ex_norm));
-    }
-    let mut moment = Array2::<f64>::zeros((d, d));
-    for row in 0..n {
-        for r in 0..d {
-            for c in 0..d {
-                moment[[r, c]] += weights[row] * values[[row, r]] * values[[row, c]];
-            }
-        }
-    }
-    let mut v = Array1::<f64>::from_elem(d, 1.0 / (d as f64).sqrt());
-    for _ in 0..64 {
-        let mut nv = Array1::<f64>::zeros(d);
-        for r in 0..d {
-            let mut acc = 0.0;
-            for c in 0..d {
-                acc += moment[[r, c]] * v[c];
-            }
-            nv[r] = acc;
-        }
-        let nrm = rg_vector_norm(nv.view());
-        if nrm <= 0.0 {
-            break;
-        }
-        nv.mapv_inplace(|x| x / nrm);
-        v = nv;
-    }
-    let v_norm = rg_vector_norm(v.view());
-    if v_norm > 0.0 {
-        let unit = v.mapv(|x| x / v_norm);
-        candidates.push(unit.clone());
-        candidates.push(unit.mapv(|x| -x));
-    }
-    Ok(candidates)
-}
-
-fn rg_sphere_weighted_log_step(
-    values: ArrayView2<'_, f64>,
-    weights: ArrayView1<'_, f64>,
-    base: ArrayView1<'_, f64>,
-) -> Result<Array1<f64>, String> {
-    let mut step = Array1::<f64>::zeros(base.len());
-    for row in 0..values.nrows() {
-        let mut dot = 0.0_f64;
-        for col in 0..base.len() {
-            dot += values[[row, col]] * base[col];
-        }
-        let dot = dot.clamp(-1.0, 1.0);
-        if dot <= -1.0 + 1.0e-12 {
-            return Err("spherical log map is undefined at antipodal points".to_string());
-        }
-        let theta = dot.acos();
-        if theta < 1.0e-12 {
-            continue;
-        }
-        let sin_theta = theta.sin();
-        let scale = if sin_theta > 1.0e-12 {
-            theta / sin_theta
-        } else {
-            1.0
-        };
-        for col in 0..base.len() {
-            step[col] += weights[row] * (values[[row, col]] - dot * base[col]) * scale;
-        }
-    }
-    Ok(step)
-}
-
-fn rg_sphere_exp_single(
-    tangent: ArrayView1<'_, f64>,
-    base: ArrayView1<'_, f64>,
-) -> Result<Array1<f64>, String> {
-    let mut radial = 0.0_f64;
-    for i in 0..base.len() {
-        radial += tangent[i] * base[i];
-    }
-    let mut z = Array1::<f64>::zeros(base.len());
-    for col in 0..base.len() {
-        z[col] = tangent[col] - radial * base[col];
-    }
-    let r = rg_vector_norm(z.view());
-    let mut out = Array1::<f64>::zeros(base.len());
-    if r < 1.0e-12 {
-        for col in 0..base.len() {
-            out[col] = base[col] + z[col];
-        }
-    } else {
-        let cos_r = r.cos();
-        let sin_scale = r.sin() / r;
-        for col in 0..base.len() {
-            out[col] = cos_r * base[col] + sin_scale * z[col];
-        }
-    }
-    let norm = rg_vector_norm(out.view());
-    if !norm.is_finite() || norm <= 0.0 {
-        return Err("spherical exponential map produced a non-finite point".to_string());
-    }
-    Ok(out.mapv(|v| v / norm))
-}
-
-fn rg_sphere_frechet_objective(
-    values: ArrayView2<'_, f64>,
-    weights: ArrayView1<'_, f64>,
-    base: ArrayView1<'_, f64>,
-) -> f64 {
-    let mut obj = 0.0_f64;
-    for row in 0..values.nrows() {
-        let mut dot = 0.0_f64;
-        for col in 0..base.len() {
-            dot += values[[row, col]] * base[col];
-        }
-        let dot = dot.clamp(-1.0, 1.0);
-        let theta = dot.acos();
-        obj += weights[row] * theta * theta;
-    }
-    obj
-}
-
-fn rg_sphere_frechet_mean_impl(
-    values: ArrayView2<'_, f64>,
-    weights: Option<ArrayView1<'_, f64>>,
-    tol: f64,
-    max_iter: usize,
-) -> Result<Array1<f64>, String> {
-    if !(tol.is_finite() && tol >= 0.0) {
-        return Err(
-            "spherical Fréchet mean tolerance must be finite and non-negative".to_string(),
-        );
-    }
-    let y = rg_normalize_sphere_matrix(values)?;
-    let w = rg_normalize_weights(y.nrows(), weights)?;
-    let mut candidates = rg_sphere_mean_candidates(y.view(), w.view())?;
-    if candidates.is_empty() {
-        candidates.push(rg_sphere_orthogonal_unit(y.row(0))?);
-    }
-    let mut best_mu: Option<Array1<f64>> = None;
-    let mut best_obj = f64::INFINITY;
-    for candidate in candidates {
-        let mut mu = candidate;
-        let mut failed = false;
-        for _ in 0..max_iter {
-            let step = match rg_sphere_weighted_log_step(y.view(), w.view(), mu.view()) {
-                Ok(step) => step,
-                Err(_) => {
-                    failed = true;
-                    break;
-                }
-            };
-            let step_norm = rg_vector_norm(step.view());
-            if step_norm < tol {
-                break;
-            }
-            mu = rg_sphere_exp_single(step.view(), mu.view())?;
-        }
-        if failed {
-            continue;
-        }
-        let obj = rg_sphere_frechet_objective(y.view(), w.view(), mu.view());
-        if obj < best_obj {
-            best_obj = obj;
-            best_mu = Some(mu);
-        }
-    }
-    best_mu.ok_or_else(|| {
-        "spherical Fréchet mean is not identifiable for these points".to_string()
-    })
 }
 
 fn rg_normalize_fisher_rao_impl(
@@ -12320,9 +11825,9 @@ fn response_geometry_simplex_frechet_mean<'py>(
     let arr = values.as_array().to_owned();
     let w_owned = weights.as_ref().map(|w| w.as_array().to_owned());
     let out = detach_py_result(py, "response_geometry_simplex_frechet_mean", move || {
-        rg_simplex_frechet_mean_impl(arr.view(), w_owned.as_ref().map(|w| w.view()))
+        simplex_frechet_mean(arr.view(), w_owned.as_ref().map(|w| w.view()))
     })?;
-    Ok(out.into_pyarray(py).unbind())
+    Ok(Array1::from_vec(out).into_pyarray(py).unbind())
 }
 
 #[pyfunction(signature = (values, base, coordinates, reference = -1))]
@@ -12412,9 +11917,14 @@ fn sphere_frechet_mean<'py>(
     let arr = values.as_array().to_owned();
     let w_owned = weights.as_ref().map(|w| w.as_array().to_owned());
     let mean = detach_py_result(py, "sphere_frechet_mean", move || {
-        rg_sphere_frechet_mean_impl(arr.view(), w_owned.as_ref().map(|w| w.view()), tol, max_iter)
+        gam::geometry::sphere::sphere_frechet_mean(
+            arr.view(),
+            w_owned.as_ref().map(|w| w.view()),
+            tol,
+            max_iter,
+        )
     })?;
-    Ok(mean.into_pyarray(py).unbind())
+    Ok(Array1::from(mean).into_pyarray(py).unbind())
 }
 
 #[pyfunction]
@@ -12495,12 +12005,13 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(sklearn_fit_metadata, module)?)?;
     module.add_function(wrap_pyfunction!(build_info, module)?)?;
     module.add_function(wrap_pyfunction!(interpolate_survival_surface, module)?)?;
+    module.add_function(wrap_pyfunction!(interpolate_rows, module)?)?;
     module.add_function(wrap_pyfunction!(survival_coerce_times, module)?)?;
     module.add_function(wrap_pyfunction!(survival_parameters_matrix, module)?)?;
     module.add_function(wrap_pyfunction!(survival_collect_chunks, module)?)?;
-    module.add_function(wrap_pyfunction!(survival_hazard_from_cumulative, module)?)?;
+    module.add_function(wrap_pyfunction!(hazard_from_cumulative, module)?)?;
     module.add_function(wrap_pyfunction!(survival_cumulative_from_survival, module)?)?;
-    module.add_function(wrap_pyfunction!(survival_block_from_anchor, module)?)?;
+    module.add_function(wrap_pyfunction!(survival_block, module)?)?;
     module.add_function(wrap_pyfunction!(survival_ffi_surface, module)?)?;
     module.add_function(wrap_pyfunction!(numeric_matrix_f64, module)?)?;
     module.add_function(wrap_pyfunction!(marginal_slope_clip_probabilities, module)?)?;
@@ -13990,10 +13501,6 @@ fn eta_bands_from_matrix(
 
 fn quantile_from_sorted(sorted: &[f64], q: f64) -> f64 {
     posterior_bands::quantile_linear_from_sorted(sorted, q)
-}
-
-fn apply_inverse_link_vec(eta: &[f64], family_kind: &str) -> Result<Vec<f64>, String> {
-    posterior_bands::apply_inverse_link_response(eta, family_kind)
 }
 
 fn posterior_credible_interval_impl(

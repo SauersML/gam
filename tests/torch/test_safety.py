@@ -7,7 +7,10 @@ cannot slip through.
 
 from __future__ import annotations
 
-import pytest
+import importlib
+from typing import Any
+
+pytest: Any = importlib.import_module("pytest")
 
 try:
     import torch

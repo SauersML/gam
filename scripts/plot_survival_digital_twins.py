@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import subprocess
 import tempfile
+import typing
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -13,6 +15,7 @@ from typing import Callable
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap
 
 ROOT = Path(__file__).resolve().parent.parent
 DATASET_DIR = ROOT / "bench" / "datasets"

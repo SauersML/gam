@@ -8,8 +8,9 @@ import sys
 from pathlib import Path
 
 BENCH_DIR = Path(__file__).resolve().parent
-sys.path.insert(0, str(BENCH_DIR))
-from fuzz_vs_mgcv import (
+REPO_DIR = BENCH_DIR.parent
+sys.path.insert(0, str(REPO_DIR))
+from bench.fuzz_vs_mgcv import (
     generate_data,
     generate_scenario,
     mgcv_formula,

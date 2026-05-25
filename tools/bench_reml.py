@@ -24,8 +24,22 @@ import sys
 import time
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Literal, TypeAlias, cast
 
 import torch
+
+FitMode: TypeAlias = Literal["joint", "independent", "auto"]
+_FIT_MODES: tuple[FitMode, ...] = ("joint", "independent", "auto")
+
+
+def _parse_modes(raw_modes: str) -> list[FitMode]:
+    modes: list[FitMode] = []
+    for raw_mode in raw_modes.split(","):
+        mode = raw_mode.strip()
+        if mode not in _FIT_MODES:
+            raise ValueError(f"unsupported mode {mode!r}; expected one of {', '.join(_FIT_MODES)}")
+        modes.append(cast(FitMode, mode))
+    return modes
 
 
 @contextmanager
@@ -58,7 +72,7 @@ def _build_inputs(N: int, F: int, M: int, D: int, device: str, seed: int = 0):
     return points, response, centers, amps
 
 
-def bench_one(*, N: int, F: int, M: int, D: int, mode: str, device: str,
+def bench_one(*, N: int, F: int, M: int, D: int, mode: FitMode, device: str,
               warmup: int, measure: int) -> dict:
     try:
         import gamfit
@@ -156,7 +170,7 @@ def main() -> int:
         return 1
 
     F_values = [int(x) for x in args.F_values.split(",")]
-    modes = [x.strip() for x in args.modes.split(",")]
+    modes = _parse_modes(args.modes)
 
     print(f"# REML bench  (gamfit {ver}, device={args.device}, N={args.N}, M={args.M_per_smooth}, D={args.D})\n")
     print(f"| F | mode | forward (ms) | backward (ms) | peak MB | status |")

@@ -221,6 +221,18 @@ class SkipTranscoderResult:
     explained_variance: float
 
 
+def _int_grid(value: int | Sequence[int]) -> list[int]:
+    if isinstance(value, int):
+        return [value]
+    return [int(item) for item in value]
+
+
+def _float_grid(value: float | int | Sequence[float]) -> list[float]:
+    if isinstance(value, (float, int)):
+        return [float(value)]
+    return [float(item) for item in value]
+
+
 def skip_transcoder(
     in_dim: int,
     out_dim: int,
@@ -246,15 +258,9 @@ def skip_transcoder(
     loop — gamfit's job is the composition primitive and the REML score;
     the user owns the optimizer.
     """
-    rank_list = list(rank_skip) if isinstance(rank_skip, (list, tuple)) else [int(rank_skip)]
-    thr_list = (
-        list(jumprelu_threshold)
-        if isinstance(jumprelu_threshold, (list, tuple))
-        else [float(jumprelu_threshold)]
-    )
-    lam_list = (
-        list(lambda_sparse) if isinstance(lambda_sparse, (list, tuple)) else [float(lambda_sparse)]
-    )
+    rank_list = _int_grid(rank_skip)
+    thr_list = _float_grid(jumprelu_threshold)
+    lam_list = _float_grid(lambda_sparse)
 
     is_sweep = (len(rank_list) > 1) or (len(thr_list) > 1) or (len(lam_list) > 1)
     if not is_sweep:

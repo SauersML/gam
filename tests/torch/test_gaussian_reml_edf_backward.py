@@ -34,14 +34,14 @@ unconstrained inputs (``x``, ``y``, ``w``).
 from __future__ import annotations
 
 import numpy as np
-import pytest
+from unittest import SkipTest
 
 try:
     import torch
 
     from gamfit.torch import gaussian_reml_fit, gaussian_reml_fit_batched
-except ImportError:
-    pytest.skip("torch dependency unavailable", allow_module_level=True)
+except ImportError as exc:
+    raise SkipTest("torch dependency unavailable") from exc
 
 
 _F64 = torch.float64

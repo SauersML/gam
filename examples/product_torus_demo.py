@@ -1,29 +1,42 @@
-"""Fit wrapped phases on a product torus."""
+"""Fit a latent smooth with product-torus updates."""
+
+from __future__ import annotations
 
 import numpy as np
 
 import gamfit
 
 
-def wrap(theta):
-    return (theta + np.pi) % (2.0 * np.pi) - np.pi
-
-
-def main():
+def main() -> None:
     rng = np.random.default_rng(11)
-    target = np.array([1.0, -2.2, 0.4])
-    theta = rng.normal(size=3)
-    for _ in range(60):
-        grad = wrap(theta - target)
-        theta = wrap(theta - 0.2 * grad)
+    n = 96
+    theta = rng.uniform(-np.pi, np.pi, size=(n, 3))
+    y = (
+        np.sin(theta[:, 0])
+        + 0.5 * np.cos(theta[:, 1] - theta[:, 2])
+        + 0.05 * rng.normal(size=n)
+    )
     manifold = gamfit.ProductManifold(
         gamfit.CircleManifold(),
         gamfit.CircleManifold(),
         gamfit.CircleManifold(),
     )
-    print(gamfit.TorusManifold(3).to_json())
-    print(manifold.to_json())
-    print("phase error", np.round(wrap(theta - target), 6))
+    model = gamfit.fit(
+        {"y": y},
+        "y ~ s(t, type='duchon', centers=24)",
+        family="gaussian",
+        latents={
+            "t": gamfit.LatentCoord(
+                n=n,
+                d=3,
+                init=theta,
+                manifold=manifold.to_json(),
+                retraction=manifold.to_json(),
+                aux_prior={"u": theta},
+            )
+        },
+    )
+    print(f"product torus fit deviance={model.summary()['deviance']:.3f}")
 
 
 if __name__ == "__main__":

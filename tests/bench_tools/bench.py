@@ -15,10 +15,11 @@ from pathlib import Path
 
 import pandas as pd
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIR))
 import mgcv
 
 
-SCRIPT_DIR = Path(__file__).resolve().parent
 WORKSPACE_ROOT = SCRIPT_DIR.parent.parent
 WORKDIR = SCRIPT_DIR / "bench_workdir"
 WORKDIR.mkdir(exist_ok=True)

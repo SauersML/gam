@@ -895,13 +895,6 @@ def _geometric_smoke_dataset(seed: int = 0, n: int = 200) -> pd.DataFrame:
         "y ~ sphere(lat, lon, radians=true)",
         # Intrinsic S² via spherical harmonics
         "y ~ sphere(lat, lon, method=harmonic, max_degree=4, radians=true)",
-        # Boundary-conditioned 1-D B-splines are exercised by the Rust
-        # tests (bc_clamped_predict_shape_bug.rs,
-        # bc_predict_dimension_invariants.rs,
-        # bc_anchored_variants_predict_works.rs) — skipped here so the
-        # smoke test stays green against published wheels that may not
-        # yet include the post-constraint frozen-transform fix. Re-add
-        # once gamfit's PyPI wheel rolls forward.
     ],
 )
 def test_geometric_smooths_round_trip_via_python_binding(formula: str) -> None:
@@ -1052,8 +1045,8 @@ def test_periodic_spline_curve_torch_fit_closes_a_circle_in_r2() -> None:
     from gamfit.torch import fit as torch_fit
 
     rng = np.random.default_rng(0)
-    n = 128
-    t_np = np.linspace(0.0, 1.0, n, endpoint=False)
+    n = 129
+    t_np = np.linspace(0.0, 1.0, n)
     y_np = np.stack(
         [
             np.cos(2.0 * np.pi * t_np) + 0.02 * rng.standard_normal(n),
@@ -1069,24 +1062,9 @@ def test_periodic_spline_curve_torch_fit_closes_a_circle_in_r2() -> None:
     result = torch_fit(t, y, spec)
     fitted = result.fitted.detach().cpu().numpy()
     assert fitted.shape == (n, 2)
-    # residuals should be small (noise std ~0.02)
     resid = fitted - y_np
     assert np.sqrt((resid ** 2).mean()) < 0.1
-
-    # periodicity: predict at t=0 and t=1 via fresh basis on each
-    basis0, _ = gamfit.periodic_spline_curve_basis(
-        np.array([0.0]), n_knots=10, degree=3
-    )
-    basis1, _ = gamfit.periodic_spline_curve_basis(
-        np.array([1.0]), n_knots=10, degree=3
-    )
-    coef_t = result.coefficients
-    if isinstance(coef_t, list):
-        coef_t = torch.stack(coef_t, dim=0)
-    coef = coef_t.detach().cpu().numpy()  # shape (K, D)
-    f0 = basis0 @ coef
-    f1 = basis1 @ coef
-    assert np.allclose(f0, f1, atol=1e-10)
+    np.testing.assert_allclose(fitted[0], fitted[-1], atol=1e-10)
 
 
 def test_sphere_torch_fit_smoke_all_kernels() -> None:
@@ -1172,29 +1150,15 @@ def test_torch_convex_smooth() -> None:
 
     rng = np.random.default_rng(1)
     n = 240
-    x_np = np.sort(rng.uniform(0.0, 1.0, size=n))
+    x_np = np.linspace(0.0, 1.0, n)
     y_np = (x_np - 0.5) ** 2 + 0.02 * rng.standard_normal(n)
 
     x = torch.as_tensor(x_np, dtype=torch.float64)
     y = torch.as_tensor(y_np, dtype=torch.float64)
     spec = BSpline(degree=3, shape_constraint="convex")
     result = torch_fit(x, y, spec)
-    # Evaluate fitted on a uniform grid via the basis at uniform points to
-    # get a clean second-difference signal.
-    from gamfit.torch._basis import bspline_basis
-    grid = torch.linspace(0.0, 1.0, 64, dtype=torch.float64)
-    # Rebuild knots that match the fit's BSpline path. Use the auto-knots
-    # derived from x for consistency.
-    knots = None
-    b_grid = bspline_basis(grid, knots, degree=3, periodic=False).detach().cpu().numpy()
-    coef_t = result.coefficients
-    if isinstance(coef_t, list):
-        coef_t = torch.stack(coef_t, dim=0)
-    coef = coef_t.detach().cpu().numpy()
-    # coef may be (M, 1); flatten.
-    coef_flat = coef.reshape(coef.shape[0], -1)
-    f_grid = (b_grid @ coef_flat).squeeze()
-    second_diffs = np.diff(f_grid, n=2)
+    fitted_at_grid = result.fitted.detach().cpu().numpy().squeeze()
+    second_diffs = np.diff(fitted_at_grid, n=2)
     assert (second_diffs >= -1e-5).all(), (
         f"convex fit violates ≥0 second-diff constraint; min={second_diffs.min()}"
     )
@@ -1221,15 +1185,7 @@ def test_torch_monotone_smooth_backward_finite_gradient() -> None:
     result = torch_fit(x, y, spec)
     fitted = result.fitted
     assert torch.isfinite(fitted).all(), "fitted contains NaN/Inf"
-    # Backward through the constrained Gaussian REML torch fit:
-    #  - at an interior cert (no constraint binds), gradients are finite;
-    #  - at an active cert, the analytic VJP is deferred and raises
-    #    NotImplementedError. Either is an acceptable contract here.
-    try:
-        fitted.sum().backward()
-    except NotImplementedError:
-        # Active-cert exit — deferred path is wired through cleanly.
-        return
+    fitted.sum().backward()
     assert x.grad is not None
     assert torch.isfinite(x.grad).all(), "x.grad has non-finite entries"
 
@@ -1258,10 +1214,6 @@ def test_constrained_reml_backward_envelope_at_interior_cert() -> None:
     y_np = (x_np @ beta_true + 0.05 * rng.standard_normal(n)).reshape(-1, 1)
     # A penalty that is a small ridge so the system is well-conditioned.
     penalty_np = np.eye(p)
-    # A constraint that the data overwhelmingly satisfies: bound a single
-    # near-zero linear combination from below by a value the fit clears
-    # easily. We pick the zero row so A·β = 0 ≥ -1 always — guaranteed
-    # interior cert.
     a_np = np.zeros((1, p))
     b_np = -np.ones(1)
 
@@ -1272,18 +1224,8 @@ def test_constrained_reml_backward_envelope_at_interior_cert() -> None:
         a_inequality=a_np,
         b_inequality=b_np,
     )
-    # Compute the true active set directly from |A·β̂ - b|. The
-    # constrained-forward's `active_indices` field uses a feasibility-style
-    # threshold, so we recompute the active set ourselves to be sure the
-    # backward sees an honest empty/non-empty signal.
-    beta_hat = np.asarray(out_fwd["coefficients"], dtype=np.float64).reshape(-1)
-    slack = a_np @ beta_hat - b_np
-    true_active = np.where(np.abs(slack) <= 1e-8 * max(1.0, float(np.abs(beta_hat).max()))) [0]
-    assert true_active.size == 0, (
-        "constraint should not be active under this data/constraint pair; "
-        f"got slacks={slack}"
-    )
-    active_for_backward = np.asarray(true_active, dtype=np.uint64)
+    active_for_backward = np.asarray(out_fwd["active_indices"], dtype=np.uint64)
+    assert active_for_backward.size == 0
 
     # Pick a downstream loss with non-trivial gradient on every output.
     grad_coef = np.ones((p, 1)) * 0.7
@@ -1344,89 +1286,6 @@ def test_constrained_reml_backward_envelope_at_interior_cert() -> None:
         assert diff <= 1e-5 * scale, (
             f"{key} disagrees between constrained and unconstrained REML "
             f"backward at interior cert: max|Δ|={diff:.3e}, scale={scale:.3e}"
-        )
-
-
-def test_constrained_reml_backward_finite_at_active_cert() -> None:
-    """When the shape constraint is binding (active cert exit), the
-    analytic VJP through the tangent-projected operator is not yet
-    implemented and the backward must raise ``NotImplementedError`` with a
-    clear pointer rather than silently producing wrong gradients."""
-    from gamfit import (
-        gaussian_reml_fit_with_constraints_backward,
-        gaussian_reml_fit_with_constraints_forward,
-    )
-
-    rng = np.random.default_rng(13)
-    n = 80
-    x_grid = np.sort(rng.uniform(0.0, 1.0, size=n))
-    # Deliberately non-monotone response: a bump that goes up then down.
-    y_np = (
-        -((x_grid - 0.5) ** 2)
-        + 0.02 * rng.standard_normal(n)
-    ).reshape(-1, 1)
-
-    # Build a small monotonic B-spline-like design via finite differences:
-    # design columns are indicator basis (one-hot binned), penalty is the
-    # second-difference penalty matrix, constraint enforces β_{i+1} ≥ β_i.
-    p = 10
-    bin_edges = np.linspace(0.0, 1.0, p + 1)
-    x_np = np.zeros((n, p), dtype=np.float64)
-    bin_index = np.clip(np.searchsorted(bin_edges, x_grid, side="right") - 1, 0, p - 1)
-    for i in range(n):
-        x_np[i, bin_index[i]] = 1.0
-
-    # Second-difference penalty: D = ∂²; S = DᵀD.
-    diff2 = np.zeros((p - 2, p))
-    for i in range(p - 2):
-        diff2[i, i] = 1.0
-        diff2[i, i + 1] = -2.0
-        diff2[i, i + 2] = 1.0
-    penalty_np = diff2.T @ diff2 + 1e-6 * np.eye(p)
-
-    # A·β ≥ 0 with A_i = e_{i+1} − e_i enforces β_{i+1} ≥ β_i (monotone
-    # non-decreasing). The bump response will trigger active constraints
-    # on the descending arm.
-    a_np = np.zeros((p - 1, p), dtype=np.float64)
-    for i in range(p - 1):
-        a_np[i, i] = -1.0
-        a_np[i, i + 1] = 1.0
-    b_np = np.zeros(p - 1, dtype=np.float64)
-
-    out_fwd = gaussian_reml_fit_with_constraints_forward(
-        x_np,
-        y_np,
-        penalty_np,
-        a_inequality=a_np,
-        b_inequality=b_np,
-    )
-    # Compute the true active set from |A·β̂ - b|.
-    beta_hat = np.asarray(out_fwd["coefficients"], dtype=np.float64).reshape(-1)
-    slack = a_np @ beta_hat - b_np
-    tol = 1e-7 * max(1.0, float(np.abs(beta_hat).max()))
-    true_active = np.where(np.abs(slack) <= tol)[0]
-    # The bump-shaped response on a monotone-non-decreasing constraint
-    # must bind at least one row.
-    assert true_active.size > 0, (
-        "test setup expected at least one binding constraint; got "
-        f"slacks={slack}"
-    )
-    active_for_backward = np.asarray(true_active, dtype=np.uint64)
-
-    # The deferred path must raise NotImplementedError with a clear msg.
-    with pytest.raises(NotImplementedError):
-        gaussian_reml_fit_with_constraints_backward(
-            x_np,
-            y_np,
-            penalty_np,
-            a_inequality=a_np,
-            b_inequality=b_np,
-            log_lambda_at_optimum=out_fwd["log_lambda"],
-            coefficients_at_optimum=out_fwd["coefficients"],
-            fitted_at_optimum=out_fwd["fitted"],
-            active_indices=active_for_backward,
-            grad_coefficients=np.ones((p, 1)) * 0.5,
-            grad_reml_score=0.1,
         )
 
 

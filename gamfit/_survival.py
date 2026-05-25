@@ -475,12 +475,7 @@ class SurvivalPrediction:
         return str(path)
 
     def _survival_block(self, params: Any, times_arr: Any) -> Any:
-        import numpy as np
-
-        anchor_log_hazard = params[:, 0:1]
-        hazard = np.exp(anchor_log_hazard)
-        cumulative = hazard * times_arr.reshape(1, -1)
-        return np.exp(-cumulative)
+        return rust_module().survival_block(params, times_arr)
 
 
 def ordered_prediction_columns(columns: dict[str, list[float]]) -> dict[str, list[float]]:
@@ -821,22 +816,15 @@ def _interpolate_rows(
     clip: tuple[float | None, float | None],
 ) -> Any:
     import numpy as np
+    from ._binding import rust_module
 
-    grid = np.asarray(grid, dtype=float).reshape(-1)
-    query = np.asarray(query, dtype=float).reshape(-1)
-    surface = np.asarray(surface, dtype=float)
-    if grid.size == 0 or surface.shape[1] != grid.size:
-        raise ValueError("survival interpolation requires a non-empty grid")
-    order = np.argsort(grid, kind="stable")
-    sorted_grid = grid[order]
-    sorted_surface = surface[:, order]
-    out = np.empty((sorted_surface.shape[0], query.size), dtype=float)
-    for row_idx in range(sorted_surface.shape[0]):
-        out[row_idx, :] = np.interp(query, sorted_grid, sorted_surface[row_idx, :])
-    lo, hi = clip
-    if lo is not None or hi is not None:
-        out = np.clip(out, lo if lo is not None else -np.inf, hi if hi is not None else np.inf)
-    return out
+    clip_lo, clip_hi = clip
+    return np.asarray(rust_module().interpolate_rows(
+        np.asarray(grid, dtype=float).reshape(-1),
+        np.asarray(surface, dtype=float),
+        np.asarray(query, dtype=float).reshape(-1),
+        clip_lo, clip_hi,
+    ), dtype=float)
 
 
 __all__ = [
