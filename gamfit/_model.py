@@ -98,7 +98,7 @@ class Model:
         """Return the model summary (coefficients, family, deviance, REML score)."""
         if self._summary_cache is None:
             try:
-                payload = json.loads(rust_module().summary_json(self._model_bytes))
+                payload = rust_module().summary_payload_from_model(self._model_bytes)
             except Exception as exc:
                 raise map_exception(exc) from exc
             self._summary_cache = Summary.from_dict(payload)
@@ -239,14 +239,15 @@ class Model:
         """Return a no-refit model extended with deployment-time group levels."""
         if not isinstance(new_group_spec, dict):
             raise TypeError("new_group_spec must be a dict")
-        payload = dict(new_group_spec)
-        if metadata is not None:
-            payload["metadata"] = metadata
-        if prior is not None:
-            payload["prior"] = prior
         try:
+            rust = rust_module()
+            payload_json = rust.build_extend_group_payload_json(
+                json.dumps(new_group_spec),
+                json.dumps(metadata) if metadata is not None else None,
+                json.dumps(prior) if prior is not None else None,
+            )
             model_bytes = bytes(
-                rust_module().extend_model_with_group(self._model_bytes, json.dumps(payload))
+                rust.extend_model_with_group(self._model_bytes, payload_json)
             )
         except Exception as exc:
             raise map_exception(exc) from exc
