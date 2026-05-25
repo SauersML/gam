@@ -108,20 +108,27 @@ mod cuda {
     pub(crate) fn pinned_htod<
         T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + Copy,
     >(
-        ctx: &std::sync::Arc<CudaContext>,
+        _ctx: &std::sync::Arc<CudaContext>,
         stream: &std::sync::Arc<cudarc::driver::CudaStream>,
         src: &[T],
     ) -> Result<CudaSlice<T>, String> {
-        // SAFETY: alloc_pinned reserves uninitialized pinned host memory of src.len() T elements;
-        // we immediately copy_from_slice over the entire region below before any device read.
-        let mut pinned = unsafe { ctx.alloc_pinned::<T>(src.len()) }
-            .map_err(|e| format!("pinned host alloc: {e}"))?;
-        pinned
-            .as_mut_slice()
-            .map_err(|e| format!("pinned host slice: {e}"))?
-            .copy_from_slice(src);
+        // Originally this routine round-tripped the upload through a
+        // `CU_MEMHOSTALLOC_WRITECOMBINED` pinned staging buffer
+        // (`ctx.alloc_pinned`) to enable async DMA. In cudarc 0.19 the
+        // `PinnedHostSlice` returned from `alloc_pinned` carries an event that
+        // its `Drop` impl unconditionally `event.synchronize()`s before freeing
+        // the host mapping — see cudarc-0.19.7 `core.rs::PinnedHostSlice::drop`.
+        // Because the staging buffer goes out of scope at the end of this
+        // function, the host thread blocks here until the H2D copy completes,
+        // immediately defeating the "async" of pinned DMA. The net cost is two
+        // extra driver calls per upload (`cuMemHostAlloc_WC` + `cuMemFreeHost`)
+        // plus a forced stream synchronization, and the workspace ends up
+        // strictly slower than a plain pageable H2D — the driver already
+        // stages pageable copies internally via its own pinned pool, and that
+        // path does not block the issuing host thread for unrelated stream
+        // work. Issue a direct async H2D from the pageable buffer instead.
         stream
-            .clone_htod(&pinned)
+            .clone_htod(src)
             .map_err(|e| format!("cuda H2D: {e}"))
     }
 
