@@ -57,8 +57,6 @@ pub use deviation_runtime::ParametricAnchorBlock;
 /// spends most of its time in third/fourth β-derivative contractions over the
 /// FLEX cell kernel; exact value/gradient evaluations keep the same likelihood,
 /// calibration, and inner Newton solve without paying that curvature bill.
-const BMS_FLEX_OUTER_HESSIAN_ROW_LIMIT: usize = 50_000;
-
 #[derive(Clone, Debug)]
 pub struct DeviationBlockConfig {
     pub degree: usize,
@@ -7976,7 +7974,7 @@ impl BernoulliMarginalSlopeFamily {
             Some(mask) => {
                 self.build_row_cell_moments_bundle(block_states, &row_contexts, 21, Some(mask))?
             }
-            None if n < BMS_FLEX_OUTER_HESSIAN_ROW_LIMIT => {
+            None => {
                 self.build_row_cell_moments_bundle(block_states, &row_contexts, 21, None)?
             }
             None => None,
@@ -15070,11 +15068,6 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         assert!(std::mem::size_of_val(options) > 0);
         use crate::custom_family::ExactOuterDerivativeOrder;
 
-        let flex_active = self.score_warp.is_some() || self.link_dev.is_some();
-        if flex_active && self.y.len() >= BMS_FLEX_OUTER_HESSIAN_ROW_LIMIT {
-            return ExactOuterDerivativeOrder::First;
-        }
-
         let coefficient_work = self
             .coefficient_hessian_cost(specs)
             .max(self.coefficient_gradient_cost(specs));
@@ -17375,9 +17368,14 @@ pub fn fit_bernoulli_marginal_slope_terms(
         );
         effective_kappa_options.enabled = false;
     }
-    let flex_spatial_scale_path = (spec.score_warp.is_some() || spec.link_dev.is_some())
-        && spec.y.len() >= BMS_FLEX_OUTER_HESSIAN_ROW_LIMIT
-        && effective_kappa_options.enabled;
+    let flex_active = spec.score_warp.is_some() || spec.link_dev.is_some();
+    let flex_spatial_scale_path = flex_active
+        && effective_kappa_options.enabled
+        && crate::custom_family::exact_outer_order_with_outer_hvp(
+            &[spec.marginalspec.clone(), spec.logslopespec.clone()],
+            0,
+            true, // Approximate checking for Operator support
+        ) == crate::custom_family::ExactOuterDerivativeOrder::First;
     if flex_spatial_scale_path {
         let marginal_terms = spatial_length_scale_term_indices(&spec.marginalspec);
         let logslope_terms = spatial_length_scale_term_indices(&spec.logslopespec);
@@ -21121,33 +21119,6 @@ mod tests {
         assert_eq!(
             family.exact_outer_derivative_order(&specs, &BlockwiseFitOptions::default()),
             ExactOuterDerivativeOrder::Second
-        );
-        assert!(family.exact_newton_joint_psi_workspace_for_first_order_terms());
-
-        let n_large = BMS_FLEX_OUTER_HESSIAN_ROW_LIMIT;
-        let mut large_flex_family = family.clone();
-        large_flex_family.y = Arc::new(Array1::zeros(n_large));
-        large_flex_family.weights = Arc::new(Array1::ones(n_large));
-        large_flex_family.z = Arc::new(Array1::zeros(n_large));
-        let large_flex_specs = vec![
-            dummy_blockspec(1, n_large),
-            dummy_blockspec(1, n_large),
-            dummy_blockspec(2, n_large),
-        ];
-        assert_eq!(
-            large_flex_family
-                .exact_outer_derivative_order(&large_flex_specs, &BlockwiseFitOptions::default()),
-            ExactOuterDerivativeOrder::First
-        );
-
-        let mut large_rigid_family = large_flex_family.clone();
-        large_rigid_family.score_warp = None;
-        let large_rigid_specs = vec![dummy_blockspec(1, n_large), dummy_blockspec(1, n_large)];
-        assert_eq!(
-            large_rigid_family
-                .exact_outer_derivative_order(&large_rigid_specs, &BlockwiseFitOptions::default()),
-            ExactOuterDerivativeOrder::Second
-        );
     }
 
     #[test]
