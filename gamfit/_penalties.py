@@ -1326,24 +1326,20 @@ class AuxConditionalPriorPenalty(_AnalyticPenalty):
                 f"within 1e-10; max asymmetry is {max_asym:.3e}"
             )
 
-    def _to_rust_payload(self) -> dict[str, Any]:
+    def _payload_extras(self) -> dict[str, Any]:
         arr = np.ascontiguousarray(self.lambda_per_row, dtype=float)
-        return _add_weight_schedule({
-            "kind": "aux_conditional_prior",
-            "target": _target_descriptor(self.target),
+        return {
             "lambda_per_row": arr.reshape(-1).tolist(),
             "lambda_per_row_shape": list(arr.shape),
             "weight": self.weight,
             "n_eff": self.n_eff,
             "learnable": self.learnable,
-        }, self)
-
-    def to_rust_descriptor(self) -> dict[str, Any]:
-        return self._to_rust_payload()
+        }
 
 
 @dataclass(init=False, slots=True)
-class IvaeRidgeMeanGauge:
+class IvaeRidgeMeanGauge(_AnalyticPenalty):
+    KIND_TAG = "ivae_ridge_mean_gauge"
     """iVAE conditional-mean gauge penalty on t.
 
     Applies ``0.5 * weight * ||t - U @ inv(U.T @ U + ridge_eps * I) @ U.T @ t||^2``.
@@ -1425,25 +1421,21 @@ class IvaeRidgeMeanGauge:
         if not np.isfinite(self.aux).all():
             raise ValueError("IvaeRidgeMeanGauge.aux must be finite")
 
-    def _to_rust_payload(self) -> dict[str, Any]:
+    def _payload_extras(self) -> dict[str, Any]:
         aux = np.ascontiguousarray(self.aux, dtype=float)
-        return _add_weight_schedule({
-            "kind": "ivae_ridge_mean_gauge",
-            "target": _target_descriptor(self.target),
+        return {
             "aux": aux.reshape(-1).tolist(),
             "aux_shape": list(aux.shape),
             "ridge_eps": self.ridge_eps,
             "weight": self.weight,
             "n_eff": self.n_eff,
             "learnable": self.learnable,
-        }, self)
-
-    def to_rust_descriptor(self) -> dict[str, Any]:
-        return self._to_rust_payload()
+        }
 
 
 @dataclass(init=False, slots=True)
-class ParametricAuxConditionalPriorPenalty:
+class ParametricAuxConditionalPriorPenalty(_AnalyticPenalty):
+    KIND_TAG = "parametric_aux_conditional_prior"
     """Parametric iVAE-style auxiliary-conditional prior on t.
 
     Applies diagonal row precision

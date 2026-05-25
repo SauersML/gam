@@ -2006,7 +2006,7 @@ fn extract_output_dim_from_view(py: Python<'_>, view: &RemlFitView<'_>) -> PyRes
     match view {
         RemlFitView::SavedSummary(payload) => Ok(json_output_dim(payload)),
         RemlFitView::PythonObject(_) => {
-            let Some(coefficients) = extract_py_metadata_value(py, view, &["coefficients"])? else {
+            let Some(coefficients) = extract_py_metadata_value(view, &["coefficients"])? else {
                 return Ok(1.0);
             };
             let Ok(shape) = coefficients.getattr("shape") else {
@@ -2026,7 +2026,7 @@ fn extract_edf_from_view(py: Python<'_>, view: &RemlFitView<'_>) -> PyResult<Opt
     match view {
         RemlFitView::SavedSummary(payload) => Ok(json_lookup_edf(payload, EDF_KEYS)),
         RemlFitView::PythonObject(_) => {
-            let Some(value) = extract_py_metadata_value(py, view, EDF_KEYS)? else {
+            let Some(value) = extract_py_metadata_value(view, EDF_KEYS)? else {
                 return Ok(None);
             };
             py_value_to_float_or_sum(&value).map(Some)
@@ -2041,7 +2041,7 @@ fn extract_float_metadata_from_view(
     match view {
         RemlFitView::SavedSummary(payload) => Ok(json_lookup_f64(payload, keys)),
         RemlFitView::PythonObject(fit) => {
-            let Some(value) = extract_py_metadata_value(fit.py(), view, keys)? else {
+            let Some(value) = extract_py_metadata_value(view, keys)? else {
                 return Ok(None);
             };
             value.extract::<f64>().map(Some)
@@ -2054,20 +2054,20 @@ fn reml_fit_view<'py>(
     fit: &Bound<'py, PyAny>,
 ) -> PyResult<RemlFitView<'py>> {
     if let Ok(model_bytes) = fit.extract::<Vec<u8>>() {
-        return Ok(RemplFitView::SavedSummary(summary_payload_from_model_bytes(
+        return Ok(RemlFitView::SavedSummary(summary_payload_from_model_bytes(
             &model_bytes,
         )?));
     }
     if fit.hasattr("_model_bytes")? {
         let model_bytes: Vec<u8> = fit.getattr("_model_bytes")?.extract()?;
-        return Ok(RemplFitView::SavedSummary(summary_payload_from_model_bytes(
+        return Ok(RemlFitView::SavedSummary(summary_payload_from_model_bytes(
             &model_bytes,
         )?));
     }
     if let Some(payload) = py_summary_payload(py, fit)? {
-        return Ok(RemplFitView::PythonObject(payload));
+        return Ok(RemlFitView::PythonObject(payload));
     }
-    Ok(RemplFitView::PythonObject(fit.clone()))
+    Ok(RemlFitView::PythonObject(fit.clone()))
 }
 
 fn summary_payload_from_model_bytes(model_bytes: &[u8]) -> PyResult<serde_json::Value> {
@@ -2096,7 +2096,6 @@ fn py_summary_payload<'py>(
 }
 
 fn extract_py_metadata_value<'py>(
-    py: Python<'py>,
     view: &RemlFitView<'py>,
     keys: &[&str],
 ) -> PyResult<Option<Bound<'py, PyAny>>> {
@@ -2114,7 +2113,6 @@ fn extract_py_metadata_value<'py>(
             }
         }
     }
-    let _ = py;
     Ok(None)
 }
 
@@ -9817,6 +9815,277 @@ fn summary_json(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<String> {
 }
 
 #[pyfunction]
+fn summary_repr(payload: &Bound<'_, PyDict>) -> PyResult<String> {
+    let mut fields = Vec::new();
+    for key in ["formula", "family_name", "model_class", "deviance", "reml_score"] {
+        if let Some(value) = payload.get_item(key)? {
+            let repr = value.repr()?.extract::<String>()?;
+            fields.push(format!("{key}={repr}"));
+        }
+    }
+    Ok(format!("Summary({})", fields.join(", ")))
+}
+
+#[pyfunction]
+fn summary_html(payload: &Bound<'_, PyDict>) -> PyResult<String> {
+    let mut rows = String::new();
+    for (key, value) in payload.iter() {
+        let key_text = key.str()?.extract::<String>()?;
+        if key_text == "coefficients" || key_text == "covariance_flat" {
+            continue;
+        }
+        rows.push_str("<tr>");
+        rows.push_str(
+            "<th style='text-align:left;padding:0.25rem 0.75rem 0.25rem 0;'>",
+        );
+        rows.push_str(&summary_html_escape(&key_text));
+        rows.push_str("</th><td style='padding:0.25rem 0;'>");
+        rows.push_str(&summary_html_escape(&summary_render_value(&value)?));
+        rows.push_str("</td></tr>");
+    }
+    let coefficient_table = summary_render_coefficients_html(payload)?;
+    Ok(format!(
+        "<div style='font-family: ui-sans-serif, system-ui, sans-serif;'>\
+         <h3 style='margin:0 0 0.5rem 0;'>Model Summary</h3>\
+         <table style='border-collapse:collapse;'>{rows}</table>\
+         {coefficient_table}\
+         </div>"
+    ))
+}
+
+const SUMMARY_HTML_COEFFICIENT_LIMIT: usize = 50;
+const SUMMARY_VALUE_PREVIEW_LIMIT: usize = 6;
+
+fn summary_render_value(value: &Bound<'_, PyAny>) -> PyResult<String> {
+    if let Ok(float_value) = value.cast::<PyFloat>() {
+        return Ok(summary_format_float(float_value.extract::<f64>()?));
+    }
+    if let Ok(mapping) = value.cast::<PyDict>() {
+        return summary_render_mapping_value(mapping);
+    }
+    if let Ok(sequence) = value.cast::<PyList>() {
+        return summary_render_list_value(sequence);
+    }
+    if let Ok(sequence) = value.cast::<PyTuple>() {
+        return summary_render_tuple_value(sequence);
+    }
+    value.str()?.extract::<String>()
+}
+
+fn summary_render_mapping_value(value: &Bound<'_, PyDict>) -> PyResult<String> {
+    if value.is_empty() {
+        return Ok("{}".to_string());
+    }
+    let mut parts = Vec::new();
+    for (index, (key, item_value)) in value.iter().enumerate() {
+        if index >= SUMMARY_VALUE_PREVIEW_LIMIT {
+            break;
+        }
+        parts.push(format!(
+            "{}: {}",
+            key.str()?.extract::<String>()?,
+            summary_render_value(&item_value)?
+        ));
+    }
+    let suffix = if value.len() <= SUMMARY_VALUE_PREVIEW_LIMIT {
+        String::new()
+    } else {
+        format!(", ... ({} total)", value.len())
+    };
+    Ok(format!("{{{}{}}}", parts.join(", "), suffix))
+}
+
+fn summary_render_list_value(value: &Bound<'_, PyList>) -> PyResult<String> {
+    if value.is_empty() {
+        return Ok("[]".to_string());
+    }
+    let preview_len = value.len().min(SUMMARY_VALUE_PREVIEW_LIMIT);
+    let mut parts = Vec::with_capacity(preview_len);
+    for index in 0..preview_len {
+        parts.push(summary_render_value(&value.get_item(index)?)?);
+    }
+    let suffix = if value.len() <= SUMMARY_VALUE_PREVIEW_LIMIT {
+        String::new()
+    } else {
+        format!(", ... ({} total)", value.len())
+    };
+    Ok(format!("[{}{}]", parts.join(", "), suffix))
+}
+
+fn summary_render_tuple_value(value: &Bound<'_, PyTuple>) -> PyResult<String> {
+    if value.is_empty() {
+        return Ok("[]".to_string());
+    }
+    let preview_len = value.len().min(SUMMARY_VALUE_PREVIEW_LIMIT);
+    let mut parts = Vec::with_capacity(preview_len);
+    for index in 0..preview_len {
+        parts.push(summary_render_value(&value.get_item(index)?)?);
+    }
+    let suffix = if value.len() <= SUMMARY_VALUE_PREVIEW_LIMIT {
+        String::new()
+    } else {
+        format!(", ... ({} total)", value.len())
+    };
+    Ok(format!("[{}{}]", parts.join(", "), suffix))
+}
+
+fn summary_render_coefficients_html(payload: &Bound<'_, PyDict>) -> PyResult<String> {
+    let Some(coefficients_any) = payload.get_item("coefficients")? else {
+        return Ok(String::new());
+    };
+    let Ok(coefficients) = coefficients_any.cast::<PyList>() else {
+        return Ok(String::new());
+    };
+    if coefficients.is_empty() {
+        return Ok(String::new());
+    }
+
+    let columns = summary_coefficient_columns(coefficients)?;
+    let mut header_cells = String::new();
+    for column in &columns {
+        header_cells.push_str(
+            "<th style='text-align:right;padding:0.25rem 0.75rem;\
+             border-bottom:1px solid #ddd;'>",
+        );
+        header_cells.push_str(&summary_html_escape(column));
+        header_cells.push_str("</th>");
+    }
+
+    let row_limit = coefficients.len().min(SUMMARY_HTML_COEFFICIENT_LIMIT);
+    let mut body_rows = String::new();
+    for index in 0..row_limit {
+        let row_any = coefficients.get_item(index)?;
+        let row = row_any
+            .cast::<PyDict>()
+            .map_err(|_| PyValueError::new_err("summary coefficient rows must be dictionaries"))?;
+        body_rows.push_str("<tr>");
+        for column in &columns {
+            let rendered = match row.get_item(column.as_str())? {
+                Some(value) => summary_render_value(&value)?,
+                None => String::new(),
+            };
+            body_rows.push_str("<td style='text-align:right;padding:0.25rem 0.75rem;'>");
+            body_rows.push_str(&summary_html_escape(&rendered));
+            body_rows.push_str("</td>");
+        }
+        body_rows.push_str("</tr>");
+    }
+
+    let note = if coefficients.len() > SUMMARY_HTML_COEFFICIENT_LIMIT {
+        format!(
+            "<p style='margin:0.25rem 0 0 0;color:#666;'>Showing first {} of {} coefficients.</p>",
+            SUMMARY_HTML_COEFFICIENT_LIMIT,
+            coefficients.len()
+        )
+    } else {
+        String::new()
+    };
+
+    Ok(format!(
+        "<h4 style='margin:1rem 0 0.35rem 0;'>Coefficients</h4>\
+         <table style='border-collapse:collapse;'>\
+         <thead><tr>{header_cells}</tr></thead>\
+         <tbody>{body_rows}</tbody>\
+         </table>\
+         {note}"
+    ))
+}
+
+fn summary_coefficient_columns(coefficients: &Bound<'_, PyList>) -> PyResult<Vec<String>> {
+    let mut columns = Vec::new();
+    for index in 0..coefficients.len() {
+        let row_any = coefficients.get_item(index)?;
+        let row = row_any
+            .cast::<PyDict>()
+            .map_err(|_| PyValueError::new_err("summary coefficient rows must be dictionaries"))?;
+        for (key, _) in row.iter() {
+            let column = key.str()?.extract::<String>()?;
+            if !columns.iter().any(|existing| existing == &column) {
+                columns.push(column);
+            }
+        }
+    }
+    Ok(columns)
+}
+
+fn summary_format_float(value: f64) -> String {
+    if value.is_nan() {
+        return "nan".to_string();
+    }
+    if value == f64::INFINITY {
+        return "inf".to_string();
+    }
+    if value == f64::NEG_INFINITY {
+        return "-inf".to_string();
+    }
+    if value == 0.0 {
+        return "0".to_string();
+    }
+
+    let exponent = value.abs().log10().floor() as i32;
+    let mut out = if !(-4..6).contains(&exponent) {
+        let raw = format!("{:.5e}", value);
+        summary_normalize_exponent(&raw)
+    } else {
+        let places = (6 - exponent - 1).max(0) as usize;
+        summary_trim_float(format!("{value:.places$}"))
+    };
+    if out == "-0" {
+        out = "0".to_string();
+    }
+    out
+}
+
+fn summary_normalize_exponent(raw: &str) -> String {
+    let Some((mantissa, exponent)) = raw.split_once('e') else {
+        return raw.to_string();
+    };
+    let mantissa = summary_trim_float(mantissa.to_string());
+    let (sign, digits) = if let Some(rest) = exponent.strip_prefix('-') {
+        ('-', rest)
+    } else if let Some(rest) = exponent.strip_prefix('+') {
+        ('+', rest)
+    } else {
+        ('+', exponent)
+    };
+    let digits = digits.trim_start_matches('0');
+    let digits = if digits.is_empty() { "0" } else { digits };
+    let padded = if digits.len() == 1 {
+        format!("0{digits}")
+    } else {
+        digits.to_string()
+    };
+    format!("{mantissa}e{sign}{padded}")
+}
+
+fn summary_trim_float(mut value: String) -> String {
+    if value.contains('.') {
+        while value.ends_with('0') {
+            value.pop();
+        }
+        if value.ends_with('.') {
+            value.pop();
+        }
+    }
+    value
+}
+
+fn summary_html_escape(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#x27;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+#[pyfunction]
 fn coefficient_state_json(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<String> {
     detach_py_result(py, "coefficient_state_json", move || {
         coefficient_state_json_impl(&model_bytes)
@@ -10510,6 +10779,10 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
         tierney_kadane_normalized_score,
         module
     )?)?;
+    module.add_function(wrap_pyfunction!(extract_reml_score, module)?)?;
+    module.add_function(wrap_pyfunction!(extract_reml_score_raw, module)?)?;
+    module.add_function(wrap_pyfunction!(extract_reml_edf, module)?)?;
+    module.add_function(wrap_pyfunction!(compare_reml_fits, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_fit, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_fit_backward, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_fit_formula_table, module)?)?;
