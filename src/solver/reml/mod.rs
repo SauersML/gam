@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 
 pub(crate) mod assembly;
 mod cache;
+pub(crate) mod continuation;
 mod eval;
 mod firth;
 pub(super) mod hyper;

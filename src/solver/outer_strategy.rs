@@ -5260,7 +5260,11 @@ fn run_outer_with_plan(
         // SeedRejection accounting any other pre-validation rejection
         // would take, then continue to the next seed.
         let prewarm_start = std::time::Instant::now();
-        match crate::solver::reml::continuation::prime_outer_seed(obj, seed, &bounds_template.1) {
+        match crate::solver::estimate::reml::continuation::prime_outer_seed(
+            obj,
+            seed,
+            &bounds_template.1,
+        ) {
             Ok(summary) => {
                 // Skip the log line on collapse — that's the
                 // zero-overhead easy-fit case and a log per seed would
