@@ -1837,8 +1837,7 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
             let bce_pi_score = -mass / pk + (n as f64 - mass) / (1.0 - pk);
             let beta_pi_score = -(a - 1.0) / pk;
             pi_score[k] = bce_pi_score + beta_pi_score;
-            pi_score_derivative[k] = -1.0 / pk
-                + (mass + a - 1.0) * pi_jac[k] / (pk * pk)
+            pi_score_derivative[k] = -1.0 / pk + (mass + a - 1.0) * pi_jac[k] / (pk * pk)
                 - 1.0 / (1.0 - pk)
                 + (n as f64 - mass) * pi_jac[k] / ((1.0 - pk) * (1.0 - pk));
         }
@@ -1850,8 +1849,7 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
                 let direct_z_score = ((1.0 - pk) / pk).ln();
                 let implicit_pi_score = pi_score[k] * pi_jac[k];
                 let score = direct_z_score + implicit_pi_score;
-                let direct_z_score_derivative =
-                    pi_jac[k] * (-1.0 / pk - 1.0 / (1.0 - pk));
+                let direct_z_score_derivative = pi_jac[k] * (-1.0 / pk - 1.0 / (1.0 - pk));
                 let score_derivative =
                     direct_z_score_derivative + pi_score_derivative[k] * pi_jac[k];
                 let z_jac = zk * (1.0 - zk) / tau;
@@ -3312,7 +3310,11 @@ impl MonotonicityPenalty {
             let slope = target[b * d + j] - target[a * d + j];
             let z = -self.direction * slope / eps;
             // softplus(z) * eps, computed in a numerically stable form.
-            let sp = if z > 0.0 { z + (-z).exp().ln_1p() } else { z.exp().ln_1p() };
+            let sp = if z > 0.0 {
+                z + (-z).exp().ln_1p()
+            } else {
+                z.exp().ln_1p()
+            };
             acc += sp * eps;
         }
         acc
@@ -7866,7 +7868,10 @@ mod tests {
             }
             assert_abs_diff_eq!(g[i], fd, epsilon = 1.0e-7);
         }
-        assert!(max_err < 1.0e-7, "IBP grad-FD max abs error = {max_err:.3e}");
+        assert!(
+            max_err < 1.0e-7,
+            "IBP grad-FD max abs error = {max_err:.3e}"
+        );
     }
 
     #[test]

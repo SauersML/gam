@@ -26,9 +26,9 @@ pub use analytic_penalties::{
     BlockOrthogonalityPenalty, BlockSparsityPenalty, DifferenceOpKind, FrozenAnalyticPenaltyOp,
     IBPAssignmentPenalty, IsometryDuchonRadialSource, IsometryPenalty, IsometryReference,
     IvaeRidgeMeanGauge, JumpReLUPenalty, MechanismSparsityPenalty, MonotonicityPenalty,
-    NestedPrefixPenalty,
-    NuclearNormPenalty, OrthogonalityPenalty, ParametricRowPrecisionPriorPenalty, PenaltyConcavity,
-    PenaltyTier, PsiSlice, RowPrecisionPriorPenalty, ScadMcpPenalty, ScalarWeightSchedule,
+    NestedPrefixPenalty, NuclearNormPenalty, OrthogonalityPenalty,
+    ParametricRowPrecisionPriorPenalty, PenaltyConcavity, PenaltyTier, PsiSlice,
+    RowPrecisionPriorPenalty, ScadMcpPenalty, ScalarWeightSchedule,
     SoftmaxAssignmentSparsityPenalty, SparsityKind, SparsityPenalty, TopKActivationPenalty,
     TotalVariationPenalty, WeightField, nested_prefix_bic, select_nested_prefix_schedule,
 };
