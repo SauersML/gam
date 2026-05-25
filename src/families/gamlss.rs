@@ -7846,11 +7846,19 @@ impl CustomFamily for GaussianLocationScaleFamily {
     /// When `options.outer_score_subsample` is `Some`, only the sampled rows
     /// contribute; each row's per-row log-likelihood term is multiplied by
     /// `WeightedOuterRow.weight`, the Horvitz–Thompson inverse-inclusion
+<<<<<<< Updated upstream
     /// factor 1/π_i (uniform or stratified sampling both supported), so the
     /// partial sum is an unbiased estimator of the full-data log-likelihood.
     /// When `None`, this returns the full-data `log_likelihood_only`. Inner
     /// PIRLS line searches never install the subsample option, so they
     /// continue to score the exact full-data log-likelihood.
+=======
+    /// factor, so the partial sum is an unbiased estimator of the full-data
+    /// log-likelihood. When `None`, this is byte-identical to
+    /// `log_likelihood_only`. Inner PIRLS line searches never install the
+    /// subsample option, so they continue to score the exact full-data
+    /// log-likelihood.
+>>>>>>> Stashed changes
     fn log_likelihood_only_with_options(
         &self,
         block_states: &[ParameterBlockState],
@@ -7878,12 +7886,21 @@ impl CustomFamily for GaussianLocationScaleFamily {
             .into());
         }
         let ln2pi = (2.0 * std::f64::consts::PI).ln();
+<<<<<<< Updated upstream
         use rayon::iter::ParallelIterator;
+=======
+        let y_view = self.y.view();
+        let w_view = self.weights.view();
+        let mu_view = etamu.view();
+        let ls_view = eta_log_sigma.view();
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+>>>>>>> Stashed changes
         let ll: f64 = subsample
             .rows
             .par_iter()
             .map(|row| {
                 let i = row.index;
+<<<<<<< Updated upstream
                 let wi = self.weights[i];
                 if wi == 0.0 {
                     return 0.0;
@@ -7894,6 +7911,19 @@ impl CustomFamily for GaussianLocationScaleFamily {
                 row.weight * wi * (-0.5 * (r * r * inv_s2 + ln2pi + 2.0 * sigma_i.ln()))
             })
             .sum();
+=======
+                let wi = w_view[i];
+                if wi == 0.0 {
+                    return 0.0;
+                }
+                let sigma_i = logb_sigma_from_eta_scalar(ls_view[i]);
+                let inv_s2 = (sigma_i * sigma_i).recip();
+                let r = y_view[i] - mu_view[i];
+                row.weight * wi * (-0.5 * (r * r * inv_s2 + ln2pi + 2.0 * sigma_i.ln()))
+            })
+            .sum();
+        let _ = n;
+>>>>>>> Stashed changes
         Ok(ll)
     }
 
@@ -8188,6 +8218,7 @@ impl CustomFamily for GaussianLocationScaleFamily {
 
     /// Outer-aware joint-Hessian workspace with optional row subsample.
     ///
+<<<<<<< Updated upstream
     /// When `options.outer_score_subsample` is `None`, this is byte-identical
     /// to `exact_newton_joint_hessian_workspace`. When `Some`, the precomputed
     /// per-row coefficient arrays (`coeff_mm`, `coeff_ml`, `coeff_ll`) — which
@@ -8199,6 +8230,20 @@ impl CustomFamily for GaussianLocationScaleFamily {
     /// rows are zeroed. The resulting joint Hessian is an unbiased estimator
     /// of the full-data joint Hessian. Inner PIRLS never installs the option,
     /// so the inner solve continues to consume the exact full-data Hessian.
+=======
+    /// When `options.outer_score_subsample` is `None`, identical to
+    /// `exact_newton_joint_hessian_workspace`. When `Some`, the precomputed
+    /// per-row coefficient arrays `coeff_mm`, `coeff_ml`, `coeff_ll` (which
+    /// the workspace feeds into `Xᵀ diag(W) X`, matvec, and diagonal
+    /// assembly) are replaced by a Horvitz–Thompson mask: each sampled
+    /// row's coefficient is multiplied by `WeightedOuterRow.weight`
+    /// (= 1/π_i, the inverse inclusion probability — uniform or stratified
+    /// both supported), and non-sampled rows are zeroed. Because every
+    /// downstream assembly is row-linear in those coefficients, the
+    /// resulting joint Hessian is an unbiased estimator of the full-data
+    /// joint Hessian. Inner PIRLS never installs the option, so the inner
+    /// solve continues to use the exact full-data Hessian.
+>>>>>>> Stashed changes
     fn exact_newton_joint_hessian_workspace_with_options(
         &self,
         block_states: &[ParameterBlockState],
@@ -8220,7 +8265,11 @@ impl CustomFamily for GaussianLocationScaleFamily {
         Ok(Some(Arc::new(workspace)))
     }
 
+<<<<<<< Updated upstream
     fn inner_coefficient_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
+=======
+    fn inner_coefficient_hessian_hvp_available(&self, _specs: &[ParameterBlockSpec]) -> bool {
+>>>>>>> Stashed changes
         // The Gaussian location-scale workspace is returned by
         // `exact_newton_joint_hessian_workspace` whenever
         // `exact_joint_dense_block_designs` succeeds, which itself depends on

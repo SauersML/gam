@@ -34,6 +34,7 @@ class GaussianRemlOutput(NamedTuple):
 class AdditiveRemlOutput:
     """Forward outputs for the multi-smooth additive REML fit.
 
+<<<<<<< Updated upstream
     On the multi-block per-smooth-λ Rust path every field is an
     autograd-tracked tensor with a working backward through
     :class:`_GaussianRemlFitBlocksFn`:
@@ -50,6 +51,23 @@ class AdditiveRemlOutput:
     reports the shared scalar ``λ`` / ``EDF`` in ``lambdas`` and ``edf``
     (length 1) and is differentiable through the existing single-λ
     autograd surface.
+=======
+    ``coefficients`` is a list of per-smooth coefficient blocks (each of
+    shape ``(K_i, D)``); ``fitted`` is the joint fit ``(N, D)``; ``lam``
+    carries the smoothing parameters (a length-``F`` 1D tensor when the
+    fit went through the multi-block per-smooth-λ Rust path, or a scalar
+    tensor for the legacy single-λ block-diagonal path); ``reml_score`` is
+    the converged REML criterion; ``edf`` is per-smooth (length ``F``) on
+    the multi-block path and a scalar on the single-λ legacy path.
+
+    .. note::
+       The multi-block path is forward-only: the underlying Rust
+       ``optimize_external_design`` driver does not yet expose an analytic
+       IFT/envelope VJP through its outer F×F Hessian to Python. Tensors
+       returned via that path have ``requires_grad=False`` for ``lam``
+       and ``edf``; gradients w.r.t. ``coefficients`` and ``fitted`` are
+       blocked at the Python wrapper. See :func:`gaussian_reml_fit_blocks`.
+>>>>>>> Stashed changes
     """
 
     coefficients: list[torch.Tensor]

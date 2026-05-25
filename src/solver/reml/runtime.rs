@@ -496,6 +496,7 @@ fn ift_mode_response_caches() -> &'static Mutex<HashMap<usize, IftModeResponseRu
     IFT_MODE_RESPONSE_CACHES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+<<<<<<< Updated upstream
 #[derive(Clone)]
 struct IftJointModeResponseRuntimeCache {
     theta: Array1<f64>,
@@ -557,6 +558,8 @@ pub(crate) fn latest_outer_theta_for_ift() -> Option<Array1<f64>> {
         .clone()
 }
 
+=======
+>>>>>>> Stashed changes
 fn l2_norm(values: &Array1<f64>) -> f64 {
     values.iter().map(|v| v * v).sum::<f64>().sqrt()
 }
@@ -5242,12 +5245,15 @@ impl<'a> RemlState<'a> {
             None
         };
         let current_ift_step_cap = self.ift_quality_step_cap(adaptive_ift_max_drho(last_residual));
+<<<<<<< Updated upstream
         if self.joint_ift_cache_matches_pending_theta(new_rho) {
             return self
                 .predict_warm_start_beta_joint_ift_with_outcome(new_rho, current_ift_step_cap);
         }
         let cache_guard = self.ift_warm_start_cache.read().unwrap();
         let cache = cache_guard.as_ref()?;
+=======
+>>>>>>> Stashed changes
         // Early short-circuit: detect both the no-op case (every
         // |Δρ_k| below the numerical-noise floor → predictor reduces
         // to identity) AND the large-Δρ rejection case (|Δρ| exceeds
