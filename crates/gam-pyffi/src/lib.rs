@@ -91,7 +91,7 @@ use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily, RhoP
 use gam::{FitConfig, FitRequest, FitResult, fit_model, materialize, resolve_offset_column};
 use ndarray::{Array1, Array2, Array3, Array4, ArrayView1, ArrayView2, ArrayView3, ArrayViewD, Axis, IxDyn, s};
 use numpy::{
-    IntoPyArray, PyArray1, PyArray2, PyArray3, PyArrayDescrMethods, PyArrayDyn, PyArrayMethods,
+    IntoPyArray, PyArray1, PyArray2, PyArray3, PyArrayDescrMethods, PyArrayMethods,
     PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3, PyReadonlyArray4, PyReadonlyArrayDyn,
     PyUntypedArray, PyUntypedArrayMethods, dtype,
 };
@@ -13140,7 +13140,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(survival_cumulative_from_survival, module)?)?;
     module.add_function(wrap_pyfunction!(survival_block, module)?)?;
     module.add_function(wrap_pyfunction!(survival_ffi_surface, module)?)?;
-    module.add_function(wrap_pyfunction!(numeric_matrix_f64, module)?)?;
+    module.add_function(wrap_pyfunction!(numeric_matrix_validate, module)?)?;
     module.add_function(wrap_pyfunction!(marginal_slope_clip_probabilities, module)?)?;
     module.add_function(wrap_pyfunction!(
         transformation_normal_z_from_columns,
