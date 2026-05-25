@@ -7620,6 +7620,29 @@ pub fn reml_laml_evaluate(
     let rho_grad_entries: Vec<(usize, f64)> = (0..k)
         .into_par_iter()
         .map(|idx| {
+            // Active upper-bound projection (Option A in #197):
+            //
+            // When ρ_k has been pinned at its upper bound by the outer
+            // bound-constrained solver, the IFT mode response `v_k` is
+            // already zeroed above and the IFT residual correction in
+            // `compute_kkt_residual_rho_corrections` is masked to 0 for
+            // this coord. The envelope main block must use the SAME
+            // gradient-projection convention — otherwise the trace term
+            // `½·tr(K·λ_k S_k)` and the penalty quadratic `½·λ_k β'S_kβ`
+            // produce a phantom non-zero gradient component along a
+            // frozen axis, mixing constrained (v_k = 0) and unconstrained
+            // (λ_k held active) terms in the same scalar — which matches
+            // the analytic derivative of neither cost. Returning exactly
+            // 0 here aligns the envelope, the IFT correction, and the
+            // box-constrained optimizer's gradient projection (#197).
+            if upper_active_rho[idx] {
+                log::trace!(
+                    "[RHO-GRAD] idx={} value=0.0 (upper-bound projection, see #197)",
+                    idx
+                );
+                return (idx, 0.0);
+            }
+
             let coord = &solution.penalty_coords[idx];
 
             // Cost derivative for the shifted penalty:

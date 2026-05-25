@@ -132,12 +132,22 @@ fn logsumexp_axis1(log_x: ArrayView2<'_, f64>) -> Array1<f64> {
     out
 }
 
+fn log_vector_is_sentinel_saturated(log_x: ArrayView1<'_, f64>) -> bool {
+    let mut max = f64::NEG_INFINITY;
+    for &v in log_x.iter() {
+        if v > max {
+            max = v;
+        }
+    }
+    !max.is_finite() || max <= LOG_ZERO_SENTINEL * 0.5
+}
+
 /// Numerically-stable softmax of a 1-D log-vector. Subtracts the max
 /// before `exp`, then re-normalizes. Returns a simplex (sums to 1).
-fn softmax_1d(log_x: ArrayView1<'_, f64>) -> Array1<f64> {
+fn softmax_1d(log_x: ArrayView1<'_, f64>) -> Result<Array1<f64>, String> {
     let m = log_x.len();
     if m == 0 {
-        return Array1::zeros(0);
+        return Ok(Array1::zeros(0));
     }
     let mut max = f64::NEG_INFINITY;
     for &v in log_x.iter() {
@@ -145,8 +155,11 @@ fn softmax_1d(log_x: ArrayView1<'_, f64>) -> Array1<f64> {
             max = v;
         }
     }
-    if !max.is_finite() {
-        return Array1::from_elem(m, 1.0 / m as f64);
+    if !max.is_finite() || max <= LOG_ZERO_SENTINEL * 0.5 {
+        return Err(
+            "sinkhorn barycenter degenerated: all log_a saturated to sentinel -- try larger eps or check cost matrix"
+                .to_string(),
+        );
     }
     let mut out = Array1::<f64>::zeros(m);
     let mut total = 0.0_f64;
@@ -156,12 +169,15 @@ fn softmax_1d(log_x: ArrayView1<'_, f64>) -> Array1<f64> {
         total += e;
     }
     if total <= 0.0 {
-        return Array1::from_elem(m, 1.0 / m as f64);
+        return Err(
+            "sinkhorn barycenter degenerated: softmax mass underflowed -- try larger eps or check cost matrix"
+                .to_string(),
+        );
     }
     for v in out.iter_mut() {
         *v /= total;
     }
-    out
+    Ok(out)
 }
 
 /// Compute the elementwise log of a simplex vector, replacing exact
@@ -396,7 +412,13 @@ pub fn sinkhorn_barycenter(
     n_iter: usize,
 ) -> Result<Array1<f64>, String> {
     let state = sinkhorn_barycenter_forward_state(atoms, weights, cost, eps, n_iter)?;
-    Ok(softmax_1d(state.log_a.view()))
+    if log_vector_is_sentinel_saturated(state.log_a.view()) {
+        return Err(
+            "sinkhorn barycenter degenerated: all log_a saturated to sentinel -- try larger eps or check cost matrix"
+                .to_string(),
+        );
+    }
+    softmax_1d(state.log_a.view())
 }
 
 /// Output of [`sinkhorn_barycenter_vjp`]: gradients w.r.t. the input
@@ -438,7 +460,7 @@ pub fn sinkhorn_barycenter_vjp(
 
     // Step A: pull the cotangent through the softmax(log_a) -> a mapping.
     // d(softmax(z))/dz = diag(p) - p p^T, so g_log_a = p .* (cot - sum(cot * p)).
-    let bary = softmax_1d(state.log_a.view());
+    let bary = softmax_1d(state.log_a.view())?;
     let mut g_log_a = Array1::<f64>::zeros(m);
     let mut weighted = 0.0_f64;
     for i in 0..m {

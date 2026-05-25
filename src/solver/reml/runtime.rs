@@ -514,6 +514,30 @@ fn ift_joint_mode_response_caches()
     IFT_JOINT_MODE_RESPONSE_CACHES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn joint_ift_cache_matches_theta(
+    cache: &IftJointModeResponseRuntimeCache,
+    theta: &Array1<f64>,
+    new_rho: &Array1<f64>,
+) -> bool {
+    if cache.theta.len() <= cache.rho_dim
+        || theta.len() != cache.theta.len()
+        || new_rho.len() != cache.rho_dim
+    {
+        return false;
+    }
+    for i in 0..cache.rho_dim {
+        if theta[i].to_bits() != new_rho[i].to_bits() {
+            return false;
+        }
+    }
+    for i in cache.rho_dim..theta.len() {
+        if theta[i].to_bits() != cache.theta[i].to_bits() {
+            return false;
+        }
+    }
+    true
+}
+
 static IFT_LATEST_OUTER_THETA: OnceLock<Mutex<Option<Array1<f64>>>> = OnceLock::new();
 static IFT_LATEST_OUTER_RHO_UPPER_BOUNDS: OnceLock<Mutex<Option<Array1<f64>>>> = OnceLock::new();
 
@@ -3453,21 +3477,12 @@ impl<'a> RemlState<'a> {
             );
             return None;
         }
-        if cache.theta.len() <= cache.rho_dim {
-            return None;
-        }
-        if theta.len() != cache.theta.len()
-            || new_rho.len() != cache.rho_dim
+        if !joint_ift_cache_matches_theta(&cache, &theta, new_rho)
             || cache.beta_original.len() != self.p
             || cache.mode_response_cols.nrows() != self.p
             || cache.mode_response_cols.ncols() != cache.theta.len()
         {
             return None;
-        }
-        for i in 0..cache.rho_dim {
-            if theta[i].to_bits() != new_rho[i].to_bits() {
-                return None;
-            }
         }
 
         let mut max_abs_dtheta = 0.0_f64;
@@ -3553,13 +3568,7 @@ impl<'a> RemlState<'a> {
         let Some(cache) = guard.get(&self.ift_mode_response_cache_key()) else {
             return false;
         };
-        if cache.theta.len() <= cache.rho_dim
-            || theta.len() != cache.theta.len()
-            || new_rho.len() != cache.rho_dim
-        {
-            return false;
-        }
-        (0..cache.rho_dim).all(|i| theta[i].to_bits() == new_rho[i].to_bits())
+        joint_ift_cache_matches_theta(cache, &theta, new_rho)
     }
 
     /// Wipe every atomic-bit-packed signal used by the adaptive

@@ -2643,6 +2643,15 @@ pub enum ArrowSchurError {
     /// supplied ridge. Indicates an under-regularized latent block —
     /// typically a gauge-free fit without an identifiability penalty.
     PerRowFactorFailed { row: usize, reason: String },
+    /// A per-row `H_tt^(i)` block factored, but the Cholesky factor's
+    /// diagonal-ratio condition-number estimate exceeded the safe
+    /// threshold for the Schur reduction. Cholesky technically
+    /// succeeded, but the inverse used in
+    /// `S = H_ββ − Σ_i H_tβ^(i)ᵀ (H_tt^(i))⁻¹ H_tβ^(i)` is contaminated
+    /// by spectral terms on the order of `κ_i`; functionally
+    /// equivalent to a PSD-fail for Schur stability. The LM outer
+    /// wrapper escalates `ridge_t` identically to `PerRowFactorFailed`.
+    PerRowFactorIllConditioned { row: usize, kappa_estimate: f64 },
     /// The Schur complement was not positive-definite. Indicates a
     /// near-collinear decoder or a degenerate weighting; the LM outer
     /// wrapper should escalate `ridge_beta` and retry.
@@ -2661,6 +2670,15 @@ impl std::fmt::Display for ArrowSchurError {
             ArrowSchurError::PerRowFactorFailed { row, reason } => write!(
                 f,
                 "arrow-Schur: per-row H_tt^({row}) Cholesky failed: {reason}"
+            ),
+            ArrowSchurError::PerRowFactorIllConditioned {
+                row,
+                kappa_estimate,
+            } => write!(
+                f,
+                "arrow-Schur: per-row H_tt^({row}) Cholesky succeeded but is \
+                 ill-conditioned (kappa_estimate={kappa_estimate:e}); Schur \
+                 reduction would be numerically contaminated"
             ),
             ArrowSchurError::SchurFactorFailed { reason } => {
                 write!(f, "arrow-Schur: Schur complement Cholesky failed: {reason}")

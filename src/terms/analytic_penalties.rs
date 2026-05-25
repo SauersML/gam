@@ -2602,6 +2602,11 @@ impl JumpReLUPenalty {
             ex / (1.0 + ex)
         }
     }
+
+    fn true_hessian_diag_entry(&self, tau: f64, gate: f64) -> f64 {
+        self.weight * tau * gate * (1.0 - gate) * (1.0 - 2.0 * gate)
+            / (self.smoothing_eps * self.smoothing_eps)
+    }
 }
 
 impl AnalyticPenalty for JumpReLUPenalty {
@@ -2652,11 +2657,32 @@ impl AnalyticPenalty for JumpReLUPenalty {
             for axis in 0..d {
                 let tau = self.threshold(axis, rho);
                 let gate = self.sigmoid_gate((target[base + axis] - tau) / self.smoothing_eps);
-                diag[base + axis] = self.weight * tau * gate * (1.0 - gate) * (1.0 - 2.0 * gate)
+                diag[base + axis] = self.weight * tau * gate * (1.0 - gate)
                     / (self.smoothing_eps * self.smoothing_eps);
             }
         }
         Some(diag)
+    }
+
+    fn hvp(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+        v: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        assert_eq!(target.len(), v.len(), "hvp dimension mismatch");
+        let d = self.latent_dim;
+        let n_obs = target.len() / d;
+        let mut out = Array1::<f64>::zeros(target.len());
+        for row in 0..n_obs {
+            let base = row * d;
+            for axis in 0..d {
+                let tau = self.threshold(axis, rho);
+                let gate = self.sigmoid_gate((target[base + axis] - tau) / self.smoothing_eps);
+                out[base + axis] = self.true_hessian_diag_entry(tau, gate) * v[base + axis];
+            }
+        }
+        out
     }
 
     fn grad_rho(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> Array1<f64> {
@@ -3314,12 +3340,15 @@ impl AnalyticPenalty for MonotonicityPenalty {
                     let ez = z.exp();
                     ez / (1.0 + ez)
                 };
-                // d/dz sigmoid(z) = sigma*(1-sigma); chain through z = -dir*slope/eps
-                // gives second-derivative coefficient = (1/eps) * sigma * (1-sigma).
-                let h = weight * sigma * (1.0 - sigma) / eps;
+                // d²P/d(target_a)d(target_b) follows from the chain rule on
+                // z = -dir * (target_b - target_a) / eps. Second derivative of
+                // softplus(z) is sigma(z)(1 - sigma(z)); the (dz/dtarget)²
+                // factor is 1/eps². Off-diagonal entries carry an extra minus
+                // sign from the difference.
+                let h = weight * sigma * (1.0 - sigma) / (eps * eps);
                 let dv = v[b * d + j] - v[a * d + j];
-                out[a * d + j] += h * dv * 1.0;
-                out[b * d + j] -= h * dv * 1.0;
+                out[a * d + j] -= h * dv;
+                out[b * d + j] += h * dv;
             }
         }
         out
@@ -6688,13 +6717,6 @@ macro_rules! define_analytic_penalty_kind {
                 rho: ArrayView1<'_, f64>,
                 v: ArrayView1<'_, f64>,
             ) -> Array1<f64> {
-                if let Some(diag) = self.hessian_diag(target, rho) {
-                    let mut out = Array1::<f64>::zeros(v.len());
-                    for i in 0..v.len() {
-                        out[i] = diag[i] * v[i];
-                    }
-                    return out;
-                }
                 match self {
                     $(AnalyticPenaltyKind::$variant(p) => p.hvp(target, rho, v),)*
                 }
