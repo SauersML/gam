@@ -1319,6 +1319,19 @@ fn numeric_matrix_validate<'py>(
 }
 
 #[pyfunction]
+fn numeric_matrix_f64<'py>(
+    py: Python<'py>,
+    values: &Bound<'py, PyAny>,
+    label: &str,
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    let numpy = py.import("numpy")?;
+    let kwargs = PyDict::new(py);
+    kwargs.set_item("dtype", "float")?;
+    let array = numpy.call_method("asarray", (values,), Some(&kwargs))?;
+    numeric_matrix_validate(py, &array, label)
+}
+
+#[pyfunction]
 fn marginal_slope_clip_probabilities(values: Vec<f64>) -> PyResult<Vec<f64>> {
     Ok(values
         .into_iter()
@@ -14574,6 +14587,273 @@ impl IsometryPenalty {
     }
 }
 
+#[pyclass(module = "gam_pyffi._rust", name = "IBPAssignmentPenalty")]
+struct PyIBPAssignmentPenalty {
+    #[pyo3(get, set)]
+    target: PyObject,
+    #[pyo3(get, set)]
+    k_max: i64,
+    #[pyo3(get, set)]
+    alpha: f64,
+    #[pyo3(get, set)]
+    tau: f64,
+    #[pyo3(get, set)]
+    learnable: bool,
+    #[pyo3(get, set)]
+    temperature_schedule: Option<PyObject>,
+    #[pyo3(get, set)]
+    weight_schedule: Option<PyObject>,
+}
+
+#[pymethods]
+impl PyIBPAssignmentPenalty {
+    #[new]
+    #[pyo3(signature = (k_max, alpha = 1.0, tau = 1.0, learnable = false, *, target = "t", temperature_schedule = None, weight_schedule = None))]
+    fn new(
+        py: Python<'_>,
+        k_max: &Bound<'_, PyAny>,
+        alpha: &Bound<'_, PyAny>,
+        tau: &Bound<'_, PyAny>,
+        learnable: &Bound<'_, PyAny>,
+        target: PyObject,
+        temperature_schedule: Option<PyObject>,
+        weight_schedule: Option<PyObject>,
+    ) -> PyResult<Self> {
+        let builtins = PyModule::import(py, "builtins")?;
+        let k_max = builtins.getattr("int")?.call1((k_max,))?.extract::<i64>()?;
+        let alpha = builtins
+            .getattr("float")?
+            .call1((alpha,))?
+            .extract::<f64>()?;
+        let tau = builtins.getattr("float")?.call1((tau,))?.extract::<f64>()?;
+        let learnable = builtins
+            .getattr("bool")?
+            .call1((learnable,))?
+            .extract::<bool>()?;
+        if k_max <= 0 {
+            return Err(PyValueError::new_err(format!(
+                "IBPAssignmentPenalty.k_max must be > 0, got {k_max}"
+            )));
+        }
+        if alpha <= 0.0 {
+            return Err(PyValueError::new_err(format!(
+                "IBPAssignmentPenalty.alpha must be > 0, got {alpha}"
+            )));
+        }
+        if tau <= 0.0 {
+            return Err(PyValueError::new_err(format!(
+                "IBPAssignmentPenalty.tau must be > 0, got {tau}"
+            )));
+        }
+        Ok(Self {
+            target,
+            k_max,
+            alpha,
+            tau,
+            learnable,
+            temperature_schedule,
+            weight_schedule,
+        })
+    }
+
+    #[classattr]
+    const KIND_TAG: &'static str = "ibp_assignment";
+
+    fn to_rust_descriptor(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let payload = PyDict::new(py);
+        payload.set_item("kind", Self::KIND_TAG)?;
+        payload.set_item("target", target_descriptor(py, self.target.bind(py))?)?;
+        payload.set_item("k_max", self.k_max)?;
+        payload.set_item("alpha", self.alpha)?;
+        payload.set_item("tau", self.tau)?;
+        payload.set_item("learnable", self.learnable)?;
+        if let Some(schedule) = &self.temperature_schedule {
+            payload.set_item("temperature_schedule", schedule.bind(py))?;
+        }
+        if let Some(schedule) = &self.weight_schedule {
+            payload.set_item("weight_schedule", schedule.bind(py))?;
+        }
+        Ok(payload.into())
+    }
+
+    fn _to_rust_payload(&self, py: Python<'_>) -> PyResult<PyObject> {
+        self.to_rust_descriptor(py)
+    }
+
+    fn set_weight_schedule<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        schedule: PyObject,
+    ) -> PyRefMut<'py, Self> {
+        slf.weight_schedule = Some(schedule);
+        slf
+    }
+
+    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        Ok(format!(
+            "IBPAssignmentPenalty(target={}, k_max={}, alpha={}, tau={}, learnable={}, temperature_schedule={}, weight_schedule={})",
+            py_repr(py, self.target.bind(py))?,
+            self.k_max,
+            self.alpha,
+            self.tau,
+            self.learnable,
+            match &self.temperature_schedule {
+                Some(schedule) => py_repr(py, schedule.bind(py))?,
+                None => "None".to_string(),
+            },
+            match &self.weight_schedule {
+                Some(schedule) => py_repr(py, schedule.bind(py))?,
+                None => "None".to_string(),
+            }
+        ))
+    }
+}
+
+#[pyclass(module = "gam_pyffi._rust", name = "TotalVariationPenalty")]
+struct TotalVariationPenalty {
+    #[pyo3(get, set)]
+    target: PyObject,
+    #[pyo3(get, set)]
+    weight: f64,
+    #[pyo3(get, set)]
+    n_eff: i64,
+    #[pyo3(get, set)]
+    difference_op: PyObject,
+    #[pyo3(get, set)]
+    smoothing_eps: f64,
+    #[pyo3(get, set)]
+    learnable: bool,
+    #[pyo3(get, set)]
+    _edges: Option<Vec<(i64, i64)>>,
+    #[pyo3(get, set)]
+    weight_schedule: Option<PyObject>,
+}
+
+#[pymethods]
+impl TotalVariationPenalty {
+    #[new]
+    #[pyo3(signature = (weight, n_eff, difference_op = "forward_1d", smoothing_eps = 1.0e-6, learnable = false, *, target = "t"))]
+    fn new(
+        py: Python<'_>,
+        weight: f64,
+        n_eff: i64,
+        difference_op: PyObject,
+        smoothing_eps: f64,
+        learnable: bool,
+        target: PyObject,
+    ) -> PyResult<Self> {
+        if weight <= 0.0 {
+            return Err(PyValueError::new_err(format!(
+                "TotalVariationPenalty.weight must be > 0, got {weight}"
+            )));
+        }
+        if n_eff <= 0 {
+            return Err(PyValueError::new_err(format!(
+                "TotalVariationPenalty.n_eff must be > 0, got {n_eff}"
+            )));
+        }
+        if smoothing_eps <= 0.0 {
+            return Err(PyValueError::new_err(format!(
+                "TotalVariationPenalty.smoothing_eps must be > 0, got {smoothing_eps}"
+            )));
+        }
+
+        let bound_difference_op = difference_op.bind(py);
+        let edges = if let Ok(op) = bound_difference_op.extract::<String>() {
+            if op != "forward_1d" {
+                return Err(PyValueError::new_err(format!(
+                    "TotalVariationPenalty.difference_op string must be 'forward_1d', got {op:?}"
+                )));
+            }
+            None
+        } else {
+            let parsed_edges =
+                bound_difference_op
+                    .extract::<Vec<(i64, i64)>>()
+                    .map_err(|_| {
+                        PyTypeError::new_err(
+                            "TotalVariationPenalty.difference_op must be 'forward_1d' or a sequence of (from_row, to_row) edges",
+                        )
+                    })?;
+            if parsed_edges.is_empty() {
+                return Err(PyValueError::new_err(
+                    "TotalVariationPenalty graph edges must not be empty",
+                ));
+            }
+            for (a, b) in &parsed_edges {
+                if *a < 0 || *b < 0 || *a >= n_eff || *b >= n_eff {
+                    return Err(PyValueError::new_err(format!(
+                        "TotalVariationPenalty graph edges must be within [0, n_eff); got ({a}, {b}) for n_eff={n_eff}"
+                    )));
+                }
+                if a == b {
+                    return Err(PyValueError::new_err(format!(
+                        "TotalVariationPenalty graph edge ({a}, {b}) is self-referential"
+                    )));
+                }
+            }
+            Some(parsed_edges)
+        };
+
+        Ok(Self {
+            target,
+            weight,
+            n_eff,
+            difference_op,
+            smoothing_eps,
+            learnable,
+            _edges: edges,
+            weight_schedule: None,
+        })
+    }
+
+    #[classattr]
+    const KIND_TAG: &'static str = "total_variation";
+
+    fn to_rust_descriptor(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let payload = PyDict::new(py);
+        payload.set_item("kind", Self::KIND_TAG)?;
+        payload.set_item("target", target_descriptor(py, self.target.bind(py))?)?;
+        payload.set_item("weight", self.weight)?;
+        payload.set_item("n_eff", self.n_eff)?;
+        payload.set_item("smoothing_eps", self.smoothing_eps)?;
+        payload.set_item("learnable", self.learnable)?;
+        if let Some(edges) = &self._edges {
+            payload.set_item("difference_op", "graph_edges")?;
+            payload.set_item("edges", edges)?;
+        } else {
+            payload.set_item("difference_op", "forward_1d")?;
+        }
+        if let Some(schedule) = topk_weight_schedule_descriptor(py, &self.weight_schedule)? {
+            payload.set_item("weight_schedule", schedule)?;
+        }
+        Ok(payload.into())
+    }
+
+    fn set_weight_schedule<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        schedule: PyObject,
+    ) -> PyRefMut<'py, Self> {
+        slf.weight_schedule = Some(schedule);
+        slf
+    }
+
+    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        Ok(format!(
+            "TotalVariationPenalty(weight={}, n_eff={}, difference_op={}, smoothing_eps={}, learnable={}, target={}, weight_schedule={})",
+            self.weight,
+            self.n_eff,
+            py_repr(py, self.difference_op.bind(py))?,
+            self.smoothing_eps,
+            self.learnable,
+            py_repr(py, self.target.bind(py))?,
+            match &self.weight_schedule {
+                Some(schedule) => py_repr(py, schedule.bind(py))?,
+                None => "None".to_string(),
+            }
+        ))
+    }
+}
+
 #[pymodule(name = "_rust", gil_used = false)]
 fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     gam::init_parallelism();
@@ -14606,6 +14886,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(survival_block, module)?)?;
     module.add_function(wrap_pyfunction!(survival_ffi_surface, module)?)?;
     module.add_function(wrap_pyfunction!(numeric_matrix_validate, module)?)?;
+    module.add_function(wrap_pyfunction!(numeric_matrix_f64, module)?)?;
     module.add_function(wrap_pyfunction!(marginal_slope_clip_probabilities, module)?)?;
     module.add_function(wrap_pyfunction!(
         transformation_normal_z_from_columns,
