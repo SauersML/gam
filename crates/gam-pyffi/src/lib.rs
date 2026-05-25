@@ -15048,7 +15048,7 @@ struct SparsityPenalty {
     eps: f64,
     #[pyo3(get, set)]
     eps_weight: String,
-    #[pyo3(get, set)]
+    #[pyo3(get)]
     weight_schedule: Option<PyObject>,
 }
 
@@ -15181,7 +15181,7 @@ fn py_repr(_py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<String> {
 struct ARDPenalty {
     #[pyo3(get, set)]
     target: PyObject,
-    #[pyo3(get, set)]
+    #[pyo3(get)]
     weight_schedule: Option<PyObject>,
 }
 
@@ -15237,7 +15237,7 @@ struct PyTopKActivationPenalty {
     k: i64,
     #[pyo3(get, set)]
     weight: f64,
-    #[pyo3(get, set)]
+    #[pyo3(get)]
     weight_schedule: Option<PyObject>,
 }
 
@@ -15317,7 +15317,7 @@ struct JumpReLUPenalty {
     weight: f64,
     #[pyo3(get, set)]
     smoothing_eps: f64,
-    #[pyo3(get, set)]
+    #[pyo3(get)]
     weight_schedule: Option<PyObject>,
 }
 
@@ -15522,7 +15522,7 @@ struct BlockSparsityPenalty {
     smoothing_eps: f64,
     #[pyo3(get, set)]
     learnable: bool,
-    #[pyo3(get, set)]
+    #[pyo3(get)]
     weight_schedule: Option<PyObject>,
 }
 
@@ -15683,7 +15683,7 @@ struct SoftmaxAssignmentSparsityPenalty {
     k_atoms: i64,
     #[pyo3(get, set)]
     temperature: f64,
-    #[pyo3(get, set)]
+    #[pyo3(get)]
     weight_schedule: Option<PyObject>,
 }
 
@@ -15772,7 +15772,7 @@ struct IsometryPenalty {
     target: PyObject,
     #[pyo3(get, set)]
     weight: PyObject,
-    #[pyo3(get, set)]
+    #[pyo3(get)]
     weight_schedule: Option<PyObject>,
 }
 
@@ -15843,7 +15843,7 @@ struct PyIBPAssignmentPenalty {
     learnable: bool,
     #[pyo3(get, set)]
     temperature_schedule: Option<PyObject>,
-    #[pyo3(get, set)]
+    #[pyo3(get)]
     weight_schedule: Option<PyObject>,
 }
 
@@ -16004,7 +16004,7 @@ struct TotalVariationPenalty {
     learnable: bool,
     #[pyo3(get, set)]
     _edges: Option<Vec<(i64, i64)>>,
-    #[pyo3(get, set)]
+    #[pyo3(get)]
     weight_schedule: Option<PyObject>,
 }
 
@@ -16276,7 +16276,7 @@ struct ParametricAuxConditionalPriorPenalty {
     n_eff: i64,
     #[pyo3(get, set)]
     learnable: bool,
-    #[pyo3(get, set)]
+    #[pyo3(get)]
     weight_schedule: Option<PyObject>,
 }
 
@@ -16421,7 +16421,7 @@ struct OrthogonalityPenalty {
     n_eff: i64,
     #[pyo3(get, set)]
     learnable: bool,
-    #[pyo3(get, set)]
+    #[pyo3(get)]
     weight_schedule: Option<PyObject>,
 }
 
@@ -16504,7 +16504,7 @@ struct ScadMcpPenalty {
     smoothing_eps: f64,
     #[pyo3(get, set)]
     learnable: bool,
-    #[pyo3(get, set)]
+    #[pyo3(get)]
     weight_schedule: Option<PyObject>,
 }
 
@@ -16646,7 +16646,7 @@ struct IvaeRidgeMeanGauge {
     n_eff: i64,
     #[pyo3(get, set)]
     learnable: bool,
-    #[pyo3(get, set)]
+    #[pyo3(get)]
     weight_schedule: Option<PyObject>,
 }
 
@@ -16804,7 +16804,7 @@ struct MechanismSparsityPenalty {
     n_eff: f64,
     #[pyo3(get, set)]
     learnable: bool,
-    #[pyo3(get, set)]
+    #[pyo3(get)]
     weight_schedule: Option<PyObject>,
 }
 
@@ -17017,7 +17017,7 @@ struct BlockOrthogonalityPenalty {
     n_eff: i64,
     #[pyo3(get, set)]
     learnable: bool,
-    #[pyo3(get, set)]
+    #[pyo3(get)]
     weight_schedule: Option<PyObject>,
 }
 
@@ -17187,7 +17187,7 @@ struct AuxConditionalPriorPenalty {
     n_eff: i64,
     #[pyo3(get, set)]
     learnable: bool,
-    #[pyo3(get, set)]
+    #[pyo3(get)]
     weight_schedule: Option<PyObject>,
 }
 
@@ -17285,7 +17285,7 @@ struct NuclearNormPenalty {
     max_rank: Option<i64>,
     #[pyo3(get, set)]
     learnable: bool,
-    #[pyo3(get, set)]
+    #[pyo3(get)]
     weight_schedule: Option<PyObject>,
 }
 
