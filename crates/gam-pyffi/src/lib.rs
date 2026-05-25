@@ -93,10 +93,10 @@ use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily, RhoP
 use gam::{FitConfig, FitRequest, FitResult, fit_model, materialize, resolve_offset_column};
 use ndarray::{Array1, Array2, Array3, Array4, ArrayView1, ArrayView2, ArrayView3, ArrayViewD, Axis, IxDyn, s};
 use numpy::{
-    IntoPyArray, PyArray1, PyArray2, PyArray3, PyArrayDescrMethods, PyArrayMethods,
-    PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3, PyReadonlyArray4, PyReadonlyArrayDyn,
-    PyUntypedArray, PyUntypedArrayMethods, dtype,
+    IntoPyArray, PyArray1, PyArray2, PyArray3, PyArrayMethods, PyReadonlyArray1,
+    PyReadonlyArray2, PyReadonlyArray3, PyReadonlyArray4, PyReadonlyArrayDyn,
 };
+use pyo3::IntoPyObjectExt;
 use pyo3::exceptions::{PyKeyError, PyNotImplementedError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBytes, PyDict, PyFloat, PyList, PyString, PyTuple};
@@ -385,20 +385,6 @@ struct SurvivalPredictionPayload {
     /// time, when uncertainty was requested.  Length equals
     /// `linear_predictor.len()`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    eta_se: Option<Vec<f64>>,
-}
-
-#[derive(Deserialize)]
-struct SurvivalPredictionJsonPayload {
-    class: String,
-    model_class: Option<String>,
-    times: Option<Vec<f64>>,
-    hazard: Option<Vec<Vec<f64>>>,
-    survival: Option<Vec<Vec<f64>>>,
-    cumulative_hazard: Option<Vec<Vec<f64>>>,
-    linear_predictor: Option<Vec<f64>>,
-    columns: Option<BTreeMap<String, Vec<f64>>>,
-    survival_se: Option<Vec<Vec<f64>>>,
     eta_se: Option<Vec<f64>>,
 }
 
@@ -1297,13 +1283,12 @@ fn numeric_matrix_validate<'py>(
         return Err(py_value_error(format!("{label} cannot be empty")));
     }
 
-    {
-        let untyped_array = array.cast::<PyUntypedArray>()?;
-        if !untyped_array.dtype().is_equiv_to(&dtype::<f64>(py)) {
-            return Err(PyTypeError::new_err(format!(
-                "{label} must be a float64 numpy array for zero-copy FFI"
-            )));
-        }
+    let dtype_value = array.getattr("dtype")?;
+    let float64_value = np.getattr("float64")?;
+    if !dtype_value.eq(float64_value)? {
+        return Err(PyTypeError::new_err(format!(
+            "{label} must be a float64 numpy array for zero-copy FFI"
+        )));
     }
 
     {
@@ -1367,130 +1352,6 @@ fn column_stack_f64<'py>(
         }
     }
     Ok(out.into_pyarray(py).unbind())
-}
-
-fn survival_prediction_matrix_from_rows(
-    rows: Vec<Vec<f64>>,
-    label: &str,
-) -> PyResult<Array2<f64>> {
-    if rows.is_empty() {
-        return Ok(Array2::<f64>::zeros((0, 0)));
-    }
-    let n_rows = rows.len();
-    let n_cols = rows[0].len();
-    for (row_idx, row) in rows.iter().enumerate() {
-        if row.len() != n_cols {
-            return Err(py_value_error(format!(
-                "{label} row {row_idx} has length {} but expected {n_cols}",
-                row.len()
-            )));
-        }
-    }
-    let data = rows.into_iter().flatten().collect::<Vec<_>>();
-    Array2::from_shape_vec((n_rows, n_cols), data)
-        .map_err(|err| py_value_error(format!("failed to reshape {label}: {err}")))
-}
-
-fn survival_prediction_parameters_from_columns(
-    columns: &BTreeMap<String, Vec<f64>>,
-    linear_predictor: &[f64],
-) -> PyResult<Array2<f64>> {
-    if columns.is_empty() {
-        if linear_predictor.is_empty() {
-            return Ok(Array2::<f64>::zeros((0, 0)));
-        }
-        return Array2::from_shape_vec((linear_predictor.len(), 1), linear_predictor.to_vec())
-            .map_err(|err| {
-                py_value_error(format!("failed to reshape survival parameters: {err}"))
-            });
-    }
-
-    let n_rows = columns.values().next().map(Vec::len).unwrap_or(0);
-    let n_cols = columns.len();
-    let mut out = Array2::<f64>::zeros((n_rows, n_cols));
-    for (col_idx, (name, values)) in columns.iter().enumerate() {
-        if values.len() != n_rows {
-            return Err(py_value_error(format!(
-                "survival parameter column '{name}' has length {} but expected {n_rows}",
-                values.len()
-            )));
-        }
-        for (row_idx, value) in values.iter().enumerate() {
-            out[[row_idx, col_idx]] = *value;
-        }
-    }
-    Ok(out)
-}
-
-fn set_survival_prediction_array1<'py>(
-    py: Python<'py>,
-    out: &Bound<'py, PyDict>,
-    key: &str,
-    values: Vec<f64>,
-) -> PyResult<()> {
-    if values.is_empty() {
-        out.set_item(key, py.None())
-    } else {
-        out.set_item(key, Array1::from_vec(values).into_pyarray(py))
-    }
-}
-
-fn set_survival_prediction_matrix<'py>(
-    py: Python<'py>,
-    out: &Bound<'py, PyDict>,
-    key: &str,
-    rows: Option<Vec<Vec<f64>>>,
-) -> PyResult<()> {
-    match rows {
-        Some(values) => out.set_item(
-            key,
-            survival_prediction_matrix_from_rows(values, key)?.into_pyarray(py),
-        ),
-        None => out.set_item(key, py.None()),
-    }
-}
-
-#[pyfunction]
-fn survival_prediction_payload_from_json(py: Python<'_>, raw: &str) -> PyResult<PyObject> {
-    let payload: SurvivalPredictionJsonPayload = serde_json::from_str(raw)
-        .map_err(|err| py_value_error(format!("failed to parse survival prediction payload: {err}")))?;
-    if payload.class != "survival_prediction" {
-        return Err(py_value_error(format!(
-            "expected survival_prediction payload, got '{}'",
-            payload.class
-        )));
-    }
-
-    let out = PyDict::new(py);
-    let model_class = payload
-        .model_class
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "survival marginal-slope".to_string());
-    out.set_item("model_class", model_class)?;
-
-    set_survival_prediction_array1(py, &out, "times", payload.times.unwrap_or_default())?;
-    set_survival_prediction_matrix(py, &out, "hazard", payload.hazard)?;
-    set_survival_prediction_matrix(py, &out, "survival", payload.survival)?;
-    set_survival_prediction_matrix(
-        py,
-        &out,
-        "cumulative_hazard",
-        payload.cumulative_hazard,
-    )?;
-    let linear_predictor = payload.linear_predictor.unwrap_or_default();
-    set_survival_prediction_array1(py, &out, "linear_predictor", linear_predictor.clone())?;
-    set_survival_prediction_matrix(py, &out, "survival_se", payload.survival_se)?;
-    set_survival_prediction_array1(py, &out, "eta_se", payload.eta_se.unwrap_or_default())?;
-
-    let columns = payload.columns.unwrap_or_default();
-    let parameter_names = columns.keys().cloned().collect::<Vec<_>>();
-    out.set_item("parameter_names", PyTuple::new(py, parameter_names)?)?;
-    out.set_item(
-        "parameters",
-        survival_prediction_parameters_from_columns(&columns, &linear_predictor)?
-            .into_pyarray(py),
-    )?;
-    Ok(out.unbind().into_any())
 }
 
 #[pyfunction]
@@ -11501,20 +11362,20 @@ fn json_object_to_py_dict(py: Python<'_>, value: serde_json::Value) -> PyResult<
 fn json_value_to_py(py: Python<'_>, value: serde_json::Value) -> PyResult<PyObject> {
     match value {
         serde_json::Value::Null => Ok(py.None()),
-        serde_json::Value::Bool(value) => Ok(value.into_pyobject(py)?.unbind().into_any()),
+        serde_json::Value::Bool(value) => value.into_py_any(py),
         serde_json::Value::Number(value) => {
             if let Some(value) = value.as_i64() {
-                return Ok(value.into_pyobject(py)?.unbind().into_any());
+                return value.into_py_any(py);
             }
             if let Some(value) = value.as_u64() {
-                return Ok(value.into_pyobject(py)?.unbind().into_any());
+                return value.into_py_any(py);
             }
             let value = value
                 .as_f64()
                 .ok_or_else(|| py_value_error("JSON number is not representable".to_string()))?;
-            Ok(value.into_pyobject(py)?.unbind().into_any())
+            value.into_py_any(py)
         }
-        serde_json::Value::String(value) => Ok(value.into_pyobject(py)?.unbind().into_any()),
+        serde_json::Value::String(value) => value.into_py_any(py),
         serde_json::Value::Array(values) => {
             let out = PyList::empty(py);
             for value in values {
@@ -12083,6 +11944,14 @@ fn benchmark_auc_score(observed: &[f64], predicted_mean: &[f64]) -> PyResult<f64
 }
 
 fn benchmark_binary_logloss(observed: &[f64], predicted_mean: &[f64]) -> PyResult<f64> {
+    benchmark_binary_logloss_eps(observed, predicted_mean, 1.0e-12)
+}
+
+fn benchmark_binary_logloss_eps(
+    observed: &[f64],
+    predicted_mean: &[f64],
+    eps: f64,
+) -> PyResult<f64> {
     if observed.len() != predicted_mean.len() {
         return Err(PyValueError::new_err(format!(
             "logloss length mismatch: observed={} predicted={}",
@@ -12093,7 +11962,6 @@ fn benchmark_binary_logloss(observed: &[f64], predicted_mean: &[f64]) -> PyResul
     if observed.is_empty() {
         return Err(PyValueError::new_err("logloss requires at least one row"));
     }
-    let eps = 1.0e-12;
     let loss_sum = observed
         .iter()
         .zip(predicted_mean.iter())
@@ -12135,6 +12003,48 @@ fn benchmark_nagelkerke_r2(
         return Ok(None);
     }
     let eps = 1.0e-12;
+    let log_null = null_mean.ln();
+    let log_not_null = (1.0 - null_mean).ln();
+    let ll_null = observed
+        .iter()
+        .map(|&y| y * log_null + (1.0 - y) * log_not_null)
+        .sum::<f64>();
+    let ll_model = observed
+        .iter()
+        .zip(predicted_mean.iter())
+        .map(|(&y, &p)| {
+            let clipped = p.clamp(eps, 1.0 - eps);
+            y * clipped.ln() + (1.0 - y) * (1.0 - clipped).ln()
+        })
+        .sum::<f64>();
+    let n = observed.len() as f64;
+    let r2_cs = 1.0 - benchmark_exp_saturated((2.0 / n) * (ll_null - ll_model));
+    let max_r2_cs = 1.0 - benchmark_exp_saturated((2.0 / n) * ll_null);
+    if !r2_cs.is_finite() || !max_r2_cs.is_finite() || max_r2_cs <= 0.0 {
+        return Ok(None);
+    }
+    Ok(Some(r2_cs / max_r2_cs))
+}
+
+fn benchmark_nagelkerke_r2_with_null_mean(
+    observed: &[f64],
+    predicted_mean: &[f64],
+    null_mean: f64,
+    eps: f64,
+) -> PyResult<Option<f64>> {
+    if observed.len() != predicted_mean.len() {
+        return Err(PyValueError::new_err(format!(
+            "nagelkerke length mismatch: observed={} predicted={}",
+            observed.len(),
+            predicted_mean.len()
+        )));
+    }
+    if observed.is_empty() {
+        return Ok(None);
+    }
+    if !null_mean.is_finite() || null_mean <= 0.0 || null_mean >= 1.0 {
+        return Ok(None);
+    }
     let log_null = null_mean.ln();
     let log_not_null = (1.0 - null_mean).ln();
     let ll_null = observed
@@ -14241,6 +14151,97 @@ fn block_sparsity_coerce_groups(groups: &Bound<'_, PyAny>) -> PyResult<Vec<Vec<u
         }
     }
     Ok(out)
+}
+
+#[pyclass(module = "gam_pyffi._rust", name = "SoftmaxAssignmentSparsityPenalty")]
+struct SoftmaxAssignmentSparsityPenalty {
+    #[pyo3(get, set)]
+    target: PyObject,
+    #[pyo3(get, set)]
+    k_atoms: i64,
+    #[pyo3(get, set)]
+    temperature: f64,
+    #[pyo3(get, set)]
+    weight_schedule: Option<PyObject>,
+}
+
+#[pymethods]
+impl SoftmaxAssignmentSparsityPenalty {
+    #[new]
+    #[pyo3(signature = (k_atoms, temperature = 1.0, *, target = "t", weight_schedule = None))]
+    fn new(
+        py: Python<'_>,
+        k_atoms: &Bound<'_, PyAny>,
+        temperature: &Bound<'_, PyAny>,
+        target: PyObject,
+        weight_schedule: Option<PyObject>,
+    ) -> PyResult<Self> {
+        let builtins = PyModule::import(py, "builtins")?;
+        let k_atoms = builtins
+            .getattr("int")?
+            .call1((k_atoms,))?
+            .extract::<i64>()?;
+        let temperature = builtins
+            .getattr("float")?
+            .call1((temperature,))?
+            .extract::<f64>()?;
+        if k_atoms <= 0 {
+            return Err(PyValueError::new_err(format!(
+                "SoftmaxAssignmentSparsityPenalty.k_atoms must be > 0, got {k_atoms}"
+            )));
+        }
+        if temperature <= 0.0 {
+            return Err(PyValueError::new_err(format!(
+                "SoftmaxAssignmentSparsityPenalty.temperature must be > 0, got {temperature}"
+            )));
+        }
+        Ok(Self {
+            target,
+            k_atoms,
+            temperature,
+            weight_schedule,
+        })
+    }
+
+    #[classattr]
+    const KIND_TAG: &'static str = "softmax_assignment_sparsity";
+
+    fn to_rust_descriptor(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let payload = PyDict::new(py);
+        payload.set_item("kind", Self::KIND_TAG)?;
+        payload.set_item("target", target_descriptor(py, self.target.bind(py))?)?;
+        payload.set_item("k_atoms", self.k_atoms)?;
+        payload.set_item("temperature", self.temperature)?;
+        if let Some(schedule) = topk_weight_schedule_descriptor(py, &self.weight_schedule)? {
+            payload.set_item("weight_schedule", schedule)?;
+        }
+        Ok(payload.into())
+    }
+
+    fn _to_rust_payload(&self, py: Python<'_>) -> PyResult<PyObject> {
+        self.to_rust_descriptor(py)
+    }
+
+    fn set_weight_schedule<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        schedule: PyObject,
+    ) -> PyRefMut<'py, Self> {
+        slf.weight_schedule = Some(schedule);
+        slf
+    }
+
+    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        Ok(format!(
+            "SoftmaxAssignmentSparsityPenalty(target={}, k_atoms={}, temperature={}, weight_schedule={})",
+            py_repr(py, self.target.bind(py))?,
+            self.k_atoms,
+            self.temperature,
+            match &self.weight_schedule {
+                Some(schedule) => py_repr(py, schedule.bind(py))?,
+                None => "None".to_string(),
+            }
+        ))
+    }
 }
 
 #[pymodule(name = "_rust", gil_used = false)]
