@@ -1320,19 +1320,6 @@ fn numeric_matrix_validate<'py>(
 }
 
 #[pyfunction]
-fn numeric_matrix_f64<'py>(
-    py: Python<'py>,
-    values: &Bound<'py, PyAny>,
-    label: &str,
-) -> PyResult<Bound<'py, PyArray2<f64>>> {
-    let np = py.import("numpy")?;
-    let kwargs = PyDict::new(py);
-    kwargs.set_item("dtype", "float")?;
-    let array = np.call_method("asarray", (values,), Some(&kwargs))?;
-    numeric_matrix_validate(py, &array, label)
-}
-
-#[pyfunction]
 fn marginal_slope_clip_probabilities(values: Vec<f64>) -> PyResult<Vec<f64>> {
     Ok(values
         .into_iter()
@@ -12312,6 +12299,56 @@ fn benchmark_prediction_metrics(
     Ok(metrics.unbind())
 }
 
+fn benchmark_km_curve(times: &[f64], events: &[f64], grid: &[f64]) -> Vec<f64> {
+    let mut rows: Vec<(f64, bool)> = times
+        .iter()
+        .zip(events.iter())
+        .filter_map(|(&time, &event)| {
+            (time.is_finite() && event.is_finite() && time > 0.0).then_some((time, event > 0.5))
+        })
+        .collect();
+    if rows.is_empty() {
+        return vec![1.0; grid.len()];
+    }
+    rows.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut steps = Vec::<(f64, f64)>::new();
+    let mut at_risk = rows.len() as f64;
+    let mut survival = 1.0;
+    let mut i = 0usize;
+    while i < rows.len() {
+        let time = rows[i].0;
+        let mut j = i + 1;
+        let mut events_at_time = usize::from(rows[i].1);
+        while j < rows.len() && rows[j].0 == time {
+            events_at_time += usize::from(rows[j].1);
+            j += 1;
+        }
+        if events_at_time > 0 && at_risk > 0.0 {
+            survival *= ((at_risk - events_at_time as f64) / at_risk).max(0.0);
+            steps.push((time, survival));
+        }
+        at_risk -= (j - i) as f64;
+        i = j;
+    }
+    let mut out = Vec::with_capacity(grid.len());
+    let mut step_idx = 0usize;
+    let mut current = 1.0;
+    for &time in grid {
+        while step_idx < steps.len() && steps[step_idx].0 <= time {
+            current = steps[step_idx].1;
+            step_idx += 1;
+        }
+        out.push(current.clamp(1.0e-12, 1.0));
+    }
+    if let Some(first) = out.first_mut() {
+        *first = 1.0;
+    }
+    for idx in 1..out.len() {
+        out[idx] = out[idx].min(out[idx - 1]);
+    }
+    out
+}
+
 fn benchmark_survival_matrix_from_risk(
     train_times: &[f64],
     train_events: &[f64],
@@ -16386,7 +16423,6 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(survival_block, module)?)?;
     module.add_function(wrap_pyfunction!(survival_ffi_surface, module)?)?;
     module.add_function(wrap_pyfunction!(numeric_matrix_validate, module)?)?;
-    module.add_function(wrap_pyfunction!(numeric_matrix_f64, module)?)?;
     module.add_function(wrap_pyfunction!(marginal_slope_clip_probabilities, module)?)?;
     module.add_function(wrap_pyfunction!(
         transformation_normal_z_from_columns,
