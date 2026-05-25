@@ -631,7 +631,11 @@ impl PirlsAcceptedStateCacheKey {
         Self::new(beta, curvature, options.firth_bias_reduction, options)
     }
 
-    fn accepted(beta: &Coefficients, state: &WorkingState, options: &WorkingModelPirlsOptions) -> Self {
+    fn accepted(
+        beta: &Coefficients,
+        state: &WorkingState,
+        options: &WorkingModelPirlsOptions,
+    ) -> Self {
         Self::new(
             beta,
             state.hessian_curvature,
@@ -647,9 +651,7 @@ impl PirlsAcceptedStateCacheKey {
         options: &WorkingModelPirlsOptions,
     ) -> Self {
         let arrow_latent_bits = options.arrow_schur.as_ref().map(|arrow_cfg| {
-            arrow_cfg
-                .snapshot_t
-                .as_ref()()
+            arrow_cfg.snapshot_t.as_ref()()
                 .iter()
                 .map(|value| value.to_bits())
                 .collect()
@@ -4756,7 +4758,7 @@ where
         // Iter 1 always rebuilds because no prior accept has populated
         // `final_state`.
         let requested_cache_key =
-            PirlsAcceptedStateCacheKey::new(&beta, preferred_curvature, options);
+            PirlsAcceptedStateCacheKey::requested(&beta, preferred_curvature, options);
         let cached_state_matches = iter > 1
             && final_state.is_some()
             && final_state_cache_key.as_ref() == Some(&requested_cache_key);
@@ -5211,19 +5213,18 @@ where
             // Reduction = -(g'δ + 0.5 δ'Hδ)
             let predred_start = std::time::Instant::now();
             let lin = state.gradient.dot(direction);
-            let predicted_reduction = if let Some(arrow_reduction) =
-                pending_arrow_predicted_reduction
-            {
-                arrow_reduction
-            } else {
-                let q_term = if let Some(sparse_reg) = cached_sparse_regularized.as_ref() {
-                    sparse_symmetric_upper_matvec_public(sparse_reg, direction)
+            let predicted_reduction =
+                if let Some(arrow_reduction) = pending_arrow_predicted_reduction {
+                    arrow_reduction
                 } else {
-                    regularized.dot(direction)
+                    let q_term = if let Some(sparse_reg) = cached_sparse_regularized.as_ref() {
+                        sparse_symmetric_upper_matvec_public(sparse_reg, direction)
+                    } else {
+                        regularized.dot(direction)
+                    };
+                    let quad = 0.5 * direction.dot(&q_term);
+                    -(lin + quad)
                 };
-                let quad = 0.5 * direction.dot(&q_term);
-                -(lin + quad)
-            };
             lm_predred_total += predred_start.elapsed();
 
             // 3. Compute Actual Reduction
@@ -5457,9 +5458,9 @@ where
                         // Preserve the structural ridge computed by the model.
                         // LM damping is a transient solver detail and must not
                         // redefine the objective's stabilization ridge.
-                        final_state_cache_key = Some(PirlsAcceptedStateCacheKey::new(
+                        final_state_cache_key = Some(PirlsAcceptedStateCacheKey::accepted(
                             &beta,
-                            accepted_state.hessian_curvature,
+                            &accepted_state,
                             options,
                         ));
                         final_state = Some(accepted_state);
