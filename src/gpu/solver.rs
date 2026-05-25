@@ -23,8 +23,10 @@ pub fn backend_status() -> BackendStatus {
 
 mod cuda {
     use crate::gpu::driver::{from_col_major, to_col_major};
+    use crate::linalg::faer_ndarray::cholesky_factor_logdet;
     use cudarc::cusolver::{DnHandle, sys as cusolver_sys};
     use cudarc::driver::{CudaContext, CudaSlice, DevicePtr, DevicePtrMut};
+    use faer::MatRef;
     use ndarray::{Array2, ArrayView2};
 
     pub(super) fn cholesky_solve(
@@ -218,11 +220,8 @@ mod cuda {
     }
 
     pub(crate) fn cholesky_logdet_from_col_major(factor: &[f64], p: usize) -> f64 {
-        let mut acc = 0.0_f64;
-        for i in 0..p {
-            acc += factor[i + i * p].abs().ln();
-        }
-        2.0 * acc
+        let factor = MatRef::from_column_major_slice(factor, p, p);
+        cholesky_factor_logdet(factor)
     }
 
     fn check_cusolver(
