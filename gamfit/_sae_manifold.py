@@ -2,12 +2,36 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal, Mapping
 
 import numpy as np
 
 from ._binding import rust_module
+
+
+# Canonical assignment-kind aliases. Both `assignment=` and `assignment_prior=`
+# normalize through this map so the two kwargs are strict synonyms.
+_ASSIGNMENT_ALIASES: dict[str, str] = {
+    "ibp": "ibp_map",
+    "ibp_map": "ibp_map",
+    "softmax": "softmax",
+    "jumprelu": "jumprelu",
+    "gated": "jumprelu",
+}
+
+
+def _canonical_assignment(value: str, label: str) -> str:
+    name = str(value).strip().lower()
+    canon = _ASSIGNMENT_ALIASES.get(name)
+    if canon is None:
+        raise ValueError(
+            f"{label}={value!r} is not a recognized assignment kind; "
+            f"expected one of {sorted(set(_ASSIGNMENT_ALIASES))}"
+        )
+    return canon
 
 
 @dataclass(slots=True)
@@ -53,9 +77,21 @@ class ManifoldSAE:
     _basis_sizes: list[int]
     _n_harmonics: list[int]
     _duchon_centers: list[np.ndarray | None]
+    alpha: float = 1.0
+    learnable_alpha: bool = False
+
+    def __repr__(self) -> str:
+        d_atom = int(self.coords[0].shape[1]) if self.coords else 0
+        n, p = (self.fitted.shape if self.fitted.ndim == 2 else (self.fitted.shape[0], 1))
+        return (
+            f"ManifoldSAE(K={len(self.atoms)}, d_atom={d_atom}, "
+            f"atom_topology={self.atom_topology!r}, assignment={self.assignment!r}, "
+            f"alpha={self.alpha!r}, learnable_alpha={self.learnable_alpha}, "
+            f"n={n}, p={p}, r2={self.reconstruction_r2:.3f})"
+        )
 
     @classmethod
-    def from_payload(cls, x: np.ndarray, payload: Mapping[str, Any], topology: str, assignment: str, penalties: list[str]) -> "ManifoldSAE":
+    def from_payload(cls, x: np.ndarray, payload: Mapping[str, Any], topology: str, assignment: str, penalties: list[str], alpha: float = 1.0, learnable_alpha: bool = False) -> "ManifoldSAE":
         plans = list(payload.get("atom_plans", []))
         atoms = [SaeManifoldAtomFit(
             basis=str(atom.get("basis_kind", "")),
@@ -86,6 +122,7 @@ class ManifoldSAE:
             training_mean=x.mean(axis=0), training_data=x.copy(), low_level=low,
             _basis_kinds=kinds, _atom_dims=dims, _basis_sizes=sizes,
             _n_harmonics=nharm, _duchon_centers=centers,
+            alpha=float(alpha), learnable_alpha=bool(learnable_alpha),
         )
 
     def reconstruct(self, X: Any) -> np.ndarray:
@@ -126,11 +163,113 @@ class ManifoldSAE:
             "K": len(self.atoms),
             "d_atom": int(self.coords[0].shape[1]) if self.coords else 0,
             "atom_topology": self.atom_topology, "assignment": self.assignment,
+            "alpha": float(self.alpha), "learnable_alpha": bool(self.learnable_alpha),
             "reml_score": float(self.reml_score), "reconstruction_r2": float(self.reconstruction_r2),
             "avg_active_atoms": float(avg_active), "mean_assignment_mass": float(mean_mass),
             "active_dims": [a.active_dim for a in self.atoms],
             "primitives": list(self.primitive_names),
         }
+
+    def to_dict(self) -> dict[str, Any]:
+        """Round-trippable JSON-compatible serialization of this fit.
+
+        The dict can be passed to :meth:`ManifoldSAE.from_dict` (or written to
+        disk via :meth:`save` / :func:`gamfit.save`) to recover an object that
+        reproduces :meth:`predict` outputs bit-exactly on training data.
+        """
+        return {
+            "schema": "gamfit.ManifoldSAE/v1",
+            "atom_topology": self.atom_topology,
+            "assignment": self.assignment,
+            "alpha": float(self.alpha),
+            "learnable_alpha": bool(self.learnable_alpha),
+            "primitive_names": list(self.primitive_names),
+            "basis_specs": list(self.basis_specs),
+            "reml_score": float(self.reml_score),
+            "reconstruction_r2": float(self.reconstruction_r2),
+            "training_mean": self.training_mean.tolist(),
+            "training_data": self.training_data.tolist(),
+            "fitted": self.fitted.tolist(),
+            "assignments": self.assignments.tolist(),
+            "coords": [c.tolist() for c in self.coords],
+            "decoder_blocks": [b.tolist() for b in self.decoder_blocks],
+            "atoms": [
+                {
+                    "basis": a.basis,
+                    "decoder_coefficients": a.decoder_coefficients.tolist(),
+                    "assignments": a.assignments.tolist(),
+                    "coords": a.coords.tolist(),
+                    "evidence": float(a.evidence),
+                    "active_dim": int(a.active_dim),
+                }
+                for a in self.atoms
+            ],
+            "basis_kinds": list(self._basis_kinds),
+            "atom_dims": list(self._atom_dims),
+            "basis_sizes": list(self._basis_sizes),
+            "n_harmonics": list(self._n_harmonics),
+            "duchon_centers": [None if c is None else c.tolist() for c in self._duchon_centers],
+        }
+
+    def save(self, path: str | Path) -> None:
+        """Write this fit to ``path`` as JSON. Round-trips via :func:`gamfit.load`."""
+        Path(path).write_text(json.dumps(self.to_dict()))
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "ManifoldSAE":
+        schema = str(payload.get("schema", ""))
+        if schema and schema != "gamfit.ManifoldSAE/v1":
+            raise ValueError(f"ManifoldSAE.from_dict: unsupported schema {schema!r}")
+        atoms = [
+            SaeManifoldAtomFit(
+                basis=str(a["basis"]),
+                decoder_coefficients=np.asarray(a["decoder_coefficients"], dtype=float),
+                assignments=np.asarray(a["assignments"], dtype=float),
+                coords=np.asarray(a["coords"], dtype=float),
+                evidence=float(a["evidence"]),
+                active_dim=int(a["active_dim"]),
+            )
+            for a in payload["atoms"]
+        ]
+        fitted = np.asarray(payload["fitted"], dtype=float)
+        assigns = np.asarray(payload["assignments"], dtype=float)
+        coords = [np.asarray(c, dtype=float) for c in payload["coords"]]
+        decoder_blocks = [np.asarray(b, dtype=float) for b in payload["decoder_blocks"]]
+        score = float(payload["reml_score"])
+        chosen_k = len(atoms)
+        low = SaeManifoldFitResult(
+            atoms, chosen_k, {chosen_k: score}, {"winner": f"K={chosen_k}"}, fitted, assigns, coords, score,
+        )
+        centers: list[np.ndarray | None] = [
+            None if c is None else np.asarray(c, dtype=float) for c in payload["duchon_centers"]
+        ]
+        return cls(
+            atoms=atoms,
+            atom_topology=str(payload["atom_topology"]),
+            assignment=str(payload["assignment"]),
+            primitive_names=list(payload["primitive_names"]),
+            fitted=fitted,
+            assignments=assigns,
+            coords=coords,
+            decoder_blocks=decoder_blocks,
+            basis_specs=list(payload["basis_specs"]),
+            reml_score=score,
+            reconstruction_r2=float(payload["reconstruction_r2"]),
+            training_mean=np.asarray(payload["training_mean"], dtype=float),
+            training_data=np.asarray(payload["training_data"], dtype=float),
+            low_level=low,
+            _basis_kinds=list(payload["basis_kinds"]),
+            _atom_dims=[int(d) for d in payload["atom_dims"]],
+            _basis_sizes=[int(s) for s in payload["basis_sizes"]],
+            _n_harmonics=[int(h) for h in payload["n_harmonics"]],
+            _duchon_centers=centers,
+            alpha=float(payload.get("alpha", 1.0)),
+            learnable_alpha=bool(payload.get("learnable_alpha", False)),
+        )
+
+    @classmethod
+    def load(cls, path: str | Path) -> "ManifoldSAE":
+        return cls.from_dict(json.loads(Path(path).read_text()))
 
 
 @dataclass(frozen=True, init=False, slots=True)
@@ -154,6 +293,10 @@ class GumbelTemperatureSchedule:
         name = str(decay).lower().replace("-", "_")
         if name == "exponential":
             name = "geometric"
+        _validate_gumbel_schedule_fields(
+            tau_start=float(tau_start), tau_min=float(tau_min), decay=name,
+            rate=rate, steps=steps, iter_count=int(iter_count),
+        )
         object.__setattr__(self, "tau_start", float(tau_start))
         object.__setattr__(self, "tau_min", float(tau_min))
         object.__setattr__(self, "decay", name)
@@ -187,7 +330,7 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
                      isometry_weight: float = 1.0, ard_per_atom: bool = True,
                      mechanism_sparsity_groups: list[list[int]] | None = None, n_iter: int = 50, *,
                      Z: Any = None, sparsity_weight: float = 1.0, smoothness_weight: float = 1.0,
-                     alpha: float | str = 1.0, learning_rate: float = 0.05, random_state: int = 0,
+                     alpha: float | str = 1.0, learning_rate: float | None = None, random_state: int = 0,
                      block_orthogonality_weight: float = 0.0, topology_selector: Any | None = None,
                      top_k: int | None = None, **kwargs: Any) -> ManifoldSAE:
     src = Z if Z is not None else X
@@ -215,6 +358,21 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
     if kind == "gated":
         kind = "jumprelu"
     alpha_value = 1.0 if alpha == "auto" else float(alpha)
+    # Magic-by-default learning rate: the SAE Newton kernel is a damped
+    # Gauss-Newton step against a quadratic local model with Armijo
+    # backtracking. For softmax / IBP-MAP assignments the natural full step
+    # is `lr=1.0` (matches the Rust reference test
+    # `sae_manifold_fit_10_steps_one_harmonic_reaches_high_r2`, which reaches
+    # R² ≥ 0.95 in 10 steps from a phase-shifted init). A small literal
+    # `lr=0.05` starves the assignment posterior of gradient mass and lets
+    # the IBP sigmoid drift into the saturated tail (the issue #165
+    # collapse: assignment mass ~1e-146). JumpReLU keeps the historical
+    # smaller step because its hard-gate STE is more sensitive to
+    # overshooting the threshold. Callers can still override explicitly.
+    if learning_rate is None:
+        effective_lr = 0.05 if kind == "jumprelu" else 1.0
+    else:
+        effective_lr = float(learning_rate)
     penalties = [n for n, ok in (("IsometryPenalty", isometry_weight > 0.0), ("ARDPenalty", ard_per_atom),
         ("MechanismSparsityPenalty", mechanism_sparsity_groups is not None),
         ("BlockOrthogonalityPenalty", block_orthogonality_weight > 0.0)) if ok]
@@ -230,7 +388,7 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         float(sparsity),
         float(smoothness),
         int(max_iter_total),
-        float(learning_rate),
+        float(effective_lr),
         int(random_state),
         int(top_k) if top_k is not None else 0,
         gumbel_schedule=_schedule_payload(gumbel_schedule),
