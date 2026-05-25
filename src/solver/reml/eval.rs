@@ -11,10 +11,6 @@ const AUTO_CUBATURE_HESSIAN_RIDGE_REL: f64 = 1e-8;
 // Absolute floor for the diagonal ridge (prevents zero ridge when the
 // Hessian diagonal is degenerate / all-zero).
 const AUTO_CUBATURE_HESSIAN_RIDGE_ABS: f64 = 1e-8;
-// Eigenvalues of V_ρ below this floor are treated as numerical zero and
-// dropped from the sigma-point spectrum. Set well below any meaningful
-// posterior variance scale so we don't propagate noise directions.
-const AUTO_CUBATURE_EIGENVALUE_FLOOR: f64 = 1e-12;
 // Inset from RHO_BOUND when clamping sigma points so the inner PIRLS
 // fit at a sigma point is strictly interior to the box constraint
 // (the box edge is unreachable by IRLS without barrier intervention).
@@ -306,11 +302,16 @@ impl<'a> RemlState<'a> {
             Ok(x) => x,
             Err(_) => return first_order_correction,
         };
+        let max_eval = evals
+            .iter()
+            .copied()
+            .fold(0.0_f64, |acc, value| acc.max(value.abs()));
+        let eigenvalue_floor = max_eval * (n_rho.max(1) as f64) * f64::EPSILON;
         let mut eig_pairs: Vec<(usize, f64)> = evals
             .iter()
             .copied()
             .enumerate()
-            .filter(|(_, v)| v.is_finite() && *v > AUTO_CUBATURE_EIGENVALUE_FLOOR)
+            .filter(|(_, v)| v.is_finite() && *v > eigenvalue_floor)
             .collect();
         if eig_pairs.is_empty() {
             return first_order_correction;

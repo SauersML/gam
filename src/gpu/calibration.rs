@@ -30,7 +30,6 @@
 //! module.
 
 use std::sync::Arc;
-use std::sync::OnceLock;
 use std::time::Instant;
 
 use cudarc::cublas::{CudaBlas, Gemm, GemmConfig, sys as cublas_sys};
@@ -266,14 +265,16 @@ pub fn measure_device(ctx: Arc<CudaContext>) -> Result<DeviceCalibration, GpuErr
     }
 }
 
-/// Measured CPU FP64 GFLOPS via a single faer dgemm. Process-wide cache;
-/// runs once on first call.
+/// Measured CPU FP64 GFLOPS via a single faer dgemm. Process-wide cache.
+/// The initializer dispatches faer work onto Rayon, so it must not park
+/// sibling Rayon workers behind a blocking `OnceLock` while the first caller
+/// is running the benchmark.
 ///
 /// The CPU baseline is what every PCIe round-trip is racing against. Hard-
 /// coding a 50 GFLOPS constant — as the old policy did — over-routed on
 /// big servers (1500 GFLOPS Genoa) and under-routed on laptops (~20 GFLOPS).
 pub fn measured_cpu_fp64_gflops() -> f64 {
-    static CACHED: OnceLock<f64> = OnceLock::new();
+    static CACHED: crate::resource::RayonSafeOnce<f64> = crate::resource::RayonSafeOnce::new();
     *CACHED.get_or_init(measure_cpu_fp64_inner)
 }
 
