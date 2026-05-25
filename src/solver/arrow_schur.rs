@@ -1062,6 +1062,18 @@ impl ArrowSchurSystem {
                 for i in 0..k {
                     sys.hbb[[i, j]] += hv[i];
                 }
+                // Keep `hbb_diag` consistent with the dense `hbb` Hessian when
+                // both are populated (the dense-allocated path + a later
+                // `set_shared_beta_operator` install). The HVP probe for
+                // column `j` returns the full Hessian column, whose `j`-th
+                // entry is the diagonal contribution of this penalty. Without
+                // this mirror, the Jacobi Schur preconditioner — which prefers
+                // `hbb_diag` over `hbb`'s diagonal — would silently use a
+                // stale diagonal for any Beta-tier analytic penalty that
+                // exposes only an HVP (no `hessian_diag`).
+                if let Some(hbb_diag) = sys.hbb_diag.as_mut() {
+                    hbb_diag[j] += hv[j];
+                }
             },
         );
     }
