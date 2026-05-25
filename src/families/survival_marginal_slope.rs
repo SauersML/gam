@@ -17119,31 +17119,71 @@ fn validate_spec(spec: &SurvivalMarginalSlopeTermSpec) -> Result<(), String> {
         .into());
     }
     if let Some(beta0) = &spec.time_block.initial_beta {
-        let derivative_constraints = time_derivative_guard_constraints(
-            &spec.time_block.design_derivative_exit,
-            &spec.time_block.derivative_offset_exit,
-            spec.derivative_guard,
-        )?;
-        if let Some(constraints) = derivative_constraints.as_ref() {
-            if beta0.len() != constraints.a.ncols() {
-                return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
-                    reason: format!(
-                        "survival-marginal-slope time_block initial_beta length mismatch: got {}, expected {}",
-                        beta0.len(),
-                        constraints.a.ncols()
-                    ),
-                }
-                .into());
-            }
-            for row in 0..constraints.a.nrows() {
-                let slack = constraints.a.row(row).dot(beta0) - constraints.b[row];
-                if slack < -1e-10 {
-                    return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
+        match spec.time_block.time_monotonicity {
+            crate::families::survival_location_scale::TimeBlockMonotonicity::StructuralISpline => {
+                // Under the I-spline base, the only feasibility constraint on
+                // `initial_beta` is the γ ≥ 0 coordinate cone — the row-wise
+                // `D γ + o ≥ guard` constraints are vacuous (I-spline derivatives
+                // ≥ 0, `add_survival_time_derivative_guard_offset` makes `o ≥ guard`
+                // already). Running the row-wise generator here would duplicate
+                // information and risk a misleading row-wise rejection.
+                if spec.time_block.design_derivative_exit.ncols() != beta0.len() {
+                    return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
                         reason: format!(
-                        "survival-marginal-slope time_block initial_beta violates derivative guard constraint at row {row}: slack={slack:.3e}"
+                            "survival-marginal-slope time_block initial_beta length mismatch under StructuralISpline: got {}, expected {}",
+                            beta0.len(),
+                            spec.time_block.design_derivative_exit.ncols()
                         ),
                     }
                     .into());
+                }
+                for (j, &g) in beta0.iter().enumerate() {
+                    if !g.is_finite() {
+                        return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
+                            reason: format!(
+                                "survival-marginal-slope time_block initial_beta is non-finite at coordinate {j} under StructuralISpline: got {g}"
+                            ),
+                        }
+                        .into());
+                    }
+                    if g < -1e-12 {
+                        return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
+                            reason: format!(
+                                "survival-marginal-slope time_block initial_beta violates γ ≥ 0 at coordinate {j} under StructuralISpline: got {g:.3e}"
+                            ),
+                        }
+                        .into());
+                    }
+                }
+            }
+            _ => {
+                let derivative_constraints = time_derivative_guard_constraints(
+                    &spec.time_block.design_derivative_exit,
+                    &spec.time_block.derivative_offset_exit,
+                    spec.derivative_guard,
+                )?;
+                if let Some(constraints) = derivative_constraints.as_ref() {
+                    if beta0.len() != constraints.a.ncols() {
+                        return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+                            reason: format!(
+                                "survival-marginal-slope time_block initial_beta length mismatch: got {}, expected {}",
+                                beta0.len(),
+                                constraints.a.ncols()
+                            ),
+                        }
+                        .into());
+                    }
+                    for row in 0..constraints.a.nrows() {
+                        let slack = constraints.a.row(row).dot(beta0) - constraints.b[row];
+                        if slack < -1e-10 {
+                            return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
+                                reason: format!(
+                                    "survival-marginal-slope time_block initial_beta violates derivative guard constraint at row {row}: slack={slack:.3e}"
+                                ),
+                            }
+                            .into());
+                        }
+                    }
                 }
             }
         }
@@ -17645,16 +17685,32 @@ pub fn fit_survival_marginal_slope_terms(
         .as_ref()
         .map(|timewiggle| time_wiggle_basis_ncols(&timewiggle.knots, timewiggle.degree))
         .transpose()?;
-    let derivative_guard_constraints = time_derivative_guard_constraints(
-        &design_derivative_exit,
-        derivative_offset_exit.as_ref(),
-        derivative_guard,
-    )?;
-    let time_linear_constraints = append_timewiggle_tail_nonnegative_constraints(
-        derivative_guard_constraints,
-        design_exit.ncols(),
-        derived_time_wiggle_ncols.unwrap_or(0),
-    )?;
+    // Under `StructuralISpline` the base + wiggle both ride a γ ≥ 0
+    // coordinate cone — the row-wise `D γ + o ≥ guard` generator is
+    // vacuous (I-spline derivatives ≥ 0, offsets already absorb `guard`)
+    // and would duplicate information into the active-set KKT system.
+    // We emit a single `p_total × p_total` identity-cone instead so the
+    // existing active-set machinery treats the whole time block uniformly.
+    let time_linear_constraints = match spec.time_block.time_monotonicity {
+        crate::families::survival_location_scale::TimeBlockMonotonicity::StructuralISpline => {
+            let p_total = design_exit.ncols();
+            LinearInequalityConstraints::from_per_coordinate_lower_bounds(
+                &Array1::<f64>::zeros(p_total),
+            )
+        }
+        _ => {
+            let derivative_guard_constraints = time_derivative_guard_constraints(
+                &design_derivative_exit,
+                derivative_offset_exit.as_ref(),
+                derivative_guard,
+            )?;
+            append_timewiggle_tail_nonnegative_constraints(
+                derivative_guard_constraints,
+                design_exit.ncols(),
+                derived_time_wiggle_ncols.unwrap_or(0),
+            )?
+        }
+    };
 
     let intercept_warm_starts = new_intercept_warm_start_cache(n);
     let make_family = |marginal_design: &TermCollectionDesign,
