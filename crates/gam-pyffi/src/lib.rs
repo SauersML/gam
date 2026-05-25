@@ -17290,7 +17290,7 @@ struct ParametricAuxConditionalPriorPenalty {
 #[pymethods]
 impl ParametricAuxConditionalPriorPenalty {
     #[new]
-    #[pyo3(signature = (aux, alpha_init, beta_init, mu_init, weight, n_eff, learnable = false, *, target = default_target_py()))]
+    #[pyo3(signature = (aux, alpha_init, beta_init, mu_init, weight, n_eff, learnable = false, *, target = None))]
     fn new(
         py: Python<'_>,
         aux: &Bound<'_, PyAny>,
@@ -17300,7 +17300,7 @@ impl ParametricAuxConditionalPriorPenalty {
         weight: f64,
         n_eff: i64,
         learnable: bool,
-        target: PyObject,
+        target: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         let aux = aux_conditional_prior_float_array(py, aux)?;
         let alpha_init = aux_conditional_prior_float_array(py, alpha_init)?;
@@ -17315,7 +17315,7 @@ impl ParametricAuxConditionalPriorPenalty {
             n_eff,
         )?;
         Ok(Self {
-            target,
+            target: py_object_or_string_default(py, target, "t"),
             aux: aux.unbind(),
             alpha_init: alpha_init.unbind(),
             beta_init: beta_init.unbind(),
@@ -17435,8 +17435,14 @@ struct OrthogonalityPenalty {
 #[pymethods]
 impl OrthogonalityPenalty {
     #[new]
-    #[pyo3(signature = (weight, n_eff, learnable = false, *, target = default_target_py()))]
-    fn new(weight: f64, n_eff: i64, learnable: bool, target: PyObject) -> PyResult<Self> {
+    #[pyo3(signature = (weight, n_eff, learnable = false, *, target = None))]
+    fn new(
+        py: Python<'_>,
+        weight: f64,
+        n_eff: i64,
+        learnable: bool,
+        target: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Self> {
         if weight <= 0.0 {
             return Err(PyValueError::new_err(format!(
                 "OrthogonalityPenalty.weight must be > 0, got {weight:?}"
@@ -17448,7 +17454,7 @@ impl OrthogonalityPenalty {
             )));
         }
         Ok(Self {
-            target,
+            target: py_object_or_string_default(py, target, "t"),
             weight,
             n_eff,
             learnable,

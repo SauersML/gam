@@ -9131,6 +9131,7 @@ fn compute_outer_hessian(
     let ext_dim = solution.ext_coords.len();
     let total = k + ext_dim;
     let mut hess = Array2::zeros((total, total));
+    let upper_active_rho = active_upper_rho_mask(rho);
     let curvature_lambdas_storage: Option<Vec<f64>> = if workspace.is_some() {
         None
     } else {
@@ -9224,7 +9225,11 @@ fn compute_outer_hessian(
                 Some(
                     curvature_a_k_betas
                         .iter()
-                        .map(|a_k_beta| {
+                        .enumerate()
+                        .map(|(idx, a_k_beta)| {
+                            if upper_active_rho[idx] {
+                                return Array1::<f64>::zeros(hop.dim());
+                            }
                             // WS1a fallback: projected kernel for rank-deficient LAML path.
                             match constrained.as_ref() {
                                 Some(ck) if ck.has_active_constraints() => {
@@ -9239,7 +9244,14 @@ fn compute_outer_hessian(
                 Some(
                     curvature_a_k_betas
                         .iter()
-                        .map(|a_k_beta| hop.solve(a_k_beta))
+                        .enumerate()
+                        .map(|(idx, a_k_beta)| {
+                            if upper_active_rho[idx] {
+                                Array1::<f64>::zeros(hop.dim())
+                            } else {
+                                hop.solve(a_k_beta)
+                            }
+                        })
                         .collect(),
                 )
             }
