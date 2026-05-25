@@ -462,40 +462,7 @@ class SurvivalPrediction:
         people_chunk: int = DEFAULT_SURVIVAL_PEOPLE_CHUNK,
         time_grid_chunk: int = DEFAULT_SURVIVAL_TIME_GRID_CHUNK,
     ) -> Any:
-        """Yield ``H(t)`` evaluations in row/time blocks.
-
-        Streaming counterpart to :meth:`cumulative_hazard_at`. When the
-        FFI provided a dense cumulative-hazard surface this iterates
-        that surface directly; otherwise it derives ``H(t)`` from each
-        survival block returned by :meth:`survival_at_chunks`.
-
-        Parameters
-        ----------
-        times : array_like
-            1-D sequence of finite, non-negative times.
-        people_chunk : int, optional
-            Maximum number of rows per yielded block. Defaults to
-            ``DEFAULT_SURVIVAL_PEOPLE_CHUNK``.
-        time_grid_chunk : int, optional
-            Maximum number of time points per yielded block. Defaults
-            to ``DEFAULT_SURVIVAL_TIME_GRID_CHUNK``.
-
-        Yields
-        ------
-        tuple of (slice, slice, ndarray)
-            ``(row_slice, time_slice, block)`` of cumulative-hazard
-            values with shape matching the slice extents.
-
-        Examples
-        --------
-        >>> for r, t, H_block in pred.cumulative_hazard_at_chunks(times):
-        ...     handle.write(H_block.tobytes())
-
-        See Also
-        --------
-        SurvivalPrediction.cumulative_hazard_at
-        SurvivalPrediction.survival_at_chunks
-        """
+        """Yield ``(row_slice, time_slice, H_block)`` cumulative-hazard chunks."""
         import numpy as np
 
         times_arr = self._coerce_times(times)
@@ -572,51 +539,10 @@ class SurvivalPrediction:
         people_chunk: int = DEFAULT_SURVIVAL_PEOPLE_CHUNK,
         time_grid_chunk: int = DEFAULT_SURVIVAL_TIME_GRID_CHUNK,
     ) -> str:
-        """Stream survival predictions to a CSV file.
+        """Stream ``S(t)`` to a CSV file via :meth:`survival_at_chunks`.
 
-        Iterates :meth:`survival_at_chunks` and writes one row per
-        ``(prediction_row, time)`` pair, avoiding materialising the full
-        ``(n_samples, len(times))`` matrix in memory. When the
-        prediction was issued with an ``id_column`` (via
-        :meth:`Model.predict`), that column is included.
-
-        Parameters
-        ----------
-        path : str or pathlib.Path
-            Destination CSV file. Overwritten if it already exists.
-        times : array_like
-            1-D sequence of finite, non-negative times at which to
-            evaluate ``S(t)``.
-        people_chunk : int, optional
-            Maximum number of rows per internal block. Defaults to
-            ``DEFAULT_SURVIVAL_PEOPLE_CHUNK``.
-        time_grid_chunk : int, optional
-            Maximum number of time points per internal block. Defaults
-            to ``DEFAULT_SURVIVAL_TIME_GRID_CHUNK``.
-
-        Returns
-        -------
-        str
-            The string form of ``path``.
-
-        Notes
-        -----
-        Columns written are ``row, time, survival`` (or
-        ``row, <id_column>, time, survival`` when an id column is
-        present). The file is opened in text mode with UTF-8 encoding.
-
-        Examples
-        --------
-        >>> import numpy as np
-        >>> pred = model.predict(test_df, id_column="patient_id")
-        >>> pred.write_survival_at_csv(
-        ...     "survival.csv", np.linspace(0.0, 10.0, 64)
-        ... )
-        'survival.csv'
-
-        See Also
-        --------
-        SurvivalPrediction.survival_at_chunks
+        Writes ``row, time, survival`` (or ``row, <id_column>, time, survival``
+        when ``id_column`` was set on :meth:`Model.predict`).
         """
         import csv
 
