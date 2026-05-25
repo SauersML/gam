@@ -2724,10 +2724,10 @@ pub fn build_survival_baseline_offsets(
             // Origin-entry rows have `entry_at_origin[i] = true` in the engine
             // (`age_entry[i] <= 1e-8`) and their eta_entry value is multiplied
             // out by `has_entry_interval = false` in the NLL/gradient/Hessian.
-            // `evaluate_survival_baseline` rejects age <= 0 for the
-            // log-cumulative-hazard scale (log H(0) = -inf for parametric
-            // targets and the function is undefined for the Linear case at the
-            // age=0 guard), so short-circuit to a finite placeholder here.
+            // `evaluate_survival_baseline` reports log H(0) = -inf for
+            // parametric targets at the origin; we substitute a finite zero
+            // placeholder for the entry channel here so downstream sums that
+            // would otherwise propagate -inf via gated rows stay finite.
             let entry_age = age_entry[i];
             let e0 = if !entry_age.is_finite() {
                 return Err(SurvivalConstructionError::DataValidationFailed {
@@ -2739,8 +2739,15 @@ pub fn build_survival_baseline_offsets(
             } else {
                 evaluate_survival_baseline(entry_age, cfg)?.0
             };
-            let (e1, d1) = evaluate_survival_baseline(age_exit[i], cfg)?;
-            if !e0.is_finite() || !e1.is_finite() || !d1.is_finite() {
+            let exit_age = age_exit[i];
+            let (e1, d1) = evaluate_survival_baseline(exit_age, cfg)?;
+            // The exit channel is the log-cumulative-hazard offset; at t = 0
+            // we report H(0) = 0 exactly via eta_exit = -inf so that
+            // `exp(eta_exit) = 0` round-trips to the physical cumulative
+            // hazard. The derivative is zero at the origin (no contribution
+            // yet). All other values must be finite.
+            let exit_origin = exit_age == 0.0 && e1 == f64::NEG_INFINITY;
+            if !e0.is_finite() || (!exit_origin && !e1.is_finite()) || !d1.is_finite() {
                 return Err(SurvivalConstructionError::DataValidationFailed {
                     reason: "non-finite survival baseline offsets computed".to_string(),
                 }
