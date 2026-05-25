@@ -2,8 +2,8 @@ use crate::construction::{KroneckerReparamResult, ReparamResult};
 use crate::estimate::EstimationError;
 use crate::estimate::reml::FirthDenseOperator;
 use crate::faer_ndarray::{
-    FaerArrayView, FaerCholesky, FaerEigh, FaerLinalgError, FaerSymmetricFactor,
-    array1_to_col_matmut, array2_to_matmut, fast_ab, fast_atb, fast_atv, fast_av, fast_av_into,
+    FaerCholesky, FaerEigh, FaerLinalgError, FaerSymmetricFactor, array1_to_col_matmut,
+    array2_to_matmut, fast_ab, fast_atb, fast_atv, fast_av, fast_av_into,
 };
 use crate::linalg::sparse_exact::{
     factorize_sparse_spd, solve_sparse_spd, solve_sparse_spd_into,
@@ -20,7 +20,6 @@ use crate::types::{
     ResponseFamily, RidgePassport, RidgePolicy, SasLinkState, is_valid_tweedie_power,
 };
 use dyn_stack::{MemBuffer, MemStack};
-use faer::linalg::matmul::matmul;
 use faer::sparse::linalg::matmul::{
     SparseMatMulInfo, sparse_sparse_matmul_numeric, sparse_sparse_matmul_numeric_scratch,
     sparse_sparse_matmul_symbolic,
@@ -32,7 +31,7 @@ use faer::sparse::{
 use faer::{Accum, Par, Side, Unbind, get_global_parallelism};
 use log;
 use ndarray::{
-    Array1, Array2, ArrayBase, ArrayView1, ArrayView2, ArrayView3, Data, Ix2, ShapeBuilder, Zip, s,
+    Array1, Array2, ArrayView1, ArrayView2, ArrayView3, ShapeBuilder, Zip, s,
 };
 use rayon::iter::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
@@ -1048,67 +1047,17 @@ impl PirlsWorkspace {
         }
     }
 
-    #[inline]
-    fn dense_xtwx_chunkrows(p: usize) -> usize {
-        const MIN_ROWS: usize = 512;
-        const MAX_ROWS: usize = 131_072; // 128K rows — let faer handle cache blocking
-        const TARGET_BYTES: usize = 64 * 1024 * 1024; // 64MB
-        let bytes_perrow = p.max(1) * std::mem::size_of::<f64>();
-        (TARGET_BYTES / bytes_perrow).clamp(MIN_ROWS, MAX_ROWS)
-    }
-
-    fn add_dense_xtwx_streaming_signed<S>(
+    fn add_dense_xtwx_signed(
         weights: &Array1<f64>,
-        weighted_x_chunk: &mut Array2<f64>,
-        x: &ArrayBase<S, Ix2>,
+        weighted_x_scratch: &mut Array2<f64>,
+        x: &Array2<f64>,
         out: &mut Array2<f64>,
-        par: Par,
-    ) where
-        S: Data<Elem = f64> + Sync,
-    {
-        let n = x.nrows();
-        let p = x.ncols();
-        if n == 0 || p == 0 {
-            return;
-        }
-        assert_eq!(
-            weights.len(),
-            n,
-            "weight length must match row count for signed streamed XtWX"
+    ) {
+        *out = crate::solver::reml::assembly::xt_diag_x_dense_into(
+            x,
+            weights,
+            weighted_x_scratch,
         );
-        let chunkrows = Self::dense_xtwx_chunkrows(p).min(n);
-        if weighted_x_chunk.ncols() != p || weighted_x_chunk.nrows() != chunkrows {
-            *weighted_x_chunk = Array2::zeros((chunkrows, p).f());
-        }
-        let mut outview = array2_to_matmut(out);
-        for start in (0..n).step_by(chunkrows) {
-            let rows = (n - start).min(chunkrows);
-            {
-                let mut chunk = weighted_x_chunk.slice_mut(s![0..rows, ..]);
-                let x_slice = x.slice(s![start..start + rows, ..]);
-                let w_slice = weights.slice(s![start..start + rows]);
-                Zip::from(chunk.rows_mut())
-                    .and(x_slice.rows())
-                    .and(&w_slice)
-                    .par_for_each(|mut dst, src, &w| {
-                        Zip::from(&mut dst)
-                            .and(&src)
-                            .for_each(|d, &xij| *d = xij * w);
-                    });
-            }
-            let weighted_rows = weighted_x_chunk.slice(s![0..rows, ..]);
-            let x_rows = x.slice(s![start..start + rows, ..]);
-            let weighted_view = FaerArrayView::new(&weighted_rows);
-            let x_view = FaerArrayView::new(&x_rows);
-            matmul(
-                outview.as_mut(),
-                Accum::Add,
-                x_view.as_ref().transpose(),
-                weighted_view.as_ref(),
-                1.0,
-                par,
-            );
-        }
     }
 
     /// Ensure the sparse penalty cache is populated and consistent with `x` and `s_lambda`.
@@ -1909,7 +1858,7 @@ impl<'a> GamWorkingModel<'a> {
         }
     }
 
-    /// Compute X^T W X via the workspace BLAS-accelerated streaming path.
+    /// Compute X^T W X via the shared dense assembly path.
     /// Falls back to the scalar loop for sparse matrices.
     fn compute_xtwx_blas(
         workspace: &mut PirlsWorkspace,
@@ -1917,7 +1866,7 @@ impl<'a> GamWorkingModel<'a> {
         weights: &Array1<f64>,
     ) -> Result<Array2<f64>, EstimationError> {
         match design {
-            // Only the materialized arm can use the streaming-BLAS dense path.
+            // Only the materialized arm can use the shared dense assembly path.
             // Lazy operator-backed dense designs (TPS/Matern at biobank scale)
             // cannot be densified; fall through to the operator XᵀWX path.
             DesignMatrix::Dense(x) if x.is_materialized_dense() => {
@@ -1947,22 +1896,20 @@ impl<'a> GamWorkingModel<'a> {
                 if weights.iter().any(|&w| w < 0.0) {
                     // Observed-information assembly may have signed row
                     // weights.  Use Xᵀ(WX) exactly; never sqrt/clip.
-                    PirlsWorkspace::add_dense_xtwx_streaming_signed(
+                    PirlsWorkspace::add_dense_xtwx_signed(
                         weights,
                         &mut workspace.weighted_x_chunk,
                         x_dense.as_ref(),
                         &mut workspace.hessian_buf,
-                        get_global_parallelism(),
                     );
                 } else {
                     // All weights are non-negative; the signed-streaming path
                     // computes Xᵀ·diag(w)·X directly without sqrt/clip.
-                    PirlsWorkspace::add_dense_xtwx_streaming_signed(
+                    PirlsWorkspace::add_dense_xtwx_signed(
                         weights,
                         &mut workspace.weighted_x_chunk,
                         x_dense.as_ref(),
                         &mut workspace.hessian_buf,
-                        get_global_parallelism(),
                     );
                 }
                 // Move the buffer out instead of cloning — saves O(p²) memcpy.
@@ -7820,8 +7767,8 @@ fn solve_penalized_least_squares_implicit(
     //
     // Gaussian + Identity REML reuses a precomputed `XᵀWX` (the weights and
     // design never change across the outer loop in that family), so when the
-    // caller supplied a `GaussianFixedCache` we skip the O(N·p²) streaming
-    // GEMM here and adopt the cached matrix as-is.
+    // caller supplied a `GaussianFixedCache` we skip the O(N·p²) dense
+    // assembly here and adopt the cached matrix as-is.
     let weights_owned = weights.to_owned();
     let xtwx_orig = match x_original {
         // Only materialized dense designs can use the streaming-BLAS path.
@@ -7834,12 +7781,11 @@ fn solve_penalized_least_squares_implicit(
             } else {
                 workspace.hessian_buf.fill(0.0);
             }
-            PirlsWorkspace::add_dense_xtwx_streaming_signed(
+            PirlsWorkspace::add_dense_xtwx_signed(
                 &weights_owned,
                 &mut workspace.weighted_x_chunk,
                 x_dense.as_ref(),
                 &mut workspace.hessian_buf,
-                get_global_parallelism(),
             );
             std::mem::take(&mut workspace.hessian_buf)
         }

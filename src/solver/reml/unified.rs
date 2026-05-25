@@ -4811,7 +4811,11 @@ impl PenaltySubspaceTrace {
     /// Uses the identity `tr(K · A) = tr(H_proj⁻¹ · U_Sᵀ A U_S)` so the
     /// reduction runs on the r × r subspace rather than materializing K.
     pub fn trace_projected_logdet(&self, a: &Array2<f64>) -> f64 {
-        self.trace_projected_logdet_reduced(&self.reduce(a))
+        crate::construction::trace_penalty_covariance_in_orthogonal_basis(
+            a,
+            &self.u_s,
+            &self.h_proj_inverse,
+        )
     }
 
     /// Reduce a p × p matrix `A` to its r × r projection `U_Sᵀ · A · U_S`.
@@ -4828,14 +4832,7 @@ impl PenaltySubspaceTrace {
 
     /// Compute `tr(H_proj⁻¹ · R)` given an already-reduced `R = U_Sᵀ A U_S`.
     pub fn trace_projected_logdet_reduced(&self, r_mat: &Array2<f64>) -> f64 {
-        let mut trace = 0.0;
-        let r = self.h_proj_inverse.nrows();
-        for i in 0..r {
-            for j in 0..r {
-                trace += self.h_proj_inverse[[i, j]] * r_mat[[j, i]];
-            }
-        }
-        trace
+        crate::construction::trace_reduced_penalty_covariance(r_mat, &self.h_proj_inverse)
     }
 
     /// Cross-trace given pre-reduced blocks `R_A = U_Sᵀ A U_S`, `R_B = U_Sᵀ B U_S`.
