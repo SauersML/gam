@@ -97,6 +97,8 @@ __all__ = [
 ]
 
 from ._binding import rust_module as _rust_module; BlockSparsityPenalty = _rust_module().BlockSparsityPenalty
+from ._binding import rust_module as _rust_module; IBPAssignmentPenalty = _rust_module().IBPAssignmentPenalty
+from ._binding import rust_module as _rust_module; TotalVariationPenalty = _rust_module().TotalVariationPenalty
 
 
 class AnalyticPenaltyKind(str, Enum):
@@ -331,6 +333,7 @@ def _target_descriptor(target: Any) -> str | int:
 
 from ._binding import rust_module as _rust_module; ARDPenalty = _rust_module().ARDPenalty
 from ._binding import rust_module as _rust_module; TopKActivationPenalty = _rust_module().TopKActivationPenalty
+from ._binding import rust_module as _rust_module; JumpReLUPenalty = _rust_module().JumpReLUPenalty
 
 
 def _inverse_softplus(x: np.ndarray) -> np.ndarray:
@@ -346,64 +349,6 @@ from ._binding import rust_module as _rust_module; AuxConditionalPriorPenalty = 
 from ._binding import rust_module as _rust_module; BlockOrthogonalityPenalty = _rust_module().BlockOrthogonalityPenalty
 from ._binding import rust_module as _rust_module; IsometryPenalty = _rust_module().IsometryPenalty
 
-
-@dataclass(init=False, slots=True)
-class IsometryPenalty(_AnalyticPenalty):
-    """Pull the decoder's pullback metric toward a reference metric on the
-    KIND_TAG = "isometry"
-    latent manifold.
-
-    For a decoder ``T : ℝ^d → ℝ^p`` and per-row Jacobian
-    ``J_n = ∂T/∂t |_{t = t_n}``, the induced pullback metric is
-    ``g_n = J_n^T J_n``. The penalty is
-
-    .. math::
-
-        P_\\mathrm{iso}(t; \\rho) \\;=\\; \\tfrac12\\, e^{\\rho_\\mathrm{iso}}
-            \\sum_n \\bigl\\| J_n^T J_n - g^\\mathrm{ref}_n \\bigr\\|_F^2
-
-    with ``g^\\mathrm{ref}`` fixed to the identity, pulling toward a local
-    isometry. ``e^{\\rho_\\mathrm{iso}}`` is REML-selectable like any other
-    smoothing weight.
-
-    **When to use.** Whenever a ``LatentCoord`` block is in play and there is
-    no auxiliary prior to break the diffeomorphism gauge. The bare data-fit
-    loss is invariant under any smooth invertible reparameterization of ``t``;
-    the isometry penalty breaks that symmetry by pinning the local geometry
-    of the decoder. The analytic gradient w.r.t. ``t`` reuses the
-    radial-derivative ``∂Φ/∂t`` jet that ``LatentCoord`` already computes via
-    ``latent_coord::LatentCoordValues::design_gradient_wrt_t``.
-
-    Parameters
-    ----------
-    target
-        Either the name of a ``LatentCoord`` block (``"t"``) or the
-        ``LatentCoord`` object itself.
-    weight
-        ``"auto"`` (REML-selected; the default) or a fixed positive float.
-    """
-
-    target: TargetSpec
-    weight: WeightSpec = "auto"
-    weight_schedule: ScalarWeightSchedule | dict[str, Any] | None = None
-
-    def __init__(
-        self,
-        weight: WeightSpec = "auto",
-        *,
-        target: TargetSpec = "t",
-        weight_schedule: ScalarWeightSchedule | dict[str, Any] | None = None,
-    ) -> None:
-        self.target = target
-        self.weight = weight
-        self.weight_schedule = weight_schedule
-        self.__post_init__()
-
-    def __post_init__(self) -> None:
-        _validate_weight(self.weight, "IsometryPenalty")
-
-    def _payload_extras(self) -> dict[str, Any]:
-        return {"weight": self.weight}
 
 @dataclass(init=False, slots=True)
 class ScadMcpPenalty(_AnalyticPenalty):
@@ -482,56 +427,6 @@ class ScadMcpPenalty(_AnalyticPenalty):
         }
 
 
-@dataclass(init=False, slots=True)
-class JumpReLUPenalty(_AnalyticPenalty):
-    """JumpReLU SAE threshold prior with one learnable threshold per atom."""
-    KIND_TAG = "jumprelu"
-
-    target: TargetSpec
-    thresholds: np.ndarray
-    weight: float
-    smoothing_eps: float
-    weight_schedule: ScalarWeightSchedule | dict[str, Any] | None
-
-    def __init__(
-        self,
-        thresholds: Any,
-        weight: float = 1.0,
-        smoothing_eps: float = 1e-3,
-        *,
-        target: TargetSpec = "t",
-        weight_schedule: ScalarWeightSchedule | dict[str, Any] | None = None,
-    ) -> None:
-        self.target = target
-        self.thresholds = np.asarray(thresholds, dtype=float).reshape(-1)
-        self.weight = float(weight)
-        self.smoothing_eps = float(smoothing_eps)
-        self.weight_schedule = weight_schedule
-        self.__post_init__()
-
-    def __post_init__(self) -> None:
-        if self.thresholds.size == 0:
-            raise ValueError("JumpReLUPenalty.thresholds must be non-empty")
-        if not np.all(np.isfinite(self.thresholds)) or np.any(self.thresholds <= 0.0):
-            raise ValueError("JumpReLUPenalty.thresholds must be finite and > 0")
-        if not np.isfinite(self.weight) or self.weight <= 0.0:
-            raise ValueError(
-                f"JumpReLUPenalty.weight must be finite and > 0, got {self.weight}"
-            )
-        if not np.isfinite(self.smoothing_eps) or self.smoothing_eps <= 0.0:
-            raise ValueError(
-                "JumpReLUPenalty.smoothing_eps must be finite and > 0, "
-                f"got {self.smoothing_eps}"
-            )
-
-    def _payload_extras(self) -> dict[str, Any]:
-        return {
-            "thresholds": self.thresholds.astype(float).tolist(),
-            "weight": float(self.weight),
-            "smoothing_eps": float(self.smoothing_eps),
-        }
-
-
 @dataclass(frozen=True, slots=True)
 class GatedSAEDecoder:
     """Standalone gated SAE decoder with gate and amplitude weights."""
@@ -578,114 +473,6 @@ def _sigmoid_numpy(x: np.ndarray) -> np.ndarray:
     ex = np.exp(x[~pos])
     out[~pos] = ex / (1.0 + ex)
     return out
-
-
-@dataclass(init=False, slots=True)
-class TotalVariationPenalty(_AnalyticPenalty):
-    """Smoothed-L¹ total variation on first differences of a latent block.
-    KIND_TAG = "total_variation"
-
-    Uses ``φ(x) = sqrt(x² + ε²) - ε`` on ``D @ T``. ``difference_op`` is either
-    ``"forward_1d"`` for adjacent ordered rows or a graph edge list
-    ``[(from_row, to_row), ...]``. Pair with ``OrthogonalityPenalty`` when
-    piecewise-constant atoms should be interpreted in a gauge-fixed basis.
-
-    Parameters
-    ----------
-    weight
-        Fixed base weight, or the base multiplier when ``learnable=True``.
-    n_eff
-        Number of rows in the row-major latent coefficient block.
-    difference_op
-        ``"forward_1d"`` or a sequence of ``(from_row, to_row)`` graph edges.
-    smoothing_eps
-        Positive smoothing scale ``ε`` for the smoothed-L¹ kernel.
-    learnable
-        If true, expose one REML-selectable log-weight ``ρ``.
-    target
-        The ``LatentCoord`` block name/object. Defaults to ``"t"``.
-    """
-
-    target: TargetSpec
-    weight: float
-    n_eff: int
-    difference_op: Any
-    smoothing_eps: float
-    learnable: bool
-    _edges: list[tuple[int, int]] | None
-    weight_schedule: ScalarWeightSchedule | dict[str, Any] | None
-
-    def __init__(
-        self,
-        weight: float,
-        n_eff: int,
-        difference_op: Any = "forward_1d",
-        smoothing_eps: float = 1e-6,
-        learnable: bool = False,
-        *,
-        target: TargetSpec = "t",
-    ) -> None:
-        self.target = target
-        self.weight = float(weight)
-        self.n_eff = int(n_eff)
-        self.difference_op = difference_op
-        self.smoothing_eps = float(smoothing_eps)
-        self.learnable = bool(learnable)
-        self._edges = None
-        self.weight_schedule = None
-        self.__post_init__()
-
-    def __post_init__(self) -> None:
-        if not self.weight > 0.0:
-            raise ValueError(f"TotalVariationPenalty.weight must be > 0, got {self.weight}")
-        if self.n_eff <= 0:
-            raise ValueError(f"TotalVariationPenalty.n_eff must be > 0, got {self.n_eff}")
-        if not self.smoothing_eps > 0.0:
-            raise ValueError(
-                "TotalVariationPenalty.smoothing_eps must be > 0, "
-                f"got {self.smoothing_eps}"
-            )
-        if isinstance(self.difference_op, str):
-            if self.difference_op != "forward_1d":
-                raise ValueError(
-                    "TotalVariationPenalty.difference_op string must be 'forward_1d', "
-                    f"got {self.difference_op!r}"
-                )
-            self._edges = None
-            return
-
-        try:
-            edges = [(index(a), index(b)) for a, b in self.difference_op]
-        except (TypeError, ValueError) as exc:
-            raise TypeError(
-                "TotalVariationPenalty.difference_op must be 'forward_1d' "
-                "or a sequence of (from_row, to_row) edges"
-            ) from exc
-        if not edges:
-            raise ValueError("TotalVariationPenalty graph edges must not be empty")
-        for a, b in edges:
-            if a < 0 or b < 0 or a >= self.n_eff or b >= self.n_eff:
-                raise ValueError(
-                    "TotalVariationPenalty graph edges must be within "
-                    f"[0, n_eff); got {(a, b)} for n_eff={self.n_eff}"
-                )
-            if a == b:
-                raise ValueError(f"TotalVariationPenalty graph edge {(a, b)} is self-referential")
-        self._edges = edges
-
-    def _payload_extras(self) -> dict[str, Any]:
-        extras: dict[str, Any] = {
-            "weight": self.weight,
-            "n_eff": self.n_eff,
-            "smoothing_eps": self.smoothing_eps,
-            "learnable": self.learnable,
-        }
-        if self._edges is None:
-            extras["difference_op"] = "forward_1d"
-        else:
-            extras["difference_op"] = "graph_edges"
-            extras["edges"] = self._edges
-        return extras
 
 
 @dataclass(init=False, slots=True)
@@ -848,112 +635,6 @@ class MechanismSparsityPenalty(_AnalyticPenalty):
             "feature_groups": self.feature_groups,
             "weight": self.weight,
             "smoothing_eps": self.smoothing_eps,
-            "n_eff": self.n_eff,
-            "learnable": self.learnable,
-        }
-
-
-@dataclass(init=False, slots=True)
-class BlockOrthogonalityPenalty(_AnalyticPenalty):
-    """Between-block-only orthogonality over latent-axis groups.
-    KIND_TAG = "block_orthogonality"
-
-    Penalizes ``0.5 * weight * sum_{g<h} ||T[:, G_g].T @ T[:, G_h]||²_F``
-    while leaving each within-block Gram matrix unconstrained. This codifies
-    the supervised-block-plus-free-discovery-block composition: supervise one
-    block via an auxiliary conditional prior, leave a companion block free,
-    and force the two blocks to be orthogonal so the supervised gauge anchors
-    the free axes.
-
-    Parameters
-    ----------
-    groups
-        Partition of latent column indices, e.g. ``[[0, 1, 2], [3, 4, 5]]``.
-    weight
-        Fixed base weight, or the base multiplier when ``learnable=True``.
-    n_eff
-        Number of rows in the row-major latent coefficient block.
-    learnable
-        If true, expose one REML-selectable log-weight ``ρ``.
-    target
-        The ``LatentCoord`` block name/object. Defaults to ``"t"``.
-    """
-
-    target: TargetSpec
-    groups: list[list[int]]
-    weight: float
-    n_eff: int
-    learnable: bool
-    weight_schedule: ScalarWeightSchedule | dict[str, Any] | None
-
-    def __init__(
-        self,
-        groups: Any,
-        weight: float,
-        n_eff: int,
-        learnable: bool = False,
-        *,
-        target: TargetSpec = "t",
-    ) -> None:
-        self.target = target
-        self.groups = self._coerce_groups(groups)
-        self.weight = float(weight)
-        self.n_eff = int(n_eff)
-        self.learnable = bool(learnable)
-        self.weight_schedule = None
-        self.__post_init__()
-
-    @staticmethod
-    def _coerce_groups(groups: Any) -> list[list[int]]:
-        try:
-            coerced = [[index(axis) for axis in group] for group in groups]
-        except TypeError as exc:
-            raise TypeError(
-                "BlockOrthogonalityPenalty.groups must be a sequence of integer sequences"
-            ) from exc
-        if len(coerced) < 2:
-            raise ValueError("BlockOrthogonalityPenalty.groups must contain at least two groups")
-        seen: set[int] = set()
-        for group_idx, group in enumerate(coerced):
-            if not group:
-                raise ValueError(
-                    f"BlockOrthogonalityPenalty.groups[{group_idx}] must not be empty"
-                )
-            for axis in group:
-                if axis < 0:
-                    raise ValueError(
-                        "BlockOrthogonalityPenalty.groups entries must be non-negative; "
-                        f"got {axis}"
-                    )
-                if axis in seen:
-                    raise ValueError(
-                        f"BlockOrthogonalityPenalty.groups axis {axis} appears more than once"
-                    )
-                seen.add(axis)
-        max_axis = max(seen)
-        missing = set(range(max_axis + 1)) - seen
-        if missing:
-            first = min(missing)
-            raise ValueError(
-                "BlockOrthogonalityPenalty.groups must partition contiguous axes from 0; "
-                f"missing axis {first}"
-            )
-        return coerced
-
-    def __post_init__(self) -> None:
-        if not self.weight > 0.0:
-            raise ValueError(
-                f"BlockOrthogonalityPenalty.weight must be > 0, got {self.weight}"
-            )
-        if self.n_eff <= 0:
-            raise ValueError(
-                f"BlockOrthogonalityPenalty.n_eff must be > 0, got {self.n_eff}"
-            )
-
-    def _payload_extras(self) -> dict[str, Any]:
-        return {
-            "groups": self.groups,
-            "weight": self.weight,
             "n_eff": self.n_eff,
             "learnable": self.learnable,
         }
@@ -1261,63 +942,6 @@ class OrthogonalityPenalty(_AnalyticPenalty):
             "n_eff": self.n_eff,
             "learnable": self.learnable,
         }
-
-
-@dataclass(init=False, slots=True)
-class IBPAssignmentPenalty(_AnalyticPenalty):
-    KIND_TAG = "ibp_assignment"
-    target: TargetSpec
-    k_max: int
-    alpha: float = 1.0
-    tau: float = 1.0
-    learnable: bool = False
-    temperature_schedule: Any = None
-    weight_schedule: ScalarWeightSchedule | dict[str, Any] | None = None
-
-    def __init__(
-        self,
-        k_max: int,
-        alpha: float = 1.0,
-        tau: float = 1.0,
-        learnable: bool = False,
-        *,
-        target: TargetSpec = "t",
-        temperature_schedule: Any = None,
-        weight_schedule: ScalarWeightSchedule | dict[str, Any] | None = None,
-    ) -> None:
-        self.target = target
-        self.k_max = int(k_max)
-        self.alpha = float(alpha)
-        self.tau = float(tau)
-        self.learnable = bool(learnable)
-        self.temperature_schedule = temperature_schedule
-        self.weight_schedule = weight_schedule
-        self.__post_init__()
-
-    def __post_init__(self) -> None:
-        if self.k_max <= 0:
-            raise ValueError(f"IBPAssignmentPenalty.k_max must be > 0, got {self.k_max}")
-        if self.alpha <= 0.0:
-            raise ValueError(f"IBPAssignmentPenalty.alpha must be > 0, got {self.alpha}")
-        if self.tau <= 0.0:
-            raise ValueError(f"IBPAssignmentPenalty.tau must be > 0, got {self.tau}")
-
-    def _payload_extras(self) -> dict[str, Any]:
-        return {
-            "k_max": int(self.k_max),
-            "alpha": float(self.alpha),
-            "tau": float(self.tau),
-            "learnable": bool(self.learnable),
-        }
-
-    def _to_rust_payload(self) -> dict[str, Any]:
-        payload = {
-            "kind": type(self).KIND_TAG,
-            "target": _target_descriptor(self.target),
-        }
-        payload.update(self._payload_extras())
-        payload = _add_temperature_schedule(payload, self)
-        return _add_weight_schedule(payload, self)
 
 
 @dataclass(init=False, slots=True)

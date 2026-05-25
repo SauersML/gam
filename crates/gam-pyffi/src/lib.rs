@@ -1422,6 +1422,134 @@ fn vec_to_array1_f64<'py>(py: Python<'py>, values: Vec<f64>) -> PyResult<Py<PyAr
     Ok(Array1::from_vec(values).into_pyarray(py).unbind())
 }
 
+fn survival_prediction_matrix_from_rows(
+    rows: Vec<Vec<f64>>,
+    label: &str,
+) -> PyResult<Array2<f64>> {
+    if rows.is_empty() {
+        return Ok(Array2::<f64>::zeros((0, 0)));
+    }
+    let n_rows = rows.len();
+    let n_cols = rows[0].len();
+    for (row_idx, row) in rows.iter().enumerate() {
+        if row.len() != n_cols {
+            return Err(py_value_error(format!(
+                "{label} row {row_idx} has length {} but expected {n_cols}",
+                row.len()
+            )));
+        }
+    }
+    let data = rows.into_iter().flatten().collect::<Vec<_>>();
+    Array2::from_shape_vec((n_rows, n_cols), data)
+        .map_err(|err| py_value_error(format!("failed to reshape {label}: {err}")))
+}
+
+fn survival_prediction_parameters_from_columns(
+    columns: &BTreeMap<String, Vec<f64>>,
+    linear_predictor: &[f64],
+) -> PyResult<Array2<f64>> {
+    if columns.is_empty() {
+        if linear_predictor.is_empty() {
+            return Ok(Array2::<f64>::zeros((0, 0)));
+        }
+        return Array2::from_shape_vec((linear_predictor.len(), 1), linear_predictor.to_vec())
+            .map_err(|err| {
+                py_value_error(format!("failed to reshape survival parameters: {err}"))
+            });
+    }
+
+    let n_rows = columns.values().next().map(Vec::len).unwrap_or(0);
+    let n_cols = columns.len();
+    let mut out = Array2::<f64>::zeros((n_rows, n_cols));
+    for (col_idx, (name, values)) in columns.iter().enumerate() {
+        if values.len() != n_rows {
+            return Err(py_value_error(format!(
+                "survival parameter column '{name}' has length {} but expected {n_rows}",
+                values.len()
+            )));
+        }
+        for (row_idx, value) in values.iter().enumerate() {
+            out[[row_idx, col_idx]] = *value;
+        }
+    }
+    Ok(out)
+}
+
+fn set_survival_prediction_array1<'py>(
+    py: Python<'py>,
+    out: &Bound<'py, PyDict>,
+    key: &str,
+    values: Vec<f64>,
+) -> PyResult<()> {
+    if values.is_empty() {
+        out.set_item(key, py.None())
+    } else {
+        out.set_item(key, Array1::from_vec(values).into_pyarray(py))
+    }
+}
+
+fn set_survival_prediction_matrix<'py>(
+    py: Python<'py>,
+    out: &Bound<'py, PyDict>,
+    key: &str,
+    rows: Option<Vec<Vec<f64>>>,
+) -> PyResult<()> {
+    match rows {
+        Some(values) => out.set_item(
+            key,
+            survival_prediction_matrix_from_rows(values, key)?.into_pyarray(py),
+        ),
+        None => out.set_item(key, py.None()),
+    }
+}
+
+#[pyfunction]
+fn survival_prediction_payload_from_json(py: Python<'_>, raw: &str) -> PyResult<PyObject> {
+    let payload: SurvivalPredictionJsonPayload = serde_json::from_str(raw).map_err(|err| {
+        py_value_error(format!(
+            "failed to parse survival prediction payload: {err}"
+        ))
+    })?;
+    if payload.class != "survival_prediction" {
+        return Err(py_value_error(format!(
+            "expected survival_prediction payload, got '{}'",
+            payload.class
+        )));
+    }
+
+    let out = PyDict::new(py);
+    let model_class = payload
+        .model_class
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "survival marginal-slope".to_string());
+    out.set_item("model_class", model_class)?;
+
+    set_survival_prediction_array1(py, &out, "times", payload.times.unwrap_or_default())?;
+    set_survival_prediction_matrix(py, &out, "hazard", payload.hazard)?;
+    set_survival_prediction_matrix(py, &out, "survival", payload.survival)?;
+    set_survival_prediction_matrix(
+        py,
+        &out,
+        "cumulative_hazard",
+        payload.cumulative_hazard,
+    )?;
+
+    let linear_predictor = payload.linear_predictor.unwrap_or_default();
+    set_survival_prediction_array1(py, &out, "linear_predictor", linear_predictor.clone())?;
+    set_survival_prediction_matrix(py, &out, "survival_se", payload.survival_se)?;
+    set_survival_prediction_array1(py, &out, "eta_se", payload.eta_se.unwrap_or_default())?;
+
+    let columns = payload.columns.unwrap_or_default();
+    let parameter_names = columns.keys().cloned().collect::<Vec<_>>();
+    out.set_item("parameter_names", PyTuple::new(py, parameter_names)?)?;
+    out.set_item(
+        "parameters",
+        survival_prediction_parameters_from_columns(&columns, &linear_predictor)?
+            .into_pyarray(py),
+    )?;
+    Ok(out.into_any().unbind())
+}
+
 #[pyfunction]
 fn competing_risks_prediction_payload_from_json(
     py: Python<'_>,
@@ -15619,6 +15747,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(survival_block, module)?)?;
     module.add_function(wrap_pyfunction!(survival_ffi_surface, module)?)?;
     module.add_function(wrap_pyfunction!(numeric_matrix_validate, module)?)?;
+    module.add_function(wrap_pyfunction!(numeric_matrix_f64, module)?)?;
     module.add_function(wrap_pyfunction!(marginal_slope_clip_probabilities, module)?)?;
     module.add_function(wrap_pyfunction!(
         transformation_normal_z_from_columns,
@@ -15822,6 +15951,8 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<ParametricAuxConditionalPriorPenalty>()?;
     module.add_class::<BlockSparsityPenalty>()?;
     module.add_class::<BlockOrthogonalityPenalty>()?;
+    module.add_class::<OrthogonalityPenalty>()?;
+    module.add_class::<SoftmaxAssignmentSparsityPenalty>()?;
     module.add_class::<PyIBPAssignmentPenalty>()?;
     module.add_class::<TotalVariationPenalty>()?;
     Ok(())
