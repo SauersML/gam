@@ -207,7 +207,7 @@ impl SaeAtomBasisKind {
                     lo: -std::f64::consts::FRAC_PI_2,
                     hi: std::f64::consts::FRAC_PI_2,
                 },
-                LatentManifold::Circle,
+                LatentManifold::Circle { period: std::f64::consts::TAU },
             ]),
             // `Torus` uses [`TorusHarmonicEvaluator`], which shares the
             // fraction-of-period convention with `PeriodicHarmonicEvaluator`
@@ -2481,7 +2481,7 @@ mod tests {
         let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
             Array2::<f64>::zeros((4, 1)),
             vec![coords0],
-            vec![LatentManifold::Circle],
+            vec![LatentManifold::Circle { period: 1.0 }],
             AssignmentMode::ibp_map(0.7, 1.0, true),
         )
         .unwrap();
@@ -2548,7 +2548,7 @@ mod tests {
             // Zero assignment mass → H_tt has zero data contribution.
             Array2::<f64>::zeros((3, 1)),
             vec![coords],
-            vec![LatentManifold::Circle],
+            vec![LatentManifold::Circle { period: 1.0 }],
             AssignmentMode::softmax(0.7),
         )
         .unwrap();
@@ -2604,7 +2604,7 @@ mod tests {
         let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
             Array2::<f64>::zeros((3, 1)),
             vec![coords],
-            vec![LatentManifold::Circle],
+            vec![LatentManifold::Circle { period: 1.0 }],
             AssignmentMode::softmax(0.7),
         )
         .unwrap();
@@ -2927,7 +2927,7 @@ mod tests {
                     lo: -std::f64::consts::FRAC_PI_2,
                     hi: std::f64::consts::FRAC_PI_2,
                 },
-                LatentManifold::Circle,
+                LatentManifold::Circle { period: std::f64::consts::TAU },
             ])],
             AssignmentMode::softmax(0.5),
         )
@@ -2998,7 +2998,7 @@ mod tests {
         let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
             Array2::<f64>::zeros((n, 1)),
             vec![coords0_data],
-            vec![LatentManifold::Circle],
+            vec![LatentManifold::Circle { period: 1.0 }],
             AssignmentMode::softmax(0.5),
         )
         .unwrap();

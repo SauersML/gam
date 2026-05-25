@@ -18267,7 +18267,7 @@ mod tests {
                 1,
                 DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD,
             ),
-            structural_monotonicity: true,
+            time_monotonicity: crate::families::survival_location_scale::TimeBlockMonotonicity::EnforcedByRowConstraint,
             penalties: Vec::new(),
             nullspace_dims: Vec::new(),
             initial_log_lambdas: None,
@@ -18725,7 +18725,7 @@ mod tests {
                 offset_entry: Array1::zeros(2),
                 offset_exit: Array1::zeros(2),
                 derivative_offset_exit: Array1::zeros(2),
-                structural_monotonicity: false,
+                time_monotonicity: crate::families::survival_location_scale::TimeBlockMonotonicity::EnforcedByCoordinateCone,
                 ..base_time_block()
             },
             timewiggle_block: None,
