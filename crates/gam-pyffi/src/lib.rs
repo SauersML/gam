@@ -77,7 +77,8 @@ use gam::terms::skip_transcoder::{
 };
 use gam::terms::smooth::BlockwisePenalty;
 use gam::terms::{
-    ARDPenalty as CoreARDPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry,
+    ARDPenalty as CoreARDPenalty, AnalyticPenalty as AnalyticPenaltyTrait, AnalyticPenaltyKind,
+    AnalyticPenaltyRegistry,
     BlockOrthogonalityPenalty as CoreBlockOrthogonalityPenalty, DifferenceOpKind, GatedSAEDecoder,
     IBPAssignmentPenalty as CoreIBPAssignmentPenalty, IsometryPenalty as CoreIsometryPenalty,
     IvaeRidgeMeanGauge as IvaeRidgeMeanGaugePenalty, JumpReLUPenalty as RustJumpReLUPenalty,
@@ -18167,6 +18168,78 @@ impl ParametricAuxConditionalPriorPenalty {
             }
         ))
     }
+
+    /// Evaluate the parametric iVAE-style row-precision prior value and
+    /// gradient at latent block `t` of shape `(n_eff, latent_dim)`. Returns
+    /// `(value, grad)` with `grad` having the same shape as `t`.
+    #[pyo3(signature = (t))]
+    fn value_grad<'py>(
+        &self,
+        py: Python<'py>,
+        t: PyReadonlyArray2<'py, f64>,
+    ) -> PyResult<(f64, Py<PyArray2<f64>>)> {
+        let view = t.as_array();
+        let (n_rows, latent_dim) = view.dim();
+        if n_rows as i64 != self.n_eff {
+            return Err(PyValueError::new_err(format!(
+                "ParametricAuxConditionalPriorPenalty.value_grad: t first dim {n_rows} must match n_eff={}",
+                self.n_eff
+            )));
+        }
+        if latent_dim == 0 {
+            return Err(PyValueError::new_err(
+                "ParametricAuxConditionalPriorPenalty.value_grad: t must have latent_dim > 0",
+            ));
+        }
+        let aux_array = self
+            .aux
+            .bind(py)
+            .extract::<PyReadonlyArray2<'_, f64>>()?;
+        let aux_owned: Array2<f64> = aux_array.as_array().to_owned();
+        let alpha_array = self
+            .alpha_init
+            .bind(py)
+            .extract::<PyReadonlyArray1<'_, f64>>()?;
+        let beta_array = self
+            .beta_init
+            .bind(py)
+            .extract::<PyReadonlyArray1<'_, f64>>()?;
+        let mu_array = self
+            .mu_init
+            .bind(py)
+            .extract::<PyReadonlyArray2<'_, f64>>()?;
+        let log_alpha: Array1<f64> = alpha_array.as_array().iter().map(|v| v.ln()).collect();
+        let raw_beta: Array1<f64> = beta_array
+            .as_array()
+            .iter()
+            .map(|v| inverse_softplus_scalar(*v))
+            .collect();
+        let mu_owned: Array2<f64> = mu_array.as_array().to_owned();
+        let slice = PsiSlice::full(n_rows * latent_dim, Some(latent_dim));
+        let penalty = ParametricRowPrecisionPriorPenalty::new(
+            slice,
+            aux_owned,
+            log_alpha,
+            raw_beta,
+            mu_owned,
+            self.weight,
+            n_rows,
+            false,
+        )
+        .map_err(py_value_error)?;
+        let flat: Array1<f64> = view.iter().copied().collect();
+        let rho = Array1::<f64>::zeros(0);
+        let value = penalty.value(flat.view(), rho.view());
+        let grad_flat = penalty.grad_target(flat.view(), rho.view());
+        let grad = grad_flat
+            .into_shape_with_order((n_rows, latent_dim))
+            .map_err(|err| {
+                py_value_error(format!(
+                    "ParametricAuxConditionalPriorPenalty.value_grad: gradient reshape failed: {err}"
+                ))
+            })?;
+        Ok((value, grad.into_pyarray(py).unbind()))
+    }
 }
 
 #[pyclass(module = "gam_pyffi._rust", name = "OrthogonalityPenalty")]
@@ -18496,6 +18569,55 @@ impl IvaeRidgeMeanGauge {
             }
         ))
     }
+
+    /// Evaluate the iVAE ridge conditional-mean gauge penalty value and
+    /// gradient at latent block `t` of shape `(n_eff, latent_dim)`. Returns
+    /// `(value, grad)` with `grad` having the same shape as `t`.
+    #[pyo3(signature = (t))]
+    fn value_grad<'py>(
+        &self,
+        py: Python<'py>,
+        t: PyReadonlyArray2<'py, f64>,
+    ) -> PyResult<(f64, Py<PyArray2<f64>>)> {
+        let view = t.as_array();
+        let (n_rows, latent_dim) = view.dim();
+        if n_rows as i64 != self.n_eff {
+            return Err(PyValueError::new_err(format!(
+                "IvaeRidgeMeanGauge.value_grad: t first dim {n_rows} must match n_eff={}",
+                self.n_eff
+            )));
+        }
+        if latent_dim == 0 {
+            return Err(PyValueError::new_err(
+                "IvaeRidgeMeanGauge.value_grad: t must have latent_dim > 0",
+            ));
+        }
+        let aux_bound = aux_conditional_prior_float_array(py, self.aux.bind(py))?;
+        let aux_array = aux_bound.extract::<PyReadonlyArray2<'_, f64>>()?;
+        let aux_owned: Array2<f64> = aux_array.as_array().to_owned();
+        let slice = PsiSlice::full(n_rows * latent_dim, Some(latent_dim));
+        let penalty = IvaeRidgeMeanGaugePenalty::new(
+            slice,
+            aux_owned,
+            self.ridge_eps,
+            self.weight,
+            n_rows,
+            false,
+        )
+        .map_err(py_value_error)?;
+        let flat: Array1<f64> = view.iter().copied().collect();
+        let rho = Array1::<f64>::zeros(0);
+        let value = penalty.value(flat.view(), rho.view());
+        let grad_flat = penalty.grad_target(flat.view(), rho.view());
+        let grad = grad_flat
+            .into_shape_with_order((n_rows, latent_dim))
+            .map_err(|err| {
+                py_value_error(format!(
+                    "IvaeRidgeMeanGauge.value_grad: gradient reshape failed: {err}"
+                ))
+            })?;
+        Ok((value, grad.into_pyarray(py).unbind()))
+    }
 }
 
 fn validate_ivae_ridge_mean_gauge_aux(
@@ -18656,6 +18778,47 @@ impl MechanismSparsityPenalty {
             "MechanismSparsityPenalty(target={target_repr}, feature_groups={:?}, weight={}, smoothing_eps={}, n_eff={}, learnable={learnable}, weight_schedule={schedule_repr})",
             self.feature_groups, self.weight, self.smoothing_eps, self.n_eff
         ))
+    }
+
+    /// Evaluate the group-lasso mechanism-sparsity penalty value and gradient
+    /// at decoder weight matrix `t` of shape `(d_latent, p_features)`.
+    /// Returns `(value, grad)` with `grad` having the same shape as `t`.
+    #[pyo3(signature = (t))]
+    fn value_grad<'py>(
+        &self,
+        py: Python<'py>,
+        t: PyReadonlyArray2<'py, f64>,
+    ) -> PyResult<(f64, Py<PyArray2<f64>>)> {
+        let view = t.as_array();
+        let (d_latent, p_features) = view.dim();
+        if d_latent == 0 || p_features == 0 {
+            return Err(PyValueError::new_err(
+                "MechanismSparsityPenalty.value_grad: t must have non-zero dimensions",
+            ));
+        }
+        let total = d_latent * p_features;
+        let slice = PsiSlice::full(total, Some(d_latent));
+        let penalty = CoreMechanismSparsityPenalty::new(
+            slice,
+            self.feature_groups.clone(),
+            self.weight,
+            self.smoothing_eps,
+            self.n_eff,
+            false,
+        )
+        .map_err(py_value_error)?;
+        let flat: Array1<f64> = view.iter().copied().collect();
+        let rho = Array1::<f64>::zeros(0);
+        let value = penalty.value(flat.view(), rho.view());
+        let grad_flat = penalty.grad_target(flat.view(), rho.view());
+        let grad = grad_flat
+            .into_shape_with_order((d_latent, p_features))
+            .map_err(|err| {
+                py_value_error(format!(
+                    "MechanismSparsityPenalty.value_grad: gradient reshape failed: {err}"
+                ))
+            })?;
+        Ok((value, grad.into_pyarray(py).unbind()))
     }
 }
 
@@ -19029,6 +19192,62 @@ impl AuxConditionalPriorPenalty {
                 None => "None".to_string(),
             }
         ))
+    }
+
+    /// Evaluate the fixed-precomputed row-precision prior value and gradient
+    /// at latent block `t` of shape `(n_eff, latent_dim)`. Returns
+    /// `(value, grad)` with `grad` having the same shape as `t`.
+    #[pyo3(signature = (t))]
+    fn value_grad<'py>(
+        &self,
+        py: Python<'py>,
+        t: PyReadonlyArray2<'py, f64>,
+    ) -> PyResult<(f64, Py<PyArray2<f64>>)> {
+        let view = t.as_array();
+        let (n_rows, latent_dim) = view.dim();
+        if n_rows as i64 != self.n_eff {
+            return Err(PyValueError::new_err(format!(
+                "AuxConditionalPriorPenalty.value_grad: t first dim {n_rows} must match n_eff={}",
+                self.n_eff
+            )));
+        }
+        if latent_dim == 0 {
+            return Err(PyValueError::new_err(
+                "AuxConditionalPriorPenalty.value_grad: t must have latent_dim > 0",
+            ));
+        }
+        let lambda_array = self
+            .lambda_per_row
+            .bind(py)
+            .extract::<PyReadonlyArray3<'_, f64>>()?;
+        let lambda_owned: Array3<f64> = lambda_array.as_array().to_owned();
+        let slice = PsiSlice::full(n_rows * latent_dim, Some(latent_dim));
+        let n_eff_usize = usize::try_from(self.n_eff).map_err(|_| {
+            py_value_error(format!(
+                "AuxConditionalPriorPenalty.value_grad: n_eff={} does not fit in usize",
+                self.n_eff
+            ))
+        })?;
+        let penalty = RowPrecisionPriorPenalty::new(
+            slice,
+            lambda_owned,
+            self.weight,
+            n_eff_usize,
+            false,
+        )
+        .map_err(py_value_error)?;
+        let flat: Array1<f64> = view.iter().copied().collect();
+        let rho = Array1::<f64>::zeros(0);
+        let value = penalty.value(flat.view(), rho.view());
+        let grad_flat = penalty.grad_target(flat.view(), rho.view());
+        let grad = grad_flat
+            .into_shape_with_order((n_rows, latent_dim))
+            .map_err(|err| {
+                py_value_error(format!(
+                    "AuxConditionalPriorPenalty.value_grad: gradient reshape failed: {err}"
+                ))
+            })?;
+        Ok((value, grad.into_pyarray(py).unbind()))
     }
 }
 
