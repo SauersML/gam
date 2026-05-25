@@ -110,21 +110,6 @@ gamfit.fit(df, "y ~ cyclic(hour, period_start=0, period_end=24)")
 gamfit.fit(df, "y ~ s(theta, periodic=true, period=2*pi)")
 ```
 
-## Tensor product with a periodic axis
-
-```python
-# Cylinder: theta wraps, h is open.
-gamfit.fit(df, "y ~ te(theta, h, periodic=[0], period=[2*pi, None])")
-
-# Calendar surface: day-of-week × hour-of-day, both periodic.
-gamfit.fit(df,
-    "y ~ te(dow, hour, bc=['periodic','periodic'],"
-    "       periods=[7, 24], origins=[0, 0])")
-
-# Torus: both axes periodic.
-gamfit.fit(df, "y ~ te(u, v, periodic=[0,1], period=[2*pi, 2*pi])")
-```
-
 ## Intrinsic sphere smooth (lat / lon)
 
 ```python
@@ -134,8 +119,8 @@ gamfit.fit(df, "y ~ sphere(lat, lon, radians=true)")
 # Spherical harmonics; max_degree=L gives basis dim L(L+2).
 gamfit.fit(df, "y ~ sphere(lat, lon, method=harmonic, max_degree=8, radians=true)")
 
-# mgcv-style alias.
-gamfit.fit(df, "y ~ s(lat, lon, bs=sos)")
+# mgcv-style pseudo-spline kernel.
+gamfit.fit(df, "y ~ s(lat, lon, bs=sos, kernel=sos)")
 ```
 
 ## Manifold-valued response (simplex / sphere)
@@ -221,7 +206,7 @@ pred = model.predict(test_df)
 
 S = pred.survival_at([1, 5, 10, 20])      # (n_rows, 4)
 H = pred.cumulative_hazard_at([10])       # (n_rows, 1)
-F = pred.failure_at([10])                 # 1 - S
+F = 1.0 - pred.survival_at([10])          # (n_rows, 1)
 ```
 
 ## Stream survival predictions to CSV
@@ -310,7 +295,7 @@ bands = posterior.predict(test, level=0.95)
 import numpy as np
 
 posterior = model.sample(train, seed=42)
-beta_t = posterior["beta_treatment"]      # (n_draws,)
+beta_t = posterior["beta_1"]              # (n_draws,)
 or_draws = np.exp(beta_t)
 print(f"OR = {or_draws.mean():.2f} "
       f"(95% CI {np.quantile(or_draws, 0.025):.2f}–"
