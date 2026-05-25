@@ -2666,6 +2666,189 @@ mod tests {
             array![[0.0, -1.0, 2.0], [3.5, 0.25, -0.75]],
             1.0e-6,
         );
+
+        // Torus T^2 with H=3 → 49-column tensor product.
+        let torus_coords = array![[0.1, 0.7], [0.42, 0.0], [0.95, 0.33], [0.5, 0.5]];
+        assert_jacobian_matches_central_difference(
+            &TorusHarmonicEvaluator::new(2, 3).unwrap(),
+            torus_coords.clone(),
+            1.0e-6,
+        );
+        let (torus_phi, torus_jet) = TorusHarmonicEvaluator::new(2, 3)
+            .unwrap()
+            .evaluate(torus_coords.view())
+            .unwrap();
+        assert_eq!(torus_phi.dim(), (torus_coords.nrows(), 49));
+        assert_eq!(torus_jet.dim(), (torus_coords.nrows(), 49, 2));
+        for row in 0..torus_coords.nrows() {
+            // Column 0 = product of the two constant axis terms = 1.
+            assert!((torus_phi[[row, 0]] - 1.0).abs() <= 1.0e-12);
+            assert!(torus_jet[[row, 0, 0]].abs() <= 1.0e-12);
+            assert!(torus_jet[[row, 0, 1]].abs() <= 1.0e-12);
+        }
+    }
+
+    /// Torus T^2 fit on synthetic data with a known two-frequency signal.
+    /// Drives a single torus atom through the [`SaeManifoldTerm`] Newton loop
+    /// and checks that the in-sample reconstruction R² clears 0.5.
+    #[test]
+    fn sae_torus_atom_recovers_two_frequency_synthetic() {
+        let n = 96usize;
+        let p = 4usize;
+        let h = 3usize;
+        let d = 2usize;
+        let evaluator = TorusHarmonicEvaluator::new(d, h).unwrap();
+        let m = evaluator.basis_size();
+        // True coords on T^2 (phase in [0, 1)).
+        let mut true_coords = Array2::<f64>::zeros((n, d));
+        for i in 0..n {
+            true_coords[[i, 0]] = ((i as f64) * 0.137).rem_euclid(1.0);
+            true_coords[[i, 1]] = ((i as f64) * 0.241 + 0.13).rem_euclid(1.0);
+        }
+        // Synthetic target: a low-frequency periodic signal on T^2 mixed
+        // linearly into a p-dim ambient.
+        let mut z = Array2::<f64>::zeros((n, p));
+        for i in 0..n {
+            let t1 = 2.0 * std::f64::consts::PI * true_coords[[i, 0]];
+            let t2 = 2.0 * std::f64::consts::PI * true_coords[[i, 1]];
+            z[[i, 0]] = t1.sin() + 0.3 * t2.cos();
+            z[[i, 1]] = t1.cos() + 0.2 * (t1 + t2).sin();
+            z[[i, 2]] = t2.sin();
+            z[[i, 3]] = 0.5 * (t1 - t2).cos();
+        }
+        let sst: f64 = z.iter().map(|v| v * v).sum::<f64>();
+        // Initialise from the true coords (this test exercises basis correctness
+        // and decoder fit, not coordinate identification on T^2).
+        let (phi0, jet0) = evaluator.evaluate(true_coords.view()).unwrap();
+        // Penalty: identity-on-non-constant + tiny floor on constant.
+        let mut penalty = Array2::<f64>::eye(m);
+        penalty *= 1.0e-4;
+        let atom = SaeManifoldAtom::new(
+            "torus_atom",
+            SaeAtomBasisKind::Torus,
+            d,
+            phi0,
+            jet0,
+            Array2::<f64>::zeros((m, p)),
+            penalty,
+        )
+        .unwrap()
+        .with_basis_evaluator(Arc::new(TorusHarmonicEvaluator::new(d, h).unwrap()));
+
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            Array2::<f64>::zeros((n, 1)),
+            vec![true_coords],
+            vec![LatentManifold::Product(vec![
+                LatentManifold::Circle,
+                LatentManifold::Circle,
+            ])],
+            AssignmentMode::softmax(0.5),
+        )
+        .unwrap();
+        let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
+        let mut rho = SaeManifoldRho::new(0.0, -4.0, vec![Array1::<f64>::zeros(1)]);
+        let ridge = 1.0e-6;
+        for _ in 0..10 {
+            let loss = term
+                .run_joint_fit_arrow_schur(z.view(), &mut rho, None, 1, 1.0, ridge, ridge)
+                .unwrap();
+            if !loss.total().is_finite() {
+                break;
+            }
+        }
+        let fitted = term.fitted();
+        assert_eq!(fitted.dim(), (n, p));
+        let mut sse = 0.0_f64;
+        for ((row, col), v) in fitted.indexed_iter() {
+            let r = v - z[[row, col]];
+            sse += r * r;
+        }
+        let r2 = 1.0 - sse / sst.max(1.0e-12);
+        assert!(
+            r2 >= 0.5,
+            "torus atom R² too low: {r2:.4} (sst={sst:.4}, sse={sse:.4})"
+        );
+    }
+
+    /// Sphere S² fit on a synthetic spherical signal. Drives a single sphere
+    /// atom through the [`SaeManifoldTerm`] Newton loop and checks in-sample
+    /// R² ≥ 0.5.
+    #[test]
+    fn sae_sphere_atom_recovers_synthetic_signal() {
+        let n = 96usize;
+        let p = 3usize;
+        let d = 2usize;
+        // True (lat, lon) coords.
+        let mut true_coords = Array2::<f64>::zeros((n, d));
+        for i in 0..n {
+            let t = (i as f64) / (n as f64);
+            true_coords[[i, 0]] = -0.5 + 1.0 * t; // lat in [-0.5, 0.5]
+            true_coords[[i, 1]] = -std::f64::consts::PI + 2.0 * std::f64::consts::PI * t;
+        }
+        let mut z = Array2::<f64>::zeros((n, p));
+        for i in 0..n {
+            let lat = true_coords[[i, 0]];
+            let lon = true_coords[[i, 1]];
+            let x = lat.cos() * lon.cos();
+            let y = lat.cos() * lon.sin();
+            let zc = lat.sin();
+            z[[i, 0]] = x;
+            z[[i, 1]] = y;
+            z[[i, 2]] = zc;
+        }
+        let sst: f64 = z.iter().map(|v| v * v).sum::<f64>();
+        let (phi0, jet0) = SphereChartEvaluator.evaluate(true_coords.view()).unwrap();
+        let m = phi0.ncols();
+        let mut penalty = Array2::<f64>::eye(m);
+        penalty *= 1.0e-4;
+        let atom = SaeManifoldAtom::new(
+            "sphere_atom",
+            SaeAtomBasisKind::Sphere,
+            d,
+            phi0,
+            jet0,
+            Array2::<f64>::zeros((m, p)),
+            penalty,
+        )
+        .unwrap()
+        .with_basis_evaluator(Arc::new(SphereChartEvaluator));
+
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            Array2::<f64>::zeros((n, 1)),
+            vec![true_coords],
+            vec![LatentManifold::Product(vec![
+                LatentManifold::Interval {
+                    lo: -std::f64::consts::FRAC_PI_2,
+                    hi: std::f64::consts::FRAC_PI_2,
+                },
+                LatentManifold::Circle,
+            ])],
+            AssignmentMode::softmax(0.5),
+        )
+        .unwrap();
+        let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
+        let mut rho = SaeManifoldRho::new(0.0, -4.0, vec![Array1::<f64>::zeros(1)]);
+        let ridge = 1.0e-6;
+        for _ in 0..10 {
+            let loss = term
+                .run_joint_fit_arrow_schur(z.view(), &mut rho, None, 1, 1.0, ridge, ridge)
+                .unwrap();
+            if !loss.total().is_finite() {
+                break;
+            }
+        }
+        let fitted = term.fitted();
+        assert_eq!(fitted.dim(), (n, p));
+        let mut sse = 0.0_f64;
+        for ((row, col), v) in fitted.indexed_iter() {
+            let r = v - z[[row, col]];
+            sse += r * r;
+        }
+        let r2 = 1.0 - sse / sst.max(1.0e-12);
+        assert!(
+            r2 >= 0.5,
+            "sphere atom R² too low: {r2:.4} (sst={sst:.4}, sse={sse:.4})"
+        );
     }
 
     /// Mirror of the Python `test_sae_manifold_softmax_dispatch` shape: drive a
