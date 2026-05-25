@@ -125,42 +125,6 @@ class PairedPosteriorSamples:
     def n_draws(self) -> int:
         return self.target.n_draws
 
-    def cumulative_incidence(
-        self,
-        new_data: Any,
-        times: Any,
-        *,
-        level: float = 0.95,
-    ) -> CumulativeIncidenceDraws:
-        """Target-cause CIF draws using paired target/competing rows."""
-        import numpy as np
-
-        from ._binding import rust_module
-        from ._exceptions import map_exception
-        from ._tables import normalize_table
-
-        if not self.target._model_bytes or not self.competing._model_bytes:
-            raise RuntimeError(
-                "PairedPosteriorSamples has no model context; cumulative_incidence "
-                "requires samples returned by Model.sample_paired(...)."
-            )
-        headers, rows, _ = normalize_table(new_data)
-        times_arr = np.asarray(times, dtype=float).reshape(-1)
-        payload = {"times": times_arr.tolist(), "level": float(level)}
-        try:
-            raw = rust_module().paired_cumulative_incidence_table(
-                self.target._model_bytes,
-                self.competing._model_bytes,
-                np.asarray(self.target.samples, dtype=float),
-                np.asarray(self.competing.samples, dtype=float),
-                headers,
-                rows,
-                json.dumps(payload),
-            )
-        except Exception as exc:
-            raise map_exception(exc) from exc
-        return CumulativeIncidenceDraws.from_ffi_payload(json.loads(raw))
-
     def __repr__(self) -> str:
         return (
             f"PairedPosteriorSamples(n_draws={self.n_draws}, "
