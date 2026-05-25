@@ -515,6 +515,7 @@ fn ift_joint_mode_response_caches()
 }
 
 static IFT_LATEST_OUTER_THETA: OnceLock<Mutex<Option<Array1<f64>>>> = OnceLock::new();
+static IFT_LATEST_OUTER_RHO_UPPER_BOUNDS: OnceLock<Mutex<Option<Array1<f64>>>> = OnceLock::new();
 
 pub(crate) fn record_current_outer_theta_for_ift(theta: &Array1<f64>) {
     let value = if theta.is_empty() || theta.iter().any(|v| !v.is_finite()) {
@@ -526,6 +527,26 @@ pub(crate) fn record_current_outer_theta_for_ift(theta: &Array1<f64>) {
         .get_or_init(|| Mutex::new(None))
         .lock()
         .unwrap() = value;
+}
+
+pub(crate) fn record_current_outer_rho_upper_bounds_for_ift(upper: &Array1<f64>) {
+    let value = if upper.is_empty() || upper.iter().any(|v| !v.is_finite()) {
+        None
+    } else {
+        Some(upper.clone())
+    };
+    *IFT_LATEST_OUTER_RHO_UPPER_BOUNDS
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap() = value;
+}
+
+pub(crate) fn latest_outer_rho_upper_bounds_for_ift() -> Option<Array1<f64>> {
+    IFT_LATEST_OUTER_RHO_UPPER_BOUNDS
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap()
+        .clone()
 }
 
 fn latest_outer_theta_for_ift() -> Option<Array1<f64>> {
@@ -6833,8 +6854,21 @@ fn predict_warm_start_beta_ift_inner_with_outcome(
     // as the directions we keep, and a clipped predictor is harder to
     // reason about than a clean fallback.
     let mut max_abs_drho = 0.0_f64;
+    let upper_bounds = latest_outer_rho_upper_bounds_for_ift();
+    let upper_active = |idx: usize| -> bool {
+        let upper = upper_bounds
+            .as_ref()
+            .and_then(|bounds| bounds.get(idx))
+            .copied()
+            .unwrap_or(RHO_BOUND);
+        upper.is_finite() && cache.rho[idx] >= upper - 1.0e-8
+    };
+
     let drho: Array1<f64> = (0..k)
         .map(|i| {
+            if upper_active(i) {
+                return 0.0;
+            }
             let d = new_rho[i] - cache.rho[i];
             if !d.is_finite() {
                 return f64::INFINITY;
@@ -7078,8 +7112,21 @@ fn predict_warm_start_beta_ift_from_mode_response_cols(
     }
 
     let mut max_abs_drho = 0.0_f64;
+    let upper_bounds = latest_outer_rho_upper_bounds_for_ift();
+    let upper_active = |idx: usize| -> bool {
+        let upper = upper_bounds
+            .as_ref()
+            .and_then(|bounds| bounds.get(idx))
+            .copied()
+            .unwrap_or(RHO_BOUND);
+        upper.is_finite() && cache.rho[idx] >= upper - 1.0e-8
+    };
+
     let drho: Array1<f64> = (0..k)
         .map(|i| {
+            if upper_active(i) {
+                return 0.0;
+            }
             let d = new_rho[i] - cache.rho[i];
             if !d.is_finite() {
                 return f64::INFINITY;

@@ -614,6 +614,21 @@ impl CandidateEvaluation {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PirlsAcceptedStateCacheKey {
+    curvature: HessianCurvatureKind,
+    beta_bits: Vec<u64>,
+}
+
+impl PirlsAcceptedStateCacheKey {
+    fn new(beta: &Coefficients, curvature: HessianCurvatureKind) -> Self {
+        Self {
+            curvature,
+            beta_bits: beta.as_ref().iter().map(|value| value.to_bits()).collect(),
+        }
+    }
+}
+
 /// Uncertainty inputs for integrated (GHQ) IRLS updates.
 #[derive(Clone, Copy)]
 pub(crate) struct IntegratedWorkingInput<'a> {
@@ -10071,8 +10086,10 @@ fn supports_observed_hessian_curvature_for_likelihood(
     likelihood: &GlmLikelihoodSpec,
     inverse_link: &InverseLink,
 ) -> bool {
-    assert!(std::mem::size_of_val(inverse_link) > 0);
     let spec = &likelihood.spec;
+    if matches!(spec.response, ResponseFamily::NegativeBinomial { .. }) {
+        return matches!(inverse_link, InverseLink::Standard(LinkFunction::Log));
+    }
     if matches!(spec.response, ResponseFamily::Gamma) {
         return true;
     }
@@ -12370,6 +12387,44 @@ mod tests {
             assert_relative_eq!(w_obs[i], expected_w, epsilon = 1e-12, max_relative = 1e-12);
             assert_relative_eq!(c_obs[i], -expected_w, epsilon = 1e-12, max_relative = 1e-12);
             assert_relative_eq!(d_obs[i], expected_w, epsilon = 1e-12, max_relative = 1e-12);
+        }
+    }
+
+    #[test]
+    fn negative_binomial_log_observed_curvature_matches_size_theta_closed_form() {
+        assert!(file!().ends_with(".rs"));
+        let theta = 2.5;
+        let eta = array![0.2, -0.4, 1.1];
+        let mu = eta.mapv(f64::exp);
+        let y = array![0.0, 3.0, 8.0];
+        let w = array![2.0, 0.5, 1.25];
+        let fisher = Array1::from_iter(
+            mu.iter()
+                .zip(w.iter())
+                .map(|(&mu_i, &w_i)| w_i * theta * mu_i / (theta + mu_i)),
+        );
+
+        let (w_obs, c_obs, d_obs) = compute_observed_hessian_curvature_arrays(
+            &GlmLikelihoodSpec::canonical(LikelihoodSpec::negative_binomial_log(theta)),
+            &InverseLink::Standard(LinkFunction::Log),
+            &eta,
+            y.view(),
+            &fisher,
+            w.view(),
+        )
+        .expect("negative-binomial-log observed curvature should evaluate");
+
+        for i in 0..eta.len() {
+            let denom = theta + mu[i];
+            let scale = w[i] * theta * (theta + y[i]);
+            let expected_w = scale * mu[i] / (denom * denom);
+            let expected_c = scale * mu[i] * (theta - mu[i]) / (denom * denom * denom);
+            let expected_d =
+                scale * mu[i] * (theta * theta - 4.0 * theta * mu[i] + mu[i] * mu[i])
+                    / (denom * denom * denom * denom);
+            assert_relative_eq!(w_obs[i], expected_w, epsilon = 1e-12, max_relative = 1e-12);
+            assert_relative_eq!(c_obs[i], expected_c, epsilon = 1e-12, max_relative = 1e-12);
+            assert_relative_eq!(d_obs[i], expected_d, epsilon = 1e-12, max_relative = 1e-12);
         }
     }
 

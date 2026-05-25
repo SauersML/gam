@@ -36,6 +36,9 @@ use crate::terms::analytic_penalties::{
 };
 use crate::terms::latent_coord::{LatentCoordValues, LatentIdMode, LatentManifold};
 
+const SAE_MANIFOLD_ARMIJO_C1: f64 = 1.0e-4;
+const SAE_MANIFOLD_MAX_LINESEARCH_HALVINGS: usize = 12;
+
 /// Decay law for deterministic Gumbel/concrete assignment temperature.
 #[derive(Debug, Clone)]
 pub enum ScheduleKind {
@@ -1655,10 +1658,57 @@ impl SaeManifoldTerm {
         for _ in 0..max_iter {
             self.advance_temperature_schedule()?;
             self.update_ard_reml(rho)?;
-            let (delta_ext_coord, delta_beta) = self
-                .solve_newton_step(target, rho, analytic_penalties, ridge_ext_coord, ridge_beta)
+            let pre_step_loss = self.loss(target, rho)?;
+            let pre_step_total = pre_step_loss.total();
+            let sys = self
+                .assemble_arrow_schur(target, rho, analytic_penalties)
                 .map_err(|err| format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}"))?;
-            self.apply_newton_step(delta_ext_coord.view(), delta_beta.view(), step_size)?;
+            let (delta_ext_coord, delta_beta) = sys
+                .solve(ridge_ext_coord, ridge_beta)
+                .map_err(|err| format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}"))?;
+            let directional_decrease = sae_manifold_newton_directional_decrease(
+                &sys,
+                delta_ext_coord.view(),
+                delta_beta.view(),
+            );
+            let snapshot = self.clone();
+            if !(pre_step_total.is_finite()
+                && directional_decrease.is_finite()
+                && directional_decrease > 0.0)
+            {
+                *self = snapshot;
+                break;
+            }
+
+            let mut trial_step_size = step_size;
+            let mut accepted = false;
+            for _ in 0..=SAE_MANIFOLD_MAX_LINESEARCH_HALVINGS {
+                *self = snapshot.clone();
+                let trial_result = self
+                    .apply_newton_step(
+                        delta_ext_coord.view(),
+                        delta_beta.view(),
+                        trial_step_size,
+                    )
+                    .and_then(|()| self.loss(target, rho));
+                match trial_result {
+                    Ok(post_step_loss) => {
+                        let post_step_total = post_step_loss.total();
+                        let armijo_bound = pre_step_total
+                            - SAE_MANIFOLD_ARMIJO_C1 * trial_step_size * directional_decrease;
+                        if post_step_total.is_finite() && post_step_total <= armijo_bound {
+                            accepted = true;
+                            break;
+                        }
+                    }
+                    Err(_) => {}
+                }
+                trial_step_size *= 0.5;
+            }
+            if !accepted {
+                *self = snapshot;
+                break;
+            }
         }
         self.update_ard_reml(rho)?;
         self.loss(target, rho)

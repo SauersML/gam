@@ -90,8 +90,7 @@ pub fn compare_reml_fits(mut candidates: Vec<RemlCandidate>) -> Result<RemlCompa
 
     let evidence_summary = if candidates.len() >= 2 {
         let runner_up = &candidates[1];
-        let runner_up_log_bayes_factor_vs_best = runner_up.score - best_score;
-        let best_log_bayes_factor_vs_runner_up = -runner_up_log_bayes_factor_vs_best;
+        let best_log_bayes_factor_vs_runner_up = best_score - runner_up.score;
         format!(
             "{} wins by Bayes factor {} over {}",
             winner,
@@ -148,4 +147,38 @@ pub fn format_three_significant(value: f64) -> String {
         }
     }
     formatted
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RemlCandidate, compare_reml_fits};
+
+    #[test]
+    fn compares_log_evidence_with_bayes_factor_for_higher_score() {
+        let comparison = compare_reml_fits(vec![
+            RemlCandidate {
+                index: 0,
+                name: "lower".to_string(),
+                score: 2.0,
+                edf: None,
+            },
+            RemlCandidate {
+                index: 1,
+                name: "higher".to_string(),
+                score: 5.0,
+                edf: Some(4.0),
+            },
+        ])
+        .expect("finite REML candidates should compare");
+
+        assert_eq!(comparison.winner, "higher");
+        assert_eq!(comparison.ranking[0].delta, 0.0);
+        assert_eq!(comparison.ranking[0].bayes_factor, 1.0);
+        assert_eq!(comparison.ranking[1].delta, 3.0);
+        assert!((comparison.ranking[1].bayes_factor - 3.0_f64.exp()).abs() < 1e-12);
+        assert_eq!(comparison.score_table[1].delta_reml, 3.0);
+        assert!(
+            (comparison.score_table[1].bayes_factor_best_over_model - 3.0_f64.exp()).abs() < 1e-12
+        );
+    }
 }
