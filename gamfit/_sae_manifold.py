@@ -512,11 +512,12 @@ def _oos_reconstruct(model: ManifoldSAE, x_new: np.ndarray) -> np.ndarray:
     tau = 0.5
 
     last_fitted: np.ndarray | None = None
-    for _ in range(max_iter_total):
+    for iter_idx in range(max_iter_total):
         basis_values, basis_jacobian = _build_basis_stack(
             atom_specs, initial_coords, dims, m_max, d_max
         )
-        # Freeze the decoder going in.
+        # Re-clamp the decoder to the trained values so the Newton step
+        # adjusts only the latent coords (and assignments).
         decoder_coefficients[...] = frozen_decoder
         result = rust.sae_manifold_fit(
             np.ascontiguousarray(x_new),
@@ -553,31 +554,7 @@ def _oos_reconstruct(model: ManifoldSAE, x_new: np.ndarray) -> np.ndarray:
 
     if last_fitted is None:
         raise RuntimeError("OOS reconstruct produced no Newton step")
-
-    # Final pass: reconstruct using frozen decoder + inferred coords to
-    # eliminate any decoder drift accumulated inside the Rust step (the
-    # Newton solver couples beta with t; we re-overwrote decoder above but
-    # the *returned* fitted uses the post-step decoder).
-    basis_values, _basis_jacobian = _build_basis_stack(
-        atom_specs, initial_coords, dims, m_max, d_max
-    )
-    if model.assignment in {"ibp", "ibp_map"}:
-        assignments = 1.0 / (1.0 + np.exp(-initial_logits))
-    elif assignment_kind == "softmax":
-        max_logits = initial_logits.max(axis=1, keepdims=True)
-        weights = np.exp((initial_logits - max_logits) / max(tau, 1.0e-12))
-        assignments = weights / np.maximum(weights.sum(axis=1, keepdims=True), 1.0e-12)
-    else:
-        assignments = np.maximum(initial_logits, 0.0)
-    if k_atoms == 1:
-        assignments = np.ones((n_new, 1), dtype=float)
-    fitted = np.zeros((n_new, p_out), dtype=float)
-    for atom_idx in range(k_atoms):
-        m = basis_sizes[atom_idx]
-        phi = basis_values[atom_idx, :, :m]
-        b = frozen_decoder[atom_idx, :m, :]
-        fitted += assignments[:, atom_idx : atom_idx + 1] * (phi @ b)
-    return fitted
+    return last_fitted
 
 
 def _wrap_payload(
