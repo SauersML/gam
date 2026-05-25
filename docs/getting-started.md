@@ -152,10 +152,11 @@ Defaults for `samples`, `warmup`, and `chains` are derived from the
 coefficient count. See [posterior-sampling.md](posterior-sampling.md)
 for the exact rule and how to override.
 
-NUTS is used where possible. Gaussian Laplace is the fallback for model
-classes without an exact NUTS path (location-scale survival, latent
-survival, location-scale GLMs, transformation-normal, Bernoulli
-marginal-slope).
+NUTS is used for most exact sampling paths; Bernoulli-logit standard
+GLMs use the Polya-Gamma Gibbs path. Gaussian Laplace is used for
+classes without an exact NUTS path (latent, latent-binary, and
+location-scale survival, location-scale GLMs, transformation-normal,
+Bernoulli marginal-slope).
 
 ## Next
 
