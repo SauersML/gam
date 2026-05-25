@@ -20611,11 +20611,12 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     // returns `CustomFamilyError::DimensionMismatch` carrying the
     // audit summary. Per the panic-vs-Err contract: never panic
     // mid-construction.
-    let audit = crate::solver::identifiability_audit::audit_identifiability(specs).map_err(
-        |reason| CustomFamilyError::DimensionMismatch {
-            reason: format!("pre-fit identifiability audit failed: {reason}"),
-        },
-    )?;
+    let audit =
+        crate::solver::identifiability_audit::audit_identifiability(specs).map_err(|reason| {
+            CustomFamilyError::DimensionMismatch {
+                reason: format!("pre-fit identifiability audit failed: {reason}"),
+            }
+        })?;
     if audit.fatal {
         return Err(CustomFamilyError::DimensionMismatch {
             reason: format!(

@@ -4995,11 +4995,12 @@ impl PenaltySubspaceTrace {
     /// `1/σ_min(H_active_normal)` — which on biobank-scale survival
     /// marginal-slope is ~10¹² and propagates into outer gradients of
     /// magnitude 10¹⁴, suppressed by the envelope tripwire downstream and
-    /// killing every seed before the fit can take a step. The projected
-    /// pseudo-inverse drops the null-space contribution by construction,
-    /// returning the gradient that lives on the constrained manifold —
-    /// which is what LAML on the projected-Hessian cost demands for
-    /// derivative-consistency with the projected `log|U_Sᵀ H U_S|` term.
+    /// killing every seed before the fit can take a step. This operator may
+    /// only drop components that the inner KKT certificate has already made
+    /// negligible; `ProjectedKktResidual::projected_into_reduced_range` enforces
+    /// that contract before the IFT correction uses this pseudo-inverse. With
+    /// that guard, the returned gradient lives on the constrained manifold,
+    /// matching the projected `log|U_Sᵀ H U_S|` term.
     ///
     /// Costs `O(p·r + r²)` for the two `U_S`-contractions plus the `r × r`
     /// solve — strictly cheaper than the `O(p²)` full `hop.solve_multi`
@@ -7250,10 +7251,13 @@ pub fn reml_laml_evaluate(
     //                                          in (β* − β̂)).
     //
     // The cost correction strictly vanishes when the inner reached exact
-    // KKT (r = 0).  When the inner exits via the noise-floor certificate
-    // with ‖r‖ > 0 it absorbs the leading error; the gradient and Hessian
-    // corrections below are the exact first and second ρ derivatives of this
-    // same scalar Newton correction under fixed-dispersion LAML.
+    // KKT (r = 0).  When the inner exits with a certified small residual it
+    // absorbs the leading error; the gradient and Hessian corrections below are
+    // the exact first and second ρ derivatives of this same scalar Newton
+    // correction under fixed-dispersion LAML. If a projected-Hessian kernel
+    // would need to drop a residual component larger than the inner KKT
+    // tolerance band, the evaluator rejects the state as a contract violation
+    // instead of manufacturing a range-only certificate.
     //
     // Filter: callers populate `kkt_residual` only on convergent inner paths.
     // The [`ProjectedKktResidual`] newtype lifts the projection invariant into
@@ -17163,16 +17167,37 @@ mod tests {
             u_s: array![[1.0], [0.0]],
             h_proj_inverse: array![[0.25]],
         };
-        let active =
-            ProjectedKktResidual::from_active_projected(array![3.0, 4.0]).with_metadata(1.0e-6, 1);
+        let active = ProjectedKktResidual::from_active_projected(array![3.0, 1.0e-8])
+            .with_metadata(1.0e-6, 1);
 
-        let reduced = active.projected_into_reduced_range(&kernel);
+        let reduced = active
+            .projected_into_reduced_range(&kernel)
+            .expect("dropped residual inside the KKT tolerance may be reduced");
 
         assert_eq!(reduced.subspace(), KktResidualSubspace::ReducedRange);
         assert_relative_eq!(reduced.as_array()[0], 3.0, epsilon = 1e-12);
         assert_relative_eq!(reduced.as_array()[1], 0.0, epsilon = 1e-12);
         assert_eq!(reduced.residual_tol(), Some(1.0e-6));
         assert_eq!(reduced.free_rank(), Some(1));
+    }
+
+    #[test]
+    fn active_projected_kkt_residual_rejects_large_drop_before_projected_ift() {
+        let kernel = PenaltySubspaceTrace {
+            u_s: array![[1.0], [0.0]],
+            h_proj_inverse: array![[0.25]],
+        };
+        let active =
+            ProjectedKktResidual::from_active_projected(array![3.0, 4.0]).with_metadata(1.0e-6, 1);
+
+        let err = active
+            .projected_into_reduced_range(&kernel)
+            .expect_err("large null/range-excluded residual must not be silently dropped");
+
+        assert!(
+            err.contains("unresolved mass outside the reduced Hessian/penalty range"),
+            "unexpected error: {err}"
+        );
     }
 
     /// Build a `PenaltySubspaceTrace` from a full H + U_S pair, using the
