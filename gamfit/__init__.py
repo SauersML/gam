@@ -73,6 +73,7 @@ from ._api import (
     gaussian_weighted_ridge_batch,
     load,
     loads,
+    save,
     mechanism_sparsity_jacobian,
     periodic_spline_curve_basis,
     smoothness_penalty,

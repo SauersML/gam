@@ -528,7 +528,9 @@ struct PredictArgs {
 #[derive(Debug, Clone)]
 struct SurvivalArgs {
     data: PathBuf,
-    entry: String,
+    /// `None` for the right-censored shorthand `Surv(time, event)`; the
+    /// entry vector is synthesized as zeros at materialization time.
+    entry: Option<String>,
     exit: String,
     event: String,
     formula: String,
@@ -997,6 +999,8 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             entry,
             exit,
             event,
+            // `entry == None` = right-censored shorthand `Surv(time, event)`;
+            // entry times are synthesized as zero at materialization time.
             formula: rhs,
             predict_noise: args.predict_noise.clone(),
             survival_likelihood: args.survival_likelihood.clone(),

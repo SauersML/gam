@@ -1283,7 +1283,15 @@ pub fn formula_rhs_text(formula: &str) -> Result<String, String> {
     Ok(parsed.rhs_terms.join(" + "))
 }
 
-pub fn parse_surv_response(lhs: &str) -> Result<Option<(String, String, String)>, FormulaDslError> {
+/// Parsed Surv(...) response specification.
+///
+/// `entry` is `None` for the 2-arg right-censored shorthand
+/// `Surv(time, event)`, which matches the R survival/mgcv default: every
+/// subject has entry time zero. Callers materialize a zero entry column
+/// when this is `None`.
+pub fn parse_surv_response(
+    lhs: &str,
+) -> Result<Option<(Option<String>, String, String)>, FormulaDslError> {
     let trimmed = lhs.trim();
     let call = match parse_function_call(trimmed) {
         Ok(call) => call,
@@ -1301,29 +1309,23 @@ pub fn parse_surv_response(lhs: &str) -> Result<Option<(String, String, String)>
         })
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>();
-    if vars.len() != 3 {
-        // Help users coming from R/mgcv (`Surv(time, status)` 2-arg form):
-        // when they give two columns, name them explicitly in the error so
-        // the fix ("prepend an entry column of zeros") is obvious.
-        if vars.len() == 2 {
-            return Err(FormulaDslError::InvalidArgument {
-                reason: format!(
-                    "Surv(...) needs three columns: Surv(entry, exit, event). \
-                     Got `Surv({}, {})` — if these are (exit, event) from an mgcv-style \
-                     left-truncation-free dataset, add a leading entry-time column of \
-                     zeros and call `Surv(0_entry, {}, {})`.",
-                    vars[0], vars[1], vars[0], vars[1]
-                ),
-            });
-        }
-        return Err(FormulaDslError::InvalidArgument {
+    match vars.len() {
+        // Right-censored shorthand: Surv(time, event) ≡ Surv(0, time, event)
+        // with a synthetic zero entry column. This matches R's
+        // `survival::Surv(time, event)` default for left-truncation-free data.
+        2 => Ok(Some((None, vars[0].clone(), vars[1].clone()))),
+        3 => Ok(Some((
+            Some(vars[0].clone()),
+            vars[1].clone(),
+            vars[2].clone(),
+        ))),
+        n => Err(FormulaDslError::InvalidArgument {
             reason: format!(
-                "Surv(...) expects exactly three columns: Surv(entry, exit, event); got {}",
-                vars.len()
+                "Surv(...) expects either Surv(time, event) (right-censored) or \
+                 Surv(entry, exit, event) (left-truncated); got {n} columns"
             ),
-        });
+        }),
     }
-    Ok(Some((vars[0].clone(), vars[1].clone(), vars[2].clone())))
 }
 
 fn top_level_formula_separator(input: &str) -> Result<Option<usize>, String> {
@@ -1657,11 +1659,11 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
                     prior,
                 });
             }
-            "group" | "re" => {
+            "group" | "re" | "factor" => {
                 if vars.len() != 1 {
                     return Err(FormulaDslError::InvalidArgument {
                         reason: format!(
-                            "group()/re() expects exactly one variable, got '{}': {raw}",
+                            "{name}() expects exactly one variable, got '{}': {raw}",
                             vars.join(",")
                         ),
                     }
@@ -1722,6 +1724,22 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
                         reason: format!("smooth()/s() requires at least one variable: {raw}"),
                     }
                     .into());
+                }
+                // mgcv idiom: `s(g, bs='re')` with a single variable is a
+                // random intercept on the factor `g`. Route it to the
+                // dedicated random-effect machinery (which expects a single
+                // categorical column) rather than to the factor-smooth path
+                // (which requires a numeric companion).
+                let bs_is_re = options
+                    .get("bs")
+                    .or_else(|| options.get("type"))
+                    .map(|v| v.trim().trim_matches(|c| c == '\'' || c == '"').to_ascii_lowercase())
+                    .as_deref()
+                    == Some("re");
+                if bs_is_re && vars.len() == 1 {
+                    return Ok(ParsedTerm::RandomEffect {
+                        name: vars[0].clone(),
+                    });
                 }
                 if matches!(name.as_str(), "cyclic" | "periodic" | "cc" | "cp") {
                     options.insert("type".to_string(), "cyclic".to_string());
@@ -1920,7 +1938,7 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
             }
             _ => {
                 return Err(format!(
-                    "unknown term function `{name}` in '{raw}'. Supported: bounded(), linear(), constrain()/constraint()/box(), nonnegative(), nonpositive(), smooth()/s(), cyclic()/cc()/cp(), thinplate()/thin_plate()/tps(), tensor()/interaction()/te(), fs(), sz(), group()/re(), sphere()/sos()/spherical(), s2(), matern(), duchon(), pca(), logslope()/log_slope(), linkwiggle(), timewiggle(), link(), survmodel()"
+                    "unknown term function `{name}` in '{raw}'. Supported: bounded(), linear(), constrain()/constraint()/box(), nonnegative(), nonpositive(), smooth()/s(), cyclic()/cc()/cp(), thinplate()/thin_plate()/tps(), tensor()/interaction()/te(), fs(), sz(), group()/re()/factor(), sphere()/sos()/spherical(), s2(), matern(), duchon(), pca(), logslope()/log_slope(), linkwiggle(), timewiggle(), link(), survmodel()"
                 ));
             }
         }

@@ -29,7 +29,10 @@
 use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3, ArrayView4, s};
 use std::sync::Arc;
 
-use crate::solver::arrow_schur::{ArrowRowBlock, ArrowSchurError, ArrowSchurSystem};
+use crate::solver::arrow_schur::{
+    ArrowRowBlock, ArrowSchurError, ArrowSchurSystem, DEFAULT_PROXIMAL_INITIAL_RIDGE,
+    DEFAULT_PROXIMAL_MAX_ATTEMPTS, DEFAULT_PROXIMAL_RIDGE_GROWTH,
+};
 use crate::terms::analytic_penalties::{
     ARDPenalty, AnalyticPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry,
     IBPAssignmentPenalty, PenaltyTier, PsiSlice, SoftmaxAssignmentSparsityPenalty,
@@ -1729,9 +1732,61 @@ impl SaeManifoldTerm {
             let sys = self
                 .assemble_arrow_schur(target, rho, analytic_penalties)
                 .map_err(|err| format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}"))?;
-            let (delta_ext_coord, delta_beta) = sys
-                .solve(ridge_ext_coord, ridge_beta)
-                .map_err(|err| format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}"))?;
+            // Inner Newton step with principled LM-style ridge escalation. The
+            // PCA-seed starting state on a small batch (e.g. `predict` on a
+            // strict subset of the training set) can produce a per-row
+            // `H_tt + ridge_t·I` whose Cholesky has a negative pivot, or a
+            // near-singular Schur complement, at the caller's nominal ridges.
+            // Rather than abort, mirror the proximal-correction outer wrapper
+            // and grow both ridges geometrically until the linear system
+            // factors. This is the same LM-trust-region damping the convergent
+            // proximal_correction path applies; we route it through the same
+            // factor-failure error variants so legitimate, non-recoverable
+            // errors (PCG divergence with no factor failure, adaptive-step
+            // exhaustion, …) still surface immediately.
+            let (delta_ext_coord, delta_beta) = {
+                let mut proximal_ridge = 0.0_f64;
+                let mut last_err: Option<ArrowSchurError> = None;
+                let mut step: Option<(Array1<f64>, Array1<f64>)> = None;
+                for attempt in 0..=DEFAULT_PROXIMAL_MAX_ATTEMPTS {
+                    let damped_ridge_t = ridge_ext_coord + proximal_ridge;
+                    let damped_ridge_beta = ridge_beta + proximal_ridge;
+                    match sys.solve(damped_ridge_t, damped_ridge_beta) {
+                        Ok(pair) => {
+                            step = Some(pair);
+                            break;
+                        }
+                        Err(err) => {
+                            let recoverable = matches!(
+                                err,
+                                ArrowSchurError::PerRowFactorFailed { .. }
+                                    | ArrowSchurError::SchurFactorFailed { .. }
+                            );
+                            last_err = Some(err);
+                            if !recoverable {
+                                break;
+                            }
+                            if attempt == DEFAULT_PROXIMAL_MAX_ATTEMPTS {
+                                break;
+                            }
+                            proximal_ridge = if proximal_ridge == 0.0 {
+                                DEFAULT_PROXIMAL_INITIAL_RIDGE
+                            } else {
+                                proximal_ridge * DEFAULT_PROXIMAL_RIDGE_GROWTH
+                            };
+                        }
+                    }
+                }
+                match step {
+                    Some(pair) => pair,
+                    None => {
+                        let err = last_err.expect("escalation loop set last_err on failure");
+                        return Err(format!(
+                            "SaeManifoldTerm::run_joint_fit_arrow_schur: {err}"
+                        ));
+                    }
+                }
+            };
             let directional_decrease = sae_manifold_newton_directional_decrease(
                 &sys,
                 delta_ext_coord.view(),

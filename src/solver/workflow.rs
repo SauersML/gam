@@ -2547,7 +2547,13 @@ pub fn materialize<'a>(
             });
         }
         materialize_survival(
-            &parsed, data, &col_map, config, &entry_col, &exit_col, &event_col,
+            &parsed,
+            data,
+            &col_map,
+            config,
+            entry_col.as_deref(),
+            &exit_col,
+            &event_col,
         )
         .map_err(|reason| WorkflowError::IntegrationFailed { reason })
     } else if config.transformation_normal {
@@ -5060,14 +5066,18 @@ fn materialize_survival<'a>(
     data: &'a Dataset,
     col_map: &HashMap<String, usize>,
     config: &FitConfig,
-    entry_col: &str,
+    entry_col: Option<&str>,
     exit_col: &str,
     event_col: &str,
 ) -> Result<MaterializedModel<'a>, String> {
     let mut inference_notes = Vec::new();
 
-    // Extract columns
-    let entry_idx = resolve_role_col(col_map, entry_col, "entry")?;
+    // Extract columns. `entry_col == None` is the right-censored shorthand
+    // `Surv(time, event)`: every subject enters at time zero, so we
+    // synthesize a constant-zero entry vector instead of resolving a column.
+    let entry_idx = entry_col
+        .map(|name| resolve_role_col(col_map, name, "entry"))
+        .transpose()?;
     let exit_idx = resolve_role_col(col_map, exit_col, "exit")?;
     let event_idx = resolve_role_col(col_map, event_col, "event")?;
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
@@ -5084,7 +5094,8 @@ fn materialize_survival<'a>(
     let pairs: Result<Vec<(f64, f64)>, String> = (0..n)
         .into_par_iter()
         .map(|i| {
-            normalize_survival_time_pair(data.values[[i, entry_idx]], data.values[[i, exit_idx]], i)
+            let entry_val = entry_idx.map_or(0.0, |idx| data.values[[i, idx]]);
+            normalize_survival_time_pair(entry_val, data.values[[i, exit_idx]], i)
         })
         .collect();
     let pairs = pairs?;

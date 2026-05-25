@@ -1,4 +1,5 @@
 use gam::inference::data::EncodedDataset;
+use gam::inference::formula_dsl::parse_link_choice;
 use gam::inference::model::{ColumnKindTag, DataSchema, SchemaColumn};
 use gam::types::{InverseLink, LinkFunction, ResponseFamily};
 use gam::{FitConfig, FitRequest, materialize, resolve_family};
@@ -42,6 +43,43 @@ fn resolve_family_accepts_binomial_logit_with_underscore_alias() {
         InverseLink::Standard(LinkFunction::Logit),
         "binomial_logit should map to the standard logit inverse-link"
     );
+}
+
+#[test]
+fn resolve_family_binomial_with_explicit_link_overrides_default_logit() {
+    // GitHub issue #155: family='binomial' + link='probit'/'cloglog' must be
+    // accepted because the bare 'binomial' family name does not pin a link.
+    let y = array![0.0, 1.0, 1.0, 0.0];
+    for (link_name, expected) in [
+        ("probit", LinkFunction::Probit),
+        ("cloglog", LinkFunction::CLogLog),
+        ("logit", LinkFunction::Logit),
+    ] {
+        let link_choice = parse_link_choice(Some(link_name), false)
+            .expect("link should parse")
+            .expect("link choice should not be None when raw was provided");
+        let resolved = resolve_family(Some("binomial"), None, Some(&link_choice), y.view())
+            .unwrap_or_else(|err| {
+                panic!("binomial + link={link_name} should be accepted, got: {err}")
+            });
+        assert_eq!(resolved.response, ResponseFamily::Binomial);
+        assert_eq!(resolved.link, InverseLink::Standard(expected));
+    }
+}
+
+#[test]
+fn resolve_family_accepts_tweedie() {
+    // GitHub issue #158: family='tweedie' must be a recognized family.
+    let y = array![0.0, 1.0, 2.0, 0.0, 3.5, 0.0];
+    let resolved = resolve_family(Some("tweedie"), None, None, y.view())
+        .expect("tweedie family should be recognized");
+    match resolved.response {
+        ResponseFamily::Tweedie { p } => {
+            assert!(p > 1.0 && p < 2.0, "default tweedie p should lie in (1, 2); got {p}");
+        }
+        other => panic!("expected Tweedie response family, got {other:?}"),
+    }
+    assert_eq!(resolved.link, InverseLink::Standard(LinkFunction::Log));
 }
 
 #[test]
