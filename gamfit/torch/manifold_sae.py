@@ -358,17 +358,26 @@ def _basis_rust(
     if t.dim() != 2:
         raise ValueError(f"_basis_rust expects (N, d), got shape {tuple(t.shape)}")
     apply = cast(Callable[..., torch.Tensor], _BasisWithJetFn.apply)
+    # Circle / sphere: the manifold dictates the basis; user choice is ignored.
     if cfg.atom_manifold == "circle":
         n_harm = max(1, (cfg.n_basis_per_atom - 1) // 2)
         return apply(t, "periodic", json.dumps({"n_harmonics": int(n_harm)}))
     if cfg.atom_manifold == "sphere":
         return apply(t, "sphere", json.dumps({}))
+    # Cylinder / product: the angular column drives the basis; remaining
+    # intrinsic coordinates enter through the amplitude path.
+    if cfg.atom_basis == "bspline":
+        params = {
+            "n_basis": int(cfg.n_basis_per_atom),
+            "degree": 3,
+            "order": int(cfg.basis_order),
+            "periodic": False,
+        }
+        return apply(t[:, :1], "bspline", json.dumps(params))
     if centers is None:
         raise ValueError("Duchon-style manifold requires centers")
     centers_list = to_numpy_f64(centers.reshape(-1, 1)).tolist()
     params = {"centers": centers_list, "m": int(cfg.basis_order)}
-    # Cylinder/product: Rust Duchon is evaluated on the angular column only;
-    # the rest of the intrinsic coordinates enter through the amplitude path.
     return apply(t[:, :1], "duchon", json.dumps(params))
 
 
