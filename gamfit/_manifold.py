@@ -219,6 +219,8 @@ class Sphere(_RustManifold):
         if int(intrinsic_dim) < 1:
             raise ValueError("Sphere.intrinsic_dim must be >= 1")
         self.json = {"kind": "sphere", "intrinsic_dim": int(intrinsic_dim)}
+        self._dim = int(intrinsic_dim)
+        self._ambient_dim = int(intrinsic_dim) + 1
 
     def __repr__(self) -> str:
         return f"Sphere(intrinsic_dim={self.json['intrinsic_dim']})"
@@ -231,6 +233,8 @@ class Torus(_RustManifold):
         if int(dim) < 1:
             raise ValueError("Torus.dim must be >= 1")
         self.json = {"kind": "torus", "d": int(dim)}
+        self._dim = int(dim)
+        self._ambient_dim = int(dim)
 
     def __repr__(self) -> str:
         return f"Torus(dim={self.json['d']})"
@@ -248,6 +252,8 @@ class CylinderManifold(_RustManifold):
             parts.append({"kind": "euclidean", "dim": int(open_dim)})
         self.json = {"kind": "product", "parts": parts}
         self._open = int(open_dim)
+        self._dim = 1 + int(open_dim)
+        self._ambient_dim = 2 + int(open_dim)  # Circle ambient (2) + Euclidean
 
     def __repr__(self) -> str:
         return f"CylinderManifold(open_dim={self._open})"

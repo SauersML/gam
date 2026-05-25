@@ -346,7 +346,7 @@ pub fn tangent_decode_backward(
     let sqrt_negc = require_negative_curvature(cache.curvature)?;
     let k = -cache.curvature;
     let (batch, d) = cache.v.dim();
-    let (n_atoms, _d2) = cache.tangents.dim();
+    let n_atoms = cache.tangents.dim().0;
     if grad_x_hat.dim() != (batch, d) {
         return Err(GeometryError::DimensionMismatch {
             context: "Poincaré tangent_decode_backward grad",
