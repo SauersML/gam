@@ -117,9 +117,7 @@ def test_joint_competing_risks_survival_is_reachable_from_fit() -> None:
     pred = model.predict(prediction_rows()[["entry", "exit", "event", "age"]])
     assert isinstance(pred, gamfit.CompetingRisksPrediction)
     assert pred.endpoint_names == ("cause_1", "cause_2")
-    assert pred.cif.shape[0] == 2
-    assert pred.cif.shape[1] == 3
-    assert pred.cif.shape[2] == pred.times.size
+    assert pred.cif.shape == (2 * 3, pred.times.size)
     assert np.all(np.isfinite(pred.cif))
     assert np.all((pred.cif >= 0.0) & (pred.cif <= 1.0))
     assert np.all((pred.overall_survival >= 0.0) & (pred.overall_survival <= 1.0))
