@@ -218,7 +218,7 @@ fn isotropic_l2_trust_region_starves_well_conditioned_blocks() {
          single scalar rescale `δ *= radius / ‖δ‖₂`. The fix is \
          per-block trust radii (each block's radius updated independently \
          from its own actual/predicted reduction), or a diagonal \
-         preconditioner D = diag(H)^{1/2} so the trust region is \
+         preconditioner D = diag(H)^{{1/2}} so the trust region is \
          ellipsoidal in the scaled metric.",
         pre_time_inf,
         post_time_inf,
