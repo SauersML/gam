@@ -1286,12 +1286,8 @@ mod tests {
         let lambdas = [2.0_f64, 0.0_f64];
         let ridge = 1e-4_f64;
 
-        let pld = PenaltyPseudologdet::from_components(
-            &[s1.clone(), s2.clone()],
-            &lambdas,
-            ridge,
-        )
-        .unwrap();
+        let pld = PenaltyPseudologdet::from_components(&[s1.clone(), s2.clone()], &lambdas, ridge)
+            .unwrap();
 
         assert_eq!(pld.rank(), 1);
         assert!((pld.value() - (8.0 + ridge).ln()).abs() < 1e-12);
@@ -1327,8 +1323,7 @@ mod tests {
         assert!((full.value() - (6.0_f64).ln()).abs() < 1e-12);
 
         let s3 = array![[5.0, 0.0], [0.0, 0.0]];
-        let deficient = PenaltyPseudologdet::from_components(&[s1, s3], &[2.0, 3.0], 0.0)
-            .unwrap();
+        let deficient = PenaltyPseudologdet::from_components(&[s1, s3], &[2.0, 3.0], 0.0).unwrap();
         assert_eq!(deficient.rank(), 1);
         assert!((deficient.value() - (17.0_f64).ln()).abs() < 1e-12);
     }

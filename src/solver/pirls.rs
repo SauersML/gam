@@ -617,14 +617,30 @@ impl CandidateEvaluation {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PirlsAcceptedStateCacheKey {
     curvature: HessianCurvatureKind,
+    firth_bias_reduction: bool,
     beta_bits: Vec<u64>,
+    arrow_latent_bits: Option<Vec<u64>>,
 }
 
 impl PirlsAcceptedStateCacheKey {
-    fn new(beta: &Coefficients, curvature: HessianCurvatureKind) -> Self {
+    fn new(
+        beta: &Coefficients,
+        curvature: HessianCurvatureKind,
+        options: &WorkingModelPirlsOptions,
+    ) -> Self {
+        let arrow_latent_bits = options.arrow_schur.as_ref().map(|arrow_cfg| {
+            arrow_cfg
+                .snapshot_t
+                .as_ref()()
+                .iter()
+                .map(|value| value.to_bits())
+                .collect()
+        });
         Self {
             curvature,
+            firth_bias_reduction: options.firth_bias_reduction,
             beta_bits: beta.as_ref().iter().map(|value| value.to_bits()).collect(),
+            arrow_latent_bits,
         }
     }
 }
@@ -4711,14 +4727,16 @@ where
         // the biobank duchon60 lane (n=320 K, p_eff=42), where it doubled
         // wall-clock per iter on top of the candidate eval that already paid
         // the same cost. Reuse `final_state` only when the cached curvature
-        // kind and exact coefficient bits match what this iter requests; the
-        // Hessian depends on the working weights/linearization point, so
-        // curvature kind alone is not a sufficient freshness predicate.
+        // kind, Firth mode, exact coefficient bits, and any arrow-Schur latent
+        // snapshot bits match what this iter requests; the Hessian depends on
+        // the working weights/linearization point, so curvature kind alone is
+        // not a sufficient freshness predicate.
         // Otherwise (e.g. force_fisher_for_rest just engaged, flipping
         // preferred from Observed → Fisher) fall through to the rebuild path.
         // Iter 1 always rebuilds because no prior accept has populated
         // `final_state`.
-        let requested_cache_key = PirlsAcceptedStateCacheKey::new(&beta, preferred_curvature);
+        let requested_cache_key =
+            PirlsAcceptedStateCacheKey::new(&beta, preferred_curvature, options);
         let cached_state_matches = iter > 1
             && final_state.is_some()
             && final_state_cache_key.as_ref() == Some(&requested_cache_key);
@@ -5398,6 +5416,7 @@ where
                         final_state_cache_key = Some(PirlsAcceptedStateCacheKey::new(
                             &beta,
                             accepted_state.hessian_curvature,
+                            options,
                         ));
                         final_state = Some(accepted_state);
                         let final_state_ref = final_state

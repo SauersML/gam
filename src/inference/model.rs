@@ -752,6 +752,7 @@ pub enum FittedFamily {
     },
     MarginalSlope {
         likelihood: LikelihoodSpec,
+        #[serde(default)]
         base_link: Option<InverseLink>,
         frailty: FrailtySpec,
     },
