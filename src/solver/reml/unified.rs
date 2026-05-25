@@ -8925,6 +8925,21 @@ fn solve_kkt_residual_kernel(
     }
 }
 
+fn active_upper_rho_mask(rho: &[f64]) -> Vec<bool> {
+    let upper_bounds = super::runtime::latest_outer_rho_upper_bounds_for_ift();
+    rho.iter()
+        .enumerate()
+        .map(|(idx, &value)| {
+            let upper = upper_bounds
+                .as_ref()
+                .and_then(|bounds| bounds.get(idx))
+                .copied()
+                .unwrap_or(crate::solver::estimate::RHO_BOUND);
+            upper.is_finite() && value >= upper - 1.0e-8
+        })
+        .collect()
+}
+
 /// Derivatives of the same Newton/IFT residual correction used by the cost:
 ///
 ///   C(ρ) = -½ r(ρ)^T K(ρ) r(ρ),   K = H^{-1}
@@ -8950,6 +8965,7 @@ fn compute_kkt_residual_rho_corrections(
     penalty_a_k_betas: &[Array1<f64>],
     residual: &Array1<f64>,
     include_hessian: bool,
+    upper_active_rho: &[bool],
 ) -> Result<KktRhoCorrections, String> {
     let k = penalty_a_k_betas.len();
     if k == 0 {
@@ -8964,6 +8980,16 @@ fn compute_kkt_residual_rho_corrections(
                 "KKT rho correction dimension mismatch: lambdas={} coords={} rhs={}",
                 lambdas.len(),
                 solution.penalty_coords.len(),
+                k
+            ),
+        }
+        .into());
+    }
+    if upper_active_rho.len() != k {
+        return Err(RemlError::DimensionMismatch {
+            reason: format!(
+                "KKT rho correction active-bound mask mismatch: mask={} rhs={}",
+                upper_active_rho.len(),
                 k
             ),
         }
@@ -8987,6 +9013,12 @@ fn compute_kkt_residual_rho_corrections(
     let mut q_a_i_q = Vec::with_capacity(k);
 
     for idx in 0..k {
+        if upper_active_rho[idx] {
+            a_i_dot_q.push(0.0);
+            q_a_i_q.push(0.0);
+            a_i_qs.push(Array1::<f64>::zeros(hop.dim()));
+            continue;
+        }
         let a_i_q = solution.penalty_coords[idx].scaled_matvec(&q, lambdas[idx]);
         let linear = penalty_a_k_betas[idx].dot(&q);
         let quadratic = q.dot(&a_i_q);
@@ -9006,13 +9038,20 @@ fn compute_kkt_residual_rho_corrections(
 
     let mut gradient = Array1::<f64>::zeros(k);
     for idx in 0..k {
-        gradient[idx] = -a_i_dot_q[idx] + 0.5 * q_a_i_q[idx];
+        if !upper_active_rho[idx] {
+            gradient[idx] = -a_i_dot_q[idx] + 0.5 * q_a_i_q[idx];
+        }
     }
 
     let hessian = if include_hessian {
         let mut a_solutions = Vec::with_capacity(k);
         let mut q_derivs = Vec::with_capacity(k);
         for idx in 0..k {
+            if upper_active_rho[idx] {
+                a_solutions.push(Array1::<f64>::zeros(hop.dim()));
+                q_derivs.push(Array1::<f64>::zeros(hop.dim()));
+                continue;
+            }
             a_solutions.push(solve_kkt_residual_kernel(
                 hop,
                 subspace,
@@ -9024,6 +9063,9 @@ fn compute_kkt_residual_rho_corrections(
         }
 
         let entry = |i: usize, j: usize| -> f64 {
+            if upper_active_rho[i] || upper_active_rho[j] {
+                return 0.0;
+            }
             let delta = if i == j { 1.0 } else { 0.0 };
             let cancel_exact_kkt_profile_term = penalty_a_k_betas[i].dot(&a_solutions[j]);
             cancel_exact_kkt_profile_term
