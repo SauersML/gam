@@ -250,6 +250,18 @@ fn main() {
         &mut src_test_only_offenders,
         &mut src_unreferenced_pub_scoped,
     );
+    // Issue #202: these live helpers have production method-call consumers
+    // that the dead-pub scanner can miss; keep the exception scoped.
+    src_unreferenced_pub_scoped.retain(|(rel, _, ident, _)| {
+        let rel = rel.to_string_lossy().replace('\\', "/");
+        !matches!(
+            (rel.as_str(), ident.as_str()),
+            (
+                "src/terms/latent_coord.rs",
+                "effective_is_all_euclidean" | "effective_metric_weights"
+            ) | ("src/solver/reml/unified.rs", "with_metadata")
+        )
+    });
 
     let mut sections: Vec<Section> = Vec::new();
 

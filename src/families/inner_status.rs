@@ -16,12 +16,11 @@
 //!   between the two — sometimes structural, sometimes just unlucky.
 //!
 //! [`InnerStatus`] preserves the existing data while exposing this
-//! structure. It is produced from a legacy `Result<BlockwiseInnerResult,
-//! String>` by [`classify_inner_result`], which inspects the bubbled
-//! error string for the sentinels emitted by `inner_blockwise_fit` and
-//! the diagnostician's `KktRefusalReport`. Once the inner solver is
-//! reworked to emit `InnerStatus` natively, the classifier becomes the
-//! identity on the structured branch and the string path is removed.
+//! structure. Startup accounting classifies legacy error strings through
+//! [`classify_inner_error`], which inspects the bubbled error string for
+//! the sentinels emitted by `inner_blockwise_fit` and the diagnostician's
+//! `KktRefusalReport`. Once the inner solver emits `InnerStatus`
+//! natively, the remaining string classification path can be removed.
 
 use super::custom_family::{BlockwiseInnerResult, KktRefusalDiagnosis};
 
@@ -105,64 +104,6 @@ pub(crate) enum InnerStatus {
         certificate: KktCertificate,
     },
     Failed(InnerFailure),
-}
-
-/// Promote a legacy inner-solver result into [`InnerStatus`]. Inspects
-/// the bubbled error string for the structured sentinels emitted by
-/// `inner_blockwise_fit` and `KktRefusalReport::format_bubbled_error`.
-/// On success, packages the `BlockwiseInnerResult.kkt_residual` (if
-/// any) into a [`KktCertificate`] and splits `Converged` vs
-/// `ConstrainedStationary` on the `converged` flag.
-pub(crate) fn classify_inner_result(raw: Result<BlockwiseInnerResult, String>) -> InnerStatus {
-    match raw {
-        Ok(result) => {
-            let certificate = certificate_from_result(&result);
-            if result.converged {
-                InnerStatus::Converged {
-                    result,
-                    certificate,
-                }
-            } else {
-                InnerStatus::ConstrainedStationary {
-                    result,
-                    certificate,
-                }
-            }
-        }
-        Err(message) => InnerStatus::Failed(classify_inner_error(message)),
-    }
-}
-
-fn certificate_from_result(result: &BlockwiseInnerResult) -> KktCertificate {
-    let projected_residual_inf = result
-        .kkt_residual
-        .as_ref()
-        .map(|kkt| {
-            kkt.as_array()
-                .iter()
-                .map(|x: &f64| x.abs())
-                .fold(0.0_f64, f64::max)
-        })
-        .unwrap_or(f64::NAN);
-    let residual_tol = result
-        .kkt_residual
-        .as_ref()
-        .and_then(|kkt| kkt.residual_tol())
-        .unwrap_or(f64::NAN);
-    let free_rank = result.kkt_residual.as_ref().and_then(|kkt| kkt.free_rank());
-    let active_set_size: usize = result
-        .active_sets
-        .iter()
-        .map(|maybe| maybe.as_ref().map(|v| v.len()).unwrap_or(0))
-        .sum();
-    KktCertificate {
-        projected_residual_inf,
-        residual_tol,
-        active_set_size,
-        free_rank,
-        accepted_step_inf: f64::NAN,
-        obj_change: f64::NAN,
-    }
 }
 
 pub(crate) fn classify_inner_error(message: String) -> InnerFailure {
@@ -375,9 +316,7 @@ mod tests {
                         "carrying-block must survive the round-trip for {diagnosis_label}"
                     );
                 }
-                other => panic!(
-                    "expected CertRefused for label {diagnosis_label}, got {other:?}"
-                ),
+                other => panic!("expected CertRefused for label {diagnosis_label}, got {other:?}"),
             }
         }
     }
