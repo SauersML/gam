@@ -354,6 +354,7 @@ from ._binding import rust_module as _rust_module; AuxConditionalPriorPenalty = 
 from ._binding import rust_module as _rust_module; BlockOrthogonalityPenalty = _rust_module().BlockOrthogonalityPenalty
 from ._binding import rust_module as _rust_module; IsometryPenalty = _rust_module().IsometryPenalty
 from ._binding import rust_module as _rust_module; ScadMcpPenalty = _rust_module().ScadMcpPenalty
+from ._binding import rust_module as _rust_module; NuclearNormPenalty = _rust_module().NuclearNormPenalty
 
 
 @dataclass(frozen=True, slots=True)
