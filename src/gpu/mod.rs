@@ -200,7 +200,7 @@ impl GpuDecision {
 pub fn log_backend_inventory_once() {
     static LOGGED: OnceLock<()> = OnceLock::new();
     LOGGED.get_or_init(|| {
-        let compiled_backends = if cfg!(all(feature = "cuda", target_os = "linux")) {
+        let compiled_backends = if cfg!(target_os = "linux") {
             "cuda-dynamic"
         } else {
             "none"
