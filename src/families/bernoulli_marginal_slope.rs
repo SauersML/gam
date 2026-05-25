@@ -8336,10 +8336,11 @@ impl BernoulliMarginalSlopeFamily {
             cache_bytes, plan.bytes,
             "row-primary Hessian cache byte plan must match the dense row-cache shape"
         );
+        let gpu_decision = crate::gpu::bms_flex::require_row_primary_hessian_supported(n, r)?;
         if !plan.materialize {
             if log_exact_work(n) {
                 log::info!(
-                    "[BMS row-primary-hessian-cache] stream rows n={} r={} bytes={} workspace_existing_bytes={} budget_bytes={} policy_operator_budget_bytes={} runtime_available_bytes={} expected_reuse_passes={} materialized_row_hessian_evals={} streamed_row_hessian_evals={} reason={}",
+                    "[BMS row-primary-hessian-cache] stream rows n={} r={} bytes={} workspace_existing_bytes={} budget_bytes={} policy_operator_budget_bytes={} runtime_available_bytes={} expected_reuse_passes={} materialized_row_hessian_evals={} streamed_row_hessian_evals={} reason={} gpu_policy={} gpu_selected={} gpu_reason={}",
                     n,
                     r,
                     plan.bytes,
@@ -8351,6 +8352,9 @@ impl BernoulliMarginalSlopeFamily {
                     plan.materialized_row_hessian_evals,
                     plan.streamed_row_hessian_evals,
                     plan.reason.as_str(),
+                    gpu_decision.policy.as_str(),
+                    gpu_decision.use_gpu,
+                    gpu_decision.reason,
                 );
             }
             return Ok(None);
@@ -8362,7 +8366,7 @@ impl BernoulliMarginalSlopeFamily {
         ));
         if log_exact_work(n) {
             log::info!(
-                "[BMS row-primary-hessian-cache] materialize start n={} r={} bytes={} workspace_existing_bytes={} budget_bytes={} policy_operator_budget_bytes={} runtime_available_bytes={} expected_reuse_passes={} materialized_row_hessian_evals={} streamed_row_hessian_evals={} reason={}",
+                "[BMS row-primary-hessian-cache] materialize start n={} r={} bytes={} workspace_existing_bytes={} budget_bytes={} policy_operator_budget_bytes={} runtime_available_bytes={} expected_reuse_passes={} materialized_row_hessian_evals={} streamed_row_hessian_evals={} reason={} gpu_policy={} gpu_selected={} gpu_reason={}",
                 n,
                 r,
                 plan.bytes,
@@ -8374,6 +8378,9 @@ impl BernoulliMarginalSlopeFamily {
                 plan.materialized_row_hessian_evals,
                 plan.streamed_row_hessian_evals,
                 plan.reason.as_str(),
+                gpu_decision.policy.as_str(),
+                gpu_decision.use_gpu,
+                gpu_decision.reason,
             );
         }
         let completed_rows = AtomicUsize::new(0);
