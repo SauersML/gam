@@ -3744,7 +3744,10 @@ fn compare_reml_fits(
         table_row.set_item("name", row.name.as_str())?;
         table_row.set_item("reml_score", row.reml_score)?;
         table_row.set_item("delta_reml", row.delta_reml)?;
-        table_row.set_item("bayes_factor_vs_best", row.bayes_factor_vs_best)?;
+        table_row.set_item(
+            "bayes_factor_best_over_model",
+            row.bayes_factor_best_over_model,
+        )?;
         table_row.set_item("effective_dof", row.effective_dof)?;
         score_table.append(table_row)?;
     }
@@ -8542,6 +8545,24 @@ fn sae_atom_basis_size(plan: &SaeAtomBuildPlan) -> usize {
     plan.basis_size
 }
 
+const SAE_MAX_PERIODIC_HARMONICS: usize = 4096;
+
+fn sae_periodic_basis_size(n_harmonics: usize) -> Result<usize, String> {
+    if n_harmonics > SAE_MAX_PERIODIC_HARMONICS {
+        return Err(format!(
+            "sae_build_periodic_atom: n_harmonics={n_harmonics} exceeds dense limit {SAE_MAX_PERIODIC_HARMONICS}"
+        ));
+    }
+    n_harmonics
+        .checked_mul(2)
+        .and_then(|twice| twice.checked_add(1))
+        .ok_or_else(|| {
+            format!(
+                "sae_build_periodic_atom: basis size overflows for n_harmonics={n_harmonics}"
+            )
+        })
+}
+
 /// PCA seed: returns coords with shape `(k_atoms, n_obs, d_max)`. For periodic
 /// atoms, column 0 is `atan2(Z·v2, Z·v1) / (2π)` (per-atom v2 picked from PCs)
 /// and remaining columns are min-max normalized projections onto subsequent
@@ -8677,7 +8698,7 @@ fn sae_build_periodic_atom(
         return Err("sae_build_periodic_atom: t has non-finite entries".into());
     }
     let n_rows = t.len();
-    let n_cols = 1 + 2 * n_harmonics;
+    let n_cols = sae_periodic_basis_size(n_harmonics)?;
     let mut phi = Array2::<f64>::zeros((n_rows, n_cols));
     let mut jet = Array3::<f64>::zeros((n_rows, n_cols, 1));
     let mut penalty = Array2::<f64>::zeros((n_cols, n_cols));
@@ -8952,7 +8973,7 @@ fn sae_build_atom_plans(
         match kind {
             SaeAtomBasisKind::Periodic => {
                 let n_harmonics = d.max(1);
-                let basis_size = 1 + 2 * n_harmonics;
+                let basis_size = sae_periodic_basis_size(n_harmonics)?;
                 plans.push(SaeAtomBuildPlan {
                     kind: SaeAtomBasisKind::Periodic,
                     latent_dim: d,
@@ -9192,7 +9213,7 @@ fn sae_manifold_predict_oos<'py>(
         match kind {
             SaeAtomBasisKind::Periodic => {
                 let n_harmonics = n_harmonics_list[atom_idx].unwrap_or(d.max(1));
-                let basis_size = 1 + 2 * n_harmonics;
+                let basis_size = sae_periodic_basis_size(n_harmonics).map_err(py_value_error)?;
                 plans.push(SaeAtomBuildPlan {
                     kind: SaeAtomBasisKind::Periodic,
                     latent_dim: d,
@@ -10833,7 +10854,10 @@ fn global_penalty_from_block(
     p: usize,
     penalty: &gam::smooth::BlockwisePenalty,
 ) -> Result<Array2<f64>, String> {
-    if penalty.col_range.end > p || penalty.col_range.len() != penalty.local.nrows() {
+    if penalty.col_range.end > p
+        || penalty.col_range.len() != penalty.local.nrows()
+        || penalty.col_range.len() != penalty.local.ncols()
+    {
         return Err(format!(
             "formula penalty range {:?} is incompatible with design width {p}",
             penalty.col_range
@@ -15999,16 +16023,18 @@ struct SparsityPenalty {
 #[pymethods]
 impl SparsityPenalty {
     #[new]
-    #[pyo3(signature = (kind = "smooth_l1".to_string(), weight = default_weight_auto_py(), eps = 1.0e-3, eps_weight = "fixed".to_string(), *, target = default_target_py(), weight_schedule = None))]
+    #[pyo3(signature = (kind = "smooth_l1".to_string(), weight = None, eps = 1.0e-3, eps_weight = "fixed".to_string(), *, target = None, weight_schedule = None))]
     fn new(
         py: Python<'_>,
         kind: String,
-        weight: PyObject,
+        weight: Option<&Bound<'_, PyAny>>,
         eps: f64,
         eps_weight: String,
-        target: PyObject,
+        target: Option<&Bound<'_, PyAny>>,
         weight_schedule: Option<PyObject>,
     ) -> PyResult<Self> {
+        let weight = py_object_or_string_default(py, weight, "auto");
+        let target = py_object_or_string_default(py, target, "t");
         validate_sparsity_weight(py, weight.bind(py), "SparsityPenalty")?;
         if !matches!(kind.as_str(), "smooth_l1" | "hoyer" | "log") {
             return Err(PyValueError::new_err(format!(
@@ -16105,26 +16131,17 @@ fn validate_sparsity_weight(py: Python<'_>, weight: &Bound<'_, PyAny>, name: &st
     )))
 }
 
-/// Build a `PyObject` holding the default analytic-penalty target literal `"t"`.
-/// Used as a default-expression sentinel inside `#[pyo3(signature = (...))]` so
-/// the macro-generated default closure produces the correct `PyObject` type
-/// rather than a `&'static str`.
-fn default_target_py() -> PyObject {
-    Python::attach(|py| pyo3::types::PyString::new(py, "t").into_any().unbind())
-}
-
-/// Build a `PyObject` containing the default sparsity-weight sentinel `"auto"`.
-fn default_weight_auto_py() -> PyObject {
-    Python::attach(|py| pyo3::types::PyString::new(py, "auto").into_any().unbind())
-}
-
-/// Build a `PyObject` containing the default difference-operator sentinel `"forward_1d"`.
-fn default_forward_1d_py() -> PyObject {
-    Python::attach(|py| {
-        pyo3::types::PyString::new(py, "forward_1d")
+fn py_object_or_string_default(
+    py: Python<'_>,
+    value: Option<&Bound<'_, PyAny>>,
+    default: &str,
+) -> PyObject {
+    match value {
+        Some(value) => value.clone().unbind(),
+        None => pyo3::types::PyString::new(py, default)
             .into_any()
-            .unbind()
-    })
+            .unbind(),
+    }
 }
 
 fn target_descriptor(py: Python<'_>, target: &Bound<'_, PyAny>) -> PyResult<PyObject> {

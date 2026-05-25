@@ -2174,6 +2174,76 @@ mod tests {
         }
     }
 
+    fn assert_jacobian_matches_central_difference<E: SaeBasisEvaluator>(
+        evaluator: &E,
+        coords: Array2<f64>,
+        tolerance: f64,
+    ) {
+        let epsilon = 1.0e-6;
+        let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
+        let (n_rows, n_basis) = phi.dim();
+        let latent_dim = coords.ncols();
+        assert_eq!(jet.dim(), (n_rows, n_basis, latent_dim));
+
+        for row in 0..n_rows {
+            for axis in 0..latent_dim {
+                let mut plus = coords.clone();
+                let mut minus = coords.clone();
+                plus[[row, axis]] += epsilon;
+                minus[[row, axis]] -= epsilon;
+                let (phi_plus, plus_jet) = evaluator.evaluate(plus.view()).unwrap();
+                let (phi_minus, minus_jet) = evaluator.evaluate(minus.view()).unwrap();
+                assert_eq!(plus_jet.dim(), jet.dim());
+                assert_eq!(minus_jet.dim(), jet.dim());
+
+                for basis in 0..n_basis {
+                    let finite_difference =
+                        (phi_plus[[row, basis]] - phi_minus[[row, basis]]) / (2.0 * epsilon);
+                    let analytic = jet[[row, basis, axis]];
+                    let error = (analytic - finite_difference).abs();
+                    assert!(
+                        error <= tolerance,
+                        "row={row} basis={basis} axis={axis}: analytic={analytic:.12e}, \
+                         finite_difference={finite_difference:.12e}, error={error:.12e}, \
+                         tolerance={tolerance:.12e}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sae_basis_evaluator_jacobians_match_central_differences() {
+        assert_jacobian_matches_central_difference(
+            &PeriodicHarmonicEvaluator::new(7).unwrap(),
+            array![[-0.37], [0.0], [0.125], [0.41]],
+            1.0e-6,
+        );
+
+        assert_jacobian_matches_central_difference(
+            &RawPeriodicCircleEvaluator::new(3).unwrap(),
+            array![[-1.2, 0.3, 2.0], [0.0, -0.4, 0.8], [2.4, 1.1, -0.7]],
+            1.0e-6,
+        );
+
+        assert_jacobian_matches_central_difference(
+            &SphereChartEvaluator,
+            array![
+                [-0.7, -1.2],
+                [-0.25, 0.0],
+                [0.35, 0.9],
+                [0.8, 2.1]
+            ],
+            1.0e-6,
+        );
+
+        assert_jacobian_matches_central_difference(
+            &AffineCoordinateEvaluator::new(3),
+            array![[0.0, -1.0, 2.0], [3.5, 0.25, -0.75]],
+            1.0e-6,
+        );
+    }
+
     /// Mirror of the Python `test_sae_manifold_softmax_dispatch` shape: drive a
     /// single periodic atom on a 1-harmonic synthetic target with 10 Newton
     /// steps end-to-end in Rust and check that the multi-step loop achieves

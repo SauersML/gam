@@ -3433,6 +3433,7 @@ pub fn run_logit_polya_gamma_gibbs(
         }
         .into());
     }
+    validate_binary_responses("run_logit_polya_gamma_gibbs", &y, &weights).map_err(String::from)?;
 
     let n_iter = config.nwarmup + config.n_samples;
 
@@ -3596,6 +3597,8 @@ pub fn estimate_logit_pg_rao_blackwell_terms(
         }
         .into());
     }
+    validate_binary_responses("estimate_logit_pg_rao_blackwell_terms", &y, &weights)
+        .map_err(String::from)?;
     if penalty_roots.iter().any(|r| r.ncols() != p) {
         return Err(HmcError::DimensionMismatch {
             reason: "estimate_logit_pg_rao_blackwell_terms: root width mismatch".to_string(),
