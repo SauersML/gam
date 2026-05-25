@@ -16591,6 +16591,14 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
         let psi_workspace = psi_workspace.clone();
 
         Box::new(move |psi_i: usize, psi_j: usize| -> HyperCoordPair {
+            // Defensive bounds check: callers in the unified outer solver only ever
+            // pass indices in `0..psi_penalty_cache.len()`, but treating an OOB
+            // request as a documented zero-pair sentinel keeps integration code
+            // (which may probe spurious coordinate pairs while building joint
+            // Hessian sparsity patterns) panic-free.
+            if psi_i >= psi_penalty_cache.len() || psi_j >= psi_penalty_cache.len() {
+                return HyperCoordPair::zero();
+            }
             let cache_i = &psi_penalty_cache[psi_i];
             let cache_j = &psi_penalty_cache[psi_j];
 
@@ -16727,6 +16735,9 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
         let s_logdet_block_cache = Arc::clone(&s_logdet_block_cache);
 
         Box::new(move |rho_k: usize, psi_j: usize| -> HyperCoordPair {
+            if rho_k >= rho_penalty_cache.len() || psi_j >= psi_penalty_cache.len() {
+                return HyperCoordPair::zero();
+            }
             let rho_cache = &rho_penalty_cache[rho_k];
             let psi_cache = &psi_penalty_cache[psi_j];
             let mut a = 0.0;
