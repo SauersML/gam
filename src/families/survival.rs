@@ -8,7 +8,7 @@ use crate::pirls::{
     LinearInequalityConstraints, WorkingModel as PirlsWorkingModel, WorkingState, array1_l2_norm,
 };
 use crate::types::{Coefficients, LinearPredictor};
-use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3, Axis};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayView3, Axis};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::ops::Range;

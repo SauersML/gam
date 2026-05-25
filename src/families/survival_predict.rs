@@ -812,7 +812,8 @@ pub fn predict_competing_risks_survival(
         return Err(format!(
             "competing-risks CIF assembly produced {} endpoint matrices, expected {cause_count}",
             assembled.cif.len()
-        ));
+        )
+        .into());
     }
     let cif = assembled.cif;
     let overall_survival = assembled.overall_survival;
