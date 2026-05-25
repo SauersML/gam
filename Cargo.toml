@@ -77,6 +77,7 @@ parquet = { version = "54", default-features = false, features = ["arrow", "snap
 wide = "0.7"
 smallvec = "1"
 sha2 = "0.10.8"
+sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 cudarc = { version = "0.19.6", default-features = false, features = ["std", "driver", "runtime", "nvrtc", "cublas", "cublaslt", "cusparse", "cusolver", "cusolvermg", "curand", "nvtx", "cupti", "fallback-dynamic-loading", "cuda-12080"] }

@@ -50,6 +50,7 @@ use crate::smooth::{
     build_term_collection_designs_and_freeze_joint, optimize_spatial_length_scale_exact_joint,
     spatial_length_scale_term_indices,
 };
+use crate::solver::estimate::EstimationError;
 use crate::solver::estimate::reml::unified::HyperOperator;
 use crate::types::{InverseLink, LinkFunction};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
@@ -17670,6 +17671,12 @@ pub fn fit_survival_marginal_slope_terms(
     let hints = RefCell::new(ThetaHints::default());
     let sigma_hint = RefCell::new(initial_sigma);
     let exact_warm_start = RefCell::new(None::<CustomFamilyWarmStart>);
+    // Outer ρ-cache β-seed staging slot. The spatial-joint optimizer fires
+    // `seed_inner_beta_fn` on a cache hit before any eval has run at the
+    // restored ρ. Per-block widths are only known once `build_blocks(rho,…)`
+    // runs, so we stash the flat β here and the eval closures promote it
+    // into `exact_warm_start` on the first invocation.
+    let pending_beta_seed = RefCell::new(None::<Array1<f64>>);
 
     let event = Arc::new(spec.event_target.clone());
     let weights = Arc::new(spec.weights.clone());
@@ -18165,6 +18172,20 @@ pub fn fit_survival_marginal_slope_terms(
             );
             let rho = theta.slice(s![..setup.rho_dim()]).to_owned();
             let blocks = build_blocks(&rho, &designs[0], &designs[1])?;
+            if let Some(beta_seed) = pending_beta_seed.borrow_mut().take() {
+                let widths: Vec<usize> =
+                    blocks.iter().map(|b| b.design.ncols()).collect();
+                match CustomFamilyWarmStart::from_cached_beta(&widths, &beta_seed) {
+                    Ok(ws) => {
+                        exact_warm_start.replace(Some(ws));
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "[SMS] outer ρ-cache β-warm-start rejected: {e}; falling back to cold β"
+                        );
+                    }
+                }
+            }
             let sigma = sigma_from_theta(theta);
             sigma_hint.replace(sigma);
             let family = make_family(&designs[0], &designs[1], sigma);
@@ -18218,6 +18239,20 @@ pub fn fit_survival_marginal_slope_terms(
             );
             let rho = theta.slice(s![..setup.rho_dim()]).to_owned();
             let blocks = build_blocks(&rho, &designs[0], &designs[1])?;
+            if let Some(beta_seed) = pending_beta_seed.borrow_mut().take() {
+                let widths: Vec<usize> =
+                    blocks.iter().map(|b| b.design.ncols()).collect();
+                match CustomFamilyWarmStart::from_cached_beta(&widths, &beta_seed) {
+                    Ok(ws) => {
+                        exact_warm_start.replace(Some(ws));
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "[SMS] outer ρ-cache β-warm-start rejected (efs): {e}; falling back to cold β"
+                        );
+                    }
+                }
+            }
             let sigma = sigma_from_theta(theta);
             sigma_hint.replace(sigma);
             let family = make_family(&designs[0], &designs[1], sigma);
@@ -18241,6 +18276,15 @@ pub fn fit_survival_marginal_slope_terms(
                 eval_started.elapsed().as_secs_f64(),
             );
             Ok(eval.efs_eval)
+        },
+        |beta: &Array1<f64>| {
+            if beta.iter().any(|v| !v.is_finite()) {
+                return Err(EstimationError::InvalidInput(
+                    "cached inner beta contains non-finite entries".to_string(),
+                ));
+            }
+            pending_beta_seed.replace(Some(beta.clone()));
+            Ok(())
         },
     )?;
     log::info!(

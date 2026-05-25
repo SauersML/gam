@@ -15267,6 +15267,7 @@ pub fn fit_transformation_normal(
             }
             Ok(eval.efs_eval)
         },
+        |_beta: &Array1<f64>| Ok(()),
     )?;
 
     let mut fit = solved.fit;

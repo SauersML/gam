@@ -6433,6 +6433,47 @@ impl CustomFamilyWarmStart {
     pub(crate) fn compatible_with_rho(&self, rho: &Array1<f64>) -> bool {
         screened_outer_warm_start(Some(&self.inner), rho).is_some()
     }
+
+    /// Build a warm-start payload from a flat cached β and the per-block
+    /// coefficient widths. The returned warm-start carries a zero `rho`
+    /// (the outer cache will overwrite it on the next eval) and empty
+    /// active sets; only the per-block β slices feed the next inner
+    /// PIRLS / Newton solve. Used by the spatial-joint outer cache to
+    /// seed the family-owned warm-start slot on cache hits so the inner
+    /// solve opens at the prior converged iterate instead of cold β.
+    pub fn from_cached_beta(
+        block_col_counts: &[usize],
+        beta: &Array1<f64>,
+    ) -> Result<Self, EstimationError> {
+        let expected: usize = block_col_counts.iter().copied().sum();
+        if beta.len() != expected {
+            return Err(EstimationError::InvalidInput(format!(
+                "cached inner beta has length {}, but spatial-joint blocks require length {}",
+                beta.len(),
+                expected
+            )));
+        }
+        if beta.iter().any(|value| !value.is_finite()) {
+            return Err(EstimationError::InvalidInput(
+                "cached inner beta contains non-finite entries".to_string(),
+            ));
+        }
+        let mut offset = 0usize;
+        let mut block_beta = Vec::with_capacity(block_col_counts.len());
+        for &width in block_col_counts {
+            let end = offset + width;
+            block_beta.push(beta.slice(s![offset..end]).to_owned());
+            offset = end;
+        }
+        Ok(CustomFamilyWarmStart {
+            inner: ConstrainedWarmStart {
+                rho: Array1::zeros(0),
+                block_beta,
+                active_sets: vec![None; block_col_counts.len()],
+                cached_inner: None,
+            },
+        })
+    }
 }
 
 struct CustomOuterState {

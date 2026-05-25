@@ -49,7 +49,7 @@ use crate::smooth::{
 };
 use crate::solver::estimate::UnifiedFitResult;
 use crate::solver::estimate::{
-    FitGeometry, ensure_finite_scalar_estimation, validate_all_finite_estimation,
+    EstimationError, FitGeometry, ensure_finite_scalar_estimation, validate_all_finite_estimation,
 };
 use crate::terms::construction::kronecker_product;
 use crate::types::{InverseLink, LinkFunction};
@@ -10355,6 +10355,10 @@ pub(crate) fn fit_survival_location_scale_terms(
             .and_then(|w| w.initial_beta.clone()),
     );
     let exact_warm_start = std::cell::RefCell::new(None::<CustomFamilyWarmStart>);
+    // Outer ρ-cache β-seed staging slot. See BMS/SMS for the contract: stash
+    // the flat β here on cache hit, promote to a real `CustomFamilyWarmStart`
+    // once per-block widths are known from `prepare_survival_location_scale_model`.
+    let pending_beta_seed = std::cell::RefCell::new(None::<Array1<f64>>);
     // Stash the geometry from the most recent inner fit. Updated on every
     // value-closure call by the spatial optimizer; the last one written
     // corresponds to the converged outer point. This avoids redoing
@@ -10513,6 +10517,23 @@ pub(crate) fn fit_survival_location_scale_terms(
             let rho = theta.slice(s![..joint_setup.rho_dim()]).to_owned();
             let assembled = build_spec(&rho, &specs[0], &specs[1], &designs[0], &designs[1])?;
             let prepared = prepare_survival_location_scale_model(&assembled)?;
+            if let Some(beta_seed) = pending_beta_seed.borrow_mut().take() {
+                let widths: Vec<usize> = prepared
+                    .blockspecs
+                    .iter()
+                    .map(|b| b.design.ncols())
+                    .collect();
+                match CustomFamilyWarmStart::from_cached_beta(&widths, &beta_seed) {
+                    Ok(ws) => {
+                        exact_warm_start.replace(Some(ws));
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "[survival-LS] outer ρ-cache β-warm-start rejected: {e}; falling back to cold β"
+                        );
+                    }
+                }
+            }
             let threshold_derivs = build_survival_covariate_block_psi_derivatives(
                 data,
                 &specs[0],
@@ -10580,6 +10601,23 @@ pub(crate) fn fit_survival_location_scale_terms(
             let rho = theta.slice(s![..joint_setup.rho_dim()]).to_owned();
             let assembled = build_spec(&rho, &specs[0], &specs[1], &designs[0], &designs[1])?;
             let prepared = prepare_survival_location_scale_model(&assembled)?;
+            if let Some(beta_seed) = pending_beta_seed.borrow_mut().take() {
+                let widths: Vec<usize> = prepared
+                    .blockspecs
+                    .iter()
+                    .map(|b| b.design.ncols())
+                    .collect();
+                match CustomFamilyWarmStart::from_cached_beta(&widths, &beta_seed) {
+                    Ok(ws) => {
+                        exact_warm_start.replace(Some(ws));
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "[survival-LS] outer ρ-cache β-warm-start rejected (efs): {e}; falling back to cold β"
+                        );
+                    }
+                }
+            }
             let threshold_derivs = build_survival_covariate_block_psi_derivatives(
                 data,
                 &specs[0],
@@ -10615,6 +10653,15 @@ pub(crate) fn fit_survival_location_scale_terms(
                 );
             }
             Ok(eval.efs_eval)
+        },
+        |beta: &Array1<f64>| {
+            if beta.iter().any(|v| !v.is_finite()) {
+                return Err(EstimationError::InvalidInput(
+                    "cached inner beta contains non-finite entries".to_string(),
+                ));
+            }
+            pending_beta_seed.replace(Some(beta.clone()));
+            Ok(())
         },
     )?;
 

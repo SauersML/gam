@@ -2587,6 +2587,7 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                     }
                     Ok(eval.efs_eval)
                 },
+                |_beta: &Array1<f64>| Ok(()),
             )
         }};
     }
