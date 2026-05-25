@@ -1,8 +1,24 @@
+import importlib
 import multiprocessing as mp
 import queue
 import time
+from typing import Any, NoReturn, Protocol, cast
 
-import pytest
+
+class _PytestModule(Protocol):
+    def importorskip(
+        self,
+        modname: str,
+        minversion: str | None = None,
+        reason: str | None = None,
+        *,
+        exc_type: type[ImportError] | tuple[type[ImportError], ...] | None = None,
+    ) -> Any: ...
+
+    def fail(self, reason: str = "", pytrace: bool = True) -> NoReturn: ...
+
+
+pytest = cast(_PytestModule, importlib.import_module("pytest"))
 
 pytest.importorskip("gamfit._rust")
 
