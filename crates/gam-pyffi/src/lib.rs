@@ -17592,6 +17592,9 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(posterior_predict_bands_table, module)?)?;
     module.add_function(wrap_pyfunction!(posterior_eta_bands, module)?)?;
     module.add_function(wrap_pyfunction!(posterior_credible_interval, module)?)?;
+    module.add_function(wrap_pyfunction!(posterior_coefficient_names_json, module)?)?;
+    module.add_function(wrap_pyfunction!(posterior_samples_summary_json, module)?)?;
+    module.add_function(wrap_pyfunction!(posterior_trace_selection_json, module)?)?;
     module.add_function(wrap_pyfunction!(apply_inverse_link_array, module)?)?;
     module.add_function(wrap_pyfunction!(summary_json, module)?)?;
     module.add_function(wrap_pyfunction!(summary_payload_from_model, module)?)?;
