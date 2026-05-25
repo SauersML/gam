@@ -19,17 +19,11 @@ from ._summary import Summary
 _NO_MODEL: bytes = b""
 
 
-def _rust():
-    from ._binding import rust_module
-
-    return rust_module()
-
-
 def _call(name: str, *args: Any) -> Any:
+    from ._binding import rust_module
     from ._exceptions import map_exception
-
     try:
-        return getattr(_rust(), name)(*args)
+        return getattr(rust_module(), name)(*args)
     except Exception as exc:
         raise map_exception(exc) from exc
 
@@ -154,11 +148,10 @@ class PosteriorSamples:
     def predict(self, new_data: Any, *, level: float = 0.95) -> dict[str, Any]:
         import numpy as np
         self._need_model()
-        headers, rows = self._normalize(new_data)
-        raw = _call("posterior_predict_bands_table", self._model_bytes, headers, rows,
-                    np.asarray(self.samples, dtype=float).ravel().tolist(),
-                    self.n_draws, self.n_coeffs, float(level))
-        parsed = json.loads(raw)
+        h, r = self._normalize(new_data)
+        parsed = json.loads(_call("posterior_predict_bands_table", self._model_bytes, h, r,
+                                  np.asarray(self.samples, dtype=float).ravel().tolist(),
+                                  self.n_draws, self.n_coeffs, float(level)))
         return {k: np.asarray(parsed[k], dtype=float)
                 for k in ("eta_mean", "eta_lower", "eta_upper", "mean", "mean_lower", "mean_upper")}
 
@@ -173,29 +166,26 @@ class PosteriorSamples:
     def _posterior_predict_eta(self, new_data: Any) -> tuple[Any, str, str]:
         import numpy as np
         self._need_model()
-        headers, rows = self._normalize(new_data)
-        parsed = json.loads(_call("posterior_predict_table", self._model_bytes, headers, rows,
-                                  np.asarray(self.samples, dtype=float).ravel().tolist(),
-                                  self.n_draws, self.n_coeffs))
-        n_draws, n_rows = int(parsed["n_draws"]), int(parsed["n_rows"])
-        flat = np.asarray(parsed.get("eta_flat", []), dtype=float)
-        if flat.size != n_draws * n_rows:
-            raise ValueError(f"posterior predict FFI payload shape mismatch: got {flat.size} floats, expected {n_draws} * {n_rows}")
-        return (flat.reshape(n_draws, n_rows),
-                str(parsed.get("family_kind", self.family_kind)),
-                str(parsed.get("model_class", self.model_class)))
+        h, r = self._normalize(new_data)
+        p = json.loads(_call("posterior_predict_table", self._model_bytes, h, r,
+                             np.asarray(self.samples, dtype=float).ravel().tolist(),
+                             self.n_draws, self.n_coeffs))
+        nd, nr = int(p["n_draws"]), int(p["n_rows"])
+        flat = np.asarray(p.get("eta_flat", []), dtype=float)
+        if flat.size != nd * nr:
+            raise ValueError(f"posterior predict FFI payload shape mismatch: got {flat.size} floats, expected {nd} * {nr}")
+        return flat.reshape(nd, nr), str(p.get("family_kind", self.family_kind)), str(p.get("model_class", self.model_class))
 
     def save(self, path: str | Path) -> str:
         import numpy as np
         out = Path(path)
-        metadata = {"coefficient_names": list(self.coefficient_names), "method": self.method,
-                    "model_class": self.model_class, "family_kind": self.family_kind,
-                    "config": self.config.to_dict()}
+        md = {"coefficient_names": list(self.coefficient_names), "method": self.method,
+              "model_class": self.model_class, "family_kind": self.family_kind, "config": self.config.to_dict()}
         np.savez(out, samples=np.asarray(self.samples, dtype=float),
                  mean=np.asarray(self.mean, dtype=float), std=np.asarray(self.std, dtype=float),
                  rhat=np.float64(self.rhat), ess=np.float64(self.ess), converged=np.bool_(self.converged),
                  model_bytes=np.frombuffer(self._model_bytes, dtype=np.uint8),
-                 metadata=np.asarray(json.dumps(metadata), dtype=object))
+                 metadata=np.asarray(json.dumps(md), dtype=object))
         return str(out)
 
     @classmethod
