@@ -202,6 +202,20 @@ try:
 except _metadata.PackageNotFoundError:
     __version__ = "0.0.0+unknown"
 
+def __getattr__(name: str):
+    """Lazy attribute hook for torch-only primitives exposed at the top level.
+
+    Importing ``gamfit`` does not pull in torch (the torch bridge is an optional
+    extra). The names listed below are forwarded on first access so users can
+    write ``gamfit.AdaptiveTopK(...)`` without an explicit ``gamfit.torch``
+    import, while leaving the cold-start import path torch-free.
+    """
+    if name == "AdaptiveTopK":
+        from .torch.modules import AdaptiveTopK as _AdaptiveTopK
+        return _AdaptiveTopK
+    raise AttributeError(f"module 'gamfit' has no attribute {name!r}")
+
+
 def load_posterior(path: str | Path) -> PosteriorSamples:
     """Load a :class:`PosteriorSamples` archive from disk.
 
@@ -229,6 +243,7 @@ def load_posterior(path: str | Path) -> PosteriorSamples:
 
 
 __all__ = [
+    "AdaptiveTopK",
     "Diagnostics",
     "EquivariantPenalty",
     "GaugeCompanion",
