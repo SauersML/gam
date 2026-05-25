@@ -36,8 +36,28 @@ impl GpuRuntime {
             return Ok(None);
         }
 
-        let device_count =
-            CudaContext::device_count().map_err(|err| GpuProbeError::Driver(err.to_string()))?;
+        // `cudarc 0.19`'s entry points lazily initialize the CUDA driver via
+        // `libloading::Library::new`. When the platform has no CUDA driver at
+        // all (e.g. macOS hosts where there is no `libcuda.dylib`), the
+        // library-load helper panics from inside the cudarc internals instead
+        // of returning an error. Catching the unwind here turns that panic
+        // into the same graceful "CUDA driver missing" Err path that an
+        // initialization-time `CUDA_ERROR_NO_DEVICE` would take — so callers
+        // see `GpuRuntime::global() == None` and the CPU fast path resumes
+        // instead of the whole process aborting from a Python boundary call.
+        let device_count = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            CudaContext::device_count().map_err(|err| GpuProbeError::Driver(err.to_string()))
+        }))
+        .map_err(|payload| {
+            let reason = if let Some(s) = payload.downcast_ref::<&'static str>() {
+                (*s).to_string()
+            } else if let Some(s) = payload.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "CUDA driver library not loadable on this host".to_string()
+            };
+            GpuProbeError::Driver(reason)
+        })??;
         if device_count <= 0 {
             Self::record_cpu_reason("CUDA driver reported no devices");
             diagnostics::log_cuda_disabled("CUDA driver reported no devices");
