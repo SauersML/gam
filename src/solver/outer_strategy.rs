@@ -30,6 +30,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 const OPERATOR_TRUST_RESTART_RADIUS_FLOOR: f64 = 1.0e-6;
 
+fn outer_strategy_contract_panic(message: impl Into<String>) -> ! {
+    std::panic::panic_any(message.into())
+}
+
 /// Bidirectional inner-PIRLS feedback channel.
 ///
 /// The outer-loop scheduler (BFGS or ARC bridge) writes a coarsened
@@ -1455,13 +1459,17 @@ impl HessianResult {
                 // SAFETY: reaching this arm means the plan promised dense
                 // analytic but the family returned an operator — contract
                 // violation; fail-fast surfaces the upstream plan bug.
-                panic!("expected dense analytic Hessian but got HessianResult::Operator")
+                outer_strategy_contract_panic(
+                    "expected dense analytic Hessian but got HessianResult::Operator",
+                )
             }
             HessianResult::Unavailable => {
                 // SAFETY: same contract as Operator above — `Unavailable`
                 // means the family failed to produce the analytic Hessian
                 // its `OuterPlan` declared.
-                panic!("expected analytic Hessian but got HessianResult::Unavailable")
+                outer_strategy_contract_panic(
+                    "expected analytic Hessian but got HessianResult::Unavailable",
+                )
             }
         }
     }
