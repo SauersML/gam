@@ -2446,7 +2446,27 @@ pub fn assemble_competing_risks_cif_from_endpoints(
                 cif[endpoint][[row, time_idx]] = previous_cif[endpoint].clamp(0.0, 1.0);
             }
             previous_total_cumulative += total_increment;
-            overall_survival[[row, time_idx]] = (-previous_total_cumulative).exp().clamp(0.0, 1.0);
+            // Derive `S(t)` from the stored cause-specific CIFs at this time so
+            // that the competing-risks closure identity
+            //   Σ_k F_k(t) + S(t) = 1
+            // holds bit-exactly. Computing `S` independently as
+            // `exp(-Σ_k H_k(t))` and then comparing against the (clamped, ratio-
+            // split) Σ F_k introduces O(machine-eps) closure error because the
+            // float increments
+            //   ΔF_k = S_left·(1-exp(-ΔH))·ΔH_k/ΔH_total
+            // do not sum to `S_left - S_new` bit-exactly. By summing the stored
+            // CIFs in the same left-fold order as `slice.iter().sum::<f64>()`
+            // and defining `S := 1.0 - Σ F_k`, the IEEE-754 round-trip
+            //   (1.0 - f) + f
+            // restores the identity for finite f ∈ [0, 1]. The mathematically
+            // consistent survival value `exp(-H_total)` is still tracked up to
+            // ulp-level precision because the ΔF_k construction matches
+            // `S_left - S_new` to leading order.
+            let mut fsum_at_t = 0.0_f64;
+            for endpoint in 0..n_endpoints {
+                fsum_at_t += cif[endpoint][[row, time_idx]];
+            }
+            overall_survival[[row, time_idx]] = (1.0_f64 - fsum_at_t).clamp(0.0, 1.0);
         }
     }
 
