@@ -10899,6 +10899,13 @@ fn truncate_joint_step_to_block_metric_radii(
     norms
 }
 
+fn shrink_joint_block_trust_radii(block_radii: &mut [f64], factor: f64) -> f64 {
+    for radius in block_radii {
+        *radius = (*radius * factor).clamp(1.0e-12, 1.0e6);
+    }
+    block_radii.iter().copied().fold(0.0_f64, f64::max)
+}
+
 fn apply_block_local_feasibility_limits<F: CustomFamily + ?Sized>(
     family: &F,
     states: &[ParameterBlockState],
@@ -12023,7 +12030,8 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 )
                 .is_err()
                 {
-                    joint_trust_radius = (0.25 * joint_trust_radius).max(1.0e-12);
+                    joint_trust_radius =
+                        shrink_joint_block_trust_radii(&mut joint_block_trust_radii, 0.25);
                     continue;
                 }
                 block_step_norms =
@@ -12104,12 +12112,16 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                                 search_delta = descent_delta;
                             }
                             Err(_) => {
-                                joint_trust_radius = (0.25 * joint_trust_radius).max(1.0e-12);
+                                joint_trust_radius = shrink_joint_block_trust_radii(
+                                    &mut joint_block_trust_radii,
+                                    0.25,
+                                );
                             }
                         }
                         tried_preconditioned_descent = true;
                     } else {
-                        joint_trust_radius = (0.25 * joint_trust_radius).max(1.0e-12);
+                        joint_trust_radius =
+                            shrink_joint_block_trust_radii(&mut joint_block_trust_radii, 0.25);
                     }
                     continue;
                 }
@@ -12156,7 +12168,8 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                             states[b].beta.assign(old);
                         }
                         refresh_all_block_etas(family, specs, &mut states)?;
-                        joint_trust_radius = (0.25 * joint_trust_radius).max(1.0e-12);
+                        joint_trust_radius =
+                            shrink_joint_block_trust_radii(&mut joint_block_trust_radii, 0.25);
                         continue;
                     }
                 };
@@ -12170,7 +12183,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     old_objective,
                 );
                 let old_radius = joint_trust_radius;
-                let old_block_radii = joint_block_trust_radii.clone();
                 for (block_radius, block_step_norm) in
                     joint_block_trust_radii.iter_mut().zip(block_step_norms.iter().copied())
                 {
