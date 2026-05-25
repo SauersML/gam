@@ -357,7 +357,7 @@ pub fn audit_identifiability(specs: &[ParameterBlockSpec]) -> Result<Identifiabi
     // so callers can correlate with the structural log.
     let mut dropped_columns: Vec<DroppedColumn> = Vec::new();
     for &joint_col in &demoted_joint_cols {
-        let (block_idx, local_col) = locate_block_column(&col_offsets, joint_col);
+        let (block_idx, local_col) = locate_block_column(&col_offsets, joint_col)?;
         let block_name = specs[block_idx].name.clone();
         let reason = format!(
             "joint-design column {joint_col} (block '{block_name}' local column \
@@ -426,23 +426,20 @@ pub fn audit_identifiability(specs: &[ParameterBlockSpec]) -> Result<Identifiabi
     })
 }
 
-fn locate_block_column(col_offsets: &[usize], joint_col: usize) -> (usize, usize) {
+fn locate_block_column(col_offsets: &[usize], joint_col: usize) -> Result<(usize, usize), String> {
     // col_offsets has length specs.len() + 1; col_offsets[i..i+1] is
     // the joint-column range for block i. Linear scan is fine — the
     // table is tiny (one entry per block).
     for i in 0..col_offsets.len() - 1 {
         if joint_col >= col_offsets[i] && joint_col < col_offsets[i + 1] {
-            return (i, joint_col - col_offsets[i]);
+            return Ok((i, joint_col - col_offsets[i]));
         }
     }
-    // Unreachable when `joint_col < *col_offsets.last()`; the RRQR
-    // permutation is over [0, p_total). The caller checks `p_total > 0`
-    // before calling here, so this branch is structurally dead.
-    panic!(
+    Err(format!(
         "identifiability_audit::locate_block_column: joint_col {joint_col} \
          outside col_offsets range (max = {})",
         col_offsets.last().copied().unwrap_or(0),
-    );
+    ))
 }
 
 fn block_pivoted_qr_diagonal(block: &Array2<f64>) -> Result<Vec<f64>, String> {

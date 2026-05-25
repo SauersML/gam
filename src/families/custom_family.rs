@@ -23,7 +23,7 @@ use crate::solver::estimate::reml::unified::{
     spectral_epsilon, spectral_regularize,
 };
 use crate::solver::estimate::{
-    FitGeometry, ensure_finite_scalar_estimation, validate_all_finite_estimation,
+    EstimationError, FitGeometry, ensure_finite_scalar_estimation, validate_all_finite_estimation,
 };
 use crate::solver::persistent_warm_start::{
     PersistentBlockInnerSummary, PersistentBlockWarmStartRecord, StableHasher, load_block_record,
@@ -2974,6 +2974,41 @@ fn constrained_warm_start_from_inner(
         active_sets: inner.active_sets.clone(),
         cached_inner: Some(cached_inner_mode_from_result(inner)),
     }
+}
+
+fn constrained_warm_start_from_cached_beta(
+    rho_dim: usize,
+    specs: &[ParameterBlockSpec],
+    beta: &Array1<f64>,
+) -> Result<ConstrainedWarmStart, EstimationError> {
+    let expected = specs.iter().map(|spec| spec.design.ncols()).sum::<usize>();
+    if beta.len() != expected {
+        return Err(EstimationError::InvalidInput(format!(
+            "cached inner beta has length {}, but custom-family blocks require length {}",
+            beta.len(),
+            expected
+        )));
+    }
+    if beta.iter().any(|value| !value.is_finite()) {
+        return Err(EstimationError::InvalidInput(
+            "cached inner beta contains non-finite entries".to_string(),
+        ));
+    }
+
+    let mut offset = 0usize;
+    let mut block_beta = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let end = offset + spec.design.ncols();
+        block_beta.push(beta.slice(s![offset..end]).to_owned());
+        offset = end;
+    }
+
+    Ok(ConstrainedWarmStart {
+        rho: Array1::zeros(rho_dim),
+        block_beta,
+        active_sets: vec![None; specs.len()],
+        cached_inner: None,
+    })
 }
 
 fn inner_penalized_objective(
@@ -21107,7 +21142,14 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                 }
             }
         },
-    );
+    )
+    .with_seed_inner_state(|outer: &mut CustomOuterState, beta: &Array1<f64>| {
+        outer.warm_cache = Some(constrained_warm_start_from_cached_beta(
+            n_rho, specs, beta,
+        )?);
+        outer.last_error = None;
+        Ok(())
+    });
 
     let outer_result = problem.run(&mut obj, "custom family");
 

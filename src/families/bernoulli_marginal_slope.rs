@@ -1818,8 +1818,7 @@ pub(crate) fn enforce_cross_block_identifiability_for_flex_block(
         ])
         .map_err(|reason| format!("BMS cross-block audit delegation failed: {reason}"))?;
         let candidate_block = audit.blocks.get(1).ok_or_else(|| {
-            "BMS cross-block audit delegation: missing candidate block in audit report"
-                .to_string()
+            "BMS cross-block audit delegation: missing candidate block in audit report".to_string()
         })?;
         if audit.fatal && candidate_block.design_range_rank == 0 {
             let reason = format!(
