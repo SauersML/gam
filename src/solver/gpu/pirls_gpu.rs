@@ -338,8 +338,8 @@ mod cpu_fallback {
                 input.gradient.len()
             ));
         }
-        let xtwx = weighted_crossprod_cpu(input.x, input.weights)?;
-        let mut penalized_hessian = xtwx + &input.penalty_hessian;
+        let mut penalized_hessian = weighted_crossprod_cpu(input.x, input.weights)?;
+        penalized_hessian += &input.penalty_hessian;
         if input.lm_ridge != 0.0 {
             for i in 0..p {
                 penalized_hessian[[i, i]] += input.lm_ridge;
