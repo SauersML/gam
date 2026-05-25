@@ -33,6 +33,7 @@ from ._api import (
     bspline_basis,
     bspline_basis_derivative,
     build_info,
+    conditional_prior_ivae,
     cross_fit_shared_precision_groups,
     cuda_diagnostics,
     duchon_basis,
@@ -62,6 +63,7 @@ from ._api import (
     gaussian_weighted_ridge_batch,
     load,
     loads,
+    mechanism_sparsity_jacobian,
     periodic_spline_curve_basis,
     smoothness_penalty,
     sphere_basis,
@@ -93,8 +95,6 @@ from ._penalties import (
     TopKActivationPenalty,
     TotalVariationPenalty,
 )
-from . import identifiability
-from .identifiability import conditional_prior_ivae, mechanism_sparsity_jacobian
 from .topology import (
     Circle,
     Cylinder,
@@ -346,7 +346,6 @@ __all__ = [
     "gumbel_geometric_schedule",
     "gumbel_linear_schedule",
     "gumbel_reciprocal_iter_schedule",
-    "identifiability",
     "load",
     "load_posterior",
     "loads",

@@ -8,6 +8,8 @@ import numpy as np
 
 import gamfit
 
+CYCLIC_FORMULA = "y ~ s(theta, periodic=true, period=2*pi)"
+
 
 def make_circle_3d(n: int = 220, seed: int = 0) -> tuple[np.ndarray, ...]:
     """Tilted noisy circle in R^3, parameterized by theta in [0, 2*pi)."""
@@ -33,14 +35,7 @@ def make_circle_3d(n: int = 220, seed: int = 0) -> tuple[np.ndarray, ...]:
     return theta, noisy[0], noisy[1], noisy[2], clean[0], clean[1], clean[2]
 
 
-def fit_cyclic(theta: np.ndarray, y: np.ndarray):
-    return gamfit.fit(
-        {"theta": theta.tolist(), "y": y.tolist()},
-        "y ~ s(theta, periodic=true, period=2*pi)",
-    )
-
-
-def predict_curve(models: tuple[object, ...], n_grid: int = 401) -> tuple[np.ndarray, ...]:
+def predict_curve(models: list[object], n_grid: int = 401) -> tuple[np.ndarray, ...]:
     grid = np.linspace(0.0, 2.0 * np.pi, n_grid)
     payload = {"theta": grid.tolist()}
     fits = [
@@ -52,12 +47,12 @@ def predict_curve(models: tuple[object, ...], n_grid: int = 401) -> tuple[np.nda
 
 def main() -> Path:
     theta, nx, ny, nz, tx, ty, tz = make_circle_3d()
-
-    mx = fit_cyclic(theta, nx)
-    my = fit_cyclic(theta, ny)
-    mz = fit_cyclic(theta, nz)
-
-    _, fx, fy, fz = predict_curve((mx, my, mz))
+    theta_values = theta.tolist()
+    models = [
+        gamfit.fit({"theta": theta_values, "y": y.tolist()}, CYCLIC_FORMULA)
+        for y in (nx, ny, nz)
+    ]
+    _, fx, fy, fz = predict_curve(models)
 
     fig = plt.figure(figsize=(8, 6.5))
     ax = fig.add_subplot(111, projection="3d")
@@ -65,8 +60,14 @@ def main() -> Path:
     ax.scatter(nx, ny, nz, s=10, color="#9ca3af", alpha=0.6, label="noisy samples")
     order = np.argsort(theta)
     ax.plot(
-        tx[order], ty[order], tz[order],
-        color="#10b981", linewidth=1.0, linestyle="--", alpha=0.7, label="truth",
+        tx[order],
+        ty[order],
+        tz[order],
+        color="#10b981",
+        linewidth=1.0,
+        linestyle="--",
+        alpha=0.7,
+        label="truth",
     )
     ax.plot(fx, fy, fz, color="#dc2626", linewidth=2.2, label="cyclic GAM fit")
 
