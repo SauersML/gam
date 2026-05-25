@@ -1,28 +1,17 @@
-"""Render two hero figures from real `gamfit` fits.
-
-Outputs (both written into docs/images/):
-- surface_fit_hero.png : data → fitted mean → predictive SE for one smooth.
-- smooth_zoo.png       : same data fit with four smooth families side-by-side
-                         (thin-plate, Matérn, Duchon, tensor product).
-
-Run from anywhere; paths are resolved relative to this file.
-"""
+"""Render docs hero figures from real `gamfit` fits."""
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.axes import Axes
+from matplotlib.colorbar import Colorbar
 
 import gamfit
 
 
-# ---------------------------------------------------------------------------
-# Editorial style — thin spines, white background, modest fonts
-# ---------------------------------------------------------------------------
 mpl.rcParams.update(
     {
         "figure.facecolor": "white",
@@ -63,7 +52,6 @@ DOCS_IMAGES.mkdir(parents=True, exist_ok=True)
 
 
 def truth(x1: np.ndarray, x2: np.ndarray) -> np.ndarray:
-    """A smooth, fittable 2-D field: two gaussian bumps + a gentle slope."""
     bump_a = 1.2 * np.exp(-((x1 - 0.3) ** 2 + (x2 - 0.65) ** 2) / 0.07)
     bump_b = -0.8 * np.exp(-((x1 - 0.72) ** 2 + (x2 - 0.28) ** 2) / 0.05)
     slope = 0.4 * (x1 - 0.5) + 0.2 * (x2 - 0.5)
@@ -94,7 +82,7 @@ def grid_predict(
     return gx, gy, mean, se
 
 
-def style_colorbar(cbar: Any) -> None:
+def style_colorbar(cbar: Colorbar) -> None:
     cbar.outline.set_linewidth(0.3)
     cbar.outline.set_edgecolor("#9ca3af")
     cbar.ax.tick_params(width=0.4, length=2.5, labelsize=7.5, color="#9ca3af")
@@ -112,9 +100,6 @@ def style_square_axes(ax: Axes, *, xlabel: str | None, ylabel: str | None) -> No
     ax.set_aspect("equal")
 
 
-# ---------------------------------------------------------------------------
-# Figure 1: data → fitted mean → predictive SE
-# ---------------------------------------------------------------------------
 def render_hero() -> Path:
     data = make_data()
     x1 = np.asarray(data["x1"])
@@ -124,7 +109,6 @@ def render_hero() -> Path:
     model = gamfit.fit(data, "y ~ matern(x1, x2)", response_geometry=None)
     gx, gy, mean, se = grid_predict(model, side=140, with_se=True)
 
-    # shared color scale for the data scatter and the fitted mean
     vmin = float(min(y.min(), mean.min()))
     vmax = float(max(y.max(), mean.max()))
 
@@ -170,9 +154,6 @@ def render_hero() -> Path:
     return out
 
 
-# ---------------------------------------------------------------------------
-# Figure 2: four smooth families side by side on the same data
-# ---------------------------------------------------------------------------
 def render_zoo() -> Path:
     data = make_data()
     x1 = np.asarray(data["x1"])
