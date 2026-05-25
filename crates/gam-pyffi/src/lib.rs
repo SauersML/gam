@@ -1320,6 +1320,19 @@ fn numeric_matrix_validate<'py>(
 }
 
 #[pyfunction]
+fn numeric_matrix_f64<'py>(
+    py: Python<'py>,
+    values: &Bound<'py, PyAny>,
+    label: &str,
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    let np = py.import("numpy")?;
+    let kwargs = PyDict::new(py);
+    kwargs.set_item("dtype", "float")?;
+    let array = np.call_method("asarray", (values,), Some(&kwargs))?;
+    numeric_matrix_validate(py, &array, label)
+}
+
+#[pyfunction]
 fn marginal_slope_clip_probabilities(values: Vec<f64>) -> PyResult<Vec<f64>> {
     Ok(values
         .into_iter()
@@ -12980,6 +12993,141 @@ fn survival_matrix_from_risk_calibration<'py>(
     .unbind())
 }
 
+#[pyfunction(signature = (event_times, events, grid, survival_matrix, null_survival_matrix = None, eps = 1e-12))]
+fn survival_lifted_metrics_from_predictions<'py>(
+    py: Python<'py>,
+    event_times: Vec<f64>,
+    events: Vec<f64>,
+    grid: Vec<f64>,
+    survival_matrix: PyReadonlyArray2<'py, f64>,
+    null_survival_matrix: Option<PyReadonlyArray2<'py, f64>>,
+    eps: f64,
+) -> PyResult<Py<PyDict>> {
+    let out = PyDict::new(py);
+    let none_result = |out: &Bound<'_, PyDict>| -> PyResult<Py<PyDict>> {
+        out.set_item("brier", py.None())?;
+        out.set_item("logloss", py.None())?;
+        out.set_item("nagelkerke_r2", py.None())?;
+        Ok(out.clone().unbind())
+    };
+    let obs: Vec<bool> = events.into_iter().map(|value| value > 0.5).collect();
+    let mut surv = survival_matrix.as_array().to_owned();
+    if event_times.len() != obs.len()
+        || surv.nrows() != event_times.len()
+        || surv.ncols() != grid.len()
+        || grid.len() < 2
+        || grid.windows(2).any(|pair| pair[1] <= pair[0])
+    {
+        return none_result(&out);
+    }
+    for mut row in surv.rows_mut() {
+        row[0] = 1.0;
+        let mut prev = 1.0;
+        for value in row.iter_mut() {
+            *value = value.clamp(eps, 1.0).min(prev);
+            prev = *value;
+        }
+    }
+    let dt: Vec<f64> = grid.windows(2).map(|pair| pair[1] - pair[0]).collect();
+    let cumhaz = surv.mapv(|value| -value.clamp(eps, 1.0).ln());
+    let mut haz = Array2::<f64>::zeros((surv.nrows(), surv.ncols() - 1));
+    for row in 0..surv.nrows() {
+        for col in 0..surv.ncols() - 1 {
+            haz[[row, col]] = ((cumhaz[[row, col + 1]] - cumhaz[[row, col]]) / dt[col]).max(0.0);
+        }
+    }
+    let mut haz_sq_prefix = Array2::<f64>::zeros((surv.nrows(), surv.ncols()));
+    for row in 0..surv.nrows() {
+        for col in 0..haz.ncols() {
+            haz_sq_prefix[[row, col + 1]] =
+                haz_sq_prefix[[row, col]] + haz[[row, col]] * haz[[row, col]] * dt[col];
+        }
+    }
+    let mut log_losses = vec![0.0; event_times.len()];
+    let mut brier_losses = vec![0.0; event_times.len()];
+    for (row, &time) in event_times.iter().enumerate() {
+        if !time.is_finite() || time <= 0.0 {
+            return none_result(&out);
+        }
+        let mut j = grid.partition_point(|value| *value < time);
+        if j >= grid.len() {
+            j = grid.len() - 1;
+        }
+        let interval_idx = j.saturating_sub(1);
+        let (h_z, h2_int, hcum_z) = if (grid[j] - time).abs() <= 1.0e-12 {
+            (haz[[row, interval_idx]], haz_sq_prefix[[row, j]], cumhaz[[row, j]])
+        } else {
+            let elapsed = time - grid[interval_idx];
+            let h = haz[[row, interval_idx]];
+            (
+                h,
+                haz_sq_prefix[[row, interval_idx]] + h * h * elapsed,
+                cumhaz[[row, interval_idx]] + h * elapsed,
+            )
+        };
+        log_losses[row] = hcum_z - if obs[row] { h_z.max(eps).ln() } else { 0.0 };
+        brier_losses[row] = 0.5 * h2_int - if obs[row] { h_z } else { 0.0 };
+    }
+    let logloss = log_losses.iter().sum::<f64>() / log_losses.len() as f64;
+    let brier = brier_losses.iter().sum::<f64>() / brier_losses.len() as f64;
+    out.set_item("brier", brier)?;
+    out.set_item("logloss", logloss)?;
+
+    let mut nagelkerke = None;
+    if let Some(null_matrix) = null_survival_matrix {
+        let mut null_surv = null_matrix.as_array().to_owned();
+        if null_surv.dim() == surv.dim() {
+            for mut row in null_surv.rows_mut() {
+                row[0] = 1.0;
+                let mut prev = 1.0;
+                for value in row.iter_mut() {
+                    *value = value.clamp(eps, 1.0).min(prev);
+                    prev = *value;
+                }
+            }
+            let null_cumhaz = null_surv.mapv(|value| -value.clamp(eps, 1.0).ln());
+            let mut null_haz = Array2::<f64>::zeros((null_surv.nrows(), null_surv.ncols() - 1));
+            for row in 0..null_surv.nrows() {
+                for col in 0..null_surv.ncols() - 1 {
+                    null_haz[[row, col]] =
+                        ((null_cumhaz[[row, col + 1]] - null_cumhaz[[row, col]]) / dt[col])
+                            .max(0.0);
+                }
+            }
+            let mut null_log_losses = vec![0.0; event_times.len()];
+            for (row, &time) in event_times.iter().enumerate() {
+                let mut j = grid.partition_point(|value| *value < time);
+                if j >= grid.len() {
+                    j = grid.len() - 1;
+                }
+                let interval_idx = j.saturating_sub(1);
+                let (h_z, hcum_z) = if (grid[j] - time).abs() <= 1.0e-12 {
+                    (null_haz[[row, interval_idx]], null_cumhaz[[row, j]])
+                } else {
+                    let elapsed = time - grid[interval_idx];
+                    let h = null_haz[[row, interval_idx]];
+                    (h, null_cumhaz[[row, interval_idx]] + h * elapsed)
+                };
+                null_log_losses[row] =
+                    hcum_z - if obs[row] { h_z.max(eps).ln() } else { 0.0 };
+            }
+            let ll_model = -log_losses.iter().sum::<f64>();
+            let ll_null = -null_log_losses.iter().sum::<f64>();
+            let n = event_times.len() as f64;
+            let r2_cs = 1.0 - benchmark_exp_saturated((2.0 / n) * (ll_null - ll_model));
+            let max_r2_cs = 1.0 - benchmark_exp_saturated((2.0 / n) * ll_null);
+            if r2_cs.is_finite() && max_r2_cs.is_finite() && max_r2_cs > 0.0 {
+                nagelkerke = Some(r2_cs / max_r2_cs);
+            }
+        }
+    }
+    match nagelkerke {
+        Some(value) => out.set_item("nagelkerke_r2", value)?,
+        None => out.set_item("nagelkerke_r2", py.None())?,
+    }
+    Ok(out.unbind())
+}
+
 // =========================================================================
 // LatentCoord input-location derivative helpers (thin pyffi wrappers).
 //
@@ -16724,6 +16872,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(survival_block, module)?)?;
     module.add_function(wrap_pyfunction!(survival_ffi_surface, module)?)?;
     module.add_function(wrap_pyfunction!(numeric_matrix_validate, module)?)?;
+    module.add_function(wrap_pyfunction!(numeric_matrix_f64, module)?)?;
     module.add_function(wrap_pyfunction!(marginal_slope_clip_probabilities, module)?)?;
     module.add_function(wrap_pyfunction!(
         transformation_normal_z_from_columns,
@@ -16933,6 +17082,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyIBPAssignmentPenalty>()?;
     module.add_class::<ScadMcpPenalty>()?;
     module.add_class::<TotalVariationPenalty>()?;
+    module.add_class::<NuclearNormPenalty>()?;
     module.add_class::<MechanismSparsityPenalty>()?;
     Ok(())
 }
