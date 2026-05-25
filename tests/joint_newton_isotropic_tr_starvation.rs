@@ -74,14 +74,22 @@ fn build_anisotropic_block_fixture() -> (Array2<f64>, Array1<f64>, Array1<f64>) 
     // Time block: well-conditioned diag with eigenvalues in [1, 5].
     for i in 0..TIME_W {
         h[[i, i]] = 1.0 + (i as f64) * 0.3;
-        g[i] = if i == 0 { -1.5 } else { -0.3 - 0.07 * (i as f64) };
+        g[i] = if i == 0 {
+            -1.5
+        } else {
+            -0.3 - 0.07 * (i as f64)
+        };
     }
 
     // Marginal block: well-conditioned diag with eigenvalues in [1.2, 3.5].
     for j in 0..MARG_W {
         let row = TIME_W + j;
         h[[row, row]] = 1.2 + (j as f64) * 0.2;
-        g[row] = if j == 0 { -0.9 } else { -0.2 + 0.01 * (j as f64) };
+        g[row] = if j == 0 {
+            -0.9
+        } else {
+            -0.2 + 0.01 * (j as f64)
+        };
     }
 
     // Logslope block: one near-null direction (σ_min = 1e-10) plus 9
