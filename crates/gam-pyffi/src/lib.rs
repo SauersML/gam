@@ -16655,6 +16655,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<OrthogonalityPenalty>()?;
     module.add_class::<SoftmaxAssignmentSparsityPenalty>()?;
     module.add_class::<PyIBPAssignmentPenalty>()?;
+    module.add_class::<ScadMcpPenalty>()?;
     module.add_class::<TotalVariationPenalty>()?;
     Ok(())
 }
