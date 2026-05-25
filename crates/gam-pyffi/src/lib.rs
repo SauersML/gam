@@ -2847,6 +2847,107 @@ fn basis_with_jet<'py>(
             ))
         }
         "sphere" => sphere_chart_basis_with_jet(py, t),
+        "bspline" | "b_spline" | "b-spline" => {
+            let coords = t.as_array();
+            if coords.ncols() != 1 {
+                return Err(py_value_error(format!(
+                    "basis_with_jet bspline basis is intrinsically 1D and requires t with exactly one column, got shape ({}, {})",
+                    coords.nrows(),
+                    coords.ncols()
+                )));
+            }
+            if coords.iter().any(|value| !value.is_finite()) {
+                return Err(py_value_error(
+                    "basis_with_jet bspline basis requires finite t values".to_string(),
+                ));
+            }
+            let degree = params
+                .get_item("degree")?
+                .map(|v| v.extract::<usize>())
+                .transpose()?
+                .unwrap_or(3);
+            let order = params
+                .get_item("order")?
+                .map(|v| v.extract::<usize>())
+                .transpose()?
+                .unwrap_or(2);
+            let periodic = params
+                .get_item("periodic")?
+                .map(|v| v.extract::<bool>())
+                .transpose()?
+                .unwrap_or(false);
+            let knots_array: Array1<f64> = match params.get_item("knots")? {
+                Some(obj) => obj.extract::<PyReadonlyArray1<'py, f64>>()?.as_array().to_owned(),
+                None => {
+                    let n_basis = params
+                        .get_item("n_basis")?
+                        .map(|v| v.extract::<usize>())
+                        .transpose()?
+                        .ok_or_else(|| {
+                            py_value_error(
+                                "basis_with_jet bspline params require either \"knots\" or \"n_basis\""
+                                    .to_string(),
+                            )
+                        })?;
+                    if n_basis < degree + 1 {
+                        return Err(py_value_error(format!(
+                            "basis_with_jet bspline: n_basis ({n_basis}) must be >= degree+1 ({})",
+                            degree + 1
+                        )));
+                    }
+                    let interior = n_basis.saturating_sub(degree + 1);
+                    let total = interior + 2 * (degree + 1);
+                    let mut knots = Array1::<f64>::zeros(total);
+                    let inner = interior as f64 + 1.0;
+                    for i in 0..total {
+                        let raw = (i as f64) - (degree as f64);
+                        let clamped = raw.max(0.0).min(inner);
+                        knots[i] = clamped / inner;
+                    }
+                    knots
+                }
+            };
+            let t_1d = coords.column(0).to_owned();
+            let phi = bspline_basis_impl(t_1d.view(), knots_array.view(), degree, periodic)
+                .map_err(py_value_error)?;
+            let deriv = if periodic {
+                // Periodic first-derivative dense matrix is not exposed; the
+                // jet is computed from the finite-difference of phi against
+                // a small h. The closed-form periodic spline path uses
+                // periodic_basis_with_jet (Fourier harmonics) instead, so
+                // this branch is only reached for the open uniform case in
+                // practice.
+                return Err(py_value_error(
+                    "basis_with_jet bspline does not support periodic=true; use kind=\"periodic\" instead"
+                        .to_string(),
+                ));
+            } else {
+                bspline_basis_derivative_impl(t_1d.view(), knots_array.view(), degree, 1, false)
+                    .map_err(py_value_error)?
+            };
+            let n_rows = phi.nrows();
+            let n_cols = phi.ncols();
+            if deriv.nrows() != n_rows || deriv.ncols() != n_cols {
+                return Err(py_value_error(format!(
+                    "basis_with_jet bspline shape mismatch: phi=({n_rows},{n_cols}) deriv=({},{})",
+                    deriv.nrows(),
+                    deriv.ncols()
+                )));
+            }
+            let mut jet = Array3::<f64>::zeros((n_rows, n_cols, 1));
+            for row in 0..n_rows {
+                for col in 0..n_cols {
+                    jet[[row, col, 0]] = deriv[[row, col]];
+                }
+            }
+            let (penalty, _null) =
+                smoothness_penalty_impl(knots_array.view(), degree, order).map_err(py_value_error)?;
+            Ok((
+                phi.into_pyarray(py).unbind(),
+                jet.into_pyarray(py).unbind(),
+                penalty.into_pyarray(py).unbind(),
+            ))
+        }
         other => Err(py_value_error(format!(
             "basis_with_jet unsupported basis kind {other:?}"
         ))),

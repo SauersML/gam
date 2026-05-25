@@ -262,6 +262,25 @@ mod tests {
     }
 
     #[test]
+    fn structural_key_extracts_diagnosis_only_for_cert_refused() {
+        let cert = cert_refused(0, "time_surface").failure;
+        let key = structural_key(&cert).expect("CertRefused must yield a structural key");
+        assert_eq!(key.0, KktRefusalDiagnosis::RankDeficientHPen);
+        assert_eq!(key.1.as_deref(), Some("time_surface"));
+
+        let domain = SeedRejection::from_message(
+            0,
+            "validation",
+            "likelihood evaluation failed: NaN response".to_string(),
+        )
+        .failure;
+        assert!(
+            structural_key(&domain).is_none(),
+            "non-cert-refused failures must not present a structural key"
+        );
+    }
+
+    #[test]
     fn startup_stats_categorises_cert_refused() {
         let rejections = vec![cert_refused(0, "time_surface"), cert_refused(1, "time_surface")];
         let stats = StartupStats::from_rejections(5, 5, 5, 0, &rejections);
@@ -302,6 +321,113 @@ mod tests {
             "likelihood evaluation failed: NaN response".to_string(),
         );
         assert!(uniform_structural_key(&[cert, domain], 2).is_none());
+    }
+
+    /// Simulates the outer seed loop's iterative behaviour: failures
+    /// arrive one at a time, and after each one we probe whether
+    /// `uniform_structural_key` is ready to fire the structural
+    /// early-exit (Stage 3). The contract is:
+    ///   - after one failure the key is not yet stable (min_count=2)
+    ///   - after two identical failures it fires
+    ///   - if the third failure deviates the key would no longer be uniform
+    /// The seed loop in `outer_strategy.rs` mirrors this exact pattern,
+    /// so the test pins the behaviour without needing to spin up the
+    /// full outer optimiser.
+    #[test]
+    fn iterative_loop_triggers_early_exit_at_second_uniform_failure() {
+        const MIN_COUNT: usize = 2;
+        let mut rejections: Vec<SeedRejection> = Vec::new();
+
+        rejections.push(cert_refused(0, "time_surface"));
+        assert!(
+            uniform_structural_key(&rejections, MIN_COUNT).is_none(),
+            "single failure must not trigger early-exit; threshold guards \
+             against transient one-off CertRefused at exploration seeds"
+        );
+
+        rejections.push(cert_refused(1, "time_surface"));
+        let key = uniform_structural_key(&rejections, MIN_COUNT)
+            .expect("second matching failure must trigger early-exit");
+        assert_eq!(key.0, KktRefusalDiagnosis::RankDeficientHPen);
+        assert_eq!(key.1.as_deref(), Some("time_surface"));
+
+        // If we kept iterating past early-exit (hypothetically) a
+        // deviating third failure would invalidate the key. Verify the
+        // equality check is strict on (diagnosis, block) — never on
+        // diagnosis alone.
+        rejections.push(cert_refused(2, "marginal"));
+        assert!(
+            uniform_structural_key(&rejections, MIN_COUNT).is_none(),
+            "structural key must be invalidated when a sibling block \
+             carries the residual at a later seed"
+        );
+    }
+
+    /// Pins the structural-cause hint copy. The phrasing names the
+    /// user's next action so the error is actionable; the test guards
+    /// against accidental message regressions when the diagnosis enum
+    /// is extended.
+    #[test]
+    fn structural_diagnosis_hint_names_next_action_per_diagnosis() {
+        let rank = structural_diagnosis_hint(&(
+            KktRefusalDiagnosis::RankDeficientHPen,
+            Some("time_surface".to_string()),
+        ));
+        assert!(rank.contains("structural rank deficiency"));
+        assert!(rank.contains("time_surface"));
+        assert!(rank.contains("reduce the smooth's knot count"));
+
+        let phantom = structural_diagnosis_hint(&(
+            KktRefusalDiagnosis::PhantomMultiplierWithWellConditionedH,
+            None,
+        ));
+        assert!(phantom.contains("phantom multiplier"));
+        assert!(phantom.contains("the smooth carrying the dominant KKT residual"));
+
+        let active = structural_diagnosis_hint(&(
+            KktRefusalDiagnosis::ActiveSetIncomplete,
+            Some("constraint_block".to_string()),
+        ));
+        assert!(active.contains("incomplete active set"));
+        assert!(active.contains("constraint_block"));
+    }
+
+    /// Smoke test that the full final-error formatter (used by
+    /// `run_outer_with_plan` when no seed converges) builds a payload
+    /// that names every field the user needs to triage a failed fit:
+    /// honest counters, per-category breakdown, structural hint, and
+    /// the original per-seed messages.
+    #[test]
+    fn format_no_seeds_passed_payload_carries_full_triage_surface() {
+        let rejections = vec![
+            cert_refused(0, "time_surface"),
+            cert_refused(1, "time_surface"),
+            cert_refused(2, "time_surface"),
+        ];
+        let stats = StartupStats::from_rejections(5, 5, 3, 0, &rejections);
+        let key = uniform_structural_key(&rejections, 2);
+        let msg = format_no_seeds_passed(
+            "custom family",
+            &stats,
+            &rejections,
+            key.as_ref(),
+            "early-exit triggered: every observed seed reported the same structural CertRefused",
+        );
+        // Honest counters
+        assert!(msg.contains("generated=5"));
+        assert!(msg.contains("exact_validated=3"));
+        assert!(msg.contains("solver_started=0"));
+        // Per-category breakdown
+        assert!(msg.contains("rejected_by_kkt=3"));
+        // Structural diagnosis
+        assert!(msg.contains("diagnosis=rank_deficient_H_pen"));
+        assert!(msg.contains("carrying-block=time_surface"));
+        assert!(msg.contains("structural rank deficiency"));
+        // Early-exit note
+        assert!(msg.contains("early-exit triggered"));
+        // Per-seed reasons preserved (the original messages still bubble)
+        assert!(msg.contains("seed 0 (validation)"));
+        assert!(msg.contains("seed 2 (validation)"));
     }
 
     #[test]
