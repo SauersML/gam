@@ -470,3 +470,93 @@ fn feasibility_alpha_preserves_the_joint_newton_direction() {
          into ascent; got model change {block_local_change:.3e}",
     );
 }
+
+// ────────────────────────────────────────────────────────────────────
+// Mechanism D: penalised Newton on a *genuinely ill-posed* problem.
+//
+// Setup: H_pen = -∇²ℓ + S has a null direction u (eigenvalue 0). The
+// gradient g satisfies uᵀg ≠ 0.
+//
+// First-principles math: along the line β + t·u, the penalised
+// objective is
+//
+//     f(β + t·u) = f(β) + t·(uᵀ∇f)        (curvature term uᵀH_pen u = 0)
+//
+// linear in t. There is NO minimum — the objective slopes to ±∞.
+// No β* with ∇f(β*) = 0 exists; the penalised likelihood is
+// genuinely unbounded below along u.
+//
+// Consequence for Newton: the truncated-pseudoinverse step
+// δ = -H_pen⁺ g lives in range(H_pen) by construction, so Hδ ∈
+// range(H_pen) and the null component of g + Hδ is exactly uᵀg ≠ 0.
+// The unprojected residual cannot shrink; linearised_rel is bounded
+// below by |uᵀg| / (1 + ‖g‖).
+//
+// The only mathematically valid responses are:
+//
+//   (i)  Detect ill-posedness at construction time and fail with a
+//        clear diagnostic that names the null direction. The user
+//        must add a constraint, drop a basis column, or supply a
+//        prior.
+//   (ii) Add an explicit, documented prior on u (i.e. a small ridge
+//        in the null direction). This changes the model, not just
+//        the solver — so it must be opt-in at the smooth-construction
+//        level, not silently added inside the inner solver.
+//   (iii) Reparameterise to remove u from the free parameters.
+//
+// Range-projecting the convergence test (`‖U_rangeᵀ g‖ < tol`) would
+// silently certify a non-stationary β and break the IFT/envelope
+// identity dV/dρ = ∂f/∂ρ for the original objective, because the
+// outer derivation assumes g(β*(ρ)) = 0 in the full space.
+// ────────────────────────────────────────────────────────────────────
+
+#[test]
+fn null_subspace_of_h_pen_with_nonzero_gradient_is_ill_posed() {
+    // H_pen with rank 1 in a 2-D system. Eigenvalues: 1, 0. The null
+    // direction is e_2.
+    let h = ndarray::array![[1.0, 0.0], [0.0, 0.0]];
+    let g = ndarray::array![-1.0, -1.0];
+
+    // The truncated-pseudoinverse Newton step. Only the rank-1
+    // component contributes; δ lives in range(H) = span(e_1).
+    let delta = ndarray::array![1.0_f64, 0.0];
+    let residual = &g + &h.dot(&delta);
+    let g_inf = g.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+    let residual_inf = residual.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+    let linearized_rel = residual_inf / (1.0 + g_inf);
+
+    eprintln!(
+        "[mechanism-D] H_pen rank-deficient, uᵀg = -1: δ̂ = ({:.3}, {:.3}), \
+         residual = ({:.3}, {:.3}), linearised_rel = {:.3}",
+        delta[0], delta[1], residual[0], residual[1], linearized_rel,
+    );
+
+    // Math fact: every Newton-type step lives in range(H_pen), so the
+    // null component of the residual equals the null component of g
+    // forever. There is no β at which ∇f = 0.
+    assert!(
+        linearized_rel >= 0.5,
+        "for H_pen with null direction u and uᵀg ≠ 0, ‖g + Hδ‖∞ / (1 + ‖g‖∞) \
+         is bounded below by |uᵀg| / (1 + ‖g‖∞). No Newton-type step can \
+         reduce it. Got linearised_rel = {linearized_rel:.3}.",
+    );
+
+    // The unambiguous detector of ill-posedness: for any u ∈ null(H_pen),
+    // check whether uᵀg / ‖u‖ exceeds the gradient tolerance. If so the
+    // objective is non-stationary along u and the fit is ill-posed.
+    let u = ndarray::array![0.0_f64, 1.0]; // spans null(H)
+    let u_dot_g = u.dot(&g);
+    let u_norm = u.dot(&u).sqrt();
+    let ill_posedness_score = u_dot_g.abs() / u_norm;
+    assert!(
+        ill_posedness_score > 1.0e-6,
+        "null(H_pen) carries gradient mass uᵀg/‖u‖ = {ill_posedness_score:.3e}; \
+         the penalised objective slopes linearly to ±∞ along u and admits \
+         no Newton stationary point. The principled responses are (i) error \
+         at construction with a diagnostic that names u, (ii) opt in to an \
+         explicit prior on null(S) at the smooth definition site, or \
+         (iii) reparameterise to drop u from the free parameters. \
+         Silently certifying ‖U_rangeᵀ g‖ < tol would break the IFT envelope \
+         identity for the original objective.",
+    );
+}
