@@ -444,7 +444,7 @@ fn feasibility_alpha_limits_only_the_constrained_block() {
     // Sanity: full Newton kills g exactly.
     let exact_residual = &g + &h.dot(&delta_hat);
     assert!(
-        exact_residual.iter().all(|v| v.abs() < 1e-12),
+        exact_residual.iter().all(|v| (*v).abs() < 1e-12),
         "unconstrained Newton must be exact on this 2-block linear system"
     );
 

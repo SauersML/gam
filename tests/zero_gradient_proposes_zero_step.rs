@@ -4,8 +4,11 @@ use ndarray::{Array1, ArrayView1, arr1};
 struct Flat;
 
 impl RiemannianObjective for Flat {
-    fn value_gradient(&mut self, point: ArrayView1<'_, f64>) -> gam::GeometryResult<(f64, Array1<f64>)> {
-        Ok((point.sum()*0.0 + 1.0, arr1(&[0.0, 0.0, 0.0])))
+    fn value_gradient(
+        &mut self,
+        point: ArrayView1<'_, f64>,
+    ) -> gam::GeometryResult<(f64, Array1<f64>)> {
+        Ok((point.sum() * 0.0 + 1.0, arr1(&[0.0, 0.0, 0.0])))
     }
 }
 

@@ -1,7 +1,10 @@
-use gam::estimate::{fit_gam, fit_gamwith_heuristic_lambdas, FitOptions, FittedLinkState};
+use gam::estimate::{FitOptions, FittedLinkState, fit_gam, fit_gamwith_heuristic_lambdas};
 use gam::smooth::BlockwisePenalty;
-use gam::types::{InverseLink, LatentCLogLogState, LikelihoodSpec, LinkComponent, LinkFunction, MixtureLinkSpec, ResponseFamily, SasLinkSpec};
-use ndarray::{array, Array1, Array2};
+use gam::types::{
+    InverseLink, LatentCLogLogState, LikelihoodSpec, LinkComponent, LinkFunction, MixtureLinkSpec,
+    ResponseFamily, SasLinkSpec,
+};
+use ndarray::{Array1, Array2, array};
 
 fn base_opts() -> FitOptions {
     FitOptions {
@@ -24,7 +27,13 @@ fn base_opts() -> FitOptions {
     }
 }
 
-fn tiny_problem() -> (Array2<f64>, Array1<f64>, Array1<f64>, Array1<f64>, Vec<BlockwisePenalty>) {
+fn tiny_problem() -> (
+    Array2<f64>,
+    Array1<f64>,
+    Array1<f64>,
+    Array1<f64>,
+    Vec<BlockwisePenalty>,
+) {
     let x = array![[1.0, -1.0], [1.0, -0.2], [1.0, 0.4], [1.0, 1.2]];
     let y = array![0.0, 0.0, 1.0, 1.0];
     let w = Array1::ones(4);
@@ -42,10 +51,28 @@ fn fit_gam_preserves_parameterized_mixture_state_in_reported_family() {
         initial_rho: array![0.3],
     });
     opts.optimize_mixture = false;
-    let family = LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Logit));
-    let fit = fit_gam(x.view(), y.view(), w.view(), offset.view(), &s, family, &opts).expect("fit should succeed");
+    let family = LikelihoodSpec::new(
+        ResponseFamily::Binomial,
+        InverseLink::Standard(LinkFunction::Logit),
+    );
+    let fit = fit_gam(
+        x.view(),
+        y.view(),
+        w.view(),
+        offset.view(),
+        &s,
+        family,
+        &opts,
+    )
+    .expect("fit should succeed");
 
-    assert!(matches!(fit.likelihood_family.as_ref().map(|f| &f.link), Some(InverseLink::Mixture(_))), "expected successful fit to keep mixture link state in likelihood_family");
+    assert!(
+        matches!(
+            fit.likelihood_family.as_ref().map(|f| &f.link),
+            Some(InverseLink::Mixture(_))
+        ),
+        "expected successful fit to keep mixture link state in likelihood_family"
+    );
 }
 
 #[test]
@@ -53,26 +80,59 @@ fn fit_gam_preserves_parameterized_latent_cloglog_state_in_reported_family() {
     let (x, y, w, offset, s) = tiny_problem();
     let mut opts = base_opts();
     opts.latent_cloglog = Some(LatentCLogLogState::new(0.7).expect("valid latent sd"));
-    let family = LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::CLogLog));
-    let fit = fit_gam(x.view(), y.view(), w.view(), offset.view(), &s, family, &opts).expect("fit should succeed");
+    let family = LikelihoodSpec::new(
+        ResponseFamily::Binomial,
+        InverseLink::Standard(LinkFunction::CLogLog),
+    );
+    let fit = fit_gam(
+        x.view(),
+        y.view(),
+        w.view(),
+        offset.view(),
+        &s,
+        family,
+        &opts,
+    )
+    .expect("fit should succeed");
 
-    assert!(matches!(fit.likelihood_family.as_ref().map(|f| &f.link), Some(InverseLink::LatentCLogLog(state)) if (state.latent_sd - 0.7).abs() < 1e-12), "expected successful fit to keep latent cloglog state in likelihood_family");
+    assert!(
+        matches!(fit.likelihood_family.as_ref().map(|f| &f.link), Some(InverseLink::LatentCLogLog(state)) if (state.latent_sd - 0.7).abs() < 1e-12),
+        "expected successful fit to keep latent cloglog state in likelihood_family"
+    );
 }
 
 #[test]
 fn resolve_external_family_rejects_beta_response_with_clear_error() {
     let (x, y, w, offset, s) = tiny_problem();
     let opts = base_opts();
-    let family = LikelihoodSpec::new(ResponseFamily::Beta { phi: 5.0 }, InverseLink::Standard(LinkFunction::Logit));
-    let err = fit_gam(x.view(), y.view(), w.view(), offset.view(), &s, family, &opts).expect_err("beta family should be rejected on external design path");
-    assert!(err.to_string().to_lowercase().contains("glm"), "expected unsupported external family error message to clearly explain GLM routing");
+    let family = LikelihoodSpec::new(
+        ResponseFamily::Beta { phi: 5.0 },
+        InverseLink::Standard(LinkFunction::Logit),
+    );
+    let err = fit_gam(
+        x.view(),
+        y.view(),
+        w.view(),
+        offset.view(),
+        &s,
+        family,
+        &opts,
+    )
+    .expect_err("beta family should be rejected on external design path");
+    assert!(
+        err.to_string().to_lowercase().contains("glm"),
+        "expected unsupported external family error message to clearly explain GLM routing"
+    );
 }
 
 #[test]
 fn heuristic_lambdas_are_used_as_initial_rho_for_reml() {
     let (x, y, w, offset, s) = tiny_problem();
     let opts = base_opts();
-    let family = LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Logit));
+    let family = LikelihoodSpec::new(
+        ResponseFamily::Binomial,
+        InverseLink::Standard(LinkFunction::Logit),
+    );
     let fit = fit_gamwith_heuristic_lambdas(
         x.view(),
         y.view(),
@@ -85,26 +145,65 @@ fn heuristic_lambdas_are_used_as_initial_rho_for_reml() {
     )
     .expect("fit should succeed");
 
-    assert!((fit.log_lambdas[0] - 2.5).abs() < 1e-8, "expected heuristic lambdas to be used as initial rho when provided");
+    assert!(
+        (fit.log_lambdas[0] - 2.5).abs() < 1e-8,
+        "expected heuristic lambdas to be used as initial rho when provided"
+    );
 }
 
 #[test]
 fn fitted_link_state_returns_none_for_standard_links() {
     let (x, y, w, offset, s) = tiny_problem();
     let opts = base_opts();
-    let family = LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Logit));
-    let fit = fit_gam(x.view(), y.view(), w.view(), offset.view(), &s, family.clone(), &opts).expect("fit should succeed");
+    let family = LikelihoodSpec::new(
+        ResponseFamily::Binomial,
+        InverseLink::Standard(LinkFunction::Logit),
+    );
+    let fit = fit_gam(
+        x.view(),
+        y.view(),
+        w.view(),
+        offset.view(),
+        &s,
+        family.clone(),
+        &opts,
+    )
+    .expect("fit should succeed");
 
-    assert!(matches!(fit.fitted_link_state(&family).expect("state should decode"), FittedLinkState::Standard(None)), "expected fitted_link_state to return None payload for standard links");
+    assert!(
+        matches!(
+            fit.fitted_link_state(&family).expect("state should decode"),
+            FittedLinkState::Standard(None)
+        ),
+        "expected fitted_link_state to return None payload for standard links"
+    );
 }
 
 #[test]
 fn sas_link_options_only_apply_to_sas_families() {
     let (x, y, w, offset, s) = tiny_problem();
     let mut opts = base_opts();
-    opts.sas_link = Some(SasLinkSpec { initial_epsilon: 0.2, initial_log_delta: -0.1 });
-    let family = LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Logit));
-    let err = fit_gam(x.view(), y.view(), w.view(), offset.view(), &s, family, &opts).expect_err("non-SAS family should reject SAS options");
+    opts.sas_link = Some(SasLinkSpec {
+        initial_epsilon: 0.2,
+        initial_log_delta: -0.1,
+    });
+    let family = LikelihoodSpec::new(
+        ResponseFamily::Binomial,
+        InverseLink::Standard(LinkFunction::Logit),
+    );
+    let err = fit_gam(
+        x.view(),
+        y.view(),
+        w.view(),
+        offset.view(),
+        &s,
+        family,
+        &opts,
+    )
+    .expect_err("non-SAS family should reject SAS options");
 
-    assert!(err.to_string().to_lowercase().contains("sas"), "expected non-SAS family path to reject SAS options with a clear message");
+    assert!(
+        err.to_string().to_lowercase().contains("sas"),
+        "expected non-SAS family path to reject SAS options with a clear message"
+    );
 }
