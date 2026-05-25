@@ -241,7 +241,7 @@ pub(crate) fn prime_outer_seed(
 /// `initial_beta` seeds the inner solve at ρ₀ (zero vector is fine —
 /// ρ₀ is in the strongly-convex regime). `bounds_upper` clamps ρ₀ to
 /// the legal box.
-pub(crate) fn fit_with_continuation(
+fn fit_with_continuation(
     obj: &mut dyn OuterObjective,
     target: &Array1<f64>,
     bounds_upper: &Array1<f64>,
