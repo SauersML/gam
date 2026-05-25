@@ -90,7 +90,8 @@ pub use geometry::{
 };
 pub use gpu::GpuPolicy;
 pub use inference::{
-    alo, data, diagnostics, generative, hmc, predict, probability, quadrature, sample, smooth_test,
+    alo, data, diagnostics, generative, hmc, polya_gamma, predict, probability, quadrature, sample,
+    smooth_test,
 };
 pub use linalg::{faer_ndarray, matrix, utils};
 pub use resource::{

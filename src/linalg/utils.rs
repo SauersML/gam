@@ -567,7 +567,16 @@ impl PcgDiagnostics {
     fn condition_estimate(&self) -> Option<f64> {
         // Build the CG Lanczos tridiagonal for the preconditioned operator.
         // For SPD CG, T has diagonal 1/a_i + b_{i-1}/a_{i-1} and off-diagonal
-        // sqrt(b_i)/a_i. Its extremal eigenvalues are Ritz estimates.
+        // sqrt(b_i)/a_i. Its eigenvalues are the Ritz estimates of the
+        // preconditioned operator's spectrum; cond ≈ λ_max(T) / λ_min(T).
+        //
+        // Previous code substituted Gershgorin disc bounds for the Ritz
+        // values. Those bounds are guaranteed *enclosures*, not estimates:
+        // they are systematically pessimistic and frequently produce a
+        // negative lower bound even for SPD T, which then collapsed the
+        // condition estimate to `None` and lost the diagnostic. With k ≤ 256
+        // a direct symmetric eigensolve is microseconds and yields the
+        // genuine Ritz values.
         let k = self.alpha.len();
         if k == 0 || k > 256 {
             return None;
@@ -597,15 +606,21 @@ impl PcgDiagnostics {
                 t[[i + 1, i]] = off;
             }
         }
+        let (evals, _) = t.eigh(Side::Lower).ok()?;
         let mut lower = f64::INFINITY;
-        let mut upper = 0.0_f64;
-        for i in 0..k {
-            let radius = if i > 0 { t[[i, i - 1]].abs() } else { 0.0 }
-                + if i + 1 < k { t[[i, i + 1]].abs() } else { 0.0 };
-            lower = lower.min(t[[i, i]] - radius);
-            upper = upper.max(t[[i, i]] + radius);
+        let mut upper = f64::NEG_INFINITY;
+        for &v in evals.iter() {
+            if !v.is_finite() {
+                return None;
+            }
+            if v < lower {
+                lower = v;
+            }
+            if v > upper {
+                upper = v;
+            }
         }
-        if lower.is_finite() && lower > 0.0 && upper.is_finite() && upper > 0.0 {
+        if lower > 0.0 && upper > 0.0 {
             Some(upper / lower)
         } else {
             None
