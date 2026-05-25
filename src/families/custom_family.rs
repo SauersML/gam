@@ -27237,7 +27237,7 @@ mod tests {
         };
         let s_lambda = Array2::<f64>::zeros((3, 3));
         let raw_delta = array![2.0, -1.0, 2.0e5];
-        let raw_inf = raw_delta.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+        let raw_inf = raw_delta.iter().fold(0.0_f64, |m, v| m.max((*v).abs()));
         let radius = 20.0_f64;
 
         let raw_inf_scaled = &raw_delta * (radius / raw_inf);

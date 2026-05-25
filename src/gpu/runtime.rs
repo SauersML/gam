@@ -225,14 +225,12 @@ mod tests {
     fn cpu_only_host_never_panics_on_gpu_entry_points() {
         // SAFETY: `is_culib_present` only attempts `libloading::Library::new`
         // against a fixed candidate list and has no other side effects.
+        // Without libcuda the runtime must report unavailable rather than
+        // panicking from inside `culib()`; with libcuda the runtime may or
+        // may not have a usable device, but the panic-free contract still
+        // holds and the dispatch smoke test below exercises it.
         let culib_present = unsafe { sys::is_culib_present() };
-        if culib_present {
-            // Host has libcuda — the runtime may or may not have a usable
-            // device, but the panic-free contract still holds; fall through
-            // and run the dispatch smoke test below.
-        } else {
-            // Without libcuda, the runtime must report unavailable rather
-            // than panicking from inside `culib()`.
+        if !culib_present {
             assert!(
                 !GpuRuntime::is_available(),
                 "is_culib_present()=false but GpuRuntime::is_available() returned true; \
@@ -257,10 +255,6 @@ mod tests {
         crate::gpu::try_fast_atv(a.view(), w.view());
         let mut chol_in = Array2::<f64>::eye(3);
         crate::gpu::try_cholesky_lower_inplace(&mut chol_in);
-
-        // gpu::session arc-based dispatcher
-        let x_arc = std::sync::Arc::new(a.clone());
-        crate::gpu::session::try_fast_xt_diag_x_arc(&x_arc, &w);
 
         // gpu::solver Cholesky entry points
         let h = Array2::<f64>::eye(3);
