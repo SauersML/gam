@@ -1,10 +1,10 @@
 use gam::terms::basis::{
-    bspline_tensor_first_derivative, build_matern_basis,
-    build_matern_basis_log_kappa_derivative, build_periodic_bspline_basis_1d,
-    periodic_bspline_first_derivative_nd, sphere_first_derivative_nd, CenterStrategy,
-    MaternBasisSpec, MaternIdentifiability, MaternNu, PeriodicBSplineBasisSpec,
+    CenterStrategy, MaternBasisSpec, MaternIdentifiability, MaternNu, PeriodicBSplineBasisSpec,
+    bspline_tensor_first_derivative, build_matern_basis, build_matern_basis_log_kappa_derivative,
+    build_periodic_bspline_basis_1d, periodic_bspline_first_derivative_nd,
+    sphere_first_derivative_nd,
 };
-use ndarray::{array, Array1};
+use ndarray::{Array1, array};
 
 #[test]
 fn periodic_radial_input_loc_grad_1d_is_continuous_at_period_boundary() {
@@ -61,8 +61,13 @@ fn basis_input_loc_grad_matches_bspline_finite_difference() {
     let x0 = 0.37_f64;
     let h = 1e-6_f64;
     let x = array![[x0]];
-    let jet = periodic_bspline_first_derivative_nd(x.view(), (origin, origin + period), degree, num_basis)
-        .expect("derivative jet should evaluate");
+    let jet = periodic_bspline_first_derivative_nd(
+        x.view(),
+        (origin, origin + period),
+        degree,
+        num_basis,
+    )
+    .expect("derivative jet should evaluate");
     let spec = PeriodicBSplineBasisSpec::new(degree, num_basis, period, origin, 2);
     let plus = build_periodic_bspline_basis_1d(Array1::from(vec![x0 + h]).view(), &spec)
         .expect("plus basis");
@@ -83,11 +88,14 @@ fn basis_input_loc_grad_matches_bspline_finite_difference() {
 #[test]
 fn tensor_product_input_loc_grad_matches_product_rule() {
     let t = array![[0.33, 0.61]];
-    let k1 = Array1::from(vec![0.0,0.0,0.0,0.5,1.0,1.0,1.0]);
-    let k2 = Array1::from(vec![0.0,0.0,0.0,0.4,0.8,1.0,1.0,1.0]);
-    let jet = bspline_tensor_first_derivative(t.view(), &[k1.view(), k2.view()], &[2,2])
+    let k1 = Array1::from(vec![0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0]);
+    let k2 = Array1::from(vec![0.0, 0.0, 0.0, 0.4, 0.8, 1.0, 1.0, 1.0]);
+    let jet = bspline_tensor_first_derivative(t.view(), &[k1.view(), k2.view()], &[2, 2])
         .expect("tensor derivative should evaluate");
-    assert!(jet.iter().all(|v| v.is_finite()), "Tensor input-location gradient should be finite and follow product-rule decomposition");
+    assert!(
+        jet.iter().all(|v| v.is_finite()),
+        "Tensor input-location gradient should be finite and follow product-rule decomposition"
+    );
 }
 
 #[test]
@@ -106,7 +114,7 @@ fn matern_gradient_dkappa_matches_finite_difference() {
     };
     let analytic = build_matern_basis_log_kappa_derivative(data.view(), &spec)
         .expect("analytic derivative should build");
-    let eps = 1e-6;
+    let eps = 1.0e-6_f64;
     let kappa = 1.0 / spec.length_scale;
     let mut sp = spec.clone();
     let mut sm = spec.clone();
@@ -115,7 +123,10 @@ fn matern_gradient_dkappa_matches_finite_difference() {
     let plus = build_matern_basis(data.view(), &sp).expect("plus build");
     let minus = build_matern_basis(data.view(), &sm).expect("minus build");
     let fd = (plus.design.to_dense() - minus.design.to_dense()) / (2.0 * eps);
-    let err = (&analytic.design_derivative - &fd).iter().map(|v| v.abs()).fold(0.0, f64::max);
+    let err = (&analytic.design_derivative - &fd)
+        .iter()
+        .map(|v| v.abs())
+        .fold(0.0, f64::max);
     assert!(
         err < 1e-5,
         "Matérn derivative with respect to κ should match finite-difference to 1e-5; max error={err}"

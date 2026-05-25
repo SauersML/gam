@@ -1,10 +1,9 @@
 //! REML model comparison: ranking, deltas, Bayes-factor summary.
 //!
-//! Pure-Rust core shared by the CLI (`src/main.rs` → `gam compare_models`),
-//! the library, and the PyO3 wrapper in `crates/gam-pyffi`. Callers
-//! marshal their fits into [`RemlCandidate`] and receive a fully-typed
-//! [`RemlComparison`] back; only presentation-layer formatting differs
-//! per surface.
+//! Pure-Rust core consumed by the PyO3 wrapper in `crates/gam-pyffi`
+//! (`compare_reml_fits`). Callers marshal their fits into [`RemlCandidate`]
+//! and receive a fully-typed [`RemlComparison`] back; only presentation-layer
+//! formatting differs per surface.
 
 use std::cmp::Ordering;
 
