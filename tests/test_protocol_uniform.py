@@ -1,0 +1,129 @@
+"""Uniform callable-descriptor protocol tests.
+
+Covers the three sibling protocols introduced in :mod:`gamfit._protocol`:
+
+* :class:`ManifoldDescriptor` — ``exp``, ``log``, ``metric``, ``geodesic``,
+  ``dimension`` returning torch tensors with grad through inputs.
+* :class:`BasisDescriptor` — ``evaluate`` (and ``__call__``) returning a
+  design matrix.
+* :class:`PenaltyDescriptor` — composition via ``+`` produces a sum
+  composite whose ``value / value_grad / hvp / hessian_diag`` are sums
+  of the parts.
+
+The :class:`Smooth` compose API (``Smooth(latent=..., basis=...,
+penalty=...)``) is also exercised end-to-end, including the eager
+dim-mismatch check.
+"""
+
+from __future__ import annotations
+
+import math
+
+import pytest
+
+torch = pytest.importorskip("torch")
+
+import gamfit
+from gamfit.manifolds import Circle as ManifoldCircle
+from gamfit.manifolds import Sphere as ManifoldSphere
+
+
+def test_circle_exp_returns_tensor_with_grad_through_v() -> None:
+    M = ManifoldCircle()
+    assert M.dimension == 1
+    p = torch.tensor(0.0, dtype=torch.float64)
+    v = torch.tensor(0.5, dtype=torch.float64, requires_grad=True)
+    q = M.exp(p, v)
+    assert isinstance(q, torch.Tensor)
+    assert q.dtype == torch.float64
+    # exp(0, 0.5) = wrap(0.5) = 0.5
+    assert q.item() == pytest.approx(0.5, abs=1e-12)
+    # Gradient through v
+    q.backward()
+    assert v.grad is not None
+    assert v.grad.item() == pytest.approx(1.0, abs=1e-12)
+
+
+def test_sphere_metric_is_symmetric_psd() -> None:
+    M = ManifoldSphere(intrinsic_dim=2)
+    for _ in range(5):
+        p_raw = torch.randn(3, dtype=torch.float64)
+        p = p_raw / torch.linalg.vector_norm(p_raw)
+        g = M.metric(p)
+        # Symmetric
+        assert torch.allclose(g, g.T, atol=1e-12)
+        # PSD with rank intrinsic_dim (one zero eigenvalue along p)
+        eigvals = torch.linalg.eigvalsh(g)
+        assert (eigvals >= -1e-10).all()
+        # Tangent rank = 2: two near-1 eigenvalues, one near-0
+        sorted_e = torch.sort(eigvals).values
+        assert sorted_e[0].item() == pytest.approx(0.0, abs=1e-10)
+        assert sorted_e[1].item() == pytest.approx(1.0, abs=1e-10)
+        assert sorted_e[2].item() == pytest.approx(1.0, abs=1e-10)
+
+
+def test_fourier_evaluate_matches_periodic_harmonic() -> None:
+    fourier = gamfit.Fourier(harmonics=3)
+    ph = gamfit.PeriodicHarmonic(num_basis=7)
+    theta = torch.linspace(0.0, 2.0 * math.pi, 32, dtype=torch.float64)
+    phi_a = fourier.evaluate(theta)
+    phi_b = ph.evaluate(theta)
+    assert phi_a.shape == (32, 7)
+    assert torch.allclose(phi_a, phi_b, atol=1e-14)
+    # Callable surface
+    assert torch.allclose(fourier(theta), phi_a, atol=1e-14)
+
+
+def test_penalty_composition_hvp_is_sum_of_parts() -> None:
+    pa = gamfit.ARDPenalty(weight=0.1)
+    pb = gamfit.IBPPenalty(alpha=1.0, tau=1.0)
+    composite = pa + pb
+    from gamfit._composite_penalty import CompositePenalty
+    assert isinstance(composite, CompositePenalty)
+    assert len(composite) == 2
+
+    t = torch.randn(4, 3, dtype=torch.float64) * 0.3
+    v = torch.randn_like(t)
+    hv_a = pa.hvp(t, v)
+    hv_b = pb.hvp(t, v)
+    hv_c = composite.hvp(t, v)
+    assert torch.allclose(hv_c, hv_a + hv_b, atol=1e-10)
+
+
+def test_smooth_compose_circle_fourier_evaluate_matches_basis() -> None:
+    sm = gamfit.Smooth(
+        latent=ManifoldCircle(),
+        basis=gamfit.Fourier(harmonics=3),
+        penalty=gamfit.ARDPenalty(weight=0.1),
+    )
+    theta = torch.linspace(0.0, 2.0 * math.pi, 16, dtype=torch.float64)
+    phi_sm = sm.evaluate(theta)
+    phi_b = sm.basis.evaluate(theta)
+    assert torch.allclose(phi_sm, phi_b, atol=1e-14)
+    assert sm(theta).shape == phi_sm.shape
+
+
+def test_smooth_dim_mismatch_raises_eagerly() -> None:
+    # Sphere has dimension=2; Fourier(harmonics=3) has input_dim=1.
+    with pytest.raises(ValueError, match="incompatible|input_dim|dimension"):
+        gamfit.Smooth(
+            latent=ManifoldSphere(intrinsic_dim=2),
+            basis=gamfit.Fourier(harmonics=3),
+        )
+
+
+def test_smooth_to_dict_roundtrip() -> None:
+    sm = gamfit.Smooth(
+        latent=ManifoldCircle(),
+        basis=gamfit.Fourier(harmonics=3),
+        name="phase",
+    )
+    d = sm.to_dict()
+    assert d["kind"] == "composed_smooth"
+    assert d["name"] == "phase"
+    assert d["latent"]["kind"] == "circle"
+    assert d["basis"]["kind"] == "periodic_harmonic"
+
+    sm2 = gamfit.Smooth.from_dict(d)
+    theta = torch.linspace(0.0, 2.0 * math.pi, 8, dtype=torch.float64)
+    assert torch.allclose(sm.evaluate(theta), sm2.evaluate(theta), atol=1e-14)
