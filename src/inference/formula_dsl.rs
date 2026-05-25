@@ -1899,7 +1899,7 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
             }
             _ => {
                 return Err(format!(
-                    "unknown term function in '{raw}'. Supported: bounded(), linear(), constrain(), nonnegative(), nonpositive(), smooth(), cyclic()/cc()/cp(), thinplate(), tensor(), group(), matern(), duchon(), linkwiggle(), timewiggle(), link(), survmodel()"
+                    "unknown term function `{name}` in '{raw}'. Supported: bounded(), linear(), constrain()/constraint()/box(), nonnegative(), nonpositive(), smooth()/s(), cyclic()/cc()/cp(), thinplate()/thin_plate()/tps(), tensor()/interaction()/te(), fs(), sz(), group()/re(), sphere()/sos()/spherical(), s2(), matern(), duchon(), pca(), logslope()/log_slope(), linkwiggle(), timewiggle(), link(), survmodel()"
                 ));
             }
         }

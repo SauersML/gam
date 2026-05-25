@@ -658,6 +658,8 @@ def _interpolate_rows(
     query: Any,
     *,
     clip: tuple[float | None, float | None],
+    left_value: float | None = None,
+    right_value: float | None = None,
 ) -> Any:
     clip_lo, clip_hi = clip
     return rust_module().interpolate_rows(
@@ -665,7 +667,29 @@ def _interpolate_rows(
         surface,
         query,
         clip_lo, clip_hi,
+        left_value,
+        right_value,
     )
+
+
+# Asymptotic boundary values for survival-related surfaces. Used when callers
+# evaluate the surface strictly outside the modeled time grid: rather than
+# clamping to the nearest endpoint (which is meaningful for an estimate but
+# semantically wrong as an extrapolation), we return the value the surface
+# *must* take in that regime by definition.
+#   * survival(t) at t<=0 is 1 (no one has failed yet); at t->inf it is 0
+#     (under the standard assumption that everyone eventually fails).
+#   * cumulative hazard mirrors survival via H(t) = -log S(t).
+#   * Hazard / standard-error surfaces have no canonical asymptote, so we
+#     leave them on the default nearest-endpoint behavior.
+_SURVIVAL_EXTRAPOLATION = {
+    "survival": (1.0, 0.0),
+    "cumulative_hazard": (0.0, None),
+}
+
+
+def _extrapolation_for(kind: str) -> tuple[float | None, float | None]:
+    return _SURVIVAL_EXTRAPOLATION.get(kind, (None, None))
 
 
 __all__ = [
