@@ -281,6 +281,7 @@ class SurvivalPrediction:
             return None
         people_chunk = _validate_survival_chunk_size(people_chunk, "people_chunk")
         time_grid_chunk = _validate_survival_chunk_size(time_grid_chunk, "time_grid_chunk")
+        left_value, right_value = _extrapolation_for(kind)
 
         def chunks() -> Any:
             for row_start in range(0, surface.shape[0], people_chunk):

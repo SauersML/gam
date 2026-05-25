@@ -1,4 +1,4 @@
-use ndarray::{Array1, ArrayView1};
+use ndarray::{Array1, Array2, ArrayView1};
 
 use crate::geometry::manifold::{GeometryResult, RiemannianManifold, check_len};
 
@@ -18,6 +18,16 @@ impl Default for GeodesicIntegrator {
 }
 
 impl GeodesicIntegrator {
+    /// Integrate the geodesic ODE on the manifold by composing the closed-form
+    /// geodesic flow `exp_p(v · h)` with parallel transport of the velocity
+    /// along that segment. This is the mathematically correct flow on every
+    /// Riemannian manifold whose `RiemannianManifold` impl supplies an
+    /// `exp_map` and `parallel_transport` consistent with its metric — it
+    /// reduces to a Christoffel-driven leap-frog integrator on coordinates
+    /// where Γ ≡ 0 (e.g. Euclidean / flat tori) but stays on the manifold
+    /// and conserves the Riemannian kinetic energy on positively curved
+    /// spaces such as the sphere, which previously drifted off because the
+    /// extrinsic Christoffel symbols are not zero.
     pub fn integrate(
         &self,
         manifold: &dyn RiemannianManifold,
@@ -32,30 +42,15 @@ impl GeodesicIntegrator {
         let steps = self.steps.max(1);
         let h = self.step_size;
         for _ in 0..steps {
-            let a = acceleration(manifold, x.view(), v.view())?;
-            x = &x + &(v.clone() * h) + &(a.clone() * (0.5 * h * h));
-            v = manifold.project_tangent(x.view(), (&v + &(a * h)).view())?;
+            let step_tangent = &v * h;
+            let x_next = manifold.exp_map(x.view(), step_tangent.view())?;
+            let mut path = Array2::<f64>::zeros((2, d));
+            path.row_mut(0).assign(&x);
+            path.row_mut(1).assign(&x_next);
+            let v_next = manifold.parallel_transport(path.view(), v.view())?;
+            x = x_next;
+            v = manifold.project_tangent(x.view(), v_next.view())?;
         }
-        manifold.retract(point, manifold.log_map(point, x.view())?.view())
+        Ok(x)
     }
-}
-
-fn acceleration(
-    manifold: &dyn RiemannianManifold,
-    point: ArrayView1<'_, f64>,
-    velocity: ArrayView1<'_, f64>,
-) -> GeometryResult<Array1<f64>> {
-    let gamma = manifold.christoffel_symbols(point)?;
-    let d = velocity.len();
-    let mut out = Array1::<f64>::zeros(d);
-    for k in 0..d {
-        let mut acc = 0.0;
-        for i in 0..d {
-            for j in 0..d {
-                acc -= gamma[k][[i, j]] * velocity[i] * velocity[j];
-            }
-        }
-        out[k] = acc;
-    }
-    Ok(out)
 }
