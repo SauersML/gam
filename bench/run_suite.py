@@ -784,7 +784,12 @@ def auc_score(y: np.ndarray, p: np.ndarray) -> float:
 
 
 def brier_score(y: np.ndarray, p: np.ndarray) -> float:
-    return float(np.mean((y - p) ** 2))
+    diagnostics = _gamfit_rust().diagnostics_from_predictions(
+        np.asarray(y, dtype=float).reshape(-1).tolist(),
+        np.asarray(p, dtype=float).reshape(-1).tolist(),
+    )
+    rmse = float(dict(diagnostics["metrics"])["rmse"])
+    return float(rmse * rmse)
 
 
 def log_loss_score(y: np.ndarray, p: np.ndarray, eps: float = 1e-12) -> float:
