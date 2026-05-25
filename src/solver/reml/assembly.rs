@@ -16,8 +16,10 @@ use super::unified::{
 };
 use crate::faer_ndarray::fast_xt_diag_y;
 use ndarray::{Array1, Array2, ArrayView2};
-use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
-use rayon::slice::{ParallelSlice, ParallelSliceMut};
+use rayon::iter::{
+    IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
+};
+use rayon::slice::ParallelSliceMut;
 use std::sync::Arc;
 
 // ═══════════════════════════════════════════════════════════════════════════
