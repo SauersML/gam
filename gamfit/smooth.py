@@ -94,19 +94,6 @@ class Smooth(_BasisDescriptor):
         repr=False,
     )
 
-    def __new__(cls, *args: Any, **kwargs: Any):
-        # Four-tuple composition dispatch: ``Smooth(latent=..., basis=...,
-        # penalty=...)`` lowers through :func:`gamfit._compose.compose_smooth`
-        # to a :class:`ComposedSmooth` (a ``Smooth`` subclass). Subclass paths
-        # (Duchon, BSpline, ...) are untouched — their generated dataclass
-        # ``__init__`` runs after this returns a fresh blank instance via
-        # ``object.__new__``.
-        if cls is Smooth and "latent" in kwargs:
-            from ._compose import compose_smooth
-            latent = kwargs.pop("latent")
-            return compose_smooth(latent, *args, **kwargs)
-        return object.__new__(cls)
-
     # ------------------------------------------------------------------
     # Callable-basis protocol is inherited from
     # :class:`gamfit._basis_protocol.BasisDescriptor`. Concrete subclasses

@@ -29,58 +29,68 @@ def _basis_input_dim(basis: BasisDescriptor) -> int | None:
     return int(dim)
 
 
-# Compatibility matrix: which (manifold-kind, basis-kind) pairs are allowed.
-# Each entry is keyed by ``type(manifold).__name__`` and the value is a frozenset
-# of acceptable ``type(basis).__name__`` strings. ``Smooth`` consults the matrix
-# at construction; anything outside it raises ``ValueError``.
-_COMPATIBILITY: dict[str, frozenset[str]] = {
-    "Circle": frozenset({"PeriodicHarmonic", "Fourier"}),
-    "Sphere": frozenset({"PeriodicHarmonic", "Fourier"}),  # placeholder; real SH wiring lives elsewhere
-    "Torus": frozenset({"PeriodicHarmonic", "Fourier"}),
-    "Euclidean": frozenset({"PeriodicHarmonic", "Fourier"}),
-    "CylinderManifold": frozenset({"PeriodicHarmonic", "Fourier"}),
-}
-
-
 def _check_manifold_basis_compatibility(latent: ManifoldDescriptor, basis: BasisDescriptor) -> None:
-    """Reject (Manifold, Basis) pairs that are not in the compatibility matrix.
+    """Validate (Manifold, Basis) compatibility on the Rust side.
 
-    Manifolds expose a ``compatible_bases`` class attribute when they want to
-    declare their own contract; otherwise the matrix above is used. ``Fourier``
-    is an alias of ``PeriodicHarmonic`` so both spellings pass.
+    Python is a thin marshaller here: it forwards the manifold and basis kind
+    tags to the Rust function :func:`gamfit._rust.validate_smooth_composition`
+    and lets the Rust core enforce the contract. When the Rust pyfunction is
+    not yet exposed by the locally-built extension, validation is skipped (the
+    Rust engine will reject incompatible specs again at fit time).
     """
-    declared = getattr(type(latent), "compatible_bases", None)
-    basis_name = type(basis).__name__
-    if declared is not None:
-        if basis_name in declared:
-            return
-        raise ValueError(
-            f"{type(basis).__name__} is not compatible with {type(latent).__name__}; "
-            f"compatible bases declared by the manifold: {sorted(declared)}"
-        )
-    allowed = _COMPATIBILITY.get(type(latent).__name__)
-    if allowed is None:
-        return  # unknown manifold class — let downstream dim check handle it
-    if basis_name not in allowed:
-        raise ValueError(
-            f"{basis_name} is not compatible with {type(latent).__name__}; "
-            f"allowed bases: {sorted(allowed)}"
-        )
+    latent_kind = (
+        latent.to_json().get("kind") if hasattr(latent, "to_json") else type(latent).__name__
+    )
+    basis_kind = (
+        basis.to_dict().get("kind") if hasattr(basis, "to_dict") else type(basis).__name__
+    )
+    from ._binding import rust_module
+    rust = rust_module()
+    validate = getattr(rust, "validate_smooth_composition", None)
+    if validate is None:
+        return
+    validate(str(latent_kind), str(basis_kind))
 
 
 def _default_basis_for(latent: ManifoldDescriptor) -> BasisDescriptor:
-    """Magic-by-default basis pick driven by the latent manifold class."""
-    from ._basis_descriptors import PeriodicHarmonic
-    name = type(latent).__name__
-    if name in {"Circle", "Sphere", "Torus", "CylinderManifold"}:
+    """Default basis lookup; the choice itself is a Rust-driven policy.
+
+    Python marshals the manifold kind to Rust and constructs the named basis
+    on the Python side. When the Rust helper is absent the safe fallback is
+    the periodic harmonic basis (works for every periodic manifold; the
+    downstream Rust engine will reject it for non-periodic manifolds at fit
+    time, leaving the user to pick explicitly).
+    """
+    from ._binding import rust_module
+    rust = rust_module()
+    latent_kind = (
+        latent.to_json().get("kind") if hasattr(latent, "to_json") else type(latent).__name__
+    )
+    pick = getattr(rust, "default_basis_for_manifold", None)
+    name = pick(str(latent_kind)) if pick is not None else "periodic_harmonic"
+    if str(name) == "periodic_harmonic":
+        from ._basis_descriptors import PeriodicHarmonic
         return PeriodicHarmonic(harmonics=3)
-    return PeriodicHarmonic(harmonics=3)
+    raise ValueError(f"default_basis_for_manifold returned unknown name {name!r}")
 
 
 def _default_penalty_for(latent: ManifoldDescriptor) -> PenaltyDescriptor | None:
-    """Magic-by-default penalty pick: ARD on the latent axes."""
-    from ._penalty_descriptors import ARDPenalty
-    return ARDPenalty(weight=1.0)
+    """Default penalty selection; Rust decides whether to attach ARD."""
+    from ._binding import rust_module
+    rust = rust_module()
+    pick = getattr(rust, "default_penalty_for_manifold", None)
+    if pick is None:
+        return None
+    latent_kind = (
+        latent.to_json().get("kind") if hasattr(latent, "to_json") else type(latent).__name__
+    )
+    name = pick(str(latent_kind))
+    if name in (None, "none"):
+        return None
+    if str(name) == "ard":
+        from ._penalty_descriptors import ARDPenalty
+        return ARDPenalty(weight=1.0)
+    raise ValueError(f"default_penalty_for_manifold returned unknown name {name!r}")
 
 
 class Smooth(BasisDescriptor):

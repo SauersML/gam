@@ -22,12 +22,6 @@ from ._protocol import ManifoldDescriptor, _require_torch
 class Euclidean(ManifoldDescriptor):
     """Flat Euclidean manifold ``R^d`` with the identity metric."""
 
-    # Composition contract: bases ride on a Euclidean patch.
-    # ``PeriodicHarmonic`` is permitted because the protocol's only torch-side
-    # basis at present is the periodic harmonic family; richer Euclidean bases
-    # (B-spline, RBF, ...) get added to this set as their descriptors land.
-    compatible_bases = frozenset({"PeriodicHarmonic", "Fourier"})
-
     def __init__(self, dim: int) -> None:
         if int(dim) <= 0:
             raise ValueError("Euclidean.dim must be > 0")
@@ -64,10 +58,6 @@ class Euclidean(ManifoldDescriptor):
 class Circle(ManifoldDescriptor):
     """The unit circle ``S^1``. Points are angles in radians; ``exp`` wraps
     modulo ``2 pi`` to stay on the canonical chart ``(-pi, pi]``."""
-
-    # Composition contract: which BasisDescriptor classes ride on this manifold.
-    # Consumed by :func:`gamfit._smooth._check_manifold_basis_compatibility`.
-    compatible_bases = frozenset({"PeriodicHarmonic", "Fourier"})
 
     @property
     def dimension(self) -> int:

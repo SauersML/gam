@@ -20,6 +20,7 @@ pub mod orthogonality;
 pub mod parametric_row_precision_prior;
 pub mod row_precision_prior;
 pub mod scad_mcp;
+pub mod sheaf_consistency;
 pub mod softmax_assignment_sparsity;
 pub mod sparsity;
 pub mod topk_activation;
@@ -57,6 +58,7 @@ macro_rules! analytic_penalty_registry {
             register!(ScadMcp, ScadMcpPenalty);
             register!(BlockOrthogonality, BlockOrthogonalityPenalty);
             register!(Orthogonality, OrthogonalityPenalty);
+            register!(SheafConsistency, SheafConsistencyPenalty);
         }
     };
 }

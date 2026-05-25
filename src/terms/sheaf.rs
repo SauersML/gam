@@ -39,6 +39,7 @@ use faer::Side;
 use ndarray::{Array1, Array2, ArrayView1};
 
 use crate::linalg::faer_ndarray::FaerEigh;
+use crate::terms::analytic_penalties::{AnalyticPenalty, PenaltyTier};
 
 /// Threshold above which `harmonic_modes` switches from a dense faer eigen
 /// solve to a matrix-free Lanczos null-space count. The dense path
@@ -511,6 +512,100 @@ impl SheafConsistencyPenalty {
             Ok((evals, _)) => evals.iter().filter(|&&e| e < tol).count(),
             Err(err) => panic!("SheafConsistencyPenalty::harmonic_modes Lanczos eigh failed: {err:?}"),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AnalyticPenalty trait bridge.
+// ---------------------------------------------------------------------------
+//
+// Wires `SheafConsistencyPenalty` into the analytic-penalty registry so it is
+// reachable from REML / PIRLS / CLI callers exactly like ARDPenalty,
+// BlockOrthogonalityPenalty, etc. `target` is the stacked-stalk vector
+// (treated as a ψ-tier flat block); `rho` is unused — this penalty is
+// quadratic with a fixed scalar weight set at construction. The
+// `harmonic_modes` query and the per-vertex layout helpers remain available
+// as inherent methods for callers that want the cellular-sheaf-specific
+// diagnostics.
+
+impl AnalyticPenalty for SheafConsistencyPenalty {
+    fn tier(&self) -> PenaltyTier {
+        PenaltyTier::Psi
+    }
+
+    fn value(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> f64 {
+        assert!(
+            rho.iter().all(|x| x.is_finite()),
+            "SheafConsistencyPenalty: rho must be finite (got {rho:?})",
+        );
+        SheafConsistencyPenalty::value(self, target)
+    }
+
+    fn grad_target(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        assert!(
+            rho.iter().all(|x| x.is_finite()),
+            "SheafConsistencyPenalty: rho must be finite (got {rho:?})",
+        );
+        SheafConsistencyPenalty::gradient(self, target)
+    }
+
+    fn hessian_diag(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> Option<Array1<f64>> {
+        assert!(
+            rho.iter().all(|x| x.is_finite()),
+            "SheafConsistencyPenalty: rho must be finite (got {rho:?})",
+        );
+        Some(SheafConsistencyPenalty::hessian_diag(self, target))
+    }
+
+    fn hvp(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+        v: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        assert!(
+            rho.iter().all(|x| x.is_finite()),
+            "SheafConsistencyPenalty: rho must be finite (got {rho:?})",
+        );
+        SheafConsistencyPenalty::hvp(self, target, v)
+    }
+
+    fn grad_rho(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        // No learnable hyperparameter axes: rho_count == 0.
+        assert_eq!(
+            rho.len(),
+            0,
+            "SheafConsistencyPenalty: rho_count is 0 but rho has length {}",
+            rho.len(),
+        );
+        assert_eq!(
+            target.len(),
+            self.total_dim(),
+            "SheafConsistencyPenalty: target length {} != total stalk dim {}",
+            target.len(),
+            self.total_dim(),
+        );
+        Array1::<f64>::zeros(0)
+    }
+
+    fn rho_count(&self) -> usize {
+        0
+    }
+
+    fn name(&self) -> &str {
+        "SheafConsistencyPenalty"
     }
 }
 

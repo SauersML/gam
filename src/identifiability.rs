@@ -207,6 +207,151 @@ pub fn piecewise_linear_eval(
     out
 }
 
+/// Outcome of a 2D log-λ grid-search weight selection.
+///
+/// `evidence_grid[i, j]` is the Laplace-style log marginal-likelihood proxy
+/// at `(lam1_grid[i], lam2_grid[j])`:
+/// `evidence = −½ N log(RSS/N) − ½ (penalty)` with `RSS = rss_grid[i, j]`
+/// and `penalty = penalty_grid[i, j]`.
+///
+/// The winner is `argmax` over the grid; ties are broken by selecting the
+/// `(i, j)` with the smallest `i + j` (i.e. smallest log-weight sum on a
+/// log-spaced grid), then by smallest `i`, then smallest `j` — a fully
+/// deterministic, reproducible policy.
+#[derive(Debug, Clone)]
+pub struct WeightSearchResult {
+    pub best_i: usize,
+    pub best_j: usize,
+    pub best_lam1: f64,
+    pub best_lam2: f64,
+    pub best_evidence: f64,
+    pub evidence_grid: Array2<f64>,
+}
+
+/// Generic 2D log-λ weight-selection driver.
+///
+/// Given a precomputed `(G1, G2)` grid of residual sums-of-squares
+/// `rss_grid`, a matching grid of total-penalty values `penalty_grid`, and
+/// the two 1D weight grids `lam1_grid` / `lam2_grid`, computes the Laplace
+/// log marginal-likelihood proxy on every cell and returns the maximising
+/// cell with deterministic tie-breaking.
+///
+/// The primitive is intentionally agnostic to *what* the two penalty
+/// weights regularise — it takes only the RSS and penalty surfaces, so it
+/// can drive weight selection for any two-penalty model (identifiable
+/// factor model, double-penalty smooths, IBP + sparsity, etc.).
+pub fn identifiable_factor_select_weights(
+    rss_grid: ArrayView2<'_, f64>,
+    penalty_grid: ArrayView2<'_, f64>,
+    lam1_grid: ArrayView1<'_, f64>,
+    lam2_grid: ArrayView1<'_, f64>,
+    n_obs: usize,
+) -> Result<WeightSearchResult, String> {
+    let (g1, g2) = rss_grid.dim();
+    if penalty_grid.dim() != (g1, g2) {
+        return Err(format!(
+            "identifiable_factor_select_weights: penalty_grid shape {:?} \
+             must match rss_grid shape ({}, {})",
+            penalty_grid.dim(),
+            g1,
+            g2
+        ));
+    }
+    if lam1_grid.len() != g1 {
+        return Err(format!(
+            "identifiable_factor_select_weights: lam1_grid len {} must \
+             equal rss_grid rows {}",
+            lam1_grid.len(),
+            g1
+        ));
+    }
+    if lam2_grid.len() != g2 {
+        return Err(format!(
+            "identifiable_factor_select_weights: lam2_grid len {} must \
+             equal rss_grid cols {}",
+            lam2_grid.len(),
+            g2
+        ));
+    }
+    if g1 == 0 || g2 == 0 {
+        return Err("identifiable_factor_select_weights: grids must be non-empty".to_string());
+    }
+    if n_obs == 0 {
+        return Err("identifiable_factor_select_weights: n_obs must be > 0".to_string());
+    }
+    for v in rss_grid.iter() {
+        if !v.is_finite() || *v < 0.0 {
+            return Err(format!(
+                "identifiable_factor_select_weights: rss_grid contains non-finite or \
+                 negative value {v}"
+            ));
+        }
+    }
+    for v in penalty_grid.iter() {
+        if !v.is_finite() {
+            return Err(format!(
+                "identifiable_factor_select_weights: penalty_grid contains non-finite value {v}"
+            ));
+        }
+    }
+    for v in lam1_grid.iter().chain(lam2_grid.iter()) {
+        if !v.is_finite() || *v <= 0.0 {
+            return Err(format!(
+                "identifiable_factor_select_weights: λ grids must contain finite positive \
+                 values, got {v}"
+            ));
+        }
+    }
+
+    let n = n_obs as f64;
+    let rss_floor = 1.0e-300_f64;
+    let mut evidence_grid = Array2::<f64>::zeros((g1, g2));
+    let mut best: Option<(usize, usize, f64)> = None;
+    for i in 0..g1 {
+        for j in 0..g2 {
+            let rss = rss_grid[[i, j]];
+            let pen = penalty_grid[[i, j]];
+            let mean_sq = (rss / n).max(rss_floor);
+            let ev = -0.5 * n * mean_sq.ln() - 0.5 * pen;
+            evidence_grid[[i, j]] = ev;
+            let better = match best {
+                None => true,
+                Some((bi, bj, bev)) => {
+                    if ev > bev {
+                        true
+                    } else if ev == bev {
+                        let cur_sum = i + j;
+                        let best_sum = bi + bj;
+                        if cur_sum < best_sum {
+                            true
+                        } else if cur_sum == best_sum && i < bi {
+                            true
+                        } else {
+                            cur_sum == best_sum && i == bi && j < bj
+                        }
+                    } else {
+                        false
+                    }
+                }
+            };
+            if better {
+                best = Some((i, j, ev));
+            }
+        }
+    }
+    let (best_i, best_j, best_evidence) = best.ok_or_else(|| {
+        "identifiable_factor_select_weights: empty search (this is a bug)".to_string()
+    })?;
+    Ok(WeightSearchResult {
+        best_i,
+        best_j,
+        best_lam1: lam1_grid[best_i],
+        best_lam2: lam2_grid[best_j],
+        best_evidence,
+        evidence_grid,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
