@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import pytest
 
 from gamfit._tables import normalize_table, restore_output_table
