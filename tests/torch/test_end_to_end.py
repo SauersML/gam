@@ -2,8 +2,26 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from importlib import import_module
+from typing import Any, NoReturn, Protocol, TypeVar, cast
+
 import numpy as np
-import pytest
+
+_T = TypeVar("_T", bound=Callable[..., Any])
+
+
+class _PytestMark(Protocol):
+    def skipif(self, condition: bool, *, reason: str) -> Callable[[_T], _T]: ...
+
+
+class _Pytest(Protocol):
+    mark: _PytestMark
+
+    def skip(self, reason: str, *, allow_module_level: bool = False) -> NoReturn: ...
+
+
+pytest = cast(_Pytest, import_module("pytest"))
 
 try:
     import torch

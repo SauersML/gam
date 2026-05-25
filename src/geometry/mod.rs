@@ -5,6 +5,7 @@ pub mod integrator;
 pub mod manifold;
 pub mod optimizer;
 pub mod product;
+pub mod simplex;
 pub mod spd;
 pub mod sphere;
 pub mod stiefel;

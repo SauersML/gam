@@ -86,7 +86,9 @@ def restore_output_table(
 
         return pd.DataFrame(columns)
     if target == "polars":
-        import polars as pl
+        pl = _try_import("polars")
+        if pl is None:
+            raise ImportError("return_type 'polars' requires the polars package")
 
         return pl.DataFrame(columns)
     if target == "numpy":
@@ -95,7 +97,9 @@ def restore_output_table(
         ordered = list(columns)
         return np.column_stack([columns[name] for name in ordered])
     if target == "pyarrow":
-        import pyarrow as pa
+        pa = _try_import("pyarrow")
+        if pa is None:
+            raise ImportError("return_type 'pyarrow' requires the pyarrow package")
 
         return pa.table(columns)
     raise ValueError(f"unsupported return_type '{target}'")

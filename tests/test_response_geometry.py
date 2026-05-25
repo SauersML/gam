@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import numpy as np
-import pytest
 
 from gamfit._response_geometry import (
     ResponseGeometryModel,
@@ -67,8 +66,12 @@ def test_sphere_frechet_mean_is_intrinsic_and_log_exp_roundtrip() -> None:
 def test_sphere_antipodal_log_is_undefined_and_mean_is_not_endpoint() -> None:
     y = np.array([[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]], dtype=float)
 
-    with pytest.raises(ValueError, match="antipodal"):
+    try:
         sphere_log_map(y[1:], y[0])
+    except ValueError as exc:
+        assert "antipodal" in str(exc)
+    else:
+        raise AssertionError("sphere_log_map should reject antipodal points")
 
     mean = sphere_frechet_mean(y)
     assert np.isclose(np.linalg.norm(mean), 1.0)

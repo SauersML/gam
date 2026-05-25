@@ -20950,28 +20950,45 @@ mod tests {
         // β-scale O(1). The full gradient including the projected trace
         // pair should be of THE SAME ORDER (or smaller after cancellation),
         // never 10⁵× larger.
-        for (k, &g) in projected.gradient.iter().enumerate() {
-            let dominant_term = 0.5
-                * lams[k]
-                * match k {
-                    0 => beta_flat.slice(s![0..p_time]).dot(&fast_av(
-                        &s_time,
-                        &beta_flat.slice(s![0..p_time]).to_owned(),
-                    )),
-                    1 => beta_flat.slice(s![p_time..p_time + p_marg]).dot(&fast_av(
+        let dominant_terms = [
+            0.5 * lams[0]
+                * beta_flat.slice(s![0..p_time]).dot(&fast_av(
+                    &s_time,
+                    &beta_flat.slice(s![0..p_time]).to_owned(),
+                )),
+            0.5 * lams[1]
+                * beta_flat
+                    .slice(s![p_time..p_time + p_marg])
+                    .dot(&fast_av(
                         &s_marg_0,
                         &beta_flat.slice(s![p_time..p_time + p_marg]).to_owned(),
                     )),
-                    2 => beta_flat.slice(s![p_time..p_time + p_marg]).dot(&fast_av(
+            0.5 * lams[2]
+                * beta_flat
+                    .slice(s![p_time..p_time + p_marg])
+                    .dot(&fast_av(
                         &s_marg_1,
                         &beta_flat.slice(s![p_time..p_time + p_marg]).to_owned(),
                     )),
-                    3 => beta_flat.slice(s![p_time + p_marg..p_total]).dot(&fast_av(
+            0.5 * lams[3]
+                * beta_flat
+                    .slice(s![p_time + p_marg..p_total])
+                    .dot(&fast_av(
                         &s_logs,
                         &beta_flat.slice(s![p_time + p_marg..p_total]).to_owned(),
                     )),
-                    _ => unreachable!(),
-                };
+        ];
+        assert_eq!(
+            projected.gradient.len(),
+            dominant_terms.len(),
+            "projected gradient dimension changed"
+        );
+        for (k, (&g, &dominant_term)) in projected
+            .gradient
+            .iter()
+            .zip(dominant_terms.iter())
+            .enumerate()
+        {
             // Bound: trace pair adds ~p contributions, plus H⁻¹ Ḣ trace
             // bounded by Σ |λ_k| / |H_diag| × p ~ λ_k p / n ~ tiny at
             // biobank scale. Total gradient should be within 10× of the
@@ -23475,8 +23492,11 @@ mod tests {
             ridge > 1.0,
             "dense joint solver ridge should lift the negative eigenvalue; got {ridge}"
         );
-        let JointHessianSource::Dense(mut stabilized) = source else {
-            unreachable!("test source is dense");
+        let mut stabilized = match source {
+            JointHessianSource::Dense(matrix) => matrix,
+            JointHessianSource::Operator { .. } => {
+                panic!("dense joint solver fixture must use a dense Hessian source")
+            }
         };
         add_joint_penalty_to_matrix(&mut stabilized, &ranges, &s_lambdas, ridge);
         let min_eval = 0.5

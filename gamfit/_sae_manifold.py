@@ -283,7 +283,11 @@ def _bases(k_atoms: int, atom_basis: Any, atom_topology: str) -> list[str]:
 
 
 def _schedule_payload(schedule: GumbelTemperatureSchedule | Mapping[str, Any] | None) -> dict[str, Any] | None:
-    return None if schedule is None else schedule.to_rust_descriptor() if hasattr(schedule, "to_rust_descriptor") else dict(schedule)
+    if schedule is None:
+        return None
+    if isinstance(schedule, GumbelTemperatureSchedule):
+        return schedule.to_rust_descriptor()
+    return dict(schedule)
 
 
 def _schedule_tau_start(schedule: Any, default: float) -> float:

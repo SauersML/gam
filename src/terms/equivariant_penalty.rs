@@ -1,7 +1,7 @@
 use ndarray::{ArrayView1, ArrayView2, ArrayView3, ArrayViewD, IxDyn};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum EquivariantGroup {
+enum EquivariantGroup {
     SO2,
     SO3,
     R1,
@@ -14,7 +14,7 @@ impl EquivariantGroup {
             EquivariantGroup::SO2 => "SO2",
             EquivariantGroup::SO3 => "SO3",
             EquivariantGroup::R1 => "R1",
-            EquivariantGroup::Trivial => "Trivial",
+            EquivariantGroup::Trivial => "TRIVIAL",
         }
     }
 
@@ -23,6 +23,18 @@ impl EquivariantGroup {
             EquivariantGroup::SO2 => 2,
             EquivariantGroup::SO3 => 3,
             EquivariantGroup::R1 | EquivariantGroup::Trivial => 1,
+        }
+    }
+
+    fn parse(group: &str) -> Result<Self, String> {
+        match group {
+            "SO2" => Ok(EquivariantGroup::SO2),
+            "SO3" => Ok(EquivariantGroup::SO3),
+            "R1" => Ok(EquivariantGroup::R1),
+            "Trivial" | "TRIVIAL" => Ok(EquivariantGroup::Trivial),
+            other => Err(format!(
+                "group must be 'SO2', 'SO3', 'R1', or 'Trivial'; got {other:?}"
+            )),
         }
     }
 }
@@ -108,7 +120,7 @@ fn square_matmul(left: &[Vec<f64>], right: &[Vec<f64>], n: usize) -> Vec<Vec<f64
     out
 }
 
-pub fn equivariant_rotation(
+fn equivariant_rotation(
     group: EquivariantGroup,
     g: ArrayViewD<'_, f64>,
     batch: usize,
@@ -164,7 +176,7 @@ pub fn equivariant_rotation(
 }
 
 pub fn equivariant_penalty_value(
-    group: EquivariantGroup,
+    group: &str,
     w: ArrayView3<'_, f64>,
     g: ArrayViewD<'_, f64>,
     z: ArrayView2<'_, f64>,
@@ -180,6 +192,7 @@ pub fn equivariant_penalty_value(
             "ard_weight must be finite and >= 0, got {ard_weight}"
         ));
     }
+    let group = EquivariantGroup::parse(group)?;
     let expected_r = group.rep_dim();
     let (n_atoms, ambient_dim, rep_dim) = (w.shape()[0], w.shape()[1], w.shape()[2]);
     if rep_dim != expected_r {
@@ -192,9 +205,6 @@ pub fn equivariant_penalty_value(
         return Err(format!("z has {} atoms but W has {n_atoms}", z.ncols()));
     }
     let batches = z.nrows();
-    if batches == 0 || n_atoms == 0 {
-        return Err("z and W must contain at least one batch and one atom".to_string());
-    }
     if g.ndim() < 2 || g.shape()[0] != batches || g.shape()[1] != n_atoms {
         return Err(format!(
             "g leading dimensions must match z shape ({batches}, {n_atoms})"

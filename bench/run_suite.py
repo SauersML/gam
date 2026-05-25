@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING
 import argparse
 from collections import deque
 import importlib
+import importlib.util
 import json
 import math
 import os
@@ -20,11 +21,17 @@ from shutil import disk_usage
 from time import monotonic, perf_counter
 
 # Statistical-regression gate. Lives in bench/gate.py so it can
-# be invoked stand-alone post-hoc as well. Imported lazily-safely: if the
+# be invoked stand-alone post-hoc as well. Loaded lazily-safely: if the
 # module is unavailable for any reason the gate just stays quiet.
 try:
-    from gate import extract_fit_quality as _gate_extract_fit_quality
-    from gate import cmd_check_results as _gate_cmd_check_results
+    _gate_path = Path(__file__).resolve().parent / "gate.py"
+    _gate_spec = importlib.util.spec_from_file_location("_bench_gate", _gate_path)
+    if _gate_spec is None or _gate_spec.loader is None:
+        raise ImportError(f"failed to load statistical gate from {_gate_path}")
+    _gate_module = importlib.util.module_from_spec(_gate_spec)
+    _gate_spec.loader.exec_module(_gate_module)
+    _gate_extract_fit_quality = _gate_module.extract_fit_quality
+    _gate_cmd_check_results = _gate_module.cmd_check_results
 except Exception:  # pragma: no cover - bench infra only
     _gate_extract_fit_quality = None
     _gate_cmd_check_results = None
@@ -2214,8 +2221,9 @@ def _synthetic_hgdp_1kg_pc_panel() -> typing.Any:
                 rows.append(row)
                 sample_idx += 1
 
-    _SYNTHETIC_PC_PANEL = pd.DataFrame(rows)
-    return _SYNTHETIC_PC_PANEL.copy()
+    panel = pd.DataFrame(rows)
+    _SYNTHETIC_PC_PANEL = panel
+    return panel.copy()
 
 
 def _load_hgdp_pc_with_imputed_latlon() -> typing.Any:
@@ -2647,7 +2655,7 @@ def _downsample_binomial_dataset(
     return out
 
 
-def dataset_for_scenario(s: typing.Any) -> typing.Any:
+def dataset_for_scenario(s: typing.Any) -> dict[str, typing.Any]:
     name = s["name"]
     ds = _dataset_for_scenario_unvalidated(s)
     downsample_factor = _scenario_downsample_factor(name)
@@ -2669,7 +2677,7 @@ def dataset_for_scenario(s: typing.Any) -> typing.Any:
     return ds
 
 
-def folds_for_dataset(ds: typing.Any) -> typing.Any:
+def folds_for_dataset(ds: dict[str, typing.Any]) -> list[Fold]:
     n_splits = int(ds.get("_cv_splits", CV_SPLITS))
     if ds["family"] == "survival":
         _coerce_positive_survival_dataset_inplace(ds, dataset_name=ds.get("name", "survival_dataset"))
@@ -8130,7 +8138,7 @@ def run_external_xgboost_aft_cv(scenario: typing.Any, *, ds: dict[str, typing.An
     if ds["family"] != "survival":
         return None
     try:
-        import xgboost as xgb
+        xgb = importlib.import_module("xgboost")
     except _EXPECTED_OPTIONAL_IMPORT_FAILURES as e:
         return {
             "contender": "python_xgboost_aft",

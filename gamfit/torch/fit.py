@@ -48,6 +48,8 @@ from ._reml import (
     gaussian_reml_fit_with_constraints,
 )
 
+ShapeConstrainedSmooth = BSpline | Duchon
+
 
 # ---------------------------------------------------------------------------
 # FitResult — the user-facing output
@@ -350,7 +352,7 @@ def _shape_constraint_grid_1d(x: torch.Tensor) -> torch.Tensor:
 
 
 def _build_shape_constraint_inequality(
-    smooth: Smooth, points: torch.Tensor, shape_kind: str,
+    smooth: ShapeConstrainedSmooth, points: torch.Tensor, shape_kind: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build ``(A, b)`` for the inequality system ``A·β ≥ b`` enforcing
     ``shape_kind`` on ``smooth``'s 1D basis at a dense grid over the data
@@ -379,7 +381,7 @@ def _build_shape_constraint_inequality(
         b_grid = bspline_basis(
             grid_1d, knots, degree=smooth.degree, periodic=smooth.periodic,
         ).to(torch.float64).detach()
-    elif isinstance(smooth, Duchon):
+    else:
         centers = _coerce_2d(_to_tensor(smooth.centers, points), "Duchon.centers")
         if centers.shape[1] != 1:
             raise NotImplementedError(
@@ -393,11 +395,6 @@ def _build_shape_constraint_inequality(
         b_grid = duchon_basis(
             grid_1d.unsqueeze(1), centers, m=smooth.m, periodic_per_axis=per,
         ).to(torch.float64).detach()
-    else:
-        raise NotImplementedError(
-            f"shape_constraint not supported on the torch path for "
-            f"{type(smooth).__name__}; supported: BSpline, Duchon (d=1)."
-        )
 
     sk = shape_kind.lower()
     if sk in ("monotone_increasing", "monotone_decreasing"):
@@ -425,7 +422,7 @@ def _build_shape_constraint_inequality(
 
 
 def _fit_single_constrained(
-    smooth: Smooth,
+    smooth: ShapeConstrainedSmooth,
     points: torch.Tensor,
     response: torch.Tensor,
     *,
@@ -650,6 +647,11 @@ def fit(
                 "column response of shape (N,) or (N, 1); got shape "
                 f"{tuple(response_in.shape)}. Multi-output responses with "
                 "constraints are not yet supported."
+            )
+        if not isinstance(smooths, (BSpline, Duchon)):
+            raise NotImplementedError(
+                "shape_constraint not supported on the torch path for "
+                f"{type(smooths).__name__}; supported: BSpline, Duchon (d=1)."
             )
         return _fit_single_constrained(
             smooths, points, response_in, weights=weights, shape_kind=_shape,

@@ -1,11 +1,24 @@
-from __future__ import annotations
-
+import importlib
 import multiprocessing as mp
 import queue
 import time
-from typing import Any
+from typing import Any, NoReturn, Protocol, cast
 
-import pytest
+
+class _PytestModule(Protocol):
+    def importorskip(
+        self,
+        modname: str,
+        minversion: str | None = None,
+        reason: str | None = None,
+        *,
+        exc_type: type[ImportError] | tuple[type[ImportError], ...] | None = None,
+    ) -> Any: ...
+
+    def fail(self, reason: str = "", pytrace: bool = True) -> NoReturn: ...
+
+
+pytest = cast(_PytestModule, importlib.import_module("pytest"))
 
 pytest.importorskip("gamfit._rust")
 
@@ -141,7 +154,7 @@ def test_latent_survival_accepts_frailty_kwargs() -> None:
     assert validation.supported_by_python is True
 
 
-def _fit_marginal_slope_worker(result_queue: mp.Queue[Any]) -> None:
+def _fit_marginal_slope_worker(result_queue) -> None:
     try:
         gamfit.fit(
             make_weibull(220),
@@ -157,7 +170,7 @@ def _fit_marginal_slope_worker(result_queue: mp.Queue[Any]) -> None:
 
 
 def test_survival_marginal_slope_fit_returns() -> None:
-    result_queue: mp.Queue[Any] = mp.Queue()
+    result_queue = mp.Queue()
     proc = mp.Process(target=_fit_marginal_slope_worker, args=(result_queue,))
     start = time.monotonic()
     proc.start()

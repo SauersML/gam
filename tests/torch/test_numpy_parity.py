@@ -7,10 +7,12 @@ inputs to within fp64 rounding, since the underlying Rust call is identical.
 
 from __future__ import annotations
 
+import importlib
 from typing import Any
 
 import numpy as np
-import pytest
+
+pytest: Any = importlib.import_module("pytest")
 
 try:
     import torch

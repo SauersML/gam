@@ -18,6 +18,7 @@ from ._penalties import _validate_weight, ScalarWeightSchedule
 
 
 GroupName = Literal["SO2", "SO3", "R1", "Trivial"]
+AuxName = Literal["HSV", "RGB", "LCh"]
 
 GROUP_DIM = {"SO2": 1, "SO3": 3, "R1": 1, "Trivial": 0}
 GROUP_REP_DIM = {"SO2": 2, "SO3": 3, "R1": 1, "Trivial": 1}
@@ -166,7 +167,7 @@ class EquivariantPenalty:
 @dataclass
 class GaugeCompanion:
     """Auxiliary-supervised gauge-fix recipe wrapped into one object."""
-    aux: Literal["HSV", "RGB", "LCh"]
+    aux: AuxName
     d_aux: int = 3
     target: str = "lie"
     weight: float = 1.0
@@ -186,7 +187,7 @@ class GaugeCompanion:
         )
 
 
-def gauge_companion(aux: str = "HSV", d_aux: int = 3, weight: float = 1.0,
+def gauge_companion(aux: AuxName = "HSV", d_aux: int = 3, weight: float = 1.0,
                     target: str = "lie", aux_values: np.ndarray | None = None) -> GaugeCompanion:
     """One-call gauge-fix companion. See `GaugeCompanion` docstring."""
     return GaugeCompanion(aux=aux, d_aux=d_aux, weight=weight, target=target,
@@ -195,7 +196,7 @@ def gauge_companion(aux: str = "HSV", d_aux: int = 3, weight: float = 1.0,
 
 def equivariant_smooth(
     group: GroupName = "SO2",
-    aux: str | None = "HSV",
+    aux: AuxName | None = "HSV",
     n_atoms: int = 128,
     d_per_atom: int = 2,
     weight: float = 1.0,

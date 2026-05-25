@@ -15,6 +15,7 @@ pub mod penalties;
 pub mod penalty_op;
 pub mod sae_manifold;
 pub mod smooth;
+pub mod skip_transcoder;
 pub mod term_builder;
 pub mod torch_dispatch;
 

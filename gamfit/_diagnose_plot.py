@@ -69,6 +69,8 @@ def plot(
     )
     if ax is None:
         _, ax = plt.subplots()
+    if ax is None:
+        raise RuntimeError("matplotlib did not return an axes object")
 
     if kind == "prediction":
         response_name = diagnostics.response_name
