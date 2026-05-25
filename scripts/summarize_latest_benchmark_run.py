@@ -11,12 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
-
-ZoneInfo: Any
-try:
-    from zoneinfo import ZoneInfo
-except Exception:  # pragma: no cover
-    ZoneInfo = None
+from zoneinfo import ZoneInfo
 
 DEFAULT_WORKFLOW = "benchmark.yml"
 DEFAULT_OUT = Path("scripts/latest_benchmark_summary.md")
@@ -24,8 +19,8 @@ DEFAULT_LOCAL_TZ = "America/Chicago"
 PAGE_SIZE = 100
 
 
-def run_cmd(args: list[str], *, capture: bool = True) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(args, check=False, text=True, capture_output=capture)
+def run_cmd(args: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(args, check=False, text=True, capture_output=True)
 
 
 def gh_api_json(path: str) -> Any:
@@ -41,7 +36,6 @@ def parse_owner_repo() -> tuple[str, str]:
         raise RuntimeError("failed to read git origin URL")
     url = proc.stdout.strip()
     if url.startswith("git@"):
-        # git@github.com:owner/repo.git
         repo = url.split(":", 1)[1]
     else:
         p = urlparse(url)
@@ -61,6 +55,11 @@ def get_run(owner: str, repo: str, run_id: int) -> dict[str, Any]:
     return dict(payload)
 
 
+def is_benchmark_shard_artifact(artifact: dict[str, Any]) -> bool:
+    name = str(artifact.get("name", ""))
+    return name.startswith("bench-") and name != "bench-runtime" and not bool(artifact.get("expired", False))
+
+
 def get_recent_runs_with_shard_artifacts(owner: str, repo: str) -> list[int]:
     run_ids: list[int] = []
     seen: set[int] = set()
@@ -72,8 +71,7 @@ def get_recent_runs_with_shard_artifacts(owner: str, repo: str) -> list[int]:
         if not chunk:
             break
         for artifact in chunk:
-            name = str(artifact.get("name", ""))
-            if not name.startswith("bench-") or name == "bench-runtime" or bool(artifact.get("expired", False)):
+            if not is_benchmark_shard_artifact(artifact):
                 continue
             workflow_run = artifact.get("workflow_run") or {}
             run_id = workflow_run.get("id")
@@ -135,20 +133,11 @@ def rank_values(values: list[float], *, higher_is_better: bool) -> list[int]:
     return ranks
 
 
-def fmt_float(v: Any, digits: int = 6) -> str:
+def fmt_number(v: Any, digits: int) -> str:
     if v is None:
         return ""
     try:
         return f"{float(v):.{digits}f}"
-    except Exception:
-        return ""
-
-
-def fmt_secs(v: Any) -> str:
-    if v is None:
-        return ""
-    try:
-        return f"{float(v):.3f}"
     except Exception:
         return ""
 
@@ -191,7 +180,6 @@ def render_scenario_block(name: str, rows: list[dict[str, Any]], run_ts_utc: dat
     if not ok_rows:
         return ""
 
-    # ranks per metric among rows with non-null value
     rank_maps: dict[str, dict[int, int]] = {}
     for _, key, higher in metrics:
         idx = [int(r["_row_idx"]) for r in ok_rows if r.get(key) is not None]
@@ -213,13 +201,8 @@ def render_scenario_block(name: str, rows: list[dict[str, Any]], run_ts_utc: dat
         ),
     )
 
-    ts_local_txt = ""
-    if ZoneInfo is not None:
-        try:
-            local_dt = run_ts_utc.astimezone(ZoneInfo(tz_name))
-            ts_local_txt = f" ({local_dt.strftime('%Y-%m-%d %H:%M:%S')} {tz_name})"
-        except Exception:
-            ts_local_txt = ""
+    local_dt = run_ts_utc.astimezone(ZoneInfo(tz_name))
+    ts_local_txt = f" ({local_dt.strftime('%Y-%m-%d %H:%M:%S')} {tz_name})"
 
     out: list[str] = []
     out.append(f"**Scenario:** `{name}` ({family})")
@@ -247,11 +230,11 @@ def render_scenario_block(name: str, rows: list[dict[str, Any]], run_ts_utc: dat
         row_idx = int(r.get("_row_idx", -1))
         row_cells = [f"`{r.get('contender','')}`"]
         for _, key, _ in metrics:
-            row_cells.append(fmt_float(r.get(key), 6))
+            row_cells.append(fmt_number(r.get(key), 6))
             rk = rank_maps.get(key, {}).get(row_idx)
             row_cells.append(str(rk) if rk is not None else "")
-        row_cells.append(fmt_secs(r.get("fit_sec")))
-        row_cells.append(fmt_secs(r.get("predict_sec")))
+        row_cells.append(fmt_number(r.get("fit_sec"), 3))
+        row_cells.append(fmt_number(r.get("predict_sec"), 3))
         out.append("| " + " | ".join(row_cells) + " |")
 
     out.append("")
@@ -265,13 +248,7 @@ def render_scenario_block(name: str, rows: list[dict[str, Any]], run_ts_utc: dat
 
 def load_rows_from_run(owner: str, repo: str, run_id: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     artifacts = list_artifacts(owner, repo, run_id)
-    shard_artifacts = [
-        a
-        for a in artifacts
-        if str(a.get("name", "")).startswith("bench-")
-        and str(a.get("name", "")) != "bench-runtime"
-        and not bool(a.get("expired", False))
-    ]
+    shard_artifacts = [a for a in artifacts if is_benchmark_shard_artifact(a)]
 
     rows: list[dict[str, Any]] = []
     with tempfile.TemporaryDirectory(prefix="gha_bench_summary_") as td:
