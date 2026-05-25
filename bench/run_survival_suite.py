@@ -28,6 +28,12 @@ DEFAULT_SURVIVAL_SCENARIOS = [
 ]
 
 
+def run_cmd(cmd: list[str]) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    env.update(SERIAL_ENV_OVERRIDES)
+    return subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, env=env)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Run survival benchmarks with leakage-safe 5-fold CV only."
@@ -57,9 +63,7 @@ def main() -> int:
     for scenario in scenarios:
         cmd.extend(["--scenario-name", scenario])
 
-    env = os.environ.copy()
-    env.update(SERIAL_ENV_OVERRIDES)
-    proc = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, env=env)
+    proc = run_cmd(cmd)
     if proc.returncode != 0:
         print((proc.stderr or proc.stdout).strip(), file=sys.stderr)
         return proc.returncode
