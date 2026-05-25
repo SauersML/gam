@@ -3637,9 +3637,12 @@ impl FixedPointObjective for OuterFixedPointBridge<'_> {
         // locally quadratically convergent, so once we are inside the
         // multiplicative-Newton basin (`||Δθ||∞ < EFS_LINESEARCH_THRESHOLD`)
         // a halving is essentially never accepted over the full step. Skip
-        // the inner P-IRLS solve we'd otherwise burn on backtracking. For
-        // hybrid runs we still need to reset the ψ-stagnation counter.
-        if max_step_abs < EFS_LINESEARCH_THRESHOLD {
+        // the inner P-IRLS solve we'd otherwise burn on backtracking. When a
+        // barrier is configured, every accepted rho-step must still pass
+        // through the barrier-aware cost because feasibility can change even
+        // under a small smoothing-parameter move. For hybrid runs we still
+        // need to reset the ψ-stagnation counter.
+        if self.barrier_config.is_none() && max_step_abs < EFS_LINESEARCH_THRESHOLD {
             if psi_indices.is_some() {
                 self.consecutive_psi_zero_iters = 0;
             }

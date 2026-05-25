@@ -7036,9 +7036,7 @@ pub fn reml_laml_evaluate(
     if let Some(ref barrier_cfg) = solution.barrier_config {
         match barrier_cfg.barrier_cost(&solution.beta) {
             Ok(bc) => cost += bc,
-            Err(e) => {
-                log::warn!("Barrier cost skipped (infeasible): {e}");
-            }
+            Err(e) => return Err(format!("REML/LAML barrier cost is undefined: {e}")),
         }
     }
 
