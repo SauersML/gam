@@ -31,7 +31,7 @@ def main() -> None:
         latents={"t": gamfit.LatentCoord(n=n, d=d, init=t_init)},
         penalties=[
             gamfit.AuxConditionalPriorPenalty(
-                lambda_per_row,
+                lambda_per_row=lambda_per_row,
                 weight=2.0,
                 n_eff=n,
                 target="t",

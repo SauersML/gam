@@ -44,7 +44,6 @@ from bench.run_suite import (  # noqa: E402
     folds_for_dataset,
     gaussian_log_loss_score,
     log_loss_score,
-    mse_score,
     nagelkerke_r2_score,
     run_external_mgcv_cv,
     run_external_mgcv_gaulss_cv,
@@ -309,7 +308,7 @@ def _metrics_from_predictions(
         "r2": d_metrics.get("r_squared", 0.0),
         "rmse": d_metrics.get("rmse"),
         "mae": d_metrics.get("mae"),
-        "mse": mse_score(y_test, pred),
+        "mse": float(np.mean((y_test - pred) ** 2)),
     }
     if sigma is not None:
         metrics["logloss"] = gaussian_log_loss_score(y_test, pred, sigma)
