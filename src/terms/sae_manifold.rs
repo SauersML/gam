@@ -335,7 +335,7 @@ impl SaeManifoldAtom {
 }
 
 /// Assignment prior/relaxation used by [`SaeAssignment`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub enum AssignmentMode {
     /// Row-wise simplex assignment with entropy sparsity.
     Softmax { temperature: f64, sparsity: f64 },
@@ -345,6 +345,8 @@ pub enum AssignmentMode {
         alpha: f64,
         learnable_alpha: bool,
     },
+    /// Independent sigmoid activations with a hard JumpReLU active gate.
+    JumpReLU { temperature: f64, threshold: f64 },
 }
 
 impl AssignmentMode {
@@ -365,10 +367,19 @@ impl AssignmentMode {
         }
     }
 
+    #[must_use]
+    pub fn jumprelu(temperature: f64, threshold: f64) -> Self {
+        Self::JumpReLU {
+            temperature,
+            threshold,
+        }
+    }
+
     pub fn temperature(&self) -> f64 {
         match *self {
             AssignmentMode::Softmax { temperature, .. }
-            | AssignmentMode::IBPMap { temperature, .. } => temperature,
+            | AssignmentMode::IBPMap { temperature, .. }
+            | AssignmentMode::JumpReLU { temperature, .. } => temperature,
         }
     }
 
@@ -380,7 +391,8 @@ impl AssignmentMode {
         }
         match self {
             AssignmentMode::Softmax { temperature, .. }
-            | AssignmentMode::IBPMap { temperature, .. } => {
+            | AssignmentMode::IBPMap { temperature, .. }
+            | AssignmentMode::JumpReLU { temperature, .. } => {
                 *temperature = new_temperature;
             }
         }
@@ -406,6 +418,13 @@ impl AssignmentMode {
                 if !(alpha.is_finite() && alpha > 0.0) {
                     return Err(format!(
                         "AssignmentMode::IBPMap: alpha must be finite and positive; got {alpha}"
+                    ));
+                }
+            }
+            AssignmentMode::JumpReLU { threshold, .. } => {
+                if !threshold.is_finite() {
+                    return Err(format!(
+                        "AssignmentMode::JumpReLU: threshold must be finite; got {threshold}"
                     ));
                 }
             }
@@ -532,6 +551,14 @@ impl SaeAssignment {
             AssignmentMode::IBPMap { temperature, .. } => {
                 Ok(sigmoid_row(self.logits.row(row), temperature))
             }
+            AssignmentMode::JumpReLU {
+                temperature,
+                threshold,
+            } => Ok(jumprelu_row(
+                self.logits.row(row),
+                temperature,
+                threshold,
+            )),
         }
     }
 
@@ -979,31 +1006,13 @@ impl SaeManifoldTerm {
             }
 
             let mut local_jac = Array2::<f64>::zeros((q, p));
-            match self.assignment.mode {
-                AssignmentMode::Softmax { temperature, .. } => {
-                    // da_k/dl_j = a_k (1[k=j] - a_j) / tau, contracted
-                    // against the assignment-weighted fitted row.
-                    let inv_tau = 1.0 / temperature;
-                    for logit_col in 0..k_atoms {
-                        for out_col in 0..p {
-                            local_jac[[logit_col, out_col]] = assignments[logit_col]
-                                * (decoded[logit_col][out_col] - fitted[out_col])
-                                * inv_tau;
-                        }
-                    }
-                }
-                AssignmentMode::IBPMap { temperature, .. } => {
-                    // Independent concrete-Bernoulli active indicators:
-                    // dz_k/dl_k = z_k(1-z_k)/tau.
-                    let inv_tau = 1.0 / temperature;
-                    for logit_col in 0..k_atoms {
-                        let dz = assignments[logit_col] * (1.0 - assignments[logit_col]) * inv_tau;
-                        for out_col in 0..p {
-                            local_jac[[logit_col, out_col]] = dz * decoded[logit_col][out_col];
-                        }
-                    }
-                }
-            }
+            fill_assignment_logit_jvp_rows(
+                self.assignment.mode,
+                assignments.view(),
+                &decoded,
+                fitted.view(),
+                &mut local_jac,
+            );
             // Coordinate columns.
             for atom_idx in 0..k_atoms {
                 let d = self.atoms[atom_idx].latent_dim;
@@ -1475,6 +1484,11 @@ impl SaeManifoldTerm {
                 };
                 AnalyticPenaltyKind::IBPAssignment(Arc::new(penalty))
             }
+            AssignmentMode::JumpReLU { .. } => {
+                panic!(
+                    "JumpReLU assignment mode uses the built-in gated L1 assignment prior and has no AnalyticPenaltyKind descriptor"
+                )
+            }
         };
         let mut ard = Vec::with_capacity(self.k_atoms());
         for coord in &self.assignment.coords {
@@ -1519,18 +1533,85 @@ fn validate_finite_logits(logits: ArrayView1<'_, f64>, row: usize) -> Result<(),
     Ok(())
 }
 
+fn sigmoid_scalar(x: f64) -> f64 {
+    if x >= 0.0 {
+        1.0 / (1.0 + (-x).exp())
+    } else {
+        let ex = x.exp();
+        ex / (1.0 + ex)
+    }
+}
+
 fn sigmoid_row(logits: ArrayView1<'_, f64>, temperature: f64) -> Array1<f64> {
     let mut out = Array1::<f64>::zeros(logits.len());
     for i in 0..logits.len() {
-        let x = logits[i] / temperature;
-        out[i] = if x >= 0.0 {
-            1.0 / (1.0 + (-x).exp())
-        } else {
-            let ex = x.exp();
-            ex / (1.0 + ex)
-        };
+        out[i] = sigmoid_scalar(logits[i] / temperature);
     }
     out
+}
+
+fn jumprelu_row(logits: ArrayView1<'_, f64>, temperature: f64, threshold: f64) -> Array1<f64> {
+    let mut out = Array1::<f64>::zeros(logits.len());
+    for i in 0..logits.len() {
+        if logits[i] > threshold {
+            out[i] = sigmoid_scalar(logits[i] / temperature);
+        }
+    }
+    out
+}
+
+fn fill_assignment_logit_jvp_rows(
+    mode: AssignmentMode,
+    assignments: ArrayView1<'_, f64>,
+    decoded: &[Array1<f64>],
+    fitted: ArrayView1<'_, f64>,
+    local_jac: &mut Array2<f64>,
+) {
+    match mode {
+        AssignmentMode::Softmax { temperature, .. } => {
+            // da_k/dl_j = a_k (1[k=j] - a_j) / tau, contracted against
+            // the assignment-weighted fitted row.
+            let inv_tau = 1.0 / temperature;
+            for logit_col in 0..assignments.len() {
+                for out_col in 0..fitted.len() {
+                    local_jac[[logit_col, out_col]] = assignments[logit_col]
+                        * (decoded[logit_col][out_col] - fitted[out_col])
+                        * inv_tau;
+                }
+            }
+        }
+                AssignmentMode::IBPMap { temperature, .. } => {
+                    // Independent concrete-Bernoulli active indicators:
+                    // dz_k/dl_k = z_k(1-z_k)/tau.
+                    let inv_tau = 1.0 / temperature;
+            for logit_col in 0..assignments.len() {
+                let dz = assignments[logit_col] * (1.0 - assignments[logit_col]) * inv_tau;
+                for out_col in 0..fitted.len() {
+                    local_jac[[logit_col, out_col]] = dz * decoded[logit_col][out_col];
+                        }
+                    }
+                }
+                AssignmentMode::JumpReLU {
+                    temperature,
+                    threshold,
+                } => {
+                    // Standard STE for the hard gate: the sigmoid derivative
+                    // contributes only on logits above the JumpReLU threshold.
+                    let inv_tau = 1.0 / temperature;
+                    for logit_col in 0..k_atoms {
+                        if self.assignment.logits[[row, logit_col]] <= threshold {
+                            continue;
+                        }
+                        let dz = sigmoid_scalar(
+                            self.assignment.logits[[row, logit_col]] * inv_tau,
+                        );
+                        let da = dz * (1.0 - dz) * inv_tau;
+                        for out_col in 0..p {
+                            local_jac[[logit_col, out_col]] = da * decoded[logit_col][out_col];
+                        }
+                    }
+                }
+            }
 }
 
 fn flat_logits(logits: ArrayView2<'_, f64>) -> Array1<f64> {
@@ -1577,6 +1658,19 @@ fn assignment_prior_value(assignment: &SaeAssignment, rho: &SaeManifoldRho) -> f
             };
             penalty.value(target.view(), rho_view.view())
         }
+        AssignmentMode::JumpReLU {
+            temperature,
+            threshold,
+        } => {
+            let sparsity_strength = rho.log_lambda_sparse.exp();
+            let mut acc = 0.0;
+            for &logit in target.iter() {
+                if logit > threshold {
+                    acc += sigmoid_scalar(logit / temperature);
+                }
+            }
+            sparsity_strength * acc
+        }
     }
 }
 
@@ -1621,6 +1715,27 @@ fn assignment_prior_grad_hdiag(
             let diag = penalty
                 .hessian_diag(target.view(), rho_view.view())
                 .ok_or_else(|| "IBP assignment hessian diag unavailable".to_string())?;
+            Ok((grad, diag))
+        }
+        AssignmentMode::JumpReLU {
+            temperature,
+            threshold,
+        } => {
+            let sparsity_strength = rho.log_lambda_sparse.exp();
+            let inv_tau = 1.0 / temperature;
+            let inv_tau2 = inv_tau * inv_tau;
+            let mut grad = Array1::<f64>::zeros(target.len());
+            let mut diag = Array1::<f64>::zeros(target.len());
+            for idx in 0..target.len() {
+                let logit = target[idx];
+                if logit <= threshold {
+                    continue;
+                }
+                let activation = sigmoid_scalar(logit * inv_tau);
+                let slope = activation * (1.0 - activation);
+                grad[idx] = sparsity_strength * slope * inv_tau;
+                diag[idx] = sparsity_strength * slope * (1.0 - 2.0 * activation) * inv_tau2;
+            }
             Ok((grad, diag))
         }
     }

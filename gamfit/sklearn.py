@@ -190,7 +190,7 @@ class GAMClassifier(_BaseGAMEstimator, ClassifierMixin):
     Same construction and ``fit`` semantics as :class:`GAMRegressor` (see that
     class for parameter documentation). Predictions interpret the model's
     mean as the probability of the positive class; classes are fixed to
-    ``[0, 1]`` and a threshold of ``0.5`` is used by :meth:`predict`.
+    ``[0, 1]`` and :meth:`predict` returns the highest-probability class.
 
     Examples
     --------
@@ -250,7 +250,7 @@ class GAMClassifier(_BaseGAMEstimator, ClassifierMixin):
         return np.column_stack([negative, positive])
 
     def predict(self, X: Any) -> np.ndarray:
-        """Predict the binary class label using a 0.5 threshold on the positive class.
+        """Predict the highest-probability binary class label.
 
         Parameters
         ----------
@@ -267,4 +267,4 @@ class GAMClassifier(_BaseGAMEstimator, ClassifierMixin):
         >>> clf.predict(X_test)[:5]
         array([1, 0, 1, 1, 0])
         """
-        return (self.predict_proba(X)[:, 1] >= 0.5).astype(int)
+        return self.classes_.take(np.argmax(self.predict_proba(X), axis=1))

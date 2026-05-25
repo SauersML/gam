@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING
 import torch
 from torch import nn
 
+from .._binding import rust_module
 from ._coerce import from_numpy_like, to_numpy_f64
 
 if TYPE_CHECKING:
@@ -38,15 +39,6 @@ class _FittedGamModule(nn.Module):
     columns the underlying model class emits (typically ``eta`` followed by
     ``mean``).
     """
-
-    def __init__(self, model: "Model") -> None:
-        super().__init__()
-        self._model = model
-
-    @property
-    def model(self) -> "Model":
-        """The wrapped fitted gamfit model."""
-        return self._model
 
     def forward(self, X: torch.Tensor) -> torch.Tensor:
         if X.dim() != 2:
@@ -83,4 +75,4 @@ def from_fitted(model: "Model") -> nn.Module:
     >>> wrapped = from_fitted(model)
     >>> preds = wrapped(torch.as_tensor(X_test))
     """
-    return _FittedGamModule(model)
+    return rust_module().torch_from_fitted(_FittedGamModule, model)

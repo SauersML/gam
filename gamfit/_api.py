@@ -145,114 +145,38 @@ def cross_fit_shared_precision_groups(
     selected block, it is skipped for that group.
     """
 
-    import numpy as np
-
     model_items = _normalize_model_mapping(models)
     group_specs = _normalize_shared_precision_groups(groups)
     if not group_specs:
         raise ValueError("at least one shared precision group is required")
 
-    states: dict[str | int, Mapping[str, Any]] = {}
+    rust = rust_module()
+    model_payloads: list[dict[str, Any]] = []
     for key, model in model_items:
         try:
-            states[key] = json.loads(rust_module().coefficient_state_json(model._model_bytes))
+            state_json = rust.coefficient_state_json(model._model_bytes)
         except Exception as exc:
             raise map_exception(exc) from exc
-
-    result: dict[str, dict[str, Any]] = {}
+        model_payloads.append({"key": key, "state_json": state_json})
+    group_payloads: list[dict[str, Any]] = []
     for group in group_specs:
-        shape = float(group.shape)
-        rate = float(group.rate)
-        if not math.isfinite(shape) or shape <= 0.0:
-            raise ValueError(
-                f"shared precision group {group.name!r} requires finite shape > 0"
-            )
-        if not math.isfinite(rate) or rate < 0.0:
-            raise ValueError(
-                f"shared precision group {group.name!r} requires finite rate >= 0"
-            )
-
-        fit_entries: list[dict[str, Any]] = []
-        dims: set[int] = set()
-        quadratic_sum = 0.0
-        for key, _model in model_items:
-            state = states[key]
-            label = _shared_group_label(group, key)
-            indices = _coefficient_indices_for_precision_label(state, label)
-            if not indices:
-                continue
-            beta = np.asarray(state.get("beta", []), dtype=float)
-            # EB must use the fixed-lambda conditional Laplace covariance. The
-            # smoothing-parameter-corrected covariance feeds lambda uncertainty
-            # back into the lambda update, inflates the trace term, and biases
-            # lambda downward.
-            cov_n = int(state.get("covariance_n", 0))
-            cov_flat = np.asarray(state.get("covariance_flat", []), dtype=float)
-            if beta.size != cov_n or cov_flat.size != cov_n * cov_n:
-                raise ValueError(
-                    f"model {key!r} has inconsistent beta/covariance dimensions"
-                )
-            index_array = np.asarray(indices, dtype=int)
-            if np.any(index_array < 0) or np.any(index_array >= cov_n):
-                raise ValueError(
-                    f"model {key!r} has coefficient provenance outside covariance bounds"
-                )
-            cov = cov_flat.reshape(cov_n, cov_n)
-            beta_block = beta[index_array]
-            trace = float(np.trace(cov[np.ix_(index_array, index_array)]))
-            beta_norm_sq = float(beta_block.dot(beta_block))
-            contribution = beta_norm_sq + trace
-            if not math.isfinite(contribution):
-                raise ValueError(
-                    f"shared precision group {group.name!r} has non-finite contribution in model {key!r}"
-                )
-            quadratic_sum += contribution
-            dims.add(int(index_array.size))
-            fit_entries.append(
-                {
-                    "model": key,
-                    "label": label,
-                    "coefficient_indices": [int(i) for i in indices],
-                    "dimension": int(index_array.size),
-                    "beta_norm_sq": beta_norm_sq,
-                    "trace_covariance": trace,
-                    "quadratic_contribution": contribution,
-                }
-            )
-
-        if not fit_entries:
-            raise ValueError(
-                f"shared precision group {group.name!r} did not match any model coefficients"
-            )
-        if len(dims) != 1:
-            raise ValueError(
-                f"shared precision group {group.name!r} matched inconsistent dimensions: {sorted(dims)}"
-            )
-        dimension = dims.pop()
-        numerator = len(fit_entries) * dimension + 2.0 * (shape - 1.0)
-        denominator = quadratic_sum + 2.0 * rate
-        if numerator <= 0.0:
-            raise ValueError(
-                f"shared precision group {group.name!r} has non-positive MAP numerator"
-            )
-        if denominator <= 0.0 or not math.isfinite(denominator):
-            raise ValueError(
-                f"shared precision group {group.name!r} has non-positive/non-finite denominator"
-            )
-        lam = numerator / denominator
-        result[group.name] = {
-            "lambda": lam,
-            "log_lambda": math.log(lam),
-            "shape": shape,
-            "rate": rate,
-            "n_fits": len(fit_entries),
-            "dimension": dimension,
-            "quadratic_sum": quadratic_sum,
-            "numerator": numerator,
-            "denominator": denominator,
-            "fits": fit_entries,
-        }
-    return result
+        group_payloads.append(
+            {
+                "name": group.name,
+                "shape": float(group.shape),
+                "rate": float(group.rate),
+                "labels": [
+                    _shared_group_label(group, key) for key, _model in model_items
+                ],
+            }
+        )
+    try:
+        raw = rust.cross_fit_shared_precision_groups_json(
+            json.dumps({"models": model_payloads, "groups": group_payloads})
+        )
+    except Exception as exc:
+        raise map_exception(exc) from exc
+    return json.loads(raw)
 
 
 def build_info() -> dict[str, Any]:
@@ -692,37 +616,6 @@ def _normalize_fisher_rao_w(value: Any, *, n_rows: int, dim: int) -> Any:
     return out
 
 
-def _apply_scalar_fisher_rao_w_to_rows(
-    headers: list[str],
-    rows: list[list[str]],
-    *,
-    weights: str | None,
-    fisher_rao_w: Any,
-) -> tuple[list[str], list[list[str]], str]:
-    import numpy as np
-
-    w = _normalize_fisher_rao_w(fisher_rao_w, n_rows=len(rows), dim=1)[:, 0, 0]
-    weight_col = "__gamfit_fisher_rao_weight"
-    if weight_col in headers:
-        raise ValueError(f"reserved fisher_rao_w column already exists: {weight_col}")
-    headers = list(headers) + [weight_col]
-    out_rows = [list(row) for row in rows]
-    if weights is None:
-        combined = w
-    else:
-        try:
-            weight_idx = headers.index(weights)
-        except ValueError as exc:
-            raise ValueError(f"weights column {weights!r} is not present") from exc
-        base_weights = np.asarray([row[weight_idx] for row in out_rows], dtype=float)
-        if not np.all(np.isfinite(base_weights)):
-            raise ValueError(f"weights column {weights!r} must contain only finite values")
-        combined = base_weights * w
-    for row, value in zip(out_rows, combined, strict=True):
-        row.append(repr(float(value)))
-    return headers, out_rows, weight_col
-
-
 @overload
 def fit(
     data: Any,
@@ -1022,16 +915,9 @@ def fit(
         )
 
     headers, rows, table_kind = normalize_table(data)
-    fisher_weight_col = None
+    fisher_w = None
     if fisher_rao_w is not None:
-        config_weights = config.get("weights") if isinstance(config, dict) else None
-        effective_weights = weights if weights is not None else config_weights
-        headers, rows, fisher_weight_col = _apply_scalar_fisher_rao_w_to_rows(
-            headers,
-            rows,
-            weights=effective_weights if isinstance(effective_weights, str) else None,
-            fisher_rao_w=fisher_rao_w,
-        )
+        fisher_w = _normalize_fisher_rao_w(fisher_rao_w, n_rows=len(rows), dim=1)
     rust_config = dict(config or {})
     for key in (
         "response_geometry",
@@ -1046,7 +932,7 @@ def fit(
     payload = _build_fit_payload(
         family=family,
         offset=offset,
-        weights=fisher_weight_col or weights,
+        weights=weights,
         transformation_normal=transformation_normal,
         survival_likelihood=survival_likelihood,
         baseline_target=baseline_target,
@@ -1070,7 +956,7 @@ def fit(
     )
     try:
         model_bytes = bytes(
-            rust_module().fit_table(headers, rows, formula, json.dumps(payload))
+            rust_module().fit_table(headers, rows, formula, json.dumps(payload), fisher_w)
         )
     except Exception as exc:
         raise map_exception(exc) from exc
@@ -1802,10 +1688,6 @@ def duchon_function_norm_penalty(
     except Exception as exc:
         raise map_exception(exc) from exc
     return np.asarray(penalty, dtype=float)
-
-
-# Backward-compat private alias (callers in this module still reference it)
-_duchon_function_norm_penalty = duchon_function_norm_penalty
 
 
 def _thin_plate_penalty(
@@ -3405,7 +3287,7 @@ def _resolve_position_penalty(
         kind = str(basis_kind).strip().lower().replace("_", "").replace("-", "")
         if kind in {"duchon", "duchonspline"}:
             if penalty_kind in {None, "function-norm", "functionnorm", "rkhs"}:
-                return _duchon_function_norm_penalty(
+                return duchon_function_norm_penalty(
                     knots_or_centers,
                     m=int(basis_order),
                     periodic=bool(periodic),
@@ -3448,7 +3330,7 @@ def _resolve_position_penalty(
             # path (which expects 2D centers and a different kernel).
             if penalty_kind not in {None, "function-norm", "functionnorm", "bending-energy", "bendingenergy"}:
                 raise ValueError(f"unsupported thin-plate penalty {penalty!r}")
-            return _duchon_function_norm_penalty(
+            return duchon_function_norm_penalty(
                 knots_or_centers,
                 m=2,
                 periodic=bool(periodic),

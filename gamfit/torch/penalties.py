@@ -12,7 +12,7 @@ from torch import nn
 from torch.optim import Optimizer
 
 from .._binding import rust_module
-from .._topology_selector import TopologyAutoSelector
+from .._select_topology import TopologyAutoSelector
 from ._coerce import from_numpy_like, to_numpy_f64
 
 

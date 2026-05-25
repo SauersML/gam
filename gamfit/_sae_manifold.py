@@ -14,7 +14,6 @@ from typing import Any, Literal, Sequence
 
 import numpy as np
 
-from ._api import gaussian_reml_fit
 from ._binding import rust_module
 from ._compare import compare_models
 from ._penalties import (
@@ -27,7 +26,7 @@ from ._penalties import (
     SoftmaxAssignmentSparsityPenalty,
     TopKActivationPenalty,
 )
-from ._topology_selector import TopologyAutoSelector
+from ._select_topology import TopologyAutoSelector
 from .smooth import Duchon, LatentCoord, PeriodicSplineCurve, Smooth, Sphere
 from .topology import Circle, EuclideanPatch
 
@@ -606,8 +605,37 @@ def _fit_fixed_k(
     if not np.isfinite(alpha_value) or alpha_value <= 0.0:
         raise ValueError("alpha must be positive, finite, or 'auto'")
 
-    if assignment_prior == "ibp_map" and hasattr(rust_module(), "sae_manifold_fit_ibp"):
-        return _fit_fixed_k_ibp_rust(
+    rust = rust_module()
+    has_generic_rust = hasattr(rust, "sae_manifold_fit")
+    has_legacy_ibp_rust = assignment_prior == "ibp_map" and hasattr(
+        rust, "sae_manifold_fit_ibp"
+    )
+    if assignment_prior in {"softmax", "ibp_map"}:
+        if has_generic_rust or has_legacy_ibp_rust:
+            return _fit_fixed_k_rust(
+                z,
+                k_atoms,
+                basis_specs,
+                dims,
+                lambda_sparse,
+                lambda_smooth,
+                alpha_value,
+                learnable_alpha,
+                tau,
+                logits,
+                coords,
+                gumbel_schedule,
+                assignment_kind=assignment_prior,
+                max_iter=max_iter,
+                learning_rate=learning_rate,
+                analytic_penalties=penalties,
+            )
+        raise RuntimeError(
+            f"assignment_prior={assignment_prior!r} requires rust_module().sae_manifold_fit"
+        )
+
+    if has_generic_rust:
+        return _fit_fixed_k_rust(
             z,
             k_atoms,
             basis_specs,
@@ -620,6 +648,7 @@ def _fit_fixed_k(
             logits,
             coords,
             gumbel_schedule,
+            assignment_kind=assignment_prior,
             max_iter=max_iter,
             learning_rate=learning_rate,
             analytic_penalties=penalties,
@@ -746,7 +775,7 @@ def _fit_fixed_k(
     )
 
 
-def _fit_fixed_k_ibp_rust(
+def _fit_fixed_k_rust(
     z: np.ndarray,
     k_atoms: int,
     basis_specs: Sequence[str | Smooth],
@@ -759,6 +788,7 @@ def _fit_fixed_k_ibp_rust(
     logits: np.ndarray,
     coords: Sequence[np.ndarray],
     gumbel_schedule: dict[str, Any] | None,
+    assignment_kind: Literal["softmax", "ibp_map", "topk", "jumprelu", "gated"],
     *,
     max_iter: int,
     learning_rate: float,
@@ -771,6 +801,16 @@ def _fit_fixed_k_ibp_rust(
     decoder_blocks: list[np.ndarray] | None = None
     log_ard = [np.zeros(d, dtype=float) for d in dims]
     normalized_penalties = _normalize_penalty_descriptors(analytic_penalties)
+    rust = rust_module()
+    fit_fn = getattr(rust, "sae_manifold_fit", None)
+    using_legacy_ibp = False
+    if fit_fn is None:
+        if assignment_kind != "ibp_map" or not hasattr(rust, "sae_manifold_fit_ibp"):
+            raise RuntimeError(
+                f"assignment_kind={assignment_kind!r} requires rust_module().sae_manifold_fit"
+            )
+        fit_fn = rust.sae_manifold_fit_ibp
+        using_legacy_ibp = True
     payload: Mapping[str, Any] | None = None
     for iter_idx in range(int(max_iter)):
         designs: list[np.ndarray] = []
@@ -804,7 +844,7 @@ def _fit_fixed_k_ibp_rust(
         if gumbel_schedule is not None:
             schedule_iter = dict(gumbel_schedule)
             schedule_iter["iter_count"] = int(schedule_iter.get("iter_count", 0)) + iter_idx
-        payload = rust_module().sae_manifold_fit_ibp(
+        common_args = (
             np.ascontiguousarray(z, dtype=float),
             [_basis_kind_name(spec) for spec in basis_specs],
             [int(d) for d in dims],
@@ -822,9 +862,20 @@ def _fit_fixed_k_ibp_rust(
             float(lambda_smooth),
             1,
             float(learning_rate),
-            gumbel_schedule=schedule_iter,
-            analytic_penalties=normalized_penalties,
         )
+        if using_legacy_ibp:
+            payload = fit_fn(
+                *common_args,
+                gumbel_schedule=schedule_iter,
+                analytic_penalties=normalized_penalties,
+            )
+        else:
+            payload = fit_fn(
+                *common_args,
+                assignment_kind=assignment_kind,
+                gumbel_schedule=schedule_iter,
+                analytic_penalties=normalized_penalties,
+            )
         logits_current = np.asarray(payload["logits"], dtype=float)
         coords_current = [
             _retract_coords(basis_specs[atom_idx], np.asarray(atom_payload["on_atom_coords_t"], dtype=float))
@@ -853,10 +904,14 @@ def _fit_fixed_k_ibp_rust(
     smooth = 0.0
     for decoder, penalty in zip(decoder_blocks, final_penalties):
         smooth += 0.5 * lambda_smooth * float(np.sum(decoder * (penalty @ decoder)))
-    effective_alpha = alpha_value * lambda_sparse if learnable_alpha else alpha_value
+    effective_alpha = (
+        alpha_value * lambda_sparse
+        if assignment_kind == "ibp_map" and learnable_alpha
+        else alpha_value
+    )
     score = -(
         data_fit
-        + _assignment_prior_value(assignments, "ibp_map", lambda_sparse, effective_alpha)
+        + _assignment_prior_value(assignments, assignment_kind, lambda_sparse, effective_alpha)
         + smooth
         + _ard_value(coords_current, log_ard)
     )
@@ -938,13 +993,17 @@ def _basis_kind_name(spec: str | Smooth) -> str:
 
 
 def _basis_and_jacobian(spec: str | Smooth, t: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    # Dispatch contract: resolve the public basis kind here, then delegate to
+    # the kind-specific helper that owns the Rust-backed Phi/J/Phi-penalty path.
+    if isinstance(spec, str):
+        spec = _basis_from_name(spec)
     if isinstance(spec, PeriodicSplineCurve):
         return _periodic_fourier_basis(_retract_coords(spec, t)[:, 0], max(3, int(spec.n_knots // 2)))
     if isinstance(spec, Sphere):
         return _sphere_chart_basis(_retract_coords(spec, t))
     if isinstance(spec, Duchon):
         return _duchon_basis_local(t, spec)
-    return _duchon_basis_local(t, Duchon(centers=None, m=2))
+    raise ValueError(f"unsupported atom_basis {spec!r}")
 
 
 def _retract_coords(spec: str | Smooth, coords: np.ndarray) -> np.ndarray:
@@ -1292,12 +1351,27 @@ def _ard_value(coords: list[np.ndarray], log_ard: list[np.ndarray]) -> float:
 
 
 def _split_decoder(B: np.ndarray, widths: Sequence[int]) -> list[np.ndarray]:
-    out = []
-    cursor = 0
-    for width in widths:
-        out.append(B[cursor : cursor + width, :])
-        cursor += width
-    return out
+    if B.ndim != 2:
+        raise ValueError(f"decoder coefficients must be 2D; got shape {B.shape}")
+
+    block_widths = tuple(widths)
+    if any(
+        isinstance(width, (bool, np.bool_)) or not isinstance(width, (int, np.integer))
+        for width in block_widths
+    ):
+        raise TypeError("decoder block widths must be integers")
+    if any(width < 0 for width in block_widths):
+        raise ValueError("decoder block widths must be non-negative")
+
+    total_width = int(sum(block_widths))
+    if total_width != B.shape[0]:
+        raise ValueError(
+            f"decoder block widths must sum to {B.shape[0]} rows; got {total_width}"
+        )
+    if not block_widths:
+        return []
+
+    return list(np.split(B, np.cumsum(block_widths[:-1]), axis=0))
 
 
 def _block_diag(blocks: Sequence[np.ndarray]) -> np.ndarray:
