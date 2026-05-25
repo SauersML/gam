@@ -27872,4 +27872,267 @@ mod tests {
             "bubbled error must name the carrying block by spec.name",
         );
     }
+
+    /// Round-trip: every variant's `as_str()` output, when embedded in the
+    /// `diagnosis: <label>` slot of the bubbled-error format, must parse
+    /// back via `parse_from_error`. seed-accounting's `InnerStatus`
+    /// classifier reads diagnoses out of bubbled error strings via that
+    /// parser; if a variant's label diverges between formatter and parser
+    /// the classifier silently falls back to "unknown" and the early-exit
+    /// canary degrades to a generic non-converged result.
+    #[test]
+    fn kkt_refusal_diagnosis_string_round_trip_through_bubbled_error_parser() {
+        for diagnosis in [
+            KktRefusalDiagnosis::RankDeficientHPen,
+            KktRefusalDiagnosis::PhantomMultiplierWithWellConditionedH,
+            KktRefusalDiagnosis::ActiveSetIncomplete,
+        ] {
+            let label = diagnosis.as_str();
+            // Mimic the trailing slot exactly as `format_bubbled_error`
+            // emits it (label at the very end after `; diagnosis: `).
+            let synthetic_error = format!(
+                "coupled exact-joint inner solve exited the joint Newton path before convergence \
+                 — cycle=7 cert REFUSED: residual=1.0e-2 > 4·tol=4.0e-6; \
+                 diagnosis: {label}"
+            );
+            let parsed = KktRefusalDiagnosis::parse_from_error(&synthetic_error);
+            assert_eq!(
+                parsed,
+                Some(diagnosis),
+                "label '{label}' must round-trip through parse_from_error; got {:?}",
+                parsed,
+            );
+        }
+    }
+
+    /// Regression canary: a synthetic 3-block fixture chosen to mimic the
+    /// biobank rank-deficient-H_pen failure mode — block-diagonal H with
+    /// a fully degenerate third block and zero s_lambdas — must classify
+    /// as `RankDeficientHPen` with nullity matching the structural rank
+    /// deficiency. When `nullspace-lead`'s smooth-construction
+    /// reparameterization lands and absorbs polynomial null spaces into
+    /// the parametric block, the SAME fixture (rewritten with a
+    /// full-rank reparameterized basis) should fit cleanly with no
+    /// refusal. That follow-up half is wired below behind `#[ignore]`
+    /// per the lead's note; the diagnosis half here is active so the
+    /// canary fires today on the failure mode the rework targets.
+    #[test]
+    fn rank_deficient_hpen_canary_fires_on_biobank_shaped_failure() {
+        let block_widths = [4usize, 4, 4];
+        let total_p: usize = block_widths.iter().sum();
+        let block_count = block_widths.len();
+
+        let mut specs: Vec<ParameterBlockSpec> = Vec::with_capacity(block_count);
+        let mut states: Vec<ParameterBlockState> = Vec::with_capacity(block_count);
+        let mut s_lambdas: Vec<Array2<f64>> = Vec::with_capacity(block_count);
+        let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(block_count);
+        let names = [
+            "location_block",
+            "scale_block",
+            "marginal_slope_block",
+        ];
+        let mut offset = 0usize;
+        for (b, &width) in block_widths.iter().enumerate() {
+            let start = offset;
+            let end = start + width;
+            offset = end;
+            ranges.push((start, end));
+            specs.push(ParameterBlockSpec {
+                name: names[b].to_string(),
+                design: DesignMatrix::from(Array2::<f64>::zeros((1, width))),
+                offset: Array1::zeros(1),
+                penalties: vec![],
+                nullspace_dims: vec![],
+                initial_log_lambdas: Array1::zeros(0),
+                initial_beta: None,
+            });
+            states.push(ParameterBlockState {
+                beta: Array1::zeros(width),
+                eta: Array1::zeros(1),
+            });
+            s_lambdas.push(Array2::<f64>::zeros((width, width)));
+        }
+
+        // H = I(4) ⊕ I(4) ⊕ 0 — the third block is the marginal-slope
+        // pathology: zero Hessian curvature on a 4-D null space the
+        // penalty does not constrain (s_lambdas are zero everywhere).
+        let mut h = Array2::<f64>::zeros((total_p, total_p));
+        for i in 0..4 {
+            h[[i, i]] = 1.0;
+            h[[4 + i, 4 + i]] = 1.0;
+        }
+        // Marginal-slope block left as the zero matrix → nullity = 4.
+
+        let source = JointHessianSource::Dense(h);
+
+        // Gradient mass concentrated on the marginal-slope block. With
+        // β=0 and S=0, the stationarity residual on that block equals
+        // −gradient there, so the carrying block is unambiguous.
+        let mut joint_grad = Array1::<f64>::zeros(total_p);
+        joint_grad[8] = 4.2;
+        joint_grad[9] = 1.7;
+        joint_grad[10] = -2.5;
+        joint_grad[11] = 0.9;
+
+        let cached_active_sets: Vec<Option<Vec<usize>>> = vec![None; block_count];
+        let block_constraints: Vec<Option<LinearInequalityConstraints>> = vec![None; block_count];
+        let math = JointNewtonMathDiagnostic {
+            old_kkt_inf: 4.2,
+            linearized_next_kkt_inf: 4.2,
+            predicted_reduction: 0.0,
+            actual_reduction: 0.0,
+            trust_ratio: 0.0,
+            step_inf: 0.0,
+            proposal_inf: 1.0e-3,
+        };
+
+        let report = compute_kkt_refusal_report(
+            123,
+            &states,
+            &specs,
+            &s_lambdas,
+            &ranges,
+            Some(&joint_grad),
+            &cached_active_sets,
+            &block_constraints,
+            &source,
+            total_p,
+            0.0,
+            RidgePolicy::explicit_stabilization_full(),
+            0.0,
+            0.0,
+            1.0e-3,
+            1.0,
+            1.0e-6,
+            1.0e-6,
+            1.0e-6,
+            0.0,
+            4.2,
+            &math,
+        );
+
+        assert_eq!(
+            report.diagnosis,
+            KktRefusalDiagnosis::RankDeficientHPen,
+            "biobank-shaped marginal-slope failure must classify as RankDeficientHPen \
+             (this is the canary nullspace-lead's smooth-construction rework targets)",
+        );
+        assert!(
+            report.hpen_nullity_at_rank_tol >= 4,
+            "fully degenerate marginal-slope block (4 zero eigenvalues) must contribute \
+             nullity >= 4; got {}",
+            report.hpen_nullity_at_rank_tol,
+        );
+        assert_eq!(
+            report.block_carrying_residual,
+            Some(2),
+            "marginal_slope_block (idx 2) must carry the residual; got {:?}, residuals={:?}",
+            report.block_carrying_residual,
+            report.block_residual_inf,
+        );
+        let bubbled = report.format_bubbled_error();
+        assert_eq!(
+            KktRefusalDiagnosis::parse_from_error(&bubbled),
+            Some(KktRefusalDiagnosis::RankDeficientHPen),
+            "canary's bubbled-error string must parse back via the classifier's parser",
+        );
+    }
+
+    /// Post-fix half of the canary: once `nullspace-lead`'s smooth
+    /// reparameterization absorbs polynomial null spaces into the
+    /// parametric block, the marginal-slope synthetic above (rewritten
+    /// to use a full-rank reparameterized basis with the absorbed null
+    /// columns moved into a separate identifiable block) should fit
+    /// without any cert refusal. This half is `#[ignore]`d until that
+    /// rework lands; flipping the attribute off is the regression
+    /// signal that the rework worked.
+    #[test]
+    #[ignore = "fires until nullspace-lead lands smooth-construction null-space absorption"]
+    fn rank_deficient_hpen_canary_disappears_after_nullspace_absorption() {
+        let block_widths = [4usize, 4, 4];
+        let total_p: usize = block_widths.iter().sum();
+        let block_count = block_widths.len();
+
+        let mut specs: Vec<ParameterBlockSpec> = Vec::with_capacity(block_count);
+        let mut states: Vec<ParameterBlockState> = Vec::with_capacity(block_count);
+        let mut s_lambdas: Vec<Array2<f64>> = Vec::with_capacity(block_count);
+        let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(block_count);
+        let names = ["location_block", "scale_block", "marginal_slope_block"];
+        let mut offset = 0usize;
+        for (b, &width) in block_widths.iter().enumerate() {
+            let start = offset;
+            let end = start + width;
+            offset = end;
+            ranges.push((start, end));
+            specs.push(ParameterBlockSpec {
+                name: names[b].to_string(),
+                design: DesignMatrix::from(Array2::<f64>::zeros((1, width))),
+                offset: Array1::zeros(1),
+                penalties: vec![],
+                nullspace_dims: vec![],
+                initial_log_lambdas: Array1::zeros(0),
+                initial_beta: None,
+            });
+            states.push(ParameterBlockState {
+                beta: Array1::zeros(width),
+                eta: Array1::zeros(1),
+            });
+            s_lambdas.push(Array2::<f64>::zeros((width, width)));
+        }
+
+        // Full-rank H across all three blocks — the post-absorption
+        // shape: the polynomial null space has been moved out of the
+        // smooth and the remaining basis is fully identified by the
+        // likelihood Hessian.
+        let h = Array2::<f64>::eye(total_p);
+        let source = JointHessianSource::Dense(h);
+        let joint_grad = Array1::<f64>::zeros(total_p);
+        let cached_active_sets: Vec<Option<Vec<usize>>> = vec![None; block_count];
+        let block_constraints: Vec<Option<LinearInequalityConstraints>> =
+            vec![None; block_count];
+        let math = JointNewtonMathDiagnostic {
+            old_kkt_inf: 0.0,
+            linearized_next_kkt_inf: 0.0,
+            predicted_reduction: 0.0,
+            actual_reduction: 0.0,
+            trust_ratio: 1.0,
+            step_inf: 0.0,
+            proposal_inf: 0.0,
+        };
+
+        let report = compute_kkt_refusal_report(
+            0,
+            &states,
+            &specs,
+            &s_lambdas,
+            &ranges,
+            Some(&joint_grad),
+            &cached_active_sets,
+            &block_constraints,
+            &source,
+            total_p,
+            0.0,
+            RidgePolicy::explicit_stabilization_full(),
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            1.0e-6,
+            1.0e-6,
+            1.0e-6,
+            0.0,
+            0.0,
+            &math,
+        );
+
+        assert_eq!(
+            report.hpen_nullity_at_rank_tol, 0,
+            "post-absorption: full-rank H_pen must register nullity 0",
+        );
+        assert_ne!(
+            report.diagnosis,
+            KktRefusalDiagnosis::RankDeficientHPen,
+            "post-absorption: the rank-deficiency diagnosis must no longer fire",
+        );
+    }
 }

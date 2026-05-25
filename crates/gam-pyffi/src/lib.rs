@@ -24849,6 +24849,50 @@ fn build_analytic_penalty_registry_from_json(
                     std::sync::Arc::new(penalty),
                 ));
             }
+            "monotonicity" => {
+                descriptor_no_unknown_keys(
+                    descriptor,
+                    &context,
+                    &[
+                        "kind",
+                        "target",
+                        "weight",
+                        "n_eff",
+                        "direction",
+                        "smoothing_eps",
+                        "learnable",
+                        "weight_schedule",
+                    ],
+                )?;
+                let weight = descriptor_f64(descriptor, "weight", 1.0)?;
+                let n_eff = descriptor_usize(descriptor, "n_eff", target.n)?;
+                let direction = match descriptor.get("direction") {
+                    None | Some(serde_json::Value::Null) => 1.0,
+                    Some(value) => value.as_f64().ok_or_else(|| {
+                        format!("{context}.direction must be a finite number (+1 or -1)")
+                    })?,
+                };
+                let smoothing_eps = descriptor_f64(descriptor, "smoothing_eps", 1.0e-3)?;
+                let learnable = descriptor
+                    .get("learnable")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                let penalty = CoreMonotonicityPenalty::new(
+                    weight,
+                    n_eff,
+                    direction,
+                    smoothing_eps,
+                    learnable,
+                )
+                .map_err(|err| format!("{context}: {err}"))?;
+                let penalty = match weight_schedule {
+                    Some(schedule) => penalty.with_weight_schedule(schedule),
+                    None => penalty,
+                };
+                registry.push(gam::terms::AnalyticPenaltyKind::Monotonicity(
+                    std::sync::Arc::new(penalty),
+                ));
+            }
             "nuclear_norm" => {
                 descriptor_no_unknown_keys(
                     descriptor,

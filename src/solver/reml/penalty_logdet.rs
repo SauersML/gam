@@ -324,7 +324,8 @@ impl PenaltyPseudologdet {
                     s_total[[i, i]] += ridge;
                 }
             }
-            Self::from_assembled_with_nullity(s_total, structural_nullity)
+            let ridge_hint = if ridge > 0.0 { Some(ridge) } else { None };
+            Self::from_assembled_with_nullity(s_total, ridge_hint, structural_nullity)
         }
     }
 
@@ -457,8 +458,12 @@ impl PenaltyPseudologdet {
                     } else {
                         None
                     };
-                    let block_pld =
-                        Self::from_assembled_with_nullity(bd.local.clone(), structural_nullity)?;
+                    let ridge_hint = if ridge > 0.0 { Some(ridge) } else { None };
+                    let block_pld = Self::from_assembled_with_nullity(
+                        bd.local.clone(),
+                        ridge_hint,
+                        structural_nullity,
+                    )?;
                     let nullity = block_pld.u_null.as_ref().map_or(0, Array2::ncols);
                     Ok(BlockResult {
                         start: bd.start,
@@ -492,8 +497,12 @@ impl PenaltyPseudologdet {
                     } else {
                         None
                     };
-                    let block_pld =
-                        Self::from_assembled_with_nullity(bd.local.clone(), structural_nullity)?;
+                    let ridge_hint = if ridge > 0.0 { Some(ridge) } else { None };
+                    let block_pld = Self::from_assembled_with_nullity(
+                        bd.local.clone(),
+                        ridge_hint,
+                        structural_nullity,
+                    )?;
                     let nullity = block_pld.u_null.as_ref().map_or(0, Array2::ncols);
                     Ok(BlockResult {
                         start: bd.start,
