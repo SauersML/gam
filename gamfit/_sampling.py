@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any, Iterator, Mapping
 
 from ._paired import CumulativeIncidenceDraws, PairedPosteriorSamples
+from ._predictive import PosteriorPredictive
 from ._summary import Summary
 
 # Sentinel for unbound posteriors loaded from disk without a model context.
@@ -81,59 +82,6 @@ def _config_from_payload(cfg_raw: Mapping[str, Any]) -> SamplingConfig:
         target_accept=float(cfg_raw.get("target_accept", 0.0)),
         seed=int(cfg_raw.get("seed", 0)),
     )
-
-
-@dataclass(frozen=True, eq=False, slots=True)
-class PosteriorPredictive:
-    """Per-row posterior fitted-mean draws on the link and response scales."""
-
-    eta: Any
-    mean: Any
-    family_kind: str
-    model_class: str
-
-    @property
-    def shape(self) -> tuple[int, int]:
-        return tuple(self.eta.shape)
-
-    @property
-    def n_draws(self) -> int:
-        return int(self.eta.shape[0])
-
-    @property
-    def n_rows(self) -> int:
-        return int(self.eta.shape[1])
-
-    def summary(self, level: float = 0.95) -> dict[str, Any]:
-        """Collapse fitted-mean draws to per-row credible bands.
-
-        Dispatches to the Rust ``posterior_eta_bands`` kernel for the
-        quantile reductions and inverse-link push-through.
-        """
-        import numpy as np
-
-        eta = np.asarray(self.eta, dtype=float)
-        try:
-            raw = _rust().posterior_eta_bands(
-                eta.ravel().tolist(),
-                int(eta.shape[0]),
-                int(eta.shape[1]),
-                self.family_kind,
-                float(level),
-            )
-        except Exception as exc:
-            raise _map_exc(exc) from exc
-        parsed = json.loads(raw)
-        return {
-            key: np.asarray(parsed[key], dtype=float)
-            for key in ("eta_mean", "eta_lower", "eta_upper", "mean", "mean_lower", "mean_upper")
-        }
-
-    def __repr__(self) -> str:
-        return (
-            f"PosteriorPredictive(n_draws={self.n_draws}, n_rows={self.n_rows}, "
-            f"family_kind={self.family_kind!r}, model_class={self.model_class!r})"
-        )
 
 
 @dataclass(frozen=True, eq=False, slots=True)
