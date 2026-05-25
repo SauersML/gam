@@ -663,66 +663,6 @@ class IvaeRidgeMeanGauge(_AnalyticPenalty):
         }
 
 
-@dataclass(init=False, slots=True)
-class OrthogonalityPenalty(_AnalyticPenalty):
-    """Gauge-fixing penalty for latent-axis identifiability.
-    KIND_TAG = "orthogonality"
-
-    Applies a Frobenius orthogonality penalty to the column-normalized latent
-    coordinate matrix, so it breaks the rotation gauge while leaving ARD free
-    to shrink individual axis norms.
-
-    **When to use.** Pair with ``ARDPenalty`` when learning intrinsic
-    dimension. ARD alone is rotation-invariant; Orthogonality locks the basis
-    so an ARD-pruned axis has a stable meaning.
-
-    Parameters
-    ----------
-    weight
-        Fixed base weight, or the base multiplier when ``learnable=True``.
-    n_eff
-        Effective observation count used for normalization.
-    learnable
-        If true, expose one REML-selectable log-weight ``ρ``.
-    target
-        The ``LatentCoord`` block name/object. Defaults to ``"t"``.
-    """
-
-    target: TargetSpec
-    weight: float
-    n_eff: int
-    learnable: bool
-    weight_schedule: ScalarWeightSchedule | dict[str, Any] | None
-
-    def __init__(
-        self,
-        weight: float,
-        n_eff: int,
-        learnable: bool = False,
-        *,
-        target: TargetSpec = "t",
-    ) -> None:
-        self.target = target
-        self.weight = float(weight)
-        self.n_eff = int(n_eff)
-        self.learnable = bool(learnable)
-        self.weight_schedule = None
-        self.__post_init__()
-
-    def __post_init__(self) -> None:
-        if not self.weight > 0.0:
-            raise ValueError(f"OrthogonalityPenalty.weight must be > 0, got {self.weight}")
-        if self.n_eff <= 0:
-            raise ValueError(f"OrthogonalityPenalty.n_eff must be > 0, got {self.n_eff}")
-
-    def _payload_extras(self) -> dict[str, Any]:
-        return {
-            "weight": self.weight,
-            "n_eff": self.n_eff,
-            "learnable": self.learnable,
-        }
-
-
 # Sum type for type hints on `gamfit.fit(..., penalties=...)` and similar.
 Penalty = (
     "IsometryPenalty | SparsityPenalty | ScadMcpPenalty | ARDPenalty | "

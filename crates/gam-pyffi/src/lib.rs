@@ -12818,6 +12818,168 @@ fn survival_null_curve_from_train<'py>(
         .unbind())
 }
 
+fn benchmark_survival_matrix_from_risk(
+    train_times: &[f64],
+    train_events: &[f64],
+    train_risk: &[f64],
+    test_risk: &[f64],
+    grid: &[f64],
+) -> PyResult<Array2<f64>> {
+    if train_times.len() != train_events.len() || train_times.len() != train_risk.len() {
+        return Err(PyValueError::new_err(format!(
+            "survival calibration length mismatch: times={} events={} risk={}",
+            train_times.len(),
+            train_events.len(),
+            train_risk.len()
+        )));
+    }
+    let mut rows: Vec<(f64, f64, f64)> = train_times
+        .iter()
+        .zip(train_events.iter())
+        .zip(train_risk.iter())
+        .filter_map(|((&time, &event), &risk)| {
+            (time.is_finite() && event.is_finite() && risk.is_finite() && time > 0.0)
+                .then_some((time, event, risk))
+        })
+        .collect();
+    if rows.is_empty() {
+        return Ok(Array2::<f64>::ones((test_risk.len(), grid.len())));
+    }
+    let risk_mean = rows.iter().map(|row| row.2).sum::<f64>() / rows.len() as f64;
+    let risk_sd = (rows
+        .iter()
+        .map(|row| {
+            let d = row.2 - risk_mean;
+            d * d
+        })
+        .sum::<f64>()
+        / rows.len() as f64)
+        .sqrt();
+    if rows.len() < 2 || risk_sd < 1.0e-12 {
+        let times: Vec<f64> = rows.iter().map(|row| row.0).collect();
+        let events: Vec<f64> = rows.iter().map(|row| row.1).collect();
+        let curve = benchmark_km_curve(&times, &events, grid);
+        let mut out = Array2::<f64>::zeros((test_risk.len(), grid.len()));
+        for mut row in out.rows_mut() {
+            for (dst, src) in row.iter_mut().zip(curve.iter()) {
+                *dst = *src;
+            }
+        }
+        return Ok(out);
+    }
+    for row in &mut rows {
+        row.2 -= risk_mean;
+    }
+    rows.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut event_times = Vec::<(f64, usize, f64)>::new();
+    let mut i = 0usize;
+    while i < rows.len() {
+        let time = rows[i].0;
+        let mut j = i + 1;
+        let mut d = usize::from(rows[i].1 > 0.5);
+        let mut event_x = if rows[i].1 > 0.5 { rows[i].2 } else { 0.0 };
+        while j < rows.len() && rows[j].0 == time {
+            if rows[j].1 > 0.5 {
+                d += 1;
+                event_x += rows[j].2;
+            }
+            j += 1;
+        }
+        if d > 0 {
+            event_times.push((time, d, event_x));
+        }
+        i = j;
+    }
+    let mut beta = 0.0;
+    let ridge = 1.0e-8;
+    for _ in 0..50 {
+        let mut score = -ridge * beta;
+        let mut info = ridge;
+        for &(time, d, event_x) in &event_times {
+            let mut s0 = 0.0;
+            let mut s1 = 0.0;
+            let mut s2 = 0.0;
+            for &(row_time, _, x) in &rows {
+                if row_time >= time {
+                    let w = (beta * x).clamp(-50.0, 50.0).exp();
+                    s0 += w;
+                    s1 += w * x;
+                    s2 += w * x * x;
+                }
+            }
+            if s0 > 0.0 {
+                let mean = s1 / s0;
+                score += event_x - d as f64 * mean;
+                info += d as f64 * (s2 / s0 - mean * mean).max(0.0);
+            }
+        }
+        if !info.is_finite() || info <= 0.0 {
+            break;
+        }
+        let step = (score / info).clamp(-2.0, 2.0);
+        beta += step;
+        if step.abs() < 1.0e-10 {
+            break;
+        }
+    }
+    let mut baseline = Vec::<(f64, f64)>::new();
+    let mut cumulative = 0.0;
+    for &(time, d, _) in &event_times {
+        let mut s0 = 0.0;
+        for &(row_time, _, x) in &rows {
+            if row_time >= time {
+                s0 += (beta * x).clamp(-50.0, 50.0).exp();
+            }
+        }
+        if s0 > 0.0 {
+            cumulative += d as f64 / s0;
+            baseline.push((time, cumulative));
+        }
+    }
+    let mut out = Array2::<f64>::zeros((test_risk.len(), grid.len()));
+    for (row_idx, &risk) in test_risk.iter().enumerate() {
+        let x = if risk.is_finite() { risk - risk_mean } else { 0.0 };
+        let mult = (beta * x).clamp(-50.0, 50.0).exp();
+        let mut step_idx = 0usize;
+        let mut h0 = 0.0;
+        let mut prev = 1.0;
+        for (col_idx, &time) in grid.iter().enumerate() {
+            while step_idx < baseline.len() && baseline[step_idx].0 <= time {
+                h0 = baseline[step_idx].1;
+                step_idx += 1;
+            }
+            let value = if col_idx == 0 {
+                1.0
+            } else {
+                (-(h0 * mult)).exp().clamp(1.0e-12, 1.0).min(prev)
+            };
+            out[[row_idx, col_idx]] = value;
+            prev = value;
+        }
+    }
+    Ok(out)
+}
+
+#[pyfunction]
+fn survival_matrix_from_risk_calibration<'py>(
+    py: Python<'py>,
+    train_times: Vec<f64>,
+    train_events: Vec<f64>,
+    train_risk: Vec<f64>,
+    test_risk: Vec<f64>,
+    grid: Vec<f64>,
+) -> PyResult<Py<PyArray2<f64>>> {
+    Ok(benchmark_survival_matrix_from_risk(
+        &train_times,
+        &train_events,
+        &train_risk,
+        &test_risk,
+        &grid,
+    )?
+    .into_pyarray(py)
+    .unbind())
+}
+
 // =========================================================================
 // LatentCoord input-location derivative helpers (thin pyffi wrappers).
 //
