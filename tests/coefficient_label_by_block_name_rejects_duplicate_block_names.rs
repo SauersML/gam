@@ -21,7 +21,10 @@ fn make_spec(name: &str) -> ParameterBlockSpec {
 #[test]
 fn coefficient_label_by_block_name_rejects_duplicate_block_names() {
     let specs = vec![make_spec("dup"), make_spec("dup")];
-    let groups = vec![CoefficientGroupSpec::new("g", vec![coefficient_label("dup", 1)])];
+    let groups = vec![CoefficientGroupSpec::new(
+        "g",
+        vec![coefficient_label("dup", 1)],
+    )];
 
     let result = realize_coefficient_groups_for_custom_family(&specs, &groups, RhoPrior::Flat);
 
