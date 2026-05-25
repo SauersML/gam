@@ -834,16 +834,15 @@ def _thread3_cliff_gradient_magnitude(
         [float(coeff_map.get(ds["features"][int(c)], 0.0)) for c in feature_cols],
         dtype=float,
     )
-    coeff_norm = float(np.linalg.norm(coeff_vec))
-    if coeff_norm < 1e-12:
-        return None
     jump = float(ds.get("thread3_cliff_jump", 0.0))
     sharpness = float(ds.get("thread3_cliff_sharpness", 1.0))
-    z = collocation_points.dot(coeff_vec)
-    az = np.clip(np.abs(sharpness * z), 0.0, 50.0)
-    sech2 = 1.0 / (np.cosh(az) ** 2)
-    deta_dz_abs = abs(jump * sharpness) * sech2
-    return np.asarray(deta_dz_abs * coeff_norm, dtype=float)
+    values = _gamfit_rust().thread3_cliff_gradient_magnitude(
+        np.asarray(collocation_points, dtype=float),
+        coeff_vec.reshape(-1).tolist(),
+        jump,
+        sharpness,
+    )
+    return None if values is None else np.asarray(values, dtype=float)
 
 
 def _extract_thread3_adaptive_fold_metrics(model_payload: dict[str, typing.Any] | None, ds: dict[str, typing.Any]) -> dict[str, typing.Any]:
@@ -1909,14 +1908,7 @@ def run_rust_gamlss_survival_cv(
             model_path = td_path / f"model_{fold_id}.json"
             pred_path = td_path / f"pred_{fold_id}.csv"
 
-            # Z-score features.
-            for col in ds["features"]:
-                mu = float(train_df[col].mean())
-                sdv = float(train_df[col].std())
-                if (not np.isfinite(sdv)) or sdv < 1e-8:
-                    sdv = 1.0
-                train_df[col] = (train_df[col] - mu) / sdv
-                test_df[col] = (test_df[col] - mu) / sdv
+            train_df, test_df = zscore_train_test(train_df, test_df, ds["features"])
             train_df["__entry"] = 0.0
             horizon = _survival_eval_horizon(train_df, ds["time_col"])
             test_pred_df = test_df.copy()
@@ -2096,13 +2088,7 @@ def run_rust_gamlss_survival_marginal_slope_cv(
             model_path = td_path / f"model_{fold_id}.json"
             pred_path = td_path / f"pred_{fold_id}.csv"
 
-            for col in ds["features"]:
-                mu = float(train_df[col].mean())
-                sdv = float(train_df[col].std())
-                if (not np.isfinite(sdv)) or sdv < 1e-8:
-                    sdv = 1.0
-                train_df[col] = (train_df[col] - mu) / sdv
-                test_df[col] = (test_df[col] - mu) / sdv
+            train_df, test_df = zscore_train_test(train_df, test_df, ds["features"])
             train_df["__entry"] = 0.0
             horizon = _survival_eval_horizon(train_df, ds["time_col"])
             test_pred_df = test_df.copy()
