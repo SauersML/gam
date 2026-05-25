@@ -13,8 +13,8 @@ overridden via `family=`.
 | --- | --- | --- |
 | Binary `{0, 1}` | binomial | logit |
 | Continuous numeric | Gaussian | identity |
-| Non-negative integer with `link(type=log)` | Poisson | log |
-| Otherwise, with `link(type=log)` | Gamma | log |
+| Non-negative integer with log link | Poisson | log |
+| Otherwise, with log link | Gamma | log |
 | `Surv(entry, exit, event)` | survival | depends on `survival_likelihood` |
 
 When the log link is set, Poisson vs Gamma is chosen automatically
@@ -74,7 +74,7 @@ Inverse link `exp(eta)`. Pair with `family="poisson"` for counts and
 `family="gamma"` for positive continuous responses.
 
 ```python
-gamfit.fit(df, "count ~ s(time) + link(type=log)",
+gamfit.fit(df, "count ~ s(time)",
            family="poisson", link="log", offset="log_exposure")
 ```
 
