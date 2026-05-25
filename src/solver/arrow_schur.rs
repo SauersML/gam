@@ -1106,6 +1106,29 @@ impl ArrowSchurSystem {
         solve_arrow_newton_step_core(self, ridge_t, ridge_beta, &options)
     }
 
+    /// Solve with the standard LM-style ridge escalation: if a per-row
+    /// `H_tt + ridge_t·I` Cholesky pivot is non-PD, or the reduced Schur
+    /// factor fails, geometrically grow both ridges and retry. This is the
+    /// same Ceres-style proximal correction the Newton driver in
+    /// `run_joint_fit_arrow_schur` performs around `solve`, lifted into the
+    /// system itself so every entry point (predict OOS reconstruction,
+    /// single-shot Newton refinement, …) is self-healing against the
+    /// pathological per-row blocks produced by PCA-seeded latent
+    /// coordinates on subset / new data — see #163 and #175.
+    ///
+    /// `ridge_t` / `ridge_beta` are the caller-nominal Tikhonov ridges; the
+    /// escalation only adds extra damping on top of them when the factor
+    /// fails. PCG / AdaptiveCorrection failures are left untouched because
+    /// they are not factorization-recoverable.
+    pub fn solve_with_lm_escalation(
+        &self,
+        ridge_t: f64,
+        ridge_beta: f64,
+    ) -> Result<(Array1<f64>, Array1<f64>), ArrowSchurError> {
+        let options = ArrowSolveOptions::automatic(self.k);
+        solve_with_lm_escalation_inner(self, ridge_t, ridge_beta, &options)
+    }
+
     /// Solve with an explicit BA Schur mode.
     ///
     /// [`ArrowSolverMode::Direct`] is the classic dense reduced-camera-system
@@ -1804,6 +1827,57 @@ pub fn solve_arrow_newton_step_core(
     }
     solve_arrow_newton_step_artifacts(sys, ridge_t, ridge_beta, options)
         .map(|step| (step.delta_t, step.delta_beta))
+}
+
+/// LM-style ridge escalation around `solve_arrow_newton_step_core`.
+///
+/// On `PerRowFactorFailed` / `SchurFactorFailed` (the factorization-level
+/// failure modes triggered when a per-row `H_tt + ridge_t·I` block or the
+/// reduced Schur complement has a non-PD pivot at the nominal ridge),
+/// geometrically grow a `proximal_ridge` on top of the caller-supplied
+/// `ridge_t` / `ridge_beta` and retry, exactly as the Ceres-style proximal
+/// correction the Newton driver in `run_joint_fit_arrow_schur` does around
+/// `solve`. Non-factorization failures (PCG divergence, adaptive-correction
+/// exhaustion) surface immediately because they are not recoverable by
+/// shifting the diagonal.
+///
+/// Returns the same `(Δt, Δβ)` as `solve_arrow_newton_step_core`, computed
+/// with the smallest escalated ridge that produced a successful factor.
+pub fn solve_with_lm_escalation_inner(
+    sys: &ArrowSchurSystem,
+    ridge_t: f64,
+    ridge_beta: f64,
+    options: &ArrowSolveOptions,
+) -> Result<(Array1<f64>, Array1<f64>), ArrowSchurError> {
+    let mut proximal_ridge = 0.0_f64;
+    let mut last_err: Option<ArrowSchurError> = None;
+    for attempt in 0..=DEFAULT_PROXIMAL_MAX_ATTEMPTS {
+        let damped_ridge_t = ridge_t + proximal_ridge;
+        let damped_ridge_beta = ridge_beta + proximal_ridge;
+        match solve_arrow_newton_step_core(sys, damped_ridge_t, damped_ridge_beta, options) {
+            Ok(pair) => return Ok(pair),
+            Err(err) => {
+                let recoverable = matches!(
+                    err,
+                    ArrowSchurError::PerRowFactorFailed { .. }
+                        | ArrowSchurError::SchurFactorFailed { .. }
+                );
+                last_err = Some(err);
+                if !recoverable {
+                    break;
+                }
+                if attempt == DEFAULT_PROXIMAL_MAX_ATTEMPTS {
+                    break;
+                }
+                proximal_ridge = if proximal_ridge == 0.0 {
+                    DEFAULT_PROXIMAL_INITIAL_RIDGE
+                } else {
+                    proximal_ridge * DEFAULT_PROXIMAL_RIDGE_GROWTH
+                };
+            }
+        }
+    }
+    Err(last_err.expect("escalation loop set last_err on failure"))
 }
 
 /// Solve a non-convex arrow-Schur step with adaptive proximal damping.

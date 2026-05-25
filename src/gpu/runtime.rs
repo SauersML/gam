@@ -1,5 +1,8 @@
+#[cfg(all(feature = "cuda", target_os = "linux"))]
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+use std::sync::{Arc, Mutex};
+use std::sync::OnceLock;
 
 use super::device::GpuDeviceInfo;
 use super::policy::GpuDispatchPolicy;

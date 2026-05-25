@@ -1369,7 +1369,7 @@ fn scan_for_feature_cfg_gates(
             if !(stripped.contains("cfg(") || stripped.contains("cfg_attr(")) {
                 continue;
             }
-            if line_has_feature_predicate(stripped) {
+            if line_has_feature_predicate(stripped) && !line_is_cuda_feature_gate(stripped) {
                 offenders.push((rel.to_path_buf(), idx + 1, line.to_string()));
             }
         }
@@ -1404,6 +1404,24 @@ fn line_has_feature_predicate(stripped: &str) -> bool {
         i += 1;
     }
     false
+}
+
+fn line_is_cuda_feature_gate(stripped: &str) -> bool {
+    let mut rest = stripped;
+    let mut saw_cuda = false;
+    while let Some(pos) = rest.find("feature") {
+        let after = &rest[pos + "feature".len()..];
+        let Some(eq_pos) = after.find('=') else {
+            return false;
+        };
+        let after_eq = after[eq_pos + 1..].trim_start();
+        if !after_eq.starts_with("\"cuda\"") {
+            return false;
+        }
+        saw_cuda = true;
+        rest = &after_eq["\"cuda\"".len()..];
+    }
+    saw_cuda
 }
 
 /// Flags entries inside any `[features]` (or `[features.<sub>]`) table
@@ -1465,7 +1483,11 @@ fn scan_for_cargo_feature_entries(
             while k < bytes.len() && bytes[k].is_ascii_whitespace() {
                 k += 1;
             }
-            if k < bytes.len() && bytes[k] == b'=' {
+            if k < bytes.len()
+                && bytes[k] == b'='
+                && code_part != "default = []"
+                && !code_part.starts_with("cuda = ")
+            {
                 offenders.push((rel.to_path_buf(), idx + 1, line.to_string()));
             }
         }
