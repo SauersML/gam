@@ -16323,6 +16323,99 @@ impl BlockOrthogonalityPenalty {
     }
 }
 
+#[pyclass(module = "gam_pyffi._rust", name = "AuxConditionalPriorPenalty")]
+struct AuxConditionalPriorPenalty {
+    #[pyo3(get, set)]
+    target: PyObject,
+    #[pyo3(get, set)]
+    lambda_per_row: PyObject,
+    #[pyo3(get, set)]
+    weight: f64,
+    #[pyo3(get, set)]
+    n_eff: i64,
+    #[pyo3(get, set)]
+    learnable: bool,
+    #[pyo3(get, set)]
+    weight_schedule: Option<PyObject>,
+}
+
+#[pymethods]
+impl AuxConditionalPriorPenalty {
+    #[new]
+    #[pyo3(signature = (lambda_per_row, weight, n_eff, learnable = false, *, target = "t"))]
+    fn new(
+        py: Python<'_>,
+        lambda_per_row: &Bound<'_, PyAny>,
+        weight: &Bound<'_, PyAny>,
+        n_eff: &Bound<'_, PyAny>,
+        learnable: &Bound<'_, PyAny>,
+        target: PyObject,
+    ) -> PyResult<Self> {
+        let builtins = py.import("builtins")?;
+        let weight = builtins.getattr("float")?.call1((weight,))?.extract::<f64>()?;
+        let n_eff = builtins.getattr("int")?.call1((n_eff,))?.extract::<i64>()?;
+        let learnable = learnable.is_truthy()?;
+        let lambda_per_row = aux_conditional_prior_float_array(py, lambda_per_row)?;
+        validate_aux_conditional_prior_lambda(&lambda_per_row, weight, n_eff)?;
+        Ok(Self {
+            target,
+            lambda_per_row: lambda_per_row.unbind(),
+            weight,
+            n_eff,
+            learnable,
+            weight_schedule: None,
+        })
+    }
+
+    #[classattr]
+    const KIND_TAG: &'static str = "aux_conditional_prior";
+
+    fn to_rust_descriptor(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let payload = PyDict::new(py);
+        payload.set_item("kind", Self::KIND_TAG)?;
+        payload.set_item("target", target_descriptor(py, self.target.bind(py))?)?;
+
+        let array = self
+            .lambda_per_row
+            .bind(py)
+            .extract::<PyReadonlyArrayDyn<'_, f64>>()?;
+        let view = array.as_array();
+        let flattened = view.iter().copied().collect::<Vec<_>>();
+        payload.set_item("lambda_per_row", PyList::new(py, flattened)?)?;
+        payload.set_item("lambda_per_row_shape", PyList::new(py, view.shape())?)?;
+        payload.set_item("weight", self.weight)?;
+        payload.set_item("n_eff", self.n_eff)?;
+        payload.set_item("learnable", self.learnable)?;
+        if let Some(schedule) = topk_weight_schedule_descriptor(py, &self.weight_schedule)? {
+            payload.set_item("weight_schedule", schedule)?;
+        }
+        Ok(payload.into())
+    }
+
+    fn set_weight_schedule<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        schedule: PyObject,
+    ) -> PyRefMut<'py, Self> {
+        slf.weight_schedule = Some(schedule);
+        slf
+    }
+
+    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        Ok(format!(
+            "AuxConditionalPriorPenalty(lambda_per_row={}, weight={}, n_eff={}, learnable={}, target={}, weight_schedule={})",
+            py_repr(py, self.lambda_per_row.bind(py))?,
+            self.weight,
+            self.n_eff,
+            self.learnable,
+            py_repr(py, self.target.bind(py))?,
+            match &self.weight_schedule {
+                Some(schedule) => py_repr(py, schedule.bind(py))?,
+                None => "None".to_string(),
+            }
+        ))
+    }
+}
+
 #[pymodule(name = "_rust", gil_used = false)]
 fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     gam::init_parallelism();
@@ -16355,7 +16448,6 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(survival_block, module)?)?;
     module.add_function(wrap_pyfunction!(survival_ffi_surface, module)?)?;
     module.add_function(wrap_pyfunction!(numeric_matrix_validate, module)?)?;
-    module.add_function(wrap_pyfunction!(numeric_matrix_f64, module)?)?;
     module.add_function(wrap_pyfunction!(marginal_slope_clip_probabilities, module)?)?;
     module.add_function(wrap_pyfunction!(
         transformation_normal_z_from_columns,
