@@ -243,12 +243,7 @@ pub trait UncertaintyCovarianceSource {
     /// Optional fitted adaptive-link state (SAS / BetaLogistic / Mixture /
     /// latent cloglog). Standard links and raw covariance sources return
     /// `None` and are handled with the family's own `InverseLink`.
-    fn resolved_fitted_link_state(
-        &self,
-        _family: &LikelihoodSpec,
-    ) -> Option<FittedLinkState> {
-        None
-    }
+    fn resolved_fitted_link_state(&self, family: &LikelihoodSpec) -> Option<FittedLinkState>;
     /// Optional first-order bias-correction shift `H⁻¹ S(λ̂) β̂` applied to
     /// the linear predictor when `options.apply_bias_correction` is set.
     fn resolved_bias_correction_beta(&self) -> Option<ArrayView1<'_, f64>> {
@@ -278,10 +273,7 @@ impl UncertaintyCovarianceSource for UnifiedFitResult {
     ) -> Result<(PredictionCovarianceBackend<'_>, bool), EstimationError> {
         selected_uncertainty_backend(self, expected_dim, mode, label)
     }
-    fn resolved_fitted_link_state(
-        &self,
-        family: &LikelihoodSpec,
-    ) -> Option<FittedLinkState> {
+    fn resolved_fitted_link_state(&self, family: &LikelihoodSpec) -> Option<FittedLinkState> {
         UnifiedFitResult::fitted_link_state(self, family).ok()
     }
     fn resolved_bias_correction_beta(&self) -> Option<ArrayView1<'_, f64>> {
@@ -310,6 +302,16 @@ impl UncertaintyCovarianceSource for Array2<f64> {
             )));
         }
         Ok((PredictionCovarianceBackend::from_dense(self.view()), false))
+    }
+
+    fn resolved_fitted_link_state(&self, family: &LikelihoodSpec) -> Option<FittedLinkState> {
+        match &family.link {
+            InverseLink::Standard(_)
+            | InverseLink::LatentCLogLog(_)
+            | InverseLink::Sas(_)
+            | InverseLink::BetaLogistic(_)
+            | InverseLink::Mixture(_) => None,
+        }
     }
 }
 
