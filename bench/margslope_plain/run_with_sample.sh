@@ -30,12 +30,17 @@ echo "pid=$PID n=$N budget=${BUDGET}s sample=${SAMPLE_SEC}s"
 # Warm-up
 sleep 5
 
+<<<<<<< HEAD
 # Concurrent sample profile. Reads $SUDO_PW from env when set; skipped otherwise.
 if [ -z "${SUDO_PW:-}" ]; then
   echo "skipping 'sample' profile (SUDO_PW not set)" >&2
 else
   printf '%s\n' "$SUDO_PW" | sudo -S sample "$PID" "$SAMPLE_SEC" 10 -mayDie -file "$RUNS/dch_$N.sample.txt" >/dev/null 2>&1 || true
 fi
+=======
+# Concurrent sample profile
+echo *** | sudo -S sample "$PID" "$SAMPLE_SEC" 10 -mayDie -file "$RUNS/dch_$N.sample.txt" >/dev/null 2>&1 || true
+>>>>>>> 8eb318ee3 (Margslope bench harness: sampler-attached and scale-dimensions variants)
 
 # Wait for the fit to finish or hit the budget
 START=$(date +%s)
