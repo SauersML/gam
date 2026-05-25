@@ -1283,6 +1283,53 @@ fn commit_pending_arrow_latent(pending_snapshot: &mut Option<Array1<f64>>) {
     drop(pending_snapshot.take());
 }
 
+fn arrow_joint_predicted_reduction(
+    sys: &crate::solver::arrow_schur::ArrowSchurSystem,
+    delta_t: ArrayView1<'_, f64>,
+    delta_beta: ArrayView1<'_, f64>,
+    ridge_t: f64,
+    ridge_beta: f64,
+) -> Option<f64> {
+    if delta_t.len() != sys.rows.len() * sys.d || delta_beta.len() != sys.k {
+        return None;
+    }
+
+    let mut lin = sys.gb.dot(&delta_beta);
+    let mut quad = ridge_beta * delta_beta.dot(&delta_beta);
+    if let Some(hbb_matvec) = sys.hbb_matvec.as_ref() {
+        let mut hbb_delta = Array1::<f64>::zeros(sys.k);
+        hbb_matvec(delta_beta, &mut hbb_delta);
+        quad += delta_beta.dot(&hbb_delta);
+    } else if sys.hbb.dim() == (sys.k, sys.k) {
+        quad += delta_beta.dot(&sys.hbb.dot(&delta_beta));
+    } else {
+        return None;
+    }
+
+    for (row_idx, row) in sys.rows.iter().enumerate() {
+        let base = row_idx * sys.d;
+        if row.gt.len() != sys.d || row.htt.dim() != (sys.d, sys.d) {
+            return None;
+        }
+        if row.htbeta.dim() != (sys.d, sys.k) {
+            return None;
+        }
+        for a in 0..sys.d {
+            let dt_a = delta_t[base + a];
+            lin += row.gt[a] * dt_a;
+            quad += ridge_t * dt_a * dt_a;
+            for b in 0..sys.d {
+                quad += dt_a * row.htt[[a, b]] * delta_t[base + b];
+            }
+            for beta_idx in 0..sys.k {
+                quad += 2.0 * dt_a * row.htbeta[[a, beta_idx]] * delta_beta[beta_idx];
+            }
+        }
+    }
+
+    Some(-(lin + 0.5 * quad))
+}
+
 #[inline]
 fn effective_kkt_tolerance(options: &WorkingModelPirlsOptions) -> f64 {
     match options.adaptive_kkt_tolerance {
@@ -5025,12 +5072,30 @@ where
                             };
                             match arrow_solve_result {
                                 Ok((delta_t, delta_beta)) => {
+                                    let arrow_predicted_reduction =
+                                        match crate::solver::arrow_schur::arrow_quadratic_model_reduction(
+                                            &arrow_system,
+                                            delta_t.view(),
+                                            delta_beta.view(),
+                                            0.0,
+                                            loop_lambda,
+                                        ) {
+                                            Ok(value) => value,
+                                            Err(e) => {
+                                                return Err(EstimationError::InvalidInput(format!(
+                                                    "arrow-Schur predicted reduction failed at iter {iter} \
+                                                     (loop_lambda={loop_lambda:.3e}): {e}"
+                                                )));
+                                            }
+                                        };
                                     // Apply the latent half of the joint
                                     // trial before screening β + Δβ so the
                                     // merit test evaluates the same pair
                                     // that will be committed on acceptance.
                                     arrow_cfg.apply_delta_t.as_ref()(&delta_t);
                                     pending_arrow_latent_restore = Some(latent_snapshot);
+                                    pending_arrow_predicted_reduction =
+                                        Some(arrow_predicted_reduction);
                                     // Write β-step into the existing
                                     // direction buffer so the rest of
                                     // the LM loop proceeds unchanged.
