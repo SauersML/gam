@@ -21027,7 +21027,7 @@ mod tests {
     }
 
     #[test]
-    fn structural_time_constraints_use_derivative_lower_bound_rows() {
+    fn time_constraints_use_exact_derivative_guard_rows() {
         let family = SurvivalMarginalSlopeFamily {
             n: 2,
             event: Arc::new(array![0.0, 1.0]),
@@ -21055,15 +21055,15 @@ mod tests {
                 Array2::zeros((2, 0)),
             )),
             logslope_surface_ranges: empty_logslope_surface_ranges(),
-            time_linear_constraints: structural_time_coefficient_constraints(
+            time_linear_constraints: time_derivative_guard_constraints(
                 &DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
-                    [1.0, 2.0],
-                    [3.0, 4.0]
+                    [1.0, 1.0],
+                    [1.0, -1.0]
                 ])),
-                &array![0.25, 0.5],
-                1e-4,
+                &array![0.0, 0.25],
+                1.0,
             )
-            .expect("time coefficient constraints"),
+            .expect("time derivative guard constraints"),
             score_warp: None,
             link_dev: None,
             time_wiggle_knots: None,
@@ -21089,20 +21089,78 @@ mod tests {
             .block_linear_constraints(&[], 0, &spec)
             .expect("constraint lookup")
             .expect("time constraints");
-        assert_eq!(constraints.a, Array2::<f64>::eye(2));
-        assert_eq!(constraints.b, Array1::<f64>::zeros(2));
+        assert_eq!(constraints.a, array![[1.0, 1.0], [1.0, -1.0]]);
+        assert_eq!(constraints.b, array![1.0, 0.75]);
+    }
+
+    #[test]
+    fn coupled_qd1_guard_limits_time_step_before_post_update_projection() {
+        let constraints = time_derivative_guard_constraints(
+            &DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0, 1.0]])),
+            &array![0.0],
+            1.0,
+        )
+        .expect("time derivative guard constraints")
+        .expect("coupled row");
+        let family = SurvivalMarginalSlopeFamily {
+            n: 1,
+            event: Arc::new(array![0.0]),
+            weights: Arc::new(array![1.0]),
+            z: Arc::new(array![0.0].insert_axis(Axis(1))),
+            score_covariance: unit_score_covariance(),
+            gaussian_frailty_sd: None,
+            derivative_guard: 1.0,
+            design_entry: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[
+                0.0, 0.0
+            ]])),
+            design_exit: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[
+                0.0, 0.0
+            ]])),
+            design_derivative_exit: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                array![[1.0, 1.0]],
+            )),
+            offset_entry: Arc::new(array![0.0]),
+            offset_exit: Arc::new(array![0.0]),
+            derivative_offset_exit: Arc::new(array![0.0]),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((1, 0)),
+            )),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((1, 0)),
+            )),
+            logslope_surface_ranges: empty_logslope_surface_ranges(),
+            time_linear_constraints: Some(constraints),
+            score_warp: None,
+            link_dev: None,
+            time_wiggle_knots: None,
+            time_wiggle_degree: None,
+            time_wiggle_ncols: 0,
+            intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+        };
+        let states = vec![ParameterBlockState {
+            beta: array![0.6, 0.6],
+            eta: array![0.0],
+        }];
+        let alpha = family
+            .max_feasible_step_size(&states, 0, &array![-1.0, 0.0])
+            .expect("coupled qd1 step limit")
+            .expect("binding coupled row");
+
+        assert_relative_eq!(alpha, 0.199, epsilon = 1e-12);
     }
 
     #[test]
     fn timewiggle_tail_constraints_are_part_of_time_block_feasibility() {
-        let structural = structural_time_coefficient_constraints(
+        let structural = time_derivative_guard_constraints(
             &DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[
                 1.0, 0.0, 0.0
             ]])),
             &array![1e-6],
             1e-6,
         )
-        .expect("structural constraints");
+        .expect("time derivative guard constraints");
         let constraints = append_timewiggle_tail_nonnegative_constraints(structural, 3, 2)
             .expect("combined constraints")
             .expect("time constraints");
@@ -21166,7 +21224,7 @@ mod tests {
     }
 
     #[test]
-    fn time_block_post_update_projects_structural_and_timewiggle_constraints() {
+    fn time_block_post_update_projects_derivative_guard_and_timewiggle_constraints() {
         let family = SurvivalMarginalSlopeFamily {
             n: 1,
             event: Arc::new(array![0.0]),
@@ -21195,14 +21253,14 @@ mod tests {
             )),
             logslope_surface_ranges: empty_logslope_surface_ranges(),
             time_linear_constraints: append_timewiggle_tail_nonnegative_constraints(
-                structural_time_coefficient_constraints(
+                time_derivative_guard_constraints(
                     &DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[
                         1.0, 0.0
                     ]])),
                     &array![1e-6],
                     1e-6,
                 )
-                .expect("time coefficient constraints"),
+                .expect("time derivative guard constraints"),
                 2,
                 1,
             )

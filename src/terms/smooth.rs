@@ -4934,6 +4934,14 @@ struct LocalSmoothTermBuild {
     penalties: Vec<Array2<f64>>,
     ops: Vec<Option<std::sync::Arc<dyn crate::terms::penalty_op::PenaltyOp>>>,
     nullspaces: Vec<usize>,
+    /// Per-active-penalty null-space eigenvector matrices, parallel to
+    /// `penalties` / `ops` / `nullspaces`. `Some(U_null)` when
+    /// `nullspaces[k] > 0`, with `U_null` orthonormal columns spanning
+    /// `null(penalties[k])` in this smooth's local coordinate system; `None`
+    /// when the active block is full-rank. Stage 1 plumbing; Stage 2
+    /// consumes this to absorb the smooth's null space into the parametric
+    /// block at `TermCollectionDesign` construction.
+    null_eigenvectors: Vec<Option<Array2<f64>>>,
     penaltyinfo: Vec<PenaltyInfo>,
     pre_dropped_penaltyinfo: Vec<PenaltyInfo>,
     metadata: BasisMetadata,
@@ -6024,6 +6032,7 @@ fn build_single_local_smooth_term(
         penalties: penalties_t,
         ops: ops_t,
         nullspaces: nullspaces_t,
+        null_eigenvectors: null_eigenvectors_t,
         penaltyinfo: penaltyinfo_t,
         pre_dropped_penaltyinfo: pre_dropped_penaltyinfo_t,
         metadata,
