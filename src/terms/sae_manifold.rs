@@ -542,8 +542,21 @@ impl SaeManifoldAtom {
     /// `g_k(t_{ik}) = Phi_k(t_{ik}) B_k`.
     pub fn decoded_row(&self, row: usize) -> Array1<f64> {
         let p = self.output_dim();
-        let m = self.basis_size();
         let mut out = Array1::<f64>::zeros(p);
+        self.fill_decoded_row(row, out.as_slice_mut().expect("contiguous"));
+        out
+    }
+
+    /// In-place fill of `g_k(t_{ik})` into a caller-supplied buffer of length `p`.
+    /// Hot-loop variant used by the arrow-Schur assembly to avoid per-row
+    /// allocations.
+    pub fn fill_decoded_row(&self, row: usize, out: &mut [f64]) {
+        let p = self.output_dim();
+        let m = self.basis_size();
+        debug_assert_eq!(out.len(), p);
+        for slot in out.iter_mut() {
+            *slot = 0.0;
+        }
         for basis_col in 0..m {
             let phi = self.basis_values[[row, basis_col]];
             if phi == 0.0 {
@@ -553,14 +566,25 @@ impl SaeManifoldAtom {
                 out[out_col] += phi * self.decoder_coefficients[[basis_col, out_col]];
             }
         }
-        out
     }
 
     /// `d g_k(t_{ik}) / d t_{ik,j}` for one row and latent axis.
     pub fn decoded_derivative_row(&self, row: usize, latent_axis: usize) -> Array1<f64> {
         let p = self.output_dim();
-        let m = self.basis_size();
         let mut out = Array1::<f64>::zeros(p);
+        self.fill_decoded_derivative_row(row, latent_axis, out.as_slice_mut().expect("contiguous"));
+        out
+    }
+
+    /// In-place fill of `d g_k / d t_{ik,axis}` into a caller-supplied buffer of
+    /// length `p`. Hot-loop variant used by the arrow-Schur assembly.
+    pub fn fill_decoded_derivative_row(&self, row: usize, latent_axis: usize, out: &mut [f64]) {
+        let p = self.output_dim();
+        let m = self.basis_size();
+        debug_assert_eq!(out.len(), p);
+        for slot in out.iter_mut() {
+            *slot = 0.0;
+        }
         for basis_col in 0..m {
             let dphi = self.basis_jacobian[[row, basis_col, latent_axis]];
             if dphi == 0.0 {
@@ -570,7 +594,6 @@ impl SaeManifoldAtom {
                 out[out_col] += dphi * self.decoder_coefficients[[basis_col, out_col]];
             }
         }
-        out
     }
 }
 
@@ -1232,39 +1255,64 @@ impl SaeManifoldTerm {
             }
         }
 
+        // Hoist per-row temporaries outside the row loop: these allocations
+        // previously fired N times per assembly, and each `decoded_row` /
+        // `decoded_derivative_row` call inside the loop allocated its own
+        // `Array1<f64>` of length p.
+        let mut decoded = Array2::<f64>::zeros((k_atoms, p));
+        let mut dg_buf = Array1::<f64>::zeros(p);
+        let mut fitted = Array1::<f64>::zeros(p);
+        let mut error = Array1::<f64>::zeros(p);
+        let mut local_jac = Array2::<f64>::zeros((q, p));
+        // Stick-breaking prior for IBP-MAP depends only on (k_atoms, alpha)
+        // which are constant across rows; precompute once.
+        let ibp_prior_vec = match self.assignment.mode {
+            AssignmentMode::IBPMap { alpha, .. } => {
+                Some(ibp_stick_breaking_prior(k_atoms, alpha).to_vec())
+            }
+            _ => None,
+        };
+        let ibp_prior_slice = ibp_prior_vec.as_deref();
         for row in 0..n {
             let assignments = self.assignment.try_assignments_row(row)?;
-            let mut decoded: Vec<Array1<f64>> = Vec::with_capacity(k_atoms);
-            let mut fitted = Array1::<f64>::zeros(p);
+            fitted.fill(0.0);
             for atom_idx in 0..k_atoms {
-                let g = self.atoms[atom_idx].decoded_row(row);
+                let decoded_row_slice = decoded
+                    .row_mut(atom_idx)
+                    .into_slice()
+                    .expect("decoded matrix is contiguous");
+                self.atoms[atom_idx].fill_decoded_row(row, decoded_row_slice);
+                let a_k = assignments[atom_idx];
                 for out_col in 0..p {
-                    fitted[out_col] += assignments[atom_idx] * g[out_col];
+                    fitted[out_col] += a_k * decoded[[atom_idx, out_col]];
                 }
-                decoded.push(g);
             }
-            let mut error = Array1::<f64>::zeros(p);
             for out_col in 0..p {
                 error[out_col] = fitted[out_col] - target[[row, out_col]];
             }
 
-            let mut local_jac = Array2::<f64>::zeros((q, p));
+            local_jac.fill(0.0);
             fill_assignment_logit_jvp_rows(
                 self.assignment.mode,
                 self.assignment.logits.row(row),
                 assignments.view(),
-                &decoded,
+                decoded.view(),
                 fitted.view(),
+                ibp_prior_slice,
                 &mut local_jac,
             );
             // Coordinate columns.
+            let dg_slice = dg_buf
+                .as_slice_mut()
+                .expect("derivative buffer is contiguous");
             for atom_idx in 0..k_atoms {
                 let d = self.atoms[atom_idx].latent_dim;
                 let off = coord_offsets[atom_idx];
+                let a_k = assignments[atom_idx];
                 for axis in 0..d {
-                    let dg = self.atoms[atom_idx].decoded_derivative_row(row, axis);
+                    self.atoms[atom_idx].fill_decoded_derivative_row(row, axis, dg_slice);
                     for out_col in 0..p {
-                        local_jac[[off + axis, out_col]] = assignments[atom_idx] * dg[out_col];
+                        local_jac[[off + axis, out_col]] = a_k * dg_slice[out_col];
                     }
                 }
             }
@@ -1898,8 +1946,9 @@ fn fill_assignment_logit_jvp_rows(
     mode: AssignmentMode,
     logits: ArrayView1<'_, f64>,
     assignments: ArrayView1<'_, f64>,
-    decoded: &[Array1<f64>],
+    decoded: ArrayView2<'_, f64>,
     fitted: ArrayView1<'_, f64>,
+    ibp_prior: Option<&[f64]>,
     local_jac: &mut Array2<f64>,
 ) {
     if assignments.len() == 1 {
@@ -1919,26 +1968,25 @@ fn fill_assignment_logit_jvp_rows(
             for logit_col in 0..assignments.len() {
                 for out_col in 0..fitted.len() {
                     local_jac[[logit_col, out_col]] = assignments[logit_col]
-                        * (decoded[logit_col][out_col] - fitted[out_col])
+                        * (decoded[[logit_col, out_col]] - fitted[out_col])
                         * inv_tau;
                 }
             }
         }
-        AssignmentMode::IBPMap {
-            temperature, alpha, ..
-        } => {
+        AssignmentMode::IBPMap { temperature, .. } => {
             // Truncated-IBP concrete relaxation: z_k = σ(l_k/τ) · π_k where
             // π_k is the stick-breaking prior. Thus
             // dz_k/dl_k = σ(l/τ)(1-σ(l/τ))/τ · π_k = a_k(π_k - a_k)/(π_k τ).
             let inv_tau = 1.0 / temperature;
-            let prior = ibp_stick_breaking_prior(assignments.len(), alpha);
+            let prior =
+                ibp_prior.expect("fill_assignment_logit_jvp_rows: IBPMap requires precomputed prior");
             for logit_col in 0..assignments.len() {
                 let pi_k = prior[logit_col];
                 let a_k = assignments[logit_col];
                 let sig = if pi_k > 0.0 { a_k / pi_k } else { 0.0 };
                 let dz = sig * (1.0 - sig) * inv_tau * pi_k;
                 for out_col in 0..fitted.len() {
-                    local_jac[[logit_col, out_col]] = dz * decoded[logit_col][out_col];
+                    local_jac[[logit_col, out_col]] = dz * decoded[[logit_col, out_col]];
                 }
             }
         }
@@ -1956,7 +2004,7 @@ fn fill_assignment_logit_jvp_rows(
                 let activation = sigmoid_scalar(logits[logit_col] * inv_tau);
                 let da = activation * (1.0 - activation) * inv_tau;
                 for out_col in 0..fitted.len() {
-                    local_jac[[logit_col, out_col]] = da * decoded[logit_col][out_col];
+                    local_jac[[logit_col, out_col]] = da * decoded[[logit_col, out_col]];
                 }
             }
         }
