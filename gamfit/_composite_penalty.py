@@ -79,5 +79,26 @@ class CompositePenalty(PenaltyDescriptor):
             total = contrib if total is None else total + contrib
         return total
 
+    def to_rust_descriptor(self) -> dict[str, Any]:
+        """Sum-composite descriptor that round-trips each child verbatim.
+
+        Children stay addressable for diagnostics: ``len(composite)`` reports
+        the count, iteration yields the originals, and the dict carries each
+        child's own ``to_rust_descriptor()`` (or ``to_dict()`` fallback) under
+        ``"children"``.
+        """
+
+        def _child(p: PenaltyDescriptor) -> dict[str, Any]:
+            if hasattr(p, "to_rust_descriptor"):
+                return p.to_rust_descriptor()
+            if hasattr(p, "to_dict"):
+                return p.to_dict()
+            return {"kind": type(p).__name__}
+
+        return {"kind": "sum", "children": [_child(p) for p in self.parts]}
+
+    def to_dict(self) -> dict[str, Any]:
+        return self.to_rust_descriptor()
+
 
 __all__ = ["CompositePenalty"]
