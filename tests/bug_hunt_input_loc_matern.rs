@@ -49,23 +49,33 @@ fn sphere_s2_input_loc_grad_lies_in_tangent_plane() {
 
 #[test]
 fn basis_input_loc_grad_matches_bspline_finite_difference() {
-    let knots = Array1::from(vec![0.0,0.0,0.0,0.0,0.25,0.5,0.75,1.0,1.0,1.0,1.0]);
-    let x0 = 0.37;
-    let h = 1e-7;
+    // Analytic jet returned by `periodic_bspline_first_derivative_nd` must
+    // equal a centered finite difference of the matching value path
+    // `build_periodic_bspline_basis_1d` at every basis column. This is the
+    // canonical "analytic derivative vs centered FD" pairing for the
+    // cardinal periodic B-spline.
+    let degree = 3usize;
+    let num_basis = 8usize;
+    let period = 1.0_f64;
+    let origin = 0.0_f64;
+    let x0 = 0.37_f64;
+    let h = 1e-6_f64;
     let x = array![[x0]];
-    let jet = periodic_bspline_first_derivative_nd(x.view(), (0.0, 1.0), 3, 8)
+    let jet = periodic_bspline_first_derivative_nd(x.view(), (origin, origin + period), degree, num_basis)
         .expect("derivative jet should evaluate");
-    let spec = BsplineBasisSpec {
-        knots: knots.clone(), degree: 3, include_intercept: false, double_penalty: false,
-        center: None, periodic: false,
-    };
-    let p = build_bspline_basis(array![[x0 + h]].view(), &spec).expect("plus basis");
-    let m = build_bspline_basis(array![[x0 - h]].view(), &spec).expect("minus basis");
-    let fd = (p.design.to_dense() - m.design.to_dense()) / (2.0 * h);
-    for j in 0..fd.ncols().min(jet.shape()[1]) {
+    let spec = PeriodicBSplineBasisSpec::new(degree, num_basis, period, origin, 2);
+    let plus = build_periodic_bspline_basis_1d(Array1::from(vec![x0 + h]).view(), &spec)
+        .expect("plus basis");
+    let minus = build_periodic_bspline_basis_1d(Array1::from(vec![x0 - h]).view(), &spec)
+        .expect("minus basis");
+    let fd = (&plus - &minus) / (2.0 * h);
+    for j in 0..num_basis {
+        let analytic = jet[[0, j, 0]];
+        let numeric = fd[[0, j]];
         assert!(
-            (fd[[0, j]] - jet[[0, j, 0]]).abs() < 1e-7,
-            "Per-row basis gradient with respect to input x should match finite differences"
+            (analytic - numeric).abs() < 1e-7,
+            "Per-row basis gradient with respect to input x should match finite differences \
+             at basis index {j}: analytic={analytic}, numeric={numeric}"
         );
     }
 }
