@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import re
 from collections.abc import Mapping, Sequence
@@ -30,9 +31,11 @@ from .smooth import (
 )
 
 
+# Sentinel placeholder for the `auto` tuple passed through `_formula_for_candidate`.
+# The Rust assembler scans for `type=AUTO` itself, so the Python side only needs
+# to know whether such a term exists; the tuple's interior is unused.
+_AUTO_PRESENT: tuple[int, int, str] = (-1, -1, "")
 _AUTO_RE = re.compile(r"\btype\s*=\s*(['\"]?)AUTO\1(?=\s*(?:,|\)))", re.IGNORECASE)
-_SMOOTH_CALL_RE = re.compile(r"\b(s|smooth)\s*\(", re.IGNORECASE)
-_SIZE_OPTION_KEYS = {"k", "basis_dim", "basis-dim", "basisdim", "centers", "knots"}
 
 
 @dataclass(frozen=True, slots=True)

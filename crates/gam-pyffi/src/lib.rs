@@ -13406,7 +13406,7 @@ fn difference_simultaneous_critical(
     if n_sim == 0 {
         return Err("difference_smooth n_sim must be at least 1 when simultaneous=True".to_string());
     }
-    let sym = (cov + &cov.t()) * 0.5;
+    let sym = (cov.to_owned() + cov.t()) * 0.5;
     let chol = sym
         .cholesky(Side::Lower)
         .map_err(|err| format!("coefficient covariance Cholesky failed: {err}"))?;
@@ -13653,9 +13653,9 @@ fn difference_smooth_json_impl(model_bytes: &[u8], request_json: &str) -> Result
             let upper = diff[idx] + crit * se[idx];
             let mut row = serde_json::Map::new();
             row.insert(request.view.clone(), serde_json::json!(x));
-            row.insert("group".to_string(), serde_json::json!(group));
-            row.insert("level_1".to_string(), serde_json::json!(level_1));
-            row.insert("level_2".to_string(), serde_json::json!(level_2));
+            row.insert("group".to_string(), serde_json::json!(group.clone()));
+            row.insert("level_1".to_string(), serde_json::json!(level_1.clone()));
+            row.insert("level_2".to_string(), serde_json::json!(level_2.clone()));
             row.insert("diff".to_string(), serde_json::json!(diff[idx]));
             row.insert("se".to_string(), serde_json::json!(se[idx]));
             row.insert("lower".to_string(), serde_json::json!(lower));
@@ -13668,7 +13668,7 @@ fn difference_smooth_json_impl(model_bytes: &[u8], request_json: &str) -> Result
             row.insert("critical".to_string(), serde_json::json!(crit));
             row.insert(
                 "covariance_kind".to_string(),
-                serde_json::json!(cov_kind),
+                serde_json::json!(cov_kind.clone()),
             );
             row.insert(
                 "covariance_corrected".to_string(),
