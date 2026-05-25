@@ -549,7 +549,7 @@ pub(crate) fn latest_outer_rho_upper_bounds_for_ift() -> Option<Array1<f64>> {
         .clone()
 }
 
-fn latest_outer_theta_for_ift() -> Option<Array1<f64>> {
+pub(crate) fn latest_outer_theta_for_ift() -> Option<Array1<f64>> {
     IFT_LATEST_OUTER_THETA
         .get_or_init(|| Mutex::new(None))
         .lock()

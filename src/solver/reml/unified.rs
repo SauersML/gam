@@ -8937,7 +8937,18 @@ fn solve_kkt_residual_kernel(
 }
 
 fn active_upper_rho_mask(rho: &[f64]) -> Vec<bool> {
-    let upper_bounds = super::runtime::latest_outer_rho_upper_bounds_for_ift();
+    let latest_theta = super::runtime::latest_outer_theta_for_ift();
+    let matching_outer_theta = latest_theta.as_ref().is_some_and(|theta| {
+        theta.len() >= rho.len()
+            && theta
+                .iter()
+                .take(rho.len())
+                .zip(rho.iter())
+                .all(|(&recorded, &current)| recorded.to_bits() == current.to_bits())
+    });
+    let upper_bounds = matching_outer_theta
+        .then(super::runtime::latest_outer_rho_upper_bounds_for_ift)
+        .flatten();
     rho.iter()
         .enumerate()
         .map(|(idx, &value)| {

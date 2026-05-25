@@ -187,6 +187,20 @@ pub struct PenaltyPseudologdet {
 }
 
 impl PenaltyPseudologdet {
+    fn structural_nullity_from_active_sum(s_unridged: &Array2<f64>) -> Result<usize, String> {
+        let p_dim = s_unridged.nrows();
+        if p_dim == 0 {
+            return Ok(0);
+        }
+
+        let (evals, _) = s_unridged
+            .eigh(Side::Lower)
+            .map_err(|e| format!("Penalty structural eigendecomposition failed: {e}"))?;
+        let threshold = super::unified::positive_eigenvalue_threshold(evals.as_slice().unwrap());
+        let rank = evals.iter().filter(|&&e| e > threshold).count();
+        Ok(p_dim - rank)
+    }
+
     /// Compute tr(A B) = Σ_i Σ_k A[i,k] B[k,i] without materializing the product.
     #[inline]
     fn trace_dense_product(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
@@ -624,13 +638,18 @@ impl PenaltyPseudologdet {
         for (k, s_k) in s_k_matrices.iter().enumerate() {
             s_total.scaled_add(lambdas[k], s_k);
         }
+        let structural_nullity = if ridge > 0.0 {
+            Some(Self::structural_nullity_from_active_sum(&s_total)?)
+        } else {
+            None
+        };
         if ridge > 0.0 {
             for i in 0..p_dim {
                 s_total[[i, i]] += ridge;
             }
         }
 
-        Self::from_assembled(s_total)
+        Self::from_assembled_with_nullity(s_total, structural_nullity)
     }
 
     /// Build from unscaled penalty components with a known structural nullity.
@@ -666,6 +685,20 @@ impl PenaltyPseudologdet {
         for (k, s_k) in s_k_matrices.iter().enumerate() {
             s_total.scaled_add(lambdas[k], s_k);
         }
+        let lambda_threshold = active_lambda_threshold(lambdas);
+        let all_lambdas_active = lambdas
+            .iter()
+            .all(|&lambda| lambda_is_active(lambda, lambda_threshold));
+        let structural_nullity = if ridge > 0.0 {
+            if all_lambdas_active {
+                structural_nullity
+                    .or(Some(Self::structural_nullity_from_active_sum(&s_total)?))
+            } else {
+                Some(Self::structural_nullity_from_active_sum(&s_total)?)
+            }
+        } else {
+            None
+        };
         if ridge > 0.0 {
             for i in 0..p_dim {
                 s_total[[i, i]] += ridge;
