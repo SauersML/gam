@@ -460,7 +460,7 @@ def ordered_prediction_columns(columns: dict[str, list[float]]) -> dict[str, lis
 
 
 def numeric_matrix(values: Any, label: str) -> Any:
-    return rust_module().numeric_matrix_validate(values, label)
+    return rust_module().numeric_matrix_f64(values, label)
 
 
 def transformation_normal_z(columns: dict[str, list[float]]) -> list[float]:

@@ -1334,6 +1334,19 @@ fn numeric_matrix_validate<'py>(
 }
 
 #[pyfunction]
+fn numeric_matrix_f64<'py>(
+    py: Python<'py>,
+    values: &Bound<'py, PyAny>,
+    label: &str,
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    let np = py.import("numpy")?;
+    let kwargs = PyDict::new(py);
+    kwargs.set_item("dtype", "float")?;
+    let array = np.call_method("asarray", (values,), Some(&kwargs))?;
+    numeric_matrix_validate(py, &array, label)
+}
+
+#[pyfunction]
 fn marginal_slope_clip_probabilities(values: Vec<f64>) -> PyResult<Vec<f64>> {
     Ok(values
         .into_iter()
