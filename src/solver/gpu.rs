@@ -158,8 +158,11 @@ pub fn dense_pirls_dispatch(
     cols: usize,
     signed_weights: bool,
 ) -> Result<GpuDispatch, String> {
+    // The literal `gpu-backend-not-compiled` token is the stable telemetry tag
+    // that solver dashboards grep for to distinguish "no device compiled in"
+    // from "device present but kernel ineligible".  Tests assert on it.
     let reason = format!(
-        "{} requires a compiled device backend; this build has no CUDA/HIP/Metal backend registered (n={rows}, p={cols}, signed_weights={signed_weights})",
+        "gpu-backend-not-compiled: {} requires a compiled device backend; this build has no CUDA/HIP/Metal backend registered (n={rows}, p={cols}, signed_weights={signed_weights})",
         operation.label()
     );
     log_auto_fallback_once(operation, &reason);

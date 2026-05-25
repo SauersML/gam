@@ -286,20 +286,93 @@ pub fn weighted_crossprod_gpu(
     weights: ArrayView1<'_, f64>,
 ) -> Result<Array2<f64>, String> {
     if crate::gpu::runtime::GpuRuntime::global().is_none() {
-        let (rows, cols) = x.dim();
-        return Err(format!(
-            "CUDA runtime unavailable for weighted cross-product; x={rows}x{cols}, weights={}",
-            weights.len()
-        ));
+        return cpu_fallback::weighted_crossprod_cpu(x, weights);
     }
     cuda::weighted_crossprod(x, weights)
 }
 
 pub fn solve_pirls_step_gpu(input: PirlsGpuInput<'_>) -> Result<PirlsGpuStep, String> {
     if crate::gpu::runtime::GpuRuntime::global().is_none() {
-        return Err("CUDA runtime unavailable for PIRLS step".to_string());
+        return cpu_fallback::solve_step_cpu(input);
     }
     cuda::solve_step(input)
+}
+
+/// CPU fallback for the PIRLS-step GPU primitives.  When this build has no
+/// CUDA runtime probed, the GPU entry points must still return numerically
+/// correct results so that callers can route a single code path through
+/// `*_gpu` and rely on `solver::gpu::dense_pirls_dispatch` telemetry to
+/// distinguish device-resident vs. host-resident execution.  Returning `Err`
+/// here would silently force every caller to grow an `if cuda { .. } else
+/// { .. }` branch and risk drifting away from the GPU formula.
+mod cpu_fallback {
+    use super::{PirlsGpuInput, PirlsGpuStep};
+    use crate::linalg::faer_ndarray::FaerCholesky;
+    use crate::solver::reml::assembly::xt_diag_x_dense_into;
+    use faer::Side;
+    use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
+
+    pub(super) fn weighted_crossprod_cpu(
+        x: ArrayView2<'_, f64>,
+        weights: ArrayView1<'_, f64>,
+    ) -> Result<Array2<f64>, String> {
+        validate(x, weights)?;
+        let x_owned = x.to_owned();
+        let w_owned = weights.to_owned();
+        let mut scratch = Array2::<f64>::zeros(x_owned.dim());
+        Ok(xt_diag_x_dense_into(&x_owned, &w_owned, &mut scratch))
+    }
+
+    pub(super) fn solve_step_cpu(input: PirlsGpuInput<'_>) -> Result<PirlsGpuStep, String> {
+        validate(input.x, input.weights)?;
+        let (_n, p) = input.x.dim();
+        if input.penalty_hessian.dim() != (p, p) {
+            return Err(format!(
+                "penalty Hessian shape {:?} does not match p={p}",
+                input.penalty_hessian.dim()
+            ));
+        }
+        if input.gradient.len() != p {
+            return Err(format!(
+                "gradient length {} does not match p={p}",
+                input.gradient.len()
+            ));
+        }
+        let xtwx = weighted_crossprod_cpu(input.x, input.weights)?;
+        let mut penalized_hessian = xtwx + &input.penalty_hessian;
+        if input.lm_ridge != 0.0 {
+            for i in 0..p {
+                penalized_hessian[[i, i]] += input.lm_ridge;
+            }
+        }
+        let factor = penalized_hessian
+            .cholesky(Side::Lower)
+            .map_err(|e| format!("CPU Cholesky failed in PIRLS fallback: {e:?}"))?;
+        let g = Array1::from_iter(input.gradient.iter().copied());
+        let mut direction = factor.solvevec(&g);
+        direction.mapv_inplace(|v| -v);
+        // Penalized-Hessian Cholesky logdet = 2 * sum(log(diag(L))).
+        let logdet = 2.0 * factor.diag().iter().map(|v| v.ln()).sum::<f64>();
+        Ok(PirlsGpuStep {
+            penalized_hessian,
+            direction,
+            logdet,
+        })
+    }
+
+    fn validate(x: ArrayView2<'_, f64>, weights: ArrayView1<'_, f64>) -> Result<(), String> {
+        let (n, p) = x.dim();
+        if weights.len() != n {
+            return Err(format!(
+                "weights length {} does not match rows {n}",
+                weights.len()
+            ));
+        }
+        if n == 0 || p == 0 {
+            return Err("empty design cannot be solved".to_string());
+        }
+        Ok(())
+    }
 }
 
 pub fn cholesky_solve_gpu(

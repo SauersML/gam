@@ -527,6 +527,25 @@ pub fn validate_mixturespec(spec: &MixtureLinkSpec) -> Result<(), String> {
             }
         }
     }
+    // `LinkComponent` carries variants (Cauchit, LogLog) that have no corresponding
+    // `LinkFunction` standard-link entry. The mixture-link pipeline projects the
+    // chosen mixture back onto a `LinkFunction` for downstream solver/IO bookkeeping,
+    // so any component without a matching standard link must be rejected at spec time
+    // rather than silently dropped or coerced. Keep this list aligned with
+    // `LinkFunction`'s mixture-supported variants.
+    for component in &spec.components {
+        match component {
+            LinkComponent::Logit | LinkComponent::Probit | LinkComponent::CLogLog => {}
+            LinkComponent::Cauchit | LinkComponent::LogLog => {
+                return Err(format!(
+                    "mixture link component {} is unsupported: LinkFunction has no \
+                     corresponding standard link; remove this component or extend \
+                     LinkFunction before re-enabling it",
+                    component.name()
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
