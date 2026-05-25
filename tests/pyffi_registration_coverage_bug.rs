@@ -17,7 +17,13 @@ fn pyffi_every_pyfunction_is_registered_once() {
                     continue;
                 }
                 if let Some(rest) = t.strip_prefix("fn ") {
-                    let name = rest.split('(').next().unwrap().trim().to_string();
+                    // Function name terminates at the first `(`, `<`, or whitespace,
+                    // so we strip generic / lifetime parameters like `<'py>` before
+                    // comparing against `wrap_pyfunction!` registrations.
+                    let name: String = rest
+                        .chars()
+                        .take_while(|c| !matches!(c, '(' | '<' | ' ' | '\t'))
+                        .collect();
                     pyfns.insert(name);
                 }
                 break;

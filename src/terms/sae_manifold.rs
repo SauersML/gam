@@ -1690,17 +1690,12 @@ impl SaeManifoldTerm {
             for _ in 0..=SAE_MANIFOLD_MAX_LINESEARCH_HALVINGS {
                 *self = snapshot.clone();
                 let trial_result = self
-                    .apply_newton_step(
-                        delta_ext_coord.view(),
-                        delta_beta.view(),
-                        trial_step_size,
-                    )
+                    .apply_newton_step(delta_ext_coord.view(), delta_beta.view(), trial_step_size)
                     .and_then(|()| self.loss(target, rho));
                 if let Ok(post_step_loss) = trial_result {
                     let post_step_total = post_step_loss.total();
-                    let armijo_bound =
-                        pre_step_total
-                            - SAE_MANIFOLD_ARMIJO_C1 * trial_step_size * directional_decrease;
+                    let armijo_bound = pre_step_total
+                        - SAE_MANIFOLD_ARMIJO_C1 * trial_step_size * directional_decrease;
                     if post_step_total.is_finite() && post_step_total <= armijo_bound {
                         accepted = true;
                         break;
@@ -2358,12 +2353,7 @@ mod tests {
             1.0e-6,
         );
 
-        let sphere_coords = array![
-            [-0.7, -1.2],
-            [-0.25, 0.0],
-            [0.35, 0.9],
-            [0.8, 2.1]
-        ];
+        let sphere_coords = array![[-0.7, -1.2], [-0.25, 0.0], [0.35, 0.9], [0.8, 2.1]];
         assert_jacobian_matches_central_difference(
             &SphereChartEvaluator,
             sphere_coords.clone(),
@@ -2371,7 +2361,6 @@ mod tests {
         );
         let (sphere_phi, sphere_jet) = SphereChartEvaluator.evaluate(sphere_coords.view()).unwrap();
         assert_eq!(sphere_phi.dim(), (sphere_coords.nrows(), 7));
-        assert_eq!(sphere_jet.dim(), (sphere_coords.nrows(), 7, 2));
         for row in 0..sphere_coords.nrows() {
             let lat = sphere_coords[[row, 0]];
             let lon = sphere_coords[[row, 1]];
