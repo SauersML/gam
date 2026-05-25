@@ -52,9 +52,9 @@ gamfit.fit(df,
 
 ## Parametric baselines
 
-For modes that support a parametric baseline (`"weibull"`,
-`"location-scale"`, `"latent"`, and `"transformation"` when used with
-`timewiggle(...)`), select it with `baseline_target=`:
+For modes that support a scalar parametric baseline (`"transformation"`,
+`"weibull"`, `"location-scale"`, `"marginal-slope"`, `"latent"`, and
+`"latent-binary"`), select it with `baseline_target=`:
 
 | `baseline_target` | Fit-time parameter defaults | Notes |
 | --- | --- | --- |
