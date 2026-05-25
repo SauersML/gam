@@ -20,6 +20,11 @@ pub enum PenaltyRepresentation {
         offsets: Vec<i32>,
     },
     Kronecker {
+        /// Full penalty-block Kronecker product `left ⊗ right`: each entry of
+        /// `left` scales an entire copy of `right` in the dense expansion.
+        ///
+        /// This is distinct from chunked kernel design assembly, where center
+        /// rows are kernel-evaluation arguments rather than matrix factors.
         left: Array2<f64>,
         right: Array2<f64>,
     },
