@@ -6,7 +6,6 @@ import argparse
 import csv
 import math
 import subprocess
-import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,7 +18,6 @@ import numpy as np
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_GAM_BIN = REPO_ROOT / "target" / "release" / "gam"
 
 
 @dataclass(frozen=True)
@@ -142,7 +140,6 @@ def make_plot(
     x_grid: np.ndarray,
     y_true: np.ndarray,
     curves: list[tuple[FitSpec, np.ndarray]],
-    skipped: list[str],
 ) -> None:
     plt.rcParams.update(
         {
@@ -153,7 +150,7 @@ def make_plot(
             "agg.path.chunksize": 0,
         }
     )
-    power_values = sorted({spec.power for spec, _ in curves} | {spec.power for spec in FIT_SPECS})
+    power_values = [spec.power for spec in FIT_SPECS]
     fig, axes = plt.subplots(1, len(power_values), figsize=(16.5, 5.8), constrained_layout=True, sharey=True)
     fig.patch.set_facecolor("#F7F2EA")
     if not isinstance(axes, np.ndarray):
@@ -202,19 +199,6 @@ def make_plot(
             ax.spines[spine].set_color("#7D746D")
             ax.spines[spine].set_linewidth(1.0)
         ax.tick_params(colors="#534B45")
-        missing = [f"mgcv power={power}" for _ in [power] if power not in curve_lookup]
-        if missing:
-            ax.text(
-                0.98,
-                0.02,
-                "missing: " + ", ".join(missing),
-                transform=ax.transAxes,
-                ha="right",
-                va="bottom",
-                fontsize=9.0,
-                color="#6B625C",
-                bbox={"facecolor": "#FFF9F1", "edgecolor": "#E9DDCA", "alpha": 0.92, "pad": 4},
-            )
 
     axes[0].set_ylabel("fitted mean")
     handles, labels = axes[0].get_legend_handles_labels()
@@ -241,35 +225,25 @@ def main() -> int:
         train_csv, grid_csv, x_train, y_train, x_grid, y_true = build_demo_data(
             workdir, args.seed, args.n_train, args.n_grid
         )
-        curves: list[tuple[FitSpec, np.ndarray]] = []
-        skipped: list[str] = []
-        for spec in FIT_SPECS:
-            try:
-                y_hat = fit_mgcv_curve(
+        curves = [
+            (
+                spec,
+                fit_mgcv_curve(
                     workdir,
                     train_csv,
                     grid_csv,
                     args.n_grid,
                     args.centers,
                     spec.power,
-                )
-            except subprocess.CalledProcessError:
-                skipped.append(spec.label)
-                continue
-            curves.append((spec, y_hat))
+                ),
+            )
+            for spec in FIT_SPECS
+        ]
 
-        make_plot(args.out, x_train, y_train, x_grid, y_true, curves, skipped)
-        if skipped:
-            print("skipped fits:")
-            for item in skipped:
-                print(f"- {item}")
+        make_plot(args.out, x_train, y_train, x_grid, y_true, curves)
         print(args.out)
     return 0
 
 
 if __name__ == "__main__":
-    try:
-        raise SystemExit(main())
-    except subprocess.CalledProcessError as exc:
-        print(f"command failed with exit code {exc.returncode}: {exc.cmd}", file=sys.stderr)
-        raise
+    raise SystemExit(main())
