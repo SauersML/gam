@@ -1,25 +1,7 @@
-"""Benchmark: marginal-slope fit time with independent 1-D B-splines vs
-a joint 3-D Duchon smooth, on 3 predictors at medium scale.
-
-We hold every aspect of the data and the marginal-slope likelihood
-constant; only the smooth basis differs.
-
-  * Variant A  — `case ~ s(x1) + s(x2) + s(x3)`
-                 plus `logslope_formula = "s(x1) + s(x2) + s(x3)"`
-  * Variant B  — `case ~ duchon(x1, x2, x3, centers=K)`
-                 plus `logslope_formula = "duchon(...)"`
-
-Stage 1 (transformation-normal calibration) is identical for both
-variants so we can compare Stage 2 cleanly.
-
-Outputs: a single timing table to stdout and (optionally) a JSON dump
-of the per-run timings.
-"""
+"""Benchmark independent 1-D B-splines against a joint 3-D Duchon smooth."""
 from __future__ import annotations
 
-import json
 import time
-from pathlib import Path
 
 import numpy as np
 
@@ -57,26 +39,22 @@ def synth(n: int, seed: int = 11) -> dict[str, list[float]]:
     }
 
 
-def stage1_calibrate(
-    data: dict[str, list[float]], formula: str
-) -> dict[str, list[float]]:
-    """Fit transformation-normal on PGS to produce a standardised z."""
+def stage1_calibrate(data: dict[str, list[float]], formula: str) -> dict[str, list[float]]:
     log(f"[stage1] fitting {formula!r}")
-    calib = gamfit.fit(
-        data, formula,
-        transformation_normal=True,
-        scale_dimensions=True,
-    )
+    calib = gamfit.fit(data, formula, transformation_normal=True, scale_dimensions=True)
     z = np.asarray(calib.predict(data), dtype=float)
     out = dict(data)
     out["pgs_z"] = z.tolist()
     return out
 
 
-def time_fit(label: str, data: dict[str, list[float]], formula: str,
-             logslope_formula: str,
-             repeats: int = 1) -> list[float]:
-    """Fit a marginal-slope model and time each fit."""
+def time_fit(
+    label: str,
+    data: dict[str, list[float]],
+    formula: str,
+    logslope_formula: str,
+    repeats: int,
+) -> list[float]:
     log(f"[fit] {label}: starting {repeats} fit(s)")
     times: list[float] = []
     for i in range(repeats):
@@ -97,37 +75,29 @@ def time_fit(label: str, data: dict[str, list[float]], formula: str,
 
 
 def main() -> None:
-    # Medium scale: 2000 rows, 3 predictors.
     n = 2000
     log(f"=== benchmark: n={n}, predictors=3 ===")
 
     raw = synth(n)
-
-    # Stage 1: use the same calibration smooth for both Stage 2 variants
-    # so any difference at Stage 2 is solely the basis choice.
     data = stage1_calibrate(raw, "PGS ~ duchon(x1, x2, x3, centers=30)")
 
     runs = 3
-    results = {}
-
-    # Variant A: independent 1-D B-splines.
-    a_times = time_fit(
-        "indep s(x1)+s(x2)+s(x3)", data,
-        "case ~ s(x1) + s(x2) + s(x3)",
-        "s(x1) + s(x2) + s(x3)",
-        repeats=runs,
-    )
-    results["indep_bsplines"] = a_times
-
-    # Variant B: joint 3-D Duchon (modest centers count so it isn't
-    # crushingly expensive — same setup the marginal-slope figure uses).
-    b_times = time_fit(
-        "joint duchon(x1, x2, x3, centers=30)", data,
-        "case ~ duchon(x1, x2, x3, centers=30)",
-        "duchon(x1, x2, x3, centers=30)",
-        repeats=runs,
-    )
-    results["joint_duchon"] = b_times
+    results = {
+        "indep_bsplines": time_fit(
+            "indep s(x1)+s(x2)+s(x3)",
+            data,
+            "case ~ s(x1) + s(x2) + s(x3)",
+            "s(x1) + s(x2) + s(x3)",
+            repeats=runs,
+        ),
+        "joint_duchon": time_fit(
+            "joint duchon(x1, x2, x3, centers=30)",
+            data,
+            "case ~ duchon(x1, x2, x3, centers=30)",
+            "duchon(x1, x2, x3, centers=30)",
+            repeats=runs,
+        ),
+    }
 
     log("")
     log("=== summary ===")
@@ -138,10 +108,6 @@ def main() -> None:
         lo = float(np.min(times))
         hi = float(np.max(times))
         log(f"{name:<42s}  {med:>11.2f}  {lo:>9.2f}  {hi:>9.2f}")
-
-    out = Path(__file__).resolve().parent / "bench_marginal_slope_basis_results.json"
-    out.write_text(json.dumps(results, indent=2))
-    log(f"\nwrote {out}")
 
 
 if __name__ == "__main__":
