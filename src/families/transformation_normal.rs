@@ -8539,7 +8539,7 @@ impl TransformationNormalJointHessianWorkspace {
         if hessian.iter().any(|value| !value.is_finite()) {
             return Err("CTN dense Hessian cache produced non-finite values".to_string());
         }
-        let _ = self.dense_hessian_cache.set(hessian);
+        self.dense_hessian_cache.set(hessian).ok();
         log::info!(
             "[STAGE] CTN dense Hessian cache build p={} elapsed={:.3}s",
             self.p_total(),

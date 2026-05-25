@@ -6,40 +6,60 @@ import gamfit._sae_manifold as sae
 class _FakeRustModule:
     def __init__(self):
         self.assignment_kinds = []
+        self.calls = 0
 
-    def sae_manifold_fit_minimal(
+    def periodic_basis_with_jet(self, t, n_harmonics):
+        x = np.asarray(t, dtype=float)
+        columns = [np.ones_like(x)]
+        jacobian_columns = [np.zeros_like(x)]
+        penalties = [0.0]
+        for harmonic in range(1, int(n_harmonics) + 1):
+            omega = 2.0 * np.pi * harmonic
+            columns.extend([np.cos(omega * x), np.sin(omega * x)])
+            jacobian_columns.extend([-omega * np.sin(omega * x), omega * np.cos(omega * x)])
+            penalties.extend([omega**4, omega**4])
+        phi = np.stack(columns, axis=1)
+        jet = np.stack(jacobian_columns, axis=1)[:, :, None]
+        penalty = np.diag(penalties)
+        return phi, jet, penalty
+
+    def sae_manifold_fit(
         self,
         z,
-        k_atoms,
         atom_basis,
         atom_dim,
-        assignment_kind,
+        basis_values,
+        basis_jacobian,
+        basis_sizes,
+        decoder_coefficients,
+        smooth_penalties,
+        initial_logits,
+        initial_coords,
         alpha,
         tau,
         learnable_alpha,
+        *,
+        assignment_kind,
         sparsity_strength,
         smoothness,
         max_iter,
         learning_rate,
-        random_state,
-        top_k,
-        *,
         gumbel_schedule=None,
+        analytic_penalties=None,
     ):
-        assert k_atoms == 2
+        assert len(atom_dim) == 2
         assert assignment_kind == "softmax"
         assert learnable_alpha is False
         assert max_iter == 1
-        assert random_state == 4
-        assert top_k is None
         assert gumbel_schedule is None
         self.assignment_kinds.append(assignment_kind)
+        self.calls += 1
         logits = np.array([[0.2, -0.1], [0.4, 0.0], [-0.2, 0.5], [0.1, 0.3]], dtype=float)
         weights = np.exp(logits / float(tau))
         assignments = weights / weights.sum(axis=1, keepdims=True)
         atoms = []
         for atom, dim in enumerate(atom_dim):
-            decoder = np.full((2, z.shape[1]), 0.1 * float(atom + 1))
+            decoder = np.full((basis_sizes[atom], z.shape[1]), 0.1 * float(atom + 1))
             atoms.append(
                 {
                     "decoder_B": decoder,
@@ -82,5 +102,6 @@ def test_softmax_fixed_k_dispatches_to_rust(monkeypatch):
     )
 
     assert fake.assignment_kinds == ["softmax"]
+    assert fake.calls == 1
     assert fit.low_level.chosen_k == 2
     assert fit.assignments.shape == (z.shape[0], 2)
