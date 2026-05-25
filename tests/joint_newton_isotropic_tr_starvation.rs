@@ -13,23 +13,23 @@
 //!   exit reason    = "linearized-rate stall early-exit:
 //!                    linearized_rel ≥ 0.9 for 15 consecutive cycles"
 //!
-//! Root cause (under test): gam's joint-Newton trust region uses a
-//! single scalar L2 norm over the concatenated δ vector
-//! (`src/families/custom_family.rs:10835-10847`). When ONE block has a
-//! near-null direction in its joint Hessian, the unconstrained Newton
-//! step is huge along that direction. The L2 rescale uniformly multiplies
-//! the entire δ by `radius / ‖δ‖₂ ≈ 1e-4`, crushing every block's
-//! Newton step by the same factor. The well-conditioned blocks lose
-//! their meaningful contribution; their gradient is essentially
-//! unchanged at the next cycle. `‖g + Hδ‖∞ ≈ ‖g‖∞` → `linearized_rel ≈ 1`
-//! → 15-cycle stall detector fires → seed rejected.
+//! Historical root cause (under test): the old joint-Newton trust region used
+//! a single scalar L2 norm over the concatenated δ vector. When ONE block has
+//! a near-null direction in its joint Hessian, the unconstrained Newton step is
+//! huge along that direction. The L2 rescale uniformly multiplies the entire δ
+//! by `radius / ‖δ‖₂ ≈ 1e-4`, crushing every block's Newton step by the same
+//! factor. The well-conditioned blocks lose their meaningful contribution;
+//! their gradient is essentially unchanged at the next cycle.
+//! `‖g + Hδ‖∞ ≈ ‖g‖∞` → `linearized_rel ≈ 1` → 15-cycle stall detector fires
+//! → seed rejected.
 
 use ndarray::{Array1, Array2};
 
 // ────────────────────────────────────────────────────────────────────
 // Copy of the old raw-L2 primitive, plus the fixed block-local metric
-// primitive. These are private inside the crate; this integration test keeps
-// the math mechanism visible without depending on test-only exports.
+// primitive. The production helper is tested directly in
+// `src/families/custom_family.rs`; this integration test keeps the historical
+// failure mechanism visible without re-exporting private internals.
 // ────────────────────────────────────────────────────────────────────
 
 fn joint_trust_region_step_norm(delta: &Array1<f64>) -> f64 {
@@ -195,9 +195,9 @@ fn joint_newton_isotropic_l2_tr_produces_production_linearized_rate_stall() {
     let pre_time_inf = block_inf(0, TIME_W, &delta_hat);
     let pre_marg_inf = block_inf(TIME_W, MARG_W, &delta_hat);
 
-    // Apply gam's actual joint-Newton trust-region truncation, with the
-    // same radius the production trust-region loop landed on after its
-    // cycle-0 shrink cascade (|δ|∞ = 20.0).
+    // Apply the historical raw-L2 joint-Newton trust-region truncation, with
+    // the same radius the production trust-region loop used in the failing
+    // trace after its cycle-0 shrink cascade (|δ|∞ = 20.0).
     let mut delta = delta_hat.clone();
     let pre_l2 = joint_trust_region_step_norm(&delta);
     let radius = 20.0_f64;
