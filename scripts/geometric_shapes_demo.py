@@ -24,6 +24,7 @@ Re-uses cached fits/data when present; pass `--regen` to start clean.
 from __future__ import annotations
 
 import argparse
+import importlib
 import shutil
 import subprocess
 import sys
@@ -33,9 +34,10 @@ from typing import Any
 
 import matplotlib as mpl
 import numpy as np
-import pyvista as pv
 from matplotlib.colors import LinearSegmentedColormap
-from PIL import Image
+
+pv: Any = importlib.import_module("pyvista")
+Image: Any = importlib.import_module("PIL.Image")
 
 SCRIPT = Path(__file__).resolve()
 REPO = SCRIPT.parent.parent
@@ -598,7 +600,7 @@ def render_frames(
 
 
 def render_mp4(shapes: dict[str, dict[str, Any]], out_path: Path) -> None:
-    import imageio.v2 as imageio
+    imageio: Any = importlib.import_module("imageio.v2")
     W, H = 1920, 1440
     if W % 2 or H % 2:
         raise SystemExit("mp4 dims must be even")

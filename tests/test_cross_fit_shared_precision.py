@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 
 import gamfit
 
 
-def _table(scale: float = 1.0) -> dict[str, list[object]]:
+def _table(scale: float = 1.0) -> dict[str, Sequence[object]]:
     groups = ["a", "b", "c"]
     x: list[float] = []
     g: list[str] = []

@@ -388,6 +388,14 @@ def _normalize_precision_pair(value: Any, label: str) -> list[float]:
             raise ValueError(
                 f"precision_hyperpriors[{label!r}] must be (shape, rate)"
             ) from exc
+    if shape is None:
+        raise ValueError(
+            f"precision_hyperpriors[{label!r}] needs a shape/a/a_p value"
+        )
+    if rate is None:
+        raise ValueError(
+            f"precision_hyperpriors[{label!r}] needs a rate/b/b_p value"
+        )
     shape_f = float(shape)
     rate_f = float(rate)
     if (

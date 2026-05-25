@@ -19,8 +19,12 @@ helper can be localised.
 
 from __future__ import annotations
 
+import importlib
+from typing import Any, cast
+
 import numpy as np
-import pytest
+
+pytest = cast(Any, importlib.import_module("pytest"))
 
 try:
     import torch
@@ -210,5 +214,4 @@ def test_gaussian_reml_fit_batched_penalty_gradcheck() -> None:
         eps=_GRADCHECK_EPS, atol=_GRADCHECK_ATOL, rtol=_GRADCHECK_RTOL,
         nondet_tol=_GRADCHECK_NONDET_TOL,
     )
-
 
