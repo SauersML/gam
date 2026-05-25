@@ -627,6 +627,61 @@ fn bspline_basis_derivative<'py>(
     Ok(basis.into_pyarray(py).unbind())
 }
 
+#[pyfunction]
+fn periodic_basis_with_jet<'py>(
+    py: Python<'py>,
+    t: PyReadonlyArray1<'py, f64>,
+    n_harmonics: usize,
+) -> PyResult<(
+    Py<PyArray2<f64>>,
+    Py<PyArray3<f64>>,
+    Py<PyArray2<f64>>,
+)> {
+    let t = t.as_array();
+    if t.iter().any(|value| !value.is_finite()) {
+        return Err(py_value_error(
+            "periodic_basis_with_jet requires finite t values".to_string(),
+        ));
+    }
+
+    let n_rows = t.len();
+    let n_cols = 1 + 2 * n_harmonics;
+    let mut phi = Array2::<f64>::zeros((n_rows, n_cols));
+    let mut jet = Array3::<f64>::zeros((n_rows, n_cols, 1));
+    let mut penalty = Array2::<f64>::zeros((n_cols, n_cols));
+
+    phi.column_mut(0).fill(1.0);
+    penalty[[0, 0]] = 1.0e-8;
+
+    for h in 1..=n_harmonics {
+        let h_f = h as f64;
+        let frequency = std::f64::consts::TAU * h_f;
+        let sin_col = 1 + 2 * (h - 1);
+        let cos_col = sin_col + 1;
+        let harmonic_penalty = h_f * h_f * h_f * h_f;
+
+        penalty[[sin_col, sin_col]] = harmonic_penalty;
+        penalty[[cos_col, cos_col]] = harmonic_penalty;
+
+        for row in 0..n_rows {
+            let angle = frequency * t[row];
+            let sin_value = angle.sin();
+            let cos_value = angle.cos();
+
+            phi[[row, sin_col]] = sin_value;
+            phi[[row, cos_col]] = cos_value;
+            jet[[row, sin_col, 0]] = frequency * cos_value;
+            jet[[row, cos_col, 0]] = -frequency * sin_value;
+        }
+    }
+
+    Ok((
+        phi.into_pyarray(py).unbind(),
+        jet.into_pyarray(py).unbind(),
+        penalty.into_pyarray(py).unbind(),
+    ))
+}
+
 /// Evaluate the Duchon m-spline basis at `points` against K `centers`,
 /// for any input dimensionality `d ≥ 1`.
 ///
@@ -8867,6 +8922,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(design_matrix_array, module)?)?;
     module.add_function(wrap_pyfunction!(bspline_basis, module)?)?;
     module.add_function(wrap_pyfunction!(bspline_basis_derivative, module)?)?;
+    module.add_function(wrap_pyfunction!(periodic_basis_with_jet, module)?)?;
     module.add_function(wrap_pyfunction!(duchon_basis, module)?)?;
     module.add_function(wrap_pyfunction!(smoothness_penalty, module)?)?;
     module.add_function(wrap_pyfunction!(duchon_function_norm_penalty, module)?)?;
