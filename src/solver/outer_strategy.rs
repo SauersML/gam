@@ -5165,6 +5165,18 @@ fn run_outer_with_plan(
         crate::families::custom_family::KktRefusalDiagnosis,
         Option<String>,
     )> = None;
+    // Two matching uniform CertRefused observations are enough to call
+    // the failure structural and break the loop. A single observation
+    // could be transient noise — an exploration seed in a degenerate
+    // ρ corner, a one-off domain excursion that happens to surface at
+    // the cert site. Requiring k=2 across DIFFERENT seeds is the
+    // smallest sample size that distinguishes noise from a structural
+    // rank deficiency of the penalized Hessian; raising k=3+ would only
+    // burn additional full joint-Newton inner solves for no extra
+    // discriminative power because uniform CertRefused is itself a
+    // strong signal once you've seen it twice on independent ρ
+    // candidates that landed at the same `(diagnosis, carrying_block)`
+    // pair.
     const STRUCTURAL_EARLY_EXIT_MIN_COUNT: usize = 2;
 
     'seed_attempts: for (seed_idx, seed) in seeds.iter().enumerate() {

@@ -17346,7 +17346,7 @@ impl CustomFamily for BinomialLocationScaleFamily {
             };
             s_pseudologdet_blocks.push(
                 crate::solver::estimate::reml::penalty_logdet::PenaltyPseudologdet::from_assembled_with_nullity(
-                    s_b, nullity,
+                    s_b, None, nullity,
                 )?,
             );
         }
