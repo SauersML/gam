@@ -518,6 +518,8 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
             "torch_from_fitted",
             "predict",
             "predict_array",
+            "interpolate_survival_surface",
+            "default_survival_time_grid",
             "competing_risks_cif",
             "sample",
             "summary",
