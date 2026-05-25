@@ -76,12 +76,12 @@ use gam::terms::skip_transcoder::{
 use gam::terms::{
     ARDPenalty as CoreARDPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry,
     BlockOrthogonalityPenalty as CoreBlockOrthogonalityPenalty,
-    DifferenceOpKind, GatedSAEDecoder, IBPAssignmentPenalty,
+    DifferenceOpKind, GatedSAEDecoder, IBPAssignmentPenalty as CoreIBPAssignmentPenalty,
     IsometryPenalty as CoreIsometryPenalty, IvaeRidgeMeanGauge,
     JumpReLUPenalty as RustJumpReLUPenalty, MaternBasisGradientTarget, MechanismSparsityPenalty,
     NuclearNormPenalty as CoreNuclearNormPenalty, OrthogonalityPenalty,
     ParametricRowPrecisionPriorPenalty, PenaltyConcavity, PenaltyTier, PsiSlice,
-    RowPrecisionPriorPenalty, ScadMcpPenalty, ScalarWeightSchedule,
+    RowPrecisionPriorPenalty, ScadMcpPenalty as CoreScadMcpPenalty, ScalarWeightSchedule,
     SoftmaxAssignmentSparsityPenalty, SparsityPenalty as CoreSparsityPenalty,
     StreamingMaternBasisGradientEvaluator,
     TopKActivationPenalty, TotalVariationPenalty,
@@ -91,12 +91,13 @@ use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily, RhoP
 use gam::{FitConfig, FitRequest, FitResult, fit_model, materialize, resolve_offset_column};
 use ndarray::{Array1, Array2, Array3, Array4, ArrayView1, ArrayView2, ArrayView3, ArrayViewD, Axis, IxDyn, s};
 use numpy::{
-    IntoPyArray, PyArray1, PyArray2, PyArray3, PyReadonlyArray1, PyReadonlyArray2,
-    PyReadonlyArray3, PyReadonlyArray4, PyReadonlyArrayDyn,
+    IntoPyArray, PyArray1, PyArray2, PyArray3, PyArrayDescrMethods, PyArrayDyn, PyArrayMethods,
+    PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3, PyReadonlyArray4, PyReadonlyArrayDyn,
+    PyUntypedArray, PyUntypedArrayMethods, dtype,
 };
 use pyo3::exceptions::{PyKeyError, PyNotImplementedError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyBytes, PyDict, PyFloat, PyList, PyString, PyTuple};
+use pyo3::types::{PyAny, PyBytes, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
 use rayon::prelude::*;
 use regex::Regex;
 use serde::de::{MapAccess, Visitor};
@@ -1275,34 +1276,43 @@ fn survival_ffi_surface<'py>(
 }
 
 #[pyfunction]
-fn numeric_matrix_f64<'py>(
+fn numeric_matrix_validate<'py>(
     py: Python<'py>,
-    values: PyReadonlyArrayDyn<'py, f64>,
-    label: String,
-) -> PyResult<Py<PyArray2<f64>>> {
-    let view = values.as_array();
-    let (rows, cols) = match view.ndim() {
-        1 => (view.shape()[0], 1usize),
-        2 => (view.shape()[0], view.shape()[1]),
-        other => {
-            return Err(py_value_error(format!(
-                "{label} must be a 1D or 2D numeric array (got {other}D)"
-            )));
-        }
-    };
+    values: &Bound<'py, PyAny>,
+    label: &str,
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    let np = py.import("numpy")?;
+    let mut array = np.getattr("asarray")?.call1((values,))?;
+    let ndim = array.getattr("ndim")?.extract::<usize>()?;
+    if ndim == 1 {
+        array = array.call_method1("reshape", (-1, 1))?;
+    } else if ndim != 2 {
+        return Err(py_value_error(format!(
+            "{label} must be a 1D or 2D numeric array"
+        )));
+    }
+
+    let (rows, cols) = array.getattr("shape")?.extract::<(usize, usize)>()?;
     if rows == 0 || cols == 0 {
         return Err(py_value_error(format!("{label} cannot be empty")));
     }
-    let data: Vec<f64> = view.iter().copied().collect();
-    if !data.iter().all(|value| value.is_finite()) {
+
+    let untyped_array = array.cast::<PyUntypedArray>()?;
+    if !untyped_array.dtype().is_equiv_to(&dtype::<f64>(py)) {
+        return Err(PyTypeError::new_err(format!(
+            "{label} must be a float64 numpy array for zero-copy FFI"
+        )));
+    }
+
+    let typed_array = array.cast::<PyArray2<f64>>()?;
+    let readonly = typed_array.readonly();
+    if !readonly.as_array().iter().all(|value| value.is_finite()) {
         return Err(py_value_error(format!(
             "{label} must contain only finite values"
         )));
     }
-    let out = Array2::from_shape_vec((rows, cols), data).map_err(|err| {
-        py_value_error(format!("failed to reshape {label}: {err}"))
-    })?;
-    Ok(out.into_pyarray(py).unbind())
+
+    array.cast_into::<PyArray2<f64>>()
 }
 
 #[pyfunction]
@@ -12884,6 +12894,105 @@ fn py_repr(_py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<String> {
     value.repr()?.extract()
 }
 
+#[pyclass(module = "gam_pyffi._rust", name = "TopKActivationPenalty")]
+struct PyTopKActivationPenalty {
+    #[pyo3(get, set)]
+    target: PyObject,
+    #[pyo3(get, set)]
+    k: i64,
+    #[pyo3(get, set)]
+    weight: f64,
+    #[pyo3(get, set)]
+    weight_schedule: Option<PyObject>,
+}
+
+#[pymethods]
+impl PyTopKActivationPenalty {
+    #[new]
+    #[pyo3(signature = (k, weight = 1.0, *, target = "t", weight_schedule = None))]
+    fn new(
+        k: &Bound<'_, PyAny>,
+        weight: f64,
+        target: PyObject,
+        weight_schedule: Option<PyObject>,
+    ) -> PyResult<Self> {
+        let k = k.call_method0("__index__")?.extract::<i64>()?;
+        if k <= 0 {
+            return Err(PyValueError::new_err(format!(
+                "TopKActivationPenalty.k must be > 0, got {k}"
+            )));
+        }
+        if !weight.is_finite() || weight <= 0.0 {
+            return Err(PyValueError::new_err(format!(
+                "TopKActivationPenalty.weight must be finite and > 0, got {weight}"
+            )));
+        }
+        Ok(Self {
+            target,
+            k,
+            weight,
+            weight_schedule,
+        })
+    }
+
+    #[classattr]
+    const KIND_TAG: &'static str = "topk_activation";
+
+    fn to_rust_descriptor(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let payload = PyDict::new(py);
+        payload.set_item("kind", Self::KIND_TAG)?;
+        payload.set_item("target", target_descriptor(py, self.target.bind(py))?)?;
+        payload.set_item("k", self.k)?;
+        payload.set_item("weight", self.weight)?;
+        if let Some(schedule) = topk_weight_schedule_descriptor(py, &self.weight_schedule)? {
+            payload.set_item("weight_schedule", schedule)?;
+        }
+        Ok(payload.into())
+    }
+
+    fn set_weight_schedule<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        schedule: PyObject,
+    ) -> PyRefMut<'py, Self> {
+        slf.weight_schedule = Some(schedule);
+        slf
+    }
+
+    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        Ok(format!(
+            "TopKActivationPenalty(k={}, weight={}, target={}, weight_schedule={})",
+            self.k,
+            self.weight,
+            py_repr(py, self.target.bind(py))?,
+            match &self.weight_schedule {
+                Some(schedule) => py_repr(py, schedule.bind(py))?,
+                None => "None".to_string(),
+            }
+        ))
+    }
+}
+
+fn topk_weight_schedule_descriptor(
+    _py: Python<'_>,
+    schedule: &Option<PyObject>,
+) -> PyResult<Option<PyObject>> {
+    let Some(schedule) = schedule else {
+        return Ok(None);
+    };
+    let bound = schedule.bind(_py);
+    if bound.hasattr("to_rust_descriptor")? {
+        return Ok(Some(
+            bound.call_method0("to_rust_descriptor")?.unbind().into(),
+        ));
+    }
+    if let Ok(mapping) = bound.downcast::<PyDict>() {
+        return Ok(Some(mapping.copy()?.unbind().into()));
+    }
+    Err(PyTypeError::new_err(
+        "weight_schedule must be ScalarWeightSchedule, a mapping, or None",
+    ))
+}
+
 #[pymodule(name = "_rust", gil_used = false)]
 fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     gam::init_parallelism();
@@ -13048,6 +13157,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(posterior_credible_interval, module)?)?;
     module.add_function(wrap_pyfunction!(apply_inverse_link_array, module)?)?;
     module.add_function(wrap_pyfunction!(summary_json, module)?)?;
+    module.add_function(wrap_pyfunction!(summary_payload_from_model, module)?)?;
     module.add_function(wrap_pyfunction!(summary_repr, module)?)?;
     module.add_function(wrap_pyfunction!(summary_html, module)?)?;
     module.add_function(wrap_pyfunction!(coefficient_state_json, module)?)?;
@@ -13090,6 +13200,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(mechanism_sparsity_jacobian, module)?)?;
     module.add_function(wrap_pyfunction!(conditional_prior_ivae, module)?)?;
     module.add_class::<SparsityPenalty>()?;
+    module.add_class::<PyTopKActivationPenalty>()?;
     Ok(())
 }
 
@@ -16660,7 +16771,7 @@ fn build_analytic_penalty_registry_from_json(
                     .get("learnable")
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false);
-                let penalty = ScadMcpPenalty::new(
+                let penalty = CoreScadMcpPenalty::new(
                     slice,
                     weight,
                     n_eff,

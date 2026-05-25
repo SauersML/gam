@@ -476,32 +476,12 @@ class SurvivalPrediction:
 
 
 def ordered_prediction_columns(columns: dict[str, list[float]]) -> dict[str, list[float]]:
-    preferred = ["eta", "mean", "effective_se", "mean_lower", "mean_upper"]
-    ordered: dict[str, list[float]] = {}
-    for key in preferred:
-        if key in columns:
-            ordered[key] = columns[key]
-    for key, value in columns.items():
-        if key not in ordered:
-            ordered[key] = value
-    return ordered
+    columns_json = json.dumps(columns, separators=(",", ":"))
+    return json.loads(rust_module().ordered_prediction_columns(columns_json))
 
 
 def numeric_matrix(values: Any, label: str) -> Any:
-    import numpy as np
-
-    arr = np.asarray(values)
-    if arr.ndim == 1:
-        arr = arr.reshape(-1, 1)
-    if arr.ndim != 2:
-        raise ValueError(f"{label} must be a 1D or 2D numeric array")
-    if arr.shape[0] == 0 or arr.shape[1] == 0:
-        raise ValueError(f"{label} cannot be empty")
-    if arr.dtype != np.float64:
-        raise TypeError(f"{label} must be a float64 numpy array for zero-copy FFI")
-    if not np.all(np.isfinite(arr)):
-        raise ValueError(f"{label} must contain only finite values")
-    return arr
+    return rust_module().numeric_matrix_validate(values, label)
 
 
 def transformation_normal_z(columns: dict[str, list[float]]) -> list[float]:
@@ -665,7 +645,8 @@ def shape_prediction_response(
     if parsed.get("class") == "competing_risks_prediction":
         return competing_risks_prediction_from_ffi_payload(parsed)
 
-    columns = ordered_prediction_columns(parsed["columns"])
+    columns_json = json.dumps(parsed["columns"], separators=(",", ":"))
+    columns = json.loads(rust_module().ordered_prediction_columns(columns_json))
     model_class = str(parsed.get("model_class") or fallback_model_class)
 
     if model_class in _TRANSFORMATION_NORMAL_MODEL_CLASSES:
