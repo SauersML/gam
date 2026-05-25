@@ -862,7 +862,6 @@ class PosteriorSamples:
         self,
         new_data: Any,
         *,
-        chunk_size: int | None = 4096,
         level: float = 0.95,
     ) -> dict[str, Any]:
         """Posterior credible bands for eta and E[y | x] on new data.
@@ -873,11 +872,6 @@ class PosteriorSamples:
             Tabular new data (DataFrame, dict of columns, or any
             object accepted by the engine's table normaliser) at which
             to evaluate the posterior fitted means.
-        chunk_size : int or None, optional
-            Number of prediction rows processed at once. Default
-            ``4096``. Pass ``None`` to disable chunking and form the
-            full ``(n_draws, n_rows)`` matrix (consider
-            :meth:`predict_draws` instead in that case).
         level : float, optional
             Coverage probability for the credible bands in ``(0, 1)``.
             Default ``0.95``.
@@ -901,10 +895,9 @@ class PosteriorSamples:
 
         Notes
         -----
-        Walks chunks of rows through ``draws @ X.T`` and reduces each
-        chunk to quantiles immediately, so memory stays bounded at
-        roughly ``n_draws * chunk_size`` floats regardless of the
-        prediction-set size. For Laplace-method posteriors the
+        Reuses the Rust posterior prediction kernel so design-matrix
+        reconstruction and ``draws @ X.T`` stay in the engine. For
+        Laplace-method posteriors the
         returned bands match what
         ``model.predict(new_data, interval=level)`` produces
         analytically, up to Monte Carlo error.
@@ -917,13 +910,11 @@ class PosteriorSamples:
         >>> bands["mean_upper"][0]
         0.812
         """
-        x = self._design_matrix(new_data)
+        eta, family_kind, _model_class = self._posterior_predict_eta(new_data)
         return _posterior_predict_bands(
-            samples=self.samples,
-            x=x,
-            family_kind=self.family_kind,
+            eta=eta,
+            family_kind=family_kind,
             level=level,
-            chunk_size=chunk_size,
         )
 
     def predict_draws(self, new_data: Any) -> PosteriorPredictive:
@@ -965,24 +956,19 @@ class PosteriorSamples:
         """
         import numpy as np
 
-        x = self._design_matrix(new_data)
-        eta = self.samples @ x.T
-        mean = _apply_inverse_link(eta, self.family_kind)
+        eta, family_kind, model_class = self._posterior_predict_eta(new_data)
+        mean = _apply_inverse_link(eta, family_kind)
         return PosteriorPredictive(
             eta=np.asarray(eta, dtype=float),
             mean=np.asarray(mean, dtype=float),
-            family_kind=self.family_kind,
-            model_class=self.model_class,
+            family_kind=family_kind,
+            model_class=model_class,
         )
 
-    def _design_matrix(self, new_data: Any) -> Any:
-        """Fetch the saved-model design matrix on ``new_data`` via the FFI.
+    def _posterior_predict_eta(self, new_data: Any) -> tuple[Any, str, str]:
+        """Evaluate per-draw linear predictors through the Rust FFI."""
+        import numpy as np
 
-        Raises ``RuntimeError`` if this :class:`PosteriorSamples` was
-        loaded from disk without a model context (``_model_bytes`` is
-        empty), and a clear FFI error if the saved model class doesn't
-        yet support a closed-form design (link-wiggle, survival, etc.).
-        """
         if not self._model_bytes:
             raise RuntimeError(
                 "PosteriorSamples has no model context; predict requires "
@@ -994,12 +980,32 @@ class PosteriorSamples:
         from ._tables import normalize_table
 
         headers, rows, _ = normalize_table(new_data)
+        samples = np.asarray(self.samples, dtype=float)
         try:
-            raw = rust_module().design_matrix_table(self._model_bytes, headers, rows)
+            raw = rust_module().posterior_predict_table(
+                self._model_bytes,
+                headers,
+                rows,
+                samples.ravel().tolist(),
+                self.n_draws,
+                self.n_coeffs,
+            )
         except Exception as exc:
             raise map_exception(exc) from exc
         parsed = json.loads(raw)
-        return _decode_design_matrix(parsed)
+        n_draws = int(parsed["n_draws"])
+        n_rows = int(parsed["n_rows"])
+        flat = np.asarray(parsed.get("eta_flat", []), dtype=float)
+        if flat.size != n_draws * n_rows:
+            raise ValueError(
+                "posterior predict FFI payload shape mismatch: "
+                f"got {flat.size} floats, expected {n_draws} * {n_rows}"
+            )
+        return (
+            flat.reshape(n_draws, n_rows),
+            str(parsed.get("family_kind", self.family_kind)),
+            str(parsed.get("model_class", self.model_class)),
+        )
 
     # ---- Persistence ----------------------------------------------------
 
@@ -1232,20 +1238,6 @@ class PosteriorSamples:
 # ---- Free helpers --------------------------------------------------------
 
 
-def _decode_design_matrix(parsed: Mapping[str, Any]) -> Any:
-    import numpy as np
-
-    n_rows = int(parsed["n_rows"])
-    n_cols = int(parsed["n_cols"])
-    flat = np.asarray(parsed.get("x_flat", []), dtype=float)
-    if flat.size != n_rows * n_cols:
-        raise ValueError(
-            "design matrix FFI payload shape mismatch: "
-            f"got {flat.size} floats, expected {n_rows} * {n_cols}"
-        )
-    return flat.reshape(n_rows, n_cols)
-
-
 def _apply_inverse_link(eta: Any, family_kind: str) -> Any:
     """Apply the inverse link element-wise.
 
@@ -1291,43 +1283,27 @@ def _apply_inverse_link(eta: Any, family_kind: str) -> Any:
 
 
 def _posterior_predict_bands(
-    samples: Any,
-    x: Any,
+    eta: Any,
     family_kind: str,
     level: float,
-    chunk_size: int | None,
 ) -> dict[str, Any]:
-    """Per-row posterior credible bands for eta and E[y | x], optionally chunked.
-
-    Walks ``X[start:stop, :]`` chunks through ``samples @ X_chunk.T`` and
-    immediately collapses each ``(n_draws, chunk_rows)`` block to per-row
-    mean and quantiles.  Memory stays bounded at roughly
-    ``n_draws * chunk_size`` floats regardless of total ``n_rows``.
-    """
+    """Per-row posterior credible bands for eta and E[y | x]."""
     import numpy as np
 
     if not (0.0 < level < 1.0):
         raise ValueError(f"interval level must lie in (0, 1); got {level}")
     alpha = (1.0 - float(level)) / 2.0
-    x_arr = np.asarray(x, dtype=float)
-    n_rows = int(x_arr.shape[0])
+    eta_arr = np.asarray(eta, dtype=float)
+    n_rows = int(eta_arr.shape[1])
 
-    if chunk_size is None or chunk_size >= n_rows:
-        eta = np.asarray(samples) @ x_arr.T
-        eta_mean = eta.mean(axis=0)
-        eta_lower = np.quantile(eta, alpha, axis=0)
-        eta_upper = np.quantile(eta, 1.0 - alpha, axis=0)
-    else:
+    if eta_arr.size == 0:
         eta_mean = np.empty(n_rows, dtype=float)
         eta_lower = np.empty(n_rows, dtype=float)
         eta_upper = np.empty(n_rows, dtype=float)
-        samples_arr = np.asarray(samples)
-        for start in range(0, n_rows, chunk_size):
-            stop = min(start + chunk_size, n_rows)
-            eta_chunk = samples_arr @ x_arr[start:stop, :].T
-            eta_mean[start:stop] = eta_chunk.mean(axis=0)
-            eta_lower[start:stop] = np.quantile(eta_chunk, alpha, axis=0)
-            eta_upper[start:stop] = np.quantile(eta_chunk, 1.0 - alpha, axis=0)
+    else:
+        eta_mean = eta_arr.mean(axis=0)
+        eta_lower = np.quantile(eta_arr, alpha, axis=0)
+        eta_upper = np.quantile(eta_arr, 1.0 - alpha, axis=0)
 
     return {
         "eta_mean": eta_mean,
