@@ -1,229 +1,469 @@
 //! Continuation / homotopy seed strategy for the outer REML loop.
 //!
-//! # Status
+//! Anneal ρ from an oversmoothing start ρ₀ down to the target ρ*,
+//! warm-starting β across steps. Each per-ρ inner solve is exact;
+//! continuation only changes *which* ρ the solver is asked about,
+//! not *how* it answers.
 //!
-//! Stage 1 of a five-stage rollout: this file currently contains only the
-//! design note. No driver-file edits and no public API have been wired
-//! yet. The module is not mounted in `src/solver/reml/mod.rs` until
-//! Stage 2 lands the `ContinuationState` + `fit_with_continuation`
-//! implementation. Keeping the design as a doc-comment-only file (no
-//! types, no items) means the file compiles to nothing — there is no
-//! dead code, no `pub` surface, no `allow(unused)` shim.
+//! `fit_with_continuation` calls the supplied `OuterObjective` for
+//! every step: `seed_inner_state` installs the warm-start β, then
+//! `eval_with_order` runs the inner P-IRLS. Returned errors flow
+//! through `inner_status::classify_inner_error` so the rollback
+//! decision tree matches the structured `InnerFailure` enum that
+//! `outer_strategy.rs` already aggregates into `StartupStats`.
 //!
-//! # Motivation
+//! # Failure rollback (per `InnerFailure` variant)
 //!
-//! Biobank-scale `survival_marginal_slope` fits (n ≈ 195 780) currently
-//! refuse every cold REML startup seed: PIRLS's joint Newton path cannot
-//! converge from a generic starting β when ρ — the smoothing parameter
-//! — already sits at its target value with very weak time-smoothing.
-//! The inner-solver correctness work is happening in parallel
-//! (`qd1-constraint-kkt`, `monotone-time-block`). This module addresses
-//! a *separate* robustness gap: many real fits have a "hard" ρ region
-//! that is reachable from a "soft" one by a smooth path but is not
-//! reachable from cold start at any single ρ in that hard region. The
-//! classical remedy — used by interior-point methods and simulated
-//! annealing — is **continuation**: start at an oversmoothing ρ₀ where
-//! the inner problem is strongly convex, and anneal ρ along a finite
-//! path ρ₀ → ρ₁ → … → ρ* while warm-starting each step from the
-//! previous accepted point.
+//! | variant                                                | action                                  |
+//! |--------------------------------------------------------|-----------------------------------------|
+//! | `CertRefused { RankDeficientHPen }`                    | expand ρ₀ outward; restart path         |
+//! | `CertRefused { ActiveSetIncomplete }`                  | propagate — real KKT bug                |
+//! | `CertRefused { PhantomMultiplierWithWellConditionedH }`| halve α; on underflow → fail            |
+//! | `BudgetExhausted`                                      | halve α                                 |
+//! | `TrustRegionFloor`                                     | halve α; on repeat → expand ρ₀          |
+//! | `LikelihoodFailure`                                    | halve α (β at ρ_k was just accepted)    |
+//! | `Other`                                                | propagate (conservative)                |
 //!
-//! Concretely, the penalised Hessian at smoothing parameter ρ is
+//! # Magic-by-default
 //!
-//!   H_pen(β; ρ) = H_loglik(β) + Σᵢ exp(ρᵢ) · Sᵢ
-//!
-//! For large ρ, H_pen is dominated by the (positive semidefinite)
-//! penalty block Σᵢ exp(ρᵢ) Sᵢ; if the sum of penalty matrices has
-//! full numerical rank over the parameter space (which the canonical
-//! penalty roots constructed in `assembly.rs` guarantee per-block), the
-//! Newton step becomes globally well-conditioned. The continuation seed
-//! drives ρ from this strongly-convex regime down to the user's target
-//! ρ* while β tracks the path of inner optima.
-//!
-//! # Where this plugs into the existing pipeline
-//!
-//! The outer REML driver lives in `src/solver/outer_strategy.rs::run_outer_with_plan`.
-//! That function:
-//!   1. Calls `crate::seeding::generate_rho_candidates` to build a
-//!      diverse set of ρ seeds (manifold seeds, neutral zero seed,
-//!      heuristic-anchored seeds, first-order-fallback seeds).
-//!   2. Optionally screens the seed list via `rank_seeds_with_screening`.
-//!   3. For each seed, calls `obj.eval_with_order(...)` which runs the
-//!      inner solve at that ρ — this is the call that PIRLS / blockwise
-//!      Newton refuse from cold β when the fit is hard.
-//!   4. Aggregates rejections into a `Vec<SeedRejection>` (built from
-//!      the structured `InnerFailure` enum in
-//!      `src/families/inner_status.rs`) and produces a `StartupStats`.
-//!
-//! Continuation slots **between steps 2 and 3**: instead of evaluating
-//! each candidate seed `ρ_seed` directly at the target ρ*, the driver
-//! evaluates a *path* `[ρ₀(ρ_seed), …, ρ_seed]` and reports the result
-//! of the final point. The structured `InnerFailure` plumbing already
-//! tells us *why* a step refused, which is exactly what the continuation
-//! schedule needs to drive its shrink-on-failure / expand-on-success
-//! adaptation. No new failure-classification machinery is required.
-//!
-//! # Stage 2 surface (planned)
-//!
-//! ```ignore
-//! pub(crate) struct ContinuationState {
-//!     /// Last accepted coefficient vector at `last_rho`.
-//!     pub beta: Array1<f64>,
-//!     /// Active-set indicator for constraint-bearing blocks; carried
-//!     /// forward because warm-starting the active set across small ρ
-//!     /// steps usually preserves feasibility and saves QP iterations.
-//!     pub active_set: ActiveSetSnapshot,
-//!     /// Last accepted trust-region radius from the inner Newton solve.
-//!     /// Inherited by the next ρ step's inner solve as its initial
-//!     /// trust radius; very effective when ρ steps are small.
-//!     pub trust_radius: Option<f64>,
-//!     /// Allocations that depend only on the design matrix (e.g.,
-//!     /// per-row kernel scratch in `latent_inner`), reused across ρ
-//!     /// steps to amortise setup cost — same data, different ρ.
-//!     pub row_workspace_cache: RowKernelWorkspace,
-//!     /// The ρ at which `beta` was accepted; the next step starts here.
-//!     pub last_rho: Array1<f64>,
-//! }
-//!
-//! pub(crate) fn fit_with_continuation(
-//!     obj: &mut dyn OuterObjective,
-//!     target_rho: &Array1<f64>,
-//!     schedule: &ContinuationSchedule,
-//! ) -> Result<ContinuationState, ContinuationError>;
-//! ```
-//!
-//! `ContinuationError` will carry an `InnerFailure` so that the outer
-//! cascade's existing structural-early-exit and `SeedRejection`
-//! accounting work unchanged.
-//!
-//! # Choosing ρ₀ (oversmoothing start)
-//!
-//! Goal: pick ρ₀ such that the *penalty* term dominates the *likelihood*
-//! Hessian at cold β=0, making H_pen well-conditioned regardless of the
-//! local data geometry. The rule is:
-//!
-//!   exp(ρ₀ᵢ) · ‖Sᵢ‖_F ≥ κ · ‖H_loglik(β=0)‖_F  for every penalty i,
-//!
-//! with κ ≈ 32 (a conservative oversmoothing factor — large enough that
-//! the penalty's spectrum dominates by an order of magnitude, small
-//! enough that ρ₀ stays inside the bounded ρ box used by `seeding.rs`).
-//! Concretely:
-//!
-//!   ρ₀ᵢ = max( ρ*ᵢ, log(κ · h0 / ‖Sᵢ‖_F) ),
-//!
-//! where `h0 = ‖H_loglik(β=0)‖_F` is cheap: it is the trace-norm of the
-//! likelihood Hessian at cold start, available from the same per-row
-//! workspaces PIRLS already builds. `ρ*ᵢ` is the user's target; the
-//! max() guarantees that on "easy" fits where the target is already
-//! more oversmoothed than κ·h0 requires, ρ₀ collapses to ρ* (i.e.,
-//! continuation degenerates to cold start — see §"Magic-by-default").
-//!
-//! The estimate is computed once per fit attempt; it does *not* require
-//! a full PIRLS step. For the biobank survival model the dominant cost
-//! is the per-row kernel evaluation, which already lives in
-//! `crate::solver::latent_inner` and is cached across continuation
-//! steps anyway.
-//!
-//! # Annealing schedule
-//!
-//! Geometric, with adaptive shrink-on-failure and expand-on-success.
-//! Parameterised by `(α_shrink, α_expand, ρ_step_max)`:
-//!
-//!   - Predict step k+1: `ρ_{k+1} = ρ_k + α · (ρ* − ρ_k)` with α
-//!     starting at `ρ_step_max = 0.5` (halve the remaining distance).
-//!   - On accept (inner returned `InnerStatus::Converged` or
-//!     `ConstrainedStationary`): expand α ← min(1.0, α · α_expand),
-//!     α_expand = 1.5. This lets the schedule grow toward "ρ* in one
-//!     step" on well-behaved paths so easy fits cost ≤ 2 inner solves.
-//!   - On refuse (inner returned `InnerStatus::Failed(InnerFailure::*)`):
-//!     shrink α ← α · α_shrink, α_shrink = 0.5, and retry from the
-//!     same `ρ_k`. The previously-accepted ρ_k stays valid; only the
-//!     next *target* ρ_{k+1} changes.
-//!   - Hard floor on α: 2⁻¹⁰ ≈ 0.001. If the schedule reaches this
-//!     floor without making progress, the next strategy is "expand ρ₀
-//!     outward" (more oversmoothing).
-//!   - Hard ceiling on path length: 64 steps. Past that, return
-//!     `ContinuationError::PathBudgetExhausted` carrying the last
-//!     `InnerFailure` so the outer cascade reports the structural
-//!     reason, not the schedule's own give-up.
-//!
-//! Adaptive ρ₀ expansion (outer retry): if the full schedule refuses
-//! before reaching ρ*, double the oversmoothing factor κ → 2κ → 4κ
-//! and restart the path. Capped at three doublings (κ ∈ {32, 64, 128,
-//! 256}). Beyond that we declare the fit genuinely infeasible.
-//!
-//! # Warm-start payload across ρ steps
-//!
-//! Each step k → k+1 reuses:
-//!   - `β_k` (the inner-accepted coefficients) as the initial β for
-//!     the inner solve at ρ_{k+1}. The IFT-tangent extrapolation
-//!     `β_{k+1}^0 = β_k + (∂β/∂ρ)|_{ρ_k} · (ρ_{k+1} − ρ_k)` is
-//!     *not* used in Stage 2 — plain β_k is robust; the IFT tangent
-//!     can be a Stage-5 perf experiment.
-//!   - Active-set snapshot. For tensor-product / cylinder smooths and
-//!     for the survival monotone-time block, the active set is the
-//!     dominant cost driver of the inner QP. Empirically the active
-//!     set at ρ_k is feasible for ρ_{k+1} after a small step;
-//!     verifying feasibility is O(k), much cheaper than rebuilding.
-//!   - Trust-region radius. Inheriting the radius preserves the local
-//!     geometry the inner solve learned; this is the same trick the
-//!     outer matrix-free TR solver uses for budget-bumped retries
-//!     (see `OperatorTrustRegionStopReason::IterationBudget` handling
-//!     in `outer_strategy.rs`).
-//!   - Row-kernel workspaces. These depend only on the design matrix
-//!     (predictors, knots, isometry references) and are ρ-independent.
-//!     Allocating them once per `fit_with_continuation` call rather
-//!     than once per ρ step is the main Stage-5 perf win.
-//!
-//! # Magic-by-default integration
-//!
-//! Per the project's "no new CLI flags" rule, continuation is enabled
-//! unconditionally. The pre-screen in Stage 3 makes it free when the
-//! fit is easy:
-//!
-//!   1. Estimate h0 = ‖H_loglik(β=0)‖_F at the first seed candidate.
-//!      This is one Hessian evaluation we would do anyway for the cold
-//!      eval.
-//!   2. Compute ρ₀ per the rule above. If ρ₀ ≈ ρ* component-wise
-//!      (within 0.5 in log-smoothing units), set `n_steps = 1` and the
-//!      continuation reduces to the existing cold-start codepath with
-//!      no overhead beyond the h0 estimate.
-//!   3. Otherwise schedule a multi-step path. The number of steps is
-//!      `ceil(max_i (ρ₀ᵢ − ρ*ᵢ) / log(2))` — i.e., one step per
-//!      e-fold of oversmoothing decrease, before adaptive shrinking
-//!      kicks in.
-//!
-//! This means continuation never *adds* inner solves on fits that
-//! already cold-start cleanly: a 1-step path is exactly cold start,
-//! and the h0 estimate is shared with the cold eval that would have
-//! run anyway.
-//!
-//! # Failure semantics
-//!
-//! Continuation is *exact at each ρ*. No approximation; the inner
-//! solver runs to its usual KKT certificate at every step. This
-//! satisfies the "no approximations without opt-in" rule because the
-//! only thing continuation changes is *which* ρ the inner solver is
-//! asked about, not *how* the inner solver answers.
-//!
-//! A failure of `fit_with_continuation` (path budget exhausted, ρ₀
-//! expansion exhausted, or `InnerFailure::LikelihoodFailure` at ρ₀
-//! itself indicating the data is outside the family domain) is
-//! reported with the underlying `InnerFailure` carried through, so
-//! the outer cascade's `SeedRejection` / `StartupStats` / structural
-//! early-exit logic in `outer_strategy.rs` continues to classify
-//! these correctly without modification.
-//!
-//! # Coordination with peer teammates
-//!
-//! - `seed-accounting`: `InnerFailure` and `InnerStatus` from
-//!   `src/families/inner_status.rs` are already stable
-//!   (`CertRefused { diagnosis, carrying_block, message }`,
-//!   `BudgetExhausted`, `TrustRegionFloor`, `LikelihoodFailure`,
-//!   `Other`). Stage 2 can consume them directly.
-//! - `qd1-constraint-kkt` / `monotone-time-block`: structural
-//!   correctness fixes. Continuation is orthogonal: it lets the
-//!   outer loop *reach* the regime where those fixes apply, by
-//!   walking β through ρ-space rather than guessing it at ρ*.
-//! - `nullspace-lead`, `diagnostician`, `cross-block-audit`:
-//!   downstream consumers of the inner solve's KKT certificate; no
-//!   contract change from continuation.
+//! Continuation is unconditional. When ρ₀ ≈ ρ* component-wise (within
+//! `RHO_EQUAL_TOL`), the schedule collapses to a single direct step at
+//! ρ*. The collapse test is bracketing-based (test, don't predict) —
+//! no expensive ‖H_loglik‖ estimate, so the no-op cost is zero on top
+//! of the cold eval.
+
+use ndarray::Array1;
+
+use crate::families::custom_family::KktRefusalDiagnosis;
+use crate::families::inner_status::{InnerFailure, classify_inner_error};
+use crate::solver::estimate::EstimationError;
+use crate::solver::outer_strategy::{OuterEval, OuterEvalOrder, OuterObjective};
+
+/// Hard ceiling on the number of ρ steps along a single continuation
+/// path. Past this we surface the last `InnerFailure` rather than the
+/// schedule's give-up.
+pub(crate) const PATH_BUDGET: usize = 64;
+
+/// Hard floor on the geometric step fraction `α`. Shrinking below
+/// this counts as "the path is not making progress at this ρ₀".
+pub(crate) const ALPHA_FLOOR: f64 = 1.0 / 1024.0;
+
+/// Initial step fraction: halve the remaining distance per step.
+pub(crate) const ALPHA_INIT: f64 = 0.5;
+
+/// Multiplier on α after a successful step. Grows toward "one shot to
+/// ρ*" on well-behaved paths.
+pub(crate) const ALPHA_EXPAND: f64 = 1.5;
+
+/// Multiplier on α after a refused step.
+pub(crate) const ALPHA_SHRINK: f64 = 0.5;
+
+/// Initial oversmoothing offset added to ρ* to build ρ₀. log(32) ≈
+/// 3.4657 — penalty curvature dominates the likelihood Hessian by ~1.5
+/// orders of magnitude in the generic case.
+pub(crate) const OVERSMOOTH_OFFSET_INIT: f64 = 3.4657359027997265;
+
+/// Maximum number of ρ₀ outward expansions when the path refuses at
+/// ρ₀ itself. Each expansion doubles the offset.
+pub(crate) const OVERSMOOTH_RETRY_MAX: usize = 3;
+
+/// Component-wise tolerance below which ρ₀ ≈ ρ* triggers the one-step
+/// collapse. 0.5 log-units ≈ factor of √e in λ.
+pub(crate) const RHO_EQUAL_TOL: f64 = 0.5;
+
+#[derive(Debug, Clone)]
+pub(crate) enum ContinuationFailure {
+    PathBudgetExhausted {
+        last: InnerFailure,
+        steps_taken: usize,
+        final_rho: Array1<f64>,
+    },
+    PathStuck {
+        last: InnerFailure,
+        rho_zero_offset: f64,
+        final_rho: Array1<f64>,
+    },
+    StructuralPropagate(InnerFailure),
+    DomainAtOversmoothedStart(InnerFailure),
+}
+
+impl ContinuationFailure {
+    pub(crate) fn inner(&self) -> &InnerFailure {
+        match self {
+            Self::PathBudgetExhausted { last, .. }
+            | Self::PathStuck { last, .. }
+            | Self::StructuralPropagate(last)
+            | Self::DomainAtOversmoothedStart(last) => last,
+        }
+    }
+}
+
+/// Accepted state carried across continuation steps. Stage 2 carries
+/// the contractually-available payload (β, ρ, the OuterEval).
+/// Active-set + trust-radius warm-start ride on later extensions of
+/// the `OuterObjective::seed_inner_state` contract.
+#[derive(Debug, Clone)]
+pub(crate) struct ContinuationState {
+    pub last_rho: Array1<f64>,
+    pub last_eval: OuterEval,
+    pub last_beta: Array1<f64>,
+    pub steps_accepted: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum FailureAction {
+    ShrinkStep,
+    ShrinkOrExpand,
+    Propagate,
+    ExpandRhoZero,
+}
+
+fn classify_action(failure: &InnerFailure) -> FailureAction {
+    match failure {
+        InnerFailure::CertRefused { diagnosis, .. } => match diagnosis {
+            KktRefusalDiagnosis::RankDeficientHPen => FailureAction::ExpandRhoZero,
+            KktRefusalDiagnosis::ActiveSetIncomplete => FailureAction::Propagate,
+            KktRefusalDiagnosis::PhantomMultiplierWithWellConditionedH => {
+                FailureAction::ShrinkStep
+            }
+        },
+        InnerFailure::BudgetExhausted { .. } => FailureAction::ShrinkStep,
+        InnerFailure::TrustRegionFloor { .. } => FailureAction::ShrinkOrExpand,
+        InnerFailure::LikelihoodFailure(_) => FailureAction::ShrinkStep,
+        InnerFailure::Other(_) => FailureAction::Propagate,
+    }
+}
+
+fn build_rho_zero(target: &Array1<f64>, upper: &Array1<f64>, offset: f64) -> Array1<f64> {
+    debug_assert_eq!(target.len(), upper.len());
+    let mut rho0 = target.clone();
+    for i in 0..rho0.len() {
+        let candidate = target[i] + offset;
+        rho0[i] = candidate.min(upper[i]);
+    }
+    rho0
+}
+
+fn rho_zero_is_target(rho0: &Array1<f64>, target: &Array1<f64>) -> bool {
+    debug_assert_eq!(rho0.len(), target.len());
+    rho0.iter()
+        .zip(target.iter())
+        .all(|(a, b)| (a - b).abs() <= RHO_EQUAL_TOL)
+}
+
+fn step_toward(rho_k: &Array1<f64>, target: &Array1<f64>, alpha: f64) -> Array1<f64> {
+    debug_assert_eq!(rho_k.len(), target.len());
+    let mut out = Array1::<f64>::zeros(rho_k.len());
+    for i in 0..rho_k.len() {
+        out[i] = rho_k[i] + alpha * (target[i] - rho_k[i]);
+    }
+    out
+}
+
+fn reached_target(rho: &Array1<f64>, target: &Array1<f64>) -> bool {
+    let tol = RHO_EQUAL_TOL / 8.0;
+    rho.iter()
+        .zip(target.iter())
+        .all(|(a, b)| (a - b).abs() <= tol)
+}
+
+fn inner_failure_from(err: EstimationError) -> InnerFailure {
+    match err {
+        EstimationError::RemlOptimizationFailed(msg) => classify_inner_error(msg),
+        other => InnerFailure::Other(other.to_string()),
+    }
+}
+
+fn eval_step(
+    obj: &mut dyn OuterObjective,
+    rho: &Array1<f64>,
+    beta_seed: &Array1<f64>,
+    order: OuterEvalOrder,
+) -> Result<OuterEval, InnerFailure> {
+    if let Err(e) = obj.seed_inner_state(beta_seed) {
+        return Err(inner_failure_from(e));
+    }
+    obj.eval_with_order(rho, order).map_err(inner_failure_from)
+}
+
+pub(crate) type ContinuationResult = Result<ContinuationState, ContinuationFailure>;
+
+/// Run the continuation path from an oversmoothing ρ₀ down to `target`.
+/// `initial_beta` seeds the inner solve at ρ₀ (zero vector is fine —
+/// ρ₀ is in the strongly-convex regime). `bounds_upper` clamps ρ₀ to
+/// the legal box.
+pub(crate) fn fit_with_continuation(
+    obj: &mut dyn OuterObjective,
+    target: &Array1<f64>,
+    bounds_upper: &Array1<f64>,
+    initial_beta: &Array1<f64>,
+    order: OuterEvalOrder,
+) -> ContinuationResult {
+    if target.len() != bounds_upper.len() {
+        return Err(ContinuationFailure::StructuralPropagate(InnerFailure::Other(
+            format!(
+                "continuation: target len {} != bounds_upper len {}",
+                target.len(),
+                bounds_upper.len()
+            ),
+        )));
+    }
+
+    let mut offset = OVERSMOOTH_OFFSET_INIT;
+
+    for retry in 0..=OVERSMOOTH_RETRY_MAX {
+        match run_path(obj, target, bounds_upper, initial_beta, order, offset) {
+            Ok(state) => return Ok(state),
+            Err(PathOutcome::ExpandRhoZero(last)) | Err(PathOutcome::Stuck(last)) => {
+                if retry == OVERSMOOTH_RETRY_MAX {
+                    let final_rho = build_rho_zero(target, bounds_upper, offset);
+                    return Err(ContinuationFailure::PathStuck {
+                        last,
+                        rho_zero_offset: offset,
+                        final_rho,
+                    });
+                }
+                offset *= 2.0;
+            }
+            Err(PathOutcome::PathBudgetExhausted {
+                last,
+                steps_taken,
+                final_rho,
+            }) => {
+                return Err(ContinuationFailure::PathBudgetExhausted {
+                    last,
+                    steps_taken,
+                    final_rho,
+                });
+            }
+            Err(PathOutcome::Propagate(last)) => {
+                return Err(ContinuationFailure::StructuralPropagate(last));
+            }
+            Err(PathOutcome::DomainAtStart(last)) => {
+                if retry == OVERSMOOTH_RETRY_MAX {
+                    return Err(ContinuationFailure::DomainAtOversmoothedStart(last));
+                }
+                offset *= 2.0;
+            }
+        }
+    }
+
+    // Loop above always returns; this is a structural impossibility.
+    // Surface the structural error rather than panicking so a future
+    // refactor that changes the retry shape can't quietly drop it.
+    Err(ContinuationFailure::PathStuck {
+        last: InnerFailure::Other("continuation: retry loop ended unexpectedly".into()),
+        rho_zero_offset: offset,
+        final_rho: build_rho_zero(target, bounds_upper, offset),
+    })
+}
+
+enum PathOutcome {
+    ExpandRhoZero(InnerFailure),
+    Stuck(InnerFailure),
+    DomainAtStart(InnerFailure),
+    Propagate(InnerFailure),
+    PathBudgetExhausted {
+        last: InnerFailure,
+        steps_taken: usize,
+        final_rho: Array1<f64>,
+    },
+}
+
+fn run_path(
+    obj: &mut dyn OuterObjective,
+    target: &Array1<f64>,
+    bounds_upper: &Array1<f64>,
+    initial_beta: &Array1<f64>,
+    order: OuterEvalOrder,
+    offset: f64,
+) -> Result<ContinuationState, PathOutcome> {
+    let rho0 = build_rho_zero(target, bounds_upper, offset);
+    let collapsed = rho_zero_is_target(&rho0, target);
+    let rho_first = if collapsed { target.clone() } else { rho0 };
+
+    let mut beta_seed = initial_beta.clone();
+
+    let eval0 = match eval_step(obj, &rho_first, &beta_seed, order) {
+        Ok(eval) => eval,
+        Err(failure) => {
+            return Err(match failure {
+                InnerFailure::LikelihoodFailure(_) => PathOutcome::DomainAtStart(failure),
+                InnerFailure::CertRefused {
+                    diagnosis: KktRefusalDiagnosis::ActiveSetIncomplete,
+                    ..
+                } => PathOutcome::Propagate(failure),
+                // RankDeficientHPen at ρ₀ → definitely expand. Other
+                // failures at the most oversmoothed point are also
+                // unusual (we're in the strongly-convex regime);
+                // treat as "expand ρ₀ and retry" rather than give up.
+                _ => PathOutcome::ExpandRhoZero(failure),
+            });
+        }
+    };
+
+    let mut state = ContinuationState {
+        last_rho: rho_first,
+        last_eval: eval0,
+        last_beta: beta_seed.clone(),
+        steps_accepted: 1,
+    };
+
+    if collapsed || reached_target(&state.last_rho, target) {
+        return Ok(state);
+    }
+
+    let mut alpha = ALPHA_INIT;
+    let mut steps_taken: usize = 1;
+    let mut last_failure: Option<InnerFailure> = None;
+    let mut consecutive_trust_floor: usize = 0;
+
+    while steps_taken < PATH_BUDGET {
+        if reached_target(&state.last_rho, target) {
+            return Ok(state);
+        }
+
+        let rho_next = step_toward(&state.last_rho, target, alpha);
+        beta_seed = state.last_beta.clone();
+
+        match eval_step(obj, &rho_next, &beta_seed, order) {
+            Ok(eval) => {
+                state.last_rho = rho_next;
+                state.last_eval = eval;
+                state.last_beta = beta_seed;
+                state.steps_accepted += 1;
+                steps_taken += 1;
+                last_failure = None;
+                consecutive_trust_floor = 0;
+                alpha = (alpha * ALPHA_EXPAND).min(1.0);
+            }
+            Err(failure) => {
+                last_failure = Some(failure.clone());
+                match classify_action(&failure) {
+                    FailureAction::Propagate => {
+                        return Err(PathOutcome::Propagate(failure));
+                    }
+                    FailureAction::ExpandRhoZero => {
+                        return Err(PathOutcome::ExpandRhoZero(failure));
+                    }
+                    FailureAction::ShrinkStep => {
+                        alpha *= ALPHA_SHRINK;
+                        if alpha < ALPHA_FLOOR {
+                            return Err(PathOutcome::Stuck(failure));
+                        }
+                        steps_taken += 1;
+                    }
+                    FailureAction::ShrinkOrExpand => {
+                        consecutive_trust_floor += 1;
+                        if consecutive_trust_floor >= 2 {
+                            return Err(PathOutcome::ExpandRhoZero(failure));
+                        }
+                        alpha *= ALPHA_SHRINK;
+                        if alpha < ALPHA_FLOOR {
+                            return Err(PathOutcome::Stuck(failure));
+                        }
+                        steps_taken += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    Err(PathOutcome::PathBudgetExhausted {
+        last: last_failure.unwrap_or_else(|| {
+            InnerFailure::Other("continuation: budget hit without recorded failure".into())
+        }),
+        steps_taken,
+        final_rho: state.last_rho.clone(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rho_zero_collapses_when_target_at_upper_bound() {
+        let target = Array1::from_vec(vec![5.0, 5.0]);
+        let upper = Array1::from_vec(vec![5.0, 5.0]);
+        let rho0 = build_rho_zero(&target, &upper, OVERSMOOTH_OFFSET_INIT);
+        assert_eq!(rho0, target);
+        assert!(rho_zero_is_target(&rho0, &target));
+    }
+
+    #[test]
+    fn rho_zero_offsets_above_target_when_room() {
+        let target = Array1::from_vec(vec![0.0, -2.0]);
+        let upper = Array1::from_vec(vec![10.0, 10.0]);
+        let rho0 = build_rho_zero(&target, &upper, OVERSMOOTH_OFFSET_INIT);
+        assert!((rho0[0] - OVERSMOOTH_OFFSET_INIT).abs() < 1e-12);
+        assert!((rho0[1] - (-2.0 + OVERSMOOTH_OFFSET_INIT)).abs() < 1e-12);
+        assert!(!rho_zero_is_target(&rho0, &target));
+    }
+
+    #[test]
+    fn step_toward_is_convex_combination() {
+        let a = Array1::from_vec(vec![0.0, 0.0]);
+        let b = Array1::from_vec(vec![4.0, -8.0]);
+        let mid = step_toward(&a, &b, 0.5);
+        assert!((mid[0] - 2.0).abs() < 1e-12);
+        assert!((mid[1] - (-4.0)).abs() < 1e-12);
+        let full = step_toward(&a, &b, 1.0);
+        assert!((full[0] - 4.0).abs() < 1e-12);
+        assert!((full[1] - (-8.0)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn classify_action_routes_diagnoses_correctly() {
+        let rank_def = InnerFailure::CertRefused {
+            diagnosis: KktRefusalDiagnosis::RankDeficientHPen,
+            carrying_block: None,
+            message: "".into(),
+        };
+        assert!(matches!(
+            classify_action(&rank_def),
+            FailureAction::ExpandRhoZero
+        ));
+
+        let active_incomp = InnerFailure::CertRefused {
+            diagnosis: KktRefusalDiagnosis::ActiveSetIncomplete,
+            carrying_block: None,
+            message: "".into(),
+        };
+        assert!(matches!(
+            classify_action(&active_incomp),
+            FailureAction::Propagate
+        ));
+
+        let phantom = InnerFailure::CertRefused {
+            diagnosis: KktRefusalDiagnosis::PhantomMultiplierWithWellConditionedH,
+            carrying_block: None,
+            message: "".into(),
+        };
+        assert!(matches!(
+            classify_action(&phantom),
+            FailureAction::ShrinkStep
+        ));
+
+        assert!(matches!(
+            classify_action(&InnerFailure::BudgetExhausted {
+                message: "".into()
+            }),
+            FailureAction::ShrinkStep
+        ));
+        assert!(matches!(
+            classify_action(&InnerFailure::TrustRegionFloor {
+                message: "".into()
+            }),
+            FailureAction::ShrinkOrExpand
+        ));
+        assert!(matches!(
+            classify_action(&InnerFailure::LikelihoodFailure("".into())),
+            FailureAction::ShrinkStep
+        ));
+        assert!(matches!(
+            classify_action(&InnerFailure::Other("".into())),
+            FailureAction::Propagate
+        ));
+    }
+}
