@@ -2409,7 +2409,9 @@ pub fn assemble_competing_risks_cif_from_endpoints(
         .flat_map(|endpoint_hazard| endpoint_hazard.iter())
         .fold(0.0_f64, |acc, value| acc.max(value.abs()));
     let monotone_tolerance = 1.0e-10_f64 * max_abs_hazard.max(1.0);
-    let mut cif = Array3::<f64>::zeros((n_endpoints, n_rows, n_times));
+    let mut cif: Vec<Array2<f64>> = (0..n_endpoints)
+        .map(|_| Array2::<f64>::zeros((n_rows, n_times)))
+        .collect();
     let mut overall_survival = Array2::<f64>::zeros((n_rows, n_times));
 
     for row in 0..n_rows {
@@ -2441,7 +2443,7 @@ pub fn assemble_competing_risks_cif_from_endpoints(
                     previous_cif[endpoint] +=
                         survival_left * interval_failure * increments[endpoint] / total_increment;
                 }
-                cif[[endpoint, row, time_idx]] = previous_cif[endpoint].clamp(0.0, 1.0);
+                cif[endpoint][[row, time_idx]] = previous_cif[endpoint].clamp(0.0, 1.0);
             }
             previous_total_cumulative += total_increment;
             overall_survival[[row, time_idx]] = (-previous_total_cumulative).exp().clamp(0.0, 1.0);
@@ -2676,11 +2678,11 @@ mod tests {
                 let failure = 1.0 - (-total_rate * times[time_idx]).exp();
                 let expected_disease = disease_rates[row] / total_rate * failure;
                 let expected_death = death_rates[row] / total_rate * failure;
-                assert!((result.cif[[0, row, time_idx]] - expected_disease).abs() < 1e-12);
-                assert!((result.cif[[1, row, time_idx]] - expected_death).abs() < 1e-12);
+                assert!((result.cif[0][[row, time_idx]] - expected_disease).abs() < 1e-12);
+                assert!((result.cif[1][[row, time_idx]] - expected_death).abs() < 1e-12);
                 assert!(
-                    (result.cif[[0, row, time_idx]]
-                        + result.cif[[1, row, time_idx]]
+                    (result.cif[0][[row, time_idx]]
+                        + result.cif[1][[row, time_idx]]
                         + result.overall_survival[[row, time_idx]]
                         - 1.0)
                         .abs()
@@ -2718,20 +2720,20 @@ mod tests {
 
         for row in 0..2 {
             for time_idx in 0..times.len() {
-                let total_cif = result.cif[[0, row, time_idx]]
-                    + result.cif[[1, row, time_idx]]
-                    + result.cif[[2, row, time_idx]];
+                let total_cif = result.cif[0][[row, time_idx]]
+                    + result.cif[1][[row, time_idx]]
+                    + result.cif[2][[row, time_idx]];
                 assert!(
                     (total_cif + result.overall_survival[[row, time_idx]] - 1.0).abs() < 1e-12,
                     "probability mass mismatch at row={row}, time_idx={time_idx}"
                 );
                 assert!((0.0..=1.0).contains(&result.overall_survival[[row, time_idx]]));
                 for cause in 0..3 {
-                    assert!((0.0..=1.0).contains(&result.cif[[cause, row, time_idx]]));
+                    assert!((0.0..=1.0).contains(&result.cif[cause][[row, time_idx]]));
                     if time_idx > 0 {
                         assert!(
-                            result.cif[[cause, row, time_idx]] + 1e-12
-                                >= result.cif[[cause, row, time_idx - 1]],
+                            result.cif[cause][[row, time_idx]] + 1e-12
+                                >= result.cif[cause][[row, time_idx - 1]],
                             "CIF decreased for cause={cause}, row={row}, time_idx={time_idx}"
                         );
                     }
@@ -2741,11 +2743,11 @@ mod tests {
 
         // Cause 1 is flat between t=1 and t=3 for row 0, but other causes
         // fail in that interval; its CIF must remain exactly flat.
-        assert_eq!(result.cif[[0, 0, 1]], result.cif[[0, 0, 2]]);
+        assert_eq!(result.cif[0][[0, 1]], result.cif[0][[0, 2]]);
         // All causes are flat between t=3 and t=7 for row 1 except cause 2;
         // causes 1 and 3 must not move.
-        assert_eq!(result.cif[[0, 1, 2]], result.cif[[0, 1, 3]]);
-        assert_eq!(result.cif[[2, 1, 2]], result.cif[[2, 1, 3]]);
+        assert_eq!(result.cif[0][[1, 2]], result.cif[0][[1, 3]]);
+        assert_eq!(result.cif[2][[1, 2]], result.cif[2][[1, 3]]);
     }
 
     #[test]
@@ -2775,11 +2777,16 @@ mod tests {
         let result =
             assemble_competing_risks_cif(times.view(), cumulative.view()).expect("assemble CIF");
 
-        for value in result.cif.iter().chain(result.overall_survival.iter()) {
+        for value in result
+            .cif
+            .iter()
+            .flat_map(|m| m.iter())
+            .chain(result.overall_survival.iter())
+        {
             assert!(value.is_finite());
             assert!((0.0..=1.0).contains(value));
         }
-        assert!((result.cif[[0, 0, 2]] + result.cif[[1, 0, 2]] - 1.0).abs() < 1e-12);
+        assert!((result.cif[0][[0, 2]] + result.cif[1][[0, 2]] - 1.0).abs() < 1e-12);
         assert_eq!(result.overall_survival[[0, 2]], 0.0);
     }
 
