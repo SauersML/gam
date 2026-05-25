@@ -250,6 +250,11 @@ fn survival_marginal_slope_stall_reproduces_residual_stall_early_exit() {
         z_column: Some("prs_z".to_string()),
         logslope_formula: Some(duchon_term),
         baseline_target: "linear".to_string(),
+        gpu_policy: if cfg!(target_os = "macos") {
+            gam::gpu::GpuPolicy::Off
+        } else {
+            gam::gpu::GpuPolicy::Auto
+        },
         ..FitConfig::default()
     };
 
