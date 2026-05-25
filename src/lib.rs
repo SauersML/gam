@@ -68,6 +68,7 @@ pub mod geometry;
 pub mod gpu;
 pub mod identifiability;
 pub mod inference;
+pub mod kernels;
 pub mod linalg;
 pub mod report;
 pub mod resource;

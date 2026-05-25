@@ -225,6 +225,9 @@ def __getattr__(name: str):
     if name == "Crosscoder":
         from .crosscoder import Crosscoder as _Crosscoder
         return _Crosscoder
+    if name == "PoincareAtoms":
+        from .torch.hyperbolic import PoincareAtoms as _PoincareAtoms
+        return _PoincareAtoms
     if name == "InterchangeSwapDecoder":
         from .torch.interchange import InterchangeSwapDecoder as _InterchangeSwapDecoder
         return _InterchangeSwapDecoder
@@ -262,6 +265,7 @@ __all__ = [
     "Crosscoder",
     "Diagnostics",
     "InterchangeSwapDecoder",
+    "PoincareAtoms",
     "EquivariantPenalty",
     "GaugeCompanion",
     "LieAtom",
