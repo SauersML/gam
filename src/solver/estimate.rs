@@ -5985,6 +5985,27 @@ where
             "mixture_link and sas_link cannot both be set".to_string(),
         ));
     }
+    // sas_link only makes sense when the family already declares an adaptive
+    // SAS-style link (BinomialSas / BinomialBetaLogistic).  Reject any attempt
+    // to use sas_link with a fixed standard link family, since the caller
+    // declared a fixed link contract and silently upgrading it to an adaptive
+    // family is a footgun.  effective_sas_link auto-fills defaults only for
+    // adaptive families, so any non-None value seen here together with a
+    // standard family link came from the caller and is inconsistent.
+    if let Some(_sas_spec) = opts.sas_link.as_ref() {
+        let link_supports_sas = matches!(
+            &family.link,
+            InverseLink::Sas(_) | InverseLink::BetaLogistic(_)
+        );
+        if !link_supports_sas {
+            return Err(EstimationError::InvalidInput(format!(
+                "sas_link options are only valid for adaptive SAS link families \
+                 (BinomialSas / BinomialBetaLogistic); family '{}' uses a fixed link \
+                 and cannot accept sas_link parameters",
+                family.pretty_name(),
+            )));
+        }
+    }
     let resolved_family: crate::types::LikelihoodSpec = if let Some(mix_spec) =
         opts.mixture_link.as_ref()
     {
@@ -6012,6 +6033,30 @@ where
                 ));
             }
         }
+    } else if let Some(latent_state) = opts.latent_cloglog.as_ref() {
+        // When a latent_cloglog state is supplied alongside a Binomial family
+        // whose link is either Standard(CLogLog) or LatentCLogLog(_), upgrade
+        // the resolved family link to LatentCLogLog so the parameterized state
+        // is carried through into ExternalOptimResult.likelihood_family and
+        // any downstream consumer (predict, save/load, summary).
+        if !family.is_binomial() {
+            return Err(EstimationError::InvalidInput(
+                "latent_cloglog is only supported for Binomial families".to_string(),
+            ));
+        }
+        match &family.link {
+            InverseLink::Standard(LinkFunction::CLogLog) | InverseLink::LatentCLogLog(_) => {
+                LikelihoodSpec::new(
+                    ResponseFamily::Binomial,
+                    InverseLink::LatentCLogLog(*latent_state),
+                )
+            }
+            _ => {
+                return Err(EstimationError::InvalidInput(
+                    "latent_cloglog is only supported with the Binomial CLogLog / LatentCLogLog link".to_string(),
+                ));
+            }
+        }
     } else if let Some(sas_spec) = effective_sas_link {
         if !family.is_binomial() {
             return Err(EstimationError::InvalidInput(
@@ -6020,11 +6065,7 @@ where
         }
         let use_beta_logistic = family.is_binomial_beta_logistic();
         match &family.link {
-            InverseLink::Standard(LinkFunction::Logit)
-            | InverseLink::Standard(LinkFunction::Probit)
-            | InverseLink::Standard(LinkFunction::CLogLog)
-            | InverseLink::Sas(_)
-            | InverseLink::BetaLogistic(_) => {
+            InverseLink::Sas(_) | InverseLink::BetaLogistic(_) => {
                 if use_beta_logistic {
                     let st = crate::mixture_link::state_from_beta_logisticspec(sas_spec).map_err(
                         |e| {
@@ -6043,7 +6084,7 @@ where
             }
             _ => {
                 return Err(EstimationError::InvalidInput(
-                    "sas_link is only supported for binomial families".to_string(),
+                    "sas_link options are only valid for adaptive SAS link families".to_string(),
                 ));
             }
         }
@@ -6054,6 +6095,22 @@ where
         return Err(EstimationError::InvalidInput(
             "fit_gam external design path does not support RoystonParmar; use survival training APIs".to_string(),
         ));
+    }
+    // Validate Beta-regression response domain upfront on the external-design
+    // GLM path so callers get a clear error before PIRLS is even constructed.
+    // Beta GLM requires y strictly in (0, 1); any boundary or out-of-range
+    // value must be rejected here with a message explicitly identifying the
+    // external GLM routing constraint.
+    if matches!(resolved_family.response, ResponseFamily::Beta { .. }) {
+        for (i, (&yi, &wi)) in y.iter().zip(weights.iter()).enumerate() {
+            if wi > 0.0 && (!yi.is_finite() || yi <= 0.0 || yi >= 1.0) {
+                return Err(EstimationError::InvalidInput(format!(
+                    "GLM Beta-regression family rejects response y[{i}]={yi}: \
+                     fit_gam external GLM routing requires y strictly in the open interval (0, 1); \
+                     boundary values 0 or 1 are not in the Beta sample space"
+                )));
+            }
+        }
     }
     validate_penalty_specs(&specs, x.ncols(), "fit_gam")?;
     let ext_opts = ExternalOptimOptions {
