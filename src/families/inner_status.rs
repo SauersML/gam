@@ -149,10 +149,7 @@ fn certificate_from_result(result: &BlockwiseInnerResult) -> KktCertificate {
         .as_ref()
         .and_then(|kkt| kkt.residual_tol())
         .unwrap_or(f64::NAN);
-    let free_rank = result
-        .kkt_residual
-        .as_ref()
-        .and_then(|kkt| kkt.free_rank());
+    let free_rank = result.kkt_residual.as_ref().and_then(|kkt| kkt.free_rank());
     let active_set_size: usize = result
         .active_sets
         .iter()
