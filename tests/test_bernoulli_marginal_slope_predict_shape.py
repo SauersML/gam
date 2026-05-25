@@ -1,33 +1,31 @@
 from __future__ import annotations
 
-import importlib
 import json
-from typing import Any, NoReturn, Protocol, cast
-
-
-class _PytestModule(Protocol):
-    def importorskip(
-        self,
-        modname: str,
-        minversion: str | None = None,
-        reason: str | None = None,
-        *,
-        exc_type: type[ImportError] | tuple[type[ImportError], ...] | None = None,
-    ) -> Any: ...
-
-    def fail(self, reason: str = "", pytrace: bool = True) -> NoReturn: ...
-
-
-pytest = cast(_PytestModule, importlib.import_module("pytest"))
-pytest.importorskip("gamfit._rust")
+from typing import Any
 
 import numpy as np
 
-from gamfit._survival import shape_prediction_response
+from gamfit import _survival
 from gamfit._tables import restore_output_table
 
 
-def test_bernoulli_marginal_slope_saved_kind_returns_1d_probabilities() -> None:
+class _FakeRust:
+    @staticmethod
+    def ordered_prediction_columns(columns_json: str) -> str:
+        return columns_json
+
+    @staticmethod
+    def marginal_slope_clip_probabilities(values: list[float]) -> list[float]:
+        return values
+
+    @staticmethod
+    def vec_to_array1_f64(values: list[float]) -> Any:
+        return np.asarray(values, dtype=float)
+
+
+def test_bernoulli_marginal_slope_saved_kind_returns_1d_probabilities(
+    monkeypatch: Any,
+) -> None:
     raw = json.dumps(
         {
             "columns": {
@@ -36,8 +34,10 @@ def test_bernoulli_marginal_slope_saved_kind_returns_1d_probabilities() -> None:
             }
         }
     )
+    rust = _FakeRust()
+    monkeypatch.setattr(_survival, "rust_module", lambda: rust)
 
-    out = shape_prediction_response(
+    out = _survival.shape_prediction_response(
         raw,
         headers=[],
         rows=[],

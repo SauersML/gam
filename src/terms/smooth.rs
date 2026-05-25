@@ -6128,14 +6128,20 @@ fn build_single_local_smooth_term(
     let linear_constraints_local =
         merge_linear_constraints_global(shape_linear_constraints, boundary_linear_constraints);
 
-    // Joint-null absorption rotation, computed from the final per-smooth
-    // penalty set after all in-smooth reparameterizations (boundary,
-    // shape, T^T·S·T congruence, etc.) have already been applied. This is
-    // Stage-2 commit B: populate `joint_null_rotation` so downstream
-    // commits (D for fit-side application, plus the Stage-3c prediction
-    // replay) have the rotation to consume. Commit B does *not* apply the
-    // rotation; `design_t` and `penalties_t` flow through unchanged.
-    let joint_null_rotation = crate::terms::basis::compute_joint_null_rotation(&penalties_t)?;
+    // Joint-null absorption rotation. On the fit path `term.joint_null_rotation`
+    // is `None` and we compute Q from the final per-smooth penalty set
+    // (after all in-smooth reparameterizations have already been applied).
+    // On the predict path the resolved `TermCollectionSpec` was frozen from
+    // the fitted `SmoothTerm` via `freeze_term_collection_from_design`, so
+    // `term.joint_null_rotation` carries the *exact* fit-time Q — reuse it
+    // verbatim. Recomputing would produce a Q' that's mathematically
+    // equivalent only up to sign flips on eigenvectors of degenerate
+    // eigenvalues, which would silently break bit-equivalent save → load →
+    // predict because the fitted β lives in the fit-time γ-coordinates.
+    let joint_null_rotation = match term.joint_null_rotation.clone() {
+        Some(persisted) => Some(persisted),
+        None => crate::terms::basis::compute_joint_null_rotation(&penalties_t)?,
+    };
 
     Ok(LocalSmoothTermBuild {
         dim: p_local,
