@@ -87,9 +87,11 @@ class SkipAffineSmooth(nn.Module):
         learnable_threshold: bool = False,
         smoothing_eps: float = 1e-3,
         device: torch.device | str | None = None,
-        dtype: torch.dtype = torch.float32,
+        dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__()
+        if dtype is None:
+            dtype = torch.get_default_dtype()
         if in_dim <= 0 or out_dim <= 0 or n_atoms <= 0:
             raise ValueError("SkipAffineSmooth dims must be > 0")
         if rank_skip < 0 or rank_skip > min(in_dim, out_dim):
@@ -132,11 +134,14 @@ class SkipAffineSmooth(nn.Module):
         self._reset_parameters()
 
     def _reset_parameters(self) -> None:
-        # Kaiming-uniform on encoder; tied init on decoder (Paulo et al.
-        # report tied-init helps stability).
+        # Kaiming-uniform on encoder; tied init on decoder when shapes permit
+        # it (Paulo et al. report tied-init helps stability).
         nn.init.kaiming_uniform_(self.W_enc, a=5**0.5)
         with torch.no_grad():
-            self.W_dec.copy_(self.W_enc.t())
+            if self.in_dim == self.out_dim:
+                self.W_dec.copy_(self.W_enc.t())
+            else:
+                nn.init.xavier_normal_(self.W_dec)
             # Decoder rows unit-normed (standard SAE convention).
             self.W_dec.div_(self.W_dec.norm(dim=1, keepdim=True).clamp(min=1e-8))
         if self.skip_U is not None and self.skip_V is not None:
@@ -244,7 +249,7 @@ def skip_transcoder(
     learnable_threshold: bool = False,
     smoothing_eps: float = 1e-3,
     device: torch.device | str | None = None,
-    dtype: torch.dtype = torch.float32,
+    dtype: torch.dtype | None = None,
 ) -> SkipAffineSmooth | list[SkipTranscoderResult]:
     """Build a skip-transcoder smooth, optionally swept over hyperparameters.
 
