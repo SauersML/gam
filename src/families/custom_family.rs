@@ -12193,35 +12193,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     old_objective,
                 );
                 let old_radius = joint_trust_radius;
-                let shrink_boundary_blocks_only = step_hit_trust_boundary
-                    && matches!(
-                        trust_update.decision,
-                        JointTrustRegionDecision::ShrinkOnRejection
-                            | JointTrustRegionDecision::ShrinkOnMarginalAccept
-                            | JointTrustRegionDecision::RejectFloor
-                    );
-                for (block_radius, block_step_norm) in joint_block_trust_radii
-                    .iter_mut()
-                    .zip(block_step_norms.iter())
-                {
-                    if shrink_boundary_blocks_only
-                        && !joint_block_step_hit_trust_boundary(*block_step_norm, *block_radius)
-                    {
-                        continue;
-                    }
-                    *block_radius = update_joint_trust_region_radius(
-                        *block_radius,
-                        *block_step_norm,
-                        actual_reduction,
-                        predicted_reduction,
-                        old_objective,
-                    )
-                    .radius;
-                }
-                joint_trust_radius = joint_block_trust_radii
-                    .iter()
-                    .copied()
-                    .fold(0.0_f64, f64::max);
                 // Classify the outcome of this attempt so the diagnostic line
                 // says *why* the step was taken or rejected rather than just
                 // dumping numbers. The four phases partition the post-log
@@ -12249,6 +12220,35 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 } else {
                     "reject"
                 };
+                if floor_reached || secondary_ok {
+                    for (block_radius, block_step_norm) in joint_block_trust_radii
+                        .iter_mut()
+                        .zip(block_step_norms.iter())
+                    {
+                        let block_update = update_joint_trust_region_radius(
+                            *block_radius,
+                            *block_step_norm,
+                            actual_reduction,
+                            predicted_reduction,
+                            old_objective,
+                        );
+                        if block_update.radius >= *block_radius
+                            || joint_block_step_hit_trust_boundary(*block_step_norm, *block_radius)
+                        {
+                            *block_radius = block_update.radius;
+                        }
+                    }
+                    joint_trust_radius = joint_block_trust_radii
+                        .iter()
+                        .copied()
+                        .fold(0.0_f64, f64::max);
+                } else {
+                    joint_trust_radius = shrink_active_joint_block_trust_radii(
+                        &mut joint_block_trust_radii,
+                        &block_step_norms,
+                        0.25,
+                    );
+                }
                 let radius_held =
                     (joint_trust_radius - old_radius).abs() <= 1e-12 * old_radius.abs().max(1.0);
                 let joint_math = JointNewtonMathDiagnostic {
