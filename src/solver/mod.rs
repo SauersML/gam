@@ -15,6 +15,7 @@ pub mod protocol;
 pub mod riemannian;
 pub mod riemannian_retraction;
 pub mod seeding;
+pub mod topology_formula;
 pub mod topology_selector;
 pub mod visualizer;
 pub(crate) mod workflow;

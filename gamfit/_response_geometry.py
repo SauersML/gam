@@ -1,3 +1,10 @@
+"""Response-geometry transforms (simplex + sphere) — thin FFI shims.
+
+Numerical work (closure, CLR/ALR, Fréchet means, log/exp maps, fisher_rao_w
+validation) lives in `gam-pyffi`. This module marshals NumPy arrays across the
+boundary and hosts the small dataclasses that hold a fitted shared-tangent
+model.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -8,137 +15,85 @@ from ._exceptions import map_exception
 from ._tables import normalize_table, restore_output_table, table_columns
 
 
-def _as_array(values: Any, *, label: str) -> Any:
+def _ffi(name: str, *args: Any) -> Any:
+    try:
+        return getattr(rust_module(), name)(*args)
+    except Exception as exc:
+        raise map_exception(exc) from exc
+
+
+def _np():
     import numpy as np
 
-    arr = np.asarray(values, dtype=float)
-    if arr.ndim != 2:
-        raise ValueError(f"{label} must be a 2-D numeric array")
-    if arr.shape[0] == 0 or arr.shape[1] < 2:
-        raise ValueError(f"{label} must have at least one row and at least two columns")
-    if not np.all(np.isfinite(arr)):
-        raise ValueError(f"{label} must contain only finite values")
-    return arr
+    return np
 
 
 def closure(values: Any) -> Any:
     """Normalize rows onto the probability simplex."""
-    import numpy as np
-
-    arr = _as_array(values, label="simplex values")
-    if np.any(arr < 0.0):
-        raise ValueError("simplex values must be non-negative")
-    totals = arr.sum(axis=1, keepdims=True)
-    if np.any(totals <= 0.0):
-        raise ValueError("simplex rows must have positive total mass")
-    return arr / totals
+    np = _np()
+    return _ffi("response_geometry_closure", np.asarray(values, dtype=float))
 
 
 def clr(values: Any) -> Any:
     """Centered log-ratio coordinates for positive compositions."""
-    import numpy as np
-
-    comp = closure(values)
-    if np.any(comp <= 0.0):
-        raise ValueError("CLR coordinates require strictly positive simplex values")
-    logs = np.log(comp)
-    return logs - logs.mean(axis=1, keepdims=True)
+    np = _np()
+    return _ffi("response_geometry_clr", np.asarray(values, dtype=float))
 
 
 def alr(values: Any, *, reference: int = -1) -> Any:
     """Additive log-ratio coordinates for positive compositions."""
-    import numpy as np
-
-    comp = closure(values)
-    if np.any(comp <= 0.0):
-        raise ValueError("ALR coordinates require strictly positive simplex values")
-    d = comp.shape[1]
-    ref = reference % d
-    keep = [j for j in range(d) if j != ref]
-    return np.log(comp[:, keep] / comp[:, [ref]])
+    np = _np()
+    return _ffi("response_geometry_alr", np.asarray(values, dtype=float), int(reference))
 
 
 def inverse_alr(coords: Any, *, reference: int = -1) -> Any:
     """Map ALR coordinates back to the simplex."""
-    import numpy as np
-
-    z = np.asarray(coords, dtype=float)
-    if z.ndim != 2:
-        raise ValueError("ALR coordinates must be a 2-D numeric array")
-    d = z.shape[1] + 1
-    ref = reference % d
-    log_parts = np.zeros((z.shape[0], d), dtype=float)
-    keep = [j for j in range(d) if j != ref]
-    log_parts[:, keep] = z
-    # Stable softmax/closure(exp(log_parts)).
-    log_parts -= log_parts.max(axis=1, keepdims=True)
-    parts = np.exp(log_parts)
-    return parts / parts.sum(axis=1, keepdims=True)
+    np = _np()
+    return _ffi(
+        "response_geometry_inverse_alr", np.asarray(coords, dtype=float), int(reference)
+    )
 
 
 def simplex_frechet_mean(values: Any, weights: Any | None = None) -> Any:
     """Intrinsic Fréchet mean under Aitchison simplex geometry."""
-    import numpy as np
-
-    comp = closure(values)
-    if np.any(comp <= 0.0):
-        raise ValueError("simplex Fréchet mean requires strictly positive values")
-    w = _normalized_weights(comp.shape[0], weights)
-    mean_log = (np.log(comp) * w[:, None]).sum(axis=0)
-    mean_log -= mean_log.max()
-    out = np.exp(mean_log)
-    return out / out.sum()
+    np = _np()
+    w = None if weights is None else np.asarray(weights, dtype=float)
+    return _ffi(
+        "response_geometry_simplex_frechet_mean",
+        np.asarray(values, dtype=float),
+        w,
+    )
 
 
 def simplex_log_map(
     values: Any, base: Any, *, coordinates: str = "clr", reference: int = -1
 ) -> Any:
     """Log map at an intrinsic simplex base point in CLR or ALR coordinates."""
-    import numpy as np
-
-    comp = closure(values)
-    base_arr = closure(np.asarray(base, dtype=float).reshape(1, -1))[0]
-    if comp.shape[1] != base_arr.shape[0]:
-        raise ValueError("simplex values and base point have different dimensions")
-    if np.any(comp <= 0.0) or np.any(base_arr <= 0.0):
-        raise ValueError("simplex log map requires strictly positive values and base point")
-    coord = coordinates.lower()
-    if coord in {"simplex", "clr"}:
-        return clr(comp) - clr(base_arr.reshape(1, -1))
-    if coord == "alr":
-        return alr(comp, reference=reference) - alr(
-            base_arr.reshape(1, -1), reference=reference
-        )
-    raise ValueError("simplex coordinates must be 'clr' or 'alr'")
+    np = _np()
+    return _ffi(
+        "response_geometry_simplex_log_map",
+        np.asarray(values, dtype=float),
+        np.asarray(base, dtype=float).reshape(-1),
+        str(coordinates),
+        int(reference),
+    )
 
 
 def simplex_exp_map(
     tangent: Any, base: Any, *, coordinates: str = "clr", reference: int = -1
 ) -> Any:
     """Exponential map from simplex tangent coordinates back to compositions."""
-    import numpy as np
-
+    np = _np()
     z = np.asarray(tangent, dtype=float)
     if z.ndim == 1:
         z = z.reshape(1, -1)
-    base_arr = closure(np.asarray(base, dtype=float).reshape(1, -1))[0]
-    coord = coordinates.lower()
-    if coord in {"simplex", "clr"}:
-        if z.shape[1] != base_arr.shape[0]:
-            raise ValueError("CLR tangent dimension must equal simplex dimension")
-        log_parts = np.log(base_arr.reshape(1, -1)) + z
-        log_parts -= log_parts.max(axis=1, keepdims=True)
-        parts = np.exp(log_parts)
-        return parts / parts.sum(axis=1, keepdims=True)
-    if coord == "alr":
-        if z.shape[1] != base_arr.shape[0] - 1:
-            raise ValueError("ALR tangent dimension must be simplex dimension minus one")
-        base_alr = alr(base_arr.reshape(1, -1), reference=reference)
-        return inverse_alr(base_alr + z, reference=reference)
-    raise ValueError("simplex coordinates must be 'clr' or 'alr'")
-
-
-_SPHERE_ANTIPODAL_TOL = 1e-12
+    return _ffi(
+        "response_geometry_simplex_exp_map",
+        z,
+        np.asarray(base, dtype=float).reshape(-1),
+        str(coordinates),
+        int(reference),
+    )
 
 
 def sphere_frechet_mean(
@@ -148,129 +103,39 @@ def sphere_frechet_mean(
     tol: float = 1e-12,
     max_iter: int = 256,
 ) -> Any:
-    """Intrinsic Fréchet/Karcher mean on the unit sphere.
-
-    If the minimizer is not unique, as for an exactly antipodal pair, this
-    returns one deterministic minimizer rather than an endpoint surrogate.
-    """
-    import numpy as np
-
+    """Intrinsic Fréchet/Karcher mean on the unit sphere."""
+    np = _np()
     w = None if weights is None else np.asarray(weights, dtype=float)
-    try:
-        return rust_module().sphere_frechet_mean(
-            np.asarray(values, dtype=float),
-            w,
-            float(tol),
-            int(max_iter),
-        )
-    except Exception as exc:
-        raise map_exception(exc) from exc
+    return _ffi(
+        "sphere_frechet_mean",
+        np.asarray(values, dtype=float),
+        w,
+        float(tol),
+        int(max_iter),
+    )
 
 
 def sphere_log_map(values: Any, base: Any) -> Any:
-    """Log map from the unit sphere to the tangent space at ``base``.
-
-    The log map is non-unique at antipodal points, so those inputs are
-    rejected instead of being mapped to a false zero tangent.
-    """
-    import numpy as np
-
-    y = _normalize_sphere(values)
-    b = _normalize_sphere(np.asarray(base, dtype=float).reshape(1, -1))[0]
-    dots = np.clip(y @ b, -1.0, 1.0)
-    theta = np.arccos(dots)
-    if np.any(dots <= -1.0 + _SPHERE_ANTIPODAL_TOL):
-        raise ValueError("spherical log map is undefined at antipodal points")
-    tangent = y - dots[:, None] * b.reshape(1, -1)
-    sin_theta = np.sin(theta)
-    scale = np.ones_like(theta)
-    mask = sin_theta > 1e-12
-    scale[mask] = theta[mask] / sin_theta[mask]
-    scale[~mask] = 1.0
-    out = tangent * scale[:, None]
-    out[theta < 1e-12, :] = 0.0
-    return out
+    """Log map from the unit sphere to the tangent space at ``base``."""
+    np = _np()
+    return _ffi(
+        "response_geometry_sphere_log_map",
+        np.asarray(values, dtype=float),
+        np.asarray(base, dtype=float).reshape(-1),
+    )
 
 
 def sphere_exp_map(tangent: Any, base: Any) -> Any:
     """Exponential map from the ambient tangent space at ``base`` to the sphere."""
-    import numpy as np
-
+    np = _np()
     z = np.asarray(tangent, dtype=float)
     if z.ndim == 1:
         z = z.reshape(1, -1)
-    b = _normalize_sphere(np.asarray(base, dtype=float).reshape(1, -1))[0]
-    # Project away tiny numerical radial components so fitted coordinates remain tangent.
-    z = z - (z @ b)[:, None] * b.reshape(1, -1)
-    r = np.linalg.norm(z, axis=1)
-    out = np.empty_like(z)
-    small = r < 1e-12
-    out[small, :] = b.reshape(1, -1) + z[small, :]
-    if np.any(~small):
-        rr = r[~small]
-        out[~small, :] = np.cos(rr)[:, None] * b.reshape(1, -1) + (
-            np.sin(rr) / rr
-        )[:, None] * z[~small, :]
-    norms = np.linalg.norm(out, axis=1, keepdims=True)
-    return out / norms
-
-
-def _normalize_sphere(values: Any) -> Any:
-    import numpy as np
-
-    arr = _as_array(values, label="spherical values")
-    norms = np.linalg.norm(arr, axis=1, keepdims=True)
-    if np.any(norms <= 0.0):
-        raise ValueError("spherical rows must have non-zero norm")
-    return arr / norms
-
-
-def _normalized_weights(n: int, weights: Any | None) -> Any:
-    import numpy as np
-
-    if weights is None:
-        return np.full(n, 1.0 / n, dtype=float)
-    w = np.asarray(weights, dtype=float).reshape(-1)
-    if w.shape[0] != n:
-        raise ValueError("weights length must match the number of rows")
-    if np.any(~np.isfinite(w)) or np.any(w < 0.0) or float(w.sum()) <= 0.0:
-        raise ValueError("weights must be finite, non-negative, and have positive total")
-    return w / float(w.sum())
-
-
-def _normalize_fisher_rao_w(value: Any, *, n_rows: int, dim: int) -> Any:
-    import numpy as np
-
-    w = np.asarray(value, dtype=float)
-    if w.ndim == 1:
-        if w.shape[0] != n_rows:
-            raise ValueError(
-                f"fisher_rao_w vector must have length {n_rows}; got {w.shape[0]}"
-            )
-        out = np.zeros((n_rows, dim, dim), dtype=float)
-        idx = np.arange(dim)
-        out[:, idx, idx] = w[:, None]
-    elif w.ndim == 2:
-        if w.shape != (dim, dim):
-            raise ValueError(
-                f"fisher_rao_w matrix must have shape ({dim}, {dim}); got {w.shape}"
-            )
-        out = np.broadcast_to(w, (n_rows, dim, dim)).copy()
-    elif w.ndim == 3:
-        if w.shape != (n_rows, dim, dim):
-            raise ValueError(
-                f"fisher_rao_w must have shape ({n_rows}, {dim}, {dim}); got {w.shape}"
-            )
-        out = np.ascontiguousarray(w, dtype=float)
-    else:
-        raise ValueError("fisher_rao_w must be a 1-D, 2-D, or 3-D numeric array")
-    if not np.all(np.isfinite(out)):
-        raise ValueError("fisher_rao_w must contain only finite values")
-    if not np.allclose(out, np.swapaxes(out, 1, 2), rtol=1e-10, atol=1e-10):
-        raise ValueError("fisher_rao_w must be symmetric in every row block")
-    if np.any(np.diagonal(out, axis1=1, axis2=2) < 0.0):
-        raise ValueError("fisher_rao_w diagonal entries must be non-negative")
-    return out
+    return _ffi(
+        "response_geometry_sphere_exp_map",
+        z,
+        np.asarray(base, dtype=float).reshape(-1),
+    )
 
 
 def response_matrix_from_table(data: Any, response_columns: Sequence[str]) -> Any:
@@ -278,11 +143,20 @@ def response_matrix_from_table(data: Any, response_columns: Sequence[str]) -> An
     missing = [name for name in response_columns if name not in columns]
     if missing:
         raise ValueError(f"response geometry columns missing from data: {missing}")
-    import numpy as np
-
+    np = _np()
     return np.column_stack(
         [np.asarray(columns[name], dtype=float) for name in response_columns]
     )
+
+
+_SIMPLEX_KINDS = {"simplex", "clr", "alr"}
+_SPHERE_KINDS = {"spherical", "sphere"}
+
+
+def _resolve_simplex_coord(kind: str, coordinates: str | None) -> str:
+    if coordinates is not None:
+        return coordinates.lower()
+    return "alr" if kind == "alr" else "clr"
 
 
 def geometry_log_map(
@@ -293,27 +167,26 @@ def geometry_log_map(
     coordinates: str | None = None,
     reference: int = -1,
 ) -> tuple[Any, Any, str]:
-    import numpy as np
-
+    np = _np()
     kind = geometry.lower()
-    if kind in {"spherical", "sphere"}:
-        base_point = (
-            sphere_frechet_mean(values)
-            if base is None
-            else _normalize_sphere(np.asarray(base, dtype=float).reshape(1, -1))[0]
-        )
+    if kind in _SPHERE_KINDS:
+        if base is None:
+            base_point = sphere_frechet_mean(values)
+        else:
+            # Normalize a single base row via the sphere_log_map FFI by mapping
+            # the base to itself: the impl normalizes its base argument internally.
+            base_point = np.asarray(base, dtype=float).reshape(-1)
+            norm = float(np.linalg.norm(base_point))
+            if norm <= 0.0:
+                raise ValueError("spherical base point must have non-zero norm")
+            base_point = base_point / norm
         return sphere_log_map(values, base_point), base_point, "spherical"
-    if kind in {"simplex", "clr", "alr"}:
-        coord = (
-            coordinates.lower()
-            if coordinates is not None
-            else ("alr" if kind == "alr" else "clr")
-        )
-        base_point = (
-            simplex_frechet_mean(values)
-            if base is None
-            else closure(np.asarray(base, dtype=float).reshape(1, -1))[0]
-        )
+    if kind in _SIMPLEX_KINDS:
+        coord = _resolve_simplex_coord(kind, coordinates)
+        if base is None:
+            base_point = simplex_frechet_mean(values)
+        else:
+            base_point = closure(np.asarray(base, dtype=float).reshape(1, -1))[0]
         return (
             simplex_log_map(values, base_point, coordinates=coord, reference=reference),
             base_point,
@@ -333,14 +206,10 @@ def geometry_exp_map(
     reference: int = -1,
 ) -> Any:
     kind = geometry.lower()
-    if kind in {"spherical", "sphere"}:
+    if kind in _SPHERE_KINDS:
         return sphere_exp_map(tangent, base)
-    if kind in {"simplex", "clr", "alr"}:
-        coord = (
-            coordinates.lower()
-            if coordinates is not None
-            else ("alr" if kind == "alr" else "clr")
-        )
+    if kind in _SIMPLEX_KINDS:
+        coord = _resolve_simplex_coord(kind, coordinates)
         return simplex_exp_map(tangent, base, coordinates=coord, reference=reference)
     raise ValueError(
         "response_geometry must be one of 'spherical', 'simplex', 'clr', or 'alr'"
@@ -400,8 +269,7 @@ class ResponseGeometryModel:
         include_tangent: bool = False,
         **kwargs: Any,
     ) -> Any:
-        import numpy as np
-
+        np = _np()
         _columns, input_kind = table_columns(data)
         if self.shared_tangent_fit is not None:
             tangent = np.asarray(self.shared_tangent_fit.predict_tangent(data), dtype=float)
@@ -481,8 +349,12 @@ def fit_response_geometry(
     kwargs["hazard_loading"] = None
     fisher_w = None
     if fisher_rao_w is not None:
-        fisher_w = _normalize_fisher_rao_w(
-            fisher_rao_w, n_rows=tangent.shape[0], dim=tangent.shape[1]
+        np = _np()
+        fisher_w = _ffi(
+            "response_geometry_normalize_fisher_rao",
+            np.asarray(fisher_rao_w, dtype=float),
+            int(tangent.shape[0]),
+            int(tangent.shape[1]),
         )
     kwargs.pop("fisher_rao_w", None)
     target = "__gamfit_response_geometry_shared"
@@ -528,8 +400,8 @@ def _fit_shared_tangent_reml(
     fisher_rao_w: Any | None = None,
 ) -> dict[str, Any]:
     import json
-    import numpy as np
 
+    np = _np()
     if fit_kwargs.get("offset") is not None:
         raise ValueError("response geometry shared REML does not support offsets")
     headers, rows, _kind = normalize_table(data)
@@ -539,17 +411,15 @@ def _fit_shared_tangent_reml(
         "weights": fit_kwargs.get("weights"),
     }
     y = np.ascontiguousarray(np.asarray(tangent, dtype=float))
-    try:
-        payload = rust_module().gaussian_reml_fit_formula_table(
-            headers,
-            rows,
-            formula,
-            y,
-            json.dumps(config),
-            fisher_rao_w,
-        )
-    except Exception as exc:
-        raise map_exception(exc) from exc
+    payload = _ffi(
+        "gaussian_reml_fit_formula_table",
+        headers,
+        rows,
+        formula,
+        y,
+        json.dumps(config),
+        fisher_rao_w,
+    )
     out = dict(payload)
     for key in (
         "coefficients",
