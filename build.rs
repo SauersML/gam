@@ -1119,14 +1119,18 @@ fn scan_for_unsafe_without_safety(
                 continue;
             }
             // Scan up to 3 preceding non-blank lines for `// SAFETY:`.
+            // Scan up to 10 preceding non-blank lines for a `SAFETY:` marker.
+            // The prior cap was 3, which forced multi-line SAFETY explanations
+            // onto a single line of context. Stopping at the first blank line
+            // keeps the marker tied to the same logical block as the site.
             let mut justified = false;
             let mut seen = 0usize;
             let mut k = idx;
-            while k > 0 && seen < 3 {
+            while k > 0 && seen < 10 {
                 k -= 1;
                 let prev = lines[k];
                 if prev.trim().is_empty() {
-                    continue;
+                    break;
                 }
                 seen += 1;
                 if prev.contains("SAFETY:") {
@@ -1207,14 +1211,18 @@ fn scan_for_transmute_without_safety(
             if line.contains("SAFETY:") {
                 continue;
             }
+            // Scan up to 10 preceding non-blank lines for a `SAFETY:` marker.
+            // The prior cap was 3, which forced multi-line SAFETY explanations
+            // onto a single line of context. Stopping at the first blank line
+            // keeps the marker tied to the same logical block as the site.
             let mut justified = false;
             let mut seen = 0usize;
             let mut k = idx;
-            while k > 0 && seen < 3 {
+            while k > 0 && seen < 10 {
                 k -= 1;
                 let prev = lines[k];
                 if prev.trim().is_empty() {
-                    continue;
+                    break;
                 }
                 seen += 1;
                 if prev.contains("SAFETY:") {
@@ -1230,7 +1238,8 @@ fn scan_for_transmute_without_safety(
 }
 
 /// Walks `panic!(` macro sites in non-test code and requires a `// SAFETY:`
-/// comment within the same line or one of the 3 preceding non-blank lines.
+/// comment within the same line or one of the preceding non-blank lines of
+/// the contiguous `//`-comment block immediately above the `panic!(` site.
 /// Mirrors `scan_for_unsafe_without_safety`. The `panic!` family in the
 /// history audit still treats any panic-shape in a former-marker body as
 /// trivial, regardless of SAFETY comments — this softening applies only
@@ -1265,14 +1274,18 @@ fn scan_for_panic_without_safety(
             if line.contains("SAFETY:") {
                 continue;
             }
+            // Scan up to 10 preceding non-blank lines for a `SAFETY:` marker.
+            // The prior cap was 3, which forced multi-line SAFETY explanations
+            // onto a single line of context. Stopping at the first blank line
+            // keeps the marker tied to the same logical block as the site.
             let mut justified = false;
             let mut seen = 0usize;
             let mut k = idx;
-            while k > 0 && seen < 3 {
+            while k > 0 && seen < 10 {
                 k -= 1;
                 let prev = lines[k];
                 if prev.trim().is_empty() {
-                    continue;
+                    break;
                 }
                 seen += 1;
                 if prev.contains("SAFETY:") {
@@ -2771,6 +2784,16 @@ fn scan_for_underscore_fn_args(
                     continue;
                 }
                 if name.starts_with('_') {
+                    // PyO3 convention: `_py: Python<'_>` (or `Python<'py>`) is
+                    // the GIL token that #[pyfunction] / #[pymethods] macros
+                    // thread through every entry point. The body of helpers
+                    // called from those entry points often doesn't touch it,
+                    // but removing the parameter forces the call site to drop
+                    // it too, which breaks the macro contract. Exempt it.
+                    let type_after_colon = rest[1..].trim_start();
+                    if type_after_colon.starts_with("Python<") {
+                        continue;
+                    }
                     // Compute the byte offset of the parameter NAME (not the
                     // leading whitespace/attribute/mut prefix) so the line
                     // mapping points to the underscore-prefixed identifier
@@ -2921,6 +2944,7 @@ fn scan_for_useless_tests(root: &Path, dir: &Path, offenders: &mut Vec<(PathBuf,
                     || line_s.contains("unimplemented!(")
                     || line_s.contains("todo!(")
                     || line_contains_propagating_question(line_s)
+                    || line_contains_assertion_helper_macro(line_s)
                 {
                     found = true;
                     break;
@@ -2933,6 +2957,53 @@ fn scan_for_useless_tests(root: &Path, dir: &Path, offenders: &mut Vec<(PathBuf,
             i = close + 1;
         }
     });
+}
+
+/// True when `stripped` contains a macro call (`<ident>!(...)`) whose name
+/// matches a convention indicating it asserts an invariant: `assert_*`,
+/// `expect_*`, `require_*`, `ensure_*`. Lets test bodies delegate to local
+/// helper macros (e.g. `expect_invalid_input!(...)`) without losing the
+/// "this test has assertions" recognition.
+fn line_contains_assertion_helper_macro(stripped: &str) -> bool {
+    let bytes = stripped.as_bytes();
+    let n = bytes.len();
+    let mut i = 0usize;
+    while i < n {
+        if bytes[i] != b'!' {
+            i += 1;
+            continue;
+        }
+        // The byte after `!` should be `(` (or `[` / `{`).
+        let next = bytes.get(i + 1).copied();
+        if !matches!(next, Some(b'(') | Some(b'[') | Some(b'{')) {
+            i += 1;
+            continue;
+        }
+        // Walk back from `!` collecting ASCII ident bytes.
+        let mut start = i;
+        while start > 0 {
+            let b = bytes[start - 1];
+            if b == b'_' || b.is_ascii_alphanumeric() {
+                start -= 1;
+            } else {
+                break;
+            }
+        }
+        if start == i {
+            i += 1;
+            continue;
+        }
+        let name = &stripped[start..i];
+        if name.starts_with("assert_")
+            || name.starts_with("expect_")
+            || name.starts_with("require_")
+            || name.starts_with("ensure_")
+        {
+            return true;
+        }
+        i += 1;
+    }
+    false
 }
 
 /// True when `stripped` contains a `?` followed by `;`, `,`, `.`, `)`,
