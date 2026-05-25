@@ -193,7 +193,7 @@ impl fmt::Display for DualRidgeResult {
 /// Residual diagnostics for observed values and predicted means.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PredictionDiagnostics {
-    pub n_obs: f64,
+    pub n_obs: usize,
     pub mae: f64,
     pub rmse: f64,
     pub bias: f64,
@@ -254,7 +254,7 @@ pub fn diagnostics_from_predictions(
     };
 
     Ok(PredictionDiagnostics {
-        n_obs: n_obs_f,
+        n_obs,
         mae: abs_sum / n_obs_f,
         rmse: (residual_sum_squares / n_obs_f).sqrt(),
         bias: residual_sum / n_obs_f,
@@ -508,7 +508,7 @@ mod tests {
         let result = diagnostics_from_predictions(&observed, &predicted).unwrap();
 
         assert_eq!(result.residuals, vec![-0.5, 0.5, 1.0]);
-        assert_eq!(result.n_obs, 3.0);
+        assert_eq!(result.n_obs, 3);
         assert_eq!(result.mae, 2.0 / 3.0);
         assert_eq!(result.bias, 1.0 / 3.0);
         assert_eq!(result.rmse, (1.5_f64 / 3.0).sqrt());

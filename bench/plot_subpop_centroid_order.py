@@ -80,8 +80,13 @@ def main() -> None:
     if args.input:
         df = pd.read_csv(Path(args.input), sep="\t")
     else:
-        sys.path.insert(0, str(Path(__file__).resolve().parent))
-        from run_suite import _synthetic_hgdp_1kg_pc_panel
+        bench_dir = Path(__file__).resolve().parent
+        repo_root = bench_dir.parent
+        for import_path in (str(repo_root), str(bench_dir)):
+            if import_path not in sys.path:
+                sys.path.insert(0, import_path)
+
+        from bench.run_suite import _synthetic_hgdp_1kg_pc_panel
 
         df = _synthetic_hgdp_1kg_pc_panel()
     pc_cols = [f"PC{i}" for i in range(1, 17)]

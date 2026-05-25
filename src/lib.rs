@@ -77,6 +77,7 @@ pub mod terms;
 #[cfg(test)]
 mod test_support;
 pub mod types;
+pub mod util;
 
 pub use data::{
     encode_recordswith_inferred_schema, load_csvwith_inferred_schema, load_csvwith_schema,

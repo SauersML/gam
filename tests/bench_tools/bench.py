@@ -163,7 +163,7 @@ def generate_flamegraph(perf_data: Path, tag: str) -> Path | None:
 
 def write_report(section: ProfileSection) -> Path:
     html_path = WORKDIR / "report.html"
-    flame_svg = section["flame_svg"]
+    flame_svg = section.get("flame_svg")
 
     with html_path.open("w", encoding="utf-8") as f:
         f.write("<!doctype html><meta charset='utf-8'>\n")
