@@ -74,7 +74,7 @@ use gam::terms::skip_transcoder::{
     SkipTranscoderRemlInputs, skip_transcoder_reml_metrics as skip_transcoder_reml_metrics_core,
 };
 use gam::terms::{
-    ARDPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry,
+    ARDPenalty as CoreARDPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry,
     BlockOrthogonalityPenalty as CoreBlockOrthogonalityPenalty,
     DifferenceOpKind, GatedSAEDecoder, IBPAssignmentPenalty, IsometryPenalty, IvaeRidgeMeanGauge,
     JumpReLUPenalty as RustJumpReLUPenalty, MaternBasisGradientTarget, MechanismSparsityPenalty,
@@ -97,9 +97,11 @@ use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBytes, PyDict, PyFloat, PyList, PyString, PyTuple};
 use rayon::prelude::*;
 use regex::Regex;
+use serde::de::{MapAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fmt;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -544,9 +546,11 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
             "predict_array",
             "build_predict_payload_json",
             "interpolate_survival_surface",
+            "survival_chunk_iter_collect",
             "write_survival_csv",
             "default_survival_time_grid",
             "competing_risks_cif",
+            "competing_risks_cif_from_predictions",
             "competing_risks_prediction_payload_from_json",
             "sample",
             "summary",
@@ -1502,6 +1506,33 @@ fn saved_model_payload_string(model_bytes: Vec<u8>, key: &str) -> PyResult<Optio
 }
 
 #[pyfunction]
+fn build_extend_group_payload_json(
+    spec_json: &str,
+    metadata_json: Option<String>,
+    prior_json: Option<String>,
+) -> PyResult<String> {
+    let spec_value: serde_json::Value = serde_json::from_str(spec_json)
+        .map_err(|err| py_value_error(format!("invalid new_group_spec json: {err}")))?;
+    let serde_json::Value::Object(mut payload) = spec_value else {
+        return Err(py_value_error(
+            "new_group_spec json must be an object".to_string(),
+        ));
+    };
+    if let Some(raw) = metadata_json {
+        let metadata: serde_json::Value = serde_json::from_str(&raw)
+            .map_err(|err| py_value_error(format!("invalid metadata json: {err}")))?;
+        payload.insert("metadata".to_string(), metadata);
+    }
+    if let Some(raw) = prior_json {
+        let prior: serde_json::Value = serde_json::from_str(&raw)
+            .map_err(|err| py_value_error(format!("invalid prior json: {err}")))?;
+        payload.insert("prior".to_string(), prior);
+    }
+    serde_json::to_string(&payload)
+        .map_err(|err| py_value_error(format!("failed to serialize extend group payload: {err}")))
+}
+
+#[pyfunction]
 fn extend_model_with_group(
     py: Python<'_>,
     model_bytes: Vec<u8>,
@@ -1678,6 +1709,17 @@ fn competing_risks_cif_from_predictions<'py>(
     }
 
     let expected_shape = cumulative_hazards[0].as_array().dim();
+    let (n_rows, n_times) = expected_shape;
+    if n_rows == 0 || n_times == 0 {
+        return Err(py_value_error(
+            "endpoint predictions must have non-empty (n_rows, n_times) shape",
+        ));
+    }
+    if time_values.len() != n_times {
+        return Err(py_value_error(
+            "time grid length must match endpoint prediction column count",
+        ));
+    }
     for cumulative_hazard in cumulative_hazards.iter().skip(1) {
         if cumulative_hazard.as_array().dim() != expected_shape {
             return Err(py_value_error(
@@ -2833,6 +2875,84 @@ fn assemble_candidate_formula(
         strict_dimension,
     )
     .map_err(PyValueError::new_err)
+}
+
+const PREFERRED_PREDICTION_COLUMNS: &[&str] =
+    &["eta", "mean", "effective_se", "mean_lower", "mean_upper"];
+
+struct OrderedPredictionColumnEntries(Vec<(String, serde_json::Value)>);
+
+impl<'de> Deserialize<'de> for OrderedPredictionColumnEntries {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct OrderedPredictionColumnVisitor;
+
+        impl<'de> Visitor<'de> for OrderedPredictionColumnVisitor {
+            type Value = OrderedPredictionColumnEntries;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a JSON object containing prediction columns")
+            }
+
+            fn visit_map<M>(self, mut access: M) -> Result<Self::Value, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let mut entries = Vec::with_capacity(access.size_hint().unwrap_or(0));
+                while let Some((key, value)) =
+                    access.next_entry::<String, serde_json::Value>()?
+                {
+                    entries.push((key, value));
+                }
+                Ok(OrderedPredictionColumnEntries(entries))
+            }
+        }
+
+        deserializer.deserialize_map(OrderedPredictionColumnVisitor)
+    }
+}
+
+fn ordered_json_object_string(
+    entries: Vec<(String, serde_json::Value)>,
+) -> Result<String, serde_json::Error> {
+    let mut output = String::from("{");
+    for (index, (key, value)) in entries.into_iter().enumerate() {
+        if index > 0 {
+            output.push(',');
+        }
+        output.push_str(&serde_json::to_string(&key)?);
+        output.push(':');
+        output.push_str(&serde_json::to_string(&value)?);
+    }
+    output.push('}');
+    Ok(output)
+}
+
+#[pyfunction]
+fn ordered_prediction_columns(columns_json: &str) -> PyResult<String> {
+    let OrderedPredictionColumnEntries(mut pending): OrderedPredictionColumnEntries =
+        serde_json::from_str(columns_json).map_err(|err| {
+            py_value_error(format!(
+                "ordered_prediction_columns: failed to parse columns JSON: {err}"
+            ))
+        })?;
+    let mut ordered = Vec::with_capacity(pending.len());
+    for preferred in PREFERRED_PREDICTION_COLUMNS {
+        if let Some(index) = pending
+            .iter()
+            .position(|entry| entry.0.as_str() == *preferred)
+        {
+            ordered.push(pending.remove(index));
+        }
+    }
+    ordered.extend(pending);
+    ordered_json_object_string(ordered).map_err(|err| {
+        py_value_error(format!(
+            "ordered_prediction_columns: failed to serialise columns JSON: {err}"
+        ))
+    })
 }
 
 /// Rank a set of topology candidates by their TK-normalized REML score.
@@ -12576,6 +12696,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(mechanism_sparsity_jacobian, module)?)?;
     module.add_function(wrap_pyfunction!(conditional_prior_ivae, module)?)?;
+    module.add_class::<SparsityPenalty>()?;
     Ok(())
 }
 
@@ -15964,7 +16085,7 @@ fn build_analytic_penalty_registry_from_json(
                     &context,
                     &["kind", "target", "weight_schedule"],
                 )?;
-                let penalty = ARDPenalty::new(slice, target.d);
+                let penalty = CoreARDPenalty::new(slice, target.d);
                 let penalty = match weight_schedule {
                     Some(schedule) => penalty.with_weight_schedule(schedule),
                     None => penalty,
@@ -16007,7 +16128,7 @@ fn build_analytic_penalty_registry_from_json(
                 let thresholds = descriptor_array1_flat(descriptor, "thresholds", &context)?;
                 let weight = descriptor_f64(descriptor, "weight", 1.0)?;
                 let smoothing_eps = descriptor_f64(descriptor, "smoothing_eps", 1.0e-3)?;
-                let penalty = JumpReLUPenalty::new(slice, thresholds, weight, smoothing_eps)
+                let penalty = RustJumpReLUPenalty::new(slice, thresholds, weight, smoothing_eps)
                     .map_err(|err| format!("{context}: {err}"))?;
                 let penalty = match weight_schedule {
                     Some(schedule) => penalty.with_weight_schedule(schedule),
