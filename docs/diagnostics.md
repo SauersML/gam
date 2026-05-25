@@ -178,6 +178,6 @@ These are read-only properties.
 | `diagnose()` raises about the response column | Pass `y="column_name"` explicitly. |
 | `check()` reports `missing_column` | The prediction data is missing a required feature. |
 | `predict` raises `SchemaMismatchError` | Run `check()` first to identify the offending column. |
-| `predict` raises `PredictionError` | The fitted class is not supported in Python; the error message lists supported alternatives. |
+| `predict` raises `PredictionError` | Prediction failed for a non-schema reason; inspect the exception and confirm the fitted model class and prediction mode are supported. |
 
 See [exceptions.md](exceptions.md) for the full exception hierarchy.
