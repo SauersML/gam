@@ -190,6 +190,8 @@ class Matern(Smooth):
         contrasts with sum constraint Σ η_a = 0, implementing geometric
         anisotropy ``Λ = κ·diag(exp η)``. ``None`` uses isotropic.
 
+    Notes
+    -----
     Streaming row-chunked evaluation activates automatically when the
     would-be dense basis buffer exceeds ~1 GiB; no opt-in is required.
     """
@@ -274,6 +276,8 @@ class Sphere(Smooth):
     kernel : one of ``"sobolev"`` (default), ``"pseudo"``, ``"harmonic"``.
     radians : default ``False`` (degrees, Earth/data-frame convention).
 
+    Notes
+    -----
     Streaming row-chunked evaluation activates automatically when the
     would-be dense basis buffer exceeds ~1 GiB; no opt-in is required.
     """
