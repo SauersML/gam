@@ -7845,6 +7845,32 @@ mod tests {
     }
 
     #[test]
+    fn ibp_assignment_grad_target_matches_value_finite_difference() {
+        let pen = IBPAssignmentPenalty::new(4, 6.0, 0.8, false);
+        let t = array![
+            0.2_f64, -0.3, 0.7, -0.5, 0.9, 0.4, -0.2, 0.1, -0.4, 0.8, 0.3, -0.1
+        ];
+        let rho = Array1::<f64>::zeros(0);
+        let g = pen.grad_target(t.view(), rho.view());
+        let eps = 1.0e-6;
+        let mut max_err = 0.0_f64;
+        for i in 0..t.len() {
+            let mut tp = t.clone();
+            let mut tm = t.clone();
+            tp[i] += eps;
+            tm[i] -= eps;
+            let fd =
+                (pen.value(tp.view(), rho.view()) - pen.value(tm.view(), rho.view())) / (2.0 * eps);
+            let err = (g[i] - fd).abs();
+            if err > max_err {
+                max_err = err;
+            }
+            assert_abs_diff_eq!(g[i], fd, epsilon = 1.0e-7);
+        }
+        assert!(max_err < 1.0e-7, "IBP grad-FD max abs error = {max_err:.3e}");
+    }
+
+    #[test]
     fn ard_grad_target_matches_lambda_t() {
         let d = 2;
         let t = array![0.5_f64, 1.0, 2.0, -1.0];

@@ -20,6 +20,101 @@ const AUTO_CUBATURE_RHO_CLAMP_INSET: f64 = 1e-8;
 // neither boundary contact nor large outer-gradient flags fired.
 const AUTO_CUBATURE_RHOVAR_TRIGGER: f64 = 0.1;
 
+/// Severity classifier for first-order fallbacks taken by
+/// [`RemlState::compute_smoothing_correction_auto`].
+///
+/// `Routine` covers by-design eligibility gates (dimension limits, the
+/// near-boundary/highgrad linearization gate, rank-deficient `V_ρ` where
+/// cubature would inject spurious variance, `n_rho == 0`, etc.). These
+/// log at `debug` and do not count as failures.
+///
+/// `NumericalFailure` covers situations where cubature was requested by
+/// the eligibility logic but a downstream numerical step refused to
+/// produce a usable second-order correction: Hessian compute / inversion
+/// failed, the inverse Hessian's spectrum is non-positive, a sigma-point
+/// inner PIRLS diverged, or the assembled total covariance is
+/// non-finite. These log at `warn` and increment
+/// [`SMOOTHING_CORRECTION_NUMERICAL_FAILURE_COUNT`] so they are visible
+/// in long-running fits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SmoothingCorrectionFallbackSeverity {
+    Routine,
+    NumericalFailure,
+}
+
+/// Structured outcome of [`RemlState::compute_smoothing_correction_auto`].
+///
+/// The variant tells the caller exactly which branch produced the
+/// returned matrix: a successful cubature upgrade, a principled
+/// first-order linearization (the gradient-only correction at ρ̂), or an
+/// unavailable correction (the only branch that yields no matrix —
+/// reserved for `n_rho == 0` where the unified corrected covariance
+/// equals `H⁻¹` and no separate additive correction is meaningful, and
+/// for the case where the caller did not supply a base covariance to
+/// upgrade).
+///
+/// The caller is responsible for emitting the canonical
+/// `[smoothing-correction]` log line that summarises which branch ran.
+#[derive(Clone, Debug)]
+pub enum SmoothingCorrectionOutcome {
+    /// Cubature upgrade succeeded.
+    Cubature {
+        correction: Array2<f64>,
+        rank: usize,
+        n_points: usize,
+        near_boundary: bool,
+        grad_norm: f64,
+        max_rho_var: f64,
+    },
+    /// Principled first-order linearization was returned, with a
+    /// machine-readable reason classifying why cubature was not used.
+    FirstOrder {
+        correction: Option<Array2<f64>>,
+        reason: &'static str,
+        severity: SmoothingCorrectionFallbackSeverity,
+    },
+}
+
+impl SmoothingCorrectionOutcome {
+    /// Extract the additive correction matrix, if any.
+    ///
+    /// Returns `None` only when the first-order path itself produced
+    /// nothing (e.g. `n_rho == 0` where no separate correction is
+    /// meaningful, or when no base covariance was supplied to upgrade).
+    pub fn into_correction(self) -> Option<Array2<f64>> {
+        match self {
+            SmoothingCorrectionOutcome::Cubature { correction, .. } => Some(correction),
+            SmoothingCorrectionOutcome::FirstOrder { correction, .. } => correction,
+        }
+    }
+
+    /// Human-readable label naming the branch taken.
+    pub fn branch_label(&self) -> &'static str {
+        match self {
+            SmoothingCorrectionOutcome::Cubature { .. } => "cubature",
+            SmoothingCorrectionOutcome::FirstOrder { severity, .. } => match severity {
+                SmoothingCorrectionFallbackSeverity::Routine => "first-order (routine)",
+                SmoothingCorrectionFallbackSeverity::NumericalFailure => {
+                    "first-order (numerical failure)"
+                }
+            },
+        }
+    }
+}
+
+/// Process-wide count of `NumericalFailure` first-order fallbacks taken
+/// inside [`RemlState::compute_smoothing_correction_auto`]. Incremented
+/// whenever cubature was requested by the eligibility gate but a
+/// downstream numerical step refused to produce a usable second-order
+/// correction. Exposed as a public counter so long-running fits can
+/// surface how often the smoothing correction silently degraded.
+pub static SMOOTHING_CORRECTION_NUMERICAL_FAILURE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Process-wide count of cubature upgrades that succeeded inside
+/// [`RemlState::compute_smoothing_correction_auto`]. Paired with
+/// [`SMOOTHING_CORRECTION_NUMERICAL_FAILURE_COUNT`] for visibility.
+pub static SMOOTHING_CORRECTION_CUBATURE_COUNT: AtomicU64 = AtomicU64::new(0);
+
 impl<'a> RemlState<'a> {
     fn cached_penalty_block_structural_nullities(
         &self,
