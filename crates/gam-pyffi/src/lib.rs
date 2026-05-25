@@ -9079,11 +9079,25 @@ fn sae_build_atom_plans(
         }
         match &kind {
             SaeAtomBasisKind::Periodic => {
-                let n_harmonics = d;
+                // A periodic atom parameterises a circle, which is intrinsically
+                // 1-dimensional: the latent coordinate is a single phase angle
+                // `t ∈ [0, 1)`. The user-facing `atom_dim` (a.k.a. `d_atom`) for
+                // a periodic basis selects the *number of harmonics* in the
+                // truncated Fourier expansion (basis size `2·n_harmonics + 1`),
+                // not a latent-space dimensionality. Setting
+                // `latent_dim = atom_dim` would force
+                // `build_sae_basis_evaluators` to fall back to the frozen
+                // `StaticBasisEvaluator` snapshot (the analytic
+                // `PeriodicHarmonicEvaluator` requires `latent_dim == 1`),
+                // killing Phi-refresh between Newton steps and collapsing the
+                // fit to a degenerate null solution. Bind the optimizer-visible
+                // latent dimension to 1 and route the user's `d_atom` into the
+                // harmonic count.
+                let n_harmonics = d.max(1);
                 let basis_size = sae_periodic_basis_size(n_harmonics)?;
                 plans.push(SaeAtomBuildPlan {
                     kind: SaeAtomBasisKind::Periodic,
-                    latent_dim: d,
+                    latent_dim: 1,
                     n_harmonics,
                     duchon_centers: None,
                     basis_size,
@@ -9233,11 +9247,16 @@ fn sae_manifold_fit_auto<'py>(
     } else {
         Array2::<f64>::zeros((n_obs, k_atoms))
     };
+    // The optimizer's latent dimension per atom must match `plan.latent_dim`,
+    // not the user-supplied `atom_dim` — for periodic atoms `atom_dim` carries
+    // a harmonic count, not a coord-block width. Periodic atoms have
+    // `latent_dim == 1`; only the per-atom planning step knows that.
+    let effective_atom_dim: Vec<usize> = plans.iter().map(|plan| plan.latent_dim).collect();
     let result_dict = sae_manifold_fit_inner(
         py,
         z_view,
         &atom_basis,
-        atom_dim.clone(),
+        effective_atom_dim,
         basis_values.view(),
         basis_jacobian.view(),
         basis_sizes.clone(),
@@ -9371,11 +9390,17 @@ fn sae_manifold_predict_oos<'py>(
         let d = atom_dim[atom_idx];
         match kind {
             SaeAtomBasisKind::Periodic => {
+                // Periodic atoms are intrinsically 1-D (see comment in
+                // `sae_build_atom_plans`); the user-supplied `atom_dim` only
+                // ever selects the harmonic count when no explicit
+                // `n_harmonics_list[k]` is supplied. Force the optimizer
+                // latent dimension to 1 so the analytic harmonic evaluator
+                // remains live during OOS prediction.
                 let n_harmonics = n_harmonics_list[atom_idx].unwrap_or(d.max(1));
                 let basis_size = sae_periodic_basis_size(n_harmonics).map_err(py_value_error)?;
                 plans.push(SaeAtomBuildPlan {
                     kind: SaeAtomBasisKind::Periodic,
-                    latent_dim: d,
+                    latent_dim: 1,
                     n_harmonics,
                     duchon_centers: None,
                     basis_size,
