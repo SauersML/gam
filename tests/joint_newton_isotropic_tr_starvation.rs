@@ -469,25 +469,38 @@ fn mistake_c_per_block_feasibility_alpha_destroys_joint_newton_direction() {
     );
     eprintln!("[mistake-C] linearized_rel = {:.3e}", linearized_rel);
 
-    // The "joint" step δ = (0.01, 1) is NOT the joint Newton direction.
-    // The time-block gradient (which was -1) is only reduced by 0.01
-    // because Hδ_time = 0.01 → g_time + Hδ_time = -1 + 0.01 = -0.99.
-    // The compatible joint Newton step that respects time's feasibility
-    // would be α · δ̂ = (0.01, 0.01), which keeps the directions
-    // co-linear. The current implementation breaks co-linearity.
+    // The CORRECT step that respects time's feasibility while remaining a
+    // joint Newton descent direction is α · δ̂ = (0.01, 0.01) — both
+    // coordinates scaled by the same α, so the direction is preserved.
+    // Per-block-only scaling gives (0.01, 1) — collinear with neither
+    // δ̂ nor α·δ̂, and not a descent direction on the JOINT quadratic.
+    let scaled_correctly = ndarray::array![alpha_time, alpha_time];
+    let scaled_residual = &g + &h.dot(&scaled_correctly);
+    let scaled_linearized_rel = scaled_residual.iter().map(|v| v.abs()).fold(0.0_f64, f64::max)
+        / (1.0 + g.iter().map(|v| v.abs()).fold(0.0_f64, f64::max));
+    eprintln!(
+        "[mistake-C] correct α·δ̂ = ({:.3e}, {:.3e}) gives linearized_rel = {:.3e}",
+        scaled_correctly[0], scaled_correctly[1], scaled_linearized_rel,
+    );
+
+    // Direction-preservation check: the two coordinates must scale by the
+    // same factor relative to δ̂. The per-block-only scheme violates this.
+    let ratio_0 = delta[0] / delta_hat[0];
+    let ratio_1 = delta[1] / delta_hat[1];
     assert!(
-        delta[0].abs() < 0.1 * delta[1].abs(),
-        "MISTAKE C: after per-block feasibility, time block is crushed ({:.3e}) \
-         while other block keeps its full step ({:.3e}). Their ratio is {:.1}×, \
-         not 1× as the joint Newton direction requires. This is the production \
-         signature: time block barely moves, gradient in time direction NEVER \
-         reduced. The joint linearised residual stays at the time-direction \
-         gradient magnitude forever. Fix: when a block's feasibility forces \
-         α < 1, scale the JOINT step by α (preserving Newton direction), or \
-         re-solve the QP with that block's hyperplane added — never multiply \
-         one block in isolation.",
-        delta[0],
-        delta[1],
-        delta[1].abs() / delta[0].abs(),
+        (ratio_0 - ratio_1).abs() < 1e-9,
+        "MISTAKE C: per-block feasibility α scales only block 0 while leaving \
+         block 1 at its unconstrained Newton step. After scaling: \
+         δ/δ̂ = ({:.3e}, {:.3e}). The two coordinates moved by different \
+         factors, so the JOINT Newton direction is destroyed. The right \
+         answer is α·δ̂ = ({:.3e}, {:.3e}) which preserves direction and \
+         gives linearised_rel = {:.3e}. The buggy step gives \
+         linearised_rel = {:.3e} (≈ 1 − α along the unscaled axis). \
+         Fix: when one block's α_max < 1, scale the JOINT step by α_max, \
+         or add the violating hyperplane to the QP and re-solve.",
+        ratio_0, ratio_1,
+        scaled_correctly[0], scaled_correctly[1],
+        scaled_linearized_rel,
+        linearized_rel,
     );
 }
