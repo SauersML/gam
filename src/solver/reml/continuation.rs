@@ -135,7 +135,7 @@ fn classify_action(failure: &InnerFailure) -> FailureAction {
 }
 
 fn build_rho_zero(target: &Array1<f64>, upper: &Array1<f64>, offset: f64) -> Array1<f64> {
-    debug_assert_eq!(target.len(), upper.len());
+    assert_eq!(target.len(), upper.len());
     let mut rho0 = target.clone();
     for i in 0..rho0.len() {
         let candidate = target[i] + offset;
@@ -145,14 +145,14 @@ fn build_rho_zero(target: &Array1<f64>, upper: &Array1<f64>, offset: f64) -> Arr
 }
 
 fn rho_zero_is_target(rho0: &Array1<f64>, target: &Array1<f64>) -> bool {
-    debug_assert_eq!(rho0.len(), target.len());
+    assert_eq!(rho0.len(), target.len());
     rho0.iter()
         .zip(target.iter())
         .all(|(a, b)| (a - b).abs() <= RHO_EQUAL_TOL)
 }
 
 fn step_toward(rho_k: &Array1<f64>, target: &Array1<f64>, alpha: f64) -> Array1<f64> {
-    debug_assert_eq!(rho_k.len(), target.len());
+    assert_eq!(rho_k.len(), target.len());
     let mut out = Array1::<f64>::zeros(rho_k.len());
     for i in 0..rho_k.len() {
         out[i] = rho_k[i] + alpha * (target[i] - rho_k[i]);

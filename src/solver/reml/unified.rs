@@ -7277,9 +7277,9 @@ pub fn reml_laml_evaluate(
                     .into());
                 }
                 if let Some(kernel) = solution.penalty_subspace_trace.as_ref() {
-                    let reduced = residual.projected_into_reduced_range(kernel).map_err(|reason| {
-                        RemlError::ContractViolation { reason }
-                    })?;
+                    let reduced = residual
+                        .projected_into_reduced_range(kernel)
+                        .map_err(|reason| RemlError::ContractViolation { reason })?;
                     Some(std::borrow::Cow::Owned(reduced.as_array().clone()))
                 } else {
                     Some(std::borrow::Cow::Borrowed(r))

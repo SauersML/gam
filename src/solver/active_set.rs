@@ -573,16 +573,7 @@ fn identity_multiplier_dependence(groups: &[Vec<usize>]) -> Vec<Vec<ActiveRowDep
         .collect()
 }
 
-pub(crate) fn rank_reduce_rows_pivoted_qr(
-    a: Array2<f64>,
-    b: Array1<f64>,
-    groups: Vec<Vec<usize>>,
-) -> (Array2<f64>, Array1<f64>, Vec<Vec<usize>>) {
-    let (a, b, groups, _) = rank_reduce_rows_pivoted_qr_with_dependence(a, b, groups);
-    (a, b, groups)
-}
-
-fn rank_reduce_rows_pivoted_qr_with_dependence(
+pub(crate) fn rank_reduce_rows_pivoted_qr_with_dependence(
     a: Array2<f64>,
     b: Array1<f64>,
     groups: Vec<Vec<usize>>,
@@ -1221,7 +1212,8 @@ pub(crate) fn solve_quadratic_with_linear_constraints(
 mod tests {
     use super::{
         LinearInequalityConstraints, project_stationarity_residual_on_constraint_cone,
-        rank_reduce_rows_pivoted_qr, solve_newton_direction_with_linear_constraints_impl,
+        rank_reduce_rows_pivoted_qr_with_dependence,
+        solve_newton_direction_with_linear_constraints_impl,
     };
     use approx::assert_relative_eq;
     use ndarray::{Array1, array};
@@ -1259,7 +1251,8 @@ mod tests {
         let b = array![0.0, 0.0];
         let groups = vec![vec![0], vec![1]];
 
-        let (a_out, b_out, groups_out) = rank_reduce_rows_pivoted_qr(a, b, groups);
+        let (a_out, b_out, groups_out, _) =
+            rank_reduce_rows_pivoted_qr_with_dependence(a, b, groups);
 
         assert_eq!(a_out.nrows(), 0);
         assert_eq!(a_out.ncols(), 2);

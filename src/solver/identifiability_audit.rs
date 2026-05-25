@@ -216,9 +216,7 @@ const ALIAS_OVERLAP_REPORTING_THRESHOLD: f64 = 0.95;
 ///      attribution → `fatal = true`.
 ///   4. Report all (a, b) column pairs whose normalised inner
 ///      product exceeds `ALIAS_OVERLAP_REPORTING_THRESHOLD`.
-pub fn audit_identifiability(
-    specs: &[ParameterBlockSpec],
-) -> Result<IdentifiabilityAudit, String> {
+pub fn audit_identifiability(specs: &[ParameterBlockSpec]) -> Result<IdentifiabilityAudit, String> {
     if specs.is_empty() {
         return Ok(IdentifiabilityAudit {
             blocks: Vec::new(),
@@ -286,9 +284,7 @@ pub fn audit_identifiability(
         let start = col_offsets[idx];
         let end = col_offsets[idx + 1];
         if end > start {
-            x_joint
-                .slice_mut(ndarray::s![.., start..end])
-                .assign(block);
+            x_joint.slice_mut(ndarray::s![.., start..end]).assign(block);
         }
     }
 
@@ -317,10 +313,8 @@ pub fn audit_identifiability(
         0.0
     };
     let rank_alpha = default_rrqr_rank_alpha();
-    let joint_rank_tol = rank_alpha
-        * f64::EPSILON
-        * (n.max(p_total).max(1) as f64)
-        * leading.max(1.0);
+    let joint_rank_tol =
+        rank_alpha * f64::EPSILON * (n.max(p_total).max(1) as f64) * leading.max(1.0);
     let joint_rank = (0..diag_len)
         .filter(|&i| r_joint[[i, i]].abs() > joint_rank_tol)
         .count();
@@ -331,12 +325,7 @@ pub fn audit_identifiability(
     // is the within-smooth nullspace problem, owned by nullspace-lead).
     let mut col_norms = Array1::<f64>::zeros(p_total);
     for j in 0..p_total {
-        let nrm = x_joint
-            .column(j)
-            .iter()
-            .map(|v| v * v)
-            .sum::<f64>()
-            .sqrt();
+        let nrm = x_joint.column(j).iter().map(|v| v * v).sum::<f64>().sqrt();
         col_norms[j] = nrm;
     }
     let mut aliased_pairs: Vec<AliasedPair> = Vec::new();
