@@ -11,45 +11,31 @@ true effect), so the 16D Duchon must discover that the signal lives on PC1.
 import math
 import random
 import sys
+from statistics import NormalDist
 
 
-def std_normal(rng, two_pi=2.0 * math.pi):
-    u1 = max(rng.random(), 1e-12)
-    u2 = rng.random()
-    return math.sqrt(-2.0 * math.log(u1)) * math.cos(two_pi * u2)
-
-
-def erf_approx(x):
-    a1, a2, a3, a4, a5, p = (
-        0.254829592, -0.284496736, 1.421413741, -1.453152027, 1.061405429, 0.3275911,
-    )
-    sign = -1.0 if x < 0 else 1.0
-    ax = abs(x)
-    t = 1.0 / (1.0 + p * ax)
-    y = 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * math.exp(-ax * ax)
-    return sign * y
+STANDARD_NORMAL = NormalDist()
 
 
 def write_csv(n, path, seed=0x5CA1AB1E):
     rng = random.Random(seed ^ n)
     two_pi = 2.0 * math.pi
-    sqrt_2 = math.sqrt(2.0)
     pc_cols = [f"pc{j}_std" for j in range(1, 17)]
     header = ["phenotype", "sex", "age_entry_std", "pgs_ctn_z"] + pc_cols
     with open(path, "w") as f:
         f.write(",".join(header) + "\n")
         for _ in range(n):
             sex = rng.randint(0, 1)
-            age = std_normal(rng)
-            z = std_normal(rng)
-            pcs = [std_normal(rng) for _ in range(16)]
+            age = rng.gauss(0.0, 1.0)
+            z = rng.gauss(0.0, 1.0)
+            pcs = [rng.gauss(0.0, 1.0) for _ in range(16)]
             eta = (
                 0.5 * math.sin(two_pi * age * 0.3)
                 + 0.4 * sex
                 + 0.6 * pcs[0]
                 + 0.3 * z
             )
-            p = 0.5 * (1.0 + erf_approx(eta / sqrt_2))
+            p = STANDARD_NORMAL.cdf(eta)
             y = 1 if rng.random() < p else 0
             row = [str(y), str(sex), f"{age:.10g}", f"{z:.10g}"] + [f"{v:.10g}" for v in pcs]
             f.write(",".join(row) + "\n")
