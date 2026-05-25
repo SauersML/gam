@@ -8556,7 +8556,7 @@ fn sae_pca_seed_initial_coords(
     let (n_obs, _p_out) = z.dim();
     let d_max = atom_dim.iter().copied().max().unwrap_or(1).max(1);
     let mut out = Array3::<f64>::zeros((k_atoms, n_obs, d_max));
-    if n_obs == 0 {
+    if n_obs == 0 || z.ncols() == 0 {
         return Ok(out);
     }
     let mut col_means = Array1::<f64>::zeros(z.ncols());
