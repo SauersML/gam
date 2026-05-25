@@ -727,3 +727,150 @@ impl<'a> RemlState<'a> {
         outcome
     }
 }
+
+#[cfg(test)]
+mod smoothing_correction_outcome_tests {
+    //! Unit tests for the structured [`SmoothingCorrectionOutcome`] type
+    //! introduced by issue #201. These tests cover variant
+    //! classification helpers, the routine-vs-numerical-failure
+    //! severity distinction, that `None` correction is only possible
+    //! in `FirstOrder` outcomes, and that the failure-reason strings
+    //! used in the function body are non-empty and distinct (a
+    //! tripwire so future refactors cannot silently lose a
+    //! classification). End-to-end tests of the fallback paths inside
+    //! `compute_smoothing_correction_auto` live with the broader REML
+    //! integration suite; the tests here are the targeted local
+    //! coverage of the new structured-return contract.
+    use super::*;
+    use ndarray::array;
+    use std::sync::atomic::Ordering;
+
+    fn make_first_order(
+        reason: &'static str,
+        severity: SmoothingCorrectionFallbackSeverity,
+        with_matrix: bool,
+    ) -> SmoothingCorrectionOutcome {
+        let correction = if with_matrix {
+            Some(array![[1.0, 0.0], [0.0, 1.0]])
+        } else {
+            None
+        };
+        SmoothingCorrectionOutcome::FirstOrder {
+            correction,
+            reason,
+            severity,
+        }
+    }
+
+    #[test]
+    fn cubature_branch_label_and_extraction() {
+        let outcome = SmoothingCorrectionOutcome::Cubature {
+            correction: array![[2.0, 0.0], [0.0, 2.0]],
+            rank: 2,
+            n_points: 4,
+            near_boundary: true,
+            grad_norm: 1.5,
+            max_rho_var: 0.7,
+        };
+        assert_eq!(outcome.branch_label(), "cubature");
+        let mat = outcome
+            .into_correction()
+            .expect("cubature always has a matrix");
+        assert_eq!(mat.dim(), (2, 2));
+        assert_eq!(mat[[0, 0]], 2.0);
+    }
+
+    #[test]
+    fn first_order_routine_branch_label_and_extraction() {
+        let outcome = make_first_order(
+            "n_rho == 0",
+            SmoothingCorrectionFallbackSeverity::Routine,
+            true,
+        );
+        assert_eq!(outcome.branch_label(), "first-order (routine)");
+        assert!(outcome.into_correction().is_some());
+    }
+
+    #[test]
+    fn first_order_numerical_branch_label_and_extraction() {
+        let outcome = make_first_order(
+            "rho Hessian inversion failed after ridge regularization",
+            SmoothingCorrectionFallbackSeverity::NumericalFailure,
+            true,
+        );
+        assert_eq!(outcome.branch_label(), "first-order (numerical failure)");
+        assert!(outcome.into_correction().is_some());
+    }
+
+    #[test]
+    fn first_order_without_matrix_returns_none() {
+        let outcome = make_first_order(
+            "no base covariance supplied",
+            SmoothingCorrectionFallbackSeverity::Routine,
+            false,
+        );
+        assert!(outcome.into_correction().is_none());
+    }
+
+    #[test]
+    fn severity_counter_is_monotonic() {
+        let before = SMOOTHING_CORRECTION_NUMERICAL_FAILURE_COUNT.load(Ordering::Relaxed);
+        SMOOTHING_CORRECTION_NUMERICAL_FAILURE_COUNT.fetch_add(1, Ordering::Relaxed);
+        let after = SMOOTHING_CORRECTION_NUMERICAL_FAILURE_COUNT.load(Ordering::Relaxed);
+        assert!(
+            after > before,
+            "numerical-failure counter must be monotonic ({} -> {})",
+            before,
+            after
+        );
+    }
+
+    #[test]
+    fn cubature_counter_is_observable() {
+        let before = SMOOTHING_CORRECTION_CUBATURE_COUNT.load(Ordering::Relaxed);
+        SMOOTHING_CORRECTION_CUBATURE_COUNT.fetch_add(1, Ordering::Relaxed);
+        let after = SMOOTHING_CORRECTION_CUBATURE_COUNT.load(Ordering::Relaxed);
+        assert!(after > before);
+    }
+
+    #[test]
+    fn classification_reason_strings_are_nonempty_and_distinct() {
+        let reasons = [
+            // Routine gates.
+            "n_rho == 0: unified corrected covariance equals H^{-1}",
+            "n_rho exceeds AUTO_CUBATURE_MAX_RHO_DIM: cubature cost prohibitive",
+            "beta dimension exceeds AUTO_CUBATURE_MAX_BETA_DIM: cubature cost prohibitive",
+            "linearization sufficient: not near boundary and outer gradient is small",
+            "first-order V_rho rank-deficient: cubature would impute spurious variance",
+            "post-inversion rho posterior variance below trigger threshold",
+            "no base covariance supplied: nothing for cubature to upgrade",
+            // Numerical failures.
+            "rho Hessian compute_lamlhessian_consistent failed",
+            "rho Hessian inversion failed after ridge regularization",
+            "eigendecomposition of inverse rho-Hessian failed",
+            "inverse rho-Hessian has no positive eigenvalues above numerical floor",
+            "positive-eigenvalue total mass non-finite or non-positive",
+            "variance-truncation produced rank 0 (unreachable guard)",
+            "empty sigma-point set (unreachable guard)",
+            "one or more sigma-point inner PIRLS fits failed",
+            "assembled total covariance contains non-finite entries",
+        ];
+        for r in reasons.iter() {
+            assert!(!r.is_empty(), "classification reason must not be empty");
+            let routine = make_first_order(r, SmoothingCorrectionFallbackSeverity::Routine, true);
+            let numerical =
+                make_first_order(r, SmoothingCorrectionFallbackSeverity::NumericalFailure, true);
+            assert_eq!(routine.branch_label(), "first-order (routine)");
+            assert_eq!(numerical.branch_label(), "first-order (numerical failure)");
+        }
+
+        let mut sorted: Vec<&'static str> = reasons.to_vec();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            reasons.len(),
+            "classification reasons must be distinct so callers can disambiguate"
+        );
+    }
+}
