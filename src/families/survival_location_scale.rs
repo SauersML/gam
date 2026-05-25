@@ -11199,7 +11199,7 @@ mod tests {
             )
             .expect_err("post-update must reject, not repair, infeasible time beta");
         assert!(
-            err.contains("outside registered linear constraints"),
+            err.contains("violates represented linear constraint"),
             "unexpected error: {err}"
         );
     }
@@ -11339,6 +11339,36 @@ mod tests {
             )
             .expect("return linkwiggle beta");
         assert_eq!(returned, array![0.3, 0.0]);
+
+        let err = family
+            .post_update_block_beta(
+                &[
+                    ParameterBlockState {
+                        beta: array![0.0],
+                        eta: array![0.0, 0.0, 0.0],
+                    },
+                    ParameterBlockState {
+                        beta: array![0.0],
+                        eta: array![0.0, 0.0, 0.0],
+                    },
+                    ParameterBlockState {
+                        beta: array![0.0],
+                        eta: array![0.0, 0.0, 0.0],
+                    },
+                    ParameterBlockState {
+                        beta: array![0.1, 0.2],
+                        eta: array![0.0, 0.0, 0.0],
+                    },
+                ],
+                SurvivalLocationScaleFamily::BLOCK_LINK_WIGGLE,
+                &spec,
+                array![0.3, -0.1],
+            )
+            .expect_err("infeasible link-wiggle beta must be rejected");
+        assert!(
+            err.contains("violates represented nonnegativity"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
