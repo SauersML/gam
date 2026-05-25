@@ -250,18 +250,15 @@ fn main() {
         &mut src_test_only_offenders,
         &mut src_unreferenced_pub_scoped,
     );
-    // Issue #202: these live helpers have production method-call consumers
-    // that the dead-pub scanner can miss; keep the exception scoped.
-    src_unreferenced_pub_scoped.retain(|(rel, _, ident, _)| {
-        let rel = rel.to_string_lossy().replace('\\', "/");
-        !matches!(
-            (rel.as_str(), ident.as_str()),
-            (
-                "src/terms/latent_coord.rs",
-                "effective_is_all_euclidean" | "effective_metric_weights"
-            ) | ("src/solver/reml/unified.rs", "with_metadata")
-        )
-    });
+    // Issue #202: the dead-pub scanner already detects receiver-method
+    // call consumers (`extract_ident_tokens_into` extracts identifiers
+    // after a `.` because `.` is treated as a non-ident byte that simply
+    // advances the cursor before the alphabetic ident scan). The three
+    // helpers (`effective_is_all_euclidean`, `effective_metric_weights`,
+    // `ProjectedKktResidual::with_metadata`) all have production callers
+    // visible to the tokenizer, so no per-item exception list is needed.
+    // Leaving this comment as the audit trail; do not reintroduce a
+    // bespoke `retain` filter — fix the scanner instead.
 
     let mut sections: Vec<Section> = Vec::new();
 
