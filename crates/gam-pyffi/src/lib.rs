@@ -15473,13 +15473,11 @@ fn response_geometry_sphere_normalize_base<'py>(
 ) -> PyResult<Py<PyArray1<f64>>> {
     let owned = base.as_array().to_owned();
     let normalized = py.detach(move || -> Result<Array1<f64>, String> {
-        let norm_sq: f64 = owned.iter().map(|v| v * v).sum();
-        let norm = norm_sq.sqrt();
+        let norm = owned.iter().fold(0.0_f64, |acc, value| acc.hypot(*value));
         if !norm.is_finite() || norm <= 0.0 {
             return Err("spherical base point must have non-zero norm".to_string());
         }
-        let inv = 1.0 / norm;
-        Ok(owned.mapv(|v| v * inv))
+        Ok(owned.mapv(|v| v / norm))
     });
     let normalized = normalized.map_err(PyValueError::new_err)?;
     Ok(normalized.into_pyarray(py).unbind())

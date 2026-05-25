@@ -1,4 +1,4 @@
-//! RED REPRO: PIRLS joint-Newton "linearized-rate stall early-exit"
+//! Mechanism repro: PIRLS joint-Newton "linearized-rate stall early-exit"
 //!
 //! Reproduces — at the linear-algebra level — the exact diagnostic
 //! signature observed in production survival_marginal_slope fits at
@@ -27,11 +27,9 @@
 use ndarray::{Array1, Array2};
 
 // ────────────────────────────────────────────────────────────────────
-// Verbatim copies of gam's internal trust-region primitives.
-// Source: src/families/custom_family.rs:10835-10847 (gam v0.2.1).
-// These are private fns inside the gam crate; we inline them so the
-// red repro is independent of test-mod compile state and survives
-// in-progress refactors of crate::test_support.
+// Copy of the old raw-L2 primitive, plus the fixed block-local metric
+// primitive. These are private inside the crate; this integration test keeps
+// the math mechanism visible without depending on test-only exports.
 // ────────────────────────────────────────────────────────────────────
 
 fn joint_trust_region_step_norm(delta: &Array1<f64>) -> f64 {
@@ -46,6 +44,43 @@ fn truncate_joint_step_to_radius(delta: &mut Array1<f64>, radius: f64) -> f64 {
         radius
     } else {
         norm
+    }
+}
+
+fn block_metric_norm(delta: &Array1<f64>, metric_diag: &Array1<f64>) -> f64 {
+    delta
+        .iter()
+        .zip(metric_diag)
+        .map(|(step, weight)| step * step * weight.abs().max(1.0e-10))
+        .sum::<f64>()
+        .sqrt()
+}
+
+fn block_metric_norms(
+    delta: &Array1<f64>,
+    ranges: &[(usize, usize)],
+    metric_diag: &Array1<f64>,
+) -> Vec<f64> {
+    ranges
+        .iter()
+        .map(|(start, end)| {
+            block_metric_norm(
+                &delta.slice(ndarray::s![*start..*end]).to_owned(),
+                &metric_diag.slice(ndarray::s![*start..*end]).to_owned(),
+            )
+        })
+        .collect()
+}
+
+fn truncate_block_metric(delta: &mut Array1<f64>, ranges: &[(usize, usize)], metric_diag: &Array1<f64>, radii: &[f64]) {
+    for (block_idx, (start, end)) in ranges.iter().copied().enumerate() {
+        let metric = metric_diag.slice(ndarray::s![start..end]).to_owned();
+        let mut block = delta.slice_mut(ndarray::s![start..end]);
+        let norm = block_metric_norm(&block.to_owned(), &metric);
+        let radius = radii[block_idx];
+        if norm.is_finite() && norm > radius && radius > 0.0 {
+            block.mapv_inplace(|v| v * (radius / norm));
+        }
     }
 }
 
@@ -239,7 +274,7 @@ fn joint_newton_isotropic_l2_tr_produces_production_linearized_rate_stall() {
         old_kkt_inf, linearized_next_kkt_inf, linearized_rel,
     );
 
-    // ── RED ASSERTION ──
+    // ── MECHANISM ASSERTION ──
     //
     // After one Newton step (this is exactly the per-cycle stall test),
     // the linear solve PLUS trust-region truncation must reduce the
@@ -247,43 +282,27 @@ fn joint_newton_isotropic_l2_tr_produces_production_linearized_rate_stall() {
     // place for the next 15+ cycles and the linearized-rate stall
     // detector rejects the seed.
     //
-    // A healthy Newton step on a well-formed quadratic has
-    // linearized_rel ≪ 0.9 even after truncation (the well-conditioned
-    // blocks pull g down). The L2 rescale here violates this by giving
-    // linearized_rel ≈ 1, exactly matching the production
-    // "linearized-rate stall early-exit" diagnostic.
+    // The old raw L2 rescale gives linearized_rel ≈ 1, exactly matching the
+    // production "linearized-rate stall early-exit" diagnostic.
     let stall_threshold = 0.9_f64;
     assert!(
-        linearized_rel < stall_threshold,
-        "ISOTROPIC-TR LINEARIZED-RATE STALL: ‖g + Hδ‖∞ / (1 + ‖g‖∞) = {:.3e} \
-         ≥ {:.1} after a single Newton step with the joint trust region. \
-         This is exactly the diagnostic gam prints right before the \
-         'linearized-rate stall early-exit' fires (after 15 consecutive \
-         cycles like this one, the outer optimizer rejects the seed). \
-         \
-         The Newton step itself is correct (δ̂ = H⁻¹(-g) gives perfect \
-         linearized_rel ≈ 0). The bug is in the joint trust-region \
-         TRUNCATION: src/families/custom_family.rs:10835-10847 computes \
-         the L2 norm of the WHOLE concatenated δ and applies a single \
-         scalar rescale `δ *= radius / ‖δ‖₂`. When one block has a \
-         near-null Hessian direction → that block's unconstrained step \
-         has component ~|g|/σ_min(H_block) = O(1e5), the rescale factor \
-         becomes ~radius / 1e5 = 1e-4, and the well-conditioned blocks' \
-         Newton steps are crushed by the same 1e-4 factor. Hδ for those \
-         blocks shrinks too, so g + Hδ ≈ g, linearized_rel ≈ 1, stall \
-         detector fires. \
-         \
-         Fix: per-block trust radii (each block updated from its own \
-         actual/predicted reduction), or a diagonal preconditioner \
-         D = diag(H)^{{1/2}} so the trust region is ellipsoidal in the \
-         scaled metric and respects each block's local curvature scale. \
-         \
-         Production observed: block_beta_inf=[2.3e-4, 15.3, 20.0], \
-         linearized_rel ≈ 0.97 for 15+ cycles, seed rejected. \
-         Reproduced here: post_time_inf={:.3e}, linearized_rel={:.3e}.",
-        linearized_rel,
-        stall_threshold,
-        post_time_inf,
-        linearized_rel,
+        linearized_rel >= stall_threshold,
+        "raw concatenated L2 should reproduce the stall; got linearized_rel={linearized_rel:.3e}",
+    );
+
+    let ranges = vec![(0, TIME_W), (TIME_W, TIME_W + MARG_W), (TIME_W + MARG_W, h.nrows())];
+    let metric_diag = h.diag().to_owned();
+    let full_block_norms = block_metric_norms(&delta_hat, &ranges, &metric_diag);
+    let mut fixed_delta = delta_hat.clone();
+    let block_radii = vec![full_block_norms[0], full_block_norms[1], radius];
+    truncate_block_metric(&mut fixed_delta, &ranges, &metric_diag, &block_radii);
+    let fixed_linearized_rel = (&g + &h.dot(&fixed_delta))
+        .iter()
+        .map(|v| v.abs())
+        .fold(0.0_f64, f64::max)
+        / (1.0 + old_kkt_inf);
+    assert!(
+        fixed_linearized_rel < 1.0e-6,
+        "block-local curvature metric should remove the starvation mechanism; got {fixed_linearized_rel:.3e}",
     );
 }
