@@ -13005,8 +13005,13 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             //     in the linearisation; it's a real multiplier.
             //   • `|Δobjective| ≤ objective_tol` — the objective has
             //     ceased moving meaningfully.
+            //   • `|δ|∞ ≤ step_tol` — the accepted feasible Newton step is
+            //     exhausted. Objective flatness alone is not a terminal
+            //     signal on large survival fits: a step of O(1e-2..1e-1)
+            //     can still continue reducing the KKT residual after the
+            //     objective first crosses tolerance.
             //
-            // Together these three are the rigorous certificate that
+            // Together these four are the rigorous certificate that
             // Newton has reached a constrained-stationary point: further
             // cycles would reproduce the same plateau (the diagnostic in
             // PIRLS/JN/math shows `‖g+Hδ‖/‖g‖` constant near 1 cycle

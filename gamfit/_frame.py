@@ -1,12 +1,26 @@
 """Cross-frame interop dispatch.
 
-Every numerical primitive in gamfit (basis descriptors, penalties, kernels,
-manifold/SAE wrappers) is implemented exactly once in the Rust core. The
-Python frontend can present that one implementation to three different
-numerical frames — pure :mod:`numpy`, :mod:`torch`, and :mod:`jax`. The
-*frame* is auto-detected from the type of the inputs the user passes; the
-return is in the user's native frame; gradients (when relevant) route
-through frame-native autograd hooked to the same Rust value+VJP kernel.
+Every numerical primitive in the gam ecosystem (basis descriptors,
+penalties, kernels, manifold/SAE wrappers) is implemented exactly once
+in the gam Rust core. The Python frontend can present that one
+implementation to three different numerical frames — pure :mod:`numpy`,
+:mod:`torch`, and :mod:`jax`. The *frame* is auto-detected from the type
+of the inputs the user passes; the return is in the user's native frame;
+gradients (when relevant) route through frame-native autograd hooked to
+the same Rust value+VJP kernel.
+
+Scope
+-----
+
+This module is the canonical cross-frame dispatcher for **any** Python
+binding around the gam Rust core. Today the only such binding is
+:mod:`gamfit`, so the module lives there; if another Python wrapper
+(a CLI shim, a notebook helper, a downstream library) starts consuming
+the gam Rust pyfunctions directly, it should import :class:`Frame`,
+:func:`detect_frame`, :func:`to_numpy`, and :func:`from_numpy` from here
+rather than re-implementing detection. The Rust-facing parts (FFI calls)
+already live in Rust by construction — this module only handles the
+Python-type boundary.
 
 The default frame is :attr:`Frame.NUMPY`, which never imports torch or jax.
 ``import gamfit`` therefore costs nothing in a numpy-only environment.

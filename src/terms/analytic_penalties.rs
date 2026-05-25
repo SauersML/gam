@@ -111,6 +111,7 @@ use crate::terms::basis::{
     duchon_radial_second_derivative_nd, duchon_radial_third_derivative_nd,
 };
 use crate::terms::penalties::PenaltyManifest;
+use crate::terms::sheaf::SheafConsistencyPenalty;
 use crate::terms::penalty_op::PenaltyOp;
 use crate::terms::sae_manifold::{GumbelTemperatureSchedule, ScheduleKind};
 use crate::terms::smooth::BlockwisePenalty;
