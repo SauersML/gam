@@ -17730,7 +17730,7 @@ pub(crate) fn exact_joint_multistart_outer_problem(
     problem
 }
 
-pub fn optimize_spatial_length_scale_exact_joint<FitOut, FitFn, ExactFn, ExactEfsFn>(
+pub fn optimize_spatial_length_scale_exact_joint<FitOut, FitFn, ExactFn, ExactEfsFn, SeedFn>(
     data: ArrayView2<'_, f64>,
     block_specs: &[TermCollectionSpec],
     block_term_indices: &[Vec<usize>],
@@ -17745,6 +17745,7 @@ pub fn optimize_spatial_length_scale_exact_joint<FitOut, FitFn, ExactFn, ExactEf
     mut fit_fn: FitFn,
     mut exact_fn: ExactFn,
     mut exact_efs_fn: ExactEfsFn,
+    mut seed_inner_beta_fn: SeedFn,
 ) -> Result<SpatialLengthScaleOptimizationResult<FitOut>, String>
 where
     FitOut: Clone,
@@ -17772,6 +17773,7 @@ where
         &[TermCollectionSpec],
         &[TermCollectionDesign],
     ) -> Result<crate::solver::outer_strategy::EfsEval, String>,
+    SeedFn: FnMut(&Array1<f64>) -> Result<(), EstimationError>,
 {
     let n_blocks = block_specs.len();
     if block_term_indices.len() != n_blocks {
@@ -18260,6 +18262,11 @@ where
                     Ok(eval)
                 },
             ),
+        );
+        let mut obj = obj.with_seed_inner_state(
+            move |_ctx: &mut &mut NBlockExactJointState<'_>, beta: &Array1<f64>| {
+                (seed_inner_beta_fn)(beta)
+            },
         );
 
         problem
@@ -21915,6 +21922,7 @@ mod tests {
                     inner_hessian_scale: None,
                 })
             },
+            |_beta: &Array1<f64>| Ok(()),
         )
         .expect("exact joint two-block κ optimization should succeed");
 
@@ -23764,6 +23772,7 @@ mod tests {
                     inner_hessian_scale: None,
                 })
             },
+            |_beta: &Array1<f64>| Ok(()),
         )
         .expect("exact joint no-spatial fast path should succeed");
 
@@ -25910,6 +25919,7 @@ mod tests {
                     inner_hessian_scale: None,
                 })
             },
+            |_beta: &Array1<f64>| Ok(()),
         )
         .expect("exact joint two-block spatial length-scale optimization should succeed");
 

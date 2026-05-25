@@ -36,6 +36,7 @@ use crate::smooth::{
     build_term_collection_designs_and_freeze_joint, optimize_spatial_length_scale_exact_joint,
     spatial_length_scale_term_indices,
 };
+use crate::solver::estimate::EstimationError;
 use crate::types::{InverseLink, LinkFunction, WigglePenaltyConfig};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 use rayon::iter::{
@@ -4924,39 +4925,54 @@ const ROW_CHUNK_SIZE: usize = 1024;
 const EXACT_WORK_LOG_MIN_ROWS: usize = 50_000;
 const BMS_ROW_PRIMARY_HESSIAN_EXPECTED_REUSE_PASSES: usize = 3;
 const BMS_ROW_PRIMARY_HESSIAN_MIN_REUSE_PASSES: usize = 2;
-const BMS_ROW_PRIMARY_HESSIAN_RUNTIME_BUDGET_DIVISOR: usize = 8;
+/// A single new row-primary Hessian cache may consume up to this fraction of
+/// currently-available RAM. Keeps a 4× safety margin against fragmentation,
+/// other workspace allocations, and the rayon parallel build's transient
+/// per-thread scratch.
+const BMS_ROW_PRIMARY_HESSIAN_SINGLE_FRACTION_NUM: u64 = 1;
+const BMS_ROW_PRIMARY_HESSIAN_SINGLE_FRACTION_DEN: u64 = 4;
+/// The summed bytes pinned across all live row-primary Hessian caches is
+/// capped at this fraction of available RAM at construction time. Independent
+/// of the per-cache cap so that two co-resident workspaces cannot together
+/// consume the whole budget.
+const BMS_ROW_PRIMARY_HESSIAN_GLOBAL_FRACTION_NUM: u64 = 1;
+const BMS_ROW_PRIMARY_HESSIAN_GLOBAL_FRACTION_DEN: u64 = 2;
 
 #[inline]
 fn log_exact_work(n: usize) -> bool {
     n >= EXACT_WORK_LOG_MIN_ROWS
 }
 
-#[cfg(target_os = "linux")]
-fn runtime_available_memory_bytes() -> Option<usize> {
-    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
-    meminfo.lines().find_map(|line| {
-        let rest = line.strip_prefix("MemAvailable:")?;
-        let kb = rest.split_whitespace().next()?.parse::<usize>().ok()?;
-        kb.checked_mul(1024)
-    })
+/// Cross-platform available-RAM probe backed by `sysinfo`. Returns the bytes
+/// the OS reports as available for new allocations (free + reclaimable cache);
+/// the underlying `System` instance is leaked behind a `OnceLock` so the cost
+/// of `new_with_specifics` is paid once per process.
+fn runtime_available_memory_bytes() -> u64 {
+    static SYSTEM: OnceLock<Mutex<sysinfo::System>> = OnceLock::new();
+    let lock = SYSTEM.get_or_init(|| {
+        let kind = sysinfo::MemoryRefreshKind::nothing().with_ram();
+        let refresh = sysinfo::RefreshKind::nothing().with_memory(kind);
+        Mutex::new(sysinfo::System::new_with_specifics(refresh))
+    });
+    let mut system = lock.lock().expect("sysinfo system mutex poisoned");
+    system.refresh_memory_specifics(sysinfo::MemoryRefreshKind::nothing().with_ram());
+    system.available_memory()
 }
 
-#[cfg(not(target_os = "linux"))]
-fn runtime_available_memory_bytes() -> Option<usize> {
-    None
-}
-
-fn optional_bytes_for_log(bytes: Option<usize>) -> String {
-    bytes
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "unknown".to_string())
+/// Process-global counter of bytes currently pinned by live BMS row-primary
+/// Hessian caches. Incremented by [`RowPrimaryHessianPin::new`] when a cache
+/// is materialized and decremented on `Drop`, so two co-resident workspaces
+/// cannot together pin more than `available_ram * GLOBAL_FRACTION`.
+fn bms_row_primary_hessian_pinned_bytes() -> &'static AtomicU64 {
+    static PINNED: OnceLock<AtomicU64> = OnceLock::new();
+    PINNED.get_or_init(|| AtomicU64::new(0))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RowPrimaryHessianCacheReason {
     ReuseTooLow,
-    RuntimeMemoryInsufficient,
-    WorkspaceBudgetExceeded,
+    SingleCacheExceedsRamFraction,
+    GlobalPinExceedsRamFraction,
     ReuseAmortizesBuild,
 }
 
@@ -4964,8 +4980,8 @@ impl RowPrimaryHessianCacheReason {
     const fn as_str(self) -> &'static str {
         match self {
             Self::ReuseTooLow => "reuse_too_low",
-            Self::RuntimeMemoryInsufficient => "runtime_memory_insufficient",
-            Self::WorkspaceBudgetExceeded => "workspace_budget_exceeded",
+            Self::SingleCacheExceedsRamFraction => "single_cache_exceeds_ram_fraction",
+            Self::GlobalPinExceedsRamFraction => "global_pin_exceeds_ram_fraction",
             Self::ReuseAmortizesBuild => "reuse_amortizes_build",
         }
     }
@@ -4974,11 +4990,11 @@ impl RowPrimaryHessianCacheReason {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RowPrimaryHessianCachePlan {
     materialize: bool,
-    bytes: usize,
-    workspace_existing_bytes: usize,
-    budget_bytes: usize,
-    policy_operator_budget_bytes: usize,
-    runtime_available_bytes: Option<usize>,
+    bytes: u64,
+    runtime_available_bytes: u64,
+    workspace_pinned_bytes: u64,
+    single_cache_budget_bytes: u64,
+    global_pin_budget_bytes: u64,
     expected_reuse_passes: usize,
     materialized_row_hessian_evals: usize,
     streamed_row_hessian_evals: usize,
@@ -4988,42 +5004,38 @@ struct RowPrimaryHessianCachePlan {
 fn decide_row_primary_hessian_cache(
     n: usize,
     r: usize,
-    policy: &crate::resource::ResourcePolicy,
-    workspace_existing_bytes: usize,
     expected_reuse_passes: usize,
-    runtime_available_bytes: Option<usize>,
+    runtime_available_bytes: u64,
+    workspace_pinned_bytes: u64,
 ) -> RowPrimaryHessianCachePlan {
-    let bytes = n
-        .saturating_mul(r)
-        .saturating_mul(r)
-        .saturating_mul(std::mem::size_of::<f64>());
-    let runtime_budget_bytes = runtime_available_bytes
-        .map(|available| available / BMS_ROW_PRIMARY_HESSIAN_RUNTIME_BUDGET_DIVISOR);
-    let budget_bytes = runtime_budget_bytes
-        .unwrap_or(policy.max_operator_cache_bytes)
-        .max(policy.max_operator_cache_bytes);
-    let total_workspace_bytes = workspace_existing_bytes.saturating_add(bytes);
-    let runtime_headroom_ok = runtime_available_bytes
-        .map(|available| total_workspace_bytes <= available / 2)
-        .unwrap_or(true);
+    let bytes = (n as u64)
+        .saturating_mul(r as u64)
+        .saturating_mul(r as u64)
+        .saturating_mul(std::mem::size_of::<f64>() as u64);
+    let single_cache_budget_bytes = runtime_available_bytes
+        .saturating_mul(BMS_ROW_PRIMARY_HESSIAN_SINGLE_FRACTION_NUM)
+        / BMS_ROW_PRIMARY_HESSIAN_SINGLE_FRACTION_DEN.max(1);
+    let global_pin_budget_bytes = runtime_available_bytes
+        .saturating_mul(BMS_ROW_PRIMARY_HESSIAN_GLOBAL_FRACTION_NUM)
+        / BMS_ROW_PRIMARY_HESSIAN_GLOBAL_FRACTION_DEN.max(1);
     let streamed_row_hessian_evals = n.saturating_mul(expected_reuse_passes);
     let materialized_row_hessian_evals = n;
     let reason = if expected_reuse_passes < BMS_ROW_PRIMARY_HESSIAN_MIN_REUSE_PASSES {
         RowPrimaryHessianCacheReason::ReuseTooLow
-    } else if !runtime_headroom_ok {
-        RowPrimaryHessianCacheReason::RuntimeMemoryInsufficient
-    } else if total_workspace_bytes > budget_bytes {
-        RowPrimaryHessianCacheReason::WorkspaceBudgetExceeded
+    } else if bytes >= single_cache_budget_bytes {
+        RowPrimaryHessianCacheReason::SingleCacheExceedsRamFraction
+    } else if workspace_pinned_bytes.saturating_add(bytes) > global_pin_budget_bytes {
+        RowPrimaryHessianCacheReason::GlobalPinExceedsRamFraction
     } else {
         RowPrimaryHessianCacheReason::ReuseAmortizesBuild
     };
     RowPrimaryHessianCachePlan {
         materialize: matches!(reason, RowPrimaryHessianCacheReason::ReuseAmortizesBuild),
         bytes,
-        workspace_existing_bytes,
-        budget_bytes,
-        policy_operator_budget_bytes: policy.max_operator_cache_bytes,
         runtime_available_bytes,
+        workspace_pinned_bytes,
+        single_cache_budget_bytes,
+        global_pin_budget_bytes,
         expected_reuse_passes,
         materialized_row_hessian_evals,
         streamed_row_hessian_evals,
@@ -5031,11 +5043,34 @@ fn decide_row_primary_hessian_cache(
     }
 }
 
+/// RAII handle around a materialized row-primary Hessian cache that
+/// decrements the process-global pinned-bytes counter on drop.
+pub(crate) struct RowPrimaryHessianPin {
+    rows: Array2<f64>,
+    bytes: u64,
+}
+
+impl RowPrimaryHessianPin {
+    fn new(rows: Array2<f64>, bytes: u64) -> Self {
+        bms_row_primary_hessian_pinned_bytes().fetch_add(bytes, Ordering::AcqRel);
+        Self { rows, bytes }
+    }
+
+    fn rows(&self) -> &Array2<f64> {
+        &self.rows
+    }
+}
+
+impl Drop for RowPrimaryHessianPin {
+    fn drop(&mut self) {
+        bms_row_primary_hessian_pinned_bytes().fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
 /// Shared precomputed state plus pre-solved per-row contexts. All row
 /// intercepts are solved once during cache construction so that workspace
 /// calls (matvec, diagonal, psi, directional derivatives) never redundantly
 /// re-solve the Newton intercept equation.
-#[derive(Clone)]
 struct BernoulliMarginalSlopeExactEvalCache {
     slices: BlockSlices,
     primary: PrimarySlices,
@@ -5056,7 +5091,7 @@ struct BernoulliMarginalSlopeExactEvalCache {
     /// avoids rebuilding cell moments + reduced flex jets on every Hv product.
     /// `None` whenever the flex path is inactive (rigid kernel) or the
     /// caller did not opt in to materialization.
-    row_primary_hessians: Option<Array2<f64>>,
+    row_primary_hessians: Option<RowPrimaryHessianPin>,
     /// Per-row uncontracted third-derivative tensor in the rigid path,
     /// lazily built on first access. The `build_psi_hyper_coords` row pass
     /// hits `rigid_row_third_contracted` once per (row, ψ-axis) — 32× per
@@ -5079,21 +5114,6 @@ struct BernoulliMarginalSlopeExactEvalCache {
     /// so caching them lets every pair contraction be a 16-multiply 2×2
     /// bilinear instead of a fresh 8-direction empirical jet.
     rigid_fourth_full: crate::resource::RayonSafeOnce<Result<Vec<[[[[f64; 2]; 2]; 2]; 2]>, String>>,
-}
-
-impl BernoulliMarginalSlopeExactEvalCache {
-    fn resident_bytes_before_row_primary_hessians(&self) -> usize {
-        let row_context_bytes = self
-            .row_contexts
-            .len()
-            .saturating_mul(std::mem::size_of::<BernoulliMarginalSlopeRowExactContext>());
-        let row_cell_bytes = self
-            .row_cell_moments
-            .as_ref()
-            .map(RowCellMomentsBundle::resident_bytes)
-            .unwrap_or(0);
-        row_context_bytes.saturating_add(row_cell_bytes)
-    }
 }
 
 // ── RowKernel<2> implementation (rigid path only) ────────────────────
@@ -8313,41 +8333,34 @@ impl BernoulliMarginalSlopeFamily {
         &self,
         block_states: &[ParameterBlockState],
         cache: &BernoulliMarginalSlopeExactEvalCache,
-    ) -> Result<Option<Array2<f64>>, String> {
+    ) -> Result<Option<RowPrimaryHessianPin>, String> {
         if !self.effective_flex_active(block_states)? {
             return Ok(None);
         }
         let n = self.y.len();
         let primary = &cache.primary;
         let r = primary.total;
-        let cache_bytes = n
-            .saturating_mul(r)
-            .saturating_mul(r)
-            .saturating_mul(std::mem::size_of::<f64>());
+        let runtime_available = runtime_available_memory_bytes();
+        let workspace_pinned = bms_row_primary_hessian_pinned_bytes().load(Ordering::Acquire);
         let plan = decide_row_primary_hessian_cache(
             n,
             r,
-            &self.policy,
-            cache.resident_bytes_before_row_primary_hessians(),
             BMS_ROW_PRIMARY_HESSIAN_EXPECTED_REUSE_PASSES,
-            runtime_available_memory_bytes(),
-        );
-        assert_eq!(
-            cache_bytes, plan.bytes,
-            "row-primary Hessian cache byte plan must match the dense row-cache shape"
+            runtime_available,
+            workspace_pinned,
         );
         let gpu_decision = crate::gpu::bms_flex::require_row_primary_hessian_supported(n, r)?;
         if !plan.materialize {
             if log_exact_work(n) {
                 log::info!(
-                    "[BMS row-primary-hessian-cache] stream rows n={} r={} bytes={} workspace_existing_bytes={} budget_bytes={} policy_operator_budget_bytes={} runtime_available_bytes={} expected_reuse_passes={} materialized_row_hessian_evals={} streamed_row_hessian_evals={} reason={} gpu_policy={} gpu_selected={} gpu_reason={}",
+                    "[BMS row-primary-hessian-cache] decision=stream need_bytes={} avail_bytes={} workspace_pinned={} single_cache_budget={} global_pin_budget={} n={} r={} expected_reuse_passes={} materialized_row_hessian_evals={} streamed_row_hessian_evals={} reason={} gpu_policy={} gpu_selected={} gpu_reason={}",
+                    plan.bytes,
+                    plan.runtime_available_bytes,
+                    plan.workspace_pinned_bytes,
+                    plan.single_cache_budget_bytes,
+                    plan.global_pin_budget_bytes,
                     n,
                     r,
-                    plan.bytes,
-                    plan.workspace_existing_bytes,
-                    plan.budget_bytes,
-                    plan.policy_operator_budget_bytes,
-                    optional_bytes_for_log(plan.runtime_available_bytes),
                     plan.expected_reuse_passes,
                     plan.materialized_row_hessian_evals,
                     plan.streamed_row_hessian_evals,
@@ -8361,19 +8374,19 @@ impl BernoulliMarginalSlopeFamily {
         }
         let started = std::time::Instant::now();
         let heartbeat_guard = crate::heartbeat::scope(format!(
-            "BMS row-primary-hessian-cache n={n} r={r} bytes={cache_bytes} budget={}",
-            plan.budget_bytes
+            "BMS row-primary-hessian-cache n={n} r={r} bytes={} single_budget={} global_budget={}",
+            plan.bytes, plan.single_cache_budget_bytes, plan.global_pin_budget_bytes
         ));
         if log_exact_work(n) {
             log::info!(
-                "[BMS row-primary-hessian-cache] materialize start n={} r={} bytes={} workspace_existing_bytes={} budget_bytes={} policy_operator_budget_bytes={} runtime_available_bytes={} expected_reuse_passes={} materialized_row_hessian_evals={} streamed_row_hessian_evals={} reason={} gpu_policy={} gpu_selected={} gpu_reason={}",
+                "[BMS row-primary-hessian-cache] decision=materialize need_bytes={} avail_bytes={} workspace_pinned={} single_cache_budget={} global_pin_budget={} n={} r={} expected_reuse_passes={} materialized_row_hessian_evals={} streamed_row_hessian_evals={} reason={} gpu_policy={} gpu_selected={} gpu_reason={}",
+                plan.bytes,
+                plan.runtime_available_bytes,
+                plan.workspace_pinned_bytes,
+                plan.single_cache_budget_bytes,
+                plan.global_pin_budget_bytes,
                 n,
                 r,
-                plan.bytes,
-                plan.workspace_existing_bytes,
-                plan.budget_bytes,
-                plan.policy_operator_budget_bytes,
-                optional_bytes_for_log(plan.runtime_available_bytes),
                 plan.expected_reuse_passes,
                 plan.materialized_row_hessian_evals,
                 plan.streamed_row_hessian_evals,
@@ -8431,7 +8444,7 @@ impl BernoulliMarginalSlopeFamily {
             );
         }
         drop(heartbeat_guard);
-        Ok(Some(packed))
+        Ok(Some(RowPrimaryHessianPin::new(packed, plan.bytes)))
     }
 
     /// Look up the cached per-row primary Hessian (`r × r`) materialized at
@@ -8444,7 +8457,7 @@ impl BernoulliMarginalSlopeFamily {
         cache: &'a BernoulliMarginalSlopeExactEvalCache,
         row: usize,
     ) -> Option<ArrayView2<'a, f64>> {
-        let rows = cache.row_primary_hessians.as_ref()?;
+        let rows = cache.row_primary_hessians.as_ref()?.rows();
         let r = cache.primary.total;
         if row >= rows.nrows() {
             return None;
@@ -15711,7 +15724,12 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         }
         let hessian_started = std::time::Instant::now();
         let mut h = if let Some(workspace) = hessian_workspace.as_ref() {
-            workspace.hessian_dense()?.ok_or_else(|| {
+            // Outer batched-gradient assembly genuinely needs the dense
+            // joint Hessian (it pulls back `H_β` against an explicit factor),
+            // so bypass the workspace's matrix-free inner-route gate via
+            // `hessian_dense_forced` — that always materialises through the
+            // fused row pass instead of falling through to column-basis HVP.
+            workspace.hessian_dense_forced()?.ok_or_else(|| {
                 "bernoulli marginal-slope batched gradient requires dense exact joint Hessian below p=512"
                     .to_string()
             })?
@@ -16424,10 +16442,70 @@ impl BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
             })
             .clone()
     }
+
+    /// Matrix-free inner-Newton/CG route for BMS flex large-n.
+    ///
+    /// Auto-selected when the workspace's per-row primary Hessian cache could
+    /// not be materialized (`n*r*r*8 > row_primary_cache_budget`). In that
+    /// regime the dense joint-H build streams all `n` rows and pays the full
+    /// flex row-kernel cost per chunk plus a BLAS-3 design-matrix gram on top;
+    /// at biobank shape (n≈195k, p≈44) that pushes one dense build past 60s
+    /// while each HVP reuses the same row stream at ~gradient-pass cost (~3s).
+    /// PCG with the joint penalty preconditioner typically converges in a
+    /// handful of HVPs, so routing the inner solve through the operator path
+    /// beats per-cycle dense reassembly.
+    fn matrix_free_inner_route(&self) -> bool {
+        if self.cache.row_primary_hessians.is_some() {
+            return false;
+        }
+        match self.family.effective_flex_active(&self.block_states) {
+            Ok(true) => {}
+            _ => return false,
+        }
+        // Tiny problems should still take the dense path: a single dense build
+        // is cheaper than CG bookkeeping when row counts are small.
+        self.family.y.len() >= 16_384
+    }
 }
 
 impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
     fn hessian_dense(&self) -> Result<Option<Array2<f64>>, String> {
+        if self.cache.slices.total >= 512 {
+            return Ok(None);
+        }
+        if self.matrix_free_inner_route() {
+            // Route the inner-Newton solve through `hessian_matvec` /
+            // `hessian_diagonal`. Callers that strictly need a dense matrix
+            // (outer-Hessian assembly, logdet factor) reach the fused dense
+            // build through `hessian_dense_forced`.
+            if log_exact_work(self.family.y.len()) {
+                log::info!(
+                    "[BMS inner] route=matrix-free-CG n={} p={} primary_hessian_cache=false reason=flex+large-n",
+                    self.family.y.len(),
+                    self.cache.slices.total
+                );
+            }
+            return Ok(None);
+        }
+        if log_exact_work(self.family.y.len()) {
+            log::info!(
+                "[BMS inner] route=dense n={} p={} primary_hessian_cache={}",
+                self.family.y.len(),
+                self.cache.slices.total,
+                self.cache.row_primary_hessians.is_some()
+            );
+        }
+        self.fused_gradient_dense()
+            .map(|fused| Some(fused.hessian.clone()))
+    }
+
+    fn hessian_dense_forced(&self) -> Result<Option<Array2<f64>>, String> {
+        // Callers that genuinely require a dense joint Hessian (e.g. outer
+        // batched-gradient assembly that pulls back the dense `H_β`) bypass
+        // the matrix-free route gate above. The fused row pass is still the
+        // structural direct-dense path here — column-basis HVP fallback would
+        // be `total` extra row sweeps, which is exactly what the matrix-free
+        // inner solver is designed to amortize across far fewer iterations.
         if self.cache.slices.total >= 512 {
             return Ok(None);
         }
@@ -16444,11 +16522,14 @@ impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJoint
     fn joint_gradient_evaluation(
         &self,
     ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
-        if self.cache.slices.total < 512 {
+        if self.cache.slices.total < 512 && !self.matrix_free_inner_route() {
             // The only current consumer of workspace-side joint gradients is
             // the exact joint-Newton path. For bounded dense systems it will
             // request the dense Hessian in the same cycle, so build the fused
-            // row pass once and let `hessian_dense` reuse it.
+            // row pass once and let `hessian_dense` reuse it. When the
+            // matrix-free inner route is active, the inner solver will pull
+            // the Hessian through HVPs instead, so the gradient pass must
+            // stay gradient-only and not force a dense build.
             return self.fused_gradient_dense().map(|fused| {
                 Some(ExactNewtonJointGradientEvaluation {
                     log_likelihood: fused.gradient.log_likelihood,
@@ -18264,6 +18345,13 @@ pub fn fit_bernoulli_marginal_slope_terms(
     };
     let final_sigma_cell = std::cell::Cell::new(initial_sigma);
     let exact_warm_start = RefCell::new(None::<CustomFamilyWarmStart>);
+    // Outer ρ-cache β-seed staging slot. On a cache hit the spatial-joint
+    // optimizer invokes `seed_inner_beta_fn` before the first eval at the
+    // restored ρ: per-block column widths aren't known until the first
+    // `build_blocks(rho, …)` runs, so we stash the flat β here and the eval
+    // closures promote it into `exact_warm_start` (the slot the inner
+    // PIRLS / Newton solve actually consumes) on their first invocation.
+    let pending_beta_seed = RefCell::new(None::<Array1<f64>>);
     let hints = RefCell::new(ThetaHints::default());
     let score_warp_runtime = score_warp_prepared.as_ref().map(|p| p.runtime.clone());
     let link_dev_runtime = link_dev_prepared.as_ref().map(|p| p.runtime.clone());
@@ -18529,6 +18617,23 @@ pub fn fit_bernoulli_marginal_slope_terms(
             );
             let rho = theta.slice(s![..setup.rho_dim()]).to_owned();
             let blocks = build_blocks(&rho, &designs[0], &designs[1])?;
+            // Promote a staged β seed (deposited by the outer ρ-cache hit
+            // before any eval ran) into the family warm-start slot now that
+            // we know the per-block widths from the freshly built blocks.
+            if let Some(beta_seed) = pending_beta_seed.borrow_mut().take() {
+                let widths: Vec<usize> =
+                    blocks.iter().map(|b| b.design.ncols()).collect();
+                match CustomFamilyWarmStart::from_cached_beta(&widths, &beta_seed) {
+                    Ok(ws) => {
+                        exact_warm_start.replace(Some(ws));
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "[BMS] outer ρ-cache β-warm-start rejected: {e}; falling back to cold β"
+                        );
+                    }
+                }
+            }
             let sigma = sigma_from_theta(theta);
             final_sigma_cell.set(sigma);
             let family = make_family(&designs[0], &designs[1], sigma);
@@ -18569,6 +18674,20 @@ pub fn fit_bernoulli_marginal_slope_terms(
         |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
             let rho = theta.slice(s![..setup.rho_dim()]).to_owned();
             let blocks = build_blocks(&rho, &designs[0], &designs[1])?;
+            if let Some(beta_seed) = pending_beta_seed.borrow_mut().take() {
+                let widths: Vec<usize> =
+                    blocks.iter().map(|b| b.design.ncols()).collect();
+                match CustomFamilyWarmStart::from_cached_beta(&widths, &beta_seed) {
+                    Ok(ws) => {
+                        exact_warm_start.replace(Some(ws));
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "[BMS] outer ρ-cache β-warm-start rejected (efs): {e}; falling back to cold β"
+                        );
+                    }
+                }
+            }
             let sigma = sigma_from_theta(theta);
             final_sigma_cell.set(sigma);
             let family = make_family(&designs[0], &designs[1], sigma);
@@ -18588,6 +18707,15 @@ pub fn fit_bernoulli_marginal_slope_terms(
                 );
             }
             Ok(eval.efs_eval)
+        },
+        |beta: &Array1<f64>| {
+            if beta.iter().any(|v| !v.is_finite()) {
+                return Err(EstimationError::InvalidInput(
+                    "cached inner beta contains non-finite entries".to_string(),
+                ));
+            }
+            pending_beta_seed.replace(Some(beta.clone()));
+            Ok(())
         },
     )?;
 
@@ -27552,63 +27680,18 @@ mod tests {
 
     #[test]
     fn bernoulli_flex_row_primary_hessian_cache_policy_materializes_aou_shape() {
-        let policy = crate::resource::ResourcePolicy::default_library();
+        // AoU-shaped cache (~626 MiB) under a 16 GiB available-RAM budget:
+        // single-cache budget is 4 GiB and the global pin budget is 8 GiB, so
+        // even though the cache is hundreds of MiB it amortizes the build.
         let plan = decide_row_primary_hessian_cache(
             195_780,
             20,
-            &policy,
-            0,
             BMS_ROW_PRIMARY_HESSIAN_EXPECTED_REUSE_PASSES,
-            None,
+            16 * 1024 * 1024 * 1024,
+            0,
         );
         assert_eq!(plan.bytes, 626_496_000);
-        assert!(
-            plan.bytes > policy.max_single_materialization_bytes,
-            "test must cover the old fixed per-materialization cutoff"
-        );
-        assert!(
-            plan.materialize,
-            "AoU-sized row-primary Hessian cache should materialize under the default workspace budget"
-        );
-        assert_eq!(
-            plan.reason,
-            RowPrimaryHessianCacheReason::ReuseAmortizesBuild
-        );
-    }
-
-    #[test]
-    fn bernoulli_flex_row_primary_hessian_cache_policy_streams_when_workspace_budget_exceeded() {
-        let mut policy = crate::resource::ResourcePolicy::default_library();
-        policy.max_operator_cache_bytes = 384 * 1024 * 1024;
-        let plan = decide_row_primary_hessian_cache(
-            195_780,
-            20,
-            &policy,
-            0,
-            BMS_ROW_PRIMARY_HESSIAN_EXPECTED_REUSE_PASSES,
-            None,
-        );
-        assert!(!plan.materialize);
-        assert_eq!(
-            plan.reason,
-            RowPrimaryHessianCacheReason::WorkspaceBudgetExceeded
-        );
-    }
-
-    #[test]
-    fn bernoulli_flex_row_primary_hessian_cache_policy_uses_runtime_memory_budget() {
-        let mut policy = crate::resource::ResourcePolicy::default_library();
-        policy.max_operator_cache_bytes = 384 * 1024 * 1024;
-        let plan = decide_row_primary_hessian_cache(
-            195_780,
-            20,
-            &policy,
-            0,
-            BMS_ROW_PRIMARY_HESSIAN_EXPECTED_REUSE_PASSES,
-            Some(16 * 1024 * 1024 * 1024),
-        );
         assert!(plan.materialize);
-        assert_eq!(plan.budget_bytes, 2 * 1024 * 1024 * 1024);
         assert_eq!(
             plan.reason,
             RowPrimaryHessianCacheReason::ReuseAmortizesBuild
@@ -27616,27 +27699,45 @@ mod tests {
     }
 
     #[test]
-    fn bernoulli_flex_row_primary_hessian_cache_policy_respects_runtime_headroom() {
-        let policy = crate::resource::ResourcePolicy::default_library();
+    fn bernoulli_flex_row_primary_hessian_cache_policy_streams_when_single_cache_exceeds_ram() {
+        // 626 MiB cache vs. only 2 GiB available RAM → single-cache budget is
+        // 512 MiB and the build is rejected, falling back to streaming.
         let plan = decide_row_primary_hessian_cache(
             195_780,
             20,
-            &policy,
-            0,
             BMS_ROW_PRIMARY_HESSIAN_EXPECTED_REUSE_PASSES,
-            Some(900 * 1024 * 1024),
+            2 * 1024 * 1024 * 1024,
+            0,
         );
         assert!(!plan.materialize);
         assert_eq!(
             plan.reason,
-            RowPrimaryHessianCacheReason::RuntimeMemoryInsufficient
+            RowPrimaryHessianCacheReason::SingleCacheExceedsRamFraction
+        );
+    }
+
+    #[test]
+    fn bernoulli_flex_row_primary_hessian_cache_policy_streams_when_global_pin_exhausted() {
+        // 16 GiB available with 7.5 GiB already pinned: global pin budget is
+        // 8 GiB, so a 626 MiB new cache pushes total pinned over the cap.
+        let plan = decide_row_primary_hessian_cache(
+            195_780,
+            20,
+            BMS_ROW_PRIMARY_HESSIAN_EXPECTED_REUSE_PASSES,
+            16 * 1024 * 1024 * 1024,
+            (15 * 1024 * 1024 * 1024) / 2,
+        );
+        assert!(!plan.materialize);
+        assert_eq!(
+            plan.reason,
+            RowPrimaryHessianCacheReason::GlobalPinExceedsRamFraction
         );
     }
 
     #[test]
     fn bernoulli_flex_row_primary_hessian_cache_policy_streams_low_reuse() {
-        let policy = crate::resource::ResourcePolicy::default_library();
-        let plan = decide_row_primary_hessian_cache(100, 4, &policy, 0, 1, None);
+        let plan =
+            decide_row_primary_hessian_cache(100, 4, 1, 16 * 1024 * 1024 * 1024, 0);
         assert!(!plan.materialize);
         assert_eq!(plan.reason, RowPrimaryHessianCacheReason::ReuseTooLow);
     }
