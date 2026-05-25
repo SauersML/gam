@@ -219,6 +219,100 @@ fn selected_uncertainty_backend<'a>(
     }
 }
 
+/// Source of posterior covariance for uncertainty prediction.
+///
+/// Implemented for `UnifiedFitResult` (which can supply smoothing-corrected
+/// covariance, fitted link state, frequentist bias correction, and dispersion
+/// for observation intervals) and for a bare `Array2<f64>` covariance (which
+/// is used directly without any of those refinements). The `Array2` impl lets
+/// callers run [`predict_gamwith_uncertainty`] for standard families without
+/// constructing a full fit container, which is essential for unit testing,
+/// generic prediction libraries, and applications that only retain the
+/// posterior covariance.
+pub trait UncertaintyCovarianceSource {
+    /// Build a [`PredictionCovarianceBackend`] satisfying the requested
+    /// covariance mode (or an error if the source cannot honor it). The
+    /// returned bool reports whether the smoothing-corrected covariance was
+    /// actually used (always `false` for raw `Array2` sources).
+    fn select_uncertainty_backend(
+        &self,
+        expected_dim: usize,
+        mode: InferenceCovarianceMode,
+        label: &str,
+    ) -> Result<(PredictionCovarianceBackend<'_>, bool), EstimationError>;
+    /// Optional fitted adaptive-link state (SAS / BetaLogistic / Mixture /
+    /// latent cloglog). Standard links and raw covariance sources return
+    /// `None` and are handled with the family's own `InverseLink`.
+    fn resolved_fitted_link_state(
+        &self,
+        _family: &LikelihoodSpec,
+    ) -> Option<FittedLinkState> {
+        None
+    }
+    /// Optional first-order bias-correction shift `H⁻¹ S(λ̂) β̂` applied to
+    /// the linear predictor when `options.apply_bias_correction` is set.
+    fn resolved_bias_correction_beta(&self) -> Option<ArrayView1<'_, f64>> {
+        None
+    }
+    /// Gaussian residual standard deviation used to widen observation
+    /// intervals for `ResponseFamily::Gaussian`. Raw-covariance sources
+    /// report `0.0`, which collapses the observation interval to the mean
+    /// interval (the only safe default when no dispersion is available).
+    fn observation_standard_deviation(&self) -> f64 {
+        0.0
+    }
+    /// Fixed dispersion `φ` used to widen observation intervals for
+    /// dispersion-bearing families (Tweedie, Gamma). Raw-covariance sources
+    /// return `None`, which falls back to `φ = 1.0`.
+    fn observation_phi(&self) -> Option<f64> {
+        None
+    }
+}
+
+impl UncertaintyCovarianceSource for UnifiedFitResult {
+    fn select_uncertainty_backend(
+        &self,
+        expected_dim: usize,
+        mode: InferenceCovarianceMode,
+        label: &str,
+    ) -> Result<(PredictionCovarianceBackend<'_>, bool), EstimationError> {
+        selected_uncertainty_backend(self, expected_dim, mode, label)
+    }
+    fn resolved_fitted_link_state(
+        &self,
+        family: &LikelihoodSpec,
+    ) -> Option<FittedLinkState> {
+        UnifiedFitResult::fitted_link_state(self, family).ok()
+    }
+    fn resolved_bias_correction_beta(&self) -> Option<ArrayView1<'_, f64>> {
+        UnifiedFitResult::bias_correction_beta(self).map(|b| b.view())
+    }
+    fn observation_standard_deviation(&self) -> f64 {
+        self.standard_deviation
+    }
+    fn observation_phi(&self) -> Option<f64> {
+        self.likelihood_scale.fixed_phi()
+    }
+}
+
+impl UncertaintyCovarianceSource for Array2<f64> {
+    fn select_uncertainty_backend(
+        &self,
+        expected_dim: usize,
+        _mode: InferenceCovarianceMode,
+        label: &str,
+    ) -> Result<(PredictionCovarianceBackend<'_>, bool), EstimationError> {
+        if self.nrows() != expected_dim || self.ncols() != expected_dim {
+            return Err(EstimationError::InvalidInput(format!(
+                "{label}: covariance dimension mismatch: expected {expected_dim}x{expected_dim}, got {}x{}",
+                self.nrows(),
+                self.ncols()
+            )));
+        }
+        Ok((PredictionCovarianceBackend::from_dense(self.view()), false))
+    }
+}
+
 /// Symmetric quadratic form `g' · C · g` for an SPD posterior covariance `C`.
 ///
 /// Math-equivalent to the naïve double loop, but exploits symmetry of `C`:
@@ -4906,16 +5000,17 @@ where
 /// Exact analytic representation (Mellin-Barnes) for I(λ):
 ///   I(λ) = (1/(2πi)) ∫_{c-i∞}^{c+i∞} Γ(z) λ^{-z} exp(-μ z + 0.5 σ² z²) dz, c>0.
 /// This Mellin-Barnes integral is mathematically exact.
-pub fn predict_gamwith_uncertainty<X>(
+pub fn predict_gamwith_uncertainty<X, S>(
     x: X,
     beta: ArrayView1<'_, f64>,
     offset: ArrayView1<'_, f64>,
     family: LikelihoodSpec,
-    fit: &UnifiedFitResult,
+    source: &S,
     options: &PredictUncertaintyOptions,
 ) -> Result<PredictUncertaintyResult, EstimationError>
 where
     X: Into<DesignMatrix>,
+    S: UncertaintyCovarianceSource + ?Sized,
 {
     let x = x.into();
     if x.ncols() != beta.len() {
