@@ -175,11 +175,11 @@ mod tests {
         assert_eq!(comparison.winner, "higher");
         assert_eq!(comparison.ranking[0].delta, 0.0);
         assert_eq!(comparison.ranking[0].bayes_factor, 1.0);
-        assert_eq!(comparison.ranking[1].delta, 3.0);
-        assert!((comparison.ranking[1].bayes_factor - 3.0_f64.exp()).abs() < 1e-12);
-        assert_eq!(comparison.score_table[1].delta_reml, 3.0);
+        assert_eq!(comparison.ranking[1].delta, -3.0);
+        assert!((comparison.ranking[1].bayes_factor - (-3.0_f64).exp()).abs() < 1e-12);
+        assert_eq!(comparison.score_table[1].delta_reml, -3.0);
         assert!(
-            (comparison.score_table[1].bayes_factor_best_over_model - 3.0_f64.exp()).abs()
+            (comparison.score_table[1].bayes_factor_vs_best - (-3.0_f64).exp()).abs()
                 < 1e-12
         );
     }

@@ -1468,6 +1468,53 @@ mod tests {
     }
 
     #[test]
+    fn test_overlapping_ridge_ignores_inactive_lambda_for_structural_nullity() {
+        let ridge = 1e-4_f64;
+        let penalties = [
+            crate::construction::CanonicalPenalty {
+                root: array![[1.0, 0.0]],
+                col_range: 0..2,
+                total_dim: 3,
+                nullity: 1,
+                local: array![[1.0, 0.0], [0.0, 0.0]],
+                prior_mean: Array1::zeros(2),
+                positive_eigenvalues: vec![1.0],
+                op: None,
+            },
+            crate::construction::CanonicalPenalty {
+                root: array![[1.0, 0.0]],
+                col_range: 1..3,
+                total_dim: 3,
+                nullity: 1,
+                local: array![[1.0, 0.0], [0.0, 0.0]],
+                prior_mean: Array1::zeros(2),
+                positive_eigenvalues: vec![1.0],
+                op: None,
+            },
+        ];
+
+        let overlapping = PenaltyPseudologdet::from_penalties(&penalties, &[1.0, 0.0], ridge, 3)
+            .expect("overlapping pseudo-logdet");
+        let assembled = PenaltyPseudologdet::from_assembled_with_nullity(
+            array![
+                [1.0 + ridge, 0.0, 0.0],
+                [0.0, ridge, 0.0],
+                [0.0, 0.0, ridge],
+            ],
+            Some(2),
+        )
+        .expect("assembled pseudo-logdet with active structural nullity");
+
+        assert_eq!(overlapping.rank(), assembled.rank());
+        assert!(
+            (overlapping.value() - assembled.value()).abs() < 1e-12,
+            "inactive overlapping lambda leaked into structural nullity: overlap={}, assembled={}",
+            overlapping.value(),
+            assembled.value()
+        );
+    }
+
+    #[test]
     fn test_block_factored_rho_derivatives_match_dense_without_cross_block_work() {
         let p_total = 6;
         let lambdas = [1.7_f64, 0.4_f64, 2.3_f64];

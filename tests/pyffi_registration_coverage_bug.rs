@@ -36,13 +36,33 @@ fn pyffi_every_pyfunction_is_registered_once() {
     let module_start = src.find("fn rust_extension").expect("pymodule init");
     let test_start = src.find("#[cfg(test)]").expect("test module");
     let mod_src = &src[module_start..test_start];
+    // Find every `wrap_pyfunction!(...)` invocation. The first identifier inside
+    // the parentheses is the registered Rust function. Walk character-by-character
+    // so that whitespace / newlines between `wrap_pyfunction!(` and the function
+    // name (rustfmt loves to split these) do not hide the registration.
+    let needle = "wrap_pyfunction!(";
     let mut regs = Vec::new();
-    for line in mod_src.lines() {
-        if let Some(idx) = line.find("wrap_pyfunction!(") {
-            let tail = &line[idx + "wrap_pyfunction!(".len()..];
-            let name = tail.split(',').next().unwrap().trim().to_string();
-            regs.push(name);
+    let bytes = mod_src.as_bytes();
+    let mut search_from = 0usize;
+    while let Some(off) = mod_src[search_from..].find(needle) {
+        let abs = search_from + off + needle.len();
+        let mut k = abs;
+        while k < bytes.len() && (bytes[k] as char).is_whitespace() {
+            k += 1;
         }
+        let start = k;
+        while k < bytes.len() {
+            let c = bytes[k] as char;
+            if c.is_ascii_alphanumeric() || c == '_' {
+                k += 1;
+            } else {
+                break;
+            }
+        }
+        if k > start {
+            regs.push(mod_src[start..k].to_string());
+        }
+        search_from = abs;
     }
 
     let regs_set: BTreeSet<String> = regs.iter().cloned().collect();
