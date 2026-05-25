@@ -27422,6 +27422,43 @@ mod tests {
     }
 
     #[test]
+    fn projected_stationarity_vector_uses_penalized_residual_not_raw_score() {
+        let spec = ParameterBlockSpec {
+            name: "score-cancellation".to_string(),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
+                [1.0, 0.0],
+                [0.0, 1.0]
+            ])),
+            offset: array![0.0, 0.0],
+            penalties: Vec::new(),
+            nullspace_dims: Vec::new(),
+            initial_log_lambdas: Array1::zeros(0),
+            initial_beta: None,
+        };
+        let state = ParameterBlockState {
+            beta: array![10.0, -4.0],
+            eta: array![10.0, -4.0],
+        };
+        let s_lambda = array![[2.0, 0.0], [0.0, 3.0]];
+        let gradient = array![19.5, -12.25];
+
+        let residual = exact_newton_joint_projected_stationarity_vector_from_gradient(
+            &gradient,
+            std::slice::from_ref(&state),
+            std::slice::from_ref(&spec),
+            std::slice::from_ref(&s_lambda),
+            0.0,
+            RidgePolicy::explicit_stabilization_full(),
+            &[None],
+            None,
+        )
+        .expect("projected stationarity residual should assemble");
+
+        assert_relative_eq!(residual[0], 0.5, epsilon = 1e-12);
+        assert_relative_eq!(residual[1], 0.25, epsilon = 1e-12);
+    }
+
+    #[test]
     fn zero_psi_derivative_operator_acts_as_zero_map() {
         let n = 17usize;
         let p = 5usize;
