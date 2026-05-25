@@ -7,7 +7,23 @@ class _FakeRustModule:
     def __init__(self):
         self.basis_snapshots = []
 
-    def sae_manifold_fit(self, *args, **kwargs):
+    def periodic_basis_with_jet(self, t, n_harmonics):
+        x = np.asarray(t, dtype=float)
+        columns = [np.ones_like(x)]
+        jacobian_columns = [np.zeros_like(x)]
+        penalties = [0.0]
+        for harmonic in range(1, int(n_harmonics) + 1):
+            omega = 2.0 * np.pi * harmonic
+            columns.extend([np.cos(omega * x), np.sin(omega * x)])
+            jacobian_columns.extend([-omega * np.sin(omega * x), omega * np.cos(omega * x)])
+            penalties.extend([omega**4, omega**4])
+        phi = np.stack(columns, axis=1)
+        jet = np.stack(jacobian_columns, axis=1)[:, :, None]
+        penalty = np.diag(penalties)
+        return phi, jet, penalty
+
+    def sae_manifold_fit(self, *args, assignment_kind=None, **kwargs):
+        assert assignment_kind == "ibp_map"
         return self.sae_manifold_fit_ibp(*args, **kwargs)
 
     def sae_manifold_fit_ibp(
