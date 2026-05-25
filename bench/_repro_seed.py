@@ -1,45 +1,56 @@
 #!/usr/bin/env python3
-"""Reproduce a single fuzz seed: emit train/test CSVs + rust + mgcv formulas + a small mgcv diag script.
+"""Reproduce a single fuzz seed: emit train/test CSVs and formula metadata.
 
 Usage: python bench/_repro_seed.py <seed> [outdir]
 """
-import sys
 import json
+import sys
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+BENCH_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(BENCH_DIR))
 from fuzz_vs_mgcv import (
-    generate_scenario, generate_data,
-    rust_mean_formula,
+    generate_data,
+    generate_scenario,
     mgcv_formula,
+    rust_mean_formula,
 )
 
-seed = int(sys.argv[1])
-outdir = Path(sys.argv[2]) if len(sys.argv) > 2 else Path(f"/tmp/fuzz_seed_{seed}")
-outdir.mkdir(parents=True, exist_ok=True)
 
-sc = generate_scenario(seed)
-print("scenario:", sc)
-print("rust_mean_formula:", rust_mean_formula([f"x{i}" for i in range(sc.n_smooths)], sc))
-print("mgcv_formula     :", mgcv_formula([f"x{i}" for i in range(sc.n_smooths)], sc))
+def main() -> None:
+    seed = int(sys.argv[1])
+    outdir = Path(sys.argv[2]) if len(sys.argv) > 2 else Path(f"/tmp/fuzz_seed_{seed}")
+    outdir.mkdir(parents=True, exist_ok=True)
 
-train_df, test_df, cols = generate_data(sc)
-train_csv = outdir / "train.csv"
-test_csv = outdir / "test.csv"
-train_df.to_csv(train_csv, index=False)
-test_df.to_csv(test_csv, index=False)
+    sc = generate_scenario(seed)
+    train_df, test_df, cols = generate_data(sc)
+    rust_formula = rust_mean_formula(cols, sc)
+    mgcv_formula_text = mgcv_formula(cols, sc)
 
-print("cols:", cols)
-print("train_csv:", train_csv, "n_train=", len(train_df))
-print("test_csv :", test_csv,  "n_test =", len(test_df))
+    train_csv = outdir / "train.csv"
+    test_csv = outdir / "test.csv"
+    train_df.to_csv(train_csv, index=False)
+    test_df.to_csv(test_csv, index=False)
 
-scenario_json = outdir / "scenario.json"
-with open(scenario_json, "w") as f:
-    json.dump({
+    print("scenario:", sc)
+    print("rust_mean_formula:", rust_formula)
+    print("mgcv_formula     :", mgcv_formula_text)
+    print("cols:", cols)
+    print("train_csv:", train_csv, "n_train=", len(train_df))
+    print("test_csv :", test_csv, "n_test =", len(test_df))
+
+    scenario_json = outdir / "scenario.json"
+    payload = {
         "seed": seed,
         "scenario": sc.__dict__,
         "cols": cols,
-        "rust_formula": rust_mean_formula(cols, sc),
-        "mgcv_formula": mgcv_formula(cols, sc),
-    }, f, indent=2, default=str)
-print("scenario_json:", scenario_json)
+        "rust_formula": rust_formula,
+        "mgcv_formula": mgcv_formula_text,
+    }
+    with open(scenario_json, "w") as f:
+        json.dump(payload, f, indent=2, default=str)
+    print("scenario_json:", scenario_json)
+
+
+if __name__ == "__main__":
+    main()
