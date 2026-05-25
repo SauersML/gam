@@ -400,6 +400,15 @@ impl WarmStartStore {
             fs::remove_file(&meta_tmp).ok();
             return Err(StoreError::Io(e));
         }
+        // Fsync the containing directory so the rename itself is durable
+        // across a power loss / hard crash. fs::File::sync_all on the
+        // payload only guarantees the file content reaches disk; without
+        // also fsyncing the directory inode, the *rename* (which is what
+        // makes the entry visible to lookups) can be lost. Best-effort on
+        // platforms where opening a directory for fsync is not supported.
+        if let Ok(d) = fs::File::open(&dir) {
+            d.sync_all().ok();
+        }
         // 5. Best-effort eviction; failure here is non-fatal. Throttle the
         // full directory scan: maintain a process-wide approximate byte
         // total and only run eviction when the total may have exceeded the

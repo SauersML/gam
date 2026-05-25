@@ -7884,7 +7884,6 @@ impl CustomFamily for GaussianLocationScaleFamily {
             .par_iter()
             .map(|row| {
                 let i = row.index;
-<<<<<<< Updated upstream
                 let wi = self.weights[i];
                 if wi == 0.0 {
                     return 0.0;
@@ -7895,19 +7894,6 @@ impl CustomFamily for GaussianLocationScaleFamily {
                 row.weight * wi * (-0.5 * (r * r * inv_s2 + ln2pi + 2.0 * sigma_i.ln()))
             })
             .sum();
-=======
-                let wi = w_view[i];
-                if wi == 0.0 {
-                    return 0.0;
-                }
-                let sigma_i = logb_sigma_from_eta_scalar(ls_view[i]);
-                let inv_s2 = (sigma_i * sigma_i).recip();
-                let r = y_view[i] - mu_view[i];
-                row.weight * wi * (-0.5 * (r * r * inv_s2 + ln2pi + 2.0 * sigma_i.ln()))
-            })
-            .sum();
-        let _ = n;
->>>>>>> Stashed changes
         Ok(ll)
     }
 
