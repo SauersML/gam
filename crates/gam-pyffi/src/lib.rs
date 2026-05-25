@@ -388,6 +388,20 @@ struct SurvivalPredictionPayload {
     eta_se: Option<Vec<f64>>,
 }
 
+#[derive(Deserialize)]
+struct SurvivalPredictionJsonPayload {
+    class: String,
+    model_class: Option<String>,
+    times: Option<Vec<f64>>,
+    hazard: Option<Vec<Vec<f64>>>,
+    survival: Option<Vec<Vec<f64>>>,
+    cumulative_hazard: Option<Vec<Vec<f64>>>,
+    linear_predictor: Option<Vec<f64>>,
+    columns: Option<BTreeMap<String, Vec<f64>>>,
+    survival_se: Option<Vec<Vec<f64>>>,
+    eta_se: Option<Vec<f64>>,
+}
+
 #[derive(Serialize)]
 struct ValidationPayload {
     formula: String,
@@ -15456,120 +15470,6 @@ impl OrthogonalityPenalty {
     }
 }
 
-#[pyclass(module = "gam_pyffi._rust", name = "NuclearNormPenalty")]
-struct NuclearNormPenalty {
-    #[pyo3(get, set)]
-    target: PyObject,
-    #[pyo3(get, set)]
-    weight: f64,
-    #[pyo3(get, set)]
-    n_eff: i64,
-    #[pyo3(get, set)]
-    smoothing_eps: f64,
-    #[pyo3(get, set)]
-    max_rank: Option<i64>,
-    #[pyo3(get, set)]
-    learnable: bool,
-    #[pyo3(get, set)]
-    weight_schedule: Option<PyObject>,
-}
-
-#[pymethods]
-impl NuclearNormPenalty {
-    #[new]
-    #[pyo3(signature = (weight, n_eff, smoothing_eps = 1.0e-6, max_rank = None, learnable = false, *, target = "t"))]
-    fn new(
-        weight: f64,
-        n_eff: &Bound<'_, PyAny>,
-        smoothing_eps: f64,
-        max_rank: Option<&Bound<'_, PyAny>>,
-        learnable: bool,
-        target: PyObject,
-    ) -> PyResult<Self> {
-        let n_eff = n_eff.call_method0("__index__")?.extract::<i64>()?;
-        let max_rank = match max_rank {
-            Some(rank) => Some(rank.call_method0("__index__")?.extract::<i64>()?),
-            None => None,
-        };
-        if weight <= 0.0 {
-            return Err(PyValueError::new_err(format!(
-                "NuclearNormPenalty.weight must be > 0, got {weight}"
-            )));
-        }
-        if n_eff <= 0 {
-            return Err(PyValueError::new_err(format!(
-                "NuclearNormPenalty.n_eff must be > 0, got {n_eff}"
-            )));
-        }
-        if smoothing_eps <= 0.0 {
-            return Err(PyValueError::new_err(format!(
-                "NuclearNormPenalty.smoothing_eps must be > 0, got {smoothing_eps}"
-            )));
-        }
-        if let Some(rank) = max_rank {
-            if rank <= 0 {
-                return Err(PyValueError::new_err(format!(
-                    "NuclearNormPenalty.max_rank must be > 0, got {rank}"
-                )));
-            }
-        }
-        Ok(Self {
-            target,
-            weight,
-            n_eff,
-            smoothing_eps,
-            max_rank,
-            learnable,
-            weight_schedule: None,
-        })
-    }
-
-    #[classattr]
-    const KIND_TAG: &'static str = "nuclear_norm";
-
-    fn to_rust_descriptor(&self, py: Python<'_>) -> PyResult<PyObject> {
-        let payload = PyDict::new(py);
-        payload.set_item("kind", Self::KIND_TAG)?;
-        payload.set_item("target", target_descriptor(py, self.target.bind(py))?)?;
-        payload.set_item("weight", self.weight)?;
-        payload.set_item("n_eff", self.n_eff)?;
-        payload.set_item("smoothing_eps", self.smoothing_eps)?;
-        payload.set_item("max_rank", self.max_rank)?;
-        payload.set_item("learnable", self.learnable)?;
-        if let Some(schedule) = topk_weight_schedule_descriptor(py, &self.weight_schedule)? {
-            payload.set_item("weight_schedule", schedule)?;
-        }
-        Ok(payload.into())
-    }
-
-    fn set_weight_schedule<'py>(
-        mut slf: PyRefMut<'py, Self>,
-        schedule: PyObject,
-    ) -> PyRefMut<'py, Self> {
-        slf.weight_schedule = Some(schedule);
-        slf
-    }
-
-    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
-        Ok(format!(
-            "NuclearNormPenalty(weight={}, n_eff={}, smoothing_eps={}, max_rank={}, learnable={}, target={}, weight_schedule={})",
-            self.weight,
-            self.n_eff,
-            self.smoothing_eps,
-            match self.max_rank {
-                Some(rank) => rank.to_string(),
-                None => "None".to_string(),
-            },
-            self.learnable,
-            py_repr(py, self.target.bind(py))?,
-            match &self.weight_schedule {
-                Some(schedule) => py_repr(py, schedule.bind(py))?,
-                None => "None".to_string(),
-            }
-        ))
-    }
-}
-
 #[pyclass(module = "gam_pyffi._rust", name = "ScadMcpPenalty")]
 struct ScadMcpPenalty {
     #[pyo3(get, set)]
@@ -15712,6 +15612,153 @@ impl ScadMcpPenalty {
         }
         Ok(())
     }
+}
+
+#[pyclass(module = "gam_pyffi._rust", name = "IvaeRidgeMeanGauge")]
+struct IvaeRidgeMeanGauge {
+    #[pyo3(get, set)]
+    target: PyObject,
+    #[pyo3(get, set)]
+    aux: PyObject,
+    #[pyo3(get, set)]
+    ridge_eps: f64,
+    #[pyo3(get, set)]
+    weight: f64,
+    #[pyo3(get, set)]
+    n_eff: i64,
+    #[pyo3(get, set)]
+    learnable: bool,
+    #[pyo3(get, set)]
+    weight_schedule: Option<PyObject>,
+}
+
+#[pymethods]
+impl IvaeRidgeMeanGauge {
+    #[new]
+    #[pyo3(signature = (aux, weight, n_eff, ridge_eps = 1.0e-6, learnable = false, *, target = "t"))]
+    fn new(
+        py: Python<'_>,
+        aux: &Bound<'_, PyAny>,
+        weight: f64,
+        n_eff: i64,
+        ridge_eps: f64,
+        learnable: bool,
+        target: PyObject,
+    ) -> PyResult<Self> {
+        let aux = aux_conditional_prior_float_array(py, aux)?;
+        validate_ivae_ridge_mean_gauge_aux(&aux, weight, n_eff, ridge_eps)?;
+        Ok(Self {
+            target,
+            aux: aux.unbind(),
+            ridge_eps,
+            weight,
+            n_eff,
+            learnable,
+            weight_schedule: None,
+        })
+    }
+
+    #[classattr]
+    const KIND_TAG: &'static str = "ivae_ridge_mean_gauge";
+
+    fn to_rust_descriptor(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let payload = PyDict::new(py);
+        payload.set_item("kind", Self::KIND_TAG)?;
+        payload.set_item("target", target_descriptor(py, self.target.bind(py))?)?;
+
+        let aux = aux_conditional_prior_float_array(py, self.aux.bind(py))?;
+        let array = aux.extract::<PyReadonlyArrayDyn<'_, f64>>()?;
+        let view = array.as_array();
+        payload.set_item(
+            "aux",
+            PyList::new(py, view.iter().copied().collect::<Vec<_>>())?,
+        )?;
+        payload.set_item("aux_shape", PyList::new(py, view.shape())?)?;
+        payload.set_item("ridge_eps", self.ridge_eps)?;
+        payload.set_item("weight", self.weight)?;
+        payload.set_item("n_eff", self.n_eff)?;
+        payload.set_item("learnable", self.learnable)?;
+        if let Some(schedule) = topk_weight_schedule_descriptor(py, &self.weight_schedule)? {
+            payload.set_item("weight_schedule", schedule)?;
+        }
+        Ok(payload.into())
+    }
+
+    fn set_weight_schedule<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        schedule: PyObject,
+    ) -> PyRefMut<'py, Self> {
+        slf.weight_schedule = Some(schedule);
+        slf
+    }
+
+    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        Ok(format!(
+            "IvaeRidgeMeanGauge(aux={}, weight={}, n_eff={}, ridge_eps={}, learnable={}, target={}, weight_schedule={})",
+            py_repr(py, self.aux.bind(py))?,
+            self.weight,
+            self.n_eff,
+            self.ridge_eps,
+            self.learnable,
+            py_repr(py, self.target.bind(py))?,
+            match &self.weight_schedule {
+                Some(schedule) => py_repr(py, schedule.bind(py))?,
+                None => "None".to_string(),
+            }
+        ))
+    }
+}
+
+fn validate_ivae_ridge_mean_gauge_aux(
+    aux: &Bound<'_, PyAny>,
+    weight: f64,
+    n_eff: i64,
+    ridge_eps: f64,
+) -> PyResult<()> {
+    if weight <= 0.0 {
+        return Err(PyValueError::new_err(format!(
+            "IvaeRidgeMeanGauge.weight must be > 0, got {weight}"
+        )));
+    }
+    if n_eff <= 0 {
+        return Err(PyValueError::new_err(format!(
+            "IvaeRidgeMeanGauge.n_eff must be > 0, got {n_eff}"
+        )));
+    }
+    if !ridge_eps.is_finite() || ridge_eps <= 0.0 {
+        return Err(PyValueError::new_err(format!(
+            "IvaeRidgeMeanGauge.ridge_eps must be finite and > 0, got {ridge_eps}"
+        )));
+    }
+
+    let array = aux.extract::<PyReadonlyArrayDyn<'_, f64>>()?;
+    let view = array.as_array();
+    let shape = view.shape();
+    if view.ndim() != 2 {
+        return Err(PyValueError::new_err(format!(
+            "IvaeRidgeMeanGauge.aux must have shape (N, q), got ndim={}",
+            view.ndim()
+        )));
+    }
+
+    let n_obs = shape[0];
+    let aux_dim = shape[1];
+    if n_obs as i64 != n_eff {
+        return Err(PyValueError::new_err(format!(
+            "IvaeRidgeMeanGauge.aux first dimension must equal n_eff={n_eff}, got {n_obs}"
+        )));
+    }
+    if aux_dim == 0 {
+        return Err(PyValueError::new_err(
+            "IvaeRidgeMeanGauge.aux must have q > 0",
+        ));
+    }
+    if !view.iter().all(|value| value.is_finite()) {
+        return Err(PyValueError::new_err(
+            "IvaeRidgeMeanGauge.aux must be finite",
+        ));
+    }
+    Ok(())
 }
 
 #[pymodule(name = "_rust", gil_used = false)]
