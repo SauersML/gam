@@ -145,25 +145,35 @@ class SparsityConfig:
 class DecoderConfig:
     """Decoder regularizer config.
 
-    Only ``ortho_weight`` is wired today (routed through the Rust
-    ``block_orthogonality`` analytic penalty). ``monotonicity_weight`` is
-    accepted but unused — see module docstring 'Deferred' section.
+    Both ``ortho_weight`` (Rust ``block_orthogonality``) and
+    ``monotonicity_weight`` (Rust ``monotonicity``) route through the
+    analytic-penalty descriptor surface.
     """
 
     ortho_weight: float = 0.0
     monotonicity_weight: float = 0.0
-
-    monotonicity_supported: bool = False
+    monotonicity_direction: float = 1.0
+    monotonicity_smoothing_eps: float = 1.0e-3
 
     def __post_init__(self) -> None:
         if self.ortho_weight < 0.0:
             raise ValueError("DecoderConfig.ortho_weight must be >= 0")
         if self.monotonicity_weight < 0.0:
             raise ValueError("DecoderConfig.monotonicity_weight must be >= 0")
+        if not (math.isfinite(self.monotonicity_direction) and self.monotonicity_direction != 0.0):
+            raise ValueError(
+                "DecoderConfig.monotonicity_direction must be finite and non-zero"
+            )
+        if not (
+            math.isfinite(self.monotonicity_smoothing_eps)
+            and self.monotonicity_smoothing_eps > 0.0
+        ):
+            raise ValueError("DecoderConfig.monotonicity_smoothing_eps must be > 0")
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "DecoderConfig":
         data = dict(payload)
+        # Legacy field kept for backward compatibility with earlier dict payloads.
         data.pop("monotonicity_supported", None)
         return cls(**data)
 

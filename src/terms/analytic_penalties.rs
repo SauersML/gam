@@ -1762,18 +1762,42 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
 
     fn grad_target(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> Array1<f64> {
         let alpha = self.resolved_alpha(rho);
+        let a = alpha / self.k_max as f64;
         let tau = self.concrete_temperature();
         let z = self.concrete_logits(target);
         let pi = self.pi_map(z.view(), alpha);
         let n = z.len() / self.k_max;
+        let denom = (n as f64 + a - 1.0).max(1.0e-9);
         let mut out = Array1::<f64>::zeros(target.len());
+        let mut active_mass = Array1::<f64>::zeros(self.k_max);
+        for row in 0..n {
+            let start = row * self.k_max;
+            for k in 0..self.k_max {
+                active_mass[k] += z[start + k];
+            }
+        }
+        let mut pi_score = Array1::<f64>::zeros(self.k_max);
+        let mut pi_jac = Array1::<f64>::zeros(self.k_max);
+        for k in 0..self.k_max {
+            let pk = pi[k].clamp(1.0e-12, 1.0 - 1.0e-12);
+            let mass = active_mass[k];
+            let raw = (mass + a - 1.0) / denom;
+            if raw > 1.0e-9 && raw < 1.0 - 1.0e-9 {
+                pi_jac[k] = 1.0 / denom;
+            }
+            let bce_pi_score = -mass / pk + (n as f64 - mass) / (1.0 - pk);
+            let beta_pi_score = -(a - 1.0) / pk;
+            pi_score[k] = bce_pi_score + beta_pi_score;
+        }
         for row in 0..n {
             let start = row * self.k_max;
             for k in 0..self.k_max {
                 let zk = z[start + k];
                 let pk = pi[k].clamp(1.0e-12, 1.0 - 1.0e-12);
-                let d_p_d_z = ((1.0 - pk) / pk).ln();
-                out[start + k] = self.weight * d_p_d_z * zk * (1.0 - zk) / tau;
+                let direct_z_score = ((1.0 - pk) / pk).ln();
+                let implicit_pi_score = pi_score[k] * pi_jac[k];
+                out[start + k] =
+                    self.weight * (direct_z_score + implicit_pi_score) * zk * (1.0 - zk) / tau;
             }
         }
         out
@@ -1785,20 +1809,55 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
         rho: ArrayView1<'_, f64>,
     ) -> Option<Array1<f64>> {
         let alpha = self.resolved_alpha(rho);
+        let a = alpha / self.k_max as f64;
         let tau = self.concrete_temperature();
         let z = self.concrete_logits(target);
         let pi = self.pi_map(z.view(), alpha);
         let n = z.len() / self.k_max;
         let mut out = Array1::<f64>::zeros(target.len());
         let inv_tau2 = 1.0 / (tau * tau);
+        let denom = (n as f64 + a - 1.0).max(1.0e-9);
+        let mut active_mass = Array1::<f64>::zeros(self.k_max);
+        for row in 0..n {
+            let start = row * self.k_max;
+            for k in 0..self.k_max {
+                active_mass[k] += z[start + k];
+            }
+        }
+        let mut pi_score = Array1::<f64>::zeros(self.k_max);
+        let mut pi_score_derivative = Array1::<f64>::zeros(self.k_max);
+        let mut pi_jac = Array1::<f64>::zeros(self.k_max);
+        for k in 0..self.k_max {
+            let pk = pi[k].clamp(1.0e-12, 1.0 - 1.0e-12);
+            let mass = active_mass[k];
+            let raw = (mass + a - 1.0) / denom;
+            if raw > 1.0e-9 && raw < 1.0 - 1.0e-9 {
+                pi_jac[k] = 1.0 / denom;
+            }
+            let bce_pi_score = -mass / pk + (n as f64 - mass) / (1.0 - pk);
+            let beta_pi_score = -(a - 1.0) / pk;
+            pi_score[k] = bce_pi_score + beta_pi_score;
+            pi_score_derivative[k] = -1.0 / pk
+                + (mass + a - 1.0) * pi_jac[k] / (pk * pk)
+                - 1.0 / (1.0 - pk)
+                + (n as f64 - mass) * pi_jac[k] / ((1.0 - pk) * (1.0 - pk));
+        }
         for row in 0..n {
             let start = row * self.k_max;
             for k in 0..self.k_max {
                 let zk = z[start + k];
                 let pk = pi[k].clamp(1.0e-12, 1.0 - 1.0e-12);
-                let d_p_d_z = ((1.0 - pk) / pk).ln();
-                out[start + k] =
-                    self.weight * d_p_d_z * zk * (1.0 - zk) * (1.0 - 2.0 * zk) * inv_tau2;
+                let direct_z_score = ((1.0 - pk) / pk).ln();
+                let implicit_pi_score = pi_score[k] * pi_jac[k];
+                let score = direct_z_score + implicit_pi_score;
+                let direct_z_score_derivative =
+                    pi_jac[k] * (-1.0 / pk - 1.0 / (1.0 - pk));
+                let score_derivative =
+                    direct_z_score_derivative + pi_score_derivative[k] * pi_jac[k];
+                let z_jac = zk * (1.0 - zk) / tau;
+                out[start + k] = self.weight
+                    * (score_derivative * z_jac * z_jac
+                        + score * zk * (1.0 - zk) * (1.0 - 2.0 * zk) * inv_tau2);
             }
         }
         Some(out)

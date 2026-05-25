@@ -51,6 +51,8 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 /// which is exactly the desired mathematical behaviour.
 pub const LOG_ZERO_SENTINEL: f64 = -1.0e300;
 
+const LOG_ZERO_SATURATION_THRESHOLD: f64 = LOG_ZERO_SENTINEL * 0.5;
+
 /// Lower bound on the regularization parameter `eps`. Below this the
 /// log-kernel exponents would lose more than 52 bits of mantissa even
 /// for unit-scale costs; we refuse to run instead of silently producing
@@ -81,7 +83,7 @@ fn logsumexp_axis0(log_x: ArrayView2<'_, f64>) -> Array1<f64> {
                 col_max = value;
             }
         }
-        if !col_max.is_finite() || col_max <= LOG_ZERO_SENTINEL * 0.5 {
+        if !col_max.is_finite() || col_max <= LOG_ZERO_SATURATION_THRESHOLD {
             out[j] = LOG_ZERO_SENTINEL;
             continue;
         }
@@ -115,7 +117,7 @@ fn logsumexp_axis1(log_x: ArrayView2<'_, f64>) -> Array1<f64> {
                 row_max = value;
             }
         }
-        if !row_max.is_finite() || row_max <= LOG_ZERO_SENTINEL * 0.5 {
+        if !row_max.is_finite() || row_max <= LOG_ZERO_SATURATION_THRESHOLD {
             out[i] = LOG_ZERO_SENTINEL;
             continue;
         }
@@ -139,7 +141,7 @@ fn log_vector_is_sentinel_saturated(log_x: ArrayView1<'_, f64>) -> bool {
             max = v;
         }
     }
-    !max.is_finite() || max <= LOG_ZERO_SENTINEL * 0.5
+    !max.is_finite() || max <= LOG_ZERO_SATURATION_THRESHOLD
 }
 
 /// Numerically-stable softmax of a 1-D log-vector. Subtracts the max
@@ -155,7 +157,7 @@ fn softmax_1d(log_x: ArrayView1<'_, f64>) -> Result<Array1<f64>, String> {
             max = v;
         }
     }
-    if !max.is_finite() || max <= LOG_ZERO_SENTINEL * 0.5 {
+    if !max.is_finite() || max <= LOG_ZERO_SATURATION_THRESHOLD {
         return Err(
             "sinkhorn barycenter degenerated: all log_a saturated to sentinel -- try larger eps or check cost matrix"
                 .to_string(),
