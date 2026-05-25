@@ -4889,9 +4889,9 @@ impl BernoulliRigidRowKernel {
     }
 
     /// Lazy-build the per-row uncontracted fourth-derivative tensor cache —
-    /// outer-Hessian analogue of [`third_full_cache`]. Same `OnceLock`
-    /// semantics: first caller runs one parallel row pass, every other
-    /// thread blocks on the lock and reads the same vector. Used by
+    /// outer-Hessian analogue of [`third_full_cache`]. Concurrent first
+    /// callers may redundantly run the parallel row pass; the first published
+    /// value wins and every subsequent caller reads the same vector. Used by
     /// `row_fourth_contracted` so each (u, v) ψ-axis pair finishes in a
     /// 16-multiply [`contract_fourth_full`] bilinear instead of triggering
     /// a fresh empirical-grid 8-direction jet.
@@ -5819,9 +5819,9 @@ impl BernoulliMarginalSlopeFamily {
     /// build-psi-hyper-coords sweep over 32 ψ-axes pays the heavy empirical
     /// jet at most once per row.
     ///
-    /// The first caller into `get_or_init` runs the parallel build *once*;
-    /// every other thread blocks on the `OnceLock` and observes the same
-    /// stored result. A failed build is captured in the `Err` arm of the
+    /// Concurrent first callers may redundantly run the parallel build; the
+    /// first published value wins and every subsequent caller observes the
+    /// same stored result. A failed build is captured in the `Err` arm of the
     /// stored `Result` and propagates identically on every subsequent call.
     fn rigid_third_full_cached<'a>(
         &self,
