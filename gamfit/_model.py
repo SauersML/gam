@@ -149,7 +149,7 @@ class Model:
         headers, rows, _ = normalize_table(data)
         try:
             ffi = rust_module()
-            raw = rust_module().sample_table(
+            raw = ffi.sample_table(
                 self._model_bytes,
                 headers,
                 rows,

@@ -88,13 +88,20 @@ class Diagnostics:
         0.13333333333333336
         """
         try:
-            diagnostics = rust_module().diagnostics_from_predictions(
+            rust = rust_module()
+            diagnostics = rust.diagnostics_from_predictions(
                 observed,
                 predicted["mean"],
             )
+            import numpy as np
+
+            residuals_array = rust.compute_residuals(
+                np.asarray(observed, dtype=np.float64),
+                np.asarray(predicted["mean"], dtype=np.float64),
+            )
         except Exception as exc:
             raise map_exception(exc) from exc
-        residuals = list(diagnostics["residuals"])
+        residuals = list(residuals_array)
         metrics = dict(diagnostics["metrics"])
         return cls(
             formula=formula,
