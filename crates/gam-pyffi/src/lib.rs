@@ -84,10 +84,11 @@ use numpy::{
     IntoPyArray, PyArray1, PyArray2, PyArray3, PyReadonlyArray1, PyReadonlyArray2,
     PyReadonlyArray3, PyReadonlyArray4, PyReadonlyArrayDyn,
 };
-use pyo3::exceptions::{PyNotImplementedError, PyValueError};
+use pyo3::exceptions::{PyNotImplementedError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyBytes, PyDict, PyList};
+use pyo3::types::{PyAny, PyBytes, PyDict, PyFloat, PyList, PyTuple};
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
@@ -366,6 +367,86 @@ struct ValidationPayload {
     supported_by_python: bool,
 }
 
+fn sklearn_response_column_name(formula: &str) -> Option<String> {
+    if !formula.contains('~') {
+        return None;
+    }
+    let candidate = formula.split('~').next()?.trim();
+    if candidate.is_empty() || candidate.starts_with("Surv(") {
+        return None;
+    }
+    let without_underscores = candidate.replace('_', "");
+    if without_underscores.is_empty()
+        || !without_underscores
+            .chars()
+            .all(|character| character.is_alphanumeric())
+    {
+        return None;
+    }
+    Some(candidate.to_string())
+}
+
+fn sklearn_resolved_formula(formula: &str, target_name: &str) -> String {
+    match formula.split_once('~') {
+        Some((_lhs, rhs)) => format!("{target_name} ~ {}", rhs.trim()),
+        None => format!("{target_name} ~ {}", formula.trim()),
+    }
+}
+
+#[pyfunction(signature = (columns, formula, target_column = None, has_external_target = false))]
+fn sklearn_fit_metadata(
+    columns: Vec<String>,
+    formula: &str,
+    target_column: Option<String>,
+    has_external_target: bool,
+) -> PyResult<(String, Vec<String>, String)> {
+    let has_target_column = target_column.is_some();
+    if has_target_column && has_external_target {
+        return Err(py_value_error(
+            "target_column and has_external_target are mutually exclusive".to_string(),
+        ));
+    }
+
+    let target_name = if let Some(target_column) = target_column {
+        if !columns.iter().any(|column| column == &target_column) {
+            return Err(py_value_error(format!(
+                "target column '{target_column}' is missing from the training table"
+            )));
+        }
+        target_column
+    } else if has_external_target {
+        sklearn_response_column_name(formula).unwrap_or_else(|| "y".to_string())
+    } else {
+        let target_name = sklearn_response_column_name(formula).ok_or_else(|| {
+            py_value_error("formula must include a response when y is not provided".to_string())
+        })?;
+        if !columns.iter().any(|column| column == &target_name) {
+            return Err(py_value_error(format!(
+                "response column '{target_name}' is missing from the training table"
+            )));
+        }
+        target_name
+    };
+
+    if has_external_target && columns.iter().any(|column| column == &target_name) {
+        return Err(py_value_error(format!(
+            "target column '{target_name}' already exists in the feature table"
+        )));
+    }
+
+    let fit_formula = if has_external_target || has_target_column {
+        sklearn_resolved_formula(formula, &target_name)
+    } else {
+        formula.to_string()
+    };
+    let feature_names = columns
+        .into_iter()
+        .filter(|column| column != &target_name)
+        .collect();
+
+    Ok((fit_formula, feature_names, target_name))
+}
+
 enum PythonExceptionKind {
     Formula,
     SchemaMismatch,
@@ -432,17 +513,22 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
             "fit_array",
             "load",
             "extend_with_group",
+            "torch_from_fitted",
             "predict",
             "predict_array",
             "competing_risks_cif",
             "sample",
             "summary",
+            "summary_html",
             "check",
             "report",
+            "sklearn_fit_metadata",
             "classify_exception_message",
             "cross_fit_shared_precision_groups",
             "save",
             "validate_formula",
+            "formula_validation_repr",
+            "formula_validation_html",
             "design_matrix_array",
             "basis",
             "duchon_function_norm_penalty",
@@ -800,6 +886,103 @@ fn periodic_basis_with_jet<'py>(
             jet[[row, sin_col, 0]] = frequency * cos_value;
             jet[[row, cos_col, 0]] = -frequency * sin_value;
         }
+    }
+
+    Ok((
+        phi.into_pyarray(py).unbind(),
+        jet.into_pyarray(py).unbind(),
+        penalty.into_pyarray(py).unbind(),
+    ))
+}
+
+#[pyfunction(signature = (points, centers, m = 2))]
+fn duchon_basis_with_jet<'py>(
+    py: Python<'py>,
+    points: PyReadonlyArray2<'py, f64>,
+    centers: PyReadonlyArray2<'py, f64>,
+    m: usize,
+) -> PyResult<(
+    Py<PyArray2<f64>>,
+    Py<PyArray3<f64>>,
+    Py<PyArray2<f64>>,
+)> {
+    if m == 0 {
+        return Err(py_value_error("Duchon m must be at least 1".to_string()));
+    }
+    let pts = points.as_array();
+    let ctrs = centers.as_array();
+    if pts.ncols() != ctrs.ncols() {
+        return Err(py_value_error(format!(
+            "points has d={} but centers has d={}",
+            pts.ncols(),
+            ctrs.ncols()
+        )));
+    }
+    if pts.iter().any(|value| !value.is_finite()) || ctrs.iter().any(|value| !value.is_finite()) {
+        return Err(py_value_error(
+            "duchon_basis_with_jet requires finite points and centers".to_string(),
+        ));
+    }
+
+    let requested_nullspace = duchon_nullspace_from_m(m);
+    let spec = DuchonBasisSpec {
+        center_strategy: CenterStrategy::UserProvided(ctrs.to_owned()),
+        length_scale: None,
+        power: 0.0,
+        nullspace_order: requested_nullspace,
+        identifiability: SpatialIdentifiability::None,
+        aniso_log_scales: None,
+        operator_penalties: Default::default(),
+        periodic: None,
+        boundary: OneDimensionalBoundary::Open,
+    };
+    let built = build_duchon_basis(pts, &spec).map_err(|err| py_value_error(err.to_string()))?;
+    let phi = built.design.to_dense();
+    let primary_idx = built
+        .penaltyinfo
+        .iter()
+        .position(|info| matches!(info.source, gam::basis::PenaltySource::Primary))
+        .ok_or_else(|| {
+            py_value_error("duchon_basis_with_jet: primary penalty was not built".to_string())
+        })?;
+    let penalty = built.penalties[primary_idx].clone();
+
+    let effective_nullspace =
+        pyffi_duchon_effective_nullspace_order(ctrs, requested_nullspace);
+    let radial_transform = pyffi_duchon_kernel_constraint_nullspace(ctrs, effective_nullspace)
+        .map_err(py_value_error)?;
+    let radial_first = duchon_radial_first_derivative_nd(pts, ctrs, None, effective_nullspace)
+        .map_err(|err| py_value_error(err.to_string()))?;
+    let radial_jet = radial_input_location_jet(pts, ctrs, radial_first.view())
+        .map_err(py_value_error)?;
+    let poly_jet = duchon_polynomial_first_derivative_nd(pts, effective_nullspace);
+
+    let n_rows = pts.nrows();
+    let dim = pts.ncols();
+    let n_kernel = radial_transform.ncols();
+    let n_poly = poly_jet.shape()[1];
+    let mut jet = Array3::<f64>::zeros((n_rows, n_kernel + n_poly, dim));
+    for axis in 0..dim {
+        let projected = radial_jet.index_axis(Axis(2), axis).dot(&radial_transform);
+        jet.slice_mut(s![.., ..n_kernel, axis]).assign(&projected);
+    }
+    jet.slice_mut(s![.., n_kernel.., ..]).assign(&poly_jet);
+
+    if phi.ncols() != jet.shape()[1] {
+        return Err(py_value_error(format!(
+            "duchon_basis_with_jet shape mismatch: Phi has {} columns but Jet has {}",
+            phi.ncols(),
+            jet.shape()[1]
+        )));
+    }
+    if penalty.nrows() != phi.ncols() || penalty.ncols() != phi.ncols() {
+        return Err(py_value_error(format!(
+            "duchon_basis_with_jet penalty shape mismatch: expected {}x{}, got {}x{}",
+            phi.ncols(),
+            phi.ncols(),
+            penalty.nrows(),
+            penalty.ncols()
+        )));
     }
 
     Ok((
@@ -1650,6 +1833,221 @@ fn gaussian_reml_score<'py>(
     out.set_item("sigma2", score.sigma2.into_pyarray(py))?;
     out.set_item("edf", score.edf)?;
     Ok(out.unbind())
+}
+
+fn require_finite_matrix(name: &str, matrix: &ArrayView2<'_, f64>) -> PyResult<()> {
+    if matrix.iter().any(|value| !value.is_finite()) {
+        return Err(py_value_error(format!("{name} must contain only finite values")));
+    }
+    Ok(())
+}
+
+#[pyfunction(signature = (y_out, y_hat, z, w_dec, lambda_sparse, skip_u = None, skip_v = None))]
+fn skip_transcoder_reml_metrics<'py>(
+    py: Python<'py>,
+    y_out: PyReadonlyArray2<'py, f64>,
+    y_hat: PyReadonlyArray2<'py, f64>,
+    z: PyReadonlyArray2<'py, f64>,
+    w_dec: PyReadonlyArray2<'py, f64>,
+    lambda_sparse: f64,
+    skip_u: Option<PyReadonlyArray2<'py, f64>>,
+    skip_v: Option<PyReadonlyArray2<'py, f64>>,
+) -> PyResult<Py<PyDict>> {
+    if !(lambda_sparse.is_finite() && lambda_sparse > 0.0) {
+        return Err(py_value_error(format!(
+            "lambda_sparse must be finite and > 0, got {lambda_sparse}"
+        )));
+    }
+
+    let y_out = y_out.as_array();
+    let y_hat = y_hat.as_array();
+    let z = z.as_array();
+    let w_dec = w_dec.as_array();
+    let skip_u_view = skip_u.as_ref().map(|value| value.as_array());
+    let skip_v_view = skip_v.as_ref().map(|value| value.as_array());
+
+    require_finite_matrix("y_out", &y_out)?;
+    require_finite_matrix("y_hat", &y_hat)?;
+    require_finite_matrix("z", &z)?;
+    require_finite_matrix("w_dec", &w_dec)?;
+    if let Some(skip_u) = skip_u_view.as_ref() {
+        require_finite_matrix("skip_u", skip_u)?;
+    }
+    if let Some(skip_v) = skip_v_view.as_ref() {
+        require_finite_matrix("skip_v", skip_v)?;
+    }
+
+    let (n_rows, out_dim) = y_out.dim();
+    if n_rows == 0 || out_dim == 0 {
+        return Err(py_value_error(
+            "skip_transcoder_reml_metrics requires non-empty y_out".to_string(),
+        ));
+    }
+    if y_hat.dim() != (n_rows, out_dim) {
+        return Err(py_value_error(format!(
+            "y_hat shape mismatch: expected ({n_rows}, {out_dim}), got ({}, {})",
+            y_hat.nrows(),
+            y_hat.ncols()
+        )));
+    }
+    if z.nrows() != n_rows {
+        return Err(py_value_error(format!(
+            "z row mismatch: expected {n_rows}, got {}",
+            z.nrows()
+        )));
+    }
+    if w_dec.dim() != (z.ncols(), out_dim) {
+        return Err(py_value_error(format!(
+            "w_dec shape mismatch: expected ({}, {out_dim}), got ({}, {})",
+            z.ncols(),
+            w_dec.nrows(),
+            w_dec.ncols()
+        )));
+    }
+    if let Some(skip_u) = skip_u_view.as_ref() {
+        if skip_u.nrows() != out_dim {
+            return Err(py_value_error(format!(
+                "skip_u row mismatch: expected {out_dim}, got {}",
+                skip_u.nrows()
+            )));
+        }
+        if let Some(skip_v) = skip_v_view.as_ref() {
+            if skip_v.ncols() != skip_u.ncols() {
+                return Err(py_value_error(format!(
+                    "skip_v rank mismatch: expected {} columns, got {}",
+                    skip_u.ncols(),
+                    skip_v.ncols()
+                )));
+            }
+        }
+    } else if skip_v_view.is_some() {
+        return Err(py_value_error(
+            "skip_v was provided without skip_u".to_string(),
+        ));
+    }
+
+    let mut active_atoms = Vec::new();
+    let mut nonzero_entries = 0_usize;
+    for atom in 0..z.ncols() {
+        let mut active = false;
+        for row in 0..z.nrows() {
+            if z[[row, atom]].abs() > 1.0e-8 {
+                active = true;
+                nonzero_entries += 1;
+            }
+        }
+        if active {
+            active_atoms.push(atom);
+        }
+    }
+
+    let skip_rank = skip_u_view.as_ref().map_or(0, |value| value.ncols());
+    let feature_count = active_atoms.len() + skip_rank;
+    let mut gram = Array2::<f64>::zeros((feature_count, feature_count));
+
+    for (i, &atom_i) in active_atoms.iter().enumerate() {
+        let row_i = w_dec.row(atom_i);
+        for (j, &atom_j) in active_atoms.iter().enumerate().take(i + 1) {
+            let value = row_i.dot(&w_dec.row(atom_j));
+            gram[[i, j]] = value;
+            gram[[j, i]] = value;
+        }
+    }
+    if let Some(skip_u) = skip_u_view.as_ref() {
+        let offset = active_atoms.len();
+        for (i, &atom_i) in active_atoms.iter().enumerate() {
+            let row_i = w_dec.row(atom_i);
+            for rank in 0..skip_rank {
+                let value = row_i.dot(&skip_u.column(rank));
+                gram[[i, offset + rank]] = value;
+                gram[[offset + rank, i]] = value;
+            }
+        }
+        for rank_i in 0..skip_rank {
+            let col_i = skip_u.column(rank_i);
+            for rank_j in 0..=rank_i {
+                let value = col_i.dot(&skip_u.column(rank_j));
+                gram[[offset + rank_i, offset + rank_j]] = value;
+                gram[[offset + rank_j, offset + rank_i]] = value;
+            }
+        }
+    }
+    for diag in 0..feature_count {
+        gram[[diag, diag]] += lambda_sparse;
+    }
+
+    let logdet = if feature_count == 0 {
+        0.0
+    } else {
+        let sym = (&gram + &gram.t()) * 0.5;
+        let chol = sym.cholesky(Side::Lower).map_err(|err| {
+            py_value_error(format!("skip_transcoder_reml_metrics logdet failed: {err}"))
+        })?;
+        let value = 2.0 * chol.diag().iter().map(|diag| diag.ln()).sum::<f64>();
+        if !value.is_finite() {
+            return Err(py_value_error(format!(
+                "skip_transcoder_reml_metrics logdet is not finite: {value}"
+            )));
+        }
+        value
+    };
+
+    let n_total = y_out.len() as f64;
+    let mut sse = 0.0_f64;
+    let mut y_sum = 0.0_f64;
+    for row in 0..n_rows {
+        for col in 0..out_dim {
+            let resid = y_out[[row, col]] - y_hat[[row, col]];
+            sse += resid * resid;
+            y_sum += y_out[[row, col]];
+        }
+    }
+    let mse = sse / n_total;
+    let sigma2 = mse.max(1.0e-12);
+    let y_mean = y_sum / n_total;
+    let mut sst = 0.0_f64;
+    for value in y_out.iter() {
+        let centered = value - y_mean;
+        sst += centered * centered;
+    }
+    let explained_variance = if sst > 0.0 {
+        1.0 - sse / sst
+    } else if sse == 0.0 {
+        1.0
+    } else {
+        0.0
+    };
+    let sparsity = if z.is_empty() {
+        0.0
+    } else {
+        nonzero_entries as f64 / z.len() as f64
+    };
+    let reml_score = 0.5 * (n_total * sigma2.ln() + logdet);
+
+    let out = PyDict::new(py);
+    out.set_item("reml_score", reml_score)?;
+    out.set_item("mse", mse)?;
+    out.set_item("sparsity", sparsity)?;
+    out.set_item("explained_variance", explained_variance)?;
+    out.set_item("active_atoms", active_atoms.len())?;
+    out.set_item("effective_rank", feature_count)?;
+    Ok(out.unbind())
+}
+
+#[pyfunction]
+fn skip_transcoder_select_reml(scores: Vec<f64>) -> PyResult<usize> {
+    let mut best: Option<(usize, f64)> = None;
+    for (idx, score) in scores.into_iter().enumerate() {
+        if score.is_nan() {
+            continue;
+        }
+        if best.map_or(true, |(_, best_score)| score < best_score) {
+            best = Some((idx, score));
+        }
+    }
+    best.map(|(idx, _)| idx).ok_or_else(|| {
+        py_value_error("No scored candidates; call reml_score_skip_transcoder first.".to_string())
+    })
 }
 
 #[pyfunction]
@@ -5627,6 +6025,8 @@ fn gumbel_temperature_schedule_from_pydict(
     Ok(Some(schedule_out))
 }
 
+/// Fit one SAE-manifold refresh step; auto lambda selection is expressed by
+/// passing `lambda_grid`, which evaluates candidate smoothness lambdas in Rust.
 #[pyfunction(signature = (
     z,
     atom_basis,
@@ -5644,6 +6044,7 @@ fn gumbel_temperature_schedule_from_pydict(
     assignment_kind,
     sparsity_strength = 1.0,
     smoothness = 1.0,
+    lambda_grid = None,
     max_iter = 12,
     learning_rate = 1.0,
     ridge_ext_coord = 1.0e-6,
@@ -5669,6 +6070,7 @@ fn sae_manifold_fit<'py>(
     assignment_kind: String,
     sparsity_strength: f64,
     smoothness: f64,
+    lambda_grid: Option<Vec<f64>>,
     max_iter: usize,
     learning_rate: f64,
     ridge_ext_coord: f64,
@@ -5732,6 +6134,24 @@ fn sae_manifold_fit<'py>(
             )));
         }
     }
+    let lambda_candidates = match lambda_grid {
+        Some(grid) => {
+            if grid.is_empty() {
+                return Err(py_value_error(
+                    "lambda_grid must contain at least one candidate".to_string(),
+                ));
+            }
+            for (idx, value) in grid.iter().copied().enumerate() {
+                if !value.is_finite() || value <= 0.0 {
+                    return Err(py_value_error(format!(
+                        "lambda_grid[{idx}] must be finite and positive; got {value}"
+                    )));
+                }
+            }
+            grid
+        }
+        None => vec![smoothness],
+    };
 
     let basis_values_shape = basis_values.as_array().shape().to_vec();
     if basis_values_shape[0] != k_atoms || basis_values_shape[1] != n_obs {
@@ -5812,7 +6232,7 @@ fn sae_manifold_fit<'py>(
             )));
         }
     };
-    let mut term = term_from_padded_blocks_with_mode(
+    let mut base_term = term_from_padded_blocks_with_mode(
         n_obs,
         p_out,
         &basis_kinds,
@@ -5830,22 +6250,50 @@ fn sae_manifold_fit<'py>(
     if let Some(schedule) =
         gumbel_temperature_schedule_from_pydict(gumbel_schedule).map_err(py_value_error)?
     {
-        term.set_temperature_schedule(schedule)
+        base_term
+            .set_temperature_schedule(schedule)
             .map_err(py_value_error)?;
     }
 
-    let log_ard = atom_dim.iter().map(|&d| Array1::<f64>::zeros(d)).collect();
-    let mut rho = SaeManifoldRho::new(sparsity_strength.ln(), smoothness.ln(), log_ard);
-    let loss = term
-        .run_single_external_basis_refresh_step_arrow_schur(
+    let log_ard: Vec<Array1<f64>> = atom_dim
+        .iter()
+        .map(|&d| Array1::<f64>::zeros(d))
+        .collect();
+    let mut best_term = None;
+    let mut best_rho = None;
+    let mut best_loss = None;
+    let mut best_score = f64::NEG_INFINITY;
+    for lambda_smooth in lambda_candidates {
+        let mut candidate_term = base_term.clone();
+        let mut candidate_rho =
+            SaeManifoldRho::new(sparsity_strength.ln(), lambda_smooth.ln(), log_ard.clone());
+        let candidate_loss = candidate_term
+            .run_single_external_basis_refresh_step_arrow_schur(
             z_view,
-            &mut rho,
+                &mut candidate_rho,
             Some(&registry),
             learning_rate,
             ridge_ext_coord,
             ridge_beta,
         )
         .map_err(py_value_error)?;
+        let candidate_score = candidate_loss.evidence_proxy();
+        if candidate_score > best_score {
+            best_score = candidate_score;
+            best_term = Some(candidate_term);
+            best_rho = Some(candidate_rho);
+            best_loss = Some(candidate_loss);
+        }
+    }
+    let term = best_term.ok_or_else(|| {
+        py_value_error("lambda_grid must contain at least one candidate".to_string())
+    })?;
+    let rho = best_rho.ok_or_else(|| {
+        py_value_error("lambda_grid must contain at least one candidate".to_string())
+    })?;
+    let loss = best_loss.ok_or_else(|| {
+        py_value_error("lambda_grid must contain at least one candidate".to_string())
+    })?;
 
     let assignments = term.assignment.assignments();
     let fitted = term.fitted();
@@ -9130,6 +9578,68 @@ fn posterior_predict_table(
 }
 
 #[pyfunction]
+fn posterior_predict_bands_table(
+    py: Python<'_>,
+    model_bytes: Vec<u8>,
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+    samples_flat: Vec<f64>,
+    n_draws: usize,
+    n_coeffs: usize,
+    level: f64,
+) -> PyResult<String> {
+    detach_py_result(py, "posterior_predict_bands_table", move || {
+        posterior_predict_bands_table_impl(
+            &model_bytes,
+            headers,
+            rows,
+            samples_flat,
+            n_draws,
+            n_coeffs,
+            level,
+        )
+    })
+}
+
+#[pyfunction]
+fn posterior_eta_bands(
+    py: Python<'_>,
+    eta_flat: Vec<f64>,
+    n_draws: usize,
+    n_rows: usize,
+    family_kind: String,
+    level: f64,
+) -> PyResult<String> {
+    detach_py_result(py, "posterior_eta_bands", move || {
+        posterior_eta_bands_impl(eta_flat, n_draws, n_rows, &family_kind, level)
+    })
+}
+
+#[pyfunction]
+fn posterior_credible_interval(
+    py: Python<'_>,
+    samples_flat: Vec<f64>,
+    n_draws: usize,
+    n_coeffs: usize,
+    level: f64,
+) -> PyResult<Vec<f64>> {
+    detach_py_result(py, "posterior_credible_interval", move || {
+        posterior_credible_interval_impl(samples_flat, n_draws, n_coeffs, level)
+    })
+}
+
+#[pyfunction]
+fn apply_inverse_link_array(
+    py: Python<'_>,
+    eta: Vec<f64>,
+    family_kind: String,
+) -> PyResult<Vec<f64>> {
+    detach_py_result(py, "apply_inverse_link_array", move || {
+        apply_inverse_link_vec(&eta, &family_kind)
+    })
+}
+
+#[pyfunction]
 fn summary_json(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<String> {
     detach_py_result(py, "summary_json", move || summary_json_impl(&model_bytes))
 }
@@ -9785,12 +10295,20 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("__doc__", "PyO3 boundary for the gam Rust engine.")?;
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
     module.add_function(wrap_pyfunction!(classify_exception_message, module)?)?;
+    module.add_function(wrap_pyfunction!(sklearn_fit_metadata, module)?)?;
     module.add_function(wrap_pyfunction!(build_info, module)?)?;
+    module.add_function(wrap_pyfunction!(torch_from_fitted, module)?)?;
     module.add_function(wrap_pyfunction!(fit_table, module)?)?;
     module.add_function(wrap_pyfunction!(fit_array, module)?)?;
     module.add_function(wrap_pyfunction!(load_model, module)?)?;
     module.add_function(wrap_pyfunction!(extend_model_with_group, module)?)?;
     module.add_function(wrap_pyfunction!(validate_formula_json, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        formula_validation_supported_by_python_json,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(formula_validation_repr_json, module)?)?;
+    module.add_function(wrap_pyfunction!(formula_validation_html_json, module)?)?;
     module.add_function(wrap_pyfunction!(predict_table, module)?)?;
     module.add_function(wrap_pyfunction!(predict_array, module)?)?;
     module.add_function(wrap_pyfunction!(competing_risks_cif, module)?)?;
@@ -9800,6 +10318,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(bspline_basis, module)?)?;
     module.add_function(wrap_pyfunction!(bspline_basis_derivative, module)?)?;
     module.add_function(wrap_pyfunction!(periodic_basis_with_jet, module)?)?;
+    module.add_function(wrap_pyfunction!(duchon_basis_with_jet, module)?)?;
     module.add_function(wrap_pyfunction!(duchon_basis, module)?)?;
     module.add_function(wrap_pyfunction!(smoothness_penalty, module)?)?;
     module.add_function(wrap_pyfunction!(duchon_function_norm_penalty, module)?)?;
@@ -9809,9 +10328,12 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(thin_plate_penalty, module)?)?;
     module.add_function(wrap_pyfunction!(auto_knots_1d, module)?)?;
     module.add_function(wrap_pyfunction!(auto_centers_1d, module)?)?;
+    module.add_function(wrap_pyfunction!(_block_diag, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_weighted_ridge_array, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_weighted_ridge_batch, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_score, module)?)?;
+    module.add_function(wrap_pyfunction!(skip_transcoder_reml_metrics, module)?)?;
+    module.add_function(wrap_pyfunction!(skip_transcoder_select_reml, module)?)?;
     module.add_function(wrap_pyfunction!(
         tierney_kadane_normalized_score,
         module
@@ -9940,292 +10462,6 @@ fn conditional_prior_ivae<'py>(
     .map_err(py_value_error)?;
     let (value, grad) = pen.value_and_grad(t.as_array());
     Ok((value, grad.into_pyarray(py).unbind()))
-}
-
-#[pyfunction(signature = (values, weights = None, tol = 1.0e-12, max_iter = 256))]
-fn sphere_frechet_mean<'py>(
-    py: Python<'py>,
-    values: PyReadonlyArray2<'py, f64>,
-    weights: Option<PyReadonlyArray1<'py, f64>>,
-    tol: f64,
-    max_iter: usize,
-) -> PyResult<Py<PyArray1<f64>>> {
-    let values_owned = values.as_array().to_owned();
-    let weights_owned = weights.as_ref().map(|w| w.as_array().to_owned());
-    let mean = detach_py_result(py, "sphere_frechet_mean", move || {
-        sphere_frechet_mean_impl(
-            values_owned.view(),
-            weights_owned.as_ref().map(|w| w.view()),
-            tol,
-            max_iter,
-        )
-    })?;
-    Ok(mean.into_pyarray(py).unbind())
-}
-
-fn sphere_frechet_mean_impl(
-    values: ArrayView2<'_, f64>,
-    weights: Option<ArrayView1<'_, f64>>,
-    tol: f64,
-    max_iter: usize,
-) -> Result<Array1<f64>, String> {
-    if !(tol.is_finite() && tol >= 0.0) {
-        return Err("spherical Fréchet mean tolerance must be finite and non-negative".to_string());
-    }
-    let y = normalize_sphere_matrix(values)?;
-    let w = normalize_response_geometry_weights(y.nrows(), weights)?;
-    let mut candidates = sphere_mean_candidates(y.view(), w.view())?;
-    if candidates.is_empty() {
-        candidates.push(sphere_orthogonal_unit(y.row(0))?);
-    }
-
-    let mut best_mu: Option<Array1<f64>> = None;
-    let mut best_obj = f64::INFINITY;
-    for candidate in candidates {
-        let mut mu = candidate;
-        let mut failed = false;
-        for _ in 0..max_iter {
-            let step = match sphere_weighted_log_step(y.view(), w.view(), mu.view()) {
-                Ok(step) => step,
-                Err(_) => {
-                    failed = true;
-                    break;
-                }
-            };
-            let step_norm = vector_norm(step.view());
-            if step_norm < tol {
-                break;
-            }
-            mu = sphere_exp_single(step.view(), mu.view())?;
-        }
-        if failed {
-            continue;
-        }
-        let obj = sphere_frechet_objective(y.view(), w.view(), mu.view());
-        if obj < best_obj {
-            best_obj = obj;
-            best_mu = Some(mu);
-        }
-    }
-    best_mu.ok_or_else(|| {
-        "spherical Fréchet mean is not identifiable for these points".to_string()
-    })
-}
-
-fn normalize_sphere_matrix(values: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
-    let (n, d) = values.dim();
-    if n == 0 || d < 2 {
-        return Err(
-            "spherical values must have at least one row and at least two columns".to_string(),
-        );
-    }
-    if let Some(((row, col), value)) = values
-        .indexed_iter()
-        .find(|(_, value)| !value.is_finite())
-    {
-        return Err(format!(
-            "spherical values must contain only finite values; got {value} at ({row}, {col})"
-        ));
-    }
-
-    let mut out = Array2::<f64>::zeros((n, d));
-    for row in 0..n {
-        let norm = vector_norm(values.row(row));
-        if norm <= 0.0 {
-            return Err("spherical rows must have non-zero norm".to_string());
-        }
-        for col in 0..d {
-            out[[row, col]] = values[[row, col]] / norm;
-        }
-    }
-    Ok(out)
-}
-
-fn normalize_response_geometry_weights(
-    n: usize,
-    weights: Option<ArrayView1<'_, f64>>,
-) -> Result<Array1<f64>, String> {
-    match weights {
-        None => Ok(Array1::from_elem(n, 1.0 / n as f64)),
-        Some(w) => {
-            if w.len() != n {
-                return Err("weights length must match the number of rows".to_string());
-            }
-            let mut total = 0.0;
-            for value in w.iter() {
-                if !value.is_finite() || *value < 0.0 {
-                    return Err(
-                        "weights must be finite, non-negative, and have positive total"
-                            .to_string(),
-                    );
-                }
-                total += *value;
-            }
-            if total <= 0.0 {
-                return Err(
-                    "weights must be finite, non-negative, and have positive total".to_string(),
-                );
-            }
-            Ok(w.mapv(|value| value / total))
-        }
-    }
-}
-
-fn sphere_mean_candidates(
-    values: ArrayView2<'_, f64>,
-    weights: ArrayView1<'_, f64>,
-) -> Result<Vec<Array1<f64>>, String> {
-    let (n, d) = values.dim();
-    let mut candidates = Vec::new();
-    let mut extrinsic = Array1::<f64>::zeros(d);
-    for row in 0..n {
-        for col in 0..d {
-            extrinsic[col] += weights[row] * values[[row, col]];
-        }
-    }
-    append_sphere_candidate(&mut candidates, extrinsic.view());
-
-    let mut moment = Array2::<f64>::zeros((d, d));
-    for row in 0..n {
-        for a in 0..d {
-            let weighted = weights[row] * values[[row, a]];
-            for b in 0..d {
-                moment[[a, b]] += weighted * values[[row, b]];
-            }
-        }
-    }
-    let (_eigs, eigvecs) = moment
-        .eigh(Side::Lower)
-        .map_err(|_| "spherical mean moment eigendecomposition failed".to_string())?;
-    for col in 0..eigvecs.ncols() {
-        let eigenvector = eigvecs.column(col).to_owned();
-        append_sphere_candidate(&mut candidates, eigenvector.view());
-        let negative = eigenvector.mapv(|value| -value);
-        append_sphere_candidate(&mut candidates, negative.view());
-    }
-
-    for row in 0..n.min(16) {
-        append_sphere_candidate(&mut candidates, values.row(row));
-    }
-    Ok(candidates)
-}
-
-fn append_sphere_candidate(candidates: &mut Vec<Array1<f64>>, candidate: ArrayView1<'_, f64>) {
-    let norm = vector_norm(candidate);
-    if !norm.is_finite() || norm <= 0.0 {
-        return;
-    }
-    let normalized = candidate.mapv(|value| value / norm);
-    for existing in candidates.iter() {
-        if dot_product(existing.view(), normalized.view()).abs() > 1.0 - 1.0e-10 {
-            return;
-        }
-    }
-    candidates.push(normalized);
-}
-
-fn sphere_orthogonal_unit(vector: ArrayView1<'_, f64>) -> Result<Array1<f64>, String> {
-    let mut min_index = 0;
-    let mut min_abs = vector[0].abs();
-    for (index, value) in vector.iter().enumerate().skip(1) {
-        let candidate = value.abs();
-        if candidate < min_abs {
-            min_abs = candidate;
-            min_index = index;
-        }
-    }
-    let axis_dot = vector[min_index];
-    let mut tangent = Array1::<f64>::zeros(vector.len());
-    tangent[min_index] = 1.0;
-    for col in 0..vector.len() {
-        tangent[col] -= axis_dot * vector[col];
-    }
-    let norm = vector_norm(tangent.view());
-    if norm <= 0.0 {
-        return Err("cannot construct a tangent direction for the spherical mean".to_string());
-    }
-    Ok(tangent.mapv(|value| value / norm))
-}
-
-fn sphere_weighted_log_step(
-    values: ArrayView2<'_, f64>,
-    weights: ArrayView1<'_, f64>,
-    base: ArrayView1<'_, f64>,
-) -> Result<Array1<f64>, String> {
-    let mut step = Array1::<f64>::zeros(base.len());
-    for row in 0..values.nrows() {
-        let dot = dot_product(values.row(row), base).clamp(-1.0, 1.0);
-        if dot <= -1.0 + 1.0e-12 {
-            return Err("spherical log map is undefined at antipodal points".to_string());
-        }
-        let theta = dot.acos();
-        if theta < 1.0e-12 {
-            continue;
-        }
-        let sin_theta = theta.sin();
-        let scale = if sin_theta > 1.0e-12 {
-            theta / sin_theta
-        } else {
-            1.0
-        };
-        for col in 0..base.len() {
-            step[col] += weights[row] * (values[[row, col]] - dot * base[col]) * scale;
-        }
-    }
-    Ok(step)
-}
-
-fn sphere_exp_single(
-    tangent: ArrayView1<'_, f64>,
-    base: ArrayView1<'_, f64>,
-) -> Result<Array1<f64>, String> {
-    let radial = dot_product(tangent, base);
-    let mut z = Array1::<f64>::zeros(base.len());
-    for col in 0..base.len() {
-        z[col] = tangent[col] - radial * base[col];
-    }
-    let r = vector_norm(z.view());
-    let mut out = Array1::<f64>::zeros(base.len());
-    if r < 1.0e-12 {
-        for col in 0..base.len() {
-            out[col] = base[col] + z[col];
-        }
-    } else {
-        let cos_r = r.cos();
-        let sin_scale = r.sin() / r;
-        for col in 0..base.len() {
-            out[col] = cos_r * base[col] + sin_scale * z[col];
-        }
-    }
-    let norm = vector_norm(out.view());
-    if !norm.is_finite() || norm <= 0.0 {
-        return Err("spherical exponential map produced a non-finite point".to_string());
-    }
-    Ok(out.mapv(|value| value / norm))
-}
-
-fn sphere_frechet_objective(
-    values: ArrayView2<'_, f64>,
-    weights: ArrayView1<'_, f64>,
-    base: ArrayView1<'_, f64>,
-) -> f64 {
-    let mut objective = 0.0;
-    for row in 0..values.nrows() {
-        let theta = dot_product(values.row(row), base).clamp(-1.0, 1.0).acos();
-        objective += weights[row] * theta * theta;
-    }
-    objective
-}
-
-fn vector_norm(vector: ArrayView1<'_, f64>) -> f64 {
-    vector.iter().map(|value| value * value).sum::<f64>().sqrt()
-}
-
-fn dot_product(left: ArrayView1<'_, f64>, right: ArrayView1<'_, f64>) -> f64 {
-    left.iter()
-        .zip(right.iter())
-        .map(|(left, right)| left * right)
-        .sum()
 }
 
 fn py_value_error(message: String) -> PyErr {
@@ -11080,6 +11316,127 @@ fn validate_formula_json_impl(
     };
     serde_json::to_string(&payload)
         .map_err(|err| format!("failed to serialize validation payload: {err}"))
+}
+
+fn parse_formula_validation_payload_json(
+    payload_json: &str,
+) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    let payload: serde_json::Value = serde_json::from_str(payload_json)
+        .map_err(|err| format!("failed to parse FormulaValidation payload: {err}"))?;
+    match payload {
+        serde_json::Value::Object(map) => Ok(map),
+        _ => Err("FormulaValidation payload must be a JSON object".to_string()),
+    }
+}
+
+fn json_payload_truthy(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => false,
+        serde_json::Value::Bool(value) => *value,
+        serde_json::Value::Number(value) => value
+            .as_f64()
+            .map(|number| number != 0.0)
+            .unwrap_or(true),
+        serde_json::Value::String(value) => !value.is_empty(),
+        serde_json::Value::Array(value) => !value.is_empty(),
+        serde_json::Value::Object(value) => !value.is_empty(),
+    }
+}
+
+fn python_repr_json_value(value: Option<&serde_json::Value>) -> String {
+    match value {
+        None | Some(serde_json::Value::Null) => "None".to_string(),
+        Some(serde_json::Value::Bool(value)) => {
+            if *value {
+                "True".to_string()
+            } else {
+                "False".to_string()
+            }
+        }
+        Some(serde_json::Value::Number(value)) => value.to_string(),
+        Some(serde_json::Value::String(value)) => python_repr_string(value),
+        Some(value @ serde_json::Value::Array(_)) | Some(value @ serde_json::Value::Object(_)) => {
+            python_str_json_value(value)
+        }
+    }
+}
+
+fn python_repr_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('\'');
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '\'' => out.push_str("\\'"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            ch if ch.is_control() => {
+                out.push_str(&format!("\\x{:02x}", ch as u32));
+            }
+            ch => out.push(ch),
+        }
+    }
+    out.push('\'');
+    out
+}
+
+fn python_str_json_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => "None".to_string(),
+        serde_json::Value::Bool(value) => {
+            if *value {
+                "True".to_string()
+            } else {
+                "False".to_string()
+            }
+        }
+        serde_json::Value::Number(value) => value.to_string(),
+        serde_json::Value::String(value) => value.clone(),
+        serde_json::Value::Array(values) => {
+            let inner = values
+                .iter()
+                .map(|value| match value {
+                    serde_json::Value::String(value) => python_repr_string(value),
+                    value => python_str_json_value(value),
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("[{inner}]")
+        }
+        serde_json::Value::Object(values) => {
+            let inner = values
+                .iter()
+                .map(|(key, value)| {
+                    format!(
+                        "{}: {}",
+                        python_repr_string(key),
+                        match value {
+                            serde_json::Value::String(value) => python_repr_string(value),
+                            value => python_str_json_value(value),
+                        }
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{{{inner}}}")
+        }
+    }
+}
+
+fn escape_html(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#x27;"),
+            ch => out.push(ch),
+        }
+    }
+    out
 }
 
 fn predict_table_impl(
@@ -15168,6 +15525,110 @@ fn duchon_nullspace_from_m(m: usize) -> DuchonNullspaceOrder {
         2 => DuchonNullspaceOrder::Linear,
         other => DuchonNullspaceOrder::Degree(other - 1),
     }
+}
+
+fn pyffi_duchon_previous_nullspace_order(order: DuchonNullspaceOrder) -> DuchonNullspaceOrder {
+    match order {
+        DuchonNullspaceOrder::Zero => DuchonNullspaceOrder::Zero,
+        DuchonNullspaceOrder::Linear => DuchonNullspaceOrder::Zero,
+        DuchonNullspaceOrder::Degree(2) => DuchonNullspaceOrder::Linear,
+        DuchonNullspaceOrder::Degree(k) => DuchonNullspaceOrder::Degree(k - 1),
+    }
+}
+
+fn pyffi_duchon_polynomial_block(
+    points: ArrayView2<'_, f64>,
+    order: DuchonNullspaceOrder,
+) -> Array2<f64> {
+    let n_rows = points.nrows();
+    let dim = points.ncols();
+    match order {
+        DuchonNullspaceOrder::Zero => Array2::<f64>::ones((n_rows, 1)),
+        DuchonNullspaceOrder::Linear => {
+            let mut poly = Array2::<f64>::zeros((n_rows, dim + 1));
+            poly.column_mut(0).fill(1.0);
+            for axis in 0..dim {
+                poly.column_mut(axis + 1).assign(&points.column(axis));
+            }
+            poly
+        }
+        DuchonNullspaceOrder::Degree(degree) => {
+            let exponents = pyffi_duchon_monomial_exponents(dim, degree);
+            let mut poly = Array2::<f64>::zeros((n_rows, exponents.len()));
+            for (col, alpha) in exponents.iter().enumerate() {
+                for row in 0..n_rows {
+                    let mut value = 1.0;
+                    for axis in 0..dim {
+                        let exp = alpha[axis];
+                        if exp != 0 {
+                            value *= points[[row, axis]].powi(exp as i32);
+                        }
+                    }
+                    poly[[row, col]] = value;
+                }
+            }
+            poly
+        }
+    }
+}
+
+fn pyffi_duchon_monomial_exponents(
+    dimension: usize,
+    max_total_degree: usize,
+) -> Vec<Vec<usize>> {
+    fn recurse(
+        axis: usize,
+        remaining_degree: usize,
+        current: &mut [usize],
+        out: &mut Vec<Vec<usize>>,
+    ) {
+        if axis + 1 == current.len() {
+            current[axis] = remaining_degree;
+            out.push(current.to_vec());
+            return;
+        }
+        for exponent in (0..=remaining_degree).rev() {
+            current[axis] = exponent;
+            recurse(axis + 1, remaining_degree - exponent, current, out);
+        }
+    }
+
+    if dimension == 0 {
+        return vec![Vec::new()];
+    }
+
+    let mut out = Vec::new();
+    let mut current = vec![0usize; dimension];
+    for total_degree in 0..=max_total_degree {
+        recurse(0, total_degree, &mut current, &mut out);
+    }
+    out
+}
+
+fn pyffi_duchon_effective_nullspace_order(
+    centers: ArrayView2<'_, f64>,
+    order: DuchonNullspaceOrder,
+) -> DuchonNullspaceOrder {
+    let mut effective = order;
+    while effective != DuchonNullspaceOrder::Zero
+        && centers.nrows() <= pyffi_duchon_polynomial_block(centers, effective).ncols()
+    {
+        effective = pyffi_duchon_previous_nullspace_order(effective);
+    }
+    effective
+}
+
+fn pyffi_duchon_kernel_constraint_nullspace(
+    centers: ArrayView2<'_, f64>,
+    order: DuchonNullspaceOrder,
+) -> Result<Array2<f64>, String> {
+    let polynomial_block = pyffi_duchon_polynomial_block(centers, order);
+    gam::faer_ndarray::rrqr_nullspace_basis(
+        &polynomial_block,
+        gam::faer_ndarray::default_rrqr_rank_alpha(),
+    )
+    .map(|(null_basis, _)| null_basis)
+    .map_err(|err| format!("failed to build Duchon kernel constraint nullspace: {err}"))
 }
 
 /// Parse the optional ``nullspace_order`` keyword on the primitive Duchon
