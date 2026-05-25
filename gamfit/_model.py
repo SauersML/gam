@@ -774,28 +774,7 @@ class Model:
         return SchemaCheck.from_dict(payload)
 
     def report(self, path: str | Path | None = None) -> str:
-        """Generate a standalone HTML report of the fitted model.
-
-        The report contains the summary table, smooth-term visualisations,
-        and convergence diagnostics.  It is self-contained (no external
-        assets), so the file can be emailed or attached to a PR.
-
-        Parameters
-        ----------
-        path:
-            If given, write the HTML to this path and return the path.
-            If ``None`` (default), return the HTML as a string.
-
-        Returns
-        -------
-        str
-            HTML string (when ``path is None``) or the written path.
-
-        Examples
-        --------
-        >>> model.report("report.html")
-        >>> html = model.report()             # for inline Jupyter display
-        """
+        """Render a standalone HTML report; writes to ``path`` if given else returns the HTML."""
         try:
             html = rust_module().report_html(self._model_bytes)
         except Exception as exc:
@@ -957,10 +936,12 @@ class Model:
         posterior coefficient simulation using the max standardized deviation
         across the whole grid.
         """
+        import json
+
         request: dict[str, Any] = {
             "view": view,
             "group": group,
-            "pairs": [[str(a), str(b)] for a, b in pairs] if pairs is not None else None,
+            "pairs": pairs,
             "n": int(n),
             "level": float(level),
             "simultaneous": bool(simultaneous),

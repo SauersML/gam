@@ -585,6 +585,188 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
     Ok(info.unbind())
 }
 
+#[pyfunction]
+fn interpolate_survival_surface<'py>(
+    py: Python<'py>,
+    grid: PyReadonlyArray1<'py, f64>,
+    surface: PyReadonlyArray2<'py, f64>,
+    query: PyReadonlyArray1<'py, f64>,
+    clip_lo: Option<f64>,
+    clip_hi: Option<f64>,
+) -> PyResult<Py<PyArray2<f64>>> {
+    let grid_view = grid.as_array();
+    let surface_view = surface.as_array();
+    let query_values: Vec<f64> = query.as_array().iter().copied().collect();
+    let n_grid = grid_view.len();
+    let (n_rows, n_cols) = surface_view.dim();
+    if n_grid == 0 || n_cols != n_grid {
+        return Err(py_value_error(
+            "survival interpolation requires a non-empty grid".to_string(),
+        ));
+    }
+
+    let mut order: Vec<(f64, usize)> = grid_view
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, value)| (value, index))
+        .collect();
+    order.sort_by(|left, right| left.0.partial_cmp(&right.0).unwrap_or(Ordering::Equal));
+    let sorted_grid: Vec<f64> = order.iter().map(|(value, _index)| *value).collect();
+    let sorted_indices: Vec<usize> = order
+        .iter()
+        .map(|(_value, index)| *index)
+        .collect();
+    let n_query = query_values.len();
+    let mut values = vec![0.0_f64; n_rows * n_query];
+
+    values
+        .par_chunks_mut(n_query.max(1))
+        .enumerate()
+        .for_each(|(row_idx, out_row)| {
+            if n_query == 0 {
+                return;
+            }
+            let surface_row = surface_view.row(row_idx);
+            for (query_idx, query_value) in query_values.iter().copied().enumerate() {
+                let mut interpolated = if query_value.is_nan() {
+                    f64::NAN
+                } else if query_value <= sorted_grid[0] {
+                    surface_row[sorted_indices[0]]
+                } else if query_value >= sorted_grid[n_grid - 1] {
+                    surface_row[sorted_indices[n_grid - 1]]
+                } else {
+                    let upper =
+                        sorted_grid.partition_point(|grid_value| *grid_value <= query_value);
+                    let lower = upper - 1;
+                    let x0 = sorted_grid[lower];
+                    let x1 = sorted_grid[upper];
+                    let y0 = surface_row[sorted_indices[lower]];
+                    let y1 = surface_row[sorted_indices[upper]];
+                    if x1 == x0 {
+                        y1
+                    } else {
+                        y0 + (query_value - x0) * (y1 - y0) / (x1 - x0)
+                    }
+                };
+                if let Some(lo) = clip_lo {
+                    if interpolated < lo {
+                        interpolated = lo;
+                    }
+                }
+                if let Some(hi) = clip_hi {
+                    if interpolated > hi {
+                        interpolated = hi;
+                    }
+                }
+                out_row[query_idx] = interpolated;
+            }
+        });
+
+    let out = Array2::from_shape_vec((n_rows, n_query), values).map_err(|err| {
+        py_value_error(format!(
+            "failed to assemble survival interpolation result: {err}"
+        ))
+    })?;
+    Ok(out.into_pyarray(py).unbind())
+}
+
+#[pyfunction]
+fn default_survival_time_grid(
+    formula: &str,
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+) -> PyResult<Option<Vec<f64>>> {
+    let re = Regex::new(r"^\s*Surv\s*\(\s*([^\s,]+)\s*,\s*([^\s,]+)\s*,\s*[^\s,]+\s*\)")
+        .map_err(|err| py_value_error(format!("invalid survival formula regex: {err}")))?;
+    let Some(captures) = re.captures(formula) else {
+        return Ok(None);
+    };
+    let entry_name = captures
+        .get(1)
+        .map(|matched| matched.as_str())
+        .unwrap_or_default();
+    let exit_name = captures
+        .get(2)
+        .map(|matched| matched.as_str())
+        .unwrap_or_default();
+
+    let header_to_index: HashMap<&str, usize> = headers
+        .iter()
+        .enumerate()
+        .map(|(index, name)| (name.as_str(), index))
+        .collect();
+    let entry_idx = header_to_index.get(entry_name).copied();
+    let exit_idx = header_to_index.get(exit_name).copied();
+    if entry_idx.is_none() || exit_idx.is_none() {
+        let mut missing = Vec::new();
+        if entry_idx.is_none() {
+            missing.push(entry_name);
+        }
+        if exit_idx.is_none() {
+            missing.push(exit_name);
+        }
+        return Err(py_value_error(format!(
+            "survival prediction data is missing required time column(s): {}",
+            missing.join(", ")
+        )));
+    }
+    let entry_idx = entry_idx.unwrap();
+    let exit_idx = exit_idx.unwrap();
+
+    let mut lo = f64::INFINITY;
+    let mut hi = f64::NEG_INFINITY;
+    let mut observed = false;
+    for (row_index, row) in rows.iter().enumerate() {
+        let entry_cell = row.get(entry_idx).ok_or_else(|| {
+            py_value_error(format!(
+                "survival entry column {entry_name:?} is missing at row {}",
+                row_index + 1
+            ))
+        })?;
+        let exit_cell = row.get(exit_idx).ok_or_else(|| {
+            py_value_error(format!(
+                "survival exit column {exit_name:?} is missing at row {}",
+                row_index + 1
+            ))
+        })?;
+        let entry_value = entry_cell.parse::<f64>().map_err(|_err| {
+            py_value_error(format!(
+                "survival entry column {entry_name:?} has a non-numeric value at row {}: {entry_cell:?}",
+                row_index + 1
+            ))
+        })?;
+        let exit_value = exit_cell.parse::<f64>().map_err(|_err| {
+            py_value_error(format!(
+                "survival exit column {exit_name:?} has a non-numeric value at row {}: {exit_cell:?}",
+                row_index + 1
+            ))
+        })?;
+        if !entry_value.is_finite() || !exit_value.is_finite() {
+            return Err(py_value_error(
+                "survival time columns must contain only finite values".to_string(),
+            ));
+        }
+        lo = lo.min(entry_value);
+        hi = hi.max(exit_value);
+        observed = true;
+    }
+    if !observed {
+        return Ok(None);
+    }
+    if hi <= lo {
+        return Err(py_value_error(format!(
+            "survival exit times must extend beyond entry times; got min entry {lo} and max exit {hi}"
+        )));
+    }
+    let span = hi - lo;
+    let hi_padded = hi + (span * 1.0e-6).max(1.0e-9);
+    let step = (hi_padded - lo) / 63.0;
+    Ok(Some(
+        (0..64).map(|index| lo + step * (index as f64)).collect(),
+    ))
+}
+
 #[pyfunction(signature = (headers, rows, formula, config_json = None, fisher_rao_w = None))]
 fn fit_table(
     py: Python<'_>,
@@ -10959,6 +11141,8 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(classify_exception_message, module)?)?;
     module.add_function(wrap_pyfunction!(sklearn_fit_metadata, module)?)?;
     module.add_function(wrap_pyfunction!(build_info, module)?)?;
+    module.add_function(wrap_pyfunction!(interpolate_survival_surface, module)?)?;
+    module.add_function(wrap_pyfunction!(default_survival_time_grid, module)?)?;
     module.add_function(wrap_pyfunction!(torch_from_fitted, module)?)?;
     module.add_function(wrap_pyfunction!(fit_table, module)?)?;
     module.add_function(wrap_pyfunction!(fit_array, module)?)?;
