@@ -16482,6 +16482,211 @@ fn response_geometry_simplex_frechet_mean<'py>(
     Ok(Array1::from_vec(out).into_pyarray(py).unbind())
 }
 
+// ------------------------------------------------------------------
+// Poincaré ball / Lorentz model primitives.
+// ------------------------------------------------------------------
+
+#[pyfunction]
+fn poincare_mobius_add<'py>(
+    py: Python<'py>,
+    u: PyReadonlyArray1<'py, f64>,
+    v: PyReadonlyArray1<'py, f64>,
+    curvature: f64,
+) -> PyResult<Py<PyArray1<f64>>> {
+    let u_owned = u.as_array().to_owned();
+    let v_owned = v.as_array().to_owned();
+    let out = detach_py_result(py, "poincare_mobius_add", move || {
+        poincare_mobius_add_impl(u_owned.view(), v_owned.view(), curvature)
+            .map_err(|e| e.to_string())
+    })?;
+    Ok(out.into_pyarray(py).unbind())
+}
+
+#[pyfunction]
+fn poincare_distance<'py>(
+    py: Python<'py>,
+    a: PyReadonlyArray1<'py, f64>,
+    b: PyReadonlyArray1<'py, f64>,
+    curvature: f64,
+) -> PyResult<f64> {
+    let a_owned = a.as_array().to_owned();
+    let b_owned = b.as_array().to_owned();
+    detach_py_result(py, "poincare_distance", move || {
+        poincare_distance_impl(a_owned.view(), b_owned.view(), curvature)
+            .map_err(|e| e.to_string())
+    })
+}
+
+#[pyfunction]
+fn poincare_project_into_ball<'py>(
+    py: Python<'py>,
+    point: PyReadonlyArray1<'py, f64>,
+    curvature: f64,
+) -> PyResult<Py<PyArray1<f64>>> {
+    let owned = point.as_array().to_owned();
+    let out = detach_py_result(py, "poincare_project_into_ball", move || {
+        poincare_project_into_ball_impl(owned.view(), curvature).map_err(|e| e.to_string())
+    })?;
+    Ok(out.into_pyarray(py).unbind())
+}
+
+#[pyfunction]
+fn poincare_log_origin<'py>(
+    py: Python<'py>,
+    y: PyReadonlyArray1<'py, f64>,
+    curvature: f64,
+) -> PyResult<Py<PyArray1<f64>>> {
+    let owned = y.as_array().to_owned();
+    let out = detach_py_result(py, "poincare_log_origin", move || {
+        poincare_log_origin_impl(owned.view(), curvature).map_err(|e| e.to_string())
+    })?;
+    Ok(out.into_pyarray(py).unbind())
+}
+
+#[pyfunction]
+fn poincare_exp_origin<'py>(
+    py: Python<'py>,
+    v: PyReadonlyArray1<'py, f64>,
+    curvature: f64,
+) -> PyResult<Py<PyArray1<f64>>> {
+    let owned = v.as_array().to_owned();
+    let out = detach_py_result(py, "poincare_exp_origin", move || {
+        poincare_exp_origin_impl(owned.view(), curvature).map_err(|e| e.to_string())
+    })?;
+    Ok(out.into_pyarray(py).unbind())
+}
+
+#[pyfunction]
+fn poincare_to_lorentz<'py>(
+    py: Python<'py>,
+    y: PyReadonlyArray1<'py, f64>,
+    curvature: f64,
+) -> PyResult<Py<PyArray1<f64>>> {
+    let owned = y.as_array().to_owned();
+    let out = detach_py_result(py, "poincare_to_lorentz", move || {
+        poincare_to_lorentz_impl(owned.view(), curvature).map_err(|e| e.to_string())
+    })?;
+    Ok(out.into_pyarray(py).unbind())
+}
+
+#[pyfunction]
+fn poincare_from_lorentz<'py>(
+    py: Python<'py>,
+    x: PyReadonlyArray1<'py, f64>,
+    curvature: f64,
+) -> PyResult<Py<PyArray1<f64>>> {
+    let owned = x.as_array().to_owned();
+    let out = detach_py_result(py, "poincare_from_lorentz", move || {
+        poincare_from_lorentz_impl(owned.view(), curvature).map_err(|e| e.to_string())
+    })?;
+    Ok(out.into_pyarray(py).unbind())
+}
+
+#[pyfunction]
+fn poincare_lorentz_log_origin<'py>(
+    py: Python<'py>,
+    x: PyReadonlyArray1<'py, f64>,
+    curvature: f64,
+) -> PyResult<Py<PyArray1<f64>>> {
+    let owned = x.as_array().to_owned();
+    let out = detach_py_result(py, "poincare_lorentz_log_origin", move || {
+        poincare_lorentz_log_origin_impl(owned.view(), curvature).map_err(|e| e.to_string())
+    })?;
+    Ok(out.into_pyarray(py).unbind())
+}
+
+#[pyfunction]
+fn poincare_lorentz_exp_origin<'py>(
+    py: Python<'py>,
+    v_spatial: PyReadonlyArray1<'py, f64>,
+    curvature: f64,
+) -> PyResult<Py<PyArray1<f64>>> {
+    let owned = v_spatial.as_array().to_owned();
+    let out = detach_py_result(py, "poincare_lorentz_exp_origin", move || {
+        poincare_lorentz_exp_origin_impl(owned.view(), curvature).map_err(|e| e.to_string())
+    })?;
+    Ok(out.into_pyarray(py).unbind())
+}
+
+/// Forward pass for the Poincaré tangent-space-at-origin decoder.
+///
+/// Returns `(x_hat, atoms_projected, v, tangents)` so the Python
+/// autograd.Function can stash them and use them on the backward pass
+/// without recomputing.
+#[pyfunction]
+fn poincare_tangent_decode_forward<'py>(
+    py: Python<'py>,
+    atoms: PyReadonlyArray2<'py, f64>,
+    gates: PyReadonlyArray2<'py, f64>,
+    curvature: f64,
+) -> PyResult<(
+    Py<PyArray2<f64>>,
+    Py<PyArray2<f64>>,
+    Py<PyArray2<f64>>,
+    Py<PyArray2<f64>>,
+)> {
+    let atoms_owned = atoms.as_array().to_owned();
+    let gates_owned = gates.as_array().to_owned();
+    let (x_hat, cache) = detach_py_result(py, "poincare_tangent_decode_forward", move || {
+        poincare_tangent_decode_forward_impl(atoms_owned.view(), gates_owned.view(), curvature)
+            .map_err(|e| e.to_string())
+    })?;
+    Ok((
+        x_hat.into_pyarray(py).unbind(),
+        cache.atoms_projected.into_pyarray(py).unbind(),
+        cache.v.into_pyarray(py).unbind(),
+        cache.tangents.into_pyarray(py).unbind(),
+    ))
+}
+
+/// Backward pass that consumes the cached state returned by the forward.
+///
+/// Returns `(grad_gates, grad_atoms)`.
+#[pyfunction]
+fn poincare_tangent_decode_backward<'py>(
+    py: Python<'py>,
+    atoms_projected: PyReadonlyArray2<'py, f64>,
+    gates: PyReadonlyArray2<'py, f64>,
+    v: PyReadonlyArray2<'py, f64>,
+    tangents: PyReadonlyArray2<'py, f64>,
+    grad_x_hat: PyReadonlyArray2<'py, f64>,
+    curvature: f64,
+) -> PyResult<(Py<PyArray2<f64>>, Py<PyArray2<f64>>)> {
+    let atoms_p = atoms_projected.as_array().to_owned();
+    let gates_owned = gates.as_array().to_owned();
+    let v_owned = v.as_array().to_owned();
+    let tangents_owned = tangents.as_array().to_owned();
+    let grad_owned = grad_x_hat.as_array().to_owned();
+    let (gg, ga) = detach_py_result(py, "poincare_tangent_decode_backward", move || {
+        let cache = gam::geometry::poincare::TangentDecodeCache {
+            atoms_projected: atoms_p,
+            gates: gates_owned,
+            v: v_owned,
+            tangents: tangents_owned,
+            curvature,
+        };
+        poincare_tangent_decode_backward_impl(&cache, grad_owned.view())
+            .map_err(|e| e.to_string())
+    })?;
+    Ok((gg.into_pyarray(py).unbind(), ga.into_pyarray(py).unbind()))
+}
+
+#[pyfunction]
+fn poincare_lorentz_decode_forward<'py>(
+    py: Python<'py>,
+    atoms: PyReadonlyArray2<'py, f64>,
+    gates: PyReadonlyArray2<'py, f64>,
+    curvature: f64,
+) -> PyResult<Py<PyArray2<f64>>> {
+    let atoms_owned = atoms.as_array().to_owned();
+    let gates_owned = gates.as_array().to_owned();
+    let out = detach_py_result(py, "poincare_lorentz_decode_forward", move || {
+        poincare_lorentz_decode_forward_impl(atoms_owned.view(), gates_owned.view(), curvature)
+            .map_err(|e| e.to_string())
+    })?;
+    Ok(out.into_pyarray(py).unbind())
+}
+
 #[pyfunction(signature = (values, base, coordinates, reference = -1))]
 fn response_geometry_simplex_log_map<'py>(
     py: Python<'py>,
@@ -20205,6 +20410,18 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
         response_geometry_simplex_frechet_mean,
         module
     )?)?;
+    module.add_function(wrap_pyfunction!(poincare_mobius_add, module)?)?;
+    module.add_function(wrap_pyfunction!(poincare_distance, module)?)?;
+    module.add_function(wrap_pyfunction!(poincare_project_into_ball, module)?)?;
+    module.add_function(wrap_pyfunction!(poincare_log_origin, module)?)?;
+    module.add_function(wrap_pyfunction!(poincare_exp_origin, module)?)?;
+    module.add_function(wrap_pyfunction!(poincare_to_lorentz, module)?)?;
+    module.add_function(wrap_pyfunction!(poincare_from_lorentz, module)?)?;
+    module.add_function(wrap_pyfunction!(poincare_lorentz_log_origin, module)?)?;
+    module.add_function(wrap_pyfunction!(poincare_lorentz_exp_origin, module)?)?;
+    module.add_function(wrap_pyfunction!(poincare_tangent_decode_forward, module)?)?;
+    module.add_function(wrap_pyfunction!(poincare_tangent_decode_backward, module)?)?;
+    module.add_function(wrap_pyfunction!(poincare_lorentz_decode_forward, module)?)?;
     module.add_function(wrap_pyfunction!(response_geometry_simplex_log_map, module)?)?;
     module.add_function(wrap_pyfunction!(response_geometry_simplex_exp_map, module)?)?;
     module.add_function(wrap_pyfunction!(response_geometry_sphere_log_map, module)?)?;
@@ -20337,6 +20554,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(mechanism_sparsity_jacobian, module)?)?;
     module.add_function(wrap_pyfunction!(conditional_prior_ivae, module)?)?;
     module.add_function(wrap_pyfunction!(partial_supervision_solve, module)?)?;
+    module.add_function(wrap_pyfunction!(thin_svd_scores, module)?)?;
     module.add_function(wrap_pyfunction!(
         identifiable_factor_select_weights_array,
         module
