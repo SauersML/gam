@@ -20978,25 +20978,44 @@ pub fn bspline_tensor_first_derivative(
     // Scratch per row: per-axis value vector and derivative vector.
     let mut values_per_axis: Vec<Vec<f64>> = k_per_axis.iter().map(|&k| vec![0.0; k]).collect();
     let mut derivs_per_axis: Vec<Vec<f64>> = k_per_axis.iter().map(|&k| vec![0.0; k]).collect();
+    // Hoist per-axis scratch allocations outside the row loop. Previously each
+    // row reallocated a fresh `BsplineScratch` for the value path and (via
+    // `evaluate_bspline_derivative_scalar`) a fresh lower-basis `Vec<f64>` and
+    // lower-degree `BsplineScratch` for the derivative path on every axis,
+    // turning the tensor evaluator into O(n_rows · n_axes) heap traffic.
+    let mut value_scratch_per_axis: Vec<internal::BsplineScratch> = degrees
+        .iter()
+        .map(|&d| internal::BsplineScratch::new(d))
+        .collect();
+    let mut lower_basis_per_axis: Vec<Vec<f64>> = knots_per_axis
+        .iter()
+        .zip(degrees.iter())
+        .map(|(knots, &d)| vec![0.0; knots.len().saturating_sub(d)])
+        .collect();
+    let mut lower_scratch_per_axis: Vec<internal::BsplineScratch> = degrees
+        .iter()
+        .map(|&d| internal::BsplineScratch::new(d.saturating_sub(1)))
+        .collect();
     let mut idx = vec![0usize; n_axes];
     let mut prefix = vec![1.0; n_axes + 1];
     let mut suffix = vec![1.0; n_axes + 1];
     for n in 0..n_rows {
         // Evaluate B^{(a)} and (B^{(a)})' at t_{n, a} for each axis.
         for a in 0..n_axes {
-            let mut scratch = internal::BsplineScratch::new(degrees[a]);
             internal::evaluate_splines_at_point_into(
                 t[[n, a]],
                 degrees[a],
                 knots_per_axis[a],
                 &mut values_per_axis[a],
-                &mut scratch,
+                &mut value_scratch_per_axis[a],
             );
-            evaluate_bspline_derivative_scalar(
+            evaluate_bspline_derivative_scalar_into(
                 t[[n, a]],
                 knots_per_axis[a],
                 degrees[a],
                 &mut derivs_per_axis[a],
+                &mut lower_basis_per_axis[a],
+                &mut lower_scratch_per_axis[a],
             )?;
         }
         // Enumerate tensor product in row-major order matching

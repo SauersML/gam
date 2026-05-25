@@ -26997,6 +26997,56 @@ mod tests {
     }
 
     #[test]
+    fn blockwise_trust_region_uses_penalized_metric_not_raw_coefficient_size() {
+        let spec = ParameterBlockSpec {
+            name: "single_block".to_string(),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::<f64>::zeros((1, 3)),
+            )),
+            offset: Array1::zeros(1),
+            penalties: vec![],
+            nullspace_dims: vec![],
+            initial_log_lambdas: Array1::zeros(0),
+            initial_beta: None,
+        };
+        let h = array![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0e-10]];
+        let work = BlockWorkingSet::ExactNewton {
+            gradient: array![0.0, 0.0, 0.0],
+            hessian: SymmetricMatrix::Dense(h.clone()),
+        };
+        let s_lambda = Array2::<f64>::zeros((3, 3));
+        let raw_delta = array![2.0, -1.0, 2.0e5];
+        let raw_inf = raw_delta.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+        let radius = 20.0_f64;
+
+        let raw_inf_scaled = &raw_delta * (radius / raw_inf);
+        assert!(
+            raw_inf_scaled[0].abs() < 1.0e-3,
+            "the old raw coefficient cap would starve ordinary coordinates inside the block"
+        );
+
+        let (metric_delta, metric_norm) = truncate_block_step_to_metric_radius(
+            &spec,
+            &work,
+            &s_lambda,
+            raw_delta,
+            radius,
+            0.0,
+            RidgePolicy::explicit_stabilization_pospart(),
+        );
+        assert!(
+            metric_norm < radius,
+            "the near-null coordinate is large in beta-space but small in the block's penalized-Hessian metric"
+        );
+        assert!(
+            (metric_delta[0] - 2.0).abs() < 1.0e-12
+                && (metric_delta[1] + 1.0).abs() < 1.0e-12
+                && (metric_delta[2] - 2.0e5).abs() < 1.0e-6,
+            "blockwise trust regions must size steps in objective curvature units, not raw coefficient units"
+        );
+    }
+
+    #[test]
     fn joint_trust_region_rosenbrock_like_quadratic_is_armijo_safe() {
         // Local Rosenbrock-at-the-valley quadratic in variables (x, y):
         // f ≈ 0.5 * [dx, dy]' H [dx, dy], H = [[802, -400], [-400, 200]].

@@ -15,10 +15,14 @@ The three arguments are column names:
 
 - `entry`: left-truncation time. Use `0` if there is no truncation.
 - `exit`: observation time (event time or censoring time).
-- `event`: `1` if the event occurred at `exit`, `0` if censored.
+- `event`: integer event code. `0` means censored and `1` means the
+  event occurred at `exit`; contiguous positive codes `1..K` select a
+  joint competing-risks fit for the transformation and Weibull modes.
 
-All three columns must be numeric. `exit >= entry` is required per row.
-The 2-column R/mgcv form `Surv(time, status)` is rejected with an error
+All three columns must be numeric. Negative or non-finite times are
+rejected; zero times are accepted and internally floored, and `exit` is
+advanced to at least `entry + 1e-9` during fitting/prediction. The
+2-column R/mgcv form `Surv(time, status)` is rejected with an error
 message that suggests adding a zero `entry` column.
 
 ## Likelihood modes
@@ -27,13 +31,15 @@ Pass one of the following via `survival_likelihood=`:
 
 | Mode | Description |
 | --- | --- |
-| `"transformation"` | I-spline monotone log-cumulative-hazard baseline with linear or smooth covariate effects. Default. |
+| `"transformation"` | I-spline monotone log-cumulative-hazard baseline with linear or smooth covariate effects. CLI default. |
 | `"weibull"` | Weibull parametric baseline with linear covariate effects on the log hazard. |
 | `"location-scale"` | Joint location and log-scale survival model; requires a `noise_formula`. See [location-scale.md](location-scale.md). |
 | `"marginal-slope"` | Separates a calibrated risk-score effect from the baseline. See [marginal-slope.md](marginal-slope.md). |
 | `"latent"` | Parametric baseline with latent-Gaussian frailty integration. |
 | `"latent-binary"` | Binary response under the same latent-Gaussian framework as `"latent"`. |
 
+When omitted in `gamfit.fit(...)`, the Rust/Python fit path uses
+`"location-scale"`; the `gam fit` CLI default is `"transformation"`.
 `--predict-noise` requires `survival_likelihood="location-scale"`; it
 is rejected for every other survival mode.
 
@@ -50,12 +56,12 @@ For modes that support a parametric baseline (`"weibull"`,
 `"location-scale"`, `"latent"`, and `"transformation"` when used with
 `timewiggle(...)`), select it with `baseline_target=`:
 
-| `baseline_target` | Required extra parameters | Notes |
+| `baseline_target` | Fit-time parameter defaults | Notes |
 | --- | --- | --- |
 | `"linear"` | none | Linear-in-log-time baseline `[1, log(age)]`. Pair with `timewiggle(...)` for flexible departures. |
-| `"weibull"` | `baseline_scale > 0`, `baseline_shape > 0` | Monotone hazard. |
-| `"gompertz"` | `baseline_rate > 0`; `baseline_shape` optional (default 0.01, must be finite) | Exponentially-rising hazard. |
-| `"gompertz-makeham"` | `baseline_rate > 0`, `baseline_makeham > 0`; `baseline_shape` optional (default 0.01, must be finite) | Gompertz hazard plus a constant additive floor. |
+| `"weibull"` | `baseline_scale` defaults to the mean positive exit time; `baseline_shape` defaults to `1.0` | Monotone hazard. |
+| `"gompertz"` | `baseline_rate` defaults to `1 / mean_positive_exit`; `baseline_shape` defaults to `0.01` | Exponentially-rising hazard. |
+| `"gompertz-makeham"` | `baseline_rate` and `baseline_makeham` default to `0.5 / mean_positive_exit`; `baseline_shape` defaults to `0.01` | Gompertz hazard plus a constant additive floor. |
 
 ```python
 gamfit.fit(df,
@@ -78,7 +84,9 @@ It accepts the same options as `linkwiggle(...)`: `internal_knots`,
 `degree`, `penalty_order`, and `double_penalty`. With
 `survival_likelihood="transformation"`, set `baseline_target` to
 `"weibull"`, `"gompertz"`, or `"gompertz-makeham"` when using
-`timewiggle(...)`.
+`timewiggle(...)`. `timewiggle(...)` is also available for
+`"location-scale"`, `"marginal-slope"`, and `"weibull"` fits, but is
+rejected for `"latent"` and `"latent-binary"`.
 
 ## Frailty
 
@@ -113,14 +121,15 @@ a fixed `frailty_sd`; `"hazard-multiplier"` is rejected at fit time.
 
 ## Prediction
 
-`Model.predict(...)` returns a [`SurvivalPrediction`](predictions.md#survivalprediction)
-that evaluates the survival surface on a user-supplied time grid:
+For one-cause survival fits, `Model.predict(...)` returns a
+[`SurvivalPrediction`](predictions.md#survivalprediction) that evaluates
+the survival surface on a user-supplied time grid:
 
 ```python
 pred = model.predict(test_df)
 
 S = pred.survival_at([1, 5, 10, 20])
-F = pred.failure_at([10, 20])
+F = 1.0 - pred.survival_at([10, 20])
 h = pred.hazard_at([1, 5, 10, 20])
 H = pred.cumulative_hazard_at([10, 20])
 ```
@@ -135,8 +144,8 @@ for row_slice, time_slice, block in pred.survival_at_chunks([1, 5, 10, 20]):
 pred.write_survival_at_csv("surv.csv", times=[1, 5, 10, 20])
 ```
 
-For competing risks, predict each cause-specific endpoint and assemble
-CIFs on the same grid:
+For separate cause-specific fits, predict each endpoint and assemble CIFs
+on the same grid:
 
 ```python
 cif = gamfit.competing_risks_cif(
@@ -147,6 +156,12 @@ cif = gamfit.competing_risks_cif(
 disease_cif = cif.cif[0]
 overall_survival = cif.overall_survival
 ```
+
+If the fitted event column contains contiguous positive event codes
+`1..K`, `Model.predict(...)` returns a `CompetingRisksPrediction`
+directly. Its `hazard`, `survival`, `cumulative_hazard`, and `cif`
+arrays are endpoint-stacked with shape `(K * n_rows, n_times)`;
+`overall_survival` has shape `(n_rows, n_times)`.
 
 ## Uncertainty on the survival surface
 
@@ -163,38 +178,11 @@ upper = (S + 1.96 * se_S).clip(0.0, 1.0)
 lower = (S - 1.96 * se_S).clip(0.0, 1.0)
 ```
 
-For other survival modes, use `Model.sample(...)` to draw posterior
-coefficients, then push them through `PosteriorSamples.predict(...)` /
-`predict_draws(...)`. Those methods are restricted to standard,
-non-link-wiggle GAMs; see [posterior-sampling.md](posterior-sampling.md).
-
-## Paired competing-risks posterior CIF
-
-For two cause-specific fits, `sample_paired(...)` aligns draw `k` from
-the target-cause fit with draw `k` from the competing-cause fit. CIF
-integration and equal-tailed bands are computed in the Rust engine from
-those paired draws:
-
-```python
-disease_post = disease_model.sample_paired(
-    death_model,
-    train_df,
-    samples=1000,
-    chains=4,
-    seed=42,
-)
-
-times = [0, 1, 5, 10, 20]
-cif = disease_post.cumulative_incidence(test_df, times, level=0.95)
-
-cif.draws   # (n_draws, n_rows, n_times)
-cif.mean    # (n_rows, n_times)
-cif.lower
-cif.upper
-```
-
-Pass `competing_data=` to `sample_paired(...)` when the two fits need
-different training tables.
+Other survival likelihood modes reject `with_uncertainty=True` at the
+Rust boundary. `Model.sample(...)` can draw posterior coefficients for
+supported saved survival models, but `PosteriorSamples.predict(...)` /
+`predict_draws(...)` are restricted to standard, non-link-wiggle GAMs;
+see [posterior-sampling.md](posterior-sampling.md).
 
 ## Example
 
