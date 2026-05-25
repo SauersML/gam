@@ -88,12 +88,31 @@ pub(crate) enum ContinuationFailure {
 }
 
 impl ContinuationFailure {
-    pub(crate) fn inner(&self) -> &InnerFailure {
+    pub(crate) fn message(&self) -> String {
         match self {
-            Self::PathBudgetExhausted { last, .. }
-            | Self::PathStuck { last, .. }
-            | Self::StructuralPropagate(last)
-            | Self::DomainAtOversmoothedStart(last) => last,
+            Self::PathBudgetExhausted {
+                last,
+                steps_taken,
+                final_rho,
+            } => format!(
+                "{} (continuation budget exhausted after {} step(s), final rho dim={})",
+                last.message(),
+                steps_taken,
+                final_rho.len()
+            ),
+            Self::PathStuck {
+                last,
+                rho_zero_offset,
+                final_rho,
+            } => format!(
+                "{} (continuation stuck at oversmooth offset {:.6e}, final rho dim={})",
+                last.message(),
+                rho_zero_offset,
+                final_rho.len()
+            ),
+            Self::StructuralPropagate(last) | Self::DomainAtOversmoothedStart(last) => {
+                last.message().to_string()
+            }
         }
     }
 }
@@ -810,10 +829,11 @@ mod tests {
             matches!(err, ContinuationFailure::StructuralPropagate(_)),
             "got {err:?}",
         );
-        match err.inner() {
-            InnerFailure::CertRefused { diagnosis, .. } => {
-                assert_eq!(*diagnosis, KktRefusalDiagnosis::ActiveSetIncomplete);
-            }
+        match err {
+            ContinuationFailure::StructuralPropagate(InnerFailure::CertRefused {
+                diagnosis,
+                ..
+            }) => assert_eq!(diagnosis, KktRefusalDiagnosis::ActiveSetIncomplete),
             other => panic!("expected CertRefused, got {other:?}"),
         }
     }
@@ -869,7 +889,7 @@ mod tests {
     #[test]
     fn pre_warm_failure_carries_underlying_message_for_seed_rejection() {
         // The outer wiring in run_outer_with_plan formats
-        // `cf.inner().message()` into the SeedRejection. Pin that
+        // `cf.message()` into the SeedRejection. Pin that
         // the message is preserved through the failure chain so the
         // existing classifier in StartupStats keeps working.
         let target = rho(&[0.0]);
@@ -882,7 +902,7 @@ mod tests {
             )],
         );
         let err = prime_outer_seed(&mut obj, &target, &upper).expect_err("propagation expected");
-        let msg = err.inner().message();
+        let msg = err.message();
         assert!(msg.contains("active_set_incomplete"), "msg='{msg}'");
     }
 }

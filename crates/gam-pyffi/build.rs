@@ -33,6 +33,10 @@ fn main() {
         "$ORIGIN/../nvidia/cublas/lib",
         "$ORIGIN/../nvidia/cusparse/lib",
         "$ORIGIN/../nvidia/cusolver/lib",
+        "/usr/local/nvidia/lib64",
+        "/usr/local/nvidia/lib",
+        "/usr/local/cuda/compat",
+        "/usr/lib/wsl/lib",
     ] {
         // `writeln!(io::stdout(), …)` produces the same bytes as `println!`
         // on stdout (which cargo captures for `cargo:` build-script

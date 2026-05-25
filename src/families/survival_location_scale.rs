@@ -1482,7 +1482,6 @@ struct SurvivalLocationScaleFamily {
     x_time_entry: Arc<Array2<f64>>,
     x_time_exit: Arc<Array2<f64>>,
     x_time_deriv: Arc<Array2<f64>>,
-    time_derivative_offset_exit: Arc<Array1<f64>>,
     time_wiggle_knots: Option<Array1<f64>>,
     time_wiggle_degree: Option<usize>,
     time_wiggle_ncols: usize,
@@ -1616,15 +1615,6 @@ struct SurvivalJointQuantities {
     /// Exit-only derivatives of ell w.r.t. qdot1 = dq/dt.
     d1_qdot1: Array1<f64>,
     d2_qdot1: Array1<f64>,
-    /// First-order gradient drivers for the time, log-σ, and time-derivative
-    /// (η_d) sub-blocks. Scaled by the same `deriv_log_scale` as `d1_q*`:
-    /// the row formulas `w * r0`, `w * event_mix(d, dlogphi1, -r1)`, and
-    /// `w * d * d_log_g` reuse the rescaled kernel quantities, so callers
-    /// that supply a nonzero `deriv_log_scale` see these fields uniformly
-    /// rescaled. `evaluate()` always calls with `deriv_log_scale = 0`.
-    grad_time_eta_h0: Array1<f64>,
-    grad_time_eta_h1: Array1<f64>,
-    grad_time_eta_d: Array1<f64>,
     h_time_h0: Array1<f64>,
     h_time_h1: Array1<f64>,
     h_time_d: Array1<f64>,
@@ -2129,9 +2119,6 @@ impl SurvivalLocationScaleFamily {
         let mut d3_q1 = Array1::<f64>::zeros(n);
         let mut d1_qdot1 = Array1::<f64>::zeros(n);
         let mut d2_qdot1 = Array1::<f64>::zeros(n);
-        let mut grad_time_eta_h0 = Array1::<f64>::zeros(n);
-        let mut grad_time_eta_h1 = Array1::<f64>::zeros(n);
-        let mut grad_time_eta_d = Array1::<f64>::zeros(n);
         let mut h_time_h0 = Array1::<f64>::zeros(n);
         let mut h_time_h1 = Array1::<f64>::zeros(n);
         let mut h_time_d = Array1::<f64>::zeros(n);
@@ -2182,9 +2169,6 @@ impl SurvivalLocationScaleFamily {
         let p_d3_q1 = SendPtr(d3_q1.as_mut_ptr());
         let p_d1_qdot1 = SendPtr(d1_qdot1.as_mut_ptr());
         let p_d2_qdot1 = SendPtr(d2_qdot1.as_mut_ptr());
-        let p_grad_time_eta_h0 = SendPtr(grad_time_eta_h0.as_mut_ptr());
-        let p_grad_time_eta_h1 = SendPtr(grad_time_eta_h1.as_mut_ptr());
-        let p_grad_time_eta_d = SendPtr(grad_time_eta_d.as_mut_ptr());
         let p_h_time_h0 = SendPtr(h_time_h0.as_mut_ptr());
         let p_h_time_h1 = SendPtr(h_time_h1.as_mut_ptr());
         let p_h_time_d = SendPtr(h_time_d.as_mut_ptr());
@@ -2222,9 +2206,6 @@ impl SurvivalLocationScaleFamily {
                     p_d3_q1.write(i, row.d3_q1);
                     p_d1_qdot1.write(i, row.d1_qdot1);
                     p_d2_qdot1.write(i, row.d2_qdot1);
-                    p_grad_time_eta_h0.write(i, row.grad_time_eta_h0);
-                    p_grad_time_eta_h1.write(i, row.grad_time_eta_h1);
-                    p_grad_time_eta_d.write(i, row.grad_time_eta_d);
                     p_h_time_h0.write(i, row.h_time_h0);
                     p_h_time_h1.write(i, row.h_time_h1);
                     p_h_time_d.write(i, row.h_time_d);
@@ -2247,9 +2228,6 @@ impl SurvivalLocationScaleFamily {
             d3_q1,
             d1_qdot1,
             d2_qdot1,
-            grad_time_eta_h0,
-            grad_time_eta_h1,
-            grad_time_eta_d,
             h_time_h0,
             h_time_h1,
             h_time_d,
@@ -4593,7 +4571,6 @@ fn prepare_survival_location_scale_model(
         x_time_entry: Arc::new(time_prepared.design_entry.clone()),
         x_time_exit: Arc::new(time_prepared.design_exit.clone()),
         x_time_deriv: Arc::new(time_prepared.design_derivative_exit.clone()),
-        time_derivative_offset_exit: Arc::new(spec.time_block.derivative_offset_exit.clone()),
         time_wiggle_knots: spec.timewiggle_block.as_ref().map(|w| w.knots.clone()),
         time_wiggle_degree: spec.timewiggle_block.as_ref().map(|w| w.degree),
         time_wiggle_ncols: protected_timewiggle_cols,
@@ -8659,116 +8636,6 @@ impl SurvivalLocationScaleFamily {
 
         Ok((ll, block_gradients))
     }
-
-    /// Assemble per-block coefficient gradients from a precomputed
-    /// `SurvivalJointQuantities` + `SurvivalDynamicGeometry`. Bit-identical
-    /// to the post-row matvec block in
-    /// [`Self::evaluate_log_likelihood_and_block_gradients_masked`] when
-    /// invoked with `row_mask = None`: every retained operation is the same
-    /// op on the same scalar inputs.
-    ///
-    /// This is the fused-path entry point used by `evaluate()`. The mask-
-    /// aware branch is not replicated here because no external caller wires
-    /// HT-subsampling through the joint gradient row loop; the `_masked`
-    /// plumbing in the legacy gradient pass is dead code that will be
-    /// removed when the legacy entry point is retired.
-    fn evaluate_block_gradients_from_quantities(
-        &self,
-        q: &SurvivalJointQuantities,
-        dynamic: &SurvivalDynamicGeometry,
-    ) -> Vec<Array1<f64>> {
-        let n = self.n;
-
-        let grad_time = dynamic.time_jac_entry.t().dot(&q.grad_time_eta_h0)
-            + dynamic.time_jac_exit.t().dot(&q.grad_time_eta_h1)
-            + dynamic.time_jac_deriv.t().dot(&q.grad_time_eta_d);
-
-        let mut scratch = Array1::<f64>::zeros(n);
-
-        let grad_t = if let (Some(x_t_entry), Some(x_t_deriv)) = (
-            self.x_threshold_entry.as_ref(),
-            self.x_threshold_deriv.as_ref(),
-        ) {
-            ndarray::Zip::from(&mut scratch)
-                .and(&q.d1_q1)
-                .and(&dynamic.dq_t_exit)
-                .and(&q.d1_qdot1)
-                .and(&dynamic.dqdot_t)
-                .for_each(|s, &a, &b, &c, &d| *s = a * b + c * d);
-            let mut out = self.x_threshold.transpose_vector_multiply(&scratch);
-            ndarray::Zip::from(&mut scratch)
-                .and(&q.d1_q0)
-                .and(&dynamic.dq_t_entry)
-                .for_each(|s, &a, &b| *s = a * b);
-            out = out + x_t_entry.transpose_vector_multiply(&scratch);
-            ndarray::Zip::from(&mut scratch)
-                .and(&q.d1_qdot1)
-                .and(&dynamic.dqdot_td)
-                .for_each(|s, &a, &b| *s = a * b);
-            out + x_t_deriv.transpose_vector_multiply(&scratch)
-        } else {
-            ndarray::Zip::from(&mut scratch)
-                .and(&q.d1_q1)
-                .and(&dynamic.dq_t_exit)
-                .and(&q.d1_q0)
-                .and(&dynamic.dq_t_entry)
-                .for_each(|s, &a, &b, &c, &d| *s = a * b + c * d);
-            ndarray::Zip::from(&mut scratch)
-                .and(&q.d1_qdot1)
-                .and(&dynamic.dqdot_t)
-                .for_each(|s, &a, &b| *s += a * b);
-            self.x_threshold.transpose_vector_multiply(&scratch)
-        };
-
-        let grad_ls = if let (Some(x_ls_entry), Some(x_ls_deriv)) = (
-            self.x_log_sigma_entry.as_ref(),
-            self.x_log_sigma_deriv.as_ref(),
-        ) {
-            ndarray::Zip::from(&mut scratch)
-                .and(&q.d1_q1)
-                .and(&dynamic.dq_ls_exit)
-                .and(&q.d1_qdot1)
-                .and(&dynamic.dqdot_ls)
-                .for_each(|s, &a, &b, &c, &d| *s = a * b + c * d);
-            let mut out = self.x_log_sigma.transpose_vector_multiply(&scratch);
-            ndarray::Zip::from(&mut scratch)
-                .and(&q.d1_q0)
-                .and(&dynamic.dq_ls_entry)
-                .for_each(|s, &a, &b| *s = a * b);
-            out = out + x_ls_entry.transpose_vector_multiply(&scratch);
-            ndarray::Zip::from(&mut scratch)
-                .and(&q.d1_qdot1)
-                .and(&dynamic.dqdot_lsd)
-                .for_each(|s, &a, &b| *s = a * b);
-            out + x_ls_deriv.transpose_vector_multiply(&scratch)
-        } else {
-            ndarray::Zip::from(&mut scratch)
-                .and(&q.d1_q1)
-                .and(&dynamic.dq_ls_exit)
-                .and(&q.d1_q0)
-                .and(&dynamic.dq_ls_entry)
-                .for_each(|s, &a, &b, &c, &d| *s = a * b + c * d);
-            ndarray::Zip::from(&mut scratch)
-                .and(&q.d1_qdot1)
-                .and(&dynamic.dqdot_ls)
-                .for_each(|s, &a, &b| *s += a * b);
-            self.x_log_sigma.transpose_vector_multiply(&scratch)
-        };
-
-        let mut block_gradients = vec![grad_time, grad_t, grad_ls];
-        if let (Some(xw_exit), Some(xw_entry), Some(xw_qdot)) = (
-            dynamic.wiggle_basis_exit.as_ref(),
-            dynamic.wiggle_basis_entry.as_ref(),
-            dynamic.wiggle_qdot_basis_exit.as_ref(),
-        ) {
-            let gradw = xw_exit.t().dot(&q.d1_q1)
-                + xw_entry.t().dot(&q.d1_q0)
-                + xw_qdot.t().dot(&q.d1_qdot1);
-            block_gradients.push(gradw);
-        }
-
-        block_gradients
-    }
 }
 
 /// Observed vs expected information: The survival location-scale family uses
@@ -11169,7 +11036,6 @@ mod tests {
             x_time_entry: Arc::new(array![[1.0], [1.0], [1.0]]),
             x_time_exit: Arc::new(array![[1.2], [0.9], [1.4]]),
             x_time_deriv: Arc::new(array![[1.0], [1.0], [1.0]]),
-            time_derivative_offset_exit: Arc::new(Array1::from_elem(3, 1e-8)),
             time_wiggle_knots: None,
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
@@ -14121,7 +13987,6 @@ mod tests {
             x_time_entry: Arc::new(x_entry),
             x_time_exit: Arc::new(x_exit.clone()),
             x_time_deriv: Arc::new(x_deriv.clone()),
-            time_derivative_offset_exit: Arc::new(offset_deriv.clone()),
             time_wiggle_knots: None,
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
@@ -14250,10 +14115,6 @@ mod tests {
             x_time_entry: Arc::new(Array2::zeros((n, 1))),
             x_time_exit: Arc::new(Array2::ones((n, 1))),
             x_time_deriv: Arc::new(Array2::ones((n, 1))),
-            time_derivative_offset_exit: Arc::new(Array1::from_elem(
-                n,
-                DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD,
-            )),
             time_wiggle_knots: None,
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,

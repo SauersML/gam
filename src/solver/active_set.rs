@@ -123,31 +123,6 @@ fn solve_newton_direction_dense(
     ))
 }
 
-fn solve_symmetric_system(
-    matrix: &Array2<f64>,
-    rhs: &Array1<f64>,
-    out: &mut Array1<f64>,
-) -> Result<(), EstimationError> {
-    if out.len() != rhs.len() {
-        *out = Array1::zeros(rhs.len());
-    }
-    out.assign(rhs);
-    let factor = StableSolver::new("active-set symmetric system")
-        .factorize(matrix)
-        .map_err(|_| {
-            EstimationError::InvalidInput("symmetric system factorization failed".to_string())
-        })?;
-    out.assign(rhs);
-    let mut rhsview = array1_to_col_matmut(out);
-    factor.solve_in_place(rhsview.as_mut());
-    if array1_is_finite(out) {
-        return Ok(());
-    }
-    Err(EstimationError::InvalidInput(
-        "symmetric system solve produced non-finite values".to_string(),
-    ))
-}
-
 fn solve_dense_system_via_pseudoinverse(
     matrix: &Array2<f64>,
     rhs: &Array1<f64>,
@@ -488,7 +463,7 @@ pub(crate) struct CompressedActiveWorkingSet {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct ActiveRowDependence {
+pub(crate) struct ActiveRowDependence {
     active_pos: usize,
     coeff: f64,
 }

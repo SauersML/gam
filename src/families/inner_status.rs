@@ -62,9 +62,7 @@ pub(crate) enum InnerFailure {
     /// solver couldn't classify this" from "the design is provably
     /// unfittable in its current shape". No rho-anneal recovers this;
     /// the structural fix is to reparameterise the aliased block.
-    IdentifiabilityFailure {
-        audit: crate::solver::identifiability_audit::IdentifiabilityAudit,
-    },
+    IdentifiabilityFailure { message: String },
     /// Catch-all for legacy error strings that do not match any of the
     /// structured sentinels above. These are still rejected; the outer
     /// cascade just cannot classify them.
@@ -79,12 +77,15 @@ impl InnerFailure {
             | InnerFailure::TrustRegionFloor { message }
             | InnerFailure::LikelihoodFailure(message)
             | InnerFailure::Other(message) => message.as_str(),
-            InnerFailure::IdentifiabilityFailure { audit } => audit.summary.as_str(),
+            InnerFailure::IdentifiabilityFailure { message } => message.as_str(),
         }
     }
 }
 
 pub(crate) fn classify_inner_error(message: String) -> InnerFailure {
+    if message.contains("IdentifiabilityFailure") || message.contains("identifiability audit") {
+        return InnerFailure::IdentifiabilityFailure { message };
+    }
     // The diagnostician's structured cert-refusal bubbled error carries
     // `diagnosis: <label>` near the end. Look for that first.
     if let Some(diagnosis) = KktRefusalDiagnosis::parse_from_error(&message) {

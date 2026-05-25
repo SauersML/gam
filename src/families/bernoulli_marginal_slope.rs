@@ -7770,21 +7770,68 @@ impl BernoulliMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         options: Option<&BlockwiseFitOptions>,
     ) -> Result<BernoulliMarginalSlopeExactEvalCache, String> {
+        self.build_exact_eval_cache_with_options_and_context_rows(block_states, options, None)
+    }
+
+    fn build_exact_eval_cache_for_selected_context_rows(
+        &self,
+        block_states: &[ParameterBlockState],
+        options: &BlockwiseFitOptions,
+        context_rows: &[usize],
+    ) -> Result<BernoulliMarginalSlopeExactEvalCache, String> {
+        self.build_exact_eval_cache_with_options_and_context_rows(
+            block_states,
+            Some(options),
+            Some(context_rows),
+        )
+    }
+
+    fn build_exact_eval_cache_with_options_and_context_rows(
+        &self,
+        block_states: &[ParameterBlockState],
+        options: Option<&BlockwiseFitOptions>,
+        context_rows: Option<&[usize]>,
+    ) -> Result<BernoulliMarginalSlopeExactEvalCache, String> {
         self.validate_exact_block_state_shapes(block_states)?;
         let slices = block_slices(self);
         let primary = primary_slices(&slices);
         let n = self.y.len();
         let flex_active = self.effective_flex_active(block_states)?;
+        let selected_context_rows = context_rows.map(|rows| {
+            let mut selected = rows
+                .iter()
+                .copied()
+                .filter(|&row| row < n)
+                .collect::<Vec<_>>();
+            selected.sort_unstable();
+            selected.dedup();
+            selected
+        });
+        let context_row_count = selected_context_rows.as_ref().map_or(n, |rows| rows.len());
         let started = std::time::Instant::now();
+        let _heartbeat = crate::heartbeat::scope(format!(
+            "BMS exact-cache build n={n} context_rows={context_row_count} p={} flex={flex_active}",
+            slices.total
+        ));
         if log_exact_work(n) {
             log::info!(
-                "[BMS exact-cache] build start n={} p={} flex={}",
+                "[BMS exact-cache] build start n={} context_rows={} p={} flex={}",
                 n,
+                context_row_count,
                 slices.total,
                 flex_active
             );
         }
+        let preseed_started = std::time::Instant::now();
         self.preseed_intercept_warm_starts(block_states)?;
+        if log_exact_work(n) {
+            log::info!(
+                "[BMS exact-cache] preseed done n={} context_rows={} elapsed={:.3}s",
+                n,
+                context_row_count,
+                preseed_started.elapsed().as_secs_f64()
+            );
+        }
         if flex_active {
             exact_kernel::reset_tail_cell_moment_cache();
         }
@@ -7801,27 +7848,90 @@ impl BernoulliMarginalSlopeFamily {
         // `degree9_cells` cache is reconstructed below so the row-evaluation
         // fast path that consults `row_ctx.degree9_cells` still has its
         // cache. Numerical results are unchanged either way.
-        let row_contexts: Result<Vec<_>, String> = (0..n)
-            .into_par_iter()
-            .map(|row| {
-                self.build_row_exact_context_with_stats_and_cell_cache(
-                    row,
-                    block_states,
-                    Some(&stats),
-                    false,
-                )
-            })
-            .collect();
-        let row_contexts = row_contexts?;
+        let context_started = std::time::Instant::now();
+        let progress_step = (context_row_count / 10).max(1);
+        let completed_rows = AtomicUsize::new(0);
+        let row_contexts = if let Some(selected_rows) = selected_context_rows.as_ref() {
+            let computed = selected_rows
+                .par_iter()
+                .copied()
+                .map(|row| {
+                    let ctx = self.build_row_exact_context_with_stats_and_cell_cache(
+                        row,
+                        block_states,
+                        Some(&stats),
+                        false,
+                    )?;
+                    if log_exact_work(n) {
+                        let done = completed_rows.fetch_add(1, Ordering::Relaxed) + 1;
+                        if done == context_row_count || done % progress_step == 0 {
+                            log::info!(
+                                "[BMS exact-cache] row-context progress rows={}/{} elapsed={:.3}s",
+                                done,
+                                context_row_count,
+                                context_started.elapsed().as_secs_f64()
+                            );
+                        }
+                    }
+                    Ok((row, ctx))
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            let mut row_contexts = vec![
+                BernoulliMarginalSlopeRowExactContext {
+                    intercept: f64::NAN,
+                    m_a: f64::NAN,
+                    intercept_fast_path: false,
+                    degree9_cells: None,
+                };
+                n
+            ];
+            for (row, ctx) in computed {
+                row_contexts[row] = ctx;
+            }
+            row_contexts
+        } else {
+            (0..n)
+                .into_par_iter()
+                .map(|row| {
+                    let ctx = self.build_row_exact_context_with_stats_and_cell_cache(
+                        row,
+                        block_states,
+                        Some(&stats),
+                        false,
+                    )?;
+                    if log_exact_work(n) {
+                        let done = completed_rows.fetch_add(1, Ordering::Relaxed) + 1;
+                        if done == context_row_count || done % progress_step == 0 {
+                            log::info!(
+                                "[BMS exact-cache] row-context progress rows={}/{} elapsed={:.3}s",
+                                done,
+                                context_row_count,
+                                context_started.elapsed().as_secs_f64()
+                            );
+                        }
+                    }
+                    Ok(ctx)
+                })
+                .collect::<Result<Vec<_>, String>>()?
+        };
         let fast_path_rows = row_contexts
             .iter()
             .filter(|ctx| ctx.intercept_fast_path)
             .count();
-        log::debug!(
-            "[BMS exact-cache] row-intercept zero-deviation fast path rows={}/{}",
-            fast_path_rows,
-            n
-        );
+        if log_exact_work(n) {
+            log::info!(
+                "[BMS exact-cache] row-context done rows={} fast_path_rows={} elapsed={:.3}s",
+                context_row_count,
+                fast_path_rows,
+                context_started.elapsed().as_secs_f64()
+            );
+        } else {
+            log::debug!(
+                "[BMS exact-cache] row-intercept zero-deviation fast path rows={}/{}",
+                fast_path_rows,
+                n
+            );
+        }
         if flex_active {
             log::info!(
                 "bernoulli marginal-slope intercept seed short-circuit: cached={}, closed_form={}, full_solver={}, max_full_solver_iters={}, seed_residual_bins={{<=1e-12:{}, <=1e-10:{}, <=1e-8:{}, <=abs_tol:{}, >abs_tol:{}}}",
@@ -7858,18 +7968,10 @@ impl BernoulliMarginalSlopeFamily {
                 100.0 * tail_stats.hit_rate(),
             );
         }
-        if log_exact_work(n) {
-            log::info!(
-                "[BMS exact-cache] build done n={} p={} flex={} elapsed={:.3}s",
-                n,
-                slices.total,
-                flex_active,
-                started.elapsed().as_secs_f64()
-            );
-        }
         let row_cell_mask = options
             .and_then(|opts| opts.outer_score_subsample.as_ref())
             .map(|subsample| subsample.mask.as_slice());
+        let row_cell_started = std::time::Instant::now();
         let row_cell_moments = match row_cell_mask {
             Some(mask) => {
                 self.build_row_cell_moments_bundle(block_states, &row_contexts, 21, Some(mask))?
@@ -7879,6 +7981,23 @@ impl BernoulliMarginalSlopeFamily {
             }
             None => None,
         };
+        if log_exact_work(n) {
+            log::info!(
+                "[BMS exact-cache] row-cell phase done n={} selected_rows={} built={} elapsed={:.3}s",
+                n,
+                row_cell_mask.map_or(n, <[usize]>::len),
+                row_cell_moments.is_some(),
+                row_cell_started.elapsed().as_secs_f64()
+            );
+            log::info!(
+                "[BMS exact-cache] build done n={} context_rows={} p={} flex={} elapsed={:.3}s",
+                n,
+                context_row_count,
+                slices.total,
+                flex_active,
+                started.elapsed().as_secs_f64()
+            );
+        }
         Ok(BernoulliMarginalSlopeExactEvalCache {
             slices,
             primary,
@@ -7923,6 +8042,19 @@ impl BernoulliMarginalSlopeFamily {
         if selected_rows.is_empty() {
             return Ok(None);
         }
+        let selected_row_count = selected_rows.len();
+        let started = std::time::Instant::now();
+        let _heartbeat = crate::heartbeat::scope(format!(
+            "BMS row-cell-moments n={n} selected_rows={selected_row_count} degree={max_degree}"
+        ));
+        if log_exact_work(n) {
+            log::info!(
+                "[BMS row-cell-moments] partition start n={} selected_rows={} degree={}",
+                n,
+                selected_row_count,
+                max_degree
+            );
+        }
         let partitions: Vec<(usize, Vec<exact_kernel::DenestedPartitionCell>)> = selected_rows
             .into_par_iter()
             .map(|row| {
@@ -7940,6 +8072,15 @@ impl BernoulliMarginalSlopeFamily {
             .iter()
             .map(|(_, cells)| cells.len())
             .sum::<usize>();
+        if log_exact_work(n) {
+            log::info!(
+                "[BMS row-cell-moments] partition done n={} selected_rows={} cells={} elapsed={:.3}s",
+                n,
+                selected_n,
+                n_cells,
+                started.elapsed().as_secs_f64()
+            );
+        }
         let estimated_bytes =
             RowCellMomentsBundle::estimated_resident_bytes(n, n_cells, max_degree);
         let limit_bytes = self.policy.max_operator_cache_bytes;
@@ -7955,7 +8096,7 @@ impl BernoulliMarginalSlopeFamily {
             );
             return Ok(None);
         }
-        let started = std::time::Instant::now();
+        let moment_started = std::time::Instant::now();
         let computed_rows = partitions
             .into_par_iter()
             .map(|(row, cells)| {
@@ -7987,7 +8128,7 @@ impl BernoulliMarginalSlopeFamily {
                 n_cells,
                 max_degree,
                 estimated_bytes,
-                started.elapsed().as_secs_f64()
+                moment_started.elapsed().as_secs_f64()
             );
         }
         Ok(Some(RowCellMomentsBundle { max_degree, rows }))
@@ -8020,6 +8161,20 @@ impl BernoulliMarginalSlopeFamily {
             }
             return Ok(None);
         }
+        let started = std::time::Instant::now();
+        let _heartbeat = crate::heartbeat::scope(format!(
+            "BMS row-primary-hessian-cache n={n} r={r} bytes={cache_bytes}"
+        ));
+        if log_exact_work(n) {
+            log::info!(
+                "[BMS row-primary-hessian-cache] build start n={} r={} bytes={}",
+                n,
+                r,
+                cache_bytes
+            );
+        }
+        let completed_rows = AtomicUsize::new(0);
+        let progress_step = (n / 10).max(1);
         let mut packed = Array2::<f64>::zeros((n, r * r));
         packed
             .axis_iter_mut(Axis(0))
@@ -8044,8 +8199,27 @@ impl BernoulliMarginalSlopeFamily {
                 for (dst, src) in packed_row.iter_mut().zip(scratch.hess.iter()) {
                     *dst = *src;
                 }
+                if log_exact_work(n) {
+                    let done = completed_rows.fetch_add(1, Ordering::Relaxed) + 1;
+                    if done == n || done % progress_step == 0 {
+                        log::info!(
+                            "[BMS row-primary-hessian-cache] progress rows={}/{} elapsed={:.3}s",
+                            done,
+                            n,
+                            started.elapsed().as_secs_f64()
+                        );
+                    }
+                }
                 Ok(())
             })?;
+        if log_exact_work(n) {
+            log::info!(
+                "[BMS row-primary-hessian-cache] build done n={} r={} elapsed={:.3}s",
+                n,
+                r,
+                started.elapsed().as_secs_f64()
+            );
+        }
         Ok(Some(packed))
     }
 
@@ -12259,6 +12433,8 @@ impl BernoulliMarginalSlopeFamily {
         let primary = &cache.primary;
         let n = self.y.len();
         let started = std::time::Instant::now();
+        let _heartbeat =
+            crate::heartbeat::scope(format!("BMS dense-H build n={n} p={}", slices.total));
         if log_exact_work(n) {
             log::info!(
                 "[BMS dense-H] build start n={} p={} source=cache",
@@ -12266,7 +12442,10 @@ impl BernoulliMarginalSlopeFamily {
                 slices.total
             );
         }
-        let acc = (0..n.div_ceil(ROW_CHUNK_SIZE))
+        let n_chunks = n.div_ceil(ROW_CHUNK_SIZE);
+        let completed_chunks = AtomicUsize::new(0);
+        let progress_step = (n_chunks / 10).max(1);
+        let acc = (0..n_chunks)
             .into_par_iter()
             .try_fold(
                 || BernoulliBlockHessianAccumulator::new(slices),
@@ -12386,6 +12565,19 @@ impl BernoulliMarginalSlopeFamily {
                         h_w.as_ref(),
                         w_w.as_ref(),
                     )?;
+                    if log_exact_work(n) {
+                        let done = completed_chunks.fetch_add(1, Ordering::Relaxed) + 1;
+                        if done == n_chunks || done % progress_step == 0 {
+                            log::info!(
+                                "[BMS dense-H] progress chunks={}/{} rows={}/{} elapsed={:.3}s",
+                                done,
+                                n_chunks,
+                                (done * ROW_CHUNK_SIZE).min(n),
+                                n,
+                                started.elapsed().as_secs_f64()
+                            );
+                        }
+                    }
                     Ok(acc)
                 },
             )
@@ -12419,6 +12611,10 @@ impl BernoulliMarginalSlopeFamily {
         }
         let n = self.y.len();
         let started = std::time::Instant::now();
+        let _heartbeat = crate::heartbeat::scope(format!(
+            "BMS exact-loglik eval n={n} p={}",
+            cache.slices.total
+        ));
         if log_exact_work(n) {
             log::info!(
                 "[BMS exact-loglik] eval start n={} p={} source=cache",
@@ -12474,6 +12670,8 @@ impl BernoulliMarginalSlopeFamily {
         let primary = &cache.primary;
         let n = self.y.len();
         let started = std::time::Instant::now();
+        let _heartbeat =
+            crate::heartbeat::scope(format!("BMS exact-gradient eval n={n} p={}", slices.total));
         if log_exact_work(n) {
             log::info!(
                 "[BMS exact-gradient] eval start n={} p={} source=cache",
@@ -13925,6 +14123,10 @@ impl BernoulliMarginalSlopeFamily {
         let n_dirs = d_beta_flats.len();
         let flex_active = self.effective_flex_active(block_states)?;
         let bundle_present = cache.row_cell_moments.is_some();
+        let _heartbeat = crate::heartbeat::scope(format!(
+            "BMS batched dH n={n} rows={n_rows} p={} dirs={n_dirs} flex={flex_active} cell_moments_bundle={bundle_present}",
+            slices.total
+        ));
         log::info!(
             "[BMS batched dH start] n={} rows={} p={} dirs={} flex={} cell_moments_bundle={}",
             n,
@@ -14974,7 +15176,22 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
             return Ok(None);
         }
 
+        let batched_started = std::time::Instant::now();
         let beta = Self::flatten_block_state_betas_for_specs(block_states, specs)?;
+        if log_exact_work(self.y.len()) {
+            log::info!(
+                "[BMS batched outer-gradient] start n={} p={} rho={} subsample_rows={} workspace={}",
+                self.y.len(),
+                total,
+                rho.len(),
+                options
+                    .outer_score_subsample
+                    .as_ref()
+                    .map_or(self.y.len(), |subsample| subsample.len()),
+                hessian_workspace.is_some()
+            );
+        }
+        let hessian_started = std::time::Instant::now();
         let mut h = if let Some(workspace) = hessian_workspace.as_ref() {
             workspace.hessian_dense()?.ok_or_else(|| {
                 "bernoulli marginal-slope batched gradient requires dense exact joint Hessian below p=512"
@@ -14986,6 +15203,14 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
                     .to_string()
             })?
         };
+        if log_exact_work(self.y.len()) {
+            log::info!(
+                "[BMS batched outer-gradient] dense-hessian ready n={} p={} elapsed={:.3}s",
+                self.y.len(),
+                total,
+                hessian_started.elapsed().as_secs_f64()
+            );
+        }
         if h.nrows() != total || h.ncols() != total {
             return Err(format!(
                 "bernoulli marginal-slope batched gradient Hessian shape {}x{} != {total}x{total}",
@@ -14994,6 +15219,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
             ));
         }
 
+        let penalty_started = std::time::Instant::now();
         let ridge = options.ridge_floor.max(1e-15);
         let trace_diagonal_ridge = if options.ridge_policy.include_quadratic_penalty
             || options.ridge_policy.include_penalty_logdet
@@ -15056,12 +15282,32 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
             penalty_logdet_ridge,
         )?;
         trace_s_pinv_sdot.assign(&penalty_logdet.first);
+        if log_exact_work(self.y.len()) {
+            log::info!(
+                "[BMS batched outer-gradient] penalty assembly/logdet done n={} p={} rho={} elapsed={:.3}s",
+                self.y.len(),
+                total,
+                rho.len(),
+                penalty_started.elapsed().as_secs_f64()
+            );
+        }
 
+        let spectral_started = std::time::Instant::now();
         let spectral =
             DenseSpectralOperator::from_symmetric_with_mode(&h, self.pseudo_logdet_mode())?;
         let factor = spectral.logdet_gradient_factor();
+        if log_exact_work(self.y.len()) {
+            log::info!(
+                "[BMS batched outer-gradient] spectral factor done n={} p={} rank={} elapsed={:.3}s",
+                self.y.len(),
+                total,
+                factor.ncols(),
+                spectral_started.elapsed().as_secs_f64()
+            );
+        }
         let mut trace_h_inv_hdot = Array1::<f64>::zeros(rho.len());
         let mut directions = Array2::<f64>::zeros((total, rho.len()));
+        let direction_started = std::time::Instant::now();
         penalty_cursor = 0;
         for (block_idx, spec) in specs.iter().enumerate() {
             let (start, end) = ranges[block_idx];
@@ -15080,6 +15326,15 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
             }
             penalty_cursor += spec.penalties.len();
         }
+        if log_exact_work(self.y.len()) {
+            log::info!(
+                "[BMS batched outer-gradient] direction solves done n={} p={} rho={} elapsed={:.3}s",
+                self.y.len(),
+                total,
+                rho.len(),
+                direction_started.elapsed().as_secs_f64()
+            );
+        }
 
         let started = std::time::Instant::now();
         // The workspace's projected trace path is full-data only and
@@ -15097,8 +15352,15 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         let correction_traces = if let Some(traces) = workspace_traces {
             traces
         } else {
-            let owned_cache =
-                self.build_exact_eval_cache_with_options(block_states, Some(options))?;
+            let owned_cache = if let Some(subsample) = options.outer_score_subsample.as_ref() {
+                self.build_exact_eval_cache_for_selected_context_rows(
+                    block_states,
+                    options,
+                    subsample.mask.as_slice(),
+                )?
+            } else {
+                self.build_exact_eval_cache_with_options(block_states, Some(options))?
+            };
             if options.outer_score_subsample.is_some() {
                 let weighted_rows = outer_weighted_rows(options, self.y.len());
                 self.batched_rho_correction_logdet_traces_for_rows(
@@ -15120,11 +15382,12 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         trace_h_inv_hdot += &correction_traces;
         if log_exact_work(self.y.len()) {
             log::info!(
-                "[BMS batched outer-gradient] n={} p={} rho={} trace_elapsed={:.3}s",
+                "[BMS batched outer-gradient] done n={} p={} rho={} trace_elapsed={:.3}s total_elapsed={:.3}s",
                 self.y.len(),
                 total,
                 rho.len(),
-                started.elapsed().as_secs_f64()
+                started.elapsed().as_secs_f64(),
+                batched_started.elapsed().as_secs_f64()
             );
         }
 
@@ -15572,6 +15835,27 @@ impl BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
         block_states: Vec<ParameterBlockState>,
         options: BlockwiseFitOptions,
     ) -> Result<Self, String> {
+        let started = std::time::Instant::now();
+        let _heartbeat = crate::heartbeat::scope(format!(
+            "BMS Hessian-workspace build n={} p={} subsample_rows={}",
+            family.y.len(),
+            block_slices(&family).total,
+            options
+                .outer_score_subsample
+                .as_ref()
+                .map_or(family.y.len(), |subsample| subsample.len())
+        ));
+        if log_exact_work(family.y.len()) {
+            log::info!(
+                "[BMS Hessian-workspace] build start n={} p={} subsample_rows={}",
+                family.y.len(),
+                block_slices(&family).total,
+                options
+                    .outer_score_subsample
+                    .as_ref()
+                    .map_or(family.y.len(), |subsample| subsample.len())
+            );
+        }
         let mut cache =
             family.build_exact_eval_cache_with_options(&block_states, Some(&options))?;
         // Materialize per-row primary Hessians at construction time. The
@@ -15580,6 +15864,15 @@ impl BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
         // amortizes the cell-moment + flex-jet rebuild over every Hv product.
         cache.row_primary_hessians =
             family.build_row_primary_hessian_cache(&block_states, &cache)?;
+        if log_exact_work(family.y.len()) {
+            log::info!(
+                "[BMS Hessian-workspace] build done n={} p={} primary_hessian_cache={} elapsed={:.3}s",
+                family.y.len(),
+                cache.slices.total,
+                cache.row_primary_hessians.is_some(),
+                started.elapsed().as_secs_f64()
+            );
+        }
         Self::from_arc_cache(family, block_states, Arc::new(cache), options)
     }
 
@@ -15629,6 +15922,11 @@ impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJoint
         // does not apply here — keep full-data semantics.
         let call = self.matvec_calls.fetch_add(1, Ordering::Relaxed) + 1;
         let started = std::time::Instant::now();
+        let _heartbeat = crate::heartbeat::scope(format!(
+            "BMS Hessian-Hv call={call} n={} p={}",
+            self.family.y.len(),
+            self.cache.slices.total
+        ));
         let result = self
             .family
             .exact_newton_joint_hessian_matvec_from_cache(
@@ -16494,6 +16792,17 @@ impl BernoulliMarginalSlopeFamily {
                 slices.total
             ));
         }
+        let started = std::time::Instant::now();
+        if log_exact_work(self.y.len()) {
+            log::info!(
+                "[BMS rho-correction-trace] sampled start n={} rows={} p={} rank={} dirs={}",
+                self.y.len(),
+                weighted_rows.len(),
+                slices.total,
+                rank,
+                n_dirs
+            );
+        }
         let traces = weighted_rows
             .par_iter()
             .try_fold(
@@ -16574,6 +16883,17 @@ impl BernoulliMarginalSlopeFamily {
                     Ok(left)
                 },
             )?;
+        if log_exact_work(self.y.len()) {
+            log::info!(
+                "[BMS rho-correction-trace] sampled done n={} rows={} p={} rank={} dirs={} elapsed={:.3}s",
+                self.y.len(),
+                weighted_rows.len(),
+                slices.total,
+                rank,
+                n_dirs,
+                started.elapsed().as_secs_f64()
+            );
+        }
         Ok(Array1::from_vec(traces))
     }
 
@@ -16605,6 +16925,20 @@ impl BernoulliMarginalSlopeFamily {
         let tail_pairs = Self::primary_tail_block_pairs(slices, primary);
         let tail_tail_gram = Self::primary_tail_tail_gram(primary.total, rank, factor, &tail_pairs);
         let n_chunks = n.div_ceil(rows_per_chunk);
+        let started = std::time::Instant::now();
+        let completed_chunks = AtomicUsize::new(0);
+        let progress_step = (n_chunks / 10).max(1);
+        if log_exact_work(n) {
+            log::info!(
+                "[BMS rho-correction-trace] full start n={} chunks={} rows_per_chunk={} p={} rank={} dirs={}",
+                n,
+                n_chunks,
+                rows_per_chunk,
+                slices.total,
+                rank,
+                n_dirs
+            );
+        }
         let traces = (0..n_chunks)
             .into_par_iter()
             .map(|chunk_idx| -> Result<Vec<f64>, String> {
@@ -16715,6 +17049,19 @@ impl BernoulliMarginalSlopeFamily {
                         acc[dir_idx] += trace;
                     }
                 }
+                if log_exact_work(n) {
+                    let done = completed_chunks.fetch_add(1, Ordering::Relaxed) + 1;
+                    if done == n_chunks || done % progress_step == 0 {
+                        log::info!(
+                            "[BMS rho-correction-trace] full progress chunks={}/{} rows={}/{} elapsed={:.3}s",
+                            done,
+                            n_chunks,
+                            (done * rows_per_chunk).min(n),
+                            n,
+                            started.elapsed().as_secs_f64()
+                        );
+                    }
+                }
                 Ok(acc)
             })
             .try_reduce(
@@ -16726,6 +17073,17 @@ impl BernoulliMarginalSlopeFamily {
                     Ok(left)
                 },
             )?;
+        if log_exact_work(n) {
+            log::info!(
+                "[BMS rho-correction-trace] full done n={} chunks={} p={} rank={} dirs={} elapsed={:.3}s",
+                n,
+                n_chunks,
+                slices.total,
+                rank,
+                n_dirs,
+                started.elapsed().as_secs_f64()
+            );
+        }
         Ok(Array1::from_vec(traces))
     }
 }
