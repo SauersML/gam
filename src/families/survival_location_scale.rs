@@ -889,8 +889,12 @@ fn time_derivative_guard_constraints(
     let mut a = Array2::<f64>::zeros((active_rows.len(), p));
     let mut b = Array1::<f64>::zeros(active_rows.len());
     for (out_row, &src_row) in active_rows.iter().enumerate() {
-        a.row_mut(out_row).assign(&dense.row(src_row));
-        b[out_row] = derivative_guard - derivative_offset_exit[src_row];
+        let row = dense.row(src_row);
+        let rhs = derivative_guard - derivative_offset_exit[src_row];
+        let row_norm = row.dot(&row).sqrt();
+        let scale = row_norm.max(rhs.abs()).max(1.0);
+        a.row_mut(out_row).assign(&(&row / scale));
+        b[out_row] = rhs / scale;
     }
     Ok(Some(LinearInequalityConstraints::from_paired(a, b)))
 }
