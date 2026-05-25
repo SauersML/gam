@@ -236,6 +236,7 @@ class SurvivalPrediction:
         grid, surface = self._ffi_surface(kind)
         if grid is None or surface is None:
             return None
+        left_value, right_value = _extrapolation_for(kind)
         if self._should_auto_chunk_dense(surface.shape[0], times_arr.size):
             clip_lo, clip_hi = clip
             return rust_module().survival_chunk_iter_collect(
@@ -248,7 +249,14 @@ class SurvivalPrediction:
                 DEFAULT_SURVIVAL_PEOPLE_CHUNK,
                 DEFAULT_SURVIVAL_TIME_GRID_CHUNK,
             )
-        return _interpolate_rows(grid, surface, times_arr, clip=clip)
+        return _interpolate_rows(
+            grid,
+            surface,
+            times_arr,
+            clip=clip,
+            left_value=left_value,
+            right_value=right_value,
+        )
 
     def _ffi_surface(self, kind: str) -> tuple[Any | None, Any | None]:
         if self.times is None:
@@ -284,7 +292,14 @@ class SurvivalPrediction:
                     yield (
                         slice(row_start, row_stop),
                         slice(time_start, time_stop),
-                        _interpolate_rows(grid, row_surface, time_block, clip=clip),
+                        _interpolate_rows(
+                            grid,
+                            row_surface,
+                            time_block,
+                            clip=clip,
+                            left_value=left_value,
+                            right_value=right_value,
+                        ),
                     )
 
         return chunks()
