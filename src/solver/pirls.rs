@@ -1053,7 +1053,7 @@ impl PirlsWorkspace {
         x: &Array2<f64>,
         out: &mut Array2<f64>,
     ) {
-        *out = crate::solver::reml::assembly::xt_diag_x_dense_into(
+        *out = crate::solver::estimate::reml::assembly::xt_diag_x_dense_into(
             x,
             weights,
             weighted_x_scratch,
