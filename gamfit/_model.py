@@ -1326,55 +1326,7 @@ class Model:
         y: str | None = None,
         interval: float | None = 0.95,
     ) -> Diagnostics:
-        """Score the fitted model on held-out ``data``.
-
-        Calls :meth:`predict` on the feature columns of ``data`` and
-        compares the result against the observed response, packaging
-        the prediction, residuals, observed values, and (when
-        requested) Wald bands into a :class:`Diagnostics` object.
-        Useful for ad-hoc held-out checks and for feeding the
-        :meth:`plot` method.
-
-        Parameters
-        ----------
-        data : table-like
-            Any table-like input accepted by :meth:`predict` that also
-            carries the response column.
-        y : str, optional
-            Name of the response column. Defaults to
-            :attr:`response_name`; required when that cannot be inferred
-            (e.g. survival formulas).
-        interval : float or None, optional
-            Pointwise Wald-interval probability passed through to
-            :meth:`predict`. Set to ``None`` to skip interval columns.
-            Defaults to ``0.95``.
-
-        Returns
-        -------
-        Diagnostics
-            A :class:`Diagnostics` record containing the formula,
-            response name, observed values, the predicted table, and
-            residuals.
-
-        Raises
-        ------
-        ValueError
-            If the response column cannot be inferred or is missing from
-            ``data``.
-
-        Examples
-        --------
-        >>> diag = model.diagnose(test_df)
-        >>> diag.rmse, diag.r_squared
-        (0.42, 0.81)
-        >>> diag.predicted["mean"][:3]
-        [1.04, 1.21, 0.99]
-
-        See Also
-        --------
-        Model.predict
-        Model.plot
-        """
+        """Score the fitted model on held-out ``data`` and return :class:`Diagnostics`."""
         columns, _kind = table_columns(data)
         response_name = y or self.response_name
         if response_name is None:
@@ -1409,61 +1361,7 @@ class Model:
         kind: str = "prediction",
         ax: Any | None = None,
     ) -> Any:
-        """Plot the model's behaviour on ``data`` with matplotlib.
-
-        Runs :meth:`diagnose` against ``data`` and then renders one of
-        three standard diagnostic plots onto a matplotlib ``Axes``.
-
-        Parameters
-        ----------
-        data : table-like
-            Held-out data with the response column present (same
-            requirements as :meth:`diagnose`).
-        x : str, optional
-            Feature column to plot on the x-axis when
-            ``kind="prediction"``. Inferred automatically when there is
-            exactly one non-response feature column.
-        y : str, optional
-            Response column name. Defaults to :attr:`response_name`.
-        interval : float or None, optional
-            Pointwise Wald-interval probability for the shaded band on
-            prediction plots. Ignored for ``residuals`` and
-            ``observed_vs_predicted`` plots. Defaults to ``0.95``.
-        kind : {"prediction", "residuals", "observed_vs_predicted"}, optional
-            * ``"prediction"`` (default) — mean curve over ``x`` with a
-              pointwise Wald band and observed scatter overlay.
-            * ``"residuals"`` — residuals vs predicted mean.
-            * ``"observed_vs_predicted"`` — observed vs predicted with
-              a reference ``y = x`` line.
-        ax : matplotlib.axes.Axes, optional
-            Existing axes to draw onto. When omitted, a fresh
-            ``Axes`` is created via ``plt.subplots()``.
-
-        Returns
-        -------
-        matplotlib.axes.Axes
-            The axes that were drawn on.
-
-        Raises
-        ------
-        ValueError
-            If ``kind`` is not one of the supported choices, or if
-            ``x`` cannot be inferred for a multi-feature prediction
-            plot, or if the named ``x`` column is missing from
-            ``data``.
-
-        Examples
-        --------
-        >>> model.plot(test_df)                       # prediction with band
-        >>> model.plot(test_df, kind="residuals")
-        >>> ax = model.plot(test_df, kind="observed_vs_predicted")
-        >>> ax.set_title("Calibration on held-out fold")
-
-        See Also
-        --------
-        Model.diagnose
-        Model.predict
-        """
+        """Diagnostic plot via matplotlib (prediction, residuals, observed_vs_predicted)."""
         import matplotlib.pyplot as plt
 
         columns, _table_kind = table_columns(data)
