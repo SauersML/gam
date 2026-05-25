@@ -29,6 +29,7 @@ fn main() {
     let mut stdout = std::io::stdout();
     for path in [
         "$ORIGIN/../nvidia/cuda_runtime/lib",
+        "$ORIGIN/../nvidia/cuda_nvrtc/lib",
         "$ORIGIN/../nvidia/nvjitlink/lib",
         "$ORIGIN/../nvidia/cublas/lib",
         "$ORIGIN/../nvidia/cusparse/lib",

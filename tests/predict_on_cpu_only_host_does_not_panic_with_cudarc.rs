@@ -68,13 +68,28 @@ fn predict_after_load_on_cpu_only_host_does_not_panic_with_cudarc() {
     // probe must have completed exactly once via gam's own libcuda
     // preflight guard — any regression there would surface as a
     // `cudarc::panic_no_lib_found` unwind escaping `catch_unwind` below.
+    #[cfg(target_os = "linux")]
+    {
+        if !gam::gpu::driver::cuda_driver_library_present() {
+            let direct_probe = gam::gpu::runtime::GpuRuntime::probe();
+            assert!(
+                matches!(
+                    direct_probe,
+                    Err(gam::gpu::GpuProbeError::Driver(ref reason))
+                        if reason == "libcuda unavailable"
+                ),
+                "absent libcuda must be surfaced as a concise driver probe failure before any cudarc driver entry point is invoked"
+            );
+        }
+    }
+
     let probe = std::panic::catch_unwind(gam::gpu::runtime::GpuRuntime::is_available)
         .expect("GpuRuntime::is_available must not panic on a CPU-only host");
 
     for kernel in [
         GpuKernel::DenseMatvec,
-        GpuKernel::DenseMatMul,
-        GpuKernel::RowReduction,
+        GpuKernel::DenseTransposeMatvec,
+        GpuKernel::DenseXtWX,
     ] {
         let decision = std::panic::catch_unwind(|| gpu::decide(kernel, true, true))
             .expect("gpu::decide must not panic on a CPU-only host");

@@ -3,6 +3,7 @@ use super::super::device::GpuDeviceInfo;
 #[cfg(target_os = "linux")]
 use super::super::policy::GpuDispatchPolicy;
 use super::GpuRuntime;
+use std::sync::OnceLock;
 
 #[cfg(target_os = "linux")]
 pub(crate) fn log_cuda_enabled(device: &GpuDeviceInfo, policy: &GpuDispatchPolicy) {
@@ -48,11 +49,11 @@ pub(crate) fn log_cuda_pool(devices: &[GpuDeviceInfo]) {
 }
 
 pub(crate) fn log_cuda_disabled(reason: &str) {
+    static CUDA_DISABLED_LOGGED: OnceLock<()> = OnceLock::new();
     let reason = GpuRuntime::cpu_reason().unwrap_or(reason);
-    log::info!(
-        "[GPU] CUDA acceleration disabled\n  backend: CPU (faer + Rayon)\n  reason: {}",
-        reason
-    );
+    CUDA_DISABLED_LOGGED.get_or_init(|| {
+        log::info!("[GPU] CUDA acceleration disabled: {reason}");
+    });
 }
 
 #[cfg(target_os = "linux")]
