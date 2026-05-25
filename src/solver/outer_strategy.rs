@@ -5079,6 +5079,7 @@ fn run_outer_with_plan(
             Array1::<f64>::from_elem(cap.n_params, config.rho_bound),
         )
     });
+    crate::solver::estimate::reml::runtime::record_current_outer_rho_upper_bounds_for_ift(&upper);
     let bounds_template = (lower, upper);
     let mut projected_seeds = Vec::with_capacity(seeds.len());
     for seed in seeds {
