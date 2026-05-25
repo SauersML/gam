@@ -11503,7 +11503,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         const RESIDUAL_STALL_NO_IMPROVE_CYCLES: usize = 30;
         const RESIDUAL_STALL_MIN_CYCLES: usize = 40;
         const RESIDUAL_STALL_IMPROVEMENT_FACTOR: f64 = 0.9;
-        const RESIDUAL_STALL_TR_CLAMP_RATIO: f64 = 10.0;
         let mut best_residual_seen: f64 = f64::INFINITY;
         let mut cycles_since_residual_improved: usize = 0;
         let mut tr_clamped_during_stall: bool = false;
@@ -12883,10 +12882,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 } else {
                     cycles_since_residual_improved =
                         cycles_since_residual_improved.saturating_add(1);
-                    if accepted_step_inf
-                        >= RESIDUAL_STALL_TR_CLAMP_RATIO * joint_trust_radius.max(1.0e-12)
-                        || accepted_step_inf >= 0.5 * joint_trust_radius
-                    {
+                    if last_accepted_hit_joint_trust_boundary {
                         tr_clamped_during_stall = true;
                     }
                 }
