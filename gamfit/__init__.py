@@ -213,6 +213,9 @@ def __getattr__(name: str):
     if name == "AdaptiveTopK":
         from .torch.modules import AdaptiveTopK as _AdaptiveTopK
         return _AdaptiveTopK
+    if name == "Crosscoder":
+        from .crosscoder import Crosscoder as _Crosscoder
+        return _Crosscoder
     raise AttributeError(f"module 'gamfit' has no attribute {name!r}")
 
 
@@ -244,6 +247,7 @@ def load_posterior(path: str | Path) -> PosteriorSamples:
 
 __all__ = [
     "AdaptiveTopK",
+    "Crosscoder",
     "Diagnostics",
     "EquivariantPenalty",
     "GaugeCompanion",
