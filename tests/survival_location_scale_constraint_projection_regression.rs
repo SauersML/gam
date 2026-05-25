@@ -1,6 +1,6 @@
 use gam::solver::active_set::LinearInequalityConstraints;
 use gam::survival_location_scale::project_onto_linear_constraints;
-use ndarray::{array, Array1};
+use ndarray::{Array1, array};
 
 #[test]
 fn project_onto_linear_constraints_should_project_onto_equalities_not_only_inequalities() {

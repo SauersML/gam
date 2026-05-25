@@ -2001,12 +2001,14 @@ fn strip_file_lines(content: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut in_str = false;
     let mut quote: u8 = 0;
+    let mut raw_hashes: u8 = 0;
     for line in content.lines() {
-        let (stripped, after_in_str, after_quote) =
-            strip_strings_and_comments_stateful(line, in_str, quote);
+        let (stripped, after_in_str, after_quote, after_hashes) =
+            strip_strings_and_comments_stateful_raw(line, in_str, quote, raw_hashes);
         out.push(stripped);
         in_str = after_in_str;
         quote = after_quote;
+        raw_hashes = after_hashes;
     }
     out
 }
