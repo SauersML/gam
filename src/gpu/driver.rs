@@ -214,6 +214,19 @@ fn load_library(candidates: &[&str]) -> Result<Library, GpuError> {
     })
 }
 
+/// Returns whether the platform loader can open a CUDA driver library.
+///
+/// This deliberately uses gam's own `libloading` probe rather than
+/// `cudarc::driver::sys::is_culib_present()`: cudarc 0.19's generated
+/// dynamic-loader helpers are exactly what emit the noisy
+/// `panic_no_lib_found` message when a CPU-only host lacks `libcuda`.
+/// Runtime availability checks need to stay completely outside cudarc until
+/// this function has established that the driver shared library exists.
+#[must_use]
+pub fn cuda_driver_library_present() -> bool {
+    load_library(cuda_library_candidates()).is_ok()
+}
+
 /// Like [`load_library`] but intentionally leaks the result so the dlopen
 /// mapping stays alive for the process. Use this when the caller's fn-pointer
 /// table needs to stay valid forever (i.e. for every library binding we

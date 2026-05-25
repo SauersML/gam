@@ -16768,8 +16768,14 @@ fn time_derivative_guard_constraints(
     let mut a = Array2::<f64>::zeros((kept_rows.len(), p));
     let mut b = Array1::<f64>::zeros(kept_rows.len());
     for (out_row, &src_row) in kept_rows.iter().enumerate() {
-        a.row_mut(out_row).assign(&dense.row(src_row));
-        b[out_row] = derivative_guard - derivative_offset_exit[src_row];
+        let row = dense.row(src_row);
+        let rhs = derivative_guard - derivative_offset_exit[src_row];
+        let row_norm = row.dot(&row).sqrt();
+        let scale = row_norm.max(rhs.abs()).max(1.0);
+        for col in 0..p {
+            a[[out_row, col]] = dense[[src_row, col]] / scale;
+        }
+        b[out_row] = rhs / scale;
     }
     Ok(Some(LinearInequalityConstraints::from_paired(a, b)))
 }
@@ -21136,8 +21142,20 @@ mod tests {
             .block_linear_constraints(&[], 0, &spec)
             .expect("constraint lookup")
             .expect("time constraints");
-        assert_eq!(constraints.a, array![[1.0, 1.0], [1.0, -1.0]]);
-        assert_eq!(constraints.b, array![1.0, 0.75]);
+        let row_scale = 2.0_f64.sqrt();
+        assert_relative_eq!(
+            constraints.a,
+            array![
+                [1.0 / row_scale, 1.0 / row_scale],
+                [1.0 / row_scale, -1.0 / row_scale]
+            ],
+            epsilon = 1e-12
+        );
+        assert_relative_eq!(
+            constraints.b,
+            array![1.0 / row_scale, 0.75 / row_scale],
+            epsilon = 1e-12
+        );
     }
 
     #[test]

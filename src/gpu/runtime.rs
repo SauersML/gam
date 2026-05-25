@@ -50,29 +50,14 @@ impl GpuRuntime {
 
         #[cfg(target_os = "linux")]
         {
-            // `cudarc 0.19`'s entry points lazily initialize the CUDA driver via
-            // a process-wide `OnceLock<libloading::Library>`. When the platform
-            // has no CUDA driver (e.g. macOS hosts where there is no
-            // `libcuda.dylib`, or Linux hosts without an NVIDIA runtime), the
-            // first call to any driver API — including `device_count()` — panics
-            // unconditionally from inside the cudarc-generated `culib()` helper
-            // (`cudarc/src/lib.rs::panic_no_lib_found`). Because the panic
-            // happens inside `OnceLock::get_or_init`, even catching the unwind
-            // here is fragile (and was observed not to catch in the 0.1.123 PyPI
-            // wheel, causing every `gamfit.fit` on macOS to abort at the
-            // Rust/Python boundary). The principled fix is to never call a
-            // function that may panic in the first place: cudarc exposes a
-            // `is_culib_present()` probe that returns `false` instead of
-            // panicking when no candidate dynamic library can be opened. Gate
-            // every other cudarc driver entry point on that check.
-            //
-            // SAFETY: `is_culib_present` only attempts a series of
-            // `libloading::Library::new(name)` calls, returns `true` on the
-            // first success and `false` if all fail. It has no preconditions
-            // and no state-changing side effects beyond the libloading load
-            // attempts themselves.
-            let culib_present = unsafe { sys::is_culib_present() };
-            if !culib_present {
+            // `cudarc 0.19`'s entry points lazily initialize the CUDA driver
+            // through generated `culib()` helpers. On CPU-only Linux hosts the
+            // first such call emits `panic_no_lib_found` before unwinding, which
+            // polluted biobank logs even when the panic was later caught and the
+            // fit fell back to CPU. Keep the preflight completely outside
+            // cudarc: use gam's own `libloading` probe first, and only touch
+            // cudarc after the platform loader can open `libcuda`.
+            if !crate::gpu::driver::cuda_driver_library_present() {
                 let reason = "CUDA driver library not present on this host";
                 Self::record_cpu_reason(reason);
                 diagnostics::log_cuda_disabled(reason);
@@ -240,13 +225,11 @@ mod tests {
     /// `GpuRuntime::is_available()` about the absence of a driver.
     #[test]
     fn cpu_only_host_never_panics_on_gpu_entry_points() {
-        // SAFETY: `is_culib_present` only attempts `libloading::Library::new`
-        // against a fixed candidate list and has no other side effects.
         // Without libcuda the runtime must report unavailable rather than
         // panicking from inside `culib()`; with libcuda the runtime may or
         // may not have a usable device, but the panic-free contract still
         // holds and the dispatch smoke test below exercises it.
-        let culib_present = unsafe { sys::is_culib_present() };
+        let culib_present = crate::gpu::driver::cuda_driver_library_present();
         if !culib_present {
             assert!(
                 !GpuRuntime::is_available(),

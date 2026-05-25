@@ -5,11 +5,11 @@
 //! triggering `cudarc::panic_no_lib_found`. The original report on
 //! `gamfit 0.1.123` showed `Model.predict(df)` panicking inside the Rust
 //! boundary on macOS because the dispatch decision reached into cudarc
-//! (via `fallback-dynamic-loading`) without first checking
-//! `is_culib_present()`.
+//! (via `fallback-dynamic-loading`) without first checking for the CUDA
+//! driver library outside cudarc.
 //!
 //! The fix landed in `GpuRuntime::probe`: every cudarc driver entry point
-//! is now gated on `is_culib_present()` returning `true`, and
+//! is now gated on gam's own `libloading` driver probe returning `true`, and
 //! `GpuRuntime::global()` lazily caches a `None` outcome so subsequent
 //! predict-path dispatch calls take the CPU fast path. This test pins the
 //! contract by:
@@ -65,9 +65,9 @@ fn predict_after_load_on_cpu_only_host_does_not_panic_with_cudarc() {
 
     // GPU dispatch decision: the predict-path kernels must not panic even
     // when `GpuRuntime::global()` returns `None` (the CPU-only path). The
-    // probe must have completed exactly once via the `is_culib_present`
-    // guard — any regression there would surface as a `cudarc::panic_no_lib_found`
-    // unwind escaping `catch_unwind` below.
+    // probe must have completed exactly once via gam's own libcuda
+    // preflight guard — any regression there would surface as a
+    // `cudarc::panic_no_lib_found` unwind escaping `catch_unwind` below.
     let probe = std::panic::catch_unwind(gam::gpu::runtime::GpuRuntime::is_available)
         .expect("GpuRuntime::is_available must not panic on a CPU-only host");
 
