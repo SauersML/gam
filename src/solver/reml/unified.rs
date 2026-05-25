@@ -5262,7 +5262,8 @@ impl ProjectedKktResidual {
         match self.subspace {
             KktResidualSubspace::ReducedRange => self.clone(),
             KktResidualSubspace::ActiveProjected => {
-                let mut reduced = Self::from_reduced_range(kernel.project_onto_subspace(&self.residual));
+                let mut reduced =
+                    Self::from_reduced_range(kernel.project_onto_subspace(&self.residual));
                 reduced.residual_tol = self.residual_tol;
                 reduced.free_rank = self.free_rank;
                 reduced
@@ -7240,27 +7241,27 @@ pub fn reml_laml_evaluate(
     // already valid.
     let kkt_residual_vec: Option<std::borrow::Cow<'_, Array1<f64>>> =
         match solution.kkt_residual.as_ref() {
-        Some(residual) => {
-            let r = residual.as_array();
-            if r.len() != hop.dim() {
-                return Err(RemlError::DimensionMismatch {
-                    reason: format!(
-                        "projected KKT residual length mismatch: got {}, expected {}",
-                        r.len(),
-                        hop.dim()
-                    ),
+            Some(residual) => {
+                let r = residual.as_array();
+                if r.len() != hop.dim() {
+                    return Err(RemlError::DimensionMismatch {
+                        reason: format!(
+                            "projected KKT residual length mismatch: got {}, expected {}",
+                            r.len(),
+                            hop.dim()
+                        ),
+                    }
+                    .into());
                 }
-                .into());
+                if let Some(kernel) = solution.penalty_subspace_trace.as_ref() {
+                    let reduced = residual.projected_into_reduced_range(kernel);
+                    Some(std::borrow::Cow::Owned(reduced.as_array().clone()))
+                } else {
+                    Some(std::borrow::Cow::Borrowed(r))
+                }
             }
-            if let Some(kernel) = solution.penalty_subspace_trace.as_ref() {
-                let reduced = residual.projected_into_reduced_range(kernel);
-                Some(std::borrow::Cow::Owned(reduced.as_array().clone()))
-            } else {
-                Some(std::borrow::Cow::Borrowed(r))
-            }
-        }
-        None => None,
-    };
+            None => None,
+        };
     let kkt_residual_correction_active = kkt_residual_vec.is_some()
         && matches!(solution.dispersion, DispersionHandling::Fixed { .. });
     // One-shot structured log of the IFT gate. Debug-level so it doesn't
@@ -7269,7 +7270,10 @@ pub fn reml_laml_evaluate(
     log::debug!(
         "[ift-gate] kkt_residual.is_some()={} kkt_residual.subspace={:?} dispersion={} correction_active={} subspace_trace.is_some()={} hop.dim()={} k={}",
         solution.kkt_residual.is_some(),
-        solution.kkt_residual.as_ref().map(ProjectedKktResidual::subspace),
+        solution
+            .kkt_residual
+            .as_ref()
+            .map(ProjectedKktResidual::subspace),
         match &solution.dispersion {
             DispersionHandling::Fixed { .. } => "Fixed",
             DispersionHandling::ProfiledGaussian => "ProfiledGaussian",
@@ -7926,24 +7930,23 @@ pub fn reml_laml_evaluate(
     // computation may use `curvature_lambdas = rho_curvature_scale · lambdas`):
     // the residual correction is in the actual S(λ) basis, and the curvature
     // scale only applies to the H-dependent trace terms.
-    let kkt_rho_corrections =
-        if let Some(r) = kkt_residual_vec
-            .as_ref()
-            .filter(|_| kkt_residual_correction_active && k > 0)
-            .map(|r| r.as_ref())
-        {
-            Some(compute_kkt_residual_rho_corrections(
-                solution,
-                hop,
-                &lambdas,
-                &rho_penalty_a_k_betas,
-                r,
-                mode == EvalMode::ValueGradientHessian,
-                &upper_active_rho,
-            )?)
-        } else {
-            None
-        };
+    let kkt_rho_corrections = if let Some(r) = kkt_residual_vec
+        .as_ref()
+        .filter(|_| kkt_residual_correction_active && k > 0)
+        .map(|r| r.as_ref())
+    {
+        Some(compute_kkt_residual_rho_corrections(
+            solution,
+            hop,
+            &lambdas,
+            &rho_penalty_a_k_betas,
+            r,
+            mode == EvalMode::ValueGradientHessian,
+            &upper_active_rho,
+        )?)
+    } else {
+        None
+    };
     if let Some(corrections) = kkt_rho_corrections.as_ref() {
         let mut sl = grad.slice_mut(ndarray::s![..k]);
         sl += &corrections.gradient;
@@ -17135,8 +17138,8 @@ mod tests {
             u_s: array![[1.0], [0.0]],
             h_proj_inverse: array![[0.25]],
         };
-        let active = ProjectedKktResidual::from_active_projected(array![3.0, 4.0])
-            .with_metadata(1.0e-6, 1);
+        let active =
+            ProjectedKktResidual::from_active_projected(array![3.0, 4.0]).with_metadata(1.0e-6, 1);
 
         let reduced = active.projected_into_reduced_range(&kernel);
 
@@ -18074,7 +18077,9 @@ mod tests {
             rho_ext_pair_fn: None,
             fixed_drift_deriv: None,
             barrier_config: None,
-            kkt_residual: Some(ProjectedKktResidual::from_active_projected(array![0.0, 0.0])),
+            kkt_residual: Some(ProjectedKktResidual::from_active_projected(array![
+                0.0, 0.0
+            ])),
             active_constraints: None,
             stochastic_trace_state: Arc::new(Mutex::new(StochasticTraceState::default())),
         };
@@ -22312,7 +22317,9 @@ mod tests {
             include_logdet_h: true,
             include_logdet_s: true,
         };
-        sol.kkt_residual = Some(ProjectedKktResidual::from_active_projected(array![0.0, 0.0]));
+        sol.kkt_residual = Some(ProjectedKktResidual::from_active_projected(array![
+            0.0, 0.0
+        ]));
 
         let err = match reml_laml_evaluate(&sol, &rho, EvalMode::ValueAndGradient, None) {
             Ok(_) => panic!("wrong-length projected KKT residual must be rejected"),

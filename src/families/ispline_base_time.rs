@@ -185,9 +185,7 @@ pub enum ISplineBaseTimeError {
         provided: usize,
     },
     /// Entry and exit length mismatch when building paired designs.
-    #[error(
-        "ispline_base_time: entry/exit length mismatch (entry={entry}, exit={exit})"
-    )]
+    #[error("ispline_base_time: entry/exit length mismatch (entry={entry}, exit={exit})")]
     EntryExitMismatch { entry: usize, exit: usize },
     /// Bubbled error from the underlying spline routines.
     #[error("ispline_base_time: spline routine failed: {reason}")]
@@ -331,16 +329,10 @@ pub fn cspline_basis_values(
         for slot in row_b.iter_mut() {
             *slot = 0.0;
         }
-        evaluate_bspline_basis_scalar(
-            u,
-            tau_ext.view(),
-            bs_deg,
-            &mut row_b,
-            &mut row_scratch,
-        )
-        .map_err(|e| ISplineBaseTimeError::Spline {
-            reason: format!("row {row_idx} evaluation failed: {e}"),
-        })?;
+        evaluate_bspline_basis_scalar(u, tau_ext.view(), bs_deg, &mut row_b, &mut row_scratch)
+            .map_err(|e| ISplineBaseTimeError::Spline {
+                reason: format!("row {row_idx} evaluation failed: {e}"),
+            })?;
         // Right-cumulative T_m^{(k+2)}(u) for m = 0..n_b_inner-1, computed
         // in the same backward sweep as the anchor.
         let mut running_u = 0.0_f64;

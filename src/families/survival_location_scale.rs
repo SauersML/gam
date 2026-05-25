@@ -879,7 +879,9 @@ fn time_derivative_guard_constraints(
         let rhs = derivative_guard - derivative_offset_exit[src_row];
         let row_norm = row.dot(&row).sqrt();
         let scale = row_norm.max(rhs.abs()).max(1.0);
-        a.row_mut(out_row).assign(&(&row / scale));
+        for col in 0..p {
+            a[[out_row, col]] = dense[[src_row, col]] / scale;
+        }
         b[out_row] = rhs / scale;
     }
     Ok(Some(LinearInequalityConstraints::from_paired(a, b)))

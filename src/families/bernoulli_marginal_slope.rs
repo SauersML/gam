@@ -19653,7 +19653,7 @@ mod tests {
     }
 
     #[test]
-    fn post_update_block_beta_projects_score_warp_to_feasible_step() {
+    fn post_update_block_beta_rejects_infeasible_score_warp_step() {
         let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
         let prepared = build_score_warp_deviation_block_from_seed(
             &seed,
@@ -19697,14 +19697,13 @@ mod tests {
             dummy_block_state(current.clone(), seed.len()),
         ];
         let spec = dummy_blockspec(score_dim, seed.len());
-        let updated = family
+        let err = family
             .post_update_block_beta(&block_states, 2, &spec, proposed.clone())
-            .expect("projected beta");
-        prepared
-            .runtime
-            .monotonicity_feasible(&updated, "projected score-warp")
-            .expect("post-update beta should remain feasible");
-        assert_ne!(updated, proposed);
+            .expect_err("post-update must not repair infeasible constrained beta");
+        assert!(
+            err.contains("structural monotonicity") || err.contains("exact monotonicity"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
