@@ -1,5 +1,7 @@
 use gam::inference::alo::{AloInput, compute_alo_from_input};
-use gam::inference::quadrature::{QuadratureContext, cloglog_ghq_value, integrated_family_moments_jet};
+use gam::inference::quadrature::{
+    QuadratureContext, cloglog_ghq_value, integrated_family_moments_jet,
+};
 use gam::inference::smooth_test::{SmoothTestInput, SmoothTestScale, wood_smooth_test};
 use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily};
 use ndarray::{Array1, Array2, array};
@@ -10,7 +12,10 @@ use statrs::distribution::{ContinuousCDF, FisherSnedecor};
 fn integrated_family_moments_jet_matches_lognormal_mean_for_poisson_log_link() {
     let mut rng = StdRng::seed_from_u64(42);
     let ctx = QuadratureContext::new();
-    let spec = LikelihoodSpec::new(ResponseFamily::Poisson, InverseLink::Standard(LinkFunction::Log));
+    let spec = LikelihoodSpec::new(
+        ResponseFamily::Poisson,
+        InverseLink::Standard(LinkFunction::Log),
+    );
 
     for _ in 0..32 {
         let eta = rng.random_range(-2.0..2.0);

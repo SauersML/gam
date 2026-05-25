@@ -6379,10 +6379,7 @@ fn build_term_collection_design_inner(
                 global_index,
                 termname: Some(linear.name.clone()),
                 penalty: PenaltyInfo {
-                    source: PenaltySource::Other(format!(
-                        "LinearTermRidge({})",
-                        linear.name
-                    )),
+                    source: PenaltySource::Other(format!("LinearTermRidge({})", linear.name)),
                     original_index: j,
                     active: true,
                     effective_rank: 1,
@@ -6402,10 +6399,7 @@ fn build_term_collection_design_inner(
                 global_index: global_index_double,
                 termname: Some(linear.name.clone()),
                 penalty: PenaltyInfo {
-                    source: PenaltySource::Other(format!(
-                        "LinearTermDoubleRidge({})",
-                        linear.name
-                    )),
+                    source: PenaltySource::Other(format!("LinearTermDoubleRidge({})", linear.name)),
                     original_index: j,
                     active: true,
                     effective_rank: 1,

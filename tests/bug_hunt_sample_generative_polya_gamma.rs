@@ -75,8 +75,12 @@ fn bug_generativespec_from_predict_roundtrip_recovers_response_distribution() {
         eta: Array1::from_vec(vec![0.2, -0.3, 0.7]),
         mean: Array1::from_vec(vec![0.2, -0.3, 0.7]),
     };
-    let like = LikelihoodSpec::new(ResponseFamily::Gaussian, InverseLink::Standard(LinkFunction::Identity));
-    let spec = generativespec_from_predict(pred, like, Some(0.5)).expect("spec generation should succeed");
+    let like = LikelihoodSpec::new(
+        ResponseFamily::Gaussian,
+        InverseLink::Standard(LinkFunction::Identity),
+    );
+    let spec =
+        generativespec_from_predict(pred, like, Some(0.5)).expect("spec generation should succeed");
     match spec.noise {
         NoiseModel::Gaussian { sigma } => {
             assert!(

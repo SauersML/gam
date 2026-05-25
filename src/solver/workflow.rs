@@ -2790,9 +2790,8 @@ pub fn resolve_family(
             // the link suffix is unpinned, so a user-supplied link is allowed
             // to refine it as long as the response family agrees with what the
             // link implies (Binomial vs Gaussian/Poisson/etc.).
-            let response_compatible =
-                std::mem::discriminant(&explicit_spec.response)
-                    == std::mem::discriminant(&from_link.response);
+            let response_compatible = std::mem::discriminant(&explicit_spec.response)
+                == std::mem::discriminant(&from_link.response);
             if !*link_pinned && response_compatible {
                 // Preserve user-chosen link (e.g. SAS state) but keep the
                 // explicit family's response variant (e.g. NB theta).
