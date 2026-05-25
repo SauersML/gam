@@ -8987,6 +8987,110 @@ fn nullspace_basis_from_block(block: &CanonicalPenaltyBlock) -> Option<Array2<f6
     Some(block.eigenvectors.select(Axis(1), &null_idx))
 }
 
+/// Compute the joint-null absorption rotation for a smooth with one or more
+/// active penalty blocks.
+///
+/// Given the smooth's active penalties `S_1, ..., S_K` (all `p × p`,
+/// symmetric PSD, in the same local coordinate system), return `Q` such
+/// that `Q = [U_range | U_null]` with `U_null` spanning the *joint* null
+/// space `null(Σ_k S_k)` — i.e., the directions annihilated by every
+/// active penalty.
+///
+/// Why the joint and not the per-block null: a per-block null
+/// `null(S_k)` may be penalized by some other `S_j` (`j ≠ k`), so
+/// absorbing it would lose smoothing the data is paying for. Only
+/// directions in the joint null are *genuinely* unpenalized and qualify
+/// for absorption into the parametric block.
+///
+/// Returns `None` when there is no penalty (`penalties.is_empty()`),
+/// when the local dimension is zero, or when the joint penalty is
+/// full-rank (joint nullity = 0). A non-trivial `joint_nullity` is the
+/// only state encoded as `Some`.
+/// Recompute per-block null-eigenvector matrices from a sequence of penalty
+/// matrices. Each output entry `null_eigenvectors[k]` is `Some(U_null)`
+/// (eigenvectors of `penalties[k]` at eigenvalues `≤ spectral_tolerance`)
+/// when the block has a non-trivial null space, and `None` otherwise.
+///
+/// This is the inverse of "consumers update `penalties[k]` without
+/// refreshing `null_eigenvectors[k]`": whenever a code path rebuilds a
+/// penalty matrix in-place (e.g., the factor-sum-to-zero handler's
+/// Kronecker-style `S_big` reconstruction), the parallel `null_eigenvectors`
+/// vector becomes stale unless this helper is called. The invariant the
+/// pipeline relies on is `null_eigenvectors[k]` always mirrors
+/// `penalties[k]`'s spectral null space.
+pub fn recompute_null_eigenvectors(
+    penalties: &[Array2<f64>],
+) -> Result<Vec<Option<Array2<f64>>>, BasisError> {
+    penalties
+        .iter()
+        .map(|s| {
+            let block = analyze_penalty_block_with_op(s, None)?;
+            Ok(nullspace_basis_from_block(&block))
+        })
+        .collect()
+}
+
+pub fn compute_joint_null_rotation(
+    penalties: &[Array2<f64>],
+) -> Result<Option<JointNullRotation>, BasisError> {
+    if penalties.is_empty() {
+        return Ok(None);
+    }
+    let p = penalties[0].nrows();
+    if p == 0 {
+        return Ok(None);
+    }
+    for (k, s) in penalties.iter().enumerate() {
+        if s.nrows() != p || s.ncols() != p {
+            return Err(BasisError::DimensionMismatch(format!(
+                "compute_joint_null_rotation: penalty[{}] is {}×{}, expected {}×{}",
+                k,
+                s.nrows(),
+                s.ncols(),
+                p,
+                p
+            )));
+        }
+    }
+    let mut s_sum = Array2::<f64>::zeros((p, p));
+    for s in penalties {
+        s_sum += s;
+    }
+    let (sym, evals, evecs) = spectral_summary(&s_sum)?;
+    let tol = spectral_tolerance(&sym, &evals);
+    let joint_nullity = evals.iter().filter(|&&ev| ev <= tol).count();
+    if joint_nullity == 0 {
+        return Ok(None);
+    }
+    // Order columns of Q as [U_range | U_null]: ascending-eigenvalue ordering
+    // from `eigh` puts null columns first (eigenvalues near zero), so we need
+    // to permute so range columns lead and null columns trail. This is the
+    // canonical absorption ordering — Stage-3 split takes the last
+    // `joint_nullity` columns as the absorbed parametric columns.
+    let n = evals.len();
+    let mut order: Vec<usize> = (0..n).collect();
+    // Stable partition: range indices first (in original order, large
+    // eigenvalues first by descending sort), then null indices (small ev).
+    order.sort_by(|&a, &b| {
+        let ev_a = evals[a];
+        let ev_b = evals[b];
+        let null_a = ev_a <= tol;
+        let null_b = ev_b <= tol;
+        match (null_a, null_b) {
+            (false, true) => std::cmp::Ordering::Less,
+            (true, false) => std::cmp::Ordering::Greater,
+            // Both range or both null: descending by eigenvalue, with
+            // NaN/sign tie-breaks unlikely on a PSD sum but handled safely.
+            _ => ev_b.partial_cmp(&ev_a).unwrap_or(std::cmp::Ordering::Equal),
+        }
+    });
+    let rotation = evecs.select(Axis(1), &order);
+    Ok(Some(JointNullRotation {
+        rotation,
+        joint_nullity,
+    }))
+}
+
 /// Same filtering pass as [`filter_active_penalty_candidates`] but also
 /// returns the per-active-penalty operator handles and null-space bases.
 ///

@@ -114,7 +114,7 @@ fn sphere_topology_recovers_synthetic_signal() {
             lo: -FRAC_PI_2,
             hi: FRAC_PI_2,
         },
-        LatentManifold::Circle,
+        LatentManifold::Circle { period: std::f64::consts::TAU },
     ]);
     let fitted = fit_single_atom(&z, atom, true_coords, latent, 12);
     let r2 = reconstruction_r2(&z, &fitted);
@@ -170,7 +170,10 @@ fn torus_topology_recovers_synthetic_signal() {
         TorusHarmonicEvaluator::new(d, h).expect("torus evaluator clone"),
     ) as Arc<dyn SaeBasisEvaluator>);
 
-    let latent = LatentManifold::Product(vec![LatentManifold::Circle, LatentManifold::Circle]);
+    let latent = LatentManifold::Product(vec![
+        LatentManifold::Circle { period: 1.0 },
+        LatentManifold::Circle { period: 1.0 },
+    ]);
     let fitted = fit_single_atom(&z, atom, true_coords, latent, 12);
     let r2 = reconstruction_r2(&z, &fitted);
     assert!(
