@@ -11,7 +11,7 @@ Supported geometries:
 
 | `response_geometry` | Response space | Tangent coordinates |
 | --- | --- | --- |
-| `"spherical"` | unit sphere | geodesic log-map at the Karcher/Fréchet mean (lives in the ambient tangent plane; norm equals geodesic distance) |
+| `"spherical"` / `"sphere"` | unit sphere | geodesic log-map at the Karcher/Fréchet mean (lives in the ambient tangent plane; norm equals geodesic distance) |
 | `"simplex"` / `"clr"` | strictly positive simplex | centered log-ratio |
 | `"alr"` | strictly positive simplex | additive log-ratio |
 
@@ -30,7 +30,7 @@ model = gamfit.fit(
 )
 
 pred = model.predict(test)          # columns: sand, silt, clay; rows sum to one
-summary = model.summary()           # includes base_point and per-coordinate summaries
+summary = model.summary()           # includes base_point, coordinates, and shared_fit
 ```
 
 Pass `response_coordinates="alr"` (or `response_geometry="alr"`) to fit

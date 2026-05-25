@@ -1,9 +1,9 @@
 # PyTorch integration
 
-`gamfit.torch` exposes gamfit's analytic primitives to PyTorch's autograd.
-Each function wraps the corresponding NumPy entry point in `gamfit._api`;
-no derivative math is reimplemented in Python. For primitives with an
-analytic Rust backward, gradients flow through `loss.backward()`.
+`gamfit.torch` exposes gamfit's analytic primitives and smooth-fit helpers
+to PyTorch. The low-level REML and basis wrappers call the corresponding
+NumPy / Rust entry points; for primitives with an analytic Rust backward,
+gradients flow through `loss.backward()`.
 
 ## Installation
 
@@ -18,9 +18,10 @@ torch installed raises `ImportError` with an install hint.
 
 ## Differentiable Gaussian REML
 
-The four closed-form REML primitives have analytic Rust VJPs. Each returns
-a `GaussianRemlOutput` (`coefficients`, `fitted`, `lam`, `reml_score`) and
-routes upstream gradients into the matching Rust backward:
+The closed-form Gaussian REML primitives have analytic Rust VJPs.
+`gaussian_reml_fit` and `gaussian_reml_fit_batched` return a
+`GaussianRemlOutput` (`coefficients`, `fitted`, `lam`, `reml_score`, `edf`)
+and route upstream gradients into the matching Rust backward:
 
 ```python
 import torch
@@ -36,10 +37,12 @@ loss.backward()
 ```
 
 The same pattern applies to `gaussian_reml_fit_batched`,
-`gaussian_reml_fit_additive`, and `gaussian_reml_fit_blocks`
-(the additive variant returns `AdditiveRemlOutput`). Saved tensors
-are version-checked; in-place mutation between forward and backward raises
-`RuntimeError`.
+`gaussian_reml_fit_additive`, and `gaussian_reml_fit_blocks`. The additive
+and block variants return `AdditiveRemlOutput` (`coefficients`, `fitted`,
+`lambdas`, `log_lambdas`, `reml_score`, `edf`); single-response additive
+fits use per-smooth lambdas, while multi-output additive fits use the
+single-lambda block-diagonal path. Saved tensors are version-checked;
+in-place mutation between forward and backward raises `RuntimeError`.
 
 ## Embedding a fitted model
 
@@ -62,31 +65,38 @@ back through the inputs. The wrapped model has no trainable parameters
 
 ## Response geometry
 
-Pure-torch implementations of the simplex and unit-sphere transforms:
+Torch implementations of the simplex and unit-sphere transforms:
 
 `closure`, `clr`, `alr`, `inverse_alr`, `simplex_log_map`,
 `simplex_exp_map`, `simplex_frechet_mean`, `sphere_log_map`,
 `sphere_exp_map`, `sphere_frechet_mean`. Autograd flows through these
-because they are written directly in torch.
+except `sphere_frechet_mean`, which calls the Rust spherical mean routine
+and is forward-only.
 
 ## Device and dtype
 
-The gamfit Rust backend operates on f64 CPU buffers. Tensors are moved to
-CPU f64 for the call and returned on the caller's original device and
-dtype. For training-loop workloads, prefer the batched and additive
-primitives (`gaussian_reml_fit_batched`, `gaussian_reml_fit_additive`,
+The gamfit Rust backend operates on f64 CPU buffers. Autograd REML wrappers
+move tensors to CPU f64 for the call and return tensors on the caller's
+original device and dtype. Some structural basis / penalty builders return
+float64 tensors because the penalty algebra is f64. For training-loop
+workloads, prefer `gamfit.torch.fit` or the batched and additive primitives
+(`gaussian_reml_fit_batched`, `gaussian_reml_fit_additive`,
 `gaussian_reml_fit_blocks`) over per-feature Python iteration.
 
 ## Public API
 
 | Group | Symbols |
 | --- | --- |
+| High-level fitting | `fit`, `FitResult`, `GAM` |
+| Smooth specs | `Smooth`, `Duchon`, `BSpline`, `TensorBSpline`, `Matern`, `Pca`, `PeriodicSplineCurve`, `Sphere`, `Categorical` |
 | Closed-form REML | `gaussian_reml_fit`, `gaussian_reml_fit_batched`, `gaussian_reml_fit_additive`, `gaussian_reml_fit_blocks`, `GaussianRemlOutput`, `AdditiveRemlOutput` |
 | Basis evaluations | `bspline_basis`, `bspline_basis_derivative`, `duchon_basis`, `periodic_spline_curve_basis`, `sphere_basis` |
 | Penalty / ridge | `smoothness_penalty`, `gaussian_weighted_ridge`, `gaussian_weighted_ridge_batch` |
+| Penalty modules | `ARDPenalty`, `BlockOrthogonalityPenalty`, `GumbelTemperatureSchedule`, `IBPAssignmentPenalty`, `IsometryPenalty`, `IvaeRidgeMeanGauge`, `JumpReLUPenalty`, `LazyPcaBasis`, `MechanismSparsityPenalty`, `RiemannianRetraction`, `TopologyAutoSelector` |
+| Skip transcoder | `SkipAffineSmooth`, `SkipTranscoderResult`, `skip_transcoder` |
 | Response geometry | `closure`, `clr`, `alr`, `inverse_alr`, `simplex_log_map`, `simplex_exp_map`, `simplex_frechet_mean`, `sphere_log_map`, `sphere_exp_map`, `sphere_frechet_mean` |
 | Fitted-model loader | `from_fitted` |
 
-Value-producing primitives are bit-exact equal to their NumPy
+Low-level value-producing wrappers are bit-exact equal to their NumPy
 counterparts. Primitives with an analytic Rust backward are covered by
 `torch.autograd.gradcheck`.
