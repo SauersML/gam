@@ -2592,57 +2592,106 @@ pub fn resolve_family(
             "negative-binomial theta must be finite and > 0; got {nb_theta}"
         ));
     }
-    let explicit: Option<LikelihoodSpec> = match family {
+    // `link_pinned = true` means the family name carried a specific link suffix
+    // (e.g. "binomial-probit"); `false` means the user only declared the response
+    // family (e.g. "binomial") and any link_choice may legally refine the link
+    // without being treated as a contradiction.
+    let explicit: Option<(LikelihoodSpec, bool)> = match family {
         Some(name) => {
-            let resolved = match name.to_ascii_lowercase().as_str() {
-                "gaussian" => LikelihoodSpec::new(
-                    ResponseFamily::Gaussian,
-                    InverseLink::Standard(LinkFunction::Identity),
-                ),
-                "binomial" | "binomial-logit" => LikelihoodSpec::new(
-                    ResponseFamily::Binomial,
-                    InverseLink::Standard(LinkFunction::Logit),
-                ),
-                "binomial-probit" => LikelihoodSpec::new(
-                    ResponseFamily::Binomial,
-                    InverseLink::Standard(LinkFunction::Probit),
-                ),
-                "binomial-cloglog" => LikelihoodSpec::new(
-                    ResponseFamily::Binomial,
-                    InverseLink::Standard(LinkFunction::CLogLog),
-                ),
-                "latent-cloglog-binomial" => LikelihoodSpec::new(
-                    ResponseFamily::Binomial,
-                    InverseLink::LatentCLogLog(
-                        LatentCLogLogState::new(1.0)
-                            .map_err(|err| format!("latent cloglog default state: {err}"))?,
+            // Accept both '-' and '_' as separators so e.g. "binomial_logit" and
+            // "negative-binomial" resolve identically. Canonicalize to '-'.
+            let canonical = name.to_ascii_lowercase().replace('_', "-");
+            let resolved = match canonical.as_str() {
+                "gaussian" => (
+                    LikelihoodSpec::new(
+                        ResponseFamily::Gaussian,
+                        InverseLink::Standard(LinkFunction::Identity),
                     ),
+                    false,
                 ),
-                "poisson" => LikelihoodSpec::new(
-                    ResponseFamily::Poisson,
-                    InverseLink::Standard(LinkFunction::Log),
+                "binomial" => (
+                    LikelihoodSpec::new(
+                        ResponseFamily::Binomial,
+                        InverseLink::Standard(LinkFunction::Logit),
+                    ),
+                    false,
                 ),
-                "nb"
-                | "negbin"
-                | "negative_binomial"
-                | "negative-binomial"
-                | "negative-binomial-log" => LikelihoodSpec::new(
-                    ResponseFamily::NegativeBinomial { theta: nb_theta },
-                    InverseLink::Standard(LinkFunction::Log),
+                "binomial-logit" => (
+                    LikelihoodSpec::new(
+                        ResponseFamily::Binomial,
+                        InverseLink::Standard(LinkFunction::Logit),
+                    ),
+                    true,
                 ),
-                "beta" | "beta-logit" | "beta-regression" | "beta-regression-logit" => {
+                "binomial-probit" => (
+                    LikelihoodSpec::new(
+                        ResponseFamily::Binomial,
+                        InverseLink::Standard(LinkFunction::Probit),
+                    ),
+                    true,
+                ),
+                "binomial-cloglog" => (
+                    LikelihoodSpec::new(
+                        ResponseFamily::Binomial,
+                        InverseLink::Standard(LinkFunction::CLogLog),
+                    ),
+                    true,
+                ),
+                "latent-cloglog-binomial" => (
+                    LikelihoodSpec::new(
+                        ResponseFamily::Binomial,
+                        InverseLink::LatentCLogLog(
+                            LatentCLogLogState::new(1.0)
+                                .map_err(|err| format!("latent cloglog default state: {err}"))?,
+                        ),
+                    ),
+                    true,
+                ),
+                "poisson" => (
+                    LikelihoodSpec::new(
+                        ResponseFamily::Poisson,
+                        InverseLink::Standard(LinkFunction::Log),
+                    ),
+                    false,
+                ),
+                "nb" | "negbin" | "negative-binomial" => (
+                    LikelihoodSpec::new(
+                        ResponseFamily::NegativeBinomial { theta: nb_theta },
+                        InverseLink::Standard(LinkFunction::Log),
+                    ),
+                    false,
+                ),
+                "negative-binomial-log" => (
+                    LikelihoodSpec::new(
+                        ResponseFamily::NegativeBinomial { theta: nb_theta },
+                        InverseLink::Standard(LinkFunction::Log),
+                    ),
+                    true,
+                ),
+                "beta" | "beta-regression" => (
                     LikelihoodSpec::new(
                         ResponseFamily::Beta { phi: 1.0 },
                         InverseLink::Standard(LinkFunction::Logit),
-                    )
-                }
-                "gamma" => LikelihoodSpec::new(
-                    ResponseFamily::Gamma,
-                    InverseLink::Standard(LinkFunction::Log),
+                    ),
+                    false,
                 ),
-                other => {
+                "beta-logit" | "beta-regression-logit" => (
+                    LikelihoodSpec::new(
+                        ResponseFamily::Beta { phi: 1.0 },
+                        InverseLink::Standard(LinkFunction::Logit),
+                    ),
+                    true,
+                ),
+                "gamma" => (
+                    LikelihoodSpec::new(
+                        ResponseFamily::Gamma,
+                        InverseLink::Standard(LinkFunction::Log),
+                    ),
+                    false,
+                ),
+                _ => {
                     return Err(WorkflowError::InvalidConfig {
-                        reason: format!("unknown family '{other}'"),
+                        reason: format!("unknown family '{name}'"),
                     }
                     .into());
                 }
@@ -2724,7 +2773,7 @@ pub fn resolve_family(
                 }
             }
         };
-        if let Some(explicit_spec) = explicit.as_ref() {
+        if let Some((explicit_spec, link_pinned)) = explicit.as_ref() {
             let compatible_log_nb = matches!(
                 (
                     &explicit_spec.response,
@@ -2737,6 +2786,21 @@ pub fn resolve_family(
                     None,
                 )
             );
+            // When the user only declared a bare family name (e.g. "binomial")
+            // the link suffix is unpinned, so a user-supplied link is allowed
+            // to refine it as long as the response family agrees with what the
+            // link implies (Binomial vs Gaussian/Poisson/etc.).
+            let response_compatible =
+                std::mem::discriminant(&explicit_spec.response)
+                    == std::mem::discriminant(&from_link.response);
+            if !*link_pinned && response_compatible {
+                // Preserve user-chosen link (e.g. SAS state) but keep the
+                // explicit family's response variant (e.g. NB theta).
+                return Ok(LikelihoodSpec::new(
+                    explicit_spec.response.clone(),
+                    from_link.link,
+                ));
+            }
             if explicit_spec.name() != from_link.name() && !compatible_log_nb {
                 return Err(WorkflowError::InvalidConfig {
                     reason: format!("family '{}' conflicts with link", explicit_spec.name()),
@@ -2744,10 +2808,10 @@ pub fn resolve_family(
                 .into());
             }
         }
-        return Ok(explicit.unwrap_or(from_link));
+        return Ok(explicit.map(|(spec, _)| spec).unwrap_or(from_link));
     }
 
-    if let Some(spec) = explicit {
+    if let Some((spec, _)) = explicit {
         return Ok(spec);
     }
 
