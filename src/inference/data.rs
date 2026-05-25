@@ -807,6 +807,15 @@ fn load_delimited_with_schema(
                         infer_all_binary[j] = false;
                     }
                     col_vecs[j].push(v);
+                    // Also remember the raw string in case this column ends up
+                    // categorical (because a *later* row fails numeric parsing).
+                    // Without this, numeric-parsing rows would keep their raw
+                    // f64 values mixed with level codes — silently corrupting
+                    // the encoding for columns like `0, 0, ..., 0, foo`. This
+                    // mirrors the fix-up already performed in the schema-less
+                    // `infer_delimited_column` path. If the column ends up
+                    // continuous/binary, this Vec is simply dropped.
+                    infer_strings[j].push((total_rows - 1, raw.to_string()));
                 } else {
                     infer_all_numeric[j] = false;
                     infer_all_binary[j] = false;
@@ -870,12 +879,24 @@ fn load_delimited_with_schema(
             col_meta[j].kind = kind;
             col_meta[j].schema_col.kind = kind;
             if matches!(kind, ColumnKindTag::Categorical) {
-                col_meta[j].schema_col.levels = infer_levels[j].clone();
-                // Fix up NaN placeholders.
+                // Re-encode the entire column as categorical level codes.
+                // `infer_strings[j]` contains every (row_idx, raw) seen during
+                // streaming (both numeric- and non-numeric-parsing rows), so
+                // numeric-looking strings like "0" become their own levels
+                // instead of leaking through as raw f64 values that would
+                // collide with real level codes.
                 for (row_idx, raw) in &infer_strings[j] {
-                    let code = *infer_level_index[j].get(raw.as_str()).unwrap();
+                    let levels_ref = &mut infer_levels[j];
+                    let code = *infer_level_index[j]
+                        .entry(raw.clone())
+                        .or_insert_with(|| {
+                            let new_idx = levels_ref.len();
+                            levels_ref.push(raw.clone());
+                            new_idx
+                        });
                     col_vecs[j][*row_idx] = code as f64;
                 }
+                col_meta[j].schema_col.levels = infer_levels[j].clone();
             }
         }
         column_kinds.push(col_meta[j].kind);

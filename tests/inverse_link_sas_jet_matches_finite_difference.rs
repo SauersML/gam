@@ -6,9 +6,12 @@ fn inverse_link_sas_jet_matches_finite_difference() {
     let state = state_from_sasspec(SasLinkSpec { initial_epsilon: 0.25, initial_log_delta: -0.4 }).expect("state");
     let spec = LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Sas(state));
     let eta = -0.4;
-    let h1 = 1e-8;
-    let h2 = 1e-6;
-    let h3 = 1e-4;
+    // Optimal centered-FD steps in f64 (balancing roundoff and truncation):
+    // h ≈ eps^(1/2) for d1, eps^(1/4) for d2, eps^(1/6) for d3. Smaller h
+    // causes catastrophic cancellation in the FD numerator to dominate.
+    let h1 = 1e-6;
+    let h2 = 1e-4;
+    let h3 = 1e-3;
     let f = |x| inverse_link_jet_for_family(&spec, x).expect("jet").mu;
     let jet = inverse_link_jet_for_family(&spec, eta).expect("jet");
     let d1 = (f(eta + h1) - f(eta - h1)) / (2.0 * h1);
