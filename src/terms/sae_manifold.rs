@@ -1805,6 +1805,13 @@ fn fill_assignment_logit_jvp_rows(
     fitted: ArrayView1<'_, f64>,
     local_jac: &mut Array2<f64>,
 ) {
+    if assignments.len() == 1 {
+        for out_col in 0..fitted.len() {
+            local_jac[[0, out_col]] = 0.0;
+        }
+        return;
+    }
+
     match mode {
         AssignmentMode::Softmax { temperature, .. } => {
             // da_k/dl_j = a_k (1[k=j] - a_j) / tau, contracted against
@@ -1862,6 +1869,10 @@ fn flat_logits(logits: ArrayView2<'_, f64>) -> Array1<f64> {
 }
 
 fn assignment_prior_value(assignment: &SaeAssignment, rho: &SaeManifoldRho) -> f64 {
+    if assignment.k_atoms() == 1 {
+        return 0.0;
+    }
+
     for row in 0..assignment.n_obs() {
         validate_finite_logits(assignment.logits.row(row), row)
             .expect("assignment logits must be finite");
@@ -1914,6 +1925,11 @@ fn assignment_prior_grad_hdiag(
     assignment: &SaeAssignment,
     rho: &SaeManifoldRho,
 ) -> Result<(Array1<f64>, Array1<f64>), String> {
+    if assignment.k_atoms() == 1 {
+        let n_obs = assignment.n_obs();
+        return Ok((Array1::zeros(n_obs), Array1::zeros(n_obs)));
+    }
+
     for row in 0..assignment.n_obs() {
         validate_finite_logits(assignment.logits.row(row), row)?;
     }

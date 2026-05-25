@@ -15,8 +15,8 @@ pub struct RemlCandidate {
     /// sorting so e.g. external CV-score arrays stay aligned.
     pub index: usize,
     pub name: String,
-    /// REML / LAML evidence score on whatever scale the caller chose
-    /// (Tierney–Kadane normalised when applicable; see `gamfit._compare`).
+    /// REML / LAML log marginal likelihood. Larger scores have stronger
+    /// evidence; Bayes factors are `exp(score_a - score_b)` directly.
     pub score: f64,
     pub edf: Option<f64>,
 }
@@ -34,7 +34,9 @@ pub struct RemlComparison {
 pub struct RankedRow {
     pub name: String,
     pub score: f64,
+    /// Log-evidence gap from the winning model: `best_score - score`.
     pub delta: f64,
+    /// Bayes factor in favor of the winning model over this row.
     pub bayes_factor: f64,
     pub edf: Option<f64>,
 }
@@ -43,7 +45,9 @@ pub struct RankedRow {
 pub struct ScoreRow {
     pub name: String,
     pub reml_score: f64,
+    /// Log-evidence gap from the winning model: `best_score - reml_score`.
     pub delta_reml: f64,
+    /// Bayes factor in favor of the winning model over this row.
     pub bayes_factor_vs_best: f64,
     pub effective_dof: Option<f64>,
 }
@@ -66,7 +70,7 @@ pub fn compare_reml_fits(mut candidates: Vec<RemlCandidate>) -> Result<RemlCompa
     let mut score_table = Vec::with_capacity(candidates.len());
 
     for row in candidates.iter() {
-        let delta = row.score - best_score;
+        let delta = best_score - row.score;
         let bayes_factor = delta.exp();
         ranking.push(RankedRow {
             name: row.name.clone(),
