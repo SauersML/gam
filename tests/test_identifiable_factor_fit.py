@@ -74,6 +74,42 @@ def test_identifiable_factor_fit_warns_on_constant_aux() -> None:
     assert any("auxiliary" in w for w in result.warnings)
 
 
+def test_identifiability_check_flags_constant_aux() -> None:
+    """``gamfit.identifiability.check`` flags a constant aux as iVAE fail.
+
+    Builds the smallest possible fit that violates one and only one
+    theorem precondition (constant aux -> iVAE fails; decoder + encoder
+    are otherwise healthy) and verifies the structured report.
+    """
+
+    x, _ = _toy_dataset(seed=4)
+    aux = np.ones((x.shape[0], 1))
+    with pytest.warns(UserWarning):
+        result = gamfit.identifiable_factor_fit(
+            x,
+            aux=aux,
+            n_supervised=1,
+            n_free=2,
+            mech_sparsity_weight=1.0,
+            aux_prior_weight=1.0,
+            encoder="mlp[16, 16]",
+            max_iter=5,
+            learning_rate=1e-2,
+            random_state=5,
+        )
+    assert result.report is not None
+    by_name = {t.theorem_name: t for t in result.report.theorems}
+    assert by_name["iVAE"].status == "fail"
+    assert "constant" in by_name["iVAE"].reason.lower()
+    assert by_name["iVAE"].metric["aux_min_std"] == 0.0
+    # Re-running check() against the saved fit reproduces the same verdict.
+    rerun = gamfit.identifiability_check(result)
+    assert rerun.status == "fail"
+    assert {t.theorem_name for t in rerun.theorems} == {
+        "iVAE", "MechanismSparsity", "RandomProjection",
+    }
+
+
 def test_identifiable_factor_fit_rejects_unknown_encoder() -> None:
     x, aux = _toy_dataset()
     with pytest.raises(ValueError, match="not a recognized encoder"):

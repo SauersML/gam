@@ -107,11 +107,11 @@ from ._penalties import (
     TotalVariationPenalty,
 )
 from .topology import (
-    Circle,
-    Cylinder,
+    Circle as _TopologyCircle,
+    Cylinder as _TopologyCylinder,
     EuclideanPatch,
     Sphere as TopologySphere,
-    Torus,
+    Torus as _TopologyTorus,
 )
 from ._select_topology import (
     BasisSpec,
@@ -124,6 +124,7 @@ from ._select_topology import (
     select_topology,
 )
 from ._diagnostics import Diagnostics
+from . import diagnostics
 from . import identifiability
 from .identifiability import (
     IdentifiabilityReport,
@@ -152,9 +153,26 @@ from .smooth import (
     Pca,
     PeriodicSplineCurve,
     ShapeConstraintLiteral,
-    Smooth,
-    Sphere,
+    Smooth as SmoothSpec,
+    Sphere as SphereSpline,
     TensorBSpline,
+)
+from ._protocol import BasisDescriptor, ManifoldDescriptor, PenaltyDescriptor
+from ._manifold import (
+    Circle as Circle,
+    CylinderManifold as CylinderManifold,
+    Euclidean as Euclidean,
+    Sphere as Sphere,
+    Torus as Torus,
+)
+from ._basis_descriptors import Fourier, PeriodicHarmonic
+from ._composite_penalty import CompositePenalty
+from ._smooth import Smooth, SmoothSum
+from ._penalty_descriptors import (
+    ARDPenalty as ARDPenaltyDescriptor,
+    BlockOrthogonalityDescriptor,
+    IBPPenalty,
+    MechanismSparsityDescriptor,
 )
 from . import recipes, topology
 from .recipes import (
@@ -269,6 +287,7 @@ __all__ = [
     "AdaptiveTopK",
     "Crosscoder",
     "Diagnostics",
+    "diagnostics",
     "InterchangeSwapDecoder",
     "PoincareAtoms",
     "EquivariantPenalty",
