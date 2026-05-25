@@ -12469,9 +12469,8 @@ mod tests {
             let scale = w[i] * theta * (theta + y[i]);
             let expected_w = scale * mu[i] / (denom * denom);
             let expected_c = scale * mu[i] * (theta - mu[i]) / (denom * denom * denom);
-            let expected_d =
-                scale * mu[i] * (theta * theta - 4.0 * theta * mu[i] + mu[i] * mu[i])
-                    / (denom * denom * denom * denom);
+            let expected_d = scale * mu[i] * (theta * theta - 4.0 * theta * mu[i] + mu[i] * mu[i])
+                / (denom * denom * denom * denom);
             assert_relative_eq!(w_obs[i], expected_w, epsilon = 1e-12, max_relative = 1e-12);
             assert_relative_eq!(c_obs[i], expected_c, epsilon = 1e-12, max_relative = 1e-12);
             assert_relative_eq!(d_obs[i], expected_d, epsilon = 1e-12, max_relative = 1e-12);

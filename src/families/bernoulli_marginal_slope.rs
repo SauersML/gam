@@ -5039,7 +5039,7 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
     /// at top-level rayon. Called by [`RowKernelHessianWorkspace::new`]
     /// before any outer `par_iter` enters; subsequent
     /// `row_third_contracted` calls inside the parallel ext-idx sweep then
-    /// hit a populated `OnceLock` and skip straight to a 2×2 contraction.
+    /// hit a populated cache and skip straight to a 2×2 contraction.
     fn warm_up_directional_caches(&self) -> Result<(), String> {
         // Touch both caches so their parallel builds run here, not later
         // (nested inside the outer ext-idx par_iter where the lock-holder
@@ -13837,7 +13837,7 @@ impl BernoulliMarginalSlopeFamily {
                 .all(|(row, wr)| wr.index == row && wr.weight == 1.0);
         // Pre-warm the per-row caches the row loop transitively reaches, so the
         // first row to enter the par_iter does not lazily run a nested
-        // `into_par_iter()` inside a `OnceLock::get_or_init` / `RayonSafeOnce`
+        // `into_par_iter()` inside a lazy cache initializer / `RayonSafeOnce`
         // race and starve the outer pool. Two distinct hazards:
         //   1. The rigid third-derivative tensor cache (`rigid_third_full_cached`).
         //      Used by the chunked / else branches when `!flex_active`; harmless
@@ -13850,7 +13850,7 @@ impl BernoulliMarginalSlopeFamily {
         //      with the rigid rank-1 row body (`dot_row_view`, `syr_row_into`)
         //      every row touches both designs — guaranteed contention. Touching
         //      a single row on the main thread before the par_iter forces the
-        //      OnceLock-guarded build once, leaving the par_iter body to read
+        //      lazy build once, leaving the par_iter body to read
         //      already-materialized `Array2` rows in O(p).
         // Mirrors the same discipline applied in
         // `exact_newton_joint_hessiansecond_directional_derivative_from_cache_with_options`.
@@ -14160,9 +14160,9 @@ impl BernoulliMarginalSlopeFamily {
         let weighted_rows = outer_weighted_rows(options, n);
 
         // Eager-prime the per-row uncontracted fourth-derivative cache *before*
-        // entering the per-row `par_iter` so the OnceLock's nested-`par_iter`
-        // build does not race with rayon workers that have already parked on
-        // the lock — see `feedback_oncelock_rayon_deadlock` and the mirror
+        // entering the per-row `par_iter` so the cache's nested-`par_iter`
+        // build does not race with Rayon workers already inside the outer
+        // loop — see `feedback_oncelock_rayon_deadlock` and the mirror
         // pre-warm for the third-derivative tensor at the top of
         // `compute_gradient_and_hessian_via_psi_axes`. Skipped on the FLEX
         // path because that branch routes through the flex jet machinery
@@ -14262,8 +14262,8 @@ impl BernoulliMarginalSlopeFamily {
         let weighted_rows = outer_weighted_rows(options, n);
 
         // Eager-prime the per-row uncontracted fourth-derivative cache *before*
-        // entering the per-row `par_iter` to avoid the OnceLock-under-rayon
-        // deadlock — see `feedback_oncelock_rayon_deadlock`.
+        // entering the per-row `par_iter` to avoid the lazy-cache-under-rayon
+        // deadlock pattern — see `feedback_oncelock_rayon_deadlock`.
         if !self.effective_flex_active(block_states)? {
             let warmed = self.rigid_fourth_full_cached(block_states, cache, 0)?;
             ensure_finite_fourth_full_cache_row(

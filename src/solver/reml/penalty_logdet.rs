@@ -1279,6 +1279,75 @@ mod tests {
         assert!((pld.value() - 5.0_f64.ln()).abs() < 1e-12);
     }
 
+    #[test]
+    fn test_component_ridge_excludes_inactive_penalty_nullspace() {
+        let s1 = array![[4.0, 0.0], [0.0, 0.0]];
+        let s2 = array![[0.0, 0.0], [0.0, 9.0]];
+        let lambdas = [2.0_f64, 0.0_f64];
+        let ridge = 1e-4_f64;
+
+        let pld = PenaltyPseudologdet::from_components(
+            &[s1.clone(), s2.clone()],
+            &lambdas,
+            ridge,
+        )
+        .unwrap();
+
+        assert_eq!(pld.rank(), 1);
+        assert!((pld.value() - (8.0 + ridge).ln()).abs() < 1e-12);
+
+        let (det1, det2) = pld.rho_derivatives(&[s1, s2], &lambdas);
+        assert!((det1[0] - 8.0 / (8.0 + ridge)).abs() < 1e-12);
+        assert!(det1[1].abs() < 1e-12);
+        assert!(det2[[0, 1]].abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_components_with_stale_nullity_uses_active_sum_when_lambda_zero() {
+        let s1 = array![[4.0, 0.0], [0.0, 0.0]];
+        let s2 = array![[0.0, 0.0], [0.0, 9.0]];
+        let lambdas = [2.0_f64, 0.0_f64];
+        let ridge = 1e-4_f64;
+
+        let pld =
+            PenaltyPseudologdet::from_components_with_nullity(&[s1, s2], &lambdas, ridge, Some(0))
+                .unwrap();
+
+        assert_eq!(pld.rank(), 1);
+        assert!((pld.value() - (8.0 + ridge).ln()).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_rank_deficient_components_can_sum_to_full_rank_or_not() {
+        let s1 = array![[1.0, 0.0], [0.0, 0.0]];
+        let s2 = array![[0.0, 0.0], [0.0, 1.0]];
+        let full =
+            PenaltyPseudologdet::from_components(&[s1.clone(), s2], &[2.0, 3.0], 0.0).unwrap();
+        assert_eq!(full.rank(), 2);
+        assert!((full.value() - (6.0_f64).ln()).abs() < 1e-12);
+
+        let s3 = array![[5.0, 0.0], [0.0, 0.0]];
+        let deficient = PenaltyPseudologdet::from_components(&[s1, s3], &[2.0, 3.0], 0.0)
+            .unwrap();
+        assert_eq!(deficient.rank(), 1);
+        assert!((deficient.value() - (17.0_f64).ln()).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_block_penalties_ridge_excludes_inactive_penalty_nullspace() {
+        let penalties = [
+            crate::construction::CanonicalPenalty::from_dense_root(array![[2.0, 0.0]], 2),
+            crate::construction::CanonicalPenalty::from_dense_root(array![[0.0, 3.0]], 2),
+        ];
+        let lambdas = [2.0_f64, 0.0_f64];
+        let ridge = 1e-4_f64;
+
+        let pld = PenaltyPseudologdet::from_penalties(&penalties, &lambdas, ridge, 2).unwrap();
+
+        assert_eq!(pld.rank(), 1);
+        assert!((pld.value() - (8.0 + ridge).ln()).abs() < 1e-12);
+    }
+
     /// The first derivative of log|S(ψ)|₊ is zero when ψ only rotates the
     /// nullspace and doesn't change the positive eigenvalues.
     #[test]
