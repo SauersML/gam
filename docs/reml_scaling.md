@@ -7,7 +7,7 @@ when to use which.
 
 | Use case | F (smooths) | D (outputs) | recommended mode |
 | --- | --- | --- | --- |
-| Tabular GAM, formula-style | 1–10 | 1 | `"joint"` (or just use `gamfit.fit(formula=...)`) |
+| Tabular GAM, formula-style | 1–10 | 1 | `"joint"` (or just use `gamfit.fit(data, formula=...)`) |
 | Multi-smooth small | ≤ 64 | 1 | `"joint"` |
 | Multi-smooth medium | ≤ 64 | > 1 (multi-output) | `"independent"` |
 | SAE / large-scale | > 64 | any | `"independent"` |
@@ -65,7 +65,7 @@ memory stays linear in F. A representative architecture is:
 positions = encoder(x)           # (B, F)
 amps = topk_amps(encoder(x))     # (B, F), sparse
 result = gamfit.torch.fit(
-    points=[positions[:, k:k+1].unsqueeze(-1) for k in range(F)],
+    points=[positions[:, k:k+1] for k in range(F)],
     response=x_centered,          # (B, D)
     smooths=[
         Duchon(centers=self.centers, m=2, by=amps[:, k])
@@ -78,9 +78,12 @@ loss = ((recon - x) ** 2).mean()
 loss.backward()                  # autograd flows back to encoder
 ```
 
-Autograd is preserved through every per-atom REML's analytic VJP. The
-encoder gradient is the sum of F single-smooth backward contributions
-through TopK-gated per-atom designs.
+Autograd is preserved through every per-atom REML's analytic VJP to the
+modulated designs and differentiable inputs. With the current Duchon torch
+basis, `points` are structural (the basis is forward-only with respect to
+positions), so encoder gradients in the example above flow through the
+TopK `by` amplitudes; use a differentiable basis path if you need coordinate
+gradients.
 
 ## Indicative timing (single-process CPU)
 
