@@ -9228,14 +9228,15 @@ fn compute_outer_hessian(
                         .enumerate()
                         .map(|(idx, a_k_beta)| {
                             if upper_active_rho[idx] {
-                                return Array1::<f64>::zeros(hop.dim());
-                            }
-                            // WS1a fallback: projected kernel for rank-deficient LAML path.
-                            match constrained.as_ref() {
-                                Some(ck) if ck.has_active_constraints() => {
-                                    ck.apply_pseudo_inverse(a_k_beta)
+                                Array1::<f64>::zeros(hop.dim())
+                            } else {
+                                // WS1a fallback: projected kernel for rank-deficient LAML path.
+                                match constrained.as_ref() {
+                                    Some(ck) if ck.has_active_constraints() => {
+                                        ck.apply_pseudo_inverse(a_k_beta)
+                                    }
+                                    _ => kernel.apply_pseudo_inverse(a_k_beta),
                                 }
-                                _ => kernel.apply_pseudo_inverse(a_k_beta),
                             }
                         })
                         .collect(),

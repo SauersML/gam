@@ -10834,10 +10834,6 @@ fn joint_objective_floor_reached(
             ))
 }
 
-fn joint_trust_region_step_norm(delta: &Array1<f64>) -> f64 {
-    delta.iter().map(|v| v * v).sum::<f64>().sqrt()
-}
-
 fn joint_trust_region_metric_step_norm(delta: &Array1<f64>, metric_diag: &Array1<f64>) -> f64 {
     assert_eq!(delta.len(), metric_diag.len());
     delta
@@ -10863,16 +10859,6 @@ fn joint_trust_region_block_metric_norms(
             )
         })
         .collect()
-}
-
-fn truncate_joint_step_to_radius(delta: &mut Array1<f64>, radius: f64) -> f64 {
-    let norm = joint_trust_region_step_norm(delta);
-    if norm.is_finite() && norm > radius && radius > 0.0 {
-        delta.mapv_inplace(|v| v * (radius / norm));
-        radius
-    } else {
-        norm
-    }
 }
 
 fn truncate_joint_step_to_block_metric_radii(
@@ -26793,7 +26779,10 @@ mod tests {
         }
 
         let mut raw_global = newton.clone();
-        truncate_joint_step_to_radius(&mut raw_global, 20.0);
+        let raw_norm = raw_global.iter().map(|v| v * v).sum::<f64>().sqrt();
+        if raw_norm.is_finite() && raw_norm > 20.0 {
+            raw_global.mapv_inplace(|v| v * (20.0 / raw_norm));
+        }
         let raw_linearized = (&g + &h.dot(&raw_global))
             .iter()
             .map(|v| v.abs())
@@ -26839,9 +26828,11 @@ mod tests {
         let gradient = -h.dot(&unconstrained);
         let rhs = -&gradient;
         let mut step = unconstrained.clone();
-        let step_norm = truncate_joint_step_to_radius(&mut step, 0.25);
+        let unconstrained_norm = unconstrained.iter().map(|v| v * v).sum::<f64>().sqrt();
+        assert!(unconstrained_norm > 0.25);
+        step.mapv_inplace(|v| v * (0.25 / unconstrained_norm));
+        let step_norm = step.iter().map(|v| v * v).sum::<f64>().sqrt();
         assert!(step_norm <= 0.25 + 1.0e-12);
-        assert!(joint_trust_region_step_norm(&unconstrained) > 0.25);
 
         let h_step = h.dot(&step);
         let predicted = joint_quadratic_predicted_reduction(&rhs, &h_step, &step);
