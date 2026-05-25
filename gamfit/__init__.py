@@ -107,12 +107,10 @@ from ._select_topology import (
     ScoreKind,
     ScoreScale,
     SelectTopologyResult,
-    select_topology,
-)
-from ._topology_selector import (
     TopologyAutoSelector,
     TopologyAutoSelectorRank,
     TopologyAutoSelectorResult,
+    select_topology,
 )
 from ._diagnostics import Diagnostics
 from ._equivariant import (

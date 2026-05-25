@@ -141,62 +141,6 @@ def simplex_exp_map(
 _SPHERE_ANTIPODAL_TOL = 1e-12
 
 
-def _append_sphere_candidate(candidates: list[Any], candidate: Any) -> None:
-    import numpy as np
-
-    c = np.asarray(candidate, dtype=float).reshape(-1)
-    norm = float(np.linalg.norm(c))
-    if not np.isfinite(norm) or norm <= 0.0:
-        return
-    c = c / norm
-    for existing in candidates:
-        if abs(float(existing @ c)) > 1.0 - 1e-10:
-            return
-    candidates.append(c)
-
-
-def _sphere_orthogonal_unit(vector: Any) -> Any:
-    import numpy as np
-
-    v = np.asarray(vector, dtype=float).reshape(-1)
-    axis = np.zeros_like(v)
-    axis[int(np.argmin(np.abs(v)))] = 1.0
-    tangent = axis - float(axis @ v) * v
-    norm = float(np.linalg.norm(tangent))
-    if norm <= 0.0:
-        raise ValueError("cannot construct a tangent direction for the spherical mean")
-    return tangent / norm
-
-
-def _sphere_frechet_objective(values: Any, weights: Any, base: Any) -> float:
-    import numpy as np
-
-    dots = np.clip(values @ base, -1.0, 1.0)
-    theta = np.arccos(dots)
-    return float(np.sum(weights * theta * theta))
-
-
-def _sphere_mean_candidates(values: Any, weights: Any) -> list[Any]:
-    import numpy as np
-
-    candidates: list[Any] = []
-    extrinsic = (values * weights[:, None]).sum(axis=0)
-    _append_sphere_candidate(candidates, extrinsic)
-
-    moment = (values * weights[:, None]).T @ values
-    _, eigvecs = np.linalg.eigh(moment)
-    for j in range(eigvecs.shape[1]):
-        _append_sphere_candidate(candidates, eigvecs[:, j])
-        _append_sphere_candidate(candidates, -eigvecs[:, j])
-
-    for row in values[: min(values.shape[0], 16)]:
-        _append_sphere_candidate(candidates, row)
-
-    if not candidates:
-        candidates.append(_sphere_orthogonal_unit(values[0]))
-    return candidates
-
-
 def sphere_frechet_mean(
     values: Any,
     weights: Any | None = None,
@@ -211,29 +155,16 @@ def sphere_frechet_mean(
     """
     import numpy as np
 
-    y = _normalize_sphere(values)
-    w = _normalized_weights(y.shape[0], weights)
-    best_mu = None
-    best_obj = float("inf")
-    for candidate in _sphere_mean_candidates(y, w):
-        mu = candidate.copy()
-        try:
-            for _ in range(max_iter):
-                logs = sphere_log_map(y, mu)
-                step = (logs * w[:, None]).sum(axis=0)
-                step_norm = float(np.linalg.norm(step))
-                if step_norm < tol:
-                    break
-                mu = sphere_exp_map(step.reshape(1, -1), mu)[0]
-        except ValueError:
-            continue
-        obj = _sphere_frechet_objective(y, w, mu)
-        if obj < best_obj:
-            best_obj = obj
-            best_mu = mu
-    if best_mu is None:
-        raise ValueError("spherical Fréchet mean is not identifiable for these points")
-    return best_mu
+    w = None if weights is None else np.asarray(weights, dtype=float)
+    try:
+        return rust_module().sphere_frechet_mean(
+            np.asarray(values, dtype=float),
+            w,
+            float(tol),
+            int(max_iter),
+        )
+    except Exception as exc:
+        raise map_exception(exc) from exc
 
 
 def sphere_log_map(values: Any, base: Any) -> Any:

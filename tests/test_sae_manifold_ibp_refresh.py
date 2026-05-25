@@ -7,6 +7,9 @@ class _FakeRustModule:
     def __init__(self):
         self.basis_snapshots = []
 
+    def sae_manifold_fit(self, *args, **kwargs):
+        return self.sae_manifold_fit_ibp(*args, **kwargs)
+
     def sae_manifold_fit_ibp(
         self,
         z,
@@ -69,17 +72,18 @@ class _FakeRustModule:
 def test_ibp_driver_refreshes_basis_between_rust_steps(monkeypatch):
     fake = _FakeRustModule()
     monkeypatch.setattr(sae, "rust_module", lambda: fake)
+    assert callable(sae.rust_module().sae_manifold_fit_ibp)
     z = np.array([[0.0, 0.2], [0.3, -0.1], [0.8, 0.5], [1.1, 0.9]])
 
     fit = sae.sae_manifold_fit(
         z,
-        n_atoms=1,
-        atom_basis="periodic",
-        atom_dim=1,
-        assignment_prior="ibp_map",
+        K=1,
+        atom_topology="circle",
+        d_atom=1,
+        assignment="ibp",
         alpha=1.0,
-        tau=0.7,
-        max_iter=2,
+        schedule=sae.gumbel_linear_schedule(tau_start=0.7, tau_min=0.7, steps=1),
+        n_iter=2,
         learning_rate=0.1,
         random_state=4,
     )
