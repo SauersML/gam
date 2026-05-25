@@ -5,7 +5,7 @@ use gam::inference::quadrature::{
 use gam::inference::smooth_test::{SmoothTestInput, SmoothTestScale, wood_smooth_test};
 use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily};
 use ndarray::{Array1, Array2, array};
-use rand::{Rng, SeedableRng, rngs::StdRng};
+use rand::{RngExt, SeedableRng, rngs::StdRng};
 use statrs::distribution::{ContinuousCDF, FisherSnedecor};
 
 #[test]
