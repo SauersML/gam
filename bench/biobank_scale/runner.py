@@ -4,6 +4,8 @@ from __future__ import annotations
 import argparse
 import csv
 import importlib
+import importlib.machinery
+import importlib.util
 import json
 import math
 import os
@@ -33,6 +35,7 @@ HEARTBEAT_INITIAL_WINDOW_SEC = 2.0
 HEARTBEAT_INITIAL_INTERVAL_SEC = 0.25
 MAX_CAPTURE_CHARS = 200000
 _OUTPUT_LOCK = threading.Lock()
+_GAMFIT_RUST: Any | None = None
 
 
 class _TerminalOutputSanitizer:
@@ -1025,6 +1028,28 @@ def zscore_train_test(train: np.ndarray, test: np.ndarray) -> tuple[np.ndarray, 
     return (train - mu) / sd, (test - mu) / sd, mu, sd
 
 
+def _gamfit_rust_module() -> Any:
+    global _GAMFIT_RUST
+    if _GAMFIT_RUST is None:
+        rust_path = ROOT / "gamfit" / "_rust.abi3.so"
+        loader = importlib.machinery.ExtensionFileLoader("_rust", str(rust_path))
+        spec = importlib.util.spec_from_file_location("_rust", rust_path, loader=loader)
+        if spec is None:
+            raise RuntimeError(f"failed to load gamfit Rust extension at {rust_path}")
+        module = importlib.util.module_from_spec(spec)
+        loader.exec_module(module)
+        _GAMFIT_RUST = module
+    return _GAMFIT_RUST
+
+
+def _gamfit_residual_metrics(observed: np.ndarray, predicted: np.ndarray) -> dict[str, float]:
+    diagnostics = _gamfit_rust_module().diagnostics_from_predictions(
+        np.asarray(observed, dtype=float).reshape(-1).tolist(),
+        np.asarray(predicted, dtype=float).reshape(-1).tolist(),
+    )
+    return {str(key): float(value) for key, value in dict(diagnostics["metrics"]).items()}
+
+
 def compute_auc(y_true: np.ndarray, y_score: np.ndarray) -> float:
     y = (np.asarray(y_true, dtype=float) > 0.5).astype(int)
     p = np.asarray(y_score, dtype=float)
@@ -1089,9 +1114,8 @@ def compute_logloss(y_true: np.ndarray, y_prob: np.ndarray, eps: float = 1e-12) 
 
 
 def compute_brier(y_true: np.ndarray, y_prob: np.ndarray) -> float:
-    y = np.asarray(y_true, dtype=float)
-    p = np.asarray(y_prob, dtype=float)
-    return float(np.mean((y - p) ** 2))
+    metrics = _gamfit_residual_metrics(y_true, y_prob)
+    return float(metrics["rmse"] ** 2)
 
 
 def compute_nagelkerke(y_true: np.ndarray, y_prob: np.ndarray, null_mean: float) -> float | None:

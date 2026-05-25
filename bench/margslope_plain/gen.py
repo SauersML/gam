@@ -15,44 +15,47 @@ remaining PCs are nuisance, and prs_z carries a covariate-modulated effect.
 import math
 import random
 import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from gamfit._binding import rust_module
+from gamfit._exceptions import map_exception
 
 
-def std_normal(rng: random.Random, two_pi: float = 2.0 * math.pi) -> float:
-    u1 = max(rng.random(), 1e-12)
-    u2 = rng.random()
-    return math.sqrt(-2.0 * math.log(u1)) * math.cos(two_pi * u2)
-
-
-def erf_approx(x: float) -> float:
-    a1, a2, a3, a4, a5, p = (
-        0.254829592, -0.284496736, 1.421413741, -1.453152027, 1.061405429, 0.3275911,
-    )
-    sign = -1.0 if x < 0 else 1.0
-    ax = abs(x)
-    t = 1.0 / (1.0 + p * ax)
-    y = 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * math.exp(-ax * ax)
-    return sign * y
+def inverse_link(values: list[float], link: str) -> list[float]:
+    try:
+        return [float(v) for v in rust_module().apply_inverse_link_array(values, link)]
+    except Exception as exc:
+        raise map_exception(exc) from exc
 
 
 def write_csv(n: int, path: str, seed: int = 0xA110CA7E) -> None:
     rng = random.Random(seed ^ n)
-    two_pi = 2.0 * math.pi
-    sqrt_2 = math.sqrt(2.0)
     pc_cols = [f"PC{j}" for j in range(1, 11)]
     header = ["case", "sex", "prs_z"] + pc_cols
     a0 = -0.4
     b0 = 0.0
+    pending_rows: list[tuple[int, float, list[float]]] = []
+    offsets: list[float] = []
+    log_slopes: list[float] = []
+    for _ in range(n):
+        sex = rng.randint(0, 1)
+        z = rng.gauss(0.0, 1.0)
+        pcs = [rng.gauss(0.0, 1.0) for _ in range(10)]
+        offsets.append(a0 + 0.6 * pcs[0] + 0.4 * math.sin(math.tau * pcs[1] * 0.3) + 0.5 * sex)
+        log_slopes.append(b0 + 0.3 * pcs[0] - 0.2 * pcs[2])
+        pending_rows.append((sex, z, pcs))
+    slopes = inverse_link(log_slopes, "log")
+    probabilities = inverse_link(
+        [offset + slope * z for offset, slope, (_sex, z, _pcs) in zip(offsets, slopes, pending_rows)],
+        "probit",
+    )
     with open(path, "w") as f:
         f.write(",".join(header) + "\n")
-        for _ in range(n):
-            sex = rng.randint(0, 1)
-            z = std_normal(rng)
-            pcs = [std_normal(rng) for _ in range(10)]
-            a = a0 + 0.6 * pcs[0] + 0.4 * math.sin(two_pi * pcs[1] * 0.3) + 0.5 * sex
-            log_b = b0 + 0.3 * pcs[0] - 0.2 * pcs[2]
-            b = math.exp(log_b)
-            eta = a + b * z
-            p_y = 0.5 * (1.0 + erf_approx(eta / sqrt_2))
+        for (sex, z, pcs), p_y in zip(pending_rows, probabilities):
             y = 1 if rng.random() < p_y else 0
             row = [str(y), str(sex), f"{z:.10g}"] + [f"{v:.10g}" for v in pcs]
             f.write(",".join(row) + "\n")

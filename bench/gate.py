@@ -61,6 +61,26 @@ REL_TOL_NEG_V = 1e-3
 ABS_TOL_EDF = 0.1
 
 
+def _compare_reml_scores(current: float, baseline: float) -> dict[str, float]:
+    """Return Rust-extracted REML scores plus gate-local deltas."""
+    from gamfit._compare import compare_models
+
+    compared = compare_models(
+        [{"reml_score": baseline}, {"reml_score": current}],
+        ["baseline", "current"],
+    )
+    scores = {row["name"]: float(row["reml_score"]) for row in compared["score_table"]}
+    base = scores["baseline"]
+    cur = scores["current"]
+    delta = cur - base
+    return {
+        "baseline": base,
+        "current": cur,
+        "delta": delta,
+        "relative": abs(delta) / max(abs(base), 1e-12),
+    }
+
+
 def _unwrap_payload(blob: Any) -> dict[str, Any] | None:
     if not isinstance(blob, dict):
         return None
@@ -137,12 +157,21 @@ def _has_baseline_data(baseline: Any) -> bool:
     return isinstance(edf, dict) and bool(edf)
 
 
-def _format_delta(label: str, baseline: float, current: float, abs_tol: float | None = None, rel_tol: float | None = None) -> str:
-    delta = current - baseline
-    rel = abs(delta) / max(abs(baseline), 1e-12)
+def _format_delta(
+    label: str,
+    baseline: float,
+    current: float,
+    *,
+    delta: float,
+    relative: float | None = None,
+    abs_tol: float | None = None,
+    rel_tol: float | None = None,
+) -> str:
     tol_str = ""
     if rel_tol is not None:
-        tol_str = f" rel={rel:.3e} (tol={rel_tol:.0e})"
+        if relative is None:
+            raise ValueError("relative delta is required when rel_tol is set")
+        tol_str = f" rel={relative:.3e} (tol={rel_tol:.0e})"
     elif abs_tol is not None:
         tol_str = f" abs_tol={abs_tol}"
     return f"  {label}: baseline={baseline:.6g} current={current:.6g} delta={delta:+.3e}{tol_str}"
@@ -166,12 +195,20 @@ def compare(
     cur_v = current.get("final_neg_v")
     base_v = baseline.get("final_neg_v")
     if isinstance(cur_v, (int, float)) and isinstance(base_v, (int, float)):
-        rel = abs(cur_v - base_v) / max(abs(base_v), 1e-12)
-        if rel > rel_tol_neg_v:
+        stats = _compare_reml_scores(float(cur_v), float(base_v))
+        formatted = _format_delta(
+            "final_neg_v",
+            stats["baseline"],
+            stats["current"],
+            delta=stats["delta"],
+            relative=stats["relative"],
+            rel_tol=rel_tol_neg_v,
+        )
+        if stats["relative"] > rel_tol_neg_v:
             passed = False
-            messages.append("REGRESS " + _format_delta("final_neg_v", base_v, cur_v, rel_tol=rel_tol_neg_v))
+            messages.append("REGRESS " + formatted)
         else:
-            messages.append("ok      " + _format_delta("final_neg_v", base_v, cur_v, rel_tol=rel_tol_neg_v))
+            messages.append("ok      " + formatted)
 
     cur_edf = current.get("edf_per_term") or {}
     base_edf = baseline.get("edf_per_term") or {}

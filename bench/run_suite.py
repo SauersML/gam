@@ -105,6 +105,7 @@ DATASET_DIR = BENCH_DIR / "datasets"
 CV_SPLITS = 5
 CV_SEED = 42
 _RUST_BIN_PATH: Path | None = None
+_GAMFIT_RUST_MODULE: typing.Any | None = None
 HEARTBEAT_INTERVAL_SEC = 15.0
 # For short-lived commands, poll more frequently at startup so heartbeat
 # diagnostics capture meaningful process stats before exit.
@@ -112,6 +113,25 @@ HEARTBEAT_INITIAL_WINDOW_SEC = 2.0
 HEARTBEAT_INITIAL_INTERVAL_SEC = 0.25
 _MAX_CAPTURE_CHARS = 200000
 _OUTPUT_LOCK = threading.Lock()
+
+
+def _gamfit_rust() -> typing.Any:
+    """Load gamfit's Rust extension without importing the package facade."""
+    global _GAMFIT_RUST_MODULE
+    if _GAMFIT_RUST_MODULE is not None:
+        return _GAMFIT_RUST_MODULE
+    rust_candidates = sorted((ROOT / "gamfit").glob("_rust*.so"))
+    if not rust_candidates:
+        rust_candidates = sorted((ROOT / "gamfit").glob("_rust*.pyd"))
+    if not rust_candidates:
+        raise RuntimeError("gamfit Rust extension is not built")
+    spec = importlib.util.spec_from_file_location("_rust", rust_candidates[0])
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"failed to load gamfit Rust extension from {rust_candidates[0]}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    _GAMFIT_RUST_MODULE = module
+    return module
 
 
 class _TerminalOutputSanitizer:
@@ -1052,14 +1072,6 @@ def score_survival_fold(
     return metrics
 
 
-def rmse_score(y: np.ndarray, mu: np.ndarray) -> float:
-    return math.sqrt(float(np.mean((y - mu) ** 2)))
-
-
-def mse_score(y: np.ndarray, mu: np.ndarray) -> float:
-    return float(np.mean((y - mu) ** 2))
-
-
 def gaussian_log_loss_score(y: np.ndarray, mu: np.ndarray, sigma: np.ndarray | float, eps: float = 1e-12) -> float:
     y_arr = np.asarray(y, dtype=float).reshape(-1)
     mu_arr = np.asarray(mu, dtype=float).reshape(-1)
@@ -1073,8 +1085,25 @@ def gaussian_log_loss_score(y: np.ndarray, mu: np.ndarray, sigma: np.ndarray | f
     return float(np.mean(0.5 * np.log(2.0 * math.pi * var) + ((y_arr - mu_arr) ** 2) / (2.0 * var)))
 
 
-def mae_score(y: np.ndarray, mu: np.ndarray) -> float:
-    return float(np.mean(np.abs(y - mu)))
+def gaussian_prediction_scores(
+    y: np.ndarray,
+    mu: np.ndarray,
+    sigma: np.ndarray | float,
+) -> dict[str, float | None]:
+    diagnostics = _gamfit_rust().diagnostics_from_predictions(
+        np.asarray(y, dtype=float).reshape(-1).tolist(),
+        np.asarray(mu, dtype=float).reshape(-1).tolist(),
+    )
+    metrics = dict(diagnostics["metrics"])
+    rmse = float(metrics["rmse"])
+    r2 = metrics.get("r_squared")
+    return {
+        "logloss": gaussian_log_loss_score(y, mu, sigma),
+        "mse": float(rmse * rmse),
+        "rmse": rmse,
+        "mae": float(metrics["mae"]),
+        "r2": None if r2 is None else float(r2),
+    }
 
 
 def zscore_train_test(train_df: pd.DataFrame, test_df: pd.DataFrame, feature_cols: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -1088,79 +1117,6 @@ def zscore_train_test(train_df: pd.DataFrame, test_df: pd.DataFrame, feature_col
         tr[col] = (tr[col] - mu) / sdv
         te[col] = (te[col] - mu) / sdv
     return tr, te
-
-
-def _restricted_cubic_spline_knots(
-    train_series: pd.Series, *, n_knots: int
-) -> np.ndarray:
-    vals = train_series.to_numpy(dtype=float)
-    vals = vals[np.isfinite(vals)]
-    if vals.size < n_knots:
-        raise RuntimeError(
-            f"cannot build restricted cubic spline with {n_knots} knots from only {vals.size} finite values"
-        )
-    probs = np.linspace(0.05, 0.95, n_knots)
-    knots = np.quantile(vals, probs)
-    knots = np.asarray(knots, dtype=float)
-    if np.unique(knots).size < n_knots:
-        raise RuntimeError(
-            f"restricted cubic spline requires {n_knots} distinct knots; got {np.unique(knots).size}"
-        )
-    return knots
-
-
-def _restricted_cubic_spline_basis(values: np.ndarray, knots: np.ndarray) -> np.ndarray:
-    x = np.asarray(values, dtype=float).reshape(-1)
-    k = np.asarray(knots, dtype=float).reshape(-1)
-    if k.size < 3:
-        raise RuntimeError("restricted cubic spline requires at least 3 knots")
-    k_last = float(k[-1])
-    k_penult = float(k[-2])
-    denom = k_last - k_penult
-    if not np.isfinite(denom) or denom <= 0.0:
-        raise RuntimeError("restricted cubic spline tail knots must be strictly increasing")
-
-    def d(arr: np.ndarray, knot: float) -> np.ndarray:
-        return np.maximum(arr - knot, 0.0) ** 3
-
-    basis_cols: list[np.ndarray] = [x]
-    for knot in k[:-2]:
-        term = d(x, float(knot))
-        term -= d(x, k_penult) * (k_last - float(knot)) / denom
-        term += d(x, k_last) * (k_penult - float(knot)) / denom
-        basis_cols.append(term)
-    return np.column_stack(basis_cols)
-
-
-def _apply_restricted_cubic_spline_train_test(
-    train_df: pd.DataFrame,
-    test_df: pd.DataFrame,
-    *,
-    col: str,
-    n_knots: int,
-    prefix: str | None = None,
-) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
-    tr = train_df.copy()
-    te = test_df.copy()
-    spline_prefix = prefix or f"{col}_rcs"
-    knots = _restricted_cubic_spline_knots(tr[col], n_knots=n_knots)
-    train_basis = _restricted_cubic_spline_basis(tr[col].to_numpy(dtype=float), knots)
-    test_basis = _restricted_cubic_spline_basis(te[col].to_numpy(dtype=float), knots)
-    basis_cols = [f"{spline_prefix}{j}" for j in range(train_basis.shape[1])]
-    for j, name in enumerate(basis_cols):
-        tr[name] = train_basis[:, j]
-        te[name] = test_basis[:, j]
-    tr = tr.drop(columns=[col])
-    te = te.drop(columns=[col])
-    return tr, te, basis_cols
-
-
-def r2_score(y: np.ndarray, mu: np.ndarray) -> float:
-    sst = float(np.sum((y - float(np.mean(y))) ** 2))
-    if sst <= 0.0:
-        return 0.0
-    sse = float(np.sum((y - mu) ** 2))
-    return 1.0 - sse / sst
 
 
 def _survival_risk_from_rust_pred(pred_df: pd.DataFrame) -> tuple[np.ndarray, str]:
@@ -4448,11 +4404,7 @@ def run_rust_scenario_cv(
                     {
                         "fit_sec": float(fit_sec),
                         "predict_sec": float(pred_sec),
-                        "logloss": gaussian_log_loss_score(y_test, pred, sigma_hat),
-                        "mse": mse_score(y_test, pred),
-                        "rmse": rmse_score(y_test, pred),
-                        "mae": mae_score(y_test, pred),
-                        "r2": r2_score(y_test, pred),
+                        **gaussian_prediction_scores(y_test, pred, sigma_hat),
                         "n_test": int(len(fold.test_idx)),
                         "model_spec": f"{fitted_formula} via release binary {eval_suffix}",
                         "fit_quality": fit_quality_row,
@@ -4819,11 +4771,7 @@ def _run_rust_gamlss_scenario_cv_variant(
                     {
                         "fit_sec": float(fit_sec),
                         "predict_sec": float(pred_sec),
-                        "logloss": gaussian_log_loss_score(y_test, pred, sigma_hat),
-                        "mse": mse_score(y_test, pred),
-                        "rmse": rmse_score(y_test, pred),
-                        "mae": mae_score(y_test, pred),
-                        "r2": r2_score(y_test, pred),
+                        **gaussian_prediction_scores(y_test, pred, sigma_hat),
                         "n_test": int(len(fold.test_idx)),
                         "model_spec": f"mu: {mean_formula}; sigma: {noise_formula} via release binary {eval_suffix}",
                     }
@@ -7629,19 +7577,6 @@ def run_external_lifelines_coxph_enet_cv(scenario: typing.Any, *, ds: dict[str, 
         train_df, test_df = zscore_train_test(train_df, test_df, feature_cols)
         fit_feature_cols = feature_cols
         model_spec = "CoxPHFitter(linear terms; train-fold z-score; penalizer=0.05; l1_ratio=0.5)"
-        if scenario["name"] == "icu_survival_death":
-            train_df, test_df, bmi_spline_cols = _apply_restricted_cubic_spline_train_test(
-                train_df,
-                test_df,
-                col="bmi",
-                n_knots=6,
-                prefix="bmi_rcs",
-            )
-            fit_feature_cols = [c for c in fit_feature_cols if c != "bmi"] + bmi_spline_cols
-            model_spec = (
-                "CoxPHFitter(train-fold z-score; bmi restricted cubic spline with 6 knots; "
-                "penalizer=0.05; l1_ratio=0.5)"
-            )
 
         fit_start = datetime.now(timezone.utc)
         cph = CoxPHFitter(penalizer=0.05, l1_ratio=0.5)
