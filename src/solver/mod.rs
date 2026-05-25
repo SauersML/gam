@@ -31,3 +31,9 @@ pub use topology_selector::{
     AutoTopologyKind, TopologyAutoFitEvidence, TopologyAutoRankedFit, TopologyAutoSelector,
     TopologyAutoSelectorResult, select_topology_with_fit, tk_normalized_score,
 };
+
+/// Public re-export of the log-barrier configuration used by the REML/LAML
+/// evaluators for monotonicity-constrained coefficients. Exposed so callers
+/// (and integration tests) can construct and probe barrier objectives without
+/// reaching through the private `estimate::reml::unified` path.
+pub use estimate::reml::unified::BarrierConfig;
