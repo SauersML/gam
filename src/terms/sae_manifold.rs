@@ -132,6 +132,27 @@ impl GumbelTemperatureSchedule {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum SearchStrategy {
+    Fixed,
+    ExponentialSweep { values: Vec<f64> },
+}
+
+impl SearchStrategy {
+    #[must_use]
+    pub fn is_fixed(&self) -> bool {
+        matches!(self, Self::Fixed)
+    }
+
+    #[must_use]
+    pub fn sweep_values(&self) -> Option<&[f64]> {
+        match self {
+            Self::Fixed => None,
+            Self::ExponentialSweep { values } => Some(values),
+        }
+    }
+}
+
 /// Basis/topology tag for one SAE manifold atom.
 ///
 /// The evaluated basis and input-location jet live on [`SaeManifoldAtom`].
@@ -1684,6 +1705,17 @@ pub fn term_from_padded_blocks_with_mode(
 mod tests {
     use super::*;
     use ndarray::array;
+
+    #[test]
+    fn search_strategy_exposes_fixed_and_sweep_values() {
+        assert!(SearchStrategy::Fixed.is_fixed());
+
+        let strategy = SearchStrategy::ExponentialSweep {
+            values: vec![0.1, 1.0, 10.0],
+        };
+        assert!(!strategy.is_fixed());
+        assert_eq!(strategy.sweep_values(), Some([0.1, 1.0, 10.0].as_slice()));
+    }
 
     fn periodic_basis(coords: &Array2<f64>) -> (Array2<f64>, Array3<f64>) {
         let n = coords.nrows();
