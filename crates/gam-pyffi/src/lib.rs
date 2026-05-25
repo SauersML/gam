@@ -1134,7 +1134,11 @@ fn survival_collect_chunks<'py>(
 ) -> PyResult<Py<PyArray2<f64>>> {
     let mut dense = Array2::<f64>::zeros((n_rows, n_times));
     for (row_start, row_stop, time_start, time_stop, block) in blocks {
-        if row_stop > n_rows || time_stop > n_times {
+        if row_start > row_stop
+            || row_stop > n_rows
+            || time_start > time_stop
+            || time_stop > n_times
+        {
             return Err(py_value_error(
                 "survival chunk block exceeds dense matrix bounds".to_string(),
             ));
@@ -8801,6 +8805,26 @@ fn sae_build_padded_basis_stacks(
     String,
 > {
     let k_atoms = plans.len();
+    let seed_shape = seed_coords.shape();
+    if seed_shape[0] != k_atoms || seed_shape[1] < n_obs {
+        return Err(format!(
+            "sae_build_padded_basis_stacks: seed_coords must have shape (K, N_seed, D_max) with K={k_atoms} and N_seed >= {n_obs}; got {:?}",
+            seed_shape
+        ));
+    }
+    for (atom_idx, plan) in plans.iter().enumerate() {
+        if plan.latent_dim == 0 {
+            return Err(format!(
+                "sae_build_padded_basis_stacks: atom {atom_idx} latent_dim must be positive"
+            ));
+        }
+        if plan.latent_dim > seed_shape[2] {
+            return Err(format!(
+                "sae_build_padded_basis_stacks: atom {atom_idx} latent_dim {} exceeds seed_coords D_max={}",
+                plan.latent_dim, seed_shape[2]
+            ));
+        }
+    }
     let basis_sizes: Vec<usize> = plans.iter().map(sae_atom_basis_size).collect();
     let m_max = basis_sizes.iter().copied().max().unwrap_or(1).max(1);
     let d_max = plans.iter().map(|p| p.latent_dim).max().unwrap_or(1).max(1);
@@ -8820,6 +8844,25 @@ fn sae_build_padded_basis_stacks(
                 };
                 let (phi, jet, penalty) = sae_build_periodic_atom(t.view(), plan.n_harmonics)?;
                 let m = phi.ncols();
+                if phi.nrows() != n_obs || m != basis_sizes[atom_idx] {
+                    return Err(format!(
+                        "sae_build_padded_basis_stacks: atom {atom_idx} periodic basis shape {:?} disagrees with N={n_obs}, declared M={}",
+                        phi.dim(),
+                        basis_sizes[atom_idx]
+                    ));
+                }
+                if jet.shape() != [n_obs, m, 1] {
+                    return Err(format!(
+                        "sae_build_padded_basis_stacks: atom {atom_idx} periodic jet shape {:?} disagrees with expected ({n_obs}, {m}, 1)",
+                        jet.shape()
+                    ));
+                }
+                if penalty.dim() != (m, m) {
+                    return Err(format!(
+                        "sae_build_padded_basis_stacks: atom {atom_idx} periodic penalty shape {:?} disagrees with M={m}",
+                        penalty.dim()
+                    ));
+                }
                 phi_stack
                     .slice_mut(s![atom_idx, 0..n_obs, 0..m])
                     .assign(&phi);
@@ -8840,8 +8883,33 @@ fn sae_build_padded_basis_stacks(
                             "sae_build_padded_basis_stacks: atom {atom_idx} non-periodic atom requires centers"
                         )
                     })?;
+                if centers.ncols() != d {
+                    return Err(format!(
+                        "sae_build_padded_basis_stacks: atom {atom_idx} centers have dim {} but plan latent_dim is {d}",
+                        centers.ncols()
+                    ));
+                }
                 let (phi, jet, penalty) = sae_build_duchon_atom(coords.view(), centers.view())?;
                 let m = phi.ncols();
+                if phi.nrows() != n_obs || m != basis_sizes[atom_idx] {
+                    return Err(format!(
+                        "sae_build_padded_basis_stacks: atom {atom_idx} Duchon basis shape {:?} disagrees with N={n_obs}, declared M={}",
+                        phi.dim(),
+                        basis_sizes[atom_idx]
+                    ));
+                }
+                if jet.shape() != [n_obs, m, d] {
+                    return Err(format!(
+                        "sae_build_padded_basis_stacks: atom {atom_idx} Duchon jet shape {:?} disagrees with expected ({n_obs}, {m}, {d})",
+                        jet.shape()
+                    ));
+                }
+                if penalty.dim() != (m, m) {
+                    return Err(format!(
+                        "sae_build_padded_basis_stacks: atom {atom_idx} Duchon penalty shape {:?} disagrees with M={m}",
+                        penalty.dim()
+                    ));
+                }
                 phi_stack
                     .slice_mut(s![atom_idx, 0..n_obs, 0..m])
                     .assign(&phi);
