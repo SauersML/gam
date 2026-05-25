@@ -92,6 +92,7 @@ __all__ = [
     "OrthogonalityPenalty",
     "IBPAssignmentPenalty",
     "SoftmaxAssignmentSparsityPenalty",
+    "SheafConsistencyPenalty",
     "ScalarWeightSchedule",
     "Penalty",
 ]

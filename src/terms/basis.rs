@@ -8894,19 +8894,49 @@ pub fn analyze_penalty_block_with_op(
 pub fn filter_active_penalty_candidates(
     candidates: Vec<PenaltyCandidate>,
 ) -> Result<(Vec<Array2<f64>>, Vec<usize>, Vec<PenaltyInfo>), BasisError> {
-    let (penalties, nullspace_dims, penaltyinfo, _ops) =
+    let (penalties, nullspace_dims, penaltyinfo, _null_eigenvectors, _ops) =
         filter_active_penalty_candidates_with_ops(candidates)?;
     Ok((penalties, nullspace_dims, penaltyinfo))
 }
 
+/// Extract the orthonormal basis of `null(S)` from a `CanonicalPenaltyBlock`.
+///
+/// Returns `Some(U_null)` with `U_null.ncols() == block.nullity` when the
+/// block has a non-trivial null space; `None` when the block is full-rank
+/// (`block.nullity == 0`). The columns of `U_null` are the eigenvectors of
+/// `block.sym_penalty` at eigenvalues `≤ block.tol` — exactly the directions
+/// along which `Sβ = 0` and on which `H_pen = H_loglik + S` carries no
+/// curvature from the penalty. These are the directions that must be
+/// absorbed into the parametric block at construction time so that the
+/// smooth's design is orthogonal to its own null space and the inner Newton
+/// solve does not get stuck refusing a non-existent stationary point.
+fn nullspace_basis_from_block(block: &CanonicalPenaltyBlock) -> Option<Array2<f64>> {
+    if block.nullity == 0 {
+        return None;
+    }
+    let null_idx: Vec<usize> = block
+        .eigenvalues
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &ev)| (ev <= block.tol).then_some(i))
+        .collect();
+    if null_idx.is_empty() {
+        return None;
+    }
+    Some(block.eigenvectors.select(Axis(1), &null_idx))
+}
+
 /// Same filtering pass as [`filter_active_penalty_candidates`] but also
-/// returns the per-active-penalty operator handles when the originating
-/// `PenaltyCandidate.op` was populated. The ops vector is parallel to the
-/// `penalties` vector (same length, same order). Each entry is `Some(op)`
-/// when the candidate carried an operator-form handle bit-equivalent to its
-/// dense matrix, and `None` for ordinary dense penalties. Consumers in the
-/// PIRLS/REML pipeline that want operator-form matvec for PCG-against-
-/// implicit-H call this and route through the `Some` entries.
+/// returns the per-active-penalty operator handles and null-space bases.
+///
+/// All three "side-channel" vectors (`nullspace_dims`, `null_eigenvectors`,
+/// `ops`) are parallel to `penalties` — same length, same order. `null_eigenvectors[k]`
+/// is `Some(U_null)` iff `nullspace_dims[k] > 0`; `ops[k]` is `Some(op)` iff
+/// the candidate carried an operator-form handle bit-equivalent to the dense
+/// matrix. Construction-side consumers use `null_eigenvectors` to absorb the
+/// smooth's penalty null space into the parametric block; PIRLS/REML
+/// consumers route through the `ops` `Some` entries for exact operator
+/// matvec without materializing the dense `p x p` Gram.
 pub fn filter_active_penalty_candidates_with_ops(
     candidates: Vec<PenaltyCandidate>,
 ) -> Result<
@@ -8914,6 +8944,7 @@ pub fn filter_active_penalty_candidates_with_ops(
         Vec<Array2<f64>>,
         Vec<usize>,
         Vec<PenaltyInfo>,
+        Vec<Option<Array2<f64>>>,
         Vec<Option<std::sync::Arc<dyn crate::terms::penalty_op::PenaltyOp>>>,
     ),
     BasisError,
@@ -8921,6 +8952,8 @@ pub fn filter_active_penalty_candidates_with_ops(
     let mut penalties = Vec::with_capacity(candidates.len());
     let mut nullspace_dims = Vec::with_capacity(candidates.len());
     let mut penaltyinfo = Vec::with_capacity(candidates.len());
+    let mut active_null_eigenvectors: Vec<Option<Array2<f64>>> =
+        Vec::with_capacity(candidates.len());
     let mut active_ops: Vec<Option<std::sync::Arc<dyn crate::terms::penalty_op::PenaltyOp>>> =
         Vec::with_capacity(candidates.len());
 
@@ -8939,16 +8972,19 @@ pub fn filter_active_penalty_candidates_with_ops(
         let kronecker_factors =
             validated_kronecker_factors(candidate.kronecker_factors, &analysis.sym_penalty);
         if active {
+            let null_basis = nullspace_basis_from_block(&analysis);
             log::debug!(
-                "Retained penalty block source={:?} original_index={} rank={} nullspace_dim_hint={} has_op={}",
+                "Retained penalty block source={:?} original_index={} rank={} nullspace_dim_hint={} has_op={} has_null_basis={}",
                 candidate.source,
                 original_index,
                 analysis.rank,
                 analysis.nullity,
                 analysis.op.is_some(),
+                null_basis.is_some(),
             );
             penalties.push(analysis.sym_penalty);
             nullspace_dims.push(analysis.nullity);
+            active_null_eigenvectors.push(null_basis);
             active_ops.push(analysis.op);
         } else {
             log::debug!(
@@ -8970,7 +9006,13 @@ pub fn filter_active_penalty_candidates_with_ops(
         });
     }
 
-    Ok((penalties, nullspace_dims, penaltyinfo, active_ops))
+    Ok((
+        penalties,
+        nullspace_dims,
+        penaltyinfo,
+        active_null_eigenvectors,
+        active_ops,
+    ))
 }
 
 fn validated_kronecker_factors(

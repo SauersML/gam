@@ -18,6 +18,7 @@ pub mod riemannian;
 pub mod riemannian_retraction;
 pub mod seeding;
 pub mod sindy;
+pub(crate) mod startup_stats;
 pub mod topology_formula;
 pub mod topology_selector;
 pub mod visualizer;

@@ -27737,4 +27737,139 @@ mod tests {
     // so it survives in-progress refactors of the surrounding test
     // support module (this `mod tests { }` currently does not compile due
     // to `crate::test_support::*` / `test_outerobjective_andgradient` WIP).
+
+    /// Synthetic 3-block fixture where the joint penalized Hessian is
+    /// rank-deficient inside block 2 (block-diagonal H with two
+    /// well-conditioned 3x3 identity blocks and a rank-1 third block; all
+    /// s_lambdas are zero so the penalty does not lift the deficiency).
+    /// The gradient is concentrated on block 2's null directions so the
+    /// stationarity residual is dominated by block 2. The report must
+    /// (a) classify the refusal as `RankDeficientHPen`, (b) record
+    /// nullity > 0, and (c) name block 2 as the carrying block.
+    #[test]
+    fn kkt_refusal_report_classifies_rank_deficient_hpen_third_block() {
+        let block_widths = [3usize, 3, 3];
+        let total_p: usize = block_widths.iter().sum();
+        let block_count = block_widths.len();
+
+        let mut specs: Vec<ParameterBlockSpec> = Vec::with_capacity(block_count);
+        let mut states: Vec<ParameterBlockState> = Vec::with_capacity(block_count);
+        let mut s_lambdas: Vec<Array2<f64>> = Vec::with_capacity(block_count);
+        let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(block_count);
+        let names = ["block_a", "block_b", "block_c_rank_deficient"];
+        let mut offset = 0usize;
+        for (b, &width) in block_widths.iter().enumerate() {
+            let start = offset;
+            let end = start + width;
+            offset = end;
+            ranges.push((start, end));
+            specs.push(ParameterBlockSpec {
+                name: names[b].to_string(),
+                design: DesignMatrix::from(Array2::<f64>::zeros((1, width))),
+                offset: Array1::zeros(1),
+                penalties: vec![],
+                nullspace_dims: vec![],
+                initial_log_lambdas: Array1::zeros(0),
+                initial_beta: None,
+            });
+            states.push(ParameterBlockState {
+                beta: Array1::zeros(width),
+                eta: Array1::zeros(1),
+            });
+            s_lambdas.push(Array2::<f64>::zeros((width, width)));
+        }
+
+        // Block-diagonal H: I(3) ⊕ I(3) ⊕ e0 e0ᵀ (third block rank 1, nullity 2).
+        let mut h = Array2::<f64>::zeros((total_p, total_p));
+        for i in 0..3 {
+            h[[i, i]] = 1.0;
+            h[[3 + i, 3 + i]] = 1.0;
+        }
+        h[[6, 6]] = 1.0;
+
+        let source = JointHessianSource::Dense(h);
+
+        // Concentrate the gradient on block 2's null directions (rows 7,8).
+        // With s_lambdas all zero and β=0, the stationarity residual equals
+        // -gradient, so block 2 carries the dominant residual mass.
+        let mut joint_grad = Array1::<f64>::zeros(total_p);
+        joint_grad[7] = 5.0;
+        joint_grad[8] = 3.0;
+        joint_grad[0] = 1.0e-6;
+
+        let cached_active_sets: Vec<Option<Vec<usize>>> = vec![None; block_count];
+        let block_constraints: Vec<Option<LinearInequalityConstraints>> = vec![None; block_count];
+
+        let math = JointNewtonMathDiagnostic {
+            old_kkt_inf: 5.0,
+            linearized_next_kkt_inf: 4.9,
+            predicted_reduction: 1.0e-4,
+            actual_reduction: 1.0e-4,
+            trust_ratio: 1.0,
+            step_inf: 1.0e-9,
+            proposal_inf: 1.0e-3,
+        };
+
+        let residual_tol = 1.0e-6;
+        let projected_residual_inf = 5.0;
+
+        let report = compute_kkt_refusal_report(
+            42,
+            &states,
+            &specs,
+            &s_lambdas,
+            &ranges,
+            Some(&joint_grad),
+            &cached_active_sets,
+            &block_constraints,
+            &source,
+            total_p,
+            0.0,
+            RidgePolicy::explicit_stabilization_full(),
+            0.0,
+            1.0e-9,
+            1.0e-3,
+            1.0,
+            residual_tol,
+            1.0e-6,
+            1.0e-6,
+            1.0e-8,
+            projected_residual_inf,
+            &math,
+        );
+
+        assert_eq!(
+            report.diagnosis,
+            KktRefusalDiagnosis::RankDeficientHPen,
+            "block-2 rank-1 H_pen with zero s_lambdas must classify as RankDeficientHPen, got {:?}",
+            report.diagnosis,
+        );
+        assert!(
+            report.hpen_nullity_at_rank_tol > 0,
+            "rank-1 block embedded in 9x9 block-diagonal H must register nullity > 0, got {}",
+            report.hpen_nullity_at_rank_tol,
+        );
+        assert_eq!(
+            report.block_carrying_residual,
+            Some(2),
+            "block 2 must carry the largest |∇L − Sβ|∞ component; got {:?}, residuals={:?}",
+            report.block_carrying_residual,
+            report.block_residual_inf,
+        );
+        assert_eq!(report.block_names.len(), block_count);
+        assert_eq!(
+            report.block_names[2], "block_c_rank_deficient",
+            "carrying-block name should be the third block",
+        );
+        assert!(
+            report.format_structured_log(4.0 * residual_tol).contains("rank_deficient_H_pen"),
+            "structured log must surface the diagnosis label",
+        );
+        assert!(
+            report
+                .format_bubbled_error()
+                .contains("block_c_rank_deficient"),
+            "bubbled error must name the carrying block by spec.name",
+        );
+    }
 }
