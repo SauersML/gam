@@ -291,7 +291,7 @@ impl UncertaintyCovarianceSource for Array2<f64> {
     fn select_uncertainty_backend(
         &self,
         expected_dim: usize,
-        _mode: InferenceCovarianceMode,
+        mode: InferenceCovarianceMode,
         label: &str,
     ) -> Result<(PredictionCovarianceBackend<'_>, bool), EstimationError> {
         if self.nrows() != expected_dim || self.ncols() != expected_dim {
@@ -301,7 +301,17 @@ impl UncertaintyCovarianceSource for Array2<f64> {
                 self.ncols()
             )));
         }
-        Ok((PredictionCovarianceBackend::from_dense(self.view()), false))
+        match mode {
+            InferenceCovarianceMode::Conditional
+            | InferenceCovarianceMode::ConditionalPlusSmoothingPreferred => {
+                Ok((PredictionCovarianceBackend::from_dense(self.view()), false))
+            }
+            InferenceCovarianceMode::ConditionalPlusSmoothingRequired => {
+                Err(EstimationError::InvalidInput(format!(
+                    "{label}: raw covariance source cannot provide smoothing-corrected covariance"
+                )))
+            }
+        }
     }
 
     fn resolved_fitted_link_state(&self, family: &LikelihoodSpec) -> Option<FittedLinkState> {
