@@ -1227,6 +1227,35 @@ fn vec_to_array1_f64<'py>(py: Python<'py>, values: Vec<f64>) -> PyResult<Py<PyAr
     Ok(Array1::from_vec(values).into_pyarray(py).unbind())
 }
 
+#[pyfunction]
+fn extract_row_ids(
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+    id_column: Option<String>,
+) -> PyResult<Option<Vec<String>>> {
+    let Some(id_column) = id_column else {
+        return Ok(None);
+    };
+    let index = headers
+        .iter()
+        .position(|header| header == &id_column)
+        .ok_or_else(|| {
+            py_value_error(format!(
+                "id_column '{id_column}' is missing from prediction data"
+            ))
+        })?;
+    let mut row_ids = Vec::with_capacity(rows.len());
+    for (row_idx, row) in rows.iter().enumerate() {
+        let value = row.get(index).ok_or_else(|| {
+            py_value_error(format!(
+                "row {row_idx} is missing id_column '{id_column}' at index {index}"
+            ))
+        })?;
+        row_ids.push(value.clone());
+    }
+    Ok(Some(row_ids))
+}
+
 fn python_string_repr(value: &str) -> String {
     let quote = if value.contains('\'') && !value.contains('"') {
         '"'
@@ -1666,6 +1695,20 @@ fn design_matrix_table(
     detach_py_result(py, "design_matrix_table", move || {
         design_matrix_table_impl(&model_bytes, headers, rows)
     })
+}
+
+#[pyfunction]
+fn design_matrix_table_dense(
+    py: Python<'_>,
+    model_bytes: Vec<u8>,
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+) -> PyResult<Py<PyArray2<f64>>> {
+    let out = detach_py_result(py, "design_matrix_table_dense", move || {
+        let raw = design_matrix_table_impl(&model_bytes, headers, rows)?;
+        design_matrix_payload_to_dense(&raw)
+    })?;
+    Ok(out.into_pyarray(py).unbind())
 }
 
 #[pyfunction]
@@ -2988,7 +3031,7 @@ fn extract_null_dim_from_view(py: Python<'_>, view: &RemlFitView<'_>) -> PyResul
     })
 }
 
-fn extract_output_dim_from_view(py: Python<'_>, view: &RemlFitView<'_>) -> PyResult<f64> {
+fn extract_output_dim_from_view(_py: Python<'_>, view: &RemlFitView<'_>) -> PyResult<f64> {
     match view {
         RemlFitView::SavedSummary(payload) => Ok(json_output_dim(payload)),
         RemlFitView::PythonObject(_) => {
@@ -3008,7 +3051,7 @@ fn extract_output_dim_from_view(py: Python<'_>, view: &RemlFitView<'_>) -> PyRes
     }
 }
 
-fn extract_edf_from_view(py: Python<'_>, view: &RemlFitView<'_>) -> PyResult<Option<f64>> {
+fn extract_edf_from_view(_py: Python<'_>, view: &RemlFitView<'_>) -> PyResult<Option<f64>> {
     match view {
         RemlFitView::SavedSummary(payload) => Ok(json_lookup_edf(payload, EDF_KEYS)),
         RemlFitView::PythonObject(_) => {
@@ -12089,6 +12132,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(column_stack_f64, module)?)?;
     module.add_function(wrap_pyfunction!(flat_to_matrix_f64, module)?)?;
     module.add_function(wrap_pyfunction!(vec_to_array1_f64, module)?)?;
+    module.add_function(wrap_pyfunction!(extract_row_ids, module)?)?;
     module.add_function(wrap_pyfunction!(default_survival_time_grid, module)?)?;
     module.add_function(wrap_pyfunction!(torch_from_fitted, module)?)?;
     module.add_function(wrap_pyfunction!(fit_table, module)?)?;
@@ -12111,6 +12155,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(sample_table, module)?)?;
     module.add_function(wrap_pyfunction!(design_matrix_table, module)?)?;
+    module.add_function(wrap_pyfunction!(design_matrix_table_dense, module)?)?;
     module.add_function(wrap_pyfunction!(design_matrix_array, module)?)?;
     module.add_function(wrap_pyfunction!(bspline_basis, module)?)?;
     module.add_function(wrap_pyfunction!(bspline_basis_derivative, module)?)?;
@@ -13459,6 +13504,13 @@ struct DesignMatrixPayload {
     covariance_n: Option<usize>,
 }
 
+#[derive(Deserialize)]
+struct DesignMatrixDensePayload {
+    x_flat: Vec<f64>,
+    n_rows: usize,
+    n_cols: usize,
+}
+
 fn design_matrix_table_impl(
     model_bytes: &[u8],
     headers: Vec<String>,
@@ -13469,6 +13521,25 @@ fn design_matrix_table_impl(
     drop(rows);
     drop(headers);
     design_matrix_dataset_impl(&model, dataset)
+}
+
+fn design_matrix_payload_to_dense(raw: &str) -> Result<Array2<f64>, String> {
+    let payload: DesignMatrixDensePayload = serde_json::from_str(raw)
+        .map_err(|err| format!("failed to parse design matrix payload: {err}"))?;
+    let expected_len = payload
+        .n_rows
+        .checked_mul(payload.n_cols)
+        .ok_or_else(|| "design matrix payload shape overflow".to_string())?;
+    if payload.x_flat.len() != expected_len {
+        return Err(format!(
+            "design matrix FFI payload shape mismatch: got {} floats, expected {} * {}",
+            payload.x_flat.len(),
+            payload.n_rows,
+            payload.n_cols
+        ));
+    }
+    Array2::from_shape_vec((payload.n_rows, payload.n_cols), payload.x_flat)
+        .map_err(|err| format!("failed to reshape design matrix payload: {err}"))
 }
 
 fn design_matrix_array_impl(
@@ -13567,10 +13638,6 @@ fn eta_bands_from_matrix(
     level: f64,
 ) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>), String> {
     posterior_bands::eta_bands_from_matrix(eta, family_kind, level)
-}
-
-fn quantile_from_sorted(sorted: &[f64], q: f64) -> f64 {
-    posterior_bands::quantile_linear_from_sorted(sorted, q)
 }
 
 fn posterior_credible_interval_impl(
