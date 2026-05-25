@@ -42,7 +42,8 @@ use crate::types::{
 use crate::visualizer::VisualizerSession;
 use faer::Side;
 use general_mcmc::generic_hmc::HamiltonianTarget;
-use general_mcmc::generic_nuts::{GenericNUTS, MassMatrixAdaptation, NUTSMassMatrixConfig};
+pub use general_mcmc::generic_nuts::NUTSMassMatrixConfig;
+use general_mcmc::generic_nuts::{GenericNUTS, MassMatrixAdaptation};
 use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, Axis};
 use rand::{RngExt, SeedableRng, rngs::StdRng};
 use serde::{Deserialize, Serialize};
