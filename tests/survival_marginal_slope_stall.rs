@@ -37,7 +37,6 @@ use gam::{FitConfig, encode_recordswith_inferred_schema, fit_from_formula, init_
 use std::sync::Once;
 use std::time::Instant;
 
-const SEED: u64 = 0xC0FF_EE15_F00D_BA75;
 const N: usize = 195_780;
 const N_PCS: usize = 3;
 
@@ -94,6 +93,29 @@ fn next_gauss(state: &mut u64) -> f64 {
     r * theta.cos()
 }
 
+fn next_gamma_alpha_ge_one(state: &mut u64, alpha: f64, scale: f64) -> f64 {
+    debug_assert!(alpha >= 1.0);
+    let d = alpha - 1.0 / 3.0;
+    let c = (1.0 / (9.0 * d)).sqrt();
+    loop {
+        let x = next_gauss(state);
+        let v = 1.0 + c * x;
+        if v <= 0.0 {
+            continue;
+        }
+        let v3 = v * v * v;
+        let u = next_unit(state);
+        if u < 1.0 - 0.0331 * x.powi(4) || u.ln() < 0.5 * x * x + d * (1.0 - v3 + v3.ln()) {
+            return scale * d * v3;
+        }
+    }
+}
+
+#[inline]
+fn clip(x: f64, lo: f64, hi: f64) -> f64 {
+    x.max(lo).min(hi)
+}
+
 /// Build the same frame shape and first-order column statistics as the
 /// failing biobank survival-marginal-slope run:
 ///
@@ -115,51 +137,90 @@ fn build_dataset() -> gam::inference::data::EncodedDataset {
         headers.push(format!("PC{}", i + 1));
     }
 
-    let mut state = SEED;
+    let mut state = 0xA0B10B_u64;
     let mut rows: Vec<StringRecord> = Vec::with_capacity(N);
 
-    for i in 0..N {
-        let sex = if next_unit(&mut state) < 0.391_184 {
+    let mut pc1 = Vec::with_capacity(N);
+    let mut pc2 = Vec::with_capacity(N);
+    let mut pc3 = Vec::with_capacity(N);
+    let mut sex = Vec::with_capacity(N);
+    let mut prs_z = Vec::with_capacity(N);
+    let mut entry_age = Vec::with_capacity(N);
+    let mut exit_age = Vec::with_capacity(N);
+
+    for _ in 0..N {
+        pc1.push(clip(
+            0.024_352_2 + 0.042 * next_gauss(&mut state),
+            -0.339_466,
+            0.118_391,
+        ));
+        pc2.push(clip(
+            0.080_796_3 + 0.030 * next_gauss(&mut state),
+            -0.186_896,
+            0.144_561,
+        ));
+        pc3.push(clip(
+            -0.008_917_45 + 0.036 * next_gauss(&mut state),
+            -0.313_383,
+            0.056_200_3,
+        ));
+        sex.push(if next_unit(&mut state) < 0.391_184 {
             1.0_f64
         } else {
             0.0_f64
-        };
-        // Match the wide observed age range and mean from the production
-        // diagnostics. U^1.76 has mean about 0.362, giving entry_age≈45.
-        let entry_age: f64 = 1.546_89 + 120.416 * next_unit(&mut state).powf(1.76);
-        let follow_up = 0.45 + 14.30 * next_unit(&mut state);
-        let exit_age = (entry_age + follow_up).min(122.47);
+        });
+        prs_z.push(next_gauss(&mut state));
+        let entry = clip(45.082_7 + 18.0 * next_gauss(&mut state), 1.546_89, 121.963);
+        let followup = next_gamma_alpha_ge_one(&mut state, 1.7, 4.4) + 0.05;
+        entry_age.push(entry);
+        exit_age.push((entry + followup).min(122.47).max(entry + 1.0e-3));
+    }
 
-        // Exactly balanced events, matching the case/control sampled
-        // production frame. Shuffle by RNG order rather than row halves.
-        let event = if splitmix64(&mut state).wrapping_add(i as u64) & 1 == 0 {
-            1.0
-        } else {
-            0.0
-        };
+    let prs_mean = prs_z.iter().copied().sum::<f64>() / N as f64;
+    let prs_var = prs_z
+        .iter()
+        .map(|x| {
+            let d = *x - prs_mean;
+            d * d
+        })
+        .sum::<f64>()
+        / N as f64;
+    let prs_sd = prs_var.sqrt();
+    for z in &mut prs_z {
+        *z = (*z - prs_mean) / prs_sd;
+    }
 
-        // Latent prs_z and 3 PCs.
-        let prs_z = next_gauss(&mut state);
-        let mut pcs = [0.0_f64; N_PCS];
-        for j in 0..N_PCS {
-            let center = match j {
-                0 => 0.024_352_2,
-                1 => 0.080_796_3,
-                _ => -0.008_917_45,
-            };
-            pcs[j] = center + 0.045 * next_gauss(&mut state);
-        }
+    let pc1_mean = pc1.iter().copied().sum::<f64>() / N as f64;
+    let pc2_mean = pc2.iter().copied().sum::<f64>() / N as f64;
+    let pc3_mean = pc3.iter().copied().sum::<f64>() / N as f64;
+    let mut event_score = Vec::with_capacity(N);
+    for i in 0..N {
+        event_score.push(
+            0.34 * prs_z[i] + 0.15 * sex[i] + 2.4 * (pc1[i] - pc1_mean) - 1.6 * (pc2[i] - pc2_mean)
+                + 1.9 * (pc3[i] - pc3_mean)
+                + next_gauss(&mut state),
+        );
+    }
+    let mut sorted_score = event_score.clone();
+    sorted_score.sort_by(|a, b| a.total_cmp(b));
+    let event_median = sorted_score[N / 2];
 
+    for i in 0..N {
         let mut record: Vec<String> = vec![
-            entry_age.to_string(),
-            exit_age.to_string(),
-            event.to_string(),
-            sex.to_string(),
-            prs_z.to_string(),
+            entry_age[i].to_string(),
+            exit_age[i].to_string(),
+            if event_score[i] >= event_median {
+                "1"
+            } else {
+                "0"
+            }
+            .to_string(),
+            sex[i].to_string(),
+            prs_z[i].to_string(),
         ];
-        for j in 0..N_PCS {
-            record.push(pcs[j].to_string());
-        }
+        record.push(pc1[i].to_string());
+        record.push(pc2[i].to_string());
+        record.push(pc3[i].to_string());
         rows.push(StringRecord::from(record));
     }
 
