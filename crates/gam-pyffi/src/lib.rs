@@ -1107,6 +1107,8 @@ fn write_survival_csv(
                             &sorted_indices,
                             row_idx,
                             *query_value,
+                            Some(1.0),
+                            Some(0.0),
                         )
                         .clamp(0.0, 1.0);
                         match (id_column.as_ref(), row_ids.as_ref()) {
