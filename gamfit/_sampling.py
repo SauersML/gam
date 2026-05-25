@@ -40,7 +40,7 @@ class PosteriorPredictive:
     def summary(self, level: float = 0.95) -> dict[str, Any]:
         """Collapse fitted-mean draws to per-row credible bands.
 
-        Dispatches to ``posterior_eta_bands`` in Rust for the quantile
+        Dispatches to ``posterior_eta_bands`` in Rust; quantile
         reductions and inverse-link push-through.
         """
         import numpy as np
@@ -61,8 +61,12 @@ class PosteriorPredictive:
             raise map_exception(exc) from exc
         parsed = json.loads(raw)
         return {
-            key: np.asarray(parsed[key], dtype=float)
-            for key in ("eta_mean", "eta_lower", "eta_upper", "mean", "mean_lower", "mean_upper")
+            "eta_mean": np.asarray(parsed["eta_mean"], dtype=float),
+            "eta_lower": np.asarray(parsed["eta_lower"], dtype=float),
+            "eta_upper": np.asarray(parsed["eta_upper"], dtype=float),
+            "mean": np.asarray(parsed["mean"], dtype=float),
+            "mean_lower": np.asarray(parsed["mean_lower"], dtype=float),
+            "mean_upper": np.asarray(parsed["mean_upper"], dtype=float),
         }
 
     def __repr__(self) -> str:
@@ -93,7 +97,13 @@ class SamplingConfig:
     seed: int
 
     def to_dict(self) -> dict[str, Any]:
-        return {f: getattr(self, f) for f in ("n_samples", "n_warmup", "n_chains", "target_accept", "seed")}
+        return {
+            "n_samples": self.n_samples,
+            "n_warmup": self.n_warmup,
+            "n_chains": self.n_chains,
+            "target_accept": self.target_accept,
+            "seed": self.seed,
+        }
 
 
 def _config_from_payload(cfg: Mapping[str, Any]) -> SamplingConfig:
@@ -104,6 +114,14 @@ def _config_from_payload(cfg: Mapping[str, Any]) -> SamplingConfig:
         target_accept=float(cfg.get("target_accept", 0.0)),
         seed=int(cfg.get("seed", 0)),
     )
+
+
+def _coefficient_names(raw_names: Any, n_coeffs: int) -> tuple[str, ...]:
+    raw = _call(
+        "posterior_coefficient_names_json",
+        json.dumps({"coefficient_names": raw_names, "n_coeffs": int(n_coeffs)}),
+    )
+    return tuple(json.loads(raw))
 
 
 @dataclass(frozen=True, eq=False, slots=True)
@@ -123,7 +141,11 @@ class PosteriorSamples:
     _name_index: Mapping[str, int] = field(repr=False, compare=False, default_factory=dict)
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "_name_index", {n: j for j, n in enumerate(self.coefficient_names)})
+        object.__setattr__(
+            self,
+            "_name_index",
+            dict(zip(self.coefficient_names, range(len(self.coefficient_names)))),
+        )
 
     @classmethod
     def from_ffi_payload(cls, payload: Mapping[str, Any], *, model_bytes: bytes = _NO_MODEL) -> "PosteriorSamples":
@@ -131,11 +153,10 @@ class PosteriorSamples:
         p = payload
         nd, nc = int(p["n_draws"]), int(p["n_coeffs"])
         flat = np.asarray(p.get("samples_flat", []), dtype=float)
+        # allow-list (a): FFI input validation
         if flat.size != nd * nc:
             raise ValueError(f"FFI sample payload shape mismatch: got {flat.size} floats, expected {nd} * {nc}")
-        names = tuple(str(n) for n in p.get("coefficient_names", []))
-        if len(names) != nc:
-            names = tuple(f"beta_{j}" for j in range(nc))
+        names = _coefficient_names(p.get("coefficient_names", []), nc)
         return cls(samples=flat.reshape(nd, nc), coefficient_names=names,
                    mean=np.asarray(p.get("posterior_mean", []), dtype=float),
                    std=np.asarray(p.get("posterior_std", []), dtype=float),
@@ -161,11 +182,13 @@ class PosteriorSamples:
     def __iter__(self) -> Iterator[Any]: return iter(self.samples)
 
     def __getitem__(self, key: Any) -> Any:
-        if isinstance(key, str):
-            if key not in self._name_index:
-                raise KeyError(f"unknown coefficient {key!r}; known: {list(self.coefficient_names)}")
-            return self.samples[:, self._name_index[key]]
-        return self.samples[key]
+        try:
+            return self.samples[key]
+        except (IndexError, TypeError):
+            try:
+                return self.samples[:, self._name_index[key]]
+            except KeyError as exc:
+                raise KeyError(f"unknown coefficient {key!r}; known: {list(self.coefficient_names)}") from exc
 
     def to_numpy(self) -> Any: return self.samples
 
@@ -181,17 +204,30 @@ class PosteriorSamples:
         return np.asarray(flat, dtype=float).reshape(self.n_coeffs, 2)
 
     def summary(self, level: float = 0.95) -> Summary:
-        ci = self.interval(level)
-        coefs = [{"index": j, "name": self.coefficient_names[j], "estimate": float(self.mean[j]),
-                  "std_error": float(self.std[j]), "ci_lower": float(ci[j, 0]),
-                  "ci_upper": float(ci[j, 1])} for j in range(self.n_coeffs)]
-        return Summary.from_dict({
-            "kind": "posterior_samples", "method": self.method, "model_class": self.model_class,
-            "family_kind": self.family_kind, "n_draws": self.n_draws, "n_coeffs": self.n_coeffs,
-            "rhat": self.rhat, "ess": self.ess, "converged": self.converged,
-            "credible_interval": float(level), "config": self.config.to_dict(), "coefficients": coefs})
+        import numpy as np
+        raw = _call(
+            "posterior_samples_summary_json",
+            json.dumps({
+                "samples_flat": np.asarray(self.samples, dtype=float).ravel().tolist(),
+                "n_draws": self.n_draws,
+                "n_coeffs": self.n_coeffs,
+                "level": float(level),
+                "coefficient_names": self.coefficient_names,
+                "posterior_mean": np.asarray(self.mean, dtype=float).tolist(),
+                "posterior_std": np.asarray(self.std, dtype=float).tolist(),
+                "rhat": float(self.rhat),
+                "ess": float(self.ess),
+                "converged": bool(self.converged),
+                "method": self.method,
+                "model_class": self.model_class,
+                "family_kind": self.family_kind,
+                "config": self.config.to_dict(),
+            }),
+        )
+        return Summary.from_dict(json.loads(raw))
 
     def _need_model(self) -> None:
+        # allow-list (a): FFI input validation
         if not self._model_bytes:
             raise RuntimeError("PosteriorSamples has no model context; predict requires the original Model. "
                                "Re-sample via Model.sample(...) or use Model.predict(...) directly.")
@@ -208,8 +244,14 @@ class PosteriorSamples:
         parsed = json.loads(_call("posterior_predict_bands_table", self._model_bytes, h, r,
                                   np.asarray(self.samples, dtype=float).ravel().tolist(),
                                   self.n_draws, self.n_coeffs, float(level)))
-        return {k: np.asarray(parsed[k], dtype=float)
-                for k in ("eta_mean", "eta_lower", "eta_upper", "mean", "mean_lower", "mean_upper")}
+        return {
+            "eta_mean": np.asarray(parsed["eta_mean"], dtype=float),
+            "eta_lower": np.asarray(parsed["eta_lower"], dtype=float),
+            "eta_upper": np.asarray(parsed["eta_upper"], dtype=float),
+            "mean": np.asarray(parsed["mean"], dtype=float),
+            "mean_lower": np.asarray(parsed["mean_lower"], dtype=float),
+            "mean_upper": np.asarray(parsed["mean_upper"], dtype=float),
+        }
 
     def predict_draws(self, new_data: Any) -> PosteriorPredictive:
         import numpy as np
@@ -228,6 +270,7 @@ class PosteriorSamples:
                              self.n_draws, self.n_coeffs))
         nd, nr = int(p["n_draws"]), int(p["n_rows"])
         flat = np.asarray(p.get("eta_flat", []), dtype=float)
+        # allow-list (a): FFI input validation
         if flat.size != nd * nr:
             raise ValueError(f"posterior predict FFI payload shape mismatch: got {flat.size} floats, expected {nd} * {nr}")
         return flat.reshape(nd, nr), str(p.get("family_kind", self.family_kind)), str(p.get("model_class", self.model_class))
@@ -251,8 +294,7 @@ class PosteriorSamples:
         md = json.loads(str(npz["metadata"].item()))
         samples = np.asarray(npz["samples"], dtype=float)
         nc = int(samples.shape[1])
-        names_raw = list(md.get("coefficient_names", []))
-        names = tuple(str(n) for n in names_raw) if len(names_raw) == nc else tuple(f"beta_{j}" for j in range(nc))
+        names = _coefficient_names(md.get("coefficient_names", []), nc)
         return cls(samples=samples, coefficient_names=names,
                    mean=np.asarray(npz["mean"], dtype=float), std=np.asarray(npz["std"], dtype=float),
                    rhat=float(npz["rhat"].item()), ess=float(npz["ess"].item()),
@@ -262,28 +304,37 @@ class PosteriorSamples:
                    config=_config_from_payload(md.get("config", {})),
                    _model_bytes=bytes(np.asarray(npz["model_bytes"], dtype=np.uint8).tobytes()))
 
-    def plot_trace(self, *, coefficients: Any = None, max_panels: int = 8, ax: Any = None) -> Any:
+    def plot_trace(self, *, coefficients: Any = None, max_panels: int = 8) -> Any:
         import matplotlib.pyplot as plt
         import numpy as np
+        import pandas as pd
 
-        sel_in = (list(range(min(max_panels, self.n_coeffs))) if coefficients is None
-                  else [coefficients] if isinstance(coefficients, (str, int)) else list(coefficients))
-        if not sel_in:
-            raise ValueError("plot_trace: no coefficients selected")
-        n = len(sel_in)
-        if ax is None:
-            fig, axes = plt.subplots(n, 2, figsize=(10, 2.2 * n))
-            axes_arr = np.atleast_2d(axes)
-        else:
-            axes_arr = np.atleast_2d(ax)
-            fig = axes_arr[0, 0].figure
-        for row, s in enumerate(sel_in):
-            draws = self[s] if isinstance(s, str) else self.samples[:, int(s)]
-            label = s if isinstance(s, str) else self.coefficient_names[int(s)]
-            axes_arr[row, 0].plot(draws, color="#1d4ed8", linewidth=0.7)
-            axes_arr[row, 0].set_title(f"{label} — trace"); axes_arr[row, 0].set_xlabel("draw")
-            axes_arr[row, 1].hist(draws, bins=40, density=True, color="#1d4ed8", alpha=0.7)
-            axes_arr[row, 1].set_title(f"{label} — density"); axes_arr[row, 1].set_xlabel("value")
+        selection = json.loads(_call(
+            "posterior_trace_selection_json",
+            json.dumps({
+                "coefficient_names": self.coefficient_names,
+                "coefficients": coefficients,
+                "max_panels": int(max_panels),
+            }),
+        ))
+        labels = list(selection["labels"])
+        data = np.asarray(self.samples, dtype=float)[:, np.asarray(selection["indices"], dtype=int)]
+        n = len(labels)
+        fig, axes_arr = plt.subplots(n, 2, figsize=(10, 2.2 * n), squeeze=False)
+        frame = pd.DataFrame(data, columns=labels)
+        frame.plot(ax=axes_arr[:, 0], subplots=True, legend=False, color="#1d4ed8", linewidth=0.7)
+        frame.plot(
+            kind="hist",
+            ax=axes_arr[:, 1],
+            subplots=True,
+            legend=False,
+            bins=40,
+            density=True,
+            color="#1d4ed8",
+            alpha=0.7,
+        )
+        axes_arr[0, 0].set_xlabel("draw")
+        axes_arr[0, 1].set_xlabel("value")
         fig.tight_layout()
         return fig
 
