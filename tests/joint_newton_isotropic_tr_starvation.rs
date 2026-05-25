@@ -164,12 +164,15 @@ fn joint_newton_isotropic_l2_tr_produces_production_linearized_rate_stall() {
     let _post_l2 = truncate_joint_step_to_radius(&mut delta, radius);
     let scale = radius / pre_l2;
 
-    // PRODUCTION CHECK 2: after the L2 rescale, |δ|∞ = radius exactly
-    // (matches production cycle-0 |δ|∞ = 20.0).
+    // PRODUCTION CHECK 2: after L2 rescale, |δ|∞ ≤ radius.  Equality
+    // holds when one component dominates the L2 norm completely; for
+    // our fixture other components are small but non-zero so post_inf
+    // is just under radius.  Production trace: |δ|∞ = 20.000 (the
+    // 'shrink_marginal_accept' decision rounded to the cap).
     let post_inf = delta.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
     assert!(
-        (post_inf - 20.0).abs() < 1.0e-6,
-        "after isotropic-L2 truncation, |δ|∞ should equal radius=20; got {}",
+        post_inf <= 20.0 && post_inf > 19.0,
+        "after isotropic-L2 truncation, |δ|∞ should be in (19, 20] (production cap = 20.0); got {}",
         post_inf,
     );
 
