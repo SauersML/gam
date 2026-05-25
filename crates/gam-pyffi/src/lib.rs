@@ -387,6 +387,7 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
             "gaussian_reml_fit_latent_backward",
             "glm_reml_fit_latent",
             "glm_reml_fit_latent_backward",
+            "tierney_kadane_normalized_score",
             "arrow_schur_newton_step",
             "gaussian_reml_fit_formula_table",
             "gaussian_reml_fit_with_constraints_forward",
@@ -1093,6 +1094,23 @@ fn gaussian_reml_score<'py>(
     out.set_item("sigma2", score.sigma2.into_pyarray(py))?;
     out.set_item("edf", score.edf)?;
     Ok(out.unbind())
+}
+
+#[pyfunction]
+fn tierney_kadane_normalized_score(
+    raw_reml: f64,
+    null_dim: f64,
+    null_space_logdet: Option<f64>,
+) -> PyResult<f64> {
+    gam::solver::topology_selector::tk_normalized_score(
+        raw_reml,
+        null_dim,
+        null_space_logdet,
+        1.0,
+        1,
+        gam::solver::evidence::TopologyScoreScale::PerObservation,
+    )
+    .map_err(PyValueError::new_err)
 }
 
 #[pyfunction(signature = (x, y, penalty, weights, ridge_lambda))]
@@ -8788,6 +8806,10 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(gaussian_weighted_ridge_array, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_weighted_ridge_batch, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_score, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        tierney_kadane_normalized_score,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_fit, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_fit_backward, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_fit_formula_table, module)?)?;
