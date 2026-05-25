@@ -341,13 +341,8 @@ from ._binding import rust_module as _rust_module; JumpReLUPenalty = _rust_modul
 
 
 def _inverse_softplus(x: np.ndarray) -> np.ndarray:
-    # Category (b): 4-line numerically-stable inverse softplus helper used only
-    # at the Python boundary to seed Rust optimizer state.  Not worth a pyfunction.
-    out = np.empty_like(x, dtype=float)
-    large = x > 30.0
-    out[large] = x[large]
-    out[~large] = np.log(np.expm1(x[~large]))
-    return out
+    # Numerics live in Rust (see crates/gam-pyffi `numerics_inverse_softplus`).
+    return _rust_module().numerics_inverse_softplus(np.ascontiguousarray(x, dtype=float))
 
 
 from ._binding import rust_module as _rust_module; SparsityPenalty = _rust_module().SparsityPenalty
@@ -398,14 +393,8 @@ class GatedSAEDecoder:
 
 
 def _sigmoid_numpy(x: np.ndarray) -> np.ndarray:
-    # Category (b): 5-line numerically-stable sigmoid used only by GatedSAEDecoder.decode
-    # for the gate threshold check.  Single vectorized branch; not worth a pyfunction.
-    out = np.empty_like(x, dtype=float)
-    pos = x >= 0.0
-    out[pos] = 1.0 / (1.0 + np.exp(-x[pos]))
-    ex = np.exp(x[~pos])
-    out[~pos] = ex / (1.0 + ex)
-    return out
+    # Numerics live in Rust (see crates/gam-pyffi `numerics_sigmoid_stable`).
+    return _rust_module().numerics_sigmoid_stable(np.ascontiguousarray(x, dtype=float))
 
 
 # Sum type for type hints on `gamfit.fit(..., penalties=...)` and similar.

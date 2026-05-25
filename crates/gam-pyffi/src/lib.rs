@@ -94,11 +94,11 @@ use ndarray::{
     Array1, Array2, Array3, Array4, ArrayView1, ArrayView2, ArrayView3, ArrayViewD, Axis, IxDyn, s,
 };
 use numpy::{
-    IntoPyArray, PyArray1, PyArray2, PyArray3, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2,
-    PyReadonlyArray3, PyReadonlyArray4, PyReadonlyArrayDyn,
+    IntoPyArray, PyArray1, PyArray2, PyArray3, PyArrayDyn, PyArrayMethods, PyReadonlyArray1,
+    PyReadonlyArray2, PyReadonlyArray3, PyReadonlyArray4, PyReadonlyArrayDyn,
 };
 use pyo3::IntoPyObjectExt;
-use pyo3::PyObject;
+type PyObject = pyo3::Py<pyo3::PyAny>;
 use pyo3::exceptions::{PyKeyError, PyNotImplementedError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBytes, PyDict, PyFloat, PyList, PyString, PyTuple};
@@ -14466,6 +14466,45 @@ fn response_geometry_sphere_exp_map<'py>(
 }
 
 #[pyfunction]
+fn response_geometry_sphere_normalize_base<'py>(
+    py: Python<'py>,
+    base: PyReadonlyArray1<'py, f64>,
+) -> PyResult<Py<PyArray1<f64>>> {
+    let owned = base.as_array().to_owned();
+    let normalized = py.detach(move || -> Result<Array1<f64>, String> {
+        let norm_sq: f64 = owned.iter().map(|v| v * v).sum();
+        let norm = norm_sq.sqrt();
+        if !norm.is_finite() || norm <= 0.0 {
+            return Err("spherical base point must have non-zero norm".to_string());
+        }
+        let inv = 1.0 / norm;
+        Ok(owned.mapv(|v| v * inv))
+    });
+    let normalized = normalized.map_err(PyValueError::new_err)?;
+    Ok(normalized.into_pyarray(py).unbind())
+}
+
+#[pyfunction]
+fn numerics_sigmoid_stable<'py>(
+    py: Python<'py>,
+    x: PyReadonlyArrayDyn<'py, f64>,
+) -> PyResult<Py<PyArrayDyn<f64>>> {
+    let owned = x.as_array().to_owned();
+    let out = py.detach(move || owned.mapv(sigmoid_stable));
+    Ok(out.into_pyarray(py).unbind())
+}
+
+#[pyfunction]
+fn numerics_inverse_softplus<'py>(
+    py: Python<'py>,
+    x: PyReadonlyArrayDyn<'py, f64>,
+) -> PyResult<Py<PyArrayDyn<f64>>> {
+    let owned = x.as_array().to_owned();
+    let out = py.detach(move || owned.mapv(inverse_softplus_scalar));
+    Ok(out.into_pyarray(py).unbind())
+}
+
+#[pyfunction]
 fn response_geometry_normalize_fisher_rao<'py>(
     py: Python<'py>,
     value: PyReadonlyArrayDyn<'py, f64>,
@@ -17345,6 +17384,12 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(response_geometry_simplex_exp_map, module)?)?;
     module.add_function(wrap_pyfunction!(response_geometry_sphere_log_map, module)?)?;
     module.add_function(wrap_pyfunction!(response_geometry_sphere_exp_map, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        response_geometry_sphere_normalize_base,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(numerics_sigmoid_stable, module)?)?;
+    module.add_function(wrap_pyfunction!(numerics_inverse_softplus, module)?)?;
     module.add_function(wrap_pyfunction!(
         response_geometry_normalize_fisher_rao,
         module
