@@ -2972,7 +2972,11 @@ def _aggregate_fit_quality_rows(cv_rows: list[dict[str, typing.Any]]) -> dict[st
     lane-level result reports unweighted means across folds plus a
     ``per_fold`` array so the gate can drill in if needed.
     """
-    fqs = [r.get("fit_quality") for r in cv_rows if isinstance(r.get("fit_quality"), dict)]
+    fqs: list[dict[str, typing.Any]] = []
+    for r in cv_rows:
+        fit_quality = r.get("fit_quality")
+        if isinstance(fit_quality, dict):
+            fqs.append(fit_quality)
     if not fqs:
         return None
     neg_vs = [float(fq["final_neg_v"]) for fq in fqs if isinstance(fq.get("final_neg_v"), (int, float))]
