@@ -37,7 +37,7 @@
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
 
-use crate::faer_ndarray::{fast_ab, fast_atb, fast_atv, fast_av};
+use crate::faer_ndarray::{fast_atb, fast_atv, fast_av};
 use crate::matrix::DesignMatrix;
 
 /// `W = diag(diag) + u · vᵀ`. Rows: `n`. Rank of correction: `u.ncols()`.
@@ -332,6 +332,7 @@ fn transpose_design_times_dense(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::faer_ndarray::fast_ab;
     use crate::matrix::DesignMatrix;
     use ndarray::array;
 
