@@ -615,21 +615,24 @@ fn infer_delimited_column(
     };
 
     if matches!(kind, ColumnKindTag::Categorical) {
+        // A column is categorical only if at least one row failed numeric
+        // parsing. For sample-window rows, the path that succeeded numeric
+        // parsing stored the *raw f64* in `values` without adding the raw
+        // string to `level_index`. After the post-sample window decides the
+        // column is categorical, those numeric rows must be recoded as level
+        // indices using their original raw string, treating them as
+        // categorical levels alongside the non-numeric ones. Without this
+        // pass, a column like "0, 0, ..., 0, foo" silently mixes raw doubles
+        // (the literal 0.0 from the sample window) with level codes from the
+        // post-window rows, breaking the categorical encoding invariant.
         for row_idx in 0..sample_count {
-            if values[row_idx].is_nan() {
-                let raw = raw_fields[row_idx * n_cols + col].as_str();
-                let code = *level_index.get(raw).ok_or_else(|| DelimitedInferenceError {
-                    row: row_idx + 1,
-                    col,
-                    error: DataError::EncodingFailure {
-                        reason: format!(
-                            "internal error: sample string '{}' missing from level map for column '{}'",
-                            raw, header
-                        ),
-                    },
-                })?;
-                values[row_idx] = code as f64;
-            }
+            let raw = raw_fields[row_idx * n_cols + col].as_str();
+            let idx = *level_index.entry(raw.to_string()).or_insert_with(|| {
+                let new_idx = levels.len();
+                levels.push(raw.to_string());
+                new_idx
+            });
+            values[row_idx] = idx as f64;
         }
     }
 
