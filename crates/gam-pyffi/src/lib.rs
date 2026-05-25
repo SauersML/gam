@@ -9235,10 +9235,12 @@ fn sae_manifold_reconstruction_r2(
         )));
     }
     let n_rows = observed.nrows();
-    if n_rows == 0 {
-        return Ok(0.0);
-    }
     let n_cols = observed.ncols();
+    if n_rows == 0 || n_cols == 0 {
+        return Err(py_value_error(
+            "sae_manifold_reconstruction_r2: observed and fitted must be non-empty".into(),
+        ));
+    }
     let mut col_means = vec![0.0_f64; n_cols];
     for col in 0..n_cols {
         let mut acc = 0.0;
@@ -9257,7 +9259,10 @@ fn sae_manifold_reconstruction_r2(
             sst += dm * dm;
         }
     }
-    Ok(1.0 - ssr / sst.max(1.0e-12))
+    if sst == 0.0 {
+        return Ok(f64::NAN);
+    }
+    Ok(1.0 - ssr / sst)
 }
 
 /// Sparsity summary stats for an `(n_rows, K)` assignment matrix returned by
