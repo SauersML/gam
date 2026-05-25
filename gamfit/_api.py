@@ -1811,6 +1811,50 @@ def gaussian_reml_fit(
     return _coerce_gaussian_reml_payload(out, np)
 
 
+def gaussian_reml_fit_blocks_forward(
+    design_blocks: list,
+    penalty_blocks: list,
+    y: Any,
+    *,
+    weights: Any | None = None,
+    init_rhos: Any | None = None,
+) -> dict[str, Any]:
+    """Multi-block Gaussian REML forward fit with per-block λ.
+
+    Thin wrapper around the Rust ``optimize_external_design`` (Gaussian identity
+    link) outer loop. Returns a dict with ``coefficients`` (p_total, 1),
+    ``fitted`` (N, 1), ``lambdas`` (F,), ``log_lambdas`` (F,),
+    ``reml_score`` (scalar), and ``edf`` (F,) — one per smooth block.
+    Forward-only: no differentiable backward path is provided.
+    """
+    import numpy as np
+
+    designs_np = [_numeric_matrix(d, f"design_blocks[{i}]") for i, d in enumerate(design_blocks)]
+    penalties_np = [
+        _numeric_matrix(p, f"penalty_blocks[{i}]") for i, p in enumerate(penalty_blocks)
+    ]
+    y_mat = _numeric_matrix(y, "y")
+    weights_vec = None if weights is None else _numeric_vector(weights, "weights")
+    rhos_vec = None if init_rhos is None else _numeric_vector(init_rhos, "init_rhos")
+
+    try:
+        out = rust_module().gaussian_reml_fit_blocks_forward(
+            designs_np,
+            penalties_np,
+            y_mat,
+            weights_vec,
+            rhos_vec,
+        )
+    except Exception as exc:
+        raise map_exception(exc) from exc
+
+    coerced = dict(out)
+    for key in ("coefficients", "fitted", "lambdas", "log_lambdas", "edf"):
+        if key in coerced:
+            coerced[key] = np.asarray(coerced[key], dtype=float)
+    return coerced
+
+
 def gaussian_reml_fit_backward(
     x: Any,
     y: Any,
