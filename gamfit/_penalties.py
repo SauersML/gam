@@ -335,6 +335,9 @@ def _inverse_softplus(x: np.ndarray) -> np.ndarray:
     return out
 
 
+from ._binding import rust_module as _rust_module; SparsityPenalty = _rust_module().SparsityPenalty
+
+
 @dataclass(init=False, slots=True)
 class IsometryPenalty(_AnalyticPenalty):
     """Pull the decoder's pullback metric toward a reference metric on the
@@ -392,104 +395,6 @@ class IsometryPenalty(_AnalyticPenalty):
 
     def _payload_extras(self) -> dict[str, Any]:
         return {"weight": self.weight}
-
-
-@dataclass(init=False, slots=True)
-class SparsityPenalty(_AnalyticPenalty):
-    """Smoothed-L¹ / Hoyer / Log sparsifier on a β or t slice.
-    KIND_TAG = "sparsity"
-
-    The smoothed-L¹ default is
-
-    .. math::
-
-        P(\\beta; \\rho, \\varepsilon) \\;=\\; e^{\\rho_\\mathrm{spars}}
-            \\sum_i \\sqrt{\\beta_i^2 + \\varepsilon^2},
-
-    with analytic gradient ``β_i / sqrt(β_i^2 + ε²)`` (smoothed sign) and
-    diagonal Hessian ``ε² / (β_i^2 + ε²)^{3/2}``. The weight
-    ``e^{\\rho_\\mathrm{spars}}`` is REML-selectable; ``ε`` may *also* be
-    REML-selected (``eps_weight="auto"``), in which case the Occam factor
-    of the marginal likelihood shrinks ``ε`` only as far as the data warrants.
-
-    Alternatives: ``kind="hoyer"`` (scale-invariant; no diagonal HVP) and
-    ``kind="log"`` (``log(1 + x²/δ²)``; aggressively sparsifying).
-
-    **When to use.** SAE codes on a β slice; soft atom amplitudes on a
-    design-moving ext-coordinate slice; any time the inductive bias is
-    "this coefficient block should be sparse" without giving up
-    differentiability for an active-set solver.
-
-    Parameters
-    ----------
-    target
-        The name of the β block (or ext-coordinate slice) to apply the
-        penalty to.
-    kind
-        ``"smooth_l1"`` (the default), ``"hoyer"``, or ``"log"``.
-    weight
-        ``"auto"`` (REML) or a fixed positive float.
-    eps
-        Smoothing scale for ``"smooth_l1"`` / ``"log"`` kernels. Default
-        ``1e-3``.
-    eps_weight
-        ``"auto"`` to let REML select ``ε`` as well; ``"fixed"`` to pin
-        it at ``eps``. Defaults to ``"fixed"``.
-    """
-
-    target: TargetSpec
-    kind: Literal["smooth_l1", "hoyer", "log"] = "smooth_l1"
-    weight: WeightSpec = "auto"
-    eps: float = 1e-3
-    eps_weight: Literal["auto", "fixed"] = "fixed"
-    weight_schedule: ScalarWeightSchedule | dict[str, Any] | None = None
-
-    def __init__(
-        self,
-        kind: Literal["smooth_l1", "hoyer", "log"] = "smooth_l1",
-        weight: WeightSpec = "auto",
-        eps: float = 1e-3,
-        eps_weight: Literal["auto", "fixed"] = "fixed",
-        *,
-        target: TargetSpec = "t",
-        weight_schedule: ScalarWeightSchedule | dict[str, Any] | None = None,
-    ) -> None:
-        self.target = target
-        self.kind = kind
-        self.weight = weight
-        self.eps = float(eps)
-        self.eps_weight = eps_weight
-        self.weight_schedule = weight_schedule
-        self.__post_init__()
-
-    def __post_init__(self) -> None:
-        _validate_weight(self.weight, "SparsityPenalty")
-        if self.kind not in ("smooth_l1", "hoyer", "log"):
-            raise ValueError(
-                f"SparsityPenalty.kind must be one of 'smooth_l1' | 'hoyer' | 'log', "
-                f"got {self.kind!r}"
-            )
-        if self.kind == "hoyer" and self.eps_weight == "auto":
-            raise ValueError(
-                "SparsityPenalty(kind='hoyer'): Hoyer has no smoothing scale, "
-                "so eps_weight='auto' is not meaningful."
-            )
-        if self.eps <= 0.0:
-            raise ValueError(f"SparsityPenalty.eps must be > 0, got {self.eps}")
-        if self.eps_weight not in ("auto", "fixed"):
-            raise ValueError(
-                f"SparsityPenalty.eps_weight must be 'auto' or 'fixed', "
-                f"got {self.eps_weight!r}"
-            )
-
-    def _payload_extras(self) -> dict[str, Any]:
-        return {
-            "sparsity_kind": self.kind,
-            "weight": self.weight,
-            "eps": float(self.eps),
-            "eps_weight": self.eps_weight,
-        }
-
 
 @dataclass(init=False, slots=True)
 class ScadMcpPenalty(_AnalyticPenalty):
