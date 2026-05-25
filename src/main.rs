@@ -8807,32 +8807,22 @@ fn parse_survival_inverse_link(args: &SurvivalArgs) -> Result<InverseLink, Strin
     if let Some(raw) = args.link.as_deref() {
         let name = raw.trim().to_ascii_lowercase();
         if name == "loglog" || name == "cauchit" {
-            if args.sas_init.is_some() || args.beta_logistic_init.is_some() {
-                return Err(
-                    "survival --link loglog/cauchit does not accept --sas-init/--beta-logistic-init"
-                        .to_string(),
-                );
-            }
-            if let Some(rho_raw) = args.mixture_rho.as_deref() {
-                let vals = parse_comma_f64(rho_raw, "--mixture-rho")?;
-                if !vals.is_empty() {
-                    return Err(
-                        "--mixture-rho expects zero values for single-component survival links"
-                            .to_string(),
-                    );
-                }
-            }
-            let component = if name == "loglog" {
-                LinkComponent::LogLog
-            } else {
-                LinkComponent::Cauchit
-            };
-            let state = state_fromspec(&MixtureLinkSpec {
-                components: vec![component],
-                initial_rho: Array1::zeros(0),
-            })
-            .map_err(|e| format!("invalid survival {name} link state: {e}"))?;
-            return Ok(InverseLink::Mixture(state));
+            // `loglog` and `cauchit` previously routed through a degenerate
+            // single-component MixtureLinkSpec, but that wrapper silently lied
+            // about the projected LinkFunction (mixture link_function() returns
+            // Logit for any composition). Because `LinkFunction` has no LogLog
+            // or Cauchit variant, there is no sound projection, so we reject
+            // the survival link until `LinkFunction` is extended (or a
+            // dedicated `InverseLink` variant is introduced). This keeps the
+            // mixture-link invariant required by
+            // `state_fromspec_rejects_cauchit_and_loglog_components` consistent
+            // with the CLI surface.
+            return Err(format!(
+                "survival --link {name} is not supported: cauchit and loglog have no \
+                 LinkFunction representative and cannot be wrapped in a MixtureLinkSpec; \
+                 {}",
+                survival_link_usage()
+            ));
         }
     }
     let choice = parse_link_choice(args.link.as_deref(), false).map_err(|err| {
