@@ -9876,8 +9876,9 @@ fn write_survival_binary_prediction_csv(
 mod tests {
     use super::{
         BlockRole, BoundedCoefficientPriorSpec, CliFirthValidation, DataSchema,
-        FAMILY_GAUSSIAN_LOCATION_SCALE, FamilyArg, FittedFamily, LikelihoodSpec, LinkChoice,
-        LinkMode, MODEL_VERSION, ModelKind, ResidualDistribution, SavedFitSummary, SavedModel,
+        FAMILY_GAUSSIAN_LOCATION_SCALE, FamilyArg, FittedFamily, InverseLink, LikelihoodScaleMetadata,
+        LikelihoodSpec, LinkChoice, LinkFunction, LinkMode, LogLikelihoodNormalization,
+        MODEL_VERSION, ModelKind, ResidualDistribution, ResponseFamily, SavedFitSummary, SavedModel,
         SurvivalArgs, SurvivalBaselineTarget, SurvivalLikelihoodMode, SurvivalTimeBasisConfig,
         build_survival_time_basis, classify_cli_error, collect_hierarchical_smooth_overlapwarnings,
         collect_linear_smooth_overlapwarnings, collect_spatial_smooth_usagewarnings,
