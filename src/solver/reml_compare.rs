@@ -126,26 +126,34 @@ pub fn format_three_significant(value: f64) -> String {
     if value == 0.0 {
         return "0".to_string();
     }
-    let abs = value.abs();
-    let decimals = if abs >= 100.0 {
-        0
-    } else if abs >= 10.0 {
-        1
-    } else if abs >= 1.0 {
-        2
-    } else {
-        let exponent = abs.log10().floor();
-        (-exponent as i32 + 2).max(0) as usize
-    };
-    let mut formatted = format!("{value:.decimals$}");
-    if formatted.contains('.') {
-        while formatted.ends_with('0') {
-            formatted.pop();
-        }
-        if formatted.ends_with('.') {
-            formatted.pop();
-        }
+    if !value.is_finite() {
+        return format!("{value}");
     }
+    let abs = value.abs();
+    // Choose decimal places so we emit exactly three significant digits.
+    // For |v| in [1, 10) we keep 2 decimals (e.g. "1.23"); for [10, 100)
+    // we keep 1 decimal (e.g. "12.3"); for [100, 1000) we keep 0 decimals
+    // (e.g. "123"). Above 1000 the integer width itself already exceeds
+    // three sig figs, so we fall back to scientific notation so we don't
+    // silently emit four-or-more-significant-digit integers like "1234".
+    let exponent = abs.log10().floor() as i32;
+    if exponent >= 3 {
+        // |v| >= 1000 — use scientific with two fractional digits (3 sig figs).
+        return format!("{value:.2e}");
+    }
+    let decimals = (2 - exponent).max(0) as usize;
+    // Round half-away-from-zero in *decimal* (not in IEEE binary) so that
+    // values such as 1.005 round to "1.01" rather than "1.00". The naive
+    // `{value:.decimals$}` uses banker's rounding on the binary
+    // representation, and 1.005 is actually 1.00499999... in IEEE-754,
+    // which yields the wrong-looking "1.00".
+    let scale = 10f64.powi(decimals as i32);
+    let rounded = (value * scale).abs().round() / scale * value.signum();
+    let formatted = format!("{rounded:.decimals$}");
+    // Do NOT strip trailing zeros: "1.00" and "10.0" are intentional and
+    // carry the three-significant-digit precision contract. Stripping them
+    // would silently turn "10.0" into "10" (two sig figs) and "1.00" into
+    // "1" (one sig fig).
     formatted
 }
 

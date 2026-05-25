@@ -8188,7 +8188,6 @@ impl CustomFamily for GaussianLocationScaleFamily {
 
     /// Outer-aware joint-Hessian workspace with optional row subsample.
     ///
-<<<<<<< Updated upstream
     /// When `options.outer_score_subsample` is `None`, this is byte-identical
     /// to `exact_newton_joint_hessian_workspace`. When `Some`, the precomputed
     /// per-row coefficient arrays (`coeff_mm`, `coeff_ml`, `coeff_ll`) — which
@@ -8200,20 +8199,6 @@ impl CustomFamily for GaussianLocationScaleFamily {
     /// rows are zeroed. The resulting joint Hessian is an unbiased estimator
     /// of the full-data joint Hessian. Inner PIRLS never installs the option,
     /// so the inner solve continues to consume the exact full-data Hessian.
-=======
-    /// When `options.outer_score_subsample` is `None`, identical to
-    /// `exact_newton_joint_hessian_workspace`. When `Some`, the precomputed
-    /// per-row coefficient arrays `coeff_mm`, `coeff_ml`, `coeff_ll` (which
-    /// the workspace feeds into `Xᵀ diag(W) X`, matvec, and diagonal
-    /// assembly) are replaced by a Horvitz–Thompson mask: each sampled
-    /// row's coefficient is multiplied by `WeightedOuterRow.weight`
-    /// (= 1/π_i, the inverse inclusion probability — uniform or stratified
-    /// both supported), and non-sampled rows are zeroed. Because every
-    /// downstream assembly is row-linear in those coefficients, the
-    /// resulting joint Hessian is an unbiased estimator of the full-data
-    /// joint Hessian. Inner PIRLS never installs the option, so the inner
-    /// solve continues to use the exact full-data Hessian.
->>>>>>> Stashed changes
     fn exact_newton_joint_hessian_workspace_with_options(
         &self,
         block_states: &[ParameterBlockState],
@@ -8235,11 +8220,7 @@ impl CustomFamily for GaussianLocationScaleFamily {
         Ok(Some(Arc::new(workspace)))
     }
 
-<<<<<<< Updated upstream
     fn inner_coefficient_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
-=======
-    fn inner_coefficient_hessian_hvp_available(&self, _specs: &[ParameterBlockSpec]) -> bool {
->>>>>>> Stashed changes
         // The Gaussian location-scale workspace is returned by
         // `exact_newton_joint_hessian_workspace` whenever
         // `exact_joint_dense_block_designs` succeeds, which itself depends on
