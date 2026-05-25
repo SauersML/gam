@@ -14,6 +14,8 @@
 use libloading::Library;
 use ndarray::{Array2, ArrayBase, Data, Ix2};
 use std::borrow::Cow;
+use std::path::Path;
+use std::sync::OnceLock;
 
 use super::error::GpuError;
 
@@ -97,7 +99,7 @@ impl CudaWorkingState {
     /// missing, or any of `cuInit / cuDeviceGet / cuCtxCreate` fails.
     pub fn init(device_ordinal: usize) -> Option<Self> {
         let ordinal = to_i32(device_ordinal)?;
-        let library = load_static_library(cuda_library_candidates()).ok()?;
+        let library = load_static_cuda_driver_library().ok()?;
         let api = DriverApi::load(library).ok()?;
         // SAFETY: api was just resolved from the live libcuda handle;
         // we pass in-range device ordinals and pointers to local stack
@@ -200,20 +202,6 @@ pub fn check_cuda(result: CuResult, name: &str) -> Result<(), GpuError> {
     }
 }
 
-fn load_library(candidates: &[&str]) -> Result<Library, GpuError> {
-    for candidate in candidates {
-        // SAFETY: Library::new runs the library's loader initializer; we
-        // only ever pass canonical libcuda names from
-        // cuda_library_candidates(), trusting the platform CUDA driver.
-        if let Ok(library) = unsafe { Library::new(*candidate) } {
-            return Ok(library);
-        }
-    }
-    Err(GpuError::DriverLibraryUnavailable {
-        reason: format!("could not load any of: {}", candidates.join(", ")),
-    })
-}
-
 /// Returns whether the platform loader can open a CUDA driver library.
 ///
 /// This deliberately uses gam's own `libloading` probe rather than
@@ -224,19 +212,84 @@ fn load_library(candidates: &[&str]) -> Result<Library, GpuError> {
 /// this function has established that the driver shared library exists.
 #[must_use]
 pub fn cuda_driver_library_present() -> bool {
-    load_library(cuda_library_candidates()).is_ok()
+    load_library_names(&cuda_library_candidate_names()).is_ok()
 }
 
-/// Like [`load_library`] but intentionally leaks the result so the dlopen
-/// mapping stays alive for the process. Use this when the caller's fn-pointer
-/// table needs to stay valid forever (i.e. for every library binding we
-/// resolve at startup).
-fn load_static_library(candidates: &[&str]) -> Result<&'static Library, GpuError> {
-    let raw = Box::into_raw(Box::new(load_library(candidates)?));
+fn load_library_names(candidates: &[String]) -> Result<Library, GpuError> {
+    for candidate in candidates {
+        // SAFETY: Library::new runs the library's loader initializer; we
+        // only pass CUDA driver candidates discovered from fixed NVIDIA
+        // driver directories or canonical libcuda sonames.
+        if let Ok(library) = unsafe { Library::new(candidate) } {
+            return Ok(library);
+        }
+    }
+    Err(GpuError::DriverLibraryUnavailable {
+        reason: format!("could not load any of: {}", candidates.join(", ")),
+    })
+}
+
+fn load_static_cuda_driver_library() -> Result<&'static Library, GpuError> {
+    let candidates = cuda_library_candidate_names();
+    let raw = Box::into_raw(Box::new(load_library_names(&candidates)?));
     // SAFETY: deliberate process-lifetime leak. `raw` was just produced by
     // `Box::into_raw`, so it is a valid, properly aligned, exclusive pointer
     // and the reborrow yields a `&'static Library` that no other code holds.
     Ok(unsafe { &*raw })
+}
+
+pub fn preload_cuda_driver() -> Result<(), String> {
+    static PRELOAD: OnceLock<Result<(), String>> = OnceLock::new();
+    PRELOAD
+        .get_or_init(|| {
+            load_static_cuda_driver_library()
+                .map(|_| ())
+                .map_err(|err| err.to_string())
+        })
+        .clone()
+}
+
+fn cuda_library_candidate_names() -> Vec<String> {
+    let mut out: Vec<String> = cuda_library_candidates()
+        .iter()
+        .map(|candidate| (*candidate).to_string())
+        .collect();
+    if cfg!(target_os = "linux") {
+        for dir in [
+            "/usr/local/nvidia/lib64",
+            "/usr/local/nvidia/lib",
+            "/usr/local/cuda/compat",
+            "/usr/lib/x86_64-linux-gnu",
+            "/usr/lib64",
+            "/usr/lib/wsl/lib",
+        ] {
+            append_versioned_linux_libcuda_candidates(&mut out, Path::new(dir));
+        }
+    }
+    out
+}
+
+fn append_versioned_linux_libcuda_candidates(out: &mut Vec<String>, dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut versioned = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if name.starts_with("libcuda.so.") && name != "libcuda.so.1" {
+            versioned.push(path);
+        }
+    }
+    versioned.sort();
+    for path in versioned {
+        let candidate = path.to_string_lossy().into_owned();
+        if !out.iter().any(|existing| existing == &candidate) {
+            out.push(candidate);
+        }
+    }
 }
 
 pub fn cuda_library_candidates() -> &'static [&'static str] {
@@ -245,7 +298,22 @@ pub fn cuda_library_candidates() -> &'static [&'static str] {
     } else if cfg!(target_os = "macos") {
         &["/usr/local/cuda/lib/libcuda.dylib", "libcuda.dylib"]
     } else {
-        &["libcuda.so.1", "libcuda.so"]
+        &[
+            "/usr/local/nvidia/lib64/libcuda.so.1",
+            "/usr/local/nvidia/lib64/libcuda.so",
+            "/usr/local/nvidia/lib/libcuda.so.1",
+            "/usr/local/nvidia/lib/libcuda.so",
+            "/usr/local/cuda/compat/libcuda.so.1",
+            "/usr/local/cuda/compat/libcuda.so",
+            "/usr/lib/x86_64-linux-gnu/libcuda.so.1",
+            "/usr/lib/x86_64-linux-gnu/libcuda.so",
+            "/usr/lib64/libcuda.so.1",
+            "/usr/lib64/libcuda.so",
+            "/usr/lib/wsl/lib/libcuda.so.1",
+            "/usr/lib/wsl/lib/libcuda.so",
+            "libcuda.so.1",
+            "libcuda.so",
+        ]
     }
 }
 

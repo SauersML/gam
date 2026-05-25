@@ -410,13 +410,13 @@ pub fn tangent_decode_backward(
     let mut grad_atoms_proj = Array2::<f64>::zeros((n_atoms, d));
     for f in 0..n_atoms {
         let a_row = cache.atoms_projected.row(f);
-        let gL_row = grad_tangents.row(f);
+        let g_l_row = grad_tangents.row(f);
         let r_sq: f64 = (0..d).map(|i| a_row[i] * a_row[i]).sum();
         let r = r_sq.sqrt();
         if r <= ORIGIN_EPS {
             // psi(0) = 1, psi'(0) finite; L = a near origin so gradient passes through.
             for i in 0..d {
-                grad_atoms_proj[[f, i]] = gL_row[i];
+                grad_atoms_proj[[f, i]] = g_l_row[i];
             }
             continue;
         }
@@ -424,9 +424,9 @@ pub fn tangent_decode_backward(
         let psi = t.atanh() / t;
         let psi_prime = (t / (1.0 - t * t) - t.atanh()) / (t * t);
         let dpsi_da_coeff = psi_prime * sqrt_negc / r;
-        let gL_dot_a: f64 = (0..d).map(|i| gL_row[i] * a_row[i]).sum();
+        let g_l_dot_a: f64 = (0..d).map(|i| g_l_row[i] * a_row[i]).sum();
         for j in 0..d {
-            grad_atoms_proj[[f, j]] = psi * gL_row[j] + gL_dot_a * dpsi_da_coeff * a_row[j];
+            grad_atoms_proj[[f, j]] = psi * g_l_row[j] + g_l_dot_a * dpsi_da_coeff * a_row[j];
         }
     }
 

@@ -66,8 +66,6 @@ use crate::solver::latent_cache::LatentRetractionRegistry;
 use crate::terms::basis::{BasisError, RadialScalarKind};
 use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3};
 use std::sync::atomic::{AtomicU64, Ordering};
-
-const TWO_PI: f64 = std::f64::consts::PI * 2.0;
 const SPHERE_NORMAL_PIN: f64 = 1.0;
 static NEXT_LATENT_COORD_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -994,11 +992,6 @@ impl LatentCoordValues {
     }
 }
 
-fn wrap_angle(x: f64) -> f64 {
-    let y = x.rem_euclid(TWO_PI);
-    if y == TWO_PI { 0.0 } else { y }
-}
-
 fn wrap_to_period(x: f64, period: f64) -> f64 {
     assert!(
         period.is_finite() && period > 0.0,
@@ -1216,19 +1209,20 @@ mod tests {
     /// values drifted outside the circle on every Newton step.
     #[test]
     fn circle_manifold_update_wraps_into_canonical_interval() {
+        let two_pi = std::f64::consts::TAU;
         let near_top = 6.2_f64;
         let m = array![[near_top]];
         let mut lc = LatentCoordValues::from_matrix_with_manifold(
             m.view(),
             LatentIdMode::None,
-            LatentManifold::Circle { period: TWO_PI },
+            LatentManifold::Circle { period: two_pi },
         );
         let delta = Array1::from(vec![1.5_f64]);
         lc.retract_flat_delta(delta.view());
         let updated = lc.row(0)[0];
-        let expected = wrap_angle(near_top + 1.5);
+        let expected = (near_top + 1.5).rem_euclid(two_pi);
         assert!(
-            (0.0..TWO_PI).contains(&updated),
+            (0.0..two_pi).contains(&updated),
             "Circle retraction did not wrap into [0, 2π): got {updated}",
         );
         assert!(
@@ -1236,11 +1230,11 @@ mod tests {
             "Circle retraction value mismatch: got {updated}, expected {expected}",
         );
 
-        let large_delta = Array1::from(vec![10.0 * TWO_PI + 0.25_f64]);
+        let large_delta = Array1::from(vec![10.0 * two_pi + 0.25_f64]);
         lc.retract_flat_delta(large_delta.view());
         let after_big = lc.row(0)[0];
         assert!(
-            (0.0..TWO_PI).contains(&after_big),
+            (0.0..two_pi).contains(&after_big),
             "Circle retraction did not wrap a large delta: got {after_big}",
         );
     }

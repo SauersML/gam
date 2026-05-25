@@ -5281,7 +5281,7 @@ fn run_outer_with_plan(
             Err(cf) => {
                 let msg = format!(
                     "continuation pre-warm refused before seed eval: {}",
-                    cf.inner().message()
+                    cf.message()
                 );
                 log::warn!("[OUTER] {context}: rejecting seed {seed_idx} (continuation): {msg}");
                 rejection_reasons.push((seed_idx, "validation", msg));

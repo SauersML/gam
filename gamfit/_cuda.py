@@ -22,6 +22,8 @@ _CUDA_LIBRARY_GROUPS: tuple[tuple[str, tuple[tuple[str, ...], ...]], ...] = (
     ("cusolver", (("libcusolver.so.12", "libcusolver.so.11", "libcusolver.so"),)),
 )
 
+_CUDA_DRIVER_NAMES: tuple[str, ...] = ("libcuda.so.1", "libcuda.so")
+
 _CUDA_LIBRARY_HANDLES: list[ctypes.CDLL] = []
 
 _CUDA_SONAME_FAMILIES: frozenset[str] = frozenset(
@@ -78,6 +80,11 @@ def cuda_diagnostics() -> dict[str, object]:
             for root in _nvidia_roots()
             if (stack := _complete_nvidia_stack(root))
         ],
+        "system_driver_libraries": [
+            str(path)
+            for lib_dir in _system_cuda_driver_dirs()
+            if (path := _first_driver_library(lib_dir))
+        ],
         "system_complete_stacks": [
             [str(path) for path in stack]
             for lib_dir in _system_cuda_lib_dirs()
@@ -118,6 +125,12 @@ def format_cuda_diagnostics() -> str:
         lines.append("    <none>")
     lines.append("  complete packaged CUDA stacks:")
     _append_stack_lines(lines, info["packaged_complete_stacks"])
+    lines.append("  system CUDA driver libraries:")
+    system_drivers = info["system_driver_libraries"]
+    if isinstance(system_drivers, list) and system_drivers:
+        lines.extend(f"    {path}" for path in system_drivers)
+    else:
+        lines.append("    <none>")
     lines.append("  complete system CUDA stacks:")
     _append_stack_lines(lines, info["system_complete_stacks"])
     return "\n".join(lines)
@@ -169,16 +182,29 @@ def assert_no_cuda_library_conflicts(context: str) -> None:
 def _cuda_library_candidates() -> tuple[Path, ...]:
     mapped = _mapped_cuda_libraries()
     if mapped:
-        # A CUDA stack is already live. Do not introduce another one.
+        # A CUDA userspace stack may already be live because another package
+        # imported cuBLAS/cuSOLVER first. Do not introduce another userspace
+        # stack, but still load the driver if it is absent: cudarc needs
+        # `libcuda` specifically and preloaded cudart/cuBLAS are not enough.
+        if "libcuda" not in mapped and (driver := _cuda_driver_candidate()) is not None:
+            return (driver,)
+        return ()
+    driver = _cuda_driver_candidate()
+    if driver is None:
+        # CUDA user-space libraries are not useful without the driver. More
+        # importantly, preloading cuBLAS/cuSOLVER without libcuda makes the
+        # process look partially CUDA-initialized while Rust must still fall
+        # back to CPU. Keep the loader state honest and let Rust report a clean
+        # CPU fallback.
         return ()
     for lib_dir in _system_cuda_lib_dirs():
         candidates = _complete_system_stack(lib_dir)
         if candidates:
-            return tuple(candidates)
+            return tuple(_prepend_driver(driver, candidates))
     for root in _nvidia_roots():
         candidates = _complete_nvidia_stack(root)
         if candidates:
-            return tuple(candidates)
+            return tuple(_prepend_driver(driver, candidates))
     return ()
 
 
@@ -267,6 +293,48 @@ def _system_cuda_lib_dirs() -> tuple[Path, ...]:
         roots.append(root / "lib")
         roots.append(root / "targets" / "x86_64-linux" / "lib")
     return tuple(_existing_unique_paths(roots))
+
+
+def _system_cuda_driver_dirs() -> tuple[Path, ...]:
+    if sys.platform != "linux":
+        return ()
+    roots: list[Path] = [
+        Path("/usr/local/nvidia/lib64"),
+        Path("/usr/local/nvidia/lib"),
+        Path("/usr/local/cuda/compat"),
+        Path("/usr/lib/x86_64-linux-gnu"),
+        Path("/usr/lib64"),
+        Path("/usr/lib/wsl/lib"),
+    ]
+    return tuple(_existing_unique_paths(roots))
+
+
+def _cuda_driver_candidate() -> Path | None:
+    for lib_dir in _system_cuda_driver_dirs():
+        path = _first_driver_library(lib_dir)
+        if path is not None:
+            return path
+    return None
+
+
+def _first_driver_library(lib_dir: Path) -> Path | None:
+    direct = _first_existing(lib_dir, _CUDA_DRIVER_NAMES)
+    if direct is not None:
+        return direct
+    try:
+        matches = sorted(lib_dir.glob("libcuda.so.*"))
+    except OSError:
+        return None
+    for path in matches:
+        if path.name != "libcuda.so" and path.exists():
+            return path
+    return None
+
+
+def _prepend_driver(driver: Path | None, stack: list[Path]) -> list[Path]:
+    if driver is None:
+        return stack
+    return _dedup_resolved([driver, *stack])
 
 
 def _complete_nvidia_stack(root: Path) -> list[Path] | None:

@@ -675,6 +675,7 @@ impl<'a> RemlState<'a> {
         &self,
         outcome: SmoothingCorrectionOutcome,
     ) -> SmoothingCorrectionOutcome {
+        let branch_label = outcome.branch_label();
         match &outcome {
             SmoothingCorrectionOutcome::Cubature {
                 rank,
@@ -686,8 +687,9 @@ impl<'a> RemlState<'a> {
             } => {
                 SMOOTHING_CORRECTION_CUBATURE_COUNT.fetch_add(1, Ordering::Relaxed);
                 log::info!(
-                    "[smoothing-correction] branch=cubature rank={} points={} near_boundary={} \
+                    "[smoothing-correction] branch={} rank={} points={} near_boundary={} \
                      grad_norm={:.3e} max_rho_var={:.3e}",
+                    branch_label,
                     rank,
                     n_points,
                     near_boundary,
