@@ -59,9 +59,15 @@ impl GpuRuntime {
             GpuProbeError::Driver(reason)
         })??;
         if device_count <= 0 {
-            Self::record_cpu_reason("CUDA driver reported no devices");
-            diagnostics::log_cuda_disabled("CUDA driver reported no devices");
-            return Ok(None);
+            let reason = "CUDA driver reported no devices";
+            Self::record_cpu_reason(reason);
+            diagnostics::log_cuda_disabled(reason);
+            // Surface the no-device state as a structured `Driver(_)` so that
+            // callers wanting a CPU-reason marker can distinguish "policy off"
+            // (Ok(None)) from "driver present but no usable hardware"
+            // (Err(Driver)). This keeps `GpuRuntime::probe()` honest: a
+            // successful `Ok` always carries at least one device.
+            return Err(GpuProbeError::Driver(reason.to_string()));
         }
 
         let mut devices = Vec::new();
