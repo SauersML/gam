@@ -5345,8 +5345,8 @@ where
                         lambda = (loop_lambda * madsen_lm_accept_factor(rho)).max(1e-9);
                         // Consume any pending arrow-latent snapshot now that
                         // we have accepted the LM step; downstream cleanup
-                        // paths still drain via `pending_arrow_latent_restore
-                        // .take()` defensively.
+                        // paths still drain via the pending-restore helper
+                        // defensively.
                         commit_pending_arrow_latent(&mut pending_arrow_latent_restore);
 
                         // Updates for next iteration. Recycle the previous beta
@@ -9062,15 +9062,7 @@ pub fn update_glmvectors(
                             (((((((mu_o, w_o), z_o), c_o), d_o), dmu_o), d2_o), d3_o),
                         )|
                          -> Result<(), EstimationError> {
-                            let eta_used = match link {
-                                LinkFunction::Logit => eta[i].clamp(-700.0, 700.0),
-                                LinkFunction::Probit
-                                | LinkFunction::CLogLog
-                                | LinkFunction::Sas
-                                | LinkFunction::BetaLogistic => eta[i].clamp(-30.0, 30.0),
-                                LinkFunction::Log => eta[i].clamp(-700.0, 700.0),
-                                LinkFunction::Identity => eta[i],
-                            };
+                            let eta_used = eta_for_observed_hessian_jet(inverse_link, eta[i]);
                             if matches!(link, LinkFunction::Logit) {
                                 let jet = logit_inverse_link_jet5(eta_used);
                                 let geom = bernoulli_logit_geometry_from_jet(
@@ -9119,15 +9111,7 @@ pub fn update_glmvectors(
                     .zip(z_s.par_iter_mut())
                     .enumerate()
                     .try_for_each(|(i, ((mu_o, w_o), z_o))| -> Result<(), EstimationError> {
-                        let eta_used = match link {
-                            LinkFunction::Logit => eta[i].clamp(-700.0, 700.0),
-                            LinkFunction::Probit
-                            | LinkFunction::CLogLog
-                            | LinkFunction::Sas
-                            | LinkFunction::BetaLogistic => eta[i].clamp(-30.0, 30.0),
-                            LinkFunction::Log => eta[i].clamp(-700.0, 700.0),
-                            LinkFunction::Identity => eta[i],
-                        };
+                        let eta_used = eta_for_observed_hessian_jet(inverse_link, eta[i]);
                         if matches!(link, LinkFunction::Logit) {
                             let jet = logit_inverse_link_jet5(eta_used);
                             let geom = bernoulli_logit_geometry_from_jet(
