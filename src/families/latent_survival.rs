@@ -2131,14 +2131,14 @@ impl LatentSurvivalFamily {
                 &slices,
                 &primary_gradient,
                 wi,
-            );
+            )?;
             self.add_pullback_primary_block_diagonals(
                 row_idx,
                 &(wi * primary_hessian),
                 &mut hess_time,
                 &mut hess_mean,
                 hess_log_sigma.as_mut(),
-            );
+            )?;
         }
         Ok((ll, gradient, hess_time, hess_mean, hess_log_sigma))
     }
@@ -2198,13 +2198,13 @@ impl LatentSurvivalFamily {
                     &slices,
                     &primary_gradient,
                     wi,
-                );
+                )?;
                 self.add_pullback_primary_hessian(
                     &mut acc.hessian,
                     row_idx,
                     &slices,
                     &(wi * primary_hessian),
-                );
+                )?;
                 Ok(())
             },
             |total_acc, chunk_acc| {
@@ -2276,7 +2276,7 @@ impl LatentSurvivalFamily {
                     row_idx,
                     &slices,
                     &(wi * third),
-                );
+                )?;
                 Ok(())
             },
             |total_acc, chunk_acc| {
@@ -2352,7 +2352,7 @@ impl LatentSurvivalFamily {
                     row_idx,
                     &slices,
                     &(wi * fourth),
-                );
+                )?;
                 Ok(())
             },
             |total_acc, chunk_acc| {
@@ -3303,7 +3303,7 @@ impl LatentJointHessianFamily for LatentSurvivalFamily {
             )?;
             let primary_dir = self.row_primary_direction_from_flat(row_idx, slices, v);
             let primary_hv = primary_hessian.dot(&primary_dir);
-            self.add_pullback_primary_gradient(out, row_idx, slices, &primary_hv, wi);
+            self.add_pullback_primary_gradient(out, row_idx, slices, &primary_hv, wi)?;
         }
         Ok(true)
     }
