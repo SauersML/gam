@@ -2629,7 +2629,7 @@ pub struct BasisBuildResult {
 /// and each per-block penalty `S_k` becomes `Qᵀ S_k Q`, which is guaranteed
 /// block-diagonal with a zero `(joint_nullity × joint_nullity)` tail
 /// (because the joint null annihilates every active `S_k`).
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct JointNullRotation {
     /// `(p_smooth × p_smooth)` orthonormal matrix; range columns first,
     /// joint-null columns last.

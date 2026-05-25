@@ -371,6 +371,15 @@ fn run_path(
                     diagnosis: KktRefusalDiagnosis::ActiveSetIncomplete,
                     ..
                 } => PathOutcome::Propagate(failure),
+                InnerFailure::CertRefused {
+                    diagnosis: KktRefusalDiagnosis::AliasingDetectedAtFit,
+                    ..
+                } => PathOutcome::Propagate(failure),
+                // Structural identifiability failure at ρ₀: rho-anneal
+                // cannot fix a rank-deficient joint design. Propagate
+                // rather than expanding into an even more oversmoothed
+                // regime where the alias persists.
+                InnerFailure::IdentifiabilityFailure { .. } => PathOutcome::Propagate(failure),
                 // RankDeficientHPen at ρ₀ → definitely expand. Other
                 // failures at the most oversmoothed point are also
                 // unusual (we're in the strongly-convex regime);
