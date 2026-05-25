@@ -1320,6 +1320,19 @@ fn numeric_matrix_validate<'py>(
 }
 
 #[pyfunction]
+fn numeric_matrix_f64<'py>(
+    py: Python<'py>,
+    values: &Bound<'py, PyAny>,
+    label: &str,
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    let np = py.import("numpy")?;
+    let kwargs = PyDict::new(py);
+    kwargs.set_item("dtype", "float")?;
+    let array = np.call_method("asarray", (values,), Some(&kwargs))?;
+    numeric_matrix_validate(py, &array, label)
+}
+
+#[pyfunction]
 fn marginal_slope_clip_probabilities(values: Vec<f64>) -> PyResult<Vec<f64>> {
     Ok(values
         .into_iter()
@@ -12299,525 +12312,6 @@ fn benchmark_prediction_metrics(
     Ok(metrics.unbind())
 }
 
-fn benchmark_pr_auc_score(observed: &[f64], predicted_mean: &[f64]) -> PyResult<f64> {
-    if observed.len() != predicted_mean.len() {
-        return Err(PyValueError::new_err(format!(
-            "pr_auc length mismatch: observed={} predicted={}",
-            observed.len(),
-            predicted_mean.len()
-        )));
-    }
-    let mut pairs: Vec<(f64, bool)> = observed
-        .iter()
-        .zip(predicted_mean.iter())
-        .map(|(&y, &p)| (p, y > 0.5))
-        .collect();
-    let n_pos = pairs.iter().filter(|(_, is_pos)| *is_pos).count();
-    if n_pos == 0 {
-        return Ok(0.0);
-    }
-    pairs.sort_by(|(a, _), (b, _)| b.total_cmp(a));
-    let mut tp = 0usize;
-    let mut fp = 0usize;
-    let mut prev_precision = 1.0;
-    let mut prev_recall = 0.0;
-    let mut area = 0.0;
-    for (_score, is_pos) in pairs {
-        if is_pos {
-            tp += 1;
-        } else {
-            fp += 1;
-        }
-        let precision = tp as f64 / (tp + fp).max(1) as f64;
-        let recall = tp as f64 / n_pos as f64;
-        area += 0.5 * (precision + prev_precision) * (recall - prev_recall);
-        prev_precision = precision;
-        prev_recall = recall;
-    }
-    Ok(area)
-}
-
-fn benchmark_ece_score(observed: &[f64], predicted_mean: &[f64], n_bins: usize) -> PyResult<f64> {
-    if observed.len() != predicted_mean.len() {
-        return Err(PyValueError::new_err(format!(
-            "ece length mismatch: observed={} predicted={}",
-            observed.len(),
-            predicted_mean.len()
-        )));
-    }
-    if observed.is_empty() {
-        return Err(PyValueError::new_err("ece requires at least one row"));
-    }
-    let mut bins = vec![(0usize, 0.0, 0.0); n_bins.max(1)];
-    let bins_len = bins.len();
-    for (&y, &p) in observed.iter().zip(predicted_mean.iter()) {
-        if !y.is_finite() || !p.is_finite() {
-            return Err(PyValueError::new_err("ece inputs must be finite"));
-        }
-        let mut idx = (p.clamp(0.0, 1.0) * bins_len as f64).floor() as usize;
-        if idx >= bins_len {
-            idx = bins_len - 1;
-        }
-        bins[idx].0 += 1;
-        bins[idx].1 += y;
-        bins[idx].2 += p;
-    }
-    let n = observed.len() as f64;
-    Ok(bins
-        .into_iter()
-        .filter(|(count, _, _)| *count > 0)
-        .map(|(count, y_sum, p_sum)| {
-            let c = count as f64;
-            (c / n) * ((y_sum / c) - (p_sum / c)).abs()
-        })
-        .sum())
-}
-
-#[pyfunction]
-fn binary_auc(observed: Vec<f64>, predicted_mean: Vec<f64>) -> PyResult<f64> {
-    benchmark_auc_score(&observed, &predicted_mean)
-}
-
-#[pyfunction]
-fn binary_brier(observed: Vec<f64>, predicted_mean: Vec<f64>) -> PyResult<f64> {
-    let diagnostics =
-        gam::inference::diagnostics::diagnostics_from_predictions(&observed, &predicted_mean)
-            .map_err(py_value_error)?;
-    Ok(diagnostics.rmse * diagnostics.rmse)
-}
-
-#[pyfunction]
-fn classification_metrics(
-    py: Python<'_>,
-    observed: Vec<f64>,
-    predicted_mean: Vec<f64>,
-    train_prev: f64,
-) -> PyResult<Py<PyDict>> {
-    if observed.len() != predicted_mean.len() {
-        return Err(PyValueError::new_err(format!(
-            "classification_metrics length mismatch: observed={} predicted={}",
-            observed.len(),
-            predicted_mean.len()
-        )));
-    }
-    let diagnostics =
-        gam::inference::diagnostics::diagnostics_from_predictions(&observed, &predicted_mean)
-            .map_err(py_value_error)?;
-    let metrics = PyDict::new(py);
-    metrics.set_item("auc", benchmark_auc_score(&observed, &predicted_mean)?)?;
-    metrics.set_item("pr_auc", benchmark_pr_auc_score(&observed, &predicted_mean)?)?;
-    metrics.set_item("brier", diagnostics.rmse * diagnostics.rmse)?;
-    metrics.set_item(
-        "logloss",
-        benchmark_binary_logloss(&observed, &predicted_mean)?,
-    )?;
-    if train_prev > 0.0 && train_prev < 1.0 {
-        let train_observed = vec![train_prev];
-        let null_mean = train_observed[0];
-        let eps = 1.0e-12;
-        let ll_null = observed
-            .iter()
-            .map(|&y| y * null_mean.ln() + (1.0 - y) * (1.0 - null_mean).ln())
-            .sum::<f64>();
-        let ll_model = observed
-            .iter()
-            .zip(predicted_mean.iter())
-            .map(|(&y, &p)| {
-                let clipped = p.clamp(eps, 1.0 - eps);
-                y * clipped.ln() + (1.0 - y) * (1.0 - clipped).ln()
-            })
-            .sum::<f64>();
-        let n = observed.len() as f64;
-        let r2_cs = 1.0 - benchmark_exp_saturated((2.0 / n) * (ll_null - ll_model));
-        let max_r2_cs = 1.0 - benchmark_exp_saturated((2.0 / n) * ll_null);
-        if r2_cs.is_finite() && max_r2_cs.is_finite() && max_r2_cs > 0.0 {
-            metrics.set_item("nagelkerke_r2", r2_cs / max_r2_cs)?;
-        } else {
-            metrics.set_item("nagelkerke_r2", py.None())?;
-        }
-    } else {
-        metrics.set_item("nagelkerke_r2", py.None())?;
-    }
-    metrics.set_item("ece", benchmark_ece_score(&observed, &predicted_mean, 20)?)?;
-    Ok(metrics.unbind())
-}
-
-#[pyfunction]
-fn auc_from_predictions(observed: Vec<f64>, predicted_mean: Vec<f64>) -> PyResult<f64> {
-    benchmark_auc_score(&observed, &predicted_mean)
-}
-
-#[pyfunction]
-fn brier_from_predictions(observed: Vec<f64>, predicted_mean: Vec<f64>) -> PyResult<f64> {
-    binary_brier(observed, predicted_mean)
-}
-
-#[pyfunction(signature = (observed, predicted_mean, eps = 1e-12))]
-fn log_loss_from_predictions(
-    observed: Vec<f64>,
-    predicted_mean: Vec<f64>,
-    eps: f64,
-) -> PyResult<f64> {
-    benchmark_binary_logloss_eps(&observed, &predicted_mean, eps)
-}
-
-#[pyfunction(signature = (observed, predicted_mean, null_mean, eps = 1e-12))]
-fn nagelkerke_r2_from_predictions(
-    observed: Vec<f64>,
-    predicted_mean: Vec<f64>,
-    null_mean: f64,
-    eps: f64,
-) -> PyResult<Option<f64>> {
-    benchmark_nagelkerke_r2_with_null_mean(&observed, &predicted_mean, null_mean, eps)
-}
-
-#[pyfunction(signature = (observed, predicted_mean, sigma, eps = 1e-12))]
-fn gaussian_log_loss_from_predictions(
-    observed: Vec<f64>,
-    predicted_mean: Vec<f64>,
-    sigma: Vec<f64>,
-    eps: f64,
-) -> PyResult<f64> {
-    if eps == 1.0e-12 {
-        return benchmark_gaussian_logloss(&observed, &predicted_mean, &sigma);
-    }
-    if observed.len() != predicted_mean.len() {
-        return Err(PyValueError::new_err(format!(
-            "gaussian logloss length mismatch: observed={} predicted={}",
-            observed.len(),
-            predicted_mean.len()
-        )));
-    }
-    if observed.is_empty() {
-        return Err(PyValueError::new_err(
-            "gaussian logloss requires at least one row",
-        ));
-    }
-    if sigma.len() != 1 && sigma.len() != observed.len() {
-        return Err(PyValueError::new_err(format!(
-            "sigma length must be 1 or {}, got {}",
-            observed.len(),
-            sigma.len()
-        )));
-    }
-    let two_pi = 2.0 * std::f64::consts::PI;
-    let loss_sum = observed
-        .iter()
-        .zip(predicted_mean.iter())
-        .enumerate()
-        .map(|(idx, (&y, &mu))| {
-            let raw_sigma = if sigma.len() == 1 {
-                sigma[0]
-            } else {
-                sigma[idx]
-            };
-            let sigma_use = raw_sigma.max(eps);
-            let var = sigma_use * sigma_use;
-            0.5 * (two_pi * var).ln() + ((y - mu) * (y - mu)) / (2.0 * var)
-        })
-        .sum::<f64>();
-    Ok(loss_sum / observed.len() as f64)
-}
-
-#[pyfunction]
-fn gaussian_prediction_scores_from_predictions(
-    py: Python<'_>,
-    observed: Vec<f64>,
-    predicted_mean: Vec<f64>,
-    sigma: Vec<f64>,
-) -> PyResult<Py<PyDict>> {
-    let diagnostics =
-        gam::inference::diagnostics::diagnostics_from_predictions(&observed, &predicted_mean)
-            .map_err(py_value_error)?;
-    let metrics = PyDict::new(py);
-    metrics.set_item(
-        "logloss",
-        benchmark_gaussian_logloss(&observed, &predicted_mean, &sigma)?,
-    )?;
-    metrics.set_item("mse", diagnostics.rmse * diagnostics.rmse)?;
-    metrics.set_item("rmse", diagnostics.rmse)?;
-    metrics.set_item("mae", diagnostics.mae)?;
-    match diagnostics.r_squared {
-        Some(r_squared) => metrics.set_item("r2", r_squared)?,
-        None => metrics.set_item("r2", py.None())?,
-    }
-    Ok(metrics.unbind())
-}
-
-#[pyfunction]
-fn make_folds_indices(
-    py: Python<'_>,
-    y: Vec<f64>,
-    n_splits: usize,
-    seed: u64,
-    stratified: bool,
-) -> PyResult<Py<PyList>> {
-    let n = y.len();
-    if n < n_splits {
-        return Err(PyValueError::new_err(format!(
-            "Need at least {n_splits} rows for {n_splits}-fold CV; got {n}"
-        )));
-    }
-    let mut rng = SplitMixNormalRng::new(seed);
-    let all_idx: Vec<usize> = (0..n).collect();
-    let folds = PyList::empty(py);
-    let append_fold =
-        |folds: &Bound<'_, PyList>, test_idx: Vec<usize>, all_idx: &[usize]| -> PyResult<()> {
-            let test_set: BTreeSet<usize> = test_idx.iter().copied().collect();
-            let train_idx: Vec<usize> = all_idx
-                .iter()
-                .copied()
-                .filter(|idx| !test_set.contains(idx))
-                .collect();
-            folds.append((train_idx, test_idx))
-        };
-
-    if n_splits == 1 {
-        if n < 2 {
-            return Err(PyValueError::new_err(
-                "Need at least 2 rows for a holdout split",
-            ));
-        }
-        if stratified {
-            let mut classes: Vec<u64> = y.iter().map(|value| value.to_bits()).collect();
-            classes.sort_unstable();
-            classes.dedup();
-            if classes.len() >= 2 {
-                let mut test_rows = Vec::new();
-                for class_bits in classes {
-                    let mut idx: Vec<usize> = y
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(i, value)| (value.to_bits() == class_bits).then_some(i))
-                        .collect();
-                    rng.shuffle(&mut idx);
-                    if idx.len() < 2 {
-                        return Err(PyValueError::new_err(
-                            "Need at least 2 observations in each class for a stratified holdout split",
-                        ));
-                    }
-                    let n_test = (((idx.len() as f64) * 0.2).round() as usize)
-                        .max(1)
-                        .min(idx.len() - 1);
-                    test_rows.extend_from_slice(&idx[..n_test]);
-                }
-                test_rows.sort_unstable();
-                append_fold(&folds, test_rows, &all_idx)?;
-                return Ok(folds.unbind());
-            }
-        }
-        let mut perm = all_idx.clone();
-        rng.shuffle(&mut perm);
-        let n_test = (((n as f64) * 0.2).round() as usize).max(1).min(n - 1);
-        let mut test_idx = perm[..n_test].to_vec();
-        test_idx.sort_unstable();
-        append_fold(&folds, test_idx, &all_idx)?;
-        return Ok(folds.unbind());
-    }
-
-    if stratified {
-        let mut classes: Vec<u64> = y.iter().map(|value| value.to_bits()).collect();
-        classes.sort_unstable();
-        classes.dedup();
-        if classes.len() >= 2 {
-            let mut fold_bins = vec![Vec::<usize>::new(); n_splits];
-            for class_bits in classes {
-                let mut idx: Vec<usize> = y
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, value)| (value.to_bits() == class_bits).then_some(i))
-                    .collect();
-                rng.shuffle(&mut idx);
-                for (i, row_idx) in idx.into_iter().enumerate() {
-                    fold_bins[i % n_splits].push(row_idx);
-                }
-            }
-            for mut test_idx in fold_bins {
-                test_idx.sort_unstable();
-                append_fold(&folds, test_idx, &all_idx)?;
-            }
-            return Ok(folds.unbind());
-        }
-    }
-
-    let mut perm = all_idx.clone();
-    rng.shuffle(&mut perm);
-    for fold in 0..n_splits {
-        let start = (fold * n) / n_splits;
-        let end = ((fold + 1) * n) / n_splits;
-        let mut test_idx = perm[start..end].to_vec();
-        test_idx.sort_unstable();
-        append_fold(&folds, test_idx, &all_idx)?;
-    }
-    Ok(folds.unbind())
-}
-
-#[pyfunction]
-fn zscore_train_test_arrays<'py>(
-    py: Python<'py>,
-    train: PyReadonlyArray2<'py, f64>,
-    test: PyReadonlyArray2<'py, f64>,
-) -> PyResult<(Py<PyArray2<f64>>, Py<PyArray2<f64>>)> {
-    let train_view = train.as_array();
-    let test_view = test.as_array();
-    if train_view.ncols() != test_view.ncols() {
-        return Err(PyValueError::new_err(format!(
-            "zscore column mismatch: train={} test={}",
-            train_view.ncols(),
-            test_view.ncols()
-        )));
-    }
-    let mut tr = train_view.to_owned();
-    let mut te = test_view.to_owned();
-    for col in 0..tr.ncols() {
-        let n = tr.nrows();
-        let mean = if n == 0 {
-            0.0
-        } else {
-            tr.column(col).iter().sum::<f64>() / n as f64
-        };
-        let variance = if n > 1 {
-            tr.column(col)
-                .iter()
-                .map(|value| {
-                    let centered = *value - mean;
-                    centered * centered
-                })
-                .sum::<f64>()
-                / (n - 1) as f64
-        } else {
-            0.0
-        };
-        let mut sd = variance.sqrt();
-        if !sd.is_finite() || sd < 1e-8 {
-            sd = 1.0;
-        }
-        for value in tr.column_mut(col).iter_mut() {
-            *value = (*value - mean) / sd;
-        }
-        for value in te.column_mut(col).iter_mut() {
-            *value = (*value - mean) / sd;
-        }
-    }
-    Ok((tr.into_pyarray(py).unbind(), te.into_pyarray(py).unbind()))
-}
-
-#[pyfunction]
-fn survival_score_grid_from_times<'py>(
-    py: Python<'py>,
-    train_times: Vec<f64>,
-) -> PyResult<Py<PyArray1<f64>>> {
-    let mut times: Vec<f64> = train_times
-        .into_iter()
-        .filter(|value| value.is_finite() && *value > 0.0)
-        .collect();
-    if times.is_empty() {
-        return Ok(Array1::from_vec(vec![0.0, 1.0]).into_pyarray(py).unbind());
-    }
-    times.sort_by(|a, b| a.total_cmp(b));
-    let median = if times.len() % 2 == 1 {
-        times[times.len() / 2]
-    } else {
-        0.5 * (times[times.len() / 2 - 1] + times[times.len() / 2])
-    };
-    let mut grid = vec![0.0, 1.0, 2.0, 5.0, 10.0, median];
-    grid.retain(|value| value.is_finite() && *value >= 0.0);
-    grid.sort_by(|a, b| a.total_cmp(b));
-    grid.dedup_by(|a, b| *a == *b);
-    if grid.is_empty() {
-        grid.push(0.0);
-    }
-    grid[0] = 0.0;
-    if grid.len() == 1 {
-        grid.push(grid[0].max(1.0));
-    }
-    Ok(Array1::from_vec(grid).into_pyarray(py).unbind())
-}
-
-#[pyfunction]
-fn repeat_survival_curve<'py>(
-    py: Python<'py>,
-    survival: Vec<f64>,
-    n_rows: usize,
-) -> PyResult<Py<PyArray2<f64>>> {
-    let mut out = Array2::<f64>::zeros((n_rows, survival.len()));
-    for mut row in out.rows_mut() {
-        for (dst, src) in row.iter_mut().zip(survival.iter()) {
-            *dst = *src;
-        }
-    }
-    Ok(out.into_pyarray(py).unbind())
-}
-
-fn benchmark_km_curve(times: &[f64], events: &[f64], grid: &[f64]) -> Vec<f64> {
-    let mut rows: Vec<(f64, bool)> = times
-        .iter()
-        .zip(events.iter())
-        .filter_map(|(&time, &event)| {
-            (time.is_finite() && event.is_finite() && time > 0.0).then_some((time, event > 0.5))
-        })
-        .collect();
-    if rows.is_empty() {
-        return vec![1.0; grid.len()];
-    }
-    rows.sort_by(|a, b| a.0.total_cmp(&b.0));
-    let mut steps = Vec::<(f64, f64)>::new();
-    let mut at_risk = rows.len() as f64;
-    let mut survival = 1.0;
-    let mut i = 0usize;
-    while i < rows.len() {
-        let time = rows[i].0;
-        let mut j = i + 1;
-        let mut events_at_time = usize::from(rows[i].1);
-        while j < rows.len() && rows[j].0 == time {
-            events_at_time += usize::from(rows[j].1);
-            j += 1;
-        }
-        if events_at_time > 0 && at_risk > 0.0 {
-            survival *= ((at_risk - events_at_time as f64) / at_risk).max(0.0);
-            steps.push((time, survival));
-        }
-        at_risk -= (j - i) as f64;
-        i = j;
-    }
-    let mut out = Vec::with_capacity(grid.len());
-    let mut step_idx = 0usize;
-    let mut current = 1.0;
-    for &time in grid {
-        while step_idx < steps.len() && steps[step_idx].0 <= time {
-            current = steps[step_idx].1;
-            step_idx += 1;
-        }
-        out.push(current.clamp(1.0e-12, 1.0));
-    }
-    if let Some(first) = out.first_mut() {
-        *first = 1.0;
-    }
-    for idx in 1..out.len() {
-        out[idx] = out[idx].min(out[idx - 1]);
-    }
-    out
-}
-
-#[pyfunction]
-fn survival_null_curve_from_train<'py>(
-    py: Python<'py>,
-    train_times: Vec<f64>,
-    train_events: Vec<f64>,
-    grid: Vec<f64>,
-) -> PyResult<Py<PyArray1<f64>>> {
-    if train_times.len() != train_events.len() {
-        return Err(PyValueError::new_err(format!(
-            "survival null curve length mismatch: times={} events={}",
-            train_times.len(),
-            train_events.len()
-        )));
-    }
-    Ok(Array1::from_vec(benchmark_km_curve(&train_times, &train_events, &grid))
-        .into_pyarray(py)
-        .unbind())
-}
-
 fn benchmark_survival_matrix_from_risk(
     train_times: &[f64],
     train_events: &[f64],
@@ -14711,7 +14205,7 @@ impl PyTopKActivationPenalty {
                 "TopKActivationPenalty.k must be > 0, got {k}"
             )));
         }
-        if !weight.is_finite() || weight <= 0.0 {
+        if !(weight > 0.0) {
             return Err(PyValueError::new_err(format!(
                 "TopKActivationPenalty.weight must be finite and > 0, got {weight}"
             )));
@@ -14814,7 +14308,7 @@ impl JumpReLUPenalty {
                 "JumpReLUPenalty.weight must be finite and > 0, got {weight}"
             )));
         }
-        if !smoothing_eps.is_finite() || smoothing_eps <= 0.0 {
+        if !(smoothing_eps > 0.0) {
             return Err(PyValueError::new_err(format!(
                 "JumpReLUPenalty.smoothing_eps must be finite and > 0, got {smoothing_eps}"
             )));
@@ -16267,18 +15761,17 @@ impl MechanismSparsityPenalty {
             smoothing_eps = 1.0e-6,
             learnable = false,
             *,
-            target = None
+            target = "t"
         ),
         text_signature = "(feature_groups, weight, n_eff, smoothing_eps=1e-06, learnable=False, *, target='t')"
     )]
     fn new(
-        py: Python<'_>,
         feature_groups: &Bound<'_, PyAny>,
         weight: f64,
         n_eff: f64,
         smoothing_eps: f64,
         learnable: bool,
-        target: Option<PyObject>,
+        target: PyObject,
     ) -> PyResult<Self> {
         if weight <= 0.0 {
             return Err(PyValueError::new_err(format!(
@@ -16295,10 +15788,6 @@ impl MechanismSparsityPenalty {
                 "MechanismSparsityPenalty.n_eff must be > 0, got {n_eff}"
             )));
         }
-        let target = match target {
-            Some(target) => target,
-            None => "t".into_pyobject(py)?.unbind().into_any(),
-        };
         Ok(Self {
             target,
             feature_groups: coerce_mechanism_feature_groups(feature_groups)?,
@@ -16756,7 +16245,7 @@ impl NuclearNormPenalty {
             Some(rank) => Some(rank.call_method0("__index__")?.extract::<i64>()?),
             None => None,
         };
-        if weight <= 0.0 {
+        if !weight.is_finite() || weight <= 0.0 {
             return Err(PyValueError::new_err(format!(
                 "NuclearNormPenalty.weight must be > 0, got {weight}"
             )));
@@ -16766,7 +16255,7 @@ impl NuclearNormPenalty {
                 "NuclearNormPenalty.n_eff must be > 0, got {n_eff}"
             )));
         }
-        if smoothing_eps <= 0.0 {
+        if !smoothing_eps.is_finite() || smoothing_eps <= 0.0 {
             return Err(PyValueError::new_err(format!(
                 "NuclearNormPenalty.smoothing_eps must be > 0, got {smoothing_eps}"
             )));
@@ -16867,6 +16356,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(survival_block, module)?)?;
     module.add_function(wrap_pyfunction!(survival_ffi_surface, module)?)?;
     module.add_function(wrap_pyfunction!(numeric_matrix_validate, module)?)?;
+    module.add_function(wrap_pyfunction!(numeric_matrix_f64, module)?)?;
     module.add_function(wrap_pyfunction!(marginal_slope_clip_probabilities, module)?)?;
     module.add_function(wrap_pyfunction!(
         transformation_normal_z_from_columns,
