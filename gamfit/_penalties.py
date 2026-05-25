@@ -1563,14 +1563,12 @@ class ParametricAuxConditionalPriorPenalty(_AnalyticPenalty):
         if not np.all(self.beta_init > 0.0):
             raise ValueError("ParametricAuxConditionalPriorPenalty.beta_init must be > 0")
 
-    def _to_rust_payload(self) -> dict[str, Any]:
+    def _payload_extras(self) -> dict[str, Any]:
         aux = np.ascontiguousarray(self.aux, dtype=float)
         alpha = np.ascontiguousarray(self.alpha_init, dtype=float)
         beta = np.ascontiguousarray(self.beta_init, dtype=float)
         mu = np.ascontiguousarray(self.mu_init, dtype=float)
-        return _add_weight_schedule({
-            "kind": "parametric_aux_conditional_prior",
-            "target": _target_descriptor(self.target),
+        return {
             "aux": aux.reshape(-1).tolist(),
             "aux_shape": list(aux.shape),
             "log_alpha": np.log(alpha).reshape(-1).tolist(),
@@ -1580,14 +1578,12 @@ class ParametricAuxConditionalPriorPenalty(_AnalyticPenalty):
             "weight": self.weight,
             "n_eff": self.n_eff,
             "learnable": self.learnable,
-        }, self)
-
-    def to_rust_descriptor(self) -> dict[str, Any]:
-        return self._to_rust_payload()
+        }
 
 
 @dataclass(init=False, slots=True)
-class OrthogonalityPenalty:
+class OrthogonalityPenalty(_AnalyticPenalty):
+    KIND_TAG = "orthogonality"
     """Gauge-fixing penalty for latent-axis identifiability.
 
     Applies a Frobenius orthogonality penalty to the column-normalized latent
@@ -1637,21 +1633,17 @@ class OrthogonalityPenalty:
         if self.n_eff <= 0:
             raise ValueError(f"OrthogonalityPenalty.n_eff must be > 0, got {self.n_eff}")
 
-    def _to_rust_payload(self) -> dict[str, Any]:
-        return _add_weight_schedule({
-            "kind": "orthogonality",
-            "target": _target_descriptor(self.target),
+    def _payload_extras(self) -> dict[str, Any]:
+        return {
             "weight": self.weight,
             "n_eff": self.n_eff,
             "learnable": self.learnable,
-        }, self)
-
-    def to_rust_descriptor(self) -> dict[str, Any]:
-        return self._to_rust_payload()
+        }
 
 
 @dataclass(init=False, slots=True)
-class IBPAssignmentPenalty:
+class IBPAssignmentPenalty(_AnalyticPenalty):
+    KIND_TAG = "ibp_assignment"
     target: TargetSpec
     k_max: int
     alpha: float = 1.0
@@ -1688,23 +1680,27 @@ class IBPAssignmentPenalty:
         if self.tau <= 0.0:
             raise ValueError(f"IBPAssignmentPenalty.tau must be > 0, got {self.tau}")
 
-    def _to_rust_payload(self) -> dict[str, Any]:
-        payload = _add_temperature_schedule({
-            "kind": "ibp_assignment",
-            "target": _target_descriptor(self.target),
+    def _payload_extras(self) -> dict[str, Any]:
+        return {
             "k_max": int(self.k_max),
             "alpha": float(self.alpha),
             "tau": float(self.tau),
             "learnable": bool(self.learnable),
-        }, self)
-        return _add_weight_schedule(payload, self)
+        }
 
-    def to_rust_descriptor(self) -> dict[str, Any]:
-        return self._to_rust_payload()
+    def _to_rust_payload(self) -> dict[str, Any]:
+        payload = {
+            "kind": type(self).KIND_TAG,
+            "target": _target_descriptor(self.target),
+        }
+        payload.update(self._payload_extras())
+        payload = _add_temperature_schedule(payload, self)
+        return _add_weight_schedule(payload, self)
 
 
 @dataclass(init=False, slots=True)
-class SoftmaxAssignmentSparsityPenalty:
+class SoftmaxAssignmentSparsityPenalty(_AnalyticPenalty):
+    KIND_TAG = "softmax_assignment_sparsity"
     target: TargetSpec
     k_atoms: int
     temperature: float = 1.0
@@ -1736,37 +1732,11 @@ class SoftmaxAssignmentSparsityPenalty:
                 f"got {self.temperature}"
             )
 
-    def _to_rust_payload(self) -> dict[str, Any]:
-        return _add_weight_schedule({
-            "kind": "softmax_assignment_sparsity",
-            "target": _target_descriptor(self.target),
+    def _payload_extras(self) -> dict[str, Any]:
+        return {
             "k_atoms": int(self.k_atoms),
             "temperature": float(self.temperature),
-        }, self)
-
-    def to_rust_descriptor(self) -> dict[str, Any]:
-        return self._to_rust_payload()
-
-
-for _penalty_cls in (
-    IsometryPenalty,
-    SparsityPenalty,
-    ScadMcpPenalty,
-    ARDPenalty,
-    TopKActivationPenalty,
-    JumpReLUPenalty,
-    TotalVariationPenalty,
-    NuclearNormPenalty,
-    BlockSparsityPenalty,
-    MechanismSparsityPenalty,
-    AuxConditionalPriorPenalty,
-    IvaeRidgeMeanGauge,
-    ParametricAuxConditionalPriorPenalty,
-    OrthogonalityPenalty,
-    IBPAssignmentPenalty,
-    SoftmaxAssignmentSparsityPenalty,
-):
-    _penalty_cls.set_weight_schedule = _set_weight_schedule
+        }
 
 
 # Sum type for type hints on `gamfit.fit(..., penalties=...)` and similar.
