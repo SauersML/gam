@@ -2403,6 +2403,29 @@ pub fn global_cubic_from_local(span: LocalSpanCubic) -> (f64, f64, f64, f64) {
     (q0, q1, q2, q3)
 }
 
+/// Return the cubic polynomial coefficients (in `z`) of
+/// `f(z) = link_span.evaluate(a + b*z)`.
+///
+/// `link_span.evaluate` is a cubic in its argument, so `f(z)` is also a cubic
+/// in `z` and can be written exactly as
+///
+/// ```text
+///     f(z) = d0 + d1·z + d2·z² + d3·z³
+/// ```
+///
+/// where `(d0, d1, d2, d3)` are the values returned by this function. These
+/// are **polynomial coefficients**, *not* derivatives of `f` at `z = 0`. The
+/// relationship to Taylor derivatives is
+///
+/// ```text
+///     d_k = f^(k)(0) / k!
+/// ```
+///
+/// so `d0 = f(0)`, `d1 = f'(0)`, `d2 = ½·f''(0)`, `d3 = ⅙·f'''(0)`. Callers
+/// such as [`denested_cell_coefficients`] and [`link_basis_cell_coefficients`]
+/// rely on the polynomial-coefficient convention, since they propagate the
+/// values directly as the `(c0, c1, c2, c3)` slots of a downstream polynomial
+/// in `z`.
 #[inline]
 pub fn transformed_link_cubic(link_span: LocalSpanCubic, a: f64, b: f64) -> (f64, f64, f64, f64) {
     let shift = a - link_span.left;
