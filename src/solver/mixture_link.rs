@@ -527,24 +527,33 @@ pub fn validate_mixturespec(spec: &MixtureLinkSpec) -> Result<(), String> {
             }
         }
     }
-    // `LinkComponent` carries variants (Cauchit, LogLog) that have no corresponding
-    // `LinkFunction` standard-link entry. The mixture-link pipeline projects the
-    // chosen mixture back onto a `LinkFunction` for downstream solver/IO bookkeeping,
-    // so any component without a matching standard link must be rejected at spec time
-    // rather than silently dropped or coerced. Keep this list aligned with
-    // `LinkFunction`'s mixture-supported variants.
-    for component in &spec.components {
-        match component {
-            LinkComponent::Logit | LinkComponent::Probit | LinkComponent::CLogLog => {}
-            LinkComponent::Cauchit | LinkComponent::LogLog => {
-                return Err(format!(
-                    "mixture link component {} is unsupported: LinkFunction has no \
-                     corresponding standard link; remove this component or extend \
-                     LinkFunction before re-enabling it",
-                    component.name()
-                ));
-            }
-        }
+    // `LinkComponent` admits two variants (Cauchit, LogLog) that have no matching
+    // `LinkFunction` entry. The mixture-link pipeline projects every mixture back onto
+    // a single `LinkFunction` value for downstream solver/IO bookkeeping (see
+    // `InverseLink::link_function`), so a mixture composed solely of components without
+    // a LinkFunction representative would silently lie about its projected link. We
+    // require every spec to contain at least one Logit/Probit/CLogLog "anchor" so the
+    // projection is meaningful. A mixture of only {Cauchit, LogLog} (or any single
+    // component restricted to that pair) has no anchor and is rejected here.
+    let has_anchor = spec.components.iter().any(|component| {
+        matches!(
+            component,
+            LinkComponent::Logit | LinkComponent::Probit | LinkComponent::CLogLog
+        )
+    });
+    if !has_anchor {
+        let unsupported: Vec<&str> = spec
+            .components
+            .iter()
+            .map(|component| component.name())
+            .collect();
+        return Err(format!(
+            "mixture link components {{{}}} are unsupported: at least one component \
+             must map to a LinkFunction variant (logit/probit/cloglog) so the mixture's \
+             projected LinkFunction is well defined; cauchit and loglog have no \
+             LinkFunction representative",
+            unsupported.join(", ")
+        ));
     }
     Ok(())
 }
