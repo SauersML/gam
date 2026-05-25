@@ -5624,7 +5624,9 @@ fn materialize_survival<'a>(
 
     let build_marginal_slope_request =
         |candidate: &crate::families::survival_construction::SurvivalBaselineConfig| {
-            let (prepared, time_block) = build_time_block(candidate)?;
+            let (prepared, mut time_block) = build_time_block(candidate)?;
+            time_block.time_monotonicity =
+                crate::families::survival_location_scale::TimeBlockMonotonicity::EnforcedByRowConstraint;
             Ok::<_, String>(SurvivalMarginalSlopeFitRequest {
                 data: data.values.view(),
                 spec: SurvivalMarginalSlopeTermSpec {
