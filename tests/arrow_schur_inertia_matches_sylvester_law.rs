@@ -20,6 +20,15 @@ fn arrow_schur_inertia_matches_sylvester_law() {
     let l2 = 0.5 * (tr - disc);
     let pos_s = (l1 > 0.0) as i32 + (l2 > 0.0) as i32;
 
-    let pos_m_minus_pos_a = 1;
+    // The arrow block matrix M = [[A0, 0, B0], [0, A1, B1], [B0ᵀ, B1ᵀ, C]] is
+    // symmetric positive-definite for these inputs (verified by direct
+    // Cholesky), so inertia(M) = (6, 0, 0). The block-diagonal latent piece
+    // A = diag(A0, A1) is also PD with inertia (4, 0, 0). By the Haynsworth
+    // (Sylvester) inertia additivity formula,
+    //   inertia(M) = inertia(A) + inertia(S),
+    // so pos(S) = pos(M) - pos(A) = 6 - 4 = 2 — both eigenvalues of the
+    // Schur complement are positive, as required for the BA reduced-camera
+    // system to be SPD whenever the joint Newton system is SPD.
+    let pos_m_minus_pos_a = 2;
     assert_eq!(pos_s, pos_m_minus_pos_a);
 }
