@@ -19521,6 +19521,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(gaussian_reml_fit_latent, module)?)?;
     module.add_function(wrap_pyfunction!(register_analytic_penalties, module)?)?;
     module.add_function(wrap_pyfunction!(analytic_penalty_value_grad, module)?)?;
+    module.add_function(wrap_pyfunction!(analytic_penalty_hvp, module)?)?;
     module.add_function(wrap_pyfunction!(equivariant_penalty_value, module)?)?;
     module.add_function(wrap_pyfunction!(riemannian_retract, module)?)?;
     module.add_function(wrap_pyfunction!(sphere_frechet_mean, module)?)?;
@@ -24122,6 +24123,91 @@ fn analytic_penalty_value_grad<'py>(
         grad.into_pyarray(py).unbind(),
         grad_rho.into_pyarray(py).unbind(),
     ))
+}
+
+/// Hessian-vector product `H · v` of the analytic-penalty registry frozen at
+/// `(target, rho)`, accumulated across all penalties whose target tier lives
+/// on `target` (`PenaltyTier::Psi`). This is the same kernel that `PIRLS`
+/// uses when it folds analytic-penalty Hessians into the inner Newton step;
+/// the result is `Σ_p (∂²P_p / ∂target²) · v` evaluated at the supplied
+/// iterate.
+///
+/// `rho` defaults to a zero vector of the registry's total ρ-length, which
+/// makes the contribution of each penalty equal to its descriptor-pinned
+/// weight (no REML shrinkage offset). Pass an explicit `rho` if the caller
+/// is mid-REML and wants the corresponding `exp(ρ)` scaling.
+#[pyfunction(signature = (
+    latents_json,
+    penalties_json,
+    target,
+    v,
+    rho = None,
+    isometry_jacobian = None,
+    isometry_jacobian_second = None
+))]
+fn analytic_penalty_hvp<'py>(
+    py: Python<'py>,
+    latents_json: &str,
+    penalties_json: &str,
+    target: PyReadonlyArray1<'py, f64>,
+    v: PyReadonlyArray1<'py, f64>,
+    rho: Option<PyReadonlyArray1<'py, f64>>,
+    isometry_jacobian: Option<PyReadonlyArray2<'py, f64>>,
+    isometry_jacobian_second: Option<PyReadonlyArray2<'py, f64>>,
+) -> PyResult<Py<PyArray1<f64>>> {
+    let latents: serde_json::Value = serde_json::from_str(latents_json)
+        .map_err(|err| py_value_error(format!("invalid latents json: {err}")))?;
+    let penalties: serde_json::Value = serde_json::from_str(penalties_json)
+        .map_err(|err| py_value_error(format!("invalid penalties json: {err}")))?;
+    let mut registry = build_analytic_penalty_registry_from_json(Some(&latents), Some(&penalties))
+        .map_err(py_value_error)?;
+
+    if let Some(j) = isometry_jacobian {
+        let j_cache = Arc::new(j.as_array().to_owned());
+        let h_cache = isometry_jacobian_second.map(|h| Arc::new(h.as_array().to_owned()));
+        for penalty in &mut registry.penalties {
+            if let AnalyticPenaltyKind::Isometry(inner) = penalty {
+                let mut cloned = (**inner).clone().with_jacobian_cache(j_cache.clone());
+                if let Some(h) = h_cache.as_ref() {
+                    cloned = cloned.with_jacobian_second_cache(h.clone());
+                }
+                *penalty = AnalyticPenaltyKind::Isometry(Arc::new(cloned));
+            }
+        }
+    }
+
+    let target_view = target.as_array();
+    let v_view = v.as_array();
+    if v_view.len() != target_view.len() {
+        return Err(py_value_error(format!(
+            "analytic_penalty_hvp: v length {} does not match target length {}",
+            v_view.len(),
+            target_view.len()
+        )));
+    }
+    let rho_owned = match rho {
+        Some(rho) => rho.as_array().to_owned(),
+        None => Array1::<f64>::zeros(registry.total_rho_count()),
+    };
+    if rho_owned.len() != registry.total_rho_count() {
+        return Err(py_value_error(format!(
+            "rho length {} does not match analytic penalty rho_count {}",
+            rho_owned.len(),
+            registry.total_rho_count()
+        )));
+    }
+
+    let mut out = Array1::<f64>::zeros(target_view.len());
+    for (penalty, (rho_slice, tier, _name)) in registry.penalties.iter().zip(registry.rho_layout())
+    {
+        if matches!(tier, PenaltyTier::Rho) {
+            continue;
+        }
+        let rho_local = rho_owned.slice(s![rho_slice.clone()]);
+        let contrib = penalty.hvp(target_view.view(), rho_local, v_view.view());
+        out += &contrib;
+    }
+    Ok(out.into_pyarray(py).unbind())
 }
 
 fn parse_manifold_kind(value: &serde_json::Value) -> Result<gam::geometry::ManifoldSpec, String> {
