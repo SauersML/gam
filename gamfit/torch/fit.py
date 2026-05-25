@@ -26,14 +26,11 @@ import torch
 
 from ..smooth import (
     BSpline,
-    Categorical,
     Duchon,
-    Matern,
     Pca,
     PeriodicSplineCurve,
     Sphere,
     Smooth,
-    TensorBSpline,
 )
 from ._basis import bspline_basis, duchon_basis, periodic_spline_curve_basis, sphere_basis
 from ._dispatch import (
@@ -151,21 +148,25 @@ def _build_design_penalty(
         raise NotImplementedError(message) from exc
 
     if entry == "duchon" and isinstance(smooth, Duchon):
-        centers = _coerce_2d(_to_tensor(smooth.centers, points), "Duchon.centers")
+        duchon_centers = smooth.centers
+        duchon_m = smooth.m
+        periodic_per_axis = smooth.periodic_per_axis
+
+        centers = _coerce_2d(_to_tensor(duchon_centers, points), "Duchon.centers")
         if centers.shape[1] != points.shape[1]:
             raise ValueError(
                 f"Duchon: points d={points.shape[1]} but centers d={centers.shape[1]}"
             )
         per = (
-            tuple(bool(p) for p in smooth.periodic_per_axis)
-            if smooth.periodic_per_axis is not None
+            tuple(bool(p) for p in periodic_per_axis)
+            if periodic_per_axis is not None
             else None
         )
-        design = duchon_basis(points, centers, m=smooth.m, periodic_per_axis=per)
+        design = duchon_basis(points, centers, m=duchon_m, periodic_per_axis=per)
         try:
             penalty_np = duchon_function_norm_penalty(
                 centers.detach().cpu().numpy(),
-                m=smooth.m,
+                m=duchon_m,
                 periodic_per_axis=per,
             )
         except NotImplementedError as exc:
@@ -211,6 +212,10 @@ def _build_design_penalty(
         return design.to(torch.float64), penalty
 
     if entry == "sphere" and isinstance(smooth, Sphere):
+        radians = smooth.radians
+        n_centers = smooth.n_centers
+        penalty_order = smooth.penalty_order
+        kernel = smooth.kernel
         if points.shape[1] != 2:
             raise ValueError(
                 f"Sphere expects points of shape (N, 2) [lat, lon]; got d={points.shape[1]}"
@@ -218,7 +223,7 @@ def _build_design_penalty(
         if not torch.isfinite(points).all():
             raise ValueError("Sphere: points contains NaN/Inf")
         lat = points[:, 0]
-        if smooth.radians:
+        if radians:
             import math
             bound = math.pi / 2.0
             if (lat.min().item() < -bound - 1e-9) or (lat.max().item() > bound + 1e-9):
@@ -232,10 +237,10 @@ def _build_design_penalty(
                 )
         design, penalty = sphere_basis(
             points,
-            n_centers=smooth.n_centers,
-            penalty_order=smooth.penalty_order,
-            kernel=smooth.kernel,
-            radians=smooth.radians,
+            n_centers=n_centers,
+            penalty_order=penalty_order,
+            kernel=kernel,
+            radians=radians,
         )
         return design.to(torch.float64), penalty.to(torch.float64)
 
@@ -246,45 +251,63 @@ def _build_design_penalty(
                 f"(N, 1); got d={points.shape[1]}"
             )
         t1d = points.squeeze(1)
+        n_knots = smooth.n_knots
+        degree = smooth.degree
+        penalty_order = smooth.penalty_order
         design, penalty = periodic_spline_curve_basis(
             t1d,
-            n_knots=smooth.n_knots,
-            degree=smooth.degree,
-            penalty_order=smooth.penalty_order,
+            n_knots=n_knots,
+            degree=degree,
+            penalty_order=penalty_order,
         )
         return design.to(torch.float64), penalty.to(torch.float64)
 
     if entry == "pca" and isinstance(smooth, Pca):
-        if smooth.lazy_path is not None:
+        pca = smooth
+        if pca.lazy_path is not None:
             raise NotImplementedError("Pca lazy_path is available on the Rust formula path")
-        if smooth.basis is None:
-            if smooth.K is None:
+        if pca.basis is None:
+            if pca.K is None:
                 raise ValueError("Pca requires K when basis is None")
-            x_for_pca = points - points.mean(dim=0, keepdim=True) if smooth.centered else points
+            x_for_pca = points - points.mean(dim=0, keepdim=True) if pca.centered else points
             _u, _s, vh = torch.linalg.svd(x_for_pca.to(torch.float64), full_matrices=False)
-            basis = vh[: int(smooth.K)].T.contiguous()
+            basis = vh[: int(pca.K)].T.contiguous()
         else:
-            basis = _to_tensor(smooth.basis, points).to(torch.float64)
+            basis = _to_tensor(pca.basis, points).to(torch.float64)
             if basis.dim() != 2:
                 raise ValueError(f"Pca.basis must be 2D, got shape {tuple(basis.shape)}")
-            if smooth.K is not None:
-                basis = basis[:, : int(smooth.K)]
+            if pca.K is not None:
+                basis = basis[:, : int(pca.K)]
         if basis.shape[0] != points.shape[1]:
             raise ValueError(
                 f"Pca: points d={points.shape[1]} but basis has {basis.shape[0]} rows"
             )
         design_points = points.to(torch.float64)
-        if smooth.centered:
+        if pca.centered:
             design_points = design_points - design_points.mean(dim=0, keepdim=True)
         design = design_points @ basis
         penalty = torch.eye(
             basis.shape[1], dtype=torch.float64, device=points.device
-        ) * float(smooth.smooth_penalty)
+        ) * float(pca.smooth_penalty)
         return design, penalty
 
-    # Defensive fallback: the Rust dispatch already rejected unsupported and
+    expected_smooth_type = {
+        "duchon": "Duchon",
+        "bspline": "BSpline",
+        "sphere": "Sphere",
+        "periodic_spline_curve": "PeriodicSplineCurve",
+        "pca": "Pca",
+    }.get(entry)
+    if expected_smooth_type is not None:
+        raise NotImplementedError(
+            f"torch fit dispatch returned {entry!r} for {type(smooth).__name__}, "
+            f"but that branch requires {expected_smooth_type}; the dispatch key "
+            "and Smooth subclass are inconsistent"
+        )
+
+    # Defensive raise: the Rust dispatch already rejected unsupported and
     # unknown specs above. Reaching here means the Rust enumeration grew a new
-    # variant without a matching torch branch — raise so the gap is visible.
+    # variant without a matching torch branch, so raise to make the gap visible.
     raise NotImplementedError(
         f"torch fit dispatch returned {entry!r} but no matching branch is "
         f"wired for {type(smooth).__name__}"
@@ -357,14 +380,11 @@ def _build_shape_constraint_inequality(
             grid_1d, knots, degree=smooth.degree, periodic=smooth.periodic,
         ).to(torch.float64).detach()
     elif isinstance(smooth, Duchon):
-        if isinstance(smooth, Duchon) and (
-            (hasattr(smooth, "centers") and _to_tensor(smooth.centers, points).reshape(
-                _to_tensor(smooth.centers, points).shape[0], -1).shape[1] != 1)
-        ):
+        centers = _coerce_2d(_to_tensor(smooth.centers, points), "Duchon.centers")
+        if centers.shape[1] != 1:
             raise NotImplementedError(
                 "shape_constraint on torch Duchon path requires 1D centers."
             )
-        centers = _coerce_2d(_to_tensor(smooth.centers, points), "Duchon.centers")
         per = (
             tuple(bool(p) for p in smooth.periodic_per_axis)
             if smooth.periodic_per_axis is not None
@@ -504,10 +524,7 @@ def _fit_independent(
         design, penalty = _build_design_penalty(smooth, pts)
         design = design.to(torch.float64)
         penalty = penalty.to(torch.float64)
-        by_t = (
-            _to_tensor(smooth.by, design).reshape(-1)
-            if smooth.by is not None else None
-        )
+        by_t = _smooth_by_tensor(smooth, design)
         init_lam_k = init_lam_seq[k] if init_lam_seq is not None else None
         out_k: GaussianRemlOutput = gaussian_reml_fit(
             design, response_f64, penalty,
@@ -658,10 +675,7 @@ def fit(
                 "got a list of points but a single smooth; pass one points tensor."
             )
         design, penalty = _build_design_penalty(smooths, points)
-        by_t = (
-            _to_tensor(smooths.by, design).reshape(-1)
-            if smooths.by is not None else None
-        )
+        by_t = _smooth_by_tensor(smooths, design)
         out: GaussianRemlOutput = gaussian_reml_fit(
             design, response_f64, penalty,
             weights=weights_f64, by=by_t,
@@ -707,7 +721,7 @@ def fit(
         design, penalty = _build_design_penalty(s, pts)
         designs.append(design)
         penalties.append(penalty)
-        bys.append(_to_tensor(s.by, design).reshape(-1) if s.by is not None else None)
+        bys.append(_smooth_by_tensor(s, design))
 
     init_lam = float(init_lambdas[0]) if init_lambdas is not None else None
     # `gaussian_reml_fit_additive` routes single-response (D == 1, F > 1)
