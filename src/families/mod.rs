@@ -5,6 +5,7 @@ pub mod family_meta;
 pub mod gamlss;
 pub mod inner_status;
 pub mod inverse_link;
+pub mod ispline_base_time;
 pub mod jet_partitions;
 pub mod latent_survival;
 pub mod lognormal_kernel;
