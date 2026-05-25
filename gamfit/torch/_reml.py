@@ -862,16 +862,12 @@ def gaussian_reml_fit_additive(
     closed-form Gaussian VJPs and the IFT through the F×F smoothing
     adjoint system.
 
-    Two cases use the closed-form block-diagonal kernel instead:
-
-    * ``F == 1`` — the single-smooth case has no per-smooth-vs-shared λ
-      distinction, so the closed-form kernel produces the exact same fit
-      as multi-block would with one block, with strictly less overhead.
-    * Multi-output response (``D > 1``) — the multi-block driver is
-      single-response, so the per-smooth penalties are assembled into a
-      block-diagonal joint penalty and a single scalar λ multiplies the
-      entire block-diagonal. ``AdditiveRemlOutput.lambdas`` is a length-1
-      tensor (lifted from the scalar) in this case.
+    Multi-output response (``D > 1``) uses the closed-form block-diagonal
+    kernel because the multi-block driver is single-response. In that case
+    the per-smooth penalties are assembled into a block-diagonal joint
+    penalty and a single scalar λ multiplies the entire block-diagonal.
+    ``AdditiveRemlOutput.lambdas`` is a length-1 tensor (lifted from the
+    scalar) in this case.
 
     Both paths return fully differentiable tensors.
 
@@ -930,12 +926,11 @@ def gaussian_reml_fit_additive(
         else:
             modulated.append(design)
 
-    # Route to the multi-block per-smooth-λ Rust path when we have
-    # multiple distinct penalties and a single-column response. The
-    # multi-block driver is single-response today, so D > 1 still falls
-    # back to the legacy single-λ closed-form path.
+    # Route single-response additive fits to the multi-block per-smooth-λ
+    # Rust path. The multi-block driver is single-response today, so D > 1
+    # still uses the legacy single-λ closed-form path.
     response_is_2d = response.dim() == 2 and response.shape[1] > 1
-    if len(designs) > 1 and not response_is_2d:
+    if not response_is_2d:
         if init_lambda is None:
             init_log = None
         else:
