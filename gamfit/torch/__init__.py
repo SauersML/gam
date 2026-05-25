@@ -82,6 +82,7 @@ from .penalties import (
     RiemannianRetraction,
     TopologyAutoSelector,
 )
+from .interchange import InterchangeSwapDecoder
 from .skip_transcoder import SkipAffineSmooth, SkipTranscoderResult, skip_transcoder
 from ..smooth import (
     BSpline,
@@ -108,6 +109,7 @@ __all__ = [
     "BlockOrthogonalityPenalty",
     "GumbelTemperatureSchedule",
     "IBPAssignmentPenalty",
+    "InterchangeSwapDecoder",
     "IsometryPenalty",
     "IvaeRidgeMeanGauge",
     "JumpReLUPenalty",
