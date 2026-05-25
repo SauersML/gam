@@ -493,8 +493,6 @@ def survival_prediction_from_columns(
     id_column: str | None = None,
     row_ids: Sequence[str] | None = None,
 ) -> SurvivalPrediction:
-    import numpy as np
-
     parameter_names = [
         name
         for name in columns
@@ -504,8 +502,8 @@ def survival_prediction_from_columns(
         raise KeyError(
             f"survival prediction payload for '{model_class}' was empty"
         )
-    stacked = np.column_stack(
-        [np.asarray(columns[name], dtype=float) for name in parameter_names]
+    stacked = rust_module().column_stack_f64(
+        [[float(value) for value in columns[name]] for name in parameter_names]
     )
     return SurvivalPrediction(
         model_class=model_class,
@@ -565,8 +563,6 @@ def shape_prediction_response(
     restore: Any,
 ) -> Any:
     """Convert a ``predict_table`` payload into the public return shape."""
-    import numpy as np
-
     if raw.startswith('{"class":"survival_prediction"'):
         return survival_prediction_from_ffi_payload(
             raw, id_column=id_column, row_ids=row_ids
@@ -586,7 +582,9 @@ def shape_prediction_response(
     model_class = str(parsed.get("model_class") or fallback_model_class)
 
     if model_class in _TRANSFORMATION_NORMAL_MODEL_CLASSES:
-        z = np.asarray(transformation_normal_z(columns), dtype=float)
+        z = rust_module().vec_to_array1_f64(
+            [float(value) for value in transformation_normal_z(columns)]
+        )
         if id_column is None and return_type is None:
             return z
         out_columns: dict[str, list[Any]] = {"z": z.tolist()}
@@ -600,7 +598,10 @@ def shape_prediction_response(
         )
 
     if model_class == "bernoulli marginal-slope":
-        probs = np.clip(np.asarray(columns.get("mean", []), dtype=float), 0.0, 1.0)
+        prob_values = rust_module().marginal_slope_clip_probabilities(
+            [float(value) for value in columns.get("mean", [])]
+        )
+        probs = rust_module().vec_to_array1_f64(prob_values)
         if id_column is None and return_type is None:
             return probs
         out_columns = {"mean": probs.tolist()}
@@ -658,16 +659,13 @@ def _interpolate_rows(
     *,
     clip: tuple[float | None, float | None],
 ) -> Any:
-    import numpy as np
-    from ._binding import rust_module
-
     clip_lo, clip_hi = clip
-    return np.asarray(rust_module().interpolate_rows(
-        np.asarray(grid, dtype=float).reshape(-1),
-        np.asarray(surface, dtype=float),
-        np.asarray(query, dtype=float).reshape(-1),
+    return rust_module().interpolate_rows(
+        grid,
+        surface,
+        query,
         clip_lo, clip_hi,
-    ), dtype=float)
+    )
 
 
 __all__ = [

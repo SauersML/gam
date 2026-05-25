@@ -18744,7 +18744,7 @@ fn build_analytic_penalty_registry_from_json(
                     .or_else(|| descriptor.get("learnable_alpha"))
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false);
-                let penalty = IBPAssignmentPenalty::new(k_max, alpha, tau, learnable);
+                let penalty = CoreIBPAssignmentPenalty::new(k_max, alpha, tau, learnable);
                 let penalty = match temperature_schedule {
                     Some(schedule) => penalty.with_temperature_schedule(schedule),
                     None => penalty,
