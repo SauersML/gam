@@ -2021,6 +2021,21 @@ fn strip_strings_and_comments_stateful(
     in_str_in: bool,
     quote_in: u8,
 ) -> (String, bool, u8) {
+    let (s, in_str, quote, _hashes) =
+        strip_strings_and_comments_stateful_raw(line, in_str_in, quote_in, 0);
+    (s, in_str, quote)
+}
+
+/// Raw-string-aware variant. Tracks Rust raw strings `r#"..."#` so the
+/// embedded `"` characters do not toggle the regular-string state machine
+/// and leak code outside the literal into the stripped output. `hashes_in`
+/// is the active hash count for an open raw string (0 when not in one).
+fn strip_strings_and_comments_stateful_raw(
+    line: &str,
+    in_str_in: bool,
+    quote_in: u8,
+    hashes_in: u8,
+) -> (String, bool, u8, u8) {
     let bytes = line.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0usize;
