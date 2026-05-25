@@ -531,40 +531,23 @@ def survival_prediction_from_ffi_payload(
 
 
 def competing_risks_prediction_from_ffi_payload(
-    parsed: dict[str, Any],
+    raw: str,
 ) -> CompetingRisksPrediction:
     """Build a :class:`CompetingRisksPrediction` from the Rust FFI payload."""
-    import numpy as np
-
-    endpoint_names = tuple(str(name) for name in (parsed.get("endpoint_names") or ()))
-    times = np.asarray(parsed.get("times") or [], dtype=float).reshape(-1)
-    columns = parsed.get("columns") or {}
+    parsed = rust_module().competing_risks_prediction_payload_from_json(raw)
     return CompetingRisksPrediction(
-        model_class=str(parsed.get("model_class") or "competing risks survival"),
-        likelihood_mode=str(parsed.get("likelihood_mode") or ""),
-        endpoint_names=endpoint_names,
-        times=times if times.size else None,
-        hazard=_coerce_matrix(parsed.get("hazard")),
-        survival=_coerce_matrix(parsed.get("survival")),
-        cumulative_hazard=_coerce_matrix(parsed.get("cumulative_hazard")),
-        cif=_coerce_matrix(parsed.get("cif")),
-        overall_survival=_coerce_matrix(parsed.get("overall_survival")),
-        linear_predictor=np.asarray(
-            parsed.get("linear_predictor") or [], dtype=float
-        ).reshape(-1) if parsed.get("linear_predictor") is not None else None,
-        columns={str(k): list(v) for k, v in columns.items()},
+        model_class=parsed["model_class"],
+        likelihood_mode=parsed["likelihood_mode"],
+        endpoint_names=tuple(parsed["endpoint_names"]),
+        times=parsed["times"],
+        hazard=parsed["hazard"],
+        survival=parsed["survival"],
+        cumulative_hazard=parsed["cumulative_hazard"],
+        cif=parsed["cif"],
+        overall_survival=parsed["overall_survival"],
+        linear_predictor=parsed["linear_predictor"],
+        columns=parsed["columns"],
     )
-
-
-def _coerce_matrix(value: Any) -> Any | None:
-    import numpy as np
-
-    if value is None:
-        return None
-    arr = np.asarray(value, dtype=float)
-    if arr.ndim == 1:
-        arr = arr.reshape(-1, 1)
-    return arr
 
 
 def shape_prediction_response(
@@ -588,13 +571,15 @@ def shape_prediction_response(
         return survival_prediction_from_ffi_payload(
             raw, id_column=id_column, row_ids=row_ids
         )
+    if raw.startswith('{"class":"competing_risks_prediction"'):
+        return competing_risks_prediction_from_ffi_payload(raw)
     parsed = json.loads(raw)
     if parsed.get("class") == "survival_prediction":
         return survival_prediction_from_ffi_payload(
             raw, id_column=id_column, row_ids=row_ids
         )
     if parsed.get("class") == "competing_risks_prediction":
-        return competing_risks_prediction_from_ffi_payload(parsed)
+        return competing_risks_prediction_from_ffi_payload(raw)
 
     columns_json = json.dumps(parsed["columns"], separators=(",", ":"))
     columns = json.loads(rust_module().ordered_prediction_columns(columns_json))

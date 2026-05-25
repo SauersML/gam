@@ -31,6 +31,7 @@ def _resolve_knots_tensor(
     """Accept None / int / Tensor for B-spline knots; auto-derive when needed."""
     if isinstance(knots, torch.Tensor):
         return knots
+    # Auto quantile knot placement delegates to Rust core, do not reimplement.
     resolved = _api._resolve_knots(knots, to_numpy_f64(t), label="knots", degree=degree)
     return from_numpy_like(resolved, t)
 
