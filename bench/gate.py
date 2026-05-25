@@ -47,6 +47,9 @@ comparing. Baselines are plain JSON, checked into git under
 from __future__ import annotations
 
 import argparse
+from functools import lru_cache
+import importlib.machinery
+import importlib.util
 import json
 import os
 import sys
@@ -55,19 +58,37 @@ from typing import Any
 
 BENCH_DIR = Path(__file__).resolve().parent
 BASELINES_DIR = BENCH_DIR / "baselines"
+GAMFIT_DIR = BENCH_DIR.parent / "gamfit"
 
 # Tolerances (see module docstring).
 REL_TOL_NEG_V = 1e-3
 ABS_TOL_EDF = 0.1
 
 
+@lru_cache(maxsize=1)
+def _rust_module() -> Any:
+    for suffix in importlib.machinery.EXTENSION_SUFFIXES:
+        candidate = GAMFIT_DIR / f"_rust{suffix}"
+        if not candidate.is_file():
+            continue
+        spec = importlib.util.spec_from_file_location("gamfit._rust", candidate)
+        if spec is None or spec.loader is None:
+            continue
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    raise RuntimeError(f"gamfit._rust extension not found under {GAMFIT_DIR}")
+
+
 def _compare_reml_scores(current: float, baseline: float) -> dict[str, float]:
     """Return Rust-extracted REML scores plus gate-local deltas."""
-    from gamfit._compare import compare_models
-
-    compared = compare_models(
+    rust = _rust_module()
+    if not hasattr(rust, "compare_reml_fits"):
+        raise RuntimeError("gamfit._rust.compare_reml_fits is unavailable; rebuild gamfit")
+    compared = rust.compare_reml_fits(
         [{"reml_score": baseline}, {"reml_score": current}],
         ["baseline", "current"],
+        None,
     )
     scores = {row["name"]: float(row["reml_score"]) for row in compared["score_table"]}
     base = scores["baseline"]
