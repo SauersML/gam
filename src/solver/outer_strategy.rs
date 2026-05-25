@@ -15,6 +15,9 @@
 
 use crate::cache::{LoadSource, Session as CacheSession};
 use crate::estimate::EstimationError;
+use crate::solver::startup_stats::{
+    SeedRejection, StartupStats, format_no_seeds_passed, structural_key, uniform_structural_key,
+};
 use crate::solver::estimate::reml::unified::BarrierConfig;
 use ::opt::{
     Arc as ArcOptimizer, ArcError, Bfgs, BfgsError, Bounds, FallbackPolicy as OptFallbackPolicy,
