@@ -2344,7 +2344,11 @@ pub struct CrudeRiskResult {
 
 #[derive(Debug, Clone)]
 pub struct CompetingRisksCifResult {
-    pub cif: Array3<f64>,
+    /// Cumulative incidence per endpoint. `cif[ep][[row, time_idx]]` is the
+    /// probability that cause `ep` occurred by `times[time_idx]` for sample `row`.
+    /// Stored one matrix per endpoint so it is ergonomic to index per-cause and
+    /// natural to construct from the per-endpoint cumulative-hazard inputs.
+    pub cif: Vec<Array2<f64>>,
     pub overall_survival: Array2<f64>,
 }
 
@@ -2356,7 +2360,10 @@ pub fn assemble_competing_risks_cif(
     if n_endpoints == 0 {
         return Err(SurvivalError::DimensionMismatch);
     }
-    let endpoint_hazards = cumulative_hazard.axis_iter(Axis(0)).collect::<Vec<_>>();
+    let endpoint_hazards = cumulative_hazard
+        .axis_iter(Axis(0))
+        .map(|view| view.to_owned())
+        .collect::<Vec<_>>();
     assemble_competing_risks_cif_from_endpoints(times, &endpoint_hazards).and_then(|result| {
         if result.overall_survival.dim() != (n_rows, n_times) {
             Err(SurvivalError::DimensionMismatch)
@@ -2368,7 +2375,7 @@ pub fn assemble_competing_risks_cif(
 
 pub fn assemble_competing_risks_cif_from_endpoints(
     times: ArrayView1<'_, f64>,
-    cumulative_hazards: &[ArrayView2<'_, f64>],
+    cumulative_hazards: &[Array2<f64>],
 ) -> Result<CompetingRisksCifResult, SurvivalError> {
     let n_endpoints = cumulative_hazards.len();
     if n_endpoints == 0 || times.is_empty() {
