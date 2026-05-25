@@ -87,7 +87,19 @@ mod cuda {
         ),
         String,
     > {
-        let ctx = CudaContext::new(0).map_err(|e| format!("cuda context: {e}"))?;
+        // Route through the runtime's cached primary context for the selected
+        // device so every CUDA client in the process (calibration, session,
+        // cuSolver) shares one CUcontext per ordinal. Falling back to
+        // `CudaContext::new(0)` here would fragment driver state across
+        // distinct contexts, defeat memory-pool sharing, and pin work to
+        // ordinal 0 even when the runtime probe chose a different device.
+        let runtime = super::super::runtime::GpuRuntime::global()
+            .ok_or_else(|| "cuda runtime unavailable".to_string())?;
+        let ordinal = runtime.selected_device().ordinal;
+        let ctx = super::super::runtime::cuda_context_for(ordinal)
+            .ok_or_else(|| format!("cuda context for ordinal {ordinal} unavailable"))?;
+        ctx.bind_to_thread()
+            .map_err(|e| format!("cuda context bind_to_thread: {e}"))?;
         let stream = ctx.new_stream().map_err(|e| format!("cuda stream: {e}"))?;
         Ok((ctx, stream))
     }
