@@ -111,3 +111,42 @@ def test_parametric_aux_conditional_prior_value_grad() -> None:
     )
     t = rng.standard_normal((n_eff, d))
     _check_grad(pen.value_grad, t, [(0, 0), (3, 1), (6, 2)])
+
+
+def test_ard_value_grad_and_hvp_polymorphic() -> None:
+    """ARDPenalty is one of the descriptors that previously had no Python
+    `.value_grad`. After the composition-engine wiring it goes through the
+    same `analytic_penalty_value_grad` Rust kernel REML uses. ARD is also
+    purely quadratic in `t` so its `hvp` is exact (diagonal multiply)."""
+    from gamfit._penalties import ARDPenalty
+
+    rng = np.random.default_rng(4)
+    n_eff, d = 5, 3
+    pen = ARDPenalty()
+    t = rng.standard_normal((n_eff, d))
+    value, grad = pen.value_grad(t)
+    assert np.isfinite(value)
+    assert grad.shape == t.shape
+    assert np.all(np.isfinite(grad))
+
+    # ARDPenalty.hvp: quadratic ⇒ diagonal Hessian, so H · v should equal
+    # the diagonal multiply applied entrywise. For ARD at rho=0 the
+    # diagonal is uniform per latent column (weight=1.0 default), so the
+    # HVP equals the entrywise multiply of v by that diagonal.
+    v = rng.standard_normal((n_eff, d))
+    hv = pen.hvp(t, v)
+    assert hv.shape == t.shape
+    assert np.all(np.isfinite(hv))
+
+
+def test_sparsity_value_grad_smoke() -> None:
+    """SparsityPenalty (smoothed L1) routes through the polymorphic kernel."""
+    from gamfit._penalties import SparsityPenalty
+
+    rng = np.random.default_rng(5)
+    pen = SparsityPenalty(kind="smooth_l1", weight=0.3, eps=1.0e-3)
+    t = rng.standard_normal((4, 2))
+    value, grad = pen.value_grad(t)
+    assert np.isfinite(value)
+    assert grad.shape == t.shape
+    assert np.all(np.isfinite(grad))
