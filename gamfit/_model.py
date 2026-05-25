@@ -65,7 +65,7 @@ class Model:
         except Exception as exc:
             raise map_exception(exc) from exc
         return shape_prediction_response(
-            json.loads(raw),
+            raw,
             headers=headers,
             rows=rows,
             table_kind=table_kind,

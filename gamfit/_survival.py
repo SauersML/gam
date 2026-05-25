@@ -87,8 +87,6 @@ def competing_risks_cif(
     endpoint_names: Sequence[str] | None = None,
 ) -> CompetingRisksCIF:
     """Assemble competing-risks CIFs from cause-specific survival predictions."""
-    import numpy as np
-
     if isinstance(predictions, Mapping):
         prediction_seq = tuple(predictions.values())
         default_names = tuple(str(name) for name in predictions)
@@ -101,17 +99,15 @@ def competing_risks_cif(
         else tuple(str(name) for name in endpoint_names)
     )
 
-    times_arr = np.asarray(times, dtype=float).reshape(-1)
-    cumulative_hazards = []
+    times_arr = rust_module().survival_coerce_times(times)
+    cumulative_hazards: list[Any] = []
     for idx, prediction in enumerate(prediction_seq):
         if not isinstance(prediction, SurvivalPrediction):
             raise TypeError(
                 "competing_risks_cif expects SurvivalPrediction objects; "
                 f"endpoint {idx} has type {type(prediction).__name__}"
             )
-        cumulative_hazards.append(
-            np.asarray(prediction.cumulative_hazard_at(times_arr), dtype=float)
-        )
+        cumulative_hazards.append(prediction.cumulative_hazard_at(times_arr))
     cif, overall_survival = rust_module().competing_risks_cif_from_predictions(
         times_arr,
         cumulative_hazards,
@@ -119,8 +115,8 @@ def competing_risks_cif(
     )
     return CompetingRisksCIF(
         times=times_arr,
-        cif=np.asarray(cif, dtype=float),
-        overall_survival=np.asarray(overall_survival, dtype=float),
+        cif=cif,
+        overall_survival=overall_survival,
         cumulative_hazard=tuple(cumulative_hazards),
         endpoint_names=names,
     )
@@ -144,33 +140,29 @@ class SurvivalPrediction:
     eta_se: Any | None = None
 
     def _coerce_times(self, times: Any) -> Any:
-        import numpy as np
-
-        times_arr = np.asarray(times, dtype=float).reshape(-1)
-        if times_arr.size == 0:
-            raise ValueError("survival prediction requires at least one time")
-        if not np.all(np.isfinite(times_arr)):
-            raise ValueError("survival prediction times must be finite")
-        return times_arr
+        return rust_module().survival_coerce_times(times)
 
     def _parameters_array(self) -> Any:
-        import numpy as np
-
-        params = np.asarray(self.parameters, dtype=float)
-        if params.ndim == 1:
-            params = params.reshape(-1, 1)
-        return params
+        return rust_module().survival_parameters_matrix(self.parameters)
 
     def _should_auto_chunk_dense(self, n_rows: int, n_times: int) -> bool:
         return int(n_rows) * int(n_times) > DENSE_SURVIVAL_AUTO_CHUNK_CELLS
 
     def _collect_chunks(self, chunks: Any, *, n_rows: int, n_times: int) -> Any:
-        import numpy as np
-
-        dense = np.empty((n_rows, n_times), dtype=float)
-        for row_slice, time_slice, block in chunks:
-            dense[row_slice, time_slice] = block
-        return dense
+        return rust_module().survival_collect_chunks(
+            n_rows,
+            n_times,
+            [
+                (
+                    int(row_slice.start),
+                    int(row_slice.stop),
+                    int(time_slice.start),
+                    int(time_slice.stop),
+                    block,
+                )
+                for row_slice, time_slice, block in chunks
+            ],
+        )
 
     def _prediction_row_count(self) -> int:
         for kind in ("hazard", "cumulative_hazard", "survival"):
@@ -207,15 +199,12 @@ class SurvivalPrediction:
         return self._hazard_from_cumulative(times_arr, cumulative)
 
     def cumulative_hazard_at(self, times: Any) -> Any:
-        import numpy as np
-
         times_arr = self._coerce_times(times)
         cumulative = self._ffi_surface_at("cumulative_hazard", times_arr, clip=(0.0, None))
         if cumulative is not None:
             return cumulative
         survival = self.survival_at(times)
-        survival = np.clip(survival, 1e-12, 1.0)
-        return -np.log(survival)
+        return rust_module().survival_cumulative_from_survival(survival)
 
     def survival_at(self, times: Any) -> Any:
         times_arr = self._coerce_times(times)
@@ -248,39 +237,27 @@ class SurvivalPrediction:
         if grid is None or surface is None:
             return None
         if self._should_auto_chunk_dense(surface.shape[0], times_arr.size):
-            import numpy as np
-
             clip_lo, clip_hi = clip
-            return np.asarray(
-                rust_module().survival_chunk_iter_collect(
-                    grid,
-                    surface,
-                    times_arr,
-                    kind,
-                    clip_lo,
-                    clip_hi,
-                    DEFAULT_SURVIVAL_PEOPLE_CHUNK,
-                    DEFAULT_SURVIVAL_TIME_GRID_CHUNK,
-                ),
-                dtype=float,
+            return rust_module().survival_chunk_iter_collect(
+                grid,
+                surface,
+                times_arr,
+                kind,
+                clip_lo,
+                clip_hi,
+                DEFAULT_SURVIVAL_PEOPLE_CHUNK,
+                DEFAULT_SURVIVAL_TIME_GRID_CHUNK,
             )
         return _interpolate_rows(grid, surface, times_arr, clip=clip)
 
     def _ffi_surface(self, kind: str) -> tuple[Any | None, Any | None]:
-        import numpy as np
-
         if self.times is None:
-            return (None, None)
-        grid = np.asarray(self.times, dtype=float).reshape(-1)
-        if grid.size == 0:
             return (None, None)
         surface = getattr(self, kind, None)
         if surface is None:
             return (None, None)
-        surface_arr = np.asarray(surface, dtype=float)
-        if surface_arr.ndim != 2 or surface_arr.shape[1] != grid.size:
-            return (None, None)
-        return (grid, surface_arr)
+        result = rust_module().survival_ffi_surface(self.times, surface)
+        return (None, None) if result is None else result
 
     def _ffi_surface_at_chunks(
         self,
@@ -351,8 +328,6 @@ class SurvivalPrediction:
         people_chunk: int = DEFAULT_SURVIVAL_PEOPLE_CHUNK,
         time_grid_chunk: int = DEFAULT_SURVIVAL_TIME_GRID_CHUNK,
     ) -> Any:
-        import numpy as np
-
         times_arr = self._coerce_times(times)
         ffi_chunks = self._ffi_surface_at_chunks(
             "cumulative_hazard",
@@ -369,7 +344,11 @@ class SurvivalPrediction:
             people_chunk=people_chunk,
             time_grid_chunk=time_grid_chunk,
         ):
-            yield row_slice, time_slice, -np.log(np.clip(survival, 1e-12, 1.0))
+            yield (
+                row_slice,
+                time_slice,
+                rust_module().survival_cumulative_from_survival(survival),
+            )
 
     def hazard_at_chunks(
         self,
@@ -538,49 +517,16 @@ def survival_prediction_from_columns(
 
 
 def survival_prediction_from_ffi_payload(
-    parsed: dict[str, Any],
+    raw: str,
     *,
     id_column: str | None = None,
     row_ids: Sequence[str] | None = None,
 ) -> SurvivalPrediction:
-    import numpy as np
-
-    model_class = str(parsed.get("model_class") or "survival marginal-slope")
-    times = np.asarray(parsed.get("times") or [], dtype=float).reshape(-1)
-    hazard = _coerce_matrix(parsed.get("hazard"))
-    survival = _coerce_matrix(parsed.get("survival"))
-    cumulative = _coerce_matrix(parsed.get("cumulative_hazard"))
-    linear_predictor = np.asarray(
-        parsed.get("linear_predictor") or [], dtype=float
-    ).reshape(-1)
-    survival_se = _coerce_matrix(parsed.get("survival_se"))
-    eta_se_raw = parsed.get("eta_se")
-    eta_se = (
-        np.asarray(eta_se_raw, dtype=float).reshape(-1)
-        if eta_se_raw is not None
-        else None
-    )
-    columns = parsed.get("columns") or {}
-    parameter_names = tuple(columns.keys())
-    if parameter_names:
-        stacked = np.column_stack(
-            [np.asarray(columns[name], dtype=float) for name in parameter_names]
-        )
-    else:
-        stacked = linear_predictor.reshape(-1, 1) if linear_predictor.size else np.zeros((0, 0))
+    payload = rust_module().survival_prediction_payload_from_json(raw)
     return SurvivalPrediction(
-        model_class=model_class,
-        parameters=stacked,
-        parameter_names=parameter_names,
-        times=times if times.size else None,
-        hazard=hazard,
-        survival=survival,
-        cumulative_hazard=cumulative,
-        linear_predictor=linear_predictor if linear_predictor.size else None,
+        **payload,
         id_column=id_column,
         row_ids=row_ids,
-        survival_se=survival_se,
-        eta_se=eta_se if eta_se is not None and eta_se.size else None,
     )
 
 
@@ -622,7 +568,7 @@ def _coerce_matrix(value: Any) -> Any | None:
 
 
 def shape_prediction_response(
-    parsed: dict[str, Any],
+    raw: str,
     *,
     headers: list[str],
     rows: list[list[str]],
@@ -638,9 +584,14 @@ def shape_prediction_response(
     """Convert a ``predict_table`` payload into the public return shape."""
     import numpy as np
 
+    if raw.startswith('{"class":"survival_prediction"'):
+        return survival_prediction_from_ffi_payload(
+            raw, id_column=id_column, row_ids=row_ids
+        )
+    parsed = json.loads(raw)
     if parsed.get("class") == "survival_prediction":
         return survival_prediction_from_ffi_payload(
-            parsed, id_column=id_column, row_ids=row_ids
+            raw, id_column=id_column, row_ids=row_ids
         )
     if parsed.get("class") == "competing_risks_prediction":
         return competing_risks_prediction_from_ffi_payload(parsed)

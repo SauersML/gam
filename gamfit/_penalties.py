@@ -327,6 +327,7 @@ def _target_descriptor(target: Any) -> str | int:
     )
 
 
+from ._binding import rust_module as _rust_module; ARDPenalty = _rust_module().ARDPenalty
 from ._binding import rust_module as _rust_module; TopKActivationPenalty = _rust_module().TopKActivationPenalty
 
 
@@ -339,6 +340,7 @@ def _inverse_softplus(x: np.ndarray) -> np.ndarray:
 
 
 from ._binding import rust_module as _rust_module; SparsityPenalty = _rust_module().SparsityPenalty
+from ._binding import rust_module as _rust_module; AuxConditionalPriorPenalty = _rust_module().AuxConditionalPriorPenalty
 
 
 @dataclass(init=False, slots=True)
@@ -474,56 +476,6 @@ class ScadMcpPenalty(_AnalyticPenalty):
             "smoothing_eps": self.smoothing_eps,
             "learnable": self.learnable,
         }
-
-
-@dataclass(init=False, slots=True)
-class ARDPenalty(_AnalyticPenalty):
-    """Automatic Relevance Determination over latent axes.
-    KIND_TAG = "ard"
-
-    For a ``LatentCoord`` block ``t ∈ ℝ^{N × d}``, applies one independent
-    ridge penalty per axis with its own REML-selectable log-precision:
-
-    .. math::
-
-        P_\\mathrm{ARD}(t; \\rho) \\;=\\; \\tfrac12 \\sum_{j=0}^{d-1}
-            e^{\\rho_j}\\, \\|t_{:,j}\\|^2.
-
-    REML's marginal-likelihood selection drives ``ρ_j → +∞`` (precision → ∞,
-    coefficients → 0) on axes whose data evidence does not justify them.
-    The intrinsic dimension is read off post-fit as the number of finite
-    ``ρ_j`` only after a separate gauge fix has pinned the latent axes.
-
-    **When to use.** Any ``LatentCoord`` block where the intrinsic dimension
-    is unknown. Fixes the audit-revised claim: compose with
-    ``IsometryPenalty`` or an auxiliary prior; ARD alone is rotation-symmetric.
-
-    Parameters
-    ----------
-    target
-        The ``LatentCoord`` block (or its name).
-    weight_schedule
-        Optional scalar annealing schedule for the ARD base multiplier.
-    """
-
-    target: TargetSpec
-    weight_schedule: ScalarWeightSchedule | dict[str, Any] | None = None
-
-    def __init__(
-        self,
-        *,
-        target: TargetSpec = "t",
-        weight_schedule: ScalarWeightSchedule | dict[str, Any] | None = None,
-    ) -> None:
-        self.target = target
-        self.weight_schedule = weight_schedule
-        self.__post_init__()
-
-    def __post_init__(self) -> None:
-        pass
-
-    def _payload_extras(self) -> dict[str, Any]:
-        return {}
 
 
 @dataclass(init=False, slots=True)
@@ -1110,103 +1062,6 @@ class BlockOrthogonalityPenalty(_AnalyticPenalty):
     def _payload_extras(self) -> dict[str, Any]:
         return {
             "groups": self.groups,
-            "weight": self.weight,
-            "n_eff": self.n_eff,
-            "learnable": self.learnable,
-        }
-
-
-@dataclass(init=False, slots=True)
-class AuxConditionalPriorPenalty(_AnalyticPenalty):
-    """Fixed-precomputed iVAE-style auxiliary-conditional prior on t.
-    KIND_TAG = "aux_conditional_prior"
-
-    Applies ``0.5 * weight * sum_n t_n.T @ Lambda_n @ t_n`` with one
-    caller-supplied positive-definite precision matrix per latent row. Python
-    validates shape, finiteness, and symmetry; Rust performs the PD eigensolve.
-    This is the fixed variant of the aux-conditional prior family identified
-    in ``proposals/composition_engine.md`` §4(c).
-
-    Parameters
-    ----------
-    lambda_per_row
-        Numeric ndarray of shape ``(N, d, d)`` containing one symmetric
-        precision matrix per latent row.
-    weight
-        Fixed base weight, or the base multiplier when ``learnable=True``.
-    n_eff
-        Number of rows in the row-major latent coefficient block.
-    learnable
-        If true, expose one REML-selectable log-weight ``ρ``.
-    target
-        The ``LatentCoord`` block name/object. Defaults to ``"t"``.
-    """
-
-    target: TargetSpec
-    lambda_per_row: np.ndarray
-    weight: float
-    n_eff: int
-    learnable: bool
-    weight_schedule: ScalarWeightSchedule | dict[str, Any] | None
-
-    def __init__(
-        self,
-        lambda_per_row: Any,
-        weight: float,
-        n_eff: int,
-        learnable: bool = False,
-        *,
-        target: TargetSpec = "t",
-    ) -> None:
-        self.target = target
-        self.lambda_per_row = np.asarray(lambda_per_row, dtype=float)
-        self.weight = float(weight)
-        self.n_eff = int(n_eff)
-        self.learnable = bool(learnable)
-        self.weight_schedule = None
-        self.__post_init__()
-
-    def __post_init__(self) -> None:
-        if not self.weight > 0.0:
-            raise ValueError(
-                f"AuxConditionalPriorPenalty.weight must be > 0, got {self.weight}"
-            )
-        if self.n_eff <= 0:
-            raise ValueError(
-                f"AuxConditionalPriorPenalty.n_eff must be > 0, got {self.n_eff}"
-            )
-        if self.lambda_per_row.ndim != 3:
-            raise ValueError(
-                "AuxConditionalPriorPenalty.lambda_per_row must have shape (N, d, d), "
-                f"got ndim={self.lambda_per_row.ndim}"
-            )
-        n_obs, rows, cols = self.lambda_per_row.shape
-        if n_obs != self.n_eff:
-            raise ValueError(
-                "AuxConditionalPriorPenalty.lambda_per_row first dimension must equal "
-                f"n_eff={self.n_eff}, got {n_obs}"
-            )
-        if rows == 0 or cols == 0 or rows != cols:
-            raise ValueError(
-                "AuxConditionalPriorPenalty.lambda_per_row must have square non-empty "
-                f"row matrices, got shape {self.lambda_per_row.shape}"
-            )
-        if not np.isfinite(self.lambda_per_row).all():
-            raise ValueError("AuxConditionalPriorPenalty.lambda_per_row must be finite")
-        max_asym = float(
-            np.max(np.abs(self.lambda_per_row - np.swapaxes(self.lambda_per_row, 1, 2)))
-        )
-        if max_asym >= 1.0e-10:
-            raise ValueError(
-                "AuxConditionalPriorPenalty.lambda_per_row matrices must be symmetric "
-                f"within 1e-10; max asymmetry is {max_asym:.3e}"
-            )
-
-    def _payload_extras(self) -> dict[str, Any]:
-        arr = np.ascontiguousarray(self.lambda_per_row, dtype=float)
-        return {
-            "lambda_per_row": arr.reshape(-1).tolist(),
-            "lambda_per_row_shape": list(arr.shape),
             "weight": self.weight,
             "n_eff": self.n_eff,
             "learnable": self.learnable,
