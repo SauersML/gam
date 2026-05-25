@@ -553,7 +553,7 @@ impl SaeManifoldAtom {
     pub fn fill_decoded_row(&self, row: usize, out: &mut [f64]) {
         let p = self.output_dim();
         let m = self.basis_size();
-        debug_assert_eq!(out.len(), p);
+        assert_eq!(out.len(), p);
         for slot in out.iter_mut() {
             *slot = 0.0;
         }
@@ -581,7 +581,7 @@ impl SaeManifoldAtom {
     pub fn fill_decoded_derivative_row(&self, row: usize, latent_axis: usize, out: &mut [f64]) {
         let p = self.output_dim();
         let m = self.basis_size();
-        debug_assert_eq!(out.len(), p);
+        assert_eq!(out.len(), p);
         for slot in out.iter_mut() {
             *slot = 0.0;
         }
