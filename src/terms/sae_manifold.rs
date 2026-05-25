@@ -2172,4 +2172,94 @@ mod tests {
             Ok(periodic_basis(&coords.to_owned()))
         }
     }
+
+    /// Mirror of the Python `test_sae_manifold_softmax_dispatch` shape: drive a
+    /// single periodic atom on a 1-harmonic synthetic target with 10 Newton
+    /// steps end-to-end in Rust and check that the multi-step loop achieves
+    /// in-sample R² ≥ 0.95.
+    #[test]
+    fn sae_manifold_fit_10_steps_one_harmonic_reaches_high_r2() {
+        let n = 64usize;
+        let m = 3usize;
+        let p = 1usize;
+
+        let true_t: Vec<f64> = (0..n).map(|i| (i as f64) / (n as f64)).collect();
+        let mut z = Array2::<f64>::zeros((n, p));
+        for i in 0..n {
+            let angle = 2.0 * std::f64::consts::PI * true_t[i];
+            z[[i, 0]] = 0.7 * angle.sin() + 0.3 * angle.cos();
+        }
+        let sst: f64 = z.iter().map(|v| v * v).sum::<f64>();
+
+        let evaluator = PeriodicHarmonicEvaluator::new(m).unwrap();
+        let mut coords0_data = Array2::<f64>::zeros((n, 1));
+        for i in 0..n {
+            // Phase-shifted initialization so the optimizer must do real work.
+            coords0_data[[i, 0]] = (true_t[i] + 0.25).rem_euclid(1.0);
+        }
+        let (phi0, jet0) = evaluator.evaluate(coords0_data.view()).unwrap();
+
+        let atom = SaeManifoldAtom::new(
+            "periodic_atom",
+            SaeAtomBasisKind::Periodic,
+            1,
+            phi0,
+            jet0,
+            Array2::<f64>::zeros((m, p)),
+            Array2::<f64>::eye(m),
+        )
+        .unwrap()
+        .with_basis_evaluator(Arc::new(PeriodicHarmonicEvaluator::new(m).unwrap()));
+
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            Array2::<f64>::zeros((n, 1)),
+            vec![coords0_data],
+            vec![LatentManifold::Circle],
+            AssignmentMode::softmax(0.5),
+        )
+        .unwrap();
+        let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
+        let mut rho = SaeManifoldRho::new(0.0, -6.0, vec![Array1::<f64>::zeros(1)]);
+
+        let max_iter = 10usize;
+        let learning_rate = 1.0;
+        let ridge = 1.0e-6;
+        let mut prev_total = f64::INFINITY;
+        for _ in 0..max_iter {
+            let loss = term
+                .run_joint_fit_arrow_schur(
+                    z.view(),
+                    &mut rho,
+                    None,
+                    1,
+                    learning_rate,
+                    ridge,
+                    ridge,
+                )
+                .unwrap();
+            let total = loss.total();
+            if !total.is_finite() {
+                break;
+            }
+            let denom = prev_total.abs().max(1.0e-12);
+            let rel = (prev_total - total).abs() / denom;
+            prev_total = total;
+            if rel < 1.0e-6 {
+                break;
+            }
+        }
+
+        let fitted = term.fitted();
+        assert_eq!(fitted.dim(), (n, p));
+        let mut ssr = 0.0;
+        for i in 0..n {
+            let r = z[[i, 0]] - fitted[[i, 0]];
+            ssr += r * r;
+        }
+        let r2 = 1.0 - ssr / sst.max(1.0e-12);
+        assert!(
+            r2 >= 0.95,
+            "10-step in-sample R² = {r2:.4} (ssr={ssr:.6}, sst={sst:.6}) should be >= 0.95"
+        );
+    }
 }

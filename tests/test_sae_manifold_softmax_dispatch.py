@@ -8,6 +8,14 @@ class _FakeRustModule:
         self.assignment_kinds = []
         self.calls = 0
 
+    def sae_manifold_reconstruction_r2(self, observed, fitted):
+        observed = np.asarray(observed, dtype=float)
+        fitted = np.asarray(fitted, dtype=float)
+        ss_res = float(np.sum((observed - fitted) ** 2))
+        mean = observed.mean(axis=0, keepdims=True)
+        ss_tot = float(np.sum((observed - mean) ** 2))
+        return 1.0 - ss_res / max(ss_tot, 1.0e-12)
+
     def periodic_basis_with_jet(self, t, n_harmonics):
         x = np.asarray(t, dtype=float)
         columns = [np.ones_like(x)]

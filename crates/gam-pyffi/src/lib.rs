@@ -7997,8 +7997,13 @@ fn build_sae_basis_evaluators(
     Ok(out)
 }
 
-/// Fit one SAE-manifold refresh step; auto lambda selection is expressed by
-/// passing `lambda_grid`, which evaluates candidate smoothness lambdas in Rust.
+/// Fit a SAE-manifold term end-to-end in Rust: up to `max_iter` Newton steps
+/// per λ_smooth candidate, refreshing `Phi` and `dPhi/dt` between steps via
+/// the per-atom [`SaeBasisEvaluator`] (analytic harmonic for `Periodic`
+/// atoms with `latent_dim == 1`; frozen snapshot fallback otherwise). The
+/// inner loop terminates early when the relative change in the penalized
+/// objective drops below `1e-6`. `lambda_grid` evaluates candidate smoothness
+/// lambdas in Rust and the best evidence-proxy wins.
 #[pyfunction(signature = (
     z,
     atom_basis,
