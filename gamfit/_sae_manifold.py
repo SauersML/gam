@@ -1,14 +1,9 @@
-"""SAE-manifold user-facing fit wrapper.
+"""SAE-manifold Python orchestration layer.
 
-This module implements the Methodspace configuration from
-``proposals/sae_manifold.md``:
-
-    Z_i ~= sum_k a_ik Phi_k(t_ik) B_k
-
-This wrapper owns candidate K construction, topology-basis materialization,
-decoder REML fits, and evidence ranking via :func:`gamfit.compare_models`.
-The Rust ``src/terms/sae_manifold.rs`` formal term owns the joint
-Arrow-Schur row-block assembly for the same configuration.
+The inner solver and row-block assembly live in Rust. This module keeps the
+Python surface thin: it prepares candidate K values, materializes topology
+bases, invokes Rust-backed fits, and ranks evidence with
+:func:`gamfit.compare_models`.
 """
 
 from __future__ import annotations
