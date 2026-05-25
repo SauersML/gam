@@ -13,8 +13,10 @@ the probit/slope scale and varies smoothly with covariates.
 
 Two families:
 
-- Bernoulli marginal-slope (`family="bernoulli-marginal-slope"`) for
-  binary outcomes.
+- Bernoulli marginal-slope for binary outcomes. In Python, pass
+  `family="bernoulli-marginal-slope"` with `z_column=` and
+  `logslope_formula=`; in the CLI, `--z-column` and `--logslope-formula`
+  route to this fit.
 - Survival marginal-slope (`survival_likelihood="marginal-slope"`) for
   time-to-event outcomes.
 
@@ -71,8 +73,9 @@ model = gamfit.fit(
 probs = model.predict(test_df, return_type="dict")["mean"]
 ```
 
-- `family="bernoulli-marginal-slope"` selects the marginal-slope
-  likelihood.
+- `family="bernoulli-marginal-slope"` names the likelihood; `z_column=`
+  and `logslope_formula=` route the Python fit onto the marginal-slope
+  path.
 - The base link is fixed to probit. `link(type=probit)` is optional in
   formulas; CLI formula-level non-probit links are rejected. The Python
   `link=` keyword is not needed for marginal-slope fits.
