@@ -1025,17 +1025,8 @@ pub(crate) fn monotone_wiggle_nonnegative_constraints(
     })
 }
 
-pub(crate) fn project_monotone_wiggle_beta(mut beta: Array1<f64>) -> Array1<f64> {
-    for value in beta.iter_mut() {
-        if !value.is_finite() || *value < 0.0 {
-            *value = 0.0;
-        }
-    }
-    beta
-}
-
 pub(crate) fn validate_monotone_wiggle_beta_nonnegative(
-    beta: &[f64],
+    beta: &Array1<f64>,
     context: &str,
 ) -> Result<(), String> {
     for (idx, &value) in beta.iter().enumerate() {
@@ -11373,7 +11364,11 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
         if block_idx != Self::BLOCK_WIGGLE {
             return Ok(beta);
         }
-        Ok(project_monotone_wiggle_beta(beta))
+        validate_monotone_wiggle_beta_nonnegative(
+            &beta,
+            "GaussianLocationScaleWiggleFamily post-update",
+        )?;
+        Ok(beta)
     }
 
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
@@ -12910,7 +12905,8 @@ impl CustomFamily for BinomialMeanWiggleFamily {
         if block_idx != Self::BLOCK_WIGGLE {
             return Ok(beta);
         }
-        Ok(project_monotone_wiggle_beta(beta))
+        validate_monotone_wiggle_beta_nonnegative(&beta, "BinomialMeanWiggleFamily post-update")?;
+        Ok(beta)
     }
 
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
@@ -20441,7 +20437,11 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         if block_idx != Self::BLOCK_WIGGLE {
             return Ok(beta);
         }
-        Ok(project_monotone_wiggle_beta(beta))
+        validate_monotone_wiggle_beta_nonnegative(
+            &beta,
+            "BinomialLocationScaleWiggleFamily post-update",
+        )?;
+        Ok(beta)
     }
 
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
@@ -22557,6 +22557,25 @@ mod tests {
                 .assign(extra_rho0);
         }
         theta
+    }
+
+    #[test]
+    fn monotone_wiggle_post_update_validator_rejects_hidden_projection() {
+        validate_monotone_wiggle_beta_nonnegative(
+            &array![0.0, 1.0e-13, 2.0],
+            "monotone wiggle validator test",
+        )
+        .expect("feasible nonnegative wiggle beta should validate");
+
+        let err = validate_monotone_wiggle_beta_nonnegative(
+            &array![0.0, -1.0e-3, 2.0],
+            "monotone wiggle validator test",
+        )
+        .expect_err("negative wiggle beta must be rejected instead of projected");
+        assert!(
+            err.contains("monotone wiggle coefficients must be non-negative"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
