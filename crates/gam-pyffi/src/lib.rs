@@ -14925,6 +14925,40 @@ impl PyIBPAssignmentPenalty {
     }
 }
 
+fn total_variation_difference_op_type_error() -> PyErr {
+    PyTypeError::new_err(
+        "TotalVariationPenalty.difference_op must be 'forward_1d' or a sequence of (from_row, to_row) edges",
+    )
+}
+
+fn total_variation_coerce_edges(edges: &Bound<'_, PyAny>) -> PyResult<Vec<(i64, i64)>> {
+    let edge_iter = edges
+        .try_iter()
+        .map_err(|_| total_variation_difference_op_type_error())?;
+    let mut out = Vec::new();
+    for edge in edge_iter {
+        let edge = edge.map_err(|_| total_variation_difference_op_type_error())?;
+        let tuple = edge
+            .downcast::<PyTuple>()
+            .map_err(|_| total_variation_difference_op_type_error())?;
+        if tuple.len() != 2 {
+            return Err(total_variation_difference_op_type_error());
+        }
+        let a = tuple
+            .get_item(0)?
+            .call_method0("__index__")
+            .and_then(|value| value.extract::<i64>())
+            .map_err(|_| total_variation_difference_op_type_error())?;
+        let b = tuple
+            .get_item(1)?
+            .call_method0("__index__")
+            .and_then(|value| value.extract::<i64>())
+            .map_err(|_| total_variation_difference_op_type_error())?;
+        out.push((a, b));
+    }
+    Ok(out)
+}
+
 #[pyclass(module = "gam_pyffi._rust", name = "TotalVariationPenalty")]
 struct TotalVariationPenalty {
     #[pyo3(get, set)]
@@ -14983,14 +15017,7 @@ impl TotalVariationPenalty {
             }
             None
         } else {
-            let parsed_edges =
-                bound_difference_op
-                    .extract::<Vec<(i64, i64)>>()
-                    .map_err(|_| {
-                        PyTypeError::new_err(
-                            "TotalVariationPenalty.difference_op must be 'forward_1d' or a sequence of (from_row, to_row) edges",
-                        )
-                    })?;
+            let parsed_edges = total_variation_coerce_edges(bound_difference_op)?;
             if parsed_edges.is_empty() {
                 return Err(PyValueError::new_err(
                     "TotalVariationPenalty graph edges must not be empty",

@@ -36,6 +36,16 @@ pub enum FaerSymmetricFactor {
     Lblt(FaerLblt<f64>),
 }
 
+#[inline]
+pub(crate) fn cholesky_factor_logdet(factor: MatRef<'_, f64>) -> f64 {
+    2.0 * diagonal_log_sum(factor.diagonal())
+}
+
+#[inline]
+fn diagonal_log_sum(diagonal: DiagRef<'_, f64>) -> f64 {
+    diagonal.column_vector().iter().map(|&x| x.ln()).sum::<f64>()
+}
+
 impl FaerSymmetricFactor {
     #[inline]
     pub fn solve(&self, rhs: MatRef<'_, f64>) -> Mat<f64> {
@@ -84,18 +94,8 @@ impl crate::matrix::FactorizedSystem for FaerSymmetricFactor {
 
     fn logdet(&self) -> f64 {
         match self {
-            FaerSymmetricFactor::Llt(f) => {
-                2.0 * f
-                    .L()
-                    .diagonal()
-                    .column_vector()
-                    .iter()
-                    .map(|&x| x.ln())
-                    .sum::<f64>()
-            }
-            FaerSymmetricFactor::Ldlt(f) => {
-                f.D().column_vector().iter().map(|&x| x.ln()).sum::<f64>()
-            }
+            FaerSymmetricFactor::Llt(f) => cholesky_factor_logdet(f.L()),
+            FaerSymmetricFactor::Ldlt(f) => diagonal_log_sum(f.D()),
             FaerSymmetricFactor::Lblt(..) => {
                 // lblt doesn't easily expose diagonal determinant. Fallback to sparse or other representations if needed, but typically Lblt is indefinite!
                 // Actually faer doesn't easily expose lblt logdet since it has 2x2 blocks.
