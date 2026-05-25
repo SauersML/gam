@@ -68,6 +68,19 @@ impl Default for RiemannianLBFGS {
 }
 
 impl RiemannianLBFGS {
+    /// Riemannian L-BFGS with a backtracking-and-expansion Armijo line search.
+    ///
+    /// The search starts at the user-supplied `step_size` (a hint, not a hard
+    /// cap) and first *expands* by doubling while the Armijo sufficient-
+    /// decrease condition continues to hold and the objective is still
+    /// strictly improving. Once expansion stalls, it accepts the best step
+    /// it has seen so far; if even the initial trial violates Armijo, it
+    /// *contracts* by halving until Armijo holds or a safeguard floor is
+    /// reached. This makes the optimizer robust to mis-scaled `step_size`
+    /// inputs (including the Newton-natural α=1 that BFGS expects on
+    /// well-conditioned quadratics) without forcing the caller to retune
+    /// it, and preserves the secant pair (s, y) curvature condition so the
+    /// L-BFGS inverse-Hessian approximation stays SPD.
     pub fn minimize(
         &self,
         manifold: &dyn RiemannianManifold,
@@ -77,25 +90,97 @@ impl RiemannianLBFGS {
         let mut x = initial.to_owned();
         let mut s_hist: Vec<Array1<f64>> = Vec::new();
         let mut y_hist: Vec<Array1<f64>> = Vec::new();
-        let (_, grad_e0) = objective.value_gradient(x.view())?;
+        let (mut f_curr, grad_e0) = objective.value_gradient(x.view())?;
         let mut grad = manifold.project_tangent(x.view(), grad_e0.view())?;
+        let armijo_c: f64 = 1.0e-4;
+        let alpha_min: f64 = 1.0e-16;
+        let alpha_max: f64 = 1.0e16;
+        let initial_step = if self.step_size.is_finite() && self.step_size > 0.0 {
+            self.step_size
+        } else {
+            1.0
+        };
         for _ in 0..self.max_iter {
             if norm(grad.view()) <= self.grad_tol {
                 break;
             }
             let direction = -two_loop(grad.view(), &s_hist, &y_hist);
+            let slope = dot(grad.view(), direction.view());
+            // Guard against ascent directions caused by stale curvature; if
+            // the BFGS direction is not a descent direction, fall back to
+            // the projected steepest-descent direction so progress is
+            // guaranteed.
+            let (direction, slope) = if slope < 0.0 {
+                (direction, slope)
+            } else {
+                let sd = -grad.clone();
+                let s_sd = dot(grad.view(), sd.view());
+                (sd, s_sd)
+            };
             let old_x = x.clone();
             let old_grad = grad.clone();
-            x = manifold.retract(x.view(), (direction * self.step_size).view())?;
-            let (_, grad_e) = objective.value_gradient(x.view())?;
-            grad = manifold.project_tangent(x.view(), grad_e.view())?;
+            // --- Armijo line search with bidirectional adaptation. ---
+            let mut alpha = initial_step;
+            let mut best_alpha = 0.0;
+            let mut best_f = f_curr;
+            let mut best_x = x.clone();
+            let mut best_grad = grad.clone();
+            // First try to expand: while Armijo holds and the objective keeps
+            // improving, double the step.
+            loop {
+                let step = &direction * alpha;
+                let trial_x = manifold.retract(x.view(), step.view())?;
+                let (f_trial, g_trial_e) = objective.value_gradient(trial_x.view())?;
+                let armijo_rhs = f_curr + armijo_c * alpha * slope;
+                let accepted = f_trial.is_finite() && f_trial <= armijo_rhs;
+                if accepted && f_trial < best_f {
+                    best_alpha = alpha;
+                    best_f = f_trial;
+                    best_x = trial_x;
+                    best_grad = manifold.project_tangent(best_x.view(), g_trial_e.view())?;
+                    if alpha >= alpha_max {
+                        break;
+                    }
+                    alpha *= 2.0;
+                } else {
+                    break;
+                }
+            }
+            // If no expansion succeeded, contract from the initial trial.
+            if best_alpha == 0.0 {
+                alpha = initial_step;
+                while alpha > alpha_min {
+                    let step = &direction * alpha;
+                    let trial_x = manifold.retract(x.view(), step.view())?;
+                    let (f_trial, g_trial_e) = objective.value_gradient(trial_x.view())?;
+                    let armijo_rhs = f_curr + armijo_c * alpha * slope;
+                    if f_trial.is_finite() && f_trial <= armijo_rhs {
+                        best_alpha = alpha;
+                        best_f = f_trial;
+                        best_x = trial_x;
+                        best_grad = manifold.project_tangent(best_x.view(), g_trial_e.view())?;
+                        break;
+                    }
+                    alpha *= 0.5;
+                }
+            }
+            if best_alpha == 0.0 {
+                // No admissible step found — terminate at the current point.
+                break;
+            }
+            x = best_x;
+            f_curr = best_f;
+            grad = best_grad;
             let s = manifold.log_map(old_x.view(), x.view())?;
             let mut path = ndarray::Array2::<f64>::zeros((2, manifold.ambient_dim()));
             path.row_mut(0).assign(&old_x);
             path.row_mut(1).assign(&x);
             let transported_old_grad = manifold.parallel_transport(path.view(), old_grad.view())?;
             let y = &grad - &transported_old_grad;
-            if dot(s.view(), y.view()).abs() > 1.0e-14 {
+            // Only commit the (s, y) pair when the curvature condition sᵀy > 0
+            // holds (strict positivity, not just non-zero). This is required
+            // for the implicit BFGS inverse-Hessian update to remain SPD.
+            if dot(s.view(), y.view()) > 1.0e-14 {
                 s_hist.push(s);
                 y_hist.push(y);
                 if s_hist.len() > self.history {
