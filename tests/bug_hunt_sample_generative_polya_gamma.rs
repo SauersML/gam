@@ -57,7 +57,7 @@ fn bug_sample_standard_gaussian_draw_covariance_matches_posterior_covariance() {
         .expect("shape should match");
     let centered = &draws - &draws.mean_axis(Axis(0)).unwrap().insert_axis(Axis(0));
     let cov = centered.t().dot(&centered) / (draws.nrows() as f64 - 1.0);
-    let posterior_cov = Array2::from_shape_vec((2, 2), vec![0.25, 0.0, 0.0, 0.25]).unwrap();
+    let posterior_cov = Array2::from_shape_vec((2, 2), vec![0.25_f64, 0.0, 0.0, 0.25]).unwrap();
     for i in 0..2 {
         for j in 0..2 {
             let sigma = posterior_cov[[i, j]].abs().sqrt().max(1e-12);
