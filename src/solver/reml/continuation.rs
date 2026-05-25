@@ -126,10 +126,19 @@ fn classify_action(failure: &InnerFailure) -> FailureAction {
             KktRefusalDiagnosis::PhantomMultiplierWithWellConditionedH => {
                 FailureAction::ShrinkStep
             }
+            // Structural cross-block alias surfaced at fit time: no
+            // ρ-anneal recovers it. Propagate so the outer driver
+            // refuses the fit rather than burning continuation budget.
+            KktRefusalDiagnosis::AliasingDetectedAtFit => FailureAction::Propagate,
         },
         InnerFailure::BudgetExhausted { .. } => FailureAction::ShrinkStep,
         InnerFailure::TrustRegionFloor { .. } => FailureAction::ShrinkOrExpand,
         InnerFailure::LikelihoodFailure(_) => FailureAction::ShrinkStep,
+        // Structural pre-fit identifiability failure surfaced via the
+        // inner classifier — propagate. The audit's structured report
+        // is already attached; rollback would just retry the same
+        // joint design with the same alias.
+        InnerFailure::IdentifiabilityFailure { .. } => FailureAction::Propagate,
         InnerFailure::Other(_) => FailureAction::Propagate,
     }
 }

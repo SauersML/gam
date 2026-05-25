@@ -5230,7 +5230,12 @@ impl ProjectedKktResidual {
 
     /// Construct from `r_R = R Rᵀ r_A`, where `R` is the actual reduced
     /// identifiable basis used by the projected inverse kernel.
-    pub(crate) fn from_reduced_range(residual: Array1<f64>) -> Self {
+    ///
+    /// This is deliberately private: callers must start with an
+    /// active-projected residual and go through `projected_into_reduced_range`
+    /// so the dropped null/range-excluded component is checked against the
+    /// producing inner KKT tolerance.
+    fn from_reduced_range(residual: Array1<f64>) -> Self {
         Self {
             residual,
             subspace: KktResidualSubspace::ReducedRange,
@@ -5241,7 +5246,7 @@ impl ProjectedKktResidual {
 
     /// Attach the KKT tolerance and free-subspace rank to a previously
     /// constructed residual. Builder-style so the construction path
-    /// (`from_active_projected` / `from_reduced_range` then `with_metadata`) reads as a single
+    /// (`from_active_projected` then `with_metadata`) reads as a single
     /// inline expression at the call site.
     pub(crate) fn with_metadata(mut self, residual_tol: f64, free_rank: usize) -> Self {
         self.residual_tol = Some(residual_tol);

@@ -17694,9 +17694,9 @@ pub fn fit_survival_marginal_slope_terms(
     let time_linear_constraints = match spec.time_block.time_monotonicity {
         crate::families::survival_location_scale::TimeBlockMonotonicity::StructuralISpline => {
             let p_total = design_exit.ncols();
-            LinearInequalityConstraints::from_per_coordinate_lower_bounds(
-                &Array1::<f64>::zeros(p_total),
-            )
+            LinearInequalityConstraints::from_per_coordinate_lower_bounds(&Array1::<f64>::zeros(
+                p_total,
+            ))
         }
         _ => {
             let derivative_guard_constraints = time_derivative_guard_constraints(

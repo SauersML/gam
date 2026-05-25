@@ -13640,22 +13640,15 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // analytic outer Hessian as unavailable.
             //
             // Combining two independent post-step signals — objective change
-            // within scale-aware tolerance AND residual within a small
-            // multiple of the same tolerance — supplies the missing
-            // certificate without weakening the envelope-theorem requirement
-            // by more than the residual measurement's own arithmetic noise.
-            // Concretely: with `residual <= 2 · residual_tol` and
-            // `|Δobjective| <= objective_tol`, the certificate fires only
-            // when the inner state is already inside the band where both
-            // the objective and the gradient norm are operating at their
-            // joint round-off floor. The bound stays at the noise scale of
-            // a single dot-product evaluation, well inside the precision the
-            // outer gradient identity itself uses; widening it further
-            // (e.g. to `10 · residual_tol`) would start to accept genuinely
-            // unconverged β states and is intentionally avoided.
+            // within scale-aware tolerance AND residual within the same KKT
+            // tolerance — supplies the missing certificate without weakening
+            // the envelope-theorem requirement. A residual above tolerance
+            // can be a free Hessian-null gradient component, not an active
+            // multiplier, so it must not be accepted by an objective-flatness
+            // rule.
             //
-            // Distinct from the strict path because the strict path requires
-            // `residual <= residual_tol` and is silent on objective change;
+            // Distinct from the strict path because the strict path is silent
+            // on objective change;
             // distinct from the trust-region floor certificate at the head
             // of the cycle because that one fires only when the trust radius
             // has collapsed to its 1e-12 floor with all attempts rejected,
@@ -13669,12 +13662,12 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     geometric_tail_history.pop_front();
                 }
             }
-            if objective_change <= objective_tol && residual <= 2.0 * residual_tol {
+            if objective_change <= objective_tol && residual <= residual_tol {
                 log::info!(
-                    "[PIRLS/joint-Newton convergence] cycle {:>3} | noise-floor KKT certificate: residual={:.3e} <= 2*tol={:.3e}, |Δobjective|={:.3e} <= obj_tol={:.3e}",
+                    "[PIRLS/joint-Newton convergence] cycle {:>3} | noise-floor KKT certificate: residual={:.3e} <= tol={:.3e}, |Δobjective|={:.3e} <= obj_tol={:.3e}",
                     cycle,
                     residual,
-                    2.0 * residual_tol,
+                    residual_tol,
                     objective_change,
                     objective_tol,
                 );
@@ -13798,7 +13791,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     // tripwire downstream. Bail with `converged = false` so
                     // the outer optimizer rejects this ρ cleanly, exactly
                     // as it would on any other non-converged inner exit.
-                    let cert_residual_factor = 4.0;
+                    let cert_residual_factor = 1.0;
                     if matches!(
                         certificate_decision,
                         ConstrainedStationaryCertificate::Accept

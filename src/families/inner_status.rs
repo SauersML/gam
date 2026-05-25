@@ -54,6 +54,17 @@ pub(crate) enum InnerFailure {
     /// family-domain error. The seed sits outside the feasible region
     /// for the parameterisation.
     LikelihoodFailure(String),
+    /// Pre-fit cross-block identifiability audit refused the fit. The
+    /// joint design across `ParameterBlockSpec`s carries a rank
+    /// deficiency that post-`joint_null_rotation` absorption did not
+    /// resolve. Held as a structured failure (not `Other`) so the
+    /// continuation driver and `StartupStats` can distinguish "the
+    /// solver couldn't classify this" from "the design is provably
+    /// unfittable in its current shape". No rho-anneal recovers this;
+    /// the structural fix is to reparameterise the aliased block.
+    IdentifiabilityFailure {
+        audit: crate::solver::identifiability_audit::IdentifiabilityAudit,
+    },
     /// Catch-all for legacy error strings that do not match any of the
     /// structured sentinels above. These are still rejected; the outer
     /// cascade just cannot classify them.
@@ -68,6 +79,7 @@ impl InnerFailure {
             | InnerFailure::TrustRegionFloor { message }
             | InnerFailure::LikelihoodFailure(message)
             | InnerFailure::Other(message) => message.as_str(),
+            InnerFailure::IdentifiabilityFailure { audit } => audit.summary.as_str(),
         }
     }
 }
