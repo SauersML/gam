@@ -10,8 +10,8 @@ use gam::estimate::{
     saved_mixture_state_from_fit, saved_sas_state_from_fit,
 };
 use gam::faer_ndarray::{
-    FaerCholesky, FaerEigh, FaerSvd, array2_to_matmut, factorize_symmetricwith_fallback,
-    fast_xt_diag_x,
+    FaerCholesky, FaerEigh, FaerSvd, array2_to_matmut, factorize_symmetricwith_fallback, fast_ata,
+    fast_atb, fast_xt_diag_x,
 };
 use gam::families::family_meta::inverse_link_to_binomial_spec;
 use gam::families::inverse_link::apply_inverse_link_vec;
