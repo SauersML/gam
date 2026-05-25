@@ -29,7 +29,7 @@
 //! Hessian structure for a fixed row set; subsampling reduces the row
 //! set itself for the family-specific row-trace path.
 
-use crate::custom_family::CustomFamilyBlockPsiDerivative;
+use crate::custom_family::{CustomFamilyBlockPsiDerivative, ParameterBlockSpec};
 use crate::families::cubic_cell_kernel::{self, DenestedPartitionCell, LocalSpanCubic};
 use crate::families::jet_partitions::MultiDirJet;
 use ndarray::{Array1, Array2, Axis};
