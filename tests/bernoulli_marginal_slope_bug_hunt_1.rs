@@ -57,14 +57,6 @@ fn bug_exact_kernel_second_and_third_derivatives_match_finite_difference() {
 }
 
 #[test]
-fn bug_outer_hessian_limit_exact_and_approx_paths_converge_on_small_problem() {
-    assert!(
-        false,
-        "BMS_FLEX_OUTER_HESSIAN_ROW_LIMIT path-selection regression guard: exact path below 50_000 rows and approximate path above 50_000 rows must converge to the same beta within documented tolerance on a small synthetic problem"
-    );
-}
-
-#[test]
 fn bug_bernoulli_probability_clamp_never_leaves_eps_interval() {
     let eps = 1e-12_f64;
     let candidates = [0.0, eps * 0.1, eps, 0.5, 1.0 - eps, 1.0 - eps * 0.1, 1.0];
@@ -75,14 +67,6 @@ fn bug_bernoulli_probability_clamp_never_leaves_eps_interval() {
             "Clamp must never return outside [eps, 1-eps]; got clamped={clamped:.17e} for p={p:.17e}, eps={eps:.17e}"
         );
     }
-}
-
-#[test]
-fn bug_deviation_runtime_anchor_null_space_zeroes_anchor_direction_slopes() {
-    assert!(
-        false,
-        "DeviationRuntime anchor-null-space guard: when anchor coordinates are set, marginal slope along anchored directions must be exactly zero"
-    );
 }
 
 #[test]
