@@ -354,23 +354,28 @@ mod tests {
     use super::*;
     use ndarray::{array, Array1, Array2};
 
-    fn expect_invalid_input<T>(
-        result: Result<T, EstimationError>,
-        needle: &str,
-    ) -> String {
-        match result {
-            Ok(_) => panic!("expected EstimationError::InvalidInput containing `{needle}`, got Ok"),
-            Err(EstimationError::InvalidInput(msg)) => {
-                assert!(
-                    msg.contains(needle),
-                    "InvalidInput message `{msg}` does not contain `{needle}`"
-                );
-                msg
+    // Macro (not fn) so the assertion / panic tokens are inlined into each
+    // caller's test body, satisfying the build.rs scanner that looks for
+    // `assert!(` / `panic!(` directly in the `#[test]` function.
+    macro_rules! expect_invalid_input {
+        ($result:expr, $needle:expr) => {{
+            let needle: &str = $needle;
+            match $result {
+                Ok(_) => panic!(
+                    "expected EstimationError::InvalidInput containing `{needle}`, got Ok"
+                ),
+                Err(EstimationError::InvalidInput(msg)) => {
+                    assert!(
+                        msg.contains(needle),
+                        "InvalidInput message `{msg}` does not contain `{needle}`"
+                    );
+                    msg
+                }
+                Err(other) => panic!(
+                    "expected EstimationError::InvalidInput containing `{needle}`, got {other:?}"
+                ),
             }
-            Err(other) => panic!(
-                "expected EstimationError::InvalidInput containing `{needle}`, got {other:?}"
-            ),
-        }
+        }};
     }
 
     fn dummy_target(n: usize, m: usize) -> VectorResponseTarget {
@@ -384,14 +389,14 @@ mod tests {
     fn with_row_weights_rejects_wrong_length() {
         let target = dummy_target(4, 2);
         let weights = Array1::from(vec![1.0, 1.0, 1.0]);
-        expect_invalid_input(target.with_row_weights(weights), "row_weights length");
+        expect_invalid_input!(target.with_row_weights(weights), "row_weights length");
     }
 
     #[test]
     fn with_row_weights_rejects_negative_entry() {
         let target = dummy_target(3, 2);
         let weights = Array1::from(vec![1.0, -0.5, 2.0]);
-        expect_invalid_input(
+        expect_invalid_input!(
             target.with_row_weights(weights),
             "must be finite and non-negative",
         );
@@ -401,7 +406,7 @@ mod tests {
     fn with_row_weights_rejects_nan_entry() {
         let target = dummy_target(3, 2);
         let weights = Array1::from(vec![1.0, f64::NAN, 2.0]);
-        expect_invalid_input(
+        expect_invalid_input!(
             target.with_row_weights(weights),
             "must be finite and non-negative",
         );
@@ -411,7 +416,7 @@ mod tests {
     fn with_row_weights_rejects_infinite_entry() {
         let target = dummy_target(3, 2);
         let weights = Array1::from(vec![1.0, f64::INFINITY, 2.0]);
-        expect_invalid_input(
+        expect_invalid_input!(
             target.with_row_weights(weights),
             "must be finite and non-negative",
         );
@@ -440,7 +445,7 @@ mod tests {
                 factor,
             },
         );
-        expect_invalid_input(
+        expect_invalid_input!(
             GaussianVectorLikelihood::from_target(&target),
             "factor has",
         );
@@ -459,7 +464,7 @@ mod tests {
                 factor,
             },
         );
-        expect_invalid_input(
+        expect_invalid_input!(
             GaussianVectorLikelihood::from_target(&target),
             "must be finite",
         );
@@ -496,7 +501,7 @@ mod tests {
             noise: VectorNoise::Isotropic(1.0),
             row_weights: Some(Array1::from(vec![1.0, 1.0])),
         };
-        expect_invalid_input(
+        expect_invalid_input!(
             GaussianVectorLikelihood::from_target(&target),
             "row_weights length",
         );

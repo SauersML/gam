@@ -1490,6 +1490,12 @@ impl SaeManifoldTerm {
                 AnalyticPenaltyKind::IBPAssignment(Arc::new(penalty))
             }
             AssignmentMode::JumpReLU { .. } => {
+                // SAFETY: `analytic_penalty_descriptors` is only called for
+                // assignment modes that have a corresponding REML descriptor
+                // (Softmax, IBPMap). JumpReLU is handled by the built-in
+                // gated-L1 assignment prior and never reaches this bridge —
+                // callers must dispatch on `self.assignment.mode` first. The
+                // panic guards against a future caller forgetting to do so.
                 panic!(
                     "JumpReLU assignment mode uses the built-in gated L1 assignment prior and has no AnalyticPenaltyKind descriptor"
                 )
