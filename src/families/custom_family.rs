@@ -26117,8 +26117,12 @@ mod tests {
         let a = array![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0],];
         let b = array![0.0, 0.0, 0.0];
         let member_constraint_ids = vec![vec![0], vec![1], vec![2]];
-        let (a_out, b_out, member_constraint_ids_out) =
-            crate::solver::active_set::rank_reduce_rows_pivoted_qr(a, b, member_constraint_ids);
+        let (a_out, b_out, member_constraint_ids_out, _) =
+            crate::solver::active_set::rank_reduce_rows_pivoted_qr_with_dependence(
+                a,
+                b,
+                member_constraint_ids,
+            );
         assert_eq!(
             a_out.nrows(),
             2,
@@ -26139,8 +26143,12 @@ mod tests {
         let a = array![[1.0, 0.0], [0.0, 1.0], [1.0, 1.0],];
         let b = array![0.0, 0.0, 0.0];
         let member_constraint_ids = vec![vec![0], vec![1], vec![2]];
-        let (a_out, b_out, member_constraint_ids_out) =
-            crate::solver::active_set::rank_reduce_rows_pivoted_qr(a, b, member_constraint_ids);
+        let (a_out, b_out, member_constraint_ids_out, _) =
+            crate::solver::active_set::rank_reduce_rows_pivoted_qr_with_dependence(
+                a,
+                b,
+                member_constraint_ids,
+            );
         // All three rows are independent in R^2 (but we only have rank 2).
         // The first two span R^2, so row 3 = row 1 + row 2 is dependent.
         assert_eq!(a_out.nrows(), 2);
