@@ -5043,7 +5043,8 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         };
         let mut options = gam::families::custom_family::BlockwiseFitOptions::default();
         options.compute_covariance = true;
-        let buildspec = |prepared: &PreparedSurvivalTimeStack| SurvivalMarginalSlopeTermSpec {
+        let buildspec = |prepared: &PreparedSurvivalTimeStack| {
+            SurvivalMarginalSlopeTermSpec {
             age_entry: age_entry.clone(),
             age_exit: age_exit.clone(),
             event_target: event_target.mapv(f64::from),
@@ -5061,7 +5062,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 offset_entry: prepared.eta_offset_entry.clone(),
                 offset_exit: prepared.eta_offset_exit.clone(),
                 derivative_offset_exit: prepared.derivative_offset_exit.clone(),
-                time_monotonicity: gam::families::survival_location_scale::TimeBlockMonotonicity::EnforcedByCoordinateCone,
+                time_monotonicity: gam::families::survival_location_scale::TimeBlockMonotonicity::EnforcedByRowConstraint,
                 penalties: prepared.time_penalties.clone(),
                 nullspace_dims: prepared.time_nullspace_dims.clone(),
                 initial_log_lambdas: survival_time_initial_log_lambdas(
@@ -5081,6 +5082,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             score_warp: routed_score_warp.clone(),
             link_dev: routed_link_dev.clone(),
             latent_z_policy: LatentZPolicy::default(),
+        }
         };
         if baseline_cfg.target != SurvivalBaselineTarget::Linear {
             baseline_cfg = optimize_survival_baseline_config_with_gradient(
