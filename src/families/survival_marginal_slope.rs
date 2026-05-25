@@ -21502,12 +21502,12 @@ mod tests {
             logslope_surface_ranges: empty_logslope_surface_ranges(),
             score_warp: None,
             link_dev: None,
-            time_linear_constraints: structural_time_coefficient_constraints(
+            time_linear_constraints: time_derivative_guard_constraints(
                 &DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0, 0.0]])),
                 &array![0.2],
                 1e-4,
             )
-            .expect("time coefficient constraints"),
+            .expect("time derivative guard constraints"),
             time_wiggle_knots: None,
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
