@@ -77,9 +77,9 @@ use gam::terms::{
     ARDPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry,
     BlockOrthogonalityPenalty as CoreBlockOrthogonalityPenalty,
     DifferenceOpKind, GatedSAEDecoder, IBPAssignmentPenalty, IsometryPenalty, IvaeRidgeMeanGauge,
-    JumpReLUPenalty, MaternBasisGradientTarget, MechanismSparsityPenalty, NuclearNormPenalty,
-    OrthogonalityPenalty, ParametricRowPrecisionPriorPenalty, PenaltyConcavity, PenaltyTier,
-    PsiSlice, RowPrecisionPriorPenalty, ScadMcpPenalty, ScalarWeightSchedule,
+    JumpReLUPenalty as RustJumpReLUPenalty, MaternBasisGradientTarget, MechanismSparsityPenalty,
+    NuclearNormPenalty, OrthogonalityPenalty, ParametricRowPrecisionPriorPenalty, PenaltyConcavity,
+    PenaltyTier, PsiSlice, RowPrecisionPriorPenalty, ScadMcpPenalty, ScalarWeightSchedule,
     SoftmaxAssignmentSparsityPenalty, SparsityPenalty as CoreSparsityPenalty,
     StreamingMaternBasisGradientEvaluator,
     TopKActivationPenalty, TotalVariationPenalty,
@@ -12421,6 +12421,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(formula_validation_repr_json, module)?)?;
     module.add_function(wrap_pyfunction!(formula_validation_html_json, module)?)?;
+    module.add_function(wrap_pyfunction!(build_predict_payload_json, module)?)?;
     module.add_function(wrap_pyfunction!(predict_table, module)?)?;
     module.add_function(wrap_pyfunction!(predict_array, module)?)?;
     module.add_function(wrap_pyfunction!(competing_risks_cif, module)?)?;
@@ -14550,6 +14551,55 @@ struct DifferenceSmoothRequest {
     template: Option<BTreeMap<String, serde_json::Value>>,
 }
 
+#[derive(Serialize)]
+struct DifferenceSmoothRequestJson<'a> {
+    view: &'a str,
+    group: Option<String>,
+    pairs: Option<Vec<(String, String)>>,
+    n: usize,
+    level: f64,
+    simultaneous: bool,
+    n_sim: usize,
+    seed: Option<u64>,
+    marginalise_random: bool,
+    group_means: bool,
+    template: Option<HashMap<String, String>>,
+}
+
+#[pyfunction]
+fn build_difference_smooth_request_json(
+    view: &str,
+    group: Option<String>,
+    pairs: Option<Vec<(String, String)>>,
+    n: usize,
+    level: f64,
+    simultaneous: bool,
+    n_sim: usize,
+    seed: Option<u64>,
+    marginalise_random: bool,
+    group_means: bool,
+    template: Option<HashMap<String, String>>,
+) -> PyResult<String> {
+    let payload = DifferenceSmoothRequestJson {
+        view,
+        group,
+        pairs,
+        n,
+        level,
+        simultaneous,
+        n_sim,
+        seed,
+        marginalise_random,
+        group_means,
+        template,
+    };
+    serde_json::to_string(&payload).map_err(|err| {
+        py_value_error(format!(
+            "failed to serialize difference_smooth request json: {err}"
+        ))
+    })
+}
+
 fn json_value_to_row_string(value: &serde_json::Value) -> Option<String> {
     match value {
         serde_json::Value::Null => None,
@@ -14741,6 +14791,23 @@ impl SplitMixNormalRng {
     fn uniform_open01(&mut self) -> f64 {
         let value = self.next_u64() >> 11;
         ((value as f64) + 0.5) * (1.0 / ((1_u64 << 53) as f64))
+    }
+
+    fn uniform_usize(&mut self, upper: usize) -> usize {
+        if upper <= 1 {
+            return 0;
+        }
+        (self.next_u64() as usize) % upper
+    }
+
+    fn shuffle<T>(&mut self, values: &mut [T]) {
+        if values.len() <= 1 {
+            return;
+        }
+        for i in (1..values.len()).rev() {
+            let j = self.uniform_usize(i + 1);
+            values.swap(i, j);
+        }
     }
 
     fn standard_normal(&mut self) -> f64 {
@@ -16135,7 +16202,7 @@ fn build_analytic_penalty_registry_from_json(
                     .unwrap_or(false);
                 registry.push(gam::terms::AnalyticPenaltyKind::BlockOrthogonality(
                     std::sync::Arc::new(
-                        BlockOrthogonalityPenalty::new(slice, groups, weight, n_eff, learnable)
+                        CoreBlockOrthogonalityPenalty::new(slice, groups, weight, n_eff, learnable)
                             .map_err(|err| format!("{context}: {err}"))?,
                     ),
                 ));
