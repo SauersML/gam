@@ -19040,6 +19040,188 @@ fn posterior_credible_interval_impl(
     gam::inference::posterior::credible_interval(&samples_flat, n_draws, n_coeffs, level)
 }
 
+#[derive(Deserialize)]
+struct PosteriorCoefficientNamesRequest {
+    coefficient_names: Option<serde_json::Value>,
+    n_coeffs: usize,
+}
+
+fn coefficient_name_from_json(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(name) => name.clone(),
+        other => other.to_string(),
+    }
+}
+
+fn default_coefficient_names(n_coeffs: usize) -> Vec<String> {
+    (0..n_coeffs).map(|j| format!("beta_{j}")).collect()
+}
+
+fn normalize_coefficient_names_value(
+    names: Option<&serde_json::Value>,
+    n_coeffs: usize,
+) -> Vec<String> {
+    match names.and_then(|value| value.as_array()) {
+        Some(raw) if raw.len() == n_coeffs => raw.iter().map(coefficient_name_from_json).collect(),
+        _ => default_coefficient_names(n_coeffs),
+    }
+}
+
+fn normalize_coefficient_names_vec(names: Vec<String>, n_coeffs: usize) -> Vec<String> {
+    if names.len() == n_coeffs {
+        names
+    } else {
+        default_coefficient_names(n_coeffs)
+    }
+}
+
+fn posterior_coefficient_names_json_impl(request_json: &str) -> Result<String, String> {
+    let request: PosteriorCoefficientNamesRequest = serde_json::from_str(request_json)
+        .map_err(|err| format!("posterior_coefficient_names_json: parse request: {err}"))?;
+    let names =
+        normalize_coefficient_names_value(request.coefficient_names.as_ref(), request.n_coeffs);
+    serde_json::to_string(&names)
+        .map_err(|err| format!("posterior_coefficient_names_json: serialise names: {err}"))
+}
+
+#[derive(Deserialize)]
+struct PosteriorSamplesSummaryRequest {
+    samples_flat: Vec<f64>,
+    n_draws: usize,
+    n_coeffs: usize,
+    level: f64,
+    coefficient_names: Vec<String>,
+    posterior_mean: Vec<f64>,
+    posterior_std: Vec<f64>,
+    rhat: f64,
+    ess: f64,
+    converged: bool,
+    method: String,
+    model_class: String,
+    family_kind: String,
+    config: serde_json::Value,
+}
+
+fn require_len(actual: usize, expected: usize, label: &str) -> Result<(), String> {
+    if actual != expected {
+        return Err(format!(
+            "{label} length mismatch: got {actual}, expected {expected}"
+        ));
+    }
+    Ok(())
+}
+
+fn posterior_samples_summary_json_impl(request_json: &str) -> Result<String, String> {
+    let request: PosteriorSamplesSummaryRequest = serde_json::from_str(request_json)
+        .map_err(|err| format!("posterior_samples_summary_json: parse request: {err}"))?;
+    require_len(request.posterior_mean.len(), request.n_coeffs, "posterior_mean")?;
+    require_len(request.posterior_std.len(), request.n_coeffs, "posterior_std")?;
+    let ci = posterior_credible_interval_impl(
+        request.samples_flat,
+        request.n_draws,
+        request.n_coeffs,
+        request.level,
+    )?;
+    require_len(ci.len(), request.n_coeffs * 2, "credible interval")?;
+    let names = normalize_coefficient_names_vec(request.coefficient_names, request.n_coeffs);
+    let coefficients: Vec<serde_json::Value> = (0..request.n_coeffs)
+        .map(|j| {
+            serde_json::json!({
+                "index": j,
+                "name": names[j],
+                "estimate": request.posterior_mean[j],
+                "std_error": request.posterior_std[j],
+                "ci_lower": ci[j * 2],
+                "ci_upper": ci[j * 2 + 1],
+            })
+        })
+        .collect();
+    let payload = serde_json::json!({
+        "kind": "posterior_samples",
+        "method": request.method,
+        "model_class": request.model_class,
+        "family_kind": request.family_kind,
+        "n_draws": request.n_draws,
+        "n_coeffs": request.n_coeffs,
+        "rhat": request.rhat,
+        "ess": request.ess,
+        "converged": request.converged,
+        "credible_interval": request.level,
+        "config": request.config,
+        "coefficients": coefficients,
+    });
+    serde_json::to_string(&payload)
+        .map_err(|err| format!("posterior_samples_summary_json: serialise payload: {err}"))
+}
+
+#[derive(Deserialize)]
+struct PosteriorTraceSelectionRequest {
+    coefficient_names: Vec<String>,
+    coefficients: Option<serde_json::Value>,
+    max_panels: usize,
+}
+
+#[derive(Serialize)]
+struct PosteriorTraceSelectionPayload {
+    indices: Vec<usize>,
+    labels: Vec<String>,
+}
+
+fn trace_index_from_value(
+    value: &serde_json::Value,
+    names: &[String],
+    n_coeffs: usize,
+) -> Result<usize, String> {
+    match value {
+        serde_json::Value::String(name) => names
+            .iter()
+            .position(|entry| entry == name)
+            .ok_or_else(|| format!("unknown coefficient {name:?}; known: {names:?}")),
+        serde_json::Value::Number(number) => {
+            let raw = number
+                .as_i64()
+                .ok_or_else(|| format!("coefficient index must be an integer, got {number}"))?;
+            if raw < 0 || raw as usize >= n_coeffs {
+                return Err(format!(
+                    "coefficient index {raw} out of range for {n_coeffs} coefficients"
+                ));
+            }
+            Ok(raw as usize)
+        }
+        other => Err(format!(
+            "coefficient selector must be a name, index, or list of names/indices; got {other}"
+        )),
+    }
+}
+
+fn posterior_trace_selection_json_impl(request_json: &str) -> Result<String, String> {
+    let request: PosteriorTraceSelectionRequest = serde_json::from_str(request_json)
+        .map_err(|err| format!("posterior_trace_selection_json: parse request: {err}"))?;
+    let n_coeffs = request.coefficient_names.len();
+    let indices = match request.coefficients.as_ref() {
+        None | Some(serde_json::Value::Null) => (0..request.max_panels.min(n_coeffs)).collect(),
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .map(|item| trace_index_from_value(item, &request.coefficient_names, n_coeffs))
+            .collect::<Result<Vec<_>, _>>()?,
+        Some(value) => vec![trace_index_from_value(
+            value,
+            &request.coefficient_names,
+            n_coeffs,
+        )?],
+    };
+    if indices.is_empty() {
+        return Err("plot_trace: no coefficients selected".to_string());
+    }
+    let labels = indices
+        .iter()
+        .map(|index| request.coefficient_names[*index].clone())
+        .collect();
+    let payload = PosteriorTraceSelectionPayload { indices, labels };
+    serde_json::to_string(&payload)
+        .map_err(|err| format!("posterior_trace_selection_json: serialise payload: {err}"))
+}
+
 fn posterior_eta_bands_impl(
     eta_flat: Vec<f64>,
     n_draws: usize,
