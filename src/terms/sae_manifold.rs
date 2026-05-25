@@ -247,6 +247,149 @@ impl SaeBasisEvaluator for PeriodicHarmonicEvaluator {
     }
 }
 
+/// Raw-angle periodic evaluator for the minimal SAE-manifold front-end.
+///
+/// The basis is exactly `[cos(t), sin(t)]` with `t` measured in radians. If
+/// the latent coordinate has more than one axis, the first axis carries the
+/// circle phase and the remaining axes are left available to the optimizer but
+/// do not enter this basis.
+#[derive(Debug, Clone)]
+pub struct RawPeriodicCircleEvaluator {
+    pub latent_dim: usize,
+}
+
+impl RawPeriodicCircleEvaluator {
+    pub fn new(latent_dim: usize) -> Result<Self, String> {
+        if latent_dim == 0 {
+            return Err("RawPeriodicCircleEvaluator requires latent_dim >= 1".to_string());
+        }
+        Ok(Self { latent_dim })
+    }
+}
+
+impl SaeBasisEvaluator for RawPeriodicCircleEvaluator {
+    fn evaluate(
+        &self,
+        coords: ArrayView2<'_, f64>,
+    ) -> Result<(Array2<f64>, Array3<f64>), String> {
+        if coords.ncols() != self.latent_dim {
+            return Err(format!(
+                "RawPeriodicCircleEvaluator: expected latent_dim {}, got {}",
+                self.latent_dim,
+                coords.ncols()
+            ));
+        }
+        let n = coords.nrows();
+        let mut phi = Array2::<f64>::zeros((n, 2));
+        let mut jet = Array3::<f64>::zeros((n, 2, self.latent_dim));
+        for row in 0..n {
+            let t = coords[[row, 0]];
+            phi[[row, 0]] = t.cos();
+            phi[[row, 1]] = t.sin();
+            jet[[row, 0, 0]] = -t.sin();
+            jet[[row, 1, 0]] = t.cos();
+        }
+        Ok((phi, jet))
+    }
+}
+
+/// Lat/lon sphere chart evaluator used by the Rust-owned minimal SAE path.
+#[derive(Debug, Clone)]
+pub struct SphereChartEvaluator;
+
+impl SaeBasisEvaluator for SphereChartEvaluator {
+    fn evaluate(
+        &self,
+        coords: ArrayView2<'_, f64>,
+    ) -> Result<(Array2<f64>, Array3<f64>), String> {
+        if coords.ncols() != 2 {
+            return Err(format!(
+                "SphereChartEvaluator expects latent_dim == 2, got {}",
+                coords.ncols()
+            ));
+        }
+        let n = coords.nrows();
+        let mut phi = Array2::<f64>::zeros((n, 7));
+        let mut jet = Array3::<f64>::zeros((n, 7, 2));
+        for row in 0..n {
+            let lat =
+                coords[[row, 0]].clamp(-std::f64::consts::FRAC_PI_2, std::f64::consts::FRAC_PI_2);
+            let lon = coords[[row, 1]];
+            let clat = lat.cos();
+            let slat = lat.sin();
+            let clon = lon.cos();
+            let slon = lon.sin();
+            let x = clat * clon;
+            let y = clat * slon;
+            let z = slat;
+            phi[[row, 0]] = 1.0;
+            phi[[row, 1]] = x;
+            phi[[row, 2]] = y;
+            phi[[row, 3]] = z;
+            phi[[row, 4]] = x * y;
+            phi[[row, 5]] = y * z;
+            phi[[row, 6]] = x * z;
+
+            let dx_dlat = -slat * clon;
+            let dx_dlon = -clat * slon;
+            let dy_dlat = -slat * slon;
+            let dy_dlon = clat * clon;
+            let dz_dlat = clat;
+            jet[[row, 1, 0]] = dx_dlat;
+            jet[[row, 1, 1]] = dx_dlon;
+            jet[[row, 2, 0]] = dy_dlat;
+            jet[[row, 2, 1]] = dy_dlon;
+            jet[[row, 3, 0]] = dz_dlat;
+            jet[[row, 4, 0]] = dx_dlat * y + x * dy_dlat;
+            jet[[row, 4, 1]] = dx_dlon * y + x * dy_dlon;
+            jet[[row, 5, 0]] = dy_dlat * z + y * dz_dlat;
+            jet[[row, 5, 1]] = dy_dlon * z;
+            jet[[row, 6, 0]] = dx_dlat * z + x * dz_dlat;
+            jet[[row, 6, 1]] = dx_dlon * z;
+        }
+        Ok((phi, jet))
+    }
+}
+
+/// Affine Euclidean/Duchon fallback for the minimal fit entrypoint.
+#[derive(Debug, Clone)]
+pub struct AffineCoordinateEvaluator {
+    pub latent_dim: usize,
+}
+
+impl AffineCoordinateEvaluator {
+    pub fn new(latent_dim: usize) -> Self {
+        Self { latent_dim }
+    }
+}
+
+impl SaeBasisEvaluator for AffineCoordinateEvaluator {
+    fn evaluate(
+        &self,
+        coords: ArrayView2<'_, f64>,
+    ) -> Result<(Array2<f64>, Array3<f64>), String> {
+        if coords.ncols() != self.latent_dim {
+            return Err(format!(
+                "AffineCoordinateEvaluator: expected latent_dim {}, got {}",
+                self.latent_dim,
+                coords.ncols()
+            ));
+        }
+        let n = coords.nrows();
+        let m = self.latent_dim + 1;
+        let mut phi = Array2::<f64>::zeros((n, m));
+        let mut jet = Array3::<f64>::zeros((n, m, self.latent_dim));
+        phi.column_mut(0).fill(1.0);
+        for row in 0..n {
+            for axis in 0..self.latent_dim {
+                phi[[row, axis + 1]] = coords[[row, axis]];
+                jet[[row, axis + 1, axis]] = 1.0;
+            }
+        }
+        Ok((phi, jet))
+    }
+}
+
 /// Static basis evaluator: returns a frozen `(Phi, dPhi/dt)` snapshot regardless
 /// of the supplied coordinates. Lets the multi-step Newton loop compose for
 /// basis kinds whose true refresh routine is not yet wired in Rust — the
@@ -276,8 +419,15 @@ impl StaticBasisEvaluator {
 impl SaeBasisEvaluator for StaticBasisEvaluator {
     fn evaluate(
         &self,
-        _coords: ArrayView2<'_, f64>,
+        coords: ArrayView2<'_, f64>,
     ) -> Result<(Array2<f64>, Array3<f64>), String> {
+        if coords.nrows() != self.phi.nrows() {
+            return Err(format!(
+                "StaticBasisEvaluator expected {} rows, got {}",
+                self.phi.nrows(),
+                coords.nrows()
+            ));
+        }
         Ok((self.phi.clone(), self.jet.clone()))
     }
 }
@@ -636,6 +786,9 @@ impl SaeAssignment {
 
     pub fn try_assignments_row(&self, row: usize) -> Result<Array1<f64>, String> {
         validate_finite_logits(self.logits.row(row), row)?;
+        if self.k_atoms() == 1 {
+            return Ok(Array1::from_vec(vec![1.0]));
+        }
         match self.mode {
             AssignmentMode::Softmax { temperature, .. } => {
                 Ok(softmax_row(self.logits.row(row), temperature))

@@ -67,8 +67,9 @@ use gam::terms::basis::{
 use gam::terms::input_loc_derivatives::contract_input_loc_gradient;
 use gam::terms::latent_coord::{AuxPriorFamily, aux_prior_targets};
 use gam::terms::sae_manifold::{
-    AssignmentMode, GumbelTemperatureSchedule, SaeAtomBasisKind, SaeBasisEvaluator,
-    SaeManifoldRho, ScheduleKind, term_from_padded_blocks_with_mode,
+    AssignmentMode, GumbelTemperatureSchedule, PeriodicHarmonicEvaluator, SaeAtomBasisKind,
+    SaeBasisEvaluator, SaeManifoldRho, ScheduleKind, StaticBasisEvaluator,
+    term_from_padded_blocks_with_mode,
 };
 use gam::terms::skip_transcoder::{
     SkipTranscoderRemlInputs, skip_transcoder_reml_metrics as skip_transcoder_reml_metrics_core,
@@ -91,7 +92,8 @@ use gam::transformation_normal::TransformationNormalFitResult;
 use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily, RhoPrior};
 use gam::{FitConfig, FitRequest, FitResult, fit_model, materialize, resolve_offset_column};
 use ndarray::{
-    Array1, Array2, Array3, Array4, ArrayView1, ArrayView2, ArrayView3, ArrayViewD, Axis, IxDyn, s,
+    Array1, Array2, Array3, Array4, ArrayView1, ArrayView2, ArrayView3, ArrayView4, ArrayViewD,
+    Axis, IxDyn, s,
 };
 use numpy::{
     IntoPyArray, PyArray1, PyArray2, PyArray3, PyArrayDyn, PyArrayMethods, PyReadonlyArray1,
@@ -7950,6 +7952,51 @@ fn gumbel_temperature_schedule_from_pydict(
     Ok(Some(schedule_out))
 }
 
+/// Build per-atom Rust basis evaluators so the Newton loop can refresh
+/// `Phi_k` and `dPhi_k/dt` between steps without bouncing back to Python.
+///
+/// `Periodic` atoms with `latent_dim == 1` are served by an analytic harmonic
+/// evaluator. Other kinds (Duchon, Sphere, EuclideanPatch, Precomputed, or
+/// higher-dimensional Periodic) currently fall back to a frozen snapshot of
+/// the caller-supplied design, which keeps the multi-step loop well-defined
+/// while leaving logits / coords / β free to move.
+fn build_sae_basis_evaluators(
+    basis_kinds: &[SaeAtomBasisKind],
+    basis_sizes: &[usize],
+    atom_dim: &[usize],
+    coord_blocks: &[Array2<f64>],
+    basis_values: ArrayView3<'_, f64>,
+    basis_jacobian: ArrayView4<'_, f64>,
+    n_obs: usize,
+) -> Result<Vec<Option<Arc<dyn SaeBasisEvaluator>>>, String> {
+    let k_atoms = basis_kinds.len();
+    if atom_dim.len() != k_atoms || basis_sizes.len() != k_atoms || coord_blocks.len() != k_atoms {
+        return Err(format!(
+            "build_sae_basis_evaluators: K-length metadata mismatch (kinds={k_atoms}, dims={}, sizes={}, coords={})",
+            atom_dim.len(),
+            basis_sizes.len(),
+            coord_blocks.len()
+        ));
+    }
+    let mut out: Vec<Option<Arc<dyn SaeBasisEvaluator>>> = Vec::with_capacity(k_atoms);
+    for k in 0..k_atoms {
+        let m = basis_sizes[k];
+        let d = atom_dim[k];
+        let evaluator: Arc<dyn SaeBasisEvaluator> = match &basis_kinds[k] {
+            SaeAtomBasisKind::Periodic if d == 1 && m % 2 == 1 => {
+                Arc::new(PeriodicHarmonicEvaluator::new(m)?)
+            }
+            _ => {
+                let phi = basis_values.slice(s![k, 0..n_obs, 0..m]).to_owned();
+                let jet = basis_jacobian.slice(s![k, 0..n_obs, 0..m, 0..d]).to_owned();
+                Arc::new(StaticBasisEvaluator::new(phi, jet)?)
+            }
+        };
+        out.push(Some(evaluator));
+    }
+    Ok(out)
+}
+
 /// Fit one SAE-manifold refresh step; auto lambda selection is expressed by
 /// passing `lambda_grid`, which evaluates candidate smoothness lambdas in Rust.
 #[pyfunction(signature = (
@@ -8033,10 +8080,10 @@ fn sae_manifold_fit<'py>(
         analytic_penalties.as_ref(),
     )
     .map_err(py_value_error)?;
-    if max_iter != 1 {
-        return Err(py_value_error(
-            "sae_manifold_fit accepts exactly one Newton step per basis snapshot; the Python driver refreshes Phi and dPhi/dt between calls".to_string(),
-        ));
+    if max_iter < 1 {
+        return Err(py_value_error(format!(
+            "sae_manifold_fit requires max_iter >= 1; got {max_iter}"
+        )));
     }
     if initial_logits.as_array().dim() != (n_obs, k_atoms) {
         return Err(py_value_error(format!(
@@ -8158,9 +8205,16 @@ fn sae_manifold_fit<'py>(
             )));
         }
     };
-    let evaluators =
-        build_sae_basis_evaluators(&basis_kinds, &basis_sizes, &atom_dim, &coord_blocks)
-            .map_err(py_value_error)?;
+    let evaluators = build_sae_basis_evaluators(
+        &basis_kinds,
+        &basis_sizes,
+        &atom_dim,
+        &coord_blocks,
+        basis_values.as_array(),
+        basis_jacobian.as_array(),
+        n_obs,
+    )
+    .map_err(py_value_error)?;
     let mut base_term = term_from_padded_blocks_with_mode(
         n_obs,
         p_out,
@@ -8194,16 +8248,42 @@ fn sae_manifold_fit<'py>(
         let mut candidate_term = base_term.clone();
         let mut candidate_rho =
             SaeManifoldRho::new(sparsity_strength.ln(), lambda_smooth.ln(), log_ard.clone());
-        let candidate_loss = candidate_term
-            .run_single_external_basis_refresh_step_arrow_schur(
+        let mut candidate_loss = candidate_term
+            .run_joint_fit_arrow_schur(
                 z_view,
                 &mut candidate_rho,
                 Some(&registry),
+                1,
                 learning_rate,
                 ridge_ext_coord,
                 ridge_beta,
             )
             .map_err(py_value_error)?;
+        let mut prev_total = candidate_loss.total();
+        for _ in 1..max_iter {
+            let step_loss = candidate_term
+                .run_joint_fit_arrow_schur(
+                    z_view,
+                    &mut candidate_rho,
+                    Some(&registry),
+                    1,
+                    learning_rate,
+                    ridge_ext_coord,
+                    ridge_beta,
+                )
+                .map_err(py_value_error)?;
+            let new_total = step_loss.total();
+            candidate_loss = step_loss;
+            if !new_total.is_finite() {
+                break;
+            }
+            let denom = prev_total.abs().max(1.0e-12);
+            let rel_change = (prev_total - new_total).abs() / denom;
+            prev_total = new_total;
+            if rel_change < 1.0e-6 {
+                break;
+            }
+        }
         let candidate_score = candidate_loss.evidence_proxy();
         if candidate_score > best_score {
             best_score = candidate_score;
