@@ -7976,6 +7976,75 @@ fn gumbel_temperature_schedule_from_pydict(
     gumbel_schedule = None,
     analytic_penalties = None,
 ))]
+/// Coefficient of determination R^2 = 1 - SSR / SST. Returned as a single
+/// f64 so the Python wrapper stays a one-line FFI call.
+#[pyfunction]
+fn sae_manifold_reconstruction_r2(
+    x: PyReadonlyArray2<'_, f64>,
+    fitted: PyReadonlyArray2<'_, f64>,
+) -> PyResult<f64> {
+    let x = x.as_array();
+    let fitted = fitted.as_array();
+    if x.dim() != fitted.dim() {
+        return Err(py_value_error(format!(
+            "sae_manifold_reconstruction_r2: shape mismatch x={:?} fitted={:?}",
+            x.dim(),
+            fitted.dim(),
+        )));
+    }
+    let n_rows = x.nrows();
+    if n_rows == 0 {
+        return Ok(0.0);
+    }
+    let mut col_means = vec![0.0_f64; x.ncols()];
+    for col in 0..x.ncols() {
+        let mut acc = 0.0;
+        for row in 0..n_rows {
+            acc += x[[row, col]];
+        }
+        col_means[col] = acc / n_rows as f64;
+    }
+    let mut ssr = 0.0_f64;
+    let mut sst = 0.0_f64;
+    for row in 0..n_rows {
+        for col in 0..x.ncols() {
+            let d = x[[row, col]] - fitted[[row, col]];
+            ssr += d * d;
+            let dm = x[[row, col]] - col_means[col];
+            sst += dm * dm;
+        }
+    }
+    Ok(1.0 - ssr / sst.max(1.0e-12))
+}
+
+/// Sparsity summary stats for an assignment matrix returned by
+/// `sae_manifold_fit*`. Returns `(avg_active_atoms, mean_assignment_mass)`.
+/// "Active" is defined as `assignment >= threshold`.
+#[pyfunction]
+fn sae_manifold_assignment_summary(
+    assignments: PyReadonlyArray2<'_, f64>,
+    threshold: f64,
+) -> PyResult<(f64, f64)> {
+    let a = assignments.as_array();
+    let (n_rows, k) = a.dim();
+    if n_rows == 0 || k == 0 {
+        return Ok((0.0, 0.0));
+    }
+    let mut active_total = 0_usize;
+    let mut mass_total = 0.0_f64;
+    for row in 0..n_rows {
+        for col in 0..k {
+            mass_total += a[[row, col]];
+            if a[[row, col]] >= threshold {
+                active_total += 1;
+            }
+        }
+    }
+    let avg_active = active_total as f64 / n_rows as f64;
+    let mean_mass = mass_total / (n_rows * k) as f64;
+    Ok((avg_active, mean_mass))
+}
+
 fn sae_manifold_fit<'py>(
     py: Python<'py>,
     z: PyReadonlyArray2<'py, f64>,
@@ -17285,6 +17354,8 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(equivariant_gauge_companion_loss, module)?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_fit, module)?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_fit_ibp, module)?)?;
+    module.add_function(wrap_pyfunction!(sae_manifold_reconstruction_r2, module)?)?;
+    module.add_function(wrap_pyfunction!(sae_manifold_assignment_summary, module)?)?;
     module.add_function(wrap_pyfunction!(gated_sae_decode, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_fit_latent_backward, module)?)?;
     module.add_function(wrap_pyfunction!(glm_reml_fit_latent, module)?)?;

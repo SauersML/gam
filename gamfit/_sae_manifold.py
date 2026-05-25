@@ -71,7 +71,10 @@ class ManifoldSAE:
         return [coord.copy() for coord in self.coords]
 
     def summary(self) -> dict[str, Any]:
-        active = self.assignments >= (0.5 if self.assignment == "ibp" else 1.0 / max(1, len(self.atoms)))
+        threshold = 0.5 if self.assignment == "ibp" else 1.0 / max(1, len(self.atoms))
+        avg_active, mean_mass = rust_module().sae_manifold_assignment_summary(
+            self.assignments, threshold
+        )
         return {
             "K": len(self.atoms),
             "d_atom": int(self.coords[0].shape[1]) if self.coords else 0,
@@ -79,8 +82,8 @@ class ManifoldSAE:
             "assignment": self.assignment,
             "reml_score": float(self.reml_score),
             "reconstruction_r2": float(self.reconstruction_r2),
-            "avg_active_atoms": float(np.mean(np.sum(active, axis=1))),
-            "mean_assignment_mass": float(np.mean(self.assignments)),
+            "avg_active_atoms": float(avg_active),
+            "mean_assignment_mass": float(mean_mass),
             "active_dims": [atom.active_dim for atom in self.atoms],
             "primitives": list(self.primitive_names),
         }
@@ -295,7 +298,7 @@ def _schedule_tau_start(schedule: Any, default: float) -> float:
 
 
 def _r2(x: np.ndarray, fitted: np.ndarray) -> float:
-    return 1.0 - float(np.sum((x - fitted) ** 2)) / max(float(np.sum((x - x.mean(axis=0)) ** 2)), 1e-12)
+    return float(rust_module().sae_manifold_reconstruction_r2(x, fitted))
 
 
 __all__ = ["GumbelTemperatureSchedule", "ManifoldSAE", "SaeManifoldAtomFit", "SaeManifoldFitResult", "gumbel_geometric_schedule", "gumbel_linear_schedule", "gumbel_reciprocal_iter_schedule", "sae_manifold_fit"]
