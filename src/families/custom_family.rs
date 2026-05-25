@@ -13634,19 +13634,13 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 }
                 BlockWorkingSet::Diagonal {
                     working_response,
-                    ..
+                    working_weights,
                 } => {
                     // IRLS local-quadratic gradient and Hessian:
                     //   rhs = X^T W (z − Xβ) − Sβ
                     //   H_pen δ = X^T W X δ + Sδ
                     let xb = spec.design.matrixvectormultiply(&beta_old);
                     let resid = working_response - &xb;
-                    let working_weights = match work {
-                        BlockWorkingSet::Diagonal {
-                            working_weights, ..
-                        } => working_weights,
-                        BlockWorkingSet::ExactNewton { .. } => unreachable!(),
-                    };
                     let w_resid = &resid * working_weights;
                     let mut rhs = spec.design.transpose_vector_multiply(&w_resid);
                     rhs -= &s_lambda.dot(&beta_old);
@@ -13853,8 +13847,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             (cached_eval.log_likelihood - prev_log_likelihood_for_divergence_check).abs();
         let loglik_frozen_tol_for_divergence_check =
             inner_tol * (1.0 + cached_eval.log_likelihood.abs());
-        let step_clamped_for_divergence_check =
-            max_proposed_beta_step >= 0.95 * NEWTON_STEP_CAP_FOR_DIVERGENCE;
+        let step_clamped_for_divergence_check = trust_boundary_hit_in_cycle;
         if loglik_change_for_divergence_check <= loglik_frozen_tol_for_divergence_check {
             consecutive_frozen_loglik_cycles += 1;
             if step_clamped_for_divergence_check {
@@ -13869,12 +13862,11 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             && clamped_step_in_frozen_run
         {
             log::warn!(
-                "[PIRLS/blockwise convergence] divergence early-exit at cycle {} | -loglik={:.6e} frozen for {} consecutive cycles | max_proposed_step={:.3e} (clamped-at-cap {} observed in frozen run) | step_tol={:.3e}; near-null Hessian direction detected — returning unconverged so the outer optimizer backs off this region instead of running to inner_max_cycles.",
+                "[PIRLS/blockwise convergence] divergence early-exit at cycle {} | -loglik={:.6e} frozen for {} consecutive cycles | max_proposed_step={:.3e} (trust-boundary hit observed in frozen run) | step_tol={:.3e}; near-null Hessian direction detected — returning unconverged so the outer optimizer backs off this region instead of running to inner_max_cycles.",
                 cycle,
                 -cached_eval.log_likelihood,
                 consecutive_frozen_loglik_cycles,
                 max_proposed_beta_step,
-                NEWTON_STEP_CAP_FOR_DIVERGENCE,
                 step_tol,
             );
             converged = false;
