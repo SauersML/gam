@@ -6741,6 +6741,18 @@ fn validate_blockspecs(specs: &[ParameterBlockSpec]) -> Result<Vec<usize>, Strin
         }
         .into());
     }
+    let mut seen_names = BTreeMap::<String, usize>::new();
+    for (b, spec) in specs.iter().enumerate() {
+        if let Some(prev) = seen_names.insert(spec.name.clone(), b) {
+            return Err(CustomFamilyError::ConstraintViolation {
+                reason: format!(
+                    "duplicate parameter block name '{}' at indices {prev} and {b}: block names must be unique so coefficient labels resolved by name are unambiguous",
+                    spec.name
+                ),
+            }
+            .into());
+        }
+    }
     let mut penalty_counts = Vec::with_capacity(specs.len());
     for (b, spec) in specs.iter().enumerate() {
         let n = spec.design.nrows();
