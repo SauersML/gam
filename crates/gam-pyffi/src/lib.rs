@@ -74,7 +74,8 @@ use gam::terms::skip_transcoder::{
     SkipTranscoderRemlInputs, skip_transcoder_reml_metrics as skip_transcoder_reml_metrics_core,
 };
 use gam::terms::{
-    ARDPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry, BlockOrthogonalityPenalty,
+    ARDPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry,
+    BlockOrthogonalityPenalty as CoreBlockOrthogonalityPenalty,
     DifferenceOpKind, GatedSAEDecoder, IBPAssignmentPenalty, IsometryPenalty, IvaeRidgeMeanGauge,
     JumpReLUPenalty, MaternBasisGradientTarget, MechanismSparsityPenalty, NuclearNormPenalty,
     OrthogonalityPenalty, ParametricRowPrecisionPriorPenalty, PenaltyConcavity, PenaltyTier,
@@ -1570,6 +1571,21 @@ fn formula_validation_html_json(payload_json: String) -> PyResult<String> {
 <h3 style='margin:0 0 0.5rem 0;'>Formula Validation</h3>\
 <table style='border-collapse:collapse;'>{rows}</table></div>"
     ))
+}
+
+#[pyfunction]
+fn build_predict_payload_json(
+    interval: Option<f64>,
+    with_uncertainty: bool,
+    time_grid: Option<Vec<f64>>,
+) -> PyResult<String> {
+    let payload = PyPredictOptionsPayload {
+        interval,
+        with_uncertainty,
+        time_grid,
+    };
+    serde_json::to_string(&payload)
+        .map_err(|err| py_value_error(format!("failed to serialize predict payload: {err}")))
 }
 
 #[pyfunction]
@@ -11065,6 +11081,30 @@ fn report_html(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<String> {
 }
 
 #[pyfunction]
+fn compute_residuals<'py>(
+    py: Python<'py>,
+    observed: PyReadonlyArray1<'py, f64>,
+    predicted_mean: PyReadonlyArray1<'py, f64>,
+) -> PyResult<Py<PyArray1<f64>>> {
+    let observed_values = observed.as_array();
+    let predicted_values = predicted_mean.as_array();
+    if observed_values.len() != predicted_values.len() {
+        return Err(py_value_error(format!(
+            "compute_residuals length mismatch: observed has {} values but predicted mean has {}",
+            observed_values.len(),
+            predicted_values.len()
+        )));
+    }
+
+    let residuals = observed_values
+        .iter()
+        .zip(predicted_values.iter())
+        .map(|(obs, pred)| *obs - *pred)
+        .collect::<Vec<_>>();
+    Ok(Array1::from_vec(residuals).into_pyarray(py).unbind())
+}
+
+#[pyfunction]
 fn diagnostics_from_predictions(
     py: Python<'_>,
     observed: Vec<f64>,
@@ -12194,6 +12234,147 @@ fn equivariant_gauge_companion_loss<'py>(
     })
 }
 
+#[pyclass(module = "gam_pyffi._rust", name = "SparsityPenalty")]
+struct SparsityPenalty {
+    #[pyo3(get, set)]
+    target: PyObject,
+    #[pyo3(get, set)]
+    kind: String,
+    #[pyo3(get, set)]
+    weight: PyObject,
+    #[pyo3(get, set)]
+    eps: f64,
+    #[pyo3(get, set)]
+    eps_weight: String,
+    #[pyo3(get, set)]
+    weight_schedule: Option<PyObject>,
+}
+
+#[pymethods]
+impl SparsityPenalty {
+    #[new]
+    #[pyo3(signature = (kind = "smooth_l1", weight = "auto", eps = 1.0e-3, eps_weight = "fixed", *, target = "t", weight_schedule = None))]
+    fn new(
+        py: Python<'_>,
+        kind: String,
+        weight: PyObject,
+        eps: f64,
+        eps_weight: String,
+        target: PyObject,
+        weight_schedule: Option<PyObject>,
+    ) -> PyResult<Self> {
+        validate_sparsity_weight(py, weight.bind(py), "SparsityPenalty")?;
+        if !matches!(kind.as_str(), "smooth_l1" | "hoyer" | "log") {
+            return Err(PyValueError::new_err(format!(
+                "SparsityPenalty.kind must be one of 'smooth_l1' | 'hoyer' | 'log', got {kind:?}"
+            )));
+        }
+        if kind == "hoyer" && eps_weight == "auto" {
+            return Err(PyValueError::new_err(
+                "SparsityPenalty(kind='hoyer'): Hoyer has no smoothing scale, so eps_weight='auto' is not meaningful.",
+            ));
+        }
+        if eps <= 0.0 {
+            return Err(PyValueError::new_err(format!(
+                "SparsityPenalty.eps must be > 0, got {eps}"
+            )));
+        }
+        if !matches!(eps_weight.as_str(), "auto" | "fixed") {
+            return Err(PyValueError::new_err(format!(
+                "SparsityPenalty.eps_weight must be 'auto' or 'fixed', got {eps_weight:?}"
+            )));
+        }
+        Ok(Self {
+            target,
+            kind,
+            weight,
+            eps,
+            eps_weight,
+            weight_schedule,
+        })
+    }
+
+    #[classattr]
+    const KIND_TAG: &'static str = "sparsity";
+
+    fn to_rust_descriptor(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let payload = PyDict::new(py);
+        payload.set_item("kind", Self::KIND_TAG)?;
+        payload.set_item("target", target_descriptor(py, self.target.bind(py))?)?;
+        payload.set_item("sparsity_kind", &self.kind)?;
+        payload.set_item("weight", self.weight.bind(py))?;
+        payload.set_item("eps", self.eps)?;
+        payload.set_item("eps_weight", &self.eps_weight)?;
+        if let Some(schedule) = &self.weight_schedule {
+            payload.set_item("weight_schedule", schedule.bind(py))?;
+        }
+        Ok(payload.into())
+    }
+
+    fn set_weight_schedule<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        schedule: PyObject,
+    ) -> PyRefMut<'py, Self> {
+        slf.weight_schedule = Some(schedule);
+        slf
+    }
+
+    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        Ok(format!(
+            "SparsityPenalty(kind={}, weight={}, eps={}, eps_weight={}, target={}, weight_schedule={})",
+            self.kind.as_str(),
+            py_repr(py, self.weight.bind(py))?,
+            self.eps,
+            self.eps_weight.as_str(),
+            py_repr(py, self.target.bind(py))?,
+            match &self.weight_schedule {
+                Some(schedule) => py_repr(py, schedule.bind(py))?,
+                None => "None".to_string(),
+            }
+        ))
+    }
+}
+
+fn validate_sparsity_weight(py: Python<'_>, weight: &Bound<'_, PyAny>, name: &str) -> PyResult<()> {
+    if let Ok(value) = weight.extract::<String>() {
+        if value == "auto" {
+            return Ok(());
+        }
+        return Err(PyValueError::new_err(format!(
+            "{name}.weight: only 'auto' is accepted as a string, got {value:?}"
+        )));
+    }
+    if let Ok(value) = weight.extract::<f64>() {
+        if value > 0.0 {
+            return Ok(());
+        }
+        return Err(PyValueError::new_err(format!(
+            "{name}.weight must be > 0, got {}",
+            py_repr(py, weight)?
+        )));
+    }
+    Err(PyTypeError::new_err(format!(
+        "{name}.weight must be 'auto' or a positive float, got {}",
+        weight.get_type().name()?
+    )))
+}
+
+fn target_descriptor(py: Python<'_>, target: &Bound<'_, PyAny>) -> PyResult<PyObject> {
+    if target.is_instance_of::<PyString>() || target.extract::<isize>().is_ok() {
+        return Ok(target.clone().unbind());
+    }
+    if let Ok(name) = target.getattr("name") {
+        return Ok(name.str()?.into_pyobject(py)?.unbind().into());
+    }
+    Err(PyTypeError::new_err(
+        "analytic penalty target must be a latent block name, latent block index, or object exposing a 'name' attribute",
+    ))
+}
+
+fn py_repr(_py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<String> {
+    value.repr()?.extract()
+}
+
 #[pymodule(name = "_rust", gil_used = false)]
 fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     gam::init_parallelism();
@@ -12364,6 +12545,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(check_json, module)?)?;
     module.add_function(wrap_pyfunction!(report_html, module)?)?;
+    module.add_function(wrap_pyfunction!(compute_residuals, module)?)?;
     module.add_function(wrap_pyfunction!(diagnostics_from_predictions, module)?)?;
     // LatentCoord input-location derivative helpers (one per basis kind).
     module.add_function(wrap_pyfunction!(
