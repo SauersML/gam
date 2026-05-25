@@ -1530,15 +1530,34 @@ impl AnalyticPenalty for SoftmaxAssignmentSparsityPenalty {
             0,
             "softmax entropy target length must be divisible by k_atoms"
         );
-        // Softmax entropy is dense-Hessian: no closed-form diagonal —
-        // callers route through `hvp` instead. Signal that with `None`
-        // for any non-empty target; size-0 target still returns the
-        // canonical empty diagonal so callers can short-circuit.
-        if target.is_empty() {
-            Some(Array1::zeros(0))
-        } else {
-            None
+        // Closed-form diagonal of the softmax-entropy Hessian wrt logits.
+        // Derived by probing the row-dense HVP with the unit vector e_k:
+        // for a row with softmax weights a_k and L_k = ln a_k + 1,
+        //   H_kk = (lambda / tau^2) * a_k *
+        //          ((1 - 2 a_k) * (E_a[L] - L_k) + a_k - 1).
+        // This matches `hvp(...) . e_k` analytically (see derivation in the
+        // bug-fix comment on `hvp`) and gives Newton/Arrow-Schur callers a
+        // principled diagonal surrogate without per-row dense factorization.
+        let lambda = self.weight * rho[0].exp();
+        let inv_tau = 1.0 / self.temperature;
+        let scale = lambda * inv_tau * inv_tau;
+        let n = target.len() / self.k_atoms;
+        let values: Vec<f64> = target.iter().copied().collect();
+        let mut out = Array1::<f64>::zeros(target.len());
+        for row in 0..n {
+            let start = row * self.k_atoms;
+            let a = self.softmax_row(&values[start..start + self.k_atoms]);
+            let mut mean_log_plus_one = 0.0;
+            for k in 0..self.k_atoms {
+                mean_log_plus_one += a[k] * (a[k].max(1e-300).ln() + 1.0);
+            }
+            for k in 0..self.k_atoms {
+                let log_plus_one = a[k].max(1e-300).ln() + 1.0;
+                let term = (1.0 - 2.0 * a[k]) * (mean_log_plus_one - log_plus_one) + a[k] - 1.0;
+                out[start + k] = scale * a[k] * term;
+            }
         }
+        Some(out)
     }
 
     fn hvp(
@@ -1548,16 +1567,14 @@ impl AnalyticPenalty for SoftmaxAssignmentSparsityPenalty {
         v: ArrayView1<'_, f64>,
     ) -> Array1<f64> {
         /*
-        Bug fix: softmax entropy is not coordinate-separable in logits.
-        The old `hessian_diag` returned λ p_k(1-p_k)/τ², which is only the
-        softmax Jacobian diagonal and omits the entropy curvature and all
-        cross-logit terms. That made `hvp` and log-det callers consume a
-        diagonal surrogate that is not the derivative of `grad_target`.
-        For H(p(z)), p'=p*(v-E_p[v])/τ and
+        Softmax entropy is not coordinate-separable in logits. The old
+        `hessian_diag` returned λ p_k(1-p_k)/τ², which is only the softmax
+        Jacobian diagonal and omits the entropy curvature and all cross-logit
+        terms. For H(p(z)), p'=p*(v-E_p[v])/τ and
         (log p_k + 1)'=(v_k-E_p[v])/τ. Differentiating
         g_k=λ p_k(E_p[log p + 1]-(log p_k+1))/τ gives the row-dense product
-        below. `hessian_diag` now returns `None`, so diagonal users recover
-        the true diagonal by probing this exact symmetric HVP.
+        below. `hessian_diag` returns the analytic diagonal extracted from
+        this HVP by setting v = e_k row-by-row.
         */
         let lambda = self.weight * rho[0].exp();
         assert_eq!(target.len(), v.len(), "hvp dimension mismatch");
@@ -7489,10 +7506,17 @@ mod tests {
         let rho = array![1.4_f64.ln()];
         let v = array![0.2_f64, -0.5, 0.7, -0.3, 0.4, 0.6];
 
-        assert!(
-            pen.hessian_diag(t.view(), rho.view()).is_none(),
-            "softmax entropy has row-dense logit curvature, not a diagonal Hessian"
-        );
+        // The analytic diagonal must equal hvp(.) probed by unit vectors e_k,
+        // i.e. the i-th entry equals dot(hvp(t, rho, e_i), e_i).
+        let h_diag = pen
+            .hessian_diag(t.view(), rho.view())
+            .expect("softmax entropy diagonal is analytic via row-dense HVP at e_k");
+        for i in 0..t.len() {
+            let mut e_i = Array1::<f64>::zeros(t.len());
+            e_i[i] = 1.0;
+            let hv_i = pen.hvp(t.view(), rho.view(), e_i.view());
+            assert_abs_diff_eq!(h_diag[i], hv_i[i], epsilon = 1e-10);
+        }
 
         let hv = pen.hvp(t.view(), rho.view(), v.view());
         let eps = 1e-6;

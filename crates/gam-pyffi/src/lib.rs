@@ -69,8 +69,8 @@ use gam::terms::input_loc_derivatives::contract_input_loc_gradient;
 use gam::terms::latent_coord::{AuxPriorFamily, aux_prior_targets};
 use gam::terms::sae_manifold::{
     AssignmentMode, GumbelTemperatureSchedule, PeriodicHarmonicEvaluator, SaeAtomBasisKind,
-    SaeBasisEvaluator, SaeManifoldRho, ScheduleKind, StaticBasisEvaluator,
-    term_from_padded_blocks_with_mode,
+    SaeBasisEvaluator, SaeManifoldRho, ScheduleKind, SphereChartEvaluator, StaticBasisEvaluator,
+    TorusHarmonicEvaluator, term_from_padded_blocks_with_mode,
 };
 use gam::terms::skip_transcoder::{
     SkipTranscoderRemlInputs, skip_transcoder_reml_metrics as skip_transcoder_reml_metrics_core,
@@ -7968,10 +7968,20 @@ fn sae_atom_basis_kind_from_str(value: &str) -> SaeAtomBasisKind {
         "duchon" => SaeAtomBasisKind::Duchon,
         "periodic" | "periodic_spline" | "circle" => SaeAtomBasisKind::Periodic,
         "sphere" => SaeAtomBasisKind::Sphere,
+        "torus" => SaeAtomBasisKind::Torus,
         "euclidean" | "euclidean_patch" => SaeAtomBasisKind::EuclideanPatch,
         other => SaeAtomBasisKind::Precomputed(other.to_string()),
     }
 }
+
+/// Default per-axis harmonic order for a torus atom (Φ has `(2H+1)^d`
+/// columns). Three harmonics per axis gives a 7-column 1-D factor and a
+/// 49-column tensor basis at `d=2`, which is the smallest expansion that
+/// reliably resolves a non-trivial signal on `T^2` without exploding the
+/// design.
+const SAE_DEFAULT_TORUS_HARMONICS: usize = 3;
+/// Sphere chart basis size (lat/lon ⇒ `[1, x, y, z, xy, yz, xz]`).
+const SAE_SPHERE_BASIS_SIZE: usize = 7;
 
 fn gumbel_temperature_schedule_from_pydict(
     schedule: Option<&Bound<'_, PyDict>>,
@@ -8071,6 +8081,15 @@ fn build_sae_basis_evaluators(
         let evaluator: Arc<dyn SaeBasisEvaluator> = match &basis_kinds[k] {
             SaeAtomBasisKind::Periodic if d == 1 && m % 2 == 1 => {
                 Arc::new(PeriodicHarmonicEvaluator::new(m)?)
+            }
+            SaeAtomBasisKind::Sphere if d == 2 && m == SAE_SPHERE_BASIS_SIZE => {
+                Arc::new(SphereChartEvaluator)
+            }
+            SaeAtomBasisKind::Torus if d >= 1 => {
+                // Recover the per-axis harmonic count `H` from `m = (2H+1)^d`.
+                let axis_m = sae_torus_axis_basis_size(m, d)?;
+                let h = (axis_m - 1) / 2;
+                Arc::new(TorusHarmonicEvaluator::new(d, h)?)
             }
             _ => {
                 let phi = basis_values.slice(s![k, 0..n_obs, 0..m]).to_owned();
@@ -8709,6 +8728,67 @@ fn sae_pca_seed_initial_coords(
                     }
                 }
             }
+            SaeAtomBasisKind::Sphere => {
+                // Seed the sphere chart from the top-3 PCs: drop the centred
+                // response onto (pc0, pc1, pc2), unit-normalise, and read off
+                // (lat, lon). This places every row on the chart with
+                // `lat ∈ (-π/2, π/2)` and `lon ∈ (-π, π]`.
+                let n_pc = vt_rows.min(3);
+                if n_pc == 0 {
+                    continue;
+                }
+                let pcs: Vec<_> = (0..n_pc).map(|i| vt.row(i)).collect();
+                for row in 0..n_obs {
+                    let mut amb = [0.0_f64; 3];
+                    for (i, pc) in pcs.iter().enumerate() {
+                        let mut acc = 0.0_f64;
+                        for col in 0..centered.ncols() {
+                            acc += centered[[row, col]] * pc[col];
+                        }
+                        amb[i] = acc;
+                    }
+                    let norm = (amb[0] * amb[0] + amb[1] * amb[1] + amb[2] * amb[2]).sqrt();
+                    let (x, y, z) = if norm > 0.0 {
+                        (amb[0] / norm, amb[1] / norm, amb[2] / norm)
+                    } else {
+                        (1.0, 0.0, 0.0)
+                    };
+                    let lat = z.clamp(-1.0, 1.0).asin();
+                    let lon = y.atan2(x);
+                    if d >= 1 {
+                        out[[atom_idx, row, 0]] = lat;
+                    }
+                    if d >= 2 {
+                        out[[atom_idx, row, 1]] = lon;
+                    }
+                }
+            }
+            SaeAtomBasisKind::Torus => {
+                // Seed each torus axis from a disjoint pair of PCs: axis `a`
+                // uses (pc_{2a}, pc_{2a+1}) projected onto the centred
+                // response and read off as `atan2`, normalised to `[0, 1)`.
+                for axis in 0..d {
+                    let pc_a_idx = 2 * axis;
+                    let pc_b_idx = 2 * axis + 1;
+                    if pc_b_idx >= vt_rows {
+                        break;
+                    }
+                    let pc_a = vt.row(pc_a_idx);
+                    let pc_b = vt.row(pc_b_idx);
+                    for row in 0..n_obs {
+                        let mut a = 0.0_f64;
+                        let mut b = 0.0_f64;
+                        for col in 0..centered.ncols() {
+                            a += centered[[row, col]] * pc_a[col];
+                            b += centered[[row, col]] * pc_b[col];
+                        }
+                        // atan2 ∈ (-π, π]; map to phase ∈ [0, 1).
+                        let phase = b.atan2(a) / two_pi;
+                        let wrapped = phase - phase.floor();
+                        out[[atom_idx, row, axis]] = wrapped;
+                    }
+                }
+            }
             _ => {
                 let k_cols = d.min(u_cols).min(s_vals.len());
                 let mut tmp = Array2::<f64>::zeros((n_obs, d));
@@ -8960,6 +9040,113 @@ fn sae_build_periodic_atom(
             phi[[row, cos_col]] = cos_value;
             jet[[row, sin_col, 0]] = frequency * cos_value;
             jet[[row, cos_col, 0]] = -frequency * sin_value;
+        }
+    }
+    Ok((phi, jet, penalty))
+}
+
+/// Compute the per-axis basis size `axis_m = (m)^(1/d)` for a torus atom and
+/// verify that `m = axis_m^d` with `axis_m` odd (i.e. `2H+1`). Returns
+/// `axis_m`.
+fn sae_torus_axis_basis_size(m: usize, d: usize) -> Result<usize, String> {
+    if d == 0 {
+        return Err("sae_torus_axis_basis_size: d must be >= 1".to_string());
+    }
+    if m == 0 {
+        return Err("sae_torus_axis_basis_size: m must be >= 1".to_string());
+    }
+    // Integer d-th root via search; m is small (`<= 4096^d` in practice).
+    let mut axis_m: usize = 1;
+    loop {
+        let mut prod: usize = 1;
+        let mut overflow = false;
+        for _ in 0..d {
+            match prod.checked_mul(axis_m) {
+                Some(p) => prod = p,
+                None => {
+                    overflow = true;
+                    break;
+                }
+            }
+        }
+        if overflow || prod > m {
+            return Err(format!(
+                "sae_torus_axis_basis_size: m={m} is not a perfect d-th power for d={d}"
+            ));
+        }
+        if prod == m {
+            if axis_m % 2 == 0 {
+                return Err(format!(
+                    "sae_torus_axis_basis_size: m={m} = {axis_m}^{d} but axis size must be odd (2H+1)"
+                ));
+            }
+            return Ok(axis_m);
+        }
+        axis_m += 1;
+    }
+}
+
+/// Build (phi, jet, penalty) for a sphere atom via the (lat, lon) chart
+/// evaluator. The penalty is identity on the six non-constant basis
+/// functions (the constant column gets a 1e-8 floor so the (M,M) block stays
+/// strictly positive on the constant subspace).
+fn sae_build_sphere_atom(
+    coords: ArrayView2<'_, f64>,
+) -> Result<(Array2<f64>, Array3<f64>, Array2<f64>), String> {
+    let (phi, jet) = SphereChartEvaluator.evaluate(coords)?;
+    let m = phi.ncols();
+    let mut penalty = Array2::<f64>::zeros((m, m));
+    penalty[[0, 0]] = 1.0e-8;
+    for i in 1..m {
+        penalty[[i, i]] = 1.0;
+    }
+    Ok((phi, jet, penalty))
+}
+
+/// Build (phi, jet, penalty) for a torus atom via the tensor-product
+/// periodic harmonic evaluator. Penalty diagonal encodes the squared
+/// Laplace–Beltrami eigenvalue
+/// `((2π)^2 · Σ_a h_a^2)^2` so the smoothness term penalises high-frequency
+/// modes — same shape as the 1-D periodic harmonic penalty
+/// (`(2π·h)^4` reduces to `h^4` up to a constant), generalised to T^d.
+fn sae_build_torus_atom(
+    coords: ArrayView2<'_, f64>,
+    latent_dim: usize,
+    num_harmonics: usize,
+) -> Result<(Array2<f64>, Array3<f64>, Array2<f64>), String> {
+    let evaluator = TorusHarmonicEvaluator::new(latent_dim, num_harmonics)?;
+    let (phi, jet) = evaluator.evaluate(coords)?;
+    let axis_m = evaluator.axis_basis_size();
+    let m = phi.ncols();
+    let mut penalty = Array2::<f64>::zeros((m, m));
+    // Decode axis index `idx_axis ∈ {0..axis_m}` → harmonic number `h`:
+    // 0 → 0 (constant), 1 → 1 (sin), 2 → 1 (cos), 3 → 2, 4 → 2, …
+    let axis_harmonic = |idx_axis: usize| -> usize {
+        if idx_axis == 0 {
+            0
+        } else {
+            idx_axis.div_ceil(2)
+        }
+    };
+    let mut idx = vec![0usize; latent_dim];
+    for flat in 0..m {
+        let mut h_sum_sq: usize = 0;
+        for axis in 0..latent_dim {
+            let h = axis_harmonic(idx[axis]);
+            h_sum_sq += h * h;
+        }
+        let lambda = if h_sum_sq == 0 {
+            1.0e-8
+        } else {
+            (h_sum_sq as f64).powi(2)
+        };
+        penalty[[flat, flat]] = lambda;
+        for axis in (0..latent_dim).rev() {
+            idx[axis] += 1;
+            if idx[axis] < axis_m {
+                break;
+            }
+            idx[axis] = 0;
         }
     }
     Ok((phi, jet, penalty))
