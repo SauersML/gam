@@ -552,7 +552,16 @@ pub enum LinearCoefficientGeometry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LinearTermSpec {
     pub name: String,
+    /// Primary feature column index. For Wilkinson-Rogers `:` interaction
+    /// terms (`a:b[:c...]`) this is the first column in `feature_cols`; the
+    /// realized design column is the elementwise product across every entry
+    /// of `feature_cols`. Plain (non-interaction) linear terms set
+    /// `feature_cols == vec![feature_col]`.
     pub feature_col: usize,
+    /// Full list of columns whose elementwise product yields this term's
+    /// design column. `len() >= 1`; `len() == 1` is a plain linear effect.
+    #[serde(default)]
+    pub feature_cols: Vec<usize>,
     /// Default ridge penalty on this linear coefficient.
     /// Non-intercept linear terms are penalized by default; set false only to
     /// opt into an explicitly unpenalized parametric effect.
@@ -564,6 +573,23 @@ pub struct LinearTermSpec {
     pub coefficient_min: Option<f64>,
     #[serde(default)]
     pub coefficient_max: Option<f64>,
+}
+
+impl LinearTermSpec {
+    /// Return the effective list of feature columns. Backfills from
+    /// `feature_col` for legacy specs that predate the multi-column field.
+    pub fn effective_feature_cols(&self) -> Vec<usize> {
+        if self.feature_cols.is_empty() {
+            vec![self.feature_col]
+        } else {
+            self.feature_cols.clone()
+        }
+    }
+
+    /// True when this term is a Wilkinson-Rogers `:` interaction (multi-col).
+    pub fn is_interaction(&self) -> bool {
+        self.feature_cols.len() > 1
+    }
 }
 
 const fn default_linear_term_double_penalty() -> bool {
@@ -17282,20 +17308,28 @@ fn build_term_collection_fixed_blocks(
 
     if !spec.linear_terms.is_empty() {
         for linear in &spec.linear_terms {
-            if linear.feature_col >= data.ncols() {
-                return Err(BasisError::DimensionMismatch(format!(
-                    "linear term '{}' feature column {} out of bounds for {} columns",
-                    linear.name,
-                    linear.feature_col,
-                    data.ncols()
-                )));
+            for &col in &linear.effective_feature_cols() {
+                if col >= data.ncols() {
+                    return Err(BasisError::DimensionMismatch(format!(
+                        "linear term '{}' feature column {} out of bounds for {} columns",
+                        linear.name,
+                        col,
+                        data.ncols()
+                    )));
+                }
             }
         }
         let mut linear_block = Array2::<f64>::zeros((data.nrows(), spec.linear_terms.len()));
         for (j, linear) in spec.linear_terms.iter().enumerate() {
-            linear_block
-                .column_mut(j)
-                .assign(&data.column(linear.feature_col));
+            let cols = linear.effective_feature_cols();
+            let mut col_view = linear_block.column_mut(j);
+            col_view.assign(&data.column(cols[0]));
+            for &c in cols.iter().skip(1) {
+                let factor = data.column(c);
+                for (out, &x) in col_view.iter_mut().zip(factor.iter()) {
+                    *out *= x;
+                }
+            }
         }
         blocks.push(DesignBlock::Dense(crate::matrix::DenseDesignMatrix::from(
             linear_block,
