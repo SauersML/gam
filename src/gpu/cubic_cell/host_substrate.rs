@@ -23,7 +23,7 @@ use crate::families::cubic_cell_kernel::{
 };
 use crate::gpu::cubic_cell::branch::classify_cell_for_gpu;
 use crate::gpu::cubic_cell::{
-    CubicCellDerivativeMomentHostView, CubicCellMomentMode, CubicCellMomentStatus,
+    CubicCellDerivativeMomentHostView, CubicCellMomentStatus,
     GpuCellBranchTag,
 };
 
@@ -117,7 +117,7 @@ mod tests {
         DenestedCubicCell, evaluate_cell_derivative_moments_uncached,
     };
     use crate::gpu::cubic_cell::{
-        CubicCellDerivativeMomentHostView, CubicCellMomentMode, CubicCellMomentResidency,
+        CubicCellDerivativeMomentHostView, CubicCellMomentResidency,
         GpuCellBranchTag, GpuDenestedCubicCell,
     };
 
@@ -167,7 +167,6 @@ mod tests {
             cells: std::slice::from_ref(&gpu),
             branches: &branches,
             max_degree: 9,
-            mode: CubicCellMomentMode::DerivativeOnly,
             residency: CubicCellMomentResidency::Host,
         };
         let out = build_host_moments(&view).expect("host substrate");
@@ -191,7 +190,6 @@ mod tests {
             cells: std::slice::from_ref(&gpu),
             branches: &branches,
             max_degree: 21,
-            mode: CubicCellMomentMode::DerivativeOnly,
             residency: CubicCellMomentResidency::Host,
         };
         let out = build_host_moments(&view).expect("host substrate");
@@ -215,7 +213,6 @@ mod tests {
             cells: std::slice::from_ref(&gpu),
             branches: &branches,
             max_degree: 15,
-            mode: CubicCellMomentMode::DerivativeOnly,
             residency: CubicCellMomentResidency::Host,
         };
         let out = build_host_moments(&view).expect("host substrate");
@@ -239,7 +236,6 @@ mod tests {
             cells: std::slice::from_ref(&gpu),
             branches: &branches,
             max_degree: 9,
-            mode: CubicCellMomentMode::DerivativeOnly,
             residency: CubicCellMomentResidency::Host,
         };
         let out = build_host_moments(&view).expect("host substrate");
@@ -262,7 +258,6 @@ mod tests {
             cells: std::slice::from_ref(&gpu),
             branches: &branches,
             max_degree: 9,
-            mode: CubicCellMomentMode::DerivativeOnly,
             residency: CubicCellMomentResidency::Host,
         };
         let out = build_host_moments(&view).expect("host substrate");
@@ -350,8 +345,7 @@ mod tests {
                 cells: &cells_gpu,
                 branches: &branches,
                 max_degree,
-                mode: CubicCellMomentMode::DerivativeOnly,
-                residency: CubicCellMomentResidency::Host,
+                    residency: CubicCellMomentResidency::Host,
             };
             let out = build_host_moments(&view).expect("host substrate");
             assert_eq!(out.stride, max_degree + 1);
@@ -389,7 +383,6 @@ mod tests {
             cells: std::slice::from_ref(&gpu),
             branches: &branches,
             max_degree: 9,
-            mode: CubicCellMomentMode::DerivativeOnly,
             residency: CubicCellMomentResidency::Host,
         };
         let out = build_host_moments(&view).expect("host substrate");

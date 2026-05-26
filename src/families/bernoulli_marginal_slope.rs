@@ -8326,7 +8326,7 @@ impl BernoulliMarginalSlopeFamily {
         #[cfg(debug_assertions)]
         {
             use crate::gpu::cubic_cell::{
-                CubicCellDerivativeMomentHostView, CubicCellMomentMode,
+                CubicCellDerivativeMomentHostView,
                 CubicCellMomentResidency, GpuCellBranchTag, GpuDenestedCubicCell,
                 try_build_cubic_cell_derivative_moments,
             };
@@ -8361,7 +8361,6 @@ impl BernoulliMarginalSlopeFamily {
                     cells: &sample_cells,
                     branches: &sample_branches,
                     max_degree,
-                    mode: CubicCellMomentMode::DerivativeOnly,
                     residency: CubicCellMomentResidency::Host,
                 };
                 match try_build_cubic_cell_derivative_moments(view) {
@@ -8373,21 +8372,7 @@ impl BernoulliMarginalSlopeFamily {
                             moments: sub_moments,
                             status: sub_status,
                             stride,
-                        } = output
-                        else {
-                            // SAFETY: parity guard runs under
-                            // `cfg(debug_assertions)` and the substrate's
-                            // `CubicCellMomentResidency::Host` contract
-                            // requires a `Host { … }` output for a Host
-                            // request. A non-Host return here is a
-                            // contract violation, not a recoverable
-                            // condition — surface it loudly in debug
-                            // builds so the divergence is caught at the
-                            // first fit, not silently masked.
-                            panic!(
-                                "BMS row-cell-moments parity: substrate returned non-Host output for Host residency request"
-                            );
-                        };
+                        } = output;
                         assert_eq!(stride, max_degree + 1);
                         assert_eq!(sub_status.len(), sample_cells.len());
                         for (i, cpu_row) in sample_cpu_moments.iter().enumerate() {

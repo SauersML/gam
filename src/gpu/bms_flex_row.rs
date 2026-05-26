@@ -98,7 +98,9 @@ use cudarc::driver::{CudaModule, CudaStream, LaunchConfig, PushKernelArg};
 pub(crate) const MAX_R: usize = 32;
 
 /// `blockDim.x` for the row kernel. Threads of a row-block parallelise the
-/// per-cell loop; thread 0 of the block finalises the IFT solve.
+/// per-cell loop; thread 0 of the block finalises the IFT solve. Linux-only
+/// because the kernel launcher that consumes it is Linux-only.
+#[cfg(target_os = "linux")]
 pub(crate) const ROW_KERNEL_THREADS: u32 = 32;
 
 /// Number of cubic predictor coefficients per cell (`C0..C3`) and the matching
