@@ -238,11 +238,16 @@ def sphere_basis(
     penalty_order: int = 2,
     kernel: str = "sobolev",
     radians: bool = False,
+    centers: Any = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build the spherical-spline (S²) design and penalty matrices.
 
     Forward-only: there is no analytic VJP through ``points``. The
     returned tensors are detached float64 copies on ``points``' device.
+
+    When ``centers`` is supplied (the descriptor path), the basis
+    dimension is fixed by ``centers.shape[0]`` and is independent of the
+    number of rows in ``points``.
 
     Parameters
     ----------
@@ -252,18 +257,34 @@ def sphere_basis(
     penalty_order : roughness order ``m ∈ {1, 2, 3, 4}``. Default ``2``.
     kernel : one of ``'sobolev'``, ``'pseudo'``, ``'harmonic'``.
     radians : default ``False`` (degrees). True for radians.
+    centers : optional ``(K, 2)`` array of pre-resolved centers.
 
     Returns
     -------
     (design (N, K), penalty (K, K)) as float64 torch tensors.
     """
-    design_np, penalty_np = _api.sphere_basis(
-        to_numpy_f64(points),
-        int(n_centers),
-        penalty_order=int(penalty_order),
-        kernel=str(kernel),
-        radians=bool(radians),
-    )
+    import numpy as np
+
+    pts_np = to_numpy_f64(points)
+    if centers is None:
+        design_np, penalty_np = _api.sphere_basis(
+            pts_np,
+            int(n_centers),
+            penalty_order=int(penalty_order),
+            kernel=str(kernel),
+            radians=bool(radians),
+        )
+    else:
+        ctrs_np = np.ascontiguousarray(
+            np.asarray(centers, dtype=np.float64)
+        )
+        design_np, penalty_np = _api.rust_module().sphere_basis_with_centers(
+            pts_np,
+            ctrs_np,
+            int(penalty_order),
+            str(kernel),
+            bool(radians),
+        )
     design = from_numpy_like(design_np, points).to(torch.float64)
     penalty = from_numpy_like(penalty_np, points).to(torch.float64)
     return design, penalty

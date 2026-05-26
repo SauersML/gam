@@ -72,7 +72,8 @@ use gam::smooth::{
 use gam::solver::reml_compare::{RemlCandidate, compare_reml_fits as compare_reml_fits_core};
 use gam::survival_marginal_slope::SurvivalMarginalSlopeFitResult;
 use gam::terms::basis::{
-    BasisOptions, CenterStrategy, Dense, DuchonBasisSpec, DuchonNullspaceOrder, MaternBasisSpec,
+    BasisOptions, CenterStrategy, Dense, DuchonBasisSpec, DuchonNullspaceOrder,
+    DuchonOperatorPenaltySpec, MaternBasisSpec, OperatorPenaltySpec,
     MaternIdentifiability, MaternNu, OneDimensionalBoundary, PeriodicBSplineBasisSpec,
     SpatialIdentifiability, SphereMethod, SphereWahbaKernel, SphericalSplineBasisSpec,
     SplineScratch, auto_centers_1d_equal_mass, auto_knot_vector_1d_quantile,
@@ -3031,17 +3032,29 @@ fn duchon_basis<'py>(
         )));
     }
     let any_periodic = periodic_flags.iter().any(|&b| b);
-    // Preserve the pre-change default path bit-for-bit when no hybrid /
-    // explicit-order keyword is supplied: `length_scale=None`,
-    // `power=0.0`, and `nullspace_order = duchon_nullspace_from_m(m)`.
-    // When any of the three new keywords is set, route through the
-    // shared hybrid resolver (matches the formula API).
-    let hybrid_requested = length_scale.is_some() || nullspace_order.is_some() || power.is_some();
-    let (spec_length_scale, spec_nullspace, spec_power) = if hybrid_requested {
-        let cfg = resolve_duchon_hybrid_config(d, m, length_scale, nullspace_order, power)?;
-        (cfg.length_scale, cfg.nullspace_order, cfg.power)
-    } else {
-        (None, duchon_nullspace_from_m(m), 0.0)
+    // Basis-only PyFFI: the returned object is just the (N, K) design
+    // matrix; no operator penalty crosses the FFI. The downstream basis
+    // builder needs only kernel-existence (`2(p+s) > d`) and — in the
+    // pure-Duchon case — the CPD/nullspace adequacy guard (`2s < d`).
+    // D1 / D2 collocation are *not* required here, so resolve with
+    // ``max_op = 0`` and construct the spec with all three operator
+    // penalties Disabled. This makes documented defaults (e.g. d=2 m=2
+    // thin-plate, d=3 m=2 generalized TPS) succeed without forcing the
+    // caller to pass ``power`` / ``nullspace_order`` themselves.
+    let cfg = resolve_duchon_hybrid_config(
+        d,
+        m,
+        length_scale,
+        nullspace_order,
+        power,
+        /* max_op = */ 0,
+    )?;
+    let (spec_length_scale, spec_nullspace, spec_power) =
+        (cfg.length_scale, cfg.nullspace_order, cfg.power);
+    let basis_only_operator_penalties = DuchonOperatorPenaltySpec {
+        mass: OperatorPenaltySpec::Disabled,
+        tension: OperatorPenaltySpec::Disabled,
+        stiffness: OperatorPenaltySpec::Disabled,
     };
     // Any periodic axis (1D or multi-D) routes through the mixed-periodicity
     // builder (cylinder/torus chord-distance polyharmonic).
@@ -3053,7 +3066,7 @@ fn duchon_basis<'py>(
             nullspace_order: spec_nullspace,
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
-            operator_penalties: Default::default(),
+            operator_penalties: basis_only_operator_penalties.clone(),
             periodic: None,
             boundary: OneDimensionalBoundary::Open,
         };
@@ -3068,7 +3081,7 @@ fn duchon_basis<'py>(
         nullspace_order: spec_nullspace,
         identifiability: SpatialIdentifiability::None,
         aniso_log_scales: None,
-        operator_penalties: Default::default(),
+        operator_penalties: basis_only_operator_penalties,
         periodic: None,
         boundary: OneDimensionalBoundary::Open,
     };
@@ -3237,7 +3250,14 @@ fn duchon_function_norm_penalty<'py>(
     // keywords is set, route through the shared hybrid resolver.
     let hybrid_requested = length_scale.is_some() || nullspace_order.is_some() || power.is_some();
     let (spec_length_scale, spec_nullspace, spec_power) = if hybrid_requested {
-        let cfg = resolve_duchon_hybrid_config(d, m, length_scale, nullspace_order, power)?;
+        let cfg = resolve_duchon_hybrid_config(
+            d,
+            m,
+            length_scale,
+            nullspace_order,
+            power,
+            /* max_op = */ 2,
+        )?;
         (cfg.length_scale, cfg.nullspace_order, cfg.power)
     } else {
         (None, duchon_nullspace_from_m(m), 0.0)

@@ -47,7 +47,7 @@ descriptor does NOT silently fall back.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Sequence
+from typing import TYPE_CHECKING, Any, ClassVar, Sequence
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     import torch as _torch_t
