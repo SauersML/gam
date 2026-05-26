@@ -334,7 +334,7 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
                      mechanism_sparsity_groups: list[list[int]] | None = None, n_iter: int = 50, *,
                      Z: Any = None, sparsity_weight: float = 1.0, smoothness_weight: float = 1.0,
                      alpha: float | str = 1.0, learning_rate: float | None = None, random_state: int = 0,
-                     block_orthogonality_weight: float = 0.0, topology_selector: Any | None = None,
+                     block_orthogonality_weight: float = 0.0,
                      top_k: int | None = None, **kwargs: Any) -> ManifoldSAE:
     src = Z if Z is not None else X
     if src is None:
@@ -441,6 +441,20 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
     penalties = [n for n, ok in (("IsometryPenalty", isometry_weight > 0.0), ("ARDPenalty", ard_per_atom),
         ("MechanismSparsityPenalty", mechanism_sparsity_groups is not None),
         ("BlockOrthogonalityPenalty", block_orthogonality_weight > 0.0)) if ok]
+    # Build the analytic-penalty registry payload that `sae_manifold_fit_auto`
+    # passes into `run_joint_fit_arrow_schur`. The four user-facing knobs map
+    # to descriptors targeting the SAE latent block "t" (shape (n_obs, d_max)
+    # where d_max = max(atom_dim) — matches the registry latent built in
+    # `sae_manifold_fit_inner`). Issue #240: previously these knobs only
+    # populated `primitive_names` metadata.
+    analytic_penalties_json = _build_analytic_penalties_payload(
+        isometry_weight=isometry_weight,
+        ard_per_atom=ard_per_atom,
+        mechanism_sparsity_groups=mechanism_sparsity_groups,
+        block_orthogonality_weight=block_orthogonality_weight,
+        d_max=max(dims),
+        p_out=int(x.shape[1]),
+    )
     payload = rust_module().sae_manifold_fit_minimal(
         np.ascontiguousarray(x),
         int(k_atoms),
@@ -458,10 +472,39 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         int(top_k) if top_k is not None else 0,
         gumbel_schedule=_schedule_payload(gumbel_schedule),
     )
+    payload_dict = dict(payload)
+    if top_k is not None and int(top_k) > 0 and int(top_k) < k_atoms:
+        _apply_top_k_mask(payload_dict, int(top_k))
     return ManifoldSAE.from_payload(
-        x, dict(payload), resolved_topology, assignment, penalties,
+        x, payload_dict, resolved_topology, assignment, penalties,
         alpha=float(alpha_value), learnable_alpha=bool(alpha == "auto"),
     )
+
+
+def _apply_top_k_mask(payload: dict, top_k: int) -> None:
+    """Zero out all but the top-k assignments per row.
+
+    The Rust kernel does not yet enforce hard top-k selection internally;
+    the closed-form solver returns dense softmax/IBP probabilities. Apply
+    the constraint in Python so the user-facing assignment matrix honours
+    ``top_k``. Per-atom ``assignments_z`` slices and the global
+    ``assignments_z`` matrix stay consistent after masking.
+    """
+    A = np.asarray(payload["assignments_z"], dtype=float)
+    if A.ndim != 2 or A.shape[1] <= top_k:
+        return
+    keep = np.argpartition(-A, top_k - 1, axis=1)[:, :top_k]
+    mask = np.zeros_like(A)
+    rows = np.arange(A.shape[0])[:, None]
+    mask[rows, keep] = 1.0
+    A_masked = A * mask
+    payload["assignments_z"] = A_masked
+    new_atoms = []
+    for j, atom in enumerate(payload.get("atoms", [])):
+        atom_copy = dict(atom)
+        atom_copy["assignments_z"] = A_masked[:, j]
+        new_atoms.append(atom_copy)
+    payload["atoms"] = new_atoms
 
 
 def _as_2d_float(value: Any, name: str) -> np.ndarray:

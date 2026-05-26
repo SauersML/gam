@@ -753,6 +753,8 @@ class ManifoldSAE(nn.Module):
         kwargs: dict[str, Any] = {}
         if learning_rate is not None:
             kwargs["learning_rate"] = float(learning_rate)
+        if cfg.sparsity.target_k is not None:
+            kwargs["top_k"] = int(cfg.sparsity.target_k)
         fit = _closed_form_sae_manifold_fit(
             Z=to_numpy_f64(x),
             n_atoms=int(cfg.n_atoms),
