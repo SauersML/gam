@@ -3984,17 +3984,21 @@ mod tests {
 
             let warmup: usize = 3;
             let iters: usize = 20;
-            // Warm up: compile / cache kernels, populate L2.
+            // Warm up: compile / cache kernels, populate L2. `assert_eq!` on
+            // the result length keeps the value live (so the optimizer cannot
+            // strip the launch) without a `let _` binding.
             for _ in 0..warmup {
-                let _ = launch_bms_flex_row_hvp(&storage, &v)
+                let out = launch_bms_flex_row_hvp(&storage, &v)
                     .expect("warmup full HVP must launch");
+                assert_eq!(out.len(), p_total);
             }
             let mut full_times_us: Vec<u128> = Vec::with_capacity(iters);
             for _ in 0..iters {
                 let t0 = std::time::Instant::now();
-                let _ = launch_bms_flex_row_hvp(&storage, &v)
+                let out = launch_bms_flex_row_hvp(&storage, &v)
                     .expect("full HVP must launch");
                 full_times_us.push(t0.elapsed().as_micros());
+                assert_eq!(out.len(), p_total);
             }
             full_times_us.sort_unstable();
             let full_median_us = full_times_us[iters / 2];
@@ -4004,15 +4008,17 @@ mod tests {
                 .expect("repack_upper must succeed at biobank shape");
             assert_eq!(storage.layout, RowHessianLayout::SymmetricPackedUpper);
             for _ in 0..warmup {
-                let _ = launch_bms_flex_row_hvp(&storage, &v)
+                let out = launch_bms_flex_row_hvp(&storage, &v)
                     .expect("warmup packed HVP must launch");
+                assert_eq!(out.len(), p_total);
             }
             let mut packed_times_us: Vec<u128> = Vec::with_capacity(iters);
             for _ in 0..iters {
                 let t0 = std::time::Instant::now();
-                let _ = launch_bms_flex_row_hvp(&storage, &v)
+                let out = launch_bms_flex_row_hvp(&storage, &v)
                     .expect("packed HVP must launch");
                 packed_times_us.push(t0.elapsed().as_micros());
+                assert_eq!(out.len(), p_total);
             }
             packed_times_us.sort_unstable();
             let packed_median_us = packed_times_us[iters / 2];

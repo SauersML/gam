@@ -16767,6 +16767,19 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
                 &self.auto_subsample_last_rho,
                 BMS_AUTO_SUBSAMPLE_PHASE1_BUDGET,
                 "BMS",
+                // Per-K work-unit cost for the BMS outer gradient kernel.
+                // BMS uses a Polya–Gamma augmentation with a per-row
+                // pseudo-Bernoulli factorisation that is materially cheaper
+                // than the survival marginal-slope risk-set scan. Empirical
+                // cost is ~50_000 units per K-unit at biobank scale, which
+                // with `AUTO_OUTER_WORK_BUDGET = 5×10⁸` caps
+                //   K_work ≈ 5e8 / 50_000 = 10_000,
+                // matching the existing default `min_k = 10_000` and so
+                // never binding tighter than the noise rule in current
+                // production configurations — the cap exists to guard
+                // against pathological per-row cost regressions, not to
+                // change today's nominal K.
+                50_000,
             ) {
                 Some(cloned) => {
                     owned_options = cloned;
