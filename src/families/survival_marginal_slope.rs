@@ -118,11 +118,6 @@ pub enum SurvivalMarginalSlopeError {
     /// flattened in order. `alias_directions` is the `(p_joint × k)`
     /// matrix whose columns are the offending right singular vectors
     /// in the joint column ordering.
-    JointRankDeficient {
-        reason: String,
-        columns: Vec<(JointPreflightBlock, usize, f64)>,
-        alias_directions: Array2<f64>,
-    },
 }
 
 /// Block tag used by the joint training-row preflight diagnostic.
@@ -17881,14 +17876,9 @@ pub(crate) fn joint_training_design_preflight(
 
     let structural_alias = p_joint.saturating_sub(sigma.len());
 
-    let mut alias_directions = Array2::<f64>::zeros((p_joint, alias_idx.len()));
     let mut columns: Vec<(JointPreflightBlock, usize, f64)> = Vec::new();
-    for (out_col, &idx) in alias_idx.iter().enumerate() {
+    for &idx in alias_idx.iter() {
         let v_row = vt.row(idx);
-        let mut col = alias_directions.column_mut(out_col);
-        for j in 0..p_joint {
-            col[j] = v_row[j];
-        }
         let mut best_j = 0usize;
         let mut best_w = 0.0_f64;
         for j in 0..p_joint {
@@ -17921,26 +17911,24 @@ pub(crate) fn joint_training_design_preflight(
         .map(|(b, c, w)| format!("{b}[{c}] (|v|={w:.3e})"))
         .collect::<Vec<_>>()
         .join("; ");
-    let reason = format!(
-        "joint training-row design is W-metric rank-deficient: rank={rank}/{p_joint} \
-         (sigma_max={sigma_max:.3e}, rank_tol={rank_tol:.3e}, n={n}, structural_alias={structural_alias}, \
-         alias_directions={alias_count}). Block layout: {block_summary}. \
-         Dominant block x column per alias: {dominant_summary}. \
-         Per-block cross-block identifiability reparam already ran; the surviving alias \
-         must come from the anchor union {{time, marginal, logslope}} itself being \
-         rank-deficient (most often duplicated low-order polynomial null spaces across \
-         marginal and logslope smooths, or a parametric term in `marginalspec` that the \
-         time block already reproduces) - OR the per-block W-metric drop tolerance \
-         admitted a direction the joint SVD rejects. Resolve by removing the duplicated \
-         model term or by lowering the offending block's knot count; this is a model-spec \
-         error, not a numerical-tolerance lever to tune.",
+    // Informational: rank deficiency at this point is handled gracefully by
+    // the canonical-gauge pipeline downstream (`canonicalize_for_identifiability`
+    // in `custom_family.rs`). That pipeline runs a joint RRQR audit with
+    // `gauge_priority` attribution and converts attributed alias drops into
+    // per-block selection matrices `T_i`, then solves on reduced specs and
+    // lifts coefficients back via `β_raw = T_i θ`. Aborting here would defeat
+    // the canonical reduction.
+    log::info!(
+        "[survival-marginal-slope/preflight] joint design W-metric rank-deficient: \
+         rank={rank}/{p_joint} (sigma_max={sigma_max:.3e}, rank_tol={rank_tol:.3e}, n={n}, \
+         structural_alias={structural_alias}, alias_directions={alias_count}). \
+         Block layout: {block_summary}. Dominant block x column per alias: {dominant_summary}. \
+         Canonical-gauge pipeline (gauge_priority: time=200, marginal=150, logslope=120, \
+         score_warp=80, link_dev=60) will attribute the alias to lower-priority blocks and \
+         proceed with reduced specs.",
         alias_count = alias_idx.len(),
     );
-    Err(SurvivalMarginalSlopeError::JointRankDeficient {
-        reason,
-        columns,
-        alias_directions,
-    })
+    Ok(())
 }
 
 pub fn fit_survival_marginal_slope_terms(

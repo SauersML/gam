@@ -104,6 +104,129 @@ impl SmoothingCorrectionOutcome {
 /// step refused to produce a usable second-order correction.
 pub static SMOOTHING_CORRECTION_NUMERICAL_FAILURE_COUNT: AtomicU64 = AtomicU64::new(0);
 
+/// Outcome of one sigma-point evaluation: the inverted-Hessian `A_m = H_m⁻¹`
+/// in the original (Qs-mapped) basis, and the original-basis coefficient
+/// vector `b_m = Qs · β̂_transformed`. Both are exactly what
+/// [`accumulate_sigma_cubature_total_covariance`] consumes.
+///
+/// `None` means the sigma point's inner PIRLS fit (or the subsequent Hessian
+/// map / inversion) failed. The caller treats any `None` in the batch as a
+/// cubature-wide numerical failure and falls back to the first-order
+/// correction, identically to the pre-dispatch inline code path.
+pub(crate) type SigmaPointResult = Option<(Array2<f64>, Array1<f64>)>;
+
+/// Predicate: is the device-resident inner PIRLS that the GPU stream-pool
+/// sigma executor needs available in this build/runtime?
+///
+/// Today this returns `false` unconditionally. It flips to `true` exactly
+/// when both of these land:
+///   * `pirls-row-v3` Stage 3 — full GPU PIRLS loop in
+///     [`crate::solver::gpu::pirls_gpu`] (eta → row kernel → XtWX → Cholesky
+///     → linesearch → beta, all device-resident).
+///   * `bms-flex-v3` Phase 5 — device-resident family derivative kernels
+///     the row-by-row inner loop depends on for the row metric / gradient.
+///
+/// The intentional non-flag gate is the only thing standing between the
+/// existing Rayon-CPU loop and the GPU stream-pool path — flipping this
+/// predicate (and pointing it at a real readiness signal those teams
+/// expose) is the documented one-line swap.
+///
+/// We deliberately do not surface a CLI flag, env var, or Cargo feature for
+/// this — magic by default. The predicate inspects only the immutable
+/// build + runtime properties that determine correctness, not user intent.
+#[inline]
+fn device_pirls_stage3_ready() -> bool {
+    // pirls-row-v3 Stage 3 + bms-flex-v3 Phase 5 not yet landed. The GPU
+    // primitives in `solve_pirls_step_on_stream` exist (P2) but they
+    // implement only a *single* Newton step over an already-uploaded X;
+    // the full PIRLS outer loop (re-weight → re-step → linesearch) still
+    // round-trips to the host for each iteration. Until the device-side
+    // loop replaces those host round-trips, the GPU stream-pool path
+    // would be no faster than CPU and would burn upload bandwidth, so we
+    // stay on Rayon.
+    //
+    // When ready, replace the body with `crate::solver::gpu::runtime::
+    // GpuRuntime::global().is_some()` (or whatever finer-grained probe
+    // the device-resident inner PIRLS module exposes).
+    false
+}
+
+/// Sigma-cubature executor dispatch — the swap site between the CPU Rayon
+/// path (today) and the GPU stream-pool path (`pirls-row-v3` Stage 3 +
+/// `bms-flex-v3` Phase 5).
+///
+/// Both branches must return per-sigma `(A_m, b_m)` pairs that the
+/// downstream [`accumulate_sigma_cubature_total_covariance`] consumes
+/// without knowing which executor produced them; that's the contract
+/// `cubature_linear_exactness_recovers_jvjt` pins to f64 round-off.
+///
+/// The selector takes no arguments other than the REML state and sigma
+/// points — magic by default, no flags. When [`device_pirls_stage3_ready`]
+/// flips to `true` the GPU branch fires for every cubature batch where the
+/// problem geometry justifies it; today it stays on the CPU path.
+pub(crate) fn sigma_cubature_dispatch(
+    state: &RemlState<'_>,
+    sigma_points: &[Array1<f64>],
+) -> Vec<SigmaPointResult> {
+    if device_pirls_stage3_ready() {
+        // GPU stream-pool path. Once the predicate above flips, replace
+        // this `unreachable!` with a call into the stream-pool executor
+        // module (sketched signature: `sigma_cubature_streampool::evaluate(
+        // state, sigma_points)`), which:
+        //   1. Uploads X once via
+        //      `crate::solver::gpu::pirls_gpu::upload_shared_pirls_gpu`.
+        //   2. Allocates a pool of `SigmaPirlsGpuWorkspace` (one per
+        //      CUDA stream, fan-out width chosen from `sigma_points.len()`
+        //      and device SM count).
+        //   3. For each sigma point on its own stream, runs the
+        //      device-resident inner PIRLS (the future Stage 3 entry),
+        //      downloads only the `p×p` H and `p`-vector β.
+        //   4. Maps to original basis (`Qs * H * Qsᵀ`, `Qs * β`) on host
+        //      — or, once P6 lands, accumulates on-device and downloads
+        //      only the final correction.
+        //
+        // The CPU fallback below is the parity oracle for that path; any
+        // divergence is a math bug to fix in the GPU executor, not a
+        // tolerance to relax (see feedback_no_weakening_tests_for_perf).
+        unreachable!(
+            "device_pirls_stage3_ready() returned true but the GPU \
+             stream-pool sigma executor has not been wired yet — flip \
+             the predicate together with landing the executor body"
+        );
+    }
+
+    // CPU Rayon path. This is the same loop that lived inline at the
+    // call site before P3 introduced the dispatch boundary; the math is
+    // bit-identical, only the location moved.
+    //
+    // Stateless inner PIRLS (`execute_pirls_stateless_for_cubature`)
+    // performs no PIRLS-cache lookup/insert, no warm-start read/write,
+    // no LM-lambda hint read/write, no adaptive-cap or IFT-quality
+    // feedback writes — so multiple sigma fits run concurrently without
+    // serializing on the shared PIRLS-cache lock and without
+    // contaminating the production outer trajectory's warm-start / LM /
+    // IFT state. This replaces the previous `AtomicFlagGuard`-based
+    // opt-out: process-wide atomic flips were a leaky proxy that still
+    // let writes through (e.g. the adaptive-cap feedback and
+    // last_pirls_lm_lambda paths) and serialized unrelated REML
+    // evaluations racing the cubature window.
+    (0..sigma_points.len())
+        .into_par_iter()
+        .map(|idx| {
+            let fit_point = state
+                .execute_pirls_stateless_for_cubature(&sigma_points[idx])
+                .ok()?;
+            let h_point = map_hessian_to_original_basis(fit_point.as_ref()).ok()?;
+            let cov_point = matrix_inversewith_regularization(&h_point, "auto cubature point")?;
+            let beta_point = fit_point
+                .reparam_result
+                .qs
+                .dot(fit_point.beta_transformed.as_ref());
+            Some((cov_point, beta_point))
+        })
+        .collect()
+}
+
 /// Accumulate the sigma-point cubature total covariance `V̂_p` from per-point
 /// `(A_m, b_m)` pairs.
 ///
