@@ -35,15 +35,6 @@
       "include_sigma": true
     },
     {
-      "name": "r_mgcv_jointpc_duchon60",
-      "dataset": "disease",
-      "backend": "r_mgcv",
-      "family": "binomial",
-      "spatial_basis": "duchon",
-      "centers": 60,
-      "include_sigma": false
-    },
-    {
       "name": "rust_margslope_aniso_duchon16d_linkwiggle_scorewarp_fast",
       "dataset": "disease",
       "backend": "rust_gam",
@@ -74,15 +65,6 @@
       "logslope_linkwiggle_knots": 8,
       "timewiggle_knots": 8,
       "max_centers": 32
-    },
-    {
-      "name": "r_mgcv_survival_jointpc_duchon60",
-      "dataset": "survival",
-      "backend": "r_mgcv_survival",
-      "family": "survival",
-      "spatial_basis": "duchon",
-      "centers": 60,
-      "include_sigma": false
     }
   ]
 }
