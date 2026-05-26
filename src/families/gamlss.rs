@@ -814,6 +814,7 @@ impl ParameterBlockInput {
             nullspace_dims: self.nullspace_dims,
             initial_log_lambdas,
             initial_beta: self.initial_beta,
+gauge_priority: 100,
         })
     }
 }
@@ -2670,6 +2671,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
             nullspace_dims: mean_design.nullspace_dims.clone(),
             initial_log_lambdas: mean_log_lambdas,
             initial_beta: mean_beta_hint,
+gauge_priority: 100,
         };
         let mut noisespec = ParameterBlockSpec {
             name: "log_sigma".to_string(),
@@ -2679,6 +2681,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
             nullspace_dims: noise_design.nullspace_dims.clone(),
             initial_log_lambdas: noise_log_lambdas,
             initial_beta: noise_beta_hint,
+gauge_priority: 100,
         };
         if meanspec.initial_beta.is_none() || noisespec.initial_beta.is_none() {
             let (betamu0, beta_ls0, _) = gaussian_location_scalewarm_start(
@@ -2816,6 +2819,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
             nullspace_dims: vec![],
             initial_log_lambdas: layout.mean_from(theta),
             initial_beta: mean_beta_hint,
+gauge_priority: 100,
         };
         let mut noisespec = ParameterBlockSpec {
             name: "log_sigma".to_string(),
@@ -2825,6 +2829,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
             nullspace_dims: vec![],
             initial_log_lambdas: layout.noise_from(theta),
             initial_beta: noise_beta_hint,
+gauge_priority: 100,
         };
         if meanspec.initial_beta.is_none() || noisespec.initial_beta.is_none() {
             let (betamu0, beta_ls0, _) = gaussian_location_scalewarm_start(
@@ -2876,6 +2881,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
                 nullspace_dims: self.wiggle_block.nullspace_dims.clone(),
                 initial_log_lambdas: layout.wiggle_from(theta),
                 initial_beta: self.wiggle_block.initial_beta.clone(),
+gauge_priority: 100,
             },
         ])
     }
@@ -3001,6 +3007,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleTermBuilder {
             nullspace_dims: vec![],
             initial_log_lambdas: layout.mean_from(theta),
             initial_beta: mean_beta_hint,
+gauge_priority: 100,
         };
         let mut log_sigmaspec = ParameterBlockSpec {
             name: "log_sigma".to_string(),
@@ -3010,6 +3017,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleTermBuilder {
             nullspace_dims: vec![],
             initial_log_lambdas: layout.noise_from(theta),
             initial_beta: noise_beta_hint,
+gauge_priority: 100,
         };
         if thresholdspec.initial_beta.is_none() || log_sigmaspec.initial_beta.is_none() {
             let (beta_t0, beta_ls0) = binomial_location_scalewarm_start(
@@ -3154,6 +3162,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleWiggleTermBuilder {
             nullspace_dims: vec![],
             initial_log_lambdas: layout.mean_from(theta),
             initial_beta: mean_beta_hint,
+gauge_priority: 100,
         };
         let mut log_sigmaspec = ParameterBlockSpec {
             name: "log_sigma".to_string(),
@@ -3163,6 +3172,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleWiggleTermBuilder {
             nullspace_dims: vec![],
             initial_log_lambdas: layout.noise_from(theta),
             initial_beta: noise_beta_hint,
+gauge_priority: 100,
         };
         if thresholdspec.initial_beta.is_none() || log_sigmaspec.initial_beta.is_none() {
             let (beta_t0, beta_ls0) = binomial_location_scalewarm_start(
@@ -3214,6 +3224,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleWiggleTermBuilder {
                 nullspace_dims: vec![],
                 initial_log_lambdas: layout.wiggle_from(theta),
                 initial_beta: self.wiggle_block.initial_beta.clone(),
+gauge_priority: 100,
             },
         ])
     }
@@ -3734,6 +3745,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                 nullspace_dims: vec![],
                 initial_log_lambdas: theta.slice(s![0..eta_penalty_count]).to_owned(),
                 initial_beta: Some(pilot_beta.clone()),
+gauge_priority: 100,
             },
             ParameterBlockSpec {
                 name: "wiggle".to_string(),
@@ -3764,6 +3776,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                 nullspace_dims: vec![],
                 initial_log_lambdas: theta.slice(s![eta_penalty_count..rho_dim]).to_owned(),
                 initial_beta: wiggle_initial_beta.clone(),
+gauge_priority: 100,
             },
         ];
         Ok((resolvedspec, design, blocks, eta_derivs))
@@ -23048,6 +23061,7 @@ mod tests {
                 nullspace_dims: Vec::new(),
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
+gauge_priority: 100,
             },
             ParameterBlockSpec {
                 name: "log_sigma".to_string(),
@@ -23059,6 +23073,7 @@ mod tests {
                 nullspace_dims: Vec::new(),
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
+gauge_priority: 100,
             },
         ];
         let p_total = (p_mu + p_log_sigma) as u64;
@@ -23096,6 +23111,7 @@ mod tests {
                 nullspace_dims: Vec::new(),
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
+gauge_priority: 100,
             },
             ParameterBlockSpec {
                 name: "log_sigma".to_string(),
@@ -23107,6 +23123,7 @@ mod tests {
                 nullspace_dims: Vec::new(),
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
+gauge_priority: 100,
             },
         ];
 
@@ -23199,6 +23216,7 @@ mod tests {
                 nullspace_dims: Vec::new(),
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
+gauge_priority: 100,
             },
             ParameterBlockSpec {
                 name: "log_sigma".to_string(),
@@ -23208,6 +23226,7 @@ mod tests {
                 nullspace_dims: Vec::new(),
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
+gauge_priority: 100,
             },
         ];
         (family, states, specs)
@@ -23266,6 +23285,7 @@ mod tests {
                 nullspace_dims: Vec::new(),
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
+gauge_priority: 100,
             },
             ParameterBlockSpec {
                 name: "log_sigma".to_string(),
@@ -23275,6 +23295,7 @@ mod tests {
                 nullspace_dims: Vec::new(),
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
+gauge_priority: 100,
             },
         ];
         (family, states, specs)
@@ -23599,6 +23620,7 @@ mod tests {
                 nullspace_dims: Vec::new(),
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
+gauge_priority: 100,
             },
             ParameterBlockSpec {
                 name: "log_sigma".to_string(),
@@ -23608,6 +23630,7 @@ mod tests {
                 nullspace_dims: Vec::new(),
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
+gauge_priority: 100,
             },
         ];
         assert!(family.inner_coefficient_hessian_hvp_available(&specs));
@@ -24157,6 +24180,7 @@ mod tests {
                 nullspace_dims: Vec::new(),
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
+gauge_priority: 100,
             },
             ParameterBlockSpec {
                 name: "log_sigma".to_string(),
@@ -24166,6 +24190,7 @@ mod tests {
                 nullspace_dims: Vec::new(),
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
+gauge_priority: 100,
             },
             ParameterBlockSpec {
                 name: "wiggle".to_string(),
@@ -24175,6 +24200,7 @@ mod tests {
                 nullspace_dims: Vec::new(),
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
+gauge_priority: 100,
             },
         ];
 
@@ -24302,6 +24328,7 @@ mod tests {
                 nullspace_dims: Vec::new(),
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
+gauge_priority: 100,
             },
             ParameterBlockSpec {
                 name: "log_sigma".to_string(),
@@ -24311,6 +24338,7 @@ mod tests {
                 nullspace_dims: Vec::new(),
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
+gauge_priority: 100,
             },
             ParameterBlockSpec {
                 name: "wiggle".to_string(),
@@ -24320,6 +24348,7 @@ mod tests {
                 nullspace_dims: Vec::new(),
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
+gauge_priority: 100,
             },
         ];
         (family, states, specs, xt, xls, wiggle_design_current)
@@ -24616,6 +24645,7 @@ mod tests {
                 nullspace_dims: Vec::new(),
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
+gauge_priority: 100,
             },
             ParameterBlockSpec {
                 name: "log_sigma".to_string(),
@@ -24625,6 +24655,7 @@ mod tests {
                 nullspace_dims: Vec::new(),
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
+gauge_priority: 100,
             },
             ParameterBlockSpec {
                 name: "wiggle".to_string(),
@@ -24634,6 +24665,7 @@ mod tests {
                 nullspace_dims: Vec::new(),
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
+gauge_priority: 100,
             },
         ];
 
@@ -24755,6 +24787,7 @@ mod tests {
                 nullspace_dims: Vec::new(),
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
+gauge_priority: 100,
             },
             ParameterBlockSpec {
                 name: "log_sigma".to_string(),
@@ -24764,6 +24797,7 @@ mod tests {
                 nullspace_dims: Vec::new(),
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
+gauge_priority: 100,
             },
             ParameterBlockSpec {
                 name: "wiggle".to_string(),
@@ -24773,6 +24807,7 @@ mod tests {
                 nullspace_dims: Vec::new(),
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
+gauge_priority: 100,
             },
         ];
         (family, states, specs, xmu, xls, xw_at_q0)
@@ -29140,6 +29175,7 @@ mod tests {
                 nullspace_dims: vec![],
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
+gauge_priority: 100,
             },
             ParameterBlockSpec {
                 name: "wiggle".to_string(),
@@ -29149,6 +29185,7 @@ mod tests {
                 nullspace_dims: vec![],
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
+gauge_priority: 100,
             },
         ];
         (family, states, specs, x_eta)
@@ -29259,6 +29296,7 @@ mod tests {
                 nullspace_dims: vec![],
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
+gauge_priority: 100,
             },
             ParameterBlockSpec {
                 name: "wiggle".to_string(),
@@ -29270,6 +29308,7 @@ mod tests {
                 nullspace_dims: vec![],
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
+gauge_priority: 100,
             },
         ];
         assert!(family.inner_coefficient_hessian_hvp_available(&specs));

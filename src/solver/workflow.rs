@@ -1227,6 +1227,7 @@ fn fit_cause_specific_survival_transformation_custom(
             nullspace_dims,
             initial_log_lambdas,
             initial_beta: Some(beta_start),
+gauge_priority: 100,
         });
     }
 

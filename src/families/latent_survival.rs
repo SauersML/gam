@@ -4046,6 +4046,7 @@ mod tests {
                 nullspace_dims: Vec::new(),
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
+gauge_priority: 100,
             })
             .collect()
     }
@@ -4125,6 +4126,7 @@ mod tests {
                 nullspace_dims: Vec::new(),
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
+gauge_priority: 100,
             },
             ParameterBlockSpec {
                 name: "mean".to_string(),
@@ -4137,6 +4139,7 @@ mod tests {
                 nullspace_dims: Vec::new(),
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
+gauge_priority: 100,
             },
             ParameterBlockSpec {
                 name: "log_sigma".to_string(),
@@ -4149,6 +4152,7 @@ mod tests {
                 nullspace_dims: Vec::new(),
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
+gauge_priority: 100,
             },
         ];
         let p_total = p_time + p_mean + p_log_sigma;
