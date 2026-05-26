@@ -3675,6 +3675,24 @@ fn row_primary_closed_form(
     Ok((nll, grad, hess))
 }
 
+/// Crate-visible wrapper around `row_primary_closed_form` so the
+/// identifiability-compiler sibling module
+/// (`survival_marginal_slope_identifiability`) can build its 4×4
+/// `SurvivalRowHessian` without exposing the closed-form kernel publicly.
+pub(crate) fn row_primary_for_compiler(
+    q0: f64,
+    q1: f64,
+    qd1: f64,
+    g: f64,
+    z: f64,
+    w: f64,
+    d: f64,
+    derivative_guard: f64,
+    probit_scale: f64,
+) -> Result<(f64, [f64; N_PRIMARY], [[f64; N_PRIMARY]; N_PRIMARY]), String> {
+    row_primary_closed_form(q0, q1, qd1, g, z, w, d, derivative_guard, probit_scale)
+}
+
 /// Shared-slope multi-z reduction for the rigid 4-primary row calculus.
 ///
 /// When K observed scores share one raw log-slope value `g`, the probit
@@ -13282,6 +13300,23 @@ impl SurvivalMarginalSlopeExactNewtonJointHessianWorkspace {
 }
 
 impl ExactNewtonJointHessianWorkspace for SurvivalMarginalSlopeExactNewtonJointHessianWorkspace {
+    fn joint_log_likelihood_evaluation(&self) -> Result<Option<f64>, String> {
+        // Phase 2d fused-pass result: the same n-row sweep that produced
+        // `joint_hessian_operator` also produced the joint log-likelihood,
+        // so the inner Newton driver reads it from the workspace instead
+        // of running a second full-data evaluation.
+        Ok(Some(self.joint_log_likelihood))
+    }
+
+    fn joint_gradient_evaluation(
+        &self,
+    ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
+        Ok(Some(ExactNewtonJointGradientEvaluation {
+            log_likelihood: self.joint_log_likelihood,
+            gradient: self.joint_gradient.clone(),
+        }))
+    }
+
     fn hessian_dense(&self) -> Result<Option<Array2<f64>>, String> {
         // The operator we already built in `Self::new` carries every block
         // (h_tt, h_mm, h_gg, h_tm, …) of the joint Hessian. Asking the family
