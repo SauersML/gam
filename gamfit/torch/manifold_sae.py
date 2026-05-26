@@ -542,31 +542,32 @@ class ManifoldSAE(nn.Module):
         if not isinstance(cfg, ManifoldSAEConfig):
             raise TypeError("ManifoldSAE expects a ManifoldSAEConfig")
         self.cfg = cfg
+        dt: torch.dtype = cfg.dtype
         D, F, K = int(cfg.input_dim), int(cfg.n_atoms), int(cfg.n_basis_per_atom)
         d = int(cfg.intrinsic_rank)
 
         n_out = F * (d + 1)
         if cfg.encoder_hidden > 0:
             self.encoder: nn.Module = nn.Sequential(
-                nn.Linear(D, int(cfg.encoder_hidden)),
+                nn.Linear(D, int(cfg.encoder_hidden), dtype=dt),
                 nn.GELU(),
-                nn.Linear(int(cfg.encoder_hidden), n_out),
+                nn.Linear(int(cfg.encoder_hidden), n_out, dtype=dt),
             )
         else:
-            self.encoder = nn.Linear(D, n_out)
+            self.encoder = nn.Linear(D, n_out, dtype=dt)
 
-        self.atom_raw_anchor = nn.Parameter(torch.zeros(F, d))
-        self.decoder_blocks = nn.Parameter(torch.empty(F, K, D))
+        self.atom_raw_anchor = nn.Parameter(torch.zeros(F, d, dtype=dt))
+        self.decoder_blocks = nn.Parameter(torch.empty(F, K, D, dtype=dt))
 
         if cfg.atom_basis == "duchon":
             self.register_buffer(
-                "duchon_centers", torch.linspace(0.0, 1.0, K), persistent=True
+                "duchon_centers", torch.linspace(0.0, 1.0, K, dtype=dt), persistent=True
             )
         else:
-            self.register_buffer("duchon_centers", torch.zeros(K), persistent=True)
+            self.register_buffer("duchon_centers", torch.zeros(K, dtype=dt), persistent=True)
 
         self.sparsity = _SparsityLayer(cfg)
-        self.log_lambda = nn.Parameter(torch.zeros(F))
+        self.log_lambda = nn.Parameter(torch.zeros(F, dtype=dt))
 
         # Decoder orthogonality penalty: Rust ``block_orthogonality`` descriptor.
         if cfg.decoder.ortho_weight > 0.0:
@@ -628,6 +629,12 @@ class ManifoldSAE(nn.Module):
         if x.dim() != 2 or x.shape[1] != self.cfg.input_dim:
             raise ValueError(
                 f"ManifoldSAE expected (N, {self.cfg.input_dim}); got {tuple(x.shape)}"
+            )
+        if x.dtype != self.cfg.dtype:
+            raise TypeError(
+                f"ManifoldSAE configured for dtype {self.cfg.dtype}; "
+                f"got input dtype {x.dtype}. Cast the input or build the config "
+                f"with the matching `dtype=` to avoid silent autograd promotion."
             )
         F = int(self.cfg.n_atoms)
         raw_positions, amp_logits = self._encode(x)
