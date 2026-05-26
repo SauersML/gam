@@ -1988,6 +1988,138 @@ pub(crate) fn repack_upper(storage: &mut DeviceResidentRowHess) -> Result<(), Gp
     Ok(())
 }
 
+/// Device-output HVP. Runs `bms_flex_row_hvp_partial(_packed)` +
+/// `bms_flex_row_hvp_reduce` on the storage's stream against caller-supplied
+/// device-resident `d_v` (length `p_total` doubles), writing the result into
+/// caller-supplied `d_out` (also `p_total` doubles). **No** `synchronize()`
+/// or DtoH is performed — the caller is responsible for stream ordering
+/// against any consumer that reads `d_out`.
+///
+/// This is the device-resident PCG hot path (Block 9 Phase 5): keeping the
+/// HVP output on the stream lets the outer PCG loop chain axpy / dot /
+/// preconditioner kernels back-to-back without a per-iter device sync.
+#[cfg(target_os = "linux")]
+pub(crate) fn launch_bms_flex_row_hvp_into_device(
+    storage: &DeviceResidentRowHess,
+    d_v: &CudaSlice<f64>,
+    d_out: &mut CudaSlice<f64>,
+) -> Result<(), GpuError> {
+    let p_total = storage.block.p_total;
+    if d_v.len() != p_total {
+        return Err(GpuError::DriverCallFailed {
+            reason: format!(
+                "bms_flex_row hvp_into_device: d_v.len()={} != p_total={}",
+                d_v.len(),
+                p_total
+            ),
+        });
+    }
+    if d_out.len() != p_total {
+        return Err(GpuError::DriverCallFailed {
+            reason: format!(
+                "bms_flex_row hvp_into_device: d_out.len()={} != p_total={}",
+                d_out.len(),
+                p_total
+            ),
+        });
+    }
+    let backend = HvpKernelBackend::probe()?;
+    let stream = backend.stream.clone();
+    let n = storage.n;
+    let r = storage.r;
+    let num_chunks = num_hvp_chunks(n);
+
+    let mut d_partial = stream
+        .alloc_zeros::<f64>(num_chunks * p_total)
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("bms_flex_row hvp_into_device alloc partial: {err}"),
+        })?;
+
+    let partial_kernel_name = match storage.layout {
+        RowHessianLayout::FullRowMajor => "bms_flex_row_hvp_partial",
+        RowHessianLayout::SymmetricPackedUpper => "bms_flex_row_hvp_partial_packed",
+    };
+    let part_func = backend
+        .module
+        .load_function(partial_kernel_name)
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("bms_flex_row hvp_into_device load {partial_kernel_name}: {err}"),
+        })?;
+    let red_func = backend
+        .module
+        .load_function("bms_flex_row_hvp_reduce")
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("bms_flex_row hvp_into_device load reduce: {err}"),
+        })?;
+
+    let n_i32 = n as i32;
+    let r_i32 = r as i32;
+    let p_m_i32 = storage.block.p_m as i32;
+    let p_g_i32 = storage.block.p_g as i32;
+    let p_total_i32 = p_total as i32;
+    let h_block_start = storage.block.h.as_ref().map(|r| r.start as i32).unwrap_or(0);
+    let h_block_len = storage.block.h.as_ref().map(|r| r.len() as i32).unwrap_or(0);
+    let w_block_start = storage.block.w.as_ref().map(|r| r.start as i32).unwrap_or(0);
+    let w_block_len = storage.block.w.as_ref().map(|r| r.len() as i32).unwrap_or(0);
+    let h_primary_start = storage.primary.h.as_ref().map(|r| r.start as i32).unwrap_or(0);
+    let w_primary_start = storage.primary.w.as_ref().map(|r| r.start as i32).unwrap_or(0);
+    let rows_per_cta = HVP_ROWS_PER_CTA as i32;
+    let num_chunks_u32 = num_chunks as u32;
+
+    let cfg_part = LaunchConfig {
+        grid_dim: (num_chunks_u32, 1, 1),
+        block_dim: (HVP_THREADS, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut builder = stream.launch_builder(&part_func);
+    builder
+        .arg(&n_i32)
+        .arg(&r_i32)
+        .arg(&p_m_i32)
+        .arg(&p_g_i32)
+        .arg(&p_total_i32)
+        .arg(&h_block_start)
+        .arg(&h_block_len)
+        .arg(&w_block_start)
+        .arg(&w_block_len)
+        .arg(&h_primary_start)
+        .arg(&w_primary_start)
+        .arg(&rows_per_cta)
+        .arg(&storage.hess)
+        .arg(&storage.marginal_design)
+        .arg(&storage.logslope_design)
+        .arg(d_v)
+        .arg(&mut d_partial);
+    // SAFETY: storage pointers have validated capacities; d_v / d_out length-
+    // checked above; d_partial sized `num_chunks * p_total`. Scalar args fit i32.
+    unsafe { builder.launch(cfg_part) }.map_err(|err| GpuError::DriverCallFailed {
+        reason: format!("bms_flex_row hvp_into_device partial launch: {err}"),
+    })?;
+
+    let red_threads: u32 = 256;
+    let red_blocks: u32 = ((p_total as u32) + red_threads - 1) / red_threads;
+    let cfg_red = LaunchConfig {
+        grid_dim: (red_blocks, 1, 1),
+        block_dim: (red_threads, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let num_chunks_i32 = num_chunks as i32;
+    let mut builder = stream.launch_builder(&red_func);
+    builder
+        .arg(&num_chunks_i32)
+        .arg(&p_total_i32)
+        .arg(&d_partial)
+        .arg(d_out);
+    // SAFETY: d_partial just populated, d_out length-checked above.
+    unsafe { builder.launch(cfg_red) }.map_err(|err| GpuError::DriverCallFailed {
+        reason: format!("bms_flex_row hvp_into_device reduce launch: {err}"),
+    })?;
+    // d_partial drops at end of fn; cudarc keeps the alloc alive until the
+    // stream is done with it, so the reduce kernel completes safely.
+    drop(d_partial);
+    Ok(())
+}
+
 /// Launch the device-resident HVP kernel. Returns the host-side joint β image
 /// of length `block.p_total`.
 #[cfg(target_os = "linux")]

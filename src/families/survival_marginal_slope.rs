@@ -13023,7 +13023,7 @@ impl SurvivalMarginalSlopeFamily {
             Array1<f64>,
             SurvivalMarginalSlopeDynamicRow,
         );
-        let make_fused: &dyn Fn() -> FusedAcc = &|| {
+        let make_fused = || -> FusedAcc {
             (
                 make_acc(),
                 0.0,
@@ -13097,13 +13097,20 @@ impl SurvivalMarginalSlopeFamily {
                 a.2 += &b.2;
                 Ok(a)
             })?;
-        let (acc, nll, joint_gradient, _ws) = final_acc;
+        // The fourth field (DynRow workspace) is per-thread scratch; the
+        // leftover from the last reducer thread carries no aggregate meaning
+        // and falls out of scope here. The second field accumulates the
+        // *signed* log-likelihood (`state.0 -= row_nll`), mirroring the
+        // sign convention in `evaluate_exact_newton_joint_dynamic_q_dense`.
+        let acc = final_acc.0;
+        let joint_log_likelihood = final_acc.1;
+        let joint_gradient = final_acc.2;
 
         let diagonal = acc.diagonal(&slices);
         Ok((
             Arc::new(acc.into_operator(slices)) as Arc<dyn HyperOperator>,
             diagonal,
-            nll,
+            joint_log_likelihood,
             joint_gradient,
         ))
     }
