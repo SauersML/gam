@@ -20179,6 +20179,62 @@ mod tests {
         }
     }
 
+    /// FlexEvaluation-anchor counterpart of the parametric true-alias test.
+    /// Captures the invariant that `CrossBlockAnchor::FlexEvaluation(a)` is
+    /// a real participant in the cross-block W-orthogonalisation: when the
+    /// flex-anchor's column span fully covers the candidate's column span,
+    /// the outcome must be `FullyAliased`, not a silent `Reparameterised`.
+    /// If the FlexEvaluation arm is ever re-skipped, this test fails.
+    #[test]
+    fn cross_block_identifiability_flex_anchor_true_alias_returns_fully_aliased() {
+        let n = 64usize;
+        let z = Array1::from_iter((0..n).map(|i| {
+            let t = (i as f64) / (n as f64 - 1.0);
+            -1.5 + 3.0 * t
+        }));
+        let weights = Array1::from_elem(n, 1.0);
+        let link_cfg = DeviationBlockConfig {
+            num_internal_knots: 2,
+            ..DeviationBlockConfig::default()
+        };
+        let q0_seed = Array1::from_iter(z.iter().map(|zi| 0.05 + 0.4 * zi));
+        let link_seed = padded_deviation_seed(&q0_seed, 1.0, 0.5);
+        let mut link_prepared = build_link_deviation_block_from_knots_design_seed_and_weights(
+            &link_seed, &q0_seed, &link_cfg,
+        )
+        .expect("link-dev fixture");
+        // Capture the candidate's training-row design and use it as the
+        // flex-evaluation anchor. span(A) = span(C) by construction, so the
+        // residualised candidate has zero surviving directions.
+        let flex_anchor_design = link_prepared
+            .runtime
+            .design(&q0_seed)
+            .expect("candidate training-row design");
+        let outcome = enforce_cross_block_identifiability_for_flex_block(
+            &mut link_prepared,
+            &q0_seed,
+            &link_cfg,
+            &[CrossBlockAnchor::FlexEvaluation(&flex_anchor_design)],
+            &[None],
+            &weights,
+        )
+        .expect("flex-anchor true alias must produce a structured FullyAliased outcome");
+        match outcome {
+            CrossBlockIdentifiabilityOutcome::FullyAliased { reason } => {
+                assert!(
+                    reason.contains("zero directions remaining"),
+                    "expected FullyAliased reason mentioning 'zero directions remaining', got: {reason}",
+                );
+            }
+            CrossBlockIdentifiabilityOutcome::Reparameterised => {
+                panic!(
+                    "FlexEvaluation anchor whose span covers the candidate must yield FullyAliased; \
+                     got Reparameterised, indicating the FlexEvaluation arm was silently skipped",
+                );
+            }
+        }
+    }
+
     /// Direct match-arm coverage on the `CrossBlockIdentifiabilityOutcome`
     /// API. Confirms that the production code's `match outcome` against
     /// `FullyAliased { reason }` extracts the reason as documented. No

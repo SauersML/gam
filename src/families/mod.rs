@@ -3,6 +3,7 @@ pub mod cubic_cell_kernel;
 pub mod custom_family;
 pub mod family_meta;
 pub mod gamlss;
+pub mod identifiability_compiler;
 pub mod inner_status;
 pub mod inverse_link;
 pub mod ispline_base_time;
@@ -24,6 +25,10 @@ pub mod survival_predict;
 pub mod transformation_normal;
 pub mod vector_response;
 
+pub use identifiability_compiler::{
+    AnchorRowEvaluator, BlockOrder, CompiledBlock, CompiledBlocks, CompilerError, RowHessian,
+    RowJacobianOperator, compile,
+};
 pub use vector_response::{
     GaussianVectorLikelihood, VectorLikelihood, VectorNoise, VectorResponseTarget,
 };
