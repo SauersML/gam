@@ -224,6 +224,7 @@ class ManifoldSAEConfig:
     reml: RemlConfig = field(default_factory=RemlConfig)
     encoder_hidden: int = 0
     init_scale: float = 0.05
+    dtype: Any = field(default=None)
 
     def __post_init__(self) -> None:
         if self.input_dim <= 0:
@@ -249,6 +250,9 @@ class ManifoldSAEConfig:
             raise ValueError("ManifoldSAEConfig.encoder_hidden must be >= 0")
         if not (math.isfinite(self.init_scale) and self.init_scale > 0.0):
             raise ValueError("ManifoldSAEConfig.init_scale must be > 0")
+        if self.dtype is None:
+            import torch as _torch
+            object.__setattr__(self, "dtype", _torch.float64)
         if isinstance(self.sparsity, Mapping):
             object.__setattr__(self, "sparsity", SparsityConfig.from_dict(self.sparsity))
         if isinstance(self.decoder, Mapping):
@@ -594,6 +598,7 @@ class ManifoldSAE(nn.Module):
         self._snapshot_locked: bool = False
         self._last_fit: _ClosedFormManifoldSAE | None = None
         self.reset_parameters()
+        self.to(dtype=cfg.dtype)
 
     def reset_parameters(self) -> None:
         s = float(self.cfg.init_scale)

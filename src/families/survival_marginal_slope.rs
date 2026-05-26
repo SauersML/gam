@@ -11,9 +11,12 @@ use crate::custom_family::{
 use crate::estimate::UnifiedFitResult;
 use crate::faer_ndarray::{fast_ab, fast_av};
 use crate::families::bernoulli_marginal_slope::{
+    CrossBlockAnchor, CrossBlockIdentifiabilityOutcome, CrossBlockIdentifiabilityWarning,
     DeviationBlockConfig, DeviationRuntime, LatentZNormalization, LatentZPolicy,
-    MarginalSlopeCovariance, build_link_deviation_block_from_knots_design_seed_and_weights,
-    build_score_warp_deviation_block_from_seed, marginal_slope_covariance_from_scores,
+    MarginalSlopeCovariance, ParametricAnchorBlock,
+    build_link_deviation_block_from_knots_design_seed_and_weights,
+    build_score_warp_deviation_block_from_seed,
+    enforce_cross_block_identifiability_for_flex_block, marginal_slope_covariance_from_scores,
     marginal_slope_preserving_scale, marginal_slope_probit_eta, padded_deviation_seed,
     project_monotone_feasible_beta, push_deviation_aux_blockspecs,
     signed_probit_neglog_derivatives_up_to_fourth, standardize_latent_z_with_policy,
@@ -17610,23 +17613,75 @@ pub fn fit_survival_marginal_slope_terms(
         .as_ref()
         .map(|cfg| build_per_z_score_warp_deviation_block_from_seed(&spec.z, cfg))
         .transpose()?;
-    let link_dev_prepared = spec
-        .link_dev
-        .as_ref()
-        .map(|cfg| {
-            let q0_seed = Array1::from_iter((0..n).map(|row| {
-                let q_exit = spec.time_block.offset_exit[row] + spec.marginal_offset[row];
-                let slope = baseline_slope + spec.logslope_offset[row];
-                rigid_observed_eta(q_exit, slope, z_primary[row], probit_scale)
-            }));
-            let padded_seed = padded_deviation_seed(&q0_seed, 1.0, 0.5);
-            build_link_deviation_block_from_knots_design_seed_and_weights(
-                &padded_seed,
-                &q0_seed,
-                cfg,
-            )
-        })
-        .transpose()?;
+    let mut cross_block_warnings: Vec<CrossBlockIdentifiabilityWarning> = Vec::new();
+    let link_dev_prepared = if let Some(cfg) = spec.link_dev.as_ref() {
+        let q0_seed = Array1::from_iter((0..n).map(|row| {
+            let q_exit = spec.time_block.offset_exit[row] + spec.marginal_offset[row];
+            let slope = baseline_slope + spec.logslope_offset[row];
+            rigid_observed_eta(q_exit, slope, z_primary[row], probit_scale)
+        }));
+        let padded_seed = padded_deviation_seed(&q0_seed, 1.0, 0.5);
+        let mut prepared = build_link_deviation_block_from_knots_design_seed_and_weights(
+            &padded_seed,
+            &q0_seed,
+            cfg,
+        )?;
+        // Cross-block identifiability: residualise the link-deviation
+        // basis against the parametric anchor union (marginal + logslope
+        // designs) at training rows so its column span is orthogonal
+        // to span(X_marginal, X_logslope). Without this, the link-dev
+        // basis's constant / low-order η-polynomial directions are
+        // exactly the constant columns carried by marginal_surface and
+        // logslope_surface, producing the alias pencil
+        //   link_dev[k] ≡ marginal_surface[m] ≡ logslope_surface[ℓ]
+        // documented by the identifiability audit (joint rank collapse
+        // from 51 → 38 on the biobank-scale hypertension fit). After
+        // the W-metric eigendecomposition installs `T_lw` on the
+        // DeviationRuntime, the joint design has full numerical column
+        // rank with respect to (marginal, logslope) and the joint
+        // penalised Hessian satisfies `σ_min(joint H + S) ≥ λ_min(S) > 0`
+        // for every β. This mirrors the BMS construction site at
+        // bernoulli_marginal_slope.rs:18236, transplanted here because
+        // SMGS had no cross-block reparam call. `spec.weights` is the
+        // structurally-correct row metric for *alias detection* (the
+        // alias structure is W-independent); using the survival IRLS
+        // Hessian row metric instead would tighten the W-orthogonality
+        // claim during PIRLS but does not change which directions get
+        // dropped from the basis.
+        let anchors = vec![
+            CrossBlockAnchor::Parametric(&marginal_design.design),
+            CrossBlockAnchor::Parametric(&logslope_design.design),
+        ];
+        let anchor_tags: Vec<Option<ParametricAnchorBlock>> = vec![
+            Some(ParametricAnchorBlock::Marginal),
+            Some(ParametricAnchorBlock::Logslope),
+        ];
+        let outcome = enforce_cross_block_identifiability_for_flex_block(
+            &mut prepared,
+            &q0_seed,
+            cfg,
+            &anchors,
+            &anchor_tags,
+            &spec.weights,
+        )?;
+        match outcome {
+            CrossBlockIdentifiabilityOutcome::Reparameterised => Some(prepared),
+            CrossBlockIdentifiabilityOutcome::FullyAliased { reason } => {
+                log::warn!(
+                    "[survival-marginal-slope cross-block identifiability] link-deviation block fully aliased \
+                     by marginal+logslope anchors; dropping the block. {reason}"
+                );
+                cross_block_warnings.push(CrossBlockIdentifiabilityWarning {
+                    candidate_label: "link_deviation",
+                    anchor_summary: "marginal+logslope".to_string(),
+                    reason,
+                });
+                None
+            }
+        }
+    } else {
+        None
+    };
     let extra_rho0 = {
         let mut out = Vec::new();
         if let Some(ref prepared) = score_warp_prepared {
