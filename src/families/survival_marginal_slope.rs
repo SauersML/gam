@@ -580,6 +580,13 @@ fn build_per_z_score_warp_aux_blockspec(
     }
     block.initial_beta = Some(projected);
     let mut spec = block.intospec("score_warp_dev")?;
+    // Survival marginal-slope gauge ownership: score-warp deviations
+    // are pure shape modifications around the latent score axis and
+    // should never own a shared affine direction with time, marginal,
+    // or logslope blocks. Set a low priority so the canonical-gauge
+    // selector drops shared directions from score_warp_dev before any
+    // parametric block loses a column.
+    spec.gauge_priority = 80;
     if prepared.score_dim > 1 {
         // The physical penalty order mirrors the direct-sum coefficient
         // layout: all penalties for beta_1, then beta_2, ..., beta_K.  Giving
