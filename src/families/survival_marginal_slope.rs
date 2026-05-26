@@ -16786,7 +16786,12 @@ fn build_time_blockspec(
         nullspace_dims: time_block.nullspace_dims.clone(),
         initial_log_lambdas: rho,
         initial_beta: beta_hint,
-        gauge_priority: 100,
+        // Survival marginal-slope gauge-ownership policy: the baseline
+        // time surface owns the global intercept and the time-axis
+        // polynomial null space. Any direction aliased between
+        // time_surface and another block must be dropped from the
+        // OTHER block, so time_surface receives the highest priority.
+        gauge_priority: 200,
     }
 }
 
@@ -16805,7 +16810,12 @@ fn build_logslope_blockspec(
         nullspace_dims: design.nullspace_dims.clone(),
         initial_log_lambdas: rho,
         initial_beta: beta_hint,
-        gauge_priority: 100,
+        // Gauge ownership: logslope_surface owns z-by-PC slope
+        // variation; if it shares an affine direction with the time
+        // baseline or the marginal-PC main effect, the canonical-gauge
+        // selector drops it from logslope_surface (lower priority than
+        // time/marginal) before the inner solver sees the joint design.
+        gauge_priority: 120,
     }
 }
 
@@ -16823,7 +16833,13 @@ fn build_marginal_blockspec(
         nullspace_dims: design.nullspace_dims.clone(),
         initial_log_lambdas: rho,
         initial_beta: beta_hint,
-        gauge_priority: 100,
+        // Gauge ownership: marginal_surface sits between time_surface
+        // (which owns the baseline) and logslope_surface (which owns
+        // z-slope variation). Shared affine directions with the time
+        // block are dropped from marginal_surface; shared affine
+        // directions with logslope_surface are dropped from
+        // logslope_surface.
+        gauge_priority: 150,
     }
 }
 

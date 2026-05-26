@@ -31,6 +31,29 @@ pub struct PirlsStepStreamInput<'a> {
     pub lm_ridge: f64,
 }
 
+/// Stage 3.2 device-input variant of [`PirlsStepStreamInput`].
+///
+/// Where the host-input form uploads `weights` + `gradient` per Newton
+/// step, this form reads them straight from the
+/// [`crate::gpu::pirls_row::RowOutputDevBuffers`] populated by the
+/// device-side row-reweight kernel — no host round-trip for the row
+/// state. Only the penalty matrix still crosses the host boundary
+/// because the outer REML loop updates Sλ + LM ridge between PIRLS
+/// steps.
+#[cfg(target_os = "linux")]
+pub struct PirlsStepStreamDeviceInput<'a, 'b> {
+    /// Device-resident solver weights `w_solver_i` (length n). Read
+    /// in-place by the cublasDdgmm WX assembly.
+    pub w_solver_dev: &'a cudarc::driver::CudaSlice<f64>,
+    /// Device-resident IRLS gradient `∂ℓ/∂η_i` (length n). Read by the
+    /// `Xᵀg` dgemv to form the Newton RHS.
+    pub grad_eta_dev: &'b cudarc::driver::CudaSlice<f64>,
+    /// Penalty Hessian Sλ in row-major host layout (p × p).
+    pub penalty_hessian: ArrayView2<'b, f64>,
+    /// Levenberg-Marquardt diagonal ridge added to H before potrf.
+    pub lm_ridge: f64,
+}
+
 /// Shared, batch-wide GPU state for stream-pool sigma-cubature PIRLS.
 ///
 /// Construct once per cubature batch via [`PirlsGpuSharedData::upload`] and
