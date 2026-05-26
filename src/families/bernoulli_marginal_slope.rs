@@ -19635,6 +19635,34 @@ pub fn fit_bernoulli_marginal_slope_terms(
         // the Hessian row metric rather than `spec.weights`.
         let cross_block_pilot_w_link_dev =
             pilot_irls_hessian_row_metric_at_eta(&eta_pilot, &spec.weights);
+        // Phase 4a shadow call to the family-agnostic identifiability
+        // compiler. The output is discarded in 4a; Phase 4b will consume
+        // the compiled blocks and Phase 4c will delete this gate + the
+        // legacy `enforce_cross_block_identifiability_for_flex_block`
+        // call below atomically.
+        const PHASE_4A_SHADOW_COMPILE: bool = true;
+        if PHASE_4A_SHADOW_COMPILE {
+            use crate::families::bernoulli_marginal_slope_identifiability as compiler_inputs;
+            use crate::families::identifiability_compiler::compile;
+            let marginal_dense = marginal_design.design.try_to_dense_by_chunks(
+                "phase4a shadow compile (BMS link-dev): marginal dense",
+            )?;
+            let logslope_dense = logslope_design.design.try_to_dense_by_chunks(
+                "phase4a shadow compile (BMS link-dev): logslope dense",
+            )?;
+            let score_warp_dense = score_warp_anchor_design.clone();
+            let (ops, ordering) = compiler_inputs::build_bernoulli_compiler_inputs(
+                marginal_dense,
+                logslope_dense,
+                score_warp_dense,
+                None,
+            );
+            let hess = compiler_inputs::BernoulliRowHessian::from_row_weights(
+                cross_block_pilot_w_link_dev.clone(),
+            );
+            compile(&ops, &hess, &ordering)
+                .map_err(|e| format!("phase4a shadow compile (BMS link-dev): {e}"))?;
+        }
         let outcome = enforce_cross_block_identifiability_for_flex_block(
             &mut prepared,
             &eta_pilot,

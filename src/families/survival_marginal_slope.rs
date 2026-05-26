@@ -18309,6 +18309,21 @@ pub fn fit_survival_marginal_slope_terms(
             Some(ParametricAnchorBlock::Marginal),
             Some(ParametricAnchorBlock::Logslope),
         ];
+        // Phase 4a shadow call to the family-agnostic identifiability
+        // compiler. Survival's K=4 row Hessian needs the per-row pilot
+        // tuple (q0, q1, qd1, g) at the post-Newton pilot β (design doc
+        // §8). That β is produced by `rigid_fit_with_block_newton` *after*
+        // this construction site, so the shadow call stays gated off in
+        // 4a; Phase 4b threads `pilot_result.fitted_blocks[*].beta` through
+        // here and flips the gate to true. Phase 4c deletes the gate +
+        // the legacy `enforce_cross_block_identifiability_for_flex_block`
+        // call below atomically.
+        const PHASE_4A_SHADOW_COMPILE: bool = false;
+        if PHASE_4A_SHADOW_COMPILE {
+            // Wired in 4b once non-rigid pilot β is reachable here. The
+            // build_survival_compiler_inputs builder in
+            // `survival_marginal_slope_identifiability` is the entry point.
+        }
         let outcome = enforce_cross_block_identifiability_for_flex_block(
             &mut base,
             &z_primary,
