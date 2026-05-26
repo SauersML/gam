@@ -12184,7 +12184,13 @@ fn coefficient_line_search_options(
     early_exit_threshold: f64,
 ) -> BlockwiseFitOptions {
     let mut line_search_options = options.clone();
-    line_search_options.outer_score_subsample = None;
+    // Preserve `outer_score_subsample` so the trial-objective and the
+    // Hessian/gradient share a row measure: the trust-region ratio
+    // ρ = [F(β) − F(β + δ)] / [−g·δ − ½·δᵀHδ] is only valid when
+    // numerator and denominator evaluate the same measure. Disable
+    // *auto*-install so no mid-iteration mask rebuild can occur, and
+    // tag scope=InnerCoefficient so any sibling auto-install path that
+    // somehow gets reached bails out (cf. `install_auto_outer_subsample_options`).
     line_search_options.auto_outer_subsample = false;
     line_search_options.outer_eval_context =
         options
@@ -12745,6 +12751,15 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             //   * line_search: backtracking step-size search (up to 8 attempts)
             //   * grad_reload: post-accept joint gradient + workspace refresh
             let cycle_started = std::time::Instant::now();
+            // Top-of-cycle row-measure capture. The trust-region ratio
+            // ρ = [F(β) − F(β + δ)] / [−g·δ − ½·δᵀHδ] is only meaningful when
+            // every input (Hessian, gradient, objective at β, trial objective
+            // at β + δ) is evaluated against the same row measure. We freeze
+            // the measure here and re-read it at each of the four sites later
+            // in the cycle, then hard-fail (Err) just before ρ if any of them
+            // diverged. Cf. `src/solver/row_measure.rs`.
+            let tr_row_measure_top =
+                crate::solver::row_measure::RowMeasure::from_options(options, total_joint_n);
             let hessian_started = std::time::Instant::now();
             log::info!(
                 "[joint-newton-tr] phase=hessian_qp cycle={} r={:.3e}",
@@ -12799,6 +12814,9 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             } else {
                 None
             };
+            // Row measure observed by the Hessian build above.
+            let tr_row_measure_hessian =
+                crate::solver::row_measure::RowMeasure::from_options(options, total_joint_n);
             let joint_hessian_source = match joint_hessian_source {
                 Some(source) => source,
                 None => {
@@ -12821,6 +12839,13 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             let Some(grad_joint) = cached_joint_gradient.clone() else {
                 break;
             };
+            // Row measure observed by the gradient at β. `cached_joint_gradient`
+            // was loaded earlier under `options`; if the auto-subsample
+            // installer or any sibling path swapped the mask between then and
+            // now, the id captured here will diverge from the rest and the
+            // pre-ρ check below will Err. Cf. `src/solver/row_measure.rs`.
+            let tr_row_measure_gradient =
+                crate::solver::row_measure::RowMeasure::from_options(options, total_joint_n);
             if grad_joint.len() != total_p {
                 break;
             }
@@ -13156,6 +13181,11 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
 
             let old_beta: Vec<Array1<f64>> = states.iter().map(|s| s.beta.clone()).collect();
             let old_objective = lastobjective;
+            // Row measure observed by the objective at β. `lastobjective` was
+            // set on the previous cycle (or at function entry) under `options`;
+            // see top-of-cycle capture for rationale.
+            let tr_row_measure_old_objective =
+                crate::solver::row_measure::RowMeasure::from_options(options, total_joint_n);
             let mut accepted = false;
             let mut accepted_joint_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>> =
                 None;
@@ -13444,6 +13474,63 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     }
                 };
                 let trialobjective = -trial_ll + trial_penalty;
+                // Row measure observed by the trial objective at β + δ. The
+                // line-search helper above runs under `coefficient_line_search_options`,
+                // which now preserves `outer_score_subsample` and disables
+                // any further auto-install; if either contract is broken the
+                // id will diverge from `tr_row_measure_top` and we Err below.
+                let tr_row_measure_trial =
+                    crate::solver::row_measure::RowMeasure::from_options(options, total_joint_n);
+                // Hard invariant: the trust-region ratio numerator (objective
+                // at β minus trial at β+δ) and denominator (rhs·δ − ½δᵀH δ)
+                // MUST share a row measure with the Hessian/gradient build.
+                // Bubble out via `Err` rather than panic; this function
+                // already returns `Result<_, String>`.
+                let top_id = tr_row_measure_top.id;
+                if tr_row_measure_hessian.id != top_id {
+                    return Err(format!(
+                        "trust-region row-measure invariant violated: \
+                         Hessian id 0x{:016x} differs from top-of-cycle id 0x{:016x} \
+                         (cycle {}); the joint Hessian was built against a different \
+                         row mask than the trust-region globalization captured at the \
+                         top of the cycle. ρ would compare ½δᵀHδ on one measure to \
+                         F(β)−F(β+δ) on another.",
+                        tr_row_measure_hessian.id, top_id, cycle
+                    ));
+                }
+                if tr_row_measure_gradient.id != top_id {
+                    return Err(format!(
+                        "trust-region row-measure invariant violated: \
+                         gradient id 0x{:016x} differs from top-of-cycle id 0x{:016x} \
+                         (cycle {}); `cached_joint_gradient` was loaded against a \
+                         different row mask than the trust-region globalization \
+                         captured at the top of the cycle. rhs·δ in the predicted \
+                         reduction would not match the rest of the ρ inputs.",
+                        tr_row_measure_gradient.id, top_id, cycle
+                    ));
+                }
+                if tr_row_measure_old_objective.id != top_id {
+                    return Err(format!(
+                        "trust-region row-measure invariant violated: \
+                         objective-at-β id 0x{:016x} differs from top-of-cycle id \
+                         0x{:016x} (cycle {}); `lastobjective` was computed against \
+                         a different row mask than the trust-region globalization \
+                         captured at the top of the cycle.",
+                        tr_row_measure_old_objective.id, top_id, cycle
+                    ));
+                }
+                if tr_row_measure_trial.id != top_id {
+                    return Err(format!(
+                        "trust-region row-measure invariant violated: \
+                         trial-objective id 0x{:016x} differs from top-of-cycle id \
+                         0x{:016x} (cycle {}, attempt {}); the line-search trial \
+                         likelihood evaluated against a different row mask than the \
+                         Hessian/gradient/old-objective build. Cf. \
+                         `coefficient_line_search_options` and \
+                         `install_auto_outer_subsample_options`.",
+                        tr_row_measure_trial.id, top_id, cycle, trust_attempt
+                    ));
+                }
                 let actual_reduction = old_objective - trialobjective;
                 let trust_update = update_joint_trust_region_radius(
                     joint_trust_radius,
