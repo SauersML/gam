@@ -43,12 +43,7 @@ classifiers = [
   "Typing :: Typed",
 ]
 dependencies = [
-  "nvidia-cublas-cu12>=12.0,<13; platform_system == 'Linux' and platform_machine == 'x86_64'",
-  "nvidia-cuda-nvrtc-cu12>=12.0,<13; platform_system == 'Linux' and platform_machine == 'x86_64'",
-  "nvidia-cuda-runtime-cu12>=12.0,<13; platform_system == 'Linux' and platform_machine == 'x86_64'",
-  "nvidia-cusolver-cu12>=11.0,<12; platform_system == 'Linux' and platform_machine == 'x86_64'",
-  "nvidia-cusparse-cu12>=12.0,<13; platform_system == 'Linux' and platform_machine == 'x86_64'",
-  "nvidia-nvjitlink-cu12>=12.0,<13; platform_system == 'Linux' and platform_machine == 'x86_64'",
+  "numpy>=1.26",
 ]
 
 [project.urls]
@@ -66,7 +61,14 @@ test = [
   "matplotlib>=3.8",
   "scikit-learn>=1.4",
 ]
-numpy = ["numpy>=1.26"]
+cuda = [
+  "nvidia-cublas-cu12>=12.0,<13; platform_system == 'Linux' and platform_machine == 'x86_64'",
+  "nvidia-cuda-nvrtc-cu12>=12.0,<13; platform_system == 'Linux' and platform_machine == 'x86_64'",
+  "nvidia-cuda-runtime-cu12>=12.0,<13; platform_system == 'Linux' and platform_machine == 'x86_64'",
+  "nvidia-cusolver-cu12>=11.0,<12; platform_system == 'Linux' and platform_machine == 'x86_64'",
+  "nvidia-cusparse-cu12>=12.0,<13; platform_system == 'Linux' and platform_machine == 'x86_64'",
+  "nvidia-nvjitlink-cu12>=12.0,<13; platform_system == 'Linux' and platform_machine == 'x86_64'",
+]
 pandas = ["pandas>=2.0", "pyarrow>=14"]
 plot = ["matplotlib>=3.8"]
 sklearn = ["scikit-learn>=1.4", "numpy>=1.26"]
