@@ -10,7 +10,7 @@
 use rand::{Rng, RngExt};
 use rand_distr::{Distribution, Exp as RandExp, Normal as RandNormal};
 use statrs::distribution::{ContinuousCDF, Normal};
-use std::f64::consts::{FRAC_2_PI, FRAC_PI_2, PI};
+use std::f64::consts::{FRAC_2_PI, PI};
 
 const PI_SQ: f64 = PI * PI;
 // sqrt(2 / pi) — the InverseGamma(α=0.5, β=2k²) PDF coefficient is
@@ -210,6 +210,82 @@ mod tests {
             assert!(
                 (emp - th).abs() / th.max(1e-12) < tol,
                 "PG(1,{c}): empirical {emp}, theory {th}",
+            );
+        }
+    }
+
+    /// Hand-computed reference for the Devroye alternating-series coefficient
+    /// `a_n(x)` of J*(1, 0). Left branch (x ≤ 2/π):
+    ///     a_n(x) = 2k · √(2/π) · x^{-3/2} · exp(-2k²/x),     k = n + 1/2.
+    /// Right branch (x > 2/π):
+    ///     a_n(x) = π · k · exp(-k² π² x / 2),                k = n + 1/2.
+    fn reference_a_n(n: usize, x: f64) -> f64 {
+        use std::f64::consts::PI;
+        let k = n as f64 + 0.5;
+        let k_sq = k * k;
+        let frac_2_pi = 2.0 / PI;
+        if x <= frac_2_pi {
+            let sqrt_2_over_pi = (2.0 / PI).sqrt();
+            2.0 * k * sqrt_2_over_pi * x.powf(-1.5) * (-2.0 * k_sq / x).exp()
+        } else {
+            PI * k * (-0.5 * k_sq * PI * PI * x).exp()
+        }
+    }
+
+    #[test]
+    fn series_coefficient_matches_reference() {
+        let pg = PolyaGamma::new();
+        for &x in &[0.1_f64, 0.5, 1.0, 2.0] {
+            for n in 0..5 {
+                let got = pg.series_coefficient(n, x);
+                let want = reference_a_n(n, x);
+                let denom = want.abs().max(1.0);
+                let rel = (got - want).abs() / denom;
+                assert!(
+                    rel < 1e-14,
+                    "a_n mismatch at n={n}, x={x}: got {got:.17e}, want {want:.17e}, rel={rel:.3e}",
+                );
+            }
+        }
+    }
+
+    /// Higher-precision moment test: PG(1, c) mean and variance must match
+    /// closed-form values to ~1e-3 relative at K = 1e6 samples.
+    /// Variance: V[PG(1,c)] = (sinh(c) - c) / (2 c³ (1 + cosh c));  at c=0, 1/24.
+    fn theoretical_variance(c: f64) -> f64 {
+        if c.abs() < 1e-6 {
+            1.0 / 24.0
+        } else {
+            (c.sinh() - c) / (2.0 * c * c * c * (1.0 + c.cosh()))
+        }
+    }
+
+    #[test]
+    fn pg1_moments_high_precision() {
+        let pg = PolyaGamma::new();
+        let k = 1_000_000usize;
+        for &c in &[0.0_f64, 0.1, 1.0, 3.0, 10.0, 30.0] {
+            let mut rng = StdRng::seed_from_u64(0xC0FFEE ^ ((c.to_bits() as u64).wrapping_mul(7)));
+            let mut sum = 0.0_f64;
+            let mut sum_sq = 0.0_f64;
+            for _ in 0..k {
+                let s = pg.draw(&mut rng, c);
+                sum += s;
+                sum_sq += s * s;
+            }
+            let mean = sum / k as f64;
+            let var = sum_sq / k as f64 - mean * mean;
+            let th_mean = theoretical_mean(c);
+            let th_var = theoretical_variance(c);
+            let mean_rel = (mean - th_mean).abs() / th_mean.max(1e-12);
+            let var_rel = (var - th_var).abs() / th_var.max(1e-12);
+            assert!(
+                mean_rel < 5e-3,
+                "PG(1,{c}) mean: emp {mean:.6e}, theory {th_mean:.6e}, rel {mean_rel:.3e}",
+            );
+            assert!(
+                var_rel < 5e-3,
+                "PG(1,{c}) var: emp {var:.6e}, theory {th_var:.6e}, rel {var_rel:.3e}",
             );
         }
     }

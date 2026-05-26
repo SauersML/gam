@@ -519,38 +519,33 @@ impl<'a> RemlState<'a> {
             ));
         }
 
-        // Disable warm-start and PIRLS-cache coupling while evaluating sigma
-        // points in parallel. Cache lookups/inserts use an exclusive lock in
-        // execute_pirls_if_needed(), so leaving cache enabled serializes this
-        // block under contention.
-        let point_results: Vec<Option<(Array2<f64>, Array1<f64>)>> = {
-            let guards = (
-                AtomicFlagGuard::swap(
-                    &self.cache_manager.pirls_cache_enabled,
-                    false,
-                    Ordering::SeqCst,
-                ),
-                AtomicFlagGuard::swap(&self.warm_start_enabled, false, Ordering::SeqCst),
-            );
-            (
-                guards,
-                (0..sigma_points.len())
-                    .into_par_iter()
-                    .map(|idx| {
-                        let fit_point = self.execute_pirls_if_needed(&sigma_points[idx]).ok()?;
-                        let h_point = map_hessian_to_original_basis(fit_point.as_ref()).ok()?;
-                        let cov_point =
-                            matrix_inversewith_regularization(&h_point, "auto cubature point")?;
-                        let beta_point = fit_point
-                            .reparam_result
-                            .qs
-                            .dot(fit_point.beta_transformed.as_ref());
-                        Some((cov_point, beta_point))
-                    })
-                    .collect(),
-            )
-                .1
-        };
+        // Evaluate sigma points in parallel via the stateless cubature PIRLS
+        // entry. Unlike `execute_pirls_if_needed`, that callee performs no
+        // PIRLS-cache lookup/insert, no warm-start read/write, no LM-lambda
+        // hint read/write, no adaptive-cap or IFT-quality feedback writes —
+        // so multiple sigma fits run concurrently without serializing on the
+        // shared PIRLS-cache lock and without contaminating the production
+        // outer trajectory's warm-start / LM / IFT state. This replaces the
+        // previous `AtomicFlagGuard`-based opt-out: process-wide atomic
+        // flips were a leaky proxy that still let writes through (e.g. the
+        // adaptive-cap feedback and last_pirls_lm_lambda paths) and serialized
+        // unrelated REML evaluations racing the cubature window.
+        let point_results: Vec<Option<(Array2<f64>, Array1<f64>)>> = (0..sigma_points.len())
+            .into_par_iter()
+            .map(|idx| {
+                let fit_point = self
+                    .execute_pirls_stateless_for_cubature(&sigma_points[idx])
+                    .ok()?;
+                let h_point = map_hessian_to_original_basis(fit_point.as_ref()).ok()?;
+                let cov_point =
+                    matrix_inversewith_regularization(&h_point, "auto cubature point")?;
+                let beta_point = fit_point
+                    .reparam_result
+                    .qs
+                    .dot(fit_point.beta_transformed.as_ref());
+                Some((cov_point, beta_point))
+            })
+            .collect();
 
         if point_results.iter().any(|r| r.is_none()) {
             return self.finalize_smoothing_outcome(first_order_numerical(

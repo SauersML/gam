@@ -3381,6 +3381,111 @@ fn sphere_basis<'py>(
     ))
 }
 
+/// Farthest-point center selection on S² (lat/lon).
+///
+/// Returns the `(n_centers, 2)` matrix of selected centers in the same
+/// angular convention (`radians` flag) as the input. Centers are a property
+/// of the basis — once selected they are independent of any future
+/// evaluation set, so callers should cache the result.
+#[pyfunction(signature = (points, n_centers, radians = false))]
+fn sphere_select_farthest_point_centers<'py>(
+    py: Python<'py>,
+    points: PyReadonlyArray2<'py, f64>,
+    n_centers: usize,
+    radians: bool,
+) -> PyResult<Py<PyArray2<f64>>> {
+    let pts = points.as_array();
+    if pts.ncols() != 2 {
+        return Err(py_value_error(format!(
+            "sphere_select_farthest_point_centers expects points of shape (N, 2); got d={}",
+            pts.ncols()
+        )));
+    }
+    let centers = select_spherical_farthest_point_centers(pts, n_centers, radians)
+        .map_err(|err| py_value_error(err.to_string()))?;
+    Ok(centers.into_pyarray(py).unbind())
+}
+
+/// Spherical-spline basis evaluated against explicit (caller-supplied) centers.
+///
+/// Unlike `sphere_basis`, the basis dimension here is fixed by `centers.nrows()`
+/// and is independent of `points.nrows()`. This is the correct path whenever
+/// the caller has already resolved a center set (e.g. from training data, an
+/// explicit user spec, or a deterministic sphere lattice).
+///
+/// For `kernel = "harmonic"`, centers act only as a degree probe:
+/// `max_degree = centers.nrows()`; the actual points are not sampled from
+/// the center set.
+#[pyfunction(signature = (points, centers, penalty_order = 2, kernel = "sobolev", radians = false))]
+fn sphere_basis_with_centers<'py>(
+    py: Python<'py>,
+    points: PyReadonlyArray2<'py, f64>,
+    centers: PyReadonlyArray2<'py, f64>,
+    penalty_order: usize,
+    kernel: &str,
+    radians: bool,
+) -> PyResult<(Py<PyArray2<f64>>, Py<PyArray2<f64>>)> {
+    let pts = points.as_array();
+    let ctrs = centers.as_array();
+    if pts.ncols() != 2 {
+        return Err(py_value_error(format!(
+            "sphere_basis_with_centers expects points of shape (N, 2) [lat, lon]; got d={}",
+            pts.ncols()
+        )));
+    }
+    if ctrs.ncols() != 2 {
+        return Err(py_value_error(format!(
+            "sphere_basis_with_centers expects centers of shape (K, 2) [lat, lon]; got d={}",
+            ctrs.ncols()
+        )));
+    }
+    if !(1..=4).contains(&penalty_order) {
+        return Err(py_value_error(format!(
+            "sphere_basis_with_centers penalty_order must be one of 1, 2, 3, 4; got {penalty_order}"
+        )));
+    }
+    let (method, wahba_kernel, max_degree) = match kernel.to_ascii_lowercase().as_str() {
+        "sobolev" => (SphereMethod::Wahba, SphereWahbaKernel::Sobolev, None),
+        "pseudo" => (SphereMethod::Wahba, SphereWahbaKernel::Pseudo, None),
+        "harmonic" => (
+            SphereMethod::Harmonic,
+            SphereWahbaKernel::Sobolev,
+            Some(ctrs.nrows()),
+        ),
+        other => {
+            return Err(py_value_error(format!(
+                "sphere_basis_with_centers kernel must be one of 'sobolev', 'pseudo', 'harmonic'; got '{other}'"
+            )));
+        }
+    };
+    let spec = SphericalSplineBasisSpec {
+        center_strategy: CenterStrategy::UserProvided(ctrs.to_owned()),
+        penalty_order,
+        double_penalty: false,
+        radians,
+        method,
+        max_degree,
+        wahba_kernel,
+    };
+    let built =
+        build_spherical_spline_basis(pts, &spec).map_err(|err| py_value_error(err.to_string()))?;
+    let primary_idx = built
+        .penaltyinfo
+        .iter()
+        .position(|info| matches!(info.source, gam::basis::PenaltySource::Primary))
+        .ok_or_else(|| {
+            py_value_error(
+                "sphere_basis_with_centers: primary penalty was not built; check spec".to_string(),
+            )
+        })?;
+    let penalty = built.penalties[primary_idx].clone();
+    let design = built.design.to_dense();
+    Ok((
+        design.into_pyarray(py).unbind(),
+        penalty.into_pyarray(py).unbind(),
+    ))
+}
+
 /// Chart-local seven-column sphere basis with analytic lat/lon jet.
 ///
 /// `t` is an `(N, 2)` array of latitude/longitude pairs in radians. The
