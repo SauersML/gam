@@ -105,19 +105,6 @@ pub enum SurvivalMarginalSlopeError {
     /// probit base link, flexible row calculus with K > 1, spatial psi
     /// for unsupported block roles, ...).
     UnsupportedConfiguration { reason: String },
-    /// The assembled joint training-row design across {time, marginal,
-    /// logslope, score_warp, link_dev} is numerically rank-deficient
-    /// under the W-metric thin-SVD certificate that runs immediately
-    /// after per-block cross-block identifiability reparam and before
-    /// the rigid pilot fires. Each alias direction is localised to its
-    /// dominant `(block, column)` so the model-spec author can lower a
-    /// knot count, remove a duplicated parametric term, or otherwise
-    /// resolve the residual alias the per-block W-metric drop tolerance
-    /// admitted. `columns` lists `(block, local_col, weight)` triples
-    /// for every alias direction (one row per small singular value),
-    /// flattened in order. `alias_directions` is the `(p_joint × k)`
-    /// matrix whose columns are the offending right singular vectors
-    /// in the joint column ordering.
 }
 
 /// Block tag used by the joint training-row preflight diagnostic.
@@ -153,8 +140,7 @@ impl std::fmt::Display for SurvivalMarginalSlopeError {
             | SurvivalMarginalSlopeError::MonotonicityViolation { reason }
             | SurvivalMarginalSlopeError::NumericalFailure { reason }
             | SurvivalMarginalSlopeError::IntegrationFailed { reason }
-            | SurvivalMarginalSlopeError::UnsupportedConfiguration { reason }
-            | SurvivalMarginalSlopeError::JointRankDeficient { reason, .. } => {
+            | SurvivalMarginalSlopeError::UnsupportedConfiguration { reason } => {
                 f.write_str(reason)
             }
         }
