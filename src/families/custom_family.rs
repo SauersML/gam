@@ -21846,32 +21846,59 @@ pub(crate) fn fit_custom_family_fixed_log_lambda_warm_start<
     F: CustomFamily + Clone + Send + Sync + 'static,
 >(
     family: &F,
-    raw_specs: &[ParameterBlockSpec],
+    specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
 ) -> Result<(Vec<Array1<f64>>, bool, usize), CustomFamilyError> {
-    // Mirror the outer-fit identifiability path: canonicalise the joint
-    // design so warm-start callers (e.g. the survival marginal-slope
-    // rigid pilot at survival_marginal_slope.rs ~18078) operate on a
-    // rank-clean reparameterisation instead of erroring out — or worse,
-    // spinning on a singular penalised Newton inner system — when the
-    // raw joint design carries cross-block aliasing that
-    // `canonicalize_for_identifiability` can attribute and absorb. The
-    // returned per-block β are lifted back to raw block dimensions via
-    // `canonical.lift_block_betas_to_raw` so callers still see the same
-    // (Vec<Array1>, converged, cycles) contract over the raw specs.
-    let canonical =
-        crate::solver::identifiability_canonical::canonicalize_for_identifiability(raw_specs)?;
-    let specs: &[ParameterBlockSpec] = &canonical.reduced_specs;
+    // Pre-fit identifiability gate. Mirrors the outer-fit gate so
+    // warm-start callers (e.g. the survival marginal-slope rigid pilot
+    // at survival_marginal_slope.rs ~18078) fail in milliseconds on
+    // rank-deficient joint designs instead of spending minutes inside
+    // a singular penalised Newton inner system.
+    //
+    // We deliberately do NOT call `canonicalize_for_identifiability`
+    // here: blockwise families capture their per-block designs at
+    // construction time (e.g. SurvivalMarginalSlopeFamily holds
+    // `self.marginal_design` and `self.logslope_design` at raw width)
+    // and their `evaluate*` paths assert on those raw widths when
+    // assembling per-row Hessian contributions. Substituting a
+    // column-reduced spec under that family would produce a runtime
+    // shape mismatch in the family's syr_row_into / row_outer_into
+    // calls, masking the audit's diagnostic with a panic later in the
+    // pipeline.
+    //
+    // The principled construction-time orthogonalisation lives in
+    // `crate::families::identifiability_compiler` (and the per-family
+    // `*_identifiability.rs` modules). Once Phase 4b threads those
+    // compiled operators through the family construction sites, the
+    // raw joint design will already be rank-clean on entry and this
+    // gate becomes a defensive check.
+    let audit =
+        crate::solver::identifiability_audit::audit_identifiability(specs).map_err(|reason| {
+            CustomFamilyError::DimensionMismatch {
+                reason: format!(
+                    "fit_custom_family_fixed_log_lambda_warm_start identifiability audit failed: {reason}"
+                ),
+            }
+        })?;
+    if audit.fatal {
+        return Err(CustomFamilyError::Optimization {
+            context: "fit_custom_family_fixed_log_lambda_warm_start identifiability audit",
+            reason: format!(
+                "fatal pre-fit identifiability audit: {summary}",
+                summary = audit.summary
+            ),
+        });
+    }
     let penalty_counts = validate_blockspecs(specs)?;
     let rho = flatten_log_lambdas(specs);
     let per_block = split_log_lambdas(&rho, &penalty_counts)?;
     let inner = inner_blockwise_fit(family, specs, &per_block, options, None)?;
-    let reduced_block_beta: Vec<Array1<f64>> = inner
+    let block_beta: Vec<Array1<f64>> = inner
         .block_states
         .iter()
         .map(|state| state.beta.clone())
         .collect();
-    if !reduced_block_beta
+    if !block_beta
         .iter()
         .flat_map(|beta| beta.iter())
         .all(|value| value.is_finite())
@@ -21881,11 +21908,7 @@ pub(crate) fn fit_custom_family_fixed_log_lambda_warm_start<
             reason: "fixed-log-lambda warm start produced non-finite coefficients".to_string(),
         });
     }
-    // Lift reduced-space β back to raw block dimensions so callers can
-    // install them against the raw ParameterBlockSpec list (dropped
-    // raw coordinates take zero — the canonical-gauge contract).
-    let raw_block_beta = canonical.lift_block_betas_to_raw(&reduced_block_beta);
-    Ok((raw_block_beta, inner.converged, inner.cycles))
+    Ok((block_beta, inner.converged, inner.cycles))
 }
 
 #[cfg(test)]

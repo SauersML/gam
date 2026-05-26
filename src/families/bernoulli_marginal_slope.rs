@@ -7817,11 +7817,19 @@ impl BernoulliMarginalSlopeFamily {
     }
 
     #[inline]
-    fn cache_row_intercept(&self, row: usize, a: f64) {
-        if let Some(cache) = self.intercept_warm_starts.as_ref()
-            && let Some(slot) = cache.get(row)
-        {
-            slot.store(a.to_bits(), Ordering::Relaxed);
+    fn cache_row_intercept(
+        &self,
+        row: usize,
+        a: f64,
+        marginal_eta: f64,
+        slope: f64,
+        beta_h: Option<&Array1<f64>>,
+        beta_w: Option<&Array1<f64>>,
+    ) {
+        if let Some(cache) = self.intercept_warm_starts.as_ref() {
+            let beta_tag =
+                hash_intercept_warm_start_key_flex(marginal_eta, slope, beta_h, beta_w);
+            cache.store_tagged(row, a, beta_tag);
         }
     }
 
@@ -7901,7 +7909,7 @@ impl BernoulliMarginalSlopeFamily {
         let exact_zero_deviation = beta_h_linf == 0.0 && beta_w_linf == 0.0;
         let standard_normal_law = matches!(self.latent_measure, LatentMeasureKind::StandardNormal);
         if exact_zero_deviation && standard_normal_law {
-            self.cache_row_intercept(row, rigid_a);
+            self.cache_row_intercept(row, rigid_a, marginal_eta, slope, beta_h, beta_w);
             return Ok((rigid_a, rigid_abs_deriv, true));
         }
 
