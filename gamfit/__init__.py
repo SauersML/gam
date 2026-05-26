@@ -243,26 +243,41 @@ try:
 except _metadata.PackageNotFoundError:
     __version__ = "0.0.0+unknown"
 
-def __getattr__(name: str):
-    """Lazy attribute hook for torch-only primitives exposed at the top level.
+# Names whose implementation lives behind the optional ``torch`` extra. They are
+# advertised at the top level so users can write ``gamfit.AdaptiveTopK(...)``
+# without an explicit ``gamfit.torch`` import, while keeping the cold-start
+# import path torch-free.
+_LAZY_TORCH_ATTRS: dict[str, tuple[str, str]] = {
+    "AdaptiveTopK":          ("gamfit.torch.modules",     "AdaptiveTopK"),
+    "Crosscoder":            ("gamfit.crosscoder",        "Crosscoder"),
+    "PoincareAtoms":         ("gamfit.torch.hyperbolic",  "PoincareAtoms"),
+    "InterchangeSwapDecoder":("gamfit.torch.interchange", "InterchangeSwapDecoder"),
+}
 
-    Importing ``gamfit`` does not pull in torch (the torch bridge is an optional
-    extra). The names listed below are forwarded on first access so users can
-    write ``gamfit.AdaptiveTopK(...)`` without an explicit ``gamfit.torch``
-    import, while leaving the cold-start import path torch-free.
+
+def __getattr__(name: str):
+    """Lazy attribute hook for optional-extra primitives exposed at the top level.
+
+    A missing optional dependency (typically ``torch``) is surfaced as
+    ``AttributeError`` chained from the underlying ``ModuleNotFoundError``.
+    This preserves the Python contract that ``hasattr`` only ever returns a
+    bool and that ``from gamfit import *`` does not blow up on torch-less
+    installs, while ``gamfit.AdaptiveTopK`` (direct access) still produces a
+    clear actionable message pointing at the ``gamfit[torch]`` extra.
     """
-    if name == "AdaptiveTopK":
-        from .torch.modules import AdaptiveTopK as _AdaptiveTopK
-        return _AdaptiveTopK
-    if name == "Crosscoder":
-        from .crosscoder import Crosscoder as _Crosscoder
-        return _Crosscoder
-    if name == "PoincareAtoms":
-        from .torch.hyperbolic import PoincareAtoms as _PoincareAtoms
-        return _PoincareAtoms
-    if name == "InterchangeSwapDecoder":
-        from .torch.interchange import InterchangeSwapDecoder as _InterchangeSwapDecoder
-        return _InterchangeSwapDecoder
+    target = _LAZY_TORCH_ATTRS.get(name)
+    if target is not None:
+        module_path, attr = target
+        from importlib import import_module
+        try:
+            module = import_module(module_path)
+        except ModuleNotFoundError as exc:
+            raise AttributeError(
+                f"gamfit.{name} requires an optional dependency that is not "
+                f"installed ({exc.name!r}). Install the torch extra: "
+                f"pip install 'gamfit[torch]'."
+            ) from exc
+        return getattr(module, attr)
     raise AttributeError(f"module 'gamfit' has no attribute {name!r}")
 
 
