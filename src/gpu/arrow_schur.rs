@@ -96,6 +96,7 @@ pub fn solve_arrow_newton_step(
 /// (n local d-vectors) consumed by the device pipeline. Each block is laid
 /// out column-major so a single allocation + `cuMemcpyHtoD` reaches the
 /// device without per-row dispatch overhead.
+#[cfg(target_os = "linux")]
 fn pack_host(sys: &ArrowSchurSystem, ridge_t: f64) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
     let n = sys.rows.len();
     let d = sys.d;
@@ -109,6 +110,7 @@ fn pack_host(sys: &ArrowSchurSystem, ridge_t: f64) -> (Vec<f64>, Vec<f64>, Vec<f
     (d_buf, b_buf, g_buf)
 }
 
+#[cfg(target_os = "linux")]
 #[inline]
 fn pack_block(
     row: &ArrowRowBlock,
