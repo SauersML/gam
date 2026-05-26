@@ -1639,3 +1639,259 @@ mod stream_device_parity_tests {
         }
     }
 }
+
+/// Block 9 Phase 5 — V100 parity for `run_pcg_against_row_hessian_device`.
+///
+/// Builds a small `(n=64, r=20, p=44)` BMS-FLEX row-Hessian fixture, computes
+/// the dense joint Hessian via the same CPU oracle the HVP parity test uses,
+/// solves `H · x = b` on the host via dense LU as ground truth, and asserts
+/// the device-resident PCG iterate matches to a tight tolerance.
+#[cfg(all(test, target_os = "linux"))]
+mod pcg_device_parity_tests {
+    use super::*;
+    use crate::gpu::bms_flex_row::{
+        BmsFlexBlockLayout, BmsFlexPrimaryLayout, DeviceResidentRowHess, RowHessianLayout,
+    };
+    use ndarray::Array2;
+
+    /// Dense oracle for `H_full = Σ_i P_iᵀ H_i P_i` consistent with
+    /// `cpu_oracle_bms_flex_row_hvp`'s pullback math.
+    fn cpu_dense_joint_hessian(
+        row_hessians: &[f64],
+        marginal: &[f64],
+        logslope: &[f64],
+        block: &BmsFlexBlockLayout,
+        primary: &BmsFlexPrimaryLayout,
+        n: usize,
+    ) -> Array2<f64> {
+        let p_total = block.p_total;
+        let r = primary.r;
+        let p_m = block.p_m;
+        let p_g = block.p_g;
+        let h_block_start = block.h.as_ref().map(|r| r.start).unwrap_or(0);
+        let h_block_len = block.h.as_ref().map(|r| r.len()).unwrap_or(0);
+        let w_block_start = block.w.as_ref().map(|r| r.start).unwrap_or(0);
+        let w_block_len = block.w.as_ref().map(|r| r.len()).unwrap_or(0);
+        let h_primary_start = primary.h.as_ref().map(|r| r.start).unwrap_or(0);
+        let w_primary_start = primary.w.as_ref().map(|r| r.start).unwrap_or(0);
+        let mut h_dense = Array2::<f64>::zeros((p_total, p_total));
+        // For each row build P_i columns as length-p_total vectors.
+        let mut phi = vec![vec![0.0_f64; p_total]; r];
+        for row in 0..n {
+            for col in phi.iter_mut() {
+                col.iter_mut().for_each(|v| *v = 0.0);
+            }
+            let mrow = &marginal[row * p_m..(row + 1) * p_m];
+            let grow = &logslope[row * p_g..(row + 1) * p_g];
+            for k in 0..p_m {
+                phi[0][k] = mrow[k];
+            }
+            for k in 0..p_g {
+                phi[1][p_m + k] = grow[k];
+            }
+            for k in 0..h_block_len {
+                phi[h_primary_start + k][h_block_start + k] = 1.0;
+            }
+            for k in 0..w_block_len {
+                phi[w_primary_start + k][w_block_start + k] = 1.0;
+            }
+            let h_row = &row_hessians[row * r * r..(row + 1) * r * r];
+            for u in 0..r {
+                for v in 0..r {
+                    let huv = h_row[u * r + v];
+                    if huv == 0.0 {
+                        continue;
+                    }
+                    for m in 0..p_total {
+                        let phim = phi[u][m];
+                        if phim == 0.0 {
+                            continue;
+                        }
+                        let scaled = huv * phim;
+                        for nn in 0..p_total {
+                            h_dense[[m, nn]] += scaled * phi[v][nn];
+                        }
+                    }
+                }
+            }
+        }
+        h_dense
+    }
+
+    /// Reference dense solve via faer Cholesky (the row-primary Hessian is
+    /// SPD by construction at the fixture diagonal boost).
+    fn cpu_dense_solve(h: &Array2<f64>, b: &[f64]) -> Vec<f64> {
+        use crate::linalg::faer_ndarray::FaerCholesky;
+        let chol = FaerCholesky::factor(h.view())
+            .expect("dense oracle Cholesky factor must succeed on SPD fixture");
+        let b_arr = ndarray::Array1::from_vec(b.to_vec());
+        chol.solve_vec(b_arr.view()).to_vec()
+    }
+
+    #[test]
+    fn pcg_device_matches_dense_oracle_at_n64_r20_p44() {
+        let Some(_runtime) = crate::gpu::runtime::GpuRuntime::global() else {
+            eprintln!("[pcg_device parity] no CUDA runtime — skipping");
+            return;
+        };
+        let n = 64_usize;
+        let p_m = 14_usize;
+        let p_g = 12_usize;
+        let p_h_dim = 10_usize;
+        let p_w_dim = 8_usize;
+        let r = 2 + p_h_dim + p_w_dim;
+        let p_total = p_m + p_g + p_h_dim + p_w_dim;
+        let block = BmsFlexBlockLayout {
+            p_m,
+            p_g,
+            h: Some(p_m + p_g..p_m + p_g + p_h_dim),
+            w: Some(p_m + p_g + p_h_dim..p_m + p_g + p_h_dim + p_w_dim),
+            p_total,
+        };
+        let primary = BmsFlexPrimaryLayout {
+            h: Some(2..2 + p_h_dim),
+            w: Some(2 + p_h_dim..2 + p_h_dim + p_w_dim),
+            r,
+        };
+
+        // Same deterministic symmetric Hessians + designs as the HVP parity
+        // gate, so any drift between Phase 4 and Phase 5 surfaces here too.
+        let mut row_hessians = vec![0.0_f64; n * r * r];
+        for row in 0..n {
+            let base = row * r * r;
+            for u in 0..r {
+                for v in 0..r {
+                    let seed = (row as f64) * 0.137
+                        + (u as f64) * 1.901
+                        + (v as f64) * 0.317;
+                    let a = (seed.sin() * 1.7 + (seed * 0.5).cos() * 0.9) * 0.5;
+                    row_hessians[base + u * r + v] = a;
+                }
+            }
+            for u in 0..r {
+                for v in (u + 1)..r {
+                    let upper = row_hessians[base + u * r + v];
+                    let lower = row_hessians[base + v * r + u];
+                    let sym = 0.5 * (upper + lower);
+                    row_hessians[base + u * r + v] = sym;
+                    row_hessians[base + v * r + u] = sym;
+                }
+                // Boost the diagonal heavily so each H_i is positive
+                // definite — guarantees the joint pulled-back Hessian is
+                // SPD, which PCG requires.
+                row_hessians[base + u * r + u] += 4.0 * (r as f64);
+            }
+        }
+        let mut marginal = vec![0.0_f64; n * p_m];
+        for row in 0..n {
+            for j in 0..p_m {
+                let seed = (row as f64) * 0.073 + (j as f64) * 0.211 + 0.4;
+                marginal[row * p_m + j] = seed.sin() * 0.8 - (seed * 0.7).cos() * 0.3;
+            }
+        }
+        let mut logslope = vec![0.0_f64; n * p_g];
+        for row in 0..n {
+            for j in 0..p_g {
+                let seed = (row as f64) * 0.091 + (j as f64) * 0.179 - 0.2;
+                logslope[row * p_g + j] = seed.cos() * 0.7 + (seed * 0.3).sin() * 0.25;
+            }
+        }
+
+        // Pick a non-trivial RHS.
+        let b: Vec<f64> = (0..p_total)
+            .map(|i| {
+                let seed = (i as f64) * 0.157 + 0.6;
+                seed.sin() * 0.55 + (seed * 0.4).cos() * 0.35
+            })
+            .collect();
+
+        let h_dense = cpu_dense_joint_hessian(
+            &row_hessians,
+            &marginal,
+            &logslope,
+            &block,
+            &primary,
+            n,
+        );
+        let x_oracle = cpu_dense_solve(&h_dense, &b);
+
+        // Build a transient device-resident storage by directly uploading
+        // the dense per-row Hessian + designs (same path as the HVP parity
+        // test). Imports the backend probe to grab the default stream.
+        let backend = match crate::gpu::bms_flex_row::HvpKernelBackend_for_tests::probe() {
+            Ok(b) => b,
+            Err(err) => {
+                eprintln!("[pcg_device parity] backend probe failed: {err}");
+                return;
+            }
+        };
+        let stream = backend.stream.clone();
+        let ctx = backend.ctx.clone();
+        let d_h = match stream.clone_htod(&row_hessians) {
+            Ok(s) => s,
+            Err(err) => {
+                eprintln!("[pcg_device parity] upload h failed: {err}");
+                return;
+            }
+        };
+        let d_m = match stream.clone_htod(&marginal) {
+            Ok(s) => s,
+            Err(err) => {
+                eprintln!("[pcg_device parity] upload marginal failed: {err}");
+                return;
+            }
+        };
+        let d_g = match stream.clone_htod(&logslope) {
+            Ok(s) => s,
+            Err(err) => {
+                eprintln!("[pcg_device parity] upload logslope failed: {err}");
+                return;
+            }
+        };
+        let storage = DeviceResidentRowHess {
+            ctx,
+            stream,
+            hess: d_h,
+            marginal_design: d_m,
+            logslope_design: d_g,
+            n,
+            r,
+            block,
+            primary,
+            layout: RowHessianLayout::FullRowMajor,
+            bytes: ((n * r * r + n * p_m + n * p_g) * std::mem::size_of::<f64>()) as u64,
+        };
+
+        let out = run_pcg_against_row_hessian_device(DeviceResidentPcgInput {
+            storage: &storage,
+            b: &b,
+            rel_tol: 1e-10,
+            max_iters: 4 * p_total,
+            precond_diag_floor: 1e-12,
+        })
+        .expect("device-resident PCG must succeed on SPD fixture");
+
+        assert_eq!(out.x.len(), p_total);
+        let mut max_abs = 0.0_f64;
+        for i in 0..p_total {
+            let diff = (out.x[i] - x_oracle[i]).abs();
+            if diff > max_abs {
+                max_abs = diff;
+            }
+        }
+        // Each iteration introduces O(1) ULPs of round-off in the dot/
+        // axpy ladder; with ~88 iters max at p=44 we expect ‖Δx‖∞ comfortably
+        // below 1e-7. Anything larger means a code bug, not float noise.
+        assert!(
+            max_abs <= 1e-7,
+            "pcg_device parity ‖Δx‖∞={max_abs:.3e} > 1e-7 after {} iters \
+             (final rel residual={:.3e})",
+            out.iterations,
+            out.final_rel_residual
+        );
+        eprintln!(
+            "[pcg_device parity] n={n} p={p_total} r={r}: iters={} rel_res={:.3e} ‖Δx‖∞={:.3e}",
+            out.iterations, out.final_rel_residual, max_abs
+        );
+    }
+}
