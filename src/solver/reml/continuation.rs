@@ -908,7 +908,6 @@ mod tests {
     // ─────────────────────────────────────────────────────────────────
 
     use crate::solver::outer_strategy::ClosureObjective;
-    use std::cell::Cell;
 
     #[test]
     fn closure_objective_publishing_inner_beta_hint_without_seed_hook_is_acceptable() {
@@ -934,8 +933,7 @@ mod tests {
                 disable_fixed_point: false,
             },
             cost_fn: |_: &mut (), rho: &Array1<f64>| Ok(rho.dot(rho)),
-            eval_fn: move |_: &mut (), rho: &Array1<f64>| {
-                eval_calls_for_closure.set(eval_calls_for_closure.get() + 1);
+            eval_fn: |_: &mut (), rho: &Array1<f64>| {
                 Ok(OuterEval {
                     cost: rho.dot(rho),
                     gradient: Array1::zeros(1),
@@ -980,8 +978,6 @@ mod tests {
              seed hook (issue #236). got: {:?}",
             result.err().map(|e| e.message().to_string()),
         );
-        let _ = n_params;
-        let _ = eval_calls.get();
     }
 
     #[test]
