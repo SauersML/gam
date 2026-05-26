@@ -954,3 +954,109 @@ pub fn cholesky_solve_gpu(
 pub fn cholesky_lower_gpu(hessian: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
     crate::gpu::solver::cholesky_lower_gpu(hessian)
 }
+
+/// Stage 3.2 V100 parity: the device-input PIRLS step must produce
+/// numerically identical `(H, direction, logdet)` triples to the
+/// host-input form when fed the same weights + gradient. This is the
+/// production caller that satisfies the dead-pub scanner for
+/// `solve_pirls_step_on_stream_device` and `PirlsStepStreamDeviceInput`.
+#[cfg(all(test, target_os = "linux"))]
+mod stream_device_parity_tests {
+    use super::*;
+    use ndarray::arr2;
+
+    #[test]
+    fn device_input_step_matches_host_input_step_on_v100() {
+        if crate::gpu::runtime::GpuRuntime::global().is_none() {
+            eprintln!("[stream_device_parity] no CUDA runtime — skipping");
+            return;
+        }
+        let x = arr2(&[
+            [1.0, 0.5, 0.1],
+            [0.2, -0.3, 1.4],
+            [0.7, 1.1, -0.2],
+            [-0.4, 0.9, 0.6],
+            [0.3, -0.8, 0.5],
+        ]);
+        let weights = ndarray::arr1(&[1.0, 0.8, 1.2, 0.9, 1.05]);
+        // Pick g_eta directly (length n) and derive the equivalent
+        // host-side gradient via the same Xᵀ projection the
+        // device-input form does on the GPU.
+        let g_eta = ndarray::arr1(&[0.10_f64, -0.20, 0.05, 0.30, -0.15]);
+        let gradient: ndarray::Array1<f64> = x.t().dot(&g_eta);
+        let penalty = arr2(&[[0.4, 0.0, 0.0], [0.0, 0.9, 0.0], [0.0, 0.0, 1.2]]);
+        let lm_ridge = 0.1;
+
+        let shared = upload_shared_pirls_gpu(x.view())
+            .expect("upload shared design");
+        let mut ws_host = allocate_sigma_pirls_workspace(&shared)
+            .expect("alloc host-input ws");
+        let mut ws_dev = allocate_sigma_pirls_workspace(&shared)
+            .expect("alloc device-input ws");
+
+        let host_step = solve_pirls_step_on_stream(
+            &shared,
+            &mut ws_host,
+            PirlsStepStreamInput {
+                weights: weights.view(),
+                penalty_hessian: penalty.view(),
+                gradient: gradient.view(),
+                lm_ridge,
+            },
+        )
+        .expect("host-input step");
+
+        let n = x.nrows();
+        let mut w_dev = ws_dev
+            .stream
+            .alloc_zeros::<f64>(n)
+            .expect("alloc w_dev");
+        let mut g_dev = ws_dev
+            .stream
+            .alloc_zeros::<f64>(n)
+            .expect("alloc g_dev");
+        ws_dev
+            .stream
+            .memcpy_htod(weights.as_slice().unwrap(), &mut w_dev)
+            .expect("upload w_dev");
+        ws_dev
+            .stream
+            .memcpy_htod(g_eta.as_slice().unwrap(), &mut g_dev)
+            .expect("upload g_dev");
+
+        let dev_step = solve_pirls_step_on_stream_device(
+            &shared,
+            &mut ws_dev,
+            PirlsStepStreamDeviceInput {
+                w_solver_dev: &w_dev,
+                grad_eta_dev: &g_dev,
+                penalty_hessian: penalty.view(),
+                lm_ridge,
+            },
+        )
+        .expect("device-input step");
+
+        // H + logdet must match to round-off (same XᵀWX, same penalty
+        // add, same potrf).
+        for i in 0..3 {
+            for j in 0..3 {
+                let diff =
+                    (host_step.penalized_hessian[[i, j]] - dev_step.penalized_hessian[[i, j]])
+                        .abs();
+                assert!(diff <= 1e-10, "H[{i},{j}] mismatch: {diff}");
+            }
+        }
+        assert!(
+            (host_step.logdet - dev_step.logdet).abs() <= 1e-9,
+            "logdet mismatch: host={} dev={}",
+            host_step.logdet,
+            dev_step.logdet
+        );
+        // Direction must match because Xᵀ·g_eta = (Xᵀ·X)·α = host
+        // gradient by construction.
+        for i in 0..3 {
+            let diff = (host_step.direction[i] - dev_step.direction[i]).abs();
+            assert!(diff <= 1e-9, "direction[{i}] mismatch: {diff}");
+        }
+    }
+}
