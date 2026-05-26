@@ -31,31 +31,26 @@ class _FakeRustModule:
         penalty = np.diag(penalties)
         return phi, jet, penalty
 
-    def sae_manifold_fit(
+    def sae_manifold_fit_minimal(
         self,
         z,
+        k_atoms,
         atom_basis,
         atom_dim,
-        basis_values,
-        basis_jacobian,
-        basis_sizes,
-        decoder_coefficients,
-        smooth_penalties,
-        initial_logits,
-        initial_coords,
+        assignment_kind,
         alpha,
         tau,
         learnable_alpha,
-        *,
-        assignment_kind,
         sparsity_strength,
         smoothness,
         max_iter,
         learning_rate,
+        random_state,
+        top_k,
+        *,
         gumbel_schedule=None,
-        analytic_penalties=None,
     ):
-        assert len(atom_dim) == 2
+        assert len(atom_dim) == int(k_atoms) == 2
         assert assignment_kind == "softmax"
         assert learnable_alpha is False
         assert max_iter == 1
@@ -66,8 +61,13 @@ class _FakeRustModule:
         weights = np.exp(logits / float(tau))
         assignments = weights / weights.sum(axis=1, keepdims=True)
         atoms = []
+        # Synthetic basis size: matches the periodic basis the production
+        # Rust kernel would have chosen given n_harmonics derived from
+        # closed-form defaults — using 3 here is enough to exercise the
+        # decoder-shape contract.
+        basis_size = 3
         for atom, dim in enumerate(atom_dim):
-            decoder = np.full((basis_sizes[atom], z.shape[1]), 0.1 * float(atom + 1))
+            decoder = np.full((basis_size, z.shape[1]), 0.1 * float(atom + 1))
             atoms.append(
                 {
                     "decoder_B": decoder,
