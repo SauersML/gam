@@ -12793,6 +12793,7 @@ impl SurvivalMarginalSlopeFamily {
     fn exact_newton_joint_hessian_operator(
         &self,
         block_states: &[ParameterBlockState],
+        options: &BlockwiseFitOptions,
     ) -> Result<(Arc<dyn HyperOperator>, Array1<f64>), String> {
         let slices = block_slices(self, block_states);
         let p_t = slices.time.len();
@@ -12812,19 +12813,30 @@ impl SurvivalMarginalSlopeFamily {
                 SurvivalMarginalSlopeDynamicRow::empty_workspace(),
             )
         };
+        // Row measure: full-data when `options.outer_score_subsample` is
+        // `None`; the stratified mask + HT weights otherwise. Matches the
+        // directional-derivative sibling so the inner trust-region ratio
+        // evaluates ½δᵀHδ on the same rows as the objective.
+        let row_iter = outer_row_indices(options, self.n).to_vec();
+        let row_weights = outer_row_weights_by_index(options, self.n);
         let acc = if self.effective_flex_active(block_states)? {
             let primary = flex_primary_slices(self);
-            (0..self.n)
+            row_iter
                 .into_par_iter()
                 .try_fold(make_acc_ws, |mut acc, row| -> Result<_, String> {
                     let (state, q_geom) = &mut acc;
                     self.row_dynamic_q_geometry_into(row, block_states, q_geom)?;
-                    let (_, g, h) = self.compute_row_flex_primary_gradient_hessian_exact(
+                    let (_, mut g, mut h) = self.compute_row_flex_primary_gradient_hessian_exact(
                         row,
                         block_states,
                         q_geom,
                         &primary,
                     )?;
+                    let w = row_weights[row];
+                    if w != 1.0 {
+                        g.mapv_inplace(|v| v * w);
+                        h.mapv_inplace(|v| v * w);
+                    }
                     state.add_pullback_with_q_geometry(self, row, q_geom, &g, &h)?;
                     Ok(acc)
                 })
@@ -12834,13 +12846,18 @@ impl SurvivalMarginalSlopeFamily {
                 })?
                 .0
         } else {
-            (0..self.n)
+            row_iter
                 .into_par_iter()
                 .try_fold(make_acc_ws, |mut acc, row| -> Result<_, String> {
                     let (state, q_geom) = &mut acc;
                     self.row_dynamic_q_geometry_into(row, block_states, q_geom)?;
-                    let (_, g, h) =
+                    let (_, mut g, mut h) =
                         self.compute_row_primary_gradient_hessian_uncached(row, block_states)?;
+                    let w = row_weights[row];
+                    if w != 1.0 {
+                        g.mapv_inplace(|v| v * w);
+                        h.mapv_inplace(|v| v * w);
+                    }
                     state.add_pullback_with_q_geometry(self, row, q_geom, &g, &h)?;
                     Ok(acc)
                 })
@@ -13022,7 +13039,7 @@ impl SurvivalMarginalSlopeExactNewtonJointHessianWorkspace {
         options: BlockwiseFitOptions,
     ) -> Result<Self, String> {
         let (joint_hessian_operator, joint_hessian_diagonal) =
-            family.exact_newton_joint_hessian_operator(&block_states)?;
+            family.exact_newton_joint_hessian_operator(&block_states, &options)?;
         let eval_cache = if family.flex_timewiggle_active() && !family.flex_active() {
             Some(family.build_eval_cache(&block_states)?)
         } else {
