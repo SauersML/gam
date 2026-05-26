@@ -7,6 +7,7 @@
 //! never loaded by default CPU-only builds.
 
 pub mod arrow_schur;
+pub mod arrow_schur_nvrtc;
 pub mod blas;
 pub mod bms_flex;
 pub mod bms_flex_row;
@@ -20,6 +21,7 @@ pub mod linalg;
 pub mod memory;
 pub mod pirls_row;
 pub mod policy;
+pub mod polya_gamma;
 pub mod profile;
 pub mod reml_trace;
 pub mod row_hessian_ops;

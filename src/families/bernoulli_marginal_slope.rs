@@ -8525,6 +8525,19 @@ impl BernoulliMarginalSlopeFamily {
         let score_runtime = self.score_warp.as_ref();
         let link_runtime = self.link_dev.as_ref();
 
+        // ── Phase-4 device-moment plan. On Linux+CUDA we skip the host
+        //    `cell_moments` fill in the per-row loop and instead build the
+        //    moments on the GPU via the cubic-cell substrate, attaching the
+        //    resulting `CudaSlice<f64>` directly to the owned bundle so
+        //    `launch_bms_flex_row_kernel` consumes it without a host
+        //    upload. The host fill stays as the fallback on hosts without
+        //    a runtime (and on every non-Linux build).
+        #[cfg(target_os = "linux")]
+        let build_device_moments =
+            crate::gpu::runtime::GpuRuntime::global().is_some();
+        #[cfg(not(target_os = "linux"))]
+        let build_device_moments = false;
+
         // ── First pass: row offsets + total cell count. The Stage-2 kernel
         //    consumes a CSR `cell_offsets[n+1]` with `total_cells =
         //    cell_offsets[n]`; reject up front any row whose cells were
@@ -8575,7 +8588,23 @@ impl BernoulliMarginalSlopeFamily {
         let mut cell_sbb = vec![0.0_f64; total_cells_us * coeff4];
         let mut cell_sbh = vec![0.0_f64; total_cells_us * p_h * coeff4];
         let mut cell_sbw = vec![0.0_f64; total_cells_us * p_w * coeff4];
-        let mut cell_moments = vec![0.0_f64; total_cells_us * moment_stride];
+        // When `build_device_moments` is set, the host `cell_moments` vec
+        // is unused (the launcher consumes the device buffer); we leave
+        // it empty so it doesn't waste RAM in biobank-scale jobs.
+        let mut cell_moments: Vec<f64> = if build_device_moments {
+            Vec::new()
+        } else {
+            vec![0.0_f64; total_cells_us * moment_stride]
+        };
+        // Per-cell SoA for the device cubic-cell substrate. Populated on
+        // every code path so the compiler sees `gpu_cells`/`gpu_branches`
+        // used unconditionally — the substrate dispatch below only fires
+        // when `build_device_moments` is true, but the small Vec push cost
+        // per cell is negligible compared to the moment compute itself.
+        let mut gpu_cells: Vec<crate::gpu::cubic_cell::GpuDenestedCubicCell> =
+            Vec::with_capacity(total_cells_us);
+        let mut gpu_branches: Vec<crate::gpu::cubic_cell::GpuCellBranchTag> =
+            Vec::with_capacity(total_cells_us);
 
         // Reusable per-row coefficient buffers. Same layout as
         // BernoulliMarginalSlopeFlexRowScratch's owned [f64;4] slices.
@@ -8728,12 +8757,40 @@ impl BernoulliMarginalSlopeFamily {
                         }
                     }
                 }
-                // cell_moments: copy state.moments, zero-pad to 10.
-                let mom_base = cell_idx * moment_stride;
-                let src_moments: &[f64] = &entry.state.moments;
-                let copy_len = src_moments.len().min(moment_stride);
-                for k in 0..copy_len {
-                    cell_moments[mom_base + k] = src_moments[k];
+                // cell_moments: copy state.moments, zero-pad to 10 — only
+                // when the host fallback path is in use. When the
+                // device-moment build is selected, this work + storage is
+                // skipped entirely and the substrate produces moments
+                // directly on the GPU below.
+                if !build_device_moments {
+                    let mom_base = cell_idx * moment_stride;
+                    let src_moments: &[f64] = &entry.state.moments;
+                    let copy_len = src_moments.len().min(moment_stride);
+                    for k in 0..copy_len {
+                        cell_moments[mom_base + k] = src_moments[k];
+                    }
+                } else {
+                    // Push the cell into the device-substrate SoA in the
+                    // exact `cell_idx` order so the resulting `[total_cells,
+                    // MOMENT_STRIDE]` device buffer is indexed by `cell_idx`
+                    // identically to `cell_moments` in the host path.
+                    debug_assert_eq!(gpu_cells.len(), cell_idx);
+                    gpu_cells.push(crate::gpu::cubic_cell::GpuDenestedCubicCell {
+                        left: cell.left,
+                        right: cell.right,
+                        c0: cell.c0,
+                        c1: cell.c1,
+                        c2: cell.c2,
+                        c3: cell.c3,
+                    });
+                    let branch = if !cell.left.is_finite() || !cell.right.is_finite() {
+                        crate::gpu::cubic_cell::GpuCellBranchTag::AffineTail
+                    } else if cell.c2 == 0.0 && cell.c3 == 0.0 {
+                        crate::gpu::cubic_cell::GpuCellBranchTag::Affine
+                    } else {
+                        crate::gpu::cubic_cell::GpuCellBranchTag::NonAffineFinite
+                    };
+                    gpu_branches.push(branch);
                 }
             }
 
@@ -8834,6 +8891,114 @@ impl BernoulliMarginalSlopeFamily {
             }
         }
 
+        // ── Phase-4: when device-moment build was selected, dispatch the
+        //    cubic-cell substrate now (all rows' cells were collected in
+        //    `gpu_cells` / `gpu_branches` during the per-row loop). The
+        //    returned device buffer lives on the shared CUDA context the
+        //    bms_flex_row backend also uses, so the launcher consumes it
+        //    without any cross-context copying.
+        #[cfg(target_os = "linux")]
+        let cell_moments_device: Option<cudarc::driver::CudaSlice<f64>> = if build_device_moments {
+            use crate::gpu::cubic_cell::{
+                CubicCellDerivativeMomentHostView, CubicCellDerivativeMomentOutput,
+                CubicCellMomentResidency, CubicCellMomentStatus,
+                try_build_cubic_cell_derivative_moments,
+            };
+            // Sanity: the per-row loop must have produced exactly one
+            // entry per cell index.
+            if gpu_cells.len() != total_cells_us || gpu_branches.len() != total_cells_us {
+                return Err(format!(
+                    "bms_flex_row pack: gpu_cells.len()={} branches.len()={} mismatch total_cells={}",
+                    gpu_cells.len(), gpu_branches.len(), total_cells_us
+                ));
+            }
+            let view = CubicCellDerivativeMomentHostView {
+                cells: &gpu_cells,
+                branches: &gpu_branches,
+                max_degree: crate::gpu::bms_flex_row::MOMENT_STRIDE - 1,
+                residency: CubicCellMomentResidency::Device,
+            };
+            match try_build_cubic_cell_derivative_moments(view)
+                .map_err(|err| format!("bms_flex_row device-moment build: {err}"))?
+            {
+                Some(CubicCellDerivativeMomentOutput::Device {
+                    d_moments,
+                    d_status: _,
+                    status,
+                    stride,
+                    n_cells,
+                }) => {
+                    if stride != crate::gpu::bms_flex_row::MOMENT_STRIDE
+                        || n_cells != total_cells_us
+                    {
+                        return Err(format!(
+                            "bms_flex_row device-moment substrate returned bad shape: \
+                             stride={stride} n_cells={n_cells} expected stride={} cells={}",
+                            crate::gpu::bms_flex_row::MOMENT_STRIDE,
+                            total_cells_us
+                        ));
+                    }
+                    // Any non-OK status means a cell the kernel refused;
+                    // the row buffer for that cell is zeroed, which is
+                    // mathematically OK (zero moments → zero contribution)
+                    // but indicates a classifier disagreement worth
+                    // surfacing in debug builds.
+                    #[cfg(debug_assertions)]
+                    {
+                        for (i, &s) in status.iter().enumerate() {
+                            assert_eq!(
+                                s,
+                                CubicCellMomentStatus::Ok as u8,
+                                "bms_flex_row device-moment cell {i} status={s} (kernel refused)"
+                            );
+                        }
+                    }
+                    // `status` is consumed only by the debug assert above;
+                    // the runtime path keeps the device buffer alive on
+                    // the owned bundle and lets the launcher feed it
+                    // straight into the row kernel.
+                    drop(status);
+                    Some(d_moments)
+                }
+                Some(CubicCellDerivativeMomentOutput::Host { .. }) => {
+                    // The substrate degraded to host residency (runtime
+                    // probe failed mid-flight). Fall back to filling the
+                    // host moments path here so the launcher still has a
+                    // valid bundle. We need to do the work the per-row
+                    // loop skipped: re-fill `cell_moments` from the
+                    // existing CPU LRU cache entries.
+                    cell_moments = vec![0.0_f64; total_cells_us * moment_stride];
+                    for (row_idx, _) in (0..n).enumerate() {
+                        let start = cell_offsets[row_idx] as usize;
+                        let row_cells = bundle
+                            .row(row_idx, 9)
+                            .expect("row cell moments presence verified above");
+                        for (local_idx, entry) in row_cells.iter().enumerate() {
+                            let cell_idx = start + local_idx;
+                            let mom_base = cell_idx * moment_stride;
+                            let src_moments: &[f64] = &entry.state.moments;
+                            let copy_len = src_moments.len().min(moment_stride);
+                            for k in 0..copy_len {
+                                cell_moments[mom_base + k] = src_moments[k];
+                            }
+                        }
+                    }
+                    None
+                }
+                None => {
+                    return Err(
+                        "bms_flex_row device-moment substrate returned Ok(None) on non-empty input"
+                            .to_string(),
+                    );
+                }
+            }
+        } else {
+            None
+        };
+        // Free the now-unneeded scratch.
+        drop(gpu_cells);
+        drop(gpu_branches);
+
         Ok(Some(crate::gpu::bms_flex_row::BmsFlexRowKernelInputsOwned {
             n_rows: n,
             r,
@@ -8860,6 +9025,8 @@ impl BernoulliMarginalSlopeFamily {
             cell_sbh,
             cell_sbw,
             cell_moments,
+            #[cfg(target_os = "linux")]
+            cell_moments_device,
             chi_obs: row_chi,
             xi_obs: row_xi,
             rho_u: row_rho,
@@ -14148,6 +14315,24 @@ impl BernoulliMarginalSlopeFamily {
                     },
                 )?;
             return Ok(diagonal);
+        }
+
+        // Phase-3 device-resident shortcut: same idea as the HVP path.
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(device_state) = cache.row_primary_hessians.device() {
+                match crate::gpu::bms_flex_row::launch_bms_flex_row_diagonal(device_state) {
+                    Ok(host) => {
+                        return Ok(Array1::<f64>::from_vec(host));
+                    }
+                    Err(err) => {
+                        log::info!(
+                            "[BMS exact-newton diag] gpu_diag_failed: {err}; falling \
+                             back to CPU row-loop"
+                        );
+                    }
+                }
+            }
         }
 
         let diagonal = (0..n.div_ceil(ROW_CHUNK_SIZE))

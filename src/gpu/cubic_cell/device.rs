@@ -673,6 +673,28 @@ impl CubicCellGpuBackend {
             n_cells,
         })
     }
+
+    /// Test-only DtoH helper used by the substrate's device-residency parity
+    /// test to read back the moments vector for elementwise comparison.
+    /// Lives on the backend so the test does not have to plumb the stream.
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) fn test_only_download_moments(
+        &self,
+        d_moments: &cudarc::driver::CudaSlice<f64>,
+    ) -> Result<Vec<f64>, GpuError> {
+        let stream = &self.inner.stream;
+        let host = stream
+            .clone_dtoh(d_moments)
+            .map_err(|err| GpuError::DriverCallFailed {
+                reason: format!("cubic_cell test_only_download_moments DtoH: {err}"),
+            })?;
+        stream
+            .synchronize()
+            .map_err(|err| GpuError::DriverCallFailed {
+                reason: format!("cubic_cell test_only_download_moments sync: {err}"),
+            })?;
+        Ok(host)
+    }
 }
 
 #[cfg(test)]

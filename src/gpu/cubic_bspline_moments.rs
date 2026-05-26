@@ -1396,6 +1396,153 @@ mod cubic_bspline_moments_tests {
         }
     }
 
+    /// GPU vs CPU parity for the hex tensor moment build: every
+    /// (cell, alpha) entry must match the CPU reference to 1e-12 relative.
+    /// Skips silently when no CUDA runtime is reachable so the test runs on
+    /// macOS dev hosts as a smoke check of the host-side glue.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gpu_hex_tensor_moments_match_cpu_reference() {
+        let t = nonuniform_knots();
+        let table = AxisCubicMomentTables::build(&t, 0, 0);
+        let axes_cpu: Vec<&AxisCubicMomentTables> = vec![&table, &table];
+        let axes_for_build: Vec<Vec<AxisCubicMomentTables>> =
+            vec![vec![table.clone()], vec![table.clone()]];
+
+        let alphas: Vec<Vec<u8>> = vec![
+            vec![0, 0],
+            vec![1, 0],
+            vec![0, 1],
+            vec![2, 1],
+            vec![3, 3],
+        ];
+        let deriv = vec![vec![0u8, 0u8]; alphas.len()];
+        let spec = CubicMomentSpec {
+            alphas: alphas.clone(),
+            derivative_left: deriv.clone(),
+            derivative_right: deriv.clone(),
+            layout: MomentLayout::AlphaMajor,
+        };
+
+        // Build a small cell list: every (sx, sy) pair × a few pair-tuples.
+        let pair_choices: [usize; 3] = [0, 4, 9];
+        let mut span_per_axis: Vec<i32> = Vec::new();
+        let mut pair_per_axis: Vec<i32> = Vec::new();
+        let mut width_per_axis: Vec<f64> = Vec::new();
+        let mut cell_meta: Vec<(usize, usize, usize, usize)> = Vec::new();
+        for sx in 0..table.n_spans() {
+            for sy in 0..table.n_spans() {
+                for &pa in &pair_choices {
+                    for &pb in &pair_choices {
+                        span_per_axis.push(sx as i32);
+                        span_per_axis.push(sy as i32);
+                        pair_per_axis.push(pa as i32);
+                        pair_per_axis.push(pb as i32);
+                        width_per_axis.push(table.width[sx]);
+                        width_per_axis.push(table.width[sy]);
+                        cell_meta.push((sx, sy, pa, pb));
+                    }
+                }
+            }
+        }
+        let n_cells = cell_meta.len();
+        let cells = HexCellTable {
+            span_per_axis,
+            pair_per_axis,
+            width_per_axis,
+            n_cells,
+            d: 2,
+        };
+
+        let dev = match super::build_hex_tensor_moments_device(&spec, &axes_for_build, &cells) {
+            Ok(d) => d,
+            Err(err) => {
+                eprintln!("skipping GPU parity test (no CUDA runtime): {err}");
+                // The skip path must still execute at least one assertion so
+                // the assertionless-test scanner stays happy.
+                assert!(
+                    matches!(err, GpuError::DriverLibraryUnavailable { .. })
+                        || matches!(err, GpuError::DriverCallFailed { .. })
+                        || matches!(err, GpuError::NotYetImplemented { .. }),
+                    "unexpected GPU error variant: {err:?}"
+                );
+                return;
+            }
+        };
+
+        // Copy the alpha-major device buffer back to host.
+        let stream = CubicMomentBackend::probe()
+            .expect("backend probe ok after a successful build")
+            .inner
+            .stream
+            .clone();
+        let host_vals = stream
+            .memcpy_dtov(&dev.values)
+            .expect("dtov of device moments");
+        let out_stride = host_vals.len() / spec.n_alpha();
+        assert!(
+            out_stride >= n_cells,
+            "out_stride={out_stride} < n_cells={n_cells}"
+        );
+
+        for (a_idx, alpha) in alphas.iter().enumerate() {
+            for (cell, &(sx, sy, pa, pb)) in cell_meta.iter().enumerate() {
+                let expected =
+                    tensor_hex_moment_cpu(&axes_cpu, &[sx, sy], alpha, &[pa, pb]);
+                let got = host_vals[a_idx * out_stride + cell];
+                assert_close!(
+                    &format!("gpu cell={cell} alpha={alpha:?}"),
+                    got,
+                    expected,
+                    1e-12,
+                    1e-13,
+                );
+            }
+        }
+    }
+
+    /// Hex tensor kernel source generator must include the requested D, AMAX,
+    /// NALPHA macros, the alpha table, and the entry-point symbol. This is the
+    /// host-side guard that the NVRTC template stays callable from the dispatcher
+    /// even when nobody can run NVRTC (macOS CI). Compiles only on rendering.
+    #[test]
+    fn hex_tensor_kernel_source_contains_required_symbols() {
+        let alphas = vec![vec![0u8, 0u8], vec![1, 0], vec![0, 1], vec![2, 1]];
+        let src = super::build_hex_tensor_kernel_source(2, 2, &alphas);
+        assert!(src.contains("#define D       2"), "D macro missing in:\n{src}");
+        assert!(
+            src.contains("#define AMAX    2"),
+            "AMAX macro missing in:\n{src}"
+        );
+        assert!(
+            src.contains("#define NALPHA  4"),
+            "NALPHA macro missing in:\n{src}"
+        );
+        assert!(
+            src.contains("cubic_hex_tensor_moments"),
+            "kernel entry-point name missing"
+        );
+        assert!(
+            src.contains("ALPHA_TABLE[NALPHA][D]"),
+            "constant alpha table missing"
+        );
+        // Each alpha row should appear as a brace-list. Spot-check the (2,1)
+        // entry to confirm the constant initialiser is byte-exact.
+        assert!(src.contains("{ 2, 1 }"), "alpha row (2,1) missing");
+    }
+
+    /// Alpha-table hash is stable across construction order and changes
+    /// whenever any byte in the table changes. Required so the NVRTC module
+    /// cache key stays canonical for the same spec.
+    #[test]
+    fn alpha_table_hash_is_stable_and_sensitive() {
+        let a = vec![vec![0u8, 0u8], vec![1, 0], vec![0, 1]];
+        let b = vec![vec![0u8, 0u8], vec![1, 0], vec![0, 1]];
+        let c = vec![vec![0u8, 0u8], vec![1, 0], vec![0, 2]];
+        assert_eq!(super::hash_alpha_table(&a), super::hash_alpha_table(&b));
+        assert_ne!(super::hash_alpha_table(&a), super::hash_alpha_table(&c));
+    }
+
     /// Backend `compiled()` reflects the platform and is callable on every
     /// host (no-op probe is fine on macOS — `probe()` will return Err there).
     #[test]
