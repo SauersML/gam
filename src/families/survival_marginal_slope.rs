@@ -3043,11 +3043,21 @@ fn rigid_observed_eta(q: f64, g: f64, z: f64, probit_scale: f64) -> f64 {
 /// contributes to η₀; the alias structure the audit reported on the
 /// biobank-scale fit is along the η₁ channel (time ↔ marginal ↔ logslope
 /// ↔ score_warp ↔ link_dev all share constant + low-order columns that
-/// project onto η₁). A fully chain-corrected metric would carry a per-
-/// block per-row scale into the W-inner product and apply the same
-/// scale at predict time through `anchor_correction_matrix`; that is a
-/// multi-file refactor (deviation_runtime + predict.rs + per-block
-/// chain tables) and is deliberately scoped out of this construction.
+/// project onto η₁). A fully chain-corrected metric is exactly what
+/// `families::identifiability_compiler` (Phase 3, family-agnostic
+/// `RowJacobianOperator` / `RowHessian` / `AnchorRowEvaluator` driver)
+/// provides as the canonical home; this SMGS pre-PIRLS pilot reparam is
+/// the principled scope for *alias killing only*. Two blocks with the
+/// same chain factor (time ↔ marginal here, both `dη₁/dq = c`) produce
+/// identical η contributions iff their bare-design columns are linearly
+/// dependent — killed by bare-design orthogonality regardless of chain.
+/// Different-chain aliases (marginal ↔ logslope) require alias structure
+/// that exactly matches the chain ratio `(q₁·c₁ + s_f·z)/c`, a
+/// degenerate case not observed. The biobank-scale alias chain the audit
+/// reported (`time ↔ marginal ↔ logslope ↔ score_warp ↔ link_dev`) is
+/// driven by shared constant + low-order columns — chain-independent and
+/// killed by this scalar W. The reparam is one-shot and pre-PIRLS by
+/// necessity: PIRLS itself cannot proceed on the aliased design.
 fn survival_pilot_irls_row_metric_at_eta(
     eta_pilot: &Array1<f64>,
     sample_weights: &Array1<f64>,
@@ -17740,22 +17750,14 @@ pub(crate) struct JointPreflightSegment {
 ///
 /// Stacks the per-block training-row designs horizontally into a single
 /// `n x p_joint` matrix `J`, pre-scales by `sqrt(W)`, and runs a thin-SVD
-/// via [`crate::faer_ndarray::FaerSvd`]. Returns `Ok(())` if every
-/// singular value is above the numerical-rank tolerance
-/// `sigma_max * max(n, p_joint) * 16 * f64::EPSILON`. Otherwise returns
-/// [`SurvivalMarginalSlopeError::JointRankDeficient`] with the alias
-/// directions localised to dominant `(block, local_col, weight)` triples.
-///
-/// This is the certificate that PIRLS will see a full-rank Hessian: the
-/// per-block cross-block reparameterisation in
-/// `enforce_cross_block_identifiability_for_flex_block` enforces span
-/// orthogonality one candidate-vs-union pair at a time, but the joint
-/// design's column rank can still collapse if (i) the anchor union
-/// itself is rank-deficient, or (ii) the per-block W-metric `drop_tol`
-/// admitted a direction the joint SVD rejects under a tighter rank
-/// threshold. Either way, the diagnostic localises which block x column
-/// dominates each alias direction so the operator can resolve the
-/// model-spec error before any pilot iteration fires.
+/// via [`crate::faer_ndarray::FaerSvd`]. Always returns `Ok(())`; if any
+/// singular value falls at or below the numerical-rank tolerance
+/// `sigma_max * max(n, p_joint) * 16 * f64::EPSILON`, emits an info-level
+/// log line localising each alias to its dominant `(block, local_col, weight)`
+/// triple. The canonical-gauge pipeline in
+/// `custom_family.rs::canonicalize_for_identifiability` attributes the alias
+/// drops via `gauge_priority` and reduces the specs before any inner Newton
+/// fires, so this preflight is diagnostic-only.
 pub(crate) fn joint_training_design_preflight(
     segments: &[JointPreflightSegment],
     weights: &Array1<f64>,
