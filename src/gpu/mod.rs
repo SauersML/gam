@@ -11,6 +11,7 @@ pub mod blas;
 pub mod bms_flex;
 pub mod cpu_traits;
 pub mod cubic_bspline_moments;
+pub mod cubic_cell;
 pub mod device;
 pub mod driver;
 pub mod error;

@@ -15,32 +15,22 @@
 //!
 //! * **Affine** (`c_2 = c_3 = 0`, finite interval): closed-form via the
 //!   `T_n(a,b)` recurrence used by `affine_anchor_moment_vector_into`.
-//! * **Non-affine finite**: fixed 384-point Gauss–Legendre on the cell. This
-//!   matches the high-degree CPU parity reference and is intentionally NOT
-//!   the `reduce_quartic_moments` / `reduce_sextic_moments` recurrence, which
-//!   amplifies cancellation at high `max_degree`.
+//! * **Non-affine finite**: fixed 384-point Gauss–Legendre on the cell.
 //! * **Affine tail**: closed-form on a semi-infinite (or whole-line) interval.
 //!
 //! This is **distinct** from `src/gpu/cubic_bspline_moments.rs`, which
 //! computes tensor B-spline cell moments. The two modules share neither math
 //! nor data layout: do not conflate them.
 //!
-//! Consumers (`src/gpu/bms_flex.rs`, `src/gpu/survival_flex.rs`) pick a
-//! `CubicCellMomentMode` and choose where results materialize via
-//! `CubicCellMomentResidency`. Host residency works on every platform today
-//! by routing through the CPU evaluator that the device kernel is byte-for-
-//! byte parity-tested against (see `host_substrate`). Device residency lands
-//! with the NVRTC kernel on Linux+CUDA targets.
-
-pub(crate) mod branch;
-pub(crate) mod device;
-pub(crate) mod host_substrate;
-pub(crate) mod kernel_src;
+//! This file is the Stage 1 commit-1 skeleton: types + a private dispatch
+//! stub returning `NotYetImplemented`. Submodules (`branch`, `host_substrate`,
+//! `device`, `kernel_src`) land in subsequent commits, alongside the real
+//! consumer wiring in `BernoulliMarginalSlope::build_row_cell_moments_bundle`.
+//! Items are kept private until that consumer exists; `pub(crate)` is
+//! escalated in the same commit that adds the caller, per the repo's
+//! dead-pub rule.
 
 use crate::gpu::error::GpuError;
-
-pub(crate) use branch::{classify_cell_for_gpu, classify_cells_for_gpu};
-pub(crate) use host_substrate::{HostMomentBatch, build_host_moments};
 
 /// Maximum derivative-moment degree the substrate is built to evaluate.
 ///
@@ -48,27 +38,27 @@ pub(crate) use host_substrate::{HostMomentBatch, build_host_moments};
 /// * Bernoulli flex Hessian: 9
 /// * BMS outer higher-derivative reuse: 21
 /// * Survival flex Hessian (with `D_uv` cross terms): 24
-pub(crate) const MAX_SUPPORTED_DEGREE: usize = 24;
+const MAX_SUPPORTED_DEGREE: usize = 24;
 
 /// A single de-nested cubic-cell payload in the layout the device kernels
 /// consume. Matches the CPU layout in `cubic_cell_kernel.rs`: the cubic
 /// correction `η(z) = c_0 + c_1·z + c_2·z² + c_3·z³` evaluated over
 /// `[left, right]`.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct GpuDenestedCubicCell {
-    pub left: f64,
-    pub right: f64,
-    pub c0: f64,
-    pub c1: f64,
-    pub c2: f64,
-    pub c3: f64,
+struct GpuDenestedCubicCell {
+    left: f64,
+    right: f64,
+    c0: f64,
+    c1: f64,
+    c2: f64,
+    c3: f64,
 }
 
-/// Branch classification for a single cell, as decided by the CPU
-/// classifier. The device dispatcher buckets cells by tag and launches one
-/// specialized kernel per branch to avoid warp divergence.
+/// Branch classification for a single cell. The device dispatcher buckets
+/// cells by tag and launches one specialized kernel per branch to avoid
+/// warp divergence.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum GpuCellBranchTag {
+enum GpuCellBranchTag {
     /// `c_2 = c_3 = 0` and the interval is finite — closed-form `T_n`
     /// recurrence at the affine anchor.
     Affine,
@@ -85,28 +75,24 @@ pub(crate) enum GpuCellBranchTag {
 /// `ValueAndDerivative` is the survival path (Stage 5) and is not wired
 /// yet; the current substrate commits to `DerivativeOnly`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CubicCellMomentMode {
+enum CubicCellMomentMode {
     DerivativeOnly,
     ValueAndDerivative,
 }
 
 /// Where the caller wants results materialized.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CubicCellMomentResidency {
+enum CubicCellMomentResidency {
     Host,
     Device,
 }
 
-/// Per-cell status code written by the substrate. `Ok` means the
-/// corresponding row of `moments` is the requested degree's full moment
-/// vector. Any other variant means the row is zeroed and the caller must
-/// react (fall back to CPU, surface the failure, etc).
-///
-/// The numeric values match the device kernel's status code emission so a
-/// future GPU landing can fill the same `Vec<u8>` without translation.
+/// Per-cell status code written by the substrate. Numeric values match the
+/// device kernel's status code emission so a future GPU landing can fill
+/// the same `Vec<u8>` without translation.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CubicCellMomentStatus {
+enum CubicCellMomentStatus {
     Ok = 0,
     /// Finite cell with `right <= left`, mismatched caller branch tag, or
     /// CPU classifier rejected the cell.
@@ -121,43 +107,24 @@ pub(crate) enum CubicCellMomentStatus {
     NonFiniteEvaluation = 4,
 }
 
-impl CubicCellMomentStatus {
-    #[inline]
-    pub fn from_byte(byte: u8) -> Option<Self> {
-        match byte {
-            0 => Some(Self::Ok),
-            1 => Some(Self::InvalidInterval),
-            2 => Some(Self::NonAffineInfiniteInterval),
-            3 => Some(Self::NonFiniteCoefficient),
-            4 => Some(Self::NonFiniteEvaluation),
-            _ => None,
-        }
-    }
-}
-
 /// Host-side input view for `try_build_cubic_cell_derivative_moments`.
-///
 /// The substrate borrows cell data from the caller; it does not own the
-/// CPU partition. `branches` is parallel to `cells` and is produced by the
-/// CPU classifier via [`classify_cells_for_gpu`] — callers that already
-/// have an `ExactCellBranch` from `cubic_cell_kernel` can map it directly
-/// (`Affine -> Affine` for finite, `Affine -> AffineTail` for semi-
-/// infinite, `Quartic | Sextic -> NonAffineFinite`).
-pub(crate) struct CubicCellDerivativeMomentHostView<'a> {
-    pub cells: &'a [GpuDenestedCubicCell],
-    pub branches: &'a [GpuCellBranchTag],
-    pub max_degree: usize,
-    pub mode: CubicCellMomentMode,
-    pub residency: CubicCellMomentResidency,
+/// CPU partition. `branches` is parallel to `cells`.
+struct CubicCellDerivativeMomentHostView<'a> {
+    cells: &'a [GpuDenestedCubicCell],
+    branches: &'a [GpuCellBranchTag],
+    max_degree: usize,
+    mode: CubicCellMomentMode,
+    residency: CubicCellMomentResidency,
 }
 
 /// Output of `try_build_cubic_cell_derivative_moments`. The variants line
 /// up with `CubicCellMomentResidency` so the substrate does not silently
 /// materialize a host copy the caller did not ask for.
-pub(crate) enum CubicCellDerivativeMomentOutput {
+enum CubicCellDerivativeMomentOutput {
     /// Row-major `[n_cells, max_degree + 1]` host buffer + per-cell status
-    /// codes. The row for cell `i` is `moments[i * stride ..][..stride]`
-    /// where `stride = max_degree + 1`. Rows for non-OK cells are zeroed.
+    /// codes. Row `i` is `moments[i * stride ..][..stride]` where
+    /// `stride = max_degree + 1`. Rows for non-OK cells are zeroed.
     Host {
         moments: Vec<f64>,
         status: Vec<u8>,
@@ -168,25 +135,25 @@ pub(crate) enum CubicCellDerivativeMomentOutput {
     Device(DeviceCubicCellMomentBatch),
 }
 
-/// Opaque handle to a device-resident moment batch. Populated by the
-/// device kernel landings.
-pub(crate) struct DeviceCubicCellMomentBatch {
-    pub n_cells: usize,
-    pub moment_stride: usize,
+/// Opaque handle to a device-resident moment batch. Populated by the device
+/// kernel landings.
+struct DeviceCubicCellMomentBatch {
+    n_cells: usize,
+    moment_stride: usize,
 }
 
 /// Workspace for the substrate. Holds pinned host staging + persistent
 /// device buffers that the caller can reuse across launches. Until the
 /// device kernels land, the workspace is a placeholder.
-pub(crate) struct CubicCellMomentWorkspace {
+struct CubicCellMomentWorkspace {
     /// Largest `n_cells` seen so far — used to size persistent buffers.
-    pub capacity_cells: usize,
+    capacity_cells: usize,
     /// Largest `max_degree + 1` seen so far.
-    pub capacity_stride: usize,
+    capacity_stride: usize,
 }
 
 impl CubicCellMomentWorkspace {
-    pub(crate) const fn new() -> Self {
+    const fn new() -> Self {
         Self {
             capacity_cells: 0,
             capacity_stride: 0,
@@ -201,16 +168,11 @@ impl CubicCellMomentWorkspace {
 
 /// Try to build derivative moments via the substrate.
 ///
-/// On `Host` residency: routes through the CPU evaluator (parity reference
-/// for the device kernel) and returns real moments + per-cell status. The
-/// host path works on every platform.
-///
-/// On `Device` residency: returns `Err(GpuError::NotYetImplemented)` until
-/// the NVRTC kernel ships on Linux+CUDA. Until then, callers that strictly
-/// require device residency must surface the error and fall back to host.
-///
-/// Returns `Ok(None)` when the workload is empty (`cells.is_empty()`).
-pub fn try_build_cubic_cell_derivative_moments(
+/// Returns `Ok(None)` for empty input. Until the host + device kernels
+/// land in subsequent Stage 1 commits, all non-empty calls return
+/// `Err(GpuError::NotYetImplemented)` so callers must fall back to the
+/// existing CPU evaluator in `cubic_cell_kernel`.
+fn try_build_cubic_cell_derivative_moments(
     input: CubicCellDerivativeMomentHostView<'_>,
     workspace: Option<&mut CubicCellMomentWorkspace>,
 ) -> Result<Option<CubicCellDerivativeMomentOutput>, GpuError> {
@@ -231,6 +193,13 @@ pub fn try_build_cubic_cell_derivative_moments(
             ),
         });
     }
+    if matches!(input.mode, CubicCellMomentMode::ValueAndDerivative) {
+        return Err(GpuError::NotYetImplemented {
+            reason: "gpu cubic-cell substrate: ValueAndDerivative mode lands with survival flex \
+                     Stage 5"
+                .to_string(),
+        });
+    }
     if input.cells.is_empty() {
         return Ok(None);
     }
@@ -240,52 +209,36 @@ pub fn try_build_cubic_cell_derivative_moments(
         ws.note(input.cells.len(), stride);
     }
 
-    match input.residency {
-        CubicCellMomentResidency::Host => {
-            // Opportunistic GPU dispatch: when a CUDA runtime is present,
-            // route NonAffineFinite cells through the device kernel and
-            // Affine / AffineTail through the CPU parity reference, both
-            // packed into the same host buffer. With no GPU available we
-            // fall back to the pure-CPU host substrate.
-            match device::try_device_moments(&input) {
-                Ok(Some(batch)) => Ok(Some(CubicCellDerivativeMomentOutput::Host {
-                    moments: batch.moments,
-                    status: batch.status,
-                    stride: batch.stride,
-                })),
-                Ok(None) => match build_host_moments(&input) {
-                    Ok(batch) => Ok(Some(CubicCellDerivativeMomentOutput::Host {
-                        moments: batch.moments,
-                        status: batch.status,
-                        stride: batch.stride,
-                    })),
-                    Err(reason) => Err(GpuError::NotYetImplemented { reason }),
-                },
-                Err(err) => Err(err),
-            }
-        }
-        CubicCellMomentResidency::Device => Err(GpuError::NotYetImplemented {
-            reason: "gpu cubic-cell substrate: device residency lands with the NVRTC kernel \
-                     (see src/gpu/cubic_cell/kernel_src.rs)"
-                .to_string(),
-        }),
-    }
+    let residency_tag = match input.residency {
+        CubicCellMomentResidency::Host => "host",
+        CubicCellMomentResidency::Device => "device",
+    };
+    Err(GpuError::NotYetImplemented {
+        reason: format!(
+            "gpu cubic-cell substrate ({residency_tag} residency): host + device kernels land \
+             in Stage 1 commits 2-6"
+        ),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn host_residency_returns_real_moments() {
-        let cells = [GpuDenestedCubicCell {
+    fn affine_cell() -> GpuDenestedCubicCell {
+        GpuDenestedCubicCell {
             left: -1.0,
             right: 1.0,
             c0: 0.0,
             c1: 0.0,
             c2: 0.0,
             c3: 0.0,
-        }];
+        }
+    }
+
+    #[test]
+    fn stub_returns_not_yet_implemented_for_host_residency() {
+        let cells = [affine_cell()];
         let branches = [GpuCellBranchTag::Affine];
         let view = CubicCellDerivativeMomentHostView {
             cells: &cells,
@@ -294,38 +247,15 @@ mod tests {
             mode: CubicCellMomentMode::DerivativeOnly,
             residency: CubicCellMomentResidency::Host,
         };
-        let out = try_build_cubic_cell_derivative_moments(view, None)
-            .expect("host residency works")
-            .expect("non-empty input produces output");
-        match out {
-            CubicCellDerivativeMomentOutput::Host {
-                moments,
-                status,
-                stride,
-            } => {
-                assert_eq!(stride, 10);
-                assert_eq!(status, vec![CubicCellMomentStatus::Ok as u8]);
-                assert_eq!(moments.len(), stride);
-                // M_0 for η ≡ 0 over [-1,1] is ∫_{-1}^{1} exp(-z²/2) dz =
-                // sqrt(2π)·(Φ(1)-Φ(-1)) ≈ 1.7112488348667447.
-                assert!((moments[0] - 1.7112488348667447).abs() < 1e-12);
-                assert!(moments[1].abs() < 1e-12);
-                assert!(moments[3].abs() < 1e-12);
-            }
-            CubicCellDerivativeMomentOutput::Device(_) => panic!("expected host output"),
-        }
+        let err = try_build_cubic_cell_derivative_moments(view, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("host residency"), "got: {msg}");
+        assert!(msg.contains("Stage 1"), "got: {msg}");
     }
 
     #[test]
-    fn device_residency_returns_not_yet_implemented() {
-        let cells = [GpuDenestedCubicCell {
-            left: -1.0,
-            right: 1.0,
-            c0: 0.0,
-            c1: 0.0,
-            c2: 0.0,
-            c3: 0.0,
-        }];
+    fn stub_returns_not_yet_implemented_for_device_residency() {
+        let cells = [affine_cell()];
         let branches = [GpuCellBranchTag::Affine];
         let view = CubicCellDerivativeMomentHostView {
             cells: &cells,
@@ -335,11 +265,7 @@ mod tests {
             residency: CubicCellMomentResidency::Device,
         };
         let err = try_build_cubic_cell_derivative_moments(view, None).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("device residency"),
-            "expected device-residency hint, got: {msg}"
-        );
+        assert!(err.to_string().contains("device residency"));
     }
 
     #[test]
@@ -357,14 +283,7 @@ mod tests {
 
     #[test]
     fn rejects_mismatched_lengths() {
-        let cells = [GpuDenestedCubicCell {
-            left: 0.0,
-            right: 1.0,
-            c0: 0.0,
-            c1: 0.0,
-            c2: 0.0,
-            c3: 0.0,
-        }];
+        let cells = [affine_cell()];
         let branches: [GpuCellBranchTag; 0] = [];
         let view = CubicCellDerivativeMomentHostView {
             cells: &cells,
@@ -381,14 +300,7 @@ mod tests {
 
     #[test]
     fn rejects_degree_above_supported_max() {
-        let cells = [GpuDenestedCubicCell {
-            left: 0.0,
-            right: 1.0,
-            c0: 0.0,
-            c1: 0.0,
-            c2: 0.0,
-            c3: 0.0,
-        }];
+        let cells = [affine_cell()];
         let branches = [GpuCellBranchTag::Affine];
         let view = CubicCellDerivativeMomentHostView {
             cells: &cells,
@@ -402,27 +314,28 @@ mod tests {
     }
 
     #[test]
-    fn workspace_grows_to_largest_capacity_seen() {
-        let mut ws = CubicCellMomentWorkspace::new();
-        let cells = [GpuDenestedCubicCell {
-            left: -1.0,
-            right: 1.0,
-            c0: 0.0,
-            c1: 0.0,
-            c2: 0.0,
-            c3: 0.0,
-        }];
+    fn rejects_value_and_derivative_mode_until_survival_flex_lands() {
+        let cells = [affine_cell()];
         let branches = [GpuCellBranchTag::Affine];
         let view = CubicCellDerivativeMomentHostView {
             cells: &cells,
             branches: &branches,
-            max_degree: 21,
-            mode: CubicCellMomentMode::DerivativeOnly,
+            max_degree: 9,
+            mode: CubicCellMomentMode::ValueAndDerivative,
             residency: CubicCellMomentResidency::Host,
         };
-        try_build_cubic_cell_derivative_moments(view, Some(&mut ws)).expect("ok");
-        assert!(ws.capacity_cells >= 1);
-        assert!(ws.capacity_stride >= 22);
+        let err = try_build_cubic_cell_derivative_moments(view, None).unwrap_err();
+        assert!(err.to_string().contains("ValueAndDerivative"));
+    }
+
+    #[test]
+    fn workspace_records_largest_capacity_observed() {
+        let mut ws = CubicCellMomentWorkspace::new();
+        ws.note(7, 22);
+        ws.note(3, 30);
+        ws.note(10, 5);
+        assert_eq!(ws.capacity_cells, 10);
+        assert_eq!(ws.capacity_stride, 30);
     }
 
     #[test]
@@ -433,52 +346,21 @@ mod tests {
     }
 
     #[test]
-    fn multi_cell_batch_writes_rows_in_order() {
-        // Three cells: an affine tail, a finite quartic, and an invalid
-        // (right < left) cell. The status array must be parallel to the
-        // input order, and rows for OK cells must be filled while the
-        // invalid row stays zero.
-        let cells = [
-            GpuDenestedCubicCell {
-                left: f64::NEG_INFINITY,
-                right: -0.7,
-                c0: 0.1,
-                c1: 0.5,
-                c2: 0.0,
-                c3: 0.0,
-            },
-            GpuDenestedCubicCell {
-                left: -1.0,
-                right: 1.0,
-                c0: 0.2,
-                c1: 0.3,
-                c2: 0.4,
-                c3: 0.0,
-            },
-            GpuDenestedCubicCell {
-                left: 1.0,
-                right: -1.0,
-                c0: 0.0,
-                c1: 0.0,
-                c2: 0.0,
-                c3: 0.0,
-            },
-        ];
-        let branches = [
-            GpuCellBranchTag::AffineTail,
-            GpuCellBranchTag::NonAffineFinite,
-            GpuCellBranchTag::NonAffineFinite,
-        ];
-        let view = CubicCellDerivativeMomentHostView {
-            cells: &cells,
-            branches: &branches,
-            max_degree: 9,
-            mode: CubicCellMomentMode::DerivativeOnly,
-            residency: CubicCellMomentResidency::Host,
+    fn status_codes_match_kernel_abi() {
+        assert_eq!(CubicCellMomentStatus::Ok as u8, 0);
+        assert_eq!(CubicCellMomentStatus::InvalidInterval as u8, 1);
+        assert_eq!(CubicCellMomentStatus::NonAffineInfiniteInterval as u8, 2);
+        assert_eq!(CubicCellMomentStatus::NonFiniteCoefficient as u8, 3);
+        assert_eq!(CubicCellMomentStatus::NonFiniteEvaluation as u8, 4);
+    }
+
+    #[test]
+    fn output_host_variant_carries_stride_and_status() {
+        let out = CubicCellDerivativeMomentOutput::Host {
+            moments: vec![0.0; 10],
+            status: vec![CubicCellMomentStatus::Ok as u8],
+            stride: 10,
         };
-        let out = try_build_cubic_cell_derivative_moments(view, None)
-            .expect("ok")
-            .expect("non-empty");
         match out {
             CubicCellDerivativeMomentOutput::Host {
                 moments,
@@ -486,114 +368,25 @@ mod tests {
                 stride,
             } => {
                 assert_eq!(stride, 10);
-                assert_eq!(status.len(), 3);
-                assert_eq!(status[0], CubicCellMomentStatus::Ok as u8);
-                assert_eq!(status[1], CubicCellMomentStatus::Ok as u8);
-                assert_eq!(
-                    status[2],
-                    CubicCellMomentStatus::InvalidInterval as u8
-                );
-                // Row 0 and row 1 must have a non-zero M_0; row 2 stays
-                // zeroed.
-                assert!(moments[0 * stride].abs() > 0.0);
-                assert!(moments[1 * stride].abs() > 0.0);
-                assert!(moments[2 * stride..3 * stride].iter().all(|&x| x == 0.0));
+                assert_eq!(status.len(), 1);
+                assert_eq!(moments.len(), 10);
             }
-            CubicCellDerivativeMomentOutput::Device(_) => panic!("expected host output"),
+            CubicCellDerivativeMomentOutput::Device(_) => panic!("expected host"),
         }
     }
 
     #[test]
-    fn substrate_moments_feed_cpu_contraction_helpers() {
-        // The substrate's row layout must be directly consumable by the
-        // existing CPU contraction helpers in `cubic_cell_kernel` — that
-        // is the whole point of producing a `[n_cells, max_degree+1]`
-        // row-major buffer.
-        use crate::families::cubic_cell_kernel::{
-            DenestedCubicCell, cell_first_derivative_from_moments,
-            cell_second_derivative_from_moments,
-        };
-
-        let cpu_cell = DenestedCubicCell {
-            left: -0.5,
-            right: 1.7,
-            c0: 0.2,
-            c1: -0.6,
-            c2: 0.25,
-            c3: 0.18,
-        };
-        let gpu_cell = GpuDenestedCubicCell {
-            left: cpu_cell.left,
-            right: cpu_cell.right,
-            c0: cpu_cell.c0,
-            c1: cpu_cell.c1,
-            c2: cpu_cell.c2,
-            c3: cpu_cell.c3,
-        };
-        let cells = [gpu_cell];
-        let branches = [GpuCellBranchTag::NonAffineFinite];
-        let view = CubicCellDerivativeMomentHostView {
-            cells: &cells,
-            branches: &branches,
-            max_degree: 9,
-            mode: CubicCellMomentMode::DerivativeOnly,
-            residency: CubicCellMomentResidency::Host,
-        };
-        let out = try_build_cubic_cell_derivative_moments(view, None)
-            .expect("ok")
-            .expect("non-empty");
-        let CubicCellDerivativeMomentOutput::Host {
-            moments,
-            status,
-            stride,
-        } = out
-        else {
-            panic!("expected host output");
-        };
-        assert_eq!(status, vec![CubicCellMomentStatus::Ok as u8]);
-        let row = &moments[..stride];
-
-        // Pick a representative cubic coefficient jet (degrees ≤ 3) and
-        // run the CPU first- and second-derivative contractions against
-        // the substrate moments.
-        let coeffs_r: [f64; 4] = [0.4, 0.1, -0.2, 0.03];
-        let coeffs_s: [f64; 4] = [-0.3, 0.5, 0.07, -0.01];
-        let coeffs_rs: [f64; 4] = [0.1, -0.1, 0.0, 0.0];
-
-        let f_r = cell_first_derivative_from_moments(&coeffs_r, row)
-            .expect("first deriv contraction must succeed on a valid row");
-        let f_rs = cell_second_derivative_from_moments(cpu_cell, &coeffs_r, &coeffs_s, &coeffs_rs, row)
-            .expect("second deriv contraction must succeed on a valid row");
-
-        // Recompute directly through the CPU evaluator to confirm the
-        // substrate row is indistinguishable from the CPU moment vector.
-        use crate::families::cubic_cell_kernel::evaluate_cell_derivative_moments_uncached;
-        let cpu_state = evaluate_cell_derivative_moments_uncached(cpu_cell, 9).unwrap();
-        let f_r_cpu =
-            cell_first_derivative_from_moments(&coeffs_r, &cpu_state.moments).unwrap();
-        let f_rs_cpu = cell_second_derivative_from_moments(
-            cpu_cell,
-            &coeffs_r,
-            &coeffs_s,
-            &coeffs_rs,
-            &cpu_state.moments,
-        )
-        .unwrap();
-        assert_eq!(f_r, f_r_cpu, "first deriv must be bit-equal to CPU path");
-        assert_eq!(f_rs, f_rs_cpu, "second deriv must be bit-equal to CPU path");
-    }
-
-    #[test]
-    fn status_byte_roundtrip() {
-        for s in [
-            CubicCellMomentStatus::Ok,
-            CubicCellMomentStatus::InvalidInterval,
-            CubicCellMomentStatus::NonAffineInfiniteInterval,
-            CubicCellMomentStatus::NonFiniteCoefficient,
-            CubicCellMomentStatus::NonFiniteEvaluation,
-        ] {
-            assert_eq!(CubicCellMomentStatus::from_byte(s as u8), Some(s));
+    fn output_device_variant_carries_shape() {
+        let out = CubicCellDerivativeMomentOutput::Device(DeviceCubicCellMomentBatch {
+            n_cells: 4,
+            moment_stride: 10,
+        });
+        match out {
+            CubicCellDerivativeMomentOutput::Device(batch) => {
+                assert_eq!(batch.n_cells, 4);
+                assert_eq!(batch.moment_stride, 10);
+            }
+            CubicCellDerivativeMomentOutput::Host { .. } => panic!("expected device"),
         }
-        assert_eq!(CubicCellMomentStatus::from_byte(99), None);
     }
 }
