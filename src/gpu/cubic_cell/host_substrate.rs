@@ -271,6 +271,109 @@ mod tests {
     }
 
     #[test]
+    fn cubic_cell_substrate_parity_against_cpu_evaluator() {
+        // Multi-cell fabricated partition mimicking the shape BMS feeds in:
+        // two affine tails bracketing a handful of interior microcells with a
+        // mix of pure-affine, quartic, and sextic coefficients. The substrate
+        // must return the exact CPU evaluator's moment vector for every cell,
+        // at every degree the consumers care about.
+        let cells_cpu = [
+            DenestedCubicCell {
+                left: f64::NEG_INFINITY,
+                right: -1.5,
+                c0: 0.05,
+                c1: 0.4,
+                c2: 0.0,
+                c3: 0.0,
+            },
+            DenestedCubicCell {
+                left: -1.5,
+                right: -0.3,
+                c0: -0.1,
+                c1: 0.2,
+                c2: 0.0,
+                c3: 0.0,
+            },
+            DenestedCubicCell {
+                left: -0.3,
+                right: 0.4,
+                c0: 0.0,
+                c1: 0.5,
+                c2: 0.3,
+                c3: 0.0,
+            },
+            DenestedCubicCell {
+                left: 0.4,
+                right: 1.1,
+                c0: 0.15,
+                c1: -0.25,
+                c2: 0.1,
+                c3: 0.18,
+            },
+            DenestedCubicCell {
+                left: 1.1,
+                right: 2.0,
+                c0: -0.2,
+                c1: 0.6,
+                c2: 0.0,
+                c3: 0.0,
+            },
+            DenestedCubicCell {
+                left: 2.0,
+                right: f64::INFINITY,
+                c0: 0.3,
+                c1: -0.4,
+                c2: 0.0,
+                c3: 0.0,
+            },
+        ];
+        let cells_gpu: Vec<GpuDenestedCubicCell> =
+            cells_cpu.iter().copied().map(gpu_from_cpu).collect();
+        let branches: Vec<GpuCellBranchTag> = cells_cpu
+            .iter()
+            .map(|c| {
+                if !c.left.is_finite() || !c.right.is_finite() {
+                    GpuCellBranchTag::AffineTail
+                } else if c.c2 == 0.0 && c.c3 == 0.0 {
+                    GpuCellBranchTag::Affine
+                } else {
+                    GpuCellBranchTag::NonAffineFinite
+                }
+            })
+            .collect();
+
+        // Exercise every degree the production consumers actually request
+        // (9 = Bernoulli flex Hessian, 15 = intermediate, 21 = BMS outer
+        // higher-derivative reuse).
+        for &max_degree in &[9usize, 15, 21] {
+            let view = CubicCellDerivativeMomentHostView {
+                cells: &cells_gpu,
+                branches: &branches,
+                max_degree,
+                mode: CubicCellMomentMode::DerivativeOnly,
+                residency: CubicCellMomentResidency::Host,
+            };
+            let out = build_host_moments(&view).expect("host substrate");
+            assert_eq!(out.stride, max_degree + 1);
+            assert_eq!(out.status.len(), cells_cpu.len());
+            for (i, &cell) in cells_cpu.iter().enumerate() {
+                assert_eq!(
+                    out.status[i],
+                    CubicCellMomentStatus::Ok as u8,
+                    "cell {i} status was {} at degree={max_degree}",
+                    out.status[i]
+                );
+                let row = &out.moments[i * out.stride..(i + 1) * out.stride];
+                // ulp_rel = 0.0 — the host substrate is a *deferring* wrapper
+                // around the same CPU evaluator, so bit-identical equality is
+                // the right bar. Any drift means the substrate has introduced
+                // a transformation that breaks consumers' assumptions.
+                assert_row_matches_cpu(row, cell, max_degree, 0.0);
+            }
+        }
+    }
+
+    #[test]
     fn host_substrate_flags_caller_branch_mismatch() {
         // A finite quartic cell, but the caller claims AffineTail.
         let gpu = GpuDenestedCubicCell {
