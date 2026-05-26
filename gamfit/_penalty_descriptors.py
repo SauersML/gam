@@ -59,11 +59,12 @@ def _to_numpy_f64(t: Any) -> np.ndarray:
 def _call_value_grad(
     t_flat: np.ndarray, n: int, d: int, target_name: str, descriptor: dict[str, Any]
 ) -> tuple[float, np.ndarray, np.ndarray]:
+    # rho=None lets the FFI fill a default zero rho sized to the registry's
+    # total_rho_count. These wrappers never manage rho themselves.
     latents_json = _latent_json(n, d, name=target_name)
     penalties_json = _penalty_json(descriptor)
-    rho = np.zeros(0, dtype=np.float64)
     value, grad, grad_rho = _rust_module().analytic_penalty_value_grad(
-        latents_json, penalties_json, t_flat, rho,
+        latents_json, penalties_json, t_flat, None,
     )
     return float(value), np.asarray(grad, dtype=np.float64), np.asarray(grad_rho, dtype=np.float64)
 
@@ -73,9 +74,8 @@ def _call_hvp(
 ) -> np.ndarray:
     latents_json = _latent_json(n, d, name=target_name)
     penalties_json = _penalty_json(descriptor)
-    rho = np.zeros(0, dtype=np.float64)
     out = _rust_module().analytic_penalty_hvp(
-        latents_json, penalties_json, t_flat, v_flat, rho,
+        latents_json, penalties_json, t_flat, v_flat, None,
     )
     return np.asarray(out, dtype=np.float64)
 
