@@ -644,6 +644,12 @@ extern "C" __global__ void reduce_q_weighted_gram(
         if !dense_indices.is_empty() {
             for &j in &dense_indices {
                 let DerivativeHessian::Dense(matrix) = &input.derivatives[j] else {
+                    // SAFETY: dense_indices was populated in the partition loop above
+                    // with exactly the indices whose variant is DerivativeHessian::Dense.
+                    // input.derivatives is immutably borrowed for the whole function so
+                    // the slot at index j cannot have been rewritten between partition and
+                    // this read; reaching this branch can only mean a future refactor split
+                    // the partition from its consumer. The panic names the offending index.
                     panic!(
                         "reml_trace dense path: derivative index {j} is in dense_indices but \
                          input.derivatives[{j}] is not DerivativeHessian::Dense — \
@@ -736,6 +742,11 @@ extern "C" __global__ void reduce_q_weighted_gram(
             for &j in &gram_indices {
                 let DerivativeHessian::WeightedGram { row_weights, .. } = &input.derivatives[j]
                 else {
+                    // SAFETY: gram_indices was populated in the partition loop above with
+                    // exactly the indices whose variant is DerivativeHessian::WeightedGram.
+                    // input.derivatives is immutably borrowed for the whole function so the
+                    // slot at j cannot have been rewritten between partition and read; a
+                    // failure here is a future-refactor bug, not a runtime input issue.
                     panic!(
                         "reml_trace structural path: derivative index {j} is in gram_indices \
                          but input.derivatives[{j}] is not DerivativeHessian::WeightedGram — \
@@ -783,6 +794,12 @@ extern "C" __global__ void reduce_q_weighted_gram(
                 let DerivativeHessian::WeightedGram { penalty_extra, .. } =
                     &input.derivatives[j]
                 else {
+                    // SAFETY: gram_indices was populated by the partition loop above with
+                    // exactly the WeightedGram-variant indices; the same indices are
+                    // re-walked here to pick up the optional penalty_extra field.
+                    // input.derivatives has been immutably borrowed since partitioning, so
+                    // the variant at index j cannot have changed. A let-else failure here
+                    // would mean a future refactor split partition from consumer loops.
                     panic!(
                         "reml_trace structural penalty_extra: derivative index {j} is in \
                          gram_indices but input.derivatives[{j}] is not \
