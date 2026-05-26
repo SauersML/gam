@@ -181,3 +181,137 @@ def test_cuda_candidates_add_driver_when_userspace_already_mapped(
     monkeypatch.setattr(_cuda, "_system_cuda_driver_dirs", lambda: (driver_dir,))
 
     assert _cuda._cuda_library_candidates() == (driver.resolve(),)
+
+
+# ---------------------------------------------------------------------------
+# Issue #229 — `format_cuda_diagnostics` / `assert_no_cuda_library_conflicts`
+# must be tolerant to partial diagnostics dicts, and `cuda_diagnostics()` must
+# keep advertising its full key set so consumers (tests, downstream tools) do
+# not silently drift.
+# ---------------------------------------------------------------------------
+
+
+_CUDA_DIAGNOSTICS_KEYS: frozenset[str] = frozenset(
+    {
+        "platform",
+        "mapped",
+        "conflicts",
+        "packaged_nvidia_roots",
+        "packaged_cuda_library_dirs",
+        "packaged_complete_stacks",
+        "system_driver_libraries",
+        "system_complete_stacks",
+    }
+)
+
+
+def test_cuda_diagnostics_pins_full_key_set() -> None:
+    """Production `cuda_diagnostics()` must always return the documented keys.
+
+    Pins the schema so silent drift (a key being renamed or dropped) is
+    caught here instead of in a downstream KeyError such as #229.
+    """
+
+    info = gamfit.cuda_diagnostics()
+    assert set(info.keys()) == set(_CUDA_DIAGNOSTICS_KEYS), (
+        "cuda_diagnostics() key set drifted from the documented schema; "
+        "any change here must be paired with format_cuda_diagnostics() and "
+        "any tests that monkeypatch a fake diagnostics dict."
+    )
+
+
+def test_format_cuda_diagnostics_tolerates_missing_packaged_cuda_library_dirs(
+    monkeypatch,
+) -> None:
+    """Repro of issue #229: omitting a list-shaped key must not crash.
+
+    Mirrors the exact fixture shape from
+    `test_assert_no_cuda_library_conflicts_warns_not_raises` (no
+    `packaged_cuda_library_dirs`). `format_cuda_diagnostics` must render a
+    `<none>` placeholder for the missing entry rather than raising
+    KeyError.
+    """
+
+    def fake_diagnostics() -> dict[str, object]:
+        return {
+            "platform": "linux",
+            "mapped": {},
+            "conflicts": {},
+            "packaged_nvidia_roots": [],
+            "packaged_complete_stacks": [],
+            "system_driver_libraries": [],
+            "system_complete_stacks": [],
+        }
+
+    monkeypatch.setattr(_cuda, "cuda_diagnostics", fake_diagnostics)
+    text = _cuda.format_cuda_diagnostics()
+    assert "packaged CUDA library dirs for subprocesses:" in text
+    # The placeholder line for the missing list MUST be rendered.
+    assert text.count("    <none>") >= 1
+
+
+def test_format_cuda_diagnostics_tolerates_each_list_key_missing(
+    monkeypatch,
+) -> None:
+    """Drop one list-shaped key at a time; formatter must never KeyError."""
+
+    base: dict[str, object] = {
+        "platform": "linux",
+        "mapped": {},
+        "conflicts": {},
+        "packaged_nvidia_roots": [],
+        "packaged_cuda_library_dirs": [],
+        "packaged_complete_stacks": [],
+        "system_driver_libraries": [],
+        "system_complete_stacks": [],
+    }
+    droppable = [
+        "packaged_nvidia_roots",
+        "packaged_cuda_library_dirs",
+        "packaged_complete_stacks",
+        "system_driver_libraries",
+        "system_complete_stacks",
+    ]
+    for missing in droppable:
+        partial = {k: v for k, v in base.items() if k != missing}
+        monkeypatch.setattr(_cuda, "cuda_diagnostics", lambda p=partial: p)
+        # Must not raise — every consumer of `info[...]` should treat a
+        # missing list-shaped key as an empty list.
+        text = _cuda.format_cuda_diagnostics()
+        assert "gamfit CUDA diagnostics:" in text, missing
+
+
+def test_assert_no_cuda_library_conflicts_handles_partial_fixture(
+    monkeypatch,
+) -> None:
+    """Exact #229 repro path.
+
+    The original fake_diagnostics in this file omits
+    `packaged_cuda_library_dirs`; with conflicts present, the warning code
+    path calls `format_cuda_diagnostics()` and used to crash with
+    KeyError. It must warn cleanly instead.
+    """
+
+    fake_conflicts = {
+        "libcublas": [
+            "/a/libcublas.so.12",
+            "/b/libcublas.so.12",
+        ],
+    }
+
+    def fake_diagnostics() -> dict[str, object]:
+        return {
+            "platform": "linux",
+            "mapped": dict(fake_conflicts),
+            "conflicts": dict(fake_conflicts),
+            "packaged_nvidia_roots": [],
+            "packaged_complete_stacks": [],
+            "system_driver_libraries": [],
+            "system_complete_stacks": [],
+        }
+
+    monkeypatch.setattr(_cuda, "cuda_diagnostics", fake_diagnostics)
+    monkeypatch.setattr(_cuda, "_CUDA_CONFLICT_WARNED", set())
+
+    # Must not raise KeyError('packaged_cuda_library_dirs').
+    _cuda.assert_no_cuda_library_conflicts("issue 229 context")
