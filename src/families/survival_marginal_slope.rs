@@ -105,6 +105,49 @@ pub enum SurvivalMarginalSlopeError {
     /// probit base link, flexible row calculus with K > 1, spatial psi
     /// for unsupported block roles, ...).
     UnsupportedConfiguration { reason: String },
+    /// The assembled joint training-row design across {time, marginal,
+    /// logslope, score_warp, link_dev} is numerically rank-deficient
+    /// under the W-metric thin-SVD certificate that runs immediately
+    /// after per-block cross-block identifiability reparam and before
+    /// the rigid pilot fires. Each alias direction is localised to its
+    /// dominant `(block, column)` so the model-spec author can lower a
+    /// knot count, remove a duplicated parametric term, or otherwise
+    /// resolve the residual alias the per-block W-metric drop tolerance
+    /// admitted. `columns` lists `(block, local_col, weight)` triples
+    /// for every alias direction (one row per small singular value),
+    /// flattened in order. `alias_directions` is the `(p_joint × k)`
+    /// matrix whose columns are the offending right singular vectors
+    /// in the joint column ordering.
+    JointRankDeficient {
+        reason: String,
+        columns: Vec<(JointPreflightBlock, usize, f64)>,
+        alias_directions: Array2<f64>,
+    },
+}
+
+/// Block tag used by the joint training-row preflight diagnostic.
+/// Names a single block in the joint design layout
+/// `[time | marginal | logslope | score_warp? | link_dev?]`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum JointPreflightBlock {
+    Time,
+    Marginal,
+    Logslope,
+    ScoreWarp,
+    LinkDev,
+}
+
+impl std::fmt::Display for JointPreflightBlock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            JointPreflightBlock::Time => "time",
+            JointPreflightBlock::Marginal => "marginal",
+            JointPreflightBlock::Logslope => "logslope",
+            JointPreflightBlock::ScoreWarp => "score_warp",
+            JointPreflightBlock::LinkDev => "link_dev",
+        };
+        f.write_str(name)
+    }
 }
 
 impl std::fmt::Display for SurvivalMarginalSlopeError {
@@ -115,7 +158,8 @@ impl std::fmt::Display for SurvivalMarginalSlopeError {
             | SurvivalMarginalSlopeError::MonotonicityViolation { reason }
             | SurvivalMarginalSlopeError::NumericalFailure { reason }
             | SurvivalMarginalSlopeError::IntegrationFailed { reason }
-            | SurvivalMarginalSlopeError::UnsupportedConfiguration { reason } => {
+            | SurvivalMarginalSlopeError::UnsupportedConfiguration { reason }
+            | SurvivalMarginalSlopeError::JointRankDeficient { reason, .. } => {
                 f.write_str(reason)
             }
         }
@@ -3938,38 +3982,30 @@ impl SurvivalMarginalSlopeFamily {
     }
 
     /// Two-phase auto-subsample entry: when `options.auto_outer_subsample` is
-    /// enabled and Phase 1 still has budget, this
-    /// returns a cloned `BlockwiseFitOptions` carrying a freshly built
-    /// stratified Horvitz-Thompson mask. Otherwise returns `None` and
-    /// the caller uses the original options unchanged.
+    /// enabled, an outer-derivative-scoped `OuterEvalContext` is present, and
+    /// Phase 1 still has budget, this returns a cloned `BlockwiseFitOptions`
+    /// carrying a freshly built stratified Horvitz-Thompson mask. Otherwise
+    /// returns `None` and the caller uses the original options unchanged.
     ///
-    /// Survival entry points (`*_workspace_with_options`,
-    /// `log_likelihood_only_with_options`) do not receive the outer ρ
-    /// directly, so we derive a per-outer-eval key by concatenating the
-    /// joint coefficient vector across blocks. Within a single outer
-    /// eval downstream calls share the same betas, so retries do not
-    /// double-bump; across outer evals the betas change so the counter
-    /// increments cleanly. This is the documented fallback for
-    /// families that lack an explicit ρ at the entry point.
+    /// Keying is on the outer ρ published by the smoothing optimizer through
+    /// `options.outer_eval_context` — never on the inner β. During inner
+    /// trust-region / joint-Newton trial steps β changes between calls at the
+    /// same outer ρ, so β-keying would re-fire phase prints and rebuild the
+    /// row mask inside one outer eval, which makes the trust-region ratio
+    /// compare objectives evaluated on different row measures (invalid).
+    /// Inner-scope contexts (set by `coefficient_line_search_options`) make
+    /// this entry return `None` immediately.
     fn install_auto_outer_subsample_options(
         &self,
         options: &BlockwiseFitOptions,
-        block_states: &[ParameterBlockState],
+        _block_states: &[ParameterBlockState],
     ) -> Option<BlockwiseFitOptions> {
-        let mut total_len = 0usize;
-        for state in block_states {
-            total_len += state.beta.len();
-        }
-        let mut beta_proxy = Array1::<f64>::zeros(total_len);
-        let mut cursor = 0usize;
-        for state in block_states {
-            let len = state.beta.len();
-            if len > 0 {
-                beta_proxy
-                    .slice_mut(s![cursor..cursor + len])
-                    .assign(&state.beta);
-                cursor += len;
-            }
+        let ctx = options.outer_eval_context.as_ref()?;
+        if !matches!(
+            ctx.scope,
+            crate::custom_family::EvalScope::OuterDerivative
+        ) {
+            return None;
         }
         let event_secondary: Vec<u8> = self
             .event
@@ -3981,7 +4017,7 @@ impl SurvivalMarginalSlopeFamily {
             options,
             z_key.as_slice().expect("z key must be contiguous"),
             Some(&event_secondary),
-            &beta_proxy,
+            ctx.rho.as_slice().expect("outer rho must be contiguous"),
             &self.auto_subsample_phase_counter,
             &self.auto_subsample_last_rho,
             SURVIVAL_MGS_AUTO_SUBSAMPLE_PHASE1_BUDGET,

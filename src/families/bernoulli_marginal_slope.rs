@@ -16721,7 +16721,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
                 options,
                 self.z.as_slice().expect("z must be contiguous"),
                 Some(&stratum_secondary),
-                rho,
+                rho.as_slice().expect("outer rho must be contiguous"),
                 &self.auto_subsample_phase_counter,
                 &self.auto_subsample_last_rho,
                 BMS_AUTO_SUBSAMPLE_PHASE1_BUDGET,
