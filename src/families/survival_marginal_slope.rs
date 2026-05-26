@@ -18245,15 +18245,15 @@ pub fn fit_survival_marginal_slope_terms(
     // before any inner solve so the failure surfaces with a precise diagnostic
     // rather than a non-convergence symptom many minutes into the fit.
     //
-    // This is an `assert!` (not `debug_assert!`) so release builds also catch
-    // the core-block alias regression we just hardened the flex-side W metric
-    // against. The flex W-metric fix (above) closes the
-    // {score_warp, link_dev} ↔ {marginal_surface, logslope_surface} alias
-    // channels under PIRLS curvature; remaining rank collapses originate in
-    // core-block aliases (e.g. shared low-order Duchon nullspace columns
-    // between the marginal and logslope surfaces when the same duchon term
-    // appears in both formulas) — surfacing them here directs the user to
-    // restructure the formula rather than silently chase REML pathologies.
+    // Diagnostic only: rank deficiency at this point is handled gracefully by
+    // the canonical-gauge pipeline downstream (`canonicalize_for_identifiability`
+    // in `custom_family.rs`, called centrally before the inner Newton solve).
+    // That pipeline runs RRQR with `gauge_priority` attribution and converts
+    // attributed alias drops into per-block selection matrices `T_i`, then
+    // solves on reduced specs and lifts coefficients back via `β_raw = T_i θ`.
+    // Aborting here would defeat the canonical reduction. We emit an info-
+    // level diagnostic with the (block, ncols, rank) tuple so the rank-deficit
+    // is visible in the log without being fatal.
     {
         use crate::linalg::faer_ndarray::rrqr_nullspace_basis;
         let time_dense = spec
@@ -18318,23 +18318,22 @@ pub fn fit_survival_marginal_slope_terms(
         .map_err(|e| {
             format!("survival-marginal-slope joint rank diagnostic QR failed: {e}")
         })?;
-        assert!(
-            rank == total_cols,
-            "survival-marginal-slope joint design at training rows is rank-deficient: \
-             detected rank {rank} < column count {total_cols} \
-             (time={p_time} marginal={p_marginal} logslope={p_logslope} \
-             score_warp={p_sw} link_dev={p_ld}). \
-             This indicates a core-block alias the flex-side W-metric reparam \
-             cannot fix — typically a shared duchon nullspace between the \
-             marginal and logslope formulas, or `linkwiggle()` on both. \
-             Restructure the formula (drop the duplicated term in one formula, \
-             or remove `linkwiggle()` from one side) and refit.",
-            p_time = time_dense.ncols(),
-            p_marginal = marginal_dense.ncols(),
-            p_logslope = logslope_dense.ncols(),
-            p_sw = score_warp_dense.as_ref().map_or(0, |m| m.ncols()),
-            p_ld = link_dev_dense.as_ref().map_or(0, |m| m.ncols()),
-        );
+        if rank < total_cols {
+            log::info!(
+                "[survival-marginal-slope joint rank diagnostic] rank={rank} < ncols={total_cols} \
+                 (time={p_time} marginal={p_marginal} logslope={p_logslope} \
+                 score_warp={p_sw} link_dev={p_ld}); canonical-gauge pipeline \
+                 will attribute the {n_drop} surplus column(s) to lower-priority blocks \
+                 via gauge_priority (time=200, marginal=150, logslope=120, \
+                 score_warp=80, link_dev=60) and proceed with reduced specs.",
+                p_time = time_dense.ncols(),
+                p_marginal = marginal_dense.ncols(),
+                p_logslope = logslope_dense.ncols(),
+                p_sw = score_warp_dense.as_ref().map_or(0, |m| m.ncols()),
+                p_ld = link_dev_dense.as_ref().map_or(0, |m| m.ncols()),
+                n_drop = total_cols - rank,
+            );
+        }
 
         // W-metric SVD preflight (complement to the unweighted rrqr above).
         // Surfaces near-rank-deficiency under the actual PIRLS curvature

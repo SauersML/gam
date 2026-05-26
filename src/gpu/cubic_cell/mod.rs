@@ -311,19 +311,16 @@ mod tests {
         assert_eq!(CubicCellMomentStatus::NonFiniteEvaluation as u8, 4);
     }
 
-    /// Phase 4 parity test: device-resident moments must match the CPU
-    /// `evaluate_cell_derivative_moments_uncached` reference across all
-    /// three branches (`Affine`, `NonAffineFinite`, `AffineTail`) at the
-    /// production high-water-mark degrees (9, 15, 21).
-    ///
-    /// Skipped silently on hosts without a usable CUDA runtime so the test
-    /// passes on the Mac builder. On V100 it runs the device pipeline,
-    /// downloads the moments for verification, and compares elementwise
-    /// against the CPU evaluator at `abs <= 1e-12 OR rel <= 1e-11`.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn cubic_cell_device_residency_matches_cpu_all_branches() {
-        use crate::families::cubic_cell_kernel::{
+    // Phase 4 device-residency parity test lives next to the device backend
+    // at `crate::gpu::cubic_cell::device::tests::cubic_cell_device_residency_matches_cpu_all_branches`
+    // so it can use the in-mod `download_moments` helper directly.
+}
+
+// === END OF tests MOD ===
+// Original test body removed; lives in device::tests now.
+#[cfg(test)]
+mod _trailing_removed_block {
+    use crate::families::cubic_cell_kernel::{
             DenestedCubicCell, evaluate_cell_derivative_moments_uncached,
         };
         use crate::gpu::runtime::GpuRuntime;
