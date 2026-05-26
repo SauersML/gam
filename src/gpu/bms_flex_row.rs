@@ -1150,129 +1150,6 @@ pub(crate) struct BmsFlexPrimaryLayout {
     pub r: usize,
 }
 
-/// CPU-portable HVP oracle. Mirrors what
-/// [`launch_bms_flex_row_hvp`] computes on the device.
-///
-/// * `row_hessians`: row-major `[n, r*r]`, contains `H_row` symmetric.
-/// * `marginal_design`: row-major `[n, p_m]` dense storage.
-/// * `logslope_design`: row-major `[n, p_g]` dense storage.
-/// * `v`: joint β direction, length `block.p_total`.
-///
-/// Returns the joint β HVP image, length `block.p_total`.
-pub(crate) fn cpu_oracle_bms_flex_row_hvp(
-    row_hessians: &[f64],
-    marginal_design: &[f64],
-    logslope_design: &[f64],
-    block: &BmsFlexBlockLayout,
-    primary: &BmsFlexPrimaryLayout,
-    n: usize,
-    v: &[f64],
-) -> Vec<f64> {
-    let r = primary.r;
-    let p_m = block.p_m;
-    let p_g = block.p_g;
-    assert_eq!(v.len(), block.p_total);
-    assert_eq!(row_hessians.len(), n * r * r);
-    assert_eq!(marginal_design.len(), n * p_m);
-    assert_eq!(logslope_design.len(), n * p_g);
-    let mut out = vec![0.0_f64; block.p_total];
-    let mut row_dir = vec![0.0_f64; r];
-    let mut action = vec![0.0_f64; r];
-    for row in 0..n {
-        // Build row_dir from joint β direction v.
-        let mrow = &marginal_design[row * p_m..(row + 1) * p_m];
-        let grow = &logslope_design[row * p_g..(row + 1) * p_g];
-        let mut acc_q = 0.0_f64;
-        for j in 0..p_m {
-            acc_q += mrow[j] * v[j];
-        }
-        let mut acc_g = 0.0_f64;
-        for j in 0..p_g {
-            acc_g += grow[j] * v[p_m + j];
-        }
-        row_dir[0] = acc_q;
-        row_dir[1] = acc_g;
-        if let (Some(prange), Some(brange)) = (primary.h.as_ref(), block.h.as_ref()) {
-            for (k, ii) in prange.clone().enumerate() {
-                row_dir[ii] = v[brange.start + k];
-            }
-        }
-        if let (Some(prange), Some(brange)) = (primary.w.as_ref(), block.w.as_ref()) {
-            for (k, ii) in prange.clone().enumerate() {
-                row_dir[ii] = v[brange.start + k];
-            }
-        }
-        // action[u] = Σ_v row_hess[u,v] · row_dir[v].
-        let h_slice = &row_hessians[row * r * r..(row + 1) * r * r];
-        for u in 0..r {
-            let mut acc = 0.0_f64;
-            for v_idx in 0..r {
-                acc += h_slice[u * r + v_idx] * row_dir[v_idx];
-            }
-            action[u] = acc;
-        }
-        // Pull back to joint β.
-        let a0 = action[0];
-        for j in 0..p_m {
-            out[j] += a0 * mrow[j];
-        }
-        let a1 = action[1];
-        for j in 0..p_g {
-            out[p_m + j] += a1 * grow[j];
-        }
-        if let (Some(prange), Some(brange)) = (primary.h.as_ref(), block.h.as_ref()) {
-            for (k, ii) in prange.clone().enumerate() {
-                out[brange.start + k] += action[ii];
-            }
-        }
-        if let (Some(prange), Some(brange)) = (primary.w.as_ref(), block.w.as_ref()) {
-            for (k, ii) in prange.clone().enumerate() {
-                out[brange.start + k] += action[ii];
-            }
-        }
-    }
-    out
-}
-
-/// CPU-portable diagonal oracle mirroring [`launch_bms_flex_row_diagonal`].
-pub(crate) fn cpu_oracle_bms_flex_row_diagonal(
-    row_hessians: &[f64],
-    marginal_design: &[f64],
-    logslope_design: &[f64],
-    block: &BmsFlexBlockLayout,
-    primary: &BmsFlexPrimaryLayout,
-    n: usize,
-) -> Vec<f64> {
-    let r = primary.r;
-    let p_m = block.p_m;
-    let p_g = block.p_g;
-    let mut out = vec![0.0_f64; block.p_total];
-    for row in 0..n {
-        let h_slice = &row_hessians[row * r * r..(row + 1) * r * r];
-        let h00 = h_slice[0];
-        let h11 = h_slice[1 * r + 1];
-        let mrow = &marginal_design[row * p_m..(row + 1) * p_m];
-        let grow = &logslope_design[row * p_g..(row + 1) * p_g];
-        for j in 0..p_m {
-            out[j] += h00 * mrow[j] * mrow[j];
-        }
-        for j in 0..p_g {
-            out[p_m + j] += h11 * grow[j] * grow[j];
-        }
-        if let (Some(prange), Some(brange)) = (primary.h.as_ref(), block.h.as_ref()) {
-            for (k, ii) in prange.clone().enumerate() {
-                out[brange.start + k] += h_slice[ii * r + ii];
-            }
-        }
-        if let (Some(prange), Some(brange)) = (primary.w.as_ref(), block.w.as_ref()) {
-            for (k, ii) in prange.clone().enumerate() {
-                out[brange.start + k] += h_slice[ii * r + ii];
-            }
-        }
-    }
-    out
-}
-
 // ── Linux-only: device-resident row-Hessian state + kernels ─────────────────
 
 /// Number of rows each HVP / diagonal CTA processes. Each CTA writes a single
@@ -1567,15 +1444,6 @@ impl HvpKernelBackend {
     }
 }
 
-/// Linux-only: NVRTC-compile + cache the HVP / diagonal kernel module.
-/// Public for the bms_flex dispatcher hook so the cache decision can probe
-/// the backend eagerly.
-#[cfg(target_os = "linux")]
-pub(crate) fn probe_hvp_backend() -> Result<(), GpuError> {
-    let _ = HvpKernelBackend::probe()?;
-    Ok(())
-}
-
 /// Build a device-resident row-Hessian cache by launching the row kernel and
 /// keeping the resulting `n × r²` slice resident on the device. Also uploads
 /// the dense marginal + logslope design matrices so subsequent HVPs do not
@@ -1632,7 +1500,7 @@ pub(crate) fn launch_bms_flex_row_kernel_device_resident(
     // Ensure the row kernel backend is compiled & loaded (this also compiles
     // the HVP backend on first use so the caller surfaces failures here).
     let backend = RowKernelBackend::probe()?;
-    let _ = HvpKernelBackend::probe()?;
+    HvpKernelBackend::probe()?;
     let stream = backend.stream.clone();
 
     let upload_f64 = |slice: &[f64], label: &str| {
@@ -2025,7 +1893,7 @@ pub(crate) fn launch_bms_flex_row_diagonal(
         .map_err(|err| GpuError::DriverCallFailed {
             reason: format!("bms_flex_row diag synchronize: {err}"),
         })?;
-    debug_assert!(num_chunks_u32 as usize == num_chunks);
+    assert!(num_chunks_u32 as usize == num_chunks);
     stream
         .clone_dtoh(&d_out)
         .map_err(|err| GpuError::DriverCallFailed {
@@ -2847,5 +2715,398 @@ mod tests {
         assert!(ROW_KERNEL_SOURCE.contains("compute_row_analytic_flex_from_parts_into"));
         #[cfg(target_os = "linux")]
         assert!(ROW_KERNEL_SOURCE.contains("cell_first_derivative_from_moments"));
+    }
+
+    // ── Phase-3 HVP / diagonal CPU oracles + GPU parity tests ────────────────
+
+    /// CPU oracle for [`launch_bms_flex_row_hvp`]. Mirrors the device kernel
+    /// element-for-element so the GPU parity test runs against the same algebra.
+    fn cpu_oracle_bms_flex_row_hvp(
+        row_hessians: &[f64],
+        marginal_design: &[f64],
+        logslope_design: &[f64],
+        block: &BmsFlexBlockLayout,
+        primary: &BmsFlexPrimaryLayout,
+        n: usize,
+        v: &[f64],
+    ) -> Vec<f64> {
+        let r = primary.r;
+        let p_m = block.p_m;
+        let p_g = block.p_g;
+        assert_eq!(v.len(), block.p_total);
+        assert_eq!(row_hessians.len(), n * r * r);
+        assert_eq!(marginal_design.len(), n * p_m);
+        assert_eq!(logslope_design.len(), n * p_g);
+        let mut out = vec![0.0_f64; block.p_total];
+        let mut row_dir = vec![0.0_f64; r];
+        let mut action = vec![0.0_f64; r];
+        for row in 0..n {
+            let mrow = &marginal_design[row * p_m..(row + 1) * p_m];
+            let grow = &logslope_design[row * p_g..(row + 1) * p_g];
+            let mut acc_q = 0.0_f64;
+            for j in 0..p_m {
+                acc_q += mrow[j] * v[j];
+            }
+            let mut acc_g = 0.0_f64;
+            for j in 0..p_g {
+                acc_g += grow[j] * v[p_m + j];
+            }
+            row_dir[0] = acc_q;
+            row_dir[1] = acc_g;
+            if let (Some(prange), Some(brange)) = (primary.h.as_ref(), block.h.as_ref()) {
+                for (k, ii) in prange.clone().enumerate() {
+                    row_dir[ii] = v[brange.start + k];
+                }
+            }
+            if let (Some(prange), Some(brange)) = (primary.w.as_ref(), block.w.as_ref()) {
+                for (k, ii) in prange.clone().enumerate() {
+                    row_dir[ii] = v[brange.start + k];
+                }
+            }
+            let h_slice = &row_hessians[row * r * r..(row + 1) * r * r];
+            for u in 0..r {
+                let mut acc = 0.0_f64;
+                for v_idx in 0..r {
+                    acc += h_slice[u * r + v_idx] * row_dir[v_idx];
+                }
+                action[u] = acc;
+            }
+            let a0 = action[0];
+            for j in 0..p_m {
+                out[j] += a0 * mrow[j];
+            }
+            let a1 = action[1];
+            for j in 0..p_g {
+                out[p_m + j] += a1 * grow[j];
+            }
+            if let (Some(prange), Some(brange)) = (primary.h.as_ref(), block.h.as_ref()) {
+                for (k, ii) in prange.clone().enumerate() {
+                    out[brange.start + k] += action[ii];
+                }
+            }
+            if let (Some(prange), Some(brange)) = (primary.w.as_ref(), block.w.as_ref()) {
+                for (k, ii) in prange.clone().enumerate() {
+                    out[brange.start + k] += action[ii];
+                }
+            }
+        }
+        out
+    }
+
+    fn cpu_oracle_bms_flex_row_diagonal(
+        row_hessians: &[f64],
+        marginal_design: &[f64],
+        logslope_design: &[f64],
+        block: &BmsFlexBlockLayout,
+        primary: &BmsFlexPrimaryLayout,
+        n: usize,
+    ) -> Vec<f64> {
+        let r = primary.r;
+        let p_m = block.p_m;
+        let p_g = block.p_g;
+        let mut out = vec![0.0_f64; block.p_total];
+        for row in 0..n {
+            let h_slice = &row_hessians[row * r * r..(row + 1) * r * r];
+            let h00 = h_slice[0];
+            let h11 = h_slice[r + 1];
+            let mrow = &marginal_design[row * p_m..(row + 1) * p_m];
+            let grow = &logslope_design[row * p_g..(row + 1) * p_g];
+            for j in 0..p_m {
+                out[j] += h00 * mrow[j] * mrow[j];
+            }
+            for j in 0..p_g {
+                out[p_m + j] += h11 * grow[j] * grow[j];
+            }
+            if let (Some(prange), Some(brange)) = (primary.h.as_ref(), block.h.as_ref()) {
+                for (k, ii) in prange.clone().enumerate() {
+                    out[brange.start + k] += h_slice[ii * r + ii];
+                }
+            }
+            if let (Some(prange), Some(brange)) = (primary.w.as_ref(), block.w.as_ref()) {
+                for (k, ii) in prange.clone().enumerate() {
+                    out[brange.start + k] += h_slice[ii * r + ii];
+                }
+            }
+        }
+        out
+    }
+
+    /// Hand-construct a small symmetric per-row Hessian + small designs and
+    /// verify the CPU oracle satisfies the expected algebra. Platform-
+    /// independent (runs on macOS / Linux without CUDA).
+    #[test]
+    fn cpu_oracle_hvp_matches_hand_computation_no_hw() {
+        let n = 4_usize;
+        let r = 4_usize; // q, logslope, h(1), w(1)
+        let p_m = 2_usize;
+        let p_g = 2_usize;
+        let p_h_dim = 1_usize;
+        let p_w_dim = 1_usize;
+        let p_total = p_m + p_g + p_h_dim + p_w_dim;
+        let block = BmsFlexBlockLayout {
+            p_m,
+            p_g,
+            h: Some(p_m + p_g..p_m + p_g + p_h_dim),
+            w: Some(p_m + p_g + p_h_dim..p_m + p_g + p_h_dim + p_w_dim),
+            p_total,
+        };
+        let primary = BmsFlexPrimaryLayout {
+            h: Some(2..3),
+            w: Some(3..4),
+            r,
+        };
+        // Symmetric per-row Hessian: H_row[u,v] = (row + 1) * (1 + u + 2v) symmetrised.
+        let mut row_hessians = vec![0.0_f64; n * r * r];
+        for row in 0..n {
+            for u in 0..r {
+                for v in u..r {
+                    let val = ((row + 1) as f64) * (1.0 + (u as f64) + 2.0 * (v as f64));
+                    row_hessians[row * r * r + u * r + v] = val;
+                    row_hessians[row * r * r + v * r + u] = val;
+                }
+            }
+        }
+        let mut marginal = vec![0.0_f64; n * p_m];
+        for row in 0..n {
+            for j in 0..p_m {
+                marginal[row * p_m + j] = 0.5 + (row as f64) * 0.1 - (j as f64) * 0.2;
+            }
+        }
+        let mut logslope = vec![0.0_f64; n * p_g];
+        for row in 0..n {
+            for j in 0..p_g {
+                logslope[row * p_g + j] = -0.3 + (row as f64) * 0.05 + (j as f64) * 0.15;
+            }
+        }
+        let v: Vec<f64> = (0..p_total).map(|i| 0.1 + (i as f64) * 0.25).collect();
+        let out = cpu_oracle_bms_flex_row_hvp(
+            &row_hessians, &marginal, &logslope, &block, &primary, n, &v,
+        );
+        // Hand check the first marginal slot: out[0] = Σ_row action[0]·mrow[0].
+        let mut expect_out_0 = 0.0_f64;
+        for row in 0..n {
+            let mrow = &marginal[row * p_m..(row + 1) * p_m];
+            let grow = &logslope[row * p_g..(row + 1) * p_g];
+            let mut row_dir = vec![0.0_f64; r];
+            row_dir[0] = mrow[0] * v[0] + mrow[1] * v[1];
+            row_dir[1] = grow[0] * v[p_m] + grow[1] * v[p_m + 1];
+            row_dir[2] = v[p_m + p_g];
+            row_dir[3] = v[p_m + p_g + p_h_dim];
+            let h_slice = &row_hessians[row * r * r..(row + 1) * r * r];
+            let mut action0 = 0.0_f64;
+            for vv in 0..r {
+                action0 += h_slice[0 * r + vv] * row_dir[vv];
+            }
+            expect_out_0 += action0 * mrow[0];
+        }
+        assert!(
+            (out[0] - expect_out_0).abs() < 1e-12,
+            "cpu oracle HVP out[0] mismatch: {} vs hand-check {}",
+            out[0],
+            expect_out_0
+        );
+        assert!(out.iter().all(|x| x.is_finite()));
+        assert_eq!(out.len(), p_total);
+    }
+
+    /// Diagonal oracle equals the explicit per-row design² accumulator.
+    #[test]
+    fn cpu_oracle_diagonal_matches_hand_computation() {
+        let n = 3_usize;
+        let r = 4_usize;
+        let p_m = 2_usize;
+        let p_g = 2_usize;
+        let p_h_dim = 1_usize;
+        let p_w_dim = 1_usize;
+        let p_total = p_m + p_g + p_h_dim + p_w_dim;
+        let block = BmsFlexBlockLayout {
+            p_m,
+            p_g,
+            h: Some(p_m + p_g..p_m + p_g + p_h_dim),
+            w: Some(p_m + p_g + p_h_dim..p_m + p_g + p_h_dim + p_w_dim),
+            p_total,
+        };
+        let primary = BmsFlexPrimaryLayout {
+            h: Some(2..3),
+            w: Some(3..4),
+            r,
+        };
+        let mut row_hessians = vec![0.0_f64; n * r * r];
+        for row in 0..n {
+            for u in 0..r {
+                row_hessians[row * r * r + u * r + u] = 1.0 + (row as f64) + (u as f64) * 0.5;
+            }
+        }
+        let mut marginal = vec![0.0_f64; n * p_m];
+        let mut logslope = vec![0.0_f64; n * p_g];
+        for row in 0..n {
+            for j in 0..p_m {
+                marginal[row * p_m + j] = 0.2 + (row as f64) * 0.3 + (j as f64) * 0.1;
+            }
+            for j in 0..p_g {
+                logslope[row * p_g + j] = -0.4 + (row as f64) * 0.1 + (j as f64) * 0.2;
+            }
+        }
+        let out = cpu_oracle_bms_flex_row_diagonal(
+            &row_hessians, &marginal, &logslope, &block, &primary, n,
+        );
+        // Hand check: out[0] = Σ_row H[row,0,0] · marginal[row,0]^2.
+        let mut expect = 0.0_f64;
+        for row in 0..n {
+            let h00 = row_hessians[row * r * r];
+            expect += h00 * marginal[row * p_m].powi(2);
+        }
+        assert!((out[0] - expect).abs() < 1e-12, "out[0] {} vs {}", out[0], expect);
+        // h slot = sum of H[row, 2, 2] across rows.
+        let mut expect_h = 0.0_f64;
+        for row in 0..n {
+            expect_h += row_hessians[row * r * r + 2 * r + 2];
+        }
+        let h_slot = p_m + p_g;
+        assert!(
+            (out[h_slot] - expect_h).abs() < 1e-12,
+            "h slot {} vs {}",
+            out[h_slot],
+            expect_h
+        );
+    }
+
+    /// GPU↔CPU parity for the HVP and diagonal kernels. Skips on non-Linux /
+    /// no-CUDA hosts. Hand-constructs a small `DeviceResidentRowHess` by
+    /// allocating the device slices directly, uploading the same arrays the
+    /// CPU oracle consumes, then dispatching the device kernels.
+    #[test]
+    fn bms_flex_row_hvp_kernel_matches_cpu_oracle_when_cuda_available() {
+        #[cfg(not(target_os = "linux"))]
+        {
+            eprintln!(
+                "[bms_flex_row hvp parity] non-Linux host — skipping CUDA parity \
+                 (CPU oracle exercised by sibling tests)"
+            );
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let Some(_runtime) = crate::gpu::runtime::GpuRuntime::global() else {
+                eprintln!(
+                    "[bms_flex_row hvp parity] no CUDA runtime — skipping device \
+                     parity"
+                );
+                return;
+            };
+            let n = 4_usize;
+            let r = 4_usize;
+            let p_m = 2_usize;
+            let p_g = 2_usize;
+            let p_h_dim = 1_usize;
+            let p_w_dim = 1_usize;
+            let p_total = p_m + p_g + p_h_dim + p_w_dim;
+            let block = BmsFlexBlockLayout {
+                p_m,
+                p_g,
+                h: Some(p_m + p_g..p_m + p_g + p_h_dim),
+                w: Some(p_m + p_g + p_h_dim..p_m + p_g + p_h_dim + p_w_dim),
+                p_total,
+            };
+            let primary = BmsFlexPrimaryLayout {
+                h: Some(2..3),
+                w: Some(3..4),
+                r,
+            };
+            let mut row_hessians = vec![0.0_f64; n * r * r];
+            for row in 0..n {
+                for u in 0..r {
+                    for v in u..r {
+                        let val = ((row + 1) as f64) * (1.0 + (u as f64) + 2.0 * (v as f64));
+                        row_hessians[row * r * r + u * r + v] = val;
+                        row_hessians[row * r * r + v * r + u] = val;
+                    }
+                }
+            }
+            let mut marginal = vec![0.0_f64; n * p_m];
+            for row in 0..n {
+                for j in 0..p_m {
+                    marginal[row * p_m + j] = 0.5 + (row as f64) * 0.1 - (j as f64) * 0.2;
+                }
+            }
+            let mut logslope = vec![0.0_f64; n * p_g];
+            for row in 0..n {
+                for j in 0..p_g {
+                    logslope[row * p_g + j] = -0.3 + (row as f64) * 0.05 + (j as f64) * 0.15;
+                }
+            }
+            let v: Vec<f64> = (0..p_total).map(|i| 0.1 + (i as f64) * 0.25).collect();
+            let cpu_hvp = cpu_oracle_bms_flex_row_hvp(
+                &row_hessians, &marginal, &logslope, &block, &primary, n, &v,
+            );
+            let cpu_diag = cpu_oracle_bms_flex_row_diagonal(
+                &row_hessians, &marginal, &logslope, &block, &primary, n,
+            );
+
+            // Allocate a DeviceResidentRowHess by hand using the HVP backend's
+            // stream + module so we don't need to drive the full BMS row kernel.
+            let backend = match HvpKernelBackend::probe() {
+                Ok(b) => b,
+                Err(err) => {
+                    eprintln!("[bms_flex_row hvp parity] backend probe failed: {err}");
+                    return;
+                }
+            };
+            let stream = backend.stream.clone();
+            let d_h = match stream.clone_htod(&row_hessians) {
+                Ok(s) => s,
+                Err(err) => {
+                    eprintln!("[bms_flex_row hvp parity] upload h failed: {err}");
+                    return;
+                }
+            };
+            let d_m = match stream.clone_htod(&marginal) {
+                Ok(s) => s,
+                Err(err) => {
+                    eprintln!("[bms_flex_row hvp parity] upload marg failed: {err}");
+                    return;
+                }
+            };
+            let d_g = match stream.clone_htod(&logslope) {
+                Ok(s) => s,
+                Err(err) => {
+                    eprintln!("[bms_flex_row hvp parity] upload logslope failed: {err}");
+                    return;
+                }
+            };
+            let storage = DeviceResidentRowHess {
+                ctx: backend.ctx.clone(),
+                stream: stream.clone(),
+                hess: d_h,
+                marginal_design: d_m,
+                logslope_design: d_g,
+                n,
+                r,
+                block: block.clone(),
+                primary: primary.clone(),
+                bytes: ((n * r * r + n * p_m + n * p_g) * std::mem::size_of::<f64>()) as u64,
+            };
+            let gpu_hvp = launch_bms_flex_row_hvp(&storage, &v)
+                .expect("HVP kernel must launch on CUDA host");
+            let gpu_diag = launch_bms_flex_row_diagonal(&storage)
+                .expect("diagonal kernel must launch on CUDA host");
+            assert_eq!(gpu_hvp.len(), cpu_hvp.len());
+            assert_eq!(gpu_diag.len(), cpu_diag.len());
+            for i in 0..p_total {
+                let diff = (cpu_hvp[i] - gpu_hvp[i]).abs();
+                assert!(
+                    diff <= 1e-10,
+                    "HVP[{i}]: cpu={} gpu={} |Δ|={diff:.3e}",
+                    cpu_hvp[i],
+                    gpu_hvp[i]
+                );
+                let ddiff = (cpu_diag[i] - gpu_diag[i]).abs();
+                assert!(
+                    ddiff <= 1e-10,
+                    "diag[{i}]: cpu={} gpu={} |Δ|={ddiff:.3e}",
+                    cpu_diag[i],
+                    gpu_diag[i]
+                );
+            }
+        }
     }
 }

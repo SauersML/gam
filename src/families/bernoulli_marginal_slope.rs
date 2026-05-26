@@ -14224,6 +14224,72 @@ impl BernoulliMarginalSlopeFamily {
             }
         }
 
+        // Host-pin shortcut: when the per-row Hessian is materialised on host
+        // (the legacy path before Phase 3), build the joint-β image by
+        // batching the per-row primary directions and dispatching the
+        // per-row matvec helper from `gpu::row_hessian_ops`. On Linux this
+        // can be GPU-accelerated by `launch_row_hessian_matvec`; on every
+        // host the CPU oracle `cpu_row_hessian_matvec` is the in-process
+        // fallback so the call sites stay consistent. The design pullback
+        // (`pullback_primary_vector`) stays on host because the designs are
+        // not necessarily resident on the device in this branch.
+        if let Some(host_pin) = cache.row_primary_hessians.host_pin() {
+            let r_pr = primary.total;
+            let mut v_rows = vec![0.0_f64; n * r_pr];
+            for row in 0..n {
+                let row_dir =
+                    self.row_primary_direction_from_flat(row, slices, primary, direction)?;
+                let row_dir_slice = row_dir
+                    .as_slice()
+                    .expect("row_primary_direction is contiguous");
+                v_rows[row * r_pr..(row + 1) * r_pr].copy_from_slice(row_dir_slice);
+            }
+            let h_rows_arr = host_pin.rows();
+            let h_rows_slice = h_rows_arr
+                .as_slice()
+                .expect("row_primary_hessians.rows() is row-major contiguous");
+            let inputs = crate::gpu::row_hessian_ops::RowHessianMatvecInputs {
+                n_rows: n,
+                r: r_pr,
+                h_rows: h_rows_slice,
+                v_rows: &v_rows,
+            };
+            let y_rows = {
+                #[cfg(target_os = "linux")]
+                {
+                    match crate::gpu::row_hessian_ops::launch_row_hessian_matvec(
+                        crate::gpu::row_hessian_ops::RowHessianMatvecInputs {
+                            n_rows: n,
+                            r: r_pr,
+                            h_rows: h_rows_slice,
+                            v_rows: &v_rows,
+                        },
+                    ) {
+                        Ok(out) => out.y_rows,
+                        Err(err) => {
+                            log::info!(
+                                "[BMS exact-newton HVP] host-pin GPU matvec failed: {err}; \
+                                 falling back to CPU oracle"
+                            );
+                            crate::gpu::row_hessian_ops::cpu_row_hessian_matvec(&inputs)
+                        }
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    crate::gpu::row_hessian_ops::cpu_row_hessian_matvec(&inputs)
+                }
+            };
+            let mut out = Array1::<f64>::zeros(slices.total);
+            for row in 0..n {
+                let action = Array1::<f64>::from(
+                    y_rows[row * r_pr..(row + 1) * r_pr].to_vec(),
+                );
+                out += &self.pullback_primary_vector(row, slices, primary, &action)?;
+            }
+            return Ok(out);
+        }
+
         let out = (0..n.div_ceil(ROW_CHUNK_SIZE))
             .into_par_iter()
             .try_fold(
@@ -14334,6 +14400,84 @@ impl BernoulliMarginalSlopeFamily {
                     }
                 }
             }
+        }
+
+        // Host-pin shortcut: extract every row's primary diagonal via the
+        // per-row diagonal helper from `gpu::row_hessian_ops`, then perform
+        // the design² accumulation on host (matches the rayon-loop algebra
+        // below without rebuilding `r²` blocks per row). On Linux this uses
+        // the GPU `launch_row_hessian_diag` kernel; on every host the CPU
+        // oracle `cpu_row_hessian_diag` is the in-process fallback so the
+        // call sites stay consistent.
+        if let Some(host_pin) = cache.row_primary_hessians.host_pin() {
+            let r_pr = primary.total;
+            let h_rows_arr = host_pin.rows();
+            let h_rows_slice = h_rows_arr
+                .as_slice()
+                .expect("row_primary_hessians.rows() is row-major contiguous");
+            let inputs = crate::gpu::row_hessian_ops::RowHessianDiagInputs {
+                n_rows: n,
+                r: r_pr,
+                h_rows: h_rows_slice,
+            };
+            let d_rows = {
+                #[cfg(target_os = "linux")]
+                {
+                    match crate::gpu::row_hessian_ops::launch_row_hessian_diag(
+                        crate::gpu::row_hessian_ops::RowHessianDiagInputs {
+                            n_rows: n,
+                            r: r_pr,
+                            h_rows: h_rows_slice,
+                        },
+                    ) {
+                        Ok(out) => out.d_rows,
+                        Err(err) => {
+                            log::info!(
+                                "[BMS exact-newton diag] host-pin GPU diag failed: {err}; \
+                                 falling back to CPU oracle"
+                            );
+                            crate::gpu::row_hessian_ops::cpu_row_hessian_diag(&inputs)
+                        }
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    crate::gpu::row_hessian_ops::cpu_row_hessian_diag(&inputs)
+                }
+            };
+            let mut diagonal = Array1::<f64>::zeros(slices.total);
+            for row in 0..n {
+                let d_row_base = row * r_pr;
+                let h00 = d_rows[d_row_base];
+                let h11 = d_rows[d_row_base + 1];
+                {
+                    let mut marginal_diag = diagonal.slice_mut(s![slices.marginal.clone()]);
+                    self.marginal_design
+                        .squared_axpy_row_into(row, h00, &mut marginal_diag)?;
+                }
+                {
+                    let mut logslope_diag = diagonal.slice_mut(s![slices.logslope.clone()]);
+                    self.logslope_design
+                        .squared_axpy_row_into(row, h11, &mut logslope_diag)?;
+                }
+                if let (Some(primary_h), Some(block_h)) =
+                    (primary.h.as_ref(), slices.h.as_ref())
+                {
+                    for (local_idx, global_idx) in block_h.clone().enumerate() {
+                        let ii = primary_h.start + local_idx;
+                        diagonal[global_idx] += d_rows[d_row_base + ii];
+                    }
+                }
+                if let (Some(primary_w), Some(block_w)) =
+                    (primary.w.as_ref(), slices.w.as_ref())
+                {
+                    for (local_idx, global_idx) in block_w.clone().enumerate() {
+                        let ii = primary_w.start + local_idx;
+                        diagonal[global_idx] += d_rows[d_row_base + ii];
+                    }
+                }
+            }
+            return Ok(diagonal);
         }
 
         let diagonal = (0..n.div_ceil(ROW_CHUNK_SIZE))
