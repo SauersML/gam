@@ -1,22 +1,37 @@
-// Cross-block identifiability canonicalisation.
+// Cross-block identifiability canonicalisation — fail-closed safety gate.
 //
 // The pre-fit `audit_identifiability` (see `identifiability_audit.rs`)
 // runs a joint RRQR on `[X_block_0 | X_block_1 | ...]` and reports per-
 // block (block_idx, local_col) drops attributing each demoted joint
-// column back to its origin. This module converts that report into a
-// concrete coordinate transform applied to the inner solver: each
-// block's design is wrapped via `CoefficientTransformOperator` with a
-// (p_raw × r_reduced) selection matrix `T_i`, its penalties are
-// pulled back as `T_iᵀ S_k T_i`, and the inner solve operates on
-// reduced specs. Coefficients in the reduced space lift back to the
-// raw space via `β_raw = T_i θ`.
+// column back to its origin. This module **previously** converted that
+// report into a concrete coordinate transform that reduced the inner
+// solve to a (p_raw → r_reduced) subspace via selection-T.
 //
-// The canonicalisation accepts joint rank deficiency: if the audit
-// returns `fatal=true` because `joint_rank < p_total` and RRQR
-// attributed the drops, we proceed with the reduced specs rather than
-// refusing the fit. A residual fatal case with empty attribution
-// (>2-way structural alias the RRQR couldn't deterministically pin to
-// a single block) is the only condition that still aborts.
+// That reduction is unsafe under the current `CustomFamily` contract.
+// Blockwise families capture their per-block designs at construction
+// time (e.g. `SurvivalMarginalSlopeFamily::marginal_design`,
+// `::logslope_design`) and the family's `evaluate_blockwise_exact_newton`
+// row-Hessian assembly uses `DesignMatrix::syr_row_into_view` /
+// `::row_outer_into_view`, which assert that the target slice's column
+// count equals the captured design's column count. Substituting a
+// column-reduced `ParameterBlockSpec` under such a family produces
+// `DesignMatrix::syr_row_into shape mismatch` (matrix.rs:6529), which
+// blockwise inner-solve callers unwrap via `.expect(...)` — a panic
+// later in the pipeline, masking the audit's diagnostic.
+//
+// Until the family contract is updated to consume reduced specs
+// (Phase 4b of `identifiability_compiler` — see
+// `src/families/identifiability_compiler.rs`), this module's
+// `canonicalize_for_identifiability` is a **fail-closed audit gate**:
+//   - clean audit (`!fatal`)             → identity transforms, raw specs returned as-is;
+//   - fatal audit (any cause)            → `CustomFamilyError::IdentifiabilityFailure`.
+//
+// The identity-on-clean path keeps `lift_block_states_to_raw` and
+// `lift_fit_geometry_to_raw` cheap no-ops in the outer-fit code path
+// without altering its surface API. The fail-closed-on-fatal path
+// converts what was a latent panic into an immediate, actionable
+// `Err` naming the offending blocks and a reparameterisation hint —
+// in milliseconds rather than minutes of singular Newton.
 
 use std::sync::Arc;
 
@@ -137,21 +152,21 @@ impl CanonicalSpecs {
     }
 }
 
-/// Run the pre-fit cross-block identifiability audit and produce
-/// canonicalised specs.
+/// Run the pre-fit cross-block identifiability audit. Fail-closed
+/// safety gate (see module docs).
 ///
 /// Behaviour:
-///   - If the audit reports `dropped_columns` (whether or not it set
-///     `fatal=true`), we build per-block selection matrices that drop
-///     those local columns and proceed with the reduced specs.
-///   - If the audit is `fatal=true` *without* attributed drops, we
-///     refuse: this is the >2-way structural alias case where RRQR
-///     couldn't pin the redundancy on a single (block, local_col)
-///     pair, and silently absorbing it would change model semantics
-///     beyond what canonicalisation can repair.
-///   - If the audit cleanly passes (no drops, not fatal), each `T_i`
-///     is the identity and the reduced specs equal the raw specs
-///     modulo cloning.
+///   - If the audit cleanly passes (`!fatal`), each `T_i` is the
+///     identity and the reduced specs are clones of the raw specs.
+///     The lift/sandwich machinery downstream becomes a no-op.
+///   - If the audit is `fatal=true` for **any** cause (joint rank
+///     deficiency with attributed drops, joint rank deficiency
+///     without attribution, or a hard-overlap alias pair), we refuse
+///     the fit with `CustomFamilyError::IdentifiabilityFailure`. The
+///     audit summary names the offending blocks and a reparameterisation
+///     hint, giving the caller a millisecond-scale diagnostic instead
+///     of a downstream `syr_row_into shape mismatch` panic when the
+///     family captures raw-width designs.
 pub fn canonicalize_for_identifiability(
     specs: &[ParameterBlockSpec],
 ) -> Result<CanonicalSpecs, CustomFamilyError> {
@@ -161,7 +176,7 @@ pub fn canonicalize_for_identifiability(
         }
     })?;
 
-    if audit.fatal && audit.dropped_columns.is_empty() {
+    if audit.fatal {
         return Err(CustomFamilyError::IdentifiabilityFailure { audit });
     }
 
