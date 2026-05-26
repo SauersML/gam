@@ -2907,6 +2907,7 @@ impl Default for BlockwiseFitOptions {
             early_exit_threshold: None,
             outer_score_subsample: None,
             auto_outer_subsample: true,
+            outer_eval_context: None,
             cache_session: None,
             cache_mirror_sessions: Vec::new(),
         }
@@ -12180,6 +12181,15 @@ fn coefficient_line_search_options(
     let mut line_search_options = options.clone();
     line_search_options.outer_score_subsample = None;
     line_search_options.auto_outer_subsample = false;
+    line_search_options.outer_eval_context =
+        options
+            .outer_eval_context
+            .as_ref()
+            .map(|ctx| OuterEvalContext {
+                rho: ctx.rho.clone(),
+                eval_id: ctx.eval_id,
+                scope: EvalScope::InnerCoefficient,
+            });
     line_search_options.early_exit_threshold = Some(early_exit_threshold);
     line_search_options
 }

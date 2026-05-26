@@ -1768,9 +1768,14 @@ pub fn try_survival_flex_gradient(
     // continues to the (not-yet-landed) joint-β assembly — which for
     // Step 3 is the `Ok(None)` sentinel.
     if let Some(ints) = intercept_solve {
+        // Prefer the device kernel; fall back to the CPU oracle on
+        // non-CUDA builds.  The oracle is the same code path the
+        // device kernel will be parity-tested against, so dispatcher
+        // behaviour stays identical regardless of where the solve
+        // ran.
         let out = match try_device_intercept_solve(ints)? {
             Some(out) => out,
-            None => return Ok(None),
+            None => cpu_oracle_intercept_solve(ints),
         };
         if out.status.iter().any(|&s| s > 1) {
             return Ok(None);
