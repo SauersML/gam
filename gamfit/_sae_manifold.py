@@ -325,7 +325,10 @@ def gumbel_reciprocal_iter_schedule(tau_start: float, tau_min: float, iter_count
     return GumbelTemperatureSchedule(tau_start, tau_min, "reciprocal_iter", iter_count=iter_count)
 
 
-def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_topology: str = "circle",
+_TOPOLOGY_UNSET: Any = object()
+
+
+def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_topology: Any = _TOPOLOGY_UNSET,
                      assignment: str = "ibp", schedule: GumbelTemperatureSchedule | Mapping[str, Any] | None = None,
                      isometry_weight: float = 1.0, ard_per_atom: bool = True,
                      mechanism_sparsity_groups: list[list[int]] | None = None, n_iter: int = 50, *,
@@ -393,7 +396,16 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
             f"sparsity_weight (sparsity_strength) must be finite and "
             f"non-negative; got {sparsity}"
         )
-    bases = _bases(k_atoms, atom_basis, atom_topology)
+    topology_supplied = atom_topology is not _TOPOLOGY_UNSET
+    atom_topology_str = str(atom_topology) if topology_supplied else "circle"
+    bases = _bases(k_atoms, atom_basis, atom_topology_str)
+    resolved_topology = _topology_for_bases(bases)
+    if topology_supplied and atom_basis is not None and resolved_topology != atom_topology_str:
+        raise ValueError(
+            f"sae_manifold_fit: atom_basis={atom_basis!r} resolves to topology "
+            f"{resolved_topology!r} but atom_topology={atom_topology_str!r} was also "
+            f"supplied; pass only one (they are aliases) or align them."
+        )
     # Normalize `assignment` and `assignment_prior` through a single alias map.
     # If both are supplied and resolve to different canonical kinds, raise an
     # eager argument-conflict error rather than letting Rust crash in the
@@ -447,7 +459,7 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         gumbel_schedule=_schedule_payload(gumbel_schedule),
     )
     return ManifoldSAE.from_payload(
-        x, dict(payload), atom_topology, assignment, penalties,
+        x, dict(payload), resolved_topology, assignment, penalties,
         alpha=float(alpha_value), learnable_alpha=bool(alpha == "auto"),
     )
 
@@ -472,13 +484,27 @@ def _dims(k_atoms: int, atom_dim: Any) -> list[int]:
     return out
 
 
+_TOPOLOGY_TO_BASIS = {
+    "circle": "periodic", "periodic": "periodic",
+    "sphere": "sphere", "torus": "torus", "euclidean": "duchon",
+}
+_BASIS_TO_TOPOLOGY = {"periodic": "circle", "sphere": "sphere", "torus": "torus", "duchon": "euclidean"}
+
+
 def _bases(k_atoms: int, atom_basis: Any, atom_topology: str) -> list[str]:
     if atom_basis is None:
-        atom_basis = {"circle": "periodic", "periodic": "periodic", "sphere": "sphere", "torus": "torus", "euclidean": "duchon"}.get(str(atom_topology), atom_topology)
+        atom_basis = _TOPOLOGY_TO_BASIS.get(str(atom_topology), atom_topology)
     raw = [atom_basis] * k_atoms if isinstance(atom_basis, str) else list(atom_basis)
     if len(raw) != k_atoms:
         raise ValueError("atom_basis must provide one basis per atom")
     return [str(v) for v in raw]
+
+
+def _topology_for_bases(bases: list[str]) -> str:
+    """Collapse a resolved bases list to a single topology label for metadata.
+    Mixed-topology fits keep the first atom's topology — basis_specs remains
+    the per-atom source of truth."""
+    return _BASIS_TO_TOPOLOGY.get(bases[0], bases[0])
 
 
 def _validate_gumbel_schedule_fields(
