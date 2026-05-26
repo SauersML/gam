@@ -19139,6 +19139,63 @@ mod tests {
     use faer::sparse::{SparseColMat, Triplet};
     use ndarray::array;
 
+    /// Pin the survival cross-block W metric to the survival row Hessian
+    /// formula `u2_eta1 = (1-d)·w·k2(-η, w·(1-d)) + d·w` rather than the
+    /// Bernoulli probit proxy `φ²/(Φ·(1-Φ))`. Three rows exercise the
+    /// censored-only, event-only, and weighted-censored branches; the
+    /// expected values are recomputed in-test from
+    /// `signed_probit_neglog_derivatives_up_to_fourth` to bind the metric
+    /// to its source-of-truth derivative routine.
+    #[test]
+    fn survival_pilot_irls_row_metric_matches_u2_eta1_formula() {
+        let eta = ndarray::Array1::from(vec![0.3_f64, -0.7, 1.2]);
+        let weights = ndarray::Array1::from(vec![1.0_f64, 2.5, 0.5]);
+        let event = ndarray::Array1::from(vec![0.0_f64, 1.0, 0.0]);
+        let computed = super::survival_pilot_irls_row_metric_at_eta(&eta, &weights, &event)
+            .expect("survival pilot W metric");
+        assert_eq!(computed.len(), 3);
+        for i in 0..3 {
+            let d = event[i];
+            let w = weights[i];
+            let e = eta[i];
+            let (_, k2, _, _) = super::signed_probit_neglog_derivatives_up_to_fourth(
+                -e,
+                w * (1.0 - d),
+            )
+            .expect("probit k2");
+            let expected = k2 + w * d;
+            approx::assert_relative_eq!(computed[i], expected, max_relative = 1e-12);
+        }
+        // Censored row (d=0): metric must be strictly positive at finite η —
+        // the Mills-ratio second derivative of -log Φ(-η) is positive on ℝ.
+        assert!(
+            computed[0] > 0.0,
+            "censored row metric must be > 0, got {}",
+            computed[0],
+        );
+        // Event row (d=1): the formula collapses to w·d exactly; the censored
+        // branch contributes zero because the k2 weight `w·(1-d)` is zero.
+        approx::assert_relative_eq!(computed[1], weights[1], max_relative = 1e-12);
+    }
+
+    /// Length-mismatch contract: the metric helper must reject misaligned
+    /// inputs instead of producing a truncated W vector that silently
+    /// passes the cross-block routine but breaks the W-inner product.
+    #[test]
+    fn survival_pilot_irls_row_metric_rejects_length_mismatch() {
+        let eta = ndarray::Array1::from(vec![0.0_f64, 1.0]);
+        let weights = ndarray::Array1::from(vec![1.0_f64]); // wrong length
+        let event = ndarray::Array1::from(vec![0.0_f64, 0.0]);
+        let result = super::survival_pilot_irls_row_metric_at_eta(&eta, &weights, &event);
+        match result {
+            Ok(_) => panic!("expected length-mismatch error, got Ok"),
+            Err(msg) => assert!(
+                msg.contains("length mismatch"),
+                "expected 'length mismatch' in error, got: {msg}",
+            ),
+        }
+    }
+
     fn empty_termspec() -> TermCollectionSpec {
         TermCollectionSpec {
             linear_terms: vec![],
