@@ -21631,6 +21631,26 @@ pub(crate) fn fit_custom_family_fixed_log_lambda_warm_start<
     options: &BlockwiseFitOptions,
 ) -> Result<(Vec<Array1<f64>>, bool, usize), CustomFamilyError> {
     let penalty_counts = validate_blockspecs(specs)?;
+    // Mirror the outer-fit identifiability gate so warm-start callers
+    // cannot land on a rank-deficient joint design and produce a
+    // singular penalized Newton system without warning.
+    let audit =
+        crate::solver::identifiability_audit::audit_identifiability(specs).map_err(|reason| {
+            CustomFamilyError::DimensionMismatch {
+                reason: format!(
+                    "fit_custom_family_fixed_log_lambda_warm_start identifiability audit failed: {reason}"
+                ),
+            }
+        })?;
+    if audit.fatal {
+        return Err(CustomFamilyError::Optimization {
+            context: "fit_custom_family_fixed_log_lambda_warm_start identifiability audit",
+            reason: format!(
+                "fatal pre-fit identifiability audit: {summary}",
+                summary = audit.summary
+            ),
+        });
+    }
     let rho = flatten_log_lambdas(specs);
     let per_block = split_log_lambdas(&rho, &penalty_counts)?;
     let inner = inner_blockwise_fit(family, specs, &per_block, options, None)?;
