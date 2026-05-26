@@ -960,19 +960,70 @@ fn rank_seeds_with_screening(
     let mut final_cap_used = initial_cap;
     let mut stages_consumed = 0usize;
     let cascade_start = std::time::Instant::now();
+    log::info!(
+        "[STAGE] {context}: seed screening cascade start seeds={} initial_cap={} stages={}",
+        seeds.len(),
+        initial_cap,
+        cascade_caps.len(),
+    );
 
     for (stage, &cap) in cascade_caps.iter().enumerate() {
         screening_cap.store(cap, Ordering::Relaxed);
         ranked.clear();
         rejected = 0;
+        let stage_started = std::time::Instant::now();
         for (idx, seed) in seeds.iter().enumerate() {
             obj.reset();
             screening_cap.store(cap, Ordering::Relaxed);
-            match obj.eval_screening_proxy(seed) {
-                Ok(cost) if cost.is_finite() => ranked.push((idx, cost)),
-                Ok(_) | Err(_) => rejected += 1,
+            let seed_started = std::time::Instant::now();
+            let result = obj.eval_screening_proxy(seed);
+            let seed_elapsed = seed_started.elapsed().as_secs_f64();
+            match result {
+                Ok(cost) if cost.is_finite() => {
+                    log::info!(
+                        "[STAGE] {context}: seed-screen stage={} seed={}/{} cap={} elapsed={:.3}s cost={:.6e}",
+                        stage,
+                        idx + 1,
+                        seeds.len(),
+                        if cap == 0 { "uncapped".to_string() } else { cap.to_string() },
+                        seed_elapsed,
+                        cost,
+                    );
+                    ranked.push((idx, cost));
+                }
+                Ok(cost) => {
+                    log::info!(
+                        "[STAGE] {context}: seed-screen stage={} seed={}/{} cap={} elapsed={:.3}s cost=non-finite ({:.3e})",
+                        stage,
+                        idx + 1,
+                        seeds.len(),
+                        if cap == 0 { "uncapped".to_string() } else { cap.to_string() },
+                        seed_elapsed,
+                        cost,
+                    );
+                    rejected += 1;
+                }
+                Err(_) => {
+                    log::info!(
+                        "[STAGE] {context}: seed-screen stage={} seed={}/{} cap={} elapsed={:.3}s rejected (error)",
+                        stage,
+                        idx + 1,
+                        seeds.len(),
+                        if cap == 0 { "uncapped".to_string() } else { cap.to_string() },
+                        seed_elapsed,
+                    );
+                    rejected += 1;
+                }
             }
         }
+        log::info!(
+            "[STAGE] {context}: seed-screen stage={} cap={} elapsed={:.3}s ranked={} rejected={}",
+            stage,
+            if cap == 0 { "uncapped".to_string() } else { cap.to_string() },
+            stage_started.elapsed().as_secs_f64(),
+            ranked.len(),
+            rejected,
+        );
         final_cap_used = cap;
         stages_consumed = stage + 1;
         if !ranked.is_empty() {
