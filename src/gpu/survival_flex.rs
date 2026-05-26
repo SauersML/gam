@@ -898,6 +898,257 @@ impl SurvivalFlexGpuBackend {
 }
 
 // ────────────────────────────────────────────────────────────────────────
+// Step 2 — survival-flex row-batched cubic-cell moment evaluator.
+//
+// Steps 3-6 need per-row derivative moments of the de-nested cubic
+// correction `η(z) = c_0 + c_1·z + c_2·z² + c_3·z³` integrated against
+// `exp(-q(z))` over each cell of the row's partition.  The CPU side
+// builds these partitions via
+// `survival_marginal_slope::denested_partition_cells` and then loops
+// `evaluate_cell_moments` / `evaluate_cell_derivative_moments_uncached`
+// per cell.
+//
+// This Step 2 wrapper takes a *flat* concatenation of per-row cells
+// (with per-row start offsets), classifies them through the shared
+// `cubic_cell::branch` classifier, and routes them in one shot through
+// the existing GPU substrate (`cubic_cell::device::try_device_moments`):
+//
+//   * NonAffineFinite cells → 384-pt Gauss-Legendre warp-cooperative
+//     kernel (the substrate's primary device path).
+//   * Affine / AffineTail cells → CPU closed-form `T_n` recurrence
+//     (substrate falls back per-cell, no warp divergence on GPU).
+//
+// Output is row-major `[total_cells, max_degree + 1]` moments plus a
+// parallel status byte array and a `row_offsets` lookup so Step 3/4
+// callers can index `row i → cells[row_offsets[i] .. row_offsets[i+1]]`.
+//
+// The wrapper does *not* duplicate any substrate logic: classification,
+// device dispatch, status accounting all live in `cubic_cell`.  Its only
+// jobs are (a) build the SoA cell list survival-flex needs and (b)
+// expose a survival-shaped error surface.
+// ────────────────────────────────────────────────────────────────────────
+
+/// Per-row partition layout: a flat list of `(left, right, c0, c1, c2, c3)`
+/// quadruples plus a `row_offsets` array of length `n + 1` so that
+/// row `i`'s cells live at indices `row_offsets[i] .. row_offsets[i+1]`.
+///
+/// The survival-flex CPU path produces this layout naturally — see
+/// `survival_marginal_slope::denested_partition_cells`.  Callers can
+/// flatten the per-row `Vec<DenestedPartitionCell>` lists into this
+/// shape with a single pass.
+#[derive(Clone, Debug)]
+pub(crate) struct SurvivalFlexRowCellsBatch<'a> {
+    /// Total cell count = sum of per-row partition lengths.
+    pub n_cells: usize,
+    /// Number of rows (logical observations).
+    pub n_rows: usize,
+    /// Highest moment degree to evaluate, in `0..=24`.  Survival flex
+    /// Hessian needs degree 24 for the `D_uv` cross terms; degree 9 is
+    /// sufficient for value-only evaluations.
+    pub max_degree: usize,
+    /// Flat SoA cell quadruples, length `n_cells` each.
+    pub left: &'a [f64],
+    pub right: &'a [f64],
+    pub c0: &'a [f64],
+    pub c1: &'a [f64],
+    pub c2: &'a [f64],
+    pub c3: &'a [f64],
+    /// Length `n_rows + 1`; row `i` owns cells `row_offsets[i] .. row_offsets[i+1]`.
+    /// `row_offsets[0] == 0`, `row_offsets[n_rows] == n_cells`.
+    pub row_offsets: &'a [usize],
+}
+
+/// Row-batched moment evaluation output.  Same shape as the substrate's
+/// `HostMomentBatch` plus an echoed `row_offsets` so Step 3/4 can drive
+/// per-row cumulative quadrature without re-flattening.
+#[derive(Clone, Debug)]
+pub(crate) struct SurvivalFlexRowMoments {
+    /// Row-major `[n_cells, stride]` derivative moments, where
+    /// `stride = max_degree + 1`.  Row for cell `k` is
+    /// `moments[k * stride ..][..stride]`.
+    pub moments: Vec<f64>,
+    /// One status byte per cell, parallel to `moments` rows.  Values
+    /// match `cubic_cell::CubicCellMomentStatus` byte-for-byte; non-zero
+    /// codes mean the corresponding moment row is zeroed.
+    pub status: Vec<u8>,
+    /// `max_degree + 1`.
+    pub stride: usize,
+    /// Echoed from the input so Step 3/4 callers index per-row cells
+    /// without threading the input back through.
+    pub row_offsets: Vec<usize>,
+}
+
+impl<'a> SurvivalFlexRowCellsBatch<'a> {
+    /// Shape-validate the batch.  Returns a `GpuError::DriverCallFailed`
+    /// with a message naming the failing invariant so callers get a
+    /// single error surface across the wrapper.
+    fn validate(&self) -> Result<(), GpuError> {
+        let nc = self.n_cells;
+        let invariants: [(&str, usize); 6] = [
+            ("left", self.left.len()),
+            ("right", self.right.len()),
+            ("c0", self.c0.len()),
+            ("c1", self.c1.len()),
+            ("c2", self.c2.len()),
+            ("c3", self.c3.len()),
+        ];
+        for (label, len) in invariants {
+            if len != nc {
+                return Err(GpuError::DriverCallFailed {
+                    reason: format!(
+                        "survival_flex row-cells batch: {label}.len()={len} != n_cells={nc}"
+                    ),
+                });
+            }
+        }
+        if self.row_offsets.len() != self.n_rows + 1 {
+            return Err(GpuError::DriverCallFailed {
+                reason: format!(
+                    "survival_flex row-cells batch: row_offsets.len()={} != n_rows+1={}",
+                    self.row_offsets.len(),
+                    self.n_rows + 1
+                ),
+            });
+        }
+        if !self.row_offsets.is_empty()
+            && (self.row_offsets[0] != 0 || self.row_offsets[self.n_rows] != nc)
+        {
+            return Err(GpuError::DriverCallFailed {
+                reason: format!(
+                    "survival_flex row-cells batch: row_offsets must start at 0 and end at \
+                     n_cells={nc}, got [{}, …, {}]",
+                    self.row_offsets[0], self.row_offsets[self.n_rows]
+                ),
+            });
+        }
+        for i in 0..self.n_rows {
+            if self.row_offsets[i] > self.row_offsets[i + 1] {
+                return Err(GpuError::DriverCallFailed {
+                    reason: format!(
+                        "survival_flex row-cells batch: row_offsets not monotone at i={i} \
+                         ({} > {})",
+                        self.row_offsets[i],
+                        self.row_offsets[i + 1]
+                    ),
+                });
+            }
+        }
+        if self.max_degree > super::cubic_cell::MAX_SUPPORTED_DEGREE {
+            return Err(GpuError::DriverCallFailed {
+                reason: format!(
+                    "survival_flex row-cells batch: max_degree={} exceeds substrate \
+                     MAX_SUPPORTED_DEGREE={}",
+                    self.max_degree,
+                    super::cubic_cell::MAX_SUPPORTED_DEGREE
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Evaluate the derivative moments for every cell in `batch`.
+///
+/// Routes through the shared `cubic_cell` substrate so the survival-flex
+/// path inherits the substrate's pre-classifier + 384-pt GL warp kernel
+/// without any survival-specific kernel code.  The substrate itself
+/// returns `Ok(None)` only on empty input; we surface that as
+/// `Ok(None)` too so the dispatcher can short-circuit downstream Step 3
+/// solves on rows that have no cells.
+///
+/// The substrate's host residency means this function works on every
+/// platform: on Linux+CUDA the NonAffineFinite bucket runs on the
+/// device, on macOS / CPU-only Linux every cell falls through to the
+/// CPU evaluator that is the parity reference for the device kernel.
+pub(crate) fn try_row_batched_cell_moments(
+    batch: SurvivalFlexRowCellsBatch<'_>,
+) -> Result<Option<SurvivalFlexRowMoments>, GpuError> {
+    batch.validate()?;
+    if batch.n_cells == 0 {
+        return Ok(None);
+    }
+
+    // Build the substrate view in one pass.  The classification (Affine /
+    // NonAffineFinite / AffineTail) is shared host code so doing it once
+    // here lines up with what the substrate would re-derive internally;
+    // we lift it out only because the substrate's `HostView` insists on
+    // a `branches: &[GpuCellBranchTag]` matching the cell list.
+    let mut cells = Vec::with_capacity(batch.n_cells);
+    let mut branches = Vec::with_capacity(batch.n_cells);
+    let mut prelim_status = Vec::with_capacity(batch.n_cells);
+    for k in 0..batch.n_cells {
+        let cell = super::cubic_cell::GpuDenestedCubicCell {
+            left: batch.left[k],
+            right: batch.right[k],
+            c0: batch.c0[k],
+            c1: batch.c1[k],
+            c2: batch.c2[k],
+            c3: batch.c3[k],
+        };
+        match super::cubic_cell::branch::classify_cell_for_gpu(cell) {
+            Ok(tag) => {
+                cells.push(cell);
+                branches.push(tag);
+                prelim_status.push(super::cubic_cell::CubicCellMomentStatus::Ok as u8);
+            }
+            Err(code) => {
+                // Substrate would also reject this cell.  Keep a placeholder
+                // in the input so per-cell indexing stays aligned; the
+                // substrate will set the matching status code itself.
+                cells.push(cell);
+                // The substrate's classifier runs again and writes the
+                // authoritative status; any tag here is fine because the
+                // substrate's "host_tag != caller_tag" path also routes to
+                // an error code, and the substrate's *own* classification
+                // is the one that wins.  Use the cheapest stable tag.
+                branches.push(super::cubic_cell::GpuCellBranchTag::Affine);
+                prelim_status.push(code as u8);
+            }
+        }
+    }
+
+    let view = super::cubic_cell::CubicCellDerivativeMomentHostView {
+        cells: &cells,
+        branches: &branches,
+        max_degree: batch.max_degree,
+        residency: super::cubic_cell::CubicCellMomentResidency::Host,
+    };
+    let out = super::cubic_cell::try_build_cubic_cell_derivative_moments(view)?
+        .ok_or_else(|| GpuError::DriverCallFailed {
+            reason: format!(
+                "survival_flex row-cells batch: substrate returned None for n_cells={} > 0 \
+                 (unexpected)",
+                batch.n_cells
+            ),
+        })?;
+
+    let super::cubic_cell::CubicCellDerivativeMomentOutput::Host {
+        moments,
+        mut status,
+        stride,
+    } = out;
+
+    // Cells we pre-rejected (`prelim_status != Ok`) get a status code
+    // from us if the substrate left them as Ok (it won't, because it
+    // re-runs the classifier — but keeping this explicit guards against
+    // a future substrate that trusts caller tags).
+    for k in 0..batch.n_cells {
+        if prelim_status[k] != super::cubic_cell::CubicCellMomentStatus::Ok as u8
+            && status[k] == super::cubic_cell::CubicCellMomentStatus::Ok as u8
+        {
+            status[k] = prelim_status[k];
+        }
+    }
+
+    Ok(Some(SurvivalFlexRowMoments {
+        moments,
+        status,
+        stride,
+        row_offsets: batch.row_offsets.to_vec(),
+    }))
+}
+
+// ────────────────────────────────────────────────────────────────────────
 // Three thin pullback entry points.  The bodies all currently return
 // `Ok(None)` (the unsupported sentinel) because Steps 2–5 still need to
 // land the flex / cubic-cell / intercept-solve infrastructure before
@@ -1351,6 +1602,159 @@ mod survival_flex_gpu_tests {
                 assert!(reason.contains("derivative_guard"), "got: {reason}");
             }
             other => panic!("expected DriverCallFailed for invalid guard, got {other:?}"),
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Step 2 — row-batched cubic-cell moment wrapper.  Validates the
+    // GPU substrate output element-wise against the CPU evaluator at the
+    // survival-flex high-water mark `max_degree = 24`, across a row mix
+    // covering finite-affine, non-affine-quartic, non-affine-sextic, and
+    // affine-tail cells (the four branches the substrate handles).
+    // ────────────────────────────────────────────────────────────────────
+
+    /// Reference moments via the CPU evaluator (parity target for both
+    /// the host substrate and the device kernel).  Returns the cell's
+    /// `max_degree + 1` derivative moments.
+    fn cpu_cell_moments(
+        left: f64,
+        right: f64,
+        c0: f64,
+        c1: f64,
+        c2: f64,
+        c3: f64,
+        max_degree: usize,
+    ) -> Vec<f64> {
+        let cpu_cell = crate::families::cubic_cell_kernel::DenestedCubicCell {
+            left,
+            right,
+            c0,
+            c1,
+            c2,
+            c3,
+        };
+        let state = crate::families::cubic_cell_kernel::evaluate_cell_derivative_moments_uncached(
+            cpu_cell, max_degree,
+        )
+        .expect("cpu cell-derivative-moments reference");
+        state.moments
+    }
+
+    #[test]
+    fn survival_flex_row_batched_cells_validates_layout() {
+        let left = [0.0_f64];
+        let right = [1.0];
+        let c0 = [0.0];
+        let c1 = [0.0];
+        let c2 = [0.0];
+        let c3 = [0.0];
+        let row_offsets = [0usize, 1];
+        let bad_batch = SurvivalFlexRowCellsBatch {
+            n_cells: 1,
+            n_rows: 1,
+            max_degree: 25, // exceeds MAX_SUPPORTED_DEGREE = 24
+            left: &left,
+            right: &right,
+            c0: &c0,
+            c1: &c1,
+            c2: &c2,
+            c3: &c3,
+            row_offsets: &row_offsets,
+        };
+        match try_row_batched_cell_moments(bad_batch) {
+            Err(GpuError::DriverCallFailed { reason }) => {
+                assert!(
+                    reason.contains("MAX_SUPPORTED_DEGREE"),
+                    "expected degree-bound error, got: {reason}"
+                );
+            }
+            other => panic!("expected validation error for degree=25, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn survival_flex_row_batched_cells_empty_returns_none() {
+        let batch = SurvivalFlexRowCellsBatch {
+            n_cells: 0,
+            n_rows: 0,
+            max_degree: 9,
+            left: &[],
+            right: &[],
+            c0: &[],
+            c1: &[],
+            c2: &[],
+            c3: &[],
+            row_offsets: &[0usize],
+        };
+        match try_row_batched_cell_moments(batch) {
+            Ok(None) => {}
+            other => panic!("expected Ok(None) for empty batch, got {other:?}"),
+        }
+    }
+
+    /// Three-row batch hitting every branch the substrate knows about,
+    /// evaluated at `max_degree = 24` (the survival-flex Hessian
+    /// high-water mark used by `D_uv` cross terms).  Element-wise parity
+    /// against the CPU evaluator at relative tolerance 1e-10 — same bar
+    /// the substrate's own d9 / d21 parity tests use.
+    #[test]
+    fn survival_flex_row_batched_cells_matches_cpu_at_degree_24() {
+        // Row 0: a finite-affine cell on [-1.5, 0.0] (c2 = c3 = 0).
+        // Row 1: a non-affine quartic on [-0.8, 0.3] (c2 ≠ 0, c3 = 0)
+        //        plus a non-affine sextic on [0.3, 1.4]    (c2 ≠ 0, c3 ≠ 0).
+        // Row 2: a whole-line affine tail (c2 = c3 = 0).
+        // Together: 1 + 2 + 1 = 4 cells covering Affine / NonAffineFinite
+        // (both subbranches) / AffineTail.
+        let left   = [-1.5_f64, -0.8, 0.3, f64::NEG_INFINITY];
+        let right  = [ 0.0_f64,  0.3, 1.4, f64::INFINITY    ];
+        let c0     = [ 0.15_f64,-0.20, 0.10, 0.05];
+        let c1     = [-0.30_f64, 0.45,-0.20,-0.10];
+        let c2     = [ 0.00_f64, 0.35, 0.25, 0.00];
+        let c3     = [ 0.00_f64, 0.00, 0.18, 0.00];
+        let row_offsets = [0usize, 1, 3, 4];
+        let max_degree = 24;
+        let batch = SurvivalFlexRowCellsBatch {
+            n_cells: 4,
+            n_rows: 3,
+            max_degree,
+            left: &left,
+            right: &right,
+            c0: &c0,
+            c1: &c1,
+            c2: &c2,
+            c3: &c3,
+            row_offsets: &row_offsets,
+        };
+        let out = try_row_batched_cell_moments(batch)
+            .expect("substrate succeeds on a valid batch")
+            .expect("non-empty batch returns Some");
+        assert_eq!(out.stride, max_degree + 1);
+        assert_eq!(out.row_offsets, vec![0usize, 1, 3, 4]);
+        assert_eq!(out.status.len(), 4);
+        assert_eq!(out.moments.len(), 4 * out.stride);
+
+        // Every cell should classify cleanly (Affine / NonAffineFinite /
+        // AffineTail) and the moments should match the CPU evaluator.
+        // The CPU evaluator handles all three branches; we don't need to
+        // distinguish here — element-wise parity covers everything.
+        for k in 0..4 {
+            assert_eq!(
+                out.status[k],
+                super::super::cubic_cell::CubicCellMomentStatus::Ok as u8,
+                "cell {k}: non-OK status 0x{:02x}",
+                out.status[k]
+            );
+            let cpu = cpu_cell_moments(left[k], right[k], c0[k], c1[k], c2[k], c3[k], max_degree);
+            let row = &out.moments[k * out.stride..(k + 1) * out.stride];
+            assert_eq!(row.len(), cpu.len());
+            for (j, (&got, &want)) in row.iter().zip(cpu.iter()).enumerate() {
+                let denom = want.abs().max(1.0);
+                let rel = (got - want).abs() / denom;
+                assert!(
+                    rel <= 1e-10,
+                    "cell {k} moment {j}: got={got:.17e} want={want:.17e} rel={rel:.3e}"
+                );
+            }
         }
     }
 }

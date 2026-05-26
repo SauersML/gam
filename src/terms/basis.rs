@@ -16035,7 +16035,7 @@ pub fn spherical_wahba_kernel_matrix_with_kind(
     Ok(out)
 }
 
-fn weighted_coefficient_sum_to_zero_transform(
+pub(crate) fn weighted_coefficient_sum_to_zero_transform(
     weights: ArrayView1<'_, f64>,
 ) -> Result<Array2<f64>, BasisError> {
     let k = weights.len();
@@ -16071,7 +16071,7 @@ fn weighted_coefficient_sum_to_zero_transform(
     Ok(z)
 }
 
-fn sphere_area_weights(centers: ArrayView2<'_, f64>, radians: bool) -> Array1<f64> {
+pub(crate) fn sphere_area_weights(centers: ArrayView2<'_, f64>, radians: bool) -> Array1<f64> {
     let to_rad = if radians {
         1.0
     } else {
