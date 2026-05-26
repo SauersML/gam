@@ -16733,6 +16733,7 @@ fn build_time_blockspec(
         nullspace_dims: time_block.nullspace_dims.clone(),
         initial_log_lambdas: rho,
         initial_beta: beta_hint,
+        gauge_priority: 100,
     }
 }
 
@@ -16751,6 +16752,7 @@ fn build_logslope_blockspec(
         nullspace_dims: design.nullspace_dims.clone(),
         initial_log_lambdas: rho,
         initial_beta: beta_hint,
+        gauge_priority: 100,
     }
 }
 
@@ -16768,6 +16770,7 @@ fn build_marginal_blockspec(
         nullspace_dims: design.nullspace_dims.clone(),
         initial_log_lambdas: rho,
         initial_beta: beta_hint,
+        gauge_priority: 100,
     }
 }
 
@@ -19066,6 +19069,7 @@ mod tests {
             nullspace_dims: Vec::new(),
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(Array1::zeros(cols)),
+            gauge_priority: 100,
         }
     }
 

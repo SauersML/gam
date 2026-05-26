@@ -22839,6 +22839,7 @@ mod tests {
             nullspace_dims: vec![],
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
+            gauge_priority: 100,
         }
     }
 
@@ -25775,6 +25776,7 @@ gauge_priority: 100,
                 nullspace_dims: vec![0; k],
                 initial_log_lambdas: Array1::zeros(k),
                 initial_beta: None,
+                gauge_priority: 100,
             }
         }
 
