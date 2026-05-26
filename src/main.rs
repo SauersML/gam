@@ -7379,6 +7379,11 @@ fn saved_anchored_deviation_runtime(runtime: &DeviationRuntime) -> SavedAnchored
                                 },
                             });
                         }
+                        AnchorNullSpaceComponent::FlexEvaluation { ncols } => {
+                            anchor_residual_components.push(SavedAnchorComponent {
+                                kind: SavedAnchorKind::FlexEvaluation { ncols: *ncols },
+                            });
+                        }
                     }
                 }
                 // Persist the rotation only if it is non-identity. The
