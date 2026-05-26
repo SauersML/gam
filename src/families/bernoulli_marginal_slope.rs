@@ -4625,34 +4625,6 @@ impl RowCellMomentsBundle {
             .saturating_add(moment_payload)
     }
 
-    fn resident_bytes(&self) -> usize {
-        let row_vecs = self
-            .rows
-            .len()
-            .saturating_mul(std::mem::size_of::<Option<Vec<CachedDenestedCellMoments>>>());
-        let cell_records = self
-            .rows
-            .iter()
-            .filter_map(Option::as_ref)
-            .map(|cells| cells.len())
-            .sum::<usize>()
-            .saturating_mul(std::mem::size_of::<CachedDenestedCellMoments>());
-        let required_moments = self.max_degree.saturating_add(1);
-        let moment_payload = if required_moments > exact_kernel::CELL_MOMENT_INLINE_CAPACITY {
-            self.rows
-                .iter()
-                .filter_map(Option::as_ref)
-                .map(|cells| cells.len())
-                .sum::<usize>()
-                .saturating_mul(required_moments)
-                .saturating_mul(std::mem::size_of::<f64>())
-        } else {
-            0
-        };
-        row_vecs
-            .saturating_add(cell_records)
-            .saturating_add(moment_payload)
-    }
 }
 
 #[derive(Clone)]
