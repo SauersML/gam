@@ -18225,6 +18225,40 @@ pub fn fit_survival_marginal_slope_terms(
             p_sw = score_warp_dense.as_ref().map_or(0, |m| m.ncols()),
             p_ld = link_dev_dense.as_ref().map_or(0, |m| m.ncols()),
         );
+
+        // W-metric SVD preflight (complement to the unweighted rrqr above).
+        // Surfaces near-rank-deficiency under the actual PIRLS curvature
+        // metric and localises the alias to (block, local_col, weight)
+        // triples so the operator sees exactly which column dominates the
+        // collapsing direction. The rrqr above catches structural rank
+        // deficiency; this catches numerical-rank deficiency at the same
+        // tolerance PIRLS will solve under.
+        let mut segments: Vec<JointPreflightSegment> = Vec::with_capacity(5);
+        segments.push(JointPreflightSegment {
+            block: JointPreflightBlock::Time,
+            columns: time_dense,
+        });
+        segments.push(JointPreflightSegment {
+            block: JointPreflightBlock::Marginal,
+            columns: marginal_dense,
+        });
+        segments.push(JointPreflightSegment {
+            block: JointPreflightBlock::Logslope,
+            columns: logslope_dense,
+        });
+        if let Some(m) = score_warp_dense {
+            segments.push(JointPreflightSegment {
+                block: JointPreflightBlock::ScoreWarp,
+                columns: m,
+            });
+        }
+        if let Some(m) = link_dev_dense {
+            segments.push(JointPreflightSegment {
+                block: JointPreflightBlock::LinkDev,
+                columns: m,
+            });
+        }
+        joint_training_design_preflight(&segments, &spec.weights)?;
     }
     let extra_rho0 = {
         let mut out = Vec::new();
