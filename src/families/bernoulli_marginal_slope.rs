@@ -8762,7 +8762,7 @@ impl BernoulliMarginalSlopeFamily {
                 // Push order is `cell_idx` (= start + local_idx) so the
                 // resulting `[total_cells, MOMENT_STRIDE]` device buffer
                 // is indexed identically to the host `cell_moments` vec.
-                debug_assert_eq!(gpu_cells.len(), cell_idx);
+                assert_eq!(gpu_cells.len(), cell_idx);
                 gpu_cells.push(crate::gpu::cubic_cell::GpuDenestedCubicCell {
                     left: cell.left,
                     right: cell.right,
