@@ -4,6 +4,7 @@ import sys
 import ctypes
 import os
 from collections.abc import Mapping
+from dataclasses import asdict, dataclass, field, fields
 from functools import lru_cache
 from importlib import util
 from pathlib import Path
@@ -71,81 +72,107 @@ def prepare_cuda_libraries() -> tuple[str, ...]:
     return loaded
 
 
+@dataclass(frozen=True)
+class CudaDiagnostics:
+    """Typed CUDA loader-state snapshot.
+
+    This is the single source of truth for the diagnostics schema. The
+    public :func:`cuda_diagnostics` returns ``asdict(...)`` of this so the
+    dict surface keeps working, and consumers (formatter, conflict
+    warning) normalize whatever they receive through
+    :meth:`from_mapping`, which fills defaults for missing fields. That
+    keeps tests and downstream callers from breaking when they hand back
+    a partial dict, and keeps every key name defined in exactly one
+    place.
+    """
+
+    platform: str = ""
+    mapped: dict[str, list[str]] = field(default_factory=dict)
+    conflicts: dict[str, list[str]] = field(default_factory=dict)
+    packaged_nvidia_roots: list[str] = field(default_factory=list)
+    packaged_cuda_library_dirs: list[str] = field(default_factory=list)
+    packaged_complete_stacks: list[list[str]] = field(default_factory=list)
+    system_driver_libraries: list[str] = field(default_factory=list)
+    system_complete_stacks: list[list[str]] = field(default_factory=list)
+
+    @classmethod
+    def from_mapping(cls, info: Mapping[str, object]) -> "CudaDiagnostics":
+        kwargs = {f.name: info[f.name] for f in fields(cls) if f.name in info}
+        return cls(**kwargs)
+
+
 def cuda_diagnostics() -> dict[str, object]:
     """Return CUDA loader state without dlopening any CUDA library."""
 
     mapped = _mapped_cuda_libraries()
     conflicts = {family: paths for family, paths in mapped.items() if len(paths) > 1}
-    return {
-        "platform": sys.platform,
-        "mapped": mapped,
-        "conflicts": conflicts,
-        "packaged_nvidia_roots": [str(path) for path in _nvidia_roots()],
-        "packaged_cuda_library_dirs": list(cuda_subprocess_library_dirs()),
-        "packaged_complete_stacks": [
-            [str(path) for path in stack]
-            for root in _nvidia_roots()
-            if (stack := _complete_nvidia_stack(root))
-        ],
-        "system_driver_libraries": [
-            str(path)
-            for lib_dir in _system_cuda_driver_dirs()
-            if (path := _first_driver_library(lib_dir))
-        ],
-        "system_complete_stacks": [
-            [str(path) for path in stack]
-            for lib_dir in _system_cuda_lib_dirs()
-            if (stack := _complete_system_stack(lib_dir))
-        ],
-    }
+    return asdict(
+        CudaDiagnostics(
+            platform=sys.platform,
+            mapped=mapped,
+            conflicts=conflicts,
+            packaged_nvidia_roots=[str(path) for path in _nvidia_roots()],
+            packaged_cuda_library_dirs=list(cuda_subprocess_library_dirs()),
+            packaged_complete_stacks=[
+                [str(path) for path in stack]
+                for root in _nvidia_roots()
+                if (stack := _complete_nvidia_stack(root))
+            ],
+            system_driver_libraries=[
+                str(path)
+                for lib_dir in _system_cuda_driver_dirs()
+                if (path := _first_driver_library(lib_dir))
+            ],
+            system_complete_stacks=[
+                [str(path) for path in stack]
+                for lib_dir in _system_cuda_lib_dirs()
+                if (stack := _complete_system_stack(lib_dir))
+            ],
+        )
+    )
 
 
 def format_cuda_diagnostics() -> str:
     """Format :func:`cuda_diagnostics` as stable, grep-friendly lines."""
 
-    info = cuda_diagnostics()
+    diag = CudaDiagnostics.from_mapping(cuda_diagnostics())
     lines = ["gamfit CUDA diagnostics:"]
-    lines.append(f"  platform: {info['platform']}")
+    lines.append(f"  platform: {diag.platform}")
     lines.append("  mapped CUDA libraries:")
-    mapped = info["mapped"]
-    if isinstance(mapped, dict) and mapped:
-        for family in sorted(mapped):
+    if diag.mapped:
+        for family in sorted(diag.mapped):
             lines.append(f"    {family}:")
-            for path in mapped[family]:
+            for path in diag.mapped[family]:
                 lines.append(f"      {path}")
     else:
         lines.append("    <none>")
     lines.append("  CUDA library conflicts:")
-    conflicts = info["conflicts"]
-    if isinstance(conflicts, dict) and conflicts:
-        for family in sorted(conflicts):
+    if diag.conflicts:
+        for family in sorted(diag.conflicts):
             lines.append(f"    {family}:")
-            for path in conflicts[family]:
+            for path in diag.conflicts[family]:
                 lines.append(f"      {path}")
     else:
         lines.append("    <none>")
     lines.append("  packaged nvidia roots:")
-    packaged_roots = info["packaged_nvidia_roots"]
-    if isinstance(packaged_roots, list) and packaged_roots:
-        lines.extend(f"    {path}" for path in packaged_roots)
+    if diag.packaged_nvidia_roots:
+        lines.extend(f"    {path}" for path in diag.packaged_nvidia_roots)
     else:
         lines.append("    <none>")
     lines.append("  packaged CUDA library dirs for subprocesses:")
-    packaged_dirs = info["packaged_cuda_library_dirs"]
-    if isinstance(packaged_dirs, list) and packaged_dirs:
-        lines.extend(f"    {path}" for path in packaged_dirs)
+    if diag.packaged_cuda_library_dirs:
+        lines.extend(f"    {path}" for path in diag.packaged_cuda_library_dirs)
     else:
         lines.append("    <none>")
     lines.append("  complete packaged CUDA stacks:")
-    _append_stack_lines(lines, info["packaged_complete_stacks"])
+    _append_stack_lines(lines, diag.packaged_complete_stacks)
     lines.append("  system CUDA driver libraries:")
-    system_drivers = info["system_driver_libraries"]
-    if isinstance(system_drivers, list) and system_drivers:
-        lines.extend(f"    {path}" for path in system_drivers)
+    if diag.system_driver_libraries:
+        lines.extend(f"    {path}" for path in diag.system_driver_libraries)
     else:
         lines.append("    <none>")
     lines.append("  complete system CUDA stacks:")
-    _append_stack_lines(lines, info["system_complete_stacks"])
+    _append_stack_lines(lines, diag.system_complete_stacks)
     return "\n".join(lines)
 
 
@@ -205,10 +232,13 @@ def assert_no_cuda_library_conflicts(context: str) -> None:
     cause discoverable; if it doesn't (the typical case), gamfit just works.
     """
 
-    conflicts = cuda_diagnostics()["conflicts"]
-    if not isinstance(conflicts, dict) or not conflicts:
+    diag = CudaDiagnostics.from_mapping(cuda_diagnostics())
+    if not diag.conflicts:
         return
-    key = "|".join(f"{f}:{','.join(sorted(p))}" for f, p in sorted(conflicts.items()))
+    key = "|".join(
+        f"{name}:{','.join(sorted(paths))}"
+        for name, paths in sorted(diag.conflicts.items())
+    )
     if key in _CUDA_CONFLICT_WARNED:
         return
     _CUDA_CONFLICT_WARNED.add(key)
