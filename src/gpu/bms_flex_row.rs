@@ -1246,6 +1246,583 @@ mod tests {
         }
     }
 
+    // ── CPU oracle that mirrors ROW_KERNEL_SOURCE bit-for-bit ────────────────
+    //
+    // `cpu_oracle_outputs` implements the same algebra as
+    // `bms_flex_row_kernel` in ROW_KERNEL_SOURCE: per-cell `T_n` / `D` / `Q`
+    // contractions, q-row override, IFT to `a_u` / `a_uv`, observed-point
+    // assembly to `bar_e_u` / `bar_e_uv`, probit Mills, and the final
+    // `out_grad` / `out_hess` writes. It takes the same
+    // `BmsFlexRowKernelInputs` struct so a CUDA-equipped host can run both
+    // paths off one bundle and check element-wise parity.
+    //
+    // Used by the GPU↔CPU parity test below; the test skips on non-Linux
+    // hosts via cfg, but the oracle itself is platform-independent so the
+    // macOS lib build can still type-check it.
+
+    const ORACLE_INV_TWO_PI: f64 = 1.0 / std::f64::consts::TAU;
+    const ORACLE_SQRT_2: f64 = std::f64::consts::SQRT_2;
+    const ORACLE_INV_SQRT_2PI: f64 = 0.398_942_280_401_432_7;
+
+    /// Cody-1969 Chebyshev rational `erfc` (same coefficients as
+    /// `pirls_row::libm_erfc`). Used by the oracle's Mills helper so the
+    /// reference path stays free of the optional `libm` crate dependency.
+    fn oracle_erfc(x: f64) -> f64 {
+        if !x.is_finite() {
+            return if x.is_nan() {
+                f64::NAN
+            } else if x > 0.0 {
+                0.0
+            } else {
+                2.0
+            };
+        }
+        let ax = x.abs();
+        let t = 1.0 / (1.0 + 0.5 * ax);
+        let r = t
+            * (-ax * ax - 1.265_512_23
+                + t * (1.000_023_68
+                    + t * (0.374_091_96
+                        + t * (0.096_784_18
+                            + t * (-0.186_288_06
+                                + t * (0.278_868_07
+                                    + t * (-1.135_203_98
+                                        + t * (1.488_515_87
+                                            + t * (-0.822_152_23 + t * 0.170_872_77)))))))))
+                .exp();
+        if x >= 0.0 { r } else { 2.0 - r }
+    }
+
+    fn oracle_erfcx_nonnegative(x: f64) -> f64 {
+        if !x.is_finite() {
+            return if x > 0.0 { 0.0 } else { f64::INFINITY };
+        }
+        if x <= 0.0 {
+            return 1.0;
+        }
+        if x < 26.0 {
+            let mut xx = x * x;
+            if xx > 700.0 {
+                xx = 700.0;
+            }
+            return xx.exp() * oracle_erfc(x);
+        }
+        let inv = 1.0 / x;
+        let inv2 = inv * inv;
+        let poly = 1.0 - 0.5 * inv2 + 0.75 * inv2 * inv2
+            - 1.875 * inv2 * inv2 * inv2
+            + 6.5625 * inv2 * inv2 * inv2 * inv2;
+        let inv_sqrt_pi: f64 = 0.564_189_583_547_756_3;
+        inv * poly * inv_sqrt_pi
+    }
+
+    fn oracle_log_ndtr_and_mills(x: f64) -> (f64, f64) {
+        if x == f64::INFINITY {
+            return (0.0, 0.0);
+        }
+        if x == f64::NEG_INFINITY {
+            return (f64::NEG_INFINITY, f64::INFINITY);
+        }
+        if x.is_nan() {
+            return (x, x);
+        }
+        if x < 0.0 {
+            let u = -x / ORACLE_SQRT_2;
+            let mut ex = oracle_erfcx_nonnegative(u);
+            if ex < 1e-300 {
+                ex = 1e-300;
+            }
+            let log_cdf = -u * u + (0.5 * ex).ln();
+            let sqrt_2_over_pi: f64 = 0.797_884_560_802_865_4;
+            (log_cdf, sqrt_2_over_pi / ex)
+        } else {
+            let mut cdf = 0.5 * oracle_erfc(-x / ORACLE_SQRT_2);
+            if cdf < 1e-300 {
+                cdf = 1e-300;
+            }
+            if cdf > 1.0 {
+                cdf = 1.0;
+            }
+            let pdf = ORACLE_INV_SQRT_2PI * (-0.5 * x * x).exp();
+            (cdf.ln(), pdf / cdf)
+        }
+    }
+
+    /// Same outputs the device kernel writes: `(neglog, grad, hess)` per row.
+    /// `grad` is row-major `n × r`, `hess` is row-major `n × r × r`.
+    /// Mirrors `bms_flex_row_kernel` line-for-line so kernel + oracle diverge
+    /// only if one side breaks parity.
+    fn cpu_oracle_outputs(inputs: &BmsFlexRowKernelInputs<'_>) -> BmsFlexRowKernelOutputs {
+        let n = inputs.n_rows;
+        let r = inputs.r;
+        let p_h = inputs.p_h;
+        let p_w = inputs.p_w;
+        let mut neglog = vec![0.0_f64; n];
+        let mut grad = vec![0.0_f64; n * r];
+        let mut hess = vec![0.0_f64; n * r * r];
+
+        for row in 0..n {
+            // ── per-cell sweep: accumulate F_u, F_au, F_uv, F_a, F_aa.
+            let mut f_u = vec![0.0_f64; r];
+            let mut f_au = vec![0.0_f64; r];
+            let mut f_uv = vec![0.0_f64; r * r];
+            let mut f_a = 0.0_f64;
+            let mut f_aa = 0.0_f64;
+
+            let cell_lo = inputs.cell_offsets[row] as usize;
+            let cell_hi = inputs.cell_offsets[row + 1] as usize;
+            for c in cell_lo..cell_hi {
+                let c_arr = [
+                    inputs.cell_c0[c],
+                    inputs.cell_c1[c],
+                    inputs.cell_c2[c],
+                    inputs.cell_c3[c],
+                ];
+                let m = &inputs.cell_moments[c * MOMENT_STRIDE..(c + 1) * MOMENT_STRIDE];
+
+                // T_n = κ · Σ_e C_e · m_{e+n}, n = 0..6.
+                let mut t = [0.0_f64; 7];
+                for (n_idx, t_slot) in t.iter_mut().enumerate() {
+                    let mut acc = 0.0_f64;
+                    for (e, c_e) in c_arr.iter().enumerate() {
+                        acc = c_e.mul_add(m[e + n_idx], acc);
+                    }
+                    *t_slot = acc * ORACLE_INV_TWO_PI;
+                }
+
+                let d_of = |r_arr: &[f64]| -> f64 {
+                    ORACLE_INV_TWO_PI
+                        * (r_arr[0] * m[0]
+                            + r_arr[1] * m[1]
+                            + r_arr[2] * m[2]
+                            + r_arr[3] * m[3])
+                };
+                let q_of = |r_arr: &[f64], s_arr: &[f64]| -> f64 {
+                    (r_arr[0] * s_arr[0]) * t[0]
+                        + (r_arr[0] * s_arr[1] + r_arr[1] * s_arr[0]) * t[1]
+                        + (r_arr[0] * s_arr[2] + r_arr[1] * s_arr[1] + r_arr[2] * s_arr[0]) * t[2]
+                        + (r_arr[0] * s_arr[3]
+                            + r_arr[1] * s_arr[2]
+                            + r_arr[2] * s_arr[1]
+                            + r_arr[3] * s_arr[0])
+                            * t[3]
+                        + (r_arr[1] * s_arr[3] + r_arr[2] * s_arr[2] + r_arr[3] * s_arr[1]) * t[4]
+                        + (r_arr[2] * s_arr[3] + r_arr[3] * s_arr[2]) * t[5]
+                        + (r_arr[3] * s_arr[3]) * t[6]
+                };
+
+                let a_c = &inputs.cell_a[c * 4..(c + 1) * 4];
+                let aa_c = &inputs.cell_aa[c * 4..(c + 1) * 4];
+                f_a += d_of(a_c);
+                f_aa += d_of(aa_c) - q_of(a_c, a_c);
+
+                for u in 1..r {
+                    let r_u_off = (c * (r - 1) + (u - 1)) * 4;
+                    let r_u = &inputs.cell_r[r_u_off..r_u_off + 4];
+                    let ar_u = &inputs.cell_ar[r_u_off..r_u_off + 4];
+                    f_u[u] += d_of(r_u);
+                    f_au[u] += d_of(ar_u) - q_of(a_c, r_u);
+                }
+
+                for u in 1..r {
+                    let r_u_off = (c * (r - 1) + (u - 1)) * 4;
+                    let r_u = &inputs.cell_r[r_u_off..r_u_off + 4];
+                    for v in u..r {
+                        let r_v_off = (c * (r - 1) + (v - 1)) * 4;
+                        let r_v = &inputs.cell_r[r_v_off..r_v_off + 4];
+                        let q_uv = q_of(r_u, r_v);
+                        let d_s = if u == 1 && v == 1 {
+                            let s_bb = &inputs.cell_sbb[c * 4..(c + 1) * 4];
+                            d_of(s_bb)
+                        } else if u == 1 && v >= 2 && v < 2 + p_h {
+                            let j = v - 2;
+                            let off = (c * p_h + j) * 4;
+                            let s_bh = &inputs.cell_sbh[off..off + 4];
+                            d_of(s_bh)
+                        } else if u == 1 && v >= 2 + p_h && v < r {
+                            let l = v - (2 + p_h);
+                            let off = (c * p_w + l) * 4;
+                            let s_bw = &inputs.cell_sbw[off..off + 4];
+                            d_of(s_bw)
+                        } else {
+                            0.0
+                        };
+                        f_uv[u * r + v] += d_s - q_uv;
+                    }
+                }
+            }
+
+            // q-row overrides (mirror kernel lines 691–700).
+            let mu_1 = inputs.mu_1[row];
+            let mu_2 = inputs.mu_2[row];
+            f_u[0] = -mu_1;
+            f_au[0] = 0.0;
+            for v in 0..r {
+                f_uv[v] = 0.0;
+                f_uv[v * r] = 0.0;
+            }
+            f_uv[0] = -mu_2;
+
+            // Degenerate F_a ⇒ NaN-fill (mirror kernel lines 703–706).
+            if !f_a.is_finite() || f_a <= 0.0 {
+                neglog[row] = f64::NAN;
+                for slot in grad[row * r..(row + 1) * r].iter_mut() {
+                    *slot = f64::NAN;
+                }
+                for slot in hess[row * r * r..(row + 1) * r * r].iter_mut() {
+                    *slot = f64::NAN;
+                }
+                continue;
+            }
+            let inv_fa = 1.0 / f_a;
+
+            // IFT first/second order.
+            let mut a_u = vec![0.0_f64; r];
+            a_u[0] = mu_1 * inv_fa;
+            for u in 1..r {
+                a_u[u] = -f_u[u] * inv_fa;
+            }
+            let mut a_uv = vec![0.0_f64; r * r];
+            for u in 0..r {
+                for v in u..r {
+                    let term = f_uv[u * r + v]
+                        + f_au[v] * a_u[u]
+                        + f_au[u] * a_u[v]
+                        + f_aa * a_u[u] * a_u[v];
+                    let val = -term * inv_fa;
+                    a_uv[u * r + v] = val;
+                    a_uv[v * r + u] = val;
+                }
+            }
+
+            // Observed predictor jets.
+            let chi = inputs.chi_obs[row];
+            let xi = inputs.xi_obs[row];
+            let rho = &inputs.rho_u[row * r..(row + 1) * r];
+            let tau = &inputs.tau_u[row * r..(row + 1) * r];
+            let ruv = &inputs.r_uv[row * r * r..(row + 1) * r * r];
+            let mut bar_e_u = vec![0.0_f64; r];
+            for u in 0..r {
+                bar_e_u[u] = chi * a_u[u] + rho[u];
+            }
+            let mut bar_e_uv = vec![0.0_f64; r * r];
+            for u in 0..r {
+                for v in u..r {
+                    let val = chi * a_uv[u * r + v]
+                        + xi * a_u[u] * a_u[v]
+                        + tau[u] * a_u[v]
+                        + a_u[u] * tau[v]
+                        + ruv[u * r + v];
+                    bar_e_uv[u * r + v] = val;
+                    if u != v {
+                        bar_e_uv[v * r + u] = val;
+                    }
+                }
+            }
+
+            // Probit Mills + final writes.
+            let y = inputs.y[row];
+            let w = inputs.w[row];
+            let s = 2.0 * y - 1.0;
+            let e_obs = bar_e_u[0];
+            let m_arg = s * e_obs;
+            let (log_cdf, lambda) = oracle_log_ndtr_and_mills(m_arg);
+            let a_i = -w * s * lambda;
+            let b_i = w * lambda * (m_arg + lambda);
+            neglog[row] = -w * log_cdf;
+            for u in 0..r {
+                grad[row * r + u] = a_i * bar_e_u[u];
+            }
+            for u in 0..r {
+                for v in u..r {
+                    let val = b_i * bar_e_u[u] * bar_e_u[v] + a_i * bar_e_uv[u * r + v];
+                    hess[row * r * r + u * r + v] = val;
+                    if u != v {
+                        hess[row * r * r + v * r + u] = val;
+                    }
+                }
+            }
+        }
+
+        BmsFlexRowKernelOutputs {
+            neglog,
+            grad,
+            hess,
+        }
+    }
+
+    /// Build a non-trivial fixture: `n = 4` rows, `r = 5` (p_h = 2, p_w = 1),
+    /// 2–4 cells per row, distinct values so a structural bug in either path
+    /// can't be masked by accidental cancellation.
+    fn make_parity_buffers() -> TestBuffers {
+        let n = 4_usize;
+        let r = 5_usize;
+        let p_h = 2_usize;
+        let p_w = 1_usize;
+        // Per-row cell counts: 2, 3, 4, 2 → total 11 cells.
+        let row_cells: [u32; 4] = [2, 3, 4, 2];
+        let mut cell_offsets = vec![0_u32; n + 1];
+        for i in 0..n {
+            cell_offsets[i + 1] = cell_offsets[i] + row_cells[i];
+        }
+        let total_cells = cell_offsets[n] as usize;
+
+        // Deterministic but varied generators (LCG-ish so each slot is distinct).
+        let f = |seed: usize| -> f64 {
+            let x = ((seed.wrapping_mul(2_654_435_761)) & 0xFFFF) as f64 / 65_536.0;
+            0.1 + 0.4 * x
+        };
+
+        let q = (0..n).map(|i| 0.05 + 0.1 * (i as f64)).collect::<Vec<_>>();
+        let b = (0..n).map(|i| 0.6 + 0.05 * (i as f64)).collect::<Vec<_>>();
+        let mu_1 = (0..n).map(|i| 0.7 + 0.02 * (i as f64)).collect::<Vec<_>>();
+        let mu_2 = (0..n).map(|i| 0.15 + 0.01 * (i as f64)).collect::<Vec<_>>();
+        let z_obs = (0..n)
+            .map(|i| -0.2 + 0.1 * (i as f64))
+            .collect::<Vec<_>>();
+        let y = [1.0, 0.0, 1.0, 0.0].to_vec();
+        let w = vec![1.0; n];
+
+        let cell_c0 = (0..total_cells).map(|c| f(c + 1001)).collect::<Vec<_>>();
+        let cell_c1 = (0..total_cells)
+            .map(|c| -f(c + 2002) * 0.5)
+            .collect::<Vec<_>>();
+        let cell_c2 = (0..total_cells).map(|c| f(c + 3003) * 0.2).collect();
+        let cell_c3 = (0..total_cells).map(|c| -f(c + 4004) * 0.1).collect();
+
+        let cell_a = (0..total_cells * 4)
+            .map(|i| f(i + 5005) * 0.3)
+            .collect::<Vec<_>>();
+        let cell_aa = (0..total_cells * 4)
+            .map(|i| f(i + 6006) * 0.1)
+            .collect::<Vec<_>>();
+        let cell_r = (0..total_cells * (r - 1) * 4)
+            .map(|i| f(i + 7007) * 0.2)
+            .collect::<Vec<_>>();
+        let cell_ar = (0..total_cells * (r - 1) * 4)
+            .map(|i| f(i + 8008) * 0.05)
+            .collect::<Vec<_>>();
+        let cell_sbb = (0..total_cells * 4)
+            .map(|i| f(i + 9009) * 0.08)
+            .collect::<Vec<_>>();
+        let cell_sbh = (0..total_cells * p_h * 4)
+            .map(|i| f(i + 10_010) * 0.07)
+            .collect::<Vec<_>>();
+        let cell_sbw = (0..total_cells * p_w * 4)
+            .map(|i| f(i + 11_011) * 0.06)
+            .collect::<Vec<_>>();
+        let cell_moments = (0..total_cells * MOMENT_STRIDE)
+            .map(|i| 0.4 + 0.1 * f(i + 12_012))
+            .collect::<Vec<_>>();
+
+        let chi_obs = (0..n).map(|i| 0.9 + 0.01 * (i as f64)).collect::<Vec<_>>();
+        let xi_obs = (0..n).map(|i| 0.2 + 0.01 * (i as f64)).collect::<Vec<_>>();
+        let rho_u = (0..n * r).map(|i| 0.03 * f(i + 13_013)).collect::<Vec<_>>();
+        let tau_u = (0..n * r).map(|i| 0.02 * f(i + 14_014)).collect::<Vec<_>>();
+        let r_uv = (0..n * r * r)
+            .map(|i| 0.04 * f(i + 15_015))
+            .collect::<Vec<_>>();
+
+        TestBuffers {
+            q,
+            b,
+            mu_1,
+            mu_2,
+            z_obs,
+            y,
+            w,
+            cell_offsets,
+            cell_c0,
+            cell_c1,
+            cell_c2,
+            cell_c3,
+            cell_a,
+            cell_aa,
+            cell_r,
+            cell_ar,
+            cell_sbb,
+            cell_sbh,
+            cell_sbw,
+            cell_moments,
+            chi_obs,
+            xi_obs,
+            rho_u,
+            tau_u,
+            r_uv,
+        }
+    }
+
+    fn parity_inputs<'a>(buffers: &'a TestBuffers) -> BmsFlexRowKernelInputs<'a> {
+        BmsFlexRowKernelInputs {
+            n_rows: 4,
+            r: 5,
+            p_h: 2,
+            p_w: 1,
+            q: &buffers.q,
+            b: &buffers.b,
+            mu_1: &buffers.mu_1,
+            mu_2: &buffers.mu_2,
+            z_obs: &buffers.z_obs,
+            y: &buffers.y,
+            w: &buffers.w,
+            s_f: 1.0,
+            cell_offsets: &buffers.cell_offsets,
+            cell_c0: &buffers.cell_c0,
+            cell_c1: &buffers.cell_c1,
+            cell_c2: &buffers.cell_c2,
+            cell_c3: &buffers.cell_c3,
+            cell_a: &buffers.cell_a,
+            cell_aa: &buffers.cell_aa,
+            cell_r: &buffers.cell_r,
+            cell_ar: &buffers.cell_ar,
+            cell_sbb: &buffers.cell_sbb,
+            cell_sbh: &buffers.cell_sbh,
+            cell_sbw: &buffers.cell_sbw,
+            cell_moments: &buffers.cell_moments,
+            chi_obs: &buffers.chi_obs,
+            xi_obs: &buffers.xi_obs,
+            rho_u: &buffers.rho_u,
+            tau_u: &buffers.tau_u,
+            r_uv: &buffers.r_uv,
+        }
+    }
+
+    /// Symmetry + finiteness of the CPU oracle. Runs on every host (Linux,
+    /// macOS, CPU CI) since the oracle is platform-independent. Guarantees the
+    /// reference path used by the GPU parity test is itself well-formed.
+    #[test]
+    fn cpu_oracle_produces_finite_symmetric_hessian() {
+        let buffers = make_parity_buffers();
+        let inputs = parity_inputs(&buffers);
+        inputs
+            .validate()
+            .expect("parity fixture must satisfy validate()");
+        let out = cpu_oracle_outputs(&inputs);
+        let n = inputs.n_rows;
+        let r = inputs.r;
+        assert_eq!(out.neglog.len(), n);
+        assert_eq!(out.grad.len(), n * r);
+        assert_eq!(out.hess.len(), n * r * r);
+        for row in 0..n {
+            assert!(
+                out.neglog[row].is_finite(),
+                "row {row}: neglog must be finite, got {}",
+                out.neglog[row]
+            );
+            for u in 0..r {
+                let g = out.grad[row * r + u];
+                assert!(g.is_finite(), "row {row}: grad[{u}] = {g}");
+                for v in 0..r {
+                    let huv = out.hess[row * r * r + u * r + v];
+                    let hvu = out.hess[row * r * r + v * r + u];
+                    assert!(huv.is_finite(), "row {row}: H[{u},{v}] = {huv}");
+                    assert_eq!(
+                        huv.to_bits(),
+                        hvu.to_bits(),
+                        "row {row}: H[{u},{v}] and H[{v},{u}] must be bit-identical"
+                    );
+                }
+            }
+        }
+    }
+
+    /// CPU↔GPU parity. Only runs end-to-end on a Linux host with a CUDA
+    /// runtime; skips with a clear `eprintln!` on every other host so the
+    /// always-on test suite stays green on the macOS dev box and CPU CI.
+    ///
+    /// On a CUDA host: drives the kernel through `launch_bms_flex_row_kernel`
+    /// and the same `BmsFlexRowKernelInputs` through `cpu_oracle_outputs`,
+    /// then asserts every element of `neglog`, `grad`, and `hess` agrees
+    /// within `|Δ| <= 1e-8 + 1e-8·|cpu|` (absolute-or-relative).
+    #[test]
+    fn bms_flex_row_kernel_matches_cpu_oracle_when_cuda_available() {
+        #[cfg(not(target_os = "linux"))]
+        {
+            eprintln!(
+                "[bms_flex_row parity] non-Linux host — skipping CUDA parity \
+                 (CPU oracle exercised by sibling test)"
+            );
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let Some(_runtime) = crate::gpu::runtime::GpuRuntime::global() else {
+                eprintln!(
+                    "[bms_flex_row parity] no CUDA runtime — skipping device \
+                     parity (CPU oracle exercised by sibling test)"
+                );
+                return;
+            };
+            let buffers = make_parity_buffers();
+            let inputs_cpu = parity_inputs(&buffers);
+            inputs_cpu
+                .validate()
+                .expect("parity fixture must satisfy validate()");
+            let cpu_out = cpu_oracle_outputs(&inputs_cpu);
+
+            // Launch the device kernel against the same inputs.
+            let inputs_gpu = parity_inputs(&buffers);
+            let gpu_out = match launch_bms_flex_row_kernel(inputs_gpu) {
+                Ok(out) => out,
+                Err(err) => {
+                    eprintln!(
+                        "[bms_flex_row parity] launch failed on CUDA host: \
+                         {err}; skipping parity (treat as CI infra outage, \
+                         not a parity regression)"
+                    );
+                    return;
+                }
+            };
+
+            let n = inputs_cpu.n_rows;
+            let r = inputs_cpu.r;
+            let tol_abs = 1e-8_f64;
+            let tol_rel = 1e-8_f64;
+            let check_close = |label: &str, idx: usize, cpu: f64, gpu: f64| {
+                if cpu.is_nan() || gpu.is_nan() {
+                    assert!(
+                        cpu.is_nan() && gpu.is_nan(),
+                        "{label}[{idx}]: NaN parity broke — cpu={cpu}, gpu={gpu}"
+                    );
+                    return;
+                }
+                let diff = (cpu - gpu).abs();
+                let tol = tol_abs + tol_rel * cpu.abs();
+                assert!(
+                    diff <= tol,
+                    "{label}[{idx}]: |cpu − gpu| = {diff:.3e} > tol = {tol:.3e}; \
+                     cpu={cpu:.17e}, gpu={gpu:.17e}"
+                );
+            };
+            assert_eq!(cpu_out.neglog.len(), gpu_out.neglog.len());
+            assert_eq!(cpu_out.grad.len(), gpu_out.grad.len());
+            assert_eq!(cpu_out.hess.len(), gpu_out.hess.len());
+            for (i, (&c, &g)) in cpu_out.neglog.iter().zip(gpu_out.neglog.iter()).enumerate() {
+                check_close("neglog", i, c, g);
+            }
+            for (i, (&c, &g)) in cpu_out.grad.iter().zip(gpu_out.grad.iter()).enumerate() {
+                check_close("grad", i, c, g);
+            }
+            for (i, (&c, &g)) in cpu_out.hess.iter().zip(gpu_out.hess.iter()).enumerate() {
+                check_close("hess", i, c, g);
+            }
+            // Spot-check exact symmetry on the GPU Hessian too.
+            for row in 0..n {
+                for u in 0..r {
+                    for v in 0..r {
+                        let a = gpu_out.hess[row * r * r + u * r + v];
+                        let bb = gpu_out.hess[row * r * r + v * r + u];
+                        assert_eq!(
+                            a.to_bits(),
+                            bb.to_bits(),
+                            "GPU row {row}: H[{u},{v}] ≠ H[{v},{u}] bit-for-bit"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn kernel_source_mentions_cpu_parity_reference() {
         // Guarantee the maintainer-facing parity reference comment survives
