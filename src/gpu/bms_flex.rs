@@ -725,7 +725,7 @@ fn accumulate_row_hessian_pullback(
         row[q_dim + g_dim + p_h + j] = 1.0;
         phi.push(row);
     }
-    debug_assert_eq!(phi.len(), r);
+    assert_eq!(phi.len(), r);
 
     for u in 0..r {
         for v in 0..r {
