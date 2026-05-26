@@ -157,22 +157,17 @@ def test_descriptor_declaration_matches_evaluators(cls: type) -> None:
     and every existing _evaluate_<backend> must be advertised. Prevents the
     drift class behind #232."""
     backends = set(getattr(cls, "SUPPORTED_BACKENDS", frozenset()))
-    impl_methods = {
-        name.removeprefix("_evaluate_")
-        for name in dir(cls)
-        if name.startswith("_evaluate_")
-    }
+    impl_methods = _own_evaluate_backends(cls)
     for b in backends:
         assert b in impl_methods, (
             f"{cls.__qualname__} advertises backend {b!r} but has no "
             f"_evaluate_{b}"
         )
     for m in impl_methods:
-        if m in {"torch", "numpy", "jax"}:
-            assert m in backends, (
-                f"{cls.__qualname__} implements _evaluate_{m} but does not "
-                "advertise it in SUPPORTED_BACKENDS"
-            )
+        assert m in backends, (
+            f"{cls.__qualname__} implements _evaluate_{m} but does not "
+            "advertise it in SUPPORTED_BACKENDS"
+        )
 
 
 # ---------------------------------------------------------------------------

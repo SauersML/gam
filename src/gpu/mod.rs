@@ -10,6 +10,7 @@ pub mod arrow_schur;
 pub mod blas;
 pub mod bms_flex;
 pub mod cpu_traits;
+pub mod cubic_bspline_moments;
 pub mod device;
 pub mod driver;
 pub mod error;
