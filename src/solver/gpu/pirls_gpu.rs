@@ -85,18 +85,40 @@ mod cuda {
         PirlsGpuInput, PirlsGpuSharedData, PirlsGpuStep, PirlsStepStreamInput,
         SigmaPirlsGpuWorkspace,
     };
+    use crate::gpu::common::PtxModuleCache;
     use crate::gpu::driver::{from_col_major, to_col_major};
-    use crate::gpu::solver::{
-        cholesky_logdet_from_col_major, context_and_stream, pinned_htod, potrf_in_place,
-        potrs_in_place,
-    };
+    use crate::gpu::solver::{context_and_stream, pinned_htod, potrf_in_place, potrs_in_place};
     use cudarc::cublas::sys::{
         cublasDdgmm, cublasDgeam, cublasOperation_t, cublasSideMode_t, cublasStatus_t,
     };
     use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
     use cudarc::cusolver::DnHandle;
-    use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
+    use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut, LaunchConfig, PushKernelArg};
     use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
+
+    /// One-thread reduction over a p×p column-major Cholesky factor's
+    /// diagonal, computing `2·Σ ln(L[i,i])` device-side and writing a
+    /// single f64 into `out[0]`. The factor's lower-triangular Cholesky
+    /// has positive diagonal by construction, so no abs/clamp needed.
+    /// One thread is enough for the dominant p ≤ ~200 sizes; the cost was
+    /// previously a full p² download, so even a serial device sweep wins.
+    const CHOL_LOGDET_PTX_SOURCE: &str = r#"
+extern "C" __global__ void chol_logdet_col_major(
+    const double* __restrict__ factor,
+    int p,
+    double* __restrict__ out
+) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    double acc = 0.0;
+    long long pp = (long long)p;
+    for (long long i = 0; i < pp; ++i) {
+        acc += log(factor[i * pp + i]);
+    }
+    out[0] = 2.0 * acc;
+}
+"#;
+
+    static CHOL_LOGDET_CACHE: PtxModuleCache = PtxModuleCache::new();
 
     impl PirlsGpuSharedData {
         /// Upload `x` to the cached per-ordinal CUDA context and return a
@@ -294,6 +316,11 @@ mod cuda {
         potrf_in_place(&ws.solver, &ws.stream, p, &mut ws.h_dev)?;
         potrs_in_place(&ws.solver, &ws.stream, p, 1, &ws.h_dev, &mut ws.rhs_dev)?;
 
+        // Logdet device-side: reduces the previous p² Cholesky-factor
+        // download to a single f64 download. Stage 2's "no per-iteration
+        // host round-trip" budget keeps the p² factor on the device.
+        let logdet = cholesky_logdet_device(&ws.stream, &shared.ctx, p, &ws.h_dev)?;
+
         // Direction: the convention is d = −H⁻¹ g.
         let direction_raw = ws
             .stream
@@ -301,12 +328,6 @@ mod cuda {
             .map_err(|e| format!("download direction: {e}"))?;
         let mut direction = Array1::from_vec(direction_raw);
         direction.mapv_inplace(|v| -v);
-
-        let h_factor_col = ws
-            .stream
-            .clone_dtoh(&ws.h_dev)
-            .map_err(|e| format!("download Cholesky factor: {e}"))?;
-        let logdet = cholesky_logdet_from_col_major(&h_factor_col, p);
 
         Ok(PirlsGpuStep {
             penalized_hessian,
@@ -487,6 +508,46 @@ mod cuda {
         } else {
             Err(format!("cublasDgeam failed with {status:?}"))
         }
+    }
+
+    /// Launch the device-side Cholesky-factor logdet kernel and download
+    /// the single scalar result. Replaces the per-step p² host download of
+    /// the Cholesky factor that the host-side `cholesky_logdet_from_col_major`
+    /// required.
+    fn cholesky_logdet_device(
+        stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+        ctx: &std::sync::Arc<cudarc::driver::CudaContext>,
+        p: usize,
+        factor_dev: &CudaSlice<f64>,
+    ) -> Result<f64, String> {
+        let module = CHOL_LOGDET_CACHE
+            .get_or_compile(ctx, "pirls_gpu_chol_logdet", CHOL_LOGDET_PTX_SOURCE)
+            .map_err(|err| format!("chol_logdet module: {err}"))?;
+        let func = module
+            .load_function("chol_logdet_col_major")
+            .map_err(|err| format!("chol_logdet load_function: {err}"))?;
+        let mut out_dev = stream
+            .alloc_zeros::<f64>(1)
+            .map_err(|err| format!("alloc chol_logdet out: {err}"))?;
+        let p_i = to_i32(p)?;
+        let cfg = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (1, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut builder = stream.launch_builder(&func);
+        builder.arg(factor_dev);
+        builder.arg(&p_i);
+        builder.arg(&mut out_dev);
+        // SAFETY: serial single-thread kernel reading `p` f64 diagonal
+        // entries from a live p*p column-major factor and writing one f64
+        // to `out_dev`; no aliasing, no oob — `p` matches the device buffer
+        // shape every caller passes in.
+        unsafe { builder.launch(cfg) }.map_err(|err| format!("chol_logdet launch: {err}"))?;
+        let out_host = stream
+            .clone_dtoh(&out_dev)
+            .map_err(|err| format!("download chol_logdet: {err}"))?;
+        Ok(out_host[0])
     }
 
     fn penalty_with_ridge(penalty: ArrayView2<'_, f64>, ridge: f64) -> Array2<f64> {
