@@ -12420,6 +12420,15 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         cached_active_sets = seed.active_sets.clone();
         refresh_all_block_etas(family, specs, &mut states)?;
     }
+    let load_joint_started = std::time::Instant::now();
+    if prelude_log {
+        log::info!(
+            "[STAGE] PIRLS/inner step=load_joint_gradient_evaluation begin use_joint_newton={} joint_workspace_requested={} (since inner-start={:.3}s)",
+            use_joint_newton,
+            joint_workspace_requested,
+            inner_started.elapsed().as_secs_f64(),
+        );
+    }
     let (
         mut current_log_likelihood,
         mut cached_eval,
@@ -12440,17 +12449,43 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         let log_likelihood = eval.log_likelihood;
         (log_likelihood, Some(eval), None, None)
     };
+    if prelude_log {
+        log::info!(
+            "[STAGE] PIRLS/inner step=load_joint_gradient_evaluation end elapsed={:.3}s log_likelihood={:.6e} has_gradient={} has_workspace={}",
+            load_joint_started.elapsed().as_secs_f64(),
+            current_log_likelihood,
+            cached_joint_gradient.is_some(),
+            cached_joint_workspace.is_some(),
+        );
+    }
     // Validate exact-Newton block Hessians at the family-evaluation
     // boundary. A non-finite entry is a contract violation against the
     // family's analytic second derivative; refuse to iterate before
     // any factorization rather than letting it slip through to a
     // downstream logdet check that may be gated off by the outer
     // optimizer's flags.
+    let validate_started = std::time::Instant::now();
     if let Some(eval) = cached_eval.as_ref() {
         validate_block_hessians_finite(eval)?;
     }
+    if prelude_log {
+        log::info!(
+            "[STAGE] PIRLS/inner step=validate_block_hessians_finite elapsed={:.3}s checked={}",
+            validate_started.elapsed().as_secs_f64(),
+            cached_eval.is_some(),
+        );
+    }
+    let penalty_started = std::time::Instant::now();
     let mut current_penalty =
         total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy);
+    if prelude_log {
+        log::info!(
+            "[STAGE] PIRLS/inner step=total_quadratic_penalty elapsed={:.3}s penalty={:.6e} (prelude_total={:.3}s)",
+            penalty_started.elapsed().as_secs_f64(),
+            current_penalty,
+            inner_started.elapsed().as_secs_f64(),
+        );
+    }
     let mut lastobjective = -current_log_likelihood + current_penalty;
     let mut converged = false;
     let mut cycles_done = 0usize;
