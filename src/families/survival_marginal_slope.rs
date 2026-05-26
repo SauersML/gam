@@ -16360,17 +16360,24 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
                 kern, rows,
             )?)));
         }
-        // Flex / timewiggle path: store the options on the workspace so the
-        // directional-derivative methods can pick up the outer-row subsample.
-        let owned;
-        let options: &BlockwiseFitOptions =
-            match self.install_auto_outer_subsample_options(options, block_states) {
-                Some(cloned) => {
-                    owned = cloned;
-                    &owned
-                }
-                None => options,
-            };
+        // Flex / timewiggle path. This workspace is constructed by the INNER
+        // joint Newton solver. Inner-coefficient evaluation must use the same
+        // row measure across (objective, gradient, Hessian, HVP); otherwise
+        // the inner Newton step is wrong. We therefore do NOT auto-install an
+        // outer-score subsample mask here. The cached joint Hessian operator
+        // built in `SurvivalMarginalSlopeExactNewtonJointHessianWorkspace::new`
+        // iterates `0..self.n` unconditionally, so installing a mask only
+        // affected the directional-derivative HVP row iteration — an
+        // inconsistent operator/HVP pair the inner Newton would silently use.
+        //
+        // If outer code wants HT subsampling on the workspace's HVPs, it must
+        // set `options.outer_score_subsample` explicitly upstream, never via
+        // a side-effect installed inside the inner-coefficient workspace
+        // constructor. The failing biobank log emitted
+        //   `phase=1 eval=N/12 ... K=19661`
+        // immediately before a ~430 s full-data Hessian build for exactly
+        // this reason: the install fired at this site, the mask was logged,
+        // then the operator builder ignored the mask and walked all rows.
         Ok(Some(Arc::new(
             SurvivalMarginalSlopeExactNewtonJointHessianWorkspace::new(
                 self.clone(),
