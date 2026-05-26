@@ -1903,9 +1903,89 @@ pub(crate) fn launch_bms_flex_row_kernel_device_resident(
             r,
             block,
             primary,
+            // Build kernel emits dense `[n, r, r]` row-major; conversion to
+            // `SymmetricPackedUpper` is opt-in via `repack_upper`.
+            layout: RowHessianLayout::FullRowMajor,
             bytes,
         },
     ))
+}
+
+/// Convert `storage.hess` from `FullRowMajor` to `SymmetricPackedUpper` in
+/// place: allocates a fresh packed slab of `n * r*(r+1)/2` doubles, launches
+/// `bms_flex_row_pack_upper` to copy the upper-triangle entries, releases
+/// the old dense slab, and updates `storage.layout` + `storage.bytes`. The
+/// numerics are bit-equal (each upper-triangle entry is copied once with no
+/// arithmetic), so callers can swap and re-run HVPs without re-validating
+/// parity.
+///
+/// Returns `Ok(())` if `storage.layout` was already `SymmetricPackedUpper`
+/// — idempotent. Errors out cleanly on alloc / launch / sync failures.
+#[cfg(target_os = "linux")]
+pub(crate) fn repack_upper(storage: &mut DeviceResidentRowHess) -> Result<(), GpuError> {
+    if storage.layout == RowHessianLayout::SymmetricPackedUpper {
+        return Ok(());
+    }
+    let backend = HvpKernelBackend::probe()?;
+    let stream = backend.stream.clone();
+    let n = storage.n;
+    let r = storage.r;
+    let per_row_dense = r * r;
+    let per_row_packed = r * (r + 1) / 2;
+    let total_packed = n * per_row_packed;
+
+    let mut d_packed = stream
+        .alloc_zeros::<f64>(total_packed)
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("bms_flex_row repack_upper alloc: {err}"),
+        })?;
+
+    let func = backend
+        .module
+        .load_function("bms_flex_row_pack_upper")
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("bms_flex_row repack_upper load_function: {err}"),
+        })?;
+    let n_i32 = i32::try_from(n).map_err(|_| GpuError::DriverCallFailed {
+        reason: format!("repack_upper: n_rows={n} exceeds i32 range"),
+    })?;
+    let r_i32 = i32::try_from(r).map_err(|_| GpuError::DriverCallFailed {
+        reason: format!("repack_upper: r={r} exceeds i32 range"),
+    })?;
+    // One CTA per row, blockDim.x = 32 (cap MAX_R).
+    let block_threads: u32 = 32;
+    let cfg = LaunchConfig {
+        grid_dim: (n as u32, 1, 1),
+        block_dim: (block_threads, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut builder = stream.launch_builder(&func);
+    builder
+        .arg(&n_i32)
+        .arg(&r_i32)
+        .arg(&storage.hess)
+        .arg(&mut d_packed);
+    // SAFETY: `storage.hess` capacity = n * r * r doubles (established at
+    // build time); `d_packed` was just allocated with n * r*(r+1)/2 doubles;
+    // both scalars fit i32; one CTA per row covers all n rows.
+    unsafe { builder.launch(cfg) }.map_err(|err| GpuError::DriverCallFailed {
+        reason: format!("bms_flex_row repack_upper launch: {err}"),
+    })?;
+    stream
+        .synchronize()
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("bms_flex_row repack_upper synchronize: {err}"),
+        })?;
+
+    // Swap in the packed slab; the old dense `storage.hess` is freed when
+    // it drops at the end of this function.
+    let old_dense = std::mem::replace(&mut storage.hess, d_packed);
+    drop(old_dense);
+    let bytes_delta = ((per_row_dense - per_row_packed) * n * std::mem::size_of::<f64>()) as i64;
+    let new_bytes = (storage.bytes as i64).saturating_sub(bytes_delta).max(0) as u64;
+    storage.bytes = new_bytes;
+    storage.layout = RowHessianLayout::SymmetricPackedUpper;
+    Ok(())
 }
 
 /// Launch the device-resident HVP kernel. Returns the host-side joint β image
@@ -1947,11 +2027,15 @@ pub(crate) fn launch_bms_flex_row_hvp(
             reason: format!("bms_flex_row hvp alloc out: {err}"),
         })?;
 
+    let partial_kernel_name = match storage.layout {
+        RowHessianLayout::FullRowMajor => "bms_flex_row_hvp_partial",
+        RowHessianLayout::SymmetricPackedUpper => "bms_flex_row_hvp_partial_packed",
+    };
     let part_func = backend
         .module
-        .load_function("bms_flex_row_hvp_partial")
+        .load_function(partial_kernel_name)
         .map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("bms_flex_row hvp load partial: {err}"),
+            reason: format!("bms_flex_row hvp load {partial_kernel_name}: {err}"),
         })?;
     let red_func = backend
         .module

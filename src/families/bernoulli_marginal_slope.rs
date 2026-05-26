@@ -19035,7 +19035,27 @@ pub(crate) fn build_deviation_aux_blockspec(
             project_monotone_feasible_beta(&prepared.runtime, &zero, &beta, name)
         })
         .transpose()?;
-    block.intospec(name)
+    let mut spec = block.intospec(name)?;
+    // Deviation auxiliary blocks (score_warp_dev, link_dev, and any
+    // future flex block routed through this builder) model pure
+    // shape modifications on top of parametric anchors. They must
+    // never own a shared affine direction with the parametric
+    // (time / marginal / logslope) blocks. The canonical-gauge
+    // selector drops shared directions from blocks with lower
+    // gauge_priority first; assigning a value below the parametric
+    // default (100) realises that contract automatically.
+    spec.gauge_priority = match name {
+        "link_dev" => 60,
+        // score_warp_dev gets a slightly higher priority than link_dev
+        // because in mixed-flex configurations (both blocks present)
+        // link_dev is the residualised one (orthogonalised against the
+        // parametric anchors PLUS the already-prepared score_warp
+        // basis at construction time); link_dev should therefore yield
+        // first when an alias still survives into the joint design.
+        "score_warp_dev" => 80,
+        _ => 70,
+    };
+    Ok(spec)
 }
 
 pub(crate) fn push_deviation_aux_blockspecs(

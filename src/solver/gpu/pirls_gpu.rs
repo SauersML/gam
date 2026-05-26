@@ -641,6 +641,50 @@ extern "C" __global__ void chol_logdet_col_major(
         }
     }
 
+    /// Borrowed-input variant of [`left_scale_rows`] used by the Stage 3.2
+    /// device-input PIRLS step. Reads weights through `&CudaSlice` so the
+    /// caller can keep ownership of the row-reweight buffer across the
+    /// PIRLS iteration without an extra device-side copy.
+    fn left_scale_rows_borrowed(
+        blas: &CudaBlas,
+        stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+        n: usize,
+        p: usize,
+        x_dev: &CudaSlice<f64>,
+        w_dev: &CudaSlice<f64>,
+        wx_dev: &mut CudaSlice<f64>,
+    ) -> Result<(), String> {
+        let n_i = to_i32(n)?;
+        let p_i = to_i32(p)?;
+        let handle = *blas.handle();
+        let (x_ptr, _x_record) = x_dev.device_ptr(stream);
+        let (w_ptr, _w_record) = w_dev.device_ptr(stream);
+        let (wx_ptr, _wx_record) = wx_dev.device_ptr_mut(stream);
+        // SAFETY: FFI call into cuBLAS; pointers come from live CudaSlice
+        // device buffers; x is n*p col-major (lda = n), w is length n
+        // (stride 1), wx is n*p output (lda = n). Caller-owned w buffer
+        // is borrowed read-only here, matching cublasDdgmm's contract.
+        let status = unsafe {
+            cublasDdgmm(
+                handle,
+                cublasSideMode_t::CUBLAS_SIDE_LEFT,
+                n_i,
+                p_i,
+                x_ptr as *const f64,
+                n_i,
+                w_ptr as *const f64,
+                1,
+                wx_ptr as *mut f64,
+                n_i,
+            )
+        };
+        if status == cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+            Ok(())
+        } else {
+            Err(format!("cublasDdgmm (borrowed) failed with {status:?}"))
+        }
+    }
+
     fn geam_add(
         blas: &CudaBlas,
         stream: &std::sync::Arc<cudarc::driver::CudaStream>,
@@ -805,6 +849,22 @@ pub fn solve_pirls_step_on_stream(
     input: PirlsStepStreamInput<'_>,
 ) -> Result<PirlsGpuStep, String> {
     cuda::solve_step_on_stream(shared, ws, input)
+}
+
+/// Stage 3.2 device-input PIRLS step. Reads `w_solver` and `grad_eta`
+/// from caller-supplied device buffers (typically populated by
+/// [`crate::gpu::pirls_row::launch_row_reweight_on_stream`]) instead of
+/// uploading them from host arrays. Math is bit-identical to
+/// [`solve_pirls_step_on_stream`]; this entry differs only by skipping
+/// the per-iter `weights` and `gradient` host-to-device transfers — only
+/// the small p×p penalty matrix still crosses the host boundary.
+#[cfg(target_os = "linux")]
+pub fn solve_pirls_step_on_stream_device(
+    shared: &PirlsGpuSharedData,
+    ws: &mut SigmaPirlsGpuWorkspace,
+    input: PirlsStepStreamDeviceInput<'_, '_>,
+) -> Result<PirlsGpuStep, String> {
+    cuda::solve_step_on_stream_device(shared, ws, input)
 }
 
 /// CPU fallback for the PIRLS-step GPU primitives.  When this build has no
