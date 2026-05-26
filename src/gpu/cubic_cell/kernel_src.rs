@@ -12,22 +12,6 @@ use crate::families::cubic_cell_kernel::{
     GL_NODES_FOR_GPU_KERNEL, GL_WEIGHTS_FOR_GPU_KERNEL,
 };
 
-pub(crate) const CUBIC_DERIV_MOMENTS_KERNEL_NAME_D9: &str = "cubic_deriv_moments_d9";
-pub(crate) const CUBIC_DERIV_MOMENTS_KERNEL_NAME_D15: &str = "cubic_deriv_moments_d15";
-pub(crate) const CUBIC_DERIV_MOMENTS_KERNEL_NAME_D21: &str = "cubic_deriv_moments_d21";
-
-pub(crate) fn cubic_deriv_moments_kernel_source_d9() -> String {
-    build_cubic_deriv_moments_kernel_source(9)
-}
-
-pub(crate) fn cubic_deriv_moments_kernel_source_d15() -> String {
-    build_cubic_deriv_moments_kernel_source(15)
-}
-
-pub(crate) fn cubic_deriv_moments_kernel_source_d21() -> String {
-    build_cubic_deriv_moments_kernel_source(21)
-}
-
 /// Emit the full NVRTC source for one `max_degree` specialization. The kernel
 /// symbol is `cubic_deriv_moments_d{max_degree}`. Output is deterministic:
 /// byte-equal across calls with the same argument.
