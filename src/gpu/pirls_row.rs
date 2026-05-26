@@ -1198,6 +1198,7 @@ mod pirls_row_gpu_tests {
                 prior_weight: 2.0,
             },
         );
+        assert!(out.mu.is_finite() && out.deviance.is_finite());
         assert_close("mu", out.mu, 0.25, 0.0);
         assert_close("grad_eta", out.grad_eta, 2.0 * (1.0 - 0.25), 1e-15);
         assert_close("w_fisher", out.w_fisher, 2.0, 0.0);
@@ -1222,6 +1223,7 @@ mod pirls_row_gpu_tests {
             },
         );
         let expected_mu = (1.5_f64).exp();
+        assert!(expected_mu.is_finite() && out.mu.is_finite());
         assert_close("mu", out.mu, expected_mu, 1e-15);
         assert_close("grad_eta", out.grad_eta, 4.0 - expected_mu, 1e-15);
         assert_close("w_fisher", out.w_fisher, expected_mu, 1e-15);
