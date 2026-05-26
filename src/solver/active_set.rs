@@ -1203,7 +1203,7 @@ pub(crate) fn solve_quadratic_with_linear_constraints(
 /// is constrained — the only feasible step is δ = 0). Callers must short-circuit
 /// both cases rather than threading a zero-column projector through downstream
 /// solves.
-pub(crate) fn tangent_space_projector(
+fn tangent_space_projector(
     active_rows: &Array2<f64>,
     rank_tol: f64,
 ) -> Result<Option<Array2<f64>>, EstimationError> {
