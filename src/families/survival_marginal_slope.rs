@@ -17834,11 +17834,12 @@ pub fn fit_survival_marginal_slope_terms(
         None
     };
     let link_dev_prepared = if let Some(cfg) = spec.link_dev.as_ref() {
-        let q0_seed = Array1::from_iter((0..n).map(|row| {
-            let q_exit = spec.time_block.offset_exit[row] + spec.marginal_offset[row];
-            let slope = baseline_slope + spec.logslope_offset[row];
-            rigid_observed_eta(q_exit, slope, z_primary[row], probit_scale)
-        }));
+        // q0_seed and the cross-block W-metric pilot η are intentionally the
+        // same vector: the link-deviation basis is anchored at this η, and
+        // the orthogonalisation metric uses the IRLS Hessian row weight at
+        // the same η so `Aᵀ W C̃ = 0` holds in the inner product the joint
+        // Hessian sees during PIRLS.
+        let q0_seed = cross_block_pilot_eta.clone();
         let padded_seed = padded_deviation_seed(&q0_seed, 1.0, 0.5);
         let mut prepared = build_link_deviation_block_from_knots_design_seed_and_weights(
             &padded_seed,
@@ -17861,12 +17862,13 @@ pub fn fit_survival_marginal_slope_terms(
         // penalised Hessian satisfies `σ_min(joint H + S) ≥ λ_min(S) > 0`
         // for every β. This mirrors the BMS construction site at
         // bernoulli_marginal_slope.rs:18236, transplanted here because
-        // SMGS had no cross-block reparam call. `spec.weights` is the
-        // structurally-correct row metric for *alias detection* (the
-        // alias structure is W-independent); using the survival IRLS
-        // Hessian row metric instead would tighten the W-orthogonality
-        // claim during PIRLS but does not change which directions get
-        // dropped from the basis.
+        // SMGS had no cross-block reparam call. The W metric routed in
+        // here is the survival IRLS Hessian row weight
+        // `w · φ(η)² / (Φ(η)(1−Φ(η)))` at the rigid pooled-probit pilot η
+        // (see `cross_block_pilot_w` above); this is the inner product the
+        // joint penalised Hessian sees during PIRLS, so `Aᵀ W C̃ = 0`
+        // after the reparam survives into PIRLS rather than holding only
+        // under uniform `spec.weights`.
         // Thread the now-reparameterised score-warp basis at training rows
         // as a flex-evaluation anchor so the link-deviation basis is jointly
         // orthogonal to span(marginal, logslope, score_warp). Mirrors BMS at
@@ -17898,7 +17900,7 @@ pub fn fit_survival_marginal_slope_terms(
             cfg,
             &anchors,
             &anchor_tags,
-            &spec.weights,
+            &cross_block_pilot_w,
         )?;
         match outcome {
             CrossBlockIdentifiabilityOutcome::Reparameterised => Some(prepared),
@@ -17918,6 +17920,101 @@ pub fn fit_survival_marginal_slope_terms(
     } else {
         None
     };
+    // Joint design column-rank diagnostic. Builds the dense training-row joint
+    // design `[time_block.design_exit | marginal | logslope | score_warp |
+    // link_dev]` (with the W-metric residuals applied to the flex bases via
+    // `design_at_training_with_residual`) and runs column-pivoted QR with a
+    // standard relative tolerance. If the detected rank is below the column
+    // count, the joint penalised Hessian has a structural null direction at
+    // every β and PIRLS will exhibit the runaway documented above. This fires
+    // before any inner solve so the failure surfaces with a precise diagnostic
+    // rather than a non-convergence symptom many minutes into the fit.
+    //
+    // This is an `assert!` (not `debug_assert!`) so release builds also catch
+    // the core-block alias regression we just hardened the flex-side W metric
+    // against. The flex W-metric fix (above) closes the
+    // {score_warp, link_dev} ↔ {marginal_surface, logslope_surface} alias
+    // channels under PIRLS curvature; remaining rank collapses originate in
+    // core-block aliases (e.g. shared low-order Duchon nullspace columns
+    // between the marginal and logslope surfaces when the same duchon term
+    // appears in both formulas) — surfacing them here directs the user to
+    // restructure the formula rather than silently chase REML pathologies.
+    {
+        use crate::linalg::faer_ndarray::{FaerQr, rrqr_nullspace_basis};
+        let _ = FaerQr::qr; // ensure trait path is in scope on the no-flex path
+        let time_dense = spec.time_block.design_exit.to_dense_array();
+        let marginal_dense = marginal_design.design.to_dense_array();
+        let logslope_dense = logslope_design.design.to_dense_array();
+        let score_warp_dense = score_warp_prepared
+            .as_ref()
+            .map(|sw| sw.runtime.design_at_training_with_residual(&z_primary))
+            .transpose()?;
+        let link_dev_dense = link_dev_prepared
+            .as_ref()
+            .map(|ld| ld.runtime.design_at_training_with_residual(&cross_block_pilot_eta))
+            .transpose()?;
+        let mut total_cols = time_dense.ncols() + marginal_dense.ncols() + logslope_dense.ncols();
+        if let Some(ref m) = score_warp_dense {
+            total_cols += m.ncols();
+        }
+        if let Some(ref m) = link_dev_dense {
+            total_cols += m.ncols();
+        }
+        let mut joint = Array2::<f64>::zeros((n, total_cols));
+        let mut cursor = 0usize;
+        joint
+            .slice_mut(s![.., cursor..cursor + time_dense.ncols()])
+            .assign(&time_dense);
+        cursor += time_dense.ncols();
+        joint
+            .slice_mut(s![.., cursor..cursor + marginal_dense.ncols()])
+            .assign(&marginal_dense);
+        cursor += marginal_dense.ncols();
+        joint
+            .slice_mut(s![.., cursor..cursor + logslope_dense.ncols()])
+            .assign(&logslope_dense);
+        cursor += logslope_dense.ncols();
+        if let Some(ref m) = score_warp_dense {
+            joint
+                .slice_mut(s![.., cursor..cursor + m.ncols()])
+                .assign(m);
+            cursor += m.ncols();
+        }
+        if let Some(ref m) = link_dev_dense {
+            joint
+                .slice_mut(s![.., cursor..cursor + m.ncols()])
+                .assign(m);
+            cursor += m.ncols();
+        }
+        debug_assert_eq!(cursor, total_cols);
+        // `rrqr_nullspace_basis` returns `(nullspace_of_Aᵀ, rank(A))` for a
+        // tall input. Joint is n × p_total with `n ≫ p_total` at biobank
+        // scale; we only consume the rank.
+        let (_null_basis, rank) = rrqr_nullspace_basis(
+            &joint,
+            crate::linalg::faer_ndarray::default_rrqr_rank_alpha(),
+        )
+        .map_err(|e| {
+            format!("survival-marginal-slope joint rank diagnostic QR failed: {e}")
+        })?;
+        assert!(
+            rank == total_cols,
+            "survival-marginal-slope joint design at training rows is rank-deficient: \
+             detected rank {rank} < column count {total_cols} \
+             (time={p_time} marginal={p_marginal} logslope={p_logslope} \
+             score_warp={p_sw} link_dev={p_ld}). \
+             This indicates a core-block alias the flex-side W-metric reparam \
+             cannot fix — typically a shared duchon nullspace between the \
+             marginal and logslope formulas, or `linkwiggle()` on both. \
+             Restructure the formula (drop the duplicated term in one formula, \
+             or remove `linkwiggle()` from one side) and refit.",
+            p_time = time_dense.ncols(),
+            p_marginal = marginal_dense.ncols(),
+            p_logslope = logslope_dense.ncols(),
+            p_sw = score_warp_dense.as_ref().map_or(0, |m| m.ncols()),
+            p_ld = link_dev_dense.as_ref().map_or(0, |m| m.ncols()),
+        );
+    }
     let extra_rho0 = {
         let mut out = Vec::new();
         if let Some(ref prepared) = score_warp_prepared {
@@ -21533,6 +21630,7 @@ mod tests {
             nullspace_dims: Vec::new(),
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
+gauge_priority: 100,
         };
         let constraints = family
             .block_linear_constraints(&[], 0, &spec)
@@ -21601,6 +21699,7 @@ mod tests {
             nullspace_dims: Vec::new(),
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
+gauge_priority: 100,
         };
 
         let constraints = family
@@ -21851,6 +21950,7 @@ mod tests {
             nullspace_dims: Vec::new(),
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
+gauge_priority: 100,
         };
         let err = family
             .post_update_block_beta(
@@ -21921,6 +22021,7 @@ mod tests {
             nullspace_dims: Vec::new(),
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
+gauge_priority: 100,
         };
         let current = array![0.4, 7.0];
         // qd1 at current = 1.0·0.4 + 0.0·7.0 + 1e-6 ≈ 0.4 (feasible)
@@ -21995,6 +22096,7 @@ mod tests {
             nullspace_dims: Vec::new(),
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
+gauge_priority: 100,
         };
         // current qd1 = -1.0 + 1e-6 < guard → infeasible.
         let err = family

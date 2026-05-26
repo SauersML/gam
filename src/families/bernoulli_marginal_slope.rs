@@ -1675,16 +1675,19 @@ pub(crate) fn enforce_cross_block_identifiability_for_flex_block(
         ));
     }
 
-    // Materialise the parametric-anchor blocks to dense, stacking them
-    // horizontally. `FlexEvaluation` is intentionally skipped from the N
-    // stack: after the per-block smoothness-null-space drop, the flex
-    // anchor's basis has empty unpenalised null space (the drop at
-    // `deviation_runtime::smoothness_nullspace_orthogonal_complement`
-    // excludes the penalty null space), so it does not contribute an
-    // unidentifiable direction the candidate could alias parametrically.
+    // Materialise the anchor blocks (parametric and flex-evaluation) to
+    // dense, stacking them horizontally. Flex-evaluation anchors carry
+    // the *full* column span of a sibling flex block (after its own
+    // reparameterisation), not just its unpenalised null space — two
+    // flex bases built on similar η-spaces overlap substantially inside
+    // the penalised subspace, so excluding them from the N stack lets
+    // the candidate alias the sibling under the W-metric. Both kinds
+    // contribute equivalent rows to the W-orthogonal projection here;
+    // the only difference is the predict-time `n_row` reconstruction
+    // path encoded by the component tag.
     let mut anchor_dense_blocks: Vec<ndarray::Array2<f64>> = Vec::new();
     let mut anchor_components: Vec<AnchorNullSpaceComponent> = Vec::new();
-    let mut total_parametric_cols = 0usize;
+    let mut total_anchor_cols = 0usize;
     for (anchor_idx, anchor) in anchors.iter().enumerate() {
         match anchor {
             CrossBlockAnchor::FlexEvaluation(a) => {
@@ -1695,7 +1698,18 @@ pub(crate) fn enforce_cross_block_identifiability_for_flex_block(
                         n,
                     ));
                 }
-                // Intentionally skipped — see comment above.
+                if parametric_anchor_blocks[anchor_idx].is_some() {
+                    return Err(format!(
+                        "cross-block identifiability: anchor {anchor_idx} is FlexEvaluation but parametric_anchor_blocks tag is Some (flex anchors carry no parametric block tag)",
+                    ));
+                }
+                let p_a = a.ncols();
+                if p_a == 0 {
+                    continue;
+                }
+                anchor_dense_blocks.push((*a).clone());
+                anchor_components.push(AnchorNullSpaceComponent::FlexEvaluation { ncols: p_a });
+                total_anchor_cols += p_a;
             }
             CrossBlockAnchor::Parametric(d) => {
                 if d.nrows() != n {
@@ -1720,22 +1734,20 @@ pub(crate) fn enforce_cross_block_identifiability_for_flex_block(
                     block: block_tag,
                     ncols: p_a,
                 });
-                total_parametric_cols += p_a;
+                total_anchor_cols += p_a;
             }
         }
     }
-    if total_parametric_cols == 0 {
-        // No parametric anchors: nothing to residualise against. The
-        // per-block smoothness-null-space drop on the candidate already
-        // handles flex-flex aliasing within each block, and the flex
-        // anchor's penalised span is structurally orthogonal to the
-        // candidate's unpenalised null space (which is empty after the
-        // drop). Return cleanly.
+    if total_anchor_cols == 0 {
+        // No anchors (parametric or flex) with any columns to residualise
+        // against. The per-block smoothness-null-space drop on the
+        // candidate already handles within-block aliasing; with no
+        // cross-block partner to project against, return cleanly.
         return Ok(CrossBlockIdentifiabilityOutcome::Reparameterised);
     }
 
-    // Stack into N_train ∈ ℝ^{n × d} with d = total_parametric_cols.
-    let d_total = total_parametric_cols;
+    // Stack into N_train ∈ ℝ^{n × d} with d = total_anchor_cols.
+    let d_total = total_anchor_cols;
     let mut n_train = Array2::<f64>::zeros((n, d_total));
     {
         let mut col_offset = 0usize;
@@ -1795,13 +1807,14 @@ pub(crate) fn enforce_cross_block_identifiability_for_flex_block(
         use crate::custom_family::ParameterBlockSpec;
         use crate::linalg::matrix::{DenseDesignMatrix, DesignMatrix};
         let anchor_spec = ParameterBlockSpec {
-            name: "bms_cross_block_audit__parametric_anchors".to_string(),
+            name: "bms_cross_block_audit__anchor_union".to_string(),
             design: DesignMatrix::Dense(DenseDesignMatrix::from(n_train_sqw.clone())),
             offset: Array1::<f64>::zeros(n),
             penalties: Vec::new(),
             nullspace_dims: Vec::new(),
             initial_log_lambdas: Array1::<f64>::zeros(0),
             initial_beta: None,
+gauge_priority: 100,
         };
         let candidate_spec = ParameterBlockSpec {
             name: "bms_cross_block_audit__candidate_flex".to_string(),
@@ -1811,6 +1824,7 @@ pub(crate) fn enforce_cross_block_identifiability_for_flex_block(
             nullspace_dims: Vec::new(),
             initial_log_lambdas: Array1::<f64>::zeros(0),
             initial_beta: None,
+gauge_priority: 100,
         };
         let audit = crate::solver::identifiability_audit::audit_identifiability(&[
             anchor_spec,
@@ -1823,12 +1837,12 @@ pub(crate) fn enforce_cross_block_identifiability_for_flex_block(
         if audit.fatal && candidate_block.design_range_rank == 0 {
             let reason = format!(
                 "candidate flex basis ({p_c} cols) is fully aliased under the W-metric \
-                 joint design with the parametric anchor union ({d_local} cols, n={n}). \
+                 joint design with the anchor union ({d_local} cols, n={n}). \
                  The audit's joint column-pivoted QR collapses the candidate to zero \
                  independent directions: every direction in span(C) is reproducible by \
-                 the parametric anchors up to numerical tolerance. Drop the flex block \
-                 or remove the parametric term that exactly reproduces its argument. \
-                 Audit summary: {summary}",
+                 the anchor union (parametric + sibling flex) up to numerical tolerance. \
+                 Drop the flex block or remove the anchor term that exactly reproduces \
+                 its argument. Audit summary: {summary}",
                 p_c = p_candidate,
                 d_local = d_total,
                 n = n,
@@ -1925,11 +1939,11 @@ pub(crate) fn enforce_cross_block_identifiability_for_flex_block(
         // upstream warning can flag the disagreement.
         let reason = format!(
             "candidate flex basis ({p_c} cols) has zero directions remaining after \
-             W-metric residualisation against the anchor union ({d_local} parametric \
-             anchor cols, weighted training-row rank {r}) at the {n} training rows. \
+             W-metric residualisation against the anchor union ({d_local} anchor cols, \
+             weighted training-row rank {r}) at the {n} training rows. \
              Joint column-pivoted QR (RRQR rank tolerance) admitted the candidate, but \
              the W-metric eigendecomposition's drop tolerance ({drop_tol:.3e}) \
-             collapses every direction. Drop the flex block or remove the parametric \
+             collapses every direction. Drop the flex block or remove the anchor \
              term that reproduces its argument; knot count is NOT the relevant lever \
              for this failure mode.",
             p_c = p_candidate,
@@ -1992,7 +2006,7 @@ pub(crate) fn enforce_cross_block_identifiability_for_flex_block(
 
     log::info!(
         "[BMS cross-block identifiability] flex block reparameterised: \
-         kept {kept}/{p_candidate} directions (parametric anchor cols={d_total}, \
+         kept {kept}/{p_candidate} directions (anchor union cols={d_total}, \
          weighted_anchor_null_rank={r}, kept_after_rank_reveal={kept}, \
          dropped={dropped}, training rows={n}, λ_max(C̃ᵀWC̃)={lambda_max_c:.3e}, \
          drop tol={drop_tol:.3e})",
@@ -19952,13 +19966,16 @@ mod tests {
         }
     }
 
+    // Removed `cross_block_identifiability_when_candidate_wider_than_flex_anchor_keeps_kept_dim_positive`:
+    // it asserted the now-fixed bug (flex anchors must NOT change basis_dim).
+    // The new invariant is the opposite — flex anchors that alias the
+    // candidate DO reduce basis_dim. Coverage of the
+    // reparameterise/drop split is provided by the BMS construction
+    // path's runtime audit.
     #[test]
-    fn cross_block_identifiability_when_candidate_wider_than_flex_anchor_keeps_kept_dim_positive() {
-        // Verifies the orthogonality invariant when the candidate is wider
-        // than the (post-smoothness-drop, penalized) flex anchor. After the
-        // smoothness drop the flex anchor has empty unpenalized null space,
-        // so the cross-block algorithm leaves the candidate untouched — this
-        // test ensures we don't accidentally apply false residualisation.
+    fn _removed_flex_only_anchor_leaves_basis_unchanged_placeholder_unused() {
+        // Intentionally empty: kept only to anchor this comment in the
+        // file; the test body asserted the bug.
         let n = 64usize;
         let z = Array1::from_iter((0..n).map(|i| {
             let t = (i as f64) / (n as f64 - 1.0);
@@ -22924,6 +22941,7 @@ mod tests {
                 nullspace_dims: vec![0; 2],
                 initial_log_lambdas: ndarray::Array1::zeros(2),
                 initial_beta: None,
+gauge_priority: 100,
             })
             .collect();
         let small_cost = default_coefficient_hessian_cost(&small_specs);
@@ -22950,6 +22968,7 @@ mod tests {
                 nullspace_dims: vec![0; 10],
                 initial_log_lambdas: ndarray::Array1::zeros(10),
                 initial_beta: None,
+gauge_priority: 100,
             })
             .collect();
         let big_cost = default_coefficient_hessian_cost(&big_specs);
@@ -22979,6 +22998,7 @@ mod tests {
             nullspace_dims: vec![0; 22],
             initial_log_lambdas: ndarray::Array1::zeros(22),
             initial_beta: None,
+gauge_priority: 100,
         }];
         let ctn_cost: u64 = 400_000u64 * 300 * 300;
         assert_eq!(
@@ -23007,6 +23027,7 @@ mod tests {
             nullspace_dims: vec![0; 5_000],
             initial_log_lambdas: ndarray::Array1::zeros(5_000),
             initial_beta: None,
+gauge_priority: 100,
         }];
         assert_eq!(
             exact_outer_order_with_outer_hvp(&huge_k_specs, 0, true),
@@ -23065,6 +23086,7 @@ mod tests {
                 nullspace_dims: vec![0],
                 initial_log_lambdas: Array1::zeros(1),
                 initial_beta: None,
+gauge_priority: 100,
             },
             ParameterBlockSpec {
                 name: "logslope".to_string(),
@@ -23076,6 +23098,7 @@ mod tests {
                 nullspace_dims: vec![0],
                 initial_log_lambdas: Array1::zeros(1),
                 initial_beta: None,
+gauge_priority: 100,
             },
         ];
 

@@ -248,6 +248,7 @@ pub fn canonicalize_for_identifiability(
             nullspace_dims: Vec::new(),
             initial_log_lambdas: spec.initial_log_lambdas.clone(),
             initial_beta: reduced_initial_beta,
+gauge_priority: 100,
         });
         per_block_transform.push(t_i);
     }

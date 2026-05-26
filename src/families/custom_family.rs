@@ -315,6 +315,11 @@ pub struct ParameterBlockSpec {
     pub initial_log_lambdas: Array1<f64>,
     /// Optional initial coefficients (defaults to zeros if omitted).
     pub initial_beta: Option<Array1<f64>>,
+    /// Gauge ownership priority. Higher = more likely to retain a
+    /// redundant direction during canonical-gauge reparameterisation.
+    /// Defaults to 100. Set higher for blocks that should "own" shared
+    /// affine/null-space directions (e.g. baseline time in survival).
+    pub gauge_priority: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20946,57 +20951,113 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
     fit_custom_family_with_rho_prior(family, specs, options, crate::types::RhoPrior::Flat)
 }
 
+/// Lift reduced-space `ParameterBlockState`s back to the raw block
+/// dimensions described by `canonical.per_block_transform`. Each block's
+/// `beta` becomes `T_i · θ_i` (selection-T zeros dropped raw entries);
+/// `eta = design · beta` is invariant under the transform, so the
+/// reduced-space `eta` field carries through unchanged.
+fn lift_block_states_to_raw(
+    canonical: &crate::solver::identifiability_canonical::CanonicalSpecs,
+    reduced: Vec<ParameterBlockState>,
+) -> Vec<ParameterBlockState> {
+    let theta_blocks: Vec<Array1<f64>> = reduced.iter().map(|s| s.beta.clone()).collect();
+    let raw_betas = canonical.lift_block_betas_to_raw(&theta_blocks);
+    reduced
+        .into_iter()
+        .zip(raw_betas.into_iter())
+        .map(|(state, beta_raw)| ParameterBlockState {
+            beta: beta_raw,
+            eta: state.eta,
+        })
+        .collect()
+}
+
+/// Lift a reduced-space conditional covariance / joint geometry pair
+/// back to the raw coordinate system by sandwiching with the joint
+/// block-diagonal transform `T_full = blockdiag(T_i)`. Selection-T
+/// zero-pads the dropped raw rows/cols; the lifted Hessian is exactly
+/// the post-canonicalisation Hessian as seen in raw coordinates and is
+/// rank-deficient by construction along the dropped directions
+/// (matching the inner-solve geometry the canonical step produced).
+fn lift_fit_geometry_to_raw(
+    canonical: &crate::solver::identifiability_canonical::CanonicalSpecs,
+    covariance_conditional: Option<Array2<f64>>,
+    geometry: Option<FitGeometry>,
+) -> (Option<Array2<f64>>, Option<FitGeometry>) {
+    let lifted_cov = covariance_conditional.map(|c| canonical.lift_joint_matrix_to_raw(&c));
+    let lifted_geom = geometry.map(|g| {
+        let h_red = g.penalized_hessian.into_array();
+        let h_raw = canonical.lift_joint_matrix_to_raw(&h_red);
+        FitGeometry {
+            penalized_hessian: h_raw.into(),
+            working_weights: g.working_weights,
+            working_response: g.working_response,
+        }
+    });
+    (lifted_cov, lifted_geom)
+}
+
 pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
     rho_prior: crate::types::RhoPrior,
 ) -> Result<crate::solver::estimate::UnifiedFitResult, CustomFamilyError> {
-    let penalty_counts = validate_blockspecs(specs)?;
+    let raw_specs: &[ParameterBlockSpec] = specs;
+    validate_blockspecs(raw_specs)?;
 
-    // Pre-fit cross-block identifiability audit. Every blockwise fit
-    // path in the tree (standard, gaussian/binomial location-scale,
-    // survival, BMS, transformation-normal, custom families) reaches
-    // this entry point with a finalised `ParameterBlockSpec` list, so
-    // wiring the audit here covers all four `solver::workflow.rs`
-    // entry points plus every direct caller of `fit_custom_family`
-    // without each family needing its own audit hook.
+    // Pre-fit cross-block identifiability canonicalisation. Every
+    // blockwise fit path in the tree (standard, gaussian/binomial
+    // location-scale, survival, BMS, transformation-normal, custom
+    // families) reaches this entry point with a finalised
+    // `ParameterBlockSpec` list, so wiring the canonicalisation here
+    // covers all four `solver::workflow.rs` entry points plus every
+    // direct caller of `fit_custom_family` without each family needing
+    // its own canonicalisation hook.
     //
     // Contract: specs arrive *after* `nullspace-lead`'s
-    // `joint_null_rotation` absorption — the audit inspects rotated
-    // columns only. A clean audit returns `fatal=false` (possibly with
-    // logged alias pairs); a fatal audit returns
-    // `CustomFamilyError::IdentifiabilityFailure { audit }` carrying
-    // the full structured report. Per the panic-vs-Err contract:
-    // never panic mid-construction.
-    let audit_started = std::time::Instant::now();
-    let audit_n_rows = specs.first().map(|s| s.design.nrows()).unwrap_or(0);
-    let audit_n_cols: usize = specs.iter().map(|s| s.design.ncols()).sum();
+    // `joint_null_rotation` absorption. The canonical step inspects
+    // post-rotation columns only, runs the joint RRQR identifiability
+    // audit, and converts attributed cross-block drops into a per-block
+    // selection transform `T_i`. The inner solve runs in the reduced
+    // coordinate space; coefficients and joint geometry are lifted back
+    // to the raw space at result assembly via `T_i` and the joint
+    // block-diagonal `T_full = blockdiag(T_i)`.
+    //
+    // An audit that is fatal *without* attributed drops (the >2-way
+    // structural alias case where RRQR couldn't pin redundancy onto a
+    // single block/column) still aborts: silently absorbing it would
+    // change model semantics beyond what canonicalisation can repair.
+    // Per the panic-vs-Err contract: never panic mid-construction.
+    let canonical_started = std::time::Instant::now();
+    let canonical_n_rows = raw_specs.first().map(|s| s.design.nrows()).unwrap_or(0);
+    let canonical_n_cols_raw: usize = raw_specs.iter().map(|s| s.design.ncols()).sum();
     log::info!(
-        "[STAGE] identifiability audit: start blocks={} n={} p_total={}",
-        specs.len(),
-        audit_n_rows,
-        audit_n_cols,
+        "[STAGE] identifiability canonicalise: start blocks={} n={} p_total_raw={}",
+        raw_specs.len(),
+        canonical_n_rows,
+        canonical_n_cols_raw,
     );
-    let audit =
-        crate::solver::identifiability_audit::audit_identifiability(specs).map_err(|reason| {
-            CustomFamilyError::DimensionMismatch {
-                reason: format!("pre-fit identifiability audit failed: {reason}"),
-            }
-        })?;
+    let canonical =
+        crate::solver::identifiability_canonical::canonicalize_for_identifiability(raw_specs)?;
+    let canonical_n_cols_red: usize = canonical
+        .reduced_specs
+        .iter()
+        .map(|s| s.design.ncols())
+        .sum();
     log::info!(
-        "[STAGE] identifiability audit: end elapsed={:.3}s alias_pairs={} dropped_cols={} fatal={}",
-        audit_started.elapsed().as_secs_f64(),
-        audit.aliased_pairs.len(),
-        audit.dropped_columns.len(),
-        audit.fatal,
+        "[STAGE] identifiability canonicalise: end elapsed={:.3}s alias_pairs={} dropped_cols={} \
+         p_total_raw={} p_total_reduced={} fatal_attributed={}",
+        canonical_started.elapsed().as_secs_f64(),
+        canonical.audit.aliased_pairs.len(),
+        canonical.audit.dropped_columns.len(),
+        canonical_n_cols_raw,
+        canonical_n_cols_red,
+        canonical.audit.fatal,
     );
-    if audit.fatal {
-        return Err(CustomFamilyError::IdentifiabilityFailure { audit });
-    }
-    if !audit.aliased_pairs.is_empty() {
-        log::info!("[identifiability audit] {}", audit.summary);
-        for pair in &audit.aliased_pairs {
+    if !canonical.audit.aliased_pairs.is_empty() {
+        log::info!("[identifiability audit] {}", canonical.audit.summary);
+        for pair in &canonical.audit.aliased_pairs {
             log::info!(
                 "[identifiability audit] alias: {}[{}] ~ {}[{}] (overlap={:.4})",
                 pair.block_a,
@@ -21007,6 +21068,16 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             );
         }
     }
+    for drop in &canonical.audit.dropped_columns {
+        log::info!(
+            "[identifiability audit] dropped: block='{}' local_col={} ({})",
+            drop.block,
+            drop.column,
+            drop.reason,
+        );
+    }
+    let specs: &[ParameterBlockSpec] = &canonical.reduced_specs;
+    let penalty_counts = validate_blockspecs(specs)?;
 
     let label_layout = penalty_label_layout(specs, penalty_counts.clone())?;
     let rho0 = label_layout.initial_rho.clone();
@@ -21987,6 +22058,7 @@ mod tests {
             nullspace_dims: vec![1],
             initial_log_lambdas: rho.clone(),
             initial_beta: Some(beta.clone()),
+gauge_priority: 100,
         };
         let specs = vec![spec];
         let inner = BlockwiseInnerResult {
@@ -22165,6 +22237,7 @@ mod tests {
                 nullspace_dims: vec![1],
                 initial_log_lambdas: rho.clone(),
                 initial_beta: Some(beta.clone()),
+gauge_priority: 100,
             };
             let specs = vec![spec];
             let inner = BlockwiseInnerResult {
@@ -22818,6 +22891,7 @@ mod tests {
             nullspace_dims: wiggle_block.nullspace_dims.clone(),
             initial_log_lambdas: array![0.1],
             initial_beta: Some(Array1::from_elem(wiggle_block.design.ncols(), 0.03)),
+gauge_priority: 100,
         };
         let family = BinomialLocationScaleWiggleFamily {
             y: base.y,
@@ -22863,6 +22937,7 @@ mod tests {
             nullspace_dims: Vec::new(),
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
+gauge_priority: 100,
         };
         let specs = vec![mk_spec(12), mk_spec(20), mk_spec(8)];
         assert_eq!(
@@ -22896,6 +22971,7 @@ mod tests {
             nullspace_dims: vec![0; retained_rho_dim],
             initial_log_lambdas: Array1::zeros(retained_rho_dim),
             initial_beta: None,
+gauge_priority: 100,
         };
         let coefficient_hessian_cost = n_train * (p as u64) * (p as u64);
 
@@ -23018,6 +23094,7 @@ mod tests {
             nullspace_dims: Vec::new(),
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
+gauge_priority: 100,
         };
         let specs = vec![mk_spec(500, 10), mk_spec(500, 14)];
         let h_cost = default_coefficient_hessian_cost(&specs);
@@ -23095,6 +23172,7 @@ mod tests {
             nullspace_dims: Vec::new(),
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
+gauge_priority: 100,
         };
         let specs = vec![mk_spec("a", 2), mk_spec("b", 3)];
 
@@ -23129,6 +23207,7 @@ mod tests {
             nullspace_dims: Vec::new(),
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
+gauge_priority: 100,
         };
 
         let err = match constrained_warm_start_from_cached_beta(1, &[spec], &array![1.0, f64::NAN])
@@ -23155,6 +23234,7 @@ mod tests {
             nullspace_dims: Vec::new(),
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
+gauge_priority: 100,
         };
         let mut state = CustomOuterState::new(None);
         state
@@ -23325,6 +23405,7 @@ mod tests {
             nullspace_dims: vec![],
             initial_log_lambdas: array![0.0],
             initial_beta: None,
+gauge_priority: 100,
         }];
         let (gradient, hessian) = custom_family_outer_derivatives(
             &OneBlockFirstOrderOnlyFamily,
@@ -23577,6 +23658,7 @@ mod tests {
             nullspace_dims: vec![],
             initial_log_lambdas: array![0.0],
             initial_beta: None,
+gauge_priority: 100,
         }];
         let options = BlockwiseFitOptions {
             use_remlobjective: true,
@@ -23628,6 +23710,7 @@ mod tests {
             nullspace_dims: vec![],
             initial_log_lambdas: array![0.0],
             initial_beta: None,
+gauge_priority: 100,
         }];
         let options = BlockwiseFitOptions {
             use_remlobjective: true,
@@ -23714,6 +23797,7 @@ mod tests {
             nullspace_dims: vec![],
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![0.75]),
+gauge_priority: 100,
         };
         let options = BlockwiseFitOptions {
             inner_tol: 1e-11,
@@ -23814,6 +23898,7 @@ mod tests {
             nullspace_dims: vec![],
             initial_log_lambdas: array![0.0],
             initial_beta: None,
+gauge_priority: 100,
         }];
         let options = BlockwiseFitOptions {
             use_remlobjective: true,
@@ -24759,6 +24844,7 @@ mod tests {
             nullspace_dims: vec![],
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(array![0.0]),
+gauge_priority: 100,
         };
         let options = BlockwiseFitOptions {
             inner_max_cycles: 1,
@@ -24805,6 +24891,7 @@ mod tests {
             nullspace_dims: vec![],
             initial_log_lambdas: array![10.0_f64.ln()],
             initial_beta: Some(array![1.0]),
+gauge_priority: 100,
         };
         let options = BlockwiseFitOptions {
             inner_max_cycles: 20,
@@ -24854,6 +24941,7 @@ mod tests {
             nullspace_dims: vec![],
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(array![1.0]),
+gauge_priority: 100,
         };
         let options = BlockwiseFitOptions {
             inner_max_cycles: 1,
@@ -24907,6 +24995,7 @@ mod tests {
             nullspace_dims: vec![],
             initial_log_lambdas: array![0.2],
             initial_beta: None,
+gauge_priority: 100,
         };
         let options = BlockwiseFitOptions {
             use_remlobjective: true,
@@ -24976,6 +25065,7 @@ mod tests {
             nullspace_dims: vec![],
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![0.0]),
+gauge_priority: 100,
         };
         let options = BlockwiseFitOptions {
             use_remlobjective: true,
@@ -25010,6 +25100,7 @@ mod tests {
             nullspace_dims: vec![],
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(array![0.0]),
+gauge_priority: 100,
         };
         let spec1 = ParameterBlockSpec {
             name: "block1".to_string(),
@@ -25019,6 +25110,7 @@ mod tests {
             nullspace_dims: vec![],
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(array![0.0]),
+gauge_priority: 100,
         };
         let options = BlockwiseFitOptions {
             inner_max_cycles: 1,
@@ -25298,6 +25390,7 @@ mod tests {
             nullspace_dims: vec![],
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![0.0]),
+gauge_priority: 100,
         };
         let spec1 = ParameterBlockSpec {
             name: "block1".to_string(),
@@ -25310,6 +25403,7 @@ mod tests {
             nullspace_dims: vec![],
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![0.0]),
+gauge_priority: 100,
         };
         let options = BlockwiseFitOptions {
             use_remlobjective: true,
@@ -25345,6 +25439,7 @@ mod tests {
             nullspace_dims: vec![],
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(array![0.0]),
+gauge_priority: 100,
         };
         let options = BlockwiseFitOptions {
             use_remlobjective: true,
@@ -25377,6 +25472,7 @@ mod tests {
             nullspace_dims: vec![],
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(array![0.0]),
+gauge_priority: 100,
         };
         let deriv = CustomFamilyBlockPsiDerivative {
             penalty_index: None,
@@ -25437,6 +25533,7 @@ mod tests {
             nullspace_dims: vec![],
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(array![0.0]),
+gauge_priority: 100,
         };
         let result = fit_custom_family(
             &OneBlockIndefinitePseudoLaplaceFamily,
@@ -25563,6 +25660,7 @@ mod tests {
             nullspace_dims: vec![],
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(array![0.0, 0.0]),
+gauge_priority: 100,
         };
         let fit = fit_custom_family(
             &OneBlockNearlySymmetricPseudoLaplaceFamily,
@@ -25766,6 +25864,7 @@ mod tests {
             nullspace_dims: vec![],
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![0.0]),
+gauge_priority: 100,
         };
         let log_sigmaspec = ParameterBlockSpec {
             name: "log_sigma".to_string(),
@@ -25778,6 +25877,7 @@ mod tests {
             nullspace_dims: vec![],
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![0.0]),
+gauge_priority: 100,
         };
         let threshold_design = thresholdspec.design.clone();
         let log_sigma_design = log_sigmaspec.design.clone();
@@ -25870,6 +25970,7 @@ mod tests {
             nullspace_dims: vec![],
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![0.2]),
+gauge_priority: 100,
         };
         let log_sigmaspec = ParameterBlockSpec {
             name: "log_sigma".to_string(),
@@ -25882,6 +25983,7 @@ mod tests {
             nullspace_dims: vec![],
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![-0.1]),
+gauge_priority: 100,
         };
         let threshold_design = thresholdspec.design.clone();
         let log_sigma_design = log_sigmaspec.design.clone();
@@ -25982,6 +26084,7 @@ mod tests {
             nullspace_dims: vec![],
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![0.15]),
+gauge_priority: 100,
         };
         let log_sigmaspec = ParameterBlockSpec {
             name: "log_sigma".to_string(),
@@ -25994,6 +26097,7 @@ mod tests {
             nullspace_dims: vec![],
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![-0.05]),
+gauge_priority: 100,
         };
         let threshold_design = thresholdspec.design.clone();
         let log_sigma_design = log_sigmaspec.design.clone();
@@ -26162,6 +26266,7 @@ mod tests {
             nullspace_dims: vec![],
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![0.2]),
+gauge_priority: 100,
         };
         let log_sigmaspec = ParameterBlockSpec {
             name: "log_sigma".to_string(),
@@ -26174,6 +26279,7 @@ mod tests {
             nullspace_dims: vec![],
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![-0.1]),
+gauge_priority: 100,
         };
         let threshold_design = thresholdspec.design.clone();
         let log_sigma_design = log_sigmaspec.design.clone();
@@ -26299,6 +26405,7 @@ mod tests {
             nullspace_dims: vec![],
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(array![1.5]),
+gauge_priority: 100,
         };
         let family = OneBlockConstrainedExactFamily {
             target: 0.0,
@@ -26351,6 +26458,7 @@ mod tests {
             nullspace_dims: vec![],
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(array![1.5]),
+gauge_priority: 100,
         };
         let states = vec![ParameterBlockState {
             beta: array![1.5],
@@ -26674,6 +26782,7 @@ mod tests {
             nullspace_dims: vec![],
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(array![0.0]),
+gauge_priority: 100,
         };
         let states = vec![ParameterBlockState {
             beta: array![0.0],
@@ -26720,6 +26829,7 @@ mod tests {
             nullspace_dims: vec![],
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![0.0]),
+gauge_priority: 100,
         };
         let options = BlockwiseFitOptions {
             outer_max_iter: 3,
@@ -26750,6 +26860,7 @@ mod tests {
             nullspace_dims: vec![],
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(array![0.0]),
+gauge_priority: 100,
         };
         let options = BlockwiseFitOptions {
             use_remlobjective: false,
@@ -26864,6 +26975,7 @@ mod tests {
                 nullspace_dims: vec![],
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: Some(array![0.0]),
+gauge_priority: 100,
             },
             ParameterBlockSpec {
                 name: "log_sigma".to_string(),
@@ -26875,6 +26987,7 @@ mod tests {
                 nullspace_dims: vec![],
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: Some(array![0.0, 0.0]),
+gauge_priority: 100,
             },
         ]
     }
@@ -27000,6 +27113,7 @@ mod tests {
             nullspace_dims: vec![],
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(array![0.0]),
+gauge_priority: 100,
         }];
         let states = vec![ParameterBlockState {
             beta: array![0.0],
@@ -27287,6 +27401,7 @@ mod tests {
                 nullspace_dims: vec![],
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: Some(Array1::from_elem(p0, 1.0)),
+gauge_priority: 100,
             },
             ParameterBlockSpec {
                 name: "small_block".to_string(),
@@ -27299,6 +27414,7 @@ mod tests {
                 nullspace_dims: vec![],
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: Some(Array1::from_elem(p1, 1.0)),
+gauge_priority: 100,
             },
         ]
     }
@@ -27347,6 +27463,7 @@ mod tests {
                 nullspace_dims: vec![],
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: Some(Array1::from_elem(2, 1.0)),
+gauge_priority: 100,
             },
             ParameterBlockSpec {
                 name: "block_b".to_string(),
@@ -27358,6 +27475,7 @@ mod tests {
                 nullspace_dims: vec![],
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: Some(Array1::from_elem(2, 1.0)),
+gauge_priority: 100,
             },
         ];
         let per_block = vec![Array1::zeros(0), Array1::zeros(0)];
@@ -27871,6 +27989,7 @@ mod tests {
             nullspace_dims: Vec::new(),
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
+gauge_priority: 100,
         };
         let state = ParameterBlockState {
             beta: array![0.25, 0.75],
@@ -27945,6 +28064,7 @@ mod tests {
             nullspace_dims: Vec::new(),
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
+gauge_priority: 100,
         };
         let state = ParameterBlockState {
             beta: array![2.0, -1.0],
@@ -27992,6 +28112,7 @@ mod tests {
             nullspace_dims: Vec::new(),
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
+gauge_priority: 100,
         };
         let state = ParameterBlockState {
             beta: array![10.0, -4.0],
@@ -28519,6 +28640,7 @@ mod tests {
             nullspace_dims: vec![],
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
+gauge_priority: 100,
         };
         let h: Array2<f64> = array![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0e-10]];
         let work = BlockWorkingSet::ExactNewton {
@@ -28573,6 +28695,7 @@ mod tests {
             nullspace_dims: vec![],
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
+gauge_priority: 100,
         };
         let h: Array2<f64> = array![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, -1.0e-8]];
         let work = BlockWorkingSet::ExactNewton {
@@ -28681,6 +28804,7 @@ mod tests {
                 nullspace_dims: vec![],
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
+gauge_priority: 100,
             });
             states.push(ParameterBlockState {
                 beta: Array1::zeros(width),
@@ -28852,6 +28976,7 @@ mod tests {
                 nullspace_dims: vec![],
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
+gauge_priority: 100,
             });
             states.push(ParameterBlockState {
                 beta: Array1::zeros(width),
@@ -28975,6 +29100,7 @@ mod tests {
                 nullspace_dims: vec![],
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
+gauge_priority: 100,
             });
             states.push(ParameterBlockState {
                 beta: Array1::zeros(width),
