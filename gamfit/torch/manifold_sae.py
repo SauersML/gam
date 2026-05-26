@@ -570,13 +570,22 @@ class ManifoldSAE(nn.Module):
         self.log_lambda = nn.Parameter(torch.zeros(F, dtype=dt))
 
         # Decoder orthogonality penalty: Rust ``block_orthogonality`` descriptor.
+        # The penalty operates on a flat target of shape ``(n_eff, latent_dim)``
+        # and treats ``groups`` as a partition of the latent (column) axis. We
+        # want to penalize cross-atom correlations between the per-atom
+        # decoder weight matrices ``R_g = decoder_blocks[g] ∈ R^{K×D}``, i.e.
+        # ``½·w·Σ_{g≠h} ‖R_g · R_hᵀ‖²_F``. We obtain that by presenting the
+        # decoder transposed: rows index the contracted ``input_dim`` axis and
+        # columns index the ``F·K`` atom-basis pairs. Each atom owns a
+        # contiguous block of ``K`` columns and the per-atom partition is the
+        # latent-axis partition Rust expects.
         if cfg.decoder.ortho_weight > 0.0:
             groups = [list(range(i * K, (i + 1) * K)) for i in range(F)]
             self._ortho_penalty: BlockOrthogonalityPenalty | None = (
                 BlockOrthogonalityPenalty(
                     groups=groups,
                     weight=float(cfg.decoder.ortho_weight),
-                    n_eff=F * K,
+                    n_eff=cfg.input_dim,
                 )
             )
         else:
@@ -792,10 +801,18 @@ class ManifoldSAE(nn.Module):
         return out
 
     def decoder_ortho_penalty(self) -> torch.Tensor:
-        """Rust ``block_orthogonality`` descriptor over per-atom decoder groups."""
+        """Rust ``block_orthogonality`` descriptor over per-atom decoder groups.
+
+        See the constructor for the transpose contract: we present the decoder
+        as ``(input_dim, F·K)`` so each atom owns a contiguous block of ``K``
+        latent (column) axes, matching the Rust partition validator.
+        """
         if self._ortho_penalty is None:
             return self.decoder_blocks.new_zeros(())
-        flat = self.decoder_blocks.reshape(-1, self.cfg.input_dim)
+        # decoder_blocks: (F, K, D). Permute → (D, F, K) → reshape → (D, F·K).
+        flat = self.decoder_blocks.permute(2, 0, 1).reshape(
+            self.cfg.input_dim, -1
+        )
         return self._ortho_penalty(flat)
 
     def decoder_monotonicity_penalty(self) -> torch.Tensor:
