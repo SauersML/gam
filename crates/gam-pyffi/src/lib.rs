@@ -27717,24 +27717,28 @@ struct DuchonHybridConfig {
 }
 
 /// Resolve the (nullspace_order, power) pair given the optional public
-/// keywords. Auto-resolution uses :func:`resolve_duchon_orders` with
-/// ``max_operator_derivative_order = 2`` to match the formula API's
-/// default: the non-periodic Duchon basis builder downstream of these
-/// primitives instantiates the full operator-penalty triplet
-/// (mass + tension + stiffness), and stiffness collocation requires
-/// ``2(p + s) > d + 2``. Using max_op=2 here keeps the auto-resolved
-/// power large enough that the kernel validator inside
-/// ``build_duchon_basis`` accepts the spec.
+/// keywords. ``max_op`` is the highest radial-derivative order required by
+/// the downstream consumer of this spec:
+///
+/// * ``max_op = 0`` — basis-only consumers that never assemble operator
+///   penalties (e.g. the Python ``duchon_basis`` PyFFI returns only the
+///   design matrix). Only kernel-existence and the pure-Duchon CPD guard
+///   apply; D1 / D2 collocation is not required.
+/// * ``max_op = 2`` — full operator-penalty triplet (mass + tension +
+///   stiffness). Used by the formula path and by
+///   ``duchon_function_norm_penalty``, whose returned penalty IS the
+///   stiffness block in the non-periodic pure-Duchon path.
 fn resolve_duchon_hybrid_config(
     dim: usize,
     m: usize,
     length_scale: Option<f64>,
     nullspace_order: Option<&str>,
     explicit_power: Option<f64>,
+    max_op: usize,
 ) -> PyResult<DuchonHybridConfig> {
     let requested_nullspace = parse_nullspace_order(nullspace_order, m)?;
     let (resolved_nullspace, auto_power) =
-        resolve_duchon_orders(dim, requested_nullspace, 2, length_scale);
+        resolve_duchon_orders(dim, requested_nullspace, max_op, length_scale);
     let power = explicit_power.unwrap_or(auto_power as f64);
     Ok(DuchonHybridConfig {
         length_scale,
