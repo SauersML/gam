@@ -42,6 +42,13 @@ pub(crate) struct HostMomentBatch {
 pub(crate) fn build_host_moments(
     view: &CubicCellDerivativeMomentHostView<'_>,
 ) -> Result<HostMomentBatch, String> {
+    if matches!(view.mode, CubicCellMomentMode::ValueAndDerivative) {
+        return Err(
+            "gpu cubic-cell substrate: ValueAndDerivative mode lands with survival flex Stage 5"
+                .to_string(),
+        );
+    }
+
     let n_cells = view.cells.len();
     let stride = view.max_degree + 1;
     let mut moments = vec![0.0_f64; n_cells.saturating_mul(stride)];
@@ -101,13 +108,6 @@ pub(crate) fn build_host_moments(
                 };
             }
         }
-    }
-
-    if matches!(view.mode, CubicCellMomentMode::ValueAndDerivative) {
-        return Err(
-            "gpu cubic-cell substrate: ValueAndDerivative mode lands with survival flex Stage 5"
-                .to_string(),
-        );
     }
 
     Ok(HostMomentBatch {

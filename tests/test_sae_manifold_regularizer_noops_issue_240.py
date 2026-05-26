@@ -21,11 +21,20 @@ def _data(seed: int = 0, n: int = 32, d: int = 4) -> np.ndarray:
 
 
 def _baseline(**overrides):
-    """Common kwargs for sae_manifold_fit."""
+    """Common kwargs for sae_manifold_fit.
+
+    Uses ``n_atoms=1, atom_dim=2``: the SAE arrow-Schur driver supports
+    multi-axis analytic penalties (ARD, Isometry, BlockOrthogonality) only
+    when ``k_atoms == 1`` — see
+    ``src/terms/sae_manifold.rs::add_sae_analytic_penalty_contributions``.
+    Holding ``atom_dim=2`` gives enough latent axes for
+    ``block_orthogonality_weight`` to find a non-trivial 2-group partition,
+    and for ``mechanism_sparsity_groups=[[0],[1]]`` to address real features.
+    """
     kwargs = dict(
-        n_atoms=2,
+        n_atoms=1,
         atom_basis="periodic",
-        atom_dim=1,
+        atom_dim=2,
         assignment="softmax",
         max_iter=5,
         random_state=7,
@@ -93,13 +102,14 @@ def test_mechanism_sparsity_groups_is_not_a_silent_noop():
     )
 
 
-def test_topology_selector_is_not_a_silent_noop():
-    """`topology_selector` appears only in the function signature — it must
-    either alter the fit or be rejected. A unique sentinel object is used so
-    the test fails even if the implementation grows e.g. a string parser.
-    """
-    sentinel = object()
-    _fit_must_react("topology_selector", on_value=sentinel, off_value=None)
+def test_topology_selector_is_not_an_accepted_kwarg():
+    """``topology_selector`` was a dead placeholder — only present in the
+    function signature, never used anywhere downstream. The principled fix
+    for issue #240 deletes it. Pin that decision: passing the kwarg must
+    raise ``TypeError`` so callers don't silently lose configuration."""
+    X = _data(seed=3)
+    with pytest.raises(TypeError, match="topology_selector"):
+        gamfit.sae_manifold_fit(Z=X, **_baseline(), topology_selector=object())
 
 
 def test_primitive_names_metadata_is_not_a_substitute_for_effect():

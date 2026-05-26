@@ -471,6 +471,7 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         int(random_state),
         int(top_k) if top_k is not None else 0,
         gumbel_schedule=_schedule_payload(gumbel_schedule),
+        analytic_penalties=analytic_penalties_json,
     )
     payload_dict = dict(payload)
     if top_k is not None and int(top_k) > 0 and int(top_k) < k_atoms:
@@ -479,6 +480,66 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         x, payload_dict, resolved_topology, assignment, penalties,
         alpha=float(alpha_value), learnable_alpha=bool(alpha == "auto"),
     )
+
+
+def _build_analytic_penalties_payload(
+    *,
+    isometry_weight: float,
+    ard_per_atom: bool,
+    mechanism_sparsity_groups: list[list[int]] | None,
+    block_orthogonality_weight: float,
+    d_max: int,
+    p_out: int,
+) -> str | None:
+    """Translate the four user-facing SAE regularizer knobs into the
+    analytic-penalty JSON payload consumed by `sae_manifold_fit_auto`.
+
+    Targets the SAE latent block ``"t"`` (the per-atom coord space declared in
+    ``sae_manifold_fit_inner``). Returns ``None`` when no penalty is active so
+    the Rust side skips registry construction entirely.
+
+    Each descriptor uses the exact key set the Rust registry parser
+    (`crates/gam-pyffi/src/lib.rs::build_analytic_penalty_registry_from_json`)
+    validates with `descriptor_no_unknown_keys`.
+    """
+    items: list[dict[str, Any]] = []
+    if isometry_weight is not None and float(isometry_weight) > 0.0:
+        items.append({
+            "kind": "isometry",
+            "target": "t",
+            "weight": float(isometry_weight),
+            "p_out": int(p_out),
+        })
+    if bool(ard_per_atom):
+        items.append({"kind": "ard", "target": "t"})
+    if block_orthogonality_weight is not None and float(block_orthogonality_weight) > 0.0:
+        # Default partition: each latent axis is its own group, encouraging
+        # pairwise orthogonality across atom coordinate dimensions. Requires
+        # `d_max >= 2`; for one-dimensional latents the penalty is vacuous
+        # and we skip it rather than failing the descriptor validator.
+        if int(d_max) >= 2:
+            groups = [[axis] for axis in range(int(d_max))]
+            items.append({
+                "kind": "block_orthogonality",
+                "target": "t",
+                "groups": groups,
+                "weight": float(block_orthogonality_weight),
+            })
+    if mechanism_sparsity_groups is not None:
+        groups_int = [[int(axis) for axis in group] for group in mechanism_sparsity_groups]
+        if not groups_int:
+            raise ValueError(
+                "mechanism_sparsity_groups must contain at least one group"
+            )
+        items.append({
+            "kind": "mechanism_sparsity",
+            "target": "t",
+            "feature_groups": groups_int,
+            "weight": 1.0,
+        })
+    if not items:
+        return None
+    return json.dumps(items)
 
 
 def _apply_top_k_mask(payload: dict, top_k: int) -> None:

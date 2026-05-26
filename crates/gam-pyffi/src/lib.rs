@@ -82,7 +82,7 @@ use gam::terms::basis::{
     build_spherical_spline_basis, build_thin_plate_penalty_matrix, create_basis,
     create_cyclic_difference_penalty_matrix, create_difference_penalty_matrix,
     duchon_polynomial_first_derivative_nd,
-    duchon_radial_first_derivative_nd, duchon_radial_second_derivative_nd,
+    duchon_radial_first_derivative_nd, duchon_radial_second_derivative_nd, monomial_exponents,
     evaluate_bspline_basis_scalar,
     matern_radial_first_derivative_nd, matern_radial_second_derivative_nd,
     periodic_bspline_first_derivative_nd, resolve_duchon_orders,
@@ -7138,40 +7138,46 @@ fn latent_input_location_jet(
 ) -> Result<Array3<f64>, String> {
     match latent_basis_kind(basis_kind)? {
         "duchon" => {
-            let nullspace_order = duchon_nullspace_from_m(m);
-            let phi_r = duchon_radial_first_derivative_nd(t_mat, centers, None, nullspace_order)
-                .map_err(|err| err.to_string())?;
+            // Mirror the column layout used by `build_latent_duchon_design` /
+            // `build_duchon_basis`: the forward design is the radial block
+            // projected through the kernel-constraint nullspace Z
+            // (p_constrained = n_centers − n_poly cols) concatenated with the
+            // polynomial nullspace block (n_poly cols). The derivative jet
+            // must use the same effective nullspace order and the same Z
+            // projection so its column count matches the design exactly.
+            let requested_nullspace = duchon_nullspace_from_m(m);
+            let effective_nullspace =
+                pyffi_duchon_effective_nullspace_order(centers, requested_nullspace);
+            let radial_transform =
+                pyffi_duchon_kernel_constraint_nullspace(centers, effective_nullspace)?;
+            let phi_r =
+                duchon_radial_first_derivative_nd(t_mat, centers, None, effective_nullspace)
+                    .map_err(|err| err.to_string())?;
             let radial_jet = radial_input_location_jet(t_mat, centers, phi_r.view())?;
-            let poly_jet = duchon_polynomial_first_derivative_nd(t_mat, nullspace_order);
+            let poly_jet = duchon_polynomial_first_derivative_nd(t_mat, effective_nullspace);
+
             let n_rows = radial_jet.shape()[0];
-            let n_radial = radial_jet.shape()[1];
-            let n_poly = poly_jet.shape()[1];
             let dim = radial_jet.shape()[2];
+            let n_kernel = radial_transform.ncols();
+            let n_poly = poly_jet.shape()[1];
             if poly_jet.shape()[0] != n_rows || poly_jet.shape()[2] != dim {
                 return Err(format!(
                     "Duchon polynomial derivative shape mismatch: radial jet is \
                      {}x{}x{}, polynomial jet is {}x{}x{}",
                     n_rows,
-                    n_radial,
+                    radial_jet.shape()[1],
                     dim,
                     poly_jet.shape()[0],
                     n_poly,
                     poly_jet.shape()[2],
                 ));
             }
-            let mut jet = Array3::<f64>::zeros((n_rows, n_radial + n_poly, dim));
-            for n in 0..n_rows {
-                for k in 0..n_radial {
-                    for a in 0..dim {
-                        jet[[n, k, a]] = radial_jet[[n, k, a]];
-                    }
-                }
-                for k in 0..n_poly {
-                    for a in 0..dim {
-                        jet[[n, n_radial + k, a]] = poly_jet[[n, k, a]];
-                    }
-                }
+            let mut jet = Array3::<f64>::zeros((n_rows, n_kernel + n_poly, dim));
+            for axis in 0..dim {
+                let projected = radial_jet.index_axis(Axis(2), axis).dot(&radial_transform);
+                jet.slice_mut(s![.., ..n_kernel, axis]).assign(&projected);
             }
+            jet.slice_mut(s![.., n_kernel.., ..]).assign(&poly_jet);
             Ok(jet)
         }
         "matern" => {
@@ -8480,6 +8486,7 @@ fn build_sae_basis_evaluators(
     ridge_beta = 1.0e-6,
     gumbel_schedule = None,
     analytic_penalties = None,
+    top_k = None,
 ))]
 fn sae_manifold_fit<'py>(
     py: Python<'py>,
@@ -8506,6 +8513,7 @@ fn sae_manifold_fit<'py>(
     ridge_beta: f64,
     gumbel_schedule: Option<&Bound<'py, PyDict>>,
     analytic_penalties: Option<String>,
+    top_k: Option<usize>,
 ) -> PyResult<Py<PyDict>> {
     sae_manifold_fit_inner(
         py,
@@ -8532,6 +8540,7 @@ fn sae_manifold_fit<'py>(
         ridge_beta,
         gumbel_schedule,
         analytic_penalties,
+        top_k,
     )
 }
 
@@ -8595,6 +8604,13 @@ fn sae_manifold_fit_inner<'py>(
         return Err(py_value_error(format!(
             "sae_manifold_fit requires max_iter >= 1; got {max_iter}"
         )));
+    }
+    if let Some(k_top) = top_k {
+        if k_top == 0 || k_top > k_atoms {
+            return Err(py_value_error(format!(
+                "top_k must satisfy 1 <= top_k <= k_atoms={k_atoms}; got {k_top}"
+            )));
+        }
     }
     if initial_logits.dim() != (n_obs, k_atoms) {
         return Err(py_value_error(format!(
@@ -8837,8 +8853,89 @@ fn sae_manifold_fit_inner<'py>(
         py_value_error("lambda_grid must contain at least one candidate".to_string())
     })?;
 
-    let assignments = term.assignment.assignments();
-    let fitted = term.fitted();
+    let mut assignments = term.assignment.assignments();
+    let mut fitted = term.fitted();
+    // Apply hard top-k projection per row, then recompute `fitted` from the
+    // projected assignments so the returned `assignments` and `fitted` stay
+    // mutually consistent (i.e. `fitted == sum_k a_k * decoder_k @ basis_k`).
+    // Smooth softmax (or IBP/JumpReLU) drives optimisation; the hard top-k
+    // gate is applied at inference time. For softmax mode the kept entries
+    // are renormalised so the resulting per-row distribution sums to 1; for
+    // the other modes the kept entries retain their unnormalised values
+    // (those modes' assignments are not probability distributions).
+    if let Some(k_top) = top_k {
+        if k_top < k_atoms {
+            let n_obs_local = z_view.nrows();
+            let p_out_local = z_view.ncols();
+            let renormalise = assignment_kind == "softmax";
+            for row in 0..n_obs_local {
+                // Collect (value, atom_idx) pairs; pick the indices of the
+                // largest k_top values. Ties broken by lower atom index.
+                let mut paired: Vec<(f64, usize)> = (0..k_atoms)
+                    .map(|atom_idx| (assignments[[row, atom_idx]], atom_idx))
+                    .collect();
+                paired.sort_by(|a, b| {
+                    b.0.partial_cmp(&a.0)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then(a.1.cmp(&b.1))
+                });
+                let mut keep = vec![false; k_atoms];
+                for &(_, atom_idx) in paired.iter().take(k_top) {
+                    keep[atom_idx] = true;
+                }
+                if renormalise {
+                    let mut kept_sum = 0.0_f64;
+                    for atom_idx in 0..k_atoms {
+                        if keep[atom_idx] {
+                            kept_sum += assignments[[row, atom_idx]];
+                        }
+                    }
+                    if kept_sum > 0.0 {
+                        for atom_idx in 0..k_atoms {
+                            assignments[[row, atom_idx]] = if keep[atom_idx] {
+                                assignments[[row, atom_idx]] / kept_sum
+                            } else {
+                                0.0
+                            };
+                        }
+                    } else {
+                        // Pathological case: all kept entries are zero. Fall
+                        // back to uniform mass over the kept indices so the
+                        // contract `assignments.sum(axis=1) == 1` still holds.
+                        let inv = 1.0 / (k_top as f64);
+                        for atom_idx in 0..k_atoms {
+                            assignments[[row, atom_idx]] =
+                                if keep[atom_idx] { inv } else { 0.0 };
+                        }
+                    }
+                } else {
+                    for atom_idx in 0..k_atoms {
+                        if !keep[atom_idx] {
+                            assignments[[row, atom_idx]] = 0.0;
+                        }
+                    }
+                }
+            }
+            // Recompute `fitted` from the projected assignments. Mirrors the
+            // body of `SaeManifoldTerm::try_fitted` but uses our projected
+            // matrix instead of the logit-derived row distribution.
+            fitted = Array2::<f64>::zeros((n_obs_local, p_out_local));
+            let mut g_buf = vec![0.0_f64; p_out_local];
+            for row in 0..n_obs_local {
+                for atom_idx in 0..k_atoms {
+                    let a_k = assignments[[row, atom_idx]];
+                    if a_k == 0.0 {
+                        continue;
+                    }
+                    term.atoms[atom_idx].fill_decoded_row(row, &mut g_buf);
+                    let mut out_row = fitted.row_mut(row);
+                    for out_col in 0..p_out_local {
+                        out_row[out_col] += a_k * g_buf[out_col];
+                    }
+                }
+            }
+        }
+    }
     let log_ard_py = PyList::empty(py);
     for atom_log_ard in &rho.log_ard {
         log_ard_py.append(atom_log_ard.clone().into_pyarray(py))?;
@@ -8966,6 +9063,7 @@ fn sae_manifold_fit_ibp<'py>(
         ridge_beta,
         gumbel_schedule,
         analytic_penalties,
+        None,
     )
 }
 
@@ -9524,12 +9622,22 @@ fn sae_build_duchon_atom(
     pts: ArrayView2<'_, f64>,
     centers: ArrayView2<'_, f64>,
 ) -> Result<(Array2<f64>, Array3<f64>, Array2<f64>), String> {
+    // Resolve (nullspace_order, power) for the requested atom dimension so the
+    // full operator-penalty triplet (mass + tension + stiffness) satisfies its
+    // collocation inequalities at every dim. The default Active triplet
+    // requires D2 collocation `2(p+s) > d+2`; hard-coding `power=0.0,
+    // nullspace=Linear` violated that for d ∈ {1, 2, 3} (issue #246). Routing
+    // through `resolve_duchon_hybrid_config(..., max_op=2)` auto-picks the
+    // smallest valid `s` so the build always produces a Primary penalty.
     let m: usize = 2;
-    let requested_nullspace = duchon_nullspace_from_m(m);
+    let dim = centers.ncols();
+    let cfg = resolve_duchon_hybrid_config(dim, m, None, None, None, /* max_op = */ 2)
+        .map_err(|err| err.to_string())?;
+    let requested_nullspace = cfg.nullspace_order;
     let spec = DuchonBasisSpec {
         center_strategy: CenterStrategy::UserProvided(centers.to_owned()),
-        length_scale: None,
-        power: 0.0,
+        length_scale: cfg.length_scale,
+        power: cfg.power,
         nullspace_order: requested_nullspace,
         identifiability: SpatialIdentifiability::None,
         aniso_log_scales: None,
@@ -9588,6 +9696,66 @@ fn sae_build_duchon_atom(
             phi.ncols(),
             jet.shape()[1]
         ));
+    }
+    Ok((phi, jet, penalty))
+}
+
+/// Build (phi, jet, penalty) for a Euclidean tangent-patch atom.
+///
+/// A Euclidean atom is a *flat* (zero-curvature) polynomial expansion in the
+/// atom's latent coordinates — distinct from the thin-plate Duchon kernel.
+/// The basis is the set of monomials of total degree ≤ `EUCLIDEAN_PATCH_MAX_DEGREE`,
+/// the jet is the first derivative of those monomials, and the penalty is an
+/// identity ridge over the non-constant monomials (the constant term is left
+/// unpenalized to preserve the affine-equivariance of the patch).
+///
+/// `centers` is accepted for API symmetry with the Duchon path; its row count
+/// determines the random-state matching seam (issue #246), but it is not
+/// otherwise used: a polynomial atom has no center-based locality.
+fn sae_build_euclidean_atom(
+    pts: ArrayView2<'_, f64>,
+    centers: ArrayView2<'_, f64>,
+) -> Result<(Array2<f64>, Array3<f64>, Array2<f64>), String> {
+    const EUCLIDEAN_PATCH_MAX_DEGREE: usize = 2;
+    let dim = centers.ncols();
+    let nullspace = if EUCLIDEAN_PATCH_MAX_DEGREE == 0 {
+        DuchonNullspaceOrder::Zero
+    } else if EUCLIDEAN_PATCH_MAX_DEGREE == 1 {
+        DuchonNullspaceOrder::Linear
+    } else {
+        DuchonNullspaceOrder::Degree(EUCLIDEAN_PATCH_MAX_DEGREE)
+    };
+    let exponents = monomial_exponents(dim, EUCLIDEAN_PATCH_MAX_DEGREE);
+    let n_basis = exponents.len();
+    let n_rows = pts.nrows();
+    let mut phi = Array2::<f64>::zeros((n_rows, n_basis));
+    for (col, alpha) in exponents.iter().enumerate() {
+        for row in 0..n_rows {
+            let mut value = 1.0_f64;
+            for (axis, &exp) in alpha.iter().enumerate() {
+                if exp != 0 {
+                    value *= pts[[row, axis]].powi(exp as i32);
+                }
+            }
+            phi[[row, col]] = value;
+        }
+    }
+    let jet = duchon_polynomial_first_derivative_nd(pts, nullspace);
+    if jet.shape()[1] != n_basis {
+        return Err(format!(
+            "sae_build_euclidean_atom: monomial/jet column mismatch {} vs {}",
+            n_basis,
+            jet.shape()[1]
+        ));
+    }
+    // Identity ridge with the constant term (alpha == zeros) unpenalized so the
+    // patch can absorb a global offset without paying a penalty.
+    let mut penalty = Array2::<f64>::zeros((n_basis, n_basis));
+    for (col, alpha) in exponents.iter().enumerate() {
+        let is_constant = alpha.iter().all(|&e| e == 0);
+        if !is_constant {
+            penalty[[col, col]] = 1.0;
+        }
     }
     Ok((phi, jet, penalty))
 }
@@ -9767,7 +9935,12 @@ fn sae_build_padded_basis_stacks(
                         centers.ncols()
                     ));
                 }
-                let (phi, jet, penalty) = sae_build_duchon_atom(coords.view(), centers.view())?;
+                let (phi, jet, penalty) = match plan.kind {
+                    SaeAtomBasisKind::EuclideanPatch => {
+                        sae_build_euclidean_atom(coords.view(), centers.view())?
+                    }
+                    _ => sae_build_duchon_atom(coords.view(), centers.view())?,
+                };
                 let m = phi.ncols();
                 if phi.nrows() != n_obs || m != basis_sizes[atom_idx] {
                     return Err(format!(
@@ -9936,10 +10109,16 @@ fn sae_build_atom_plans(
                         centers[[out_row, col]] = seed_coords[[atom_idx, src_row, col]];
                     }
                 }
-                // Probe one Duchon build to learn the final basis size.
+                // Probe one build to learn the final basis size. Euclidean
+                // patches use the polynomial atom; everything else (Duchon)
+                // uses the thin-plate kernel.
                 let probe_pts = Array2::<f64>::zeros((1, d));
-                let (phi, _jet, _penalty) =
-                    sae_build_duchon_atom(probe_pts.view(), centers.view())?;
+                let (phi, _jet, _penalty) = match kind {
+                    SaeAtomBasisKind::EuclideanPatch => {
+                        sae_build_euclidean_atom(probe_pts.view(), centers.view())?
+                    }
+                    _ => sae_build_duchon_atom(probe_pts.view(), centers.view())?,
+                };
                 let basis_size = phi.ncols();
                 plans.push(SaeAtomBuildPlan {
                     kind,
@@ -10374,6 +10553,7 @@ fn sae_manifold_predict_oos<'py>(
         learning_rate,
         ridge_ext_coord,
         ridge_beta,
+        None,
         None,
         None,
     )?;

@@ -244,7 +244,10 @@ pub fn audit_identifiability(specs: &[ParameterBlockSpec]) -> Result<Identifiabi
     let mut blocks: Vec<BlockIdentity> = Vec::with_capacity(specs.len());
     let mut col_offsets: Vec<usize> = Vec::with_capacity(specs.len() + 1);
     col_offsets.push(0);
-    for spec in specs {
+    let block_phase_started = std::time::Instant::now();
+    let block_heartbeat = (n.saturating_mul(specs.len()) >= 1_000_000)
+        .then(crate::util::heartbeat::Heartbeat::default_interval);
+    for (idx, spec) in specs.iter().enumerate() {
         let dense = spec
             .design
             .try_to_dense_arc(&format!(
@@ -266,6 +269,27 @@ pub fn audit_identifiability(specs: &[ParameterBlockSpec]) -> Result<Identifiabi
         let next_offset = col_offsets[col_offsets.len() - 1] + p_block;
         col_offsets.push(next_offset);
         dense_blocks.push(dense);
+        if let Some(hb) = block_heartbeat.as_ref() {
+            hb.tick(1, |progress, elapsed| {
+                log::info!(
+                    "[STAGE] identifiability audit: per-block QR progress={}/{} elapsed={:.1}s (overall={:.1}s)",
+                    progress.min(specs.len()),
+                    specs.len(),
+                    elapsed,
+                    block_phase_started.elapsed().as_secs_f64(),
+                );
+            });
+        }
+        // Per-block summary on the last iteration so the user always
+        // sees one waypoint between "audit start" and the dense joint
+        // assembly even if no heartbeat fires.
+        if idx + 1 == specs.len() {
+            log::info!(
+                "[STAGE] identifiability audit: per-block QR complete blocks={} elapsed={:.3}s",
+                specs.len(),
+                block_phase_started.elapsed().as_secs_f64(),
+            );
+        }
     }
     let p_total = *col_offsets.last().expect("col_offsets non-empty");
 
