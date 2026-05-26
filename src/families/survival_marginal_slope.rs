@@ -3048,6 +3048,25 @@ fn rigid_observed_eta(q: f64, g: f64, z: f64, probit_scale: f64) -> f64 {
 /// step. See the long comment block in bernoulli_marginal_slope.rs:19180 for
 /// the BMS analogue and the failure mode the metric prevents (REML can
 /// otherwise collapse the alias eigenvalue when `Aᵀ W_pirls C̃ ≠ 0`).
+///
+/// # Residual approximation
+///
+/// This is the η₁-channel row curvature. The full survival row Hessian is
+/// 4×4 in primary scalars `(q₀, q₁, qd₁, g)` and chains differently into
+/// each block (time/marginal share `dη₁/dq = c`; logslope chains through
+/// `dη₁/dg = q₁·c₁ + s_f·z`; flex bases chain through `dη₁/dη = 1`). The
+/// cross-block orthogonalisation here is therefore exact in the η₁
+/// direction and approximate along the η₀ and ad₁ directions and between
+/// blocks whose chain factors differ. In practice η₁ dominates because
+/// both event and censored rows contribute through it while only entry
+/// contributes to η₀; the alias structure the audit reported on the
+/// biobank-scale fit is along the η₁ channel (time ↔ marginal ↔ logslope
+/// ↔ score_warp ↔ link_dev all share constant + low-order columns that
+/// project onto η₁). A fully chain-corrected metric would carry a per-
+/// block per-row scale into the W-inner product and apply the same
+/// scale at predict time through `anchor_correction_matrix`; that is a
+/// multi-file refactor (deviation_runtime + predict.rs + per-block
+/// chain tables) and is deliberately scoped out of this construction.
 fn survival_pilot_irls_row_metric_at_eta(
     eta_pilot: &Array1<f64>,
     sample_weights: &Array1<f64>,
