@@ -683,6 +683,177 @@ impl<'a> RemlState<'a> {
 }
 
 #[cfg(test)]
+mod sigma_cubature_accumulation_tests {
+    //! Math-spec validation tests for the sigma-cubature accumulation
+    //! formula (Block 6 validation test #1, "cubature linear exactness").
+    //!
+    //! These tests pin the math of
+    //! [`accumulate_sigma_cubature_total_covariance`] independently of the
+    //! execution model that produced the per-sigma `(A_m, b_m)` pairs.
+    //! Pulled out so the same parity oracle covers both the CPU Rayon
+    //! sigma loop and any future GPU stream-pool sigma executor.
+    use super::accumulate_sigma_cubature_total_covariance;
+    use ndarray::{Array1, Array2};
+
+    /// Cubature linear exactness: if `b_m = b_0 + J·(ρ_m − ρ̂)` is linear
+    /// in `ρ` and `A_m = A_0` is constant, the cubature output must equal
+    /// `A_0 + J · V_ρ,r · J^T` exactly, where `V_ρ,r` is the empirical
+    /// covariance of the sigma points themselves (equal-weighted, by the
+    /// usual 2r-point symmetric rule with `M = 2r` and weights `1/M`).
+    ///
+    /// This is the conservation law the cubature formula was designed to
+    /// satisfy; any drift away from it is a math bug, not a numerics
+    /// issue, so the tolerance is at f64 round-off (1e-12 relative).
+    #[test]
+    fn cubature_linear_exactness_recovers_jvjt() {
+        // Pick a non-trivial (p, d_ρ, r) shape: p=4 outputs, d_ρ=3 inputs,
+        // r=3 retained eigendirections → 2r = 6 sigma points. Use a
+        // hand-built `V_ρ,r` with three distinct eigenvalues so the test
+        // genuinely exercises off-diagonal covariance entries.
+        let p = 4;
+        let d_rho = 3;
+        let r = 3;
+        let m_points = 2 * r;
+
+        // Hand-picked eigendecomposition of V_ρ,r: orthonormal U from
+        // QR of a simple block, diagonal eigenvalues d. Sigma points:
+        // ρ_m − ρ̂ = ±√(r · d_j) · u_j for j = 0..r and sign ∈ {+,−}, so
+        // the empirical covariance under equal weights 1/M equals V_ρ,r.
+        let eigenvalues = [0.25_f64, 0.49, 0.81];
+        // Use a simple orthonormal matrix (a 3×3 Householder-like
+        // construction) for U so the test does not depend on any RNG.
+        // U columns are the eigenvectors of V_ρ,r.
+        let u: Array2<f64> = ndarray::array![
+            [1.0 / 3f64.sqrt(), 1.0 / 2f64.sqrt(), 1.0 / 6f64.sqrt()],
+            [1.0 / 3f64.sqrt(), -1.0 / 2f64.sqrt(), 1.0 / 6f64.sqrt()],
+            [1.0 / 3f64.sqrt(), 0.0, -2.0 / 6f64.sqrt()],
+        ];
+        // sanity: U is orthonormal
+        let ut_u = u.t().dot(&u);
+        for i in 0..d_rho {
+            for j in 0..d_rho {
+                let want = if i == j { 1.0 } else { 0.0 };
+                assert!(
+                    (ut_u[[i, j]] - want).abs() < 1e-12,
+                    "U is not orthonormal at ({i},{j}): got {} expected {}",
+                    ut_u[[i, j]],
+                    want,
+                );
+            }
+        }
+
+        // V_ρ,r = U · diag(d) · Uᵀ
+        let mut v_rho_r = Array2::<f64>::zeros((d_rho, d_rho));
+        for k in 0..d_rho {
+            let col = u.column(k);
+            let scaled = col.mapv(|v| v * eigenvalues[k]);
+            for i in 0..d_rho {
+                for j in 0..d_rho {
+                    v_rho_r[[i, j]] += scaled[i] * col[j];
+                }
+            }
+        }
+
+        // Build the 2r sigma displacements: ρ_m − ρ̂ = ±√(r · d_j) · u_j.
+        // Equal weights 1/M and the symmetric ± pairing make the
+        // empirical mean zero and the empirical second-moment matrix
+        // sum to V_ρ,r exactly.
+        let mut sigma_displacements: Vec<Array1<f64>> = Vec::with_capacity(m_points);
+        for k in 0..r {
+            let scale = (r as f64 * eigenvalues[k]).sqrt();
+            let axis = u.column(k).to_owned();
+            for sign in [1.0_f64, -1.0_f64] {
+                sigma_displacements.push(axis.mapv(|v| v * sign * scale));
+            }
+        }
+
+        // Pick a non-degenerate (p × d_ρ) Jacobian J and constants b_0,
+        // A_0. Use plain integers so the synthetic test data is
+        // exactly representable in f64.
+        let b0: Array1<f64> = ndarray::array![1.0, -2.0, 3.5, 0.5];
+        let jacobian: Array2<f64> = ndarray::array![
+            [1.0, 0.0, -1.0],
+            [2.0, 1.0, 0.0],
+            [0.0, -1.0, 1.0],
+            [1.0, 1.0, 1.0],
+        ];
+        // A_0 is SPD by construction so the cubature output is a real
+        // covariance matrix; pick a simple diagonal + small off-diagonal
+        // structure so the assertion is not vacuous on the A_0 term.
+        let mut a0 = Array2::<f64>::eye(p);
+        a0[[0, 1]] = 0.25;
+        a0[[1, 0]] = 0.25;
+        a0[[2, 3]] = -0.10;
+        a0[[3, 2]] = -0.10;
+
+        // Synthesize per-sigma (A_m, b_m) with A_m = A_0 (constant),
+        // b_m = b_0 + J · (ρ_m − ρ̂) (linear).
+        let points: Vec<(Array2<f64>, Array1<f64>)> = sigma_displacements
+            .iter()
+            .map(|drho| {
+                let bm = &b0 + &jacobian.dot(drho);
+                (a0.clone(), bm)
+            })
+            .collect();
+
+        // Expected: V̂_p = A_0 + J · V_ρ,r · Jᵀ. Symmetric by
+        // construction, so no enforce_symmetry needed for the oracle.
+        let jvjt = jacobian.dot(&v_rho_r).dot(&jacobian.t());
+        let expected = &a0 + &jvjt;
+
+        let actual = accumulate_sigma_cubature_total_covariance(&points, p);
+
+        // f64 round-off bound: every entry is a sum of <= 32 products
+        // of single-digit magnitudes, so 1e-12 relative is very safe.
+        let mut max_rel_dev = 0.0_f64;
+        let mut max_abs_dev = 0.0_f64;
+        for i in 0..p {
+            for j in 0..p {
+                let diff = (actual[[i, j]] - expected[[i, j]]).abs();
+                let denom = expected[[i, j]].abs().max(1.0);
+                max_rel_dev = max_rel_dev.max(diff / denom);
+                max_abs_dev = max_abs_dev.max(diff);
+            }
+        }
+        assert!(
+            max_rel_dev < 1e-12,
+            "cubature linear-exactness violation: max_rel_dev={:.3e}, max_abs_dev={:.3e}",
+            max_rel_dev,
+            max_abs_dev,
+        );
+    }
+
+    /// Degenerate sanity: a single sigma point with `M = 1` collapses
+    /// `var_beta` to zero (the symmetric ± pairing degenerates), so
+    /// the cubature output equals exactly `A_0`. Guards the formula
+    /// against a stray off-by-one in the variance subtraction.
+    #[test]
+    fn cubature_single_point_collapses_to_a0() {
+        let p = 3;
+        let a0: Array2<f64> = ndarray::array![[2.0, 0.5, 0.0], [0.5, 1.5, 0.25], [0.0, 0.25, 1.0]];
+        let b0: Array1<f64> = ndarray::array![0.1, -0.2, 0.3];
+        let points = vec![(a0.clone(), b0.clone())];
+        let actual = accumulate_sigma_cubature_total_covariance(&points, p);
+        // With M=1: mean_beta = b0, second_beta = b0 b0ᵀ,
+        //          var_beta = b0 b0ᵀ - b0 b0ᵀ = 0,
+        //          mean_hinv = a0  ⇒ total = a0.
+        for i in 0..p {
+            for j in 0..p {
+                let diff = (actual[[i, j]] - a0[[i, j]]).abs();
+                assert!(
+                    diff < 1e-14,
+                    "single-point cubature did not collapse to A_0 at ({i},{j}): \
+                     actual={}, expected={}, diff={:.3e}",
+                    actual[[i, j]],
+                    a0[[i, j]],
+                    diff,
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod smoothing_correction_outcome_tests {
     //! Unit tests for the structured [`SmoothingCorrectionOutcome`] type
     //! introduced by issue #201. These tests cover variant

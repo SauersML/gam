@@ -657,7 +657,7 @@ mod tests {
     fn distance_self_is_zero() {
         let a = array![0.1, -0.2, 0.05];
         let d = poincare_distance(a.view(), a.view(), -1.0).expect("distance");
-        assert!(d.abs() < 1.0e-8, "got {d}");
+        assert_eq!(d, 0.0, "self-distance must be exactly 0.0, got {d:e}");
     }
 
     #[test]
