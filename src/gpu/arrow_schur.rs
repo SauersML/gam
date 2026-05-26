@@ -20,7 +20,7 @@
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
-use crate::solver::arrow_schur::ArrowSchurSystem;
+use crate::solver::arrow_schur::{ArrowRowBlock, ArrowSchurSystem};
 
 /// Outcome of a single Arrow-Schur Newton solve.
 pub struct ArrowSchurGpuSolution {
