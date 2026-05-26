@@ -446,7 +446,7 @@ impl CubicCellGpuBackend {
 mod tests {
     use super::*;
     use crate::gpu::cubic_cell::{
-        CubicCellDerivativeMomentHostView, CubicCellMomentResidency,
+        CubicCellDerivativeMomentHostView, CubicCellMomentResidency, CubicCellMomentStatus,
         GpuCellBranchTag, GpuDenestedCubicCell,
     };
     use crate::gpu::runtime::GpuRuntime;
