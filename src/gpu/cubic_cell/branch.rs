@@ -60,35 +60,6 @@ pub(crate) fn classify_cell_for_gpu(
     }
 }
 
-/// Bulk version of [`classify_cell_for_gpu`].
-///
-/// Returns two parallel vectors: one branch tag per cell (with an arbitrary
-/// non-failing tag when the cell is rejected — the caller must consult
-/// `status` first), and one status code per cell. Cells with non-OK status
-/// are guaranteed to receive a zeroed moment row by the substrate; the
-/// returned tag for those positions is unused.
-pub(crate) fn classify_cells_for_gpu(
-    cells: &[GpuDenestedCubicCell],
-) -> (Vec<GpuCellBranchTag>, Vec<CubicCellMomentStatus>) {
-    let mut tags = Vec::with_capacity(cells.len());
-    let mut statuses = Vec::with_capacity(cells.len());
-    for &cell in cells {
-        match classify_cell_for_gpu(cell) {
-            Ok(tag) => {
-                tags.push(tag);
-                statuses.push(CubicCellMomentStatus::Ok);
-            }
-            Err(status) => {
-                // The status is the authoritative signal; the tag is a
-                // placeholder so the parallel-vector contract holds.
-                tags.push(GpuCellBranchTag::AffineTail);
-                statuses.push(status);
-            }
-        }
-    }
-    (tags, statuses)
-}
-
 #[inline]
 fn is_finite_coefficient_block(cell: GpuDenestedCubicCell) -> bool {
     cell.c0.is_finite() && cell.c1.is_finite() && cell.c2.is_finite() && cell.c3.is_finite()
@@ -183,20 +154,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn bulk_classifier_preserves_parallel_vector_contract() {
-        let cells = vec![
-            cell(-1.0, 1.0, 0.0, 0.0, 0.0, 0.0),
-            cell(1.0, -1.0, 0.0, 0.0, 0.0, 0.0),
-            cell(f64::NEG_INFINITY, 0.0, 0.1, 0.2, 0.0, 0.0),
-        ];
-        let (tags, statuses) = classify_cells_for_gpu(&cells);
-        assert_eq!(tags.len(), 3);
-        assert_eq!(statuses.len(), 3);
-        assert_eq!(statuses[0], CubicCellMomentStatus::Ok);
-        assert_eq!(statuses[1], CubicCellMomentStatus::InvalidInterval);
-        assert_eq!(statuses[2], CubicCellMomentStatus::Ok);
-        assert_eq!(tags[0], GpuCellBranchTag::Affine);
-        assert_eq!(tags[2], GpuCellBranchTag::AffineTail);
-    }
 }
