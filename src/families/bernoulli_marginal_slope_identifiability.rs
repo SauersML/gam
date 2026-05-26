@@ -164,7 +164,15 @@ impl ParametricAnchorEvaluator {
 }
 
 impl AnchorRowEvaluator for ParametricAnchorEvaluator {
-    fn anchor_rows(&self, _predict_arg: &Array1<f64>) -> Result<Array2<f64>, String> {
+    fn anchor_rows(&self, predict_arg: &Array1<f64>) -> Result<Array2<f64>, String> {
+        if predict_arg.len() != self.design.nrows() {
+            return Err(format!(
+                "ParametricAnchorEvaluator: predict_arg length {} must match \
+                 materialised design rows {}",
+                predict_arg.len(),
+                self.design.nrows()
+            ));
+        }
         Ok(self.design.clone())
     }
     fn ncols(&self) -> usize {
