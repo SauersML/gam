@@ -3013,6 +3013,62 @@ fn rigid_observed_eta(q: f64, g: f64, z: f64, probit_scale: f64) -> f64 {
     q * rigid_observed_scale(g, probit_scale) + rigid_observed_logslope(g, probit_scale) * z
 }
 
+/// Survival IRLS Hessian row metric at a β-independent pilot η, mirroring
+/// `bernoulli_marginal_slope::pilot_irls_hessian_row_metric_at_eta`. The SMGS
+/// conditional likelihood at the exit time is a probit Bernoulli on the
+/// event indicator with link variance `Φ(η)(1−Φ(η))`; the IRLS row weight
+/// (which is the eigenvalue the joint penalised Hessian sees along the
+/// "linear-predictor direction" of every parametric / flex anchor column) is
+///
+///   W[i] = sample_weights[i] · φ(η_i)² / (Φ(η_i)·(1 − Φ(η_i)))
+///
+/// evaluated at a β-independent pilot η so the cross-block orthogonalisation
+/// is a one-shot construction-time step. This is the metric that makes
+/// `Aᵀ W C̃ = 0` hold in the same inner product the joint Hessian uses during
+/// PIRLS — without it, A and C̃ are merely Euclidean-orthogonal, the joint
+/// Hessian carries a near-null direction along the W-metric alias, and REML
+/// can collapse the alias eigenvalue (see the long comment block in
+/// bernoulli_marginal_slope.rs:19180).
+fn survival_pilot_irls_row_metric_at_eta(
+    eta_pilot: &Array1<f64>,
+    sample_weights: &Array1<f64>,
+) -> Array1<f64> {
+    use crate::probability::{normal_cdf, normal_pdf};
+    let n = eta_pilot.len();
+    let mut w = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        let eta = eta_pilot[i];
+        let mu = normal_cdf(eta).clamp(1e-12, 1.0 - 1e-12);
+        let phi = normal_pdf(eta).max(1e-300);
+        let var = (mu * (1.0 - mu)).max(1e-300);
+        w[i] = sample_weights[i] * (phi * phi) / var;
+    }
+    w
+}
+
+/// Build the SMGS rigid pooled-probit pilot η at training rows from the
+/// time-block offsets, marginal/logslope offsets, baseline slope and z. This
+/// is the survival analog of BMS `rigid_pooled_probit_pilot_eta`; the basis
+/// is intentionally β-independent so the resulting W metric depends only on
+/// data + spec offsets and the cross-block orthogonalisation remains a one-
+/// shot construction-time step. Used to weight the W-metric inner product
+/// in `enforce_cross_block_identifiability_for_flex_block` (both flex paths).
+fn survival_rigid_pilot_eta(
+    n: usize,
+    z_primary: &Array1<f64>,
+    offset_exit: &Array1<f64>,
+    marginal_offset: &Array1<f64>,
+    logslope_offset: &Array1<f64>,
+    baseline_slope: f64,
+    probit_scale: f64,
+) -> Array1<f64> {
+    Array1::from_iter((0..n).map(|row| {
+        let q_exit = offset_exit[row] + marginal_offset[row];
+        let slope = baseline_slope + logslope_offset[row];
+        rigid_observed_eta(q_exit, slope, z_primary[row], probit_scale)
+    }))
+}
+
 pub fn survival_marginal_slope_vector_scale(
     slopes: &[f64],
     covariance: &MarginalSlopeCovariance,
@@ -17666,6 +17722,28 @@ pub fn fit_survival_marginal_slope_terms(
 
     let time_penalties_len = spec.time_block.penalties.len();
     let mut cross_block_warnings: Vec<CrossBlockIdentifiabilityWarning> = Vec::new();
+    // Cross-block W metric: build the survival rigid pooled-probit pilot η
+    // ONCE and use the IRLS Hessian row weight `w · φ(η)² / (Φ(η)(1−Φ(η)))`
+    // for both flex anchor orthogonalisations below. Using `&spec.weights`
+    // (uniform sample weights) instead makes A and C̃ merely Euclidean-
+    // orthogonal — at PIRLS time `Aᵀ W_pirls C̃ ≠ 0`, the joint Hessian
+    // carries a near-null direction along the W-metric alias, and REML can
+    // drive the flex block's λ small enough that the alias direction's
+    // joint Hessian eigenvalue collapses (the `rho≈2.0`, constant
+    // `step_inf`, growing `beta_inf` runaway documented for BMS). This is
+    // the survival analog of bernoulli_marginal_slope.rs:19213-19214 +
+    // :19355-19356.
+    let cross_block_pilot_eta = survival_rigid_pilot_eta(
+        n,
+        &z_primary,
+        &spec.time_block.offset_exit,
+        &spec.marginal_offset,
+        &spec.logslope_offset,
+        baseline_slope,
+        probit_scale,
+    );
+    let cross_block_pilot_w =
+        survival_pilot_irls_row_metric_at_eta(&cross_block_pilot_eta, &spec.weights);
     // Unified location-anchor design at training rows.
     //
     // Survival prediction routes through `BernoulliMarginalSlopePredictor`
@@ -18450,10 +18528,20 @@ pub fn fit_survival_marginal_slope_terms(
                 }
                 other => other,
             };
+            let eval_id = outer_eval_counter.get();
+            outer_eval_counter.set(eval_id.wrapping_add(1));
+            let mut outer_options =
+                joint_hyper_options_for_outer_tolerance(options, exact_spatial_outer_tol);
+            outer_options.outer_eval_context =
+                Some(crate::custom_family::OuterEvalContext {
+                    rho: std::sync::Arc::new(rho.clone()),
+                    eval_id,
+                    scope: crate::custom_family::EvalScope::OuterDerivative,
+                });
             let eval = evaluate_custom_family_joint_hyper_shared(
                 &family,
                 &blocks,
-                &joint_hyper_options_for_outer_tolerance(options, exact_spatial_outer_tol),
+                &outer_options,
                 &rho,
                 derivative_blocks,
                 exact_warm_start.borrow().as_ref(),
@@ -18507,10 +18595,20 @@ pub fn fit_survival_marginal_slope_terms(
             sigma_hint.replace(sigma);
             let family = make_family(&designs[0], &designs[1], sigma, FlexActivation::On);
             let derivative_blocks = get_derivative_blocks(theta, specs, designs)?;
+            let eval_id = outer_eval_counter.get();
+            outer_eval_counter.set(eval_id.wrapping_add(1));
+            let mut outer_options =
+                joint_hyper_options_for_outer_tolerance(options, exact_spatial_outer_tol);
+            outer_options.outer_eval_context =
+                Some(crate::custom_family::OuterEvalContext {
+                    rho: std::sync::Arc::new(rho.clone()),
+                    eval_id,
+                    scope: crate::custom_family::EvalScope::OuterDerivative,
+                });
             let eval = evaluate_custom_family_joint_hyper_efs_shared(
                 &family,
                 &blocks,
-                &joint_hyper_options_for_outer_tolerance(options, exact_spatial_outer_tol),
+                &outer_options,
                 &rho,
                 derivative_blocks,
                 exact_warm_start.borrow().as_ref(),
