@@ -1243,6 +1243,7 @@ mod pirls_row_gpu_tests {
                 prior_weight: 3.0,
             },
         );
+        assert!(mu > 0.0 && mu < 1.0);
         assert_close("mu", out.mu, mu, 1e-12);
         assert_close("w_fisher", out.w_fisher, 3.0 * mu * (1.0 - mu), 1e-12);
         assert_close("grad_eta", out.grad_eta, 3.0 * (1.0 - mu), 1e-12);
