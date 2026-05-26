@@ -204,14 +204,37 @@ extern "C" __global__ void bms_flex_probe() {
 ///
 /// ## erfcx implementation
 ///
-/// CUDA's libm exposes `erfcf` but not `erfcx` directly; the left-tail
-/// formula needs `erfcx(u) = exp(u²) erfc(u)` for `u ≥ 0`. We use the
-/// identity `erfcx(u) = exp(u²) · erfc(u)` evaluated as `expf(u²) * erfc(u)`
-/// in f64 via `exp` and `erfc`, with a Chebyshev refinement guard for
-/// `u > 6.5` to avoid `exp(u²)` overflow — mirrors the `erfcx_nonnegative`
-/// CPU helper in `src/inference/probability.rs:130-ish` (whichever
-/// branched formula it uses, the device version must produce the same
-/// numerics within 1 ULP for parity).
+/// CUDA's libm exposes `erfc` (f64) but not `erfcx` directly; the
+/// left-tail formula needs `erfcx(u) = exp(u²) · erfc(u)` for `u ≥ 0`.
+/// We use `exp(u²) · erfc(u)` in f64 for `u < 26` and the asymptotic
+/// expansion `1 − ½u⁻² + ¾u⁻⁴ − 15⁄8·u⁻⁶ + 105⁄16·u⁻⁸` for `u ≥ 26`
+/// (the next term `−945⁄32·u⁻¹⁰` is the math-team-confirmed first
+/// omitted contributor, ~2.1e-13 relative at `u = 26`, comfortably
+/// under the 1e-8 parity bar). Crossover `u = 26 ⇒ x = −26√2 ≈ −36.77`.
+/// Parity reference: `signed_probit_logcdf_and_mills_ratio` in
+/// `src/inference/probability.rs:222` and `erfcx_nonnegative` in the
+/// same file. Note: this device helper will be *replaced* by the
+/// shared `src/gpu/numerics_device.rs` const that survival-flex (Block
+/// 8) is authoring; this inlined version is staging only.
+///
+/// ## Launch geometry (when the dispatcher consumer lands)
+///
+/// One thread per row. Math-team guidance: use `block_dim = 256` for
+/// the rigid path (flex uses 128 due to larger FP64 register
+/// footprint at r≈20 + degree-9 moments + 4-coeff polynomial
+/// scratch). `grid_dim = ceil_div(n, 256)` — for biobank `n = 195_000`
+/// that's ~762 blocks, ample occupancy on a V100 SM82.
+///
+/// ## v1 latent-measure scope
+///
+/// Standard-normal only. The Auto pipeline rank-INT calibrates
+/// non-normal latent z back to standard normal before the row
+/// primitive runs (see
+/// `src/families/bernoulli_marginal_slope.rs:752-783, :528-554`), so
+/// `LatentMeasureKind::GlobalEmpirical` and `LocalEmpirical` are
+/// explicit follow-up milestones — this kernel mirrors only the
+/// `latent_measure.empirical_grid_for_training_row(row)? == None`
+/// branch of `rigid_row_kernel_eval`.
 ///
 /// ## Status
 ///

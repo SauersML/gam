@@ -445,6 +445,50 @@ pub fn build_termspec(
                 )
                 .to_string());
             }
+            ParsedTerm::Interaction { vars } => {
+                // Validate every atom resolves to a numeric column. Linear
+                // `:` interactions produce a design column equal to the
+                // elementwise product of the operands; categorical operands
+                // would need a factor-aware expansion (one column per cell)
+                // that is not yet wired here.
+                let mut cols = Vec::<usize>::with_capacity(vars.len());
+                for var in vars {
+                    let col = resolve_col(col_map, var)?;
+                    let kind = ds.column_kinds.get(col).copied().ok_or_else(|| {
+                        TermBuilderError::missing_column(format!(
+                            "internal column-kind lookup failed for '{var}'"
+                        ))
+                        .to_string()
+                    })?;
+                    match kind {
+                        ColumnKindTag::Continuous | ColumnKindTag::Binary => cols.push(col),
+                        ColumnKindTag::Categorical => {
+                            return Err(TermBuilderError::incompatible_config(format!(
+                                "interaction `{}` references categorical column `{var}`; \
+                                 linear `:` interactions currently support only numeric \
+                                 (continuous/binary) operands. Use te(...) for smooth \
+                                 interactions or pre-encode the factor as numeric columns.",
+                                vars.join(":")
+                            ))
+                            .to_string());
+                        }
+                    }
+                }
+                let label = vars.join(":");
+                linear_terms.push(LinearTermSpec {
+                    name: label,
+                    feature_col: cols[0],
+                    feature_cols: cols,
+                    double_penalty: true,
+                    coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
+                    coefficient_min: None,
+                    coefficient_max: None,
+                });
+                inference_notes.push(format!(
+                    "wired linear interaction `{}` as product of numeric columns",
+                    vars.join(":")
+                ));
+            }
         }
     }
 

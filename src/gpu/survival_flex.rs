@@ -833,22 +833,25 @@ impl SurvivalFlexGpuBackend {
         };
         let derivative_guard = inputs.derivative_guard;
         let probit_scale = inputs.probit_scale;
-        let n_i32 = n as i32;
+        let n_i32: i32 = i32::try_from(n).map_err(|_| GpuError::DriverCallFailed {
+            reason: format!("survival_flex n={n} overflows i32"),
+        })?;
         let mut builder = stream.launch_builder(&func);
-        builder.arg(&d_q0);
-        builder.arg(&d_q1);
-        builder.arg(&d_qd1);
-        builder.arg(&d_z);
-        builder.arg(&d_g);
-        builder.arg(&d_w);
-        builder.arg(&d_d);
-        builder.arg(&derivative_guard);
-        builder.arg(&probit_scale);
-        builder.arg(&n_i32);
-        builder.arg(&mut d_nll);
-        builder.arg(&mut d_grad);
-        builder.arg(&mut d_hess);
-        builder.arg(&mut d_status);
+        builder
+            .arg(&d_q0)
+            .arg(&d_q1)
+            .arg(&d_qd1)
+            .arg(&d_z)
+            .arg(&d_g)
+            .arg(&d_w)
+            .arg(&d_d)
+            .arg(&derivative_guard)
+            .arg(&probit_scale)
+            .arg(&n_i32)
+            .arg(&mut d_nll)
+            .arg(&mut d_grad)
+            .arg(&mut d_hess)
+            .arg(&mut d_status);
         // SAFETY: every argument is a typed device pointer / scalar
         // matching the kernel signature above, and grid/block cover
         // exactly `n` rows.  Out-of-range threads early-return.
