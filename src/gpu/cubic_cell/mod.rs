@@ -42,7 +42,6 @@ pub(crate) mod kernel_src;
 
 use crate::gpu::error::GpuError;
 
-pub(crate) use branch::{classify_cell_for_gpu, classify_cells_for_gpu};
 pub(crate) use host_substrate::{HostMomentBatch, build_host_moments};
 
 /// Maximum derivative-moment degree the substrate is built to evaluate.
