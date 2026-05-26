@@ -17639,6 +17639,202 @@ enum FlexActivation {
     On,
 }
 
+/// One block in the joint training-row design layout consumed by
+/// [`joint_training_design_preflight`]. Holds a dense `(n x p_block)`
+/// slice and the block tag used in the failure diagnostic.
+pub(crate) struct JointPreflightSegment {
+    pub block: JointPreflightBlock,
+    pub columns: Array2<f64>,
+}
+
+/// W-metric joint training-row design preflight.
+///
+/// Stacks the per-block training-row designs horizontally into a single
+/// `n x p_joint` matrix `J`, pre-scales by `sqrt(W)`, and runs a thin-SVD
+/// via [`crate::faer_ndarray::FaerSvd`]. Returns `Ok(())` if every
+/// singular value is above the numerical-rank tolerance
+/// `sigma_max * max(n, p_joint) * 16 * f64::EPSILON`. Otherwise returns
+/// [`SurvivalMarginalSlopeError::JointRankDeficient`] with the alias
+/// directions localised to dominant `(block, local_col, weight)` triples.
+///
+/// This is the certificate that PIRLS will see a full-rank Hessian: the
+/// per-block cross-block reparameterisation in
+/// `enforce_cross_block_identifiability_for_flex_block` enforces span
+/// orthogonality one candidate-vs-union pair at a time, but the joint
+/// design's column rank can still collapse if (i) the anchor union
+/// itself is rank-deficient, or (ii) the per-block W-metric `drop_tol`
+/// admitted a direction the joint SVD rejects under a tighter rank
+/// threshold. Either way, the diagnostic localises which block x column
+/// dominates each alias direction so the operator can resolve the
+/// model-spec error before any pilot iteration fires.
+pub(crate) fn joint_training_design_preflight(
+    segments: &[JointPreflightSegment],
+    weights: &Array1<f64>,
+) -> Result<(), SurvivalMarginalSlopeError> {
+    use crate::faer_ndarray::FaerSvd;
+
+    if segments.is_empty() {
+        return Ok(());
+    }
+    let n = weights.len();
+    let mut p_joint = 0usize;
+    let mut block_ranges: Vec<(JointPreflightBlock, usize, usize)> =
+        Vec::with_capacity(segments.len());
+    for seg in segments {
+        if seg.columns.nrows() != n {
+            return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+                reason: format!(
+                    "joint preflight: block {} has {} rows, weights have {}",
+                    seg.block,
+                    seg.columns.nrows(),
+                    n,
+                ),
+            });
+        }
+        let start = p_joint;
+        let end = p_joint + seg.columns.ncols();
+        block_ranges.push((seg.block, start, end));
+        p_joint = end;
+    }
+    if p_joint == 0 {
+        return Ok(());
+    }
+
+    let mut sqrt_w = Array1::<f64>::zeros(n);
+    for (i, &w) in weights.iter().enumerate() {
+        if !w.is_finite() || w < 0.0 {
+            return Err(SurvivalMarginalSlopeError::InvalidInput {
+                reason: format!(
+                    "joint preflight: weights[{i}] = {w} is not finite/non-negative",
+                ),
+            });
+        }
+        sqrt_w[i] = w.sqrt();
+    }
+
+    let mut j_sqw = Array2::<f64>::zeros((n, p_joint));
+    for (seg, (_, start, end)) in segments.iter().zip(block_ranges.iter()) {
+        let width = *end - *start;
+        let mut dst = j_sqw.slice_mut(s![.., *start..*end]);
+        dst.assign(&seg.columns);
+        for i in 0..n {
+            let s_i = sqrt_w[i];
+            for j in 0..width {
+                dst[[i, j]] *= s_i;
+            }
+        }
+    }
+
+    let (_u, sigma, vt) =
+        j_sqw
+            .svd(false, true)
+            .map_err(|e| SurvivalMarginalSlopeError::NumericalFailure {
+                reason: format!("joint preflight: W-metric thin-SVD failed: {e:?}"),
+            })?;
+    let vt = vt.ok_or_else(|| SurvivalMarginalSlopeError::NumericalFailure {
+        reason: "joint preflight: thin-SVD requested right singular vectors but none returned"
+            .to_string(),
+    })?;
+    if vt.nrows() != sigma.len() || vt.ncols() != p_joint {
+        return Err(SurvivalMarginalSlopeError::NumericalFailure {
+            reason: format!(
+                "joint preflight: SVD shape inconsistent - sigma.len()={}, vt={:?}, p_joint={}",
+                sigma.len(),
+                vt.shape(),
+                p_joint,
+            ),
+        });
+    }
+
+    let sigma_max = sigma.iter().copied().fold(0.0_f64, f64::max);
+    let rank_dim = n.max(p_joint) as f64;
+    let rank_tol = sigma_max * rank_dim * 16.0 * f64::EPSILON;
+
+    let alias_idx: Vec<usize> = sigma
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, &s)| (s <= rank_tol).then_some(idx))
+        .collect();
+    let rank = sigma.len() - alias_idx.len();
+
+    if alias_idx.is_empty() && sigma.len() == p_joint {
+        let sigma_min = sigma.iter().copied().fold(f64::INFINITY, f64::min);
+        let condition = if sigma_min > 0.0 {
+            sigma_max / sigma_min
+        } else {
+            f64::INFINITY
+        };
+        log::info!(
+            "[survival-marginal-slope/preflight] joint design full-rank: n={n} p_joint={p_joint} \
+             sigma_min={sigma_min:.3e} sigma_max={sigma_max:.3e} kappa={condition:.3e} tol={rank_tol:.3e}",
+        );
+        return Ok(());
+    }
+
+    let structural_alias = p_joint.saturating_sub(sigma.len());
+
+    let mut alias_directions = Array2::<f64>::zeros((p_joint, alias_idx.len()));
+    let mut columns: Vec<(JointPreflightBlock, usize, f64)> = Vec::new();
+    for (out_col, &idx) in alias_idx.iter().enumerate() {
+        let v_row = vt.row(idx);
+        let mut col = alias_directions.column_mut(out_col);
+        for j in 0..p_joint {
+            col[j] = v_row[j];
+        }
+        let mut best_j = 0usize;
+        let mut best_w = 0.0_f64;
+        for j in 0..p_joint {
+            let w = v_row[j].abs();
+            if w > best_w {
+                best_w = w;
+                best_j = j;
+            }
+        }
+        let (block, local_col) = block_ranges
+            .iter()
+            .find_map(|(b, start, end)| {
+                (best_j >= *start && best_j < *end).then_some((*b, best_j - *start))
+            })
+            .ok_or_else(|| SurvivalMarginalSlopeError::NumericalFailure {
+                reason: format!(
+                    "joint preflight: alias column index {best_j} outside block ranges (p_joint={p_joint})",
+                ),
+            })?;
+        columns.push((block, local_col, best_w));
+    }
+
+    let block_summary = block_ranges
+        .iter()
+        .map(|(b, start, end)| format!("{b}=[{start}..{end})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let dominant_summary = columns
+        .iter()
+        .map(|(b, c, w)| format!("{b}[{c}] (|v|={w:.3e})"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let reason = format!(
+        "joint training-row design is W-metric rank-deficient: rank={rank}/{p_joint} \
+         (sigma_max={sigma_max:.3e}, rank_tol={rank_tol:.3e}, n={n}, structural_alias={structural_alias}, \
+         alias_directions={alias_count}). Block layout: {block_summary}. \
+         Dominant block x column per alias: {dominant_summary}. \
+         Per-block cross-block identifiability reparam already ran; the surviving alias \
+         must come from the anchor union {{time, marginal, logslope}} itself being \
+         rank-deficient (most often duplicated low-order polynomial null spaces across \
+         marginal and logslope smooths, or a parametric term in `marginalspec` that the \
+         time block already reproduces) - OR the per-block W-metric drop tolerance \
+         admitted a direction the joint SVD rejects. Resolve by removing the duplicated \
+         model term or by lowering the offending block's knot count; this is a model-spec \
+         error, not a numerical-tolerance lever to tune.",
+        alias_count = alias_idx.len(),
+    );
+    Err(SurvivalMarginalSlopeError::JointRankDeficient {
+        reason,
+        columns,
+        alias_directions,
+    })
+}
+
 pub fn fit_survival_marginal_slope_terms(
     data: ArrayView2<'_, f64>,
     spec: SurvivalMarginalSlopeTermSpec,

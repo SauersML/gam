@@ -864,6 +864,51 @@ pub struct AutoOuterSubsampleOptions {
     /// `0xA075_8AMP_LE_5UB5` (deterministic across runs at the same
     /// `n`, so CRN holds across BFGS iterations).
     pub seed: u64,
+    /// Family-supplied per-row outer-derivative work units. The auto
+    /// schedule caps `K` by `WORK_BUDGET / per_row_outer_cost_units`
+    /// so a single outer eval cannot exceed
+    /// [`AUTO_OUTER_WORK_BUDGET`] work units even when the noise-only
+    /// target would pick a larger `K`. Default `1` (i.e. no work cap
+    /// beyond `K ≤ n`); families with measurably expensive derivative
+    /// rows (e.g. survival marginal-slope) overwrite this to their
+    /// `predicted_gradient_work / n` snapshot.
+    pub per_row_outer_cost_units: u64,
+}
+
+/// Half-billion outer-derivative work units per evaluation. Picked so the
+/// rigid survival marginal-slope pilot Newton cycle (which previously ran
+/// ~57 min at n≈2e5 with `K=19_661`) finishes in a minute or two on
+/// commodity hardware once `K` is capped by this budget.
+pub const AUTO_OUTER_WORK_BUDGET: u64 = 500_000_000;
+
+/// Absolute floor on `K` chosen by the auto schedule. Even when the work
+/// budget would drive `K` to a handful of rows the stratified mask cannot
+/// usefully shrink below `MIN_K_FLOOR` without collapsing entire deciles
+/// of `z`-strata. Set so the resulting gradient noise (~3 %) is still
+/// usable for BFGS Phase 1 progress when the family is very expensive.
+pub const AUTO_OUTER_MIN_K_FLOOR: usize = 1_000;
+
+/// Reason the auto schedule chose the reported `K`. Used by the
+/// `[family auto-subsample]` log line so operators can tell whether the
+/// noise model, the work budget, the `MIN_K_FLOOR`, or `n` itself
+/// determined the subsample size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AutoOuterCapReason {
+    Noise,
+    Work,
+    Floor,
+    NFull,
+}
+
+impl AutoOuterCapReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AutoOuterCapReason::Noise => "noise",
+            AutoOuterCapReason::Work => "work",
+            AutoOuterCapReason::Floor => "floor",
+            AutoOuterCapReason::NFull => "n",
+        }
+    }
 }
 
 impl Default for AutoOuterSubsampleOptions {
@@ -873,26 +918,73 @@ impl Default for AutoOuterSubsampleOptions {
             min_k: 10_000,
             target_fraction: 0.10,
             seed: 0xA075_8A8B_1ED5_5B5C,
+            per_row_outer_cost_units: 1,
         }
     }
+}
+
+/// Outcome of [`AutoOuterSubsampleOptions::target_k_detailed`]: the
+/// chosen `K`, the underlying noise-only choice, the work-budget cap,
+/// and which constraint won.
+#[derive(Clone, Copy, Debug)]
+pub struct AutoOuterKChoice {
+    pub k: usize,
+    pub k_noise: usize,
+    pub k_work: usize,
+    pub cap_reason: AutoOuterCapReason,
 }
 
 impl AutoOuterSubsampleOptions {
     /// Compute the K that this configuration would pick for a given n.
     /// Returns `None` if `n < min_n_for_auto` (caller should not subsample).
     pub fn target_k(&self, n: usize) -> Option<usize> {
+        self.target_k_detailed(n).map(|choice| choice.k)
+    }
+
+    /// Same as [`target_k`] but also reports the noise-only `K`, the
+    /// work-budget cap, and which constraint set the final value. Used by
+    /// [`maybe_install_auto_outer_subsample`] to surface a `cap_reason`
+    /// in the auto-subsample log line.
+    pub fn target_k_detailed(&self, n: usize) -> Option<AutoOuterKChoice> {
         if n < self.min_n_for_auto {
             return None;
         }
-        let k_target = ((n as f64) * self.target_fraction).round() as usize;
-        let k = k_target.max(self.min_k).min(n);
-        if k >= n {
-            // Borderline: target_fraction × n already covers the dataset.
-            // No subsampling buys nothing here.
-            None
+        let k_noise_raw = ((n as f64) * self.target_fraction).round() as usize;
+        let k_noise = k_noise_raw.max(self.min_k);
+        // Work-budget cap. `per_row_outer_cost_units == 1` is the
+        // default-1-work-unit signal that the family has not measured a
+        // per-row cost, in which case the work cap is `WORK_BUDGET` and
+        // typically dominated by `n`.
+        let per_row = self.per_row_outer_cost_units.max(1);
+        let k_work_u64 = AUTO_OUTER_WORK_BUDGET / per_row;
+        let k_work = usize::try_from(k_work_u64).unwrap_or(usize::MAX);
+        // Combine noise + work + n + floor in a single comparison so we
+        // can attribute the binding constraint exactly once.
+        let mut k = k_noise.min(k_work);
+        let mut cap_reason = if k_work < k_noise {
+            AutoOuterCapReason::Work
         } else {
-            Some(k)
+            AutoOuterCapReason::Noise
+        };
+        if k < AUTO_OUTER_MIN_K_FLOOR {
+            k = AUTO_OUTER_MIN_K_FLOOR;
+            cap_reason = AutoOuterCapReason::Floor;
         }
+        if k > n {
+            k = n;
+            cap_reason = AutoOuterCapReason::NFull;
+        }
+        if k >= n {
+            // Borderline: the auto schedule would cover the whole
+            // dataset. Subsampling buys nothing.
+            return None;
+        }
+        Some(AutoOuterKChoice {
+            k,
+            k_noise,
+            k_work,
+            cap_reason,
+        })
     }
 }
 
@@ -962,6 +1054,7 @@ pub fn maybe_install_auto_outer_subsample(
     last_rho: &Arc<std::sync::Mutex<Option<Array1<f64>>>>,
     phase1_budget: usize,
     family_label: &'static str,
+    per_row_outer_cost_units: u64,
 ) -> Option<crate::custom_family::BlockwiseFitOptions> {
     if options.outer_score_subsample.is_some() || !options.auto_outer_subsample {
         return None;
