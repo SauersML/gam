@@ -19,13 +19,13 @@ term = { expr }
 
 expr = { sum }
 sum = { product ~ (add_op ~ product)* }
-add_op = _{ "+" | "-" }
+add_op = { "+" | "-" }
 product = { interact ~ (mul_op ~ interact)* }
-mul_op = _{ "*" | "/" }
+mul_op = { "*" | "/" }
 interact = { power ~ (interact_op ~ power)* }
-interact_op = _{ ":" }
+interact_op = { ":" }
 power = { unary ~ (pow_op ~ unary)* }
-pow_op = _{ "^" }
+pow_op = { "^" }
 unary = { unary_op* ~ primary }
 unary_op = _{ "+" | "-" }
 
@@ -264,6 +264,357 @@ fn extract_rhs_terms(rhs: Pair<'_, Rule>) -> Result<Vec<String>, String> {
     }
     out.push(tail.to_string());
     Ok(out)
+}
+
+/// Wilkinson-Rogers operator-family expansion.
+///
+/// A raw RHS term (already split on top-level `+`) may use the documented
+/// formula operators `:`, `*`, `/`, `^`, and parenthesization. This function
+/// expands the term into a normalized list of `WrAtomList`s, where each
+/// `WrAtomList` is one resulting model term — either a single atom (linear
+/// main effect / function-call term) or multiple atoms (interaction).
+///
+/// Wilkinson-Rogers semantics implemented here:
+/// * `a` produces `{a}` — one main effect.
+/// * `a:b` produces `{a:b}` — one interaction.
+/// * `a*b` produces `{a, b, a:b}` — crossing (expanded).
+/// * `a/b` produces `{a, a:b}` — nesting.
+/// * `(a + b + ... )^n` produces every non-empty subset of `{a, b, ...}` of
+///   size at most `n`, each subset being one interaction.
+/// * `+` unions two term sets; `-` is rejected.
+///
+/// Atoms inside the AST may be bare identifiers or function calls. Function
+/// calls are opaque — they pass through as-is and cannot participate in an
+/// `:` interaction with other atoms (smooths/factors require dedicated
+/// constructors like `te()`).
+type WrAtomList = Vec<String>;
+
+fn expand_wr_term(raw: &str) -> Result<Vec<WrAtomList>, String> {
+    let mut parsed = FormulaParser::parse(Rule::top_expr, raw).map_err(|e| {
+        FormulaDslError::ParseError {
+            reason: format!("invalid term syntax in `{raw}`: {e}"),
+        }
+        .to_string()
+    })?;
+    let top = parsed.next().ok_or_else(|| {
+        FormulaDslError::ParseError {
+            reason: format!("invalid term syntax in `{raw}`: empty parse"),
+        }
+        .to_string()
+    })?;
+    let expr = top
+        .into_inner()
+        .find(|p| p.as_rule() == Rule::expr)
+        .ok_or_else(|| {
+            FormulaDslError::ParseError {
+                reason: format!("invalid term syntax in `{raw}`: missing expr"),
+            }
+            .to_string()
+        })?;
+    let interactions = expand_expr(expr, raw)?;
+    let normalized: Vec<WrAtomList> = interactions
+        .into_iter()
+        .map(normalize_interaction)
+        .collect();
+    // Deduplicate while preserving order: a*b yields {a, b, a:b}; a*b + a
+    // would otherwise list `a` twice.
+    let mut seen = std::collections::BTreeSet::<Vec<String>>::new();
+    let mut out = Vec::<WrAtomList>::new();
+    for term in normalized {
+        let key = term.clone();
+        if seen.insert(key) {
+            out.push(term);
+        }
+    }
+    Ok(out)
+}
+
+fn normalize_interaction(mut atoms: WrAtomList) -> WrAtomList {
+    atoms.sort();
+    atoms.dedup();
+    atoms
+}
+
+fn expand_expr(pair: Pair<'_, Rule>, raw: &str) -> Result<Vec<WrAtomList>, String> {
+    match pair.as_rule() {
+        Rule::expr => {
+            let inner = pair.into_inner().next().ok_or_else(|| {
+                FormulaDslError::ParseError {
+                    reason: format!("invalid term syntax in `{raw}`: empty expr"),
+                }
+                .to_string()
+            })?;
+            expand_expr(inner, raw)
+        }
+        Rule::sum => {
+            let mut iter = pair.into_inner().peekable();
+            let first = iter.next().ok_or_else(|| {
+                FormulaDslError::ParseError {
+                    reason: format!("invalid term syntax in `{raw}`: empty sum"),
+                }
+                .to_string()
+            })?;
+            let mut acc = expand_expr(first, raw)?;
+            while let Some(op) = iter.next() {
+                // Inner sequence is (add_op product)*; pest emits add_op as
+                // silent (it's `_{ ... }`) so the next item is the operand.
+                // But we kept add_op as non-silent? Let's match defensively.
+                let operand = if matches!(op.as_rule(), Rule::product) {
+                    op
+                } else {
+                    iter.next().ok_or_else(|| {
+                        FormulaDslError::ParseError {
+                            reason: format!(
+                                "invalid term syntax in `{raw}`: dangling add operator"
+                            ),
+                        }
+                        .to_string()
+                    })?
+                };
+                let mut rhs = expand_expr(operand, raw)?;
+                acc.append(&mut rhs);
+            }
+            Ok(acc)
+        }
+        Rule::product => {
+            // product = { interact ~ (mul_op ~ interact)* }
+            // mul_op IS silent, but the operator tokens *are* still in the
+            // inner pairs as strings; we walk pairs and infer the op from
+            // the source text between operands.
+            let span_str = pair.as_str();
+            let inner: Vec<Pair<'_, Rule>> = pair.into_inner().collect();
+            let mut acc = expand_expr(inner[0].clone(), raw)?;
+            let mut cursor = 0usize;
+            for operand in inner.iter().skip(1) {
+                let operand_start = operand.as_span().start() - operand.as_span().get_input().len()
+                    + operand.as_span().get_input().len();
+                // Simpler: read the chunk of span_str between the end of
+                // the previous operand and the start of this one to find
+                // the operator character.
+                let prev_end = inner[cursor].as_span().end();
+                let next_start = operand.as_span().start();
+                let between = &operand.as_span().get_input()[prev_end..next_start];
+                let op_char = between
+                    .chars()
+                    .find(|c| *c == '*' || *c == '/')
+                    .ok_or_else(|| {
+                        FormulaDslError::ParseError {
+                            reason: format!(
+                                "invalid term syntax in `{raw}`: expected `*` or `/` between product operands"
+                            ),
+                        }
+                        .to_string()
+                    })?;
+                let rhs = expand_expr(operand.clone(), raw)?;
+                acc = match op_char {
+                    '*' => wr_cross(acc, rhs),
+                    '/' => wr_nest(acc, rhs),
+                    _ => unreachable!(),
+                };
+                cursor += 1;
+                // Silence unused
+                if false {
+                    let _ = (span_str, operand_start);
+                }
+            }
+            Ok(acc)
+        }
+        Rule::interact => {
+            // interact = { power ~ (interact_op ~ power)* }
+            let mut iter = pair.into_inner();
+            let first = iter.next().ok_or_else(|| {
+                FormulaDslError::ParseError {
+                    reason: format!("invalid term syntax in `{raw}`: empty interact"),
+                }
+                .to_string()
+            })?;
+            let mut acc = expand_expr(first, raw)?;
+            for operand in iter {
+                let rhs = expand_expr(operand, raw)?;
+                acc = wr_interact(acc, rhs, raw)?;
+            }
+            Ok(acc)
+        }
+        Rule::power => {
+            // power = { unary ~ (pow_op ~ unary)* }
+            let inner: Vec<Pair<'_, Rule>> = pair.into_inner().collect();
+            let base = expand_expr(inner[0].clone(), raw)?;
+            if inner.len() == 1 {
+                return Ok(base);
+            }
+            // pow_op is silent, so subsequent pairs are exponent operands
+            // (unary -> primary -> number).
+            let exponent_pair = inner[1].clone();
+            let exp_text = exponent_pair.as_str().trim();
+            let n: usize = exp_text.parse().map_err(|_| {
+                FormulaDslError::ParseError {
+                    reason: format!(
+                        "invalid term syntax in `{raw}`: `^` exponent must be a positive integer, got `{exp_text}`"
+                    ),
+                }
+                .to_string()
+            })?;
+            if n == 0 {
+                return Err(FormulaDslError::ParseError {
+                    reason: format!(
+                        "invalid term syntax in `{raw}`: `^0` is not a meaningful formula expansion"
+                    ),
+                }
+                .into());
+            }
+            Ok(wr_power(base, n))
+        }
+        Rule::unary => {
+            for inner in pair.into_inner() {
+                if inner.as_rule() == Rule::primary {
+                    return expand_expr(inner, raw);
+                }
+            }
+            Err(FormulaDslError::ParseError {
+                reason: format!("invalid term syntax in `{raw}`: empty unary"),
+            }
+            .into())
+        }
+        Rule::primary => {
+            let span = pair.as_str().trim().to_string();
+            let inner = pair.into_inner().next();
+            match inner {
+                Some(child) if child.as_rule() == Rule::expr => expand_expr(child, raw),
+                Some(child) if child.as_rule() == Rule::function_call => {
+                    Ok(vec![vec![child.as_str().trim().to_string()]])
+                }
+                Some(child) if child.as_rule() == Rule::ident => {
+                    Ok(vec![vec![child.as_str().trim().to_string()]])
+                }
+                Some(child) if child.as_rule() == Rule::number => {
+                    // Allow numeric literals as atoms (they act as the
+                    // exponent in `^n` and are otherwise rejected by
+                    // parse_term).
+                    Ok(vec![vec![child.as_str().trim().to_string()]])
+                }
+                Some(child) => Ok(vec![vec![child.as_str().trim().to_string()]]),
+                None => Ok(vec![vec![span]]),
+            }
+        }
+        _ => Err(FormulaDslError::ParseError {
+            reason: format!(
+                "invalid term syntax in `{raw}`: unexpected node `{:?}`",
+                pair.as_rule()
+            ),
+        }
+        .into()),
+    }
+}
+
+fn wr_cross(left: Vec<WrAtomList>, right: Vec<WrAtomList>) -> Vec<WrAtomList> {
+    // a*b = a + b + a:b
+    let mut out = Vec::with_capacity(left.len() + right.len() + left.len() * right.len());
+    out.extend(left.iter().cloned());
+    out.extend(right.iter().cloned());
+    for l in &left {
+        for r in &right {
+            let mut merged: WrAtomList = l.iter().cloned().chain(r.iter().cloned()).collect();
+            merged.sort();
+            merged.dedup();
+            out.push(merged);
+        }
+    }
+    out
+}
+
+fn wr_nest(left: Vec<WrAtomList>, right: Vec<WrAtomList>) -> Vec<WrAtomList> {
+    // a/b = a + a:b
+    let mut out = Vec::with_capacity(left.len() + left.len() * right.len());
+    out.extend(left.iter().cloned());
+    for l in &left {
+        for r in &right {
+            let mut merged: WrAtomList = l.iter().cloned().chain(r.iter().cloned()).collect();
+            merged.sort();
+            merged.dedup();
+            out.push(merged);
+        }
+    }
+    out
+}
+
+fn wr_interact(
+    left: Vec<WrAtomList>,
+    right: Vec<WrAtomList>,
+    raw: &str,
+) -> Result<Vec<WrAtomList>, String> {
+    // a:b — Cartesian merge of every (l, r) pair.
+    let mut out = Vec::with_capacity(left.len() * right.len());
+    for l in &left {
+        for r in &right {
+            let combined: WrAtomList = l.iter().cloned().chain(r.iter().cloned()).collect();
+            // Reject interactions whose atoms contain function-call syntax.
+            // These would build design columns that are not simple products
+            // (factors, smooths) and need a dedicated constructor.
+            for atom in &combined {
+                if atom.contains('(') {
+                    return Err(FormulaDslError::IncompatibleTerm {
+                        reason: format!(
+                            "interaction operator `:` with function-call atom is not supported in `{raw}`. \
+                             Use te(...) for smooth interactions or group()/factor() with a separate \
+                             interaction strategy for categorical effects."
+                        ),
+                    }
+                    .into());
+                }
+            }
+            let mut merged = combined;
+            merged.sort();
+            merged.dedup();
+            out.push(merged);
+        }
+    }
+    Ok(out)
+}
+
+fn wr_power(base: Vec<WrAtomList>, n: usize) -> Vec<WrAtomList> {
+    // (e)^n produces every non-empty subset of `base` of size ≤ n,
+    // each subset being one interaction. The standard WR semantics
+    // treat the base as a *set* of atoms — interactions inside `base`
+    // are kept as-is and not re-crossed.
+    if base.is_empty() {
+        return Vec::new();
+    }
+    let m = base.len();
+    let mut out = Vec::<WrAtomList>::new();
+    let max_size = n.min(m);
+    for size in 1..=max_size {
+        // Enumerate combinations of `size` elements out of m.
+        let mut indices: Vec<usize> = (0..size).collect();
+        loop {
+            let mut merged = WrAtomList::new();
+            for &i in &indices {
+                merged.extend(base[i].iter().cloned());
+            }
+            merged.sort();
+            merged.dedup();
+            out.push(merged);
+            // Next combination
+            let mut k = size;
+            while k > 0 {
+                k -= 1;
+                if indices[k] != k + m - size {
+                    indices[k] += 1;
+                    for j in (k + 1)..size {
+                        indices[j] = indices[j - 1] + 1;
+                    }
+                    break;
+                }
+                if k == 0 {
+                    k = usize::MAX;
+                    break;
+                }
+            }
+            if k == usize::MAX {
+                break;
+            }
+        }
+    }
+    out
 }
 
 fn is_exact_ident(raw: &str) -> bool {

@@ -1,4 +1,3 @@
-use self::cache::AtomicFlagGuard;
 use self::inner_strategy::GeometryBackendKind;
 use super::*;
 use crate::linalg::sparse_exact::{

@@ -82,8 +82,10 @@ use gam::terms::basis::{
     build_spherical_spline_basis, build_thin_plate_penalty_matrix, create_basis,
     create_cyclic_difference_penalty_matrix, create_difference_penalty_matrix,
     duchon_polynomial_first_derivative_nd,
-    duchon_radial_first_derivative_nd, evaluate_bspline_basis_scalar,
-    matern_radial_first_derivative_nd, periodic_bspline_first_derivative_nd, resolve_duchon_orders,
+    duchon_radial_first_derivative_nd, duchon_radial_second_derivative_nd,
+    evaluate_bspline_basis_scalar,
+    matern_radial_first_derivative_nd, matern_radial_second_derivative_nd,
+    periodic_bspline_first_derivative_nd, resolve_duchon_orders,
     select_spherical_farthest_point_centers, sphere_first_derivative_nd,
 };
 use gam::terms::input_loc_derivatives::contract_input_loc_gradient;
@@ -15835,6 +15837,57 @@ fn matern_input_location_first_derivative<'py>(
     Ok(out.into_pyarray(py).unbind())
 }
 
+/// `φ''(r_{n,k})` for the Matérn kernel at every `(row, center)` pair.
+/// Companion to `matern_input_location_first_derivative`; combine with
+/// `φ'(r)` and the axis ratios `u = (t − c)/r` at the call site to assemble
+/// the input-location Hessian.
+#[pyfunction(signature = (t, centers, length_scale, nu = "3/2"))]
+fn matern_input_location_second_derivative<'py>(
+    py: Python<'py>,
+    t: PyReadonlyArray2<'py, f64>,
+    centers: PyReadonlyArray2<'py, f64>,
+    length_scale: f64,
+    nu: &str,
+) -> PyResult<Py<PyArray2<f64>>> {
+    let nu_parsed = parse_matern_nu_py("matern_input_location_second_derivative", nu)?;
+    let out = matern_radial_second_derivative_nd(
+        t.as_array(),
+        centers.as_array(),
+        length_scale,
+        nu_parsed,
+    )
+    .map_err(|err| py_value_error(err.to_string()))?;
+    Ok(out.into_pyarray(py).unbind())
+}
+
+/// `φ''(r_{n,k})` for the Duchon kernel at every `(row, center)` pair.
+/// Companion to `duchon_input_location_first_derivative`; combine with
+/// `φ'(r)` and the axis ratios `u = (t − c)/r` at the call site to assemble
+/// the input-location Hessian.
+#[pyfunction(signature = (t, centers, length_scale = None, m = 2))]
+fn duchon_input_location_second_derivative<'py>(
+    py: Python<'py>,
+    t: PyReadonlyArray2<'py, f64>,
+    centers: PyReadonlyArray2<'py, f64>,
+    length_scale: Option<f64>,
+    m: usize,
+) -> PyResult<Py<PyArray2<f64>>> {
+    if m == 0 {
+        return Err(py_value_error(
+            "duchon_input_location_second_derivative: m must be >= 1".to_string(),
+        ));
+    }
+    let nullspace_order = duchon_nullspace_from_m(m);
+    let out = duchon_radial_second_derivative_nd(
+        t.as_array(),
+        centers.as_array(),
+        length_scale,
+        nullspace_order,
+    )
+    .map_err(|err| py_value_error(err.to_string()))?;
+    Ok(out.into_pyarray(py).unbind())
+}
+
 /// Streaming closed-form `dK/dtheta` for Matérn basis values.
 ///
 /// `target="log_kappa"` returns the global scale derivative. `target="aniso"`
@@ -20810,6 +20863,14 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(
         matern_input_location_first_derivative,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        matern_input_location_second_derivative,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        duchon_input_location_second_derivative,
         module
     )?)?;
     module.add_function(wrap_pyfunction!(matern_basis_gradient_streaming, module)?)?;

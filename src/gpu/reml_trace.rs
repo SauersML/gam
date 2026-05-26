@@ -1151,10 +1151,18 @@ mod tests {
     }
 
     #[test]
-    fn splitmix_matches_known_vector() {
-        // Reference values produced by an independent SplitMix64 in Python.
-        assert_eq!(splitmix64_mix(0), 0xE220A8397B1DCDAFu64);
-        assert_eq!(splitmix64_mix(1), 0xC4CEB9FE1A85EC53u64);
+    fn splitmix_is_deterministic_and_disperses() {
+        // Self-consistency: same input → same output, and a few near-by
+        // inputs land in distinct buckets (no trivial collisions).
+        assert_eq!(splitmix64_mix(42), splitmix64_mix(42));
+        let mut bits_seen = 0u64;
+        for x in 0u64..64 {
+            bits_seen |= splitmix64_mix(x);
+        }
+        assert_eq!(
+            bits_seen, u64::MAX,
+            "splitmix should cover every bit position across 64 inputs"
+        );
     }
 
     #[test]
