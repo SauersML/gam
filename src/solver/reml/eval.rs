@@ -562,32 +562,14 @@ impl<'a> RemlState<'a> {
             ));
         }
 
-        // Evaluate sigma points in parallel via the stateless cubature PIRLS
-        // entry. Unlike `execute_pirls_if_needed`, that callee performs no
-        // PIRLS-cache lookup/insert, no warm-start read/write, no LM-lambda
-        // hint read/write, no adaptive-cap or IFT-quality feedback writes —
-        // so multiple sigma fits run concurrently without serializing on the
-        // shared PIRLS-cache lock and without contaminating the production
-        // outer trajectory's warm-start / LM / IFT state. This replaces the
-        // previous `AtomicFlagGuard`-based opt-out: process-wide atomic
-        // flips were a leaky proxy that still let writes through (e.g. the
-        // adaptive-cap feedback and last_pirls_lm_lambda paths) and serialized
-        // unrelated REML evaluations racing the cubature window.
-        let point_results: Vec<Option<(Array2<f64>, Array1<f64>)>> = (0..sigma_points.len())
-            .into_par_iter()
-            .map(|idx| {
-                let fit_point = self
-                    .execute_pirls_stateless_for_cubature(&sigma_points[idx])
-                    .ok()?;
-                let h_point = map_hessian_to_original_basis(fit_point.as_ref()).ok()?;
-                let cov_point = matrix_inversewith_regularization(&h_point, "auto cubature point")?;
-                let beta_point = fit_point
-                    .reparam_result
-                    .qs
-                    .dot(fit_point.beta_transformed.as_ref());
-                Some((cov_point, beta_point))
-            })
-            .collect();
+        // Dispatch the sigma-point evaluation to whichever executor is
+        // currently the best fit for this build/runtime. See
+        // [`sigma_cubature_dispatch`] for the auto-selection rule and
+        // for the documented one-line swap site that flips to the GPU
+        // stream-pool path once `pirls-row-v3` Stage 3 and `bms-flex-v3`
+        // Phase 5 land the device-resident inner PIRLS the GPU
+        // executor needs.
+        let point_results = sigma_cubature_dispatch(self, &sigma_points);
 
         if point_results.iter().any(|r| r.is_none()) {
             return self.finalize_smoothing_outcome(first_order_numerical(

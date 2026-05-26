@@ -19,7 +19,7 @@ use std::sync::Arc;
 use ndarray::{Array1, Array2, Array3, Axis, s};
 
 use crate::linalg::faer_ndarray::{
-    FaerEigh, FaerSvd, default_rrqr_rank_alpha, fast_ab, fast_atb, rrqr_with_permutation,
+    FaerEigh, default_rrqr_rank_alpha, fast_ab, fast_atb, rrqr_with_permutation,
 };
 use faer::Side;
 
