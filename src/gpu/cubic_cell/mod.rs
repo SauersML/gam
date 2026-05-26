@@ -204,6 +204,7 @@ impl CubicCellMomentWorkspace {
 ///   CPU evaluator — no silent device claim.
 ///
 /// Returns `Ok(None)` only when the workload is empty.
+///
 pub(crate) fn try_build_cubic_cell_derivative_moments(
     input: CubicCellDerivativeMomentHostView<'_>,
     workspace: Option<&mut CubicCellMomentWorkspace>,
