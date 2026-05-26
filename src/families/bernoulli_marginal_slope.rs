@@ -8322,6 +8322,36 @@ impl BernoulliMarginalSlopeFamily {
             workspace_pinned,
         );
         let gpu_decision = crate::gpu::bms_flex::require_row_primary_hessian_supported(n, r)?;
+        // Milestone 2 (#210): when the policy says GPU, eagerly probe the
+        // backend so any NVRTC compile / context init failure surfaces in
+        // the cache-decision log instead of at first dispatch. Probe
+        // returning `NotYetImplemented` is the expected pre-milestone-3
+        // outcome and means dispatch falls through to CPU rows below —
+        // the same path as today.
+        if gpu_decision.use_gpu {
+            match crate::gpu::bms_flex::BmsFlexGpuBackend::probe() {
+                Ok(backend) => {
+                    if log_exact_work(n) {
+                        log::info!(
+                            "[BMS row-primary-hessian-cache] gpu_backend_ready: {}",
+                            backend.describe()
+                        );
+                    }
+                }
+                Err(crate::gpu::error::GpuError::NotYetImplemented { reason }) => {
+                    log::info!(
+                        "[BMS row-primary-hessian-cache] gpu_backend_pending: {reason}; \
+                         falling back to CPU rows"
+                    );
+                }
+                Err(err) => {
+                    log::info!(
+                        "[BMS row-primary-hessian-cache] gpu_backend_probe_failed: {err}; \
+                         falling back to CPU rows"
+                    );
+                }
+            }
+        }
         if !plan.materialize {
             if log_exact_work(n) {
                 log::info!(

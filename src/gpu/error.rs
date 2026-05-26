@@ -28,6 +28,14 @@ pub enum GpuError {
     /// Runtime throughput calibration produced an unusable measurement
     /// (non-positive elapsed time, non-finite GB/s or GFLOPS).
     CalibrationFailed { reason: String },
+    /// The requested GPU code path is recognized but not yet implemented.
+    /// Used by milestone-by-milestone kernel rollouts: callers treat this
+    /// as a sentinel to fall back to the CPU path silently (no panic, no
+    /// error log, just an info line). Distinct from `DriverCallFailed` so
+    /// the dispatcher can tell "kernel not landed yet" apart from "device
+    /// said no". Carries a short reason for diagnostics, e.g. the kernel
+    /// name and the awaited milestone.
+    NotYetImplemented { reason: String },
 }
 
 impl std::fmt::Display for GpuError {
@@ -36,7 +44,8 @@ impl std::fmt::Display for GpuError {
             GpuError::DriverLibraryUnavailable { reason }
             | GpuError::DriverSymbolMissing { reason }
             | GpuError::DriverCallFailed { reason }
-            | GpuError::CalibrationFailed { reason } => f.write_str(reason),
+            | GpuError::CalibrationFailed { reason }
+            | GpuError::NotYetImplemented { reason } => f.write_str(reason),
         }
     }
 }
