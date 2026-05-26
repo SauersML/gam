@@ -4051,6 +4051,12 @@ impl SurvivalMarginalSlopeFamily {
     /// compare objectives evaluated on different row measures (invalid).
     /// Inner-scope contexts (set by `coefficient_line_search_options`) make
     /// this entry return `None` immediately.
+    ///
+    /// CONTRACT: MUST NOT be called from inner-coefficient paths (line-search,
+    /// trust-region globalization). The InnerCoefficient scope guard below is
+    /// the enforcement mechanism; this comment makes the contract obvious.
+    /// Cf. `src/solver/row_measure.rs` and the TR row-measure invariant in
+    /// `inner_blockwise_fit`.
     fn install_auto_outer_subsample_options(
         &self,
         options: &BlockwiseFitOptions,
@@ -21237,7 +21243,7 @@ mod tests {
             .evaluate_exact_newton_joint_dynamic_q_dense(&block_states)
             .expect("dense joint Hessian");
         let (operator, _) = family
-            .exact_newton_joint_hessian_operator(&block_states)
+            .exact_newton_joint_hessian_operator(&block_states, &BlockwiseFitOptions::default())
             .expect("joint Hessian operator");
         let op_dense = operator.to_dense();
 

@@ -8129,6 +8129,38 @@ mod tests {
     }
 
     #[test]
+    fn block_orthogonality_hessian_diag_matches_finite_difference() {
+        let t = block_ortho_test_target();
+        let n = t.len();
+        let target = PsiSlice::full(n, Some(4));
+        let pen = BlockOrthogonalityPenalty::new(
+            target,
+            vec![vec![0_usize, 1], vec![2, 3]],
+            0.9,
+            4,
+            false,
+        )
+        .expect("valid block orthogonality penalty");
+        let rho = array![0.0_f64];
+        let diag = pen
+            .hessian_diag(t.view(), rho.view())
+            .expect("hessian_diag must be available");
+        assert_eq!(diag.len(), n);
+        let eps = 1e-5;
+        for i in 0..n {
+            let mut tp = t.clone();
+            let mut tm = t.clone();
+            tp[i] += eps;
+            tm[i] -= eps;
+            let gp = pen.grad_target(tp.view(), rho.view())[i];
+            let gm = pen.grad_target(tm.view(), rho.view())[i];
+            let fd = (gp - gm) / (2.0 * eps);
+            assert_abs_diff_eq!(diag[i], fd, epsilon = 1e-5);
+            assert!(diag[i] >= 0.0, "hessian_diag entry must be PSD; got {}", diag[i]);
+        }
+    }
+
+    #[test]
     fn block_orthogonality_rejects_groups_missing_an_axis() {
         // latent_dim derived as len/n_eff = 16/4 = 4; groups cover only axes
         // 0,1,2 → axis 3 is missing.
