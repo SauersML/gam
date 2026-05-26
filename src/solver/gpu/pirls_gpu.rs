@@ -105,8 +105,8 @@ pub struct SigmaPirlsGpuWorkspace {
 #[cfg(target_os = "linux")]
 mod cuda {
     use super::{
-        PirlsGpuInput, PirlsGpuSharedData, PirlsGpuStep, PirlsStepStreamInput,
-        SigmaPirlsGpuWorkspace,
+        PirlsGpuInput, PirlsGpuSharedData, PirlsGpuStep, PirlsStepStreamDeviceInput,
+        PirlsStepStreamInput, SigmaPirlsGpuWorkspace,
     };
     use crate::gpu::common::PtxModuleCache;
     use crate::gpu::driver::{from_col_major, to_col_major};
@@ -114,7 +114,7 @@ mod cuda {
     use cudarc::cublas::sys::{
         cublasDdgmm, cublasDgeam, cublasOperation_t, cublasSideMode_t, cublasStatus_t,
     };
-    use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
+    use cudarc::cublas::{CudaBlas, Gemm, GemmConfig, Gemv, GemvConfig};
     use cudarc::cusolver::DnHandle;
     use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut, LaunchConfig, PushKernelArg};
     use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
@@ -349,6 +349,155 @@ extern "C" __global__ void chol_logdet_col_major(
             .stream
             .clone_dtoh(&ws.rhs_dev)
             .map_err(|e| format!("download direction: {e}"))?;
+        let mut direction = Array1::from_vec(direction_raw);
+        direction.mapv_inplace(|v| -v);
+
+        Ok(PirlsGpuStep {
+            penalized_hessian,
+            direction,
+            logdet,
+        })
+    }
+
+    /// Stage 3.2 device-input PIRLS Newton step.
+    ///
+    /// Identical math to [`solve_step_on_stream`] but reads `w_solver`
+    /// and `grad_eta` straight from device buffers populated by the
+    /// device-side row-reweight kernel (no host upload of weights or
+    /// gradient). Only the penalty matrix still crosses the host
+    /// boundary because the outer REML loop updates Sλ + LM ridge
+    /// between PIRLS steps; the penalty is p×p which is independent of
+    /// n, so for biobank-scale n it is a negligible transfer.
+    ///
+    /// Outputs match `solve_step_on_stream`: returns the assembled
+    /// penalised Hessian, the Newton direction `−H⁻¹·g`, and the
+    /// log-determinant computed via the device-side
+    /// `chol_logdet_col_major` kernel.
+    pub(super) fn solve_step_on_stream_device(
+        shared: &PirlsGpuSharedData,
+        ws: &mut SigmaPirlsGpuWorkspace,
+        input: PirlsStepStreamDeviceInput<'_, '_>,
+    ) -> Result<PirlsGpuStep, String> {
+        let n = shared.n;
+        let p = shared.p;
+        if ws.n != n || ws.p != p {
+            return Err(format!(
+                "workspace shape ({}, {}) does not match shared design ({n}, {p})",
+                ws.n, ws.p
+            ));
+        }
+        if input.w_solver_dev.len() != n {
+            return Err(format!(
+                "w_solver_dev length {} does not match n={n}",
+                input.w_solver_dev.len()
+            ));
+        }
+        if input.grad_eta_dev.len() != n {
+            return Err(format!(
+                "grad_eta_dev length {} does not match n={n}",
+                input.grad_eta_dev.len()
+            ));
+        }
+        if input.penalty_hessian.dim() != (p, p) {
+            return Err(format!(
+                "penalty Hessian shape {:?} does not match p={p}",
+                input.penalty_hessian.dim()
+            ));
+        }
+
+        // Form WX = diag(w_solver_dev) · X into ws.wx_dev. We borrow
+        // the caller's device buffer through `left_scale_rows`'s
+        // device_ptr API; no upload.
+        left_scale_rows_borrowed(
+            &ws.blas,
+            &ws.stream,
+            n,
+            p,
+            &shared.x_dev,
+            input.w_solver_dev,
+            &mut ws.wx_dev,
+        )?;
+
+        // XtWX = Xᵀ · WX → ws.xtwx_dev.
+        let n_i = to_i32(n)?;
+        let p_i = to_i32(p)?;
+        let gemm_cfg = GemmConfig::<f64> {
+            transa: cublasOperation_t::CUBLAS_OP_T,
+            transb: cublasOperation_t::CUBLAS_OP_N,
+            m: p_i,
+            n: p_i,
+            k: n_i,
+            alpha: 1.0,
+            lda: n_i,
+            ldb: n_i,
+            beta: 0.0,
+            ldc: p_i,
+        };
+        // SAFETY: validated i32 dims; shared.x_dev and ws.wx_dev are n*p
+        // f64 col-major buffers; ws.xtwx_dev is p*p; bound to ws.stream.
+        unsafe {
+            ws.blas
+                .gemm(gemm_cfg, &shared.x_dev, &ws.wx_dev, &mut ws.xtwx_dev)
+        }
+        .map_err(|e| format!("cublas dgemm XtWX (device-input): {e}"))?;
+
+        // Upload penalty + ridge (p×p, small).
+        let penalty = penalty_with_ridge(input.penalty_hessian, input.lm_ridge);
+        let penalty_view = penalty.view();
+        let penalty_col = to_col_major(&penalty_view);
+        ws.stream
+            .memcpy_htod(penalty_col.as_ref(), &mut ws.penalty_dev)
+            .map_err(|e| format!("upload penalty (device-input): {e}"))?;
+
+        // H = XtWX + (S + λI).
+        geam_add(
+            &ws.blas,
+            &ws.stream,
+            p,
+            &ws.xtwx_dev,
+            &ws.penalty_dev,
+            &mut ws.h_dev,
+        )?;
+
+        // RHS = Xᵀ · grad_eta_dev → ws.rhs_dev (length p). No host upload.
+        let gemv_cfg = GemvConfig::<f64> {
+            trans: cublasOperation_t::CUBLAS_OP_T,
+            m: n_i,
+            n: p_i,
+            alpha: 1.0,
+            lda: n_i,
+            incx: 1,
+            beta: 0.0,
+            incy: 1,
+        };
+        // SAFETY: shared.x_dev is n*p col-major; input.grad_eta_dev is
+        // length n; ws.rhs_dev is length p; cuBLAS contract satisfied.
+        unsafe {
+            ws.blas
+                .gemv(gemv_cfg, &shared.x_dev, input.grad_eta_dev, &mut ws.rhs_dev)
+        }
+        .map_err(|e| format!("cublas dgemv Xtg (device-input): {e}"))?;
+
+        // Snapshot the assembled penalised Hessian for the caller before
+        // potrf overwrites it with the Cholesky factor — caller contract
+        // matches host-input path. Single d→h copy at the step boundary,
+        // not per-iter.
+        let h_total_col = ws
+            .stream
+            .clone_dtoh(&ws.h_dev)
+            .map_err(|e| format!("download penalised Hessian (device-input): {e}"))?;
+        let penalized_hessian =
+            from_col_major(&h_total_col, p, p).ok_or("H layout conversion failed")?;
+
+        potrf_in_place(&ws.solver, &ws.stream, p, &mut ws.h_dev)?;
+        potrs_in_place(&ws.solver, &ws.stream, p, 1, &ws.h_dev, &mut ws.rhs_dev)?;
+
+        let logdet = cholesky_logdet_device(&ws.stream, &shared.ctx, p, &ws.h_dev)?;
+
+        let direction_raw = ws
+            .stream
+            .clone_dtoh(&ws.rhs_dev)
+            .map_err(|e| format!("download direction (device-input): {e}"))?;
         let mut direction = Array1::from_vec(direction_raw);
         direction.mapv_inplace(|v| -v);
 
