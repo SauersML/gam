@@ -1124,34 +1124,66 @@ mod pirls_row_gpu_tests {
         assert_close("self", 0.0, 0.0, 0.0);
     }
 
+    /// Count how many rows actually carried a positive Fisher weight; tests
+    /// assert non-zero so a silently no-op evaluator (e.g. all-NaN output)
+    /// can't satisfy the per-row invariants vacuously.
+    fn count_active_rows(family: PirlsRowFamily) -> usize {
+        let mut active = 0usize;
+        for &eta in [-700.0, -3.0, 0.0, 3.0, 700.0].iter() {
+            for &y in [0.0, 0.5, 1.0].iter() {
+                for &wp in [1.0, 2.5].iter() {
+                    let out = row_reweight_cpu(
+                        family,
+                        CurvatureMode::Fisher,
+                        RowInput {
+                            eta,
+                            y,
+                            prior_weight: wp,
+                        },
+                    );
+                    if out.w_fisher > 0.0 {
+                        active += 1;
+                    }
+                }
+            }
+        }
+        active
+    }
+
     #[test]
     fn gaussian_identity_row_invariants() {
         check_family_matches_cpu_reference(PirlsRowFamily::GaussianIdentity);
+        assert!(count_active_rows(PirlsRowFamily::GaussianIdentity) > 0);
     }
 
     #[test]
     fn poisson_log_row_invariants() {
         check_family_matches_cpu_reference(PirlsRowFamily::PoissonLog);
+        assert!(count_active_rows(PirlsRowFamily::PoissonLog) > 0);
     }
 
     #[test]
     fn gamma_log_row_invariants() {
         check_family_matches_cpu_reference(PirlsRowFamily::GammaLog);
+        assert!(count_active_rows(PirlsRowFamily::GammaLog) > 0);
     }
 
     #[test]
     fn bernoulli_logit_row_invariants() {
         check_family_matches_cpu_reference(PirlsRowFamily::BernoulliLogit);
+        assert!(count_active_rows(PirlsRowFamily::BernoulliLogit) > 0);
     }
 
     #[test]
     fn bernoulli_probit_row_invariants() {
         check_family_matches_cpu_reference(PirlsRowFamily::BernoulliProbit);
+        assert!(count_active_rows(PirlsRowFamily::BernoulliProbit) > 0);
     }
 
     #[test]
     fn bernoulli_cloglog_row_invariants() {
         check_family_matches_cpu_reference(PirlsRowFamily::BernoulliCLogLog);
+        assert!(count_active_rows(PirlsRowFamily::BernoulliCLogLog) > 0);
     }
 
     /// Gaussian identity must match the trivial CPU formula for any input.
@@ -1233,6 +1265,10 @@ mod pirls_row_gpu_tests {
     /// Skipped on hosts without a CUDA runtime (mac, CI).
     #[test]
     fn backend_compiles_one_module_per_family_when_device_present() {
+        // The compiled-backend flag itself is independent of runtime probe
+        // and must agree with the `cfg(target_os = "linux")` selector that
+        // gates the rest of the module-cache code path.
+        assert_eq!(PirlsRowBackend::compiled(), cfg!(target_os = "linux"));
         if super::super::runtime::GpuRuntime::global().is_none() {
             eprintln!("[pirls_row_gpu test] no CUDA runtime — skipping device compile test");
             return;
