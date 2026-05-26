@@ -703,9 +703,21 @@ extern "C" __global__ void reduce_q_weighted_gram(
                     reason: format!("reml_trace alloc RW: {err}"),
                 })?;
             // R_Z = X Z   (n × p) · (p × K) -> (n × K)
-            gemm_nn(&blas, n, k, p, &x_dev, &z_dev, &mut rz_dev, n, p, n)?;
+            gemm_nn(
+                &blas,
+                GemmShape { m: n, n: k, k_inner: p, lda: n, ldb: p, ldc: n },
+                &x_dev,
+                &z_dev,
+                &mut rz_dev,
+            )?;
             // R_W = X W
-            gemm_nn(&blas, n, k, p, &x_dev, &w_dev, &mut rw_dev, n, p, n)?;
+            gemm_nn(
+                &blas,
+                GemmShape { m: n, n: k, k_inner: p, lda: n, ldb: p, ldc: n },
+                &x_dev,
+                &w_dev,
+                &mut rw_dev,
+            )?;
 
             // Stack the row-weight vectors into A_stack column-major (n × D_gram).
             let d_gram = gram_indices.len();
