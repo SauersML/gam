@@ -77,4 +77,14 @@ def map_exception(exc: BaseException) -> BaseException:
         return SchemaMismatchError(message)
     if kind == "prediction":
         return PredictionError(message)
+    # No gam-specific classification matched. The Rust extension raises typed
+    # Python exceptions (PyValueError for caller-input domain errors,
+    # PyTypeError for shape/dtype mismatches, etc.), and downgrading those to
+    # GamError would lose the Python-native contract that callers rely on —
+    # e.g. response-geometry domain errors (antipodal sphere log, non-positive
+    # simplex mass, mismatched base-point dimensions) must surface as
+    # ValueError. Preserve the original typed exception; wrap only the truly
+    # untyped fall-through case as GamError.
+    if isinstance(exc, (ValueError, TypeError, LookupError, ArithmeticError)):
+        return exc
     return GamError(message)
