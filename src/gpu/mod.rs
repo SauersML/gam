@@ -23,6 +23,7 @@ pub mod reml_trace;
 pub mod runtime;
 pub mod solver;
 pub mod sphere;
+pub mod survival_flex;
 
 pub use cpu_traits::{ExecutionTarget, MatrixLocation};
 pub use device::GpuDeviceInfo;
