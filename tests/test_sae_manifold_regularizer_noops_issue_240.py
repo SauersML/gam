@@ -31,9 +31,11 @@ def _baseline(**overrides):
     ``block_orthogonality_weight`` to find a non-trivial 2-group partition,
     and for ``mechanism_sparsity_groups=[[0],[1]]`` to address real features.
     """
+    # `sphere` keeps `latent_dim == 2` (periodic atoms force it to 1
+    # regardless of `atom_dim`). Block-orthogonality requires ≥2 axes.
     kwargs = dict(
         n_atoms=1,
-        atom_basis="periodic",
+        atom_basis="sphere",
         atom_dim=2,
         assignment="softmax",
         max_iter=5,
