@@ -188,7 +188,90 @@ class _IsometryPenaltyFn(torch.autograd.Function):
         )
 
 
-class IsometryPenalty(nn.Module):
+@dataclass(slots=True)
+class _PenaltyCall:
+    """Materialized arguments for one Rust analytic-penalty evaluation.
+
+    Subclasses of :class:`_RustPenaltyModule` build this from their parameters;
+    the base class then routes it through either the autograd ``Function`` (for
+    ``forward``) or the closed-form helper (for ``rust_value``).
+    """
+
+    target: torch.Tensor
+    rho: torch.Tensor
+    latents_json: str
+    penalties_json: str
+    isometry_basis: torch.Tensor | None = None
+    isometry_jacobian_second: torch.Tensor | None = None
+
+
+class _RustPenaltyModule(nn.Module):
+    """Base class for penalty modules backed by Rust's analytic penalty registry.
+
+    Subclasses implement :meth:`_prepare`. The base class provides:
+
+    * ``forward(primary, basis=None)`` — routes through ``_RustPenaltyFn`` or,
+      when the prep returns an isometry basis, through ``_IsometryPenaltyFn``.
+    * ``rust_value(primary, **kwargs)`` — graph-free numpy entry point that
+      calls the same ``_call_rust_value_grad`` helper ``forward`` uses, so the
+      two paths cannot drift.
+    """
+
+    def _prepare(
+        self, primary: torch.Tensor, basis: torch.Tensor | None = None
+    ) -> _PenaltyCall:
+        raise NotImplementedError
+
+    def forward(
+        self, primary: torch.Tensor, basis: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        call = self._prepare(primary, basis=basis)
+        if call.isometry_basis is not None:
+            apply = cast(Callable[..., torch.Tensor], _IsometryPenaltyFn.apply)
+            return apply(
+                call.target,
+                call.rho,
+                call.isometry_basis,
+                call.isometry_jacobian_second,
+                call.latents_json,
+                call.penalties_json,
+            )
+        apply = cast(Callable[..., torch.Tensor], _RustPenaltyFn.apply)
+        return apply(call.target, call.rho, call.latents_json, call.penalties_json)
+
+    def rust_value(
+        self,
+        primary: np.ndarray | torch.Tensor,
+        basis: np.ndarray | torch.Tensor | None = None,
+    ) -> float:
+        """Closed-form penalty value (no autograd graph)."""
+        primary_t = torch.as_tensor(primary, dtype=torch.float64)
+        basis_t = (
+            None if basis is None else torch.as_tensor(basis, dtype=torch.float64)
+        )
+        call = self._prepare(primary_t, basis=basis_t)
+        extras: dict[str, torch.Tensor] = {}
+        if call.isometry_basis is not None:
+            n_rows = int(call.target.shape[0])
+            jacobian = (
+                call.isometry_basis.unsqueeze(0).expand(n_rows, -1, -1)
+                if call.isometry_basis.dim() == 2
+                else call.isometry_basis
+            )
+            extras["isometry_jacobian"] = jacobian.reshape(n_rows, -1)
+        if call.isometry_jacobian_second is not None:
+            extras["isometry_jacobian_second"] = call.isometry_jacobian_second
+        value_t = _call_rust_value_grad(
+            call.target,
+            call.rho,
+            call.latents_json,
+            call.penalties_json,
+            **extras,
+        )[0]
+        return float(value_t.item())
+
+
+class IsometryPenalty(_RustPenaltyModule):
     """Pull a decoder Jacobian's metric toward the Euclidean metric."""
 
     def __init__(self, weight: float = 1.0, *, target: str = "t") -> None:
