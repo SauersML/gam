@@ -22434,7 +22434,7 @@ fn polynomial_block_from_order(
     }
 }
 
-fn monomial_exponents(dimension: usize, max_total_degree: usize) -> Vec<Vec<usize>> {
+pub fn monomial_exponents(dimension: usize, max_total_degree: usize) -> Vec<Vec<usize>> {
     fn recurse(
         axis: usize,
         remaining_degree: usize,

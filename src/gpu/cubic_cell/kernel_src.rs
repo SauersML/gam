@@ -35,7 +35,7 @@ pub(crate) fn build_cubic_deriv_moments_kernel_source(max_degree: usize) -> Stri
     let mut src = String::with_capacity(64 * 1024);
 
     src.push_str(HEADER);
-    let _ = writeln!(src, "#define MAX_DEGREE {}", max_degree);
+    writeln!(src, "#define MAX_DEGREE {}", max_degree).expect("writes to String are infallible");
     src.push_str("#define MOMENT_STRIDE (MAX_DEGREE + 1)\n");
     src.push_str("#define GL_N 384\n");
     src.push_str("#define LANES_PER_WARP 32\n");
@@ -51,11 +51,12 @@ pub(crate) fn build_cubic_deriv_moments_kernel_source(max_degree: usize) -> Stri
 
     src.push_str(DEVICE_HELPERS);
 
-    let _ = writeln!(
+    writeln!(
         src,
         "extern \"C\" __global__ void cubic_deriv_moments_d{degree}(",
         degree = max_degree
-    );
+    )
+    .expect("writes to String are infallible");
     src.push_str(KERNEL_BODY);
 
     src
@@ -63,7 +64,7 @@ pub(crate) fn build_cubic_deriv_moments_kernel_source(max_degree: usize) -> Stri
 
 fn emit_table(dst: &mut String, table: &[f64; 384]) {
     for value in table.iter() {
-        let _ = writeln!(dst, "    {value:.17e},");
+        writeln!(dst, "    {value:.17e},").expect("writes to String are infallible");
     }
 }
 
@@ -162,10 +163,11 @@ const KERNEL_BODY: &str = r#"    const double* __restrict__ cell_left,
                 local_status = STATUS_INVALID;
             }
         } else if (branch == BRANCH_AFFINE_TAIL) {
-            // Affine recurrence only; reject if any nonzero quadratic/cubic term.
-            if (c2 != 0.0 || c3 != 0.0) {
-                local_status = STATUS_NONAFFINE_INF;
-            } else if (!(R > L)) {
+            // Host classifier guarantees |c2|, |c3| <= NORMALIZED_CELL_BRANCH_TOL
+            // (1e-10 by default). Tails with material curvature are rejected at
+            // classify time; here we treat sub-tol coefficients as exact zero
+            // so the affine q'-recurrence is the only branch that runs.
+            if (!(R > L)) {
                 local_status = STATUS_INVALID;
             }
         } else if (branch == BRANCH_AFFINE) {
@@ -248,6 +250,10 @@ const KERNEL_BODY: &str = r#"    const double* __restrict__ cell_left,
     }
 
     // Affine / Affine-tail: lane 0 runs the closed-form q'-recurrence.
+    // The CPU evaluator uses only (alpha=c0, beta=c1) on the affine path —
+    // c2 and c3 are guaranteed sub-tolerance by the host classifier and are
+    // dropped here so the GPU agrees with `affine_anchor_moment_vector`
+    // byte-for-byte on the recurrence's q values.
     if (lane == 0) {
         const double alpha = c0;
         const double beta  = c1;
@@ -260,13 +266,13 @@ const KERNEL_BODY: &str = r#"    const double* __restrict__ cell_left,
         const double prefactor = exp(-(alpha * alpha) / (2.0 * d1)) / s * SQRT_TWO_PI;
 
         // Endpoint boundary terms B_n = R^n * exp(-q(R)) - L^n * exp(-q(L)).
-        // Infinite endpoints contribute zero.
+        // Infinite endpoints contribute zero. Affine q uses c2=c3=0 exactly.
         double qL = 0.0, qR = 0.0;
         double expL = 0.0, expR = 0.0;
         bool L_finite = isfinite(L);
         bool R_finite = isfinite(R);
         if (L_finite) {
-            qL = q_of_z(L, c0, c1, c2, c3);
+            qL = q_of_z(L, c0, c1, 0.0, 0.0);
             if (!isfinite(qL)) {
                 status[cell_id] = STATUS_NONFINITE_Q;
                 for (int k = 0; k < (int)MOMENT_STRIDE; ++k) {
@@ -277,7 +283,7 @@ const KERNEL_BODY: &str = r#"    const double* __restrict__ cell_left,
             expL = exp(-qL);
         }
         if (R_finite) {
-            qR = q_of_z(R, c0, c1, c2, c3);
+            qR = q_of_z(R, c0, c1, 0.0, 0.0);
             if (!isfinite(qR)) {
                 status[cell_id] = STATUS_NONFINITE_Q;
                 for (int k = 0; k < (int)MOMENT_STRIDE; ++k) {

@@ -33,6 +33,7 @@
 //! with the NVRTC kernel on Linux+CUDA targets.
 
 pub(crate) mod branch;
+pub(crate) mod device;
 pub(crate) mod host_substrate;
 pub(crate) mod kernel_src;
 
@@ -414,6 +415,157 @@ mod tests {
         let ws = CubicCellMomentWorkspace::new();
         assert_eq!(ws.capacity_cells, 0);
         assert_eq!(ws.capacity_stride, 0);
+    }
+
+    #[test]
+    fn multi_cell_batch_writes_rows_in_order() {
+        // Three cells: an affine tail, a finite quartic, and an invalid
+        // (right < left) cell. The status array must be parallel to the
+        // input order, and rows for OK cells must be filled while the
+        // invalid row stays zero.
+        let cells = [
+            GpuDenestedCubicCell {
+                left: f64::NEG_INFINITY,
+                right: -0.7,
+                c0: 0.1,
+                c1: 0.5,
+                c2: 0.0,
+                c3: 0.0,
+            },
+            GpuDenestedCubicCell {
+                left: -1.0,
+                right: 1.0,
+                c0: 0.2,
+                c1: 0.3,
+                c2: 0.4,
+                c3: 0.0,
+            },
+            GpuDenestedCubicCell {
+                left: 1.0,
+                right: -1.0,
+                c0: 0.0,
+                c1: 0.0,
+                c2: 0.0,
+                c3: 0.0,
+            },
+        ];
+        let branches = [
+            GpuCellBranchTag::AffineTail,
+            GpuCellBranchTag::NonAffineFinite,
+            GpuCellBranchTag::NonAffineFinite,
+        ];
+        let view = CubicCellDerivativeMomentHostView {
+            cells: &cells,
+            branches: &branches,
+            max_degree: 9,
+            mode: CubicCellMomentMode::DerivativeOnly,
+            residency: CubicCellMomentResidency::Host,
+        };
+        let out = try_build_cubic_cell_derivative_moments(view, None)
+            .expect("ok")
+            .expect("non-empty");
+        match out {
+            CubicCellDerivativeMomentOutput::Host {
+                moments,
+                status,
+                stride,
+            } => {
+                assert_eq!(stride, 10);
+                assert_eq!(status.len(), 3);
+                assert_eq!(status[0], CubicCellMomentStatus::Ok as u8);
+                assert_eq!(status[1], CubicCellMomentStatus::Ok as u8);
+                assert_eq!(
+                    status[2],
+                    CubicCellMomentStatus::InvalidInterval as u8
+                );
+                // Row 0 and row 1 must have a non-zero M_0; row 2 stays
+                // zeroed.
+                assert!(moments[0 * stride].abs() > 0.0);
+                assert!(moments[1 * stride].abs() > 0.0);
+                assert!(moments[2 * stride..3 * stride].iter().all(|&x| x == 0.0));
+            }
+            CubicCellDerivativeMomentOutput::Device(_) => panic!("expected host output"),
+        }
+    }
+
+    #[test]
+    fn substrate_moments_feed_cpu_contraction_helpers() {
+        // The substrate's row layout must be directly consumable by the
+        // existing CPU contraction helpers in `cubic_cell_kernel` — that
+        // is the whole point of producing a `[n_cells, max_degree+1]`
+        // row-major buffer.
+        use crate::families::cubic_cell_kernel::{
+            DenestedCubicCell, cell_first_derivative_from_moments,
+            cell_second_derivative_from_moments,
+        };
+
+        let cpu_cell = DenestedCubicCell {
+            left: -0.5,
+            right: 1.7,
+            c0: 0.2,
+            c1: -0.6,
+            c2: 0.25,
+            c3: 0.18,
+        };
+        let gpu_cell = GpuDenestedCubicCell {
+            left: cpu_cell.left,
+            right: cpu_cell.right,
+            c0: cpu_cell.c0,
+            c1: cpu_cell.c1,
+            c2: cpu_cell.c2,
+            c3: cpu_cell.c3,
+        };
+        let cells = [gpu_cell];
+        let branches = [GpuCellBranchTag::NonAffineFinite];
+        let view = CubicCellDerivativeMomentHostView {
+            cells: &cells,
+            branches: &branches,
+            max_degree: 9,
+            mode: CubicCellMomentMode::DerivativeOnly,
+            residency: CubicCellMomentResidency::Host,
+        };
+        let out = try_build_cubic_cell_derivative_moments(view, None)
+            .expect("ok")
+            .expect("non-empty");
+        let CubicCellDerivativeMomentOutput::Host {
+            moments,
+            status,
+            stride,
+        } = out
+        else {
+            panic!("expected host output");
+        };
+        assert_eq!(status, vec![CubicCellMomentStatus::Ok as u8]);
+        let row = &moments[..stride];
+
+        // Pick a representative cubic coefficient jet (degrees ≤ 3) and
+        // run the CPU first- and second-derivative contractions against
+        // the substrate moments.
+        let coeffs_r: [f64; 4] = [0.4, 0.1, -0.2, 0.03];
+        let coeffs_s: [f64; 4] = [-0.3, 0.5, 0.07, -0.01];
+        let coeffs_rs: [f64; 4] = [0.1, -0.1, 0.0, 0.0];
+
+        let f_r = cell_first_derivative_from_moments(&coeffs_r, row)
+            .expect("first deriv contraction must succeed on a valid row");
+        let f_rs = cell_second_derivative_from_moments(cpu_cell, &coeffs_r, &coeffs_s, &coeffs_rs, row)
+            .expect("second deriv contraction must succeed on a valid row");
+
+        // Recompute directly through the CPU evaluator to confirm the
+        // substrate row is indistinguishable from the CPU moment vector.
+        use crate::families::cubic_cell_kernel::evaluate_cell_derivative_moments_uncached;
+        let cpu_state = evaluate_cell_derivative_moments_uncached(cpu_cell, 9).unwrap();
+        let f_r_cpu =
+            cell_first_derivative_from_moments(&coeffs_r, &cpu_state.moments).unwrap();
+        let f_rs_cpu = cell_second_derivative_from_moments(
+            cpu_cell,
+            &coeffs_r,
+            &coeffs_s,
+            &coeffs_rs,
+            &cpu_state.moments,
+        )
+        .unwrap();
+        assert_eq!(f_r, f_r_cpu, "first deriv must be bit-equal to CPU path");
+        assert_eq!(f_rs, f_rs_cpu, "second deriv must be bit-equal to CPU path");
     }
 
     #[test]

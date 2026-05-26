@@ -20756,12 +20756,28 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     // `CustomFamilyError::IdentifiabilityFailure { audit }` carrying
     // the full structured report. Per the panic-vs-Err contract:
     // never panic mid-construction.
+    let audit_started = std::time::Instant::now();
+    let audit_n_rows = specs.first().map(|s| s.design.nrows()).unwrap_or(0);
+    let audit_n_cols: usize = specs.iter().map(|s| s.design.ncols()).sum();
+    log::info!(
+        "[STAGE] identifiability audit: start blocks={} n={} p_total={}",
+        specs.len(),
+        audit_n_rows,
+        audit_n_cols,
+    );
     let audit =
         crate::solver::identifiability_audit::audit_identifiability(specs).map_err(|reason| {
             CustomFamilyError::DimensionMismatch {
                 reason: format!("pre-fit identifiability audit failed: {reason}"),
             }
         })?;
+    log::info!(
+        "[STAGE] identifiability audit: end elapsed={:.3}s alias_pairs={} dropped_cols={} fatal={}",
+        audit_started.elapsed().as_secs_f64(),
+        audit.aliased_pairs.len(),
+        audit.dropped_columns.len(),
+        audit.fatal,
+    );
     if audit.fatal {
         return Err(CustomFamilyError::IdentifiabilityFailure { audit });
     }
