@@ -11,6 +11,7 @@ pub mod arrow_schur_nvrtc;
 pub mod blas;
 pub mod bms_flex;
 pub mod bms_flex_row;
+pub mod common;
 pub mod cpu_traits;
 pub mod cubic_bspline_moments;
 pub mod cubic_cell;
