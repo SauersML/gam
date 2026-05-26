@@ -445,7 +445,7 @@ class MonotonicityPenalty(_RustPenaltyModule):
         )
 
 
-class MechanismSparsityPenalty(nn.Module):
+class MechanismSparsityPenalty(_RustPenaltyModule):
     """Per-latent group-lasso sparsity over decoder feature groups."""
 
     def __init__(self, feature_groups: Sequence[Sequence[int]], weight: float, n_eff: float, smoothing_eps: float = 1e-6, *, target: str = "t", learnable: bool = False) -> None:
@@ -459,9 +459,11 @@ class MechanismSparsityPenalty(nn.Module):
         if self.learnable:
             self.log_weight = nn.Parameter(torch.zeros(1))
 
-    def forward(self, weights: torch.Tensor, basis: torch.Tensor | None = None) -> torch.Tensor:
+    def _prepare(
+        self, primary: torch.Tensor, basis: torch.Tensor | None = None
+    ) -> _PenaltyCall:
         del basis
-        weights = _check_matrix(weights, "weights")
+        weights = _check_matrix(primary, "weights")
         descriptor = {
             "kind": "mechanism_sparsity",
             "target": self.target,
@@ -472,11 +474,17 @@ class MechanismSparsityPenalty(nn.Module):
             "learnable": self.learnable,
         }
         rho = _rho_tensor(getattr(self, "log_weight", None), weights, 1 if self.learnable else 0)
-        apply = cast(Callable[..., torch.Tensor], _RustPenaltyFn.apply)
-        return apply(weights, rho, _latent_json(max(1, int(round(self.n_eff))), weights.shape[0], name=self.target), _penalty_json(descriptor))
+        return _PenaltyCall(
+            target=weights,
+            rho=rho,
+            latents_json=_latent_json(
+                max(1, int(round(self.n_eff))), weights.shape[0], name=self.target
+            ),
+            penalties_json=_penalty_json(descriptor),
+        )
 
 
-class IBPAssignmentPenalty(nn.Module):
+class IBPAssignmentPenalty(_RustPenaltyModule):
     """Finite IBP prior over row-wise assignment logits."""
 
     def __init__(self, k_max: int, alpha: float = 1.0, tau: float = 1.0, *, target: str = "t", learnable: bool = False) -> None:
@@ -489,9 +497,11 @@ class IBPAssignmentPenalty(nn.Module):
         if self.learnable:
             self.log_alpha = nn.Parameter(torch.zeros(1))
 
-    def forward(self, logits: torch.Tensor, basis: torch.Tensor | None = None) -> torch.Tensor:
+    def _prepare(
+        self, primary: torch.Tensor, basis: torch.Tensor | None = None
+    ) -> _PenaltyCall:
         del basis
-        logits = _check_matrix(logits, "logits")
+        logits = _check_matrix(primary, "logits")
         if logits.shape[1] != self.k_max:
             raise ValueError("logits width must equal k_max")
         descriptor = {
@@ -503,8 +513,12 @@ class IBPAssignmentPenalty(nn.Module):
             "learnable": self.learnable,
         }
         rho = _rho_tensor(getattr(self, "log_alpha", None), logits, 1 if self.learnable else 0)
-        apply = cast(Callable[..., torch.Tensor], _RustPenaltyFn.apply)
-        return apply(logits, rho, _latent_json(logits.shape[0], logits.shape[1], name=self.target), _penalty_json(descriptor))
+        return _PenaltyCall(
+            target=logits,
+            rho=rho,
+            latents_json=_latent_json(logits.shape[0], logits.shape[1], name=self.target),
+            penalties_json=_penalty_json(descriptor),
+        )
 
 
 class IvaeRidgeMeanGauge(nn.Module):
