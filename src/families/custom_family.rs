@@ -2731,6 +2731,35 @@ pub trait CustomFamily {
     }
 }
 
+/// Scope of an outer-evaluation context — distinguishes a real outer
+/// derivative evaluation (where auto-subsample is allowed to install a
+/// fresh stratified mask and emit phase prints) from an inner
+/// coefficient line-search trial (where the family must reuse the outer
+/// row measure, so auto-subsample must stay disabled).
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub enum EvalScope {
+    /// Real outer derivative evaluation: ρ has advanced; auto-subsample
+    /// install paths may build/refresh a mask keyed on this ρ.
+    OuterDerivative,
+    /// Inner coefficient trial (joint-Newton / line-search) at fixed
+    /// outer ρ: row measure must remain identical to the surrounding
+    /// outer eval, so auto-subsample must not install a fresh mask.
+    InnerCoefficient,
+}
+
+/// Context published by the outer smoothing optimizer for every
+/// downstream family evaluation. Carries the current outer ρ and a
+/// monotonic per-outer-eval id alongside the [`EvalScope`] tag used to
+/// gate auto-subsample installation. See the
+/// [`BlockwiseFitOptions::outer_eval_context`] field doc for the bug
+/// this prevents.
+#[derive(Clone, Debug)]
+pub struct OuterEvalContext {
+    pub rho: Arc<Array1<f64>>,
+    pub eval_id: usize,
+    pub scope: EvalScope,
+}
+
 /// Stable public API for installing outer-score subsampling.
 #[derive(Clone)]
 pub struct BlockwiseFitOptions {
@@ -2801,6 +2830,21 @@ pub struct BlockwiseFitOptions {
     /// When `outer_score_subsample` is already `Some(...)` the auto
     /// path is bypassed entirely (caller-provided masks always win).
     pub auto_outer_subsample: bool,
+    /// Outer-evaluation context populated by the smoothing optimizer at
+    /// the top of each real outer derivative evaluation. Used by
+    /// auto-subsample install paths to key the stratified mask on the
+    /// outer ρ rather than the inner β proxy: during the inner trust-
+    /// region / coefficient line search β changes on every trial step,
+    /// so keying on β re-fires phase prints (and re-shuffles the mask)
+    /// inside a single outer eval. Keying on (rho, eval_id) instead
+    /// keeps the mask stable across the inner Newton at one ρ, and
+    /// suppresses auto-subsample entirely on inner trial evaluations via
+    /// the [`EvalScope::InnerCoefficient`] tag set by
+    /// [`coefficient_line_search_options`].
+    ///
+    /// `None` preserves legacy behavior (no context — install paths fall
+    /// back to "no auto-subsample"). Default `None`.
+    pub outer_eval_context: Option<OuterEvalContext>,
     /// Optional persistent warm-start cache session. When `Some`, the
     /// outer smoothing optimizer consults the on-disk cache before
     /// starting (to seed θ from the last accepted iterate) and writes

@@ -1748,6 +1748,7 @@ impl SurvivalFlexGpuBackend {
 /// `Err` only when the request *is* supported but the driver failed.
 pub fn try_survival_flex_gradient(
     inputs: SurvivalFlexGpuRowInputs<'_>,
+    intercept_solve: Option<&SurvivalFlexInterceptSolveInputs<'_>>,
 ) -> Result<Option<(f64, Array1<f64>)>, GpuError> {
     inputs.validate()?;
     if inputs.score_dim != 1 {
@@ -1756,10 +1757,25 @@ pub fn try_survival_flex_gradient(
     if !SurvivalFlexGpuBackend::compiled() {
         return Ok(None);
     }
-    // Coefficient-space pullback lives in Step 5/6.  Step 1 only owns
-    // the rigid row primitive; the dispatcher hookup that turns the
-    // per-row outputs into the joint-β gradient lands once the flex
-    // cell runtime + intercept solve are in.
+    // Step 3 hookup: when an intercept-solve descriptor is provided,
+    // run the device monotone-root kernel as the precheck stage so the
+    // Step-3 path has a real production consumer before Step 4/5/6
+    // joint-β assembly lands.  Step 4 will replace the analytic
+    // evaluator on the device side with the real survival F(a)
+    // calibration evaluator; the host-side hookup shape stays the
+    // same.  On any non-OK device row we fall back to CPU; on every
+    // OK row we accept the warm-started root and the dispatcher
+    // continues to the (not-yet-landed) joint-β assembly — which for
+    // Step 3 is the `Ok(None)` sentinel.
+    if let Some(ints) = intercept_solve {
+        let out = match try_device_intercept_solve(ints)? {
+            Some(out) => out,
+            None => return Ok(None),
+        };
+        if out.status.iter().any(|&s| s > 1) {
+            return Ok(None);
+        }
+    }
     Ok(None)
 }
 
@@ -2015,7 +2031,7 @@ mod survival_flex_gpu_tests {
         let w = vec![1.0; n];
         let d = vec![0.0, 1.0, 0.0, 1.0];
         let inputs = make_inputs(n, &q0, &q1, &qd1, &z, &g, &w, &d, &beta);
-        match try_survival_flex_gradient(inputs) {
+        match try_survival_flex_gradient(inputs, None) {
             Ok(None) => {}
             Ok(Some(_)) => panic!("survival_flex gradient should be None until Step 6 lands"),
             Err(err) => panic!("unexpected error from survival_flex gradient: {err:?}"),
