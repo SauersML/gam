@@ -137,26 +137,6 @@ impl<'a> CellMomentsSource<'a> {
         }
     }
 
-    /// Host-resident view of the moments. The CPU oracle and any other
-    /// CPU-resident consumer needs the raw slice; calling this on a Device
-    /// variant is a programmer error (the oracle is a host-only sanity
-    /// checker and will never run with device-resident moments).
-    pub(crate) fn expect_host_slice(&self) -> &[f64] {
-        match self {
-            CellMomentsSource::Host(slice) => slice,
-            #[cfg(target_os = "linux")]
-            // SAFETY: `expect_host_slice` is documented as a host-only entry point
-            // (CPU oracle, host fallback). Reaching the Device arm here means the
-            // caller mis-routed a device-resident bundle into a host consumer —
-            // that is a programmer-side wiring error, not a runtime condition we
-            // could recover from. Panicking here surfaces the bug at the call
-            // site instead of silently returning bogus data.
-            CellMomentsSource::Device(_) => panic!(
-                "BmsFlexRowKernelInputs::cell_moments is device-resident; \
-                 CPU oracle / host consumers cannot index it without a DtoH copy"
-            ),
-        }
-    }
 }
 
 /// Per-row input bundle for [`launch_bms_flex_row_kernel`].
@@ -2247,7 +2227,19 @@ mod tests {
         let mut neglog = vec![0.0_f64; n];
         let mut grad = vec![0.0_f64; n * r];
         let mut hess = vec![0.0_f64; n * r * r];
-        let cell_moments_host = inputs.cell_moments.expect_host_slice();
+        let cell_moments_host = match &inputs.cell_moments {
+            CellMomentsSource::Host(slice) => *slice,
+            #[cfg(target_os = "linux")]
+            CellMomentsSource::Device(_) => panic!(
+                // SAFETY: this CPU oracle is a host-only sanity checker invoked
+                // exclusively from `#[cfg(test)] mod tests`. The kernel-launch
+                // path uses `CellMomentsSource::Device(...)`; the oracle must
+                // never see that variant. Reaching this arm means a test
+                // mis-wired its fixture — surface it loudly at the call site.
+                "cpu_oracle_outputs: cell_moments is device-resident; oracle \
+                 is a host-only sanity checker"
+            ),
+        };
 
         for row in 0..n {
             // ── per-cell sweep: accumulate F_u, F_au, F_uv, F_a, F_aa.

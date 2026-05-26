@@ -1149,6 +1149,590 @@ pub(crate) fn try_row_batched_cell_moments(
 }
 
 // ────────────────────────────────────────────────────────────────────────
+// Step 3 — device monotone-root intercept solve.
+//
+// The flex calibration step solves `F(a) = ⟨Φ(-η(z;a))⟩ - Φ(-q) = 0`
+// once per row.  The CPU side runs `monotone_root::solve_monotone_root_detailed`
+// (`families::survival_marginal_slope.rs:5363`).  Step 3 ports the
+// control flow (Newton probe → bracket expansion → bisection +
+// safeguarded Halley/Newton refinement) into an NVRTC kernel so every
+// row solves in parallel.
+//
+// The control-flow kernel is parameterised over the F-evaluator: Step 4
+// substitutes the real survival calibration (which needs the cell
+// moments from Step 2) by adding the relevant evaluator branch to the
+// NVRTC source.  Step 3 ships and tests against an analytic evaluator
+//
+//     F(a)   = alpha · exp(beta · a) + gamma
+//     F'(a)  = alpha · beta · exp(beta · a)
+//     F''(a) = alpha · beta² · exp(beta · a)
+//
+// whose closed-form root `a* = ln(-gamma/alpha) / beta` lets the parity
+// test verify Newton probe + bracket expansion + Halley/Newton refine
+// down to the CPU `solve_monotone_root_detailed` tolerance.
+//
+// Warm-start design: per-row arrays `a_entry[row]`, `a_exit[row]` carry
+// the previous-iter intercept solution.  The kernel reads them, runs
+// the solver, and writes back the converged root *plus* the abs-deriv
+// and residual that downstream Step 4 IFT corrections need.
+//
+// Bracket safety: matches the CPU cap exactly —
+// `step_cap = max(1e6, 1024·(1+|a_init|))` — and the same
+// `step_sign = -sign(f·F')` rule.  Convergence on
+// `|F| ≤ tol` *or* bracket width `≤ tol·(1+|lo|+|hi|)`, identical to
+// the CPU loop.
+// ────────────────────────────────────────────────────────────────────────
+
+/// Per-row inputs for the Step 3 device intercept solve.  Borrows
+/// host-side warm-start arrays + the per-row evaluator coefficients.
+/// The Step-4 wiring replaces `(alpha, beta, gamma)` with the real
+/// survival calibration evaluator; the Step-3 test path uses these
+/// directly for closed-form parity against the CPU monotone-root
+/// solver.
+#[derive(Clone, Debug)]
+pub(crate) struct SurvivalFlexInterceptSolveInputs<'a> {
+    /// Number of rows.
+    pub n: usize,
+    /// Warm-start seed per row.  For the rigid (flex=false) fallback the
+    /// CPU side uses `a_seed = q · √(1 + (s·g)²) / s` — the caller is
+    /// expected to provide either that rigid seed *or* the previous-iter
+    /// converged root (whichever is fresher).
+    pub a_warm: &'a [f64],
+    /// Analytic evaluator coefficients per row.  Step 4 swaps this out
+    /// for the real survival calibration evaluator inputs.
+    pub alpha: &'a [f64],
+    pub beta: &'a [f64],
+    pub gamma: &'a [f64],
+    /// `|F| ≤ convergence_tol` and bracket width `≤ tol·(1+|lo|+|hi|)`
+    /// both stop the loop.  Matches the CPU contract.
+    pub convergence_tol: f64,
+    /// Bracket-expansion iteration cap.  CPU side uses 64 for survival.
+    pub max_bracket_iters: u32,
+    /// Refinement iteration cap.  CPU side uses 64.
+    pub max_refine_iters: u32,
+}
+
+/// Step 3 per-row output.
+#[derive(Clone, Debug)]
+pub(crate) struct SurvivalFlexInterceptSolveOutputs {
+    /// Converged root `a*` per row.
+    pub a_root: Vec<f64>,
+    /// `|F'(a*)|` per row — Step 4 IFT uses this to invert through the
+    /// constraint and propagate derivatives.
+    pub abs_deriv: Vec<f64>,
+    /// `F(a*)` per row.  Always satisfies `|residual| ≤ convergence_tol`
+    /// on success.
+    pub residual: Vec<f64>,
+    /// Per-row exit status:
+    ///   0 — converged to `|F| ≤ tol`
+    ///   1 — exited on bracket-width contraction (acceptable; root within tol)
+    ///   2 — Newton probe degenerate (F'(a_warm) zero / non-finite)
+    ///   3 — bracket search exhausted (no sign change after `max_bracket_iters`)
+    ///   4 — refine loop exhausted without bracket/residual convergence
+    ///   5 — non-finite produced by the evaluator (e.g. overflow)
+    pub status: Vec<u8>,
+}
+
+impl<'a> SurvivalFlexInterceptSolveInputs<'a> {
+    fn validate(&self) -> Result<(), GpuError> {
+        let n = self.n;
+        let lens: [(&str, usize); 4] = [
+            ("a_warm", self.a_warm.len()),
+            ("alpha", self.alpha.len()),
+            ("beta", self.beta.len()),
+            ("gamma", self.gamma.len()),
+        ];
+        for (label, len) in lens {
+            if len != n {
+                return Err(GpuError::DriverCallFailed {
+                    reason: format!(
+                        "survival_flex intercept-solve inputs: {label}.len()={len} != n={n}"
+                    ),
+                });
+            }
+        }
+        if !(self.convergence_tol.is_finite() && self.convergence_tol > 0.0) {
+            return Err(GpuError::DriverCallFailed {
+                reason: format!(
+                    "survival_flex intercept-solve inputs: convergence_tol must be positive \
+                     finite, got {}",
+                    self.convergence_tol
+                ),
+            });
+        }
+        if self.max_bracket_iters == 0 || self.max_refine_iters == 0 {
+            return Err(GpuError::DriverCallFailed {
+                reason: format!(
+                    "survival_flex intercept-solve inputs: iter caps must be positive, got \
+                     bracket={} refine={}",
+                    self.max_bracket_iters, self.max_refine_iters
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// CPU oracle for the Step 3 intercept solve.  Drives the existing
+/// `families::monotone_root::solve_monotone_root_detailed` against the
+/// analytic evaluator (`alpha · exp(beta · a) + gamma`) so the device
+/// kernel can be checked element-wise.  Returns the same output layout
+/// as the device kernel.
+///
+/// Status codes match the device kernel's enumeration (0 converged,
+/// 2 degenerate-derivative, 3 bracket-exhausted, 5 non-finite).  The
+/// CPU solver collapses "Halley-only convergence" and "bisection-only
+/// convergence" into a single status `0`, so the device parity bar is
+/// status-equal *plus* numerical equality of `a_root`, `abs_deriv`,
+/// `residual` at the CPU tolerance.
+pub(crate) fn cpu_oracle_intercept_solve(
+    inputs: &SurvivalFlexInterceptSolveInputs<'_>,
+) -> SurvivalFlexInterceptSolveOutputs {
+    use crate::families::monotone_root::{
+        MonotoneRootError, solve_monotone_root_detailed,
+    };
+    let mut a_root = vec![0.0_f64; inputs.n];
+    let mut abs_deriv = vec![0.0_f64; inputs.n];
+    let mut residual = vec![0.0_f64; inputs.n];
+    let mut status = vec![0u8; inputs.n];
+    for row in 0..inputs.n {
+        let alpha = inputs.alpha[row];
+        let beta = inputs.beta[row];
+        let gamma = inputs.gamma[row];
+        let a_warm = inputs.a_warm[row];
+        let eval = |a: f64| -> Result<(f64, f64, f64), String> {
+            let e = (beta * a).exp();
+            if !e.is_finite() {
+                return Err(format!("overflow at a={a}"));
+            }
+            let f = alpha * e + gamma;
+            let fp = alpha * beta * e;
+            let fpp = alpha * beta * beta * e;
+            Ok((f, fp, fpp))
+        };
+        match solve_monotone_root_detailed(
+            eval,
+            a_warm,
+            "survival_flex_intercept_oracle",
+            inputs.convergence_tol,
+            inputs.max_bracket_iters as usize,
+            inputs.max_refine_iters as usize,
+        ) {
+            Ok(sol) => {
+                a_root[row] = sol.root;
+                abs_deriv[row] = sol.abs_deriv;
+                residual[row] = sol.residual;
+                status[row] = 0;
+            }
+            Err(MonotoneRootError::DegenerateDerivative { a, .. }) => {
+                a_root[row] = a;
+                abs_deriv[row] = 0.0;
+                residual[row] = f64::NAN;
+                status[row] = 2;
+            }
+            Err(MonotoneRootError::BracketingExhausted { .. }) => {
+                a_root[row] = a_warm;
+                abs_deriv[row] = 0.0;
+                residual[row] = f64::NAN;
+                status[row] = 3;
+            }
+            Err(MonotoneRootError::RefinementDidNotConverge { last_residual, .. }) => {
+                a_root[row] = a_warm;
+                abs_deriv[row] = 0.0;
+                residual[row] = last_residual;
+                status[row] = 4;
+            }
+            Err(_) => {
+                a_root[row] = a_warm;
+                abs_deriv[row] = 0.0;
+                residual[row] = f64::NAN;
+                status[row] = 5;
+            }
+        }
+    }
+    SurvivalFlexInterceptSolveOutputs {
+        a_root,
+        abs_deriv,
+        residual,
+        status,
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// NVRTC source — Step 3 (parameterised monotone root, analytic evaluator).
+//
+// One thread per row.  Identical control flow to the CPU
+// `solve_monotone_root_detailed`:
+//   * Up to 2 Newton probes from `a_warm[row]`.
+//   * If un-converged, geometric step doubling (bracket phase) using
+//     `step_sign = -sign(f · F')`, step_mag start = max(1.0, 0.25·(1+|a|)),
+//     cap = max(1e6, 1024·(1+|a_warm|)).
+//   * Phase 2: hybrid bisection / safeguarded Halley + Newton inside
+//     the bracket; convergence on residual or bracket width.
+//   * Best-of accounting for the residual, matching the CPU loop.
+// ────────────────────────────────────────────────────────────────────────
+
+#[cfg(target_os = "linux")]
+const SURVIVAL_FLEX_INTERCEPT_SOLVE_SOURCE: &str = r#"
+extern "C" __device__ __forceinline__ void
+eval_F_analytic(double a, double alpha, double beta, double gamma,
+                double *f, double *fp, double *fpp, int *ok) {
+    double e = exp(beta * a);
+    if (!isfinite(e)) { *f = 0.0; *fp = 0.0; *fpp = 0.0; *ok = 0; return; }
+    *f   = alpha * e + gamma;
+    *fp  = alpha * beta * e;
+    *fpp = alpha * beta * beta * e;
+    *ok  = 1;
+}
+
+extern "C" __global__ void survival_flex_intercept_solve(
+    const double * __restrict__ a_warm_arr,
+    const double * __restrict__ alpha_arr,
+    const double * __restrict__ beta_arr,
+    const double * __restrict__ gamma_arr,
+    double                       convergence_tol,
+    unsigned int                 max_bracket_iters,
+    unsigned int                 max_refine_iters,
+    int                          n,
+    double * __restrict__        out_a_root,
+    double * __restrict__        out_abs_deriv,
+    double * __restrict__        out_residual,
+    unsigned char * __restrict__ out_status
+) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n) return;
+
+    double alpha = alpha_arr[row];
+    double beta  = beta_arr[row];
+    double gamma = gamma_arr[row];
+    double a_init = a_warm_arr[row];
+
+    double f, fp, fpp;
+    int ok;
+    eval_F_analytic(a_init, alpha, beta, gamma, &f, &fp, &fpp, &ok);
+    if (!ok) { out_a_root[row]=a_init; out_abs_deriv[row]=0.0; out_residual[row]=nan(""); out_status[row]=5; return; }
+
+    // Exact-root shortcut.
+    if (fabs(f) <= convergence_tol) {
+        double abs_d = fabs(fp);
+        if (!isfinite(abs_d) || abs_d == 0.0) {
+            out_a_root[row]=a_init; out_abs_deriv[row]=0.0; out_residual[row]=f; out_status[row]=2;
+        } else {
+            out_a_root[row]=a_init; out_abs_deriv[row]=abs_d; out_residual[row]=f; out_status[row]=0;
+        }
+        return;
+    }
+
+    if (!isfinite(fp) || fp == 0.0) {
+        out_a_root[row]=a_init; out_abs_deriv[row]=0.0; out_residual[row]=nan(""); out_status[row]=2;
+        return;
+    }
+
+    // --- Newton probe (≤ 2) ---
+    double a = a_init;
+    double f_init = f;
+    double fp_init = fp;
+    for (int probe = 0; probe < 2; ++probe) {
+        if (fabs(f) <= convergence_tol) {
+            double abs_d = fabs(fp);
+            if (isfinite(abs_d) && abs_d != 0.0) {
+                out_a_root[row]=a; out_abs_deriv[row]=abs_d; out_residual[row]=f; out_status[row]=0;
+                return;
+            }
+            break;
+        }
+        if (!isfinite(fp) || fabs(fp) <= 1e-30) break;
+        double step = -f / fp;
+        if (!isfinite(step) || fabs(step) > 8.0 * (1.0 + fabs(a))) break;
+        double cand = a + step;
+        double f_c, fp_c, fpp_c; int ok_c;
+        eval_F_analytic(cand, alpha, beta, gamma, &f_c, &fp_c, &fpp_c, &ok_c);
+        if (!ok_c) break;
+        if (fabs(f_c) <= convergence_tol) {
+            double abs_d = fabs(fp_c);
+            if (isfinite(abs_d) && abs_d != 0.0) {
+                out_a_root[row]=cand; out_abs_deriv[row]=abs_d; out_residual[row]=f_c; out_status[row]=0;
+                return;
+            }
+            break;
+        }
+        a = cand; f = f_c; fp = fp_c; fpp = fpp_c;
+    }
+
+    // --- Phase 1: bracket ---
+    double step_sign = (f_init * fp_init < 0.0) ? 1.0 : -1.0;
+    int f_init_neg = (f_init < 0.0) ? 1 : 0;
+    double same_side = a_init;
+    double step_mag = fmax(0.25 * (1.0 + fabs(a_init)), 1.0);
+    double step_cap = fmax(1e6, 1024.0 * (1.0 + fabs(a_init)));
+
+    int found_other = 0;
+    double other = 0.0;
+    for (unsigned int it = 0; it < max_bracket_iters; ++it) {
+        double probe_pt = same_side + step_mag * step_sign;
+        double f_probe, fp_probe, fpp_probe; int ok_probe;
+        eval_F_analytic(probe_pt, alpha, beta, gamma, &f_probe, &fp_probe, &fpp_probe, &ok_probe);
+        if (!ok_probe) break;
+        int crossed = f_init_neg ? (f_probe >= 0.0) : (f_probe <= 0.0);
+        if (crossed) { other = probe_pt; found_other = 1; break; }
+        same_side = probe_pt;
+        step_mag *= 2.0;
+        if (step_mag > step_cap) break;
+    }
+    if (!found_other) {
+        out_a_root[row]=a_init; out_abs_deriv[row]=0.0; out_residual[row]=nan(""); out_status[row]=3;
+        return;
+    }
+
+    double neg_pt, pos_pt;
+    if (f_init_neg) { neg_pt = same_side; pos_pt = other; }
+    else            { neg_pt = other;     pos_pt = same_side; }
+
+    // --- Phase 2: hybrid refine ---
+    double best_a = a_init, best_f = f_init, best_abs_d = fabs(fp_init);
+    int    converged_residual = 0, converged_bracket = 0;
+
+    for (unsigned int it = 0; it < max_refine_iters; ++it) {
+        double lo = fmin(neg_pt, pos_pt);
+        double hi = fmax(neg_pt, pos_pt);
+        double mid = 0.5 * (lo + hi);
+
+        double f_mid, fp_mid, fpp_mid; int ok_mid;
+        eval_F_analytic(mid, alpha, beta, gamma, &f_mid, &fp_mid, &fpp_mid, &ok_mid);
+        if (!ok_mid) { out_a_root[row]=best_a; out_abs_deriv[row]=best_abs_d; out_residual[row]=best_f; out_status[row]=5; return; }
+        if (fabs(f_mid) < fabs(best_f)) { best_a = mid; best_f = f_mid; best_abs_d = fabs(fp_mid); }
+
+        if (fabs(f_mid) <= convergence_tol) { converged_residual = 1; break; }
+
+        // Safeguarded Halley probe inside (lo, hi); fall back to Newton, else midpoint.
+        double probe_pt = mid;
+        int halley_ok = 0;
+        if (isfinite(fp_mid) && fabs(fp_mid) > 1e-30) {
+            double denom = 2.0 * fp_mid * fp_mid - f_mid * fpp_mid;
+            if (isfinite(denom) && fabs(denom) > 1e-30) {
+                double cand = mid - (2.0 * f_mid * fp_mid) / denom;
+                if (cand > lo && cand < hi) { probe_pt = cand; halley_ok = 1; }
+            }
+        }
+        if (!halley_ok && isfinite(fp_mid) && fabs(fp_mid) > 1e-30) {
+            double cand = mid - f_mid / fp_mid;
+            if (cand > lo && cand < hi) probe_pt = cand;
+        }
+
+        double f_b = f_mid;
+        if (probe_pt != mid) {
+            double f_p, fp_p, fpp_p; int ok_p;
+            eval_F_analytic(probe_pt, alpha, beta, gamma, &f_p, &fp_p, &fpp_p, &ok_p);
+            if (!ok_p) { out_a_root[row]=best_a; out_abs_deriv[row]=best_abs_d; out_residual[row]=best_f; out_status[row]=5; return; }
+            if (fabs(f_p) < fabs(best_f)) { best_a = probe_pt; best_f = f_p; best_abs_d = fabs(fp_p); }
+            f_b = f_p;
+        } else {
+            probe_pt = mid;
+        }
+
+        if (f_b <= 0.0) neg_pt = probe_pt; else pos_pt = probe_pt;
+
+        double next_lo = fmin(neg_pt, pos_pt);
+        double next_hi = fmax(neg_pt, pos_pt);
+        if (fabs(next_hi - next_lo) <= convergence_tol * (1.0 + fabs(next_hi) + fabs(next_lo))) {
+            converged_bracket = 1; break;
+        }
+    }
+
+    if (!isfinite(best_abs_d) || best_abs_d == 0.0) {
+        double f_r, fp_r, fpp_r; int ok_r;
+        eval_F_analytic(best_a, alpha, beta, gamma, &f_r, &fp_r, &fpp_r, &ok_r);
+        if (ok_r) best_abs_d = fabs(fp_r);
+    }
+
+    out_a_root[row]    = best_a;
+    out_abs_deriv[row] = best_abs_d;
+    out_residual[row]  = best_f;
+    if      (converged_residual)             out_status[row] = 0;
+    else if (converged_bracket)              out_status[row] = 1;
+    else                                     out_status[row] = 4;
+}
+"#;
+
+/// Launch the Step 3 device intercept solve.  Returns `Ok(None)` on
+/// non-Linux / no-CUDA builds so the dispatcher can fall back to the
+/// CPU oracle; returns `Err` only on genuine driver / compile failures.
+pub(crate) fn try_device_intercept_solve(
+    inputs: &SurvivalFlexInterceptSolveInputs<'_>,
+) -> Result<Option<SurvivalFlexInterceptSolveOutputs>, GpuError> {
+    inputs.validate()?;
+    if !SurvivalFlexGpuBackend::compiled() {
+        return Ok(None);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let backend = match SurvivalFlexGpuBackend::probe() {
+            Ok(b) => b,
+            Err(GpuError::DriverLibraryUnavailable { .. }) => return Ok(None),
+            Err(other) => return Err(other),
+        };
+        Some(backend.launch_intercept_solve_linux(inputs)).transpose()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(None)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl SurvivalFlexGpuBackend {
+    /// NVRTC-compile (lazily, shared with other survival_flex modules) the
+    /// Step 3 module.  Held in a static `OnceLock` so the compile runs
+    /// once per process.
+    fn compile_intercept_solve_module(&self) -> Result<Arc<CudaModule>, GpuError> {
+        static INTERCEPT_MODULE: OnceLock<
+            std::sync::Mutex<Option<Result<Arc<CudaModule>, GpuError>>>,
+        > = OnceLock::new();
+        let cell = INTERCEPT_MODULE.get_or_init(|| std::sync::Mutex::new(None));
+        let mut guard = cell.lock().map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("survival_flex intercept-solve module mutex poisoned: {err}"),
+        })?;
+        if let Some(existing) = guard.as_ref() {
+            return existing.clone();
+        }
+        let result = (|| {
+            let ptx = cudarc::nvrtc::compile_ptx(SURVIVAL_FLEX_INTERCEPT_SOLVE_SOURCE).map_err(
+                |err| GpuError::DriverCallFailed {
+                    reason: format!("survival_flex intercept-solve NVRTC compile: {err}"),
+                },
+            )?;
+            self.inner
+                .ctx
+                .load_module(ptx)
+                .map_err(|err| GpuError::DriverCallFailed {
+                    reason: format!("survival_flex intercept-solve module load: {err}"),
+                })
+        })();
+        *guard = Some(result.clone());
+        result
+    }
+
+    fn launch_intercept_solve_linux(
+        &self,
+        inputs: &SurvivalFlexInterceptSolveInputs<'_>,
+    ) -> Result<SurvivalFlexInterceptSolveOutputs, GpuError> {
+        use cudarc::driver::{LaunchConfig, PushKernelArg};
+        let module = self.compile_intercept_solve_module()?;
+        let func = module.load_function("survival_flex_intercept_solve").map_err(
+            |err| GpuError::DriverCallFailed {
+                reason: format!("survival_flex intercept-solve load_function: {err}"),
+            },
+        )?;
+
+        let n = inputs.n;
+        let stream = &self.inner.stream;
+        let mk_htod = |slice: &[f64], name: &str| -> Result<_, GpuError> {
+            stream
+                .clone_htod(slice)
+                .map_err(|err| GpuError::DriverCallFailed {
+                    reason: format!("survival_flex intercept-solve memcpy_stod {name}: {err}"),
+                })
+        };
+        let d_a_warm = mk_htod(inputs.a_warm, "a_warm")?;
+        let d_alpha = mk_htod(inputs.alpha, "alpha")?;
+        let d_beta = mk_htod(inputs.beta, "beta")?;
+        let d_gamma = mk_htod(inputs.gamma, "gamma")?;
+
+        let mut d_a_root =
+            stream
+                .alloc_zeros::<f64>(n)
+                .map_err(|err| GpuError::DriverCallFailed {
+                    reason: format!("survival_flex intercept-solve alloc a_root: {err}"),
+                })?;
+        let mut d_abs_deriv =
+            stream
+                .alloc_zeros::<f64>(n)
+                .map_err(|err| GpuError::DriverCallFailed {
+                    reason: format!("survival_flex intercept-solve alloc abs_deriv: {err}"),
+                })?;
+        let mut d_residual =
+            stream
+                .alloc_zeros::<f64>(n)
+                .map_err(|err| GpuError::DriverCallFailed {
+                    reason: format!("survival_flex intercept-solve alloc residual: {err}"),
+                })?;
+        let mut d_status =
+            stream
+                .alloc_zeros::<u8>(n)
+                .map_err(|err| GpuError::DriverCallFailed {
+                    reason: format!("survival_flex intercept-solve alloc status: {err}"),
+                })?;
+
+        let convergence_tol = inputs.convergence_tol;
+        let max_bracket_iters = inputs.max_bracket_iters;
+        let max_refine_iters = inputs.max_refine_iters;
+        let n_i32 = i32::try_from(n).map_err(|_| GpuError::DriverCallFailed {
+            reason: format!("survival_flex intercept-solve n={n} overflows i32"),
+        })?;
+
+        let block: u32 = 256;
+        let grid: u32 = ((n as u32) + block - 1) / block;
+        let cfg = LaunchConfig {
+            grid_dim: (grid.max(1), 1, 1),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut builder = stream.launch_builder(&func);
+        builder
+            .arg(&d_a_warm)
+            .arg(&d_alpha)
+            .arg(&d_beta)
+            .arg(&d_gamma)
+            .arg(&convergence_tol)
+            .arg(&max_bracket_iters)
+            .arg(&max_refine_iters)
+            .arg(&n_i32)
+            .arg(&mut d_a_root)
+            .arg(&mut d_abs_deriv)
+            .arg(&mut d_residual)
+            .arg(&mut d_status);
+        // SAFETY: argument types match the kernel signature; grid covers n rows.
+        unsafe { builder.launch(cfg) }.map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("survival_flex intercept-solve launch: {err}"),
+        })?;
+
+        let a_root = stream
+            .clone_dtoh(&d_a_root)
+            .map_err(|err| GpuError::DriverCallFailed {
+                reason: format!("survival_flex intercept-solve memcpy_dtoh a_root: {err}"),
+            })?;
+        let abs_deriv = stream
+            .clone_dtoh(&d_abs_deriv)
+            .map_err(|err| GpuError::DriverCallFailed {
+                reason: format!("survival_flex intercept-solve memcpy_dtoh abs_deriv: {err}"),
+            })?;
+        let residual = stream
+            .clone_dtoh(&d_residual)
+            .map_err(|err| GpuError::DriverCallFailed {
+                reason: format!("survival_flex intercept-solve memcpy_dtoh residual: {err}"),
+            })?;
+        let status =
+            stream
+                .clone_dtoh(&d_status)
+                .map_err(|err| GpuError::DriverCallFailed {
+                    reason: format!("survival_flex intercept-solve memcpy_dtoh status: {err}"),
+                })?;
+        stream
+            .synchronize()
+            .map_err(|err| GpuError::DriverCallFailed {
+                reason: format!("survival_flex intercept-solve synchronize: {err}"),
+            })?;
+
+        Ok(SurvivalFlexInterceptSolveOutputs {
+            a_root,
+            abs_deriv,
+            residual,
+            status,
+        })
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────
 // Three thin pullback entry points.  The bodies all currently return
 // `Ok(None)` (the unsupported sentinel) because Steps 2–5 still need to
 // land the flex / cubic-cell / intercept-solve infrastructure before

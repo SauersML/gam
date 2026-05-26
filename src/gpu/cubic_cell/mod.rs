@@ -443,9 +443,11 @@ mod tests {
             let backend =
                 crate::gpu::cubic_cell::device::CubicCellGpuBackend::probe()
                     .expect("backend probe");
-            let host_moments = backend
-                .test_only_download_moments(&d_moments)
-                .expect("DtoH download for parity check");
+            let host_moments = crate::gpu::cubic_cell::device::test_support::download_moments(
+                &backend,
+                &d_moments,
+            )
+            .expect("DtoH download for parity check");
             for (i, &cpu_cell) in cpu_cells.iter().enumerate() {
                 assert_eq!(
                     status[i],
