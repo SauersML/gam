@@ -21,9 +21,17 @@ use crate::custom_family::{ExactNewtonJointGradientEvaluation, ExactNewtonJointH
 use crate::solver::estimate::reml::unified::{
     HyperOperator, ProjectedFactorCache, ProjectedFactorKey,
 };
+use crate::util::heartbeat::Heartbeat;
 use ndarray::{Array1, Array2, ArrayView2, s};
 use rayon::prelude::*;
 use std::sync::Arc;
+
+/// Minimum row count that justifies a periodic heartbeat from
+/// `build_row_kernel_cache`. Below this, the cache build finishes in
+/// well under a second on biobank-scale hardware and the heartbeat
+/// machinery is pure noise. Above this, a silent multi-minute build is
+/// the documented failure mode the heartbeat exists to expose.
+const ROW_KERNEL_CACHE_HEARTBEAT_MIN_ROWS: usize = 100_000;
 
 // ── Row selector ─────────────────────────────────────────────────────
 //
@@ -350,11 +358,32 @@ pub fn build_row_kernel_cache<const K: usize>(
     let mut nll = vec![0.0_f64; n];
     let mut gradients = vec![[0.0_f64; K]; n];
     let mut hessians = vec![[[0.0_f64; K]; K]; n];
+    let work_count = match rows {
+        RowSet::All => n,
+        RowSet::Subsample { rows: list, .. } => list.len(),
+    };
+    let heartbeat = (work_count >= ROW_KERNEL_CACHE_HEARTBEAT_MIN_ROWS)
+        .then(Heartbeat::default_interval);
     match rows {
         RowSet::All => {
             let evaluated: Vec<(f64, [f64; K], [[f64; K]; K])> = (0..n)
                 .into_par_iter()
-                .map(|row| kern.row_kernel(row))
+                .map(|row| {
+                    let out = kern.row_kernel(row);
+                    if let Some(hb) = heartbeat.as_ref() {
+                        hb.tick(1, |progress, elapsed| {
+                            log::info!(
+                                "[STAGE] row-kernel cache (all) progress={}/{} ({:.1}%) elapsed={:.1}s threads={}",
+                                progress.min(n),
+                                n,
+                                100.0 * progress.min(n) as f64 / n.max(1) as f64,
+                                elapsed,
+                                rayon::current_num_threads(),
+                            );
+                        });
+                    }
+                    out
+                })
                 .collect::<Result<Vec<_>, String>>()?;
             for (i, (l, g, h)) in evaluated.into_iter().enumerate() {
                 nll[i] = l;
@@ -365,9 +394,25 @@ pub fn build_row_kernel_cache<const K: usize>(
         RowSet::Subsample { rows: list, .. } => {
             // Evaluate only the sampled rows in parallel; scatter into
             // the n-sized cache slots keyed by their full-data index.
+            let total = list.len();
             let pairs: Vec<(usize, (f64, [f64; K], [[f64; K]; K]))> = list
                 .par_iter()
-                .map(|r| kern.row_kernel(r.index).map(|out| (r.index, out)))
+                .map(|r| {
+                    let out = kern.row_kernel(r.index).map(|out| (r.index, out));
+                    if let Some(hb) = heartbeat.as_ref() {
+                        hb.tick(1, |progress, elapsed| {
+                            log::info!(
+                                "[STAGE] row-kernel cache (subsample) progress={}/{} ({:.1}%) elapsed={:.1}s threads={}",
+                                progress.min(total),
+                                total,
+                                100.0 * progress.min(total) as f64 / total.max(1) as f64,
+                                elapsed,
+                                rayon::current_num_threads(),
+                            );
+                        });
+                    }
+                    out
+                })
                 .collect::<Result<Vec<_>, String>>()?;
             for (idx, (l, g, h)) in pairs {
                 nll[idx] = l;
