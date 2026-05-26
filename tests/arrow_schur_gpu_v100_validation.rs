@@ -21,6 +21,7 @@
 
 use gam::gpu::arrow_schur::{
     ArrowSchurGpuFailure, solve_arrow_newton_step, solve_arrow_newton_step_dense_reference,
+    solve_arrow_newton_step_fused_force,
 };
 use gam::solver::arrow_schur::ArrowSchurSystem;
 use ndarray::Array2;
@@ -439,4 +440,59 @@ fn arrow_schur_gpu_ridge_bump_required_on_non_pd_row_recovers_after_bump() {
         "[arrow_schur_gpu_v100/ridge_bump_required] failed to recover within \
          ten geometric escalations starting from bump={bump:e}"
     );
+}
+
+/// Math block 3 §16 test 6 — Layer C (cuSOLVER/cuBLAS) ↔ Layer D (fused
+/// NVRTC) parity. Both device paths must produce δt, δβ, log|H| identical
+/// to 1e-10 relative on the same `(n, d, k)` system. Drives the fused path
+/// explicitly via `solve_arrow_newton_step_fused_force` so the comparison
+/// is unaffected by the admission heuristic (which may route small shapes
+/// through Layer C even when Layer D is functional).
+#[test]
+fn arrow_schur_gpu_fused_layer_d_matches_layer_a_b_c() {
+    skip_without_cuda!("arrow_schur_gpu_v100/c_vs_d_parity");
+    // Three shapes spanning the kernel's compile-time R templates:
+    //   * (n=12, d=10, k=4) — R rounds to template 4
+    //   * (n=8,  d=16, k=8) — R = template 8
+    //   * (n=4,  d=30, k=16) — R = template 16, exercises the max-P_MAX path
+    let configurations: [(usize, usize, usize, u64); 3] = [
+        (12, 10, 4, 0xC0DE_0001_0001_0001),
+        (8, 16, 8, 0xC0DE_0002_0002_0002),
+        (4, 30, 16, 0xC0DE_0003_0003_0003),
+    ];
+    for (n, d, k, seed) in configurations {
+        let sys = build_fixture(n, d, k, seed);
+        let ridge_t = 1e-9;
+        let ridge_beta = 1e-9;
+        let abc = match solve_arrow_newton_step(&sys, ridge_t, ridge_beta) {
+            Ok(sol) => sol,
+            Err(ArrowSchurGpuFailure::Unavailable) => {
+                eprintln!(
+                    "[arrow_schur_gpu_v100/c_vs_d_parity n={n} d={d} k={k}] \
+                     Layer A+B+C declined — skipping"
+                );
+                continue;
+            }
+            Err(other) => panic!(
+                "[arrow_schur_gpu_v100/c_vs_d_parity n={n} d={d} k={k}] \
+                 Layer A+B+C failed: {other:?}"
+            ),
+        };
+        let fused = match solve_arrow_newton_step_fused_force(&sys, ridge_t, ridge_beta) {
+            Ok(sol) => sol,
+            Err(ArrowSchurGpuFailure::Unavailable) => {
+                eprintln!(
+                    "[arrow_schur_gpu_v100/c_vs_d_parity n={n} d={d} k={k}] \
+                     Layer D declined — skipping"
+                );
+                continue;
+            }
+            Err(other) => panic!(
+                "[arrow_schur_gpu_v100/c_vs_d_parity n={n} d={d} k={k}] \
+                 Layer D failed: {other:?}"
+            ),
+        };
+        let label = format!("arrow_schur_gpu_v100/c_vs_d_parity n={n} d={d} k={k}");
+        assert_solution_matches(&label, n, d, k, &fused, &abc, 1e-10);
+    }
 }
