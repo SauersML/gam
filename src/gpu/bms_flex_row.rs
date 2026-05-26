@@ -191,6 +191,97 @@ pub(crate) struct BmsFlexRowKernelInputs<'a> {
     pub r_uv: &'a [f64],
 }
 
+/// Owned twin of [`BmsFlexRowKernelInputs`] — every borrowed slice is replaced
+/// by an owned `Vec`. Built by the host packer in
+/// `BernoulliMarginalSlopeFamily::pack_bms_flex_row_kernel_inputs`; converted
+/// to a borrowed view via [`BmsFlexRowKernelInputsOwned::as_borrowed`] just
+/// before [`launch_bms_flex_row_kernel`] uploads to the device.
+///
+/// Holds all per-row + per-cell SoA buffers in the exact layouts the device
+/// kernel reads (`bms_flex_row_kernel` in [`ROW_KERNEL_SOURCE`]):
+///   * scalars `n_rows`, `r`, `p_h`, `p_w`, `s_f`,
+///   * per-row `q / b / mu_1 / mu_2 / z_obs / y / w / chi_obs / xi_obs`,
+///   * per-row `rho_u [n*r]`, `tau_u [n*r]`, `r_uv [n*r*r]`,
+///   * CSR `cell_offsets [n+1]` and per-cell `cell_c0..c3`,
+///     `cell_a / cell_aa [n_cells * 4]`,
+///     `cell_r / cell_ar [n_cells * (r-1) * 4]`,
+///     `cell_sbb [n_cells * 4]`,
+///     `cell_sbh [n_cells * p_h * 4]`,
+///     `cell_sbw [n_cells * p_w * 4]`,
+///     `cell_moments [n_cells * 10]`.
+pub(crate) struct BmsFlexRowKernelInputsOwned {
+    pub n_rows: usize,
+    pub r: usize,
+    pub p_h: usize,
+    pub p_w: usize,
+    pub s_f: f64,
+    pub q: Vec<f64>,
+    pub b: Vec<f64>,
+    pub mu_1: Vec<f64>,
+    pub mu_2: Vec<f64>,
+    pub z_obs: Vec<f64>,
+    pub y: Vec<f64>,
+    pub w: Vec<f64>,
+    pub cell_offsets: Vec<u32>,
+    pub cell_c0: Vec<f64>,
+    pub cell_c1: Vec<f64>,
+    pub cell_c2: Vec<f64>,
+    pub cell_c3: Vec<f64>,
+    pub cell_a: Vec<f64>,
+    pub cell_aa: Vec<f64>,
+    pub cell_r: Vec<f64>,
+    pub cell_ar: Vec<f64>,
+    pub cell_sbb: Vec<f64>,
+    pub cell_sbh: Vec<f64>,
+    pub cell_sbw: Vec<f64>,
+    pub cell_moments: Vec<f64>,
+    pub chi_obs: Vec<f64>,
+    pub xi_obs: Vec<f64>,
+    pub rho_u: Vec<f64>,
+    pub tau_u: Vec<f64>,
+    pub r_uv: Vec<f64>,
+}
+
+impl BmsFlexRowKernelInputsOwned {
+    /// Borrowed view over `self` suitable for [`launch_bms_flex_row_kernel`].
+    /// The returned struct holds references into `self` so the owned bundle
+    /// must outlive the launch.
+    pub(crate) fn as_borrowed(&self) -> BmsFlexRowKernelInputs<'_> {
+        BmsFlexRowKernelInputs {
+            n_rows: self.n_rows,
+            r: self.r,
+            p_h: self.p_h,
+            p_w: self.p_w,
+            s_f: self.s_f,
+            q: &self.q,
+            b: &self.b,
+            mu_1: &self.mu_1,
+            mu_2: &self.mu_2,
+            z_obs: &self.z_obs,
+            y: &self.y,
+            w: &self.w,
+            cell_offsets: &self.cell_offsets,
+            cell_c0: &self.cell_c0,
+            cell_c1: &self.cell_c1,
+            cell_c2: &self.cell_c2,
+            cell_c3: &self.cell_c3,
+            cell_a: &self.cell_a,
+            cell_aa: &self.cell_aa,
+            cell_r: &self.cell_r,
+            cell_ar: &self.cell_ar,
+            cell_sbb: &self.cell_sbb,
+            cell_sbh: &self.cell_sbh,
+            cell_sbw: &self.cell_sbw,
+            cell_moments: &self.cell_moments,
+            chi_obs: &self.chi_obs,
+            xi_obs: &self.xi_obs,
+            rho_u: &self.rho_u,
+            tau_u: &self.tau_u,
+            r_uv: &self.r_uv,
+        }
+    }
+}
+
 /// Per-row outputs produced by [`launch_bms_flex_row_kernel`].
 pub(crate) struct BmsFlexRowKernelOutputs {
     /// Per-row negative log-likelihood. Length `n_rows`.
