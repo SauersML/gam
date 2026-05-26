@@ -3013,12 +3013,10 @@ fn rigid_observed_eta(q: f64, g: f64, z: f64, probit_scale: f64) -> f64 {
     q * rigid_observed_scale(g, probit_scale) + rigid_observed_logslope(g, probit_scale) * z
 }
 
-/// Survival IRLS Hessian row metric at a β-independent pilot η, mirroring
-/// `bernoulli_marginal_slope::pilot_irls_hessian_row_metric_at_eta`. The SMGS
-/// conditional likelihood at the exit time is a probit Bernoulli on the
-/// event indicator with link variance `Φ(η)(1−Φ(η))`; the IRLS row weight
-/// W metric for survival cross-block orthogonalisation. The previous
-/// implementation copied the Bernoulli probit IRLS row weight
+/// Survival row Hessian row metric at a β-independent pilot η, used to
+/// build the W inner product for cross-block orthogonalisation of the
+/// score-warp and link-deviation flex bases. The previous implementation
+/// copied the Bernoulli probit IRLS row weight
 /// `w · φ(η)² / (Φ(η)·(1 − Φ(η)))` from BMS verbatim, but that is the row
 /// curvature for a Bernoulli probit likelihood, not for the survival
 /// marginal-slope likelihood. The survival row neg-log Hessian wrt η₁
@@ -18125,12 +18123,12 @@ pub fn fit_survival_marginal_slope_terms(
         // for every β. This mirrors the BMS construction site at
         // bernoulli_marginal_slope.rs:18236, transplanted here because
         // SMGS had no cross-block reparam call. The W metric routed in
-        // here is the survival IRLS Hessian row weight
-        // `w · φ(η)² / (Φ(η)(1−Φ(η)))` at the rigid pooled-probit pilot η
-        // (see `cross_block_pilot_w` above); this is the inner product the
-        // joint penalised Hessian sees during PIRLS, so `Aᵀ W C̃ = 0`
-        // after the reparam survives into PIRLS rather than holding only
-        // under uniform `spec.weights`.
+        // here is the survival row neg-log Hessian diagonal wrt η₁ at the
+        // rigid pooled-probit pilot η (see `cross_block_pilot_w` above —
+        // matches `u2_eta1` in `row_primary_closed_form`); this is the
+        // inner product the joint penalised Hessian sees during PIRLS, so
+        // `Aᵀ W C̃ = 0` after the reparam survives into PIRLS rather than
+        // holding only under uniform `spec.weights`.
         // Thread the now-reparameterised score-warp basis at training rows
         // as a flex-evaluation anchor so the link-deviation basis is jointly
         // orthogonal to span(marginal, logslope, score_warp). Mirrors BMS at
