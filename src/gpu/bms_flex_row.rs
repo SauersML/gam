@@ -89,7 +89,7 @@ use super::error::GpuError;
 use std::sync::Arc;
 
 #[cfg(target_os = "linux")]
-use cudarc::driver::{CudaContext, CudaModule, CudaStream, DeviceRepr, LaunchConfig, PushKernelArg};
+use cudarc::driver::{CudaContext, CudaModule, CudaStream, LaunchConfig, PushKernelArg};
 
 /// Hard ceiling on `r` (= 2 + p_h + p_w). Matches the shared-memory budget
 /// argument in the module docstring: with `MAX_R = 32` the per-block shared
@@ -937,25 +937,6 @@ fn launch_linux(
         })?;
 
     Ok(BmsFlexRowKernelOutputs { neglog, grad, hess })
-}
-
-// `DeviceRepr` / `PushKernelArg` imports above are part of the public cudarc
-// dispatch surface used by the launch builder. Acknowledge the imports by
-// reading their associated types so the build.rs scanner does not see an
-// `unused_imports` lint candidate; this compiles to a no-op.
-#[cfg(target_os = "linux")]
-#[inline]
-pub(crate) fn _device_repr_witness<T: DeviceRepr>() -> usize {
-    core::mem::size_of::<T>()
-}
-
-#[cfg(target_os = "linux")]
-#[inline]
-pub(crate) fn _push_kernel_arg_witness<T>(_: &T) -> bool
-where
-    T: PushKernelArg<f64>,
-{
-    true
 }
 
 #[cfg(test)]
