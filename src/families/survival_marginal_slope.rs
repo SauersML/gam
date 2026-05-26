@@ -324,47 +324,152 @@ enum SurvivalInterceptSlotKind {
 }
 
 /// Per-row warm-start storage for the survival calibration root solver.
-/// Two atomic `f64::to_bits` slots per row — one for the entry intercept
-/// (`q = q0`) and one for the exit intercept (`q = q1`). NaN bits flag a
-/// slot that hasn't been populated yet.
+///
+/// Two slots per row (entry intercept against `q0`, exit intercept against
+/// `q1`). Each slot stores the converged intercept `a` alongside a
+/// `beta_tag: u64` — a 64-bit hash of the joint coefficient vector at the
+/// time of write. Reads return `Some(a)` only when the caller's tag matches
+/// the stored tag AND the stored value is finite. This makes the cache
+/// transactional with respect to trust-region trials and subsampled probes:
+/// a rejected trial at β_A and an accepted full-data eval at β_B key under
+/// distinct tags, so writes from one cannot poison reads from the other.
+///
+/// The "never written" sentinel is `beta_tag == 0`. Callers compute their
+/// tag with `hash_intercept_warm_start_key` and remap `0` to `1` so that the
+/// sentinel can never collide with a real key. Two consecutive evaluations
+/// at the same β share the same tag and reuse the cached root.
+///
+/// Memory ordering: the writer stores `value` with `Relaxed` and then `tag`
+/// with `Release`. The reader loads `tag` with `Acquire`, reads `value`
+/// with `Relaxed`, and re-checks `tag` with `Acquire`. The double-check
+/// detects a torn read where another thread interleaved a tag bump between
+/// the value read and the second tag load.
 struct SurvivalInterceptWarmStartCache {
-    entry: Vec<std::sync::atomic::AtomicU64>,
-    exit: Vec<std::sync::atomic::AtomicU64>,
+    entry_value: Vec<std::sync::atomic::AtomicU64>,
+    entry_tag: Vec<std::sync::atomic::AtomicU64>,
+    exit_value: Vec<std::sync::atomic::AtomicU64>,
+    exit_tag: Vec<std::sync::atomic::AtomicU64>,
 }
 
 impl SurvivalInterceptWarmStartCache {
     #[inline]
-    fn slots_for(&self, kind: SurvivalInterceptSlotKind) -> &[std::sync::atomic::AtomicU64] {
+    fn slots_for(
+        &self,
+        kind: SurvivalInterceptSlotKind,
+    ) -> (
+        &[std::sync::atomic::AtomicU64],
+        &[std::sync::atomic::AtomicU64],
+    ) {
         match kind {
-            SurvivalInterceptSlotKind::Entry => &self.entry,
-            SurvivalInterceptSlotKind::Exit => &self.exit,
+            SurvivalInterceptSlotKind::Entry => (&self.entry_value, &self.entry_tag),
+            SurvivalInterceptSlotKind::Exit => (&self.exit_value, &self.exit_tag),
         }
     }
 
+    /// Return the cached intercept iff the slot's stored `beta_tag` matches
+    /// the caller's `beta_tag` and the stored value is finite. Otherwise
+    /// returns `None` (cache miss — caller falls back to closed-form seed).
     #[inline]
-    fn load(&self, row: usize, kind: SurvivalInterceptSlotKind) -> Option<f64> {
-        let slot = self.slots_for(kind).get(row)?;
-        let value = f64::from_bits(slot.load(std::sync::atomic::Ordering::Relaxed));
+    fn load(
+        &self,
+        row: usize,
+        kind: SurvivalInterceptSlotKind,
+        beta_tag: u64,
+    ) -> Option<f64> {
+        let (values, tags) = self.slots_for(kind);
+        let value_slot = values.get(row)?;
+        let tag_slot = tags.get(row)?;
+        let tag_before = tag_slot.load(std::sync::atomic::Ordering::Acquire);
+        if tag_before != beta_tag {
+            return None;
+        }
+        let bits = value_slot.load(std::sync::atomic::Ordering::Relaxed);
+        let tag_after = tag_slot.load(std::sync::atomic::Ordering::Acquire);
+        if tag_after != beta_tag {
+            return None;
+        }
+        let value = f64::from_bits(bits);
         value.is_finite().then_some(value)
     }
 
+    /// Stamp the slot with the converged intercept under `beta_tag`. Concurrent
+    /// writers from different trials race; the last writer wins, which is fine
+    /// because every reader gates on its own tag and only accepts a match.
     #[inline]
-    fn store(&self, row: usize, kind: SurvivalInterceptSlotKind, a: f64) {
-        if let Some(slot) = self.slots_for(kind).get(row) {
-            slot.store(a.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    fn store(
+        &self,
+        row: usize,
+        kind: SurvivalInterceptSlotKind,
+        a: f64,
+        beta_tag: u64,
+    ) {
+        let (values, tags) = self.slots_for(kind);
+        if let (Some(value_slot), Some(tag_slot)) = (values.get(row), tags.get(row)) {
+            // Invalidate before writing the new value so an interleaved
+            // reader cannot see the new tag paired with the old value.
+            tag_slot.store(0, std::sync::atomic::Ordering::Release);
+            value_slot.store(a.to_bits(), std::sync::atomic::Ordering::Relaxed);
+            tag_slot.store(beta_tag, std::sync::atomic::Ordering::Release);
         }
     }
 }
 
 fn new_intercept_warm_start_cache(n: usize) -> Arc<SurvivalInterceptWarmStartCache> {
     Arc::new(SurvivalInterceptWarmStartCache {
-        entry: (0..n)
+        entry_value: (0..n)
             .map(|_| std::sync::atomic::AtomicU64::new(f64::NAN.to_bits()))
             .collect(),
-        exit: (0..n)
+        entry_tag: (0..n)
+            .map(|_| std::sync::atomic::AtomicU64::new(0))
+            .collect(),
+        exit_value: (0..n)
             .map(|_| std::sync::atomic::AtomicU64::new(f64::NAN.to_bits()))
+            .collect(),
+        exit_tag: (0..n)
+            .map(|_| std::sync::atomic::AtomicU64::new(0))
             .collect(),
     })
+}
+
+/// FNV-1a 64-bit hash of the joint coefficient slices `(beta_h, beta_w)`.
+/// Returned tag is guaranteed non-zero (zero is remapped to one) so that
+/// the cache's "never written" sentinel cannot collide with a real key.
+/// At 64 bits, false collisions across distinct β are astronomically rare;
+/// on a miss we just re-solve from the closed-form seed.
+#[inline]
+fn hash_intercept_warm_start_key(
+    beta_h: Option<&Array1<f64>>,
+    beta_w: Option<&Array1<f64>>,
+) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let mut hash = FNV_OFFSET;
+    let mix = |hash: &mut u64, byte: u8| {
+        *hash ^= byte as u64;
+        *hash = hash.wrapping_mul(FNV_PRIME);
+    };
+    let feed = |hash: &mut u64, beta: Option<&Array1<f64>>, marker: u8| {
+        mix(hash, marker);
+        match beta {
+            None => mix(hash, 0xffu8),
+            Some(v) => {
+                let len = v.len() as u64;
+                for b in len.to_le_bytes() {
+                    mix(hash, b);
+                }
+                for x in v.iter() {
+                    // Canonicalize -0.0 to +0.0 so equal vectors hash equal.
+                    let bits = if *x == 0.0 { 0u64 } else { x.to_bits() };
+                    for b in bits.to_le_bytes() {
+                        mix(hash, b);
+                    }
+                }
+            }
+        }
+    };
+    feed(&mut hash, beta_h, 0xa1);
+    feed(&mut hash, beta_w, 0xa2);
+    if hash == 0 { 1 } else { hash }
 }
 
 #[derive(Clone, Default)]
@@ -5505,10 +5610,16 @@ impl SurvivalMarginalSlopeFamily {
         // bits decode to a non-finite value (uninitialised NaN sentinel /
         // stale), fall back to the closed-form rigid seed — preserving the
         // exact pre-warm-start behaviour.
+        // Tag the cache entry with a 64-bit hash of (beta_h, beta_w) so that
+        // rejected trust-region trials and subsampled probes cannot poison
+        // the global per-row root: each trial keys under its own β, so a
+        // write at β_A is invisible to a subsequent read at β_B. Consecutive
+        // evaluations at the same β share the tag and reuse the warm start.
+        let beta_tag = hash_intercept_warm_start_key(beta_h, beta_w);
         let cached_a = slot.and_then(|(row, kind)| {
             self.intercept_warm_starts
                 .as_ref()
-                .and_then(|cache| cache.load(row, kind))
+                .and_then(|cache| cache.load(row, kind, beta_tag))
         });
         let a_init = cached_a.unwrap_or(a_closed_form);
         let mut solve_result = super::monotone_root::solve_monotone_root_detailed(
@@ -5610,11 +5721,14 @@ impl SurvivalMarginalSlopeFamily {
 
         // Cache the converged intercept for the next PIRLS iter, if a slot
         // was provided. When `slot` is None this is a no-op, preserving the
-        // exact pre-warm-start behaviour.
+        // exact pre-warm-start behaviour. The stamp is the β-tagged key
+        // computed above: only future reads at the same β observe this
+        // write, so rejected or subsampled trials cannot leak their roots
+        // into accepted full-data evaluations.
         if let Some((row, kind)) = slot
             && let Some(cache) = self.intercept_warm_starts.as_ref()
         {
-            cache.store(row, kind, a);
+            cache.store(row, kind, a, beta_tag);
         }
 
         Ok((a, abs_deriv))
