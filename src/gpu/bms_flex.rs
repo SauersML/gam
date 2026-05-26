@@ -39,6 +39,9 @@ use std::sync::{Arc, Mutex};
 #[cfg(target_os = "linux")]
 use cudarc::driver::{CudaContext, CudaModule, CudaStream};
 
+#[cfg(target_os = "linux")]
+use super::common::{DeviceArena, PtxModuleCache};
+
 // ────────────────────────────────────────────────────────────────────────
 // Public policy entry points (preserved from the previous policy-only
 // implementation so call sites stay source-compatible).
@@ -315,52 +318,12 @@ struct BmsFlexGpuContextLinux {
     /// NVRTC-compiled module containing the probe kernel. Lazy so the
     /// compile happens exactly once per process and is shared by every
     /// dispatching thread.
-    module: OnceLock<Arc<CudaModule>>,
+    module: PtxModuleCache,
     /// Reusable f64 device buffers keyed by power-of-two element-count
     /// buckets. Held under a `Mutex` because biobank fits dispatch from
     /// multiple rayon worker threads; the mutex is only held during
     /// `alloc` / `release`, not across kernel launches.
     arena: Mutex<DeviceArena>,
-}
-
-#[cfg(target_os = "linux")]
-#[derive(Default)]
-struct DeviceArena {
-    free: std::collections::HashMap<usize, Vec<cudarc::driver::CudaSlice<f64>>>,
-}
-
-#[cfg(target_os = "linux")]
-impl DeviceArena {
-    fn bucket_of(elements: usize) -> usize {
-        elements.max(1).next_power_of_two()
-    }
-
-    /// Allocate a device slice of at least `elements` f64s. Returns the
-    /// bucket size actually allocated so the caller can release into the
-    /// same bucket on drop.
-    fn alloc(
-        &mut self,
-        stream: &Arc<CudaStream>,
-        elements: usize,
-    ) -> Result<(usize, cudarc::driver::CudaSlice<f64>), GpuError> {
-        let bucket = Self::bucket_of(elements);
-        if let Some(bucket_vec) = self.free.get_mut(&bucket)
-            && let Some(slot) = bucket_vec.pop()
-        {
-            return Ok((bucket, slot));
-        }
-        let fresh =
-            stream
-                .alloc_zeros::<f64>(bucket)
-                .map_err(|err| GpuError::DriverCallFailed {
-                    reason: format!("bms_flex arena alloc_zeros<{bucket}>: {err}"),
-                })?;
-        Ok((bucket, fresh))
-    }
-
-    fn release(&mut self, bucket: usize, slab: cudarc::driver::CudaSlice<f64>) {
-        self.free.entry(bucket).or_default().push(slab);
-    }
 }
 
 impl BmsFlexGpuBackend {
@@ -415,7 +378,7 @@ impl BmsFlexGpuBackend {
             inner: BmsFlexGpuContextLinux {
                 ctx,
                 stream,
-                module: OnceLock::new(),
+                module: PtxModuleCache::new(),
                 arena: Mutex::new(DeviceArena::default()),
             },
         };
@@ -428,27 +391,9 @@ impl BmsFlexGpuBackend {
     /// NVRTC-compile (or fetch from cache) the probe module.
     #[cfg(target_os = "linux")]
     fn compile_probe_module(&self) -> Result<&Arc<CudaModule>, GpuError> {
-        if let Some(existing) = self.inner.module.get() {
-            return Ok(existing);
-        }
-        let ptx = cudarc::nvrtc::compile_ptx(PROBE_KERNEL_SOURCE).map_err(|err| {
-            GpuError::DriverCallFailed {
-                reason: format!("bms_flex NVRTC compile failed: {err}"),
-            }
-        })?;
-        let module = self
-            .inner
-            .ctx
-            .load_module(ptx)
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("bms_flex module load failed: {err}"),
-            })?;
-        self.inner.module.set(module).ok();
-        Ok(self
-            .inner
+        self.inner
             .module
-            .get()
-            .expect("module slot is populated after set"))
+            .get_or_compile(&self.inner.ctx, "bms_flex", PROBE_KERNEL_SOURCE)
     }
 
     /// Launch the probe kernel and synchronize. Used by tests and by the
@@ -505,7 +450,7 @@ impl BmsFlexGpuBackend {
             .map_err(|err| GpuError::DriverCallFailed {
                 reason: format!("bms_flex arena mutex poisoned: {err}"),
             })?;
-        let (bucket, slab) = guard.alloc(&self.inner.stream, elements)?;
+        let (bucket, slab) = guard.alloc(&self.inner.stream, elements, "bms_flex")?;
         guard.release(bucket, slab);
         Ok(bucket)
     }

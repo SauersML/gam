@@ -16312,8 +16312,27 @@ pub fn build_spherical_spline_basis(
     let weights = sphere_area_weights(centers.view(), spec.radians);
     let z = weighted_coefficient_sum_to_zero_transform(weights.view())?;
     let penalty = z.t().dot(&raw_penalty).dot(&z);
-    let sphere_auto_chunk = auto_streaming_chunk_size_for_dense(data.nrows(), z.ncols());
-    let design = if let Some(chunk) = sphere_auto_chunk {
+    // Prefer the device truncated-spectral kernel whenever
+    // `sphere_kernel_decision` reports the (n, m, lmax) workload is
+    // worth GPU dispatch — this short-circuits the CPU streaming
+    // evaluator at the same time. We still keep the streaming fallback
+    // for the (rare) case where the kernel is Sobolev/Pseudo (untruncated)
+    // or the GPU runtime refuses the call.
+    let gpu_raw_design = try_build_truncated_sphere_design_gpu(
+        data,
+        centers.view(),
+        spec.wahba_kernel,
+        spec.penalty_order,
+        spec.radians,
+    );
+    let sphere_auto_chunk = if gpu_raw_design.is_some() {
+        None
+    } else {
+        auto_streaming_chunk_size_for_dense(data.nrows(), z.ncols())
+    };
+    let design = if let Some(raw_design) = gpu_raw_design {
+        DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(raw_design.dot(&z)))
+    } else if let Some(chunk) = sphere_auto_chunk {
         log::info!(
             "Sphere basis auto-streaming evaluator: n={} p={} chunk_size={}",
             data.nrows(),
@@ -16332,22 +16351,13 @@ pub fn build_spherical_spline_basis(
         .map_err(BasisError::InvalidInput)?;
         DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Arc::new(op)))
     } else {
-        let raw_design = match try_build_truncated_sphere_design_gpu(
+        let raw_design = spherical_wahba_kernel_matrix_with_kind(
             data,
             centers.view(),
-            spec.wahba_kernel,
             spec.penalty_order,
             spec.radians,
-        ) {
-            Some(gpu_design) => gpu_design,
-            None => spherical_wahba_kernel_matrix_with_kind(
-                data,
-                centers.view(),
-                spec.penalty_order,
-                spec.radians,
-                spec.wahba_kernel,
-            )?,
-        };
+            spec.wahba_kernel,
+        )?;
         DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(raw_design.dot(&z)))
     };
     let (penalty_norm, c_primary) = normalize_penalty(&((&penalty + &penalty.t()) * 0.5));

@@ -53,6 +53,9 @@ use std::sync::{Arc, Mutex};
 #[cfg(target_os = "linux")]
 use cudarc::driver::{CudaContext, CudaModule, CudaStream};
 
+#[cfg(target_os = "linux")]
+use super::common::{DeviceArena, PtxModuleCache};
+
 // ────────────────────────────────────────────────────────────────────────
 // Policy entry points (parallels `bms_flex::row_primary_hessian_decision`).
 // ────────────────────────────────────────────────────────────────────────
@@ -528,48 +531,11 @@ struct SurvivalFlexGpuContextLinux {
     /// NVRTC-compiled module holding `survival_flex_rigid_rows` (and, in
     /// later steps, the flex kernels).  `OnceLock` so the compile runs
     /// exactly once per process and is shared by every dispatching thread.
-    module: OnceLock<Arc<CudaModule>>,
+    module: PtxModuleCache,
     /// Reusable f64 device buffers keyed by power-of-two element-count
     /// buckets — the same bucketed arena `bms_flex` uses, so a fit that
     /// touches both backends does not double up on device memory.
     arena: Mutex<DeviceArena>,
-}
-
-#[cfg(target_os = "linux")]
-#[derive(Default)]
-struct DeviceArena {
-    free: std::collections::HashMap<usize, Vec<cudarc::driver::CudaSlice<f64>>>,
-}
-
-#[cfg(target_os = "linux")]
-impl DeviceArena {
-    fn bucket_of(elements: usize) -> usize {
-        elements.max(1).next_power_of_two()
-    }
-
-    fn alloc(
-        &mut self,
-        stream: &Arc<CudaStream>,
-        elements: usize,
-    ) -> Result<(usize, cudarc::driver::CudaSlice<f64>), GpuError> {
-        let bucket = Self::bucket_of(elements);
-        if let Some(bucket_vec) = self.free.get_mut(&bucket)
-            && let Some(slot) = bucket_vec.pop()
-        {
-            return Ok((bucket, slot));
-        }
-        let fresh =
-            stream
-                .alloc_zeros::<f64>(bucket)
-                .map_err(|err| GpuError::DriverCallFailed {
-                    reason: format!("survival_flex arena alloc_zeros<{bucket}>: {err}"),
-                })?;
-        Ok((bucket, fresh))
-    }
-
-    fn release(&mut self, bucket: usize, slab: cudarc::driver::CudaSlice<f64>) {
-        self.free.entry(bucket).or_default().push(slab);
-    }
 }
 
 impl SurvivalFlexGpuBackend {
@@ -621,7 +587,7 @@ impl SurvivalFlexGpuBackend {
             inner: SurvivalFlexGpuContextLinux {
                 ctx,
                 stream,
-                module: OnceLock::new(),
+                module: PtxModuleCache::new(),
                 arena: Mutex::new(DeviceArena::default()),
             },
         };
@@ -632,27 +598,11 @@ impl SurvivalFlexGpuBackend {
     /// NVRTC-compile (or fetch from cache) the rigid-kernel module.
     #[cfg(target_os = "linux")]
     fn compile_rigid_module(&self) -> Result<&Arc<CudaModule>, GpuError> {
-        if let Some(existing) = self.inner.module.get() {
-            return Ok(existing);
-        }
-        let ptx = cudarc::nvrtc::compile_ptx(SURVIVAL_FLEX_RIGID_SOURCE).map_err(|err| {
-            GpuError::DriverCallFailed {
-                reason: format!("survival_flex NVRTC compile failed: {err}"),
-            }
-        })?;
-        let module = self
-            .inner
-            .ctx
-            .load_module(ptx)
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("survival_flex module load failed: {err}"),
-            })?;
-        self.inner.module.set(module).ok();
-        Ok(self
-            .inner
-            .module
-            .get()
-            .expect("module slot is populated after set"))
+        self.inner.module.get_or_compile(
+            &self.inner.ctx,
+            "survival_flex",
+            SURVIVAL_FLEX_RIGID_SOURCE,
+        )
     }
 
     /// Round-trip the arena.  Mirrors `bms_flex` so the V100 smoke test
@@ -666,7 +616,7 @@ impl SurvivalFlexGpuBackend {
             .map_err(|err| GpuError::DriverCallFailed {
                 reason: format!("survival_flex arena mutex poisoned: {err}"),
             })?;
-        let (bucket, slab) = guard.alloc(&self.inner.stream, elements)?;
+        let (bucket, slab) = guard.alloc(&self.inner.stream, elements, "survival_flex")?;
         guard.release(bucket, slab);
         Ok(bucket)
     }

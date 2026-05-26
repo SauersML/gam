@@ -339,3 +339,104 @@ fn arrow_schur_gpu_dense_reference_matches_cpu_solve() {
         );
     }
 }
+
+/// Non-PD row block → `RidgeBumpRequired` round trip.
+///
+/// The Layer-A `cusolverDnDpotrfBatched` returns a positive pivot index for
+/// the first non-PD block; the host wraps that into
+/// `ArrowSchurGpuFailure::RidgeBumpRequired { row, bump }` so the outer caller
+/// can re-launch at `ridge_t + bump`. This test constructs a fixture whose
+/// row #2 has `htt = -I` (rank deficient and negative-definite) and verifies:
+///   (a) row index matches,
+///   (b) `bump > 0`,
+///   (c) re-launching at `ridge_t = bump` succeeds and matches the dense
+///       reference at the same shifted ridge.
+#[test]
+fn arrow_schur_gpu_ridge_bump_required_on_non_pd_row_recovers_after_bump() {
+    skip_without_cuda!("arrow_schur_gpu_v100/ridge_bump_required");
+    let mut sys = build_fixture(4, 8, 3, 0xDEAD_C0DE_DEAD_C0DE);
+    // Poison row #2: replace `htt` with `-I` so the unperturbed Cholesky
+    // fails at the very first pivot (j=0).
+    for r in 0..sys.d {
+        for c in 0..sys.d {
+            sys.rows[2].htt[[r, c]] = if r == c { -1.0 } else { 0.0 };
+        }
+    }
+    let ridge_t = 0.0;
+    let ridge_beta = 0.0;
+    let bump = match solve_arrow_newton_step(&sys, ridge_t, ridge_beta) {
+        Err(ArrowSchurGpuFailure::RidgeBumpRequired { row, bump }) => {
+            assert_eq!(
+                row, 2,
+                "[arrow_schur_gpu_v100/ridge_bump_required] expected row 2 \
+                 to be flagged, got row {row}"
+            );
+            assert!(
+                bump > 0.0,
+                "[arrow_schur_gpu_v100/ridge_bump_required] bump must be \
+                 strictly positive, got {bump:e}"
+            );
+            bump
+        }
+        Err(ArrowSchurGpuFailure::Unavailable) => {
+            eprintln!(
+                "[arrow_schur_gpu_v100/ridge_bump_required] device declined — \
+                 skipping"
+            );
+            return;
+        }
+        Err(other) => panic!(
+            "[arrow_schur_gpu_v100/ridge_bump_required] expected \
+             RidgeBumpRequired, got {other:?}"
+        ),
+        Ok(_) => panic!(
+            "[arrow_schur_gpu_v100/ridge_bump_required] non-PD row should not \
+             have factored at ridge=0"
+        ),
+    };
+    // Re-launch at ridge_t = bump. The poisoned row is `-I`; the shifted
+    // `htt + bump·I = (bump − 1)·I`, which only becomes PD once `bump > 1`.
+    // The Ceres-style escalation already returns a `bump ≥ 1024·√ε ≈ 4.8e-5`
+    // baseline, so we may need a few geometric doublings. Iterate up to ten
+    // doublings — math block 3 §16 caps the escalation chain at ten before
+    // declaring the system genuinely rank-deficient.
+    let mut ridge = bump;
+    for attempt in 0..10 {
+        match solve_arrow_newton_step(&sys, ridge, ridge_beta) {
+            Ok(got) => {
+                let expected =
+                    solve_arrow_newton_step_dense_reference(&sys, ridge, ridge_beta).expect(
+                        "dense reference Cholesky must succeed at sufficiently large ridge",
+                    );
+                assert_solution_matches(
+                    "arrow_schur_gpu_v100/ridge_bump_required/recovered",
+                    sys.rows.len(),
+                    sys.d,
+                    sys.k,
+                    &got,
+                    &expected,
+                    1e-10,
+                );
+                return;
+            }
+            Err(ArrowSchurGpuFailure::RidgeBumpRequired { bump: next_bump, .. }) => {
+                ridge = (ridge + next_bump).max(ridge * 2.0);
+            }
+            Err(ArrowSchurGpuFailure::Unavailable) => {
+                eprintln!(
+                    "[arrow_schur_gpu_v100/ridge_bump_required] device \
+                     declined on recovery attempt {attempt} — skipping"
+                );
+                return;
+            }
+            Err(other) => panic!(
+                "[arrow_schur_gpu_v100/ridge_bump_required] unexpected error \
+                 on recovery attempt {attempt}: {other:?}"
+            ),
+        }
+    }
+    panic!(
+        "[arrow_schur_gpu_v100/ridge_bump_required] failed to recover within \
+         ten geometric escalations starting from bump={bump:e}"
+    );
+}
