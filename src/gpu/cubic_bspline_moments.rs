@@ -1110,14 +1110,22 @@ pub fn build_hex_tensor_moments_device(
 
 /// macOS-side stub so the Phase 2 entry point is callable on every host;
 /// returns the same `DriverLibraryUnavailable` error as the backend probe.
+/// Params are referenced in the error message so the non-Linux build does
+/// not silently strip them via `_`-prefixed silencer names.
 #[cfg(not(target_os = "linux"))]
 pub fn build_hex_tensor_moments_device(
-    _spec: &CubicMomentSpec,
-    _axis_tables: &[Vec<AxisCubicMomentTables>],
-    _cells: &HexCellTable,
+    spec: &CubicMomentSpec,
+    axis_tables: &[Vec<AxisCubicMomentTables>],
+    cells: &HexCellTable,
 ) -> Result<DeviceCubicMomentTable, GpuError> {
     Err(GpuError::DriverLibraryUnavailable {
-        reason: "cubic_bspline_moments GPU backend is Linux-only".to_string(),
+        reason: format!(
+            "cubic_bspline_moments GPU backend is Linux-only \
+             (layout={:?}, axis_tables_axes={}, n_cells={})",
+            spec.layout,
+            axis_tables.len(),
+            cells.n_cells,
+        ),
     })
 }
 

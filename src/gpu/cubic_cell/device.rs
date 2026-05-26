@@ -486,7 +486,7 @@ impl CubicCellGpuBackend {
 
         let n_cells = view.cells.len();
         let stride = view.max_degree + 1;
-        debug_assert!(n_cells > 0, "caller must guard empty views");
+        assert!(n_cells > 0, "caller must guard empty views");
 
         // ---- Run the host classifier so cells the kernel can't handle
         //      (genuinely degenerate intervals, non-finite coefficients,
