@@ -21187,19 +21187,19 @@ mod tests {
             .expect("constraint lookup")
             .expect("time constraints");
         let row_scale = 2.0_f64.sqrt();
-        assert_relative_eq!(
-            constraints.a,
-            array![
-                [1.0 / row_scale, 1.0 / row_scale],
-                [1.0 / row_scale, -1.0 / row_scale]
-            ],
-            epsilon = 1e-12
-        );
-        assert_relative_eq!(
-            constraints.b,
-            array![1.0 / row_scale, 0.75 / row_scale],
-            epsilon = 1e-12
-        );
+        let expected_a = array![
+            [1.0 / row_scale, 1.0 / row_scale],
+            [1.0 / row_scale, -1.0 / row_scale]
+        ];
+        assert_eq!(constraints.a.dim(), expected_a.dim());
+        for (got, want) in constraints.a.iter().zip(expected_a.iter()) {
+            assert_relative_eq!(*got, *want, epsilon = 1e-12);
+        }
+        let expected_b = array![1.0 / row_scale, 0.75 / row_scale];
+        assert_eq!(constraints.b.dim(), expected_b.dim());
+        for (got, want) in constraints.b.iter().zip(expected_b.iter()) {
+            assert_relative_eq!(*got, *want, epsilon = 1e-12);
+        }
     }
 
     #[test]

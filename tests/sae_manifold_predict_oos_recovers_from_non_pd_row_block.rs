@@ -23,7 +23,7 @@
 //!
 //! No `let _`, no `#[allow]`, no `#[ignore]`, no env vars.
 
-use ndarray::{Array1, Array2, array};
+use ndarray::{Array1, Array2, Array3, array};
 
 use gam::terms::{
     AssignmentMode, LatentManifold, SaeAssignment, SaeAtomBasisKind, SaeManifoldAtom,
@@ -35,21 +35,22 @@ use gam::terms::{
 /// `src/terms/sae_manifold.rs` so the integration test reproduces the exact
 /// degeneracy seen on the OOS predict path: zero assignment mass + zero
 /// smoothness penalty on the decoder means `H_tt` collapses to ridge·I.
-fn periodic_basis_tiny(coords: &Array2<f64>) -> (Array2<f64>, Array2<f64>) {
+fn periodic_basis_tiny(coords: &Array2<f64>) -> (Array2<f64>, Array3<f64>) {
     let n = coords.nrows();
     // 3-harmonic periodic basis: [1, cos(t), sin(t)] — matches the in-tree
     // analytic harmonic evaluator's smallest non-trivial layout.
     let m = 3usize;
+    let latent_dim = 1usize;
     let mut phi = Array2::<f64>::zeros((n, m));
-    let mut jet = Array2::<f64>::zeros((n, m));
+    let mut jet = Array3::<f64>::zeros((n, m, latent_dim));
     for i in 0..n {
         let t = coords[[i, 0]];
         phi[[i, 0]] = 1.0;
         phi[[i, 1]] = t.cos();
         phi[[i, 2]] = t.sin();
-        jet[[i, 0]] = 0.0;
-        jet[[i, 1]] = -t.sin();
-        jet[[i, 2]] = t.cos();
+        jet[[i, 0, 0]] = 0.0;
+        jet[[i, 1, 0]] = -t.sin();
+        jet[[i, 2, 0]] = t.cos();
     }
     (phi, jet)
 }
