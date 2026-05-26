@@ -394,9 +394,21 @@ fn score_warp_component_beta(
     Ok(beta.slice(s![range]).to_owned())
 }
 
-fn build_per_z_score_warp_deviation_block_from_seed(
+/// Stripe a (post-reparam) scalar score-warp `base` across K z coordinates
+/// to produce the direct-sum block `Φ_total = [Φ(z_1) | Φ(z_2) | ... | Φ(z_K)]`.
+///
+/// Caller is responsible for any cross-block reparameterisation on
+/// `base.runtime` BEFORE calling this — `compose_anchor_orthogonalisation`
+/// has already updated `base.runtime.basis_dim()` to the kept dimension
+/// `p_kept`, and `base.block.design / penalties / nullspace_dims` reflect
+/// that reparam. Each per-z stripe then evaluates `runtime.design_at_training_with_residual`
+/// at `z[:, k]` so the cached parametric anchor rows are folded into every
+/// stripe, giving a striped design that is jointly orthogonal (in the W-
+/// metric used during reparam) to span(anchors) at training rows.
+fn stripe_score_warp_across_z_coords(
+    base: ParameterBlockInput,
+    base_runtime: DeviationRuntime,
     z: &Array2<f64>,
-    cfg: &DeviationBlockConfig,
 ) -> Result<PerZScoreWarpPrepared, String> {
     let score_dim = z.ncols();
     if score_dim == 0 {
@@ -405,12 +417,10 @@ fn build_per_z_score_warp_deviation_block_from_seed(
         }
         .into());
     }
-    let z_primary = z.column(0).to_owned();
-    let base = build_score_warp_deviation_block_from_seed(&z_primary, cfg)?;
     if score_dim == 1 {
         return Ok(PerZScoreWarpPrepared {
-            block: base.block,
-            runtime: base.runtime,
+            block: base,
+            runtime: base_runtime,
             score_dim,
         });
     }
@@ -421,17 +431,19 @@ fn build_per_z_score_warp_deviation_block_from_seed(
     //
     // The coefficient vector is laid out as [beta_1 | ... | beta_K],
     // and the row design is the horizontal concatenation of the K scalar
-    // designs.  Penalties are block-local on each coordinate slice, giving
-    // each W_k its own smoothing parameter unless a later grouping layer
-    // intentionally ties precision labels.  When K=1, the direct sum has
-    // one component and the function has already returned the exact legacy
-    // scalar block above.
-    let p = base.runtime.basis_dim();
+    // designs. Per-z stripes go through `design_at_training_with_residual`
+    // so that any installed anchor residual (from cross-block reparam) is
+    // subtracted uniformly across all K stripes — each stripe lives in
+    // the SAME orthogonal complement of the parametric anchor span as the
+    // primary z coordinate's basis. Penalties are block-local on each
+    // coordinate slice, giving each W_k its own smoothing parameter unless
+    // a later grouping layer intentionally ties precision labels.
+    let p = base_runtime.basis_dim();
     let n = z.nrows();
     let mut design = Array2::<f64>::zeros((n, p * score_dim));
     for coord in 0..score_dim {
         let z_coord = z.column(coord).to_owned();
-        let coord_design = base.runtime.design(&z_coord)?;
+        let coord_design = base_runtime.design_at_training_with_residual(&z_coord)?;
         if coord_design.nrows() != n || coord_design.ncols() != p {
             return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
                 reason: format!(
@@ -447,13 +459,13 @@ fn build_per_z_score_warp_deviation_block_from_seed(
             .assign(&coord_design);
     }
 
-    let mut block = base.block.clone();
+    let mut block = base.clone();
     block.design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(design));
     block.offset = Array1::zeros(n);
     block.initial_beta = Some(Array1::zeros(p * score_dim));
     block.initial_log_lambdas = None;
-    let base_penalties = base.block.penalties.clone();
-    let base_nullspaces = base.block.nullspace_dims.clone();
+    let base_penalties = base.penalties.clone();
+    let base_nullspaces = base.nullspace_dims.clone();
     block.penalties.clear();
     block.nullspace_dims.clear();
     for coord in 0..score_dim {
@@ -486,7 +498,7 @@ fn build_per_z_score_warp_deviation_block_from_seed(
 
     Ok(PerZScoreWarpPrepared {
         block,
-        runtime: base.runtime,
+        runtime: base_runtime,
         score_dim,
     })
 }
@@ -17607,12 +17619,67 @@ pub fn fit_survival_marginal_slope_terms(
         combine_logslope_surface_designs(joint_designs, &joint_specs)?;
 
     let time_penalties_len = spec.time_block.penalties.len();
-    let score_warp_prepared = spec
-        .score_warp
-        .as_ref()
-        .map(|cfg| build_per_z_score_warp_deviation_block_from_seed(&spec.z, cfg))
-        .transpose()?;
     let mut cross_block_warnings: Vec<CrossBlockIdentifiabilityWarning> = Vec::new();
+    // Score-warp: build the scalar base DeviationPrepared, apply cross-
+    // block identifiability reparameterisation against the parametric
+    // anchor union (marginal + logslope) on the underlying runtime, then
+    // re-stripe across z coordinates. Reparameterising on the scalar base
+    // BEFORE the direct-sum striping is the principled order: the per-z
+    // stripes share a single runtime, so installing the W-metric residual
+    // (`anchor_residual` + cached `anchor_rows_at_training`) once means
+    // every stripe inherits the same orthogonal-complement basis when
+    // `design_at_training_with_residual` is called. Without this, the
+    // score-warp block carries its own constant / low-order η-polynomial
+    // direction on every z stripe, producing the alias pencil
+    //   score_warp_dev[k] ≡ marginal_surface[m] ≡ logslope_surface[ℓ]
+    // and (against the already-reparameterised link-dev) the
+    //   score_warp_dev[k] ≡ link_dev[k]
+    // overlap chain documented by the identifiability audit.
+    let score_warp_prepared = if let Some(cfg) = spec.score_warp.as_ref() {
+        let score_dim = spec.z.ncols();
+        if score_dim == 0 {
+            return Err(SurvivalMarginalSlopeError::InvalidInput {
+                reason: "survival score-warp requires at least one z coordinate".to_string(),
+            }
+            .into());
+        }
+        let mut base = build_score_warp_deviation_block_from_seed(&z_primary, cfg)?;
+        let anchors = vec![
+            CrossBlockAnchor::Parametric(&marginal_design.design),
+            CrossBlockAnchor::Parametric(&logslope_design.design),
+        ];
+        let anchor_tags: Vec<Option<ParametricAnchorBlock>> = vec![
+            Some(ParametricAnchorBlock::Marginal),
+            Some(ParametricAnchorBlock::Logslope),
+        ];
+        let outcome = enforce_cross_block_identifiability_for_flex_block(
+            &mut base,
+            &z_primary,
+            cfg,
+            &anchors,
+            &anchor_tags,
+            &spec.weights,
+        )?;
+        match outcome {
+            CrossBlockIdentifiabilityOutcome::Reparameterised => Some(
+                stripe_score_warp_across_z_coords(base.block, base.runtime, &spec.z)?,
+            ),
+            CrossBlockIdentifiabilityOutcome::FullyAliased { reason } => {
+                log::warn!(
+                    "[survival-marginal-slope cross-block identifiability] score-warp block fully aliased \
+                     by marginal+logslope anchors; dropping the block. {reason}"
+                );
+                cross_block_warnings.push(CrossBlockIdentifiabilityWarning {
+                    candidate_label: "score_warp",
+                    anchor_summary: "marginal+logslope".to_string(),
+                    reason,
+                });
+                None
+            }
+        }
+    } else {
+        None
+    };
     let link_dev_prepared = if let Some(cfg) = spec.link_dev.as_ref() {
         let q0_seed = Array1::from_iter((0..n).map(|row| {
             let q_exit = spec.time_block.offset_exit[row] + spec.marginal_offset[row];
@@ -17647,14 +17714,31 @@ pub fn fit_survival_marginal_slope_terms(
         // Hessian row metric instead would tighten the W-orthogonality
         // claim during PIRLS but does not change which directions get
         // dropped from the basis.
-        let anchors = vec![
+        // Thread the now-reparameterised score-warp basis at training rows
+        // as a flex-evaluation anchor so the link-deviation basis is jointly
+        // orthogonal to span(marginal, logslope, score_warp). Mirrors BMS at
+        // bernoulli_marginal_slope.rs:18291-18307. For the per-z striped
+        // score-warp, only the primary-coordinate basis is needed as a flex
+        // anchor (score-warp's per-z stripes share a single underlying
+        // basis, all in the same orthogonal complement of the parametric
+        // anchors after the score-warp reparam above), so we evaluate the
+        // reparameterised runtime at z_primary.
+        let score_warp_anchor_design = score_warp_prepared
+            .as_ref()
+            .map(|sw| sw.runtime.design_at_training_with_residual(&z_primary))
+            .transpose()?;
+        let mut anchors = vec![
             CrossBlockAnchor::Parametric(&marginal_design.design),
             CrossBlockAnchor::Parametric(&logslope_design.design),
         ];
-        let anchor_tags: Vec<Option<ParametricAnchorBlock>> = vec![
+        let mut anchor_tags: Vec<Option<ParametricAnchorBlock>> = vec![
             Some(ParametricAnchorBlock::Marginal),
             Some(ParametricAnchorBlock::Logslope),
         ];
+        if let Some(ref a) = score_warp_anchor_design {
+            anchors.push(CrossBlockAnchor::FlexEvaluation(a));
+            anchor_tags.push(None);
+        }
         let outcome = enforce_cross_block_identifiability_for_flex_block(
             &mut prepared,
             &q0_seed,
