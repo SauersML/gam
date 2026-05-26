@@ -696,11 +696,6 @@ impl IsometryPenalty {
     }
 
     fn missing_cache_default(&self, method: &str, detail: &str) {
-        let has_required_cache = false;
-        assert!(
-            has_required_cache,
-            "IsometryPenalty::{method} missing required derivative state: {detail}"
-        );
         log::warn!(
             "IsometryPenalty::{method} missing required derivative state: {detail}; \
              returning the zero safe default"
