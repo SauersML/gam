@@ -169,7 +169,7 @@ pub fn poincare_distance(
     let denom_a = (1.0 + curvature * a_sq).max(ORIGIN_EPS);
     let denom_b = (1.0 + curvature * b_sq).max(ORIGIN_EPS);
     let arg = 1.0 + 2.0 * (-curvature) * diff_sq / (denom_a * denom_b);
-    let arg = arg.max(1.0 + ORIGIN_EPS);
+    let arg = arg.max(1.0);
     Ok(arg.acosh() / sqrt_negc)
 }
 
