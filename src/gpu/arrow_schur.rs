@@ -87,6 +87,26 @@ pub fn solve_arrow_newton_step(
 
     #[cfg(target_os = "linux")]
     {
+        // Layer D admission: when the system shape passes the
+        // (Σ p³ ≥ 1e5 OR R ≥ 16) heuristic and `p ≤ MAX_FUSED_P`, the fused
+        // NVRTC kernel replaces the cuSOLVER/cuBLAS Layer A+B+C path with a
+        // single per-row block. Layer C↔D parity (math block 3 §16 test 6)
+        // requires both paths to agree to 1e-10 on identical inputs.
+        if crate::gpu::arrow_schur_nvrtc::system_admits_fused_path(sys) {
+            match cuda::solve_fused(sys, ridge_t, ridge_beta) {
+                Ok(sol) => return Ok(sol),
+                // RidgeBumpRequired must surface to the outer escalation loop —
+                // the fused path's pivot diagnostic is identical in semantics
+                // to the cuSOLVER batched POTRF info code.
+                Err(ArrowSchurGpuFailure::RidgeBumpRequired { row, bump }) => {
+                    return Err(ArrowSchurGpuFailure::RidgeBumpRequired { row, bump });
+                }
+                // Any other failure (Unavailable, SchurFactorFailed) falls
+                // through to the unfused path so a flaky NVRTC compile or
+                // shared-mem allocation does not abort the outer Newton step.
+                Err(_) => {}
+            }
+        }
         cuda::solve(sys, ridge_t, ridge_beta)
     }
 }
@@ -745,6 +765,363 @@ mod cuda {
                 .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
         }
         Ok(())
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Layer D + E — fused NVRTC dispatch.
+    //
+    // The forward kernel (`arrow_schur_forward_pgroup`) is a single launch
+    // that, per row block, factors `D_i + ρI = L_i L_iᵀ` in shared memory,
+    // forward-solves `u_i = L_i⁻¹ g_i` and `Y_i = L_i⁻¹ B_i`, and emits the
+    // per-block Schur partials `partial_S[i] = Yᵀ Y` (R×R) and
+    // `partial_r[i] = Yᵀ u` (R). The host reduces partials on the CPU after
+    // dtoh (one fused sum across `n` blocks of R²+R doubles; cheap because
+    // n·R² ≲ 5M doubles at biobank scale), assembles `S_β`, factors it via
+    // cuSOLVER, and launches the back-substitution kernel
+    // `arrow_schur_back_sub_pgroup` to recover `δt_i = -L_i⁻ᵀ(u_i + Y_i δβ)`
+    // without re-uploading the local factors.
+    // ────────────────────────────────────────────────────────────────────
+
+    use cudarc::driver::{CudaContext, CudaModule, LaunchConfig, PushKernelArg};
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    /// One compiled NVRTC module per `(cc_major, cc_minor, p_max, r_template)`.
+    /// `cc_*` lets one process drive multiple device generations; the
+    /// `(p_max, r_template)` pair selects the shared-memory layout baked into
+    /// the kernel source.
+    struct FusedModuleCache {
+        modules: Mutex<HashMap<crate::gpu::arrow_schur_nvrtc::FusedModuleCacheKey, Arc<CudaModule>>>,
+    }
+
+    fn fused_module_cache() -> &'static FusedModuleCache {
+        static CACHE: OnceLock<FusedModuleCache> = OnceLock::new();
+        CACHE.get_or_init(|| FusedModuleCache {
+            modules: Mutex::new(HashMap::new()),
+        })
+    }
+
+    fn fused_module_for(
+        ctx: &Arc<CudaContext>,
+        key: crate::gpu::arrow_schur_nvrtc::FusedModuleCacheKey,
+    ) -> Result<Arc<CudaModule>, ArrowSchurGpuFailure> {
+        let cache = fused_module_cache();
+        if let Ok(guard) = cache.modules.lock() {
+            if let Some(existing) = guard.get(&key) {
+                return Ok(existing.clone());
+            }
+        }
+        let src = crate::gpu::arrow_schur_nvrtc::forward_kernel_source(
+            key.p_max as usize,
+            key.r_template as usize,
+        );
+        let ptx = cudarc::nvrtc::compile_ptx(&src).map_err(|err| {
+            ArrowSchurGpuFailure::SchurFactorFailed {
+                reason: format!(
+                    "arrow-schur fused NVRTC compile (p_max={}, r={}): {err}",
+                    key.p_max, key.r_template
+                ),
+            }
+        })?;
+        let module = ctx
+            .load_module(ptx)
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        if let Ok(mut guard) = cache.modules.lock() {
+            guard.entry(key).or_insert_with(|| module.clone());
+        }
+        Ok(module)
+    }
+
+    /// Pack `D + ρ_t I`, `B`, and `g` into the strided `(n × P_MAX × P_MAX)`
+    /// / `(n × P_MAX × R_TEMPLATE)` / `(n × P_MAX)` layout the fused kernel
+    /// expects. Entries outside the runtime `(p, r)` window stay at zero so
+    /// the kernel's per-element loops are safe to no-op there.
+    fn pack_fused_host(
+        sys: &ArrowSchurSystem,
+        ridge_t: f64,
+        p_max: usize,
+        r_template: usize,
+    ) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+        let n = sys.rows.len();
+        let d = sys.d;
+        let k = sys.k;
+        let mut d_buf = vec![0.0_f64; n * p_max * p_max];
+        let mut b_buf = vec![0.0_f64; n * p_max * r_template];
+        let mut g_buf = vec![0.0_f64; n * p_max];
+        for (i, row) in sys.rows.iter().enumerate() {
+            // D_i + ρI, column-major in P_MAX×P_MAX strided block.
+            for col in 0..d {
+                let base = (i * p_max + col) * p_max;
+                for r in 0..d {
+                    let mut value = row.htt[[r, col]];
+                    if r == col {
+                        value += ridge_t;
+                    }
+                    d_buf[base + r] = value;
+                }
+            }
+            // B_i in P_MAX×R_TEMPLATE strided block.
+            for col in 0..k {
+                let base = (i * p_max + col) * p_max;
+                for r in 0..d {
+                    b_buf[base + r] = row.htbeta[[r, col]];
+                }
+            }
+            // g_i in P_MAX strided vector.
+            let g_base = i * p_max;
+            for r in 0..d {
+                g_buf[g_base + r] = row.gt[r];
+            }
+        }
+        (d_buf, b_buf, g_buf)
+    }
+
+    pub(super) fn solve_fused(
+        sys: &ArrowSchurSystem,
+        ridge_t: f64,
+        ridge_beta: f64,
+    ) -> Result<ArrowSchurGpuSolution, ArrowSchurGpuFailure> {
+        let n = sys.rows.len();
+        let d = sys.d;
+        let k = sys.k;
+        let plan = crate::gpu::arrow_schur_nvrtc::plan_fused_launch(n, d, k)
+            .ok_or(ArrowSchurGpuFailure::Unavailable)?;
+        let p_max = plan.p_max;
+        let r_template = plan.r_template;
+
+        let runtime = crate::gpu::linalg::route_through_gpu(
+            crate::gpu::linalg::DispatchOp::SmallDenseBatchedPotrf { p: d, batch: n },
+        )
+        .ok_or(ArrowSchurGpuFailure::Unavailable)?;
+        let ctx = crate::gpu::runtime::cuda_context_for(runtime.device.ordinal)
+            .ok_or(ArrowSchurGpuFailure::Unavailable)?;
+        let stream = ctx
+            .new_stream()
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        let cap = &runtime.device.capability;
+        let key = crate::gpu::arrow_schur_nvrtc::FusedModuleCacheKey {
+            cc_major: cap.compute_major,
+            cc_minor: cap.compute_minor,
+            p_max: p_max as u32,
+            r_template: r_template as u32,
+        };
+        let module = fused_module_for(&ctx, key)?;
+        let forward = module
+            .load_function("arrow_schur_forward_pgroup")
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        let back_sub = module
+            .load_function("arrow_schur_back_sub_pgroup")
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+
+        // ----- Upload packed D, B, g -----
+        let (d_host, b_host, g_host) = pack_fused_host(sys, ridge_t, p_max, r_template);
+        let d_dev = stream
+            .clone_htod(&d_host)
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        let b_dev = stream
+            .clone_htod(&b_host)
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        let g_dev = stream
+            .clone_htod(&g_host)
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        let mut l_out = stream
+            .alloc_zeros::<f64>(n * p_max * p_max)
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        let mut u_out = stream
+            .alloc_zeros::<f64>(n * p_max)
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        let mut y_out = stream
+            .alloc_zeros::<f64>(n * p_max * r_template)
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        let mut partial_s = stream
+            .alloc_zeros::<f64>(plan.partial_s_doubles)
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        let mut partial_r = stream
+            .alloc_zeros::<f64>(plan.partial_r_doubles)
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        let mut status_dev = stream
+            .alloc_zeros::<i32>(n)
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+
+        // ----- Launch forward kernel: 1 block per row, P_MAX threads -----
+        let cfg = LaunchConfig {
+            grid_dim: (plan.blocks, 1, 1),
+            block_dim: (plan.threads_per_block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let n_i32 = to_i32(n).ok_or(ArrowSchurGpuFailure::Unavailable)?;
+        let p_i32 = to_i32(d).ok_or(ArrowSchurGpuFailure::Unavailable)?;
+        let r_i32 = to_i32(k).ok_or(ArrowSchurGpuFailure::Unavailable)?;
+        let ridge_arg = ridge_t;
+        {
+            let mut builder = stream.launch_builder(&forward);
+            builder
+                .arg(&d_dev)
+                .arg(&b_dev)
+                .arg(&g_dev)
+                .arg(&n_i32)
+                .arg(&p_i32)
+                .arg(&r_i32)
+                .arg(&ridge_arg)
+                .arg(&mut l_out)
+                .arg(&mut u_out)
+                .arg(&mut y_out)
+                .arg(&mut partial_s)
+                .arg(&mut partial_r)
+                .arg(&mut status_dev);
+            // SAFETY: all buffers were just allocated on `stream` with sizes
+            // derived from `plan`; kernel parameter list matches the
+            // FORWARD_KERNEL_SOURCE signature.
+            unsafe { builder.launch(cfg) }
+                .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        }
+        stream
+            .synchronize()
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+
+        // ----- Check per-block pivot status -----
+        let status_host = stream
+            .clone_dtoh(&status_dev)
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        if let Some(row) = status_host.iter().position(|s| *s != 0) {
+            let pivot = status_host[row];
+            let scale = sys.rows[row]
+                .htt
+                .diag()
+                .iter()
+                .map(|v| v.abs())
+                .fold(0.0_f64, f64::max)
+                .max(1.0);
+            return Err(ArrowSchurGpuFailure::RidgeBumpRequired {
+                row,
+                bump: scale * (pivot.abs() as f64).max(1.0) * f64::EPSILON.sqrt() * 1024.0,
+            });
+        }
+
+        // ----- Reduce partials on host into S_β and r_β -----
+        let partial_s_host = stream
+            .clone_dtoh(&partial_s)
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        let partial_r_host = stream
+            .clone_dtoh(&partial_r)
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        let mut schur_host = vec![0.0_f64; k * k];
+        for col in 0..k {
+            for row in 0..k {
+                let mut v = sys.hbb[[row, col]];
+                if row == col {
+                    v += ridge_beta;
+                }
+                schur_host[col * k + row] = v;
+            }
+        }
+        let mut rhs_host: Vec<f64> = sys.gb.iter().map(|v| -v).collect();
+        for i in 0..n {
+            // partial_S[i] stride is R_TEMPLATE × R_TEMPLATE column-major; we
+            // only read the leading (k × k) sub-block.
+            let s_base = i * r_template * r_template;
+            for col in 0..k {
+                let col_base = s_base + col * r_template;
+                let dst_col_base = col * k;
+                for row in 0..k {
+                    schur_host[dst_col_base + row] -= partial_s_host[col_base + row];
+                }
+            }
+            let r_base = i * r_template;
+            for a in 0..k {
+                rhs_host[a] += partial_r_host[r_base + a];
+            }
+        }
+
+        // ----- Factor S_β on device (cuSOLVER), solve for δβ -----
+        let mut schur_dev = stream
+            .clone_htod(&schur_host)
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        let mut rhs_dev = stream
+            .clone_htod(&rhs_host)
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        let solver =
+            DnHandle::new(stream.clone()).map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        let blas = CudaBlas::new(stream.clone()).map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        let info = potrf_single(&solver, &stream, k, &mut schur_dev)?;
+        if info != 0 {
+            return Err(ArrowSchurGpuFailure::SchurFactorFailed {
+                reason: format!("fused Schur Cholesky failed at pivot {info}"),
+            });
+        }
+        trsm_single(&blas, &stream, k, &schur_dev, &mut rhs_dev, false, false)?;
+        trsm_single(&blas, &stream, k, &schur_dev, &mut rhs_dev, false, true)?;
+        let delta_beta_host = stream
+            .clone_dtoh(&rhs_dev)
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        let delta_beta = Array1::from_vec(delta_beta_host.clone());
+
+        // ----- Layer E: launch back-sub kernel using persisted L, u, Y -----
+        let mut delta_t_dev = stream
+            .alloc_zeros::<f64>(n * p_max)
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        let back_cfg = LaunchConfig {
+            grid_dim: (plan.blocks, 1, 1),
+            block_dim: (plan.threads_per_block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        {
+            let mut builder = stream.launch_builder(&back_sub);
+            builder
+                .arg(&l_out)
+                .arg(&u_out)
+                .arg(&y_out)
+                .arg(&rhs_dev)
+                .arg(&n_i32)
+                .arg(&p_i32)
+                .arg(&r_i32)
+                .arg(&mut delta_t_dev);
+            // SAFETY: kernel parameter list matches FORWARD_KERNEL_SOURCE
+            // back-sub signature; `rhs_dev` holds δβ in the leading k entries
+            // (R_TEMPLATE-strided indexing is column 0..k of the R-vector).
+            unsafe { builder.launch(back_cfg) }
+                .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        }
+        stream
+            .synchronize()
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+
+        let delta_t_host = stream
+            .clone_dtoh(&delta_t_dev)
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        let mut delta_t = Array1::<f64>::zeros(n * d);
+        for i in 0..n {
+            let src_base = i * p_max;
+            let dst_base = i * d;
+            for r in 0..d {
+                delta_t[dst_base + r] = delta_t_host[src_base + r];
+            }
+        }
+
+        // ----- log|H| = 2·Σ log L_{i,jj} + 2·Σ log R_{β,aa} -----
+        let l_local_host = stream
+            .clone_dtoh(&l_out)
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        let l_schur_host = stream
+            .clone_dtoh(&schur_dev)
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        let mut log_det = 0.0_f64;
+        for i in 0..n {
+            let base = i * p_max * p_max;
+            for j in 0..d {
+                log_det += l_local_host[base + j * p_max + j].ln();
+            }
+        }
+        for j in 0..k {
+            log_det += l_schur_host[j * k + j].ln();
+        }
+        log_det *= 2.0;
+
+        Ok(ArrowSchurGpuSolution {
+            delta_t,
+            delta_beta,
+            log_det_hessian: log_det,
+        })
     }
 }
 

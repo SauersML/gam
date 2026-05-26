@@ -709,26 +709,9 @@ extern "C" __global__ void reduce_q_weighted_gram(
 
     const THREADS_PER_BLOCK: u32 = 256;
 
-    struct CompiledModule {
-        module: Arc<CudaModule>,
-    }
-
-    fn module(ctx: &Arc<CudaContext>) -> Result<&'static CompiledModule, GpuError> {
-        static MODULE: OnceLock<Result<CompiledModule, GpuError>> = OnceLock::new();
-        let result = MODULE.get_or_init(|| {
-            let ptx = cudarc::nvrtc::compile_ptx(PTX_SOURCE).map_err(|err| {
-                GpuError::DriverCallFailed {
-                    reason: format!("reml_trace NVRTC compile failed: {err}"),
-                }
-            })?;
-            let m = ctx
-                .load_module(ptx)
-                .map_err(|err| GpuError::DriverCallFailed {
-                    reason: format!("reml_trace module load failed: {err}"),
-                })?;
-            Ok(CompiledModule { module: m })
-        });
-        result.as_ref().map_err(GpuError::clone)
+    fn module(ctx: &Arc<CudaContext>) -> Result<&'static Arc<CudaModule>, GpuError> {
+        static CACHE: crate::gpu::common::PtxModuleCache = crate::gpu::common::PtxModuleCache::new();
+        CACHE.get_or_compile(ctx, "reml_trace", PTX_SOURCE)
     }
 
     pub(super) fn evidence_derivatives(
@@ -746,6 +729,7 @@ extern "C" __global__ void reduce_q_weighted_gram(
             reason: format!("reml_trace cublas init: {err}"),
         })?;
         let compiled = module(&ctx)?;
+        let module_handle: &Arc<CudaModule> = compiled;
 
         // ── 1. Upload H, factor once.
         let h_col = to_col_major(&input.penalized_hessian);
@@ -770,7 +754,7 @@ extern "C" __global__ void reduce_q_weighted_gram(
                 .map_err(|err| GpuError::DriverCallFailed {
                     reason: format!("reml_trace alloc Z: {err}"),
                 })?;
-        launch_fill_rademacher(&stream, &compiled.module, input.seed, p, k, &mut z_dev)?;
+        launch_fill_rademacher(&stream, module_handle, input.seed, p, k, &mut z_dev)?;
 
         // ── 3. Solve H W = Z in a single batched potrs call (nrhs = K).
         //     Copy Z into a fresh buffer first; potrs is in-place.
@@ -845,7 +829,7 @@ extern "C" __global__ void reduce_q_weighted_gram(
                         })?;
                 launch_reduce_q_dense(
                     &stream,
-                    &compiled.module,
+                    module_handle,
                     p,
                     k,
                     1,
@@ -953,7 +937,7 @@ extern "C" __global__ void reduce_q_weighted_gram(
             })?;
             launch_reduce_q_weighted_gram(
                 &stream,
-                &compiled.module,
+                module_handle,
                 n,
                 k,
                 d_gram,
