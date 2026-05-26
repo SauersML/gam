@@ -146,10 +146,11 @@ const INV_TWO_PI: f64 = 1.0 / std::f64::consts::TAU;
 
 /// 384-point Gauss–Legendre nodes, re-exported for the GPU cubic-cell kernel
 /// (`src/gpu/cubic_cell/kernel_src.rs`) to embed as `__constant__` device
-/// memory. Kept in sync with the CPU evaluator's quadrature so CPU↔GPU parity
-/// holds byte-for-byte before sum rounding.
+/// memory. Linux-only because the kernel emitter is Linux-only.
+#[cfg(target_os = "linux")]
 pub(crate) const GL_NODES_FOR_GPU_KERNEL: &[f64; 384] = &GL_NODES;
-/// Companion weights to [`GL_NODES_FOR_GPU_KERNEL`]; same parity rationale.
+/// Companion weights to [`GL_NODES_FOR_GPU_KERNEL`].
+#[cfg(target_os = "linux")]
 pub(crate) const GL_WEIGHTS_FOR_GPU_KERNEL: &[f64; 384] = &GL_WEIGHTS;
 
 const GL_NODES: [f64; 384] = [

@@ -2,9 +2,12 @@
 //! moment kernel, emitted as Rust string constants.
 //!
 //! The actual nvcc/NVRTC invocation lives elsewhere; this module is pure
-//! string construction so it builds on any host (including darwin without
-//! CUDA). One specialization is emitted per `max_degree`; consumers use
+//! string construction and is only compiled on Linux+CUDA where
+//! `CubicCellGpuBackend::module_for_degree` consumes the emitted source.
+//! One specialization is emitted per `max_degree`; consumers use
 //! `_d9`, `_d15`, `_d21` for the published high-water marks.
+
+#![cfg(target_os = "linux")]
 
 use std::fmt::Write as _;
 

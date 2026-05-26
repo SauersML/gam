@@ -82,12 +82,6 @@ pub(crate) enum GpuCellBranchTag {
     AffineTail,
 }
 
-/// What the caller wants the substrate to compute per cell.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CubicCellMomentMode {
-    DerivativeOnly,
-}
-
 /// Where the caller wants results materialized.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CubicCellMomentResidency {
@@ -121,12 +115,12 @@ pub(crate) struct CubicCellDerivativeMomentHostView<'a> {
     pub cells: &'a [GpuDenestedCubicCell],
     pub branches: &'a [GpuCellBranchTag],
     pub max_degree: usize,
-    pub mode: CubicCellMomentMode,
     pub residency: CubicCellMomentResidency,
 }
 
 /// Output of `try_build_cubic_cell_derivative_moments`. Single host-resident
 /// shape until a real device-residency consumer lands.
+#[derive(Debug)]
 pub(crate) enum CubicCellDerivativeMomentOutput {
     /// Row-major `[n_cells, max_degree + 1]` host buffer + per-cell status
     /// codes. Row `i` is `moments[i * stride ..][..stride]` where
@@ -221,7 +215,6 @@ mod tests {
             cells,
             branches,
             max_degree,
-            mode: CubicCellMomentMode::DerivativeOnly,
             residency: CubicCellMomentResidency::Host,
         }
     }

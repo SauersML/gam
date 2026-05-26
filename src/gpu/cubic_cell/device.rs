@@ -24,12 +24,11 @@ use crate::gpu::cubic_cell::host_substrate::HostMomentBatch;
 use crate::gpu::cubic_cell::{
     CubicCellMomentStatus, GpuCellBranchTag, branch::classify_cell_for_gpu,
 };
-use crate::gpu::cubic_cell::{CubicCellDerivativeMomentHostView, CubicCellMomentMode};
+use crate::gpu::cubic_cell::CubicCellDerivativeMomentHostView;
 use crate::gpu::error::GpuError;
 
 #[cfg(target_os = "linux")]
-use std::sync::{Arc, Mutex};
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 
 #[cfg(target_os = "linux")]
 use cudarc::driver::{CudaContext, CudaModule, CudaStream};
@@ -41,33 +40,33 @@ use cudarc::driver::{CudaContext, CudaModule, CudaStream};
 /// buckets. Returns `Ok(None)` when no GPU runtime is available (caller
 /// should fall back to the host substrate). Returns `Err` on a genuine
 /// driver / NVRTC / shape failure that the caller must surface.
+#[cfg(target_os = "linux")]
 pub(crate) fn try_device_moments(
     view: &CubicCellDerivativeMomentHostView<'_>,
 ) -> Result<Option<HostMomentBatch>, GpuError> {
-    if !CubicCellGpuBackend::compiled() {
-        return Ok(None);
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let backend = match CubicCellGpuBackend::probe() {
-            Ok(b) => b,
-            Err(GpuError::DriverLibraryUnavailable { .. }) => return Ok(None),
-            Err(other) => return Err(other),
-        };
-        backend.dispatch(view).map(Some)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        Ok(None)
-    }
+    let backend = match CubicCellGpuBackend::probe() {
+        Ok(b) => b,
+        Err(GpuError::DriverLibraryUnavailable { .. }) => return Ok(None),
+        Err(other) => return Err(other),
+    };
+    backend.dispatch(view).map(Some)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn try_device_moments(
+    _view: &CubicCellDerivativeMomentHostView<'_>,
+) -> Result<Option<HostMomentBatch>, GpuError> {
+    Ok(None)
 }
 
 /// Process-wide cubic-cell GPU backend. Mirrors the
 /// `BmsFlexGpuBackend` / `SurvivalFlexGpuBackend` shape so future
-/// device-residency residencies can swap in without churn.
+/// device-residency residencies can swap in without churn. Linux-only:
+/// non-Linux builds compile a `try_device_moments` stub that never
+/// constructs this backend.
+#[cfg(target_os = "linux")]
 #[must_use]
 pub(crate) struct CubicCellGpuBackend {
-    #[cfg(target_os = "linux")]
     inner: CubicCellGpuContextLinux,
 }
 
@@ -80,31 +79,15 @@ struct CubicCellGpuContextLinux {
     modules: Mutex<std::collections::HashMap<usize, Arc<CudaModule>>>,
 }
 
+#[cfg(target_os = "linux")]
 impl CubicCellGpuBackend {
-    /// Returns `true` if the cubic-cell GPU backend is compiled into this
-    /// build (Linux + cudarc).
-    pub(crate) const fn compiled() -> bool {
-        cfg!(target_os = "linux")
-    }
-
     /// Lazily initialise the process-wide backend. First-call NVRTC-compile
     /// of the kernel module is deferred to dispatch (each `max_degree`
     /// specialization compiles on first use, cached forever).
     pub(crate) fn probe() -> Result<&'static Self, GpuError> {
         static BACKEND: OnceLock<Result<CubicCellGpuBackend, GpuError>> = OnceLock::new();
         BACKEND
-            .get_or_init(|| {
-                #[cfg(target_os = "linux")]
-                {
-                    Self::probe_linux()
-                }
-                #[cfg(not(target_os = "linux"))]
-                {
-                    Err(GpuError::DriverLibraryUnavailable {
-                        reason: "cubic_cell GPU backend is Linux-only".to_string(),
-                    })
-                }
-            })
+            .get_or_init(Self::probe_linux)
             .as_ref()
             .map_err(GpuError::clone)
     }
@@ -463,7 +446,7 @@ impl CubicCellGpuBackend {
 mod tests {
     use super::*;
     use crate::gpu::cubic_cell::{
-        CubicCellDerivativeMomentHostView, CubicCellMomentMode, CubicCellMomentResidency,
+        CubicCellDerivativeMomentHostView, CubicCellMomentResidency,
         GpuCellBranchTag, GpuDenestedCubicCell,
     };
     use crate::gpu::runtime::GpuRuntime;
@@ -536,7 +519,6 @@ mod tests {
             cells: &cells,
             branches: &branches,
             max_degree,
-            mode: CubicCellMomentMode::DerivativeOnly,
             residency: CubicCellMomentResidency::Host,
         };
 
@@ -588,7 +570,6 @@ mod tests {
             cells: &cells,
             branches: &branches,
             max_degree: 9,
-            mode: CubicCellMomentMode::DerivativeOnly,
             residency: CubicCellMomentResidency::Host,
         };
         let out = try_device_moments(&view).expect("clean Ok on hosts without CUDA");
