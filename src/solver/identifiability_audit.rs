@@ -356,6 +356,7 @@ pub fn audit_identifiability(specs: &[ParameterBlockSpec]) -> Result<Identifiabi
     let pairwise_block_heartbeat = (n.saturating_mul(p_total) >= 1_000_000)
         .then(crate::util::heartbeat::Heartbeat::default_interval);
     let mut aliased_pairs: Vec<AliasedPair> = Vec::new();
+    let n_block_pairs = specs.len().saturating_mul(specs.len().saturating_sub(1)) / 2;
     for a_block_idx in 0..specs.len() {
         let a_start = col_offsets[a_block_idx];
         let a_end = col_offsets[a_block_idx + 1];
@@ -387,8 +388,20 @@ pub fn audit_identifiability(specs: &[ParameterBlockSpec]) -> Result<Identifiabi
                     }
                 }
             }
+            if let Some(hb) = pairwise_block_heartbeat.as_ref() {
+                hb.tick(1, |done, secs| {
+                    log::info!(
+                        "[STAGE] identifiability audit: pairwise overlap progress {done}/{n_block_pairs} block pairs in {secs:.1}s",
+                    );
+                });
+            }
         }
     }
+    log::info!(
+        "[STAGE] identifiability audit: pairwise overlap scan done in {:.3}s ({} aliased pairs)",
+        pairwise_started.elapsed().as_secs_f64(),
+        aliased_pairs.len(),
+    );
 
     // Attribute each demoted joint column back to its (block, local_col)
     // origin using the col_offsets table built above. The earliest

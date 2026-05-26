@@ -498,7 +498,7 @@ def _build_analytic_penalties_payload(
     ``block_orthogonality_weight``, and ``mechanism_sparsity_groups`` need
     SAE row-block driver work in ``src/terms/sae_manifold.rs`` (Jacobian
     cache for Isometry, target-shape resolution for the others) — tracked
-    as issue #241. Activating any of them raises ``NotImplementedError``
+    as issue #249. Activating any of them raises ``NotImplementedError``
     here so callers cannot silently lose configuration. The historical bug
     (issue #240) was *silent* acceptance; rejecting cleanly with an
     actionable message is the principled wrapper-layer half of the fix.
@@ -521,11 +521,11 @@ def _build_analytic_penalties_payload(
             "`sae_penalty_is_row_block_supported` "
             "(`src/terms/sae_manifold.rs`). Wiring the remaining analytic "
             "penalties needs Jacobian-cache + target-shape work in that "
-            "module; tracked as issue #241. Pass only `ard_per_atom` for "
+            "module; tracked as issue #249. Pass only `ard_per_atom` for "
             "now, or omit these parameters to fit without them."
         )
     # `d_max` / `p_out` are reserved for the descriptors that will land once
-    # issue #241 wires the remaining penalties; they participate in the
+    # issue #249 wires the remaining penalties; they participate in the
     # target-length arithmetic the Rust parsers perform.
     del d_max, p_out
     items: list[dict[str, Any]] = []

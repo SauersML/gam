@@ -33,6 +33,9 @@ def _baseline(**overrides):
     """
     # `sphere` keeps `latent_dim == 2` (periodic atoms force it to 1
     # regardless of `atom_dim`). Block-orthogonality requires ≥2 axes.
+    # `isometry_weight=0.0` overrides the public default of 1.0 so the
+    # baseline does not trip the issue #249 NotImplementedError gate when
+    # tests vary unrelated parameters.
     kwargs = dict(
         n_atoms=1,
         atom_basis="sphere",
@@ -40,6 +43,7 @@ def _baseline(**overrides):
         assignment="softmax",
         max_iter=5,
         random_state=7,
+        isometry_weight=0.0,
     )
     kwargs.update(overrides)
     return kwargs
@@ -115,27 +119,36 @@ def test_topology_selector_is_not_an_accepted_kwarg():
 
 
 def test_primitive_names_metadata_is_not_a_substitute_for_effect():
-    """The current code only updates `primitive_names` when these toggles
-    change. Confirm metadata flips but fits stay identical — captures the
-    exact pathological state from issue #240."""
+    """The original issue-#240 footgun: setting ``isometry_weight`` /
+    ``block_orthogonality_weight`` flipped the ``primitive_names`` list but
+    left fit arrays bit-identical (silent acceptance of a no-op).
+
+    The principled fix has two halves. (1) ``ard_per_atom`` is wired
+    through to Rust and DOES alter the fit (see
+    ``test_ard_per_atom_is_not_a_silent_noop``). (2) The remaining three
+    knobs raise ``NotImplementedError`` at the wrapper boundary until the
+    Rust SAE row-block driver supports them (issue #249). Either branch
+    rules out the pathological metadata-only divergence: this test pins
+    that ``isometry_weight=10.0`` must NOT silently succeed and produce an
+    identical fit."""
     X = _data(seed=2)
     base_kwargs = _baseline()
-    fit_off = gamfit.sae_manifold_fit(
-        Z=X, **base_kwargs, isometry_weight=0.0, block_orthogonality_weight=0.0
+    on_kwargs = dict(base_kwargs)
+    on_kwargs["isometry_weight"] = 10.0
+    on_kwargs["block_orthogonality_weight"] = 10.0
+    try:
+        fit_on = gamfit.sae_manifold_fit(Z=X, **on_kwargs)
+    except NotImplementedError:
+        # Principled rejection — exactly the contract we want.
+        return
+    # If the call returned, the fit must visibly differ from the no-penalty
+    # baseline. Silent acceptance with no effect is the bug.
+    fit_off = gamfit.sae_manifold_fit(Z=X, **base_kwargs)
+    differs = (
+        _differs(fit_on.fitted, fit_off.fitted)
+        or _differs(fit_on.assignments, fit_off.assignments)
     )
-    fit_on = gamfit.sae_manifold_fit(
-        Z=X, **base_kwargs, isometry_weight=10.0, block_orthogonality_weight=10.0
-    )
-    metadata_changed = set(fit_on.primitive_names) != set(fit_off.primitive_names)
-    fit_arrays_unchanged = np.allclose(
-        fit_on.fitted, fit_off.fitted, atol=1e-8, rtol=0.0
-    ) and np.allclose(
-        fit_on.assignments, fit_off.assignments, atol=1e-8, rtol=0.0
-    )
-    # The bug: metadata flips but math doesn't. Pinning that this combination
-    # must not persist — fix must either change the math or remove the
-    # metadata advertising.
-    assert not (metadata_changed and fit_arrays_unchanged), (
-        "Metadata `primitive_names` flipped but `fitted` and `assignments` "
-        "are bit-identical: regularizers are advertised but not applied."
+    assert differs, (
+        "isometry_weight=10.0 and block_orthogonality_weight=10.0 were "
+        "accepted without effect — the issue-#240 silent-no-op regression."
     )

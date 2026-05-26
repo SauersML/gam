@@ -731,6 +731,13 @@ pub fn build_householder_constrained_design_device(
             ),
         });
     }
+    if !beta.is_finite() {
+        return Err(GpuError::DriverCallFailed {
+            reason: format!(
+                "build_householder_constrained_design_device: beta must be finite (got {beta})"
+            ),
+        });
+    }
 
     #[cfg(target_os = "linux")]
     {
