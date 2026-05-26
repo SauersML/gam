@@ -18379,7 +18379,7 @@ pub fn fit_survival_marginal_slope_terms(
                 row_set_rows,
             );
             let rho = theta.slice(s![..setup.rho_dim()]).to_owned();
-            let blocks = build_blocks(&rho, &designs[0], &designs[1])?;
+            let blocks = build_blocks(&rho, &designs[0], &designs[1], FlexActivation::On)?;
             if let Some(beta_seed) = pending_beta_seed.borrow_mut().take() {
                 let widths: Vec<usize> = blocks.iter().map(|b| b.design.ncols()).collect();
                 match CustomFamilyWarmStart::from_cached_beta(&widths, &beta_seed) {
@@ -18395,7 +18395,7 @@ pub fn fit_survival_marginal_slope_terms(
             }
             let sigma = sigma_from_theta(theta);
             sigma_hint.replace(sigma);
-            let family = make_family(&designs[0], &designs[1], sigma);
+            let family = make_family(&designs[0], &designs[1], sigma, FlexActivation::On);
             let derivative_blocks = get_derivative_blocks(theta, specs, designs)?;
             // Preserve ValueOnly probes and request the Hessian exactly when
             // this realized family advertised analytic joint second-order
@@ -18445,7 +18445,7 @@ pub fn fit_survival_marginal_slope_terms(
                 theta.len(),
             );
             let rho = theta.slice(s![..setup.rho_dim()]).to_owned();
-            let blocks = build_blocks(&rho, &designs[0], &designs[1])?;
+            let blocks = build_blocks(&rho, &designs[0], &designs[1], FlexActivation::On)?;
             if let Some(beta_seed) = pending_beta_seed.borrow_mut().take() {
                 let widths: Vec<usize> = blocks.iter().map(|b| b.design.ncols()).collect();
                 match CustomFamilyWarmStart::from_cached_beta(&widths, &beta_seed) {
@@ -18461,7 +18461,7 @@ pub fn fit_survival_marginal_slope_terms(
             }
             let sigma = sigma_from_theta(theta);
             sigma_hint.replace(sigma);
-            let family = make_family(&designs[0], &designs[1], sigma);
+            let family = make_family(&designs[0], &designs[1], sigma, FlexActivation::On);
             let derivative_blocks = get_derivative_blocks(theta, specs, designs)?;
             let eval = evaluate_custom_family_joint_hyper_efs_shared(
                 &family,
@@ -18509,8 +18509,12 @@ pub fn fit_survival_marginal_slope_terms(
     }
 
     let (baseline_offset_residuals, baseline_offset_curvatures) = {
-        let final_family =
-            make_family(&solved.designs[0], &solved.designs[1], *sigma_hint.borrow());
+        let final_family = make_family(
+            &solved.designs[0],
+            &solved.designs[1],
+            *sigma_hint.borrow(),
+            FlexActivation::On,
+        );
         final_family.offset_channel_geometry(&solved.fit.block_states)?
     };
     let mut resolved_specs = solved.resolved_specs;
