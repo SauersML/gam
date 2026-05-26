@@ -676,17 +676,17 @@ impl CubicCellGpuBackend {
 
 }
 
-/// Test-only DtoH helpers for cubic-cell device residency parity tests.
-/// `#[cfg(test)]` on the `mod` declaration (with the `test_support` name
-/// the ban scanner's allow-list explicitly accepts) keeps every item inside
-/// invisible to production builds; the dead-pub scanner skips
-/// `#[cfg(test)]`-region defs, so the inner `pub(crate)` is sound even
-/// when the only consumers live in sibling `mod tests` blocks.
 #[cfg(test)]
-pub(crate) mod test_support {
-    use super::CubicCellGpuBackend;
+pub(crate) mod tests {
+    use super::*;
+    use crate::gpu::cubic_cell::{
+        CubicCellDerivativeMomentHostView, CubicCellMomentResidency, CubicCellMomentStatus,
+        GpuCellBranchTag, GpuDenestedCubicCell,
+    };
     use crate::gpu::error::GpuError;
+    use crate::gpu::runtime::GpuRuntime;
 
+    /// Test-only DtoH helper for cubic-cell device residency parity tests.
     pub(crate) fn download_moments(
         backend: &CubicCellGpuBackend,
         d_moments: &cudarc::driver::CudaSlice<f64>,
@@ -695,25 +695,15 @@ pub(crate) mod test_support {
         let host = stream
             .clone_dtoh(d_moments)
             .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("cubic_cell test_support::download_moments DtoH: {err}"),
+                reason: format!("cubic_cell tests::download_moments DtoH: {err}"),
             })?;
         stream
             .synchronize()
             .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("cubic_cell test_support::download_moments sync: {err}"),
+                reason: format!("cubic_cell tests::download_moments sync: {err}"),
             })?;
         Ok(host)
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::gpu::cubic_cell::{
-        CubicCellDerivativeMomentHostView, CubicCellMomentResidency, CubicCellMomentStatus,
-        GpuCellBranchTag, GpuDenestedCubicCell,
-    };
-    use crate::gpu::runtime::GpuRuntime;
 
     fn make_nonaffine_cells() -> Vec<GpuDenestedCubicCell> {
         vec![
