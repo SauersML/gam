@@ -1507,6 +1507,97 @@ mod cubic_bspline_moments_tests {
                 );
             }
         }
+
+        // Alpha-major layout invariant: stride is the 32-aligned `n_cells` and
+        // the full buffer length is `stride * n_alpha`. Catches a silent regression
+        // to cell-major or to a stride that drops the warp-coalesced padding.
+        assert_eq!(
+            out_stride,
+            ((n_cells + 31) / 32) * 32,
+            "alpha-major stride must be 32-aligned n_cells"
+        );
+        assert_eq!(
+            host_vals.len(),
+            out_stride * spec.n_alpha(),
+            "alpha-major total = stride * n_alpha"
+        );
+
+    }
+
+    /// Module-cache hit on re-fit with the same spec. The NVRTC compile is
+    /// the dominant per-call latency; the cache key
+    /// (cc_major, cc_minor, d, amax, nalpha, alpha_hash, deriv_hash, layout_tag)
+    /// must collide for two structurally-identical specs so the second build
+    /// reuses the module rather than re-compiling.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn hex_tensor_module_cache_hits_on_repeat_spec() {
+        let t = nonuniform_knots();
+        let table = AxisCubicMomentTables::build(&t, 0, 0);
+        let axes_for_build: Vec<Vec<AxisCubicMomentTables>> =
+            vec![vec![table.clone()], vec![table.clone()]];
+        let alphas: Vec<Vec<u8>> = vec![vec![0, 0], vec![1, 0], vec![2, 1]];
+        let deriv = vec![vec![0u8, 0u8]; alphas.len()];
+        let spec = CubicMomentSpec {
+            alphas,
+            derivative_left: deriv.clone(),
+            derivative_right: deriv,
+            layout: MomentLayout::AlphaMajor,
+        };
+        // One cell on (sx=0, sy=0), pair (0, 0). Avoids redoing the big sweep.
+        let cells = HexCellTable {
+            span_per_axis: vec![0, 0],
+            pair_per_axis: vec![0, 0],
+            width_per_axis: vec![table.width[0], table.width[0]],
+            n_cells: 1,
+            d: 2,
+        };
+
+        // First build — compiles the module.
+        let first = match super::build_hex_tensor_moments_device(&spec, &axes_for_build, &cells) {
+            Ok(d) => d,
+            Err(err) => {
+                eprintln!("skipping module-cache test (no CUDA runtime): {err}");
+                assert!(
+                    matches!(err, GpuError::DriverLibraryUnavailable { .. })
+                        || matches!(err, GpuError::DriverCallFailed { .. })
+                        || matches!(err, GpuError::NotYetImplemented { .. }),
+                    "unexpected GPU error variant: {err:?}"
+                );
+                return;
+            }
+        };
+        let backend = CubicMomentBackend::probe().expect("backend probe");
+        let cache_len_after_first = {
+            let g = backend.inner.modules.lock().expect("cache lock");
+            g.len()
+        };
+        assert!(
+            cache_len_after_first >= 1,
+            "module cache must hold ≥1 entry after first build"
+        );
+
+        // Second build with an identical spec — must not grow the cache. The
+        // returned table is sanity-checked rather than discarded to keep the
+        // banned-`let _` scanner happy.
+        let second = super::build_hex_tensor_moments_device(&spec, &axes_for_build, &cells)
+            .expect("second build with identical spec must succeed");
+        assert_eq!(
+            second.n_alpha, first.n_alpha,
+            "cache hit must yield the same n_alpha as the first build"
+        );
+        assert_eq!(
+            second.n_cells, first.n_cells,
+            "cache hit must yield the same n_cells as the first build"
+        );
+        let cache_len_after_second = {
+            let g = backend.inner.modules.lock().expect("cache lock");
+            g.len()
+        };
+        assert_eq!(
+            cache_len_after_first, cache_len_after_second,
+            "identical spec must hit the cache (no new module compiled)"
+        );
     }
 
     /// Hex tensor kernel source generator must include the requested D, AMAX,

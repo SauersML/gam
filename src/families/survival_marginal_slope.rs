@@ -4054,7 +4054,6 @@ impl SurvivalMarginalSlopeFamily {
     fn install_auto_outer_subsample_options(
         &self,
         options: &BlockwiseFitOptions,
-        _block_states: &[ParameterBlockState],
     ) -> Option<BlockwiseFitOptions> {
         let ctx = options.outer_eval_context.as_ref()?;
         if !matches!(
@@ -16223,7 +16222,7 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
     ) -> Result<f64, String> {
         let owned;
         let options: &BlockwiseFitOptions =
-            match self.install_auto_outer_subsample_options(options, block_states) {
+            match self.install_auto_outer_subsample_options(options) {
                 Some(cloned) => {
                     owned = cloned;
                     &owned
@@ -16577,7 +16576,7 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
     ) -> Result<Option<Arc<dyn ExactNewtonJointPsiWorkspace>>, String> {
         let owned;
         let options: &BlockwiseFitOptions =
-            match self.install_auto_outer_subsample_options(options, block_states) {
+            match self.install_auto_outer_subsample_options(options) {
                 Some(cloned) => {
                     owned = cloned;
                     &owned
@@ -18198,7 +18197,7 @@ pub fn fit_survival_marginal_slope_terms(
                 .assign(m);
             cursor += m.ncols();
         }
-        debug_assert_eq!(cursor, total_cols);
+        assert_eq!(cursor, total_cols);
         // `rrqr_nullspace_basis` returns `(nullspace_of_Aᵀ, rank(A))` for a
         // tall input. Joint is n × p_total with `n ≫ p_total` at biobank
         // scale; we only consume the rank.
