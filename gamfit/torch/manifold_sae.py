@@ -251,8 +251,7 @@ class ManifoldSAEConfig:
         if not (math.isfinite(self.init_scale) and self.init_scale > 0.0):
             raise ValueError("ManifoldSAEConfig.init_scale must be > 0")
         if self.dtype is None:
-            import torch as _torch
-            object.__setattr__(self, "dtype", _torch.float64)
+            object.__setattr__(self, "dtype", torch.float64)
         if isinstance(self.sparsity, Mapping):
             object.__setattr__(self, "sparsity", SparsityConfig.from_dict(self.sparsity))
         if isinstance(self.decoder, Mapping):
