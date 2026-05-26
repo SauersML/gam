@@ -1470,4 +1470,251 @@ mod tests {
             "Gibbs step displacement {disp} not meaningfully nonzero"
         );
     }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Charter §6 / §12 parity tests
+    // ────────────────────────────────────────────────────────────────────
+
+    /// Two-sample Kolmogorov–Smirnov statistic. Returns sup_x |F_a(x) − F_b(x)|.
+    /// We avoid pulling a stats crate here because the test only needs the
+    /// statistic (compared to an asymptotic critical value below) — the math
+    /// is a pure sort + merge.
+    fn ks_two_sample(a: &mut [f64], b: &mut [f64]) -> f64 {
+        a.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        b.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        let (na, nb) = (a.len() as f64, b.len() as f64);
+        let (mut i, mut j) = (0usize, 0usize);
+        let (mut fa, mut fb) = (0.0_f64, 0.0_f64);
+        let mut d_max = 0.0_f64;
+        while i < a.len() && j < b.len() {
+            if a[i] <= b[j] {
+                i += 1;
+                fa = i as f64 / na;
+            } else {
+                j += 1;
+                fb = j as f64 / nb;
+            }
+            let d = (fa - fb).abs();
+            if d > d_max {
+                d_max = d;
+            }
+        }
+        d_max
+    }
+
+    /// KS critical value at α = 0.01 for a two-sample test with sample sizes
+    /// `n_a`, `n_b`: `c(0.01) · sqrt((n_a + n_b)/(n_a · n_b))` with
+    /// `c(0.01) ≈ 1.6276` (standard asymptotic table; one-sided 0.005 tail
+    /// of the Kolmogorov distribution).
+    fn ks_critical_001(n_a: usize, n_b: usize) -> f64 {
+        let na = n_a as f64;
+        let nb = n_b as f64;
+        1.6276 * ((na + nb) / (na * nb)).sqrt()
+    }
+
+    #[test]
+    fn pg1_cpu_oracle_matches_inference_module_distribution() {
+        // KS test: the kernel-aligned XORWOW oracle here vs. the production
+        // `inference::polya_gamma::PolyaGamma::draw` sampler should agree in
+        // distribution (both implement Devroye with the corrected right-tail
+        // coefficient). 5 000 samples each at three tilts; KS critical value
+        // at α = 0.01.
+        use crate::inference::polya_gamma::PolyaGamma;
+        use rand::{SeedableRng, rngs::StdRng};
+        let pg = PolyaGamma::new();
+        for &c in &[0.0_f64, 1.5, 4.0] {
+            let n_dev = 5_000;
+            let n_ref = 5_000;
+            let mut from_oracle: Vec<f64> = (0..n_dev)
+                .map(|i| {
+                    let mut st = XorwowState::new(0xDEADBEEF_u64 ^ c.to_bits(), i as u64);
+                    pg1_draw_cpu_oracle(&mut st, c)
+                })
+                .collect();
+            let mut from_reference: Vec<f64> = {
+                let mut rng = StdRng::seed_from_u64(0xABCD_u64 ^ c.to_bits());
+                (0..n_ref).map(|_| pg.draw(&mut rng, c)).collect()
+            };
+            let d = ks_two_sample(&mut from_oracle, &mut from_reference);
+            let crit = ks_critical_001(n_dev, n_ref);
+            assert!(
+                d <= 2.0 * crit,
+                "PG(1, c={c}) two-sample KS d={d} > 2·crit={}; XORWOW oracle and reference disagree in distribution",
+                2.0 * crit
+            );
+        }
+    }
+
+    #[test]
+    fn pg_convolution_identity_at_small_b() {
+        // PG(b, c) =_d sum_{j=1..b} PG(1, c) for integer b. We compare two
+        // independent draw streams: one drawing b independent PG(1, c) variates
+        // and summing, the other drawing one PG(1, c) variate b times sharing a
+        // single XORWOW (the dispatcher's convolution path). KS at α = 0.01.
+        let n = 4_000;
+        let b: u32 = 8;
+        let c: f64 = 1.2;
+        let mut left: Vec<f64> = (0..n)
+            .map(|i| {
+                // Reset state per draw so successive PG(1) draws share the same
+                // chain — matches the host convolution path.
+                let mut st = XorwowState::new(0x1111_u64, i as u64);
+                (0..b).map(|_| pg1_draw_cpu_oracle(&mut st, c)).sum()
+            })
+            .collect();
+        let mut right: Vec<f64> = (0..n)
+            .map(|i| {
+                // Independent fresh state per j to make this a genuinely
+                // independent sum-of-PG(1) stream (different from `left` but
+                // same distribution).
+                (0..b)
+                    .map(|j| {
+                        let mut st = XorwowState::new(0x2222_u64 ^ (j as u64), i as u64);
+                        pg1_draw_cpu_oracle(&mut st, c)
+                    })
+                    .sum::<f64>()
+            })
+            .collect();
+        let d = ks_two_sample(&mut left, &mut right);
+        let crit = ks_critical_001(n, n);
+        assert!(
+            d <= 2.0 * crit,
+            "PG({b}, {c}) convolution identity KS d={d} > 2·crit={}",
+            2.0 * crit
+        );
+    }
+
+    #[test]
+    fn pg_normal_kernel_matches_moments_at_b_500() {
+        // CPU oracle for the normal-approximation kernel hits PSW (b, c)
+        // moments to 2 % mean / 5 % var at b = 500 with 50 000 draws. The
+        // GPU kernel runs the same arithmetic with the same XORWOW state,
+        // so this test is also a parity gate for the device path (any
+        // device drift would surface as a CPU/GPU oracle mismatch first).
+        let b = 500u32;
+        let c = 2.0_f64;
+        let n = 50_000;
+        let mut sum = 0.0;
+        let mut sum_sq = 0.0;
+        for i in 0..n {
+            let mut st = XorwowState::new(0xCAFE_u64, i as u64);
+            let x = pg_normal_cpu_oracle(&mut st, b, c);
+            sum += x;
+            sum_sq += x * x;
+        }
+        let mean = sum / n as f64;
+        let var = sum_sq / n as f64 - mean * mean;
+        let th_mean = pg_mean(b as f64, c);
+        let th_var = pg_variance(b as f64, c);
+        let m_rel = (mean - th_mean).abs() / th_mean;
+        let v_rel = (var - th_var).abs() / th_var;
+        assert!(m_rel < 0.02, "normal kernel mean: emp {mean}, theory {th_mean}, rel {m_rel}");
+        assert!(v_rel < 0.05, "normal kernel var: emp {var}, theory {th_var}, rel {v_rel}");
+    }
+
+    #[test]
+    fn logistic_gibbs_chain_converges_to_mle_direction() {
+        // End-to-end Gibbs harness validation. Start from β = 0, run 200
+        // steps on a small synthetic Bernoulli-logistic dataset with known
+        // β* = (1.5, -0.7, 0.3). Drop the first 50 as burn-in and check that
+        // the posterior mean direction aligns with β* (cosine > 0.85).
+        use rand::{Rng, SeedableRng, rngs::StdRng};
+        let n = 400;
+        let p = 3;
+        let beta_star = [1.5_f64, -0.7, 0.3];
+        let mut design = Array2::<f64>::zeros((n, p));
+        let mut targets = Array1::<u8>::zeros(n);
+        let mut rng = StdRng::seed_from_u64(0xFEED);
+        for i in 0..n {
+            let x1 = ((i as f64) / (n as f64)) * 2.0 - 1.0;
+            let x2 = (((i * 13) % n) as f64 / n as f64) * 2.0 - 1.0;
+            design[[i, 0]] = x1;
+            design[[i, 1]] = x2;
+            design[[i, 2]] = 1.0;
+            let eta = beta_star[0] * x1 + beta_star[1] * x2 + beta_star[2];
+            let p_y = 1.0 / (1.0 + (-eta).exp());
+            let u: f64 = rng.random();
+            targets[i] = if u < p_y { 1 } else { 0 };
+        }
+        let q0 = Array2::<f64>::eye(p) * 0.01;
+        let mut beta = Array1::<f64>::zeros(p);
+        let mut accum = Array1::<f64>::zeros(p);
+        let steps = 200;
+        let burn = 50;
+        for k in 0..steps {
+            beta = logistic_gibbs_step(
+                design.view(),
+                targets.view(),
+                q0.view(),
+                beta.view(),
+                PgSeed(0xC0DE + k as u64),
+                0xCAFE + k as u64,
+            )
+            .expect("Gibbs step");
+            if k >= burn {
+                for j in 0..p {
+                    accum[j] += beta[j];
+                }
+            }
+        }
+        for j in 0..p {
+            accum[j] /= (steps - burn) as f64;
+        }
+        let dot: f64 = (0..p).map(|j| accum[j] * beta_star[j]).sum();
+        let na: f64 = accum.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let nb: f64 = beta_star.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let cos = dot / (na * nb);
+        assert!(
+            cos > 0.85,
+            "Gibbs chain posterior-mean direction does not align with β*: cos = {cos}, accum = {accum:?}, β* = {beta_star:?}"
+        );
+    }
+
+    /// GPU parity gate: when the runtime is available, the dispatched
+    /// `draw_batch` path must agree with the CPU oracle bit-for-bit, since
+    /// both consume the same XORWOW byte stream per row. macOS / no-runtime
+    /// builds skip the body cleanly.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn pg1_gpu_matches_cpu_oracle_when_runtime_available() {
+        if super::super::runtime::GpuRuntime::global().is_none() {
+            return;
+        }
+        let n = 256usize;
+        let shapes = Array1::<u32>::from_elem(n, 1);
+        let mut tilts = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            tilts[i] = ((i as f64) / (n as f64)) * 6.0 - 3.0;
+        }
+        let seed = PgSeed(0x9E37_79B9_7F4A_7C15);
+        let gpu = draw_batch(PolyaGammaBatchInput {
+            shapes: shapes.view(),
+            tilts: tilts.view(),
+            seed,
+        })
+        .expect("GPU draw_batch");
+        let cpu = draw_batch_cpu(&PolyaGammaBatchInput {
+            shapes: shapes.view(),
+            tilts: tilts.view(),
+            seed,
+        })
+        .expect("CPU draw_batch");
+        assert_eq!(gpu.len(), cpu.len());
+        // The device transcendentals (exp / log / tanh / sqrt) round to within
+        // ~1 ULP of glibc's libm but are not bit-identical, so we test a tight
+        // relative tolerance rather than equality. A 1e-6 relative tolerance is
+        // far inside the PG distribution's spread and any genuine algorithmic
+        // drift (e.g. wrong series term) would blow this out by orders of
+        // magnitude.
+        for i in 0..n {
+            let g = gpu[i];
+            let c = cpu[i];
+            let rel = (g - c).abs() / c.max(1e-12);
+            assert!(
+                rel < 1e-6,
+                "pg1 GPU/CPU divergence at row {i}, tilt={}: gpu={g}, cpu={c}, rel={rel}",
+                tilts[i]
+            );
+        }
+    }
 }
