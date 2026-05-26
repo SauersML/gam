@@ -123,7 +123,7 @@ pub(crate) enum CubicCellMomentStatus {
 
 impl CubicCellMomentStatus {
     #[inline]
-    pub(crate) fn from_byte(byte: u8) -> Option<Self> {
+    pub fn from_byte(byte: u8) -> Option<Self> {
         match byte {
             0 => Some(Self::Ok),
             1 => Some(Self::InvalidInterval),
@@ -210,7 +210,7 @@ impl CubicCellMomentWorkspace {
 /// require device residency must surface the error and fall back to host.
 ///
 /// Returns `Ok(None)` when the workload is empty (`cells.is_empty()`).
-pub(crate) fn try_build_cubic_cell_derivative_moments(
+pub fn try_build_cubic_cell_derivative_moments(
     input: CubicCellDerivativeMomentHostView<'_>,
     workspace: Option<&mut CubicCellMomentWorkspace>,
 ) -> Result<Option<CubicCellDerivativeMomentOutput>, GpuError> {
