@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import importlib.util
 import json
 import math
 import os
@@ -22,8 +23,6 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-
-from gamfit._binding import rust_module
 
 
 BENCH_DIR = Path(__file__).resolve().parent
@@ -160,9 +159,25 @@ _RUST: Any | None = None
 
 
 def _rust() -> Any:
+    # Load gamfit._rust directly from the .so/.pyd file rather than going
+    # through `from gamfit._binding import rust_module`, which would import
+    # `gamfit/__init__.py` → `_penalties.py` at module-load time and abort
+    # the whole runner before `prepare` / `matrix` (neither of which needs
+    # the Rust extension) ever runs. Mirrors `bench/_run_suite_datasets.py`.
     global _RUST
-    if _RUST is None:
-        _RUST = rust_module()
+    if _RUST is not None:
+        return _RUST
+    candidates = sorted((ROOT / "gamfit").glob("_rust*.so"))
+    if not candidates:
+        candidates = sorted((ROOT / "gamfit").glob("_rust*.pyd"))
+    if not candidates:
+        raise RuntimeError("gamfit Rust extension is not built")
+    spec = importlib.util.spec_from_file_location("_rust", candidates[0])
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"failed to load gamfit Rust extension from {candidates[0]}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    _RUST = module
     return _RUST
 
 
