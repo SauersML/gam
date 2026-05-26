@@ -21,6 +21,8 @@ contract here guards against future descriptors that expose rho_count > 0.
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import pytest
 
@@ -46,12 +48,23 @@ def test_ard_value_grad_numpy_does_not_raise_rho_length() -> None:
 
 
 def test_ard_value_grad_numpy_matches_closed_form() -> None:
-    """For default rho=0, ARD ≡ ½·weight·‖t‖² with grad = weight·t."""
+    """ARD value at rho=0 is ridge + Occam log-det:
+
+        value = Σ_j [ ½·λ_j·‖t_j‖² − ½·N_eff·ln(λ_j) ]
+
+    where λ_j = weight·exp(rho_j) (analytic_penalties.rs:2353-2368). With the
+    wrapper's default rho=0 and the Rust default ``N_eff = n_obs``
+    (target.len()/latent_dim), this collapses to
+    ``½·w·‖t‖² − ½·(d·n_obs)·ln(w)``. The log-det piece has no t-derivative,
+    so the gradient is still ``w·t``.
+    """
     weight = 0.7
     rng = np.random.default_rng(0)
     t = rng.standard_normal((5, 3))
+    n_obs, d = t.shape
     v, g = ARDPenalty(weight=weight).value_grad(t)
-    assert float(v) == pytest.approx(0.5 * weight * float(np.sum(t * t)), rel=1e-12, abs=1e-12)
+    expected = 0.5 * weight * float(np.sum(t * t)) - 0.5 * (d * n_obs) * math.log(weight)
+    assert float(v) == pytest.approx(expected, rel=1e-12, abs=1e-12)
     np.testing.assert_allclose(g, weight * t, atol=1e-12, rtol=1e-12)
 
 
@@ -72,11 +85,16 @@ def test_ard_hvp_numpy_matches_closed_form() -> None:
 
 
 def test_ard_value_grad_vector_target() -> None:
-    """1-D target → d=1 → rho_count=1 (still > 0, still failed by old wrapper)."""
+    """1-D target → d=1 → rho_count=1 (still > 0, still failed by old wrapper).
+
+    Same Rust formula as the 2-D case: ½·w·‖t‖² − ½·(d·n_obs)·ln(w).
+    """
     weight = 0.5
     t = np.array([1.0, -2.0, 3.0], dtype=np.float64)
+    n_obs, d = t.shape[0], 1
     v, g = ARDPenalty(weight=weight).value_grad(t)
-    assert float(v) == pytest.approx(0.5 * weight * float(np.sum(t * t)))
+    expected = 0.5 * weight * float(np.sum(t * t)) - 0.5 * (d * n_obs) * math.log(weight)
+    assert float(v) == pytest.approx(expected, rel=1e-12, abs=1e-12)
     np.testing.assert_allclose(g, weight * t, atol=1e-12, rtol=1e-12)
 
 
