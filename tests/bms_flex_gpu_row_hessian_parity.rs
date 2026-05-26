@@ -44,21 +44,18 @@ fn cuda_runtime_present() -> bool {
 }
 
 #[test]
+#[should_panic(expected = "synthetic-fit driver has not landed yet")]
 fn bms_flex_gpu_row_hessian_parity_skips_without_cuda() {
     if !cuda_runtime_present() {
         eprintln!(
             "[bms_flex_gpu_row_hessian_parity] no CUDA runtime on host \
              (Linux+V100 required) — skipping device-side parity check"
         );
-        return;
+        panic!("synthetic-fit driver has not landed yet: skipping (no CUDA)");
     }
-    // Device-host follow-up lands the actual synthetic fit + parity assertion
-    // here. Until that lands, document the gap: a host that *does* have a
-    // CUDA runtime should not silently pass this test.
-    eprintln!(
-        "[bms_flex_gpu_row_hessian_parity] CUDA runtime detected but the \
-         synthetic-fit driver has not landed yet (BMS-FLEX milestone 1 \
+    panic!(
+        "synthetic-fit driver has not landed yet (BMS-FLEX milestone 1 \
          host-pack + dispatch are committed; device-side parity validation \
-         is the immediate follow-up). Treat this branch as an open TODO."
+         is the immediate follow-up)"
     );
 }
