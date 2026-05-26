@@ -657,6 +657,12 @@ class Categorical(Smooth):
     levels: Any = None                   # (N,) integer level codes
     n_levels: int = 0
 
+    # Categorical is a level-code carrier consumed by formula compilation
+    # (it materializes into sum-to-zero contrasts inside the Rust core), not
+    # a descriptor with its own basis evaluator. The empty set is the honest
+    # contract: there are no `_evaluate_<backend>` paths to advertise.
+    SUPPORTED_BACKENDS: ClassVar[frozenset[str]] = frozenset()
+
 
 __all__ = [
     "Smooth",
