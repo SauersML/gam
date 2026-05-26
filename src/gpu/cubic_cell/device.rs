@@ -20,14 +20,16 @@
 //! substrate.
 
 use crate::gpu::cubic_cell::host_substrate::HostMomentBatch;
+#[cfg(target_os = "linux")]
 use crate::gpu::cubic_cell::{
-    CubicCellDerivativeMomentHostView, CubicCellMomentMode, CubicCellMomentStatus,
-    GpuCellBranchTag, branch::classify_cell_for_gpu,
+    CubicCellMomentStatus, GpuCellBranchTag, branch::classify_cell_for_gpu,
 };
+use crate::gpu::cubic_cell::{CubicCellDerivativeMomentHostView, CubicCellMomentMode};
 use crate::gpu::error::GpuError;
 
 #[cfg(target_os = "linux")]
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
+use std::sync::OnceLock;
 
 #[cfg(target_os = "linux")]
 use cudarc::driver::{CudaContext, CudaModule, CudaStream};
@@ -42,11 +44,6 @@ use cudarc::driver::{CudaContext, CudaModule, CudaStream};
 pub(crate) fn try_device_moments(
     view: &CubicCellDerivativeMomentHostView<'_>,
 ) -> Result<Option<HostMomentBatch>, GpuError> {
-    if matches!(view.mode, CubicCellMomentMode::ValueAndDerivative) {
-        return Err(GpuError::NotYetImplemented {
-            reason: "gpu cubic-cell substrate: ValueAndDerivative mode is Stage-2".to_string(),
-        });
-    }
     if !CubicCellGpuBackend::compiled() {
         return Ok(None);
     }
@@ -460,27 +457,6 @@ impl CubicCellGpuBackend {
         Ok(())
     }
 
-    /// Short backend descriptor for logs / tests.
-    pub(crate) fn describe(&self) -> String {
-        #[cfg(target_os = "linux")]
-        {
-            let module_count = self
-                .inner
-                .modules
-                .lock()
-                .map(|g| g.len())
-                .unwrap_or(0);
-            return format!(
-                "cubic_cell backend: device={:?} modules_loaded={}",
-                self.inner.ctx.name().ok(),
-                module_count
-            );
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            "cubic_cell backend: unavailable (not Linux)".to_string()
-        }
-    }
 }
 
 #[cfg(test)]

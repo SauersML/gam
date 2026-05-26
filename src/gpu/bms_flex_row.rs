@@ -81,6 +81,7 @@
 //! limit. This keeps the implementation simple and avoids per-thread global
 //! scratch (a per-thread `r*r` scratch arena would be ~2 GB at n=195k, r=20).
 
+#[cfg(target_os = "linux")]
 use std::sync::OnceLock;
 
 use super::error::GpuError;
