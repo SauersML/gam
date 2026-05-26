@@ -17811,7 +17811,7 @@ pub fn fit_survival_marginal_slope_terms(
             cfg,
             &anchors,
             &anchor_tags,
-            &spec.weights,
+            &cross_block_pilot_w,
         )?;
         match outcome {
             CrossBlockIdentifiabilityOutcome::Reparameterised => Some(
