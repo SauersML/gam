@@ -783,12 +783,16 @@ mod bms_flex_gpu_tests {
     /// usable device so the test still passes on the CI/mac builders.
     #[test]
     fn bms_flex_gpu_context_initialises_when_device_present() {
-        let Some(_runtime) = super::super::runtime::GpuRuntime::global() else {
+        let Some(runtime) = super::super::runtime::GpuRuntime::global() else {
             eprintln!(
                 "[bms_flex_gpu test] no CUDA runtime — skipping device-side init smoketest"
             );
             return;
         };
+        eprintln!(
+            "[bms_flex_gpu test] runtime selected device ordinal={}",
+            runtime.selected_device().ordinal
+        );
         let backend = BmsFlexGpuBackend::probe().unwrap_or_else(|err| {
             panic!("BmsFlexGpuBackend::probe failed on a host that reports a CUDA runtime: {err}")
         });
@@ -844,12 +848,16 @@ mod bms_flex_gpu_tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn bms_flex_rigid_kernel_source_compiles_on_device() {
-        let Some(_runtime) = super::super::runtime::GpuRuntime::global() else {
+        let Some(runtime) = super::super::runtime::GpuRuntime::global() else {
             eprintln!(
                 "[bms_flex_gpu test] no CUDA runtime — skipping rigid-kernel NVRTC compile"
             );
             return;
         };
+        eprintln!(
+            "[bms_flex_gpu test] NVRTC compile on device ordinal={}",
+            runtime.selected_device().ordinal
+        );
         let backend = match BmsFlexGpuBackend::probe() {
             Ok(b) => b,
             Err(e) => panic!("BmsFlexGpuBackend::probe must succeed on a host with a CUDA runtime: {e}"),
