@@ -17620,6 +17620,35 @@ pub fn fit_survival_marginal_slope_terms(
 
     let time_penalties_len = spec.time_block.penalties.len();
     let mut cross_block_warnings: Vec<CrossBlockIdentifiabilityWarning> = Vec::new();
+    // Unified location-anchor design at training rows.
+    //
+    // Survival prediction routes through `BernoulliMarginalSlopePredictor`
+    // (`survival_predict.rs:2458`); at predict time the SMGS predictor
+    // passes `q_design = [time_block.design_exit | timewiggle_exit |
+    // cov_design]` as `PredictInput.design`, which the BMS predict-time
+    // anchor-row builder (`predict.rs:1158`) treats AS-IS as the
+    // "marginal" parametric anchor when applying `n_row · M`. For the
+    // matmul width to match, fit-time anchoring must use the same
+    // concatenation — `[spec.time_block.design_exit | marginal_design]`
+    // — not `marginal_design` alone. This both (a) keeps the predict-
+    // time `anchor_correction_matrix` ncols check happy, and (b)
+    // residualises the score-warp / link-deviation bases against the
+    // time block's polynomial null space (constant + low-order time
+    // poly), killing the time_surface ↔ {score_warp_dev, link_dev}
+    // alias chain at the same construction step. `spec.time_block
+    // .design_exit` already includes the timewiggle tail columns by
+    // construction (validate_spec enforces `design_exit.ncols() ==
+    // p_time_base + p_timewiggle`), matching the predict-time
+    // q_design layout column-for-column.
+    let location_anchor_design = DesignMatrix::hstack(vec![
+        spec.time_block.design_exit.clone(),
+        marginal_design.design.clone(),
+    ])
+    .map_err(|e| {
+        format!(
+            "survival marginal-slope cross-block anchor stack failed to concatenate time + marginal design at training rows: {e}"
+        )
+    })?;
     // Score-warp: build the scalar base DeviationPrepared, apply cross-
     // block identifiability reparameterisation against the parametric
     // anchor union (marginal + logslope) on the underlying runtime, then
@@ -17645,7 +17674,7 @@ pub fn fit_survival_marginal_slope_terms(
         }
         let mut base = build_score_warp_deviation_block_from_seed(&z_primary, cfg)?;
         let anchors = vec![
-            CrossBlockAnchor::Parametric(&marginal_design.design),
+            CrossBlockAnchor::Parametric(&location_anchor_design),
             CrossBlockAnchor::Parametric(&logslope_design.design),
         ];
         let anchor_tags: Vec<Option<ParametricAnchorBlock>> = vec![
@@ -17728,7 +17757,7 @@ pub fn fit_survival_marginal_slope_terms(
             .map(|sw| sw.runtime.design_at_training_with_residual(&z_primary))
             .transpose()?;
         let mut anchors = vec![
-            CrossBlockAnchor::Parametric(&marginal_design.design),
+            CrossBlockAnchor::Parametric(&location_anchor_design),
             CrossBlockAnchor::Parametric(&logslope_design.design),
         ];
         let mut anchor_tags: Vec<Option<ParametricAnchorBlock>> = vec![

@@ -286,6 +286,7 @@ impl BmsFlexRowKernelInputsOwned {
 }
 
 /// Per-row outputs produced by [`launch_bms_flex_row_kernel`].
+#[derive(Debug)]
 pub(crate) struct BmsFlexRowKernelOutputs {
     /// Per-row negative log-likelihood. Length `n_rows`.
     pub neglog: Vec<f64>,
