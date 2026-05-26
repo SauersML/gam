@@ -16,6 +16,69 @@ pub struct PirlsGpuStep {
     pub logdet: f64,
 }
 
+/// Per-step inputs for [`solve_pirls_step_on_stream`].
+///
+/// Mirrors [`PirlsGpuInput`] but elides the design matrix `x` because that
+/// lives device-resident in the shared batch state. Each PIRLS Newton step
+/// only changes `weights`, `penalty_hessian` (with the current Sλ sum),
+/// `gradient`, and the LM ridge — these are the small per-step uploads the
+/// stream-pool path streams to the device.
+#[derive(Clone, Debug)]
+pub struct PirlsStepStreamInput<'a> {
+    pub weights: ArrayView1<'a, f64>,
+    pub penalty_hessian: ArrayView2<'a, f64>,
+    pub gradient: ArrayView1<'a, f64>,
+    pub lm_ridge: f64,
+}
+
+/// Shared, batch-wide GPU state for stream-pool sigma-cubature PIRLS.
+///
+/// Construct once per cubature batch via [`PirlsGpuSharedData::upload`] and
+/// hand a shared reference (`&PirlsGpuSharedData`) to many
+/// [`SigmaPirlsGpuWorkspace`]s — one per CUDA stream. The design matrix is
+/// uploaded a single time and reused by every sigma fit.
+///
+/// Only `x` is device-resident on this struct (the immediate Block 6 P2
+/// scope). Later priorities (per the math spec) add device-resident
+/// `y`, `offset`, `prior_weights`, and per-family kernel handles here so
+/// the row reweight and gradient-formation kernels can read them on-stream
+/// without any host roundtrip.
+#[cfg(target_os = "linux")]
+pub struct PirlsGpuSharedData {
+    pub(crate) ctx: std::sync::Arc<cudarc::driver::CudaContext>,
+    pub(crate) n: usize,
+    pub(crate) p: usize,
+    /// `n*p` f64 column-major design matrix, device-resident.
+    pub(crate) x_dev: cudarc::driver::CudaSlice<f64>,
+}
+
+/// Per-stream workspace for [`solve_pirls_step_on_stream`].
+///
+/// Owns a non-default CUDA stream plus cuBLAS / cuSOLVER handles bound to
+/// that stream, and the persistent device buffers that every PIRLS Newton
+/// step in this sigma fit reuses (no per-step allocation, no per-step
+/// handle creation). Multiple workspaces on independent streams sharing
+/// one [`PirlsGpuSharedData`] are the substrate the stream-pool cubature
+/// executor (Block 6 P3) composes.
+///
+/// Row-chunked WX assembly (Block 6 P4) replaces the full `n*p` `wx_dev`
+/// with a `chunk*p` buffer reused across row chunks; until that lands the
+/// workspace allocates the full matrix.
+#[cfg(target_os = "linux")]
+pub struct SigmaPirlsGpuWorkspace {
+    pub(crate) stream: std::sync::Arc<cudarc::driver::CudaStream>,
+    pub(crate) blas: cudarc::cublas::CudaBlas,
+    pub(crate) solver: cudarc::cusolver::DnHandle,
+    pub(crate) wx_dev: cudarc::driver::CudaSlice<f64>,
+    pub(crate) w_dev: cudarc::driver::CudaSlice<f64>,
+    pub(crate) xtwx_dev: cudarc::driver::CudaSlice<f64>,
+    pub(crate) h_dev: cudarc::driver::CudaSlice<f64>,
+    pub(crate) rhs_dev: cudarc::driver::CudaSlice<f64>,
+    pub(crate) penalty_dev: cudarc::driver::CudaSlice<f64>,
+    pub(crate) n: usize,
+    pub(crate) p: usize,
+}
+
 #[cfg(target_os = "linux")]
 mod cuda {
     use super::{PirlsGpuInput, PirlsGpuStep};
