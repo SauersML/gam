@@ -205,7 +205,7 @@ class Duchon(Smooth):
         from ._basis_eval import duchon_evaluate_numpy
         return duchon_evaluate_numpy(self, coords)
 
-    SUPPORTED_BACKENDS: frozenset[str] = frozenset({"torch", "numpy", "jax"})
+    SUPPORTED_BACKENDS: ClassVar[frozenset[str]] = frozenset({"torch", "numpy", "jax"})
 
 
 @dataclass(slots=True)
@@ -242,7 +242,7 @@ class BSpline(Smooth):
         from ._basis_eval import bspline_evaluate_numpy
         return bspline_evaluate_numpy(self, coords)
 
-    SUPPORTED_BACKENDS: frozenset[str] = frozenset({"torch", "numpy", "jax"})
+    SUPPORTED_BACKENDS: ClassVar[frozenset[str]] = frozenset({"torch", "numpy", "jax"})
 
 
 @dataclass(slots=True)
@@ -277,7 +277,7 @@ class TensorBSpline(Smooth):
         from ._basis_eval import tensor_bspline_evaluate_numpy
         return tensor_bspline_evaluate_numpy(self, coords)
 
-    SUPPORTED_BACKENDS: frozenset[str] = frozenset({"torch", "numpy", "jax"})
+    SUPPORTED_BACKENDS: ClassVar[frozenset[str]] = frozenset({"torch", "numpy", "jax"})
 
 
 @dataclass(slots=True)
@@ -336,6 +336,8 @@ class Matern(Smooth):
     def _evaluate_numpy(self, coords: Any) -> Any:
         from ._basis_eval import matern_evaluate_numpy
         return matern_evaluate_numpy(self, coords)
+
+    SUPPORTED_BACKENDS: ClassVar[frozenset[str]] = frozenset({"torch", "numpy", "jax"})
 
 
 @dataclass(init=False, slots=True)
@@ -420,7 +422,7 @@ class Pca(Smooth):
         from ._basis_eval import pca_evaluate_numpy
         return pca_evaluate_numpy(self, coords)
 
-    SUPPORTED_BACKENDS: frozenset[str] = frozenset({"torch", "numpy", "jax"})
+    SUPPORTED_BACKENDS: ClassVar[frozenset[str]] = frozenset({"torch", "numpy", "jax"})
 
 
 @dataclass(slots=True)
@@ -488,7 +490,7 @@ class Sphere(Smooth):
         from ._basis_eval import sphere_evaluate
         return sphere_evaluate(self, coords)
 
-    SUPPORTED_BACKENDS: frozenset[str] = frozenset({"torch", "numpy", "jax"})
+    SUPPORTED_BACKENDS: ClassVar[frozenset[str]] = frozenset({"torch", "numpy", "jax"})
 
 
 @dataclass(slots=True)
@@ -539,7 +541,7 @@ class PeriodicSplineCurve(Smooth):
         coords_np[:, 0] = coords_np[:, 0] - np.floor(coords_np[:, 0])
         return periodic_curve_evaluate_numpy(self, coords_np)
 
-    SUPPORTED_BACKENDS: frozenset[str] = frozenset({"torch", "numpy", "jax"})
+    SUPPORTED_BACKENDS: ClassVar[frozenset[str]] = frozenset({"torch", "numpy", "jax"})
 
 
 @dataclass(slots=True)

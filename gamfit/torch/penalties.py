@@ -281,8 +281,12 @@ class IsometryPenalty(_RustPenaltyModule):
         self.weight = float(weight)
         self.target = str(target)
 
-    def forward(self, latent: torch.Tensor, basis: torch.Tensor) -> torch.Tensor:
-        latent = _check_matrix(latent, "latent")
+    def _prepare(
+        self, primary: torch.Tensor, basis: torch.Tensor | None = None
+    ) -> _PenaltyCall:
+        if basis is None:
+            raise ValueError("IsometryPenalty requires `basis`")
+        latent = _check_matrix(primary, "latent")
         if basis.dim() == 2:
             basis_t = basis.to(device=latent.device, dtype=latent.dtype)
             p_out = int(basis_t.shape[0])
@@ -301,19 +305,19 @@ class IsometryPenalty(_RustPenaltyModule):
             "weight": 1.0,
             "p_out": p_out,
         }
-        rho = torch.full((1,), float(np.log(self.weight)), dtype=latent.dtype, device=latent.device)
-        apply = cast(Callable[..., torch.Tensor], _IsometryPenaltyFn.apply)
-        return apply(
-            latent,
-            rho,
-            basis_t,
-            None,
-            _latent_json(latent.shape[0], latent.shape[1], name=self.target),
-            _penalty_json(descriptor),
+        rho = torch.full(
+            (1,), float(np.log(self.weight)), dtype=latent.dtype, device=latent.device
+        )
+        return _PenaltyCall(
+            target=latent,
+            rho=rho,
+            latents_json=_latent_json(latent.shape[0], latent.shape[1], name=self.target),
+            penalties_json=_penalty_json(descriptor),
+            isometry_basis=basis_t,
         )
 
 
-class ARDPenalty(nn.Module):
+class ARDPenalty(_RustPenaltyModule):
     """Automatic relevance determination over latent axes."""
 
     def __init__(self, latent_dim: int | None = None, weight: float = 1.0, *, target: str = "t") -> None:
@@ -332,16 +336,21 @@ class ARDPenalty(nn.Module):
             self.register_parameter("log_precision", nn.Parameter(torch.zeros(self.latent_dim, dtype=latent.dtype, device=latent.device)))
         return self.log_precision.to(device=latent.device, dtype=latent.dtype)
 
-    def forward(self, latent: torch.Tensor, basis: torch.Tensor | None = None) -> torch.Tensor:
+    def _prepare(
+        self, primary: torch.Tensor, basis: torch.Tensor | None = None
+    ) -> _PenaltyCall:
         del basis
-        latent = _check_matrix(latent, "latent")
+        latent = _check_matrix(primary, "latent")
         descriptor: dict[str, Any] = {"kind": "ard", "target": self.target}
         schedule = _fixed_weight_schedule(self.weight)
         if schedule is not None:
             descriptor["weight_schedule"] = schedule
-        rho = self._rho(latent)
-        apply = cast(Callable[..., torch.Tensor], _RustPenaltyFn.apply)
-        return apply(latent, rho, _latent_json(latent.shape[0], latent.shape[1], name=self.target), _penalty_json(descriptor))
+        return _PenaltyCall(
+            target=latent,
+            rho=self._rho(latent),
+            latents_json=_latent_json(latent.shape[0], latent.shape[1], name=self.target),
+            penalties_json=_penalty_json(descriptor),
+        )
 
 
 class BlockOrthogonalityPenalty(nn.Module):
