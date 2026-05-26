@@ -834,9 +834,12 @@ mod tests {
             !audit.dropped_columns.is_empty(),
             "RRQR must attribute the three-way alias as a dropped column",
         );
+        // Under the task #5 halt gate, joint_rank < joint_cols is fatal
+        // even with attribution: the inner KKT system inherits the
+        // unattributed null direction and the outer optimiser will spin.
         assert!(
-            !audit.fatal,
-            "alias with column attribution must not be fatal: {}",
+            audit.fatal,
+            "three-way alias with joint rank < joint cols must be fatal under the halt gate: {}",
             audit.summary,
         );
         // Joint rank = 2 (the three columns span at most {1, x}).
@@ -892,9 +895,12 @@ mod tests {
             spec_from_dense("alias_block", alias_block),
         ];
         let audit = audit_identifiability(&specs).expect("biobank-shape audit must succeed");
+        // The seeded x~x alias is exactly the biobank failure shape the
+        // task #5 halt gate exists to refuse: two distinct blocks
+        // contributing the same direction at overlap 1.0. Must be fatal.
         assert!(
-            !audit.fatal,
-            "seeded alias with attribution must not be fatal: {}",
+            audit.fatal,
+            "seeded biobank-shape exact x~x alias must be fatal under the halt gate: {}",
             audit.summary,
         );
         assert!(
