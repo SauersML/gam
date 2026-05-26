@@ -884,14 +884,14 @@ fn launch_linux(
 
     let upload_f64 = |slice: &[f64], label: &str| {
         stream
-            .memcpy_stod(slice)
+            .clone_htod(slice)
             .map_err(|err| GpuError::DriverCallFailed {
                 reason: format!("bms_flex_row upload {label}: {err}"),
             })
     };
     let upload_u32 = |slice: &[u32], label: &str| {
         stream
-            .memcpy_stod(slice)
+            .clone_htod(slice)
             .map_err(|err| GpuError::DriverCallFailed {
                 reason: format!("bms_flex_row upload {label}: {err}"),
             })
@@ -998,17 +998,17 @@ fn launch_linux(
         })?;
 
     let neglog = stream
-        .memcpy_dtov(&d_neglog)
+        .clone_dtoh(&d_neglog)
         .map_err(|err| GpuError::DriverCallFailed {
             reason: format!("bms_flex_row download neglog: {err}"),
         })?;
     let grad = stream
-        .memcpy_dtov(&d_grad)
+        .clone_dtoh(&d_grad)
         .map_err(|err| GpuError::DriverCallFailed {
             reason: format!("bms_flex_row download grad: {err}"),
         })?;
     let hess = stream
-        .memcpy_dtov(&d_hess)
+        .clone_dtoh(&d_hess)
         .map_err(|err| GpuError::DriverCallFailed {
             reason: format!("bms_flex_row download hess: {err}"),
         })?;

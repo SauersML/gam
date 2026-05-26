@@ -348,37 +348,37 @@ impl CubicCellGpuBackend {
 
         let stream = &self.inner.stream;
         let d_left = stream
-            .memcpy_stod(&left)
+            .clone_htod(&left)
             .map_err(|err| GpuError::DriverCallFailed {
                 reason: format!("cubic_cell memcpy_stod left: {err}"),
             })?;
         let d_right = stream
-            .memcpy_stod(&right)
+            .clone_htod(&right)
             .map_err(|err| GpuError::DriverCallFailed {
                 reason: format!("cubic_cell memcpy_stod right: {err}"),
             })?;
         let d_c0 = stream
-            .memcpy_stod(&c0)
+            .clone_htod(&c0)
             .map_err(|err| GpuError::DriverCallFailed {
                 reason: format!("cubic_cell memcpy_stod c0: {err}"),
             })?;
         let d_c1 = stream
-            .memcpy_stod(&c1)
+            .clone_htod(&c1)
             .map_err(|err| GpuError::DriverCallFailed {
                 reason: format!("cubic_cell memcpy_stod c1: {err}"),
             })?;
         let d_c2 = stream
-            .memcpy_stod(&c2)
+            .clone_htod(&c2)
             .map_err(|err| GpuError::DriverCallFailed {
                 reason: format!("cubic_cell memcpy_stod c2: {err}"),
             })?;
         let d_c3 = stream
-            .memcpy_stod(&c3)
+            .clone_htod(&c3)
             .map_err(|err| GpuError::DriverCallFailed {
                 reason: format!("cubic_cell memcpy_stod c3: {err}"),
             })?;
         let d_branch = stream
-            .memcpy_stod(&branch_code)
+            .clone_htod(&branch_code)
             .map_err(|err| GpuError::DriverCallFailed {
                 reason: format!("cubic_cell memcpy_stod branch_code: {err}"),
             })?;
@@ -427,12 +427,12 @@ impl CubicCellGpuBackend {
         })?;
 
         let host_moments = stream
-            .memcpy_dtov(&d_moments)
+            .clone_dtoh(&d_moments)
             .map_err(|err| GpuError::DriverCallFailed {
                 reason: format!("cubic_cell memcpy_dtov moments: {err}"),
             })?;
         let host_status = stream
-            .memcpy_dtov(&d_status)
+            .clone_dtoh(&d_status)
             .map_err(|err| GpuError::DriverCallFailed {
                 reason: format!("cubic_cell memcpy_dtov status: {err}"),
             })?;
