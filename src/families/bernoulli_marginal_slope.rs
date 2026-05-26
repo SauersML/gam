@@ -5050,23 +5050,49 @@ impl Drop for RowPrimaryHessianPin {
 pub(crate) enum RowPrimaryHessianCache {
     Empty,
     Host(RowPrimaryHessianPin),
+    /// Device-resident row-Hessian cache, produced on Linux + CUDA by the
+    /// Phase-3 `launch_bms_flex_row_kernel_device_resident` entry point.
+    /// HVP / diagonal consumers route through
+    /// [`crate::gpu::bms_flex_row::launch_bms_flex_row_hvp`] /
+    /// [`crate::gpu::bms_flex_row::launch_bms_flex_row_diagonal`] which read
+    /// the row Hessians + uploaded designs directly from device memory.
+    #[cfg(target_os = "linux")]
+    Device(crate::gpu::bms_flex_row::DeviceResidentRowHess),
 }
 
 impl RowPrimaryHessianCache {
     /// Mirrors `Option::is_some` on the prior field type. CPU dispatcher
     /// branches that gate on "is the per-row Hessian materialized at all"
-    /// answer yes only for the host-resident pin (no device cache exists yet).
+    /// answer yes for both host- and device-resident caches.
     #[inline]
     pub(crate) fn is_some(&self) -> bool {
         !matches!(self, Self::Empty)
     }
 
-    /// Returns the host-resident pin when the cache is materialized.
+    /// Returns the host-resident pin when the cache is materialized as a
+    /// host pin. Returns `None` for the device-resident variant — callers
+    /// that need to read the full `r × r` Hessian per row must either
+    /// route through the device-aware HVP / diagonal entry points or fall
+    /// back to recomputing the row Hessian on the fly.
     #[inline]
     pub(crate) fn host_pin(&self) -> Option<&RowPrimaryHessianPin> {
         match self {
             Self::Host(pin) => Some(pin),
             Self::Empty => None,
+            #[cfg(target_os = "linux")]
+            Self::Device(_) => None,
+        }
+    }
+
+    /// Returns the device-resident state when the cache lives on the GPU.
+    /// `None` on every other variant (and on non-Linux builds where the
+    /// device variant does not exist).
+    #[cfg(target_os = "linux")]
+    #[inline]
+    pub(crate) fn device(&self) -> Option<&crate::gpu::bms_flex_row::DeviceResidentRowHess> {
+        match self {
+            Self::Device(state) => Some(state),
+            _ => None,
         }
     }
 }
@@ -8954,7 +8980,71 @@ impl BernoulliMarginalSlopeFamily {
         //    panic mid-fit.
         if gpu_decision.use_gpu {
             match self.pack_bms_flex_row_kernel_inputs(block_states, cache)? {
-                Some(owned) => match crate::gpu::bms_flex_row::launch_bms_flex_row_kernel(
+                Some(owned) => {
+                    // Phase-3: when both marginal/logslope designs expose a
+                    // contiguous dense view, take the device-resident path
+                    // that keeps the n×r² row Hessian + designs resident on
+                    // the GPU so subsequent HVP / diagonal launches do not
+                    // round-trip 626 MB through host memory.
+                    #[cfg(target_os = "linux")]
+                    {
+                        let marginal_dense = self.marginal_design.as_dense_ref();
+                        let logslope_dense = self.logslope_design.as_dense_ref();
+                        if let (Some(md), Some(gd)) = (marginal_dense, logslope_dense) {
+                            // Both designs must be row-major contiguous for the
+                            // device upload's `[n, p]` layout to be byte-correct.
+                            let md_is_rowmajor = md.is_standard_layout();
+                            let gd_is_rowmajor = gd.is_standard_layout();
+                            if md_is_rowmajor && gd_is_rowmajor {
+                                let block_layout = crate::gpu::bms_flex_row::BmsFlexBlockLayout {
+                                    p_m: cache.slices.marginal.len(),
+                                    p_g: cache.slices.logslope.len(),
+                                    h: cache.slices.h.clone(),
+                                    w: cache.slices.w.clone(),
+                                    p_total: cache.slices.total,
+                                };
+                                let primary_layout =
+                                    crate::gpu::bms_flex_row::BmsFlexPrimaryLayout {
+                                        h: primary.h.clone(),
+                                        w: primary.w.clone(),
+                                        r: primary.total,
+                                    };
+                                let md_slice = md
+                                    .as_slice()
+                                    .expect("dense marginal_design is row-major contiguous");
+                                let gd_slice = gd
+                                    .as_slice()
+                                    .expect("dense logslope_design is row-major contiguous");
+                                match crate::gpu::bms_flex_row::launch_bms_flex_row_kernel_device_resident(
+                                    owned.as_borrowed(),
+                                    md_slice,
+                                    gd_slice,
+                                    block_layout,
+                                    primary_layout,
+                                ) {
+                                    Ok((_, _, device_state)) => {
+                                        if log_exact_work(n) {
+                                            log::info!(
+                                                "[BMS row-primary-hessian-cache] gpu_device_resident_ok rows={} r={} elapsed={:.3}s",
+                                                n,
+                                                r,
+                                                started.elapsed().as_secs_f64()
+                                            );
+                                        }
+                                        drop(heartbeat_guard);
+                                        return Ok(RowPrimaryHessianCache::Device(device_state));
+                                    }
+                                    Err(err) => {
+                                        log::info!(
+                                            "[BMS row-primary-hessian-cache] gpu_device_resident_failed: {err}; \
+                                             falling back to host-pin GPU launch"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    match crate::gpu::bms_flex_row::launch_bms_flex_row_kernel(
                     owned.as_borrowed(),
                 ) {
                     Ok(outputs) => {
@@ -8979,7 +9069,8 @@ impl BernoulliMarginalSlopeFamily {
                              falling back to CPU rows"
                         );
                     }
-                },
+                }
+                }
                 None => {
                     if log_exact_work(n) {
                         log::info!(
@@ -13938,6 +14029,31 @@ impl BernoulliMarginalSlopeFamily {
                     },
                 )?;
             return Ok(out);
+        }
+
+        // Phase-3 device-resident shortcut: when the row Hessian + designs
+        // are pinned on the GPU, dispatch the HVP partial+reduce kernels and
+        // return the joint-β image without ever touching the host
+        // `row_primary_hessians` array.
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(device_state) = cache.row_primary_hessians.device() {
+                match crate::gpu::bms_flex_row::launch_bms_flex_row_hvp(
+                    device_state,
+                    direction.as_slice().expect("direction is contiguous"),
+                ) {
+                    Ok(host) => {
+                        return Ok(Array1::<f64>::from_vec(host));
+                    }
+                    Err(err) => {
+                        log::info!(
+                            "[BMS exact-newton HVP] gpu_hvp_failed: {err}; falling \
+                             back to CPU row-loop (this should be rare under \
+                             gpu=auto and is treated as a runtime degradation)"
+                        );
+                    }
+                }
+            }
         }
 
         let out = (0..n.div_ceil(ROW_CHUNK_SIZE))

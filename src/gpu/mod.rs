@@ -22,6 +22,7 @@ pub mod pirls_row;
 pub mod policy;
 pub mod profile;
 pub mod reml_trace;
+pub mod row_hessian_ops;
 pub mod runtime;
 pub mod solver;
 pub mod sphere;

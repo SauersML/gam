@@ -7691,7 +7691,82 @@ pub fn reml_laml_evaluate(
         let generic_ops: Vec<&dyn HyperOperator> = operators.iter().map(|op| op.as_ref()).collect();
         let implicit_ops: Vec<&ImplicitHyperOperator> =
             operators.iter().filter_map(|op| op.as_implicit()).collect();
-        let raw_traces = if generic_ops.is_empty() {
+
+        // ── Block 2.5: GPU-adaptive Hutchinson bypass.
+        //
+        // When the gate fires we replace the CPU stochastic estimator with
+        // the device-resident path in `gpu::reml_trace::evidence_traces_adaptive`,
+        // which factors `H` once on device (potrf), then for an adaptive
+        // K-schedule (16→32→64→128) solves `H W = Z` in one batched potrs
+        // and reduces `q_{j,k} = z_k^T H_j w_k` on device. CRN is preserved
+        // because the SplitMix probe RNG hashes `(seed, k_index, i)`
+        // statelessly. The gate requires:
+        //   * `operators.is_empty()`  — every drift is a dense `p × p`
+        //     matrix, so each `H_j` can be packed as
+        //     `DerivativeHessian::Dense(...)` without re-walking penalty
+        //     operators on device.
+        //   * `gpu::reml_trace::should_bypass_cpu_with_gpu_adaptive(...)`
+        //     — `p ≥ 512`, plain SPD logdet kernel, dense backend, projected
+        //     penalty subspace inactive.
+        // Both must hold; otherwise we fall through to the existing CPU
+        // path. The dispatch entry inside `evidence_traces_adaptive`
+        // itself falls back to the SplitMix CPU reference when the CUDA
+        // runtime is absent — so non-GPU hosts keep the existing
+        // estimator behaviour even with the gate set.
+        let gpu_bypass_raw_traces: Option<Vec<f64>> = if operators.is_empty()
+            && crate::gpu::reml_trace::should_bypass_cpu_with_gpu_adaptive(
+                total_p,
+                hop.as_exact_dense_spectral().is_some(),
+                hop.logdet_traces_match_hinv_kernel() && hop.is_dense(),
+                hop.prefers_stochastic_trace_estimation(),
+                solution.penalty_subspace_trace.is_some(),
+            ) {
+            use crate::gpu::reml_trace::{
+                DerivativeHessian, HUTCHINSON_ADAPTIVE_REL_TOL, HUTCHINSON_ADAPTIVE_TAU_REL,
+                ProbeSeed, evidence_traces_adaptive,
+            };
+            // Build the dense SPD H from the operator's spectral
+            // decomposition (same path the LAML/tangent-projection code
+            // uses, so the matrix is bit-identical to what other backends
+            // see). The unwrap is safe: the gate verified
+            // `hop.as_exact_dense_spectral().is_some()`.
+            let dense_op = hop
+                .as_exact_dense_spectral()
+                .expect("gate guarantees as_exact_dense_spectral().is_some()");
+            let h_dense = assemble_h_raw_dense(dense_op);
+            let derivatives: Vec<DerivativeHessian<'_>> = dense_refs
+                .iter()
+                .map(|m| DerivativeHessian::Dense(m.view()))
+                .collect();
+            // Seed the device RNG. We use a single deterministic seed
+            // across REML iterations: the SplitMix probe RNG is stateless
+            // (`(seed, k_index, i) → ±1`), so the K=16, 32, 64, 128
+            // adaptive schedule within one call already enjoys CRN, and
+            // the cross-iteration bias from probe reuse is bounded by the
+            // adaptive SE check (a fixed-seed Hutchinson is still
+            // unbiased; only its variance across REML trajectories is
+            // correlated). Matching `StochasticTraceConfig::default().seed`
+            // keeps the GPU probes bit-identical to the CPU reference for
+            // parity testing (Block 2.6 test "same-probes CPU vs GPU").
+            let probe_seed = ProbeSeed::default();
+            match evidence_traces_adaptive(
+                h_dense.view(),
+                derivatives,
+                None,
+                probe_seed,
+                HUTCHINSON_ADAPTIVE_REL_TOL,
+                HUTCHINSON_ADAPTIVE_TAU_REL,
+            ) {
+                Ok(evidence) => Some(evidence.traces.to_vec()),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+
+        let raw_traces = if let Some(gpu_traces) = gpu_bypass_raw_traces {
+            gpu_traces
+        } else if generic_ops.is_empty() {
             stochastic_trace_hinv_products_with_floor(
                 hop,
                 StochasticTraceTargets::Dense(&dense_refs),

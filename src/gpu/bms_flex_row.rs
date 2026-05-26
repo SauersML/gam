@@ -90,7 +90,7 @@ use super::error::GpuError;
 use std::sync::Arc;
 
 #[cfg(target_os = "linux")]
-use cudarc::driver::{CudaModule, CudaStream, LaunchConfig, PushKernelArg};
+use cudarc::driver::{CudaContext, CudaModule, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
 
 /// Hard ceiling on `r` (= 2 + p_h + p_w). Matches the shared-memory budget
 /// argument in the module docstring: with `MAX_R = 32` the per-block shared
@@ -1018,6 +1018,936 @@ fn launch_linux(
         })?;
 
     Ok(BmsFlexRowKernelOutputs { neglog, grad, hess })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 3: device-resident row Hessian + HVP / diagonal kernels.
+//
+// Math (mirrors the CPU oracle in
+// `src/families/bernoulli_marginal_slope.rs::exact_newton_joint_hessian_*_from_cache`):
+//
+//   Block layout (joint β):
+//     marginal = [0..p_m), logslope = [p_m..p_m+p_g),
+//     h        = [h_start..h_end), w = [w_start..w_end), total = p_total.
+//
+//   Primary layout (per-row r-vector):
+//     q = 0, logslope = 1,
+//     h = [h_primary_start..h_primary_end),
+//     w = [w_primary_start..w_primary_end), total = r.
+//
+//   row_dir[u] for u in primary layout:
+//     row_dir[0]   = Σ_j marginal_design[row, j] · v[j]
+//     row_dir[1]   = Σ_j logslope_design[row, j] · v[p_m + j]
+//     row_dir[h_k] = v[h_block_start + (h_k - h_primary_start)]
+//     row_dir[w_k] = v[w_block_start + (w_k - w_primary_start)]
+//
+//   action[u]    = Σ_v row_hessians[row, u*r + v] · row_dir[v]
+//
+//   block_partial[marginal_j] += action[0] · marginal_design[row, j]
+//   block_partial[logslope_j] += action[1] · logslope_design[row, j]
+//   block_partial[h_block_start + (h_k - h_primary_start)] += action[h_k]
+//   block_partial[w_block_start + (w_k - w_primary_start)] += action[w_k]
+//
+// Diagonal:
+//   diag[marginal_j] += row_hess[row, 0*r + 0] · marginal_design[row, j]²
+//   diag[logslope_j] += row_hess[row, 1*r + 1] · logslope_design[row, j]²
+//   diag[h_block_start + k] += row_hess[row, ii*r + ii]   (ii = h_primary_start + k)
+//   diag[w_block_start + k] += row_hess[row, ii*r + ii]   (ii = w_primary_start + k)
+//
+// Determinism: each CTA owns a contiguous slice of `[chunk_start..chunk_end)`
+// rows and writes its full per-chunk `p_total` partial into a non-overlapping
+// region of the global partial buffer. The reduce kernel then sums those
+// partials in fixed chunk-major order. No atomics.
+
+/// Joint-β block layout shared with the host (mirrors `BlockSlices` in
+/// `bernoulli_marginal_slope.rs`).
+#[derive(Clone, Debug)]
+pub(crate) struct BmsFlexBlockLayout {
+    pub p_m: usize,
+    pub p_g: usize,
+    pub h: Option<std::ops::Range<usize>>,
+    pub w: Option<std::ops::Range<usize>>,
+    pub p_total: usize,
+}
+
+/// Primary-r layout shared with the host (mirrors `PrimarySlices`).
+#[derive(Clone, Debug)]
+pub(crate) struct BmsFlexPrimaryLayout {
+    pub h: Option<std::ops::Range<usize>>,
+    pub w: Option<std::ops::Range<usize>>,
+    pub r: usize,
+}
+
+/// CPU-portable HVP oracle. Mirrors what
+/// [`launch_bms_flex_row_hvp`] computes on the device.
+///
+/// * `row_hessians`: row-major `[n, r*r]`, contains `H_row` symmetric.
+/// * `marginal_design`: row-major `[n, p_m]` dense storage.
+/// * `logslope_design`: row-major `[n, p_g]` dense storage.
+/// * `v`: joint β direction, length `block.p_total`.
+///
+/// Returns the joint β HVP image, length `block.p_total`.
+pub(crate) fn cpu_oracle_bms_flex_row_hvp(
+    row_hessians: &[f64],
+    marginal_design: &[f64],
+    logslope_design: &[f64],
+    block: &BmsFlexBlockLayout,
+    primary: &BmsFlexPrimaryLayout,
+    n: usize,
+    v: &[f64],
+) -> Vec<f64> {
+    let r = primary.r;
+    let p_m = block.p_m;
+    let p_g = block.p_g;
+    assert_eq!(v.len(), block.p_total);
+    assert_eq!(row_hessians.len(), n * r * r);
+    assert_eq!(marginal_design.len(), n * p_m);
+    assert_eq!(logslope_design.len(), n * p_g);
+    let mut out = vec![0.0_f64; block.p_total];
+    let mut row_dir = vec![0.0_f64; r];
+    let mut action = vec![0.0_f64; r];
+    for row in 0..n {
+        // Build row_dir from joint β direction v.
+        let mrow = &marginal_design[row * p_m..(row + 1) * p_m];
+        let grow = &logslope_design[row * p_g..(row + 1) * p_g];
+        let mut acc_q = 0.0_f64;
+        for j in 0..p_m {
+            acc_q += mrow[j] * v[j];
+        }
+        let mut acc_g = 0.0_f64;
+        for j in 0..p_g {
+            acc_g += grow[j] * v[p_m + j];
+        }
+        row_dir[0] = acc_q;
+        row_dir[1] = acc_g;
+        if let (Some(prange), Some(brange)) = (primary.h.as_ref(), block.h.as_ref()) {
+            for (k, ii) in prange.clone().enumerate() {
+                row_dir[ii] = v[brange.start + k];
+            }
+        }
+        if let (Some(prange), Some(brange)) = (primary.w.as_ref(), block.w.as_ref()) {
+            for (k, ii) in prange.clone().enumerate() {
+                row_dir[ii] = v[brange.start + k];
+            }
+        }
+        // action[u] = Σ_v row_hess[u,v] · row_dir[v].
+        let h_slice = &row_hessians[row * r * r..(row + 1) * r * r];
+        for u in 0..r {
+            let mut acc = 0.0_f64;
+            for v_idx in 0..r {
+                acc += h_slice[u * r + v_idx] * row_dir[v_idx];
+            }
+            action[u] = acc;
+        }
+        // Pull back to joint β.
+        let a0 = action[0];
+        for j in 0..p_m {
+            out[j] += a0 * mrow[j];
+        }
+        let a1 = action[1];
+        for j in 0..p_g {
+            out[p_m + j] += a1 * grow[j];
+        }
+        if let (Some(prange), Some(brange)) = (primary.h.as_ref(), block.h.as_ref()) {
+            for (k, ii) in prange.clone().enumerate() {
+                out[brange.start + k] += action[ii];
+            }
+        }
+        if let (Some(prange), Some(brange)) = (primary.w.as_ref(), block.w.as_ref()) {
+            for (k, ii) in prange.clone().enumerate() {
+                out[brange.start + k] += action[ii];
+            }
+        }
+    }
+    out
+}
+
+/// CPU-portable diagonal oracle mirroring [`launch_bms_flex_row_diagonal`].
+pub(crate) fn cpu_oracle_bms_flex_row_diagonal(
+    row_hessians: &[f64],
+    marginal_design: &[f64],
+    logslope_design: &[f64],
+    block: &BmsFlexBlockLayout,
+    primary: &BmsFlexPrimaryLayout,
+    n: usize,
+) -> Vec<f64> {
+    let r = primary.r;
+    let p_m = block.p_m;
+    let p_g = block.p_g;
+    let mut out = vec![0.0_f64; block.p_total];
+    for row in 0..n {
+        let h_slice = &row_hessians[row * r * r..(row + 1) * r * r];
+        let h00 = h_slice[0];
+        let h11 = h_slice[1 * r + 1];
+        let mrow = &marginal_design[row * p_m..(row + 1) * p_m];
+        let grow = &logslope_design[row * p_g..(row + 1) * p_g];
+        for j in 0..p_m {
+            out[j] += h00 * mrow[j] * mrow[j];
+        }
+        for j in 0..p_g {
+            out[p_m + j] += h11 * grow[j] * grow[j];
+        }
+        if let (Some(prange), Some(brange)) = (primary.h.as_ref(), block.h.as_ref()) {
+            for (k, ii) in prange.clone().enumerate() {
+                out[brange.start + k] += h_slice[ii * r + ii];
+            }
+        }
+        if let (Some(prange), Some(brange)) = (primary.w.as_ref(), block.w.as_ref()) {
+            for (k, ii) in prange.clone().enumerate() {
+                out[brange.start + k] += h_slice[ii * r + ii];
+            }
+        }
+    }
+    out
+}
+
+// ── Linux-only: device-resident row-Hessian state + kernels ─────────────────
+
+/// Number of rows each HVP / diagonal CTA processes. Each CTA writes a single
+/// `[1, p_total]` partial row into the global partial buffer (no atomics);
+/// the reduce kernel then sums partials in chunk-major fixed order.
+#[cfg(target_os = "linux")]
+pub(crate) const HVP_ROWS_PER_CTA: u32 = 256;
+
+/// `blockDim.x` for the HVP / diagonal partial kernels.
+#[cfg(target_os = "linux")]
+pub(crate) const HVP_THREADS: u32 = 128;
+
+/// Device-resident state produced by
+/// [`launch_bms_flex_row_kernel_device_resident`] and consumed by
+/// [`launch_bms_flex_row_hvp`] / [`launch_bms_flex_row_diagonal`].
+///
+/// Owns the row-Hessian + design slices on-device so the host can issue
+/// many HVPs against the same β snapshot without round-tripping
+/// 626 MB through host RAM. Drop releases the device memory back to
+/// the CUDA runtime.
+#[cfg(target_os = "linux")]
+pub(crate) struct DeviceResidentRowHess {
+    pub(crate) ctx: Arc<CudaContext>,
+    pub(crate) stream: Arc<CudaStream>,
+    pub(crate) hess: CudaSlice<f64>,
+    pub(crate) marginal_design: CudaSlice<f64>,
+    pub(crate) logslope_design: CudaSlice<f64>,
+    pub(crate) n: usize,
+    pub(crate) r: usize,
+    pub(crate) block: BmsFlexBlockLayout,
+    pub(crate) primary: BmsFlexPrimaryLayout,
+    /// Estimated bytes resident on device (for accounting).
+    pub(crate) bytes: u64,
+}
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Debug for DeviceResidentRowHess {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceResidentRowHess")
+            .field("n", &self.n)
+            .field("r", &self.r)
+            .field("p_total", &self.block.p_total)
+            .field("bytes", &self.bytes)
+            .finish()
+    }
+}
+
+/// Sized-to-fit-once CTA mapping. Rows `[c * HVP_ROWS_PER_CTA, (c+1) * HVP_ROWS_PER_CTA)`
+/// belong to chunk `c`.
+#[cfg(target_os = "linux")]
+fn num_hvp_chunks(n: usize) -> usize {
+    n.div_ceil(HVP_ROWS_PER_CTA as usize)
+}
+
+/// NVRTC source: HVP-partial kernel + HVP-reduce kernel + diag-partial +
+/// diag-reduce. All kernels mirror the CPU oracle in this file.
+#[cfg(target_os = "linux")]
+const HVP_KERNEL_SOURCE: &str = r#"
+// CPU parity reference: cpu_oracle_bms_flex_row_hvp / cpu_oracle_bms_flex_row_diagonal
+// in src/gpu/bms_flex_row.rs.
+
+extern "C" __global__ void bms_flex_row_hvp_partial(
+    int                  n_rows,
+    int                  r,
+    int                  p_m,
+    int                  p_g,
+    int                  p_total,
+    int                  h_block_start,
+    int                  h_block_len,
+    int                  w_block_start,
+    int                  w_block_len,
+    int                  h_primary_start,
+    int                  w_primary_start,
+    int                  rows_per_cta,
+    const double * __restrict__ row_hessians,    // [n, r*r]
+    const double * __restrict__ marginal_design, // [n, p_m] row-major
+    const double * __restrict__ logslope_design, // [n, p_g] row-major
+    const double * __restrict__ v,               // [p_total]
+    double       * __restrict__ partial)         // [num_chunks, p_total]
+{
+    int chunk = blockIdx.x;
+    int tid   = threadIdx.x;
+    int row_lo = chunk * rows_per_cta;
+    int row_hi = row_lo + rows_per_cta;
+    if (row_hi > n_rows) row_hi = n_rows;
+
+    // Zero this chunk's partial slice cooperatively.
+    double *out = partial + (size_t)chunk * (size_t)p_total;
+    for (int j = tid; j < p_total; j += blockDim.x) {
+        out[j] = 0.0;
+    }
+    __syncthreads();
+
+    // Each thread serially processes a stride-of-blockDim set of rows so
+    // every write to `out[..]` happens from one thread → no atomics within
+    // the chunk. To keep writes race-free across threads of the same chunk,
+    // we serialize the cross-row accumulation through a per-row barrier:
+    // thread 0 of the block processes all rows in the chunk. The per-row
+    // work is dominated by the dot/axpy over `p_m + p_g`, which is large.
+    // For Stage 3 we ship the simple, correct path (thread 0 sequential
+    // per row, blockDim.x threads parallel within a row's dot/axpy).
+    __shared__ double row_dir[32];
+    __shared__ double action[32];
+    __shared__ double dot_reduce[128];
+
+    for (int row = row_lo; row < row_hi; ++row) {
+        const double *mrow = marginal_design + (size_t)row * (size_t)p_m;
+        const double *grow = logslope_design + (size_t)row * (size_t)p_g;
+        const double *Hrow = row_hessians + (size_t)row * (size_t)r * (size_t)r;
+
+        // row_dir[0] = mrow · v[0..p_m]
+        double local = 0.0;
+        for (int j = tid; j < p_m; j += blockDim.x) {
+            local += mrow[j] * v[j];
+        }
+        dot_reduce[tid] = local;
+        __syncthreads();
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) dot_reduce[tid] += dot_reduce[tid + stride];
+            __syncthreads();
+        }
+        if (tid == 0) row_dir[0] = dot_reduce[0];
+
+        // row_dir[1] = grow · v[p_m..p_m+p_g]
+        local = 0.0;
+        for (int j = tid; j < p_g; j += blockDim.x) {
+            local += grow[j] * v[p_m + j];
+        }
+        dot_reduce[tid] = local;
+        __syncthreads();
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) dot_reduce[tid] += dot_reduce[tid + stride];
+            __syncthreads();
+        }
+        if (tid == 0) row_dir[1] = dot_reduce[0];
+
+        // h/w blocks: direct copy.
+        if (tid == 0) {
+            for (int k = 0; k < h_block_len; ++k) {
+                row_dir[h_primary_start + k] = v[h_block_start + k];
+            }
+            for (int k = 0; k < w_block_len; ++k) {
+                row_dir[w_primary_start + k] = v[w_block_start + k];
+            }
+        }
+        __syncthreads();
+
+        // action[u] = Σ_v Hrow[u*r+v] · row_dir[v], computed by thread u (u < r).
+        if (tid < r) {
+            double acc = 0.0;
+            for (int vv = 0; vv < r; ++vv) {
+                acc += Hrow[tid * r + vv] * row_dir[vv];
+            }
+            action[tid] = acc;
+        }
+        __syncthreads();
+
+        // Pull back into joint β slot.
+        //   marginal: out[j] += action[0] · mrow[j]   (parallel j)
+        double a0 = action[0];
+        for (int j = tid; j < p_m; j += blockDim.x) {
+            out[j] += a0 * mrow[j];
+        }
+        double a1 = action[1];
+        for (int j = tid; j < p_g; j += blockDim.x) {
+            out[p_m + j] += a1 * grow[j];
+        }
+        if (tid == 0) {
+            for (int k = 0; k < h_block_len; ++k) {
+                out[h_block_start + k] += action[h_primary_start + k];
+            }
+            for (int k = 0; k < w_block_len; ++k) {
+                out[w_block_start + k] += action[w_primary_start + k];
+            }
+        }
+        __syncthreads();
+    }
+}
+
+extern "C" __global__ void bms_flex_row_hvp_reduce(
+    int                  num_chunks,
+    int                  p_total,
+    const double * __restrict__ partial,   // [num_chunks, p_total]
+    double       * __restrict__ out)        // [p_total]
+{
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= p_total) return;
+    double acc = 0.0;
+    for (int c = 0; c < num_chunks; ++c) {
+        acc += partial[(size_t)c * (size_t)p_total + (size_t)j];
+    }
+    out[j] = acc;
+}
+
+extern "C" __global__ void bms_flex_row_diag_partial(
+    int                  n_rows,
+    int                  r,
+    int                  p_m,
+    int                  p_g,
+    int                  p_total,
+    int                  h_block_start,
+    int                  h_block_len,
+    int                  w_block_start,
+    int                  w_block_len,
+    int                  h_primary_start,
+    int                  w_primary_start,
+    int                  rows_per_cta,
+    const double * __restrict__ row_hessians,
+    const double * __restrict__ marginal_design,
+    const double * __restrict__ logslope_design,
+    double       * __restrict__ partial)
+{
+    int chunk = blockIdx.x;
+    int tid   = threadIdx.x;
+    int row_lo = chunk * rows_per_cta;
+    int row_hi = row_lo + rows_per_cta;
+    if (row_hi > n_rows) row_hi = n_rows;
+
+    double *out = partial + (size_t)chunk * (size_t)p_total;
+    for (int j = tid; j < p_total; j += blockDim.x) {
+        out[j] = 0.0;
+    }
+    __syncthreads();
+
+    for (int row = row_lo; row < row_hi; ++row) {
+        const double *mrow = marginal_design + (size_t)row * (size_t)p_m;
+        const double *grow = logslope_design + (size_t)row * (size_t)p_g;
+        const double *Hrow = row_hessians + (size_t)row * (size_t)r * (size_t)r;
+        double h00 = Hrow[0];
+        double h11 = Hrow[1 * r + 1];
+        for (int j = tid; j < p_m; j += blockDim.x) {
+            double v = mrow[j];
+            out[j] += h00 * v * v;
+        }
+        for (int j = tid; j < p_g; j += blockDim.x) {
+            double v = grow[j];
+            out[p_m + j] += h11 * v * v;
+        }
+        if (tid == 0) {
+            for (int k = 0; k < h_block_len; ++k) {
+                int ii = h_primary_start + k;
+                out[h_block_start + k] += Hrow[ii * r + ii];
+            }
+            for (int k = 0; k < w_block_len; ++k) {
+                int ii = w_primary_start + k;
+                out[w_block_start + k] += Hrow[ii * r + ii];
+            }
+        }
+        __syncthreads();
+    }
+}
+"#;
+
+#[cfg(target_os = "linux")]
+struct HvpKernelBackend {
+    stream: Arc<CudaStream>,
+    module: Arc<CudaModule>,
+    ctx: Arc<CudaContext>,
+}
+
+#[cfg(target_os = "linux")]
+impl HvpKernelBackend {
+    fn probe() -> Result<&'static Self, GpuError> {
+        static BACKEND: OnceLock<Result<HvpKernelBackend, GpuError>> = OnceLock::new();
+        BACKEND
+            .get_or_init(|| {
+                let runtime = super::runtime::GpuRuntime::global().ok_or_else(|| {
+                    GpuError::DriverLibraryUnavailable {
+                        reason: "bms_flex_row hvp backend: no CUDA runtime available".to_string(),
+                    }
+                })?;
+                let ctx = super::runtime::cuda_context_for(runtime.selected_device().ordinal)
+                    .ok_or_else(|| GpuError::DriverCallFailed {
+                        reason: format!(
+                            "bms_flex_row hvp backend: failed to create CUDA context for device {}",
+                            runtime.selected_device().ordinal
+                        ),
+                    })?;
+                let stream = ctx.default_stream();
+                let ptx = cudarc::nvrtc::compile_ptx(HVP_KERNEL_SOURCE).map_err(|err| {
+                    GpuError::DriverCallFailed {
+                        reason: format!("bms_flex_row hvp NVRTC compile failed: {err}"),
+                    }
+                })?;
+                let module = ctx.load_module(ptx).map_err(|err| GpuError::DriverCallFailed {
+                    reason: format!("bms_flex_row hvp module load failed: {err}"),
+                })?;
+                Ok(HvpKernelBackend { stream, module, ctx })
+            })
+            .as_ref()
+            .map_err(GpuError::clone)
+    }
+}
+
+/// Linux-only: NVRTC-compile + cache the HVP / diagonal kernel module.
+/// Public for the bms_flex dispatcher hook so the cache decision can probe
+/// the backend eagerly.
+#[cfg(target_os = "linux")]
+pub(crate) fn probe_hvp_backend() -> Result<(), GpuError> {
+    let _ = HvpKernelBackend::probe()?;
+    Ok(())
+}
+
+/// Build a device-resident row-Hessian cache by launching the row kernel and
+/// keeping the resulting `n × r²` slice resident on the device. Also uploads
+/// the dense marginal + logslope design matrices so subsequent HVPs do not
+/// re-upload them at every direction.
+///
+/// `marginal_design_row_major` and `logslope_design_row_major` must be
+/// row-major `[n, p_m]` and `[n, p_g]` contiguous slices.
+#[cfg(target_os = "linux")]
+pub(crate) fn launch_bms_flex_row_kernel_device_resident(
+    inputs: BmsFlexRowKernelInputs<'_>,
+    marginal_design_row_major: &[f64],
+    logslope_design_row_major: &[f64],
+    block: BmsFlexBlockLayout,
+    primary: BmsFlexPrimaryLayout,
+) -> Result<(Vec<f64>, Vec<f64>, DeviceResidentRowHess), GpuError> {
+    inputs.validate()?;
+    if !s_f_diagnostic_finite(&inputs) {
+        return Err(GpuError::DriverCallFailed {
+            reason: format!(
+                "bms_flex_row device-resident: s_f must be positive and finite, got {}",
+                inputs.s_f
+            ),
+        });
+    }
+    let n = inputs.n_rows;
+    let r = inputs.r;
+    if marginal_design_row_major.len() != n * block.p_m {
+        return Err(GpuError::DriverCallFailed {
+            reason: format!(
+                "bms_flex_row device-resident: marginal_design len={} != n*p_m={}",
+                marginal_design_row_major.len(),
+                n * block.p_m
+            ),
+        });
+    }
+    if logslope_design_row_major.len() != n * block.p_g {
+        return Err(GpuError::DriverCallFailed {
+            reason: format!(
+                "bms_flex_row device-resident: logslope_design len={} != n*p_g={}",
+                logslope_design_row_major.len(),
+                n * block.p_g
+            ),
+        });
+    }
+    if primary.r != r {
+        return Err(GpuError::DriverCallFailed {
+            reason: format!(
+                "bms_flex_row device-resident: primary.r={} != inputs.r={}",
+                primary.r, r
+            ),
+        });
+    }
+
+    // Ensure the row kernel backend is compiled & loaded (this also compiles
+    // the HVP backend on first use so the caller surfaces failures here).
+    let backend = RowKernelBackend::probe()?;
+    let _ = HvpKernelBackend::probe()?;
+    let stream = backend.stream.clone();
+
+    let upload_f64 = |slice: &[f64], label: &str| {
+        stream
+            .clone_htod(slice)
+            .map_err(|err| GpuError::DriverCallFailed {
+                reason: format!("bms_flex_row device-resident upload {label}: {err}"),
+            })
+    };
+    let upload_u32 = |slice: &[u32], label: &str| {
+        stream
+            .clone_htod(slice)
+            .map_err(|err| GpuError::DriverCallFailed {
+                reason: format!("bms_flex_row device-resident upload {label}: {err}"),
+            })
+    };
+
+    let d_q       = upload_f64(inputs.q, "q")?;
+    let d_b       = upload_f64(inputs.b, "b")?;
+    let d_mu1     = upload_f64(inputs.mu_1, "mu_1")?;
+    let d_mu2     = upload_f64(inputs.mu_2, "mu_2")?;
+    let d_zobs    = upload_f64(inputs.z_obs, "z_obs")?;
+    let d_y       = upload_f64(inputs.y, "y")?;
+    let d_w       = upload_f64(inputs.w, "w")?;
+    let d_offsets = upload_u32(inputs.cell_offsets, "cell_offsets")?;
+    let d_c0      = upload_f64(inputs.cell_c0, "cell_c0")?;
+    let d_c1      = upload_f64(inputs.cell_c1, "cell_c1")?;
+    let d_c2      = upload_f64(inputs.cell_c2, "cell_c2")?;
+    let d_c3      = upload_f64(inputs.cell_c3, "cell_c3")?;
+    let d_a       = upload_f64(inputs.cell_a, "cell_a")?;
+    let d_aa      = upload_f64(inputs.cell_aa, "cell_aa")?;
+    let d_r       = upload_f64(inputs.cell_r, "cell_r")?;
+    let d_ar      = upload_f64(inputs.cell_ar, "cell_ar")?;
+    let d_sbb     = upload_f64(inputs.cell_sbb, "cell_sbb")?;
+    let d_sbh     = upload_f64(inputs.cell_sbh, "cell_sbh")?;
+    let d_sbw     = upload_f64(inputs.cell_sbw, "cell_sbw")?;
+    let d_moments = upload_f64(inputs.cell_moments, "cell_moments")?;
+    let d_chi     = upload_f64(inputs.chi_obs, "chi_obs")?;
+    let d_xi      = upload_f64(inputs.xi_obs, "xi_obs")?;
+    let d_rho     = upload_f64(inputs.rho_u, "rho_u")?;
+    let d_tau     = upload_f64(inputs.tau_u, "tau_u")?;
+    let d_ruv     = upload_f64(inputs.r_uv, "r_uv")?;
+
+    let d_marginal = upload_f64(marginal_design_row_major, "marginal_design")?;
+    let d_logslope = upload_f64(logslope_design_row_major, "logslope_design")?;
+
+    let mut d_neglog = stream
+        .alloc_zeros::<f64>(n)
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("bms_flex_row device-resident alloc neglog: {err}"),
+        })?;
+    let mut d_grad = stream
+        .alloc_zeros::<f64>(n * r)
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("bms_flex_row device-resident alloc grad: {err}"),
+        })?;
+    let mut d_hess = stream
+        .alloc_zeros::<f64>(n * r * r)
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("bms_flex_row device-resident alloc hess: {err}"),
+        })?;
+
+    let func = backend
+        .module
+        .load_function("bms_flex_row_kernel")
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("bms_flex_row device-resident load_function: {err}"),
+        })?;
+
+    let cfg = LaunchConfig {
+        grid_dim: (n as u32, 1, 1),
+        block_dim: (ROW_KERNEL_THREADS, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let n_i32 = i32::try_from(n).map_err(|_| GpuError::DriverCallFailed {
+        reason: format!("bms_flex_row device-resident: n_rows={n} exceeds i32 range"),
+    })?;
+    let r_i32 = i32::try_from(r).map_err(|_| GpuError::DriverCallFailed {
+        reason: format!("bms_flex_row device-resident: r={r} exceeds i32 range"),
+    })?;
+    let p_h_i32 = i32::try_from(inputs.p_h).map_err(|_| GpuError::DriverCallFailed {
+        reason: format!("bms_flex_row device-resident: p_h={} exceeds i32 range", inputs.p_h),
+    })?;
+    let p_w_i32 = i32::try_from(inputs.p_w).map_err(|_| GpuError::DriverCallFailed {
+        reason: format!("bms_flex_row device-resident: p_w={} exceeds i32 range", inputs.p_w),
+    })?;
+    let s_f_val = inputs.s_f;
+
+    let mut builder = stream.launch_builder(&func);
+    builder
+        .arg(&n_i32).arg(&r_i32).arg(&p_h_i32).arg(&p_w_i32).arg(&s_f_val)
+        .arg(&d_q).arg(&d_b).arg(&d_mu1).arg(&d_mu2).arg(&d_zobs).arg(&d_y).arg(&d_w)
+        .arg(&d_offsets)
+        .arg(&d_c0).arg(&d_c1).arg(&d_c2).arg(&d_c3)
+        .arg(&d_a).arg(&d_aa).arg(&d_r).arg(&d_ar)
+        .arg(&d_sbb).arg(&d_sbh).arg(&d_sbw).arg(&d_moments)
+        .arg(&d_chi).arg(&d_xi).arg(&d_rho).arg(&d_tau).arg(&d_ruv)
+        .arg(&mut d_neglog).arg(&mut d_grad).arg(&mut d_hess);
+    // SAFETY: same shape contract as `launch_linux`: every kernel parameter is
+    // either a primitive scalar by-value, a const device pointer whose
+    // capacity was validated by `inputs.validate()`, or one of the three
+    // output buffers we just allocated with the expected element count.
+    unsafe { builder.launch(cfg) }.map_err(|err| GpuError::DriverCallFailed {
+        reason: format!("bms_flex_row device-resident launch: {err}"),
+    })?;
+    stream
+        .synchronize()
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("bms_flex_row device-resident synchronize: {err}"),
+        })?;
+
+    let neglog = stream
+        .clone_dtoh(&d_neglog)
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("bms_flex_row device-resident download neglog: {err}"),
+        })?;
+    let grad = stream
+        .clone_dtoh(&d_grad)
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("bms_flex_row device-resident download grad: {err}"),
+        })?;
+    // Drop the per-cell uploads; keep d_hess + designs.
+    drop(d_q); drop(d_b); drop(d_mu1); drop(d_mu2); drop(d_zobs); drop(d_y); drop(d_w);
+    drop(d_offsets); drop(d_c0); drop(d_c1); drop(d_c2); drop(d_c3);
+    drop(d_a); drop(d_aa); drop(d_r); drop(d_ar);
+    drop(d_sbb); drop(d_sbh); drop(d_sbw); drop(d_moments);
+    drop(d_chi); drop(d_xi); drop(d_rho); drop(d_tau); drop(d_ruv);
+
+    let ctx = backend.module.ctx().clone();
+    let bytes = ((n * r * r + marginal_design_row_major.len() + logslope_design_row_major.len())
+        * std::mem::size_of::<f64>()) as u64;
+    Ok((
+        neglog,
+        grad,
+        DeviceResidentRowHess {
+            ctx,
+            stream,
+            hess: d_hess,
+            marginal_design: d_marginal,
+            logslope_design: d_logslope,
+            n,
+            r,
+            block,
+            primary,
+            bytes,
+        },
+    ))
+}
+
+/// Launch the device-resident HVP kernel. Returns the host-side joint β image
+/// of length `block.p_total`.
+#[cfg(target_os = "linux")]
+pub(crate) fn launch_bms_flex_row_hvp(
+    storage: &DeviceResidentRowHess,
+    v: &[f64],
+) -> Result<Vec<f64>, GpuError> {
+    if v.len() != storage.block.p_total {
+        return Err(GpuError::DriverCallFailed {
+            reason: format!(
+                "bms_flex_row hvp: v.len()={} != p_total={}",
+                v.len(),
+                storage.block.p_total
+            ),
+        });
+    }
+    let backend = HvpKernelBackend::probe()?;
+    let stream = backend.stream.clone();
+    let n = storage.n;
+    let p_total = storage.block.p_total;
+    let r = storage.r;
+    let num_chunks = num_hvp_chunks(n);
+
+    let d_v = stream
+        .clone_htod(v)
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("bms_flex_row hvp upload v: {err}"),
+        })?;
+    let mut d_partial = stream
+        .alloc_zeros::<f64>(num_chunks * p_total)
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("bms_flex_row hvp alloc partial: {err}"),
+        })?;
+    let mut d_out = stream
+        .alloc_zeros::<f64>(p_total)
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("bms_flex_row hvp alloc out: {err}"),
+        })?;
+
+    let part_func = backend
+        .module
+        .load_function("bms_flex_row_hvp_partial")
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("bms_flex_row hvp load partial: {err}"),
+        })?;
+    let red_func = backend
+        .module
+        .load_function("bms_flex_row_hvp_reduce")
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("bms_flex_row hvp load reduce: {err}"),
+        })?;
+
+    let n_i32 = n as i32;
+    let r_i32 = r as i32;
+    let p_m_i32 = storage.block.p_m as i32;
+    let p_g_i32 = storage.block.p_g as i32;
+    let p_total_i32 = p_total as i32;
+    let h_block_start = storage.block.h.as_ref().map(|r| r.start as i32).unwrap_or(0);
+    let h_block_len = storage.block.h.as_ref().map(|r| r.len() as i32).unwrap_or(0);
+    let w_block_start = storage.block.w.as_ref().map(|r| r.start as i32).unwrap_or(0);
+    let w_block_len = storage.block.w.as_ref().map(|r| r.len() as i32).unwrap_or(0);
+    let h_primary_start = storage.primary.h.as_ref().map(|r| r.start as i32).unwrap_or(0);
+    let w_primary_start = storage.primary.w.as_ref().map(|r| r.start as i32).unwrap_or(0);
+    let rows_per_cta = HVP_ROWS_PER_CTA as i32;
+    let num_chunks_u32 = num_chunks as u32;
+
+    let cfg_part = LaunchConfig {
+        grid_dim: (num_chunks_u32, 1, 1),
+        block_dim: (HVP_THREADS, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut builder = stream.launch_builder(&part_func);
+    builder
+        .arg(&n_i32)
+        .arg(&r_i32)
+        .arg(&p_m_i32)
+        .arg(&p_g_i32)
+        .arg(&p_total_i32)
+        .arg(&h_block_start)
+        .arg(&h_block_len)
+        .arg(&w_block_start)
+        .arg(&w_block_len)
+        .arg(&h_primary_start)
+        .arg(&w_primary_start)
+        .arg(&rows_per_cta)
+        .arg(&storage.hess)
+        .arg(&storage.marginal_design)
+        .arg(&storage.logslope_design)
+        .arg(&d_v)
+        .arg(&mut d_partial);
+    // SAFETY: every device pointer above either comes from `storage` (whose
+    // capacities were established by `launch_bms_flex_row_kernel_device_resident`)
+    // or was just allocated here (`d_v` length-checked, `d_partial` =
+    // num_chunks * p_total). Scalar args are i32 / u32 by-value.
+    unsafe { builder.launch(cfg_part) }.map_err(|err| GpuError::DriverCallFailed {
+        reason: format!("bms_flex_row hvp partial launch: {err}"),
+    })?;
+
+    let red_threads: u32 = 256;
+    let red_blocks: u32 = ((p_total as u32) + red_threads - 1) / red_threads;
+    let cfg_red = LaunchConfig {
+        grid_dim: (red_blocks, 1, 1),
+        block_dim: (red_threads, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let num_chunks_i32 = num_chunks as i32;
+    let mut builder = stream.launch_builder(&red_func);
+    builder
+        .arg(&num_chunks_i32)
+        .arg(&p_total_i32)
+        .arg(&d_partial)
+        .arg(&mut d_out);
+    // SAFETY: `d_partial` was just populated by the partial kernel above;
+    // `d_out` is `p_total` doubles; both scalar args fit i32.
+    unsafe { builder.launch(cfg_red) }.map_err(|err| GpuError::DriverCallFailed {
+        reason: format!("bms_flex_row hvp reduce launch: {err}"),
+    })?;
+    stream
+        .synchronize()
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("bms_flex_row hvp synchronize: {err}"),
+        })?;
+    stream
+        .clone_dtoh(&d_out)
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("bms_flex_row hvp download out: {err}"),
+        })
+}
+
+/// Launch the device-resident diagonal kernel. Returns the host-side joint
+/// β diagonal of length `block.p_total`.
+#[cfg(target_os = "linux")]
+pub(crate) fn launch_bms_flex_row_diagonal(
+    storage: &DeviceResidentRowHess,
+) -> Result<Vec<f64>, GpuError> {
+    let backend = HvpKernelBackend::probe()?;
+    let stream = backend.stream.clone();
+    let n = storage.n;
+    let p_total = storage.block.p_total;
+    let r = storage.r;
+    let num_chunks = num_hvp_chunks(n);
+
+    let mut d_partial = stream
+        .alloc_zeros::<f64>(num_chunks * p_total)
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("bms_flex_row diag alloc partial: {err}"),
+        })?;
+    let mut d_out = stream
+        .alloc_zeros::<f64>(p_total)
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("bms_flex_row diag alloc out: {err}"),
+        })?;
+    let part_func = backend
+        .module
+        .load_function("bms_flex_row_diag_partial")
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("bms_flex_row diag load partial: {err}"),
+        })?;
+    let red_func = backend
+        .module
+        .load_function("bms_flex_row_hvp_reduce")
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("bms_flex_row diag load reduce: {err}"),
+        })?;
+
+    let n_i32 = n as i32;
+    let r_i32 = r as i32;
+    let p_m_i32 = storage.block.p_m as i32;
+    let p_g_i32 = storage.block.p_g as i32;
+    let p_total_i32 = p_total as i32;
+    let h_block_start = storage.block.h.as_ref().map(|r| r.start as i32).unwrap_or(0);
+    let h_block_len = storage.block.h.as_ref().map(|r| r.len() as i32).unwrap_or(0);
+    let w_block_start = storage.block.w.as_ref().map(|r| r.start as i32).unwrap_or(0);
+    let w_block_len = storage.block.w.as_ref().map(|r| r.len() as i32).unwrap_or(0);
+    let h_primary_start = storage.primary.h.as_ref().map(|r| r.start as i32).unwrap_or(0);
+    let w_primary_start = storage.primary.w.as_ref().map(|r| r.start as i32).unwrap_or(0);
+    let rows_per_cta = HVP_ROWS_PER_CTA as i32;
+    let num_chunks_u32 = num_chunks as u32;
+
+    let cfg_part = LaunchConfig {
+        grid_dim: (num_chunks_u32, 1, 1),
+        block_dim: (HVP_THREADS, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut builder = stream.launch_builder(&part_func);
+    builder
+        .arg(&n_i32)
+        .arg(&r_i32)
+        .arg(&p_m_i32)
+        .arg(&p_g_i32)
+        .arg(&p_total_i32)
+        .arg(&h_block_start)
+        .arg(&h_block_len)
+        .arg(&w_block_start)
+        .arg(&w_block_len)
+        .arg(&h_primary_start)
+        .arg(&w_primary_start)
+        .arg(&rows_per_cta)
+        .arg(&storage.hess)
+        .arg(&storage.marginal_design)
+        .arg(&storage.logslope_design)
+        .arg(&mut d_partial);
+    // SAFETY: same contract as the HVP partial kernel above — pointers come
+    // from `storage` (capacities established at construction time) and
+    // freshly allocated buffers sized to `num_chunks * p_total`.
+    unsafe { builder.launch(cfg_part) }.map_err(|err| GpuError::DriverCallFailed {
+        reason: format!("bms_flex_row diag partial launch: {err}"),
+    })?;
+
+    let red_threads: u32 = 256;
+    let red_blocks: u32 = ((p_total as u32) + red_threads - 1) / red_threads;
+    let cfg_red = LaunchConfig {
+        grid_dim: (red_blocks, 1, 1),
+        block_dim: (red_threads, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let num_chunks_i32 = num_chunks as i32;
+    let mut builder = stream.launch_builder(&red_func);
+    builder
+        .arg(&num_chunks_i32)
+        .arg(&p_total_i32)
+        .arg(&d_partial)
+        .arg(&mut d_out);
+    // SAFETY: `d_partial` populated above, `d_out` sized to `p_total`.
+    unsafe { builder.launch(cfg_red) }.map_err(|err| GpuError::DriverCallFailed {
+        reason: format!("bms_flex_row diag reduce launch: {err}"),
+    })?;
+    stream
+        .synchronize()
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("bms_flex_row diag synchronize: {err}"),
+        })?;
+    debug_assert!(num_chunks_u32 as usize == num_chunks);
+    stream
+        .clone_dtoh(&d_out)
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("bms_flex_row diag download out: {err}"),
+        })
 }
 
 #[cfg(test)]

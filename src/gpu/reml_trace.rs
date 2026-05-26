@@ -415,6 +415,165 @@ pub fn evidence_derivatives_hutchinson_gpu(
 }
 
 // ────────────────────────────────────────────────────────────────────────
+// Adaptive K (Block 2.5)
+// ────────────────────────────────────────────────────────────────────────
+
+/// Default relative-error target for the adaptive-K stopping rule.
+/// Matches `StochasticTraceConfig::default().relative_tol`.
+pub const HUTCHINSON_ADAPTIVE_REL_TOL: f64 = 0.01;
+/// Default near-zero-trace protection floor. Matches
+/// `StochasticTraceConfig::default().tau_rel`.
+pub const HUTCHINSON_ADAPTIVE_TAU_REL: f64 = 1e-8;
+
+/// Adaptive-K Hutchinson trace schedule with common random numbers (CRN).
+///
+/// Repeatedly invokes [`evidence_derivatives_hutchinson_gpu`] with probe
+/// counts `K = 16, 32, 64, 128`, stopping at the first `K` that satisfies
+/// the per-coordinate relative-SE criterion
+///
+/// ```text
+/// max_j  s_j / (sqrt(K) · max(|t_j|, τ))  ≤  ε
+/// ```
+///
+/// where `s_j` is the sample standard deviation across the `K` probes (the
+/// raw quadratic-form sample, *without* the `(1/2)` REML logdet scaling)
+/// and `t_j` is the running mean. Because the SplitMix probe RNG is
+/// stateless (`(seed, k_index, i) → ±1`), the first `K_prev` probes of a
+/// `K = 2·K_prev` re-run are bit-identical to the previous batch, so each
+/// step extends the prior estimate rather than starting fresh in
+/// expectation. The implementation re-runs from scratch at each `K` for
+/// simplicity; CRN is preserved by the stateless RNG seed.
+///
+/// Returns the **raw traces** `t_j = tr(H⁻¹ H_j) = mean_k q_{j,k}`
+/// (length `D`), the `log|H|` from the cached Cholesky, and the final
+/// probe count `K` actually used. The raw traces (not the `(1/2)` REML
+/// logdet gradient) are what the outer evaluator wants — it applies the
+/// logdet-gradient half-factor itself.
+pub struct AdaptiveTraceEvidence {
+    pub logdet_hessian: f64,
+    pub traces: Array1<f64>,
+    pub stderrs: Array1<f64>,
+    pub probe_count: usize,
+    pub converged: bool,
+}
+
+pub fn evidence_traces_adaptive(
+    penalized_hessian: ArrayView2<'_, f64>,
+    derivatives: Vec<DerivativeHessian<'_>>,
+    design: Option<ArrayView2<'_, f64>>,
+    seed: ProbeSeed,
+    rel_tol: f64,
+    tau_rel: f64,
+) -> Result<AdaptiveTraceEvidence, String> {
+    // Adaptive schedule per math team block 2 §16: K = 16, 32, 64, 128.
+    const SCHEDULE: [usize; 4] = [16, 32, 64, 128];
+
+    let d = derivatives.len();
+    if d == 0 {
+        return Err("evidence_traces_adaptive: derivatives is empty".to_string());
+    }
+    if !(rel_tol > 0.0) {
+        return Err(format!(
+            "evidence_traces_adaptive: rel_tol must be > 0 (got {rel_tol})"
+        ));
+    }
+    if !(tau_rel > 0.0) {
+        return Err(format!(
+            "evidence_traces_adaptive: tau_rel must be > 0 (got {tau_rel})"
+        ));
+    }
+
+    let mut last_logdet = 0.0_f64;
+    let mut last_traces = Array1::<f64>::zeros(d);
+    let mut last_stderrs = Array1::<f64>::zeros(d);
+    let mut last_k = 0_usize;
+    let mut converged = false;
+
+    for &k in &SCHEDULE {
+        let input = RemlTraceHutchinsonInput {
+            penalized_hessian,
+            derivatives: derivatives.clone(),
+            design,
+            probe_count: k,
+            seed,
+        };
+        let evidence = evidence_derivatives_hutchinson_gpu(input)?;
+        last_logdet = evidence.logdet_hessian;
+        last_k = k;
+
+        // The dispatch entry returns the **(1/2)·mean** REML logdet
+        // gradient and **(1/2)·sample-SE**. Undo the half to recover the
+        // raw `t_j = mean_k q_{j,k}` and `s_j` the stopping rule wants.
+        for j in 0..d {
+            last_traces[j] = 2.0 * evidence.gradient_rho_logdet[j];
+            last_stderrs[j] = 2.0 * evidence.gradient_rho_stderr[j];
+        }
+
+        // Stopping rule (math block 2 §16):
+        //   max_j  s_j / (sqrt(K) · max(|t_j|, τ))  ≤  ε
+        // `s_j` here is the sample standard deviation across the K probes
+        // (returned by `reduce_mean_stderr`); dividing by sqrt(K) converts
+        // it to the standard error of the running mean.
+        let sqrt_k = (k as f64).sqrt();
+        let mut worst = 0.0_f64;
+        for j in 0..d {
+            let denom = sqrt_k * last_traces[j].abs().max(tau_rel);
+            let r = last_stderrs[j] / denom;
+            if r > worst {
+                worst = r;
+            }
+        }
+        if worst <= rel_tol {
+            converged = true;
+            break;
+        }
+    }
+
+    Ok(AdaptiveTraceEvidence {
+        logdet_hessian: last_logdet,
+        traces: last_traces,
+        stderrs: last_stderrs,
+        probe_count: last_k,
+        converged,
+    })
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Outer logdet-gradient dispatch gate (Block 2.5)
+// ────────────────────────────────────────────────────────────────────────
+
+/// Composite gate predicate for the outer REML logdet-gradient bypass:
+/// when this returns `true`, the unified evaluator should replace its
+/// CPU stochastic-trace call with [`evidence_traces_adaptive`].
+///
+/// All five conditions must hold simultaneously:
+/// * `p ≥ 512` and `K_initial..=K_max` is `[16, 128]`
+/// * `H` is resident as a dense SPD operator (caller passes
+///   `dense_spd_h_resident = true` when `hop.as_exact_dense_spectral()`
+///   is `Some` AND the Cholesky succeeds — the latter is checked
+///   indirectly by `plain_spd_logdet`).
+/// * `plain_spd_logdet`: the operator's logdet kernel is `H⁻¹` exactly
+///   (i.e. `hop.logdet_traces_match_hinv_kernel() && hop.is_dense()`),
+///   so smooth-spectral and SCOP-warped paths are excluded.
+/// * `prefers_stochastic`: `hop.prefers_stochastic_trace_estimation()`.
+/// * `!projected_penalty_subspace_active`: the rank-deficient LAML
+///   projected kernel `U_S H_proj⁻¹ U_Sᵀ` is **not** installed.
+#[must_use]
+pub fn should_bypass_cpu_with_gpu_adaptive(
+    p: usize,
+    dense_spd_h_resident: bool,
+    plain_spd_logdet: bool,
+    prefers_stochastic: bool,
+    projected_penalty_subspace_active: bool,
+) -> bool {
+    p >= HUTCHINSON_GPU_MIN_P
+        && dense_spd_h_resident
+        && plain_spd_logdet
+        && prefers_stochastic
+        && !projected_penalty_subspace_active
+}
+
+// ────────────────────────────────────────────────────────────────────────
 // Linux/CUDA implementation
 // ────────────────────────────────────────────────────────────────────────
 
