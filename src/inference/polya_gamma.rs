@@ -119,10 +119,11 @@ impl PolyaGamma {
             let x_neg_three_half = inv_x * inv_x.sqrt();
             coeff * x_neg_three_half * (-2.0 * k_sq * inv_x).exp()
         } else {
-            // (1 / (π · k²)) · Exp(rate = k² π² / 2) PDF at x
-            //   = (1 / (π · k²)) · (k² π² / 2) · exp(-k² π² x / 2)
-            //   = (π / 2) · exp(-k² π² x / 2).
-            FRAC_PI_2 * (-0.5 * k_sq * PI_SQ * x).exp()
+            // Right-tail coefficient from the Devroye alternating-series
+            // representation of J*(1,0): a_n(x) = π · (n + 1/2) · exp(-(n+1/2)² π² x / 2).
+            // The previous form `(π/2) · exp(...)` missed the factor of `2k` and
+            // only happened to agree for n = 0 because k = 1/2.
+            PI * k0 * (-0.5 * k_sq * PI_SQ * x).exp()
         }
     }
 

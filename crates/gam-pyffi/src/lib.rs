@@ -83,7 +83,7 @@ use gam::terms::basis::{
     duchon_polynomial_first_derivative_nd,
     duchon_radial_first_derivative_nd, evaluate_bspline_basis_scalar,
     matern_radial_first_derivative_nd, periodic_bspline_first_derivative_nd, resolve_duchon_orders,
-    sphere_first_derivative_nd,
+    select_spherical_farthest_point_centers, sphere_first_derivative_nd,
 };
 use gam::terms::input_loc_derivatives::contract_input_loc_gradient;
 use gam::terms::interchange_decoder::{

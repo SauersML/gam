@@ -54,7 +54,18 @@ def test_descriptor_declares_supported_backends_as_classvar(cls: type) -> None:
         "descriptor because it was declared as an instance field rather than "
         "ClassVar[frozenset[str]]"
     )
-    assert value, f"{cls.__qualname__}.SUPPORTED_BACKENDS must be non-empty"
+    # Non-empty iff the descriptor implements at least one _evaluate_<backend>
+    # method. Carrier-only descriptors (e.g. Categorical) legitimately have
+    # frozenset() because formula compilation consumes them directly.
+    impl_methods = {
+        name.removeprefix("_evaluate_")
+        for name in dir(cls)
+        if name.startswith("_evaluate_") and name != "_evaluate_impl"
+    }
+    if impl_methods & {"torch", "numpy", "jax"}:
+        assert value, (
+            f"{cls.__qualname__} has _evaluate_* methods but advertises no backends"
+        )
 
 
 @pytest.mark.parametrize("cls", _descriptor_subclasses(), ids=lambda c: c.__qualname__)
