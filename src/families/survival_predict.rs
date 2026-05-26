@@ -38,6 +38,13 @@ use crate::term_builder::resolve_role_col;
 use crate::terms::smooth::{TermCollectionSpec, build_term_collection_design};
 use crate::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily};
 
+/// Smallest positive survival probability we admit before taking
+/// `-ln(S)` for the cumulative hazard. Using `f64::MIN_POSITIVE` (≈ 2.2e-308)
+/// would let `-ln(S)` reach ~709 and risk downstream `exp(-cum)` underflow
+/// patterns that don't round-trip through `clamp(0,1)`. `1e-300` keeps
+/// `-ln(S) ≤ ~691` and matches the location-scale predict contract upstream.
+const SURVIVAL_PROB_MIN_FOR_LOG: f64 = 1e-300;
+
 /// Typed errors emitted by the survival prediction pipeline.
 ///
 /// Each variant carries a pre-formatted `reason` string so `Display` is
@@ -1687,9 +1694,12 @@ fn predict_survival_location_scale_batch(
         let beta_log_sigma = saved_fit.beta_log_sigma();
         let eta_t_subject =
             cov_design.design.matrixvectormultiply(&beta_threshold) + primary_offset;
+        // `expand_vector(noise_offset)` already lives on `pred_input` as
+        // `eta_log_sigma_offset`; reuse it instead of re-expanding the noise
+        // offset (a per-call allocation when the time grid is explicit).
         let eta_ls_subject = prepared_sigma_design_view(&pred_input)
             .matrixvectormultiply(&beta_log_sigma)
-            + &expand_vector(noise_offset);
+            + &pred_input.eta_log_sigma_offset;
         let eta_t = expand_vector(&eta_t_subject);
         let pred = predict_survival_location_scale_from_linear_components(
             &pred_input.x_time_exit,
@@ -1735,7 +1745,7 @@ fn predict_survival_location_scale_batch(
         .and(&mut hazard)
         .par_for_each(|(i, j), s, ch, h| {
             let k = if per_row_eval { i } else { i * eval_width + j };
-            let surv = survival_prob_full[k].clamp(1e-300, 1.0);
+            let surv = survival_prob_full[k].clamp(SURVIVAL_PROB_MIN_FOR_LOG, 1.0);
             *s = surv;
             *ch = -surv.ln();
             *h = hazard_full[k];
@@ -2379,12 +2389,16 @@ pub fn build_saved_survival_marginal_slope_predictor(
     }
 
     let beta_time_base = beta_time.slice(s![..p_time_base]).to_owned();
+    // `cov_design · beta_marginal` is row-only (no time dependence); hoist it
+    // once so both the entry- and exit-time baselines share the single
+    // matrix-vector multiply instead of recomputing it.
+    let cov_eta_marginal = cov_design.dot(beta_marginal);
     let q_entry_base = time_build.x_entry_time.dot(&beta_time_base)
-        + cov_design.dot(beta_marginal)
+        + &cov_eta_marginal
         + eta_offset_entry
         + primary_offset;
     let q_exit_base = time_build.x_exit_time.dot(&beta_time_base)
-        + cov_design.dot(beta_marginal)
+        + &cov_eta_marginal
         + eta_offset_exit
         + primary_offset;
     let qd_exit_base = time_build.x_derivative_time.dot(&beta_time_base) + derivative_offset_exit;
