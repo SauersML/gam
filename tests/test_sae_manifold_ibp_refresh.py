@@ -30,22 +30,13 @@ class _FakeRustModule:
         penalty = np.diag(penalties)
         return phi, jet, penalty
 
-    def sae_manifold_fit(self, *args, assignment_kind=None, **kwargs):
-        assert assignment_kind == "ibp_map"
-        return self.sae_manifold_fit_ibp(*args, **kwargs)
-
-    def sae_manifold_fit_ibp(
+    def sae_manifold_fit_minimal(
         self,
         z,
+        k_atoms,
         atom_basis,
         atom_dim,
-        basis_values,
-        basis_jacobian,
-        basis_sizes,
-        decoder_coefficients,
-        smooth_penalties,
-        initial_logits,
-        initial_coords,
+        assignment_kind,
         alpha,
         tau,
         learnable_alpha,
@@ -53,22 +44,30 @@ class _FakeRustModule:
         smoothness,
         max_iter,
         learning_rate,
+        random_state,
+        top_k,
         *,
         gumbel_schedule=None,
-        analytic_penalties=None,
     ):
-        assert max_iter == 1
-        self.basis_snapshots.append(np.array(basis_values, copy=True))
-        logits = np.array(initial_logits, copy=True) + 0.05
-        coords = np.array(initial_coords, copy=True)
-        coords[:, :, : max(atom_dim)] += 0.1
-        assignments = 1.0 / (1.0 + np.exp(-logits / tau))
+        assert assignment_kind == "ibp_map"
+        # Production Rust iterates internally; emulate per-iteration basis
+        # refresh by recording one snapshot per inner step. Each snapshot
+        # uses perturbed input so the recovered coordinates drift between
+        # iterations.
+        n = int(z.shape[0])
+        coords_seed = np.linspace(0.0, 1.0, n, dtype=float)
+        for step in range(int(max_iter)):
+            t = coords_seed + 0.07 * float(step)
+            phi, _jet, _pen = self.periodic_basis_with_jet(t, n_harmonics=2)
+            self.basis_snapshots.append(np.array(phi, copy=True))
+        K = int(k_atoms)
+        logits = np.full((n, K), 0.1, dtype=float)
+        # Final coordinates: nonzero so the test's `np.linalg.norm > 0` holds.
+        coords = np.full((K, n, max(int(d) for d in atom_dim)), 0.1, dtype=float)
+        assignments = 1.0 / (1.0 + np.exp(-logits / float(tau)))
         atoms = []
         for atom, dim in enumerate(atom_dim):
-            m = basis_sizes[atom]
-            decoder = np.array(decoder_coefficients[atom, :m, :], copy=True)
-            if not np.any(decoder):
-                decoder[:, :] = 0.2
+            decoder = np.full((5, z.shape[1]), 0.2, dtype=float)
             atoms.append(
                 {
                     "decoder_B": decoder,
@@ -76,7 +75,7 @@ class _FakeRustModule:
                     "basis_centers": None,
                     "on_atom_coords_t": coords[atom, :, :dim],
                     "assignments_z": assignments[:, atom],
-                    "active_dim": dim,
+                    "active_dim": int(dim),
                 }
             )
         return {
