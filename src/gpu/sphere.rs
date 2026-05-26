@@ -293,11 +293,8 @@ impl<'a> S2KernelBuildInputs<'a> {
 
 #[cfg(target_os = "linux")]
 const KERNEL_TEMPLATE: &str = r#"
-// LMAX is supplied by the host via NVRTC define.
-#ifndef LMAX
-#error "LMAX must be defined by the host NVRTC compile flags"
-#endif
-
+// LMAX is supplied by the host via a `#define LMAX ...` prepended to
+// this source before NVRTC compilation (see `SphereGpuBackend::module_for`).
 extern "C" __global__
 __launch_bounds__(256)
 void s2_wahba_legendre_colmajor(
@@ -533,7 +530,9 @@ impl SphereGpuBackend {
             }
         })?;
         let stream = ctx.default_stream();
-        let (cc_major, cc_minor) = runtime.selected_device().capability.as_compute_capability();
+        let cap = &runtime.selected_device().capability;
+        let cc_major = cap.compute_major;
+        let cc_minor = cap.compute_minor;
         Ok(SphereGpuBackend {
             inner: SphereGpuContext {
                 ctx,
@@ -554,14 +553,19 @@ impl SphereGpuBackend {
                 return Ok(existing.clone());
             }
         }
-        let arch = format!("--gpu-architecture=compute_{}{}", key.cc_major, key.cc_minor);
-        let lmax_def = format!("-DLMAX={}", key.lmax);
-        let opts = vec!["--std=c++17".to_string(), arch, lmax_def];
-        let opts_refs: Vec<&str> = opts.iter().map(String::as_str).collect();
-        let ptx = cudarc::nvrtc::Ptx::compile(KERNEL_TEMPLATE, &opts_refs).map_err(|err| {
-            GpuError::DriverCallFailed {
-                reason: format!("sphere NVRTC compile (kind={}, lmax={}): {err}", key.kind.tag(), key.lmax),
-            }
+        // CompileOptions in cudarc 0.19 takes `arch: Option<&'static str>`
+        // which we cannot satisfy with a runtime-built string. Prepend the
+        // `LMAX` macro directly to the source so the NVRTC compile is a
+        // pure `compile_ptx`, matching the sibling kernels' invocation
+        // pattern. The kernel itself targets the device the driver
+        // reports (Volta+).
+        let src = format!("#define LMAX {}\n{}", key.lmax, KERNEL_TEMPLATE);
+        let ptx = cudarc::nvrtc::compile_ptx(&src).map_err(|err| GpuError::DriverCallFailed {
+            reason: format!(
+                "sphere NVRTC compile (kind={}, lmax={}): {err}",
+                key.kind.tag(),
+                key.lmax
+            ),
         })?;
         let module = self
             .inner

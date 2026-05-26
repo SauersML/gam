@@ -966,6 +966,139 @@ pub fn try_survival_flex_dense_hessian(
 }
 
 // ────────────────────────────────────────────────────────────────────────
+// CPU reference for parity tests.
+//
+// Mirrors `row_primary_closed_form` in
+// `src/families/survival_marginal_slope.rs` line-for-line for the scalar
+// (K = 1) case.  Kept in this module — rather than calling the family
+// helper across the crate boundary — so that the Step 1 GPU/CPU parity
+// test exercises the *exact* algebra the device kernel runs (same
+// numerical chain, same operator order) and surfaces sign / chain-rule
+// regressions inside this file without traversing the survival family's
+// import graph.  The two implementations are reconciled in Step 6 when
+// the dispatcher hookup lands.
+// ────────────────────────────────────────────────────────────────────────
+
+/// Per-row CPU reference for the rigid 4-primary survival kernel.
+/// Returns `(nll, grad[4], hess[4][4], status)` with the same status
+/// codes as the GPU kernel (0 ok, 1 monotonicity, 2 non-finite a₁).
+#[doc(hidden)]
+pub fn cpu_reference_rigid_row(
+    q0: f64,
+    q1: f64,
+    qd1: f64,
+    z: f64,
+    g: f64,
+    w: f64,
+    d: f64,
+    derivative_guard: f64,
+    probit_scale: f64,
+) -> (f64, [f64; 4], [[f64; 4]; 4], i32) {
+    if SurvivalFlexGpuRowInputs::rigid_row_guard_violated(qd1, derivative_guard) {
+        return (0.0, [0.0; 4], [[0.0; 4]; 4], 1);
+    }
+
+    let observed_g = probit_scale * g;
+    let s2 = probit_scale * probit_scale;
+    let c = (1.0 + observed_g * observed_g).sqrt();
+    let c1 = s2 * g / c;
+    let c2 = s2 / (c * c * c);
+
+    let eta0 = q0 * c + observed_g * z;
+    let eta1 = q1 * c + observed_g * z;
+    let a1 = qd1 * c;
+
+    if !(a1.is_finite() && a1 > 0.0) {
+        return (0.0, [0.0; 4], [[0.0; 4]; 4], 2);
+    }
+
+    let (log_cdf_neg_eta0, _l0) =
+        crate::probability::signed_probit_logcdf_and_mills_ratio(-eta0);
+    let (log_cdf_neg_eta1, _l1) =
+        crate::probability::signed_probit_logcdf_and_mills_ratio(-eta1);
+    let log_phi_eta1 = -0.5 * (eta1 * eta1 + std::f64::consts::TAU.ln());
+    let log_a1 = a1.max(1e-300).ln();
+
+    let nll = w
+        * ((1.0 - d) * (-log_cdf_neg_eta1) + log_cdf_neg_eta0
+            - d * log_phi_eta1
+            - d * log_a1);
+
+    // signed_probit_neglog_derivatives k1/k2 — replicated inline so this
+    // reference does not depend on bernoulli_marginal_slope's pub(crate).
+    let neglog_k1k2 = |signed_margin: f64, weight: f64| -> (f64, f64) {
+        if weight == 0.0 || signed_margin == f64::INFINITY {
+            return (0.0, 0.0);
+        }
+        if signed_margin == f64::NEG_INFINITY {
+            return (f64::NEG_INFINITY, weight);
+        }
+        if signed_margin.is_nan() {
+            return (f64::NAN, f64::NAN);
+        }
+        let (_, lambda) = crate::probability::signed_probit_logcdf_and_mills_ratio(signed_margin);
+        let k1 = -lambda;
+        let k2 = lambda * (signed_margin + lambda);
+        (weight * k1, weight * k2)
+    };
+    let (e0_k1, e0_k2) = neglog_k1k2(-eta0, -w);
+    let (e1_k1, e1_k2) = neglog_k1k2(-eta1, w * (1.0 - d));
+    let phi_u1 = w * d * eta1;
+    let phi_u2 = w * d;
+    let inv = 1.0 / a1.max(1e-300);
+    let nl_u1 = -inv;
+    let nl_u2 = inv * inv;
+    let td_u1 = w * d * nl_u1;
+    let td_u2 = w * d * nl_u2;
+
+    let deta0_dq0 = c;
+    let deta0_dg = q0 * c1 + probit_scale * z;
+    let deta1_dq1 = c;
+    let deta1_dg = q1 * c1 + probit_scale * z;
+    let dad1_dqd1 = c;
+    let dad1_dg = qd1 * c1;
+
+    let u1_eta0 = -e0_k1;
+    let u1_eta1 = -e1_k1 + phi_u1;
+    let u1_ad1 = td_u1;
+    let u2_eta0 = e0_k2;
+    let u2_eta1 = e1_k2 + phi_u2;
+    let u2_ad1 = td_u2;
+
+    let mut grad = [0.0_f64; 4];
+    grad[0] = u1_eta0 * deta0_dq0;
+    grad[1] = u1_eta1 * deta1_dq1;
+    grad[2] = u1_ad1 * dad1_dqd1;
+    grad[3] = u1_eta0 * deta0_dg + u1_eta1 * deta1_dg + u1_ad1 * dad1_dg;
+
+    let d2eta0_dq0dg = c1;
+    let d2eta1_dq1dg = c1;
+    let d2ad1_dqd1dg = c1;
+    let d2eta0_dg2 = q0 * c2;
+    let d2eta1_dg2 = q1 * c2;
+    let d2ad1_dg2 = qd1 * c2;
+
+    let mut hess = [[0.0_f64; 4]; 4];
+    hess[0][0] = u2_eta0 * deta0_dq0 * deta0_dq0;
+    hess[1][1] = u2_eta1 * deta1_dq1 * deta1_dq1;
+    hess[2][2] = u2_ad1 * dad1_dqd1 * dad1_dqd1;
+    hess[0][3] = u2_eta0 * deta0_dq0 * deta0_dg + u1_eta0 * d2eta0_dq0dg;
+    hess[3][0] = hess[0][3];
+    hess[1][3] = u2_eta1 * deta1_dq1 * deta1_dg + u1_eta1 * d2eta1_dq1dg;
+    hess[3][1] = hess[1][3];
+    hess[2][3] = u2_ad1 * dad1_dqd1 * dad1_dg + u1_ad1 * d2ad1_dqd1dg;
+    hess[3][2] = hess[2][3];
+    hess[3][3] = u2_eta0 * deta0_dg * deta0_dg
+        + u1_eta0 * d2eta0_dg2
+        + u2_eta1 * deta1_dg * deta1_dg
+        + u1_eta1 * d2eta1_dg2
+        + u2_ad1 * dad1_dg * dad1_dg
+        + u1_ad1 * d2ad1_dg2;
+
+    (nll, grad, hess, 0)
+}
+
+// ────────────────────────────────────────────────────────────────────────
 // Tests.  Run via:
 //   cargo test -p gam survival_flex_gpu -- --nocapture 2>&1 | tee /tmp/sv.log
 // ────────────────────────────────────────────────────────────────────────
@@ -1090,6 +1223,115 @@ mod survival_flex_gpu_tests {
                 Ok(None) => {}
                 other => panic!("expected None on non-Linux build, got {other:?}"),
             }
+        }
+    }
+
+    /// Eight diverse single-row scenarios covering the cross-product of
+    /// (event=0/1) × (deep-left-tail q / mid q) × (sub-/super-unit slope).
+    /// On a CUDA host (V100) this checks GPU vs CPU bit-pattern within
+    /// 1e-10 NLL / 1e-8 grad/Hess per the Block 8 validation contract.
+    /// On a CPU-only host the test asserts the CPU reference is finite
+    /// for every scenario and the kernel returns `Ok(None)` (unsupported).
+    #[test]
+    fn survival_flex_gpu_rigid_matches_cpu_reference() {
+        // (q0, q1, qd1, z, g, w, d) — tail / interior / event mix.
+        let cases: [(f64, f64, f64, f64, f64, f64, f64); 8] = [
+            (-2.0, -0.5, 1.30, 0.10, 0.20, 1.0, 0.0),
+            (-2.0, -0.5, 1.30, 0.10, 0.20, 1.0, 1.0),
+            (-8.0, -6.0, 1.50, -0.30, 0.05, 0.7, 0.0),
+            (-8.0, -6.0, 1.50, -0.30, 0.05, 0.7, 1.0),
+            (0.5, 1.2, 0.80, 0.40, -0.10, 1.2, 0.0),
+            (0.5, 1.2, 0.80, 0.40, -0.10, 1.2, 1.0),
+            (-1.5, 0.7, 1.05, 0.00, 0.50, 1.0, 1.0),
+            (3.0, 5.0, 2.10, 0.20, 0.30, 1.0, 0.0),
+        ];
+        let derivative_guard = 1e-6;
+        let probit_scale = 1.0;
+
+        let n = cases.len();
+        let q0: Vec<f64> = cases.iter().map(|c| c.0).collect();
+        let q1: Vec<f64> = cases.iter().map(|c| c.1).collect();
+        let qd1: Vec<f64> = cases.iter().map(|c| c.2).collect();
+        let z: Vec<f64> = cases.iter().map(|c| c.3).collect();
+        let g: Vec<f64> = cases.iter().map(|c| c.4).collect();
+        let w: Vec<f64> = cases.iter().map(|c| c.5).collect();
+        let d: Vec<f64> = cases.iter().map(|c| c.6).collect();
+        let beta = vec![0.0_f64; 4];
+        let mut inputs = make_inputs(n, &q0, &q1, &qd1, &z, &g, &w, &d, &beta);
+        inputs.derivative_guard = derivative_guard;
+        inputs.probit_scale = probit_scale;
+
+        // CPU reference, for every row.
+        let cpu_results: Vec<(f64, [f64; 4], [[f64; 4]; 4], i32)> = cases
+            .iter()
+            .map(|(q0, q1, qd1, z, g, w, d)| {
+                cpu_reference_rigid_row(
+                    *q0,
+                    *q1,
+                    *qd1,
+                    *z,
+                    *g,
+                    *w,
+                    *d,
+                    derivative_guard,
+                    probit_scale,
+                )
+            })
+            .collect();
+        for (i, (nll, grad, _hess, status)) in cpu_results.iter().enumerate() {
+            assert!(nll.is_finite(), "row {i}: cpu nll non-finite ({nll})");
+            assert_eq!(*status, 0, "row {i}: cpu status non-zero ({status})");
+            for k in 0..4 {
+                assert!(
+                    grad[k].is_finite(),
+                    "row {i}: cpu grad[{k}] non-finite ({})",
+                    grad[k]
+                );
+            }
+        }
+
+        match try_rigid_row_primitive(inputs) {
+            Ok(Some(out)) => {
+                // GPU path actually ran (CUDA host).  Element-wise parity
+                // check against the CPU reference at the contract tolerance.
+                for (i, (cpu_nll, cpu_grad, cpu_hess, cpu_status)) in
+                    cpu_results.iter().enumerate()
+                {
+                    assert_eq!(out.row_status[i], *cpu_status, "row {i} status mismatch");
+                    let gpu_nll = out.nll[i];
+                    let nll_err = (gpu_nll - cpu_nll).abs();
+                    assert!(
+                        nll_err <= 1e-10 * (1.0 + cpu_nll.abs()),
+                        "row {i}: nll parity violation gpu={gpu_nll} cpu={cpu_nll} err={nll_err}"
+                    );
+                    for k in 0..4 {
+                        let gpu_g = out.grad[i * 4 + k];
+                        let g_err = (gpu_g - cpu_grad[k]).abs();
+                        assert!(
+                            g_err <= 1e-8 * (1.0 + cpu_grad[k].abs()),
+                            "row {i}: grad[{k}] parity violation gpu={gpu_g} cpu={} err={g_err}",
+                            cpu_grad[k]
+                        );
+                    }
+                    for a in 0..4 {
+                        for b in 0..4 {
+                            let gpu_h = out.hess[i * 16 + a * 4 + b];
+                            let h_err = (gpu_h - cpu_hess[a][b]).abs();
+                            assert!(
+                                h_err <= 1e-8 * (1.0 + cpu_hess[a][b].abs()),
+                                "row {i}: hess[{a}][{b}] parity violation gpu={gpu_h} cpu={} err={h_err}",
+                                cpu_hess[a][b]
+                            );
+                        }
+                    }
+                }
+            }
+            Ok(None) => {
+                // Non-CUDA host: confirm the CPU reference at least
+                // produces finite values across every scenario so the
+                // V100 parity check has a known-good target to land on.
+            }
+            Err(err) => panic!("survival_flex rigid kernel failed: {err:?}"),
         }
     }
 
