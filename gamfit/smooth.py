@@ -19,7 +19,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, Sequence
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, Sequence
 
 if TYPE_CHECKING:
     import torch

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from dataclasses import fields
+
 import gamfit
 from gamfit import _cuda
+from gamfit._cuda import CudaDiagnostics
 
 
 def test_cuda_diagnostics_shape() -> None:
@@ -192,16 +195,7 @@ def test_cuda_candidates_add_driver_when_userspace_already_mapped(
 
 
 _CUDA_DIAGNOSTICS_KEYS: frozenset[str] = frozenset(
-    {
-        "platform",
-        "mapped",
-        "conflicts",
-        "packaged_nvidia_roots",
-        "packaged_cuda_library_dirs",
-        "packaged_complete_stacks",
-        "system_driver_libraries",
-        "system_complete_stacks",
-    }
+    f.name for f in fields(CudaDiagnostics)
 )
 
 

@@ -6,6 +6,7 @@
 //! compiled only for Linux builds that enable the `cuda` feature, so cudarc is
 //! never loaded by default CPU-only builds.
 
+pub mod arrow_schur;
 pub mod blas;
 pub mod bms_flex;
 pub mod cpu_traits;
