@@ -1918,8 +1918,8 @@ fn repack_upper(storage: &mut DeviceResidentRowHess) -> Result<(), GpuError> {
     let stream = backend.stream.clone();
     let n = storage.n;
     let r = storage.r;
-    let per_row_dense = r * r;
-    let per_row_packed = r * (r + 1) / 2;
+    let per_row_dense = RowHessianLayout::FullRowMajor.per_row_doubles(r);
+    let per_row_packed = RowHessianLayout::SymmetricPackedUpper.per_row_doubles(r);
     let total_packed = n * per_row_packed;
 
     let mut d_packed = stream

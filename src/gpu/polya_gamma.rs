@@ -1683,11 +1683,13 @@ mod tests {
     /// PG draw shape (one PG variate per data row per Gibbs iteration), so a
     /// 50× win here is the actual ship gate for the device sampler.
     #[test]
-    #[ignore]
     #[cfg(target_os = "linux")]
     fn polya_gamma_hill_climb_pg1_50x() {
         if super::super::runtime::GpuRuntime::global().is_none() {
-            panic!("polya_gamma_hill_climb_pg1_50x requires a GPU runtime");
+            eprintln!(
+                "[polya_gamma_hill_climb_pg1_50x] no CUDA runtime on host — skipping"
+            );
+            return;
         }
         let n = 200_000usize;
         let shapes = Array1::<u32>::from_elem(n, 1);
