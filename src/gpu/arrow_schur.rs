@@ -113,7 +113,7 @@ fn pack_host(sys: &ArrowSchurSystem, ridge_t: f64) -> (Vec<f64>, Vec<f64>, Vec<f
 #[cfg(target_os = "linux")]
 #[inline]
 fn pack_block(
-    row: &ArrowRowBlock,
+    row: &crate::solver::arrow_schur::ArrowRowBlock,
     ridge_t: f64,
     d: usize,
     k: usize,
