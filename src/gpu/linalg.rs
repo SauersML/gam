@@ -66,6 +66,9 @@ impl DispatchOp {
             }
             Self::Gemv { m, k } => 2u128 * (m as u128) * (k as u128),
             Self::Potrf { p, batch } => (batch as u128) * (p as u128).pow(3) / 3,
+            Self::SmallDenseBatchedPotrf { p, batch } => {
+                (batch as u128) * (p as u128).pow(3) / 3
+            }
             Self::Trsm { m, n } => (m as u128) * (m as u128) * (n as u128),
             Self::XtDiagX { n, p } => 2u128 * (n as u128) * (p as u128) * (p as u128),
             Self::XtDiagY { n, px, q } => 2u128 * (n as u128) * (px as u128) * (q as u128),
@@ -97,6 +100,11 @@ pub fn route_through_gpu(op: DispatchOp) -> Option<&'static GpuRuntime> {
             op.flops() >= (policy.gemm_min_flops as u128) && m > 0 && k > 0
         }
         DispatchOp::Potrf { p, batch } => p >= policy.potrf_min_p && batch > 0,
+        DispatchOp::SmallDenseBatchedPotrf { p, batch } => {
+            p > 0
+                && p <= policy.small_dense_batched_potrf_max_p
+                && batch >= policy.small_dense_batched_potrf_min_batch
+        }
         DispatchOp::Trsm { m, n } => {
             op.flops() >= (policy.gemm_min_flops as u128) && m > 0 && n > 0
         }
