@@ -1,5 +1,4 @@
 use ndarray::Array1;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Sanitized memoization key for rho vectors.
 ///
@@ -18,28 +17,4 @@ pub(super) fn sanitized_rhokey(rho: &Array1<f64>) -> Option<Vec<u64>> {
         });
     }
     Some(key)
-}
-
-/// Small RAII helper for temporary atomic-flag overrides.
-pub(super) struct AtomicFlagGuard<'a> {
-    flag: &'a AtomicBool,
-    prev: bool,
-    ordering: Ordering,
-}
-
-impl<'a> AtomicFlagGuard<'a> {
-    pub(super) fn swap(flag: &'a AtomicBool, value: bool, ordering: Ordering) -> Self {
-        let prev = flag.swap(value, ordering);
-        Self {
-            flag,
-            prev,
-            ordering,
-        }
-    }
-}
-
-impl Drop for AtomicFlagGuard<'_> {
-    fn drop(&mut self) {
-        self.flag.store(self.prev, self.ordering);
-    }
 }

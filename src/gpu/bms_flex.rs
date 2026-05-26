@@ -225,8 +225,7 @@ extern "C" __global__ void bms_flex_probe() {
 ///   3. Parity within 1e-8 against `rigid_row_kernel_eval` for the same
 ///      inputs on CPU.
 #[cfg(target_os = "linux")]
-#[allow(dead_code)] // staged substrate; no dispatcher consumer yet (see module doc)
-const RIGID_ROW_KERNEL_SOURCE: &str = r#"
+pub(super) const RIGID_ROW_KERNEL_SOURCE: &str = r#"
 // Stable Mills ratio λ(m) = φ(m)/Φ(m) plus log Φ(m) for the signed
 // margin m. Mirrors `signed_probit_logcdf_and_mills_ratio` in
 // src/inference/probability.rs — left tail uses the erfcx-based
@@ -788,4 +787,57 @@ mod bms_flex_gpu_tests {
         }
     }
 
+    /// Static source-shape checks on the staged rigid kernel substrate.
+    /// Always runs (no device required): verifies the const isn't empty,
+    /// declares the expected `extern "C"` entry point, and references the
+    /// shared Mills-ratio device helper. NVRTC compilation is exercised
+    /// by `bms_flex_rigid_kernel_source_compiles_on_device` when a CUDA
+    /// runtime is present.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bms_flex_rigid_kernel_source_has_expected_shape() {
+        let src = super::RIGID_ROW_KERNEL_SOURCE;
+        assert!(!src.is_empty(), "rigid kernel source must not be empty");
+        assert!(
+            src.contains("extern \"C\" __global__ void\nbms_rigid_row"),
+            "rigid kernel must export bms_rigid_row as extern \"C\" __global__"
+        );
+        assert!(
+            src.contains("bms_signed_probit_logcdf_and_mills"),
+            "rigid kernel must call the shared Mills-ratio device helper"
+        );
+        assert!(
+            src.contains("erfc("),
+            "rigid kernel must use libm erfc for stable left-tail logcdf"
+        );
+    }
+
+    /// V100-only: NVRTC-compile the staged rigid kernel and load it into
+    /// the BMS flex backend's CUDA context, confirming the source is at
+    /// least syntactically and semantically valid PTX-emittable code on
+    /// real hardware. Skipped on hosts without a usable device. Does not
+    /// launch the kernel yet — full launch + parity check lands when the
+    /// dispatcher consumer (milestone 3b/4) is wired.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bms_flex_rigid_kernel_source_compiles_on_device() {
+        let Some(_runtime) = super::super::runtime::GpuRuntime::global() else {
+            eprintln!(
+                "[bms_flex_gpu test] no CUDA runtime — skipping rigid-kernel NVRTC compile"
+            );
+            return;
+        };
+        let backend = BmsFlexGpuBackend::probe()
+            .expect("BmsFlexGpuBackend::probe must succeed on a host with a CUDA runtime");
+        let ptx = cudarc::nvrtc::compile_ptx(super::RIGID_ROW_KERNEL_SOURCE)
+            .expect("rigid kernel source must NVRTC-compile cleanly on the selected device");
+        let module = backend
+            .inner
+            .ctx
+            .load_module(ptx)
+            .expect("compiled PTX must load into the BMS flex backend's CUDA context");
+        module
+            .load_function("bms_rigid_row")
+            .expect("bms_rigid_row must be resolvable in the loaded module");
+    }
 }

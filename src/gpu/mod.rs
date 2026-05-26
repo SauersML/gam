@@ -22,6 +22,7 @@ pub mod profile;
 pub mod reml_trace;
 pub mod runtime;
 pub mod solver;
+pub mod sphere;
 
 pub use cpu_traits::{ExecutionTarget, MatrixLocation};
 pub use device::GpuDeviceInfo;

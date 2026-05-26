@@ -8,7 +8,7 @@ plus a one-shot `equivariant_smooth` constructor.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 
 import numpy as np
 
@@ -110,6 +110,11 @@ class LieAtom(Smooth):
     n_atoms: int = 64
     d_per_atom: int = 2
     bandwidth_init: float = 0.0
+
+    # LieAtom is a config carrier for the additive Lie-decoder layer; it
+    # does not carry its own basis-evaluator surface (the Rust decoder
+    # consumes the dataclass directly). Empty set is the honest contract.
+    SUPPORTED_BACKENDS: ClassVar[frozenset[str]] = frozenset()
 
     def __post_init__(self) -> None:
         expected = GROUP_REP_DIM[self.group]
