@@ -204,19 +204,39 @@ fn clamp_eta(eta: f64) -> (f64, bool) {
 }
 
 /// Reference CPU evaluator for one row. `mode` selects `w_hessian` curvature.
+///
+/// Stage 1 keeps `CurvatureMode::Fisher` and `CurvatureMode::Observed` numerically
+/// identical for every family; Stage 5 introduces the observed-information
+/// branch for Gamma-log + non-canonical Bernoulli. The `mode` argument flows
+/// through every family helper today so the dispatch path is in place when
+/// Stage 5 lands the math, and so the kernel module cache key already keys on
+/// the curvature surface.
 pub fn row_reweight_cpu(family: PirlsRowFamily, mode: CurvatureMode, input: RowInput) -> RowOutput {
     match family {
-        PirlsRowFamily::GaussianIdentity => row_gaussian_identity(input),
-        PirlsRowFamily::PoissonLog => row_poisson_log(input),
+        PirlsRowFamily::GaussianIdentity => row_gaussian_identity(input, mode),
+        PirlsRowFamily::PoissonLog => row_poisson_log(input, mode),
         PirlsRowFamily::GammaLog => row_gamma_log(input, mode),
-        PirlsRowFamily::BernoulliLogit => row_bernoulli_logit(input),
+        PirlsRowFamily::BernoulliLogit => row_bernoulli_logit(input, mode),
         PirlsRowFamily::BernoulliProbit => row_bernoulli_probit(input, mode),
         PirlsRowFamily::BernoulliCLogLog => row_bernoulli_cloglog(input, mode),
     }
 }
 
+/// Resolve `(w_fisher, observed_correction)` into the `w_hessian` value that
+/// matches the selected curvature surface. Stage 1 returns `w_fisher` for both
+/// modes (parity with the CPU PIRLS path that, today, uses Fisher weights
+/// even for non-canonical links); Stage 5 will switch the `Observed` arm to
+/// `w_fisher + observed_correction` and the call sites stay unchanged.
 #[inline]
-fn row_gaussian_identity(input: RowInput) -> RowOutput {
+fn select_w_hessian(mode: CurvatureMode, w_fisher: f64, observed_correction: f64) -> f64 {
+    match mode {
+        CurvatureMode::Fisher => w_fisher,
+        CurvatureMode::Observed => w_fisher + observed_correction,
+    }
+}
+
+#[inline]
+fn row_gaussian_identity(input: RowInput, mode: CurvatureMode) -> RowOutput {
     let w = input.prior_weight.max(0.0);
     let mu = input.eta;
     let resid = input.y - mu;
@@ -226,12 +246,18 @@ fn row_gaussian_identity(input: RowInput) -> RowOutput {
     } else {
         0
     };
+    // Identity link: Var(Y) is constant in η, so observed == Fisher exactly.
+    let w_hessian = select_w_hessian(mode, w, 0.0);
     RowOutput {
         mu,
         grad_eta: w * resid,
         w_fisher: w,
-        w_hessian: w,
-        w_solver: if w > 0.0 { w.max(W_SOLVER_FLOOR) } else { 0.0 },
+        w_hessian,
+        w_solver: if w_hessian > 0.0 {
+            w_hessian.max(W_SOLVER_FLOOR)
+        } else {
+            0.0
+        },
         z_fisher: input.y,
         z_hessian: input.y,
         deviance: dev,
@@ -240,7 +266,7 @@ fn row_gaussian_identity(input: RowInput) -> RowOutput {
 }
 
 #[inline]
-fn row_poisson_log(input: RowInput) -> RowOutput {
+fn row_poisson_log(input: RowInput, mode: CurvatureMode) -> RowOutput {
     let (eta_c, clamped) = clamp_eta(input.eta);
     let mu_raw = eta_c.exp();
     let mu_floored = mu_raw < MU_FLOOR_POISSON;
@@ -275,12 +301,14 @@ fn row_poisson_log(input: RowInput) -> RowOutput {
     if !(input.y.is_finite() && input.y >= 0.0) {
         status |= status_flags::INVALID_RESPONSE;
     }
+    // Canonical log link: observed == Fisher (∂²ℓ/∂η² is deterministic in η).
+    let w_hessian = select_w_hessian(mode, w_fisher, 0.0);
     RowOutput {
         mu,
         grad_eta: w_prior * resid,
         w_fisher,
-        w_hessian: w_fisher,
-        w_solver: w_fisher,
+        w_hessian,
+        w_solver: w_hessian,
         z_fisher: z,
         z_hessian: z,
         deviance: dev,
@@ -301,14 +329,10 @@ fn row_gamma_log(input: RowInput, mode: CurvatureMode) -> RowOutput {
     let mu = mu_raw.max(MU_FLOOR_GAMMA);
     let w_prior = input.prior_weight.max(0.0);
     let w_fisher = w_prior * shape;
-    // Observed information for the Gamma log link adds a residual-dependent
-    // correction. For canonical-on-the-fly canonical-mode requests we keep
-    // Fisher == Observed (matches CPU). Stage 5 populates the observed
-    // weight when `mode == Observed` (here scaffolded to the same value).
-    let w_hessian = match mode {
-        CurvatureMode::Fisher => w_fisher,
-        CurvatureMode::Observed => w_fisher, // populated in Stage 5
-    };
+    // Stage 1 keeps observed == Fisher (matches the current CPU PIRLS path
+    // for Gamma log). Stage 5 will replace the zero correction with the
+    // observed-information term  −w_prior · (y − μ) · h'' / V .
+    let w_hessian = select_w_hessian(mode, w_fisher, 0.0);
     let resid = input.y - mu;
     // Saturated Gamma deviance: 2 w [−log(y/μ) + (y − μ)/μ].
     let dev = if input.y > 0.0 {
@@ -350,7 +374,7 @@ fn row_gamma_log(input: RowInput, mode: CurvatureMode) -> RowOutput {
 }
 
 #[inline]
-fn row_bernoulli_logit(input: RowInput) -> RowOutput {
+fn row_bernoulli_logit(input: RowInput, mode: CurvatureMode) -> RowOutput {
     let (eta_c, clamped) = clamp_eta(input.eta);
     // Numerically stable σ(η): use tanh(η/2) form to avoid catastrophic
     // cancellation for large |η|. μ = (1 + tanh(η/2)) / 2.
@@ -380,13 +404,14 @@ fn row_bernoulli_logit(input: RowInput) -> RowOutput {
     if !(input.y.is_finite() && (0.0..=1.0).contains(&input.y)) {
         status |= status_flags::INVALID_RESPONSE;
     }
+    let w_hessian = select_w_hessian(mode, w_fisher, 0.0);
     RowOutput {
         mu,
         grad_eta,
         w_fisher,
-        w_hessian: w_fisher,
-        w_solver: if w_fisher > 0.0 {
-            w_fisher.max(W_SOLVER_FLOOR)
+        w_hessian,
+        w_solver: if w_hessian > 0.0 {
+            w_hessian.max(W_SOLVER_FLOOR)
         } else {
             0.0
         },
@@ -398,7 +423,7 @@ fn row_bernoulli_logit(input: RowInput) -> RowOutput {
 }
 
 #[inline]
-fn row_bernoulli_probit(input: RowInput, _mode: CurvatureMode) -> RowOutput {
+fn row_bernoulli_probit(input: RowInput, mode: CurvatureMode) -> RowOutput {
     let (eta_c, clamped) = clamp_eta(input.eta);
     let mu_raw = standard_normal_cdf(eta_c);
     let mu_low = mu_raw < MU_FLOOR_BERNOULLI;

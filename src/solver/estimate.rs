@@ -3009,6 +3009,24 @@ where
                 state.compute_screening_proxy(rho)
             },
         );
+        // Standard REML's eval closure publishes
+        // `inner_beta_hint = state.current_original_basis_beta()` on
+        // every accepted eval. The continuation pre-warm carries that
+        // hint forward and calls `seed_inner_state(beta)` before the
+        // next eval — see src/solver/reml/continuation.rs:209-212,
+        // 434-438. Without a hook here, `ClosureObjective::seed_inner_state`
+        // (src/solver/outer_strategy.rs:2097-2107) rejected any
+        // non-empty β fatally, dropping every seed before the inner
+        // solver started (issue #236). Wire the symmetric consumer:
+        // when the pre-warm forwards the cached β, install it into the
+        // same `warm_start_beta` slot the publisher reads from.
+        let mut obj = obj.with_seed_inner_state(
+            |state: &mut &mut crate::solver::estimate::reml::RemlState<'_>,
+             beta: &Array1<f64>| {
+                state.setwarm_start_original_beta(Some(beta.view()));
+                Ok(())
+            },
+        );
 
         let strategy_result = problem.run(&mut obj, "standard REML")?;
         // Convergence guard for the outer-aware inner-PIRLS schedule
@@ -3312,6 +3330,18 @@ where
                     Ok(efs_eval)
                 },
             ),
+        );
+        // Same publish/consume symmetry as the standard REML arm above
+        // (issue #236). The mixture/SAS eval closure also surfaces
+        // `inner_beta_hint = state.current_original_basis_beta()` (see
+        // src/solver/estimate.rs:3275), so continuation pre-warm needs
+        // a real seed hook to install it.
+        let mut obj = obj.with_seed_inner_state(
+            |state: &mut &mut crate::solver::estimate::reml::RemlState<'_>,
+             beta: &Array1<f64>| {
+                state.setwarm_start_original_beta(Some(beta.view()));
+                Ok(())
+            },
         );
         let outer_result = problem.run(&mut obj, "mixture/SAS flexible link")?;
         // Convergence guard for the outer-aware inner-PIRLS schedule

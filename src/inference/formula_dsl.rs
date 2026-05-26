@@ -347,7 +347,7 @@ fn expand_expr(pair: Pair<'_, Rule>, raw: &str) -> Result<Vec<WrAtomList>, Strin
             expand_expr(inner, raw)
         }
         Rule::sum => {
-            let mut iter = pair.into_inner().peekable();
+            let mut iter = pair.into_inner();
             let first = iter.next().ok_or_else(|| {
                 FormulaDslError::ParseError {
                     reason: format!("invalid term syntax in `{raw}`: empty sum"),
@@ -356,71 +356,79 @@ fn expand_expr(pair: Pair<'_, Rule>, raw: &str) -> Result<Vec<WrAtomList>, Strin
             })?;
             let mut acc = expand_expr(first, raw)?;
             while let Some(op) = iter.next() {
-                // Inner sequence is (add_op product)*; pest emits add_op as
-                // silent (it's `_{ ... }`) so the next item is the operand.
-                // But we kept add_op as non-silent? Let's match defensively.
-                let operand = if matches!(op.as_rule(), Rule::product) {
-                    op
-                } else {
-                    iter.next().ok_or_else(|| {
-                        FormulaDslError::ParseError {
-                            reason: format!(
-                                "invalid term syntax in `{raw}`: dangling add operator"
-                            ),
-                        }
-                        .to_string()
-                    })?
-                };
+                if op.as_rule() != Rule::add_op {
+                    return Err(FormulaDslError::ParseError {
+                        reason: format!(
+                            "invalid term syntax in `{raw}`: expected add operator, got `{:?}`",
+                            op.as_rule()
+                        ),
+                    }
+                    .into());
+                }
+                let op_str = op.as_str().trim();
+                let operand = iter.next().ok_or_else(|| {
+                    FormulaDslError::ParseError {
+                        reason: format!("invalid term syntax in `{raw}`: dangling `{op_str}`"),
+                    }
+                    .to_string()
+                })?;
+                if op_str == "-" {
+                    return Err(FormulaDslError::IncompatibleTerm {
+                        reason: format!(
+                            "binary `-` is not supported inside a formula term in `{raw}` \
+                             (use multiple `+` terms or drop the unwanted predictor explicitly)"
+                        ),
+                    }
+                    .into());
+                }
                 let mut rhs = expand_expr(operand, raw)?;
                 acc.append(&mut rhs);
             }
             Ok(acc)
         }
         Rule::product => {
-            // product = { interact ~ (mul_op ~ interact)* }
-            // mul_op IS silent, but the operator tokens *are* still in the
-            // inner pairs as strings; we walk pairs and infer the op from
-            // the source text between operands.
-            let span_str = pair.as_str();
-            let inner: Vec<Pair<'_, Rule>> = pair.into_inner().collect();
-            let mut acc = expand_expr(inner[0].clone(), raw)?;
-            let mut cursor = 0usize;
-            for operand in inner.iter().skip(1) {
-                let operand_start = operand.as_span().start() - operand.as_span().get_input().len()
-                    + operand.as_span().get_input().len();
-                // Simpler: read the chunk of span_str between the end of
-                // the previous operand and the start of this one to find
-                // the operator character.
-                let prev_end = inner[cursor].as_span().end();
-                let next_start = operand.as_span().start();
-                let between = &operand.as_span().get_input()[prev_end..next_start];
-                let op_char = between
-                    .chars()
-                    .find(|c| *c == '*' || *c == '/')
-                    .ok_or_else(|| {
-                        FormulaDslError::ParseError {
+            let mut iter = pair.into_inner();
+            let first = iter.next().ok_or_else(|| {
+                FormulaDslError::ParseError {
+                    reason: format!("invalid term syntax in `{raw}`: empty product"),
+                }
+                .to_string()
+            })?;
+            let mut acc = expand_expr(first, raw)?;
+            while let Some(op) = iter.next() {
+                if op.as_rule() != Rule::mul_op {
+                    return Err(FormulaDslError::ParseError {
+                        reason: format!(
+                            "invalid term syntax in `{raw}`: expected `*` or `/`, got `{:?}`",
+                            op.as_rule()
+                        ),
+                    }
+                    .into());
+                }
+                let op_str = op.as_str().trim();
+                let operand = iter.next().ok_or_else(|| {
+                    FormulaDslError::ParseError {
+                        reason: format!("invalid term syntax in `{raw}`: dangling `{op_str}`"),
+                    }
+                    .to_string()
+                })?;
+                let rhs = expand_expr(operand, raw)?;
+                acc = match op_str {
+                    "*" => wr_cross(acc, rhs),
+                    "/" => wr_nest(acc, rhs),
+                    other => {
+                        return Err(FormulaDslError::ParseError {
                             reason: format!(
-                                "invalid term syntax in `{raw}`: expected `*` or `/` between product operands"
+                                "invalid term syntax in `{raw}`: unrecognized mul operator `{other}`"
                             ),
                         }
-                        .to_string()
-                    })?;
-                let rhs = expand_expr(operand.clone(), raw)?;
-                acc = match op_char {
-                    '*' => wr_cross(acc, rhs),
-                    '/' => wr_nest(acc, rhs),
-                    _ => unreachable!(),
+                        .into());
+                    }
                 };
-                cursor += 1;
-                // Silence unused
-                if false {
-                    let _ = (span_str, operand_start);
-                }
             }
             Ok(acc)
         }
         Rule::interact => {
-            // interact = { power ~ (interact_op ~ power)* }
             let mut iter = pair.into_inner();
             let first = iter.next().ok_or_else(|| {
                 FormulaDslError::ParseError {
@@ -429,22 +437,54 @@ fn expand_expr(pair: Pair<'_, Rule>, raw: &str) -> Result<Vec<WrAtomList>, Strin
                 .to_string()
             })?;
             let mut acc = expand_expr(first, raw)?;
-            for operand in iter {
+            while let Some(op) = iter.next() {
+                if op.as_rule() != Rule::interact_op {
+                    return Err(FormulaDslError::ParseError {
+                        reason: format!(
+                            "invalid term syntax in `{raw}`: expected `:`, got `{:?}`",
+                            op.as_rule()
+                        ),
+                    }
+                    .into());
+                }
+                let operand = iter.next().ok_or_else(|| {
+                    FormulaDslError::ParseError {
+                        reason: format!("invalid term syntax in `{raw}`: dangling `:`"),
+                    }
+                    .to_string()
+                })?;
                 let rhs = expand_expr(operand, raw)?;
                 acc = wr_interact(acc, rhs, raw)?;
             }
             Ok(acc)
         }
         Rule::power => {
-            // power = { unary ~ (pow_op ~ unary)* }
-            let inner: Vec<Pair<'_, Rule>> = pair.into_inner().collect();
-            let base = expand_expr(inner[0].clone(), raw)?;
-            if inner.len() == 1 {
+            let mut iter = pair.into_inner();
+            let first = iter.next().ok_or_else(|| {
+                FormulaDslError::ParseError {
+                    reason: format!("invalid term syntax in `{raw}`: empty power"),
+                }
+                .to_string()
+            })?;
+            let base = expand_expr(first, raw)?;
+            let Some(op) = iter.next() else {
                 return Ok(base);
+            };
+            if op.as_rule() != Rule::pow_op {
+                return Err(FormulaDslError::ParseError {
+                    reason: format!(
+                        "invalid term syntax in `{raw}`: expected `^`, got `{:?}`",
+                        op.as_rule()
+                    ),
+                }
+                .into());
             }
-            // pow_op is silent, so subsequent pairs are exponent operands
-            // (unary -> primary -> number).
-            let exponent_pair = inner[1].clone();
+            let exponent_pair = iter.next().ok_or_else(|| {
+                FormulaDslError::ParseError {
+                    reason: format!("invalid term syntax in `{raw}`: dangling `^`"),
+                }
+                .to_string()
+            })?;
             let exp_text = exponent_pair.as_str().trim();
             let n: usize = exp_text.parse().map_err(|_| {
                 FormulaDslError::ParseError {
@@ -480,18 +520,6 @@ fn expand_expr(pair: Pair<'_, Rule>, raw: &str) -> Result<Vec<WrAtomList>, Strin
             let inner = pair.into_inner().next();
             match inner {
                 Some(child) if child.as_rule() == Rule::expr => expand_expr(child, raw),
-                Some(child) if child.as_rule() == Rule::function_call => {
-                    Ok(vec![vec![child.as_str().trim().to_string()]])
-                }
-                Some(child) if child.as_rule() == Rule::ident => {
-                    Ok(vec![vec![child.as_str().trim().to_string()]])
-                }
-                Some(child) if child.as_rule() == Rule::number => {
-                    // Allow numeric literals as atoms (they act as the
-                    // exponent in `^n` and are otherwise rejected by
-                    // parse_term).
-                    Ok(vec![vec![child.as_str().trim().to_string()]])
-                }
                 Some(child) => Ok(vec![vec![child.as_str().trim().to_string()]]),
                 None => Ok(vec![vec![span]]),
             }
@@ -1803,7 +1831,46 @@ pub fn parse_formula(formula: &str) -> Result<ParsedFormula, FormulaDslError> {
     // produces a rank-deficient design and the user has no idea why their
     // fit is over-parameterized.
     let mut seen_term_keys: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut expanded_terms = Vec::<String>::new();
     for raw in parsed_dsl.rhs_terms {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            expanded_terms.push(String::new());
+            continue;
+        }
+        // Single function-call terms (smooths, group(), etc.) are opaque to
+        // WR expansion; pass them through verbatim so parse_term sees the
+        // exact source string. Bare identifiers and any term mentioning
+        // `:`, `*`, `/`, `^` are routed through the AST-driven WR expander.
+        let is_call = parse_function_call(trimmed).is_ok();
+        let needs_expansion = !is_call
+            && trimmed
+                .chars()
+                .scan(0i32, |depth, ch| {
+                    let d_before = *depth;
+                    match ch {
+                        '(' | '[' | '{' => *depth += 1,
+                        ')' | ']' | '}' if *depth > 0 => *depth -= 1,
+                        _ => {}
+                    }
+                    Some((d_before, ch))
+                })
+                .any(|(d, ch)| d == 0 && matches!(ch, ':' | '*' | '/' | '^'));
+        if needs_expansion {
+            for atoms in expand_wr_term(trimmed)
+                .map_err(|reason| FormulaDslError::ParseError { reason })?
+            {
+                if atoms.is_empty() {
+                    continue;
+                }
+                expanded_terms.push(atoms.join(":"));
+            }
+        } else {
+            expanded_terms.push(trimmed.to_string());
+        }
+    }
+
+    for raw in expanded_terms {
         let t = raw.trim();
         if t.is_empty() || t == "1" {
             continue;
@@ -1926,6 +1993,33 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
             }
         }
         (vars, options)
+    }
+
+    // Wilkinson-Rogers `:` interaction term. The expander in `parse_formula`
+    // produces `a:b[:c...]` for these; parse_term is also reached directly
+    // from tests, so handle the syntax here as well.
+    if raw.contains(':')
+        && !raw.contains('(')
+        && raw.split(':').all(|piece| is_exact_ident(piece.trim()))
+    {
+        let vars: Vec<String> = raw
+            .split(':')
+            .map(|piece| piece.trim().to_string())
+            .collect();
+        if vars.len() >= 2 {
+            let mut sorted = vars.clone();
+            sorted.sort();
+            sorted.dedup();
+            if sorted.len() != vars.len() {
+                return Err(FormulaDslError::IncompatibleTerm {
+                    reason: format!(
+                        "interaction term `{raw}` references the same variable more than once"
+                    ),
+                }
+                .into());
+            }
+            return Ok(ParsedTerm::Interaction { vars: sorted });
+        }
     }
 
     let call = parse_function_call(raw).ok();
