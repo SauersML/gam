@@ -866,6 +866,112 @@ pub fn householder_reflector_from_weights(w: &[f64]) -> (Vec<f64>, f64) {
 }
 
 // ────────────────────────────────────────────────────────────────────────
+// Phase 2 — center-center penalty C + constraint S = Zᵀ C Z.
+//
+// `C` is the (m × m) Wahba kernel of centers against themselves and is
+// computed by reusing the raw GPU kernel with `n = m`. The constraint
+// transform is the same Householder reflector used by the Phase-3 fused
+// kernel: Z = (I − β · v · vᵀ) with the first column dropped, so the
+// constrained penalty is the trailing (m−1)×(m−1) block of HᵀCH.
+//
+// At m ≤ 200 the Householder product is cheap on host and the result is
+// returned as an `ndarray::Array2`. Future calls into cuSOLVER QR can
+// upload it (or its Cholesky factor) once and keep it device-resident.
+// ────────────────────────────────────────────────────────────────────────
+
+/// Build the (m × m) center-center kernel matrix `C` using the same GPU
+/// kernel that builds the design. `centers_xyz` is the unit-vector
+/// representation of the centers, length `3 * m`. `coeffs` and `kind`
+/// match the design build.
+pub fn build_center_kernel_device(
+    centers_xyz: &[f64],
+    lmax: usize,
+    coeffs: &[f64],
+    kind: SphereSpectralKernelKind,
+) -> Result<DeviceS2KernelMatrix, GpuError> {
+    let m = centers_xyz.len() / 3;
+    if centers_xyz.len() != 3 * m {
+        return Err(GpuError::DriverCallFailed {
+            reason: "build_center_kernel_device: centers_xyz length not divisible by 3".into(),
+        });
+    }
+    let inputs = S2KernelBuildInputs {
+        n: m,
+        m,
+        lmax,
+        data_xyz: centers_xyz,
+        centers_xyz,
+        coeffs,
+        kind,
+        layout: DeviceMatrixLayout::ColumnMajor,
+    };
+    build_kernel_matrix_device(inputs)
+}
+
+/// Constrained penalty matrix `S = Zᵀ C Z` for the
+/// weighted-sum-to-zero Householder constraint built from `w`.
+/// Returned shape is `((m−1) × (m−1))`. `C` is taken as a host
+/// (m × m) array (typically the dtoh of `build_center_kernel_device`).
+pub fn constrained_penalty_host(
+    c: ArrayView2<'_, f64>,
+    w: &[f64],
+) -> Result<Array2<f64>, GpuError> {
+    let (m1, m2) = c.dim();
+    if m1 != m2 {
+        return Err(GpuError::DriverCallFailed {
+            reason: format!(
+                "constrained_penalty_host: C must be square, got {m1}x{m2}"
+            ),
+        });
+    }
+    let m = m1;
+    if w.len() != m {
+        return Err(GpuError::DriverCallFailed {
+            reason: format!(
+                "constrained_penalty_host: w.len()={} != m={}",
+                w.len(),
+                m
+            ),
+        });
+    }
+    if m < 2 {
+        return Err(GpuError::DriverCallFailed {
+            reason: format!(
+                "constrained_penalty_host: m must be >= 2 (got {m})"
+            ),
+        });
+    }
+    let (v, beta) = householder_reflector_from_weights(w);
+
+    // Form HCH = (I - β v vᵀ) C (I - β v vᵀ) = C - β (v · uᵀ + u · vᵀ) + β² (vᵀ C v) v vᵀ,
+    // where u = C v. This is O(m²) — fine for m ≤ 200.
+    let mut u = vec![0.0_f64; m];
+    for i in 0..m {
+        let mut acc = 0.0_f64;
+        for j in 0..m {
+            acc += c[(i, j)] * v[j];
+        }
+        u[i] = acc;
+    }
+    let vtcv: f64 = v.iter().zip(&u).map(|(vi, ui)| vi * ui).sum();
+    let mut hch = Array2::<f64>::zeros((m, m));
+    for i in 0..m {
+        for j in 0..m {
+            hch[(i, j)] = c[(i, j)] - beta * (v[i] * u[j] + u[i] * v[j])
+                + beta * beta * vtcv * v[i] * v[j];
+        }
+    }
+    // Drop the first row and column (the Householder-constrained nullspace).
+    let mut s = Array2::<f64>::zeros((m - 1, m - 1));
+    for i in 0..(m - 1) {
+        for j in 0..(m - 1) {
+            s[(i, j)] = hch[(i + 1, j + 1)];
+        }
+    }
+    Ok(s)
+}
+
+// ────────────────────────────────────────────────────────────────────────
 // Tests
 // ────────────────────────────────────────────────────────────────────────
 
