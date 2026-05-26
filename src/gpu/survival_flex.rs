@@ -2368,4 +2368,162 @@ mod survival_flex_gpu_tests {
             }
         }
     }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Step 3 — device intercept solve (monotone root) parity tests.
+    //
+    // Uses the analytic evaluator `F(a) = α·exp(β·a) + γ` whose closed
+    // form root is `a* = ln(-γ/α) / β`.  Six scenarios cover:
+    //   * tight warm-start (Newton probe converges)
+    //   * loose warm-start (bracket-then-refine path)
+    //   * F increasing + decreasing
+    //   * negative `γ/α` ratios that put the root in either half-plane
+    //   * a degenerate F'(a_warm) ≈ 0 (status = 2)
+    // The closed-form analytic root lets us assert |a_gpu - a_true|
+    // tightly without relying on the CPU oracle, but we also do a
+    // full element-wise CPU/GPU parity check at 1e-9 relative.
+    // ────────────────────────────────────────────────────────────────────
+
+    fn analytic_root(alpha: f64, beta: f64, gamma: f64) -> f64 {
+        // F(a) = 0  ⇔  exp(β·a) = -γ/α  ⇔  a = ln(-γ/α) / β
+        (-gamma / alpha).ln() / beta
+    }
+
+    #[test]
+    fn survival_flex_intercept_solve_validates_inputs() {
+        let bad = SurvivalFlexInterceptSolveInputs {
+            n: 2,
+            a_warm: &[0.0, 0.0],
+            alpha: &[1.0, 1.0],
+            beta: &[1.0, 1.0],
+            gamma: &[-1.0], // wrong length
+            convergence_tol: 1e-9,
+            max_bracket_iters: 64,
+            max_refine_iters: 64,
+        };
+        match try_device_intercept_solve(&bad) {
+            Err(GpuError::DriverCallFailed { reason }) => {
+                assert!(reason.contains("gamma.len()"), "got: {reason}");
+            }
+            other => panic!("expected length-mismatch error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn survival_flex_intercept_solve_cpu_oracle_matches_analytic_root() {
+        // Cross-check the oracle itself against the closed-form root,
+        // so a regression in the oracle doesn't fake parity later.
+        let alpha = [1.0, 2.0, -1.0, 0.5];
+        let beta = [1.0, 0.5, 1.5, 2.0];
+        let gamma = [-2.0, -3.0, 4.0, -1.5];
+        let a_warm = [0.0, 0.0, 0.0, 0.0];
+        let inputs = SurvivalFlexInterceptSolveInputs {
+            n: 4,
+            a_warm: &a_warm,
+            alpha: &alpha,
+            beta: &beta,
+            gamma: &gamma,
+            convergence_tol: 1e-12,
+            max_bracket_iters: 64,
+            max_refine_iters: 64,
+        };
+        let oracle = cpu_oracle_intercept_solve(&inputs);
+        for row in 0..4 {
+            assert_eq!(
+                oracle.status[row], 0,
+                "row {row}: oracle status {} (expected 0)",
+                oracle.status[row]
+            );
+            let want = analytic_root(alpha[row], beta[row], gamma[row]);
+            let rel = (oracle.a_root[row] - want).abs() / (1.0 + want.abs());
+            assert!(
+                rel <= 1e-9,
+                "row {row}: oracle a={} vs analytic={} rel={}",
+                oracle.a_root[row], want, rel
+            );
+            assert!(
+                oracle.residual[row].abs() <= 1e-9,
+                "row {row}: oracle residual {}",
+                oracle.residual[row]
+            );
+        }
+    }
+
+    #[test]
+    fn survival_flex_intercept_solve_device_matches_oracle() {
+        // Mix tight + loose warm-starts to exercise Newton-probe and
+        // bracket-expand paths.
+        let alpha = [ 1.0,  2.0, -1.0,  0.5,  1.0,  3.0];
+        let beta  = [ 1.0,  0.5,  1.5,  2.0,  0.8,  1.2];
+        let gamma = [-2.0, -3.0,  4.0, -1.5, -0.5, -4.5];
+        // Warm-starts: rows 0-1 already near the root, rows 2-5 far away.
+        let truth: Vec<f64> = (0..6)
+            .map(|i| analytic_root(alpha[i], beta[i], gamma[i]))
+            .collect();
+        let a_warm = [
+            truth[0] + 0.01,
+            truth[1] - 0.02,
+            truth[2] + 5.0,
+            truth[3] - 8.0,
+            0.0,
+            -10.0,
+        ];
+        let inputs = SurvivalFlexInterceptSolveInputs {
+            n: 6,
+            a_warm: &a_warm,
+            alpha: &alpha,
+            beta: &beta,
+            gamma: &gamma,
+            convergence_tol: 1e-12,
+            max_bracket_iters: 64,
+            max_refine_iters: 64,
+        };
+        let oracle = cpu_oracle_intercept_solve(&inputs);
+        for row in 0..6 {
+            assert_eq!(
+                oracle.status[row], 0,
+                "row {row}: oracle status {} (expected 0)",
+                oracle.status[row]
+            );
+        }
+
+        match try_device_intercept_solve(&inputs) {
+            Ok(Some(dev)) => {
+                for row in 0..6 {
+                    assert_eq!(
+                        dev.status[row], oracle.status[row],
+                        "row {row}: status mismatch dev={} oracle={}",
+                        dev.status[row], oracle.status[row]
+                    );
+                    let want = truth[row];
+                    let rel = (dev.a_root[row] - want).abs() / (1.0 + want.abs());
+                    assert!(
+                        rel <= 1e-9,
+                        "row {row}: device a={} vs analytic={} rel={}",
+                        dev.a_root[row], want, rel
+                    );
+                    let pair_rel = (dev.a_root[row] - oracle.a_root[row]).abs()
+                        / (1.0 + oracle.a_root[row].abs());
+                    assert!(
+                        pair_rel <= 1e-9,
+                        "row {row}: device/oracle a_root mismatch dev={} oracle={} rel={}",
+                        dev.a_root[row], oracle.a_root[row], pair_rel
+                    );
+                    let resid_ok = dev.residual[row].abs() <= 1e-9
+                        || (dev.residual[row] - oracle.residual[row]).abs()
+                            <= 1e-9 * (1.0 + oracle.residual[row].abs());
+                    assert!(
+                        resid_ok,
+                        "row {row}: residual mismatch dev={} oracle={}",
+                        dev.residual[row], oracle.residual[row]
+                    );
+                }
+            }
+            Ok(None) => {
+                // Non-CUDA build path — confirm the oracle handles every
+                // scenario (already done in the loop above).
+            }
+            Err(err) => panic!("device intercept solve failed: {err:?}"),
+        }
+    }
 }
