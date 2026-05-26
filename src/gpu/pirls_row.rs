@@ -744,6 +744,139 @@ impl PirlsRowBackend {
     }
 }
 
+/// Device-resident per-row output buffers for the GPU row-reweight kernel.
+///
+/// One buffer per [`RowOutput`] field, length `n`. The host launcher
+/// [`launch_row_reweight_on_stream`] writes into these on the supplied
+/// stream; downstream Stage-3 kernels (XᵀWX assembly, Xᵀg formation,
+/// line-search deviance reduction) read them in place without any host
+/// round-trip.
+#[cfg(target_os = "linux")]
+pub struct RowOutputDevBuffers {
+    pub mu: cudarc::driver::CudaSlice<f64>,
+    pub grad_eta: cudarc::driver::CudaSlice<f64>,
+    pub w_fisher: cudarc::driver::CudaSlice<f64>,
+    pub w_hessian: cudarc::driver::CudaSlice<f64>,
+    pub w_solver: cudarc::driver::CudaSlice<f64>,
+    pub z_fisher: cudarc::driver::CudaSlice<f64>,
+    pub z_hessian: cudarc::driver::CudaSlice<f64>,
+    pub deviance: cudarc::driver::CudaSlice<f64>,
+    pub status: cudarc::driver::CudaSlice<u32>,
+    pub n: usize,
+}
+
+#[cfg(target_os = "linux")]
+impl RowOutputDevBuffers {
+    /// Allocate all nine per-row output buffers (length `n`) on `stream`.
+    pub fn allocate(
+        stream: &Arc<cudarc::driver::CudaStream>,
+        n: usize,
+    ) -> Result<Self, GpuError> {
+        let alloc_f64 = |label: &'static str| {
+            stream
+                .alloc_zeros::<f64>(n)
+                .map_err(|err| GpuError::DriverCallFailed {
+                    reason: format!("pirls_row alloc {label}: {err}"),
+                })
+        };
+        let alloc_u32 = |label: &'static str| {
+            stream
+                .alloc_zeros::<u32>(n)
+                .map_err(|err| GpuError::DriverCallFailed {
+                    reason: format!("pirls_row alloc {label}: {err}"),
+                })
+        };
+        Ok(Self {
+            mu: alloc_f64("mu")?,
+            grad_eta: alloc_f64("grad_eta")?,
+            w_fisher: alloc_f64("w_fisher")?,
+            w_hessian: alloc_f64("w_hessian")?,
+            w_solver: alloc_f64("w_solver")?,
+            z_fisher: alloc_f64("z_fisher")?,
+            z_hessian: alloc_f64("z_hessian")?,
+            deviance: alloc_f64("deviance")?,
+            status: alloc_u32("status")?,
+            n,
+        })
+    }
+}
+
+/// Device-side row reweight launcher.
+///
+/// Resolves the cached per-family kernel from [`PirlsRowBackend::module_for`],
+/// dispatches a 1D grid of `THREADS_PER_BLOCK = 256` threads across `n`
+/// rows, and returns once the launch is enqueued on `stream`. The kernel
+/// writes the per-row IRLS state into `out` in place; no host transfers.
+///
+/// The kernel's `extern "C"` signature is fixed at the top of `cuda_source_for`
+/// (see `extern "C" __global__ void {kernel_name}(int n, …)` in this file).
+#[cfg(target_os = "linux")]
+pub fn launch_row_reweight_on_stream(
+    backend: &PirlsRowBackend,
+    family: PirlsRowFamily,
+    curvature: CurvatureMode,
+    stream: &Arc<cudarc::driver::CudaStream>,
+    n: usize,
+    eta_dev: &cudarc::driver::CudaSlice<f64>,
+    y_dev: &cudarc::driver::CudaSlice<f64>,
+    prior_w_dev: &cudarc::driver::CudaSlice<f64>,
+    out: &mut RowOutputDevBuffers,
+) -> Result<(), GpuError> {
+    use cudarc::driver::{LaunchConfig, PushKernelArg};
+    if out.n != n {
+        return Err(GpuError::DriverCallFailed {
+            reason: format!(
+                "row reweight buffers shape {} mismatches n={n}",
+                out.n
+            ),
+        });
+    }
+    let module = backend.module_for(family, curvature)?;
+    let func = module
+        .load_function(family.kernel_name())
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: format!(
+                "row reweight load_function({}): {err}",
+                family.kernel_name()
+            ),
+        })?;
+    const THREADS_PER_BLOCK: u32 = 256;
+    let n_u32 = u32::try_from(n).map_err(|_| GpuError::DriverCallFailed {
+        reason: format!("n={n} exceeds u32 for row reweight grid sizing"),
+    })?;
+    let grid_x = n_u32.div_ceil(THREADS_PER_BLOCK).max(1);
+    let n_i32 = i32::try_from(n).map_err(|_| GpuError::DriverCallFailed {
+        reason: format!("n={n} exceeds i32 for row reweight kernel argument"),
+    })?;
+    let cfg = LaunchConfig {
+        grid_dim: (grid_x, 1, 1),
+        block_dim: (THREADS_PER_BLOCK, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut builder = stream.launch_builder(&func);
+    builder.arg(&n_i32);
+    builder.arg(eta_dev);
+    builder.arg(y_dev);
+    builder.arg(prior_w_dev);
+    builder.arg(&mut out.mu);
+    builder.arg(&mut out.grad_eta);
+    builder.arg(&mut out.w_fisher);
+    builder.arg(&mut out.w_hessian);
+    builder.arg(&mut out.w_solver);
+    builder.arg(&mut out.z_fisher);
+    builder.arg(&mut out.z_hessian);
+    builder.arg(&mut out.deviance);
+    builder.arg(&mut out.status);
+    // SAFETY: kernel signature is fixed by cuda_source_for above (n:i32,
+    // 3 const f64*, 8 mut f64*, 1 mut u32*); arg order/types match
+    // one-for-one. Output buffers were allocated with `n` elements each
+    // (validated above); input buffers are caller-supplied with length n.
+    // Grid covers all n rows; threads guard `if (i >= n) return`.
+    unsafe { builder.launch(cfg) }.map_err(|err| GpuError::DriverCallFailed {
+        reason: format!("row reweight launch({}): {err}", family.kernel_name()),
+    })
+}
+
 // ────────────────────────────────────────────────────────────────────────
 // CUDA sources (one per family / curvature pair)
 // ────────────────────────────────────────────────────────────────────────
@@ -1292,6 +1425,143 @@ mod pirls_row_gpu_tests {
                     Arc::ptr_eq(&m1, &m2),
                     "{family:?}: module cache must return same handle on second call"
                 );
+            }
+        }
+    }
+
+    /// V100 parity for the device-side row launcher.
+    ///
+    /// For every built-in family the launcher's per-row outputs must match
+    /// the CPU `row_reweight_cpu` reference to round-off. Skipped on hosts
+    /// without a CUDA runtime (mac, CI). This is also the production
+    /// caller that justifies the launcher + `RowOutputDevBuffers` surface
+    /// per the dead-pub-scanner rule.
+    #[test]
+    fn launch_row_reweight_matches_cpu_reference_on_device() {
+        if super::super::runtime::GpuRuntime::global().is_none() {
+            eprintln!("[pirls_row_gpu test] no CUDA runtime — skipping launcher parity test");
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // Use a small but non-trivial row batch with several y-values per
+            // family. Pick a y that's valid for every family below (0/1 are
+            // valid for Bernoulli; positive for Poisson/Gamma; arbitrary for
+            // Gaussian). Build per-family input vectors.
+            let etas = [-3.0_f64, -0.5, 0.0, 0.5, 3.0, 10.0, -10.0, 1.5];
+            let n = etas.len();
+            let backend =
+                PirlsRowBackend::probe().expect("backend probe on CUDA host");
+            let runtime = super::super::runtime::GpuRuntime::global()
+                .expect("GPU runtime available when probe succeeded");
+            let ctx = super::super::runtime::cuda_context_for(
+                runtime.selected_device().ordinal,
+            )
+            .expect("ctx for selected device");
+            let stream = ctx.default_stream();
+
+            for &family in PirlsRowFamily::ALL.iter() {
+                let ys: Vec<f64> = match family {
+                    PirlsRowFamily::GammaLog | PirlsRowFamily::PoissonLog => {
+                        (0..n).map(|i| 1.0 + 0.5 * (i as f64)).collect()
+                    }
+                    PirlsRowFamily::GaussianIdentity => {
+                        (0..n).map(|i| -1.0 + 0.5 * (i as f64)).collect()
+                    }
+                    _ => (0..n).map(|i| if i % 2 == 0 { 0.0 } else { 1.0 }).collect(),
+                };
+                let priors: Vec<f64> = (0..n).map(|i| 1.0 + 0.25 * (i as f64)).collect();
+
+                // CPU reference.
+                let mut cpu_out = Vec::with_capacity(n);
+                for i in 0..n {
+                    cpu_out.push(row_reweight_cpu(
+                        family,
+                        CurvatureMode::Fisher,
+                        RowInput {
+                            eta: etas[i],
+                            y: ys[i],
+                            prior_weight: priors[i],
+                        },
+                    ));
+                }
+
+                // Upload inputs, allocate device outputs, launch, download.
+                let mut eta_dev =
+                    stream.alloc_zeros::<f64>(n).expect("alloc eta_dev");
+                let mut y_dev = stream.alloc_zeros::<f64>(n).expect("alloc y_dev");
+                let mut prior_dev =
+                    stream.alloc_zeros::<f64>(n).expect("alloc prior_dev");
+                stream
+                    .memcpy_htod(etas.as_slice(), &mut eta_dev)
+                    .expect("upload eta");
+                stream
+                    .memcpy_htod(ys.as_slice(), &mut y_dev)
+                    .expect("upload y");
+                stream
+                    .memcpy_htod(priors.as_slice(), &mut prior_dev)
+                    .expect("upload prior");
+                let mut out =
+                    RowOutputDevBuffers::allocate(&stream, n).expect("alloc row buffers");
+                launch_row_reweight_on_stream(
+                    backend,
+                    family,
+                    CurvatureMode::Fisher,
+                    &stream,
+                    n,
+                    &eta_dev,
+                    &y_dev,
+                    &prior_dev,
+                    &mut out,
+                )
+                .unwrap_or_else(|err| panic!("launch {family:?}: {err}"));
+                stream.synchronize().expect("stream sync");
+                let mu = stream.clone_dtoh(&out.mu).expect("dl mu");
+                let g = stream.clone_dtoh(&out.grad_eta).expect("dl grad_eta");
+                let wf = stream.clone_dtoh(&out.w_fisher).expect("dl w_fisher");
+                let wh = stream.clone_dtoh(&out.w_hessian).expect("dl w_hessian");
+                let ws_v = stream.clone_dtoh(&out.w_solver).expect("dl w_solver");
+                let zf = stream.clone_dtoh(&out.z_fisher).expect("dl z_fisher");
+                let zh = stream.clone_dtoh(&out.z_hessian).expect("dl z_hessian");
+                let dev = stream.clone_dtoh(&out.deviance).expect("dl deviance");
+
+                let tol = 1e-12;
+                for i in 0..n {
+                    let r = cpu_out[i];
+                    assert_close(&format!("{family:?}/row{i}/mu"), mu[i], r.mu, tol);
+                    assert_close(&format!("{family:?}/row{i}/grad_eta"), g[i], r.grad_eta, tol);
+                    assert_close(
+                        &format!("{family:?}/row{i}/w_fisher"),
+                        wf[i],
+                        r.w_fisher,
+                        tol,
+                    );
+                    assert_close(
+                        &format!("{family:?}/row{i}/w_hessian"),
+                        wh[i],
+                        r.w_hessian,
+                        tol,
+                    );
+                    assert_close(
+                        &format!("{family:?}/row{i}/w_solver"),
+                        ws_v[i],
+                        r.w_solver,
+                        tol,
+                    );
+                    assert_close(
+                        &format!("{family:?}/row{i}/z_fisher"),
+                        zf[i],
+                        r.z_fisher,
+                        tol,
+                    );
+                    assert_close(
+                        &format!("{family:?}/row{i}/z_hessian"),
+                        zh[i],
+                        r.z_hessian,
+                        tol,
+                    );
+                    assert_close(&format!("{family:?}/row{i}/deviance"), dev[i], r.deviance, tol);
+                }
             }
         }
     }
