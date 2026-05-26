@@ -145,6 +145,215 @@ extern "C" __global__ void bms_flex_probe() {
 }
 "#;
 
+/// Rigid (flex=false) BMS probit row primitive — algebraic substrate.
+///
+/// This NVRTC source is the f64 CUDA port of the standard-normal branch of
+/// [`crate::families::bernoulli_marginal_slope::RigidProbitKernel::new`] (the
+/// non-empirical-grid case) plus the marginal-coordinate transformations in
+/// `rigid_transformed_gradient` / `rigid_transformed_hessian`. Per row it
+/// produces a 2-vector gradient and a 2×2 Hessian over the primary
+/// `(q, g)` block, where `q` is the marginal-η coordinate and `g` is
+/// log-slope.
+///
+/// **No dispatcher consumer yet.** The bernoulli marginal-slope dispatcher
+/// only fires the `MarginalSlopeRows` policy when `effective_flex_active`
+/// is true (see `build_row_primary_hessian_cache` at
+/// `src/families/bernoulli_marginal_slope.rs:8309`), and the rigid path
+/// never hits that cache. This kernel is staged here purely as
+/// *algebraic substrate* for the milestone-4 flex kernel — the flex math
+/// reuses the same probit log-CDF / Mills-ratio / `k1..k4` primitives at
+/// each cell node, so getting them right and parity-validated in the
+/// rigid setting first de-risks the larger flex port. The const is
+/// compile-time only; nothing in the host code path NVRTC-compiles it
+/// until a future milestone wires it through `gpu_hessian_dense` for a
+/// rigid-only opt-in surface (or it gets inlined into the flex kernel as
+/// shared device helpers — see `__device__` helpers below).
+///
+/// ## Math (mirror of CPU)
+///
+/// Inputs per row `i`: `q_i, g_i, z_i, y_i, w_i, q1_i, q2_i` plus
+/// process-wide `probit_scale`. Outputs per row: 2-vec `grad` and 2×2
+/// `H` over `(q, g)` block.
+///
+///   `s   = 2 y − 1`
+///   `gp  = probit_scale · g`
+///   `c   = sqrt(1 + gp²)`
+///   `η   = q · c + gp · z`
+///   `m   = s · η`
+///   `λ   = φ(m) / Φ(m)` (numerically stable via erfcx on left tail)
+///   `k1  = w · (−λ)`
+///   `k2  = w · λ (m + λ)`
+///   `u1  = s · k1,  u2 = k2`
+///   `c1  = gp / c · probit_scale         (= probit_scale² · g / c)`
+///   `c2  = probit_scale² / c³`
+///   `eta_q = c,  eta_g = q · c1 + probit_scale · z`
+///
+/// Primary-block Hessian (before link transform):
+///   `H_p[0][0] = u2 · eta_q²`
+///   `H_p[0][1] = u2 · eta_q · eta_g + u1 · c1`
+///   `H_p[1][1] = u2 · eta_g² + u1 · q · c2`
+///
+/// Transformed Hessian (marginal coordinates via `q1, q2`):
+///   `H[0][0] = H_p[0][0] · q1² + (u1 · eta_q) · q2`
+///   `H[0][1] = H_p[0][1] · q1`
+///   `H[1][1] = H_p[1][1]`
+///
+/// Transformed gradient:
+///   `grad[0] = u1 · eta_q · q1`
+///   `grad[1] = u1 · eta_g`
+///
+/// ## erfcx implementation
+///
+/// CUDA's libm exposes `erfcf` but not `erfcx` directly; the left-tail
+/// formula needs `erfcx(u) = exp(u²) erfc(u)` for `u ≥ 0`. We use the
+/// identity `erfcx(u) = exp(u²) · erfc(u)` evaluated as `expf(u²) * erfc(u)`
+/// in f64 via `exp` and `erfc`, with a Chebyshev refinement guard for
+/// `u > 6.5` to avoid `exp(u²)` overflow — mirrors the `erfcx_nonnegative`
+/// CPU helper in `src/inference/probability.rs:130-ish` (whichever
+/// branched formula it uses, the device version must produce the same
+/// numerics within 1 ULP for parity).
+///
+/// ## Status
+///
+/// PRE-VALIDATION. NVRTC syntax has not been compile-tested on V100
+/// because task #45 (the pirls_row.rs ban-violation blocker) prevents
+/// any `cargo build --lib` from succeeding on the device host. Once that
+/// clears, the validation path is:
+///   1. NVRTC-compile this source via `cudarc::nvrtc::compile_ptx`.
+///   2. Load and launch `bms_rigid_row` on a small batch (n=8, varied
+///      y/z/q/g).
+///   3. Parity within 1e-8 against `rigid_row_kernel_eval` for the same
+///      inputs on CPU.
+#[cfg(target_os = "linux")]
+#[allow(dead_code)] // staged substrate; no dispatcher consumer yet (see module doc)
+const RIGID_ROW_KERNEL_SOURCE: &str = r#"
+// Stable Mills ratio λ(m) = φ(m)/Φ(m) plus log Φ(m) for the signed
+// margin m. Mirrors `signed_probit_logcdf_and_mills_ratio` in
+// src/inference/probability.rs — left tail uses the erfcx-based
+// representation to avoid catastrophic cancellation.
+__device__ __forceinline__ void
+bms_signed_probit_logcdf_and_mills(double x, double *log_cdf, double *lambda) {
+    const double SQRT_2     = 1.4142135623730951;
+    const double SQRT_2_OVER_PI = 0.7978845608028654;
+    if (isinf(x)) {
+        if (x > 0.0) { *log_cdf = 0.0;        *lambda = 0.0;          return; }
+        else         { *log_cdf = -INFINITY;  *lambda = INFINITY;     return; }
+    }
+    if (isnan(x)) { *log_cdf = nan(""); *lambda = nan(""); return; }
+    if (x < 0.0) {
+        // erfcx(u) = exp(u²) · erfc(u), u ≥ 0. CUDA libm provides erfc
+        // but not erfcx; compose carefully to avoid overflow for large u.
+        double u  = -x / SQRT_2;
+        double u2 = u * u;
+        // For modest u, exp(u²)*erfc(u) is safe in f64.  For u beyond ~26
+        // erfc(u) underflows to 0; the asymptotic expansion
+        //   erfcx(u) ~ 1/(u√π) · (1 − 1/(2u²) + 3/(4u⁴) − …)
+        // keeps full f64 precision.
+        double ex;
+        if (u < 26.0) {
+            ex = exp(u2) * erfc(u);
+        } else {
+            double inv_u2 = 1.0 / (u * u);
+            double series = 1.0
+                - 0.5  * inv_u2
+                + 0.75 * inv_u2 * inv_u2
+                - 1.875 * inv_u2 * inv_u2 * inv_u2;
+            ex = series / (u * 1.7724538509055159);  // u·√π
+        }
+        if (ex < 1e-300) ex = 1e-300;
+        *log_cdf = -u2 + log(0.5 * ex);
+        *lambda  = SQRT_2_OVER_PI / ex;
+    } else {
+        // 0.5 · erfc(−x/√2) is Φ(x); use it directly.
+        double cdf = 0.5 * erfc(-x / SQRT_2);
+        if (cdf < 1e-300) cdf = 1e-300;
+        if (cdf > 1.0)    cdf = 1.0;
+        const double INV_SQRT_2PI = 0.3989422804014327;
+        double pdf = INV_SQRT_2PI * exp(-0.5 * x * x);
+        *log_cdf = log(cdf);
+        *lambda  = pdf / cdf;
+    }
+}
+
+// One thread per row. Computes the 2×2 transformed Hessian and 2-vec
+// transformed gradient over the primary (q, g) block, ready for the
+// per-row Bᵢᵀ · row · Bᵢ assembly that the host orchestration handles.
+//
+// Layout:
+//   q, g, z, y, w, q1, q2 — length n, row-major.
+//   out_grad — length 2n, row-major: [g_q_0, g_g_0, g_q_1, g_g_1, …].
+//   out_hess — length 4n, row-major: [h00_0, h01_0, h10_0, h11_0, …]
+//              (symmetric: h10 == h01).
+//   out_neglog — length n, the per-row −w · log Φ(s·η).
+extern "C" __global__ void
+bms_rigid_row(int n,
+              double probit_scale,
+              const double * __restrict__ q,
+              const double * __restrict__ g,
+              const double * __restrict__ z,
+              const double * __restrict__ y,
+              const double * __restrict__ w,
+              const double * __restrict__ q1,
+              const double * __restrict__ q2,
+              double * __restrict__ out_neglog,
+              double * __restrict__ out_grad,
+              double * __restrict__ out_hess) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
+    double qi = q[i], gi = g[i], zi = z[i], yi = y[i], wi = w[i];
+    double q1i = q1[i], q2i = q2[i];
+
+    double s  = 2.0 * yi - 1.0;
+    double gp = probit_scale * gi;
+    double c  = sqrt(1.0 + gp * gp);
+    double eta = qi * c + gp * zi;
+    double m   = s * eta;
+
+    double log_cdf, lambda;
+    bms_signed_probit_logcdf_and_mills(m, &log_cdf, &lambda);
+
+    // Per-row k1, k2 of −log Φ(s·η) w.r.t. m (with weight folded in).
+    double k1 = -lambda;
+    double k2 = lambda * (m + lambda);
+
+    double u1 = s * (wi * k1);
+    double u2 = wi * k2;
+
+    // c1 = probit_scale · gp / c  =  probit_scale² · g / c
+    // c2 = probit_scale² / c³
+    double c1 = probit_scale * gp / c;
+    double c_inv2 = 1.0 / (c * c);
+    double c2 = probit_scale * probit_scale * c_inv2 / c;
+
+    double eta_q = c;
+    double eta_g = qi * c1 + probit_scale * zi;
+
+    // Primary-block 2×2 Hessian.
+    double Hp00 = u2 * eta_q * eta_q;
+    double Hp01 = u2 * eta_q * eta_g + u1 * c1;
+    double Hp11 = u2 * eta_g * eta_g + u1 * qi * c2;
+
+    // Transformed (marginal-coord) gradient.
+    double grad_q = u1 * eta_q;
+    double g_q_marg = grad_q * q1i;
+    double g_g_marg = u1 * eta_g;
+
+    // Transformed Hessian.
+    double H00 = Hp00 * q1i * q1i + grad_q * q2i;
+    double H01 = Hp01 * q1i;
+    double H11 = Hp11;
+
+    out_neglog[i] = -wi * log_cdf;
+    out_grad[2*i + 0] = g_q_marg;
+    out_grad[2*i + 1] = g_g_marg;
+    out_hess[4*i + 0] = H00;
+    out_hess[4*i + 1] = H01;
+    out_hess[4*i + 2] = H01;
+    out_hess[4*i + 3] = H11;
+}
+"#;
+
 /// Process-wide BMS-flex GPU backend. Lazy-initialised on first call to
 /// [`BmsFlexGpuBackend::probe`] / one of the entry points.
 #[must_use]

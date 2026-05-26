@@ -255,7 +255,7 @@ class BasisDescriptor:
 
     #: Backends this descriptor supports. Concrete subclasses override.
     #: Membership is enforced at :meth:`evaluate` dispatch time.
-    SUPPORTED_BACKENDS: frozenset[str] = frozenset({"torch", "numpy", "jax"})
+    SUPPORTED_BACKENDS: ClassVar[frozenset[str]] = frozenset({"torch", "numpy", "jax"})
 
     # ------------------------------------------------------------------ shape
 
