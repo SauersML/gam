@@ -17,6 +17,7 @@ pub mod memory;
 pub mod pirls_row;
 pub mod policy;
 pub mod profile;
+pub mod reml_trace;
 pub mod runtime;
 pub mod solver;
 
