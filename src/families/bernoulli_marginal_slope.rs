@@ -19966,7 +19966,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn cross_block_identifiability_anchor_wider_than_candidate_no_false_alias() {
         // Old buggy algorithm conflated `null(AᵀC) == {0}` with
