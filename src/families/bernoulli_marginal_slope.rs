@@ -8214,34 +8214,6 @@ impl BernoulliMarginalSlopeFamily {
         if !matches!(self.latent_measure, LatentMeasureKind::StandardNormal) {
             return Ok(None);
         }
-        // Block-12 Stage-1 GPU substrate hook. The substrate currently
-        // returns NotYetImplemented for non-empty inputs and Ok(None) for
-        // empty input, so this empty-input probe is the no-op consumer that
-        // keeps the substrate's pub(crate) entry point live until the real
-        // per-row dispatch lands in a follow-up commit. Errors are routed
-        // back to the existing CPU path via the early Ok(None) below.
-        {
-            use crate::gpu::cubic_cell::{
-                CubicCellDerivativeMomentHostView, CubicCellMomentMode,
-                CubicCellMomentResidency, try_build_cubic_cell_derivative_moments,
-            };
-            let probe = CubicCellDerivativeMomentHostView {
-                cells: &[],
-                branches: &[],
-                max_degree,
-                mode: CubicCellMomentMode::DerivativeOnly,
-                residency: CubicCellMomentResidency::Host,
-            };
-            if try_build_cubic_cell_derivative_moments(probe)
-                .ok()
-                .flatten()
-                .is_some()
-            {
-                // Substrate cannot produce a populated bundle from an empty
-                // probe — guard branch reserved for the wired Stage-1 path.
-                return Ok(None);
-            }
-        }
         let n = self.y.len();
         let beta_h = self.score_beta(block_states)?;
         let beta_w = self.link_beta(block_states)?;
@@ -8342,6 +8314,113 @@ impl BernoulliMarginalSlopeFamily {
                 Ok((row, moments))
             })
             .collect::<Result<Vec<_>, String>>()?;
+        // Block-12 Stage-1 GPU-substrate parity guard. The substrate
+        // `try_build_cubic_cell_derivative_moments` is the future per-row
+        // moment producer (host path today, NVRTC kernel on V100 later);
+        // landing the call here makes it a real production consumer of the
+        // substrate's pub(crate) entry point and surfaces any divergence
+        // from the existing LRU evaluator the moment it appears. We sample
+        // a small prefix of rows so the debug-build cost stays bounded for
+        // biobank-scale fits; the production build pays nothing because the
+        // block is `cfg(debug_assertions)`-gated.
+        #[cfg(debug_assertions)]
+        {
+            use crate::gpu::cubic_cell::{
+                CubicCellDerivativeMomentHostView, CubicCellMomentMode,
+                CubicCellMomentResidency, GpuCellBranchTag, GpuDenestedCubicCell,
+                try_build_cubic_cell_derivative_moments,
+            };
+            const PARITY_ROW_BUDGET: usize = 4;
+            let mut sample_cells: Vec<GpuDenestedCubicCell> = Vec::new();
+            let mut sample_branches: Vec<GpuCellBranchTag> = Vec::new();
+            let mut sample_cpu_moments: Vec<Vec<f64>> = Vec::new();
+            for (_, moments) in computed_rows.iter().take(PARITY_ROW_BUDGET) {
+                for cached in moments {
+                    let cell = cached.partition_cell.cell;
+                    let branch = if !cell.left.is_finite() || !cell.right.is_finite() {
+                        GpuCellBranchTag::AffineTail
+                    } else if cell.c2 == 0.0 && cell.c3 == 0.0 {
+                        GpuCellBranchTag::Affine
+                    } else {
+                        GpuCellBranchTag::NonAffineFinite
+                    };
+                    sample_cells.push(GpuDenestedCubicCell {
+                        left: cell.left,
+                        right: cell.right,
+                        c0: cell.c0,
+                        c1: cell.c1,
+                        c2: cell.c2,
+                        c3: cell.c3,
+                    });
+                    sample_branches.push(branch);
+                    sample_cpu_moments.push(cached.state.moments.to_vec());
+                }
+            }
+            if !sample_cells.is_empty() {
+                let view = CubicCellDerivativeMomentHostView {
+                    cells: &sample_cells,
+                    branches: &sample_branches,
+                    max_degree,
+                    mode: CubicCellMomentMode::DerivativeOnly,
+                    residency: CubicCellMomentResidency::Host,
+                };
+                match try_build_cubic_cell_derivative_moments(view) {
+                    Ok(Some(output)) => {
+                        use crate::gpu::cubic_cell::{
+                            CubicCellDerivativeMomentOutput, CubicCellMomentStatus,
+                        };
+                        let CubicCellDerivativeMomentOutput::Host {
+                            moments: sub_moments,
+                            status: sub_status,
+                            stride,
+                        } = output
+                        else {
+                            panic!(
+                                "BMS row-cell-moments parity: substrate returned non-Host output for Host residency request"
+                            );
+                        };
+                        assert_eq!(stride, max_degree + 1);
+                        assert_eq!(sub_status.len(), sample_cells.len());
+                        for (i, cpu_row) in sample_cpu_moments.iter().enumerate() {
+                            assert_eq!(
+                                sub_status[i],
+                                CubicCellMomentStatus::Ok as u8,
+                                "BMS row-cell-moments parity: substrate refused cell {i} (status={})",
+                                sub_status[i]
+                            );
+                            let sub_row = &sub_moments[i * stride..(i + 1) * stride];
+                            let copy_len = cpu_row.len().min(stride);
+                            for k in 0..copy_len {
+                                let want = cpu_row[k];
+                                let got = sub_row[k];
+                                let denom = want.abs().max(1.0);
+                                let rel = (got - want).abs() / denom;
+                                let abs = (got - want).abs();
+                                assert!(
+                                    abs <= 1e-12 || rel <= 1e-11,
+                                    "BMS row-cell-moments parity drift cell={i} k={k} \
+                                     cpu={want:.17e} substrate={got:.17e} abs={abs:.3e} rel={rel:.3e}"
+                                );
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        // Empty input cannot happen here (we guard with
+                        // sample_cells.is_empty above) — surface the
+                        // contract break loudly in debug builds.
+                        panic!(
+                            "BMS row-cell-moments parity: substrate returned Ok(None) for a non-empty sample of {} cells",
+                            sample_cells.len()
+                        );
+                    }
+                    Err(err) => panic!(
+                        "BMS row-cell-moments parity: substrate failed on {} sample cells: {}",
+                        sample_cells.len(),
+                        err
+                    ),
+                }
+            }
+        }
         let mut rows = vec![None; n];
         for (row, moments) in computed_rows {
             rows[row] = Some(moments);
