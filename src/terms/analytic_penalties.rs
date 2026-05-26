@@ -6330,6 +6330,39 @@ impl AnalyticPenalty for BlockOrthogonalityPenalty {
         Self::flatten_matrix(&hv)
     }
 
+    fn hessian_diag(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> Option<Array1<f64>> {
+        let t = self.target_matrix(target)?;
+        let n_obs = t.nrows();
+        let d = t.ncols();
+        let weight = self.resolved_weight(rho);
+        let mut group_of = vec![usize::MAX; d];
+        for (gi, group) in self.groups.iter().enumerate() {
+            for &axis in group {
+                group_of[axis] = gi;
+            }
+        }
+        let mut out = Array1::<f64>::zeros(n_obs * d);
+        for n in 0..n_obs {
+            let mut row_sq = 0.0_f64;
+            let mut group_sq = vec![0.0_f64; self.groups.len()];
+            for b in 0..d {
+                let v = t[[n, b]];
+                let v2 = v * v;
+                row_sq += v2;
+                group_sq[group_of[b]] += v2;
+            }
+            for a in 0..d {
+                let g = group_of[a];
+                out[n * d + a] = weight * (row_sq - group_sq[g]);
+            }
+        }
+        Some(out)
+    }
+
     fn grad_rho(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> Array1<f64> {
         if !self.learnable_weight {
             return Array1::<f64>::zeros(0);
