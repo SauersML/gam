@@ -169,6 +169,9 @@ pub fn poincare_distance(
     let denom_a = (1.0 + curvature * a_sq).max(ORIGIN_EPS);
     let denom_b = (1.0 + curvature * b_sq).max(ORIGIN_EPS);
     let arg = 1.0 + 2.0 * (-curvature) * diff_sq / (denom_a * denom_b);
+    // Clamp at exactly 1.0 — `acosh(1.0) == 0.0` in IEEE 754, so identical
+    // points yield exact-zero distance. A `1.0 + ε` clamp would inject
+    // `acosh(1+ε) ≈ √(2ε)` of noise (~4.5e-8 for ε=1e-15).
     let arg = arg.max(1.0);
     Ok(arg.acosh() / sqrt_negc)
 }
@@ -509,7 +512,9 @@ pub fn lorentz_log_origin(x: ArrayView1<'_, f64>, curvature: f64) -> GeometryRes
     }
     let d = x.len() - 1;
     let x0 = x[0];
-    let arg = (sqrt_negc * x0).max(1.0 + ORIGIN_EPS);
+    // Same exact-1.0 clamp as `poincare_distance`: at the hyperboloid
+    // origin, `sqrt_negc * x0 == 1.0` and the log must be the zero tangent.
+    let arg = (sqrt_negc * x0).max(1.0);
     let dist = arg.acosh() / sqrt_negc;
     let mut xs_norm_sq = 0.0;
     for i in 0..d {

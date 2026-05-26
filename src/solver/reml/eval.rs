@@ -104,6 +104,49 @@ impl SmoothingCorrectionOutcome {
 /// step refused to produce a usable second-order correction.
 pub static SMOOTHING_CORRECTION_NUMERICAL_FAILURE_COUNT: AtomicU64 = AtomicU64::new(0);
 
+/// Accumulate the sigma-point cubature total covariance `V̂_p` from per-point
+/// `(A_m, b_m)` pairs.
+///
+/// Math: with equal weights `w_m = 1/M`,
+///   `mean_hinv = Σ w_m A_m`
+///   `mean_beta = Σ w_m b_m`
+///   `second_beta = Σ w_m b_m b_mᵀ`
+///   `var_beta = second_beta − mean_beta · mean_betaᵀ`
+///   `V̂_p = mean_hinv + var_beta`
+///
+/// This is the law of total covariance applied to the per-sigma Laplace
+/// approximation: `V_p = φ[E_ρ H(ρ)⁻¹ + Cov_ρ β̂(ρ)]`. Returned matrix is
+/// not yet symmetry-enforced; the caller does that.
+///
+/// Pulled out as a free function so the sigma-cubature math has a single,
+/// directly-testable implementation, independent of the (CPU Rayon / future
+/// GPU stream-pool) execution model that produced `points`.
+pub(crate) fn accumulate_sigma_cubature_total_covariance(
+    points: &[(Array2<f64>, Array1<f64>)],
+    p: usize,
+) -> Array2<f64> {
+    let w = 1.0 / (points.len() as f64);
+    let mut mean_hinv = Array2::<f64>::zeros((p, p));
+    let mut mean_beta = Array1::<f64>::zeros(p);
+    let mut second_beta = Array2::<f64>::zeros((p, p));
+    for (cov_point, beta_point) in points {
+        // scaled_add avoids allocating intermediate scaled arrays per sigma
+        // point; numerically equivalent to `mean += &arr.mapv(|v| w * v)`.
+        mean_hinv.scaled_add(w, cov_point);
+        mean_beta.scaled_add(w, beta_point);
+        let beta_col = beta_point.view().insert_axis(ndarray::Axis(1));
+        let beta_row = beta_point.view().insert_axis(ndarray::Axis(0));
+        let outer = beta_col.dot(&beta_row);
+        second_beta.scaled_add(w, &outer);
+    }
+    let mean_outer = mean_beta
+        .view()
+        .insert_axis(ndarray::Axis(1))
+        .dot(&mean_beta.view().insert_axis(ndarray::Axis(0)));
+    let var_beta = second_beta - mean_outer;
+    mean_hinv + var_beta
+}
+
 /// Process-wide count of cubature upgrades that succeeded inside
 /// [`RemlState::compute_smoothing_correction_auto`]. Paired with
 /// [`SMOOTHING_CORRECTION_NUMERICAL_FAILURE_COUNT`] for visibility.
@@ -554,36 +597,16 @@ impl<'a> RemlState<'a> {
             ));
         }
 
-        let w = 1.0 / (sigma_points.len() as f64);
-        let mut mean_hinv = Array2::<f64>::zeros((p, p));
-        let mut mean_beta = Array1::<f64>::zeros(p);
-        let mut second_beta = Array2::<f64>::zeros((p, p));
-        for (cov_point, beta_point) in point_results.into_iter().flatten() {
-            // Use scaled_add to avoid allocating intermediate scaled arrays
-            // on every sigma-point iteration; numerically equivalent to
-            // `mean += &arr.mapv(|v| w * v)`.
-            mean_hinv.scaled_add(w, &cov_point);
-            mean_beta.scaled_add(w, &beta_point);
-            let beta_col = beta_point.view().insert_axis(ndarray::Axis(1));
-            let beta_row = beta_point.view().insert_axis(ndarray::Axis(0));
-            let outer = beta_col.dot(&beta_row);
-            second_beta.scaled_add(w, &outer);
-        }
-
-        let mean_outer = mean_beta
-            .view()
-            .insert_axis(ndarray::Axis(1))
-            .dot(&mean_beta.view().insert_axis(ndarray::Axis(0)));
-        let var_beta = second_beta - mean_outer;
-
-        let mut total_cov = mean_hinv + var_beta;
-        enforce_symmetry(&mut total_cov);
+        let point_pairs: Vec<(Array2<f64>, Array1<f64>)> =
+            point_results.into_iter().flatten().collect();
+        let mut total_cov = accumulate_sigma_cubature_total_covariance(&point_pairs, p);
         if !total_cov.iter().all(|v| v.is_finite()) {
             return self.finalize_smoothing_outcome(first_order_numerical(
                 first_order_correction,
                 "assembled total covariance contains non-finite entries",
             ));
         }
+        enforce_symmetry(&mut total_cov);
 
         let mut corr = total_cov - base_cov;
         enforce_symmetry(&mut corr);
