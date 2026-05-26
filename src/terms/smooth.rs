@@ -18155,7 +18155,7 @@ where
             }
         };
 
-        let mut obj = problem.build_objective_with_eval_order(
+        let obj = problem.build_objective_with_eval_order(
             &mut state,
             |ctx: &mut &mut NBlockExactJointState<'_>, theta: &Array1<f64>| {
                 if let Some(cost) = ctx.cache.memoized_cost(theta) {
