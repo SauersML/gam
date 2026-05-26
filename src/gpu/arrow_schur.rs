@@ -160,6 +160,34 @@ fn pack_block(
     }
 }
 
+/// Test-only entry that forces the Layer D + E fused NVRTC path regardless
+/// of the admission heuristic. Used by the V100 Layer C↔D parity test to
+/// drive the fused kernel at small shapes the heuristic would otherwise
+/// route through the cuSOLVER/cuBLAS Layer A+B+C path.
+#[doc(hidden)]
+pub fn solve_arrow_newton_step_fused_force(
+    sys: &ArrowSchurSystem,
+    ridge_t: f64,
+    ridge_beta: f64,
+) -> Result<ArrowSchurGpuSolution, ArrowSchurGpuFailure> {
+    if ridge_t.is_nan() || ridge_beta.is_nan() {
+        return Err(ArrowSchurGpuFailure::SchurFactorFailed {
+            reason: "ridge is NaN".to_string(),
+        });
+    }
+    if crate::gpu::arrow_schur_nvrtc::plan_fused_launch(sys.rows.len(), sys.d, sys.k).is_none() {
+        return Err(ArrowSchurGpuFailure::Unavailable);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err(ArrowSchurGpuFailure::Unavailable)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        cuda::solve_fused(sys, ridge_t, ridge_beta)
+    }
+}
+
 /// Reference dense back-end used by tests and as the fallback when the
 /// GPU declines. Kept here (not in `arrow_schur_gpu.rs`) so the validation
 /// suite has one canonical baseline.
