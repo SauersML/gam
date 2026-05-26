@@ -8757,9 +8757,32 @@ impl BernoulliMarginalSlopeFamily {
                         }
                     }
                 }
+                // Always push the cell into the device-substrate SoA so
+                // it's available for the Phase-4 GPU moment build below.
+                // Push order is `cell_idx` (= start + local_idx) so the
+                // resulting `[total_cells, MOMENT_STRIDE]` device buffer
+                // is indexed identically to the host `cell_moments` vec.
+                debug_assert_eq!(gpu_cells.len(), cell_idx);
+                gpu_cells.push(crate::gpu::cubic_cell::GpuDenestedCubicCell {
+                    left: cell.left,
+                    right: cell.right,
+                    c0: cell.c0,
+                    c1: cell.c1,
+                    c2: cell.c2,
+                    c3: cell.c3,
+                });
+                let branch = if !cell.left.is_finite() || !cell.right.is_finite() {
+                    crate::gpu::cubic_cell::GpuCellBranchTag::AffineTail
+                } else if cell.c2 == 0.0 && cell.c3 == 0.0 {
+                    crate::gpu::cubic_cell::GpuCellBranchTag::Affine
+                } else {
+                    crate::gpu::cubic_cell::GpuCellBranchTag::NonAffineFinite
+                };
+                gpu_branches.push(branch);
+
                 // cell_moments: copy state.moments, zero-pad to 10 — only
                 // when the host fallback path is in use. When the
-                // device-moment build is selected, this work + storage is
+                // device-moment build is selected, this storage is
                 // skipped entirely and the substrate produces moments
                 // directly on the GPU below.
                 if !build_device_moments {
@@ -8769,28 +8792,6 @@ impl BernoulliMarginalSlopeFamily {
                     for k in 0..copy_len {
                         cell_moments[mom_base + k] = src_moments[k];
                     }
-                } else {
-                    // Push the cell into the device-substrate SoA in the
-                    // exact `cell_idx` order so the resulting `[total_cells,
-                    // MOMENT_STRIDE]` device buffer is indexed by `cell_idx`
-                    // identically to `cell_moments` in the host path.
-                    debug_assert_eq!(gpu_cells.len(), cell_idx);
-                    gpu_cells.push(crate::gpu::cubic_cell::GpuDenestedCubicCell {
-                        left: cell.left,
-                        right: cell.right,
-                        c0: cell.c0,
-                        c1: cell.c1,
-                        c2: cell.c2,
-                        c3: cell.c3,
-                    });
-                    let branch = if !cell.left.is_finite() || !cell.right.is_finite() {
-                        crate::gpu::cubic_cell::GpuCellBranchTag::AffineTail
-                    } else if cell.c2 == 0.0 && cell.c3 == 0.0 {
-                        crate::gpu::cubic_cell::GpuCellBranchTag::Affine
-                    } else {
-                        crate::gpu::cubic_cell::GpuCellBranchTag::NonAffineFinite
-                    };
-                    gpu_branches.push(branch);
                 }
             }
 
