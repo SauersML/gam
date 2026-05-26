@@ -8375,6 +8375,15 @@ impl BernoulliMarginalSlopeFamily {
                             stride,
                         } = output
                         else {
+                            // SAFETY: parity guard runs under
+                            // `cfg(debug_assertions)` and the substrate's
+                            // `CubicCellMomentResidency::Host` contract
+                            // requires a `Host { … }` output for a Host
+                            // request. A non-Host return here is a
+                            // contract violation, not a recoverable
+                            // condition — surface it loudly in debug
+                            // builds so the divergence is caught at the
+                            // first fit, not silently masked.
                             panic!(
                                 "BMS row-cell-moments parity: substrate returned non-Host output for Host residency request"
                             );
@@ -8405,14 +8414,24 @@ impl BernoulliMarginalSlopeFamily {
                         }
                     }
                     Ok(None) => {
-                        // Empty input cannot happen here (we guard with
-                        // sample_cells.is_empty above) — surface the
-                        // contract break loudly in debug builds.
+                        // SAFETY: substrate's `Ok(None)` contract is
+                        // reserved for empty input; the surrounding
+                        // `if !sample_cells.is_empty()` guards against
+                        // that. A `None` return for a populated sample
+                        // is a contract violation that must be visible
+                        // at the first fit in debug builds, not silently
+                        // tolerated.
                         panic!(
                             "BMS row-cell-moments parity: substrate returned Ok(None) for a non-empty sample of {} cells",
                             sample_cells.len()
                         );
                     }
+                    // SAFETY: substrate errors during the parity sample
+                    // mean the host evaluator (which we are checking
+                    // against the LRU path) disagreed on cells the LRU
+                    // already accepted. Continuing past such a divergence
+                    // hides correctness bugs the parity guard is here to
+                    // catch; abort the debug-build fit.
                     Err(err) => panic!(
                         "BMS row-cell-moments parity: substrate failed on {} sample cells: {}",
                         sample_cells.len(),
