@@ -319,8 +319,20 @@ pub fn audit_identifiability(specs: &[ParameterBlockSpec]) -> Result<Identifiabi
     // uses the same `RRQR_RANK_ALPHA · ε · max(m,n) · leading`
     // tolerance as the per-block diagonal counter above, so the joint
     // verdict and the per-block diagnostics are tolerance-consistent.
+    let rrqr_started = std::time::Instant::now();
+    log::info!(
+        "[STAGE] identifiability audit: joint RRQR start n={} p_total={}",
+        n,
+        p_total,
+    );
     let rrqr = rrqr_with_permutation(&x_joint, default_rrqr_rank_alpha())
         .map_err(|e| format!("identifiability audit joint RRQR failed: {e:?}"))?;
+    log::info!(
+        "[STAGE] identifiability audit: joint RRQR end rank={}/{} elapsed={:.3}s",
+        rrqr.rank,
+        p_total,
+        rrqr_started.elapsed().as_secs_f64(),
+    );
     let joint_rank = rrqr.rank;
     let joint_rank_tol = rrqr.rank_tol;
     let demoted_joint_cols: Vec<usize> = rrqr.column_permutation[rrqr.rank..].to_vec();
@@ -329,11 +341,20 @@ pub fn audit_identifiability(specs: &[ParameterBlockSpec]) -> Result<Identifiabi
     // columns. O(p_total² · n) — fine at GAM smooth widths. We only
     // record pairs whose blocks are distinct (within-block aliasing
     // is the within-smooth nullspace problem, owned by nullspace-lead).
+    let pairwise_started = std::time::Instant::now();
+    log::info!(
+        "[STAGE] identifiability audit: pairwise overlap scan start n={} p_total={} blocks={}",
+        n,
+        p_total,
+        specs.len(),
+    );
     let mut col_norms = Array1::<f64>::zeros(p_total);
     for j in 0..p_total {
         let nrm = x_joint.column(j).iter().map(|v| v * v).sum::<f64>().sqrt();
         col_norms[j] = nrm;
     }
+    let pairwise_block_heartbeat = (n.saturating_mul(p_total) >= 1_000_000)
+        .then(crate::util::heartbeat::Heartbeat::default_interval);
     let mut aliased_pairs: Vec<AliasedPair> = Vec::new();
     for a_block_idx in 0..specs.len() {
         let a_start = col_offsets[a_block_idx];

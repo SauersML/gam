@@ -10478,8 +10478,14 @@ fn sae_manifold_predict_oos<'py>(
                     .as_array()
                     .to_owned();
                 let probe_pts = Array2::<f64>::zeros((1, d.max(1)));
-                let (phi, _jet, _penalty) = sae_build_duchon_atom(probe_pts.view(), centers.view())
-                    .map_err(py_value_error)?;
+                let (phi, _jet, _penalty) = match kind {
+                    SaeAtomBasisKind::EuclideanPatch => {
+                        sae_build_euclidean_atom(probe_pts.view(), centers.view())
+                            .map_err(py_value_error)?
+                    }
+                    _ => sae_build_duchon_atom(probe_pts.view(), centers.view())
+                        .map_err(py_value_error)?,
+                };
                 let basis_size = phi.ncols();
                 plans.push(SaeAtomBuildPlan {
                     kind,
