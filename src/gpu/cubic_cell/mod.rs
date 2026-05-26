@@ -171,7 +171,7 @@ pub(crate) fn try_build_cubic_cell_derivative_moments(
     input: CubicCellDerivativeMomentHostView<'_>,
 ) -> Result<Option<CubicCellDerivativeMomentOutput>, GpuError> {
     if input.cells.len() != input.branches.len() {
-        return Err(GpuError::NotYetImplemented {
+        return Err(GpuError::DriverCallFailed {
             reason: format!(
                 "gpu cubic-cell substrate: cells.len()={} != branches.len()={}",
                 input.cells.len(),
@@ -180,7 +180,7 @@ pub(crate) fn try_build_cubic_cell_derivative_moments(
         });
     }
     if input.max_degree > MAX_SUPPORTED_DEGREE {
-        return Err(GpuError::NotYetImplemented {
+        return Err(GpuError::DriverCallFailed {
             reason: format!(
                 "gpu cubic-cell substrate: max_degree={} exceeds MAX_SUPPORTED_DEGREE={}",
                 input.max_degree, MAX_SUPPORTED_DEGREE
@@ -197,7 +197,7 @@ pub(crate) fn try_build_cubic_cell_derivative_moments(
                 return Ok(Some(into_host_output(batch)));
             }
             let batch = build_host_moments(&input)
-                .map_err(|reason| GpuError::NotYetImplemented { reason })?;
+                .map_err(|reason| GpuError::DriverCallFailed { reason })?;
             Ok(Some(into_host_output(batch)))
         }
         CubicCellMomentResidency::Device => {
@@ -211,7 +211,7 @@ pub(crate) fn try_build_cubic_cell_derivative_moments(
             // the caller has a parity-shaped result instead of a phantom
             // device claim.
             let batch = build_host_moments(&input)
-                .map_err(|reason| GpuError::NotYetImplemented { reason })?;
+                .map_err(|reason| GpuError::DriverCallFailed { reason })?;
             Ok(Some(into_host_output(batch)))
         }
     }
