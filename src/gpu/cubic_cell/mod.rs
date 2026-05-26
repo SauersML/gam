@@ -443,7 +443,7 @@ mod tests {
             let backend =
                 crate::gpu::cubic_cell::device::CubicCellGpuBackend::probe()
                     .expect("backend probe");
-            let host_moments = crate::gpu::cubic_cell::device::test_support::download_moments(
+            let host_moments = crate::gpu::cubic_cell::device::tests::download_moments(
                 &backend,
                 &d_moments,
             )
