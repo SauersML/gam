@@ -8235,6 +8235,34 @@ impl BernoulliMarginalSlopeFamily {
         if !matches!(self.latent_measure, LatentMeasureKind::StandardNormal) {
             return Ok(None);
         }
+        // Block-12 Stage-1 GPU substrate hook. The substrate currently
+        // returns NotYetImplemented for non-empty inputs and Ok(None) for
+        // empty input, so this empty-input probe is the no-op consumer that
+        // keeps the substrate's pub(crate) entry point live until the real
+        // per-row dispatch lands in a follow-up commit. Errors are routed
+        // back to the existing CPU path via the early Ok(None) below.
+        {
+            use crate::gpu::cubic_cell::{
+                CubicCellDerivativeMomentHostView, CubicCellMomentMode,
+                CubicCellMomentResidency, try_build_cubic_cell_derivative_moments,
+            };
+            let probe = CubicCellDerivativeMomentHostView {
+                cells: &[],
+                branches: &[],
+                max_degree,
+                mode: CubicCellMomentMode::DerivativeOnly,
+                residency: CubicCellMomentResidency::Host,
+            };
+            if try_build_cubic_cell_derivative_moments(probe, None)
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                // Substrate cannot produce a populated bundle from an empty
+                // probe — guard branch reserved for the wired Stage-1 path.
+                return Ok(None);
+            }
+        }
         let n = self.y.len();
         let beta_h = self.score_beta(block_states)?;
         let beta_w = self.link_beta(block_states)?;
