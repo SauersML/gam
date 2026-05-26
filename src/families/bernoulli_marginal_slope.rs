@@ -8047,7 +8047,7 @@ impl BernoulliMarginalSlopeFamily {
                             .fetch_add(1, Ordering::Relaxed);
                     }
                 }
-                self.cache_row_intercept(row, *a);
+                self.cache_row_intercept(row, *a, marginal_eta, slope, beta_h, beta_w);
                 return Ok((*a, *abs_deriv, false));
             }
         }
@@ -8096,7 +8096,7 @@ impl BernoulliMarginalSlopeFamily {
         }
 
         // Cache the converged intercept for the next PIRLS iter.
-        self.cache_row_intercept(row, a);
+        self.cache_row_intercept(row, a, marginal_eta, slope, beta_h, beta_w);
 
         Ok((a, abs_deriv, false))
     }
