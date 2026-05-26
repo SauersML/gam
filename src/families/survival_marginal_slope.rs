@@ -4114,6 +4114,19 @@ impl SurvivalMarginalSlopeFamily {
             &self.auto_subsample_last_rho,
             SURVIVAL_MGS_AUTO_SUBSAMPLE_PHASE1_BUDGET,
             "survival-mgs",
+            // Per-K work-unit cost for the survival marginal-slope outer
+            // gradient kernel. Calibrated from the biobank repro
+            // (n=195_780, K=19_661, predicted_gradient_work ≈ 4.33×10⁹):
+            //   per_K-unit cost ≈ 4.33e9 / 19_661 ≈ 220_000 units.
+            // With `AUTO_OUTER_WORK_BUDGET = 5×10⁸`, this caps
+            //   K_work ≈ 5e8 / 250_000 ≈ 2_000,
+            // bounding outer gradient work below ~5×10⁸ units even
+            // when the noise-only rule would request K ≈ 0.1n. Without
+            // this cap the rigid pilot and outer line search spend
+            // ~57 minutes per evaluation on biobank-scale joint designs
+            // before the identifiability gate even gets a chance to
+            // veto rank-deficient configurations.
+            250_000,
         )
     }
 
