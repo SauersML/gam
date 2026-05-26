@@ -1,4 +1,5 @@
 pub mod bernoulli_marginal_slope;
+pub mod bernoulli_marginal_slope_identifiability;
 pub mod cubic_cell_kernel;
 pub mod custom_family;
 pub mod family_meta;
@@ -21,6 +22,7 @@ pub mod survival;
 pub mod survival_construction;
 pub mod survival_location_scale;
 pub mod survival_marginal_slope;
+pub mod survival_marginal_slope_identifiability;
 pub mod survival_predict;
 pub mod transformation_normal;
 pub mod vector_response;
