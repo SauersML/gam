@@ -163,13 +163,13 @@ def _DuchonRustFn_apply(
 ) -> Any:
     """Autograd boundary for Duchon.
 
-    Forward calls the Rust ``duchon_basis`` PyFFI. Backward uses the analytic
-    Rust jet exposed by ``duchon_basis_with_jet`` when the descriptor is the
-    plain m-spline (no ``length_scale``, no ``periodic_per_axis``). For the
-    parameterized variants the closed-form jet isn't on the PyFFI surface
-    today; backward then composes the Rust radial derivative kernel
-    ``duchon_input_location_first_derivative`` with the closed-form
-    ``(t − c) / r`` axis ratio (still all-Rust math).
+    Forward calls the Rust ``duchon_basis`` PyFFI. Backward composes the
+    Rust radial first derivative ``φ'(r)`` with the closed-form axis
+    ratio ``(t − c)/r`` to produce the per-row jet ``(B, K, d)``. The
+    jet is itself routed through :func:`_RadialJetFn_apply` so that
+    ``torch.autograd.grad`` of the jacobian — i.e. the input-location
+    Hessian — is well-defined: that Function's own backward uses the
+    Rust ``φ''(r)`` to assemble the analytic Hessian.
     """
     torch = _torch()
     from . import _api
@@ -180,7 +180,38 @@ def _DuchonRustFn_apply(
     if length_scale is not None:
         kwargs["length_scale"] = float(length_scale)
 
-    use_jet = periodic_per_axis is None and length_scale is None
+    def _resolve_centers_np(pts_np: Any) -> Any:
+        import numpy as np
+
+        d = pts_np.shape[1]
+        if centers is None or isinstance(centers, int):
+            if d != 1:
+                raise ValueError(
+                    "Duchon backward: auto centers only supported for d=1"
+                )
+            return _api._resolve_centers(
+                centers, pts_np[:, 0], label="centers"
+            ).reshape(-1, 1)
+        ctrs_np = np.asarray(centers, dtype=float)
+        if ctrs_np.ndim == 1:
+            ctrs_np = ctrs_np.reshape(-1, 1)
+        return ctrs_np
+
+    def _radial_first(pts_np: Any, ctrs_np: Any) -> Any:
+        import numpy as np
+
+        out = _api.rust_module().duchon_input_location_first_derivative(
+            pts_np, ctrs_np, length_scale, int(m),
+        )
+        return np.asarray(out, dtype=float)
+
+    def _radial_second(pts_np: Any, ctrs_np: Any) -> Any:
+        import numpy as np
+
+        out = _api.rust_module().duchon_input_location_second_derivative(
+            pts_np, ctrs_np, length_scale, int(m),
+        )
+        return np.asarray(out, dtype=float)
 
     class _Fn(torch.autograd.Function):
         @staticmethod
@@ -193,49 +224,83 @@ def _DuchonRustFn_apply(
 
         @staticmethod
         def backward(ctx: Any, *grads: Any) -> Any:
-            import numpy as np
-
             (g,) = grads
             (pts,) = ctx.saved_tensors
-            pts_np = pts.detach().to(dtype=torch.float64).cpu().numpy()
-            # Centers may be int / None for d=1 auto-quantile; resolve via Rust.
-            d = pts_np.shape[1]
-            if centers is None or isinstance(centers, int):
-                if d != 1:
-                    raise ValueError(
-                        "Duchon backward: auto centers only supported for d=1"
-                    )
-                ctrs_np = _api._resolve_centers(centers, pts_np[:, 0], label="centers").reshape(-1, 1)
-            else:
-                ctrs_np = np.asarray(centers, dtype=float)
-                if ctrs_np.ndim == 1:
-                    ctrs_np = ctrs_np.reshape(-1, 1)
-
-            if use_jet:
-                # Analytic jet (B, M, d) from the Rust core in one call.
-                _phi, jet_np, _pen = _api.rust_module().duchon_basis_with_jet(
-                    pts_np, ctrs_np, int(m),
-                )
-                jet = torch.as_tensor(jet_np, dtype=pts.dtype, device=pts.device)
-                # grad_pts[b, j] = sum_m g[b, m] * jet[b, m, j]
-                grad_pts = torch.einsum("bm,bmj->bj", g, jet)
-                return grad_pts
-
-            # Parameterized path: combine Rust radial derivative φ'(r) with
-            # the axis ratio (t − c)/r. Both pieces come from the Rust core.
-            radial = _api.rust_module().duchon_input_location_first_derivative(
-                pts_np, ctrs_np, length_scale, int(m),
-            )  # (B, K)
-            radial_np = np.asarray(radial, dtype=float)
-            diffs = pts_np[:, None, :] - ctrs_np[None, :, :]  # (B, K, d)
-            r = np.sqrt((diffs * diffs).sum(axis=-1) + 1e-300)  # (B, K)
-            axis_ratio = diffs / r[..., None]  # (B, K, d)
-            jet_np = radial_np[..., None] * axis_ratio
-            jet = torch.as_tensor(jet_np, dtype=pts.dtype, device=pts.device)
-            grad_pts = torch.einsum("bk,bkj->bj", g, jet)
+            jet = _RadialJetFn_apply(
+                pts, _resolve_centers_np, _radial_first, _radial_second
+            )  # (B, K, d), autograd-tracked through pts
+            grad_pts = torch.einsum("bk,bkj->bj", g.to(dtype=jet.dtype), jet)
             return grad_pts
 
     return _Fn.apply(points)
+
+
+def _RadialJetFn_apply(
+    points: Any,
+    resolve_centers: Any,
+    radial_first: Any,
+    radial_second: Any,
+) -> Any:
+    """Autograd-aware radial-kernel input-location jet ``φ'(r)·(t−c)/r``.
+
+    Forward returns the per-row jet ``(B, K, d)``. Backward assembles the
+    Hessian contraction analytically:
+
+    ``H[b, k, i, j] = φ''(r) u_i u_j + (φ'(r)/r) (δ_ij − u_i u_j)``,
+    ``u = (t − c)/r``.
+
+    Routing the jet through this Function makes
+    :meth:`gamfit.BasisDescriptor.hessian` work via the generic autograd
+    path for both Duchon and Matérn descriptors.
+    """
+    torch = _torch()
+
+    class _JetFn(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx: Any, pts: Any) -> Any:
+            import numpy as np
+
+            pts_np = pts.detach().to(dtype=torch.float64).cpu().numpy()
+            ctrs_np = resolve_centers(pts_np)
+            phi_r = radial_first(pts_np, ctrs_np)  # (B, K)
+            diffs = pts_np[:, None, :] - ctrs_np[None, :, :]  # (B, K, d)
+            r2 = (diffs * diffs).sum(axis=-1)
+            r_safe = np.sqrt(r2 + 1e-300)
+            axis_ratio = diffs / r_safe[..., None]
+            jet_np = phi_r[..., None] * axis_ratio
+            jet = torch.as_tensor(jet_np, dtype=pts.dtype, device=pts.device)
+            ctx.save_for_backward(pts)
+            return jet
+
+        @staticmethod
+        def backward(ctx: Any, *grads: Any) -> Any:
+            import numpy as np
+
+            (grad_jet,) = grads  # (B, K, d)
+            (pts,) = ctx.saved_tensors
+            pts_np = pts.detach().to(dtype=torch.float64).cpu().numpy()
+            ctrs_np = resolve_centers(pts_np)
+            phi_r = radial_first(pts_np, ctrs_np)
+            phi_rr = radial_second(pts_np, ctrs_np)
+            diffs = pts_np[:, None, :] - ctrs_np[None, :, :]
+            r2 = (diffs * diffs).sum(axis=-1)
+            r = np.sqrt(r2)
+            r_safe = np.where(r > 0.0, r, 1.0)
+            phi_r_over_r = np.where(r > 0.0, phi_r / r_safe, phi_rr)
+            u = np.where(r[..., None] > 0.0, diffs / r_safe[..., None], 0.0)
+            d = u.shape[-1]
+            uu = u[..., :, None] * u[..., None, :]  # (B, K, d, d)
+            eye = np.eye(d, dtype=float)
+            H = phi_rr[..., None, None] * uu + phi_r_over_r[..., None, None] * (
+                eye - uu
+            )
+            H_t = torch.as_tensor(H, dtype=pts.dtype, device=pts.device)
+            grad_pts = torch.einsum(
+                "bkj,bkij->bi", grad_jet.to(dtype=H_t.dtype), H_t
+            )
+            return grad_pts
+
+    return _JetFn.apply(points)
 
 
 # ---------------------------------------------------------------------------
@@ -299,15 +364,37 @@ def _MaternRustFn_apply(
         else tuple(float(v) for v in aniso_log_scales)
     )
 
+    def _resolve_centers_np(_pts_np: Any) -> Any:
+        import numpy as np
+
+        ctrs_np = np.asarray(centers, dtype=float)
+        if ctrs_np.ndim == 1:
+            ctrs_np = ctrs_np.reshape(-1, 1)
+        return ctrs_np
+
+    def _radial_first(pts_np: Any, ctrs_np: Any) -> Any:
+        import numpy as np
+
+        out = _api.rust_module().matern_input_location_first_derivative(
+            pts_np, ctrs_np, float(length_scale), str(nu),
+        )
+        return np.asarray(out, dtype=float)
+
+    def _radial_second(pts_np: Any, ctrs_np: Any) -> Any:
+        import numpy as np
+
+        out = _api.rust_module().matern_input_location_second_derivative(
+            pts_np, ctrs_np, float(length_scale), str(nu),
+        )
+        return np.asarray(out, dtype=float)
+
     class _Fn(torch.autograd.Function):
         @staticmethod
         def forward(ctx: Any, pts: Any) -> Any:
             import numpy as np
 
             pts_np = pts.detach().to(dtype=torch.float64).cpu().numpy()
-            ctrs_np = np.asarray(centers, dtype=float)
-            if ctrs_np.ndim == 1:
-                ctrs_np = ctrs_np.reshape(-1, 1)
+            ctrs_np = _resolve_centers_np(pts_np)
             basis_np = _api.matern_basis(
                 pts_np,
                 ctrs_np,
@@ -321,24 +408,12 @@ def _MaternRustFn_apply(
 
         @staticmethod
         def backward(ctx: Any, *grads: Any) -> Any:
-            import numpy as np
-
             (g,) = grads
             (pts,) = ctx.saved_tensors
-            pts_np = pts.detach().to(dtype=torch.float64).cpu().numpy()
-            ctrs_np = np.asarray(centers, dtype=float)
-            if ctrs_np.ndim == 1:
-                ctrs_np = ctrs_np.reshape(-1, 1)
-            radial = _api.rust_module().matern_input_location_first_derivative(
-                pts_np, ctrs_np, float(length_scale), str(nu),
-            )  # (B, K)
-            radial_np = np.asarray(radial, dtype=float)
-            diffs = pts_np[:, None, :] - ctrs_np[None, :, :]  # (B, K, d)
-            r = np.sqrt((diffs * diffs).sum(axis=-1) + 1e-300)  # (B, K)
-            axis_ratio = diffs / r[..., None]
-            jet_np = radial_np[..., None] * axis_ratio  # (B, K, d)
-            jet = torch.as_tensor(jet_np, dtype=pts.dtype, device=pts.device)
-            grad_pts = torch.einsum("bk,bkj->bj", g, jet)
+            jet = _RadialJetFn_apply(
+                pts, _resolve_centers_np, _radial_first, _radial_second
+            )  # (B, K, d), autograd-tracked through pts
+            grad_pts = torch.einsum("bk,bkj->bj", g.to(dtype=jet.dtype), jet)
             return grad_pts
 
     return _Fn.apply(points)
