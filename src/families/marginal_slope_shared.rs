@@ -864,15 +864,27 @@ pub struct AutoOuterSubsampleOptions {
     /// `0xA075_8AMP_LE_5UB5` (deterministic across runs at the same
     /// `n`, so CRN holds across BFGS iterations).
     pub seed: u64,
-    /// Family-supplied per-row outer-derivative work units. The auto
-    /// schedule caps `K` by `WORK_BUDGET / per_row_outer_cost_units`
-    /// so a single outer eval cannot exceed
-    /// [`AUTO_OUTER_WORK_BUDGET`] work units even when the noise-only
-    /// target would pick a larger `K`. Default `1` (i.e. no work cap
-    /// beyond `K ≤ n`); families with measurably expensive derivative
-    /// rows (e.g. survival marginal-slope) overwrite this to their
-    /// `predicted_gradient_work / n` snapshot.
-    pub per_row_outer_cost_units: u64,
+    /// Family-supplied **per-unit-of-K** outer-derivative work cost.
+    ///
+    /// Despite the historical name, this is *not* a per-row quantity.
+    /// It is `predicted_outer_gradient_work / K` evaluated at the
+    /// family's reference operating point — i.e. how many work units
+    /// each additional row in the K-subsample contributes summed over
+    /// all n. The auto schedule caps `K` by
+    /// `K_work = AUTO_OUTER_WORK_BUDGET / outer_work_per_k_unit`,
+    /// guaranteeing a single outer evaluation never exceeds
+    /// [`AUTO_OUTER_WORK_BUDGET`] work units regardless of the
+    /// noise-only target. Default `1` (no effective work cap beyond
+    /// `K ≤ n`); families with measurable per-K cost (survival
+    /// marginal-slope, BMS) overwrite at the call site.
+    ///
+    /// Calibration recipe: from a profiled run,
+    ///     outer_work_per_k_unit = predicted_gradient_work / K.
+    /// For the biobank survival marginal-slope reference
+    /// (predicted_gradient_work ≈ 4.33×10⁹ at K=19_661), this gives
+    /// ~220_000; we use 250_000 as a conservative upper bound. With
+    /// `AUTO_OUTER_WORK_BUDGET = 5×10⁸` that caps K at ~2_000.
+    pub outer_work_per_k_unit: u64,
 }
 
 /// Half-billion outer-derivative work units per evaluation. Picked so the
@@ -918,7 +930,7 @@ impl Default for AutoOuterSubsampleOptions {
             min_k: 10_000,
             target_fraction: 0.10,
             seed: 0xA075_8A8B_1ED5_5B5C,
-            per_row_outer_cost_units: 1,
+            outer_work_per_k_unit: 1,
         }
     }
 }
@@ -951,12 +963,12 @@ impl AutoOuterSubsampleOptions {
         }
         let k_noise_raw = ((n as f64) * self.target_fraction).round() as usize;
         let k_noise = k_noise_raw.max(self.min_k);
-        // Work-budget cap. `per_row_outer_cost_units == 1` is the
-        // default-1-work-unit signal that the family has not measured a
-        // per-row cost, in which case the work cap is `WORK_BUDGET` and
-        // typically dominated by `n`.
-        let per_row = self.per_row_outer_cost_units.max(1);
-        let k_work_u64 = AUTO_OUTER_WORK_BUDGET / per_row;
+        // Work-budget cap. `outer_work_per_k_unit == 1` is the
+        // default-1-work-unit signal that the family has not measured
+        // its per-K cost, in which case the work cap is `WORK_BUDGET`
+        // and typically dominated by `n`.
+        let work_per_k = self.outer_work_per_k_unit.max(1);
+        let k_work_u64 = AUTO_OUTER_WORK_BUDGET / work_per_k;
         let k_work = usize::try_from(k_work_u64).unwrap_or(usize::MAX);
         // Combine noise + work + n + floor in a single comparison so we
         // can attribute the binding constraint exactly once.
@@ -1054,7 +1066,7 @@ pub fn maybe_install_auto_outer_subsample(
     last_rho: &Arc<std::sync::Mutex<Option<Array1<f64>>>>,
     phase1_budget: usize,
     family_label: &'static str,
-    per_row_outer_cost_units: u64,
+    outer_work_per_k_unit: u64,
 ) -> Option<crate::custom_family::BlockwiseFitOptions> {
     if options.outer_score_subsample.is_some() || !options.auto_outer_subsample {
         return None;
