@@ -17890,6 +17890,14 @@ pub fn fit_survival_marginal_slope_terms(
     // runs, so we stash the flat β here and the eval closures promote it
     // into `exact_warm_start` on the first invocation.
     let pending_beta_seed = RefCell::new(None::<Array1<f64>>);
+    // Monotonic per-outer-eval counter used to populate
+    // `BlockwiseFitOptions::outer_eval_context` so downstream
+    // auto-subsample install paths key on (rho, eval_id) instead of
+    // the inner β. Distinct outer derivative evaluations always get a
+    // distinct eval_id; the contained `EvalScope` distinguishes the
+    // outer derivative call from inner trial line-search calls (which
+    // copy this id but flip the scope to `InnerCoefficient`).
+    let outer_eval_counter = std::cell::Cell::new(0usize);
 
     let event = Arc::new(spec.event_target.clone());
     let weights = Arc::new(spec.weights.clone());
