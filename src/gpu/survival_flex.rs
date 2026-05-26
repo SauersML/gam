@@ -1206,8 +1206,17 @@ pub fn try_survival_flex_hvp(
 
 /// Assemble the dense survival-flex joint Hessian on the GPU.  Returns
 /// a `p × p` row-major matrix, or `Ok(None)` for unsupported shapes.
+///
+/// When `cells` is `Some(_)` (Step 2 hookup) the entry point evaluates
+/// the per-cell derivative moments via [`try_row_batched_cell_moments`]
+/// first — this validates the moment-building stage end-to-end on the
+/// device runtime before the Step 4/5/6 joint-β assembly lands.  When
+/// every cell evaluates cleanly the entry point still returns `Ok(None)`
+/// (joint-β assembly not yet wired); on any non-OK substrate status the
+/// caller falls back to CPU.
 pub fn try_survival_flex_dense_hessian(
     inputs: SurvivalFlexGpuRowInputs<'_>,
+    cells: Option<SurvivalFlexRowCellsBatch<'_>>,
 ) -> Result<Option<Array2<f64>>, GpuError> {
     inputs.validate()?;
     if inputs.score_dim != 1 {
@@ -1215,6 +1224,24 @@ pub fn try_survival_flex_dense_hessian(
     }
     if !SurvivalFlexGpuBackend::compiled() {
         return Ok(None);
+    }
+    if let Some(batch) = cells {
+        // Validate the moment-building stage on the substrate runtime.
+        // Step 4/5/6 will plug these moments into the joint-β
+        // gradient/Hessian; here we only confirm the moments are
+        // evaluatable so the dispatcher does not silently fall through
+        // to CPU when the GPU substrate is healthy.
+        let out = match try_row_batched_cell_moments(batch)? {
+            Some(out) => out,
+            None => return Ok(None),
+        };
+        let ok_byte = super::cubic_cell::CubicCellMomentStatus::Ok as u8;
+        if out.status.iter().any(|&b| b != ok_byte) {
+            // Any cell that failed the substrate classifier or kernel
+            // is a CPU fallback for this fit — Step 4/5/6 assembly is
+            // not landed yet so we cannot stitch a partial answer.
+            return Ok(None);
+        }
     }
     Ok(None)
 }
@@ -1445,7 +1472,7 @@ mod survival_flex_gpu_tests {
         let d = vec![0.0; n];
         let mut inputs = make_inputs(n, &q0, &q1, &qd1, &z, &g, &w, &d, &beta);
         inputs.score_dim = 2;
-        match try_survival_flex_dense_hessian(inputs) {
+        match try_survival_flex_dense_hessian(inputs, None) {
             Ok(None) => {}
             other => panic!("expected None for vector score (K>1), got {other:?}"),
         }
