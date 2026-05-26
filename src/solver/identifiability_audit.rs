@@ -198,6 +198,31 @@ pub struct IdentifiabilityAudit {
 /// makes a decision.
 const ALIAS_OVERLAP_REPORTING_THRESHOLD: f64 = 0.95;
 
+/// Overlap magnitude above which the audit halts the fit unconditionally.
+///
+/// At or above this threshold, two named blocks contribute the *same*
+/// direction up to 1% relative noise. The joint penalised-Newton inner
+/// solve has no unique minimiser in that direction — the inner KKT
+/// system is structurally rank-deficient regardless of penalty value,
+/// the outer Hessian inherits the same null space, and the outer
+/// optimiser silently spins on the unattributed direction. This is the
+/// "auto-subsample eval=1/12 hung for hours" failure mode the audit-gate
+/// task (#5) installs the safety net for: the audit must refuse, with
+/// an actionable message naming the offending blocks/columns and a
+/// reparameterisation hint, BEFORE the outer solver ever enters.
+///
+/// Note this is strictly stricter than
+/// `ALIAS_OVERLAP_REPORTING_THRESHOLD` (0.95). The 0.95 threshold is
+/// for *reporting* — partial overlap that the penalty and line search
+/// can still resolve. The 0.99 threshold is for *halting* — overlap so
+/// close to 1.0 that no penalty value can distinguish the two
+/// directions and no warm-start can untangle them. The aliasing-fix
+/// peer's basis reparameterisation should keep biobank specs below
+/// this threshold; if this gate ever fires on production specs after
+/// their fix lands, that's a real bug surfaced rather than silently
+/// absorbed.
+const HARD_HALT_OVERLAP_THRESHOLD: f64 = 0.99;
+
 /// Run the pre-fit cross-block identifiability audit on a finalised
 /// list of `ParameterBlockSpec`s. The caller is responsible for
 /// having applied any within-smooth `joint_null_rotation`; the audit
@@ -447,15 +472,87 @@ pub fn audit_identifiability(specs: &[ParameterBlockSpec]) -> Result<Identifiabi
     }
 
     let joint_rank_deficient = joint_rank < p_total;
-    // Fatal when joint rank is deficient AND we cannot attribute the
-    // deficiency to either (a) at least one pairwise alias above the
-    // reporting threshold or (b) at least one dropped-column record.
-    // RRQR always populates `demoted_joint_cols` for any deficiency
-    // it detects, so the only way to reach `fatal=true` is if the
-    // tolerance disagreement between RRQR and the column-norm
-    // pairwise scan hides the structural alias — exactly the >2-way
-    // alias case the caller must refuse.
-    let fatal = joint_rank_deficient && aliased_pairs.is_empty() && dropped_columns.is_empty();
+    // Hard-halt cases (the audit-gate from task #5 — the safety net that
+    // would have prevented the biobank `eval=1/12` hours-long hang):
+    //
+    //   (a) `joint_rank < p_total` — the joint design is structurally
+    //       rank-deficient. Whether RRQR attributed the deficiency via
+    //       `dropped_columns` does NOT change the fact that the inner
+    //       penalised-Newton KKT system has a non-trivial null space
+    //       inherited by the outer Hessian: the outer optimiser will
+    //       silently spin on the unattributed direction. The previous
+    //       gate (`deficient && pairs.empty() && drops.empty()`) only
+    //       fired when attribution was IMPOSSIBLE; that's the wrong
+    //       boundary because "attributed" does not imply "fittable".
+    //
+    //   (b) Any pairwise overlap `>= HARD_HALT_OVERLAP_THRESHOLD` (0.99)
+    //       between two named blocks. Two distinct blocks contributing
+    //       the same direction to within 1% noise floor is structurally
+    //       unfittable regardless of penalty values, regardless of
+    //       whether the joint rank happens to be full at this n.
+    //
+    // RRQR's tolerance can disagree with the column-norm pairwise scan
+    // on edge cases (e.g. a high-overlap pair that RRQR keeps because
+    // its residual is just above the rank threshold), so the two
+    // conditions are kept independent: either one is sufficient to halt.
+    let hard_alias_pair = aliased_pairs
+        .iter()
+        .max_by(|a, b| a.overlap.partial_cmp(&b.overlap).unwrap_or(std::cmp::Ordering::Equal))
+        .filter(|p| p.overlap >= HARD_HALT_OVERLAP_THRESHOLD)
+        .cloned();
+    let fatal = joint_rank_deficient || hard_alias_pair.is_some();
+
+    let fatal_detail = if fatal {
+        let mut parts: Vec<String> = Vec::new();
+        if joint_rank_deficient {
+            // Name the worst-attributed dropped column (if any) so the
+            // caller sees which (block, local_col) to reparameterise
+            // first. When attribution is empty, surface that fact —
+            // it indicates a >2-way structural alias that the pairwise
+            // scan didn't catch and is the hardest case to fix.
+            let attribution = if let Some(first_drop) = dropped_columns.first() {
+                format!(
+                    "first attributed drop: block '{}' local column {} \
+                     (reparam: replace this column with a sum-to-zero or \
+                     orthogonal-complement projection against earlier blocks, \
+                     or remove the redundant term entirely)",
+                    first_drop.block, first_drop.column,
+                )
+            } else {
+                "no per-column attribution (>2-way structural alias); \
+                 audit the joint design by eye and absorb the shared null \
+                 subspace into a single parametric block"
+                    .to_string()
+            };
+            parts.push(format!(
+                "joint rank {} < joint columns {} ({} dropped column(s); {})",
+                joint_rank,
+                p_total,
+                dropped_columns.len(),
+                attribution,
+            ));
+        }
+        if let Some(pair) = hard_alias_pair.as_ref() {
+            parts.push(format!(
+                "alias pair: '{}'[{}] ~ '{}'[{}] overlap={:.4} >= halt threshold {:.2} \
+                 (reparam: orthogonalise one block's column {} against the other \
+                 via sum-to-zero, or absorb the shared direction into a single \
+                 parametric block)",
+                pair.block_a,
+                pair.direction_a,
+                pair.block_b,
+                pair.direction_b,
+                pair.overlap,
+                HARD_HALT_OVERLAP_THRESHOLD,
+                pair.direction_b,
+            ));
+        }
+        format!(" — FATAL: {}", parts.join("; "))
+    } else if !aliased_pairs.is_empty() {
+        " — partial alias(es) below halt threshold; penalty + line search will resolve".to_string()
+    } else {
+        " — clean".to_string()
+    };
 
     let summary = format!(
         "identifiability audit: {} block(s), {} joint columns, joint rank {}, \
@@ -466,13 +563,7 @@ pub fn audit_identifiability(specs: &[ParameterBlockSpec]) -> Result<Identifiabi
         aliased_pairs.len(),
         ALIAS_OVERLAP_REPORTING_THRESHOLD,
         dropped_columns.len(),
-        if fatal {
-            " — FATAL (rank deficiency without pair or column attribution)"
-        } else if joint_rank_deficient {
-            " — alias(es) flagged; family-specific reparameterisation required"
-        } else {
-            " — clean"
-        },
+        fatal_detail,
     );
 
     Ok(IdentifiabilityAudit {
@@ -597,8 +688,12 @@ mod tests {
     }
 
     /// Test 2: a smooth's constant column aliased with a separate
-    /// parametric intercept → audit drops one column, fatal=false,
-    /// at least one alias pair attributed.
+    /// parametric intercept → audit drops one column AND now flags
+    /// the configuration as fatal under the task #5 halt-or-repair gate.
+    /// The two blocks contribute the same direction up to numerical
+    /// noise (overlap == 1.0): the inner KKT system is structurally
+    /// rank-deficient regardless of penalty, so the audit must refuse
+    /// the fit with an actionable message rather than warn-and-proceed.
     #[test]
     fn audit_smooth_constant_aliased_with_intercept() {
         let n = 64;
@@ -618,8 +713,8 @@ mod tests {
         ];
         let audit = audit_identifiability(&specs).expect("audit must succeed");
         assert!(
-            !audit.fatal,
-            "alias with attribution must not be fatal: {}",
+            audit.fatal,
+            "exact intercept~smooth-constant alias must be fatal under the halt gate: {}",
             audit.summary,
         );
         assert!(
@@ -647,6 +742,19 @@ mod tests {
             "expected 3 surviving directions; got {total_kept} (summary: {})",
             audit.summary,
         );
+        // Actionable message must name both offending blocks and the
+        // reparam suggestion so the caller can act on the failure.
+        assert!(
+            audit.summary.contains("intercept") && audit.summary.contains("smooth_with_const"),
+            "fatal summary must name both blocks; got {:?}",
+            audit.summary,
+        );
+        assert!(
+            audit.summary.contains("reparam") || audit.summary.contains("sum-to-zero")
+                || audit.summary.contains("orthogonal") || audit.summary.contains("absorb"),
+            "fatal summary must include a reparameterisation suggestion; got {:?}",
+            audit.summary,
+        );
     }
 
     /// Test 3: two smooths on the same covariate axis with a shared
@@ -670,10 +778,13 @@ mod tests {
             spec_from_dense("smooth_b", smooth_b),
         ];
         let audit = audit_identifiability(&specs).expect("audit must succeed");
+        // Under the task #5 halt gate, an x~x alias at overlap ~ 1.0 is
+        // fatal — two distinct blocks contributing the same direction is
+        // structurally unfittable regardless of attribution.
         assert!(
-            !audit.fatal,
-            "attributed alias must not be fatal: {}",
-            audit.summary
+            audit.fatal,
+            "exact x~x alias across two smooth blocks must be fatal under the halt gate: {}",
+            audit.summary,
         );
         let cross_linear_pair = audit
             .aliased_pairs
