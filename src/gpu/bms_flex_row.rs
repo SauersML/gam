@@ -1182,18 +1182,6 @@ pub(crate) enum RowHessianLayout {
 }
 
 #[cfg(target_os = "linux")]
-impl RowHessianLayout {
-    /// Per-row entry count for this layout.
-    #[inline]
-    pub(crate) fn per_row_doubles(self, r: usize) -> usize {
-        match self {
-            RowHessianLayout::FullRowMajor => r * r,
-            RowHessianLayout::SymmetricPackedUpper => r * (r + 1) / 2,
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
 pub(crate) struct DeviceResidentRowHess {
     pub(crate) ctx: Arc<CudaContext>,
     pub(crate) stream: Arc<CudaStream>,
@@ -1922,7 +1910,7 @@ pub(crate) fn launch_bms_flex_row_kernel_device_resident(
 /// Returns `Ok(())` if `storage.layout` was already `SymmetricPackedUpper`
 /// — idempotent. Errors out cleanly on alloc / launch / sync failures.
 #[cfg(target_os = "linux")]
-pub(crate) fn repack_upper(storage: &mut DeviceResidentRowHess) -> Result<(), GpuError> {
+fn repack_upper(storage: &mut DeviceResidentRowHess) -> Result<(), GpuError> {
     if storage.layout == RowHessianLayout::SymmetricPackedUpper {
         return Ok(());
     }

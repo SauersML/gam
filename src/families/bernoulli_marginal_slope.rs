@@ -1142,20 +1142,95 @@ struct BernoulliInterceptPredictorWarmStart {
     intercept_primary_deriv: Vec<f64>,
 }
 
+/// Per-row warm-start cache for the scalar intercept root-finder.
+///
+/// Each slot stores `(value, beta_tag)` where `beta_tag` is a 64-bit hash of
+/// the per-row state that uniquely determines the intercept root. Reads return
+/// `Some(a)` only when the caller's tag matches the stored tag AND the stored
+/// value is finite. This makes the cache transactional with respect to
+/// trust-region trials and subsampled probes: a rejected trial at β_A and an
+/// accepted full-data eval at β_B key under distinct tags, so writes from one
+/// cannot poison reads from the other.
+///
+/// The "never written" sentinel is `beta_tag == 0`. Tag helpers
+/// (`hash_intercept_warm_start_key_*`) remap `0` to `1` so the sentinel can
+/// never collide with a real key.
+///
+/// Memory ordering: the writer stores `value` with `Relaxed` and then `tag`
+/// with `Release`; the reader loads `tag` with `Acquire`, reads `value` with
+/// `Relaxed`, and re-checks `tag` with `Acquire`. The double-check detects a
+/// torn read where another thread interleaved a tag bump between the value
+/// read and the second tag load.
 struct BernoulliInterceptWarmStartCache {
-    intercepts: Vec<AtomicU64>,
+    intercept_value: Vec<AtomicU64>,
+    intercept_tag: Vec<AtomicU64>,
     predictors: Vec<Mutex<Option<BernoulliInterceptPredictorWarmStart>>>,
 }
 
-impl std::ops::Deref for BernoulliInterceptWarmStartCache {
-    type Target = [AtomicU64];
-
-    fn deref(&self) -> &Self::Target {
-        &self.intercepts
-    }
-}
-
 impl BernoulliInterceptWarmStartCache {
+    #[inline]
+    fn len(&self) -> usize {
+        self.intercept_value.len()
+    }
+
+    /// Return the cached intercept iff the slot's stored `beta_tag` matches
+    /// the caller's `beta_tag` and the stored value is finite.
+    #[inline]
+    fn load_tagged(&self, row: usize, beta_tag: u64) -> Option<f64> {
+        let value_slot = self.intercept_value.get(row)?;
+        let tag_slot = self.intercept_tag.get(row)?;
+        let tag_before = tag_slot.load(Ordering::Acquire);
+        if tag_before != beta_tag {
+            return None;
+        }
+        let bits = value_slot.load(Ordering::Relaxed);
+        let tag_after = tag_slot.load(Ordering::Acquire);
+        if tag_after != beta_tag {
+            return None;
+        }
+        let value = f64::from_bits(bits);
+        value.is_finite().then_some(value)
+    }
+
+    /// Stamp the slot with the converged intercept under `beta_tag`.
+    #[inline]
+    fn store_tagged(&self, row: usize, value: f64, beta_tag: u64) {
+        if let (Some(value_slot), Some(tag_slot)) =
+            (self.intercept_value.get(row), self.intercept_tag.get(row))
+        {
+            // Invalidate before writing the new value so an interleaved
+            // reader cannot see the new tag paired with the old value.
+            tag_slot.store(0, Ordering::Release);
+            value_slot.store(value.to_bits(), Ordering::Relaxed);
+            tag_slot.store(beta_tag, Ordering::Release);
+        }
+    }
+
+    /// CAS-install `(value, beta_tag)` into a slot only if the tag slot is
+    /// still the "never written" sentinel (`0`). Returns `Ok(())` if the seed
+    /// was installed, `Err(prev_tag)` if some prior write already populated
+    /// the slot (in which case the caller should keep the existing entry).
+    #[inline]
+    fn compare_exchange_unseeded(
+        &self,
+        row: usize,
+        value: f64,
+        beta_tag: u64,
+    ) -> Result<(), u64> {
+        let value_slot = self.intercept_value.get(row).ok_or(0u64)?;
+        let tag_slot = self.intercept_tag.get(row).ok_or(0u64)?;
+        match tag_slot.compare_exchange(0, beta_tag, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => {
+                // We own the tag; publish the value. A late reader that loads
+                // `tag == beta_tag` and then `value == NaN` will reject via
+                // `is_finite()` and fall back to the closed-form seed.
+                value_slot.store(value.to_bits(), Ordering::Relaxed);
+                Ok(())
+            }
+            Err(prev) => Err(prev),
+        }
+    }
+
     fn predictor_seed(&self, row: usize, current_point: &[f64]) -> Option<f64> {
         let warm = self.predictors.get(row)?.lock().ok()?.as_ref().cloned()?;
         if warm.primary_point.len() != current_point.len()
@@ -1204,9 +1279,87 @@ impl BernoulliInterceptWarmStartCache {
 
 fn new_intercept_warm_start_cache(n: usize) -> Arc<BernoulliInterceptWarmStartCache> {
     Arc::new(BernoulliInterceptWarmStartCache {
-        intercepts: (0..n).map(|_| AtomicU64::new(f64::NAN.to_bits())).collect(),
+        intercept_value: (0..n).map(|_| AtomicU64::new(f64::NAN.to_bits())).collect(),
+        intercept_tag: (0..n).map(|_| AtomicU64::new(0)).collect(),
         predictors: (0..n).map(|_| Mutex::new(None)).collect(),
     })
+}
+
+/// FNV-1a 64-bit hash of per-row state determining the empirical-grid rigid
+/// intercept root. The root depends only on `(marginal.q, slope)` (the grid
+/// nodes/weights are immutable per `latent_measure`), so hashing these two
+/// scalars is sufficient to distinguish trust-region trials at different β.
+/// Returned tag is guaranteed non-zero (zero is remapped to one) so the
+/// cache's "never written" sentinel cannot collide with a real key.
+#[inline]
+fn hash_intercept_warm_start_key_rigid(marginal_q: f64, slope: f64) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let mut hash = FNV_OFFSET;
+    let mix = |hash: &mut u64, byte: u8| {
+        *hash ^= byte as u64;
+        *hash = hash.wrapping_mul(FNV_PRIME);
+    };
+    // Domain separator for the rigid (empirical-grid) cache stream.
+    mix(&mut hash, 0xb1);
+    for x in [marginal_q, slope] {
+        let bits = if x == 0.0 { 0u64 } else { x.to_bits() };
+        for b in bits.to_le_bytes() {
+            mix(&mut hash, b);
+        }
+    }
+    if hash == 0 { 1 } else { hash }
+}
+
+/// FNV-1a 64-bit hash of per-row state determining the FLEX intercept root.
+/// The root depends on `(marginal_eta, slope, beta_h, beta_w)`: under
+/// link-deviation and score-warp the joint β vector enters via the link
+/// basis evaluated at the intercept, so trials at different β at the same
+/// row produce different roots and must NOT share a cache slot.
+#[inline]
+fn hash_intercept_warm_start_key_flex(
+    marginal_eta: f64,
+    slope: f64,
+    beta_h: Option<&Array1<f64>>,
+    beta_w: Option<&Array1<f64>>,
+) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let mut hash = FNV_OFFSET;
+    let mix = |hash: &mut u64, byte: u8| {
+        *hash ^= byte as u64;
+        *hash = hash.wrapping_mul(FNV_PRIME);
+    };
+    // Domain separator for the FLEX cache stream so it cannot collide with
+    // a rigid-stream hash that happens to produce the same scalar bits.
+    mix(&mut hash, 0xb2);
+    for x in [marginal_eta, slope] {
+        let bits = if x == 0.0 { 0u64 } else { x.to_bits() };
+        for b in bits.to_le_bytes() {
+            mix(&mut hash, b);
+        }
+    }
+    let feed = |hash: &mut u64, beta: Option<&Array1<f64>>, marker: u8| {
+        mix(hash, marker);
+        match beta {
+            None => mix(hash, 0xffu8),
+            Some(v) => {
+                let len = v.len() as u64;
+                for b in len.to_le_bytes() {
+                    mix(hash, b);
+                }
+                for x in v.iter() {
+                    let bits = if *x == 0.0 { 0u64 } else { x.to_bits() };
+                    for b in bits.to_le_bytes() {
+                        mix(hash, b);
+                    }
+                }
+            }
+        }
+    };
+    feed(&mut hash, beta_h, 0xc1);
+    feed(&mut hash, beta_w, 0xc2);
+    if hash == 0 { 1 } else { hash }
 }
 
 #[derive(Clone, Default)]
@@ -5642,10 +5795,18 @@ impl BernoulliMarginalSlopeFamily {
         nodes: &[f64],
         measure_weights: &[f64],
     ) -> Result<f64, String> {
-        let cached = self.intercept_warm_starts.as_ref().and_then(|cache| {
-            let value = f64::from_bits(cache.get(row)?.load(Ordering::Relaxed));
-            value.is_finite().then_some(value)
-        });
+        // Cache slot is keyed by `(marginal.q, slope)`: a rejected TR trial
+        // at one β and an accepted trial at another produce different
+        // `(marginal_eta_row, slope_row)` for the same row, so without the
+        // tag the slot can read back a value from a different trial and
+        // poison the new root solve. The empirical-grid root depends only
+        // on `(marginal.q, slope)` (the grid is immutable per latent measure),
+        // so this two-scalar tag is sufficient.
+        let beta_tag = hash_intercept_warm_start_key_rigid(marginal.q, slope);
+        let cached = self
+            .intercept_warm_starts
+            .as_ref()
+            .and_then(|cache| cache.load_tagged(row, beta_tag));
         let root = empirical_intercept_from_marginal(
             marginal.mu,
             marginal.q,
@@ -5655,10 +5816,8 @@ impl BernoulliMarginalSlopeFamily {
             measure_weights,
             cached,
         )?;
-        if let Some(cache) = self.intercept_warm_starts.as_ref()
-            && let Some(slot) = cache.get(row)
-        {
-            slot.store(root.to_bits(), Ordering::Relaxed);
+        if let Some(cache) = self.intercept_warm_starts.as_ref() {
+            cache.store_tagged(row, root, beta_tag);
         }
         Ok(root)
     }

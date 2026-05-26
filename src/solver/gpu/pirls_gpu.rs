@@ -867,6 +867,585 @@ pub fn solve_pirls_step_on_stream_device(
     cuda::solve_step_on_stream_device(shared, ws, input)
 }
 
+// ────────────────────────────────────────────────────────────────────────
+// Block 9 Phase 5 — device-resident PCG against the BMS-FLEX row-Hessian
+// operator.
+//
+// The inner Newton solve in `BernoulliMarginalSlope` (matrix-free path,
+// biobank shape n=195k, p=44, r=20) currently reaches the GPU as a
+// per-CG-iteration call to `launch_bms_flex_row_hvp` returning a host
+// `Vec<f64>`. With ~6400 inner CG iterations per outer iteration that round-
+// trip cost dominates: each iter pays one `stream.synchronize()` plus one
+// DtoH download. At p=44 the download itself is 352 bytes — trivial in
+// bandwidth, painful in latency.
+//
+// Phase 5 keeps every PCG vector on the device and runs the outer loop with
+// only a single small scalar download per iteration (the squared residual
+// norm for the convergence check). The Hv kernel becomes `into_device`
+// (Block 9 addition to `bms_flex_row.rs`), and the axpy / dot / diagonal-
+// preconditioner / scale-and-add steps run as tiny NVRTC kernels on the
+// same default stream so the sequence is implicitly ordered without sync.
+// ────────────────────────────────────────────────────────────────────────
+
+/// Inputs to [`run_pcg_against_row_hessian_device`]. The right-hand-side
+/// `b` is supplied as a host slice (it is the only host-resident vector
+/// that needs to enter the loop — the iterate, residual, search direction,
+/// and Hv output all live on the device).
+#[cfg(target_os = "linux")]
+pub struct DeviceResidentPcgInput<'a> {
+    /// Per-fit row-Hessian + design storage. The PCG operator is
+    /// `v ↦ launch_bms_flex_row_hvp_into_device(storage, ...)`.
+    pub storage: &'a crate::gpu::bms_flex_row::DeviceResidentRowHess,
+    /// Right-hand-side `b`, length `storage.block.p_total`. Uploaded once.
+    pub b: &'a [f64],
+    /// Convergence tolerance on relative residual `‖r‖₂ / ‖b‖₂`.
+    pub rel_tol: f64,
+    /// Hard cap on iterations (the inner loop also bails on stagnation).
+    pub max_iters: usize,
+    /// Floor on `|diag(H)[i]|` used by the Jacobi preconditioner. Set to
+    /// `1e-12` for the matrix-free row-Hessian path; the row-primary
+    /// Hessian's diagonal is positive-definite by construction.
+    pub precond_diag_floor: f64,
+}
+
+/// Output of [`run_pcg_against_row_hessian_device`].
+#[cfg(target_os = "linux")]
+pub struct DeviceResidentPcgOutput {
+    /// Solution `x` such that `H · x ≈ b`, length `storage.block.p_total`.
+    pub x: Vec<f64>,
+    /// Number of PCG iterations consumed (final iter does not count if it
+    /// converged immediately after the dot reduction).
+    pub iterations: usize,
+    /// Final achieved relative residual `‖r‖₂ / ‖b‖₂`.
+    pub final_rel_residual: f64,
+}
+
+/// NVRTC source for the Phase-5 device-resident PCG support kernels. Every
+/// kernel here operates on length-`p` device vectors with `p` typically
+/// 44–256, so a single CTA suffices for each.
+#[cfg(target_os = "linux")]
+const PCG_KERNEL_SOURCE: &str = r#"
+// y[i] += a * x[i]
+extern "C" __global__ void pcg_axpy(int n, double a,
+                                    const double * __restrict__ x,
+                                    double * __restrict__ y)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] += a * x[i];
+}
+
+// y[i] = a * x[i] + b * y[i]
+extern "C" __global__ void pcg_axpby(int n, double a,
+                                     const double * __restrict__ x,
+                                     double b,
+                                     double * __restrict__ y)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = a * x[i] + b * y[i];
+}
+
+// z[i] = r[i] / clamp(diag[i], floor) (sign-preserving floor on |diag|).
+extern "C" __global__ void pcg_apply_diag_precond(int n, double floor_val,
+                                                  const double * __restrict__ diag,
+                                                  const double * __restrict__ r,
+                                                  double * __restrict__ z)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        double d = diag[i];
+        double ad = d < 0 ? -d : d;
+        double clamped = ad > floor_val ? d : (d >= 0.0 ? floor_val : -floor_val);
+        z[i] = r[i] / clamped;
+    }
+}
+
+// Single-block dot product; writes the scalar to out[0]. n must be <= 1024.
+extern "C" __global__ void pcg_dot_single_block(int n,
+                                                const double * __restrict__ a,
+                                                const double * __restrict__ b,
+                                                double * __restrict__ out)
+{
+    __shared__ double s[1024];
+    int tid = threadIdx.x;
+    double acc = 0.0;
+    for (int i = tid; i < n; i += blockDim.x) acc += a[i] * b[i];
+    s[tid] = acc;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) s[tid] += s[tid + stride];
+        __syncthreads();
+    }
+    if (tid == 0) out[0] = s[0];
+}
+
+// Set out[i] = 0 for i in [0, n).
+extern "C" __global__ void pcg_init_zero(int n, double * __restrict__ out) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = 0.0;
+}
+
+// Copy y[i] = x[i].
+extern "C" __global__ void pcg_copy(int n,
+                                    const double * __restrict__ x,
+                                    double * __restrict__ y)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = x[i];
+}
+"#;
+
+#[cfg(target_os = "linux")]
+mod pcg_device {
+    use super::DeviceResidentPcgInput;
+    use super::DeviceResidentPcgOutput;
+    use super::PCG_KERNEL_SOURCE;
+    use crate::gpu::bms_flex_row::launch_bms_flex_row_diagonal;
+    use crate::gpu::bms_flex_row::launch_bms_flex_row_hvp_into_device;
+    use cudarc::driver::{CudaContext, CudaModule, CudaStream, LaunchConfig, PushKernelArg};
+    use std::sync::{Arc, OnceLock};
+
+    struct PcgBackend {
+        stream: Arc<CudaStream>,
+        module: Arc<CudaModule>,
+        ctx: Arc<CudaContext>,
+    }
+
+    impl PcgBackend {
+        fn probe() -> Result<&'static Self, String> {
+            static BACKEND: OnceLock<Result<PcgBackend, String>> = OnceLock::new();
+            BACKEND
+                .get_or_init(|| {
+                    let runtime = crate::gpu::runtime::GpuRuntime::global()
+                        .ok_or_else(|| "pcg backend: no CUDA runtime available".to_string())?;
+                    let ctx = crate::gpu::runtime::cuda_context_for(
+                        runtime.selected_device().ordinal,
+                    )
+                    .ok_or_else(|| {
+                        format!(
+                            "pcg backend: failed to create CUDA context for device {}",
+                            runtime.selected_device().ordinal
+                        )
+                    })?;
+                    let stream = ctx.default_stream();
+                    let ptx = cudarc::nvrtc::compile_ptx(PCG_KERNEL_SOURCE)
+                        .map_err(|err| format!("pcg NVRTC compile failed: {err}"))?;
+                    let module = ctx
+                        .load_module(ptx)
+                        .map_err(|err| format!("pcg module load failed: {err}"))?;
+                    Ok(PcgBackend { stream, module, ctx })
+                })
+                .as_ref()
+                .map_err(String::clone)
+        }
+    }
+
+    fn launch_blocks(p: usize, threads: u32) -> u32 {
+        ((p as u32) + threads - 1) / threads
+    }
+
+    /// PCG against the row-Hessian operator with Jacobi preconditioner from
+    /// `diag(H)`. All vectors remain on the device for the duration of the
+    /// loop; only the squared residual norm crosses the host boundary each
+    /// iter (one f64, ≤ 8 bytes).
+    pub(super) fn run(
+        input: DeviceResidentPcgInput<'_>,
+    ) -> Result<DeviceResidentPcgOutput, String> {
+        let p = input.storage.block.p_total;
+        if input.b.len() != p {
+            return Err(format!(
+                "device-resident pcg: b.len()={} != p_total={p}",
+                input.b.len()
+            ));
+        }
+        if !input.rel_tol.is_finite() || input.rel_tol <= 0.0 {
+            return Err(format!(
+                "device-resident pcg: rel_tol must be positive and finite (got {})",
+                input.rel_tol
+            ));
+        }
+        if input.max_iters == 0 {
+            return Err("device-resident pcg: max_iters must be >= 1".to_string());
+        }
+        if !input.precond_diag_floor.is_finite() || input.precond_diag_floor <= 0.0 {
+            return Err(format!(
+                "device-resident pcg: precond_diag_floor must be positive and finite (got {})",
+                input.precond_diag_floor
+            ));
+        }
+
+        let backend = PcgBackend::probe()?;
+        let stream = backend.stream.clone();
+        let module = backend.module.clone();
+
+        // ── Load kernel handles once ─────────────────────────────────────
+        let f_axpy = module
+            .load_function("pcg_axpy")
+            .map_err(|e| format!("pcg load pcg_axpy: {e}"))?;
+        let f_axpby = module
+            .load_function("pcg_axpby")
+            .map_err(|e| format!("pcg load pcg_axpby: {e}"))?;
+        let f_precond = module
+            .load_function("pcg_apply_diag_precond")
+            .map_err(|e| format!("pcg load pcg_apply_diag_precond: {e}"))?;
+        let f_dot = module
+            .load_function("pcg_dot_single_block")
+            .map_err(|e| format!("pcg load pcg_dot_single_block: {e}"))?;
+        let f_copy = module
+            .load_function("pcg_copy")
+            .map_err(|e| format!("pcg load pcg_copy: {e}"))?;
+
+        // ── Allocate device vectors x, r, z, p_vec, q (length p each) ──
+        let mut d_x = stream
+            .alloc_zeros::<f64>(p)
+            .map_err(|e| format!("pcg alloc x: {e}"))?;
+        let mut d_r = stream
+            .clone_htod(input.b)
+            .map_err(|e| format!("pcg upload b -> r: {e}"))?;
+        let mut d_z = stream
+            .alloc_zeros::<f64>(p)
+            .map_err(|e| format!("pcg alloc z: {e}"))?;
+        let mut d_p = stream
+            .alloc_zeros::<f64>(p)
+            .map_err(|e| format!("pcg alloc p: {e}"))?;
+        let mut d_q = stream
+            .alloc_zeros::<f64>(p)
+            .map_err(|e| format!("pcg alloc q: {e}"))?;
+        // One-element scalar buffer reused across iters for `p·q` and
+        // `r·z` dot products.
+        let mut d_scalar = stream
+            .alloc_zeros::<f64>(1)
+            .map_err(|e| format!("pcg alloc scalar: {e}"))?;
+
+        // Preconditioner: M⁻¹ from diag(H). One HostVec download per
+        // *outer* call, but this is constant work per solve — not per
+        // iter — so it does not block the inner loop's no-sync property.
+        let diag_host = launch_bms_flex_row_diagonal(input.storage)
+            .map_err(|e| format!("pcg diag fetch: {e}"))?;
+        if diag_host.len() != p {
+            return Err(format!(
+                "pcg: diag length {} != p_total {p}",
+                diag_host.len()
+            ));
+        }
+        let d_diag = stream
+            .clone_htod(&diag_host)
+            .map_err(|e| format!("pcg upload diag: {e}"))?;
+
+        // ── Convergence baseline: ‖b‖₂ via one in-stream dot ─────────────
+        let n_i32 = i32::try_from(p)
+            .map_err(|_| format!("pcg: p_total={p} exceeds i32 range"))?;
+        let vec_threads: u32 = 64;
+        let vec_blocks = launch_blocks(p, vec_threads);
+        let dot_threads: u32 = match p {
+            0..=64 => 64,
+            65..=128 => 128,
+            129..=256 => 256,
+            257..=512 => 512,
+            _ => 1024,
+        };
+        if p > 1024 {
+            return Err(format!(
+                "device-resident pcg: p_total={p} exceeds single-block dot capacity (1024); \
+                 widen pcg_dot_single_block to multi-block reduce before raising the cap"
+            ));
+        }
+
+        // ‖b‖₂² = b · b (b is currently in d_r since r₀ = b - H·0 = b)
+        unsafe {
+            stream
+                .launch_builder(&f_dot)
+                .arg(&n_i32)
+                .arg(&d_r)
+                .arg(&d_r)
+                .arg(&mut d_scalar)
+                .launch(LaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (dot_threads, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+        }
+        .map_err(|e| format!("pcg b·b launch: {e}"))?;
+        stream
+            .synchronize()
+            .map_err(|e| format!("pcg b·b sync: {e}"))?;
+        let host_scalar = stream
+            .clone_dtoh(&d_scalar)
+            .map_err(|e| format!("pcg b·b download: {e}"))?;
+        let bb = host_scalar[0];
+        if !bb.is_finite() {
+            return Err(format!("pcg: b·b not finite ({bb})"));
+        }
+        let b_norm = bb.sqrt();
+        if b_norm == 0.0 {
+            // x = 0, r = b = 0, trivially converged.
+            return Ok(DeviceResidentPcgOutput {
+                x: vec![0.0; p],
+                iterations: 0,
+                final_rel_residual: 0.0,
+            });
+        }
+
+        // z₀ = M⁻¹ r₀
+        unsafe {
+            stream
+                .launch_builder(&f_precond)
+                .arg(&n_i32)
+                .arg(&input.precond_diag_floor)
+                .arg(&d_diag)
+                .arg(&d_r)
+                .arg(&mut d_z)
+                .launch(LaunchConfig {
+                    grid_dim: (vec_blocks, 1, 1),
+                    block_dim: (vec_threads, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+        }
+        .map_err(|e| format!("pcg precond z₀: {e}"))?;
+
+        // p₀ = z₀
+        unsafe {
+            stream
+                .launch_builder(&f_copy)
+                .arg(&n_i32)
+                .arg(&d_z)
+                .arg(&mut d_p)
+                .launch(LaunchConfig {
+                    grid_dim: (vec_blocks, 1, 1),
+                    block_dim: (vec_threads, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+        }
+        .map_err(|e| format!("pcg copy p₀: {e}"))?;
+
+        // ρ₀ = r₀·z₀
+        unsafe {
+            stream
+                .launch_builder(&f_dot)
+                .arg(&n_i32)
+                .arg(&d_r)
+                .arg(&d_z)
+                .arg(&mut d_scalar)
+                .launch(LaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (dot_threads, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+        }
+        .map_err(|e| format!("pcg ρ₀ launch: {e}"))?;
+        stream
+            .synchronize()
+            .map_err(|e| format!("pcg ρ₀ sync: {e}"))?;
+        let s = stream
+            .clone_dtoh(&d_scalar)
+            .map_err(|e| format!("pcg ρ₀ download: {e}"))?;
+        let mut rho = s[0];
+        if !rho.is_finite() {
+            return Err(format!("pcg: ρ₀ not finite ({rho})"));
+        }
+
+        let mut iters_taken: usize = 0;
+        let mut final_rel_residual: f64 = (bb.sqrt() / b_norm).max(0.0);
+        for iter in 0..input.max_iters {
+            iters_taken = iter + 1;
+
+            // q = H · p (on device, no sync, no DtoH).
+            launch_bms_flex_row_hvp_into_device(input.storage, &d_p, &mut d_q)
+                .map_err(|e| format!("pcg Hv iter {iter}: {e}"))?;
+
+            // pq = p·q
+            unsafe {
+                stream
+                    .launch_builder(&f_dot)
+                    .arg(&n_i32)
+                    .arg(&d_p)
+                    .arg(&d_q)
+                    .arg(&mut d_scalar)
+                    .launch(LaunchConfig {
+                        grid_dim: (1, 1, 1),
+                        block_dim: (dot_threads, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+            }
+            .map_err(|e| format!("pcg p·q launch iter {iter}: {e}"))?;
+            stream
+                .synchronize()
+                .map_err(|e| format!("pcg p·q sync iter {iter}: {e}"))?;
+            let s = stream
+                .clone_dtoh(&d_scalar)
+                .map_err(|e| format!("pcg p·q download iter {iter}: {e}"))?;
+            let pq = s[0];
+            if !pq.is_finite() || pq == 0.0 {
+                return Err(format!(
+                    "pcg iter {iter}: p·q={pq} (non-finite or zero); operator is not positive-definite"
+                ));
+            }
+            let alpha = rho / pq;
+
+            // x += α p
+            unsafe {
+                stream
+                    .launch_builder(&f_axpy)
+                    .arg(&n_i32)
+                    .arg(&alpha)
+                    .arg(&d_p)
+                    .arg(&mut d_x)
+                    .launch(LaunchConfig {
+                        grid_dim: (vec_blocks, 1, 1),
+                        block_dim: (vec_threads, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+            }
+            .map_err(|e| format!("pcg x+=αp iter {iter}: {e}"))?;
+
+            // r -= α q
+            let neg_alpha = -alpha;
+            unsafe {
+                stream
+                    .launch_builder(&f_axpy)
+                    .arg(&n_i32)
+                    .arg(&neg_alpha)
+                    .arg(&d_q)
+                    .arg(&mut d_r)
+                    .launch(LaunchConfig {
+                        grid_dim: (vec_blocks, 1, 1),
+                        block_dim: (vec_threads, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+            }
+            .map_err(|e| format!("pcg r-=αq iter {iter}: {e}"))?;
+
+            // ‖r‖₂² = r·r (single device dot, single f64 DtoH)
+            unsafe {
+                stream
+                    .launch_builder(&f_dot)
+                    .arg(&n_i32)
+                    .arg(&d_r)
+                    .arg(&d_r)
+                    .arg(&mut d_scalar)
+                    .launch(LaunchConfig {
+                        grid_dim: (1, 1, 1),
+                        block_dim: (dot_threads, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+            }
+            .map_err(|e| format!("pcg ‖r‖₂² launch iter {iter}: {e}"))?;
+            stream
+                .synchronize()
+                .map_err(|e| format!("pcg ‖r‖₂² sync iter {iter}: {e}"))?;
+            let s = stream
+                .clone_dtoh(&d_scalar)
+                .map_err(|e| format!("pcg ‖r‖₂² download iter {iter}: {e}"))?;
+            let rr = s[0];
+            if !rr.is_finite() {
+                return Err(format!("pcg iter {iter}: ‖r‖₂²={rr} non-finite"));
+            }
+            let rel = rr.sqrt() / b_norm;
+            final_rel_residual = rel;
+            if rel <= input.rel_tol {
+                break;
+            }
+
+            // z = M⁻¹ r
+            unsafe {
+                stream
+                    .launch_builder(&f_precond)
+                    .arg(&n_i32)
+                    .arg(&input.precond_diag_floor)
+                    .arg(&d_diag)
+                    .arg(&d_r)
+                    .arg(&mut d_z)
+                    .launch(LaunchConfig {
+                        grid_dim: (vec_blocks, 1, 1),
+                        block_dim: (vec_threads, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+            }
+            .map_err(|e| format!("pcg z=M⁻¹r iter {iter}: {e}"))?;
+
+            // ρ_new = r·z
+            unsafe {
+                stream
+                    .launch_builder(&f_dot)
+                    .arg(&n_i32)
+                    .arg(&d_r)
+                    .arg(&d_z)
+                    .arg(&mut d_scalar)
+                    .launch(LaunchConfig {
+                        grid_dim: (1, 1, 1),
+                        block_dim: (dot_threads, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+            }
+            .map_err(|e| format!("pcg ρ_new launch iter {iter}: {e}"))?;
+            stream
+                .synchronize()
+                .map_err(|e| format!("pcg ρ_new sync iter {iter}: {e}"))?;
+            let s = stream
+                .clone_dtoh(&d_scalar)
+                .map_err(|e| format!("pcg ρ_new download iter {iter}: {e}"))?;
+            let rho_new = s[0];
+            if !rho_new.is_finite() {
+                return Err(format!("pcg iter {iter}: ρ_new={rho_new} non-finite"));
+            }
+            let beta_pcg = rho_new / rho;
+
+            // p = z + β p  ⇒  via pcg_axpby with a=1, b=β
+            unsafe {
+                stream
+                    .launch_builder(&f_axpby)
+                    .arg(&n_i32)
+                    .arg(&1.0_f64)
+                    .arg(&d_z)
+                    .arg(&beta_pcg)
+                    .arg(&mut d_p)
+                    .launch(LaunchConfig {
+                        grid_dim: (vec_blocks, 1, 1),
+                        block_dim: (vec_threads, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+            }
+            .map_err(|e| format!("pcg p=z+βp iter {iter}: {e}"))?;
+
+            rho = rho_new;
+        }
+
+        // Download x once at the end.
+        let x_host = stream
+            .clone_dtoh(&d_x)
+            .map_err(|e| format!("pcg final x DtoH: {e}"))?;
+        // The auxiliary device allocs (d_r/d_z/d_p/d_q/d_scalar/d_diag) drop
+        // here and return their bytes to cudarc's allocator.
+        drop(d_r);
+        drop(d_z);
+        drop(d_p);
+        drop(d_q);
+        drop(d_scalar);
+        drop(d_diag);
+        Ok(DeviceResidentPcgOutput {
+            x: x_host,
+            iterations: iters_taken,
+            final_rel_residual,
+        })
+    }
+}
+
+/// Device-resident PCG against the BMS-FLEX row-Hessian operator.
+///
+/// Block 9 Phase 5: every PCG vector — `x`, `r`, `z`, `p`, `q` — stays on
+/// the device for the entire loop; only the squared residual norm (one f64)
+/// is downloaded per iteration for the convergence check. Bit-equal output
+/// to a host-side reference PCG against the same operator + preconditioner
+/// when the tolerance is tight; differences only show up at the floating-
+/// point reduction-order level.
+///
+/// Linux-only. See [`DeviceResidentPcgInput`] for parameters.
+#[cfg(target_os = "linux")]
+pub fn run_pcg_against_row_hessian_device(
+    input: DeviceResidentPcgInput<'_>,
+) -> Result<DeviceResidentPcgOutput, String> {
+    pcg_device::run(input)
+}
+
 /// CPU fallback for the PIRLS-step GPU primitives.  When this build has no
 /// CUDA runtime probed, the GPU entry points must still return numerically
 /// correct results so that callers can route a single code path through
