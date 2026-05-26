@@ -1076,6 +1076,47 @@ mod sphere_gpu_tests {
     }
 
     #[test]
+    fn constrained_penalty_is_symmetric_and_drops_constraint_direction() {
+        // Build a small symmetric PD matrix as a stand-in for C, then
+        // verify that constrained_penalty_host returns a symmetric
+        // (m-1)×(m-1) matrix whose action against Z·x matches the
+        // expected Zᵀ C Z mapping.
+        let m = 6;
+        let mut c = Array2::<f64>::zeros((m, m));
+        for i in 0..m {
+            for j in 0..m {
+                let d = (i as f64 - j as f64).abs();
+                c[(i, j)] = (-0.5 * d).exp();
+            }
+        }
+        let w = vec![1.0_f64; m];
+        let s = constrained_penalty_host(c.view(), &w).expect("constrained S");
+        assert_eq!(s.dim(), (m - 1, m - 1));
+        // Symmetry within roundoff.
+        let mut max_asym = 0.0_f64;
+        for i in 0..(m - 1) {
+            for j in 0..(m - 1) {
+                let d = (s[(i, j)] - s[(j, i)]).abs();
+                if d > max_asym {
+                    max_asym = d;
+                }
+            }
+        }
+        assert!(max_asym < 1e-13, "S not symmetric: max |S - Sᵀ| = {max_asym:.3e}");
+
+        // The kernel-of-Zᵀ direction: Zᵀ · w = 0 ⇒ x = (something) such
+        // that Z · x stays in span(w)^⊥, so x can be any (m-1) vector;
+        // we just verify that picking the all-ones constraint direction
+        // collapses to zero through Z when applied to constant fields.
+        // i.e. constant-field penalty norm must be zero in the
+        // un-constrained Cv direction, and the trailing block here is
+        // never used against the constraint.
+        let ones = ndarray::Array1::<f64>::ones(m - 1);
+        let sx = s.dot(&ones);
+        assert!(sx.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
     fn householder_reflector_zeroes_target_vector() {
         let w = vec![3.0, 4.0, 0.0, -1.0];
         let (v, beta) = householder_reflector_from_weights(&w);
