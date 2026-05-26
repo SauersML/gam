@@ -677,12 +677,12 @@ impl CubicCellGpuBackend {
 }
 
 /// Test-only DtoH helpers for cubic-cell device residency parity tests.
-/// Lives in `mod test_support` — the ban scanner's explicit allow-list of
-/// test-friendly module names (alongside `mod tests`, `mod tests_*`,
-/// `mod *_tests`), so the no-consumer scanner sees this is intentional
-/// test scaffolding. The mod stays compiled in production (zero-cost: only
-/// reachable through a `cfg(test)` call site), so no `#[cfg(test)]` on the
-/// `mod` declaration itself.
+/// `#[cfg(test)]` on the `mod` declaration (with the `test_support` name
+/// the ban scanner's allow-list explicitly accepts) keeps every item inside
+/// invisible to production builds; the dead-pub scanner skips
+/// `#[cfg(test)]`-region defs, so the inner `pub(crate)` is sound even
+/// when the only consumers live in sibling `mod tests` blocks.
+#[cfg(test)]
 pub(crate) mod test_support {
     use super::CubicCellGpuBackend;
     use crate::gpu::error::GpuError;
