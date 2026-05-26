@@ -256,7 +256,14 @@ pub fn rademacher_entry(seed: u64, k: u64, i: u64) -> f64 {
 /// Host-side reference: fill a column-major `(p, K)` Rademacher matrix.
 /// Used by tests to verify the GPU kernel produces the same bits.
 pub fn fill_rademacher_host(seed: ProbeSeed, p: usize, k: usize, out: &mut [f64]) {
-    debug_assert_eq!(out.len(), p * k);
+    assert_eq!(
+        out.len(),
+        p * k,
+        "fill_rademacher_host: out buffer length {} != p*K = {}*{}",
+        out.len(),
+        p,
+        k
+    );
     for col in 0..k {
         for row in 0..p {
             out[col * p + row] = rademacher_entry(seed.0, col as u64, row as u64);
@@ -637,7 +644,11 @@ extern "C" __global__ void reduce_q_weighted_gram(
         if !dense_indices.is_empty() {
             for &j in &dense_indices {
                 let DerivativeHessian::Dense(matrix) = &input.derivatives[j] else {
-                    unreachable!("filtered above");
+                    panic!(
+                        "reml_trace dense path: derivative index {j} is in dense_indices but \
+                         input.derivatives[{j}] is not DerivativeHessian::Dense — \
+                         dense_indices partition invariant violated"
+                    );
                 };
                 let hj_col = to_col_major(matrix);
                 let hj_dev = pinned_htod(&ctx, &stream, &hj_col)
@@ -725,7 +736,11 @@ extern "C" __global__ void reduce_q_weighted_gram(
             for &j in &gram_indices {
                 let DerivativeHessian::WeightedGram { row_weights, .. } = &input.derivatives[j]
                 else {
-                    unreachable!("filtered above");
+                    panic!(
+                        "reml_trace structural path: derivative index {j} is in gram_indices \
+                         but input.derivatives[{j}] is not DerivativeHessian::WeightedGram — \
+                         gram_indices partition invariant violated"
+                    );
                 };
                 let slice = row_weights
                     .as_slice()
@@ -768,7 +783,12 @@ extern "C" __global__ void reduce_q_weighted_gram(
                 let DerivativeHessian::WeightedGram { penalty_extra, .. } =
                     &input.derivatives[j]
                 else {
-                    unreachable!("filtered above");
+                    panic!(
+                        "reml_trace structural penalty_extra: derivative index {j} is in \
+                         gram_indices but input.derivatives[{j}] is not \
+                         DerivativeHessian::WeightedGram — gram_indices partition invariant \
+                         violated"
+                    );
                 };
                 if let Some(pen) = penalty_extra {
                     let z_host = stream.clone_dtoh(&z_dev).map_err(|err| {
@@ -1032,7 +1052,14 @@ fn validate_inputs(input: &RemlTraceHutchinsonInput<'_>) -> Result<(), String> {
 /// the variance and divides by `sqrt(K)` so the returned value is the
 /// standard error of the mean.
 fn reduce_mean_stderr(q: &[f64], d: usize, k: usize) -> (Vec<f64>, Vec<f64>) {
-    debug_assert_eq!(q.len(), d * k);
+    assert_eq!(
+        q.len(),
+        d * k,
+        "reduce_mean_stderr: q buffer length {} != D*K = {}*{}",
+        q.len(),
+        d,
+        k
+    );
     let mut means = vec![0.0_f64; d];
     let mut stderrs = vec![0.0_f64; d];
     let inv_k = 1.0 / (k as f64);
