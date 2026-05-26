@@ -647,7 +647,13 @@ extern "C" __global__ void reduce_q_weighted_gram(
                     .map_err(|err| GpuError::DriverCallFailed {
                         reason: format!("reml_trace alloc Y_j (j={j}): {err}"),
                     })?;
-                gemm_nn(&blas, p, k, p, &hj_dev, &w_dev, &mut y_dev, p, p, p)?;
+                gemm_nn(
+                    &blas,
+                    GemmShape { m: p, n: k, k_inner: p, lda: p, ldb: p, ldc: p },
+                    &hj_dev,
+                    &w_dev,
+                    &mut y_dev,
+                )?;
                 let mut q_j_dev = stream
                     .alloc_zeros::<f64>(k)
                     .map_err(|err| GpuError::DriverCallFailed {
@@ -931,19 +937,23 @@ extern "C" __global__ void reduce_q_weighted_gram(
             })
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn gemm_nn(
-        blas: &CudaBlas,
+    struct GemmShape {
         m: usize,
         n: usize,
         k_inner: usize,
-        a: &cudarc::driver::CudaSlice<f64>,
-        b: &cudarc::driver::CudaSlice<f64>,
-        c: &mut cudarc::driver::CudaSlice<f64>,
         lda: usize,
         ldb: usize,
         ldc: usize,
+    }
+
+    fn gemm_nn(
+        blas: &CudaBlas,
+        shape: GemmShape,
+        a: &cudarc::driver::CudaSlice<f64>,
+        b: &cudarc::driver::CudaSlice<f64>,
+        c: &mut cudarc::driver::CudaSlice<f64>,
     ) -> Result<(), GpuError> {
+        let GemmShape { m, n, k_inner, lda, ldb, ldc } = shape;
         let cfg = GemmConfig::<f64> {
             transa: cublasOperation_t::CUBLAS_OP_N,
             transb: cublasOperation_t::CUBLAS_OP_N,

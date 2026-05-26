@@ -521,7 +521,7 @@ class IBPAssignmentPenalty(_RustPenaltyModule):
         )
 
 
-class IvaeRidgeMeanGauge(nn.Module):
+class IvaeRidgeMeanGauge(_RustPenaltyModule):
     """iVAE conditional-mean ridge gauge on latent coordinates."""
 
     def __init__(self, aux: Any, weight: float, n_eff: int | None = None, ridge_eps: float = 1e-6, *, target: str = "t", learnable: bool = False) -> None:
@@ -538,9 +538,11 @@ class IvaeRidgeMeanGauge(nn.Module):
         if self.learnable:
             self.log_weight = nn.Parameter(torch.zeros(1))
 
-    def forward(self, latent: torch.Tensor, basis: torch.Tensor | None = None) -> torch.Tensor:
+    def _prepare(
+        self, primary: torch.Tensor, basis: torch.Tensor | None = None
+    ) -> _PenaltyCall:
         del basis
-        latent = _check_matrix(latent, "latent")
+        latent = _check_matrix(primary, "latent")
         aux = self.aux.to(device=latent.device, dtype=latent.dtype)
         descriptor = {
             "kind": "ivae_ridge_mean_gauge",
@@ -553,11 +555,15 @@ class IvaeRidgeMeanGauge(nn.Module):
             "learnable": self.learnable,
         }
         rho = _rho_tensor(getattr(self, "log_weight", None), latent, 1 if self.learnable else 0)
-        apply = cast(Callable[..., torch.Tensor], _RustPenaltyFn.apply)
-        return apply(latent, rho, _latent_json(latent.shape[0], latent.shape[1], name=self.target), _penalty_json(descriptor))
+        return _PenaltyCall(
+            target=latent,
+            rho=rho,
+            latents_json=_latent_json(latent.shape[0], latent.shape[1], name=self.target),
+            penalties_json=_penalty_json(descriptor),
+        )
 
 
-class JumpReLUPenalty(nn.Module):
+class JumpReLUPenalty(_RustPenaltyModule):
     """JumpReLU SAE prior with hard-threshold gating + straight-through estimator.
 
     Forward: ``φ(z) = z · 1[z > τ]`` per latent axis with per-axis learnable
