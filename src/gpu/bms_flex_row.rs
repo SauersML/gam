@@ -3107,4 +3107,190 @@ mod tests {
             }
         }
     }
+
+    /// Block 9 Phase 2 parity gate at the shape specified by the
+    /// charter task: `n = 64`, `r = 20`, `p_total = 44`. Splits
+    /// `p_total` as `p_m = 14`, `p_g = 12`, `p_h = 10`, `p_w = 8` so
+    /// `r = 2 + p_h + p_w = 20` and every primary block participates
+    /// in both the device pullback and the reduce pass. Tolerance is
+    /// `|Δ| ≤ 1e-8` per the task description (looser than the 1e-10
+    /// hand-fixture parity, since accumulation order across HVP CTAs
+    /// differs from the CPU oracle's row-major sum even with the
+    /// deterministic reduction policy).
+    ///
+    /// Skips cleanly on non-Linux and no-CUDA hosts using the same
+    /// convention as the hand-fixture parity above.
+    #[test]
+    fn bms_flex_row_hvp_kernel_matches_cpu_oracle_at_n64_r20_p44() {
+        #[cfg(not(target_os = "linux"))]
+        {
+            eprintln!(
+                "[bms_flex_row hvp parity n64_r20_p44] non-Linux host — \
+                 skipping CUDA parity"
+            );
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let Some(_runtime) = crate::gpu::runtime::GpuRuntime::global() else {
+                eprintln!(
+                    "[bms_flex_row hvp parity n64_r20_p44] no CUDA runtime — \
+                     skipping device parity"
+                );
+                return;
+            };
+            let n = 64_usize;
+            let p_m = 14_usize;
+            let p_g = 12_usize;
+            let p_h_dim = 10_usize;
+            let p_w_dim = 8_usize;
+            let r = 2 + p_h_dim + p_w_dim;
+            assert_eq!(r, 20);
+            let p_total = p_m + p_g + p_h_dim + p_w_dim;
+            assert_eq!(p_total, 44);
+            let block = BmsFlexBlockLayout {
+                p_m,
+                p_g,
+                h: Some(p_m + p_g..p_m + p_g + p_h_dim),
+                w: Some(p_m + p_g + p_h_dim..p_m + p_g + p_h_dim + p_w_dim),
+                p_total,
+            };
+            let primary = BmsFlexPrimaryLayout {
+                h: Some(2..2 + p_h_dim),
+                w: Some(2 + p_h_dim..2 + p_h_dim + p_w_dim),
+                r,
+            };
+
+            // Deterministic symmetric per-row Hessians + designs +
+            // direction. Same scrambling family as
+            // `row_hessian_ops::tests::make_fixture` so any regression
+            // surfaces consistently across the host-pinned and
+            // device-resident parity tests.
+            let mut row_hessians = vec![0.0_f64; n * r * r];
+            for row in 0..n {
+                let base = row * r * r;
+                for u in 0..r {
+                    for v in 0..r {
+                        let seed = (row as f64) * 0.137
+                            + (u as f64) * 1.901
+                            + (v as f64) * 0.317;
+                        let a = (seed.sin() * 1.7 + (seed * 0.5).cos() * 0.9) * 0.5;
+                        row_hessians[base + u * r + v] = a;
+                    }
+                }
+                for u in 0..r {
+                    for v in (u + 1)..r {
+                        let upper = row_hessians[base + u * r + v];
+                        let lower = row_hessians[base + v * r + u];
+                        let sym = 0.5 * (upper + lower);
+                        row_hessians[base + u * r + v] = sym;
+                        row_hessians[base + v * r + u] = sym;
+                    }
+                    row_hessians[base + u * r + u] += r as f64;
+                }
+            }
+            let mut marginal = vec![0.0_f64; n * p_m];
+            for row in 0..n {
+                for j in 0..p_m {
+                    let seed = (row as f64) * 0.073 + (j as f64) * 0.211 + 0.4;
+                    marginal[row * p_m + j] = seed.sin() * 0.8 - (seed * 0.7).cos() * 0.3;
+                }
+            }
+            let mut logslope = vec![0.0_f64; n * p_g];
+            for row in 0..n {
+                for j in 0..p_g {
+                    let seed = (row as f64) * 0.091 + (j as f64) * 0.179 - 0.2;
+                    logslope[row * p_g + j] = seed.cos() * 0.7 + (seed * 0.3).sin() * 0.25;
+                }
+            }
+            let v: Vec<f64> = (0..p_total)
+                .map(|i| {
+                    let seed = (i as f64) * 0.157 + 0.6;
+                    seed.sin() * 0.55 + (seed * 0.4).cos() * 0.35
+                })
+                .collect();
+
+            let cpu_hvp = cpu_oracle_bms_flex_row_hvp(
+                &row_hessians, &marginal, &logslope, &block, &primary, n, &v,
+            );
+            let cpu_diag = cpu_oracle_bms_flex_row_diagonal(
+                &row_hessians, &marginal, &logslope, &block, &primary, n,
+            );
+
+            let backend = match HvpKernelBackend::probe() {
+                Ok(b) => b,
+                Err(err) => {
+                    eprintln!(
+                        "[bms_flex_row hvp parity n64_r20_p44] backend probe \
+                         failed: {err}"
+                    );
+                    return;
+                }
+            };
+            let stream = backend.stream.clone();
+            let d_h = match stream.clone_htod(&row_hessians) {
+                Ok(s) => s,
+                Err(err) => {
+                    eprintln!(
+                        "[bms_flex_row hvp parity n64_r20_p44] upload h \
+                         failed: {err}"
+                    );
+                    return;
+                }
+            };
+            let d_m = match stream.clone_htod(&marginal) {
+                Ok(s) => s,
+                Err(err) => {
+                    eprintln!(
+                        "[bms_flex_row hvp parity n64_r20_p44] upload marg \
+                         failed: {err}"
+                    );
+                    return;
+                }
+            };
+            let d_g = match stream.clone_htod(&logslope) {
+                Ok(s) => s,
+                Err(err) => {
+                    eprintln!(
+                        "[bms_flex_row hvp parity n64_r20_p44] upload logslope \
+                         failed: {err}"
+                    );
+                    return;
+                }
+            };
+            let storage = DeviceResidentRowHess {
+                ctx: backend.ctx.clone(),
+                stream: stream.clone(),
+                hess: d_h,
+                marginal_design: d_m,
+                logslope_design: d_g,
+                n,
+                r,
+                block: block.clone(),
+                primary: primary.clone(),
+                bytes: ((n * r * r + n * p_m + n * p_g) * std::mem::size_of::<f64>()) as u64,
+            };
+            let gpu_hvp = launch_bms_flex_row_hvp(&storage, &v)
+                .expect("HVP kernel must launch on CUDA host at n64/r20/p44");
+            let gpu_diag = launch_bms_flex_row_diagonal(&storage)
+                .expect("diagonal kernel must launch on CUDA host at n64/r20/p44");
+            assert_eq!(gpu_hvp.len(), cpu_hvp.len());
+            assert_eq!(gpu_diag.len(), cpu_diag.len());
+            for i in 0..p_total {
+                let diff = (cpu_hvp[i] - gpu_hvp[i]).abs();
+                assert!(
+                    diff <= 1e-8,
+                    "n64_r20_p44 HVP[{i}]: cpu={} gpu={} |Δ|={diff:.3e}",
+                    cpu_hvp[i],
+                    gpu_hvp[i]
+                );
+                let ddiff = (cpu_diag[i] - gpu_diag[i]).abs();
+                assert!(
+                    ddiff <= 1e-8,
+                    "n64_r20_p44 diag[{i}]: cpu={} gpu={} |Δ|={ddiff:.3e}",
+                    cpu_diag[i],
+                    gpu_diag[i]
+                );
+            }
+        }
+    }
 }
