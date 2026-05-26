@@ -1328,9 +1328,9 @@ pub fn solve_penalised_ls_device(
 
 #[cfg(not(target_os = "linux"))]
 pub fn solve_penalised_ls_device(
-    _x_s_device: &DeviceS2KernelMatrix,
-    _wy: &[f64],
-    _r_s: ArrayView2<'_, f64>,
+    _: &DeviceS2KernelMatrix,
+    _: &[f64],
+    _: ArrayView2<'_, f64>,
 ) -> Result<PenalisedLsSolution, GpuError> {
     Err(GpuError::DriverLibraryUnavailable {
         reason: "sphere GPU cuSOLVER QR path is Linux-only".to_string(),
