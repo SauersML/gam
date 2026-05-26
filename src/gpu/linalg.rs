@@ -38,6 +38,11 @@ pub enum DispatchOp {
     },
     /// Dense Cholesky factorization.
     Potrf { p: usize, batch: usize },
+    /// Batched small-dense Cholesky factorization where each block has the
+    /// same small width `p` (≲ 32) but the batch is large. Routed through
+    /// `cusolverDnDpotrfBatched` and kept device-resident for downstream
+    /// triangular solves (Arrow-Schur, Stage-3 PIRLS).
+    SmallDenseBatchedPotrf { p: usize, batch: usize },
     /// Triangular matrix solve.
     Trsm { m: usize, n: usize },
     /// Matrix-vector (or matrix · single-column) product.
