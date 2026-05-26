@@ -4950,12 +4950,12 @@ fn log_exact_work(n: usize) -> bool {
 fn runtime_available_memory_bytes() -> u64 {
     static SYSTEM: OnceLock<Mutex<sysinfo::System>> = OnceLock::new();
     let lock = SYSTEM.get_or_init(|| {
-        let kind = sysinfo::MemoryRefreshKind::nothing().with_ram();
-        let refresh = sysinfo::RefreshKind::nothing().with_memory(kind);
+        let refresh = sysinfo::RefreshKind::new()
+            .with_memory(sysinfo::MemoryRefreshKind::everything());
         Mutex::new(sysinfo::System::new_with_specifics(refresh))
     });
     let mut system = lock.lock().expect("sysinfo system mutex poisoned");
-    system.refresh_memory_specifics(sysinfo::MemoryRefreshKind::nothing().with_ram());
+    system.refresh_memory_specifics(sysinfo::MemoryRefreshKind::everything());
     system.available_memory()
 }
 
