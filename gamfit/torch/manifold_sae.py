@@ -645,6 +645,8 @@ class ManifoldSAE(nn.Module):
                 f"got input dtype {x.dtype}. Cast the input or build the config "
                 f"with the matching `dtype=` to avoid silent autograd promotion."
             )
+        if self._last_fit is not None:
+            return self._forward_from_closed_form(x)
         F = int(self.cfg.n_atoms)
         raw_positions, amp_logits = self._encode(x)
         raw_with_anchor = raw_positions + self.atom_raw_anchor.unsqueeze(0)
@@ -662,12 +664,7 @@ class ManifoldSAE(nn.Module):
         per_atom_recon = torch.einsum("nfk,fkd->nfd", curves, self.decoder_blocks)
         x_hat = (z.unsqueeze(-1) * per_atom_recon).sum(dim=1)
 
-        if self._last_fit is not None:
-            reml_score = torch.tensor(
-                float(self._last_fit.reml_score), dtype=x.dtype, device=x.device
-            )
-        else:
-            reml_score = torch.tensor(float("nan"), dtype=x.dtype, device=x.device)
+        reml_score = torch.tensor(float("nan"), dtype=x.dtype, device=x.device)
         lambdas = torch.exp(self.log_lambda).to(dtype=x.dtype, device=x.device)
 
         return ManifoldSAEOutput(
@@ -677,6 +674,61 @@ class ManifoldSAE(nn.Module):
             amplitudes=amp,
             curves=curves,
             gate=gate_pre,
+            assignments=assignments,
+            reml_score=reml_score,
+            lambdas=lambdas,
+        )
+
+    def _forward_from_closed_form(self, x: torch.Tensor) -> ManifoldSAEOutput:
+        # When .fit() has been called, the closed-form Rust solve is the source
+        # of truth: forward must reproduce fit.fitted exactly for in-sample x.
+        # The random encoder/anchors play no role because the closed-form solver
+        # does not produce an encoder to copy back into module parameters.
+        fit = self._last_fit
+        assert fit is not None
+        F = int(self.cfg.n_atoms)
+        d = int(self.cfg.intrinsic_rank)
+        x_np = x.detach().cpu().numpy()
+        is_in_sample = (
+            fit.training_data.shape == x_np.shape
+            and np.allclose(x_np, fit.training_data)
+        )
+        if not is_in_sample:
+            raise NotImplementedError(
+                "ManifoldSAE.forward(x) after .fit() requires x to be the same "
+                "data .fit() was called on; for out-of-sample reconstruction "
+                "call fit.reconstruct(x) / fit.predict(x) on the returned fit."
+            )
+        fitted_np = np.asarray(fit.fitted, dtype=np.float64)
+        assignments_np = np.asarray(fit.assignments, dtype=np.float64)
+        coords_per_atom = [np.asarray(c, dtype=np.float64) for c in fit.coords[:F]]
+        positions_np = np.stack(
+            [c.reshape(c.shape[0], d) for c in coords_per_atom], axis=1
+        )
+        x_hat = torch.as_tensor(fitted_np, dtype=x.dtype, device=x.device)
+        assignments = torch.as_tensor(
+            assignments_np, dtype=x.dtype, device=x.device
+        )
+        positions = torch.as_tensor(positions_np, dtype=x.dtype, device=x.device)
+        curves = _eval_basis_on_manifold(
+            positions,
+            self.cfg,
+            self.duchon_centers if self.cfg.atom_basis == "duchon" else None,
+        )
+        amp = torch.ones_like(assignments)
+        z = assignments
+        gate = assignments
+        reml_score = torch.tensor(
+            float(fit.reml_score), dtype=x.dtype, device=x.device
+        )
+        lambdas = torch.exp(self.log_lambda).to(dtype=x.dtype, device=x.device)
+        return ManifoldSAEOutput(
+            z=z,
+            x_hat=x_hat,
+            positions=positions,
+            amplitudes=amp,
+            curves=curves,
+            gate=gate,
             assignments=assignments,
             reml_score=reml_score,
             lambdas=lambdas,
