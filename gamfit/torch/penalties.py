@@ -628,14 +628,16 @@ class JumpReLUPenalty(_RustPenaltyModule):
         tau = self.effective_thresholds(z.dtype).to(z.device)
         return _JumpReLUSTEFn.apply(z, tau, float(self.smoothing_eps))
 
-    def forward(self, latent: torch.Tensor, basis: torch.Tensor | None = None) -> torch.Tensor:
+    def _prepare(
+        self, primary: torch.Tensor, basis: torch.Tensor | None = None
+    ) -> _PenaltyCall:
         """Penalty value: ``weight · Σ τ · σ((z − τ)/ε)`` (smoothed L0).
 
-        Matches the Rust `JumpReLUPenalty::value` analytic formulation so
+        Matches the Rust ``JumpReLUPenalty::value`` analytic formulation so
         outer-loop REML can compose this term with other gam penalties.
         """
         del basis
-        latent = _check_matrix(latent, "latent")
+        latent = _check_matrix(primary, "latent")
         descriptor = {
             "kind": "jumprelu",
             "target": self.target,
@@ -644,12 +646,11 @@ class JumpReLUPenalty(_RustPenaltyModule):
             "smoothing_eps": self.smoothing_eps,
         }
         rho = self.log_threshold.to(device=latent.device, dtype=latent.dtype)
-        apply = cast(Callable[..., torch.Tensor], _RustPenaltyFn.apply)
-        return apply(
-            latent,
-            rho,
-            _latent_json(latent.shape[0], latent.shape[1], name=self.target),
-            _penalty_json(descriptor),
+        return _PenaltyCall(
+            target=latent,
+            rho=rho,
+            latents_json=_latent_json(latent.shape[0], latent.shape[1], name=self.target),
+            penalties_json=_penalty_json(descriptor),
         )
 
 
