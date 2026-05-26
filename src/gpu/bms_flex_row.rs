@@ -89,7 +89,7 @@ use super::error::GpuError;
 use std::sync::Arc;
 
 #[cfg(target_os = "linux")]
-use cudarc::driver::{CudaContext, CudaModule, CudaStream, LaunchConfig, PushKernelArg};
+use cudarc::driver::{CudaModule, CudaStream, LaunchConfig, PushKernelArg};
 
 /// Hard ceiling on `r` (= 2 + p_h + p_w). Matches the shared-memory budget
 /// argument in the module docstring: with `MAX_R = 32` the per-block shared
@@ -804,7 +804,6 @@ pub(crate) fn s_f_diagnostic_finite(inputs: &BmsFlexRowKernelInputs<'_>) -> bool
 
 #[cfg(target_os = "linux")]
 struct RowKernelBackend {
-    ctx: Arc<CudaContext>,
     stream: Arc<CudaStream>,
     module: Arc<CudaModule>,
 }
@@ -836,22 +835,14 @@ impl RowKernelBackend {
                 let module = ctx.load_module(ptx).map_err(|err| GpuError::DriverCallFailed {
                     reason: format!("bms_flex_row module load failed: {err}"),
                 })?;
-                Ok(RowKernelBackend { ctx, stream, module })
+                // `ctx` is intentionally dropped here: both `stream` and
+                // `module` hold their own `Arc<CudaContext>` clones internally
+                // (via cudarc's `CudaStream::ctx()` / `CudaModule::ctx()`
+                // accessors), so the context outlives the local binding.
+                Ok(RowKernelBackend { stream, module })
             })
             .as_ref()
             .map_err(GpuError::clone)
-    }
-}
-
-// Suppress the dead-field warning for the cached CudaContext on Linux: the
-// context is held to keep the stream + module alive even though we dispatch
-// through `stream` directly. Touching it via an inline accessor keeps the
-// build.rs banned-pattern scanner happy without `let _` or `allow(dead_code)`.
-#[cfg(target_os = "linux")]
-impl RowKernelBackend {
-    #[inline]
-    fn ctx_is_set(&self) -> bool {
-        Arc::strong_count(&self.ctx) >= 1
     }
 }
 
@@ -889,11 +880,6 @@ fn launch_linux(
     inputs: BmsFlexRowKernelInputs<'_>,
 ) -> Result<BmsFlexRowKernelOutputs, GpuError> {
     let backend = RowKernelBackend::probe()?;
-    if !backend.ctx_is_set() {
-        return Err(GpuError::DriverCallFailed {
-            reason: "bms_flex_row: cached CUDA context dropped unexpectedly".to_string(),
-        });
-    }
     let stream = &backend.stream;
 
     let upload_f64 = |slice: &[f64], label: &str| {
