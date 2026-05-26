@@ -444,10 +444,10 @@ mod tests {
         for i in 0..n {
             time[[i, 0]] = 1.0;
             time[[i, 1]] = x[i];
-            time[[i, 2]] = 2.0 * x[i];
+            time[[i, 2]] = x[i] * x[i] * x[i];
             marginal[[i, 0]] = 1.0;
             marginal[[i, 1]] = x[i] * x[i];
-            marginal[[i, 2]] = 2.0 * x[i] * x[i];
+            marginal[[i, 2]] = x[i].sin();
             logslope[[i, 0]] = 1.0;
             logslope[[i, 1]] = (3.0 * x[i]).sin();
             logslope[[i, 2]] = (6.0 * x[i]).sin();
