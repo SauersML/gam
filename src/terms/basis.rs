@@ -16099,7 +16099,7 @@ fn spherical_chord_distance2(a: ArrayView1<'_, f64>, b: ArrayView1<'_, f64>, rad
     2.0 * (1.0 - cos_gamma.clamp(-1.0, 1.0))
 }
 
-fn select_spherical_farthest_point_centers(
+pub fn select_spherical_farthest_point_centers(
     data: ArrayView2<'_, f64>,
     num_centers: usize,
     radians: bool,

@@ -353,7 +353,7 @@ class ARDPenalty(_RustPenaltyModule):
         )
 
 
-class BlockOrthogonalityPenalty(nn.Module):
+class BlockOrthogonalityPenalty(_RustPenaltyModule):
     """Between-block orthogonality over latent-axis groups."""
 
     def __init__(self, groups: Sequence[Sequence[int]], weight: float, n_eff: int | None = None, *, target: str = "t", learnable: bool = False) -> None:
@@ -366,9 +366,11 @@ class BlockOrthogonalityPenalty(nn.Module):
         if self.learnable:
             self.log_weight = nn.Parameter(torch.zeros(1))
 
-    def forward(self, latent: torch.Tensor, basis: torch.Tensor | None = None) -> torch.Tensor:
+    def _prepare(
+        self, primary: torch.Tensor, basis: torch.Tensor | None = None
+    ) -> _PenaltyCall:
         del basis
-        latent = _check_matrix(latent, "latent")
+        latent = _check_matrix(primary, "latent")
         descriptor = {
             "kind": "block_orthogonality",
             "target": self.target,
@@ -378,11 +380,15 @@ class BlockOrthogonalityPenalty(nn.Module):
             "learnable": self.learnable,
         }
         rho = _rho_tensor(getattr(self, "log_weight", None), latent, 1 if self.learnable else 0)
-        apply = cast(Callable[..., torch.Tensor], _RustPenaltyFn.apply)
-        return apply(latent, rho, _latent_json(latent.shape[0], latent.shape[1], name=self.target), _penalty_json(descriptor))
+        return _PenaltyCall(
+            target=latent,
+            rho=rho,
+            latents_json=_latent_json(latent.shape[0], latent.shape[1], name=self.target),
+            penalties_json=_penalty_json(descriptor),
+        )
 
 
-class MonotonicityPenalty(nn.Module):
+class MonotonicityPenalty(_RustPenaltyModule):
     """Soft monotonicity penalty along the leading axis of a latent block.
 
     Routes through the Rust ``monotonicity`` analytic-penalty descriptor.
@@ -416,9 +422,11 @@ class MonotonicityPenalty(nn.Module):
         if self.learnable:
             self.log_weight = nn.Parameter(torch.zeros(1))
 
-    def forward(self, latent: torch.Tensor, basis: torch.Tensor | None = None) -> torch.Tensor:
+    def _prepare(
+        self, primary: torch.Tensor, basis: torch.Tensor | None = None
+    ) -> _PenaltyCall:
         del basis
-        latent = _check_matrix(latent, "latent")
+        latent = _check_matrix(primary, "latent")
         descriptor = {
             "kind": "monotonicity",
             "target": self.target,
@@ -429,12 +437,11 @@ class MonotonicityPenalty(nn.Module):
             "learnable": self.learnable,
         }
         rho = _rho_tensor(getattr(self, "log_weight", None), latent, 1 if self.learnable else 0)
-        apply = cast(Callable[..., torch.Tensor], _RustPenaltyFn.apply)
-        return apply(
-            latent,
-            rho,
-            _latent_json(latent.shape[0], latent.shape[1], name=self.target),
-            _penalty_json(descriptor),
+        return _PenaltyCall(
+            target=latent,
+            rho=rho,
+            latents_json=_latent_json(latent.shape[0], latent.shape[1], name=self.target),
+            penalties_json=_penalty_json(descriptor),
         )
 
 
