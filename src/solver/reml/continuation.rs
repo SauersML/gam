@@ -886,6 +886,176 @@ mod tests {
         }
     }
 
+    // ─────────────────────────────────────────────────────────────────
+    //  RED tests for issue #236:
+    //  https://github.com/SauersML/gam/issues/236
+    //
+    //  Standard REML publishes a non-empty `inner_beta_hint` from every
+    //  eval (see src/solver/estimate.rs:3275). Continuation forwards
+    //  that hint into `seed_inner_state` at the next step. When the
+    //  objective is a `ClosureObjective` without `with_seed_inner_state`
+    //  (which is exactly how `build_objective` wires the standard REML
+    //  closure at src/solver/estimate.rs:3202), the seed call returns
+    //  Invalid input fatally — the pre-warm fails before the first
+    //  real solver step, rejecting every seed and pinning
+    //  `solver_started=0`.
+    //
+    //  The contract this should satisfy is: an objective that publishes
+    //  a hint MUST be able to consume that hint via `seed_inner_state`,
+    //  *or* the continuation/pre-warm wiring must not forward a hint
+    //  the objective cannot accept. Either way, this scenario must not
+    //  abort the seed.
+    // ─────────────────────────────────────────────────────────────────
+
+    use crate::solver::outer_strategy::ClosureObjective;
+    use std::cell::Cell;
+
+    #[test]
+    fn closure_objective_publishing_inner_beta_hint_without_seed_hook_is_acceptable() {
+        // ClosureObjective wired exactly like the standard REML closure:
+        //   - eval_with_order returns inner_beta_hint = Some(non-empty β)
+        //   - no with_seed_inner_state(...) installed
+        // continuation walks ρ from oversmoothed rho_zero to target, so
+        // step 2 forwards the published hint into seed_inner_state.
+        // Today that path raises Invalid input and prime_outer_seed
+        // returns Err — but it should not.
+        let target = Array1::from_vec(vec![0.0]);
+        let upper = Array1::from_vec(vec![10.0]);
+        let obj = ClosureObjective {
+            state: (),
+            cap: crate::solver::outer_strategy::OuterCapability {
+                gradient: crate::solver::outer_strategy::Derivative::Analytic,
+                hessian: crate::solver::outer_strategy::DeclaredHessianForm::Unavailable,
+                n_params: 1,
+                psi_dim: 0,
+                fixed_point_available: false,
+                barrier_config: None,
+                prefer_gradient_only: false,
+                disable_fixed_point: false,
+            },
+            cost_fn: |_: &mut (), rho: &Array1<f64>| Ok(rho.dot(rho)),
+            eval_fn: move |_: &mut (), rho: &Array1<f64>| {
+                eval_calls_for_closure.set(eval_calls_for_closure.get() + 1);
+                Ok(OuterEval {
+                    cost: rho.dot(rho),
+                    gradient: Array1::zeros(1),
+                    hessian: HessianResult::Unavailable,
+                    inner_beta_hint: Some(Array1::from_vec(vec![0.1, 0.2, 0.3, 0.4])),
+                })
+            },
+            eval_order_fn: None::<
+                fn(
+                    &mut (),
+                    &Array1<f64>,
+                    crate::solver::outer_strategy::OuterEvalOrder,
+                ) -> Result<OuterEval, EstimationError>,
+            >,
+            reset_fn: None::<fn(&mut ())>,
+            efs_fn: None::<
+                fn(
+                    &mut (),
+                    &Array1<f64>,
+                ) -> Result<
+                    crate::solver::outer_strategy::EfsEval,
+                    EstimationError,
+                >,
+            >,
+            screening_proxy_fn: None::<
+                fn(&mut (), &Array1<f64>) -> Result<f64, EstimationError>,
+            >,
+            seed_fn: None::<
+                fn(&mut (), &Array1<f64>) -> Result<(), EstimationError>,
+            >,
+        };
+
+        // No `.with_seed_inner_state(...)` — mirrors standard REML's
+        // build_objective wiring at src/solver/estimate.rs:3202.
+        let mut obj = obj;
+        let result = prime_outer_seed(&mut obj, &target, &upper);
+
+        assert!(
+            result.is_ok(),
+            "prime_outer_seed must not reject a seed just because the \
+             objective publishes inner_beta_hint without installing a \
+             seed hook (issue #236). got: {:?}",
+            result.err().map(|e| e.message().to_string()),
+        );
+        let _ = n_params;
+        let _ = eval_calls.get();
+    }
+
+    #[test]
+    fn pre_warm_does_not_forward_hint_into_objective_lacking_seed_hook() {
+        // A weaker, more targeted check: the continuation layer must
+        // not blindly forward `inner_beta_hint` to an objective that
+        // would reject it. Today the error message
+        //   "cached inner beta has length N, but this objective does
+        //    not expose an inner-state seeding hook"
+        // is surfaced verbatim through `prime_outer_seed`. Pin that
+        // this message no longer reaches users (issue #236).
+        let target = Array1::from_vec(vec![0.0]);
+        let upper = Array1::from_vec(vec![10.0]);
+
+        let obj = ClosureObjective {
+            state: (),
+            cap: crate::solver::outer_strategy::OuterCapability {
+                gradient: crate::solver::outer_strategy::Derivative::Analytic,
+                hessian: crate::solver::outer_strategy::DeclaredHessianForm::Unavailable,
+                n_params: 1,
+                psi_dim: 0,
+                fixed_point_available: false,
+                barrier_config: None,
+                prefer_gradient_only: false,
+                disable_fixed_point: false,
+            },
+            cost_fn: |_: &mut (), rho: &Array1<f64>| Ok(rho.dot(rho)),
+            eval_fn: |_: &mut (), rho: &Array1<f64>| {
+                Ok(OuterEval {
+                    cost: rho.dot(rho),
+                    gradient: Array1::zeros(1),
+                    hessian: HessianResult::Unavailable,
+                    inner_beta_hint: Some(Array1::from_vec(vec![1.0, 2.0])),
+                })
+            },
+            eval_order_fn: None::<
+                fn(
+                    &mut (),
+                    &Array1<f64>,
+                    crate::solver::outer_strategy::OuterEvalOrder,
+                ) -> Result<OuterEval, EstimationError>,
+            >,
+            reset_fn: None::<fn(&mut ())>,
+            efs_fn: None::<
+                fn(
+                    &mut (),
+                    &Array1<f64>,
+                ) -> Result<
+                    crate::solver::outer_strategy::EfsEval,
+                    EstimationError,
+                >,
+            >,
+            screening_proxy_fn: None::<
+                fn(&mut (), &Array1<f64>) -> Result<f64, EstimationError>,
+            >,
+            seed_fn: None::<
+                fn(&mut (), &Array1<f64>) -> Result<(), EstimationError>,
+            >,
+        };
+
+        let mut obj = obj;
+        match prime_outer_seed(&mut obj, &target, &upper) {
+            Ok(_) => {}
+            Err(cf) => {
+                let msg = cf.message();
+                assert!(
+                    !msg.contains("does not expose an inner-state seeding hook"),
+                    "pre-warm leaked the seed-hook rejection to the outer \
+                     loop (issue #236). msg='{msg}'"
+                );
+            }
+        }
+    }
+
     #[test]
     fn pre_warm_failure_carries_underlying_message_for_seed_rejection() {
         // The outer wiring in run_outer_with_plan formats

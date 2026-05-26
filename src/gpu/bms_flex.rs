@@ -314,7 +314,7 @@ impl BmsFlexGpuBackend {
             block_dim: (1, 1, 1),
             shared_mem_bytes: 0,
         };
-        let builder = self.inner.stream.launch_builder(&func);
+        let mut builder = self.inner.stream.launch_builder(&func);
         // SAFETY: probe kernel takes no arguments and does no memory
         // access, so launch parameters and lack of args are trivially
         // valid for any device.
