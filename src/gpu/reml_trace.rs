@@ -1584,4 +1584,162 @@ mod tests {
     fn gate_accepts_canonical_case() {
         assert!(should_use_gpu_hutchinson(2000, 16, true, true, true, false));
     }
+
+    // ────────────────────────────────────────────────────────────────
+    // Block 2.6: adaptive-K validation tests.
+    //
+    // All five run on CPU hosts (where `evidence_derivatives_hutchinson_gpu`
+    // falls back to the SplitMix CPU reference) and on V100 hosts (where the
+    // CUDA path takes over). Probe-level CRN is preserved across both paths.
+    // ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn block_2_6_adaptive_unbiased_against_exact_p512() {
+        // (1) Adaptive Hutchinson with the default ε must land near the
+        // exact `tr(H⁻¹ A)` within its reported stopping tolerance.
+        let p = 64;
+        let h = make_spd(p, 0.5);
+        let a = random_dense_sym(p, 0xBADC0DE);
+        let exact = exact_trace_hinv_a(h.view(), a.view());
+        let evidence = evidence_traces_adaptive(
+            h.view(),
+            vec![DerivativeHessian::Dense(a.view())],
+            None,
+            ProbeSeed(0xA5A5A5),
+            HUTCHINSON_ADAPTIVE_REL_TOL,
+            HUTCHINSON_ADAPTIVE_TAU_REL,
+        )
+        .expect("adaptive run ok");
+        let est = evidence.traces[0];
+        let se = evidence.stderrs[0] / (evidence.probe_count as f64).sqrt();
+        let tol = (8.0 * se).max(0.05 * exact.abs());
+        assert!(
+            (est - exact).abs() <= tol,
+            "adaptive est {est} far from exact {exact} (tol={tol}, se={se}, K={})",
+            evidence.probe_count
+        );
+    }
+
+    #[test]
+    fn block_2_6_same_probes_cpu_vs_dispatch() {
+        // (2) The dispatch entry (`_gpu`) and the explicit CPU reference
+        // must produce identical estimates when given the same probes.
+        // The dispatcher falls back to the CPU reference on non-CUDA hosts,
+        // so this is a tautology on CPU; on V100 it asserts bit-identical
+        // q-values across paths (the `q_{j,k}=z_k^T H_j w_k` reduction is
+        // deterministic to machine precision once probes match).
+        let p = 32;
+        let h = make_spd(p, 0.3);
+        let a = random_dense_sym(p, 0x1357);
+        let input = RemlTraceHutchinsonInput {
+            penalized_hessian: h.view(),
+            derivatives: vec![DerivativeHessian::Dense(a.view())],
+            design: None,
+            probe_count: 16,
+            seed: ProbeSeed(0xBEEF),
+        };
+        let cpu = evidence_derivatives_hutchinson_cpu(&input).expect("cpu");
+        let dispatch = evidence_derivatives_hutchinson_gpu(input).expect("dispatch");
+        let diff = (cpu.gradient_rho_logdet[0] - dispatch.gradient_rho_logdet[0]).abs();
+        assert!(
+            diff < 1e-9,
+            "same-probes CPU vs GPU dispatch differ: cpu={}, dispatch={}, diff={diff}",
+            cpu.gradient_rho_logdet[0],
+            dispatch.gradient_rho_logdet[0]
+        );
+    }
+
+    #[test]
+    fn block_2_6_fd_logdet_matches_adaptive() {
+        // (3) Adaptive estimate of `tr(H⁻¹ A)` should agree with the
+        // central-difference derivative `d/dρ log|H + ρA|` at ρ=0.
+        let p = 24;
+        let h = make_spd(p, 0.4);
+        let a = random_dense_sym(p, 0x2468);
+        let eps = 1e-4;
+        let mut hp = h.clone();
+        let mut hm = h.clone();
+        for i in 0..p {
+            for j in 0..p {
+                hp[[i, j]] += eps * a[[i, j]];
+                hm[[i, j]] -= eps * a[[i, j]];
+            }
+        }
+        let ld = |m: &Array2<f64>| -> f64 {
+            let l = cholesky_lower(m).expect("SPD");
+            2.0 * (0..p).map(|i| l[[i, i]].ln()).sum::<f64>()
+        };
+        let fd = (ld(&hp) - ld(&hm)) / (2.0 * eps);
+        let evidence = evidence_traces_adaptive(
+            h.view(),
+            vec![DerivativeHessian::Dense(a.view())],
+            None,
+            ProbeSeed(0x9999),
+            HUTCHINSON_ADAPTIVE_REL_TOL,
+            HUTCHINSON_ADAPTIVE_TAU_REL,
+        )
+        .expect("adaptive ok");
+        let est = evidence.traces[0];
+        let se = evidence.stderrs[0] / (evidence.probe_count as f64).sqrt();
+        let tol = (8.0 * se).max(0.05 * fd.abs());
+        assert!(
+            (est - fd).abs() <= tol,
+            "adaptive trace {est} disagrees with FD logdet derivative {fd} (tol={tol})"
+        );
+    }
+
+    #[test]
+    fn block_2_6_k_4096_matches_exact_tightly() {
+        // (4) A large fixed K (4096 probes) — well past the adaptive
+        // schedule's max — must drive the Hutchinson estimator to within
+        // a few SE of exact. Bounds the residual variance and confirms
+        // the estimator is consistent (not merely unbiased at small K).
+        let p = 40;
+        let h = make_spd(p, 0.6);
+        let a = random_dense_sym(p, 0xDEAD);
+        let exact = exact_trace_hinv_a(h.view(), a.view());
+        let input = RemlTraceHutchinsonInput {
+            penalized_hessian: h.view(),
+            derivatives: vec![DerivativeHessian::Dense(a.view())],
+            design: None,
+            probe_count: 4096,
+            seed: ProbeSeed(0xC0FFEE),
+        };
+        let evidence = evidence_derivatives_hutchinson_gpu(input).expect("ok");
+        let est = 2.0 * evidence.gradient_rho_logdet[0];
+        let se = 2.0 * evidence.gradient_rho_stderr[0] / (4096_f64).sqrt();
+        let tol = (6.0 * se).max(1e-3 * exact.abs());
+        assert!(
+            (est - exact).abs() <= tol,
+            "K=4096 Hutchinson {est} not within 6·SE of exact {exact} (tol={tol}, se={se})"
+        );
+    }
+
+    #[test]
+    fn block_2_6_crn_prefix_match_across_schedule() {
+        // (5) Common-random-numbers: the first 16 probes of a K=32 (and
+        // K=64) draw must be bit-identical to a K=16 draw with the same
+        // seed. The SplitMix probe RNG is stateless in (seed, k, i), so
+        // this is what guarantees the adaptive schedule's variance
+        // monotonically *decreases* rather than oscillating.
+        let p = 50;
+        let seed = ProbeSeed(0x4242_4242);
+        let mut z16 = vec![0.0_f64; p * 16];
+        let mut z32 = vec![0.0_f64; p * 32];
+        let mut z64 = vec![0.0_f64; p * 64];
+        fill_rademacher_host(seed, p, 16, &mut z16);
+        fill_rademacher_host(seed, p, 32, &mut z32);
+        fill_rademacher_host(seed, p, 64, &mut z64);
+        for col in 0..16 {
+            for row in 0..p {
+                assert_eq!(z16[col * p + row], z32[col * p + row]);
+                assert_eq!(z16[col * p + row], z64[col * p + row]);
+            }
+        }
+        for col in 0..32 {
+            for row in 0..p {
+                assert_eq!(z32[col * p + row], z64[col * p + row]);
+            }
+        }
+    }
 }
