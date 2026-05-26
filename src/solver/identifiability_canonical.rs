@@ -411,6 +411,112 @@ mod tests {
         );
     }
 
+    /// Five-block biobank-shape aliasing repro mirroring the survival
+    /// marginal-slope gauge ownership policy. Each block carries an
+    /// intercept-like constant column; gauge_priority is assigned
+    /// top-down (time=200 > marginal=150 > logslope=120 > score_warp=80
+    /// > link_dev=60). Canonicalisation must:
+    ///
+    ///   (1) preserve the constant in `time_surface` (highest priority);
+    ///   (2) drop a constant from each lower-priority block whose
+    ///       column would otherwise alias the time intercept after
+    ///       priority-aware RRQR pivoting;
+    ///   (3) leave the time block's parameterisation untouched.
+    ///
+    /// This is exactly the gauge-ownership contract that the audit
+    /// must enforce before any pilot or outer Newton solve.
+    #[test]
+    fn canonical_five_block_gauge_ownership_drops_from_lowest_priority() {
+        let n = 96;
+        let x = linspace(n);
+        // Each block carries `ones(n)` in column 0 (the shared-constant
+        // direction) plus per-block-unique content in columns 1..p.
+        // The joint design therefore has a 4-D null space among the
+        // five constant columns; priority decides which four are
+        // dropped. We expect canonicalize to drop one constant from
+        // each of (marginal, logslope, score_warp, link_dev) and keep
+        // the time block's constant.
+        let mut time = Array2::<f64>::zeros((n, 3));
+        let mut marginal = Array2::<f64>::zeros((n, 3));
+        let mut logslope = Array2::<f64>::zeros((n, 3));
+        let mut score_warp = Array2::<f64>::zeros((n, 2));
+        let mut link_dev = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            time[[i, 0]] = 1.0;
+            time[[i, 1]] = x[i];
+            time[[i, 2]] = 2.0 * x[i];
+            marginal[[i, 0]] = 1.0;
+            marginal[[i, 1]] = x[i] * x[i];
+            marginal[[i, 2]] = 2.0 * x[i] * x[i];
+            logslope[[i, 0]] = 1.0;
+            logslope[[i, 1]] = (3.0 * x[i]).sin();
+            logslope[[i, 2]] = (6.0 * x[i]).sin();
+            score_warp[[i, 0]] = 1.0;
+            score_warp[[i, 1]] = (5.0 * x[i]).cos();
+            link_dev[[i, 0]] = 1.0;
+            link_dev[[i, 1]] = (7.0 * x[i]).tanh();
+        }
+        let mut t_spec = spec_from_dense("time_surface", time);
+        t_spec.gauge_priority = 200;
+        let mut m_spec = spec_from_dense("marginal_surface", marginal);
+        m_spec.gauge_priority = 150;
+        let mut g_spec = spec_from_dense("logslope_surface", logslope);
+        g_spec.gauge_priority = 120;
+        let mut w_spec = spec_from_dense("score_warp_dev", score_warp);
+        w_spec.gauge_priority = 80;
+        let mut l_spec = spec_from_dense("link_dev", link_dev);
+        l_spec.gauge_priority = 60;
+        let specs = [t_spec, m_spec, g_spec, w_spec, l_spec];
+
+        let canon = canonicalize_for_identifiability(&specs)
+            .expect("five-block aliased canonical must reduce, not refuse");
+
+        // Joint rank check: each block has p_i columns with one shared
+        // constant direction across all five blocks. Raw p_total =
+        // 3+3+3+2+2 = 13; only one of the five constants is independent;
+        // expected rank = 13 − 4 = 9.
+        let total_kept: usize = canon.reduced_block_dims().iter().sum();
+        assert_eq!(
+            total_kept, 9,
+            "expected joint rank = 13 − 4 shared constants = 9; got {total_kept} (raw dims {:?}, kept dims {:?})",
+            canon.raw_block_dims(),
+            canon.reduced_block_dims(),
+        );
+
+        // Gauge-ownership contract: time_surface (highest priority) must
+        // keep all 3 of its raw columns including its constant.
+        let time_kept = canon.reduced_block_dims()[0];
+        assert_eq!(
+            time_kept, 3,
+            "highest-priority block must retain all its columns under canonical gauge; \
+             time kept {time_kept}/3"
+        );
+
+        // Lift round-trip: a reduced β supplied per block lifts to a
+        // raw β where dropped raw indices receive exactly zero (the
+        // canonical-gauge contract — dropped directions get no
+        // contribution from the lifted coefficient vector).
+        let theta: Vec<Array1<f64>> = canon
+            .reduced_block_dims()
+            .iter()
+            .map(|&r| Array1::from_iter((1..=r).map(|j| j as f64)))
+            .collect();
+        let raw_betas = canon.lift_block_betas_to_raw(&theta);
+        assert_eq!(raw_betas.len(), 5);
+        let total_zeros: usize = raw_betas
+            .iter()
+            .map(|b| b.iter().filter(|&&v| v == 0.0).count())
+            .sum();
+        let total_raw: usize = canon.raw_block_dims().iter().sum();
+        assert_eq!(
+            total_zeros, total_raw - total_kept,
+            "lifted β must have exactly (raw_total − kept_total) zeros for dropped \
+             indices; got {total_zeros} zeros, expected {} \
+             (raw_total={total_raw}, kept_total={total_kept})",
+            total_raw - total_kept,
+        );
+    }
+
     #[test]
     fn canonical_pulls_back_penalty_to_kept_indices() {
         let n = 32;
