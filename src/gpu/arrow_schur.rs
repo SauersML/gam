@@ -65,9 +65,11 @@ pub fn solve_arrow_newton_step(
     if n == 0 || d == 0 {
         return Err(ArrowSchurGpuFailure::Unavailable);
     }
-    if sys.rows.iter().any(|row| {
-        row.htt.dim() != (d, d) || row.htbeta.dim() != (d, k) || row.gt.len() != d
-    }) {
+    if sys
+        .rows
+        .iter()
+        .any(|row| row.htt.dim() != (d, d) || row.htbeta.dim() != (d, k) || row.gt.len() != d)
+    {
         return Err(ArrowSchurGpuFailure::SchurFactorFailed {
             reason: "row block dimension mismatch".to_string(),
         });
@@ -177,8 +179,8 @@ pub fn solve_arrow_newton_step_dense_reference(
         h[[n * d + c, n * d + c]] += ridge_beta;
         rhs[n * d + c] = -sys.gb[c];
     }
-    let factor =
-        cholesky_lower_host(h.view()).ok_or_else(|| "dense reference Cholesky failed".to_string())?;
+    let factor = cholesky_lower_host(h.view())
+        .ok_or_else(|| "dense reference Cholesky failed".to_string())?;
     let mut log_det = 0.0_f64;
     for i in 0..total {
         log_det += factor[[i, i]].ln();
@@ -244,9 +246,7 @@ fn solve_cholesky_lower_host(l: ArrayView2<'_, f64>, rhs: ArrayView1<'_, f64>) -
 
 #[cfg(target_os = "linux")]
 mod cuda {
-    use super::{
-        ArrowSchurGpuFailure, ArrowSchurGpuSolution, pack_host,
-    };
+    use super::{ArrowSchurGpuFailure, ArrowSchurGpuSolution, pack_host};
     use crate::gpu::driver::to_i32;
     use crate::gpu::linalg::{DispatchOp, route_through_gpu};
     use crate::solver::arrow_schur::ArrowSchurSystem;
@@ -255,7 +255,7 @@ mod cuda {
     };
     use cudarc::cublas::{CudaBlas, Gemm, GemmConfig, Gemv, GemvConfig};
     use cudarc::cusolver::{DnHandle, sys as cusolver_sys};
-    use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut, sys as driver_sys};
+    use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
     use ndarray::Array1;
     use std::sync::Arc;
 
@@ -273,10 +273,9 @@ mod cuda {
         let stream = crate::gpu::runtime::cuda_context_for(runtime.device.ordinal)
             .and_then(|ctx| ctx.new_stream().ok())
             .ok_or(ArrowSchurGpuFailure::Unavailable)?;
-        let solver = DnHandle::new(stream.clone())
-            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
-        let blas = CudaBlas::new(stream.clone())
-            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        let solver =
+            DnHandle::new(stream.clone()).map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        let blas = CudaBlas::new(stream.clone()).map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
 
         // ----- Pack + upload D, B, g -----
         let (d_host, b_host, g_host) = pack_host(sys, ridge_t);
@@ -353,7 +352,7 @@ mod cuda {
             .clone_htod(&rhs_init)
             .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
 
-        accumulate_schur(&blas, &stream, d, k, n, &b_dev, &g_dev, &mut schur_dev, &mut rhs_dev)?;
+        accumulate_schur(&blas, d, k, n, &b_dev, &g_dev, &mut schur_dev, &mut rhs_dev)?;
 
         // ----- Layer C (1/2): factor S_β and solve for δβ -----
         let info = potrf_single(&solver, &stream, k, &mut schur_dev)?;
@@ -377,7 +376,7 @@ mod cuda {
         // Compute g_dev ← g_dev + Y_block · δβ per block (cuBLAS gemv with beta=1),
         // then in-place trsm with L_i^T (CUBLAS_OP_T) to obtain x_i, and finally
         // δt_i = -x_i on host after download.
-        accumulate_back_sub_rhs(&blas, &stream, d, k, n, &b_dev, &rhs_dev, &mut g_dev)?;
+        accumulate_back_sub_rhs(&blas, d, k, n, &b_dev, &rhs_dev, &mut g_dev)?;
         trsm_batched_lower_inplace_transposed(&blas, &stream, d, n, 1, &d_dev, &mut g_dev)?;
 
         let x_host = stream
@@ -436,20 +435,22 @@ mod cuda {
         let mut info_dev = stream
             .alloc_zeros::<i32>(batch)
             .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
-        let (ptrs_ptr, _ptrs_record) = ptrs_dev.device_ptr_mut(stream);
-        let (info_ptr, _info_record) = info_dev.device_ptr_mut(stream);
-        // SAFETY: pointer array and info buffer live on the device,
-        // matrices_dev holds `batch` contiguous p×p column-major blocks.
-        let status = unsafe {
-            cusolver_sys::cusolverDnDpotrfBatched(
-                solver.cu(),
-                cublasFillMode_t::CUBLAS_FILL_MODE_LOWER,
-                p_i,
-                ptrs_ptr as *mut *mut f64,
-                p_i,
-                info_ptr as *mut i32,
-                batch_i,
-            )
+        let status = {
+            let (ptrs_ptr, _ptrs_record) = ptrs_dev.device_ptr_mut(stream);
+            let (info_ptr, _info_record) = info_dev.device_ptr_mut(stream);
+            // SAFETY: pointer array and info buffer live on the device,
+            // matrices_dev holds `batch` contiguous p×p column-major blocks.
+            unsafe {
+                cusolver_sys::cusolverDnDpotrfBatched(
+                    solver.cu(),
+                    cusolver_sys::cublasFillMode_t::CUBLAS_FILL_MODE_LOWER,
+                    p_i,
+                    ptrs_ptr as *mut *mut f64,
+                    p_i,
+                    info_ptr as *mut i32,
+                    batch_i,
+                )
+            }
         };
         if status != cusolver_sys::cusolverStatus_t::CUSOLVER_STATUS_SUCCESS {
             return Err(ArrowSchurGpuFailure::Unavailable);
@@ -466,7 +467,7 @@ mod cuda {
         matrix: &mut CudaSlice<f64>,
     ) -> Result<i32, ArrowSchurGpuFailure> {
         let p_i = to_i32(p).ok_or(ArrowSchurGpuFailure::Unavailable)?;
-        let uplo = cublasFillMode_t::CUBLAS_FILL_MODE_LOWER;
+        let uplo = cusolver_sys::cublasFillMode_t::CUBLAS_FILL_MODE_LOWER;
         let mut lwork = 0_i32;
         {
             let (mat_ptr, _rec) = matrix.device_ptr_mut(stream);
@@ -662,7 +663,6 @@ mod cuda {
     /// the accumulation device-side.
     fn accumulate_schur(
         blas: &CudaBlas,
-        stream: &Arc<CudaStream>,
         d: usize,
         k: usize,
         n: usize,
@@ -674,10 +674,8 @@ mod cuda {
         let y_block_elems = d * k;
         let u_block_elems = d;
         for i in 0..n {
-            let y_slice = y_stack
-                .slice(i * y_block_elems..(i + 1) * y_block_elems);
-            let u_slice = u_stack
-                .slice(i * u_block_elems..(i + 1) * u_block_elems);
+            let y_slice = y_stack.slice(i * y_block_elems..(i + 1) * y_block_elems);
+            let u_slice = u_stack.slice(i * u_block_elems..(i + 1) * u_block_elems);
             // GEMM: schur += (-1) · Y_i^T · Y_i  (Y_i is d×k col-major; out is k×k)
             let gemm_cfg = GemmConfig::<f64> {
                 transa: cublasOperation_t::CUBLAS_OP_T,
@@ -717,7 +715,6 @@ mod cuda {
     /// pre-trsm RHS for the back-substitution `L_i^T x_i = w_i`.
     fn accumulate_back_sub_rhs(
         blas: &CudaBlas,
-        stream: &Arc<CudaStream>,
         d: usize,
         k: usize,
         n: usize,
@@ -728,10 +725,8 @@ mod cuda {
         let y_block_elems = d * k;
         let u_block_elems = d;
         for i in 0..n {
-            let y_slice = y_stack
-                .slice(i * y_block_elems..(i + 1) * y_block_elems);
-            let mut u_slice = u_stack
-                .slice_mut(i * u_block_elems..(i + 1) * u_block_elems);
+            let y_slice = y_stack.slice(i * y_block_elems..(i + 1) * y_block_elems);
+            let mut u_slice = u_stack.slice_mut(i * u_block_elems..(i + 1) * u_block_elems);
             let gemv_cfg = GemvConfig::<f64> {
                 trans: cublasOperation_t::CUBLAS_OP_N,
                 m: to_i32(d).ok_or(ArrowSchurGpuFailure::Unavailable)?,
@@ -761,7 +756,9 @@ mod tests {
         let mut sys = ArrowSchurSystem::new(n, d, k);
         let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
         let mut sample = || -> f64 {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((state >> 33) as f64) / ((1u64 << 31) as f64) - 1.0
         };
         for row in &mut sys.rows {

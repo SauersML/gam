@@ -144,9 +144,6 @@ pub const NORMALIZED_CELL_BRANCH_TOL: f64 = 1e-10;
 
 const INV_TWO_PI: f64 = 1.0 / std::f64::consts::TAU;
 
-pub(crate) const GL_NODES_FOR_GPU_KERNEL: &[f64; 384] = &GL_NODES;
-pub(crate) const GL_WEIGHTS_FOR_GPU_KERNEL: &[f64; 384] = &GL_WEIGHTS;
-
 const GL_NODES: [f64; 384] = [
     -9.999_804_411_726_474e-1,
     -9.998_969_471_378_596e-1,

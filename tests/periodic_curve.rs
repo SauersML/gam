@@ -175,6 +175,7 @@ fn periodic_bspline_terms_build_with_cyclic_penalty_and_formula_alias() {
             },
         },
         shape: gam::terms::smooth::ShapeConstraint::None,
+        joint_null_rotation: None,
     };
     let spec = TermCollectionSpec {
         linear_terms: vec![],

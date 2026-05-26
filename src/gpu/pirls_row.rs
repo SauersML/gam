@@ -53,7 +53,7 @@ use super::error::GpuError;
 use std::sync::{Arc, Mutex};
 
 #[cfg(target_os = "linux")]
-use cudarc::driver::{CudaContext, CudaModule, CudaStream};
+use cudarc::driver::{CudaContext, CudaModule};
 
 // ────────────────────────────────────────────────────────────────────────
 // Public selectors
@@ -110,10 +110,9 @@ impl PirlsRowFamily {
     /// True for `(response, canonical-link)` pairs: w_hessian == w_fisher.
     pub const fn is_canonical(self) -> bool {
         match self {
-            Self::BernoulliLogit
-            | Self::PoissonLog
-            | Self::GaussianIdentity
-            | Self::GammaLog => true,
+            Self::BernoulliLogit | Self::PoissonLog | Self::GaussianIdentity | Self::GammaLog => {
+                true
+            }
             Self::BernoulliProbit | Self::BernoulliCLogLog => false,
         }
     }
@@ -472,7 +471,11 @@ fn row_bernoulli_probit(input: RowInput, mode: CurvatureMode) -> RowOutput {
         w_hessian: select_w_hessian(mode, w_fisher, 0.0),
         w_solver: {
             let wh = select_w_hessian(mode, w_fisher, 0.0);
-            if wh > 0.0 { wh.max(W_SOLVER_FLOOR) } else { 0.0 }
+            if wh > 0.0 {
+                wh.max(W_SOLVER_FLOOR)
+            } else {
+                0.0
+            }
         },
         z_fisher: z,
         z_hessian: z,
@@ -614,7 +617,8 @@ fn libm_erfc(x: f64) -> f64 {
                             + t * (0.278_868_07
                                 + t * (-1.135_203_98
                                     + t * (1.488_515_87
-                                        + t * (-0.822_152_23 + t * 0.170_872_77))))))))).exp();
+                                        + t * (-0.822_152_23 + t * 0.170_872_77)))))))))
+            .exp();
     if x >= 0.0 { r } else { 2.0 - r }
 }
 
@@ -638,7 +642,6 @@ pub struct PirlsRowBackend {
 #[cfg(target_os = "linux")]
 struct PirlsRowBackendLinux {
     ctx: Arc<CudaContext>,
-    stream: Arc<CudaStream>,
     modules: Mutex<std::collections::HashMap<ModuleKey, Arc<CudaModule>>>,
 }
 
@@ -688,11 +691,9 @@ impl PirlsRowBackend {
                 ),
             },
         )?;
-        let stream = ctx.default_stream();
         Ok(Self {
             inner: PirlsRowBackendLinux {
                 ctx,
-                stream,
                 modules: Mutex::new(std::collections::HashMap::new()),
             },
         })
@@ -725,13 +726,13 @@ impl PirlsRowBackend {
                 curv = curvature.as_str(),
             ),
         })?;
-        let module =
-            self.inner
-                .ctx
-                .load_module(ptx)
-                .map_err(|err| GpuError::DriverCallFailed {
-                    reason: format!("pirls_row module load failed: {err}"),
-                })?;
+        let module = self
+            .inner
+            .ctx
+            .load_module(ptx)
+            .map_err(|err| GpuError::DriverCallFailed {
+                reason: format!("pirls_row module load failed: {err}"),
+            })?;
         self.inner
             .modules
             .lock()
@@ -1103,7 +1104,8 @@ mod pirls_row_gpu_tests {
                     }
                     // Final sanity: outputs are finite or carry an explicit
                     // INVALID_RESPONSE / ZERO_PRIOR_WEIGHT flag.
-                    if out.status & (status_flags::INVALID_RESPONSE | status_flags::ZERO_PRIOR_WEIGHT)
+                    if out.status
+                        & (status_flags::INVALID_RESPONSE | status_flags::ZERO_PRIOR_WEIGHT)
                         == 0
                     {
                         assert!(

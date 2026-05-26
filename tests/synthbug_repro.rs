@@ -146,6 +146,7 @@ fn local_synth_copd_like_duchon_orth_to_parametric() {
             LinearTermSpec {
                 name: "sex".to_string(),
                 feature_col: 1,
+                feature_cols: vec![1],
                 double_penalty: true,
                 coefficient_geometry: Default::default(),
                 coefficient_min: None,
@@ -154,6 +155,7 @@ fn local_synth_copd_like_duchon_orth_to_parametric() {
             LinearTermSpec {
                 name: "prs_z".to_string(),
                 feature_col: 2,
+                feature_cols: vec![2],
                 double_penalty: true,
                 coefficient_geometry: Default::default(),
                 coefficient_min: None,

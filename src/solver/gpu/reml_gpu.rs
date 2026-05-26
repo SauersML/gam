@@ -14,7 +14,7 @@
 //! numerically identical (with the same per-derivative overhead) — the
 //! optimisation is Linux-only because that is where CUDA actually runs.
 
-use ndarray::{Array1, Array2, ArrayView2};
+use ndarray::{Array1, ArrayView2};
 
 #[derive(Clone, Debug)]
 pub struct RemlGpuInput<'a> {
@@ -63,9 +63,7 @@ mod linux_cuda {
     use cudarc::cusolver::DnHandle;
     use ndarray::Array1;
 
-    pub(super) fn evidence_derivatives(
-        input: RemlGpuInput<'_>,
-    ) -> Result<RemlGpuEvidence, String> {
+    pub(super) fn evidence_derivatives(input: RemlGpuInput<'_>) -> Result<RemlGpuEvidence, String> {
         let p = input.penalized_hessian.nrows();
         let d = input.derivative_hessians.len();
         let (ctx, stream) = context_and_stream()?;
@@ -128,9 +126,7 @@ mod cpu_fallback {
     use super::{RemlGpuEvidence, RemlGpuInput};
     use ndarray::{Array1, Array2};
 
-    pub(super) fn evidence_derivatives(
-        input: RemlGpuInput<'_>,
-    ) -> Result<RemlGpuEvidence, String> {
+    pub(super) fn evidence_derivatives(input: RemlGpuInput<'_>) -> Result<RemlGpuEvidence, String> {
         let p = input.penalized_hessian.nrows();
         let mut identity = Array2::<f64>::zeros((p, p));
         for i in 0..p {

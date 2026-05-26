@@ -132,8 +132,7 @@ mod cuda {
                 .ctx
                 .new_stream()
                 .map_err(|e| format!("cuda stream alloc: {e}"))?;
-            let blas =
-                CudaBlas::new(stream.clone()).map_err(|e| format!("cublas init: {e}"))?;
+            let blas = CudaBlas::new(stream.clone()).map_err(|e| format!("cublas init: {e}"))?;
             let solver =
                 DnHandle::new(stream.clone()).map_err(|e| format!("cusolver init: {e}"))?;
             let np = n.checked_mul(p).ok_or("X size overflow")?;
@@ -222,7 +221,15 @@ mod cuda {
             .map_err(|e| format!("upload W: {e}"))?;
 
         // Form WX = diag(w) · X into ws.wx_dev (no reallocation).
-        left_scale_rows(&ws.blas, &ws.stream, n, p, &shared.x_dev, &mut ws.w_dev, &mut ws.wx_dev)?;
+        left_scale_rows(
+            &ws.blas,
+            &ws.stream,
+            n,
+            p,
+            &shared.x_dev,
+            &mut ws.w_dev,
+            &mut ws.wx_dev,
+        )?;
 
         // XtWX = Xᵀ · WX.
         let n_i = to_i32(n)?;
@@ -241,19 +248,29 @@ mod cuda {
         };
         // SAFETY: cuBLAS dgemm with validated i32 dimensions; shared.x_dev and ws.wx_dev are n*p
         // f64 device buffers, ws.xtwx_dev is the p*p output; all bound to ws.stream via blas.
-        unsafe { ws.blas.gemm(cfg, &shared.x_dev, &ws.wx_dev, &mut ws.xtwx_dev) }
-            .map_err(|e| format!("cublas dgemm XtWX: {e}"))?;
+        unsafe {
+            ws.blas
+                .gemm(cfg, &shared.x_dev, &ws.wx_dev, &mut ws.xtwx_dev)
+        }
+        .map_err(|e| format!("cublas dgemm XtWX: {e}"))?;
 
         // Upload S + λI per step (the penalty + ridge are the only structural inputs that change).
         let penalty = penalty_with_ridge(input.penalty_hessian, input.lm_ridge);
         let penalty_view = penalty.view();
         let penalty_col = to_col_major(&penalty_view);
         ws.stream
-            .memcpy_htod(&penalty_col, &mut ws.penalty_dev)
+            .memcpy_htod(penalty_col.as_ref(), &mut ws.penalty_dev)
             .map_err(|e| format!("upload penalty: {e}"))?;
 
         // H = XtWX + (S + λI), in-place into ws.h_dev.
-        geam_add(&ws.blas, &ws.stream, p, &ws.xtwx_dev, &ws.penalty_dev, &mut ws.h_dev)?;
+        geam_add(
+            &ws.blas,
+            &ws.stream,
+            p,
+            &ws.xtwx_dev,
+            &ws.penalty_dev,
+            &mut ws.h_dev,
+        )?;
 
         // Upload gradient into the persistent RHS buffer.
         let g_slice = input

@@ -19884,6 +19884,7 @@ mod tests {
             linear_terms: vec![LinearTermSpec {
                 name: "lin_x0".to_string(),
                 feature_col: 0,
+                feature_cols: vec![0],
                 double_penalty: true,
                 coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
                 coefficient_min: None,
@@ -20029,6 +20030,7 @@ mod tests {
             linear_terms: vec![LinearTermSpec {
                 name: "lin_x0".to_string(),
                 feature_col: 0,
+                feature_cols: vec![0],
                 double_penalty: false,
                 coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
                 coefficient_min: None,
@@ -20091,6 +20093,7 @@ mod tests {
             linear_terms: vec![LinearTermSpec {
                 name: "lin_x0".to_string(),
                 feature_col: 0,
+                feature_cols: vec![0],
                 double_penalty: false,
                 coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
                 coefficient_min: None,
@@ -20234,6 +20237,7 @@ mod tests {
                 .map(|j| LinearTermSpec {
                     name: format!("pc{j}"),
                     feature_col: j,
+                    feature_cols: vec![j],
                     double_penalty: false,
                     coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
                     coefficient_min: None,
@@ -20306,6 +20310,7 @@ mod tests {
             linear_terms: vec![LinearTermSpec {
                 name: "x".to_string(),
                 feature_col: 0,
+                feature_cols: vec![0],
                 double_penalty: false,
                 coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
                 coefficient_min: None,
@@ -20412,6 +20417,7 @@ mod tests {
         let linear_terms = vec![LinearTermSpec {
             name: "x0".to_string(),
             feature_col: 0,
+            feature_cols: vec![0],
             double_penalty: false,
             coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
             coefficient_min: None,
@@ -20568,6 +20574,7 @@ mod tests {
             linear_terms: vec![LinearTermSpec {
                 name: "x".to_string(),
                 feature_col: 0,
+                feature_cols: vec![0],
                 double_penalty: false,
                 coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
                 coefficient_min: None,
@@ -20654,6 +20661,7 @@ mod tests {
             linear_terms: vec![LinearTermSpec {
                 name: "x".to_string(),
                 feature_col: 0,
+                feature_cols: vec![0],
                 double_penalty: false,
                 coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
                 coefficient_min: None,
@@ -20708,6 +20716,7 @@ mod tests {
             linear_terms: vec![LinearTermSpec {
                 name: "lin_x0".to_string(),
                 feature_col: 0,
+                feature_cols: vec![0],
                 double_penalty: false,
                 coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
                 coefficient_min: None,
@@ -21987,6 +21996,7 @@ mod tests {
                 .map(|j| LinearTermSpec {
                     name: format!("x{j}"),
                     feature_col: j,
+                    feature_cols: vec![j],
                     double_penalty: false,
                     coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
                     coefficient_min: None,
@@ -23843,6 +23853,7 @@ mod tests {
             linear_terms: vec![LinearTermSpec {
                 name: "lin".to_string(),
                 feature_col: 1,
+                feature_cols: vec![1],
                 double_penalty: false,
                 coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
                 coefficient_min: Some(-0.5),
@@ -24334,6 +24345,7 @@ mod tests {
             linear_terms: vec![LinearTermSpec {
                 name: "x0".to_string(),
                 feature_col: 0,
+                feature_cols: vec![0],
                 double_penalty: false,
                 coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
                 coefficient_min: None,
@@ -26148,6 +26160,7 @@ mod tests {
                 LinearTermSpec {
                     name: "x".to_string(),
                     feature_col: 0,
+                    feature_cols: vec![0],
                     double_penalty: false,
                     coefficient_geometry: LinearCoefficientGeometry::Bounded {
                         min: 0.0,
@@ -26160,6 +26173,7 @@ mod tests {
                 LinearTermSpec {
                     name: "z".to_string(),
                     feature_col: 1,
+                    feature_cols: vec![1],
                     double_penalty: false,
                     coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
                     coefficient_min: None,
@@ -26224,6 +26238,7 @@ mod tests {
             linear_terms: vec![LinearTermSpec {
                 name: "x".to_string(),
                 feature_col: 0,
+                feature_cols: vec![0],
                 double_penalty: false,
                 coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
                 coefficient_min: Some(0.0),
@@ -26262,6 +26277,7 @@ mod tests {
                 LinearTermSpec {
                     name: "x1".to_string(),
                     feature_col: 0,
+                    feature_cols: vec![0],
                     double_penalty: true,
                     coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
                     coefficient_min: None,
@@ -26270,6 +26286,7 @@ mod tests {
                 LinearTermSpec {
                     name: "x2".to_string(),
                     feature_col: 1,
+                    feature_cols: vec![1],
                     double_penalty: true,
                     coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
                     coefficient_min: None,

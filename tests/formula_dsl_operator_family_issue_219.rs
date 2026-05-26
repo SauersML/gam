@@ -25,7 +25,10 @@ fn colon_interaction_in_dsl_string_parses() {
         parsed.rhs_terms
     );
     assert!(
-        parsed.rhs_terms.iter().any(|t| t.replace(' ', "") == "x1:x2"),
+        parsed
+            .rhs_terms
+            .iter()
+            .any(|t| t.replace(' ', "") == "x1:x2"),
         "expected an `x1:x2` interaction term in rhs_terms, got: {:?}",
         parsed.rhs_terms
     );

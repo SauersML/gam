@@ -15,13 +15,12 @@ use crate::families::bernoulli_marginal_slope::{
     DeviationBlockConfig, DeviationRuntime, LatentZNormalization, LatentZPolicy,
     MarginalSlopeCovariance, ParametricAnchorBlock,
     build_link_deviation_block_from_knots_design_seed_and_weights,
-    build_score_warp_deviation_block_from_seed,
-    enforce_cross_block_identifiability_for_flex_block, marginal_slope_covariance_from_scores,
-    marginal_slope_preserving_scale, marginal_slope_probit_eta, padded_deviation_seed,
-    project_monotone_feasible_beta, push_deviation_aux_blockspecs,
-    signed_probit_neglog_derivatives_up_to_fourth, standardize_latent_z_with_policy,
-    unary_derivatives_log, unary_derivatives_log_normal_pdf, unary_derivatives_neglog_phi,
-    unary_derivatives_sqrt,
+    build_score_warp_deviation_block_from_seed, enforce_cross_block_identifiability_for_flex_block,
+    marginal_slope_covariance_from_scores, marginal_slope_preserving_scale,
+    marginal_slope_probit_eta, padded_deviation_seed, project_monotone_feasible_beta,
+    push_deviation_aux_blockspecs, signed_probit_neglog_derivatives_up_to_fourth,
+    standardize_latent_z_with_policy, unary_derivatives_log, unary_derivatives_log_normal_pdf,
+    unary_derivatives_neglog_phi, unary_derivatives_sqrt,
 };
 use crate::families::cubic_cell_kernel as exact_kernel;
 use crate::families::gamlss::{ParameterBlockInput, monotone_wiggle_basis_with_derivative_order};
@@ -18228,8 +18227,7 @@ pub fn fit_survival_marginal_slope_terms(
             let rho = theta.slice(s![..setup.rho_dim()]).to_owned();
             let blocks = build_blocks(&rho, &designs[0], &designs[1])?;
             if let Some(beta_seed) = pending_beta_seed.borrow_mut().take() {
-                let widths: Vec<usize> =
-                    blocks.iter().map(|b| b.design.ncols()).collect();
+                let widths: Vec<usize> = blocks.iter().map(|b| b.design.ncols()).collect();
                 match CustomFamilyWarmStart::from_cached_beta(&widths, &beta_seed) {
                     Ok(ws) => {
                         exact_warm_start.replace(Some(ws));
@@ -18295,8 +18293,7 @@ pub fn fit_survival_marginal_slope_terms(
             let rho = theta.slice(s![..setup.rho_dim()]).to_owned();
             let blocks = build_blocks(&rho, &designs[0], &designs[1])?;
             if let Some(beta_seed) = pending_beta_seed.borrow_mut().take() {
-                let widths: Vec<usize> =
-                    blocks.iter().map(|b| b.design.ncols()).collect();
+                let widths: Vec<usize> = blocks.iter().map(|b| b.design.ncols()).collect();
                 match CustomFamilyWarmStart::from_cached_beta(&widths, &beta_seed) {
                     Ok(ws) => {
                         exact_warm_start.replace(Some(ws));

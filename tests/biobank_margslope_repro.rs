@@ -81,6 +81,7 @@ fn linear(name: &str, feature_col: usize) -> LinearTermSpec {
     LinearTermSpec {
         name: name.to_string(),
         feature_col,
+        feature_cols: vec![feature_col],
         double_penalty: true,
         coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
         coefficient_min: None,

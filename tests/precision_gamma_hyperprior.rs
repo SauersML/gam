@@ -49,6 +49,7 @@ fn linear_fixture() -> (
         linear_terms: vec![LinearTermSpec {
             name: "x".to_string(),
             feature_col: 0,
+            feature_cols: vec![0],
             double_penalty: true,
             coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
             coefficient_min: None,

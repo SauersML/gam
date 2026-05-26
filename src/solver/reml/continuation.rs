@@ -953,17 +953,11 @@ mod tests {
                 fn(
                     &mut (),
                     &Array1<f64>,
-                ) -> Result<
-                    crate::solver::outer_strategy::EfsEval,
-                    EstimationError,
-                >,
+                )
+                    -> Result<crate::solver::outer_strategy::EfsEval, EstimationError>,
             >,
-            screening_proxy_fn: None::<
-                fn(&mut (), &Array1<f64>) -> Result<f64, EstimationError>,
-            >,
-            seed_fn: None::<
-                fn(&mut (), &Array1<f64>) -> Result<(), EstimationError>,
-            >,
+            screening_proxy_fn: None::<fn(&mut (), &Array1<f64>) -> Result<f64, EstimationError>>,
+            seed_fn: None::<fn(&mut (), &Array1<f64>) -> Result<(), EstimationError>>,
         };
 
         // No `.with_seed_inner_state(...)` — mirrors standard REML's
@@ -1025,17 +1019,11 @@ mod tests {
                 fn(
                     &mut (),
                     &Array1<f64>,
-                ) -> Result<
-                    crate::solver::outer_strategy::EfsEval,
-                    EstimationError,
-                >,
+                )
+                    -> Result<crate::solver::outer_strategy::EfsEval, EstimationError>,
             >,
-            screening_proxy_fn: None::<
-                fn(&mut (), &Array1<f64>) -> Result<f64, EstimationError>,
-            >,
-            seed_fn: None::<
-                fn(&mut (), &Array1<f64>) -> Result<(), EstimationError>,
-            >,
+            screening_proxy_fn: None::<fn(&mut (), &Array1<f64>) -> Result<f64, EstimationError>>,
+            seed_fn: None::<fn(&mut (), &Array1<f64>) -> Result<(), EstimationError>>,
         };
 
         let mut obj = obj;

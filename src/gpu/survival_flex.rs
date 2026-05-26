@@ -181,9 +181,7 @@ impl<'a> SurvivalFlexGpuRowInputs<'a> {
     #[inline]
     fn rigid_row_guard_violated(qd1: f64, derivative_guard: f64) -> bool {
         let tol = 256.0 * f64::EPSILON * (1.0 + qd1.abs().max(derivative_guard.abs()));
-        !qd1.is_finite()
-            | !derivative_guard.is_finite()
-            | (qd1 + tol < derivative_guard)
+        !qd1.is_finite() | !derivative_guard.is_finite() | (qd1 + tol < derivative_guard)
     }
 }
 
@@ -560,11 +558,12 @@ impl DeviceArena {
         {
             return Ok((bucket, slot));
         }
-        let fresh = stream
-            .alloc_zeros::<f64>(bucket)
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("survival_flex arena alloc_zeros<{bucket}>: {err}"),
-            })?;
+        let fresh =
+            stream
+                .alloc_zeros::<f64>(bucket)
+                .map_err(|err| GpuError::DriverCallFailed {
+                    reason: format!("survival_flex arena alloc_zeros<{bucket}>: {err}"),
+                })?;
         Ok((bucket, fresh))
     }
 
@@ -641,13 +640,13 @@ impl SurvivalFlexGpuBackend {
                 reason: format!("survival_flex NVRTC compile failed: {err}"),
             }
         })?;
-        let module =
-            self.inner
-                .ctx
-                .load_module(ptx)
-                .map_err(|err| GpuError::DriverCallFailed {
-                    reason: format!("survival_flex module load failed: {err}"),
-                })?;
+        let module = self
+            .inner
+            .ctx
+            .load_module(ptx)
+            .map_err(|err| GpuError::DriverCallFailed {
+                reason: format!("survival_flex module load failed: {err}"),
+            })?;
         self.inner.module.set(module).ok();
         Ok(self
             .inner
@@ -768,37 +767,37 @@ impl SurvivalFlexGpuBackend {
         let stream = &self.inner.stream;
 
         let d_q0 = stream
-            .memcpy_stod(inputs.q0)
+            .clone_htod(inputs.q0)
             .map_err(|err| GpuError::DriverCallFailed {
                 reason: format!("survival_flex memcpy_stod q0: {err}"),
             })?;
         let d_q1 = stream
-            .memcpy_stod(inputs.q1)
+            .clone_htod(inputs.q1)
             .map_err(|err| GpuError::DriverCallFailed {
                 reason: format!("survival_flex memcpy_stod q1: {err}"),
             })?;
         let d_qd1 = stream
-            .memcpy_stod(inputs.qd1)
+            .clone_htod(inputs.qd1)
             .map_err(|err| GpuError::DriverCallFailed {
                 reason: format!("survival_flex memcpy_stod qd1: {err}"),
             })?;
         let d_z = stream
-            .memcpy_stod(inputs.z)
+            .clone_htod(inputs.z)
             .map_err(|err| GpuError::DriverCallFailed {
                 reason: format!("survival_flex memcpy_stod z: {err}"),
             })?;
         let d_g = stream
-            .memcpy_stod(inputs.g)
+            .clone_htod(inputs.g)
             .map_err(|err| GpuError::DriverCallFailed {
                 reason: format!("survival_flex memcpy_stod g: {err}"),
             })?;
         let d_w = stream
-            .memcpy_stod(inputs.weights)
+            .clone_htod(inputs.weights)
             .map_err(|err| GpuError::DriverCallFailed {
                 reason: format!("survival_flex memcpy_stod weights: {err}"),
             })?;
         let d_d = stream
-            .memcpy_stod(inputs.event)
+            .clone_htod(inputs.event)
             .map_err(|err| GpuError::DriverCallFailed {
                 reason: format!("survival_flex memcpy_stod event: {err}"),
             })?;
@@ -808,21 +807,24 @@ impl SurvivalFlexGpuBackend {
             .map_err(|err| GpuError::DriverCallFailed {
                 reason: format!("survival_flex alloc_zeros nll: {err}"),
             })?;
-        let mut d_grad = stream
-            .alloc_zeros::<f64>(4 * n)
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("survival_flex alloc_zeros grad: {err}"),
-            })?;
-        let mut d_hess = stream
-            .alloc_zeros::<f64>(16 * n)
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("survival_flex alloc_zeros hess: {err}"),
-            })?;
-        let mut d_status = stream
-            .alloc_zeros::<i32>(n)
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("survival_flex alloc_zeros status: {err}"),
-            })?;
+        let mut d_grad =
+            stream
+                .alloc_zeros::<f64>(4 * n)
+                .map_err(|err| GpuError::DriverCallFailed {
+                    reason: format!("survival_flex alloc_zeros grad: {err}"),
+                })?;
+        let mut d_hess =
+            stream
+                .alloc_zeros::<f64>(16 * n)
+                .map_err(|err| GpuError::DriverCallFailed {
+                    reason: format!("survival_flex alloc_zeros hess: {err}"),
+                })?;
+        let mut d_status =
+            stream
+                .alloc_zeros::<i32>(n)
+                .map_err(|err| GpuError::DriverCallFailed {
+                    reason: format!("survival_flex alloc_zeros status: {err}"),
+                })?;
 
         let block: u32 = 256;
         let grid: u32 = ((n as u32) + block - 1) / block;
@@ -860,25 +862,26 @@ impl SurvivalFlexGpuBackend {
         })?;
 
         let nll = stream
-            .memcpy_dtov(&d_nll)
+            .clone_dtoh(&d_nll)
             .map_err(|err| GpuError::DriverCallFailed {
                 reason: format!("survival_flex memcpy_dtov nll: {err}"),
             })?;
         let grad = stream
-            .memcpy_dtov(&d_grad)
+            .clone_dtoh(&d_grad)
             .map_err(|err| GpuError::DriverCallFailed {
                 reason: format!("survival_flex memcpy_dtov grad: {err}"),
             })?;
         let hess = stream
-            .memcpy_dtov(&d_hess)
+            .clone_dtoh(&d_hess)
             .map_err(|err| GpuError::DriverCallFailed {
                 reason: format!("survival_flex memcpy_dtov hess: {err}"),
             })?;
-        let row_status = stream
-            .memcpy_dtov(&d_status)
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("survival_flex memcpy_dtov status: {err}"),
-            })?;
+        let row_status =
+            stream
+                .clone_dtoh(&d_status)
+                .map_err(|err| GpuError::DriverCallFailed {
+                    reason: format!("survival_flex memcpy_dtov status: {err}"),
+                })?;
         stream
             .synchronize()
             .map_err(|err| GpuError::DriverCallFailed {
@@ -1012,17 +1015,13 @@ pub fn cpu_reference_rigid_row(
         return (0.0, [0.0; 4], [[0.0; 4]; 4], 2);
     }
 
-    let (log_cdf_neg_eta0, _l0) =
-        crate::probability::signed_probit_logcdf_and_mills_ratio(-eta0);
-    let (log_cdf_neg_eta1, _l1) =
-        crate::probability::signed_probit_logcdf_and_mills_ratio(-eta1);
+    let (log_cdf_neg_eta0, _l0) = crate::probability::signed_probit_logcdf_and_mills_ratio(-eta0);
+    let (log_cdf_neg_eta1, _l1) = crate::probability::signed_probit_logcdf_and_mills_ratio(-eta1);
     let log_phi_eta1 = -0.5 * (eta1 * eta1 + std::f64::consts::TAU.ln());
     let log_a1 = a1.max(1e-300).ln();
 
-    let nll = w
-        * ((1.0 - d) * (-log_cdf_neg_eta1) + log_cdf_neg_eta0
-            - d * log_phi_eta1
-            - d * log_a1);
+    let nll =
+        w * ((1.0 - d) * (-log_cdf_neg_eta1) + log_cdf_neg_eta0 - d * log_phi_eta1 - d * log_a1);
 
     // signed_probit_neglog_derivatives k1/k2 — replicated inline so this
     // reference does not depend on bernoulli_marginal_slope's pub(crate).
@@ -1294,8 +1293,7 @@ mod survival_flex_gpu_tests {
             Ok(Some(out)) => {
                 // GPU path actually ran (CUDA host).  Element-wise parity
                 // check against the CPU reference at the contract tolerance.
-                for (i, (cpu_nll, cpu_grad, cpu_hess, cpu_status)) in
-                    cpu_results.iter().enumerate()
+                for (i, (cpu_nll, cpu_grad, cpu_hess, cpu_status)) in cpu_results.iter().enumerate()
                 {
                     assert_eq!(out.row_status[i], *cpu_status, "row {i} status mismatch");
                     let gpu_nll = out.nll[i];

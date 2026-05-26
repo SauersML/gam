@@ -5,9 +5,7 @@
 //! `ArrowSchurError` variant the PIRLS outer loop already understands, so
 //! call-sites do not need to learn the device-specific reason codes.
 
-use crate::gpu::arrow_schur::{
-    ArrowSchurGpuFailure, solve_arrow_newton_step,
-};
+use crate::gpu::arrow_schur::{ArrowSchurGpuFailure, solve_arrow_newton_step};
 use crate::solver::arrow_schur::{ArrowSchurError, ArrowSchurSystem};
 use ndarray::Array1;
 
@@ -30,9 +28,7 @@ pub fn solve_arrow_newton_step_gpu(
         Err(ArrowSchurGpuFailure::RidgeBumpRequired { row, bump }) => {
             Err(ArrowSchurError::PerRowFactorFailed {
                 row,
-                reason: format!(
-                    "GPU Cholesky factor failed; suggested ridge bump {bump:.3e}"
-                ),
+                reason: format!("GPU Cholesky factor failed; suggested ridge bump {bump:.3e}"),
             })
         }
         Err(ArrowSchurGpuFailure::SchurFactorFailed { reason }) => {

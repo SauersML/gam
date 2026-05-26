@@ -430,10 +430,10 @@ mod linux_cuda {
         cholesky_logdet_from_col_major, context_and_stream, pinned_htod, potrf_in_place,
         potrs_in_place,
     };
-    use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
     use cudarc::cublas::sys::cublasOperation_t;
+    use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
     use cudarc::cusolver::DnHandle;
-    use cudarc::driver::{CudaContext, CudaModule, CudaStream, LaunchConfig};
+    use cudarc::driver::{CudaContext, CudaModule, CudaStream, LaunchConfig, PushKernelArg};
     use std::sync::{Arc, OnceLock};
 
     /// NVRTC source for the three custom kernels used by this path. All
@@ -602,25 +602,25 @@ extern "C" __global__ void reduce_q_weighted_gram(
         let logdet_hessian = cholesky_logdet_from_col_major(&factor_col, p);
 
         // ── 2. Allocate Z (p, K) and fill with Rademacher entries on device.
-        let total_z = p
-            .checked_mul(k)
-            .ok_or_else(|| GpuError::DriverCallFailed {
-                reason: format!("reml_trace Z size overflow: p={p}, K={k}"),
-            })?;
-        let mut z_dev = stream
-            .alloc_zeros::<f64>(total_z)
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("reml_trace alloc Z: {err}"),
-            })?;
+        let total_z = p.checked_mul(k).ok_or_else(|| GpuError::DriverCallFailed {
+            reason: format!("reml_trace Z size overflow: p={p}, K={k}"),
+        })?;
+        let mut z_dev =
+            stream
+                .alloc_zeros::<f64>(total_z)
+                .map_err(|err| GpuError::DriverCallFailed {
+                    reason: format!("reml_trace alloc Z: {err}"),
+                })?;
         launch_fill_rademacher(&stream, &compiled.module, input.seed, p, k, &mut z_dev)?;
 
         // ── 3. Solve H W = Z in a single batched potrs call (nrhs = K).
         //     Copy Z into a fresh buffer first; potrs is in-place.
-        let mut w_dev = stream
-            .alloc_zeros::<f64>(total_z)
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("reml_trace alloc W: {err}"),
-            })?;
+        let mut w_dev =
+            stream
+                .alloc_zeros::<f64>(total_z)
+                .map_err(|err| GpuError::DriverCallFailed {
+                    reason: format!("reml_trace alloc W: {err}"),
+                })?;
         copy_device_slice(&stream, &z_dev, &mut w_dev)?;
         potrs_in_place(&solver, &stream, p, k, &h_dev, &mut w_dev)
             .map_err(|reason| GpuError::DriverCallFailed { reason })?;
@@ -659,23 +659,31 @@ extern "C" __global__ void reduce_q_weighted_gram(
                 let hj_col = to_col_major(matrix);
                 let hj_dev = pinned_htod(&ctx, &stream, &hj_col)
                     .map_err(|reason| GpuError::DriverCallFailed { reason })?;
-                let mut y_dev = stream
-                    .alloc_zeros::<f64>(total_z)
-                    .map_err(|err| GpuError::DriverCallFailed {
+                let mut y_dev = stream.alloc_zeros::<f64>(total_z).map_err(|err| {
+                    GpuError::DriverCallFailed {
                         reason: format!("reml_trace alloc Y_j (j={j}): {err}"),
-                    })?;
+                    }
+                })?;
                 gemm_nn(
                     &blas,
-                    GemmShape { m: p, n: k, k_inner: p, lda: p, ldb: p, ldc: p },
+                    GemmShape {
+                        m: p,
+                        n: k,
+                        k_inner: p,
+                        lda: p,
+                        ldb: p,
+                        ldc: p,
+                    },
                     &hj_dev,
                     &w_dev,
                     &mut y_dev,
                 )?;
-                let mut q_j_dev = stream
-                    .alloc_zeros::<f64>(k)
-                    .map_err(|err| GpuError::DriverCallFailed {
-                        reason: format!("reml_trace alloc Q_j (j={j}): {err}"),
-                    })?;
+                let mut q_j_dev =
+                    stream
+                        .alloc_zeros::<f64>(k)
+                        .map_err(|err| GpuError::DriverCallFailed {
+                            reason: format!("reml_trace alloc Q_j (j={j}): {err}"),
+                        })?;
                 launch_reduce_q_dense(
                     &stream,
                     &compiled.module,
@@ -686,11 +694,12 @@ extern "C" __global__ void reduce_q_weighted_gram(
                     &y_dev,
                     &mut q_j_dev,
                 )?;
-                let q_host_j = stream.clone_dtoh(&q_j_dev).map_err(|err| {
-                    GpuError::DriverCallFailed {
-                        reason: format!("reml_trace download Q_j (j={j}): {err}"),
-                    }
-                })?;
+                let q_host_j =
+                    stream
+                        .clone_dtoh(&q_j_dev)
+                        .map_err(|err| GpuError::DriverCallFailed {
+                            reason: format!("reml_trace download Q_j (j={j}): {err}"),
+                        })?;
                 q_host[j * k..(j + 1) * k].copy_from_slice(&q_host_j);
             }
         }
@@ -698,31 +707,40 @@ extern "C" __global__ void reduce_q_weighted_gram(
         // ── 5b. Structural path: form R_Z = X Z and R_W = X W **once**,
         //       then run reduce_q_weighted_gram for each derivative.
         if !gram_indices.is_empty() {
-            let design = input.design.as_ref().ok_or_else(|| GpuError::DriverCallFailed {
-                reason: "reml_trace: structural derivative present but design=None".to_string(),
-            })?;
+            let design = input
+                .design
+                .as_ref()
+                .ok_or_else(|| GpuError::DriverCallFailed {
+                    reason: "reml_trace: structural derivative present but design=None".to_string(),
+                })?;
             let n = design.nrows();
             let design_col = to_col_major(design);
             let x_dev = pinned_htod(&ctx, &stream, &design_col)
                 .map_err(|reason| GpuError::DriverCallFailed { reason })?;
             let mut rz_dev = stream
-                .alloc_zeros::<f64>(n.checked_mul(k).ok_or_else(|| {
-                    GpuError::DriverCallFailed {
-                        reason: format!("reml_trace RZ overflow: n={n}, K={k}"),
-                    }
+                .alloc_zeros::<f64>(n.checked_mul(k).ok_or_else(|| GpuError::DriverCallFailed {
+                    reason: format!("reml_trace RZ overflow: n={n}, K={k}"),
                 })?)
                 .map_err(|err| GpuError::DriverCallFailed {
                     reason: format!("reml_trace alloc RZ: {err}"),
                 })?;
-            let mut rw_dev = stream
-                .alloc_zeros::<f64>(n * k)
-                .map_err(|err| GpuError::DriverCallFailed {
-                    reason: format!("reml_trace alloc RW: {err}"),
-                })?;
+            let mut rw_dev =
+                stream
+                    .alloc_zeros::<f64>(n * k)
+                    .map_err(|err| GpuError::DriverCallFailed {
+                        reason: format!("reml_trace alloc RW: {err}"),
+                    })?;
             // R_Z = X Z   (n × p) · (p × K) -> (n × K)
             gemm_nn(
                 &blas,
-                GemmShape { m: n, n: k, k_inner: p, lda: n, ldb: p, ldc: n },
+                GemmShape {
+                    m: n,
+                    n: k,
+                    k_inner: p,
+                    lda: n,
+                    ldb: p,
+                    ldc: n,
+                },
                 &x_dev,
                 &z_dev,
                 &mut rz_dev,
@@ -730,7 +748,14 @@ extern "C" __global__ void reduce_q_weighted_gram(
             // R_W = X W
             gemm_nn(
                 &blas,
-                GemmShape { m: n, n: k, k_inner: p, lda: n, ldb: p, ldc: n },
+                GemmShape {
+                    m: n,
+                    n: k,
+                    k_inner: p,
+                    lda: n,
+                    ldb: p,
+                    ldc: n,
+                },
                 &x_dev,
                 &w_dev,
                 &mut rw_dev,
@@ -762,11 +787,11 @@ extern "C" __global__ void reduce_q_weighted_gram(
             }
             let a_dev = pinned_htod(&ctx, &stream, &a_stack)
                 .map_err(|reason| GpuError::DriverCallFailed { reason })?;
-            let mut q_dev = stream
-                .alloc_zeros::<f64>(d_gram * k)
-                .map_err(|err| GpuError::DriverCallFailed {
+            let mut q_dev = stream.alloc_zeros::<f64>(d_gram * k).map_err(|err| {
+                GpuError::DriverCallFailed {
                     reason: format!("reml_trace alloc Q_gram: {err}"),
-                })?;
+                }
+            })?;
             launch_reduce_q_weighted_gram(
                 &stream,
                 &compiled.module,
@@ -778,21 +803,20 @@ extern "C" __global__ void reduce_q_weighted_gram(
                 &a_dev,
                 &mut q_dev,
             )?;
-            let q_host_gram = stream.clone_dtoh(&q_dev).map_err(|err| {
-                GpuError::DriverCallFailed {
-                    reason: format!("reml_trace download Q_gram: {err}"),
-                }
-            })?;
+            let q_host_gram =
+                stream
+                    .clone_dtoh(&q_dev)
+                    .map_err(|err| GpuError::DriverCallFailed {
+                        reason: format!("reml_trace download Q_gram: {err}"),
+                    })?;
             for (slot, &j) in gram_indices.iter().enumerate() {
-                q_host[j * k..(j + 1) * k]
-                    .copy_from_slice(&q_host_gram[slot * k..(slot + 1) * k]);
+                q_host[j * k..(j + 1) * k].copy_from_slice(&q_host_gram[slot * k..(slot + 1) * k]);
             }
             // penalty_extra contributions (uncommon, dense p×p) — handled on
             // host to keep the kernel surface small; total cost p² · K per
             // derivative that has one.
             for &j in &gram_indices {
-                let DerivativeHessian::WeightedGram { penalty_extra, .. } =
-                    &input.derivatives[j]
+                let DerivativeHessian::WeightedGram { penalty_extra, .. } = &input.derivatives[j]
                 else {
                     // SAFETY: gram_indices was populated by the partition loop above with
                     // exactly the WeightedGram-variant indices; the same indices are
@@ -808,16 +832,18 @@ extern "C" __global__ void reduce_q_weighted_gram(
                     );
                 };
                 if let Some(pen) = penalty_extra {
-                    let z_host = stream.clone_dtoh(&z_dev).map_err(|err| {
-                        GpuError::DriverCallFailed {
-                            reason: format!("reml_trace download Z for penalty_extra: {err}"),
-                        }
-                    })?;
-                    let w_host = stream.clone_dtoh(&w_dev).map_err(|err| {
-                        GpuError::DriverCallFailed {
-                            reason: format!("reml_trace download W for penalty_extra: {err}"),
-                        }
-                    })?;
+                    let z_host =
+                        stream
+                            .clone_dtoh(&z_dev)
+                            .map_err(|err| GpuError::DriverCallFailed {
+                                reason: format!("reml_trace download Z for penalty_extra: {err}"),
+                            })?;
+                    let w_host =
+                        stream
+                            .clone_dtoh(&w_dev)
+                            .map_err(|err| GpuError::DriverCallFailed {
+                                reason: format!("reml_trace download W for penalty_extra: {err}"),
+                            })?;
                     for col in 0..k {
                         let z_col = &z_host[col * p..(col + 1) * p];
                         let w_col = &w_host[col * p..(col + 1) * p];
@@ -886,6 +912,7 @@ extern "C" __global__ void reduce_q_weighted_gram(
                 .arg(z)
                 .launch(cfg)
         }
+        .map(|_| ())
         .map_err(|err| GpuError::DriverCallFailed {
             reason: format!("reml_trace launch fill_rademacher: {err}"),
         })
@@ -901,11 +928,12 @@ extern "C" __global__ void reduce_q_weighted_gram(
         y_stack: &cudarc::driver::CudaSlice<f64>,
         q: &mut cudarc::driver::CudaSlice<f64>,
     ) -> Result<(), GpuError> {
-        let func = module
-            .load_function("reduce_q_dense")
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("reml_trace load reduce_q_dense: {err}"),
-            })?;
+        let func =
+            module
+                .load_function("reduce_q_dense")
+                .map_err(|err| GpuError::DriverCallFailed {
+                    reason: format!("reml_trace load reduce_q_dense: {err}"),
+                })?;
         let cfg = LaunchConfig {
             grid_dim: (k as u32, d as u32, 1),
             block_dim: (THREADS_PER_BLOCK, 1, 1),
@@ -927,6 +955,7 @@ extern "C" __global__ void reduce_q_weighted_gram(
                 .arg(q)
                 .launch(cfg)
         }
+        .map(|_| ())
         .map_err(|err| GpuError::DriverCallFailed {
             reason: format!("reml_trace launch reduce_q_dense: {err}"),
         })
@@ -969,6 +998,7 @@ extern "C" __global__ void reduce_q_weighted_gram(
                 .arg(q)
                 .launch(cfg)
         }
+        .map(|_| ())
         .map_err(|err| GpuError::DriverCallFailed {
             reason: format!("reml_trace launch reduce_q_weighted_gram: {err}"),
         })
@@ -1002,7 +1032,14 @@ extern "C" __global__ void reduce_q_weighted_gram(
         b: &cudarc::driver::CudaSlice<f64>,
         c: &mut cudarc::driver::CudaSlice<f64>,
     ) -> Result<(), GpuError> {
-        let GemmShape { m, n, k_inner, lda, ldb, ldc } = shape;
+        let GemmShape {
+            m,
+            n,
+            k_inner,
+            lda,
+            ldb,
+            ldc,
+        } = shape;
         let cfg = GemmConfig::<f64> {
             transa: cublasOperation_t::CUBLAS_OP_N,
             transb: cublasOperation_t::CUBLAS_OP_N,
@@ -1030,9 +1067,7 @@ extern "C" __global__ void reduce_q_weighted_gram(
 fn validate_inputs(input: &RemlTraceHutchinsonInput<'_>) -> Result<(), String> {
     let (p, p2) = input.penalized_hessian.dim();
     if p == 0 || p != p2 {
-        return Err(format!(
-            "reml_trace input H must be square, got {p}x{p2}"
-        ));
+        return Err(format!("reml_trace input H must be square, got {p}x{p2}"));
     }
     if input.probe_count < 2 {
         return Err(format!(
@@ -1057,9 +1092,10 @@ fn validate_inputs(input: &RemlTraceHutchinsonInput<'_>) -> Result<(), String> {
         ));
     }
     for (j, derivative) in input.derivatives.iter().enumerate() {
-        derivative.dim_p(p, n).map_err(String::from).map_err(|e| {
-            format!("reml_trace derivative {j}: {e}")
-        })?;
+        derivative
+            .dim_p(p, n)
+            .map_err(String::from)
+            .map_err(|e| format!("reml_trace derivative {j}: {e}"))?;
     }
     Ok(())
 }
@@ -1204,7 +1240,8 @@ mod tests {
             bits_seen |= splitmix64_mix(x);
         }
         assert_eq!(
-            bits_seen, u64::MAX,
+            bits_seen,
+            u64::MAX,
             "splitmix should cover every bit position across 64 inputs"
         );
     }
@@ -1215,7 +1252,10 @@ mod tests {
         for k in 0..16u64 {
             for i in 0..32u64 {
                 let v = rademacher_entry(seed.0, k, i);
-                assert!(v == 1.0 || v == -1.0, "non-pm1 entry at (k={k}, i={i}): {v}");
+                assert!(
+                    v == 1.0 || v == -1.0,
+                    "non-pm1 entry at (k={k}, i={i}): {v}"
+                );
                 let v2 = rademacher_entry(seed.0, k, i);
                 assert_eq!(v, v2, "same (k,i) must hash to same value");
             }
@@ -1387,7 +1427,9 @@ mod tests {
     #[test]
     fn gate_rejects_k_out_of_range() {
         assert!(!should_use_gpu_hutchinson(2000, 4, true, true, true, false));
-        assert!(!should_use_gpu_hutchinson(2000, 200, true, true, true, false));
+        assert!(!should_use_gpu_hutchinson(
+            2000, 200, true, true, true, false
+        ));
     }
 
     #[test]
@@ -1399,5 +1441,4 @@ mod tests {
     fn gate_accepts_canonical_case() {
         assert!(should_use_gpu_hutchinson(2000, 16, true, true, true, false));
     }
-
 }

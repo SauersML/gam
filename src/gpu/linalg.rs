@@ -66,9 +66,7 @@ impl DispatchOp {
             }
             Self::Gemv { m, k } => 2u128 * (m as u128) * (k as u128),
             Self::Potrf { p, batch } => (batch as u128) * (p as u128).pow(3) / 3,
-            Self::SmallDenseBatchedPotrf { p, batch } => {
-                (batch as u128) * (p as u128).pow(3) / 3
-            }
+            Self::SmallDenseBatchedPotrf { p, batch } => (batch as u128) * (p as u128).pow(3) / 3,
             Self::Trsm { m, n } => (m as u128) * (m as u128) * (n as u128),
             Self::XtDiagX { n, p } => 2u128 * (n as u128) * (p as u128) * (p as u128),
             Self::XtDiagY { n, px, q } => 2u128 * (n as u128) * (px as u128) * (q as u128),

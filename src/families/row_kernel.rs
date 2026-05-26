@@ -362,8 +362,8 @@ pub fn build_row_kernel_cache<const K: usize>(
         RowSet::All => n,
         RowSet::Subsample { rows: list, .. } => list.len(),
     };
-    let heartbeat = (work_count >= ROW_KERNEL_CACHE_HEARTBEAT_MIN_ROWS)
-        .then(Heartbeat::default_interval);
+    let heartbeat =
+        (work_count >= ROW_KERNEL_CACHE_HEARTBEAT_MIN_ROWS).then(Heartbeat::default_interval);
     match rows {
         RowSet::All => {
             let evaluated: Vec<(f64, [f64; K], [[f64; K]; K])> = (0..n)

@@ -9,7 +9,7 @@
 //! +ORIGIN_EPS clamp is removed (or self-distance is special-cased).
 
 use gam::geometry::poincare::poincare_distance;
-use ndarray::{array, Array1};
+use ndarray::{Array1, array};
 
 #[test]
 fn self_distance_is_exact_zero_curvature_minus_one() {
