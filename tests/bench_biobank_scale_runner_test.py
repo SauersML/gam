@@ -1554,5 +1554,35 @@ class PhaseSummaryAggregationTests(unittest.TestCase):
         self.assertIn("ift_accept_rate=0.57", out)
 
 
+class DefaultBenchmarkConfigTests(unittest.TestCase):
+    """RED tests for issue #221.
+
+    The default config ships methods that the runner's spec validator must
+    accept. Today `r_mgcv_jointpc_duchon60` is a `disease` method with
+    `backend: r_mgcv`, but `validate_method_spec` rejects every disease
+    backend except `rust_gam`, so the default config cannot be loaded
+    end-to-end.
+    """
+
+    def test_default_config_loads_and_builds_specs(self) -> None:
+        cfg = _RUNNER.load_config(_RUNNER.DEFAULT_CONFIG)
+        specs = _RUNNER.build_method_specs(cfg)
+        self.assertGreater(len(specs), 0, "default config must define at least one method")
+
+    def test_every_default_method_passes_spec_validation(self) -> None:
+        cfg = _RUNNER.load_config(_RUNNER.DEFAULT_CONFIG)
+        raw_methods = list(cfg.get("methods", []))
+        self.assertGreater(len(raw_methods), 0)
+        failures: list[str] = []
+        for entry in raw_methods:
+            name = entry.get("name", "<unnamed>")
+            try:
+                spec = _RUNNER.MethodSpec(**entry)
+                _RUNNER.validate_method_spec(spec)
+            except Exception as exc:
+                failures.append(f"{name}: {exc}")
+        self.assertEqual(failures, [], f"default-config methods failed validation: {failures}")
+
+
 if __name__ == "__main__":
     unittest.main()

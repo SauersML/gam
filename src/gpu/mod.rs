@@ -14,6 +14,7 @@ pub mod driver;
 pub mod error;
 pub mod linalg;
 pub mod memory;
+pub mod pirls_row;
 pub mod policy;
 pub mod profile;
 pub mod runtime;
