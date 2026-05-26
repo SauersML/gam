@@ -17940,11 +17940,17 @@ pub fn fit_survival_marginal_slope_terms(
     // appears in both formulas) — surfacing them here directs the user to
     // restructure the formula rather than silently chase REML pathologies.
     {
-        use crate::linalg::faer_ndarray::{FaerQr, rrqr_nullspace_basis};
-        let _ = FaerQr::qr; // ensure trait path is in scope on the no-flex path
-        let time_dense = spec.time_block.design_exit.to_dense_array();
-        let marginal_dense = marginal_design.design.to_dense_array();
-        let logslope_dense = logslope_design.design.to_dense_array();
+        use crate::linalg::faer_ndarray::rrqr_nullspace_basis;
+        let time_dense = spec
+            .time_block
+            .design_exit
+            .try_to_dense_by_chunks("survival-marginal-slope joint rank diagnostic time")?;
+        let marginal_dense = marginal_design
+            .design
+            .try_to_dense_by_chunks("survival-marginal-slope joint rank diagnostic marginal")?;
+        let logslope_dense = logslope_design
+            .design
+            .try_to_dense_by_chunks("survival-marginal-slope joint rank diagnostic logslope")?;
         let score_warp_dense = score_warp_prepared
             .as_ref()
             .map(|sw| sw.runtime.design_at_training_with_residual(&z_primary))

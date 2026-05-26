@@ -21127,9 +21127,12 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             specs,
             &warm_start,
         );
+        let block_states_raw = lift_block_states_to_raw(&canonical, inner.block_states);
+        let (covariance_conditional, geometry) =
+            lift_fit_geometry_to_raw(&canonical, covariance_conditional, geometry);
         return blockwise_fit_from_parts(
             BlockwiseFitResultParts {
-                block_states: inner.block_states,
+                block_states: block_states_raw,
                 log_likelihood: inner.log_likelihood,
                 log_lambdas: Array1::zeros(0),
                 lambdas: Array1::zeros(0),
@@ -21143,7 +21146,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                 outer_converged: inner.converged,
                 geometry,
             },
-            specs,
+            raw_specs,
         )
         .map_err(|reason| CustomFamilyError::Optimization {
             context: "fit_custom_family no-smoothing result assembly",
