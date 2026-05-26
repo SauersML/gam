@@ -22565,6 +22565,7 @@ gauge_priority: 100,
                 nullspace_dims: vec![null],
                 initial_log_lambdas: rho_block,
                 initial_beta: Some(beta_flat.slice(s![..p]).to_owned()),
+                gauge_priority: 100,
             }
         };
         let specs = vec![
@@ -23489,6 +23490,7 @@ gauge_priority: 100,
             nullspace_dims: vec![],
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![0.2, -0.1]),
+            gauge_priority: 100,
         }
     }
 

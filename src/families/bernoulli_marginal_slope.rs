@@ -18989,6 +18989,7 @@ fn build_blockspec(
         nullspace_dims: design.nullspace_dims.clone(),
         initial_log_lambdas: rho,
         initial_beta: beta_hint,
+        gauge_priority: 100,
     }
 }
 
@@ -19857,6 +19858,7 @@ mod tests {
             nullspace_dims: vec![],
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(Array1::zeros(p)),
+            gauge_priority: 100,
         }
     }
 

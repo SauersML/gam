@@ -939,6 +939,7 @@ fn build_time_blockspec(
             .clone()
             .unwrap_or_else(|| Array1::zeros(prepared.penalties.len())),
         initial_beta: prepared.initial_beta.clone(),
+            gauge_priority: 100,
     }
 }
 
@@ -951,6 +952,7 @@ fn build_mean_blockspec(design: &TermCollectionDesign, offset: Array1<f64>) -> P
         nullspace_dims: design.nullspace_dims.clone(),
         initial_log_lambdas: Array1::zeros(design.penalties.len()),
         initial_beta: None,
+        gauge_priority: 100,
     }
 }
 
@@ -969,6 +971,7 @@ fn build_log_sigma_blockspec(initial_sigma: f64) -> ParameterBlockSpec {
             1,
             exp_sigma_eta_for_sigma_scalar(initial_sigma),
         )),
+        gauge_priority: 100,
     }
 }
 
