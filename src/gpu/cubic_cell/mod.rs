@@ -120,20 +120,6 @@ pub(crate) enum CubicCellMomentStatus {
     NonFiniteEvaluation = 4,
 }
 
-impl CubicCellMomentStatus {
-    #[inline]
-    pub(crate) fn from_byte(byte: u8) -> Option<Self> {
-        match byte {
-            0 => Some(Self::Ok),
-            1 => Some(Self::InvalidInterval),
-            2 => Some(Self::NonAffineInfiniteInterval),
-            3 => Some(Self::NonFiniteCoefficient),
-            4 => Some(Self::NonFiniteEvaluation),
-            _ => None,
-        }
-    }
-}
-
 /// Host-side input view for `try_build_cubic_cell_derivative_moments`.
 /// The substrate borrows cell data from the caller; it does not own the
 /// CPU partition. `branches` is parallel to `cells`.
@@ -432,21 +418,7 @@ mod tests {
         assert_eq!(CubicCellMomentStatus::NonFiniteEvaluation as u8, 4);
     }
 
-    #[test]
-    fn status_byte_roundtrip() {
-        for s in [
-            CubicCellMomentStatus::Ok,
-            CubicCellMomentStatus::InvalidInterval,
-            CubicCellMomentStatus::NonAffineInfiniteInterval,
-            CubicCellMomentStatus::NonFiniteCoefficient,
-            CubicCellMomentStatus::NonFiniteEvaluation,
-        ] {
-            assert_eq!(CubicCellMomentStatus::from_byte(s as u8), Some(s));
-        }
-        assert_eq!(CubicCellMomentStatus::from_byte(99), None);
-    }
-
-    #[test]
+#[test]
     fn output_host_variant_carries_stride_and_status() {
         let out = CubicCellDerivativeMomentOutput::Host {
             moments: vec![0.0; 10],
