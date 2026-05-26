@@ -158,14 +158,24 @@ def test_descriptor_declaration_matches_evaluators(cls: type) -> None:
     drift class behind #232."""
     backends = set(getattr(cls, "SUPPORTED_BACKENDS", frozenset()))
     impl_methods = _own_evaluate_backends(cls)
+    # Direct overrides: torch / numpy must be overridden if advertised.
+    # jax has a working default fallback in the abstract base
+    # (`_evaluate_jax` wraps `_evaluate_numpy` via `jax.pure_callback`),
+    # so advertising jax is OK whenever numpy is implemented.
     for b in backends:
-        assert b in impl_methods, (
-            f"{cls.__qualname__} advertises backend {b!r} but has no "
-            f"_evaluate_{b}"
-        )
+        if b in ("torch", "numpy"):
+            assert b in impl_methods, (
+                f"{cls.__qualname__} advertises backend {b!r} but does not "
+                f"override _evaluate_{b}"
+            )
+        elif b == "jax":
+            assert "numpy" in impl_methods, (
+                f"{cls.__qualname__} advertises 'jax' but has no _evaluate_numpy "
+                "for the base-class pure_callback fallback to wrap"
+            )
     for m in impl_methods:
         assert m in backends, (
-            f"{cls.__qualname__} implements _evaluate_{m} but does not "
+            f"{cls.__qualname__} overrides _evaluate_{m} but does not "
             "advertise it in SUPPORTED_BACKENDS"
         )
 

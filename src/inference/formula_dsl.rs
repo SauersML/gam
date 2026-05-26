@@ -12,6 +12,7 @@ use crate::types::{InverseLink, LikelihoodSpec, LinkComponent, LinkFunction, Wig
 WHITESPACE = _{ " " | "\t" | NEWLINE }
 
 top_function_call = { SOI ~ function_call ~ EOI }
+top_expr = { SOI ~ expr ~ EOI }
 formula = { SOI ~ expr ~ "~" ~ rhs ~ EOI }
 rhs = { term ~ ("+" ~ term)* }
 term = { expr }
@@ -622,6 +623,16 @@ pub enum ParsedTerm {
         z_column: String,
         terms: Vec<ParsedTerm>,
     },
+    /// Wilkinson-Rogers interaction term `a:b[:c...]`.
+    ///
+    /// `vars` is a sorted, deduplicated list of base column names. Each element
+    /// must be a bare identifier — interactions with function-call atoms
+    /// (smooths, factors, etc.) are rejected upstream because their design
+    /// columns are not simple products. The design column is the elementwise
+    /// product of the referenced numeric columns.
+    Interaction {
+        vars: Vec<String>,
+    },
 }
 
 pub fn parsed_terms_reference_column(terms: &[ParsedTerm], column_name: &str) -> bool {
@@ -630,6 +641,7 @@ pub fn parsed_terms_reference_column(terms: &[ParsedTerm], column_name: &str) ->
         | ParsedTerm::BoundedLinear { name, .. }
         | ParsedTerm::RandomEffect { name } => name == column_name,
         ParsedTerm::Smooth { vars, .. } => vars.iter().any(|var| var == column_name),
+        ParsedTerm::Interaction { vars } => vars.iter().any(|var| var == column_name),
         ParsedTerm::LinkWiggle { .. }
         | ParsedTerm::TimeWiggle { .. }
         | ParsedTerm::LinkConfig { .. }
