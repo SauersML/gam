@@ -1169,7 +1169,10 @@ mod tests {
     #[test]
     fn validate_rejects_non_monotone_offsets() {
         let mut buffers = make_buffers(2, 4, 1, 1);
-        buffers.cell_offsets = vec![5, 3];
+        // Keep `cell_offsets.len() == n + 1` AND keep
+        // `offsets[n] == total_cells == cell_c0.len()`, so the only check
+        // that can fail is monotonicity (offsets[0] > offsets[1]).
+        buffers.cell_offsets = vec![5, 3, 2];
         let inputs = minimal_inputs(&buffers);
         let err = inputs
             .validate()
