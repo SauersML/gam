@@ -31,7 +31,7 @@ fn phi(x: f64) -> f64 {
 /// Standard normal cdf. Wrapper for the codebase's `normal_cdf`.
 #[inline]
 fn cdf(x: f64) -> f64 {
-    crate::families::row_kernel::normal_cdf(x)
+    crate::inference::probability::normal_cdf(x)
 }
 
 /// Probit IRLS row weight `w_i · φ(η)² / (Φ(η) · Φ(−η))`. Clamped strictly
