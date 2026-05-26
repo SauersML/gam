@@ -21037,6 +21037,55 @@ pub fn matern_radial_first_derivative_nd(
     Ok(out)
 }
 
+/// N-D Matérn radial second derivative `φ''(r)` evaluated for every
+/// `(row, center)` pair.
+///
+/// Companion to [`matern_radial_first_derivative_nd`]. Together they give
+/// the full input-location Hessian:
+///
+/// ```text
+/// ∂²φ/∂t_i∂t_j = (φ'(r)/r) (δ_ij − u_i u_j) + φ''(r) u_i u_j,
+/// ```
+/// where `u_a = (t_a − c_a) / r`. At `r = 0`, the limit reduces to the
+/// isotropic `φ''(0) δ_ij`.
+pub fn matern_radial_second_derivative_nd(
+    t: ArrayView2<'_, f64>,
+    centers: ArrayView2<'_, f64>,
+    length_scale: f64,
+    nu: MaternNu,
+) -> Result<Array2<f64>, BasisError> {
+    let n_rows = t.nrows();
+    let n_centers = centers.nrows();
+    let dim = centers.ncols();
+    if dim == 0 {
+        return Err(BasisError::InvalidInput(
+            "matern_radial_second_derivative_nd: centers must have at least one column".into(),
+        ));
+    }
+    if t.ncols() != dim {
+        return Err(BasisError::InvalidInput(format!(
+            "matern_radial_second_derivative_nd: t has {} cols but centers have {}",
+            t.ncols(),
+            dim
+        )));
+    }
+    let mut out = Array2::<f64>::zeros((n_rows, n_centers));
+    for n in 0..n_rows {
+        for k in 0..n_centers {
+            let mut r2 = 0.0_f64;
+            for a in 0..dim {
+                let dv = t[[n, a]] - centers[[k, a]];
+                r2 += dv * dv;
+            }
+            let r = r2.sqrt();
+            let (_phi, _phi_r, phi_rr, _ratio) =
+                matern_kernel_radial_tripletwith_safe_ratio(r, length_scale, nu)?;
+            out[[n, k]] = phi_rr;
+        }
+    }
+    Ok(out)
+}
+
 /// Spectral derivative of the Sobolev sphere kernel w.r.t. `cos γ`.
 ///
 /// `dK_m/d(cos γ) = (1/4π) Σ_{l ≥ 1} (2l+1) · [l(l+1)]^{−m} · P_l'(cos γ)`,

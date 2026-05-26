@@ -45,8 +45,6 @@
 //! `(family_id, curvature_mode, precision)` so a single process compiles each
 //! kernel exactly once across all fits.
 
-#![allow(dead_code)] // Stage-2 wiring lands the dispatchers; keep host harness reachable.
-
 use std::sync::OnceLock;
 
 use super::error::GpuError;
