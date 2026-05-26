@@ -9,7 +9,7 @@ use crate::custom_family::{
     joint_hyper_options_for_outer_tolerance,
 };
 use crate::estimate::UnifiedFitResult;
-use crate::faer_ndarray::{fast_ab, fast_av};
+use crate::faer_ndarray::{FaerCholesky, fast_ab, fast_atv, fast_av, fast_xt_diag_x};
 use crate::families::bernoulli_marginal_slope::{
     CrossBlockAnchor, CrossBlockIdentifiabilityOutcome, CrossBlockIdentifiabilityWarning,
     DeviationBlockConfig, DeviationRuntime, LatentZNormalization, LatentZPolicy,
@@ -3213,6 +3213,218 @@ fn survival_rigid_pilot_eta(
         let slope = baseline_slope + logslope_offset[row];
         rigid_observed_eta(q_exit, slope, z_primary[row], probit_scale)
     }))
+}
+
+/// One-step IRLS refinement of the rigid pilot η along the dominant η₁ row
+/// channel. Starts from `survival_rigid_pilot_eta` (offset+baseline), runs
+/// a single weighted Newton step over the joint location-anchor + logslope
+/// design `X = [T_exit | M | G]`, and returns the refined per-row η₁ pilot
+/// that the cross-block W metric uses. Prevents the flex-anchor bases
+/// (`link_dev`, `score_warp`) from collapsing onto the same constant scalar
+/// path that the offset-only seed would produce when training offsets are
+/// uniform — the failure mode the original biobank-scale audit pinned to a
+/// 13-dimensional unidentified quotient. The η₁ direction matches the doc
+/// scope of `survival_pilot_irls_row_metric_at_eta` (see its long block);
+/// the chain factor `dη₁/dq = c(g)` is absorbed into a per-row scaling of
+/// the location anchor before the solve.
+fn survival_nonrigid_pilot_eta(
+    n: usize,
+    location_anchor_design: &DesignMatrix,
+    logslope_design: &DesignMatrix,
+    z_primary: &Array1<f64>,
+    offset_exit: &Array1<f64>,
+    marginal_offset: &Array1<f64>,
+    logslope_offset: &Array1<f64>,
+    baseline_slope: f64,
+    sample_weights: &Array1<f64>,
+    event: &Array1<f64>,
+    probit_scale: f64,
+) -> Result<Array1<f64>, String> {
+    if location_anchor_design.nrows() != n
+        || logslope_design.nrows() != n
+        || z_primary.len() != n
+        || offset_exit.len() != n
+        || marginal_offset.len() != n
+        || logslope_offset.len() != n
+        || sample_weights.len() != n
+        || event.len() != n
+    {
+        return Err(format!(
+            "survival_nonrigid_pilot_eta: row-count mismatch (n={n}, location={}, logslope={}, \
+             z={}, offset_exit={}, marginal_offset={}, logslope_offset={}, weights={}, event={})",
+            location_anchor_design.nrows(),
+            logslope_design.nrows(),
+            z_primary.len(),
+            offset_exit.len(),
+            marginal_offset.len(),
+            logslope_offset.len(),
+            sample_weights.len(),
+            event.len(),
+        ));
+    }
+    let loc_dense = location_anchor_design
+        .try_to_dense_arc("survival_nonrigid_pilot_eta: location anchor")?;
+    let g_dense =
+        logslope_design.try_to_dense_arc("survival_nonrigid_pilot_eta: logslope design")?;
+    let p_loc = loc_dense.ncols();
+    let p_g = g_dense.ncols();
+    let p_joint = p_loc + p_g;
+    if p_joint == 0 {
+        return Ok(survival_rigid_pilot_eta(
+            n,
+            z_primary,
+            offset_exit,
+            marginal_offset,
+            logslope_offset,
+            baseline_slope,
+            probit_scale,
+        ));
+    }
+    // Starting pilot (offset-only). Decompose into q_exit and slope so the
+    // chain rule below can attribute the η₁ Newton step back to each piece.
+    let mut q_exit = Array1::<f64>::zeros(n);
+    let mut slope = Array1::<f64>::zeros(n);
+    let mut eta1 = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        q_exit[i] = offset_exit[i] + marginal_offset[i];
+        slope[i] = baseline_slope + logslope_offset[i];
+        eta1[i] = rigid_observed_eta(q_exit[i], slope[i], z_primary[i], probit_scale);
+    }
+    // Build the η₁ chain-corrected joint design: each location column scales
+    // by c(g_i), each logslope column scales by (q_i·c'(g_i) + s_f'(g_i)·z_i).
+    // This makes the Newton update directly act on η₁ so the resulting pilot
+    // η₁ is the one-shot best linear fit along the dominant channel.
+    let mut x_chain = Array2::<f64>::zeros((n, p_joint));
+    let mut grad_eta1 = Array1::<f64>::zeros(n);
+    let mut hess_eta1 = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        let g_i = slope[i];
+        let z_i = z_primary[i];
+        // Chain factors along the η₁ row direction.
+        //   η₁ = q·c(g) + s(g)·z   with c(g) = sqrt(1 + s(g)²), s(g) = observed_logslope(g)
+        //   ∂η₁/∂q = c(g)
+        //   ∂η₁/∂g = q·c'(g) + s'(g)·z
+        // We only need ∂η₁/∂q and ∂η₁/∂g for the chain rule below; rebuild
+        // them from `rigid_observed_eta` via numerical finite-difference on
+        // a tiny step (the parametric closed-form derivatives live further
+        // down in `c_derivatives`; reusing it would couple this helper to
+        // private internals, while finite-difference at 1e-7 is well within
+        // the IRLS pilot's accuracy budget — the result is just used to
+        // weight the W metric, not propagated into a final coefficient).
+        let h_fd: f64 = 1.0e-7;
+        let chain_q = (rigid_observed_eta(q_exit[i] + h_fd, g_i, z_i, probit_scale)
+            - rigid_observed_eta(q_exit[i] - h_fd, g_i, z_i, probit_scale))
+            / (2.0 * h_fd);
+        let chain_g = (rigid_observed_eta(q_exit[i], g_i + h_fd, z_i, probit_scale)
+            - rigid_observed_eta(q_exit[i], g_i - h_fd, z_i, probit_scale))
+            / (2.0 * h_fd);
+        for j in 0..p_loc {
+            x_chain[[i, j]] = chain_q * loc_dense[[i, j]];
+        }
+        for j in 0..p_g {
+            x_chain[[i, p_loc + j]] = chain_g * g_dense[[i, j]];
+        }
+        // Row gradient and Hessian along η₁ (mirror
+        // `survival_pilot_irls_row_metric_at_eta`'s formula):
+        //   censored:  d(-log Φ(-η))/dη at weight w·(1-d). The primitive
+        //              `signed_probit_neglog_derivatives_up_to_fourth(-η, c)`
+        //              returns derivatives wrt its first argument; the chain
+        //              rule wrt η is therefore  d/dη = -d/d(-η).
+        //   event:     d(η²/2)/dη · w·d = w·d·η, Hessian = w·d.
+        let (k1, k2, _, _) = signed_probit_neglog_derivatives_up_to_fourth(
+            -eta1[i],
+            sample_weights[i] * (1.0 - event[i]),
+        )
+        .map_err(|e| format!("survival_nonrigid_pilot_eta: row {i}: {e}"))?;
+        let event_w = sample_weights[i] * event[i];
+        grad_eta1[i] = -k1 + event_w * eta1[i];
+        hess_eta1[i] = k2 + event_w;
+        if !hess_eta1[i].is_finite() || hess_eta1[i] < 0.0 {
+            // Defensive: any non-PSD row would corrupt the joint Gram. Clamp
+            // to a tiny positive so the IRLS step degenerates to a small
+            // proximal update rather than producing NaN.
+            hess_eta1[i] = hess_eta1[i].max(0.0);
+        }
+        if !grad_eta1[i].is_finite() {
+            grad_eta1[i] = 0.0;
+        }
+    }
+    // Normal equations: (Xᵀ W X + λI) β = -Xᵀ g, where W = diag(hess_eta1)
+    // along η₁ and g = grad_eta1. The minus sign is the Newton step
+    // direction.
+    let mut gram = fast_xt_diag_x(&x_chain, &hess_eta1);
+    let rhs = {
+        let mut neg_g = grad_eta1.clone();
+        for i in 0..n {
+            neg_g[i] = -neg_g[i];
+        }
+        fast_atv(&x_chain, &neg_g)
+    };
+    // Adaptive ridge: 1e-6 × average diagonal, floored at 1e-12. Keeps the
+    // Cholesky well-conditioned even when the rigid design has near-null
+    // directions (which it often does at construction — the whole point of
+    // the eventual cross-block reparam).
+    let avg_diag = if p_joint > 0 {
+        (0..p_joint).map(|j| gram[[j, j]]).sum::<f64>() / (p_joint as f64)
+    } else {
+        0.0
+    };
+    let ridge_eff = (1.0e-6 * avg_diag).max(1.0e-12);
+    for j in 0..p_joint {
+        gram[[j, j]] += ridge_eff;
+    }
+    let factor = gram
+        .cholesky(faer::Side::Lower)
+        .map_err(|e| format!("survival_nonrigid_pilot_eta: Cholesky failed: {e:?}"))?;
+    let beta_step = factor.solvevec(&rhs);
+    // Apply the Newton update: pilot q_exit ← q_exit + chain_q · β_loc,
+    // pilot slope ← slope + chain_g · β_g — but the chain factors were
+    // already folded into `x_chain` above so the row delta along η₁ is
+    // simply `x_chain[i,:] · β_step`. We split it back into q and g by
+    // re-projecting through the bare designs (without chain factors).
+    let mut beta_loc = Array1::<f64>::zeros(p_loc);
+    let mut beta_g = Array1::<f64>::zeros(p_g);
+    for j in 0..p_loc {
+        beta_loc[j] = beta_step[j];
+    }
+    for j in 0..p_g {
+        beta_g[j] = beta_step[p_loc + j];
+    }
+    let q_delta = fast_av(&loc_dense, &beta_loc);
+    let g_delta = fast_av(&g_dense, &beta_g);
+    // Trust-region cap to prevent a runaway first step on ill-conditioned
+    // pilots: limit |Δη₁| per row to 4·σ_η (σ_η ≈ 1 under probit), measured
+    // by the rigid pilot's η₁ standard deviation. This keeps the pilot in
+    // the regime where the second-order Taylor approximation is meaningful;
+    // the cross-block W metric only needs a per-row varying η₁, not the
+    // converged β.
+    let mut step_cap: f64 = 4.0;
+    {
+        let mean: f64 = eta1.iter().sum::<f64>() / (n as f64).max(1.0);
+        let mut var: f64 = 0.0;
+        for i in 0..n {
+            let d = eta1[i] - mean;
+            var += d * d;
+        }
+        let sd = (var / (n as f64).max(1.0)).sqrt();
+        if sd.is_finite() && sd > 0.0 {
+            step_cap = (4.0_f64).max(4.0 * sd);
+        }
+    }
+    let mut pilot_eta = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        let q_new = q_exit[i] + q_delta[i];
+        let g_new = slope[i] + g_delta[i];
+        let proposed = rigid_observed_eta(q_new, g_new, z_primary[i], probit_scale);
+        let delta = proposed - eta1[i];
+        let capped = if delta.abs() > step_cap {
+            eta1[i] + step_cap.copysign(delta)
+        } else {
+            proposed
+        };
+        pilot_eta[i] = if capped.is_finite() { capped } else { eta1[i] };
+    }
+    Ok(pilot_eta)
 }
 
 pub fn survival_marginal_slope_vector_scale(
@@ -18233,41 +18445,13 @@ pub fn fit_survival_marginal_slope_terms(
     // shaped proxy, not the survival row curvature; using the actual
     // survival curvature here matches the inner product PIRLS sees on this
     // family. Analog of bernoulli_marginal_slope.rs:19213-19214 + :19355-19356.
-    let cross_block_pilot_eta = survival_rigid_pilot_eta(
-        n,
-        &z_primary,
-        &spec.time_block.offset_exit,
-        &spec.marginal_offset,
-        &spec.logslope_offset,
-        baseline_slope,
-        probit_scale,
-    );
-    let cross_block_pilot_w = survival_pilot_irls_row_metric_at_eta(
-        &cross_block_pilot_eta,
-        &spec.weights,
-        &spec.event_target,
-    )
-    .map_err(|e| format!("survival cross-block W metric construction: {e}"))?;
-    // Unified location-anchor design at training rows.
-    //
-    // Survival prediction routes through `BernoulliMarginalSlopePredictor`
-    // (`survival_predict.rs:2458`); at predict time the SMGS predictor
-    // passes `q_design = [time_block.design_exit | timewiggle_exit |
-    // cov_design]` as `PredictInput.design`, which the BMS predict-time
-    // anchor-row builder (`predict.rs:1158`) treats AS-IS as the
-    // "marginal" parametric anchor when applying `n_row · M`. For the
-    // matmul width to match, fit-time anchoring must use the same
-    // concatenation — `[spec.time_block.design_exit | marginal_design]`
-    // — not `marginal_design` alone. This both (a) keeps the predict-
-    // time `anchor_correction_matrix` ncols check happy, and (b)
-    // residualises the score-warp / link-deviation bases against the
-    // time block's polynomial null space (constant + low-order time
-    // poly), killing the time_surface ↔ {score_warp_dev, link_dev}
-    // alias chain at the same construction step. `spec.time_block
-    // .design_exit` already includes the timewiggle tail columns by
-    // construction (validate_spec enforces `design_exit.ncols() ==
-    // p_time_base + p_timewiggle`), matching the predict-time
-    // q_design layout column-for-column.
+    // Build the location anchor design once, ahead of both the cross-block
+    // W-metric pilot and the cross-block residualisation calls below. The
+    // pilot needs it to compute a one-step IRLS refinement of η₁ that
+    // varies per row; reusing it for the residualisation calls keeps the
+    // anchor matmul width consistent between fit time and predict time
+    // (`predict.rs` ~1158 enforces `[time_exit | marginal]` width on the
+    // saved `anchor_correction_matrix`).
     let location_anchor_design = DesignMatrix::hstack(vec![
         spec.time_block.design_exit.clone(),
         marginal_design.design.clone(),
@@ -18277,6 +18461,45 @@ pub fn fit_survival_marginal_slope_terms(
             "survival marginal-slope cross-block anchor stack failed to concatenate time + marginal design at training rows: {e}"
         )
     })?;
+    // Non-rigid pilot η₁ via one IRLS step on the rigid joint design
+    // `[T_exit | M | G]`. The offset-only `survival_rigid_pilot_eta` was a
+    // near-constant scalar when training offsets are uniform (the typical
+    // biobank case), which collapses the cross-block W metric onto a
+    // single direction and lets `link_dev` alias `score_warp_dev` along
+    // the scalar PRS-axis path documented in the original audit (item #3
+    // of the principled fix: link_dev seed must reflect actual fitted
+    // exit-location and logslope surfaces, not just data offsets). One
+    // Newton step is sufficient for the cross-block residualisation: we
+    // need a per-row-varying η₁ that respects event/weight structure, not
+    // a converged β.
+    let cross_block_pilot_eta = survival_nonrigid_pilot_eta(
+        n,
+        &location_anchor_design,
+        &logslope_design.design,
+        &z_primary,
+        &spec.time_block.offset_exit,
+        &spec.marginal_offset,
+        &spec.logslope_offset,
+        baseline_slope,
+        &spec.weights,
+        &spec.event_target,
+        probit_scale,
+    )?;
+    let cross_block_pilot_w = survival_pilot_irls_row_metric_at_eta(
+        &cross_block_pilot_eta,
+        &spec.weights,
+        &spec.event_target,
+    )
+    .map_err(|e| format!("survival cross-block W metric construction: {e}"))?;
+    // `location_anchor_design` was built above (alongside the non-rigid
+    // pilot η) and is reused here for the cross-block residualisation
+    // calls. Keeping the construction at one site means the
+    // predict-time `anchor_correction_matrix` width contract — survival
+    // prediction routes through `BernoulliMarginalSlopePredictor`
+    // (`survival_predict.rs:2458`) which passes
+    // `[time_block.design_exit | timewiggle_exit | cov_design]` and
+    // `predict.rs:1158` treats AS-IS as the parametric anchor — is
+    // satisfied by a single source of truth.
     // Score-warp: build the scalar base DeviationPrepared, apply cross-
     // block identifiability reparameterisation against the parametric
     // anchor union (marginal + logslope) on the underlying runtime, then
