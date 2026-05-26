@@ -169,15 +169,22 @@ pub(crate) fn sigma_cubature_dispatch(
     sigma_points: &[Array1<f64>],
 ) -> Vec<SigmaPointResult> {
     if device_pirls_stage3_ready() {
-        // GPU stream-pool path. Once the predicate above flips, replace
-        // this `unreachable!` with a call into the stream-pool executor
-        // module (sketched signature: `sigma_cubature_streampool::evaluate(
-        // state, sigma_points)`), which:
+        // GPU stream-pool path lives here. Until `pirls-row-v3` Stage 3
+        // and `bms-flex-v3` Phase 5 land, the swap site falls through to
+        // the CPU Rayon path so behavior is identical regardless of how
+        // the predicate is evaluated — protecting the production path
+        // from a premature flip.
+        //
+        // The one-line swap when Stage 3 ships is to replace this
+        // delegation with a call into the stream-pool executor module
+        // (sketched signature:
+        // `sigma_cubature_streampool::evaluate(state, sigma_points)`),
+        // which:
         //   1. Uploads X once via
         //      `crate::solver::gpu::pirls_gpu::upload_shared_pirls_gpu`.
         //   2. Allocates a pool of `SigmaPirlsGpuWorkspace` (one per
-        //      CUDA stream, fan-out width chosen from `sigma_points.len()`
-        //      and device SM count).
+        //      CUDA stream, fan-out width chosen from
+        //      `sigma_points.len()` and device SM count).
         //   3. For each sigma point on its own stream, runs the
         //      device-resident inner PIRLS (the future Stage 3 entry),
         //      downloads only the `p×p` H and `p`-vector β.
@@ -185,31 +192,36 @@ pub(crate) fn sigma_cubature_dispatch(
         //      — or, once P6 lands, accumulates on-device and downloads
         //      only the final correction.
         //
-        // The CPU fallback below is the parity oracle for that path; any
-        // divergence is a math bug to fix in the GPU executor, not a
-        // tolerance to relax (see feedback_no_weakening_tests_for_perf).
-        unreachable!(
-            "device_pirls_stage3_ready() returned true but the GPU \
-             stream-pool sigma executor has not been wired yet — flip \
-             the predicate together with landing the executor body"
-        );
+        // The CPU path below is the parity oracle for that future GPU
+        // path; any divergence is a math bug to fix in the GPU
+        // executor, not a tolerance to relax (see
+        // feedback_no_weakening_tests_for_perf).
+        return sigma_cubature_evaluate_cpu_rayon(state, sigma_points);
     }
 
-    // CPU Rayon path. This is the same loop that lived inline at the
-    // call site before P3 introduced the dispatch boundary; the math is
-    // bit-identical, only the location moved.
-    //
-    // Stateless inner PIRLS (`execute_pirls_stateless_for_cubature`)
-    // performs no PIRLS-cache lookup/insert, no warm-start read/write,
-    // no LM-lambda hint read/write, no adaptive-cap or IFT-quality
-    // feedback writes — so multiple sigma fits run concurrently without
-    // serializing on the shared PIRLS-cache lock and without
-    // contaminating the production outer trajectory's warm-start / LM /
-    // IFT state. This replaces the previous `AtomicFlagGuard`-based
-    // opt-out: process-wide atomic flips were a leaky proxy that still
-    // let writes through (e.g. the adaptive-cap feedback and
-    // last_pirls_lm_lambda paths) and serialized unrelated REML
-    // evaluations racing the cubature window.
+    sigma_cubature_evaluate_cpu_rayon(state, sigma_points)
+}
+
+/// CPU Rayon sigma evaluator. The same loop that lived inline at the call
+/// site in [`RemlState::compute_smoothing_correction_auto`] before P3
+/// introduced the dispatch boundary; the math is bit-identical and
+/// continues to be the parity oracle pinned by
+/// [`sigma_cubature_accumulation_tests::cubature_linear_exactness_recovers_jvjt`].
+///
+/// Stateless inner PIRLS (`execute_pirls_stateless_for_cubature`) performs
+/// no PIRLS-cache lookup/insert, no warm-start read/write, no LM-lambda
+/// hint read/write, no adaptive-cap or IFT-quality feedback writes — so
+/// multiple sigma fits run concurrently without serializing on the shared
+/// PIRLS-cache lock and without contaminating the production outer
+/// trajectory's warm-start / LM / IFT state. This replaces the previous
+/// `AtomicFlagGuard`-based opt-out: process-wide atomic flips were a
+/// leaky proxy that still let writes through (e.g. the adaptive-cap
+/// feedback and last_pirls_lm_lambda paths) and serialized unrelated
+/// REML evaluations racing the cubature window.
+fn sigma_cubature_evaluate_cpu_rayon(
+    state: &RemlState<'_>,
+    sigma_points: &[Array1<f64>],
+) -> Vec<SigmaPointResult> {
     (0..sigma_points.len())
         .into_par_iter()
         .map(|idx| {
