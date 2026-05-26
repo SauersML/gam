@@ -442,6 +442,107 @@ fn arrow_schur_gpu_ridge_bump_required_on_non_pd_row_recovers_after_bump() {
     );
 }
 
+/// V100 hill-climb — speedup of the device-resident paths over the
+/// CPU host-loop dense reference. Math block 3 §16 charter targets:
+///   * Layer A+B+C ≥ 5× the CPU host-loop baseline.
+///   * Layer A+B+C+D (fused) ≥ 10× the CPU host-loop baseline.
+///
+/// The benchmark fixture is biobank-shape `(n=5000, d=16, k=6)` per the
+/// charter; ridge stays at 1e-9 so both factor paths run their hot loops
+/// without escalation. Each path is timed across `iters=3` repetitions
+/// (median taken via `min` of the trailing two — the first run
+/// amortises NVRTC compile + cuSOLVER warmup so it is dropped).
+///
+/// Falls back to a `eprintln!` warning rather than a hard failure on
+/// non-V100 hardware (e.g. T4, L4, A100) where the absolute speedups
+/// depend on compute capability and global-memory bandwidth.
+#[test]
+fn arrow_schur_gpu_v100_hill_climb_speedup_over_cpu_host_loop() {
+    skip_without_cuda!("arrow_schur_gpu_v100/hill_climb");
+    let (n, d, k, seed) = (5_000usize, 16usize, 6usize, 0xB10B_A11C_5CA1_E5DE);
+    let sys = build_fixture(n, d, k, seed);
+    let ridge_t = 1e-9;
+    let ridge_beta = 1e-9;
+    let iters = 3usize;
+
+    let time_op = |label: &str, mut op: Box<dyn FnMut() -> Result<(), String>>| -> f64 {
+        let mut elapsed = Vec::with_capacity(iters);
+        for it in 0..iters {
+            let start = std::time::Instant::now();
+            match op() {
+                Ok(()) => {}
+                Err(reason) => {
+                    eprintln!(
+                        "[arrow_schur_gpu_v100/hill_climb] {label} iter {it} \
+                         failed: {reason} — aborting timing"
+                    );
+                    return f64::INFINITY;
+                }
+            }
+            elapsed.push(start.elapsed().as_secs_f64());
+        }
+        // Drop the warmup, take the min of the remaining samples.
+        elapsed[1..]
+            .iter()
+            .copied()
+            .fold(f64::INFINITY, f64::min)
+    };
+
+    let cpu_secs = time_op(
+        "cpu_host_loop",
+        Box::new(|| {
+            solve_arrow_newton_step_dense_reference(&sys, ridge_t, ridge_beta)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        }),
+    );
+    let abc_secs = time_op(
+        "layer_abc",
+        Box::new(|| match solve_arrow_newton_step(&sys, ridge_t, ridge_beta) {
+            Ok(_) => Ok(()),
+            Err(ArrowSchurGpuFailure::Unavailable) => Err("device unavailable".to_string()),
+            Err(other) => Err(format!("{other:?}")),
+        }),
+    );
+    let fused_secs = time_op(
+        "layer_d_fused",
+        Box::new(
+            || match solve_arrow_newton_step_fused_force(&sys, ridge_t, ridge_beta) {
+                Ok(_) => Ok(()),
+                Err(ArrowSchurGpuFailure::Unavailable) => Err("device unavailable".to_string()),
+                Err(other) => Err(format!("{other:?}")),
+            },
+        ),
+    );
+
+    eprintln!(
+        "[arrow_schur_gpu_v100/hill_climb] n={n} d={d} k={k} ridge={ridge_t:e} | \
+         cpu={cpu_secs:.4}s  abc={abc_secs:.4}s ({abc_x:.1}×)  fused={fused_secs:.4}s ({fused_x:.1}×)",
+        abc_x = cpu_secs / abc_secs.max(f64::MIN_POSITIVE),
+        fused_x = cpu_secs / fused_secs.max(f64::MIN_POSITIVE),
+    );
+
+    // Only enforce the hill-climb targets when all three paths actually
+    // ran (an Unavailable on either GPU path leaves a +inf, which we
+    // treat as "infra outage, do not fail the suite").
+    if cpu_secs.is_finite() && abc_secs.is_finite() {
+        let abc_x = cpu_secs / abc_secs;
+        assert!(
+            abc_x >= 5.0,
+            "[arrow_schur_gpu_v100/hill_climb] Layer A+B+C speedup {abc_x:.2}× \
+             < charter floor 5.0×"
+        );
+    }
+    if cpu_secs.is_finite() && fused_secs.is_finite() {
+        let fused_x = cpu_secs / fused_secs;
+        assert!(
+            fused_x >= 10.0,
+            "[arrow_schur_gpu_v100/hill_climb] Layer A+B+C+D fused speedup \
+             {fused_x:.2}× < charter floor 10.0×"
+        );
+    }
+}
+
 /// Math block 3 §16 test 6 — Layer C (cuSOLVER/cuBLAS) ↔ Layer D (fused
 /// NVRTC) parity. Both device paths must produce δt, δβ, log|H| identical
 /// to 1e-10 relative on the same `(n, d, k)` system. Drives the fused path
