@@ -861,6 +861,13 @@ pub enum SavedAnchorKind {
         block: ParametricAnchorBlock,
         ncols: usize,
     },
+    /// Flex-evaluation anchor (sibling flex block's reparameterised basis,
+    /// evaluated at training rows at fit time and at predict rows at
+    /// predict time). The predictor stacks `ncols` columns from the
+    /// sibling runtime's `design(arg)` into `n_row`.
+    FlexEvaluation {
+        ncols: usize,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -1332,6 +1339,7 @@ impl SavedAnchoredDeviationRuntime {
             .iter()
             .map(|c| match &c.kind {
                 SavedAnchorKind::Parametric { ncols, .. } => *ncols,
+                SavedAnchorKind::FlexEvaluation { ncols } => *ncols,
             })
             .sum();
         if coeffs.len() != d {

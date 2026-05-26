@@ -86,6 +86,14 @@ pub enum AnchorNullSpaceComponent {
         block: ParametricAnchorBlock,
         ncols: usize,
     },
+    /// Flex-evaluation anchor — a sibling flex block's design at training
+    /// rows (post-reparameterisation, in the same coordinate frame the
+    /// predictor will use at predict time). The number of columns equals
+    /// the sibling block's reparameterised basis dimension. At predict
+    /// time the parent predictor evaluates the sibling runtime at the
+    /// predict-row argument and stacks those columns into `n_row` in the
+    /// same order they appear here.
+    FlexEvaluation { ncols: usize },
 }
 
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -617,6 +625,7 @@ impl DeviationRuntime {
                         .iter()
                         .map(|c| match c {
                             AnchorNullSpaceComponent::Parametric { ncols, .. } => *ncols,
+                            AnchorNullSpaceComponent::FlexEvaluation { ncols } => *ncols,
                         })
                         .sum();
                     if orthonormalising_rotation.nrows() != sum

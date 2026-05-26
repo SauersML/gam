@@ -168,29 +168,13 @@ pub fn canonicalize_for_identifiability(
     let mut per_block_transform: Vec<Array2<f64>> = Vec::with_capacity(specs.len());
     let mut reduced_specs: Vec<ParameterBlockSpec> = Vec::with_capacity(specs.len());
 
-    for (block_idx, spec) in specs.iter().enumerate() {
+    for spec in specs.iter() {
         let p_raw = spec.design.ncols();
         let dropped_locals: Vec<usize> = audit
             .dropped_columns
             .iter()
-            .enumerate()
-            .filter_map(|(drop_pos, drop)| {
-                if drop.block == spec.name {
-                    let block_matches_audit = audit
-                        .blocks
-                        .get(block_idx)
-                        .map(|b| b.block_name == spec.name)
-                        .unwrap_or(false);
-                    if block_matches_audit {
-                        Some(drop.column)
-                    } else {
-                        let _ = drop_pos;
-                        Some(drop.column)
-                    }
-                } else {
-                    None
-                }
-            })
+            .filter(|drop| drop.block == spec.name)
+            .map(|drop| drop.column)
             .collect();
         let mut dropped_sorted = dropped_locals.clone();
         dropped_sorted.sort_unstable();
@@ -207,7 +191,7 @@ pub fn canonicalize_for_identifiability(
             }
         }
         let kept: Vec<usize> = (0..p_raw)
-            .filter(|c| !dropped_sorted.binary_search(c).is_ok())
+            .filter(|c| dropped_sorted.binary_search(c).is_err())
             .collect();
         let r_block = kept.len();
 
