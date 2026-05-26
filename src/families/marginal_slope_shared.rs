@@ -957,7 +957,7 @@ pub fn maybe_install_auto_outer_subsample(
     options: &crate::custom_family::BlockwiseFitOptions,
     z: &[f64],
     stratum_secondary: Option<&[u8]>,
-    current_rho: &Array1<f64>,
+    outer_rho_key: &[f64],
     phase_counter: &Arc<std::sync::atomic::AtomicUsize>,
     last_rho: &Arc<std::sync::Mutex<Option<Array1<f64>>>>,
     phase1_budget: usize,
@@ -972,10 +972,10 @@ pub fn maybe_install_auto_outer_subsample(
             .expect("auto_subsample_last_rho mutex poisoned");
         let new_step = match guard.as_ref() {
             None => true,
-            Some(prev) if prev.len() != current_rho.len() => true,
+            Some(prev) if prev.len() != outer_rho_key.len() => true,
             Some(prev) => {
                 let mut sq = 0.0_f64;
-                for (a, b) in current_rho.iter().zip(prev.iter()) {
+                for (a, b) in outer_rho_key.iter().zip(prev.iter()) {
                     let d = a - b;
                     sq += d * d;
                 }
@@ -983,7 +983,7 @@ pub fn maybe_install_auto_outer_subsample(
             }
         };
         if new_step {
-            *guard = Some(current_rho.clone());
+            *guard = Some(Array1::from(outer_rho_key.to_vec()));
             phase_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
         } else {
             phase_counter
