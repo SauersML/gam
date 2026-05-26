@@ -18533,20 +18533,14 @@ pub fn fit_survival_marginal_slope_terms(
             Some(ParametricAnchorBlock::Logslope),
         ];
         // Phase 4a shadow call to the family-agnostic identifiability
-        // compiler. Survival's K=4 row Hessian needs the per-row pilot
-        // tuple (q0, q1, qd1, g) at the post-Newton pilot β (design doc
-        // §8). That β is produced by `rigid_fit_with_block_newton` *after*
-        // this construction site, so the shadow call stays gated off in
-        // 4a; Phase 4b threads `pilot_result.fitted_blocks[*].beta` through
-        // here and flips the gate to true. Phase 4c deletes the gate +
-        // the legacy `enforce_cross_block_identifiability_for_flex_block`
-        // call below atomically.
-        const PHASE_4A_SHADOW_COMPILE: bool = false;
-        if PHASE_4A_SHADOW_COMPILE {
-            // Wired in 4b once non-rigid pilot β is reachable here. The
-            // build_survival_compiler_inputs builder in
-            // `survival_marginal_slope_identifiability` is the entry point.
-        }
+        // compiler. The K=1 cross-block residualisation now routes through
+        // `identifiability_compiler::compile` via the
+        // `enforce_cross_block_identifiability_for_flex_block` delegation
+        // (commit 4e20b8dc8); the K=4 family-Jacobian compile path remains
+        // available via `survival_marginal_slope_identifiability` for the
+        // post-Newton non-rigid pilot work, which is now in place via
+        // `survival_nonrigid_pilot_eta` (commit 0b40b93b9). The dead-gated
+        // 4a shadow has been removed.
         let outcome = enforce_cross_block_identifiability_for_flex_block(
             &mut base,
             &z_primary,
