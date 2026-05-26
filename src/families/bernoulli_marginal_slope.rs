@@ -1738,6 +1738,33 @@ pub(crate) fn enforce_cross_block_identifiability_for_flex_block(
             }
         }
     }
+    // Enforce the anchor-order invariant that predict-side reconstruction
+    // depends on: every Parametric component appears before any
+    // FlexEvaluation. `predict.rs` (~1235-1258) validates the saved
+    // residual components in this order; if a caller here passes anchors
+    // in the wrong order we'd silently produce a saved model that fails
+    // predict-time validation. Catch it at construction.
+    {
+        let mut saw_flex = false;
+        for component in &anchor_components {
+            match component {
+                AnchorNullSpaceComponent::Parametric { .. } => {
+                    if saw_flex {
+                        return Err(
+                            "cross-block identifiability: anchor order invariant violated — \
+                             a Parametric anchor follows a FlexEvaluation anchor. Predict-time \
+                             reconstruction requires every Parametric component before any \
+                             FlexEvaluation tail."
+                                .to_string(),
+                        );
+                    }
+                }
+                AnchorNullSpaceComponent::FlexEvaluation { .. } => {
+                    saw_flex = true;
+                }
+            }
+        }
+    }
     if total_anchor_cols == 0 {
         // No anchors (parametric or flex) with any columns to residualise
         // against. The per-block smoothness-null-space drop on the

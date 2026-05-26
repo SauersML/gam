@@ -248,7 +248,7 @@ fn scale_block_by_sqrt_h(jb: &Array3<f64>, h_full: &Array3<f64>) -> Array2<f64> 
     let n = jb.shape()[0];
     let p = jb.shape()[1];
     let k = jb.shape()[2];
-    debug_assert_eq!(h_full.shape(), &[n, k, k]);
+    assert_eq!(h_full.shape(), &[n, k, k]);
     let mut out = Array2::<f64>::zeros((n * k, p));
     let mut sqrt_h = Array2::<f64>::zeros((k, k));
     let mut scratch_jrow = Array2::<f64>::zeros((p, k));
@@ -284,8 +284,8 @@ fn scale_block_by_sqrt_h(jb: &Array3<f64>, h_full: &Array3<f64>) -> Array2<f64> 
 /// eigenvalues clamped to zero (PSD projection guard).
 fn symmetric_sqrt_into(m: &Array2<f64>, out: &mut Array2<f64>) {
     let k = m.nrows();
-    debug_assert_eq!(m.ncols(), k);
-    debug_assert_eq!(out.shape(), &[k, k]);
+    assert_eq!(m.ncols(), k);
+    assert_eq!(out.shape(), &[k, k]);
     if k == 1 {
         out[[0, 0]] = m[[0, 0]].max(0.0).sqrt();
         return;
@@ -459,133 +459,125 @@ fn audit_and_drop_trailing_pivots(
     Ok(dropped_locals)
 }
 
-/// Convenience: wrap a dense `(n × p)` block design as a `K=1`
-/// row-Jacobian operator. Used by tests; production families ship their
-/// own concrete operators per `docs/identifiability_compiler.md` §1.
-#[cfg(test)]
-pub(crate) struct DenseScalarOperator {
-    design: Array2<f64>,
-}
-
-#[cfg(test)]
-impl DenseScalarOperator {
-    pub(crate) fn new(design: Array2<f64>) -> Self {
-        Self { design }
-    }
-}
-
-#[cfg(test)]
-impl RowJacobianOperator for DenseScalarOperator {
-    fn k(&self) -> usize {
-        1
-    }
-    fn ncols(&self) -> usize {
-        self.design.ncols()
-    }
-    fn nrows(&self) -> usize {
-        self.design.nrows()
-    }
-    fn apply_row(&self, row: usize, delta_beta: &[f64], out: &mut [f64]) {
-        debug_assert_eq!(out.len(), 1);
-        let mut acc = 0.0;
-        for (j, &b) in delta_beta.iter().enumerate() {
-            acc += self.design[[row, j]] * b;
-        }
-        out[0] = acc;
-    }
-    fn evaluate_full(&self) -> Array3<f64> {
-        let n = self.design.nrows();
-        let p = self.design.ncols();
-        let mut out = Array3::<f64>::zeros((n, p, 1));
-        for i in 0..n {
-            for j in 0..p {
-                out[[i, j, 0]] = self.design[[i, j]];
-            }
-        }
-        out
-    }
-}
-
-/// Identity row Hessian (`H_i = I_K`) used by tests.
-#[cfg(test)]
-pub(crate) struct IdentityRowHessian {
-    n: usize,
-    k: usize,
-}
-
-#[cfg(test)]
-impl IdentityRowHessian {
-    pub(crate) fn new(n: usize, k: usize) -> Self {
-        Self { n, k }
-    }
-}
-
-#[cfg(test)]
-impl RowHessian for IdentityRowHessian {
-    fn k(&self) -> usize {
-        self.k
-    }
-    fn nrows(&self) -> usize {
-        self.n
-    }
-    fn fill_row(&self, _row: usize, out: &mut [f64]) {
-        debug_assert_eq!(out.len(), self.k * self.k);
-        for i in 0..self.k {
-            for j in 0..self.k {
-                out[i * self.k + j] = if i == j { 1.0 } else { 0.0 };
-            }
-        }
-    }
-    fn evaluate_full(&self) -> Array3<f64> {
-        let mut out = Array3::<f64>::zeros((self.n, self.k, self.k));
-        for i in 0..self.n {
-            for c in 0..self.k {
-                out[[i, c, c]] = 1.0;
-            }
-        }
-        out
-    }
-}
-
-/// Diagonal row Hessian with per-row scalar weights (K=1 case).
-#[cfg(test)]
-pub(crate) struct DiagonalScalarRowHessian {
-    w: Array1<f64>,
-}
-
-#[cfg(test)]
-impl DiagonalScalarRowHessian {
-    pub(crate) fn new(w: Array1<f64>) -> Self {
-        Self { w }
-    }
-}
-
-#[cfg(test)]
-impl RowHessian for DiagonalScalarRowHessian {
-    fn k(&self) -> usize {
-        1
-    }
-    fn nrows(&self) -> usize {
-        self.w.len()
-    }
-    fn fill_row(&self, row: usize, out: &mut [f64]) {
-        debug_assert_eq!(out.len(), 1);
-        out[0] = self.w[row];
-    }
-    fn evaluate_full(&self) -> Array3<f64> {
-        let n = self.w.len();
-        let mut out = Array3::<f64>::zeros((n, 1, 1));
-        for i in 0..n {
-            out[[i, 0, 0]] = self.w[i];
-        }
-        out
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use ndarray::{Array1, Array2};
+
+    /// Convenience: wrap a dense `(n × p)` block design as a `K=1`
+    /// row-Jacobian operator. Used by tests; production families ship their
+    /// own concrete operators per `docs/identifiability_compiler.md` §1.
+    struct DenseScalarOperator {
+        design: Array2<f64>,
+    }
+
+    impl DenseScalarOperator {
+        fn new(design: Array2<f64>) -> Self {
+            Self { design }
+        }
+    }
+
+    impl RowJacobianOperator for DenseScalarOperator {
+        fn k(&self) -> usize {
+            1
+        }
+        fn ncols(&self) -> usize {
+            self.design.ncols()
+        }
+        fn nrows(&self) -> usize {
+            self.design.nrows()
+        }
+        fn apply_row(&self, row: usize, delta_beta: &[f64], out: &mut [f64]) {
+            assert_eq!(out.len(), 1);
+            let mut acc = 0.0;
+            for (j, &b) in delta_beta.iter().enumerate() {
+                acc += self.design[[row, j]] * b;
+            }
+            out[0] = acc;
+        }
+        fn evaluate_full(&self) -> Array3<f64> {
+            let n = self.design.nrows();
+            let p = self.design.ncols();
+            let mut out = Array3::<f64>::zeros((n, p, 1));
+            for i in 0..n {
+                for j in 0..p {
+                    out[[i, j, 0]] = self.design[[i, j]];
+                }
+            }
+            out
+        }
+    }
+
+    /// Identity row Hessian (`H_i = I_K`) used by tests.
+    struct IdentityRowHessian {
+        n: usize,
+        k: usize,
+    }
+
+    impl IdentityRowHessian {
+        fn new(n: usize, k: usize) -> Self {
+            Self { n, k }
+        }
+    }
+
+    impl RowHessian for IdentityRowHessian {
+        fn k(&self) -> usize {
+            self.k
+        }
+        fn nrows(&self) -> usize {
+            self.n
+        }
+        fn fill_row(&self, row: usize, out: &mut [f64]) {
+            assert!(row < self.n, "IdentityRowHessian::fill_row row {row} out of range {n}", n = self.n);
+            assert_eq!(out.len(), self.k * self.k);
+            for i in 0..self.k {
+                for j in 0..self.k {
+                    out[i * self.k + j] = if i == j { 1.0 } else { 0.0 };
+                }
+            }
+        }
+        fn evaluate_full(&self) -> Array3<f64> {
+            let mut out = Array3::<f64>::zeros((self.n, self.k, self.k));
+            for i in 0..self.n {
+                for c in 0..self.k {
+                    out[[i, c, c]] = 1.0;
+                }
+            }
+            out
+        }
+    }
+
+    /// Diagonal row Hessian with per-row scalar weights (K=1 case).
+    struct DiagonalScalarRowHessian {
+        w: Array1<f64>,
+    }
+
+    impl DiagonalScalarRowHessian {
+        fn new(w: Array1<f64>) -> Self {
+            Self { w }
+        }
+    }
+
+    impl RowHessian for DiagonalScalarRowHessian {
+        fn k(&self) -> usize {
+            1
+        }
+        fn nrows(&self) -> usize {
+            self.w.len()
+        }
+        fn fill_row(&self, row: usize, out: &mut [f64]) {
+            assert_eq!(out.len(), 1);
+            out[0] = self.w[row];
+        }
+        fn evaluate_full(&self) -> Array3<f64> {
+            let n = self.w.len();
+            let mut out = Array3::<f64>::zeros((n, 1, 1));
+            for i in 0..n {
+                out[[i, 0, 0]] = self.w[i];
+            }
+            out
+        }
+    }
 
     fn op(design: Array2<f64>) -> Arc<dyn RowJacobianOperator> {
         Arc::new(DenseScalarOperator::new(design))
@@ -710,7 +702,14 @@ mod tests {
     }
 
     impl AnchorRowEvaluator for MockAnchorEvaluator {
-        fn anchor_rows(&self, _predict_arg: &Array1<f64>) -> Result<Array2<f64>, String> {
+        fn anchor_rows(&self, predict_arg: &Array1<f64>) -> Result<Array2<f64>, String> {
+            assert_eq!(
+                predict_arg.len(),
+                self.rows.nrows(),
+                "MockAnchorEvaluator: predict_arg length {} must match stored rows {}",
+                predict_arg.len(),
+                self.rows.nrows(),
+            );
             Ok(self.rows.clone())
         }
         fn ncols(&self) -> usize {
