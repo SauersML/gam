@@ -111,6 +111,48 @@ pub(crate) const COEFF4: usize = 4;
 /// and `n = 0..6`, so the maximum index is `9`. `MOMENT_STRIDE = 10`.
 pub(crate) const MOMENT_STRIDE: usize = 10;
 
+/// Source of the per-cell derivative moments fed into the row kernel.
+/// Phase-4 wiring: the substrate at `src/gpu/cubic_cell/mod.rs` can produce
+/// these on the GPU; this enum lets the launcher consume them directly
+/// without a DtoH+HtoD round-trip.
+pub(crate) enum CellMomentsSource<'a> {
+    /// Host-resident `[total_cells, MOMENT_STRIDE = 10]` row-major buffer.
+    /// The launcher will HtoD-upload this on every launch.
+    Host(&'a [f64]),
+    /// Device-resident moments already living on the row-kernel backend's
+    /// default stream (which is the same `cuda_context_for(ordinal).default_stream()`
+    /// the cubic-cell substrate uses, so no cross-context copy is needed).
+    /// Length on the device must be `total_cells * MOMENT_STRIDE`. Linux-only.
+    #[cfg(target_os = "linux")]
+    Device(&'a CudaSlice<f64>),
+}
+
+impl<'a> CellMomentsSource<'a> {
+    /// Logical element count of the moments source, used by [`BmsFlexRowKernelInputs::validate`].
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            CellMomentsSource::Host(slice) => slice.len(),
+            #[cfg(target_os = "linux")]
+            CellMomentsSource::Device(d) => d.len(),
+        }
+    }
+
+    /// Host-resident view of the moments. The CPU oracle and any other
+    /// CPU-resident consumer needs the raw slice; calling this on a Device
+    /// variant is a programmer error (the oracle is a host-only sanity
+    /// checker and will never run with device-resident moments).
+    pub(crate) fn expect_host_slice(&self) -> &[f64] {
+        match self {
+            CellMomentsSource::Host(slice) => slice,
+            #[cfg(target_os = "linux")]
+            CellMomentsSource::Device(_) => panic!(
+                "BmsFlexRowKernelInputs::cell_moments is device-resident; \
+                 CPU oracle / host consumers cannot index it without a DtoH copy"
+            ),
+        }
+    }
+}
+
 /// Per-row input bundle for [`launch_bms_flex_row_kernel`].
 ///
 /// Coordinate ordering convention: `u = 0` is `a` (the latent intercept and
@@ -180,8 +222,11 @@ pub(crate) struct BmsFlexRowKernelInputs<'a> {
     /// (length `total_cells * p_w * 4`, row-major `[total_cells, p_w, 4]`).
     pub cell_sbw: &'a [f64],
     /// Per-cell derivative moments from Stage 1: row-major
-    /// `[total_cells, MOMENT_STRIDE = 10]`.
-    pub cell_moments: &'a [f64],
+    /// `[total_cells, MOMENT_STRIDE = 10]`. Phase-4 wiring: either a host
+    /// slice (legacy upload-on-launch path) or a device-resident
+    /// `CudaSlice<f64>` produced by `src/gpu/cubic_cell::try_build_cubic_cell_derivative_moments`
+    /// with `CubicCellMomentResidency::Device`.
+    pub cell_moments: CellMomentsSource<'a>,
     /// Per-row `chi_obs`. Length `n_rows`.
     pub chi_obs: &'a [f64],
     /// Per-row `xi_obs`. Length `n_rows`.
@@ -237,7 +282,13 @@ pub(crate) struct BmsFlexRowKernelInputsOwned {
     pub cell_sbb: Vec<f64>,
     pub cell_sbh: Vec<f64>,
     pub cell_sbw: Vec<f64>,
+    /// Host-resident moments. Phase-4: when `cell_moments_device` is
+    /// `Some(_)`, this stays empty and the device buffer is used instead.
     pub cell_moments: Vec<f64>,
+    /// Phase-4 device-resident moments. When `Some(_)`, the launcher skips
+    /// the host upload and consumes the buffer directly. Linux-only field.
+    #[cfg(target_os = "linux")]
+    pub cell_moments_device: Option<CudaSlice<f64>>,
     pub chi_obs: Vec<f64>,
     pub xi_obs: Vec<f64>,
     pub rho_u: Vec<f64>,
@@ -250,6 +301,13 @@ impl BmsFlexRowKernelInputsOwned {
     /// The returned struct holds references into `self` so the owned bundle
     /// must outlive the launch.
     pub(crate) fn as_borrowed(&self) -> BmsFlexRowKernelInputs<'_> {
+        #[cfg(target_os = "linux")]
+        let cell_moments = match self.cell_moments_device.as_ref() {
+            Some(d) => CellMomentsSource::Device(d),
+            None => CellMomentsSource::Host(&self.cell_moments),
+        };
+        #[cfg(not(target_os = "linux"))]
+        let cell_moments = CellMomentsSource::Host(&self.cell_moments);
         BmsFlexRowKernelInputs {
             n_rows: self.n_rows,
             r: self.r,
@@ -275,7 +333,7 @@ impl BmsFlexRowKernelInputsOwned {
             cell_sbb: &self.cell_sbb,
             cell_sbh: &self.cell_sbh,
             cell_sbw: &self.cell_sbw,
-            cell_moments: &self.cell_moments,
+            cell_moments,
             chi_obs: &self.chi_obs,
             xi_obs: &self.xi_obs,
             rho_u: &self.rho_u,
@@ -383,6 +441,10 @@ impl<'a> BmsFlexRowKernelInputs<'a> {
             self.cell_moments.len(),
             total_cells * MOMENT_STRIDE,
         )?;
+        // Bonus: when the moments came from `CellMomentsSource::Device`, the
+        // launcher needs to know the source is from a device buffer; nothing
+        // to validate beyond length above. The Host variant length check is
+        // also already covered above.
         // Monotone cell_offsets check.
         for i in 0..n {
             if self.cell_offsets[i] > self.cell_offsets[i + 1] {
@@ -920,7 +982,17 @@ fn launch_linux(
     let d_sbb     = upload_f64(inputs.cell_sbb, "cell_sbb")?;
     let d_sbh     = upload_f64(inputs.cell_sbh, "cell_sbh")?;
     let d_sbw     = upload_f64(inputs.cell_sbw, "cell_sbw")?;
-    let d_moments = upload_f64(inputs.cell_moments, "cell_moments")?;
+    // Phase-4: optionally consume device-resident moments (no host upload).
+    // Both branches end up holding a `&CudaSlice<f64>` named `d_moments_ref`
+    // we can pass to the launch builder uniformly.
+    let owned_host_moments: CudaSlice<f64>;
+    let d_moments_ref: &CudaSlice<f64> = match &inputs.cell_moments {
+        CellMomentsSource::Host(slice) => {
+            owned_host_moments = upload_f64(slice, "cell_moments")?;
+            &owned_host_moments
+        }
+        CellMomentsSource::Device(d) => *d,
+    };
     let d_chi     = upload_f64(inputs.chi_obs, "chi_obs")?;
     let d_xi      = upload_f64(inputs.xi_obs, "xi_obs")?;
     let d_rho     = upload_f64(inputs.rho_u, "rho_u")?;
@@ -982,7 +1054,7 @@ fn launch_linux(
         .arg(&d_offsets)
         .arg(&d_c0).arg(&d_c1).arg(&d_c2).arg(&d_c3)
         .arg(&d_a).arg(&d_aa).arg(&d_r).arg(&d_ar)
-        .arg(&d_sbb).arg(&d_sbh).arg(&d_sbw).arg(&d_moments)
+        .arg(&d_sbb).arg(&d_sbh).arg(&d_sbw).arg(d_moments_ref)
         .arg(&d_chi).arg(&d_xi).arg(&d_rho).arg(&d_tau).arg(&d_ruv)
         .arg(&mut d_neglog).arg(&mut d_grad).arg(&mut d_hess);
 
@@ -1597,7 +1669,15 @@ pub(crate) fn launch_bms_flex_row_kernel_device_resident(
     let d_sbb     = upload_f64(inputs.cell_sbb, "cell_sbb")?;
     let d_sbh     = upload_f64(inputs.cell_sbh, "cell_sbh")?;
     let d_sbw     = upload_f64(inputs.cell_sbw, "cell_sbw")?;
-    let d_moments = upload_f64(inputs.cell_moments, "cell_moments")?;
+    // Phase-4: optionally consume device-resident moments (no host upload).
+    let owned_host_moments: CudaSlice<f64>;
+    let d_moments_ref: &CudaSlice<f64> = match &inputs.cell_moments {
+        CellMomentsSource::Host(slice) => {
+            owned_host_moments = upload_f64(slice, "cell_moments")?;
+            &owned_host_moments
+        }
+        CellMomentsSource::Device(d) => *d,
+    };
     let d_chi     = upload_f64(inputs.chi_obs, "chi_obs")?;
     let d_xi      = upload_f64(inputs.xi_obs, "xi_obs")?;
     let d_rho     = upload_f64(inputs.rho_u, "rho_u")?;
@@ -1656,7 +1736,7 @@ pub(crate) fn launch_bms_flex_row_kernel_device_resident(
         .arg(&d_offsets)
         .arg(&d_c0).arg(&d_c1).arg(&d_c2).arg(&d_c3)
         .arg(&d_a).arg(&d_aa).arg(&d_r).arg(&d_ar)
-        .arg(&d_sbb).arg(&d_sbh).arg(&d_sbw).arg(&d_moments)
+        .arg(&d_sbb).arg(&d_sbh).arg(&d_sbw).arg(d_moments_ref)
         .arg(&d_chi).arg(&d_xi).arg(&d_rho).arg(&d_tau).arg(&d_ruv)
         .arg(&mut d_neglog).arg(&mut d_grad).arg(&mut d_hess);
     // SAFETY: same shape contract as `launch_linux`: every kernel parameter is
@@ -1686,7 +1766,10 @@ pub(crate) fn launch_bms_flex_row_kernel_device_resident(
     drop(d_q); drop(d_b); drop(d_mu1); drop(d_mu2); drop(d_zobs); drop(d_y); drop(d_w);
     drop(d_offsets); drop(d_c0); drop(d_c1); drop(d_c2); drop(d_c3);
     drop(d_a); drop(d_aa); drop(d_r); drop(d_ar);
-    drop(d_sbb); drop(d_sbh); drop(d_sbw); drop(d_moments);
+    drop(d_sbb); drop(d_sbh); drop(d_sbw);
+    // `owned_host_moments` (if any) and the borrowed `d_moments_ref` both
+    // go out of scope at the end of the function; the device-resident
+    // moments owned by the caller stay alive.
     drop(d_chi); drop(d_xi); drop(d_rho); drop(d_tau); drop(d_ruv);
 
     let ctx = backend.module.ctx().clone();
@@ -1980,7 +2063,7 @@ mod tests {
             cell_sbb: &buffers.cell_sbb,
             cell_sbh: &buffers.cell_sbh,
             cell_sbw: &buffers.cell_sbw,
-            cell_moments: &buffers.cell_moments,
+            cell_moments: CellMomentsSource::Host(&buffers.cell_moments),
             chi_obs: &buffers.chi_obs,
             xi_obs: &buffers.xi_obs,
             rho_u: &buffers.rho_u,
@@ -2290,6 +2373,7 @@ mod tests {
         let mut neglog = vec![0.0_f64; n];
         let mut grad = vec![0.0_f64; n * r];
         let mut hess = vec![0.0_f64; n * r * r];
+        let cell_moments_host = inputs.cell_moments.expect_host_slice();
 
         for row in 0..n {
             // ── per-cell sweep: accumulate F_u, F_au, F_uv, F_a, F_aa.
@@ -2308,7 +2392,7 @@ mod tests {
                     inputs.cell_c2[c],
                     inputs.cell_c3[c],
                 ];
-                let m = &inputs.cell_moments[c * MOMENT_STRIDE..(c + 1) * MOMENT_STRIDE];
+                let m = &cell_moments_host[c * MOMENT_STRIDE..(c + 1) * MOMENT_STRIDE];
 
                 // T_n = κ · Σ_e C_e · m_{e+n}, n = 0..6.
                 let mut t = [0.0_f64; 7];
@@ -2608,7 +2692,7 @@ mod tests {
             cell_sbb: &buffers.cell_sbb,
             cell_sbh: &buffers.cell_sbh,
             cell_sbw: &buffers.cell_sbw,
-            cell_moments: &buffers.cell_moments,
+            cell_moments: CellMomentsSource::Host(&buffers.cell_moments),
             chi_obs: &buffers.chi_obs,
             xi_obs: &buffers.xi_obs,
             rho_u: &buffers.rho_u,
