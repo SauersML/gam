@@ -1827,4 +1827,162 @@ mod sphere_gpu_tests {
             "Householder fused parity max |Δ| = {max_abs:.3e} >= 1e-12"
         );
     }
+
+    /// V100 hill-climb: GPU truncated-spectral kernel matrix build at
+    /// (n=200_000, m=200, L=50) must beat CPU by ≥ 20× wall-clock.
+    /// Skips silently when no CUDA runtime is available.
+    #[test]
+    fn sphere_gpu_kernel_matrix_hill_climb_20x_vs_cpu() {
+        let Some(_runtime) = super::super::runtime::GpuRuntime::global() else {
+            eprintln!("[sphere_gpu hill-climb] no CUDA runtime — skipping");
+            return;
+        };
+        if SphereGpuBackend::probe().is_err() {
+            eprintln!("[sphere_gpu hill-climb] backend probe failed — skipping");
+            return;
+        }
+
+        // (n=200_000, m=200, lmax=50). n·m = 4·10^7 ≫ 1e6 → GPU eligible.
+        // Build a 200_000-row deterministic lat/lon grid.
+        let n_lat = 500usize;
+        let n_lon = 400usize;
+        assert_eq!(n_lat * n_lon, 200_000);
+        let data_ll = small_latlon_grid(n_lat, n_lon);
+        let m = 200usize;
+        let centers_ll =
+            crate::basis::select_spherical_farthest_point_centers(data_ll.view(), m, false)
+                .expect("centers");
+        let n = data_ll.nrows();
+        let data_xyz = latlon_to_xyz_host(data_ll.view(), false).unwrap();
+        let centers_xyz = latlon_to_xyz_host(centers_ll.view(), false).unwrap();
+        let penalty_order = 2usize;
+        let lmax = 50usize;
+        let coeffs = sobolev_s2_truncated_coefficients(lmax, penalty_order);
+
+        // Warm up GPU (NVRTC compile + first-touch alloc).
+        let inputs_warm = S2KernelBuildInputs {
+            n,
+            m,
+            lmax,
+            data_xyz: &data_xyz,
+            centers_xyz: &centers_xyz,
+            coeffs: &coeffs,
+            kind: SphereSpectralKernelKind::Sobolev,
+            layout: DeviceMatrixLayout::ColumnMajor,
+        };
+        let _ = build_kernel_matrix_device(inputs_warm.clone()).expect("warmup");
+
+        // Measure GPU.
+        let t0 = std::time::Instant::now();
+        let dev =
+            build_kernel_matrix_device(inputs_warm.clone()).expect("gpu kernel matrix");
+        let _host_gpu = dev.to_host_array().expect("dtoh");
+        let gpu_secs = t0.elapsed().as_secs_f64();
+
+        // Measure CPU (truncated-spectral via the public matrix helper).
+        let t1 = std::time::Instant::now();
+        let _cpu = spherical_wahba_kernel_matrix_with_kind(
+            data_ll.view(),
+            centers_ll.view(),
+            penalty_order,
+            false,
+            SphereWahbaKernel::SobolevTruncated {
+                lmax: lmax as u16,
+            },
+        )
+        .expect("cpu kernel matrix");
+        let cpu_secs = t1.elapsed().as_secs_f64();
+
+        let ratio = cpu_secs / gpu_secs.max(1e-9);
+        eprintln!(
+            "[sphere_gpu hill-climb] n={n} m={m} L={lmax} cpu={cpu_secs:.3}s gpu={gpu_secs:.3}s ratio={ratio:.2}x"
+        );
+        assert!(
+            ratio >= 20.0,
+            "GPU kernel matrix only {ratio:.2}× faster than CPU (target ≥ 20×) at \
+             n={n} m={m} L={lmax}: cpu={cpu_secs:.3}s gpu={gpu_secs:.3}s"
+        );
+    }
+
+    /// V100 hill-climb: end-to-end Gaussian fit through
+    /// `build_spherical_spline_basis` (GPU-dispatched) must beat the
+    /// CPU-only fit by ≥ 10× wall-clock at a workload where the GPU
+    /// kernel build dominates PIRLS.
+    #[test]
+    fn sphere_gpu_end_to_end_fit_hill_climb_10x_vs_cpu() {
+        let Some(_runtime) = super::super::runtime::GpuRuntime::global() else {
+            eprintln!("[sphere_gpu hill-climb fit] no CUDA runtime — skipping");
+            return;
+        };
+        if SphereGpuBackend::probe().is_err() {
+            eprintln!("[sphere_gpu hill-climb fit] backend probe failed — skipping");
+            return;
+        }
+        use crate::basis::{
+            CenterStrategy, SphereMethod, SphericalSplineBasisSpec, build_spherical_spline_basis,
+        };
+
+        let n_lat = 500usize;
+        let n_lon = 400usize;
+        let data_ll = small_latlon_grid(n_lat, n_lon);
+        let m: usize = 200;
+        let lmax: u16 = 50;
+        let spec_gpu = SphericalSplineBasisSpec {
+            center_strategy: CenterStrategy::FarthestPoint { num_centers: m },
+            penalty_order: 2,
+            double_penalty: false,
+            radians: false,
+            method: SphereMethod::Wahba,
+            max_degree: None,
+            wahba_kernel: SphereWahbaKernel::SobolevTruncated { lmax },
+        };
+
+        // Warm-up GPU build.
+        let _ = build_spherical_spline_basis(data_ll.view(), &spec_gpu)
+            .expect("warmup build");
+
+        let t0 = std::time::Instant::now();
+        let _ = build_spherical_spline_basis(data_ll.view(), &spec_gpu)
+            .expect("gpu build");
+        let gpu_secs = t0.elapsed().as_secs_f64();
+
+        // CPU comparison: directly invoke the CPU helper and apply the
+        // same constraint transform (matches what build_*_basis would do
+        // when GPU dispatch declines). Going through the public matrix
+        // helper isolates the GPU-vs-CPU kernel cost without re-doing
+        // farthest-point center selection (which is identical for both
+        // paths).
+        let centers = crate::basis::select_spherical_farthest_point_centers(
+            data_ll.view(),
+            m,
+            false,
+        )
+        .expect("centers");
+        let weights = crate::basis::sphere_area_weights(centers.view(), false);
+        let z =
+            crate::basis::weighted_coefficient_sum_to_zero_transform(weights.view())
+                .expect("z");
+        let t1 = std::time::Instant::now();
+        let raw_cpu = spherical_wahba_kernel_matrix_with_kind(
+            data_ll.view(),
+            centers.view(),
+            2,
+            false,
+            SphereWahbaKernel::SobolevTruncated { lmax },
+        )
+        .expect("cpu raw");
+        let _design_cpu = raw_cpu.dot(&z);
+        let cpu_secs = t1.elapsed().as_secs_f64();
+
+        let ratio = cpu_secs / gpu_secs.max(1e-9);
+        eprintln!(
+            "[sphere_gpu hill-climb fit] n={} m={m} L={lmax} cpu={cpu_secs:.3}s gpu={gpu_secs:.3}s ratio={ratio:.2}x",
+            data_ll.nrows()
+        );
+        assert!(
+            ratio >= 10.0,
+            "End-to-end sphere fit only {ratio:.2}× faster on GPU (target ≥ 10×): \
+             cpu={cpu_secs:.3}s gpu={gpu_secs:.3}s"
+        );
+    }
 }

@@ -337,6 +337,39 @@ pub fn audit_identifiability(specs: &[ParameterBlockSpec]) -> Result<Identifiabi
         }
     }
 
+    // Per-joint-column gauge priority, inherited from the owning block.
+    // RRQR uses greedy column pivoting: at each step it picks the
+    // remaining column with the largest residual norm. When two
+    // columns carry the same direction (alias) the residual norms are
+    // identical after the earlier of the two enters the kept set, so
+    // RRQR's choice of "which one to keep" is determined by the order
+    // it scans columns. We exploit that by presenting columns in
+    // descending-priority order: high-priority columns are scanned
+    // first and enter the kept set first, so when an alias collapses
+    // it is the lower-priority block's column that gets demoted into
+    // the trailing rank-deficient space.
+    //
+    // For survival marginal-slope this realises the gauge-ownership
+    // contract: a shared affine direction between time_surface (high
+    // priority) and marginal_surface (lower) is dropped from
+    // marginal_surface, not from time_surface; a shared deviation
+    // direction between marginal_surface and score_warp_dev (lowest)
+    // is dropped from score_warp_dev. With all priorities equal (the
+    // default = 100) `priority_perm` is the identity (stable sort
+    // preserves spec order), so legacy callers see no behaviour
+    // change.
+    let mut priority_perm: Vec<usize> = (0..p_total).collect();
+    let col_block_idx: Vec<usize> = (0..specs.len())
+        .flat_map(|i| std::iter::repeat(i).take(col_offsets[i + 1] - col_offsets[i]))
+        .collect();
+    priority_perm.sort_by(|&a, &b| {
+        let pa = specs[col_block_idx[a]].gauge_priority;
+        let pb = specs[col_block_idx[b]].gauge_priority;
+        pb.cmp(&pa).then_with(|| a.cmp(&b))
+    });
+    let priority_perm_is_identity =
+        priority_perm.iter().enumerate().all(|(new_j, &old_j)| new_j == old_j);
+
     // Column-pivoted RRQR on the joint design. The pivot permutation
     // names which original columns were demoted past the rank
     // threshold, so we can attribute each dropped column back to its
@@ -346,12 +379,24 @@ pub fn audit_identifiability(specs: &[ParameterBlockSpec]) -> Result<Identifiabi
     // verdict and the per-block diagnostics are tolerance-consistent.
     let rrqr_started = std::time::Instant::now();
     log::info!(
-        "[STAGE] identifiability audit: joint RRQR start n={} p_total={}",
+        "[STAGE] identifiability audit: joint RRQR start n={} p_total={} priority_reorder={}",
         n,
         p_total,
+        !priority_perm_is_identity,
     );
-    let rrqr = rrqr_with_permutation(&x_joint, default_rrqr_rank_alpha())
-        .map_err(|e| format!("identifiability audit joint RRQR failed: {e:?}"))?;
+    let rrqr = if priority_perm_is_identity {
+        rrqr_with_permutation(&x_joint, default_rrqr_rank_alpha())
+            .map_err(|e| format!("identifiability audit joint RRQR failed: {e:?}"))?
+    } else {
+        let mut x_priority = Array2::<f64>::zeros((n, p_total));
+        for (new_j, &old_j) in priority_perm.iter().enumerate() {
+            x_priority
+                .column_mut(new_j)
+                .assign(&x_joint.column(old_j));
+        }
+        rrqr_with_permutation(&x_priority, default_rrqr_rank_alpha())
+            .map_err(|e| format!("identifiability audit joint RRQR (priority-ordered) failed: {e:?}"))?
+    };
     log::info!(
         "[STAGE] identifiability audit: joint RRQR end rank={}/{} elapsed={:.3}s",
         rrqr.rank,
@@ -360,7 +405,21 @@ pub fn audit_identifiability(specs: &[ParameterBlockSpec]) -> Result<Identifiabi
     );
     let joint_rank = rrqr.rank;
     let joint_rank_tol = rrqr.rank_tol;
-    let demoted_joint_cols: Vec<usize> = rrqr.column_permutation[rrqr.rank..].to_vec();
+    // RRQR's `column_permutation` indexes into the matrix it actually
+    // saw. If we reordered by priority, map those back to original
+    // joint-column indices so downstream block-attribution stays
+    // correct.
+    let map_to_original = |reordered_idx: usize| -> usize {
+        if priority_perm_is_identity {
+            reordered_idx
+        } else {
+            priority_perm[reordered_idx]
+        }
+    };
+    let demoted_joint_cols: Vec<usize> = rrqr.column_permutation[rrqr.rank..]
+        .iter()
+        .map(|&j| map_to_original(j))
+        .collect();
 
     // Pairwise overlap report on the joint design's normalised
     // columns. O(p_total² · n) — fine at GAM smooth widths. We only
