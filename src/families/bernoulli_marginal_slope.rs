@@ -7701,23 +7701,28 @@ impl BernoulliMarginalSlopeFamily {
                 }
             })
             .collect();
-        let nan_bits = f64::NAN.to_bits();
+        // Resolve β_h once for the preseed sweep so each row's tag includes
+        // the joint β that the FLEX intercept root actually depends on.
+        let beta_h = self.score_beta(block_states)?;
         let mut preseeded = 0usize;
         let mut kept_warm = 0usize;
         for (row, seed) in seeds.iter().enumerate() {
-            let slot = &cache[row];
             if !seed.is_finite() {
                 continue;
             }
-            match slot.compare_exchange(
-                nan_bits,
-                seed.to_bits(),
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => preseeded += 1,
-                Err(prev) => {
-                    if f64::from_bits(prev).is_finite() {
+            let beta_tag = hash_intercept_warm_start_key_flex(
+                marginal_eta[row],
+                slope_eta[row],
+                beta_h,
+                beta_w,
+            );
+            match cache.compare_exchange_unseeded(row, *seed, beta_tag) {
+                Ok(()) => preseeded += 1,
+                Err(prev_tag) => {
+                    if prev_tag == beta_tag {
+                        // A prior write at the same β already published a
+                        // value for this row; the cached intercept is reused
+                        // verbatim by the subsequent root solve.
                         kept_warm += 1;
                     }
                 }
