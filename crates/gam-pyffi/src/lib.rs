@@ -2564,6 +2564,32 @@ fn bspline_basis_derivative<'py>(
     Ok(basis.into_pyarray(py).unbind())
 }
 
+/// Build a closed cyclic uniform B-spline basis and its cyclic difference
+/// penalty on the periodic parameter `t`.
+///
+/// The basis lives on `[0, 1)` (values of `t` are reduced modulo 1 by the
+/// underlying kernel) with `n_knots` cyclic control points, and the
+/// returned penalty is the `penalty_order`-th cyclic difference penalty on
+/// those coefficients (constant vector is its only nullspace direction).
+#[pyfunction(signature = (t, n_knots, degree = 3, penalty_order = 2))]
+fn periodic_spline_curve_basis<'py>(
+    py: Python<'py>,
+    t: PyReadonlyArray1<'py, f64>,
+    n_knots: usize,
+    degree: usize,
+    penalty_order: usize,
+) -> PyResult<(Py<PyArray2<f64>>, Py<PyArray2<f64>>)> {
+    let spec = PeriodicBSplineBasisSpec::new(degree, n_knots, 1.0, 0.0, penalty_order);
+    let basis =
+        build_periodic_bspline_basis_1d(t.as_array(), &spec).map_err(|e| py_value_error(e.to_string()))?;
+    let penalty = create_cyclic_difference_penalty_matrix(n_knots, penalty_order)
+        .map_err(|e| py_value_error(e.to_string()))?;
+    Ok((
+        basis.into_pyarray(py).unbind(),
+        penalty.into_pyarray(py).unbind(),
+    ))
+}
+
 #[pyfunction]
 fn periodic_basis_with_jet<'py>(
     py: Python<'py>,
@@ -20447,6 +20473,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(bspline_basis_derivative, module)?)?;
     module.add_function(wrap_pyfunction!(basis_with_jet, module)?)?;
     module.add_function(wrap_pyfunction!(periodic_basis_with_jet, module)?)?;
+    module.add_function(wrap_pyfunction!(periodic_spline_curve_basis, module)?)?;
     module.add_function(wrap_pyfunction!(duchon_basis_with_jet, module)?)?;
     module.add_function(wrap_pyfunction!(duchon_basis, module)?)?;
     module.add_function(wrap_pyfunction!(matern_basis, module)?)?;
