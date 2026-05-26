@@ -8492,7 +8492,7 @@ fn collect_term_column_names(terms: &[ParsedTerm], out: &mut BTreeSet<String>) {
             | ParsedTerm::RandomEffect { name } => {
                 out.insert(name.clone());
             }
-            ParsedTerm::Smooth { vars, .. } => {
+            ParsedTerm::Smooth { vars, .. } | ParsedTerm::Interaction { vars } => {
                 out.extend(vars.iter().cloned());
             }
             ParsedTerm::LinkWiggle { .. }
@@ -12308,6 +12308,7 @@ mod tests {
             linear_terms: vec![LinearTermSpec {
                 name: "pc1".to_string(),
                 feature_col: 0,
+                feature_cols: vec![0],
                 double_penalty: true,
                 coefficient_geometry: LinearCoefficientGeometry::default(),
                 coefficient_min: None,

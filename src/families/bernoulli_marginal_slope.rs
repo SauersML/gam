@@ -4624,7 +4624,6 @@ impl RowCellMomentsBundle {
             .saturating_add(cell_records)
             .saturating_add(moment_payload)
     }
-
 }
 
 #[derive(Clone)]
@@ -4922,8 +4921,8 @@ fn log_exact_work(n: usize) -> bool {
 fn runtime_available_memory_bytes() -> u64 {
     static SYSTEM: OnceLock<Mutex<sysinfo::System>> = OnceLock::new();
     let lock = SYSTEM.get_or_init(|| {
-        let refresh = sysinfo::RefreshKind::new()
-            .with_memory(sysinfo::MemoryRefreshKind::everything());
+        let refresh =
+            sysinfo::RefreshKind::new().with_memory(sysinfo::MemoryRefreshKind::everything());
         Mutex::new(sysinfo::System::new_with_specifics(refresh))
     });
     let mut system = lock.lock().expect("sysinfo system mutex poisoned");
@@ -18646,8 +18645,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
             // before any eval ran) into the family warm-start slot now that
             // we know the per-block widths from the freshly built blocks.
             if let Some(beta_seed) = pending_beta_seed.borrow_mut().take() {
-                let widths: Vec<usize> =
-                    blocks.iter().map(|b| b.design.ncols()).collect();
+                let widths: Vec<usize> = blocks.iter().map(|b| b.design.ncols()).collect();
                 match CustomFamilyWarmStart::from_cached_beta(&widths, &beta_seed) {
                     Ok(ws) => {
                         exact_warm_start.replace(Some(ws));
@@ -18700,8 +18698,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
             let rho = theta.slice(s![..setup.rho_dim()]).to_owned();
             let blocks = build_blocks(&rho, &designs[0], &designs[1])?;
             if let Some(beta_seed) = pending_beta_seed.borrow_mut().take() {
-                let widths: Vec<usize> =
-                    blocks.iter().map(|b| b.design.ncols()).collect();
+                let widths: Vec<usize> = blocks.iter().map(|b| b.design.ncols()).collect();
                 match CustomFamilyWarmStart::from_cached_beta(&widths, &beta_seed) {
                     Ok(ws) => {
                         exact_warm_start.replace(Some(ws));
@@ -27761,8 +27758,7 @@ mod tests {
 
     #[test]
     fn bernoulli_flex_row_primary_hessian_cache_policy_streams_low_reuse() {
-        let plan =
-            decide_row_primary_hessian_cache(100, 4, 1, 16 * 1024 * 1024 * 1024, 0);
+        let plan = decide_row_primary_hessian_cache(100, 4, 1, 16 * 1024 * 1024 * 1024, 0);
         assert!(!plan.materialize);
         assert_eq!(plan.reason, RowPrimaryHessianCacheReason::ReuseTooLow);
     }

@@ -45,6 +45,7 @@ fn mixed_term_spec() -> TermCollectionSpec {
             LinearTermSpec {
                 name: "lin_a".to_string(),
                 feature_col: 0,
+                feature_cols: vec![0],
                 double_penalty: false,
                 coefficient_geometry: Default::default(),
                 coefficient_min: None,
@@ -53,6 +54,7 @@ fn mixed_term_spec() -> TermCollectionSpec {
             LinearTermSpec {
                 name: "lin_b".to_string(),
                 feature_col: 1,
+                feature_cols: vec![1],
                 double_penalty: false,
                 coefficient_geometry: Default::default(),
                 coefficient_min: None,
@@ -467,6 +469,7 @@ fn three_linear_spec() -> (TermCollectionSpec, Array2<f64>) {
             LinearTermSpec {
                 name: "z1".to_string(),
                 feature_col: 0,
+                feature_cols: vec![0],
                 double_penalty: false,
                 coefficient_geometry: Default::default(),
                 coefficient_min: None,
@@ -475,6 +478,7 @@ fn three_linear_spec() -> (TermCollectionSpec, Array2<f64>) {
             LinearTermSpec {
                 name: "z2".to_string(),
                 feature_col: 1,
+                feature_cols: vec![1],
                 double_penalty: false,
                 coefficient_geometry: Default::default(),
                 coefficient_min: None,
@@ -483,6 +487,7 @@ fn three_linear_spec() -> (TermCollectionSpec, Array2<f64>) {
             LinearTermSpec {
                 name: "z3".to_string(),
                 feature_col: 2,
+                feature_cols: vec![2],
                 double_penalty: false,
                 coefficient_geometry: Default::default(),
                 coefficient_min: None,

@@ -47,6 +47,7 @@ fn two_linear_term_spec() -> TermCollectionSpec {
             LinearTermSpec {
                 name: "score_a".to_string(),
                 feature_col: 0,
+                feature_cols: vec![0],
                 double_penalty: false,
                 coefficient_geometry: Default::default(),
                 coefficient_min: None,
@@ -55,6 +56,7 @@ fn two_linear_term_spec() -> TermCollectionSpec {
             LinearTermSpec {
                 name: "score_b".to_string(),
                 feature_col: 1,
+                feature_cols: vec![1],
                 double_penalty: false,
                 coefficient_geometry: Default::default(),
                 coefficient_min: None,

@@ -46,6 +46,7 @@ fn coefficient_groups_with_gamma_priors_add_distinct_penalty_coordinates() {
             LinearTermSpec {
                 name: "x0".into(),
                 feature_col: 0,
+                feature_cols: vec![0],
                 double_penalty: true,
                 coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
                 coefficient_min: None,
@@ -54,6 +55,7 @@ fn coefficient_groups_with_gamma_priors_add_distinct_penalty_coordinates() {
             LinearTermSpec {
                 name: "x1".into(),
                 feature_col: 1,
+                feature_cols: vec![1],
                 double_penalty: true,
                 coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
                 coefficient_min: None,
@@ -107,6 +109,7 @@ fn joint_design_build_freeze_keeps_spec_order_stable() {
         linear_terms: vec![LinearTermSpec {
             name: "a".into(),
             feature_col: 0,
+            feature_cols: vec![0],
             double_penalty: false,
             coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
             coefficient_min: None,
@@ -119,6 +122,7 @@ fn joint_design_build_freeze_keeps_spec_order_stable() {
         linear_terms: vec![LinearTermSpec {
             name: "b".into(),
             feature_col: 0,
+            feature_cols: vec![0],
             double_penalty: false,
             coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
             coefficient_min: None,

@@ -5323,7 +5323,7 @@ pub struct GaussianLocationScaleFamily {
     /// Cached per-observation row scalars keyed by 6-element fingerprint
     /// (first, mid, last elements of both eta vectors).
     /// Avoids recomputing O(n) scalars K+ times per REML gradient/Hessian evaluation.
-    cached_row_scalars:
+    pub cached_row_scalars:
         std::sync::RwLock<Option<(f64, f64, f64, f64, f64, f64, Arc<GaussianJointRowScalars>)>>,
 }
 
@@ -5737,7 +5737,7 @@ type GaussianLocationScaleWiggleExactNewtonJointPsiWorkspace =
     GaussianLocationScaleJointPsiWorkspace<GaussianLocationScaleWiggleFamily>;
 
 #[derive(Clone)]
-struct GaussianJointRowScalars {
+pub struct GaussianJointRowScalars {
     obs_weight: Array1<f64>,
     w: Array1<f64>,
     m: Array1<f64>,

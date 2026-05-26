@@ -580,8 +580,7 @@ impl<'a> RemlState<'a> {
                     .execute_pirls_stateless_for_cubature(&sigma_points[idx])
                     .ok()?;
                 let h_point = map_hessian_to_original_basis(fit_point.as_ref()).ok()?;
-                let cov_point =
-                    matrix_inversewith_regularization(&h_point, "auto cubature point")?;
+                let cov_point = matrix_inversewith_regularization(&h_point, "auto cubature point")?;
                 let beta_point = fit_point
                     .reparam_result
                     .qs

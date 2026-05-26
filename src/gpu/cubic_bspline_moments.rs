@@ -56,12 +56,6 @@ use std::sync::OnceLock;
 
 use super::error::GpuError;
 
-#[cfg(target_os = "linux")]
-use std::sync::{Arc, Mutex};
-
-#[cfg(target_os = "linux")]
-use cudarc::driver::{CudaContext, CudaModule, CudaStream};
-
 // ────────────────────────────────────────────────────────────────────────
 // Constants and small numeric helpers
 // ────────────────────────────────────────────────────────────────────────
@@ -219,7 +213,10 @@ pub fn differentiate_basis_coeffs(a: [f64; ACTIVE_PER_SPAN]) -> [f64; ACTIVE_PER
 /// Convolve two degree-≤3 coefficient vectors into a degree-≤6 product vector
 /// (section 1 explicit formula). Branch-free, FMA-friendly.
 #[inline]
-pub fn convolve_basis_pair(a: [f64; ACTIVE_PER_SPAN], b: [f64; ACTIVE_PER_SPAN]) -> [f64; PROD_LEN] {
+pub fn convolve_basis_pair(
+    a: [f64; ACTIVE_PER_SPAN],
+    b: [f64; ACTIVE_PER_SPAN],
+) -> [f64; PROD_LEN] {
     let mut c = [0.0; PROD_LEN];
     for i in 0..ACTIVE_PER_SPAN {
         if a[i] == 0.0 {
@@ -507,10 +504,7 @@ pub struct CubicMomentSpec {
 
 impl CubicMomentSpec {
     pub fn d(&self) -> usize {
-        self.alphas
-            .first()
-            .map(|v| v.len())
-            .unwrap_or(0)
+        self.alphas.first().map(|v| v.len()).unwrap_or(0)
     }
 
     pub fn n_alpha(&self) -> usize {
@@ -531,7 +525,12 @@ pub fn build_axis_tables_cpu(
     for axis in 0..d {
         // Distinct (deriv_left[axis], deriv_right[axis]) pairs across all alphas.
         let mut sigs: Vec<(u8, u8)> = (0..spec.n_alpha())
-            .map(|i| (spec.derivative_left[i][axis], spec.derivative_right[i][axis]))
+            .map(|i| {
+                (
+                    spec.derivative_left[i][axis],
+                    spec.derivative_right[i][axis],
+                )
+            })
             .collect();
         sigs.sort_unstable();
         sigs.dedup();
@@ -602,31 +601,12 @@ pub struct DeviceMarginalTable {
 // CUDA backend handle (Phase 2 entry point; Phase 1 only probes/caches).
 // ────────────────────────────────────────────────────────────────────────
 
-/// Process-wide cache of compiled NVRTC modules keyed by specialization.
+/// Probe handle for the cubic-B-spline moments GPU backend. Currently a
+/// marker — Phase 1 only validates that a CUDA runtime is reachable on
+/// Linux; consumers that need a live context/stream/module cache will be
+/// added when the downstream kernels land.
 #[must_use]
-pub struct CubicMomentBackend {
-    #[cfg(target_os = "linux")]
-    inner: CubicMomentBackendLinux,
-}
-
-#[cfg(target_os = "linux")]
-struct CubicMomentBackendLinux {
-    ctx: Arc<CudaContext>,
-    stream: Arc<CudaStream>,
-    modules: Mutex<std::collections::HashMap<ModuleKey, Arc<CudaModule>>>,
-}
-
-#[cfg(target_os = "linux")]
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct ModuleKey {
-    d: u8,
-    amax: u8,
-    n_alpha: u16,
-    alpha_hash: u64,
-    deriv_hash: u64,
-    layout: u8,
-    cell_shape: u8,
-}
+pub struct CubicMomentBackend;
 
 impl CubicMomentBackend {
     pub const fn compiled() -> bool {
@@ -659,22 +639,18 @@ impl CubicMomentBackend {
                 reason: "cubic_bspline_moments backend: no CUDA runtime available".to_string(),
             }
         })?;
-        let ctx = super::runtime::cuda_context_for(runtime.selected_device().ordinal).ok_or_else(
-            || GpuError::DriverCallFailed {
+        // Touch the device ordinal so the probe fails fast when the CUDA
+        // context for the selected device cannot be created — the eventual
+        // kernel consumers will need this to succeed.
+        super::runtime::cuda_context_for(runtime.selected_device().ordinal).ok_or_else(|| {
+            GpuError::DriverCallFailed {
                 reason: format!(
                     "cubic_bspline_moments backend: failed to create CUDA context for device {}",
                     runtime.selected_device().ordinal
                 ),
-            },
-        )?;
-        let stream = ctx.default_stream();
-        Ok(Self {
-            inner: CubicMomentBackendLinux {
-                ctx,
-                stream,
-                modules: Mutex::new(std::collections::HashMap::new()),
-            },
-        })
+            }
+        })?;
+        Ok(Self)
     }
 }
 
@@ -720,7 +696,7 @@ mod cubic_bspline_moments_tests {
     /// Implemented as a macro (not a fn) so each call site inlines an `assert!`
     /// — keeps the build's "test bodies must contain assertions" scanner happy.
     macro_rules! assert_close {
-        ($label:expr, $got:expr, $expected:expr, $rel:expr, $abs:expr) => {{
+        ($label:expr, $got:expr, $expected:expr, $rel:expr, $abs:expr $(,)?) => {{
             let got_v: f64 = $got;
             let expected_v: f64 = $expected;
             let rel_v: f64 = $rel;
@@ -820,7 +796,12 @@ mod cubic_bspline_moments_tests {
             for pair in 0..PAIRS_PER_SPAN {
                 let c = tables.prod(span, pair);
                 for nu in 0..=3usize {
-                    for &m in &[left - 0.3, left + 0.1, left + 0.5 * width, left + width + 0.2] {
+                    for &m in &[
+                        left - 0.3,
+                        left + 0.1,
+                        left + 0.5 * width,
+                        left + width + 0.2,
+                    ] {
                         let closed = moment_1d_about(c, width, nu, m - left);
                         let gl = moment_1d_gauss_legendre(c, left, width, nu, m);
                         assert_close!(
@@ -871,12 +852,8 @@ mod cubic_bspline_moments_tests {
                 for pa in [0usize, 4, 9] {
                     for pb in [0usize, 3, 7] {
                         for alpha in &[[0u8, 0u8], [1, 0], [0, 1], [2, 1], [3, 3]] {
-                            let m_tensor = tensor_hex_moment_cpu(
-                                &axes,
-                                &[sx, sy],
-                                alpha,
-                                &[pa, pb],
-                            );
+                            let m_tensor =
+                                tensor_hex_moment_cpu(&axes, &[sx, sy], alpha, &[pa, pb]);
                             let m_marginal = table_x.moment_local(sx, pa, alpha[0] as usize)
                                 * table_y.moment_local(sy, pb, alpha[1] as usize);
                             assert_close!(
@@ -962,7 +939,10 @@ mod cubic_bspline_moments_tests {
             // Linux probe may succeed or fail depending on libcuda availability;
             // both are acceptable. The hard requirement is "does not panic" —
             // reaching this assertion at all is the proof of that.
-            assert!(probe.is_ok() || probe.is_err(), "probe must return a Result");
+            assert!(
+                probe.is_ok() || probe.is_err(),
+                "probe must return a Result"
+            );
         } else {
             assert!(probe.is_err(), "non-Linux probe must return Err");
         }

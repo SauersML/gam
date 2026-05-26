@@ -222,6 +222,7 @@ pub fn build_termspec(
                     linear_terms.push(LinearTermSpec {
                         name: name.clone(),
                         feature_col: col,
+                        feature_cols: vec![col],
                         double_penalty: true,
                         coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
                         coefficient_min: *coefficient_min,
@@ -233,6 +234,7 @@ pub fn build_termspec(
                             linear_terms.push(LinearTermSpec {
                                 name: name.clone(),
                                 feature_col: col,
+                                feature_cols: vec![col],
                                 double_penalty: true,
                                 coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
                                 coefficient_min: *coefficient_min,
@@ -279,6 +281,7 @@ pub fn build_termspec(
                 linear_terms.push(LinearTermSpec {
                     name: name.clone(),
                     feature_col: col,
+                    feature_cols: vec![col],
                     double_penalty: false,
                     coefficient_geometry: LinearCoefficientGeometry::Bounded {
                         min: *min,

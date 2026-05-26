@@ -73,18 +73,17 @@ use gam::solver::reml_compare::{RemlCandidate, compare_reml_fits as compare_reml
 use gam::survival_marginal_slope::SurvivalMarginalSlopeFitResult;
 use gam::terms::basis::{
     BasisOptions, CenterStrategy, Dense, DuchonBasisSpec, DuchonNullspaceOrder,
-    DuchonOperatorPenaltySpec, MaternBasisSpec, OperatorPenaltySpec,
-    MaternIdentifiability, MaternNu, OneDimensionalBoundary, PeriodicBSplineBasisSpec,
-    SpatialIdentifiability, SphereMethod, SphereWahbaKernel, SphericalSplineBasisSpec,
-    SplineScratch, auto_centers_1d_equal_mass, auto_knot_vector_1d_quantile,
-    bspline_tensor_first_derivative, build_duchon_basis, build_duchon_basis_mixed_periodicity_auto,
+    DuchonOperatorPenaltySpec, MaternBasisSpec, MaternIdentifiability, MaternNu,
+    OneDimensionalBoundary, OperatorPenaltySpec, PeriodicBSplineBasisSpec, SpatialIdentifiability,
+    SphereMethod, SphereWahbaKernel, SphericalSplineBasisSpec, SplineScratch,
+    auto_centers_1d_equal_mass, auto_knot_vector_1d_quantile, bspline_tensor_first_derivative,
+    build_duchon_basis, build_duchon_basis_mixed_periodicity_auto,
     build_duchon_operator_penalty_matrices, build_matern_basis, build_periodic_bspline_basis_1d,
     build_spherical_spline_basis, build_thin_plate_penalty_matrix, create_basis,
     create_cyclic_difference_penalty_matrix, create_difference_penalty_matrix,
-    duchon_polynomial_first_derivative_nd,
-    duchon_radial_first_derivative_nd, duchon_radial_second_derivative_nd, monomial_exponents,
-    evaluate_bspline_basis_scalar,
-    matern_radial_first_derivative_nd, matern_radial_second_derivative_nd,
+    duchon_polynomial_first_derivative_nd, duchon_radial_first_derivative_nd,
+    duchon_radial_second_derivative_nd, evaluate_bspline_basis_scalar,
+    matern_radial_first_derivative_nd, matern_radial_second_derivative_nd, monomial_exponents,
     periodic_bspline_first_derivative_nd, resolve_duchon_orders,
     select_spherical_farthest_point_centers, sphere_first_derivative_nd,
 };
@@ -2583,8 +2582,8 @@ fn periodic_spline_curve_basis<'py>(
     penalty_order: usize,
 ) -> PyResult<(Py<PyArray2<f64>>, Py<PyArray2<f64>>)> {
     let spec = PeriodicBSplineBasisSpec::new(degree, n_knots, 1.0, 0.0, penalty_order);
-    let basis =
-        build_periodic_bspline_basis_1d(t.as_array(), &spec).map_err(|e| py_value_error(e.to_string()))?;
+    let basis = build_periodic_bspline_basis_1d(t.as_array(), &spec)
+        .map_err(|e| py_value_error(e.to_string()))?;
     let penalty = create_cyclic_difference_penalty_matrix(n_knots, penalty_order)
         .map_err(|e| py_value_error(e.to_string()))?;
     Ok((
@@ -8904,8 +8903,7 @@ fn sae_manifold_fit_inner<'py>(
                         // contract `assignments.sum(axis=1) == 1` still holds.
                         let inv = 1.0 / (k_top as f64);
                         for atom_idx in 0..k_atoms {
-                            assignments[[row, atom_idx]] =
-                                if keep[atom_idx] { inv } else { 0.0 };
+                            assignments[[row, atom_idx]] = if keep[atom_idx] { inv } else { 0.0 };
                         }
                     }
                 } else {
@@ -20844,7 +20842,10 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(duchon_operator_penalties, module)?)?;
     module.add_function(wrap_pyfunction!(sphere_basis, module)?)?;
     module.add_function(wrap_pyfunction!(sphere_basis_with_centers, module)?)?;
-    module.add_function(wrap_pyfunction!(sphere_select_farthest_point_centers, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        sphere_select_farthest_point_centers,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(sphere_chart_basis_with_jet, module)?)?;
     module.add_function(wrap_pyfunction!(thin_plate_penalty, module)?)?;
     module.add_function(wrap_pyfunction!(auto_knots_1d, module)?)?;

@@ -1857,8 +1857,8 @@ pub fn parse_formula(formula: &str) -> Result<ParsedFormula, FormulaDslError> {
                 })
                 .any(|(d, ch)| d == 0 && matches!(ch, ':' | '*' | '/' | '^'));
         if needs_expansion {
-            for atoms in expand_wr_term(trimmed)
-                .map_err(|reason| FormulaDslError::ParseError { reason })?
+            for atoms in
+                expand_wr_term(trimmed).map_err(|reason| FormulaDslError::ParseError { reason })?
             {
                 if atoms.is_empty() {
                     continue;

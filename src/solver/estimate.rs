@@ -2974,7 +2974,7 @@ where
             None => problem,
         };
 
-        let mut obj = problem.build_objective_with_screening_proxy(
+        let obj = problem.build_objective_with_screening_proxy(
             &mut reml_state,
             |state: &mut &mut crate::solver::estimate::reml::RemlState<'_>, rho: &Array1<f64>| {
                 state.compute_cost(rho)
@@ -3021,8 +3021,7 @@ where
         // when the pre-warm forwards the cached β, install it into the
         // same `warm_start_beta` slot the publisher reads from.
         let mut obj = obj.with_seed_inner_state(
-            |state: &mut &mut crate::solver::estimate::reml::RemlState<'_>,
-             beta: &Array1<f64>| {
+            |state: &mut &mut crate::solver::estimate::reml::RemlState<'_>, beta: &Array1<f64>| {
                 state.setwarm_start_original_beta(Some(beta.view()));
                 Ok(())
             },
@@ -3217,7 +3216,7 @@ where
             }
         };
 
-        let mut obj = problem.build_objective(
+        let obj = problem.build_objective(
             &mut reml_state,
             |state: &mut &mut crate::solver::estimate::reml::RemlState<'_>,
              theta: &Array1<f64>| {
@@ -3337,8 +3336,7 @@ where
         // src/solver/estimate.rs:3275), so continuation pre-warm needs
         // a real seed hook to install it.
         let mut obj = obj.with_seed_inner_state(
-            |state: &mut &mut crate::solver::estimate::reml::RemlState<'_>,
-             beta: &Array1<f64>| {
+            |state: &mut &mut crate::solver::estimate::reml::RemlState<'_>, beta: &Array1<f64>| {
                 state.setwarm_start_original_beta(Some(beta.view()));
                 Ok(())
             },

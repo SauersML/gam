@@ -464,7 +464,9 @@ pub const fn sphere_gpu_compiled() -> bool {
 pub fn sphere_kernel_decision(n: usize, m: usize, lmax: usize) -> GpuDecision {
     let large_enough = if let Some(runtime) = super::runtime::GpuRuntime::global() {
         let ld = ((n + 31) / 32) * 32;
-        let needed_bytes = ld.saturating_mul(m).saturating_mul(std::mem::size_of::<f64>());
+        let needed_bytes = ld
+            .saturating_mul(m)
+            .saturating_mul(std::mem::size_of::<f64>());
         let budget = runtime.memory_budget_bytes;
         n.saturating_mul(m) >= 1_000_000 && lmax <= 200 && needed_bytes <= budget
     } else {
@@ -617,30 +619,34 @@ pub fn build_kernel_matrix_device(
             })?;
         let stream = backend.inner.stream.clone();
 
-        let data_dev = stream
-            .memcpy_stod(inputs.data_xyz)
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("sphere htod data_xyz: {err}"),
-            })?;
-        let centers_dev = stream
-            .memcpy_stod(inputs.centers_xyz)
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("sphere htod centers_xyz: {err}"),
-            })?;
-        let coeffs_dev = stream
-            .memcpy_stod(inputs.coeffs)
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("sphere htod coeffs: {err}"),
-            })?;
+        let data_dev =
+            stream
+                .clone_htod(inputs.data_xyz)
+                .map_err(|err| GpuError::DriverCallFailed {
+                    reason: format!("sphere htod data_xyz: {err}"),
+                })?;
+        let centers_dev =
+            stream
+                .clone_htod(inputs.centers_xyz)
+                .map_err(|err| GpuError::DriverCallFailed {
+                    reason: format!("sphere htod centers_xyz: {err}"),
+                })?;
+        let coeffs_dev =
+            stream
+                .clone_htod(inputs.coeffs)
+                .map_err(|err| GpuError::DriverCallFailed {
+                    reason: format!("sphere htod coeffs: {err}"),
+                })?;
 
         let n = inputs.n;
         let m = inputs.m;
         let ld = ((n + 31) / 32) * 32;
-        let mut out_dev = stream
-            .alloc_zeros::<f64>(ld * m)
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("sphere alloc out (ld={ld}, m={m}): {err}"),
-            })?;
+        let mut out_dev =
+            stream
+                .alloc_zeros::<f64>(ld * m)
+                .map_err(|err| GpuError::DriverCallFailed {
+                    reason: format!("sphere alloc out (ld={ld}, m={m}): {err}"),
+                })?;
 
         // Block (32, 8, 1) — x over centers, y over rows.
         let block_x: u32 = 32;
@@ -676,9 +682,11 @@ pub fn build_kernel_matrix_device(
         unsafe { builder.launch(cfg) }.map_err(|err| GpuError::DriverCallFailed {
             reason: format!("sphere raw kernel launch: {err}"),
         })?;
-        stream.synchronize().map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("sphere raw kernel synchronize: {err}"),
-        })?;
+        stream
+            .synchronize()
+            .map_err(|err| GpuError::DriverCallFailed {
+                reason: format!("sphere raw kernel synchronize: {err}"),
+            })?;
 
         Ok(DeviceS2KernelMatrix {
             rows: n,
@@ -744,23 +752,26 @@ pub fn build_householder_constrained_design_device(
             })?;
         let stream = backend.inner.stream.clone();
 
-        let data_dev = stream
-            .memcpy_stod(inputs.data_xyz)
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("sphere-hh htod data_xyz: {err}"),
-            })?;
-        let centers_dev = stream
-            .memcpy_stod(inputs.centers_xyz)
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("sphere-hh htod centers_xyz: {err}"),
-            })?;
-        let coeffs_dev = stream
-            .memcpy_stod(inputs.coeffs)
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("sphere-hh htod coeffs: {err}"),
-            })?;
+        let data_dev =
+            stream
+                .clone_htod(inputs.data_xyz)
+                .map_err(|err| GpuError::DriverCallFailed {
+                    reason: format!("sphere-hh htod data_xyz: {err}"),
+                })?;
+        let centers_dev =
+            stream
+                .clone_htod(inputs.centers_xyz)
+                .map_err(|err| GpuError::DriverCallFailed {
+                    reason: format!("sphere-hh htod centers_xyz: {err}"),
+                })?;
+        let coeffs_dev =
+            stream
+                .clone_htod(inputs.coeffs)
+                .map_err(|err| GpuError::DriverCallFailed {
+                    reason: format!("sphere-hh htod coeffs: {err}"),
+                })?;
         let v_dev = stream
-            .memcpy_stod(v)
+            .clone_htod(v)
             .map_err(|err| GpuError::DriverCallFailed {
                 reason: format!("sphere-hh htod v: {err}"),
             })?;
@@ -806,9 +817,11 @@ pub fn build_householder_constrained_design_device(
         unsafe { builder.launch(cfg) }.map_err(|err| GpuError::DriverCallFailed {
             reason: format!("sphere-hh kernel launch: {err}"),
         })?;
-        stream.synchronize().map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("sphere-hh kernel synchronize: {err}"),
-        })?;
+        stream
+            .synchronize()
+            .map_err(|err| GpuError::DriverCallFailed {
+                reason: format!("sphere-hh kernel synchronize: {err}"),
+            })?;
 
         Ok(DeviceS2KernelMatrix {
             rows: n,
@@ -919,26 +932,18 @@ pub fn constrained_penalty_host(
     let (m1, m2) = c.dim();
     if m1 != m2 {
         return Err(GpuError::DriverCallFailed {
-            reason: format!(
-                "constrained_penalty_host: C must be square, got {m1}x{m2}"
-            ),
+            reason: format!("constrained_penalty_host: C must be square, got {m1}x{m2}"),
         });
     }
     let m = m1;
     if w.len() != m {
         return Err(GpuError::DriverCallFailed {
-            reason: format!(
-                "constrained_penalty_host: w.len()={} != m={}",
-                w.len(),
-                m
-            ),
+            reason: format!("constrained_penalty_host: w.len()={} != m={}", w.len(), m),
         });
     }
     if m < 2 {
         return Err(GpuError::DriverCallFailed {
-            reason: format!(
-                "constrained_penalty_host: m must be >= 2 (got {m})"
-            ),
+            reason: format!("constrained_penalty_host: m must be >= 2 (got {m})"),
         });
     }
     let (v, beta) = householder_reflector_from_weights(w);
@@ -957,8 +962,8 @@ pub fn constrained_penalty_host(
     let mut hch = Array2::<f64>::zeros((m, m));
     for i in 0..m {
         for j in 0..m {
-            hch[(i, j)] = c[(i, j)] - beta * (v[i] * u[j] + u[i] * v[j])
-                + beta * beta * vtcv * v[i] * v[j];
+            hch[(i, j)] =
+                c[(i, j)] - beta * (v[i] * u[j] + u[i] * v[j]) + beta * beta * vtcv * v[i] * v[j];
         }
     }
     // Drop the first row and column (the Householder-constrained nullspace).
@@ -1033,10 +1038,7 @@ pub fn solve_penalised_ls_device(
     let p = x_s_device.cols;
     if wy.len() != n {
         return Err(GpuError::DriverCallFailed {
-            reason: format!(
-                "solve_penalised_ls_device: wy.len()={} != n={n}",
-                wy.len()
-            ),
+            reason: format!("solve_penalised_ls_device: wy.len()={} != n={n}", wy.len()),
         });
     }
     if r_s.dim() != (p, p) {
@@ -1069,9 +1071,7 @@ pub fn solve_penalised_ls_device(
     for j in 0..p {
         let src_off = j * x_s_device.ld;
         let dst_off = j * n_aug;
-        a_aug_host[dst_off..dst_off + n].copy_from_slice(
-            &x_host_colmajor[src_off..src_off + n],
-        );
+        a_aug_host[dst_off..dst_off + n].copy_from_slice(&x_host_colmajor[src_off..src_off + n]);
         for i in 0..p {
             // R_S is row-major host; insert into column j of the lower
             // block (rows n..n+p) as r_s[i, j].
@@ -1079,7 +1079,7 @@ pub fn solve_penalised_ls_device(
         }
     }
     let mut a_dev = stream
-        .memcpy_stod(&a_aug_host)
+        .clone_htod(&a_aug_host)
         .map_err(|err| GpuError::DriverCallFailed {
             reason: format!("solve_penalised_ls_device htod A_aug: {err}"),
         })?;
@@ -1088,7 +1088,7 @@ pub fn solve_penalised_ls_device(
     let mut b_host = vec![0.0_f64; n_aug];
     b_host[..n].copy_from_slice(wy);
     let mut b_dev = stream
-        .memcpy_stod(&b_host)
+        .clone_htod(&b_host)
         .map_err(|err| GpuError::DriverCallFailed {
             reason: format!("solve_penalised_ls_device htod b_aug: {err}"),
         })?;
@@ -1128,11 +1128,12 @@ pub fn solve_penalised_ls_device(
     let lwork_us = usize::try_from(lwork).map_err(|_| GpuError::DriverCallFailed {
         reason: format!("solve_penalised_ls_device: negative lwork={lwork}"),
     })?;
-    let mut workspace = stream
-        .alloc_zeros::<f64>(lwork_us.max(1))
-        .map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("solve_penalised_ls_device alloc workspace: {err}"),
-        })?;
+    let mut workspace =
+        stream
+            .alloc_zeros::<f64>(lwork_us.max(1))
+            .map_err(|err| GpuError::DriverCallFailed {
+                reason: format!("solve_penalised_ls_device alloc workspace: {err}"),
+            })?;
     let mut tau = stream
         .alloc_zeros::<f64>(p)
         .map_err(|err| GpuError::DriverCallFailed {
@@ -1328,12 +1329,18 @@ pub fn solve_penalised_ls_device(
 
 #[cfg(not(target_os = "linux"))]
 pub fn solve_penalised_ls_device(
-    _: &DeviceS2KernelMatrix,
-    _: &[f64],
-    _: ArrayView2<'_, f64>,
+    x_s_device: &DeviceS2KernelMatrix,
+    wy: &[f64],
+    r_s: ArrayView2<'_, f64>,
 ) -> Result<PenalisedLsSolution, GpuError> {
     Err(GpuError::DriverLibraryUnavailable {
-        reason: "sphere GPU cuSOLVER QR path is Linux-only".to_string(),
+        reason: format!(
+            "sphere GPU cuSOLVER QR path is Linux-only (n={}, p={}, wy.len()={}, r_s={:?})",
+            x_s_device.rows,
+            x_s_device.cols,
+            wy.len(),
+            r_s.dim()
+        ),
     })
 }
 
@@ -1345,7 +1352,7 @@ pub fn solve_penalised_ls_device(
 mod sphere_gpu_tests {
     use super::*;
     use crate::basis::{
-        SphereWahbaKernel, sphere_truncated_spectral_eval, sobolev_s2_truncated_coefficients,
+        SphereWahbaKernel, sobolev_s2_truncated_coefficients, sphere_truncated_spectral_eval,
         spherical_wahba_kernel_matrix_with_kind,
     };
     use ndarray::Array2;
@@ -1356,8 +1363,7 @@ mod sphere_gpu_tests {
         for i in 0..n_lat {
             let lat = -85.0 + (170.0 * i as f64) / (n_lat.saturating_sub(1).max(1) as f64);
             for j in 0..n_lon {
-                let lon =
-                    -180.0 + (360.0 * j as f64) / (n_lon.saturating_sub(1).max(1) as f64);
+                let lon = -180.0 + (360.0 * j as f64) / (n_lon.saturating_sub(1).max(1) as f64);
                 rows.push(lat);
                 rows.push(lon);
             }
@@ -1377,8 +1383,9 @@ mod sphere_gpu_tests {
         let xyz = latlon_to_xyz_host(latlon.view(), false).expect("xyz");
         assert_eq!(xyz.len(), 3 * 5);
         for i in 0..5 {
-            let nrm2 =
-                xyz[3 * i] * xyz[3 * i] + xyz[3 * i + 1] * xyz[3 * i + 1] + xyz[3 * i + 2] * xyz[3 * i + 2];
+            let nrm2 = xyz[3 * i] * xyz[3 * i]
+                + xyz[3 * i + 1] * xyz[3 * i + 1]
+                + xyz[3 * i + 2] * xyz[3 * i + 2];
             assert!((nrm2 - 1.0).abs() < 1e-15, "row {i} not unit norm: {nrm2}");
         }
         // Equator @ lon=0 → (1, 0, 0).
@@ -1423,9 +1430,7 @@ mod sphere_gpu_tests {
             centers.view(),
             m_penalty,
             false,
-            SphereWahbaKernel::SobolevTruncated {
-                lmax: lmax as u16,
-            },
+            SphereWahbaKernel::SobolevTruncated { lmax: lmax as u16 },
         )
         .expect("kernel matrix");
         // Recompute cos γ on the unit sphere.
@@ -1468,7 +1473,10 @@ mod sphere_gpu_tests {
                 }
             }
         }
-        assert!(max_asym < 1e-13, "S not symmetric: max |S - Sᵀ| = {max_asym:.3e}");
+        assert!(
+            max_asym < 1e-13,
+            "S not symmetric: max |S - Sᵀ| = {max_asym:.3e}"
+        );
 
         // The kernel-of-Zᵀ direction: Zᵀ · w = 0 ⇒ x = (something) such
         // that Z · x stays in span(w)^⊥, so x can be any (m-1) vector;
@@ -1545,9 +1553,7 @@ mod sphere_gpu_tests {
             centers_ll.view(),
             penalty,
             false,
-            SphereWahbaKernel::SobolevTruncated {
-                lmax: lmax as u16,
-            },
+            SphereWahbaKernel::SobolevTruncated { lmax: lmax as u16 },
         )
         .expect("cpu kernel matrix");
 
@@ -1616,8 +1622,8 @@ mod sphere_gpu_tests {
             }
         }
 
-        let xs_dev = build_householder_constrained_design_device(inputs_raw, &v, beta)
-            .expect("hh design");
+        let xs_dev =
+            build_householder_constrained_design_device(inputs_raw, &v, beta).expect("hh design");
         let xs_gpu = xs_dev.to_host_array().expect("dtoh hh");
 
         let mut max_abs = 0.0_f64;
