@@ -1746,11 +1746,13 @@ mod tests {
     /// dependent on the unfinished sp_kernel. 200 000 rows total; gate is
     /// ≥ 20× CPU.
     #[test]
-    #[ignore]
     #[cfg(target_os = "linux")]
     fn polya_gamma_hill_climb_mixed_nb_20x() {
         if super::super::runtime::GpuRuntime::global().is_none() {
-            panic!("polya_gamma_hill_climb_mixed_nb_20x requires a GPU runtime");
+            eprintln!(
+                "[polya_gamma_hill_climb_mixed_nb_20x] no CUDA runtime on host — skipping"
+            );
+            return;
         }
         let n = 200_000usize;
         let mut shapes = Array1::<u32>::zeros(n);

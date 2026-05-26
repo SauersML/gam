@@ -7935,7 +7935,7 @@ impl BernoulliMarginalSlopeFamily {
                 beta_w,
             )?;
             if f_rigid.abs() <= abs_tol {
-                self.cache_row_intercept(row, rigid_a);
+                self.cache_row_intercept(row, rigid_a, marginal_eta, slope, beta_h, beta_w);
                 return Ok((rigid_a, rigid_abs_deriv, true));
             }
         }
@@ -7968,10 +7968,17 @@ impl BernoulliMarginalSlopeFamily {
             .intercept_warm_starts
             .as_ref()
             .and_then(|cache| cache.predictor_seed(row, &current_primary_point));
-        let cached_a = self.intercept_warm_starts.as_ref().and_then(|cache| {
-            let value = f64::from_bits(cache.get(row)?.load(Ordering::Relaxed));
-            value.is_finite().then_some(value)
-        });
+        // FLEX cache slot must include β_h and β_w: under link-deviation and
+        // score-warp the root depends on the joint coefficient vector, not
+        // just `(marginal_eta, slope)`. Without the tag a TR trial at one β
+        // can read back a converged value from a different trial at the same
+        // row and poison the solve.
+        let flex_beta_tag =
+            hash_intercept_warm_start_key_flex(marginal_eta, slope, beta_h, beta_w);
+        let cached_a = self
+            .intercept_warm_starts
+            .as_ref()
+            .and_then(|cache| cache.load_tagged(row, flex_beta_tag));
         let a_init = predictor_a.or(cached_a).unwrap_or(a_closed_form);
 
         // Note: an explicit `eval(a_closed_form)` short-circuit at this point
