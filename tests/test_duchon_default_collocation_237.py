@@ -35,6 +35,7 @@ def _torch():
 
 
 def test_descriptor_evaluate_d1_m2_natural_cubic() -> None:
+    torch = _torch()
     centers = np.linspace(0.0, 1.0, 8).reshape(-1, 1)
     spec = gamfit.Duchon(centers=centers, m=2)
     x = torch.linspace(0.05, 0.95, 11, dtype=torch.float64)
@@ -44,6 +45,7 @@ def test_descriptor_evaluate_d1_m2_natural_cubic() -> None:
 
 
 def test_descriptor_evaluate_d2_m2_thin_plate() -> None:
+    torch = _torch()
     rng = np.random.default_rng(0)
     centers = rng.standard_normal((9, 2))
     spec = gamfit.Duchon(centers=centers, m=2)
@@ -56,6 +58,7 @@ def test_descriptor_evaluate_d2_m2_thin_plate() -> None:
 
 
 def test_descriptor_evaluate_d3_m2_generalized_tps() -> None:
+    torch = _torch()
     rng = np.random.default_rng(1)
     centers = rng.standard_normal((12, 3))
     spec = gamfit.Duchon(centers=centers, m=2)
@@ -70,6 +73,7 @@ def test_descriptor_evaluate_d3_m2_generalized_tps() -> None:
 
 @pytest.mark.parametrize("m", [1, 2, 3, 4])
 def test_descriptor_evaluate_d2_various_m(m: int) -> None:
+    torch = _torch()
     rng = np.random.default_rng(2 + m)
     centers = rng.standard_normal((10, 2))
     spec = gamfit.Duchon(centers=centers, m=m)
