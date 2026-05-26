@@ -1397,6 +1397,88 @@ mod sphere_gpu_tests {
     }
 
     #[test]
+    fn truncated_spectral_at_same_point_matches_sum_of_coefficients() {
+        // P_ℓ(1) = 1 for all ℓ, so K(x, x) = Σ_{ℓ=0..L} c_ℓ. The Legendre
+        // recurrence in `sphere_truncated_spectral_eval` must reproduce
+        // this exact identity to roundoff.
+        for m_penalty in 1..=4 {
+            for &lmax in &[5_usize, 20, 50] {
+                let coeffs = sobolev_s2_truncated_coefficients(lmax, m_penalty);
+                let expected: f64 = coeffs.iter().sum();
+                let got = sphere_truncated_spectral_eval(1.0, &coeffs);
+                assert!(
+                    (got - expected).abs() < 1e-13,
+                    "K(x,x) identity broken at m={m_penalty}, L={lmax}: got {got:.6e}, expected {expected:.6e}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn truncated_spectral_at_antipode_matches_alternating_sum() {
+        // P_ℓ(-1) = (-1)^ℓ, so K(x, -x) = Σ_{ℓ=0..L} c_ℓ · (-1)^ℓ. Same
+        // exact identity for the recurrence at t = -1.
+        for m_penalty in 1..=4 {
+            for &lmax in &[5_usize, 20, 50] {
+                let coeffs = sobolev_s2_truncated_coefficients(lmax, m_penalty);
+                let expected: f64 = coeffs
+                    .iter()
+                    .enumerate()
+                    .map(|(ell, c)| if ell % 2 == 0 { *c } else { -*c })
+                    .sum();
+                let got = sphere_truncated_spectral_eval(-1.0, &coeffs);
+                assert!(
+                    (got - expected).abs() < 1e-13,
+                    "K(x,-x) identity broken at m={m_penalty}, L={lmax}: got {got:.6e}, expected {expected:.6e}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn truncated_spectral_matrix_is_symmetric() {
+        // K(γ) depends only on cos γ = x · y = y · x, so the Gram
+        // matrix B B^T-style kernel evaluation on the same point set
+        // must be symmetric to roundoff.
+        let centers = ndarray::array![
+            [10.0_f64, 20.0],
+            [-30.0, 100.0],
+            [45.0, -60.0],
+            [-89.0, 0.0],
+            [0.0, 180.0],
+            [60.0, -179.9],
+        ];
+        for m_penalty in [1usize, 2, 4] {
+            for &lmax in &[10_usize, 30] {
+                let mat = spherical_wahba_kernel_matrix_with_kind(
+                    centers.view(),
+                    centers.view(),
+                    m_penalty,
+                    false,
+                    SphereWahbaKernel::SobolevTruncated {
+                        lmax: lmax as u16,
+                    },
+                )
+                .expect("kernel matrix");
+                let n = centers.nrows();
+                let mut max_asym = 0.0_f64;
+                for i in 0..n {
+                    for j in 0..n {
+                        let d = (mat[(i, j)] - mat[(j, i)]).abs();
+                        if d > max_asym {
+                            max_asym = d;
+                        }
+                    }
+                }
+                assert!(
+                    max_asym < 1e-13,
+                    "K not symmetric at m={m_penalty}, L={lmax}: max |K - Kᵀ| = {max_asym:.3e}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn truncated_coefficients_have_zero_constant_mode() {
         for m in 1..=4 {
             let c = sobolev_s2_truncated_coefficients(50, m);

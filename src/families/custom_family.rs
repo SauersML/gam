@@ -12272,10 +12272,29 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
     options: &BlockwiseFitOptions,
     warm_start: Option<&ConstrainedWarmStart>,
 ) -> Result<BlockwiseInnerResult, String> {
+    // Inner-blockwise prelude waypoints. At biobank n the cold-start
+    // path between function entry and the first PIRLS/JN cycle-summary
+    // log can run for many minutes (sometimes hours) silently while
+    // row-kernel workspace builds run. Emit a `[STAGE] PIRLS/inner`
+    // line at each transition so the next failed run pinpoints which
+    // named step holds time. Gated on biobank-scale n so small-fit
+    // tests stay quiet.
+    let inner_started = std::time::Instant::now();
     let mut states = buildblock_states(family, specs)?;
     refresh_all_block_etas(family, specs, &mut states)?;
     let total_joint_p = specs.iter().map(|spec| spec.design.ncols()).sum::<usize>();
     let total_joint_n = joint_observation_count(&states);
+    const INNER_PRELUDE_LOG_MIN_N: usize = 100_000;
+    let prelude_log = total_joint_n >= INNER_PRELUDE_LOG_MIN_N;
+    if prelude_log {
+        log::info!(
+            "[STAGE] PIRLS/inner step=buildblock_states+refresh_etas elapsed={:.3}s n={} p={} blocks={}",
+            inner_started.elapsed().as_secs_f64(),
+            total_joint_n,
+            total_joint_p,
+            specs.len(),
+        );
+    }
     let matrix_free_joint_requested = use_joint_matrix_free_path(total_joint_p, total_joint_n)
         || family.prefers_matrix_free_inner_joint(specs, &states);
     let has_workspace_source = family.inner_coefficient_hessian_hvp_available(specs);
@@ -12310,34 +12329,43 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
     // strictly serial because each accepted block update changes the state seen
     // by later blocks.
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
-    let s_lambdas =
-        (0..specs.len())
-            .into_par_iter()
-            .map(|b| {
-                let spec = &specs[b];
-                let Some(block_log_lambda) = block_log_lambdas.get(b) else {
-                    return Err(CustomFamilyError::UnsupportedConfiguration {
-                        reason: format!("missing log-smoothing parameter vector for block {b}"),
-                    }
-                    .into());
-                };
-                if block_log_lambda.len() != spec.penalties.len() {
-                    return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-                    "block {b} log-smoothing parameter length {} does not match penalties {}",
-                    block_log_lambda.len(),
-                    spec.penalties.len()
-                ) }.into());
-                }
+    let s_lambdas_launch_started = std::time::Instant::now();
+    let s_lambdas_par_iter = (0..specs.len()).into_par_iter().map(|b| {
+        let spec = &specs[b];
+        let Some(block_log_lambda) = block_log_lambdas.get(b) else {
+            return Err(CustomFamilyError::UnsupportedConfiguration {
+                reason: format!("missing log-smoothing parameter vector for block {b}"),
+            }
+            .into());
+        };
+        if block_log_lambda.len() != spec.penalties.len() {
+            return Err(CustomFamilyError::DimensionMismatch { reason: format!(
+                "block {b} log-smoothing parameter length {} does not match penalties {}",
+                block_log_lambda.len(),
+                spec.penalties.len()
+            ) }.into());
+        }
 
-                let p = spec.design.ncols();
-                let lambdas = block_log_lambda.mapv(f64::exp);
-                let mut s_lambda = Array2::<f64>::zeros((p, p));
-                for (k, s) in spec.penalties.iter().enumerate() {
-                    s.add_scaled_to(lambdas[k], &mut s_lambda);
-                }
-                Ok(s_lambda)
-            })
-            .collect::<Result<Vec<_>, String>>()?;
+        let p = spec.design.ncols();
+        let lambdas = block_log_lambda.mapv(f64::exp);
+        let mut s_lambda = Array2::<f64>::zeros((p, p));
+        for (k, s) in spec.penalties.iter().enumerate() {
+            s.add_scaled_to(lambdas[k], &mut s_lambda);
+        }
+        Ok(s_lambda)
+    });
+    let s_lambdas_collect_started = std::time::Instant::now();
+    let s_lambdas_launch_elapsed = s_lambdas_launch_started.elapsed();
+    let s_lambdas = s_lambdas_par_iter.collect::<Result<Vec<_>, String>>()?;
+    if prelude_log {
+        log::info!(
+            "[STAGE] PIRLS/inner step=s_lambdas par_iter launch={:.3}s collect={:.3}s blocks={} (since inner-start={:.3}s)",
+            s_lambdas_launch_elapsed.as_secs_f64(),
+            s_lambdas_collect_started.elapsed().as_secs_f64(),
+            specs.len(),
+            inner_started.elapsed().as_secs_f64(),
+        );
+    }
     let ridge = effective_solverridge(options.ridge_floor);
     let mut cached_active_sets: Vec<Option<Vec<usize>>> = vec![None; specs.len()];
     if let Some(seed) = warm_start

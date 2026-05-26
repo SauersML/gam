@@ -491,52 +491,46 @@ def _build_analytic_penalties_payload(
     d_max: int,
     p_out: int,
 ) -> str | None:
-    """Translate the four user-facing SAE regularizer knobs into the
-    analytic-penalty JSON payload consumed by `sae_manifold_fit_auto`.
+    """Translate the SAE regularizer knobs into the analytic-penalty JSON
+    payload consumed by ``sae_manifold_fit_auto``.
 
-    Targets the SAE latent block ``"t"`` (the per-atom coord space declared in
-    ``sae_manifold_fit_inner``). Returns ``None`` when no penalty is active so
-    the Rust side skips registry construction entirely.
-
-    Each descriptor uses the exact key set the Rust registry parser
-    (`crates/gam-pyffi/src/lib.rs::build_analytic_penalty_registry_from_json`)
-    validates with `descriptor_no_unknown_keys`.
+    Only ``ard_per_atom`` is currently wired through. ``isometry_weight``,
+    ``block_orthogonality_weight``, and ``mechanism_sparsity_groups`` need
+    SAE row-block driver work in ``src/terms/sae_manifold.rs`` (Jacobian
+    cache for Isometry, target-shape resolution for the others) — tracked
+    as issue #241. Activating any of them raises ``NotImplementedError``
+    here so callers cannot silently lose configuration. The historical bug
+    (issue #240) was *silent* acceptance; rejecting cleanly with an
+    actionable message is the principled wrapper-layer half of the fix.
     """
-    items: list[dict[str, Any]] = []
+    unsupported: list[str] = []
     if isometry_weight is not None and float(isometry_weight) > 0.0:
-        items.append({
-            "kind": "isometry",
-            "target": "t",
-            "weight": float(isometry_weight),
-            "p_out": int(p_out),
-        })
+        unsupported.append("isometry_weight")
+    if (
+        block_orthogonality_weight is not None
+        and float(block_orthogonality_weight) > 0.0
+    ):
+        unsupported.append("block_orthogonality_weight")
+    if mechanism_sparsity_groups is not None:
+        unsupported.append("mechanism_sparsity_groups")
+    if unsupported:
+        names = ", ".join(unsupported)
+        raise NotImplementedError(
+            f"sae_manifold_fit: {names} cannot be applied yet — the Rust "
+            "SAE row-block driver only routes ARD through "
+            "`sae_penalty_is_row_block_supported` "
+            "(`src/terms/sae_manifold.rs`). Wiring the remaining analytic "
+            "penalties needs Jacobian-cache + target-shape work in that "
+            "module; tracked as issue #241. Pass only `ard_per_atom` for "
+            "now, or omit these parameters to fit without them."
+        )
+    # `d_max` / `p_out` are reserved for the descriptors that will land once
+    # issue #241 wires the remaining penalties; they participate in the
+    # target-length arithmetic the Rust parsers perform.
+    del d_max, p_out
+    items: list[dict[str, Any]] = []
     if bool(ard_per_atom):
         items.append({"kind": "ard", "target": "t"})
-    if block_orthogonality_weight is not None and float(block_orthogonality_weight) > 0.0:
-        # Default partition: each latent axis is its own group, encouraging
-        # pairwise orthogonality across atom coordinate dimensions. Requires
-        # `d_max >= 2`; for one-dimensional latents the penalty is vacuous
-        # and we skip it rather than failing the descriptor validator.
-        if int(d_max) >= 2:
-            groups = [[axis] for axis in range(int(d_max))]
-            items.append({
-                "kind": "block_orthogonality",
-                "target": "t",
-                "groups": groups,
-                "weight": float(block_orthogonality_weight),
-            })
-    if mechanism_sparsity_groups is not None:
-        groups_int = [[int(axis) for axis in group] for group in mechanism_sparsity_groups]
-        if not groups_int:
-            raise ValueError(
-                "mechanism_sparsity_groups must contain at least one group"
-            )
-        items.append({
-            "kind": "mechanism_sparsity",
-            "target": "t",
-            "feature_groups": groups_int,
-            "weight": 1.0,
-        })
     if not items:
         return None
     return json.dumps(items)
