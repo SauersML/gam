@@ -22,9 +22,11 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-torch = pytest.importorskip("torch")
-
 import gamfit
+
+
+def _torch():
+    return pytest.importorskip("torch")
 
 
 # ---------------------------------------------------------------------------
