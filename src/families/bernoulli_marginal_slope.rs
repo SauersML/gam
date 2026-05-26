@@ -8382,6 +8382,404 @@ impl BernoulliMarginalSlopeFamily {
         Ok(Some(RowCellMomentsBundle { max_degree, rows }))
     }
 
+    /// BMS-FLEX GPU milestone 1: pack the row-primary Hessian inputs for the
+    /// Stage-2 device kernel in `crate::gpu::bms_flex_row`. Returns `None`
+    /// when any precondition fails (latent is not StandardNormal, the
+    /// row-cell-moments bundle was not materialised, or score-warp /
+    /// link-deviation runtimes are missing); the caller then falls back to
+    /// the CPU rayon loop.
+    ///
+    /// The packed bundle mirrors `compute_row_analytic_flex_from_parts_into`
+    /// (`StandardNormal` branch at lines 9047–9314) field-for-field. The
+    /// per-cell coefficient families are built here on the host (cheap
+    /// scalar work) so the device kernel reads only flat SoA buffers and
+    /// keeps its inner loop free of cubic-cell partial-derivative math.
+    fn pack_bms_flex_row_kernel_inputs(
+        &self,
+        block_states: &[ParameterBlockState],
+        cache: &BernoulliMarginalSlopeExactEvalCache,
+    ) -> Result<Option<crate::gpu::bms_flex_row::BmsFlexRowKernelInputsOwned>, String> {
+        use crate::families::bernoulli_marginal_slope::exact_kernel as exact;
+        use crate::families::marginal_slope_shared::SparsePrimaryCoeffJetView;
+
+        // ── Preconditions: the Stage-2 kernel only handles the StandardNormal
+        //    cell-loop branch with a pre-built row-cell-moments bundle. The
+        //    empirical-grid branch and the per-row degree-9 fallback both
+        //    require additional packing the kernel does not consume yet.
+        if !matches!(self.latent_measure, LatentMeasureKind::StandardNormal) {
+            return Ok(None);
+        }
+        let Some(bundle) = cache.row_cell_moments.as_ref() else {
+            return Ok(None);
+        };
+        let primary = &cache.primary;
+        let r = primary.total;
+        if r < 2 || r > crate::gpu::bms_flex_row::MAX_R {
+            return Ok(None);
+        }
+        let h_range = primary.h.clone();
+        let w_range = primary.w.clone();
+        let p_h = h_range.as_ref().map(|range| range.len()).unwrap_or(0);
+        let p_w = w_range.as_ref().map(|range| range.len()).unwrap_or(0);
+        if r != 2 + p_h + p_w {
+            return Ok(None);
+        }
+        if p_h > 0 && self.score_warp.is_none() {
+            return Ok(None);
+        }
+        if p_w > 0 && self.link_dev.is_none() {
+            return Ok(None);
+        }
+        let beta_h = self.score_beta(block_states)?;
+        let beta_w = self.link_beta(block_states)?;
+        let scale = self.probit_frailty_scale();
+        let n = self.y.len();
+        let score_runtime = self.score_warp.as_ref();
+        let link_runtime = self.link_dev.as_ref();
+
+        // ── First pass: row offsets + total cell count. The Stage-2 kernel
+        //    consumes a CSR `cell_offsets[n+1]` with `total_cells =
+        //    cell_offsets[n]`; reject up front any row whose cells were
+        //    not materialised at degree ≥ 9 (the kernel needs `m_0..m_9`).
+        let mut cell_offsets: Vec<u32> = Vec::with_capacity(n + 1);
+        cell_offsets.push(0);
+        let mut total_cells: u32 = 0;
+        for row in 0..n {
+            let Some(row_cells) = bundle.row(row, 9) else {
+                return Ok(None);
+            };
+            let len_u32 = u32::try_from(row_cells.len()).map_err(|_| {
+                format!("bms_flex_row pack: row {row} cell count exceeds u32 range")
+            })?;
+            total_cells = total_cells
+                .checked_add(len_u32)
+                .ok_or_else(|| "bms_flex_row pack: total cell count overflows u32".to_string())?;
+            cell_offsets.push(total_cells);
+        }
+        let total_cells_us = total_cells as usize;
+
+        // ── Per-row scalars + observed-point pre-eval buffers.
+        let mut row_q = Vec::<f64>::with_capacity(n);
+        let mut row_b = Vec::<f64>::with_capacity(n);
+        let mut row_mu1 = Vec::<f64>::with_capacity(n);
+        let mut row_mu2 = Vec::<f64>::with_capacity(n);
+        let mut row_zobs = Vec::<f64>::with_capacity(n);
+        let mut row_y = Vec::<f64>::with_capacity(n);
+        let mut row_w = Vec::<f64>::with_capacity(n);
+        let mut row_chi = Vec::<f64>::with_capacity(n);
+        let mut row_xi = Vec::<f64>::with_capacity(n);
+        let mut row_rho = vec![0.0_f64; n * r];
+        let mut row_tau = vec![0.0_f64; n * r];
+        let mut row_ruv = vec![0.0_f64; n * r * r];
+
+        // ── Per-cell SoA arrays sized once.
+        let coeff4 = crate::gpu::bms_flex_row::COEFF4;
+        let moment_stride = crate::gpu::bms_flex_row::MOMENT_STRIDE;
+        let mut cell_c0 = vec![0.0_f64; total_cells_us];
+        let mut cell_c1 = vec![0.0_f64; total_cells_us];
+        let mut cell_c2 = vec![0.0_f64; total_cells_us];
+        let mut cell_c3 = vec![0.0_f64; total_cells_us];
+        let mut cell_a = vec![0.0_f64; total_cells_us * coeff4];
+        let mut cell_aa = vec![0.0_f64; total_cells_us * coeff4];
+        let r_minus_1 = r.saturating_sub(1);
+        let mut cell_r_buf = vec![0.0_f64; total_cells_us * r_minus_1 * coeff4];
+        let mut cell_ar = vec![0.0_f64; total_cells_us * r_minus_1 * coeff4];
+        let mut cell_sbb = vec![0.0_f64; total_cells_us * coeff4];
+        let mut cell_sbh = vec![0.0_f64; total_cells_us * p_h * coeff4];
+        let mut cell_sbw = vec![0.0_f64; total_cells_us * p_w * coeff4];
+        let mut cell_moments = vec![0.0_f64; total_cells_us * moment_stride];
+
+        // Reusable per-row coefficient buffers. Same layout as
+        // BernoulliMarginalSlopeFlexRowScratch's owned [f64;4] slices.
+        let mut coeff_u: Vec<[f64; 4]> = vec![[0.0; 4]; r];
+        let mut coeff_au: Vec<[f64; 4]> = vec![[0.0; 4]; r];
+        let mut coeff_bu: Vec<[f64; 4]> = vec![[0.0; 4]; r];
+        let zero_family: Vec<[f64; 4]> = vec![[0.0; 4]; r];
+
+        for row in 0..n {
+            let row_ctx = Self::row_ctx(cache, row);
+            let a = row_ctx.intercept;
+            let q = block_states[0].eta[row];
+            let b = block_states[1].eta[row];
+            let marginal = self.marginal_link_map(q)?;
+            row_q.push(q);
+            row_b.push(b);
+            row_mu1.push(marginal.mu1);
+            row_mu2.push(marginal.mu2);
+            row_zobs.push(self.z[row]);
+            row_y.push(self.y[row]);
+            row_w.push(self.weights[row]);
+
+            let start = cell_offsets[row] as usize;
+            let row_cells = bundle
+                .row(row, 9)
+                .expect("row cell moments presence verified above");
+            for (local_idx, entry) in row_cells.iter().enumerate() {
+                let cell_idx = start + local_idx;
+                let cell = entry.partition_cell.cell;
+                let z_mid = exact::interval_probe_point(cell.left, cell.right)?;
+                let u_mid = a + b * z_mid;
+
+                cell_c0[cell_idx] = cell.c0;
+                cell_c1[cell_idx] = cell.c1;
+                cell_c2[cell_idx] = cell.c2;
+                cell_c3[cell_idx] = cell.c3;
+
+                // dc_da, dc_db (scaled)
+                let (dc_da_raw, dc_db_raw) = exact::denested_cell_coefficient_partials(
+                    entry.partition_cell.score_span,
+                    entry.partition_cell.link_span,
+                    a,
+                    b,
+                );
+                let dc_da = scale_coeff4(dc_da_raw, scale);
+                let dc_db = scale_coeff4(dc_db_raw, scale);
+                let (dc_daa_raw, dc_dab_raw, dc_dbb_raw) =
+                    exact::denested_cell_second_partials(
+                        entry.partition_cell.score_span,
+                        entry.partition_cell.link_span,
+                        a,
+                        b,
+                    );
+                let dc_daa = scale_coeff4(dc_daa_raw, scale);
+                let dc_dab = scale_coeff4(dc_dab_raw, scale);
+                let dc_dbb = scale_coeff4(dc_dbb_raw, scale);
+
+                // cell_a, cell_aa.
+                let a_base = cell_idx * coeff4;
+                for k in 0..coeff4 {
+                    cell_a[a_base + k] = dc_da[k];
+                    cell_aa[a_base + k] = dc_daa[k];
+                }
+
+                // Reset per-row-cell coefficient families.
+                for slot in coeff_u.iter_mut() {
+                    *slot = [0.0; 4];
+                }
+                for slot in coeff_au.iter_mut() {
+                    *slot = [0.0; 4];
+                }
+                for slot in coeff_bu.iter_mut() {
+                    *slot = [0.0; 4];
+                }
+                coeff_u[1] = dc_db;
+                coeff_au[1] = dc_dab;
+                coeff_bu[1] = dc_dbb;
+
+                if let (Some(h_range), Some(runtime)) = (h_range.as_ref(), score_runtime) {
+                    Self::for_each_deviation_basis_cubic_at(
+                        runtime,
+                        h_range,
+                        z_mid,
+                        "score-warp",
+                        |_, idx, basis_span| {
+                            coeff_u[idx] = scale_coeff4(
+                                exact::score_basis_cell_coefficients(basis_span, b),
+                                scale,
+                            );
+                            coeff_bu[idx] = scale_coeff4(
+                                exact::score_basis_cell_coefficients(basis_span, 1.0),
+                                scale,
+                            );
+                            Ok(())
+                        },
+                    )?;
+                }
+                if let (Some(w_range), Some(runtime)) = (w_range.as_ref(), link_runtime) {
+                    Self::for_each_deviation_basis_cubic_at(
+                        runtime,
+                        w_range,
+                        u_mid,
+                        "link-wiggle",
+                        |_, idx, basis_span| {
+                            coeff_u[idx] = scale_coeff4(
+                                exact::link_basis_cell_coefficients(basis_span, a, b),
+                                scale,
+                            );
+                            let (dc_aw_raw, dc_bw_raw) =
+                                exact::link_basis_cell_coefficient_partials(basis_span, a, b);
+                            coeff_au[idx] = scale_coeff4(dc_aw_raw, scale);
+                            coeff_bu[idx] = scale_coeff4(dc_bw_raw, scale);
+                            Ok(())
+                        },
+                    )?;
+                }
+
+                // cell_r / cell_ar: indexed u in 1..r → slot u-1.
+                let r_base = cell_idx * r_minus_1 * coeff4;
+                for u in 1..r {
+                    let off = r_base + (u - 1) * coeff4;
+                    for k in 0..coeff4 {
+                        cell_r_buf[off + k] = coeff_u[u][k];
+                        cell_ar[off + k] = coeff_au[u][k];
+                    }
+                }
+                // cell_sbb = coeff_bu[1].
+                for k in 0..coeff4 {
+                    cell_sbb[a_base + k] = coeff_bu[1][k];
+                }
+                // cell_sbh[c, j, *] = coeff_bu[h_range.start + j].
+                if let Some(h_range) = h_range.as_ref() {
+                    let h_base = cell_idx * p_h * coeff4;
+                    for j in 0..p_h {
+                        let off = h_base + j * coeff4;
+                        let src = &coeff_bu[h_range.start + j];
+                        for k in 0..coeff4 {
+                            cell_sbh[off + k] = src[k];
+                        }
+                    }
+                }
+                // cell_sbw[c, j, *] = coeff_bu[w_range.start + j].
+                if let Some(w_range) = w_range.as_ref() {
+                    let w_base = cell_idx * p_w * coeff4;
+                    for j in 0..p_w {
+                        let off = w_base + j * coeff4;
+                        let src = &coeff_bu[w_range.start + j];
+                        for k in 0..coeff4 {
+                            cell_sbw[off + k] = src[k];
+                        }
+                    }
+                }
+                // cell_moments: copy state.moments, zero-pad to 10.
+                let mom_base = cell_idx * moment_stride;
+                let src_moments: &[f64] = &entry.state.moments;
+                let copy_len = src_moments.len().min(moment_stride);
+                for k in 0..copy_len {
+                    cell_moments[mom_base + k] = src_moments[k];
+                }
+            }
+
+            // ── Observed-point pre-evaluation (mirrors CPU lines 9265–9314).
+            let z_obs = self.z[row];
+            let u_obs = a + b * z_obs;
+            let obs = self.observed_denested_cell_partials(row, a, b, beta_h, beta_w)?;
+            let chi_obs = eval_coeff4_at(&obs.dc_da, z_obs);
+            let xi_obs = eval_coeff4_at(&obs.dc_daa, z_obs);
+            row_chi.push(chi_obs);
+            row_xi.push(xi_obs);
+
+            // g_u_fixed / g_au_fixed / g_bu_fixed at z_obs (score) / u_obs (link).
+            let mut g_u_fixed: Vec<[f64; 4]> = vec![[0.0; 4]; r];
+            let mut g_au_fixed: Vec<[f64; 4]> = vec![[0.0; 4]; r];
+            let mut g_bu_fixed: Vec<[f64; 4]> = vec![[0.0; 4]; r];
+            g_u_fixed[1] = obs.dc_db;
+            g_au_fixed[1] = obs.dc_dab;
+            g_bu_fixed[1] = obs.dc_dbb;
+            if let (Some(h_range), Some(runtime)) = (h_range.as_ref(), score_runtime) {
+                Self::for_each_deviation_basis_cubic_at(
+                    runtime,
+                    h_range,
+                    z_obs,
+                    "score-warp observed",
+                    |_, idx, basis_span| {
+                        g_u_fixed[idx] = scale_coeff4(
+                            exact::score_basis_cell_coefficients(basis_span, b),
+                            scale,
+                        );
+                        g_bu_fixed[idx] = scale_coeff4(
+                            exact::score_basis_cell_coefficients(basis_span, 1.0),
+                            scale,
+                        );
+                        Ok(())
+                    },
+                )?;
+            }
+            if let (Some(w_range), Some(runtime)) = (w_range.as_ref(), link_runtime) {
+                Self::for_each_deviation_basis_cubic_at(
+                    runtime,
+                    w_range,
+                    u_obs,
+                    "link-wiggle observed",
+                    |_, idx, basis_span| {
+                        g_u_fixed[idx] = scale_coeff4(
+                            exact::link_basis_cell_coefficients(basis_span, a, b),
+                            scale,
+                        );
+                        let (dc_aw_raw, dc_bw_raw) =
+                            exact::link_basis_cell_coefficient_partials(basis_span, a, b);
+                        g_au_fixed[idx] = scale_coeff4(dc_aw_raw, scale);
+                        g_bu_fixed[idx] = scale_coeff4(dc_bw_raw, scale);
+                        Ok(())
+                    },
+                )?;
+            }
+
+            // Build rho / tau via eval_coeff4_at, mirroring CPU :9319–:9322.
+            let row_rho_base = row * r;
+            let row_tau_base = row * r;
+            for u in 1..r {
+                row_rho[row_rho_base + u] = eval_coeff4_at(&g_u_fixed[u], z_obs);
+                row_tau[row_tau_base + u] = eval_coeff4_at(&g_au_fixed[u], z_obs);
+            }
+            // r_uv via pair_from_b_family(g_b_first, ·, ·, BHW), mirroring
+            // CPU :9343–:9356. Symmetric — fill both off-diagonals.
+            let g_jet = SparsePrimaryCoeffJetView::new(
+                1,
+                h_range.as_ref(),
+                w_range.as_ref(),
+                g_u_fixed.as_slice(),
+                g_au_fixed.as_slice(),
+                g_bu_fixed.as_slice(),
+                zero_family.as_slice(),
+                zero_family.as_slice(),
+                zero_family.as_slice(),
+                zero_family.as_slice(),
+                zero_family.as_slice(),
+                zero_family.as_slice(),
+                zero_family.as_slice(),
+            );
+            let row_ruv_base = row * r * r;
+            for u in 0..r {
+                for v in u..r {
+                    let pair = g_jet.pair_from_b_family(
+                        g_jet.b_first,
+                        u,
+                        v,
+                        COEFF_SUPPORT_BHW,
+                    );
+                    let val = eval_coeff4_at(&pair, z_obs);
+                    row_ruv[row_ruv_base + u * r + v] = val;
+                    if u != v {
+                        row_ruv[row_ruv_base + v * r + u] = val;
+                    }
+                }
+            }
+        }
+
+        Ok(Some(crate::gpu::bms_flex_row::BmsFlexRowKernelInputsOwned {
+            n_rows: n,
+            r,
+            p_h,
+            p_w,
+            s_f: scale,
+            q: row_q,
+            b: row_b,
+            mu_1: row_mu1,
+            mu_2: row_mu2,
+            z_obs: row_zobs,
+            y: row_y,
+            w: row_w,
+            cell_offsets,
+            cell_c0,
+            cell_c1,
+            cell_c2,
+            cell_c3,
+            cell_a,
+            cell_aa,
+            cell_r: cell_r_buf,
+            cell_ar,
+            cell_sbb,
+            cell_sbh,
+            cell_sbw,
+            cell_moments,
+            chi_obs: row_chi,
+            xi_obs: row_xi,
+            rho_u: row_rho,
+            tau_u: row_tau,
+            r_uv: row_ruv,
+        }))
+    }
+
     fn build_row_primary_hessian_cache(
         &self,
         block_states: &[ParameterBlockState],
@@ -8478,6 +8876,57 @@ impl BernoulliMarginalSlopeFamily {
                 gpu_decision.use_gpu,
                 gpu_decision.reason,
             );
+        }
+        // ── BMS-FLEX GPU milestone 1: when the policy says use_gpu *and* the
+        //    Stage-2 device kernel preconditions are met (StandardNormal
+        //    latent, row-cell-moments bundle present, optional score-warp /
+        //    link-deviation runtimes present), pack the host inputs once and
+        //    dispatch the row kernel. A successful launch returns the
+        //    `n × r²` row-major Hessian; the CPU rayon loop below is then
+        //    skipped. Any failure (`NotYetImplemented`, driver errors, or
+        //    pack-time precondition mismatch) logs a one-liner and falls
+        //    through to the existing CPU path, preserving production
+        //    behaviour under `gpu=auto`. Under `gpu=force`, the upstream
+        //    `require_row_primary_hessian_supported` would already have
+        //    failed; here we still fall back on launch failure rather than
+        //    panic mid-fit.
+        if gpu_decision.use_gpu {
+            match self.pack_bms_flex_row_kernel_inputs(block_states, cache)? {
+                Some(owned) => match crate::gpu::bms_flex_row::launch_bms_flex_row_kernel(
+                    owned.as_borrowed(),
+                ) {
+                    Ok(outputs) => {
+                        if log_exact_work(n) {
+                            log::info!(
+                                "[BMS row-primary-hessian-cache] gpu_launch_ok rows={} r={} elapsed={:.3}s",
+                                n,
+                                r,
+                                started.elapsed().as_secs_f64()
+                            );
+                        }
+                        let packed = Array2::<f64>::from_shape_vec((n, r * r), outputs.hess)
+                            .map_err(|err| format!("bms_flex_row output shape: {err}"))?;
+                        drop(heartbeat_guard);
+                        return Ok(RowPrimaryHessianCache::Host(RowPrimaryHessianPin::new(
+                            packed, plan.bytes,
+                        )));
+                    }
+                    Err(err) => {
+                        log::info!(
+                            "[BMS row-primary-hessian-cache] gpu_launch_failed: {err}; \
+                             falling back to CPU rows"
+                        );
+                    }
+                },
+                None => {
+                    if log_exact_work(n) {
+                        log::info!(
+                            "[BMS row-primary-hessian-cache] gpu_unsupported_inputs; \
+                             falling back to CPU rows"
+                        );
+                    }
+                }
+            }
         }
         let completed_rows = AtomicUsize::new(0);
         let progress_step = (n / 10).max(1);
