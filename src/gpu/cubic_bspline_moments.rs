@@ -52,9 +52,17 @@
 //! in this module are deliberately distinct (`cubic_bspline_cell_moments`,
 //! `tensor_bspline_moment_table`) to avoid any collision or confusion.
 
+use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+#[cfg(target_os = "linux")]
+use std::sync::Mutex;
 use std::sync::OnceLock;
 
 use super::error::GpuError;
+
+#[cfg(target_os = "linux")]
+use cudarc::driver::{CudaContext, CudaModule, CudaStream};
 
 // ────────────────────────────────────────────────────────────────────────
 // Constants and small numeric helpers
@@ -598,15 +606,202 @@ pub struct DeviceMarginalTable {
 }
 
 // ────────────────────────────────────────────────────────────────────────
-// CUDA backend handle (Phase 2 entry point; Phase 1 only probes/caches).
+// CUDA backend handle, module cache key, and NVRTC kernel source generator
+// for the hexahedral tensor-moment kernel (Phase 2).
 // ────────────────────────────────────────────────────────────────────────
 
-/// Probe handle for the cubic-B-spline moments GPU backend. Currently a
-/// marker — Phase 1 only validates that a CUDA runtime is reachable on
-/// Linux; consumers that need a live context/stream/module cache will be
-/// added when the downstream kernels land.
+/// NVRTC module-cache key. The module is specialised at compile-time by
+/// (D, AMAX, NALPHA, hashed alpha/derivative tables, output layout, CC) so a
+/// re-fit with the same spec resolves to a cache hit.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct HexMomentModuleKey {
+    cc_major: i32,
+    cc_minor: i32,
+    d: u32,
+    amax: u32,
+    nalpha: u32,
+    alpha_hash: u64,
+    deriv_hash: u64,
+    layout_tag: u8,
+}
+
+/// 64-bit FNV-style hash of the alpha multi-index table. Stable across runs;
+/// used as part of the module cache key so two specs with the same alpha grid
+/// share one NVRTC compile.
+fn hash_alpha_table(alphas: &[Vec<u8>]) -> u64 {
+    let mut h = DefaultHasher::new();
+    (alphas.len() as u64).hash(&mut h);
+    for row in alphas {
+        (row.len() as u64).hash(&mut h);
+        for &v in row {
+            v.hash(&mut h);
+        }
+    }
+    h.finish()
+}
+
+fn hash_deriv_table(deriv_left: &[Vec<u8>], deriv_right: &[Vec<u8>]) -> u64 {
+    let mut h = DefaultHasher::new();
+    (deriv_left.len() as u64).hash(&mut h);
+    for row in deriv_left {
+        (row.len() as u64).hash(&mut h);
+        for &v in row {
+            v.hash(&mut h);
+        }
+    }
+    (deriv_right.len() as u64).hash(&mut h);
+    for row in deriv_right {
+        (row.len() as u64).hash(&mut h);
+        for &v in row {
+            v.hash(&mut h);
+        }
+    }
+    h.finish()
+}
+
+#[inline]
+fn layout_tag(layout: MomentLayout) -> u8 {
+    match layout {
+        MomentLayout::AlphaMajor => 0,
+    }
+}
+
+/// Generate the NVRTC C++ source for the hex tensor moment kernel,
+/// specialised to the spec's `(D, AMAX, NALPHA)` triple. The alpha multi-index
+/// table is baked in as a `__constant__` array so the inner loop unrolls.
+///
+/// Math (section 9): for each cell c, output slot α, ordered pair-tuple
+/// (i_r, j_r) per axis,
+///
+///   M_α^{ij}(c) = Π_{r=0..D-1} I_{α_r}^{i_r j_r}(L_r)
+///
+/// with the cell-local 1D moment
+///
+///   I_ν^{ij}(L) = Σ_{q=0..6} c_q · h^{q+ν+1} / (q + ν + 1).
+///
+/// `alpha_table[NALPHA][D]` carries the exponent multi-indices for the spec.
+/// Output is alpha-major with stride `((n_cells+31)/32)*32` so consecutive
+/// threads write coalesced f64s on Volta+.
+fn build_hex_tensor_kernel_source(
+    d: usize,
+    amax: usize,
+    alphas: &[Vec<u8>],
+) -> String {
+    let nalpha = alphas.len();
+    let mut alpha_decl = String::new();
+    alpha_decl.push_str("__constant__ unsigned char ALPHA_TABLE[NALPHA][D] = {\n");
+    for row in alphas {
+        alpha_decl.push_str("    { ");
+        for (k, v) in row.iter().enumerate() {
+            if k > 0 {
+                alpha_decl.push_str(", ");
+            }
+            alpha_decl.push_str(&v.to_string());
+        }
+        alpha_decl.push_str(" },\n");
+    }
+    alpha_decl.push_str("};\n");
+
+    format!(
+        r#"
+#define D       {d}
+#define AMAX    {amax}
+#define NALPHA  {nalpha}
+#define PROD_LEN 7
+
+{alpha_decl}
+
+// Closed-form 1D moment about the cell's left endpoint (m = L):
+//   I_nu^{{ij}}(L) = sum_{{q=0..6}} c_q * h^{{q+nu+1}} / (q + nu + 1)
+// Implemented with a Horner-style accumulating `h_pow` and fma. We loop on
+// nu_plus_one = nu + 1 up to the compile-time AMAX so the divides are
+// constant-foldable.
+__device__ __forceinline__ double moment_1d_local(
+    const double *cprod,   // [PROD_LEN], product-poly coefs on cell
+    double        h,       // cell width
+    unsigned int  nu       // moment exponent
+) {{
+    double h_pow = 1.0;
+    for (unsigned int s = 0; s <= nu; ++s) {{
+        h_pow *= h;             // after loop: h_pow == h^{{nu+1}} ... continues below
+    }}
+    double acc = 0.0;
+    #pragma unroll
+    for (int q = 0; q < PROD_LEN; ++q) {{
+        double denom = (double)(q + nu + 1);
+        acc = fma(cprod[q] / denom, h_pow, acc);
+        h_pow *= h;
+    }}
+    return acc;
+}}
+
+// One thread = one (cell, alpha-slot). Block (32, 8, 1): x → cell, y → alpha.
+// Inputs (all device-resident):
+//   axis_prod_coeff_flat: f64 buffer, concatenated per-axis tables; offset
+//       per axis given by `axis_offset[axis]` (in elements). Each axis table
+//       is [n_spans_axis][PAIRS_PER_SPAN(=10)][PROD_LEN(=7)] row-major.
+//   axis_offset:          i64[D]
+//   cell_span_per_axis:   i32[n_cells * D] — active-span index per axis.
+//   cell_pair_per_axis:   i32[n_cells * D] — unordered-pair slot (0..=9) per axis.
+//   cell_width_per_axis:  f64[n_cells * D] — cell width per axis.
+// Output:
+//   out: f64[NALPHA * out_stride], alpha-major; thread writes out[a*out_stride + c].
+extern "C" __global__ void cubic_hex_tensor_moments(
+    const double *axis_prod_coeff_flat,
+    const long long *axis_offset,
+    const int *cell_span_per_axis,
+    const int *cell_pair_per_axis,
+    const double *cell_width_per_axis,
+    int          n_cells,
+    long long    out_stride,
+    double      *out
+) {{
+    const int cell  = blockIdx.x * blockDim.x + threadIdx.x;
+    const int alpha = blockIdx.y * blockDim.y + threadIdx.y;
+    if (cell >= n_cells || alpha >= NALPHA) return;
+
+    double prod = 1.0;
+    #pragma unroll
+    for (int r = 0; r < D; ++r) {{
+        const int   span_r  = cell_span_per_axis[cell * D + r];
+        const int   pair_r  = cell_pair_per_axis[cell * D + r];
+        const double width_r = cell_width_per_axis[cell * D + r];
+        const long long base = axis_offset[r]
+            + (long long)span_r * 10LL * (long long)PROD_LEN
+            + (long long)pair_r * (long long)PROD_LEN;
+        const double *cprod = axis_prod_coeff_flat + base;
+        const unsigned int nu = (unsigned int)ALPHA_TABLE[alpha][r];
+        const double mu = moment_1d_local(cprod, width_r, nu);
+        prod *= mu;
+    }}
+
+    out[(long long)alpha * out_stride + (long long)cell] = prod;
+}}
+"#,
+        d = d,
+        amax = amax,
+        nalpha = nalpha,
+        alpha_decl = alpha_decl,
+    )
+}
+
+/// Probe handle for the cubic-B-spline moments GPU backend. Holds the CUDA
+/// context, default stream, capability tag, and the NVRTC module cache so
+/// re-fits with the same `CubicMomentSpec` resolve to a cache hit.
+#[cfg(target_os = "linux")]
+struct CubicMomentBackendInner {
+    ctx: std::sync::Arc<CudaContext>,
+    stream: std::sync::Arc<CudaStream>,
+    modules: Mutex<HashMap<HexMomentModuleKey, std::sync::Arc<CudaModule>>>,
+    cc_major: i32,
+    cc_minor: i32,
+}
+
 #[must_use]
-pub struct CubicMomentBackend;
+pub struct CubicMomentBackend {
+    #[cfg(target_os = "linux")]
+    inner: CubicMomentBackendInner,
+}
 
 impl CubicMomentBackend {
     pub const fn compiled() -> bool {
@@ -639,19 +834,291 @@ impl CubicMomentBackend {
                 reason: "cubic_bspline_moments backend: no CUDA runtime available".to_string(),
             }
         })?;
-        // Touch the device ordinal so the probe fails fast when the CUDA
-        // context for the selected device cannot be created — the eventual
-        // kernel consumers will need this to succeed.
-        super::runtime::cuda_context_for(runtime.selected_device().ordinal).ok_or_else(|| {
+        let ordinal = runtime.selected_device().ordinal;
+        let ctx = super::runtime::cuda_context_for(ordinal).ok_or_else(|| {
             GpuError::DriverCallFailed {
                 reason: format!(
-                    "cubic_bspline_moments backend: failed to create CUDA context for device {}",
-                    runtime.selected_device().ordinal
+                    "cubic_bspline_moments backend: failed to create CUDA context for device {ordinal}"
                 ),
             }
         })?;
-        Ok(Self)
+        let stream = ctx.default_stream();
+        let cap = &runtime.selected_device().capability;
+        let cc_major = cap.compute_major;
+        let cc_minor = cap.compute_minor;
+        Ok(CubicMomentBackend {
+            inner: CubicMomentBackendInner {
+                ctx,
+                stream,
+                modules: Mutex::new(HashMap::new()),
+                cc_major,
+                cc_minor,
+            },
+        })
     }
+
+    #[cfg(target_os = "linux")]
+    fn module_for(
+        &self,
+        key: HexMomentModuleKey,
+        src_factory: impl FnOnce() -> String,
+    ) -> Result<std::sync::Arc<CudaModule>, GpuError> {
+        if let Ok(guard) = self.inner.modules.lock() {
+            if let Some(existing) = guard.get(&key) {
+                return Ok(existing.clone());
+            }
+        }
+        let src = src_factory();
+        let ptx = cudarc::nvrtc::compile_ptx(&src).map_err(|err| GpuError::DriverCallFailed {
+            reason: format!(
+                "cubic_bspline_moments NVRTC compile (D={}, AMAX={}, NALPHA={}): {err}",
+                key.d, key.amax, key.nalpha
+            ),
+        })?;
+        let module = self
+            .inner
+            .ctx
+            .load_module(ptx)
+            .map_err(|err| GpuError::DriverCallFailed {
+                reason: format!("cubic_bspline_moments module load: {err}"),
+            })?;
+        if let Ok(mut guard) = self.inner.modules.lock() {
+            guard.entry(key).or_insert_with(|| module.clone());
+        }
+        Ok(module)
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Device-resident hex tensor moment build (Phase 2 entry point).
+// ────────────────────────────────────────────────────────────────────────
+
+/// Per-cell descriptor for the hex tensor build: which active span and which
+/// unordered active-pair slot to use on each axis, plus the cell width per
+/// axis. The width is carried explicitly so the kernel never has to chase a
+/// second indirection just to read it back.
+#[derive(Clone, Debug)]
+pub struct HexCellTable {
+    /// `span_per_axis[cell * d + axis]` — active-span index on `axis`.
+    pub span_per_axis: Vec<i32>,
+    /// `pair_per_axis[cell * d + axis]` — `active_pair_index(i_axis, j_axis)`.
+    pub pair_per_axis: Vec<i32>,
+    /// `width_per_axis[cell * d + axis]` — `t[k+1] − t[k]` for that span.
+    pub width_per_axis: Vec<f64>,
+    pub n_cells: usize,
+    pub d: usize,
+}
+
+impl HexCellTable {
+    pub fn validate(&self) -> Result<(), GpuError> {
+        let want = self.n_cells * self.d;
+        if self.span_per_axis.len() != want
+            || self.pair_per_axis.len() != want
+            || self.width_per_axis.len() != want
+        {
+            return Err(GpuError::NotYetImplemented {
+                reason: format!(
+                    "HexCellTable: expected length {want} (n_cells*d), got span={}, pair={}, width={}",
+                    self.span_per_axis.len(),
+                    self.pair_per_axis.len(),
+                    self.width_per_axis.len(),
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Build the alpha-major `[NALPHA, n_cells]` hex tensor moment table on the
+/// device. Per-axis tables must be supplied in a fixed (axis × derivative-sig)
+/// order matching `build_axis_tables_cpu`; the consumer picks one table per
+/// alpha slot through `derivative_left` / `derivative_right` (the kernel
+/// itself is derivative-agnostic — derivative orders are baked into the
+/// product-poly coefficients of each axis table on the CPU).
+///
+/// For now Phase 2 requires that the spec uses **one** derivative signature
+/// per axis (the homogeneous-deriv case driven by the PIRLS consumer). Mixed
+/// signatures fall back to the CPU path until Phase 3 adds the
+/// derivative-bank kernel; this matches what the math notes call the
+/// "single-bank" hex specialisation.
+#[cfg(target_os = "linux")]
+pub fn build_hex_tensor_moments_device(
+    spec: &CubicMomentSpec,
+    axis_tables: &[Vec<AxisCubicMomentTables>],
+    cells: &HexCellTable,
+) -> Result<DeviceCubicMomentTable, GpuError> {
+    use cudarc::driver::{LaunchConfig, PushKernelArg};
+
+    cells.validate()?;
+    if spec.d() != cells.d {
+        return Err(GpuError::NotYetImplemented {
+            reason: format!(
+                "build_hex_tensor_moments_device: spec.d()={} != cells.d={}",
+                spec.d(),
+                cells.d
+            ),
+        });
+    }
+    if axis_tables.len() != cells.d {
+        return Err(GpuError::NotYetImplemented {
+            reason: format!(
+                "build_hex_tensor_moments_device: axis_tables.len()={} != d={}",
+                axis_tables.len(),
+                cells.d
+            ),
+        });
+    }
+    // Single-bank requirement: exactly one derivative signature per axis.
+    // Mixed-signature support is Phase 3.
+    for (axis, banks) in axis_tables.iter().enumerate() {
+        if banks.len() != 1 {
+            return Err(GpuError::NotYetImplemented {
+                reason: format!(
+                    "build_hex_tensor_moments_device: axis {axis} has {} derivative banks; \
+                     single-bank only in Phase 2 — use the CPU path or wait on Phase 3",
+                    banks.len()
+                ),
+            });
+        }
+    }
+    let nalpha = spec.n_alpha();
+    if nalpha == 0 || cells.n_cells == 0 {
+        return Err(GpuError::NotYetImplemented {
+            reason: "build_hex_tensor_moments_device: empty spec or cell list".to_string(),
+        });
+    }
+    let amax = spec
+        .alphas
+        .iter()
+        .flat_map(|row| row.iter().copied())
+        .max()
+        .unwrap_or(0) as usize;
+
+    let backend = CubicMomentBackend::probe()?;
+    let key = HexMomentModuleKey {
+        cc_major: backend.inner.cc_major,
+        cc_minor: backend.inner.cc_minor,
+        d: cells.d as u32,
+        amax: amax as u32,
+        nalpha: nalpha as u32,
+        alpha_hash: hash_alpha_table(&spec.alphas),
+        deriv_hash: hash_deriv_table(&spec.derivative_left, &spec.derivative_right),
+        layout_tag: layout_tag(spec.layout),
+    };
+    let d_for_src = cells.d;
+    let alphas_for_src = spec.alphas.clone();
+    let module = backend.module_for(key, move || {
+        build_hex_tensor_kernel_source(d_for_src, amax, &alphas_for_src)
+    })?;
+    let func = module
+        .load_function("cubic_hex_tensor_moments")
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("cubic_bspline_moments load_function: {err}"),
+        })?;
+    let stream = backend.inner.stream.clone();
+
+    // Concatenate per-axis tables into one device-side f64 buffer and record
+    // per-axis offsets (in elements).
+    let mut axis_offsets: Vec<i64> = Vec::with_capacity(cells.d);
+    let mut flat: Vec<f64> = Vec::new();
+    for banks in axis_tables.iter() {
+        axis_offsets.push(flat.len() as i64);
+        flat.extend_from_slice(&banks[0].prod_coeff);
+    }
+
+    let axis_flat_dev = stream
+        .clone_htod(flat.as_slice())
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("cubic_bspline_moments htod axis_flat: {err}"),
+        })?;
+    let axis_off_dev = stream
+        .clone_htod(axis_offsets.as_slice())
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("cubic_bspline_moments htod axis_offsets: {err}"),
+        })?;
+    let span_dev = stream
+        .clone_htod(cells.span_per_axis.as_slice())
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("cubic_bspline_moments htod span: {err}"),
+        })?;
+    let pair_dev = stream
+        .clone_htod(cells.pair_per_axis.as_slice())
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("cubic_bspline_moments htod pair: {err}"),
+        })?;
+    let width_dev = stream
+        .clone_htod(cells.width_per_axis.as_slice())
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("cubic_bspline_moments htod width: {err}"),
+        })?;
+
+    let out_stride = ((cells.n_cells + 31) / 32) * 32;
+    let mut out_dev = stream
+        .alloc_zeros::<f64>(out_stride * nalpha)
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: format!(
+                "cubic_bspline_moments alloc out (stride={out_stride}, nalpha={nalpha}): {err}"
+            ),
+        })?;
+
+    let block_x: u32 = 32;
+    let block_y: u32 = 8;
+    let grid_x: u32 = ((cells.n_cells as u32) + block_x - 1) / block_x;
+    let grid_y: u32 = ((nalpha as u32) + block_y - 1) / block_y;
+    let cfg = LaunchConfig {
+        grid_dim: (grid_x, grid_y, 1),
+        block_dim: (block_x, block_y, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let n_cells_i32: i32 = i32::try_from(cells.n_cells).map_err(|_| GpuError::DriverCallFailed {
+        reason: format!("cubic_bspline_moments n_cells={} overflows i32", cells.n_cells),
+    })?;
+    let out_stride_i64: i64 = out_stride as i64;
+
+    let mut builder = stream.launch_builder(&func);
+    builder
+        .arg(&axis_flat_dev)
+        .arg(&axis_off_dev)
+        .arg(&span_dev)
+        .arg(&pair_dev)
+        .arg(&width_dev)
+        .arg(&n_cells_i32)
+        .arg(&out_stride_i64)
+        .arg(&mut out_dev);
+    // SAFETY: all pointers come from cudarc-checked allocations on `stream`;
+    // the kernel reads inputs of declared sizes and writes within
+    // `out[0 .. out_stride * nalpha]`. Launch dims are non-zero and bounded
+    // by the per-axis i32 cap above.
+    unsafe { builder.launch(cfg) }.map_err(|err| GpuError::DriverCallFailed {
+        reason: format!("cubic_bspline_moments kernel launch: {err}"),
+    })?;
+    stream
+        .synchronize()
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("cubic_bspline_moments synchronize: {err}"),
+        })?;
+
+    Ok(DeviceCubicMomentTable {
+        n_cells: cells.n_cells,
+        pair_tuple_count: 1,
+        n_alpha: nalpha,
+        layout: spec.layout,
+        values: out_dev,
+    })
+}
+
+/// macOS-side stub so the Phase 2 entry point is callable on every host;
+/// returns the same `DriverLibraryUnavailable` error as the backend probe.
+#[cfg(not(target_os = "linux"))]
+pub fn build_hex_tensor_moments_device(
+    _spec: &CubicMomentSpec,
+    _axis_tables: &[Vec<AxisCubicMomentTables>],
+    _cells: &HexCellTable,
+) -> Result<DeviceCubicMomentTable, GpuError> {
+    Err(GpuError::DriverLibraryUnavailable {
+        reason: "cubic_bspline_moments GPU backend is Linux-only".to_string(),
+    })
 }
 
 // ────────────────────────────────────────────────────────────────────────

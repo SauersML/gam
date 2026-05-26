@@ -16203,6 +16203,79 @@ pub fn auto_streaming_chunk_size_for_dense(n_rows: usize, n_basis_cols: usize) -
     Some(clamped)
 }
 
+/// GPU dispatch for the raw `(n × m)` Wahba truncated-spectral kernel
+/// matrix. Returns `None` when the kernel variant is not one of the
+/// `Truncated` forms (the GPU path matches only those exactly), when the
+/// `(n, m, lmax)` workload is too small to amortise H2D/D2H, or when the
+/// GPU runtime is unavailable. A transient GPU failure falls back to the
+/// CPU path (logged at warn level).
+fn try_build_truncated_sphere_design_gpu(
+    data: ArrayView2<'_, f64>,
+    centers: ArrayView2<'_, f64>,
+    kernel: SphereWahbaKernel,
+    penalty_order: usize,
+    radians: bool,
+) -> Option<Array2<f64>> {
+    let (lmax_u16, kind) = match kernel {
+        SphereWahbaKernel::SobolevTruncated { lmax } => (
+            lmax,
+            crate::gpu::sphere::SphereSpectralKernelKind::Sobolev,
+        ),
+        SphereWahbaKernel::PseudoTruncated { lmax } => (
+            lmax,
+            crate::gpu::sphere::SphereSpectralKernelKind::Pseudo,
+        ),
+        SphereWahbaKernel::Sobolev | SphereWahbaKernel::Pseudo => return None,
+    };
+    let lmax = lmax_u16 as usize;
+    if lmax == 0 {
+        return None;
+    }
+    let n = data.nrows();
+    let m = centers.nrows();
+    let decision = crate::gpu::sphere::sphere_kernel_decision(n, m, lmax);
+    if !decision.use_gpu {
+        return None;
+    }
+    let data_xyz = crate::gpu::sphere::latlon_to_xyz_host(data, radians).ok()?;
+    let centers_xyz = crate::gpu::sphere::latlon_to_xyz_host(centers, radians).ok()?;
+    let coeffs = kind.coefficients(lmax, penalty_order);
+    let inputs = crate::gpu::sphere::S2KernelBuildInputs {
+        n,
+        m,
+        lmax,
+        data_xyz: &data_xyz,
+        centers_xyz: &centers_xyz,
+        coeffs: &coeffs,
+        kind,
+        layout: crate::gpu::sphere::DeviceMatrixLayout::ColumnMajor,
+    };
+    let dev = match crate::gpu::sphere::build_kernel_matrix_device(inputs) {
+        Ok(d) => d,
+        Err(err) => {
+            log::warn!(
+                "sphere GPU kernel build fell back to CPU (n={n}, m={m}, lmax={lmax}): {err}"
+            );
+            return None;
+        }
+    };
+    match dev.to_host_array() {
+        Ok(arr) => {
+            log::info!(
+                "sphere GPU kernel matrix: n={n} m={m} lmax={lmax} kind={}",
+                kind.tag()
+            );
+            Some(arr)
+        }
+        Err(err) => {
+            log::warn!(
+                "sphere GPU dtoh fell back to CPU (n={n}, m={m}, lmax={lmax}): {err}"
+            );
+            None
+        }
+    }
+}
+
 pub fn build_spherical_spline_basis(
     data: ArrayView2<'_, f64>,
     spec: &SphericalSplineBasisSpec,
@@ -16259,13 +16332,22 @@ pub fn build_spherical_spline_basis(
         .map_err(BasisError::InvalidInput)?;
         DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Arc::new(op)))
     } else {
-        let raw_design = spherical_wahba_kernel_matrix_with_kind(
+        let raw_design = match try_build_truncated_sphere_design_gpu(
             data,
             centers.view(),
+            spec.wahba_kernel,
             spec.penalty_order,
             spec.radians,
-            spec.wahba_kernel,
-        )?;
+        ) {
+            Some(gpu_design) => gpu_design,
+            None => spherical_wahba_kernel_matrix_with_kind(
+                data,
+                centers.view(),
+                spec.penalty_order,
+                spec.radians,
+                spec.wahba_kernel,
+            )?,
+        };
         DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(raw_design.dot(&z)))
     };
     let (penalty_norm, c_primary) = normalize_penalty(&((&penalty + &penalty.t()) * 0.5));
