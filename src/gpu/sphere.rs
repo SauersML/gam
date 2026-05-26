@@ -1661,6 +1661,104 @@ mod sphere_gpu_tests {
         );
     }
 
+    /// V100-only end-to-end dispatch parity: drive
+    /// `build_spherical_spline_basis` with a `SobolevTruncated` spec on
+    /// a workload large enough to trigger `sphere_kernel_decision().use_gpu`,
+    /// then re-build with the CPU-only `Sobolev` (deep-spectral) kernel
+    /// is **not** what we compare to — the GPU exactly matches the
+    /// `SobolevTruncated` CPU path, so the comparison is
+    /// truncated-on-GPU vs truncated-on-CPU. Down-stream PIRLS/REML
+    /// consumes the design verbatim so element-wise design parity at
+    /// ≤ 1e-9 implies fit parity at the same tolerance.
+    #[test]
+    fn sphere_gpu_end_to_end_dispatch_parity_vs_cpu_truncated() {
+        let Some(_runtime) = super::super::runtime::GpuRuntime::global() else {
+            eprintln!(
+                "[sphere_gpu test] no CUDA runtime — skipping end-to-end dispatch parity"
+            );
+            return;
+        };
+        if SphereGpuBackend::probe().is_err() {
+            eprintln!("[sphere_gpu test] backend probe failed — skipping");
+            return;
+        }
+        use crate::basis::{
+            CenterStrategy, SphereMethod, SphericalSplineBasisSpec, build_spherical_spline_basis,
+            sobolev_s2_truncated_coefficients,
+        };
+        let _ = sobolev_s2_truncated_coefficients(1, 1);
+
+        // (n=10_000, m=200) → n·m = 2_000_000 ≥ 1_000_000 → GPU eligible.
+        let data = small_latlon_grid(100, 100);
+        let lmax: u16 = 30;
+        let penalty_order = 2usize;
+        let spec_gpu = SphericalSplineBasisSpec {
+            center_strategy: CenterStrategy::FarthestPoint { num_centers: 200 },
+            penalty_order,
+            double_penalty: false,
+            radians: false,
+            method: SphereMethod::Wahba,
+            max_degree: None,
+            wahba_kernel: SphereWahbaKernel::SobolevTruncated { lmax },
+        };
+        let result_gpu = build_spherical_spline_basis(data.view(), &spec_gpu)
+            .expect("GPU-eligible build_spherical_spline_basis succeeds");
+
+        // Re-run with the same spec but bypass the GPU by shrinking
+        // `n·m` below the 1e6 gate is not possible without changing data
+        // shape, so instead we materialise the CPU-truncated reference
+        // design by calling the public CPU helper directly with the same
+        // centers that the GPU build chose. The centers are deterministic
+        // (farthest-point with the same seed = leftmost-lowest lat/lon),
+        // so we can rebuild them.
+        let centers = crate::basis::select_spherical_farthest_point_centers(
+            data.view(),
+            200,
+            false,
+        )
+        .expect("centers");
+        let raw_cpu = spherical_wahba_kernel_matrix_with_kind(
+            data.view(),
+            centers.view(),
+            penalty_order,
+            false,
+            SphereWahbaKernel::SobolevTruncated { lmax },
+        )
+        .expect("cpu raw design");
+
+        // The build wraps raw · Z into the final design; rebuild Z from
+        // the same weighted sum-to-zero transform.
+        let weights = crate::basis::sphere_area_weights(centers.view(), false);
+        let z = crate::basis::weighted_coefficient_sum_to_zero_transform(weights.view())
+            .expect("z");
+        let cpu_design = raw_cpu.dot(&z);
+
+        let gpu_design = result_gpu
+            .design
+            .as_dense()
+            .expect("dense design")
+            .clone();
+
+        assert_eq!(gpu_design.dim(), cpu_design.dim());
+        let mut max_abs = 0.0_f64;
+        let mut max_rel = 0.0_f64;
+        for ((g, c), _) in gpu_design.iter().zip(cpu_design.iter()).zip(0..) {
+            let d = (g - c).abs();
+            if d > max_abs {
+                max_abs = d;
+            }
+            let denom = g.abs().max(c.abs()).max(1e-300);
+            let r = d / denom;
+            if r > max_rel {
+                max_rel = r;
+            }
+        }
+        assert!(
+            max_rel < 1e-9,
+            "end-to-end design parity max relative |Δ| = {max_rel:.3e} >= 1e-9 (abs {max_abs:.3e})"
+        );
+    }
+
     /// V100-only: parity of Householder-constrained kernel against
     /// (raw kernel) · Z evaluated on host.
     #[test]
