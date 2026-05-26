@@ -21567,7 +21567,7 @@ mod tests {
         let (_, _, dense) = family
             .evaluate_exact_newton_joint_dynamic_q_dense(&block_states)
             .expect("dense joint Hessian");
-        let (operator, _) = family
+        let (operator, _, _, _) = family
             .exact_newton_joint_hessian_operator(&block_states, &BlockwiseFitOptions::default())
             .expect("joint Hessian operator");
         let op_dense = operator.to_dense();
