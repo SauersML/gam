@@ -19,8 +19,12 @@ term = { expr }
 expr = { sum }
 sum = { product ~ (add_op ~ product)* }
 add_op = _{ "+" | "-" }
-product = { unary ~ (mul_op ~ unary)* }
+product = { interact ~ (mul_op ~ interact)* }
 mul_op = _{ "*" | "/" }
+interact = { power ~ (interact_op ~ power)* }
+interact_op = _{ ":" }
+power = { unary ~ (pow_op ~ unary)* }
+pow_op = _{ "^" }
 unary = { unary_op* ~ primary }
 unary_op = _{ "+" | "-" }
 

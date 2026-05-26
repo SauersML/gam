@@ -441,9 +441,20 @@ class Sphere(Smooth):
         ``m=2`` is the canonical TPS-on-sphere analogue (curvature).
     kernel : one of ``"sobolev"`` (default), ``"pseudo"``, ``"harmonic"``.
     radians : default ``False`` (degrees, Earth/data-frame convention).
+    centers : optional explicit ``(K, 2)`` center array (lat, lon) in the
+        same angular convention as ``radians``. When provided, ``n_centers``
+        is ignored and ``K = centers.shape[0]`` drives the basis size.
 
     Notes
     -----
+    Centers are a property of the basis, not of the evaluation set. If the
+    user does not supply explicit ``centers``, the descriptor resolves
+    centers on first evaluation: farthest-point sampling from the eval
+    rows when there are at least ``n_centers`` of them, otherwise a
+    deterministic Fibonacci-lattice fallback so that small/test eval sets
+    still work. The resolved centers are then cached and reused for every
+    later evaluation.
+
     Streaming row-chunked evaluation activates automatically when the
     would-be dense basis buffer exceeds ~1 GiB; no opt-in is required.
     """
@@ -452,6 +463,7 @@ class Sphere(Smooth):
     penalty_order: int = 2
     kernel: str = "sobolev"
     radians: bool = False
+    centers: Any = None
 
     @property
     def intrinsic_dim(self) -> int:
@@ -459,28 +471,69 @@ class Sphere(Smooth):
 
     @property
     def basis_size(self) -> int:
-        # Determined by the Rust ``sphere_basis`` call shape. Probe with two
-        # dummy points and cache.
-        cached = getattr(self, "_cached_basis_size", None)
+        """Analytic basis dimension — no Rust call required.
+
+        - ``kernel='sobolev' | 'pseudo'``: ``K = n_centers - 1`` after the
+          area-weighted sum-to-zero identifiability transform applied by
+          the Rust builder.
+        - ``kernel='harmonic'``: ``K = L * (L + 2)`` where ``L = n_centers``
+          is the truncation degree.
+        """
+        if self.centers is not None:
+            import numpy as np
+
+            k = int(np.asarray(self.centers, dtype=np.float64).shape[0])
+        else:
+            k = int(self.n_centers)
+        if str(self.kernel).lower() == "harmonic":
+            return k * (k + 2)
+        return k - 1
+
+    def _resolve_centers(self, coords: Any) -> Any:
+        """Resolve and cache the basis center matrix.
+
+        For ``kernel='harmonic'`` no centers are needed and this returns
+        ``None``. For Wahba kernels the resolution order is:
+
+        1. User-supplied ``centers``.
+        2. Farthest-point sampling from ``coords`` when it has at least
+           ``n_centers`` rows.
+        3. Deterministic Fibonacci-lattice fallback otherwise.
+        """
+        if str(self.kernel).lower() == "harmonic":
+            return None
+
+        cached = getattr(self, "_cached_centers", None)
         if cached is not None:
             return cached
+
         import numpy as np
 
-        from . import _api
+        if self.centers is not None:
+            ctrs = np.ascontiguousarray(
+                np.asarray(self.centers, dtype=np.float64)
+            )
+            if ctrs.ndim != 2 or ctrs.shape[1] != 2:
+                raise ValueError(
+                    f"Sphere.centers must have shape (K, 2); got {ctrs.shape}"
+                )
+        else:
+            n_centers_i = int(self.n_centers)
+            pts = np.ascontiguousarray(np.asarray(coords, dtype=np.float64))
+            if pts.shape[0] >= n_centers_i:
+                from . import _api
 
-        probe = np.zeros((2, 2), dtype=np.float64)
-        if not self.radians:
-            probe[1, 0] = 1.0
-        design, _ = _api.rust_module().sphere_basis(
-            probe,
-            int(self.n_centers),
-            int(self.penalty_order),
-            str(self.kernel),
-            bool(self.radians),
-        )
-        size = int(np.asarray(design).shape[1])
-        object.__setattr__(self, "_cached_basis_size", size)
-        return size
+                ctrs = np.asarray(
+                    _api.rust_module().sphere_select_farthest_point_centers(
+                        pts, n_centers_i, bool(self.radians),
+                    ),
+                    dtype=np.float64,
+                )
+            else:
+                ctrs = _fibonacci_sphere_lat_lon(n_centers_i, bool(self.radians))
+
+        object.__setattr__(self, "_cached_centers", ctrs)
+        return ctrs
 
     def _evaluate_numpy(self, coords: Any) -> Any:
         from ._basis_eval import sphere_evaluate_numpy
@@ -491,6 +544,31 @@ class Sphere(Smooth):
         return sphere_evaluate(self, coords)
 
     SUPPORTED_BACKENDS: ClassVar[frozenset[str]] = frozenset({"torch", "numpy", "jax"})
+
+
+def _fibonacci_sphere_lat_lon(n: int, radians: bool) -> Any:
+    """Deterministic quasi-uniform sphere lattice — (n, 2) [lat, lon].
+
+    Golden-angle Fibonacci spiral on S². Used as the default center set
+    when ``Sphere.evaluate`` is called without pre-fit context (eval rows
+    < ``n_centers`` and no user-supplied ``centers``).
+    """
+    import numpy as np
+
+    if n < 2:
+        raise ValueError(f"Sphere needs at least 2 centers; got n_centers={n}")
+    k = np.arange(n, dtype=np.float64)
+    z = 1.0 - (2.0 * k + 1.0) / float(n)
+    z = np.clip(z, -1.0, 1.0)
+    lat_rad = np.arcsin(z)
+    golden_angle = np.pi * (3.0 - np.sqrt(5.0))
+    lon_rad = (k * golden_angle) % (2.0 * np.pi)
+    lon_rad = np.where(lon_rad > np.pi, lon_rad - 2.0 * np.pi, lon_rad)
+    if radians:
+        return np.column_stack([lat_rad, lon_rad]).astype(np.float64)
+    return np.column_stack([np.degrees(lat_rad), np.degrees(lon_rad)]).astype(
+        np.float64
+    )
 
 
 @dataclass(slots=True)

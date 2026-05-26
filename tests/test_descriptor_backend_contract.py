@@ -23,6 +23,26 @@ import gamfit
 from gamfit.smooth import Smooth
 
 
+def _own_evaluate_backends(cls: type) -> set[str]:
+    """Return the set of backends the class actually implements.
+
+    A backend counts as implemented iff some concrete subclass in the MRO
+    (between `cls` and `_BasisDescriptor` exclusive) overrides
+    `_evaluate_<backend>`. Pure inheritance from the abstract base doesn't
+    count — `_BasisDescriptor._evaluate_*` raises NotImplementedError.
+    """
+    from gamfit._basis_protocol import BasisDescriptor as _Base
+
+    out: set[str] = set()
+    for backend in ("torch", "numpy", "jax"):
+        method_name = f"_evaluate_{backend}"
+        own = getattr(cls, method_name, None)
+        base = getattr(_Base, method_name, None)
+        if own is not None and own is not base:
+            out.add(backend)
+    return out
+
+
 def _descriptor_subclasses() -> list[type]:
     seen: dict[str, type] = {}
 
@@ -57,11 +77,7 @@ def test_descriptor_declares_supported_backends_as_classvar(cls: type) -> None:
     # Non-empty iff the descriptor implements at least one _evaluate_<backend>
     # method. Carrier-only descriptors (e.g. Categorical) legitimately have
     # frozenset() because formula compilation consumes them directly.
-    impl_methods = {
-        name.removeprefix("_evaluate_")
-        for name in dir(cls)
-        if name.startswith("_evaluate_") and name != "_evaluate_impl"
-    }
+    impl_methods = _own_evaluate_backends(cls)
     if impl_methods & {"torch", "numpy", "jax"}:
         assert value, (
             f"{cls.__qualname__} has _evaluate_* methods but advertises no backends"

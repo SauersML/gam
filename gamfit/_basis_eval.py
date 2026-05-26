@@ -24,6 +24,31 @@ from ._basis_protocol import _torch
 # ---------------------------------------------------------------------------
 
 
+def _ensure_bspline_knots(spec: Any, t_np: Any) -> Any:
+    """Resolve `spec.knots` and cache the resolved array back onto the spec.
+
+    The descriptor advertises `knots=None` and `knots=K` as auto-derived,
+    but every backend (numpy, torch, jax) needs the *same* resolved knot
+    vector. Resolving on first evaluation and writing back guarantees:
+
+      * subsequent evaluations are deterministic regardless of which `t`
+        is passed (the first one wins, like a fit/transform contract).
+      * `bspline_basis_size` (and therefore the JAX static-shape path)
+        works after one `.evaluate(x)` call, as the docstring promises.
+
+    Returns the resolved knot array.
+    """
+    import numpy as np
+
+    from . import _api
+
+    knots = spec.knots
+    if knots is None or isinstance(knots, int):
+        resolved = _api._resolve_knots(knots, t_np, label="knots", degree=int(spec.degree))
+        spec.knots = np.asarray(resolved, dtype=np.float64)
+    return spec.knots
+
+
 def bspline_evaluate(spec: Any, coords: Any) -> Any:
     """Evaluate a :class:`gamfit.BSpline` at stacked ``(B, 1)`` coords.
 
@@ -41,18 +66,28 @@ def bspline_evaluate(spec: Any, coords: Any) -> Any:
             "or Duchon for radial."
         )
     t = coords[:, 0]
+    import numpy as np
+
+    t_np = np.asarray(t.detach().cpu().numpy() if hasattr(t, "detach") else t, dtype=np.float64)
+    _ensure_bspline_knots(spec, t_np)
     return bspline_basis(
         t, spec.knots, degree=int(spec.degree), periodic=bool(spec.periodic),
     )
 
 
 def bspline_basis_size(spec: Any) -> int:
-    """Compute n_basis from spec.knots when knots are resolved."""
+    """Compute n_basis from spec.knots once knots are resolved.
+
+    Knots are auto-resolved and cached by the first `evaluate()` call; that
+    contract is documented on `BSpline.knots` and the JAX path depends on
+    it for static output shape.
+    """
     knots = spec.knots
     if knots is None or isinstance(knots, int):
         raise ValueError(
-            "BSpline.basis_size is only defined once knots are resolved "
-            "(call .evaluate(x) once, or set spec.knots to an explicit array)."
+            "BSpline.basis_size: knots not resolved. Call `.evaluate(x)` "
+            "once (any backend) — that resolves knots from x and caches "
+            "them on the spec — or set `spec.knots` to an explicit array."
         )
     import numpy as np
 
@@ -391,9 +426,13 @@ def tensor_bspline_evaluate(spec: Any, coords: Any) -> Any:
         )
     if not marginals:
         raise ValueError("TensorBSpline: no marginals to evaluate")
+    import numpy as np
+
     out = None
     for j, marg in enumerate(marginals):
         x = coords[:, j]
+        x_np = np.asarray(x.detach().cpu().numpy() if hasattr(x, "detach") else x, dtype=np.float64)
+        _ensure_bspline_knots(marg, x_np)
         col = bspline_basis(
             x, marg.knots, degree=int(marg.degree), periodic=bool(marg.periodic),
         )
@@ -420,9 +459,11 @@ def bspline_evaluate_numpy(spec: Any, coords: Any) -> Any:
         raise ValueError(
             f"BSpline.evaluate: 1D-only; got coords with d={coords.shape[1]}"
         )
+    t_np = np.asarray(coords[:, 0], dtype=np.float64)
+    _ensure_bspline_knots(spec, t_np)
     return np.asarray(
         _api.bspline_basis(
-            coords[:, 0],
+            t_np,
             spec.knots,
             degree=int(spec.degree),
             periodic=bool(spec.periodic),
@@ -468,9 +509,11 @@ def tensor_bspline_evaluate_numpy(spec: Any, coords: Any) -> Any:
         raise ValueError("TensorBSpline: no marginals to evaluate")
     out = None
     for j, marg in enumerate(marginals):
+        x_np = np.asarray(coords[:, j], dtype=np.float64)
+        _ensure_bspline_knots(marg, x_np)
         col = np.asarray(
             _api.bspline_basis(
-                coords[:, j],
+                x_np,
                 marg.knots,
                 degree=int(marg.degree),
                 periodic=bool(marg.periodic),
@@ -524,18 +567,26 @@ def sphere_evaluate(spec: Any, coords: Any) -> Any:
             f"Sphere.evaluate expects (B, 2) coords [lat, lon]; "
             f"got d={coords.shape[1]}"
         )
+    centers = spec._resolve_centers(coords)
     design, _penalty = sphere_basis(
         coords,
         n_centers=int(spec.n_centers),
         penalty_order=int(spec.penalty_order),
         kernel=str(spec.kernel),
         radians=bool(spec.radians),
+        centers=centers,
     )
     return design
 
 
 def sphere_evaluate_numpy(spec: Any, coords: Any) -> Any:
-    """NumPy-backend Sphere evaluation. Direct Rust ``sphere_basis``."""
+    """NumPy-backend Sphere evaluation.
+
+    For Wahba kernels (``sobolev``/``pseudo``) this routes through
+    ``sphere_basis_with_centers`` so the basis dimension is fixed by the
+    descriptor's resolved center set rather than by the evaluation row
+    count. For ``harmonic`` (eigen) basis, no centers are needed.
+    """
     import numpy as np
 
     from . import _api
@@ -546,13 +597,23 @@ def sphere_evaluate_numpy(spec: Any, coords: Any) -> Any:
             f"Sphere.evaluate expects (B, 2) coords [lat, lon]; "
             f"got shape {tuple(pts.shape)}"
         )
-    design, _ = _api.sphere_basis(
-        pts,
-        int(spec.n_centers),
-        penalty_order=int(spec.penalty_order),
-        kernel=str(spec.kernel),
-        radians=bool(spec.radians),
-    )
+    centers = spec._resolve_centers(pts)
+    if centers is None:
+        design, _ = _api.sphere_basis(
+            pts,
+            int(spec.n_centers),
+            penalty_order=int(spec.penalty_order),
+            kernel=str(spec.kernel),
+            radians=bool(spec.radians),
+        )
+    else:
+        design, _ = _api.rust_module().sphere_basis_with_centers(
+            pts,
+            np.ascontiguousarray(centers, dtype=np.float64),
+            int(spec.penalty_order),
+            str(spec.kernel),
+            bool(spec.radians),
+        )
     return np.asarray(design, dtype=np.float64)
 
 
