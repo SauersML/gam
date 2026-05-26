@@ -8560,6 +8560,7 @@ fn sae_manifold_fit_inner<'py>(
     ridge_beta: f64,
     gumbel_schedule: Option<&Bound<'py, PyDict>>,
     analytic_penalties: Option<String>,
+    top_k: Option<usize>,
 ) -> PyResult<Py<PyDict>> {
     let analytic_penalties: Option<serde_json::Value> = match analytic_penalties {
         Some(s) => Some(serde_json::from_str(&s).map_err(|e| py_value_error(e.to_string()))?),
@@ -9984,6 +9985,7 @@ fn sae_build_atom_plans(
     gumbel_schedule = None,
     analytic_penalties = None,
     random_state = 0,
+    top_k = None,
 ))]
 fn sae_manifold_fit_auto<'py>(
     py: Python<'py>,
@@ -10004,6 +10006,7 @@ fn sae_manifold_fit_auto<'py>(
     gumbel_schedule: Option<&Bound<'py, PyDict>>,
     analytic_penalties: Option<String>,
     random_state: u64,
+    top_k: Option<usize>,
 ) -> PyResult<Py<PyDict>> {
     let z_view = z.as_array();
     let (n_obs, _p_out) = z_view.dim();
@@ -10130,6 +10133,7 @@ fn sae_manifold_fit_auto<'py>(
         ridge_beta,
         gumbel_schedule,
         analytic_penalties,
+        top_k,
     )?;
     // Attach per-atom build plans so OOS predict can rebuild design without Python.
     let plans_py = PyList::empty(py);
