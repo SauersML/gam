@@ -2352,6 +2352,7 @@ fn sae_penalty_is_row_block_supported(penalty: &AnalyticPenaltyKind) -> bool {
             | AnalyticPenaltyKind::RowPrecisionPrior(_)
             | AnalyticPenaltyKind::ParametricRowPrecisionPrior(_)
             | AnalyticPenaltyKind::ScadMcp(_)
+            | AnalyticPenaltyKind::BlockOrthogonality(_)
     )
 }
 
