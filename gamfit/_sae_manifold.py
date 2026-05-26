@@ -494,43 +494,51 @@ def _build_analytic_penalties_payload(
     """Translate the SAE regularizer knobs into the analytic-penalty JSON
     payload consumed by ``sae_manifold_fit_auto``.
 
-    Only ``ard_per_atom`` is currently wired through. ``isometry_weight``,
-    ``block_orthogonality_weight``, and ``mechanism_sparsity_groups`` need
-    SAE row-block driver work in ``src/terms/sae_manifold.rs`` (Jacobian
-    cache for Isometry, target-shape resolution for the others) — tracked
-    as issue #249. Activating any of them raises ``NotImplementedError``
-    here so callers cannot silently lose configuration. The historical bug
-    (issue #240) was *silent* acceptance; rejecting cleanly with an
-    actionable message is the principled wrapper-layer half of the fix.
+    ``ard_per_atom`` and ``block_orthogonality_weight`` route through the
+    row-block driver in ``src/terms/sae_manifold.rs``. ``isometry_weight``
+    and ``mechanism_sparsity_groups`` are deferred — Isometry needs a
+    pullback-metric provider hook on ``SaeManifoldAtom`` and
+    MechanismSparsity needs a stride-aware target view onto SAE's per-atom
+    decoder beta. Activating either raises ``NotImplementedError``.
     """
     unsupported: list[str] = []
     if isometry_weight is not None and float(isometry_weight) > 0.0:
         unsupported.append("isometry_weight")
-    if (
-        block_orthogonality_weight is not None
-        and float(block_orthogonality_weight) > 0.0
-    ):
-        unsupported.append("block_orthogonality_weight")
     if mechanism_sparsity_groups is not None:
         unsupported.append("mechanism_sparsity_groups")
     if unsupported:
         names = ", ".join(unsupported)
         raise NotImplementedError(
             f"sae_manifold_fit: {names} cannot be applied yet — the Rust "
-            "SAE row-block driver only routes ARD through "
-            "`sae_penalty_is_row_block_supported` "
-            "(`src/terms/sae_manifold.rs`). Wiring the remaining analytic "
-            "penalties needs Jacobian-cache + target-shape work in that "
-            "module; tracked as issue #249. Pass only `ard_per_atom` for "
-            "now, or omit these parameters to fit without them."
+            "SAE row-block driver needs pullback-metric / stride-aware "
+            "target-layout work in `src/terms/sae_manifold.rs`. Pass only "
+            "`ard_per_atom` and/or `block_orthogonality_weight` for now."
         )
-    # `d_max` / `p_out` are reserved for the descriptors that will land once
-    # issue #249 wires the remaining penalties; they participate in the
-    # target-length arithmetic the Rust parsers perform.
-    del d_max, p_out
+    del p_out
     items: list[dict[str, Any]] = []
     if bool(ard_per_atom):
         items.append({"kind": "ard", "target": "t"})
+    if (
+        block_orthogonality_weight is not None
+        and float(block_orthogonality_weight) > 0.0
+    ):
+        # The latent block "t" is (n_obs, d_max). BlockOrth requires ≥2
+        # groups that partition contiguous axes from 0 — split into
+        # singletons so each axis is in its own group, which is the most
+        # restrictive (and most informative) gauge available without
+        # caller-supplied structure.
+        if int(d_max) < 2:
+            raise ValueError(
+                "block_orthogonality_weight requires atom_dim >= 2; "
+                f"got d_max={d_max}"
+            )
+        groups = [[axis] for axis in range(int(d_max))]
+        items.append({
+            "kind": "block_orthogonality",
+            "target": "t",
+            "groups": groups,
+            "weight": float(block_orthogonality_weight),
+        })
     if not items:
         return None
     return json.dumps(items)
