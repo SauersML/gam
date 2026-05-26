@@ -12686,19 +12686,40 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             //   * grad_reload: post-accept joint gradient + workspace refresh
             let cycle_started = std::time::Instant::now();
             let hessian_started = std::time::Instant::now();
+            let cycle_log = prelude_log;
+            let constraints_started = std::time::Instant::now();
             let block_constraints = collect_block_linear_constraints(family, &states, specs)?;
             let joint_constraints =
                 assemble_joint_linear_constraints(&block_constraints, &ranges, total_p)?;
+            if cycle_log && cycle == 0 {
+                log::info!(
+                    "[STAGE] PIRLS/inner step=cycle0 block+joint constraints elapsed={:.3}s n={} p={}",
+                    constraints_started.elapsed().as_secs_f64(),
+                    total_joint_n,
+                    total_p,
+                );
+            }
+            let workspace_build_started = std::time::Instant::now();
             // Get joint Hessian and block gradients from the current evaluation.
             let hessian_workspace_for_cycle: Option<Arc<dyn ExactNewtonJointHessianWorkspace>> =
                 None;
             let joint_hessian_source = if joint_workspace_requested {
+                let cached_hit = cached_joint_workspace.is_some();
                 let workspace = match cached_joint_workspace.take() {
                     Some(workspace) => Some(workspace),
                     None => family.exact_newton_joint_hessian_workspace_with_options(
                         &states, specs, options,
                     )?,
                 };
+                if cycle_log && cycle == 0 {
+                    log::info!(
+                        "[STAGE] PIRLS/inner step=cycle0 hessian-workspace cached_hit={} elapsed={:.3}s n={} p={}",
+                        cached_hit,
+                        workspace_build_started.elapsed().as_secs_f64(),
+                        total_joint_n,
+                        total_p,
+                    );
+                }
                 workspace
                     .as_ref()
                     .map(|workspace| {
