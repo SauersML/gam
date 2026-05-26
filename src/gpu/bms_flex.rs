@@ -153,6 +153,78 @@ pub struct BmsFlexGpuBackend {
     inner: BmsFlexGpuContextLinux,
 }
 
+/// Device-resident row-primary Hessian cache (Block 9 Phase 1).
+///
+/// Holds the per-row `r × r` Hessian block C_i for every observation row
+/// of a single FLEX fit in CUDA memory, in row-major `(n, r·r)`
+/// layout. Consumed by the device Hv kernel (Block 9 Phase 2 / task
+/// #54) and the device diagonal kernel (Phase 3 / task #55). The
+/// kernel that *builds* this cache is task #4's NVRTC source
+/// (`row_hessian_build_kernel`, lands as part of completing Phase 1).
+///
+/// This type currently exists as the cache-enum carrier only; the
+/// build kernel + populate path land in a follow-up Phase-1 commit.
+/// Constructing it from outside `src/gpu/bms_flex.rs` requires the
+/// `BmsFlexGpuBackend` (and therefore Linux + a working CUDA runtime),
+/// so wherever this variant of `RowPrimaryHessianCache` lives, the
+/// holder cannot be a non-Linux build.
+#[cfg(target_os = "linux")]
+pub struct RowPrimaryHessianDevice {
+    /// Flat row-major `(n, r·r)` slab of f64 Hessian entries on the
+    /// device — `n*r*r` elements total. Stream-bound to `stream`.
+    c_i: cudarc::driver::CudaSlice<f64>,
+    /// Stream that owns `c_i`. Borrowed `Arc` so the same stream can be
+    /// reused by Hv/diag kernels (and, in Block 9 Phase 5, by the PIRLS
+    /// inner solve PCG vectors). Cloning is cheap; the underlying CUDA
+    /// stream is reference-counted by cudarc.
+    stream: Arc<CudaStream>,
+    /// Row count `n` — the fast dimension of `c_i`.
+    n: usize,
+    /// Primary local dimension `r` — block dim of each `r × r` per-row
+    /// Hessian. `c_i` is logically `[n][r][r]`.
+    r: usize,
+}
+
+#[cfg(target_os = "linux")]
+impl RowPrimaryHessianDevice {
+    /// Total length of the flat device slab, in f64 elements.
+    /// `n * r * r`. Useful for sanity checks at consumer sites.
+    #[inline]
+    #[must_use]
+    pub fn element_count(&self) -> usize {
+        self.n.saturating_mul(self.r).saturating_mul(self.r)
+    }
+
+    /// Stream the device cache is bound to. Hv / diag kernels must
+    /// launch on this stream (or arrange explicit event-based wait).
+    #[inline]
+    #[must_use]
+    pub fn stream(&self) -> &Arc<CudaStream> {
+        &self.stream
+    }
+
+    /// Per-fit row count.
+    #[inline]
+    #[must_use]
+    pub fn n(&self) -> usize {
+        self.n
+    }
+
+    /// Per-fit primary local dimension.
+    #[inline]
+    #[must_use]
+    pub fn r(&self) -> usize {
+        self.r
+    }
+
+    /// Read access to the flat row-major `(n, r·r)` device slab.
+    #[inline]
+    #[must_use]
+    pub fn c_i(&self) -> &cudarc::driver::CudaSlice<f64> {
+        &self.c_i
+    }
+}
+
 #[cfg(target_os = "linux")]
 struct BmsFlexGpuContextLinux {
     ctx: Arc<CudaContext>,
