@@ -2053,6 +2053,26 @@ pub trait CustomFamily {
         false
     }
 
+    /// Opt families in to the matrix-free inner-Newton/PCG path on top of the
+    /// generic `use_joint_matrix_free_path` heuristic.
+    ///
+    /// `use_joint_matrix_free_path` is tuned for families with cheap per-row
+    /// work where dense `O(n·p²)` assembly is itself the bottleneck and HVPs
+    /// cost the same. Families with very expensive per-row work (e.g. BMS flex
+    /// streaming cell partitions + flex-jet evaluations per row) can override
+    /// this to force the operator path even at moderate `p`, because each HVP
+    /// reuses the row stream once and PCG converges in a handful of iters.
+    /// Default `false` keeps the heuristic untouched for everyone else.
+    fn prefers_matrix_free_inner_joint(
+        &self,
+        specs: &[ParameterBlockSpec],
+        states: &[ParameterBlockState],
+    ) -> bool {
+        assert_valid_blockspecs(specs, "matrix-free inner-joint preference");
+        assert!(states.len() <= isize::MAX as usize);
+        false
+    }
+
     fn inner_joint_workspace_log_likelihood_available(&self, specs: &[ParameterBlockSpec]) -> bool {
         assert_valid_blockspecs(specs, "inner joint workspace log-likelihood availability");
         false
@@ -12256,7 +12276,8 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
     refresh_all_block_etas(family, specs, &mut states)?;
     let total_joint_p = specs.iter().map(|spec| spec.design.ncols()).sum::<usize>();
     let total_joint_n = joint_observation_count(&states);
-    let matrix_free_joint_requested = use_joint_matrix_free_path(total_joint_p, total_joint_n);
+    let matrix_free_joint_requested = use_joint_matrix_free_path(total_joint_p, total_joint_n)
+        || family.prefers_matrix_free_inner_joint(specs, &states);
     let has_workspace_source = family.inner_coefficient_hessian_hvp_available(specs);
     let has_joint_exacthessian = if has_workspace_source {
         true

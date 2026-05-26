@@ -16127,6 +16127,29 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         parameter_block_specs_match_rows(specs, self.y.len())
     }
 
+    /// Force the matrix-free inner-Newton/PCG path for BMS flex at biobank
+    /// scale, on top of the generic `use_joint_matrix_free_path` heuristic.
+    ///
+    /// At n≈195k with `linkwiggle()` / `logslope_formula linkwiggle()`, dense
+    /// joint-H assembly streams every row through the expensive flex row
+    /// kernel and pays a BLAS-3 design-matrix gram per chunk on top — ~63s
+    /// per inner cycle. Each HVP reuses the row stream at near-gradient cost
+    /// (~3s), and PCG with the joint penalty preconditioner typically
+    /// converges in a handful of iters. The generic gate only fires for
+    /// `p >= 128`, but BMS-flex per-row work is heavy enough that the matrix-
+    /// free path wins well below that — drop the `p` floor for this family.
+    fn prefers_matrix_free_inner_joint(
+        &self,
+        specs: &[ParameterBlockSpec],
+        states: &[ParameterBlockState],
+    ) -> bool {
+        assert!(specs.len() <= isize::MAX as usize);
+        if self.y.len() < 16_384 {
+            return false;
+        }
+        self.effective_flex_active(states).unwrap_or(false)
+    }
+
     fn exact_newton_joint_hessian_directional_derivative(
         &self,
         block_states: &[ParameterBlockState],
