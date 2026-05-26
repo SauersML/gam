@@ -60,10 +60,10 @@ def test_clr_rejects_zero_mass_with_value_error() -> None:
         clr(bad)
 
 
-def test_alr_invalid_reference_raises_value_error() -> None:
-    y = np.array([[0.3, 0.3, 0.4]])
+def test_alr_rejects_non_finite_input_with_value_error() -> None:
+    bad = np.array([[0.3, 0.3, np.nan]])
     with pytest.raises(ValueError):
-        alr(y, reference=42)
+        alr(bad, reference=-1)
 
 
 def test_simplex_log_map_rejects_non_positive_with_value_error() -> None:
