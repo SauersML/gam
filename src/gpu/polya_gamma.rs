@@ -1058,26 +1058,9 @@ extern "C" __global__ void normal_kernel(
 
     const THREADS_PER_BLOCK: u32 = 128;
 
-    struct CompiledModule {
-        module: Arc<CudaModule>,
-    }
-
-    fn module(ctx: &Arc<CudaContext>) -> Result<&'static CompiledModule, GpuError> {
-        static MODULE: OnceLock<Result<CompiledModule, GpuError>> = OnceLock::new();
-        let result = MODULE.get_or_init(|| {
-            let ptx = cudarc::nvrtc::compile_ptx(PTX_SOURCE).map_err(|err| {
-                GpuError::DriverCallFailed {
-                    reason: format!("polya_gamma NVRTC compile failed: {err}"),
-                }
-            })?;
-            let m = ctx
-                .load_module(ptx)
-                .map_err(|err| GpuError::DriverCallFailed {
-                    reason: format!("polya_gamma module load failed: {err}"),
-                })?;
-            Ok(CompiledModule { module: m })
-        });
-        result.as_ref().map_err(GpuError::clone)
+    fn module(ctx: &Arc<CudaContext>) -> Result<&'static Arc<CudaModule>, GpuError> {
+        static CACHE: crate::gpu::common::PtxModuleCache = crate::gpu::common::PtxModuleCache::new();
+        CACHE.get_or_compile(ctx, "polya_gamma", PTX_SOURCE)
     }
 
     pub(super) fn draw_batch_gpu(
@@ -1090,6 +1073,7 @@ extern "C" __global__ void normal_kernel(
         let (ctx, stream) =
             context_and_stream().map_err(|reason| GpuError::DriverCallFailed { reason })?;
         let compiled = module(&ctx)?;
+        let module_handle: &Arc<CudaModule> = compiled;
 
         // ── Partition rows by regime (math §7). For the 2 ≤ b < SADDLE_MIN
         //   band the device kernel set above does not have a dedicated
@@ -1142,14 +1126,14 @@ extern "C" __global__ void normal_kernel(
             let rows_dev = stream.clone_htod(&pg1_rows).map_err(|err| {
                 GpuError::DriverCallFailed { reason: format!("polya_gamma upload pg1 rows: {err}") }
             })?;
-            launch_pg1(&stream, &compiled.module, input.seed, &rows_dev, &tilts_dev, &mut out_dev)?;
+            launch_pg1(&stream, module_handle, input.seed, &rows_dev, &tilts_dev, &mut out_dev)?;
         }
         if !sp_rows.is_empty() {
             let rows_dev = stream.clone_htod(&sp_rows).map_err(|err| {
                 GpuError::DriverCallFailed { reason: format!("polya_gamma upload sp rows: {err}") }
             })?;
             launch_sp(
-                &stream, &compiled.module, input.seed, &rows_dev, &shapes_dev, &tilts_dev,
+                &stream, module_handle, input.seed, &rows_dev, &shapes_dev, &tilts_dev,
                 &mut out_dev,
             )?;
         }
@@ -1160,7 +1144,7 @@ extern "C" __global__ void normal_kernel(
                 }
             })?;
             launch_normal(
-                &stream, &compiled.module, input.seed, &rows_dev, &shapes_dev, &tilts_dev,
+                &stream, module_handle, input.seed, &rows_dev, &shapes_dev, &tilts_dev,
                 &mut out_dev,
             )?;
         }
