@@ -12687,6 +12687,11 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             //   * grad_reload: post-accept joint gradient + workspace refresh
             let cycle_started = std::time::Instant::now();
             let hessian_started = std::time::Instant::now();
+            log::info!(
+                "[joint-newton-tr] phase=hessian_qp cycle={} r={:.3e}",
+                cycle,
+                joint_trust_radius,
+            );
             let cycle_log = prelude_log;
             let constraints_started = std::time::Instant::now();
             let block_constraints = collect_block_linear_constraints(family, &states, specs)?;
@@ -13074,6 +13079,12 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // backtracking step search.
             let hessian_and_qp_elapsed = hessian_started.elapsed();
             let line_search_started = std::time::Instant::now();
+            log::info!(
+                "[joint-newton-tr] phase=line_search cycle={} r={:.3e} hessian_qp_elapsed={:.3}s",
+                cycle,
+                joint_trust_radius,
+                hessian_and_qp_elapsed.as_secs_f64(),
+            );
             let delta = &candidate_beta - &beta_joint;
 
             // Trust-region globalization for the joint Newton proposal.  The
@@ -13511,6 +13522,25 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     }
                 }
                 if floor_reached {
+                    if let Some(sig) = tr_log_sig.take() {
+                        if tr_log_first == tr_log_last {
+                            log::info!(
+                                "[PIRLS/joint-Newton/TR cycle={} attempt={}] {}",
+                                cycle,
+                                tr_log_first,
+                                sig,
+                            );
+                        } else {
+                            log::info!(
+                                "[PIRLS/joint-Newton/TR cycle={} attempts={}..{} ×{}] {}",
+                                cycle,
+                                tr_log_first,
+                                tr_log_last,
+                                tr_log_last - tr_log_first + 1,
+                                sig,
+                            );
+                        }
+                    }
                     for (b, old) in old_beta.iter().enumerate() {
                         states[b].beta.assign(old);
                     }
@@ -13521,6 +13551,25 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     break;
                 }
                 if secondary_ok {
+                    if let Some(sig) = tr_log_sig.take() {
+                        if tr_log_first == tr_log_last {
+                            log::info!(
+                                "[PIRLS/joint-Newton/TR cycle={} attempt={}] {}",
+                                cycle,
+                                tr_log_first,
+                                sig,
+                            );
+                        } else {
+                            log::info!(
+                                "[PIRLS/joint-Newton/TR cycle={} attempts={}..{} ×{}] {}",
+                                cycle,
+                                tr_log_first,
+                                tr_log_last,
+                                tr_log_last - tr_log_first + 1,
+                                sig,
+                            );
+                        }
+                    }
                     current_penalty = trial_penalty;
                     if let Some(joint_active_set) = search_joint_active_set.as_ref() {
                         cached_active_sets =
@@ -13536,6 +13585,25 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 }
                 refresh_all_block_etas(family, specs, &mut states)?;
                 objective_rejects += 1;
+            }
+            if let Some(sig) = tr_log_sig.take() {
+                if tr_log_first == tr_log_last {
+                    log::info!(
+                        "[PIRLS/joint-Newton/TR cycle={} attempt={}] {}",
+                        cycle,
+                        tr_log_first,
+                        sig,
+                    );
+                } else {
+                    log::info!(
+                        "[PIRLS/joint-Newton/TR cycle={} attempts={}..{} ×{}] {}",
+                        cycle,
+                        tr_log_first,
+                        tr_log_last,
+                        tr_log_last - tr_log_first + 1,
+                        sig,
+                    );
+                }
             }
             let line_search_elapsed = line_search_started.elapsed();
             if accepted && converged {
@@ -13601,6 +13669,12 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             }
 
             let grad_reload_started = std::time::Instant::now();
+            log::info!(
+                "[joint-newton-tr] phase=gradient_reload cycle={} attempts={} r={:.3e}",
+                cycle,
+                line_search_attempts,
+                joint_trust_radius,
+            );
             let (log_likelihood, gradient, eval, workspace) = load_joint_gradient_evaluation(
                 family,
                 specs,

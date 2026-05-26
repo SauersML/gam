@@ -17534,6 +17534,16 @@ fn pooled_survival_baseline(
 
 // ── Public fitting function ───────────────────────────────────────────
 
+/// Whether the optional score-warp / link-deviation flex blocks participate in
+/// a family build. The rigid warm-start pilot must construct its family and
+/// blocks with `OffForRigidPilot` so the cold-start coefficient solve cannot
+/// silently activate the survival flex exact-Joint-Newton path.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum FlexActivation {
+    OffForRigidPilot,
+    On,
+}
+
 pub fn fit_survival_marginal_slope_terms(
     data: ArrayView2<'_, f64>,
     spec: SurvivalMarginalSlopeTermSpec,
@@ -17893,10 +17903,21 @@ pub fn fit_survival_marginal_slope_terms(
     };
 
     let intercept_warm_starts = new_intercept_warm_start_cache(n);
+    // FlexActivation::OffForRigidPilot forces the rigid warm-start to construct
+    // a family with no score_warp / link_dev runtimes and no flex blocks. That
+    // is the only way to guarantee the pilot does not enter the survival flex
+    // exact-Joint-Newton path. A boolean here would be too easy to flip
+    // accidentally; the named enum makes the intent and audit obvious at every
+    // call site.
     let make_family = |marginal_design: &TermCollectionDesign,
                        logslope_design: &TermCollectionDesign,
-                       sigma: Option<f64>|
+                       sigma: Option<f64>,
+                       flex: FlexActivation|
      -> SurvivalMarginalSlopeFamily {
+        let (score_warp_active, link_dev_active) = match flex {
+            FlexActivation::OffForRigidPilot => (None, None),
+            FlexActivation::On => (score_warp_runtime.clone(), link_dev_runtime.clone()),
+        };
         SurvivalMarginalSlopeFamily {
             n,
             event: Arc::clone(&event),
@@ -17914,8 +17935,8 @@ pub fn fit_survival_marginal_slope_terms(
             marginal_design: marginal_design.design.clone(),
             logslope_design: logslope_design.design.clone(),
             logslope_surface_ranges: logslope_surface_ranges.clone(),
-            score_warp: score_warp_runtime.clone(),
-            link_dev: link_dev_runtime.clone(),
+            score_warp: score_warp_active,
+            link_dev: link_dev_active,
             time_linear_constraints: time_linear_constraints.clone(),
             time_wiggle_knots: spec.timewiggle_block.as_ref().map(|w| w.knots.clone()),
             time_wiggle_degree: spec.timewiggle_block.as_ref().map(|w| w.degree),
@@ -17928,7 +17949,8 @@ pub fn fit_survival_marginal_slope_terms(
 
     let build_blocks = |rho: &Array1<f64>,
                         marginal_design: &TermCollectionDesign,
-                        logslope_design: &TermCollectionDesign|
+                        logslope_design: &TermCollectionDesign,
+                        flex: FlexActivation|
      -> Result<Vec<ParameterBlockSpec>, String> {
         let hints = hints.borrow();
         let mut cursor = 0usize;
@@ -17944,6 +17966,14 @@ pub fn fit_survival_marginal_slope_terms(
             .slice(s![cursor..cursor + logslope_design.penalties.len()])
             .to_owned();
         cursor += logslope_design.penalties.len();
+        let score_warp_active = match flex {
+            FlexActivation::On => score_warp_prepared.as_ref(),
+            FlexActivation::OffForRigidPilot => None,
+        };
+        let link_dev_active = match flex {
+            FlexActivation::On => link_dev_prepared.as_ref(),
+            FlexActivation::OffForRigidPilot => None,
+        };
         let time_beta_hint = if let Some(constraints) = time_linear_constraints.as_ref() {
             Some(project_onto_linear_constraints(
                 design_exit.ncols(),
@@ -17975,7 +18005,7 @@ pub fn fit_survival_marginal_slope_terms(
                 hints.logslope_beta.clone(),
             ),
         ];
-        if let Some(prepared) = score_warp_prepared.as_ref() {
+        if let Some(prepared) = score_warp_active {
             let rho_h = rho
                 .slice(s![cursor..cursor + prepared.block.penalties.len()])
                 .to_owned();
@@ -17991,7 +18021,7 @@ pub fn fit_survival_marginal_slope_terms(
             rho,
             &mut cursor,
             None,
-            link_dev_prepared.as_ref(),
+            link_dev_active,
             None,
             hints.link_dev_beta.clone(),
         )?;
@@ -18036,19 +18066,27 @@ pub fn fit_survival_marginal_slope_terms(
             marginal_design.design.ncols(),
             logslope_design.design.ncols(),
         );
+        // Pilot ρ has exactly the parametric block sizes — score_warp and
+        // link_dev are excluded via FlexActivation::OffForRigidPilot below.
+        // Sizing must match build_blocks(... OffForRigidPilot) or the cursor
+        // walk inside the closure would slice past the end of the array.
         let rigid_rho = Array1::<f64>::zeros(
             time_penalties_len
                 + marginal_design.penalties.len()
-                + logslope_design.penalties.len()
-                + score_warp_prepared
-                    .as_ref()
-                    .map_or(0, |prepared| prepared.block.penalties.len())
-                + link_dev_prepared
-                    .as_ref()
-                    .map_or(0, |prepared| prepared.block.penalties.len()),
+                + logslope_design.penalties.len(),
         );
-        let rigid_blocks = build_blocks(&rigid_rho, &marginal_design, &logslope_design)?;
-        let rigid_family = make_family(&marginal_design, &logslope_design, initial_sigma);
+        let rigid_blocks = build_blocks(
+            &rigid_rho,
+            &marginal_design,
+            &logslope_design,
+            FlexActivation::OffForRigidPilot,
+        )?;
+        let rigid_family = make_family(
+            &marginal_design,
+            &logslope_design,
+            initial_sigma,
+            FlexActivation::OffForRigidPilot,
+        );
         let mut pilot_options = options.clone();
         // The pilot is only a warm start. Avoid production covariance assembly
         // and cap inner cycles so a bad seed cannot silently consume minutes
@@ -18086,6 +18124,10 @@ pub fn fit_survival_marginal_slope_terms(
                 // picks (cached seed or initial_theta), which is the
                 // behaviour the warning text already promises.
                 if converged {
+                    // Pilot only seeds the three parametric blocks. Flex
+                    // (score_warp / link_dev) blocks are intentionally absent
+                    // under FlexActivation::OffForRigidPilot — there is no
+                    // pilot β for them to seed.
                     let mut hints_mut = hints.borrow_mut();
                     if let Some(beta) = block_beta.first() {
                         hints_mut.time_beta = Some(beta.clone());
@@ -18095,17 +18137,6 @@ pub fn fit_survival_marginal_slope_terms(
                     }
                     if let Some(beta) = block_beta.get(2) {
                         hints_mut.logslope_beta = Some(beta.clone());
-                    }
-                    if score_warp_prepared.is_some()
-                        && let Some(beta) = block_beta.get(3)
-                    {
-                        hints_mut.score_warp_beta = Some(beta.clone());
-                    }
-                    if link_dev_prepared.is_some() {
-                        let link_idx = if score_warp_prepared.is_some() { 4 } else { 3 };
-                        if let Some(beta) = block_beta.get(link_idx) {
-                            hints_mut.link_dev_beta = Some(beta.clone());
-                        }
                     }
                 }
                 log::info!(
@@ -18147,8 +18178,18 @@ pub fn fit_survival_marginal_slope_terms(
         setup.log_kappa_dim(),
     );
     let initial_rho = setup.theta0().slice(s![..setup.rho_dim()]).to_owned();
-    let initial_blocks = build_blocks(&initial_rho, &marginal_design, &logslope_design)?;
-    let initial_family = make_family(&marginal_design, &logslope_design, initial_sigma);
+    let initial_blocks = build_blocks(
+        &initial_rho,
+        &marginal_design,
+        &logslope_design,
+        FlexActivation::On,
+    )?;
+    let initial_family = make_family(
+        &marginal_design,
+        &logslope_design,
+        initial_sigma,
+        FlexActivation::On,
+    );
     let (joint_gradient, joint_hessian) =
         custom_family_outer_derivatives(&initial_family, &initial_blocks, options);
     let analytic_joint_gradient_available = analytic_joint_derivatives_available
@@ -18288,10 +18329,10 @@ pub fn fit_survival_marginal_slope_terms(
                 theta.len(),
             );
             let rho = theta.slice(s![..setup.rho_dim()]).to_owned();
-            let blocks = build_blocks(&rho, &designs[0], &designs[1])?;
+            let blocks = build_blocks(&rho, &designs[0], &designs[1], FlexActivation::On)?;
             let sigma = sigma_from_theta(theta);
             sigma_hint.replace(sigma);
-            let family = make_family(&designs[0], &designs[1], sigma);
+            let family = make_family(&designs[0], &designs[1], sigma, FlexActivation::On);
             let fit = inner_fit(&family, &blocks, options)?;
             let mut hints_mut = hints.borrow_mut();
             if let Some(block) = fit.block_states.first() {
