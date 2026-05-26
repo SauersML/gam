@@ -3017,33 +3017,59 @@ fn rigid_observed_eta(q: f64, g: f64, z: f64, probit_scale: f64) -> f64 {
 /// `bernoulli_marginal_slope::pilot_irls_hessian_row_metric_at_eta`. The SMGS
 /// conditional likelihood at the exit time is a probit Bernoulli on the
 /// event indicator with link variance `Φ(η)(1−Φ(η))`; the IRLS row weight
-/// (which is the eigenvalue the joint penalised Hessian sees along the
-/// "linear-predictor direction" of every parametric / flex anchor column) is
+/// W metric for survival cross-block orthogonalisation. The previous
+/// implementation copied the Bernoulli probit IRLS row weight
+/// `w · φ(η)² / (Φ(η)·(1 − Φ(η)))` from BMS verbatim, but that is the row
+/// curvature for a Bernoulli probit likelihood, not for the survival
+/// marginal-slope likelihood. The survival row neg-log Hessian wrt η₁
+/// (the dominant linear-predictor channel — both event and censored rows
+/// contribute through it) at fixed β is
 ///
-///   W[i] = sample_weights[i] · φ(η_i)² / (Φ(η_i)·(1 − Φ(η_i)))
+///   u2_eta1[i] = (1 − d_i) · w_i · d²/dη²[−log Φ(−η_i)]
+///              + d_i · w_i
 ///
-/// evaluated at a β-independent pilot η so the cross-block orthogonalisation
-/// is a one-shot construction-time step. This is the metric that makes
-/// `Aᵀ W C̃ = 0` hold in the same inner product the joint Hessian uses during
-/// PIRLS — without it, A and C̃ are merely Euclidean-orthogonal, the joint
-/// Hessian carries a near-null direction along the W-metric alias, and REML
-/// can collapse the alias eigenvalue (see the long comment block in
-/// bernoulli_marginal_slope.rs:19180).
+/// where the first term is the censored-row Mills-ratio second derivative
+/// computed via `signed_probit_neglog_derivatives_up_to_fourth(-η, w·(1−d))`
+/// (matching `row_primary_closed_form` at ~3483 column `u2_eta1`) and the
+/// second term is the event-row contribution from `−log φ(η) = η²/2 + …`,
+/// whose η-Hessian is `w·d`. This is exactly the curvature the joint
+/// penalised Hessian sees along the dominant linear-predictor direction at
+/// the pilot, so `Aᵀ W C̃ = 0` after the cross-block reparam is preserved in
+/// the inner product PIRLS uses (modulo β-dependent drift between pilot and
+/// running η — second-order in the off-anchor direction and bounded by the
+/// Mills-ratio curvature scaling shared between both branches).
+///
+/// The pilot η is β-independent so this remains a one-shot construction-time
+/// step. See the long comment block in bernoulli_marginal_slope.rs:19180 for
+/// the BMS analogue and the failure mode the metric prevents (REML can
+/// otherwise collapse the alias eigenvalue when `Aᵀ W_pirls C̃ ≠ 0`).
 fn survival_pilot_irls_row_metric_at_eta(
     eta_pilot: &Array1<f64>,
     sample_weights: &Array1<f64>,
-) -> Array1<f64> {
-    use crate::probability::{normal_cdf, normal_pdf};
+    event: &Array1<f64>,
+) -> Result<Array1<f64>, String> {
     let n = eta_pilot.len();
+    if sample_weights.len() != n || event.len() != n {
+        return Err(format!(
+            "survival cross-block W metric: length mismatch eta={}, weights={}, event={}",
+            n,
+            sample_weights.len(),
+            event.len(),
+        ));
+    }
     let mut w = Array1::<f64>::zeros(n);
     for i in 0..n {
         let eta = eta_pilot[i];
-        let mu = normal_cdf(eta).clamp(1e-12, 1.0 - 1e-12);
-        let phi = normal_pdf(eta).max(1e-300);
-        let var = (mu * (1.0 - mu)).max(1e-300);
-        w[i] = sample_weights[i] * (phi * phi) / var;
+        let d = event[i];
+        let weight = sample_weights[i];
+        let (_, k2, _, _) = signed_probit_neglog_derivatives_up_to_fourth(
+            -eta,
+            weight * (1.0 - d),
+        )?;
+        let phi_part = weight * d;
+        w[i] = k2 + phi_part;
     }
-    w
+    Ok(w)
 }
 
 /// Build the SMGS rigid pooled-probit pilot η at training rows from the
@@ -17951,16 +17977,20 @@ pub fn fit_survival_marginal_slope_terms(
     let time_penalties_len = spec.time_block.penalties.len();
     let mut cross_block_warnings: Vec<CrossBlockIdentifiabilityWarning> = Vec::new();
     // Cross-block W metric: build the survival rigid pooled-probit pilot η
-    // ONCE and use the IRLS Hessian row weight `w · φ(η)² / (Φ(η)(1−Φ(η)))`
-    // for both flex anchor orthogonalisations below. Using `&spec.weights`
-    // (uniform sample weights) instead makes A and C̃ merely Euclidean-
-    // orthogonal — at PIRLS time `Aᵀ W_pirls C̃ ≠ 0`, the joint Hessian
-    // carries a near-null direction along the W-metric alias, and REML can
-    // drive the flex block's λ small enough that the alias direction's
-    // joint Hessian eigenvalue collapses (the `rho≈2.0`, constant
-    // `step_inf`, growing `beta_inf` runaway documented for BMS). This is
-    // the survival analog of bernoulli_marginal_slope.rs:19213-19214 +
-    // :19355-19356.
+    // ONCE and use the survival row neg-log Hessian diagonal wrt η₁ at the
+    // pilot for both flex anchor orthogonalisations below
+    // (`survival_pilot_irls_row_metric_at_eta` — see its doc for the exact
+    // formula; matches `u2_eta1` in `row_primary_closed_form`). Using
+    // `&spec.weights` (uniform sample weights) instead would make A and C̃
+    // merely Euclidean-orthogonal — at PIRLS time `Aᵀ W_pirls C̃ ≠ 0`, the
+    // joint Hessian carries a near-null direction along the W-metric alias,
+    // and REML can drive the flex block's λ small enough that the alias
+    // direction's joint Hessian eigenvalue collapses (the `rho≈2.0`,
+    // constant `step_inf`, growing `beta_inf` runaway documented for BMS).
+    // The earlier copy of BMS's `w · φ(η)² / (Φ(η)(1−Φ(η)))` was a probit-
+    // shaped proxy, not the survival row curvature; using the actual
+    // survival curvature here matches the inner product PIRLS sees on this
+    // family. Analog of bernoulli_marginal_slope.rs:19213-19214 + :19355-19356.
     let cross_block_pilot_eta = survival_rigid_pilot_eta(
         n,
         &z_primary,
@@ -17970,8 +18000,12 @@ pub fn fit_survival_marginal_slope_terms(
         baseline_slope,
         probit_scale,
     );
-    let cross_block_pilot_w =
-        survival_pilot_irls_row_metric_at_eta(&cross_block_pilot_eta, &spec.weights);
+    let cross_block_pilot_w = survival_pilot_irls_row_metric_at_eta(
+        &cross_block_pilot_eta,
+        &spec.weights,
+        &spec.event_target,
+    )
+    .map_err(|e| format!("survival cross-block W metric construction: {e}"))?;
     // Unified location-anchor design at training rows.
     //
     // Survival prediction routes through `BernoulliMarginalSlopePredictor`
