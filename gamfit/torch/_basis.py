@@ -37,7 +37,13 @@ def _resolve_knots_tensor(
 
 
 class _BsplineBasisFn(torch.autograd.Function):
-    """Autograd Function evaluating the Rust B-spline basis with grad wrt ``t``."""
+    """Autograd Function evaluating the Rust B-spline basis with grad wrt ``t``.
+
+    Backward routes through :class:`_BsplineJetFn` (a second custom
+    autograd Function) so the returned ``∂L/∂t`` is itself differentiable:
+    a second autograd pass — the input-location Hessian — calls back into
+    Rust via ``bspline_basis_derivative(order=2)`` for the open case.
+    """
 
     @staticmethod
     def forward(
@@ -57,15 +63,75 @@ class _BsplineBasisFn(torch.autograd.Function):
     ) -> tuple[torch.Tensor, None, None, None]:
         (grad_basis,) = grad_outputs
         t, knots = ctx.saved_tensors
-        deriv_np = _api.bspline_basis_derivative(
+        jet = _BsplineJetFn.apply(t, knots, int(ctx.degree), bool(ctx.periodic))
+        grad_t = (grad_basis.to(dtype=jet.dtype) * jet).sum(dim=-1)
+        return grad_t, None, None, None
+
+
+class _BsplineJetFn(torch.autograd.Function):
+    """``∂Φ/∂t`` for the 1D B-spline basis as a tracked ``(N, K)`` tensor.
+
+    Forward dispatches to the correct Rust derivative API:
+
+    * ``periodic=False`` → ``bspline_basis_derivative(order=1, periodic=False)``;
+    * ``periodic=True``  →
+      ``periodic_bspline_input_location_first_derivative`` (the dense
+      ``order=1`` API is intentionally not exposed for periodic bases —
+      issue #233).
+
+    Backward returns the input-location Hessian contraction. For the open
+    case it calls ``bspline_basis_derivative(order=2)``; the periodic case
+    has no Rust second-derivative API today, so the inner backward raises
+    a clear ``NotImplementedError`` rather than leaking a Rust string.
+    """
+
+    @staticmethod
+    def forward(
+        ctx: Any, t: torch.Tensor, knots: torch.Tensor, degree: int, periodic: bool
+    ) -> torch.Tensor:
+        t_np = to_numpy_f64(t)
+        knots_np = to_numpy_f64(knots)
+        if periodic:
+            from .._binding import rust_module
+
+            left = float(knots_np[0])
+            right = float(knots_np[-1])
+            num_basis = int(knots_np.shape[0] - 1)
+            jet_3d = rust_module().periodic_bspline_input_location_first_derivative(
+                t_np.reshape(-1, 1), left, right, int(degree), num_basis,
+            )
+            # Rust returns (N, K, 1); reduce the trailing intrinsic-dim axis.
+            jet_np = jet_3d.reshape(jet_3d.shape[0], jet_3d.shape[1])
+        else:
+            jet_np = _api.bspline_basis_derivative(
+                t_np, knots_np, degree=int(degree), order=1, periodic=False,
+            )
+        ctx.save_for_backward(t, knots)
+        ctx.degree = int(degree)
+        ctx.periodic = bool(periodic)
+        return from_numpy_like(jet_np, t)
+
+    @staticmethod
+    def backward(
+        ctx: Any, *grad_outputs: torch.Tensor
+    ) -> tuple[torch.Tensor, None, None, None]:
+        (grad_jet,) = grad_outputs  # (N, K)
+        t, knots = ctx.saved_tensors
+        if ctx.periodic:
+            raise NotImplementedError(
+                "Second-order autograd through the periodic B-spline basis "
+                "is not yet exposed; the Rust core needs a periodic "
+                "input-location second-derivative kernel."
+            )
+        second_np = _api.bspline_basis_derivative(
             to_numpy_f64(t),
             to_numpy_f64(knots),
             degree=ctx.degree,
-            order=1,
-            periodic=ctx.periodic,
+            order=2,
+            periodic=False,
         )
-        deriv = from_numpy_like(deriv_np, t)
-        grad_t = (grad_basis.to(dtype=deriv.dtype) * deriv).sum(dim=-1)
+        second = from_numpy_like(second_np, t)
+        grad_t = (grad_jet.to(dtype=second.dtype) * second).sum(dim=-1)
         return grad_t, None, None, None
 
 

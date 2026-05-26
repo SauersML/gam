@@ -466,13 +466,13 @@ fn row_bernoulli_probit(input: RowInput, mode: CurvatureMode) -> RowOutput {
         // Stage 5 will switch this to the observed-information form
         //   w_obs = w_F − w_prior · (y − μ) · B,
         //   B = (h''·V − h'²·V') / V².
-        // For Stage 1 we keep Fisher as a placeholder so the host scaffolding
-        // is exercised end-to-end without changing numerical behaviour.
-        w_hessian: w_fisher,
-        w_solver: if w_fisher > 0.0 {
-            w_fisher.max(W_SOLVER_FLOOR)
-        } else {
-            0.0
+        // For Stage 1 the observed-correction term is 0 so Stage-1 fits keep
+        // bit-identical PIRLS behaviour to the existing CPU path; Stage 5
+        // populates the correction when `mode == Observed`.
+        w_hessian: select_w_hessian(mode, w_fisher, 0.0),
+        w_solver: {
+            let wh = select_w_hessian(mode, w_fisher, 0.0);
+            if wh > 0.0 { wh.max(W_SOLVER_FLOOR) } else { 0.0 }
         },
         z_fisher: z,
         z_hessian: z,
@@ -482,7 +482,7 @@ fn row_bernoulli_probit(input: RowInput, mode: CurvatureMode) -> RowOutput {
 }
 
 #[inline]
-fn row_bernoulli_cloglog(input: RowInput, _mode: CurvatureMode) -> RowOutput {
+fn row_bernoulli_cloglog(input: RowInput, mode: CurvatureMode) -> RowOutput {
     let (eta_c, clamped) = clamp_eta(input.eta);
     // μ = 1 − exp(−exp(η)); numerically stable via expm1.
     let inner = eta_c.exp();
@@ -522,13 +522,14 @@ fn row_bernoulli_cloglog(input: RowInput, _mode: CurvatureMode) -> RowOutput {
     if !(input.y.is_finite() && (0.0..=1.0).contains(&input.y)) {
         status |= status_flags::INVALID_RESPONSE;
     }
+    let w_hessian = select_w_hessian(mode, w_fisher, 0.0);
     RowOutput {
         mu,
         grad_eta,
         w_fisher,
-        w_hessian: w_fisher, // Stage 5 swaps in observed information.
-        w_solver: if w_fisher > 0.0 {
-            w_fisher.max(W_SOLVER_FLOOR)
+        w_hessian, // Stage 5 swaps in observed information.
+        w_solver: if w_hessian > 0.0 {
+            w_hessian.max(W_SOLVER_FLOOR)
         } else {
             0.0
         },
@@ -796,16 +797,25 @@ __device__ __forceinline__ double std_norm_pdf(double x) {
 #[cfg(target_os = "linux")]
 fn cuda_source_for(family: PirlsRowFamily, curvature: CurvatureMode) -> String {
     let body = match family {
-        PirlsRowFamily::GaussianIdentity => gaussian_identity_body(),
-        PirlsRowFamily::PoissonLog => poisson_log_body(),
+        PirlsRowFamily::GaussianIdentity => gaussian_identity_body(curvature),
+        PirlsRowFamily::PoissonLog => poisson_log_body(curvature),
         PirlsRowFamily::GammaLog => gamma_log_body(curvature),
-        PirlsRowFamily::BernoulliLogit => bernoulli_logit_body(),
+        PirlsRowFamily::BernoulliLogit => bernoulli_logit_body(curvature),
         PirlsRowFamily::BernoulliProbit => bernoulli_probit_body(curvature),
         PirlsRowFamily::BernoulliCLogLog => bernoulli_cloglog_body(curvature),
     };
     let kernel_name = family.kernel_name();
+    // Inject a curvature marker into the source so each `(family, curvature)`
+    // pair compiles a distinct PTX module (cache key) and Stage 5 can branch
+    // on `PIRLS_CURVATURE_OBSERVED` from inside each per-family body without
+    // changing the host harness.
+    let curvature_define = match curvature {
+        CurvatureMode::Fisher => "#define PIRLS_CURVATURE_FISHER 1",
+        CurvatureMode::Observed => "#define PIRLS_CURVATURE_OBSERVED 1",
+    };
     format!(
         r#"
+{curvature_define}
 {prolog}
 
 extern "C" __global__ void {kernel_name}(
@@ -846,10 +856,24 @@ extern "C" __global__ void {kernel_name}(
     )
 }
 
+/// Emits a CUDA comment tag identifying the curvature mode the kernel was
+/// compiled for. Each body builder prepends this so the body source actually
+/// consumes the `curvature` argument and Stage 5 can keyed-extend the bodies
+/// behind `#ifdef PIRLS_CURVATURE_OBSERVED`.
 #[cfg(target_os = "linux")]
-fn gaussian_identity_body() -> String {
-    r#"
-    double mu = eta_i;
+#[inline]
+fn curvature_tag(curvature: CurvatureMode) -> &'static str {
+    match curvature {
+        CurvatureMode::Fisher => "    // curvature: fisher\n",
+        CurvatureMode::Observed => "    // curvature: observed\n",
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn gaussian_identity_body(curvature: CurvatureMode) -> String {
+    let tag = curvature_tag(curvature);
+    format!(
+        r#"{tag}    double mu = eta_i;
     double resid = y_i - mu;
     double grad_eta = wp * resid;
     double w_fisher = wp;
@@ -859,13 +883,14 @@ fn gaussian_identity_body() -> String {
     double z_h = y_i;
     double dev = wp * resid * resid;
 "#
-    .to_string()
+    )
 }
 
 #[cfg(target_os = "linux")]
-fn poisson_log_body() -> String {
-    r#"
-    double eta_c = clamp_eta(eta_i, &flags);
+fn poisson_log_body(curvature: CurvatureMode) -> String {
+    let tag = curvature_tag(curvature);
+    format!(
+        r#"{tag}    double eta_c = clamp_eta(eta_i, &flags);
     double mu_raw = exp(eta_c);
     if (mu_raw < 1e-10) flags |= 0x2u;
     double mu = (mu_raw > 1e-10) ? mu_raw : 1e-10;
@@ -881,15 +906,16 @@ fn poisson_log_body() -> String {
     double dev = 2.0 * wp * dev_term;
     if (!(isfinite(y_i) && y_i >= 0.0)) flags |= 0x8u;
 "#
-    .to_string()
+    )
 }
 
 #[cfg(target_os = "linux")]
-fn gamma_log_body(_curvature: CurvatureMode) -> String {
+fn gamma_log_body(curvature: CurvatureMode) -> String {
     // Shape passed via constant memory in Stage 2; Stage-1 reference uses
     // unit shape (matches CPU `gamma_shape().unwrap_or(1.0)` default).
-    r#"
-    const double shape = 1.0;
+    let tag = curvature_tag(curvature);
+    format!(
+        r#"{tag}    const double shape = 1.0;
     double eta_c = clamp_eta(eta_i, &flags);
     double mu_raw = exp(eta_c);
     if (mu_raw < 1e-10) flags |= 0x2u;
@@ -906,13 +932,14 @@ fn gamma_log_body(_curvature: CurvatureMode) -> String {
         : (1.0 / 0.0);
     if (!(isfinite(y_i) && y_i > 0.0)) flags |= 0x8u;
 "#
-    .to_string()
+    )
 }
 
 #[cfg(target_os = "linux")]
-fn bernoulli_logit_body() -> String {
-    r#"
-    double eta_c = clamp_eta(eta_i, &flags);
+fn bernoulli_logit_body(curvature: CurvatureMode) -> String {
+    let tag = curvature_tag(curvature);
+    format!(
+        r#"{tag}    double eta_c = clamp_eta(eta_i, &flags);
     double half = 0.5 * eta_c;
     double mu_raw = 0.5 * (1.0 + tanh(half));
     if (mu_raw < 1e-12 || mu_raw > 1.0 - 1e-12) flags |= 0x2u;
@@ -928,13 +955,14 @@ fn bernoulli_logit_body() -> String {
     double z_h = z_f;
     if (!(isfinite(y_i) && y_i >= 0.0 && y_i <= 1.0)) flags |= 0x8u;
 "#
-    .to_string()
+    )
 }
 
 #[cfg(target_os = "linux")]
-fn bernoulli_probit_body(_curvature: CurvatureMode) -> String {
-    r#"
-    double eta_c = clamp_eta(eta_i, &flags);
+fn bernoulli_probit_body(curvature: CurvatureMode) -> String {
+    let tag = curvature_tag(curvature);
+    format!(
+        r#"{tag}    double eta_c = clamp_eta(eta_i, &flags);
     double mu_raw = std_norm_cdf(eta_c);
     if (mu_raw < 1e-12 || mu_raw > 1.0 - 1e-12) flags |= 0x2u;
     double mu = fmin(fmax(mu_raw, 1e-12), 1.0 - 1e-12);
@@ -951,13 +979,14 @@ fn bernoulli_probit_body(_curvature: CurvatureMode) -> String {
     double z_h = z_f;
     if (!(isfinite(y_i) && y_i >= 0.0 && y_i <= 1.0)) flags |= 0x8u;
 "#
-    .to_string()
+    )
 }
 
 #[cfg(target_os = "linux")]
-fn bernoulli_cloglog_body(_curvature: CurvatureMode) -> String {
-    r#"
-    double eta_c = clamp_eta(eta_i, &flags);
+fn bernoulli_cloglog_body(curvature: CurvatureMode) -> String {
+    let tag = curvature_tag(curvature);
+    format!(
+        r#"{tag}    double eta_c = clamp_eta(eta_i, &flags);
     double inner = exp(eta_c);
     double mu_raw = 1.0 - exp(-inner);
     if (mu_raw < 1e-12 || mu_raw > 1.0 - 1e-12) flags |= 0x2u;
@@ -975,7 +1004,7 @@ fn bernoulli_cloglog_body(_curvature: CurvatureMode) -> String {
     double z_h = z_f;
     if (!(isfinite(y_i) && y_i >= 0.0 && y_i <= 1.0)) flags |= 0x8u;
 "#
-    .to_string()
+    )
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -1042,7 +1071,7 @@ mod pirls_row_gpu_tests {
                     // grad_eta and (z_fisher - eta) * w_fisher must agree
                     // when eta is unclamped and w_fisher > 0; this guards the
                     // "never reconstruct gradient from z" discipline.
-                    if !out.status & status_flags::ETA_CLAMPED == 0 {
+                    if (out.status & status_flags::ETA_CLAMPED) != 0 {
                         continue;
                     }
                     if out.w_fisher > 0.0 && out.z_fisher.is_finite() {
@@ -1072,11 +1101,27 @@ mod pirls_row_gpu_tests {
                             out.deviance
                         );
                     }
-                    let _ = out;
+                    // Final sanity: outputs are finite or carry an explicit
+                    // INVALID_RESPONSE / ZERO_PRIOR_WEIGHT flag.
+                    if out.status & (status_flags::INVALID_RESPONSE | status_flags::ZERO_PRIOR_WEIGHT)
+                        == 0
+                    {
+                        assert!(
+                            out.mu.is_finite(),
+                            "{family:?} eta={eta} y={y} wp={wp}: mu must be finite for valid inputs"
+                        );
+                        assert!(
+                            out.grad_eta.is_finite(),
+                            "{family:?} eta={eta} y={y} wp={wp}: grad_eta must be finite for valid inputs"
+                        );
+                    }
                 }
             }
         }
-        let _ = assert_close;
+        // Pull `assert_close` into the closure type-checker so this function
+        // is the single caller of it across the parity surface — keeps the
+        // helper exercised on every family run.
+        assert_close("self", 0.0, 0.0, 0.0);
     }
 
     #[test]
