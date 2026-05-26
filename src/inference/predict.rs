@@ -1153,7 +1153,9 @@ impl BernoulliMarginalSlopePredictor {
         &self,
         input: &PredictInput,
         design_logslope: &DesignMatrix,
+        z: &Array1<f64>,
     ) -> Result<BmsAnchorCorrections, EstimationError> {
+        use crate::inference::model::SavedAnchorKind;
         let needs_score = self
             .score_warp_runtime
             .as_ref()
@@ -1188,39 +1190,150 @@ impl BernoulliMarginalSlopePredictor {
                 logslope_dense.nrows()
             )));
         }
+        if z.len() != n_rows {
+            return Err(EstimationError::InvalidInput(format!(
+                "bernoulli marginal-slope predict anchor materialisation: z has {} entries, expected {}",
+                z.len(),
+                n_rows
+            )));
+        }
         let p_marginal = marginal_dense.ncols();
         let p_logslope = logslope_dense.ncols();
-        let d = p_marginal + p_logslope;
-        let mut n_anchor_rows = Array2::<f64>::zeros((n_rows, d));
-        n_anchor_rows
+        let d_parametric = p_marginal + p_logslope;
+        let mut parametric_rows = Array2::<f64>::zeros((n_rows, d_parametric));
+        parametric_rows
             .slice_mut(ndarray::s![.., 0..p_marginal])
             .assign(&marginal_dense.view());
-        n_anchor_rows
-            .slice_mut(ndarray::s![.., p_marginal..d])
+        parametric_rows
+            .slice_mut(ndarray::s![.., p_marginal..d_parametric])
             .assign(&logslope_dense.view());
+
+        // Score-warp anchor layout is `[marginal | logslope]` (parametric
+        // only; flex-flex anchoring goes the other direction).
         let score_warp = if needs_score {
-            self.score_warp_runtime
-                .as_ref()
-                .unwrap()
-                .anchor_correction_matrix(n_anchor_rows.view())
+            let runtime = self.score_warp_runtime.as_ref().unwrap();
+            self.validate_runtime_anchor_layout_parametric_only(runtime, "score_warp")?;
+            runtime
+                .anchor_correction_matrix(parametric_rows.view())
                 .map_err(EstimationError::from)?
         } else {
             None
         };
-        let link_dev = if needs_link {
-            self.link_deviation_runtime
-                .as_ref()
-                .unwrap()
-                .anchor_correction_matrix(n_anchor_rows.view())
-                .map_err(EstimationError::from)?
+
+        // Link-deviation anchor layout matches the fit-time stacking in
+        // `enforce_cross_block_identifiability_for_flex_block`: parametric
+        // columns first, then (if a FlexEvaluation component is present)
+        // the score-warp runtime's reparameterised basis at predict rows.
+        let (link_dev_anchor_rows, link_dev) = if needs_link {
+            let runtime = self.link_deviation_runtime.as_ref().unwrap();
+            // Determine whether the saved link-dev residual carries a
+            // FlexEvaluation tail and validate ordering matches the
+            // fit-time invariant (all parametric components first, then
+            // at most one FlexEvaluation tail).
+            let mut saw_flex_tail = false;
+            let mut flex_tail_ncols: usize = 0;
+            for (idx, component) in runtime.anchor_residual_components.iter().enumerate() {
+                match &component.kind {
+                    SavedAnchorKind::Parametric { .. } => {
+                        if saw_flex_tail {
+                            return Err(EstimationError::InvalidInput(format!(
+                                "bernoulli marginal-slope link-deviation saved anchor components \
+                                 are out of order: parametric component at index {idx} follows \
+                                 a FlexEvaluation tail",
+                            )));
+                        }
+                    }
+                    SavedAnchorKind::FlexEvaluation { ncols } => {
+                        if saw_flex_tail {
+                            return Err(EstimationError::InvalidInput(
+                                "bernoulli marginal-slope link-deviation saved anchor components \
+                                 carry more than one FlexEvaluation tail; fit-time stacking emits \
+                                 at most one (score-warp)".to_string(),
+                            ));
+                        }
+                        saw_flex_tail = true;
+                        flex_tail_ncols = *ncols;
+                    }
+                }
+            }
+            let rows = if saw_flex_tail {
+                let score_runtime = self.score_warp_runtime.as_ref().ok_or_else(|| {
+                    EstimationError::InvalidInput(
+                        "bernoulli marginal-slope link-deviation saved anchor includes a \
+                         FlexEvaluation tail but the saved score-warp runtime is missing"
+                            .to_string(),
+                    )
+                })?;
+                // Evaluate the score-warp runtime at predict-row z. When
+                // the score-warp itself carries an anchor residual, route
+                // through `design_with_anchor_rows` so the per-row
+                // subtraction is applied; otherwise the raw `design(z)`
+                // is the reparameterised basis.
+                let score_basis = if score_runtime.anchor_residual_coefficients.is_some() {
+                    score_runtime
+                        .design_with_anchor_rows(z, parametric_rows.view())
+                        .map_err(EstimationError::from)?
+                } else {
+                    score_runtime.design(z).map_err(EstimationError::from)?
+                };
+                if score_basis.ncols() != flex_tail_ncols {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "bernoulli marginal-slope link-deviation FlexEvaluation tail expects \
+                         {} score-warp basis columns at predict rows, got {}",
+                        flex_tail_ncols,
+                        score_basis.ncols()
+                    )));
+                }
+                let mut combined =
+                    Array2::<f64>::zeros((n_rows, d_parametric + flex_tail_ncols));
+                combined
+                    .slice_mut(ndarray::s![.., 0..d_parametric])
+                    .assign(&parametric_rows.view());
+                combined
+                    .slice_mut(ndarray::s![.., d_parametric..])
+                    .assign(&score_basis.view());
+                combined
+            } else {
+                parametric_rows.clone()
+            };
+            let corr = runtime
+                .anchor_correction_matrix(rows.view())
+                .map_err(EstimationError::from)?;
+            (Some(rows), corr)
         } else {
-            None
+            (None, None)
         };
+
         Ok(BmsAnchorCorrections {
-            n_anchor_rows: Some(n_anchor_rows),
+            score_warp_anchor_rows: Some(parametric_rows),
+            link_dev_anchor_rows,
             score_warp,
             link_dev,
         })
+    }
+
+    /// Validate that a saved deviation runtime's anchor residual contains
+    /// only `Parametric` components (no `FlexEvaluation` tail). Used for
+    /// the score-warp runtime, whose fit-time stacking is parametric-only.
+    fn validate_runtime_anchor_layout_parametric_only(
+        &self,
+        runtime: &SavedAnchoredDeviationRuntime,
+        runtime_label: &str,
+    ) -> Result<(), EstimationError> {
+        use crate::inference::model::SavedAnchorKind;
+        for (idx, component) in runtime.anchor_residual_components.iter().enumerate() {
+            match &component.kind {
+                SavedAnchorKind::Parametric { .. } => {}
+                SavedAnchorKind::FlexEvaluation { .. } => {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "bernoulli marginal-slope {runtime_label} saved anchor component at \
+                         index {idx} is FlexEvaluation; only Parametric components are \
+                         expected for this runtime",
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn likelihood_family(&self) -> LikelihoodSpec {
@@ -2157,7 +2270,8 @@ impl BernoulliMarginalSlopePredictor {
         // subtracts the corresponding row of these matrices from the raw
         // cubic-span basis output. When neither runtime has a residual,
         // the returned bundle is empty and threading is a no-op.
-        let anchor_corrections = self.build_anchor_correction_matrices(input, design_logslope)?;
+        let anchor_corrections =
+            self.build_anchor_correction_matrices(input, design_logslope, &z)?;
         let marginal_map = marginal_eta
             .iter()
             .map(|&eta| {
@@ -2919,7 +3033,8 @@ impl BernoulliMarginalSlopePredictor {
             .collect::<Result<Vec<_>, _>>()?;
         // Cross-block anchor corrections (see final_eta_and_gradient_from_theta
         // for the design); precompute once before the per-row loop.
-        let anchor_corrections = self.build_anchor_correction_matrices(input, design_logslope)?;
+        let anchor_corrections =
+            self.build_anchor_correction_matrices(input, design_logslope, &z)?;
         // Per-row: solve intercept scalar, evaluate denested calibration,
         // record (intercept, a_q). The `warm_start_buf` is just per-call
         // scratch — give each rayon worker its own buffer via fold init.

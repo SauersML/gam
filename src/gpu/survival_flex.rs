@@ -1285,7 +1285,7 @@ impl<'a> SurvivalFlexInterceptSolveInputs<'a> {
 /// convergence" into a single status `0`, so the device parity bar is
 /// status-equal *plus* numerical equality of `a_root`, `abs_deriv`,
 /// `residual` at the CPU tolerance.
-pub(crate) fn cpu_oracle_intercept_solve(
+pub fn cpu_oracle_intercept_solve(
     inputs: &SurvivalFlexInterceptSolveInputs<'_>,
 ) -> SurvivalFlexInterceptSolveOutputs {
     use crate::families::monotone_root::{
@@ -1557,7 +1557,7 @@ extern "C" __global__ void survival_flex_intercept_solve(
 /// Launch the Step 3 device intercept solve.  Returns `Ok(None)` on
 /// non-Linux / no-CUDA builds so the dispatcher can fall back to the
 /// CPU oracle; returns `Err` only on genuine driver / compile failures.
-pub(crate) fn try_device_intercept_solve(
+pub fn try_device_intercept_solve(
     inputs: &SurvivalFlexInterceptSolveInputs<'_>,
 ) -> Result<Option<SurvivalFlexInterceptSolveOutputs>, GpuError> {
     inputs.validate()?;
