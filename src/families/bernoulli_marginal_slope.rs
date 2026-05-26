@@ -19470,6 +19470,33 @@ pub fn fit_bernoulli_marginal_slope_terms(
     let score_warp_prepared = if let Some(cfg) = spec.score_warp.as_ref() {
         use crate::families::bernoulli_marginal_slope::deviation_runtime::ParametricAnchorBlock;
         let mut prepared = build_score_warp_deviation_block_from_seed(z_train, cfg)?;
+        // Phase 4a shadow call to the family-agnostic identifiability
+        // compiler. The Compile output is discarded in 4a; Phase 4b will
+        // route the compiled blocks into the deviation runtimes and Phase
+        // 4c will delete this gate together with the legacy
+        // `enforce_cross_block_identifiability_for_flex_block` path below.
+        const PHASE_4A_SHADOW_COMPILE: bool = true;
+        if PHASE_4A_SHADOW_COMPILE {
+            use crate::families::bernoulli_marginal_slope_identifiability as compiler_inputs;
+            use crate::families::identifiability_compiler::compile;
+            let marginal_dense = marginal_design.design.try_to_dense_by_chunks(
+                "phase4a shadow compile (BMS score-warp): marginal dense",
+            )?;
+            let logslope_dense = logslope_design.design.try_to_dense_by_chunks(
+                "phase4a shadow compile (BMS score-warp): logslope dense",
+            )?;
+            let (ops, ordering) = compiler_inputs::build_bernoulli_compiler_inputs(
+                marginal_dense,
+                logslope_dense,
+                None,
+                None,
+            );
+            let hess = compiler_inputs::BernoulliRowHessian::from_row_weights(
+                cross_block_pilot_w_score_warp.clone(),
+            );
+            compile(&ops, &hess, &ordering)
+                .map_err(|e| format!("phase4a shadow compile (BMS score-warp): {e}"))?;
+        }
         let outcome = enforce_cross_block_identifiability_for_flex_block(
             &mut prepared,
             z_train,
