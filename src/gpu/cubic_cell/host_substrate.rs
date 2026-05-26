@@ -103,13 +103,6 @@ pub(crate) fn build_host_moments(
         }
     }
 
-    if matches!(view.mode, CubicCellMomentMode::ValueAndDerivative) {
-        return Err(
-            "gpu cubic-cell substrate: ValueAndDerivative mode lands with survival flex Stage 5"
-                .to_string(),
-        );
-    }
-
     Ok(HostMomentBatch {
         moments,
         status,
@@ -301,25 +294,4 @@ mod tests {
         assert!(out.moments.iter().all(|&x| x == 0.0));
     }
 
-    #[test]
-    fn host_substrate_value_and_derivative_mode_is_unsupported() {
-        let gpu = GpuDenestedCubicCell {
-            left: -1.0,
-            right: 1.0,
-            c0: 0.0,
-            c1: 0.0,
-            c2: 0.0,
-            c3: 0.0,
-        };
-        let branches = vec![GpuCellBranchTag::Affine];
-        let view = CubicCellDerivativeMomentHostView {
-            cells: std::slice::from_ref(&gpu),
-            branches: &branches,
-            max_degree: 9,
-            mode: CubicCellMomentMode::ValueAndDerivative,
-            residency: CubicCellMomentResidency::Host,
-        };
-        let err = build_host_moments(&view).unwrap_err();
-        assert!(err.contains("ValueAndDerivative"));
-    }
 }

@@ -16203,60 +16203,6 @@ pub fn auto_streaming_chunk_size_for_dense(n_rows: usize, n_basis_cols: usize) -
     Some(clamped)
 }
 
-/// If the spec opted into a finite truncated-spectral kernel
-/// (`SobolevTruncated` / `PseudoTruncated`) and the GPU dispatch
-/// heuristic accepts `(n, m, lmax)`, build the `(n × m)` raw kernel
-/// matrix on device and return it as a host ndarray. Returns `None`
-/// for any closed-form variant, when GPU is unavailable, or when the
-/// device path errors out — the caller falls back to the CPU helper.
-///
-/// This is the only entry point that bridges the GPU sphere kernel
-/// into the basis pipeline. It deliberately stays an `Option` so
-/// dispatch is silent (CPU still wins on small fits, on hosts without
-/// CUDA, and on any device fault) — matching the rest of the GPU
-/// layer's "auto" semantics.
-fn try_gpu_sphere_kernel_matrix(
-    data: ArrayView2<'_, f64>,
-    centers: ArrayView2<'_, f64>,
-    spec: &SphericalSplineBasisSpec,
-) -> Option<Array2<f64>> {
-    let (kind, lmax) = match spec.wahba_kernel {
-        SphereWahbaKernel::SobolevTruncated { lmax } => (
-            crate::gpu::sphere::SphereSpectralKernelKind::Sobolev,
-            lmax as usize,
-        ),
-        SphereWahbaKernel::PseudoTruncated { lmax } => (
-            crate::gpu::sphere::SphereSpectralKernelKind::Pseudo,
-            lmax as usize,
-        ),
-        SphereWahbaKernel::Sobolev | SphereWahbaKernel::Pseudo => return None,
-    };
-    if lmax == 0 {
-        return None;
-    }
-    let n = data.nrows();
-    let m = centers.nrows();
-    let decision = crate::gpu::sphere::sphere_kernel_decision(n, m, lmax);
-    if !decision.use_gpu {
-        return None;
-    }
-    let data_xyz = crate::gpu::sphere::latlon_to_xyz_host(data, spec.radians).ok()?;
-    let centers_xyz = crate::gpu::sphere::latlon_to_xyz_host(centers, spec.radians).ok()?;
-    let coeffs = kind.coefficients(lmax, spec.penalty_order);
-    let inputs = crate::gpu::sphere::S2KernelBuildInputs {
-        n,
-        m,
-        lmax,
-        data_xyz: &data_xyz,
-        centers_xyz: &centers_xyz,
-        coeffs: &coeffs,
-        kind,
-        layout: crate::gpu::sphere::DeviceMatrixLayout::ColumnMajor,
-    };
-    let dev_mat = crate::gpu::sphere::build_kernel_matrix_device(inputs).ok()?;
-    dev_mat.to_host_array().ok()
-}
-
 pub fn build_spherical_spline_basis(
     data: ArrayView2<'_, f64>,
     spec: &SphericalSplineBasisSpec,
