@@ -1670,6 +1670,134 @@ mod tests {
         );
     }
 
+    // ────────────────────────────────────────────────────────────────────
+    // Charter §7 hill-climb gates (Linux-only, `#[ignore]` by default —
+    // run with `cargo test -- --ignored polya_gamma_hill_climb_` on the
+    // V100. The 50×/20× ratios compare CPU vs GPU draws built in the same
+    // mode; the NVRTC kernel runs at device speed regardless of host opt
+    // level, so the ratio is meaningful at any host build mode.
+    // ────────────────────────────────────────────────────────────────────
+
+    /// Hill-climb gate: pure Bernoulli (b = 1) at n = 200 000 must run on the
+    /// GPU at ≥ 50× the CPU oracle's draw rate. This is the dominant biobank
+    /// PG draw shape (one PG variate per data row per Gibbs iteration), so a
+    /// 50× win here is the actual ship gate for the device sampler.
+    #[test]
+    #[ignore]
+    #[cfg(target_os = "linux")]
+    fn polya_gamma_hill_climb_pg1_50x() {
+        if super::super::runtime::GpuRuntime::global().is_none() {
+            panic!("polya_gamma_hill_climb_pg1_50x requires a GPU runtime");
+        }
+        let n = 200_000usize;
+        let shapes = Array1::<u32>::from_elem(n, 1);
+        let mut tilts = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            tilts[i] = ((i as f64) / (n as f64)) * 6.0 - 3.0;
+        }
+        let seed = PgSeed(0x50_4F_4C_59_47_41_4D_41);
+
+        // Warm the device module (NVRTC compile, allocator priming) so the
+        // first kernel launch's compile time doesn't pollute the timing.
+        {
+            let warm_shapes = Array1::<u32>::from_elem(16, 1);
+            let warm_tilts = Array1::<f64>::zeros(16);
+            draw_batch(PolyaGammaBatchInput {
+                shapes: warm_shapes.view(),
+                tilts: warm_tilts.view(),
+                seed,
+            })
+            .expect("warm");
+        }
+
+        let t_gpu_start = std::time::Instant::now();
+        let _gpu = draw_batch(PolyaGammaBatchInput {
+            shapes: shapes.view(),
+            tilts: tilts.view(),
+            seed,
+        })
+        .expect("GPU draw_batch");
+        let dt_gpu = t_gpu_start.elapsed().as_secs_f64();
+
+        let t_cpu_start = std::time::Instant::now();
+        let _cpu = draw_batch_cpu(&PolyaGammaBatchInput {
+            shapes: shapes.view(),
+            tilts: tilts.view(),
+            seed,
+        })
+        .expect("CPU draw_batch");
+        let dt_cpu = t_cpu_start.elapsed().as_secs_f64();
+
+        let speedup = dt_cpu / dt_gpu;
+        println!(
+            "polya_gamma_hill_climb_pg1: n={n} cpu={dt_cpu:.3}s gpu={dt_gpu:.3}s speedup={speedup:.1}×"
+        );
+        assert!(
+            speedup >= 50.0,
+            "PG(1) GPU speedup {speedup:.1}× < 50× hill-climb gate (cpu={dt_cpu:.3}s, gpu={dt_gpu:.3}s)"
+        );
+    }
+
+    /// Hill-climb gate: mixed negative-binomial style workload — 80 % of rows
+    /// at b ≥ 200 (normal-approx regime), 20 % at b = 1 (pg1 regime), 0 % at
+    /// the placeholder saddlepoint band so the throughput claim is not
+    /// dependent on the unfinished sp_kernel. 200 000 rows total; gate is
+    /// ≥ 20× CPU.
+    #[test]
+    #[ignore]
+    #[cfg(target_os = "linux")]
+    fn polya_gamma_hill_climb_mixed_nb_20x() {
+        if super::super::runtime::GpuRuntime::global().is_none() {
+            panic!("polya_gamma_hill_climb_mixed_nb_20x requires a GPU runtime");
+        }
+        let n = 200_000usize;
+        let mut shapes = Array1::<u32>::zeros(n);
+        let mut tilts = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            // 20 % b = 1, 80 % b = 250 (normal regime).
+            shapes[i] = if i.is_multiple_of(5) { 1 } else { 250 };
+            tilts[i] = ((i as f64) / (n as f64)) * 4.0 - 2.0;
+        }
+        let seed = PgSeed(0xDEAD_BEEF_CAFE_BABE);
+
+        // Warm
+        let warm_shapes = Array1::<u32>::from_elem(16, 250);
+        let warm_tilts = Array1::<f64>::zeros(16);
+        draw_batch(PolyaGammaBatchInput {
+            shapes: warm_shapes.view(),
+            tilts: warm_tilts.view(),
+            seed,
+        })
+        .expect("warm");
+
+        let t_gpu = std::time::Instant::now();
+        let _g = draw_batch(PolyaGammaBatchInput {
+            shapes: shapes.view(),
+            tilts: tilts.view(),
+            seed,
+        })
+        .expect("GPU mixed");
+        let dt_gpu = t_gpu.elapsed().as_secs_f64();
+
+        let t_cpu = std::time::Instant::now();
+        let _c = draw_batch_cpu(&PolyaGammaBatchInput {
+            shapes: shapes.view(),
+            tilts: tilts.view(),
+            seed,
+        })
+        .expect("CPU mixed");
+        let dt_cpu = t_cpu.elapsed().as_secs_f64();
+
+        let speedup = dt_cpu / dt_gpu;
+        println!(
+            "polya_gamma_hill_climb_mixed: n={n} cpu={dt_cpu:.3}s gpu={dt_gpu:.3}s speedup={speedup:.1}×"
+        );
+        assert!(
+            speedup >= 20.0,
+            "Mixed NB GPU speedup {speedup:.1}× < 20× gate (cpu={dt_cpu:.3}s, gpu={dt_gpu:.3}s)"
+        );
+    }
+
     /// GPU parity gate: when the runtime is available, the dispatched
     /// `draw_batch` path must agree with the CPU oracle bit-for-bit, since
     /// both consume the same XORWOW byte stream per row. macOS / no-runtime
