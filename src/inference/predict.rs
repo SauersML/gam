@@ -1102,12 +1102,22 @@ pub struct BernoulliMarginalSlopePredictor {
 /// output to apply the cross-block residual `n_row · M` correction.
 ///
 /// `n_anchor_rows` is the underlying `n × d` parametric anchor stack
-/// (concatenated marginal + logslope). It is shared between the two
-/// runtimes' correction computations and reused by `design_with_anchor_rows`
-/// for the full-matrix evaluation sites.
+/// (per-runtime layouts: score_warp gets `[marginal | logslope]`;
+/// link_dev gets `[marginal | logslope | score_warp_design(z)]` when the
+/// fit-time identifiability stage threaded the score-warp basis in as a
+/// flex-evaluation anchor). These layouts must match the column order
+/// `enforce_cross_block_identifiability_for_flex_block` used at fit time.
 #[derive(Default)]
 struct BmsAnchorCorrections {
-    n_anchor_rows: Option<Array2<f64>>,
+    /// `[marginal | logslope]` at predict rows. `Some` whenever any
+    /// runtime carries an anchor residual.
+    score_warp_anchor_rows: Option<Array2<f64>>,
+    /// `[marginal | logslope | score_warp_design(z)]` at predict rows.
+    /// `Some` whenever the link-deviation runtime carries an anchor
+    /// residual; the score-warp tail is included iff the saved
+    /// link-deviation runtime's residual components include a
+    /// `FlexEvaluation` entry.
+    link_dev_anchor_rows: Option<Array2<f64>>,
     score_warp: Option<Array2<f64>>,
     link_dev: Option<Array2<f64>>,
 }
@@ -1121,8 +1131,12 @@ impl BmsAnchorCorrections {
         self.link_dev.as_ref().map(|m| m.row(row))
     }
 
-    fn n_anchor_rows_view(&self) -> Option<ndarray::ArrayView2<'_, f64>> {
-        self.n_anchor_rows.as_ref().map(|m| m.view())
+    fn score_warp_anchor_rows_view(&self) -> Option<ndarray::ArrayView2<'_, f64>> {
+        self.score_warp_anchor_rows.as_ref().map(|m| m.view())
+    }
+
+    fn link_dev_anchor_rows_view(&self) -> Option<ndarray::ArrayView2<'_, f64>> {
+        self.link_dev_anchor_rows.as_ref().map(|m| m.view())
     }
 }
 

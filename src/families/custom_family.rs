@@ -21190,9 +21190,10 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         })?;
         let lambdas = rho0.mapv(f64::exp);
         let log_lambdas = lambdas.mapv(|v| v.max(1e-300).ln());
+        let block_states_raw = lift_block_states_to_raw(&canonical, inner.block_states);
         return blockwise_fit_from_parts(
             BlockwiseFitResultParts {
-                block_states: inner.block_states,
+                block_states: block_states_raw,
                 log_likelihood: inner.log_likelihood,
                 log_lambdas,
                 lambdas,
@@ -21205,7 +21206,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                 outer_converged: inner.converged,
                 geometry: None,
             },
-            specs,
+            raw_specs,
         )
         .map_err(|reason| CustomFamilyError::Optimization {
             context: "fit_custom_family one-cycle result assembly",
@@ -21646,9 +21647,12 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     let rho_star_physical = expand_labeled_log_lambdas(&rho_star, &label_layout)?;
     let lambdas_final = rho_star_physical.mapv(f64::exp);
     let log_lambdas_final = lambdas_final.mapv(|v| v.max(1e-300).ln());
+    let block_states_raw = lift_block_states_to_raw(&canonical, inner.block_states);
+    let (covariance_conditional, geometry) =
+        lift_fit_geometry_to_raw(&canonical, covariance_conditional, geometry);
     blockwise_fit_from_parts(
         BlockwiseFitResultParts {
-            block_states: inner.block_states,
+            block_states: block_states_raw,
             log_likelihood: inner.log_likelihood,
             log_lambdas: log_lambdas_final,
             lambdas: lambdas_final,
@@ -21661,7 +21665,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             outer_converged: outer_result.converged,
             geometry,
         },
-        specs,
+        raw_specs,
     )
     .map_err(|reason| CustomFamilyError::Optimization {
         context: "fit_custom_family result assembly",
