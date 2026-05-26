@@ -590,9 +590,12 @@ def _dims(k_atoms: int, atom_dim: Any) -> list[int]:
 
 _TOPOLOGY_TO_BASIS = {
     "circle": "periodic", "periodic": "periodic",
-    "sphere": "sphere", "torus": "torus", "euclidean": "duchon",
+    "sphere": "sphere", "torus": "torus", "euclidean": "euclidean",
 }
-_BASIS_TO_TOPOLOGY = {"periodic": "circle", "sphere": "sphere", "torus": "torus", "duchon": "euclidean"}
+_BASIS_TO_TOPOLOGY = {
+    "periodic": "circle", "sphere": "sphere", "torus": "torus",
+    "duchon": "euclidean", "euclidean": "euclidean", "euclidean_patch": "euclidean",
+}
 
 
 def _bases(k_atoms: int, atom_basis: Any, atom_topology: str) -> list[str]:

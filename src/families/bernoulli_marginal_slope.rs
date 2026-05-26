@@ -5038,6 +5038,60 @@ impl Drop for RowPrimaryHessianPin {
     }
 }
 
+/// Per-fit row-primary Hessian cache state. Replaces the prior
+/// `Option<RowPrimaryHessianPin>` so the GPU dispatch can carry a device
+/// handle without losing the host-pinned RAII path.
+///
+/// Variants:
+/// - `Empty`: cache not materialized (rigid path or caller opted out).
+/// - `Host`: f64 cache lives in host RAM as a flattened `(n, r*r)` Array2.
+///   Consumed by the CPU per-row Hv / diagonal / direct-product loops via
+///   [`BernoulliMarginalSlopeFamily::cached_row_primary_hessian`].
+/// - `Device`: cache lives on the selected CUDA device (see
+///   [`crate::gpu::bms_flex::RowPrimaryHessianDevice`]). Consumed by the
+///   device Hv / diagonal kernels in Block 9 Phases 2/3 (tasks #54 / #55).
+/// - `DeviceStreaming { reason }`: cache exceeded the device-memory fit
+///   check; consumers recompute per pass instead of caching.
+pub(crate) enum RowPrimaryHessianCache {
+    Empty,
+    Host(RowPrimaryHessianPin),
+    #[cfg(target_os = "linux")]
+    Device(crate::gpu::bms_flex::RowPrimaryHessianDevice),
+    #[cfg(target_os = "linux")]
+    DeviceStreaming {
+        reason: String,
+    },
+}
+
+impl RowPrimaryHessianCache {
+    /// Mirrors `Option::is_some` on the prior field type. CPU dispatcher
+    /// branches that gate on "is the per-row Hessian materialized at all"
+    /// must answer yes for both Host and Device caches.
+    #[inline]
+    pub(crate) fn is_some(&self) -> bool {
+        !matches!(self, Self::Empty)
+    }
+
+    /// Mirrors `Option::is_none`.
+    #[inline]
+    pub(crate) fn is_none(&self) -> bool {
+        matches!(self, Self::Empty)
+    }
+
+    /// Returns the host-resident pin when the cache is materialized on
+    /// host RAM. Used by the per-row CPU Hv / diagonal contractions that
+    /// touch the `r×r` block via an `ArrayView2`. Returns `None` for the
+    /// Device / DeviceStreaming variants (their consumers reach the data
+    /// through device contraction kernels, not host views).
+    #[inline]
+    pub(crate) fn host_pin(&self) -> Option<&RowPrimaryHessianPin> {
+        match self {
+            Self::Host(pin) => Some(pin),
+            _ => None,
+        }
+    }
+}
+
 /// Shared precomputed state plus pre-solved per-row contexts. All row
 /// intercepts are solved once during cache construction so that workspace
 /// calls (matvec, diagonal, psi, directional derivatives) never redundantly
@@ -5062,7 +5116,7 @@ struct BernoulliMarginalSlopeExactEvalCache {
     /// avoids rebuilding cell moments + reduced flex jets on every Hv product.
     /// `None` whenever the flex path is inactive (rigid kernel) or the
     /// caller did not opt in to materialization.
-    row_primary_hessians: Option<RowPrimaryHessianPin>,
+    row_primary_hessians: RowPrimaryHessianCache,
     /// Per-row uncontracted third-derivative tensor in the rigid path,
     /// lazily built on first access. The `build_psi_hyper_coords` row pass
     /// hits `rigid_row_third_contracted` once per (row, ψ-axis) — 32× per
@@ -8152,7 +8206,7 @@ impl BernoulliMarginalSlopeFamily {
             primary,
             row_contexts,
             row_cell_moments,
-            row_primary_hessians: None,
+            row_primary_hessians: RowPrimaryHessianCache::Empty,
             rigid_third_full: crate::resource::RayonSafeOnce::new(),
             rigid_fourth_full: crate::resource::RayonSafeOnce::new(),
         })
@@ -8304,9 +8358,9 @@ impl BernoulliMarginalSlopeFamily {
         &self,
         block_states: &[ParameterBlockState],
         cache: &BernoulliMarginalSlopeExactEvalCache,
-    ) -> Result<Option<RowPrimaryHessianPin>, String> {
+    ) -> Result<RowPrimaryHessianCache, String> {
         if !self.effective_flex_active(block_states)? {
-            return Ok(None);
+            return Ok(RowPrimaryHessianCache::Empty);
         }
         let n = self.y.len();
         let primary = &cache.primary;
@@ -8371,7 +8425,7 @@ impl BernoulliMarginalSlopeFamily {
                     gpu_decision.reason,
                 );
             }
-            return Ok(None);
+            return Ok(RowPrimaryHessianCache::Empty);
         }
         let started = std::time::Instant::now();
         let heartbeat_guard = crate::heartbeat::scope(format!(
@@ -8445,7 +8499,9 @@ impl BernoulliMarginalSlopeFamily {
             );
         }
         drop(heartbeat_guard);
-        Ok(Some(RowPrimaryHessianPin::new(packed, plan.bytes)))
+        Ok(RowPrimaryHessianCache::Host(RowPrimaryHessianPin::new(
+            packed, plan.bytes,
+        )))
     }
 
     /// Look up the cached per-row primary Hessian (`r × r`) materialized at
@@ -8458,7 +8514,7 @@ impl BernoulliMarginalSlopeFamily {
         cache: &'a BernoulliMarginalSlopeExactEvalCache,
         row: usize,
     ) -> Option<ArrayView2<'a, f64>> {
-        let rows = cache.row_primary_hessians.as_ref()?.rows();
+        let rows = cache.row_primary_hessians.host_pin()?.rows();
         let r = cache.primary.total;
         if row >= rows.nrows() {
             return None;
@@ -27777,7 +27833,7 @@ mod tests {
             primary: cached.primary.clone(),
             row_contexts: cached.row_contexts.clone(),
             row_cell_moments: None,
-            row_primary_hessians: None,
+            row_primary_hessians: RowPrimaryHessianCache::Empty,
             rigid_third_full: crate::resource::RayonSafeOnce::new(),
             rigid_fourth_full: crate::resource::RayonSafeOnce::new(),
         };
@@ -27836,7 +27892,7 @@ mod tests {
             primary: cached.primary.clone(),
             row_contexts: cached.row_contexts.clone(),
             row_cell_moments: None,
-            row_primary_hessians: None,
+            row_primary_hessians: RowPrimaryHessianCache::Empty,
             rigid_third_full: crate::resource::RayonSafeOnce::new(),
             rigid_fourth_full: crate::resource::RayonSafeOnce::new(),
         };
