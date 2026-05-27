@@ -466,12 +466,14 @@ mod device_dispatch {
         Ok(Some(out))
     }
 
-    /// Placeholder for the fixed-partials baseline launch.
+    /// Launch the fixed-partials kernel for the no-runtime baseline.
     ///
-    /// Today the caller declines to invoke this path because the
-    /// `FlexPrimaryLayout` (r + g_slot) isn't plumbed through the seam.
-    /// Kept here so the kernel + cache stay live and the symbol is
-    /// available the moment the layout is wired into the call boundary.
+    /// Returns the flat-packed `(12 + 40·r) · n_cells_total` doubles per
+    /// the layout described in
+    /// `kernel_src::DENESTED_CELL_PRIMARY_FIXED_PARTIALS_KERNEL_SRC`.
+    /// The caller re-packs into `CellPrimaryFixedPartialsOutput` and the
+    /// family-side consumer rebuilds `DenestedCellPrimaryFixedPartials`
+    /// via `from_flat_slice`.
     pub(super) fn cell_primary_fixed_partials_baseline(
         layout: super::FlexPrimaryLayout,
         n_cells_total: usize,
