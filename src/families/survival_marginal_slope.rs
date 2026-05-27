@@ -19145,15 +19145,17 @@ pub fn fit_survival_marginal_slope_terms(
     let z = Arc::new(spec.z.clone());
     let derivative_guard = spec.derivative_guard;
 
-    // Phase-4b active cutover: when the parametric joint design carries
-    // cross-block aliasing in the (q₀, q₁, q′₁, g) row primary state,
-    // residualise each block's terms against the cumulative anchor in
-    // the structural row metric (identity 4×4 H per row) and apply the
-    // resulting per-term V matrices to the raw designs + penalties.
-    // The inner Newton then operates on a rank-clean reparameterised
-    // joint design; at fit result the per-block β is lifted via the
-    // stored block-diagonal V back to raw width so predict-time
-    // consumes raw β unchanged.
+    // Phase-4b V+M-exact active cutover: when the parametric joint
+    // design carries cross-block aliasing in the (q₀, q₁, q′₁, g) row
+    // primary state, residualise each block's terms against the
+    // cumulative anchor in the structural row metric (identity 4×4 H
+    // per row), wrap raw designs through `ResidualisedDesignOperator`
+    // (the exact `C_b·V_b − A_{<b}·R_b` row form), and pull each
+    // per-term penalty back through the full triangular T (V's on the
+    // diagonal, `−R_{a→b}` off-diagonals). The inner Newton then
+    // operates on a rank-clean reparameterised joint design; at fit
+    // result the joint β is lifted via `T · θ` back to raw width so
+    // predict-time consumes raw β unchanged.
     //
     // When no aliasing is detected (drops_by_block == (0, 0, 0) for the
     // structural pass) the cutover is a no-op: raw designs / penalties
@@ -19162,19 +19164,33 @@ pub fn fit_survival_marginal_slope_terms(
     // The preflight observability block earlier already runs the same
     // structural compile and logs the drops_by_block summary. This site
     // re-runs the compile (cheap relative to the inner solve) and
-    // additionally applies the per-term V matrices when reduction is
-    // needed.
-    let (design_entry, design_exit, design_derivative_exit, marginal_design, logslope_design, smgs_lift_v): (
+    // additionally applies the V+M-exact per-term construction when
+    // reduction is needed.
+    type SmgsCutoverTuple = (
         crate::linalg::matrix::DesignMatrix,
         crate::linalg::matrix::DesignMatrix,
         crate::linalg::matrix::DesignMatrix,
         crate::terms::smooth::TermCollectionDesign,
         crate::terms::smooth::TermCollectionDesign,
-        Option<crate::families::survival_marginal_slope_identifiability::SmgsLiftPerBlockV>,
-    ) = {
+        Option<crate::families::survival_marginal_slope_identifiability::SmgsLiftViaT>,
+        Option<Vec<crate::families::custom_family::PenaltyMatrix>>,
+        Option<Vec<crate::families::custom_family::PenaltyMatrix>>,
+        Option<Vec<crate::families::custom_family::PenaltyMatrix>>,
+    );
+    let (
+        design_entry,
+        design_exit,
+        design_derivative_exit,
+        marginal_design,
+        logslope_design,
+        smgs_lift_v,
+        time_penalties_vm,
+        marginal_penalties_vm,
+        logslope_penalties_vm,
+    ): SmgsCutoverTuple = {
         use crate::families::survival_marginal_slope_identifiability::{
-            CompiledSurvivalDesignsPerTerm, SmgsLiftPerBlockV, SurvivalRowHessian,
-            apply_per_term_survival_parametric_compile_to_designs,
+            CompiledSurvivalDesignsVMExact, SmgsLiftViaT, SurvivalParametricCompiledPerTerm,
+            SurvivalRowHessian, apply_per_term_vm_exact,
             compile_survival_parametric_designs_per_term,
             extract_term_partition_from_penalty_ranges,
         };
@@ -19182,7 +19198,10 @@ pub fn fit_survival_marginal_slope_terms(
         // compile error) falls back to raw — observability preflight
         // and downstream canonicalize_for_identifiability still gate
         // on the audit.
-        let attempt = (|| -> Result<Option<CompiledSurvivalDesignsPerTerm>, String> {
+        let attempt = (|| -> Result<
+            Option<(CompiledSurvivalDesignsVMExact, SurvivalParametricCompiledPerTerm)>,
+            String,
+        > {
             let n_rows = spec.time_block.design_entry.nrows();
             let p_time = spec.time_block.design_entry.ncols();
             let p_marg = marginal_design.design.ncols();

@@ -18,6 +18,7 @@ pub mod cubic_cell;
 pub mod device;
 pub mod driver;
 pub mod error;
+pub mod identifiability_compile;
 pub mod linalg;
 pub mod memory;
 pub mod pirls_row;
