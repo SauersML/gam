@@ -935,34 +935,6 @@ def _extract_thread3_adaptive_fold_metrics(model_payload: dict[str, typing.Any] 
     return out
 
 
-def _rust_survival_fit_options_for_scenario(scenario_name: typing.Any) -> typing.Any:
-    # Survival time effects must use a structurally monotone basis so the
-    # fitted cumulative baseline cannot violate survival semantics.
-    if scenario_name in {"icu_survival_death", "icu_survival_los"}:
-        return {
-            "time_basis": "ispline",
-            "time_degree": 3,
-            "time_num_internal_knots": 10,
-            "time_smooth_lambda": 5e-2,
-            "ridge_lambda": 1e-6,
-        }
-    if scenario_name in {"heart_failure_survival", "cirrhosis_survival"}:
-        return {
-            "time_basis": "ispline",
-            "time_degree": 3,
-            "time_num_internal_knots": 8,
-            "time_smooth_lambda": 1e-2,
-            "ridge_lambda": 1e-6,
-        }
-    return {
-        "time_basis": "ispline",
-        "time_degree": 3,
-        "time_num_internal_knots": 8,
-        "time_smooth_lambda": 1e-2,
-        "ridge_lambda": 1e-6,
-    }
-
-
 def _rust_native_survival_matrix_from_model(
     *,
     rust_bin: Path,
