@@ -1129,12 +1129,13 @@ fn launch_linux(
 /// consumers `launch_bms_flex_row_hvp` / `_diagonal` / `_dense_block`
 /// are similarly Linux-only). The CPU-side oracle helpers + parity
 /// tests in this file's `mod tests` also construct it under `cfg(test)`
-/// on every host, so the wider gate covers both branches without the
-/// non-Linux release build triggering rustc's "never constructed"
-/// warning (which it would do otherwise because the lone production
-/// constructor in `bernoulli_marginal_slope.rs:9189` sits behind a
-/// `#[cfg(target_os = "linux")]` block).
-#[cfg(any(target_os = "linux", test))]
+/// Gating: Linux-only. The lone production constructor lives in
+/// `bernoulli_marginal_slope.rs:9189` behind `#[cfg(target_os = "linux")]`,
+/// so the struct is only used on Linux. Any non-Linux test referencing
+/// this type must guard itself with `#[cfg(target_os = "linux")]` too —
+/// the build.rs ban scanner explicitly rejects `#[cfg(any(..., test))]`
+/// as a dead-code escape hatch.
+#[cfg(target_os = "linux")]
 #[derive(Clone, Debug)]
 pub(crate) struct BmsFlexBlockLayout {
     pub p_m: usize,
@@ -1146,7 +1147,7 @@ pub(crate) struct BmsFlexBlockLayout {
 
 /// Primary-r layout shared with the host (mirrors `PrimarySlices`).
 /// Gating rationale identical to [`BmsFlexBlockLayout`].
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 #[derive(Clone, Debug)]
 pub(crate) struct BmsFlexPrimaryLayout {
     pub h: Option<std::ops::Range<usize>>,
