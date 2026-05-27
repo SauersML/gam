@@ -145,12 +145,12 @@ impl CubicCellGpuBackend {
         let source =
             crate::gpu::cubic_cell::kernel_src::build_cubic_deriv_moments_kernel_source(max_degree);
         let ptx =
-            cudarc::nvrtc::compile_ptx(&source).gpu_ctx("cubic_cell NVRTC compile (degree={max_degree}) failed")?;
+            cudarc::nvrtc::compile_ptx(&source).gpu_ctx_with(|err| format!("cubic_cell NVRTC compile (degree={max_degree}) failed: {err}"))?;
         let module = self
             .inner
             .ctx
             .load_module(ptx)
-            .gpu_ctx("cubic_cell module load (degree={max_degree}) failed")?;
+            .gpu_ctx_with(|err| format!("cubic_cell module load (degree={max_degree}) failed: {err}"))?;
         let mut guard = self
             .inner
             .modules
@@ -323,7 +323,7 @@ impl CubicCellGpuBackend {
         let func =
             module
                 .load_function(&kernel_name)
-                .gpu_ctx("cubic_cell load_function {kernel_name}")?;
+                .gpu_ctx_with(|err| format!("cubic_cell load_function {kernel_name}: {err}"))?;
 
         let stream = &self.inner.stream;
         let d_left = stream
@@ -498,7 +498,7 @@ impl CubicCellGpuBackend {
         let func =
             module
                 .load_function(&kernel_name)
-                .gpu_ctx("cubic_cell load_function {kernel_name}")?;
+                .gpu_ctx_with(|err| format!("cubic_cell load_function {kernel_name}: {err}"))?;
 
         let stream = &self.inner.stream;
         let d_left = stream
