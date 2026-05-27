@@ -738,7 +738,7 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
                 update_glmvectors(
                     y,
                     eta,
-                    &InverseLink::Standard(self.link_function()),
+                    &self.spec.link,
                     priorweights,
                     mu,
                     weights,
@@ -4295,7 +4295,14 @@ fn solve_intercept_for_prevalence(
                 _ => InverseLink::Sas(*state),
             }
         } else {
-            InverseLink::Standard(link_function)
+            // SAFETY: when `sas_link_state` is None, `solve_intercept_for_prevalence`
+            // is only invoked with the five legal `StandardLink` variants (the
+            // dispatch site at pirls.rs:4203 routes Sas/BetaLogistic into the
+            // Some branch above with state).
+            InverseLink::Standard(
+                StandardLink::try_from(link_function)
+                    .expect("state-bearing link reached state-less arm in solve_intercept_for_prevalence"),
+            )
         };
         standard_inverse_link_jet(&inverse_link, eta)
             .map(|jet| jet.mu - prevalence)
@@ -9292,7 +9299,7 @@ fn integrated_inverse_link_from_family(
         (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::Logit))
         | (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::Probit))
         | (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::CLogLog)) => {
-            Ok(InverseLink::Standard(spec.link_function()))
+            Ok(spec.link.clone())
         }
         (ResponseFamily::Binomial, InverseLink::Sas(_)) => {
             let state = sas_link_state.ok_or_else(|| {

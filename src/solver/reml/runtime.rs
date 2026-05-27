@@ -3727,7 +3727,13 @@ impl<'a> RemlState<'a> {
                 InverseLink::Sas(state)
             }
         } else {
-            InverseLink::Standard(link_function)
+            // SAFETY: when neither mixture nor sas state is present, the
+            // configured link is necessarily one of the five legal
+            // `StandardLink` variants — Sas/BetaLogistic always carry state.
+            InverseLink::Standard(
+                StandardLink::try_from(link_function)
+                    .expect("state-bearing link without runtime state in hessian_cde_arrays"),
+            )
         };
 
         // Use the same saturation contract as PIRLS observed-Hessian

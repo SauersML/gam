@@ -768,7 +768,7 @@ impl RemlConfig {
         // the outer also tightens the inner), but never coarser than the
         // floor — a coarse outer must not silently pollute the inner mode.
         let pirls_tol = reml_tol.min(PIRLS_INNER_TOLERANCE_FLOOR);
-        let link_kind = InverseLink::Standard(likelihood.link_function());
+        let link_kind = likelihood.spec.link.clone();
         Self {
             likelihood,
             link_kind,
@@ -1919,7 +1919,11 @@ fn resolved_external_inverse_link(
             ),
         });
     }
-    Ok(InverseLink::Standard(link))
+    Ok(InverseLink::Standard(StandardLink::try_from(link).map_err(|e| {
+        EstimationError::InvalidInput(format!(
+            "inverse link resolution: {e}; supply `sas_link` or `latent_cloglog` configuration for state-bearing links"
+        ))
+    })?))
 }
 
 #[inline]
@@ -4091,7 +4095,7 @@ pub struct FitInference {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum FittedLinkState {
-    Standard(Option<LinkFunction>),
+    Standard(Option<StandardLink>),
     LatentCLogLog {
         state: LatentCLogLogState,
     },
