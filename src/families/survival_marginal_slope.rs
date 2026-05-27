@@ -19375,8 +19375,8 @@ pub fn fit_survival_marginal_slope_terms(
         recompile_after_accept,
     ): SmgsCutoverTuple = {
         use crate::families::survival_marginal_slope_identifiability::{
-            CompiledSurvivalDesignsVMExact, SmgsLiftViaT, SurvivalParametricCompiledPerTerm,
-            SurvivalRowHessian, apply_per_term_vm_exact,
+            CompiledSurvivalDesignsVMExact, SmgsLiftViaT, SurvivalRowHessian,
+            apply_compiled_map_to_designs, apply_per_term_vm_exact,
             compile_survival_parametric_designs_per_term,
             extract_term_partition_from_penalty_ranges,
         };
@@ -19390,7 +19390,7 @@ pub fn fit_survival_marginal_slope_terms(
         // and downstream canonicalize_for_identifiability still gate
         // on the audit.
         let attempt = (|| -> Result<
-            Option<(CompiledSurvivalDesignsVMExact, SurvivalParametricCompiledPerTerm)>,
+            Option<(CompiledSurvivalDesignsVMExact, SmgsLiftViaT)>,
             String,
         > {
             let n_rows = spec.time_block.design_entry.nrows();
