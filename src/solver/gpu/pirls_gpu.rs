@@ -2310,12 +2310,13 @@ mod stream_device_parity_tests {
             }
             let h = x.t().dot(&wx_full) + &penalty;
             let rhs = x.t().dot(&g);
-            let h_faer = faer::Mat::from_fn(p, p, |i, j| h[[i, j]]);
-            let chol = h_faer.cholesky(faer::Side::Lower).expect("chol");
-            let rhs_faer = faer::Mat::from_fn(p, 1, |i, _| rhs[i]);
-            let d = chol.solve(rhs_faer.as_ref());
+            use crate::linalg::faer_ndarray::FaerCholesky;
+            let chol = h
+                .cholesky(faer::Side::Lower)
+                .expect("CPU PIRLS reference Cholesky");
+            let d = chol.solvevec(&rhs);
             for i in 0..p {
-                beta[i] -= d[(i, 0)];
+                beta[i] -= d[i];
             }
         }
         let cpu_secs = t1.elapsed().as_secs_f64();
