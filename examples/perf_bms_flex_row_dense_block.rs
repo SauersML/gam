@@ -43,8 +43,7 @@ fn main() {
             }
         }
         Err(err) => {
-            eprintln!("[BENCH-FAIL phase6] {err}");
-            std::process::exit(1);
+            panic!("[BENCH-FAIL phase6] {err}");
         }
     }
 }
