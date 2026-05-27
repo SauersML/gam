@@ -627,8 +627,8 @@ impl IsometryPenalty {
             target,
             reference: IsometryReference::Euclidean,
             rho_index: 0,
-            jacobian_cache: None,
-            jacobian_second_cache: None,
+            jacobian_cache_slot: RwLock::new(None),
+            jacobian_second_cache_slot: RwLock::new(None),
             duchon_radial_source: None,
             cache_third_decoder_derivative: None,
             p_out,
@@ -637,6 +637,88 @@ impl IsometryPenalty {
             weight_schedule: None,
         }
     }
+
+    /// Read-side accessor: takes the read lock briefly and clones the inner
+    /// `Arc` (refcount bump only; no payload copy). Returns `None` when the
+    /// cache has not been refreshed yet. Internally panics on poisoned lock
+    /// — the lock only wraps an `Option<Arc<…>>`, so the write side cannot
+    /// leave it in an invariant-violating state.
+    #[must_use]
+    pub fn jacobian_cache(&self) -> Option<Arc<Array2<f64>>> {
+        self.jacobian_cache_slot
+            .read()
+            .expect("IsometryPenalty::jacobian_cache_slot poisoned")
+            .clone()
+    }
+
+    /// Read-side accessor for the per-row Jacobian second derivative.
+    /// Mirrors [`Self::jacobian_cache`].
+    #[must_use]
+    pub fn jacobian_second_cache(&self) -> Option<Arc<Array2<f64>>> {
+        self.jacobian_second_cache_slot
+            .read()
+            .expect("IsometryPenalty::jacobian_second_cache_slot poisoned")
+            .clone()
+    }
+
+    /// Per-step refresh entry point. Takes `&self` (no `&mut`) so the SAE
+    /// outer loop can install fresh caches on an `Arc<IsometryPenalty>` held
+    /// in the analytic-penalty registry without disturbing the surrounding
+    /// dispatcher. Pass `None` for either argument to clear that cache (the
+    /// dispatcher will then either fall back to the Duchon radial source if
+    /// available, or return the zero safe default).
+    pub fn refresh_caches(
+        &self,
+        jac: Option<Arc<Array2<f64>>>,
+        jac2: Option<Arc<Array2<f64>>>,
+    ) {
+        *self
+            .jacobian_cache_slot
+            .write()
+            .expect("IsometryPenalty::jacobian_cache_slot poisoned") = jac;
+        *self
+            .jacobian_second_cache_slot
+            .write()
+            .expect("IsometryPenalty::jacobian_second_cache_slot poisoned") = jac2;
+    }
+
+    /// In-place writer for just the Jacobian cache (used by callers that
+    /// already own the radial Duchon source and only want to refresh `J`).
+    pub fn set_jacobian_cache(&self, jac: Option<Arc<Array2<f64>>>) {
+        *self
+            .jacobian_cache_slot
+            .write()
+            .expect("IsometryPenalty::jacobian_cache_slot poisoned") = jac;
+    }
+
+    /// In-place writer for just the Jacobian second-derivative cache.
+    pub fn set_jacobian_second_cache(&self, jac2: Option<Arc<Array2<f64>>>) {
+        *self
+            .jacobian_second_cache_slot
+            .write()
+            .expect("IsometryPenalty::jacobian_second_cache_slot poisoned") = jac2;
+    }
+}
+
+impl Clone for IsometryPenalty {
+    fn clone(&self) -> Self {
+        Self {
+            target: self.target.clone(),
+            reference: self.reference.clone(),
+            rho_index: self.rho_index,
+            jacobian_cache_slot: RwLock::new(self.jacobian_cache()),
+            jacobian_second_cache_slot: RwLock::new(self.jacobian_second_cache()),
+            duchon_radial_source: self.duchon_radial_source.clone(),
+            cache_third_decoder_derivative: self.cache_third_decoder_derivative.clone(),
+            p_out: self.p_out,
+            weight: self.weight.clone(),
+            scalar_weight: self.scalar_weight,
+            weight_schedule: self.weight_schedule.clone(),
+        }
+    }
+}
+
+impl IsometryPenalty {
 
     /// Attach a cached third decoder derivative
     /// `K_n[i, a, c, d] = ∂²J_n[i, a] / ∂t_{n, c} ∂t_{n, d}`, flattened
@@ -656,14 +738,14 @@ impl IsometryPenalty {
     }
 
     #[must_use]
-    pub fn with_jacobian_cache(mut self, j: Arc<Array2<f64>>) -> Self {
-        self.jacobian_cache = Some(j);
+    pub fn with_jacobian_cache(self, j: Arc<Array2<f64>>) -> Self {
+        self.set_jacobian_cache(Some(j));
         self
     }
 
     #[must_use]
-    pub fn with_jacobian_second_cache(mut self, h: Arc<Array2<f64>>) -> Self {
-        self.jacobian_second_cache = Some(h);
+    pub fn with_jacobian_second_cache(self, h: Arc<Array2<f64>>) -> Self {
+        self.set_jacobian_second_cache(Some(h));
         self
     }
 
@@ -703,7 +785,7 @@ impl IsometryPenalty {
     }
 
     fn has_jacobian_cache(&self, method: &str) -> bool {
-        if self.jacobian_cache.is_some() {
+        if self.jacobian_cache().is_some() {
             true
         } else {
             self.missing_cache_default(method, "jacobian_cache is None");
@@ -712,7 +794,7 @@ impl IsometryPenalty {
     }
 
     fn has_jacobian_second_source(&self, method: &str) -> bool {
-        if self.jacobian_second_cache.is_some() || self.duchon_radial_source.is_some() {
+        if self.jacobian_second_cache().is_some() || self.duchon_radial_source.is_some() {
             true
         } else {
             self.missing_cache_default(
@@ -742,7 +824,7 @@ impl IsometryPenalty {
     /// is consumed. Every value/grad/hvp path funnels through here, so the
     /// `(J^T U)(U^T J)` ordering invariant cannot be violated by accident.
     fn projected_jacobian_row(&self, n: usize, d: usize) -> Option<Array2<f64>> {
-        let Some(jac) = self.jacobian_cache.as_ref() else {
+        let Some(jac) = self.jacobian_cache() else {
             self.missing_cache_default("projected_jacobian_row", "jacobian_cache is None");
             return None;
         };
@@ -775,7 +857,7 @@ impl IsometryPenalty {
 
     /// Form `W_n J_n` without materializing `W_n`.
     fn weighted_jacobian_row(&self, n: usize, d: usize) -> Option<Array2<f64>> {
-        let Some(jac) = self.jacobian_cache.as_ref() else {
+        let Some(jac) = self.jacobian_cache() else {
             self.missing_cache_default("weighted_jacobian_row", "jacobian_cache is None");
             return None;
         };
@@ -991,8 +1073,14 @@ impl IsometryPenalty {
         n_obs: usize,
         d: usize,
     ) -> Option<CowArray<'a, f64, Ix2>> {
-        if let Some(jac2) = self.jacobian_second_cache.as_ref() {
-            return Some(CowArray::from(jac2.view()));
+        if let Some(jac2) = self.jacobian_second_cache() {
+            // Clone the underlying Array2 to detach from the Arc — the
+            // CowArray needs to outlive the temporary Arc returned by the
+            // accessor. The clone is `n_obs × p·d²` floats, paid once per
+            // grad_target / hvp_state invocation; same per-step cost as the
+            // pre-refactor code path which also took ownership via
+            // `jac2.view().to_owned()` semantics implicitly.
+            return Some(CowArray::from((*jac2).clone()));
         }
         let source = self.duchon_radial_source.as_ref()?;
         match self.duchon_radial_jacobian_second(target, n_obs, d, source) {
@@ -1166,7 +1254,7 @@ impl IsometryPenalty {
     /// `U_n` and `J_n`) plus `O(r · d²)` for `M_n^T M_n`. The `p × p` weight
     /// `W_n` is never materialized.
     fn pullback_metric(&self, latent_dim: usize) -> Option<Array2<f64>> {
-        let Some(jac) = self.jacobian_cache.as_ref() else {
+        let Some(jac) = self.jacobian_cache() else {
             self.missing_cache_default("pullback_metric", "jacobian_cache is None");
             return None;
         };
