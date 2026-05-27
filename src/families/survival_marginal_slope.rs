@@ -25034,4 +25034,252 @@ gauge_priority: 100,
             "fresh family must have no recorded last-rho proxy"
         );
     }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Block 10 parity — third T_uv[r] and fourth Q_uv[r,s] contractions:
+    // crate::gpu::survival_flex::cpu_oracle_third_contraction /
+    // cpu_oracle_fourth_contraction must match the family CPU paths
+    // (row_flex_primary_third_contracted_exact / _fourth_contracted_exact)
+    // to within 5e-8 absolute / 5e-7 relative.
+    // ────────────────────────────────────────────────────────────────────
+
+    fn b10_flex_family_for_parity() -> (SurvivalMarginalSlopeFamily, Vec<ParameterBlockState>) {
+        let score_runtime = test_deviation_runtime();
+        let link_runtime = test_deviation_runtime();
+        let family = SurvivalMarginalSlopeFamily {
+            n: 1,
+            event: Arc::new(array![1.0]),
+            weights: Arc::new(array![0.75]),
+            z: Arc::new(array![-0.2].insert_axis(Axis(1))),
+            score_covariance: unit_score_covariance(),
+            gaussian_frailty_sd: None,
+            derivative_guard: 1e-6,
+            design_entry: DesignMatrix::from(Array2::zeros((1, 1))),
+            design_exit: DesignMatrix::from(Array2::zeros((1, 1))),
+            design_derivative_exit: DesignMatrix::from(Array2::zeros((1, 1))),
+            offset_entry: Arc::new(array![-0.4]),
+            offset_exit: Arc::new(array![0.6]),
+            derivative_offset_exit: Arc::new(array![0.85]),
+            marginal_design: DesignMatrix::from(Array2::zeros((1, 0))),
+            logslope_design: DesignMatrix::from(Array2::zeros((1, 0))),
+            logslope_surface_ranges: empty_logslope_surface_ranges(),
+            score_warp: Some(score_runtime.clone()),
+            link_dev: Some(link_runtime.clone()),
+            time_linear_constraints: None,
+            time_wiggle_knots: None,
+            time_wiggle_degree: None,
+            time_wiggle_ncols: 0,
+            intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+        };
+        let h_dim = score_runtime.basis_dim();
+        let w_dim = link_runtime.basis_dim();
+        // Mild non-zero coefficients to drive the chi/D quotient terms
+        // away from the zero-warp / zero-deviation degenerate case.
+        let h_beta: Array1<f64> = (0..h_dim)
+            .map(|k| 0.05 * ((k as f64 + 1.0).sin()))
+            .collect::<Vec<_>>()
+            .into();
+        let w_beta: Array1<f64> = (0..w_dim)
+            .map(|k| 0.04 * ((k as f64 + 1.0).cos()))
+            .collect::<Vec<_>>()
+            .into();
+        let block_states = vec![
+            ParameterBlockState {
+                beta: Array1::zeros(1),
+                eta: Array1::zeros(1),
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(0),
+                eta: Array1::zeros(1),
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(0),
+                eta: array![0.32],
+            },
+            ParameterBlockState {
+                beta: h_beta,
+                eta: Array1::zeros(1),
+            },
+            ParameterBlockState {
+                beta: w_beta,
+                eta: Array1::zeros(1),
+            },
+        ];
+        (family, block_states)
+    }
+
+    fn b10_pack_base(
+        base: &SurvivalFlexTimepointExact,
+    ) -> crate::gpu::survival_flex::SurvivalFlexBlock10TimepointBase {
+        crate::gpu::survival_flex::SurvivalFlexBlock10TimepointBase {
+            eta: base.eta,
+            chi: base.chi,
+            d: base.d,
+            eta_u: base.eta_u.to_vec(),
+            eta_uv: base.eta_uv.iter().copied().collect(),
+            chi_u: base.chi_u.to_vec(),
+            chi_uv: base.chi_uv.iter().copied().collect(),
+            d_u: base.d_u.to_vec(),
+            d_uv: base.d_uv.iter().copied().collect(),
+        }
+    }
+
+    fn b10_pack_dir(
+        ext: &SurvivalFlexTimepointDirectionalExact,
+    ) -> crate::gpu::survival_flex::SurvivalFlexBlock10TimepointDirectional {
+        crate::gpu::survival_flex::SurvivalFlexBlock10TimepointDirectional {
+            eta_uv_dir: ext.eta_uv_dir.iter().copied().collect(),
+            chi_uv_dir: ext.chi_uv_dir.iter().copied().collect(),
+            d_u_dir: ext.d_u_dir.to_vec(),
+            d_uv_dir: ext.d_uv_dir.iter().copied().collect(),
+        }
+    }
+
+    fn b10_pack_bi(
+        bi: &SurvivalFlexTimepointBiDirectionalExact,
+    ) -> crate::gpu::survival_flex::SurvivalFlexBlock10TimepointBiDirectional {
+        crate::gpu::survival_flex::SurvivalFlexBlock10TimepointBiDirectional {
+            eta_uv_uv: bi.eta_uv_uv.iter().copied().collect(),
+            chi_uv_uv: bi.chi_uv_uv.iter().copied().collect(),
+            d_uv_uv: bi.d_uv_uv.iter().copied().collect(),
+        }
+    }
+
+    fn b10_assert_parity(actual: &[f64], expected: &ndarray::Array2<f64>, label: &str) {
+        let p = expected.nrows();
+        assert_eq!(expected.ncols(), p, "{label}: expected non-square");
+        assert_eq!(actual.len(), p * p, "{label}: flat length mismatch");
+        for u in 0..p {
+            for v in 0..p {
+                let got = actual[u * p + v];
+                let want = expected[[u, v]];
+                let abs = (got - want).abs();
+                let rel = abs / want.abs().max(1.0);
+                assert!(
+                    abs <= 5e-8 || rel <= 5e-7,
+                    "{label}[{u},{v}]: got={got:.17e} want={want:.17e} abs={abs:.3e} rel={rel:.3e}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn block10_cpu_oracle_third_contraction_matches_family() {
+        let (family, block_states) = b10_flex_family_for_parity();
+        let primary = flex_primary_slices(&family);
+        let p = primary.total;
+        // Deterministic non-axis-aligned direction.
+        let dir: Array1<f64> = (0..p)
+            .map(|k| 0.1 + 0.07 * ((k as f64 + 1.7).sin()))
+            .collect::<Vec<_>>()
+            .into();
+
+        let expected = family
+            .row_flex_primary_third_contracted_exact(0, &block_states, &dir)
+            .expect("cpu third contraction");
+
+        let (entry_base, exit_base, entry_ext, exit_ext, _e2, _x2, _eb, _xb, _qd1, qd1_idx, p_total) =
+            family
+                .flex_primary_timepoint_jets_for_test(0, &block_states, &dir, None)
+                .expect("jets");
+
+        let entry_b = b10_pack_base(&entry_base);
+        let exit_b = b10_pack_base(&exit_base);
+        let entry_d = b10_pack_dir(&entry_ext);
+        let exit_d = b10_pack_dir(&exit_ext);
+        let dir_vec: Vec<f64> = dir.to_vec();
+        let inputs = crate::gpu::survival_flex::SurvivalFlexBlock10ThirdInputs {
+            p: p_total,
+            qd1_index: qd1_idx,
+            qd1: family
+                .row_dynamic_q_geometry(0, &block_states)
+                .expect("q geom")
+                .qd1,
+            w: family.weights[0],
+            d: family.event[0],
+            dir: &dir_vec,
+            entry_base: &entry_b,
+            exit_base: &exit_b,
+            entry_ext: &entry_d,
+            exit_ext: &exit_d,
+        };
+        let actual = crate::gpu::survival_flex::cpu_oracle_third_contraction(&inputs)
+            .expect("oracle third");
+        b10_assert_parity(&actual, &expected, "block10_third");
+    }
+
+    #[test]
+    fn block10_cpu_oracle_fourth_contraction_matches_family() {
+        let (family, block_states) = b10_flex_family_for_parity();
+        let primary = flex_primary_slices(&family);
+        let p = primary.total;
+        let dir_u: Array1<f64> = (0..p)
+            .map(|k| 0.08 + 0.06 * ((k as f64 + 0.4).cos()))
+            .collect::<Vec<_>>()
+            .into();
+        let dir_v: Array1<f64> = (0..p)
+            .map(|k| -0.05 + 0.09 * ((k as f64 + 1.1).sin()))
+            .collect::<Vec<_>>()
+            .into();
+
+        let expected = family
+            .row_flex_primary_fourth_contracted_exact(0, &block_states, &dir_u, &dir_v)
+            .expect("cpu fourth contraction");
+
+        let (
+            entry_base,
+            exit_base,
+            entry_ext1,
+            exit_ext1,
+            entry_ext2,
+            exit_ext2,
+            entry_bi,
+            exit_bi,
+            _qd1,
+            qd1_idx,
+            p_total,
+        ) = family
+            .flex_primary_timepoint_jets_for_test(0, &block_states, &dir_u, Some(&dir_v))
+            .expect("bi-jets");
+        let entry_ext2 = entry_ext2.expect("entry ext2");
+        let exit_ext2 = exit_ext2.expect("exit ext2");
+        let entry_bi = entry_bi.expect("entry bi");
+        let exit_bi = exit_bi.expect("exit bi");
+
+        let entry_b = b10_pack_base(&entry_base);
+        let exit_b = b10_pack_base(&exit_base);
+        let entry_d1 = b10_pack_dir(&entry_ext1);
+        let entry_d2 = b10_pack_dir(&entry_ext2);
+        let exit_d1 = b10_pack_dir(&exit_ext1);
+        let exit_d2 = b10_pack_dir(&exit_ext2);
+        let entry_bi_p = b10_pack_bi(&entry_bi);
+        let exit_bi_p = b10_pack_bi(&exit_bi);
+        let dir_u_v: Vec<f64> = dir_u.to_vec();
+        let dir_v_v: Vec<f64> = dir_v.to_vec();
+        let inputs = crate::gpu::survival_flex::SurvivalFlexBlock10FourthInputs {
+            p: p_total,
+            qd1_index: qd1_idx,
+            qd1: family
+                .row_dynamic_q_geometry(0, &block_states)
+                .expect("q geom")
+                .qd1,
+            w: family.weights[0],
+            d: family.event[0],
+            dir_u: &dir_u_v,
+            dir_v: &dir_v_v,
+            entry_base: &entry_b,
+            exit_base: &exit_b,
+            entry_ext_u: &entry_d1,
+            entry_ext_v: &entry_d2,
+            exit_ext_u: &exit_d1,
+            exit_ext_v: &exit_d2,
+            entry_bi: &entry_bi_p,
+            exit_bi: &exit_bi_p,
+        };
+        let actual = crate::gpu::survival_flex::cpu_oracle_fourth_contraction(&inputs)
+            .expect("oracle fourth");
+        b10_assert_parity(&actual, &expected, "block10_fourth");
+    }
 }
