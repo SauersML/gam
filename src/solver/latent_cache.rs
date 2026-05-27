@@ -17,12 +17,11 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1};
-use sha2::{Digest, Sha256};
 
 use crate::basis::{DuchonNullspaceOrder, MaternNu, RadialScalarKind};
+use crate::cache::{Fingerprint, Fingerprinter};
 use crate::estimate::EstimationError;
 use crate::estimate::reml::DirectionalHyperParam;
-use crate::solver::persistent_warm_start::StableHasher;
 use crate::solver::riemannian_retraction::{Retraction, RetractionKind};
 use crate::terms::latent_coord::{
     AuxPriorFamily, AuxPriorStrength, LatentCoordValues, LatentIdMode, LatentManifold,
@@ -113,53 +112,18 @@ impl LatentFingerprint {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct CacheDigest([u8; 32]);
+pub(crate) type CacheDigest = Fingerprint;
 
-struct CacheDigestBuilder {
-    hasher: Sha256,
-}
-
-impl CacheDigestBuilder {
-    fn new(namespace: &str) -> Self {
-        let mut out = Self {
-            hasher: Sha256::new(),
-        };
-        out.write_str(namespace);
-        out
-    }
-
-    fn write_bool(&mut self, value: bool) {
-        self.hasher.update([u8::from(value)]);
-    }
-
-    fn write_u8(&mut self, value: u8) {
-        self.hasher.update([value]);
-    }
-
-    fn write_u64(&mut self, value: u64) {
-        self.hasher.update(value.to_le_bytes());
-    }
-
-    fn write_f64(&mut self, value: f64) {
-        self.hasher.update(value.to_bits().to_le_bytes());
-    }
-
-    fn write_str(&mut self, value: &str) {
-        self.write_usize(value.len());
-        self.hasher.update(value.as_bytes());
-    }
-
-    fn write_usize(&mut self, value: usize) {
-        self.hasher.update((value as u64).to_le_bytes());
-    }
-
-    fn finish(self) -> CacheDigest {
-        let digest = self.hasher.finalize();
-        let mut out = [0_u8; 32];
-        out.copy_from_slice(&digest);
-        CacheDigest(out)
-    }
+/// Open a [`Fingerprinter`] pre-seeded with a length-prefixed namespace
+/// string so different cache-digest call sites cannot alias.
+///
+/// This is a thin convenience wrapper over [`Fingerprinter::write_str`]
+/// — it exists so the call sites read as `cache_digest_builder("…-v1")`
+/// instead of repeating the namespace-framing pattern at every callsite.
+fn cache_digest_builder(namespace: &str) -> Fingerprinter {
+    let mut out = Fingerprinter::new();
+    out.write_str(namespace);
+    out
 }
 
 #[derive(Clone)]
@@ -231,7 +195,7 @@ impl LatentBasisKind {
     }
 
     fn cache_digest(&self) -> CacheDigest {
-        let mut hasher = CacheDigestBuilder::new("latent-basis-v1");
+        let mut hasher = cache_digest_builder("latent-basis-v1");
         match self {
             Self::Matern {
                 centers,
@@ -323,7 +287,7 @@ impl LatentBasisKind {
                 hasher.write_u64(smooth_penalty.to_bits());
                 if let Some(path) = pca_basis_path {
                     hasher.write_u8(1);
-                    hasher.hasher.update(path.to_string_lossy().as_bytes());
+                    hasher.write_bytes(path.to_string_lossy().as_bytes());
                     if let Ok(meta) = std::fs::metadata(path) {
                         hasher.write_u64(meta.len());
                         if let Ok(modified) = meta.modified()
@@ -343,12 +307,12 @@ impl LatentBasisKind {
                 hash_matrix(basis_matrix, &mut hasher);
             }
         }
-        hasher.finish()
+        hasher.finalize()
     }
 }
 
 pub(crate) fn pca_center_mean_fingerprint(mean: &Array1<f64>) -> u64 {
-    let mut hasher = StableHasher::new();
+    let mut hasher = Fingerprinter::new();
     hasher.write_usize(mean.len());
     for &value in mean.iter() {
         hasher.write_f64(value);
@@ -366,7 +330,7 @@ fn matern_nu_signature(nu: MaternNu) -> usize {
     }
 }
 
-fn hash_duchon_nullspace_order(order: DuchonNullspaceOrder, hasher: &mut CacheDigestBuilder) {
+fn hash_duchon_nullspace_order(order: DuchonNullspaceOrder, hasher: &mut Fingerprinter) {
     match order {
         DuchonNullspaceOrder::Zero => {
             hasher.write_usize(0);
@@ -381,7 +345,7 @@ fn hash_duchon_nullspace_order(order: DuchonNullspaceOrder, hasher: &mut CacheDi
     }
 }
 
-fn hash_optional_f64(value: Option<f64>, hasher: &mut CacheDigestBuilder) {
+fn hash_optional_f64(value: Option<f64>, hasher: &mut Fingerprinter) {
     match value {
         Some(value) => {
             hasher.write_bool(true);
@@ -393,7 +357,7 @@ fn hash_optional_f64(value: Option<f64>, hasher: &mut CacheDigestBuilder) {
     }
 }
 
-fn hash_optional_usize(value: Option<usize>, hasher: &mut CacheDigestBuilder) {
+fn hash_optional_usize(value: Option<usize>, hasher: &mut Fingerprinter) {
     match value {
         Some(value) => {
             hasher.write_bool(true);
@@ -405,14 +369,14 @@ fn hash_optional_usize(value: Option<usize>, hasher: &mut CacheDigestBuilder) {
     }
 }
 
-fn hash_f64_slice(values: &[f64], hasher: &mut CacheDigestBuilder) {
+fn hash_f64_slice(values: &[f64], hasher: &mut Fingerprinter) {
     hasher.write_usize(values.len());
     for &value in values {
         hasher.write_f64(value);
     }
 }
 
-fn hash_matrix(matrix: &Array2<f64>, hasher: &mut CacheDigestBuilder) {
+fn hash_matrix(matrix: &Array2<f64>, hasher: &mut Fingerprinter) {
     hasher.write_usize(matrix.nrows());
     hasher.write_usize(matrix.ncols());
     for &value in matrix.iter() {
@@ -420,7 +384,7 @@ fn hash_matrix(matrix: &Array2<f64>, hasher: &mut CacheDigestBuilder) {
     }
 }
 
-fn hash_vector(vector: &Array1<f64>, hasher: &mut CacheDigestBuilder) {
+fn hash_vector(vector: &Array1<f64>, hasher: &mut Fingerprinter) {
     hasher.write_usize(vector.len());
     for &value in vector.iter() {
         hasher.write_f64(value);
@@ -428,12 +392,12 @@ fn hash_vector(vector: &Array1<f64>, hasher: &mut CacheDigestBuilder) {
 }
 
 fn latent_metadata_cache_digest(latent: &LatentCoordValues) -> CacheDigest {
-    let mut hasher = CacheDigestBuilder::new("latent-cache-metadata-v1");
+    let mut hasher = cache_digest_builder("latent-cache-metadata-v1");
     hasher.write_usize(latent.n_obs());
     hasher.write_usize(latent.latent_dim());
     hash_latent_manifold(latent.manifold(), &mut hasher);
     hash_latent_id_mode(latent.id_mode(), &mut hasher);
-    hasher.finish()
+    hasher.finalize()
 }
 
 pub(crate) fn latent_design_context_cache_digest(
@@ -443,7 +407,7 @@ pub(crate) fn latent_design_context_cache_digest(
     analytic_rho_count: usize,
     feature_cols: &[usize],
 ) -> Result<CacheDigest, EstimationError> {
-    let mut hasher = CacheDigestBuilder::new("latent-design-context-v1");
+    let mut hasher = cache_digest_builder("latent-design-context-v1");
     hasher.write_usize(data.nrows());
     hasher.write_usize(data.ncols());
     for row in 0..data.nrows() {
@@ -457,17 +421,17 @@ pub(crate) fn latent_design_context_cache_digest(
         ))
     })?;
     hasher.write_usize(spec_bytes.len());
-    hasher.hasher.update(spec_bytes);
+    hasher.write_bytes(&spec_bytes);
     hasher.write_usize(term_index.get());
     hasher.write_usize(analytic_rho_count);
     hasher.write_usize(feature_cols.len());
     for &col in feature_cols {
         hasher.write_usize(col);
     }
-    Ok(hasher.finish())
+    Ok(hasher.finalize())
 }
 
-fn hash_latent_id_mode(id_mode: &LatentIdMode, hasher: &mut CacheDigestBuilder) {
+fn hash_latent_id_mode(id_mode: &LatentIdMode, hasher: &mut Fingerprinter) {
     match id_mode {
         LatentIdMode::AuxPrior {
             u,
@@ -501,14 +465,14 @@ fn hash_latent_id_mode(id_mode: &LatentIdMode, hasher: &mut CacheDigestBuilder) 
     }
 }
 
-fn hash_aux_prior_family(family: AuxPriorFamily, hasher: &mut CacheDigestBuilder) {
+fn hash_aux_prior_family(family: AuxPriorFamily, hasher: &mut Fingerprinter) {
     hasher.write_usize(match family {
         AuxPriorFamily::Ridge => 0,
         AuxPriorFamily::Linear => 1,
     });
 }
 
-fn hash_aux_prior_strength(strength: AuxPriorStrength, hasher: &mut CacheDigestBuilder) {
+fn hash_aux_prior_strength(strength: AuxPriorStrength, hasher: &mut Fingerprinter) {
     match strength {
         AuxPriorStrength::Auto => {
             hasher.write_usize(0);
@@ -520,7 +484,7 @@ fn hash_aux_prior_strength(strength: AuxPriorStrength, hasher: &mut CacheDigestB
     }
 }
 
-fn hash_optional_vector(vector: Option<&Array1<f64>>, hasher: &mut CacheDigestBuilder) {
+fn hash_optional_vector(vector: Option<&Array1<f64>>, hasher: &mut Fingerprinter) {
     match vector {
         Some(vector) => {
             hasher.write_bool(true);
@@ -532,7 +496,7 @@ fn hash_optional_vector(vector: Option<&Array1<f64>>, hasher: &mut CacheDigestBu
     }
 }
 
-fn hash_latent_manifold(manifold: &LatentManifold, hasher: &mut CacheDigestBuilder) {
+fn hash_latent_manifold(manifold: &LatentManifold, hasher: &mut Fingerprinter) {
     match manifold {
         LatentManifold::Euclidean => {
             hasher.write_usize(0);

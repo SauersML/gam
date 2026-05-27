@@ -96,7 +96,7 @@
 use ndarray::{Array1, Array2, ArrayView1};
 use std::sync::Arc;
 
-use crate::solver::persistent_warm_start::StableHasher;
+use crate::cache::Fingerprinter;
 use crate::terms::analytic_penalties::{AnalyticPenaltyKind, AnalyticPenaltyRegistry, PenaltyTier};
 use crate::terms::latent_coord::{LatentCoordValues, LatentManifold};
 
@@ -519,7 +519,7 @@ fn manifold_mode_fingerprint(latent: &LatentCoordValues) -> u64 {
         return EUCLIDEAN_MANIFOLD_MODE_FINGERPRINT;
     }
 
-    let mut hasher = StableHasher::new();
+    let mut hasher = Fingerprinter::new();
     hasher.write_str("arrow-schur-manifold-mode-v1");
     hasher.write_usize(latent.n_obs());
     hasher.write_usize(latent.latent_dim());
@@ -534,7 +534,7 @@ fn manifold_mode_fingerprint(latent: &LatentCoordValues) -> u64 {
 }
 
 fn row_hessian_fingerprint_for_system(sys: &ArrowSchurSystem) -> u64 {
-    let mut hasher = StableHasher::new();
+    let mut hasher = Fingerprinter::new();
     hasher.write_str("arrow-schur-row-hessian-v2");
     hasher.write_usize(sys.rows.len());
     hasher.write_usize(sys.d);
@@ -561,7 +561,7 @@ fn combine_row_and_registry_fingerprints(row: u64, registry: u64) -> u64 {
     if registry == 0 {
         return row;
     }
-    let mut hasher = StableHasher::new();
+    let mut hasher = Fingerprinter::new();
     hasher.write_str("arrow-schur-row-hessian-with-penalties-v1");
     hasher.write_u64(row);
     hasher.write_u64(registry);
@@ -578,7 +578,7 @@ fn stable_softplus_for_fingerprint(x: f64) -> f64 {
     }
 }
 
-fn write_array2_fingerprint(hasher: &mut StableHasher, values: &Array2<f64>) {
+fn write_array2_fingerprint(hasher: &mut Fingerprinter, values: &Array2<f64>) {
     hasher.write_usize(values.nrows());
     hasher.write_usize(values.ncols());
     for &value in values.iter() {
@@ -595,7 +595,7 @@ fn analytic_penalty_row_hessian_fingerprint(
         return None;
     }
 
-    let mut hasher = StableHasher::new();
+    let mut hasher = Fingerprinter::new();
     hasher.write_str("arrow-schur-analytic-row-hessian-v1");
     hasher.write_str(penalty.name());
     hasher.write_usize(target_t.len());
@@ -677,7 +677,7 @@ fn analytic_penalty_row_hessian_fingerprint(
     Some(hasher.finish_u64())
 }
 
-fn write_latent_manifold(hasher: &mut StableHasher, manifold: &LatentManifold) {
+fn write_latent_manifold(hasher: &mut Fingerprinter, manifold: &LatentManifold) {
     match manifold {
         LatentManifold::Euclidean => {
             hasher.write_str("euclidean");
@@ -1009,7 +1009,7 @@ impl ArrowSchurSystem {
         self.analytic_row_hessian_fingerprint = if penalty_fingerprints.is_empty() {
             0
         } else {
-            let mut hasher = StableHasher::new();
+            let mut hasher = Fingerprinter::new();
             hasher.write_str("arrow-schur-row-hessian-registry-v1");
             hasher.write_usize(penalty_fingerprints.len());
             for fingerprint in penalty_fingerprints {

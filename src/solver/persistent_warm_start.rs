@@ -18,7 +18,14 @@ const CACHE_TTL_SECS: u64 = 60 * 60 * 24 * 365 * 10;
 /// separate** from `CARGO_PKG_VERSION` so a routine library version bump
 /// does NOT invalidate every user's warm-start cache.
 pub(crate) fn cache_schema_tag() -> String {
-    "schema2-arrow-schur-streaming-v1".to_string()
+    // Bumped from `schema2-` → `schema3-` when the three hand-written
+    // hashers (`Fingerprinter`, `StableHasher`, `CacheDigestBuilder`) were
+    // unified onto `Fingerprinter`. Prior on-disk warm-start entries are
+    // walled off into the `schema2-` keyspace and cold-start once; this
+    // is the intentional consequence of the unification, documented in
+    // the commit that performs it. See `src/cache/key.rs` for the new
+    // canonical hasher API.
+    "schema3-unified-fingerprinter-v1".to_string()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -181,55 +188,6 @@ impl PersistentWarmStartRecord {
     }
 }
 
-pub(crate) struct StableHasher {
-    state: u64,
-}
-
-impl StableHasher {
-    pub(crate) fn new() -> Self {
-        Self {
-            state: 0xcbf2_9ce4_8422_2325,
-        }
-    }
-
-    pub(crate) fn write_bytes(&mut self, bytes: &[u8]) {
-        for &byte in bytes {
-            self.state ^= u64::from(byte);
-            self.state = self.state.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-    }
-
-    pub(crate) fn write_str(&mut self, value: &str) {
-        self.write_usize(value.len());
-        self.write_bytes(value.as_bytes());
-    }
-
-    pub(crate) fn write_usize(&mut self, value: usize) {
-        self.write_bytes(&(value as u64).to_le_bytes());
-    }
-
-    pub(crate) fn write_u64(&mut self, value: u64) {
-        self.write_bytes(&value.to_le_bytes());
-    }
-
-    pub(crate) fn write_bool(&mut self, value: bool) {
-        self.write_bytes(&[u8::from(value)]);
-    }
-
-    pub(crate) fn write_f64(&mut self, value: f64) {
-        let normalized = if value == 0.0 { 0.0 } else { value };
-        self.write_u64(normalized.to_bits());
-    }
-
-    pub(crate) fn finish_hex(&self) -> String {
-        format!("{:016x}", self.state)
-    }
-
-    pub(crate) fn finish_u64(&self) -> u64 {
-        self.state
-    }
-}
-
 pub(crate) fn load_record(key: &str) -> Option<PersistentWarmStartRecord> {
     load_json_record(key)
 }
@@ -255,9 +213,11 @@ fn store_json_record<T: Serialize>(key: &str, record: &T) -> Result<(), String> 
     let Some(store) = persistent_store() else {
         return Ok(());
     };
+    let mut fp = Fingerprinter::new();
+    fp.absorb_str(b"warm-start-key", key);
     store
         .save(
-            &fingerprint_for_key(key),
+            &fp.finalize(),
             &bytes,
             None,
             None,
@@ -269,7 +229,9 @@ fn store_json_record<T: Serialize>(key: &str, record: &T) -> Result<(), String> 
 
 fn load_json_record<T: for<'de> Deserialize<'de>>(key: &str) -> Option<T> {
     let store = persistent_store()?;
-    let entry = store.lookup(&fingerprint_for_key(key)).ok().flatten()?;
+    let mut fp = Fingerprinter::new();
+    fp.absorb_str(b"warm-start-key", key);
+    let entry = store.lookup(&fp.finalize()).ok().flatten()?;
     if entry.payload.len() as u64 > MAX_ENTRY_BYTES {
         return None;
     }
@@ -299,12 +261,6 @@ fn persistent_store() -> Option<WarmStartStore> {
     .ok()
 }
 
-fn fingerprint_for_key(key: &str) -> crate::cache::Fingerprint {
-    let mut fp = Fingerprinter::new();
-    fp.absorb_str(b"warm-start-key", key);
-    fp.finalize()
-}
-
 /// Look up a single outer-iterate payload by string key without opening
 /// a long-lived session.
 ///
@@ -327,8 +283,9 @@ pub(crate) fn lookup_outer_iterate_payload(seed_key: &str) -> Option<crate::cach
 
 /// Open a [`crate::cache::Session`] for outer-iterate (rho-axis) checkpoints.
 ///
-/// Uses a different fingerprint tag than [`fingerprint_for_key`] so the
-/// outer-iterate keyspace is disjoint from the inner beta-record keyspace —
+/// Uses a different fingerprint tag than the inner `warm-start-key`
+/// absorption (see [`load_json_record`]) so the outer-iterate keyspace
+/// is disjoint from the inner beta-record keyspace —
 /// the two layers persist different payload shapes and must not alias.
 pub(crate) fn open_outer_session(key: &str) -> Option<std::sync::Arc<crate::cache::Session>> {
     let store = persistent_store()?;
