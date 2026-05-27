@@ -4322,12 +4322,16 @@ mod survival_flex_gpu_tests {
         };
         let score_span = LocalSpanCubic {
             left: -0.5,
+            right: 0.5,
+            c0: 0.0,
             c1: 0.13,
             c2: -0.05,
             c3: 0.02,
         };
         let link_span = LocalSpanCubic {
             left: -0.5,
+            right: 0.5,
+            c0: 0.0,
             c1: 0.09,
             c2: 0.04,
             c3: -0.01,
@@ -4467,12 +4471,16 @@ mod survival_flex_gpu_tests {
                     },
                     score_span: LocalSpanCubic {
                         left: -0.5,
+                        right: 0.5,
+                        c0: 0.0,
                         c1: 0.13,
                         c2: -0.05,
                         c3: 0.02,
                     },
                     link_span: LocalSpanCubic {
                         left: -0.5,
+                        right: 0.5,
+                        c0: 0.0,
                         c1: 0.09,
                         c2: 0.04,
                         c3: -0.01,
@@ -4489,12 +4497,16 @@ mod survival_flex_gpu_tests {
                     },
                     score_span: LocalSpanCubic {
                         left: 0.0,
+                        right: 1.0,
+                        c0: 0.0,
                         c1: 0.11,
                         c2: 0.03,
                         c3: -0.02,
                     },
                     link_span: LocalSpanCubic {
                         left: 0.0,
+                        right: 1.0,
+                        c0: 0.0,
                         c1: 0.08,
                         c2: -0.04,
                         c3: 0.015,
@@ -4594,12 +4606,16 @@ mod survival_flex_gpu_tests {
             },
             score_span: LocalSpanCubic {
                 left: -0.5,
+                right: 0.5,
+                c0: 0.0,
                 c1: 0.13,
                 c2: -0.05,
                 c3: 0.02,
             },
             link_span: LocalSpanCubic {
                 left: -0.5,
+                right: 0.5,
+                c0: 0.0,
                 c1: 0.09,
                 c2: 0.04,
                 c3: -0.01,
