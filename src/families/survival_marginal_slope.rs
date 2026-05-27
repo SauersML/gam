@@ -11115,15 +11115,21 @@ impl SurvivalMarginalSlopeFamily {
             d: self.event[row],
             dir_u: &dir_u_vec,
             dir_v: &dir_v_vec,
-                val += wi * di * (d2_r_d - d2_s_d);
-
-                // qd1 term
-                if u == primary.qd1 && v == primary.qd1 {
-                    val += wi * di * (6.0 / (qd1 * qd1 * qd1 * qd1)) * qd1_d1 * qd1_d2;
-                }
-
-                out[[u, v]] = val;
-                out[[v, u]] = val;
+            entry_base: &entry_b,
+            exit_base: &exit_b,
+            entry_ext_u: &entry_d1,
+            entry_ext_v: &entry_d2,
+            exit_ext_u: &exit_d1,
+            exit_ext_v: &exit_d2,
+            entry_bi: &entry_bi_p,
+            exit_bi: &exit_bi_p,
+        };
+        let flat = crate::gpu::survival_flex::cpu_oracle_fourth_contraction(&inputs)
+            .map_err(|e| format!("block10 fourth contraction: {e}"))?;
+        let mut out = Array2::<f64>::zeros((p, p));
+        for u in 0..p {
+            for v in 0..p {
+                out[[u, v]] = flat[u * p + v];
             }
         }
         Ok(out)
