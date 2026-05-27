@@ -348,25 +348,328 @@ pub enum FitRequest<'a> {
     TransformationNormal(TransformationNormalFitRequest<'a>),
 }
 
+/// Mechanical surface every `FitRequest` variant must expose. Centralising
+/// these here makes the per-variant logic live with the variant's data and
+/// turns the `FitRequest` impl block's case-analysis into a single dispatch
+/// macro, so adding a new family is one struct + one trait impl + one
+/// variant arm in [`family_dispatch!`]; the compiler then refuses to
+/// silently leave a ladder unupdated.
+pub trait FamilyFitRequest {
+    /// Stable, short identifier ("standard", "survival-marginal-slope", …).
+    /// Used as a `family={tag}` segment of the persistent warm-start key
+    /// and as the structured tag in `[CACHE] …` log lines.
+    const TAG: &'static str;
+
+    /// Instance accessor for [`Self::TAG`] so callers holding a `&dyn` /
+    /// generic reference (or going through [`family_dispatch!`]) can avoid
+    /// the turbofish.
+    fn tag(&self) -> &'static str {
+        Self::TAG
+    }
+
+    /// Row count of the response / design (n).
+    fn n_obs(&self) -> usize;
+
+    /// Column count of the user-facing design matrix (p_data, before
+    /// per-family basis expansion). Used in the cache-key `dims=N×D`
+    /// segment for the shape-prefix lookup.
+    fn n_cols(&self) -> usize;
+
+    /// Family-shape hash inputs (link kind, baseline, frailty, etc.) —
+    /// everything that changes the coefficient layout. Feeds the exact
+    /// cache key.
+    fn write_shape_hash(&self, h: &mut crate::solver::persistent_warm_start::StableHasher);
+
+    /// Data-independent seed-key hash inputs. Same structural identifiers
+    /// as `write_shape_hash` but with the row count deliberately *excluded*
+    /// so cross-validation folds / hyperparameter sweeps share a prefix.
+    fn write_seed_hash(&self, h: &mut crate::solver::persistent_warm_start::StableHasher);
+
+    /// Attach the primary persistent warm-start session. Default no-op for
+    /// variants like `Standard` that open their own session inside the
+    /// outer optimizer (see `solver/estimate.rs:2701`) and would otherwise
+    /// double-checkpoint.
+    fn attach_cache_session(&mut self, _session: std::sync::Arc<crate::cache::Session>) {}
+
+    /// Attach a mirror session that receives a broadcast copy of the final
+    /// `finalize` write under the seed-prefix keyspace. Default no-op for
+    /// variants without a mirror channel.
+    fn attach_cache_mirror(&mut self, _mirror: std::sync::Arc<crate::cache::Session>) {}
+}
+
+/// Enumerates every `FitRequest` variant in **one** place. Use as
+/// `family_dispatch!(expr, r => expr_using_r)`; expands to the full
+/// 10-arm match. The compiler enforces exhaustiveness here too, so adding
+/// a new variant produces a single hard error at this site (rather than
+/// silently routing through an `_` arm of a hand-written ladder).
+macro_rules! family_dispatch {
+    ($scrutinee:expr, $req:ident => $body:expr) => {
+        match $scrutinee {
+            FitRequest::Standard($req) => $body,
+            FitRequest::GaussianLocationScale($req) => $body,
+            FitRequest::BinomialLocationScale($req) => $body,
+            FitRequest::SurvivalLocationScale($req) => $body,
+            FitRequest::SurvivalTransformation($req) => $body,
+            FitRequest::BernoulliMarginalSlope($req) => $body,
+            FitRequest::SurvivalMarginalSlope($req) => $body,
+            FitRequest::LatentSurvival($req) => $body,
+            FitRequest::LatentBinary($req) => $body,
+            FitRequest::TransformationNormal($req) => $body,
+        }
+    };
+}
+
+impl<'a> FamilyFitRequest for StandardFitRequest<'a> {
+    const TAG: &'static str = "standard";
+    fn n_obs(&self) -> usize { self.y.len() }
+    fn n_cols(&self) -> usize { self.data.ncols() }
+    fn write_shape_hash(&self, h: &mut crate::solver::persistent_warm_start::StableHasher) {
+        h.write_str("standard");
+        h.write_str(&format!("{:?}", self.family));
+        h.write_usize(self.y.len());
+        h.write_usize(self.data.ncols());
+    }
+    fn write_seed_hash(&self, h: &mut crate::solver::persistent_warm_start::StableHasher) {
+        h.write_str("standard-seed");
+        h.write_str(&format!("{:?}", self.family));
+        h.write_usize(self.data.ncols());
+    }
+    // attach_cache_session: default no-op — the standard REML path opens
+    // its own session inside the outer optimizer via
+    // `reml_state.outer_cache_session()` (see `solver/estimate.rs:2701`),
+    // so the dispatcher-level session here would be a duplicate keyed on
+    // the same fingerprint.
+    // attach_cache_mirror: default no-op for the same reason.
+}
+
+impl<'a> FamilyFitRequest for GaussianLocationScaleFitRequest<'a> {
+    const TAG: &'static str = "gaussian-location-scale";
+    fn n_obs(&self) -> usize { self.spec.y.len() }
+    fn n_cols(&self) -> usize { self.data.ncols() }
+    fn write_shape_hash(&self, h: &mut crate::solver::persistent_warm_start::StableHasher) {
+        h.write_str("gauss-ls");
+        h.write_usize(self.spec.y.len());
+        h.write_usize(self.data.ncols());
+    }
+    fn write_seed_hash(&self, h: &mut crate::solver::persistent_warm_start::StableHasher) {
+        h.write_str("gauss-ls-seed");
+        h.write_usize(self.data.ncols());
+    }
+    fn attach_cache_session(&mut self, session: std::sync::Arc<crate::cache::Session>) {
+        self.options.cache_session.get_or_insert(session);
+    }
+    fn attach_cache_mirror(&mut self, mirror: std::sync::Arc<crate::cache::Session>) {
+        self.options.cache_mirror_sessions.push(mirror);
+    }
+}
+
+impl<'a> FamilyFitRequest for BinomialLocationScaleFitRequest<'a> {
+    const TAG: &'static str = "binomial-location-scale";
+    fn n_obs(&self) -> usize { self.spec.y.len() }
+    fn n_cols(&self) -> usize { self.data.ncols() }
+    fn write_shape_hash(&self, h: &mut crate::solver::persistent_warm_start::StableHasher) {
+        h.write_str("binom-ls");
+        h.write_usize(self.spec.y.len());
+        h.write_usize(self.data.ncols());
+        h.write_str(&format!("{:?}", self.spec.link_kind));
+    }
+    fn write_seed_hash(&self, h: &mut crate::solver::persistent_warm_start::StableHasher) {
+        h.write_str("binom-ls-seed");
+        h.write_usize(self.data.ncols());
+        h.write_str(&format!("{:?}", self.spec.link_kind));
+    }
+    fn attach_cache_session(&mut self, session: std::sync::Arc<crate::cache::Session>) {
+        self.options.cache_session.get_or_insert(session);
+    }
+    fn attach_cache_mirror(&mut self, mirror: std::sync::Arc<crate::cache::Session>) {
+        self.options.cache_mirror_sessions.push(mirror);
+    }
+}
+
+impl<'a> FamilyFitRequest for SurvivalLocationScaleFitRequest<'a> {
+    const TAG: &'static str = "survival-location-scale";
+    fn n_obs(&self) -> usize { self.spec.age_entry.len() }
+    fn n_cols(&self) -> usize { self.data.ncols() }
+    fn write_shape_hash(&self, h: &mut crate::solver::persistent_warm_start::StableHasher) {
+        h.write_str("surv-ls");
+        h.write_usize(self.spec.age_entry.len());
+        h.write_usize(self.data.ncols());
+        h.write_str(&format!("{:?}", self.spec.inverse_link));
+    }
+    fn write_seed_hash(&self, h: &mut crate::solver::persistent_warm_start::StableHasher) {
+        h.write_str("surv-ls-seed");
+        h.write_usize(self.data.ncols());
+        h.write_str(&format!("{:?}", self.spec.inverse_link));
+    }
+    fn attach_cache_session(&mut self, session: std::sync::Arc<crate::cache::Session>) {
+        // Request-level slot is mirrored into the spec slot so the family
+        // fit fn sees the session when it constructs its internal
+        // BlockwiseFitOptions.
+        if self.cache_session.is_none() {
+            self.cache_session = Some(session.clone());
+        }
+        if self.spec.cache_session.is_none() {
+            self.spec.cache_session = Some(session);
+        }
+    }
+    fn attach_cache_mirror(&mut self, mirror: std::sync::Arc<crate::cache::Session>) {
+        self.spec.cache_mirror_sessions.push(mirror);
+    }
+}
+
+impl<'a> FamilyFitRequest for SurvivalTransformationFitRequest<'a> {
+    const TAG: &'static str = "survival-transformation";
+    fn n_obs(&self) -> usize { self.spec.age_entry.len() }
+    fn n_cols(&self) -> usize { self.data.ncols() }
+    fn write_shape_hash(&self, h: &mut crate::solver::persistent_warm_start::StableHasher) {
+        h.write_str("surv-tn");
+        h.write_usize(self.spec.age_entry.len());
+        h.write_usize(self.data.ncols());
+        h.write_str(&format!("{:?}", self.spec.likelihood_mode));
+        h.write_str(&self.spec.time_build.basisname);
+    }
+    fn write_seed_hash(&self, h: &mut crate::solver::persistent_warm_start::StableHasher) {
+        h.write_str("surv-tn-seed");
+        h.write_usize(self.data.ncols());
+        h.write_str(&format!("{:?}", self.spec.likelihood_mode));
+        h.write_str(&self.spec.time_build.basisname);
+    }
+    fn attach_cache_session(&mut self, session: std::sync::Arc<crate::cache::Session>) {
+        // SurvivalTransformation uses WorkingModelPirlsOptions (different
+        // mechanism) for its inner solve; the cache session is parked at
+        // the request level so future wiring through
+        // `persistent_survival_transformation_key` can be unified. For now
+        // that path's own exact-match warm-start fires independently.
+        self.cache_session.get_or_insert(session);
+    }
+    // attach_cache_mirror: default no-op — the path's own
+    // `persistent_survival_transformation_key` mechanism handles
+    // exact-match warm-start; mirror finalize would be a duplicate.
+}
+
+impl<'a> FamilyFitRequest for BernoulliMarginalSlopeFitRequest<'a> {
+    const TAG: &'static str = "bernoulli-marginal-slope";
+    fn n_obs(&self) -> usize { self.spec.y.len() }
+    fn n_cols(&self) -> usize { self.data.ncols() }
+    fn write_shape_hash(&self, h: &mut crate::solver::persistent_warm_start::StableHasher) {
+        h.write_str("bern-ms");
+        h.write_usize(self.spec.y.len());
+        h.write_usize(self.data.ncols());
+        h.write_str(&format!("{:?}", self.spec.base_link));
+    }
+    fn write_seed_hash(&self, h: &mut crate::solver::persistent_warm_start::StableHasher) {
+        h.write_str("bern-ms-seed");
+        h.write_usize(self.data.ncols());
+        h.write_str(&format!("{:?}", self.spec.base_link));
+    }
+    fn attach_cache_session(&mut self, session: std::sync::Arc<crate::cache::Session>) {
+        self.options.cache_session.get_or_insert(session);
+    }
+    fn attach_cache_mirror(&mut self, mirror: std::sync::Arc<crate::cache::Session>) {
+        self.options.cache_mirror_sessions.push(mirror);
+    }
+}
+
+impl<'a> FamilyFitRequest for SurvivalMarginalSlopeFitRequest<'a> {
+    const TAG: &'static str = "survival-marginal-slope";
+    fn n_obs(&self) -> usize { self.spec.age_entry.len() }
+    fn n_cols(&self) -> usize { self.data.ncols() }
+    fn write_shape_hash(&self, h: &mut crate::solver::persistent_warm_start::StableHasher) {
+        h.write_str("surv-ms");
+        h.write_usize(self.spec.age_entry.len());
+        h.write_usize(self.data.ncols());
+        h.write_str(&format!("{:?}", self.spec.base_link));
+        h.write_str(&format!("{:?}", self.spec.frailty));
+    }
+    fn write_seed_hash(&self, h: &mut crate::solver::persistent_warm_start::StableHasher) {
+        h.write_str("surv-ms-seed");
+        h.write_usize(self.data.ncols());
+        h.write_str(&format!("{:?}", self.spec.base_link));
+        h.write_str(&format!("{:?}", self.spec.frailty));
+    }
+    fn attach_cache_session(&mut self, session: std::sync::Arc<crate::cache::Session>) {
+        self.options.cache_session.get_or_insert(session);
+    }
+    fn attach_cache_mirror(&mut self, mirror: std::sync::Arc<crate::cache::Session>) {
+        self.options.cache_mirror_sessions.push(mirror);
+    }
+}
+
+impl<'a> FamilyFitRequest for LatentSurvivalFitRequest<'a> {
+    const TAG: &'static str = "latent-survival";
+    fn n_obs(&self) -> usize { self.spec.age_entry.len() }
+    fn n_cols(&self) -> usize { self.data.ncols() }
+    fn write_shape_hash(&self, h: &mut crate::solver::persistent_warm_start::StableHasher) {
+        h.write_str("lat-surv");
+        h.write_usize(self.spec.age_entry.len());
+        h.write_usize(self.data.ncols());
+        h.write_str(&format!("{:?}", self.frailty));
+    }
+    fn write_seed_hash(&self, h: &mut crate::solver::persistent_warm_start::StableHasher) {
+        h.write_str("lat-surv-seed");
+        h.write_usize(self.data.ncols());
+        h.write_str(&format!("{:?}", self.frailty));
+    }
+    fn attach_cache_session(&mut self, session: std::sync::Arc<crate::cache::Session>) {
+        self.options.cache_session.get_or_insert(session);
+    }
+    fn attach_cache_mirror(&mut self, mirror: std::sync::Arc<crate::cache::Session>) {
+        self.options.cache_mirror_sessions.push(mirror);
+    }
+}
+
+impl<'a> FamilyFitRequest for LatentBinaryFitRequest<'a> {
+    const TAG: &'static str = "latent-binary";
+    fn n_obs(&self) -> usize { self.spec.age_entry.len() }
+    fn n_cols(&self) -> usize { self.data.ncols() }
+    fn write_shape_hash(&self, h: &mut crate::solver::persistent_warm_start::StableHasher) {
+        h.write_str("lat-bin");
+        h.write_usize(self.spec.age_entry.len());
+        h.write_usize(self.data.ncols());
+        h.write_str(&format!("{:?}", self.frailty));
+    }
+    fn write_seed_hash(&self, h: &mut crate::solver::persistent_warm_start::StableHasher) {
+        h.write_str("lat-bin-seed");
+        h.write_usize(self.data.ncols());
+        h.write_str(&format!("{:?}", self.frailty));
+    }
+    fn attach_cache_session(&mut self, session: std::sync::Arc<crate::cache::Session>) {
+        self.options.cache_session.get_or_insert(session);
+    }
+    fn attach_cache_mirror(&mut self, mirror: std::sync::Arc<crate::cache::Session>) {
+        self.options.cache_mirror_sessions.push(mirror);
+    }
+}
+
+impl<'a> FamilyFitRequest for TransformationNormalFitRequest<'a> {
+    const TAG: &'static str = "transformation-normal";
+    fn n_obs(&self) -> usize { self.response.len() }
+    fn n_cols(&self) -> usize { self.data.ncols() }
+    fn write_shape_hash(&self, h: &mut crate::solver::persistent_warm_start::StableHasher) {
+        h.write_str("tn");
+        h.write_usize(self.response.len());
+        h.write_usize(self.data.ncols());
+    }
+    fn write_seed_hash(&self, h: &mut crate::solver::persistent_warm_start::StableHasher) {
+        h.write_str("tn-seed");
+        h.write_usize(self.data.ncols());
+    }
+    fn attach_cache_session(&mut self, session: std::sync::Arc<crate::cache::Session>) {
+        self.options.cache_session.get_or_insert(session);
+    }
+    fn attach_cache_mirror(&mut self, mirror: std::sync::Arc<crate::cache::Session>) {
+        self.options.cache_mirror_sessions.push(mirror);
+    }
+}
+
 impl<'a> FitRequest<'a> {
     /// Short stable string identifying the family variant. Used as one
     /// segment of the warm-start cache key — every fit of this family
     /// shape shares the same family tag, so a hierarchical lookup can
     /// drop trailing key segments to find near-match seeds from prior
     /// fits of the same family on related data.
-    pub const fn family_tag(&self) -> &'static str {
-        match self {
-            FitRequest::Standard(_) => "standard",
-            FitRequest::GaussianLocationScale(_) => "gaussian-location-scale",
-            FitRequest::BinomialLocationScale(_) => "binomial-location-scale",
-            FitRequest::SurvivalLocationScale(_) => "survival-location-scale",
-            FitRequest::SurvivalTransformation(_) => "survival-transformation",
-            FitRequest::BernoulliMarginalSlope(_) => "bernoulli-marginal-slope",
-            FitRequest::SurvivalMarginalSlope(_) => "survival-marginal-slope",
-            FitRequest::LatentSurvival(_) => "latent-survival",
-            FitRequest::LatentBinary(_) => "latent-binary",
-            FitRequest::TransformationNormal(_) => "transformation-normal",
-        }
+    pub fn family_tag(&self) -> &'static str {
+        family_dispatch!(self, r => r.tag())
     }
 
     /// Deterministic warm-start cache key for this request.
@@ -388,81 +691,9 @@ impl<'a> FitRequest<'a> {
         // variant. Two fits with identical family-shape hashes have
         // compatible θ shapes and can warm-start from each other.
         let mut shape = crate::solver::persistent_warm_start::StableHasher::new();
-        match self {
-            FitRequest::Standard(req) => {
-                shape.write_str("standard");
-                shape.write_str(&format!("{:?}", req.family));
-                shape.write_usize(req.y.len());
-                shape.write_usize(req.data.ncols());
-            }
-            FitRequest::GaussianLocationScale(req) => {
-                shape.write_str("gauss-ls");
-                shape.write_usize(req.spec.y.len());
-                shape.write_usize(req.data.ncols());
-            }
-            FitRequest::BinomialLocationScale(req) => {
-                shape.write_str("binom-ls");
-                shape.write_usize(req.spec.y.len());
-                shape.write_usize(req.data.ncols());
-                shape.write_str(&format!("{:?}", req.spec.link_kind));
-            }
-            FitRequest::SurvivalLocationScale(req) => {
-                shape.write_str("surv-ls");
-                shape.write_usize(req.spec.age_entry.len());
-                shape.write_usize(req.data.ncols());
-                shape.write_str(&format!("{:?}", req.spec.inverse_link));
-            }
-            FitRequest::SurvivalTransformation(req) => {
-                shape.write_str("surv-tn");
-                shape.write_usize(req.spec.age_entry.len());
-                shape.write_usize(req.data.ncols());
-                shape.write_str(&format!("{:?}", req.spec.likelihood_mode));
-                shape.write_str(&req.spec.time_build.basisname);
-            }
-            FitRequest::BernoulliMarginalSlope(req) => {
-                shape.write_str("bern-ms");
-                shape.write_usize(req.spec.y.len());
-                shape.write_usize(req.data.ncols());
-                shape.write_str(&format!("{:?}", req.spec.base_link));
-            }
-            FitRequest::SurvivalMarginalSlope(req) => {
-                shape.write_str("surv-ms");
-                shape.write_usize(req.spec.age_entry.len());
-                shape.write_usize(req.data.ncols());
-                shape.write_str(&format!("{:?}", req.spec.base_link));
-                shape.write_str(&format!("{:?}", req.spec.frailty));
-            }
-            FitRequest::LatentSurvival(req) => {
-                shape.write_str("lat-surv");
-                shape.write_usize(req.spec.age_entry.len());
-                shape.write_usize(req.data.ncols());
-                shape.write_str(&format!("{:?}", req.frailty));
-            }
-            FitRequest::LatentBinary(req) => {
-                shape.write_str("lat-bin");
-                shape.write_usize(req.spec.age_entry.len());
-                shape.write_usize(req.data.ncols());
-                shape.write_str(&format!("{:?}", req.frailty));
-            }
-            FitRequest::TransformationNormal(req) => {
-                shape.write_str("tn");
-                shape.write_usize(req.response.len());
-                shape.write_usize(req.data.ncols());
-            }
-        }
+        family_dispatch!(self, r => r.write_shape_hash(&mut shape));
         let shape_hash = shape.finish_hex();
-        let (nrows, ncols) = match self {
-            FitRequest::Standard(req) => (req.y.len(), req.data.ncols()),
-            FitRequest::GaussianLocationScale(req) => (req.spec.y.len(), req.data.ncols()),
-            FitRequest::BinomialLocationScale(req) => (req.spec.y.len(), req.data.ncols()),
-            FitRequest::SurvivalLocationScale(req) => (req.spec.age_entry.len(), req.data.ncols()),
-            FitRequest::SurvivalTransformation(req) => (req.spec.age_entry.len(), req.data.ncols()),
-            FitRequest::BernoulliMarginalSlope(req) => (req.spec.y.len(), req.data.ncols()),
-            FitRequest::SurvivalMarginalSlope(req) => (req.spec.age_entry.len(), req.data.ncols()),
-            FitRequest::LatentSurvival(req) => (req.spec.age_entry.len(), req.data.ncols()),
-            FitRequest::LatentBinary(req) => (req.spec.age_entry.len(), req.data.ncols()),
-            FitRequest::TransformationNormal(req) => (req.response.len(), req.data.ncols()),
-        };
+        let (nrows, ncols) = family_dispatch!(self, r => (r.n_obs(), r.n_cols()));
         format!(
             "{}/family={}/dims={}x{}/shape={}",
             crate::solver::persistent_warm_start::cache_schema_tag(),
@@ -484,58 +715,7 @@ impl<'a> FitRequest<'a> {
     /// near-match never silently overrides a perfect match.
     pub fn cache_seed_key(&self) -> String {
         let mut shape = crate::solver::persistent_warm_start::StableHasher::new();
-        match self {
-            FitRequest::Standard(req) => {
-                shape.write_str("standard-seed");
-                shape.write_str(&format!("{:?}", req.family));
-                shape.write_usize(req.data.ncols());
-            }
-            FitRequest::GaussianLocationScale(req) => {
-                shape.write_str("gauss-ls-seed");
-                shape.write_usize(req.data.ncols());
-            }
-            FitRequest::BinomialLocationScale(req) => {
-                shape.write_str("binom-ls-seed");
-                shape.write_usize(req.data.ncols());
-                shape.write_str(&format!("{:?}", req.spec.link_kind));
-            }
-            FitRequest::SurvivalLocationScale(req) => {
-                shape.write_str("surv-ls-seed");
-                shape.write_usize(req.data.ncols());
-                shape.write_str(&format!("{:?}", req.spec.inverse_link));
-            }
-            FitRequest::SurvivalTransformation(req) => {
-                shape.write_str("surv-tn-seed");
-                shape.write_usize(req.data.ncols());
-                shape.write_str(&format!("{:?}", req.spec.likelihood_mode));
-                shape.write_str(&req.spec.time_build.basisname);
-            }
-            FitRequest::BernoulliMarginalSlope(req) => {
-                shape.write_str("bern-ms-seed");
-                shape.write_usize(req.data.ncols());
-                shape.write_str(&format!("{:?}", req.spec.base_link));
-            }
-            FitRequest::SurvivalMarginalSlope(req) => {
-                shape.write_str("surv-ms-seed");
-                shape.write_usize(req.data.ncols());
-                shape.write_str(&format!("{:?}", req.spec.base_link));
-                shape.write_str(&format!("{:?}", req.spec.frailty));
-            }
-            FitRequest::LatentSurvival(req) => {
-                shape.write_str("lat-surv-seed");
-                shape.write_usize(req.data.ncols());
-                shape.write_str(&format!("{:?}", req.frailty));
-            }
-            FitRequest::LatentBinary(req) => {
-                shape.write_str("lat-bin-seed");
-                shape.write_usize(req.data.ncols());
-                shape.write_str(&format!("{:?}", req.frailty));
-            }
-            FitRequest::TransformationNormal(req) => {
-                shape.write_str("tn-seed");
-                shape.write_usize(req.data.ncols());
-            }
-        }
+        family_dispatch!(self, r => r.write_seed_hash(&mut shape));
         format!(
             "{}/family={}/seed/{}",
             crate::solver::persistent_warm_start::cache_schema_tag(),
@@ -552,38 +732,7 @@ impl<'a> FitRequest<'a> {
     /// session path as the primary cache, so interrupted runs can still seed
     /// later related fits instead of waiting for a successful final result.
     pub fn attach_cache_mirror(&mut self, mirror: std::sync::Arc<crate::cache::Session>) {
-        match self {
-            FitRequest::Standard(_) => {}
-            FitRequest::GaussianLocationScale(req) => {
-                req.options.cache_mirror_sessions.push(mirror);
-            }
-            FitRequest::BinomialLocationScale(req) => {
-                req.options.cache_mirror_sessions.push(mirror);
-            }
-            FitRequest::SurvivalLocationScale(req) => {
-                req.spec.cache_mirror_sessions.push(mirror);
-            }
-            FitRequest::SurvivalTransformation(_) => {
-                // SurvivalTransformation uses an internal WorkingModelPirlsOptions
-                // path with its own warm-start key. Mirror finalize is a no-op
-                // here — the path's own cache fires on exact match.
-            }
-            FitRequest::BernoulliMarginalSlope(req) => {
-                req.options.cache_mirror_sessions.push(mirror);
-            }
-            FitRequest::SurvivalMarginalSlope(req) => {
-                req.options.cache_mirror_sessions.push(mirror);
-            }
-            FitRequest::LatentSurvival(req) => {
-                req.options.cache_mirror_sessions.push(mirror);
-            }
-            FitRequest::LatentBinary(req) => {
-                req.options.cache_mirror_sessions.push(mirror);
-            }
-            FitRequest::TransformationNormal(req) => {
-                req.options.cache_mirror_sessions.push(mirror);
-            }
-        }
+        family_dispatch!(self, r => <_ as FamilyFitRequest>::attach_cache_mirror(r, mirror))
     }
 
     /// Attach a warm-start cache session to this request.
@@ -593,57 +742,7 @@ impl<'a> FitRequest<'a> {
     /// field, whichever is the variant's natural slot. Idempotent —
     /// existing sessions are not overwritten so callers can pre-attach.
     pub fn attach_cache_session(&mut self, session: std::sync::Arc<crate::cache::Session>) {
-        match self {
-            FitRequest::Standard(_) => {
-                // The standard REML path opens its own session inside the
-                // outer optimizer via `reml_state.outer_cache_session()`
-                // (see `solver/estimate.rs:2701`). The session here would
-                // be a duplicate keyed on the same fingerprint, so we
-                // skip it to avoid double-checkpointing.
-            }
-            FitRequest::GaussianLocationScale(req) => {
-                req.options.cache_session.get_or_insert(session);
-            }
-            FitRequest::BinomialLocationScale(req) => {
-                req.options.cache_session.get_or_insert(session);
-            }
-            FitRequest::SurvivalLocationScale(req) => {
-                // The request-level slot is mirrored into the spec slot
-                // so the family fit fn sees the session when it
-                // constructs its internal BlockwiseFitOptions.
-                if req.cache_session.is_none() {
-                    req.cache_session = Some(session.clone());
-                }
-                if req.spec.cache_session.is_none() {
-                    req.spec.cache_session = Some(session);
-                }
-            }
-            FitRequest::SurvivalTransformation(req) => {
-                // SurvivalTransformation uses WorkingModelPirlsOptions
-                // (different mechanism) for its inner solve; the cache
-                // session here is parked at the request level so future
-                // wiring through `persistent_survival_transformation_key`
-                // can be unified. For now, the path's own
-                // `persistent_survival_transformation_key` mechanism
-                // handles exact-match warm-start.
-                req.cache_session.get_or_insert(session);
-            }
-            FitRequest::BernoulliMarginalSlope(req) => {
-                req.options.cache_session.get_or_insert(session);
-            }
-            FitRequest::SurvivalMarginalSlope(req) => {
-                req.options.cache_session.get_or_insert(session);
-            }
-            FitRequest::LatentSurvival(req) => {
-                req.options.cache_session.get_or_insert(session);
-            }
-            FitRequest::LatentBinary(req) => {
-                req.options.cache_session.get_or_insert(session);
-            }
-            FitRequest::TransformationNormal(req) => {
-                req.options.cache_session.get_or_insert(session);
-            }
-        }
+        family_dispatch!(self, r => <_ as FamilyFitRequest>::attach_cache_session(r, session))
     }
 }
 
