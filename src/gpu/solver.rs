@@ -34,7 +34,7 @@ mod cuda {
         hessian: ArrayView2<'_, f64>,
         rhs: ArrayView2<'_, f64>,
     ) -> Result<(Array2<f64>, f64), String> {
-        let (ctx, stream) = context_and_stream()?;
+        let (_, stream) = context_and_stream()?;
         let (p, p2) = hessian.dim();
         if p == 0 || p != p2 || rhs.nrows() != p {
             return Err("Cholesky solve dimension mismatch".to_string());
@@ -43,8 +43,8 @@ mod cuda {
         let solver = DnHandle::new(stream.clone()).map_err(|e| format!("cusolver init: {e}"))?;
         let h_col = to_col_major(&hessian);
         let rhs_col = to_col_major(&rhs);
-        let mut h_dev = pinned_htod(&ctx, &stream, &h_col)?;
-        let mut rhs_dev = pinned_htod(&ctx, &stream, &rhs_col)?;
+        let mut h_dev = pinned_htod(&stream, &h_col)?;
+        let mut rhs_dev = pinned_htod(&stream, &rhs_col)?;
         potrf_in_place(&solver, &stream, p, &mut h_dev)?;
         potrs_in_place(&solver, &stream, p, nrhs, &h_dev, &mut rhs_dev)?;
         let factor_col = stream
@@ -59,14 +59,14 @@ mod cuda {
     }
 
     pub(super) fn cholesky_lower(hessian: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
-        let (ctx, stream) = context_and_stream()?;
+        let (_, stream) = context_and_stream()?;
         let (p, p2) = hessian.dim();
         if p == 0 || p != p2 {
             return Err("Cholesky factorization dimension mismatch".to_string());
         }
         let solver = DnHandle::new(stream.clone()).map_err(|e| format!("cusolver init: {e}"))?;
         let h_col = to_col_major(&hessian);
-        let mut h_dev = pinned_htod(&ctx, &stream, &h_col)?;
+        let mut h_dev = pinned_htod(&stream, &h_col)?;
         potrf_in_place(&solver, &stream, p, &mut h_dev)?;
         let factor_col = stream
             .clone_dtoh(&h_dev)
@@ -108,7 +108,6 @@ mod cuda {
     pub(crate) fn pinned_htod<
         T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + Copy,
     >(
-        _ctx: &std::sync::Arc<CudaContext>,
         stream: &std::sync::Arc<cudarc::driver::CudaStream>,
         src: &[T],
     ) -> Result<CudaSlice<T>, String> {

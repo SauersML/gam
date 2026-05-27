@@ -153,7 +153,7 @@ extern "C" __global__ void chol_logdet_col_major(
             }
             let (ctx, stream) = context_and_stream()?;
             let x_col = to_col_major(&x);
-            let x_dev = pinned_htod(&ctx, &stream, &x_col)?;
+            let x_dev = pinned_htod(&stream, &x_col)?;
             // Synchronize the upload stream so the buffer is visible to
             // every workspace we hand off to. Workspaces use independent
             // streams; the upload completed on the bootstrap stream above.
@@ -512,13 +512,12 @@ extern "C" __global__ void chol_logdet_col_major(
         x: ArrayView2<'_, f64>,
         weights: ArrayView1<'_, f64>,
     ) -> Result<Array2<f64>, String> {
-        let (ctx, stream) = context_and_stream()?;
+        let (_, stream) = context_and_stream()?;
         let (n, p) = validate_design(x, weights)?;
         let blas = CudaBlas::new(stream.clone()).map_err(|e| format!("cublas init: {e}"))?;
         let x_col = to_col_major(&x);
-        let x_dev = pinned_htod(&ctx, &stream, &x_col)?;
+        let x_dev = pinned_htod(&stream, &x_col)?;
         let mut w_dev = pinned_htod(
-            &ctx,
             &stream,
             weights.as_slice().ok_or("weights must be contiguous")?,
         )?;

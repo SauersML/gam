@@ -978,7 +978,7 @@ extern "C" __global__ void reduce_q_weighted_gram(
 
         // ── 1. Upload H, factor once.
         let h_col = to_col_major(&input.penalized_hessian);
-        let mut h_dev = pinned_htod(&ctx, &stream, &h_col)
+        let mut h_dev = pinned_htod(&stream, &h_col)
             .map_err(|reason| GpuError::DriverCallFailed { reason })?;
         potrf_in_place(&solver, &stream, p, &mut h_dev)
             .map_err(|reason| GpuError::DriverCallFailed { reason })?;
@@ -1045,7 +1045,7 @@ extern "C" __global__ void reduce_q_weighted_gram(
                     );
                 };
                 let hj_col = to_col_major(matrix);
-                let hj_dev = pinned_htod(&ctx, &stream, &hj_col)
+                let hj_dev = pinned_htod(&stream, &hj_col)
                     .map_err(|reason| GpuError::DriverCallFailed { reason })?;
                 let mut y_dev = stream.alloc_zeros::<f64>(total_z).map_err(|err| {
                     GpuError::DriverCallFailed {
@@ -1103,7 +1103,7 @@ extern "C" __global__ void reduce_q_weighted_gram(
                 })?;
             let n = design.nrows();
             let design_col = to_col_major(design);
-            let x_dev = pinned_htod(&ctx, &stream, &design_col)
+            let x_dev = pinned_htod(&stream, &design_col)
                 .map_err(|reason| GpuError::DriverCallFailed { reason })?;
             let mut rz_dev = stream
                 .alloc_zeros::<f64>(n.checked_mul(k).ok_or_else(|| GpuError::DriverCallFailed {
@@ -1173,7 +1173,7 @@ extern "C" __global__ void reduce_q_weighted_gram(
                     })?;
                 a_stack.extend_from_slice(slice);
             }
-            let a_dev = pinned_htod(&ctx, &stream, &a_stack)
+            let a_dev = pinned_htod(&stream, &a_stack)
                 .map_err(|reason| GpuError::DriverCallFailed { reason })?;
             let mut q_dev = stream.alloc_zeros::<f64>(d_gram * k).map_err(|err| {
                 GpuError::DriverCallFailed {
