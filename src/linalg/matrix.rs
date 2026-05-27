@@ -3998,6 +3998,57 @@ impl DenseDesignOperator for CoefficientTransformOperator {
     }
 }
 
+/// Row-wise (Khatri–Rao) Kronecker product of two dense matrices sharing the
+/// same number of rows: `out[i, j * pb + k] = a[i, j] * b[i, k]`. Parallel
+/// across row chunks; short-circuits on zeros in `a` to skip the inner
+/// `b`-column loop when the left factor is structurally sparse.
+///
+/// Canonical home for the dense path; the operator-backed streaming variant
+/// lives on [`RowwiseKroneckerOperator`]. Survival families that need a
+/// `DesignMatrix`-typed output still use the operator wrapper because the
+/// product would otherwise materialize an `n × (p_cov · p_time)` dense block.
+pub fn dense_rowwise_kronecker(
+    a: ArrayView2<'_, f64>,
+    b: ArrayView2<'_, f64>,
+) -> Array2<f64> {
+    assert_eq!(
+        a.nrows(),
+        b.nrows(),
+        "dense_rowwise_kronecker requires matching row counts: a={}, b={}",
+        a.nrows(),
+        b.nrows()
+    );
+    let n = a.nrows();
+    let pa = a.ncols();
+    let pb = b.ncols();
+    let mut out = Array2::<f64>::zeros((n, pa * pb));
+    if n == 0 || pa == 0 || pb == 0 {
+        return out;
+    }
+    const CHUNK: usize = 1024;
+    out.axis_chunks_iter_mut(Axis(0), CHUNK)
+        .into_par_iter()
+        .enumerate()
+        .for_each(|(chunk_idx, mut out_chunk)| {
+            let start = chunk_idx * CHUNK;
+            let rows = out_chunk.nrows();
+            for local in 0..rows {
+                let i = start + local;
+                for j in 0..pa {
+                    let a_ij = a[[i, j]];
+                    if a_ij == 0.0 {
+                        continue;
+                    }
+                    let off = j * pb;
+                    for k in 0..pb {
+                        out_chunk[[local, off + k]] = a_ij * b[[i, k]];
+                    }
+                }
+            }
+        });
+    out
+}
+
 impl RowwiseKroneckerOperator {
     pub fn new(cov: DesignMatrix, time_basis: Arc<Array2<f64>>) -> Result<Self, String> {
         let n = cov.nrows();

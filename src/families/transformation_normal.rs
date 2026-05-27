@@ -44,6 +44,7 @@ use crate::families::gamlss::{
 use crate::inference::model::{TRANSFORMATION_SCORE_PIT_CLIP_EPS, TransformationScoreCalibration};
 use crate::matrix::{
     DenseDesignMatrix, DenseDesignOperator, DesignMatrix, LinearOperator, SymmetricMatrix,
+    dense_rowwise_kronecker,
 };
 use crate::pirls::LinearInequalityConstraints;
 use crate::probability::{log1mexp_positive, normal_logcdf, standard_normal_quantile};
@@ -9972,44 +9973,6 @@ fn effective_response_num_internal_knots(
 // Tensor product construction
 // ---------------------------------------------------------------------------
 
-/// Row-wise Kronecker product of two matrices (same number of rows).
-///
-/// output\[i, j * p_b + k\] = a\[i, j\] * b\[i, k\]
-fn rowwise_kronecker(a: &Array2<f64>, b: &Array2<f64>) -> Array2<f64> {
-    rowwise_kronecker_views(a.view(), b.view())
-}
-
-fn rowwise_kronecker_views(a: ArrayView2<'_, f64>, b: ArrayView2<'_, f64>) -> Array2<f64> {
-    assert_eq!(a.nrows(), b.nrows());
-    let n = a.nrows();
-    let pa = a.ncols();
-    let pb = b.ncols();
-    let mut out = Array2::<f64>::zeros((n, pa * pb));
-    {
-        use rayon::prelude::*;
-        out.axis_chunks_iter_mut(ndarray::Axis(0), 1024)
-            .into_par_iter()
-            .enumerate()
-            .for_each(|(chunk_idx, mut out_chunk)| {
-                let start = chunk_idx * 1024;
-                let rows = out_chunk.nrows();
-                for local in 0..rows {
-                    let i = start + local;
-                    for j in 0..pa {
-                        let a_ij = a[[i, j]];
-                        if a_ij == 0.0 {
-                            continue;
-                        }
-                        for k in 0..pb {
-                            out_chunk[[local, j * pb + k]] = a_ij * b[[i, k]];
-                        }
-                    }
-                }
-            });
-    }
-    out
-}
-
 fn assert_rowwise_kronecker_dimensions(n: usize, p_resp: usize, p_cov: usize, context: &str) {
     assert!(
         p_resp > 0 && p_cov > 0,
@@ -10352,7 +10315,7 @@ impl DenseDesignOperator for KroneckerDesign {
                 );
                 let left_chunk = left.slice(s![rows.clone(), ..]).to_owned();
                 let right_chunk = right.try_row_chunk(rows)?;
-                out.assign(&rowwise_kronecker(&left_chunk, &right_chunk));
+                out.assign(&dense_rowwise_kronecker(left_chunk.view(), right_chunk.view()));
             }
         }
         Ok(())
@@ -10948,7 +10911,7 @@ impl TensorKroneckerPsiOperator {
             )));
         }
         let resp = self.response_val_basis.slice(s![rows, ..]);
-        Ok(rowwise_kronecker_views(resp, cov.view()))
+        Ok(dense_rowwise_kronecker(resp, cov.view()))
     }
 
     fn materialize_cov_first_axis_uncached(
@@ -11158,7 +11121,7 @@ impl TensorKroneckerPsiOperator {
     }
 
     fn materialize_lifted(&self, resp_basis: &Array2<f64>, cov: &Array2<f64>) -> Array2<f64> {
-        rowwise_kronecker(resp_basis, cov)
+        dense_rowwise_kronecker(resp_basis.view(), cov.view())
     }
 
     /// Internal directional accumulator on a chosen response basis:
@@ -11983,7 +11946,7 @@ mod tests {
         )
         .expect("kronecker design");
 
-        let dense = rowwise_kronecker(&left, &right);
+        let dense = dense_rowwise_kronecker(left.view(), right.view());
         let expected_transpose = dense.t().dot(&v);
         let expected_gram = fast_atb(&weight_rows(&dense, &weights), &dense);
 

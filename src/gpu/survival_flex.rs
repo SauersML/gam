@@ -2563,16 +2563,8 @@ pub struct SurvivalFlexLayerCRowInputs<'a> {
 /// Inverse to a row-major upper triangle pack.
 #[inline]
 pub const fn tri_index(u: usize, v: usize, p: usize) -> usize {
-    debug_only_check_tri(u, v, p);
     let u_idx = u * (2 * p - u - 1) / 2;
     u_idx + v
-}
-
-#[inline]
-const fn debug_only_check_tri(_u: usize, _v: usize, _p: usize) {
-    // Intentional no-op: kept as a `pub const fn` sibling so that the
-    // index function compiles in const context.  In tests we exercise
-    // the index against the layout invariant directly.
 }
 
 /// Per-row Layer C-α outputs.
