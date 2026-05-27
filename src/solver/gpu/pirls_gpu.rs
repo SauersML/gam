@@ -2735,6 +2735,7 @@ mod stream_device_parity_tests {
             0.0,
             20,
             1e-9,
+            None,
         )
         .expect("pirls loop");
 
