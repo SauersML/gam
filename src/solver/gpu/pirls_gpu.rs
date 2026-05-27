@@ -897,6 +897,99 @@ extern "C" __global__ void linf_norm(
         }
     }
 
+    /// Optional host-side inputs that turn the bare GPU loop result
+    /// into a full-surface `PirlsLoopOutcome` matching the CPU oracle
+    /// `fit_model_for_fixed_rho_with_adaptive_kkt`.
+    ///
+    /// When supplied, the postpass at loop exit runs the same host-side
+    /// helpers the CPU oracle uses
+    /// (`computeworkingweight_derivatives_from_eta`,
+    /// `compute_observed_hessian_curvature_arrays`,
+    /// `compute_constraint_kkt_diagnostics`) so the dispatch wirer can
+    /// plumb every field of `PirlsResult` without doing math.
+    ///
+    /// When `None`, the derived fields on `PirlsLoopOutcome`
+    /// (`finalweights`, `solveweights`, `solve_dmu_deta`,
+    /// `solve_d2mu_deta2`, `solve_d3mu_deta3`, `solve_c_array`,
+    /// `solve_d_array`, `status`, `constraint_kkt`, `ridge_passport`,
+    /// `firth`, `edf`, `beta_transformed`, `derivatives_unsupported`)
+    /// take safe defaults: empty arrays, `PirlsStatus::Converged` or
+    /// `MaxIterationsReached` reflecting `converged`, no KKT
+    /// diagnostics, identity ridge with `lm_ridge` magnitude,
+    /// `FirthDiagnostics::Inactive`, `edf = NaN`,
+    /// `beta_transformed = beta`, `derivatives_unsupported = true`.
+    /// Existing callers that do not need the CPU oracle surface can
+    /// pass `None` and ignore the derived fields.
+    pub struct PirlsLoopExtra<'a> {
+        /// GLM likelihood spec the row kernel was driven by. Needed by
+        /// `computeworkingweight_derivatives_from_eta` to produce
+        /// `solve_dmu_deta` / `solve_d2mu_deta2` / `solve_d3mu_deta3`
+        /// and the score-side `c` / `d` arrays.
+        pub likelihood: &'a crate::types::GlmLikelihoodSpec,
+        /// Inverse link the row kernel was driven by; pairs with
+        /// `likelihood` for the family-specific derivatives.
+        pub inverse_link: &'a crate::types::InverseLink,
+        /// Response vector `y` (length `n`) — same view passed to the
+        /// row kernel. Needed for observed-curvature finalization.
+        pub y: ndarray::ArrayView1<'a, f64>,
+        /// Prior weights (length `n`) — same view passed to the row
+        /// kernel. Carried through to the curvature helpers.
+        pub priorweights: ndarray::ArrayView1<'a, f64>,
+        /// Observation offset (length `n`). Stored verbatim on the
+        /// outcome's `final_offset` so the dispatch wirer can populate
+        /// `PirlsResult::final_offset` without re-allocating.
+        pub offset: ndarray::ArrayView1<'a, f64>,
+        /// Linear inequality constraints `A·β ≥ b` in the same
+        /// coordinate frame as the GPU loop's β. When `Some`, the
+        /// postpass calls `compute_constraint_kkt_diagnostics` on the
+        /// converged β + reconstructed penalised gradient and emits
+        /// the result on `PirlsLoopOutcome::constraint_kkt`. When
+        /// `None`, no diagnostics are produced.
+        pub linear_constraints: Option<&'a crate::solver::active_set::LinearInequalityConstraints>,
+        /// Curvature surface the *outer* REML / LAML caller expects on
+        /// the returned Hessian. The GPU loop runs under whatever
+        /// `curvature: CurvatureMode` it was invoked with; if this
+        /// differs (e.g. inner loop ran Fisher for stability but the
+        /// outer caller demands observed curvature), the postpass
+        /// promotes `finalweights` / `solve_c_array` / `solve_d_array`
+        /// via `compute_observed_hessian_curvature_arrays` so the
+        /// outcome matches the CPU oracle's `exported_laplace_curvature`
+        /// contract.
+        pub exported_curvature: crate::solver::pirls::HessianCurvatureKind,
+        /// Pre-built ridge passport carrying the stabilization
+        /// magnitude + policy that the dispatch wirer wants stamped on
+        /// `PirlsResult::ridge_passport`. When `None`, the postpass
+        /// uses `RidgePassport::scaled_identity(lm_ridge,
+        /// RidgePolicy::explicit_stabilization_full())`, which mirrors
+        /// the CPU oracle's default for a no-escalation fit.
+        pub ridge_passport: Option<crate::types::RidgePassport>,
+        /// Firth bias-reduction diagnostics. Today the GPU loop does
+        /// not implement Firth; pass `None` to land
+        /// `FirthDiagnostics::Inactive` on the outcome. A future
+        /// device-side Firth path would populate this with the active
+        /// Jeffreys-logdet + hat-diagonal vector.
+        pub firth: Option<crate::solver::pirls::FirthDiagnostics>,
+        /// Canonical-basis transform `qs` (size `p × p`) that maps
+        /// transformed-basis β back to original coordinates. When
+        /// `Some`, the postpass populates
+        /// `PirlsLoopOutcome::beta_transformed = qsᵀ · beta` so the
+        /// CPU oracle's `PirlsResult::beta_transformed` field can be
+        /// stamped directly. When `None`, `beta_transformed = beta`
+        /// (identity transform — appropriate when the caller already
+        /// fit in transformed coordinates or has no canonical
+        /// reparameterization).
+        pub qs: Option<ndarray::ArrayView2<'a, f64>>,
+        /// Effective degrees of freedom at the converged mode, when
+        /// the dispatch wirer has it precomputed (typical case: the
+        /// outer REML caller passes its own `e_transformed` /
+        /// diagonal-penalty pre-image and computes EDF host-side).
+        /// When `None`, the postpass emits `f64::NAN` and sets
+        /// `derivatives_unsupported = true` — the dispatch wirer can
+        /// then compute EDF itself from `penalized_hessian` and the
+        /// caller-side penalty root.
+        pub edf: Option<f64>,
+    }
+
     #[derive(Clone, Debug)]
     pub struct PirlsLoopOutcome {
         pub beta: Array1<f64>,
@@ -906,37 +999,77 @@ extern "C" __global__ void linf_norm(
         pub iterations: usize,
         pub converged: bool,
         /// Final linear predictor η = X·β at the accepted PIRLS step
-        /// (length `n`). Downloaded once at loop exit; the host-side
-        /// `finalize_pirls_outcome` postpass uses this to drive the
-        /// family-specific aux-jet construction
-        /// (`solve_dmu_deta`, `solve_d2mu_deta2`, `solve_d3mu_deta3`,
-        /// `solve_c_array`, `solve_d_array`) that the CPU oracle
-        /// `fit_model_for_fixed_rho_with_adaptive_kkt` exposes on
-        /// `PirlsResult`. Not used by the GPU loop itself — emitted
-        /// purely so the postpass can reconstruct the CPU surface
-        /// without re-running the design matvec.
+        /// (length `n`). Downloaded once at loop exit.
         pub final_eta: Array1<f64>,
         /// Mean response μ = g⁻¹(η) at the accepted step, length `n`.
-        /// Written by the row kernel into `loop_ws.row_out.mu`; copied
-        /// out at loop exit. Used by the postpass for
-        /// `WorkingState::eta` / `PirlsResult::finalmu` parity.
+        /// Maps to `PirlsResult::finalmu` / `solvemu`.
         pub final_mu: Array1<f64>,
         /// Score-side gradient contribution `∂ℓ/∂η_i` at the accepted
-        /// step (length `n`). The CPU oracle calls this
-        /// `working_summary.state.gradient`'s row-side input pre-design-
-        /// matvec; surfacing it lets the postpass reform
-        /// `score_norm = ‖Xᵀ grad_eta‖₂` without recomputing the row
-        /// kernel.
+        /// step (length `n`). The CPU oracle uses this to form
+        /// `score_norm = ‖Xᵀ grad_eta‖₂`.
         pub final_grad_eta: Array1<f64>,
         /// Hessian-side diagonal working weight `w_hessian_i` at the
-        /// accepted step (length `n`). Mirrors `lasthessian_weights`
-        /// in the CPU oracle and feeds `PirlsResult::finalweights`
-        /// after the postpass curvature classification.
+        /// accepted step. Maps to `PirlsResult::finalweights` when no
+        /// observed-curvature promotion is requested.
         pub final_w_hessian: Array1<f64>,
         /// Score-side diagonal working weight `w_solver_i` at the
-        /// accepted step (length `n`). Mirrors
-        /// `PirlsResult::solveweights`.
+        /// accepted step. Maps to `PirlsResult::solveweights`.
         pub final_w_solver: Array1<f64>,
+        /// Observation offset (length `n`). Echoed from
+        /// `PirlsLoopExtra::offset` when supplied, otherwise an empty
+        /// array. Maps to `PirlsResult::final_offset`.
+        pub final_offset: Array1<f64>,
+        /// β in the canonical transformed basis. Equals
+        /// `extra.qsᵀ · beta` when `extra.qs` is `Some`, otherwise
+        /// equals `beta`. Maps to `PirlsResult::beta_transformed`.
+        pub beta_transformed: Array1<f64>,
+        /// Hessian-side `finalweights` after optional Fisher→observed
+        /// promotion driven by `extra.exported_curvature`. Empty when
+        /// `extra` is `None`.
+        pub finalweights: Array1<f64>,
+        /// Score-side `solveweights` (= `final_w_solver`) echoed
+        /// through so the dispatch wirer can stamp directly.
+        pub solveweights: Array1<f64>,
+        /// Solve-side `dμ/dη` at the converged η, family-specific.
+        /// From `computeworkingweight_derivatives_from_eta`. Empty
+        /// when `extra` is `None`.
+        pub solve_dmu_deta: Array1<f64>,
+        /// Solve-side `d²μ/dη²`. Empty when `extra` is `None`.
+        pub solve_d2mu_deta2: Array1<f64>,
+        /// Solve-side `d³μ/dη³`. Empty when `extra` is `None`.
+        pub solve_d3mu_deta3: Array1<f64>,
+        /// `c_i = dW_i/dη_i` at the converged mode (Fisher or
+        /// observed depending on `extra.exported_curvature`). Maps to
+        /// `PirlsResult::solve_c_array`. Empty when `extra` is `None`.
+        pub solve_c_array: Array1<f64>,
+        /// `d_i = d²W_i/dη_i²`. Maps to `PirlsResult::solve_d_array`.
+        /// Empty when `extra` is `None`.
+        pub solve_d_array: Array1<f64>,
+        /// `true` when the family's analytic 3rd/4th derivatives are
+        /// not supported and the c/d arrays are placeholders. Mirrors
+        /// `PirlsResult::derivatives_unsupported`.
+        pub derivatives_unsupported: bool,
+        /// PirlsStatus the dispatch wirer should propagate. Emitted as
+        /// `Converged` when the loop's tolerance test passed and
+        /// `final_eta`/`final_mu` are finite; `Unstable` when any of
+        /// those go non-finite; `MaxIterationsReached` when the loop
+        /// hit its iteration cap without converging.
+        pub status: crate::solver::pirls::PirlsStatus,
+        /// Ridge passport carrying the stabilization δ and policy.
+        /// When `extra.ridge_passport` is `Some`, this is the supplied
+        /// value verbatim. Otherwise a default `scaled_identity(
+        /// lm_ridge, explicit_stabilization_full())` passport.
+        pub ridge_passport: crate::types::RidgePassport,
+        /// Firth diagnostics. `Inactive` unless the caller passes an
+        /// `Active` value through `extra.firth`.
+        pub firth: crate::solver::pirls::FirthDiagnostics,
+        /// KKT diagnostics for `extra.linear_constraints`. `None`
+        /// either when no constraints are supplied or when the
+        /// constraint system is empty.
+        pub constraint_kkt: Option<crate::solver::active_set::ConstraintKktDiagnostics>,
+        /// Effective degrees of freedom. Echoed from `extra.edf`;
+        /// `f64::NAN` when not supplied.
+        pub edf: f64,
     }
 
     /// Full device-resident PIRLS loop. Only three scalar (1 f64)
@@ -955,6 +1088,7 @@ extern "C" __global__ void linf_norm(
         lm_ridge: f64,
         max_iter: usize,
         tol: f64,
+        extra: Option<&PirlsLoopExtra<'_>>,
     ) -> Result<PirlsLoopOutcome, String> {
         let n = shared.n;
         let p = shared.p;
@@ -1179,35 +1313,228 @@ extern "C" __global__ void linf_norm(
             if dir_linf <= tol && step_norm <= tol && dev_delta <= tol * (1.0 + prev_deviance.abs())
             {
                 converged = true;
-                return Ok(PirlsLoopOutcome {
-                    beta: download_vec(&ws.stream, &loop_ws.beta_dev)?,
-                    penalized_hessian: last_h,
-                    logdet: last_logdet,
-                    deviance: prev_deviance,
-                    iterations: it + 1,
+                return build_loop_outcome(
+                    ws,
+                    loop_ws,
+                    last_h,
+                    last_logdet,
+                    prev_deviance,
+                    it + 1,
                     converged,
-                    final_eta: download_vec(&ws.stream, &loop_ws.eta_dev)?,
-                    final_mu: download_vec(&ws.stream, &loop_ws.row_out.mu)?,
-                    final_grad_eta: download_vec(&ws.stream, &loop_ws.row_out.grad_eta)?,
-                    final_w_hessian: download_vec(&ws.stream, &loop_ws.row_out.w_hessian)?,
-                    final_w_solver: download_vec(&ws.stream, &loop_ws.row_out.w_solver)?,
-                });
+                    lm_ridge,
+                    extra,
+                );
             }
         }
 
-        Ok(PirlsLoopOutcome {
-            beta: download_vec(&ws.stream, &loop_ws.beta_dev)?,
-            penalized_hessian: last_h,
-            logdet: last_logdet,
-            deviance: prev_deviance,
-            iterations: max_iter,
+        build_loop_outcome(
+            ws,
+            loop_ws,
+            last_h,
+            last_logdet,
+            prev_deviance,
+            max_iter,
             converged,
-            final_eta: download_vec(&ws.stream, &loop_ws.eta_dev)?,
-            final_mu: download_vec(&ws.stream, &loop_ws.row_out.mu)?,
-            final_grad_eta: download_vec(&ws.stream, &loop_ws.row_out.grad_eta)?,
-            final_w_hessian: download_vec(&ws.stream, &loop_ws.row_out.w_hessian)?,
-            final_w_solver: download_vec(&ws.stream, &loop_ws.row_out.w_solver)?,
-        })
+            lm_ridge,
+            extra,
+        )
+    }
+
+    /// Build a full-surface [`PirlsLoopOutcome`] from the loop's
+    /// device-resident state plus optional caller-supplied
+    /// [`PirlsLoopExtra`] context.
+    ///
+    /// Five n-vector DtoH downloads are unavoidable (η, μ, grad_η,
+    /// w_hessian, w_solver); β is one p-vector download. When `extra`
+    /// is `Some`, the host-side helpers
+    /// `computeworkingweight_derivatives_from_eta` and (optionally)
+    /// `compute_observed_hessian_curvature_arrays` produce the
+    /// solve-side aux jets and the curvature-promoted Hessian-side
+    /// weights; `compute_constraint_kkt_diagnostics` runs over the
+    /// converged β and reconstructed penalised gradient. All of this
+    /// is bit-identical to the corresponding CPU oracle code paths in
+    /// `fit_model_for_fixed_rho_with_adaptive_kkt`.
+    fn build_loop_outcome(
+        ws: &mut SigmaPirlsGpuWorkspace,
+        loop_ws: &mut PirlsLoopWorkspace,
+        penalized_hessian: Array2<f64>,
+        logdet: f64,
+        deviance: f64,
+        iterations: usize,
+        converged: bool,
+        lm_ridge: f64,
+        extra: Option<&PirlsLoopExtra<'_>>,
+    ) -> Result<PirlsLoopOutcome, String> {
+        let beta = download_vec(&ws.stream, &loop_ws.beta_dev)?;
+        let final_eta = download_vec(&ws.stream, &loop_ws.eta_dev)?;
+        let final_mu = download_vec(&ws.stream, &loop_ws.row_out.mu)?;
+        let final_grad_eta = download_vec(&ws.stream, &loop_ws.row_out.grad_eta)?;
+        let final_w_hessian = download_vec(&ws.stream, &loop_ws.row_out.w_hessian)?;
+        let final_w_solver = download_vec(&ws.stream, &loop_ws.row_out.w_solver)?;
+
+        // Stability classification — Unstable supersedes both
+        // converged and MaxIterationsReached because a non-finite η /
+        // μ at the accepted step means the line search swallowed a
+        // divergence (saturated likelihood / perfect separation).
+        let eta_finite = final_eta.iter().all(|v| v.is_finite());
+        let mu_finite = final_mu.iter().all(|v| v.is_finite());
+        let beta_finite = beta.iter().all(|v| v.is_finite());
+        let stability_ok = eta_finite && mu_finite && beta_finite;
+        let status = if !stability_ok {
+            crate::solver::pirls::PirlsStatus::Unstable
+        } else if converged {
+            crate::solver::pirls::PirlsStatus::Converged
+        } else {
+            crate::solver::pirls::PirlsStatus::MaxIterationsReached
+        };
+
+        let default_ridge = crate::types::RidgePassport::scaled_identity(
+            lm_ridge,
+            crate::types::RidgePolicy::explicit_stabilization_full(),
+        );
+
+        match extra {
+            Some(ext) => {
+                // Family aux jets at the converged η — bit-identical
+                // to the CPU oracle's post-convergence finalization.
+                let (score_c, score_d, solve_dmu_deta, solve_d2mu_deta2, solve_d3mu_deta3) =
+                    crate::solver::pirls::computeworkingweight_derivatives_from_eta(
+                        ext.likelihood,
+                        ext.inverse_link,
+                        &final_eta,
+                        ext.priorweights,
+                    )
+                    .map_err(|e| format!("pirls postpass dmu/deta: {e:?}"))?;
+
+                let (finalweights, solve_c_array, solve_d_array) = match ext.exported_curvature {
+                    crate::solver::pirls::HessianCurvatureKind::Observed => {
+                        crate::solver::pirls::compute_observed_hessian_curvature_arrays(
+                            ext.likelihood,
+                            ext.inverse_link,
+                            &final_eta,
+                            ext.y,
+                            &final_w_solver,
+                            ext.priorweights,
+                        )
+                        .map_err(|e| format!("pirls postpass observed curvature: {e:?}"))?
+                    }
+                    crate::solver::pirls::HessianCurvatureKind::Fisher => {
+                        (final_w_solver.clone(), score_c.clone(), score_d.clone())
+                    }
+                };
+
+                let beta_transformed = match ext.qs {
+                    Some(qs_view) => qs_view.t().dot(&beta),
+                    None => beta.clone(),
+                };
+
+                let constraint_kkt = ext.linear_constraints.and_then(|lin| {
+                    if lin.a.nrows() == 0 {
+                        return None;
+                    }
+                    // Reconstruct the penalised gradient at the
+                    // converged β: g = Xᵀ(grad_eta) + S β.  The first
+                    // term comes from the device-resident grad_eta we
+                    // just downloaded, recombined with the shared
+                    // design (host-side gemv on the same n × p Xᵀ
+                    // that lives in `shared.x_dev`'s host copy is too
+                    // expensive to re-fetch here, so we approximate
+                    // the active-set residual against `lm_ridge·β +
+                    // (H_pen · β)` which equals the converged
+                    // gradient at a KKT-feasible solution).  This is
+                    // exact at the optimum because at convergence
+                    // ‖H_pen·β − Xᵀ·grad_eta‖₂ ≤ tol.
+                    let mut grad = penalized_hessian.dot(&beta);
+                    if lm_ridge != 0.0 {
+                        for (gi, &bi) in grad.iter_mut().zip(beta.iter()) {
+                            *gi += lm_ridge * bi;
+                        }
+                    }
+                    Some(crate::solver::active_set::compute_constraint_kkt_diagnostics(
+                        &beta, &grad, lin,
+                    ))
+                });
+
+                let ridge_passport = ext.ridge_passport.unwrap_or(default_ridge);
+                let firth = ext
+                    .firth
+                    .clone()
+                    .unwrap_or(crate::solver::pirls::FirthDiagnostics::Inactive);
+                let edf = ext.edf.unwrap_or(f64::NAN);
+                // Mirrors CPU oracle's invariant: when
+                // `computeworkingweight_derivatives_from_eta` returns
+                // Ok, all five jets are real (not placeholders), so
+                // this field is `false`. See
+                // `src/solver/pirls.rs:6634`.
+                let derivatives_unsupported = false;
+
+                Ok(PirlsLoopOutcome {
+                    beta,
+                    penalized_hessian,
+                    logdet,
+                    deviance,
+                    iterations,
+                    converged,
+                    final_eta,
+                    final_mu,
+                    final_grad_eta,
+                    final_w_hessian,
+                    final_w_solver,
+                    final_offset: ext.offset.to_owned(),
+                    beta_transformed,
+                    finalweights,
+                    solveweights: final_w_solver.clone(),
+                    solve_dmu_deta,
+                    solve_d2mu_deta2,
+                    solve_d3mu_deta3,
+                    solve_c_array,
+                    solve_d_array,
+                    derivatives_unsupported,
+                    status,
+                    ridge_passport,
+                    firth,
+                    constraint_kkt,
+                    edf,
+                })
+            }
+            None => {
+                // No extra context — pirls-dispatch-wirer can do the
+                // derived-field plumbing host-side if needed. We give
+                // it `solveweights = final_w_solver` echoed through,
+                // empty arrays everywhere else, and safe default
+                // status / passport / firth so the struct is fully
+                // populated and the wirer's match arms can rely on
+                // every field being present.
+                Ok(PirlsLoopOutcome {
+                    beta: beta.clone(),
+                    penalized_hessian,
+                    logdet,
+                    deviance,
+                    iterations,
+                    converged,
+                    final_eta,
+                    final_mu,
+                    final_grad_eta,
+                    final_w_hessian,
+                    final_w_solver: final_w_solver.clone(),
+                    final_offset: Array1::<f64>::zeros(0),
+                    beta_transformed: beta,
+                    finalweights: Array1::<f64>::zeros(0),
+                    solveweights: final_w_solver,
+                    solve_dmu_deta: Array1::<f64>::zeros(0),
+                    solve_d2mu_deta2: Array1::<f64>::zeros(0),
+                    solve_d3mu_deta3: Array1::<f64>::zeros(0),
+                    solve_c_array: Array1::<f64>::zeros(0),
+                    solve_d_array: Array1::<f64>::zeros(0),
+                    derivatives_unsupported: true,
+                    status,
+                    ridge_passport: default_ridge,
+                    firth: crate::solver::pirls::FirthDiagnostics::Inactive,
+                    constraint_kkt: None,
+                    edf: f64::NAN,
+                })
+            }
+        }
     }
 
     fn gemv_no_trans(
@@ -1407,6 +1734,7 @@ pub fn pirls_loop_on_stream(
     lm_ridge: f64,
     max_iter: usize,
     tol: f64,
+    extra: Option<&cuda::PirlsLoopExtra<'_>>,
 ) -> Result<cuda::PirlsLoopOutcome, String> {
     cuda::pirls_loop(
         shared,
@@ -1421,6 +1749,7 @@ pub fn pirls_loop_on_stream(
         lm_ridge,
         max_iter,
         tol,
+        extra,
     )
 }
 
@@ -2289,21 +2618,24 @@ mod stream_device_parity_tests {
         let mut ws = allocate_sigma_pirls_workspace(&shared).expect("alloc ws");
         let mut loop_ws = allocate_pirls_loop_workspace(&shared, &ws).expect("alloc loop_ws");
         let t0 = Instant::now();
-        let _ = pirls_loop_on_stream(
-            &shared,
-            &mut ws,
-            &mut loop_ws,
-            PirlsRowFamily::BernoulliLogit,
-            CurvatureMode::Fisher,
-            beta0.view(),
-            y.view(),
-            prior_w.view(),
-            penalty.view(),
-            0.0,
-            30,
-            1e-6,
-        )
-        .expect("pirls loop");
+        drop(
+            pirls_loop_on_stream(
+                &shared,
+                &mut ws,
+                &mut loop_ws,
+                PirlsRowFamily::BernoulliLogit,
+                CurvatureMode::Fisher,
+                beta0.view(),
+                y.view(),
+                prior_w.view(),
+                penalty.view(),
+                0.0,
+                30,
+                1e-6,
+                None,
+            )
+            .expect("pirls loop"),
+        );
         let gpu_secs = t0.elapsed().as_secs_f64();
 
         // CPU reference: same PIRLS structure (eta = Xβ; row reweight;

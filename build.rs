@@ -924,6 +924,7 @@ fn compute_test_mask(content: &str, rel: &Path) -> Vec<bool> {
     let file_is_test = rel_str.starts_with("tests/")
         || rel_str.starts_with("bench/")
         || rel_str.starts_with("benches/")
+        || rel_str.starts_with("examples/")
         || path_matches_crates_test(&rel_str);
     if file_is_test {
         mask.fill(true);
