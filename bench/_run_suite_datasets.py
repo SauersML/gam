@@ -18,6 +18,19 @@ _SYNTHETIC_PC_PANEL_ROWS_PER_SUBPOP = 40
 _SYNTHETIC_PC_PANEL: pd.DataFrame | None = None
 
 
+def configure(context: dict[str, typing.Any]) -> None:
+    # Loaded via bench/run_suite.py's `_import_run_suite_exports`, which
+    # invokes this hook with the caller's globals so cross-module names
+    # (`os`, `subprocess`, `tempfile`, `sys`, `threading`, `disk_usage`,
+    # `monotonic`, `Fold`, the `HEARTBEAT_*` constants, the `_print_stderr` /
+    # `_write_stream` helpers) resolve at call time. The other three
+    # _run_suite_*.py helpers ship the same hook; without it, every function
+    # below that touches one of those names raises `NameError` the moment
+    # CI exercises the corresponding path (e.g. `bench_run_suite_mapping`
+    # tests that drive `run_suite.main` end-to-end).
+    globals().update(context)
+
+
 _GAMFIT_RUST_MODULE: typing.Any | None = None
 
 
@@ -641,6 +654,34 @@ def _survival_eval_horizon(train_df: pd.DataFrame, time_col: str) -> float:
     if (not np.isfinite(horizon)) or horizon <= 0.0:
         horizon = 1.0
     return horizon
+
+
+def _rust_survival_fit_options_for_scenario(scenario_name: typing.Any) -> typing.Any:
+    # Survival time effects must use a structurally monotone basis so the
+    # fitted cumulative baseline cannot violate survival semantics.
+    if scenario_name in {"icu_survival_death", "icu_survival_los"}:
+        return {
+            "time_basis": "ispline",
+            "time_degree": 3,
+            "time_num_internal_knots": 10,
+            "time_smooth_lambda": 5e-2,
+            "ridge_lambda": 1e-6,
+        }
+    if scenario_name in {"heart_failure_survival", "cirrhosis_survival"}:
+        return {
+            "time_basis": "ispline",
+            "time_degree": 3,
+            "time_num_internal_knots": 8,
+            "time_smooth_lambda": 1e-2,
+            "ridge_lambda": 1e-6,
+        }
+    return {
+        "time_basis": "ispline",
+        "time_degree": 3,
+        "time_num_internal_knots": 8,
+        "time_smooth_lambda": 1e-2,
+        "ridge_lambda": 1e-6,
+    }
 
 
 def _rust_survival_fit_cli_args(scenario_name: str) -> list[str]:
