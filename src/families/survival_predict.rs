@@ -36,7 +36,7 @@ use crate::solver::estimate::{BlockRole, FittedBlock, FittedLinkState, UnifiedFi
 use crate::solver::mixture_link::inverse_link_jet_for_inverse_link;
 use crate::term_builder::resolve_role_col;
 use crate::terms::smooth::{TermCollectionSpec, build_term_collection_design};
-use crate::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily};
+use crate::types::{InverseLink, LikelihoodSpec, LinkFunction, StandardLink, ResponseFamily};
 
 /// Smallest positive survival probability we admit before taking
 /// `-ln(S)` for the cumulative hazard. Using `f64::MIN_POSITIVE` (≈ 2.2e-308)

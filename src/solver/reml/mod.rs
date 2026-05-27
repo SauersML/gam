@@ -332,7 +332,7 @@ mod tests {
     use crate::solver::outer_strategy::{HessianResult, OuterEval};
     use crate::terms::basis::{ImplicitDesignPsiDerivative, RadialScalarKind};
     use crate::types::{
-        GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily,
+        GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkFunction, StandardLink, ResponseFamily,
     };
     use faer::Side;
     use ndarray::{Array1, Array2, array, s};

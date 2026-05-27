@@ -1,6 +1,6 @@
 use gam::estimate::{FitOptions, fit_gam};
 use gam::smooth::BlockwisePenalty;
-use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily};
+use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, StandardLink, ResponseFamily};
 use ndarray::{Array1, Array2, array};
 
 fn base_options() -> FitOptions {

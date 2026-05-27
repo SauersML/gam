@@ -37,7 +37,7 @@ use crate::solver::mixture_link::{
     InverseLinkKernel, LinkParamPartials, inverse_link_jet_for_inverse_link, softmax_last_fixedzero,
 };
 use crate::types::{
-    InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily, RhoPrior, is_valid_tweedie_power,
+    InverseLink, LikelihoodSpec, LinkFunction, StandardLink, ResponseFamily, RhoPrior, is_valid_tweedie_power,
 };
 use crate::visualizer::VisualizerSession;
 use faer::Side;

@@ -14,7 +14,7 @@ use crate::solver::persistent_warm_start::{
     PersistentWarmStartRecord, load_record, store_record,
 };
 use crate::types::{
-    GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily, RhoPrior,
+    GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkFunction, StandardLink, ResponseFamily, RhoPrior,
     SasLinkState,
 };
 use std::collections::{HashMap, VecDeque};

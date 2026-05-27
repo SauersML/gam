@@ -6,7 +6,7 @@ use gam::{
         ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, SpatialLengthScaleOptimizationOptions,
         TermCollectionSpec,
     },
-    types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily},
+    types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily, StandardLink},
 };
 use ndarray::{Array1, Array2};
 

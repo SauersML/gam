@@ -4,7 +4,7 @@ use gam::construction::CanonicalPenalty;
 use gam::faer_ndarray::{FaerArrayView, FaerColView, factorize_symmetricwith_fallback, fast_ata};
 use gam::pirls::{self, PenaltyConfig, PirlsConfig, PirlsProblem};
 use gam::types::{
-    GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkFunction, LogSmoothingParamsView,
+    GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkFunction, StandardLink, LogSmoothingParamsView,
     ResponseFamily,
 };
 use ndarray::{Array1, Array2, Axis};

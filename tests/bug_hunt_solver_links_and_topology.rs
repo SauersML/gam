@@ -5,7 +5,7 @@ use gam::topology_selector::{
     AutoTopologyKind, TopologyAutoFitEvidence, TopologyAutoSelector, select_topology_with_fit,
 };
 use gam::types::{
-    InverseLink, LikelihoodSpec, LinkComponent, LinkFunction, MixtureLinkSpec, ResponseFamily,
+    InverseLink, LikelihoodSpec, LinkComponent, LinkFunction, StandardLink, MixtureLinkSpec, ResponseFamily,
     SasLinkSpec,
 };
 use ndarray::array;

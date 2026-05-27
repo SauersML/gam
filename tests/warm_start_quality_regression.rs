@@ -26,7 +26,7 @@ use gam::construction::CanonicalPenalty;
 use gam::estimate::PenaltySpec;
 use gam::pirls::{PenaltyConfig, PirlsConfig, PirlsProblem, PirlsStatus, fit_model_for_fixed_rho};
 use gam::types::{
-    Coefficients, GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkFunction,
+    Coefficients, GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkFunction, StandardLink,
     LogSmoothingParamsView, ResponseFamily,
 };
 use ndarray::{Array1, Array2, array};

@@ -3,7 +3,7 @@ use gam::pirls::update_glmvectors_by_family;
 use gam::predict::predict_gam;
 use gam::probability::normal_cdf;
 use gam::smooth::BlockwisePenalty;
-use gam::types::{GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily};
+use gam::types::{GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkFunction, StandardLink, ResponseFamily};
 use ndarray::{Array1, Array2};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};

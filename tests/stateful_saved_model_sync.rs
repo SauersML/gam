@@ -9,7 +9,7 @@ use gam::inference::model::{
 };
 use gam::pirls::PirlsStatus;
 use gam::types::{
-    InverseLink, LatentCLogLogState, LikelihoodScaleMetadata, LikelihoodSpec, LinkFunction,
+    InverseLink, LatentCLogLogState, LikelihoodScaleMetadata, LikelihoodSpec, LinkFunction, StandardLink,
     LogLikelihoodNormalization, ResponseFamily, SasLinkState,
 };
 use ndarray::{Array1, Array2};

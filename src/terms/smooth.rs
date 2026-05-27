@@ -45,7 +45,7 @@ use crate::mixture_link::{
 use crate::pirls::LinearInequalityConstraints;
 use crate::resource::MatrixMaterializationError;
 use crate::types::{
-    InverseLink, LatentCLogLogState, LikelihoodSpec, LinkFunction, MixtureLinkState,
+    InverseLink, LatentCLogLogState, LikelihoodSpec, LinkFunction, StandardLink, MixtureLinkState,
     ResponseFamily, SasLinkState,
 };
 use crate::util::quantile::quantile_from_sorted;

@@ -1989,7 +1989,7 @@ pub fn sas_inverse_link_jetwith_param_partials(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{InverseLink, LinkComponent, LinkFunction, MixtureLinkSpec, SasLinkState};
+    use crate::types::{InverseLink, LinkComponent, LinkFunction, StandardLink, MixtureLinkSpec, SasLinkState};
 
     #[test]
     fn softmax_jacobian_matchesfd() {

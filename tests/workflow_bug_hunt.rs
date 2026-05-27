@@ -1,7 +1,7 @@
 use gam::inference::data::EncodedDataset;
 use gam::inference::formula_dsl::parse_link_choice;
 use gam::inference::model::{ColumnKindTag, DataSchema, SchemaColumn};
-use gam::types::{InverseLink, LinkFunction, ResponseFamily};
+use gam::types::{InverseLink, LinkFunction, StandardLink, ResponseFamily};
 use gam::{FitConfig, FitRequest, materialize, resolve_family};
 use ndarray::{Array2, array};
 
