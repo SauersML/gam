@@ -3113,7 +3113,7 @@ fn solve_newton_direction_dense_with_factor(
                 .map_err(EstimationError::InvalidInput)?;
         direction_out.assign(&solved.column(0));
         direction_out.mapv_inplace(|v| -v);
-        if array1_is_finite(direction_out) {
+        if array_is_finite(direction_out) {
             log::info!(
                 "[STAGE] PIRLS dense newton solve backend=CUDA p={} flops~{} elapsed={:.3}s route=\"cuSOLVER potrf/potrs\"",
                 p,
@@ -3169,7 +3169,7 @@ fn solve_newton_direction_dense_with_factor(
             return Ok(Some(factor));
         }
     }
-    if array1_is_finite(direction_out) {
+    if array_is_finite(direction_out) {
         log::info!(
             "[STAGE] PIRLS dense newton solve backend=CPU p={} flops~{} elapsed={:.3}s route=\"{}\"",
             p,
@@ -3309,7 +3309,7 @@ where
 
     direction_out.assign(&solution);
     direction_out.mapv_inplace(|v| -v);
-    if !array1_is_finite(direction_out) {
+    if !array_is_finite(direction_out) {
         return Err(EstimationError::LinearSystemSolveFailed(
             FaerLinalgError::FactorizationFailed {
                 context: "PIRLS implicit PCG non-finite direction",
@@ -3841,7 +3841,7 @@ fn solve_subsystem_direction(
         let mut rhs = array1_to_col_matmut(out);
         factor.solve_in_place(rhs.as_mut());
         out.mapv_inplace(|v| -v);
-        if array1_is_finite(out) {
+        if array_is_finite(out) {
             return Ok(());
         }
     }
@@ -3863,7 +3863,7 @@ fn solve_subsystem_direction(
             let mut rhs = array1_to_col_matmut(out);
             factor.solve_in_place(rhs.as_mut());
             out.mapv_inplace(|v| -v);
-            if array1_is_finite(out) {
+            if array_is_finite(out) {
                 return Ok(());
             }
         }
@@ -4527,7 +4527,7 @@ where
             for i in 0..len {
                 self.beta_accel[i] = beta_new[i] - alpha * (self.dx[i] + self.dr[i]);
             }
-            if !array1_is_finite(&self.beta_accel) {
+            if !array_is_finite(&self.beta_accel) {
                 return None;
             }
             // The caller copies this borrow into its candidate buffer before the next AA mutation.
@@ -5167,7 +5167,7 @@ where
                 }
             };
             lm_solve_total += attempt_solve_start.elapsed();
-            if !array1_is_finite(direction) {
+            if !array_is_finite(direction) {
                 if lm_can_retry(loop_lambda) {
                     loop_lambda *= madsen_reject_factor;
                     madsen_reject_factor *= 2.0;
@@ -5237,10 +5237,10 @@ where
                         k_rhs.scaled_add(-2.0, &state.gradient);
                         k_rhs.mapv_inplace(|v| v / (GEODESIC_FD_H * GEODESIC_FD_H));
 
-                        if array1_is_finite(&k_rhs) {
+                        if array_is_finite(&k_rhs) {
                             let mut delta2 = Array1::<f64>::zeros(beta.len());
                             solve_direction_with_dense_factor(factor, &k_rhs, &mut delta2);
-                            if array1_is_finite(&delta2) {
+                            if array_is_finite(&delta2) {
                                 let d2_norm = array1_l2_norm(&delta2);
                                 if d2_norm.is_finite()
                                     && d2_norm <= GEODESIC_ACCEPT_ALPHA * dir_norm
@@ -5254,7 +5254,7 @@ where
             }
             // Re-borrow after the geodesic block (which may have written
             // δp₂ into `newton_direction`). NLL ended the previous
-            // `direction` borrow at `array1_is_finite(direction)` above,
+            // `direction` borrow at `array_is_finite(direction)` above,
             // so this fresh borrow is the one downstream code reads.
             let direction: &Array1<f64> = &newton_direction;
 
@@ -5334,7 +5334,7 @@ where
                     {
                         project_coefficients_to_lower_bounds(&mut candidate_buf, lb);
                     }
-                    if array1_is_finite(&candidate_buf) {
+                    if array_is_finite(&candidate_buf) {
                         aa_attempt = true;
                     }
                 }
@@ -8051,7 +8051,7 @@ fn solve_penalized_least_squares_implicit(
         .map_err(EstimationError::LinearSystemSolveFailed)?;
     let mut rhsview = array1_to_col_matmut(&mut workspace.rhs_full);
     factor.solve_in_place(rhsview.as_mut());
-    if !array1_is_finite(&workspace.rhs_full) {
+    if !array_is_finite(&workspace.rhs_full) {
         return Err(EstimationError::LinearSystemSolveFailed(
             FaerLinalgError::FactorizationFailed {
                 context: "PIRLS implicit PLS non-finite solve",
@@ -11246,7 +11246,7 @@ fn calculate_edfwithworkspace(
     }
     if workspace.final_aug_matrix.nrows() == p
         && workspace.final_aug_matrix.ncols() == r
-        && array2_is_finite(&workspace.final_aug_matrix)
+        && array_is_finite(&workspace.final_aug_matrix)
     {
         return Ok(edf_from_solution(p, r, mp, e_transformed, |i, j| {
             workspace.final_aug_matrix[(i, j)]

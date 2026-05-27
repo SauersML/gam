@@ -1,6 +1,6 @@
 use crate::estimate::EstimationError;
 use crate::faer_ndarray::{FaerArrayView, FaerLinalgError, FaerSvd, array1_to_col_matmut};
-use crate::linalg::utils::{StableSolver, boundary_hit_step_fraction};
+use crate::linalg::utils::{StableSolver, array_is_finite, boundary_hit_step_fraction};
 use faer::linalg::solvers::{Lblt as FaerLblt, Solve as FaerSolve};
 use faer::{Side, Unbind};
 use ndarray::{Array1, Array2, s};
@@ -108,7 +108,7 @@ fn solve_newton_direction_dense(
     let mut rhsview = array1_to_col_matmut(direction_out);
     factor.solve_in_place(rhsview.as_mut());
     direction_out.mapv_inplace(|v| -v);
-    if array1_is_finite(direction_out) {
+    if array_is_finite(direction_out) {
         return Ok(());
     }
     Err(EstimationError::LinearSystemSolveFailed(
@@ -153,7 +153,7 @@ fn solve_dense_system_via_pseudoinverse(
         }
     }
     let solution = vt.t().dot(&coeff);
-    if !array1_is_finite(&solution) {
+    if !array_is_finite(&solution) {
         return Err(EstimationError::InvalidInput(
             "dense pseudoinverse solve produced non-finite values".to_string(),
         ));
@@ -262,7 +262,7 @@ pub(crate) fn project_stationarity_residual_on_constraint_cone(
         let Some(entering) = entering else {
             lambda.mapv_inplace(|v| if v > tol { v } else { 0.0 });
             projected = residual - &active_a.t().dot(&lambda);
-            if !array1_is_finite(&projected) || !array1_is_finite(&lambda) {
+            if !array_is_finite(&projected) || !array_is_finite(&lambda) {
                 return None;
             }
             return Some((projected, lambda));
@@ -285,7 +285,7 @@ pub(crate) fn project_stationarity_residual_on_constraint_cone(
             let rhs = a_passive.dot(residual);
             let mut lambda_passive = Array1::<f64>::zeros(passive_rows.len());
             solve_dense_system_via_pseudoinverse(&gram, &rhs, &mut lambda_passive).ok()?;
-            if !array1_is_finite(&lambda_passive) {
+            if !array_is_finite(&lambda_passive) {
                 return None;
             }
 
@@ -798,7 +798,7 @@ fn fallback_projected_gradient_direction(
         direction
     };
 
-    if !array1_is_finite(&tangent_direction) {
+    if !array_is_finite(&tangent_direction) {
         return Ok(None);
     }
 
