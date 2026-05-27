@@ -318,7 +318,7 @@ mod linux_impl {
         };
 
         // Stabilised Hessian = penalized_hessian + δI per ridge_passport.
-        let delta = ridge_passport.delta();
+        let delta = ridge_passport.delta;
         let mut stab = penalized_hessian.clone();
         if delta > 0.0 {
             for i in 0..p {
