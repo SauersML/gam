@@ -35,20 +35,20 @@ pub fn pirls_loop_family_for(spec: &LikelihoodSpec) -> Option<PirlsLoopFamilyKin
         _ => return None,
     };
     match (&spec.response, link) {
-        (ResponseFamily::Binomial, LinkFunction::Logit) => {
+        (ResponseFamily::Binomial, StandardLink::Logit) => {
             Some(PirlsLoopFamilyKind::BernoulliLogit)
         }
-        (ResponseFamily::Binomial, LinkFunction::Probit) => {
+        (ResponseFamily::Binomial, StandardLink::Probit) => {
             Some(PirlsLoopFamilyKind::BernoulliProbit)
         }
-        (ResponseFamily::Binomial, LinkFunction::CLogLog) => {
+        (ResponseFamily::Binomial, StandardLink::CLogLog) => {
             Some(PirlsLoopFamilyKind::BernoulliCLogLog)
         }
-        (ResponseFamily::Poisson, LinkFunction::Log) => Some(PirlsLoopFamilyKind::PoissonLog),
-        (ResponseFamily::Gaussian, LinkFunction::Identity) => {
+        (ResponseFamily::Poisson, StandardLink::Log) => Some(PirlsLoopFamilyKind::PoissonLog),
+        (ResponseFamily::Gaussian, StandardLink::Identity) => {
             Some(PirlsLoopFamilyKind::GaussianIdentity)
         }
-        (ResponseFamily::Gamma, LinkFunction::Log) => Some(PirlsLoopFamilyKind::GammaLog),
+        (ResponseFamily::Gamma, StandardLink::Log) => Some(PirlsLoopFamilyKind::GammaLog),
         // Every other pairing is either not in the JIT-cache set or is a
         // canonical-pair the row kernels do not currently support.
         _ => None,

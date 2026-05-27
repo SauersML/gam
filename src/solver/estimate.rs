@@ -44,7 +44,7 @@ use crate::terms::smooth::BlockwisePenalty;
 use crate::types::{
     Coefficients, GlmLikelihoodSpec, InverseLink, LatentCLogLogState, LikelihoodScaleMetadata,
     LikelihoodSpec, LinkFunction, LogLikelihoodNormalization, LogSmoothingParamsView,
-    MixtureLinkState, ResponseFamily, RidgePassport, SasLinkState,
+    MixtureLinkState, ResponseFamily, RidgePassport, SasLinkState, StandardLink,
 };
 use crate::types::{MixtureLinkSpec, SasLinkSpec};
 
