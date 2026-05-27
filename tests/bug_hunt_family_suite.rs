@@ -1,4 +1,4 @@
-use gam::families::family_meta::inverse_link_to_binomial_spec;
+use gam::types::inverse_link_to_binomial_spec;
 use gam::families::latent_survival::fixed_latent_hazard_frailty;
 use gam::families::lognormal_kernel::{FrailtySpec, HazardLoading};
 use gam::families::marginal_slope_shared::{

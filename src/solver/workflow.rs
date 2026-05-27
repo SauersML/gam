@@ -5091,16 +5091,22 @@ fn materialize_standard<'a>(
         if !family.is_binomial() {
             return None;
         }
-        let link_kind = link_choice
-            .as_ref()
-            .map(|c| InverseLink::Standard(c.link))
-            .unwrap_or_else(|| {
+        let link_kind = match link_choice.as_ref() {
+            Some(c) => match StandardLink::try_from(c.link) {
+                Ok(std_link) => InverseLink::Standard(std_link),
+                // linkwiggle is gated by `linkname_supports_joint_wiggle` which
+                // rejects Sas / BetaLogistic upstream, so reaching this arm
+                // means the gate was bypassed.
+                Err(_) => return None,
+            },
+            None => {
                 if let Some(state) = latent_cloglog {
                     InverseLink::LatentCLogLog(state)
                 } else {
                     InverseLink::Standard(StandardLink::Logit)
                 }
-            });
+            }
+        };
         Some(StandardBinomialWiggleConfig {
             link_kind,
             wiggle: LinkWiggleConfig {
@@ -6328,10 +6334,21 @@ fn materialize_location_scale<'a>(
     }
 
     if family.is_binomial() {
-        let link_kind = link_choice
-            .as_ref()
-            .map(|c| InverseLink::Standard(c.link))
-            .unwrap_or(InverseLink::Standard(StandardLink::Logit));
+        let link_kind = match link_choice.as_ref() {
+            Some(c) => match StandardLink::try_from(c.link) {
+                Ok(std_link) => InverseLink::Standard(std_link),
+                Err(e) => {
+                    return Err(WorkflowError::InvalidConfig {
+                        reason: format!(
+                            "binomial location-scale fitting cannot route link `{}` through `InverseLink::Standard`: {e}",
+                            c.link.name()
+                        ),
+                    }
+                    .into());
+                }
+            },
+            None => InverseLink::Standard(StandardLink::Logit),
+        };
         Ok(MaterializedModel {
             request: FitRequest::BinomialLocationScale(BinomialLocationScaleFitRequest {
                 data: data.values.view(),

@@ -2,7 +2,6 @@ pub mod bernoulli_marginal_slope;
 pub mod bernoulli_marginal_slope_identifiability;
 pub mod cubic_cell_kernel;
 pub mod custom_family;
-pub mod family_meta;
 pub mod gamlss;
 pub mod identifiability_compiler;
 pub mod inverse_link;

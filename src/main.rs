@@ -17,7 +17,7 @@ use gam::families::bernoulli_marginal_slope::{
     LatentZPolicy,
 };
 use gam::families::cubic_cell_kernel as exact_kernel;
-use gam::families::family_meta::inverse_link_to_binomial_spec;
+use gam::types::inverse_link_to_binomial_spec;
 use gam::families::latent_survival::latent_hazard_loading;
 use gam::families::scale_design::{
     ScaleDeviationTransform, build_scale_deviation_operator,

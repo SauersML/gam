@@ -13,7 +13,7 @@ use gam::faer_ndarray::{
     FaerCholesky, FaerEigh, FaerSvd, array2_to_matmut, factorize_symmetricwith_fallback, fast_ata,
     fast_atb, fast_xt_diag_x,
 };
-use gam::families::family_meta::inverse_link_to_binomial_spec;
+use gam::types::inverse_link_to_binomial_spec;
 use gam::families::inverse_link::apply_inverse_link_vec;
 use gam::families::scale_design::{build_scale_deviation_transform, infer_non_intercept_start};
 use gam::families::survival_construction::{SavedSurvivalTimeBasis, survival_likelihood_modename};
@@ -23150,10 +23150,6 @@ fn family_link_kind(family: &LikelihoodSpec) -> &'static str {
         (ResponseFamily::RoystonParmar, _) => "royston-parmar",
         (ResponseFamily::Binomial, InverseLink::Sas(_)) => "sas",
         (ResponseFamily::Binomial, InverseLink::BetaLogistic(_)) => "beta-logistic",
-        (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Sas)) => "sas",
-        (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::BetaLogistic)) => {
-            "beta-logistic"
-        }
         _ => match family.link_function() {
             LinkFunction::Identity => "identity",
             LinkFunction::Logit => "logit",
