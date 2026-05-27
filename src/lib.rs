@@ -70,7 +70,7 @@ pub mod diagnostics;
 pub mod families;
 pub mod geometry;
 pub mod gpu;
-mod heartbeat;
+pub mod heartbeat;
 pub mod identifiability;
 pub mod inference;
 pub mod kernels;

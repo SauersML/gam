@@ -28,7 +28,15 @@ impl WigglePenaltyConfig {
     }
 }
 
-/// Shared engine-level link selector for generalized models.
+/// Shared engine-level link selector for generalized models. This is the
+/// "wide" link descriptor: CLI parsing, formula DSL, and the projection from
+/// `InverseLink::link_function()` all live in this enum, so it carries every
+/// link kind the engine knows about — including the state-bearing
+/// `Sas` / `BetaLogistic` cases.
+///
+/// `LinkFunction` is *not* the right type for the state-less `InverseLink::Standard`
+/// cell. Use [`StandardLink`] there: the type system then refuses to construct
+/// a state-less `Standard(Sas)` / `Standard(BetaLogistic)` placeholder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LinkFunction {
     Logit,
@@ -52,6 +60,47 @@ impl LinkFunction {
             Self::Identity => "identity",
             Self::Log => "log",
         }
+    }
+}
+
+/// Legal-only link descriptor for the state-less `InverseLink::Standard` cell.
+///
+/// `Sas` / `BetaLogistic` are state-bearing and live in their own
+/// `InverseLink::Sas(_)` / `InverseLink::BetaLogistic(_)` variants. The type
+/// system enforces that fact by omitting them here, so the historical
+/// "state-less placeholder" pattern (`InverseLink::Standard(LinkFunction::Sas)`)
+/// no longer compiles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StandardLink {
+    Logit,
+    Probit,
+    CLogLog,
+    Identity,
+    Log,
+}
+
+impl StandardLink {
+    #[inline]
+    pub const fn name(self) -> &'static str {
+        self.as_link_function().name()
+    }
+
+    #[inline]
+    pub const fn as_link_function(self) -> LinkFunction {
+        match self {
+            Self::Logit => LinkFunction::Logit,
+            Self::Probit => LinkFunction::Probit,
+            Self::CLogLog => LinkFunction::CLogLog,
+            Self::Identity => LinkFunction::Identity,
+            Self::Log => LinkFunction::Log,
+        }
+    }
+}
+
+impl From<StandardLink> for LinkFunction {
+    #[inline]
+    fn from(link: StandardLink) -> Self {
+        link.as_link_function()
     }
 }
 
@@ -136,7 +185,7 @@ impl LatentCLogLogState {
 /// Parameterized inverse-link selector used where mu/derivatives are evaluated.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum InverseLink {
-    Standard(LinkFunction),
+    Standard(StandardLink),
     LatentCLogLog(LatentCLogLogState),
     Sas(SasLinkState),
     BetaLogistic(SasLinkState),
@@ -147,7 +196,7 @@ impl InverseLink {
     #[inline]
     pub const fn link_function(&self) -> LinkFunction {
         match self {
-            Self::Standard(link) => *link,
+            Self::Standard(link) => link.as_link_function(),
             Self::LatentCLogLog(_) => LinkFunction::CLogLog,
             Self::Sas(_) => LinkFunction::Sas,
             Self::BetaLogistic(_) => LinkFunction::BetaLogistic,
@@ -413,7 +462,7 @@ impl LikelihoodSpec {
     pub const fn gaussian_identity() -> Self {
         Self::new(
             ResponseFamily::Gaussian,
-            InverseLink::Standard(LinkFunction::Identity),
+            InverseLink::Standard(StandardLink::Identity),
         )
     }
 
@@ -421,7 +470,7 @@ impl LikelihoodSpec {
     pub const fn binomial_logit() -> Self {
         Self::new(
             ResponseFamily::Binomial,
-            InverseLink::Standard(LinkFunction::Logit),
+            InverseLink::Standard(StandardLink::Logit),
         )
     }
 
@@ -429,7 +478,7 @@ impl LikelihoodSpec {
     pub const fn binomial_probit() -> Self {
         Self::new(
             ResponseFamily::Binomial,
-            InverseLink::Standard(LinkFunction::Probit),
+            InverseLink::Standard(StandardLink::Probit),
         )
     }
 
@@ -437,7 +486,7 @@ impl LikelihoodSpec {
     pub const fn binomial_cloglog() -> Self {
         Self::new(
             ResponseFamily::Binomial,
-            InverseLink::Standard(LinkFunction::CLogLog),
+            InverseLink::Standard(StandardLink::CLogLog),
         )
     }
 
@@ -465,7 +514,7 @@ impl LikelihoodSpec {
     pub const fn poisson_log() -> Self {
         Self::new(
             ResponseFamily::Poisson,
-            InverseLink::Standard(LinkFunction::Log),
+            InverseLink::Standard(StandardLink::Log),
         )
     }
 
@@ -473,7 +522,7 @@ impl LikelihoodSpec {
     pub const fn tweedie_log(p: f64) -> Self {
         Self::new(
             ResponseFamily::Tweedie { p },
-            InverseLink::Standard(LinkFunction::Log),
+            InverseLink::Standard(StandardLink::Log),
         )
     }
 
@@ -481,7 +530,7 @@ impl LikelihoodSpec {
     pub const fn negative_binomial_log(theta: f64) -> Self {
         Self::new(
             ResponseFamily::NegativeBinomial { theta },
-            InverseLink::Standard(LinkFunction::Log),
+            InverseLink::Standard(StandardLink::Log),
         )
     }
 
@@ -489,7 +538,7 @@ impl LikelihoodSpec {
     pub const fn beta_logit(phi: f64) -> Self {
         Self::new(
             ResponseFamily::Beta { phi },
-            InverseLink::Standard(LinkFunction::Logit),
+            InverseLink::Standard(StandardLink::Logit),
         )
     }
 
@@ -497,7 +546,7 @@ impl LikelihoodSpec {
     pub const fn gamma_log() -> Self {
         Self::new(
             ResponseFamily::Gamma,
-            InverseLink::Standard(LinkFunction::Log),
+            InverseLink::Standard(StandardLink::Log),
         )
     }
 
@@ -505,7 +554,7 @@ impl LikelihoodSpec {
     pub const fn royston_parmar() -> Self {
         Self::new(
             ResponseFamily::RoystonParmar,
-            InverseLink::Standard(LinkFunction::Identity),
+            InverseLink::Standard(StandardLink::Identity),
         )
     }
 
@@ -516,12 +565,15 @@ impl LikelihoodSpec {
 
     /// Once-and-for-all classification into the legal-only `FamilySpecKind`.
     ///
-    /// `(ResponseFamily, InverseLink)` is a 40-cell product; only the cells
-    /// listed here are recognised by the family math. Cells that fall outside
-    /// the legal enumeration are coerced to the nearest legal cell that the
-    /// historical `pretty_name`/`name` fallback arms exposed (currently
-    /// `BinomialLogit` for any `Binomial + Standard(_)` cell that is not
-    /// already Logit/Probit/CLogLog).
+    /// `(ResponseFamily, InverseLink)` is a 35-cell product (7 response × 5
+    /// inverse-link); only the cells listed here are recognised by the family
+    /// math. With `InverseLink::Standard` carrying `StandardLink` (not
+    /// `LinkFunction`), the historical "state-less Sas/BetaLogistic
+    /// placeholder" cells are no longer representable, so the match is
+    /// exhaustive over the legal cells. `Standard(Identity)` / `Standard(Log)`
+    /// for the binomial family are structurally inert (no construction site
+    /// reaches them) and are routed to `BinomialLogit` as the nearest legal
+    /// classification.
     pub fn kind(&self) -> FamilySpecKind {
         match (&self.response, &self.link) {
             (ResponseFamily::Gaussian, _) => FamilySpecKind::GaussianIdentity,
@@ -533,12 +585,19 @@ impl LikelihoodSpec {
             (ResponseFamily::Beta { phi }, _) => FamilySpecKind::BetaLogit { phi: *phi },
             (ResponseFamily::Gamma, _) => FamilySpecKind::GammaLog,
             (ResponseFamily::RoystonParmar, _) => FamilySpecKind::RoystonParmar,
-            (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Probit)) => {
+            (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::Logit)) => {
+                FamilySpecKind::BinomialLogit
+            }
+            (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::Probit)) => {
                 FamilySpecKind::BinomialProbit
             }
-            (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::CLogLog)) => {
+            (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::CLogLog)) => {
                 FamilySpecKind::BinomialCLogLog
             }
+            (
+                ResponseFamily::Binomial,
+                InverseLink::Standard(StandardLink::Identity | StandardLink::Log),
+            ) => FamilySpecKind::BinomialLogit,
             (ResponseFamily::Binomial, InverseLink::LatentCLogLog(state)) => {
                 FamilySpecKind::BinomialLatentCLogLog(*state)
             }
@@ -551,21 +610,6 @@ impl LikelihoodSpec {
             (ResponseFamily::Binomial, InverseLink::Mixture(state)) => {
                 FamilySpecKind::BinomialMixture(state.clone())
             }
-            // Two-phase resolution placeholder. `Binomial + Standard(Sas |
-            // BetaLogistic)` is constructed at CLI-resolution sites (e.g.
-            // `src/main.rs:8646-8654`) **before** the link state has been
-            // configured; downstream paths in `src/main.rs:2308-2324` and
-            // `src/families/survival_location_scale.rs:4170-4180` recognise
-            // the marker and upgrade to `InverseLink::Sas(state)` /
-            // `InverseLink::BetaLogistic(state)` once the state spec is
-            // available. The placeholder is never observed by a real fit
-            // path, so kind() routes it to `BinomialLogit` as a benign
-            // catch-all matching the historical name() output.
-            // `Standard(Logit | Identity | Log)` also lands here — Logit
-            // is genuinely "binomial-logit"; Identity / Log are
-            // structurally impossible for the binomial family (the type
-            // system permits the cell but no construction site reaches it).
-            (ResponseFamily::Binomial, InverseLink::Standard(_)) => FamilySpecKind::BinomialLogit,
         }
     }
 
