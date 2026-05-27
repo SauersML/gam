@@ -232,7 +232,7 @@ impl XorwowState {
 // for a bit-for-bit GPU oracle. The math (Devroye 1986; PSW 2013) is
 // identical down to the alternating-series tail.
 
-use std::f64::consts::{FRAC_2_PI, PI};
+use std::f64::consts::{FRAC_2_PI, FRAC_PI_2, PI};
 
 const PI_SQ: f64 = PI * PI;
 const SQRT_2_OVER_SQRT_PI: f64 = 0.797_884_560_802_865_4;
@@ -389,9 +389,31 @@ pub fn saddlepoint_solve(x: f64) -> f64 {
         return 0.0;
     }
     if x < 1.0 {
-        // Negative-t branch, work in v = sqrt(-2t).
-        let mut v = (3.0 * (1.0 - x)).sqrt().max(1e-6);
-        for _ in 0..6 {
+        // Negative-t branch, work in v = sqrt(-2t). `tanh(v)/v` is monotone
+        // decreasing in v on (0, ∞), with two well-separated asymptotic
+        // regimes:
+        //
+        //   * x ≈ 1 (v small): Taylor expansion tanh(v)/v ≈ 1 - v²/3 gives
+        //     `v₀ = sqrt(3(1 - x))`, which is the ~quadratic starting point
+        //     used historically.
+        //   * x ≈ 0 (v large): `tanh(v) → 1`, so `tanh(v)/v ≈ 1/v` and the
+        //     root sits near `v ≈ 1/x`. The Taylor seed `sqrt(3(1-x)) ≤ √3`
+        //     is bounded above by ~1.73, which leaves Newton walking the
+        //     plateau at ~`tanh(v)/v ≈ 0.55` and converging linearly to the
+        //     true root (≈ 20 at x = 0.05); six Newton steps are not enough
+        //     to drive the relative error to 1e-6 from there.
+        //
+        // Take the maximum of the two seeds so each regime gets a starting
+        // point in its quadratic-convergence basin; the function is monotone
+        // so overshooting the root from above just trades a couple of
+        // descending Newton steps for the missing factor-of-ten distance.
+        // 16 Newton iterations is comfortable even when the initial seed
+        // overshoots and Newton has to recover via several linear steps
+        // before settling into the quadratic regime.
+        let v_taylor = (3.0 * (1.0 - x)).sqrt();
+        let v_asym = 1.0 / x.max(1e-12);
+        let mut v = v_taylor.max(v_asym).max(1e-6);
+        for _ in 0..16 {
             let tanh_v = v.tanh();
             let f = tanh_v / v - x;
             // d/dv [tanh(v)/v] = (1 - tanh²v)/v - tanh(v)/v²
@@ -405,11 +427,24 @@ pub fn saddlepoint_solve(x: f64) -> f64 {
         }
         -0.5 * v * v
     } else {
-        // Positive-t branch, work in v = sqrt(2t). The pole of tan is
-        // at v = π/2; the relevant root is in (0, π/2). Initialise from
-        // the Taylor of `tan(v)/v = 1 + v²/3 + ...` for moderate x.
-        let mut v = (3.0 * (x - 1.0)).sqrt().min(0.49 * PI).max(1e-6);
-        for _ in 0..6 {
+        // Positive-t branch, work in v = sqrt(2t). The pole of tan is at
+        // v = π/2; the relevant root sits in (0, π/2). Two regimes:
+        //
+        //   * x ≈ 1 (v small): Taylor tan(v)/v ≈ 1 + v²/3 gives
+        //     `v₀ = sqrt(3(x - 1))` — the historical seed.
+        //   * x large (v near π/2): tan(v) ≈ 1/(π/2 - v), so the root sits
+        //     near `v ≈ π/2 - 2/(x π)`. Seeding from the 0.49 π cap leaves
+        //     Newton inside the very steep tail of the pole, where each
+        //     Newton step descends by a fraction of the remaining distance;
+        //     six steps left x = 3 stuck at rel ≈ 1.5e-4 above 1e-6.
+        //
+        // The cap stays at 0.499 π to keep `tan(v)` finite; the analytic
+        // pole-tail seed is honoured when it sits below that cap. Bumping
+        // the iteration cap mirrors the negative branch.
+        let v_taylor = (3.0 * (x - 1.0)).sqrt();
+        let v_pole = FRAC_PI_2 - 2.0 / (x.max(1e-12) * PI);
+        let mut v = v_taylor.max(v_pole).min(0.499 * PI).max(1e-6);
+        for _ in 0..16 {
             let tan_v = v.tan();
             let f = tan_v / v - x;
             // d/dv [tan(v)/v] = (1 + tan²v)/v - tan(v)/v².
@@ -425,23 +460,32 @@ pub fn saddlepoint_solve(x: f64) -> f64 {
     }
 }
 
-/// Saddlepoint approximation K''(t) given the saddlepoint t solving
-/// K'(t) = x and the mean x. The math spec (§9) records the closed form:
-/// `K''(t) = x² + (1 - x) / (2u)` where u relates to v above. We instead
-/// use the direct derivative of K' to keep the code branch-free:
-/// `K''(t) = sech²(v)/v² - tanh(v)/v³` (negative branch),
-/// `K''(t) = sec²(v)/v²  - tan(v)/v³`  (positive branch).
+/// Saddlepoint approximation K''(t), the variance of the tilted distribution
+/// from K'(t) = x. K''(t) is variance, so positive on both branches.
+///
+/// Derivation. From `saddlepoint_solve` the saddlepoint parameterisation is
+///   negative branch (t ≤ 0): K'(t) = tanh(v)/v with v = sqrt(-2t),
+///   positive branch (t > 0): K'(t) = tan(v)/v  with v = sqrt( 2t).
+/// Chain rule with dv/dt = ±1/v (sign matches the branch) yields
+///   negative branch:  K''(t) = tanh(v)/v³ - sech²(v)/v²
+///   positive branch:  K''(t) = sec²(v)/v²  - tan(v)/v³
+/// As v → 0 both branches reduce to the same Taylor limit 2/3, which is the
+/// continuous value of K''(0).
+///
+/// The previous form returned `sech²(v)/v² - tanh(v)/v³` on the negative
+/// branch — the algebraic negative of the chain-rule derivative — and a
+/// hardcoded `1/3` at t = 0 that did not match either one-sided limit. The
+/// negative-branch sign error produced K''(-2) ≈ -0.103, which the test
+/// `saddlepoint_kpp_is_positive` correctly flagged (variance must be > 0).
 pub fn saddlepoint_kpp(t: f64) -> f64 {
     if t.abs() < 1e-14 {
-        // Limit at t = 0: K''(0) = 1/3 (variance of one-half PG(1, 0) draw,
-        // up to the b-scaling factor the caller handles).
-        return 1.0 / 3.0;
+        return 2.0 / 3.0;
     }
     if t < 0.0 {
         let v = (-2.0 * t).sqrt();
         let tanh_v = v.tanh();
         let sech_sq = 1.0 - tanh_v * tanh_v;
-        (sech_sq / (v * v)) - (tanh_v / (v * v * v))
+        (tanh_v / (v * v * v)) - (sech_sq / (v * v))
     } else {
         let v = (2.0 * t).sqrt();
         let tan_v = v.tan();
