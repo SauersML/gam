@@ -1782,7 +1782,7 @@ pub(crate) fn install_compiled_flex_block_into_runtime(
     training_row_weights: &Array1<f64>,
 ) -> Result<FlexCompileOutcome, String> {
     use crate::families::bernoulli_marginal_slope::deviation_runtime::{
-        AnchorNullSpaceComponent, AnchorNullSpaceEvaluator, AnchorResidual,
+        AnchorComponentTag, AnchorNullSpaceEvaluator, InstalledFlexBlock,
     };
     use crate::families::bernoulli_marginal_slope_identifiability::{
         BernoulliDenseDesignOperator, BernoulliRowHessian,
@@ -1817,7 +1817,7 @@ pub(crate) fn install_compiled_flex_block_into_runtime(
     // parametric anchor once into a contiguous `n × p_a` block; flex anchor
     // matrices are already dense and used as-is.
     let mut anchor_dense_blocks: Vec<Array2<f64>> = Vec::new();
-    let mut anchor_components: Vec<AnchorNullSpaceComponent> = Vec::new();
+    let mut anchor_components: Vec<AnchorComponentTag> = Vec::new();
     let mut total_anchor_cols = 0usize;
     for (d, block_tag) in parametric_anchors {
         if d.nrows() != n {
@@ -1836,7 +1836,7 @@ pub(crate) fn install_compiled_flex_block_into_runtime(
             .as_ref()
             .clone();
         anchor_dense_blocks.push(dense);
-        anchor_components.push(AnchorNullSpaceComponent::Parametric {
+        anchor_components.push(AnchorComponentTag::Parametric {
             block: *block_tag,
             ncols: p_a,
         });
@@ -1855,7 +1855,7 @@ pub(crate) fn install_compiled_flex_block_into_runtime(
             continue;
         }
         anchor_dense_blocks.push((*a).clone());
-        anchor_components.push(AnchorNullSpaceComponent::FlexEvaluation { ncols: p_a });
+        anchor_components.push(AnchorComponentTag::FlexEvaluation { ncols: p_a });
         total_anchor_cols += p_a;
     }
     if total_anchor_cols == 0 {
