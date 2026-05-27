@@ -1968,6 +1968,50 @@ mod pirls_row_gpu_tests {
                     );
                 }
             }
+
+            // Direct Level B raw-body → CPU reference parity. Closes
+            // the chain JIT-raw → CPU without going through the
+            // built-in GPU kernel as an intermediary. Gaussian
+            // identity is straight-line scalar arithmetic on both
+            // sides, so we still demand bit-equality on the eight
+            // outputs the CPU evaluator exposes.
+            let mu_j = stream.clone_dtoh(&out_jit.mu).expect("dl jit mu");
+            let g_j = stream.clone_dtoh(&out_jit.grad_eta).expect("dl jit g");
+            let wf_j = stream.clone_dtoh(&out_jit.w_fisher).expect("dl jit wf");
+            let wh_j = stream.clone_dtoh(&out_jit.w_hessian).expect("dl jit wh");
+            let ws_j = stream.clone_dtoh(&out_jit.w_solver).expect("dl jit ws");
+            let zf_j = stream.clone_dtoh(&out_jit.z_fisher).expect("dl jit zf");
+            let zh_j = stream.clone_dtoh(&out_jit.z_hessian).expect("dl jit zh");
+            let d_j = stream.clone_dtoh(&out_jit.deviance).expect("dl jit d");
+            for i in 0..n {
+                let cpu = row_reweight_cpu(
+                    PirlsRowFamily::GaussianIdentity,
+                    curvature,
+                    RowInput {
+                        eta: etas[i],
+                        y: ys[i],
+                        prior_weight: priors[i],
+                    },
+                );
+                for (label, cpu_v, jit_v) in [
+                    ("mu", cpu.mu, mu_j[i]),
+                    ("grad_eta", cpu.grad_eta, g_j[i]),
+                    ("w_fisher", cpu.w_fisher, wf_j[i]),
+                    ("w_hessian", cpu.w_hessian, wh_j[i]),
+                    ("w_solver", cpu.w_solver, ws_j[i]),
+                    ("z_fisher", cpu.z_fisher, zf_j[i]),
+                    ("z_hessian", cpu.z_hessian, zh_j[i]),
+                    ("deviance", cpu.deviance, d_j[i]),
+                ] {
+                    assert_eq!(
+                        cpu_v.to_bits(),
+                        jit_v.to_bits(),
+                        "{label}[{i}]: cpu {} ≠ jit-raw {}",
+                        cpu_v,
+                        jit_v,
+                    );
+                }
+            }
         }
     }
 
