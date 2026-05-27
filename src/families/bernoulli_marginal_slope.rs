@@ -1924,22 +1924,24 @@ pub(crate) fn install_compiled_flex_block_into_runtime(
         );
         return Ok(FlexCompileOutcome::FullyAliased { reason });
     }
-    let residual_coefficients =
-        candidate_compiled
-            .anchor_correction
-            .clone()
-            .ok_or_else(|| {
-                "cross-block identifiability: compile returned no anchor_correction for the \
-                 candidate block (expected for trailing block with non-empty anchor union)"
-                    .to_string()
-            })?;
-    if residual_coefficients.nrows() != d_total || residual_coefficients.ncols() != k_kept {
-        return Err(format!(
-            "cross-block identifiability: anchor_correction shape {}×{} does not match \
-             expected d_total={d_total} × k_kept={k_kept}",
-            residual_coefficients.nrows(),
-            residual_coefficients.ncols(),
-        ));
+    // Shape contract: compile() must emit (d_total × k_kept) anchor_correction
+    // for the trailing candidate block. install_compiled_flex_block re-validates
+    // via compose_anchor_orthogonalisation but emits a less specific error;
+    // catch it here with the d_total / k_kept context.
+    {
+        let m = candidate_compiled.anchor_correction.as_ref().ok_or_else(|| {
+            "cross-block identifiability: compile returned no anchor_correction for the \
+             candidate block (expected for trailing block with non-empty anchor union)"
+                .to_string()
+        })?;
+        if m.nrows() != d_total || m.ncols() != k_kept {
+            return Err(format!(
+                "cross-block identifiability: anchor_correction shape {}×{} does not match \
+                 expected d_total={d_total} × k_kept={k_kept}",
+                m.nrows(),
+                m.ncols(),
+            ));
+        }
     }
 
     // Install: hand the compiled flex block to the runtime in one call.
@@ -1947,7 +1949,6 @@ pub(crate) fn install_compiled_flex_block_into_runtime(
     // right-selector V to span_c{0..3} + boundary/monotonicity rows, and
     // stores the anchor correction M alongside the per-anchor predict-time
     // tags so the saved model can replay the anchor row map.
-    let _ = residual_coefficients; // value flows through CompiledBlock below
     candidate
         .runtime
         .install_compiled_flex_block(candidate_compiled, anchor_components, n_train)?;
@@ -20192,12 +20193,12 @@ mod tests {
         }
     }
 
-    /// FlexEvaluation-anchor counterpart of the parametric true-alias test.
-    /// Captures the invariant that `CrossBlockAnchor::FlexEvaluation(a)` is
-    /// a real participant in the cross-block W-orthogonalisation: when the
-    /// flex-anchor's column span fully covers the candidate's column span,
-    /// the outcome must be `FullyAliased`, not a silent `Reparameterised`.
-    /// If the FlexEvaluation arm is ever re-skipped, this test fails.
+    /// Flex-anchor counterpart of the parametric true-alias test. Captures
+    /// the invariant that flex-evaluation anchors are real participants in
+    /// the cross-block W-orthogonalisation: when the flex-anchor's column
+    /// span fully covers the candidate's column span, the outcome must be
+    /// `FullyAliased`, not a silent `Reparameterised`. Regression guard for
+    /// the historical "FlexEvaluation silently skipped" bug.
     #[test]
     fn cross_block_identifiability_flex_anchor_true_alias_returns_fully_aliased() {
         let n = 64usize;
