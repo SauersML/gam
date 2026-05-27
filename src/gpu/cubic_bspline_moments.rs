@@ -790,6 +790,7 @@ struct CubicMomentBackendInner {
     ctx: std::sync::Arc<CudaContext>,
     stream: std::sync::Arc<CudaStream>,
     modules: Mutex<HashMap<HexMomentModuleKey, std::sync::Arc<CudaModule>>>,
+    tet_modules: Mutex<HashMap<TetMomentModuleKey, std::sync::Arc<CudaModule>>>,
     cc_major: i32,
     cc_minor: i32,
 }
@@ -875,10 +876,38 @@ impl CubicMomentBackend {
                 ctx,
                 stream,
                 modules: Mutex::new(HashMap::new()),
+                tet_modules: Mutex::new(HashMap::new()),
                 cc_major,
                 cc_minor,
             },
         })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn tet_module_for(
+        &self,
+        key: TetMomentModuleKey,
+        src_factory: impl FnOnce() -> String,
+    ) -> Result<std::sync::Arc<CudaModule>, GpuError> {
+        if let Ok(guard) = self.inner.tet_modules.lock() {
+            if let Some(existing) = guard.get(&key) {
+                return Ok(existing.clone());
+            }
+        }
+        let src = src_factory();
+        let ptx = cudarc::nvrtc::compile_ptx(&src).gpu_ctx_with(|err| format!(
+                "tetrahedral_moments NVRTC compile (D={}, NBETA={}, NALPHA={}): {err}",
+                key.d, key.nbeta, key.nalpha
+            ))?;
+        let module = self
+            .inner
+            .ctx
+            .load_module(ptx)
+            .gpu_ctx("tetrahedral_moments module load")?;
+        if let Ok(mut guard) = self.inner.tet_modules.lock() {
+            guard.entry(key).or_insert_with(|| module.clone());
+        }
+        Ok(module)
     }
 
     #[cfg(target_os = "linux")]
