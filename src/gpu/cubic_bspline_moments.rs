@@ -916,7 +916,7 @@ impl HexCellTable {
             || self.pair_per_axis.len() != want
             || self.width_per_axis.len() != want
         {
-            return Err(GpuError::NotYetImplemented {
+            return Err(GpuError::DriverCallFailed {
                 reason: format!(
                     "HexCellTable: expected length {want} (n_cells*d), got span={}, pair={}, width={}",
                     self.span_per_axis.len(),
@@ -951,7 +951,7 @@ pub fn build_hex_tensor_moments_device(
 
     cells.validate()?;
     if spec.d() != cells.d {
-        return Err(GpuError::NotYetImplemented {
+        return Err(GpuError::DriverCallFailed {
             reason: format!(
                 "build_hex_tensor_moments_device: spec.d()={} != cells.d={}",
                 spec.d(),
@@ -960,7 +960,7 @@ pub fn build_hex_tensor_moments_device(
         });
     }
     if axis_tables.len() != cells.d {
-        return Err(GpuError::NotYetImplemented {
+        return Err(GpuError::DriverCallFailed {
             reason: format!(
                 "build_hex_tensor_moments_device: axis_tables.len()={} != d={}",
                 axis_tables.len(),
@@ -983,7 +983,7 @@ pub fn build_hex_tensor_moments_device(
     }
     let nalpha = spec.n_alpha();
     if nalpha == 0 || cells.n_cells == 0 {
-        return Err(GpuError::NotYetImplemented {
+        return Err(GpuError::DriverCallFailed {
             reason: "build_hex_tensor_moments_device: empty spec or cell list".to_string(),
         });
     }
