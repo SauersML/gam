@@ -54,8 +54,8 @@ impl From<DeviationRuntimeError> for String {
 ///
 ///   design_row(x) = pure_span_row(x) − n_row · M
 ///
-/// The legacy `orthonormalising_rotation` (always identity by construction —
-/// the compiler bakes the orthonormalising rotation into M) is dropped.
+/// The compiler bakes the orthonormalising rotation into M, so no
+/// separate rotation matrix is stored on the install state.
 #[derive(Clone, Debug)]
 pub struct InstalledFlexBlock {
     /// Anchor correction matrix `M ∈ R^{d × k}` from

@@ -3472,6 +3472,201 @@ pub fn try_device_layer_c_beta_d_uv(
 }
 
 // ────────────────────────────────────────────────────────────────────────
+// Step 5 — per-row primary gradient + Hessian assembly from the full jet.
+//
+// Given the entry- and exit-time jets `(eta, chi, d, eta_u, eta_uv,
+// chi_u, chi_uv, d_u, d_uv)` (from Layer C-α + C-β) plus the
+// `signed_probit_neglog` derivatives `(k1, k2)` at `-entry.eta` /
+// `-exit.eta`, the per-row NLL and its primary gradient + Hessian are
+// pure scalar / vector algebra (CPU
+// `compute_row_flex_primary_gradient_hessian_from_parts`, lines
+// 7263-7384 of survival_marginal_slope.rs).
+//
+// The joint-β `axpy_row_into` pullback into the dense coefficient
+// gradient / Hessian is family-owned (per-block design rows in
+// `marginal_design` / `logslope_design` / `score_warp` / `link_dev`
+// runtimes); Step 6 wires it behind the three try_* entry points.
+// ────────────────────────────────────────────────────────────────────────
+
+/// Per-row time-point jet bundle for the Step-5 assembly.
+#[derive(Clone, Debug)]
+pub struct SurvivalFlexTimepointJet<'a> {
+    pub eta: f64,
+    pub chi: f64,
+    pub d: f64,
+    /// Length `p`.
+    pub eta_u: &'a [f64],
+    /// Row-major `p × p`, symmetric.
+    pub eta_uv: &'a [f64],
+    /// Length `p`.
+    pub chi_u: &'a [f64],
+    /// Row-major `p × p`, symmetric.
+    pub chi_uv: &'a [f64],
+    /// Length `p`.
+    pub d_u: &'a [f64],
+    /// Row-major `p × p`, symmetric.
+    pub d_uv: &'a [f64],
+}
+
+/// Per-row inputs for the Step-5 primary gradient + Hessian assembly.
+#[derive(Clone, Debug)]
+pub struct SurvivalFlexStep5RowInputs<'a> {
+    pub entry: SurvivalFlexTimepointJet<'a>,
+    pub exit: SurvivalFlexTimepointJet<'a>,
+    pub wi: f64,
+    pub di: f64,
+    pub q1: f64,
+    pub qd1: f64,
+    /// `q1_index`: primary index of the q1 perturbation, `usize::MAX`
+    /// to disable the `+ wi·di·q1` / `+ wi·di` bumps.
+    pub q1_index: usize,
+    /// `qd1_index`: primary index of the qd1 perturbation, `usize::MAX`
+    /// to disable the `-wi·di/qd1` / `+wi·di/qd1²` bumps.
+    pub qd1_index: usize,
+    pub entry_k1: f64,
+    pub entry_k2: f64,
+    pub exit_k1: f64,
+    pub exit_k2: f64,
+    pub log_surv0: f64,
+    pub log_surv1: f64,
+}
+
+/// Per-row Step-5 outputs.
+#[derive(Clone, Debug)]
+pub struct SurvivalFlexStep5RowOutputs {
+    pub row_nll: f64,
+    pub grad: Vec<f64>,
+    pub hess: Vec<f64>,
+}
+
+/// Step-5 per-row primary gradient + Hessian assembly.  Pure scalar /
+/// vector algebra over the supplied jet bundles; no quadrature.
+pub fn try_device_step5_primary_assembly(
+    rows: &[SurvivalFlexStep5RowInputs<'_>],
+) -> Result<Vec<SurvivalFlexStep5RowOutputs>, GpuError> {
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::with_capacity(rows.len());
+    for (i, r) in rows.iter().enumerate() {
+        let p = r.entry.eta_u.len();
+        let check = |label: &str, len: usize, expected: usize| -> Result<(), GpuError> {
+            if len != expected {
+                return Err(GpuError::DriverCallFailed {
+                    reason: format!(
+                        "step5 row {i}: {label}.len()={len} expected {expected}"
+                    ),
+                });
+            }
+            Ok(())
+        };
+        check("entry.eta_uv", r.entry.eta_uv.len(), p * p)?;
+        check("entry.chi_u", r.entry.chi_u.len(), p)?;
+        check("entry.chi_uv", r.entry.chi_uv.len(), p * p)?;
+        check("entry.d_u", r.entry.d_u.len(), p)?;
+        check("entry.d_uv", r.entry.d_uv.len(), p * p)?;
+        check("exit.eta_u", r.exit.eta_u.len(), p)?;
+        check("exit.eta_uv", r.exit.eta_uv.len(), p * p)?;
+        check("exit.chi_u", r.exit.chi_u.len(), p)?;
+        check("exit.chi_uv", r.exit.chi_uv.len(), p * p)?;
+        check("exit.d_u", r.exit.d_u.len(), p)?;
+        check("exit.d_uv", r.exit.d_uv.len(), p * p)?;
+
+        if !(r.exit.chi.is_finite() && r.exit.chi > 0.0) {
+            return Err(GpuError::DriverCallFailed {
+                reason: format!(
+                    "step5 row {i}: exit.chi must be positive finite, got {}",
+                    r.exit.chi
+                ),
+            });
+        }
+        if !(r.exit.d.is_finite() && r.exit.d > 0.0) {
+            return Err(GpuError::DriverCallFailed {
+                reason: format!(
+                    "step5 row {i}: exit.d must be positive finite, got {}",
+                    r.exit.d
+                ),
+            });
+        }
+
+        let log_phi_eta1 = -0.5 * (r.exit.eta * r.exit.eta + std::f64::consts::TAU.ln());
+        let log_phi_q1 = -0.5 * (r.q1 * r.q1 + std::f64::consts::TAU.ln());
+        let row_nll = r.wi
+            * (r.log_surv0
+                - (1.0 - r.di) * r.log_surv1
+                - r.di * log_phi_eta1
+                - r.di * r.exit.chi.ln()
+                - r.di * log_phi_q1
+                + r.di * r.exit.d.ln()
+                - r.di * r.qd1.ln());
+
+        let entry_u1 = -r.entry_k1;
+        let entry_u2 = r.entry_k2;
+        let exit_surv_u1 = -r.exit_k1;
+        let exit_surv_u2 = r.exit_k2;
+
+        let mut grad = vec![0.0_f64; p];
+        for u in 0..p {
+            let mut val = 0.0;
+            val += entry_u1 * r.entry.eta_u[u];
+            val += exit_surv_u1 * r.exit.eta_u[u];
+            val += r.wi * r.di * r.exit.eta * r.exit.eta_u[u];
+            val -= r.wi * r.di * r.exit.chi_u[u] / r.exit.chi;
+            if u == r.q1_index {
+                val += r.wi * r.di * r.q1;
+            }
+            val += r.wi * r.di * r.exit.d_u[u] / r.exit.d;
+            if u == r.qd1_index {
+                val -= r.wi * r.di / r.qd1;
+            }
+            grad[u] = val;
+        }
+
+        let mut hess = vec![0.0_f64; p * p];
+        let chi_sq = r.exit.chi * r.exit.chi;
+        let d_sq = r.exit.d * r.exit.d;
+        for u in 0..p {
+            for v in u..p {
+                let mut val = 0.0;
+                val += entry_u2 * r.entry.eta_u[u] * r.entry.eta_u[v]
+                    + entry_u1 * r.entry.eta_uv[u * p + v];
+                val += exit_surv_u2 * r.exit.eta_u[u] * r.exit.eta_u[v]
+                    + exit_surv_u1 * r.exit.eta_uv[u * p + v];
+                val += r.wi
+                    * r.di
+                    * (r.exit.eta_u[u] * r.exit.eta_u[v]
+                        + r.exit.eta * r.exit.eta_uv[u * p + v]);
+                val -= r.wi
+                    * r.di
+                    * (r.exit.chi_uv[u * p + v] / r.exit.chi
+                        - (r.exit.chi_u[u] * r.exit.chi_u[v]) / chi_sq);
+                if u == r.q1_index && v == r.q1_index {
+                    val += r.wi * r.di;
+                }
+                val += r.wi
+                    * r.di
+                    * (r.exit.d_uv[u * p + v] / r.exit.d
+                        - (r.exit.d_u[u] * r.exit.d_u[v]) / d_sq);
+                if u == r.qd1_index && v == r.qd1_index {
+                    val += r.wi * r.di / (r.qd1 * r.qd1);
+                }
+                hess[u * p + v] = val;
+                if v != u {
+                    hess[v * p + u] = val;
+                }
+            }
+        }
+
+        out.push(SurvivalFlexStep5RowOutputs {
+            row_nll,
+            grad,
+            hess,
+        });
+    }
+    Ok(out)
+}
+
+// ────────────────────────────────────────────────────────────────────────
 // Three thin pullback entry points.  The bodies all currently return
 // `Ok(None)` (the unsupported sentinel) because Steps 2–5 still need to
 // land the flex / cubic-cell / intercept-solve infrastructure before
@@ -5066,5 +5261,183 @@ mod survival_flex_gpu_tests {
                 assert!(uv.is_finite(), "d_uv[{u},{v}] non-finite: {uv}");
             }
         }
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Step 5 — `try_device_step5_primary_assembly` algebraic identity tests.
+    // ────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn step5_di_zero_collapses_gradient_to_survival_only() {
+        // With di = 0 (censored row): the gradient simplifies to
+        //   grad[u] = entry_u1·entry.eta_u[u] + exit_surv_u1·exit.eta_u[u]
+        // and the Hessian to the two `k2` outer products + two `k1·eta_uv`.
+        // d_u / d_uv / chi_u / chi_uv contributions all vanish (multiplied by wi·di=0).
+        let p = 2usize;
+        let entry_eta_u = vec![0.3_f64, -0.2];
+        let entry_eta_uv = vec![0.05_f64, -0.02, -0.02, 0.08];
+        let exit_eta_u = vec![0.4_f64, 0.1];
+        let exit_eta_uv = vec![0.1_f64, 0.03, 0.03, -0.04];
+        let zero_p = vec![0.0_f64; p];
+        let zero_pp = vec![0.0_f64; p * p];
+
+        let entry_k1 = -0.21_f64;
+        let entry_k2 = 0.13_f64;
+        let exit_k1 = 0.08_f64;
+        let exit_k2 = 0.05_f64;
+
+        let row = SurvivalFlexStep5RowInputs {
+            entry: SurvivalFlexTimepointJet {
+                eta: 0.4,
+                chi: 0.7,
+                d: 0.85,
+                eta_u: &entry_eta_u,
+                eta_uv: &entry_eta_uv,
+                chi_u: &zero_p,
+                chi_uv: &zero_pp,
+                d_u: &zero_p,
+                d_uv: &zero_pp,
+            },
+            exit: SurvivalFlexTimepointJet {
+                eta: 0.6,
+                chi: 0.75,
+                d: 0.9,
+                eta_u: &exit_eta_u,
+                eta_uv: &exit_eta_uv,
+                chi_u: &zero_p,
+                chi_uv: &zero_pp,
+                d_u: &zero_p,
+                d_uv: &zero_pp,
+            },
+            wi: 1.0,
+            di: 0.0,
+            q1: 0.5,
+            qd1: 1.0,
+            q1_index: usize::MAX,
+            qd1_index: usize::MAX,
+            entry_k1,
+            entry_k2,
+            exit_k1,
+            exit_k2,
+            log_surv0: -0.2,
+            log_surv1: -0.3,
+        };
+        let out = try_device_step5_primary_assembly(std::slice::from_ref(&row))
+            .expect("step5 censored assembly must succeed");
+        assert_eq!(out.len(), 1);
+        let r = &out[0];
+
+        let entry_u1 = -entry_k1;
+        let exit_surv_u1 = -exit_k1;
+        for u in 0..p {
+            let expected = entry_u1 * entry_eta_u[u] + exit_surv_u1 * exit_eta_u[u];
+            assert!(
+                (r.grad[u] - expected).abs() <= 5e-15,
+                "grad[{u}] = {} but expected {expected}",
+                r.grad[u]
+            );
+        }
+        // Hessian: entry_k2·eta_u⊗eta_u + entry_u1·eta_uv + exit_k2·eta_u⊗eta_u + exit_surv_u1·eta_uv
+        for u in 0..p {
+            for v in 0..p {
+                let expected = entry_k2 * entry_eta_u[u] * entry_eta_u[v]
+                    + entry_u1 * entry_eta_uv[u * p + v]
+                    + exit_k2 * exit_eta_u[u] * exit_eta_u[v]
+                    + exit_surv_u1 * exit_eta_uv[u * p + v];
+                let got = r.hess[u * p + v];
+                assert!(
+                    (got - expected).abs() <= 5e-15 * (1.0 + expected.abs()),
+                    "hess[{u},{v}] = {} but expected {expected}",
+                    got
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn step5_hessian_symmetric_under_swap() {
+        // Non-trivial fixture: di = 1, q1_index and qd1_index active.
+        // The full chain-rule Hessian must still be symmetric under
+        // (u, v) swap — every term in the assembly is constructed
+        // symmetrically.
+        let p = 3usize;
+        let entry_eta_u = vec![0.3_f64, -0.2, 0.1];
+        let entry_eta_uv = vec![
+            0.05, -0.02, 0.01,
+            -0.02, 0.08, -0.03,
+            0.01, -0.03, 0.04_f64,
+        ];
+        let exit_eta_u = vec![0.4_f64, 0.1, -0.2];
+        let exit_eta_uv = vec![
+            0.1, 0.03, -0.02,
+            0.03, -0.04, 0.05,
+            -0.02, 0.05, 0.06_f64,
+        ];
+        let exit_chi_u = vec![0.07_f64, -0.04, 0.02];
+        let exit_chi_uv = vec![
+            0.01, -0.005, 0.002,
+            -0.005, 0.015, -0.003,
+            0.002, -0.003, 0.008_f64,
+        ];
+        let exit_d_u = vec![0.06_f64, 0.02, -0.01];
+        let exit_d_uv = vec![
+            0.012, 0.004, -0.002,
+            0.004, 0.01, 0.003,
+            -0.002, 0.003, 0.007_f64,
+        ];
+        let zero_p = vec![0.0_f64; p];
+        let zero_pp = vec![0.0_f64; p * p];
+
+        let row = SurvivalFlexStep5RowInputs {
+            entry: SurvivalFlexTimepointJet {
+                eta: 0.4,
+                chi: 0.7,
+                d: 0.85,
+                eta_u: &entry_eta_u,
+                eta_uv: &entry_eta_uv,
+                chi_u: &zero_p,
+                chi_uv: &zero_pp,
+                d_u: &zero_p,
+                d_uv: &zero_pp,
+            },
+            exit: SurvivalFlexTimepointJet {
+                eta: 0.6,
+                chi: 0.75,
+                d: 0.9,
+                eta_u: &exit_eta_u,
+                eta_uv: &exit_eta_uv,
+                chi_u: &exit_chi_u,
+                chi_uv: &exit_chi_uv,
+                d_u: &exit_d_u,
+                d_uv: &exit_d_uv,
+            },
+            wi: 1.0,
+            di: 1.0,
+            q1: 0.5,
+            qd1: 1.0,
+            q1_index: 1,
+            qd1_index: 2,
+            entry_k1: -0.21,
+            entry_k2: 0.13,
+            exit_k1: 0.08,
+            exit_k2: 0.05,
+            log_surv0: -0.2,
+            log_surv1: -0.3,
+        };
+        let out = try_device_step5_primary_assembly(std::slice::from_ref(&row))
+            .expect("step5 symmetry assembly must succeed");
+        assert_eq!(out.len(), 1);
+        let r = &out[0];
+        for u in 0..p {
+            for v in (u + 1)..p {
+                let uv = r.hess[u * p + v];
+                let vu = r.hess[v * p + u];
+                assert!(
+                    (uv - vu).abs() <= 1e-14 * (1.0 + uv.abs().max(vu.abs())),
+                    "hess symmetry ({u},{v})={uv} vs ({v},{u})={vu}"
+                );
+            }
+        }
+        assert!(r.row_nll.is_finite());
     }
 }

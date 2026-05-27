@@ -48,7 +48,7 @@
 //    DSL ([[project_gam_geometric_smooths]]) is invisible to it.
 //
 // 2. **Tied to `DeviationRuntime`.** The reparameterisation is applied
-//    via `compose_anchor_orthogonalisation` + `AnchorResidual` on a
+//    via `install_compiled_flex_block` + `InstalledFlexBlock` on a
 //    `DeviationPrepared`; it cannot be pointed at a generic
 //    `ParameterBlockSpec` or at an already-built joint design.
 //
@@ -112,7 +112,7 @@
 // wrapper that builds the spec list (with the BMS-specific W-metric
 // PIRLS row weights), delegates to `audit_identifiability`, then
 // installs the resulting reparameterisation back into
-// `DeviationRuntime` via the existing `AnchorResidual` plumbing.
+// `DeviationRuntime` via the existing `InstalledFlexBlock` plumbing.
 //
 // Coordination:
 //   - `nullspace-lead`: final `ParameterBlockSpec.design` layout
