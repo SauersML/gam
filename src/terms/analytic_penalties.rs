@@ -103,7 +103,7 @@
 
 use faer::Side;
 use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayViewMut1, CowArray, Ix2, Ix3};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use crate::linalg::faer_ndarray::{FaerEigh, FaerSvd};
 use crate::terms::basis::{
@@ -553,7 +553,15 @@ impl WeightField {
 /// cancellation dominates. No autograd needed.
 ///
 /// `μ = exp(ρ_iso)` is REML-selectable as one extra ρ axis.
-#[derive(Debug, Clone)]
+///
+/// `jacobian_cache_slot` and `jacobian_second_cache_slot` are interior-mutable
+/// (`RwLock<Option<Arc<…>>>`) so the SAE outer loop can refresh them in place
+/// each step without needing `&mut self` on the registry-held penalty (see
+/// `refresh_caches` and [`crate::terms::sae_manifold::refresh_isometry_caches_from_atom`]).
+/// Readers go through the [`Self::jacobian_cache`] / [`Self::jacobian_second_cache`]
+/// accessors, which take the read lock briefly and clone the inner `Arc`
+/// (refcount bump — no payload copy). Writers go through [`Self::refresh_caches`].
+#[derive(Debug)]
 pub struct IsometryPenalty {
     pub target: PsiSlice,
     pub reference: IsometryReference,
@@ -563,14 +571,16 @@ pub struct IsometryPenalty {
     /// Cached Jacobian `J ∈ ℝ^{n_obs × p × d}`, flattened row-major
     /// `(n_obs, p*d)`. The owning driver refreshes this each IFT outer step
     /// before invoking `value` / `grad_target`; in operator-only call sites
-    /// (Hessian-vector products) the cache must be live.
-    pub jacobian_cache: Option<Arc<Array2<f64>>>,
+    /// (Hessian-vector products) the cache must be live. Access through
+    /// [`Self::jacobian_cache`] / [`Self::set_jacobian_cache`].
+    pub jacobian_cache_slot: RwLock<Option<Arc<Array2<f64>>>>,
     /// Optional cached per-row Jacobian *second derivative*
     /// `H_n ∈ ℝ^{p × d × d}`, flattened row-major as `(n_obs, p*d*d)`.
     /// `H_n[i, a, c] = ∂J_n[i, a] / ∂t_{n, c}`. Either this cache or
     /// `duchon_radial_source` must be present for exact isometry
-    /// gradient/HVP calls.
-    pub jacobian_second_cache: Option<Arc<Array2<f64>>>,
+    /// gradient/HVP calls. Access through [`Self::jacobian_second_cache`] /
+    /// [`Self::set_jacobian_second_cache`].
+    pub jacobian_second_cache_slot: RwLock<Option<Arc<Array2<f64>>>>,
     /// Optional radial-Duchon source used to build `jacobian_second_cache`
     /// analytically from `φ'(r)` and the public `φ''(r)` jet helper. This is
     /// the exact chain-rule path for callers that do not pre-cache `∂J/∂t`.

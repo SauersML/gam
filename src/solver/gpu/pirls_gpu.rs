@@ -905,6 +905,38 @@ extern "C" __global__ void linf_norm(
         pub deviance: f64,
         pub iterations: usize,
         pub converged: bool,
+        /// Final linear predictor η = X·β at the accepted PIRLS step
+        /// (length `n`). Downloaded once at loop exit; the host-side
+        /// `finalize_pirls_outcome` postpass uses this to drive the
+        /// family-specific aux-jet construction
+        /// (`solve_dmu_deta`, `solve_d2mu_deta2`, `solve_d3mu_deta3`,
+        /// `solve_c_array`, `solve_d_array`) that the CPU oracle
+        /// `fit_model_for_fixed_rho_with_adaptive_kkt` exposes on
+        /// `PirlsResult`. Not used by the GPU loop itself — emitted
+        /// purely so the postpass can reconstruct the CPU surface
+        /// without re-running the design matvec.
+        pub final_eta: Array1<f64>,
+        /// Mean response μ = g⁻¹(η) at the accepted step, length `n`.
+        /// Written by the row kernel into `loop_ws.row_out.mu`; copied
+        /// out at loop exit. Used by the postpass for
+        /// `WorkingState::eta` / `PirlsResult::finalmu` parity.
+        pub final_mu: Array1<f64>,
+        /// Score-side gradient contribution `∂ℓ/∂η_i` at the accepted
+        /// step (length `n`). The CPU oracle calls this
+        /// `working_summary.state.gradient`'s row-side input pre-design-
+        /// matvec; surfacing it lets the postpass reform
+        /// `score_norm = ‖Xᵀ grad_eta‖₂` without recomputing the row
+        /// kernel.
+        pub final_grad_eta: Array1<f64>,
+        /// Hessian-side diagonal working weight `w_hessian_i` at the
+        /// accepted step (length `n`). Mirrors `lasthessian_weights`
+        /// in the CPU oracle and feeds `PirlsResult::finalweights`
+        /// after the postpass curvature classification.
+        pub final_w_hessian: Array1<f64>,
+        /// Score-side diagonal working weight `w_solver_i` at the
+        /// accepted step (length `n`). Mirrors
+        /// `PirlsResult::solveweights`.
+        pub final_w_solver: Array1<f64>,
     }
 
     /// Full device-resident PIRLS loop. Only three scalar (1 f64)
@@ -1154,6 +1186,11 @@ extern "C" __global__ void linf_norm(
                     deviance: prev_deviance,
                     iterations: it + 1,
                     converged,
+                    final_eta: download_vec(&ws.stream, &loop_ws.eta_dev)?,
+                    final_mu: download_vec(&ws.stream, &loop_ws.row_out.mu)?,
+                    final_grad_eta: download_vec(&ws.stream, &loop_ws.row_out.grad_eta)?,
+                    final_w_hessian: download_vec(&ws.stream, &loop_ws.row_out.w_hessian)?,
+                    final_w_solver: download_vec(&ws.stream, &loop_ws.row_out.w_solver)?,
                 });
             }
         }

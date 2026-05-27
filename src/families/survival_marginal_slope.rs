@@ -10848,96 +10848,29 @@ impl SurvivalMarginalSlopeFamily {
             row, &primary, q1, primary.q1, a1, g, beta_h, beta_w, dir, true,
         )?;
 
-        let wi = self.weights[row];
-        let di = self.event[row];
-
-        let (entry_k1, entry_k2, entry_k3, _) =
-            signed_probit_neglog_derivatives_up_to_fourth(-entry.eta, -wi)?;
-        let (exit_k1, exit_k2, exit_k3, _) =
-            signed_probit_neglog_derivatives_up_to_fourth(-exit.eta, wi * (1.0 - di))?;
-
-        let entry_u1 = -entry_k1;
-        let entry_u2 = entry_k2;
-        let entry_u3 = -entry_k3;
-        let exit_u1 = -exit_k1;
-        let exit_u2 = exit_k2;
-        let exit_u3 = -exit_k3;
-
-        let entry_eta_dir = entry.eta_u.dot(dir);
-        let exit_eta_dir = exit.eta_u.dot(dir);
-        let exit_chi_dir = exit.chi_u.dot(dir);
-        let exit_d_dir = exit.d_u.dot(dir);
-        let qd1_dir = dir[primary.qd1];
-
-        let entry_eta_u_dir = entry.eta_uv.dot(dir);
-        let exit_eta_u_dir = exit.eta_uv.dot(dir);
-        let exit_chi_u_dir = exit.chi_uv.dot(dir);
-        let exit_d_u_dir = exit.d_uv.dot(dir);
-
-        let chi = exit.chi;
-        let chi_inv = 1.0 / chi;
-        let chi_inv2 = chi_inv * chi_inv;
-        let chi_inv3 = chi_inv2 * chi_inv;
-        let d_val = exit.d;
-        let d_inv = 1.0 / d_val;
-        let d_inv2 = d_inv * d_inv;
-        let d_inv3 = d_inv2 * d_inv;
-
-        let mut out = Array2::<f64>::zeros((p, p));
-        for u in 0..p {
-            for v in u..p {
-                let mut val = 0.0;
-
-                // Entry probit
-                val += entry_u3 * entry_eta_dir * entry.eta_u[u] * entry.eta_u[v];
-                val += entry_u2
-                    * (entry_eta_u_dir[u] * entry.eta_u[v] + entry.eta_u[u] * entry_eta_u_dir[v]);
-                val += entry_u2 * entry_eta_dir * entry.eta_uv[[u, v]];
-                val += entry_u1 * entry_ext.eta_uv_dir[[u, v]];
-
-                // Exit probit survival
-                val += exit_u3 * exit_eta_dir * exit.eta_u[u] * exit.eta_u[v];
-                val += exit_u2
-                    * (exit_eta_u_dir[u] * exit.eta_u[v] + exit.eta_u[u] * exit_eta_u_dir[v]);
-                val += exit_u2 * exit_eta_dir * exit.eta_uv[[u, v]];
-                val += exit_u1 * exit_ext.eta_uv_dir[[u, v]];
-
-                // Event density
-                val += wi
-                    * di
-                    * (exit_eta_u_dir[u] * exit.eta_u[v]
-                        + exit.eta_u[u] * exit_eta_u_dir[v]
-                        + exit_eta_dir * exit.eta_uv[[u, v]]
-                        + exit.eta * exit_ext.eta_uv_dir[[u, v]]);
-
-                // Event chi
-                let chi_uv_over_chi_dir = (exit_ext.chi_uv_dir[[u, v]] * chi
-                    - exit.chi_uv[[u, v]] * exit_chi_dir)
-                    * chi_inv2;
-                let chi_u_chi_v_over_chi2_dir = (exit_chi_u_dir[u] * exit.chi_u[v]
-                    + exit.chi_u[u] * exit_chi_u_dir[v])
-                    * chi_inv2
-                    - 2.0 * exit.chi_u[u] * exit.chi_u[v] * exit_chi_dir * chi_inv3;
-                val -= wi * di * (chi_uv_over_chi_dir - chi_u_chi_v_over_chi2_dir);
-
-                // Event D
-                let d_uv_over_d_dir =
-                    (exit_ext.d_uv_dir[[u, v]] * d_val - exit.d_uv[[u, v]] * exit_d_dir) * d_inv2;
-                let d_u_d_v_over_d2_dir =
-                    (exit_d_u_dir[u] * exit.d_u[v] + exit.d_u[u] * exit_d_u_dir[v]) * d_inv2
-                        - 2.0 * exit.d_u[u] * exit.d_u[v] * exit_d_dir * d_inv3;
-                val += wi * di * (d_uv_over_d_dir - d_u_d_v_over_d2_dir);
-
-                // qd1 term
-                if u == primary.qd1 && v == primary.qd1 {
-                    val += wi * di * (-2.0 / (qd1 * qd1 * qd1)) * qd1_dir;
-                }
-
-                out[[u, v]] = val;
-                out[[v, u]] = val;
-            }
-        }
-        Ok(out)
+        // Delegate the per-(u, v) assembly to the Block 10 GPU-substrate
+        // pure assembler in `crate::gpu::survival_flex`.  This is the
+        // single source of truth for the third-contraction inner loop —
+        // shared with the GPU dispatch path so CPU/GPU cannot drift.
+        let entry_b = block10_pack_base(&entry);
+        let exit_b = block10_pack_base(&exit);
+        let entry_d = block10_pack_dir(&entry_ext);
+        let exit_d = block10_pack_dir(&exit_ext);
+        let dir_vec: Vec<f64> = dir.to_vec();
+        let inputs = crate::gpu::survival_flex::SurvivalFlexBlock10ThirdInputs {
+            p,
+            qd1_index: primary.qd1,
+            qd1,
+            w: self.weights[row],
+            d: self.event[row],
+            dir: &dir_vec,
+            entry_base: &entry_b,
+            exit_base: &exit_b,
+            entry_ext: &entry_d,
+            exit_ext: &exit_d,
+        };
+        let flat = crate::gpu::survival_flex::cpu_oracle_third_contraction(&inputs)?;
+        Ok(Array2::<f64>::from_shape_vec((p, p), flat).map_err(|e| e.to_string())?)
     }
 
     /// Fourth-order directional contraction for the flexible survival path.
