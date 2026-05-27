@@ -551,13 +551,20 @@ impl LikelihoodSpec {
             (ResponseFamily::Binomial, InverseLink::Mixture(state)) => {
                 FamilySpecKind::BinomialMixture(state.clone())
             }
-            // Legacy fallback: `Binomial + Standard(Logit | Identity | Log | Sas |
-            // BetaLogistic)` all historically named "binomial-logit". The
-            // `binomial_link(LinkFunction::Sas | BetaLogistic)` constructor
-            // produces `Binomial + Standard(Sas | BetaLogistic)` — these are
-            // illegal cells (Sas/BetaLogistic must travel via their own
-            // `InverseLink` variants), but routing them to `BinomialLogit`
-            // preserves the historical fallback behaviour.
+            // Two-phase resolution placeholder. `Binomial + Standard(Sas |
+            // BetaLogistic)` is constructed at CLI-resolution sites (e.g.
+            // `src/main.rs:8646-8654`) **before** the link state has been
+            // configured; downstream paths in `src/main.rs:2308-2324` and
+            // `src/families/survival_location_scale.rs:4170-4180` recognise
+            // the marker and upgrade to `InverseLink::Sas(state)` /
+            // `InverseLink::BetaLogistic(state)` once the state spec is
+            // available. The placeholder is never observed by a real fit
+            // path, so kind() routes it to `BinomialLogit` as a benign
+            // catch-all matching the historical name() output.
+            // `Standard(Logit | Identity | Log)` also lands here — Logit
+            // is genuinely "binomial-logit"; Identity / Log are
+            // structurally impossible for the binomial family (the type
+            // system permits the cell but no construction site reaches it).
             (ResponseFamily::Binomial, InverseLink::Standard(_)) => FamilySpecKind::BinomialLogit,
         }
     }
