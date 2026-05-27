@@ -33,10 +33,9 @@ mod linux_impl {
         calculate_loglikelihood_omitting_constants, compute_observed_hessian_curvature_arrays,
         computeworkingweight_derivatives_from_eta,
     };
-    use crate::types::{
-        Coefficients, DesignMatrix, GlmLikelihoodSpec, InverseLink, LinearPredictor,
-        ReparamResult,
-    };
+    use crate::construction::ReparamResult;
+    use crate::matrix::DesignMatrix;
+    use crate::types::{Coefficients, GlmLikelihoodSpec, InverseLink, LinearPredictor};
 
     /// All inputs needed for the GPU PIRLS loop end-to-end. Built by the
     /// CPU PIRLS driver right before it would invoke `runworking_model_pirls`,
