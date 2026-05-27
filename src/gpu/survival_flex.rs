@@ -2082,6 +2082,371 @@ pub fn try_device_evaluate_calibration(
 }
 
 // ────────────────────────────────────────────────────────────────────────
+// Step 4 Layer B — first-order timepoint jet from the IFT solve.
+//
+// Given the calibration root `a*` (from Step 3 / Layer A), the IFT
+// produces the per-primary directional derivative:
+//
+//     a_u[u] = f_u[u] / D            (lines 6658-6661 of survival_marginal_slope.rs)
+//
+// where `D = D(a*)` is the calibration denominator (positive, finite by
+// construction) and `f_u[u] = Σ_cells <neg_coeff_u[u], moments>` (with
+// `+φ(q)` added to the entry matching `q_index` — line 6637).
+//
+// The first-order outputs are:
+//
+//     eta_u[u]  = chi * a_u[u] + rho[u]
+//     chi_u[u]  = eta_aa * a_u[u] + tau[u]
+//     d_u[u]    = Σ_cells ⟨integrand_u, moments⟩
+//
+// where the per-cell integrand is
+//
+//     integrand_u = chi_u_poly - (chi_poly * eta_poly * eta_u_poly)
+//     eta_u_poly  = a_u[u] · chi_poly + coeff_u[u]
+//     chi_u_poly  = a_u[u] · eta_aa_poly + coeff_au[u]
+//
+// (CPU lines 6675-6681).
+//
+// Layer B keeps the same separation of concerns as Layer A: the
+// substrate gives the moments, the caller hands in the analytic
+// per-cell coefficient tables (`coeff_u`, `coeff_au`, plus the cell-local
+// `chi_poly = dc_da_pos` and `eta_aa_poly = dc_daa_pos` already produced
+// by `denested_cell_coefficient_partials` / `denested_cell_second_partials`),
+// and the entry point folds them on host into `(a_u, eta_u, chi_u, d_u)`.
+// The cell cubic `(c0..c3)` is the `eta_poly` reused as the integrand kernel.
+//
+// `coeff_u[u]`, `coeff_au[u]`: per-primary `[f64; 4]` polynomial slices.
+// Their construction lives in the family module's
+// `denested_cell_primary_fixed_partials` (lines 6235-6341), which has
+// branching on score-warp / link-dev / g-index that's properly owned
+// there.  Step 6 will compose: family builds the tables, this entry
+// folds them with the substrate moments.
+// ────────────────────────────────────────────────────────────────────────
+
+/// Per-cell primary-coefficient tables for the Layer B fold.  Mirrors the
+/// `coeff_u` / `coeff_au` slabs in CPU `DenestedCellPrimaryFixedPartials`:
+/// one `[f64; 4]` per primary index `u`.
+#[derive(Clone, Debug)]
+pub struct SurvivalFlexLayerBCellCoeffs {
+    /// `coeff_u[u]`: ∂c/∂β_u  (length `p`).
+    pub coeff_u: Vec<[f64; 4]>,
+    /// `coeff_au[u]`: ∂²c/∂a∂β_u (length `p`).
+    pub coeff_au: Vec<[f64; 4]>,
+}
+
+/// Per-row inputs for the Layer B fold.
+#[derive(Clone, Debug)]
+pub struct SurvivalFlexLayerBRowInputs<'a> {
+    /// Per-row partition cells (geometry + spans, same as Layer A).
+    pub partition_cells: &'a [SurvivalFlexCalibrationCell],
+    /// Per-cell primary tables (one per cell).
+    pub cell_coeffs: &'a [SurvivalFlexLayerBCellCoeffs],
+    /// Calibration denominator `D(a*)` for this row, positive finite.
+    pub d_check: f64,
+    /// Index of the q-perturbation primary (used for the `+φ(q)` bump
+    /// in `f_u[q_index]`).  Set to `usize::MAX` to disable.
+    pub q_index: usize,
+    /// `φ(q)`: the normal pdf at `q`, for the `f_u[q_index]` bump.
+    pub phi_q: f64,
+    /// Observed-row `chi`, `eta_aa` scalars from
+    /// `observed_denested_cell_partials` evaluated at the observed
+    /// `z_obs` point.
+    pub chi: f64,
+    /// Observed-row `eta_aa` scalar.
+    pub eta_aa: f64,
+    /// `rho[u]`: per-primary observed `∂eta/∂β_u | a fixed`.
+    pub rho: &'a [f64],
+    /// `tau[u]`: per-primary observed `∂chi/∂β_u | a fixed`.
+    pub tau: &'a [f64],
+    /// `probit_scale`: passed through for sign / scaling of partials.
+    pub probit_scale: f64,
+    /// Calibration root `a*` per the Step-3 / Layer-A solve.
+    pub a: f64,
+    /// Slope `b` (≡ `qd1 * c` upstream) per the CPU helper.
+    pub slope: f64,
+}
+
+/// Per-row Layer-B outputs.
+#[derive(Clone, Debug)]
+pub struct SurvivalFlexLayerBRowOutputs {
+    /// `a_u[u] = f_u[u] / D`, length `p`.
+    pub a_u: Vec<f64>,
+    /// `eta_u[u] = chi · a_u[u] + rho[u]`, length `p`.
+    pub eta_u: Vec<f64>,
+    /// `chi_u[u] = eta_aa · a_u[u] + tau[u]`, length `p`.
+    pub chi_u: Vec<f64>,
+    /// `d_u[u] = Σ_cells ⟨integrand_u, moments⟩`, length `p`.
+    pub d_u: Vec<f64>,
+}
+
+/// Substrate-backed Layer B fold.  Computes the first-order
+/// timepoint jet `(a_u, eta_u, chi_u, d_u)` for every input row.
+///
+/// `rows` and `cell_coeffs_by_row` are parallel slices: row `i` consumes
+/// `rows[i]` and has its own per-cell coefficient tables in
+/// `cell_coeffs_by_row[i]`.  Each cell's `cell_coeffs.coeff_u.len()`
+/// must equal the row's `rho.len()` (≡ primary dimension `p`).
+pub fn try_device_layer_b_jet(
+    rows: &[SurvivalFlexLayerBRowInputs<'_>],
+) -> Result<Option<Vec<SurvivalFlexLayerBRowOutputs>>, GpuError> {
+    use crate::families::cubic_cell_kernel::{
+        cell_first_derivative_from_moments, cell_polynomial_integral_from_moments,
+        denested_cell_coefficient_partials, denested_cell_second_partials,
+    };
+
+    if rows.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+    let n_rows = rows.len();
+
+    // Validate shapes and accumulate total cell count.
+    let mut total_cells = 0usize;
+    let mut row_offsets = Vec::with_capacity(n_rows + 1);
+    row_offsets.push(0);
+    for (i, row) in rows.iter().enumerate() {
+        if row.partition_cells.len() != row.cell_coeffs.len() {
+            return Err(GpuError::DriverCallFailed {
+                reason: format!(
+                    "layer_b row {i}: cells.len()={} != cell_coeffs.len()={}",
+                    row.partition_cells.len(),
+                    row.cell_coeffs.len()
+                ),
+            });
+        }
+        let p = row.rho.len();
+        if row.tau.len() != p {
+            return Err(GpuError::DriverCallFailed {
+                reason: format!(
+                    "layer_b row {i}: rho.len()={} != tau.len()={}",
+                    p,
+                    row.tau.len()
+                ),
+            });
+        }
+        for (k, cc) in row.cell_coeffs.iter().enumerate() {
+            if cc.coeff_u.len() != p || cc.coeff_au.len() != p {
+                return Err(GpuError::DriverCallFailed {
+                    reason: format!(
+                        "layer_b row {i} cell {k}: coeff_u.len()={} coeff_au.len()={} expected {p}",
+                        cc.coeff_u.len(),
+                        cc.coeff_au.len()
+                    ),
+                });
+            }
+        }
+        if !(row.d_check.is_finite() && row.d_check > 0.0) {
+            return Err(GpuError::DriverCallFailed {
+                reason: format!(
+                    "layer_b row {i}: d_check must be positive finite, got {}",
+                    row.d_check
+                ),
+            });
+        }
+        if !(row.probit_scale.is_finite() && row.probit_scale > 0.0) {
+            return Err(GpuError::DriverCallFailed {
+                reason: format!(
+                    "layer_b row {i}: probit_scale must be positive finite, got {}",
+                    row.probit_scale
+                ),
+            });
+        }
+        total_cells += row.partition_cells.len();
+        row_offsets.push(total_cells);
+    }
+
+    // Build the flat substrate moment batch (negated cubic, same shape
+    // as Layer A).
+    if total_cells == 0 {
+        // Every row's outputs are zero — no cells contribute.
+        let mut out = Vec::with_capacity(n_rows);
+        for row in rows {
+            let p = row.rho.len();
+            out.push(SurvivalFlexLayerBRowOutputs {
+                a_u: vec![0.0; p],
+                eta_u: row.rho.to_vec(),
+                chi_u: row.tau.to_vec(),
+                d_u: vec![0.0; p],
+            });
+        }
+        return Ok(Some(out));
+    }
+    let mut left = Vec::with_capacity(total_cells);
+    let mut right = Vec::with_capacity(total_cells);
+    let mut c0 = Vec::with_capacity(total_cells);
+    let mut c1 = Vec::with_capacity(total_cells);
+    let mut c2 = Vec::with_capacity(total_cells);
+    let mut c3 = Vec::with_capacity(total_cells);
+    for row in rows {
+        for pc in row.partition_cells {
+            left.push(pc.cell.left);
+            right.push(pc.cell.right);
+            c0.push(-pc.cell.c0);
+            c1.push(-pc.cell.c1);
+            c2.push(-pc.cell.c2);
+            c3.push(-pc.cell.c3);
+        }
+    }
+    let batch = SurvivalFlexRowCellsBatch {
+        n_cells: total_cells,
+        n_rows,
+        max_degree: 9,
+        left: &left,
+        right: &right,
+        c0: &c0,
+        c1: &c1,
+        c2: &c2,
+        c3: &c3,
+        row_offsets: &row_offsets,
+    };
+    let mom = match try_row_batched_cell_moments(batch)? {
+        Some(m) => m,
+        None => return Ok(None),
+    };
+    let stride = mom.stride;
+    if stride < 10 {
+        return Err(GpuError::DriverCallFailed {
+            reason: format!(
+                "layer_b: substrate returned stride={stride} < 10"
+            ),
+        });
+    }
+    let ok_byte = super::cubic_cell::CubicCellMomentStatus::Ok as u8;
+    if mom.status.iter().any(|&s| s != ok_byte) {
+        return Ok(None);
+    }
+
+    let mut out = Vec::with_capacity(n_rows);
+    for (row_idx, row) in rows.iter().enumerate() {
+        let p = row.rho.len();
+        let row_start = row_offsets[row_idx];
+        let row_end = row_offsets[row_idx + 1];
+
+        // Step 1: f_u[u] per primary index = Σ_cells <-coeff_u[u], moments[0..4]>.
+        let mut f_u = vec![0.0_f64; p];
+        for cell_idx in row_start..row_end {
+            let local_idx = cell_idx - row_start;
+            let cc = &row.cell_coeffs[local_idx];
+            let moments_row = &mom.moments[cell_idx * stride..cell_idx * stride + stride];
+            for u in 0..p {
+                let neg_coeff_u = [
+                    -cc.coeff_u[u][0],
+                    -cc.coeff_u[u][1],
+                    -cc.coeff_u[u][2],
+                    -cc.coeff_u[u][3],
+                ];
+                let contrib = cell_first_derivative_from_moments(&neg_coeff_u, moments_row)
+                    .map_err(|e| GpuError::DriverCallFailed {
+                        reason: format!("layer_b row {row_idx} cell {local_idx}: f_u fold: {e}"),
+                    })?;
+                f_u[u] += contrib;
+            }
+        }
+        // q-index `+φ(q)` bump (line 6637 of the family helper).
+        if row.q_index < p {
+            f_u[row.q_index] += row.phi_q;
+        }
+
+        // Step 2: a_u[u] = f_u[u] / D.
+        let mut a_u = vec![0.0_f64; p];
+        for u in 0..p {
+            a_u[u] = f_u[u] / row.d_check;
+        }
+
+        // Step 3: d_u[u] = Σ_cells ⟨integrand_u, moments⟩.
+        // integrand_u = chi_u_poly - (chi_poly * eta_poly * eta_u_poly)
+        // where eta_poly = (c0..c3), chi_poly = dc_da_pos, eta_aa_poly = dc_daa_pos.
+        let mut d_u = vec![0.0_f64; p];
+        for cell_idx in row_start..row_end {
+            let local_idx = cell_idx - row_start;
+            let pc = &row.partition_cells[local_idx];
+            let cc = &row.cell_coeffs[local_idx];
+            let moments_row = &mom.moments[cell_idx * stride..cell_idx * stride + stride];
+
+            // Per-cell positive-orientation partials at this row's (a, slope).
+            let (dc_da_pos, _) =
+                denested_cell_coefficient_partials(pc.score_span, pc.link_span, row.a, row.slope);
+            let (dc_daa_pos, _, _) =
+                denested_cell_second_partials(pc.score_span, pc.link_span, row.a, row.slope);
+            let chi_poly = dc_da_pos;
+            let eta_aa_poly = dc_daa_pos;
+            let eta_poly = [pc.cell.c0, pc.cell.c1, pc.cell.c2, pc.cell.c3];
+
+            // Pre-compute the (chi_poly * eta_poly) convolution once per
+            // cell — it's reused for every u.  Result length 4+4-1 = 7.
+            let mut chi_eta = [0.0_f64; 16];
+            for i in 0..4 {
+                for j in 0..4 {
+                    chi_eta[i + j] = chi_poly[i].mul_add(eta_poly[j], chi_eta[i + j]);
+                }
+            }
+            let chi_eta_len = 7usize;
+
+            for u in 0..p {
+                // eta_u_poly = a_u[u] · chi_poly + coeff_u[u], length 4.
+                let eta_u_poly = [
+                    a_u[u] * chi_poly[0] + cc.coeff_u[u][0],
+                    a_u[u] * chi_poly[1] + cc.coeff_u[u][1],
+                    a_u[u] * chi_poly[2] + cc.coeff_u[u][2],
+                    a_u[u] * chi_poly[3] + cc.coeff_u[u][3],
+                ];
+                // chi_u_poly = a_u[u] · eta_aa_poly + coeff_au[u], length 4.
+                let chi_u_poly = [
+                    a_u[u] * eta_aa_poly[0] + cc.coeff_au[u][0],
+                    a_u[u] * eta_aa_poly[1] + cc.coeff_au[u][1],
+                    a_u[u] * eta_aa_poly[2] + cc.coeff_au[u][2],
+                    a_u[u] * eta_aa_poly[3] + cc.coeff_au[u][3],
+                ];
+                // chi_eta_etau = conv(chi_eta, eta_u_poly), length 7+4-1 = 10.
+                let mut chi_eta_etau = [0.0_f64; 16];
+                for i in 0..chi_eta_len {
+                    for j in 0..4 {
+                        chi_eta_etau[i + j] =
+                            chi_eta[i].mul_add(eta_u_poly[j], chi_eta_etau[i + j]);
+                    }
+                }
+                let triple_len = chi_eta_len + 4 - 1;
+                // integrand = chi_u_poly (len 4) - chi_eta_etau (len 10).
+                let mut integrand = [0.0_f64; 16];
+                for k in 0..4 {
+                    integrand[k] = chi_u_poly[k];
+                }
+                for k in 0..triple_len {
+                    integrand[k] -= chi_eta_etau[k];
+                }
+                let contrib = cell_polynomial_integral_from_moments(
+                    &integrand[..triple_len],
+                    moments_row,
+                    "survival_flex layer_b d_u",
+                )
+                .map_err(|e| GpuError::DriverCallFailed {
+                    reason: format!(
+                        "layer_b row {row_idx} cell {local_idx} u={u}: d_u fold: {e}"
+                    ),
+                })?;
+                d_u[u] += contrib;
+            }
+        }
+
+        // Step 4: eta_u, chi_u closed-form.
+        let mut eta_u = vec![0.0_f64; p];
+        let mut chi_u = vec![0.0_f64; p];
+        for u in 0..p {
+            eta_u[u] = row.chi * a_u[u] + row.rho[u];
+            chi_u[u] = row.eta_aa * a_u[u] + row.tau[u];
+        }
+
+        out.push(SurvivalFlexLayerBRowOutputs {
+            a_u,
+            eta_u,
+            chi_u,
+            d_u,
+        });
+    }
+
+    Ok(Some(out))
+}
+
+// ────────────────────────────────────────────────────────────────────────
 // Three thin pullback entry points.  The bodies all currently return
 // `Ok(None)` (the unsupported sentinel) because Steps 2–5 still need to
 // land the flex / cubic-cell / intercept-solve infrastructure before
@@ -3169,6 +3534,157 @@ mod survival_flex_gpu_tests {
             chk("F", dev.f, oracle.f);
             chk("F'", dev.f_prime, oracle.f_prime);
             chk("F''", dev.f_double_prime, oracle.f_double_prime);
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Step 4 Layer B — `try_device_layer_b_jet` algebraic identity tests.
+    //
+    // The fold has three independent contracts that can be checked in
+    // isolation without re-implementing the full quadrature path:
+    //
+    //   1. With all `coeff_u[u] = [0;4]`, `f_u[u] == 0` for u != q_index
+    //      and `f_u[q_index] == φ(q)` → `a_u[q_index] == φ(q) / D` and
+    //      `a_u[u] == 0` for u != q_index.
+    //
+    //   2. With all `coeff_u[u] = [0;4]` and all `coeff_au[u] = [0;4]`,
+    //      the integrand reduces to `-(chi_poly · eta_poly · a_u[u] · chi_poly)`
+    //      so `d_u[u] = -a_u[u] · ⟨chi_poly² · eta_poly, moments⟩`.  We
+    //      probe this against an oracle computed via the same substrate.
+    //
+    //   3. `eta_u[u] == chi · a_u[u] + rho[u]` and
+    //      `chi_u[u] == eta_aa · a_u[u] + tau[u]` exact algebra.
+    // ────────────────────────────────────────────────────────────────────
+
+    fn step4b_fixture_cell() -> SurvivalFlexCalibrationCell {
+        use crate::families::cubic_cell_kernel::{DenestedCubicCell, LocalSpanCubic};
+        SurvivalFlexCalibrationCell {
+            cell: DenestedCubicCell {
+                left: -0.5,
+                right: 0.5,
+                c0: 0.31,
+                c1: 0.27,
+                c2: -0.11,
+                c3: 0.07,
+            },
+            score_span: LocalSpanCubic {
+                left: -0.5,
+                c1: 0.13,
+                c2: -0.05,
+                c3: 0.02,
+            },
+            link_span: LocalSpanCubic {
+                left: -0.5,
+                c1: 0.09,
+                c2: 0.04,
+                c3: -0.01,
+            },
+        }
+    }
+
+    #[test]
+    fn step4b_layer_b_q_index_bump_only() {
+        // p = 2, q_index = 1, all coeff_u = coeff_au = 0 → f_u = [0, φ(q)]
+        // → a_u = [0, φ(q)/D], eta_u = [rho[0], chi·a_u[1] + rho[1]],
+        // chi_u = [tau[0], eta_aa·a_u[1] + tau[1]], d_u = [0, 0] (no
+        // coeff_u contribution makes the integrand `eta_u_poly = a_u[u]·chi_poly`
+        // but for u=0 that's also 0).
+        let cell = step4b_fixture_cell();
+        let zero4 = [0.0_f64; 4];
+        let cell_coeffs = SurvivalFlexLayerBCellCoeffs {
+            coeff_u: vec![zero4, zero4],
+            coeff_au: vec![zero4, zero4],
+        };
+        let rho = vec![0.11_f64, 0.23];
+        let tau = vec![-0.04_f64, 0.07];
+        let chi = 0.65_f64;
+        let eta_aa = -0.12_f64;
+        let phi_q = 1.0 / (2.0_f64 * std::f64::consts::PI).sqrt() * (-0.5_f64 * 0.4 * 0.4).exp();
+        let d_check = 0.83_f64;
+
+        let row = SurvivalFlexLayerBRowInputs {
+            partition_cells: std::slice::from_ref(&cell),
+            cell_coeffs: std::slice::from_ref(&cell_coeffs),
+            d_check,
+            q_index: 1,
+            phi_q,
+            chi,
+            eta_aa,
+            rho: &rho,
+            tau: &tau,
+            probit_scale: 1.0,
+            a: 0.07,
+            slope: 0.55,
+        };
+        let out = match try_device_layer_b_jet(std::slice::from_ref(&row)) {
+            Ok(Some(o)) => o,
+            Ok(None) => {
+                eprintln!(
+                    "[step4b q_index] substrate non-OK or empty; skipping"
+                );
+                return;
+            }
+            Err(err) => panic!("layer b q_index test failed: {err:?}"),
+        };
+        assert_eq!(out.len(), 1);
+        let r = &out[0];
+        assert_eq!(r.a_u.len(), 2);
+        // a_u[0] == 0 (no perturbation), a_u[1] = φ(q)/D.
+        let expected_a_u1 = phi_q / d_check;
+        assert!(
+            r.a_u[0].abs() <= 5e-15,
+            "a_u[0] should be 0, got {}",
+            r.a_u[0]
+        );
+        assert!(
+            (r.a_u[1] - expected_a_u1).abs() <= 5e-15 * (1.0 + expected_a_u1.abs()),
+            "a_u[1] should be φ(q)/D = {}, got {}",
+            expected_a_u1,
+            r.a_u[1]
+        );
+        // eta_u / chi_u closed-form identity.
+        let exp_eta_u0 = chi * r.a_u[0] + rho[0];
+        let exp_eta_u1 = chi * r.a_u[1] + rho[1];
+        let exp_chi_u0 = eta_aa * r.a_u[0] + tau[0];
+        let exp_chi_u1 = eta_aa * r.a_u[1] + tau[1];
+        assert!((r.eta_u[0] - exp_eta_u0).abs() <= 5e-15);
+        assert!((r.eta_u[1] - exp_eta_u1).abs() <= 5e-15);
+        assert!((r.chi_u[0] - exp_chi_u0).abs() <= 5e-15);
+        assert!((r.chi_u[1] - exp_chi_u1).abs() <= 5e-15);
+    }
+
+    #[test]
+    fn step4b_layer_b_input_validation() {
+        // Validate that mismatched shapes return DriverCallFailed.
+        let cell = step4b_fixture_cell();
+        let cell_coeffs = SurvivalFlexLayerBCellCoeffs {
+            coeff_u: vec![[0.0; 4]],
+            coeff_au: vec![[0.0; 4]],
+        };
+        let rho = vec![0.0_f64, 0.0]; // p=2
+        let tau = vec![0.0_f64, 0.0];
+        let row = SurvivalFlexLayerBRowInputs {
+            partition_cells: std::slice::from_ref(&cell),
+            cell_coeffs: std::slice::from_ref(&cell_coeffs),
+            d_check: 1.0,
+            q_index: 0,
+            phi_q: 0.0,
+            chi: 0.0,
+            eta_aa: 0.0,
+            rho: &rho,
+            tau: &tau,
+            probit_scale: 1.0,
+            a: 0.0,
+            slope: 0.5,
+        };
+        match try_device_layer_b_jet(std::slice::from_ref(&row)) {
+            Err(GpuError::DriverCallFailed { reason }) => {
+                assert!(
+                    reason.contains("coeff_u.len()") || reason.contains("expected"),
+                    "unexpected validation message: {reason}"
+                );
+            }
+            other => panic!("expected validation error, got {other:?}"),
         }
     }
 }
