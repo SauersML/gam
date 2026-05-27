@@ -18428,6 +18428,123 @@ pub fn fit_survival_marginal_slope_terms(
     let (logslope_design, logslopespec_boot, logslope_surface_ranges) =
         combine_logslope_surface_designs(joint_designs, &joint_specs)?;
 
+    // Phase-4b parametric identifiability pre-flight (observability-only).
+    //
+    // Runs `compile_survival_parametric_designs` on the three SMGS
+    // parametric blocks (time, marginal, logslope) with a structural
+    // identity row Hessian to detect cross-block aliasing in the
+    // (q₀, q₁, q′₁, g) row primary state BEFORE the pilot or outer
+    // Newton starts. The drops_by_block tuple is logged at INFO so the
+    // user sees an immediate, actionable diagnostic when the joint
+    // parametric design carries redundant directions — strictly tighter
+    // and more structured than the post-construction
+    // `audit_identifiability` fatal gate (which sees only the official
+    // per-block design, not the full (entry, exit, derivative_exit)
+    // triplet that lives in the family primary operator).
+    //
+    // Why observability-only here (not applied): the family's
+    // `evaluate_blockwise_exact_newton` row-Hessian assembly
+    // (`syr_row_into_view` / `row_outer_into_view`) asserts that the
+    // captured `marginal_design` / `logslope_design` widths equal the
+    // workspace slice widths. Threading the compiled (V-transformed)
+    // designs through `make_family` and the downstream PIRLS workspace
+    // requires width-consistent updates across the >2 000-line
+    // `evaluate_blockwise_exact_newton` family of methods that is
+    // currently outside this pre-flight's scope. The
+    // `canonicalize_for_identifiability` fail-closed gate covers the
+    // resulting unsafe-reduce path; this pre-flight gives the user
+    // earlier visibility into the same diagnostic. When the family
+    // contract is updated to accept compiled designs (a follow-up
+    // commit), replace the `log::info!` below with a call to
+    // `apply_survival_parametric_compile_to_designs` and re-route
+    // `make_family` to the compiled triplet — that is the one-line
+    // promotion from observability-only to active reduction.
+    {
+        use crate::families::survival_marginal_slope_identifiability::{
+            SurvivalRowHessian, compile_survival_parametric_designs,
+        };
+        let n_rows = spec.time_block.design_entry.nrows();
+        let preflight = (|| -> Result<(), String> {
+            let dq0 = spec
+                .time_block
+                .design_entry
+                .try_to_dense_by_chunks("smgs phase-4b preflight time_entry")?;
+            let dq1 = spec
+                .time_block
+                .design_exit
+                .try_to_dense_by_chunks("smgs phase-4b preflight time_exit")?;
+            let dqd1 = spec
+                .time_block
+                .design_derivative_exit
+                .try_to_dense_by_chunks("smgs phase-4b preflight time_deriv")?;
+            let m_dq = marginal_design
+                .design
+                .try_to_dense_by_chunks("smgs phase-4b preflight marginal")?;
+            let m_dqd1 = ndarray::Array2::<f64>::zeros(m_dq.dim());
+            let g_dg = logslope_design
+                .design
+                .try_to_dense_by_chunks("smgs phase-4b preflight logslope")?;
+            // Identity 4×4 row Hessian per row — purely structural
+            // orthogonalisation in the K=4 row primary space. A data-
+            // adaptive row Hessian (PSD-clamped from the pilot β) is
+            // strictly more informative but requires the pilot β, which
+            // is established further down the construction site; the
+            // structural pass already catches every column-level cross-
+            // block alias (the only failure mode the biobank repro
+            // surfaced).
+            let mut h_full =
+                ndarray::Array3::<f64>::zeros((n_rows, 4, 4));
+            for i in 0..n_rows {
+                for k in 0..4 {
+                    h_full[[i, k, k]] = 1.0;
+                }
+            }
+            let row_hess = SurvivalRowHessian::from_full(h_full);
+            let compiled = compile_survival_parametric_designs(
+                dq0, dq1, dqd1, m_dq, m_dqd1, g_dg, &row_hess,
+            )?;
+            let (dt, dm, dg) = compiled.drops_by_block;
+            if dt + dm + dg > 0 {
+                log::info!(
+                    "[smgs phase-4b preflight] cross-block parametric alias detected: \
+                     time_drops={} marginal_drops={} logslope_drops={} \
+                     (V_time={}→{}, V_marginal={}→{}, V_logslope={}→{}). \
+                     Currently observability-only; canonicalize_for_identifiability \
+                     fail-closes downstream if the alias also surfaces in the per-block \
+                     audit.",
+                    dt,
+                    dm,
+                    dg,
+                    spec.time_block.design_exit.ncols(),
+                    compiled.v_time.ncols(),
+                    marginal_design.design.ncols(),
+                    compiled.v_marginal.ncols(),
+                    logslope_design.design.ncols(),
+                    compiled.v_logslope.ncols(),
+                );
+            } else {
+                log::debug!(
+                    "[smgs phase-4b preflight] parametric joint design is rank-clean: \
+                     no cross-block aliasing in (q0, q1, qd1, g) primary state \
+                     (raw widths time={} marginal={} logslope={})",
+                    spec.time_block.design_exit.ncols(),
+                    marginal_design.design.ncols(),
+                    logslope_design.design.ncols(),
+                );
+            }
+            Ok(())
+        })();
+        if let Err(reason) = preflight {
+            // Pre-flight is observability-only; an internal error here
+            // (e.g. densification budget exceeded) does NOT abort the
+            // fit — the downstream audit / fail-closed gate remains
+            // the source of truth.
+            log::warn!(
+                "[smgs phase-4b preflight] skipped: {reason}",
+            );
+        }
+    }
+
     let time_penalties_len = spec.time_block.penalties.len();
     let mut cross_block_warnings: Vec<CrossBlockIdentifiabilityWarning> = Vec::new();
     // Cross-block W metric: build the survival rigid pooled-probit pilot η
