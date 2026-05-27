@@ -1,4 +1,4 @@
-use gam::inference::prediction_linalg::PredictionCovarianceBackend;
+use gam::inference::predict::linalg::PredictionCovarianceBackend;
 use gam::matrix::SymmetricMatrix;
 use gam::predict::{
     InferenceCovarianceMode, MeanIntervalMethod, PredictPosteriorMeanResult,

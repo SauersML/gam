@@ -75,7 +75,7 @@ fn predict_after_load_on_cpu_only_host_does_not_panic_with_cudarc() {
             assert!(
                 matches!(
                     direct_probe,
-                    Err(gam::gpu::GpuProbeError::Driver(ref reason))
+                    Err(gam::gpu::GpuError::DriverLibraryUnavailable { ref reason })
                         if reason == "libcuda unavailable"
                 ),
                 "absent libcuda must be surfaced as a concise driver probe failure before any cudarc driver entry point is invoked"

@@ -57,7 +57,7 @@ use gam::inference::model::{
     append_deployment_extension_columns,
 };
 use gam::inference::posterior_bands::{self, PosteriorPredictBandsPayload};
-use gam::inference::predict_input::build_predict_input_for_model;
+use gam::inference::predict::input::build_predict_input_for_model;
 use gam::kernels::sinkhorn_barycenter::{
     circular_cost as sinkhorn_circular_cost_impl, euclidean_cost as sinkhorn_euclidean_cost_impl,
     geodesic_sphere_cost as sinkhorn_geodesic_sphere_cost_impl,
