@@ -1848,6 +1848,143 @@ mod pirls_row_gpu_tests {
         }
     }
 
+    /// Stage 6 Level B: caller-supplied raw CUDA body (no built-in
+    /// family enum) must produce byte-identical outputs to the cached
+    /// built-in `GaussianIdentity` kernel on the same fixture. The
+    /// raw body below is written from scratch — different statement
+    /// layout, different intermediate names — but performs the same
+    /// floating-point operations in the same order as
+    /// `gaussian_identity_body`, so the bit pattern of every output
+    /// must match the built-in kernel exactly.
+    #[test]
+    fn jit_raw_body_kernel_matches_builtin_gaussian_byte_identical() {
+        if super::super::runtime::GpuRuntime::global().is_none() {
+            eprintln!("[stage_6_jit_raw] no CUDA runtime — skipping");
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // 256-row deterministic fixture covering positive/negative
+            // residuals, zero residuals, varying prior weights, and a
+            // zero-weight row (exercises the `(wp > 0.0)` branch in
+            // `w_solver`).
+            let n: usize = 256;
+            let mut etas = vec![0.0_f64; n];
+            let mut ys = vec![0.0_f64; n];
+            let mut priors = vec![0.0_f64; n];
+            for i in 0..n {
+                let t = (i as f64) / (n as f64 - 1.0); // 0..=1
+                etas[i] = -3.0 + 6.0 * t;
+                ys[i] = 5.0 * (t - 0.5);
+                priors[i] = if i == 7 {
+                    0.0 // zero-weight row
+                } else {
+                    0.25 + 1.75 * t
+                };
+            }
+
+            let family = PirlsRowFamily::GaussianIdentity;
+            let curvature = CurvatureMode::Fisher;
+            let backend =
+                PirlsRowBackend::probe().expect("backend probe on CUDA host");
+            let runtime = super::super::runtime::GpuRuntime::global()
+                .expect("GPU runtime available");
+            let ctx = super::super::runtime::cuda_context_for(
+                runtime.selected_device().ordinal,
+            )
+            .expect("ctx");
+            let stream = ctx.default_stream();
+
+            let mut eta_dev = stream.alloc_zeros::<f64>(n).expect("eta");
+            let mut y_dev = stream.alloc_zeros::<f64>(n).expect("y");
+            let mut prior_dev = stream.alloc_zeros::<f64>(n).expect("prior");
+            stream.memcpy_htod(&etas, &mut eta_dev).expect("up eta");
+            stream.memcpy_htod(&ys, &mut y_dev).expect("up y");
+            stream.memcpy_htod(&priors, &mut prior_dev).expect("up prior");
+
+            // Built-in Level A Gaussian-identity kernel (reference).
+            let mut out_builtin =
+                RowOutputDevBuffers::allocate(&stream, n).expect("alloc builtin");
+            launch_row_reweight_on_stream(
+                backend,
+                family,
+                curvature,
+                &stream,
+                n,
+                &eta_dev,
+                &y_dev,
+                &prior_dev,
+                &mut out_builtin,
+            )
+            .expect("builtin launch");
+
+            // Level B raw-body Gaussian-identity kernel. Source is
+            // written by hand against the JitFamilySpec contract: read
+            // eta_i, y_i, wp; assign mu, grad_eta, w_fisher, w_hessian,
+            // w_solver, z_f, z_h, dev. The op sequence matches
+            // `gaussian_identity_body` exactly so the result is
+            // bit-identical to the built-in path.
+            let raw_body = r#"    // level-b raw body: gaussian identity (hand-written)
+    // identity link: mu = eta
+    double mu = eta_i;
+    // ordinary residual on the response scale
+    double resid = y_i - mu;
+    // canonical score contribution
+    double grad_eta = wp * resid;
+    // fisher info per row: weight itself (V(mu)=1, dmu/deta=1)
+    double w_fisher = wp;
+    // observed == fisher for canonical identity link
+    double w_hessian = wp;
+    // solver weight clamps tiny positives to avoid singularity
+    double w_solver = (wp > 0.0) ? fmax(wp, 1e-12) : 0.0;
+    // working response equals raw response on identity link
+    double z_f = y_i;
+    double z_h = y_i;
+    // squared-error contribution to deviance
+    double dev = wp * resid * resid;
+"#;
+            let spec = JitFamilySpec::raw(0x5241_575f_4741_5553u64, raw_body);
+            let mut out_jit =
+                RowOutputDevBuffers::allocate(&stream, n).expect("alloc jit");
+            launch_row_reweight_jit_on_stream(
+                backend,
+                &spec,
+                curvature,
+                &stream,
+                n,
+                &eta_dev,
+                &y_dev,
+                &prior_dev,
+                &mut out_jit,
+            )
+            .expect("jit raw launch");
+            stream.synchronize().expect("sync");
+
+            for (label, b_dev, j_dev) in [
+                ("mu", &out_builtin.mu, &out_jit.mu),
+                ("grad_eta", &out_builtin.grad_eta, &out_jit.grad_eta),
+                ("w_fisher", &out_builtin.w_fisher, &out_jit.w_fisher),
+                ("w_hessian", &out_builtin.w_hessian, &out_jit.w_hessian),
+                ("w_solver", &out_builtin.w_solver, &out_jit.w_solver),
+                ("z_fisher", &out_builtin.z_fisher, &out_jit.z_fisher),
+                ("z_hessian", &out_builtin.z_hessian, &out_jit.z_hessian),
+                ("deviance", &out_builtin.deviance, &out_jit.deviance),
+            ] {
+                let b = stream.clone_dtoh(b_dev).expect("dl builtin");
+                let j = stream.clone_dtoh(j_dev).expect("dl jit raw");
+                for i in 0..n {
+                    assert_eq!(
+                        b[i].to_bits(),
+                        j[i].to_bits(),
+                        "{label}[{i}]: builtin {} ≠ jit-raw {}",
+                        b[i],
+                        j[i],
+                    );
+                }
+            }
+        }
+    }
+
     /// Stage 5: observed-information curvature mode is now real math
     /// (no longer a Fisher alias) for Gamma-log, Bernoulli probit, and
     /// Bernoulli cloglog. Canonical families (Bernoulli logit, Poisson
