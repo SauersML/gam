@@ -5758,8 +5758,8 @@ fn run_outer_with_plan(
                         crate::solver::gpu::reml_outer::RemlOuterGpuInput {
                             seed_rho: seed.clone(),
                             bounds: bounds_dev,
-                            gradient_tolerance: grad_tol_dev,
-                            max_iterations: max_iter_dev,
+                            gradient_tolerance: grad_tol_dev.abs,
+                            max_iterations: config.max_iter,
                             axis_step_caps: axis_caps_dev,
                             admission,
                             seed_penalised_hessian: ndarray::Array2::<f64>::zeros((0, 0)),
@@ -5780,12 +5780,7 @@ fn run_outer_with_plan(
                             let mut obj_ref = obj_cell.borrow_mut();
                             let eval = obj_ref
                                 .eval_with_order(rho_trial, OuterEvalOrder::ValueAndGradient)
-                                .map_err(|err| match err {
-                                    ObjectiveEvalError::Recoverable { message }
-                                    | ObjectiveEvalError::Fatal { message } => {
-                                        EstimationError::RemlOptimizationFailed(message)
-                                    }
-                                })?;
+                                ?;
                             Ok(crate::solver::gpu::reml_outer::RemlOuterDeviceEval {
                                 objective: eval.cost,
                                 gradient: eval.gradient,

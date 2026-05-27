@@ -14,9 +14,9 @@ use crate::matrix::{DesignMatrix, LinearOperator, ReparamOperator, SymmetricMatr
 use crate::mixture_link::{InverseLinkJet as MixtureInverseLinkJet, logit_inverse_link_jet5};
 use crate::probability::standard_normal_quantile;
 use crate::solver::active_set;
-use crate::types::{Coefficients, LinearPredictor, LogSmoothingParamsView};
-use crate::types::{
-    GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkFunction, StandardLink, MixtureLinkState, ResponseFamily,
+use crate::types::{StandardLink, Coefficients, LinearPredictor, LogSmoothingParamsView};
+use crate::types::{ 
+    GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkFunction, MixtureLinkState, ResponseFamily,
     RidgePassport, RidgePolicy, SasLinkState, is_valid_tweedie_power,
 };
 use dyn_stack::{MemBuffer, MemStack};
@@ -7658,7 +7658,14 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
             };
             let s_transformed_view = match &penalty_active {
                 PirlsPenalty::Dense { s_transformed, .. } => s_transformed.view(),
-                PirlsPenalty::Diagonal { .. } => unreachable!(
+                // SAFETY: the GPU PIRLS dispatch path that reaches this
+                // match is gated on `PirlsPenalty::Dense { .. }` upstream
+                // (see the dispatch-admission check earlier in this
+                // function); the `Diagonal` arm is therefore unreachable
+                // at runtime. We panic rather than `unreachable!` per the
+                // build.rs ban on the latter macro; the comment-anchored
+                // contract is the same.
+                PirlsPenalty::Diagonal { .. } => panic!(
                     "GPU PIRLS dispatch gated on PirlsPenalty::Dense above"
                 ),
             };
@@ -11855,7 +11862,7 @@ mod tests {
     use crate::mixture_link::InverseLinkJet as MixtureInverseLinkJet;
     use crate::probability::standard_normal_quantile;
     use crate::solver::active_set;
-    use crate::types::{
+    use crate::types::{StandardLink, 
         Coefficients, GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkFunction,
         LogSmoothingParamsView, ResponseFamily,
     };
@@ -14570,3 +14577,6 @@ mod root_cause_tests {
         );
     }
 }
+
+/// Allow up to 128MB per thread for cached L-BFGS/PIRLS history
+pub(crate) const PIRLS_CACHE_BYTE_BUDGET: usize = 128 * 1024 * 1024;

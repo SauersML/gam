@@ -1,6 +1,6 @@
 use gam::inference::probability::{normal_cdf, normal_pdf};
 use gam::solver::mixture_link::inverse_link_jet_for_inverse_link;
-use gam::types::{InverseLink, LatentCLogLogState, LinkComponent, LinkFunction, StandardLink, MixtureLinkState};
+use gam::types::{InverseLink, LatentCLogLogState, LinkComponent, MixtureLinkState, StandardLink};
 use ndarray::array;
 
 fn central_diff(f: impl Fn(f64) -> f64, x: f64, h: f64) -> f64 {

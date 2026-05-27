@@ -30,7 +30,6 @@ ignored = ["grep", "walkdir"]
 path = "src/lib.rs"
 
 [workspace]
-members = ["crates/gam-pyffi"]
 resolver = "3"
 
 [lints.rust]

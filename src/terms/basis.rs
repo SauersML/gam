@@ -4995,7 +4995,7 @@ impl LatentCoordDesignDerivative {
         out
     }
 
-    pub(crate) fn forward_mul_axis(
+    pub fn forward_mul_axis(
         &self,
         flat_axis: usize,
         u: &ArrayView1<'_, f64>,
@@ -5036,7 +5036,7 @@ impl LatentCoordDesignDerivative {
         Ok(out)
     }
 
-    pub(crate) fn transpose_mul_axis(
+    pub fn transpose_mul_axis(
         &self,
         flat_axis: usize,
         v: &ArrayView1<'_, f64>,
@@ -5078,7 +5078,7 @@ impl LatentCoordDesignDerivative {
         }
     }
 
-    pub(crate) fn materialize_axis(&self, flat_axis: usize) -> Result<Array2<f64>, BasisError> {
+    pub fn materialize_axis(&self, flat_axis: usize) -> Result<Array2<f64>, BasisError> {
         assert!(
             flat_axis < self.n_axes(),
             "latent-coordinate derivative flat axis out of bounds in materialize_axis: flat_axis={flat_axis}, n_axes={}",

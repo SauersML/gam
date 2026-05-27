@@ -208,6 +208,7 @@ impl JointPenaltySpec {
 /// and adds the full-width quadratic / matvec / preconditioner / Hessian
 /// contributions to the joint-Newton primitives.
 #[derive(Clone)]
+#[derive(Debug)]
 pub struct JointPenaltyBundle {
     pub specs: std::sync::Arc<Vec<JointPenaltySpec>>,
     pub log_lambdas: Vec<f64>,
@@ -471,7 +472,7 @@ mod tests {
             initial_log_lambda: 0.0,
             nullspace_dim: 0,
         };
-        let log_lambda = -0.4;
+        let log_lambda = -0.4_f64;
         let lam = log_lambda.exp();
         let bundle = JointPenaltyBundle::new(
             std::sync::Arc::new(vec![spec]),
@@ -503,7 +504,8 @@ mod tests {
         let mut rhs_mat = Array2::<f64>::zeros((2, 1));
         rhs_mat[[0, 0]] = b[0];
         rhs_mat[[1, 0]] = b[1];
-        let beta_mat = chol.solve(&rhs_mat);
+        let mut beta_mat = rhs_mat.clone();
+        chol.solve_mat_in_place(&mut beta_mat);
         let beta_hat: Array1<f64> = array![beta_mat[[0, 0]], beta_mat[[1, 0]]];
 
         // Gradient at β̂: (β̂ − b) + λ S β̂ should be ~0.

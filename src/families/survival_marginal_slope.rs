@@ -1067,7 +1067,7 @@ impl DenestedCellPrimaryFixedPartials {
         cursor += 4 * r;
         let coeff_bbbu = read_run(cursor);
         cursor += 4 * r;
-        debug_assert_eq!(cursor, expected);
+        assert_eq!(cursor, expected);
         Ok(Self {
             dc_da,
             dc_daa,

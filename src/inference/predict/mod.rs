@@ -5634,7 +5634,7 @@ mod tests {
     };
     use crate::inference::model::SavedCompiledFlexBlock;
     use crate::pirls::PirlsStatus;
-    use crate::types::LinkFunction;
+    use crate::types::{LinkFunction, StandardLink};
     use ndarray::{Array1, Array2, array};
 
     fn saved_runtime_from_deviation_runtime(

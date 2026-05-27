@@ -116,7 +116,7 @@ impl DerivativeHessian<'_> {
         match self {
             DerivativeHessian::Dense(matrix) => {
                 if matrix.nrows() != expected_p || matrix.ncols() != expected_p {
-                    gpu_bail!(
+                    crate::gpu_bail!(
                             "reml_trace dense H_j: shape {:?} != ({expected_p}, {expected_p})",
                             matrix.dim()
                         );
@@ -127,7 +127,7 @@ impl DerivativeHessian<'_> {
                 penalty_extra,
             } => {
                 if row_weights.len() != expected_n {
-                    gpu_bail!(
+                    crate::gpu_bail!(
                             "reml_trace structural H_j: row_weights.len()={} != n={expected_n}",
                             row_weights.len()
                         );
@@ -135,7 +135,7 @@ impl DerivativeHessian<'_> {
                 if let Some(p_extra) = penalty_extra
                     && (p_extra.nrows() != expected_p || p_extra.ncols() != expected_p)
                 {
-                    gpu_bail!(
+                    crate::gpu_bail!(
                             "reml_trace structural H_j penalty_extra: shape {:?} != ({expected_p}, {expected_p})",
                             p_extra.dim()
                         );

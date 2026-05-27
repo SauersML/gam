@@ -972,7 +972,7 @@ impl HexCellTable {
             || self.pair_per_axis.len() != want
             || self.width_per_axis.len() != want
         {
-            gpu_bail!(
+            crate::gpu_bail!(
                     "HexCellTable: expected length {want} (n_cells*d), got span={}, pair={}, width={}",
                     self.span_per_axis.len(),
                     self.pair_per_axis.len(),
@@ -1005,14 +1005,14 @@ pub fn build_hex_tensor_moments_device(
 
     cells.validate()?;
     if spec.d() != cells.d {
-        gpu_bail!(
+        crate::gpu_bail!(
                 "build_hex_tensor_moments_device: spec.d()={} != cells.d={}",
                 spec.d(),
                 cells.d
             );
     }
     if axis_tables.len() != cells.d {
-        gpu_bail!(
+        crate::gpu_bail!(
                 "build_hex_tensor_moments_device: axis_tables.len()={} != d={}",
                 axis_tables.len(),
                 cells.d
@@ -1238,20 +1238,20 @@ impl TetrahedralCellTable {
     pub fn validate(&self) -> Result<(), GpuError> {
         let want_v = self.n_tets * 4 * self.d;
         if self.vertices.len() != want_v {
-            gpu_bail!(
+            crate::gpu_bail!(
                 "TetrahedralCellTable: expected vertices len {want_v} (n_tets*4*d), got {}",
                 self.vertices.len()
             );
         }
         if self.cell_index.len() != self.n_tets {
-            gpu_bail!(
+            crate::gpu_bail!(
                 "TetrahedralCellTable: cell_index len {} != n_tets {}",
                 self.cell_index.len(),
                 self.n_tets
             );
         }
         if self.cell_centers.len() != self.n_cells * self.d {
-            gpu_bail!(
+            crate::gpu_bail!(
                 "TetrahedralCellTable: cell_centers len {} != n_cells*d {}",
                 self.cell_centers.len(),
                 self.n_cells * self.d
@@ -1259,7 +1259,7 @@ impl TetrahedralCellTable {
         }
         for (i, &c) in self.cell_index.iter().enumerate() {
             if c < 0 || (c as usize) >= self.n_cells {
-                gpu_bail!(
+                crate::gpu_bail!(
                     "TetrahedralCellTable: cell_index[{i}] = {c} out of range [0, {})",
                     self.n_cells
                 );
@@ -1790,7 +1790,7 @@ pub fn try_device_tetrahedral_moments(
     // `inputs` parameter is genuinely consumed (no `_`-prefixed silencer).
     inputs.cells.validate()?;
     if inputs.cells.d < 3 {
-        gpu_bail!(
+        crate::gpu_bail!(
             "try_device_tetrahedral_moments: tetrahedral path requires D >= 3 (got {})",
             inputs.cells.d
         );
@@ -1809,14 +1809,14 @@ fn build_tetrahedral_moments_device(
     let spec = inputs.spec;
     let cells = inputs.cells;
     if spec.d() != cells.d {
-        gpu_bail!(
+        crate::gpu_bail!(
             "build_tetrahedral_moments_device: spec.d()={} != cells.d={}",
             spec.d(),
             cells.d
         );
     }
     if cells.d < 3 {
-        gpu_bail!(
+        crate::gpu_bail!(
             "build_tetrahedral_moments_device: tetrahedral path requires D >= 3 (got {})",
             cells.d
         );
@@ -1825,7 +1825,7 @@ fn build_tetrahedral_moments_device(
     let nbeta = spec.n_beta();
     let pairs = spec.pairs_per_cell;
     if nalpha == 0 || nbeta == 0 || pairs == 0 || cells.n_tets == 0 || cells.n_cells == 0 {
-        gpu_bail!(
+        crate::gpu_bail!(
             "build_tetrahedral_moments_device: empty spec or cell list \
              (nalpha={nalpha}, nbeta={nbeta}, pairs={pairs}, n_tets={}, n_cells={})",
             cells.n_tets,
@@ -1834,14 +1834,14 @@ fn build_tetrahedral_moments_device(
     }
     let want_off = cells.n_cells + 1;
     if inputs.tet_offsets.len() != want_off {
-        gpu_bail!(
+        crate::gpu_bail!(
             "build_tetrahedral_moments_device: tet_offsets len {} != n_cells+1 {}",
             inputs.tet_offsets.len(),
             want_off
         );
     }
     if inputs.tet_index_in_segment.len() != cells.n_tets {
-        gpu_bail!(
+        crate::gpu_bail!(
             "build_tetrahedral_moments_device: tet_index_in_segment len {} != n_tets {}",
             inputs.tet_index_in_segment.len(),
             cells.n_tets
@@ -1849,7 +1849,7 @@ fn build_tetrahedral_moments_device(
     }
     let want_w = cells.n_cells * nalpha * nbeta * pairs;
     if inputs.weights.len() != want_w {
-        gpu_bail!(
+        crate::gpu_bail!(
             "build_tetrahedral_moments_device: weights len {} != n_cells*nalpha*nbeta*pairs {}",
             inputs.weights.len(),
             want_w

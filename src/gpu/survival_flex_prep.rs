@@ -309,7 +309,7 @@ pub fn try_device_cell_primary_fixed_partials(
         }
         partials.push(row_cells);
     }
-    debug_assert_eq!(cursor, flat.len());
+    assert_eq!(cursor, flat.len());
     Ok(Some(CellPrimaryFixedPartialsOutput { partials }))
 }
 
@@ -444,7 +444,7 @@ mod device_dispatch {
                 ));
             }
         }
-        debug_assert_eq!(cells_host.len(), n * 18);
+        assert_eq!(cells_host.len(), n * 18);
         // Reconstruct per-row Vec<DenestedPartitionCell>.  The kernel writes
         // exactly one cell per row in the trivial baseline; we reproduce
         // the host trivial cell shape (using the kernel-written numerics

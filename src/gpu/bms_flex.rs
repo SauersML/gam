@@ -183,13 +183,13 @@ impl<'a> BmsFlexGpuRowInputs<'a> {
     fn validate(&self) -> Result<(), GpuError> {
         let want_p = self.q_dim + self.g_dim + self.p_h + self.p_w;
         if self.p != want_p {
-            gpu_bail!(
+            crate::gpu_bail!(
                     "bms_flex inputs: p={} != q_dim({}) + g_dim({}) + p_h({}) + p_w({}) = {}",
                     self.p, self.q_dim, self.g_dim, self.p_h, self.p_w, want_p
                 );
         }
         if self.r != 2 + self.p_h + self.p_w {
-            gpu_bail!(
+            crate::gpu_bail!(
                     "bms_flex inputs: r={} != 2 + p_h({}) + p_w({}) = {}",
                     self.r,
                     self.p_h,
@@ -198,24 +198,24 @@ impl<'a> BmsFlexGpuRowInputs<'a> {
                 );
         }
         if self.beta.len() != self.p {
-            gpu_bail!(
+            crate::gpu_bail!(
                     "bms_flex inputs: beta.len()={} != p={}",
                     self.beta.len(),
                     self.p
                 );
         }
         if self.y.len() != self.n {
-            gpu_bail!("bms_flex inputs: y.len()={} != n={}", self.y.len(), self.n);
+            crate::gpu_bail!("bms_flex inputs: y.len()={} != n={}", self.y.len(), self.n);
         }
         if self.weights.len() != self.n {
-            gpu_bail!(
+            crate::gpu_bail!(
                     "bms_flex inputs: weights.len()={} != n={}",
                     self.weights.len(),
                     self.n
                 );
         }
         if self.x_design.len() != self.n * self.q_dim {
-            gpu_bail!(
+            crate::gpu_bail!(
                     "bms_flex inputs: x_design.len()={} != n({})*q_dim({}) = {}",
                     self.x_design.len(),
                     self.n,
@@ -224,7 +224,7 @@ impl<'a> BmsFlexGpuRowInputs<'a> {
                 );
         }
         if self.g_design.len() != self.n * self.g_dim {
-            gpu_bail!(
+            crate::gpu_bail!(
                     "bms_flex inputs: g_design.len()={} != n({})*g_dim({}) = {}",
                     self.g_design.len(),
                     self.n,
@@ -652,7 +652,7 @@ pub fn gpu_hessian_matvec(
 ) -> Result<Vec<f64>, GpuError> {
     inputs.validate()?;
     if v.len() != inputs.p {
-        gpu_bail!(
+        crate::gpu_bail!(
                 "bms_flex gpu_hessian_matvec: v.len()={} != p={}",
                 v.len(),
                 inputs.p
