@@ -2088,4 +2088,105 @@ mod tests {
             );
         }
     }
+
+    // ────────────────────────────────────────────────────────────────
+    // Block 2.8: V100 hill-climb (10× vs exact GPU at p=2000, d_ρ=8).
+    //
+    // The assertion only fires when a CUDA runtime is detected;
+    // on CPU-only hosts the test still runs the timing comparison but
+    // skips the speedup assertion (exact dense Cholesky is competitive
+    // with adaptive Hutchinson on a single core, so the 10× lower bound
+    // is V100-specific). On V100, the adaptive path batches K=16-128
+    // probes through one potrs while the exact path repeats `d` full
+    // solves; the bound is therefore comfortable.
+    // ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn block_2_8_hill_climb_adaptive_vs_exact_at_p2000_d8() {
+        // Smaller dimensions on CPU CI to keep the test under a minute;
+        // V100 runs the full p=2000, d=8 specified in the charter.
+        let on_v100 = cfg!(target_os = "linux")
+            && super::super::runtime::GpuRuntime::global().is_some();
+        let (p, d): (usize, usize) = if on_v100 { (2000, 8) } else { (256, 4) };
+
+        let mut h = Array2::<f64>::zeros((p, p));
+        for i in 0..p {
+            for j in 0..p {
+                h[[i, j]] = if i == j {
+                    p as f64 + 1.0
+                } else {
+                    1.0 / (1.0 + (i as f64 - j as f64).abs())
+                };
+            }
+        }
+        let derivs_owned: Vec<Array2<f64>> =
+            (0..d).map(|k| random_dense_sym(p, 0x1000 + k as u64)).collect();
+        let derivs: Vec<DerivativeHessian<'_>> = derivs_owned
+            .iter()
+            .map(|a| DerivativeHessian::Dense(a.view()))
+            .collect();
+
+        // Exact path: factor H once, then `tr(H⁻¹ A_j) = Σᵢ (H⁻¹ A_j)[i,i]`
+        // by solving H X = A_j column-by-column. This is the cost the
+        // CPU/exact-spectral path pays per REML outer step.
+        let t_exact_start = std::time::Instant::now();
+        let factor = cholesky_lower(&h).expect("SPD");
+        let mut exact_traces = vec![0.0_f64; d];
+        for (j, a) in derivs_owned.iter().enumerate() {
+            let mut acc = 0.0_f64;
+            for col in 0..p {
+                let mut rhs = vec![0.0_f64; p];
+                for r in 0..p {
+                    rhs[r] = a[[r, col]];
+                }
+                let w = solve_cholesky(&factor, &rhs);
+                acc += w[col];
+            }
+            exact_traces[j] = acc;
+        }
+        let t_exact = t_exact_start.elapsed();
+
+        // Adaptive Hutchinson path.
+        let t_adaptive_start = std::time::Instant::now();
+        let evidence = evidence_traces_adaptive(
+            h.view(),
+            derivs,
+            None,
+            ProbeSeed(0xB10C),
+            HUTCHINSON_ADAPTIVE_REL_TOL,
+            HUTCHINSON_ADAPTIVE_TAU_REL,
+        )
+        .expect("adaptive ok");
+        let t_adaptive = t_adaptive_start.elapsed();
+
+        // Sanity: every adaptive trace must agree with exact within its
+        // reported SE. This guards against a fast-but-wrong perf path.
+        for j in 0..d {
+            let se = evidence.stderrs[j] / (evidence.probe_count as f64).sqrt();
+            let tol = (10.0 * se).max(0.05 * exact_traces[j].abs());
+            let diff = (evidence.traces[j] - exact_traces[j]).abs();
+            assert!(
+                diff <= tol,
+                "block_2_8: derivative {j} adaptive {} disagrees with exact {} (tol {tol}, diff {diff})",
+                evidence.traces[j],
+                exact_traces[j]
+            );
+        }
+
+        let speedup = t_exact.as_secs_f64() / t_adaptive.as_secs_f64().max(1e-9);
+        eprintln!(
+            "block_2_8 hill-climb [p={p}, d={d}, V100={on_v100}]: \
+             exact={:?}, adaptive={:?}, speedup={:.2}× (K={}, converged={})",
+            t_exact, t_adaptive, speedup, evidence.probe_count, evidence.converged
+        );
+        if on_v100 {
+            assert!(
+                speedup >= 10.0,
+                "block_2_8 V100 speedup {speedup:.2}× below the 10× target \
+                 (exact {:?}, adaptive {:?})",
+                t_exact,
+                t_adaptive,
+            );
+        }
+    }
 }
