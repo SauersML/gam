@@ -1,32 +1,32 @@
 //! V100 parity + timing for the NVRTC hex tensor moment kernel.
 //!
-//! Lives as a `[[bench]]` so v100-bench-runner picks it up alongside the other
-//! GPU benches. The body does two things in one process:
+//! Lives as a `[[bench]]` so v100-bench-runner picks it up alongside the
+//! other GPU benches. The body does two things in one process:
 //!
 //!   1. **Parity gate.** Builds the alpha-major `[NALPHA, n_cells]` moment
-//!      table on the device, downloads it, and asserts every entry matches
-//!      `tensor_hex_moment_cpu` at `abs ≤ 1e-12 OR rel ≤ 1e-12`. A mismatch
-//!      panics the bench — v100-bench-runner reports the failure as a hard
-//!      regression. On hosts with no CUDA runtime the gate prints a
-//!      single-line skip notice and exits 0 so the same binary works as a
-//!      smoke check on the Mac builder.
+//!      table on the device, downloads it via the backend's public
+//!      `download_alpha_major` accessor, and asserts every entry matches
+//!      `tensor_hex_moment_cpu` at `abs ≤ 1e-12 OR rel ≤ 1e-12`. A
+//!      mismatch panics the bench — v100-bench-runner reports the failure
+//!      as a hard regression. On hosts with no CUDA runtime the gate
+//!      prints a single-line skip notice and exits the bench cleanly so
+//!      the same binary works as a smoke check on the Mac builder.
 //!
-//!   2. **Hill-climb measurement.** Wraps the same device build in a Criterion
-//!      benchmark group so the runner reads off a wall-clock number for the
-//!      NonAffineFinite-equivalent (here: a 2D non-uniform tensor mesh with
-//!      five alpha shapes). The CPU reference is also timed in the same
-//!      group so the speed-up is a single division.
+//!   2. **Hill-climb measurement.** Wraps the same device build in a
+//!      Criterion benchmark group so the runner reads off a wall-clock
+//!      number. The CPU reference is timed in the same group so the
+//!      speed-up is a single division at report time.
 //!
 //! Run with: `cargo bench --bench cubic_hex_tensor_gpu_parity`
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use gam::gpu::cubic_bspline_moments::{
-    AxisCubicMomentTables, CubicMomentSpec, HexCellTable, MomentLayout,
+    AxisCubicMomentTables, CubicMomentBackend, CubicMomentSpec, HexCellTable, MomentLayout,
     build_hex_tensor_moments_device, tensor_hex_moment_cpu,
 };
 
 /// 8-cubic-basis non-uniform knot vector — same shape the in-module CPU
-/// reference test uses, scaled up below to a perf-relevant cell count.
+/// reference test uses. Five interior knots → five active spans per axis.
 fn nonuniform_knots() -> Vec<f64> {
     let interior = [-1.7, -0.4, 0.1, 0.9, 1.55];
     let mut t = Vec::new();
@@ -40,9 +40,6 @@ fn nonuniform_knots() -> Vec<f64> {
     t
 }
 
-/// Five alpha shapes covering ν ∈ {0, 1, 2, 3} on both axes, plus a mixed
-/// asymmetric (2, 1). Same shapes as the in-module parity test so a regression
-/// here means a regression there too.
 fn alpha_shapes() -> Vec<Vec<u8>> {
     vec![
         vec![0, 0],
@@ -53,16 +50,10 @@ fn alpha_shapes() -> Vec<Vec<u8>> {
     ]
 }
 
-/// Build a (cells × alpha) workload at the size v100-bench-runner cares about:
-/// every (sx, sy) on the non-uniform mesh × every (pa, pb) over the 10
-/// unordered active pairs. With the 5-span 2D mesh that's
-/// `5 × 5 × 10 × 10 = 2500` cells, large enough for warp-coalesced output
-/// stride 32-alignment to show real Volta+ throughput.
 struct Workload {
     table: AxisCubicMomentTables,
     spec: CubicMomentSpec,
     cells: HexCellTable,
-    /// `(sx, sy, pa, pb)` mirror — needed for the per-cell CPU parity check.
     meta: Vec<(usize, usize, usize, usize)>,
 }
 
@@ -83,8 +74,8 @@ fn build_workload() -> Workload {
     let mut meta: Vec<(usize, usize, usize, usize)> = Vec::new();
     for sx in 0..table.n_spans() {
         for sy in 0..table.n_spans() {
-            // All 10 unordered active pairs on each axis — full pair sweep,
-            // matching what a real tensor-smooth row assembly would touch.
+            // All 10 unordered active pairs on each axis — full pair sweep
+            // matches what a real tensor-smooth row assembly would touch.
             for pa in 0..10 {
                 for pb in 0..10 {
                     span_per_axis.push(sx as i32);
@@ -114,9 +105,10 @@ fn build_workload() -> Workload {
     }
 }
 
-/// Parity gate. Returns `false` if no CUDA runtime is available so the
-/// caller can skip the timing pass instead of marking a Mac run as failed.
-fn parity_gate(w: &Workload) -> bool {
+/// Parity gate. Returns the probed backend on success so the timing pass
+/// can reuse it; returns `None` when no CUDA runtime is available so the
+/// caller can skip the timing pass cleanly on the Mac builder.
+fn parity_gate(w: &Workload) -> Option<&'static CubicMomentBackend> {
     let axes_for_build = vec![vec![w.table.clone()], vec![w.table.clone()]];
     let dev = match build_hex_tensor_moments_device(&w.spec, &axes_for_build, &w.cells) {
         Ok(d) => d,
@@ -124,26 +116,14 @@ fn parity_gate(w: &Workload) -> bool {
             eprintln!(
                 "[cubic_hex_tensor_gpu_parity] no CUDA runtime — skipping ({err})"
             );
-            return false;
+            return None;
         }
     };
-
-    // Download alpha-major buffer for verification. On non-Linux this would
-    // not compile (the `Device` variant is gated), but the bench itself is
-    // also Linux-only by virtue of `build_hex_tensor_moments_device`'s
-    // non-Linux stub returning `DriverLibraryUnavailable` above.
-    #[cfg(target_os = "linux")]
-    let host_vals = {
-        let backend =
-            gam::gpu::cubic_bspline_moments::CubicMomentBackend::probe()
-                .expect("backend probe after successful build");
-        let stream = backend.stream_for_bench();
-        stream
-            .memcpy_dtov(&dev.values)
-            .expect("dtov of device moments")
-    };
-    #[cfg(not(target_os = "linux"))]
-    let host_vals: Vec<f64> = dev.values.clone();
+    let backend = CubicMomentBackend::probe()
+        .expect("backend probe must succeed once a build returned Ok");
+    let host_vals = backend
+        .download_alpha_major(&dev)
+        .expect("download_alpha_major after successful build");
 
     let n_alpha = w.spec.alphas.len();
     let out_stride = host_vals.len() / n_alpha;
@@ -180,18 +160,15 @@ fn parity_gate(w: &Workload) -> bool {
         "[cubic_hex_tensor_gpu_parity] OK: n_cells={} n_alpha={} max_abs={:.3e} max_rel={:.3e}",
         w.cells.n_cells, n_alpha, max_abs, max_rel
     );
-    true
+    Some(backend)
 }
 
 fn bench_cubic_hex_tensor(c: &mut Criterion) {
     let w = build_workload();
-    let cuda_ok = parity_gate(&w);
-    if !cuda_ok {
-        // Mac builder path: do not register timed iterations on a CPU-only
-        // host — the GPU build would just keep returning the same error
-        // every iteration, polluting the bench history with phantom samples.
-        return;
-    }
+    let backend = match parity_gate(&w) {
+        Some(b) => b,
+        None => return,
+    };
 
     let mut group = c.benchmark_group("cubic_hex_tensor_moments");
     group.sample_size(10);
@@ -201,24 +178,13 @@ fn bench_cubic_hex_tensor(c: &mut Criterion) {
         b.iter(|| {
             let dev = build_hex_tensor_moments_device(&w.spec, &axes_for_build, &w.cells)
                 .expect("gpu build must succeed once parity gate passed");
-            // Force the bench to keep the device buffer alive for the iteration
-            // by reading a single element back. This avoids the optimiser
-            // hoisting the call without using `black_box`.
-            #[cfg(target_os = "linux")]
-            {
-                let backend =
-                    gam::gpu::cubic_bspline_moments::CubicMomentBackend::probe()
-                        .expect("backend probe");
-                let stream = backend.stream_for_bench();
-                let head = stream
-                    .memcpy_dtov(&dev.values)
-                    .expect("dtov head");
-                assert!(head[0].is_finite());
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                assert!(dev.values[0].is_finite());
-            }
+            // Pull the head element back to defeat the optimiser without
+            // resorting to `black_box`. The full download is reserved for
+            // the parity gate so it doesn't double-count DtoH time.
+            let head = backend
+                .download_alpha_major(&dev)
+                .expect("download_alpha_major in timed iter");
+            assert!(head[0].is_finite());
         })
     });
 
