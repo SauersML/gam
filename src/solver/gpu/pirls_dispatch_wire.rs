@@ -177,10 +177,6 @@ mod linux_impl {
             qs: qs_view,
             edf: input.edf,
         };
-        // exported_curvature is also passed through the policy-side enum
-        // so the GPU postpass can map back to PirlsLoopCurvatureKind.
-        let _ = exported;
-
         let outcome = pirls_gpu::pirls_loop_on_stream(
             &shared,
             &mut ws,
