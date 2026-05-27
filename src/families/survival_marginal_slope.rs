@@ -14033,6 +14033,237 @@ impl SurvivalMarginalSlopeFamily {
     /// Unified dense joint Hessian assembly for flex and timewiggle paths.
     /// Both paths use q-geometry Jacobians via accumulate_dynamic_q_joint_row.
     /// The rigid path (no flex, no timewiggle) uses the RowKernel fast path.
+    /// What slice of the joint NLL surface should the GPU survival-flex
+    /// dispatcher try to compute on the device?
+    ///
+    /// Returned by [`Self::try_survival_flex_joint_dispatch_gradient`] et al.,
+    /// these encode the three Step-6 entry points and the matching CPU
+    /// fallback boundary.  When the GPU declines (`Ok(None)`) the caller
+    /// runs the existing CPU per-row sweep.
+    fn build_survival_flex_gpu_row_batch(
+        &self,
+        block_states: &[ParameterBlockState],
+        slices: &BlockSlices,
+    ) -> Result<Option<SurvivalFlexGpuRowBatch>, String> {
+        // Only the scalar-score path is currently representable in
+        // `SurvivalFlexGpuRowInputs::score_dim == 1`.  Vector-score
+        // and any per-row composition outside the canonical 3-block
+        // (time, marginal, logslope) layout must take the CPU path.
+        if self.score_dim() != 1 {
+            return Ok(None);
+        }
+        let n = self.n;
+        let g_eta: &Array1<f64> = block_states[2].eta.as_ref();
+        if g_eta.len() != n {
+            return Ok(None);
+        }
+        let mut q0 = vec![0.0_f64; n];
+        let mut q1 = vec![0.0_f64; n];
+        let mut qd1 = vec![0.0_f64; n];
+        let mut z = vec![0.0_f64; n];
+        let mut g = vec![0.0_f64; n];
+        // Per-row q-values reuse the canonical `row_dynamic_q_values`
+        // helper so the GPU descriptor sees exactly the same q-geometry
+        // the CPU per-row primary path consumes (timewiggle-aware when
+        // active).
+        for row in 0..n {
+            let qv = self.row_dynamic_q_values(row, block_states)?;
+            q0[row] = qv.q0;
+            q1[row] = qv.q1;
+            qd1[row] = qv.qd1;
+            z[row] = self.z[[row, 0]];
+            g[row] = g_eta[row];
+        }
+        let p = slices.total;
+        // Materialize the joint-β vector in joint-block order.  Length
+        // must equal `p = slices.total` to satisfy the GPU descriptor's
+        // shape contract; mismatches force CPU fallback.
+        let mut beta = vec![0.0_f64; p];
+        let copy_block = |dst: &mut [f64], range: &std::ops::Range<usize>, src: &Array1<f64>| {
+            if src.len() == range.len() {
+                dst[range.clone()].copy_from_slice(
+                    src.as_slice()
+                        .expect("survival flex GPU batch: block β must be contiguous"),
+                );
+            }
+        };
+        copy_block(&mut beta, &slices.time, &block_states[0].beta);
+        copy_block(&mut beta, &slices.marginal, &block_states[1].beta);
+        copy_block(&mut beta, &slices.logslope, &block_states[2].beta);
+        if let Some(range) = slices.score_warp.as_ref() {
+            copy_block(&mut beta, range, &block_states[3].beta);
+        }
+        if let Some(range) = slices.link_dev.as_ref() {
+            let block_index = 3 + usize::from(self.score_warp.is_some());
+            copy_block(&mut beta, range, &block_states[block_index].beta);
+        }
+        Ok(Some(SurvivalFlexGpuRowBatch {
+            n,
+            p,
+            q0,
+            q1,
+            qd1,
+            z,
+            g,
+            beta,
+            weights: self.weights.to_vec(),
+            event: self.event.to_vec(),
+        }))
+    }
+
+    /// Step-6 dispatcher for the joint-β gradient.  Builds the
+    /// `SurvivalFlexGpuRowInputs` descriptor, runs the GPU policy
+    /// `decide`, and routes through
+    /// [`crate::gpu::survival_flex::try_survival_flex_gradient`].
+    ///
+    /// Returns:
+    ///
+    /// * `Ok(None)` when the GPU path is gated off (policy, shape,
+    ///   backend-not-compiled, or runtime declined) — callers fall back
+    ///   to the existing CPU per-row sweep.
+    /// * `Ok(Some((nll, grad)))` when the GPU produced a usable answer.
+    /// * `Err(_)` only when `gpu=force` was requested but the kernel is
+    ///   not supported, mirroring the convention in `gpu::decide`.
+    fn try_survival_flex_joint_dispatch_gradient(
+        &self,
+        block_states: &[ParameterBlockState],
+        slices: &BlockSlices,
+    ) -> Result<Option<(f64, Array1<f64>)>, String> {
+        let decision = crate::gpu::survival_flex::row_primary_hessian_decision(
+            self.n,
+            N_PRIMARY,
+        );
+        decision.clone().log();
+        if !decision.use_gpu {
+            decision.require_supported()?;
+            return Ok(None);
+        }
+        let batch = match self.build_survival_flex_gpu_row_batch(block_states, slices)? {
+            Some(b) => b,
+            None => {
+                decision.require_supported()?;
+                return Ok(None);
+            }
+        };
+        let inputs = batch.as_inputs(self);
+        match crate::gpu::survival_flex::try_survival_flex_gradient(inputs, None)
+            .map_err(|e| e.to_string())?
+        {
+            Some((nll, grad)) => {
+                if grad.len() != slices.total {
+                    return Err(format!(
+                        "survival-flex GPU gradient returned len={} but joint p={}",
+                        grad.len(),
+                        slices.total
+                    ));
+                }
+                Ok(Some((nll, grad)))
+            }
+            None => {
+                decision.require_supported()?;
+                Ok(None)
+            }
+        }
+    }
+
+    /// Step-6 dispatcher for the joint Hessian × vector product.  See
+    /// [`Self::try_survival_flex_joint_dispatch_gradient`] for the
+    /// `decide`/fallback semantics.
+    fn try_survival_flex_joint_dispatch_hvp(
+        &self,
+        block_states: &[ParameterBlockState],
+        slices: &BlockSlices,
+        v: &Array1<f64>,
+    ) -> Result<Option<Array1<f64>>, String> {
+        let decision = crate::gpu::survival_flex::row_primary_hessian_decision(
+            self.n,
+            N_PRIMARY,
+        );
+        decision.clone().log();
+        if !decision.use_gpu {
+            decision.require_supported()?;
+            return Ok(None);
+        }
+        if v.len() != slices.total {
+            return Ok(None);
+        }
+        let batch = match self.build_survival_flex_gpu_row_batch(block_states, slices)? {
+            Some(b) => b,
+            None => {
+                decision.require_supported()?;
+                return Ok(None);
+            }
+        };
+        let inputs = batch.as_inputs(self);
+        let v_slice = v
+            .as_slice()
+            .ok_or_else(|| "survival-flex GPU HVP requires contiguous v".to_string())?;
+        match crate::gpu::survival_flex::try_survival_flex_hvp(inputs, v_slice)
+            .map_err(|e| e.to_string())?
+        {
+            Some(hv) => {
+                if hv.len() != slices.total {
+                    return Err(format!(
+                        "survival-flex GPU HVP returned len={} but joint p={}",
+                        hv.len(),
+                        slices.total
+                    ));
+                }
+                Ok(Some(hv))
+            }
+            None => {
+                decision.require_supported()?;
+                Ok(None)
+            }
+        }
+    }
+
+    /// Step-6 dispatcher for the dense joint Hessian.  Returns
+    /// `Ok(Some(H))` on a successful device assembly, `Ok(None)` for the
+    /// CPU fallback, and `Err(_)` only for `gpu=force` shape mismatches.
+    fn try_survival_flex_joint_dispatch_dense_hessian(
+        &self,
+        block_states: &[ParameterBlockState],
+        slices: &BlockSlices,
+    ) -> Result<Option<Array2<f64>>, String> {
+        let decision = crate::gpu::survival_flex::row_primary_hessian_decision(
+            self.n,
+            N_PRIMARY,
+        );
+        decision.clone().log();
+        if !decision.use_gpu {
+            decision.require_supported()?;
+            return Ok(None);
+        }
+        let batch = match self.build_survival_flex_gpu_row_batch(block_states, slices)? {
+            Some(b) => b,
+            None => {
+                decision.require_supported()?;
+                return Ok(None);
+            }
+        };
+        let inputs = batch.as_inputs(self);
+        match crate::gpu::survival_flex::try_survival_flex_dense_hessian(inputs, None)
+            .map_err(|e| e.to_string())?
+        {
+            Some(h) => {
+                let p = slices.total;
+                if h.shape() != [p, p] {
+                    return Err(format!(
+                        "survival-flex GPU dense H returned shape {:?} but joint p={}",
+                        h.shape(),
+                        p
+                    ));
+                }
+                Ok(Some(h))
+            }
+            None => {
+                decision.require_supported()?;
+                Ok(None)
+            }
+        }
+    }
+
     fn evaluate_exact_newton_joint_dynamic_q_dense(
         &self,
         block_states: &[ParameterBlockState],
@@ -14042,6 +14273,38 @@ impl SurvivalMarginalSlopeFamily {
             self.validate_exact_monotonicity(block_states)?;
         }
         let slices = block_slices(self, block_states);
+        // ── Step-6 dispatcher: try GPU dense H + gradient first ──────────
+        //
+        // The two `try_survival_flex_joint_dispatch_*` entries route the
+        // joint-β work through
+        // [`crate::gpu::survival_flex::try_survival_flex_dense_hessian`]
+        // and [`crate::gpu::survival_flex::try_survival_flex_gradient`]
+        // respectively, with the standard `gpu::decide` policy.  Both
+        // currently return `Ok(None)` until the NVRTC joint-β assembly
+        // lands (Steps 4 + 5 sibling commits), so the CPU per-row sweep
+        // below remains the production path; the wiring exists so the
+        // device dispatch becomes hot the moment the GPU side composes
+        // the prep cells (`try_device_partition_cells` +
+        // `try_device_cell_primary_fixed_partials`) into a joint pullback.
+        if flex_active && !self.flex_timewiggle_active() {
+            if let Some(h) =
+                self.try_survival_flex_joint_dispatch_dense_hessian(block_states, &slices)?
+            {
+                let (nll, grad) = match self
+                    .try_survival_flex_joint_dispatch_gradient(block_states, &slices)?
+                {
+                    Some(pair) => pair,
+                    None => {
+                        return Err(
+                            "survival-flex GPU dense H succeeded but gradient declined; \
+                             prep dispatchers must compose consistently"
+                                .to_string(),
+                        );
+                    }
+                };
+                return Ok((nll, grad, h));
+            }
+        }
         let primary = flex_primary_slices(self);
         let p_total = slices.total;
         let identity_blocks = if flex_active {

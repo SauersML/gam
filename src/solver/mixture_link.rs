@@ -833,7 +833,7 @@ impl InverseLinkKernel for MixtureLinkState {
 impl InverseLinkKernel for InverseLink {
     fn jet(&self, eta: f64) -> Result<InverseLinkJet, EstimationError> {
         match self {
-            InverseLink::Standard(link_fn) => link_fn.jet(eta),
+            InverseLink::Standard(link_fn) => link_fn.as_link_function().jet(eta),
             InverseLink::LatentCLogLog(state) => latent_cloglog_point_jet(state, eta),
             InverseLink::Sas(state) => state.jet(eta),
             InverseLink::BetaLogistic(state) => BetaLogisticKernel {
