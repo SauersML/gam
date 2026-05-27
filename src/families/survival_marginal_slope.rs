@@ -11099,13 +11099,13 @@ impl SurvivalMarginalSlopeFamily {
 
     /// Test-only accessor that materialises the per-row timepoint jets
     /// (entry/exit base + per-direction extensions + bidirectional) used
-    /// to assemble the third- and fourth-order contractions.  Exposed so
-    /// parity tests in `src/gpu/survival_flex.rs` can drive the Block 10
-    /// CPU oracle (which is a pure assembler over these jets) against
+    /// to assemble the third- and fourth-order contractions.  Drives the
+    /// Block 10 CPU oracle parity tests below against
     /// `row_flex_primary_third_contracted_exact` /
     /// `row_flex_primary_fourth_contracted_exact`.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn flex_primary_timepoint_jets_for_test(
+    fn flex_primary_timepoint_jets_for_test(
         &self,
         row: usize,
         block_states: &[ParameterBlockState],
@@ -25207,6 +25207,7 @@ gauge_priority: 100,
         };
         let actual = crate::gpu::survival_flex::cpu_oracle_third_contraction(&inputs)
             .expect("oracle third");
+        assert_eq!(actual.len(), expected.nrows() * expected.ncols());
         b10_assert_parity(&actual, &expected, "block10_third");
     }
 
@@ -25280,6 +25281,7 @@ gauge_priority: 100,
         };
         let actual = crate::gpu::survival_flex::cpu_oracle_fourth_contraction(&inputs)
             .expect("oracle fourth");
+        assert_eq!(actual.len(), expected.nrows() * expected.ncols());
         b10_assert_parity(&actual, &expected, "block10_fourth");
     }
 }
