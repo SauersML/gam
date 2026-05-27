@@ -1,6 +1,8 @@
 # Identifiability Compiler — Phase 2 Architecture
 
-Replaces the term-level residualizer (`enforce_cross_block_identifiability_for_flex_block` + `CrossBlockAnchor` enum) with a family-agnostic row-Jacobian compiler that orthogonalises in the *row primary-state* metric. Survival uses `u_i = (q0, q1, qd1, g) ∈ R^4`, Bernoulli uses `u_i = η ∈ R^1`. FlexEvaluation anchors become first-class — they expose a residualised row operator that subsequent blocks (link-dev) consume identically to a parametric anchor.
+> **Status: implemented.** Source of truth is now `src/families/identifiability_compiler.rs` + the family-specific operator files. This document is the design-time record of the refactor that replaced the term-level residualizer (formerly `enforce_cross_block_identifiability_for_flex_block` + the `CrossBlockAnchor` enum) with the row-Jacobian compiler.
+
+Family-agnostic row-Jacobian compiler that orthogonalises blocks in the *row primary-state* metric. Survival uses `u_i = (q0, q1, qd1, g) ∈ R^4`, Bernoulli uses `u_i = η ∈ R^1`. FlexEvaluation anchors become first-class — they expose a residualised row operator that subsequent blocks (link-dev) consume identically to a parametric anchor.
 
 Module path: `src/families/identifiability_compiler.rs`. Family-specific trait impls live in `src/families/survival_marginal_slope/identifiability.rs` (new file) and `src/families/bernoulli_marginal_slope/identifiability.rs` (new file). Re-exported through each family's `mod.rs`.
 

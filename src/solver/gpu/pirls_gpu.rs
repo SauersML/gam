@@ -2302,9 +2302,6 @@ mod stream_device_parity_tests {
                 assert!(diff <= 1e-8, "H[{i},{j}] mismatch: {diff}");
             }
         }
-        // Make sure the placeholder is used so it survives any
-        // unused-binding lint.
-        let _ = h_ref.shape();
     }
 }
 

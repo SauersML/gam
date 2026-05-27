@@ -261,11 +261,17 @@ mod tests {
         let out = try_build_cubic_cell_derivative_moments(host_view(&cells, &branches, 9))
             .expect("host substrate succeeds on a valid cell")
             .expect("non-empty input produces output");
-        let CubicCellDerivativeMomentOutput::Host {
-            moments,
-            status,
-            stride,
-        } = out;
+        let (moments, status, stride) = match out {
+            CubicCellDerivativeMomentOutput::Host {
+                moments,
+                status,
+                stride,
+            } => (moments, status, stride),
+            #[cfg(target_os = "linux")]
+            CubicCellDerivativeMomentOutput::Device { .. } => {
+                panic!("host residency request must not yield Device output")
+            }
+        };
         assert_eq!(stride, 10);
         assert_eq!(status, vec![CubicCellMomentStatus::Ok as u8]);
         // M_0 for η ≡ 0 over [-1, 1] is sqrt(2π) · (Φ(1) − Φ(−1)).
