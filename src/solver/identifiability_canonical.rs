@@ -525,23 +525,29 @@ mod tests {
         }
     }
 
+    /// On a clean (non-fatal) configuration with a non-trivial penalty,
+    /// canonicalisation must succeed with **identity** transforms (the
+    /// fail-closed contract makes reduction unreachable, but the
+    /// pull-back-on-identity path is still exercised by the lift
+    /// machinery downstream). The reduced penalty equals the raw
+    /// penalty modulo cloning.
     #[test]
-    fn canonical_pulls_back_penalty_to_kept_indices() {
+    fn canonical_clean_specs_with_penalty_round_trip() {
         let n = 32;
         let x = linspace(n);
         let parametric = Array2::<f64>::from_shape_fn((n, 1), |(_, _)| 1.0);
-        let mut smooth = Array2::<f64>::zeros((n, 3));
+        // Smooth WITHOUT a duplicate constant column — clean joint design.
+        let mut smooth = Array2::<f64>::zeros((n, 2));
         for i in 0..n {
-            smooth[[i, 0]] = 1.0;
-            smooth[[i, 1]] = x[i] * x[i];
-            smooth[[i, 2]] = x[i] * x[i] * x[i];
+            smooth[[i, 0]] = x[i] * x[i];
+            smooth[[i, 1]] = x[i] * x[i] * x[i];
         }
-        let mut smooth_spec = spec_from_dense("smooth_with_const", smooth);
-        let mut s = Array2::<f64>::zeros((3, 3));
-        s[[1, 1]] = 4.0;
-        s[[2, 2]] = 9.0;
-        s[[1, 2]] = 1.5;
-        s[[2, 1]] = 1.5;
+        let mut smooth_spec = spec_from_dense("smooth_only", smooth);
+        let mut s = Array2::<f64>::zeros((2, 2));
+        s[[0, 0]] = 4.0;
+        s[[1, 1]] = 9.0;
+        s[[0, 1]] = 1.5;
+        s[[1, 0]] = 1.5;
         smooth_spec.penalties = vec![PenaltyMatrix::Dense(s.clone())];
         smooth_spec.initial_log_lambdas = Array1::from(vec![0.0]);
         let specs = [
@@ -549,11 +555,20 @@ mod tests {
             smooth_spec,
         ];
         let canon = canonicalize_for_identifiability(&specs)
-            .expect("aliased canonical with penalty must reduce");
+            .expect("clean canonical must succeed with identity transforms");
         let smooth_reduced = &canon.reduced_specs[1];
         assert_eq!(smooth_reduced.penalties.len(), 1);
         let dense_red = smooth_reduced.penalties[0].as_dense_cow().into_owned();
-        let r = smooth_reduced.design.ncols();
-        assert_eq!(dense_red.dim(), (r, r));
+        // Identity pullback: penalty dimensions equal raw design width.
+        assert_eq!(dense_red.dim(), (2, 2));
+        // Identity transform: per-block transform is the 2×2 identity.
+        let t_smooth = &canon.per_block_transform[1];
+        assert_eq!(t_smooth.dim(), (2, 2));
+        for i in 0..2 {
+            for j in 0..2 {
+                let expected = if i == j { 1.0 } else { 0.0 };
+                assert_eq!(t_smooth[[i, j]], expected, "T_smooth must be identity");
+            }
+        }
     }
 }
