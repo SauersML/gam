@@ -1121,6 +1121,20 @@ fn launch_linux(
 
 /// Joint-β block layout shared with the host (mirrors `BlockSlices` in
 /// `bernoulli_marginal_slope.rs`).
+///
+/// Gated `#[cfg(any(target_os = "linux", test))]`: every production
+/// constructor and consumer lives under `target_os = "linux"` (the
+/// device-resident row-Hessian path is the only producer — see
+/// `launch_bms_flex_row_kernel_device_resident` — and the joint-β
+/// consumers `launch_bms_flex_row_hvp` / `_diagonal` / `_dense_block`
+/// are similarly Linux-only). The CPU-side oracle helpers + parity
+/// tests in this file's `mod tests` also construct it under `cfg(test)`
+/// on every host, so the wider gate covers both branches without the
+/// non-Linux release build triggering rustc's "never constructed"
+/// warning (which it would do otherwise because the lone production
+/// constructor in `bernoulli_marginal_slope.rs:9189` sits behind a
+/// `#[cfg(target_os = "linux")]` block).
+#[cfg(any(target_os = "linux", test))]
 #[derive(Clone, Debug)]
 pub(crate) struct BmsFlexBlockLayout {
     pub p_m: usize,
@@ -1131,6 +1145,8 @@ pub(crate) struct BmsFlexBlockLayout {
 }
 
 /// Primary-r layout shared with the host (mirrors `PrimarySlices`).
+/// Gating rationale identical to [`BmsFlexBlockLayout`].
+#[cfg(any(target_os = "linux", test))]
 #[derive(Clone, Debug)]
 pub(crate) struct BmsFlexPrimaryLayout {
     pub h: Option<std::ops::Range<usize>>,
