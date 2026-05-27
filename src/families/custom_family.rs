@@ -26,8 +26,9 @@ use crate::solver::estimate::reml::unified::{
 use crate::solver::estimate::{
     EstimationError, FitGeometry, ensure_finite_scalar_estimation, validate_all_finite_estimation,
 };
+use crate::cache::Fingerprinter;
 use crate::solver::persistent_warm_start::{
-    PersistentBlockInnerSummary, PersistentBlockWarmStartRecord, StableHasher, load_block_record,
+    PersistentBlockInnerSummary, PersistentBlockWarmStartRecord, load_block_record,
     store_block_record,
 };
 use crate::types::{RidgeDeterminantMode, RidgePolicy};
@@ -3160,14 +3161,14 @@ fn warm_start_without_cached_inner_for_psi_derivatives(
     })
 }
 
-fn hash_cf_array_view(hasher: &mut StableHasher, values: ndarray::ArrayView1<'_, f64>) {
+fn hash_cf_array_view(hasher: &mut Fingerprinter, values: ndarray::ArrayView1<'_, f64>) {
     hasher.write_usize(values.len());
     for &value in values {
         hasher.write_f64(value);
     }
 }
 
-fn hash_cf_array2(hasher: &mut StableHasher, values: &Array2<f64>) {
+fn hash_cf_array2(hasher: &mut Fingerprinter, values: &Array2<f64>) {
     hasher.write_usize(values.nrows());
     hasher.write_usize(values.ncols());
     for &value in values {
@@ -3175,7 +3176,7 @@ fn hash_cf_array2(hasher: &mut StableHasher, values: &Array2<f64>) {
     }
 }
 
-fn hash_cf_design_matrix(hasher: &mut StableHasher, design: &DesignMatrix) -> Result<(), String> {
+fn hash_cf_design_matrix(hasher: &mut Fingerprinter, design: &DesignMatrix) -> Result<(), String> {
     let n = design.nrows();
     let p = design.ncols();
     hasher.write_usize(n);
@@ -3192,7 +3193,7 @@ fn hash_cf_design_matrix(hasher: &mut StableHasher, design: &DesignMatrix) -> Re
     Ok(())
 }
 
-fn hash_cf_penalty(hasher: &mut StableHasher, penalty: &PenaltyMatrix) {
+fn hash_cf_penalty(hasher: &mut Fingerprinter, penalty: &PenaltyMatrix) {
     match penalty {
         PenaltyMatrix::Dense(matrix) => {
             hasher.write_str("dense");
@@ -3227,7 +3228,7 @@ fn persistent_custom_family_key<F: CustomFamily + ?Sized>(
     specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
 ) -> Option<String> {
-    let mut hasher = StableHasher::new();
+    let mut hasher = Fingerprinter::new();
     hasher.write_str("gamfit-persistent-block-warm-start");
     hasher.write_str(&crate::solver::persistent_warm_start::cache_schema_tag());
     hasher.write_str(type_name::<F>());

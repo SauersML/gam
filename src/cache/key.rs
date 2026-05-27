@@ -120,6 +120,67 @@ impl Fingerprinter {
         bytes.copy_from_slice(&out);
         Fingerprint(bytes)
     }
+
+    // ------------------------------------------------------------------
+    // Untagged write_* API — drop-in replacement for the formerly-separate
+    // `StableHasher` (warm-start) and `CacheDigestBuilder` (latent_cache)
+    // hashers. Callers that use this API are responsible for their own
+    // type-disambiguation (typically by writing a leading namespace string
+    // via `write_str`); the `absorb_*` family above prepends per-call tags
+    // and is the safer choice for new code that does not need streaming
+    // compatibility with hand-framed inputs.
+    // ------------------------------------------------------------------
+
+    pub fn write_bytes(&mut self, data: &[u8]) {
+        self.h.update(data);
+    }
+
+    pub fn write_u8(&mut self, value: u8) {
+        self.h.update([value]);
+    }
+
+    pub fn write_bool(&mut self, value: bool) {
+        self.h.update([u8::from(value)]);
+    }
+
+    pub fn write_u64(&mut self, value: u64) {
+        self.h.update(value.to_le_bytes());
+    }
+
+    pub fn write_usize(&mut self, value: usize) {
+        self.h.update((value as u64).to_le_bytes());
+    }
+
+    pub fn write_f64(&mut self, value: f64) {
+        // Normalize -0.0 to +0.0 so signed-zero comparison ambiguity does
+        // not split cache buckets — matches the prior `StableHasher`
+        // contract that warm-start keys depended on.
+        let normalized = if value == 0.0 { 0.0 } else { value };
+        self.h.update(normalized.to_bits().to_le_bytes());
+    }
+
+    pub fn write_str(&mut self, value: &str) {
+        self.write_usize(value.len());
+        self.h.update(value.as_bytes());
+    }
+
+    /// Finalize and return the first 8 bytes of the SHA-256 digest as a
+    /// little-endian `u64`. Used by callers that need a compact in-process
+    /// identifier (manifold mode fingerprints, registry fingerprints, …)
+    /// rather than the full 32-byte [`Fingerprint`].
+    pub fn finish_u64(self) -> u64 {
+        let out = self.h.finalize();
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&out[..8]);
+        u64::from_le_bytes(bytes)
+    }
+
+    /// Finalize and return a zero-padded 16-character hex representation
+    /// of [`Fingerprinter::finish_u64`], suitable for embedding directly
+    /// in cache-key strings.
+    pub fn finish_hex(self) -> String {
+        format!("{:016x}", self.finish_u64())
+    }
 }
 
 /// Feed `xs` to the hasher in one bulk `update` instead of one 8-byte

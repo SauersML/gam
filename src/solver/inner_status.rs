@@ -20,7 +20,7 @@
 //! the bubbled error string for the sentinels emitted by
 //! `inner_blockwise_fit` and the diagnostician's `KktRefusalReport`.
 
-use super::custom_family::KktRefusalDiagnosis;
+use crate::families::custom_family::KktRefusalDiagnosis;
 
 /// Structured failure modes for the inner solver. Each variant carries
 /// the original message for backwards-compatible logging plus structured

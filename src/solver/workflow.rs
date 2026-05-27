@@ -378,12 +378,12 @@ pub trait FamilyFitRequest {
     /// Family-shape hash inputs (link kind, baseline, frailty, etc.) —
     /// everything that changes the coefficient layout. Feeds the exact
     /// cache key.
-    fn write_shape_hash(&self, h: &mut crate::solver::persistent_warm_start::StableHasher);
+    fn write_shape_hash(&self, h: &mut crate::cache::Fingerprinter);
 
     /// Data-independent seed-key hash inputs. Same structural identifiers
     /// as `write_shape_hash` but with the row count deliberately *excluded*
     /// so cross-validation folds / hyperparameter sweeps share a prefix.
-    fn write_seed_hash(&self, h: &mut crate::solver::persistent_warm_start::StableHasher);
+    fn write_seed_hash(&self, h: &mut crate::cache::Fingerprinter);
 
     /// Attach the primary persistent warm-start session. Variants like
     /// `Standard` that open their own session inside the outer optimizer
@@ -427,13 +427,13 @@ impl<'a> FamilyFitRequest for StandardFitRequest<'a> {
     fn n_cols(&self) -> usize {
         self.data.ncols()
     }
-    fn write_shape_hash(&self, h: &mut crate::solver::persistent_warm_start::StableHasher) {
+    fn write_shape_hash(&self, h: &mut crate::cache::Fingerprinter) {
         h.write_str("standard");
         h.write_str(&format!("{:?}", self.family));
         h.write_usize(self.y.len());
         h.write_usize(self.data.ncols());
     }
-    fn write_seed_hash(&self, h: &mut crate::solver::persistent_warm_start::StableHasher) {
+    fn write_seed_hash(&self, h: &mut crate::cache::Fingerprinter) {
         h.write_str("standard-seed");
         h.write_str(&format!("{:?}", self.family));
         h.write_usize(self.data.ncols());
@@ -459,12 +459,12 @@ impl<'a> FamilyFitRequest for GaussianLocationScaleFitRequest<'a> {
     fn n_cols(&self) -> usize {
         self.data.ncols()
     }
-    fn write_shape_hash(&self, h: &mut crate::solver::persistent_warm_start::StableHasher) {
+    fn write_shape_hash(&self, h: &mut crate::cache::Fingerprinter) {
         h.write_str("gauss-ls");
         h.write_usize(self.spec.y.len());
         h.write_usize(self.data.ncols());
     }
-    fn write_seed_hash(&self, h: &mut crate::solver::persistent_warm_start::StableHasher) {
+    fn write_seed_hash(&self, h: &mut crate::cache::Fingerprinter) {
         h.write_str("gauss-ls-seed");
         h.write_usize(self.data.ncols());
     }
@@ -484,13 +484,13 @@ impl<'a> FamilyFitRequest for BinomialLocationScaleFitRequest<'a> {
     fn n_cols(&self) -> usize {
         self.data.ncols()
     }
-    fn write_shape_hash(&self, h: &mut crate::solver::persistent_warm_start::StableHasher) {
+    fn write_shape_hash(&self, h: &mut crate::cache::Fingerprinter) {
         h.write_str("binom-ls");
         h.write_usize(self.spec.y.len());
         h.write_usize(self.data.ncols());
         h.write_str(&format!("{:?}", self.spec.link_kind));
     }
-    fn write_seed_hash(&self, h: &mut crate::solver::persistent_warm_start::StableHasher) {
+    fn write_seed_hash(&self, h: &mut crate::cache::Fingerprinter) {
         h.write_str("binom-ls-seed");
         h.write_usize(self.data.ncols());
         h.write_str(&format!("{:?}", self.spec.link_kind));
@@ -511,13 +511,13 @@ impl<'a> FamilyFitRequest for SurvivalLocationScaleFitRequest<'a> {
     fn n_cols(&self) -> usize {
         self.data.ncols()
     }
-    fn write_shape_hash(&self, h: &mut crate::solver::persistent_warm_start::StableHasher) {
+    fn write_shape_hash(&self, h: &mut crate::cache::Fingerprinter) {
         h.write_str("surv-ls");
         h.write_usize(self.spec.age_entry.len());
         h.write_usize(self.data.ncols());
         h.write_str(&format!("{:?}", self.spec.inverse_link));
     }
-    fn write_seed_hash(&self, h: &mut crate::solver::persistent_warm_start::StableHasher) {
+    fn write_seed_hash(&self, h: &mut crate::cache::Fingerprinter) {
         h.write_str("surv-ls-seed");
         h.write_usize(self.data.ncols());
         h.write_str(&format!("{:?}", self.spec.inverse_link));
@@ -546,14 +546,14 @@ impl<'a> FamilyFitRequest for SurvivalTransformationFitRequest<'a> {
     fn n_cols(&self) -> usize {
         self.data.ncols()
     }
-    fn write_shape_hash(&self, h: &mut crate::solver::persistent_warm_start::StableHasher) {
+    fn write_shape_hash(&self, h: &mut crate::cache::Fingerprinter) {
         h.write_str("surv-tn");
         h.write_usize(self.spec.age_entry.len());
         h.write_usize(self.data.ncols());
         h.write_str(&format!("{:?}", self.spec.likelihood_mode));
         h.write_str(&self.spec.time_build.basisname);
     }
-    fn write_seed_hash(&self, h: &mut crate::solver::persistent_warm_start::StableHasher) {
+    fn write_seed_hash(&self, h: &mut crate::cache::Fingerprinter) {
         h.write_str("surv-tn-seed");
         h.write_usize(self.data.ncols());
         h.write_str(&format!("{:?}", self.spec.likelihood_mode));
@@ -583,13 +583,13 @@ impl<'a> FamilyFitRequest for BernoulliMarginalSlopeFitRequest<'a> {
     fn n_cols(&self) -> usize {
         self.data.ncols()
     }
-    fn write_shape_hash(&self, h: &mut crate::solver::persistent_warm_start::StableHasher) {
+    fn write_shape_hash(&self, h: &mut crate::cache::Fingerprinter) {
         h.write_str("bern-ms");
         h.write_usize(self.spec.y.len());
         h.write_usize(self.data.ncols());
         h.write_str(&format!("{:?}", self.spec.base_link));
     }
-    fn write_seed_hash(&self, h: &mut crate::solver::persistent_warm_start::StableHasher) {
+    fn write_seed_hash(&self, h: &mut crate::cache::Fingerprinter) {
         h.write_str("bern-ms-seed");
         h.write_usize(self.data.ncols());
         h.write_str(&format!("{:?}", self.spec.base_link));
@@ -610,14 +610,14 @@ impl<'a> FamilyFitRequest for SurvivalMarginalSlopeFitRequest<'a> {
     fn n_cols(&self) -> usize {
         self.data.ncols()
     }
-    fn write_shape_hash(&self, h: &mut crate::solver::persistent_warm_start::StableHasher) {
+    fn write_shape_hash(&self, h: &mut crate::cache::Fingerprinter) {
         h.write_str("surv-ms");
         h.write_usize(self.spec.age_entry.len());
         h.write_usize(self.data.ncols());
         h.write_str(&format!("{:?}", self.spec.base_link));
         h.write_str(&format!("{:?}", self.spec.frailty));
     }
-    fn write_seed_hash(&self, h: &mut crate::solver::persistent_warm_start::StableHasher) {
+    fn write_seed_hash(&self, h: &mut crate::cache::Fingerprinter) {
         h.write_str("surv-ms-seed");
         h.write_usize(self.data.ncols());
         h.write_str(&format!("{:?}", self.spec.base_link));
@@ -639,13 +639,13 @@ impl<'a> FamilyFitRequest for LatentSurvivalFitRequest<'a> {
     fn n_cols(&self) -> usize {
         self.data.ncols()
     }
-    fn write_shape_hash(&self, h: &mut crate::solver::persistent_warm_start::StableHasher) {
+    fn write_shape_hash(&self, h: &mut crate::cache::Fingerprinter) {
         h.write_str("lat-surv");
         h.write_usize(self.spec.age_entry.len());
         h.write_usize(self.data.ncols());
         h.write_str(&format!("{:?}", self.frailty));
     }
-    fn write_seed_hash(&self, h: &mut crate::solver::persistent_warm_start::StableHasher) {
+    fn write_seed_hash(&self, h: &mut crate::cache::Fingerprinter) {
         h.write_str("lat-surv-seed");
         h.write_usize(self.data.ncols());
         h.write_str(&format!("{:?}", self.frailty));
@@ -666,13 +666,13 @@ impl<'a> FamilyFitRequest for LatentBinaryFitRequest<'a> {
     fn n_cols(&self) -> usize {
         self.data.ncols()
     }
-    fn write_shape_hash(&self, h: &mut crate::solver::persistent_warm_start::StableHasher) {
+    fn write_shape_hash(&self, h: &mut crate::cache::Fingerprinter) {
         h.write_str("lat-bin");
         h.write_usize(self.spec.age_entry.len());
         h.write_usize(self.data.ncols());
         h.write_str(&format!("{:?}", self.frailty));
     }
-    fn write_seed_hash(&self, h: &mut crate::solver::persistent_warm_start::StableHasher) {
+    fn write_seed_hash(&self, h: &mut crate::cache::Fingerprinter) {
         h.write_str("lat-bin-seed");
         h.write_usize(self.data.ncols());
         h.write_str(&format!("{:?}", self.frailty));
@@ -693,12 +693,12 @@ impl<'a> FamilyFitRequest for TransformationNormalFitRequest<'a> {
     fn n_cols(&self) -> usize {
         self.data.ncols()
     }
-    fn write_shape_hash(&self, h: &mut crate::solver::persistent_warm_start::StableHasher) {
+    fn write_shape_hash(&self, h: &mut crate::cache::Fingerprinter) {
         h.write_str("tn");
         h.write_usize(self.response.len());
         h.write_usize(self.data.ncols());
     }
-    fn write_seed_hash(&self, h: &mut crate::solver::persistent_warm_start::StableHasher) {
+    fn write_seed_hash(&self, h: &mut crate::cache::Fingerprinter) {
         h.write_str("tn-seed");
         h.write_usize(self.data.ncols());
     }
@@ -734,11 +734,12 @@ impl<'a> FitRequest<'a> {
     /// (convergence tolerances, ridge, etc.) — those go in the
     /// finer-grained suffix so a near-match can still be a useful seed.
     pub fn cache_key(&self) -> String {
-        // Family-shape hash: a 64-bit StableHasher-derived integer that
+        // Family-shape hash: a 64-bit truncation of the canonical
+        // SHA-256 `Fingerprinter` digest that
         // captures dimensions / formula structure unique to this family
         // variant. Two fits with identical family-shape hashes have
         // compatible θ shapes and can warm-start from each other.
-        let mut shape = crate::solver::persistent_warm_start::StableHasher::new();
+        let mut shape = crate::cache::Fingerprinter::new();
         family_dispatch!(self, r => r.write_shape_hash(&mut shape));
         let shape_hash = shape.finish_hex();
         let (nrows, ncols) = family_dispatch!(self, r => (r.n_obs(), r.n_cols()));
@@ -762,7 +763,7 @@ impl<'a> FitRequest<'a> {
     /// looks up this prefix only when the exact key has no entry — so a
     /// near-match never silently overrides a perfect match.
     pub fn cache_seed_key(&self) -> String {
-        let mut shape = crate::solver::persistent_warm_start::StableHasher::new();
+        let mut shape = crate::cache::Fingerprinter::new();
         family_dispatch!(self, r => r.write_seed_hash(&mut shape));
         format!(
             "{}/family={}/seed/{}",
@@ -1477,7 +1478,7 @@ fn cause_specific_survival_rho_prior(
 }
 
 fn hash_workflow_array_view(
-    hasher: &mut crate::solver::persistent_warm_start::StableHasher,
+    hasher: &mut crate::cache::Fingerprinter,
     array: ArrayView1<'_, f64>,
 ) {
     hasher.write_usize(array.len());
@@ -1487,7 +1488,7 @@ fn hash_workflow_array_view(
 }
 
 fn hash_workflow_u8_array(
-    hasher: &mut crate::solver::persistent_warm_start::StableHasher,
+    hasher: &mut crate::cache::Fingerprinter,
     array: ArrayView1<'_, u8>,
 ) {
     hasher.write_usize(array.len());
@@ -1497,7 +1498,7 @@ fn hash_workflow_u8_array(
 }
 
 fn hash_workflow_array2(
-    hasher: &mut crate::solver::persistent_warm_start::StableHasher,
+    hasher: &mut crate::cache::Fingerprinter,
     array: ArrayView2<'_, f64>,
 ) {
     hasher.write_usize(array.nrows());
@@ -1510,7 +1511,7 @@ fn hash_workflow_array2(
 }
 
 fn hash_workflow_design_matrix(
-    hasher: &mut crate::solver::persistent_warm_start::StableHasher,
+    hasher: &mut crate::cache::Fingerprinter,
     matrix: &crate::matrix::DesignMatrix,
 ) {
     let dense = matrix.to_dense();
@@ -1535,7 +1536,7 @@ fn persistent_survival_transformation_key(
     opts: &crate::pirls::WorkingModelPirlsOptions,
     n_cols: usize,
 ) -> String {
-    let mut hasher = crate::solver::persistent_warm_start::StableHasher::new();
+    let mut hasher = crate::cache::Fingerprinter::new();
     hasher.write_str("gamfit-persistent-survival-transformation-working-pirls");
     // Use the cache schema tag (NOT CARGO_PKG_VERSION) so routine
     // library version bumps don't invalidate users' on-disk warm-start

@@ -9,8 +9,9 @@ use crate::linalg::utils::{
 use crate::pirls::PirlsWorkspace;
 use crate::solver::estimate::reml::inner_strategy::HessianEvalStrategyKind;
 use crate::solver::outer_strategy::{HessianResult, OuterEval};
+use crate::cache::Fingerprinter;
 use crate::solver::persistent_warm_start::{
-    PersistentWarmStartRecord, StableHasher, load_record, store_record,
+    PersistentWarmStartRecord, load_record, store_record,
 };
 use crate::types::{
     GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily, RhoPrior,
@@ -674,14 +675,14 @@ fn screening_residual_penalty(cost: f64, pr: &PirlsResult) -> f64 {
     }
 }
 
-fn hash_array_view(hasher: &mut StableHasher, values: ndarray::ArrayView1<'_, f64>) {
+fn hash_array_view(hasher: &mut Fingerprinter, values: ndarray::ArrayView1<'_, f64>) {
     hasher.write_usize(values.len());
     for &value in values {
         hasher.write_f64(value);
     }
 }
 
-fn hash_array2(hasher: &mut StableHasher, values: &Array2<f64>) {
+fn hash_array2(hasher: &mut Fingerprinter, values: &Array2<f64>) {
     hasher.write_usize(values.nrows());
     hasher.write_usize(values.ncols());
     for &value in values {
@@ -690,7 +691,7 @@ fn hash_array2(hasher: &mut StableHasher, values: &Array2<f64>) {
 }
 
 fn hash_aux_prior_strength(
-    hasher: &mut StableHasher,
+    hasher: &mut Fingerprinter,
     strength: crate::terms::latent_coord::AuxPriorStrength,
 ) {
     use crate::terms::latent_coord::AuxPriorStrength;
@@ -707,7 +708,7 @@ pub(in crate::solver::estimate) fn latent_id_mode_cache_fingerprint(
     id_mode: &crate::terms::latent_coord::LatentIdMode,
 ) -> u64 {
     use crate::terms::latent_coord::{AuxPriorFamily, LatentIdMode};
-    let mut hasher = StableHasher::new();
+    let mut hasher = Fingerprinter::new();
     hasher.write_str("latent-id-mode-cache-v1");
     match id_mode {
         LatentIdMode::AuxPrior {
@@ -743,7 +744,7 @@ pub(in crate::solver::estimate) fn latent_id_mode_cache_fingerprint(
     hasher.finish_u64()
 }
 
-fn hash_array3(hasher: &mut StableHasher, values: &ndarray::Array3<f64>) {
+fn hash_array3(hasher: &mut Fingerprinter, values: &ndarray::Array3<f64>) {
     let (a, b, c) = values.dim();
     hasher.write_usize(a);
     hasher.write_usize(b);
@@ -753,7 +754,7 @@ fn hash_array3(hasher: &mut StableHasher, values: &ndarray::Array3<f64>) {
     }
 }
 
-fn hash_psi_slice(hasher: &mut StableHasher, target: &crate::terms::analytic_penalties::PsiSlice) {
+fn hash_psi_slice(hasher: &mut Fingerprinter, target: &crate::terms::analytic_penalties::PsiSlice) {
     hasher.write_usize(target.range.start);
     hasher.write_usize(target.range.end);
     match target.latent_dim {
@@ -766,7 +767,7 @@ fn hash_psi_slice(hasher: &mut StableHasher, target: &crate::terms::analytic_pen
 }
 
 fn hash_scalar_weight_schedule(
-    hasher: &mut StableHasher,
+    hasher: &mut Fingerprinter,
     schedule: &crate::terms::analytic_penalties::ScalarWeightSchedule,
 ) {
     use crate::terms::sae_manifold::ScheduleKind;
@@ -788,7 +789,7 @@ fn hash_scalar_weight_schedule(
 }
 
 fn hash_weight_schedule_option(
-    hasher: &mut StableHasher,
+    hasher: &mut Fingerprinter,
     schedule: &Option<crate::terms::analytic_penalties::ScalarWeightSchedule>,
 ) {
     match schedule {
@@ -801,7 +802,7 @@ fn hash_weight_schedule_option(
 }
 
 fn hash_gumbel_temperature_schedule(
-    hasher: &mut StableHasher,
+    hasher: &mut Fingerprinter,
     schedule: &crate::terms::sae_manifold::GumbelTemperatureSchedule,
 ) {
     use crate::terms::sae_manifold::ScheduleKind;
@@ -823,7 +824,7 @@ fn hash_gumbel_temperature_schedule(
 }
 
 fn hash_gumbel_schedule_option(
-    hasher: &mut StableHasher,
+    hasher: &mut Fingerprinter,
     schedule: &Option<crate::terms::sae_manifold::GumbelTemperatureSchedule>,
 ) {
     match schedule {
@@ -836,7 +837,7 @@ fn hash_gumbel_schedule_option(
 }
 
 fn hash_isometry_reference(
-    hasher: &mut StableHasher,
+    hasher: &mut Fingerprinter,
     reference: &crate::terms::analytic_penalties::IsometryReference,
 ) {
     use crate::terms::analytic_penalties::IsometryReference;
@@ -851,7 +852,7 @@ fn hash_isometry_reference(
 }
 
 fn hash_weight_field(
-    hasher: &mut StableHasher,
+    hasher: &mut Fingerprinter,
     field: &crate::terms::analytic_penalties::WeightField,
 ) {
     use crate::terms::analytic_penalties::WeightField;
@@ -868,7 +869,7 @@ fn hash_weight_field(
 }
 
 fn hash_sparsity_kind(
-    hasher: &mut StableHasher,
+    hasher: &mut Fingerprinter,
     kind: crate::terms::analytic_penalties::SparsityKind,
 ) {
     use crate::terms::analytic_penalties::SparsityKind;
@@ -887,7 +888,7 @@ fn hash_sparsity_kind(
 }
 
 fn hash_difference_op_kind(
-    hasher: &mut StableHasher,
+    hasher: &mut Fingerprinter,
     kind: &crate::terms::analytic_penalties::DifferenceOpKind,
 ) {
     use crate::terms::analytic_penalties::DifferenceOpKind;
@@ -905,7 +906,7 @@ fn hash_difference_op_kind(
     }
 }
 
-fn hash_groups(hasher: &mut StableHasher, groups: &[Vec<usize>]) {
+fn hash_groups(hasher: &mut Fingerprinter, groups: &[Vec<usize>]) {
     hasher.write_usize(groups.len());
     for group in groups {
         hasher.write_usize(group.len());
@@ -916,7 +917,7 @@ fn hash_groups(hasher: &mut StableHasher, groups: &[Vec<usize>]) {
 }
 
 fn hash_analytic_penalty_kind(
-    hasher: &mut StableHasher,
+    hasher: &mut Fingerprinter,
     penalty: &crate::terms::analytic_penalties::AnalyticPenaltyKind,
 ) {
     use crate::terms::analytic_penalties::{AnalyticPenaltyKind, PenaltyConcavity};
@@ -1201,7 +1202,7 @@ fn hash_analytic_penalty_kind(
 pub(crate) fn analytic_penalty_registry_fingerprint(
     registry: &crate::terms::analytic_penalties::AnalyticPenaltyRegistry,
 ) -> u64 {
-    let mut hasher = StableHasher::new();
+    let mut hasher = Fingerprinter::new();
     hasher.write_str("analytic-penalty-registry-v1");
     hasher.write_usize(registry.penalties.len());
     for penalty in &registry.penalties {
@@ -1210,7 +1211,7 @@ pub(crate) fn analytic_penalty_registry_fingerprint(
     hasher.finish_u64()
 }
 
-fn hash_design_matrix(hasher: &mut StableHasher, design: &DesignMatrix) -> Result<(), String> {
+fn hash_design_matrix(hasher: &mut Fingerprinter, design: &DesignMatrix) -> Result<(), String> {
     let n = design.nrows();
     let p = design.ncols();
     hasher.write_usize(n);
@@ -1228,7 +1229,7 @@ fn hash_design_matrix(hasher: &mut StableHasher, design: &DesignMatrix) -> Resul
 }
 
 fn hash_canonical_penalties(
-    hasher: &mut StableHasher,
+    hasher: &mut Fingerprinter,
     penalties: &[crate::construction::CanonicalPenalty],
 ) {
     hasher.write_usize(penalties.len());
@@ -5029,7 +5030,7 @@ impl<'a> RemlState<'a> {
         if let Some(key) = self.persistent_warm_start_key.read().unwrap().clone() {
             return Some(key);
         }
-        let mut hasher = StableHasher::new();
+        let mut hasher = Fingerprinter::new();
         hasher.write_str("gamfit-persistent-warm-start-v2");
         // Use the cache schema tag (NOT CARGO_PKG_VERSION) so routine
         // library version bumps don't invalidate users' on-disk
