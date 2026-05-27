@@ -6163,7 +6163,7 @@ impl<'a> RemlState<'a> {
                             InverseLink::Sas(state)
                         }
                     } else {
-                        InverseLink::Standard(self.config.link_function())
+                        InverseLink::Standard(StandardLink::try_from(self.config.link_function()).expect("state-bearing link without runtime state"))
                     };
                 return Ok(Arc::new(cached.rehydrate_after_reml_cache(
                     self.x(),
@@ -6258,7 +6258,7 @@ impl<'a> RemlState<'a> {
                     InverseLink::Sas(state)
                 }
             } else {
-                InverseLink::Standard(self.config.link_function())
+                InverseLink::Standard(StandardLink::try_from(self.config.link_function()).expect("state-bearing link without runtime state"))
             };
             // Levenberg-Marquardt damping warm-start. Read the cached
             // λ from the previous successful PIRLS solve at this
@@ -6672,7 +6672,7 @@ impl<'a> RemlState<'a> {
                 InverseLink::Sas(state)
             }
         } else {
-            InverseLink::Standard(self.config.link_function())
+            InverseLink::Standard(StandardLink::try_from(self.config.link_function()).expect("state-bearing link without runtime state"))
         };
 
         // Gaussian + Identity outer REML reuses a precomputed XᵀWX and
