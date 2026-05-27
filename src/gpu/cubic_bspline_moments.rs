@@ -821,7 +821,7 @@ impl CubicMomentBackend {
             let stream = &self.inner.stream;
             let host =
                 stream
-                    .memcpy_dtov(&dev.values)
+                    .clone_dtoh(&dev.values)
                     .map_err(|err| GpuError::DriverCallFailed {
                         reason: format!(
                             "cubic_bspline_moments download_alpha_major dtov: {err}"
