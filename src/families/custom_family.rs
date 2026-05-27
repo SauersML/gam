@@ -23108,7 +23108,7 @@ mod tests {
         let family = BinomialLocationScaleWiggleFamily {
             y: base.y,
             weights: base.weights,
-            link_kind: crate::types::InverseLink::Standard(crate::types::LinkFunction::Probit),
+            link_kind: crate::types::InverseLink::Standard(crate::types::StandardLink::Probit),
             threshold_design: Some(base.threshold_design),
             log_sigma_design: Some(base.log_sigma_design),
             wiggle_knots: knots,
@@ -26105,7 +26105,7 @@ mod tests {
         let family = BinomialLocationScaleFamily {
             y,
             weights,
-            link_kind: crate::types::InverseLink::Standard(crate::types::LinkFunction::Probit),
+            link_kind: crate::types::InverseLink::Standard(crate::types::StandardLink::Probit),
             threshold_design: Some(threshold_design),
             log_sigma_design: Some(log_sigma_design),
             policy: crate::resource::ResourcePolicy::default_library(),
@@ -26211,7 +26211,7 @@ mod tests {
         let family = BinomialLocationScaleFamily {
             y,
             weights,
-            link_kind: crate::types::InverseLink::Standard(crate::types::LinkFunction::Probit),
+            link_kind: crate::types::InverseLink::Standard(crate::types::StandardLink::Probit),
             threshold_design: Some(threshold_design),
             log_sigma_design: Some(log_sigma_design),
             policy: crate::resource::ResourcePolicy::default_library(),
@@ -26325,7 +26325,7 @@ mod tests {
         let family = BinomialLocationScaleFamily {
             y,
             weights,
-            link_kind: crate::types::InverseLink::Standard(crate::types::LinkFunction::Probit),
+            link_kind: crate::types::InverseLink::Standard(crate::types::StandardLink::Probit),
             threshold_design: Some(threshold_design),
             log_sigma_design: Some(log_sigma_design),
             policy: crate::resource::ResourcePolicy::default_library(),
@@ -26507,7 +26507,7 @@ mod tests {
         let family = BinomialLocationScaleFamily {
             y,
             weights,
-            link_kind: crate::types::InverseLink::Standard(crate::types::LinkFunction::Probit),
+            link_kind: crate::types::InverseLink::Standard(crate::types::StandardLink::Probit),
             threshold_design: Some(threshold_design),
             log_sigma_design: Some(log_sigma_design),
             policy: crate::resource::ResourcePolicy::default_library(),

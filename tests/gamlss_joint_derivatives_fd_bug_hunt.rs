@@ -5,7 +5,7 @@ use gam::families::gamlss::{
 };
 use gam::matrix::DesignMatrix;
 use gam::resource::ResourcePolicy;
-use gam::types::{InverseLink, LinkFunction};
+use gam::types::{InverseLink, LinkFunction, StandardLink};
 use ndarray::{Array1, Array2, array};
 
 fn spec(name: &str, x: &Array2<f64>) -> ParameterBlockSpec {

@@ -3,7 +3,7 @@ use gam::inference::model::{
     FittedFamily, FittedModel, FittedModelPayload, MODEL_PAYLOAD_VERSION, ModelKind,
 };
 use gam::types::{
-    InverseLink, LatentCLogLogState, LikelihoodSpec, LinkComponent, LinkFunction, MixtureLinkState,
+    InverseLink, LatentCLogLogState, LikelihoodSpec, LinkComponent, LinkFunction, StandardLink, MixtureLinkState,
     ResponseFamily, SasLinkState,
 };
 use ndarray::array;

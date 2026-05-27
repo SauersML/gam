@@ -9,7 +9,7 @@ use gam::smooth::{
     CoefficientGroupPrior, CoefficientGroupSpec, CoefficientSelector, LinearTermSpec,
     TermCollectionSpec, build_term_collection_design, fit_term_collection_with_coefficient_groups,
 };
-use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily, RhoPrior};
+use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, StandardLink, ResponseFamily, RhoPrior};
 use ndarray::{Array1, Array2, array};
 use std::sync::Arc;
 

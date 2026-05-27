@@ -1,5 +1,5 @@
 use gam::estimate::{FitOptions, fit_gam};
-use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily};
+use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, StandardLink, ResponseFamily};
 use ndarray::array;
 
 #[test]

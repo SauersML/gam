@@ -23,7 +23,7 @@ use gam::estimate::{
 };
 use gam::faer_ndarray::{FaerCholesky, FaerEigh};
 use gam::smooth::BlockwisePenalty;
-use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily};
+use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, StandardLink, ResponseFamily};
 use ndarray::{Array1, Array2, Axis, array};
 
 // ─────────────────────────────────────────────────────────────────────────────

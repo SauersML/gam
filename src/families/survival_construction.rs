@@ -27,7 +27,7 @@ use crate::families::survival_marginal_slope::DEFAULT_SURVIVAL_MARGINAL_SLOPE_DE
 use crate::inference::formula_dsl::LinkWiggleFormulaSpec;
 use crate::matrix::{DenseDesignMatrix, DesignMatrix, SparseDesignMatrix};
 use crate::probability::{normal_pdf, standard_normal_quantile};
-use crate::types::{InverseLink, LinkFunction};
+use crate::types::{InverseLink, LinkFunction, StandardLink};
 use ndarray::{Array1, Array2, array, s};
 use rayon::prelude::*;
 

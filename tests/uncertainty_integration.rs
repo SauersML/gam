@@ -8,7 +8,7 @@ use gam::predict::{
 use gam::probability::try_inverse_link_array;
 use gam::smooth::BlockwisePenalty;
 use gam::types::{
-    InverseLink, LikelihoodSpec, LinkComponent, LinkFunction, MixtureLinkSpec, ResponseFamily,
+    InverseLink, LikelihoodSpec, LinkComponent, LinkFunction, StandardLink, MixtureLinkSpec, ResponseFamily,
 };
 use ndarray::{Array1, Array2};
 

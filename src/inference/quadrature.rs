@@ -181,7 +181,7 @@ use crate::probability::{
     erfcx_nonnegative, stable_polynomial_times_exp_neg as cloglog_stable_poly_times_exp_neg,
 };
 use crate::types::{
-    InverseLink, LikelihoodSpec, LinkComponent, LinkFunction, MixtureLinkState, ResponseFamily,
+    InverseLink, LikelihoodSpec, LinkComponent, LinkFunction, StandardLink, MixtureLinkState, ResponseFamily,
     SasLinkState,
 };
 use statrs::function::erf::erfc;

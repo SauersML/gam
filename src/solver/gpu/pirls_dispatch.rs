@@ -14,7 +14,7 @@
 //! reach the mapper directly without standing up a full fit.
 
 use crate::gpu::policy::{PirlsLoopAdmission, PirlsLoopCurvatureKind, PirlsLoopFamilyKind};
-use crate::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily};
+use crate::types::{InverseLink, LikelihoodSpec, LinkFunction, StandardLink, ResponseFamily};
 
 /// Result of mapping the engine-level `(ResponseFamily, InverseLink)` pair
 /// to the six built-in JIT-cached families the Stage 3.3 PIRLS loop can

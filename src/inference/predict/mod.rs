@@ -1966,7 +1966,7 @@ impl BernoulliMarginalSlopePredictor {
         };
         if !matches!(
             base_link,
-            InverseLink::Standard(crate::types::LinkFunction::Probit)
+            InverseLink::Standard(crate::types::StandardLink::Probit)
         ) {
             return Err(
                 "bernoulli marginal-slope predictor requires link(type=probit); saved non-probit marginal-slope models must be refit"
@@ -4075,7 +4075,7 @@ fn survival_tail_value_from_failure_jet(
     failure_jet: &InverseLinkJet,
 ) -> f64 {
     match inverse_link {
-        InverseLink::Standard(crate::types::LinkFunction::Probit) => {
+        InverseLink::Standard(crate::types::StandardLink::Probit) => {
             if eta.is_nan() {
                 f64::NAN
             } else if eta == f64::INFINITY {
@@ -4086,8 +4086,8 @@ fn survival_tail_value_from_failure_jet(
                 0.5 * statrs::function::erf::erfc(eta / std::f64::consts::SQRT_2)
             }
         }
-        InverseLink::Standard(crate::types::LinkFunction::Logit) => 1.0 / (1.0 + eta.exp()),
-        InverseLink::Standard(crate::types::LinkFunction::CLogLog) => (-(eta.exp())).exp(),
+        InverseLink::Standard(crate::types::StandardLink::Logit) => 1.0 / (1.0 + eta.exp()),
+        InverseLink::Standard(crate::types::StandardLink::CLogLog) => (-(eta.exp())).exp(),
         _ => (1.0 - failure_jet.mu).clamp(0.0, 1.0),
     }
 }
@@ -5880,7 +5880,7 @@ mod tests {
             beta_logslope: array![1.6],
             beta_score_warp: Some(array![0.7, -0.4]),
             beta_link_dev: None,
-            base_link: InverseLink::Standard(crate::types::LinkFunction::Probit),
+            base_link: InverseLink::Standard(crate::types::StandardLink::Probit),
             z_column: "z".to_string(),
             latent_z_normalization: SavedLatentZNormalization { mean: 0.0, sd: 1.0 },
             latent_measure: LatentMeasureKind::StandardNormal,
@@ -6062,7 +6062,7 @@ mod tests {
             beta_logslope: array![-0.4],
             beta_score_warp: None,
             beta_link_dev: None,
-            base_link: InverseLink::Standard(crate::types::LinkFunction::Probit),
+            base_link: InverseLink::Standard(crate::types::StandardLink::Probit),
             z_column: "z".to_string(),
             latent_z_normalization: SavedLatentZNormalization { mean: 0.0, sd: 1.0 },
             latent_measure: LatentMeasureKind::StandardNormal,
@@ -6123,7 +6123,7 @@ mod tests {
             beta_logslope: array![0.9],
             beta_score_warp: None,
             beta_link_dev: None,
-            base_link: InverseLink::Standard(crate::types::LinkFunction::Probit),
+            base_link: InverseLink::Standard(crate::types::StandardLink::Probit),
             z_column: "z".to_string(),
             latent_z_normalization: SavedLatentZNormalization { mean: 0.0, sd: 1.0 },
             latent_measure: LatentMeasureKind::LocalEmpirical {
@@ -6183,7 +6183,7 @@ mod tests {
             beta_logslope: array![-0.4],
             beta_score_warp: None,
             beta_link_dev: None,
-            base_link: InverseLink::Standard(crate::types::LinkFunction::Logit),
+            base_link: InverseLink::Standard(crate::types::StandardLink::Logit),
             z_column: "z".to_string(),
             latent_z_normalization: SavedLatentZNormalization { mean: 0.0, sd: 1.0 },
             latent_measure: LatentMeasureKind::StandardNormal,

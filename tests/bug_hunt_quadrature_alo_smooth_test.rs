@@ -3,7 +3,7 @@ use gam::inference::quadrature::{
     QuadratureContext, cloglog_ghq_value, integrated_family_moments_jet,
 };
 use gam::inference::smooth_test::{SmoothTestInput, SmoothTestScale, wood_smooth_test};
-use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily};
+use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, StandardLink, ResponseFamily};
 use ndarray::{Array1, Array2, array};
 use rand::{RngExt, SeedableRng, rngs::StdRng};
 use statrs::distribution::{ContinuousCDF, FisherSnedecor};

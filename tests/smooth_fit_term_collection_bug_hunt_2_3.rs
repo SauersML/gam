@@ -5,7 +5,7 @@ use gam::smooth::{
     build_term_collection_designs_joint,
     fit_term_collection_with_coefficient_groups_and_penalty_block_gamma_priors,
 };
-use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily, RhoPrior};
+use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, StandardLink, ResponseFamily, RhoPrior};
 use ndarray::{Array1, Array2};
 
 fn opts() -> FitOptions {

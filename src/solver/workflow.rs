@@ -65,7 +65,7 @@ use crate::terms::{
     TotalVariationPenalty,
 };
 use crate::types::{
-    InverseLink, LatentCLogLogState, LikelihoodSpec, LinkFunction, MixtureLinkSpec, ResponseFamily,
+    InverseLink, LatentCLogLogState, LikelihoodSpec, LinkFunction, StandardLink, MixtureLinkSpec, ResponseFamily,
     SasLinkSpec, WigglePenaltyConfig,
 };
 

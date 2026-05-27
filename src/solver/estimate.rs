@@ -6754,7 +6754,7 @@ mod estimate_policy_tests {
     use super::*;
     use crate::linalg::utils::{StableSolver, max_abs_diag};
     use crate::mixture_link::{sas_inverse_link_jet, sas_inverse_link_jetwith_param_partials};
-    use crate::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily};
+    use crate::types::{InverseLink, LikelihoodSpec, LinkFunction, StandardLink, ResponseFamily};
     use ndarray::{Array1, Array2, array};
     use rand::rngs::StdRng;
     use rand::{RngExt, SeedableRng};

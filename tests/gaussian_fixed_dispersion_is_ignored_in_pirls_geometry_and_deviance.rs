@@ -9,7 +9,7 @@ fn gaussian_fixed_dispersion_should_scale_working_weight_and_deviance() {
     let likelihood = GlmLikelihoodSpec {
         spec: LikelihoodSpec {
             response: ResponseFamily::Gaussian,
-            link: InverseLink::Standard(gam::types::LinkFunction::Identity),
+            link: InverseLink::Standard(gam::types::StandardLink::Identity),
         },
         scale: LikelihoodScaleMetadata::FixedDispersion { phi: 4.0 },
     };

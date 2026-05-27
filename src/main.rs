@@ -1435,7 +1435,6 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             family.clone(),
             effective_link,
             mixture_linkspec.as_ref(),
-            sas_linkspec.as_ref(),
             "binomial mean-only link wiggle",
         )?;
         Some(StandardBinomialWiggleConfig {
@@ -2295,7 +2294,7 @@ fn run_fitwith_predict_noise(
     }
     // family is already gated as binomial by is_binomial() above, so we
     // only need to discriminate on the link.
-    let location_scale_link_kind = match family.link {
+    let location_scale_link_kind = match &family.link {
         InverseLink::Standard(StandardLink::Logit) => {
             let spec = mixture_linkspec
                 .ok_or_else(|| {
@@ -2307,24 +2306,14 @@ fn run_fitwith_predict_noise(
                 .map_err(|e| format!("invalid blended link configuration: {e}"))?;
             InverseLink::Mixture(state)
         }
-        InverseLink::Standard(LinkFunction::Sas) => {
-            let spec = *sas_linkspec.ok_or_else(|| {
-                "binomial SAS location-scale fitting requires link(type=sas)".to_string()
-            })?;
-            let state = state_from_sasspec(spec)
-                .map_err(|e| format!("invalid SAS link configuration: {e}"))?;
-            InverseLink::Sas(state)
-        }
-        InverseLink::Standard(LinkFunction::BetaLogistic) => {
-            let spec = *sas_linkspec.ok_or_else(|| {
-                "binomial beta-logistic location-scale fitting requires link(type=beta-logistic)"
-                    .to_string()
-            })?;
-            let state = state_from_beta_logisticspec(spec)
-                .map_err(|e| format!("invalid Beta-Logistic link configuration: {e}"))?;
-            InverseLink::BetaLogistic(state)
-        }
-        _ => InverseLink::Standard(effective_link),
+        // `resolve_family` already upgrades `LinkFunction::Sas` /
+        // `LinkFunction::BetaLogistic` to their state-bearing variants,
+        // so the family arrives here fully typed.
+        InverseLink::Sas(state) => InverseLink::Sas(*state),
+        InverseLink::BetaLogistic(state) => InverseLink::BetaLogistic(*state),
+        InverseLink::Mixture(state) => InverseLink::Mixture(state.clone()),
+        InverseLink::LatentCLogLog(state) => InverseLink::LatentCLogLog(*state),
+        InverseLink::Standard(link) => InverseLink::Standard(*link),
     };
     if formula_linkwiggle.is_some() {
         require_inverse_link_supports_joint_wiggle(&location_scale_link_kind, "linkwiggle(...)")?;
@@ -8780,7 +8769,6 @@ fn resolve_binomial_inverse_link_for_fit(
     family: LikelihoodSpec,
     effective_link: LinkFunction,
     mixture_linkspec: Option<&MixtureLinkSpec>,
-    sas_linkspec: Option<&SasLinkSpec>,
     context: &str,
 ) -> Result<InverseLink, String> {
     if !family.is_binomial() {
@@ -8789,7 +8777,7 @@ fn resolve_binomial_inverse_link_for_fit(
             family.name()
         ));
     }
-    match family.link {
+    match &family.link {
         InverseLink::Standard(StandardLink::Logit) => {
             let spec = mixture_linkspec
                 .ok_or_else(|| format!("{context} requires link(type=blended(...))"))?;
@@ -8797,24 +8785,42 @@ fn resolve_binomial_inverse_link_for_fit(
                 .map_err(|e| format!("invalid blended link configuration: {e}"))?;
             Ok(InverseLink::Mixture(state))
         }
-        InverseLink::Standard(LinkFunction::Sas) => {
-            let spec = *sas_linkspec.ok_or_else(|| format!("{context} requires link(type=sas)"))?;
-            let state = state_from_sasspec(spec)
-                .map_err(|e| format!("invalid SAS link configuration: {e}"))?;
-            Ok(InverseLink::Sas(state))
-        }
-        InverseLink::Standard(LinkFunction::BetaLogistic) => {
-            let spec = *sas_linkspec
-                .ok_or_else(|| format!("{context} requires link(type=beta-logistic)"))?;
-            let state = state_from_beta_logisticspec(spec)
-                .map_err(|e| format!("invalid Beta-Logistic link configuration: {e}"))?;
-            Ok(InverseLink::BetaLogistic(state))
-        }
+        // `resolve_family` already upgrades Sas / BetaLogistic to their
+        // state-bearing variants; we only need to forward them here.
+        InverseLink::Sas(state) => Ok(InverseLink::Sas(*state)),
+        InverseLink::BetaLogistic(state) => Ok(InverseLink::BetaLogistic(*state)),
         InverseLink::Standard(StandardLink::CLogLog) => Err(format!(
             "{context} does not construct latent-cloglog links directly; use the latent-cloglog family path with explicit frailty"
         )),
-        InverseLink::Standard(StandardLink::Probit) => Ok(InverseLink::Standard(effective_link)),
-        _ => Ok(InverseLink::Standard(effective_link)),
+        InverseLink::Standard(StandardLink::Probit)
+        | InverseLink::Standard(StandardLink::Identity)
+        | InverseLink::Standard(StandardLink::Log)
+        | InverseLink::LatentCLogLog(_)
+        | InverseLink::Mixture(_) => {
+            Ok(InverseLink::Standard(effective_link_to_standard(effective_link, context)?))
+        }
+    }
+}
+
+/// Narrow a wide `LinkFunction` into the legal-only `StandardLink` carried by
+/// `InverseLink::Standard`. Sas / BetaLogistic are state-bearing and have
+/// already been routed to their own `InverseLink` variants by the time this
+/// fallback runs; reaching it with one of those wide variants is a contract
+/// violation by the caller.
+fn effective_link_to_standard(
+    link: LinkFunction,
+    context: &str,
+) -> Result<StandardLink, String> {
+    match link {
+        LinkFunction::Logit => Ok(StandardLink::Logit),
+        LinkFunction::Probit => Ok(StandardLink::Probit),
+        LinkFunction::CLogLog => Ok(StandardLink::CLogLog),
+        LinkFunction::Identity => Ok(StandardLink::Identity),
+        LinkFunction::Log => Ok(StandardLink::Log),
+        LinkFunction::Sas | LinkFunction::BetaLogistic => Err(format!(
+            "{context}: state-bearing link `{}` must be routed through `InverseLink::Sas` / `InverseLink::BetaLogistic`, not `Standard(_)`",
+            link.name()
+        )),
     }
 }
 
@@ -9083,7 +9089,7 @@ fn build_model_summary(
         let null_likelihood = if family.is_royston_parmar() {
             gam::types::GlmLikelihoodSpec::canonical(gam::types::LikelihoodSpec::new(
                 gam::types::ResponseFamily::Gaussian,
-                gam::types::InverseLink::Standard(gam::types::LinkFunction::Identity),
+                gam::types::InverseLink::Standard(gam::types::StandardLink::Identity),
             ))
         } else {
             gam::types::GlmLikelihoodSpec::canonical(family.clone())
