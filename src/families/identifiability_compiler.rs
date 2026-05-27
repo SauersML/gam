@@ -1072,4 +1072,240 @@ mod tests {
             "compiled B-design must be H-orthogonal to A: max cross = {max_cross:e}"
         );
     }
+
+    /// `K=4` dense row Hessian: per-row PSD matrix supplied directly.
+    struct DenseRowHessian {
+        h: Array3<f64>,
+    }
+
+    impl RowHessian for DenseRowHessian {
+        fn k(&self) -> usize {
+            self.h.shape()[1]
+        }
+        fn nrows(&self) -> usize {
+            self.h.shape()[0]
+        }
+        fn fill_row(&self, row: usize, out: &mut [f64]) {
+            let k = self.k();
+            assert_eq!(out.len(), k * k);
+            for c in 0..k {
+                for d in 0..k {
+                    out[c * k + d] = self.h[[row, c, d]];
+                }
+            }
+        }
+        fn evaluate_full(&self) -> Array3<f64> {
+            self.h.clone()
+        }
+    }
+
+    /// Reference W-based Gram for verification: build `W = sqrt(H) · J` then
+    /// return `Wᵀ W`. Mirrors the in-walk path in [`compile`].
+    fn reference_gram_from_w(j_full: &Array3<f64>, h_full: &Array3<f64>) -> Array2<f64> {
+        let w = scale_block_by_sqrt_h(j_full, h_full);
+        fast_ata(&w)
+    }
+
+    /// Two-block toy at K=4: build per-channel (n × p_b) blocks and verify
+    /// the closed-form Gram matches the reference W-based Gram.
+    #[test]
+    fn closed_form_gram_matches_reference_two_block_k4() {
+        let n = 17;
+        let k = 4;
+        let p_a = 3;
+        let p_b = 2;
+
+        // Random-ish per-channel design matrices for each block.
+        let make_block = |seed: f64, n: usize, p: usize| -> Vec<Option<Array2<f64>>> {
+            (0..4)
+                .map(|c| {
+                    let m = Array2::from_shape_fn((n, p), |(i, j)| {
+                        ((i as f64 + 1.0) * (j as f64 + 1.0) * (c as f64 + 1.0) + seed).sin()
+                    });
+                    Some(m)
+                })
+                .collect()
+        };
+        let block_a = make_block(0.3, n, p_a);
+        let block_b = make_block(1.1, n, p_b);
+
+        // Per-row PSD H: random symmetric PSD via Mᵀ M.
+        let h = Array3::from_shape_fn((n, k, k), |(i, c, d)| {
+            let mut acc = 0.0;
+            for r in 0..k {
+                let mc = ((i + 1) as f64 * (c + 1) as f64 * (r + 1) as f64 * 0.13).cos();
+                let md = ((i + 1) as f64 * (d + 1) as f64 * (r + 1) as f64 * 0.13).cos();
+                acc += mc * md;
+            }
+            acc + if c == d { 0.5 } else { 0.0 }
+        });
+        let row_hess = DenseRowHessian { h: h.clone() };
+
+        let channel_blocks = PrimaryChannelBlocks {
+            blocks: vec![block_a.clone(), block_b.clone()],
+        };
+        let raw_ranges = vec![0..p_a, p_a..(p_a + p_b)];
+
+        let gram = build_raw_grams_from_channel_blocks(&channel_blocks, &row_hess, &raw_ranges)
+            .expect("closed-form Gram should succeed");
+
+        // Reference: assemble full row Jacobian J as (n × p_total × K) by
+        // placing per-block, per-channel slices at the right columns.
+        let p_total = p_a + p_b;
+        let mut j_full = Array3::<f64>::zeros((n, p_total, k));
+        for c in 0..k {
+            if let Some(xa) = block_a[c].as_ref() {
+                for i in 0..n {
+                    for j in 0..p_a {
+                        j_full[[i, j, c]] = xa[[i, j]];
+                    }
+                }
+            }
+            if let Some(xb) = block_b[c].as_ref() {
+                for i in 0..n {
+                    for j in 0..p_b {
+                        j_full[[i, p_a + j, c]] = xb[[i, j]];
+                    }
+                }
+            }
+        }
+        let ref_gram = reference_gram_from_w(&j_full, &h);
+
+        let diff = &gram - &ref_gram;
+        let max_err = diff.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+        let scale = ref_gram.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+        assert!(
+            max_err < 1e-9 * scale.max(1.0),
+            "closed-form Gram mismatches reference: max_err={max_err:e}, scale={scale:e}"
+        );
+
+        // Symmetry of the result.
+        for i in 0..p_total {
+            for j in 0..p_total {
+                assert!(
+                    (gram[[i, j]] - gram[[j, i]]).abs() < 1e-12,
+                    "closed-form Gram not symmetric at ({i},{j})"
+                );
+            }
+        }
+    }
+
+    /// Channel sparsity test: block A contributes only to channel 0, block B
+    /// only to channel 3. Cross-block contribution must be exactly
+    /// `(X_A^(0))ᵀ · diag(h_{03}) · X_B^(3)` — zero when `h_03 ≡ 0`,
+    /// non-zero otherwise.
+    #[test]
+    fn closed_form_gram_channel_sparsity() {
+        let n = 13;
+        let k = 4;
+        let p_a = 2;
+        let p_b = 2;
+
+        let xa = Array2::from_shape_fn((n, p_a), |(i, j)| ((i + 1) as f64 * 0.21 + j as f64).cos());
+        let xb = Array2::from_shape_fn((n, p_b), |(i, j)| ((i + 1) as f64 * 0.17 + j as f64).sin() + 0.5);
+
+        let block_a: Vec<Option<Array2<f64>>> = vec![Some(xa.clone()), None, None, None];
+        let block_b: Vec<Option<Array2<f64>>> = vec![None, None, None, Some(xb.clone())];
+
+        // Case 1: H with non-zero h_{03} (and h_{30}). The cross-block
+        // (A, B) entries must equal `Xaᵀ · diag(h_03) · Xb`.
+        let h_03_vec = Array1::from_shape_fn(n, |i| 0.7 + 0.3 * ((i as f64) * 0.4).sin());
+        let h = Array3::from_shape_fn((n, k, k), |(i, c, d)| {
+            // Symmetric: only the (0,3)/(3,0) off-diagonal carries weight,
+            // plus a strong PSD diagonal so per-row H is PSD.
+            if (c, d) == (0, 3) || (c, d) == (3, 0) {
+                h_03_vec[i]
+            } else if c == d {
+                2.0
+            } else {
+                0.0
+            }
+        });
+        let row_hess = DenseRowHessian { h: h.clone() };
+
+        let channel_blocks = PrimaryChannelBlocks {
+            blocks: vec![block_a.clone(), block_b.clone()],
+        };
+        let raw_ranges = vec![0..p_a, p_a..(p_a + p_b)];
+        let gram = build_raw_grams_from_channel_blocks(&channel_blocks, &row_hess, &raw_ranges)
+            .expect("closed-form Gram should succeed");
+
+        // Cross-block submatrix.
+        let cross = gram.slice(s![0..p_a, p_a..(p_a + p_b)]).to_owned();
+        // Expected: only the (c=0, d=3) channel-pair survives.
+        let expected = fast_xt_diag_y(&xa, &h_03_vec, &xb);
+        let diff = &cross - &expected;
+        let max_err = diff.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+        assert!(
+            max_err < 1e-12,
+            "cross-block Gram must equal Xaᵀ·diag(h_03)·Xb: max_err={max_err:e}"
+        );
+
+        // Case 2: zero out h_{03} → cross-block must be zero.
+        let h_zero = Array3::from_shape_fn((n, k, k), |(_, c, d)| if c == d { 2.0 } else { 0.0 });
+        let row_hess_zero = DenseRowHessian { h: h_zero };
+        let gram_zero = build_raw_grams_from_channel_blocks(&channel_blocks, &row_hess_zero, &raw_ranges)
+            .expect("closed-form Gram should succeed");
+        let cross_zero = gram_zero.slice(s![0..p_a, p_a..(p_a + p_b)]);
+        let max_zero = cross_zero.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+        assert!(
+            max_zero < 1e-12,
+            "cross-block Gram must vanish when coupling channel pair is zero: got {max_zero:e}"
+        );
+    }
+
+    /// Structural Gram: identity per-row Hessian collapses the channel-pair
+    /// sum to within-channel `XᵀX`. Validates [`build_raw_grams_structural`].
+    #[test]
+    fn structural_gram_matches_within_channel_sum() {
+        let n = 11;
+        let p_a = 2;
+        let p_b = 3;
+        let make_block = |seed: f64, n: usize, p: usize| -> Vec<Option<Array2<f64>>> {
+            (0..4)
+                .map(|c| {
+                    if c == 1 {
+                        // Sparse channel for variety.
+                        return None;
+                    }
+                    Some(Array2::from_shape_fn((n, p), |(i, j)| {
+                        ((i as f64 + 1.0) * (j as f64 + 1.0) + seed * (c as f64 + 1.0)).sin()
+                    }))
+                })
+                .collect()
+        };
+        let block_a = make_block(0.1, n, p_a);
+        let block_b = make_block(0.7, n, p_b);
+        let channel_blocks = PrimaryChannelBlocks {
+            blocks: vec![block_a.clone(), block_b.clone()],
+        };
+        let raw_ranges = vec![0..p_a, p_a..(p_a + p_b)];
+        let gram = build_raw_grams_structural(&channel_blocks, &raw_ranges);
+
+        // Hand-compute cross block: Σ_c Xaᵀ Xb over channels where both
+        // sides are present (skipping channel 1 entirely).
+        let mut expected_cross = Array2::<f64>::zeros((p_a, p_b));
+        for c in 0..4 {
+            if let (Some(xa), Some(xb)) = (block_a[c].as_ref(), block_b[c].as_ref()) {
+                expected_cross += &fast_atb(xa, xb);
+            }
+        }
+        let cross = gram.slice(s![0..p_a, p_a..(p_a + p_b)]).to_owned();
+        let diff = &cross - &expected_cross;
+        let max_err = diff.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+        assert!(
+            max_err < 1e-12,
+            "structural cross-block must equal Σ_c Xaᵀ·Xb: max_err={max_err:e}"
+        );
+
+        // Symmetry.
+        for i in 0..(p_a + p_b) {
+            for j in 0..(p_a + p_b) {
+                assert!(
+                    (gram[[i, j]] - gram[[j, i]]).abs() < 1e-12,
+                    "structural Gram not symmetric at ({i},{j})"
+                );
+            }
+        }
+    }
 }

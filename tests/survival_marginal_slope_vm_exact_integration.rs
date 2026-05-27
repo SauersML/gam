@@ -26,10 +26,11 @@
 //! will run it once the cutover is in.
 
 use csv::StringRecord;
+use gam::matrix::LinearOperator;
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Arc, Mutex, Once, OnceLock};
 
 const N: usize = 300;
 
@@ -73,13 +74,16 @@ impl log::Log for CapturingLogger {
 }
 
 static INIT_LOGGER: Once = Once::new();
-static LOG_SINK: once_cell::sync::Lazy<Arc<CapturedLogs>> =
-    once_cell::sync::Lazy::new(|| Arc::new(CapturedLogs::default()));
+static LOG_SINK: OnceLock<Arc<CapturedLogs>> = OnceLock::new();
+
+fn log_sink() -> &'static Arc<CapturedLogs> {
+    LOG_SINK.get_or_init(|| Arc::new(CapturedLogs::default()))
+}
 
 fn install_logger() {
     INIT_LOGGER.call_once(|| {
         let logger = Box::leak(Box::new(CapturingLogger {
-            sink: LOG_SINK.clone(),
+            sink: log_sink().clone(),
         }));
         if log::set_logger(logger).is_ok() {
             log::set_max_level(log::LevelFilter::Info);
@@ -201,7 +205,7 @@ fn survival_marginal_slope_v_plus_m_exact_engages_and_lifts_beta_to_raw_width() 
         result.fit.outer_iterations, result.fit.reml_score
     );
 
-    let logs = LOG_SINK.snapshot();
+    let logs = log_sink().snapshot();
     let active_marker = "[smgs phase-4b active] applying per-term V:";
     let active_seen = logs.iter().any(|line| line.contains(active_marker));
     assert!(
@@ -264,7 +268,7 @@ fn survival_marginal_slope_v_plus_m_exact_engages_and_lifts_beta_to_raw_width() 
         .iter()
         .find(|b| b.beta.len() == raw_marginal_width)
         .expect("locate marginal β block");
-    let pred_marginal = result.marginal_design.dense().dot(&marginal_beta_block.beta);
+    let pred_marginal = result.marginal_design.apply(&marginal_beta_block.beta);
     for (i, &v) in pred_marginal.iter().enumerate() {
         assert!(v.is_finite(), "marginal η[{i}] non-finite: {v}");
     }
