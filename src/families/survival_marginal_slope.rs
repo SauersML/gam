@@ -18820,6 +18820,11 @@ pub fn fit_survival_marginal_slope_terms(
             compile_survival_parametric_designs_per_term,
             extract_term_partition_from_penalty_ranges,
         };
+        // Recompile context, populated when the densify + compile half
+        // of the attempt succeeds (regardless of whether apply_per_term
+        // fired). The post-solve recompile-after-accept hook consumes
+        // this to rebuild row Hessians at the converged β.
+        let mut recompile_ctx: Option<SmgsRecompileAfterAcceptContext> = None;
         // Try the active cutover. Failure (e.g. densification budget,
         // compile error) falls back to raw — observability preflight
         // and downstream canonicalize_for_identifiability still gate
