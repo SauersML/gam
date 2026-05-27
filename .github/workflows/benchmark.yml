@@ -65,8 +65,14 @@ jobs:
           if not scenarios:
               raise SystemExit("No benchmark scenarios found in bench/scenarios.json")
 
+          # Pure-Python schema validation: confirm each scenario spec is
+          # well-formed and dispatches to a registered dataset loader, without
+          # actually generating data. The matrix-prepare job does not build the
+          # Rust extension, so any preflight that called the full data path
+          # would hit `gamfit Rust extension is not built` and short-circuit
+          # the whole benchmark pipeline before the matrix is emitted.
           for s in scenarios:
-              mod.dataset_for_scenario(s)
+              mod.validate_scenario_schema(s)
           print(f"validated {len(scenarios)} scenario dataset schemas")
           PY
 
@@ -91,7 +97,7 @@ jobs:
               raise SystemExit("No geo_subpop16 scenarios found in bench/scenarios.json")
 
           for s in geo_subpop:
-              mod.dataset_for_scenario(s)
+              mod.validate_scenario_schema(s)
           print(f"validated geo_subpop16 simulation for {len(geo_subpop)} scenarios")
           PY
 
