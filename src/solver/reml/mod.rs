@@ -2580,6 +2580,89 @@ enum DerivativeMatrixStorage {
     LatentCoord(LatentCoordDerivativeOp),
 }
 
+/// Mechanical surface every `DerivativeMatrixStorage` variant must expose so
+/// the `HyperDesignDerivative` / `HyperPenaltyDerivative` wrappers can dispatch
+/// with a single per-call `storage_dispatch!`. Each backend owns its variant's
+/// substantive math; the wrappers contain only one-line routing, the same way
+/// `FamilyFitRequest` collapses `FitRequest`'s per-variant case analysis.
+///
+/// `design_*` variants treat the backend as an X-style operator (rows index
+/// data, columns index coefficients); `penalty_*` variants treat the backend
+/// as a square `p×p` penalty in the global coefficient frame. The Embedded
+/// case is the only variant whose two views genuinely differ (local rows vs
+/// total_dim square), which is why the two role-specific methods both live in
+/// one trait rather than two parallel traits.
+trait DerivativeStorageBackend {
+    fn resident_byte_count(&self) -> usize;
+    fn design_nrows(&self) -> usize;
+    fn design_ncols(&self) -> usize;
+    fn penalty_dim(&self) -> usize;
+    fn uses_implicit_storage(&self) -> bool;
+    fn any_nonzero(&self) -> bool;
+    fn materialize(&self) -> Array2<f64>;
+    fn implicit_first_axis_info(
+        &self,
+    ) -> Option<(
+        std::sync::Arc<crate::terms::basis::ImplicitDesignPsiDerivative>,
+        usize,
+    )>;
+    fn implicit_axis_count_hint(&self) -> Option<usize>;
+    fn design_forward_mul_original(
+        &self,
+        u: &Array1<f64>,
+    ) -> Result<Array1<f64>, EstimationError>;
+    fn design_transpose_mul_original(
+        &self,
+        v: &Array1<f64>,
+    ) -> Result<Array1<f64>, EstimationError>;
+    fn design_transformed(
+        &self,
+        qs: &Array2<f64>,
+        free_basis_opt: Option<&Array2<f64>>,
+    ) -> Result<Array2<f64>, EstimationError>;
+    /// Returns `Some(_)` when the backend has a faster matvec path through
+    /// the transformed product than materialising it via `design_transformed`
+    /// then `.dot(u)`. Dense / Embedded backends return `None`; Implicit and
+    /// LatentCoord return their direct operator path.
+    fn design_transformed_forward_mul_fast(
+        &self,
+        qs: &Array2<f64>,
+        free_basis_opt: Option<&Array2<f64>>,
+        u: &Array1<f64>,
+    ) -> Option<Array1<f64>>;
+    fn design_transformed_transpose_mul_fast(
+        &self,
+        qs: &Array2<f64>,
+        free_basis_opt: Option<&Array2<f64>>,
+        v: &Array1<f64>,
+    ) -> Option<Array1<f64>>;
+    fn penalty_transformed(
+        &self,
+        qs: &Array2<f64>,
+        free_basis_opt: Option<&Array2<f64>>,
+    ) -> Result<Array2<f64>, EstimationError>;
+    fn penalty_scaled_add_to(
+        &self,
+        target: &mut Array2<f64>,
+        amp: f64,
+    ) -> Result<(), EstimationError>;
+}
+
+/// Fans `expr` over the four `DerivativeMatrixStorage` variants in one place
+/// so every wrapper method is a single dispatch line — the compiler enforces
+/// exhaustiveness here, so adding a new variant produces one hard error at
+/// this site rather than a silent miss in any of the (currently 16) ladders.
+macro_rules! storage_dispatch {
+    ($scrutinee:expr, $backend:ident => $body:expr) => {
+        match $scrutinee {
+            DerivativeMatrixStorage::Dense($backend) => $body,
+            DerivativeMatrixStorage::Embedded($backend) => $body,
+            DerivativeMatrixStorage::Implicit($backend) => $body,
+            DerivativeMatrixStorage::LatentCoord($backend) => $body,
+        }
+    };
+}
+
 /// Which derivative level the implicit operator should compute.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum ImplicitDerivLevel {
