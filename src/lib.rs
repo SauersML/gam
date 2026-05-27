@@ -46,6 +46,9 @@
 
 include!(concat!(env!("OUT_DIR"), "/lint_errors.rs"));
 
+#[macro_use]
+mod macros;
+
 /// Initialize faer's global parallelism backend to a Rayon pool sized at
 /// `rayon::current_num_threads()`. Rayon's pool itself honors the standard
 /// `RAYON_NUM_THREADS` environment variable on first use, so callers that
