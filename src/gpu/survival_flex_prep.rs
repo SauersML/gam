@@ -273,15 +273,44 @@ pub fn try_device_cell_primary_fixed_partials(
     if !trivial_spans {
         return Ok(None);
     }
-    // The trivial kernel needs `r` and `g_slot` from the caller's layout.
-    // Today the family wires this seam without passing the layout explicitly;
-    // when no cells exist, we trivially short-circuit above.  Until the
-    // layout is plumbed through the call boundary, we conservatively decline
-    // here so the caller falls back to the CPU per-cell path — the family's
-    // own match arm rejects a non-empty device output without a layout
-    // anyway.  The kernel + PTX cache live in `device_dispatch` and become
-    // active the moment the layout-aware seam is wired.
-    Ok(None)
+    // The trivial kernel requires every row's layout to share the same
+    // `(r, g_slot)` so a single launch can emit a uniform per-cell stride.
+    // Differing layouts → decline (CPU fallback per row).
+    let layout0 = rows[0].layout;
+    if !rows
+        .iter()
+        .all(|r| r.layout.r == layout0.r && r.layout.g_slot == layout0.g_slot)
+    {
+        return Ok(None);
+    }
+    // If no cells at all, return an empty partials shape that matches
+    // `rows.len()` so the caller can index into the result.
+    let mut row_cell_counts: Vec<usize> = rows.iter().map(|r| r.cells.len()).collect();
+    let total_cells: usize = row_cell_counts.iter().copied().sum();
+    if total_cells == 0 {
+        let mut partials: Vec<Vec<Vec<f64>>> = Vec::with_capacity(rows.len());
+        for _ in 0..rows.len() {
+            partials.push(Vec::new());
+        }
+        return Ok(Some(CellPrimaryFixedPartialsOutput { partials }));
+    }
+    let flat = match device_dispatch::cell_primary_fixed_partials_baseline(layout0, total_cells) {
+        Ok(flat) => flat,
+        Err(_) => return Ok(None),
+    };
+    let per_cell = 12usize + 40usize * (layout0.r as usize);
+    let mut partials: Vec<Vec<Vec<f64>>> = Vec::with_capacity(rows.len());
+    let mut cursor = 0usize;
+    for n_cells in row_cell_counts.drain(..) {
+        let mut row_cells: Vec<Vec<f64>> = Vec::with_capacity(n_cells);
+        for _ in 0..n_cells {
+            row_cells.push(flat[cursor..cursor + per_cell].to_vec());
+            cursor += per_cell;
+        }
+        partials.push(row_cells);
+    }
+    debug_assert_eq!(cursor, flat.len());
+    Ok(Some(CellPrimaryFixedPartialsOutput { partials }))
 }
 
 #[inline]
