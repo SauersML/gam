@@ -1094,6 +1094,73 @@ pub fn launch_row_reweight_on_stream(
     })
 }
 
+/// Stage 6: device-side row reweight launcher for JIT-compiled
+/// custom-family kernels. Same kernel ABI as the built-in path
+/// ([`launch_row_reweight_on_stream`]) — the only differences are
+/// (a) the kernel symbol is `spec.kernel_name()` and (b) the module
+/// resolution goes through [`PirlsRowBackend::module_for_jit`].
+#[cfg(target_os = "linux")]
+pub fn launch_row_reweight_jit_on_stream(
+    backend: &PirlsRowBackend,
+    spec: &JitFamilySpec,
+    curvature: CurvatureMode,
+    stream: &Arc<cudarc::driver::CudaStream>,
+    n: usize,
+    eta_dev: &cudarc::driver::CudaSlice<f64>,
+    y_dev: &cudarc::driver::CudaSlice<f64>,
+    prior_w_dev: &cudarc::driver::CudaSlice<f64>,
+    out: &mut RowOutputDevBuffers,
+) -> Result<(), GpuError> {
+    use cudarc::driver::{LaunchConfig, PushKernelArg};
+    if out.n != n {
+        return Err(GpuError::DriverCallFailed {
+            reason: format!(
+                "JIT row reweight buffers shape {} mismatches n={n}",
+                out.n
+            ),
+        });
+    }
+    let module = backend.module_for_jit(spec, curvature)?;
+    let kernel_name = spec.kernel_name();
+    let func = module
+        .load_function(&kernel_name)
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("JIT row reweight load_function({kernel_name}): {err}"),
+        })?;
+    const THREADS_PER_BLOCK: u32 = 256;
+    let n_u32 = u32::try_from(n).map_err(|_| GpuError::DriverCallFailed {
+        reason: format!("n={n} exceeds u32 for JIT row reweight grid sizing"),
+    })?;
+    let grid_x = n_u32.div_ceil(THREADS_PER_BLOCK).max(1);
+    let n_i32 = i32::try_from(n).map_err(|_| GpuError::DriverCallFailed {
+        reason: format!("n={n} exceeds i32 for JIT row reweight kernel argument"),
+    })?;
+    let cfg = LaunchConfig {
+        grid_dim: (grid_x, 1, 1),
+        block_dim: (THREADS_PER_BLOCK, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut builder = stream.launch_builder(&func);
+    builder.arg(&n_i32);
+    builder.arg(eta_dev);
+    builder.arg(y_dev);
+    builder.arg(prior_w_dev);
+    builder.arg(&mut out.mu);
+    builder.arg(&mut out.grad_eta);
+    builder.arg(&mut out.w_fisher);
+    builder.arg(&mut out.w_hessian);
+    builder.arg(&mut out.w_solver);
+    builder.arg(&mut out.z_fisher);
+    builder.arg(&mut out.z_hessian);
+    builder.arg(&mut out.deviance);
+    builder.arg(&mut out.status);
+    // SAFETY: JIT spec's `cuda_source` builder emits the same kernel
+    // signature as `cuda_source_for`; arg order/types match one-for-one.
+    unsafe { builder.launch(cfg) }.map_err(|err| GpuError::DriverCallFailed {
+        reason: format!("JIT row reweight launch({kernel_name}): {err}"),
+    })
+}
+
 // ────────────────────────────────────────────────────────────────────────
 // CUDA sources (one per family / curvature pair)
 // ────────────────────────────────────────────────────────────────────────
@@ -1676,6 +1743,103 @@ mod pirls_row_gpu_tests {
                     Arc::ptr_eq(&m1, &m2),
                     "{family:?}: module cache must return same handle on second call"
                 );
+            }
+        }
+    }
+
+    /// Stage 6: JIT-compiled custom-family kernel through Level A
+    /// (built-in spec) must produce byte-identical outputs to the
+    /// cached built-in kernel on the same inputs. Validates the
+    /// `JitFamilySpec::glm` builder + `cuda_source` shell + JIT module
+    /// cache + `launch_row_reweight_jit_on_stream` end to end against
+    /// the Stage 1 cached built-in path.
+    #[test]
+    fn jit_glm_kernel_matches_builtin_byte_identical() {
+        if super::super::runtime::GpuRuntime::global().is_none() {
+            eprintln!("[stage_6_jit] no CUDA runtime — skipping");
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let etas = [-2.0_f64, -0.5, 0.3, 1.5];
+            let ys = [0.0_f64, 1.0, 0.0, 1.0];
+            let priors = [1.0_f64, 1.2, 0.8, 1.5];
+            let n = etas.len();
+            let family = PirlsRowFamily::BernoulliLogit;
+            let curvature = CurvatureMode::Fisher;
+            let backend =
+                PirlsRowBackend::probe().expect("backend probe on CUDA host");
+            let runtime = super::super::runtime::GpuRuntime::global()
+                .expect("GPU runtime available");
+            let ctx = super::super::runtime::cuda_context_for(
+                runtime.selected_device().ordinal,
+            )
+            .expect("ctx");
+            let stream = ctx.default_stream();
+
+            let mut eta_dev = stream.alloc_zeros::<f64>(n).expect("eta");
+            let mut y_dev = stream.alloc_zeros::<f64>(n).expect("y");
+            let mut prior_dev = stream.alloc_zeros::<f64>(n).expect("prior");
+            stream.memcpy_htod(&etas, &mut eta_dev).expect("up eta");
+            stream.memcpy_htod(&ys, &mut y_dev).expect("up y");
+            stream.memcpy_htod(&priors, &mut prior_dev).expect("up prior");
+
+            // Built-in path.
+            let mut out_builtin =
+                RowOutputDevBuffers::allocate(&stream, n).expect("alloc builtin");
+            launch_row_reweight_on_stream(
+                backend,
+                family,
+                curvature,
+                &stream,
+                n,
+                &eta_dev,
+                &y_dev,
+                &prior_dev,
+                &mut out_builtin,
+            )
+            .expect("builtin launch");
+
+            // JIT path through Level A spec (same body, distinct kernel symbol).
+            let spec = JitFamilySpec::glm(0x424c_4c47u64, family, curvature);
+            let mut out_jit =
+                RowOutputDevBuffers::allocate(&stream, n).expect("alloc jit");
+            launch_row_reweight_jit_on_stream(
+                backend,
+                &spec,
+                curvature,
+                &stream,
+                n,
+                &eta_dev,
+                &y_dev,
+                &prior_dev,
+                &mut out_jit,
+            )
+            .expect("jit launch");
+            stream.synchronize().expect("sync");
+
+            // Byte-identical per-field comparison.
+            for (label, b_dev, j_dev) in [
+                ("mu", &out_builtin.mu, &out_jit.mu),
+                ("grad_eta", &out_builtin.grad_eta, &out_jit.grad_eta),
+                ("w_fisher", &out_builtin.w_fisher, &out_jit.w_fisher),
+                ("w_hessian", &out_builtin.w_hessian, &out_jit.w_hessian),
+                ("w_solver", &out_builtin.w_solver, &out_jit.w_solver),
+                ("z_fisher", &out_builtin.z_fisher, &out_jit.z_fisher),
+                ("z_hessian", &out_builtin.z_hessian, &out_jit.z_hessian),
+                ("deviance", &out_builtin.deviance, &out_jit.deviance),
+            ] {
+                let b = stream.clone_dtoh(b_dev).expect("dl builtin");
+                let j = stream.clone_dtoh(j_dev).expect("dl jit");
+                for i in 0..n {
+                    assert_eq!(
+                        b[i].to_bits(),
+                        j[i].to_bits(),
+                        "{label}[{i}]: builtin {} ≠ jit {}",
+                        b[i],
+                        j[i],
+                    );
+                }
             }
         }
     }
