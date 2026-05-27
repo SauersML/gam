@@ -422,9 +422,9 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
             ResponseFamily::Gaussian => {
                 let sigma = require_noise_parameter(&self.spec, "Gaussian sigma", gaussian_scale)?;
                 if sigma < 0.0 {
-                    return Err(EstimationError::InvalidInput(format!(
+                    crate::bail_invalid_estim!(format!(
                         "Gaussian Identity generative sampling requires Gaussian sigma >= 0; got {sigma}"
-                    )));
+                    ));
                 }
                 Ok(NoiseModel::Gaussian {
                     sigma: Array1::from_elem(mean.len(), sigma),
@@ -435,9 +435,9 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
             ResponseFamily::Tweedie { p } => {
                 let p = *p;
                 if !is_valid_tweedie_power(p) {
-                    return Err(EstimationError::InvalidInput(format!(
+                    crate::bail_invalid_estim!(format!(
                         "Tweedie variance power must be finite and strictly between 1 and 2; got {p}"
-                    )));
+                    ));
                 }
                 Ok(NoiseModel::Tweedie {
                     p,
@@ -451,18 +451,18 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
             ResponseFamily::NegativeBinomial { theta } => {
                 let theta = *theta;
                 if !(theta.is_finite() && theta > 0.0) {
-                    return Err(EstimationError::InvalidInput(format!(
+                    crate::bail_invalid_estim!(format!(
                         "negative-binomial theta must be finite and > 0; got {theta}"
-                    )));
+                    ));
                 }
                 Ok(NoiseModel::NegativeBinomial { theta })
             }
             ResponseFamily::Beta { phi } => {
                 let phi = *phi;
                 if !(phi.is_finite() && phi > 0.0) {
-                    return Err(EstimationError::InvalidInput(format!(
+                    crate::bail_invalid_estim!(format!(
                         "beta-regression phi must be finite and > 0; got {phi}"
-                    )));
+                    ));
                 }
                 Ok(NoiseModel::Beta { phi })
             }

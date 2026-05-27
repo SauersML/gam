@@ -3068,16 +3068,14 @@ fn constrained_warm_start_from_cached_beta(
 ) -> Result<ConstrainedWarmStart, EstimationError> {
     let expected = specs.iter().map(|spec| spec.design.ncols()).sum::<usize>();
     if beta.len() != expected {
-        return Err(EstimationError::InvalidInput(format!(
+        crate::bail_invalid_estim!(format!(
             "cached inner beta has length {}, but custom-family blocks require length {}",
             beta.len(),
             expected
-        )));
+        ));
     }
     if beta.iter().any(|value| !value.is_finite()) {
-        return Err(EstimationError::InvalidInput(
-            "cached inner beta contains non-finite entries".to_string(),
-        ));
+        crate::bail_invalid_estim!("cached inner beta contains non-finite entries".to_string(),);
     }
 
     let mut offset = 0usize;
@@ -6500,16 +6498,14 @@ impl CustomFamilyWarmStart {
     ) -> Result<Self, EstimationError> {
         let expected: usize = block_col_counts.iter().copied().sum();
         if beta.len() != expected {
-            return Err(EstimationError::InvalidInput(format!(
+            crate::bail_invalid_estim!(format!(
                 "cached inner beta has length {}, but spatial-joint blocks require length {}",
                 beta.len(),
                 expected
-            )));
+            ));
         }
         if beta.iter().any(|value| !value.is_finite()) {
-            return Err(EstimationError::InvalidInput(
-                "cached inner beta contains non-finite entries".to_string(),
-            ));
+            crate::bail_invalid_estim!("cached inner beta contains non-finite entries".to_string(),);
         }
         let mut offset = 0usize;
         let mut block_beta = Vec::with_capacity(block_col_counts.len());
@@ -18453,35 +18449,23 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
     eval_mode: EvalMode,
 ) -> Result<OuterObjectiveEvalResult, CustomFamilyError> {
     if derivative_blocks.len() != specs.len() {
-        return Err(CustomFamilyError::DimensionMismatch {
-            reason: format!(
-                "joint hyper derivative block count mismatch: got {}, expected {}",
+        crate::bail_dim_custom!("joint hyper derivative block count mismatch: got {}, expected {}",
                 derivative_blocks.len(),
-                specs.len()
-            ),
-        });
+                specs.len());
     }
 
     if penalty_counts.len() != specs.len() {
-        return Err(CustomFamilyError::DimensionMismatch {
-            reason: format!(
-                "joint hyper penalty-count block mismatch: got {}, expected {}",
+        crate::bail_dim_custom!("joint hyper penalty-count block mismatch: got {}, expected {}",
                 penalty_counts.len(),
-                specs.len()
-            ),
-        });
+                specs.len());
     }
     let rho_dim = penalty_counts.iter().sum::<usize>();
     let psi_dim = derivative_blocks.iter().map(Vec::len).sum::<usize>();
     if rho_current.len() != rho_dim {
-        return Err(CustomFamilyError::DimensionMismatch {
-            reason: format!(
-                "joint hyper rho dimension mismatch: got {}, expected {} (psi={})",
+        crate::bail_dim_custom!("joint hyper rho dimension mismatch: got {}, expected {} (psi={})",
                 rho_current.len(),
                 rho_dim,
-                psi_dim
-            ),
-        });
+                psi_dim);
     }
 
     // ── Common setup: inner solve, ridge, refresh, ranges ──
@@ -19106,15 +19090,11 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
             hessian,
         } => {
             if hessian.nrows() != p || hessian.ncols() != p {
-                return Err(CustomFamilyError::DimensionMismatch {
-                    reason: format!(
-                        "block {b} exact-newton Hessian shape mismatch in outer gradient: got {}x{}, expected {}x{}",
+                crate::bail_dim_custom!("block {b} exact-newton Hessian shape mismatch in outer gradient: got {}x{}, expected {}x{}",
                         hessian.nrows(),
                         hessian.ncols(),
                         p,
-                        p
-                    ),
-                });
+                        p);
             }
             hessian.to_dense()
         }
@@ -19537,22 +19517,14 @@ fn evaluate_custom_family_joint_hyper_efs_internal_shared<
     CustomFamilyError,
 > {
     if derivative_blocks.len() != specs.len() {
-        return Err(CustomFamilyError::DimensionMismatch {
-            reason: format!(
-                "joint hyper derivative block count mismatch: got {}, expected {}",
+        crate::bail_dim_custom!("joint hyper derivative block count mismatch: got {}, expected {}",
                 derivative_blocks.len(),
-                specs.len()
-            ),
-        });
+                specs.len());
     }
     if penalty_counts.len() != specs.len() {
-        return Err(CustomFamilyError::DimensionMismatch {
-            reason: format!(
-                "joint hyper penalty-count block mismatch: got {}, expected {}",
+        crate::bail_dim_custom!("joint hyper penalty-count block mismatch: got {}, expected {}",
                 penalty_counts.len(),
-                specs.len()
-            ),
-        });
+                specs.len());
     }
 
     let rho_dim = penalty_counts.iter().sum::<usize>();
@@ -19564,14 +19536,10 @@ fn evaluate_custom_family_joint_hyper_efs_internal_shared<
         });
     }
     if rho_current.len() != rho_dim {
-        return Err(CustomFamilyError::DimensionMismatch {
-            reason: format!(
-                "joint hyper rho dimension mismatch: got {}, expected {} (psi={})",
+        crate::bail_dim_custom!("joint hyper rho dimension mismatch: got {}, expected {} (psi={})",
                 rho_current.len(),
                 rho_dim,
-                psi_dim
-            ),
-        });
+                psi_dim);
     }
 
     let include_logdet_h = include_exact_newton_logdet_h(family, options);
@@ -19893,13 +19861,9 @@ pub fn evaluate_custom_family_joint_hyper_efs<F: CustomFamily + Clone + Send + S
 ) -> Result<CustomFamilyJointHyperEfsResult, CustomFamilyError> {
     let penalty_counts = validate_blockspecs(specs)?;
     if derivative_blocks.len() != specs.len() {
-        return Err(CustomFamilyError::DimensionMismatch {
-            reason: format!(
-                "joint hyper derivative block count mismatch: got {}, expected {}",
+        crate::bail_dim_custom!("joint hyper derivative block count mismatch: got {}, expected {}",
                 derivative_blocks.len(),
-                specs.len()
-            ),
-        });
+                specs.len());
     }
     let (efs_eval, warm_start, inner_converged) = if derivative_blocks.iter().all(Vec::is_empty) {
         outerobjectiveefs(
@@ -19942,13 +19906,9 @@ pub(crate) fn evaluate_custom_family_joint_hyper_efs_shared<
 ) -> Result<CustomFamilyJointHyperEfsResult, CustomFamilyError> {
     let penalty_counts = validate_blockspecs(specs)?;
     if derivative_blocks.len() != specs.len() {
-        return Err(CustomFamilyError::DimensionMismatch {
-            reason: format!(
-                "joint hyper derivative block count mismatch: got {}, expected {}",
+        crate::bail_dim_custom!("joint hyper derivative block count mismatch: got {}, expected {}",
                 derivative_blocks.len(),
-                specs.len()
-            ),
-        });
+                specs.len());
     }
     let (efs_eval, warm_start, inner_converged) = if derivative_blocks.iter().all(Vec::is_empty) {
         outerobjectiveefs(

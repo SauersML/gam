@@ -3896,9 +3896,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
             .map_err(EstimationError::InvalidInput)?;
         if !eval.inner_converged {
             state.warm_cache = Some(eval.warm_start);
-            return Err(EstimationError::InvalidInput(
-                "binomial mean-wiggle exact spatial inner solve did not converge".to_string(),
-            ));
+            crate::bail_invalid_estim!("binomial mean-wiggle exact spatial inner solve did not converge".to_string(),);
         }
         let hessian_result = eval.outer_hessian.clone();
         state.last_eval = Some((
@@ -3933,10 +3931,8 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                 .map_err(EstimationError::InvalidInput)?;
             if !eval.inner_converged {
                 state.warm_cache = Some(eval.warm_start);
-                return Err(EstimationError::InvalidInput(
-                    "binomial mean-wiggle exact spatial cost inner solve did not converge"
-                        .to_string(),
-                ));
+                crate::bail_invalid_estim!("binomial mean-wiggle exact spatial cost inner solve did not converge"
+                        .to_string(),);
             }
             state.warm_cache = Some(eval.warm_start);
             Ok(eval.objective)
@@ -3964,10 +3960,8 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                 .map_err(EstimationError::InvalidInput)?;
             if !eval.inner_converged {
                 state.warm_cache = Some(eval.warm_start);
-                return Err(EstimationError::InvalidInput(
-                    "binomial mean-wiggle exact spatial EFS inner solve did not converge"
-                        .to_string(),
-                ));
+                crate::bail_invalid_estim!("binomial mean-wiggle exact spatial EFS inner solve did not converge"
+                        .to_string(),);
             }
             state.warm_cache = Some(eval.warm_start);
             Ok(eval.efs_eval)

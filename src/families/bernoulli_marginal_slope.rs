@@ -19841,9 +19841,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
         },
         |beta: &Array1<f64>| {
             if beta.iter().any(|v| !v.is_finite()) {
-                return Err(EstimationError::InvalidInput(
-                    "cached inner beta contains non-finite entries".to_string(),
-                ));
+                crate::bail_invalid_estim!("cached inner beta contains non-finite entries".to_string(),);
             }
             pending_beta_seed.replace(Some(beta.clone()));
             Ok(())
