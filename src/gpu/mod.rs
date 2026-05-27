@@ -37,7 +37,8 @@ pub use device::GpuDeviceInfo;
 pub use memory::{DeviceBuffer, DeviceCsrMatrix, DeviceMatrix, DeviceVector};
 pub use policy::{GpuDispatchPolicy, MixedPrecisionPolicy};
 pub use profile::{KernelStat, KernelStatsSnapshot};
-pub use runtime::{GpuProbeError, GpuRuntime};
+pub use error::GpuError;
+pub use runtime::GpuRuntime;
 
 // ---------------------------------------------------------------------------
 // User-facing policy and instrumentation hooks (formerly src/gpu.rs).

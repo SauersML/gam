@@ -12,8 +12,6 @@ pub mod polya_gamma;
 pub mod posterior;
 pub mod posterior_bands;
 pub mod predict;
-pub mod predict_input;
-pub mod prediction_linalg;
 pub mod probability;
 pub mod quadrature;
 pub mod sample;

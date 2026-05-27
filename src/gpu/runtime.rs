@@ -7,18 +7,13 @@ use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 
 use super::device::GpuDeviceInfo;
+use super::error::GpuError;
 use super::policy::GpuDispatchPolicy;
 #[cfg(target_os = "linux")]
 use cudarc::driver::{CudaContext, result, sys};
 
 #[path = "diagnostics.rs"]
 pub(crate) mod diagnostics;
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[must_use]
-pub enum GpuProbeError {
-    Driver(String),
-}
 
 #[derive(Clone, Debug)]
 #[must_use]
@@ -63,7 +58,7 @@ fn install_cudarc_panic_filter() {
 }
 
 impl GpuRuntime {
-    pub fn probe() -> Result<Option<Self>, GpuProbeError> {
+    pub fn probe() -> Result<Option<Self>, GpuError> {
         if super::global_policy() == super::GpuPolicy::Off {
             Self::record_cpu_reason("GPU policy is off");
             diagnostics::log_cuda_disabled("GPU policy is off");
@@ -75,7 +70,9 @@ impl GpuRuntime {
             let reason = "CUDA support not compiled into this build";
             Self::record_cpu_reason(reason);
             diagnostics::log_cuda_disabled(reason);
-            return Err(GpuProbeError::Driver(reason.to_string()));
+            return Err(GpuError::DriverLibraryUnavailable {
+                reason: reason.to_string(),
+            });
         }
 
         #[cfg(target_os = "linux")]
@@ -95,14 +92,16 @@ impl GpuRuntime {
             // install a panic-hook filter that suppresses cudarc's
             // `panic_no_lib_found` message and wrap every cudarc entry point
             // below in `catch_unwind` to convert the panic into a typed
-            // `GpuProbeError::Driver` instead.
+            // `GpuError::DriverCallFailed` instead.
             install_cudarc_panic_filter();
             if crate::gpu::driver::preload_cuda_driver().is_err() {
                 let reason = "libcuda unavailable";
                 Self::record_cpu_reason(reason);
                 log::info!("[GPU] CUDA acceleration disabled: {reason}");
                 diagnostics::log_cuda_disabled(reason);
-                return Err(GpuProbeError::Driver(reason.to_string()));
+                return Err(GpuError::DriverLibraryUnavailable {
+                    reason: reason.to_string(),
+                });
             }
 
             // cudarc 0.19's `culib()` panics via `panic_no_lib_found` when its
@@ -113,35 +112,48 @@ impl GpuRuntime {
             // panic into a typed probe failure so the runtime cleanly disables
             // CUDA and the CPU fallback proceeds without alarming stderr noise.
             let device_count = catch_unwind(AssertUnwindSafe(CudaContext::device_count))
-                .map_err(|_| GpuProbeError::Driver("libcuda unavailable".to_string()))?
-                .map_err(|err| GpuProbeError::Driver(err.to_string()))?;
+                .map_err(|_| GpuError::DriverLibraryUnavailable {
+                    reason: "libcuda unavailable".to_string(),
+                })?
+                .map_err(|err| GpuError::DriverCallFailed {
+                    reason: err.to_string(),
+                })?;
             if device_count <= 0 {
                 let reason = "CUDA driver reported no devices";
                 Self::record_cpu_reason(reason);
                 diagnostics::log_cuda_disabled(reason);
-                // Surface the no-device state as a structured `Driver(_)` so that
-                // callers wanting a CPU-reason marker can distinguish "policy off"
-                // (Ok(None)) from "driver present but no usable hardware"
-                // (Err(Driver)). This keeps `GpuRuntime::probe()` honest: a
+                // Surface the no-device state as a structured `DriverCallFailed`
+                // so callers wanting a CPU-reason marker can distinguish
+                // "policy off" (Ok(None)) from "driver present but no usable
+                // hardware" (Err). This keeps `GpuRuntime::probe()` honest: a
                 // successful `Ok` always carries at least one device.
-                return Err(GpuProbeError::Driver(reason.to_string()));
+                return Err(GpuError::DriverCallFailed {
+                    reason: reason.to_string(),
+                });
             }
 
             let mut devices = Vec::new();
-            for ordinal in 0..usize::try_from(device_count)
-                .map_err(|_| GpuProbeError::Driver("negative CUDA device count".into()))?
-            {
-                let ctx = cuda_context_for(ordinal).ok_or_else(|| {
-                    GpuProbeError::Driver(format!(
-                        "failed to create CUDA context for device {ordinal}"
-                    ))
+            for ordinal in 0..usize::try_from(device_count).map_err(|_| {
+                GpuError::DriverCallFailed {
+                    reason: "negative CUDA device count".into(),
+                }
+            })? {
+                let ctx = cuda_context_for(ordinal).ok_or_else(|| GpuError::DriverCallFailed {
+                    reason: format!("failed to create CUDA context for device {ordinal}"),
                 })?;
                 catch_unwind(AssertUnwindSafe(|| ctx.bind_to_thread()))
-                    .map_err(|_| GpuProbeError::Driver("libcuda unavailable".to_string()))?
-                    .map_err(|err| GpuProbeError::Driver(err.to_string()))?;
+                    .map_err(|_| GpuError::DriverLibraryUnavailable {
+                        reason: "libcuda unavailable".to_string(),
+                    })?
+                    .map_err(|err| GpuError::DriverCallFailed {
+                        reason: err.to_string(),
+                    })?;
                 devices.push(
-                    catch_unwind(AssertUnwindSafe(|| cuda_device_info(ordinal, &ctx)))
-                        .map_err(|_| GpuProbeError::Driver("libcuda unavailable".to_string()))??,
+                    catch_unwind(AssertUnwindSafe(|| cuda_device_info(ordinal, &ctx))).map_err(
+                        |_| GpuError::DriverLibraryUnavailable {
+                            reason: "libcuda unavailable".to_string(),
+                        },
+                    )??,
                 );
             }
 
@@ -172,7 +184,8 @@ impl GpuRuntime {
         RUNTIME
             .get_or_init(|| match Self::probe() {
                 Ok(runtime) => runtime,
-                Err(GpuProbeError::Driver(reason)) => {
+                Err(err) => {
+                    let reason = err.to_string();
                     Self::record_cpu_reason(reason.clone());
                     diagnostics::log_cuda_disabled(&reason);
                     None
@@ -224,21 +237,30 @@ pub fn cuda_context_for(ordinal: usize) -> Option<Arc<CudaContext>> {
 }
 
 #[cfg(target_os = "linux")]
-fn cuda_device_info(ordinal: usize, ctx: &CudaContext) -> Result<GpuDeviceInfo, GpuProbeError> {
-    result::init().map_err(|err| GpuProbeError::Driver(err.to_string()))?;
-    let device = result::device::get(
-        i32::try_from(ordinal)
-            .map_err(|_| GpuProbeError::Driver("device ordinal overflow".into()))?,
-    )
-    .map_err(|err| GpuProbeError::Driver(err.to_string()))?;
-    let attr = |attribute| -> Result<i32, GpuProbeError> {
+fn cuda_device_info(ordinal: usize, ctx: &CudaContext) -> Result<GpuDeviceInfo, GpuError> {
+    result::init().map_err(|err| GpuError::DriverCallFailed {
+        reason: err.to_string(),
+    })?;
+    let device = result::device::get(i32::try_from(ordinal).map_err(|_| {
+        GpuError::DriverCallFailed {
+            reason: "device ordinal overflow".into(),
+        }
+    })?)
+    .map_err(|err| GpuError::DriverCallFailed {
+        reason: err.to_string(),
+    })?;
+    let attr = |attribute| -> Result<i32, GpuError> {
         // SAFETY: device comes from cudarc's validated device::get.
-        unsafe { result::device::get_attribute(device, attribute) }
-            .map_err(|err| GpuProbeError::Driver(err.to_string()))
+        unsafe { result::device::get_attribute(device, attribute) }.map_err(|err| {
+            GpuError::DriverCallFailed {
+                reason: err.to_string(),
+            }
+        })
     };
-    let (free_mem_bytes, total_mem_bytes) = ctx
-        .mem_get_info()
-        .map_err(|err| GpuProbeError::Driver(err.to_string()))?;
+    let (free_mem_bytes, total_mem_bytes) =
+        ctx.mem_get_info().map_err(|err| GpuError::DriverCallFailed {
+            reason: err.to_string(),
+        })?;
     let major = attr(sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)?;
     let minor = attr(sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)?;
     Ok(GpuDeviceInfo {

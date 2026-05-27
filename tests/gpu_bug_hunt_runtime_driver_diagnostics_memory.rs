@@ -8,7 +8,7 @@ use std::thread;
 fn gpu_runtime_probe_reports_no_device_or_driver_as_structured_error_instead_of_none() {
     let probe = GpuRuntime::probe();
     assert!(
-        probe.is_ok() || matches!(probe, Err(gam::gpu::GpuProbeError::Driver(_))),
+        probe.is_ok() || matches!(probe, Err(gam::gpu::GpuError::DriverLibraryUnavailable { .. } | gam::gpu::GpuError::DriverCallFailed { .. })),
         "GpuRuntime::probe should return a runtime or a typed CUDA probe failure, not panic or collapse unavailable hardware into Ok(None)"
     );
 }
@@ -41,7 +41,7 @@ fn gpu_device_info_device_count_matches_underlying_driver_count() {
         assert!(
             matches!(
                 GpuRuntime::probe(),
-                Err(gam::gpu::GpuProbeError::Driver(ref reason))
+                Err(gam::gpu::GpuError::DriverLibraryUnavailable { ref reason })
                     if reason == "libcuda unavailable"
             ),
             "missing libcuda should be reported before touching cudarc device-count paths"

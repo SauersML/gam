@@ -1,3 +1,6 @@
+pub mod input;
+pub mod linalg;
+
 use crate::estimate::{BlockRole, EstimationError, FittedLinkState, UnifiedFitResult};
 use crate::families::bernoulli_marginal_slope::{
     EmpiricalZGrid, LatentMeasureKind, bernoulli_marginal_link_map,
@@ -14,7 +17,7 @@ use crate::families::strategy::{
 use crate::inference::model::{
     SavedCompiledFlexBlock, SavedLatentZNormalization, SavedLinkWiggleRuntime,
 };
-use crate::inference::prediction_linalg::{
+use crate::inference::predict::linalg::{
     PredictionCovarianceBackend, design_row_chunk, prediction_chunk_rows,
     rowwise_local_covariances_parallel,
 };
