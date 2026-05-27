@@ -1206,6 +1206,14 @@ extern "C" __global__ void linf_norm(
         let mut last_logdet = 0.0_f64;
         let mut last_h = Array2::<f64>::zeros((p, p));
         let mut converged = false;
+        // Diagnostic scalars surfaced on the outcome so the dispatch
+        // wirer can populate WorkingModelPirlsResult / PirlsResult
+        // fields without re-running the loop. All four mirror the CPU
+        // oracle's per-iter tracking in runworking_model_pirls.
+        let mut last_dev_delta = 0.0_f64;
+        let mut last_halving: usize = 0;
+        let mut last_step_size = 0.0_f64;
+        let mut min_dev = prev_deviance;
 
         for it in 0..max_iter {
             let step = solve_step_on_stream_device(
@@ -1250,7 +1258,12 @@ extern "C" __global__ void linf_norm(
 
             let mut alpha = 0.0_f64;
             let mut accepted_dev = prev_deviance;
-            for &a in &[1.0_f64, 0.5, 0.25, 0.125, 0.0625, 0.03125, 0.015625] {
+            let mut halving_count: usize = 0;
+            for (ladder_idx, &a) in
+                [1.0_f64, 0.5, 0.25, 0.125, 0.0625, 0.03125, 0.015625]
+                    .iter()
+                    .enumerate()
+            {
                 ws.stream
                     .memcpy_dtod(&loop_ws.eta_dev, &mut loop_ws.eta_cand_dev)
                     .map_err(|e| format!("copy eta→cand: {e}"))?;
@@ -1285,6 +1298,7 @@ extern "C" __global__ void linf_norm(
                 if cand.is_finite() && cand < prev_deviance {
                     alpha = a;
                     accepted_dev = cand;
+                    halving_count = ladder_idx;
                     break;
                 }
             }
@@ -1339,6 +1353,12 @@ extern "C" __global__ void linf_norm(
 
             let step_norm = alpha.abs() * dir_linf;
             let dev_delta = (prev_deviance - accepted_dev).abs();
+            last_dev_delta = dev_delta;
+            last_halving = halving_count;
+            last_step_size = alpha;
+            if accepted_dev < min_dev {
+                min_dev = accepted_dev;
+            }
             prev_deviance = accepted_dev;
 
             if dir_linf <= tol && step_norm <= tol && dev_delta <= tol * (1.0 + prev_deviance.abs())
@@ -1354,6 +1374,12 @@ extern "C" __global__ void linf_norm(
                     converged,
                     lm_ridge,
                     extra,
+                    LoopDiagnostics {
+                        last_deviance_change: last_dev_delta,
+                        last_step_halving: last_halving,
+                        last_step_size,
+                        min_deviance: min_dev,
+                    },
                 );
             }
         }
@@ -1368,7 +1394,24 @@ extern "C" __global__ void linf_norm(
             converged,
             lm_ridge,
             extra,
+            LoopDiagnostics {
+                last_deviance_change: last_dev_delta,
+                last_step_halving: last_halving,
+                last_step_size,
+                min_deviance: min_dev,
+            },
         )
+    }
+
+    /// Internal carrier for the four scalar diagnostics tracked
+    /// across the inner Newton loop. Surfaced verbatim on
+    /// `PirlsLoopOutcome` so the dispatch wirer's plumbing to
+    /// `WorkingModelPirlsResult` is a direct field copy.
+    struct LoopDiagnostics {
+        last_deviance_change: f64,
+        last_step_halving: usize,
+        last_step_size: f64,
+        min_deviance: f64,
     }
 
     /// Build a full-surface [`PirlsLoopOutcome`] from the loop's
@@ -1395,6 +1438,7 @@ extern "C" __global__ void linf_norm(
         converged: bool,
         lm_ridge: f64,
         extra: Option<&PirlsLoopExtra<'_>>,
+        diagnostics: LoopDiagnostics,
     ) -> Result<PirlsLoopOutcome, String> {
         let beta = download_vec(&ws.stream, &loop_ws.beta_dev)?;
         let final_eta = download_vec(&ws.stream, &loop_ws.eta_dev)?;
@@ -1423,6 +1467,10 @@ extern "C" __global__ void linf_norm(
             lm_ridge,
             crate::types::RidgePolicy::explicit_stabilization_full(),
         );
+
+        let max_abs_eta = final_eta
+            .iter()
+            .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
 
         match extra {
             Some(ext) => {
@@ -1526,6 +1574,12 @@ extern "C" __global__ void linf_norm(
                     firth,
                     constraint_kkt,
                     edf,
+                    last_deviance_change: diagnostics.last_deviance_change,
+                    last_step_halving: diagnostics.last_step_halving,
+                    last_step_size: diagnostics.last_step_size,
+                    final_lm_lambda: lm_ridge,
+                    min_deviance: diagnostics.min_deviance,
+                    max_abs_eta,
                 })
             }
             None => {
@@ -1563,6 +1617,12 @@ extern "C" __global__ void linf_norm(
                     firth: crate::solver::pirls::FirthDiagnostics::Inactive,
                     constraint_kkt: None,
                     edf: f64::NAN,
+                    last_deviance_change: diagnostics.last_deviance_change,
+                    last_step_halving: diagnostics.last_step_halving,
+                    last_step_size: diagnostics.last_step_size,
+                    final_lm_lambda: lm_ridge,
+                    min_deviance: diagnostics.min_deviance,
+                    max_abs_eta,
                 })
             }
         }
