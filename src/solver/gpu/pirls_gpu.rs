@@ -2219,7 +2219,6 @@ mod stream_device_parity_tests {
     /// PIRLS reference loop to avoid dragging in `solver::pirls`'s
     /// 13k-line state machine.
     #[test]
-    #[ignore]
     fn hill_climb_loop_beats_cpu_10x_on_biobank_logit() {
         use crate::gpu::pirls_row::{
             row_reweight_cpu, CurvatureMode, PirlsRowFamily, RowInput,
