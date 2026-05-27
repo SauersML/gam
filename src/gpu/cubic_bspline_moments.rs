@@ -805,6 +805,43 @@ impl CubicMomentBackend {
         cfg!(target_os = "linux")
     }
 
+    /// Download an alpha-major `[NALPHA, n_cells]` device-resident moment
+    /// table into a host `Vec<f64>`. Provided for bench-side parity checks
+    /// (see `bench/cargo_benches/cubic_hex_tensor_gpu_parity.rs`) and any
+    /// future debugging tool that wants to inspect the kernel output without
+    /// reaching past the backend's privacy boundary. On non-Linux hosts the
+    /// `DeviceCubicMomentTable.values` field is already a `Vec<f64>` so the
+    /// call is a copy; on Linux it issues one DtoH and a stream sync.
+    pub fn download_alpha_major(
+        &self,
+        dev: &DeviceCubicMomentTable,
+    ) -> Result<Vec<f64>, GpuError> {
+        #[cfg(target_os = "linux")]
+        {
+            let stream = &self.inner.stream;
+            let host =
+                stream
+                    .memcpy_dtov(&dev.values)
+                    .map_err(|err| GpuError::DriverCallFailed {
+                        reason: format!(
+                            "cubic_bspline_moments download_alpha_major dtov: {err}"
+                        ),
+                    })?;
+            stream
+                .synchronize()
+                .map_err(|err| GpuError::DriverCallFailed {
+                    reason: format!(
+                        "cubic_bspline_moments download_alpha_major sync: {err}"
+                    ),
+                })?;
+            Ok(host)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Ok(dev.values.clone())
+        }
+    }
+
     pub fn probe() -> Result<&'static Self, GpuError> {
         static BACKEND: OnceLock<Result<CubicMomentBackend, GpuError>> = OnceLock::new();
         BACKEND

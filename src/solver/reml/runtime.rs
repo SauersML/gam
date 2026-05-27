@@ -935,14 +935,24 @@ fn hash_analytic_penalty_kind(
             hash_weight_field(hasher, &p.weight);
             hasher.write_f64(p.scalar_weight);
             hash_weight_schedule_option(hasher, &p.weight_schedule);
-            match p.jacobian_cache.as_ref() {
+            // Caches now live behind RwLocks (option-B refactor) so the SAE
+            // outer loop can refresh them without &mut on the registry-held
+            // Arc<IsometryPenalty>. The accessor takes the read lock briefly
+            // and clones the inner Arc — the hash sees a consistent snapshot
+            // of whatever was last installed by refresh_caches. When the
+            // SAE loop installs new caches each outer step the resulting
+            // change in the hashed bytes invalidates the REML cache key
+            // automatically, so no separate "basis identity" tag is needed
+            // beyond the Jacobian contents themselves: any change in the
+            // basis (and hence in J or H) shows up directly in these arrays.
+            match p.jacobian_cache() {
                 Some(values) => {
                     hasher.write_bool(true);
                     hash_array2(hasher, values.as_ref());
                 }
                 None => hasher.write_bool(false),
             }
-            match p.jacobian_second_cache.as_ref() {
+            match p.jacobian_second_cache() {
                 Some(values) => {
                     hasher.write_bool(true);
                     hash_array2(hasher, values.as_ref());

@@ -32,7 +32,8 @@ use std::sync::Arc;
 use crate::solver::arrow_schur::{ArrowRowBlock, ArrowSchurError, ArrowSchurSystem};
 use crate::terms::analytic_penalties::{
     ARDPenalty, AnalyticPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry,
-    IBPAssignmentPenalty, PenaltyTier, PsiSlice, SoftmaxAssignmentSparsityPenalty,
+    IBPAssignmentPenalty, IsometryPenalty, PenaltyTier, PsiSlice,
+    SoftmaxAssignmentSparsityPenalty,
 };
 use crate::terms::latent_coord::{LatentCoordValues, LatentIdMode, LatentManifold};
 
@@ -2643,6 +2644,158 @@ pub fn term_from_padded_blocks_with_mode(
         mode,
     )?;
     SaeManifoldTerm::new(atoms, assignment)
+}
+
+/// Build the per-row Jacobian `J` and Hessian `H` of the decoded output
+/// `Z_n = Phi_n B` with respect to the latent coordinates `t_n` of a single
+/// SAE atom and install them on the supplied [`IsometryPenalty`].
+///
+/// Layout follows the convention used by [`IsometryPenalty::grad_target`] and
+/// friends:
+///
+/// * `J ∈ ℝ^{n_obs × (p · d)}`, flattened as `J[n, i*d + a]` —
+///   `J[n, i, a] = ∂Z_{n,i} / ∂t_{n,a} = Σ_m dPhi[n, m, a] · B[m, i]`.
+/// * `H ∈ ℝ^{n_obs × (p · d · d)}`, flattened as `H[n, (i*d + a)*d + c]` —
+///   `H[n, i, a, c] = ∂J[n, i, a] / ∂t_{n, c} = Σ_m d²Phi[n, m, a, c] · B[m, i]`.
+///
+/// Returns `Ok(true)` when both caches were installed (i.e. the atom's basis
+/// evaluator implemented [`SaeBasisEvaluator::second_jet`]). Returns
+/// `Ok(false)` when the evaluator returned `None` for `second_jet` — in that
+/// case only the first-jet `jacobian_cache` is installed and the penalty's
+/// `has_jacobian_second_source` check still has a chance to succeed via a
+/// pre-supplied `duchon_radial_source`. Returns `Err` only on shape
+/// mismatches (which would indicate a buggy evaluator).
+///
+/// This entry point takes `&IsometryPenalty` rather than `&mut` because the
+/// caches are interior-mutable (see [`IsometryPenalty::refresh_caches`]).
+pub fn refresh_isometry_caches_from_atom(
+    penalty: &IsometryPenalty,
+    atom: &SaeManifoldAtom,
+    coords: ArrayView2<'_, f64>,
+) -> Result<bool, String> {
+    let evaluator = atom.basis_evaluator.as_ref().ok_or_else(|| {
+        format!(
+            "refresh_isometry_caches_from_atom: atom {} has no basis evaluator",
+            atom.name
+        )
+    })?;
+    let (_phi, jet) = evaluator.evaluate(coords)?;
+    let second = evaluator.second_jet(coords);
+
+    let n_obs = coords.nrows();
+    let d = atom.latent_dim;
+    let m = atom.basis_size();
+    let p = atom.decoder_coefficients.ncols();
+    if penalty.p_out != p {
+        return Err(format!(
+            "refresh_isometry_caches_from_atom: penalty.p_out={} but atom.decoder.cols={p}",
+            penalty.p_out
+        ));
+    }
+    if jet.dim() != (n_obs, m, d) {
+        return Err(format!(
+            "refresh_isometry_caches_from_atom: evaluator first jet has shape {:?}, expected ({n_obs}, {m}, {d})",
+            jet.dim()
+        ));
+    }
+
+    // J[n, i*d + a] = Σ_m dPhi[n, m, a] · B[m, i].
+    let b = &atom.decoder_coefficients;
+    let mut jac = Array2::<f64>::zeros((n_obs, p * d));
+    for n in 0..n_obs {
+        for i in 0..p {
+            for a in 0..d {
+                let mut acc = 0.0;
+                for mm in 0..m {
+                    acc += jet[[n, mm, a]] * b[[mm, i]];
+                }
+                jac[[n, i * d + a]] = acc;
+            }
+        }
+    }
+
+    let jac2_opt = match second {
+        Some(hess) => {
+            if hess.dim() != (n_obs, m, d, d) {
+                return Err(format!(
+                    "refresh_isometry_caches_from_atom: evaluator second jet has shape {:?}, expected ({n_obs}, {m}, {d}, {d})",
+                    hess.dim()
+                ));
+            }
+            let mut jac2 = Array2::<f64>::zeros((n_obs, p * d * d));
+            for n in 0..n_obs {
+                for i in 0..p {
+                    for a in 0..d {
+                        for c in 0..d {
+                            let mut acc = 0.0;
+                            for mm in 0..m {
+                                acc += hess[[n, mm, a, c]] * b[[mm, i]];
+                            }
+                            jac2[[n, (i * d + a) * d + c]] = acc;
+                        }
+                    }
+                }
+            }
+            Some(Arc::new(jac2))
+        }
+        None => None,
+    };
+
+    let installed = jac2_opt.is_some();
+    penalty.refresh_caches(Some(Arc::new(jac)), jac2_opt);
+    Ok(installed)
+}
+
+/// Walk an [`AnalyticPenaltyRegistry`] and refresh every Isometry penalty
+/// whose `target` aligns with a SAE atom's latent block. The alignment rule
+/// is the simplest correct one: the penalty's `target.latent_dim` must equal
+/// the atom's `latent_dim` AND the penalty's `p_out` must equal the atom's
+/// decoder column count `p`. With a single SAE atom and a single isometry
+/// penalty in the registry (the common case wired by `solver/workflow.rs`),
+/// this rule pairs them unambiguously. Multi-atom configurations should
+/// install one isometry penalty per atom; this helper picks the first
+/// matching atom for each.
+///
+/// Returns the number of penalties that got both caches populated (i.e. the
+/// number of atoms whose basis evaluator implements [`SaeBasisEvaluator::second_jet`]).
+pub fn refresh_isometry_caches_from_term(
+    registry: &AnalyticPenaltyRegistry,
+    term: &SaeManifoldTerm,
+    coords_per_atom: &[Array2<f64>],
+) -> Result<usize, String> {
+    if coords_per_atom.len() != term.atoms.len() {
+        return Err(format!(
+            "refresh_isometry_caches_from_term: coords_per_atom length {} != number of atoms {}",
+            coords_per_atom.len(),
+            term.atoms.len()
+        ));
+    }
+    let mut refreshed_with_second = 0usize;
+    for entry in registry.penalties.iter() {
+        let AnalyticPenaltyKind::Isometry(p) = entry else {
+            continue;
+        };
+        let Some(p_latent_dim) = p.target.latent_dim else {
+            continue;
+        };
+        let Some((atom_idx, atom)) = term
+            .atoms
+            .iter()
+            .enumerate()
+            .find(|(_, atom)| {
+                atom.latent_dim == p_latent_dim
+                    && atom.decoder_coefficients.ncols() == p.p_out
+                    && atom.basis_evaluator.is_some()
+            })
+        else {
+            continue;
+        };
+        let coords = coords_per_atom[atom_idx].view();
+        if refresh_isometry_caches_from_atom(p, atom, coords)? {
+            refreshed_with_second += 1;
+        }
+    }
+    Ok(refreshed_with_second)
 }
 
 #[cfg(test)]
