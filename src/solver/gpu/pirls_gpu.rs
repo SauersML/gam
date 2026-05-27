@@ -1151,6 +1151,12 @@ mod pcg_device {
         }
 
         // ‖b‖₂² = b · b (b is currently in d_r since r₀ = b - H·0 = b)
+        // SAFETY: `f_dot` is the `pcg_dot_single_block` device function loaded
+        // above; its signature is `(i32, *const f64, *const f64, *mut f64)`.
+        // `n_i32` was bounded against `1024` (kernel's max-n contract) two
+        // lines up; `d_r` is a `CudaSlice<f64>` of length `n` allocated to the
+        // same stream; `d_scalar` is the length-1 output slice. Single-block
+        // grid (1×dot_threads) matches the kernel's reduction strategy.
         unsafe {
             stream
                 .launch_builder(&f_dot)
@@ -1186,6 +1192,10 @@ mod pcg_device {
         }
 
         // z₀ = M⁻¹ r₀
+        // SAFETY: `f_precond` is `pcg_jacobi_precond` with signature
+        // `(i32, f64, *const f64, *const f64, *mut f64)`. `d_diag`, `d_r`,
+        // `d_z` are all `CudaSlice<f64>` of length `n` on the same stream;
+        // `vec_blocks × vec_threads ≥ n` covers every output element.
         unsafe {
             stream
                 .launch_builder(&f_precond)
@@ -1203,6 +1213,10 @@ mod pcg_device {
         .map_err(|e| format!("pcg precond z₀: {e}"))?;
 
         // p₀ = z₀
+        // SAFETY: `f_copy` is `pcg_copy` with signature
+        // `(i32, *const f64, *mut f64)`. `d_z` and `d_p` are
+        // `CudaSlice<f64>` of length `n` on the same stream;
+        // `vec_blocks × vec_threads ≥ n` covers every element.
         unsafe {
             stream
                 .launch_builder(&f_copy)
@@ -1218,6 +1232,10 @@ mod pcg_device {
         .map_err(|e| format!("pcg copy p₀: {e}"))?;
 
         // ρ₀ = r₀·z₀
+        // SAFETY: same invariants as the ‖b‖₂² launch above — `f_dot`
+        // signature `(i32, *const f64, *const f64, *mut f64)`, `d_r` and
+        // `d_z` are length-`n` `CudaSlice<f64>`, `d_scalar` is length-1,
+        // single-block grid matches kernel's reduction.
         unsafe {
             stream
                 .launch_builder(&f_dot)
@@ -1253,6 +1271,10 @@ mod pcg_device {
                 .map_err(|e| format!("pcg Hv iter {iter}: {e}"))?;
 
             // pq = p·q
+            // SAFETY: identical to ‖b‖₂² launch — `f_dot` signature
+            // `(i32, *const f64, *const f64, *mut f64)`; `d_p` is the
+            // current search direction and `d_q` was just populated by
+            // `launch_bms_flex_row_hvp_into_device` (same stream, same `n`).
             unsafe {
                 stream
                     .launch_builder(&f_dot)
@@ -1282,6 +1304,11 @@ mod pcg_device {
             let alpha = rho / pq;
 
             // x += α p
+            // SAFETY: `f_axpy` is `pcg_axpy` with signature
+            // `(i32, f64, *const f64, *mut f64)`. `alpha` is the
+            // finite-checked CG step length (`rho/pq`, both validated
+            // above). `d_p` and `d_x` are length-`n` `CudaSlice<f64>` on
+            // the same stream. Grid covers all `n` elements.
             unsafe {
                 stream
                     .launch_builder(&f_axpy)
@@ -1299,6 +1326,10 @@ mod pcg_device {
 
             // r -= α q
             let neg_alpha = -alpha;
+            // SAFETY: same `f_axpy` invariants as the `x += α p` launch
+            // above; `neg_alpha = -alpha` is finite (alpha was checked),
+            // `d_q` and `d_r` are length-`n` `CudaSlice<f64>` on the same
+            // stream.
             unsafe {
                 stream
                     .launch_builder(&f_axpy)
@@ -1315,6 +1346,9 @@ mod pcg_device {
             .map_err(|e| format!("pcg r-=αq iter {iter}: {e}"))?;
 
             // ‖r‖₂² = r·r (single device dot, single f64 DtoH)
+            // SAFETY: identical to the ‖b‖₂² launch at function entry —
+            // `f_dot` signature, `d_r` length-`n`, `d_scalar` length-1,
+            // single-block reduction grid.
             unsafe {
                 stream
                     .launch_builder(&f_dot)
@@ -1346,6 +1380,10 @@ mod pcg_device {
             }
 
             // z = M⁻¹ r
+            // SAFETY: same `f_precond` invariants as the `z₀ = M⁻¹ r₀`
+            // launch above — signature `(i32, f64, *const f64, *const f64,
+            // *mut f64)`, all four slices length-`n` `CudaSlice<f64>`, grid
+            // covers all `n` elements.
             unsafe {
                 stream
                     .launch_builder(&f_precond)
@@ -1363,6 +1401,8 @@ mod pcg_device {
             .map_err(|e| format!("pcg z=M⁻¹r iter {iter}: {e}"))?;
 
             // ρ_new = r·z
+            // SAFETY: identical to the ρ₀ launch above — `f_dot`
+            // signature, `d_r` and `d_z` length-`n`, `d_scalar` length-1.
             unsafe {
                 stream
                     .launch_builder(&f_dot)
@@ -1390,6 +1430,11 @@ mod pcg_device {
             let beta_pcg = rho_new / rho;
 
             // p = z + β p  ⇒  via pcg_axpby with a=1, b=β
+            // SAFETY: `f_axpby` is `pcg_axpby` with signature
+            // `(i32, f64, *const f64, f64, *mut f64)`. `beta_pcg = rho_new/rho`
+            // was finite-checked. `d_z` and `d_p` are length-`n`
+            // `CudaSlice<f64>` on the same stream; grid covers all `n`
+            // elements.
             unsafe {
                 stream
                     .launch_builder(&f_axpby)

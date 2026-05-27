@@ -385,8 +385,15 @@ mod tests {
         assert_eq!(raw[1].as_slice().unwrap(), &[1.0, 2.0]);
     }
 
+    /// Fail-closed contract: an aliased smooth-constant ~ intercept
+    /// configuration must produce `CustomFamilyError::IdentifiabilityFailure`,
+    /// not a silently-reduced spec list. Substituting a column-reduced
+    /// `ParameterBlockSpec` under a family that captures raw-width
+    /// designs (the current `CustomFamily` contract) panics inside
+    /// `DesignMatrix::syr_row_into_view`; the safe behaviour is to
+    /// refuse the fit with an actionable diagnostic in milliseconds.
     #[test]
-    fn canonical_drops_aliased_column() {
+    fn canonical_refuses_aliased_smooth_constant_with_intercept() {
         let n = 64;
         let x = linspace(n);
         let parametric = Array2::<f64>::from_shape_fn((n, 1), |(_, _)| 1.0);
@@ -400,48 +407,44 @@ mod tests {
             spec_from_dense("intercept", parametric),
             spec_from_dense("smooth_with_const", smooth),
         ];
-        let canon =
-            canonicalize_for_identifiability(&specs).expect("aliased canonical must reduce");
-        let total_red: usize = canon.reduced_block_dims().iter().sum();
-        assert_eq!(
-            total_red, 3,
-            "expected 3 surviving directions; got {total_red}"
-        );
-        let raw_dims: Vec<usize> = canon.raw_block_dims();
-        assert_eq!(raw_dims, vec![1, 3]);
-        let theta: Vec<Array1<f64>> = canon
-            .reduced_block_dims()
-            .iter()
-            .map(|&r| Array1::from_iter((0..r).map(|j| (j + 1) as f64)))
-            .collect();
-        let raw_betas = canon.lift_block_betas_to_raw(&theta);
-        let zero_count: usize = raw_betas
-            .iter()
-            .map(|b| b.iter().filter(|&&v| v == 0.0).count())
-            .sum();
-        assert!(
-            zero_count >= 1,
-            "at least one dropped raw coordinate must lift to zero; raw_betas={:?}",
-            raw_betas,
-        );
+        let err = canonicalize_for_identifiability(&specs)
+            .expect_err("aliased smooth-constant + intercept must refuse, not reduce");
+        match err {
+            CustomFamilyError::IdentifiabilityFailure { audit } => {
+                assert!(
+                    audit.fatal,
+                    "audit attached to IdentifiabilityFailure must be fatal; got {}",
+                    audit.summary,
+                );
+                assert!(
+                    audit.summary.contains("intercept")
+                        && audit.summary.contains("smooth_with_const"),
+                    "refusal summary must name both offending blocks; got {:?}",
+                    audit.summary,
+                );
+            }
+            other => panic!("expected IdentifiabilityFailure, got {other:?}"),
+        }
     }
 
-    /// Five-block biobank-shape aliasing repro mirroring the survival
-    /// marginal-slope gauge ownership policy. Each block carries an
-    /// intercept-like constant column; gauge_priority is assigned
-    /// top-down (time=200 > marginal=150 > logslope=120 > score_warp=80
-    /// > link_dev=60). Canonicalisation must:
+    /// Five-block biobank-shape aliasing repro. Each block carries an
+    /// intercept-like constant column; gauge_priority is set per the
+    /// survival marginal-slope ownership policy (time=200 > marginal=150
+    /// > logslope=120 > score_warp=80 > link_dev=60). The joint design
+    /// has a 4-D null space among the five constants.
     ///
-    ///   (1) preserve the constant in `time_surface` (highest priority);
-    ///   (2) drop a constant from each lower-priority block whose
-    ///       column would otherwise alias the time intercept after
-    ///       priority-aware RRQR pivoting;
-    ///   (3) leave the time block's parameterisation untouched.
-    ///
-    /// This is exactly the gauge-ownership contract that the audit
-    /// must enforce before any pilot or outer Newton solve.
+    /// Under the fail-closed contract, canonicalisation must refuse this
+    /// configuration with `IdentifiabilityFailure` — naming the
+    /// offending alias and giving the caller a millisecond diagnostic
+    /// instead of a downstream singular-Hessian panic. The
+    /// gauge_priority field still influences which alias pair the audit
+    /// flags first (lowest-priority block's column is the one named in
+    /// the dropped_columns attribution), but the canonicalise step does
+    /// not act on that attribution until Phase 4b of the
+    /// identifiability_compiler threads compiled designs through the
+    /// family construction sites.
     #[test]
-    fn canonical_five_block_gauge_ownership_drops_from_lowest_priority() {
+    fn canonical_five_block_gauge_ownership_refuses_with_attribution() {
         let n = 96;
         let x = linspace(n);
         // Each block carries `ones(n)` in column 0 (the shared-constant
