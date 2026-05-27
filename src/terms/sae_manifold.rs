@@ -26,7 +26,7 @@
 //! bordered Hessian in that layout and hands it to
 //! [`crate::solver::arrow_schur::ArrowSchurSystem`].
 
-use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3, ArrayView4, s};
+use ndarray::{Array1, Array2, Array3, Array4, ArrayView1, ArrayView2, ArrayView3, ArrayView4, s};
 use std::sync::Arc;
 
 use crate::solver::arrow_schur::{ArrowRowBlock, ArrowSchurError, ArrowSchurSystem};
@@ -233,6 +233,16 @@ impl SaeAtomBasisKind {
 
 pub trait SaeBasisEvaluator: Send + Sync + std::fmt::Debug {
     fn evaluate(&self, coords: ArrayView2<'_, f64>) -> Result<(Array2<f64>, Array3<f64>), String>;
+
+    /// Second-jet `H[n, m, a, c] = ∂²Phi_k[n, m] / (∂t_{n,a} ∂t_{n,c})`,
+    /// shape `(n_rows, n_basis, latent_dim, latent_dim)`. Returning `None`
+    /// signals "not implemented for this basis"; callers (e.g. the SAE
+    /// Isometry penalty wiring) treat that as "no analytic ∂J/∂t available
+    /// from the basis" and fall back to whatever derivative-free or
+    /// Duchon-radial source they already use.
+    fn second_jet(&self, _coords: ArrayView2<'_, f64>) -> Option<Array4<f64>> {
+        None
+    }
 }
 
 /// Periodic harmonic basis evaluator for a single-dimensional circle latent.

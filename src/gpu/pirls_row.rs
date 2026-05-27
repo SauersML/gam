@@ -2181,4 +2181,138 @@ mod pirls_row_gpu_tests {
             }
         }
     }
+
+    /// Stage 5 end-to-end V100 parity for `CurvatureMode::Observed`.
+    ///
+    /// 256-row synthetic fixture per family with η ∈ [-6, 6] spanning the
+    /// saturated tails. Two assertions:
+    ///
+    /// 1. Noncanonical families (BernoulliProbit, BernoulliCLogLog,
+    ///    GammaLog): device `w_hessian` under Observed mode matches the
+    ///    CPU `row_reweight_cpu(..., Observed, ..)` reference to
+    ///    `abs ≤ 1e-12` OR `rel ≤ 1e-11`.
+    /// 2. Canonical families (GaussianIdentity, PoissonLog, BernoulliLogit):
+    ///    device `w_hessian` under Observed mode equals device `w_fisher`
+    ///    bit-for-bit (via `to_bits()`) — canonical links have observed
+    ///    information ≡ Fisher information by construction.
+    #[test]
+    fn gpu_observed_parity() {
+        if super::super::runtime::GpuRuntime::global().is_none() {
+            eprintln!("[gpu_observed_parity] no CUDA runtime — skipping");
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            const N: usize = 256;
+            let etas: Vec<f64> = (0..N)
+                .map(|i| -6.0 + 12.0 * (i as f64) / ((N - 1) as f64))
+                .collect();
+            let priors: Vec<f64> = (0..N)
+                .map(|i| 0.5 + 1.5 * ((i as f64) / (N as f64)))
+                .collect();
+
+            let backend =
+                PirlsRowBackend::probe().expect("backend probe on CUDA host");
+            let runtime = super::super::runtime::GpuRuntime::global()
+                .expect("GPU runtime available when probe succeeded");
+            let ctx = super::super::runtime::cuda_context_for(
+                runtime.selected_device().ordinal,
+            )
+            .expect("ctx for selected device");
+            let stream = ctx.default_stream();
+
+            for &family in PirlsRowFamily::ALL.iter() {
+                let ys: Vec<f64> = match family {
+                    PirlsRowFamily::GammaLog => {
+                        (0..N).map(|i| 0.25 + 0.05 * (i as f64)).collect()
+                    }
+                    PirlsRowFamily::PoissonLog => {
+                        (0..N).map(|i| (i % 6) as f64).collect()
+                    }
+                    PirlsRowFamily::GaussianIdentity => (0..N)
+                        .map(|i| -2.0 + 4.0 * (i as f64) / ((N - 1) as f64))
+                        .collect(),
+                    _ => (0..N).map(|i| if i % 2 == 0 { 0.0 } else { 1.0 }).collect(),
+                };
+
+                let mut eta_dev = stream.alloc_zeros::<f64>(N).expect("alloc eta_dev");
+                let mut y_dev = stream.alloc_zeros::<f64>(N).expect("alloc y_dev");
+                let mut prior_dev = stream.alloc_zeros::<f64>(N).expect("alloc prior_dev");
+                stream
+                    .memcpy_htod(etas.as_slice(), &mut eta_dev)
+                    .expect("upload eta");
+                stream.memcpy_htod(ys.as_slice(), &mut y_dev).expect("upload y");
+                stream
+                    .memcpy_htod(priors.as_slice(), &mut prior_dev)
+                    .expect("upload prior");
+
+                let mut out_obs =
+                    RowOutputDevBuffers::allocate(&stream, N).expect("alloc out_obs");
+                launch_row_reweight_on_stream(
+                    backend,
+                    family,
+                    CurvatureMode::Observed,
+                    &stream,
+                    N,
+                    &eta_dev,
+                    &y_dev,
+                    &prior_dev,
+                    &mut out_obs,
+                )
+                .unwrap_or_else(|err| panic!("observed launch {family:?}: {err}"));
+                stream.synchronize().expect("stream sync (observed)");
+
+                let wh_obs = stream
+                    .clone_dtoh(&out_obs.w_hessian)
+                    .expect("dl w_hessian (observed)");
+                let wf_obs = stream
+                    .clone_dtoh(&out_obs.w_fisher)
+                    .expect("dl w_fisher (observed)");
+
+                if family.is_canonical() {
+                    for i in 0..N {
+                        assert_eq!(
+                            wh_obs[i].to_bits(),
+                            wf_obs[i].to_bits(),
+                            "{family:?} row {i}: observed w_hessian {} must bit-equal w_fisher {} on canonical link",
+                            wh_obs[i],
+                            wf_obs[i],
+                        );
+                    }
+                } else {
+                    for i in 0..N {
+                        let cpu = row_reweight_cpu(
+                            family,
+                            CurvatureMode::Observed,
+                            RowInput {
+                                eta: etas[i],
+                                y: ys[i],
+                                prior_weight: priors[i],
+                            },
+                        );
+                        let got = wh_obs[i];
+                        let exp = cpu.w_hessian;
+                        let abs_err = (got - exp).abs();
+                        let rel_err = if exp.abs() > 0.0 {
+                            abs_err / exp.abs()
+                        } else {
+                            abs_err
+                        };
+                        assert!(
+                            abs_err <= 1.0e-12 || rel_err <= 1.0e-11,
+                            "{family:?} row {i} (eta={}, y={}, wp={}): \
+                             device w_hessian={} vs CPU observed={} (abs={}, rel={})",
+                            etas[i],
+                            ys[i],
+                            priors[i],
+                            got,
+                            exp,
+                            abs_err,
+                            rel_err,
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
