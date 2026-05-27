@@ -6756,36 +6756,56 @@ impl SurvivalMarginalSlopeFamily {
         }
 
         // ── 3. per-cell fixed partials via the device seam, CPU fallback ──
+        let layout = crate::gpu::survival_flex_prep::FlexPrimaryLayout {
+            r: u32::try_from(primary.total).map_err(|_| {
+                format!(
+                    "build_cached_partition_with_moment_order: primary.total={} exceeds u32",
+                    primary.total
+                )
+            })?,
+            g_slot: u32::try_from(primary.g).map_err(|_| {
+                format!(
+                    "build_cached_partition_with_moment_order: primary.g={} exceeds u32",
+                    primary.g
+                )
+            })?,
+        };
         let row_fp_input =
             crate::gpu::survival_flex_prep::CellPrimaryFixedPartialsRowInputs {
                 a,
                 b,
                 cells: &fp_inputs,
+                layout,
             };
         let dev_fixed = crate::gpu::survival_flex_prep::try_device_cell_primary_fixed_partials(
             std::slice::from_ref(&row_fp_input),
         )
         .map_err(|e| e.to_string())?;
-        // The current substrate decline is `None`; even when the device
-        // returns a flat-packed `Vec<f64>`, the family-side
-        // `DenestedCellPrimaryFixedPartials` consumer below is the source of
-        // truth and is reconstructed from the per-cell CPU helper.  When the
-        // sibling commit lands the NVRTC kernel + the
-        // `DenestedCellPrimaryFixedPartials::from_flat_slice` shim, this
-        // match's `Some(_)` arm will assemble cells from the device output
-        // instead of the CPU per-cell loop below.
-        match dev_fixed {
-            Some(out) if !out.partials.is_empty() => {
-                // Reserved for the device-resident assembly path; the V100
-                // sibling commit replaces this `unreachable_arm` with the
-                // flat-slice reconstruction.  The `Ok(None)` decline above
-                // makes this arm cold today.
-                return Err(format!(
-                    "device-resident fixed-partials assembly not yet wired (n_rows={})",
-                    out.partials.len()
-                ));
+        // When the device path returns flat-packed partials, reconstruct
+        // the per-cell `DenestedCellPrimaryFixedPartials` from the device
+        // buffer via the `from_flat_slice` shim — byte-identical to what
+        // the CPU per-cell helper would produce for the supported
+        // (trivial-span) shape.  Any decline drops through to the CPU
+        // per-cell loop below.
+        if let Some(out) = dev_fixed.as_ref()
+            && out.partials.len() == 1
+            && out.partials[0].len() == n
+        {
+            let mut cells = Vec::with_capacity(n);
+            for (idx, partition_cell) in raw_cells.into_iter().enumerate() {
+                let flat = &out.partials[0][idx];
+                let fixed = DenestedCellPrimaryFixedPartials::from_flat_slice(
+                    flat.as_slice(),
+                    primary.total,
+                )?;
+                cells.push(CachedCellEntry {
+                    partition_cell,
+                    neg_cell: neg_cells[idx],
+                    state: states[idx].clone(),
+                    fixed,
+                });
             }
-            _ => {}
+            return Ok(CachedPartitionCells { cells });
         }
         let mut cells = Vec::with_capacity(n);
         for (idx, partition_cell) in raw_cells.into_iter().enumerate() {
