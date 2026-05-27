@@ -19701,7 +19701,7 @@ pub fn fit_survival_marginal_slope_terms(
             Ok(Some((applied, lift)))
         })();
         match attempt {
-            Ok(Some((applied, compiled))) => {
+            Ok(Some((applied, lift))) => {
                 // V+M-exact compiled .design swapped into clones of the
                 // raw TermCollectionDesigns. The TermCollectionDesign's
                 // .penalties field stays raw (Vec<BlockwisePenalty>) for
@@ -19717,15 +19717,6 @@ pub fn fit_survival_marginal_slope_terms(
                 marg_out.design = applied.marginal_design;
                 let mut log_out = logslope_design.clone();
                 log_out.design = applied.logslope_design;
-                // Flatten per-term V's in global compile order: time,
-                // then marginal, then logslope. Matches the ordering
-                // `apply_per_term_vm_exact` used to build `t_full` and
-                // `compiled.r_lw_per_term`.
-                let mut v_per_block: Vec<ndarray::Array2<f64>> = Vec::new();
-                v_per_block.extend(compiled.v_time_per_term.iter().cloned());
-                v_per_block.extend(compiled.v_marginal_per_term.iter().cloned());
-                v_per_block.extend(compiled.v_logslope_per_term.iter().cloned());
-                let lift = SmgsLiftViaT::from_v_and_r(&v_per_block, &compiled.r_lw_per_term);
                 (
                     applied.time_design_entry,
                     applied.time_design_exit,
