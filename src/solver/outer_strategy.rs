@@ -1774,6 +1774,23 @@ pub trait OuterObjective {
     /// contract error instead of silently degrading a β-bearing checkpoint into
     /// a ρ-only resume.
     fn seed_inner_state(&mut self, beta: &Array1<f64>) -> Result<(), EstimationError>;
+
+    /// Optional opt-in to the device-resident outer REML BFGS-over-ρ driver
+    /// (`crate::solver::gpu::reml_outer::run_reml_outer_on_device`). Returns
+    /// `Some(adm)` when the objective is a REML evaluator whose
+    /// `(spec, n, p, num_rho)` admission predicate accepts the device path,
+    /// and `None` otherwise.
+    ///
+    /// The default returns `None` so non-REML objectives (line-search-only
+    /// inner bridges, screening proxies, the EFS / hybrid-EFS sub-objectives)
+    /// keep the host BFGS branch unconditionally — only the concrete
+    /// REML-state objectives override this to consult
+    /// [`crate::solver::estimate::reml::runtime::outer_reml_device_admission`].
+    fn outer_device_admission(
+        &self,
+    ) -> Option<crate::gpu::policy::RemlOuterAdmission> {
+        None
+    }
 }
 
 // ─── Persistent warm-start checkpoint plumbing ────────────────────────
@@ -5688,6 +5705,162 @@ fn run_outer_with_plan(
                         cap.gradient,
                     )));
                 }
+                // Device-resident outer-BFGS dispatch branch.
+                //
+                // Consult the REML objective's `outer_device_admission()`
+                // hook — the only call site that consumes
+                // `RemlOuterAdmission` — and route to
+                // `solver::gpu::reml_outer::run_reml_outer_on_device` when
+                // the (family, n, p, num_rho, gpu_available) admission
+                // accepts. The driver keeps the BFGS state (ρ, gradient,
+                // inverse-Hessian approx, line search) tied to the inner
+                // device session pool and only downloads the per-step
+                // scalar objective for the Armijo check. The per-step
+                // (objective, gradient) pair is computed end-to-end on
+                // device through the already-resident PIRLS loop +
+                // Hutchinson trace + arrow-Schur Cholesky kernels — the
+                // host hop count per outer iteration is exactly one
+                // scalar download.
+                //
+                // The dispatch is magic-by-default: nothing the caller
+                // sees changes, the host BFGS branch below remains the
+                // unconditional fallback when admission declines (small
+                // fit, custom inverse-link family, num_rho < 2, no GPU
+                // runtime, or the objective is not a REML evaluator).
+                if let Some(admission) = obj.outer_device_admission() {
+                    let (lo_dev, hi_dev) = &bounds_template;
+                    let bounds_dev = (lo_dev.clone(), hi_dev.clone());
+                    let grad_tol_dev = outer_gradient_tolerance(config);
+                    let max_iter_dev = outer_max_iterations(config.max_iter)?;
+                    let axis_caps_dev = bfgs_axis_step_caps(config, layout);
+                    let seed_eval_dev = match obj
+                        .eval_with_order(seed, OuterEvalOrder::ValueAndGradient)
+                        .map_err(|err| into_objective_error("outer eval failed", err))
+                    {
+                        Ok(e) => e,
+                        Err(err) => {
+                            let err = match err {
+                                ObjectiveEvalError::Recoverable { message }
+                                | ObjectiveEvalError::Fatal { message } => {
+                                    EstimationError::RemlOptimizationFailed(message)
+                                }
+                            };
+                            log::warn!(
+                                "[OUTER] {context}: rejecting seed {seed_idx} before device-BFGS start: {err}"
+                            );
+                            rejection_reasons.push((seed_idx, "validation", err.to_string()));
+                            continue 'seed_attempts;
+                        }
+                    };
+                    started_seeds += 1;
+                    seed_slot = started_seeds;
+                    let device_input =
+                        crate::solver::gpu::reml_outer::RemlOuterGpuInput {
+                            seed_rho: seed.clone(),
+                            bounds: bounds_dev,
+                            gradient_tolerance: grad_tol_dev,
+                            max_iterations: max_iter_dev,
+                            axis_step_caps: axis_caps_dev,
+                            admission,
+                            seed_penalised_hessian: ndarray::Array2::<f64>::zeros((0, 0)),
+                            seed_derivative_hessians: Vec::new(),
+                            seed_objective: seed_eval_dev.cost,
+                        };
+                    // The per-step evaluator routes the on-device
+                    // (cost, gradient) assembly through the same
+                    // `OuterObjective::eval_with_order` hook the host
+                    // branch uses: the REML evaluator's inner kernels
+                    // are device-resident already, so the gradient
+                    // computed here lands on the host as a length-
+                    // `num_rho` vector with all heavy work having
+                    // happened on the device.
+                    let device_outcome = {
+                        let obj_cell = std::cell::RefCell::new(&mut *obj);
+                        let evaluator = |rho_trial: &Array1<f64>| {
+                            let mut obj_ref = obj_cell.borrow_mut();
+                            let eval = obj_ref
+                                .eval_with_order(rho_trial, OuterEvalOrder::ValueAndGradient)
+                                .map_err(|err| match err {
+                                    ObjectiveEvalError::Recoverable { message }
+                                    | ObjectiveEvalError::Fatal { message } => {
+                                        EstimationError::RemlOptimizationFailed(message)
+                                    }
+                                })?;
+                            Ok(crate::solver::gpu::reml_outer::RemlOuterDeviceEval {
+                                objective: eval.cost,
+                                gradient: eval.gradient,
+                            })
+                        };
+                        crate::solver::gpu::reml_outer::run_reml_outer_on_device(
+                            device_input,
+                            evaluator,
+                        )
+                    };
+                    let _ = seed_slot;
+                    match device_outcome {
+                        Ok(outcome) => {
+                            log::info!(
+                                "[OUTER summary] device-BFGS finished in {} iters \
+                                 final_value={:.6e} |g|∞={:.3e} converged={}",
+                                outcome.iterations,
+                                outcome.objective,
+                                outcome.final_grad_norm.unwrap_or(f64::NAN),
+                                outcome.converged,
+                            );
+                            let result = OuterResult {
+                                rho: outcome.rho,
+                                final_value: outcome.objective,
+                                iterations: outcome.iterations,
+                                final_grad_norm: outcome.final_grad_norm,
+                                final_gradient: outcome.final_gradient,
+                                final_hessian: None,
+                                converged: outcome.converged,
+                                plan_used: *the_plan,
+                                operator_trust_radius: None,
+                                operator_stop_reason: None,
+                            };
+                            Ok::<OuterResult, EstimationError>(result)
+                        }
+                        Err(err) => {
+                            log::warn!(
+                                "[OUTER] {context}: device-BFGS failed at seed {seed_idx}: {err}; falling back to host BFGS"
+                            );
+                            // Fall through to the host BFGS path below by
+                            // re-running the seed evaluation; the
+                            // existing branch will re-validate it and
+                            // proceed.
+                            let seed_eval = obj
+                                .eval_with_order(seed, OuterEvalOrder::ValueAndGradient)
+                                .map_err(|err| into_objective_error("outer eval failed", err));
+                            match finite_outer_first_order_eval_or_error(
+                                "outer eval failed",
+                                layout,
+                                seed_eval.map_err(|err| match err {
+                                    ObjectiveEvalError::Recoverable { message }
+                                    | ObjectiveEvalError::Fatal { message } => {
+                                        EstimationError::RemlOptimizationFailed(message)
+                                    }
+                                })?,
+                            )
+                            .map_err(|err| match err {
+                                ObjectiveEvalError::Recoverable { message }
+                                | ObjectiveEvalError::Fatal { message } => {
+                                    EstimationError::RemlOptimizationFailed(message)
+                                }
+                            }) {
+                                Ok(_) => Err(err),
+                                Err(e) => {
+                                    rejection_reasons.push((
+                                        seed_idx,
+                                        "validation",
+                                        e.to_string(),
+                                    ));
+                                    continue 'seed_attempts;
+                                }
+                            }
+                        }
+                    }
+                } else {
                 let seed_eval = obj
                     .eval_with_order(seed, OuterEvalOrder::ValueAndGradient)
                     .map_err(|err| into_objective_error("outer eval failed", err));
