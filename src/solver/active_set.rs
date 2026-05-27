@@ -92,11 +92,6 @@ pub struct ConstraintKktDiagnostics {
 
 use crate::linalg::utils::array_is_finite;
 
-#[inline]
-fn array1_is_finite(values: &Array1<f64>) -> bool {
-    array_is_finite(values)
-}
-
 fn solve_newton_direction_dense(
     hessian: &Array2<f64>,
     gradient: &Array1<f64>,

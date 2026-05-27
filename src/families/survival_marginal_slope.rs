@@ -19130,18 +19130,7 @@ pub fn fit_survival_marginal_slope_terms(
         // compile error) falls back to raw — observability preflight
         // and downstream canonicalize_for_identifiability still gate
         // on the audit.
-        let attempt = (|| -> Result<
-            Option<(
-                crate::linalg::matrix::DesignMatrix,
-                crate::linalg::matrix::DesignMatrix,
-                crate::linalg::matrix::DesignMatrix,
-                Vec<crate::terms::smooth::BlockwisePenalty>,
-                Vec<crate::terms::smooth::BlockwisePenalty>,
-                Vec<crate::terms::smooth::BlockwisePenalty>,
-                SmgsLiftPerBlockV,
-            )>,
-            String,
-        > {
+        let attempt = (|| -> Result<Option<CompiledSurvivalDesignsPerTerm>, String> {
             let n_rows = spec.time_block.design_entry.nrows();
             let p_time = spec.time_block.design_entry.ncols();
             let p_marg = marginal_design.design.ncols();
@@ -19251,56 +19240,35 @@ pub fn fit_survival_marginal_slope_terms(
                     &marginal_design.penalties,
                     &logslope_design.penalties,
                 )?;
-            let lift = SmgsLiftPerBlockV {
-                // Order: time (0), marginal (1), logslope (2). Flex
-                // blocks (score_warp_dev, link_dev) are appended at
-                // higher indices and need no parametric V lift.
-                v_per_block: vec![applied.v_time, applied.v_marginal, applied.v_logslope],
-            };
-            Ok(Some((
-                applied.time_design_entry,
-                applied.time_design_exit,
-                applied.time_design_derivative_exit,
-                applied.time_penalties,
-                applied.marginal_penalties,
-                applied.logslope_penalties,
-                lift,
-            )))
+            Ok(Some(applied))
         })();
         match attempt {
-            Ok(Some((te, tx, td, _tpens, mpens, lpens, lift))) => {
-                // Build replacement TermCollectionDesigns for marginal
-                // and logslope with .design + .penalties swapped to the
-                // compiled versions. Other metadata fields (intercept_
-                // range, linear_ranges, smooth, ...) stay at raw width
-                // — they are consumed post-fit, and at that point the
-                // β has been lifted back to raw via SmgsLiftPerBlockV.
-                let mut marg_compiled = marginal_design.clone();
-                marg_compiled.design = applied_design_marg(&te, &tx, &td);
-                let _ = marg_compiled;
-                // The above is a placeholder — the real wiring lives
-                // below in the explicit return tuple. We assemble new
-                // TermCollectionDesigns with the compiled .design and
-                // .penalties pulled-back, and leave the rest cloned
-                // from the raw inputs.
-                let mut marg_clone = marginal_design.clone();
-                marg_clone.design = te.clone(); // wrong placeholder
-                let _ = marg_clone;
-                // Compute the actually-correct compiled marginal &
-                // logslope TermCollectionDesigns:
+            Ok(Some(applied)) => {
+                // Compiled .design + per-term pulled-back .penalties
+                // swapped into clones of the raw TermCollectionDesigns.
+                // Other metadata fields stay at raw width — they are
+                // consumed post-fit, and at that point β has been
+                // lifted back to raw via SmgsLiftPerBlockV.
                 let mut marg_out = marginal_design.clone();
+                marg_out.design = applied.marginal_design;
+                marg_out.penalties = applied.marginal_penalties;
                 let mut log_out = logslope_design.clone();
-                marg_out.design = {
-                    // The compiled marginal design is the second-to-last
-                    // element of the applied set; we need access to it.
-                    // Drop the placeholder lines above; the closure
-                    // result re-binds explicitly.
-                    marg_out.design
+                log_out.design = applied.logslope_design;
+                log_out.penalties = applied.logslope_penalties;
+                let lift = SmgsLiftPerBlockV {
+                    // Order: time (0), marginal (1), logslope (2). Flex
+                    // blocks (score_warp_dev, link_dev) appear at
+                    // higher indices and need no parametric V lift.
+                    v_per_block: vec![applied.v_time, applied.v_marginal, applied.v_logslope],
                 };
-                log_out.design = log_out.design;
-                marg_out.penalties = mpens;
-                log_out.penalties = lpens;
-                (te, tx, td, marg_out, log_out, Some(lift))
+                (
+                    applied.time_design_entry,
+                    applied.time_design_exit,
+                    applied.time_design_derivative_exit,
+                    marg_out,
+                    log_out,
+                    Some(lift),
+                )
             }
             Ok(None) => (
                 spec.time_block.design_entry.clone(),
@@ -19323,17 +19291,6 @@ pub fn fit_survival_marginal_slope_terms(
             }
         }
     };
-    // Helper closure for the apply branch — currently inline-stubbed
-    // above; the cutover above returns a fully-populated tuple. Drop
-    // the placeholder reference if rustc warns.
-    fn applied_design_marg(
-        _te: &crate::linalg::matrix::DesignMatrix,
-        _tx: &crate::linalg::matrix::DesignMatrix,
-        _td: &crate::linalg::matrix::DesignMatrix,
-    ) -> crate::linalg::matrix::DesignMatrix {
-        // This stub is unreachable when the real tuple is built above.
-        unreachable!("applied_design_marg stub should not be invoked");
-    }
     let offset_entry = Arc::new(spec.time_block.offset_entry.clone());
     let offset_exit = Arc::new(spec.time_block.offset_exit.clone());
     let derivative_offset_exit = Arc::new(spec.time_block.derivative_offset_exit.clone());
@@ -19775,7 +19732,7 @@ pub fn fit_survival_marginal_slope_terms(
         initial_family.outer_derivative_policy(&initial_blocks, psi_dim, options)
     };
     let exact_spatial_outer_tol = kappa_options_ref.rel_tol.max(1e-6);
-    let solved = optimize_spatial_length_scale_exact_joint(
+    let mut solved = optimize_spatial_length_scale_exact_joint(
         data,
         &[marginalspec_boot.clone(), logslopespec_boot.clone()],
         &[marginal_terms.clone(), logslope_terms.clone()],
@@ -20007,6 +19964,29 @@ pub fn fit_survival_marginal_slope_terms(
         );
         final_family.offset_channel_geometry(&solved.fit.block_states)?
     };
+
+    // Phase-4b result-time β lift. When the active cutover applied
+    // per-block V to the time/marginal/logslope designs, the inner
+    // Newton produced β at *compiled* width. Predict-time consumers
+    // expect β at the original raw width: serialise lifts each block's
+    // β via `β_raw = V_block · β_compiled`. The corresponding η is
+    // numerically invariant under the lift (η = X_raw · β_raw =
+    // X_raw · V · β_compiled = X_compiled · β_compiled) so we leave
+    // it alone. When the cutover did NOT fire (smgs_lift_v is None),
+    // β is already at raw width and the lift is a no-op.
+    if let Some(ref lift) = smgs_lift_v {
+        let mut betas: Vec<Array1<f64>> = solved
+            .fit
+            .block_states
+            .iter()
+            .map(|s| s.beta.clone())
+            .collect();
+        lift.lift_block_betas(&mut betas);
+        for (state, beta) in solved.fit.block_states.iter_mut().zip(betas.into_iter()) {
+            state.beta = beta;
+        }
+    }
+
     let mut resolved_specs = solved.resolved_specs;
     let designs = solved.designs;
     Ok(SurvivalMarginalSlopeFitResult {
