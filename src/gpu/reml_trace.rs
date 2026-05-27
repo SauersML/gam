@@ -457,10 +457,10 @@ pub struct AdaptiveTraceEvidence {
     pub converged: bool,
 }
 
-pub fn evidence_traces_adaptive(
-    penalized_hessian: ArrayView2<'_, f64>,
-    derivatives: Vec<DerivativeHessian<'_>>,
-    design: Option<ArrayView2<'_, f64>>,
+pub fn evidence_traces_adaptive<'a>(
+    penalized_hessian: ArrayView2<'a, f64>,
+    derivatives: Vec<DerivativeHessian<'a>>,
+    design: Option<ArrayView2<'a, f64>>,
     seed: ProbeSeed,
     rel_tol: f64,
     tau_rel: f64,

@@ -1072,11 +1072,21 @@ pub(crate) fn try_row_batched_cell_moments(
             ),
         })?;
 
-    let super::cubic_cell::CubicCellDerivativeMomentOutput::Host {
-        moments,
-        mut status,
-        stride,
-    } = out;
+    let (moments, mut status, stride) = match out {
+        super::cubic_cell::CubicCellDerivativeMomentOutput::Host {
+            moments,
+            status,
+            stride,
+        } => (moments, status, stride),
+        #[cfg(target_os = "linux")]
+        super::cubic_cell::CubicCellDerivativeMomentOutput::Device { .. } => {
+            return Err(GpuError::DriverCallFailed {
+                reason: "survival_flex row-cells batch: substrate returned device-resident output \
+                         but the survival-flex host pipeline consumes Host residency only"
+                    .to_string(),
+            });
+        }
+    };
 
     // Cells we pre-rejected (`prelim_status != Ok`) get a status code
     // from us if the substrate left them as Ok (it won't, because it
