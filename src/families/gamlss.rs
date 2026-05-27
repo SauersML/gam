@@ -1618,10 +1618,10 @@ fn binomial_location_scale_link_eta_from_probability(
 ) -> Result<f64, String> {
     let target = probability.clamp(1e-6, 1.0 - 1e-6);
     match link_kind {
-        InverseLink::Standard(LinkFunction::Logit) => Ok((target / (1.0 - target)).ln()),
-        InverseLink::Standard(LinkFunction::Probit) => standard_normal_quantile(target)
+        InverseLink::Standard(StandardLink::Logit) => Ok((target / (1.0 - target)).ln()),
+        InverseLink::Standard(StandardLink::Probit) => standard_normal_quantile(target)
             .map_err(|err| format!("failed to invert probit warm-start probability: {err}")),
-        InverseLink::Standard(LinkFunction::CLogLog) => Ok((-((1.0 - target).ln())).ln()),
+        InverseLink::Standard(StandardLink::CLogLog) => Ok((-((1.0 - target).ln())).ln()),
         other => Err(GamlssError::UnsupportedConfiguration { reason: format!(
             "binomial location-scale warm start requires logit, probit, or cloglog link, got {other:?}"
         ) }.into()),
@@ -2076,7 +2076,7 @@ fn fit_binomial_mean_wiggle(
     validate_blockrows("wiggle", n, &spec.wiggle_block)?;
     if matches!(
         spec.link_kind,
-        InverseLink::Standard(LinkFunction::Identity)
+        InverseLink::Standard(StandardLink::Identity)
     ) {
         return Err(GamlssError::UnsupportedConfiguration {
             reason: "fit_binomial_mean_wiggle does not support identity link".to_string(),
@@ -4486,13 +4486,13 @@ fn binomial_neglog_q_derivatives_closed_form_dispatch(
     link_kind: &InverseLink,
 ) -> (f64, f64, f64) {
     match link_kind {
-        InverseLink::Standard(LinkFunction::Probit) => {
+        InverseLink::Standard(StandardLink::Probit) => {
             binomial_neglog_q_derivatives_probit_closed_form(y, weight, q)
         }
-        InverseLink::Standard(LinkFunction::Logit) => {
+        InverseLink::Standard(StandardLink::Logit) => {
             binomial_neglog_q_derivatives_logit_closed_form(y, weight, q)
         }
-        InverseLink::Standard(LinkFunction::CLogLog) => {
+        InverseLink::Standard(StandardLink::CLogLog) => {
             binomial_neglog_q_derivatives_cloglog_closed_form(y, weight, q)
         }
         _ => {
@@ -4511,13 +4511,13 @@ fn binomial_neglog_q_fourth_derivative_closed_form_dispatch(
     link_kind: &InverseLink,
 ) -> f64 {
     match link_kind {
-        InverseLink::Standard(LinkFunction::Probit) => {
+        InverseLink::Standard(StandardLink::Probit) => {
             binomial_neglog_q_fourth_derivative_probit_closed_form(y, weight, q)
         }
-        InverseLink::Standard(LinkFunction::Logit) => {
+        InverseLink::Standard(StandardLink::Logit) => {
             binomial_neglog_q_fourth_derivative_logit_closed_form(y, weight, q)
         }
-        InverseLink::Standard(LinkFunction::CLogLog) => {
+        InverseLink::Standard(StandardLink::CLogLog) => {
             binomial_neglog_q_fourth_derivative_cloglog_closed_form(y, weight, q)
         }
         _ => 0.0,
@@ -4530,9 +4530,9 @@ fn binomial_neglog_q_fourth_derivative_closed_form_dispatch(
 fn binomial_link_has_closed_form(link_kind: &InverseLink) -> bool {
     matches!(
         link_kind,
-        InverseLink::Standard(LinkFunction::Probit)
-            | InverseLink::Standard(LinkFunction::Logit)
-            | InverseLink::Standard(LinkFunction::CLogLog)
+        InverseLink::Standard(StandardLink::Probit)
+            | InverseLink::Standard(StandardLink::Logit)
+            | InverseLink::Standard(StandardLink::CLogLog)
     )
 }
 
@@ -4933,13 +4933,13 @@ fn binomial_location_scale_log_likelihood(
         return Ok(0.0);
     }
     match link_kind {
-        InverseLink::Standard(LinkFunction::Probit) => {
+        InverseLink::Standard(StandardLink::Probit) => {
             Ok(weight * (y * normal_logcdf(q) + (1.0_f64 - y) * normal_logsf(q)))
         }
-        InverseLink::Standard(LinkFunction::Logit) => Ok(weight
+        InverseLink::Standard(StandardLink::Logit) => Ok(weight
             * (-y * crate::linalg::utils::stable_softplus(-q)
                 - (1.0_f64 - y) * crate::linalg::utils::stable_softplus(q))),
-        InverseLink::Standard(LinkFunction::CLogLog) => {
+        InverseLink::Standard(StandardLink::CLogLog) => {
             let z = q.exp();
             let log_p = if z == 0.0 {
                 q
@@ -5023,7 +5023,7 @@ fn binomial_location_scale_ll_only(
                 let SigmaJet1 { sigma, .. } = exp_sigma_jet1_scalar(el_slice[i]);
                 let q0 = binomial_location_scale_q0(et_slice[i], sigma);
                 let q = q0 + ew_slice.map_or(0.0, |w| w[i]);
-                if matches!(link_kind, InverseLink::Standard(LinkFunction::Probit)) {
+                if matches!(link_kind, InverseLink::Standard(StandardLink::Probit)) {
                     return Ok(acc
                         + binomial_location_scale_log_likelihood(
                             y_slice[i], w_slice[i], q, link_kind, 0.5,
@@ -16716,7 +16716,7 @@ impl CustomFamily for BinomialLocationScaleFamily {
                     }
                     let SigmaJet1 { sigma, .. } = exp_sigma_jet1_scalar(eta_ls[i]);
                     let q = binomial_location_scale_q0(eta_t[i], sigma);
-                    let mu = if matches!(link_kind, InverseLink::Standard(LinkFunction::Probit)) {
+                    let mu = if matches!(link_kind, InverseLink::Standard(StandardLink::Probit)) {
                         0.5
                     } else {
                         let jet = inverse_link_jet_for_inverse_link(link_kind, q).map_err(|e| {
@@ -20636,7 +20636,7 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
                     let SigmaJet1 { sigma, .. } = exp_sigma_jet1_scalar(eta_ls[i]);
                     let q0 = binomial_location_scale_q0(eta_t[i], sigma);
                     let q = q0 + etaw[i];
-                    let mu = if matches!(link_kind, InverseLink::Standard(LinkFunction::Probit)) {
+                    let mu = if matches!(link_kind, InverseLink::Standard(StandardLink::Probit)) {
                         0.5
                     } else {
                         let jet = inverse_link_jet_for_inverse_link(link_kind, q).map_err(|e| {
@@ -22953,7 +22953,7 @@ mod tests {
         let logit_family = BinomialLocationScaleFamily {
             y: array![0.0, 1.0],
             weights: Array1::ones(n),
-            link_kind: InverseLink::Standard(LinkFunction::Logit),
+            link_kind: InverseLink::Standard(StandardLink::Logit),
             threshold_design: Some(design.clone()),
             log_sigma_design: Some(design.clone()),
             policy: crate::resource::ResourcePolicy::default_library(),
@@ -22976,7 +22976,7 @@ mod tests {
         let cloglog_family = BinomialLocationScaleFamily {
             y: array![0.0, 1.0],
             weights: Array1::ones(n),
-            link_kind: InverseLink::Standard(LinkFunction::CLogLog),
+            link_kind: InverseLink::Standard(StandardLink::CLogLog),
             threshold_design: Some(design.clone()),
             log_sigma_design: Some(design),
             policy: crate::resource::ResourcePolicy::default_library(),
@@ -23257,7 +23257,7 @@ mod tests {
         let family = BinomialLocationScaleFamily {
             y,
             weights,
-            link_kind: InverseLink::Standard(LinkFunction::Probit),
+            link_kind: InverseLink::Standard(StandardLink::Probit),
             threshold_design: Some(threshold_design.clone()),
             log_sigma_design: Some(log_sigma_design.clone()),
             policy: crate::resource::ResourcePolicy::default_library(),
@@ -23592,7 +23592,7 @@ mod tests {
         let family = BinomialLocationScaleFamily {
             y: Array1::from_iter((0..n).map(|i| if i % 2 == 0 { 1.0 } else { 0.0 })),
             weights: Array1::from_elem(n, 1.0),
-            link_kind: InverseLink::Standard(LinkFunction::Probit),
+            link_kind: InverseLink::Standard(StandardLink::Probit),
             threshold_design: None,
             log_sigma_design: None,
             policy: crate::resource::ResourcePolicy::default_library(),
@@ -24132,7 +24132,7 @@ mod tests {
         let family = BinomialLocationScaleWiggleFamily {
             y,
             weights,
-            link_kind: InverseLink::Standard(LinkFunction::Probit),
+            link_kind: InverseLink::Standard(StandardLink::Probit),
             threshold_design: Some(threshold_design.clone()),
             log_sigma_design: Some(log_sigma_design.clone()),
             wiggle_knots: knots,
@@ -24280,7 +24280,7 @@ mod tests {
         let family = BinomialLocationScaleWiggleFamily {
             y,
             weights,
-            link_kind: InverseLink::Standard(LinkFunction::Probit),
+            link_kind: InverseLink::Standard(StandardLink::Probit),
             threshold_design: Some(threshold_design.clone()),
             log_sigma_design: Some(log_sigma_design.clone()),
             wiggle_knots: knots,
@@ -25714,7 +25714,7 @@ mod tests {
         let family = BinomialLocationScaleFamily {
             y,
             weights,
-            link_kind: InverseLink::Standard(LinkFunction::Probit),
+            link_kind: InverseLink::Standard(StandardLink::Probit),
             threshold_design: Some(threshold_design.clone()),
             log_sigma_design: Some(log_sigma_design.clone()),
             policy: crate::resource::ResourcePolicy::default_library(),
@@ -25779,7 +25779,7 @@ mod tests {
         let family = BinomialLocationScaleFamily {
             y: Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0]),
             weights: Array1::from_elem(n, 1.0),
-            link_kind: InverseLink::Standard(LinkFunction::Probit),
+            link_kind: InverseLink::Standard(StandardLink::Probit),
             threshold_design: None,
             log_sigma_design: None,
             policy: crate::resource::ResourcePolicy::default_library(),
@@ -25810,7 +25810,7 @@ mod tests {
         let builder = BinomialLocationScaleTermBuilder {
             y: Array1::from_elem(n, 0.0),
             weights: Array1::from_elem(n, 1.0),
-            link_kind: InverseLink::Standard(LinkFunction::Probit),
+            link_kind: InverseLink::Standard(StandardLink::Probit),
             meanspec: simple_matern_term_collection(&[0, 1], 0.4),
             noisespec: simple_matern_term_collection(&[0, 1], 0.75),
             mean_offset: Array1::zeros(n),
@@ -25847,7 +25847,7 @@ mod tests {
         let builder = BinomialLocationScaleWiggleTermBuilder {
             y: Array1::from_elem(n, 0.0),
             weights: Array1::from_elem(n, 1.0),
-            link_kind: InverseLink::Standard(LinkFunction::Probit),
+            link_kind: InverseLink::Standard(StandardLink::Probit),
             meanspec: simple_matern_term_collection(&[0, 1], 0.4),
             noisespec: simple_matern_term_collection(&[0, 1], 0.75),
             mean_offset: Array1::zeros(n),
@@ -25889,7 +25889,7 @@ mod tests {
             noise_offset: Array1::zeros(y.len()),
             y,
             weights,
-            link_kind: InverseLink::Standard(LinkFunction::Probit),
+            link_kind: InverseLink::Standard(StandardLink::Probit),
             meanspec: simple_matern_term_collection(&[0, 1], 0.45),
             noisespec: simple_matern_term_collection(&[0, 1], 0.8),
         };
@@ -25937,7 +25937,7 @@ mod tests {
             noise_offset: Array1::zeros(y.len()),
             y,
             weights,
-            link_kind: InverseLink::Standard(LinkFunction::Probit),
+            link_kind: InverseLink::Standard(StandardLink::Probit),
             meanspec: simple_matern_term_collection(&[0, 1], 0.45),
             noisespec: simple_matern_term_collection(&[0, 1], 0.8),
             wiggle_knots: knots,
@@ -25981,7 +25981,7 @@ mod tests {
             noise_offset: Array1::zeros(y.len()),
             y,
             weights,
-            link_kind: InverseLink::Standard(LinkFunction::Probit),
+            link_kind: InverseLink::Standard(StandardLink::Probit),
             meanspec: meanspec.clone(),
             noisespec: noisespec.clone(),
         };
@@ -26068,7 +26068,7 @@ mod tests {
             noise_offset: Array1::zeros(y.len()),
             y,
             weights,
-            link_kind: InverseLink::Standard(LinkFunction::Probit),
+            link_kind: InverseLink::Standard(StandardLink::Probit),
             meanspec: meanspec.clone(),
             noisespec: noisespec.clone(),
             wiggle_knots: knots,
@@ -26240,7 +26240,7 @@ mod tests {
             noise_offset: Array1::zeros(y.len()),
             y,
             weights,
-            link_kind: InverseLink::Standard(LinkFunction::Probit),
+            link_kind: InverseLink::Standard(StandardLink::Probit),
             meanspec: meanspec.clone(),
             noisespec: noisespec.clone(),
             wiggle_knots: knots,
@@ -26503,7 +26503,7 @@ mod tests {
         let spec = BinomialLocationScaleTermSpec {
             y: Array1::from_vec(vec![0.0, 1.0, 0.0, 2.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Array1::from_elem(n, 1.0),
-            link_kind: InverseLink::Standard(LinkFunction::Probit),
+            link_kind: InverseLink::Standard(StandardLink::Probit),
             thresholdspec: simple_matern_term_collection(&[0, 1], 0.4),
             log_sigmaspec: simple_matern_term_collection(&[0, 1], 0.75),
             threshold_offset: Array1::zeros(n),
@@ -26529,7 +26529,7 @@ mod tests {
         let spec = BinomialLocationScaleTermSpec {
             y: Array1::from_elem(n, 0.0),
             weights: Array1::from_elem(n, 1.0),
-            link_kind: InverseLink::Standard(LinkFunction::Probit),
+            link_kind: InverseLink::Standard(StandardLink::Probit),
             thresholdspec: simple_matern_term_collection(&[0, 1], 0.4),
             log_sigmaspec: simple_matern_term_collection(&[0, 1], 0.75),
             threshold_offset: Array1::zeros(n),
@@ -26596,7 +26596,7 @@ mod tests {
         let spec = BinomialLocationScaleTermSpec {
             y,
             weights,
-            link_kind: InverseLink::Standard(LinkFunction::Probit),
+            link_kind: InverseLink::Standard(StandardLink::Probit),
             thresholdspec: simple_matern_term_collection(&[0, 1], 0.4),
             log_sigmaspec: simple_matern_term_collection(&[0, 1], 0.75),
             threshold_offset: Array1::zeros(n),
@@ -26636,7 +26636,7 @@ mod tests {
         let spec = BinomialLocationScaleWiggleTermSpec {
             y,
             weights,
-            link_kind: InverseLink::Standard(LinkFunction::Probit),
+            link_kind: InverseLink::Standard(StandardLink::Probit),
             thresholdspec: simple_matern_term_collection(&[0, 1], 0.45),
             log_sigmaspec: simple_matern_term_collection(&[0, 1], 0.8),
             threshold_offset: Array1::zeros(n),
@@ -26677,7 +26677,7 @@ mod tests {
         let family = BinomialLocationScaleWiggleFamily {
             y: y.clone(),
             weights: weights.clone(),
-            link_kind: InverseLink::Standard(LinkFunction::Probit),
+            link_kind: InverseLink::Standard(StandardLink::Probit),
             threshold_design: Some(threshold_design),
             log_sigma_design: Some(log_sigma_design),
             wiggle_knots: knots,
@@ -26767,7 +26767,7 @@ mod tests {
         let family = BinomialLocationScaleWiggleFamily {
             y: y.clone(),
             weights: weights.clone(),
-            link_kind: InverseLink::Standard(LinkFunction::Probit),
+            link_kind: InverseLink::Standard(StandardLink::Probit),
             threshold_design: Some(threshold_design.clone()),
             log_sigma_design: Some(log_sigma_design.clone()),
             wiggle_knots: knots,
@@ -26879,7 +26879,7 @@ mod tests {
         let family = BinomialLocationScaleWiggleFamily {
             y: y.clone(),
             weights: weights.clone(),
-            link_kind: InverseLink::Standard(LinkFunction::Logit),
+            link_kind: InverseLink::Standard(StandardLink::Logit),
             threshold_design: Some(threshold_design.clone()),
             log_sigma_design: Some(log_sigma_design.clone()),
             wiggle_knots: knots.clone(),
@@ -27762,7 +27762,7 @@ mod tests {
         let family = BinomialLocationScaleWiggleFamily {
             y: y.clone(),
             weights: weights.clone(),
-            link_kind: InverseLink::Standard(LinkFunction::Probit),
+            link_kind: InverseLink::Standard(StandardLink::Probit),
             threshold_design: Some(threshold_design.clone()),
             log_sigma_design: Some(log_sigma_design.clone()),
             wiggle_knots: knots,
@@ -27860,7 +27860,7 @@ mod tests {
         let family = BinomialLocationScaleWiggleFamily {
             y: y.clone(),
             weights: weights.clone(),
-            link_kind: InverseLink::Standard(LinkFunction::Probit),
+            link_kind: InverseLink::Standard(StandardLink::Probit),
             threshold_design: Some(threshold_design.clone()),
             log_sigma_design: Some(log_sigma_design.clone()),
             wiggle_knots: knots,
@@ -27996,7 +27996,7 @@ mod tests {
         let family = BinomialLocationScaleWiggleFamily {
             y: y.clone(),
             weights: weights.clone(),
-            link_kind: InverseLink::Standard(LinkFunction::Probit),
+            link_kind: InverseLink::Standard(StandardLink::Probit),
             threshold_design: Some(threshold_design.clone()),
             log_sigma_design: Some(log_sigma_design.clone()),
             wiggle_knots: knots,
@@ -28141,7 +28141,7 @@ mod tests {
         let family = BinomialLocationScaleWiggleFamily {
             y: y.clone(),
             weights: weights.clone(),
-            link_kind: InverseLink::Standard(LinkFunction::Probit),
+            link_kind: InverseLink::Standard(StandardLink::Probit),
             threshold_design: Some(threshold_design.clone()),
             log_sigma_design: Some(log_sigma_design.clone()),
             wiggle_knots: knots,
@@ -28258,7 +28258,7 @@ mod tests {
         let family = BinomialLocationScaleWiggleFamily {
             y: y.clone(),
             weights: weights.clone(),
-            link_kind: InverseLink::Standard(LinkFunction::Probit),
+            link_kind: InverseLink::Standard(StandardLink::Probit),
             threshold_design: Some(threshold_design.clone()),
             log_sigma_design: Some(log_sigma_design.clone()),
             wiggle_knots: knots,
@@ -28372,7 +28372,7 @@ mod tests {
         let family = BinomialLocationScaleWiggleFamily {
             y: y.clone(),
             weights: weights.clone(),
-            link_kind: InverseLink::Standard(LinkFunction::Probit),
+            link_kind: InverseLink::Standard(StandardLink::Probit),
             threshold_design: Some(threshold_design.clone()),
             log_sigma_design: Some(log_sigma_design.clone()),
             wiggle_knots: knots,
@@ -28536,7 +28536,7 @@ mod tests {
         let family = BinomialLocationScaleFamily {
             y: y.clone(),
             weights: weights.clone(),
-            link_kind: InverseLink::Standard(LinkFunction::Probit),
+            link_kind: InverseLink::Standard(StandardLink::Probit),
             threshold_design: Some(threshold_design.clone()),
             log_sigma_design: Some(log_sigma_design.clone()),
             policy: crate::resource::ResourcePolicy::default_library(),
@@ -28607,7 +28607,7 @@ mod tests {
         let family = BinomialLocationScaleFamily {
             y: y.clone(),
             weights: weights.clone(),
-            link_kind: InverseLink::Standard(LinkFunction::Probit),
+            link_kind: InverseLink::Standard(StandardLink::Probit),
             threshold_design: Some(threshold_design.clone()),
             log_sigma_design: Some(log_sigma_design.clone()),
             policy: crate::resource::ResourcePolicy::default_library(),
@@ -28681,7 +28681,7 @@ mod tests {
         let family = BinomialLocationScaleFamily {
             y: y.clone(),
             weights: weights.clone(),
-            link_kind: InverseLink::Standard(LinkFunction::Probit),
+            link_kind: InverseLink::Standard(StandardLink::Probit),
             threshold_design: Some(threshold_design.clone()),
             log_sigma_design: Some(log_sigma_design.clone()),
             policy: crate::resource::ResourcePolicy::default_library(),
@@ -28871,7 +28871,7 @@ mod tests {
         let family = BinomialLocationScaleFamily {
             y: y.clone(),
             weights: weights.clone(),
-            link_kind: InverseLink::Standard(LinkFunction::Probit),
+            link_kind: InverseLink::Standard(StandardLink::Probit),
             threshold_design: None,
             log_sigma_design: None,
             policy: crate::resource::ResourcePolicy::default_library(),
@@ -28921,7 +28921,7 @@ mod tests {
         let family = BinomialLocationScaleWiggleFamily {
             y: y.clone(),
             weights: weights.clone(),
-            link_kind: InverseLink::Standard(LinkFunction::Probit),
+            link_kind: InverseLink::Standard(StandardLink::Probit),
             threshold_design: None,
             log_sigma_design: None,
             wiggle_knots: knots,
@@ -29056,7 +29056,7 @@ mod tests {
         let family = BinomialLocationScaleFamily {
             y: base.y,
             weights: base.weights,
-            link_kind: InverseLink::Standard(LinkFunction::Probit),
+            link_kind: InverseLink::Standard(StandardLink::Probit),
             threshold_design: Some(base.threshold_design),
             log_sigma_design: Some(base.log_sigma_design),
             policy: crate::resource::ResourcePolicy::default_library(),
@@ -29145,7 +29145,7 @@ mod tests {
         let family = BinomialMeanWiggleFamily {
             y: array![0.0, 1.0, 0.0, 1.0, 1.0, 0.0],
             weights: array![1.0, 0.8, 1.2, 1.0, 0.7, 1.1],
-            link_kind: InverseLink::Standard(LinkFunction::Logit),
+            link_kind: InverseLink::Standard(StandardLink::Logit),
             wiggle_knots: knots,
             wiggle_degree: degree,
             policy: crate::resource::ResourcePolicy::default_library(),
@@ -29272,7 +29272,7 @@ mod tests {
         let family = BinomialMeanWiggleFamily {
             y: Array1::zeros(n),
             weights: Array1::ones(n),
-            link_kind: InverseLink::Standard(LinkFunction::Logit),
+            link_kind: InverseLink::Standard(StandardLink::Logit),
             wiggle_knots: initialize_monotone_wiggle_knots_from_seed(
                 Array1::linspace(-1.0, 1.0, 9).view(),
                 3,

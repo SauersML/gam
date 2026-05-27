@@ -30,14 +30,14 @@ fn one_penalty(p: usize) -> Vec<BlockwisePenalty> {
 fn gaussian_identity_spec() -> LikelihoodSpec {
     LikelihoodSpec::new(
         ResponseFamily::Gaussian,
-        InverseLink::Standard(LinkFunction::Identity),
+        InverseLink::Standard(StandardLink::Identity),
     )
 }
 
 fn binomial_logit_spec() -> LikelihoodSpec {
     LikelihoodSpec::new(
         ResponseFamily::Binomial,
-        InverseLink::Standard(LinkFunction::Logit),
+        InverseLink::Standard(StandardLink::Logit),
     )
 }
 

@@ -14,7 +14,7 @@ fn fitted_family_all_variants_round_trip_to_identical_json_bytes() {
         FittedFamily::Standard {
             likelihood: LikelihoodSpec::new(
                 ResponseFamily::Binomial,
-                InverseLink::Standard(LinkFunction::Logit),
+                InverseLink::Standard(StandardLink::Logit),
             ),
             link: Some(LinkFunction::Logit),
             latent_cloglog_state: Some(LatentCLogLogState { latent_sd: 1.25 }),
@@ -31,11 +31,11 @@ fn fitted_family_all_variants_round_trip_to_identical_json_bytes() {
         },
         FittedFamily::LocationScale {
             likelihood: LikelihoodSpec::gaussian_identity(),
-            base_link: Some(InverseLink::Standard(LinkFunction::Identity)),
+            base_link: Some(InverseLink::Standard(StandardLink::Identity)),
         },
         FittedFamily::MarginalSlope {
             likelihood: LikelihoodSpec::binomial_probit(),
-            base_link: Some(InverseLink::Standard(LinkFunction::Probit)),
+            base_link: Some(InverseLink::Standard(StandardLink::Probit)),
             frailty: FrailtySpec::None,
         },
         FittedFamily::Survival {
@@ -196,11 +196,11 @@ fn from_payload_model_kind_maps_to_expected_fitted_model_variant() {
             },
             ModelKind::LocationScale => FittedFamily::LocationScale {
                 likelihood: LikelihoodSpec::gaussian_identity(),
-                base_link: Some(InverseLink::Standard(LinkFunction::Identity)),
+                base_link: Some(InverseLink::Standard(StandardLink::Identity)),
             },
             ModelKind::MarginalSlope => FittedFamily::MarginalSlope {
                 likelihood: LikelihoodSpec::binomial_probit(),
-                base_link: Some(InverseLink::Standard(LinkFunction::Probit)),
+                base_link: Some(InverseLink::Standard(StandardLink::Probit)),
                 frailty: FrailtySpec::None,
             },
             ModelKind::Survival => FittedFamily::Survival {

@@ -123,7 +123,7 @@ fn build_problem(n: usize, flex: bool) -> (Array2<f64>, BernoulliMarginalSlopeTe
         y,
         weights,
         z,
-        base_link: InverseLink::Standard(LinkFunction::Probit),
+        base_link: InverseLink::Standard(StandardLink::Probit),
         marginalspec,
         logslopespec,
         marginal_offset,

@@ -107,7 +107,7 @@ fn probitworkingvectors_are_finite_for_extreme_eta() {
         &eta,
         &GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
             ResponseFamily::Binomial,
-            InverseLink::Standard(LinkFunction::Probit),
+            InverseLink::Standard(StandardLink::Probit),
         )),
         w.view(),
         &mut mu,
@@ -305,7 +305,7 @@ fn cloglogworkingvectors_are_finite_for_extreme_eta() {
         &eta,
         &GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
             ResponseFamily::Binomial,
-            InverseLink::Standard(LinkFunction::CLogLog),
+            InverseLink::Standard(StandardLink::CLogLog),
         )),
         w.view(),
         &mut mu,

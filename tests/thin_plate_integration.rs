@@ -49,7 +49,7 @@ fn thin_plate_fit_gam_gaussian_fast_integration() {
         &s_list,
         LikelihoodSpec::new(
             ResponseFamily::Gaussian,
-            InverseLink::Standard(LinkFunction::Identity),
+            InverseLink::Standard(StandardLink::Identity),
         ),
         &FitOptions {
             latent_cloglog: None,
@@ -136,7 +136,7 @@ fn thin_plate_fit_gam_gaussian_simulated_train_test() {
         &s_list,
         LikelihoodSpec::new(
             ResponseFamily::Gaussian,
-            InverseLink::Standard(LinkFunction::Identity),
+            InverseLink::Standard(StandardLink::Identity),
         ),
         &FitOptions {
             latent_cloglog: None,
@@ -301,7 +301,7 @@ fn thin_plate_fit_gam_gaussian_3d_simulated_train_test() {
         &s_list,
         LikelihoodSpec::new(
             ResponseFamily::Gaussian,
-            InverseLink::Standard(LinkFunction::Identity),
+            InverseLink::Standard(StandardLink::Identity),
         ),
         &FitOptions {
             latent_cloglog: None,

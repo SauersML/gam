@@ -1335,7 +1335,7 @@ fn reml_is_gaussian_identity(likelihood: &GlmLikelihoodSpec) -> bool {
 fn reml_supports_firth(likelihood: &GlmLikelihoodSpec) -> bool {
     let spec = reml_spec(likelihood);
     matches!(spec.response, ResponseFamily::Binomial)
-        && matches!(spec.link, InverseLink::Standard(LinkFunction::Logit))
+        && matches!(spec.link, InverseLink::Standard(StandardLink::Logit))
 }
 
 #[inline]
@@ -3750,7 +3750,7 @@ impl<'a> RemlState<'a> {
         let canonical_logit = {
             let spec = reml_spec(&pirls_result.likelihood);
             matches!(spec.response, ResponseFamily::Binomial)
-                && matches!(spec.link, InverseLink::Standard(LinkFunction::Logit))
+                && matches!(spec.link, InverseLink::Standard(StandardLink::Logit))
         } && self.runtime_mixture_link_state.is_none();
 
         if canonical_logit {
@@ -3862,7 +3862,7 @@ impl<'a> RemlState<'a> {
         let canonical_logit = {
             let spec = reml_spec(&pirls_result.likelihood);
             matches!(spec.response, ResponseFamily::Binomial)
-                && matches!(spec.link, InverseLink::Standard(LinkFunction::Logit))
+                && matches!(spec.link, InverseLink::Standard(StandardLink::Logit))
         } && self.runtime_mixture_link_state.is_none();
         if !canonical_logit {
             return Err(EstimationError::InvalidInput(
@@ -5787,7 +5787,7 @@ impl<'a> RemlState<'a> {
         let family_ok = matches!(spec.response, ResponseFamily::Gaussian);
         let link_ok = matches!(
             self.config.link_kind,
-            crate::types::InverseLink::Standard(LinkFunction::Identity)
+            crate::types::InverseLink::Standard(StandardLink::Identity)
         );
         if !family_ok
             || !link_ok
@@ -9930,7 +9930,7 @@ mod tk_math_tests {
         assert!(file!().ends_with(".rs"));
         let etas = [-1.4_f64, -0.4, 0.0, 0.6, 1.3];
         let ys = [0.0_f64, 1.0];
-        let probit = InverseLink::Standard(LinkFunction::Probit);
+        let probit = InverseLink::Standard(StandardLink::Probit);
         for &eta in &etas {
             let jet = inverse_link_jet_for_inverse_link(&probit, eta).expect("probit jet");
             let h4 =
@@ -9954,7 +9954,7 @@ mod tk_math_tests {
         assert!(file!().ends_with(".rs"));
         let etas = [-1.6_f64, -0.5, 0.0, 0.4, 1.2];
         let ys = [0.0_f64, 1.0];
-        let cloglog = InverseLink::Standard(LinkFunction::CLogLog);
+        let cloglog = InverseLink::Standard(StandardLink::CLogLog);
         for &eta in &etas {
             let jet = inverse_link_jet_for_inverse_link(&cloglog, eta).expect("cloglog jet");
             let h4 = inverse_link_pdfthird_derivative_for_inverse_link(&cloglog, eta)
@@ -9981,7 +9981,7 @@ mod tk_math_tests {
     fn e_obs_from_jets_matches_dual3_ad_logit_bernoulli_canonical_consistency() {
         let etas = [-1.7_f64, -0.6, 0.0, 0.5, 1.4];
         let ys = [0.0_f64, 1.0];
-        let logit = InverseLink::Standard(LinkFunction::Logit);
+        let logit = InverseLink::Standard(StandardLink::Logit);
         for &eta in &etas {
             let jet = inverse_link_jet_for_inverse_link(&logit, eta).expect("logit jet");
             let h4 =

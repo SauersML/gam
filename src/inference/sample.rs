@@ -586,13 +586,13 @@ fn sample_standard_link_wiggle(
     };
 
     let nuts_family = match (&likelihood.response, &likelihood.link) {
-        (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Logit)) => {
+        (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::Logit)) => {
             NutsFamily::BinomialLogit
         }
-        (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Probit)) => {
+        (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::Probit)) => {
             NutsFamily::BinomialProbit
         }
-        (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::CLogLog)) => {
+        (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::CLogLog)) => {
             NutsFamily::BinomialCLogLog
         }
         (ResponseFamily::Gaussian, _) => NutsFamily::Gaussian,

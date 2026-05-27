@@ -1501,7 +1501,7 @@ fn require_probit_marginal_slope_link(
     base_link: &InverseLink,
     context: &str,
 ) -> Result<(), String> {
-    if matches!(base_link, InverseLink::Standard(LinkFunction::Probit)) {
+    if matches!(base_link, InverseLink::Standard(StandardLink::Probit)) {
         Ok(())
     } else {
         Err(format!(
@@ -19889,7 +19889,7 @@ mod tests {
 
     #[inline]
     fn bernoulli_marginal_slope_probit_link() -> InverseLink {
-        InverseLink::Standard(LinkFunction::Probit)
+        InverseLink::Standard(StandardLink::Probit)
     }
 
     /// Test-only default fields for `BernoulliMarginalSlopeFamily`. Returns a
@@ -21427,7 +21427,7 @@ mod tests {
             y,
             weights,
             z,
-            base_link: InverseLink::Standard(LinkFunction::Logit),
+            base_link: InverseLink::Standard(StandardLink::Logit),
             marginalspec: empty_termspec(),
             logslopespec: empty_termspec(),
             marginal_offset: Array1::zeros(2),
@@ -21441,7 +21441,7 @@ mod tests {
             .expect_err("non-probit marginal-slope link should be rejected");
         assert!(err.contains("requires link(type=probit)"));
         let err = bernoulli_marginal_slope_eta_from_probability(
-            &InverseLink::Standard(LinkFunction::Logit),
+            &InverseLink::Standard(StandardLink::Logit),
             0.5,
             "test logit inverse",
         )

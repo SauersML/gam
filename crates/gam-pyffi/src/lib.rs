@@ -4857,7 +4857,7 @@ fn gaussian_reml_fit_blocks_forward<'py>(
             heuristic_slice,
             LikelihoodSpec::new(
                 ResponseFamily::Gaussian,
-                InverseLink::Standard(LinkFunction::Identity),
+                InverseLink::Standard(StandardLink::Identity),
             ),
             &opts,
         )
@@ -5882,7 +5882,7 @@ fn gaussian_reml_fit_with_constraints_forward<'py>(
                 heuristic_slice,
                 LikelihoodSpec::new(
                     ResponseFamily::Gaussian,
-                    InverseLink::Standard(LinkFunction::Identity),
+                    InverseLink::Standard(StandardLink::Identity),
                 ),
                 &opts,
             )
@@ -11107,23 +11107,23 @@ fn latent_glm_family_from_str(
     match value.to_ascii_lowercase().replace('_', "-").as_str() {
         "gaussian" | "gaussian-identity" => Ok(LikelihoodSpec::new(
             ResponseFamily::Gaussian,
-            InverseLink::Standard(LinkFunction::Identity),
+            InverseLink::Standard(StandardLink::Identity),
         )),
         "binomial" | "binomial-logit" | "logistic" => Ok(LikelihoodSpec::new(
             ResponseFamily::Binomial,
-            InverseLink::Standard(LinkFunction::Logit),
+            InverseLink::Standard(StandardLink::Logit),
         )),
         "binomial-probit" | "probit" => Ok(LikelihoodSpec::new(
             ResponseFamily::Binomial,
-            InverseLink::Standard(LinkFunction::Probit),
+            InverseLink::Standard(StandardLink::Probit),
         )),
         "binomial-cloglog" | "cloglog" => Ok(LikelihoodSpec::new(
             ResponseFamily::Binomial,
-            InverseLink::Standard(LinkFunction::CLogLog),
+            InverseLink::Standard(StandardLink::CLogLog),
         )),
         "poisson" | "poisson-log" => Ok(LikelihoodSpec::new(
             ResponseFamily::Poisson,
-            InverseLink::Standard(LinkFunction::Log),
+            InverseLink::Standard(StandardLink::Log),
         )),
         "tweedie" | "tweedie-log" => {
             if !tweedie_p.is_finite() {
@@ -11131,7 +11131,7 @@ fn latent_glm_family_from_str(
             }
             Ok(LikelihoodSpec::new(
                 ResponseFamily::Tweedie { p: tweedie_p },
-                InverseLink::Standard(LinkFunction::Log),
+                InverseLink::Standard(StandardLink::Log),
             ))
         }
         "negbin" | "negbin-log" | "negative-binomial" | "negative-binomial-log" => {
@@ -11144,7 +11144,7 @@ fn latent_glm_family_from_str(
                 ResponseFamily::NegativeBinomial {
                     theta: negbin_theta,
                 },
-                InverseLink::Standard(LinkFunction::Log),
+                InverseLink::Standard(StandardLink::Log),
             ))
         }
         "beta" | "beta-logit" | "beta-regression" | "beta-regression-logit" => {
@@ -11153,12 +11153,12 @@ fn latent_glm_family_from_str(
             }
             Ok(LikelihoodSpec::new(
                 ResponseFamily::Beta { phi: beta_phi },
-                InverseLink::Standard(LinkFunction::Logit),
+                InverseLink::Standard(StandardLink::Logit),
             ))
         }
         "gamma" | "gamma-log" => Ok(LikelihoodSpec::new(
             ResponseFamily::Gamma,
-            InverseLink::Standard(LinkFunction::Log),
+            InverseLink::Standard(StandardLink::Log),
         )),
         other => Err(format!(
             "unsupported latent GLM family {other:?}; supported families are gaussian-identity, binomial-logit, binomial-probit, binomial-cloglog, poisson-log, tweedie-log, negbin-log, beta-regression-logit, gamma-log"
@@ -23181,7 +23181,7 @@ fn model_likelihood_spec(model: &FittedModel) -> LikelihoodSpec {
         gam::inference::model::FittedFamily::LatentSurvival { .. }
         | gam::inference::model::FittedFamily::LatentBinary { .. } => LikelihoodSpec::new(
             ResponseFamily::RoystonParmar,
-            InverseLink::Standard(LinkFunction::Identity),
+            InverseLink::Standard(StandardLink::Identity),
         ),
     }
 }
@@ -28228,7 +28228,7 @@ fn build_transformation_normal_ffi_payload(
         FittedFamily::TransformationNormal {
             likelihood: LikelihoodSpec::new(
                 ResponseFamily::Gaussian,
-                InverseLink::Standard(LinkFunction::Identity),
+                InverseLink::Standard(StandardLink::Identity),
             ),
         },
         "transformation-normal".to_string(),
@@ -28428,7 +28428,7 @@ fn build_survival_marginal_slope_ffi_payload(
         FittedFamily::Survival {
             likelihood: LikelihoodSpec::new(
                 ResponseFamily::RoystonParmar,
-                InverseLink::Standard(LinkFunction::Identity),
+                InverseLink::Standard(StandardLink::Identity),
             ),
             survival_likelihood: Some("marginal-slope".to_string()),
             survival_distribution: Some(ResidualDistribution::Gaussian),
@@ -28456,7 +28456,7 @@ fn build_survival_marginal_slope_ffi_payload(
     payload.survivalridge_lambda = Some(fit_config.ridge_lambda);
     payload.survival_likelihood = Some(survival_likelihood_modename(likelihood_mode).to_string());
     payload.survival_distribution = Some(ResidualDistribution::Gaussian);
-    payload.link = Some(InverseLink::Standard(LinkFunction::Probit));
+    payload.link = Some(InverseLink::Standard(StandardLink::Probit));
     payload.training_headers = Some(dataset.headers.clone());
     payload.resolved_termspec = Some(frozen_marginal);
     payload.resolved_termspec_logslope = Some(frozen_logslope);
@@ -28505,7 +28505,7 @@ fn build_survival_transformation_ffi_payload(
         FittedFamily::Survival {
             likelihood: LikelihoodSpec::new(
                 ResponseFamily::RoystonParmar,
-                InverseLink::Standard(LinkFunction::Identity),
+                InverseLink::Standard(StandardLink::Identity),
             ),
             survival_likelihood: Some(likelihood_label.clone()),
             survival_distribution: None,
@@ -28627,7 +28627,7 @@ fn build_gaussian_location_scale_ffi_payload(
         FittedFamily::LocationScale {
             likelihood: LikelihoodSpec::new(
                 ResponseFamily::Gaussian,
-                InverseLink::Standard(LinkFunction::Identity),
+                InverseLink::Standard(StandardLink::Identity),
             ),
             base_link: None,
         },
@@ -28636,7 +28636,7 @@ fn build_gaussian_location_scale_ffi_payload(
     payload.unified = Some(fit.clone());
     payload.fit_result = Some(fit);
     payload.data_schema = Some(dataset.schema.clone());
-    payload.link = Some(InverseLink::Standard(LinkFunction::Identity));
+    payload.link = Some(InverseLink::Standard(StandardLink::Identity));
     payload.formula_noise = Some(noise_formula);
     payload.beta_noise = scale_beta;
     payload.gaussian_response_scale = Some(response_scale);
@@ -28903,7 +28903,7 @@ fn build_survival_location_scale_ffi_payload(
         FittedFamily::Survival {
             likelihood: LikelihoodSpec::new(
                 ResponseFamily::RoystonParmar,
-                InverseLink::Standard(LinkFunction::Identity),
+                InverseLink::Standard(StandardLink::Identity),
             ),
             survival_likelihood: Some(survival_likelihood_modename(likelihood_mode).to_string()),
             survival_distribution: residual_distribution_from_inverse_link(&fitted_inverse_link),
@@ -29462,7 +29462,7 @@ mod tests {
             FittedFamily::Standard {
                 likelihood: LikelihoodSpec::new(
                     ResponseFamily::Gaussian,
-                    InverseLink::Standard(LinkFunction::Identity),
+                    InverseLink::Standard(StandardLink::Identity),
                 ),
                 link: Some(LinkFunction::Identity),
                 latent_cloglog_state: None,
@@ -29764,7 +29764,7 @@ mod tests {
             Some(heuristic_lambdas.as_slice()),
             LikelihoodSpec::new(
                 ResponseFamily::Gaussian,
-                InverseLink::Standard(LinkFunction::Identity),
+                InverseLink::Standard(StandardLink::Identity),
             ),
             &opts,
         )?;

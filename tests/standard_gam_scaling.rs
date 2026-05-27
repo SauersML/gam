@@ -138,7 +138,7 @@ fn run_fit_with_k(n: usize, k: usize) -> (f64, usize, usize, bool) {
         &s_list,
         LikelihoodSpec::new(
             ResponseFamily::Binomial,
-            InverseLink::Standard(LinkFunction::Logit),
+            InverseLink::Standard(StandardLink::Logit),
         ),
         &FitOptions {
             latent_cloglog: None,

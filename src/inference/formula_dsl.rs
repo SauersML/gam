@@ -1150,11 +1150,11 @@ pub fn require_likelihood_spec_supports_joint_wiggle(
 pub const fn inverse_link_supports_joint_wiggle(link: &InverseLink) -> bool {
     matches!(
         link,
-        InverseLink::Standard(LinkFunction::Identity)
-            | InverseLink::Standard(LinkFunction::Log)
-            | InverseLink::Standard(LinkFunction::Logit)
-            | InverseLink::Standard(LinkFunction::Probit)
-            | InverseLink::Standard(LinkFunction::CLogLog)
+        InverseLink::Standard(StandardLink::Identity)
+            | InverseLink::Standard(StandardLink::Log)
+            | InverseLink::Standard(StandardLink::Logit)
+            | InverseLink::Standard(StandardLink::Probit)
+            | InverseLink::Standard(StandardLink::CLogLog)
     )
 }
 
@@ -1172,9 +1172,9 @@ pub fn require_inverse_link_supports_joint_wiggle(
 pub const fn binomial_inverse_link_supports_joint_wiggle(link: &InverseLink) -> bool {
     matches!(
         link,
-        InverseLink::Standard(LinkFunction::Logit)
-            | InverseLink::Standard(LinkFunction::Probit)
-            | InverseLink::Standard(LinkFunction::CLogLog)
+        InverseLink::Standard(StandardLink::Logit)
+            | InverseLink::Standard(StandardLink::Probit)
+            | InverseLink::Standard(StandardLink::CLogLog)
     )
 }
 

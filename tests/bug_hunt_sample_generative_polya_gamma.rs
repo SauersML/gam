@@ -77,7 +77,7 @@ fn bug_generativespec_from_predict_roundtrip_recovers_response_distribution() {
     };
     let like = LikelihoodSpec::new(
         ResponseFamily::Gaussian,
-        InverseLink::Standard(LinkFunction::Identity),
+        InverseLink::Standard(StandardLink::Identity),
     );
     let spec =
         generativespec_from_predict(pred, like, Some(0.5)).expect("spec generation should succeed");

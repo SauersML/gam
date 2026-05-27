@@ -63,7 +63,7 @@ fn make_problem(
 fn binomial_logit_likelihood() -> LikelihoodSpec {
     LikelihoodSpec::new(
         ResponseFamily::Binomial,
-        InverseLink::Standard(LinkFunction::Logit),
+        InverseLink::Standard(StandardLink::Logit),
     )
 }
 
@@ -79,9 +79,9 @@ fn fit_beta_norm(
     let cfg = PirlsConfig {
         likelihood: GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
             ResponseFamily::Binomial,
-            InverseLink::Standard(LinkFunction::Logit),
+            InverseLink::Standard(StandardLink::Logit),
         )),
-        link_kind: InverseLink::Standard(LinkFunction::Logit),
+        link_kind: InverseLink::Standard(StandardLink::Logit),
         max_iterations: 500,
         convergence_tolerance: 1e-10,
         firth_bias_reduction: firth,
@@ -131,9 +131,9 @@ fn proxycostwith_pirls(
     let cfg = PirlsConfig {
         likelihood: GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
             ResponseFamily::Binomial,
-            InverseLink::Standard(LinkFunction::Logit),
+            InverseLink::Standard(StandardLink::Logit),
         )),
-        link_kind: InverseLink::Standard(LinkFunction::Logit),
+        link_kind: InverseLink::Standard(StandardLink::Logit),
         max_iterations: 500,
         convergence_tolerance: 1e-10,
         firth_bias_reduction: firth,

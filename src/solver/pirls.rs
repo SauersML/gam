@@ -761,7 +761,7 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
                 update_glmvectors(
                     y,
                     eta,
-                    &InverseLink::Standard(LinkFunction::Identity),
+                    &InverseLink::Standard(StandardLink::Identity),
                     priorweights,
                     mu,
                     weights,
@@ -7527,7 +7527,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         config.firth_bias_reduction
             && matches!(
                 &config.link_kind,
-                InverseLink::Standard(LinkFunction::Logit)
+                InverseLink::Standard(StandardLink::Logit)
             ),
         transform_active.clone(),
         quadctx,
@@ -9305,9 +9305,9 @@ fn integrated_inverse_link_from_family(
     sas_link_state: Option<&SasLinkState>,
 ) -> Result<InverseLink, EstimationError> {
     match (&spec.response, &spec.link) {
-        (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Logit))
-        | (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Probit))
-        | (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::CLogLog)) => {
+        (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::Logit))
+        | (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::Probit))
+        | (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::CLogLog)) => {
             Ok(InverseLink::Standard(spec.link_function()))
         }
         (ResponseFamily::Binomial, InverseLink::Sas(_)) => {
@@ -9414,9 +9414,9 @@ pub fn update_glmvectors_integrated_for_link(
     let link = inverse_link.link_function();
     if !matches!(
         inverse_link,
-        InverseLink::Standard(LinkFunction::Logit)
-            | InverseLink::Standard(LinkFunction::Probit)
-            | InverseLink::Standard(LinkFunction::CLogLog)
+        InverseLink::Standard(StandardLink::Logit)
+            | InverseLink::Standard(StandardLink::Probit)
+            | InverseLink::Standard(StandardLink::CLogLog)
             | InverseLink::LatentCLogLog(_)
             | InverseLink::Sas(_)
             | InverseLink::BetaLogistic(_)
@@ -9463,7 +9463,7 @@ pub fn update_glmvectors_integrated_for_link(
                             eta[i],
                             se[i].hypot(state.latent_sd),
                         )?
-                    } else if matches!(inverse_link, InverseLink::Standard(LinkFunction::Logit)) {
+                    } else if matches!(inverse_link, InverseLink::Standard(StandardLink::Logit)) {
                         crate::quadrature::integrated_logit_inverse_link_jet_pirls(
                             quadctx, eta[i], se[i],
                         )?
@@ -9517,7 +9517,7 @@ pub fn update_glmvectors_integrated_for_link(
                         eta[i],
                         se[i].hypot(state.latent_sd),
                     )?
-                } else if matches!(inverse_link, InverseLink::Standard(LinkFunction::Logit)) {
+                } else if matches!(inverse_link, InverseLink::Standard(StandardLink::Logit)) {
                     crate::quadrature::integrated_logit_inverse_link_jet_pirls(
                         quadctx, eta[i], se[i],
                     )?
@@ -10207,13 +10207,11 @@ pub fn weight_family_for_glm_likelihood(likelihood: &GlmLikelihoodSpec) -> Weigh
 #[inline]
 fn weight_link_for_inverse_link(inverse_link: &InverseLink) -> WeightLink {
     match inverse_link {
-        InverseLink::Standard(LinkFunction::Identity) => WeightLink::Identity,
-        InverseLink::Standard(LinkFunction::Log) => WeightLink::Log,
-        InverseLink::Standard(LinkFunction::Logit) => WeightLink::Logit,
-        InverseLink::Standard(LinkFunction::Probit)
-        | InverseLink::Standard(LinkFunction::CLogLog)
-        | InverseLink::Standard(LinkFunction::Sas)
-        | InverseLink::Standard(LinkFunction::BetaLogistic)
+        InverseLink::Standard(StandardLink::Identity) => WeightLink::Identity,
+        InverseLink::Standard(StandardLink::Log) => WeightLink::Log,
+        InverseLink::Standard(StandardLink::Logit) => WeightLink::Logit,
+        InverseLink::Standard(StandardLink::Probit)
+        | InverseLink::Standard(StandardLink::CLogLog)
         | InverseLink::LatentCLogLog(_)
         | InverseLink::Sas(_)
         | InverseLink::BetaLogistic(_)
@@ -10228,7 +10226,7 @@ fn supports_observed_hessian_curvature_for_likelihood(
 ) -> bool {
     let spec = &likelihood.spec;
     if matches!(spec.response, ResponseFamily::NegativeBinomial { .. }) {
-        return matches!(inverse_link, InverseLink::Standard(LinkFunction::Log));
+        return matches!(inverse_link, InverseLink::Standard(StandardLink::Log));
     }
     if matches!(spec.response, ResponseFamily::Gamma) {
         return true;
@@ -10238,8 +10236,8 @@ fn supports_observed_hessian_curvature_for_likelihood(
     }
     matches!(
         spec.link,
-        InverseLink::Standard(LinkFunction::Probit)
-            | InverseLink::Standard(LinkFunction::CLogLog)
+        InverseLink::Standard(StandardLink::Probit)
+            | InverseLink::Standard(StandardLink::CLogLog)
             | InverseLink::Sas(_)
             | InverseLink::BetaLogistic(_)
             | InverseLink::Mixture(_)
@@ -10250,19 +10248,18 @@ fn supports_observed_hessian_curvature_for_likelihood(
 fn eta_for_observed_hessian_jet(inverse_link: &InverseLink, eta: f64) -> f64 {
     match inverse_link {
         // Why: canonical links keep V(mu) representable across the full f64 eta range; only guard against inf.
-        InverseLink::Standard(LinkFunction::Logit | LinkFunction::Log) => eta.clamp(-700.0, 700.0),
-        InverseLink::Standard(LinkFunction::Identity) => eta,
+        InverseLink::Standard(StandardLink::Logit | StandardLink::Log) => eta.clamp(-700.0, 700.0),
+        InverseLink::Standard(StandardLink::Identity) => eta,
         // Why: probit mu=Phi(eta) saturates to 1.0 in f64 by |eta|~8.3; +/-6 keeps V=mu(1-mu) ~ 1e-9 representable.
-        InverseLink::Standard(LinkFunction::Probit) => eta.clamp(-6.0, 6.0),
+        InverseLink::Standard(StandardLink::Probit) => eta.clamp(-6.0, 6.0),
         // Why: cloglog has mu~exp(eta) for eta<<0 (underflows below ~-23) and 1-mu~exp(-exp(eta)) collapses by eta=3.
-        InverseLink::Standard(LinkFunction::CLogLog) | InverseLink::LatentCLogLog(_) => {
+        InverseLink::Standard(StandardLink::CLogLog) | InverseLink::LatentCLogLog(_) => {
             eta.clamp(-23.0, 3.0)
         }
         // Why: SAS / beta-logistic / mixture compose logistic-like sigmoids that saturate by |eta|~20 (logistic(20)~1-2e-9).
-        InverseLink::Standard(LinkFunction::Sas | LinkFunction::BetaLogistic)
-        | InverseLink::Sas(_)
-        | InverseLink::BetaLogistic(_)
-        | InverseLink::Mixture(_) => eta.clamp(-20.0, 20.0),
+        InverseLink::Sas(_) | InverseLink::BetaLogistic(_) | InverseLink::Mixture(_) => {
+            eta.clamp(-20.0, 20.0)
+        }
     }
 }
 
@@ -12142,9 +12139,9 @@ mod tests {
         let config = PirlsConfig {
             likelihood: GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
                 ResponseFamily::Gaussian,
-                InverseLink::Standard(LinkFunction::Identity),
+                InverseLink::Standard(StandardLink::Identity),
             )),
-            link_kind: InverseLink::Standard(LinkFunction::Identity),
+            link_kind: InverseLink::Standard(StandardLink::Identity),
             max_iterations: 20,
             convergence_tolerance: 1e-12,
             firth_bias_reduction: false,
@@ -12361,9 +12358,9 @@ mod tests {
         let config = PirlsConfig {
             likelihood: GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
                 ResponseFamily::Binomial,
-                InverseLink::Standard(LinkFunction::Logit),
+                InverseLink::Standard(StandardLink::Logit),
             )),
-            link_kind: InverseLink::Standard(LinkFunction::Logit),
+            link_kind: InverseLink::Standard(StandardLink::Logit),
             max_iterations: 100,
             convergence_tolerance: 1e-8,
             firth_bias_reduction: false,
@@ -12456,7 +12453,7 @@ mod tests {
         let y = array![1.0];
         let eta = array![50.0];
         let priorweights = array![1.0];
-        let inverse_link = InverseLink::Standard(LinkFunction::Logit);
+        let inverse_link = InverseLink::Standard(StandardLink::Logit);
         let mut mu = Array1::zeros(1);
         let mut weights = Array1::zeros(1);
         let mut z = Array1::zeros(1);
@@ -12558,7 +12555,7 @@ mod tests {
             &mu,
             &GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
                 ResponseFamily::Gamma,
-                InverseLink::Standard(LinkFunction::Log),
+                InverseLink::Standard(StandardLink::Log),
             )),
             w.view(),
         );
@@ -12580,9 +12577,9 @@ mod tests {
         let (w_obs, c_obs, d_obs) = compute_observed_hessian_curvature_arrays(
             &GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
                 ResponseFamily::Gamma,
-                InverseLink::Standard(LinkFunction::Log),
+                InverseLink::Standard(StandardLink::Log),
             )),
-            &InverseLink::Standard(LinkFunction::Log),
+            &InverseLink::Standard(StandardLink::Log),
             &eta,
             y.view(),
             &fisher,
@@ -12614,7 +12611,7 @@ mod tests {
 
         let (w_obs, c_obs, d_obs) = compute_observed_hessian_curvature_arrays(
             &GlmLikelihoodSpec::canonical(LikelihoodSpec::negative_binomial_log(theta)),
-            &InverseLink::Standard(LinkFunction::Log),
+            &InverseLink::Standard(StandardLink::Log),
             &eta,
             y.view(),
             &fisher,
@@ -12662,9 +12659,9 @@ mod tests {
         let config = PirlsConfig {
             likelihood: GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
                 ResponseFamily::Gamma,
-                InverseLink::Standard(LinkFunction::Log),
+                InverseLink::Standard(StandardLink::Log),
             )),
-            link_kind: InverseLink::Standard(LinkFunction::Log),
+            link_kind: InverseLink::Standard(StandardLink::Log),
             max_iterations: 100,
             convergence_tolerance: 1e-8,
             firth_bias_reduction: false,
@@ -12741,9 +12738,9 @@ mod tests {
         let config = PirlsConfig {
             likelihood: GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
                 ResponseFamily::Poisson,
-                InverseLink::Standard(LinkFunction::Log),
+                InverseLink::Standard(StandardLink::Log),
             )),
-            link_kind: InverseLink::Standard(LinkFunction::Log),
+            link_kind: InverseLink::Standard(StandardLink::Log),
             max_iterations: 100,
             convergence_tolerance: 1e-8,
             firth_bias_reduction: false,
@@ -12784,7 +12781,7 @@ mod tests {
                 y.view(),
                 w.view(),
                 offset.view(),
-                &InverseLink::Standard(LinkFunction::Log),
+                &InverseLink::Standard(StandardLink::Log),
             )
             .expect("rehydration should succeed");
 
@@ -13970,9 +13967,9 @@ mod root_cause_tests {
         let config = PirlsConfig {
             likelihood: GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
                 ResponseFamily::Gaussian,
-                InverseLink::Standard(LinkFunction::Identity),
+                InverseLink::Standard(StandardLink::Identity),
             )),
-            link_kind: InverseLink::Standard(LinkFunction::Identity),
+            link_kind: InverseLink::Standard(StandardLink::Identity),
             max_iterations: 100,
             convergence_tolerance: 1e-8,
             firth_bias_reduction: false,
@@ -14056,9 +14053,9 @@ mod root_cause_tests {
         let config = PirlsConfig {
             likelihood: GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
                 ResponseFamily::Binomial,
-                InverseLink::Standard(LinkFunction::Logit),
+                InverseLink::Standard(StandardLink::Logit),
             )),
-            link_kind: InverseLink::Standard(LinkFunction::Logit),
+            link_kind: InverseLink::Standard(StandardLink::Logit),
             max_iterations: 100,
             convergence_tolerance: 1e-8,
             firth_bias_reduction: false,
@@ -14161,9 +14158,9 @@ mod root_cause_tests {
             let config = PirlsConfig {
                 likelihood: GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
                     ResponseFamily::Binomial,
-                    InverseLink::Standard(LinkFunction::Logit),
+                    InverseLink::Standard(StandardLink::Logit),
                 )),
-                link_kind: InverseLink::Standard(LinkFunction::Logit),
+                link_kind: InverseLink::Standard(StandardLink::Logit),
                 max_iterations: 100,
                 convergence_tolerance: 1e-8,
                 firth_bias_reduction: false,

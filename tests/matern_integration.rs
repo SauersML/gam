@@ -84,7 +84,7 @@ fn matern_fit_term_collection_gaussian_simulated_10d() {
         &spec,
         LikelihoodSpec::new(
             ResponseFamily::Gaussian,
-            InverseLink::Standard(LinkFunction::Identity),
+            InverseLink::Standard(StandardLink::Identity),
         ),
         &FitOptions {
             latent_cloglog: None,
@@ -181,7 +181,7 @@ fn matern_fit_term_collection_gaussian_simulated_10dwith_exact_adaptive_regulari
         &spec,
         LikelihoodSpec::new(
             ResponseFamily::Gaussian,
-            InverseLink::Standard(LinkFunction::Identity),
+            InverseLink::Standard(StandardLink::Identity),
         ),
         &FitOptions {
             latent_cloglog: None,
@@ -335,7 +335,7 @@ fn matern_3d_aniso_fits_successfully() {
             &spec,
             LikelihoodSpec::new(
                 ResponseFamily::Gaussian,
-                InverseLink::Standard(LinkFunction::Identity),
+                InverseLink::Standard(StandardLink::Identity),
             ),
             &FitOptions {
                 latent_cloglog: None,

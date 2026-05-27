@@ -16,7 +16,7 @@ fn opts(nullspace_dims: Vec<usize>) -> ExternalOptimOptions {
         optimize_sas: false,
         family: LikelihoodSpec::new(
             ResponseFamily::Gaussian,
-            InverseLink::Standard(LinkFunction::Identity),
+            InverseLink::Standard(StandardLink::Identity),
         ),
         compute_inference: true,
         max_iter: 500,

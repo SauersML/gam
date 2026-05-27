@@ -6416,7 +6416,7 @@ mod tests {
         let predictor = SurvivalPredictor {
             beta_threshold: array![0.5],
             beta_log_sigma: array![0.0],
-            inverse_link: InverseLink::Standard(LinkFunction::Probit),
+            inverse_link: InverseLink::Standard(StandardLink::Probit),
             covariance: Some(array![[9.0, 0.0], [0.0, 16.0]]),
         };
         let input = PredictInput {
@@ -6440,7 +6440,7 @@ mod tests {
         let predictor = SurvivalPredictor {
             beta_threshold: array![-1.0],
             beta_log_sigma: array![0.0],
-            inverse_link: InverseLink::Standard(LinkFunction::CLogLog),
+            inverse_link: InverseLink::Standard(StandardLink::CLogLog),
             covariance: Some(array![[4.0, 0.0], [0.0, 0.0]]),
         };
         let input = PredictInput {
@@ -6470,7 +6470,7 @@ mod tests {
         let predictor = SurvivalPredictor {
             beta_threshold: array![-1.0],
             beta_log_sigma: array![0.0],
-            inverse_link: InverseLink::Standard(LinkFunction::CLogLog),
+            inverse_link: InverseLink::Standard(StandardLink::CLogLog),
             covariance: Some(Array2::zeros((2, 2))),
         };
         let fit = survival_fit_with_covariance(array![-1.0], array![0.0], Array2::zeros((2, 2)));
@@ -6498,7 +6498,7 @@ mod tests {
         let predictor = SurvivalPredictor {
             beta_threshold: array![0.0],
             beta_log_sigma: array![0.0],
-            inverse_link: InverseLink::Standard(LinkFunction::CLogLog),
+            inverse_link: InverseLink::Standard(StandardLink::CLogLog),
             covariance: None,
         };
         let input = PredictInput {

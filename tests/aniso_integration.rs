@@ -97,7 +97,7 @@ fn aniso_matern_recovers_signal_axis() {
         spec,
         family: LikelihoodSpec::new(
             ResponseFamily::Gaussian,
-            InverseLink::Standard(LinkFunction::Identity),
+            InverseLink::Standard(StandardLink::Identity),
         ),
         options: FitOptions {
             latent_cloglog: None,

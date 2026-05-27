@@ -14,7 +14,7 @@ fn fit_family_rejects_nan_in_weights_and_design() {
     let s_list: Vec<BlockwisePenalty> = vec![];
     let fam = LikelihoodSpec::new(
         ResponseFamily::Gaussian,
-        InverseLink::Standard(LinkFunction::Identity),
+        InverseLink::Standard(StandardLink::Identity),
     );
     let opts = FitOptions::default();
 

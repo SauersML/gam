@@ -313,7 +313,7 @@ fn closed_form_scalar_matches_existing_gaussian_reml_path() {
         &[penalty],
         LikelihoodSpec::new(
             ResponseFamily::Gaussian,
-            InverseLink::Standard(LinkFunction::Identity),
+            InverseLink::Standard(StandardLink::Identity),
         ),
         &fit_options(),
     )

@@ -90,7 +90,7 @@ fn minimal_fit_result(fitted_link: FittedLinkState) -> UnifiedFitResult {
         lambdas: Array1::zeros(0),
         likelihood_family: Some(LikelihoodSpec::new(
             ResponseFamily::Gaussian,
-            InverseLink::Standard(LinkFunction::Identity),
+            InverseLink::Standard(StandardLink::Identity),
         )),
         likelihood_scale: LikelihoodScaleMetadata::ProfiledGaussian,
         log_likelihood_normalization: LogLikelihoodNormalization::Full,
@@ -143,7 +143,7 @@ fn minimal_survival_fit_result() -> UnifiedFitResult {
         lambdas: Array1::zeros(0),
         likelihood_family: Some(LikelihoodSpec::new(
             ResponseFamily::RoystonParmar,
-            InverseLink::Standard(LinkFunction::Identity),
+            InverseLink::Standard(StandardLink::Identity),
         )),
         likelihood_scale: LikelihoodScaleMetadata::Unspecified,
         log_likelihood_normalization: LogLikelihoodNormalization::Full,
@@ -186,7 +186,7 @@ fn minimal_standard_model_with_group_metadata(
         FittedFamily::Standard {
             likelihood: LikelihoodSpec::new(
                 ResponseFamily::Gaussian,
-                InverseLink::Standard(LinkFunction::Identity),
+                InverseLink::Standard(StandardLink::Identity),
             ),
             link: Some(LinkFunction::Identity),
             latent_cloglog_state: None,
@@ -471,7 +471,7 @@ fn survival_marginal_slope_saved_models_require_special_predict_handling() {
         FittedFamily::Survival {
             likelihood: LikelihoodSpec::new(
                 ResponseFamily::RoystonParmar,
-                InverseLink::Standard(LinkFunction::Identity),
+                InverseLink::Standard(StandardLink::Identity),
             ),
             survival_likelihood: Some("marginal-slope".to_string()),
             survival_distribution: Some(ResidualDistribution::Gaussian),

@@ -455,7 +455,7 @@ fn tps_reml_fit_must_not_oversmooth_seed118_style_additive_signal() {
         &marginal_tps_spec(18),
         LikelihoodSpec::new(
             ResponseFamily::Gaussian,
-            InverseLink::Standard(LinkFunction::Identity),
+            InverseLink::Standard(StandardLink::Identity),
         ),
         &standard_fit_options(80),
     )

@@ -91,7 +91,7 @@ fn coefficient_groups_with_gamma_priors_add_distinct_penalty_coordinates() {
     let fit = fit_term_collection_with_coefficient_groups_and_penalty_block_gamma_priors(
         data.view(), y.view(), Array1::ones(n).view(), Array1::zeros(n).view(), &spec, &groups,
         &[("x0".into(), 2.0, 1.0), ("x1".into(), 2.0, 1.0)],
-        LikelihoodSpec::new(ResponseFamily::Gaussian, InverseLink::Standard(LinkFunction::Identity)),
+        LikelihoodSpec::new(ResponseFamily::Gaussian, InverseLink::Standard(StandardLink::Identity)),
         &opts(),
     ).expect("Combining coefficient groups and block gamma priors should keep each group as a separate penalty coordinate in the fitted result.");
 

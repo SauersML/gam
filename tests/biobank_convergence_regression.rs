@@ -164,7 +164,7 @@ fn biobank_convergence_regression() {
         &s_list,
         LikelihoodSpec::new(
             ResponseFamily::Binomial,
-            InverseLink::Standard(LinkFunction::Logit),
+            InverseLink::Standard(StandardLink::Logit),
         ),
         &FitOptions {
             latent_cloglog: None,

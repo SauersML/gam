@@ -343,7 +343,7 @@ mod tests {
     fn binomial_logit_glm_spec() -> GlmLikelihoodSpec {
         GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
             ResponseFamily::Binomial,
-            InverseLink::Standard(LinkFunction::Logit),
+            InverseLink::Standard(StandardLink::Logit),
         ))
     }
 
@@ -352,7 +352,7 @@ mod tests {
     fn gaussian_identity_glm_spec() -> GlmLikelihoodSpec {
         GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
             ResponseFamily::Gaussian,
-            InverseLink::Standard(LinkFunction::Identity),
+            InverseLink::Standard(StandardLink::Identity),
         ))
     }
 

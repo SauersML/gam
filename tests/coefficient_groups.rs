@@ -37,7 +37,7 @@ fn fit_options(rho_prior: RhoPrior) -> FitOptions {
 fn gaussian_identity_spec() -> LikelihoodSpec {
     LikelihoodSpec::new(
         ResponseFamily::Gaussian,
-        InverseLink::Standard(LinkFunction::Identity),
+        InverseLink::Standard(StandardLink::Identity),
     )
 }
 
