@@ -856,6 +856,7 @@ pub(crate) fn s_f_diagnostic_finite(inputs: &BmsFlexRowKernelInputs<'_>) -> bool
 
 #[cfg(target_os = "linux")]
 struct RowKernelBackend {
+    ctx: Arc<CudaContext>,
     stream: Arc<CudaStream>,
     module: Arc<CudaModule>,
 }
@@ -887,11 +888,12 @@ impl RowKernelBackend {
                 let module = ctx.load_module(ptx).map_err(|err| GpuError::DriverCallFailed {
                     reason: format!("bms_flex_row module load failed: {err}"),
                 })?;
-                // `ctx` is intentionally dropped here: both `stream` and
-                // `module` hold their own `Arc<CudaContext>` clones internally
-                // (via cudarc's `CudaStream::ctx()` / `CudaModule::ctx()`
-                // accessors), so the context outlives the local binding.
-                Ok(RowKernelBackend { stream, module })
+                // Keep an explicit `Arc<CudaContext>` clone on the backend so
+                // callers that build `DeviceResidentRowHess` can hand it to
+                // downstream HVP / diagonal launches without re-probing the
+                // runtime. cudarc's `Arc<CudaModule>` does not expose a
+                // public `ctx()` accessor.
+                Ok(RowKernelBackend { ctx, stream, module })
             })
             .as_ref()
             .map_err(GpuError::clone)
@@ -1179,6 +1181,22 @@ pub(crate) enum RowHessianLayout {
     ///     `i * r*(r+1)/2 + u*(2r - u - 1)/2 + (v - u)`.
     /// For `v < u`, the reader swaps `u` and `v` (symmetry).
     SymmetricPackedUpper,
+}
+
+#[cfg(target_os = "linux")]
+impl RowHessianLayout {
+    /// Per-row entry count for this layout. `FullRowMajor` lays out the full
+    /// `r × r` row Hessian (`r²` doubles); `SymmetricPackedUpper` packs only
+    /// the upper triangle (`r·(r+1)/2` doubles). Used by `repack_upper` and
+    /// the HVP / diagonal allocators to stay in sync with the kernel-side
+    /// indexing.
+    #[inline]
+    pub(crate) fn per_row_doubles(self, r: usize) -> usize {
+        match self {
+            RowHessianLayout::FullRowMajor => r * r,
+            RowHessianLayout::SymmetricPackedUpper => r * (r + 1) / 2,
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -2013,7 +2031,7 @@ pub(crate) fn launch_bms_flex_row_kernel_device_resident(
     // moments owned by the caller stay alive.
     drop(d_chi); drop(d_xi); drop(d_rho); drop(d_tau); drop(d_ruv);
 
-    let ctx = backend.module.ctx().clone();
+    let ctx = backend.ctx.clone();
     let bytes = ((n * r * r + marginal_design_row_major.len() + logslope_design_row_major.len())
         * std::mem::size_of::<f64>()) as u64;
     Ok((

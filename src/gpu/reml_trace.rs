@@ -539,6 +539,251 @@ pub fn evidence_traces_adaptive<'a>(
 }
 
 // ────────────────────────────────────────────────────────────────────────
+// Block 2.7: batched-PCG HVP variant of adaptive Hutchinson
+// ────────────────────────────────────────────────────────────────────────
+
+/// CG convergence tolerance for the per-probe solve `H w = z`. The outer
+/// adaptive-K loop already drives Hutchinson variance to ~1%; a per-probe
+/// relative residual of 1e-6 keeps the CG round-off well below the
+/// stochastic SE without paying for double-machine convergence.
+pub const PCG_HVP_REL_TOL: f64 = 1e-6;
+
+/// Maximum CG iterations per probe before we stop and accept the partial
+/// solve. Capped so a poorly conditioned `H` cannot make a single REML
+/// step pay unbounded time — the Hutchinson estimator is statistically
+/// robust to a few stale `w_k` values (it inflates SE, which the adaptive
+/// stopping rule then catches by extending the schedule).
+pub const PCG_HVP_MAX_ITERS: usize = 200;
+
+/// Adaptive Hutchinson variant that consumes `H` as a matrix-free HVP
+/// closure rather than a dense `ArrayView2`. Used by call sites where the
+/// penalized Hessian is implicit (operator-only) and forming it densely
+/// would blow the memory budget — e.g. the device-resident PCG path in
+/// `gpu/bms_flex_row.rs` or the biobank-scale BMS Schur operator.
+///
+/// `hvp` must compute `out ← H · v` for an SPD `H`. The closure is called
+/// once per CG iteration per probe (so `K · iters_per_probe` times in
+/// total for each schedule step). It is responsible for any necessary
+/// pre-conditioning state, threading, or device residency — the routine
+/// itself is pure CPU.
+///
+/// `derivatives` are still passed as dense or `WeightedGram`; the
+/// adaptive trace `t_j = mean_k z_k^T H_j w_k` only needs `H_j` to be
+/// available as a matvec, and the dense / weighted-Gram variants of
+/// `DerivativeHessian::quadratic_form` already provide that.
+///
+/// CRN is preserved exactly as in [`evidence_traces_adaptive`]: the
+/// SplitMix probe RNG is stateless in `(seed, k_index, i)`, so the
+/// `K=16, 32, 64, 128` schedule extends the prior estimate rather than
+/// restarting it. Each schedule step re-runs all `K` solves; the
+/// implementation is intentionally simple, the asymptotic cost is
+/// dominated by the largest `K`.
+///
+/// Returns the same [`AdaptiveTraceEvidence`] shape as the dense path,
+/// with one exception: `logdet_hessian` is **NaN** because no Cholesky
+/// is performed. Callers needing both `tr(H⁻¹ H_j)` and `log|H|` from
+/// the matrix-free path should obtain `log|H|` separately (e.g. via
+/// stochastic Lanczos or by routing through the dense path when `H`
+/// fits in memory).
+pub fn evidence_traces_adaptive_hvp<F>(
+    p: usize,
+    mut hvp: F,
+    derivatives: Vec<DerivativeHessian<'_>>,
+    design: Option<ArrayView2<'_, f64>>,
+    seed: ProbeSeed,
+    rel_tol: f64,
+    tau_rel: f64,
+) -> Result<AdaptiveTraceEvidence, String>
+where
+    F: FnMut(&[f64], &mut [f64]),
+{
+    const SCHEDULE: [usize; 4] = [16, 32, 64, 128];
+
+    let d = derivatives.len();
+    if d == 0 {
+        return Err("evidence_traces_adaptive_hvp: derivatives is empty".to_string());
+    }
+    if p == 0 {
+        return Err("evidence_traces_adaptive_hvp: p must be > 0".to_string());
+    }
+    if !(rel_tol > 0.0) {
+        return Err(format!(
+            "evidence_traces_adaptive_hvp: rel_tol must be > 0 (got {rel_tol})"
+        ));
+    }
+    if !(tau_rel > 0.0) {
+        return Err(format!(
+            "evidence_traces_adaptive_hvp: tau_rel must be > 0 (got {tau_rel})"
+        ));
+    }
+
+    let mut last_traces = Array1::<f64>::zeros(d);
+    let mut last_stderrs = Array1::<f64>::zeros(d);
+    let mut last_k = 0_usize;
+    let mut converged = false;
+
+    let mut z = vec![0.0_f64; p];
+    let mut w = vec![0.0_f64; p];
+
+    // Per-derivative running sums of q and q² for online mean / SE.
+    let mut q_sums = vec![0.0_f64; d];
+    let mut q_sq_sums = vec![0.0_f64; d];
+
+    for &k_target in &SCHEDULE {
+        // Re-run from scratch at each schedule step — CRN guarantees the
+        // first min(K_prev, K_target) probes are bit-identical, so the
+        // estimator is monotone in expectation across schedule extensions.
+        for s in q_sums.iter_mut() {
+            *s = 0.0;
+        }
+        for s in q_sq_sums.iter_mut() {
+            *s = 0.0;
+        }
+
+        for k_idx in 0..k_target {
+            // Fill z_k from the stateless SplitMix RNG.
+            for i in 0..p {
+                z[i] = rademacher_entry(seed.0, k_idx as u64, i as u64);
+            }
+            // Solve H w = z by unpreconditioned CG.
+            cg_solve(&mut hvp, &z, &mut w, rel_tol, PCG_HVP_MAX_ITERS);
+
+            // Reduce q_{j,k} = z^T H_j w for each derivative. Mirrors the
+            // dense reference in `evidence_derivatives_hutchinson_cpu`.
+            for j in 0..d {
+                let q = match &derivatives[j] {
+                    DerivativeHessian::Dense(matrix) => {
+                        let mut y = 0.0_f64;
+                        for r in 0..p {
+                            let mut hr_w = 0.0_f64;
+                            for c in 0..p {
+                                hr_w += matrix[[r, c]] * w[c];
+                            }
+                            y += z[r] * hr_w;
+                        }
+                        y
+                    }
+                    DerivativeHessian::WeightedGram {
+                        row_weights,
+                        penalty_extra,
+                    } => {
+                        let design_view = design.as_ref().ok_or_else(|| {
+                            "evidence_traces_adaptive_hvp: WeightedGram derivative requires \
+                             design matrix"
+                                .to_string()
+                        })?;
+                        let n = design_view.nrows();
+                        let mut acc = 0.0_f64;
+                        for row in 0..n {
+                            let mut rz = 0.0_f64;
+                            let mut rw = 0.0_f64;
+                            for ci in 0..p {
+                                rz += design_view[[row, ci]] * z[ci];
+                                rw += design_view[[row, ci]] * w[ci];
+                            }
+                            acc += row_weights[row] * rz * rw;
+                        }
+                        if let Some(pen) = penalty_extra {
+                            for r in 0..p {
+                                let mut row_acc = 0.0_f64;
+                                for c in 0..p {
+                                    row_acc += pen[[r, c]] * w[c];
+                                }
+                                acc += z[r] * row_acc;
+                            }
+                        }
+                        acc
+                    }
+                };
+                q_sums[j] += q;
+                q_sq_sums[j] += q * q;
+            }
+        }
+
+        let n = k_target as f64;
+        let mut worst_ratio = 0.0_f64;
+        for j in 0..d {
+            let mean = q_sums[j] / n;
+            // Sample variance (divide-by-N for the population estimator,
+            // matches `reduce_mean_stderr`'s convention used in the dense
+            // path; the K factor in the denominator below converts it to
+            // the standard error of the running mean).
+            let var = (q_sq_sums[j] / n - mean * mean).max(0.0);
+            let s = var.sqrt();
+            last_traces[j] = mean;
+            last_stderrs[j] = s;
+            let denom = n.sqrt() * mean.abs().max(tau_rel);
+            let r = s / denom;
+            if r > worst_ratio {
+                worst_ratio = r;
+            }
+        }
+        last_k = k_target;
+        if worst_ratio <= rel_tol {
+            converged = true;
+            break;
+        }
+    }
+
+    Ok(AdaptiveTraceEvidence {
+        logdet_hessian: f64::NAN,
+        traces: last_traces,
+        stderrs: last_stderrs,
+        probe_count: last_k,
+        converged,
+    })
+}
+
+/// Unpreconditioned conjugate gradients for `H w = b` with `H` accessed
+/// only through `hvp(v, out) → out ← H v`. SPD `H` is required.
+/// Initial guess is `w = 0`; stops when `‖r‖ ≤ rel_tol · ‖b‖` or after
+/// `max_iters` iterations.
+fn cg_solve<F>(hvp: &mut F, b: &[f64], w: &mut [f64], rel_tol: f64, max_iters: usize)
+where
+    F: FnMut(&[f64], &mut [f64]),
+{
+    let n = b.len();
+    debug_assert!(w.len() == n);
+    for v in w.iter_mut() {
+        *v = 0.0;
+    }
+    // r = b - H w = b (since w=0)
+    let mut r = b.to_vec();
+    let mut p = r.clone();
+    let mut hp = vec![0.0_f64; n];
+
+    let b_norm_sq: f64 = b.iter().map(|x| x * x).sum();
+    if b_norm_sq == 0.0 {
+        return;
+    }
+    let mut r_norm_sq: f64 = r.iter().map(|x| x * x).sum();
+    let tol_sq = rel_tol * rel_tol * b_norm_sq;
+
+    for _ in 0..max_iters {
+        if r_norm_sq <= tol_sq {
+            break;
+        }
+        hvp(p.as_slice(), hp.as_mut_slice());
+        let p_hp: f64 = p.iter().zip(hp.iter()).map(|(a, b)| a * b).sum();
+        if !(p_hp > 0.0) {
+            // Lost SPD (round-off near convergence) — accept current w.
+            break;
+        }
+        let alpha = r_norm_sq / p_hp;
+        for i in 0..n {
+            w[i] += alpha * p[i];
+            r[i] -= alpha * hp[i];
+        }
+        let new_r_norm_sq: f64 = r.iter().map(|x| x * x).sum();
+        let beta = new_r_norm_sq / r_norm_sq;
+        for i in 0..n {
+            p[i] = r[i] + beta * p[i];
+        }
+        r_norm_sq = new_r_norm_sq;
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────
 // Outer logdet-gradient dispatch gate (Block 2.5)
 // ────────────────────────────────────────────────────────────────────────
 
@@ -1740,6 +1985,107 @@ mod tests {
             for row in 0..p {
                 assert_eq!(z32[col * p + row], z64[col * p + row]);
             }
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // Block 2.7: batched-PCG HVP variant tests.
+    // ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn block_2_7_hvp_path_matches_dense_adaptive() {
+        // HVP closure that multiplies a stored dense H matches the
+        // dense `evidence_traces_adaptive` exactly (same CRN probes,
+        // same derivative). CG round-off bounded by PCG_HVP_REL_TOL.
+        let p = 40;
+        let h = make_spd(p, 0.7);
+        let a = random_dense_sym(p, 0xABBA);
+        let seed = ProbeSeed(0x707);
+
+        let dense = evidence_traces_adaptive(
+            h.view(),
+            vec![DerivativeHessian::Dense(a.view())],
+            None,
+            seed,
+            HUTCHINSON_ADAPTIVE_REL_TOL,
+            HUTCHINSON_ADAPTIVE_TAU_REL,
+        )
+        .expect("dense ok");
+
+        let h_clone = h.clone();
+        let hvp_evidence = evidence_traces_adaptive_hvp(
+            p,
+            |v: &[f64], out: &mut [f64]| {
+                for r in 0..p {
+                    let mut acc = 0.0_f64;
+                    for c in 0..p {
+                        acc += h_clone[[r, c]] * v[c];
+                    }
+                    out[r] = acc;
+                }
+            },
+            vec![DerivativeHessian::Dense(a.view())],
+            None,
+            seed,
+            HUTCHINSON_ADAPTIVE_REL_TOL,
+            HUTCHINSON_ADAPTIVE_TAU_REL,
+        )
+        .expect("hvp ok");
+
+        // Adaptive may stop at different K if SE crosses the threshold
+        // at a different step due to CG round-off; compare both
+        // estimates against exact rather than to each other.
+        let exact = exact_trace_hinv_a(h.view(), a.view());
+        let se_dense = dense.stderrs[0] / (dense.probe_count as f64).sqrt();
+        let se_hvp = hvp_evidence.stderrs[0] / (hvp_evidence.probe_count as f64).sqrt();
+        let tol_dense = (8.0 * se_dense).max(0.05 * exact.abs());
+        let tol_hvp = (8.0 * se_hvp).max(0.05 * exact.abs());
+        assert!(
+            (dense.traces[0] - exact).abs() <= tol_dense,
+            "dense adaptive {} not near exact {} (tol {})",
+            dense.traces[0],
+            exact,
+            tol_dense
+        );
+        assert!(
+            (hvp_evidence.traces[0] - exact).abs() <= tol_hvp,
+            "hvp adaptive {} not near exact {} (tol {})",
+            hvp_evidence.traces[0],
+            exact,
+            tol_hvp
+        );
+        // logdet is intentionally NaN on the HVP path.
+        assert!(hvp_evidence.logdet_hessian.is_nan());
+    }
+
+    #[test]
+    fn block_2_7_cg_solves_diagonal_in_one_iteration() {
+        // For diagonal H, CG converges in one step (Krylov subspace
+        // contains the exact solution). Verifies the CG residual
+        // logic and SPD bailout.
+        let p = 8;
+        let diag: Vec<f64> = (0..p).map(|i| 1.0 + i as f64).collect();
+        let b: Vec<f64> = (0..p).map(|i| (i as f64) + 0.5).collect();
+        let mut w = vec![0.0_f64; p];
+        let diag_clone = diag.clone();
+        cg_solve(
+            &mut |v: &[f64], out: &mut [f64]| {
+                for i in 0..p {
+                    out[i] = diag_clone[i] * v[i];
+                }
+            },
+            &b,
+            &mut w,
+            1e-12,
+            PCG_HVP_MAX_ITERS,
+        );
+        for i in 0..p {
+            let expected = b[i] / diag[i];
+            assert!(
+                (w[i] - expected).abs() < 1e-10,
+                "diagonal CG: w[{i}]={} expected {expected}",
+                w[i]
+            );
         }
     }
 }

@@ -279,7 +279,7 @@ impl<'a> BmsFlexGpuRowInputs<'a> {
             cell_sbb: self.cell_sbb,
             cell_sbh: self.cell_sbh,
             cell_sbw: self.cell_sbw,
-            cell_moments: self.cell_moments,
+            cell_moments: crate::gpu::bms_flex_row::CellMomentsSource::Host(self.cell_moments),
             chi_obs: self.chi_obs,
             xi_obs: self.xi_obs,
             rho_u: self.rho_u,
