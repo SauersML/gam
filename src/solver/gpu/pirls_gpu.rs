@@ -1220,7 +1220,9 @@ extern "C" __global__ void linf_norm(
         builder.arg(&n_i);
         // SAFETY: axpy_n signature is (double, const double*, double*, int);
         // both vectors length n.
-        unsafe { builder.launch(cfg) }.map_err(|e| format!("axpy launch: {e}"))
+        unsafe { builder.launch(cfg) }
+            .map(|_event_pair| ())
+            .map_err(|e| format!("axpy launch: {e}"))
     }
 
     fn reduce_scalar(

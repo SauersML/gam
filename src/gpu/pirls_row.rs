@@ -1089,9 +1089,11 @@ pub fn launch_row_reweight_on_stream(
     // one-for-one. Output buffers were allocated with `n` elements each
     // (validated above); input buffers are caller-supplied with length n.
     // Grid covers all n rows; threads guard `if (i >= n) return`.
-    unsafe { builder.launch(cfg) }.map_err(|err| GpuError::DriverCallFailed {
-        reason: format!("row reweight launch({}): {err}", family.kernel_name()),
-    })
+    unsafe { builder.launch(cfg) }
+        .map(|_event_pair| ())
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("row reweight launch({}): {err}", family.kernel_name()),
+        })
 }
 
 /// Stage 6: device-side row reweight launcher for JIT-compiled
@@ -1156,9 +1158,11 @@ pub fn launch_row_reweight_jit_on_stream(
     builder.arg(&mut out.status);
     // SAFETY: JIT spec's `cuda_source` builder emits the same kernel
     // signature as `cuda_source_for`; arg order/types match one-for-one.
-    unsafe { builder.launch(cfg) }.map_err(|err| GpuError::DriverCallFailed {
-        reason: format!("JIT row reweight launch({kernel_name}): {err}"),
-    })
+    unsafe { builder.launch(cfg) }
+        .map(|_event_pair| ())
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("JIT row reweight launch({kernel_name}): {err}"),
+        })
 }
 
 // ────────────────────────────────────────────────────────────────────────
