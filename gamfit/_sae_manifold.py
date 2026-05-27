@@ -331,11 +331,25 @@ _TOPOLOGY_UNSET: Any = object()
 def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_topology: Any = _TOPOLOGY_UNSET,
                      assignment: str = "ibp", schedule: GumbelTemperatureSchedule | Mapping[str, Any] | None = None,
                      isometry_weight: float = 1.0, ard_per_atom: bool = True,
-                     mechanism_sparsity_groups: list[list[int]] | None = None, n_iter: int = 50, *,
+                     decoder_feature_sparsity_groups: list[list[int]] | None = None, n_iter: int = 50, *,
                      Z: Any = None, sparsity_weight: float = 1.0, smoothness_weight: float = 1.0,
                      alpha: float | str = 1.0, learning_rate: float | None = None, random_state: int = 0,
                      block_orthogonality_weight: float = 0.0,
                      top_k: int | None = None, **kwargs: Any) -> ManifoldSAE:
+    """Fit an SAE-manifold model.
+
+    ``decoder_feature_sparsity_groups`` was previously named
+    ``mechanism_sparsity_groups``. The rename reflects the actual semantics in
+    the SAE setting: ``MechanismSparsityPenalty`` group-lassoes over rows of
+    a ``(latent_dim, p_features)`` decoder block. For the standalone
+    ``MechSparsity`` use-case the rows are *latents* and the groups index
+    *features* (mechanisms); for the SAE decoder the rows are the per-atom
+    *basis functions* (M_k) and the groups still index the ``p_out`` output
+    features. The penalty drives basis-function-aligned feature groups to
+    zero, encouraging each basis function to load on a single feature
+    cluster. Only ``k_atoms=1`` is supported — multi-atom SAEs would require
+    a stride-aware per-atom view that does not exist yet.
+    """
     src = Z if Z is not None else X
     if src is None:
         raise TypeError("sae_manifold_fit requires Z= (or X=) input array")
@@ -439,7 +453,7 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
     else:
         effective_lr = float(learning_rate)
     penalties = [n for n, ok in (("IsometryPenalty", isometry_weight > 0.0), ("ARDPenalty", ard_per_atom),
-        ("MechanismSparsityPenalty", mechanism_sparsity_groups is not None),
+        ("MechanismSparsityPenalty", decoder_feature_sparsity_groups is not None),
         ("BlockOrthogonalityPenalty", block_orthogonality_weight > 0.0)) if ok]
     # Build the analytic-penalty registry payload that `sae_manifold_fit_auto`
     # passes into `run_joint_fit_arrow_schur`. The four user-facing knobs map
@@ -450,10 +464,11 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
     analytic_penalties_json = _build_analytic_penalties_payload(
         isometry_weight=isometry_weight,
         ard_per_atom=ard_per_atom,
-        mechanism_sparsity_groups=mechanism_sparsity_groups,
+        decoder_feature_sparsity_groups=decoder_feature_sparsity_groups,
         block_orthogonality_weight=block_orthogonality_weight,
         d_max=max(dims),
         p_out=int(x.shape[1]),
+        k_atoms=k_atoms,
     )
     payload = rust_module().sae_manifold_fit_minimal(
         np.ascontiguousarray(x),

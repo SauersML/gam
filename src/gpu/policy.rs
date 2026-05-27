@@ -84,3 +84,75 @@ pub enum Operation {
     XtDiagX,
     XtDiagY,
 }
+
+/// Which `(response, link)` family the Stage 3.3 device-resident PIRLS loop
+/// can evaluate without going through the Level-B raw-body NVRTC path.
+///
+/// Mirrors `PirlsRowFamily::ALL` at the policy layer so the predicate stays
+/// linkable from the CPU PIRLS entry without dragging a Linux-only enum into
+/// every host compilation unit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PirlsLoopFamilyKind {
+    BernoulliLogit,
+    BernoulliProbit,
+    BernoulliCLogLog,
+    PoissonLog,
+    GaussianIdentity,
+    GammaLog,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PirlsLoopCurvatureKind {
+    Fisher,
+    Observed,
+}
+
+/// Inputs to [`should_use_gpu_pirls_loop`]. Each field comes from data the
+/// CPU PIRLS entry has on hand before it touches the eigendecomposition
+/// engine, so the admission check itself is allocation-free and can short-
+/// circuit before any heavy work happens.
+#[derive(Clone, Copy, Debug)]
+pub struct PirlsLoopAdmission {
+    /// Number of rows in the active (post-transform) design matrix.
+    pub n: usize,
+    /// Number of columns in the active design (i.e. `p` of `Xᵀ X`).
+    pub p: usize,
+    /// `Some(_)` when the inner family maps onto one of the six JIT-cached
+    /// `PirlsRowFamily` variants; `None` for custom families that still
+    /// require Stage 6 Level B and have not yet been admitted here.
+    pub family: Option<PirlsLoopFamilyKind>,
+    /// Curvature surface the inner loop will use; the GPU loop has Fisher +
+    /// Observed kernels, anything else (e.g. expected-projection surrogates)
+    /// is not admitted.
+    pub curvature: PirlsLoopCurvatureKind,
+    /// True when the CUDA runtime is initialised on this host (i.e.
+    /// `GpuRuntime::global().is_some()`).
+    pub gpu_available: bool,
+}
+
+impl GpuDispatchPolicy {
+    /// Conservative admission predicate for routing
+    /// `fit_model_for_fixed_rho_with_adaptive_kkt` through the Stage 3.3
+    /// device-resident PIRLS loop instead of the CPU LM loop.
+    ///
+    /// The thresholds (`n ≥ 50_000`, `p ≥ 32`) are deliberately well above
+    /// the matrix-size where a single PIRLS iter's `XᵀWX + Cholesky` would
+    /// be PCIe-bandwidth-bound. Smaller fits stay on the CPU LM loop where
+    /// the full `PirlsResult` surface (firth, EDF, per-row weights, …) is
+    /// already populated as a free side-effect of the iteration.
+    pub const fn should_use_gpu_pirls_loop(&self, adm: PirlsLoopAdmission) -> bool {
+        if !adm.gpu_available {
+            return false;
+        }
+        if adm.n < self.row_kernel_min_n {
+            return false;
+        }
+        if adm.p < 32 {
+            return false;
+        }
+        match adm.family {
+            Some(_) => true,
+            None => false,
+        }
+    }
+}
