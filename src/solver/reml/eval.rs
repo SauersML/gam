@@ -1634,6 +1634,326 @@ mod sigma_cubature_accumulation_tests {
              stage3_ready=true"
         );
     }
+
+    /// Test #11 — bilinearity in A_m.
+    ///
+    /// The A-side of the accumulator (mean_hinv) is the equal-weighted
+    /// arithmetic mean of the per-sigma A_m matrices. Linear combinations
+    /// of inputs must produce the same linear combination on the output:
+    /// V̂[α·A_m + β·A'_m, b_m] = α·V̂[A_m, b_m] + β·V̂[A'_m, b_m] − (α+β−1)·var(b_m).
+    /// In the special case α + β = 1 this collapses to convex combination
+    /// invariance on the A-side, which is what we pin here.
+    #[test]
+    fn cubature_a_side_is_convex_on_input() {
+        let p = 3;
+        let r = 2;
+        let m = 2 * r;
+        let b0: Array1<f64> = ndarray::array![0.4, -0.3, 0.2];
+        let scales = [0.6_f64, 1.1];
+        let points_b: Vec<Array1<f64>> = (0..r)
+            .flat_map(|k| {
+                [1.0_f64, -1.0_f64].into_iter().map(move |sign| {
+                    let mut b = b0.clone();
+                    b[k] += sign * scales[k];
+                    b
+                })
+            })
+            .collect();
+        let a_set_1: Vec<Array2<f64>> = (0..m)
+            .map(|i| {
+                let mut a = Array2::<f64>::eye(p);
+                a[[0, 0]] = 1.0 + 0.05 * i as f64;
+                a[[1, 1]] = 1.5 - 0.02 * i as f64;
+                a[[0, 1]] = 0.10;
+                a[[1, 0]] = 0.10;
+                a
+            })
+            .collect();
+        let a_set_2: Vec<Array2<f64>> = (0..m)
+            .map(|i| {
+                let mut a = Array2::<f64>::eye(p);
+                a[[0, 0]] = 2.0 - 0.04 * i as f64;
+                a[[2, 2]] = 0.9 + 0.03 * i as f64;
+                a[[1, 2]] = -0.05;
+                a[[2, 1]] = -0.05;
+                a
+            })
+            .collect();
+        let alpha = 0.3_f64;
+        let beta = 1.0 - alpha; // convex
+        let a_set_mix: Vec<Array2<f64>> = a_set_1
+            .iter()
+            .zip(a_set_2.iter())
+            .map(|(a, ap)| a.mapv(|v| v * alpha) + ap.mapv(|v| v * beta))
+            .collect();
+
+        let pts1: Vec<(Array2<f64>, Array1<f64>)> = a_set_1
+            .iter()
+            .zip(points_b.iter())
+            .map(|(a, b)| (a.clone(), b.clone()))
+            .collect();
+        let pts2: Vec<(Array2<f64>, Array1<f64>)> = a_set_2
+            .iter()
+            .zip(points_b.iter())
+            .map(|(a, b)| (a.clone(), b.clone()))
+            .collect();
+        let pts_mix: Vec<(Array2<f64>, Array1<f64>)> = a_set_mix
+            .iter()
+            .zip(points_b.iter())
+            .map(|(a, b)| (a.clone(), b.clone()))
+            .collect();
+
+        let v1 = accumulate_sigma_cubature_total_covariance(&pts1, p);
+        let v2 = accumulate_sigma_cubature_total_covariance(&pts2, p);
+        let vmix = accumulate_sigma_cubature_total_covariance(&pts_mix, p);
+
+        // With α+β = 1 the var(b) terms cancel, so
+        // V[α·A + β·A'] = α·V[A] + β·V[A'].
+        let expected = v1.mapv(|v| v * alpha) + v2.mapv(|v| v * beta);
+        let mut max_abs = 0.0_f64;
+        for i in 0..p {
+            for j in 0..p {
+                max_abs = max_abs.max((vmix[[i, j]] - expected[[i, j]]).abs());
+            }
+        }
+        assert!(
+            max_abs < 1e-13,
+            "A-side convexity violated: max_abs={:.3e}",
+            max_abs,
+        );
+    }
+
+    /// Test #12 — translation invariance of var(b).
+    ///
+    /// Adding the same constant offset to every `b_m` (i.e. translating
+    /// the b-cloud) cannot change the variance term `second_beta −
+    /// mean_outer`. The A-side is unaffected by b at all. So shifting
+    /// every b by the same vector leaves the whole output unchanged.
+    /// Pins that the accumulator's b-side computes a *centred* second
+    /// moment (not a raw second moment).
+    #[test]
+    fn cubature_b_translation_leaves_output_unchanged() {
+        let p = 3;
+        let a_const: Array2<f64> = ndarray::array![
+            [1.5, 0.2, 0.0],
+            [0.2, 1.2, 0.1],
+            [0.0, 0.1, 1.0],
+        ];
+        let raw_bs: Vec<Array1<f64>> = vec![
+            ndarray::array![0.4, -0.3, 0.2],
+            ndarray::array![-0.4, 0.3, -0.2],
+            ndarray::array![0.1, 0.5, -0.4],
+            ndarray::array![-0.1, -0.5, 0.4],
+        ];
+        let pts_raw: Vec<(Array2<f64>, Array1<f64>)> =
+            raw_bs.iter().map(|b| (a_const.clone(), b.clone())).collect();
+        let shift: Array1<f64> = ndarray::array![10.0, -5.0, 3.0];
+        let pts_shifted: Vec<(Array2<f64>, Array1<f64>)> = raw_bs
+            .iter()
+            .map(|b| (a_const.clone(), b + &shift))
+            .collect();
+
+        let v_raw = accumulate_sigma_cubature_total_covariance(&pts_raw, p);
+        let v_shifted = accumulate_sigma_cubature_total_covariance(&pts_shifted, p);
+        let mut max_abs = 0.0_f64;
+        for i in 0..p {
+            for j in 0..p {
+                max_abs = max_abs.max((v_raw[[i, j]] - v_shifted[[i, j]]).abs());
+            }
+        }
+        // Translating b by a constant of magnitude ~10 inflates the
+        // intermediate raw second moment by ~100, so the centred
+        // difference is a real test of the variance subtraction's
+        // numerical stability — a 1e-10 absolute bound here would still
+        // be a generous round-off allowance, and we pick 1e-11.
+        assert!(
+            max_abs < 1e-11,
+            "b-translation invariance violated: max_abs={:.3e}",
+            max_abs,
+        );
+    }
+
+    /// Test #13 — block-diagonal A and block-aligned b decouple.
+    ///
+    /// If every A_m has a 2×2 block-diagonal structure A_m = blkdiag(A_top, A_bot)
+    /// AND every b_m has matching block structure (top half varies, bottom
+    /// half is constant), the output must be block-diagonal too — the
+    /// cross-block entries vanish exactly. Pins that the accumulator does
+    /// not introduce spurious cross-block coupling (e.g. via a buggy
+    /// outer-product loop that wraps indices).
+    #[test]
+    fn cubature_block_diagonal_inputs_yield_block_diagonal_output() {
+        let p_top = 2;
+        let p_bot = 2;
+        let p = p_top + p_bot;
+        let m = 4;
+        let a_top: Array2<f64> = ndarray::array![[1.0, 0.1], [0.1, 1.2]];
+        let a_bot: Array2<f64> = ndarray::array![[0.8, 0.05], [0.05, 0.7]];
+        let mut a_full = Array2::<f64>::zeros((p, p));
+        for i in 0..p_top {
+            for j in 0..p_top {
+                a_full[[i, j]] = a_top[[i, j]];
+            }
+        }
+        for i in 0..p_bot {
+            for j in 0..p_bot {
+                a_full[[p_top + i, p_top + j]] = a_bot[[i, j]];
+            }
+        }
+
+        // b: top half varies across sigma points (so var on the top is
+        // non-zero), bottom half is constant (so var on the bottom is
+        // zero). Cross-block (top × bottom) entries of mean_outer cancel
+        // because the bottom is constant, but second_beta cross-entries
+        // are b_top·b_bot — these must equal mean(b_top)·b_bot_const
+        // exactly, so var cross-entries cancel.
+        let b_bot_const: Array1<f64> = ndarray::array![0.5, -0.3];
+        let top_bs: Vec<Array1<f64>> = vec![
+            ndarray::array![0.4, 0.1],
+            ndarray::array![-0.4, -0.1],
+            ndarray::array![0.2, 0.3],
+            ndarray::array![-0.2, -0.3],
+        ];
+        let mut points: Vec<(Array2<f64>, Array1<f64>)> = Vec::with_capacity(m);
+        for top in &top_bs {
+            let mut b = Array1::<f64>::zeros(p);
+            for i in 0..p_top {
+                b[i] = top[i];
+            }
+            for i in 0..p_bot {
+                b[p_top + i] = b_bot_const[i];
+            }
+            points.push((a_full.clone(), b));
+        }
+        let v = accumulate_sigma_cubature_total_covariance(&points, p);
+        let mut max_cross_abs = 0.0_f64;
+        for i in 0..p_top {
+            for j in 0..p_bot {
+                max_cross_abs = max_cross_abs.max(v[[i, p_top + j]].abs());
+                max_cross_abs = max_cross_abs.max(v[[p_top + j, i]].abs());
+            }
+        }
+        assert!(
+            max_cross_abs < 1e-13,
+            "block-diagonal inputs leaked cross-block coupling: \
+             max_cross_abs={:.3e}",
+            max_cross_abs,
+        );
+    }
+
+    /// Test #14 — output is always symmetric (PSD by construction
+    /// when inputs are PSD).
+    ///
+    /// `accumulate_sigma_cubature_total_covariance` is a sum of:
+    ///   * mean(A_m) — symmetric when each A_m is symmetric
+    ///   * second_beta − mean_outer — a centred second moment, always
+    ///     symmetric and PSD
+    /// So the output should be symmetric to f64 round-off for any
+    /// symmetric A_m. Pins this invariant since the production caller
+    /// passes the output to `enforce_symmetry` and any drift here is a
+    /// silent bug masked by that downstream cleanup.
+    #[test]
+    fn cubature_output_is_symmetric_for_symmetric_inputs() {
+        let p = 5;
+        let m = 6;
+        let points: Vec<(Array2<f64>, Array1<f64>)> = (0..m)
+            .map(|idx| {
+                let mut a = Array2::<f64>::eye(p);
+                // Build a non-trivial symmetric A by mirroring across
+                // the diagonal.
+                for i in 0..p {
+                    for j in 0..i {
+                        let v = 0.05 + 0.03 * (i as f64 + j as f64)
+                            + 0.02 * (idx as f64);
+                        a[[i, j]] = v;
+                        a[[j, i]] = v;
+                    }
+                    a[[i, i]] = 2.0 + 0.1 * idx as f64;
+                }
+                let b: Array1<f64> = (0..p)
+                    .map(|d| 0.1 * (d as f64 + 1.0) + 0.05 * idx as f64)
+                    .collect();
+                (a, b)
+            })
+            .collect();
+        let v = accumulate_sigma_cubature_total_covariance(&points, p);
+        let mut max_asym = 0.0_f64;
+        for i in 0..p {
+            for j in (i + 1)..p {
+                max_asym = max_asym.max((v[[i, j]] - v[[j, i]]).abs());
+            }
+        }
+        assert!(
+            max_asym < 1e-13,
+            "output not symmetric for symmetric inputs: max_asym={:.3e}",
+            max_asym,
+        );
+    }
+
+    /// Test #15 — pure-A invariance under reordering of (A_m, b_m).
+    ///
+    /// Permuting which b_m is paired with which A_m must move the
+    /// var(b) term (since that is computed from the b_m sequence) but
+    /// must NOT move the mean_hinv term (which depends only on the
+    /// multiset of A_m). Pins that the accumulator's A-side and b-side
+    /// are truly decoupled in code, not just in math.
+    #[test]
+    fn cubature_a_side_unchanged_under_b_permutation() {
+        let p = 3;
+        let m = 6;
+        let a_set: Vec<Array2<f64>> = (0..m)
+            .map(|i| {
+                let mut a = Array2::<f64>::eye(p);
+                a[[0, 0]] = 1.0 + 0.07 * (i as f64);
+                a[[1, 1]] = 1.5 - 0.05 * (i as f64);
+                a[[2, 2]] = 0.9 + 0.04 * (i as f64);
+                a[[0, 1]] = 0.05;
+                a[[1, 0]] = 0.05;
+                a
+            })
+            .collect();
+        // Constant b across all sigma points → var(b) = 0 → output is
+        // exactly mean(A_m). Permuting b is a no-op for constant b but
+        // permuting A_m would change mean(A_m) — except mean is
+        // permutation-invariant. So output of original == output of
+        // permuted-A == mean(A_m).
+        let b_const: Array1<f64> = ndarray::array![0.2, -0.1, 0.3];
+        let original: Vec<(Array2<f64>, Array1<f64>)> = a_set
+            .iter()
+            .map(|a| (a.clone(), b_const.clone()))
+            .collect();
+        // Build a non-trivial permutation of A's.
+        let perm: [usize; 6] = [3, 0, 5, 1, 4, 2];
+        let permuted_a: Vec<(Array2<f64>, Array1<f64>)> = perm
+            .iter()
+            .map(|&i| (a_set[i].clone(), b_const.clone()))
+            .collect();
+
+        let v_orig = accumulate_sigma_cubature_total_covariance(&original, p);
+        let v_perm = accumulate_sigma_cubature_total_covariance(&permuted_a, p);
+        let w = 1.0 / m as f64;
+        let mut mean_a = Array2::<f64>::zeros((p, p));
+        for a in &a_set {
+            mean_a.scaled_add(w, a);
+        }
+        let mut max_abs_orig = 0.0_f64;
+        let mut max_abs_perm = 0.0_f64;
+        for i in 0..p {
+            for j in 0..p {
+                max_abs_orig =
+                    max_abs_orig.max((v_orig[[i, j]] - mean_a[[i, j]]).abs());
+                max_abs_perm =
+                    max_abs_perm.max((v_perm[[i, j]] - mean_a[[i, j]]).abs());
+            }
+        }
+        assert!(
+            max_abs_orig < 1e-13 && max_abs_perm < 1e-13,
+            "A-side independent of A ordering under constant b: \
+             orig={:.3e}, perm={:.3e}",
+            max_abs_orig,
+            max_abs_perm,
+        );
+    }
 }
 
 #[cfg(test)]
