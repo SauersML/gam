@@ -4869,11 +4869,6 @@ fn clamped_binomial_probability(mu: f64) -> (f64, bool) {
 }
 
 #[inline]
-fn stable_softplus(x: f64) -> f64 {
-    crate::linalg::utils::stable_softplus(x)
-}
-
-#[inline]
 fn log1mexp_neg_positive(z: f64) -> f64 {
     assert!(z >= 0.0);
     if z == 0.0 {
@@ -4942,7 +4937,9 @@ fn binomial_location_scale_log_likelihood(
             Ok(weight * (y * normal_logcdf(q) + (1.0_f64 - y) * normal_logsf(q)))
         }
         InverseLink::Standard(LinkFunction::Logit) => {
-            Ok(weight * (-y * stable_softplus(-q) - (1.0_f64 - y) * stable_softplus(q)))
+            Ok(weight
+                * (-y * crate::linalg::utils::stable_softplus(-q)
+                    - (1.0_f64 - y) * crate::linalg::utils::stable_softplus(q)))
         }
         InverseLink::Standard(LinkFunction::CLogLog) => {
             let z = q.exp();

@@ -595,25 +595,21 @@ impl FirthDenseOperator {
                 x_metric_reduced_inv_diag[col] = metric_eig.recip();
             }
         }
-        // Reduced design enters M = Z K_r Z' and P = M⊙M.
-        // Without fixed observation weights, Z = X_r. With fixed observation
-        // weights a_i, Z = diag(sqrt(a_i)) X_r.
-        let z_reduced = x_reduced.clone();
+        // Reduced design enters M = X_r K_r X_rᵀ and P = M⊙M.
         let h_diag = if r > 0 {
-            RemlState::reduced_diag_gram(&z_reduced, &k_reduced)
+            RemlState::reduced_diag_gram(&x_reduced, &k_reduced)
         } else {
             Array1::<f64>::zeros(n)
         };
         let x_dense_t = x_dense.t().to_owned();
         let b_base = RemlState::row_scale(x_dense, &w1);
         let p_b_base =
-            RemlState::apply_hadamard_gram_to_matrix(&z_reduced, &k_reduced, &k_reduced, &b_base);
+            RemlState::apply_hadamard_gram_to_matrix(&x_reduced, &k_reduced, &k_reduced, &b_base);
         Ok(FirthDenseOperator {
             x_dense: x_dense.clone(),
             x_dense_t,
             q_basis,
             x_reduced,
-            z_reduced,
             observation_weight_sqrt,
             k_reduced,
             x_metric_reduced_inv_diag,
@@ -731,7 +727,7 @@ impl FirthDenseOperator {
         let a_u_reduced = k_g_u.dot(&self.k_reduced);
         // Dh[u] = -diag(N_u),  N_u = X T_u Xᵀ, represented here as
         //   N_u = Z A_u Zᵀ in weighted reduced coordinates.
-        let dh = -RemlState::reduced_diag_gram(&self.z_reduced, &a_u_reduced);
+        let dh = -RemlState::reduced_diag_gram(&self.x_reduced, &a_u_reduced);
         let b_uvec = &self.w2 * &deta;
         FirthDirection {
             deta,
@@ -750,7 +746,7 @@ impl FirthDenseOperator {
     #[inline]
     fn apply_p_u_to_matrix(&self, a_u_reduced: &Array2<f64>, mat: &Array2<f64>) -> Array2<f64> {
         let mut out = RemlState::apply_hadamard_gram_to_matrix(
-            &self.z_reduced,
+            &self.x_reduced,
             &self.k_reduced,
             a_u_reduced,
             mat,
@@ -780,14 +776,14 @@ impl FirthDenseOperator {
         let etav = fast_ab(&self.x_dense, rhs);
         let qv = &etav * &self.w1.view().insert_axis(Axis(1));
         let m_qv = RemlState::apply_hadamard_gram_to_matrix(
-            &self.z_reduced,
+            &self.x_reduced,
             &self.k_reduced,
             &self.k_reduced,
             &qv,
         );
         let buvec = &dir.b_uvec;
         let m_buv = RemlState::apply_hadamard_gram_to_matrix(
-            &self.z_reduced,
+            &self.x_reduced,
             &self.k_reduced,
             &self.k_reduced,
             &(&etav * &buvec.view().insert_axis(Axis(1))),
@@ -860,7 +856,7 @@ impl FirthDenseOperator {
         let a_uv_reduced = k_g_uv.dot(&self.k_reduced)
             - k_gv.dot(&k_g_u).dot(&self.k_reduced)
             - k_g_u.dot(&k_gv).dot(&self.k_reduced);
-        let d2h = -RemlState::reduced_diag_gram(&self.z_reduced, &a_uv_reduced);
+        let d2h = -RemlState::reduced_diag_gram(&self.x_reduced, &a_uv_reduced);
         // Implements mixed diagonal coefficient:
         //   c_uv = w'''' ⊙ (Xu) ⊙ (Xv) ⊙ h
         //          + w''' ⊙ ((Xu) ⊙ Dh[v] + (Xv) ⊙ Dh[u])
@@ -886,19 +882,19 @@ impl FirthDenseOperator {
         // avoiding repeated O(n r^2 c) work for every rhs block.
         let p_b_rhs = fast_ab(&self.p_b_base, rhs);
         let p_bu_rhs = RemlState::apply_hadamard_gram_to_matrix(
-            &self.z_reduced,
+            &self.x_reduced,
             &self.k_reduced,
             &self.k_reduced,
             &(&eta_rhs * &u.b_uvec.view().insert_axis(Axis(1))),
         );
         let p_bv_rhs = RemlState::apply_hadamard_gram_to_matrix(
-            &self.z_reduced,
+            &self.x_reduced,
             &self.k_reduced,
             &self.k_reduced,
             &(&eta_rhs * &v.b_uvec.view().insert_axis(Axis(1))),
         );
         let p_buv_base = RemlState::apply_hadamard_gram_to_matrix(
-            &self.z_reduced,
+            &self.x_reduced,
             &self.k_reduced,
             &self.k_reduced,
             &b_uv_base,
@@ -917,13 +913,13 @@ impl FirthDenseOperator {
         );
 
         let p_nu_nv_base = RemlState::apply_hadamard_gram_to_matrix(
-            &self.z_reduced,
+            &self.x_reduced,
             &u.a_u_reduced,
             &v.a_u_reduced,
             &self.b_base,
         );
         let p_hw_nuv_base = RemlState::apply_hadamard_gram_to_matrix(
-            &self.z_reduced,
+            &self.x_reduced,
             &self.k_reduced,
             &a_uv_reduced,
             &self.b_base,
@@ -1128,7 +1124,7 @@ impl FirthDenseOperator {
     pub(crate) fn apply_pbar_to_matrix(&self, mat: &Array2<f64>) -> Array2<f64> {
         // Applies P̄ = (X_r K_r X_rᵀ)⊙(X_r K_r X_rᵀ) to each column of mat.
         RemlState::apply_hadamard_gram_to_matrix(
-            &self.z_reduced,
+            &self.x_reduced,
             &self.k_reduced,
             &self.k_reduced,
             mat,
@@ -1157,17 +1153,17 @@ impl FirthDenseOperator {
         let mut out = Array2::<f64>::zeros(mat.raw_dim());
         for col in 0..mat.ncols() {
             let v = mat.column(col).to_owned();
-            let szz = RemlState::reducedweighted_gram(&self.z_reduced, &v);
+            let szz = RemlState::reducedweighted_gram(&self.x_reduced, &v);
             let mzz = self.k_reduced.dot(&szz).dot(&self.k_reduced);
-            let t1 = Self::rowwise_bilinear(&self.z_reduced, &mzz, &kernel.x_tau_reduced);
+            let t1 = Self::rowwise_bilinear(&self.x_reduced, &mzz, &kernel.x_tau_reduced);
 
             let szt =
-                RemlState::reduced_crossweighted_gram(&self.z_reduced, &kernel.x_tau_reduced, &v);
+                RemlState::reduced_crossweighted_gram(&self.x_reduced, &kernel.x_tau_reduced, &v);
             let mzt = self.k_reduced.dot(&szt).dot(&self.k_reduced);
-            let t2 = RemlState::reduced_diag_gram(&self.z_reduced, &mzt);
+            let t2 = RemlState::reduced_diag_gram(&self.x_reduced, &mzt);
 
             let t3 = RemlState::apply_hadamard_gram(
-                &self.z_reduced,
+                &self.x_reduced,
                 &self.k_reduced,
                 &kernel.dot_k_reduced,
                 &v,
@@ -1624,7 +1620,7 @@ impl FirthDenseOperator {
         let m = rhs.ncols();
 
         // Short aliases.
-        let z = &self.z_reduced;
+        let z = &self.x_reduced;
         let x_r = &self.x_reduced;
         let k = &self.k_reduced;
         let x_ri = &kernel.x_tau_i_reduced;
@@ -2215,16 +2211,16 @@ impl FirthDenseOperator {
         let mut out = Array2::<f64>::zeros(mat.raw_dim());
         for col in 0..mat.ncols() {
             let v = mat.column(col).to_owned();
-            let szz = RemlState::reducedweighted_gram(&self.z_reduced, &v);
+            let szz = RemlState::reducedweighted_gram(&self.x_reduced, &v);
             let mzz = self.k_reduced.dot(&szz).dot(&self.k_reduced);
-            let t1 = Self::rowwise_bilinear(&self.z_reduced, &mzz, x_tau_reduced);
+            let t1 = Self::rowwise_bilinear(&self.x_reduced, &mzz, x_tau_reduced);
 
-            let szt = RemlState::reduced_crossweighted_gram(&self.z_reduced, x_tau_reduced, &v);
+            let szt = RemlState::reduced_crossweighted_gram(&self.x_reduced, x_tau_reduced, &v);
             let mzt = self.k_reduced.dot(&szt).dot(&self.k_reduced);
-            let t2 = RemlState::reduced_diag_gram(&self.z_reduced, &mzt);
+            let t2 = RemlState::reduced_diag_gram(&self.x_reduced, &mzt);
 
             let t3 =
-                RemlState::apply_hadamard_gram(&self.z_reduced, &self.k_reduced, dot_k_reduced, &v);
+                RemlState::apply_hadamard_gram(&self.x_reduced, &self.k_reduced, dot_k_reduced, &v);
 
             let y = 2.0 * (t1 + t2 + t3);
             out.column_mut(col).assign(&y);
@@ -2499,7 +2495,7 @@ impl FirthDenseOperator {
         if mat.nrows() != n || mat.ncols() == 0 {
             return Array2::<f64>::zeros(mat.raw_dim());
         }
-        let z = &self.z_reduced;
+        let z = &self.x_reduced;
         let z_tau = &kernel.x_tau_reduced;
         let k_r = &self.k_reduced;
         let a_v = &kernel.a_v_reduced; // = +K_r I'_v K_r  (so K̇_v = -a_v)

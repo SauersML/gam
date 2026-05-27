@@ -3596,9 +3596,6 @@ pub(crate) struct FirthDenseOperator {
     // Reduced identifiable design. With fixed observation weights a_i this is
     // diag(sqrt(a_i)) X Q; otherwise it is X Q.
     x_reduced: Array2<f64>,
-    // Reduced design used for M = Z K_r Zᵀ. Name kept for compatibility with
-    // existing callsites; Z equals x_reduced for the current implementation.
-    z_reduced: Array2<f64>,
     // Optional fixed case-weight square roots used when the Jeffreys/Firth
     // operator is formed from Xᵀ diag(case_weight ⊙ w(η)) X rather than
     // Xᵀ diag(w(η)) X. The exact directional tau derivatives must project and

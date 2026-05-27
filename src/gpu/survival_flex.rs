@@ -70,8 +70,7 @@ pub fn row_primary_hessian_decision(n: usize, r: usize) -> GpuDecision {
         .unwrap_or(false);
     decide(
         GpuKernel::MarginalSlopeRows,
-        SurvivalFlexGpuBackend::compiled(),
-        large_enough,
+        super::GpuEligibility::from_flags(SurvivalFlexGpuBackend::compiled(), large_enough),
     )
 }
 

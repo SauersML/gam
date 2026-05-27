@@ -1061,6 +1061,79 @@ array1_f64_newtype!(Coefficients);
 array1_f64_newtype!(LinearPredictor);
 array1_f64_newtype!(LogSmoothingParams, exp);
 
+/// Index into `TermCollectionSpec::smooth_terms` (and the parallel
+/// `TermCollectionDesign::smooth.terms` slice produced from it).
+///
+/// This is **not** a penalty/ρ index, **not** a column index, and **not** a
+/// coefficient-offset index. Keeping it behind a `#[repr(transparent)]`
+/// newtype makes those confusables a compile error: a `SmoothTermIdx` cannot
+/// be silently used to index `rho`, `beta`, or a design column.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct SmoothTermIdx(usize);
+
+impl SmoothTermIdx {
+    #[inline]
+    pub const fn new(idx: usize) -> Self {
+        Self(idx)
+    }
+
+    /// Sentinel used by transient builders that must allocate a coord config
+    /// before the smooth term it references has been positioned in the spec.
+    /// Every code path that constructs a sentinel must overwrite it before
+    /// the value escapes the builder.
+    #[inline]
+    pub const fn placeholder() -> Self {
+        Self(usize::MAX)
+    }
+
+    #[inline]
+    pub const fn get(self) -> usize {
+        self.0
+    }
+
+    #[inline]
+    pub const fn is_placeholder(self) -> bool {
+        self.0 == usize::MAX
+    }
+}
+
+impl std::fmt::Display for SmoothTermIdx {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Index into the canonical penalty list `&[CanonicalPenalty]` — equivalently,
+/// the position of a smoothing parameter in the ρ / λ vector.
+///
+/// Penalty/ρ indices are not interchangeable with `SmoothTermIdx` (a smooth
+/// term can carry multiple canonical penalties — e.g. tensor-product double
+/// penalties — and structural penalties don't correspond to any smooth term).
+/// Keeping them as separate newtypes makes the historical bug pattern
+/// "indexed `rho` with a smooth-term ordinal" impossible to express.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct PenaltyIdx(usize);
+
+impl PenaltyIdx {
+    #[inline]
+    pub const fn new(idx: usize) -> Self {
+        Self(idx)
+    }
+
+    #[inline]
+    pub const fn get(self) -> usize {
+        self.0
+    }
+}
+
+impl std::fmt::Display for PenaltyIdx {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug)]
 pub struct LogSmoothingParamsView<'a>(pub ArrayView1<'a, f64>);

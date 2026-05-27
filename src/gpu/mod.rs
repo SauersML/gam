@@ -155,26 +155,72 @@ pub fn configure_global_policy(policy: GpuPolicy) {
     POLICY.set(policy).ok();
 }
 
+/// Joint eligibility state for a GPU kernel at the call site.
+///
+/// Callers construct exactly one variant, which encodes both the compile-time
+/// backend presence and the runtime workload threshold check.  Replacing the
+/// former `(supported: bool, large_enough: bool)` pair removes the possibility
+/// of silently swapping the two flags at a call site: each meaningful state
+/// has exactly one constructor and the `match` inside [`decide`] is total.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GpuEligibility {
+    /// Vendor backend is not compiled into this build for this kernel.
+    BackendNotCompiled,
+    /// Backend is compiled in, but the workload (n, m, ...) is below the
+    /// runtime threshold for this kernel.
+    WorkloadBelowThreshold,
+    /// Backend is compiled in and the workload is large enough; the only
+    /// remaining gates are policy and runtime probe.
+    Eligible,
+}
+
+impl GpuEligibility {
+    /// Combine the compile-time backend flag with the workload predicate into
+    /// the canonical joint state.  Use this only when you genuinely have two
+    /// independent booleans; otherwise prefer constructing a variant directly.
+    #[inline]
+    pub const fn from_flags(supported: bool, large_enough: bool) -> Self {
+        if !supported {
+            Self::BackendNotCompiled
+        } else if !large_enough {
+            Self::WorkloadBelowThreshold
+        } else {
+            Self::Eligible
+        }
+    }
+}
+
 /// Decide whether a GPU kernel may run. This is deliberately conservative:
 /// with no compiled vendor backend, `auto` returns CPU fallback and `force`
 /// returns an error at the call site through [`GpuDecision::require_supported`].
-pub fn decide(kernel: GpuKernel, supported: bool, large_enough: bool) -> GpuDecision {
+pub fn decide(kernel: GpuKernel, eligibility: GpuEligibility) -> GpuDecision {
     let policy = global_policy();
     // Auto must consult the actual probed runtime, not only the
-    // compile-time `supported` flag. Without this, `decide()` would claim
+    // compile-time eligibility.  Without this, `decide()` would claim
     // GPU when the kernel is "compiled in" even though `GpuRuntime::global()`
     // observed no device — silently producing CPU work via failed dispatch
     // and hiding the cpu_reason from callers wanting to log fallback cause.
     let runtime_available = runtime::GpuRuntime::is_available();
-    let (use_gpu, reason) = match policy {
-        GpuPolicy::Off => (false, "cpu-gpu-policy-off"),
-        GpuPolicy::Auto if !supported => (false, "cpu-gpu-backend-not-compiled"),
-        GpuPolicy::Auto if !runtime_available => (false, "cpu-gpu-runtime-unavailable"),
-        GpuPolicy::Auto if !large_enough => (false, "cpu-workload-below-gpu-threshold"),
-        GpuPolicy::Auto => (true, "gpu-auto-supported"),
-        GpuPolicy::Force if !supported => (false, "cpu-gpu-force-unsupported"),
-        GpuPolicy::Force if !runtime_available => (false, "cpu-gpu-force-runtime-unavailable"),
-        GpuPolicy::Force => (true, "gpu-force-supported"),
+    let (use_gpu, reason) = match (policy, eligibility) {
+        (GpuPolicy::Off, _) => (false, "cpu-gpu-policy-off"),
+        (GpuPolicy::Auto, GpuEligibility::BackendNotCompiled) => {
+            (false, "cpu-gpu-backend-not-compiled")
+        }
+        (GpuPolicy::Auto, _) if !runtime_available => (false, "cpu-gpu-runtime-unavailable"),
+        (GpuPolicy::Auto, GpuEligibility::WorkloadBelowThreshold) => {
+            (false, "cpu-workload-below-gpu-threshold")
+        }
+        (GpuPolicy::Auto, GpuEligibility::Eligible) => (true, "gpu-auto-supported"),
+        (GpuPolicy::Force, GpuEligibility::BackendNotCompiled) => {
+            (false, "cpu-gpu-force-unsupported")
+        }
+        (GpuPolicy::Force, _) if !runtime_available => {
+            (false, "cpu-gpu-force-runtime-unavailable")
+        }
+        // Under `force`, the workload-threshold gate is intentionally bypassed:
+        // the user explicitly asked for GPU regardless of size.
+        (GpuPolicy::Force, GpuEligibility::WorkloadBelowThreshold)
+        | (GpuPolicy::Force, GpuEligibility::Eligible) => (true, "gpu-force-supported"),
     };
     GpuDecision {
         policy,

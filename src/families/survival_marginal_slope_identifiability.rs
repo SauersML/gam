@@ -906,6 +906,138 @@ pub fn pull_back_blockwise_penalty_per_term(
     Ok(BlockwisePenalty::new(compiled_start..compiled_end, sym))
 }
 
+/// Per-term-aware compiled designs + penalties + block-diagonal V
+/// matrices for the result-time β lift. The construction site swaps
+/// raw designs/penalties for these compiled versions before building
+/// `ParameterBlockSpec`s; at fit result the per-block β is lifted via
+/// `v_time · β_time_compiled` (and similarly for marginal/logslope) to
+/// produce raw-width β that predict-time consumes unchanged.
+pub struct CompiledSurvivalDesignsPerTerm {
+    pub time_design_entry: DesignMatrix,
+    pub time_design_exit: DesignMatrix,
+    pub time_design_derivative_exit: DesignMatrix,
+    pub marginal_design: DesignMatrix,
+    pub logslope_design: DesignMatrix,
+    pub time_penalties: Vec<crate::terms::smooth::BlockwisePenalty>,
+    pub marginal_penalties: Vec<crate::terms::smooth::BlockwisePenalty>,
+    pub logslope_penalties: Vec<crate::terms::smooth::BlockwisePenalty>,
+    /// Block-diagonal V for each block: rows = raw block width,
+    /// cols = compiled block width. Used by `lift_smgs_block_betas_to_raw`
+    /// at fit result to map compiled β back to raw β before serialise.
+    pub v_time: Array2<f64>,
+    pub v_marginal: Array2<f64>,
+    pub v_logslope: Array2<f64>,
+}
+
+/// Per-term apply: produce compiled designs + per-term-pulled-back
+/// penalties + the block-diagonal V matrices needed for the result-
+/// time lift.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_per_term_survival_parametric_compile_to_designs(
+    compiled: &SurvivalParametricCompiledPerTerm,
+    time_partition: &[std::ops::Range<usize>],
+    marginal_partition: &[std::ops::Range<usize>],
+    logslope_partition: &[std::ops::Range<usize>],
+    time_design_entry: DesignMatrix,
+    time_design_exit: DesignMatrix,
+    time_design_derivative_exit: DesignMatrix,
+    marginal_design: DesignMatrix,
+    logslope_design: DesignMatrix,
+    time_penalties: &[crate::terms::smooth::BlockwisePenalty],
+    marginal_penalties: &[crate::terms::smooth::BlockwisePenalty],
+    logslope_penalties: &[crate::terms::smooth::BlockwisePenalty],
+) -> Result<CompiledSurvivalDesignsPerTerm, String> {
+    let v_time = compiled.v_time_block_diag();
+    let v_marginal = compiled.v_marginal_block_diag();
+    let v_logslope = compiled.v_logslope_block_diag();
+    let pull_set = |pens: &[crate::terms::smooth::BlockwisePenalty],
+                    partition: &[std::ops::Range<usize>],
+                    v_per_term: &[Array2<f64>]|
+     -> Result<Vec<crate::terms::smooth::BlockwisePenalty>, String> {
+        pens.iter()
+            .map(|p| pull_back_blockwise_penalty_per_term(p, partition, v_per_term))
+            .collect()
+    };
+    Ok(CompiledSurvivalDesignsPerTerm {
+        time_design_entry: wrap_design_with_transform(
+            time_design_entry,
+            &v_time,
+            "smgs per-term apply: time entry",
+        )?,
+        time_design_exit: wrap_design_with_transform(
+            time_design_exit,
+            &v_time,
+            "smgs per-term apply: time exit",
+        )?,
+        time_design_derivative_exit: wrap_design_with_transform(
+            time_design_derivative_exit,
+            &v_time,
+            "smgs per-term apply: time derivative_exit",
+        )?,
+        marginal_design: wrap_design_with_transform(
+            marginal_design,
+            &v_marginal,
+            "smgs per-term apply: marginal",
+        )?,
+        logslope_design: wrap_design_with_transform(
+            logslope_design,
+            &v_logslope,
+            "smgs per-term apply: logslope",
+        )?,
+        time_penalties: pull_set(time_penalties, time_partition, &compiled.v_time_per_term)?,
+        marginal_penalties: pull_set(
+            marginal_penalties,
+            marginal_partition,
+            &compiled.v_marginal_per_term,
+        )?,
+        logslope_penalties: pull_set(
+            logslope_penalties,
+            logslope_partition,
+            &compiled.v_logslope_per_term,
+        )?,
+        v_time,
+        v_marginal,
+        v_logslope,
+    })
+}
+
+/// Per-block V matrices for the SMGS result-time β lift. The block
+/// order is: index 0 = time, 1 = marginal, 2 = logslope, 3+ = flex
+/// (score_warp_dev, link_dev) which are NOT compiled by this path —
+/// they go through `identifiability_compiler::compile` independently
+/// at construction time via `install_compiled_flex_block_into_runtime`
+/// and need no result-time lift.
+#[derive(Debug, Clone)]
+pub struct SmgsLiftPerBlockV {
+    pub v_per_block: Vec<Array2<f64>>,
+}
+
+impl SmgsLiftPerBlockV {
+    /// Lift `block_betas[i]` from compiled width to raw via
+    /// `v_per_block[i] · block_betas[i]` when `i < v_per_block.len()`
+    /// and the V's shape matches; otherwise pass through unchanged
+    /// (so flex blocks and any other consumers stay untouched).
+    pub fn lift_block_betas(&self, block_betas: &mut [Array1<f64>]) {
+        for (i, beta) in block_betas.iter_mut().enumerate() {
+            if let Some(v) = self.v_per_block.get(i) {
+                if v.ncols() == beta.len() && v.nrows() != v.ncols() {
+                    let raw = v.dot(&*beta);
+                    *beta = raw;
+                }
+                // If v is square (identity case) we still apply for
+                // correctness, but the result equals input modulo
+                // floating noise.
+                else if v.ncols() == beta.len() && v.nrows() == v.ncols() {
+                    // Square V — likely identity. Apply for correctness;
+                    // the identity case is a no-op modulo float noise.
+                    let raw = v.dot(&*beta);
+                    *beta = raw;
+                }
+            }
+        }
+    }
+}
+
 /// Run the identifiability compiler on the three survival parametric
 /// blocks (time, marginal, logslope) at a pilot β and return the per-
 /// block V reparameterisation matrices.

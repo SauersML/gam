@@ -1532,10 +1532,6 @@ fn load_parquet_with_schema(
     })
 }
 
-// ---------------------------------------------------------------------------
-// Legacy: encode_recordswith_schema — kept for test backward compatibility
-// ---------------------------------------------------------------------------
-
 pub fn encode_recordswith_inferred_schema(
     headers: Vec<String>,
     records: Vec<StringRecord>,
