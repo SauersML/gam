@@ -20,6 +20,8 @@
 //! substrate.
 
 #[cfg(target_os = "linux")]
+use crate::gpu_err;
+#[cfg(target_os = "linux")]
 use crate::gpu::cubic_cell::host_substrate::HostMomentBatch;
 #[cfg(target_os = "linux")]
 use crate::gpu::cubic_cell::{
