@@ -849,7 +849,7 @@ mod linux_cuda {
         PG1_MAX_B, PgSeed, PolyaGammaBatchInput, SADDLE_MAX_B, SADDLE_MIN_B, XorwowState,
         pg_convolution_cpu_oracle, pg_normal_cpu_oracle,
     };
-    use crate::gpu::error::GpuError;
+    use crate::gpu::error::{GpuError, GpuResultExt};
     use crate::gpu::solver::context_and_stream;
     use cudarc::driver::{CudaContext, CudaModule, CudaStream, LaunchConfig, PushKernelArg};
     use ndarray::Array1;
