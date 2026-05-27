@@ -1202,6 +1202,11 @@ extern "C" __global__ void linf_norm(
             deviance: prev_deviance,
             iterations: max_iter,
             converged,
+            final_eta: download_vec(&ws.stream, &loop_ws.eta_dev)?,
+            final_mu: download_vec(&ws.stream, &loop_ws.row_out.mu)?,
+            final_grad_eta: download_vec(&ws.stream, &loop_ws.row_out.grad_eta)?,
+            final_w_hessian: download_vec(&ws.stream, &loop_ws.row_out.w_hessian)?,
+            final_w_solver: download_vec(&ws.stream, &loop_ws.row_out.w_solver)?,
         })
     }
 

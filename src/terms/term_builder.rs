@@ -147,9 +147,9 @@ pub fn resolve_role_col(
         .ok_or_else(|| missing_column_message(col_map, name, Some(role)))
 }
 
-fn encoded_levels_for_column(ds: &Dataset, col: usize) -> Vec<(u64, String)> {
+fn encoded_levels_for_column(ds: &Dataset, col: ColIdx) -> Vec<(u64, String)> {
     let mut seen = BTreeSet::<u64>::new();
-    for value in ds.values.column(col) {
+    for value in ds.values.column(col.get()) {
         if value.is_finite() {
             seen.insert(value.to_bits());
         }
@@ -157,7 +157,7 @@ fn encoded_levels_for_column(ds: &Dataset, col: usize) -> Vec<(u64, String)> {
     let schema_levels = ds
         .schema
         .columns
-        .get(col)
+        .get(col.get())
         .map(|column| column.levels.as_slice())
         .unwrap_or(&[]);
     seen.into_iter()
@@ -383,7 +383,7 @@ pub fn build_termspec(
                         format!("internal column-kind lookup failed for by variable '{by_name}'")
                     })? {
                         ColumnKindTag::Categorical => {
-                            let levels = encoded_levels_for_column(ds, by_col);
+                            let levels = encoded_levels_for_column(ds, ColIdx::new(by_col));
                             // Add an unpenalized treatment-coded fixed main effect for the factor, unless present already.
                             if !random_terms
                                 .iter()

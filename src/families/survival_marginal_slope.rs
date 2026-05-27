@@ -758,6 +758,47 @@ struct FlexPrimarySlices {
     total: usize,
 }
 
+/// Pack a private `SurvivalFlexTimepointExact` into the Block 10
+/// pub-substrate input type so the shared CPU/GPU pure assembler in
+/// `crate::gpu::survival_flex` can consume it without taking a
+/// dependency on the family's private jet structs.
+pub(crate) fn block10_pack_base(
+    base: &SurvivalFlexTimepointExact,
+) -> crate::gpu::survival_flex::SurvivalFlexBlock10TimepointBase {
+    crate::gpu::survival_flex::SurvivalFlexBlock10TimepointBase {
+        eta: base.eta,
+        chi: base.chi,
+        d: base.d,
+        eta_u: base.eta_u.to_vec(),
+        eta_uv: base.eta_uv.iter().copied().collect(),
+        chi_u: base.chi_u.to_vec(),
+        chi_uv: base.chi_uv.iter().copied().collect(),
+        d_u: base.d_u.to_vec(),
+        d_uv: base.d_uv.iter().copied().collect(),
+    }
+}
+
+pub(crate) fn block10_pack_dir(
+    ext: &SurvivalFlexTimepointDirectionalExact,
+) -> crate::gpu::survival_flex::SurvivalFlexBlock10TimepointDirectional {
+    crate::gpu::survival_flex::SurvivalFlexBlock10TimepointDirectional {
+        eta_uv_dir: ext.eta_uv_dir.iter().copied().collect(),
+        chi_uv_dir: ext.chi_uv_dir.iter().copied().collect(),
+        d_u_dir: ext.d_u_dir.to_vec(),
+        d_uv_dir: ext.d_uv_dir.iter().copied().collect(),
+    }
+}
+
+pub(crate) fn block10_pack_bi(
+    bi: &SurvivalFlexTimepointBiDirectionalExact,
+) -> crate::gpu::survival_flex::SurvivalFlexBlock10TimepointBiDirectional {
+    crate::gpu::survival_flex::SurvivalFlexBlock10TimepointBiDirectional {
+        eta_uv_uv: bi.eta_uv_uv.iter().copied().collect(),
+        chi_uv_uv: bi.chi_uv_uv.iter().copied().collect(),
+        d_uv_uv: bi.d_uv_uv.iter().copied().collect(),
+    }
+}
+
 fn flex_primary_slices(family: &SurvivalMarginalSlopeFamily) -> FlexPrimarySlices {
     let q0 = 0usize;
     let q1 = 1usize;
@@ -10776,6 +10817,17 @@ impl SurvivalMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         dir: &Array1<f64>,
     ) -> Result<Array2<f64>, String> {
+        // Try the GPU substrate path first; fall through to CPU jets if
+        // the GPU path declines (any reason).  GPU path reuses the same
+        // pure assembler so numerics are bit-identical.
+        if let Some(out) = crate::gpu::survival_flex::try_third_contraction_for_survival(
+            self,
+            row,
+            block_states,
+            dir,
+        )? {
+            return Ok(out);
+        }
         self.ensure_scalar_flex_exact_score_geometry("row_flex_primary_third_contracted_exact")?;
         let primary = flex_primary_slices(self);
         let p = primary.total;
@@ -10885,6 +10937,18 @@ impl SurvivalMarginalSlopeFamily {
         dir_u: &Array1<f64>,
         dir_v: &Array1<f64>,
     ) -> Result<Array2<f64>, String> {
+        // Try the GPU substrate path first; fall through to CPU jets if
+        // the GPU path declines.  Both paths share the Block 10 pure
+        // assembler so numerics are bit-identical.
+        if let Some(out) = crate::gpu::survival_flex::try_fourth_contraction_for_survival(
+            self,
+            row,
+            block_states,
+            dir_u,
+            dir_v,
+        )? {
+            return Ok(out);
+        }
         self.ensure_scalar_flex_exact_score_geometry("row_flex_primary_fourth_contracted_exact")?;
         let primary = flex_primary_slices(self);
         let p = primary.total;
@@ -10973,44 +11037,38 @@ impl SurvivalMarginalSlopeFamily {
             row, &primary, q1, primary.q1, a1, g, beta_h, beta_w, dir_u, dir_v,
         )?;
 
-        let ordered_uv = self.compute_survival_fourth_contracted_ordered(
-            row,
-            &primary,
+        // Delegate the per-(u, v) assembly + averaged-ordered
+        // symmetrization to the Block 10 GPU-substrate pure assembler.
+        // Single source of truth shared with the GPU dispatch path.
+        let entry_b = block10_pack_base(&entry_base);
+        let exit_b = block10_pack_base(&exit_base);
+        let entry_d1 = block10_pack_dir(&entry_ext_u);
+        let entry_d2 = block10_pack_dir(&entry_ext_v);
+        let exit_d1 = block10_pack_dir(&exit_ext_u);
+        let exit_d2 = block10_pack_dir(&exit_ext_v);
+        let entry_bi_p = block10_pack_bi(&entry_bi);
+        let exit_bi_p = block10_pack_bi(&exit_bi);
+        let dir_u_vec: Vec<f64> = dir_u.to_vec();
+        let dir_v_vec: Vec<f64> = dir_v.to_vec();
+        let inputs = crate::gpu::survival_flex::SurvivalFlexBlock10FourthInputs {
+            p,
+            qd1_index: primary.qd1,
             qd1,
-            &entry_base,
-            &exit_base,
-            &entry_ext_u,
-            &entry_ext_v,
-            &exit_ext_u,
-            &exit_ext_v,
-            &entry_bi,
-            &exit_bi,
-            dir_u,
-            dir_v,
-        )?;
-        let ordered_vu = self.compute_survival_fourth_contracted_ordered(
-            row,
-            &primary,
-            qd1,
-            &entry_base,
-            &exit_base,
-            &entry_ext_v,
-            &entry_ext_u,
-            &exit_ext_v,
-            &exit_ext_u,
-            &entry_bi,
-            &exit_bi,
-            dir_v,
-            dir_u,
-        )?;
-
-        let mut out = Array2::<f64>::zeros((p, p));
-        for i in 0..p {
-            for j in 0..p {
-                out[[i, j]] = 0.5 * (ordered_uv[[i, j]] + ordered_vu[[i, j]]);
-            }
-        }
-        Ok(out)
+            w: self.weights[row],
+            d: self.event[row],
+            dir_u: &dir_u_vec,
+            dir_v: &dir_v_vec,
+            entry_base: &entry_b,
+            exit_base: &exit_b,
+            entry_ext_u: &entry_d1,
+            entry_ext_v: &entry_d2,
+            exit_ext_u: &exit_d1,
+            exit_ext_v: &exit_d2,
+            entry_bi: &entry_bi_p,
+            exit_bi: &exit_bi_p,
+        };
+        let flat = crate::gpu::survival_flex::cpu_oracle_fourth_contraction(&inputs)?;
+        Ok(Array2::<f64>::from_shape_vec((p, p), flat).map_err(|e| e.to_string())?)
     }
 
     /// Compute the ordered fourth contracted D_{dir2}(D_{dir1}(H[a,b])).
