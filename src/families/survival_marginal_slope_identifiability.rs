@@ -588,6 +588,324 @@ fn pull_back_penalties(penalties: &[PenaltyMatrix], v: &Array2<f64>) -> Vec<Pena
         .collect()
 }
 
+/// Per-term V reparameterisation matrices for the three parametric
+/// survival blocks. Each block's full V is the block-diagonal assembly
+/// of its per-term V's (one entry per element of the input
+/// `*_partition`). Preserves per-term penalty structure: applying
+/// `V_b = block_diag(V_term1, ..., V_termM)` to a per-term BlockwisePenalty
+/// pulls each penalty back only via its OWN term's V, so what was a
+/// per-term λ tunable in REML stays per-term tunable.
+pub struct SurvivalParametricCompiledPerTerm {
+    pub v_time_per_term: Vec<Array2<f64>>,
+    pub v_marginal_per_term: Vec<Array2<f64>>,
+    pub v_logslope_per_term: Vec<Array2<f64>>,
+    /// Per-block drops (raw_cols − sum(kept_cols across terms)).
+    pub drops_by_block: (usize, usize, usize),
+}
+
+impl SurvivalParametricCompiledPerTerm {
+    /// Block-diagonal V for the time block.
+    pub fn v_time_block_diag(&self) -> Array2<f64> {
+        block_diag_from(&self.v_time_per_term)
+    }
+    /// Block-diagonal V for the marginal block.
+    pub fn v_marginal_block_diag(&self) -> Array2<f64> {
+        block_diag_from(&self.v_marginal_per_term)
+    }
+    /// Block-diagonal V for the logslope block.
+    pub fn v_logslope_block_diag(&self) -> Array2<f64> {
+        block_diag_from(&self.v_logslope_per_term)
+    }
+}
+
+/// Stack a list of per-term V matrices into a single block-diagonal V.
+/// Output has rows = sum of raw widths, cols = sum of kept widths.
+fn block_diag_from(v_per_term: &[Array2<f64>]) -> Array2<f64> {
+    let total_rows: usize = v_per_term.iter().map(|v| v.nrows()).sum();
+    let total_cols: usize = v_per_term.iter().map(|v| v.ncols()).sum();
+    let mut out = Array2::<f64>::zeros((total_rows, total_cols));
+    let mut row_off = 0usize;
+    let mut col_off = 0usize;
+    for v in v_per_term {
+        let r = v.nrows();
+        let c = v.ncols();
+        if r > 0 && c > 0 {
+            out.slice_mut(ndarray::s![row_off..row_off + r, col_off..col_off + c])
+                .assign(v);
+        }
+        row_off += r;
+        col_off += c;
+    }
+    out
+}
+
+/// Per-term-aware compile: residualise each block's TERMS individually
+/// in priority order so the emitted V is block-diagonal on term
+/// boundaries. This preserves the per-term penalty structure that
+/// REML's per-λ accounting depends on.
+///
+/// Each `*_partition` is a list of disjoint contiguous column ranges
+/// covering `[0..p_block)`. For the marginal/logslope blocks the
+/// natural source is the union of `BlockwisePenalty::col_range` values
+/// (one per smoothness penalty / term) plus the complement
+/// (unpenalised parametric columns).
+///
+/// Order of residualisation: time terms first (in their partition
+/// order), then marginal terms, then logslope terms. Within each
+/// block, terms are residualised against ALL prior anchor columns
+/// (terms from earlier blocks + earlier terms within this block).
+/// Aliased directions land in the lowest-priority block that contains
+/// them, in the natural term order within that block — matching the
+/// gauge-priority ownership contract.
+pub fn compile_survival_parametric_designs_per_term(
+    time_dq0: Array2<f64>,
+    time_dq1: Array2<f64>,
+    time_dqd1: Array2<f64>,
+    time_partition: &[std::ops::Range<usize>],
+    marginal_dq: Array2<f64>,
+    marginal_dqd1: Array2<f64>,
+    marginal_partition: &[std::ops::Range<usize>],
+    logslope_dg: Array2<f64>,
+    logslope_partition: &[std::ops::Range<usize>],
+    row_hess: &dyn RowHessian,
+) -> Result<SurvivalParametricCompiledPerTerm, String> {
+    use crate::families::identifiability_compiler::compile;
+
+    let p_time = time_dq0.ncols();
+    let p_marg = marginal_dq.ncols();
+    let p_log = logslope_dg.ncols();
+    validate_partition(time_partition, p_time, "time")?;
+    validate_partition(marginal_partition, p_marg, "marginal")?;
+    validate_partition(logslope_partition, p_log, "logslope")?;
+
+    // Build per-term operators. Each term gets its own RowJacobianOperator
+    // restricted to its column slice; the operator type matches the
+    // block's K-channel signature (Time, QChannel, Logslope).
+    let mut operators: Vec<Arc<dyn RowJacobianOperator>> = Vec::new();
+    let mut ordering: Vec<BlockOrder> = Vec::new();
+    for range in time_partition {
+        let dq0 = time_dq0.slice(ndarray::s![.., range.clone()]).to_owned();
+        let dq1 = time_dq1.slice(ndarray::s![.., range.clone()]).to_owned();
+        let dqd1 = time_dqd1.slice(ndarray::s![.., range.clone()]).to_owned();
+        operators.push(Arc::new(TimeBlockOperator::new(dq0, dq1, dqd1)));
+        ordering.push(BlockOrder::Time);
+    }
+    for range in marginal_partition {
+        let dq = marginal_dq.slice(ndarray::s![.., range.clone()]).to_owned();
+        let dqd1 = marginal_dqd1.slice(ndarray::s![.., range.clone()]).to_owned();
+        operators.push(Arc::new(QChannelBlockOperator::new(dq, dqd1)));
+        ordering.push(BlockOrder::Marginal);
+    }
+    for range in logslope_partition {
+        let dg = logslope_dg.slice(ndarray::s![.., range.clone()]).to_owned();
+        operators.push(Arc::new(LogslopeBlockOperator::new(dg)));
+        ordering.push(BlockOrder::Logslope);
+    }
+
+    let compiled = compile(&operators, row_hess, &ordering)
+        .map_err(|e| format!("identifiability_compiler::compile (per-term) failed: {e}"))?;
+    let blocks = compiled.blocks;
+    let n_time = time_partition.len();
+    let n_marg = marginal_partition.len();
+    let n_log = logslope_partition.len();
+    if blocks.len() != n_time + n_marg + n_log {
+        return Err(format!(
+            "per-term compile: expected {} compiled blocks (time={}, marg={}, log={}), got {}",
+            n_time + n_marg + n_log,
+            n_time,
+            n_marg,
+            n_log,
+            blocks.len(),
+        ));
+    }
+    let mut iter = blocks.into_iter();
+    let v_time_per_term: Vec<Array2<f64>> = (0..n_time)
+        .map(|_| iter.next().unwrap().t_lw)
+        .collect();
+    let v_marginal_per_term: Vec<Array2<f64>> = (0..n_marg)
+        .map(|_| iter.next().unwrap().t_lw)
+        .collect();
+    let v_logslope_per_term: Vec<Array2<f64>> = (0..n_log)
+        .map(|_| iter.next().unwrap().t_lw)
+        .collect();
+    let drops_time: usize = time_partition
+        .iter()
+        .zip(v_time_per_term.iter())
+        .map(|(r, v)| r.len().saturating_sub(v.ncols()))
+        .sum();
+    let drops_marg: usize = marginal_partition
+        .iter()
+        .zip(v_marginal_per_term.iter())
+        .map(|(r, v)| r.len().saturating_sub(v.ncols()))
+        .sum();
+    let drops_log: usize = logslope_partition
+        .iter()
+        .zip(v_logslope_per_term.iter())
+        .map(|(r, v)| r.len().saturating_sub(v.ncols()))
+        .sum();
+    Ok(SurvivalParametricCompiledPerTerm {
+        v_time_per_term,
+        v_marginal_per_term,
+        v_logslope_per_term,
+        drops_by_block: (drops_time, drops_marg, drops_log),
+    })
+}
+
+fn validate_partition(
+    partition: &[std::ops::Range<usize>],
+    p_block: usize,
+    label: &str,
+) -> Result<(), String> {
+    if partition.is_empty() {
+        if p_block == 0 {
+            return Ok(());
+        }
+        return Err(format!(
+            "{label} partition empty but block has p={p_block} columns"
+        ));
+    }
+    if partition[0].start != 0 {
+        return Err(format!(
+            "{label} partition must start at 0, got start={}",
+            partition[0].start
+        ));
+    }
+    if partition.last().unwrap().end != p_block {
+        return Err(format!(
+            "{label} partition must cover [0, {p_block}); last range ends at {}",
+            partition.last().unwrap().end
+        ));
+    }
+    for w in partition.windows(2) {
+        if w[0].end != w[1].start {
+            return Err(format!(
+                "{label} partition has gap/overlap between [{}..{}) and [{}..{})",
+                w[0].start, w[0].end, w[1].start, w[1].end
+            ));
+        }
+        if w[0].is_empty() {
+            return Err(format!(
+                "{label} partition has empty range [{}..{})",
+                w[0].start, w[0].end
+            ));
+        }
+    }
+    if partition.last().unwrap().is_empty() {
+        return Err(format!(
+            "{label} partition's final range is empty",
+        ));
+    }
+    Ok(())
+}
+
+/// Derive a disjoint contiguous partition of `[0..p_block)` from a
+/// list of BlockwisePenalty col_ranges. Distinct penalty ranges define
+/// term boundaries; gaps between them (unpenalised columns) become
+/// their own single-column partitions. Multiple penalties with the
+/// SAME col_range (e.g. tensor anisotropy axes) coalesce to one term.
+pub fn extract_term_partition_from_penalty_ranges(
+    p_block: usize,
+    penalty_ranges: &[std::ops::Range<usize>],
+) -> Vec<std::ops::Range<usize>> {
+    use std::collections::BTreeSet;
+    let mut starts: BTreeSet<usize> = BTreeSet::new();
+    starts.insert(0);
+    starts.insert(p_block);
+    for r in penalty_ranges {
+        starts.insert(r.start.min(p_block));
+        starts.insert(r.end.min(p_block));
+    }
+    let v: Vec<usize> = starts.into_iter().collect();
+    v.windows(2).filter_map(|w| if w[0] < w[1] { Some(w[0]..w[1]) } else { None }).collect()
+}
+
+/// Pull back a BlockwisePenalty under a block-diagonal V whose per-term
+/// V's are listed in `v_per_term`, partitioned by `raw_partition`.
+/// The penalty's `col_range` must lie within a single partition entry
+/// (i.e. the penalty belongs to one term). Returns a new BlockwisePenalty
+/// with `local = V_term^T · local · V_term` and `col_range` shifted to
+/// compiled coordinates.
+pub fn pull_back_blockwise_penalty_per_term(
+    pen: &crate::terms::smooth::BlockwisePenalty,
+    raw_partition: &[std::ops::Range<usize>],
+    v_per_term: &[Array2<f64>],
+) -> Result<crate::terms::smooth::BlockwisePenalty, String> {
+    use crate::terms::smooth::BlockwisePenalty;
+    if raw_partition.len() != v_per_term.len() {
+        return Err(format!(
+            "pull_back_blockwise_penalty_per_term: partition len {} != v_per_term len {}",
+            raw_partition.len(),
+            v_per_term.len()
+        ));
+    }
+    // Find which term the penalty belongs to.
+    let mut term_idx = None;
+    for (idx, range) in raw_partition.iter().enumerate() {
+        if pen.col_range.start >= range.start && pen.col_range.end <= range.end {
+            term_idx = Some(idx);
+            break;
+        }
+    }
+    let term_idx = term_idx.ok_or_else(|| {
+        format!(
+            "pull_back_blockwise_penalty_per_term: penalty col_range {}..{} does not fit \
+             within any term partition (partition entries: {:?})",
+            pen.col_range.start, pen.col_range.end, raw_partition
+        )
+    })?;
+    let v_term = &v_per_term[term_idx];
+    let term_range = &raw_partition[term_idx];
+    // The penalty's local matrix is sized `pen.col_range.len()` and
+    // covers a *sub-region* of the term (some smooths emit a single
+    // penalty over the whole term; tensor smooths can emit multiple
+    // penalties at the same col_range; anisotropic constructions can
+    // emit a penalty over a sub-range of the term). We need a V slice
+    // that lines up with pen.col_range relative to term_range.start.
+    let local_off_start = pen.col_range.start - term_range.start;
+    let local_off_end = pen.col_range.end - term_range.start;
+    // Per-term V is (term_p × term_p_kept). Slicing the rows of V along
+    // pen.col_range's offset within the term gives the sub-block to use
+    // for pullback. Equivalently: build an embedded V_full at term width
+    // and multiply V_full^T · embed(local) · V_full.
+    //
+    // For correctness when the penalty doesn't cover the full term, we
+    // embed the local matrix to the full term width, then pull back via
+    // the whole V_term, then keep all kept-cols of the result. This
+    // matches the canonical Vᵀ embed(S) V on the term subspace.
+    let term_p = term_range.len();
+    let mut embedded = Array2::<f64>::zeros((term_p, term_p));
+    for i in 0..pen.col_range.len() {
+        for j in 0..pen.col_range.len() {
+            embedded[[local_off_start + i, local_off_start + j]] = pen.local[[i, j]];
+        }
+    }
+    // Vᵀ · embedded · V
+    let temp = embedded.dot(v_term);
+    let pulled = v_term.t().dot(&temp);
+    // Symmetrise to wash out floating noise.
+    let r = pulled.nrows();
+    let mut sym = Array2::<f64>::zeros((r, r));
+    for i in 0..r {
+        for j in 0..r {
+            sym[[i, j]] = 0.5 * (pulled[[i, j]] + pulled[[j, i]]);
+        }
+    }
+    // Compiled term col_range: offsets in the compiled (block-diagonal)
+    // coordinate are the cumulative sum of v_per_term[k].ncols() up to
+    // term_idx.
+    let mut compiled_start = 0usize;
+    for v in v_per_term.iter().take(term_idx) {
+        compiled_start += v.ncols();
+    }
+    let compiled_end = compiled_start + v_term.ncols();
+    // The pen.local previously covered local_off_start..local_off_end of
+    // the term; after pullback we drop that sub-region distinction and
+    // the new penalty covers the WHOLE compiled term (since the
+    // embedded-then-pulled-back form is over all term-kept cols).
+    let _ = local_off_end;
+    Ok(BlockwisePenalty::new(compiled_start..compiled_end, sym))
+}
+
 /// Run the identifiability compiler on the three survival parametric
 /// blocks (time, marginal, logslope) at a pilot β and return the per-
 /// block V reparameterisation matrices.
@@ -799,6 +1117,134 @@ mod tests {
         assert_eq!(out[2], 0.0);
         let want = dg[[1, 0]] * 2.0 + dg[[1, 1]] * (-1.0);
         assert!((out[3] - want).abs() < 1e-12);
+    }
+
+    #[test]
+    fn extract_term_partition_simple_cases() {
+        // No penalties: whole block is one term.
+        let part = extract_term_partition_from_penalty_ranges(5, &[]);
+        assert_eq!(part, vec![0..5]);
+        // One penalty covering the whole block.
+        let part = extract_term_partition_from_penalty_ranges(5, &[0..5]);
+        assert_eq!(part, vec![0..5]);
+        // Two penalties with a gap: produces three terms (pen1, gap, pen2).
+        let part = extract_term_partition_from_penalty_ranges(10, &[0..3, 6..10]);
+        assert_eq!(part, vec![0..3, 3..6, 6..10]);
+        // Duplicate penalty ranges coalesce.
+        let part = extract_term_partition_from_penalty_ranges(6, &[0..3, 0..3, 3..6]);
+        assert_eq!(part, vec![0..3, 3..6]);
+        // Empty block.
+        let part = extract_term_partition_from_penalty_ranges(0, &[]);
+        assert!(part.is_empty());
+    }
+
+    #[test]
+    fn block_diag_from_assembles_correctly() {
+        let v1 = Array2::<f64>::from_shape_fn((3, 2), |(i, j)| (i * 2 + j + 1) as f64);
+        let v2 = Array2::<f64>::from_shape_fn((2, 2), |(i, j)| (10 + i * 2 + j) as f64);
+        let bd = block_diag_from(&[v1.clone(), v2.clone()]);
+        assert_eq!(bd.dim(), (5, 4));
+        // Top-left = v1, bottom-right = v2, off-blocks = zero.
+        for i in 0..3 {
+            for j in 0..2 {
+                assert_eq!(bd[[i, j]], v1[[i, j]]);
+                assert_eq!(bd[[i, 2 + j]], 0.0);
+            }
+        }
+        for i in 0..2 {
+            for j in 0..2 {
+                assert_eq!(bd[[3 + i, 2 + j]], v2[[i, j]]);
+                assert_eq!(bd[[3 + i, j]], 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn pull_back_blockwise_penalty_per_term_full_term_identity_v() {
+        use crate::terms::smooth::BlockwisePenalty;
+        // Single-term partition, identity V → pullback returns input.
+        let v_term = Array2::<f64>::eye(3);
+        let v_per_term = vec![v_term];
+        let partition = vec![0..3];
+        let local = Array2::<f64>::from_shape_fn((3, 3), |(i, j)| (i + j) as f64);
+        let pen = BlockwisePenalty::new(0..3, local.clone());
+        let out = pull_back_blockwise_penalty_per_term(&pen, &partition, &v_per_term)
+            .expect("identity-V pullback must succeed");
+        assert_eq!(out.col_range, 0..3);
+        for i in 0..3 {
+            for j in 0..3 {
+                assert!((out.local[[i, j]] - 0.5 * (local[[i, j]] + local[[j, i]])).abs() < 1e-12);
+            }
+        }
+    }
+
+    #[test]
+    fn pull_back_blockwise_penalty_per_term_drops_one_column() {
+        use crate::terms::smooth::BlockwisePenalty;
+        // 3-column term, V drops one column (3 → 2): V is the 3×2
+        // matrix with columns e_1 and e_2 (drop the constant).
+        let mut v_term = Array2::<f64>::zeros((3, 2));
+        v_term[[1, 0]] = 1.0;
+        v_term[[2, 1]] = 1.0;
+        let partition = vec![0..3];
+        let local = Array2::<f64>::from_shape_fn((3, 3), |(i, j)| (i + j + 1) as f64);
+        let pen = BlockwisePenalty::new(0..3, local.clone());
+        let out = pull_back_blockwise_penalty_per_term(&pen, &partition, &[v_term])
+            .expect("selection-V pullback must succeed");
+        assert_eq!(out.col_range, 0..2);
+        // Expected: pullback is the (1..3, 1..3) sub-block of the
+        // symmetric part of `local`.
+        let sym = |i: usize, j: usize| 0.5 * (local[[i, j]] + local[[j, i]]);
+        assert!((out.local[[0, 0]] - sym(1, 1)).abs() < 1e-12);
+        assert!((out.local[[0, 1]] - sym(1, 2)).abs() < 1e-12);
+        assert!((out.local[[1, 0]] - sym(2, 1)).abs() < 1e-12);
+        assert!((out.local[[1, 1]] - sym(2, 2)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn pull_back_blockwise_penalty_per_term_routes_to_correct_term() {
+        use crate::terms::smooth::BlockwisePenalty;
+        // Two-term partition: term0 = 0..2, term1 = 2..5.
+        // V_term0 = 2×2 identity; V_term1 drops 1 col (3 → 2).
+        let v0 = Array2::<f64>::eye(2);
+        let mut v1 = Array2::<f64>::zeros((3, 2));
+        v1[[0, 0]] = 1.0;
+        v1[[2, 1]] = 1.0;
+        let partition = vec![0..2, 2..5];
+        let v_per_term = vec![v0, v1];
+        // Penalty over term1 only (col_range 2..5).
+        let local1 = Array2::<f64>::from_shape_fn((3, 3), |(i, j)| (10 + i + j) as f64);
+        let pen1 = BlockwisePenalty::new(2..5, local1.clone());
+        let out1 = pull_back_blockwise_penalty_per_term(&pen1, &partition, &v_per_term)
+            .expect("term1 pullback must succeed");
+        // Compiled col_range for term1 = (0+2)..(0+2)+v1.ncols() = 2..4.
+        assert_eq!(out1.col_range, 2..4);
+        // Pullback expected: V1ᵀ · sym(local1) · V1, which picks rows/
+        // cols (0, 2) of sym(local1).
+        let sym = |i: usize, j: usize| 0.5 * (local1[[i, j]] + local1[[j, i]]);
+        assert!((out1.local[[0, 0]] - sym(0, 0)).abs() < 1e-12);
+        assert!((out1.local[[0, 1]] - sym(0, 2)).abs() < 1e-12);
+        assert!((out1.local[[1, 0]] - sym(2, 0)).abs() < 1e-12);
+        assert!((out1.local[[1, 1]] - sym(2, 2)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn validate_partition_rejects_bad_partitions() {
+        // Doesn't start at 0.
+        assert!(validate_partition(&[1..5], 5, "test").is_err());
+        // Doesn't cover the block.
+        assert!(validate_partition(&[0..3], 5, "test").is_err());
+        // Has a gap.
+        assert!(validate_partition(&[0..2, 3..5], 5, "test").is_err());
+        // Has overlap.
+        assert!(validate_partition(&[0..3, 2..5], 5, "test").is_err());
+        // Has empty range.
+        assert!(validate_partition(&[0..0, 0..5], 5, "test").is_err());
+        // Empty block + empty partition OK.
+        assert!(validate_partition(&[], 0, "test").is_ok());
+        // Valid partition.
+        assert!(validate_partition(&[0..2, 2..5], 5, "test").is_ok());
+        assert!(validate_partition(&[0..5], 5, "test").is_ok());
     }
 
     /// Phase-4b application step: take the V matrices from
