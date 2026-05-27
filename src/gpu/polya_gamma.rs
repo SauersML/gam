@@ -807,7 +807,7 @@ mod linux_cuda {
     use crate::gpu::solver::context_and_stream;
     use cudarc::driver::{CudaContext, CudaModule, CudaStream, LaunchConfig, PushKernelArg};
     use ndarray::Array1;
-    use std::sync::{Arc, OnceLock};
+    use std::sync::Arc;
 
     /// NVRTC source for the three regime kernels plus shared device-side
     /// XORWOW state advance, SplitMix64 seeding, and the Devroye and

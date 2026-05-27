@@ -1779,9 +1779,7 @@ pub(crate) fn install_compiled_flex_block_into_runtime(
     flex_anchors: &[&Array2<f64>],
     training_row_weights: &Array1<f64>,
 ) -> Result<FlexCompileOutcome, String> {
-    use crate::families::bernoulli_marginal_slope::deviation_runtime::{
-        AnchorComponentTag, InstalledFlexBlock,
-    };
+    use crate::families::bernoulli_marginal_slope::deviation_runtime::AnchorComponentTag;
     use crate::families::bernoulli_marginal_slope_identifiability::{
         BernoulliDenseDesignOperator, BernoulliRowHessian,
     };

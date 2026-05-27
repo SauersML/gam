@@ -838,7 +838,7 @@ mod linux_cuda {
     use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
     use cudarc::cusolver::DnHandle;
     use cudarc::driver::{CudaContext, CudaModule, CudaStream, LaunchConfig, PushKernelArg};
-    use std::sync::{Arc, OnceLock};
+    use std::sync::Arc;
 
     /// NVRTC source for the three custom kernels used by this path. All
     /// arithmetic is in `double` and the layouts are column-major to match
