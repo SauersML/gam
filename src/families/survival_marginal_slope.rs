@@ -18854,6 +18854,96 @@ pub fn fit_survival_marginal_slope_terms(
                 }
             }
             let row_hess = SurvivalRowHessian::from_full(h_full);
+
+            // Closed-form Gram probe: assemble the SMGS K=4 channel-block
+            // view (time → q0/q1/qd1; marginal → q0/q1; logslope → g),
+            // build (K^H, K^S) via the GPU-or-CPU dispatcher, and run
+            // `compile_from_raw_grams`. The result is logged for parity
+            // tracking; the per-term V/R path below remains load-bearing
+            // until the result-time lift can consume a `CompiledMap` T
+            // directly. On any probe failure we log and continue.
+            {
+                use crate::families::identifiability_compiler::{
+                    BlockOrder as IdBlockOrder, PrimaryChannelBlocks, build_primary_grams_gpu_or_cpu,
+                    compile_from_raw_grams,
+                };
+                let probe = (|| -> Result<(usize, usize, usize), String> {
+                    let time_slots: Vec<Option<ndarray::Array2<f64>>> = vec![
+                        Some(dq0.clone()),
+                        Some(dq1.clone()),
+                        Some(dqd1.clone()),
+                        None,
+                    ];
+                    let marg_slots: Vec<Option<ndarray::Array2<f64>>> = vec![
+                        Some(m_dq.clone()),
+                        Some(m_dq.clone()),
+                        Some(m_dqd1.clone()),
+                        None,
+                    ];
+                    let log_slots: Vec<Option<ndarray::Array2<f64>>> = vec![
+                        None,
+                        None,
+                        None,
+                        Some(g_dg.clone()),
+                    ];
+                    let channel_blocks = PrimaryChannelBlocks {
+                        blocks: vec![time_slots, marg_slots, log_slots],
+                    };
+                    let p_total_raw = p_time + p_marg + p_log;
+                    let raw_ranges = vec![
+                        0..p_time,
+                        p_time..(p_time + p_marg),
+                        (p_time + p_marg)..p_total_raw,
+                    ];
+                    let (gram_h, gram_struct) = build_primary_grams_gpu_or_cpu(
+                        &channel_blocks,
+                        &row_hess,
+                        &raw_ranges,
+                    )
+                    .map_err(|e| format!("gram build: {e}"))?;
+                    let map = compile_from_raw_grams(
+                        &gram_h,
+                        &gram_struct,
+                        &raw_ranges,
+                        &[
+                            IdBlockOrder::Time,
+                            IdBlockOrder::Marginal,
+                            IdBlockOrder::Logslope,
+                        ],
+                    )
+                    .map_err(|e| format!("compile_from_raw_grams: {e}"))?;
+                    if map.raw_from_compiled.shape()[0] != p_total_raw {
+                        return Err(format!(
+                            "T raw width {} != expected {}",
+                            map.raw_from_compiled.shape()[0],
+                            p_total_raw
+                        ));
+                    }
+                    if !map.raw_from_compiled.iter().all(|v| v.is_finite()) {
+                        return Err("T contains non-finite entries".to_string());
+                    }
+                    let w_time = map.compiled_block_ranges[0].len();
+                    let w_marg = map.compiled_block_ranges[1].len();
+                    let w_log = map.compiled_block_ranges[2].len();
+                    Ok((w_time, w_marg, w_log))
+                })();
+                match probe {
+                    Ok((wt, wm, wl)) => {
+                        log::info!(
+                            "[smgs phase-4b gram-probe] compile_from_raw_grams ok: \
+                             time {p_time}→{wt}, marginal {p_marg}→{wm}, logslope {p_log}→{wl}; \
+                             production path = per_term_vm_exact"
+                        );
+                    }
+                    Err(reason) => {
+                        log::info!(
+                            "[smgs phase-4b gram-probe] closed-form path unavailable ({reason}); \
+                             production path = per_term_vm_exact"
+                        );
+                    }
+                }
+            }
+
             let compiled = compile_survival_parametric_designs_per_term(
                 dq0,
                 dq1,

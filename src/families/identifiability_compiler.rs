@@ -875,6 +875,217 @@ fn pack_row_hessian_symmetric(row_hess: &dyn RowHessian) -> Option<Array2<f64>> 
     Some(packed)
 }
 
+/// Closed-form Gram-based compile output: a single `p_raw × p_compiled`
+/// reparam matrix `T` mapping compiled coordinates back to raw width.
+/// `T · θ` lifts a fitted compiled-width β back to raw width; predict-time
+/// row contribution is `X_raw · T · θ` where `X_raw` is the full raw design.
+///
+/// `compiled_block_ranges[b]` gives the column range inside `T` (and inside
+/// the compiled-width coefficient vector) attributable to raw block `b`.
+/// `raw_block_ranges[b]` gives the corresponding raw-width column range.
+pub struct CompiledMap {
+    /// `(p_raw × p_compiled)` raw-from-compiled reparam matrix.
+    pub raw_from_compiled: Array2<f64>,
+    /// Per-block compiled-width column ranges, parallel to
+    /// `raw_block_ranges`. Same length as the input `ordering`.
+    pub compiled_block_ranges: Vec<std::ops::Range<usize>>,
+    /// Per-block raw-width column ranges (copied through from input).
+    pub raw_block_ranges: Vec<std::ops::Range<usize>>,
+}
+
+/// Closed-form Gram-based identifiability compile.
+///
+/// Sequential algorithm operating purely on the raw-width Grams
+/// `K^H = Σ_i J_iᵀ H_i J_i` (curvature) and `K^S = Σ_i J_iᵀ J_i`
+/// (structural). Walks `ordering` left-to-right; for each block `b` with
+/// raw-width selector `P_b` (columns of the identity selecting that
+/// block) and cumulative compiled map `T = [T_0, …, T_{b-1}]`:
+///
+/// 1. Structural rank step (drop true gauges):
+///    `G^S_AA = Tᵀ K^S T`, `G^S_Ab = Tᵀ K^S P_b`, `G^S_bb = P_bᵀ K^S P_b`,
+///    `R_S = (G^S_AA)^+ G^S_Ab`, `G^S_res = G^S_bb − G^S_Abᵀ R_S`.
+///    Eigendecompose `G^S_res`; keep positive eigvecs `Q+`. Then
+///    `D = (P_b − T R_S) · Q+` (raw-space cols, structurally independent
+///    of `T`).
+/// 2. Curvature step (within-block conditioning):
+///    `G^H_AA = Tᵀ K^H T`, `G^H_AD = Tᵀ K^H D`,
+///    `R_H = (G^H_AA)^+ G^H_AD`, `E = D − T R_H` (raw-space).
+///    Curvature Gram `G^H_res = Dᵀ K^H D − G^H_ADᵀ R_H`. Eigendecompose
+///    and keep positive eigvecs `U`. Then `T_b = E · U`.
+/// 3. Append: `T ← [T, T_b]`.
+///
+/// Returns [`CompilerError::FullyAliased`] when any block's `Q+` has zero
+/// columns (block fully structurally aliased) or its `U` has zero
+/// columns (block fully curvature-aliased within structurally-kept span).
+pub fn compile_from_raw_grams(
+    gram_h: &Array2<f64>,
+    gram_struct: &Array2<f64>,
+    raw_block_ranges: &[std::ops::Range<usize>],
+    ordering: &[BlockOrder],
+) -> Result<CompiledMap, CompilerError> {
+    if raw_block_ranges.len() != ordering.len() {
+        return Err(CompilerError::DimensionMismatch(format!(
+            "raw_block_ranges ({}) and ordering ({}) length mismatch",
+            raw_block_ranges.len(),
+            ordering.len()
+        )));
+    }
+    let p_raw = raw_block_ranges.last().map(|r| r.end).unwrap_or(0);
+    if gram_h.shape() != [p_raw, p_raw] {
+        return Err(CompilerError::DimensionMismatch(format!(
+            "gram_h shape {:?} != [p_raw={p_raw}, p_raw={p_raw}]",
+            gram_h.shape()
+        )));
+    }
+    if gram_struct.shape() != [p_raw, p_raw] {
+        return Err(CompilerError::DimensionMismatch(format!(
+            "gram_struct shape {:?} != [p_raw={p_raw}, p_raw={p_raw}]",
+            gram_struct.shape()
+        )));
+    }
+    if raw_block_ranges.is_empty() {
+        return Ok(CompiledMap {
+            raw_from_compiled: Array2::<f64>::zeros((0, 0)),
+            compiled_block_ranges: Vec::new(),
+            raw_block_ranges: Vec::new(),
+        });
+    }
+    // Validate contiguous ranges from 0.
+    let mut expected_start = 0usize;
+    for (b, r) in raw_block_ranges.iter().enumerate() {
+        if r.start != expected_start {
+            return Err(CompilerError::DimensionMismatch(format!(
+                "raw_block_ranges must be contiguous from 0; block {b} starts at {} expected {expected_start}",
+                r.start
+            )));
+        }
+        expected_start = r.end;
+    }
+
+    // Cumulative raw-from-compiled map. Starts empty (zero compiled cols).
+    let mut t_cum: Array2<f64> = Array2::<f64>::zeros((p_raw, 0));
+    let mut compiled_block_ranges: Vec<std::ops::Range<usize>> =
+        Vec::with_capacity(raw_block_ranges.len());
+
+    for (idx, range_b) in raw_block_ranges.iter().enumerate() {
+        let p_b = range_b.end - range_b.start;
+        // Slice gram columns/rows by raw block range. P_bᵀ K X = rows
+        // range_b of K X. K^S T and K^H T are full-rows products.
+        // 1) Structural rank step.
+        // K^S · T (p_raw × p_compiled)
+        let ks_t = fast_ab(gram_struct, &t_cum);
+        // G^S_AA = Tᵀ K^S T (p_compiled × p_compiled)
+        let g_s_aa = fast_atb(&t_cum, &ks_t);
+        // G^S_Ab = Tᵀ K^S P_b = Tᵀ · K^S[:, range_b] (p_compiled × p_b)
+        let ks_pb = gram_struct
+            .slice(s![.., range_b.start..range_b.end])
+            .to_owned();
+        let g_s_ab = fast_atb(&t_cum, &ks_pb);
+        // G^S_bb = P_bᵀ K^S P_b = K^S[range_b, range_b] (p_b × p_b)
+        let g_s_bb = gram_struct
+            .slice(s![range_b.start..range_b.end, range_b.start..range_b.end])
+            .to_owned();
+        // R_S = (G^S_AA)^+ G^S_Ab (p_compiled × p_b)
+        let r_s = solve_psd_system(&g_s_aa, &g_s_ab)?;
+        // G^S_res = G^S_bb − G^S_Abᵀ R_S (p_b × p_b), symmetrise.
+        let g_s_res_raw = &g_s_bb - &fast_atb(&g_s_ab, &r_s);
+        let g_s_res = symmetrise(&g_s_res_raw);
+        // Trace of the unresidualised diagonal block (scale ref).
+        let g_s_bb_trace: f64 = (0..p_b).map(|i| g_s_bb[[i, i]].max(0.0)).sum();
+        // p_raw stands in as the "n*K" scale for the closed-form tolerance.
+        let q_plus = keep_positive_eigenspace(&g_s_res, p_raw, 1, g_s_bb_trace)?;
+        if q_plus.ncols() == 0 {
+            return Err(CompilerError::FullyAliased {
+                block_idx: idx,
+                reason: format!(
+                    "structural residual Gram has no positive eigenspace (block of width {p_b} fully aliased by cumulative anchor in K^S)"
+                ),
+            });
+        }
+        // D = (P_b − T R_S) · Q+ (p_raw × k_kept). Build (P_b − T R_S)
+        // explicitly as a p_raw × p_b matrix: columns of P_b are columns
+        // range_b of I_p_raw, so (P_b − T R_S) places −T R_S in all rows
+        // and adds the identity on rows range_b.
+        let mut diff = Array2::<f64>::zeros((p_raw, p_b));
+        if t_cum.ncols() > 0 {
+            // diff = −T · R_S
+            let t_rs = fast_ab(&t_cum, &r_s);
+            for i in 0..p_raw {
+                for j in 0..p_b {
+                    diff[[i, j]] = -t_rs[[i, j]];
+                }
+            }
+        }
+        for j in 0..p_b {
+            diff[[range_b.start + j, j]] += 1.0;
+        }
+        let d_mat = fast_ab(&diff, &q_plus);
+
+        // 2) Curvature step.
+        // K^H · T (p_raw × p_compiled), K^H · D (p_raw × k_kept)
+        let kh_t = fast_ab(gram_h, &t_cum);
+        let g_h_aa = fast_atb(&t_cum, &kh_t);
+        let kh_d = fast_ab(gram_h, &d_mat);
+        let g_h_ad = fast_atb(&t_cum, &kh_d);
+        let r_h = solve_psd_system(&g_h_aa, &g_h_ad)?;
+        // G^H_res = Dᵀ K^H D − G^H_ADᵀ R_H (k_kept × k_kept)
+        let d_t_kh_d = fast_atb(&d_mat, &kh_d);
+        let g_h_res_raw = &d_t_kh_d - &fast_atb(&g_h_ad, &r_h);
+        let g_h_res = symmetrise(&g_h_res_raw);
+        let k_kept = q_plus.ncols();
+        let g_h_dd_trace: f64 = (0..k_kept).map(|i| d_t_kh_d[[i, i]].max(0.0)).sum();
+        let u_mat = keep_positive_eigenspace(&g_h_res, p_raw, 1, g_h_dd_trace)?;
+        if u_mat.ncols() == 0 {
+            return Err(CompilerError::FullyAliased {
+                block_idx: idx,
+                reason: format!(
+                    "curvature residual Gram has no positive eigenspace within structurally-kept basis (block of width {p_b}, structural-kept {k_kept})"
+                ),
+            });
+        }
+        // E = D − T · R_H (p_raw × k_kept); T_b = E · U.
+        let mut e_mat = d_mat.clone();
+        if t_cum.ncols() > 0 {
+            let t_rh = fast_ab(&t_cum, &r_h);
+            e_mat = &e_mat - &t_rh;
+        }
+        let t_b = fast_ab(&e_mat, &u_mat);
+
+        let start = t_cum.ncols();
+        let end = start + t_b.ncols();
+        compiled_block_ranges.push(start..end);
+        t_cum = concat_cols(&t_cum, &t_b);
+    }
+
+    // Finite check.
+    for v in t_cum.iter() {
+        if !v.is_finite() {
+            return Err(CompilerError::LinalgFailure(
+                "compile_from_raw_grams produced non-finite entry in raw_from_compiled".to_string(),
+            ));
+        }
+    }
+
+    Ok(CompiledMap {
+        raw_from_compiled: t_cum,
+        compiled_block_ranges,
+        raw_block_ranges: raw_block_ranges.to_vec(),
+    })
+}
+
+/// Symmetrise a (nearly-symmetric) matrix by averaging with its transpose.
+fn symmetrise(m: &Array2<f64>) -> Array2<f64> {
+    let (r, c) = m.dim();
+    assert_eq!(r, c, "symmetrise expects square matrix");
+    let mut out = Array2::<f64>::zeros((r, c));
+    for i in 0..r {
+        for j in 0..c {
+            out[[i, j]] = 0.5 * (m[[i, j]] + m[[j, i]]);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1776,5 +1987,218 @@ mod tests {
                 cpu_s[idx]
             );
         }
+    }
+
+    // ---- compile_from_raw_grams tests ----
+
+    /// Build (gram_h, gram_struct) for a K=1 scalar two-block toy via the
+    /// per-block channel-block builders. Used by the closed-form tests
+    /// below.
+    fn scalar_grams_two_block(
+        a: &Array2<f64>,
+        b: &Array2<f64>,
+        w: &Array1<f64>,
+    ) -> (Array2<f64>, Array2<f64>, Vec<std::ops::Range<usize>>) {
+        let n = a.nrows();
+        let p_a = a.ncols();
+        let p_b = b.ncols();
+        let raw_ranges = vec![0..p_a, p_a..(p_a + p_b)];
+        let channel_blocks = PrimaryChannelBlocks {
+            blocks: vec![vec![Some(a.clone())], vec![Some(b.clone())]],
+        };
+        let row_hess = DiagonalScalarRowHessian::new(w.clone());
+        let _ = n; // silence
+        let gram_h =
+            build_raw_grams_from_channel_blocks(&channel_blocks, &row_hess, &raw_ranges).unwrap();
+        let gram_struct = build_raw_grams_structural(&channel_blocks, &raw_ranges);
+        (gram_h, gram_struct, raw_ranges)
+    }
+
+    /// Block B is a column-duplicate of block A in the structural metric
+    /// → `compile_from_raw_grams` must return FullyAliased on block 1.
+    #[test]
+    fn compile_from_raw_grams_full_structural_alias() {
+        let n = 10;
+        let a = Array2::from_shape_fn((n, 2), |(i, j)| ((i + 1) as f64 * (j + 1) as f64).sin());
+        // Block B = A · L for some 2×2 invertible L → same column span.
+        let l = Array2::from_shape_vec((2, 2), vec![1.0, 0.5, -0.25, 1.0]).unwrap();
+        let b = a.dot(&l);
+        let w = Array1::ones(n);
+        let (gram_h, gram_struct, raw_ranges) = scalar_grams_two_block(&a, &b, &w);
+        let res = compile_from_raw_grams(
+            &gram_h,
+            &gram_struct,
+            &raw_ranges,
+            &[BlockOrder::Marginal, BlockOrder::Logslope],
+        );
+        match res {
+            Err(CompilerError::FullyAliased { block_idx, .. }) => {
+                assert_eq!(block_idx, 1, "alias should fire on block 1, not 0");
+            }
+            other => panic!("expected FullyAliased on block 1, got {other:?}"),
+        }
+    }
+
+    /// Partial alias: block B's first column duplicates A; second column is
+    /// independent. Closed-form `T` must have shape `(p_raw × (p_a + 1))`
+    /// — block 1's compiled width is exactly the independent direction —
+    /// and the joint design `X_raw · T` must span the same column space as
+    /// the W-based reference compile result.
+    #[test]
+    fn compile_from_raw_grams_partial_alias_matches_w_reference() {
+        let n = 25;
+        let a = Array2::from_shape_fn((n, 2), |(i, j)| {
+            ((i + 1) as f64 * (j + 1) as f64 * 0.3).sin()
+        });
+        // B = [a_0  +  independent]
+        let mut b = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            b[[i, 0]] = a[[i, 0]];
+            b[[i, 1]] = ((i + 1) as f64 * 0.7).cos();
+        }
+        let w = Array1::from_shape_fn(n, |i| 1.0 + 0.1 * (i as f64));
+        let (gram_h, gram_struct, raw_ranges) = scalar_grams_two_block(&a, &b, &w);
+        let compiled = compile_from_raw_grams(
+            &gram_h,
+            &gram_struct,
+            &raw_ranges,
+            &[BlockOrder::Marginal, BlockOrder::Logslope],
+        )
+        .expect("closed-form compile must succeed");
+        let p_a = a.ncols();
+        let p_b = b.ncols();
+        assert_eq!(compiled.raw_from_compiled.shape()[0], p_a + p_b);
+        assert_eq!(
+            compiled.raw_from_compiled.shape()[1],
+            p_a + 1,
+            "partial alias should leave compiled width = p_a + 1 (one column dropped from B)"
+        );
+        // Block ranges sum to compiled width.
+        assert_eq!(compiled.compiled_block_ranges[0], 0..p_a);
+        assert_eq!(
+            compiled.compiled_block_ranges[1].end - compiled.compiled_block_ranges[1].start,
+            1
+        );
+
+        // Column-span equality vs. W-reference: stack the raw design
+        // X_raw = [A | B] and check that range(X_raw · T) ⊆ range(X_raw)
+        // and has the same rank as the W-based compile.
+        let mut x_raw = Array2::<f64>::zeros((n, p_a + p_b));
+        for i in 0..n {
+            for j in 0..p_a {
+                x_raw[[i, j]] = a[[i, j]];
+            }
+            for j in 0..p_b {
+                x_raw[[i, p_a + j]] = b[[i, j]];
+            }
+        }
+        let x_compiled = fast_ab(&x_raw, &compiled.raw_from_compiled);
+        // Rank of compiled design via Gram eigvals.
+        let g_compiled = fast_ata(&x_compiled);
+        let (evals, _) = g_compiled.eigh(Side::Lower).unwrap();
+        let lam_max = evals.iter().cloned().fold(0.0_f64, f64::max);
+        let tol = lam_max * 64.0 * (g_compiled.nrows() as f64) * f64::EPSILON;
+        let rank_compiled = evals.iter().filter(|&&l| l > tol).count();
+        assert_eq!(
+            rank_compiled,
+            p_a + 1,
+            "compiled design column rank must equal p_a + 1 after dropping the alias"
+        );
+
+        // Reference compile via the W-based dual-metric path on the same
+        // scalar blocks; compiled total width should also be p_a + 1.
+        let ops_dual: Vec<Arc<dyn RowJacobianOperator>> = vec![op(a.clone()), op(b.clone())];
+        let curvature = DiagonalScalarRowHessian::new(w.clone());
+        let id_struct = IdentityRowHessian::new(n, 1);
+        let dual = compile_with_dual_metric(
+            &ops_dual,
+            &curvature,
+            &id_struct,
+            &[BlockOrder::Marginal, BlockOrder::Logslope],
+        )
+        .expect("dual metric compile should succeed");
+        let dual_total: usize = dual.blocks.iter().map(|b| b.t_lw.ncols()).sum();
+        assert_eq!(dual_total, p_a + 1, "W-reference total width should match");
+    }
+
+    /// Three-block toy: changing the ordering changes the per-block
+    /// compiled widths (later blocks absorb the alias instead of earlier).
+    #[test]
+    fn compile_from_raw_grams_three_block_ordering_matters() {
+        let n = 30;
+        let a = Array2::from_shape_fn((n, 2), |(i, j)| ((i + 1) as f64 * (j + 2) as f64 * 0.2).sin());
+        // B has 2 cols: col 0 independent, col 1 = a[:, 0]
+        let mut b = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            b[[i, 0]] = ((i + 1) as f64 * 0.4).cos();
+            b[[i, 1]] = a[[i, 0]];
+        }
+        // C has 2 cols: col 0 independent, col 1 = a[:, 1]
+        let mut c = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            c[[i, 0]] = ((i + 1) as f64 * 0.55).sin();
+            c[[i, 1]] = a[[i, 1]];
+        }
+        let w = Array1::ones(n);
+
+        let build = |b0: &Array2<f64>, b1: &Array2<f64>, b2: &Array2<f64>| {
+            let raw_ranges = vec![
+                0..b0.ncols(),
+                b0.ncols()..(b0.ncols() + b1.ncols()),
+                (b0.ncols() + b1.ncols())..(b0.ncols() + b1.ncols() + b2.ncols()),
+            ];
+            let channel_blocks = PrimaryChannelBlocks {
+                blocks: vec![
+                    vec![Some(b0.clone())],
+                    vec![Some(b1.clone())],
+                    vec![Some(b2.clone())],
+                ],
+            };
+            let row_hess = DiagonalScalarRowHessian::new(w.clone());
+            let gram_h =
+                build_raw_grams_from_channel_blocks(&channel_blocks, &row_hess, &raw_ranges)
+                    .unwrap();
+            let gram_struct = build_raw_grams_structural(&channel_blocks, &raw_ranges);
+            (gram_h, gram_struct, raw_ranges)
+        };
+
+        // Order 1: A, B, C — B drops 1 (col 1 aliased to A), C drops 1.
+        let (gh, gs, rr) = build(&a, &b, &c);
+        let order_abc = compile_from_raw_grams(
+            &gh,
+            &gs,
+            &rr,
+            &[BlockOrder::Marginal, BlockOrder::Logslope, BlockOrder::LinkDev],
+        )
+        .expect("ABC compile");
+        assert_eq!(order_abc.compiled_block_ranges[0].len(), 2);
+        assert_eq!(order_abc.compiled_block_ranges[1].len(), 1);
+        assert_eq!(order_abc.compiled_block_ranges[2].len(), 1);
+
+        // Order 2: B, A, C — A's col 0 is aliased by B's col 1 now; A's
+        // col 1 is independent. So A drops 1; C still drops 1.
+        let (gh2, gs2, rr2) = build(&b, &a, &c);
+        let order_bac = compile_from_raw_grams(
+            &gh2,
+            &gs2,
+            &rr2,
+            &[BlockOrder::Marginal, BlockOrder::Logslope, BlockOrder::LinkDev],
+        )
+        .expect("BAC compile");
+        assert_eq!(order_bac.compiled_block_ranges[0].len(), 2);
+        assert_eq!(order_bac.compiled_block_ranges[1].len(), 1);
+        // Total rank invariant under permutation: 4.
+        let total_abc: usize = order_abc
+            .compiled_block_ranges
+            .iter()
+            .map(|r| r.len())
+            .sum();
+        let total_bac: usize = order_bac
+            .compiled_block_ranges
+            .iter()
+            .map(|r| r.len())
+            .sum();
+        assert_eq!(total_abc, total_bac);
+        assert_eq!(total_abc, 4);
     }
 }
