@@ -9,6 +9,7 @@ pub mod inner_status;
 pub mod inverse_link;
 pub mod ispline_base_time;
 pub mod jet_partitions;
+pub mod joint_penalty;
 pub mod latent_survival;
 pub mod lognormal_kernel;
 pub mod marginal_slope_shared;

@@ -1840,13 +1840,10 @@ pub fn apply_per_term_vm_exact(
     let pull_set = |pens: &[crate::terms::smooth::BlockwisePenalty],
                     anchor_offset: usize|
      -> Result<Vec<PenaltyMatrix>, String> {
-        pens.iter()
-            .map(|p| {
-                pull_back_penalty_through_t(p, anchor_offset, &t_full).map_err(|e| {
-                    format!("vm-exact: pull_back_penalty_through_t: {e}")
-                })
-            })
-            .collect()
+        Ok(pens
+            .iter()
+            .map(|p| pull_back_penalty_through_t(p, anchor_offset, &t_full))
+            .collect())
     };
 
     if t_full.ncols() != p_compiled_total {
@@ -1941,6 +1938,174 @@ pub fn project_raw_beta_to_compiled(
     }
     let theta = crate::linalg::faer_ndarray::fast_av(&evecs, &scaled);
     Ok(theta)
+}
+
+/// Per-block, per-channel raw primary-state designs at block `a`. Each
+/// channel design has shape `(n × raw_widths[a])` — the contribution of
+/// block `a`'s raw coefficients to that primary-state channel's emitted
+/// row. For blocks that don't contribute to a channel (e.g. a logslope
+/// block contributes only to `g`), pass a zero design of the right shape.
+#[derive(Debug, Clone)]
+pub struct RawPrimaryBlockDesign {
+    pub name: String,
+    pub q0: DesignMatrix,
+    pub q1: DesignMatrix,
+    pub qd1: DesignMatrix,
+    pub g: DesignMatrix,
+}
+
+/// Per-block, per-channel compiled primary-state designs at compiled
+/// block `b`. Each channel design has shape `(n × p_b_compiled)` and is
+/// the row-space realisation of the T-residualisation:
+/// `compiled X_b^(c) = Σ_a raw X_a^(c) · T[raw_a_range, compiled_b_range]`.
+/// For COMPILED logslope blocks the q0/q1/qd1 channels may be nonzero
+/// because anchor subtraction (`−R_{a→b}` in the upper triangle of T)
+/// can pull contributions from earlier time/marginal blocks into the
+/// logslope block's coefficient column.
+#[derive(Debug, Clone)]
+pub struct CompiledPrimaryBlockDesign {
+    pub name: String,
+    pub q0: DesignMatrix,
+    pub q1: DesignMatrix,
+    pub qd1: DesignMatrix,
+    pub g: DesignMatrix,
+}
+
+/// Build per-compiled-block, per-channel designs from per-raw-block,
+/// per-channel raw designs and the full triangular reparam `t_full`
+/// (rows = raw joint width, cols = compiled joint width).
+///
+/// For each compiled block `b` and channel `c`:
+///   `compiled X_b^(c)  =  Σ_a raw X_a^(c) · T[raw_a_range, compiled_b_range]`
+///
+/// `n_rows` is the number of rows of every channel design — all raw
+/// channel designs (including any zero-designs) must share this row
+/// count.
+pub fn materialise_compiled_primary_blocks(
+    n_rows: usize,
+    raw_channel_blocks: &[RawPrimaryBlockDesign],
+    compiled_block_ranges: &[std::ops::Range<usize>],
+    raw_block_ranges: &[std::ops::Range<usize>],
+    t_full: &Array2<f64>,
+) -> Result<Vec<CompiledPrimaryBlockDesign>, String> {
+    let n_blocks = raw_channel_blocks.len();
+    if compiled_block_ranges.len() != n_blocks {
+        return Err(format!(
+            "materialise_compiled_primary_blocks: compiled_block_ranges len {} != raw_channel_blocks len {}",
+            compiled_block_ranges.len(),
+            n_blocks,
+        ));
+    }
+    if raw_block_ranges.len() != n_blocks {
+        return Err(format!(
+            "materialise_compiled_primary_blocks: raw_block_ranges len {} != raw_channel_blocks len {}",
+            raw_block_ranges.len(),
+            n_blocks,
+        ));
+    }
+
+    let raw_joint_width: usize = raw_block_ranges.iter().map(|r| r.len()).sum();
+    let compiled_joint_width: usize = compiled_block_ranges.iter().map(|r| r.len()).sum();
+    if t_full.nrows() != raw_joint_width {
+        return Err(format!(
+            "materialise_compiled_primary_blocks: t_full has {} rows but raw joint width is {raw_joint_width}",
+            t_full.nrows(),
+        ));
+    }
+    if t_full.ncols() != compiled_joint_width {
+        return Err(format!(
+            "materialise_compiled_primary_blocks: t_full has {} cols but compiled joint width is {compiled_joint_width}",
+            t_full.ncols(),
+        ));
+    }
+    for (a, r) in raw_block_ranges.iter().enumerate() {
+        if r.end > raw_joint_width {
+            return Err(format!(
+                "materialise_compiled_primary_blocks: raw_block_ranges[{a}] = {r:?} exceeds raw_joint_width {raw_joint_width}",
+            ));
+        }
+    }
+    for (b, r) in compiled_block_ranges.iter().enumerate() {
+        if r.end > compiled_joint_width {
+            return Err(format!(
+                "materialise_compiled_primary_blocks: compiled_block_ranges[{b}] = {r:?} exceeds compiled_joint_width {compiled_joint_width}",
+            ));
+        }
+    }
+
+    let densify = |dm: &DesignMatrix,
+                   raw_w: usize,
+                   a: usize,
+                   channel: &str|
+     -> Result<Array2<f64>, String> {
+        let dense = match dm {
+            DesignMatrix::Dense(d) => d.to_dense(),
+            DesignMatrix::Sparse(_) => dm
+                .try_to_dense_by_chunks(&format!(
+                    "materialise_compiled_primary_blocks: densify raw block {a} channel {channel}"
+                ))
+                .map_err(|e| {
+                    format!(
+                        "materialise_compiled_primary_blocks: densify raw block {a} channel {channel}: {e}"
+                    )
+                })?,
+        };
+        if dense.nrows() != n_rows {
+            return Err(format!(
+                "materialise_compiled_primary_blocks: raw block {a} channel {channel} has {} rows, expected {n_rows}",
+                dense.nrows(),
+            ));
+        }
+        if dense.ncols() != raw_w {
+            return Err(format!(
+                "materialise_compiled_primary_blocks: raw block {a} channel {channel} has {} cols, expected raw width {raw_w}",
+                dense.ncols(),
+            ));
+        }
+        Ok(dense)
+    };
+
+    let mut raw_q0: Vec<Array2<f64>> = Vec::with_capacity(n_blocks);
+    let mut raw_q1: Vec<Array2<f64>> = Vec::with_capacity(n_blocks);
+    let mut raw_qd1: Vec<Array2<f64>> = Vec::with_capacity(n_blocks);
+    let mut raw_g: Vec<Array2<f64>> = Vec::with_capacity(n_blocks);
+    for (a, blk) in raw_channel_blocks.iter().enumerate() {
+        let raw_w = raw_block_ranges[a].len();
+        raw_q0.push(densify(&blk.q0, raw_w, a, "q0")?);
+        raw_q1.push(densify(&blk.q1, raw_w, a, "q1")?);
+        raw_qd1.push(densify(&blk.qd1, raw_w, a, "qd1")?);
+        raw_g.push(densify(&blk.g, raw_w, a, "g")?);
+    }
+
+    let mut out: Vec<CompiledPrimaryBlockDesign> = Vec::with_capacity(n_blocks);
+    for (b, comp_range) in compiled_block_ranges.iter().enumerate() {
+        let p_b = comp_range.len();
+        let mut acc_q0 = Array2::<f64>::zeros((n_rows, p_b));
+        let mut acc_q1 = Array2::<f64>::zeros((n_rows, p_b));
+        let mut acc_qd1 = Array2::<f64>::zeros((n_rows, p_b));
+        let mut acc_g = Array2::<f64>::zeros((n_rows, p_b));
+        for (a, raw_range) in raw_block_ranges.iter().enumerate() {
+            if raw_range.is_empty() || p_b == 0 {
+                continue;
+            }
+            let t_ab = t_full
+                .slice(ndarray::s![raw_range.clone(), comp_range.clone()])
+                .to_owned();
+            acc_q0 = acc_q0 + fast_ab(&raw_q0[a], &t_ab);
+            acc_q1 = acc_q1 + fast_ab(&raw_q1[a], &t_ab);
+            acc_qd1 = acc_qd1 + fast_ab(&raw_qd1[a], &t_ab);
+            acc_g = acc_g + fast_ab(&raw_g[a], &t_ab);
+        }
+        out.push(CompiledPrimaryBlockDesign {
+            name: raw_channel_blocks[b].name.clone(),
+            q0: DesignMatrix::Dense(DenseDesignMatrix::from(acc_q0)),
+            q1: DesignMatrix::Dense(DenseDesignMatrix::from(acc_q1)),
+            qd1: DesignMatrix::Dense(DenseDesignMatrix::from(acc_qd1)),
+            g: DesignMatrix::Dense(DenseDesignMatrix::from(acc_g)),
+        });
+    }
+
+    Ok(out)
 }
 
 #[cfg(test)]
