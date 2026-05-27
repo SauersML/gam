@@ -2210,6 +2210,125 @@ mod stream_device_parity_tests {
         }
     }
 
+    /// V100 hill-climb gate: at biobank-shape (n=80k, p=44,
+    /// BernoulliLogit/Fisher) the device-resident loop must be ≥10×
+    /// faster than the CPU reference. Marked `#[ignore]` so it only
+    /// runs when explicitly invoked (`cargo test -- --ignored
+    /// hill_climb_loop`); the CI/mac path can't host the GPU work
+    /// anyway. Uses CPU `row_reweight_cpu` + faer Cholesky as the
+    /// PIRLS reference loop to avoid dragging in `solver::pirls`'s
+    /// 13k-line state machine.
+    #[test]
+    #[ignore]
+    fn hill_climb_loop_beats_cpu_10x_on_biobank_logit() {
+        use crate::gpu::pirls_row::{
+            row_reweight_cpu, CurvatureMode, PirlsRowFamily, RowInput,
+        };
+        use std::time::Instant;
+        if crate::gpu::runtime::GpuRuntime::global().is_none() {
+            eprintln!("[hill_climb] no CUDA runtime — skipping");
+            return;
+        }
+        let n = 80_000_usize;
+        let p = 44_usize;
+        // Synthesise X (col-major dense) and y from a known β.
+        let beta_true: ndarray::Array1<f64> = ndarray::Array1::from_iter(
+            (0..p).map(|j| 0.05 * ((j as f64) - 0.5 * p as f64) / p as f64),
+        );
+        let mut x = ndarray::Array2::<f64>::zeros((n, p));
+        for i in 0..n {
+            for j in 0..p {
+                x[[i, j]] = ((i as f64 + j as f64 * 17.0) * 0.001).sin();
+            }
+        }
+        let eta: ndarray::Array1<f64> = x.dot(&beta_true);
+        let y: ndarray::Array1<f64> = eta
+            .iter()
+            .enumerate()
+            .map(|(i, &e)| {
+                let mu = 0.5 * (1.0 + (0.5 * e).tanh());
+                if (i as f64 * 1.31).fract() < mu { 1.0 } else { 0.0 }
+            })
+            .collect();
+        let prior_w = ndarray::Array1::<f64>::ones(n);
+        let penalty = ndarray::Array2::<f64>::eye(p) * 1e-3;
+        let beta0 = ndarray::Array1::<f64>::zeros(p);
+
+        // GPU timing.
+        let shared = upload_shared_pirls_gpu(x.view())
+            .expect("upload shared design");
+        let mut ws = allocate_sigma_pirls_workspace(&shared)
+            .expect("alloc ws");
+        let mut loop_ws = allocate_pirls_loop_workspace(&shared, &ws)
+            .expect("alloc loop_ws");
+        let t0 = Instant::now();
+        let _ = pirls_loop_on_stream(
+            &shared,
+            &mut ws,
+            &mut loop_ws,
+            PirlsRowFamily::BernoulliLogit,
+            CurvatureMode::Fisher,
+            beta0.view(),
+            y.view(),
+            prior_w.view(),
+            penalty.view(),
+            0.0,
+            30,
+            1e-6,
+        )
+        .expect("pirls loop");
+        let gpu_secs = t0.elapsed().as_secs_f64();
+
+        // CPU reference: same PIRLS structure (eta = Xβ; row reweight;
+        // XᵀWX + Sλ; faer Cholesky; β update with α=1).
+        let t1 = Instant::now();
+        let mut beta = ndarray::Array1::<f64>::zeros(p);
+        for _ in 0..30 {
+            let eta: ndarray::Array1<f64> = x.dot(&beta);
+            let mut w = ndarray::Array1::<f64>::zeros(n);
+            let mut g = ndarray::Array1::<f64>::zeros(n);
+            for i in 0..n {
+                let out = row_reweight_cpu(
+                    PirlsRowFamily::BernoulliLogit,
+                    CurvatureMode::Fisher,
+                    RowInput {
+                        eta: eta[i],
+                        y: y[i],
+                        prior_weight: prior_w[i],
+                    },
+                );
+                w[i] = out.w_solver;
+                g[i] = out.grad_eta;
+            }
+            let mut wx_full = x.clone();
+            for j in 0..p {
+                for i in 0..n {
+                    wx_full[[i, j]] *= w[i];
+                }
+            }
+            let h = x.t().dot(&wx_full) + &penalty;
+            let rhs = x.t().dot(&g);
+            let h_faer = faer::Mat::from_fn(p, p, |i, j| h[[i, j]]);
+            let chol = h_faer.cholesky(faer::Side::Lower).expect("chol");
+            let rhs_faer = faer::Mat::from_fn(p, 1, |i, _| rhs[i]);
+            let d = chol.solve(rhs_faer.as_ref());
+            for i in 0..p {
+                beta[i] -= d[(i, 0)];
+            }
+        }
+        let cpu_secs = t1.elapsed().as_secs_f64();
+
+        let speedup = cpu_secs / gpu_secs;
+        eprintln!(
+            "[hill_climb] n={n} p={p} BernoulliLogit/Fisher: gpu={:.3}s cpu={:.3}s speedup={:.2}×",
+            gpu_secs, cpu_secs, speedup
+        );
+        assert!(
+            speedup >= 10.0,
+            "GPU PIRLS loop must be ≥10× CPU at biobank shape; got speedup={speedup:.2}× (gpu={gpu_secs:.3}s cpu={cpu_secs:.3}s)"
+        );
+    }
+
     /// Stage 3.3 production caller: end-to-end GPU PIRLS loop on a
     /// Gaussian-identity fit reaches OLS β to high precision in a
     /// handful of iterations and matches the closed-form
