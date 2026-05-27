@@ -252,6 +252,27 @@ impl ResponseFamily {
             Self::RoystonParmar => "royston-parmar",
         }
     }
+
+    /// Closed-interval bounds for the mean (response-scale) of this family.
+    ///
+    /// Used by predict-side CI clamps that need to keep transformed bounds
+    /// within the support of the response. Beta uses strict-open `(1e-10, 1 − 1e-10)`
+    /// to avoid logit singularities; Binomial / Royston-Parmar use the closed
+    /// `[0, 1]` since they are evaluated post-transformation. Unbounded
+    /// (continuous-real or non-negative-real) families return `None` — the
+    /// caller should not clamp.
+    #[inline]
+    pub fn mean_clamp_bounds(&self) -> Option<(f64, f64)> {
+        match self {
+            Self::Binomial | Self::RoystonParmar => Some((0.0, 1.0)),
+            Self::Beta { .. } => Some((1e-10, 1.0 - 1e-10)),
+            Self::Gaussian
+            | Self::Poisson
+            | Self::Tweedie { .. }
+            | Self::NegativeBinomial { .. }
+            | Self::Gamma => None,
+        }
+    }
 }
 
 /// Unified likelihood specification: response distribution + parameterized link.
@@ -1099,6 +1120,41 @@ impl PenaltyIdx {
 }
 
 impl std::fmt::Display for PenaltyIdx {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Index into a single smooth term's set of basis functions — i.e. the `k`
+/// in "the k-th basis function `B_k(x)` of this term".
+///
+/// Distinct from:
+///   * [`SmoothTermIdx`] — selects *which* smooth term in the spec.
+///   * [`PenaltyIdx`]    — selects *which* ρ/λ entry / canonical penalty.
+///   * A design-matrix column index — which lives in the *combined* layout
+///     after intercept/parametric blocks and per-term offsets are applied;
+///     a `BasisIdx` is term-local, a column index is model-global.
+///
+/// Keeping this as its own `#[repr(transparent)]` newtype makes the
+/// historically-easy confusion "indexed a global column slice with a
+/// term-local basis ordinal" (or vice versa) a compile error.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct BasisIdx(usize);
+
+impl BasisIdx {
+    #[inline]
+    pub const fn new(idx: usize) -> Self {
+        Self(idx)
+    }
+
+    #[inline]
+    pub const fn get(self) -> usize {
+        self.0
+    }
+}
+
+impl std::fmt::Display for BasisIdx {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
     }

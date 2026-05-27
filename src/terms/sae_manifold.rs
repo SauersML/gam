@@ -3188,8 +3188,10 @@ mod tests {
     #[test]
     fn isometry_torus_second_jet_matches_fd() -> Result<(), String> {
         let torus_coords = array![[0.1, 0.7], [0.42, 0.0], [0.95, 0.33], [0.5, 0.5]];
+        let evaluator = TorusHarmonicEvaluator::new(2, 3).unwrap();
+        assert!(evaluator.basis_size() > 0);
         assert_second_jet_matches_central_difference(
-            &TorusHarmonicEvaluator::new(2, 3).unwrap(),
+            &evaluator,
             torus_coords,
             1.0e-5,
         )?;
