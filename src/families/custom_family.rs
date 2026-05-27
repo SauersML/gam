@@ -2870,6 +2870,18 @@ pub struct BlockwiseFitOptions {
     /// can warm-start from this run. Writes still pass through the session
     /// rate limiter, so mirroring checkpoints does not add unbounded I/O.
     pub cache_mirror_sessions: Vec<Arc<crate::cache::Session>>,
+    /// Optional bundle of cross-block (full-width) penalties, paired with
+    /// their current `log λ` values from the outer ρ vector. When `Some`,
+    /// the inner joint-Newton primitives add the contributions
+    ///
+    /// * objective: `½ Σ_j exp(ρ_j) βᵀ S_j β`
+    /// * gradient:  `Σ_j exp(ρ_j) S_j β`
+    /// * Hessian:   `Σ_j exp(ρ_j) S_j`
+    ///
+    /// in addition to the per-block penalty stack assembled from
+    /// `ParameterBlockSpec.penalties`. The per-block path is unchanged.
+    /// `None` preserves legacy behaviour for every existing caller.
+    pub joint_penalties: Option<Arc<crate::families::joint_penalty::JointPenaltyBundle>>,
 }
 
 pub const DEFAULT_CUSTOM_FAMILY_INNER_MAX_CYCLES: usize = 1200;
@@ -2916,6 +2928,7 @@ impl Default for BlockwiseFitOptions {
             outer_eval_context: None,
             cache_session: None,
             cache_mirror_sessions: Vec::new(),
+            joint_penalties: None,
         }
     }
 }
@@ -8571,8 +8584,10 @@ fn total_quadratic_penalty(
     s_lambdas: &[Array2<f64>],
     ridge: f64,
     ridge_policy: RidgePolicy,
+    joint_full_width: Option<&crate::families::joint_penalty::JointPenaltyBundle>,
+    specs: Option<&[ParameterBlockSpec]>,
 ) -> f64 {
-    if total_quadratic_penalty_parallel_worthwhile(states, s_lambdas) {
+    let per_block: f64 = if total_quadratic_penalty_parallel_worthwhile(states, s_lambdas) {
         use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 
         states
@@ -8590,7 +8605,15 @@ fn total_quadratic_penalty(
                 block_quadratic_penalty(&state.beta, s_lambda, ridge, ridge_policy)
             })
             .sum()
-    }
+    };
+    let joint = match (joint_full_width, specs) {
+        (Some(bundle), Some(specs)) if !bundle.is_empty() => {
+            let beta_flat = flatten_state_betas(states, specs);
+            bundle.quadratic(beta_flat.view())
+        }
+        _ => 0.0,
+    };
+    per_block + joint
 }
 
 /// Locate the first non-finite entry in a Hessian and report it as a
@@ -12030,6 +12053,7 @@ fn apply_joint_penalized_hessian_into(
     diagonal_ridge: f64,
     vector: &Array1<f64>,
     out: &mut Array1<f64>,
+    joint_full_width: Option<&crate::families::joint_penalty::JointPenaltyBundle>,
 ) -> Result<(), String> {
     match source {
         JointHessianSource::Dense(h_joint) => {
@@ -12040,7 +12064,14 @@ fn apply_joint_penalized_hessian_into(
         }
     }
     let mut penalty = Array1::<f64>::zeros(vector.len());
-    apply_joint_block_penalty_into(ranges, s_lambdas, vector, diagonal_ridge, &mut penalty);
+    apply_joint_block_penalty_into(
+        ranges,
+        s_lambdas,
+        vector,
+        diagonal_ridge,
+        &mut penalty,
+        joint_full_width,
+    );
     *out += &penalty;
     Ok(())
 }
@@ -12052,6 +12083,7 @@ fn stabilized_joint_solver_diagonal_ridge<F: CustomFamily + ?Sized>(
     s_lambdas: &[Array2<f64>],
     base_diagonal_ridge: f64,
     ridge_floor: f64,
+    joint_full_width: Option<&crate::families::joint_penalty::JointPenaltyBundle>,
 ) -> f64 {
     if use_exact_newton_strict_spd(family) {
         return base_diagonal_ridge;
@@ -12060,7 +12092,13 @@ fn stabilized_joint_solver_diagonal_ridge<F: CustomFamily + ?Sized>(
         return base_diagonal_ridge;
     };
     let mut lhs = h_joint.clone();
-    add_joint_penalty_to_matrix(&mut lhs, ranges, s_lambdas, base_diagonal_ridge);
+    add_joint_penalty_to_matrix(
+        &mut lhs,
+        ranges,
+        s_lambdas,
+        base_diagonal_ridge,
+        joint_full_width,
+    );
     let shift = exact_newton_stabilizing_shift(&lhs, ridge_floor).unwrap_or(0.0);
     if shift > 0.0 {
         log::debug!(
@@ -12085,13 +12123,19 @@ fn joint_preconditioned_descent_delta(
     s_lambdas: &[Array2<f64>],
     diagonal_ridge: f64,
     rhs: &Array1<f64>,
+    joint_full_width: Option<&crate::families::joint_penalty::JointPenaltyBundle>,
 ) -> Result<Array1<f64>, String> {
     let base_diagonal = match source {
         JointHessianSource::Dense(h_joint) => h_joint.diag().to_owned(),
         JointHessianSource::Operator { diagonal, .. } => diagonal.clone(),
     };
-    let preconditioner =
-        joint_penalty_preconditioner_diag(&base_diagonal, ranges, s_lambdas, diagonal_ridge);
+    let preconditioner = joint_penalty_preconditioner_diag(
+        &base_diagonal,
+        ranges,
+        s_lambdas,
+        diagonal_ridge,
+        joint_full_width,
+    );
     let mut delta = rhs / &preconditioner;
     if !delta.iter().all(|v| v.is_finite()) || rhs.dot(&delta) <= 0.0 {
         delta.assign(rhs);
@@ -12106,6 +12150,7 @@ fn joint_preconditioned_descent_delta(
             diagonal_ridge,
             &delta,
             &mut hpen_delta,
+            joint_full_width,
         )?;
         let curvature = delta.dot(&hpen_delta);
         if curvature.is_finite() && curvature > 0.0 {
@@ -12405,6 +12450,26 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         );
     }
     let ridge = effective_solverridge(options.ridge_floor);
+    let joint_bundle: Option<&crate::families::joint_penalty::JointPenaltyBundle> =
+        options.joint_penalties.as_deref();
+    if let Some(bundle) = joint_bundle {
+        for (i, spec) in bundle.specs.iter().enumerate() {
+            if spec.dim() != total_joint_p {
+                return Err(format!(
+                    "joint penalty {i}: dim {} != total compiled p {}",
+                    spec.dim(),
+                    total_joint_p,
+                ));
+            }
+        }
+        if bundle.specs.len() != bundle.log_lambdas.len() {
+            return Err(format!(
+                "joint penalty bundle: {} specs vs {} log_lambdas",
+                bundle.specs.len(),
+                bundle.log_lambdas.len(),
+            ));
+        }
+    }
     let mut cached_active_sets: Vec<Option<Vec<usize>>> = vec![None; specs.len()];
     if let Some(seed) = warm_start
         && seed.block_beta.len() == states.len()
@@ -12515,7 +12580,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
     }
     let penalty_started = std::time::Instant::now();
     let mut current_penalty =
-        total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy);
+        total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy, joint_bundle, Some(specs));
     if prelude_log {
         log::info!(
             "[STAGE] PIRLS/inner step=total_quadratic_penalty elapsed={:.3}s penalty={:.6e} (prelude_total={:.3}s)",
@@ -12839,6 +12904,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 &s_lambdas,
                 trace_diagonal_ridge,
                 options.ridge_floor,
+                joint_bundle,
             );
             let joint_trust_metric_diag = match &joint_hessian_source {
                 JointHessianSource::Dense(h_joint) => joint_penalty_preconditioner_diag(
@@ -12846,12 +12912,14 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     &ranges,
                     &s_lambdas,
                     joint_solver_diagonal_ridge,
+                    joint_bundle,
                 ),
                 JointHessianSource::Operator { diagonal, .. } => joint_penalty_preconditioner_diag(
                     diagonal,
                     &ranges,
                     &s_lambdas,
                     joint_solver_diagonal_ridge,
+                    joint_bundle,
                 ),
             };
             let current_kkt_norm = exact_newton_joint_stationarity_inf_norm_from_gradient(
@@ -12886,6 +12954,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         &ranges,
                         &s_lambdas,
                         trace_diagonal_ridge,
+                        joint_bundle,
                     );
                     if joint_solver_diagonal_ridge != trace_diagonal_ridge {
                         for d in 0..lhs.nrows() {
@@ -12919,6 +12988,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         &s_lambdas,
                         &beta_joint,
                         joint_mode_diagonal_ridge,
+                        joint_bundle,
                     );
                     let rhs_step = &grad_joint - &penalty_beta_joint;
                     let rhs_beta = &lhs.dot(&beta_joint) + &rhs_step;
@@ -12951,6 +13021,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         &s_lambdas,
                         &beta_joint,
                         joint_mode_diagonal_ridge,
+                        joint_bundle,
                     );
                     let rhs = &grad_joint - &penalty_beta;
                     let grad_inf_for_solve = grad_joint
@@ -12974,6 +13045,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                                     &ranges,
                                     &s_lambdas,
                                     joint_solver_diagonal_ridge,
+                                    joint_bundle,
                                 )
                             }
                             JointHessianSource::Operator { diagonal, .. } => {
@@ -12982,6 +13054,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                                     &ranges,
                                     &s_lambdas,
                                     joint_solver_diagonal_ridge,
+                                    joint_bundle,
                                 )
                             }
                         };
@@ -13010,6 +13083,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                                             v,
                                             joint_solver_diagonal_ridge,
                                             &mut pen,
+                                            joint_bundle,
                                         );
                                         *out += &*pen;
                                     },
@@ -13046,6 +13120,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                                             v,
                                             joint_solver_diagonal_ridge,
                                             &mut pen,
+                                            joint_bundle,
                                         );
                                         *out += &*pen;
                                     },
@@ -13096,6 +13171,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                             &ranges,
                             &s_lambdas,
                             joint_mode_diagonal_ridge,
+                            joint_bundle,
                         );
                         let spectral_step = solve_joint_newton_step_on_spectral_range(
                             &lhs_true,
@@ -13405,7 +13481,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 }
                 refresh_all_block_etas(family, specs, &mut states)?;
                 let trial_penalty =
-                    total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy);
+                    total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy, joint_bundle, Some(specs));
                 // Cheap-LL line-search path: rejected backtracking attempts
                 // discard the exact-Newton workspace they build, so by default
                 // we evaluate just the scalar full-data log-likelihood for the
@@ -13821,7 +13897,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             cached_eval = eval;
             cached_joint_workspace = workspace;
             current_penalty =
-                total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy);
+                total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy, joint_bundle, Some(specs));
             lastobjective = -current_log_likelihood + current_penalty;
             let accepted_step_inf = states
                 .iter()
@@ -14423,7 +14499,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         // If joint Newton converged, skip the blockwise loop entirely.
         if converged {
             let penalty_value =
-                total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy);
+                total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy, joint_bundle, Some(specs));
             let (block_logdet_h, block_logdet_s) = blockwise_logdet_terms_with_workspace(
                 family,
                 specs,
@@ -14488,7 +14564,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         }
         if cycles_done >= inner_max_cycles {
             let penalty_value =
-                total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy);
+                total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy, joint_bundle, Some(specs));
             let (block_logdet_h, block_logdet_s) = blockwise_logdet_terms_with_workspace(
                 family,
                 specs,
@@ -14612,7 +14688,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 );
             }
             let penalty_value =
-                total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy);
+                total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy, joint_bundle, Some(specs));
             let (block_logdet_h, block_logdet_s) = blockwise_logdet_terms_with_workspace(
                 family,
                 specs,
@@ -15114,7 +15190,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             refresh_all_block_etas(family, specs, &mut states)?;
         }
         cached_eval = family.evaluate(&states)?;
-        current_penalty = total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy);
+        current_penalty = total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy, joint_bundle, Some(specs));
         let objective = -cached_eval.log_likelihood + current_penalty;
         let objective_change = (objective - lastobjective).abs();
         lastobjective = objective;
@@ -15423,7 +15499,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     }
                 };
                 let trial_penalty =
-                    total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy);
+                    total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy, joint_bundle, Some(specs));
                 let trial_obj = -trial_ll + trial_penalty;
                 if trial_obj.is_finite() && trial_obj <= old_obj + 1e-12 {
                     current_penalty = trial_penalty;
@@ -15444,7 +15520,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
     }
 
     // Reuse cached evaluation from the last cycle's end (or the initial eval if 0 cycles ran).
-    let penalty_value = total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy);
+    let penalty_value = total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy, joint_bundle, Some(specs));
 
     let (block_logdet_h, block_logdet_s) =
         blockwise_logdet_terms(family, specs, &mut states, block_log_lambdas, options)?;
@@ -19946,9 +20022,17 @@ fn apply_joint_block_penalty(
     s_lambdas: &[Array2<f64>],
     vector: &Array1<f64>,
     diagonal_ridge: f64,
+    joint_full_width: Option<&crate::families::joint_penalty::JointPenaltyBundle>,
 ) -> Array1<f64> {
     let mut out = Array1::<f64>::zeros(vector.len());
-    apply_joint_block_penalty_into(ranges, s_lambdas, vector, diagonal_ridge, &mut out);
+    apply_joint_block_penalty_into(
+        ranges,
+        s_lambdas,
+        vector,
+        diagonal_ridge,
+        &mut out,
+        joint_full_width,
+    );
     out
 }
 
@@ -19966,6 +20050,7 @@ fn apply_joint_block_penalty_into(
     vector: &Array1<f64>,
     diagonal_ridge: f64,
     out: &mut Array1<f64>,
+    joint_full_width: Option<&crate::families::joint_penalty::JointPenaltyBundle>,
 ) {
     assert_eq!(out.len(), vector.len());
     assert!(s_lambdas.len() <= ranges.len());
@@ -19981,6 +20066,11 @@ fn apply_joint_block_penalty_into(
         if diagonal_ridge > 0.0 {
             out.scaled_add(diagonal_ridge, vector);
         }
+        if let Some(bundle) = joint_full_width
+            && !bundle.is_empty()
+        {
+            bundle.add_apply_into(vector.view(), out);
+        }
         return;
     }
 
@@ -19993,6 +20083,11 @@ fn apply_joint_block_penalty_into(
         }
         if diagonal_ridge > 0.0 {
             out.scaled_add(diagonal_ridge, vector);
+        }
+        if let Some(bundle) = joint_full_width
+            && !bundle.is_empty()
+        {
+            bundle.add_apply_into(vector.view(), out);
         }
         return;
     }
@@ -20041,6 +20136,12 @@ fn apply_joint_block_penalty_into(
             out.scaled_add(diagonal_ridge, vector);
         }
     }
+
+    if let Some(bundle) = joint_full_width
+        && !bundle.is_empty()
+    {
+        bundle.add_apply_into(vector.view(), out);
+    }
 }
 
 /// Penalty-aware Jacobi preconditioner used by every matrix-free PCG path
@@ -20072,6 +20173,7 @@ fn joint_penalty_preconditioner_diag(
     ranges: &[(usize, usize)],
     s_lambdas: &[Array2<f64>],
     diagonal_ridge: f64,
+    joint_full_width: Option<&crate::families::joint_penalty::JointPenaltyBundle>,
 ) -> Array1<f64> {
     assert!(s_lambdas.len() <= ranges.len());
     let mut diag = base_diagonal.clone();
@@ -20087,6 +20189,11 @@ fn joint_penalty_preconditioner_diag(
         for value in &mut diag {
             *value += diagonal_ridge;
         }
+    }
+    if let Some(bundle) = joint_full_width
+        && !bundle.is_empty()
+    {
+        bundle.add_diag(&mut diag);
     }
     diag.mapv(positive_joint_diagonal_entry)
 }
@@ -20137,6 +20244,7 @@ fn add_joint_penalty_to_matrix(
     ranges: &[(usize, usize)],
     s_lambdas: &[Array2<f64>],
     diagonal_ridge: f64,
+    joint_full_width: Option<&crate::families::joint_penalty::JointPenaltyBundle>,
 ) {
     for (b, s_lambda) in s_lambdas.iter().enumerate() {
         let (start, end) = ranges[b];
@@ -20147,6 +20255,11 @@ fn add_joint_penalty_to_matrix(
         for d in 0..matrix.nrows() {
             matrix[[d, d]] += diagonal_ridge;
         }
+    }
+    if let Some(bundle) = joint_full_width
+        && !bundle.is_empty()
+    {
+        bundle.add_to_matrix(matrix);
     }
 }
 
