@@ -8627,7 +8627,7 @@ fn resolve_family(
     let explicit_family = family_from_arg(arg, nb_theta);
     if let Some(choice) = link_choice.as_ref() {
         let from_link = if choice.mixture_components.is_some() {
-            LikelihoodSpec::binomial_link(LinkFunction::Logit)
+            LikelihoodSpec::binomial_logit()
         } else {
             match choice.link {
                 LinkFunction::Identity => LikelihoodSpec::gaussian_identity(),
@@ -8643,10 +8643,14 @@ fn resolve_family(
                 LinkFunction::Logit => LikelihoodSpec::binomial_logit(),
                 LinkFunction::Probit => LikelihoodSpec::binomial_probit(),
                 LinkFunction::CLogLog => LikelihoodSpec::binomial_cloglog(),
-                LinkFunction::Sas => LikelihoodSpec::binomial_link(LinkFunction::Sas),
-                LinkFunction::BetaLogistic => {
-                    LikelihoodSpec::binomial_link(LinkFunction::BetaLogistic)
-                }
+                LinkFunction::Sas => LikelihoodSpec::new(
+                    ResponseFamily::Binomial,
+                    InverseLink::Standard(LinkFunction::Sas),
+                ),
+                LinkFunction::BetaLogistic => LikelihoodSpec::new(
+                    ResponseFamily::Binomial,
+                    InverseLink::Standard(LinkFunction::BetaLogistic),
+                ),
             }
         };
         if let Some(explicit) = explicit_family.as_ref() {
@@ -8678,7 +8682,7 @@ fn resolve_family(
         FamilyArg::BinomialLogit => LikelihoodSpec::binomial_logit(),
         FamilyArg::BinomialProbit => LikelihoodSpec::binomial_probit(),
         FamilyArg::BinomialCloglog => LikelihoodSpec::binomial_cloglog(),
-        FamilyArg::LatentCloglogBinomial => LikelihoodSpec::binomial_link(LinkFunction::CLogLog),
+        FamilyArg::LatentCloglogBinomial => LikelihoodSpec::binomial_cloglog(),
         FamilyArg::PoissonLog => LikelihoodSpec::poisson_log(),
         FamilyArg::NegativeBinomial => LikelihoodSpec::negative_binomial_log(nb_theta),
         FamilyArg::GammaLog => LikelihoodSpec::gamma_log(),
@@ -8701,9 +8705,7 @@ fn family_from_arg(arg: FamilyArg, negative_binomial_theta: f64) -> Option<Likel
         FamilyArg::BinomialLogit => Some(LikelihoodSpec::binomial_logit()),
         FamilyArg::BinomialProbit => Some(LikelihoodSpec::binomial_probit()),
         FamilyArg::BinomialCloglog => Some(LikelihoodSpec::binomial_cloglog()),
-        FamilyArg::LatentCloglogBinomial => {
-            Some(LikelihoodSpec::binomial_link(LinkFunction::CLogLog))
-        }
+        FamilyArg::LatentCloglogBinomial => Some(LikelihoodSpec::binomial_cloglog()),
         FamilyArg::PoissonLog => Some(LikelihoodSpec::poisson_log()),
         FamilyArg::NegativeBinomial => Some(LikelihoodSpec::negative_binomial_log(
             negative_binomial_theta,
