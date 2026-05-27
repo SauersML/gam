@@ -69,9 +69,6 @@ impl HeartbeatState {
 
     fn emit(&self) {
         let threads = self.threads.lock().expect("heartbeat registry poisoned");
-        if threads.is_empty() {
-            return;
-        }
         let resource = ProcessResourceSnapshot::read();
         log::info!(
             "[heartbeat] elapsed={} {} active_threads={}",

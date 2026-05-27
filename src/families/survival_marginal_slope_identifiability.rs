@@ -3441,4 +3441,106 @@ mod tests {
             }
         }
     }
+
+    /// Recompile-after-first-PIRLS-accept refinement: under a structural
+    /// (identity) row Hessian, a direction that is *only* identifiable
+    /// through the q1 channel survives the per-term compile; under a
+    /// data-adaptive row Hessian that happens to zero out the q1/qd1/g
+    /// metric weight (everything except q0), the same direction collapses.
+    /// This pins the diagnostic the production hook in
+    /// `fit_survival_marginal_slope_terms` watches for: the two row
+    /// Hessians produce different `drops_by_block` on identical raw
+    /// designs.
+    #[test]
+    fn recompile_after_accept_diff_detection_pilot_curvature_trap() {
+        let n = 6usize;
+        // Time block: a single column that only contributes through q0
+        // (entry-time channel). Both row Hessians see it identically on
+        // the q0 axis.
+        let time_dq0 = Array2::<f64>::from_elem((n, 1), 1.0);
+        let time_dq1 = Array2::<f64>::zeros((n, 1));
+        let time_dqd1 = Array2::<f64>::zeros((n, 1));
+        // Marginal block: a single column whose q0 part is colinear with
+        // the time block's q0 (both are ones-vectors). Its q-channel maps
+        // into BOTH q0 and q1 under QChannelBlockOperator, so under a
+        // metric that weighs q1 it carries a non-colinear component.
+        let marg_dq = Array2::<f64>::from_elem((n, 1), 1.0);
+        let marg_dqd1 = Array2::<f64>::zeros((n, 1));
+        // No logslope columns.
+        let log_dg = Array2::<f64>::zeros((n, 0));
+        let time_partition = vec![0..1usize];
+        let marg_partition = vec![0..1usize];
+        let log_partition: Vec<std::ops::Range<usize>> = Vec::new();
+
+        // Pass 1: structural identity row Hessian. q0/q1/qd1/g all weighted
+        // equally → marg's q1 component is visible, so marg is identifiable
+        // after residualising against the time block (drops_marg = 0).
+        let mut h_ident = Array3::<f64>::zeros((n, K_SURVIVAL, K_SURVIVAL));
+        for i in 0..n {
+            for k in 0..K_SURVIVAL {
+                h_ident[[i, k, k]] = 1.0;
+            }
+        }
+        let row_hess_ident = SurvivalRowHessian::from_full(h_ident);
+        let compiled_ident = compile_survival_parametric_designs_per_term(
+            time_dq0.clone(),
+            time_dq1.clone(),
+            time_dqd1.clone(),
+            &time_partition,
+            marg_dq.clone(),
+            marg_dqd1.clone(),
+            &marg_partition,
+            log_dg.clone(),
+            &log_partition,
+            &row_hess_ident,
+        )
+        .expect("identity-H compile must succeed");
+
+        // Pass 2: data-adaptive row Hessian that only weighs q0 (all
+        // other channel diagonals zero). Marg's q1 contribution is now
+        // invisible → marg fully aliases with time on q0 → drops_marg = 1.
+        let mut h_q0_only = Array3::<f64>::zeros((n, K_SURVIVAL, K_SURVIVAL));
+        for i in 0..n {
+            h_q0_only[[i, 0, 0]] = 1.0;
+        }
+        let row_hess_q0 = SurvivalRowHessian::from_full(h_q0_only);
+        let compiled_q0 = compile_survival_parametric_designs_per_term(
+            time_dq0,
+            time_dq1,
+            time_dqd1,
+            &time_partition,
+            marg_dq,
+            marg_dqd1,
+            &marg_partition,
+            log_dg,
+            &log_partition,
+            &row_hess_q0,
+        )
+        .expect("q0-only-H compile must succeed");
+
+        // The two drops_by_block tuples disagree on the marginal block —
+        // this is exactly the "pilot-curvature trap" the recompile-after-
+        // accept hook is designed to surface.
+        assert_ne!(
+            compiled_ident.drops_by_block,
+            compiled_q0.drops_by_block,
+            "structural-H and data-adaptive-H compiles must produce different \
+             drops_by_block on the constructed pilot-curvature-trap design; \
+             identity={:?} q0-only={:?}",
+            compiled_ident.drops_by_block,
+            compiled_q0.drops_by_block,
+        );
+        // Under identity H, marg survives (no drop).
+        assert_eq!(
+            compiled_ident.drops_by_block.1, 0,
+            "identity-H marg drops expected 0, got {:?}",
+            compiled_ident.drops_by_block,
+        );
+        // Under q0-only H, marg fully aliases with time on q0.
+        assert_eq!(
+            compiled_q0.drops_by_block.1, 1,
+            "q0-only-H marg drops expected 1, got {:?}",
+            compiled_q0.drops_by_block,
+        );
+    }
 }
