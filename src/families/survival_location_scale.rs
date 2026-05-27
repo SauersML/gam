@@ -52,7 +52,7 @@ use crate::solver::estimate::{
     EstimationError, FitGeometry, ensure_finite_scalar_estimation, validate_all_finite_estimation,
 };
 use crate::terms::construction::kronecker_product;
-use crate::types::{InverseLink, LinkFunction, StandardLink};
+use crate::types::{InverseLink, StandardLink};
 use ndarray::{Array1, Array2, ArrayView1, Axis, s};
 use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
 use rayon::slice::ParallelSliceMut;

@@ -47,7 +47,7 @@ use crate::smooth::{
     spatial_length_scale_term_indices,
 };
 use crate::solver::estimate::validate_all_finite_estimation;
-use crate::types::{InverseLink, LinkFunction, StandardLink, RidgePolicy};
+use crate::types::{InverseLink, StandardLink, RidgePolicy};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut2, Axis, s};
 use rayon::prelude::*;
 use std::borrow::Cow;

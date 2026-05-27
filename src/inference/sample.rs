@@ -43,7 +43,7 @@ use crate::survival_construction::{
     resolved_survival_time_basis_config_from_build, survival_derivative_guard_for_likelihood,
 };
 use crate::term_builder::resolve_role_col;
-use crate::types::{InverseLink, LikelihoodSpec, LinkFunction, StandardLink, ResponseFamily};
+use crate::types::{InverseLink, LikelihoodSpec, StandardLink, ResponseFamily};
 
 /// Reconstruct the `LinkWiggleFormulaSpec` from a saved model's
 /// baseline-time-wiggle runtime, returning `None` when the model has no
