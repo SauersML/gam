@@ -11115,18 +11115,17 @@ impl SurvivalMarginalSlopeFamily {
             d: self.event[row],
             dir_u: &dir_u_vec,
             dir_v: &dir_v_vec,
-                val += wi * di * (d2_r_d - d2_s_d);
-
-                // qd1 term
-                if u == primary.qd1 && v == primary.qd1 {
-                    val += wi * di * (6.0 / (qd1 * qd1 * qd1 * qd1)) * qd1_d1 * qd1_d2;
-                }
-
-                out[[u, v]] = val;
-                out[[v, u]] = val;
-            }
-        }
-        Ok(out)
+            entry_base: &entry_b,
+            exit_base: &exit_b,
+            entry_ext_u: &entry_d1,
+            entry_ext_v: &entry_d2,
+            exit_ext_u: &exit_d1,
+            exit_ext_v: &exit_d2,
+            entry_bi: &entry_bi_p,
+            exit_bi: &exit_bi_p,
+        };
+        let flat = crate::gpu::survival_flex::cpu_oracle_fourth_contraction(&inputs)?;
+        Ok(Array2::<f64>::from_shape_vec((p, p), flat).map_err(|e| e.to_string())?)
     }
 
     fn row_primary_third_contracted_general(
