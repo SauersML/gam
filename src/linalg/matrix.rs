@@ -3998,6 +3998,281 @@ impl DenseDesignOperator for CoefficientTransformOperator {
     }
 }
 
+/// SMGS Phase 4b residualised design operator: emits the mathematically-exact
+/// row `C_b · V_b − Σ_{a<b} A_a · R_{a,b}` for block `b`, where `V_b` is the
+/// kept-direction reparametrisation of the inner raw block `C_b` and each
+/// `R_{a,b} = M_{a,b} · V_b` is the precomputed residualised contribution of
+/// an earlier anchor design `A_a` against block `b`.
+///
+/// The operator presents shape `(n × V_b.ncols())` so the rest of the design
+/// stack sees the compiled (kept) width. Row-chunk emission computes
+/// `inner_chunk · V_b` and then subtracts `anchor_chunk · r_block` for every
+/// anchor pair. The combined `n × kept` block is cached via `OnceLock` under
+/// the same `MATERIALIZE_MAX_BYTES = 1 GiB` ceiling as
+/// [`CoefficientTransformOperator`], so streaming consumers fall back to
+/// per-chunk evaluation when the materialisation would exceed budget.
+pub struct ResidualisedDesignOperator {
+    inner: DenseDesignMatrix,
+    transform: Arc<Array2<f64>>,
+    anchors: Vec<(DesignMatrix, Arc<Array2<f64>>)>,
+    n: usize,
+    p_out: usize,
+    materialized: OnceLock<Option<Arc<Array2<f64>>>>,
+}
+
+impl ResidualisedDesignOperator {
+    /// Matches `CoefficientTransformOperator::MATERIALIZE_MAX_BYTES`: 1 GiB
+    /// covers biobank-scale shapes (n=320 K, p_out≈40 → ~100 MiB) and rejects
+    /// pathological designs.
+    const MATERIALIZE_MAX_BYTES: usize = 1024 * 1024 * 1024;
+
+    pub fn new(
+        inner: DenseDesignMatrix,
+        transform: Array2<f64>,
+        anchors: Vec<(DesignMatrix, Arc<Array2<f64>>)>,
+    ) -> Result<Self, String> {
+        let p_inner = inner.ncols();
+        if transform.nrows() != p_inner {
+            return Err(format!(
+                "ResidualisedDesignOperator: inner has {} cols but transform has {} rows",
+                p_inner,
+                transform.nrows(),
+            ));
+        }
+        let n = inner.nrows();
+        let p_out = transform.ncols();
+        for (idx, (anchor, r_block)) in anchors.iter().enumerate() {
+            if anchor.nrows() != n {
+                return Err(format!(
+                    "ResidualisedDesignOperator: anchor[{idx}] has {} rows but inner has {n}",
+                    anchor.nrows(),
+                ));
+            }
+            if r_block.nrows() != anchor.ncols() || r_block.ncols() != p_out {
+                return Err(format!(
+                    "ResidualisedDesignOperator: anchor[{idx}] r_block is {}x{} but expected {}x{}",
+                    r_block.nrows(),
+                    r_block.ncols(),
+                    anchor.ncols(),
+                    p_out,
+                ));
+            }
+        }
+        Ok(Self {
+            inner,
+            transform: Arc::new(transform),
+            anchors,
+            n,
+            p_out,
+            materialized: OnceLock::new(),
+        })
+    }
+
+    /// Get-or-build the cached n × p_out materialised block. Mirrors
+    /// [`CoefficientTransformOperator::materialized_combined`]: computed
+    /// outside the lock to avoid the OnceLock+rayon deadlock pattern, with
+    /// the per-cache 1 GiB byte cap routed through a relaxed policy so the
+    /// inner densification is admitted on the cache's own budget.
+    fn materialized_combined(&self) -> Option<&Array2<f64>> {
+        if let Some(slot) = self.materialized.get() {
+            return slot.as_ref().map(|a| a.as_ref());
+        }
+        let bytes = self
+            .n
+            .checked_mul(self.p_out)
+            .and_then(|cells| cells.checked_mul(std::mem::size_of::<f64>()));
+        let computed = match bytes {
+            Some(b) if b <= Self::MATERIALIZE_MAX_BYTES => {
+                let auto_policy = ResourcePolicy::for_problem(
+                    self.n,
+                    self.p_out,
+                    crate::resource::ProblemHints::default(),
+                );
+                let cache_policy = ResourcePolicy {
+                    max_single_materialization_bytes: Self::MATERIALIZE_MAX_BYTES,
+                    derivative_storage_mode: auto_policy.derivative_storage_mode,
+                    ..ResourcePolicy::default_library()
+                };
+                self.inner
+                    .try_to_dense_arc_with_policy(
+                        "ResidualisedDesignOperator materialization",
+                        &cache_policy,
+                    )
+                    .ok()
+                    .and_then(|x| {
+                        let mut combined = fast_ab(x.as_ref(), &self.transform);
+                        for (anchor, r_block) in &self.anchors {
+                            let anchor_dense = match anchor {
+                                DesignMatrix::Dense(d) => d
+                                    .try_to_dense_arc_with_policy(
+                                        "ResidualisedDesignOperator anchor materialization",
+                                        &cache_policy,
+                                    )
+                                    .ok()?,
+                                DesignMatrix::Sparse(s) => s
+                                    .try_to_dense_arc(
+                                        "ResidualisedDesignOperator anchor materialization",
+                                    )
+                                    .ok()?,
+                            };
+                            let contribution = fast_ab(anchor_dense.as_ref(), r_block.as_ref());
+                            combined -= &contribution;
+                        }
+                        Some(Arc::new(combined))
+                    })
+            }
+            _ => None,
+        };
+        if self.materialized.set(computed).is_err() {
+            return self
+                .materialized
+                .get()
+                .and_then(|opt| opt.as_ref().map(|a| a.as_ref()));
+        }
+        self.materialized
+            .get()
+            .and_then(|opt| opt.as_ref().map(|a| a.as_ref()))
+    }
+
+    /// Public lazy materialisation handle: returns the cached combined block
+    /// when available, falling back to chunked row-wise materialisation via
+    /// the operator-backed path on the caller's behalf.
+    pub fn try_to_dense_arc(&self, context: &str) -> Result<Arc<Array2<f64>>, String> {
+        if let Some(combined) = self.materialized.get().and_then(|opt| opt.clone()) {
+            return Ok(combined);
+        }
+        if let Some(_combined_ref) = self.materialized_combined() {
+            if let Some(arc) = self.materialized.get().and_then(|opt| opt.clone()) {
+                return Ok(arc);
+            }
+        }
+        dense_operator_to_dense_by_chunks(self)
+            .map(Arc::new)
+            .map_err(|err| format!("{context}: failed to materialize dense row chunks: {err}"))
+    }
+}
+
+impl LinearOperator for ResidualisedDesignOperator {
+    fn nrows(&self) -> usize {
+        self.n
+    }
+    fn ncols(&self) -> usize {
+        self.p_out
+    }
+    fn apply(&self, vector: &Array1<f64>) -> Array1<f64> {
+        if let Some(combined) = self.materialized_combined() {
+            return dense_matvec(combined, vector);
+        }
+        // y = C_b · (V_b · v) − Σ_a A_a · (R_{a,b} · v)
+        let tv = fast_av(&self.transform, vector);
+        let mut out = self.inner.apply(&tv);
+        for (anchor, r_block) in &self.anchors {
+            let rv = fast_av(r_block.as_ref(), vector);
+            let contrib = match anchor {
+                DesignMatrix::Dense(d) => d.apply(&rv),
+                DesignMatrix::Sparse(s) => s.apply(&rv),
+            };
+            out -= &contrib;
+        }
+        out
+    }
+    fn apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64> {
+        if let Some(combined) = self.materialized_combined() {
+            return dense_transpose_matvec(combined, vector);
+        }
+        let xtv = self.inner.apply_transpose(vector);
+        let mut out = fast_atv(&self.transform, &xtv);
+        for (anchor, r_block) in &self.anchors {
+            let atv = match anchor {
+                DesignMatrix::Dense(d) => d.apply_transpose(vector),
+                DesignMatrix::Sparse(s) => s.apply_transpose(vector),
+            };
+            let contrib = fast_atv(r_block.as_ref(), &atv);
+            out -= &contrib;
+        }
+        out
+    }
+    fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
+        if let Some(combined) = self.materialized_combined() {
+            let mut xtwx = Array2::<f64>::zeros((self.p_out, self.p_out));
+            streaming_blas_xt_diag_x(combined, weights, &mut xtwx);
+            return Ok(xtwx);
+        }
+        // Fall back to the default DenseDesignOperator chunked path via
+        // explicit materialisation: emit chunks through row_chunk_into and
+        // accumulate XᵀWX without ever holding the full n × p_out block.
+        let n = self.n;
+        if weights.len() != n {
+            return Err(format!(
+                "ResidualisedDesignOperator::diag_xtw_x weights len {} != nrows {n}",
+                weights.len()
+            ));
+        }
+        let p = self.p_out;
+        let chunk_rows = (8 * 1024 * 1024 / (p.max(1) * 8 * 2)).max(16).min(n.max(1));
+        let mut xtwx = Array2::<f64>::zeros((p, p));
+        let mut start = 0;
+        while start < n {
+            let end = (start + chunk_rows).min(n);
+            let chunk = <Self as DenseDesignOperator>::try_row_chunk(self, start..end)
+                .map_err(|e| e.to_string())?;
+            let w_slice = weights.slice(s![start..end]).to_owned();
+            let mut local = Array2::<f64>::zeros((p, p));
+            streaming_blas_xt_diag_x(&chunk, &w_slice, &mut local);
+            xtwx += &local;
+            start = end;
+        }
+        Ok(xtwx)
+    }
+}
+
+impl DenseDesignOperator for ResidualisedDesignOperator {
+    fn as_dense_ref(&self) -> Option<&Array2<f64>> {
+        self.materialized_combined()
+    }
+
+    fn to_dense(&self) -> Array2<f64> {
+        if let Some(combined) = self.materialized_combined() {
+            return combined.clone();
+        }
+        // Chunked fallback when the cache refuses (oversize block).
+        dense_operator_to_dense_by_chunks(self).unwrap_or_else(|err| {
+            std::panic::panic_any(format!(
+                "ResidualisedDesignOperator::to_dense: failed to materialize {}x{} \
+                 via row chunks: {err}",
+                self.n, self.p_out,
+            ))
+        })
+    }
+
+    fn row_chunk_into(
+        &self,
+        rows: Range<usize>,
+        mut out: ArrayViewMut2<'_, f64>,
+    ) -> Result<(), MatrixMaterializationError> {
+        if out.nrows() != rows.end - rows.start || out.ncols() != self.p_out {
+            return Err(MatrixMaterializationError::MissingRowChunk {
+                context: "ResidualisedDesignOperator::row_chunk_into shape mismatch",
+            });
+        }
+        if let Some(combined) = self.materialized_combined() {
+            out.assign(&combined.slice(s![rows, ..]));
+            return Ok(());
+        }
+        // C_b chunk in raw width, then project: out = (inner_chunk) · V_b
+        let inner_chunk = self.inner.try_row_chunk(rows.clone())?;
+        let mut combined = fast_ab(&inner_chunk, &self.transform);
+        // Subtract Σ_a (anchor_chunk · r_block)
+        for (anchor, r_block) in &self.anchors {
+            let anchor_chunk = anchor.try_row_chunk(rows.clone())?;
+            let contribution = fast_ab(&anchor_chunk, r_block.as_ref());
+            combined -= &contribution;
+        }
+        out.assign(&combined);
+        Ok(())
+    }
+}
+
 /// Row-wise (Khatri–Rao) Kronecker product of two dense matrices sharing the
 /// same number of rows: `out[i, j * pb + k] = a[i, j] * b[i, k]`. Parallel
 /// across row chunks; short-circuits on zeros in `a` to skip the inner
@@ -7386,9 +7661,10 @@ mod tests {
     use super::{
         ChunkedKernelDesignOperator, CoefficientTransformOperator, DenseDesignMatrix,
         DenseDesignOperator, DesignMatrix, EmbeddedColumnBlock, MultiChannelOperator,
-        ReparamOperator, RowwiseKroneckerOperator, SparseDesignMatrix, SparseHessianAccumulator,
-        dense_matvec, dense_operator_to_dense_by_chunks, dense_transpose_matvec,
-        dense_transpose_weighted_response, dense_xtwx_view, streaming_sparse_csc_xt_diag_x,
+        ReparamOperator, ResidualisedDesignOperator, RowwiseKroneckerOperator, SparseDesignMatrix,
+        SparseHessianAccumulator, dense_matvec, dense_operator_to_dense_by_chunks,
+        dense_transpose_matvec, dense_transpose_weighted_response, dense_xtwx_view,
+        streaming_sparse_csc_xt_diag_x,
     };
     use crate::linalg::matrix::LinearOperator;
     use crate::linalg::utils::{PcgSolveInfo, StableSolver};
