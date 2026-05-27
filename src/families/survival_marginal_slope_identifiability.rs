@@ -801,6 +801,138 @@ mod tests {
         assert!((out[3] - want).abs() < 1e-12);
     }
 
+    /// Phase-4b application step: take the V matrices from
+    /// `compile_survival_parametric_designs` and apply them to raw
+    /// designs + penalties via
+    /// `apply_survival_parametric_compile_to_designs`. Verify the
+    /// produced `CompiledSurvivalDesigns` has consistent widths
+    /// across the time triplet, the marginal/logslope singletons,
+    /// and their pulled-back penalty matrices.
+    #[test]
+    fn apply_compile_produces_width_consistent_designs_and_penalties() {
+        use crate::families::custom_family::PenaltyMatrix;
+        use crate::linalg::matrix::DenseDesignMatrix;
+
+        let n = 16;
+        let p_time = 3;
+        let p_marginal = 3;
+        let p_logslope = 2;
+        let x: Vec<f64> = (0..n).map(|i| -1.0 + 2.0 * (i as f64) / (n as f64 - 1.0)).collect();
+        let mut time_dq0 = Array2::<f64>::zeros((n, p_time));
+        let mut time_dq1 = Array2::<f64>::zeros((n, p_time));
+        let mut time_dqd1 = Array2::<f64>::zeros((n, p_time));
+        let mut marg_dq = Array2::<f64>::zeros((n, p_marginal));
+        let marg_dqd1 = Array2::<f64>::zeros((n, p_marginal));
+        let mut log_dg = Array2::<f64>::zeros((n, p_logslope));
+        for i in 0..n {
+            time_dq0[[i, 0]] = 1.0;
+            time_dq0[[i, 1]] = x[i];
+            time_dq0[[i, 2]] = x[i] * x[i];
+            time_dq1[[i, 0]] = 1.0;
+            time_dq1[[i, 1]] = x[i];
+            time_dq1[[i, 2]] = x[i] * x[i];
+            time_dqd1[[i, 0]] = 0.0;
+            time_dqd1[[i, 1]] = 1.0;
+            time_dqd1[[i, 2]] = 2.0 * x[i];
+            marg_dq[[i, 0]] = 1.0;
+            marg_dq[[i, 1]] = x[i] * x[i] * x[i];
+            marg_dq[[i, 2]] = x[i].sin();
+            log_dg[[i, 0]] = (2.0 * x[i]).cos();
+            log_dg[[i, 1]] = x[i].tanh();
+        }
+        let mut h_full = Array3::<f64>::zeros((n, K_SURVIVAL, K_SURVIVAL));
+        for i in 0..n {
+            for k in 0..K_SURVIVAL {
+                h_full[[i, k, k]] = 1.0;
+            }
+        }
+        let row_hess = SurvivalRowHessian::from_full(h_full);
+        let compiled = compile_survival_parametric_designs(
+            time_dq0.clone(),
+            time_dq1.clone(),
+            time_dqd1.clone(),
+            marg_dq.clone(),
+            marg_dqd1.clone(),
+            log_dg.clone(),
+            &row_hess,
+        )
+        .expect("compile must succeed");
+
+        // Build raw DesignMatrix wrappers around the same dense data
+        // for the apply step (in production these come from the
+        // family's design accumulation; here we re-use the dense
+        // matrices we already built for the operator construction).
+        let raw_time_entry = DesignMatrix::Dense(DenseDesignMatrix::from(time_dq0.clone()));
+        let raw_time_exit = DesignMatrix::Dense(DenseDesignMatrix::from(time_dq1.clone()));
+        let raw_time_deriv = DesignMatrix::Dense(DenseDesignMatrix::from(time_dqd1.clone()));
+        let raw_marg = DesignMatrix::Dense(DenseDesignMatrix::from(marg_dq.clone()));
+        let raw_log = DesignMatrix::Dense(DenseDesignMatrix::from(log_dg.clone()));
+
+        // Penalties: simple diagonal placeholders at raw width so we
+        // can verify the pulled-back result has the expected shape.
+        let time_pens = vec![PenaltyMatrix::Dense(Array2::<f64>::from_shape_fn(
+            (p_time, p_time),
+            |(i, j)| if i == j { (i + 1) as f64 } else { 0.0 },
+        ))];
+        let marg_pens = vec![PenaltyMatrix::Dense(Array2::<f64>::from_shape_fn(
+            (p_marginal, p_marginal),
+            |(i, j)| if i == j { (i + 1) as f64 } else { 0.0 },
+        ))];
+        let log_pens = vec![PenaltyMatrix::Dense(Array2::<f64>::from_shape_fn(
+            (p_logslope, p_logslope),
+            |(i, j)| if i == j { (i + 1) as f64 } else { 0.0 },
+        ))];
+
+        let out = apply_survival_parametric_compile_to_designs(
+            &compiled,
+            raw_time_entry,
+            raw_time_exit,
+            raw_time_deriv,
+            raw_marg,
+            raw_log,
+            &time_pens,
+            &marg_pens,
+            &log_pens,
+        )
+        .expect("apply must succeed");
+
+        // Time triplet: all three designs share V_time, so all three
+        // have the same compiled width = V_time.ncols() = p_time (no
+        // drops on time block in this scenario).
+        assert_eq!(out.time_design_entry.ncols(), compiled.v_time.ncols());
+        assert_eq!(out.time_design_exit.ncols(), compiled.v_time.ncols());
+        assert_eq!(out.time_design_derivative_exit.ncols(), compiled.v_time.ncols());
+
+        // Marginal / logslope: widths equal their V's column count.
+        assert_eq!(out.marginal_design.ncols(), compiled.v_marginal.ncols());
+        assert_eq!(out.logslope_design.ncols(), compiled.v_logslope.ncols());
+
+        // Penalty pullbacks: each penalty matrix is (p_kept × p_kept).
+        for s in &out.time_penalties {
+            let dense = s.as_dense_cow();
+            assert_eq!(dense.dim(), (compiled.v_time.ncols(), compiled.v_time.ncols()));
+        }
+        for s in &out.marginal_penalties {
+            let dense = s.as_dense_cow();
+            assert_eq!(
+                dense.dim(),
+                (compiled.v_marginal.ncols(), compiled.v_marginal.ncols())
+            );
+        }
+        for s in &out.logslope_penalties {
+            let dense = s.as_dense_cow();
+            assert_eq!(
+                dense.dim(),
+                (compiled.v_logslope.ncols(), compiled.v_logslope.ncols())
+            );
+        }
+
+        // Row count of every design must equal n.
+        assert_eq!(out.time_design_entry.nrows(), n);
+        assert_eq!(out.marginal_design.nrows(), n);
+        assert_eq!(out.logslope_design.nrows(), n);
+    }
+
     /// Top-level Phase-4b API test for the SMGS parametric path:
     /// call `compile_survival_parametric_designs` on a shared-constant
     /// alias between time and marginal, with an identity row Hessian.
