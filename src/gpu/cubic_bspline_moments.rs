@@ -1777,12 +1777,15 @@ pub fn try_device_tetrahedral_moments(
 pub fn try_device_tetrahedral_moments(
     inputs: &TetrahedralMomentInputs<'_>,
 ) -> Result<Option<DeviceCubicMomentTable>, GpuError> {
-    // Surface the inputs in the error path so non-Linux builds do not
-    // silently strip them (the lib must not contain `_`-prefixed silencers).
-    if inputs.cells.n_tets == 0 {
+    // Non-Linux hosts have no CUDA backend; the dispatcher always reports
+    // "fallback" via Ok(None). We still validate the inputs so a malformed
+    // caller surfaces the same error on every platform, and so the
+    // `inputs` parameter is genuinely consumed (no `_`-prefixed silencer).
+    inputs.cells.validate()?;
+    if inputs.cells.d < 3 {
         gpu_bail!(
-            "try_device_tetrahedral_moments: empty tet list (n_cells={})",
-            inputs.cells.n_cells
+            "try_device_tetrahedral_moments: tetrahedral path requires D >= 3 (got {})",
+            inputs.cells.d
         );
     }
     Ok(None)
@@ -2508,6 +2511,219 @@ use crate::gpu::error::GpuResultExt;
         let c = vec![vec![0u8, 0u8], vec![1, 0], vec![0, 2]];
         assert_eq!(super::hash_alpha_table(&a), super::hash_alpha_table(&b));
         assert_ne!(super::hash_alpha_table(&a), super::hash_alpha_table(&c));
+    }
+
+    /// CM-P3 sanity: the CPU reference for a single unit-volume tet with
+    /// vertices at the canonical basis matches the analytic Dirichlet
+    /// formula for several β. Asserts the affine T_n expansion on the CPU
+    /// side (and thus the formula the NVRTC kernel implements verbatim).
+    #[test]
+    fn tetrahedral_geom_moment_cpu_matches_dirichlet_unit_simplex() {
+        // Vertices: v0 = 0, v1 = e1, v2 = e2, v3 = e3. So T = T_ref and
+        // |det B| = 1; x − c0 = u (with c0 = 0). Then
+        //   ∫_T u_1^{β_1} u_2^{β_2} u_3^{β_3} du
+        //     = β_1! β_2! β_3! / (β_1+β_2+β_3+3)!
+        let v0 = [0.0, 0.0, 0.0];
+        let v1 = [1.0, 0.0, 0.0];
+        let v2 = [0.0, 1.0, 0.0];
+        let v3 = [0.0, 0.0, 1.0];
+        let mut verts = Vec::new();
+        verts.extend_from_slice(&v0);
+        verts.extend_from_slice(&v1);
+        verts.extend_from_slice(&v2);
+        verts.extend_from_slice(&v3);
+        let c0 = [0.0f64, 0.0, 0.0];
+        for beta in &[
+            [0u8, 0, 0],
+            [1, 0, 0],
+            [0, 1, 0],
+            [0, 0, 1],
+            [2, 0, 0],
+            [1, 1, 0],
+            [1, 0, 1],
+            [0, 1, 1],
+            [2, 1, 0],
+            [1, 1, 1],
+            [2, 2, 1],
+        ] {
+            let got = super::tetrahedral_geom_moment_cpu(&verts, &c0, beta, 3);
+            let want = super::dirichlet_ref_simplex(
+                beta[0] as u32,
+                beta[1] as u32,
+                beta[2] as u32,
+            );
+            assert_close!(
+                &format!("dirichlet β={:?}", beta),
+                got,
+                want,
+                1e-14,
+                1e-15,
+            );
+        }
+    }
+
+    /// CM-P3: scaled / translated tet — vertices on a non-degenerate
+    /// parallelepiped should yield G_β(T) = |det B| · ∫_{T_ref} (Bu + q)^β du,
+    /// matched against a brute 6th-order Gauss-quadrature reference on
+    /// the reference simplex (more than enough for |β| ≤ 3 polynomial
+    /// integrand × the affine pull-back). The point of this test is to
+    /// catch any sign / index error in the T_n expansion that the unit
+    /// simplex test (B = I, q = 0) cannot see.
+    #[test]
+    fn tetrahedral_geom_moment_cpu_matches_quadrature_general_tet() {
+        // Non-degenerate tetrahedron with shifted v0 and asymmetric edges.
+        let v0 = [0.3f64, -0.2, 0.7];
+        let v1 = [1.1, 0.4, 0.6];
+        let v2 = [0.5, 0.9, 1.1];
+        let v3 = [0.7, -0.1, 1.8];
+        let mut verts = Vec::new();
+        verts.extend_from_slice(&v0);
+        verts.extend_from_slice(&v1);
+        verts.extend_from_slice(&v2);
+        verts.extend_from_slice(&v3);
+        let c0 = [0.1f64, 0.05, 0.2];
+
+        // 14-point Stroud-degree-5 rule on the 3-simplex. We use the
+        // simpler approach: tensor 8-pt GL on [0,1]^3 with the standard
+        // Duffy transform from the cube to the simplex,
+        //   u_1 = ξ,  u_2 = (1-ξ) η,  u_3 = (1-ξ)(1-η) ζ,
+        //   du_1 du_2 du_3 = (1-ξ)^2 (1-η) dξ dη dζ.
+        // Exact for polynomials of total degree ≤ 15 (8-pt GL is exact
+        // through degree 15 per axis), more than enough for |β| ≤ 3.
+        const GL8_X01: [f64; 8] = [
+            0.019_855_071_751_231_88,
+            0.101_666_761_293_186_63,
+            0.237_233_795_041_835_50,
+            0.408_282_678_752_175_10,
+            0.591_717_321_247_824_90,
+            0.762_766_204_958_164_50,
+            0.898_333_238_706_813_30,
+            0.980_144_928_248_768_10,
+        ];
+        const GL8_W01: [f64; 8] = [
+            0.050_614_268_145_188_18,
+            0.111_190_517_226_687_24,
+            0.156_853_322_938_943_55,
+            0.181_341_891_689_180_92,
+            0.181_341_891_689_180_92,
+            0.156_853_322_938_943_55,
+            0.111_190_517_226_687_24,
+            0.050_614_268_145_188_18,
+        ];
+
+        for beta in &[
+            [0u8, 0, 0],
+            [1, 0, 0],
+            [0, 1, 0],
+            [0, 0, 1],
+            [2, 1, 0],
+            [1, 1, 1],
+            [3, 0, 0],
+        ] {
+            let got = super::tetrahedral_geom_moment_cpu(&verts, &c0, beta, 3);
+            // Reference via Duffy + tensor 8-pt GL.
+            let mut ref_acc = 0.0f64;
+            for ix in 0..8 {
+                for iy in 0..8 {
+                    for iz in 0..8 {
+                        let xi = GL8_X01[ix];
+                        let et = GL8_X01[iy];
+                        let ze = GL8_X01[iz];
+                        let w = GL8_W01[ix] * GL8_W01[iy] * GL8_W01[iz];
+                        let u1 = xi;
+                        let u2 = (1.0 - xi) * et;
+                        let u3 = (1.0 - xi) * (1.0 - et) * ze;
+                        let jac = (1.0 - xi) * (1.0 - xi) * (1.0 - et);
+                        // x(u) = v0 + u1 (v1-v0) + u2 (v2-v0) + u3 (v3-v0)
+                        let mut x = [0.0f64; 3];
+                        for r in 0..3 {
+                            x[r] = v0[r]
+                                + u1 * (v1[r] - v0[r])
+                                + u2 * (v2[r] - v0[r])
+                                + u3 * (v3[r] - v0[r]);
+                        }
+                        let mut integrand = 1.0;
+                        for r in 0..3 {
+                            integrand *= (x[r] - c0[r]).powi(beta[r] as i32);
+                        }
+                        ref_acc += w * jac * integrand;
+                    }
+                }
+            }
+            // |det B|
+            let b = [
+                [v1[0] - v0[0], v2[0] - v0[0], v3[0] - v0[0]],
+                [v1[1] - v0[1], v2[1] - v0[1], v3[1] - v0[1]],
+                [v1[2] - v0[2], v2[2] - v0[2], v3[2] - v0[2]],
+            ];
+            let det = (b[0][0] * (b[1][1] * b[2][2] - b[1][2] * b[2][1])
+                - b[0][1] * (b[1][0] * b[2][2] - b[1][2] * b[2][0])
+                + b[0][2] * (b[1][0] * b[2][1] - b[1][1] * b[2][0]))
+                .abs();
+            let want = ref_acc * det;
+            assert_close!(
+                &format!("tet β={:?}", beta),
+                got,
+                want,
+                1e-12,
+                1e-13,
+            );
+        }
+    }
+
+    /// CM-P3: TetrahedralCellTable::validate catches mis-sized vertex / cell
+    /// arrays and out-of-range cell indices. The validator is the only
+    /// gatekeeper between the host caller and the NVRTC kernel, so its
+    /// rejection set must stay tight.
+    #[test]
+    fn tetrahedral_cell_table_validate_catches_misshapen_input() {
+        let good = super::TetrahedralCellTable {
+            vertices: vec![0.0; 4 * 3],
+            cell_index: vec![0],
+            cell_centers: vec![0.0, 0.0, 0.0],
+            n_tets: 1,
+            n_cells: 1,
+            d: 3,
+        };
+        assert!(good.validate().is_ok(), "well-formed table validates");
+
+        let bad_verts = super::TetrahedralCellTable {
+            vertices: vec![0.0; 4 * 3 - 1],
+            ..good.clone()
+        };
+        assert!(bad_verts.validate().is_err(), "short vertex array rejected");
+
+        let bad_idx = super::TetrahedralCellTable {
+            cell_index: vec![3],
+            ..good.clone()
+        };
+        assert!(bad_idx.validate().is_err(), "out-of-range cell index rejected");
+    }
+
+    /// CM-P3 kernel source must contain the two entry-point symbols the
+    /// host dispatcher looks up by name. Catches any future rename that
+    /// would surface only as a runtime "function not found" failure.
+    #[test]
+    fn tetrahedral_kernel_sources_contain_required_symbols() {
+        let betas = vec![vec![0u8, 0, 0], vec![1, 0, 0]];
+        let geom_src = super::build_tet_geom_kernel_source(3, &betas);
+        assert!(
+            geom_src.contains("tetrahedral_geom_moments_kernel"),
+            "geom kernel missing entry-point symbol"
+        );
+        assert!(
+            geom_src.contains("BETA_TABLE"),
+            "geom kernel missing baked-in β table"
+        );
+        let con_src = super::build_tet_contract_kernel_source(4, 3, 10);
+        assert!(
+            con_src.contains("tetrahedral_contract_kernel"),
+            "contract kernel missing entry-point symbol"
+        );
+        assert!(
+            con_src.contains("NALPHA  4") && con_src.contains("NBETA   3"),
+            "contract kernel missing NALPHA / NBETA defines"
+        );
     }
 
     /// Backend `compiled()` reflects the platform and is callable on every

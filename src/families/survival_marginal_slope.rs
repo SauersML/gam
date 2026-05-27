@@ -742,6 +742,52 @@ fn block_slices(
     }
 }
 
+/// Owned scratch buffers backing a
+/// [`crate::gpu::survival_flex::SurvivalFlexGpuRowInputs`] descriptor.
+///
+/// Built per-call by
+/// [`SurvivalMarginalSlopeFamily::build_survival_flex_gpu_row_batch`];
+/// callers hold the batch by value across the GPU `try_*` entry so the
+/// borrowed slices returned by [`Self::as_inputs`] live for the dispatch.
+struct SurvivalFlexGpuRowBatch {
+    n: usize,
+    p: usize,
+    q0: Vec<f64>,
+    q1: Vec<f64>,
+    qd1: Vec<f64>,
+    z: Vec<f64>,
+    g: Vec<f64>,
+    beta: Vec<f64>,
+    weights: Vec<f64>,
+    event: Vec<f64>,
+}
+
+impl SurvivalFlexGpuRowBatch {
+    /// Borrow the buffers as a
+    /// [`crate::gpu::survival_flex::SurvivalFlexGpuRowInputs`] descriptor.
+    fn as_inputs<'a>(
+        &'a self,
+        family: &SurvivalMarginalSlopeFamily,
+    ) -> crate::gpu::survival_flex::SurvivalFlexGpuRowInputs<'a> {
+        crate::gpu::survival_flex::SurvivalFlexGpuRowInputs {
+            n: self.n,
+            r: N_PRIMARY,
+            p: self.p,
+            score_dim: family.score_dim(),
+            beta: &self.beta,
+            q0: &self.q0,
+            q1: &self.q1,
+            qd1: &self.qd1,
+            z: &self.z,
+            g: &self.g,
+            weights: &self.weights,
+            event: &self.event,
+            derivative_guard: family.derivative_guard,
+            probit_scale: family.probit_frailty_scale(),
+        }
+    }
+}
+
 // ── Primary-space helpers ─────────────────────────────────────────────
 
 // Primary scalar indices: 0=q0, 1=q1, 2=qd1, 3=g
@@ -13550,6 +13596,31 @@ impl ExactNewtonJointHessianWorkspace for SurvivalMarginalSlopeExactNewtonJointH
             }
             .into());
         }
+        // ── Step-6 dispatcher: try GPU joint-Hessian × v first ───────────
+        //
+        // Routes through
+        // [`crate::gpu::survival_flex::try_survival_flex_hvp`] via the
+        // `gpu::decide` policy.  Returns `Ok(None)` until the joint-β
+        // device HVP assembly lands; on `Ok(Some(hv))` we write straight
+        // into the caller-owned `out` buffer and skip the prebuilt
+        // operator matvec.  The CPU `mul_vec_into` below remains the
+        // production fallback path and is byte-for-byte identical to the
+        // pre-Step-6 hot path.
+        if self.family.effective_flex_active(&self.block_states)?
+            && !self.family.flex_timewiggle_active()
+        {
+            let slices = block_slices(&self.family, &self.block_states);
+            if let Some(hv) = self.family.try_survival_flex_joint_dispatch_hvp(
+                &self.block_states,
+                &slices,
+                v,
+            )? {
+                if hv.len() == out.len() {
+                    out.assign(&hv);
+                    return Ok(true);
+                }
+            }
+        }
         self.joint_hessian_operator
             .mul_vec_into(v.view(), out.view_mut());
         Ok(true)
@@ -14033,13 +14104,11 @@ impl SurvivalMarginalSlopeFamily {
     /// Unified dense joint Hessian assembly for flex and timewiggle paths.
     /// Both paths use q-geometry Jacobians via accumulate_dynamic_q_joint_row.
     /// The rigid path (no flex, no timewiggle) uses the RowKernel fast path.
-    /// What slice of the joint NLL surface should the GPU survival-flex
-    /// dispatcher try to compute on the device?
+    /// Owned scratch buffers backing a [`SurvivalFlexGpuRowInputs`]
+    /// descriptor for one fit-evaluation call.
     ///
-    /// Returned by [`Self::try_survival_flex_joint_dispatch_gradient`] et al.,
-    /// these encode the three Step-6 entry points and the matching CPU
-    /// fallback boundary.  When the GPU declines (`Ok(None)`) the caller
-    /// runs the existing CPU per-row sweep.
+    /// Held by-value across the GPU `try_*` entry so the borrowed slices
+    /// in `as_inputs` live as long as the dispatcher invocation.
     fn build_survival_flex_gpu_row_batch(
         &self,
         block_states: &[ParameterBlockState],
@@ -14053,7 +14122,7 @@ impl SurvivalMarginalSlopeFamily {
             return Ok(None);
         }
         let n = self.n;
-        let g_eta: &Array1<f64> = block_states[2].eta.as_ref();
+        let g_eta: &Array1<f64> = &block_states[2].eta;
         if g_eta.len() != n {
             return Ok(None);
         }
@@ -14080,11 +14149,17 @@ impl SurvivalMarginalSlopeFamily {
         // shape contract; mismatches force CPU fallback.
         let mut beta = vec![0.0_f64; p];
         let copy_block = |dst: &mut [f64], range: &std::ops::Range<usize>, src: &Array1<f64>| {
-            if src.len() == range.len() {
-                dst[range.clone()].copy_from_slice(
-                    src.as_slice()
-                        .expect("survival flex GPU batch: block β must be contiguous"),
-                );
+            if src.len() != range.len() {
+                return;
+            }
+            if let Some(slice) = src.as_slice() {
+                dst[range.clone()].copy_from_slice(slice);
+            } else {
+                // Non-contiguous Array1 — copy element-wise so the GPU
+                // descriptor still sees the canonical joint-block β.
+                for (offset, value) in src.iter().enumerate() {
+                    dst[range.start + offset] = *value;
+                }
             }
         };
         copy_block(&mut beta, &slices.time, &block_states[0].beta);
@@ -14392,6 +14467,21 @@ impl SurvivalMarginalSlopeFamily {
     ) -> Result<(f64, Array1<f64>), String> {
         let flex_active = self.effective_flex_active(block_states)?;
         let slices = block_slices(self, block_states);
+        // ── Step-6 dispatcher: try GPU joint-β gradient first ────────────
+        //
+        // Routes through
+        // [`crate::gpu::survival_flex::try_survival_flex_gradient`] via
+        // the `gpu::decide` policy.  Returns `Ok(None)` until the joint-β
+        // device assembly lands (Steps 4 + 5 sibling commits), at which
+        // point this site becomes the hot dispatch with no further
+        // family-side rework.
+        if flex_active && !self.flex_timewiggle_active() {
+            if let Some(pair) =
+                self.try_survival_flex_joint_dispatch_gradient(block_states, &slices)?
+            {
+                return Ok(pair);
+            }
+        }
         let primary = flex_primary_slices(self);
         let identity_blocks = if flex_active {
             flex_identity_block_pairs(&primary, &slices)
