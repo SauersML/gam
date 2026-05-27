@@ -2386,15 +2386,13 @@ mod stream_device_parity_tests {
         // Closed-form OLS (with tiny ridge).
         let xtx = x.t().dot(&x);
         let xty = x.t().dot(&y);
-        let mut h_ref = xtx + &penalty;
-        // Solve via faer.
-        let h_faer = faer::Mat::from_fn(p, p, |i, j| h_ref[[i, j]]);
-        let chol = h_faer.cholesky(faer::Side::Lower).expect("chol");
-        let rhs = faer::Mat::from_fn(p, 1, |i, _| xty[i]);
-        let beta_ref_mat = chol.solve(rhs.as_ref());
-        let beta_ref = ndarray::Array1::from(
-            (0..p).map(|i| beta_ref_mat[(i, 0)]).collect::<Vec<_>>(),
-        );
+        let h_ref = xtx + &penalty;
+        // Solve via the crate's faer/ndarray bridge.
+        use crate::linalg::faer_ndarray::FaerCholesky;
+        let chol = h_ref
+            .cholesky(faer::Side::Lower)
+            .expect("OLS reference Cholesky");
+        let beta_ref: ndarray::Array1<f64> = chol.solvevec(&xty);
 
         // Gaussian-identity PIRLS converges in one Newton iter (linear
         // problem); the loop may take a few iters because the line

@@ -1652,8 +1652,9 @@ mod sigma_cubature_accumulation_tests {
         let scales = [0.6_f64, 1.1];
         let points_b: Vec<Array1<f64>> = (0..r)
             .flat_map(|k| {
+                let b_outer = b0.clone();
                 [1.0_f64, -1.0_f64].into_iter().map(move |sign| {
-                    let mut b = b0.clone();
+                    let mut b = b_outer.clone();
                     b[k] += sign * scales[k];
                     b
                 })
