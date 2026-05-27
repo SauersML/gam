@@ -9,7 +9,7 @@ Priority order (per team-lead):
 1. `arrow_schur_hill_climb` — Layer C 5×, Layer D fused 10×, biobank scale
 2. `perf_bms_flex_row_dense_block` — 10× CPU dense-H at biobank
 3. `perf_bms_flex_row_packed_vs_full_hvp` — 5× CPU HVP at biobank
-4. Sphere end-to-end parity (≤1e-9)
+4. Sphere end-to-end parity (≤1e-9) — **WIRED (task #25)**: see `sphere_gpu_end_to_end_fit_parity_vs_cpu_truncated` in `src/gpu/sphere.rs` (`#[ignore = "requires CUDA"]`); v100-bench-runner unignores in their harness
 5. Sphere 20× kernel at (n=200k, m=200, L=50)
 6. Cubic-moments NVRTC hex tensor parity
 7. Sphere 10× end-to-end fit
