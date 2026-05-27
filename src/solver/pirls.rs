@@ -7649,8 +7649,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
             // X is already in transformed coordinates.
             let qs_view = qs_arc.as_ref().map(|qs| qs.view());
             let x_transformed_owned: Option<Array2<f64>> = match transform_active.as_ref() {
-                Some(_) => qs_view
-                    .map(|qs| crate::faer_ndarray::fast_ab(&x_dense.to_owned(), &qs.to_owned())),
+                Some(_) => qs_view.map(|qs| crate::faer_ndarray::fast_ab(&x_dense, &qs)),
                 None => None,
             };
             let x_t_view = match x_transformed_owned.as_ref() {
