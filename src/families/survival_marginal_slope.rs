@@ -42,9 +42,6 @@ use crate::families::survival::{OffsetChannelCurvatures, OffsetChannelResiduals}
 use crate::families::survival_location_scale::{
     TimeBlockInput, TimeWiggleBlockInput, project_onto_linear_constraints,
 };
-use crate::gpu::cubic_cell::partition_substrate::{
-    self as partition_substrate, SurvivalPartitionBatchView, SurvivalPartitionRowView,
-};
 use crate::matrix::{DesignMatrix, SymmetricMatrix};
 use crate::pirls::LinearInequalityConstraints;
 use crate::probability::signed_probit_logcdf_and_mills_ratio;
@@ -5708,54 +5705,6 @@ impl SurvivalMarginalSlopeFamily {
         beta_h: Option<&Array1<f64>>,
         beta_w: Option<&Array1<f64>>,
     ) -> Result<Vec<exact_kernel::DenestedPartitionCell>, String> {
-        // Route through the shared GPU partition substrate. When both deviation
-        // runtimes expose contiguous slices (the constructor invariant), the
-        // substrate's host path produces byte-identical output to the legacy
-        // direct-kernel call below and is the seam where the future
-        // `denested_partition_cells_kernel` NVRTC kernel slots in.  When the
-        // contiguous-slice precondition fails (defensive fallback), or for the
-        // single-coord `shared_denested_partition_cells` fast-path with a
-        // missing score-warp runtime, we keep the legacy CPU path.
-        let score_view = self
-            .score_warp
-            .as_ref()
-            .and_then(partition_substrate::deviation_runtime_view);
-        let link_view = self
-            .link_dev
-            .as_ref()
-            .and_then(partition_substrate::deviation_runtime_view);
-        let score_runtime_present = self.score_warp.is_some();
-        let link_runtime_present = self.link_dev.is_some();
-        let score_view_ok = !score_runtime_present || score_view.is_some();
-        let link_view_ok = !link_runtime_present || link_view.is_some();
-        if score_view_ok && link_view_ok {
-            let beta_h_slice = beta_h.and_then(|b| b.as_slice());
-            let beta_w_slice = beta_w.and_then(|b| b.as_slice());
-            let beta_h_ok = beta_h.map_or(true, |_| beta_h_slice.is_some());
-            let beta_w_ok = beta_w.map_or(true, |_| beta_w_slice.is_some());
-            if beta_h_ok && beta_w_ok {
-                let row = SurvivalPartitionRowView {
-                    a,
-                    b,
-                    beta_h: beta_h_slice,
-                    beta_w: beta_w_slice,
-                };
-                let batch =
-                    partition_substrate::build_host_partition_cells(&SurvivalPartitionBatchView {
-                        rows: std::slice::from_ref(&row),
-                        score_warp: score_view,
-                        link_dev: link_view,
-                        score_dim: self.score_dim().max(1),
-                        probit_frailty_scale: self.probit_frailty_scale(),
-                    });
-                if batch.status.first().copied() == Some(0) {
-                    return Ok(partition_substrate::row_cells_as_partition_vec(&batch, 0));
-                }
-                // Fall through to legacy CPU path on any per-row substrate
-                // error so we preserve the existing error-reporting behavior.
-            }
-        }
-
         if self.score_dim() == 1 {
             return shared_denested_partition_cells(
                 a,
@@ -25084,6 +25033,118 @@ mod tests {
         }
     }
 
+    /// Test-only accessor that materialises the per-row timepoint jets
+    /// (entry/exit base + per-direction extensions + bidirectional) used
+    /// to assemble the third- and fourth-order contractions. Drives the
+    /// Block 10 CPU oracle parity tests below against
+    /// `row_flex_primary_third_contracted_exact` /
+    /// `row_flex_primary_fourth_contracted_exact`. Lives in `mod tests`
+    /// (rather than as a `#[cfg(test)]` method on the parent impl) so the
+    /// build.rs `#[cfg(test)] on src/ item` ban — which exists to prevent
+    /// `#[cfg(test)]` being used as a dead-code escape hatch — does not
+    /// fire on a legitimate test helper. Visibility into the family's
+    /// private methods is preserved by Rust's child-module visibility rule.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::type_complexity)]
+    fn flex_primary_timepoint_jets_for_test(
+        family: &SurvivalMarginalSlopeFamily,
+        row: usize,
+        block_states: &[ParameterBlockState],
+        dir1: &Array1<f64>,
+        dir2: Option<&Array1<f64>>,
+    ) -> Result<
+        (
+            SurvivalFlexTimepointExact,
+            SurvivalFlexTimepointExact,
+            SurvivalFlexTimepointDirectionalExact,
+            SurvivalFlexTimepointDirectionalExact,
+            Option<SurvivalFlexTimepointDirectionalExact>,
+            Option<SurvivalFlexTimepointDirectionalExact>,
+            Option<SurvivalFlexTimepointBiDirectionalExact>,
+            Option<SurvivalFlexTimepointBiDirectionalExact>,
+            f64,
+            usize,
+            usize,
+        ),
+        String,
+    > {
+        family.ensure_scalar_flex_exact_score_geometry("flex_primary_timepoint_jets_for_test")?;
+        let primary = flex_primary_slices(family);
+        let q_geom = family.row_dynamic_q_geometry(row, block_states)?;
+        let q0 = q_geom.q0;
+        let q1 = q_geom.q1;
+        let qd1 = q_geom.qd1;
+        let g = block_states[2].eta[row];
+        let beta_h = family.flex_score_beta(block_states)?;
+        let beta_w = family.flex_link_beta(block_states)?;
+
+        let (a0, d0) = family.solve_row_survival_intercept_with_slot(
+            q0,
+            g,
+            beta_h,
+            beta_w,
+            Some((row, SurvivalInterceptSlotKind::Entry)),
+        )?;
+        let (a1, d1) = family.solve_row_survival_intercept_with_slot(
+            q1,
+            g,
+            beta_h,
+            beta_w,
+            Some((row, SurvivalInterceptSlotKind::Exit)),
+        )?;
+
+        let entry_base = family.compute_survival_timepoint_exact(
+            row, &primary, q0, primary.q0, a0, g, d0, beta_h, beta_w, false,
+        )?;
+        let exit_base = family.compute_survival_timepoint_exact(
+            row, &primary, q1, primary.q1, a1, g, d1, beta_h, beta_w, true,
+        )?;
+
+        let entry_ext1 = family.compute_survival_timepoint_directional_exact(
+            row, &primary, q0, primary.q0, a0, g, beta_h, beta_w, dir1, false,
+        )?;
+        let exit_ext1 = family.compute_survival_timepoint_directional_exact(
+            row, &primary, q1, primary.q1, a1, g, beta_h, beta_w, dir1, true,
+        )?;
+
+        let (entry_ext2, exit_ext2, entry_bi, exit_bi) = if let Some(dir2_arr) = dir2 {
+            let entry_ext2 = family.compute_survival_timepoint_directional_exact(
+                row, &primary, q0, primary.q0, a0, g, beta_h, beta_w, dir2_arr, false,
+            )?;
+            let exit_ext2 = family.compute_survival_timepoint_directional_exact(
+                row, &primary, q1, primary.q1, a1, g, beta_h, beta_w, dir2_arr, true,
+            )?;
+            let entry_bi = family.compute_survival_timepoint_bidirectional_exact(
+                row, &primary, q0, primary.q0, a0, g, beta_h, beta_w, dir1, dir2_arr,
+            )?;
+            let exit_bi = family.compute_survival_timepoint_bidirectional_exact(
+                row, &primary, q1, primary.q1, a1, g, beta_h, beta_w, dir1, dir2_arr,
+            )?;
+            (
+                Some(entry_ext2),
+                Some(exit_ext2),
+                Some(entry_bi),
+                Some(exit_bi),
+            )
+        } else {
+            (None, None, None, None)
+        };
+
+        Ok((
+            entry_base,
+            exit_base,
+            entry_ext1,
+            exit_ext1,
+            entry_ext2,
+            exit_ext2,
+            entry_bi,
+            exit_bi,
+            qd1,
+            primary.qd1,
+            primary.total,
+        ))
+    }
+
     fn b10_assert_parity(actual: &[f64], expected: &ndarray::Array2<f64>, label: &str) {
         let p = expected.nrows();
         assert_eq!(expected.ncols(), p, "{label}: expected non-square");
@@ -25237,8 +25298,7 @@ mod tests {
             _qd1,
             qd1_idx,
             p_total,
-        ) = family
-            .flex_primary_timepoint_jets_for_test(0, &block_states, &dir, None)
+        ) = flex_primary_timepoint_jets_for_test(&family, 0, &block_states, &dir, None)
             .expect("jets");
 
         let entry_b = b10_pack_base(&entry_base);
@@ -25297,8 +25357,7 @@ mod tests {
             _qd1,
             qd1_idx,
             p_total,
-        ) = family
-            .flex_primary_timepoint_jets_for_test(0, &block_states, &dir_u, Some(&dir_v))
+        ) = flex_primary_timepoint_jets_for_test(&family, 0, &block_states, &dir_u, Some(&dir_v))
             .expect("bi-jets");
         let entry_ext2 = entry_ext2.expect("entry ext2");
         let exit_ext2 = exit_ext2.expect("exit ext2");
