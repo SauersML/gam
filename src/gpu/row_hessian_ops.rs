@@ -101,34 +101,28 @@ impl<'a> RowHessianMatvecInputs<'a> {
             });
         }
         if self.r > MAX_R {
-            return Err(GpuError::DriverCallFailed {
-                reason: format!(
+            gpu_bail!(
                     "row_hessian_matvec inputs: r={} exceeds MAX_R={MAX_R}",
                     self.r
-                ),
-            });
+                );
         }
         if self.h_rows.len() != self.n_rows * self.r * self.r {
-            return Err(GpuError::DriverCallFailed {
-                reason: format!(
+            gpu_bail!(
                     "row_hessian_matvec inputs: h_rows.len()={} != n_rows({})*r({})*r = {}",
                     self.h_rows.len(),
                     self.n_rows,
                     self.r,
                     self.n_rows * self.r * self.r
-                ),
-            });
+                );
         }
         if self.v_rows.len() != self.n_rows * self.r {
-            return Err(GpuError::DriverCallFailed {
-                reason: format!(
+            gpu_bail!(
                     "row_hessian_matvec inputs: v_rows.len()={} != n_rows({})*r({}) = {}",
                     self.v_rows.len(),
                     self.n_rows,
                     self.r,
                     self.n_rows * self.r
-                ),
-            });
+                );
         }
         Ok(())
     }
@@ -143,23 +137,19 @@ impl<'a> RowHessianDiagInputs<'a> {
             });
         }
         if self.r > MAX_R {
-            return Err(GpuError::DriverCallFailed {
-                reason: format!(
+            gpu_bail!(
                     "row_hessian_diag inputs: r={} exceeds MAX_R={MAX_R}",
                     self.r
-                ),
-            });
+                );
         }
         if self.h_rows.len() != self.n_rows * self.r * self.r {
-            return Err(GpuError::DriverCallFailed {
-                reason: format!(
+            gpu_bail!(
                     "row_hessian_diag inputs: h_rows.len()={} != n_rows({})*r({})*r = {}",
                     self.h_rows.len(),
                     self.n_rows,
                     self.r,
                     self.n_rows * self.r * self.r
-                ),
-            });
+                );
         }
         Ok(())
     }
@@ -264,23 +254,17 @@ impl RowOpsBackend {
                     }
                 })?;
                 let ctx = super::runtime::cuda_context_for(runtime.selected_device().ordinal)
-                    .ok_or_else(|| GpuError::DriverCallFailed {
-                        reason: format!(
+                    .ok_or_else(|| gpu_err!(
                             "row_hessian_ops backend: failed to create CUDA context for device {}",
                             runtime.selected_device().ordinal
-                        ),
-                    })?;
+                        ))?;
                 let stream = ctx.default_stream();
                 let ptx = cudarc::nvrtc::compile_ptx(ROW_KERNEL_SOURCE).map_err(|err| {
-                    GpuError::DriverCallFailed {
-                        reason: format!("row_hessian_ops NVRTC compile failed: {err}"),
-                    }
+                    gpu_err!("row_hessian_ops NVRTC compile failed: {err}")
                 })?;
                 let module = ctx
                     .load_module(ptx)
-                    .map_err(|err| GpuError::DriverCallFailed {
-                        reason: format!("row_hessian_ops module load failed: {err}"),
-                    })?;
+                    .gpu_ctx("row_hessian_ops module load failed")?;
                 Ok(RowOpsBackend { stream, module })
             })
             .as_ref()
@@ -339,38 +323,26 @@ fn launch_matvec_linux(
 
     let d_h = stream
         .clone_htod(inputs.h_rows)
-        .map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("row_hessian_matvec upload h_rows: {err}"),
-        })?;
+        .gpu_ctx("row_hessian_matvec upload h_rows")?;
     let d_v = stream
         .clone_htod(inputs.v_rows)
-        .map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("row_hessian_matvec upload v_rows: {err}"),
-        })?;
+        .gpu_ctx("row_hessian_matvec upload v_rows")?;
     let mut d_y = stream
         .alloc_zeros::<f64>(n * r)
-        .map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("row_hessian_matvec alloc y_rows: {err}"),
-        })?;
+        .gpu_ctx("row_hessian_matvec alloc y_rows")?;
 
     let func = backend
         .module
         .load_function("row_hessian_matvec_kernel")
-        .map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("row_hessian_matvec load_function: {err}"),
-        })?;
+        .gpu_ctx("row_hessian_matvec load_function")?;
 
     let cfg = LaunchConfig {
         grid_dim: (n as u32, 1, 1),
         block_dim: (ROW_HV_THREADS, 1, 1),
         shared_mem_bytes: 0,
     };
-    let n_i32 = i32::try_from(n).map_err(|_| GpuError::DriverCallFailed {
-        reason: format!("row_hessian_matvec: n_rows={n} exceeds i32 range"),
-    })?;
-    let r_i32 = i32::try_from(r).map_err(|_| GpuError::DriverCallFailed {
-        reason: format!("row_hessian_matvec: r={r} exceeds i32 range"),
-    })?;
+    let n_i32 = i32::try_from(n).map_err(|_| gpu_err!("row_hessian_matvec: n_rows={n} exceeds i32 range"))?;
+    let r_i32 = i32::try_from(r).map_err(|_| gpu_err!("row_hessian_matvec: r={r} exceeds i32 range"))?;
 
     let mut builder = stream.launch_builder(&func);
     builder
@@ -385,19 +357,13 @@ fn launch_matvec_linux(
     // (`validate()` matches the kernel's exact indexing pattern). The
     // shared-memory `v_shared[32]` array in the kernel source is sized for
     // MAX_R = 32, and `validate()` rejects r > MAX_R.
-    unsafe { builder.launch(cfg) }.map_err(|err| GpuError::DriverCallFailed {
-        reason: format!("row_hessian_matvec launch: {err}"),
-    })?;
+    unsafe { builder.launch(cfg) }.gpu_ctx("row_hessian_matvec launch")?;
     stream
         .synchronize()
-        .map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("row_hessian_matvec synchronize: {err}"),
-        })?;
+        .gpu_ctx("row_hessian_matvec synchronize")?;
     let y_rows = stream
         .clone_dtoh(&d_y)
-        .map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("row_hessian_matvec download y_rows: {err}"),
-        })?;
+        .gpu_ctx("row_hessian_matvec download y_rows")?;
     Ok(RowHessianMatvecOutputs { y_rows })
 }
 
@@ -410,33 +376,23 @@ fn launch_diag_linux(inputs: RowHessianDiagInputs<'_>) -> Result<RowHessianDiagO
 
     let d_h = stream
         .clone_htod(inputs.h_rows)
-        .map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("row_hessian_diag upload h_rows: {err}"),
-        })?;
+        .gpu_ctx("row_hessian_diag upload h_rows")?;
     let mut d_d = stream
         .alloc_zeros::<f64>(n * r)
-        .map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("row_hessian_diag alloc d_rows: {err}"),
-        })?;
+        .gpu_ctx("row_hessian_diag alloc d_rows")?;
 
     let func = backend
         .module
         .load_function("row_hessian_diag_kernel")
-        .map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("row_hessian_diag load_function: {err}"),
-        })?;
+        .gpu_ctx("row_hessian_diag load_function")?;
 
     let cfg = LaunchConfig {
         grid_dim: (n as u32, 1, 1),
         block_dim: (ROW_HV_THREADS, 1, 1),
         shared_mem_bytes: 0,
     };
-    let n_i32 = i32::try_from(n).map_err(|_| GpuError::DriverCallFailed {
-        reason: format!("row_hessian_diag: n_rows={n} exceeds i32 range"),
-    })?;
-    let r_i32 = i32::try_from(r).map_err(|_| GpuError::DriverCallFailed {
-        reason: format!("row_hessian_diag: r={r} exceeds i32 range"),
-    })?;
+    let n_i32 = i32::try_from(n).map_err(|_| gpu_err!("row_hessian_diag: n_rows={n} exceeds i32 range"))?;
+    let r_i32 = i32::try_from(r).map_err(|_| gpu_err!("row_hessian_diag: r={r} exceeds i32 range"))?;
 
     let mut builder = stream.launch_builder(&func);
     builder.arg(&n_i32).arg(&r_i32).arg(&d_h).arg(&mut d_d);
@@ -445,19 +401,13 @@ fn launch_diag_linux(inputs: RowHessianDiagInputs<'_>) -> Result<RowHessianDiagO
     // or a device pointer to a buffer whose length was validated above.
     // The kernel only reads diagonal entries `H_i[u, u]` for `u ∈ [0, r)`,
     // which is in-bounds for `h_rows.len() = n_rows*r*r`.
-    unsafe { builder.launch(cfg) }.map_err(|err| GpuError::DriverCallFailed {
-        reason: format!("row_hessian_diag launch: {err}"),
-    })?;
+    unsafe { builder.launch(cfg) }.gpu_ctx("row_hessian_diag launch")?;
     stream
         .synchronize()
-        .map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("row_hessian_diag synchronize: {err}"),
-        })?;
+        .gpu_ctx("row_hessian_diag synchronize")?;
     let d_rows = stream
         .clone_dtoh(&d_d)
-        .map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("row_hessian_diag download d_rows: {err}"),
-        })?;
+        .gpu_ctx("row_hessian_diag download d_rows")?;
     Ok(RowHessianDiagOutputs { d_rows })
 }
 
@@ -504,6 +454,9 @@ pub(crate) fn cpu_row_hessian_diag(inputs: &RowHessianDiagInputs<'_>) -> Vec<f64
 #[cfg(test)]
 mod tests {
     use super::*;
+use crate::gpu_err;
+use crate::gpu_bail;
+use crate::gpu::error::GpuResultExt;
 
     /// Deterministic non-trivial Hessian fixture. Generates per-row
     /// symmetric `r×r` blocks via `H_i = A_i + A_iᵀ + r·I` for a

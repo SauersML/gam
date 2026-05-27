@@ -138,9 +138,7 @@ impl GpuRuntime {
                     reason: "negative CUDA device count".into(),
                 }
             })? {
-                let ctx = cuda_context_for(ordinal).ok_or_else(|| GpuError::DriverCallFailed {
-                    reason: format!("failed to create CUDA context for device {ordinal}"),
-                })?;
+                let ctx = cuda_context_for(ordinal).ok_or_else(|| gpu_err!("failed to create CUDA context for device {ordinal}"))?;
                 catch_unwind(AssertUnwindSafe(|| ctx.bind_to_thread()))
                     .map_err(|_| GpuError::DriverLibraryUnavailable {
                         reason: "libcuda unavailable".to_string(),
@@ -324,6 +322,7 @@ mod tests {
         // *does* have a GPU still passes (workload below dispatch threshold
         // → returns None / Err / CPU fallback the same way).
         use ndarray::{Array1, Array2};
+use crate::gpu_err;
         let a = Array2::<f64>::zeros((4, 3));
         let b = Array2::<f64>::zeros((3, 2));
         let v = Array1::<f64>::zeros(3);

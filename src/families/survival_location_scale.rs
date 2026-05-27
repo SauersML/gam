@@ -5599,9 +5599,10 @@ fn inverse_link_survival_probvalue(inverse_link: &InverseLink, eta: f64) -> f64 
         InverseLink::Standard(StandardLink::CLogLog) => (-(eta.exp())).exp(),
         InverseLink::Standard(StandardLink::Identity) => 1.0 - eta,
         InverseLink::Standard(StandardLink::Log) => {
-            // Survival families register only Probit/Logit/CLogLog/Identity/
-            // LatentCLogLog/Sas/BetaLogistic/Mixture inverse links; the bare
-            // `Log` arm here is unreachable on a validated survival model.
+            // SAFETY: survival families register only Probit/Logit/CLogLog/
+            // Identity/LatentCLogLog/Sas/BetaLogistic/Mixture inverse links;
+            // `validate_predict_inverse_link` rejects `Standard(Log)` upstream
+            // so this arm is unreachable on a validated survival model.
             panic!("state-less log inverse link is invalid for survival prediction")
         }
         InverseLink::LatentCLogLog(_)

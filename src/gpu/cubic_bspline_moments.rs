@@ -822,18 +822,10 @@ impl CubicMomentBackend {
             let host =
                 stream
                     .memcpy_dtov(&dev.values)
-                    .map_err(|err| GpuError::DriverCallFailed {
-                        reason: format!(
-                            "cubic_bspline_moments download_alpha_major dtov: {err}"
-                        ),
-                    })?;
+                    .gpu_ctx("cubic_bspline_moments download_alpha_major dtov")?;
             stream
                 .synchronize()
-                .map_err(|err| GpuError::DriverCallFailed {
-                    reason: format!(
-                        "cubic_bspline_moments download_alpha_major sync: {err}"
-                    ),
-                })?;
+                .gpu_ctx("cubic_bspline_moments download_alpha_major sync")?;
             Ok(host)
         }
         #[cfg(not(target_os = "linux"))]
@@ -870,11 +862,9 @@ impl CubicMomentBackend {
         })?;
         let ordinal = runtime.selected_device().ordinal;
         let ctx = super::runtime::cuda_context_for(ordinal).ok_or_else(|| {
-            GpuError::DriverCallFailed {
-                reason: format!(
+            gpu_err!(
                     "cubic_bspline_moments backend: failed to create CUDA context for device {ordinal}"
-                ),
-            }
+                )
         })?;
         let stream = ctx.default_stream();
         let cap = &runtime.selected_device().capability;
@@ -903,19 +893,15 @@ impl CubicMomentBackend {
             }
         }
         let src = src_factory();
-        let ptx = cudarc::nvrtc::compile_ptx(&src).map_err(|err| GpuError::DriverCallFailed {
-            reason: format!(
+        let ptx = cudarc::nvrtc::compile_ptx(&src).gpu_ctx_with(|err| format!(
                 "cubic_bspline_moments NVRTC compile (D={}, AMAX={}, NALPHA={}): {err}",
                 key.d, key.amax, key.nalpha
-            ),
-        })?;
+            ))?;
         let module = self
             .inner
             .ctx
             .load_module(ptx)
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("cubic_bspline_moments module load: {err}"),
-            })?;
+            .gpu_ctx("cubic_bspline_moments module load")?;
         if let Ok(mut guard) = self.inner.modules.lock() {
             guard.entry(key).or_insert_with(|| module.clone());
         }
@@ -950,14 +936,12 @@ impl HexCellTable {
             || self.pair_per_axis.len() != want
             || self.width_per_axis.len() != want
         {
-            return Err(GpuError::DriverCallFailed {
-                reason: format!(
+            gpu_bail!(
                     "HexCellTable: expected length {want} (n_cells*d), got span={}, pair={}, width={}",
                     self.span_per_axis.len(),
                     self.pair_per_axis.len(),
                     self.width_per_axis.len(),
-                ),
-            });
+                );
         }
         Ok(())
     }
@@ -985,22 +969,18 @@ pub fn build_hex_tensor_moments_device(
 
     cells.validate()?;
     if spec.d() != cells.d {
-        return Err(GpuError::DriverCallFailed {
-            reason: format!(
+        gpu_bail!(
                 "build_hex_tensor_moments_device: spec.d()={} != cells.d={}",
                 spec.d(),
                 cells.d
-            ),
-        });
+            );
     }
     if axis_tables.len() != cells.d {
-        return Err(GpuError::DriverCallFailed {
-            reason: format!(
+        gpu_bail!(
                 "build_hex_tensor_moments_device: axis_tables.len()={} != d={}",
                 axis_tables.len(),
                 cells.d
-            ),
-        });
+            );
     }
     // Single-bank requirement: exactly one derivative signature per axis.
     // Mixed-signature support is Phase 3.
@@ -1046,9 +1026,7 @@ pub fn build_hex_tensor_moments_device(
     })?;
     let func = module
         .load_function("cubic_hex_tensor_moments")
-        .map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("cubic_bspline_moments load_function: {err}"),
-        })?;
+        .gpu_ctx("cubic_bspline_moments load_function")?;
     let stream = backend.inner.stream.clone();
 
     // Concatenate per-axis tables into one device-side f64 buffer and record
@@ -1063,39 +1041,25 @@ pub fn build_hex_tensor_moments_device(
     let axis_flat_dev =
         stream
             .clone_htod(flat.as_slice())
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("cubic_bspline_moments htod axis_flat: {err}"),
-            })?;
+            .gpu_ctx("cubic_bspline_moments htod axis_flat")?;
     let axis_off_dev =
         stream
             .clone_htod(axis_offsets.as_slice())
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("cubic_bspline_moments htod axis_offsets: {err}"),
-            })?;
+            .gpu_ctx("cubic_bspline_moments htod axis_offsets")?;
     let span_dev = stream
         .clone_htod(cells.span_per_axis.as_slice())
-        .map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("cubic_bspline_moments htod span: {err}"),
-        })?;
+        .gpu_ctx("cubic_bspline_moments htod span")?;
     let pair_dev = stream
         .clone_htod(cells.pair_per_axis.as_slice())
-        .map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("cubic_bspline_moments htod pair: {err}"),
-        })?;
+        .gpu_ctx("cubic_bspline_moments htod pair")?;
     let width_dev = stream
         .clone_htod(cells.width_per_axis.as_slice())
-        .map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("cubic_bspline_moments htod width: {err}"),
-        })?;
+        .gpu_ctx("cubic_bspline_moments htod width")?;
 
     let out_stride = ((cells.n_cells + 31) / 32) * 32;
     let mut out_dev = stream
         .alloc_zeros::<f64>(out_stride * nalpha)
-        .map_err(|err| GpuError::DriverCallFailed {
-            reason: format!(
-                "cubic_bspline_moments alloc out (stride={out_stride}, nalpha={nalpha}): {err}"
-            ),
-        })?;
+        .gpu_ctx("cubic_bspline_moments alloc out (stride={out_stride}, nalpha={nalpha})")?;
 
     let block_x: u32 = 32;
     let block_y: u32 = 8;
@@ -1108,12 +1072,10 @@ pub fn build_hex_tensor_moments_device(
     };
 
     let n_cells_i32: i32 =
-        i32::try_from(cells.n_cells).map_err(|_| GpuError::DriverCallFailed {
-            reason: format!(
+        i32::try_from(cells.n_cells).map_err(|_| gpu_err!(
                 "cubic_bspline_moments n_cells={} overflows i32",
                 cells.n_cells
-            ),
-        })?;
+            ))?;
     let out_stride_i64: i64 = out_stride as i64;
 
     let mut builder = stream.launch_builder(&func);
@@ -1130,14 +1092,10 @@ pub fn build_hex_tensor_moments_device(
     // the kernel reads inputs of declared sizes and writes within
     // `out[0 .. out_stride * nalpha]`. Launch dims are non-zero and bounded
     // by the per-axis i32 cap above.
-    unsafe { builder.launch(cfg) }.map_err(|err| GpuError::DriverCallFailed {
-        reason: format!("cubic_bspline_moments kernel launch: {err}"),
-    })?;
+    unsafe { builder.launch(cfg) }.gpu_ctx("cubic_bspline_moments kernel launch")?;
     stream
         .synchronize()
-        .map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("cubic_bspline_moments synchronize: {err}"),
-        })?;
+        .gpu_ctx("cubic_bspline_moments synchronize")?;
 
     Ok(DeviceCubicMomentTable {
         n_cells: cells.n_cells,
@@ -1176,6 +1134,9 @@ pub fn build_hex_tensor_moments_device(
 #[cfg(test)]
 mod cubic_bspline_moments_tests {
     use super::*;
+use crate::gpu_err;
+use crate::gpu_bail;
+use crate::gpu::error::GpuResultExt;
 
     fn open_uniform_knots(n_basis: usize) -> Vec<f64> {
         // Open uniform clamped knot vector for n_basis cubic B-splines on [0,1].

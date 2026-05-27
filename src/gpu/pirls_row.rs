@@ -712,12 +712,10 @@ impl PirlsRowBackend {
             }
         })?;
         let ctx = super::runtime::cuda_context_for(runtime.selected_device().ordinal).ok_or_else(
-            || GpuError::DriverCallFailed {
-                reason: format!(
+            || gpu_err!(
                     "pirls_row backend: failed to create CUDA context for device {}",
                     runtime.selected_device().ordinal
                 ),
-            },
         )?;
         Ok(Self {
             inner: PirlsRowBackendLinux {
@@ -740,34 +738,26 @@ impl PirlsRowBackend {
             .inner
             .modules
             .lock()
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("pirls_row module cache mutex poisoned: {err}"),
-            })?
+            .gpu_ctx("pirls_row module cache mutex poisoned")?
             .get(&key)
         {
             return Ok(existing.clone());
         }
         let source = cuda_source_for(family, curvature);
-        let ptx = cudarc::nvrtc::compile_ptx(source).map_err(|err| GpuError::DriverCallFailed {
-            reason: format!(
+        let ptx = cudarc::nvrtc::compile_ptx(source).gpu_ctx_with(|err| format!(
                 "pirls_row NVRTC compile failed for {family}/{curv}: {err}",
                 family = family.as_str(),
                 curv = curvature.as_str(),
-            ),
-        })?;
+            ))?;
         let module = self
             .inner
             .ctx
             .load_module(ptx)
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("pirls_row module load failed: {err}"),
-            })?;
+            .gpu_ctx("pirls_row module load failed")?;
         self.inner
             .modules
             .lock()
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("pirls_row module cache mutex poisoned: {err}"),
-            })?
+            .gpu_ctx("pirls_row module cache mutex poisoned")?
             .insert(key, module.clone());
         Ok(module)
     }
@@ -803,34 +793,26 @@ impl PirlsRowBackend {
             .inner
             .jit_modules
             .lock()
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("pirls_row jit cache poisoned: {err}"),
-            })?
+            .gpu_ctx("pirls_row jit cache poisoned")?
             .get(&key)
         {
             return Ok(existing.clone());
         }
         let source = spec.cuda_source(curvature);
-        let ptx = cudarc::nvrtc::compile_ptx(source).map_err(|err| GpuError::DriverCallFailed {
-            reason: format!(
+        let ptx = cudarc::nvrtc::compile_ptx(source).gpu_ctx_with(|err| format!(
                 "pirls_row JIT NVRTC compile failed for spec_id={} curvature={}: {err}",
                 spec.spec_id,
                 curvature.as_str(),
-            ),
-        })?;
+            ))?;
         let module = self
             .inner
             .ctx
             .load_module(ptx)
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("pirls_row JIT module load failed: {err}"),
-            })?;
+            .gpu_ctx("pirls_row JIT module load failed")?;
         self.inner
             .jit_modules
             .lock()
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("pirls_row jit cache poisoned (insert): {err}"),
-            })?
+            .gpu_ctx("pirls_row jit cache poisoned (insert)")?
             .insert(key, module.clone());
         Ok(module)
     }
@@ -989,16 +971,12 @@ impl RowOutputDevBuffers {
         let alloc_f64 = |label: &'static str| {
             stream
                 .alloc_zeros::<f64>(n)
-                .map_err(|err| GpuError::DriverCallFailed {
-                    reason: format!("pirls_row alloc {label}: {err}"),
-                })
+                .gpu_ctx("pirls_row alloc {label}")
         };
         let alloc_u32 = |label: &'static str| {
             stream
                 .alloc_zeros::<u32>(n)
-                .map_err(|err| GpuError::DriverCallFailed {
-                    reason: format!("pirls_row alloc {label}: {err}"),
-                })
+                .gpu_ctx("pirls_row alloc {label}")
         };
         Ok(Self {
             mu: alloc_f64("mu")?,
@@ -1038,28 +1016,20 @@ pub fn launch_row_reweight_on_stream(
 ) -> Result<(), GpuError> {
     use cudarc::driver::{LaunchConfig, PushKernelArg};
     if out.n != n {
-        return Err(GpuError::DriverCallFailed {
-            reason: format!("row reweight buffers shape {} mismatches n={n}", out.n),
-        });
+        gpu_bail!("row reweight buffers shape {} mismatches n={n}", out.n);
     }
     let module = backend.module_for(family, curvature)?;
     let func =
         module
             .load_function(family.kernel_name())
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!(
+            .gpu_ctx_with(|err| format!(
                     "row reweight load_function({}): {err}",
                     family.kernel_name()
-                ),
-            })?;
+                ))?;
     const THREADS_PER_BLOCK: u32 = 256;
-    let n_u32 = u32::try_from(n).map_err(|_| GpuError::DriverCallFailed {
-        reason: format!("n={n} exceeds u32 for row reweight grid sizing"),
-    })?;
+    let n_u32 = u32::try_from(n).map_err(|_| gpu_err!("n={n} exceeds u32 for row reweight grid sizing"))?;
     let grid_x = n_u32.div_ceil(THREADS_PER_BLOCK).max(1);
-    let n_i32 = i32::try_from(n).map_err(|_| GpuError::DriverCallFailed {
-        reason: format!("n={n} exceeds i32 for row reweight kernel argument"),
-    })?;
+    let n_i32 = i32::try_from(n).map_err(|_| gpu_err!("n={n} exceeds i32 for row reweight kernel argument"))?;
     let cfg = LaunchConfig {
         grid_dim: (grid_x, 1, 1),
         block_dim: (THREADS_PER_BLOCK, 1, 1),
@@ -1086,9 +1056,7 @@ pub fn launch_row_reweight_on_stream(
     // Grid covers all n rows; threads guard `if (i >= n) return`.
     unsafe { builder.launch(cfg) }
         .map(|_event_pair| ())
-        .map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("row reweight launch({}): {err}", family.kernel_name()),
-        })
+        .gpu_ctx_with(|err| format!("row reweight launch({}): {err}", family.kernel_name()))
 }
 
 /// Stage 6: device-side row reweight launcher for JIT-compiled
@@ -1110,25 +1078,17 @@ pub fn launch_row_reweight_jit_on_stream(
 ) -> Result<(), GpuError> {
     use cudarc::driver::{LaunchConfig, PushKernelArg};
     if out.n != n {
-        return Err(GpuError::DriverCallFailed {
-            reason: format!("JIT row reweight buffers shape {} mismatches n={n}", out.n),
-        });
+        gpu_bail!("JIT row reweight buffers shape {} mismatches n={n}", out.n);
     }
     let module = backend.module_for_jit(spec, curvature)?;
     let kernel_name = spec.kernel_name();
     let func = module
         .load_function(&kernel_name)
-        .map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("JIT row reweight load_function({kernel_name}): {err}"),
-        })?;
+        .gpu_ctx("JIT row reweight load_function({kernel_name})")?;
     const THREADS_PER_BLOCK: u32 = 256;
-    let n_u32 = u32::try_from(n).map_err(|_| GpuError::DriverCallFailed {
-        reason: format!("n={n} exceeds u32 for JIT row reweight grid sizing"),
-    })?;
+    let n_u32 = u32::try_from(n).map_err(|_| gpu_err!("n={n} exceeds u32 for JIT row reweight grid sizing"))?;
     let grid_x = n_u32.div_ceil(THREADS_PER_BLOCK).max(1);
-    let n_i32 = i32::try_from(n).map_err(|_| GpuError::DriverCallFailed {
-        reason: format!("n={n} exceeds i32 for JIT row reweight kernel argument"),
-    })?;
+    let n_i32 = i32::try_from(n).map_err(|_| gpu_err!("n={n} exceeds i32 for JIT row reweight kernel argument"))?;
     let cfg = LaunchConfig {
         grid_dim: (grid_x, 1, 1),
         block_dim: (THREADS_PER_BLOCK, 1, 1),
@@ -1152,9 +1112,7 @@ pub fn launch_row_reweight_jit_on_stream(
     // signature as `cuda_source_for`; arg order/types match one-for-one.
     unsafe { builder.launch(cfg) }
         .map(|_event_pair| ())
-        .map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("JIT row reweight launch({kernel_name}): {err}"),
-        })
+        .gpu_ctx("JIT row reweight launch({kernel_name})")
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -1462,6 +1420,9 @@ fn bernoulli_cloglog_body(curvature: CurvatureMode) -> String {
 #[cfg(test)]
 mod pirls_row_gpu_tests {
     use super::*;
+use crate::gpu_err;
+use crate::gpu_bail;
+use crate::gpu::error::GpuResultExt;
 
     fn assert_close(label: &str, got: f64, expected: f64, tol: f64) {
         if !(got.is_finite() && expected.is_finite()) {
