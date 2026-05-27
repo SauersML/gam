@@ -53,7 +53,7 @@ use crate::smooth::{
 };
 use crate::solver::estimate::EstimationError;
 use crate::solver::estimate::reml::unified::HyperOperator;
-use crate::types::{InverseLink, LinkFunction, StandardLink};
+use crate::types::{InverseLink, StandardLink};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 use rayon::prelude::*;
 use smallvec::{SmallVec, smallvec};

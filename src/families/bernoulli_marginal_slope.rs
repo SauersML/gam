@@ -37,7 +37,7 @@ use crate::smooth::{
     spatial_length_scale_term_indices,
 };
 use crate::solver::estimate::EstimationError;
-use crate::types::{InverseLink, LinkFunction, StandardLink, WigglePenaltyConfig};
+use crate::types::{InverseLink, StandardLink, WigglePenaltyConfig};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 use rayon::iter::{
     IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
