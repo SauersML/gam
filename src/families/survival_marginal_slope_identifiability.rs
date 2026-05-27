@@ -1269,13 +1269,7 @@ impl SmgsLiftViaT {
         v_per_term: &[Array2<f64>],
         r_per_term: &[Option<Array2<f64>>],
     ) -> Self {
-        assert_eq!(
-            v_per_term.len(),
-            r_per_term.len(),
-            "SmgsLiftViaT::from_v_and_r: v_per_term and r_per_term must have the same length"
-        );
         let n_blocks = v_per_term.len();
-
         let mut block_starts_compiled = Vec::with_capacity(n_blocks + 1);
         let mut block_starts_raw = Vec::with_capacity(n_blocks + 1);
         block_starts_compiled.push(0);
@@ -1286,56 +1280,48 @@ impl SmgsLiftViaT {
             block_starts_compiled.push(prev_c + v.ncols());
             block_starts_raw.push(prev_r + v.nrows());
         }
-        let total_raw = *block_starts_raw.last().unwrap();
-        let total_compiled = *block_starts_compiled.last().unwrap();
-
-        let mut t_full = Array2::<f64>::zeros((total_raw, total_compiled));
-        for (a, v) in v_per_term.iter().enumerate() {
-            let r0 = block_starts_raw[a];
-            let r1 = block_starts_raw[a + 1];
-            let c0 = block_starts_compiled[a];
-            let c1 = block_starts_compiled[a + 1];
-            if v.nrows() > 0 && v.ncols() > 0 {
-                t_full.slice_mut(ndarray::s![r0..r1, c0..c1]).assign(v);
-            }
+        let t_full = build_full_t_matrix(v_per_term, r_per_term);
+        Self {
+            t_full,
+            block_starts_compiled,
+            block_starts_raw,
         }
-        for b in 1..n_blocks {
-            let r_b = match r_per_term[b].as_ref() {
-                Some(r) => r,
-                None => continue,
-            };
-            let c0 = block_starts_compiled[b];
-            let c1 = block_starts_compiled[b + 1];
-            assert_eq!(
-                r_b.ncols(),
-                c1 - c0,
-                "SmgsLiftViaT::from_v_and_r: r_per_term[{b}] has {} cols, expected compiled width {}",
-                r_b.ncols(),
-                c1 - c0,
-            );
-            assert_eq!(
-                r_b.nrows(),
-                block_starts_raw[b],
-                "SmgsLiftViaT::from_v_and_r: r_per_term[{b}] has {} rows, expected {} (raw width sum of earlier blocks)",
-                r_b.nrows(),
-                block_starts_raw[b],
-            );
-            for a in 0..b {
-                let ra0 = block_starts_raw[a];
-                let ra1 = block_starts_raw[a + 1];
-                if ra1 == ra0 || c1 == c0 {
-                    continue;
-                }
-                let slab = r_b.slice(ndarray::s![ra0..ra1, ..]);
-                let mut dest = t_full.slice_mut(ndarray::s![ra0..ra1, c0..c1]);
-                for i in 0..(ra1 - ra0) {
-                    for j in 0..(c1 - c0) {
-                        dest[[i, j]] = -slab[[i, j]];
-                    }
-                }
-            }
-        }
+    }
 
+    /// Build directly from an already-assembled global `T` plus the
+    /// per-block raw and compiled width partitions. Useful when the
+    /// caller already has `T` from elsewhere (e.g. a dual-metric
+    /// compile that emits the global T directly).
+    pub fn from_t(
+        t_full: Array2<f64>,
+        raw_widths: &[usize],
+        compiled_widths: &[usize],
+    ) -> Self {
+        assert_eq!(
+            raw_widths.len(),
+            compiled_widths.len(),
+            "SmgsLiftViaT::from_t: raw_widths len {} != compiled_widths len {}",
+            raw_widths.len(),
+            compiled_widths.len(),
+        );
+        let total_raw: usize = raw_widths.iter().sum();
+        let total_compiled: usize = compiled_widths.iter().sum();
+        assert_eq!(
+            t_full.dim(),
+            (total_raw, total_compiled),
+            "SmgsLiftViaT::from_t: T has shape {:?}, expected ({total_raw}, {total_compiled})",
+            t_full.dim(),
+        );
+        let mut block_starts_raw = Vec::with_capacity(raw_widths.len() + 1);
+        block_starts_raw.push(0);
+        for w in raw_widths {
+            block_starts_raw.push(block_starts_raw.last().copied().unwrap() + w);
+        }
+        let mut block_starts_compiled = Vec::with_capacity(compiled_widths.len() + 1);
+        block_starts_compiled.push(0);
+        for w in compiled_widths {
+            block_starts_compiled.push(block_starts_compiled.last().copied().unwrap() + w);
+        }
         Self {
             t_full,
             block_starts_compiled,
