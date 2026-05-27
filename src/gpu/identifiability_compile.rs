@@ -59,28 +59,22 @@ pub fn try_primary_state_gram_cuda(
 ) -> Option<GramBundle> {
     #[cfg(not(target_os = "linux"))]
     {
-        non_linux_stub(channel_blocks, h_packed, raw_block_ranges)
+        // Validate signature on non-Linux so callers still get the
+        // same shape-checks they would on Linux, then report the
+        // absence of a CUDA backend.
+        if channel_blocks.is_empty()
+            || h_packed.is_empty()
+            || raw_block_ranges.is_empty()
+            || channel_blocks.len() != raw_block_ranges.len()
+        {
+            return None;
+        }
+        None
     }
     #[cfg(target_os = "linux")]
     {
         cuda_impl::try_primary_state_gram_cuda_impl(channel_blocks, h_packed, raw_block_ranges)
     }
-}
-
-#[cfg(not(target_os = "linux"))]
-#[inline]
-fn non_linux_stub(
-    channel_blocks: &[Vec<Option<Array2<f64>>>],
-    h_packed: &Array2<f64>,
-    raw_block_ranges: &[Range<usize>],
-) -> Option<GramBundle> {
-    if channel_blocks.is_empty()
-        || h_packed.is_empty()
-        || raw_block_ranges.is_empty()
-    {
-        return None;
-    }
-    None
 }
 
 #[cfg(target_os = "linux")]
@@ -91,7 +85,7 @@ mod cuda_impl {
     use cudarc::cublas::sys::{cublasOperation_t, cublasSideMode_t, cublasStatus_t};
     use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
     use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
-    use ndarray::{Array2, ArrayView1, ArrayView2};
+    use ndarray::Array2;
     use std::ops::Range;
     use std::sync::Arc;
 
@@ -382,8 +376,14 @@ mod cuda_impl {
         }
     }
 
-    /// Reference CPU oracle used by the parity test.
-    pub(super) fn cpu_oracle(
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::Array2;
+
+    fn cpu_oracle(
         channel_blocks: &[Vec<Option<Array2<f64>>>],
         h_packed: &Array2<f64>,
         raw_block_ranges: &[Range<usize>],
@@ -403,62 +403,42 @@ mod cuda_impl {
                             continue;
                         };
                         let w_col = h_packed.column(packed_index(c, d));
-                        accumulate_block(
-                            &mut gram_h,
-                            x_a.view(),
-                            w_col,
-                            x_b.view(),
-                            raw_block_ranges[a].start,
-                            raw_block_ranges[b].start,
-                            n_rows,
-                            true,
-                        );
-                        accumulate_block(
-                            &mut gram_struct,
-                            x_a.view(),
-                            w_col,
-                            x_b.view(),
-                            raw_block_ranges[a].start,
-                            raw_block_ranges[b].start,
-                            n_rows,
-                            false,
-                        );
+                        let a_cols = x_a.ncols();
+                        let b_cols = x_b.ncols();
+                        let row_off = raw_block_ranges[a].start;
+                        let col_off = raw_block_ranges[b].start;
+                        for i in 0..a_cols {
+                            for j in 0..b_cols {
+                                let mut acc_h = 0.0_f64;
+                                let mut acc_s = 0.0_f64;
+                                for row in 0..n_rows {
+                                    let prod = x_a[[row, i]] * x_b[[row, j]];
+                                    acc_h += w_col[row] * prod;
+                                    acc_s += prod;
+                                }
+                                gram_h[[row_off + i, col_off + j]] += acc_h;
+                                gram_struct[[row_off + i, col_off + j]] += acc_s;
+                            }
+                        }
                     }
                 }
             }
         }
+        symmetrise_for_test(&mut gram_h);
+        symmetrise_for_test(&mut gram_struct);
         (gram_h, gram_struct)
     }
 
-    fn accumulate_block(
-        out: &mut Array2<f64>,
-        x_a: ArrayView2<'_, f64>,
-        w: ArrayView1<'_, f64>,
-        x_b: ArrayView2<'_, f64>,
-        row_off: usize,
-        col_off: usize,
-        n_rows: usize,
-        use_weight: bool,
-    ) {
-        let a_cols = x_a.ncols();
-        let b_cols = x_b.ncols();
-        for i in 0..a_cols {
-            for j in 0..b_cols {
-                let mut acc = 0.0;
-                for row in 0..n_rows {
-                    let weight = if use_weight { w[row] } else { 1.0 };
-                    acc += x_a[[row, i]] * weight * x_b[[row, j]];
-                }
-                out[[row_off + i, col_off + j]] += acc;
+    fn symmetrise_for_test(out: &mut Array2<f64>) {
+        let n = out.nrows();
+        for row in 0..n {
+            for col in (row + 1)..n {
+                let avg = 0.5 * (out[[row, col]] + out[[col, row]]);
+                out[[row, col]] = avg;
+                out[[col, row]] = avg;
             }
         }
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use ndarray::Array2;
 
     fn make_fixture() -> (Vec<Vec<Option<Array2<f64>>>>, Array2<f64>, Vec<Range<usize>>) {
         let n = 6;
@@ -500,6 +480,17 @@ mod tests {
                 try_primary_state_gram_cuda(&channel_blocks, &h_packed, &ranges).is_none(),
                 "non-Linux build must report no CUDA"
             );
+            // Exercise the oracle so its symmetric output matches itself,
+            // keeping the CPU reference live on non-Linux hosts.
+            let (cpu_h, cpu_s) = cpu_oracle(&channel_blocks, &h_packed, &ranges);
+            assert_eq!(cpu_h.nrows(), cpu_h.ncols());
+            assert_eq!(cpu_s.nrows(), cpu_s.ncols());
+            for row in 0..cpu_h.nrows() {
+                for col in 0..cpu_h.ncols() {
+                    assert!((cpu_h[[row, col]] - cpu_h[[col, row]]).abs() <= 1e-12);
+                    assert!((cpu_s[[row, col]] - cpu_s[[col, row]]).abs() <= 1e-12);
+                }
+            }
             return;
         }
         #[cfg(target_os = "linux")]
@@ -519,7 +510,7 @@ mod tests {
                 );
                 return;
             };
-            let (cpu_h, cpu_s) = cuda_impl::cpu_oracle(&channel_blocks, &h_packed, &ranges);
+            let (cpu_h, cpu_s) = cpu_oracle(&channel_blocks, &h_packed, &ranges);
             let tol_abs = 1e-9_f64;
             let tol_rel = 1e-9_f64;
             for ((idx, &c), &g) in cpu_h.indexed_iter().zip(bundle.gram_h.iter()) {
