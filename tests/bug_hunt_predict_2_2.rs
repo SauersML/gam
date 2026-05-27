@@ -5,10 +5,10 @@ use gam::predict::{
     PredictUncertaintyOptions, enrich_posterior_mean_bounds,
     predict_gam_posterior_meanwith_backend, predict_gamwith_uncertainty,
 };
-use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily};
+use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
 use ndarray::{Array1, Array2, array};
 
-fn like(response: ResponseFamily, link: LinkFunction) -> LikelihoodSpec {
+fn like(response: ResponseFamily, link: StandardLink) -> LikelihoodSpec {
     LikelihoodSpec::new(response, InverseLink::Standard(link))
 }
 
@@ -22,7 +22,7 @@ fn predict_uncertainty_bounds_track_requested_alpha_level_for_logit() {
         x.view(),
         beta.view(),
         offset.view(),
-        like(ResponseFamily::Binomial, LinkFunction::Logit),
+        like(ResponseFamily::Binomial, StandardLink::Logit),
         &cov,
         &PredictUncertaintyOptions {
             confidence_level: 0.8,
@@ -52,7 +52,7 @@ fn enrich_posterior_mean_bounds_clamps_domains_for_probability_and_count_familie
     enrich_posterior_mean_bounds(
         &mut beta_result,
         0.95,
-        like(ResponseFamily::Beta { phi: 20.0 }, LinkFunction::Logit),
+        like(ResponseFamily::Beta { phi: 20.0 }, StandardLink::Logit),
         None,
     )
     .expect("beta-family bounds should be enrichable");
@@ -74,7 +74,7 @@ fn enrich_posterior_mean_bounds_clamps_domains_for_probability_and_count_familie
     enrich_posterior_mean_bounds(
         &mut pois_result,
         0.95,
-        like(ResponseFamily::Poisson, LinkFunction::Log),
+        like(ResponseFamily::Poisson, StandardLink::Log),
         None,
     )
     .expect("poisson-family bounds should be enrichable");
@@ -105,7 +105,7 @@ fn delta_method_variance_matches_posterior_simulation_for_small_logit_problem() 
         x.view(),
         beta.view(),
         offset.view(),
-        like(ResponseFamily::Binomial, LinkFunction::Logit),
+        like(ResponseFamily::Binomial, StandardLink::Logit),
         &cov,
         &PredictUncertaintyOptions {
             mean_interval_method: MeanIntervalMethod::Delta,
@@ -153,7 +153,7 @@ fn backend_variance_matches_between_dense_and_factorized_backends() {
         x.view(),
         beta.view(),
         offset.view(),
-        like(ResponseFamily::Binomial, LinkFunction::Logit),
+        like(ResponseFamily::Binomial, StandardLink::Logit),
         &dense,
     )
     .expect("dense backend should predict");
@@ -161,7 +161,7 @@ fn backend_variance_matches_between_dense_and_factorized_backends() {
         x.view(),
         beta.view(),
         offset.view(),
-        like(ResponseFamily::Binomial, LinkFunction::Logit),
+        like(ResponseFamily::Binomial, StandardLink::Logit),
         &fact,
     )
     .expect("factorized backend should predict");
@@ -183,7 +183,7 @@ fn survival_uncertainty_bounds_stay_in_unit_interval() {
         x.view(),
         beta.view(),
         offset.view(),
-        like(ResponseFamily::RoystonParmar, LinkFunction::Log),
+        like(ResponseFamily::RoystonParmar, StandardLink::Log),
         &cov,
         &PredictUncertaintyOptions::default(),
     )

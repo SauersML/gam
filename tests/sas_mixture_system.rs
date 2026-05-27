@@ -9,8 +9,8 @@ use gam::mixture_link::{
 };
 use gam::smooth::BlockwisePenalty;
 use gam::types::{
-    InverseLink, LikelihoodSpec, LinkComponent, LinkFunction, MixtureLinkSpec, ResponseFamily,
-    SasLinkSpec,
+    InverseLink, LikelihoodSpec, LinkComponent, MixtureLinkSpec, ResponseFamily, SasLinkSpec,
+    StandardLink,
 };
 use ndarray::{Array1, Array2};
 use rand::rngs::StdRng;
@@ -72,7 +72,7 @@ fn coverage(true_p: &Array1<f64>, lo: &Array1<f64>, hi: &Array1<f64>) -> f64 {
     hit as f64 / true_p.len() as f64
 }
 
-fn binomial_likelihood(link: LinkFunction) -> LikelihoodSpec {
+fn binomial_likelihood(link: StandardLink) -> LikelihoodSpec {
     LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Standard(link))
 }
 
@@ -246,7 +246,7 @@ fn posterior_mean_coverage_includes_sas_and_mixture() {
     let s_list = one_penalty_for_non_intercept(x_train.ncols());
 
     let opts_logit = base_fit_options();
-    let logit_family = binomial_likelihood(LinkFunction::Logit);
+    let logit_family = binomial_likelihood(StandardLink::Logit);
     let fit_logit = fit_gam(
         x_train.view(),
         y_train.view(),
@@ -259,7 +259,7 @@ fn posterior_mean_coverage_includes_sas_and_mixture() {
     .expect("logit fit");
 
     let opts_probit = base_fit_options();
-    let probit_family = binomial_likelihood(LinkFunction::Probit);
+    let probit_family = binomial_likelihood(StandardLink::Probit);
     let fit_probit = fit_gam(
         x_train.view(),
         y_train.view(),

@@ -5,10 +5,10 @@ use gam::predict::{
     InferenceCovarianceMode, MeanIntervalMethod, PredictUncertaintyOptions,
     coefficient_uncertainty, predict_gam_posterior_mean, predict_gamwith_uncertainty,
 };
-use gam::probability::try_inverse_link_array;
+
 use gam::smooth::BlockwisePenalty;
 use gam::types::{
-    InverseLink, LikelihoodSpec, LinkComponent, LinkFunction, StandardLink, MixtureLinkSpec, ResponseFamily,
+    InverseLink, LikelihoodSpec, LinkComponent, MixtureLinkSpec, ResponseFamily, StandardLink,
 };
 use ndarray::{Array1, Array2};
 
@@ -24,7 +24,7 @@ fn gaussian_identity_likelihood() -> LikelihoodSpec {
     )
 }
 
-fn binomial_likelihood(link: LinkFunction) -> LikelihoodSpec {
+fn binomial_likelihood(link: StandardLink) -> LikelihoodSpec {
     LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Standard(link))
 }
 
@@ -302,7 +302,7 @@ fn prediction_uncertainty_is_finite_andwell_shaped() {
         weights.view(),
         offset.view(),
         &[dense_penalty(s)],
-        binomial_likelihood(LinkFunction::Logit),
+        binomial_likelihood(StandardLink::Logit),
         &FitOptions {
             latent_cloglog: None,
             mixture_link: None,
@@ -328,7 +328,7 @@ fn prediction_uncertainty_is_finite_andwell_shaped() {
         x.view(),
         fit.beta.view(),
         offset.view(),
-        binomial_likelihood(LinkFunction::Logit),
+        binomial_likelihood(StandardLink::Logit),
         &fit,
         &PredictUncertaintyOptions {
             confidence_level: 0.95,
@@ -480,7 +480,7 @@ fn posterior_mean_prediction_shrinks_extreme_logit_probabilities() {
         x.view(),
         beta.view(),
         offset.view(),
-        binomial_likelihood(LinkFunction::Logit),
+        binomial_likelihood(StandardLink::Logit),
         cov.view(),
     )
     .expect("posterior mean prediction should succeed");
@@ -548,7 +548,7 @@ fn mixture_uncertainty_intervals_are_clamped_to_unit_interval() {
         weights.view(),
         offset.view(),
         &[dense_penalty(s)],
-        binomial_likelihood(LinkFunction::Logit),
+        binomial_likelihood(StandardLink::Logit),
         &FitOptions {
             latent_cloglog: None,
             mixture_link: None,
