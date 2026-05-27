@@ -68,9 +68,7 @@ pub(crate) fn stable_logistic(x: f64) -> f64 {
     }
 }
 
-/// Generic finiteness check for any `f64` ndarray view (1-D, 2-D, etc.). This
-/// is the canonical helper; module-local `array1_is_finite` / `array2_is_finite`
-/// in `solver/pirls.rs` and `solver/active_set.rs` now forward here.
+/// Generic finiteness check for any `f64` ndarray view (1-D, 2-D, etc.).
 #[inline]
 pub(crate) fn array_is_finite<S, D>(values: &ArrayBase<S, D>) -> bool
 where
