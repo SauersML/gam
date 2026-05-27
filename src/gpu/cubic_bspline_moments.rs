@@ -1096,7 +1096,7 @@ pub fn build_hex_tensor_moments_device(
     let out_stride = ((cells.n_cells + 31) / 32) * 32;
     let mut out_dev = stream
         .alloc_zeros::<f64>(out_stride * nalpha)
-        .gpu_ctx("cubic_bspline_moments alloc out (stride={out_stride}, nalpha={nalpha})")?;
+        .gpu_ctx_with(|err| format!("cubic_bspline_moments alloc out (stride={out_stride}, nalpha={nalpha}): {err}"))?;
 
     let block_x: u32 = 32;
     let block_y: u32 = 8;

@@ -971,12 +971,12 @@ impl RowOutputDevBuffers {
         let alloc_f64 = |label: &'static str| {
             stream
                 .alloc_zeros::<f64>(n)
-                .gpu_ctx("pirls_row alloc {label}")
+                .gpu_ctx_with(|err| format!("pirls_row alloc {label}: {err}"))
         };
         let alloc_u32 = |label: &'static str| {
             stream
                 .alloc_zeros::<u32>(n)
-                .gpu_ctx("pirls_row alloc {label}")
+                .gpu_ctx_with(|err| format!("pirls_row alloc {label}: {err}"))
         };
         Ok(Self {
             mu: alloc_f64("mu")?,
@@ -1084,7 +1084,7 @@ pub fn launch_row_reweight_jit_on_stream(
     let kernel_name = spec.kernel_name();
     let func = module
         .load_function(&kernel_name)
-        .gpu_ctx("JIT row reweight load_function({kernel_name})")?;
+        .gpu_ctx_with(|err| format!("JIT row reweight load_function({kernel_name}): {err}"))?;
     const THREADS_PER_BLOCK: u32 = 256;
     let n_u32 = u32::try_from(n).map_err(|_| gpu_err!("n={n} exceeds u32 for JIT row reweight grid sizing"))?;
     let grid_x = n_u32.div_ceil(THREADS_PER_BLOCK).max(1);
@@ -1112,7 +1112,7 @@ pub fn launch_row_reweight_jit_on_stream(
     // signature as `cuda_source_for`; arg order/types match one-for-one.
     unsafe { builder.launch(cfg) }
         .map(|_event_pair| ())
-        .gpu_ctx("JIT row reweight launch({kernel_name})")
+        .gpu_ctx_with(|err| format!("JIT row reweight launch({kernel_name}): {err}"))
 }
 
 // ────────────────────────────────────────────────────────────────────────

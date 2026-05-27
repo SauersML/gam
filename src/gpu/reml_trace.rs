@@ -1050,7 +1050,7 @@ extern "C" __global__ void reduce_q_weighted_gram(
                 let mut q_j_dev =
                     stream
                         .alloc_zeros::<f64>(k)
-                        .gpu_ctx("reml_trace alloc Q_j (j={j})")?;
+                        .gpu_ctx_with(|err| format!("reml_trace alloc Q_j (j={j}): {err}"))?;
                 launch_reduce_q_dense(
                     &stream,
                     module_handle,
@@ -1064,7 +1064,7 @@ extern "C" __global__ void reduce_q_weighted_gram(
                 let q_host_j =
                     stream
                         .clone_dtoh(&q_j_dev)
-                        .gpu_ctx("reml_trace download Q_j (j={j})")?;
+                        .gpu_ctx_with(|err| format!("reml_trace download Q_j (j={j}): {err}"))?;
                 q_host[j * k..(j + 1) * k].copy_from_slice(&q_host_j);
             }
         }
