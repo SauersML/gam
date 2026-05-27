@@ -667,6 +667,10 @@ pub struct PirlsRowBackend {
 struct PirlsRowBackendLinux {
     ctx: Arc<CudaContext>,
     modules: Mutex<std::collections::HashMap<ModuleKey, Arc<CudaModule>>>,
+    /// Stage 6: separate cache for JIT-compiled custom-family modules
+    /// keyed by `(spec_id, curvature)`. Distinct JIT specs in the same
+    /// process get distinct cached modules.
+    jit_modules: Mutex<std::collections::HashMap<JitKey, Arc<CudaModule>>>,
 }
 
 #[cfg(target_os = "linux")]
@@ -719,6 +723,7 @@ impl PirlsRowBackend {
             inner: PirlsRowBackendLinux {
                 ctx,
                 modules: Mutex::new(std::collections::HashMap::new()),
+                jit_modules: Mutex::new(std::collections::HashMap::new()),
             },
         })
     }
@@ -765,6 +770,194 @@ impl PirlsRowBackend {
             })?
             .insert(key, module.clone());
         Ok(module)
+    }
+
+    /// Stage 6: JIT-compile and cache a custom-family row module.
+    ///
+    /// The kernel name is `pirls_row_jit_{spec.spec_id}` so multiple
+    /// distinct JIT specs in the same process get distinct cached
+    /// modules. The cache key is `(spec_id, curvature)` which mirrors
+    /// the built-in `(family, curvature)` cache and reuses the same
+    /// HashMap-of-`Arc<CudaModule>` (but with a synthetic `ModuleKey`
+    /// derived from the spec_id).
+    ///
+    /// Note: a fresh `(spec_id, curvature)` recompiles via NVRTC the
+    /// first time; subsequent fits in the same process hit the cache.
+    /// Spec changes (different body) must use a different `spec_id` so
+    /// that the cache does NOT return a stale module.
+    #[cfg(target_os = "linux")]
+    pub fn module_for_jit(
+        &self,
+        spec: &JitFamilySpec,
+        curvature: CurvatureMode,
+    ) -> Result<Arc<CudaModule>, GpuError> {
+        // Reuse the built-in ModuleKey by mapping `spec_id` to a
+        // synthetic family slot. We piggy-back on the cache by keying
+        // off a hashed family enum value won't fit cleanly; instead
+        // use a separate JIT cache HashMap.
+        let key = JitKey {
+            spec_id: spec.spec_id,
+            curvature,
+        };
+        if let Some(existing) = self
+            .inner
+            .jit_modules
+            .lock()
+            .map_err(|err| GpuError::DriverCallFailed {
+                reason: format!("pirls_row jit cache poisoned: {err}"),
+            })?
+            .get(&key)
+        {
+            return Ok(existing.clone());
+        }
+        let source = spec.cuda_source(curvature);
+        let ptx = cudarc::nvrtc::compile_ptx(source).map_err(|err| GpuError::DriverCallFailed {
+            reason: format!(
+                "pirls_row JIT NVRTC compile failed for spec_id={} curvature={}: {err}",
+                spec.spec_id,
+                curvature.as_str(),
+            ),
+        })?;
+        let module = self
+            .inner
+            .ctx
+            .load_module(ptx)
+            .map_err(|err| GpuError::DriverCallFailed {
+                reason: format!("pirls_row JIT module load failed: {err}"),
+            })?;
+        self.inner
+            .jit_modules
+            .lock()
+            .map_err(|err| GpuError::DriverCallFailed {
+                reason: format!("pirls_row jit cache poisoned (insert): {err}"),
+            })?
+            .insert(key, module.clone());
+        Ok(module)
+    }
+}
+
+/// Stage 6 cache key for JIT-compiled family modules.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct JitKey {
+    spec_id: u64,
+    curvature: CurvatureMode,
+}
+
+/// Stage 6 custom-family JIT specification.
+///
+/// Two levels per the charter:
+/// - **Level A** (`JitFamilySpec::glm`): provide a `(family, link)` enum
+///   value plus an optional shape constant. The generator emits the
+///   matching built-in row body, identical to the cached built-in
+///   kernel — useful for end-to-end JIT path validation against the
+///   built-in cache.
+/// - **Level B** (`JitFamilySpec::raw`): provide raw CUDA source for
+///   the row body. The body must define the same per-row locals the
+///   kernel shell expects: `mu`, `grad_eta`, `w_fisher`, `w_hessian`,
+///   `w_solver`, `z_f`, `z_h`, `dev`, and update `flags`. The shell
+///   wraps it in the canonical
+///   `extern "C" __global__ void pirls_row_jit_{spec_id}(...)`
+///   signature that [`launch_row_reweight_on_stream`] expects.
+#[derive(Clone, Debug)]
+pub struct JitFamilySpec {
+    /// Process-unique identifier for this spec; the module cache uses
+    /// it as a key so callers must reuse the same `spec_id` for the
+    /// same body and pick a new one whenever the body changes.
+    pub spec_id: u64,
+    /// CUDA body source. Must read from `eta_c`, `y_i`, `wp`, set
+    /// `flags`, and assign to `mu`, `grad_eta`, `w_fisher`, `w_hessian`,
+    /// `w_solver`, `z_f`, `z_h`, `dev`. See [`COMMON_DEVICE_PROLOG`] for
+    /// the available helpers.
+    pub body: String,
+}
+
+impl JitFamilySpec {
+    /// Level A: build a spec from a built-in `(family, curvature)`
+    /// pair. The generator reuses the same per-family body as the
+    /// built-in cached kernel — useful to validate the JIT pipeline
+    /// end-to-end against the built-in numerical reference.
+    #[cfg(target_os = "linux")]
+    pub fn glm(spec_id: u64, family: PirlsRowFamily, curvature: CurvatureMode) -> Self {
+        let body = match family {
+            PirlsRowFamily::GaussianIdentity => gaussian_identity_body(curvature),
+            PirlsRowFamily::PoissonLog => poisson_log_body(curvature),
+            PirlsRowFamily::GammaLog => gamma_log_body(curvature),
+            PirlsRowFamily::BernoulliLogit => bernoulli_logit_body(curvature),
+            PirlsRowFamily::BernoulliProbit => bernoulli_probit_body(curvature),
+            PirlsRowFamily::BernoulliCLogLog => bernoulli_cloglog_body(curvature),
+        };
+        Self { spec_id, body }
+    }
+
+    /// Level B: build a spec from caller-supplied body source. The
+    /// kernel shell wraps it; the body must define the required locals
+    /// listed on [`JitFamilySpec`].
+    pub fn raw(spec_id: u64, body: impl Into<String>) -> Self {
+        Self {
+            spec_id,
+            body: body.into(),
+        }
+    }
+
+    /// The `extern "C"` kernel symbol the JIT-compiled module exposes.
+    pub fn kernel_name(&self) -> String {
+        format!("pirls_row_jit_{}", self.spec_id)
+    }
+
+    /// Build the full CUDA source ready for NVRTC compilation. The
+    /// shell + prolog match the built-in `cuda_source_for` so the JIT
+    /// kernel ABI is bit-identical to the cached built-ins;
+    /// [`launch_row_reweight_on_stream`] cannot tell the difference.
+    #[cfg(target_os = "linux")]
+    pub fn cuda_source(&self, curvature: CurvatureMode) -> String {
+        let curvature_define = match curvature {
+            CurvatureMode::Fisher => "#define PIRLS_CURVATURE_FISHER 1",
+            CurvatureMode::Observed => "#define PIRLS_CURVATURE_OBSERVED 1",
+        };
+        let kernel_name = self.kernel_name();
+        let body = &self.body;
+        format!(
+            r#"
+{curvature_define}
+{prolog}
+
+extern "C" __global__ void {kernel_name}(
+    int            n,
+    const double* __restrict__ eta,
+    const double* __restrict__ y,
+    const double* __restrict__ prior_w,
+    double* __restrict__ mu_out,
+    double* __restrict__ grad_eta_out,
+    double* __restrict__ w_fisher_out,
+    double* __restrict__ w_hessian_out,
+    double* __restrict__ w_solver_out,
+    double* __restrict__ z_fisher_out,
+    double* __restrict__ z_hessian_out,
+    double* __restrict__ deviance_out,
+    unsigned int* __restrict__ status_out
+) {{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    unsigned int flags = 0u;
+    double eta_i = eta[i];
+    double y_i = y[i];
+    double wp = prior_w[i] > 0.0 ? prior_w[i] : 0.0;
+    if (prior_w[i] <= 0.0) flags |= 0x10u;
+{body}
+    mu_out[i] = mu;
+    grad_eta_out[i] = grad_eta;
+    w_fisher_out[i] = w_fisher;
+    w_hessian_out[i] = w_hessian;
+    w_solver_out[i] = w_solver;
+    z_fisher_out[i] = z_f;
+    z_hessian_out[i] = z_h;
+    deviance_out[i] = dev;
+    status_out[i] = flags;
+}}
+"#,
+            prolog = COMMON_DEVICE_PROLOG,
+        )
     }
 }
 
