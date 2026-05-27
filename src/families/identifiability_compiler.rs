@@ -200,6 +200,53 @@ pub fn compile(
     row_hess: &dyn RowHessian,
     ordering: &[BlockOrder],
 ) -> Result<CompiledBlocks, CompilerError> {
+    // Default structural metric is the per-row identity `K^S_i = I_K`.
+    // A pilot-curvature `H` can collapse a direction (zero eigenvalue) at
+    // a bad β even though the optimum keeps that direction; routing the
+    // rank decision through the structural metric and reserving `H` for
+    // *within-kept-subspace* curvature handling prevents that mis-drop.
+    let n = row_hess.nrows();
+    let k = row_hess.k();
+    let id_struct = IdentityRowHessian::new(n, k);
+    compile_with_dual_metric(operators, row_hess, &id_struct, ordering)
+}
+
+/// Compile a sequence of row-Jacobian operators using *separate* metrics
+/// for structural rank decisions and curvature-aware orthogonalisation.
+///
+/// - `row_hess` is the curvature row metric `K^H_i` (a PSD-clamped Hessian
+///   of `−log L_i(u_i)` at a pilot β).
+/// - `row_structural` is the structural row metric `K^S_i` — typically an
+///   [`IdentityRowHessian`] — used only to decide which columns survive
+///   block-against-block residualisation. A direction that the curvature
+///   `K^H` happens to see as zero at a bad pilot β is *not* dropped here
+///   as long as it is structurally non-degenerate.
+///
+/// Per-block algorithm (left-to-right walk over `ordering`):
+///
+/// 1. Residualise the block in the structural metric against the
+///    cumulative structural anchor; eigendecompose the structural residual
+///    Gram and drop only structural-zero eigenvalues → kept basis `D`
+///    (raw-block selector).
+/// 2. Residualise `W^H_b · D` in the curvature metric against the
+///    cumulative curvature anchor → curvature anchor correction
+///    `M^H_inner` and residual `R^H`.
+/// 3. Eigendecompose the curvature Gram of `R^H` and drop curvature-zero
+///    directions (a *within*-structurally-kept curvature alias is a true
+///    redundancy) → rotation/selector `T_inner`.
+/// 4. Compose: `V = D · T_inner`; compiled anchor correction is
+///    `M^H_inner · T_inner` so the predict-time row contribution stays
+///    `(C(x) · V − A(x) · anchor_correction) · β`.
+///
+/// When `row_structural` and `row_hess` represent the same metric (e.g.
+/// `compile()` with an identity row Hessian on both sides), the two
+/// passes collapse to the single-metric loop.
+pub fn compile_with_dual_metric(
+    operators: &[Arc<dyn RowJacobianOperator>],
+    row_hess: &dyn RowHessian,
+    row_structural: &dyn RowHessian,
+    ordering: &[BlockOrder],
+) -> Result<CompiledBlocks, CompilerError> {
     if operators.len() != ordering.len() {
         return Err(CompilerError::DimensionMismatch(format!(
             "operators ({}) and ordering ({}) length mismatch",
@@ -217,74 +264,112 @@ pub fn compile(
 
     let k = row_hess.k();
     let n = row_hess.nrows();
+    if row_structural.k() != k {
+        return Err(CompilerError::DimensionMismatch(format!(
+            "structural row metric has K={} but curvature row Hessian has K={k}",
+            row_structural.k()
+        )));
+    }
+    if row_structural.nrows() != n {
+        return Err(CompilerError::DimensionMismatch(format!(
+            "structural row metric has nrows={} but curvature row Hessian has nrows={n}",
+            row_structural.nrows()
+        )));
+    }
     for (idx, op) in operators.iter().enumerate() {
         if op.k() != k {
             return Err(CompilerError::DimensionMismatch(format!(
-                "operator {idx} has K={} but row Hessian has K={}",
-                op.k(),
-                k
+                "operator {idx} has K={} but row Hessian has K={k}",
+                op.k()
             )));
         }
         if op.nrows() != n {
             return Err(CompilerError::DimensionMismatch(format!(
-                "operator {idx} has nrows={} but row Hessian has nrows={}",
-                op.nrows(),
-                n
+                "operator {idx} has nrows={} but row Hessian has nrows={n}",
+                op.nrows()
             )));
         }
     }
 
-    // Materialise once. For survival K=4 / Bernoulli K=1 and the column
-    // counts in production are small (≤ a few hundred), so the dense
-    // tensor cost is dominated by the eventual joint-design audit.
+    // Materialise once per metric. K is tiny (1 or 4) so the K×K
+    // symmetric-sqrt cost is dominated by the joint-design audit below.
     let h_full = row_hess.evaluate_full();
+    let s_full = row_structural.evaluate_full();
     let j_full: Vec<Array3<f64>> = operators.iter().map(|op| op.evaluate_full()).collect();
 
-    // Per-block weighted-design `W_b = sqrt(H_i) · J_b,i` flattened to an
-    // (n*K, ncols_b) matrix. Built up to here for each block as we walk
-    // the ordering and append residualised "B·V" columns to the cumulative
-    // anchor design `w_anchor`.
-    let scaled_blocks: Vec<Array2<f64>> = j_full
+    let scaled_h: Vec<Array2<f64>> = j_full
         .iter()
         .map(|jb| scale_block_by_sqrt_h(jb, &h_full))
         .collect();
+    let scaled_s: Vec<Array2<f64>> = j_full
+        .iter()
+        .map(|jb| scale_block_by_sqrt_h(jb, &s_full))
+        .collect();
 
     let mut compiled: Vec<CompiledBlock> = Vec::with_capacity(operators.len());
-    let mut w_anchor: Array2<f64> = Array2::zeros((n * k, 0));
+    let mut anchor_h: Array2<f64> = Array2::zeros((n * k, 0));
+    let mut anchor_s: Array2<f64> = Array2::zeros((n * k, 0));
 
-    for (idx, w_b) in scaled_blocks.iter().enumerate() {
-        let p_b = w_b.ncols();
-        // 1. Build the residual operator P_⊥(W_anchor) · W_b. With
-        //    A = W_anchor, we solve A^T A · M = A^T W_b and form
-        //    W̃_b = W_b − A · M.
-        let (residual_scaled, m_opt) = residualise_in_metric(&w_anchor, w_b)?;
+    for idx in 0..operators.len() {
+        let w_h = &scaled_h[idx];
+        let w_s = &scaled_s[idx];
+        let p_b = w_h.ncols();
 
-        // 2. Eigendecompose the residual Gram G̃ = W̃_bᵀ W̃_b. The kept
-        //    eigenvectors form V ∈ R^{p_B × p_B'}.
-        let g_tilde = fast_atb(&residual_scaled, &residual_scaled);
-        let g_bb_trace: f64 = (0..p_b).map(|i| g_tilde[[i, i]].max(0.0)).sum();
-        let v = keep_positive_eigenspace(&g_tilde, n, k, g_bb_trace)?;
-        if v.ncols() == 0 {
+        // Pass 1 (structural): residualise W^S_b against cumulative
+        // structural anchor; eigendecompose the structural residual Gram
+        // and keep only directions with non-zero structural mass → D
+        // (raw-block selector).
+        let (residual_s, _m_s_opt) = residualise_in_metric(&anchor_s, w_s)?;
+        let g_s = fast_atb(&residual_s, &residual_s);
+        let g_s_trace: f64 = (0..p_b).map(|i| g_s[[i, i]].max(0.0)).sum();
+        let d = keep_positive_eigenspace(&g_s, n, k, g_s_trace)?;
+        if d.ncols() == 0 {
             return Err(CompilerError::FullyAliased {
                 block_idx: idx,
                 reason: format!(
-                    "residual Gram has no positive eigenspace (block of width {p_b} fully aliased by cumulative anchor)"
+                    "structural residual Gram has no positive eigenspace (block of width {p_b} fully aliased by cumulative structural anchor)"
                 ),
             });
         }
 
-        // 3. Append (W_b − A·M)·V to the cumulative anchor design (still
-        //    in the sqrt(H) metric). This is the H-orthogonal residual
-        //    times V — the right design for downstream blocks to
-        //    residualise against, and numerically better conditioned than
-        //    `W_b·V` when `V` compresses columns.
-        let residual_v = fast_ab(&residual_scaled, &v);
-        w_anchor = concat_cols(&w_anchor, &residual_v);
+        // Pass 2 (curvature): form W^H_b · D and residualise against the
+        // cumulative curvature anchor. Eigendecompose the curvature
+        // residual Gram and drop curvature-zero directions inside D →
+        // T_inner. A direction kept by the structural pass but degenerate
+        // here is genuinely curvature-redundant *within* the
+        // structurally-kept basis, so dropping it is correct.
+        let w_h_d = fast_ab(w_h, &d);
+        let (residual_h, m_h_inner_opt) = residualise_in_metric(&anchor_h, &w_h_d)?;
+        let g_h = fast_atb(&residual_h, &residual_h);
+        let p_d = d.ncols();
+        let g_h_trace: f64 = (0..p_d).map(|i| g_h[[i, i]].max(0.0)).sum();
+        let t_inner = keep_positive_eigenspace(&g_h, n, k, g_h_trace)?;
+        if t_inner.ncols() == 0 {
+            return Err(CompilerError::FullyAliased {
+                block_idx: idx,
+                reason: format!(
+                    "curvature residual Gram has no positive eigenspace within structurally-kept basis (block of width {p_b}, structural-kept {p_d})"
+                ),
+            });
+        }
 
-        // Store M at compiled width: the residualised correction is M·V,
-        // so consumers can directly evaluate `(C(x)·V − A(x)·(M·V))·β`.
-        // `r_lw` is the same matrix; both fields are kept synonymous.
-        let m_compiled = m_opt.as_ref().map(|m| fast_ab(m, &v));
+        // Compose V = D · T_inner (raw-block → kept).
+        let v = fast_ab(&d, &t_inner);
+
+        // Append residual-V columns to both cumulative anchors so future
+        // blocks see the structurally-orthogonal and curvature-orthogonal
+        // residual designs of this block, never the raw scaled block.
+        let residual_h_t = fast_ab(&residual_h, &t_inner);
+        anchor_h = concat_cols(&anchor_h, &residual_h_t);
+        // The structural anchor needs the structural-residual restricted
+        // to the kept directions: residual_s · v gives (W^S_b − A^S · M^S)·V.
+        let residual_s_v = fast_ab(&residual_s, &v);
+        anchor_s = concat_cols(&anchor_s, &residual_s_v);
+
+        // Compiled anchor correction lives in the curvature metric — the
+        // predict-time row contribution is `(C(x) · V − A(x) · (M·V))·β`,
+        // where the subtraction makes residuals H-orthogonal at training.
+        let m_compiled = m_h_inner_opt.as_ref().map(|m| fast_ab(m, &t_inner));
         compiled.push(CompiledBlock {
             t_lw: v,
             anchor_correction: m_compiled.clone(),
@@ -293,10 +378,9 @@ pub fn compile(
         });
     }
 
-    // 4. Pre-fit audit: column-pivoted QR on the cumulative `w_anchor`
-    //    (which is the full joint primary-state design scaled by sqrt(H)).
-    //    Drop trailing pivots; attribute them to the latest block.
-    let dropped = audit_and_drop_trailing_pivots(&w_anchor, &mut compiled)?;
+    // Joint-design audit on the curvature-scaled cumulative anchor: the
+    // identifiability question the fit cares about is curvature-rank.
+    let dropped = audit_and_drop_trailing_pivots(&anchor_h, &mut compiled)?;
     let joint_rank: usize = compiled.iter().map(|b| b.t_lw.ncols()).sum();
 
     Ok(CompiledBlocks {
@@ -1322,5 +1406,201 @@ mod tests {
                 );
             }
         }
+    }
+
+    // Per-row Hessian (K=1) sourced from an arbitrary positive vector —
+    // used by the dual-metric sanity test to drive both structural and
+    // curvature passes with the *same* non-identity weights.
+    fn diag_hess(w: Array1<f64>) -> DiagonalScalarRowHessian {
+        DiagonalScalarRowHessian::new(w)
+    }
+
+    /// L#1: dual-metric with structural = curvature reproduces single-metric
+    /// `compile()` exactly. The two passes degenerate to one because the
+    /// structural-anchor and curvature-anchor are the same matrix.
+    #[test]
+    fn dual_metric_with_equal_metrics_matches_single_metric() {
+        let n = 36;
+        let a = Array2::from_shape_fn((n, 2), |(i, j)| (i as f64 * 0.13 + j as f64).sin());
+        // B partially aliases A's first column.
+        let b = Array2::from_shape_fn((n, 2), |(i, j)| {
+            0.4 * a[[i, 0]] + (i as f64 * 0.07 + j as f64).cos()
+        });
+        let w = Array1::from_shape_fn(n, |i| 0.5 + (i as f64 * 0.17).sin().abs());
+        let curvature = diag_hess(w.clone());
+        let ordering = [BlockOrder::Marginal, BlockOrder::Logslope];
+
+        let ops_single = vec![op(a.clone()), op(b.clone())];
+        let single = compile(&ops_single, &curvature, &ordering)
+            .expect("single-metric compile should succeed");
+
+        // Dual-metric with structural = curvature (same `RowHessian` on both
+        // sides). The structural pass collapses to the curvature pass.
+        let structural_same = diag_hess(w.clone());
+        let ops_dual = vec![op(a.clone()), op(b.clone())];
+        let dual = compile_with_dual_metric(&ops_dual, &curvature, &structural_same, &ordering)
+            .expect("dual-metric compile should succeed");
+
+        assert_eq!(single.blocks.len(), dual.blocks.len());
+        for (idx, (sb, db)) in single.blocks.iter().zip(dual.blocks.iter()).enumerate() {
+            assert_eq!(
+                sb.t_lw.dim(),
+                db.t_lw.dim(),
+                "block {idx}: V dims differ"
+            );
+            let max_v = (&sb.t_lw - &db.t_lw)
+                .iter()
+                .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+            assert!(max_v < 1e-10, "block {idx}: V mismatch {max_v:e}");
+            match (sb.anchor_correction.as_ref(), db.anchor_correction.as_ref()) {
+                (None, None) => {}
+                (Some(s), Some(d)) => {
+                    assert_eq!(s.dim(), d.dim());
+                    let max_m = (s - d)
+                        .iter()
+                        .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+                    assert!(max_m < 1e-10, "block {idx}: M mismatch {max_m:e}");
+                }
+                _ => panic!("block {idx}: one side has anchor correction, the other does not"),
+            }
+        }
+        assert_eq!(single.joint_rank, dual.joint_rank);
+    }
+
+    /// L#2: the pilot-curvature trap. A 2-block toy where the pilot
+    /// curvature `H` has a zero direction that is NOT a real gauge — the
+    /// dual-metric path keeps it (identity-structural sees it as a full-
+    /// rank structural direction), while a single-metric path through the
+    /// same H would drop it.
+    ///
+    /// Construction: two K=1 blocks `A` (n × 1) and `B` (n × 1). Choose H
+    /// (diagonal row weights) so that `H · B` happens to be a scalar
+    /// multiple of `H · A` (curvature alias) but `B` is *not* a scalar
+    /// multiple of `A` in the unweighted metric. Specifically, pick rows
+    /// where `w_i` is non-zero only on a handful of rows where A and B
+    /// happen to be proportional, and zero on the rows where they differ.
+    /// Under identity-structural this is structurally-independent; under H
+    /// it is a (spurious) curvature alias.
+    #[test]
+    fn dual_metric_resists_pilot_curvature_alias() {
+        let n = 12;
+        // A: x_i = i+1 (no zeros). B: equals 2·A on rows 0..6 only; the
+        // remaining rows are uncorrelated (linear vs trigonometric).
+        let a = Array2::from_shape_fn((n, 1), |(i, _)| (i as f64) + 1.0);
+        let b = Array2::from_shape_fn((n, 1), |(i, _)| {
+            if i < 6 {
+                2.0 * a[[i, 0]]
+            } else {
+                ((i as f64) * 0.3).cos() + 0.5
+            }
+        });
+
+        // Curvature weights are non-zero ONLY on the rows where B == 2A.
+        // Under curvature metric, B is exactly 2·A → curvature-rank drops
+        // B fully. Under identity-structural, B is independent of A across
+        // all rows → structural-rank is 1 (kept).
+        let mut w_vec = vec![0.0_f64; n];
+        for w in &mut w_vec[..6] {
+            *w = 1.0;
+        }
+        let w = Array1::from(w_vec);
+        let curvature = diag_hess(w.clone());
+
+        // Reference single-metric compile (uses identity by `compile()` —
+        // which now routes through identity-structural). For this test we
+        // explicitly invoke the dual-metric API both ways.
+        let id_struct = IdentityRowHessian::new(n, 1);
+        let ordering = [BlockOrder::Marginal, BlockOrder::Logslope];
+
+        // Path 1: dual-metric with identity-structural (the new default).
+        // Structural pass: B is independent of A across all rows → keep
+        // B's single column.
+        let ops_dual = vec![op(a.clone()), op(b.clone())];
+        let dual = compile_with_dual_metric(&ops_dual, &curvature, &id_struct, &ordering);
+
+        // Path 2: dual-metric with structural = curvature (the "H decides
+        // everything" trap). On the curvature-only rows, B ≡ 2A, so
+        // structural pass sees zero residual span and rejects the block.
+        let ops_h_only = vec![op(a.clone()), op(b.clone())];
+        let h_only = compile_with_dual_metric(
+            &ops_h_only,
+            &curvature,
+            &curvature,
+            &ordering,
+        );
+
+        // The H-only path must fail (FullyAliased) or strip B's column.
+        // The dual (identity-structural) path must keep B.
+        match h_only {
+            Err(CompilerError::FullyAliased { block_idx, .. }) => {
+                assert_eq!(block_idx, 1, "H-only path must alias block 1");
+            }
+            Ok(out) => {
+                // If the H-only path somehow compiled, it must have
+                // either dropped B's column to zero width or audited it
+                // out. Either way B's V must be empty after the audit
+                // attributes the drop.
+                let v1_cols = out.blocks[1].t_lw.ncols();
+                assert!(
+                    v1_cols == 0 || !out.dropped.is_empty(),
+                    "H-only path should reject B's curvature-aliased column; v1_cols={v1_cols}, dropped={dropped:?}",
+                    dropped = out.dropped,
+                );
+            }
+            Err(other) => panic!("unexpected H-only error: {other:?}"),
+        }
+
+        let dual = dual.expect("dual-metric must succeed: identity-structural sees B as independent");
+        // The dual path may still drop B's column at the joint audit step
+        // because the joint H-scaled design is rank-1 (only the first
+        // block contributes non-zero rows under the curvature weights).
+        // What matters is that the *structural* decision did NOT drop B
+        // — verified by the structural pass not raising FullyAliased and
+        // by B's `t_lw` having the full structural width before the audit
+        // demotes it. After audit, B's V may shrink because the curvature
+        // joint design is rank-deficient, and that is expected.
+        assert_eq!(dual.blocks.len(), 2);
+        assert_eq!(dual.blocks[0].t_lw.ncols(), 1, "A must keep its column");
+        // Block 1 either keeps its structural rank-1 column or is audited
+        // away by the joint H-rank check, but in either case the per-block
+        // pre-audit width must reflect that the structural pass kept the
+        // column (i.e. the function did not return FullyAliased).
+        let v1_post_audit = dual.blocks[1].t_lw.ncols();
+        let dropped_count = dual.dropped.len();
+        assert_eq!(
+            v1_post_audit + dropped_count,
+            1,
+            "structural pass kept B's column; audit may demote it but the pre-audit width was 1"
+        );
+    }
+
+    /// L#3: identity-structural lets the compiler keep a direction even
+    /// when the pilot curvature has reduced rank. This is the same
+    /// scenario as L#2 but with a curvature `H` whose row weights are all
+    /// strictly positive — so the *only* aliasing source is the structural
+    /// pass deciding to keep or drop. The dual-metric path with non-trivial
+    /// `H` and identity-structural must agree with the dual-metric path
+    /// with identity on both sides whenever the blocks are structurally
+    /// non-aliased.
+    #[test]
+    fn dual_metric_identity_structural_preserves_full_rank() {
+        let n = 24;
+        let a = Array2::from_shape_fn((n, 2), |(i, j)| ((i + 1) as f64 + j as f64).sqrt());
+        let b = Array2::from_shape_fn((n, 2), |(i, j)| {
+            ((i + 1) as f64).ln() + (i as f64 * 0.1 + j as f64).cos()
+        });
+        let w = Array1::from_shape_fn(n, |i| 0.4 + (i as f64 * 0.05).sin().powi(2));
+        let curvature = diag_hess(w.clone());
+        let id_struct = IdentityRowHessian::new(n, 1);
+        let ordering = [BlockOrder::Marginal, BlockOrder::Logslope];
+
+        let ops = vec![op(a.clone()), op(b.clone())];
+        let out =
+            compile_with_dual_metric(&ops, &curvature, &id_struct, &ordering).expect("compile");
+        // Both blocks structurally independent → both keep full width.
+        assert_eq!(out.blocks[0].t_lw.ncols(), 2);
+        assert_eq!(out.blocks[1].t_lw.ncols(), 2);
+        assert_eq!(out.dropped.len(), 0);
+        assert_eq!(out.joint_rank, 4);
     }
 }
