@@ -599,18 +599,17 @@ mod tests {
     }
 
     #[test]
-    fn nonempty_fixed_partials_inputs_decline_without_layout() {
+    fn empty_cells_per_row_returns_empty_partials() {
         let inputs = [CellPrimaryFixedPartialsRowInputs {
             a: 0.0,
             b: 1.0,
             cells: &[],
+            layout: FlexPrimaryLayout { r: 4, g_slot: 3 },
         }];
         let out = try_device_cell_primary_fixed_partials(&inputs).expect("ok");
-        // Empty cells per row → short-circuit branch returns Some(empty
-        // partials) once the device path materializes.  Today we decline
-        // (None) because the layout (r, g_slot) isn't plumbed yet, so the
-        // family-side caller falls back to CPU.
-        assert!(out.is_none());
+        let some = out.expect("Some when all rows have zero cells");
+        assert_eq!(some.partials.len(), 1);
+        assert!(some.partials[0].is_empty());
     }
 
     #[test]
