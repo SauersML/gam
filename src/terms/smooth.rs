@@ -26174,10 +26174,8 @@ mod tests {
                     max_mm_iter: 4,
                     beta_rel_tol: 1e-4,
                     max_epsilon_outer_iter: 2,
-                    epsilon_log_step: std::f64::consts::LN_2,
                     min_epsilon: 1e-6,
-                    weight_floor: 1e-8,
-                    weight_ceiling: 1e8,
+                    ..AdaptiveRegularizationOptions::default()
                 }),
                 penalty_shrinkage_floor: None,
                 ..FitOptions::default()
@@ -26262,10 +26260,8 @@ mod tests {
                     max_mm_iter: 4,
                     beta_rel_tol: 1e-4,
                     max_epsilon_outer_iter: 2,
-                    epsilon_log_step: std::f64::consts::LN_2,
                     min_epsilon: 1e-6,
-                    weight_floor: 1e-8,
-                    weight_ceiling: 1e8,
+                    ..AdaptiveRegularizationOptions::default()
                 }),
                 penalty_shrinkage_floor: None,
                 ..FitOptions::default()
@@ -26344,10 +26340,8 @@ mod tests {
                     max_mm_iter: 4,
                     beta_rel_tol: 1e-4,
                     max_epsilon_outer_iter: 2,
-                    epsilon_log_step: std::f64::consts::LN_2,
                     min_epsilon: 1e-6,
-                    weight_floor: 1e-8,
-                    weight_ceiling: 1e8,
+                    ..AdaptiveRegularizationOptions::default()
                 }),
                 penalty_shrinkage_floor: None,
                 ..FitOptions::default()
@@ -26794,13 +26788,7 @@ mod tests {
                 max_iter: 40,
                 adaptive_regularization: Some(AdaptiveRegularizationOptions {
                     enabled: true,
-                    max_mm_iter: 10,
-                    beta_rel_tol: 1e-3,
-                    max_epsilon_outer_iter: 4,
-                    epsilon_log_step: std::f64::consts::LN_2,
-                    min_epsilon: 1e-8,
-                    weight_floor: 1e-8,
-                    weight_ceiling: 1e8,
+                    ..AdaptiveRegularizationOptions::default()
                 }),
                 penalty_shrinkage_floor: None,
                 ..FitOptions::default()
