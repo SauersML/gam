@@ -8,6 +8,7 @@ pub mod gaussian_reml;
 pub mod gpu;
 pub mod identifiability_audit;
 pub mod identifiability_canonical;
+pub mod inner_status;
 pub(crate) mod latent_cache;
 pub mod latent_inner;
 pub mod mixture_link;
