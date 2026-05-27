@@ -2898,4 +2898,114 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn project_raw_beta_identity_t_and_k_is_identity() {
+        let p = 5;
+        let t_full = Array2::<f64>::eye(p);
+        let k_struct = Array2::<f64>::eye(p);
+        let beta_raw = Array1::from_vec(vec![0.3_f64, -1.1, 2.5, 0.0, 4.2]);
+        let theta = project_raw_beta_to_compiled(&t_full, &k_struct, &beta_raw)
+            .expect("identity projection should succeed");
+        assert_eq!(theta.len(), p);
+        for i in 0..p {
+            assert!(
+                (theta[i] - beta_raw[i]).abs() < 1e-12,
+                "identity projection mismatch at {i}: got {} expected {}",
+                theta[i],
+                beta_raw[i]
+            );
+        }
+    }
+
+    #[test]
+    fn project_raw_beta_column_selector_recovers_kept_indices() {
+        // Selection-V case: T picks columns 0, 2, 4 from a p_raw=5 raw space.
+        let p_raw = 5;
+        let kept = [0usize, 2, 4];
+        let p_comp = kept.len();
+        let mut t_full = Array2::<f64>::zeros((p_raw, p_comp));
+        for (j, &i) in kept.iter().enumerate() {
+            t_full[[i, j]] = 1.0;
+        }
+        // Use a diagonal K^S with positive entries on the kept rows; off-kept
+        // entries are irrelevant to the projection (selector zeroes them).
+        let mut k_struct = Array2::<f64>::zeros((p_raw, p_raw));
+        for i in 0..p_raw {
+            k_struct[[i, i]] = (i as f64 + 1.0) * 0.7;
+        }
+        let beta_raw = Array1::from_vec(vec![1.5_f64, -0.4, 2.0, 9.9, -3.3]);
+        let theta = project_raw_beta_to_compiled(&t_full, &k_struct, &beta_raw)
+            .expect("selector projection should succeed");
+        for (j, &i) in kept.iter().enumerate() {
+            assert!(
+                (theta[j] - beta_raw[i]).abs() < 1e-10,
+                "selector projection at compiled idx {j} (raw {i}): got {} expected {}",
+                theta[j],
+                beta_raw[i]
+            );
+        }
+    }
+
+    #[test]
+    fn project_raw_beta_roundtrip_on_structural_positive_subspace() {
+        // T is a thin orthonormal-ish basis with non-trivial structure; build
+        // β_raw = T·θ on a vector strictly inside the structural-positive
+        // subspace, then project back and expect θ to be recovered.
+        let p_raw = 6;
+        let p_comp = 3;
+        // Construct T from Gram-Schmidt on a deterministic data matrix.
+        let raw_cols = Array2::from_shape_fn((p_raw, p_comp), |(i, j)| {
+            ((i as f64) * 0.31 + (j as f64) * 1.7 + 0.5).sin() + (j as f64)
+        });
+        // Orthonormalize columns of raw_cols to get T (Euclidean QR-like).
+        let mut t_full = raw_cols.clone();
+        for j in 0..p_comp {
+            for k in 0..j {
+                let mut dot = 0.0;
+                for i in 0..p_raw {
+                    dot += t_full[[i, j]] * t_full[[i, k]];
+                }
+                for i in 0..p_raw {
+                    t_full[[i, j]] -= dot * t_full[[i, k]];
+                }
+            }
+            let mut nrm = 0.0;
+            for i in 0..p_raw {
+                nrm += t_full[[i, j]].powi(2);
+            }
+            nrm = nrm.sqrt();
+            assert!(nrm > 1e-10, "column {j} collapsed in QR");
+            for i in 0..p_raw {
+                t_full[[i, j]] /= nrm;
+            }
+        }
+        // K^S is positive on the column span of T (use K = T·diag(d)·Tᵀ + tiny
+        // positive on its complement so the full Gram is PD).
+        let d = Array1::from_vec(vec![2.0_f64, 0.7, 1.3]);
+        let mut k_struct = Array2::<f64>::zeros((p_raw, p_raw));
+        for i in 0..p_raw {
+            for j in 0..p_raw {
+                let mut s = 0.0;
+                for r in 0..p_comp {
+                    s += t_full[[i, r]] * d[r] * t_full[[j, r]];
+                }
+                k_struct[[i, j]] = s;
+            }
+            k_struct[[i, i]] += 1e-6;
+        }
+        let theta_true = Array1::from_vec(vec![0.7_f64, -1.4, 2.1]);
+        // β_raw = T · θ_true lies entirely in T's range.
+        let beta_raw = crate::linalg::faer_ndarray::fast_av(&t_full, &theta_true);
+        let theta = project_raw_beta_to_compiled(&t_full, &k_struct, &beta_raw)
+            .expect("round-trip projection should succeed");
+        for i in 0..p_comp {
+            assert!(
+                (theta[i] - theta_true[i]).abs() < 1e-8,
+                "round-trip mismatch at {i}: got {} expected {}",
+                theta[i],
+                theta_true[i]
+            );
+        }
+    }
 }
