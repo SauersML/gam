@@ -52,6 +52,15 @@ pub const fn packed_index(c: usize, d: usize) -> usize {
 
 /// Try to build the primary-state Gram bundle on the GPU. Returns `None`
 /// when no CUDA device is available or when any device call fails.
+///
+/// This is a one-shot convenience wrapper: it builds a
+/// [`GpuIdentifiabilityCompileWorkspace`], runs a single
+/// `compute_grams`, and drops the workspace. Callers that compute Grams
+/// for the same `channel_blocks` more than once (e.g. structural-H
+/// compile followed by a recompile-after-PIRLS-accept with a
+/// data-adaptive H) should construct one workspace explicitly and reuse
+/// it across `compute_grams` calls to avoid re-uploading the
+/// channel-block designs.
 pub fn try_primary_state_gram_cuda(
     channel_blocks: &[Vec<Option<Array2<f64>>>],
     h_packed: &Array2<f64>,
@@ -73,7 +82,70 @@ pub fn try_primary_state_gram_cuda(
     }
     #[cfg(target_os = "linux")]
     {
-        cuda_impl::try_primary_state_gram_cuda_impl(channel_blocks, h_packed, raw_block_ranges)
+        let workspace = GpuIdentifiabilityCompileWorkspace::try_new(channel_blocks, raw_block_ranges)?;
+        workspace.compute_grams(h_packed)
+    }
+}
+
+/// Device-resident workspace that caches uploaded channel-block designs
+/// across multiple Gram builds for the same `(channel_blocks,
+/// raw_block_ranges)` topology. Only the per-row packed Hessian `H` is
+/// re-uploaded on each [`Self::compute_grams`] call.
+///
+/// Intended use: construct once at SMGS identifiability-compile time,
+/// then call [`Self::compute_grams`] for the structural-H pass and again
+/// for any recompile-after-PIRLS-accept pass with the data-adaptive H.
+///
+/// On non-Linux builds this is a stub that always reports unavailable
+/// via [`Self::try_new`] returning `None`.
+pub struct GpuIdentifiabilityCompileWorkspace {
+    #[cfg(target_os = "linux")]
+    inner: cuda_impl::WorkspaceInner,
+    #[cfg(not(target_os = "linux"))]
+    _never: std::marker::PhantomData<()>,
+}
+
+impl GpuIdentifiabilityCompileWorkspace {
+    /// Build a device-resident workspace by uploading each
+    /// `(block, channel)` raw design exactly once. Returns `None` when
+    /// no CUDA runtime is available, when inputs are malformed, or when
+    /// any device allocation/copy fails.
+    pub fn try_new(
+        channel_blocks: &[Vec<Option<Array2<f64>>>],
+        raw_block_ranges: &[Range<usize>],
+    ) -> Option<Self> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            if channel_blocks.is_empty()
+                || raw_block_ranges.is_empty()
+                || channel_blocks.len() != raw_block_ranges.len()
+            {
+                return None;
+            }
+            None
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let inner = cuda_impl::WorkspaceInner::try_new(channel_blocks, raw_block_ranges)?;
+            Some(Self { inner })
+        }
+    }
+
+    /// Compute the `(gram_h, gram_struct)` bundle on device. Uploads
+    /// only the packed Hessian columns it actually needs; reuses the
+    /// cached channel-block designs.
+    pub fn compute_grams(&self, h_packed: &Array2<f64>) -> Option<GramBundle> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            if h_packed.is_empty() {
+                return None;
+            }
+            None
+        }
+        #[cfg(target_os = "linux")]
+        {
+            self.inner.compute_grams(h_packed)
+        }
     }
 }
 

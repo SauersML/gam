@@ -7659,8 +7659,9 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
             };
             let s_transformed_view = match &penalty_active {
                 PirlsPenalty::Dense { s_transformed, .. } => s_transformed.view(),
-                // Already gated above; unreachable in practice.
-                PirlsPenalty::Diagonal { .. } => x_t_view, // shape mismatch — would fail admission
+                PirlsPenalty::Diagonal { .. } => unreachable!(
+                    "GPU PIRLS dispatch gated on PirlsPenalty::Dense above"
+                ),
             };
             // Dense-design materialization for `PirlsResult.x_transformed`.
             let qs_arc_for_design = qs_arc
