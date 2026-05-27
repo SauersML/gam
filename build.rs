@@ -906,10 +906,18 @@ fn scan_for_banned_substrings(
 }
 
 /// Compute a per-line bitmap of "is this line in test scope?". A line is in
-/// test scope if either the file is a test/bench file (under `tests/`,
-/// `bench/`, `benches/`, or `crates/*/tests|benches/`), or the line is
-/// inside a brace block annotated with `#[cfg(test)]` / `#[cfg(all(test,
-/// ...))]` / `#[cfg(any(test, ...))]`.
+/// test scope if either the file is a test/bench/example file (under
+/// `tests/`, `bench/`, `benches/`, `examples/`, or `crates/*/tests|benches/`),
+/// or the line is inside a brace block annotated with `#[cfg(test)]` /
+/// `#[cfg(all(test, ...))]` / `#[cfg(any(test, ...))]`.
+///
+/// `examples/` is included because Cargo example binaries are user-facing
+/// demonstration entry points: their `fn main` reports results to stdout
+/// and exits with a status code by contract, exactly like a CLI under
+/// `tests/` or `bench/`. Several banned-substring rules (`println!`,
+/// `process::exit`, `Box::leak`, `hint::black_box`) explicitly document
+/// the test/example/bench scope as the legitimate use site for those
+/// primitives; the mask is the place that decision is enforced.
 ///
 /// Brace tracking uses `strip_strings_and_comments` per line to ignore
 /// braces inside string literals and `//` comments. Block comments and
@@ -924,6 +932,7 @@ fn compute_test_mask(content: &str, rel: &Path) -> Vec<bool> {
     let file_is_test = rel_str.starts_with("tests/")
         || rel_str.starts_with("bench/")
         || rel_str.starts_with("benches/")
+        || rel_str.starts_with("examples/")
         || path_matches_crates_test(&rel_str);
     if file_is_test {
         mask.fill(true);
