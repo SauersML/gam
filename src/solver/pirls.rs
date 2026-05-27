@@ -9621,7 +9621,7 @@ pub fn update_glmvectors_integrated_by_family(
 /// - When hard clamps activate, the update map is piecewise and no longer C².
 ///   Setting c_i=d_i=0 is a practical subgradient-like choice to avoid unstable
 ///   explosive derivatives at the kink.
-fn computeworkingweight_derivatives_from_eta(
+pub(crate) fn computeworkingweight_derivatives_from_eta(
     likelihood: &GlmLikelihoodSpec,
     inverse_link: &InverseLink,
     eta: &Array1<f64>,
@@ -10408,7 +10408,7 @@ fn compute_observed_hessian_curvature_arrays_into(
         })
 }
 
-fn compute_observed_hessian_curvature_arrays(
+pub(crate) fn compute_observed_hessian_curvature_arrays(
     likelihood: &GlmLikelihoodSpec,
     inverse_link: &InverseLink,
     eta: &Array1<f64>,

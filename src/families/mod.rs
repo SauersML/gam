@@ -6,7 +6,6 @@ pub mod family_meta;
 pub mod gamlss;
 pub mod identifiability_compiler;
 pub mod inverse_link;
-pub mod ispline_base_time;
 pub mod jet_partitions;
 pub mod joint_penalty;
 pub mod latent_survival;
