@@ -743,7 +743,7 @@ where
     F: FnMut(&[f64], &mut [f64]),
 {
     let n = b.len();
-    debug_assert!(w.len() == n);
+    assert!(w.len() == n);
     for v in w.iter_mut() {
         *v = 0.0;
     }

@@ -8405,6 +8405,16 @@ impl BernoulliMarginalSlopeFamily {
                             } => (moments, status, stride),
                             #[cfg(target_os = "linux")]
                             CubicCellDerivativeMomentOutput::Device { .. } => {
+                                // SAFETY: this match arm is unreachable by construction.
+                                // The view above explicitly requested
+                                // `CubicCellMomentResidency::Host`, and the substrate's
+                                // contract (`try_build_cubic_cell_derivative_moments` in
+                                // `src/gpu/cubic_cell/mod.rs:170`) guarantees that a Host
+                                // request returns `Host(...)` even on Linux+CUDA. Reaching
+                                // this arm means the substrate's contract was violated —
+                                // a hard programming error in the GPU dispatcher, not a
+                                // runtime condition we can recover from. Panicking
+                                // surfaces it at the call site.
                                 panic!(
                                     "BMS row-cell-moments parity probe requested Host residency \
                                      but substrate returned device-resident output"
