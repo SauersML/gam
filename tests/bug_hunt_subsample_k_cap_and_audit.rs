@@ -1,23 +1,25 @@
-//! Falsification tests for the biobank 8-hour-hang investigation.
+//! Regression guards for the biobank 8h-hang investigation.
 //!
-//! Two hypotheses are tested here against the current local source:
+//! Pinned mechanism (validated via multiple orthogonal lines):
 //!
-//!   H1: `maybe_install_auto_outer_subsample` ignores its
-//!       `outer_work_per_k_unit` argument because line 1109 constructs
-//!       `AutoOuterSubsampleOptions::default()` (work_per_k=1). Survival
-//!       passes 250_000 expecting K_work ≈ 2_000; the run logs K = 19_661.
+//!   * `marginal_slope_shared.rs:maybe_install_auto_outer_subsample`
+//!     used to construct `AutoOuterSubsampleOptions::default()` and
+//!     discard the `outer_work_per_k_unit` argument. At biobank n the
+//!     noise-only rule then picked K ≈ 0.10·n = 19_661, ~9× larger
+//!     than the survival family's intended K ≈ 2_000. The first outer
+//!     analytic Hessian evaluation then exhausted RAM and disk; the
+//!     kernel killed the process with SIGKILL (exit 137) after 8h of
+//!     silent grinding.
 //!
-//!   H2: The current `audit_identifiability` sets `fatal=true` and
-//!       `canonicalize_for_identifiability` returns `IdentifiabilityFailure`
-//!       on the biobank shape (5 blocks, joint rank ≪ joint cols). The
-//!       installed release's audit log shows "alias(es) flagged;
-//!       family-specific reparameterisation required" — a phrase absent
-//!       from current source — and the run proceeds, so the release lacks
-//!       the gate. The test below proves current source halts.
+//!   * The identifiability audit / canonicalization halts the biobank
+//!     5-block shape (51 cols, rank 38) with
+//!     `CustomFamilyError::IdentifiabilityFailure`. The release binary
+//!     that emitted the failing log predates this gate — the literal
+//!     phrase "family-specific reparameterisation required" does not
+//!     appear in current source.
 //!
-//! No tests are required to run on the live biobank host. These run
-//! locally and either PASS (hypothesis confirmed) or FAIL (hypothesis
-//! falsified), with `assert!` messages diagnosing the actual values.
+//! These tests guard both fixes against regression and document the
+//! K-cap multiplier mechanism quantitatively.
 
 use gam::families::marginal_slope_shared::{
     AUTO_OUTER_MIN_K_FLOOR, AUTO_OUTER_WORK_BUDGET, AutoOuterCapReason,
@@ -87,10 +89,16 @@ fn h1b_target_k_with_survival_work_per_k_picks_work_rule() {
 // -------- H1: maybe_install_auto_outer_subsample's argument is dead --------
 
 #[test]
-fn h1c_maybe_install_ignores_outer_work_per_k_unit_argument() {
-    // Build a small synthetic outer-score input. The function only uses
-    // z + stratum for stratification; the K it picks depends solely on
-    // the `AutoOuterSubsampleOptions` it constructs internally.
+fn h1c_maybe_install_honors_outer_work_per_k_unit_argument() {
+    // Regression guard for the K-cap bypass at marginal_slope_shared.rs:1109.
+    // Pre-fix: the function constructed `AutoOuterSubsampleOptions::default()`
+    // and discarded the `outer_work_per_k_unit` argument, so the work-budget
+    // cap never bound; the noise-only rule picked K ≈ 0.10·n (≈ 19_661 at
+    // biobank n=195_780) instead of the survival family's intended K ≈ 2_000.
+    // That ~9× inflation drove the observed 8h biobank hang (exit 137).
+    //
+    // Post-fix: the function threads `outer_work_per_k_unit` into the options
+    // it constructs, so the cap binds and K lands near 2_000.
     let z: Vec<f64> = (0..BIOBANK_N).map(|i| (i as f64) / (BIOBANK_N as f64)).collect();
     let stratum: Vec<u8> = (0..BIOBANK_N).map(|i| (i & 1) as u8).collect();
     let opts_struct = gam::families::custom_family::BlockwiseFitOptions {
@@ -121,30 +129,30 @@ fn h1c_maybe_install_ignores_outer_work_per_k_unit_argument() {
     let k = mask.len();
     let expected_work_capped_k = (AUTO_OUTER_WORK_BUDGET / SURVIVAL_WORK_PER_K_UNIT) as usize;
 
-    // If the argument were threaded through, k should be ~2_000 (with a small
-    // stratification ceil overshoot). The bug at marginal_slope_shared.rs:1109
-    // throws it away and the function picks ~19_578-19_661 instead.
-    //
-    // Falsification: this assert FAILS on current source iff the argument
-    // is correctly threaded. We expect it to PASS (confirming the bug).
+    // With the cap honoured, K is at most a small stratification ceil
+    // overshoot above 2_000. Allow a generous overshoot bound (×1.5)
+    // since stratum count depends on the synthetic z distribution.
+    let allowed_overshoot = expected_work_capped_k + expected_work_capped_k / 2;
     assert!(
-        k > expected_work_capped_k * 3,
-        "If outer_work_per_k_unit were honored, mask K would be ~{}; got K={}. \
-         Bug at marginal_slope_shared.rs:1109 is FIXED (test should be inverted).",
-        expected_work_capped_k,
-        k,
-    );
-    // The observed live-run K=19_661 should be reproduced quantitatively.
-    let lo = 19_500;
-    let hi = 20_000;
-    assert!(
-        k >= lo && k <= hi,
-        "Buggy path predicts K in [{}, {}] (noise-rule + stratification ceil overshoot); \
-         got K={}. Live run logged K={}.",
-        lo,
-        hi,
+        k <= allowed_overshoot,
+        "outer_work_per_k_unit must be honoured. Expected K ≤ {} (work-cap with ceil overshoot); \
+         got K = {}. Live-run buggy value was K = {} ≈ 9× this.",
+        allowed_overshoot,
         k,
         OBSERVED_K_IN_RUN,
+    );
+    // Floor: the cap should not collapse below the AUTO_OUTER_MIN_K_FLOOR.
+    assert!(
+        k >= AUTO_OUTER_MIN_K_FLOOR,
+        "K must stay above the {} floor; got {}",
+        AUTO_OUTER_MIN_K_FLOOR,
+        k,
+    );
+    // Strict: K is far below the buggy fallback.
+    assert!(
+        k < OBSERVED_K_IN_RUN / 5,
+        "K should be ~10× smaller than the buggy fallback; got K={}",
+        k,
     );
 }
 
@@ -171,6 +179,58 @@ fn h1d_direct_capped_options_do_produce_small_k() {
         "expected K near {} (work cap); got K={}",
         expected_work_capped_k,
         k,
+    );
+}
+
+// -------- H3-quantitative: K-cap-bypass resource multiplier ----------
+//
+// The user's failed run died with exit 137 (SIGKILL by OOM/disk) after
+// 8h post-`eval=1/12`. RAM was at 67G/85G during the run; disk hit
+// 100% by the end. The mechanism is consistent with the K-cap bypass
+// inflating per-outer-eval working set ≈ 10× over intended.
+//
+// This test makes the multiplier concrete: same n, same z, same
+// strata; only the `outer_work_per_k_unit` differs. K_buggy / K_capped
+// is the resource-consumption multiplier per outer evaluation.
+
+#[test]
+fn h3a_uncapped_vs_capped_subsample_size_ratio_is_about_10x() {
+    // Documents the resource-consumption multiplier the cap saves.
+    // Same n, same z, same strata; only `outer_work_per_k_unit` differs.
+    // Outer Hessian per-direction work scales linearly in K when the
+    // HT-weighted row pass dominates, so this K ratio is the wall-time
+    // and intermediate-working-set blowup the survival family would
+    // suffer if the cap argument were not honoured.
+    let z: Vec<f64> = (0..BIOBANK_N).map(|i| (i as f64) / (BIOBANK_N as f64)).collect();
+    let stratum: Vec<u8> = (0..BIOBANK_N).map(|i| (i & 1) as u8).collect();
+
+    let uncapped = AutoOuterSubsampleOptions::default();
+    let k_uncapped = auto_outer_score_subsample(&z, Some(&stratum), &uncapped)
+        .expect("uncapped default still installs at biobank n")
+        .len();
+
+    let capped = AutoOuterSubsampleOptions {
+        outer_work_per_k_unit: SURVIVAL_WORK_PER_K_UNIT,
+        ..AutoOuterSubsampleOptions::default()
+    };
+    let k_capped = auto_outer_score_subsample(&z, Some(&stratum), &capped)
+        .expect("capped install at biobank n")
+        .len();
+
+    let multiplier = (k_uncapped as f64) / (k_capped as f64);
+    assert!(
+        multiplier > 7.0 && multiplier < 12.0,
+        "expected ~10x K multiplier between uncapped and capped paths; \
+         got K_uncapped={} K_capped={} ratio={:.2}",
+        k_uncapped,
+        k_capped,
+        multiplier,
+    );
+    assert!(k_capped <= 2_500, "capped K should ≤ 2500, got {}", k_capped);
+    assert!(k_uncapped >= 19_000, "uncapped K should ≥ 19_000, got {}", k_uncapped);
+    eprintln!(
+        "H3a: K_uncapped={} K_capped={} multiplier={:.2}x (the resource ratio the cap argument saves)",
+        k_uncapped, k_capped, multiplier
     );
 }
 

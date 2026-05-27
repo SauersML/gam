@@ -1106,12 +1106,27 @@ pub fn maybe_install_auto_outer_subsample(
         }
         return None;
     }
-    let auto_options = AutoOuterSubsampleOptions::default();
+    // Honour the family's per-K-unit work cost. Constructing
+    // `AutoOuterSubsampleOptions::default()` here would silently reset
+    // `outer_work_per_k_unit` to 1, making the work-budget cap
+    // (`K_work = AUTO_OUTER_WORK_BUDGET / outer_work_per_k_unit`)
+    // never bind, and letting the noise-only rule pick K ≈ 0.10·n —
+    // which at biobank n=195_780 is K≈19_578 instead of the survival
+    // family's intended K≈2_000. That ~9× inflation drove the
+    // documented 8h biobank hang (exit 137 from resource exhaustion).
+    let auto_options = AutoOuterSubsampleOptions {
+        outer_work_per_k_unit: outer_work_per_k_unit.max(1),
+        ..AutoOuterSubsampleOptions::default()
+    };
+    // Compute the K choice up-front so the log surfaces both the
+    // noise-only target and the work-cap target even when stratification
+    // ceil overshoots the picked K.
+    let choice = auto_options.target_k_detailed(z.len())?;
     let mask = auto_outer_score_subsample(z, stratum_secondary, &auto_options)?;
     let n_full = mask.n_full;
     let k = mask.len();
     log::info!(
-        "[{family_label} auto-subsample] phase=1 eval={}/{} n={} K={} fraction={:.3} expected_grad_noise={:.2}% work_per_k_unit={}",
+        "[{family_label} auto-subsample] phase=1 eval={}/{} n={} K={} fraction={:.3} expected_grad_noise={:.2}% work_per_k_unit={} k_noise={} k_work={} cap_reason={}",
         phase_idx + 1,
         phase1_budget,
         n_full,
@@ -1119,6 +1134,9 @@ pub fn maybe_install_auto_outer_subsample(
         k as f64 / n_full.max(1) as f64,
         100.0 * (1.0 / (k as f64).sqrt()) * (1.0 - k as f64 / n_full.max(1) as f64).sqrt(),
         outer_work_per_k_unit,
+        choice.k_noise,
+        choice.k_work,
+        choice.cap_reason.as_str(),
     );
     let mut cloned = options.clone();
     cloned.outer_score_subsample = Some(Arc::new(mask));
