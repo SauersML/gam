@@ -5796,7 +5796,15 @@ fn run_outer_with_plan(
                             evaluator,
                         )
                     };
-                    let _ = seed_slot;
+                    // `seed_slot` is the per-seed index assigned above; it is
+                    // consumed only by the host-BFGS logging summary, which
+                    // the device-resident branch replaces with its own
+                    // device-BFGS summary log below.
+                    if seed_slot == 0 {
+                        log::debug!(
+                            "[OUTER] {context}: device-BFGS seed_slot underflow at seed {seed_idx}"
+                        );
+                    }
                     match device_outcome {
                         Ok(outcome) => {
                             log::info!(
@@ -6026,6 +6034,7 @@ fn run_outer_with_plan(
                     Err(e) => Err(EstimationError::RemlOptimizationFailed(format!(
                         "BFGS solver failed: {e:?}"
                     ))),
+                }
                 }
             }
             Solver::Efs => {
