@@ -18762,6 +18762,34 @@ pub fn fit_survival_marginal_slope_terms(
     // re-runs the compile (cheap relative to the inner solve) and
     // additionally applies the V+M-exact per-term construction when
     // reduction is needed.
+    // Recompile-after-first-PIRLS-accept context. Captured inside the
+    // cutover branch so we can re-run `compile_survival_parametric_designs_per_term`
+    // against a data-adaptive row Hessian built at the converged β, then
+    // compare drops_by_block against the structural-H pass. If they differ,
+    // the structural compile mis-classified at least one direction (the
+    // "pilot-curvature trap") and the user is warned with the diff.
+    struct SmgsRecompileAfterAcceptContext {
+        dq0: ndarray::Array2<f64>,
+        dq1: ndarray::Array2<f64>,
+        dqd1: ndarray::Array2<f64>,
+        m_dq: ndarray::Array2<f64>,
+        m_dqd1: ndarray::Array2<f64>,
+        g_dg: ndarray::Array2<f64>,
+        time_partition: Vec<std::ops::Range<usize>>,
+        marginal_partition: Vec<std::ops::Range<usize>>,
+        logslope_partition: Vec<std::ops::Range<usize>>,
+        offset_entry: Array1<f64>,
+        offset_exit: Array1<f64>,
+        derivative_offset_exit: Array1<f64>,
+        marginal_offset: Array1<f64>,
+        logslope_offset: Array1<f64>,
+        z_primary: Array1<f64>,
+        weights: Array1<f64>,
+        event: Array1<f64>,
+        derivative_guard: f64,
+        probit_scale: f64,
+        drops_by_block_initial: (usize, usize, usize),
+    }
     type SmgsCutoverTuple = (
         crate::linalg::matrix::DesignMatrix,
         crate::linalg::matrix::DesignMatrix,
@@ -18772,6 +18800,7 @@ pub fn fit_survival_marginal_slope_terms(
         Option<Vec<crate::families::custom_family::PenaltyMatrix>>,
         Option<Vec<crate::families::custom_family::PenaltyMatrix>>,
         Option<Vec<crate::families::custom_family::PenaltyMatrix>>,
+        Option<SmgsRecompileAfterAcceptContext>,
     );
     let (
         design_entry,
@@ -18783,6 +18812,7 @@ pub fn fit_survival_marginal_slope_terms(
         time_penalties_vm,
         marginal_penalties_vm,
         logslope_penalties_vm,
+        recompile_after_accept,
     ): SmgsCutoverTuple = {
         use crate::families::survival_marginal_slope_identifiability::{
             CompiledSurvivalDesignsVMExact, SmgsLiftViaT, SurvivalParametricCompiledPerTerm,
@@ -19771,15 +19801,26 @@ pub fn fit_survival_marginal_slope_terms(
             .map(|s| s.beta.clone())
             .collect();
         let lifted = lift.lift_block_betas_via_t(&compiled_betas);
-        for (state, beta) in solved
+        for ((state, block), beta) in solved
             .fit
             .block_states
             .iter_mut()
             .take(n_lift)
+            .zip(solved.fit.blocks.iter_mut().take(n_lift))
             .zip(lifted.into_iter())
         {
-            state.beta = beta;
+            state.beta = beta.clone();
+            block.beta = beta;
         }
+        let mut off = 0usize;
+        let total: usize = solved.fit.blocks.iter().map(|b| b.beta.len()).sum();
+        let mut flat = Array1::<f64>::zeros(total);
+        for block in &solved.fit.blocks {
+            let p = block.beta.len();
+            flat.slice_mut(ndarray::s![off..off + p]).assign(&block.beta);
+            off += p;
+        }
+        solved.fit.beta = flat;
     }
 
     let mut resolved_specs = solved.resolved_specs;
