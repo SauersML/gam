@@ -72,6 +72,10 @@ pub struct CompiledBlock {
     /// Anchor correction `M ∈ R^{d × p'}` so the row contribution is
     /// `(C(x)·V − A(x)·M)·β`. `None` for the first block in the ordering.
     pub anchor_correction: Option<Array2<f64>>,
+    /// Residualised reparam `R_b = M_b · V_b` — what the residualised row
+    /// evaluator uses to subtract the anchor portion. `None` for the first
+    /// block in the ordering (no anchor).
+    pub r_lw: Option<Array2<f64>>,
     /// Predict-time anchor row evaluator. `None` for purely-parametric
     /// blocks that downstream stages do not consume as an anchor.
     pub anchor_evaluator: Option<Arc<dyn AnchorRowEvaluator>>,
@@ -222,9 +226,11 @@ pub fn compile(
         let w_b_v = fast_ab(w_b, &v);
         w_anchor = concat_cols(&w_anchor, &w_b_v);
 
+        let r_lw = m_opt.as_ref().map(|m| fast_ab(m, &v));
         compiled.push(CompiledBlock {
             t_lw: v,
             anchor_correction: m_opt,
+            r_lw,
             anchor_evaluator: None,
         });
     }

@@ -39,6 +39,7 @@ pub(crate) mod branch;
 pub(crate) mod device;
 pub(crate) mod host_substrate;
 pub(crate) mod kernel_src;
+pub(crate) mod partition_substrate;
 
 use crate::gpu::error::GpuError;
 
