@@ -6560,6 +6560,12 @@ impl SurvivalMarginalSlopeFamily {
     /// Build a cached partition: cells + moment states + fixed partials,
     /// computed once per (a, b, β_h, β_w) and reused across the three
     /// integration passes (F, D, D_uv).
+    ///
+    /// The cell-table assembly and the per-cell primary-fixed-partials
+    /// assembly route through the GPU-shaped `try_device_*` seams in
+    /// [`crate::gpu::survival_flex_prep`].  Until the matching NVRTC kernels
+    /// land, both seams return `Ok(None)` and the call site falls back to
+    /// the existing CPU implementation, so behavior is preserved.
     fn build_cached_partition_with_moment_order(
         &self,
         primary: &FlexPrimarySlices,
@@ -6569,9 +6575,35 @@ impl SurvivalMarginalSlopeFamily {
         beta_w: Option<&Array1<f64>>,
         moment_order: usize,
     ) -> Result<CachedPartitionCells, String> {
-        let raw_cells = self.denested_partition_cells(a, b, beta_h, beta_w)?;
-        let mut cells = Vec::with_capacity(raw_cells.len());
-        for partition_cell in raw_cells {
+        // ── 1. partition cells via the device seam, CPU fallback on decline ──
+        let raw_cells = {
+            let row_input = crate::gpu::survival_flex_prep::PartitionCellsRowInputs {
+                a,
+                b,
+                beta_h: beta_h.and_then(|b| b.as_slice()),
+                beta_w: beta_w.and_then(|b| b.as_slice()),
+            };
+            let dev = crate::gpu::survival_flex_prep::try_device_partition_cells(
+                std::slice::from_ref(&row_input),
+            )
+            .map_err(|e| e.to_string())?;
+            match dev {
+                Some(mut by_row) if by_row.len() == 1 => by_row.remove(0),
+                _ => self.denested_partition_cells(a, b, beta_h, beta_w)?,
+            }
+        };
+
+        // ── 2. per-cell prelude (neg_cell, z_mid, u_mid, moment state) ──
+        let n = raw_cells.len();
+        let mut neg_cells = Vec::with_capacity(n);
+        let mut z_mids = Vec::with_capacity(n);
+        let mut u_mids = Vec::with_capacity(n);
+        let mut states = Vec::with_capacity(n);
+        let mut fp_inputs =
+            Vec::<crate::gpu::survival_flex_prep::CellPrimaryFixedPartialsCellInputs>::with_capacity(
+                n,
+            );
+        for partition_cell in &raw_cells {
             let cell = partition_cell.cell;
             let neg_cell = exact_kernel::DenestedCubicCell {
                 left: cell.left,
@@ -6584,19 +6616,67 @@ impl SurvivalMarginalSlopeFamily {
             let z_mid = exact_kernel::interval_probe_point(cell.left, cell.right)?;
             let u_mid = a + b * z_mid;
             let state = exact_kernel::evaluate_cell_moments(cell, moment_order)?;
+            neg_cells.push(neg_cell);
+            z_mids.push(z_mid);
+            u_mids.push(u_mid);
+            states.push(state);
+            fp_inputs.push(
+                crate::gpu::survival_flex_prep::CellPrimaryFixedPartialsCellInputs {
+                    score_span: partition_cell.score_span,
+                    link_span: partition_cell.link_span,
+                    z_basis: z_mid,
+                    u_basis: u_mid,
+                },
+            );
+        }
+
+        // ── 3. per-cell fixed partials via the device seam, CPU fallback ──
+        let row_fp_input =
+            crate::gpu::survival_flex_prep::CellPrimaryFixedPartialsRowInputs {
+                a,
+                b,
+                cells: &fp_inputs,
+            };
+        let dev_fixed = crate::gpu::survival_flex_prep::try_device_cell_primary_fixed_partials(
+            std::slice::from_ref(&row_fp_input),
+        )
+        .map_err(|e| e.to_string())?;
+        // The current substrate decline is `None`; even when the device
+        // returns a flat-packed `Vec<f64>`, the family-side
+        // `DenestedCellPrimaryFixedPartials` consumer below is the source of
+        // truth and is reconstructed from the per-cell CPU helper.  When the
+        // sibling commit lands the NVRTC kernel + the
+        // `DenestedCellPrimaryFixedPartials::from_flat_slice` shim, this
+        // match's `Some(_)` arm will assemble cells from the device output
+        // instead of the CPU per-cell loop below.
+        match dev_fixed {
+            Some(out) if !out.partials.is_empty() => {
+                // Reserved for the device-resident assembly path; the V100
+                // sibling commit replaces this `unreachable_arm` with the
+                // flat-slice reconstruction.  The `Ok(None)` decline above
+                // makes this arm cold today.
+                return Err(format!(
+                    "device-resident fixed-partials assembly not yet wired (n_rows={})",
+                    out.partials.len()
+                ));
+            }
+            _ => {}
+        }
+        let mut cells = Vec::with_capacity(n);
+        for (idx, partition_cell) in raw_cells.into_iter().enumerate() {
             let fixed = self.denested_cell_primary_fixed_partials(
                 primary,
                 a,
                 b,
                 partition_cell.score_span,
                 partition_cell.link_span,
-                z_mid,
-                u_mid,
+                z_mids[idx],
+                u_mids[idx],
             )?;
             cells.push(CachedCellEntry {
                 partition_cell,
-                neg_cell,
-                state,
+                neg_cell: neg_cells[idx],
+                state: states[idx].clone(),
                 fixed,
             });
         }
@@ -10817,17 +10897,6 @@ impl SurvivalMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         dir: &Array1<f64>,
     ) -> Result<Array2<f64>, String> {
-        // Try the GPU substrate path first; fall through to CPU jets if
-        // the GPU path declines (any reason).  GPU path reuses the same
-        // pure assembler so numerics are bit-identical.
-        if let Some(out) = crate::gpu::survival_flex::try_third_contraction_for_survival(
-            self,
-            row,
-            block_states,
-            dir,
-        )? {
-            return Ok(out);
-        }
         self.ensure_scalar_flex_exact_score_geometry("row_flex_primary_third_contracted_exact")?;
         let primary = flex_primary_slices(self);
         let p = primary.total;
@@ -10937,18 +11006,6 @@ impl SurvivalMarginalSlopeFamily {
         dir_u: &Array1<f64>,
         dir_v: &Array1<f64>,
     ) -> Result<Array2<f64>, String> {
-        // Try the GPU substrate path first; fall through to CPU jets if
-        // the GPU path declines.  Both paths share the Block 10 pure
-        // assembler so numerics are bit-identical.
-        if let Some(out) = crate::gpu::survival_flex::try_fourth_contraction_for_survival(
-            self,
-            row,
-            block_states,
-            dir_u,
-            dir_v,
-        )? {
-            return Ok(out);
-        }
         self.ensure_scalar_flex_exact_score_geometry("row_flex_primary_fourth_contracted_exact")?;
         let primary = flex_primary_slices(self);
         let p = primary.total;
@@ -11058,237 +11115,6 @@ impl SurvivalMarginalSlopeFamily {
             d: self.event[row],
             dir_u: &dir_u_vec,
             dir_v: &dir_v_vec,
-            entry_base: &entry_b,
-            exit_base: &exit_b,
-            entry_ext_u: &entry_d1,
-            entry_ext_v: &entry_d2,
-            exit_ext_u: &exit_d1,
-            exit_ext_v: &exit_d2,
-            entry_bi: &entry_bi_p,
-            exit_bi: &exit_bi_p,
-        };
-        let flat = crate::gpu::survival_flex::cpu_oracle_fourth_contraction(&inputs)?;
-        Ok(Array2::<f64>::from_shape_vec((p, p), flat).map_err(|e| e.to_string())?)
-    }
-
-    /// Compute the ordered fourth contracted D_{dir2}(D_{dir1}(H[a,b])).
-    fn compute_survival_fourth_contracted_ordered(
-        &self,
-        row: usize,
-        primary: &FlexPrimarySlices,
-        qd1: f64,
-        entry_base: &SurvivalFlexTimepointExact,
-        exit_base: &SurvivalFlexTimepointExact,
-        entry_ext1: &SurvivalFlexTimepointDirectionalExact,
-        entry_ext2: &SurvivalFlexTimepointDirectionalExact,
-        exit_ext1: &SurvivalFlexTimepointDirectionalExact,
-        exit_ext2: &SurvivalFlexTimepointDirectionalExact,
-        entry_bi: &SurvivalFlexTimepointBiDirectionalExact,
-        exit_bi: &SurvivalFlexTimepointBiDirectionalExact,
-        dir1: &Array1<f64>,
-        dir2: &Array1<f64>,
-    ) -> Result<Array2<f64>, String> {
-        let p = primary.total;
-        let wi = self.weights[row];
-        let di = self.event[row];
-
-        let (entry_k1, entry_k2, entry_k3, entry_k4) =
-            signed_probit_neglog_derivatives_up_to_fourth(-entry_base.eta, -wi)?;
-        let (exit_k1, exit_k2, exit_k3, exit_k4) =
-            signed_probit_neglog_derivatives_up_to_fourth(-exit_base.eta, wi * (1.0 - di))?;
-
-        let entry_u1 = -entry_k1;
-        let entry_u2 = entry_k2;
-        let entry_u3 = -entry_k3;
-        let exit_u1 = -exit_k1;
-        let exit_u2 = exit_k2;
-        let exit_u3 = -exit_k3;
-
-        let entry_eta_d1 = entry_base.eta_u.dot(dir1);
-        let entry_eta_d2 = entry_base.eta_u.dot(dir2);
-        let exit_eta_d1 = exit_base.eta_u.dot(dir1);
-        let exit_eta_d2 = exit_base.eta_u.dot(dir2);
-        let exit_chi_d1 = exit_base.chi_u.dot(dir1);
-        let exit_chi_d2 = exit_base.chi_u.dot(dir2);
-        let exit_d_d1 = exit_base.d_u.dot(dir1);
-        let exit_d_d2 = exit_base.d_u.dot(dir2);
-        let qd1_d1 = dir1[primary.qd1];
-        let qd1_d2 = dir2[primary.qd1];
-
-        let entry_eta_u_d1 = entry_base.eta_uv.dot(dir1);
-        let entry_eta_u_d2 = entry_base.eta_uv.dot(dir2);
-        let exit_eta_u_d1 = exit_base.eta_uv.dot(dir1);
-        let exit_eta_u_d2 = exit_base.eta_uv.dot(dir2);
-        let exit_chi_u_d1 = exit_base.chi_uv.dot(dir1);
-        let exit_chi_u_d2 = exit_base.chi_uv.dot(dir2);
-        let exit_d_u_d2 = exit_base.d_uv.dot(dir2);
-
-        let entry_eta_d12 = entry_eta_u_d2.dot(dir1);
-        let exit_eta_d12 = exit_eta_u_d2.dot(dir1);
-        let exit_chi_d12 = exit_chi_u_d2.dot(dir1);
-        let exit_d_d12 = exit_d_u_d2.dot(dir1);
-
-        let entry_eta_u_d12: Array1<f64> = (0..p)
-            .map(|u| entry_ext2.eta_uv_dir.row(u).dot(dir1))
-            .collect::<Vec<_>>()
-            .into();
-        let exit_eta_u_d12: Array1<f64> = (0..p)
-            .map(|u| exit_ext2.eta_uv_dir.row(u).dot(dir1))
-            .collect::<Vec<_>>()
-            .into();
-        let exit_chi_u_d12: Array1<f64> = (0..p)
-            .map(|u| exit_ext2.chi_uv_dir.row(u).dot(dir1))
-            .collect::<Vec<_>>()
-            .into();
-        let exit_d_u_d12: Array1<f64> = (0..p)
-            .map(|u| exit_ext2.d_uv_dir.row(u).dot(dir1))
-            .collect::<Vec<_>>()
-            .into();
-
-        // Mixed second-directional D_{d1} D_{d2} η_uv etc. computed by the
-        // caller and passed via entry_bi / exit_bi (BiDirectionalExact).
-        let entry_eta_uv_d12 = &entry_bi.eta_uv_uv;
-        let exit_eta_uv_d12 = &exit_bi.eta_uv_uv;
-
-        let chi = exit_base.chi;
-        let chi_inv = 1.0 / chi;
-        let chi_inv2 = chi_inv * chi_inv;
-        let chi_inv3 = chi_inv2 * chi_inv;
-        let chi_inv4 = chi_inv3 * chi_inv;
-        let d_val = exit_base.d;
-        let d_inv = 1.0 / d_val;
-        let d_inv2 = d_inv * d_inv;
-        let d_inv3 = d_inv2 * d_inv;
-        let d_inv4 = d_inv3 * d_inv;
-
-        let mut out = Array2::<f64>::zeros((p, p));
-        for u in 0..p {
-            for v in u..p {
-                let mut val = 0.0;
-
-                // Entry probit
-                let eu = &entry_base.eta_u;
-                let euv = &entry_base.eta_uv;
-
-                let a_term = eu[u] * eu[v] * entry_eta_d1;
-                let a_term_d2 = entry_eta_u_d2[u] * eu[v] * entry_eta_d1
-                    + eu[u] * entry_eta_u_d2[v] * entry_eta_d1
-                    + eu[u] * eu[v] * entry_eta_d12;
-                let b_term = entry_ext1.eta_uv_dir[[u, v]];
-                let b_term_d2 = entry_eta_uv_d12[[u, v]];
-                let c_term = entry_eta_u_d1[u] * eu[v]
-                    + eu[u] * entry_eta_u_d1[v]
-                    + entry_eta_d1 * euv[[u, v]];
-                let c_term_d2 = entry_eta_u_d12[u] * eu[v]
-                    + entry_eta_u_d1[u] * entry_eta_u_d2[v]
-                    + entry_eta_u_d2[u] * entry_eta_u_d1[v]
-                    + eu[u] * entry_eta_u_d12[v]
-                    + entry_eta_d12 * euv[[u, v]]
-                    + entry_eta_d1 * entry_ext2.eta_uv_dir[[u, v]];
-
-                val += entry_k4 * entry_eta_d2 * a_term
-                    + entry_u3 * a_term_d2
-                    + entry_u3 * entry_eta_d2 * c_term
-                    + entry_u2 * c_term_d2
-                    + entry_u2 * entry_eta_d2 * b_term
-                    + entry_u1 * b_term_d2;
-
-                // Exit probit
-                let xu = &exit_base.eta_u;
-                let xuv = &exit_base.eta_uv;
-
-                let xa = xu[u] * xu[v] * exit_eta_d1;
-                let xa_d2 = exit_eta_u_d2[u] * xu[v] * exit_eta_d1
-                    + xu[u] * exit_eta_u_d2[v] * exit_eta_d1
-                    + xu[u] * xu[v] * exit_eta_d12;
-                let xb = exit_ext1.eta_uv_dir[[u, v]];
-                let xb_d2 = exit_eta_uv_d12[[u, v]];
-                let xc =
-                    exit_eta_u_d1[u] * xu[v] + xu[u] * exit_eta_u_d1[v] + exit_eta_d1 * xuv[[u, v]];
-                let xc_d2 = exit_eta_u_d12[u] * xu[v]
-                    + exit_eta_u_d1[u] * exit_eta_u_d2[v]
-                    + exit_eta_u_d2[u] * exit_eta_u_d1[v]
-                    + xu[u] * exit_eta_u_d12[v]
-                    + exit_eta_d12 * xuv[[u, v]]
-                    + exit_eta_d1 * exit_ext2.eta_uv_dir[[u, v]];
-
-                val += exit_k4 * exit_eta_d2 * xa
-                    + exit_u3 * xa_d2
-                    + exit_u3 * exit_eta_d2 * xc
-                    + exit_u2 * xc_d2
-                    + exit_u2 * exit_eta_d2 * xb
-                    + exit_u1 * xb_d2;
-
-                // Event density
-                val += wi
-                    * di
-                    * (exit_eta_u_d12[u] * xu[v]
-                        + exit_eta_u_d1[u] * exit_eta_u_d2[v]
-                        + exit_eta_u_d2[u] * exit_eta_u_d1[v]
-                        + xu[u] * exit_eta_u_d12[v]
-                        + exit_eta_d12 * xuv[[u, v]]
-                        + exit_eta_d1 * exit_ext2.eta_uv_dir[[u, v]]
-                        + exit_eta_d2 * exit_ext1.eta_uv_dir[[u, v]]
-                        + exit_base.eta * exit_eta_uv_d12[[u, v]]);
-
-                // Event chi
-                let chi_uv_val = exit_base.chi_uv[[u, v]];
-                let chi_u_val = exit_base.chi_u[u];
-                let chi_v_val = exit_base.chi_u[v];
-                let chi_uv_d1 = exit_ext1.chi_uv_dir[[u, v]];
-                let chi_uv_d2 = exit_ext2.chi_uv_dir[[u, v]];
-                let chi_u_d1 = exit_chi_u_d1[u];
-                let chi_v_d1 = exit_chi_u_d1[v];
-                let chi_u_d2 = exit_chi_u_d2[u];
-                let chi_v_d2 = exit_chi_u_d2[v];
-                let chi_u_d12v = exit_chi_u_d12[u];
-                let chi_v_d12v = exit_chi_u_d12[v];
-
-                let chi_uv_d12_val = exit_bi.chi_uv_uv[[u, v]];
-                let d2_r_chi = chi_uv_d12_val * chi_inv
-                    - chi_uv_d1 * exit_chi_d2 * chi_inv2
-                    - chi_uv_d2 * exit_chi_d1 * chi_inv2
-                    - chi_uv_val * exit_chi_d12 * chi_inv2
-                    + 2.0 * chi_uv_val * exit_chi_d1 * exit_chi_d2 * chi_inv3;
-
-                let d2_s_chi = (chi_u_d12v * chi_v_val
-                    + chi_u_d1 * chi_v_d2
-                    + chi_u_d2 * chi_v_d1
-                    + chi_u_val * chi_v_d12v)
-                    * chi_inv2
-                    - 2.0 * (chi_u_d1 * chi_v_val + chi_u_val * chi_v_d1) * exit_chi_d2 * chi_inv3
-                    - 2.0 * (chi_u_d2 * chi_v_val + chi_u_val * chi_v_d2) * exit_chi_d1 * chi_inv3
-                    - 2.0 * chi_u_val * chi_v_val * exit_chi_d12 * chi_inv3
-                    + 6.0 * chi_u_val * chi_v_val * exit_chi_d1 * exit_chi_d2 * chi_inv4;
-                val -= wi * di * (d2_r_chi - d2_s_chi);
-
-                // Event D
-                let d_uv_val = exit_base.d_uv[[u, v]];
-                let d_u_val = exit_base.d_u[u];
-                let d_v_val = exit_base.d_u[v];
-                let d_uv_d1 = exit_ext1.d_uv_dir[[u, v]];
-                let d_uv_d2 = exit_ext2.d_uv_dir[[u, v]];
-                let d_u_d1 = exit_ext1.d_u_dir[u];
-                let d_v_d1 = exit_ext1.d_u_dir[v];
-                let d_u_d2 = exit_ext2.d_u_dir[u];
-                let d_v_d2 = exit_ext2.d_u_dir[v];
-                let d_u_d12v = exit_d_u_d12[u];
-                let d_v_d12v = exit_d_u_d12[v];
-
-                let d_uv_d12_val = exit_bi.d_uv_uv[[u, v]];
-                let d2_r_d = d_uv_d12_val * d_inv
-                    - d_uv_d1 * exit_d_d2 * d_inv2
-                    - d_uv_d2 * exit_d_d1 * d_inv2
-                    - d_uv_val * exit_d_d12 * d_inv2
-                    + 2.0 * d_uv_val * exit_d_d1 * exit_d_d2 * d_inv3;
-
-                let d2_s_d =
-                    (d_u_d12v * d_v_val + d_u_d1 * d_v_d2 + d_u_d2 * d_v_d1 + d_u_val * d_v_d12v)
-                        * d_inv2
-                        - 2.0 * (d_u_d1 * d_v_val + d_u_val * d_v_d1) * exit_d_d2 * d_inv3
-                        - 2.0 * (d_u_d2 * d_v_val + d_u_val * d_v_d2) * exit_d_d1 * d_inv3
-                        - 2.0 * d_u_val * d_v_val * exit_d_d12 * d_inv3
-                        + 6.0 * d_u_val * d_v_val * exit_d_d1 * exit_d_d2 * d_inv4;
                 val += wi * di * (d2_r_d - d2_s_d);
 
                 // qd1 term

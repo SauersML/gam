@@ -3921,4 +3921,152 @@ mod tests {
             .expect("softmax K=2 must complete second joint-fit step");
         assert!(loss1.total().is_finite());
     }
+
+    /// End-to-end Isometry wiring oracle.
+    ///
+    /// Build a SAE atom around an evaluator whose `second_jet` is now
+    /// implemented (periodic / sphere / torus), construct an
+    /// [`IsometryPenalty`] with matching `latent_dim` and `p_out`, refresh
+    /// the caches via [`refresh_isometry_caches_from_atom`], and check that
+    ///
+    ///   * `IsometryPenalty.value(target, rho)` is strictly positive (the
+    ///     decoder we feed in is not orthonormal so the pullback metric is
+    ///     not the identity, and the Euclidean reference picks up the gap).
+    ///   * `IsometryPenalty.grad_target(target, rho)` is non-zero on at
+    ///     least one latent-coordinate component.
+    ///   * The analytic gradient matches a finite-difference oracle of
+    ///     `value()` w.r.t. `target` (a single coord), where each FD probe
+    ///     drives a fresh cache refresh — this is exactly the chain of
+    ///     calls the SAE outer loop will make.
+    ///
+    /// The FD oracle re-uses the existing [`refresh_isometry_caches_from_atom`]
+    /// helper for both the analytic side and the FD side, so any layout
+    /// mismatch between `J`/`H` would show up as a tolerance failure rather
+    /// than a silently zero gradient.
+    fn assert_isometry_wiring_matches_fd(
+        evaluator: Arc<dyn SaeBasisEvaluator>,
+        coords: Array2<f64>,
+    ) {
+        let n_obs = coords.nrows();
+        let latent_dim = coords.ncols();
+        let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
+        let m = phi.ncols();
+        let p: usize = 3;
+        // A deterministic non-orthonormal decoder: deterministic LCG-ish
+        // floats keep the test reproducible without needing rand.
+        let mut decoder = Array2::<f64>::zeros((m, p));
+        for i in 0..m {
+            for j in 0..p {
+                let x = (i as f64) * 0.371 + (j as f64) * 0.193 + 0.5;
+                decoder[[i, j]] = (x.sin() * 0.9) + 0.1 * ((i + j) as f64).cos();
+            }
+        }
+        let smooth = Array2::<f64>::eye(m);
+        let atom = SaeManifoldAtom::new(
+            "iso_wire_test",
+            SaeAtomBasisKind::Periodic,
+            latent_dim,
+            phi.clone(),
+            jet.clone(),
+            decoder.clone(),
+            smooth,
+        )
+        .unwrap()
+        .with_basis_evaluator(evaluator);
+
+        let target_slice = PsiSlice::full(n_obs * latent_dim, Some(latent_dim));
+        let penalty = IsometryPenalty::new_euclidean(target_slice, p);
+        let rho = Array1::<f64>::zeros(1);
+
+        // Without a refresh, the safe default is zero and the gradient is
+        // all zeros. Confirm the precondition so the post-refresh contrast
+        // is meaningful.
+        let target_flat: Array1<f64> = coords.iter().copied().collect();
+        let v0 = penalty.value(target_flat.view(), rho.view());
+        assert_eq!(v0, IsometryPenalty::DEFAULT_VALUE_ON_MISSING_CACHE);
+        let g0 = penalty.grad_target(target_flat.view(), rho.view());
+        assert!(
+            g0.iter().all(|x| *x == 0.0),
+            "grad_target without cache must be all zeros, got {g0:?}"
+        );
+
+        // Refresh and re-evaluate.
+        let installed_second =
+            refresh_isometry_caches_from_atom(&penalty, &atom, coords.view()).unwrap();
+        assert!(
+            installed_second,
+            "evaluator must implement second_jet for this oracle to run"
+        );
+
+        let value = penalty.value(target_flat.view(), rho.view());
+        assert!(
+            value > 1.0e-6,
+            "expected non-trivial isometry loss after cache refresh, got {value}"
+        );
+        let grad = penalty.grad_target(target_flat.view(), rho.view());
+        assert_eq!(grad.len(), target_flat.len());
+        let max_abs = grad.iter().fold(0.0_f64, |acc, x| acc.max(x.abs()));
+        assert!(
+            max_abs > 1.0e-6,
+            "expected non-zero isometry gradient on at least one component, max |grad|={max_abs}"
+        );
+
+        // FD check: bump one coord, refresh, compare value(t±h e_j) against
+        // analytic grad[j]. Pick coord (row 0, axis 0).
+        let h_fd = 1.0e-5;
+        let probe_idx = 0usize; // (row=0, axis=0) flattens to 0.
+        let mut coords_plus = coords.clone();
+        coords_plus[[0, 0]] += h_fd;
+        let mut coords_minus = coords.clone();
+        coords_minus[[0, 0]] -= h_fd;
+
+        refresh_isometry_caches_from_atom(&penalty, &atom, coords_plus.view()).unwrap();
+        let target_plus: Array1<f64> = coords_plus.iter().copied().collect();
+        let v_plus = penalty.value(target_plus.view(), rho.view());
+
+        refresh_isometry_caches_from_atom(&penalty, &atom, coords_minus.view()).unwrap();
+        let target_minus: Array1<f64> = coords_minus.iter().copied().collect();
+        let v_minus = penalty.value(target_minus.view(), rho.view());
+
+        // Reinstall the base caches before reading grad at the base point.
+        refresh_isometry_caches_from_atom(&penalty, &atom, coords.view()).unwrap();
+        let grad_base = penalty.grad_target(target_flat.view(), rho.view());
+
+        let fd = (v_plus - v_minus) / (2.0 * h_fd);
+        let analytic = grad_base[probe_idx];
+        // Both `value` and `grad_target` use the cached `J` (and `grad_target`
+        // also the cached `H`). With finite differencing the cache itself,
+        // the analytic-vs-FD agreement bounds the entire pipeline (J build,
+        // H build, accessor read, pullback metric, gradient assembly) to
+        // O(h²) error. Tolerance 1e-3 leaves headroom for the per-evaluator
+        // characteristic magnitude.
+        assert!(
+            (analytic - fd).abs() <= 1.0e-3 + 1.0e-4 * analytic.abs().max(fd.abs()),
+            "isometry grad/FD mismatch at coord 0: analytic={analytic:.6e}, fd={fd:.6e}"
+        );
+    }
+
+    #[test]
+    fn isometry_wiring_periodic_matches_fd() {
+        assert_isometry_wiring_matches_fd(
+            Arc::new(PeriodicHarmonicEvaluator::new(5).unwrap()),
+            array![[0.12], [0.37], [0.58], [0.81]],
+        );
+    }
+
+    #[test]
+    fn isometry_wiring_sphere_matches_fd() {
+        assert_isometry_wiring_matches_fd(
+            Arc::new(SphereChartEvaluator),
+            array![[-0.5, 0.3], [0.2, -1.1], [0.7, 0.9]],
+        );
+    }
+
+    #[test]
+    fn isometry_wiring_torus_matches_fd() {
+        assert_isometry_wiring_matches_fd(
+            Arc::new(TorusHarmonicEvaluator::new(2, 2).unwrap()),
+            array![[0.13, 0.42], [0.66, 0.19], [0.88, 0.55]],
+        );
+    }
 }

@@ -31,6 +31,7 @@ pub mod runtime;
 pub mod solver;
 pub mod sphere;
 pub mod survival_flex;
+pub mod survival_flex_prep;
 
 pub use cpu_traits::{ExecutionTarget, MatrixLocation};
 pub use device::GpuDeviceInfo;
