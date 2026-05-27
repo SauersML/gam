@@ -808,6 +808,73 @@ pub fn build_raw_grams_structural(
     gram
 }
 
+/// Build the primary-state curvature Gram `K^H` and structural Gram `K^S`
+/// for a block decomposition, preferring the device (GPU) path when
+/// available and falling back to the CPU closed-form builders otherwise.
+///
+/// The GPU path is only attempted for survival-family geometry
+/// (`K = CHANNELS = 4`) — that is the case the GPU kernel
+/// ([`crate::gpu::identifiability_compile::try_primary_state_gram_cuda`])
+/// is specialised for via the packed-symmetric `n × 10` weight layout.
+/// For any other `K` the CPU builders are used unconditionally.
+///
+/// Returns `(gram_h, gram_struct)` with the same shape and semantics as
+/// [`build_raw_grams_from_channel_blocks`] + [`build_raw_grams_structural`].
+pub fn build_primary_grams_gpu_or_cpu(
+    channel_blocks: &PrimaryChannelBlocks,
+    row_hess: &dyn RowHessian,
+    raw_block_ranges: &[std::ops::Range<usize>],
+) -> Result<(Array2<f64>, Array2<f64>), CompilerError> {
+    let k = row_hess.k();
+    if k == crate::gpu::identifiability_compile::CHANNELS {
+        let gpu_blocks: Vec<Vec<Option<Array2<f64>>>> = channel_blocks
+            .blocks
+            .iter()
+            .map(|slots| slots.iter().cloned().collect())
+            .collect();
+        if let Some(h_packed) = pack_row_hessian_symmetric(row_hess) {
+            if let Some(bundle) =
+                crate::gpu::identifiability_compile::try_primary_state_gram_cuda(
+                    &gpu_blocks,
+                    &h_packed,
+                    raw_block_ranges,
+                )
+            {
+                log::info!("[identifiability_compile] gram path = gpu");
+                return Ok((bundle.gram_h, bundle.gram_struct));
+            }
+        }
+    }
+    log::info!("[identifiability_compile] gram path = cpu");
+    let gram_h = build_raw_grams_from_channel_blocks(channel_blocks, row_hess, raw_block_ranges)?;
+    let gram_struct = build_raw_grams_structural(channel_blocks, raw_block_ranges);
+    Ok((gram_h, gram_struct))
+}
+
+/// Pack a per-row symmetric `K = 4` Hessian into the `n × 10`
+/// upper-triangular row-major layout consumed by the GPU kernel
+/// (`packed_index(c, d)` for `c ≤ d`). Returns `None` when `K != 4`.
+fn pack_row_hessian_symmetric(row_hess: &dyn RowHessian) -> Option<Array2<f64>> {
+    use crate::gpu::identifiability_compile::{CHANNELS, PACKED_LEN, packed_index};
+    if row_hess.k() != CHANNELS {
+        return None;
+    }
+    let n = row_hess.nrows();
+    let h_full = row_hess.evaluate_full();
+    if h_full.shape() != [n, CHANNELS, CHANNELS] {
+        return None;
+    }
+    let mut packed = Array2::<f64>::zeros((n, PACKED_LEN));
+    for i in 0..n {
+        for c in 0..CHANNELS {
+            for d in c..CHANNELS {
+                packed[[i, packed_index(c, d)]] = h_full[[i, c, d]];
+            }
+        }
+    }
+    Some(packed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1637,5 +1704,77 @@ mod tests {
         assert_eq!(out.blocks[1].t_lw.ncols(), 2);
         assert_eq!(out.dropped.len(), 0);
         assert_eq!(out.joint_rank, 4);
+    }
+
+    /// Smoke test for the GPU-or-CPU dispatch helper. On non-CUDA hosts
+    /// (or when the runtime is unavailable) the helper falls back to the
+    /// CPU closed-form builders; the result must match the CPU builders
+    /// called directly. When a CUDA runtime is live, parity vs. CPU is
+    /// verified to tight tolerance.
+    #[test]
+    fn build_primary_grams_gpu_or_cpu_two_block_k4_matches_cpu() {
+        let n = 11;
+        let k = 4;
+        let p_a = 2;
+        let p_b = 3;
+
+        let make_block = |seed: f64, n: usize, p: usize| -> Vec<Option<Array2<f64>>> {
+            (0..4)
+                .map(|c| {
+                    let m = Array2::from_shape_fn((n, p), |(i, j)| {
+                        ((i as f64 + 1.0) * (j as f64 + 1.0) * (c as f64 + 1.0) + seed).sin()
+                    });
+                    Some(m)
+                })
+                .collect()
+        };
+        let block_a = make_block(0.7, n, p_a);
+        let block_b = make_block(-0.4, n, p_b);
+
+        let h = Array3::from_shape_fn((n, k, k), |(i, c, d)| {
+            let mut acc = 0.0;
+            for r in 0..k {
+                let mc = ((i + 1) as f64 * (c + 1) as f64 * (r + 1) as f64 * 0.11).cos();
+                let md = ((i + 1) as f64 * (d + 1) as f64 * (r + 1) as f64 * 0.11).cos();
+                acc += mc * md;
+            }
+            acc + if c == d { 0.25 } else { 0.0 }
+        });
+        let row_hess = DenseRowHessian { h: h.clone() };
+
+        let channel_blocks = PrimaryChannelBlocks {
+            blocks: vec![block_a, block_b],
+        };
+        let raw_ranges = vec![0..p_a, p_a..(p_a + p_b)];
+
+        let (gram_h, gram_struct) =
+            build_primary_grams_gpu_or_cpu(&channel_blocks, &row_hess, &raw_ranges)
+                .expect("dispatch helper should succeed");
+
+        let cpu_h = build_raw_grams_from_channel_blocks(&channel_blocks, &row_hess, &raw_ranges)
+            .expect("CPU curvature Gram should succeed");
+        let cpu_s = build_raw_grams_structural(&channel_blocks, &raw_ranges);
+
+        let tol = 1e-9_f64;
+        for idx in cpu_h.indexed_iter().map(|(i, _)| i) {
+            let diff = (gram_h[idx] - cpu_h[idx]).abs();
+            let scale = cpu_h[idx].abs().max(1.0);
+            assert!(
+                diff <= tol * scale,
+                "gram_h mismatch at {idx:?}: helper={} cpu={}",
+                gram_h[idx],
+                cpu_h[idx]
+            );
+        }
+        for idx in cpu_s.indexed_iter().map(|(i, _)| i) {
+            let diff = (gram_struct[idx] - cpu_s[idx]).abs();
+            let scale = cpu_s[idx].abs().max(1.0);
+            assert!(
+                diff <= tol * scale,
+                "gram_struct mismatch at {idx:?}: helper={} cpu={}",
+                gram_struct[idx],
+                cpu_s[idx]
+            );
+        }
     }
 }

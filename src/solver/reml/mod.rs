@@ -2620,22 +2620,27 @@ trait DerivativeStorageBackend {
         qs: &Array2<f64>,
         free_basis_opt: Option<&Array2<f64>>,
     ) -> Result<Array2<f64>, EstimationError>;
-    /// Returns `Some(_)` when the backend has a faster matvec path through
-    /// the transformed product than materialising it via `design_transformed`
-    /// then `.dot(u)`. Dense / Embedded backends return `None`; Implicit and
-    /// LatentCoord return their direct operator path.
-    fn design_transformed_forward_mul_fast(
+    /// Default materialises through `design_transformed` then `.dot(u)`;
+    /// implicit/latent-coordinate backends override with a direct-operator
+    /// path that skips the dense materialisation.
+    fn design_transformed_forward_mul(
         &self,
         qs: &Array2<f64>,
         free_basis_opt: Option<&Array2<f64>>,
         u: &Array1<f64>,
-    ) -> Option<Array1<f64>>;
-    fn design_transformed_transpose_mul_fast(
+    ) -> Result<Array1<f64>, EstimationError> {
+        Ok(self.design_transformed(qs, free_basis_opt)?.dot(u))
+    }
+    /// Default materialises through `design_transformed` then `.t().dot(v)`;
+    /// implicit/latent-coordinate backends override with a direct path.
+    fn design_transformed_transpose_mul(
         &self,
         qs: &Array2<f64>,
         free_basis_opt: Option<&Array2<f64>>,
         v: &Array1<f64>,
-    ) -> Option<Array1<f64>>;
+    ) -> Result<Array1<f64>, EstimationError> {
+        Ok(self.design_transformed(qs, free_basis_opt)?.t().dot(v))
+    }
     fn penalty_transformed(
         &self,
         qs: &Array2<f64>,
@@ -2843,25 +2848,450 @@ impl EmbeddedDerivativeMatrix {
     }
 }
 
+impl DerivativeStorageBackend for Array2<f64> {
+    fn resident_byte_count(&self) -> usize {
+        self.len().saturating_mul(std::mem::size_of::<f64>())
+    }
+    fn design_nrows(&self) -> usize { Array2::nrows(self) }
+    fn design_ncols(&self) -> usize { Array2::ncols(self) }
+    fn penalty_dim(&self) -> usize { Array2::nrows(self) }
+    fn uses_implicit_storage(&self) -> bool { false }
+    fn any_nonzero(&self) -> bool { self.iter().any(|v| *v != 0.0) }
+    fn materialize(&self) -> Array2<f64> { self.clone() }
+    fn implicit_first_axis_info(
+        &self,
+    ) -> Option<(
+        std::sync::Arc<crate::terms::basis::ImplicitDesignPsiDerivative>,
+        usize,
+    )> { None }
+    fn implicit_axis_count_hint(&self) -> Option<usize> { None }
+
+    fn design_forward_mul_original(
+        &self,
+        u: &Array1<f64>,
+    ) -> Result<Array1<f64>, EstimationError> {
+        if Array2::ncols(self) != u.len() {
+            return Err(EstimationError::InvalidInput(format!(
+                "dense hyper design derivative forward_mul_original width mismatch: matrix={}x{}, vector={}",
+                Array2::nrows(self),
+                Array2::ncols(self),
+                u.len()
+            )));
+        }
+        Ok(self.dot(u))
+    }
+
+    fn design_transpose_mul_original(
+        &self,
+        v: &Array1<f64>,
+    ) -> Result<Array1<f64>, EstimationError> {
+        if Array2::nrows(self) != v.len() {
+            return Err(EstimationError::InvalidInput(format!(
+                "dense hyper design derivative transpose_mul_original height mismatch: matrix={}x{}, vector={}",
+                Array2::nrows(self),
+                Array2::ncols(self),
+                v.len()
+            )));
+        }
+        Ok(self.t().dot(v))
+    }
+
+    fn design_transformed(
+        &self,
+        qs: &Array2<f64>,
+        free_basis_opt: Option<&Array2<f64>>,
+    ) -> Result<Array2<f64>, EstimationError> {
+        Ok(crate::matrix::DenseRightProductView::new(self)
+            .with_factor(qs)
+            .with_optional_factor(free_basis_opt)
+            .materialize())
+    }
+
+    fn penalty_transformed(
+        &self,
+        qs: &Array2<f64>,
+        free_basis_opt: Option<&Array2<f64>>,
+    ) -> Result<Array2<f64>, EstimationError> {
+        let mut transformed = qs.t().dot(self).dot(qs);
+        if let Some(z) = free_basis_opt {
+            transformed = z.t().dot(&transformed).dot(z);
+        }
+        Ok(transformed)
+    }
+
+    fn penalty_scaled_add_to(
+        &self,
+        target: &mut Array2<f64>,
+        amp: f64,
+    ) -> Result<(), EstimationError> {
+        if target.raw_dim() != self.raw_dim() {
+            return Err(EstimationError::InvalidInput(format!(
+                "dense hyper penalty derivative shape mismatch: target={}x{}, matrix={}x{}",
+                target.nrows(),
+                target.ncols(),
+                Array2::nrows(self),
+                Array2::ncols(self)
+            )));
+        }
+        target.scaled_add(amp, self);
+        Ok(())
+    }
+}
+
+impl DerivativeStorageBackend for EmbeddedDerivativeMatrix {
+    fn resident_byte_count(&self) -> usize {
+        self.local.len().saturating_mul(std::mem::size_of::<f64>())
+    }
+    fn design_nrows(&self) -> usize { self.local.nrows() }
+    fn design_ncols(&self) -> usize { self.total_dim }
+    fn penalty_dim(&self) -> usize { self.total_dim }
+    fn uses_implicit_storage(&self) -> bool { false }
+    fn any_nonzero(&self) -> bool { self.local.iter().any(|v| *v != 0.0) }
+    fn materialize(&self) -> Array2<f64> {
+        let mut dense = Array2::<f64>::zeros((self.local.nrows(), self.total_dim));
+        dense
+            .slice_mut(s![.., self.global_range.clone()])
+            .assign(&self.local);
+        dense
+    }
+    fn implicit_first_axis_info(
+        &self,
+    ) -> Option<(
+        std::sync::Arc<crate::terms::basis::ImplicitDesignPsiDerivative>,
+        usize,
+    )> { None }
+    fn implicit_axis_count_hint(&self) -> Option<usize> { None }
+
+    fn design_forward_mul_original(
+        &self,
+        u: &Array1<f64>,
+    ) -> Result<Array1<f64>, EstimationError> {
+        if self.total_dim != u.len() {
+            return Err(EstimationError::InvalidInput(format!(
+                "embedded hyper design derivative forward_mul_original width mismatch: total_dim={}, vector={}",
+                self.total_dim,
+                u.len()
+            )));
+        }
+        let u_local = u.slice(s![self.global_range.clone()]).to_owned();
+        Ok(self.local.dot(&u_local))
+    }
+
+    fn design_transpose_mul_original(
+        &self,
+        v: &Array1<f64>,
+    ) -> Result<Array1<f64>, EstimationError> {
+        if self.local.nrows() != v.len() {
+            return Err(EstimationError::InvalidInput(format!(
+                "embedded hyper design derivative transpose_mul_original height mismatch: local_rows={}, vector={}",
+                self.local.nrows(),
+                v.len()
+            )));
+        }
+        let mut out = Array1::<f64>::zeros(self.total_dim);
+        let pulled = self.local.t().dot(v);
+        out.slice_mut(s![self.global_range.clone()]).assign(&pulled);
+        Ok(out)
+    }
+
+    fn design_transformed(
+        &self,
+        qs: &Array2<f64>,
+        free_basis_opt: Option<&Array2<f64>>,
+    ) -> Result<Array2<f64>, EstimationError> {
+        if self.total_dim != qs.nrows() {
+            return Err(EstimationError::InvalidInput(format!(
+                "embedded design derivative width mismatch: total_cols={}, qs rows={}",
+                self.total_dim,
+                qs.nrows()
+            )));
+        }
+        let qs_local = qs.slice(s![self.global_range.clone(), ..]);
+        let mut transformed = self.local.dot(&qs_local);
+        if let Some(z) = free_basis_opt {
+            transformed = transformed.dot(z);
+        }
+        Ok(transformed)
+    }
+
+    fn penalty_transformed(
+        &self,
+        qs: &Array2<f64>,
+        free_basis_opt: Option<&Array2<f64>>,
+    ) -> Result<Array2<f64>, EstimationError> {
+        if self.total_dim != qs.nrows() {
+            return Err(EstimationError::InvalidInput(format!(
+                "embedded penalty derivative width mismatch: total_dim={}, qs rows={}",
+                self.total_dim,
+                qs.nrows()
+            )));
+        }
+        let qs_local = qs.slice(s![self.global_range.clone(), ..]);
+        let mut transformed = qs_local.t().dot(&self.local).dot(&qs_local);
+        if let Some(z) = free_basis_opt {
+            transformed = z.t().dot(&transformed).dot(z);
+        }
+        Ok(transformed)
+    }
+
+    fn penalty_scaled_add_to(
+        &self,
+        target: &mut Array2<f64>,
+        amp: f64,
+    ) -> Result<(), EstimationError> {
+        if target.nrows() != self.total_dim || target.ncols() != self.total_dim {
+            return Err(EstimationError::InvalidInput(format!(
+                "embedded hyper penalty derivative shape mismatch: target={}x{}, expected {}x{}",
+                target.nrows(),
+                target.ncols(),
+                self.total_dim,
+                self.total_dim
+            )));
+        }
+        target
+            .slice_mut(s![self.global_range.clone(), self.global_range.clone()])
+            .scaled_add(amp, &self.local);
+        Ok(())
+    }
+}
+
+impl DerivativeStorageBackend for ImplicitDerivativeOp {
+    fn resident_byte_count(&self) -> usize { 0 }
+    fn design_nrows(&self) -> usize { self.nrows() }
+    fn design_ncols(&self) -> usize { self.ncols() }
+    fn penalty_dim(&self) -> usize { self.nrows() }
+    fn uses_implicit_storage(&self) -> bool { true }
+    fn any_nonzero(&self) -> bool { true }
+    fn materialize(&self) -> Array2<f64> { self.materialize_dense().clone() }
+    fn implicit_first_axis_info(
+        &self,
+    ) -> Option<(
+        std::sync::Arc<crate::terms::basis::ImplicitDesignPsiDerivative>,
+        usize,
+    )> {
+        match self.level {
+            ImplicitDerivLevel::First(axis) => Some((self.operator.clone(), axis)),
+            _ => None,
+        }
+    }
+    fn implicit_axis_count_hint(&self) -> Option<usize> { Some(self.operator.n_axes()) }
+
+    fn design_forward_mul_original(
+        &self,
+        u: &Array1<f64>,
+    ) -> Result<Array1<f64>, EstimationError> {
+        if self.ncols() != u.len() {
+            return Err(EstimationError::InvalidInput(format!(
+                "implicit hyper design derivative forward_mul_original width mismatch: operator_cols={}, vector={}",
+                self.ncols(),
+                u.len()
+            )));
+        }
+        Ok(self.forward_mul(u))
+    }
+
+    fn design_transpose_mul_original(
+        &self,
+        v: &Array1<f64>,
+    ) -> Result<Array1<f64>, EstimationError> {
+        if self.nrows() != v.len() {
+            return Err(EstimationError::InvalidInput(format!(
+                "implicit hyper design derivative transpose_mul_original height mismatch: operator_rows={}, vector={}",
+                self.nrows(),
+                v.len()
+            )));
+        }
+        Ok(self.transpose_mul(v))
+    }
+
+    fn design_transformed(
+        &self,
+        qs: &Array2<f64>,
+        free_basis_opt: Option<&Array2<f64>>,
+    ) -> Result<Array2<f64>, EstimationError> {
+        let dense = self.materialize_dense();
+        Ok(crate::matrix::DenseRightProductView::new(dense)
+            .with_factor(qs)
+            .with_optional_factor(free_basis_opt)
+            .materialize())
+    }
+
+    fn design_transformed_forward_mul(
+        &self,
+        qs: &Array2<f64>,
+        free_basis_opt: Option<&Array2<f64>>,
+        u: &Array1<f64>,
+    ) -> Result<Array1<f64>, EstimationError> {
+        let mut right = if let Some(z) = free_basis_opt { z.dot(u) } else { u.clone() };
+        right = qs.dot(&right);
+        Ok(self.forward_mul(&right))
+    }
+
+    fn design_transformed_transpose_mul(
+        &self,
+        qs: &Array2<f64>,
+        free_basis_opt: Option<&Array2<f64>>,
+        v: &Array1<f64>,
+    ) -> Result<Array1<f64>, EstimationError> {
+        let mut pulled = qs.t().dot(&self.transpose_mul(v));
+        if let Some(z) = free_basis_opt {
+            pulled = z.t().dot(&pulled);
+        }
+        Ok(pulled)
+    }
+
+    fn penalty_transformed(
+        &self,
+        qs: &Array2<f64>,
+        free_basis_opt: Option<&Array2<f64>>,
+    ) -> Result<Array2<f64>, EstimationError> {
+        let dense = self.materialize_dense();
+        let mut transformed = qs.t().dot(dense).dot(qs);
+        if let Some(z) = free_basis_opt {
+            transformed = z.t().dot(&transformed).dot(z);
+        }
+        Ok(transformed)
+    }
+
+    fn penalty_scaled_add_to(
+        &self,
+        target: &mut Array2<f64>,
+        amp: f64,
+    ) -> Result<(), EstimationError> {
+        let dense = self.materialize_dense();
+        if target.raw_dim() != dense.raw_dim() {
+            return Err(EstimationError::InvalidInput(format!(
+                "implicit hyper penalty derivative shape mismatch: target={}x{}, matrix={}x{}",
+                target.nrows(),
+                target.ncols(),
+                dense.nrows(),
+                dense.ncols()
+            )));
+        }
+        target.scaled_add(amp, dense);
+        Ok(())
+    }
+}
+
+impl DerivativeStorageBackend for LatentCoordDerivativeOp {
+    fn resident_byte_count(&self) -> usize { 0 }
+    fn design_nrows(&self) -> usize { self.nrows() }
+    fn design_ncols(&self) -> usize { self.ncols() }
+    fn penalty_dim(&self) -> usize { self.nrows() }
+    fn uses_implicit_storage(&self) -> bool { true }
+    fn any_nonzero(&self) -> bool { true }
+    fn materialize(&self) -> Array2<f64> { self.materialize_dense().clone() }
+    fn implicit_first_axis_info(
+        &self,
+    ) -> Option<(
+        std::sync::Arc<crate::terms::basis::ImplicitDesignPsiDerivative>,
+        usize,
+    )> { None }
+    fn implicit_axis_count_hint(&self) -> Option<usize> { Some(self.operator.n_axes()) }
+
+    fn design_forward_mul_original(
+        &self,
+        u: &Array1<f64>,
+    ) -> Result<Array1<f64>, EstimationError> {
+        if self.ncols() != u.len() {
+            return Err(EstimationError::InvalidInput(format!(
+                "latent-coordinate hyper design derivative forward_mul_original width mismatch: operator_cols={}, vector={}",
+                self.ncols(),
+                u.len()
+            )));
+        }
+        Ok(self.forward_mul(u))
+    }
+
+    fn design_transpose_mul_original(
+        &self,
+        v: &Array1<f64>,
+    ) -> Result<Array1<f64>, EstimationError> {
+        if self.nrows() != v.len() {
+            return Err(EstimationError::InvalidInput(format!(
+                "latent-coordinate hyper design derivative transpose_mul_original height mismatch: operator_rows={}, vector={}",
+                self.nrows(),
+                v.len()
+            )));
+        }
+        Ok(self.transpose_mul(v))
+    }
+
+    fn design_transformed(
+        &self,
+        qs: &Array2<f64>,
+        free_basis_opt: Option<&Array2<f64>>,
+    ) -> Result<Array2<f64>, EstimationError> {
+        let dense = self.materialize_dense();
+        Ok(crate::matrix::DenseRightProductView::new(dense)
+            .with_factor(qs)
+            .with_optional_factor(free_basis_opt)
+            .materialize())
+    }
+
+    fn design_transformed_forward_mul(
+        &self,
+        qs: &Array2<f64>,
+        free_basis_opt: Option<&Array2<f64>>,
+        u: &Array1<f64>,
+    ) -> Result<Array1<f64>, EstimationError> {
+        let mut right = if let Some(z) = free_basis_opt { z.dot(u) } else { u.clone() };
+        right = qs.dot(&right);
+        Ok(self.forward_mul(&right))
+    }
+
+    fn design_transformed_transpose_mul(
+        &self,
+        qs: &Array2<f64>,
+        free_basis_opt: Option<&Array2<f64>>,
+        v: &Array1<f64>,
+    ) -> Result<Array1<f64>, EstimationError> {
+        let mut pulled = qs.t().dot(&self.transpose_mul(v));
+        if let Some(z) = free_basis_opt {
+            pulled = z.t().dot(&pulled);
+        }
+        Ok(pulled)
+    }
+
+    fn penalty_transformed(
+        &self,
+        qs: &Array2<f64>,
+        free_basis_opt: Option<&Array2<f64>>,
+    ) -> Result<Array2<f64>, EstimationError> {
+        let dense = self.materialize_dense();
+        let mut transformed = qs.t().dot(dense).dot(qs);
+        if let Some(z) = free_basis_opt {
+            transformed = z.t().dot(&transformed).dot(z);
+        }
+        Ok(transformed)
+    }
+
+    fn penalty_scaled_add_to(
+        &self,
+        target: &mut Array2<f64>,
+        amp: f64,
+    ) -> Result<(), EstimationError> {
+        let dense = self.materialize_dense();
+        if target.raw_dim() != dense.raw_dim() {
+            return Err(EstimationError::InvalidInput(format!(
+                "latent-coordinate hyper penalty derivative shape mismatch: target={}x{}, matrix={}x{}",
+                target.nrows(),
+                target.ncols(),
+                dense.nrows(),
+                dense.ncols()
+            )));
+        }
+        target.scaled_add(amp, dense);
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct HyperDesignDerivative {
     storage: DerivativeMatrixStorage,
 }
 
 impl HyperDesignDerivative {
-    pub(crate) fn resident_byte_count(&self) -> usize {
-        match &self.storage {
-            DerivativeMatrixStorage::Dense(dense) => {
-                dense.len().saturating_mul(std::mem::size_of::<f64>())
-            }
-            DerivativeMatrixStorage::Embedded(embedded) => embedded
-                .local
-                .len()
-                .saturating_mul(std::mem::size_of::<f64>()),
-            DerivativeMatrixStorage::Implicit(_) | DerivativeMatrixStorage::LatentCoord(_) => 0,
-        }
-    }
-
     pub(crate) fn from_embedded(
         local: Array2<f64>,
         global_range: Range<usize>,
@@ -2910,156 +3340,42 @@ impl HyperDesignDerivative {
         }
     }
 
+    pub(crate) fn resident_byte_count(&self) -> usize {
+        storage_dispatch!(&self.storage, b => b.resident_byte_count())
+    }
+
     pub(crate) fn nrows(&self) -> usize {
-        match &self.storage {
-            DerivativeMatrixStorage::Dense(dense) => dense.nrows(),
-            DerivativeMatrixStorage::Embedded(embedded) => embedded.local.nrows(),
-            DerivativeMatrixStorage::Implicit(op) => op.nrows(),
-            DerivativeMatrixStorage::LatentCoord(op) => op.nrows(),
-        }
+        storage_dispatch!(&self.storage, b => b.design_nrows())
     }
 
     pub(crate) fn ncols(&self) -> usize {
-        match &self.storage {
-            DerivativeMatrixStorage::Dense(dense) => dense.ncols(),
-            DerivativeMatrixStorage::Embedded(embedded) => embedded.total_dim,
-            DerivativeMatrixStorage::Implicit(op) => op.ncols(),
-            DerivativeMatrixStorage::LatentCoord(op) => op.ncols(),
-        }
+        storage_dispatch!(&self.storage, b => b.design_ncols())
     }
 
     pub(crate) fn uses_implicit_storage(&self) -> bool {
-        matches!(
-            self.storage,
-            DerivativeMatrixStorage::Implicit(..) | DerivativeMatrixStorage::LatentCoord(..)
-        )
+        storage_dispatch!(&self.storage, b => b.uses_implicit_storage())
     }
 
     pub(crate) fn materialize(&self) -> Array2<f64> {
-        match &self.storage {
-            DerivativeMatrixStorage::Dense(dense) => dense.clone(),
-            DerivativeMatrixStorage::Embedded(embedded) => {
-                let mut dense = Array2::<f64>::zeros((embedded.local.nrows(), embedded.total_dim));
-                dense
-                    .slice_mut(s![.., embedded.global_range.clone()])
-                    .assign(&embedded.local);
-                dense
-            }
-            DerivativeMatrixStorage::Implicit(op) => op.materialize_dense().clone(),
-            DerivativeMatrixStorage::LatentCoord(op) => op.materialize_dense().clone(),
-        }
+        storage_dispatch!(&self.storage, b => b.materialize())
     }
 
     pub(crate) fn any_nonzero(&self) -> bool {
-        match &self.storage {
-            DerivativeMatrixStorage::Dense(dense) => dense.iter().any(|v| *v != 0.0),
-            DerivativeMatrixStorage::Embedded(embedded) => embedded.local.iter().any(|v| *v != 0.0),
-            DerivativeMatrixStorage::Implicit(..) => true,
-            DerivativeMatrixStorage::LatentCoord(..) => true,
-        }
+        storage_dispatch!(&self.storage, b => b.any_nonzero())
     }
 
     pub(crate) fn forward_mul_original(
         &self,
         u: &Array1<f64>,
     ) -> Result<Array1<f64>, EstimationError> {
-        match &self.storage {
-            DerivativeMatrixStorage::Dense(dense) => {
-                if dense.ncols() != u.len() {
-                    return Err(EstimationError::InvalidInput(format!(
-                        "dense hyper design derivative forward_mul_original width mismatch: matrix={}x{}, vector={}",
-                        dense.nrows(),
-                        dense.ncols(),
-                        u.len()
-                    )));
-                }
-                Ok(dense.dot(u))
-            }
-            DerivativeMatrixStorage::Embedded(embedded) => {
-                if embedded.total_dim != u.len() {
-                    return Err(EstimationError::InvalidInput(format!(
-                        "embedded hyper design derivative forward_mul_original width mismatch: total_dim={}, vector={}",
-                        embedded.total_dim,
-                        u.len()
-                    )));
-                }
-                let u_local = u.slice(s![embedded.global_range.clone()]).to_owned();
-                Ok(embedded.local.dot(&u_local))
-            }
-            DerivativeMatrixStorage::Implicit(op) => {
-                if op.ncols() != u.len() {
-                    return Err(EstimationError::InvalidInput(format!(
-                        "implicit hyper design derivative forward_mul_original width mismatch: operator_cols={}, vector={}",
-                        op.ncols(),
-                        u.len()
-                    )));
-                }
-                Ok(op.forward_mul(u))
-            }
-            DerivativeMatrixStorage::LatentCoord(op) => {
-                if op.ncols() != u.len() {
-                    return Err(EstimationError::InvalidInput(format!(
-                        "latent-coordinate hyper design derivative forward_mul_original width mismatch: operator_cols={}, vector={}",
-                        op.ncols(),
-                        u.len()
-                    )));
-                }
-                Ok(op.forward_mul(u))
-            }
-        }
+        storage_dispatch!(&self.storage, b => b.design_forward_mul_original(u))
     }
 
     pub(crate) fn transpose_mul_original(
         &self,
         v: &Array1<f64>,
     ) -> Result<Array1<f64>, EstimationError> {
-        match &self.storage {
-            DerivativeMatrixStorage::Dense(dense) => {
-                if dense.nrows() != v.len() {
-                    return Err(EstimationError::InvalidInput(format!(
-                        "dense hyper design derivative transpose_mul_original height mismatch: matrix={}x{}, vector={}",
-                        dense.nrows(),
-                        dense.ncols(),
-                        v.len()
-                    )));
-                }
-                Ok(dense.t().dot(v))
-            }
-            DerivativeMatrixStorage::Embedded(embedded) => {
-                if embedded.local.nrows() != v.len() {
-                    return Err(EstimationError::InvalidInput(format!(
-                        "embedded hyper design derivative transpose_mul_original height mismatch: local_rows={}, vector={}",
-                        embedded.local.nrows(),
-                        v.len()
-                    )));
-                }
-                let mut out = Array1::<f64>::zeros(embedded.total_dim);
-                let pulled = embedded.local.t().dot(v);
-                out.slice_mut(s![embedded.global_range.clone()])
-                    .assign(&pulled);
-                Ok(out)
-            }
-            DerivativeMatrixStorage::Implicit(op) => {
-                if op.nrows() != v.len() {
-                    return Err(EstimationError::InvalidInput(format!(
-                        "implicit hyper design derivative transpose_mul_original height mismatch: operator_rows={}, vector={}",
-                        op.nrows(),
-                        v.len()
-                    )));
-                }
-                Ok(op.transpose_mul(v))
-            }
-            DerivativeMatrixStorage::LatentCoord(op) => {
-                if op.nrows() != v.len() {
-                    return Err(EstimationError::InvalidInput(format!(
-                        "latent-coordinate hyper design derivative transpose_mul_original height mismatch: operator_rows={}, vector={}",
-                        op.nrows(),
-                        v.len()
-                    )));
-                }
-                Ok(op.transpose_mul(v))
-            }
-        }
+        storage_dispatch!(&self.storage, b => b.design_transpose_mul_original(v))
     }
 
     pub(crate) fn transformed(
@@ -3067,43 +3383,7 @@ impl HyperDesignDerivative {
         qs: &Array2<f64>,
         free_basis_opt: Option<&Array2<f64>>,
     ) -> Result<Array2<f64>, EstimationError> {
-        match &self.storage {
-            DerivativeMatrixStorage::Embedded(embedded) => {
-                if embedded.total_dim != qs.nrows() {
-                    return Err(EstimationError::InvalidInput(format!(
-                        "embedded design derivative width mismatch: total_cols={}, qs rows={}",
-                        embedded.total_dim,
-                        qs.nrows()
-                    )));
-                }
-                let qs_local = qs.slice(s![embedded.global_range.clone(), ..]);
-                let mut transformed = embedded.local.dot(&qs_local);
-                if let Some(z) = free_basis_opt {
-                    transformed = transformed.dot(z);
-                }
-                Ok(transformed)
-            }
-            DerivativeMatrixStorage::Dense(dense) => {
-                Ok(crate::matrix::DenseRightProductView::new(dense)
-                    .with_factor(qs)
-                    .with_optional_factor(free_basis_opt)
-                    .materialize())
-            }
-            DerivativeMatrixStorage::Implicit(op) => {
-                let dense = op.materialize_dense();
-                Ok(crate::matrix::DenseRightProductView::new(dense)
-                    .with_factor(qs)
-                    .with_optional_factor(free_basis_opt)
-                    .materialize())
-            }
-            DerivativeMatrixStorage::LatentCoord(op) => {
-                let dense = op.materialize_dense();
-                Ok(crate::matrix::DenseRightProductView::new(dense)
-                    .with_factor(qs)
-                    .with_optional_factor(free_basis_opt)
-                    .materialize())
-            }
-        }
+        storage_dispatch!(&self.storage, b => b.design_transformed(qs, free_basis_opt))
     }
 
     pub(crate) fn transformed_forward_mul(
@@ -3112,27 +3392,7 @@ impl HyperDesignDerivative {
         free_basis_opt: Option<&Array2<f64>>,
         u: &Array1<f64>,
     ) -> Result<Array1<f64>, EstimationError> {
-        match &self.storage {
-            DerivativeMatrixStorage::Implicit(op) => {
-                let mut right = if let Some(z) = free_basis_opt {
-                    z.dot(u)
-                } else {
-                    u.clone()
-                };
-                right = qs.dot(&right);
-                Ok(op.forward_mul(&right))
-            }
-            DerivativeMatrixStorage::LatentCoord(op) => {
-                let mut right = if let Some(z) = free_basis_opt {
-                    z.dot(u)
-                } else {
-                    u.clone()
-                };
-                right = qs.dot(&right);
-                Ok(op.forward_mul(&right))
-            }
-            _ => Ok(self.transformed(qs, free_basis_opt)?.dot(u)),
-        }
+        storage_dispatch!(&self.storage, b => b.design_transformed_forward_mul(qs, free_basis_opt, u))
     }
 
     pub(crate) fn transformed_transpose_mul(
@@ -3141,23 +3401,7 @@ impl HyperDesignDerivative {
         free_basis_opt: Option<&Array2<f64>>,
         v: &Array1<f64>,
     ) -> Result<Array1<f64>, EstimationError> {
-        match &self.storage {
-            DerivativeMatrixStorage::Implicit(op) => {
-                let mut pulled = qs.t().dot(&op.transpose_mul(v));
-                if let Some(z) = free_basis_opt {
-                    pulled = z.t().dot(&pulled);
-                }
-                Ok(pulled)
-            }
-            DerivativeMatrixStorage::LatentCoord(op) => {
-                let mut pulled = qs.t().dot(&op.transpose_mul(v));
-                if let Some(z) = free_basis_opt {
-                    pulled = z.t().dot(&pulled);
-                }
-                Ok(pulled)
-            }
-            _ => Ok(self.transformed(qs, free_basis_opt)?.t().dot(v)),
-        }
+        storage_dispatch!(&self.storage, b => b.design_transformed_transpose_mul(qs, free_basis_opt, v))
     }
 
     /// If this derivative uses implicit storage at the first-derivative level,
@@ -3170,21 +3414,11 @@ impl HyperDesignDerivative {
         std::sync::Arc<crate::terms::basis::ImplicitDesignPsiDerivative>,
         usize,
     )> {
-        match &self.storage {
-            DerivativeMatrixStorage::Implicit(op) => match op.level {
-                ImplicitDerivLevel::First(axis) => Some((op.operator.clone(), axis)),
-                _ => None,
-            },
-            _ => None,
-        }
+        storage_dispatch!(&self.storage, b => b.implicit_first_axis_info())
     }
 
     pub(crate) fn implicit_axis_count_hint(&self) -> Option<usize> {
-        match &self.storage {
-            DerivativeMatrixStorage::Implicit(op) => Some(op.operator.n_axes()),
-            DerivativeMatrixStorage::LatentCoord(op) => Some(op.operator.n_axes()),
-            _ => None,
-        }
+        storage_dispatch!(&self.storage, b => b.implicit_axis_count_hint())
     }
 }
 
@@ -3202,19 +3436,6 @@ pub(crate) struct HyperPenaltyDerivative {
 }
 
 impl HyperPenaltyDerivative {
-    pub(crate) fn resident_byte_count(&self) -> usize {
-        match &self.storage {
-            DerivativeMatrixStorage::Dense(dense) => {
-                dense.len().saturating_mul(std::mem::size_of::<f64>())
-            }
-            DerivativeMatrixStorage::Embedded(embedded) => embedded
-                .local
-                .len()
-                .saturating_mul(std::mem::size_of::<f64>()),
-            DerivativeMatrixStorage::Implicit(_) | DerivativeMatrixStorage::LatentCoord(_) => 0,
-        }
-    }
-
     pub(crate) fn from_embedded(
         local: Array2<f64>,
         global_range: Range<usize>,
@@ -3229,13 +3450,12 @@ impl HyperPenaltyDerivative {
         }
     }
 
+    pub(crate) fn resident_byte_count(&self) -> usize {
+        storage_dispatch!(&self.storage, b => b.resident_byte_count())
+    }
+
     pub(crate) fn nrows(&self) -> usize {
-        match &self.storage {
-            DerivativeMatrixStorage::Dense(dense) => dense.nrows(),
-            DerivativeMatrixStorage::Embedded(embedded) => embedded.total_dim,
-            DerivativeMatrixStorage::Implicit(op) => op.nrows(),
-            DerivativeMatrixStorage::LatentCoord(op) => op.nrows(),
-        }
+        storage_dispatch!(&self.storage, b => b.penalty_dim())
     }
 
     pub(crate) fn ncols(&self) -> usize {
@@ -3254,46 +3474,7 @@ impl HyperPenaltyDerivative {
         qs: &Array2<f64>,
         free_basis_opt: Option<&Array2<f64>>,
     ) -> Result<Array2<f64>, EstimationError> {
-        match &self.storage {
-            DerivativeMatrixStorage::Embedded(embedded) => {
-                if embedded.total_dim != qs.nrows() {
-                    return Err(EstimationError::InvalidInput(format!(
-                        "embedded penalty derivative width mismatch: total_dim={}, qs rows={}",
-                        embedded.total_dim,
-                        qs.nrows()
-                    )));
-                }
-                let qs_local = qs.slice(s![embedded.global_range.clone(), ..]);
-                let mut transformed = qs_local.t().dot(&embedded.local).dot(&qs_local);
-                if let Some(z) = free_basis_opt {
-                    transformed = z.t().dot(&transformed).dot(z);
-                }
-                Ok(transformed)
-            }
-            DerivativeMatrixStorage::Dense(dense) => {
-                let mut transformed = qs.t().dot(dense).dot(qs);
-                if let Some(z) = free_basis_opt {
-                    transformed = z.t().dot(&transformed).dot(z);
-                }
-                Ok(transformed)
-            }
-            DerivativeMatrixStorage::Implicit(op) => {
-                let dense = op.materialize_dense();
-                let mut transformed = qs.t().dot(dense).dot(qs);
-                if let Some(z) = free_basis_opt {
-                    transformed = z.t().dot(&transformed).dot(z);
-                }
-                Ok(transformed)
-            }
-            DerivativeMatrixStorage::LatentCoord(op) => {
-                let dense = op.materialize_dense();
-                let mut transformed = qs.t().dot(dense).dot(qs);
-                if let Some(z) = free_basis_opt {
-                    transformed = z.t().dot(&transformed).dot(z);
-                }
-                Ok(transformed)
-            }
-        }
+        storage_dispatch!(&self.storage, b => b.penalty_transformed(qs, free_basis_opt))
     }
 
     pub(crate) fn scaled_add_to(
@@ -3301,64 +3482,7 @@ impl HyperPenaltyDerivative {
         target: &mut Array2<f64>,
         amp: f64,
     ) -> Result<(), EstimationError> {
-        match &self.storage {
-            DerivativeMatrixStorage::Dense(dense) => {
-                if target.raw_dim() != dense.raw_dim() {
-                    return Err(EstimationError::InvalidInput(format!(
-                        "dense hyper penalty derivative shape mismatch: target={}x{}, matrix={}x{}",
-                        target.nrows(),
-                        target.ncols(),
-                        dense.nrows(),
-                        dense.ncols()
-                    )));
-                }
-                target.scaled_add(amp, dense);
-            }
-            DerivativeMatrixStorage::Embedded(embedded) => {
-                if target.nrows() != embedded.total_dim || target.ncols() != embedded.total_dim {
-                    return Err(EstimationError::InvalidInput(format!(
-                        "embedded hyper penalty derivative shape mismatch: target={}x{}, expected {}x{}",
-                        target.nrows(),
-                        target.ncols(),
-                        embedded.total_dim,
-                        embedded.total_dim
-                    )));
-                }
-                target
-                    .slice_mut(s![
-                        embedded.global_range.clone(),
-                        embedded.global_range.clone()
-                    ])
-                    .scaled_add(amp, &embedded.local);
-            }
-            DerivativeMatrixStorage::Implicit(op) => {
-                let dense = op.materialize_dense();
-                if target.raw_dim() != dense.raw_dim() {
-                    return Err(EstimationError::InvalidInput(format!(
-                        "implicit hyper penalty derivative shape mismatch: target={}x{}, matrix={}x{}",
-                        target.nrows(),
-                        target.ncols(),
-                        dense.nrows(),
-                        dense.ncols()
-                    )));
-                }
-                target.scaled_add(amp, dense);
-            }
-            DerivativeMatrixStorage::LatentCoord(op) => {
-                let dense = op.materialize_dense();
-                if target.raw_dim() != dense.raw_dim() {
-                    return Err(EstimationError::InvalidInput(format!(
-                        "latent-coordinate hyper penalty derivative shape mismatch: target={}x{}, matrix={}x{}",
-                        target.nrows(),
-                        target.ncols(),
-                        dense.nrows(),
-                        dense.ncols()
-                    )));
-                }
-                target.scaled_add(amp, dense);
-            }
-        }
-        Ok(())
+        storage_dispatch!(&self.storage, b => b.penalty_scaled_add_to(target, amp))
     }
 }
 
