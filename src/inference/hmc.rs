@@ -569,25 +569,6 @@ pub struct NutsPosterior {
 }
 
 impl NutsPosterior {
-    #[inline]
-    fn log1pexp(eta: f64) -> f64 {
-        if eta > 0.0 {
-            eta + (-eta).exp().ln_1p()
-        } else {
-            eta.exp().ln_1p()
-        }
-    }
-
-    #[inline]
-    fn sigmoid_stable(eta: f64) -> f64 {
-        if eta >= 0.0 {
-            1.0 / (1.0 + (-eta).exp())
-        } else {
-            let e = eta.exp();
-            e / (1.0 + e)
-        }
-    }
-
     /// Creates a new posterior target from ndarray data.
     ///
     /// # Arguments
@@ -1280,9 +1261,9 @@ fn logit_logp_and_grad_into(
             let eta_i = eta[i];
             let y_i = data.y[i];
             let w_i = data.weights[i];
-            let mu = NutsPosterior::sigmoid_stable(eta_i);
+            let mu = crate::linalg::utils::stable_logistic(eta_i);
             *slot = w_i * (y_i - mu);
-            w_i * (y_i * eta_i - NutsPosterior::log1pexp(eta_i))
+            w_i * (y_i * eta_i - crate::linalg::utils::stable_softplus(eta_i))
         })
         .sum();
 
@@ -1838,15 +1819,15 @@ mod tests {
 
     #[test]
     fn log1pexp_is_finite_for_extreme_eta() {
-        assert!(NutsPosterior::log1pexp(1000.0).is_finite());
-        assert!(NutsPosterior::log1pexp(-1000.0).is_finite());
-        assert!((NutsPosterior::log1pexp(-1000.0) - 0.0).abs() < 1e-12);
+        assert!(crate::linalg::utils::stable_softplus(1000.0).is_finite());
+        assert!(crate::linalg::utils::stable_softplus(-1000.0).is_finite());
+        assert!((crate::linalg::utils::stable_softplus(-1000.0) - 0.0).abs() < 1e-12);
     }
 
     #[test]
     fn sigmoid_stable_behaves_at_extremes() {
-        let hi = NutsPosterior::sigmoid_stable(1000.0);
-        let lo = NutsPosterior::sigmoid_stable(-1000.0);
+        let hi = crate::linalg::utils::stable_logistic(1000.0);
+        let lo = crate::linalg::utils::stable_logistic(-1000.0);
         assert!((1.0 - 1e-12..=1.0).contains(&hi));
         assert!((0.0..=1e-12).contains(&lo));
     }
@@ -4500,8 +4481,8 @@ impl LinkWigglePosterior {
                 for i in 0..self.n_samples {
                     let eta_i = eta[i];
                     let (y_i, w_i) = (self.y[i], self.weights[i]);
-                    ll_acc += w_i * (y_i * eta_i - NutsPosterior::log1pexp(eta_i));
-                    let mu = NutsPosterior::sigmoid_stable(eta_i);
+                    ll_acc += w_i * (y_i * eta_i - crate::linalg::utils::stable_softplus(eta_i));
+                    let mu = crate::linalg::utils::stable_logistic(eta_i);
                     residual[i] = w_i * (y_i - mu);
                 }
                 ll = ll_acc;

@@ -2089,15 +2089,6 @@ fn validate_finite_logits(logits: ArrayView1<'_, f64>, row: usize) -> Result<(),
     Ok(())
 }
 
-fn sigmoid_scalar(x: f64) -> f64 {
-    if x >= 0.0 {
-        1.0 / (1.0 + (-x).exp())
-    } else {
-        let ex = x.exp();
-        ex / (1.0 + ex)
-    }
-}
-
 /// Truncated-IBP stick-breaking prior weights `π_k = (α/(α+1))^k` for
 /// k = 0, .., K-1. Under a Beta(α, 1) stick-breaking construction these are
 /// the prior means of the active-set probabilities, so IBP-MAP assignment
@@ -2120,7 +2111,7 @@ fn ibp_map_row(logits: ArrayView1<'_, f64>, temperature: f64, alpha: f64) -> Arr
     let prior = ibp_stick_breaking_prior(logits.len(), alpha);
     let mut out = Array1::<f64>::zeros(logits.len());
     for i in 0..logits.len() {
-        out[i] = sigmoid_scalar(logits[i] / temperature) * prior[i];
+        out[i] = crate::linalg::utils::stable_logistic(logits[i] / temperature) * prior[i];
     }
     out
 }
@@ -2129,7 +2120,7 @@ fn jumprelu_row(logits: ArrayView1<'_, f64>, temperature: f64, threshold: f64) -
     let mut out = Array1::<f64>::zeros(logits.len());
     for i in 0..logits.len() {
         if logits[i] > threshold {
-            out[i] = sigmoid_scalar(logits[i] / temperature);
+            out[i] = crate::linalg::utils::stable_logistic(logits[i] / temperature);
         }
     }
     out
@@ -2194,7 +2185,7 @@ fn fill_assignment_logit_jvp_rows(
                 if logits[logit_col] <= threshold {
                     continue;
                 }
-                let activation = sigmoid_scalar(logits[logit_col] * inv_tau);
+                let activation = crate::linalg::utils::stable_logistic(logits[logit_col] * inv_tau);
                 let da = activation * (1.0 - activation) * inv_tau;
                 for out_col in 0..fitted.len() {
                     local_jac[[logit_col, out_col]] = da * decoded[[logit_col, out_col]];
@@ -2260,7 +2251,7 @@ fn assignment_prior_value(assignment: &SaeAssignment, rho: &SaeManifoldRho) -> f
             let mut acc = 0.0;
             for &logit in target.iter() {
                 if logit > threshold {
-                    acc += sigmoid_scalar(logit / temperature);
+                    acc += crate::linalg::utils::stable_logistic(logit / temperature);
                 }
             }
             sparsity_strength * acc
@@ -2330,7 +2321,7 @@ fn assignment_prior_grad_hdiag(
                 if logit <= threshold {
                     continue;
                 }
-                let activation = sigmoid_scalar(logit * inv_tau);
+                let activation = crate::linalg::utils::stable_logistic(logit * inv_tau);
                 let slope = activation * (1.0 - activation);
                 grad[idx] = sparsity_strength * slope * inv_tau;
                 diag[idx] = sparsity_strength * slope * slope * inv_tau2;
@@ -3106,7 +3097,7 @@ mod tests {
         for (idx, &entry) in diag.iter().enumerate() {
             let logit = logits[[idx / k, idx % k]];
             let expected = if logit > threshold {
-                let activation = sigmoid_scalar(logit * inv_tau);
+                let activation = crate::linalg::utils::stable_logistic(logit * inv_tau);
                 let slope = activation * (1.0 - activation);
                 sparsity_strength * slope * slope * inv_tau2
             } else {

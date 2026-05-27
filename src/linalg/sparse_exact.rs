@@ -37,7 +37,7 @@ impl crate::matrix::FactorizedSystem for SparseExactFactor {
 
 #[derive(Clone)]
 pub struct SparsePenaltyBlock {
-    pub term_index: usize,
+    pub penalty_idx: crate::types::PenaltyIdx,
     pub p_start: usize,
     pub p_end: usize,
     pub positive_eigenvalues: Arc<Vec<f64>>,
@@ -775,7 +775,7 @@ pub fn build_sparse_penalty_blocks_from_canonical(
     let block_results: Vec<Result<SparsePenaltyBlock, EstimationError>> = penalties
         .par_iter()
         .enumerate()
-        .map(|(term_index, cp)| {
+        .map(|(penalty_ordinal, cp)| {
             let p_start = cp.col_range.start;
             let p_end = cp.col_range.end;
             let s_k_block_dense = cp.local_penalty();
@@ -797,7 +797,7 @@ pub fn build_sparse_penalty_blocks_from_canonical(
             }
 
             Ok(SparsePenaltyBlock {
-                term_index,
+                penalty_idx: crate::types::PenaltyIdx::new(penalty_ordinal),
                 p_start,
                 p_end,
                 positive_eigenvalues: Arc::new(cp.positive_eigenvalues.clone()),
@@ -1384,7 +1384,7 @@ mod tests {
 
         let observed: Vec<(usize, usize, usize)> = blocks
             .iter()
-            .map(|block| (block.term_index, block.p_start, block.p_end))
+            .map(|block| (block.penalty_idx.get(), block.p_start, block.p_end))
             .collect();
         assert_eq!(observed, vec![(0, 2, 4), (1, 0, 1), (2, 4, 5)]);
         assert_eq!(&*blocks[0].positive_eigenvalues, &vec![2.0, 3.0]);

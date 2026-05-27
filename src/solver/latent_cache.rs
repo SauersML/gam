@@ -439,7 +439,7 @@ fn latent_metadata_cache_digest(latent: &LatentCoordValues) -> CacheDigest {
 pub(crate) fn latent_design_context_cache_digest(
     data: ArrayView2<'_, f64>,
     spec: &TermCollectionSpec,
-    term_index: usize,
+    term_index: crate::types::SmoothTermIdx,
     analytic_rho_count: usize,
     feature_cols: &[usize],
 ) -> Result<CacheDigest, EstimationError> {
@@ -458,7 +458,7 @@ pub(crate) fn latent_design_context_cache_digest(
     })?;
     hasher.write_usize(spec_bytes.len());
     hasher.hasher.update(spec_bytes);
-    hasher.write_usize(term_index);
+    hasher.write_usize(term_index.get());
     hasher.write_usize(analytic_rho_count);
     hasher.write_usize(feature_cols.len());
     for &col in feature_cols {

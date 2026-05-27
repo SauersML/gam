@@ -1967,9 +1967,13 @@ impl<'a> GamWorkingModel<'a> {
                     .map_err(EstimationError::InvalidInput);
                 }
                 crate::gpu::log_backend_inventory_once();
-                let large_enough = x.nrows() >= 100_000 || (x.nrows() * p) >= 2_000_000;
-                let gpu_decision =
-                    crate::gpu::decide(crate::gpu::GpuKernel::DenseXtWX, false, large_enough);
+                // DenseXtWX has no compiled vendor backend on this path; the
+                // workload-size predicate is computed only for diagnostic
+                // logging via the `decide` reason channel.
+                let gpu_decision = crate::gpu::decide(
+                    crate::gpu::GpuKernel::DenseXtWX,
+                    crate::gpu::GpuEligibility::BackendNotCompiled,
+                );
                 gpu_decision
                     .require_supported()
                     .map_err(EstimationError::InvalidInput)?;

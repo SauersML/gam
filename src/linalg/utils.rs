@@ -48,6 +48,26 @@ pub(crate) fn stable_softplus(x: f64) -> f64 {
     }
 }
 
+/// Numerically stable logistic `σ(x) = 1 / (1 + exp(-x))`.
+///
+/// Splits on the sign of `x` to keep both `exp` arguments non-positive and
+/// avoid overflow:
+///   σ(x) = 1 / (1 + exp(-x))   for x ≥ 0,
+///   σ(x) = exp(x) / (1 + exp(x))   for x < 0.
+///
+/// Canonical home for the routine previously duplicated as `logistic` in
+/// `terms/analytic_penalties.rs`, `sigmoid_stable` in `inference/hmc.rs`, and
+/// `sigmoid_scalar` in `terms/sae_manifold.rs` — all three were bit-identical.
+#[inline]
+pub(crate) fn stable_logistic(x: f64) -> f64 {
+    if x >= 0.0 {
+        1.0 / (1.0 + (-x).exp())
+    } else {
+        let ex = x.exp();
+        ex / (1.0 + ex)
+    }
+}
+
 /// Generic finiteness check for any `f64` ndarray view (1-D, 2-D, etc.). This
 /// is the canonical helper; module-local `array1_is_finite` / `array2_is_finite`
 /// in `solver/pirls.rs` and `solver/active_set.rs` now forward here.

@@ -1965,7 +1965,7 @@ pub struct FittedTermCollectionWithSpec {
 #[derive(Clone)]
 pub struct StandardLatentCoordConfig {
     pub values: std::sync::Arc<crate::terms::latent_coord::LatentCoordValues>,
-    pub term_index: usize,
+    pub term_index: crate::types::SmoothTermIdx,
     pub feature_cols: Vec<usize>,
     pub manifold: crate::terms::latent_coord::LatentManifold,
     pub manifold_auto: bool,
@@ -10120,11 +10120,6 @@ fn stable_sigmoid(theta: f64) -> f64 {
     }
 }
 
-#[inline]
-fn stable_softplus(x: f64) -> f64 {
-    crate::linalg::utils::stable_softplus(x)
-}
-
 fn bounded_latent_to_user(theta: f64, min: f64, max: f64) -> (f64, f64, f64) {
     let z = stable_sigmoid(theta);
     let width = max - min;
@@ -10207,8 +10202,8 @@ fn evaluate_standard_familyobservations(
                 fisherweight[i] = jet.d1.max(MU_DERIV_EPS);
                 neghessian_eta[i] = jet.d1;
                 neghessian_eta_derivative[i] = jet.d2;
-                let logmu = -stable_softplus(-eta_i);
-                let log_one_minusmu = -stable_softplus(eta_i);
+                let logmu = -crate::linalg::utils::stable_softplus(-eta_i);
+                let log_one_minusmu = -crate::linalg::utils::stable_softplus(eta_i);
                 log_likelihood += w * (yi * logmu + (1.0 - yi) * log_one_minusmu);
             }
             (ResponseFamily::Binomial, _) => {
@@ -13529,7 +13524,7 @@ pub(crate) fn try_build_latent_coord_hyper_dirs(
     latent: std::sync::Arc<crate::terms::latent_coord::LatentCoordValues>,
     resolvedspec: &TermCollectionSpec,
     design: &TermCollectionDesign,
-    latent_terms: &[usize],
+    latent_terms: &[crate::types::SmoothTermIdx],
     analytic_rho_count: usize,
 ) -> Result<Option<Vec<DirectionalHyperParam>>, EstimationError> {
     if latent_terms.is_empty() || latent.is_empty() {
@@ -13542,12 +13537,12 @@ pub(crate) fn try_build_latent_coord_hyper_dirs(
         ));
     }
     let term_idx = latent_terms[0];
-    let smooth_term = design.smooth.terms.get(term_idx).ok_or_else(|| {
+    let smooth_term = design.smooth.terms.get(term_idx.get()).ok_or_else(|| {
         EstimationError::InvalidInput(format!(
             "LatentCoord term index {term_idx} out of bounds for realized smooth design"
         ))
     })?;
-    let termspec = resolvedspec.smooth_terms.get(term_idx).ok_or_else(|| {
+    let termspec = resolvedspec.smooth_terms.get(term_idx.get()).ok_or_else(|| {
         EstimationError::InvalidInput(format!(
             "LatentCoord term index {term_idx} out of bounds for resolved smooth spec"
         ))
@@ -14466,7 +14461,7 @@ struct SingleBlockLatentCoordDesignCache {
         Array1<f64>,
         crate::solver::outer_strategy::HessianResult,
     )>,
-    term_index: usize,
+    term_index: crate::types::SmoothTermIdx,
     feature_cols: Vec<usize>,
     rho_dim: usize,
     n_obs: usize,
@@ -14492,7 +14487,7 @@ impl SingleBlockLatentCoordDesignCache {
         latent: &StandardLatentCoordConfig,
         rho_dim: usize,
     ) -> Result<Self, String> {
-        if latent.term_index >= spec.smooth_terms.len() {
+        if latent.term_index.get() >= spec.smooth_terms.len() {
             return Err(SmoothError::dimension_mismatch(format!(
                 "latent-coordinate term index {} out of bounds for {} smooth terms",
                 latent.term_index,
@@ -14584,14 +14579,14 @@ impl SingleBlockLatentCoordDesignCache {
             .design
             .smooth
             .terms
-            .get(self.term_index)
+            .get(self.term_index.get())
             .ok_or_else(|| {
                 SmoothError::dimension_mismatch(format!(
                     "LatentCoord term index {} out of bounds for realized smooth design",
                     self.term_index
                 ))
             })?;
-        let termspec = self.spec.smooth_terms.get(self.term_index).ok_or_else(|| {
+        let termspec = self.spec.smooth_terms.get(self.term_index.get()).ok_or_else(|| {
             SmoothError::dimension_mismatch(format!(
                 "LatentCoord term index {} out of bounds for resolved smooth spec",
                 self.term_index
@@ -24282,7 +24277,7 @@ mod tests {
         ));
         let latent = StandardLatentCoordConfig {
             values: latent_values,
-            term_index: 0,
+            term_index: crate::types::SmoothTermIdx::new(0),
             feature_cols: vec![0],
             manifold: LatentManifold::Euclidean,
             manifold_auto: false,

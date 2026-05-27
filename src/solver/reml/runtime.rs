@@ -5889,14 +5889,14 @@ impl<'a> RemlState<'a> {
         for block in blocks {
             // L(λ_k S_k) = Σ_{positive} log(λ_k σ_i).
             for &eig in block.positive_eigenvalues.iter() {
-                logdet += rho[block.term_index] + eig.ln();
+                logdet += rho[block.penalty_idx.get()] + eig.ln();
             }
 
             penalty_rank += block.positive_eigenvalues.len();
             // ∂/∂ρ_k L = rank (number of positive eigenvalues).
             // Since ∂/∂ρ_k log(λ_k σ_i) = ∂/∂ρ_k (ρ_k + log σ_i) = 1.
-            if block.term_index < det1.len() {
-                det1[block.term_index] = block.positive_eigenvalues.len() as f64;
+            if block.penalty_idx.get() < det1.len() {
+                det1[block.penalty_idx.get()] = block.positive_eigenvalues.len() as f64;
             }
         }
         (penalty_rank.min(self.p), logdet, det1)

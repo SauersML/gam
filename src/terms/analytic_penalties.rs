@@ -176,16 +176,6 @@ fn stable_softplus(x: f64) -> f64 {
     }
 }
 
-fn logistic(x: f64) -> f64 {
-    if x >= 0.0 {
-        let z = (-x).exp();
-        1.0 / (1.0 + z)
-    } else {
-        let z = x.exp();
-        z / (1.0 + z)
-    }
-}
-
 /// Scalar annealing schedule for analytic penalty weights.
 ///
 /// This is the penalty-weight analogue of [`crate::terms::sae_manifold::GumbelTemperatureSchedule`]:
@@ -5595,7 +5585,7 @@ impl AnalyticPenalty for ParametricRowPrecisionPriorPenalty {
             let alpha = log_alpha.exp();
             let raw_beta = self.active_raw_beta(k, rho);
             let beta = stable_softplus(raw_beta);
-            let beta_jac = logistic(raw_beta);
+            let beta_jac = crate::linalg::utils::stable_logistic(raw_beta);
             let mut grad_alpha_direct = 0.0;
             let mut grad_beta_direct = 0.0;
             let mut grad_mu_direct = vec![0.0_f64; du];

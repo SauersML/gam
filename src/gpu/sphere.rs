@@ -474,8 +474,7 @@ pub fn sphere_kernel_decision(n: usize, m: usize, lmax: usize) -> GpuDecision {
     };
     decide(
         GpuKernel::SpatialKernelOperator,
-        sphere_gpu_compiled(),
-        large_enough,
+        super::GpuEligibility::from_flags(sphere_gpu_compiled(), large_enough),
     )
 }
 

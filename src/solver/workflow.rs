@@ -4691,7 +4691,7 @@ fn prepare_standard_latent_coord(
         rewritten,
         StandardLatentCoordConfig {
             values: latent_values,
-            term_index: usize::MAX,
+            term_index: crate::types::SmoothTermIdx::placeholder(),
             feature_cols,
             manifold: spec.manifold.manifold,
             manifold_auto: spec.manifold.auto,
@@ -4836,7 +4836,7 @@ fn materialize_standard<'a>(
         &policy,
     )?;
     if let Some(coord) = latent_coord.as_mut() {
-        coord.term_index = spec
+        let resolved_idx = spec
             .smooth_terms
             .iter()
             .position(|term| {
@@ -4847,9 +4847,10 @@ fn materialize_standard<'a>(
                 "latent-coordinate smooth term disappeared during formula materialization"
                     .to_string()
             })?;
+        coord.term_index = crate::types::SmoothTermIdx::new(resolved_idx);
         if coord.manifold_auto {
             let inferred = natural_latent_manifold_for_basis(
-                &spec.smooth_terms[coord.term_index].basis,
+                &spec.smooth_terms[coord.term_index.get()].basis,
                 coord.feature_cols.len(),
             );
             coord.manifold = inferred.clone();
