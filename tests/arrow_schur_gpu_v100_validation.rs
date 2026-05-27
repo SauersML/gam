@@ -19,6 +19,8 @@
 //!      that any GPU↔reference disagreement is genuinely a GPU bug, not a
 //!      reference-formulation bug.
 
+#![cfg(target_os = "linux")]
+
 use gam::gpu::arrow_schur::{
     ArrowSchurGpuFailure, solve_arrow_newton_step, solve_arrow_newton_step_dense_reference,
     solve_arrow_newton_step_fused_force,

@@ -17,7 +17,6 @@ use gam::families::bernoulli_marginal_slope::{
     LatentZPolicy,
 };
 use gam::families::cubic_cell_kernel as exact_kernel;
-use gam::types::inverse_link_to_binomial_spec;
 use gam::families::latent_survival::latent_hazard_loading;
 use gam::families::scale_design::{
     ScaleDeviationTransform, build_scale_deviation_operator,
@@ -101,9 +100,10 @@ use gam::term_builder::{
     build_termspec, column_map_with_alias, enable_scale_dimensions, resolve_role_col,
 };
 use gam::transformation_normal::TransformationNormalConfig;
+use gam::types::inverse_link_to_binomial_spec;
 use gam::types::{
     InverseLink, LikelihoodScaleMetadata, LikelihoodSpec, LinkFunction, LogLikelihoodNormalization,
-    MixtureLinkSpec, ResponseFamily, SasLinkSpec, WigglePenaltyConfig,
+    MixtureLinkSpec, ResponseFamily, SasLinkSpec, StandardLink, WigglePenaltyConfig,
 };
 use gam::{
     BernoulliMarginalSlopeFitRequest, BinomialLocationScaleFitRequest, FitRequest, FitResult,
@@ -1291,10 +1291,8 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             &parsed,
             &y,
             family,
-            effective_link,
             link_choice.as_ref(),
             mixture_linkspec.as_ref(),
-            sas_linkspec.as_ref(),
             effective_linkwiggle.as_ref(),
             &mut inference_notes,
             noise_formula_raw,
@@ -1641,7 +1639,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             ModelKind::Standard,
             FittedFamily::Standard {
                 likelihood: family.clone(),
-                link: Some(effective_link),
+                link: StandardLink::try_from(effective_link).ok(),
                 latent_cloglog_state,
                 mixture_state: saved_mixture_state_from_fit(&saved_fit),
                 sas_state: saved_sas_state_from_fit(&saved_fit),
@@ -2091,10 +2089,8 @@ fn run_fitwith_predict_noise(
     parsed: &ParsedFormula,
     y: &Array1<f64>,
     family: LikelihoodSpec,
-    effective_link: LinkFunction,
     link_choice: Option<&LinkChoice>,
     mixture_linkspec: Option<&MixtureLinkSpec>,
-    sas_linkspec: Option<&SasLinkSpec>,
     formula_linkwiggle: Option<&LinkWiggleFormulaSpec>,
     inference_notes: &mut Vec<String>,
     noise_formula_raw: &str,
@@ -2251,10 +2247,16 @@ fn run_fitwith_predict_noise(
                 SavedFitSummary::from_blockwise_fit(&fit)?
                     .rescaled_gaussian_location_scale(response_scale, y.len())?,
             );
+            let resolved_base_link = link_choice
+                .map(|choice| {
+                    effective_link_to_standard(choice.link, "gaussian location-scale base link")
+                        .map(InverseLink::Standard)
+                })
+                .transpose()?;
             let mut model = build_location_scale_saved_model(
                 formula_text.to_string(),
                 FAMILY_GAUSSIAN_LOCATION_SCALE.to_string(),
-                link_choice.map(|choice| InverseLink::Standard(choice.link)),
+                resolved_base_link,
                 ds.schema.clone(),
                 noise_formula.clone(),
                 ds.headers.clone(),
@@ -8796,9 +8798,10 @@ fn resolve_binomial_inverse_link_for_fit(
         | InverseLink::Standard(StandardLink::Identity)
         | InverseLink::Standard(StandardLink::Log)
         | InverseLink::LatentCLogLog(_)
-        | InverseLink::Mixture(_) => {
-            Ok(InverseLink::Standard(effective_link_to_standard(effective_link, context)?))
-        }
+        | InverseLink::Mixture(_) => Ok(InverseLink::Standard(effective_link_to_standard(
+            effective_link,
+            context,
+        )?)),
     }
 }
 
@@ -8807,10 +8810,7 @@ fn resolve_binomial_inverse_link_for_fit(
 /// already been routed to their own `InverseLink` variants by the time this
 /// fallback runs; reaching it with one of those wide variants is a contract
 /// violation by the caller.
-fn effective_link_to_standard(
-    link: LinkFunction,
-    context: &str,
-) -> Result<StandardLink, String> {
+fn effective_link_to_standard(link: LinkFunction, context: &str) -> Result<StandardLink, String> {
     match link {
         LinkFunction::Logit => Ok(StandardLink::Logit),
         LinkFunction::Probit => Ok(StandardLink::Probit),
@@ -8974,7 +8974,10 @@ fn parse_survival_inverse_link(args: &SurvivalArgs) -> Result<InverseLink, Strin
                 if args.beta_logistic_init.is_some() {
                     return Err("--beta-logistic-init requires --link beta-logistic".to_string());
                 }
-                Ok(InverseLink::Standard(other))
+                Ok(InverseLink::Standard(effective_link_to_standard(
+                    other,
+                    "survival inverse link",
+                )?))
             }
         }
     } else {
@@ -9986,7 +9989,7 @@ mod tests {
     };
     use gam::types::{
         InverseLink, LikelihoodScaleMetadata, LinkFunction, LogLikelihoodNormalization,
-        WigglePenaltyConfig,
+        StandardLink, WigglePenaltyConfig,
     };
     use ndarray::{Array1, Array2, ArrayViewMut2, array, s};
     use rand::SeedableRng;
@@ -10602,7 +10605,8 @@ mod tests {
         assert!(file!().ends_with(".rs"));
         let y = array![0.0, 1.0, 1.0, 0.0];
 
-        let family = resolve_family(FamilyArg::Auto, None, None, None, y.view()).expect("resolve family");
+        let family =
+            resolve_family(FamilyArg::Auto, None, None, None, y.view()).expect("resolve family");
 
         assert_eq!(family, LikelihoodSpec::binomial_logit());
     }
@@ -11229,7 +11233,7 @@ mod tests {
                     ResponseFamily::Binomial,
                     InverseLink::Standard(StandardLink::Logit),
                 ),
-                link: Some(LinkFunction::Logit),
+                link: Some(StandardLink::Logit),
                 latent_cloglog_state: None,
                 mixture_state: None,
                 sas_state: None,
@@ -11623,7 +11627,10 @@ mod tests {
             ModelKind::Standard,
             FittedFamily::Standard {
                 likelihood: family,
-                link: Some(link),
+                link: Some(
+                    StandardLink::try_from(link)
+                        .expect("binomial mean-wiggle test helper requires a standard link"),
+                ),
                 latent_cloglog_state: None,
                 mixture_state: None,
                 sas_state: None,
@@ -11631,7 +11638,10 @@ mod tests {
             family_name,
         );
         payload.fit_result = Some(fit_result);
-        payload.link = Some(InverseLink::Standard(link));
+        payload.link = Some(InverseLink::Standard(
+            StandardLink::try_from(link)
+                .expect("binomial mean-wiggle test helper requires a standard link"),
+        ));
         payload.linkwiggle_knots = Some(wiggle_knots);
         payload.linkwiggle_degree = Some(wiggle_degree);
         payload.set_training_feature_metadata(vec![], vec![]);

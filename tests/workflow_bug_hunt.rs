@@ -1,7 +1,7 @@
 use gam::inference::data::EncodedDataset;
 use gam::inference::formula_dsl::parse_link_choice;
 use gam::inference::model::{ColumnKindTag, DataSchema, SchemaColumn};
-use gam::types::{InverseLink, LinkFunction, StandardLink, ResponseFamily};
+use gam::types::{InverseLink, ResponseFamily, StandardLink};
 use gam::{FitConfig, FitRequest, materialize, resolve_family};
 use ndarray::{Array2, array};
 
@@ -51,9 +51,9 @@ fn resolve_family_binomial_with_explicit_link_overrides_default_logit() {
     // accepted because the bare 'binomial' family name does not pin a link.
     let y = array![0.0, 1.0, 1.0, 0.0];
     for (link_name, expected) in [
-        ("probit", LinkFunction::Probit),
-        ("cloglog", LinkFunction::CLogLog),
-        ("logit", LinkFunction::Logit),
+        ("probit", StandardLink::Probit),
+        ("cloglog", StandardLink::CLogLog),
+        ("logit", StandardLink::Logit),
     ] {
         let link_choice = parse_link_choice(Some(link_name), false)
             .expect("link should parse")

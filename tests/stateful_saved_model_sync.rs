@@ -9,8 +9,8 @@ use gam::inference::model::{
 };
 use gam::pirls::PirlsStatus;
 use gam::types::{
-    InverseLink, LatentCLogLogState, LikelihoodScaleMetadata, LikelihoodSpec, LinkFunction, StandardLink,
-    LogLikelihoodNormalization, ResponseFamily, SasLinkState,
+    InverseLink, LatentCLogLogState, LikelihoodScaleMetadata, LikelihoodSpec,
+    LogLikelihoodNormalization, ResponseFamily, SasLinkState, StandardLink,
 };
 use ndarray::{Array1, Array2};
 use serde_json::Value;
@@ -188,7 +188,7 @@ fn minimal_standard_model_with_group_metadata(
                 ResponseFamily::Gaussian,
                 InverseLink::Standard(StandardLink::Identity),
             ),
-            link: Some(LinkFunction::Identity),
+            link: Some(StandardLink::Identity),
             latent_cloglog_state: None,
             mixture_state: None,
             sas_state: None,
@@ -268,7 +268,7 @@ fn save_and_load_syncs_standard_sas_state_from_fit_result() {
         ModelKind::Standard,
         FittedFamily::Standard {
             likelihood: LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Sas(sas_state)),
-            link: Some(LinkFunction::Sas),
+            link: None,
             latent_cloglog_state: None,
             mixture_state: None,
             sas_state: None,
@@ -367,7 +367,7 @@ fn save_and_load_syncs_standard_latent_cloglog_state_from_fit_result() {
                 ResponseFamily::Binomial,
                 InverseLink::LatentCLogLog(latent_state),
             ),
-            link: Some(LinkFunction::CLogLog),
+            link: Some(StandardLink::CLogLog),
             latent_cloglog_state: None,
             mixture_state: None,
             sas_state: None,

@@ -8,7 +8,12 @@ use std::thread;
 fn gpu_runtime_probe_reports_no_device_or_driver_as_structured_error_instead_of_none() {
     let probe = GpuRuntime::probe();
     assert!(
-        probe.is_ok() || matches!(probe, Err(gam::gpu::GpuError::DriverLibraryUnavailable { .. } | gam::gpu::GpuError::DriverCallFailed { .. })),
+        probe.is_ok()
+            || matches!(
+                probe,
+                Err(gam::gpu::GpuError::DriverLibraryUnavailable { .. }
+                    | gam::gpu::GpuError::DriverCallFailed { .. })
+            ),
         "GpuRuntime::probe should return a runtime or a typed CUDA probe failure, not panic or collapse unavailable hardware into Ok(None)"
     );
 }
@@ -29,14 +34,9 @@ fn gpu_policy_auto_falls_back_to_cpu_when_runtime_is_unavailable_and_sets_cpu_re
     );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn gpu_device_info_device_count_matches_underlying_driver_count() {
-    #[cfg(not(target_os = "linux"))]
-    {
-        return;
-    }
-
-    #[cfg(target_os = "linux")]
     if !gam::gpu::driver::cuda_driver_library_present() {
         assert!(
             matches!(
@@ -129,7 +129,12 @@ fn concurrent_runtime_probe_is_idempotent_without_race_or_double_init() {
 
     let direct_probe = GpuRuntime::probe();
     assert!(
-        direct_probe.is_ok() || matches!(direct_probe, Err(gam::gpu::GpuProbeError::Driver(_))),
+        direct_probe.is_ok()
+            || matches!(
+                direct_probe,
+                Err(gam::gpu::GpuError::DriverLibraryUnavailable { .. }
+                    | gam::gpu::GpuError::DriverCallFailed { .. })
+            ),
         "direct probe after concurrent global initialization should remain idempotent and typed"
     );
 }
