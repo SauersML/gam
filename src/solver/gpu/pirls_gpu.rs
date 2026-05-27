@@ -1763,14 +1763,28 @@ mod pcg_device_parity_tests {
         h_dense
     }
 
-    /// Reference dense solve via faer Cholesky (the row-primary Hessian is
-    /// SPD by construction at the fixture diagonal boost).
-    fn cpu_dense_solve(h: &Array2<f64>, b: &[f64]) -> Vec<f64> {
-        use crate::linalg::faer_ndarray::FaerCholesky;
-        let chol = FaerCholesky::factor(h.view())
-            .expect("dense oracle Cholesky factor must succeed on SPD fixture");
-        let b_arr = ndarray::Array1::from_vec(b.to_vec());
-        chol.solve_vec(b_arr.view()).to_vec()
+    /// Reference oracle: host PCG against the dense joint H + diag(H)
+    /// preconditioner, with a tolerance two decades tighter than the GPU
+    /// PCG's. Comparing GPU PCG to host PCG (rather than to a Cholesky
+    /// solve) keeps the comparison numerically apples-to-apples — only
+    /// reduction order differs between the two paths.
+    fn cpu_pcg_oracle(h: &Array2<f64>, b: &[f64], rel_tol: f64) -> Vec<f64> {
+        let p = b.len();
+        let diag: ndarray::Array1<f64> =
+            ndarray::Array1::from_vec((0..p).map(|i| h[[i, i]]).collect());
+        let rhs = ndarray::Array1::from_vec(b.to_vec());
+        let h_owned = h.clone();
+        let apply = move |v: &ndarray::Array1<f64>| h_owned.dot(v);
+        let (x, info) = crate::linalg::utils::solve_spd_pcg_with_info(
+            apply, &rhs, &diag, rel_tol, 4 * p,
+        )
+        .expect("host PCG oracle must converge on SPD fixture");
+        assert!(
+            info.converged,
+            "host PCG oracle failed to converge: iters={} rel_res={}",
+            info.iterations, info.relative_residual_norm
+        );
+        x.to_vec()
     }
 
     #[test]
