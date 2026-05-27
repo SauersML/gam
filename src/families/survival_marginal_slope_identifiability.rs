@@ -599,6 +599,13 @@ pub struct SurvivalParametricCompiledPerTerm {
     pub v_time_per_term: Vec<Array2<f64>>,
     pub v_marginal_per_term: Vec<Array2<f64>>,
     pub v_logslope_per_term: Vec<Array2<f64>>,
+    /// Per-term residualised reparam `R_b = M_b · V_b` from the
+    /// identifiability compiler, in the same global compile order
+    /// (time terms, then marginal terms, then logslope terms). `None`
+    /// for the very first compiled block (no anchor). Used by the
+    /// V+M-exact apply path to emit residualised rows
+    /// `C_b·V_b − A_{<b}·R_b` and to assemble the full triangular T.
+    pub r_lw_per_term: Vec<Option<Array2<f64>>>,
     /// Per-block drops (raw_cols − sum(kept_cols across terms)).
     pub drops_by_block: (usize, usize, usize),
 }
@@ -719,15 +726,32 @@ pub fn compile_survival_parametric_designs_per_term(
         ));
     }
     let mut iter = blocks.into_iter();
-    let v_time_per_term: Vec<Array2<f64>> = (0..n_time)
-        .map(|_| iter.next().unwrap().t_lw)
-        .collect();
-    let v_marginal_per_term: Vec<Array2<f64>> = (0..n_marg)
-        .map(|_| iter.next().unwrap().t_lw)
-        .collect();
-    let v_logslope_per_term: Vec<Array2<f64>> = (0..n_log)
-        .map(|_| iter.next().unwrap().t_lw)
-        .collect();
+    let mut v_time_per_term: Vec<Array2<f64>> = Vec::with_capacity(n_time);
+    let mut r_time_per_term: Vec<Option<Array2<f64>>> = Vec::with_capacity(n_time);
+    for _ in 0..n_time {
+        let blk = iter.next().unwrap();
+        v_time_per_term.push(blk.t_lw);
+        r_time_per_term.push(blk.r_lw);
+    }
+    let mut v_marginal_per_term: Vec<Array2<f64>> = Vec::with_capacity(n_marg);
+    let mut r_marginal_per_term: Vec<Option<Array2<f64>>> = Vec::with_capacity(n_marg);
+    for _ in 0..n_marg {
+        let blk = iter.next().unwrap();
+        v_marginal_per_term.push(blk.t_lw);
+        r_marginal_per_term.push(blk.r_lw);
+    }
+    let mut v_logslope_per_term: Vec<Array2<f64>> = Vec::with_capacity(n_log);
+    let mut r_logslope_per_term: Vec<Option<Array2<f64>>> = Vec::with_capacity(n_log);
+    for _ in 0..n_log {
+        let blk = iter.next().unwrap();
+        v_logslope_per_term.push(blk.t_lw);
+        r_logslope_per_term.push(blk.r_lw);
+    }
+    let mut r_lw_per_term: Vec<Option<Array2<f64>>> =
+        Vec::with_capacity(n_time + n_marg + n_log);
+    r_lw_per_term.extend(r_time_per_term);
+    r_lw_per_term.extend(r_marginal_per_term);
+    r_lw_per_term.extend(r_logslope_per_term);
     let drops_time: usize = time_partition
         .iter()
         .zip(v_time_per_term.iter())
@@ -747,6 +771,7 @@ pub fn compile_survival_parametric_designs_per_term(
         v_time_per_term,
         v_marginal_per_term,
         v_logslope_per_term,
+        r_lw_per_term,
         drops_by_block: (drops_time, drops_marg, drops_log),
     })
 }
@@ -1191,6 +1216,171 @@ impl SmgsLiftPerBlockV {
                 }
             }
         }
+    }
+}
+
+/// Triangular block-upper-triangular lift `T` for the V+M-exact path.
+///
+/// Whereas [`SmgsLiftPerBlockV`] performs a strictly per-block lift
+/// `β_b_raw = V_b · θ_b`, the V+M-exact path requires a joint lift
+/// `β_raw = T · θ_full` where `T` is block-upper-triangular: the
+/// diagonal blocks are the per-block `V_b` matrices and the
+/// strictly-upper off-diagonal blocks are `−R_{a,b}` (the
+/// residualisation reparameterisations of earlier-priority block `a`
+/// against later block `b`'s compiled kept directions).
+///
+/// Mathematically, partitioning θ_full into per-block compiled vectors
+/// `θ = (θ_1, …, θ_B)` (concatenated in priority order) and the raw
+/// β_full into per-block raw vectors `β_raw = (β_1_raw, …, β_B_raw)`:
+///
+/// ```text
+///   β_a_raw = V_a · θ_a  −  Σ_{b > a} R_{a,b} · θ_b
+/// ```
+///
+/// `T` packages this as a single dense block-upper-triangular matrix
+/// of shape `(Σ p_b_raw) × (Σ p_b_compiled)`. When all `R_{a,b}` are
+/// zero (no cross-block residualisation), `T` reduces to the
+/// block-diagonal of `V`s and `lift_block_betas_via_t` agrees with
+/// applying [`SmgsLiftPerBlockV`] per block.
+#[derive(Debug, Clone)]
+pub struct SmgsLiftViaT {
+    pub t_full: Array2<f64>,
+    pub block_starts_compiled: Vec<usize>,
+    pub block_starts_raw: Vec<usize>,
+}
+
+impl SmgsLiftViaT {
+    /// Build `T_full` from per-block diagonal `V_b` matrices and the
+    /// strictly-upper off-diagonal `R_{a,b}` matrices.
+    ///
+    /// `r_per_term[b]` (when `Some`) packs ALL strictly-upper
+    /// off-diagonal columns for block `b` stacked row-wise across all
+    /// earlier-priority blocks `a < b`. It must have:
+    ///
+    /// - `nrows = Σ_{a < b} v_per_term[a].nrows()` (sum of raw widths
+    ///   of all earlier blocks), and
+    /// - `ncols = v_per_term[b].ncols()` (compiled width of block `b`).
+    ///
+    /// `r_per_term[0]` is unused (the first block has no earlier
+    /// blocks to residualise against) and should be `None`.
+    pub fn from_v_and_r(
+        v_per_term: &[Array2<f64>],
+        r_per_term: &[Option<Array2<f64>>],
+    ) -> Self {
+        assert_eq!(
+            v_per_term.len(),
+            r_per_term.len(),
+            "SmgsLiftViaT::from_v_and_r: v_per_term and r_per_term must have the same length"
+        );
+        let n_blocks = v_per_term.len();
+
+        let mut block_starts_compiled = Vec::with_capacity(n_blocks + 1);
+        let mut block_starts_raw = Vec::with_capacity(n_blocks + 1);
+        block_starts_compiled.push(0);
+        block_starts_raw.push(0);
+        for v in v_per_term {
+            let prev_c = *block_starts_compiled.last().unwrap();
+            let prev_r = *block_starts_raw.last().unwrap();
+            block_starts_compiled.push(prev_c + v.ncols());
+            block_starts_raw.push(prev_r + v.nrows());
+        }
+        let total_raw = *block_starts_raw.last().unwrap();
+        let total_compiled = *block_starts_compiled.last().unwrap();
+
+        let mut t_full = Array2::<f64>::zeros((total_raw, total_compiled));
+        for (a, v) in v_per_term.iter().enumerate() {
+            let r0 = block_starts_raw[a];
+            let r1 = block_starts_raw[a + 1];
+            let c0 = block_starts_compiled[a];
+            let c1 = block_starts_compiled[a + 1];
+            if v.nrows() > 0 && v.ncols() > 0 {
+                t_full.slice_mut(ndarray::s![r0..r1, c0..c1]).assign(v);
+            }
+        }
+        for b in 1..n_blocks {
+            let r_b = match r_per_term[b].as_ref() {
+                Some(r) => r,
+                None => continue,
+            };
+            let c0 = block_starts_compiled[b];
+            let c1 = block_starts_compiled[b + 1];
+            assert_eq!(
+                r_b.ncols(),
+                c1 - c0,
+                "SmgsLiftViaT::from_v_and_r: r_per_term[{b}] has {} cols, expected compiled width {}",
+                r_b.ncols(),
+                c1 - c0,
+            );
+            assert_eq!(
+                r_b.nrows(),
+                block_starts_raw[b],
+                "SmgsLiftViaT::from_v_and_r: r_per_term[{b}] has {} rows, expected {} (raw width sum of earlier blocks)",
+                r_b.nrows(),
+                block_starts_raw[b],
+            );
+            for a in 0..b {
+                let ra0 = block_starts_raw[a];
+                let ra1 = block_starts_raw[a + 1];
+                if ra1 == ra0 || c1 == c0 {
+                    continue;
+                }
+                let slab = r_b.slice(ndarray::s![ra0..ra1, ..]);
+                let mut dest = t_full.slice_mut(ndarray::s![ra0..ra1, c0..c1]);
+                for i in 0..(ra1 - ra0) {
+                    for j in 0..(c1 - c0) {
+                        dest[[i, j]] = -slab[[i, j]];
+                    }
+                }
+            }
+        }
+
+        Self {
+            t_full,
+            block_starts_compiled,
+            block_starts_raw,
+        }
+    }
+
+    /// Apply the triangular lift to per-block compiled betas. Inputs
+    /// are concatenated into θ_full, multiplied by `T_full` to give
+    /// β_full, and split at `block_starts_raw` into per-block raw βs.
+    pub fn lift_block_betas_via_t(
+        &self,
+        compiled_block_betas: &[Array1<f64>],
+    ) -> Vec<Array1<f64>> {
+        let n_blocks = self.block_starts_compiled.len().saturating_sub(1);
+        assert_eq!(
+            compiled_block_betas.len(),
+            n_blocks,
+            "SmgsLiftViaT::lift_block_betas_via_t: got {} compiled block betas, expected {}",
+            compiled_block_betas.len(),
+            n_blocks,
+        );
+        for (b, beta) in compiled_block_betas.iter().enumerate() {
+            let expected = self.block_starts_compiled[b + 1] - self.block_starts_compiled[b];
+            assert_eq!(
+                beta.len(),
+                expected,
+                "SmgsLiftViaT::lift_block_betas_via_t: block {b} has β of len {}, expected compiled width {}",
+                beta.len(),
+                expected,
+            );
+        }
+        let total_compiled = *self.block_starts_compiled.last().unwrap_or(&0);
+        let mut theta_full = Array1::<f64>::zeros(total_compiled);
+        for (b, beta) in compiled_block_betas.iter().enumerate() {
+            let c0 = self.block_starts_compiled[b];
+            let c1 = self.block_starts_compiled[b + 1];
+            theta_full.slice_mut(ndarray::s![c0..c1]).assign(beta);
+        }
+        let beta_full = self.t_full.dot(&theta_full);
+        let mut out = Vec::with_capacity(n_blocks);
+        for b in 0..n_blocks {
+            let r0 = self.block_starts_raw[b];
+            let r1 = self.block_starts_raw[b + 1];
+            out.push(beta_full.slice(ndarray::s![r0..r1]).to_owned());
+        }
+        out
     }
 }
 
