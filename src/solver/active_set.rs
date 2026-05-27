@@ -90,8 +90,6 @@ pub struct ConstraintKktDiagnostics {
     pub active_tolerance: f64,
 }
 
-use crate::linalg::utils::array_is_finite;
-
 fn solve_newton_direction_dense(
     hessian: &Array2<f64>,
     gradient: &Array1<f64>,
@@ -1175,120 +1173,12 @@ pub(crate) fn solve_quadratic_with_linear_constraints(
     Ok((beta_start + &delta, active_hint))
 }
 
-/// Build an orthonormal basis `P ∈ ℝ^{p × (p-k_eff)}` for `ker(A_active)`,
-/// the tangent space at the currently active inequality constraints.
-///
-/// `active_rows` is `A_active`, a `k × p` matrix whose rows are the currently
-/// active constraint Jacobian rows in the joint coefficient layout. `k_eff` is
-/// the numerical row-rank of `A_active`; rows that are linearly dependent on
-/// earlier rows (within `rank_tol`) are absorbed silently, so the returned `P`
-/// always satisfies `A_active @ P ≈ 0` and `P^T P = I_{p-k_eff}` to numerical
-/// tolerance.
-///
-/// Pipeline:
-///   1. Thin SVD of `A_active^T` (shape `p × k`) gives `U_row ∈ ℝ^{p × k}`
-///      whose first `k_eff` columns are an orthonormal basis of the row space
-///      of `A_active` (== range of `A^T`).
-///   2. Form the orthogonal projector onto the null space `M = I_p − Σ_{j<k_eff} u_j u_jᵀ`.
-///   3. Thin SVD of `M` returns left singular vectors with singular values
-///      ≈ 1 (one per null-space dimension); we keep those columns.
-///
-/// Returns `Ok(None)` when `k_eff = 0` (no effective constraints — the caller
-/// should use the unconstrained Newton path) or when `k_eff = p` (every direction
-/// is constrained — the only feasible step is δ = 0). Callers must short-circuit
-/// both cases rather than threading a zero-column projector through downstream
-/// solves.
-fn tangent_space_projector(
-    active_rows: &Array2<f64>,
-    rank_tol: f64,
-) -> Result<Option<Array2<f64>>, EstimationError> {
-    let k = active_rows.nrows();
-    let p = active_rows.ncols();
-    if !rank_tol.is_finite() || rank_tol < 0.0 {
-        return Err(EstimationError::InvalidInput(format!(
-            "tangent_space_projector: rank_tol must be finite and non-negative (got {rank_tol})"
-        )));
-    }
-    if k == 0 || p == 0 {
-        return Ok(None);
-    }
-    if active_rows.iter().any(|v| !v.is_finite()) {
-        return Err(EstimationError::InvalidInput(
-            "tangent_space_projector: active_rows contains non-finite entries".to_string(),
-        ));
-    }
-
-    let a_t = active_rows.t().to_owned();
-    let (u_opt, sigma_row, _) = a_t.svd(true, false).map_err(|e| {
-        EstimationError::InvalidInput(format!(
-            "tangent_space_projector: SVD of A_activeᵀ failed: {e:?}"
-        ))
-    })?;
-    let u_row = u_opt.ok_or_else(|| {
-        EstimationError::InvalidInput(
-            "tangent_space_projector: row-space basis SVD did not return U".to_string(),
-        )
-    })?;
-    let sigma_max = sigma_row
-        .iter()
-        .copied()
-        .map(f64::abs)
-        .fold(0.0_f64, f64::max);
-    let cutoff = rank_tol * sigma_max;
-    let k_eff = sigma_row.iter().take_while(|&&s| s > cutoff).count();
-    if k_eff == 0 {
-        return Ok(None);
-    }
-    if k_eff >= p {
-        return Ok(None);
-    }
-
-    let mut projector = Array2::<f64>::eye(p);
-    for j in 0..k_eff {
-        let u_j = u_row.column(j);
-        for r in 0..p {
-            let u_r = u_j[r];
-            if u_r == 0.0 {
-                continue;
-            }
-            for c in 0..p {
-                projector[[r, c]] -= u_r * u_j[c];
-            }
-        }
-    }
-
-    let (left_opt, sigma_proj, _) = projector.svd(true, false).map_err(|e| {
-        EstimationError::InvalidInput(format!(
-            "tangent_space_projector: SVD of null-space projector failed: {e:?}"
-        ))
-    })?;
-    let left = left_opt.ok_or_else(|| {
-        EstimationError::InvalidInput(
-            "tangent_space_projector: null-projector SVD did not return U".to_string(),
-        )
-    })?;
-    let null_dim = p - k_eff;
-    let kept = sigma_proj
-        .iter()
-        .take(null_dim)
-        .filter(|&&s| (s - 1.0).abs() <= 1.0e-8)
-        .count();
-    if kept != null_dim {
-        return Err(EstimationError::InvalidInput(format!(
-            "tangent_space_projector: expected {null_dim} unit singular values in null \
-             projector (rank_tol={rank_tol:.3e}, k_eff={k_eff}, p={p}), found {kept} within 1e-8 of 1"
-        )));
-    }
-    let basis = left.slice(s![.., ..null_dim]).to_owned();
-    Ok(Some(basis))
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         LinearInequalityConstraints, project_stationarity_residual_on_constraint_cone,
         rank_reduce_rows_pivoted_qr_with_dependence,
-        solve_newton_direction_with_linear_constraints_impl, tangent_space_projector,
+        solve_newton_direction_with_linear_constraints_impl,
     };
     use approx::assert_relative_eq;
     use ndarray::{Array1, array};

@@ -1397,12 +1397,12 @@ fn bernoulli_probit_body(curvature: CurvatureMode) -> String {
     //   w_obs = w_F + w_p · (y − μ) · [h'/V − h²·V'/V²].
     // h(η)=φ(η), h'(η)=−η·φ(η); V'=1−2μ.
     double w_hessian = w_fisher;
-    if (v > 0.0 && wp > 0.0) {
+    if (v > 0.0 && wp > 0.0) {{
         double h_prime = -eta_c * dmu_deta;
         double v_prime = 1.0 - 2.0 * mu;
         double bracket = h_prime / v - (dmu_deta * dmu_deta) * v_prime / (v * v);
         w_hessian = w_fisher + wp * (y_i - mu) * bracket;
-    }
+    }}
 #else
     double w_hessian = w_fisher;
 #endif
@@ -1435,12 +1435,12 @@ fn bernoulli_cloglog_body(curvature: CurvatureMode) -> String {
     //   w_obs = w_F + w_p · (y − μ) · [h'/V − h²·V'/V²].
     // h'(η) = h(η) · (1 − inner); V'=1−2μ.
     double w_hessian = w_fisher;
-    if (v > 0.0 && wp > 0.0) {
+    if (v > 0.0 && wp > 0.0) {{
         double h_prime = dmu_deta * (1.0 - inner);
         double v_prime = 1.0 - 2.0 * mu;
         double bracket = h_prime / v - (dmu_deta * dmu_deta) * v_prime / (v * v);
         w_hessian = w_fisher + wp * (y_i - mu) * bracket;
-    }
+    }}
 #else
     double w_hessian = w_fisher;
 #endif
