@@ -31,6 +31,7 @@ use crate::smooth::{
     SmoothBasisSpec, SmoothTermSpec, TensorBSplineIdentifiability, TensorBSplineSpec,
     TermCollectionSpec,
 };
+use crate::types::ColIdx;
 
 // ---------------------------------------------------------------------------
 // Typed errors
