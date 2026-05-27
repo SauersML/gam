@@ -470,10 +470,10 @@ pub(crate) fn robust_eigh_faer(
                     let val = mat[(i, j)];
                     if !val.is_finite() {
                         let max_abs = mat_max_abs_element(mat.as_ref());
-                        crate::bail_invalid_estim!(format!(
+                        crate::bail_invalid_estim!(
                             "{} contains non-finite entries (max finite magnitude {:.3e})",
                             ctx, max_abs
-                        ));
+                        );
                     }
                 }
             }
@@ -702,11 +702,11 @@ fn decompose_kronecker_factors(
     for (j, factor) in factors.iter().enumerate() {
         let q_j = factor.nrows();
         if q_j != factor.ncols() {
-            crate::bail_invalid_estim!(format!(
+            crate::bail_invalid_estim!(
                 "{context}: Kronecker factor {j} must be square, got {}x{}",
                 factor.nrows(),
                 factor.ncols()
-            ));
+            );
         }
         let is_identity = {
             let mut is_id = true;
@@ -1144,17 +1144,17 @@ pub fn canonicalize_penalty_spec(
         } => {
             let bd = col_range.len();
             if local.nrows() != bd || local.ncols() != bd {
-                crate::bail_invalid_estim!(format!(
+                crate::bail_invalid_estim!(
                     "{context}: block penalty {idx} local matrix must be {bd}x{bd}, got {}x{}",
                     local.nrows(),
                     local.ncols()
-                ));
+                );
             }
             if col_range.end > p {
-                crate::bail_invalid_estim!(format!(
+                crate::bail_invalid_estim!(
                     "{context}: block penalty {idx} col_range {}..{} exceeds p={p}",
                     col_range.start, col_range.end
-                ));
+                );
             }
             (
                 local.view(),
@@ -1166,11 +1166,11 @@ pub fn canonicalize_penalty_spec(
         }
         PenaltySpec::Dense(m) => {
             if m.nrows() != p || m.ncols() != p {
-                crate::bail_invalid_estim!(format!(
+                crate::bail_invalid_estim!(
                     "{context}: dense penalty {idx} must be {p}x{p}, got {}x{}",
                     m.nrows(),
                     m.ncols()
-                ));
+                );
             }
             (
                 m.view(),
@@ -1182,11 +1182,11 @@ pub fn canonicalize_penalty_spec(
         }
         PenaltySpec::DenseWithMean { matrix, prior_mean } => {
             if matrix.nrows() != p || matrix.ncols() != p {
-                crate::bail_invalid_estim!(format!(
+                crate::bail_invalid_estim!(
                     "{context}: dense penalty {idx} must be {p}x{p}, got {}x{}",
                     matrix.nrows(),
                     matrix.ncols()
-                ));
+                );
             }
             (matrix.view(), 0..p, prior_mean, None, None)
         }
@@ -1312,11 +1312,11 @@ pub fn canonicalize_penalty_specs(
     context: &str,
 ) -> Result<(Vec<CanonicalPenalty>, Vec<usize>), EstimationError> {
     if specs.len() != nullspace_dims.len() {
-        crate::bail_invalid_estim!(format!(
+        crate::bail_invalid_estim!(
             "{context}: nullspace_dims length mismatch: penalties={}, nullspace_dims={}",
             specs.len(),
             nullspace_dims.len()
-        ));
+        );
     }
 
     let mut active = Vec::with_capacity(specs.len());

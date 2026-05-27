@@ -95,7 +95,7 @@ fn embed_dense_block_to_sparse_symmetric_upper(
 ) -> Result<SparseColMat<usize, f64>, EstimationError> {
     let block_n = local.nrows();
     if local.ncols() != block_n {
-        crate::bail_invalid_estim!("embed_dense_block_to_sparse_symmetric_upper requires a square block".to_string(),);
+        crate::bail_invalid_estim!("embed_dense_block_to_sparse_symmetric_upper requires a square block");
     }
     if offset + block_n > total_dim {
         crate::bail_invalid_estim!("embed_dense_block_to_sparse_symmetric_upper offset+block exceeds total_dim"
@@ -444,11 +444,11 @@ fn canonicalize_sparse_symmetric_upper(
     tol: f64,
 ) -> Result<SparseColMat<usize, f64>, EstimationError> {
     if matrix.nrows() != matrix.ncols() {
-        crate::bail_invalid_estim!(format!(
+        crate::bail_invalid_estim!(
             "sparse SPD factorization requires square matrix, got {}x{}",
             matrix.nrows(),
             matrix.ncols()
-        ));
+        );
     }
 
     #[derive(Default, Clone, Copy)]
@@ -543,7 +543,7 @@ where
     for (row, col) in indices {
         let value = solved[(row, col)];
         if !value.is_finite() {
-            crate::bail_invalid_estim!(non_finite_message.to_string(),);
+            crate::bail_invalid_estim!("{}", non_finite_message.to_string());
         }
         consume(&mut result, row, col, value);
     }
@@ -558,11 +558,11 @@ where
     S: Data<Elem = f64>,
 {
     if rhs.len() != factor.n {
-        crate::bail_invalid_estim!(format!(
+        crate::bail_invalid_estim!(
             "sparse SPD solve dimension mismatch: rhs has {}, factor has {}",
             rhs.len(),
             factor.n
-        ));
+        );
     }
     let mut result = Array1::<f64>::zeros(rhs.len());
     solve_sparse_spd_into(factor, rhs, &mut result)?;
@@ -582,25 +582,25 @@ where
     S: Data<Elem = f64>,
 {
     if rhs.len() != factor.n {
-        crate::bail_invalid_estim!(format!(
+        crate::bail_invalid_estim!(
             "sparse SPD solve dimension mismatch: rhs has {}, factor has {}",
             rhs.len(),
             factor.n
-        ));
+        );
     }
     if out.len() != factor.n {
-        crate::bail_invalid_estim!(format!(
+        crate::bail_invalid_estim!(
             "sparse SPD solve output dimension mismatch: out has {}, factor has {}",
             out.len(),
             factor.n
-        ));
+        );
     }
     let rhsview = FaerColView::new(rhs);
     let solved = factor.factor.solve(rhsview.as_ref());
     for i in 0..factor.n {
         let value = solved[(i, 0)];
         if !value.is_finite() {
-            crate::bail_invalid_estim!("sparse SPD solve produced non-finite values".to_string(),);
+            crate::bail_invalid_estim!("sparse SPD solve produced non-finite values");
         }
         out[i] = value;
     }
@@ -615,11 +615,11 @@ where
     S: Data<Elem = f64>,
 {
     if rhs.nrows() != factor.n {
-        crate::bail_invalid_estim!(format!(
+        crate::bail_invalid_estim!(
             "sparse SPD multi-solve row mismatch: rhs has {}, factor has {}",
             rhs.nrows(),
             factor.n
-        ));
+        );
     }
     let indices = (0..rhs.nrows()).flat_map(|i| (0..rhs.ncols()).map(move |j| (i, j)));
     solve_view(
@@ -644,17 +644,17 @@ where
     S: Data<Elem = f64>,
 {
     if rhs.nrows() != factor.n {
-        crate::bail_invalid_estim!(format!(
+        crate::bail_invalid_estim!(
             "sparse SPD multi-solve row mismatch: rhs has {}, factor has {}",
             rhs.nrows(),
             factor.n
-        ));
+        );
     }
     if row_start > row_end || row_end > factor.n {
-        crate::bail_invalid_estim!(format!(
+        crate::bail_invalid_estim!(
             "sparse SPD selected rows out of bounds: row_start={}, row_end={}, factor={}",
             row_start, row_end, factor.n
-        ));
+        );
     }
     let indices = (row_start..row_end).flat_map(|i| (0..rhs.ncols()).map(move |j| (i, j)));
     solve_view(
@@ -678,12 +678,12 @@ where
     S: Data<Elem = f64>,
 {
     if row_start.saturating_add(rhs.ncols()) > rhs.nrows() {
-        crate::bail_invalid_estim!(format!(
+        crate::bail_invalid_estim!(
             "sparse SPD selected diagonal out of bounds: row_start={}, rows={}, cols={}",
             row_start,
             rhs.nrows(),
             rhs.ncols()
-        ));
+        );
     }
     let indices = (0..rhs.ncols()).map(|col| (row_start + col, col));
     solve_view(
@@ -1000,11 +1000,11 @@ impl SimplicialFactor {
     /// product and then map rows/columns back to the caller's coordinate order.
     fn assemble_h_dense_original_order(&self) -> Result<Array2<f64>, EstimationError> {
         if self.perm_inv.len() != self.n {
-            crate::bail_invalid_estim!(format!(
+            crate::bail_invalid_estim!(
                 "simplicial factor permutation length {} does not match dimension {}",
                 self.perm_inv.len(),
                 self.n
-            ));
+            );
         }
         let mut h_permuted = Array2::<f64>::zeros((self.n, self.n));
         for col in 0..self.n {
@@ -1014,9 +1014,9 @@ impl SimplicialFactor {
                 let left_row = self.l_row_idx[left_idx];
                 let left_value = self.l_values[left_idx];
                 if !left_value.is_finite() {
-                    crate::bail_invalid_estim!(format!(
+                    crate::bail_invalid_estim!(
                         "simplicial factor has non-finite L entry at value index {left_idx}"
-                    ));
+                    );
                 }
                 for right_idx in start..end {
                     let right_row = self.l_row_idx[right_idx];
@@ -1030,16 +1030,16 @@ impl SimplicialFactor {
         for i in 0..self.n {
             let pi = self.perm_inv[i];
             if pi >= self.n {
-                crate::bail_invalid_estim!(format!(
+                crate::bail_invalid_estim!(
                     "simplicial factor permutation maps row {i} to out-of-bounds index {pi}"
-                ));
+                );
             }
             for j in 0..self.n {
                 let pj = self.perm_inv[j];
                 if pj >= self.n {
-                    crate::bail_invalid_estim!(format!(
+                    crate::bail_invalid_estim!(
                         "simplicial factor permutation maps column {j} to out-of-bounds index {pj}"
-                    ));
+                    );
                 }
                 let value = h_permuted[[pi, pj]];
                 if !value.is_finite() {
@@ -1215,9 +1215,9 @@ impl TakahashiInverse {
                 }
                 let value = -correction / diag;
                 if !value.is_finite() {
-                    crate::bail_invalid_estim!(format!(
+                    crate::bail_invalid_estim!(
                         "Takahashi selected inverse produced non-finite entry ({i},{j})"
-                    ));
+                    );
                 }
                 z_values[idx] = value;
             }
@@ -1227,9 +1227,9 @@ impl TakahashiInverse {
             }
             let value = (1.0 / diag - correction) / diag;
             if !value.is_finite() {
-                crate::bail_invalid_estim!(format!(
+                crate::bail_invalid_estim!(
                     "Takahashi selected inverse produced non-finite diagonal entry ({j},{j})"
-                ));
+                );
             }
             z_values[diag_idx] = value;
         }

@@ -2871,12 +2871,12 @@ impl DerivativeStorageBackend for Array2<f64> {
         u: &Array1<f64>,
     ) -> Result<Array1<f64>, EstimationError> {
         if Array2::ncols(self) != u.len() {
-            crate::bail_invalid_estim!(format!(
+            crate::bail_invalid_estim!(
                 "dense hyper design derivative forward_mul_original width mismatch: matrix={}x{}, vector={}",
                 Array2::nrows(self),
                 Array2::ncols(self),
                 u.len()
-            ));
+            );
         }
         Ok(self.dot(u))
     }
@@ -2886,12 +2886,12 @@ impl DerivativeStorageBackend for Array2<f64> {
         v: &Array1<f64>,
     ) -> Result<Array1<f64>, EstimationError> {
         if Array2::nrows(self) != v.len() {
-            crate::bail_invalid_estim!(format!(
+            crate::bail_invalid_estim!(
                 "dense hyper design derivative transpose_mul_original height mismatch: matrix={}x{}, vector={}",
                 Array2::nrows(self),
                 Array2::ncols(self),
                 v.len()
-            ));
+            );
         }
         Ok(self.t().dot(v))
     }
@@ -2925,13 +2925,13 @@ impl DerivativeStorageBackend for Array2<f64> {
         amp: f64,
     ) -> Result<(), EstimationError> {
         if target.raw_dim() != self.raw_dim() {
-            crate::bail_invalid_estim!(format!(
+            crate::bail_invalid_estim!(
                 "dense hyper penalty derivative shape mismatch: target={}x{}, matrix={}x{}",
                 target.nrows(),
                 target.ncols(),
                 Array2::nrows(self),
                 Array2::ncols(self)
-            ));
+            );
         }
         target.scaled_add(amp, self);
         Ok(())
@@ -2967,11 +2967,11 @@ impl DerivativeStorageBackend for EmbeddedDerivativeMatrix {
         u: &Array1<f64>,
     ) -> Result<Array1<f64>, EstimationError> {
         if self.total_dim != u.len() {
-            crate::bail_invalid_estim!(format!(
+            crate::bail_invalid_estim!(
                 "embedded hyper design derivative forward_mul_original width mismatch: total_dim={}, vector={}",
                 self.total_dim,
                 u.len()
-            ));
+            );
         }
         let u_local = u.slice(s![self.global_range.clone()]).to_owned();
         Ok(self.local.dot(&u_local))
@@ -2982,11 +2982,11 @@ impl DerivativeStorageBackend for EmbeddedDerivativeMatrix {
         v: &Array1<f64>,
     ) -> Result<Array1<f64>, EstimationError> {
         if self.local.nrows() != v.len() {
-            crate::bail_invalid_estim!(format!(
+            crate::bail_invalid_estim!(
                 "embedded hyper design derivative transpose_mul_original height mismatch: local_rows={}, vector={}",
                 self.local.nrows(),
                 v.len()
-            ));
+            );
         }
         let mut out = Array1::<f64>::zeros(self.total_dim);
         let pulled = self.local.t().dot(v);
@@ -3000,11 +3000,11 @@ impl DerivativeStorageBackend for EmbeddedDerivativeMatrix {
         free_basis_opt: Option<&Array2<f64>>,
     ) -> Result<Array2<f64>, EstimationError> {
         if self.total_dim != qs.nrows() {
-            crate::bail_invalid_estim!(format!(
+            crate::bail_invalid_estim!(
                 "embedded design derivative width mismatch: total_cols={}, qs rows={}",
                 self.total_dim,
                 qs.nrows()
-            ));
+            );
         }
         let qs_local = qs.slice(s![self.global_range.clone(), ..]);
         let mut transformed = self.local.dot(&qs_local);
@@ -3020,11 +3020,11 @@ impl DerivativeStorageBackend for EmbeddedDerivativeMatrix {
         free_basis_opt: Option<&Array2<f64>>,
     ) -> Result<Array2<f64>, EstimationError> {
         if self.total_dim != qs.nrows() {
-            crate::bail_invalid_estim!(format!(
+            crate::bail_invalid_estim!(
                 "embedded penalty derivative width mismatch: total_dim={}, qs rows={}",
                 self.total_dim,
                 qs.nrows()
-            ));
+            );
         }
         let qs_local = qs.slice(s![self.global_range.clone(), ..]);
         let mut transformed = qs_local.t().dot(&self.local).dot(&qs_local);
@@ -3040,13 +3040,13 @@ impl DerivativeStorageBackend for EmbeddedDerivativeMatrix {
         amp: f64,
     ) -> Result<(), EstimationError> {
         if target.nrows() != self.total_dim || target.ncols() != self.total_dim {
-            crate::bail_invalid_estim!(format!(
+            crate::bail_invalid_estim!(
                 "embedded hyper penalty derivative shape mismatch: target={}x{}, expected {}x{}",
                 target.nrows(),
                 target.ncols(),
                 self.total_dim,
                 self.total_dim
-            ));
+            );
         }
         target
             .slice_mut(s![self.global_range.clone(), self.global_range.clone()])
@@ -3081,11 +3081,11 @@ impl DerivativeStorageBackend for ImplicitDerivativeOp {
         u: &Array1<f64>,
     ) -> Result<Array1<f64>, EstimationError> {
         if self.ncols() != u.len() {
-            crate::bail_invalid_estim!(format!(
+            crate::bail_invalid_estim!(
                 "implicit hyper design derivative forward_mul_original width mismatch: operator_cols={}, vector={}",
                 self.ncols(),
                 u.len()
-            ));
+            );
         }
         Ok(self.forward_mul(u))
     }
@@ -3095,11 +3095,11 @@ impl DerivativeStorageBackend for ImplicitDerivativeOp {
         v: &Array1<f64>,
     ) -> Result<Array1<f64>, EstimationError> {
         if self.nrows() != v.len() {
-            crate::bail_invalid_estim!(format!(
+            crate::bail_invalid_estim!(
                 "implicit hyper design derivative transpose_mul_original height mismatch: operator_rows={}, vector={}",
                 self.nrows(),
                 v.len()
-            ));
+            );
         }
         Ok(self.transpose_mul(v))
     }
@@ -3160,13 +3160,13 @@ impl DerivativeStorageBackend for ImplicitDerivativeOp {
     ) -> Result<(), EstimationError> {
         let dense = self.materialize_dense();
         if target.raw_dim() != dense.raw_dim() {
-            crate::bail_invalid_estim!(format!(
+            crate::bail_invalid_estim!(
                 "implicit hyper penalty derivative shape mismatch: target={}x{}, matrix={}x{}",
                 target.nrows(),
                 target.ncols(),
                 dense.nrows(),
                 dense.ncols()
-            ));
+            );
         }
         target.scaled_add(amp, dense);
         Ok(())
@@ -3194,11 +3194,11 @@ impl DerivativeStorageBackend for LatentCoordDerivativeOp {
         u: &Array1<f64>,
     ) -> Result<Array1<f64>, EstimationError> {
         if self.ncols() != u.len() {
-            crate::bail_invalid_estim!(format!(
+            crate::bail_invalid_estim!(
                 "latent-coordinate hyper design derivative forward_mul_original width mismatch: operator_cols={}, vector={}",
                 self.ncols(),
                 u.len()
-            ));
+            );
         }
         Ok(self.forward_mul(u))
     }
@@ -3208,11 +3208,11 @@ impl DerivativeStorageBackend for LatentCoordDerivativeOp {
         v: &Array1<f64>,
     ) -> Result<Array1<f64>, EstimationError> {
         if self.nrows() != v.len() {
-            crate::bail_invalid_estim!(format!(
+            crate::bail_invalid_estim!(
                 "latent-coordinate hyper design derivative transpose_mul_original height mismatch: operator_rows={}, vector={}",
                 self.nrows(),
                 v.len()
-            ));
+            );
         }
         Ok(self.transpose_mul(v))
     }
@@ -3273,13 +3273,13 @@ impl DerivativeStorageBackend for LatentCoordDerivativeOp {
     ) -> Result<(), EstimationError> {
         let dense = self.materialize_dense();
         if target.raw_dim() != dense.raw_dim() {
-            crate::bail_invalid_estim!(format!(
+            crate::bail_invalid_estim!(
                 "latent-coordinate hyper penalty derivative shape mismatch: target={}x{}, matrix={}x{}",
                 target.nrows(),
                 target.ncols(),
                 dense.nrows(),
                 dense.ncols()
-            ));
+            );
         }
         target.scaled_add(amp, dense);
         Ok(())
@@ -3555,10 +3555,10 @@ impl DirectionalHyperParam {
         let mut out: Vec<PenaltyDerivativeComponent> = Vec::with_capacity(components.len());
         for (penalty_index, matrix) in components {
             if out.iter().any(|c| c.penalty_index == penalty_index) {
-                crate::bail_invalid_estim!(format!(
+                crate::bail_invalid_estim!(
                     "duplicate penalty derivative component for penalty {}",
                     penalty_index
-                ));
+                );
             }
             out.push(PenaltyDerivativeComponent {
                 penalty_index,
@@ -3684,21 +3684,21 @@ impl DirectionalHyperParam {
         let mut out = Array2::<f64>::zeros((p, p));
         for component in &self.penalty_first_components {
             if component.matrix.nrows() != p || component.matrix.ncols() != p {
-                crate::bail_invalid_estim!(format!(
+                crate::bail_invalid_estim!(
                     "S_tau shape mismatch for penalty {}: expected {}x{}, got {}x{}",
                     component.penalty_index,
                     p,
                     p,
                     component.matrix.nrows(),
                     component.matrix.ncols()
-                ));
+                );
             }
             if component.penalty_index >= rho.len() {
-                crate::bail_invalid_estim!(format!(
+                crate::bail_invalid_estim!(
                     "penalty_index {} out of bounds for rho dimension {}",
                     component.penalty_index,
                     rho.len()
-                ));
+                );
             }
             component
                 .matrix

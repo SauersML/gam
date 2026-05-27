@@ -279,9 +279,9 @@ pub(crate) struct IntegratedInverseLinkJet5 {
 #[inline]
 pub(crate) fn validate_latent_cloglog_inputs(eta: f64, sigma: f64) -> Result<(), EstimationError> {
     if !eta.is_finite() || !sigma.is_finite() || sigma < 0.0 {
-        crate::bail_invalid_estim!(format!(
+        crate::bail_invalid_estim!(
             "latent cloglog jet requires finite eta and sigma >= 0, got eta={eta}, sigma={sigma}"
-        ));
+        );
     }
     Ok::<(), _>(())
 }
@@ -551,7 +551,7 @@ fn cloglog_cc_required_nodes(mu: f64, sigma: f64, tol: f64) -> Result<usize, Est
     let numer = ((8.0 * a * m_s) / ((rho - 1.0).max(1e-12) * eps_quad)).max(1.0);
     let denom = rho.ln();
     if !denom.is_finite() || denom <= 0.0 {
-        crate::bail_invalid_estim!("CC cloglog backend ellipse bound became degenerate".to_string(),);
+        crate::bail_invalid_estim!("CC cloglog backend ellipse bound became degenerate");
     }
 
     let mut n = (1.0 + numer.ln() / denom).ceil() as usize;
@@ -1057,7 +1057,7 @@ pub(crate) fn logit_posterior_meanwith_deriv_exact(
     // (e.g. 128 nodes) on sigma in {0.01, 0.1, 1, 5, 20, 100} and mu on
     // [-10, 10] to confirm the regime transitions.
     if !(mu.is_finite() && sigma.is_finite()) {
-        crate::bail_invalid_estim!("logit exact expectation requires finite mu and sigma".to_string(),);
+        crate::bail_invalid_estim!("logit exact expectation requires finite mu and sigma");
     }
     if sigma <= LOGIT_SIGMA_DEGENERATE {
         let (mean, dmean_dmu) = stable_sigmoidwith_derivative(mu);
@@ -1164,7 +1164,7 @@ fn logit_posterior_meanwith_deriv_exact_erfcx(
         mean = 1.0 - mean;
     }
     if !(mean.is_finite() && dmean.is_finite() && dmean >= 0.0) {
-        crate::bail_invalid_estim!("logit erfcx expectation produced non-finite values".to_string(),);
+        crate::bail_invalid_estim!("logit erfcx expectation produced non-finite values");
     }
     Ok(IntegratedMeanDerivative {
         mean,
@@ -1217,7 +1217,7 @@ fn logit_posterior_meanwith_deriv_controlled(
     sigma: f64,
 ) -> Result<IntegratedMeanDerivative, EstimationError> {
     if !(mu.is_finite() && sigma.is_finite()) {
-        crate::bail_invalid_estim!("logit integrated moments require finite mu and sigma".to_string(),);
+        crate::bail_invalid_estim!("logit integrated moments require finite mu and sigma");
     }
     match logit_posterior_meanwith_deriv_exact(mu, sigma) {
         Ok(out) => Ok(out),
@@ -1961,7 +1961,7 @@ fn cloglog_survival_miles(mu: f64, sigma: f64) -> Result<f64, EstimationError> {
             let log_half_erfc = log_half_erfc_stable(u);
             let term_log = base_log + log_half_erfc;
             if term_log > QUADRATURE_EXP_LOG_MAX {
-                crate::bail_invalid_estim!("Miles cloglog series term exceeded finite exp range".to_string(),);
+                crate::bail_invalid_estim!("Miles cloglog series term exceeded finite exp range");
             }
             let term = sign * safe_exp(term_log);
             pair_s += term;
@@ -2042,7 +2042,7 @@ fn cloglog_survival_cc(
         .max(1.0);
     let n = cloglog_cc_required_nodes(mu, sigma, tol)?;
     if n > CLOGLOG_CC_NODE_CAP {
-        crate::bail_invalid_estim!("CC cloglog backend requires too many nodes".to_string(),);
+        crate::bail_invalid_estim!("CC cloglog backend requires too many nodes");
     }
 
     let rule = ctx.clenshaw_curtis_n(n);
@@ -2062,7 +2062,7 @@ fn cloglog_survival_cc(
 
     let survival = (a * sum).clamp(0.0, 1.0);
     if !survival.is_finite() {
-        crate::bail_invalid_estim!("CC cloglog backend produced non-finite values".to_string(),);
+        crate::bail_invalid_estim!("CC cloglog backend produced non-finite values");
     }
     Ok(survival)
 }
@@ -2215,7 +2215,7 @@ fn complex_log_gamma_lanczos(z: Complex) -> Complex {
 
 fn cloglog_survival_gamma_reference(mu: f64, sigma: f64) -> Result<f64, EstimationError> {
     if !(mu.is_finite() && sigma.is_finite()) || sigma <= 0.0 {
-        crate::bail_invalid_estim!("Gamma cloglog reference backend requires finite mu and positive sigma".to_string(),);
+        crate::bail_invalid_estim!("Gamma cloglog reference backend requires finite mu and positive sigma");
     }
 
     // Exact Mellin-Barnes / Bromwich representation for the lognormal Laplace
@@ -2289,7 +2289,7 @@ fn cloglog_survival_gamma_reference(mu: f64, sigma: f64) -> Result<f64, Estimati
     }
     let sval = ((h / 3.0) * sum_s / std::f64::consts::PI).clamp(0.0, 1.0);
     if !sval.is_finite() {
-        crate::bail_invalid_estim!("Gamma cloglog reference backend produced non-finite values".to_string(),);
+        crate::bail_invalid_estim!("Gamma cloglog reference backend produced non-finite values");
     }
     Ok(sval)
 }
@@ -2687,10 +2687,10 @@ fn integrated_mixture_jet(
     // derivatives for the probit component are therefore not threaded here
     // because the integrated PIRLS callers do not consume them.
     if mixture_state.components.is_empty() {
-        crate::bail_invalid_estim!("integrated mixture-link jet requires at least one blended component".to_string(),);
+        crate::bail_invalid_estim!("integrated mixture-link jet requires at least one blended component");
     }
     if mixture_state.components.len() != mixture_state.pi.len() {
-        crate::bail_invalid_estim!("integrated mixture-link jet requires matching component and weight counts".to_string(),);
+        crate::bail_invalid_estim!("integrated mixture-link jet requires matching component and weight counts");
     }
 
     // Validation note: compare against a 128-point direct GHQ reference for
@@ -2827,9 +2827,9 @@ pub fn integrated_family_moments_jet(
 ) -> Result<IntegratedMomentsJet, EstimationError> {
     const PROB_EPS: f64 = 1e-12;
     if !(eta.is_finite() && (-700.0..=700.0).contains(&eta)) {
-        crate::bail_invalid_estim!(format!(
+        crate::bail_invalid_estim!(
             "integrated moments eta must be finite and within [-700, 700]; got {eta}"
-        ));
+        );
     }
     let e = eta;
     let se = se_eta.max(0.0);
@@ -4210,7 +4210,7 @@ mod tests {
         let mean = cloglog_mean_from_survival(survival);
         let dmean = cloglog_shift_identity_derivative(mu, sigma, shifted_survival);
         if !(mean.is_finite() && dmean.is_finite()) {
-            crate::bail_invalid_estim!("Gamma cloglog reference backend produced non-finite values".to_string(),);
+            crate::bail_invalid_estim!("Gamma cloglog reference backend produced non-finite values");
         }
         Ok(IntegratedMeanDerivative {
             mean,

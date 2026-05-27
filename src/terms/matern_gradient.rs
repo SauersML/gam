@@ -38,21 +38,21 @@ impl StreamingMaternBasisGradientEvaluator {
                     .to_string(),);
         }
         if centers.iter().any(|v| !v.is_finite()) {
-            crate::bail_invalid_basis!("StreamingMaternBasisGradientEvaluator centers must be finite".to_string(),);
+            crate::bail_invalid_basis!("StreamingMaternBasisGradientEvaluator centers must be finite");
         }
         if !(length_scale.is_finite() && length_scale > 0.0) {
-            crate::bail_invalid_basis!(format!(
+            crate::bail_invalid_basis!(
                 "StreamingMaternBasisGradientEvaluator length_scale must be finite and positive; got {length_scale}"
-            ));
+            );
         }
         let metric_weights = match aniso_log_scales {
             Some(eta) => {
                 if eta.len() != centers.ncols() {
-                    crate::bail_dim_basis!(format!(
+                    crate::bail_dim_basis!(
                         "aniso_log_scales length {} != center dimension {}",
                         eta.len(),
                         centers.ncols()
-                    ));
+                    );
                 }
                 eta.iter()
                     .enumerate()
@@ -95,18 +95,18 @@ impl StreamingMaternBasisGradientEvaluator {
     ) -> Result<Array2<f64>, BasisError> {
         self.validate_data(data)?;
         if start > end || end > data.nrows() {
-            crate::bail_invalid_basis!(format!(
+            crate::bail_invalid_basis!(
                 "Matérn gradient row chunk {start}..{end} is outside data with {} rows",
                 data.nrows()
-            ));
+            );
         }
         if let MaternBasisGradientTarget::AnisoLogScale(axis) = target
             && axis >= self.dimension()
         {
-            crate::bail_invalid_basis!(format!(
+            crate::bail_invalid_basis!(
                 "Matérn anisotropic gradient axis {axis} out of bounds for dimension {}",
                 self.dimension()
-            ));
+            );
         }
 
         let chunk_n = end - start;
@@ -176,11 +176,11 @@ impl StreamingMaternBasisGradientEvaluator {
     ) -> Result<Array1<f64>, BasisError> {
         self.validate_data(data)?;
         if coeffs.len() != self.n_centers() {
-            crate::bail_dim_basis!(format!(
+            crate::bail_dim_basis!(
                 "Matérn gradient coeff length {} != centers {}",
                 coeffs.len(),
                 self.n_centers()
-            ));
+            );
         }
         let mut out = Array1::<f64>::zeros(data.nrows());
         for start in (0..data.nrows()).step_by(self.chunk_size) {
@@ -193,14 +193,14 @@ impl StreamingMaternBasisGradientEvaluator {
 
     fn validate_data(&self, data: ArrayView2<'_, f64>) -> Result<(), BasisError> {
         if data.ncols() != self.dimension() {
-            crate::bail_dim_basis!(format!(
+            crate::bail_dim_basis!(
                 "Matérn gradient data dimension {} != center dimension {}",
                 data.ncols(),
                 self.dimension()
-            ));
+            );
         }
         if data.iter().any(|v| !v.is_finite()) {
-            crate::bail_invalid_basis!("Matérn gradient data must be finite".to_string(),);
+            crate::bail_invalid_basis!("Matérn gradient data must be finite");
         }
         Ok::<(), _>(())
     }
