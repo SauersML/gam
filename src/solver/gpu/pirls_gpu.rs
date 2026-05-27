@@ -103,7 +103,7 @@ pub struct SigmaPirlsGpuWorkspace {
 }
 
 #[cfg(target_os = "linux")]
-mod cuda {
+pub(crate) mod cuda {
     use super::{
         PirlsGpuInput, PirlsGpuSharedData, PirlsGpuStep, PirlsStepStreamDeviceInput,
         PirlsStepStreamInput, SigmaPirlsGpuWorkspace,
