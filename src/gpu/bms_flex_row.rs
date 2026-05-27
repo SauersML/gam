@@ -1577,6 +1577,144 @@ extern "C" __global__ void bms_flex_row_hvp_partial_packed(
     }
 }
 
+// ────────────────────────────────────────────────────────────────────────
+// Phase 6 — dense joint-Hessian block kernel for the debug / exact-REML
+// route. Materialises the full `[p_total, p_total]` row-major joint H
+// from the per-row r×r Hessian via the P_i pullback. NOT the default
+// Newton path: production Newton uses HVP (Phase 2/3); this kernel exists
+// for exact-REML logdet / dense-H comparisons / diagnostic dumps where the
+// caller genuinely needs the dense matrix on the device.
+//
+// Per-CTA partial: each CTA owns a contiguous chunk of rows
+// `[chunk*rows_per_cta, (chunk+1)*rows_per_cta)`. Inside the CTA the
+// per-row pullback computes `(P_i^T H_i P_i)[m, n]` and adds it to the
+// CTA's shared-mem `[p_total, p_total]` partial. The reduce kernel sums
+// chunk-major-fixed-order into a single `[p_total, p_total]` output.
+//
+// Math: for primary index u ∈ [0, r):
+//   * u = 0:        phi_u = (X_i in slot 0..p_m, 0 elsewhere)
+//   * u = 1:        phi_u = (0, G_i in slot p_m..p_m+p_g, 0 elsewhere)
+//   * u = 2+j:      phi_u = e_{h_block_start + j}  (j ∈ 0..h_block_len)
+//   * u = 2+h+l:    phi_u = e_{w_block_start + l}  (l ∈ 0..w_block_len)
+// Then `H_full[m, n] += sum_{u,v} H_i[u,v] * phi_u[m] * phi_v[n]`.
+//
+// Shared-memory budget: at biobank shape p_total = 44, a [44, 44] f64
+// partial is 44*44*8 = 15.5 KiB — well below the V100 48 KiB/SM cap.
+// At p_total ≤ 80 the kernel still fits (80*80*8 = 50 KiB → just over
+// V100 cap; caller must enforce p_total ≤ DENSE_BLOCK_MAX_P). The
+// launcher rejects oversize p_total cleanly.
+
+extern "C" __global__ void bms_flex_row_dense_block_partial(
+    int                  n_rows,
+    int                  r,
+    int                  p_m,
+    int                  p_g,
+    int                  p_total,
+    int                  h_block_start,
+    int                  h_block_len,
+    int                  w_block_start,
+    int                  w_block_len,
+    int                  h_primary_start,
+    int                  w_primary_start,
+    int                  rows_per_cta,
+    const double * __restrict__ row_hessians,    // [n, r*r]
+    const double * __restrict__ marginal_design, // [n, p_m]
+    const double * __restrict__ logslope_design, // [n, p_g]
+    double       * __restrict__ partial)         // [num_chunks, p_total, p_total]
+{
+    extern __shared__ double shmem[];
+    int chunk = blockIdx.x;
+    int tid   = threadIdx.x;
+    int row_lo = chunk * rows_per_cta;
+    int row_hi = row_lo + rows_per_cta;
+    if (row_hi > n_rows) row_hi = n_rows;
+
+    int pp = p_total * p_total;
+    double *acc = shmem; // CTA-private accumulator [p_total, p_total]
+    for (int j = tid; j < pp; j += blockDim.x) acc[j] = 0.0;
+    __syncthreads();
+
+    // Per-row work performed by thread 0 to avoid cross-thread RW
+    // contention on `acc[]`. Per-row complexity is O(r * p_m + r * p_g
+    // + r²): tractable because r ≤ 32 and p_m + p_g typically ≤ 64.
+    // Tighter parallel implementations are possible (warp-stripe the
+    // 4-way nested u-v-m-n loop) but Phase 6 is a debug-only path and
+    // the simple version is easier to audit for correctness against
+    // the CPU `accumulate_row_hessian_pullback` reference.
+    if (tid == 0) {
+        for (int row = row_lo; row < row_hi; ++row) {
+            const double *mrow = marginal_design + (size_t)row * (size_t)p_m;
+            const double *grow = logslope_design + (size_t)row * (size_t)p_g;
+            const double *Hrow = row_hessians + (size_t)row * (size_t)r * (size_t)r;
+            for (int u = 0; u < r; ++u) {
+                for (int v = 0; v < r; ++v) {
+                    double huv = Hrow[u * r + v];
+                    if (huv == 0.0) continue;
+                    // For each (u, v), iterate (m, n) over the non-zero
+                    // outer-product support of phi_u and phi_v.
+                    // Build a small (offset, len, src_ptr) descriptor for
+                    // each operand block as we go.
+                    int m_off, m_len; const double *m_src; bool m_indicator;
+                    int n_off, n_len; const double *n_src; bool n_indicator;
+                    if (u == 0)      { m_off = 0;   m_len = p_m; m_src = mrow; m_indicator = false; }
+                    else if (u == 1) { m_off = p_m; m_len = p_g; m_src = grow; m_indicator = false; }
+                    else if (u - 2 < h_block_len) {
+                                       m_off = h_block_start + (u - 2);
+                                       m_len = 1;   m_src = NULL; m_indicator = true;
+                    } else {
+                                       m_off = w_block_start + (u - 2 - h_block_len);
+                                       m_len = 1;   m_src = NULL; m_indicator = true;
+                    }
+                    if (v == 0)      { n_off = 0;   n_len = p_m; n_src = mrow; n_indicator = false; }
+                    else if (v == 1) { n_off = p_m; n_len = p_g; n_src = grow; n_indicator = false; }
+                    else if (v - 2 < h_block_len) {
+                                       n_off = h_block_start + (v - 2);
+                                       n_len = 1;   n_src = NULL; n_indicator = true;
+                    } else {
+                                       n_off = w_block_start + (v - 2 - h_block_len);
+                                       n_len = 1;   n_src = NULL; n_indicator = true;
+                    }
+                    // accumulate huv * phi_u[m] * phi_v[n] into acc[m, n]
+                    for (int mi = 0; mi < m_len; ++mi) {
+                        double pm = m_indicator ? 1.0 : m_src[mi];
+                        if (pm == 0.0) continue;
+                        double scaled = huv * pm;
+                        int m_idx = m_off + mi;
+                        for (int ni = 0; ni < n_len; ++ni) {
+                            double pn = n_indicator ? 1.0 : n_src[ni];
+                            int n_idx = n_off + ni;
+                            acc[m_idx * p_total + n_idx] += scaled * pn;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    __syncthreads();
+
+    // Write CTA accumulator out to global memory at its chunk slot.
+    double *out_chunk = partial + (size_t)chunk * (size_t)pp;
+    for (int j = tid; j < pp; j += blockDim.x) {
+        out_chunk[j] = acc[j];
+    }
+}
+
+extern "C" __global__ void bms_flex_row_dense_block_reduce(
+    int                  num_chunks,
+    int                  p_total,
+    const double * __restrict__ partial,
+    double       * __restrict__ out)
+{
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    int pp = p_total * p_total;
+    if (j >= pp) return;
+    double acc = 0.0;
+    for (int c = 0; c < num_chunks; ++c) {
+        acc += partial[(size_t)c * (size_t)pp + (size_t)j];
+    }
+    out[j] = acc;
+}
+
 extern "C" __global__ void bms_flex_row_diag_partial_packed(
     int                  n_rows,
     int                  r,

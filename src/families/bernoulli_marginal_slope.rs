@@ -1942,22 +1942,15 @@ pub(crate) fn enforce_cross_block_identifiability_for_flex_block(
         ));
     }
 
-    let null_basis_evaluator = AnchorNullSpaceEvaluator::Stacked {
-        components: anchor_components,
-        orthonormalising_rotation: Array2::<f64>::eye(d_total),
-    };
-    let residual = AnchorResidual {
-        residual_coefficients,
-        null_basis_evaluator,
-    };
-
-    // Install: cache N_train rows so `design_at_training_with_residual`
-    // can rebuild block.design without re-deriving the parametric rows,
-    // then apply the right-selector V and the residual M.
-    candidate.runtime.set_anchor_rows_at_training(n_train);
+    // Install: hand the compiled flex block to the runtime in one call.
+    // `install_compiled_flex_block` caches N_train rows, applies the
+    // right-selector V to span_c{0..3} + boundary/monotonicity rows, and
+    // stores the anchor correction M alongside the per-anchor predict-time
+    // tags so the saved model can replay the anchor row map.
+    let _ = residual_coefficients; // value flows through CompiledBlock below
     candidate
         .runtime
-        .compose_anchor_orthogonalisation(&v_selector, Some(residual))?;
+        .install_compiled_flex_block(candidate_compiled, anchor_components, n_train)?;
     let new_design = candidate
         .runtime
         .design_at_training_with_residual(candidate_arg_at_training_rows)?;
