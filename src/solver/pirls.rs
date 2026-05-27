@@ -46,16 +46,6 @@ pub use crate::solver::active_set::{ConstraintKktDiagnostics, LinearInequalityCo
 
 use crate::linalg::utils::{array_is_finite, inf_norm};
 
-#[inline]
-fn array1_is_finite(values: &Array1<f64>) -> bool {
-    array_is_finite(values)
-}
-
-#[inline]
-fn array2_is_finite(values: &Array2<f64>) -> bool {
-    array_is_finite(values)
-}
-
 const GAMMA_SHAPE_MIN: f64 = 1e-8;
 const GAMMA_SHAPE_MAX: f64 = 1e12;
 const GAMMA_SHAPE_TARGET_TOL: f64 = 1e-12;
