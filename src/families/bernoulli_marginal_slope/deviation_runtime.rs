@@ -544,7 +544,7 @@ impl DeviationRuntime {
     // `integrated_derivative_penalty_with_nullity` are also expressed in
     // the new parameterisation.
     //
-    // Used by `enforce_cross_block_identifiability_for_flex_block` to
+    // Used by `install_compiled_flex_block_into_runtime` to
     // enforce the joint-design identifiability invariant in the W-metric
     // (W = p(1−p) at training rows). With `A_train` the stacked parametric
     // anchors and `C_train = span_eval(values)` the candidate basis at the
@@ -740,7 +740,7 @@ impl DeviationRuntime {
     }
 
     /// Cached parametric-anchor matrix at training rows, installed by
-    /// `enforce_cross_block_identifiability_for_flex_block` when the
+    /// `install_compiled_flex_block_into_runtime` when the
     /// runtime is reparameterised against the parametric anchor union.
     /// Used by per-row link-deviation evaluators that need the row's
     /// anchor slice to apply `design_with_anchor_rows` correctly. Returns

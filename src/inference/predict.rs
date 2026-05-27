@@ -12,7 +12,7 @@ use crate::families::strategy::{
     FamilyStrategy, strategy_for_family, strategy_for_spec, strategy_from_fit,
 };
 use crate::inference::model::{
-    SavedAnchoredDeviationRuntime, SavedLatentZNormalization, SavedLinkWiggleRuntime,
+    SavedCompiledFlexBlock, SavedLatentZNormalization, SavedLinkWiggleRuntime,
 };
 use crate::inference::prediction_linalg::{
     PredictionCovarianceBackend, design_row_chunk, prediction_chunk_rows,
@@ -1072,8 +1072,8 @@ pub struct BernoulliMarginalSlopePredictor {
     pub baseline_marginal: f64,
     pub baseline_logslope: f64,
     pub covariance: Option<Array2<f64>>,
-    pub score_warp_runtime: Option<SavedAnchoredDeviationRuntime>,
-    pub link_deviation_runtime: Option<SavedAnchoredDeviationRuntime>,
+    pub score_warp_runtime: Option<SavedCompiledFlexBlock>,
+    pub link_deviation_runtime: Option<SavedCompiledFlexBlock>,
     pub gaussian_frailty_sd: Option<f64>,
     /// Optional rank-INT latent-z calibration. When `Some`, every
     /// predict-time z (after `latent_z_normalization`) is routed through
@@ -1106,7 +1106,7 @@ pub struct BernoulliMarginalSlopePredictor {
 /// link_dev gets `[marginal | logslope | score_warp_design(z)]` when the
 /// fit-time identifiability stage threaded the score-warp basis in as a
 /// flex-evaluation anchor). These layouts must match the column order
-/// `enforce_cross_block_identifiability_for_flex_block` used at fit time.
+/// `install_compiled_flex_block_into_runtime` used at fit time.
 #[derive(Default)]
 struct BmsAnchorCorrections {
     /// `[marginal | logslope]` at predict rows. `Some` whenever any
@@ -1221,7 +1221,7 @@ impl BernoulliMarginalSlopePredictor {
         };
 
         // Link-deviation anchor layout matches the fit-time stacking in
-        // `enforce_cross_block_identifiability_for_flex_block`: parametric
+        // `install_compiled_flex_block_into_runtime`: parametric
         // columns first, then (if a FlexEvaluation component is present)
         // the score-warp runtime's reparameterised basis at predict rows.
         let (link_dev_anchor_rows, link_dev) = if needs_link {
@@ -1317,7 +1317,7 @@ impl BernoulliMarginalSlopePredictor {
     /// the score-warp runtime, whose fit-time stacking is parametric-only.
     fn validate_runtime_anchor_layout_parametric_only(
         &self,
-        runtime: &SavedAnchoredDeviationRuntime,
+        runtime: &SavedCompiledFlexBlock,
         runtime_label: &str,
     ) -> Result<(), EstimationError> {
         use crate::inference::model::SavedAnchorKind;
@@ -1937,8 +1937,8 @@ impl BernoulliMarginalSlopePredictor {
         baseline_logslope: f64,
         base_link: InverseLink,
         frailty: FrailtySpec,
-        score_warp_runtime: Option<SavedAnchoredDeviationRuntime>,
-        link_deviation_runtime: Option<SavedAnchoredDeviationRuntime>,
+        score_warp_runtime: Option<SavedCompiledFlexBlock>,
+        link_deviation_runtime: Option<SavedCompiledFlexBlock>,
         latent_z_calibration: Option<
             crate::families::bernoulli_marginal_slope::LatentZRankIntCalibration,
         >,
@@ -5635,15 +5635,15 @@ mod tests {
         BlockRole, FitArtifacts, FittedBlock, FittedLinkState, UnifiedFitResult,
         UnifiedFitResultParts,
     };
-    use crate::inference::model::SavedAnchoredDeviationRuntime;
+    use crate::inference::model::SavedCompiledFlexBlock;
     use crate::pirls::PirlsStatus;
     use crate::types::LinkFunction;
     use ndarray::{Array1, Array2, array};
 
     fn saved_runtime_from_deviation_runtime(
         runtime: &crate::families::bernoulli_marginal_slope::DeviationRuntime,
-    ) -> SavedAnchoredDeviationRuntime {
-        SavedAnchoredDeviationRuntime {
+    ) -> SavedCompiledFlexBlock {
+        SavedCompiledFlexBlock {
             kernel:
                 crate::families::bernoulli_marginal_slope::exact_kernel::ANCHORED_DEVIATION_KERNEL
                     .to_string(),
@@ -5891,7 +5891,7 @@ mod tests {
             baseline_marginal: 0.0,
             baseline_logslope: 0.0,
             covariance: None,
-            score_warp_runtime: Some(SavedAnchoredDeviationRuntime {
+            score_warp_runtime: Some(SavedCompiledFlexBlock {
                 kernel: "OldQuadrature".to_string(),
                 ..production_runtime.clone()
             }),

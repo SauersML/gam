@@ -1656,14 +1656,14 @@ fn append_deviation_function_penalty(
 // residualisation theorem is `span(C) ⊆ span(A) ⇔ (I − P_A) C = 0`, and
 // that is what this code actually tests.
 //
-// `enforce_cross_block_identifiability_for_flex_block` takes two slices —
+// `install_compiled_flex_block_into_runtime` takes two slices —
 // `parametric_anchors: &[(&DesignMatrix, ParametricAnchorBlock)]` and
 // `flex_anchors: &[&Array2<f64>]` — preserving the parametric-before-flex
 // invariant by construction. The K=1 row-Jacobian math runs through
 // `identifiability_compiler::compile`, so there is exactly one cross-block
 // residualisation math implementation in the codebase.
 
-/// Outcome of [`enforce_cross_block_identifiability_for_flex_block`].
+/// Outcome of [`install_compiled_flex_block_into_runtime`].
 ///
 /// * `Reparameterised` — the candidate was reparameterised in place so
 ///   its column span at the n training rows is orthogonal to the anchor
@@ -1679,7 +1679,7 @@ fn append_deviation_function_penalty(
 ///   pre-call state (the reparameterisation is never applied) so the
 ///   caller can safely discard it.
 #[derive(Debug)]
-pub(crate) enum CrossBlockIdentifiabilityOutcome {
+pub(crate) enum FlexCompileOutcome {
     Reparameterised,
     FullyAliased { reason: String },
 }
@@ -1773,14 +1773,14 @@ pub struct CrossBlockIdentifiabilityWarning {
 /// their unpenalised span; the diagnostic surfaces this explicitly rather
 /// than letting the inner solver collide with the resulting rank-deficient
 /// Hessian.
-pub(crate) fn enforce_cross_block_identifiability_for_flex_block(
+pub(crate) fn install_compiled_flex_block_into_runtime(
     candidate: &mut DeviationPrepared,
     candidate_arg_at_training_rows: &Array1<f64>,
     candidate_cfg: &DeviationBlockConfig,
     parametric_anchors: &[(&DesignMatrix, crate::families::bernoulli_marginal_slope::deviation_runtime::ParametricAnchorBlock)],
     flex_anchors: &[&Array2<f64>],
     training_row_weights: &Array1<f64>,
-) -> Result<CrossBlockIdentifiabilityOutcome, String> {
+) -> Result<FlexCompileOutcome, String> {
     use crate::families::bernoulli_marginal_slope::deviation_runtime::{
         AnchorNullSpaceComponent, AnchorNullSpaceEvaluator, AnchorResidual,
     };
@@ -1795,7 +1795,7 @@ pub(crate) fn enforce_cross_block_identifiability_for_flex_block(
     let n = candidate_design.nrows();
     let p_candidate = candidate_design.ncols();
     if p_candidate == 0 {
-        return Ok(CrossBlockIdentifiabilityOutcome::Reparameterised);
+        return Ok(FlexCompileOutcome::Reparameterised);
     }
     if training_row_weights.len() != n {
         return Err(format!(
@@ -1861,7 +1861,7 @@ pub(crate) fn enforce_cross_block_identifiability_for_flex_block(
     if total_anchor_cols == 0 {
         // No anchors to residualise against — the candidate's own per-block
         // smoothness-null-space drop already handles intra-block aliasing.
-        return Ok(CrossBlockIdentifiabilityOutcome::Reparameterised);
+        return Ok(FlexCompileOutcome::Reparameterised);
     }
 
     // Stack the anchor dense blocks horizontally into N_train (n × d_total)
@@ -1922,7 +1922,7 @@ pub(crate) fn enforce_cross_block_identifiability_for_flex_block(
              numerical tolerance. Drop the flex block or remove the anchor term that reproduces \
              its argument; knot count is NOT the relevant lever for this failure mode.",
         );
-        return Ok(CrossBlockIdentifiabilityOutcome::FullyAliased { reason });
+        return Ok(FlexCompileOutcome::FullyAliased { reason });
     }
     let residual_coefficients =
         candidate_compiled
@@ -1981,7 +1981,7 @@ pub(crate) fn enforce_cross_block_identifiability_for_flex_block(
         joint_rank = compiled.joint_rank,
         dropped = compiled.dropped.len(),
     );
-    Ok(CrossBlockIdentifiabilityOutcome::Reparameterised)
+    Ok(FlexCompileOutcome::Reparameterised)
 }
 
 pub(crate) fn project_monotone_feasible_beta(
@@ -7437,7 +7437,7 @@ impl BernoulliMarginalSlopeFamily {
         //   ℓ(η) = η + Φ_link_dev(η) · β_link
         //
         // is the row-i link deviation. After
-        // `enforce_cross_block_identifiability_for_flex_block`
+        // `install_compiled_flex_block_into_runtime`
         // reparameterised the link-deviation runtime against the
         // marginal+logslope parametric anchor union, the per-row
         // reparameterised basis is
@@ -19252,11 +19252,11 @@ pub fn fit_bernoulli_marginal_slope_terms(
     let score_warp_prepared = if let Some(cfg) = spec.score_warp.as_ref() {
         use crate::families::bernoulli_marginal_slope::deviation_runtime::ParametricAnchorBlock;
         let mut prepared = build_score_warp_deviation_block_from_seed(z_train, cfg)?;
-        // `enforce_cross_block_identifiability_for_flex_block` now delegates
+        // `install_compiled_flex_block_into_runtime` now delegates
         // its math body to `identifiability_compiler::compile` (commit
         // 4e20b8dc8); the prior Phase-4a shadow compile here was a
         // duplicate of that internal call and has been removed.
-        let outcome = enforce_cross_block_identifiability_for_flex_block(
+        let outcome = install_compiled_flex_block_into_runtime(
             &mut prepared,
             z_train,
             cfg,
@@ -19268,8 +19268,8 @@ pub fn fit_bernoulli_marginal_slope_terms(
             &cross_block_pilot_w_score_warp,
         )?;
         match outcome {
-            CrossBlockIdentifiabilityOutcome::Reparameterised => Some(prepared),
-            CrossBlockIdentifiabilityOutcome::FullyAliased { reason } => {
+            FlexCompileOutcome::Reparameterised => Some(prepared),
+            FlexCompileOutcome::FullyAliased { reason } => {
                 log::warn!(
                     "[BMS cross-block identifiability] score-warp block fully aliased \
                      by marginal+logslope anchors; dropping the block. {reason}"
@@ -19351,7 +19351,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
         // > 0` for every β. This is the standard GAM `gam.side`
         // convention generalised to multi-anchor unions (mgcv applies it
         // sequentially across smooths sharing a covariate).
-        // When `enforce_cross_block_identifiability_for_flex_block`
+        // When `install_compiled_flex_block_into_runtime`
         // reparameterised the score-warp runtime against the parametric
         // anchor union (marginal + logslope), it installed an
         // `anchor_residual` and cached the training-row parametric
@@ -19382,7 +19382,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
         // itself is anchored).
         let cross_block_pilot_w_link_dev =
             pilot_irls_hessian_row_metric_at_eta(&eta_pilot, &spec.weights);
-        let outcome = enforce_cross_block_identifiability_for_flex_block(
+        let outcome = install_compiled_flex_block_into_runtime(
             &mut prepared,
             &eta_pilot,
             cfg,
@@ -19391,8 +19391,8 @@ pub fn fit_bernoulli_marginal_slope_terms(
             &cross_block_pilot_w_link_dev,
         )?;
         match outcome {
-            CrossBlockIdentifiabilityOutcome::Reparameterised => Some(prepared),
-            CrossBlockIdentifiabilityOutcome::FullyAliased { reason } => {
+            FlexCompileOutcome::Reparameterised => Some(prepared),
+            FlexCompileOutcome::FullyAliased { reason } => {
                 log::warn!(
                     "[BMS cross-block identifiability] link-deviation block fully aliased \
                      by parametric + score-warp anchors; dropping the block. {reason}"
@@ -20021,7 +20021,7 @@ mod tests {
         let p_before = link_prepared.runtime.basis_dim();
         assert!(p_before > 0, "fixture must have positive basis_dim");
         use crate::families::bernoulli_marginal_slope::deviation_runtime::ParametricAnchorBlock;
-        enforce_cross_block_identifiability_for_flex_block(
+        install_compiled_flex_block_into_runtime(
             &mut link_prepared,
             &q0_seed,
             &link_cfg,
@@ -20101,7 +20101,7 @@ mod tests {
             .assign(&candidate_design.column(0));
         let anchor_design = DesignMatrix::Dense(DenseDesignMatrix::from(anchor_dense.clone()));
         use crate::families::bernoulli_marginal_slope::deviation_runtime::ParametricAnchorBlock;
-        enforce_cross_block_identifiability_for_flex_block(
+        install_compiled_flex_block_into_runtime(
             &mut link_prepared,
             &q0_seed,
             &link_cfg,
@@ -20170,7 +20170,7 @@ mod tests {
             .expect("candidate training-row design");
         let anchor_design = DesignMatrix::Dense(DenseDesignMatrix::from(candidate_design));
         use crate::families::bernoulli_marginal_slope::deviation_runtime::ParametricAnchorBlock;
-        let outcome = enforce_cross_block_identifiability_for_flex_block(
+        let outcome = install_compiled_flex_block_into_runtime(
             &mut link_prepared,
             &q0_seed,
             &link_cfg,
@@ -20180,13 +20180,13 @@ mod tests {
         )
         .expect("true alias must produce a structured FullyAliased outcome");
         match outcome {
-            CrossBlockIdentifiabilityOutcome::FullyAliased { reason } => {
+            FlexCompileOutcome::FullyAliased { reason } => {
                 assert!(
                     reason.contains("zero directions remaining"),
                     "expected FullyAliased reason mentioning 'zero directions remaining', got: {reason}",
                 );
             }
-            CrossBlockIdentifiabilityOutcome::Reparameterised => {
+            FlexCompileOutcome::Reparameterised => {
                 panic!("expected FullyAliased outcome but got Reparameterised");
             }
         }
@@ -20223,7 +20223,7 @@ mod tests {
             .runtime
             .design(&q0_seed)
             .expect("candidate training-row design");
-        let outcome = enforce_cross_block_identifiability_for_flex_block(
+        let outcome = install_compiled_flex_block_into_runtime(
             &mut link_prepared,
             &q0_seed,
             &link_cfg,
@@ -20233,13 +20233,13 @@ mod tests {
         )
         .expect("flex-anchor true alias must produce a structured FullyAliased outcome");
         match outcome {
-            CrossBlockIdentifiabilityOutcome::FullyAliased { reason } => {
+            FlexCompileOutcome::FullyAliased { reason } => {
                 assert!(
                     reason.contains("zero directions remaining"),
                     "expected FullyAliased reason mentioning 'zero directions remaining', got: {reason}",
                 );
             }
-            CrossBlockIdentifiabilityOutcome::Reparameterised => {
+            FlexCompileOutcome::Reparameterised => {
                 panic!(
                     "FlexEvaluation anchor whose span covers the candidate must yield FullyAliased; \
                      got Reparameterised, indicating the FlexEvaluation arm was silently skipped",
@@ -20248,20 +20248,20 @@ mod tests {
         }
     }
 
-    /// Direct match-arm coverage on the `CrossBlockIdentifiabilityOutcome`
+    /// Direct match-arm coverage on the `FlexCompileOutcome`
     /// API. Confirms that the production code's `match outcome` against
     /// `FullyAliased { reason }` extracts the reason as documented. No
     /// algorithm invocation; constructs the outcome value directly.
     #[test]
     fn cross_block_identifiability_outcome_fully_aliased_extracts_reason() {
-        let outcome = CrossBlockIdentifiabilityOutcome::FullyAliased {
+        let outcome = FlexCompileOutcome::FullyAliased {
             reason: "candidate has zero directions remaining after residualisation".to_string(),
         };
         match outcome {
-            CrossBlockIdentifiabilityOutcome::FullyAliased { reason } => {
+            FlexCompileOutcome::FullyAliased { reason } => {
                 assert!(reason.contains("zero directions remaining"));
             }
-            CrossBlockIdentifiabilityOutcome::Reparameterised => {
+            FlexCompileOutcome::Reparameterised => {
                 panic!("constructed FullyAliased; cannot pattern-match as Reparameterised")
             }
         }
@@ -20332,7 +20332,7 @@ mod tests {
         let anchor_design = DesignMatrix::Dense(DenseDesignMatrix::from(anchor_dense.clone()));
         use crate::families::bernoulli_marginal_slope::deviation_runtime::ParametricAnchorBlock;
         let p_before = link_prepared.runtime.basis_dim();
-        enforce_cross_block_identifiability_for_flex_block(
+        install_compiled_flex_block_into_runtime(
             &mut link_prepared,
             &q0_seed,
             &link_cfg,

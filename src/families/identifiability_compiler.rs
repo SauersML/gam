@@ -1,7 +1,7 @@
 //! Family-agnostic identifiability compiler.
 //!
 //! Replaces the legacy term-level residualizer
-//! (`enforce_cross_block_identifiability_for_flex_block` + the
+//! (`install_compiled_flex_block_into_runtime` + the
 //! `CrossBlockAnchor` enum) with a row-Jacobian compiler that orthogonalises
 //! parameter blocks in the *row primary-state* metric `H_i`. Each block
 //! exposes a [`RowJacobianOperator`] that maps a coefficient perturbation
