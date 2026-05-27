@@ -37,7 +37,9 @@ use crate::families::identifiability_compiler::{
     AnchorRowEvaluator, BlockOrder, RowHessian, RowJacobianOperator,
 };
 use crate::linalg::faer_ndarray::{FaerEigh, fast_ab};
-use crate::linalg::matrix::{CoefficientTransformOperator, DenseDesignMatrix, DesignMatrix};
+use crate::linalg::matrix::{
+    CoefficientTransformOperator, DenseDesignMatrix, DesignMatrix, ResidualisedDesignOperator,
+};
 use faer::Side;
 
 const K_SURVIVAL: usize = 4;
@@ -2076,5 +2078,116 @@ mod tests {
             compiled.joint_rank, kept_total,
             "CompiledBlocks::joint_rank must match the sum of per-block t_lw widths",
         );
+    }
+
+    /// `T = I` case: per-block V = identity, R = None. The triangular
+    /// lift must be the identity on each block.
+    #[test]
+    fn smgs_lift_via_t_identity_passes_through() {
+        let v0 = Array2::<f64>::eye(3);
+        let v1 = Array2::<f64>::eye(2);
+        let v_per_term = vec![v0, v1];
+        let r_per_term: Vec<Option<Array2<f64>>> = vec![None, None];
+        let lift = SmgsLiftViaT::from_v_and_r(&v_per_term, &r_per_term);
+        assert_eq!(lift.t_full.dim(), (5, 5));
+        assert_eq!(lift.block_starts_compiled, vec![0, 3, 5]);
+        assert_eq!(lift.block_starts_raw, vec![0, 3, 5]);
+        for i in 0..5 {
+            for j in 0..5 {
+                let want = if i == j { 1.0 } else { 0.0 };
+                assert!((lift.t_full[[i, j]] - want).abs() < 1e-14);
+            }
+        }
+        let theta_0 = Array1::from(vec![1.0_f64, -2.0, 3.5]);
+        let theta_1 = Array1::from(vec![-0.5_f64, 7.0]);
+        let lifted = lift.lift_block_betas_via_t(&[theta_0.clone(), theta_1.clone()]);
+        assert_eq!(lifted.len(), 2);
+        for (a, b) in theta_0.iter().zip(lifted[0].iter()) {
+            assert!((a - b).abs() < 1e-14);
+        }
+        for (a, b) in theta_1.iter().zip(lifted[1].iter()) {
+            assert!((a - b).abs() < 1e-14);
+        }
+    }
+
+    /// Two-block toy: V_a = I_3, V_b drops the middle column, R is a
+    /// non-trivial residualised reparam. Verify β_a_raw = θ_a − R · θ_b
+    /// and β_b_raw = V_b · θ_b.
+    #[test]
+    fn smgs_lift_via_t_two_block_with_residualisation() {
+        let v_a = Array2::<f64>::eye(3);
+        let mut v_b = Array2::<f64>::zeros((3, 2));
+        v_b[[0, 0]] = 1.0;
+        v_b[[2, 1]] = 1.0;
+        let mut r_b = Array2::<f64>::zeros((3, 2));
+        r_b[[0, 0]] = 0.4;
+        r_b[[0, 1]] = -0.1;
+        r_b[[1, 0]] = 0.7;
+        r_b[[1, 1]] = 1.3;
+        r_b[[2, 0]] = -0.2;
+        r_b[[2, 1]] = 0.5;
+        let lift = SmgsLiftViaT::from_v_and_r(
+            &[v_a.clone(), v_b.clone()],
+            &[None, Some(r_b.clone())],
+        );
+        assert_eq!(lift.t_full.dim(), (6, 5));
+        assert_eq!(lift.block_starts_compiled, vec![0, 3, 5]);
+        assert_eq!(lift.block_starts_raw, vec![0, 3, 6]);
+
+        let theta_a = Array1::from(vec![1.0_f64, 2.0, -1.5]);
+        let theta_b = Array1::from(vec![0.5_f64, -0.25]);
+        let lifted = lift.lift_block_betas_via_t(&[theta_a.clone(), theta_b.clone()]);
+        let r_theta_b = r_b.dot(&theta_b);
+        let expected_a = &theta_a - &r_theta_b;
+        assert_eq!(lifted[0].len(), 3);
+        for (got, want) in lifted[0].iter().zip(expected_a.iter()) {
+            assert!((got - want).abs() < 1e-12, "got {got}, want {want}");
+        }
+        assert_eq!(lifted[1].len(), 3);
+        assert!((lifted[1][0] - theta_b[0]).abs() < 1e-12);
+        assert!(lifted[1][1].abs() < 1e-12);
+        assert!((lifted[1][2] - theta_b[1]).abs() < 1e-12);
+    }
+
+    /// When all R's are None, lift_block_betas_via_t must equal the
+    /// per-block V · θ lift produced by `SmgsLiftPerBlockV`.
+    #[test]
+    fn smgs_lift_via_t_zero_r_matches_per_block_v_lift() {
+        let mut v_a = Array2::<f64>::zeros((3, 2));
+        v_a[[0, 0]] = 0.6;
+        v_a[[1, 0]] = -0.8;
+        v_a[[1, 1]] = 0.3;
+        v_a[[2, 1]] = 0.9;
+        let mut v_b = Array2::<f64>::zeros((4, 3));
+        v_b[[0, 0]] = 1.0;
+        v_b[[1, 1]] = -0.4;
+        v_b[[2, 0]] = 0.2;
+        v_b[[2, 2]] = 0.7;
+        v_b[[3, 2]] = -1.1;
+        let v_per_term = vec![v_a.clone(), v_b.clone()];
+        let lift = SmgsLiftViaT::from_v_and_r(&v_per_term, &[None, None]);
+        let theta_a = Array1::from(vec![0.3_f64, -1.4]);
+        let theta_b = Array1::from(vec![2.1_f64, 0.0, -0.7]);
+        let via_t = lift.lift_block_betas_via_t(&[theta_a.clone(), theta_b.clone()]);
+        let ref_a = v_a.dot(&theta_a);
+        let ref_b = v_b.dot(&theta_b);
+        assert_eq!(via_t[0].len(), ref_a.len());
+        for (g, w) in via_t[0].iter().zip(ref_a.iter()) {
+            assert!((g - w).abs() < 1e-12);
+        }
+        assert_eq!(via_t[1].len(), ref_b.len());
+        for (g, w) in via_t[1].iter().zip(ref_b.iter()) {
+            assert!((g - w).abs() < 1e-12);
+        }
+
+        let per_block = SmgsLiftPerBlockV { v_per_block: v_per_term };
+        let mut block_betas = vec![theta_a, theta_b];
+        per_block.lift_block_betas(&mut block_betas);
+        for (got, want) in via_t[0].iter().zip(block_betas[0].iter()) {
+            assert!((got - want).abs() < 1e-12);
+        }
+        for (got, want) in via_t[1].iter().zip(block_betas[1].iter()) {
+            assert!((got - want).abs() < 1e-12);
+        }
     }
 }
