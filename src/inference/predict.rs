@@ -2384,13 +2384,15 @@ impl BernoulliMarginalSlopePredictor {
             .as_ref()
             .map(|runtime| {
                 if runtime.anchor_residual_coefficients.is_some() {
-                    let anchor_rows = anchor_corrections.n_anchor_rows_view().ok_or_else(|| {
-                        EstimationError::InvalidInput(
-                            "bernoulli marginal-slope score-warp anchor residual present but \
-                             anchor_corrections bundle is missing the parametric anchor rows"
-                                .to_string(),
-                        )
-                    })?;
+                    let anchor_rows = anchor_corrections
+                        .score_warp_anchor_rows_view()
+                        .ok_or_else(|| {
+                            EstimationError::InvalidInput(
+                                "bernoulli marginal-slope score-warp anchor residual present but \
+                                 anchor_corrections bundle is missing the parametric anchor rows"
+                                    .to_string(),
+                            )
+                        })?;
                     runtime
                         .design_with_anchor_rows(&z, anchor_rows)
                         .map_err(EstimationError::from)
@@ -2743,13 +2745,15 @@ impl BernoulliMarginalSlopePredictor {
             link_dev_beta_owned.as_ref(),
         ) {
             let basis = if runtime.anchor_residual_coefficients.is_some() {
-                let anchor_rows = anchor_corrections.n_anchor_rows_view().ok_or_else(|| {
-                    EstimationError::InvalidInput(
-                        "bernoulli marginal-slope link-deviation anchor residual present but \
-                         anchor_corrections bundle is missing the parametric anchor rows"
-                            .to_string(),
-                    )
-                })?;
+                let anchor_rows = anchor_corrections
+                    .link_dev_anchor_rows_view()
+                    .ok_or_else(|| {
+                        EstimationError::InvalidInput(
+                            "bernoulli marginal-slope link-deviation anchor residual present but \
+                             anchor_corrections bundle is missing the parametric anchor rows"
+                                .to_string(),
+                        )
+                    })?;
                 runtime
                     .design_with_anchor_rows(&eta_base, anchor_rows)
                     .map_err(EstimationError::from)?
@@ -3087,13 +3091,15 @@ impl BernoulliMarginalSlopePredictor {
             self.beta_score_warp.as_ref(),
         ) {
             let design = if runtime.anchor_residual_coefficients.is_some() {
-                let anchor_rows = anchor_corrections.n_anchor_rows_view().ok_or_else(|| {
-                    EstimationError::InvalidInput(
-                        "bernoulli marginal-slope score-warp anchor residual present but \
-                         anchor_corrections bundle is missing the parametric anchor rows"
-                            .to_string(),
-                    )
-                })?;
+                let anchor_rows = anchor_corrections
+                    .score_warp_anchor_rows_view()
+                    .ok_or_else(|| {
+                        EstimationError::InvalidInput(
+                            "bernoulli marginal-slope score-warp anchor residual present but \
+                             anchor_corrections bundle is missing the parametric anchor rows"
+                                .to_string(),
+                        )
+                    })?;
                 runtime
                     .design_with_anchor_rows(&z, anchor_rows)
                     .map_err(EstimationError::from)?
@@ -3110,13 +3116,15 @@ impl BernoulliMarginalSlopePredictor {
             self.beta_link_dev.as_ref(),
         ) {
             let basis = if runtime.anchor_residual_coefficients.is_some() {
-                let anchor_rows = anchor_corrections.n_anchor_rows_view().ok_or_else(|| {
-                    EstimationError::InvalidInput(
-                        "bernoulli marginal-slope link-deviation anchor residual present but \
-                         anchor_corrections bundle is missing the parametric anchor rows"
-                            .to_string(),
-                    )
-                })?;
+                let anchor_rows = anchor_corrections
+                    .link_dev_anchor_rows_view()
+                    .ok_or_else(|| {
+                        EstimationError::InvalidInput(
+                            "bernoulli marginal-slope link-deviation anchor residual present but \
+                             anchor_corrections bundle is missing the parametric anchor rows"
+                                .to_string(),
+                        )
+                    })?;
                 runtime
                     .design_with_anchor_rows(&eta_base, anchor_rows)
                     .map_err(EstimationError::from)?

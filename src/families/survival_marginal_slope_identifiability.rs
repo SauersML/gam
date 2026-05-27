@@ -408,6 +408,115 @@ pub struct SurvivalCompilerInputs {
     pub ordering: Vec<BlockOrder>,
 }
 
+/// Per-block V reparameterisation matrices for the three parametric
+/// survival blocks emitted by [`compile_survival_parametric_designs`].
+/// Each `v_*` is a `(p_block_raw × p_block_kept)` selection-or-rotation
+/// matrix that maps a `β_kept` coefficient vector to its `β_raw`
+/// equivalent: `β_raw = V · β_kept`. The construction site applies these
+/// to the raw block designs (`design_raw · V → design_compiled`) and
+/// to the penalties (`Vᵀ S V`) before building `ParameterBlockSpec`s
+/// and passing the compiled designs into `make_family`.
+///
+/// Phase-4b architecture: this is the seam where the family-agnostic
+/// row-Jacobian compiler hands control back to the family-specific
+/// construction site. Each `v_*` width equals the corresponding
+/// `CompiledBlocks::blocks[i].t_lw.ncols()` — i.e., the kept-direction
+/// count after sqrt-H-metric residualisation and post-walk RRQR
+/// trailing-pivot drop.
+pub struct SurvivalParametricCompiled {
+    pub v_time: Array2<f64>,
+    pub v_marginal: Array2<f64>,
+    pub v_logslope: Array2<f64>,
+    /// Per-block dropped raw-column count, indexed
+    /// `(time_dropped, marginal_dropped, logslope_dropped)`. Equal to
+    /// `(p_raw − v.ncols())` for each block. Useful for logging the
+    /// gauge-attribution summary at the construction site.
+    pub drops_by_block: (usize, usize, usize),
+}
+
+/// Run the identifiability compiler on the three survival parametric
+/// blocks (time, marginal, logslope) at a pilot β and return the per-
+/// block V reparameterisation matrices.
+///
+/// `row_hess` must be a PSD per-row 4×4 Hessian of `−log L_i(u_i)` at
+/// the pilot β (see [`SurvivalRowHessian::from_pilot_primary_state`]).
+/// The compiler residualises blocks left-to-right in priority order
+/// (time → marginal → logslope) in the sqrt-H-metric so any aliased
+/// direction lands in the lower-priority block, then runs a post-walk
+/// column-pivoted QR on the cumulative anchor and drops trailing
+/// pivots from the latest block. The returned V matrices are ready to
+/// be applied to each block's raw design and penalty before the
+/// `ParameterBlockSpec` list is assembled.
+///
+/// On `FullyAliased` from `compile()` (a block fully absorbed by its
+/// cumulative anchor) this returns `Err`. The construction site should
+/// surface that as a structured user-facing diagnostic — the model is
+/// asking the compiler to assign zero degrees of freedom to a named
+/// parametric block, which is a model-spec bug not a numerical one.
+///
+/// Sibling Phase-4b wiring (`bernoulli_marginal_slope::install_compiled_flex_block_into_runtime`)
+/// already calls `compile()` for the flex blocks. This helper extends
+/// that contract to the parametric blocks by giving the SMGS
+/// construction site a one-line entry point — it does NOT yet apply
+/// the V transforms to the family's captured designs (the captured-
+/// design update is the remaining integration step that touches the
+/// family's row-Hessian assembly assertions).
+pub fn compile_survival_parametric_designs(
+    time_dq0: Array2<f64>,
+    time_dq1: Array2<f64>,
+    time_dqd1: Array2<f64>,
+    marginal_dq: Array2<f64>,
+    marginal_dqd1: Array2<f64>,
+    logslope_dg: Array2<f64>,
+    row_hess: &dyn RowHessian,
+) -> Result<SurvivalParametricCompiled, String> {
+    use crate::families::identifiability_compiler::compile;
+
+    let p_time_raw = time_dq0.ncols();
+    let p_marg_raw = marginal_dq.ncols();
+    let p_log_raw = logslope_dg.ncols();
+
+    let inputs = build_survival_compiler_inputs(
+        time_dq0,
+        time_dq1,
+        time_dqd1,
+        marginal_dq,
+        marginal_dqd1,
+        logslope_dg,
+        None,
+        None,
+    );
+    if inputs.operators.len() != 3 {
+        return Err(format!(
+            "compile_survival_parametric_designs: expected exactly 3 parametric operators \
+             (time, marginal, logslope); got {}",
+            inputs.operators.len(),
+        ));
+    }
+    let compiled = compile(&inputs.operators, row_hess, &inputs.ordering)
+        .map_err(|e| format!("identifiability_compiler::compile failed: {e}"))?;
+    if compiled.blocks.len() != 3 {
+        return Err(format!(
+            "compile_survival_parametric_designs: compiler emitted {} blocks; expected 3",
+            compiled.blocks.len(),
+        ));
+    }
+    let v_time = compiled.blocks[0].t_lw.clone();
+    let v_marginal = compiled.blocks[1].t_lw.clone();
+    let v_logslope = compiled.blocks[2].t_lw.clone();
+    let drops_by_block = (
+        p_time_raw.saturating_sub(v_time.ncols()),
+        p_marg_raw.saturating_sub(v_marginal.ncols()),
+        p_log_raw.saturating_sub(v_logslope.ncols()),
+    );
+    Ok(SurvivalParametricCompiled {
+        v_time,
+        v_marginal,
+        v_logslope,
+        drops_by_block,
+    })
+}
+
 /// Build the operator stack from already-materialised dense designs.
 ///
 /// `time_dq0/dq1/dqd1` are the time block's three primary-state Jacobians
@@ -536,5 +645,226 @@ mod tests {
         assert_eq!(out[2], 0.0);
         let want = dg[[1, 0]] * 2.0 + dg[[1, 1]] * (-1.0);
         assert!((out[3] - want).abs() < 1e-12);
+    }
+
+    /// Top-level Phase-4b API test for the SMGS parametric path:
+    /// call `compile_survival_parametric_designs` on a shared-constant
+    /// alias between time and marginal, with an identity row Hessian.
+    /// Verify the returned `v_*` matrices have the expected widths
+    /// (time keeps all 3, marginal loses 1, logslope keeps both) and
+    /// `drops_by_block` reports `(0, 1, 0)`.
+    #[test]
+    fn compile_survival_parametric_designs_helper_attributes_drop_to_marginal() {
+        let n = 24;
+        let p_time = 3;
+        let p_marginal = 3;
+        let p_logslope = 2;
+        let x: Vec<f64> = (0..n).map(|i| -1.0 + 2.0 * (i as f64) / (n as f64 - 1.0)).collect();
+        let mut time_dq0 = Array2::<f64>::zeros((n, p_time));
+        let mut time_dq1 = Array2::<f64>::zeros((n, p_time));
+        let mut time_dqd1 = Array2::<f64>::zeros((n, p_time));
+        let mut marg_dq = Array2::<f64>::zeros((n, p_marginal));
+        let marg_dqd1 = Array2::<f64>::zeros((n, p_marginal));
+        let mut log_dg = Array2::<f64>::zeros((n, p_logslope));
+        for i in 0..n {
+            time_dq0[[i, 0]] = 1.0;
+            time_dq0[[i, 1]] = x[i];
+            time_dq0[[i, 2]] = x[i] * x[i];
+            time_dq1[[i, 0]] = 1.0;
+            time_dq1[[i, 1]] = x[i];
+            time_dq1[[i, 2]] = x[i] * x[i];
+            time_dqd1[[i, 0]] = 0.0;
+            time_dqd1[[i, 1]] = 1.0;
+            time_dqd1[[i, 2]] = 2.0 * x[i];
+            marg_dq[[i, 0]] = 1.0; // alias with time col 0
+            marg_dq[[i, 1]] = x[i] * x[i] * x[i];
+            marg_dq[[i, 2]] = x[i].sin();
+            log_dg[[i, 0]] = (2.0 * x[i]).cos();
+            log_dg[[i, 1]] = x[i].tanh();
+        }
+        let mut h_full = Array3::<f64>::zeros((n, K_SURVIVAL, K_SURVIVAL));
+        for i in 0..n {
+            for k in 0..K_SURVIVAL {
+                h_full[[i, k, k]] = 1.0;
+            }
+        }
+        let row_hess = SurvivalRowHessian::from_full(h_full);
+        let out = compile_survival_parametric_designs(
+            time_dq0, time_dq1, time_dqd1, marg_dq, marg_dqd1, log_dg, &row_hess,
+        )
+        .expect("Phase-4b parametric compile must succeed on single-direction alias");
+        assert_eq!(out.v_time.ncols(), p_time, "time keeps all columns");
+        assert_eq!(
+            out.v_marginal.ncols(),
+            p_marginal - 1,
+            "marginal loses exactly the shared-constant direction"
+        );
+        assert_eq!(out.v_logslope.ncols(), p_logslope, "logslope is clean");
+        assert_eq!(
+            out.drops_by_block,
+            (0, 1, 0),
+            "attribution: zero from time/logslope, one from marginal",
+        );
+    }
+
+    /// End-to-end Phase-4b smoke test: build the full 3-block survival
+    /// parametric operator stack (time + marginal + logslope) with a
+    /// shared-constant alias seeded between the time and marginal
+    /// blocks, feed it into `compile()` with an identity 4×4 row
+    /// Hessian on every row, and verify the compiler:
+    ///
+    ///   (1) returns a [`CompiledBlocks`] with one block per input;
+    ///   (2) preserves all 3 columns of the highest-priority `Time`
+    ///       block in `t_lw` (the time block enters first in the
+    ///       ordering, so its full column span survives);
+    ///   (3) drops exactly one direction from `Marginal` (the
+    ///       constant aliased with the time intercept), leaving its
+    ///       remaining columns in `t_lw`;
+    ///   (4) reports `joint_rank` = (raw_total - 1).
+    ///
+    /// This validates the Phase-4b construction-time orthogonalisation
+    /// path on the survival K=4 row primary state without requiring
+    /// the SMGS construction site to be wired yet (which is what the
+    /// active sibling integration handles). The shape of the result
+    /// is the contract the SMGS wiring will assert against.
+    #[test]
+    fn compile_survival_three_block_with_shared_constant_drops_one_direction() {
+        use crate::families::identifiability_compiler::compile;
+
+        let n = 32;
+        let p_time = 3;
+        let p_marginal = 3;
+        let p_logslope = 2;
+
+        // Time block:
+        //   col 0 = ones (the shared constant — aliases marginal col 0);
+        //   col 1 = linear x;
+        //   col 2 = quadratic x².
+        // q0/q1 share the same design (so the alias surfaces in both
+        // the entry and exit primary channels); qd1 is the derivative
+        // of the design w.r.t. time at the exit point, which for the
+        // constant column is exactly zero (the gauge identity that
+        // makes the constant a true null direction under (q0, q1, qd1)
+        // joint).
+        let x: Vec<f64> = (0..n).map(|i| -1.0 + 2.0 * (i as f64) / (n as f64 - 1.0)).collect();
+        let mut time_dq0 = Array2::<f64>::zeros((n, p_time));
+        let mut time_dq1 = Array2::<f64>::zeros((n, p_time));
+        let mut time_dqd1 = Array2::<f64>::zeros((n, p_time));
+        for i in 0..n {
+            time_dq0[[i, 0]] = 1.0;
+            time_dq0[[i, 1]] = x[i];
+            time_dq0[[i, 2]] = x[i] * x[i];
+            time_dq1[[i, 0]] = 1.0;
+            time_dq1[[i, 1]] = x[i];
+            time_dq1[[i, 2]] = x[i] * x[i];
+            // d/dt of a constant = 0; d/dt of x ≡ 1; d/dt of x² ≡ 2x.
+            time_dqd1[[i, 0]] = 0.0;
+            time_dqd1[[i, 1]] = 1.0;
+            time_dqd1[[i, 2]] = 2.0 * x[i];
+        }
+
+        // Marginal block (q-channel only; qd1 contribution zero — no
+        // timewiggle in this scenario):
+        //   col 0 = ones (the shared constant);
+        //   col 1 = x³;
+        //   col 2 = sin(x).
+        let mut marg_dq = Array2::<f64>::zeros((n, p_marginal));
+        let marg_dqd1 = Array2::<f64>::zeros((n, p_marginal));
+        for i in 0..n {
+            marg_dq[[i, 0]] = 1.0;
+            marg_dq[[i, 1]] = x[i] * x[i] * x[i];
+            marg_dq[[i, 2]] = x[i].sin();
+        }
+
+        // Logslope block (g-channel only):
+        //   col 0 = cos(2x);
+        //   col 1 = tanh(x).  (no shared constant — logslope is clean)
+        let mut log_dg = Array2::<f64>::zeros((n, p_logslope));
+        for i in 0..n {
+            log_dg[[i, 0]] = (2.0 * x[i]).cos();
+            log_dg[[i, 1]] = x[i].tanh();
+        }
+
+        let inputs = build_survival_compiler_inputs(
+            time_dq0,
+            time_dq1,
+            time_dqd1,
+            marg_dq,
+            marg_dqd1,
+            log_dg,
+            None,
+            None,
+        );
+
+        // Identity 4×4 row Hessian on every row. With H_i = I the
+        // sqrt-H metric collapses to the standard Frobenius metric,
+        // so the compiler's residualisation is ordinary least-squares
+        // projection — exactly what we want for verifying the
+        // structural rank-deficiency attribution.
+        let mut h_full = Array3::<f64>::zeros((n, K_SURVIVAL, K_SURVIVAL));
+        for i in 0..n {
+            for k in 0..K_SURVIVAL {
+                h_full[[i, k, k]] = 1.0;
+            }
+        }
+        let row_hess = SurvivalRowHessian::from_full(h_full);
+
+        let compiled = compile(&inputs.operators, &row_hess, &inputs.ordering)
+            .expect("survival 3-block compile must succeed; aliasing is single-direction");
+
+        // (1) One CompiledBlock per input.
+        assert_eq!(compiled.blocks.len(), 3, "expected 3 CompiledBlocks");
+
+        // (2) Time enters first; under sqrt-I metric every column of
+        // the time block is residual-vs-empty-anchor and therefore
+        // survives the eigendecomposition with positive eigenvalue.
+        // V_time has p_time columns.
+        let v_time = &compiled.blocks[0].t_lw;
+        assert_eq!(
+            v_time.ncols(),
+            p_time,
+            "time block (first in ordering) must retain all {p_time} of its columns; V_time={:?}",
+            v_time.dim(),
+        );
+
+        // (3) Marginal enters second. Its constant column is aliased
+        // with time's constant column in (q0, q1) and contributes zero
+        // to qd1. After residualising against the time anchor in the
+        // K=4 stacked metric, the residual Gram has rank
+        // p_marginal − 1 (one direction collapsed by the alias). So
+        // V_marginal has exactly (p_marginal − 1) columns.
+        let v_marg = &compiled.blocks[1].t_lw;
+        assert_eq!(
+            v_marg.ncols(),
+            p_marginal - 1,
+            "marginal block must lose exactly the shared-constant direction; \
+             V_marginal cols = {}, expected {}",
+            v_marg.ncols(),
+            p_marginal - 1,
+        );
+
+        // (4) Logslope enters third and carries no shared direction
+        // with time or marginal in the g-channel. Both columns survive.
+        let v_log = &compiled.blocks[2].t_lw;
+        assert_eq!(
+            v_log.ncols(),
+            p_logslope,
+            "logslope block (no shared direction) must retain all {p_logslope} columns",
+        );
+
+        // (5) Joint rank consistency: sum of compiled column counts
+        // equals raw_total minus the one aliased direction.
+        let raw_total = p_time + p_marginal + p_logslope;
+        let kept_total: usize = compiled.blocks.iter().map(|b| b.t_lw.ncols()).sum();
+        assert_eq!(
+            kept_total,
+            raw_total - 1,
+            "joint kept = raw_total − aliased; got {kept_total}, expected {}",
+            raw_total - 1,
+        );
+        assert_eq!(
+            compiled.joint_rank, kept_total,
+            "CompiledBlocks::joint_rank must match the sum of per-block t_lw widths",
+        );
     }
 }
