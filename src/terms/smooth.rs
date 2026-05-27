@@ -21708,22 +21708,8 @@ mod tests {
             }],
         };
         let fit_opts = FitOptions {
-            latent_cloglog: None,
-            mixture_link: None,
-            optimize_mixture: false,
-            sas_link: None,
-            optimize_sas: false,
-            compute_inference: true,
             max_iter: 40,
-            tol: 1e-6,
-            nullspace_dims: vec![],
-            linear_constraints: None,
-            firth_bias_reduction: false,
-            adaptive_regularization: None,
-            penalty_shrinkage_floor: Some(1e-6),
-            rho_prior: Default::default(),
-            kronecker_penalty_system: None,
-            kronecker_factored: None,
+            ..FitOptions::default()
         };
         let weights = Array1::ones(n);
         let offset = Array1::zeros(n);
@@ -22008,22 +21994,11 @@ mod tests {
             }],
         };
         let fit_opts = FitOptions {
-            latent_cloglog: None,
-            mixture_link: None,
-            optimize_mixture: false,
-            sas_link: None,
-            optimize_sas: false,
             compute_inference: false,
             max_iter: 120,
             tol: 1e-10,
-            nullspace_dims: vec![],
-            linear_constraints: None,
-            firth_bias_reduction: false,
-            adaptive_regularization: None,
             penalty_shrinkage_floor: None,
-            rho_prior: Default::default(),
-            kronecker_penalty_system: None,
-            kronecker_factored: None,
+            ..FitOptions::default()
         };
 
         let design = build_term_collection_design(data.view(), &spec).expect("design");
@@ -22224,22 +22199,11 @@ mod tests {
             }],
         };
         let fit_opts = FitOptions {
-            latent_cloglog: None,
-            mixture_link: None,
-            optimize_mixture: false,
-            sas_link: None,
-            optimize_sas: false,
             compute_inference: false,
             max_iter: 200,
             tol: 1e-12,
-            nullspace_dims: vec![],
-            linear_constraints: None,
-            firth_bias_reduction: false,
-            adaptive_regularization: None,
             penalty_shrinkage_floor: None,
-            rho_prior: Default::default(),
-            kronecker_penalty_system: None,
-            kronecker_factored: None,
+            ..FitOptions::default()
         };
 
         let design = build_term_collection_design(data.view(), &spec).expect("design");
@@ -22542,22 +22506,11 @@ mod tests {
             }],
         };
         let fit_opts = FitOptions {
-            latent_cloglog: None,
-            mixture_link: None,
-            optimize_mixture: false,
-            sas_link: None,
-            optimize_sas: false,
             compute_inference: false,
             max_iter: 200,
             tol: 1e-12,
-            nullspace_dims: vec![],
-            linear_constraints: None,
-            firth_bias_reduction: false,
-            adaptive_regularization: None,
             penalty_shrinkage_floor: None,
-            rho_prior: Default::default(),
-            kronecker_penalty_system: None,
-            kronecker_factored: None,
+            ..FitOptions::default()
         };
         let design = build_term_collection_design(data.view(), &spec).expect("design");
         let frozen = freeze_term_collection_from_design(&spec, &design).expect("freeze");
@@ -22774,22 +22727,11 @@ mod tests {
             }],
         };
         let fit_opts = FitOptions {
-            latent_cloglog: None,
-            mixture_link: None,
-            optimize_mixture: false,
-            sas_link: None,
-            optimize_sas: false,
             compute_inference: false,
             max_iter: 200,
             tol: 1e-12,
-            nullspace_dims: vec![],
-            linear_constraints: None,
-            firth_bias_reduction: false,
-            adaptive_regularization: None,
             penalty_shrinkage_floor: None,
-            rho_prior: Default::default(),
-            kronecker_penalty_system: None,
-            kronecker_factored: None,
+            ..FitOptions::default()
         };
         let design = build_term_collection_design(data.view(), &spec).expect("design");
         let frozen = freeze_term_collection_from_design(&spec, &design).expect("freeze");
@@ -23030,22 +22972,11 @@ mod tests {
             }],
         };
         let fit_opts = FitOptions {
-            latent_cloglog: None,
-            mixture_link: None,
-            optimize_mixture: false,
-            sas_link: None,
-            optimize_sas: false,
             compute_inference: false,
             max_iter: 200,
             tol: 1e-12,
-            nullspace_dims: vec![],
-            linear_constraints: None,
-            firth_bias_reduction: false,
-            adaptive_regularization: None,
             penalty_shrinkage_floor: None,
-            rho_prior: Default::default(),
-            kronecker_penalty_system: None,
-            kronecker_factored: None,
+            ..FitOptions::default()
         };
         let design = build_term_collection_design(data.view(), &spec).expect("design");
         let frozen = freeze_term_collection_from_design(&spec, &design).expect("freeze");
@@ -24100,22 +24031,11 @@ mod tests {
         let weights = Array1::ones(n);
         let offset = Array1::zeros(n);
         let fit_opts = FitOptions {
-            latent_cloglog: None,
-            mixture_link: None,
-            optimize_mixture: false,
-            sas_link: None,
-            optimize_sas: false,
             compute_inference: false,
             max_iter: 40,
             tol: 1e-7,
-            nullspace_dims: vec![],
-            linear_constraints: None,
-            firth_bias_reduction: false,
-            adaptive_regularization: None,
             penalty_shrinkage_floor: None,
-            rho_prior: Default::default(),
-            kronecker_penalty_system: None,
-            kronecker_factored: None,
+            ..FitOptions::default()
         };
 
         let design = build_term_collection_design(data.view(), &spec).expect("design");
@@ -24619,22 +24539,9 @@ mod tests {
             }],
         };
         let fit_opts = FitOptions {
-            latent_cloglog: None,
-            mixture_link: None,
-            optimize_mixture: false,
-            sas_link: None,
-            optimize_sas: false,
-            compute_inference: true,
             max_iter: 40,
-            tol: 1e-6,
-            nullspace_dims: vec![],
-            linear_constraints: None,
-            firth_bias_reduction: false,
-            adaptive_regularization: None,
             penalty_shrinkage_floor: None,
-            rho_prior: Default::default(),
-            kronecker_penalty_system: None,
-            kronecker_factored: None,
+            ..FitOptions::default()
         };
         let weights = Array1::ones(n);
         let offset = Array1::zeros(n);
@@ -24742,22 +24649,8 @@ mod tests {
             }],
         };
         let fit_opts = FitOptions {
-            latent_cloglog: None,
-            mixture_link: None,
-            optimize_mixture: false,
-            sas_link: None,
-            optimize_sas: false,
-            compute_inference: true,
             max_iter: 60,
-            tol: 1e-6,
-            nullspace_dims: vec![],
-            linear_constraints: None,
-            firth_bias_reduction: false,
-            adaptive_regularization: None,
-            penalty_shrinkage_floor: Some(1e-6),
-            rho_prior: Default::default(),
-            kronecker_penalty_system: None,
-            kronecker_factored: None,
+            ..FitOptions::default()
         };
         let weights = Array1::ones(n);
         let offset = Array1::zeros(n);
@@ -24860,22 +24753,9 @@ mod tests {
         assert_eq!(spatial_length_scale_term_indices(&spec), vec![0]);
 
         let fit_opts = FitOptions {
-            latent_cloglog: None,
-            mixture_link: None,
-            optimize_mixture: false,
-            sas_link: None,
-            optimize_sas: false,
-            compute_inference: true,
             max_iter: 40,
-            tol: 1e-6,
-            nullspace_dims: vec![],
-            linear_constraints: None,
-            firth_bias_reduction: false,
-            adaptive_regularization: None,
             penalty_shrinkage_floor: None,
-            rho_prior: Default::default(),
-            kronecker_penalty_system: None,
-            kronecker_factored: None,
+            ..FitOptions::default()
         };
         let y = Array1::linspace(0.0, 1.0, data.nrows());
         let weights = Array1::ones(data.nrows());
@@ -25246,22 +25126,9 @@ mod tests {
         };
 
         let fit_opts = FitOptions {
-            latent_cloglog: None,
-            mixture_link: None,
-            optimize_mixture: false,
-            sas_link: None,
-            optimize_sas: false,
-            compute_inference: true,
             max_iter: 40,
-            tol: 1e-6,
-            nullspace_dims: vec![],
-            linear_constraints: None,
-            firth_bias_reduction: false,
-            adaptive_regularization: None,
             penalty_shrinkage_floor: None,
-            rho_prior: Default::default(),
-            kronecker_penalty_system: None,
-            kronecker_factored: None,
+            ..FitOptions::default()
         };
 
         let optimized = fit_term_collectionwith_spatial_length_scale_optimization(
@@ -25521,22 +25388,9 @@ mod tests {
             }],
         };
         let fit_opts = FitOptions {
-            latent_cloglog: None,
-            mixture_link: None,
-            optimize_mixture: false,
-            sas_link: None,
-            optimize_sas: false,
-            compute_inference: true,
             max_iter: 40,
-            tol: 1e-6,
-            nullspace_dims: vec![],
-            linear_constraints: None,
-            firth_bias_reduction: false,
-            adaptive_regularization: None,
             penalty_shrinkage_floor: None,
-            rho_prior: Default::default(),
-            kronecker_penalty_system: None,
-            kronecker_factored: None,
+            ..FitOptions::default()
         };
 
         let fitted = fit_term_collectionwith_spatial_length_scale_optimization(
