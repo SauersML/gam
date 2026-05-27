@@ -8397,11 +8397,20 @@ impl BernoulliMarginalSlopeFamily {
                         use crate::gpu::cubic_cell::{
                             CubicCellDerivativeMomentOutput, CubicCellMomentStatus,
                         };
-                        let CubicCellDerivativeMomentOutput::Host {
-                            moments: sub_moments,
-                            status: sub_status,
-                            stride,
-                        } = output;
+                        let (sub_moments, sub_status, stride) = match output {
+                            CubicCellDerivativeMomentOutput::Host {
+                                moments,
+                                status,
+                                stride,
+                            } => (moments, status, stride),
+                            #[cfg(target_os = "linux")]
+                            CubicCellDerivativeMomentOutput::Device { .. } => {
+                                panic!(
+                                    "BMS row-cell-moments parity probe requested Host residency \
+                                     but substrate returned device-resident output"
+                                )
+                            }
+                        };
                         assert_eq!(stride, max_degree + 1);
                         assert_eq!(sub_status.len(), sample_cells.len());
                         for (i, cpu_row) in sample_cpu_moments.iter().enumerate() {
