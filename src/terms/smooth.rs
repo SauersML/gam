@@ -21741,13 +21741,10 @@ mod tests {
             ),
             &fit_opts,
             &SpatialLengthScaleOptimizationOptions {
-                enabled: true,
                 max_outer_iter: 2,
                 rel_tol: 1e-5,
-                log_step: std::f64::consts::LN_2,
-                min_length_scale: 1e-3,
-                max_length_scale: 1e3,
                 pilot_subsample_threshold: 0,
+                ..SpatialLengthScaleOptimizationOptions::default()
             },
         )
         .expect("optimized fit should succeed");
@@ -21818,13 +21815,10 @@ mod tests {
         };
 
         let kappa_options = SpatialLengthScaleOptimizationOptions {
-            enabled: true,
             max_outer_iter: 1,
             rel_tol: 1e-6,
-            log_step: std::f64::consts::LN_2,
-            min_length_scale: 1e-3,
-            max_length_scale: 1e3,
             pilot_subsample_threshold: 0,
+            ..SpatialLengthScaleOptimizationOptions::default()
         };
         let joint_setup = two_block_exact_joint_hyper_setup(&meanspec, &noisespec, &kappa_options);
         let theta_dim = joint_setup.theta0().len();
@@ -23397,13 +23391,10 @@ mod tests {
         };
 
         let kappa_options = SpatialLengthScaleOptimizationOptions {
-            enabled: true,
             max_outer_iter: 1,
             rel_tol: 1e-6,
-            log_step: std::f64::consts::LN_2,
-            min_length_scale: 1e-3,
-            max_length_scale: 1e3,
             pilot_subsample_threshold: 0,
+            ..SpatialLengthScaleOptimizationOptions::default()
         };
         let joint_setup = two_block_exact_joint_hyper_setup(&meanspec, &noisespec, &kappa_options);
         let theta_dim = joint_setup.theta0().len();
@@ -23691,13 +23682,10 @@ mod tests {
             smooth_terms: vec![matern_term("noise", 1.1)],
         };
         let kappa_options = SpatialLengthScaleOptimizationOptions {
-            enabled: true,
             max_outer_iter: 1,
             rel_tol: 1e-6,
-            log_step: std::f64::consts::LN_2,
-            min_length_scale: 1e-3,
-            max_length_scale: 1e3,
             pilot_subsample_threshold: 0,
+            ..SpatialLengthScaleOptimizationOptions::default()
         };
         let joint_setup = two_block_exact_joint_hyper_setup(&meanspec, &noisespec, &kappa_options);
         let theta0 = joint_setup.theta0();
@@ -24573,13 +24561,10 @@ mod tests {
             ),
             &fit_opts,
             &SpatialLengthScaleOptimizationOptions {
-                enabled: true,
                 max_outer_iter: 2,
                 rel_tol: 1e-5,
-                log_step: std::f64::consts::LN_2,
-                min_length_scale: 1e-3,
-                max_length_scale: 1e3,
                 pilot_subsample_threshold: 0,
+                ..SpatialLengthScaleOptimizationOptions::default()
             },
         )
         .expect("optimized fit should succeed");
@@ -24667,13 +24652,10 @@ mod tests {
             ),
             &fit_opts,
             &SpatialLengthScaleOptimizationOptions {
-                enabled: true,
                 max_outer_iter: 2,
                 rel_tol: 1e-5,
-                log_step: std::f64::consts::LN_2,
-                min_length_scale: 1e-3,
-                max_length_scale: 1e3,
                 pilot_subsample_threshold: 0,
+                ..SpatialLengthScaleOptimizationOptions::default()
             },
         )
         .expect("standard binomial-logit spatial kappa optimization should use exact non-TK LAML derivatives");
@@ -25044,13 +25026,12 @@ mod tests {
             }],
         };
         let options = SpatialLengthScaleOptimizationOptions {
-            enabled: true,
             max_outer_iter: 1,
             rel_tol: 1e-6,
-            log_step: std::f64::consts::LN_2,
             min_length_scale: (-2.0_f64).exp(),
             max_length_scale: 1.0_f64.exp(),
             pilot_subsample_threshold: 0,
+            ..SpatialLengthScaleOptimizationOptions::default()
         };
         let spatial_terms = vec![0];
         let dims_per_term = spatial_dims_per_term(&spec, &spatial_terms);
@@ -25470,13 +25451,10 @@ mod tests {
         };
 
         let kappa_options = SpatialLengthScaleOptimizationOptions {
-            enabled: true,
             max_outer_iter: 1,
             rel_tol: 1e-6,
-            log_step: std::f64::consts::LN_2,
-            min_length_scale: 1e-3,
-            max_length_scale: 1e3,
             pilot_subsample_threshold: 0,
+            ..SpatialLengthScaleOptimizationOptions::default()
         };
         let joint_setup = two_block_exact_joint_hyper_setup(&meanspec, &noisespec, &kappa_options);
         let theta_dim = joint_setup.theta0().len();
@@ -25652,13 +25630,10 @@ mod tests {
         }
 
         let kappa_options = SpatialLengthScaleOptimizationOptions {
-            enabled: true,
             max_outer_iter: 1,
             rel_tol: 1e-6,
-            log_step: std::f64::consts::LN_2,
-            min_length_scale: 1e-3,
-            max_length_scale: 1e3,
             pilot_subsample_threshold: 0,
+            ..SpatialLengthScaleOptimizationOptions::default()
         };
         let joint_setup =
             two_block_exact_joint_hyper_setup(&frozen_specs[0], &frozen_specs[1], &kappa_options);
