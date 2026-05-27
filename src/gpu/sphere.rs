@@ -1855,4 +1855,183 @@ use crate::gpu::error::GpuResultExt;
              cpu={cpu_secs:.3}s gpu={gpu_secs:.3}s"
         );
     }
+
+    /// Task #25: end-to-end fit parity between the GPU truncated-spectral
+    /// path and the CPU truncated-spectral path on a small synthetic
+    /// intrinsic-S² fixture.
+    ///
+    /// Setup: deterministic lat/lon grid (n = 1000 = 25 × 40), 80 centers
+    /// chosen by farthest-point selection, lmax = 15, penalty order 2,
+    /// Wahba weighted-sum-to-zero constraint applied via `Z`. We fit a
+    /// fixed-λ penalised LS problem
+    ///   β = argmin ‖X_s β − y‖² + λ · βᵀ S β
+    /// where `X_s = K(data, centers) · Z` and `S = Zᵀ · K(centers, centers) · Z`,
+    /// solving `(X_sᵀ X_s + λ S) β = X_sᵀ y` via faer LLT for both paths.
+    /// The only path-dependent quantity is `K(data, centers)`: built on
+    /// GPU via `build_kernel_matrix_device` for one β, and on CPU via
+    /// `spherical_wahba_kernel_matrix_with_kind` for the other. The
+    /// penalty kernel `K(centers, centers)` is m × m and tiny, so we
+    /// build it once on CPU and share it across paths (it is not the
+    /// surface under test).
+    ///
+    /// Asserts max-absolute coefficient delta ≤ 1e-9 and max-absolute
+    /// fitted-value delta ≤ 1e-9. `#[ignore = "requires CUDA"]` so the
+    /// V100 bench runner unignores in their harness.
+    #[test]
+    #[ignore = "requires CUDA"]
+    fn sphere_gpu_end_to_end_fit_parity_vs_cpu_truncated() {
+        use crate::basis::{
+            select_spherical_farthest_point_centers, sphere_area_weights,
+            spherical_wahba_kernel_matrix_with_kind, weighted_coefficient_sum_to_zero_transform,
+        };
+        use crate::linalg::faer_ndarray::FaerCholesky;
+        use faer::Side;
+
+        let _runtime = super::super::runtime::GpuRuntime::global()
+            .expect("task #25 parity requires CUDA runtime (test is #[ignore]d off CUDA)");
+        SphereGpuBackend::probe()
+            .expect("task #25 parity requires sphere GPU backend probe to succeed");
+
+        // Fixture: 25 × 40 lat/lon grid → n = 1000.
+        let data_ll = small_latlon_grid(25, 40);
+        assert_eq!(data_ll.nrows(), 1000);
+        let n = data_ll.nrows();
+        let m: usize = 80;
+        let lmax_u16: u16 = 15;
+        let lmax: usize = lmax_u16 as usize;
+        let penalty_order: usize = 2;
+        let kernel = SphereWahbaKernel::SobolevTruncated { lmax: lmax_u16 };
+        let lambda: f64 = 1.0e-3;
+
+        // Deterministic centers via farthest-point selection.
+        let centers_ll = select_spherical_farthest_point_centers(data_ll.view(), m, false)
+            .expect("farthest-point centers");
+        assert_eq!(centers_ll.nrows(), m);
+
+        // Constraint transform Z (m × (m-1)).
+        let weights = sphere_area_weights(centers_ll.view(), false);
+        let z = weighted_coefficient_sum_to_zero_transform(weights.view())
+            .expect("weighted sum-to-zero transform");
+        let p = z.ncols();
+        assert_eq!(p, m - 1);
+
+        // Penalty K(centers, centers), built once on CPU. The penalty
+        // kernel evaluation is m × m (= 6400 entries), well outside the
+        // GPU dispatch threshold, and identical for both paths under
+        // test by construction.
+        let k_cc = spherical_wahba_kernel_matrix_with_kind(
+            centers_ll.view(),
+            centers_ll.view(),
+            penalty_order,
+            false,
+            kernel,
+        )
+        .expect("centers×centers kernel");
+        let s_full = z.t().dot(&k_cc).dot(&z);
+
+        // CPU path: K(data, centers) via the public CPU helper.
+        let raw_design_cpu = spherical_wahba_kernel_matrix_with_kind(
+            data_ll.view(),
+            centers_ll.view(),
+            penalty_order,
+            false,
+            kernel,
+        )
+        .expect("CPU raw design");
+        let x_s_cpu = raw_design_cpu.dot(&z);
+
+        // GPU path: K(data, centers) via `build_kernel_matrix_device`.
+        let data_xyz = latlon_to_xyz_host(data_ll.view(), false).expect("data xyz");
+        let centers_xyz = latlon_to_xyz_host(centers_ll.view(), false).expect("centers xyz");
+        let coeffs = crate::basis::sobolev_s2_truncated_coefficients(lmax, penalty_order);
+        let inputs = S2KernelBuildInputs {
+            n,
+            m,
+            lmax,
+            data_xyz: &data_xyz,
+            centers_xyz: &centers_xyz,
+            coeffs: &coeffs,
+            kind: SphereSpectralKernelKind::Sobolev,
+            layout: DeviceMatrixLayout::ColumnMajor,
+        };
+        let raw_dev = build_kernel_matrix_device(inputs).expect("GPU raw design");
+        let raw_design_gpu = raw_dev.to_host_array().expect("dtoh GPU raw design");
+        let x_s_gpu = raw_design_gpu.dot(&z);
+
+        assert_eq!(x_s_cpu.dim(), (n, p));
+        assert_eq!(x_s_gpu.dim(), (n, p));
+
+        // Deterministic synthetic response. The intent is to give the
+        // penalised LS solve a non-trivial right-hand side; any smooth
+        // function of the lat/lon is fine. Use a fixed-seed pseudo-
+        // random walk derived from coordinates so the fixture has no
+        // RNG dependency.
+        let mut y = ndarray::Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let lat_rad = data_ll[(i, 0)].to_radians();
+            let lon_rad = data_ll[(i, 1)].to_radians();
+            // Smooth ground truth + a tiny deterministic high-freq jitter.
+            y[i] = (2.0 * lat_rad).sin() * (3.0 * lon_rad).cos()
+                + 0.25 * lat_rad.cos() * (5.0 * lon_rad).sin();
+        }
+
+        // Penalised normal-equation solve via faer LLT for each path:
+        //   (X_sᵀ X_s + λ S) β = X_sᵀ y
+        // S is symmetric positive semi-definite; λ S makes the system
+        // strictly positive definite once added to X_sᵀ X_s.
+        let solve_penalised = |x_s: &ndarray::Array2<f64>| -> ndarray::Array1<f64> {
+            let xtx = x_s.t().dot(x_s);
+            let mut a = xtx;
+            for i in 0..p {
+                for j in 0..p {
+                    a[(i, j)] += lambda * s_full[(i, j)];
+                }
+            }
+            let rhs = x_s.t().dot(&y);
+            let factor = a
+                .cholesky(Side::Lower)
+                .expect("penalised normal equations are SPD under λ > 0");
+            factor.solvevec(&rhs)
+        };
+
+        let beta_cpu = solve_penalised(&x_s_cpu);
+        let beta_gpu = solve_penalised(&x_s_gpu);
+        assert_eq!(beta_cpu.len(), p);
+        assert_eq!(beta_gpu.len(), p);
+
+        // Fitted values for both paths use their own design matrices —
+        // this is the customer-visible quantity (prediction at training
+        // points).
+        let yhat_cpu = x_s_cpu.dot(&beta_cpu);
+        let yhat_gpu = x_s_gpu.dot(&beta_gpu);
+
+        let mut max_beta_delta = 0.0_f64;
+        for k in 0..p {
+            let d = (beta_cpu[k] - beta_gpu[k]).abs();
+            if d > max_beta_delta {
+                max_beta_delta = d;
+            }
+        }
+        let mut max_fit_delta = 0.0_f64;
+        for i in 0..n {
+            let d = (yhat_cpu[i] - yhat_gpu[i]).abs();
+            if d > max_fit_delta {
+                max_fit_delta = d;
+            }
+        }
+
+        eprintln!(
+            "[sphere_gpu fit parity] n={n} m={m} p={p} lmax={lmax} λ={lambda:.1e} \
+             max|Δβ|={max_beta_delta:.3e} max|Δŷ|={max_fit_delta:.3e}"
+        );
+
+        assert!(
+            max_beta_delta <= 1.0e-9,
+            "GPU vs CPU truncated-spectral coefficient max |Δ| = {max_beta_delta:.3e} > 1e-9"
+        );
+        assert!(
+            max_fit_delta <= 1.0e-9,
+            "GPU vs CPU truncated-spectral fitted-value max |Δ| = {max_fit_delta:.3e} > 1e-9"
+        );
+    }
 }
