@@ -8,7 +8,7 @@ use gam::predict::{
 use gam::probability::try_inverse_link_array;
 use gam::smooth::BlockwisePenalty;
 use gam::types::{
-    InverseLink, LikelihoodSpec, LinkComponent, LinkFunction, MixtureLinkSpec, ResponseFamily,
+    InverseLink, LikelihoodSpec, LinkComponent, LinkFunction, StandardLink, MixtureLinkSpec, ResponseFamily,
 };
 use ndarray::{Array1, Array2};
 
@@ -20,7 +20,7 @@ fn dense_penalty(local: Array2<f64>) -> BlockwisePenalty {
 fn gaussian_identity_likelihood() -> LikelihoodSpec {
     LikelihoodSpec::new(
         ResponseFamily::Gaussian,
-        InverseLink::Standard(LinkFunction::Identity),
+        InverseLink::Standard(StandardLink::Identity),
     )
 }
 
@@ -519,21 +519,11 @@ fn posterior_mean_prediction_shrinks_extreme_logit_probabilities() {
     }
 }
 
-#[test]
-fn stateless_sas_inverse_link_is_rejected() {
-    let eta = Array1::from_vec(vec![-0.7, 0.0, 1.2]);
-    let likelihood = LikelihoodSpec::new(
-        ResponseFamily::Binomial,
-        InverseLink::Standard(LinkFunction::Sas),
-    );
-    let sas_err = try_inverse_link_array(&likelihood, eta.view())
-        .expect_err("SAS inverse-link should require explicit sas_params");
-    assert!(
-        sas_err
-            .to_string()
-            .contains("requires explicit SAS link state")
-    );
-}
+// `stateless_sas_inverse_link_is_rejected` was deleted: the type system now
+// rejects `InverseLink::Standard(LinkFunction::Sas)` at compile time
+// (`InverseLink::Standard` carries `StandardLink`, which has no `Sas`
+// variant), so the runtime check it exercised is unreachable by
+// construction.
 
 #[test]
 fn mixture_uncertainty_intervals_are_clamped_to_unit_interval() {

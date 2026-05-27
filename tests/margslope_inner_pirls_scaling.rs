@@ -47,7 +47,7 @@ use gam::terms::smooth::{
     ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, SpatialLengthScaleOptimizationOptions,
     TermCollectionSpec,
 };
-use gam::types::{InverseLink, LinkFunction};
+use gam::types::{InverseLink, LinkFunction, StandardLink};
 use gam::{BernoulliMarginalSlopeFitRequest, FitRequest, FitResult, fit_model};
 use ndarray::{Array1, Array2};
 use rand::rngs::StdRng;
@@ -154,7 +154,7 @@ fn build_problem(n: usize, flex: bool) -> Problem {
         y,
         weights,
         z,
-        base_link: InverseLink::Standard(LinkFunction::Probit),
+        base_link: InverseLink::Standard(StandardLink::Probit),
         marginalspec,
         logslopespec,
         marginal_offset,

@@ -17,7 +17,7 @@ use gam::smooth::{
     LinearCoefficientGeometry, LinearTermSpec, ShapeConstraint, SmoothBasisSpec, SmoothTermSpec,
     SpatialLengthScaleOptimizationOptions, TermCollectionSpec,
 };
-use gam::types::{InverseLink, LinkFunction, WigglePenaltyConfig};
+use gam::types::{InverseLink, LinkFunction, StandardLink, WigglePenaltyConfig};
 use gam::{BernoulliMarginalSlopeFitRequest, FitRequest, FitResult, ResourcePolicy, fit_model};
 use ndarray::{Array1, Array2};
 use rand::rngs::StdRng;
@@ -183,7 +183,7 @@ fn build_problem(n: usize) -> BiobankProblem {
             y,
             weights: Array1::ones(n),
             z,
-            base_link: InverseLink::Standard(LinkFunction::Probit),
+            base_link: InverseLink::Standard(StandardLink::Probit),
             marginalspec,
             logslopespec,
             marginal_offset: Array1::zeros(n),

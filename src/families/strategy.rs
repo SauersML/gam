@@ -10,7 +10,7 @@ use crate::quadrature::{
     probit_posterior_meanvariance, survival_posterior_mean, survival_posterior_meanvariance,
 };
 use crate::types::{
-    InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily, is_valid_tweedie_power,
+    InverseLink, LikelihoodSpec, LinkFunction, StandardLink, ResponseFamily, is_valid_tweedie_power,
 };
 use ndarray::{Array1, ArrayView1};
 
@@ -332,13 +332,13 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
     ) -> Result<(f64, f64), EstimationError> {
         match (&self.spec.response, &self.spec.link) {
             (ResponseFamily::Gaussian, _) => Ok((eta, (se_eta * se_eta).max(0.0))),
-            (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Logit)) => {
+            (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::Logit)) => {
                 Ok(logit_posterior_meanvariance(quadctx, eta, se_eta))
             }
-            (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Probit)) => {
+            (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::Probit)) => {
                 Ok(probit_posterior_meanvariance(quadctx, eta, se_eta))
             }
-            (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::CLogLog)) => {
+            (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::CLogLog)) => {
                 Ok(cloglog_posterior_meanvariance(quadctx, eta, se_eta))
             }
             (ResponseFamily::Binomial, InverseLink::Standard(_)) => {
@@ -422,9 +422,9 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
             ResponseFamily::Gaussian => {
                 let sigma = require_noise_parameter(&self.spec, "Gaussian sigma", gaussian_scale)?;
                 if sigma < 0.0 {
-                    return Err(EstimationError::InvalidInput(format!(
+                    crate::bail_invalid_estim!(
                         "Gaussian Identity generative sampling requires Gaussian sigma >= 0; got {sigma}"
-                    )));
+                    );
                 }
                 Ok(NoiseModel::Gaussian {
                     sigma: Array1::from_elem(mean.len(), sigma),
@@ -435,9 +435,9 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
             ResponseFamily::Tweedie { p } => {
                 let p = *p;
                 if !is_valid_tweedie_power(p) {
-                    return Err(EstimationError::InvalidInput(format!(
+                    crate::bail_invalid_estim!(
                         "Tweedie variance power must be finite and strictly between 1 and 2; got {p}"
-                    )));
+                    );
                 }
                 Ok(NoiseModel::Tweedie {
                     p,
@@ -451,18 +451,18 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
             ResponseFamily::NegativeBinomial { theta } => {
                 let theta = *theta;
                 if !(theta.is_finite() && theta > 0.0) {
-                    return Err(EstimationError::InvalidInput(format!(
+                    crate::bail_invalid_estim!(
                         "negative-binomial theta must be finite and > 0; got {theta}"
-                    )));
+                    );
                 }
                 Ok(NoiseModel::NegativeBinomial { theta })
             }
             ResponseFamily::Beta { phi } => {
                 let phi = *phi;
                 if !(phi.is_finite() && phi > 0.0) {
-                    return Err(EstimationError::InvalidInput(format!(
+                    crate::bail_invalid_estim!(
                         "beta-regression phi must be finite and > 0; got {phi}"
-                    )));
+                    );
                 }
                 Ok(NoiseModel::Beta { phi })
             }

@@ -52,7 +52,7 @@ use crate::solver::estimate::{
     EstimationError, FitGeometry, ensure_finite_scalar_estimation, validate_all_finite_estimation,
 };
 use crate::terms::construction::kronecker_product;
-use crate::types::{InverseLink, LinkFunction};
+use crate::types::{InverseLink, StandardLink};
 use ndarray::{Array1, Array2, ArrayView1, Axis, s};
 use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
 use rayon::slice::ParallelSliceMut;
@@ -249,13 +249,9 @@ fn safe_hadamard_product(
     rhs: &Array1<f64>,
 ) -> Result<Array1<f64>, SurvivalLocationScaleError> {
     if lhs.len() != rhs.len() {
-        return Err(SurvivalLocationScaleError::DimensionMismatch {
-            reason: format!(
-                "safe_hadamard_product length mismatch: lhs has {}, rhs has {}",
+        crate::bail_dim_sls!("safe_hadamard_product length mismatch: lhs has {}, rhs has {}",
                 lhs.len(),
-                rhs.len()
-            ),
-        });
+                rhs.len());
     }
     let out = Array1::from_shape_fn(lhs.len(), |i| safe_product(lhs[i], rhs[i]));
     if out.iter().any(|value| value.is_nan()) {
@@ -273,15 +269,11 @@ fn safe_linear_combo2_arrays(
     d: &Array1<f64>,
 ) -> Result<Array1<f64>, SurvivalLocationScaleError> {
     if a.len() != b.len() || a.len() != c.len() || a.len() != d.len() {
-        return Err(SurvivalLocationScaleError::DimensionMismatch {
-            reason: format!(
-                "safe_linear_combo2_arrays length mismatch: a={}, b={}, c={}, d={}",
+        crate::bail_dim_sls!("safe_linear_combo2_arrays length mismatch: a={}, b={}, c={}, d={}",
                 a.len(),
                 b.len(),
                 c.len(),
-                d.len()
-            ),
-        });
+                d.len());
     }
     let out = Array1::from_shape_fn(a.len(), |i| {
         safe_sum2(safe_product(a[i], b[i]), safe_product(c[i], d[i]))
@@ -596,12 +588,12 @@ impl ResidualDistributionOps for ResidualDistribution {
                 -(z * z * z - 3.0 * z) * f
             }
             ResidualDistribution::Gumbel => inverse_link_pdfthird_derivative_for_inverse_link(
-                &InverseLink::Standard(LinkFunction::CLogLog),
+                &InverseLink::Standard(StandardLink::CLogLog),
                 z,
             )
             .expect("standard cloglog inverse-link third derivative should evaluate"),
             ResidualDistribution::Logistic => inverse_link_pdfthird_derivative_for_inverse_link(
-                &InverseLink::Standard(LinkFunction::Logit),
+                &InverseLink::Standard(StandardLink::Logit),
                 z,
             )
             .expect("standard logit inverse-link third derivative should evaluate"),
@@ -633,12 +625,12 @@ impl ResidualDistributionOps for ResidualDistribution {
                 (z2 * z2 - 6.0 * z2 + 3.0) * f
             }
             ResidualDistribution::Gumbel => inverse_link_pdffourth_derivative_for_inverse_link(
-                &InverseLink::Standard(LinkFunction::CLogLog),
+                &InverseLink::Standard(StandardLink::CLogLog),
                 z,
             )
             .expect("standard cloglog inverse-link fourth derivative should evaluate"),
             ResidualDistribution::Logistic => inverse_link_pdffourth_derivative_for_inverse_link(
-                &InverseLink::Standard(LinkFunction::Logit),
+                &InverseLink::Standard(StandardLink::Logit),
                 z,
             )
             .expect("standard logit inverse-link fourth derivative should evaluate"),
@@ -647,11 +639,11 @@ impl ResidualDistributionOps for ResidualDistribution {
 }
 
 #[inline]
-fn residual_distribution_link(distribution: ResidualDistribution) -> LinkFunction {
+fn residual_distribution_link(distribution: ResidualDistribution) -> StandardLink {
     match distribution {
-        ResidualDistribution::Gaussian => LinkFunction::Probit,
-        ResidualDistribution::Gumbel => LinkFunction::CLogLog,
-        ResidualDistribution::Logistic => LinkFunction::Logit,
+        ResidualDistribution::Gaussian => StandardLink::Probit,
+        ResidualDistribution::Gumbel => StandardLink::CLogLog,
+        ResidualDistribution::Logistic => StandardLink::Logit,
     }
 }
 
@@ -669,9 +661,9 @@ pub fn residual_distribution_inverse_link(distribution: ResidualDistribution) ->
 #[inline]
 pub fn residual_distribution_from_inverse_link(link: &InverseLink) -> Option<ResidualDistribution> {
     match link {
-        InverseLink::Standard(LinkFunction::Probit) => Some(ResidualDistribution::Gaussian),
-        InverseLink::Standard(LinkFunction::CLogLog) => Some(ResidualDistribution::Gumbel),
-        InverseLink::Standard(LinkFunction::Logit) => Some(ResidualDistribution::Logistic),
+        InverseLink::Standard(StandardLink::Probit) => Some(ResidualDistribution::Gaussian),
+        InverseLink::Standard(StandardLink::CLogLog) => Some(ResidualDistribution::Gumbel),
+        InverseLink::Standard(StandardLink::Logit) => Some(ResidualDistribution::Logistic),
         _ => None,
     }
 }
@@ -692,13 +684,13 @@ fn inverse_link_pdffourth_derivative(
     eta: f64,
 ) -> Result<f64, SurvivalLocationScaleError> {
     match inverse_link {
-        InverseLink::Standard(LinkFunction::Probit) => {
+        InverseLink::Standard(StandardLink::Probit) => {
             Ok(ResidualDistribution::Gaussian.pdffourth_derivative(eta))
         }
-        InverseLink::Standard(LinkFunction::Logit) => {
+        InverseLink::Standard(StandardLink::Logit) => {
             Ok(ResidualDistribution::Logistic.pdffourth_derivative(eta))
         }
-        InverseLink::Standard(LinkFunction::CLogLog) => {
+        InverseLink::Standard(StandardLink::CLogLog) => {
             Ok(ResidualDistribution::Gumbel.pdffourth_derivative(eta))
         }
         _ => crate::solver::mixture_link::inverse_link_pdffourth_derivative_for_inverse_link(
@@ -2631,14 +2623,14 @@ impl SurvivalLocationScaleFamily {
         deriv_log_scale: f64,
     ) -> Result<(f64, f64, f64, f64, f64), String> {
         match inverse_link {
-            InverseLink::Standard(LinkFunction::Probit) => Ok((
+            InverseLink::Standard(StandardLink::Probit) => Ok((
                 -0.5 * eta * eta - 0.5 * (2.0 * std::f64::consts::PI).ln(),
                 -eta,
                 -1.0,
                 0.0,
                 0.0,
             )),
-            InverseLink::Standard(LinkFunction::Logit) => {
+            InverseLink::Standard(StandardLink::Logit) => {
                 let mu = crate::solver::mixture_link::component_inverse_link_jet(
                     crate::types::LinkComponent::Logit,
                     eta,
@@ -2653,7 +2645,7 @@ impl SurvivalLocationScaleFamily {
                     -2.0 * w * (1.0 - 6.0 * w),
                 ))
             }
-            InverseLink::Standard(LinkFunction::CLogLog) => {
+            InverseLink::Standard(StandardLink::CLogLog) => {
                 let t_val = eta.exp(); // for function value (may be Inf)
                 let t_deriv = (eta - deriv_log_scale).exp(); // for derivatives
                 let deriv_scale = (-deriv_log_scale).exp();
@@ -2665,7 +2657,7 @@ impl SurvivalLocationScaleFamily {
                     -t_deriv,
                 ))
             }
-            InverseLink::Standard(LinkFunction::Identity) => Ok((0.0, 0.0, 0.0, 0.0, 0.0)),
+            InverseLink::Standard(StandardLink::Identity) => Ok((0.0, 0.0, 0.0, 0.0, 0.0)),
             _ => {
                 let jet = inverse_link_jet_for_inverse_link(inverse_link, eta)
                     .map_err(|e| format!("inverse link evaluation failed at eta={eta}: {e}"))?;
@@ -2708,11 +2700,11 @@ impl SurvivalLocationScaleFamily {
         deriv_log_scale: f64,
     ) -> Result<(f64, f64, f64, f64, f64), String> {
         match inverse_link {
-            InverseLink::Standard(LinkFunction::Probit) => {
+            InverseLink::Standard(StandardLink::Probit) => {
                 let (log_s, r, dr, ddr, dddr) = probit_log_survival_and_ratio_derivatives(eta);
                 Ok((log_s, r, dr, ddr, dddr))
             }
-            InverseLink::Standard(LinkFunction::Logit) => {
+            InverseLink::Standard(StandardLink::Logit) => {
                 let mu = crate::solver::mixture_link::component_inverse_link_jet(
                     crate::types::LinkComponent::Logit,
                     eta,
@@ -2727,12 +2719,12 @@ impl SurvivalLocationScaleFamily {
                     w * (1.0 - 6.0 * w),
                 ))
             }
-            InverseLink::Standard(LinkFunction::CLogLog) => {
+            InverseLink::Standard(StandardLink::CLogLog) => {
                 let t_val = eta.exp(); // for the function value (may be Inf)
                 let t_deriv = (eta - deriv_log_scale).exp(); // for derivatives (finite when shifted)
                 Ok((-t_val, t_deriv, t_deriv, t_deriv, t_deriv))
             }
-            InverseLink::Standard(LinkFunction::Identity) => {
+            InverseLink::Standard(StandardLink::Identity) => {
                 let s = 1.0 - eta;
                 if !(s.is_finite() && s > 0.0) {
                     return Err(SurvivalLocationScaleError::NumericalFailure {
@@ -2888,7 +2880,7 @@ impl SurvivalLocationScaleFamily {
         let ((log_s1, r1, dr1, ddr1, dddr1), (logphi1, dlogphi1, d2logphi1, d3logphi1, d4logphi1)) =
             if matches!(
                 &self.inverse_link,
-                InverseLink::Standard(LinkFunction::CLogLog)
+                InverseLink::Standard(StandardLink::CLogLog)
             ) {
                 Self::clglog_exit_pair(u1, deriv_log_scale)
             } else {
@@ -3144,42 +3136,26 @@ fn validate_cov_block(
     b: &CovariateBlockInput,
 ) -> Result<(), SurvivalLocationScaleError> {
     if b.design.nrows() != n {
-        return Err(SurvivalLocationScaleError::DimensionMismatch {
-            reason: format!(
-                "{name} design row mismatch: got {}, expected {n}",
-                b.design.nrows()
-            ),
-        });
+        crate::bail_dim_sls!("{name} design row mismatch: got {}, expected {n}",
+                b.design.nrows());
     }
     if b.offset.len() != n {
-        return Err(SurvivalLocationScaleError::DimensionMismatch {
-            reason: format!(
-                "{name} offset length mismatch: got {}, expected {n}",
-                b.offset.len()
-            ),
-        });
+        crate::bail_dim_sls!("{name} offset length mismatch: got {}, expected {n}",
+                b.offset.len());
     }
     let p = b.design.ncols();
     if let Some(beta0) = &b.initial_beta
         && beta0.len() != p
     {
-        return Err(SurvivalLocationScaleError::DimensionMismatch {
-            reason: format!(
-                "{name} initial_beta length mismatch: got {}, expected {p}",
-                beta0.len()
-            ),
-        });
+        crate::bail_dim_sls!("{name} initial_beta length mismatch: got {}, expected {p}",
+                beta0.len());
     }
     let k = b.penalties.len();
     if let Some(rho0) = &b.initial_log_lambdas
         && rho0.len() != k
     {
-        return Err(SurvivalLocationScaleError::DimensionMismatch {
-            reason: format!(
-                "{name} initial_log_lambdas length mismatch: got {}, expected {k}",
-                rho0.len()
-            ),
-        });
+        crate::bail_dim_sls!("{name} initial_log_lambdas length mismatch: got {}, expected {k}",
+                rho0.len());
     }
     for (idx, s) in b.penalties.iter().enumerate() {
         match s {
@@ -3190,24 +3166,18 @@ fn validate_cov_block(
                     || local.nrows() != col_range.len()
                     || local.ncols() != col_range.len()
                 {
-                    return Err(SurvivalLocationScaleError::DimensionMismatch {
-                        reason: format!(
-                            "{name} penalty {idx} block shape mismatch: col_range={}..{}, local={}x{}, total_dim={p}",
+                    crate::bail_dim_sls!("{name} penalty {idx} block shape mismatch: col_range={}..{}, local={}x{}, total_dim={p}",
                             col_range.start,
                             col_range.end,
                             local.nrows(),
-                            local.ncols()
-                        ),
-                    });
+                            local.ncols());
                 }
             }
             crate::solver::estimate::PenaltySpec::Dense(m)
             | crate::solver::estimate::PenaltySpec::DenseWithMean { matrix: m, .. } => {
                 let (r, c) = m.dim();
                 if r != p || c != p {
-                    return Err(SurvivalLocationScaleError::DimensionMismatch {
-                        reason: format!("{name} penalty {idx} must be {p}x{p}, got {r}x{c}"),
-                    });
+                    crate::bail_dim_sls!("{name} penalty {idx} must be {p}x{p}, got {r}x{c}");
                 }
             }
         }
@@ -3224,88 +3194,52 @@ fn validate_cov_block_kind(
         CovariateBlockKind::Static(b) => validate_cov_block(name, n, b),
         CovariateBlockKind::TimeVarying(tv) => {
             if tv.design_covariates.nrows() != n {
-                return Err(SurvivalLocationScaleError::DimensionMismatch {
-                    reason: format!(
-                        "{name} time-varying covariate design row mismatch: got {}, expected {n}",
-                        tv.design_covariates.nrows()
-                    ),
-                });
+                crate::bail_dim_sls!("{name} time-varying covariate design row mismatch: got {}, expected {n}",
+                        tv.design_covariates.nrows());
             }
             if tv.time_basis_entry.nrows() != n || tv.time_basis_exit.nrows() != n {
-                return Err(SurvivalLocationScaleError::DimensionMismatch {
-                    reason: format!(
-                        "{name} time-varying time basis row mismatch: entry={}, exit={}, expected {n}",
+                crate::bail_dim_sls!("{name} time-varying time basis row mismatch: entry={}, exit={}, expected {n}",
                         tv.time_basis_entry.nrows(),
-                        tv.time_basis_exit.nrows()
-                    ),
-                });
+                        tv.time_basis_exit.nrows());
             }
             if tv.time_basis_derivative_exit.nrows() != n {
-                return Err(SurvivalLocationScaleError::DimensionMismatch {
-                    reason: format!(
-                        "{name} time-varying derivative basis row mismatch: got {}, expected {n}",
-                        tv.time_basis_derivative_exit.nrows()
-                    ),
-                });
+                crate::bail_dim_sls!("{name} time-varying derivative basis row mismatch: got {}, expected {n}",
+                        tv.time_basis_derivative_exit.nrows());
             }
             if tv.offset.len() != n {
-                return Err(SurvivalLocationScaleError::DimensionMismatch {
-                    reason: format!(
-                        "{name} time-varying offset length mismatch: got {}, expected {n}",
-                        tv.offset.len()
-                    ),
-                });
+                crate::bail_dim_sls!("{name} time-varying offset length mismatch: got {}, expected {n}",
+                        tv.offset.len());
             }
             let p_cov = tv.design_covariates.ncols();
             let p_time = tv.time_basis_exit.ncols();
             if tv.time_basis_entry.ncols() != p_time {
-                return Err(SurvivalLocationScaleError::DimensionMismatch {
-                    reason: format!(
-                        "{name} time-varying time basis column mismatch: entry={}, exit={}",
+                crate::bail_dim_sls!("{name} time-varying time basis column mismatch: entry={}, exit={}",
                         tv.time_basis_entry.ncols(),
-                        p_time
-                    ),
-                });
+                        p_time);
             }
             if tv.time_basis_derivative_exit.ncols() != p_time {
-                return Err(SurvivalLocationScaleError::DimensionMismatch {
-                    reason: format!(
-                        "{name} time-varying derivative basis column mismatch: derivative={}, exit={}",
+                crate::bail_dim_sls!("{name} time-varying derivative basis column mismatch: derivative={}, exit={}",
                         tv.time_basis_derivative_exit.ncols(),
-                        p_time
-                    ),
-                });
+                        p_time);
             }
             let p_tensor = p_cov * p_time;
             let k = tv.penalties.len();
             if let Some(beta0) = &tv.initial_beta
                 && beta0.len() != p_tensor
             {
-                return Err(SurvivalLocationScaleError::DimensionMismatch {
-                    reason: format!(
-                        "{name} time-varying initial_beta length mismatch: got {}, expected {p_tensor}",
-                        beta0.len()
-                    ),
-                });
+                crate::bail_dim_sls!("{name} time-varying initial_beta length mismatch: got {}, expected {p_tensor}",
+                        beta0.len());
             }
             if let Some(rho0) = &tv.initial_log_lambdas
                 && rho0.len() != k
             {
-                return Err(SurvivalLocationScaleError::DimensionMismatch {
-                    reason: format!(
-                        "{name} time-varying initial_log_lambdas length mismatch: got {}, expected {k}",
-                        rho0.len()
-                    ),
-                });
+                crate::bail_dim_sls!("{name} time-varying initial_log_lambdas length mismatch: got {}, expected {k}",
+                        rho0.len());
             }
             for (idx, s) in tv.penalties.iter().enumerate() {
                 let (r, c) = s.shape();
                 if r != p_tensor || c != p_tensor {
-                    return Err(SurvivalLocationScaleError::DimensionMismatch {
-                        reason: format!(
-                            "{name} time-varying penalty {idx} must be {p_tensor}x{p_tensor}, got {r}x{c}"
-                        ),
-                    });
+                    crate::bail_dim_sls!("{name} time-varying penalty {idx} must be {p_tensor}x{p_tensor}, got {r}x{c}");
                 }
             }
             Ok(())
@@ -4162,27 +4096,15 @@ fn validate_survival_location_scale_spec(
     let n = spec.event_target.len();
     let monotone_time_wiggle_ncols = spec.timewiggle_block.as_ref().map_or(0, |w| w.ncols);
     match &spec.inverse_link {
-        InverseLink::Standard(LinkFunction::Log) => {
+        InverseLink::Standard(StandardLink::Log) => {
             return Err(SurvivalLocationScaleError::InvalidConfiguration {
                 reason: "fit_survival_location_scale does not support Standard(Log)".to_string(),
             });
         }
-        InverseLink::Standard(LinkFunction::Sas) => {
-            return Err(SurvivalLocationScaleError::InvalidConfiguration {
-                reason: "fit_survival_location_scale requires explicit SasLinkState; state-less Standard(Sas) is unsupported"
-                    .to_string(),
-            });
-        }
-        InverseLink::Standard(LinkFunction::BetaLogistic) => {
-            return Err(SurvivalLocationScaleError::InvalidConfiguration {
-                reason: "fit_survival_location_scale requires explicit Beta-Logistic link state; state-less Standard(BetaLogistic) is unsupported"
-                    .to_string(),
-            });
-        }
-        InverseLink::Standard(LinkFunction::Logit)
-        | InverseLink::Standard(LinkFunction::Probit)
-        | InverseLink::Standard(LinkFunction::CLogLog)
-        | InverseLink::Standard(LinkFunction::Identity)
+        InverseLink::Standard(StandardLink::Logit)
+        | InverseLink::Standard(StandardLink::Probit)
+        | InverseLink::Standard(StandardLink::CLogLog)
+        | InverseLink::Standard(StandardLink::Identity)
         | InverseLink::LatentCLogLog(_)
         | InverseLink::Sas(_)
         | InverseLink::BetaLogistic(_)
@@ -4194,9 +4116,7 @@ fn validate_survival_location_scale_spec(
         });
     }
     if spec.age_entry.len() != n || spec.age_exit.len() != n || spec.weights.len() != n {
-        return Err(SurvivalLocationScaleError::DimensionMismatch {
-            reason: "fit_survival_location_scale: top-level input size mismatch".to_string(),
-        });
+        crate::bail_dim_sls!("fit_survival_location_scale: top-level input size mismatch");
     }
     if !(spec.tol.is_finite() && spec.tol > 0.0) {
         return Err(SurvivalLocationScaleError::InvalidConfiguration {
@@ -4750,12 +4670,8 @@ fn validatewiggle_block(
     b: &LinkWiggleBlockInput,
 ) -> Result<(), SurvivalLocationScaleError> {
     if b.design.nrows() != n {
-        return Err(SurvivalLocationScaleError::DimensionMismatch {
-            reason: format!(
-                "linkwiggle_block design row mismatch: got {}, expected {n}",
-                b.design.nrows()
-            ),
-        });
+        crate::bail_dim_sls!("linkwiggle_block design row mismatch: got {}, expected {n}",
+                b.design.nrows());
     }
     let p = b.design.ncols();
     if b.knots.len() < b.degree + 2 {
@@ -4770,12 +4686,8 @@ fn validatewiggle_block(
     if let Some(beta0) = &b.initial_beta
         && beta0.len() != p
     {
-        return Err(SurvivalLocationScaleError::DimensionMismatch {
-            reason: format!(
-                "linkwiggle_block initial_beta length mismatch: got {}, expected {p}",
-                beta0.len()
-            ),
-        });
+        crate::bail_dim_sls!("linkwiggle_block initial_beta length mismatch: got {}, expected {p}",
+                beta0.len());
     }
     if let Some(beta0) = &b.initial_beta {
         if let Some(beta0_slice) = beta0.as_slice() {
@@ -4795,12 +4707,8 @@ fn validatewiggle_block(
     if let Some(rho0) = &b.initial_log_lambdas
         && rho0.len() != k
     {
-        return Err(SurvivalLocationScaleError::DimensionMismatch {
-            reason: format!(
-                "linkwiggle_block initial_log_lambdas length mismatch: got {}, expected {k}",
-                rho0.len()
-            ),
-        });
+        crate::bail_dim_sls!("linkwiggle_block initial_log_lambdas length mismatch: got {}, expected {k}",
+                rho0.len());
     }
     for (idx, s) in b.penalties.iter().enumerate() {
         match s {
@@ -4811,26 +4719,18 @@ fn validatewiggle_block(
                     || local.nrows() != col_range.len()
                     || local.ncols() != col_range.len()
                 {
-                    return Err(SurvivalLocationScaleError::DimensionMismatch {
-                        reason: format!(
-                            "linkwiggle_block penalty {idx} block shape mismatch: col_range={}..{}, local={}x{}, total_dim={p}",
+                    crate::bail_dim_sls!("linkwiggle_block penalty {idx} block shape mismatch: col_range={}..{}, local={}x{}, total_dim={p}",
                             col_range.start,
                             col_range.end,
                             local.nrows(),
-                            local.ncols()
-                        ),
-                    });
+                            local.ncols());
                 }
             }
             crate::solver::estimate::PenaltySpec::Dense(m)
             | crate::solver::estimate::PenaltySpec::DenseWithMean { matrix: m, .. } => {
                 let (r, c) = m.dim();
                 if r != p || c != p {
-                    return Err(SurvivalLocationScaleError::DimensionMismatch {
-                        reason: format!(
-                            "linkwiggle_block penalty {idx} must be {p}x{p}, got {r}x{c}"
-                        ),
-                    });
+                    crate::bail_dim_sls!("linkwiggle_block penalty {idx} must be {p}x{p}, got {r}x{c}");
                 }
             }
         }
@@ -4851,15 +4751,11 @@ fn validate_time_block(
         || b.offset_exit.len() != n
         || b.derivative_offset_exit.len() != n
     {
-        return Err(SurvivalLocationScaleError::DimensionMismatch {
-            reason: "time_block input size mismatch".to_string(),
-        });
+        crate::bail_dim_sls!("time_block input size mismatch");
     }
     let p = b.design_exit.ncols();
     if b.design_entry.ncols() != p || b.design_derivative_exit.ncols() != p {
-        return Err(SurvivalLocationScaleError::DimensionMismatch {
-            reason: "time_block design column mismatch across entry/exit/derivative".to_string(),
-        });
+        crate::bail_dim_sls!("time_block design column mismatch across entry/exit/derivative");
     }
     if !b.time_monotonicity.is_coordinate_cone() {
         return Err(SurvivalLocationScaleError::InvalidConfiguration {
@@ -4878,30 +4774,20 @@ fn validate_time_block(
     if let Some(beta0) = &b.initial_beta
         && beta0.len() != p
     {
-        return Err(SurvivalLocationScaleError::DimensionMismatch {
-            reason: format!(
-                "time_block initial_beta length mismatch: got {}, expected {p}",
-                beta0.len()
-            ),
-        });
+        crate::bail_dim_sls!("time_block initial_beta length mismatch: got {}, expected {p}",
+                beta0.len());
     }
     let k = b.penalties.len();
     if let Some(rho0) = &b.initial_log_lambdas
         && rho0.len() != k
     {
-        return Err(SurvivalLocationScaleError::DimensionMismatch {
-            reason: format!(
-                "time_block initial_log_lambdas length mismatch: got {}, expected {k}",
-                rho0.len()
-            ),
-        });
+        crate::bail_dim_sls!("time_block initial_log_lambdas length mismatch: got {}, expected {k}",
+                rho0.len());
     }
     for (idx, s) in b.penalties.iter().enumerate() {
         let (r, c) = s.dim();
         if r != p || c != p {
-            return Err(SurvivalLocationScaleError::DimensionMismatch {
-                reason: format!("time_block penalty {idx} must be {p}x{p}, got {r}x{c}"),
-            });
+            crate::bail_dim_sls!("time_block penalty {idx} must be {p}x{p}, got {r}x{c}");
         }
     }
     Ok(())
@@ -5588,13 +5474,9 @@ fn scale_dense_rows(
     coeffs: &Array1<f64>,
 ) -> Result<Array2<f64>, SurvivalLocationScaleError> {
     if mat.nrows() != coeffs.len() {
-        return Err(SurvivalLocationScaleError::DimensionMismatch {
-            reason: format!(
-                "row scaling dimension mismatch: matrix has {} rows but coeffs have {} entries",
+        crate::bail_dim_sls!("row scaling dimension mismatch: matrix has {} rows but coeffs have {} entries",
                 mat.nrows(),
-                coeffs.len()
-            ),
-        });
+                coeffs.len());
     }
     let sanitized_coeffs = sanitize_survival_weight_vector(coeffs);
     let work = mat.nrows().saturating_mul(mat.ncols());
@@ -5680,12 +5562,15 @@ fn validate_predict_inverse_link(
     inverse_link: &InverseLink,
 ) -> Result<(), SurvivalLocationScaleError> {
     match inverse_link {
-        InverseLink::Standard(LinkFunction::Log) => Err(SurvivalLocationScaleError::InvalidConfiguration { reason: "prediction does not support Standard(Log) for survival models".to_string(), }),
-        InverseLink::Standard(LinkFunction::Sas) => Err(SurvivalLocationScaleError::InvalidConfiguration { reason: "prediction requires explicit SasLinkState; state-less Standard(Sas) is unsupported"
-                .to_string(), }),
-        InverseLink::Standard(LinkFunction::BetaLogistic) => Err(SurvivalLocationScaleError::InvalidConfiguration { reason: "prediction requires explicit Beta-Logistic link state; state-less Standard(BetaLogistic) is unsupported"
-                .to_string(), }),
-        _ => Ok(()),
+        InverseLink::Standard(StandardLink::Log) => Err(SurvivalLocationScaleError::InvalidConfiguration { reason: "prediction does not support Standard(Log) for survival models".to_string(), }),
+        InverseLink::Standard(StandardLink::Logit)
+        | InverseLink::Standard(StandardLink::Probit)
+        | InverseLink::Standard(StandardLink::CLogLog)
+        | InverseLink::Standard(StandardLink::Identity)
+        | InverseLink::LatentCLogLog(_)
+        | InverseLink::Sas(_)
+        | InverseLink::BetaLogistic(_)
+        | InverseLink::Mixture(_) => Ok(()),
     }
 }
 
@@ -5709,16 +5594,15 @@ fn inverse_link_survival_prob_checked(
 
 fn inverse_link_survival_probvalue(inverse_link: &InverseLink, eta: f64) -> f64 {
     match inverse_link {
-        InverseLink::Standard(LinkFunction::Probit) => probit_survival_value(eta),
-        InverseLink::Standard(LinkFunction::Logit) => 1.0 / (1.0 + eta.exp()),
-        InverseLink::Standard(LinkFunction::CLogLog) => (-(eta.exp())).exp(),
-        InverseLink::Standard(LinkFunction::Identity) => 1.0 - eta,
-        InverseLink::Standard(LinkFunction::Log) => {
-            // Survival families register only Probit/Logit/CLogLog/Identity/
-            // LatentCLogLog/Sas/BetaLogistic/Mixture inverse links; the bare
-            // `Log` arm here is unreachable on a validated survival model.
-            // SAFETY: the match must stay exhaustive over `LinkFunction`,
-            // and reaching this arm means the family validator was bypassed.
+        InverseLink::Standard(StandardLink::Probit) => probit_survival_value(eta),
+        InverseLink::Standard(StandardLink::Logit) => 1.0 / (1.0 + eta.exp()),
+        InverseLink::Standard(StandardLink::CLogLog) => (-(eta.exp())).exp(),
+        InverseLink::Standard(StandardLink::Identity) => 1.0 - eta,
+        InverseLink::Standard(StandardLink::Log) => {
+            // SAFETY: survival families register only Probit/Logit/CLogLog/
+            // Identity/LatentCLogLog/Sas/BetaLogistic/Mixture inverse links;
+            // `validate_predict_inverse_link` rejects `Standard(Log)` upstream
+            // so this arm is unreachable on a validated survival model.
             panic!("state-less log inverse link is invalid for survival prediction")
         }
         InverseLink::LatentCLogLog(_)
@@ -5726,15 +5610,6 @@ fn inverse_link_survival_probvalue(inverse_link: &InverseLink, eta: f64) -> f64 
         | InverseLink::BetaLogistic(_)
         | InverseLink::Mixture(_) => inverse_link_survival_prob_checked(inverse_link, eta)
             .expect("validated inverse link should evaluate during prediction"),
-        InverseLink::Standard(LinkFunction::Sas)
-        | InverseLink::Standard(LinkFunction::BetaLogistic) => {
-            // SAS/BetaLogistic are state-bearing inverse links; valid models
-            // always wrap their parameter state in `InverseLink::Sas(_)` /
-            // `InverseLink::BetaLogistic(_)`, never `Standard(...)`.
-            // SAFETY: reaching this arm means a deserializer dropped link
-            // state — a contract the loader is required to reject upstream.
-            panic!("state-less SAS/Beta-Logistic inverse link is invalid for prediction")
-        }
     }
 }
 
@@ -7962,7 +7837,7 @@ impl SurvivalLocationScaleFamily {
     fn hessian_deriv_log_rescale(&self, block_states: &[ParameterBlockState]) -> f64 {
         if !matches!(
             self.inverse_link,
-            InverseLink::Standard(LinkFunction::CLogLog)
+            InverseLink::Standard(StandardLink::CLogLog)
         ) {
             return 0.0;
         }
@@ -10660,9 +10535,7 @@ pub(crate) fn fit_survival_location_scale_terms(
         },
         |beta: &Array1<f64>| {
             if beta.iter().any(|v| !v.is_finite()) {
-                return Err(EstimationError::InvalidInput(
-                    "cached inner beta contains non-finite entries".to_string(),
-                ));
+                crate::bail_invalid_estim!("cached inner beta contains non-finite entries");
             }
             pending_beta_seed.replace(Some(beta.clone()));
             Ok(())
@@ -12270,7 +12143,7 @@ mod tests {
         let eta = 3.25;
         let (logf, d1, d2, d3, d4) =
             SurvivalLocationScaleFamily::exact_log_pdf_derivatives_rescaled(
-                &InverseLink::Standard(LinkFunction::Probit),
+                &InverseLink::Standard(StandardLink::Probit),
                 eta,
                 0.0,
             )
@@ -12289,14 +12162,14 @@ mod tests {
         let log_scale = 1.0;
         let (logf, d1, d2, d3, d4) =
             SurvivalLocationScaleFamily::exact_log_pdf_derivatives_rescaled(
-                &InverseLink::Standard(LinkFunction::CLogLog),
+                &InverseLink::Standard(StandardLink::CLogLog),
                 eta,
                 log_scale,
             )
             .expect("rescaled cloglog log-pdf derivatives");
         let (unscaled_logf, u1, u2, u3, u4) =
             SurvivalLocationScaleFamily::exact_log_pdf_derivatives_rescaled(
-                &InverseLink::Standard(LinkFunction::CLogLog),
+                &InverseLink::Standard(StandardLink::CLogLog),
                 eta,
                 0.0,
             )
@@ -12321,7 +12194,7 @@ mod tests {
         let inv = 1.0 / s;
         let (log_s, r, dr, ddr, dddr) =
             SurvivalLocationScaleFamily::exact_survival_neglog_derivatives_fourth_rescaled(
-                &InverseLink::Standard(LinkFunction::Identity),
+                &InverseLink::Standard(StandardLink::Identity),
                 eta,
                 0.0,
             )
@@ -13765,33 +13638,6 @@ mod tests {
     }
 
     #[test]
-    fn predict_rejects_stateless_beta_logistic_inverse_link() {
-        let fit = test_survival_fit(array![0.4, -0.1], array![0.2, 0.3], array![-0.5, 0.1], None);
-        let input = SurvivalLocationScalePredictInput {
-            x_time_exit: array![[1.0, 0.5]],
-            eta_time_offset_exit: array![0.2],
-            time_wiggle_knots: None,
-            time_wiggle_degree: None,
-            time_wiggle_ncols: 0,
-            x_threshold: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[
-                1.0, -0.2
-            ]])),
-            eta_threshold_offset: array![0.0],
-            x_log_sigma: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[
-                1.0, 0.3
-            ]])),
-            eta_log_sigma_offset: array![0.0],
-            x_link_wiggle: None,
-            link_wiggle_knots: None,
-            link_wiggle_degree: None,
-            inverse_link: InverseLink::Standard(LinkFunction::BetaLogistic),
-        };
-
-        let err = predict_survival_location_scale(&input, &fit).expect_err("should reject");
-        assert!(err.contains("state-less Standard(BetaLogistic)"));
-    }
-
-    #[test]
     fn predict_supports_sas_beta_logistic_and_mixture_links() {
         let fit = test_survival_fit(array![0.4, -0.1], array![0.2, 0.3], array![-0.5, 0.1], None);
         let base = SurvivalLocationScalePredictInput {
@@ -13811,7 +13657,7 @@ mod tests {
             x_link_wiggle: None,
             link_wiggle_knots: None,
             link_wiggle_degree: None,
-            inverse_link: InverseLink::Standard(LinkFunction::Probit),
+            inverse_link: InverseLink::Standard(StandardLink::Probit),
         };
 
         let sas = InverseLink::Sas(
@@ -14341,7 +14187,7 @@ mod tests {
         let stable_survival = 0.5 * statrs::function::erf::erfc(eta / std::f64::consts::SQRT_2);
         assert!(stable_survival > 0.0);
         let helper =
-            inverse_link_survival_probvalue(&InverseLink::Standard(LinkFunction::Probit), eta);
+            inverse_link_survival_probvalue(&InverseLink::Standard(StandardLink::Probit), eta);
         assert!(
             (helper - stable_survival).abs() < 1e-30,
             "probit survival helper should use the upper-tail erfc form at eta={eta}; got {} vs {}",
@@ -14355,7 +14201,7 @@ mod tests {
         let eta = -100.0_f64;
         let stable_survival = (-(eta.exp())).exp();
         let helper =
-            inverse_link_survival_probvalue(&InverseLink::Standard(LinkFunction::CLogLog), eta);
+            inverse_link_survival_probvalue(&InverseLink::Standard(StandardLink::CLogLog), eta);
         assert_eq!(stable_survival, 1.0);
         assert!(
             (helper - stable_survival).abs() < 1e-30,
@@ -14370,7 +14216,7 @@ mod tests {
         let cumulative_hazard = 4.0_f64;
         let eta = cumulative_hazard.ln();
         let survival =
-            inverse_link_survival_probvalue(&InverseLink::Standard(LinkFunction::CLogLog), eta);
+            inverse_link_survival_probvalue(&InverseLink::Standard(StandardLink::CLogLog), eta);
         let expected = (-cumulative_hazard).exp();
         assert!(
             (survival - expected).abs() < 1e-15,

@@ -2,7 +2,7 @@ use gam::estimate::{
     FitOptions, PenaltySpec, fit_gam, fit_gam_with_penalty_specs, fit_gamwith_heuristic_lambdas,
 };
 use gam::terms::smooth::BlockwisePenalty;
-use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily};
+use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, StandardLink, ResponseFamily};
 use ndarray::array;
 
 #[test]
@@ -14,7 +14,7 @@ fn fit_family_rejects_nan_in_weights_and_design() {
     let s_list: Vec<BlockwisePenalty> = vec![];
     let fam = LikelihoodSpec::new(
         ResponseFamily::Gaussian,
-        InverseLink::Standard(LinkFunction::Identity),
+        InverseLink::Standard(StandardLink::Identity),
     );
     let opts = FitOptions::default();
 

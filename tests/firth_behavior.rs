@@ -3,7 +3,7 @@ use gam::estimate::{ExternalOptimOptions, PenaltySpec, evaluate_externalcost_and
 use gam::pirls::{PenaltyConfig, PirlsConfig, PirlsProblem, fit_model_for_fixed_rho};
 use gam::smooth::BlockwisePenalty;
 use gam::types::{
-    GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkFunction, LogSmoothingParamsView,
+    GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkFunction, StandardLink, LogSmoothingParamsView,
     ResponseFamily,
 };
 use ndarray::{Array1, Array2, array};
@@ -63,7 +63,7 @@ fn make_problem(
 fn binomial_logit_likelihood() -> LikelihoodSpec {
     LikelihoodSpec::new(
         ResponseFamily::Binomial,
-        InverseLink::Standard(LinkFunction::Logit),
+        InverseLink::Standard(StandardLink::Logit),
     )
 }
 
@@ -79,9 +79,9 @@ fn fit_beta_norm(
     let cfg = PirlsConfig {
         likelihood: GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
             ResponseFamily::Binomial,
-            InverseLink::Standard(LinkFunction::Logit),
+            InverseLink::Standard(StandardLink::Logit),
         )),
-        link_kind: InverseLink::Standard(LinkFunction::Logit),
+        link_kind: InverseLink::Standard(StandardLink::Logit),
         max_iterations: 500,
         convergence_tolerance: 1e-10,
         firth_bias_reduction: firth,
@@ -131,9 +131,9 @@ fn proxycostwith_pirls(
     let cfg = PirlsConfig {
         likelihood: GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
             ResponseFamily::Binomial,
-            InverseLink::Standard(LinkFunction::Logit),
+            InverseLink::Standard(StandardLink::Logit),
         )),
-        link_kind: InverseLink::Standard(LinkFunction::Logit),
+        link_kind: InverseLink::Standard(StandardLink::Logit),
         max_iterations: 500,
         convergence_tolerance: 1e-10,
         firth_bias_reduction: firth,

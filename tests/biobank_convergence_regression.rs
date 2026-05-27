@@ -26,7 +26,7 @@
 use gam::estimate::{FitOptions, fit_gam};
 use gam::pirls::PirlsStatus;
 use gam::smooth::BlockwisePenalty;
-use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily};
+use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, StandardLink, ResponseFamily};
 use ndarray::{Array1, Array2};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -164,7 +164,7 @@ fn biobank_convergence_regression() {
         &s_list,
         LikelihoodSpec::new(
             ResponseFamily::Binomial,
-            InverseLink::Standard(LinkFunction::Logit),
+            InverseLink::Standard(StandardLink::Logit),
         ),
         &FitOptions {
             latent_cloglog: None,

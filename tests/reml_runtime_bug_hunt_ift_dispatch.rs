@@ -1,6 +1,6 @@
 use gam::types::{
     GlmLikelihoodSpec, InverseLink, LatentCLogLogState, LikelihoodSpec, LinkComponent,
-    LinkFunction, MixtureLinkState, ResponseFamily, SasLinkState,
+    LinkFunction, StandardLink, MixtureLinkState, ResponseFamily, SasLinkState,
 };
 use ndarray::{Array1, array};
 
@@ -65,7 +65,7 @@ fn reml_likelihood_spec_preserves_parameterized_link_state_for_all_variants() {
 fn reml_predicate_contract_is_deterministic_for_repeated_calls() {
     let spec = glm(LikelihoodSpec::new(
         ResponseFamily::Gaussian,
-        InverseLink::Standard(LinkFunction::Identity),
+        InverseLink::Standard(StandardLink::Identity),
     ));
 
     let first = spec.spec.is_gaussian_identity();
@@ -87,7 +87,7 @@ fn reml_predicate_contract_is_deterministic_for_repeated_calls() {
 fn reml_fixed_dispersion_contract_matches_response_family_rules() {
     let beta = glm(LikelihoodSpec::new(
         ResponseFamily::Beta { phi: 7.0 },
-        InverseLink::Standard(LinkFunction::Logit),
+        InverseLink::Standard(StandardLink::Logit),
     ));
     assert_eq!(
         beta.spec.fixed_dispersion(),
@@ -97,7 +97,7 @@ fn reml_fixed_dispersion_contract_matches_response_family_rules() {
 
     let nb = glm(LikelihoodSpec::new(
         ResponseFamily::NegativeBinomial { theta: 3.5 },
-        InverseLink::Standard(LinkFunction::Log),
+        InverseLink::Standard(StandardLink::Log),
     ));
     assert_eq!(
         nb.spec.fixed_dispersion(),

@@ -19,6 +19,8 @@ pub mod device;
 pub mod driver;
 pub mod error;
 pub mod identifiability_compile;
+#[cfg(target_os = "linux")]
+pub mod identifiability_compile_kernel;
 pub mod linalg;
 pub mod memory;
 pub mod pirls_row;
@@ -28,6 +30,7 @@ pub mod profile;
 pub mod reml_trace;
 pub mod row_hessian_ops;
 pub mod runtime;
+pub mod sigma_cubature;
 pub mod solver;
 pub mod sphere;
 pub mod survival_flex;

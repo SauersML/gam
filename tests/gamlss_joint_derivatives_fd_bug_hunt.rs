@@ -5,7 +5,7 @@ use gam::families::gamlss::{
 };
 use gam::matrix::DesignMatrix;
 use gam::resource::ResourcePolicy;
-use gam::types::{InverseLink, LinkFunction};
+use gam::types::{InverseLink, LinkFunction, StandardLink};
 use ndarray::{Array1, Array2, array};
 
 fn spec(name: &str, x: &Array2<f64>) -> ParameterBlockSpec {
@@ -84,7 +84,7 @@ fn gamlss_joint_derivatives_match_finite_difference() {
             Box::new(BinomialLocationScaleFamily {
                 y: y_b.clone(),
                 weights: w.clone(),
-                link_kind: InverseLink::Standard(LinkFunction::Logit),
+                link_kind: InverseLink::Standard(StandardLink::Logit),
                 threshold_design: Some(DesignMatrix::from(x.clone())),
                 log_sigma_design: Some(DesignMatrix::from(z.clone())),
                 policy: ResourcePolicy::default_library(),
@@ -97,7 +97,7 @@ fn gamlss_joint_derivatives_match_finite_difference() {
             Box::new(BinomialMeanWiggleFamily {
                 y: y_b.clone(),
                 weights: w.clone(),
-                link_kind: InverseLink::Standard(LinkFunction::Logit),
+                link_kind: InverseLink::Standard(StandardLink::Logit),
                 wiggle_knots: array![-1.0, -0.3, 0.4, 1.1],
                 wiggle_degree: 3,
                 policy: ResourcePolicy::default_library(),

@@ -1,4 +1,4 @@
-use gam::families::family_meta::inverse_link_to_binomial_spec;
+use gam::types::inverse_link_to_binomial_spec;
 use gam::families::latent_survival::fixed_latent_hazard_frailty;
 use gam::families::lognormal_kernel::{FrailtySpec, HazardLoading};
 use gam::families::marginal_slope_shared::{
@@ -9,15 +9,15 @@ use gam::families::scale_design::{
 };
 use gam::families::strategy::{FamilyStrategy, strategy_for_spec};
 use gam::families::vector_response::{GaussianVectorLikelihood, VectorNoise, VectorResponseTarget};
-use gam::types::{InverseLink, LatentCLogLogState, LikelihoodSpec, LinkFunction, ResponseFamily};
+use gam::types::{InverseLink, LatentCLogLogState, LikelihoodSpec, LinkFunction, StandardLink, ResponseFamily};
 use ndarray::{Array1, Array2, array};
 
 #[test]
 fn bug_family_meta_binomial_inverse_links_round_trip_identity() {
     let links = vec![
-        InverseLink::Standard(LinkFunction::Logit),
-        InverseLink::Standard(LinkFunction::Probit),
-        InverseLink::Standard(LinkFunction::CLogLog),
+        InverseLink::Standard(StandardLink::Logit),
+        InverseLink::Standard(StandardLink::Probit),
+        InverseLink::Standard(StandardLink::CLogLog),
         InverseLink::LatentCLogLog(LatentCLogLogState { latent_sd: 0.4 }),
     ];
     for link in links {
@@ -40,35 +40,35 @@ fn bug_strategy_for_spec_preserves_family_marker_for_all_response_variants() {
     let specs = vec![
         LikelihoodSpec::new(
             ResponseFamily::Gaussian,
-            InverseLink::Standard(LinkFunction::Identity),
+            InverseLink::Standard(StandardLink::Identity),
         ),
         LikelihoodSpec::new(
             ResponseFamily::Binomial,
-            InverseLink::Standard(LinkFunction::Logit),
+            InverseLink::Standard(StandardLink::Logit),
         ),
         LikelihoodSpec::new(
             ResponseFamily::Poisson,
-            InverseLink::Standard(LinkFunction::Log),
+            InverseLink::Standard(StandardLink::Log),
         ),
         LikelihoodSpec::new(
             ResponseFamily::Tweedie { p: 1.5 },
-            InverseLink::Standard(LinkFunction::Log),
+            InverseLink::Standard(StandardLink::Log),
         ),
         LikelihoodSpec::new(
             ResponseFamily::NegativeBinomial { theta: 2.0 },
-            InverseLink::Standard(LinkFunction::Log),
+            InverseLink::Standard(StandardLink::Log),
         ),
         LikelihoodSpec::new(
             ResponseFamily::Beta { phi: 3.0 },
-            InverseLink::Standard(LinkFunction::Logit),
+            InverseLink::Standard(StandardLink::Logit),
         ),
         LikelihoodSpec::new(
             ResponseFamily::Gamma,
-            InverseLink::Standard(LinkFunction::Log),
+            InverseLink::Standard(StandardLink::Log),
         ),
         LikelihoodSpec::new(
             ResponseFamily::RoystonParmar,
-            InverseLink::Standard(LinkFunction::Identity),
+            InverseLink::Standard(StandardLink::Identity),
         ),
     ];
     for spec in specs {

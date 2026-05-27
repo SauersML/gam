@@ -43,7 +43,7 @@ use crate::survival_construction::{
     resolved_survival_time_basis_config_from_build, survival_derivative_guard_for_likelihood,
 };
 use crate::term_builder::resolve_role_col;
-use crate::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily};
+use crate::types::{InverseLink, LikelihoodSpec, StandardLink, ResponseFamily};
 
 /// Reconstruct the `LinkWiggleFormulaSpec` from a saved model's
 /// baseline-time-wiggle runtime, returning `None` when the model has no
@@ -586,13 +586,13 @@ fn sample_standard_link_wiggle(
     };
 
     let nuts_family = match (&likelihood.response, &likelihood.link) {
-        (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Logit)) => {
+        (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::Logit)) => {
             NutsFamily::BinomialLogit
         }
-        (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Probit)) => {
+        (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::Probit)) => {
             NutsFamily::BinomialProbit
         }
-        (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::CLogLog)) => {
+        (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::CLogLog)) => {
             NutsFamily::BinomialCLogLog
         }
         (ResponseFamily::Gaussian, _) => NutsFamily::Gaussian,

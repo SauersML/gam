@@ -12,8 +12,10 @@ use std::sync::atomic::{AtomicU8, Ordering};
 
 pub mod arrow_schur_gpu;
 pub mod pirls_dispatch;
+pub mod pirls_dispatch_wire;
 pub mod pirls_gpu;
 pub mod reml_gpu;
+pub mod reml_outer;
 
 /// Runtime solver device selection.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

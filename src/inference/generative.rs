@@ -102,9 +102,9 @@ fn noise_model_for_likelihood(
         ResponseFamily::Gaussian => {
             let sigma = require_noise_parameter(likelihood, "Gaussian sigma", gaussian_scale)?;
             if sigma < 0.0 {
-                return Err(EstimationError::InvalidInput(format!(
+                crate::bail_invalid_estim!(
                     "gaussian generative sampling requires Gaussian sigma >= 0; got {sigma}"
-                )));
+                );
             }
             Ok(NoiseModel::Gaussian {
                 sigma: Array1::from_elem(nobs, sigma),
@@ -115,9 +115,9 @@ fn noise_model_for_likelihood(
         ResponseFamily::Tweedie { p } => {
             let p = *p;
             if !(p.is_finite() && p > 1.0 && p < 2.0) {
-                return Err(EstimationError::InvalidInput(format!(
+                crate::bail_invalid_estim!(
                     "Tweedie variance power must be finite and strictly between 1 and 2; got {p}"
-                )));
+                );
             }
             Ok(NoiseModel::Tweedie {
                 p,
@@ -131,18 +131,18 @@ fn noise_model_for_likelihood(
         ResponseFamily::NegativeBinomial { theta } => {
             let theta = *theta;
             if !(theta.is_finite() && theta > 0.0) {
-                return Err(EstimationError::InvalidInput(format!(
+                crate::bail_invalid_estim!(
                     "negative-binomial theta must be finite and > 0; got {theta}"
-                )));
+                );
             }
             Ok(NoiseModel::NegativeBinomial { theta })
         }
         ResponseFamily::Beta { phi } => {
             let phi = *phi;
             if !(phi.is_finite() && phi > 0.0) {
-                return Err(EstimationError::InvalidInput(format!(
+                crate::bail_invalid_estim!(
                     "beta-regression phi must be finite and > 0; got {phi}"
-                )));
+                );
             }
             Ok(NoiseModel::Beta { phi })
         }
@@ -161,18 +161,16 @@ pub fn sampleobservations<R: rand::Rng + ?Sized>(
     rng: &mut R,
 ) -> Result<Array1<f64>, EstimationError> {
     if spec.mean.iter().any(|m| !m.is_finite()) {
-        return Err(EstimationError::InvalidInput(
-            "generative mean contains non-finite values".to_string(),
-        ));
+        crate::bail_invalid_estim!("generative mean contains non-finite values");
     }
     match &spec.noise {
         NoiseModel::Gaussian { sigma } => {
             if sigma.len() != spec.mean.len() {
-                return Err(EstimationError::InvalidInput(format!(
+                crate::bail_invalid_estim!(
                     "Gaussian sigma length {} does not match mean length {}",
                     sigma.len(),
                     spec.mean.len()
-                )));
+                );
             }
             let mut y = spec.mean.clone();
             for i in 0..y.len() {
@@ -201,14 +199,14 @@ pub fn sampleobservations<R: rand::Rng + ?Sized>(
         }
         NoiseModel::Tweedie { p, phi } => {
             if !(p.is_finite() && *p >= 1.0 && *p <= 2.0) {
-                return Err(EstimationError::InvalidInput(format!(
+                crate::bail_invalid_estim!(
                     "invalid Tweedie power p: {p}"
-                )));
+                );
             }
             if !(phi.is_finite() && *phi > 0.0) {
-                return Err(EstimationError::InvalidInput(format!(
+                crate::bail_invalid_estim!(
                     "invalid Tweedie dispersion phi: {phi}"
-                )));
+                );
             }
             let mut y = Array1::<f64>::zeros(spec.mean.len());
             if (*p - 1.0).abs() <= 1.0e-12 {
@@ -264,9 +262,9 @@ pub fn sampleobservations<R: rand::Rng + ?Sized>(
         }
         NoiseModel::NegativeBinomial { theta } => {
             if !(theta.is_finite() && *theta > 0.0) {
-                return Err(EstimationError::InvalidInput(format!(
+                crate::bail_invalid_estim!(
                     "invalid negative-binomial theta: {theta}"
-                )));
+                );
             }
             let mut y = Array1::<f64>::zeros(spec.mean.len());
             for i in 0..y.len() {
@@ -290,9 +288,9 @@ pub fn sampleobservations<R: rand::Rng + ?Sized>(
         }
         NoiseModel::Beta { phi } => {
             if !(phi.is_finite() && *phi > 0.0) {
-                return Err(EstimationError::InvalidInput(format!(
+                crate::bail_invalid_estim!(
                     "invalid beta-regression phi: {phi}"
-                )));
+                );
             }
             let mut y = Array1::<f64>::zeros(spec.mean.len());
             for i in 0..y.len() {
@@ -310,9 +308,9 @@ pub fn sampleobservations<R: rand::Rng + ?Sized>(
         }
         NoiseModel::Gamma { shape } => {
             if !shape.is_finite() || *shape <= 0.0 {
-                return Err(EstimationError::InvalidInput(format!(
+                crate::bail_invalid_estim!(
                     "invalid Gamma shape: {shape}"
-                )));
+                );
             }
             let mut y = Array1::<f64>::zeros(spec.mean.len());
             for i in 0..y.len() {

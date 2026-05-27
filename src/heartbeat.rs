@@ -69,9 +69,6 @@ impl HeartbeatState {
 
     fn emit(&self) {
         let threads = self.threads.lock().expect("heartbeat registry poisoned");
-        if threads.is_empty() {
-            return;
-        }
         let resource = ProcessResourceSnapshot::read();
         log::info!(
             "[heartbeat] elapsed={} {} active_threads={}",
@@ -113,6 +110,15 @@ impl Drop for HeartbeatGuard {
             state.update_thread(&stack);
         });
     }
+}
+
+/// Eagerly start the background heartbeat thread (idempotent). Once
+/// started, the thread emits an `[heartbeat] elapsed=… rss=…` line every
+/// `HEARTBEAT_INTERVAL` until process exit — even when no `scope()`
+/// frames are active — so long silent stretches in the solver still
+/// surface a process-alive signal with current memory footprint.
+pub fn ensure_started() {
+    heartbeat_state();
 }
 
 pub(crate) fn scope(label: impl Into<String>) -> HeartbeatGuard {

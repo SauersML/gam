@@ -3,7 +3,7 @@ use gam::construction::canonicalize_penalty_spec;
 use gam::estimate::PenaltySpec;
 use gam::estimate::{FitOptions, fit_gam};
 use gam::smooth::BlockwisePenalty;
-use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily};
+use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, StandardLink, ResponseFamily};
 use ndarray::{Array1, Array2};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -49,7 +49,7 @@ fn thin_plate_fit_gam_gaussian_fast_integration() {
         &s_list,
         LikelihoodSpec::new(
             ResponseFamily::Gaussian,
-            InverseLink::Standard(LinkFunction::Identity),
+            InverseLink::Standard(StandardLink::Identity),
         ),
         &FitOptions {
             latent_cloglog: None,
@@ -136,7 +136,7 @@ fn thin_plate_fit_gam_gaussian_simulated_train_test() {
         &s_list,
         LikelihoodSpec::new(
             ResponseFamily::Gaussian,
-            InverseLink::Standard(LinkFunction::Identity),
+            InverseLink::Standard(StandardLink::Identity),
         ),
         &FitOptions {
             latent_cloglog: None,
@@ -301,7 +301,7 @@ fn thin_plate_fit_gam_gaussian_3d_simulated_train_test() {
         &s_list,
         LikelihoodSpec::new(
             ResponseFamily::Gaussian,
-            InverseLink::Standard(LinkFunction::Identity),
+            InverseLink::Standard(StandardLink::Identity),
         ),
         &FitOptions {
             latent_cloglog: None,

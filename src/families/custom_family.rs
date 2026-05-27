@@ -3068,16 +3068,14 @@ fn constrained_warm_start_from_cached_beta(
 ) -> Result<ConstrainedWarmStart, EstimationError> {
     let expected = specs.iter().map(|spec| spec.design.ncols()).sum::<usize>();
     if beta.len() != expected {
-        return Err(EstimationError::InvalidInput(format!(
+        crate::bail_invalid_estim!(
             "cached inner beta has length {}, but custom-family blocks require length {}",
             beta.len(),
             expected
-        )));
+        );
     }
     if beta.iter().any(|value| !value.is_finite()) {
-        return Err(EstimationError::InvalidInput(
-            "cached inner beta contains non-finite entries".to_string(),
-        ));
+        crate::bail_invalid_estim!("cached inner beta contains non-finite entries");
     }
 
     let mut offset = 0usize;
@@ -6500,16 +6498,14 @@ impl CustomFamilyWarmStart {
     ) -> Result<Self, EstimationError> {
         let expected: usize = block_col_counts.iter().copied().sum();
         if beta.len() != expected {
-            return Err(EstimationError::InvalidInput(format!(
+            crate::bail_invalid_estim!(
                 "cached inner beta has length {}, but spatial-joint blocks require length {}",
                 beta.len(),
                 expected
-            )));
+            );
         }
         if beta.iter().any(|value| !value.is_finite()) {
-            return Err(EstimationError::InvalidInput(
-                "cached inner beta contains non-finite entries".to_string(),
-            ));
+            crate::bail_invalid_estim!("cached inner beta contains non-finite entries");
         }
         let mut offset = 0usize;
         let mut block_beta = Vec::with_capacity(block_col_counts.len());
@@ -18453,35 +18449,23 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
     eval_mode: EvalMode,
 ) -> Result<OuterObjectiveEvalResult, CustomFamilyError> {
     if derivative_blocks.len() != specs.len() {
-        return Err(CustomFamilyError::DimensionMismatch {
-            reason: format!(
-                "joint hyper derivative block count mismatch: got {}, expected {}",
+        crate::bail_dim_custom!("joint hyper derivative block count mismatch: got {}, expected {}",
                 derivative_blocks.len(),
-                specs.len()
-            ),
-        });
+                specs.len());
     }
 
     if penalty_counts.len() != specs.len() {
-        return Err(CustomFamilyError::DimensionMismatch {
-            reason: format!(
-                "joint hyper penalty-count block mismatch: got {}, expected {}",
+        crate::bail_dim_custom!("joint hyper penalty-count block mismatch: got {}, expected {}",
                 penalty_counts.len(),
-                specs.len()
-            ),
-        });
+                specs.len());
     }
     let rho_dim = penalty_counts.iter().sum::<usize>();
     let psi_dim = derivative_blocks.iter().map(Vec::len).sum::<usize>();
     if rho_current.len() != rho_dim {
-        return Err(CustomFamilyError::DimensionMismatch {
-            reason: format!(
-                "joint hyper rho dimension mismatch: got {}, expected {} (psi={})",
+        crate::bail_dim_custom!("joint hyper rho dimension mismatch: got {}, expected {} (psi={})",
                 rho_current.len(),
                 rho_dim,
-                psi_dim
-            ),
-        });
+                psi_dim);
     }
 
     // ── Common setup: inner solve, ridge, refresh, ranges ──
@@ -19106,15 +19090,11 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
             hessian,
         } => {
             if hessian.nrows() != p || hessian.ncols() != p {
-                return Err(CustomFamilyError::DimensionMismatch {
-                    reason: format!(
-                        "block {b} exact-newton Hessian shape mismatch in outer gradient: got {}x{}, expected {}x{}",
+                crate::bail_dim_custom!("block {b} exact-newton Hessian shape mismatch in outer gradient: got {}x{}, expected {}x{}",
                         hessian.nrows(),
                         hessian.ncols(),
                         p,
-                        p
-                    ),
-                });
+                        p);
             }
             hessian.to_dense()
         }
@@ -19537,22 +19517,14 @@ fn evaluate_custom_family_joint_hyper_efs_internal_shared<
     CustomFamilyError,
 > {
     if derivative_blocks.len() != specs.len() {
-        return Err(CustomFamilyError::DimensionMismatch {
-            reason: format!(
-                "joint hyper derivative block count mismatch: got {}, expected {}",
+        crate::bail_dim_custom!("joint hyper derivative block count mismatch: got {}, expected {}",
                 derivative_blocks.len(),
-                specs.len()
-            ),
-        });
+                specs.len());
     }
     if penalty_counts.len() != specs.len() {
-        return Err(CustomFamilyError::DimensionMismatch {
-            reason: format!(
-                "joint hyper penalty-count block mismatch: got {}, expected {}",
+        crate::bail_dim_custom!("joint hyper penalty-count block mismatch: got {}, expected {}",
                 penalty_counts.len(),
-                specs.len()
-            ),
-        });
+                specs.len());
     }
 
     let rho_dim = penalty_counts.iter().sum::<usize>();
@@ -19564,14 +19536,10 @@ fn evaluate_custom_family_joint_hyper_efs_internal_shared<
         });
     }
     if rho_current.len() != rho_dim {
-        return Err(CustomFamilyError::DimensionMismatch {
-            reason: format!(
-                "joint hyper rho dimension mismatch: got {}, expected {} (psi={})",
+        crate::bail_dim_custom!("joint hyper rho dimension mismatch: got {}, expected {} (psi={})",
                 rho_current.len(),
                 rho_dim,
-                psi_dim
-            ),
-        });
+                psi_dim);
     }
 
     let include_logdet_h = include_exact_newton_logdet_h(family, options);
@@ -19893,13 +19861,9 @@ pub fn evaluate_custom_family_joint_hyper_efs<F: CustomFamily + Clone + Send + S
 ) -> Result<CustomFamilyJointHyperEfsResult, CustomFamilyError> {
     let penalty_counts = validate_blockspecs(specs)?;
     if derivative_blocks.len() != specs.len() {
-        return Err(CustomFamilyError::DimensionMismatch {
-            reason: format!(
-                "joint hyper derivative block count mismatch: got {}, expected {}",
+        crate::bail_dim_custom!("joint hyper derivative block count mismatch: got {}, expected {}",
                 derivative_blocks.len(),
-                specs.len()
-            ),
-        });
+                specs.len());
     }
     let (efs_eval, warm_start, inner_converged) = if derivative_blocks.iter().all(Vec::is_empty) {
         outerobjectiveefs(
@@ -19942,13 +19906,9 @@ pub(crate) fn evaluate_custom_family_joint_hyper_efs_shared<
 ) -> Result<CustomFamilyJointHyperEfsResult, CustomFamilyError> {
     let penalty_counts = validate_blockspecs(specs)?;
     if derivative_blocks.len() != specs.len() {
-        return Err(CustomFamilyError::DimensionMismatch {
-            reason: format!(
-                "joint hyper derivative block count mismatch: got {}, expected {}",
+        crate::bail_dim_custom!("joint hyper derivative block count mismatch: got {}, expected {}",
                 derivative_blocks.len(),
-                specs.len()
-            ),
-        });
+                specs.len());
     }
     let (efs_eval, warm_start, inner_converged) = if derivative_blocks.iter().all(Vec::is_empty) {
         outerobjectiveefs(
@@ -21241,15 +21201,43 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     );
     if !canonical.audit.aliased_pairs.is_empty() {
         log::info!("[identifiability audit] {}", canonical.audit.summary);
+        // Aggregate by (block_a, block_b) so the log stays bounded by the
+        // block-pair count rather than the quadratic direction-pair count
+        // — a few wide blocks alone produce 100+ pair-lines and bury the
+        // useful structural signal. INFO carries the cluster shape (count,
+        // overlap range, perfect-collinearity count); DEBUG prints the
+        // worst three sample pairs per cluster for forensic users.
+        let mut by_pair: BTreeMap<(&str, &str), Vec<&_>> = BTreeMap::new();
         for pair in &canonical.audit.aliased_pairs {
+            by_pair
+                .entry((pair.block_a.as_str(), pair.block_b.as_str()))
+                .or_default()
+                .push(pair);
+        }
+        for ((a, b), pairs) in &by_pair {
+            let count = pairs.len();
+            let max = pairs.iter().map(|p| p.overlap).fold(f64::NEG_INFINITY, f64::max);
+            let min = pairs.iter().map(|p| p.overlap).fold(f64::INFINITY, f64::min);
+            let near_one = pairs.iter().filter(|p| p.overlap >= 0.9999).count();
             log::info!(
-                "[identifiability audit] alias: {}[{}] ~ {}[{}] (overlap={:.4})",
-                pair.block_a,
-                pair.direction_a,
-                pair.block_b,
-                pair.direction_b,
-                pair.overlap,
+                "[identifiability audit] alias-cluster {a} ~ {b}: {count} direction-pair{plural} \
+                 (overlap {min:.4}..{max:.4}; {near_one} ≥0.9999)",
+                plural = if count == 1 { "" } else { "s" },
             );
+        }
+        if log::log_enabled!(log::Level::Debug) {
+            for ((a, b), pairs) in &by_pair {
+                let mut sorted = pairs.clone();
+                sorted.sort_by(|p, q| q.overlap.partial_cmp(&p.overlap).unwrap_or(std::cmp::Ordering::Equal));
+                for pair in sorted.iter().take(3) {
+                    log::debug!(
+                        "[identifiability audit]   sample {a}[{ai}] ~ {b}[{bi}] overlap={ov:.4}",
+                        ai = pair.direction_a,
+                        bi = pair.direction_b,
+                        ov = pair.overlap,
+                    );
+                }
+            }
         }
     }
     for drop in &canonical.audit.dropped_columns {
@@ -23108,7 +23096,7 @@ mod tests {
         let family = BinomialLocationScaleWiggleFamily {
             y: base.y,
             weights: base.weights,
-            link_kind: crate::types::InverseLink::Standard(crate::types::LinkFunction::Probit),
+            link_kind: crate::types::InverseLink::Standard(crate::types::StandardLink::Probit),
             threshold_design: Some(base.threshold_design),
             log_sigma_design: Some(base.log_sigma_design),
             wiggle_knots: knots,
@@ -26105,7 +26093,7 @@ mod tests {
         let family = BinomialLocationScaleFamily {
             y,
             weights,
-            link_kind: crate::types::InverseLink::Standard(crate::types::LinkFunction::Probit),
+            link_kind: crate::types::InverseLink::Standard(crate::types::StandardLink::Probit),
             threshold_design: Some(threshold_design),
             log_sigma_design: Some(log_sigma_design),
             policy: crate::resource::ResourcePolicy::default_library(),
@@ -26211,7 +26199,7 @@ mod tests {
         let family = BinomialLocationScaleFamily {
             y,
             weights,
-            link_kind: crate::types::InverseLink::Standard(crate::types::LinkFunction::Probit),
+            link_kind: crate::types::InverseLink::Standard(crate::types::StandardLink::Probit),
             threshold_design: Some(threshold_design),
             log_sigma_design: Some(log_sigma_design),
             policy: crate::resource::ResourcePolicy::default_library(),
@@ -26325,7 +26313,7 @@ mod tests {
         let family = BinomialLocationScaleFamily {
             y,
             weights,
-            link_kind: crate::types::InverseLink::Standard(crate::types::LinkFunction::Probit),
+            link_kind: crate::types::InverseLink::Standard(crate::types::StandardLink::Probit),
             threshold_design: Some(threshold_design),
             log_sigma_design: Some(log_sigma_design),
             policy: crate::resource::ResourcePolicy::default_library(),
@@ -26507,7 +26495,7 @@ mod tests {
         let family = BinomialLocationScaleFamily {
             y,
             weights,
-            link_kind: crate::types::InverseLink::Standard(crate::types::LinkFunction::Probit),
+            link_kind: crate::types::InverseLink::Standard(crate::types::StandardLink::Probit),
             threshold_design: Some(threshold_design),
             log_sigma_design: Some(log_sigma_design),
             policy: crate::resource::ResourcePolicy::default_library(),

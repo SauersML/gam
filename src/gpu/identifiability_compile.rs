@@ -52,6 +52,15 @@ pub const fn packed_index(c: usize, d: usize) -> usize {
 
 /// Try to build the primary-state Gram bundle on the GPU. Returns `None`
 /// when no CUDA device is available or when any device call fails.
+///
+/// This is a one-shot convenience wrapper: it builds a
+/// [`GpuIdentifiabilityCompileWorkspace`], runs a single
+/// `compute_grams`, and drops the workspace. Callers that compute Grams
+/// for the same `channel_blocks` more than once (e.g. structural-H
+/// compile followed by a recompile-after-PIRLS-accept with a
+/// data-adaptive H) should construct one workspace explicitly and reuse
+/// it across `compute_grams` calls to avoid re-uploading the
+/// channel-block designs.
 pub fn try_primary_state_gram_cuda(
     channel_blocks: &[Vec<Option<Array2<f64>>>],
     h_packed: &Array2<f64>,
@@ -73,7 +82,101 @@ pub fn try_primary_state_gram_cuda(
     }
     #[cfg(target_os = "linux")]
     {
-        cuda_impl::try_primary_state_gram_cuda_impl(channel_blocks, h_packed, raw_block_ranges)
+        let workspace = GpuIdentifiabilityCompileWorkspace::try_new(channel_blocks, raw_block_ranges)?;
+        workspace.compute_grams(h_packed)
+    }
+}
+
+/// Try the fused NVRTC primary-state Gram kernel. Returns `None` on any
+/// failure (no runtime, NVRTC compile failure, launch error, malformed
+/// inputs) so the caller can fall back. The default
+/// [`try_primary_state_gram_cuda`] entry point already attempts this path
+/// first and transparently falls back to the cuBLAS DDGMM+DGEMM kernel;
+/// this entry point is exported so parity tests can pin behavior to the
+/// fused path alone.
+pub fn try_primary_state_gram_fused_cuda(
+    channel_blocks: &[Vec<Option<Array2<f64>>>],
+    h_packed: &Array2<f64>,
+    raw_block_ranges: &[Range<usize>],
+) -> Option<GramBundle> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        if channel_blocks.is_empty()
+            || h_packed.is_empty()
+            || raw_block_ranges.is_empty()
+            || channel_blocks.len() != raw_block_ranges.len()
+        {
+            return None;
+        }
+        None
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let workspace =
+            GpuIdentifiabilityCompileWorkspace::try_new(channel_blocks, raw_block_ranges)?;
+        workspace.inner.compute_grams_fused(h_packed)
+    }
+}
+
+/// Device-resident workspace that caches uploaded channel-block designs
+/// across multiple Gram builds for the same `(channel_blocks,
+/// raw_block_ranges)` topology. Only the per-row packed Hessian `H` is
+/// re-uploaded on each [`Self::compute_grams`] call.
+///
+/// Intended use: construct once at SMGS identifiability-compile time,
+/// then call [`Self::compute_grams`] for the structural-H pass and again
+/// for any recompile-after-PIRLS-accept pass with the data-adaptive H.
+///
+/// On non-Linux builds this is a stub that always reports unavailable
+/// via [`Self::try_new`] returning `None`.
+pub struct GpuIdentifiabilityCompileWorkspace {
+    #[cfg(target_os = "linux")]
+    pub(crate) inner: cuda_impl::WorkspaceInner,
+    #[cfg(not(target_os = "linux"))]
+    _never: std::marker::PhantomData<()>,
+}
+
+impl GpuIdentifiabilityCompileWorkspace {
+    /// Build a device-resident workspace by uploading each
+    /// `(block, channel)` raw design exactly once. Returns `None` when
+    /// no CUDA runtime is available, when inputs are malformed, or when
+    /// any device allocation/copy fails.
+    pub fn try_new(
+        channel_blocks: &[Vec<Option<Array2<f64>>>],
+        raw_block_ranges: &[Range<usize>],
+    ) -> Option<Self> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            if channel_blocks.is_empty()
+                || raw_block_ranges.is_empty()
+                || channel_blocks.len() != raw_block_ranges.len()
+            {
+                return None;
+            }
+            None
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let inner = cuda_impl::WorkspaceInner::try_new(channel_blocks, raw_block_ranges)?;
+            Some(Self { inner })
+        }
+    }
+
+    /// Compute the `(gram_h, gram_struct)` bundle on device. Uploads
+    /// only the packed Hessian columns it actually needs; reuses the
+    /// cached channel-block designs.
+    pub fn compute_grams(&self, h_packed: &Array2<f64>) -> Option<GramBundle> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            if h_packed.is_empty() {
+                return None;
+            }
+            None
+        }
+        #[cfg(target_os = "linux")]
+        {
+            self.inner.compute_grams(h_packed)
+        }
     }
 }
 
@@ -86,171 +189,405 @@ mod cuda_impl {
     use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
     use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
     use ndarray::Array2;
+    use std::cell::RefCell;
     use std::ops::Range;
     use std::sync::Arc;
 
-    pub(super) fn try_primary_state_gram_cuda_impl(
-        channel_blocks: &[Vec<Option<Array2<f64>>>],
-        h_packed: &Array2<f64>,
-        raw_block_ranges: &[Range<usize>],
-    ) -> Option<GramBundle> {
-        let runtime = GpuRuntime::global()?;
-        let num_blocks = channel_blocks.len();
-        if num_blocks == 0 || raw_block_ranges.len() != num_blocks {
-            return None;
-        }
-        let (n_rows, packed_cols) = h_packed.dim();
-        if packed_cols != PACKED_LEN {
-            return None;
-        }
+    /// Process-wide PTX cache for the fused primary-state Gram kernel.
+    /// NVRTC-compiled on the first `compute_grams_fused` call that
+    /// reaches a CUDA context; reused on every subsequent call.
+    pub(super) static FUSED_GRAM_PTX_CACHE: crate::gpu::common::PtxModuleCache =
+        crate::gpu::common::PtxModuleCache::new();
 
-        for (b, channels) in channel_blocks.iter().enumerate() {
-            if channels.len() != CHANNELS {
+    /// Device-resident cache of channel-block designs plus a reusable
+    /// row-scale scratch buffer. Built once per identifiability compile;
+    /// each `compute_grams` call only re-uploads the per-row packed
+    /// Hessian columns it actually needs.
+    pub(super) struct WorkspaceInner {
+        stream: Arc<CudaStream>,
+        blas: CudaBlas,
+        /// `uploads[block][channel]` — column-major device copy of each
+        /// raw design slice. `None` slots mean "channel inactive on this
+        /// block", consistent with the host-side `Option<Array2>` layout.
+        uploads: Vec<Vec<Option<CudaSlice<f64>>>>,
+        /// `needed[packed_index(c,d)]` — true iff some `(block_a,
+        /// block_b)` pair will request that channel-pair Hessian column.
+        needed: [bool; PACKED_LEN],
+        /// Reusable device scratch for the DGMM row-scaled right
+        /// operand. Sized at the largest `(block, channel)` right matrix
+        /// across the topology, so it fits every `(a,b,c,d)` step. Wrapped
+        /// in `RefCell` so `compute_grams` can mutate it through `&self`.
+        scaled_dev: RefCell<CudaSlice<f64>>,
+        raw_block_ranges: Vec<Range<usize>>,
+        n_rows: usize,
+        total_cols: usize,
+    }
+
+    impl WorkspaceInner {
+        pub(super) fn try_new(
+            channel_blocks: &[Vec<Option<Array2<f64>>>],
+            raw_block_ranges: &[Range<usize>],
+        ) -> Option<Self> {
+            let runtime = GpuRuntime::global()?;
+            let num_blocks = channel_blocks.len();
+            if num_blocks == 0 || raw_block_ranges.len() != num_blocks {
                 return None;
             }
-            let want_cols = raw_block_ranges[b].len();
-            for ch in channels.iter().flatten() {
-                if ch.nrows() != n_rows || ch.ncols() != want_cols {
+
+            // Establish a consistent n_rows across all uploaded blocks.
+            let mut n_rows: Option<usize> = None;
+            for (block_idx, channels) in channel_blocks.iter().enumerate() {
+                if channels.len() != CHANNELS {
                     return None;
                 }
-            }
-        }
-
-        let total_cols = raw_block_ranges
-            .iter()
-            .map(|r| r.len())
-            .fold(0usize, |a, l| a.saturating_add(l));
-        if total_cols == 0 {
-            return None;
-        }
-
-        let stream = cuda_context_for(runtime.device.ordinal)?
-            .new_stream()
-            .ok()?;
-        let blas = CudaBlas::new(stream.clone()).ok()?;
-
-        // Upload each (block, channel) raw design once, column-major.
-        let mut uploads: Vec<Vec<Option<CudaSlice<f64>>>> = Vec::with_capacity(num_blocks);
-        for channels in channel_blocks.iter() {
-            let mut row: Vec<Option<CudaSlice<f64>>> = Vec::with_capacity(CHANNELS);
-            for slot in channels.iter() {
-                let dev = match slot.as_ref() {
-                    Some(mat) => {
-                        let col = to_col_major(mat);
-                        Some(stream.clone_htod(&*col).ok()?)
+                let want_cols = raw_block_ranges[block_idx].len();
+                for ch in channels.iter().flatten() {
+                    if ch.ncols() != want_cols {
+                        return None;
                     }
-                    None => None,
-                };
-                row.push(dev);
-            }
-            uploads.push(row);
-        }
-
-        // Upload each channel-pair weight column (10 in total). We only
-        // upload the columns we will actually consume.
-        let mut h_columns: [Option<CudaSlice<f64>>; PACKED_LEN] =
-            [None, None, None, None, None, None, None, None, None, None];
-        let mut needed: [bool; PACKED_LEN] = [false; PACKED_LEN];
-        for a in 0..num_blocks {
-            for b in 0..num_blocks {
-                for c in 0..CHANNELS {
-                    if uploads[a][c].is_none() {
-                        continue;
+                    match n_rows {
+                        Some(expected) if expected != ch.nrows() => return None,
+                        Some(_) => {}
+                        None => n_rows = Some(ch.nrows()),
                     }
-                    for d in 0..CHANNELS {
-                        if uploads[b][d].is_none() {
+                }
+            }
+            let n_rows = n_rows?;
+
+            let total_cols = raw_block_ranges
+                .iter()
+                .map(|r| r.len())
+                .fold(0usize, |a, l| a.saturating_add(l));
+            if total_cols == 0 {
+                return None;
+            }
+
+            let stream = cuda_context_for(runtime.device.ordinal)?
+                .new_stream()
+                .ok()?;
+            let blas = CudaBlas::new(stream.clone()).ok()?;
+
+            // Upload each (block, channel) raw design once, column-major.
+            let mut uploads: Vec<Vec<Option<CudaSlice<f64>>>> = Vec::with_capacity(num_blocks);
+            for channels in channel_blocks.iter() {
+                let mut row: Vec<Option<CudaSlice<f64>>> = Vec::with_capacity(CHANNELS);
+                for slot in channels.iter() {
+                    let dev = match slot.as_ref() {
+                        Some(mat) => {
+                            let col = to_col_major(mat);
+                            Some(stream.clone_htod(&*col).ok()?)
+                        }
+                        None => None,
+                    };
+                    row.push(dev);
+                }
+                uploads.push(row);
+            }
+
+            // Pre-compute which packed-H columns the topology requires.
+            let mut needed: [bool; PACKED_LEN] = [false; PACKED_LEN];
+            for a in 0..num_blocks {
+                for b in 0..num_blocks {
+                    for c in 0..CHANNELS {
+                        if uploads[a][c].is_none() {
                             continue;
                         }
-                        needed[packed_index(c, d)] = true;
+                        for d in 0..CHANNELS {
+                            if uploads[b][d].is_none() {
+                                continue;
+                            }
+                            needed[packed_index(c, d)] = true;
+                        }
                     }
                 }
             }
-        }
-        for idx in 0..PACKED_LEN {
-            if !needed[idx] {
-                continue;
-            }
-            let col = h_packed.column(idx);
-            let host: Vec<f64> = col.iter().copied().collect();
-            h_columns[idx] = Some(stream.clone_htod(&host).ok()?);
-        }
 
-        let mut gram_h = Array2::<f64>::zeros((total_cols, total_cols));
-        let mut gram_struct = Array2::<f64>::zeros((total_cols, total_cols));
-
-        // Scratch buffer reused across (a,b,c,d) pairs to hold the
-        // row-scaled right operand. Sized at the largest right matrix.
-        let max_right_len = channel_blocks
-            .iter()
-            .zip(raw_block_ranges.iter())
-            .flat_map(|(channels, range)| {
-                channels.iter().map(move |slot| {
-                    if slot.is_some() {
-                        n_rows.checked_mul(range.len()).unwrap_or(0)
-                    } else {
-                        0
-                    }
+            // Scratch sized at the largest right matrix across the topology.
+            let max_right_len = channel_blocks
+                .iter()
+                .zip(raw_block_ranges.iter())
+                .flat_map(|(channels, range)| {
+                    channels.iter().map(move |slot| {
+                        if slot.is_some() {
+                            n_rows.checked_mul(range.len()).unwrap_or(0)
+                        } else {
+                            0
+                        }
+                    })
                 })
-            })
-            .max()
-            .unwrap_or(0);
-        if max_right_len == 0 {
-            return None;
-        }
-        let mut scaled_dev = stream.alloc_zeros::<f64>(max_right_len).ok()?;
+                .max()
+                .unwrap_or(0);
+            if max_right_len == 0 {
+                return None;
+            }
+            let scaled_dev = stream.alloc_zeros::<f64>(max_right_len).ok()?;
 
-        for block_a in 0..num_blocks {
-            let range_a = &raw_block_ranges[block_a];
-            for block_b in 0..num_blocks {
-                let range_b = &raw_block_ranges[block_b];
-                let mut contrib_h = Array2::<f64>::zeros((range_a.len(), range_b.len()));
-                let mut contrib_s = Array2::<f64>::zeros((range_a.len(), range_b.len()));
+            Some(Self {
+                stream,
+                blas,
+                uploads,
+                needed,
+                scaled_dev: RefCell::new(scaled_dev),
+                raw_block_ranges: raw_block_ranges.to_vec(),
+                n_rows,
+                total_cols,
+            })
+        }
+
+        pub(super) fn compute_grams(&self, h_packed: &Array2<f64>) -> Option<GramBundle> {
+            // Try the fused NVRTC kernel first — it streams each design
+            // matrix once instead of 16 times. Any compile / launch /
+            // shape failure routes us to the cuBLAS DDGMM+DGEMM path
+            // below; the two paths are bit-equivalent to within
+            // floating-point reordering, so the caller cannot observe
+            // which one served the request.
+            if let Some(bundle) = self.compute_grams_fused(h_packed) {
+                return Some(bundle);
+            }
+            self.compute_grams_cublas(h_packed)
+        }
+
+        /// Fused-kernel path: one NVRTC launch per `(block_a, block_b)`
+        /// pair accumulates **all** channel-pair contributions in a
+        /// single pass over the rows. Returns `None` on shape mismatch,
+        /// NVRTC compile failure, or any cudarc driver error so the
+        /// caller can fall back to the cuBLAS path. Both `gram_h` and
+        /// `gram_struct` are emitted from the same row-stream so the
+        /// second Gram costs no extra memory traffic relative to the
+        /// first.
+        pub(super) fn compute_grams_fused(&self, h_packed: &Array2<f64>) -> Option<GramBundle> {
+            let (n_rows, packed_cols) = h_packed.dim();
+            if packed_cols != PACKED_LEN || n_rows != self.n_rows {
+                return None;
+            }
+            let num_blocks = self.uploads.len();
+            let n_rows_u32 = u32::try_from(n_rows).ok()?;
+
+            // Upload h_packed once, column-major (n_rows × 10).
+            let h_packed_cm = to_col_major(h_packed);
+            let h_packed_dev = self.stream.clone_htod(&*h_packed_cm).ok()?;
+
+            // Resolve a CUDA context for module compilation. The default
+            // stream sits on the same context per cudarc's caching, so
+            // launches from this stream see the loaded module.
+            let runtime = GpuRuntime::global()?;
+            let ctx = cuda_context_for(runtime.device.ordinal)?;
+            let module = FUSED_GRAM_PTX_CACHE
+                .get_or_compile(
+                    &ctx,
+                    "identifiability_compile_fused",
+                    crate::gpu::identifiability_compile_kernel::KERNEL_SRC,
+                )
+                .ok()?;
+            let func = module
+                .load_function(crate::gpu::identifiability_compile_kernel::KERNEL_NAME)
+                .ok()?;
+
+            let total_cols = self.total_cols;
+            let mut gram_h = Array2::<f64>::zeros((total_cols, total_cols));
+            let mut gram_struct = Array2::<f64>::zeros((total_cols, total_cols));
+
+            // Lazily-allocated null device pointer used to stand in for
+            // missing channels. We reuse the existing `scaled_dev`
+            // scratch's allocation as a non-null placeholder; the kernel
+            // ignores the bytes under the corresponding present-mask bit.
+            let scaled_borrow = self.scaled_dev.borrow();
+            let placeholder: &CudaSlice<f64> = &*scaled_borrow;
+
+            for block_a in 0..num_blocks {
+                let range_a = &self.raw_block_ranges[block_a];
+                let a_cols = range_a.len();
+                if a_cols == 0 {
+                    continue;
+                }
+                let a_cols_u32 = u32::try_from(a_cols).ok()?;
+                let mut a_present_mask: u32 = 0;
                 for c in 0..CHANNELS {
-                    let Some(x_a) = uploads[block_a][c].as_ref() else {
+                    if self.uploads[block_a][c].is_some() {
+                        a_present_mask |= 1u32 << c;
+                    }
+                }
+                if a_present_mask == 0 {
+                    continue;
+                }
+
+                for block_b in 0..num_blocks {
+                    let range_b = &self.raw_block_ranges[block_b];
+                    let b_cols = range_b.len();
+                    if b_cols == 0 {
                         continue;
-                    };
+                    }
+                    let b_cols_u32 = u32::try_from(b_cols).ok()?;
+                    let mut b_present_mask: u32 = 0;
                     for d in 0..CHANNELS {
-                        let Some(x_b) = uploads[block_b][d].as_ref() else {
+                        if self.uploads[block_b][d].is_some() {
+                            b_present_mask |= 1u32 << d;
+                        }
+                    }
+                    if b_present_mask == 0 {
+                        continue;
+                    }
+
+                    // Allocate per-tile output buffers (column-major).
+                    let tile_len = a_cols.checked_mul(b_cols)?;
+                    let mut gram_h_tile_dev = self.stream.alloc_zeros::<f64>(tile_len).ok()?;
+                    let mut gram_s_tile_dev = self.stream.alloc_zeros::<f64>(tile_len).ok()?;
+
+                    let xa: [&CudaSlice<f64>; CHANNELS] = [
+                        self.uploads[block_a][0].as_ref().unwrap_or(placeholder),
+                        self.uploads[block_a][1].as_ref().unwrap_or(placeholder),
+                        self.uploads[block_a][2].as_ref().unwrap_or(placeholder),
+                        self.uploads[block_a][3].as_ref().unwrap_or(placeholder),
+                    ];
+                    let xb: [&CudaSlice<f64>; CHANNELS] = [
+                        self.uploads[block_b][0].as_ref().unwrap_or(placeholder),
+                        self.uploads[block_b][1].as_ref().unwrap_or(placeholder),
+                        self.uploads[block_b][2].as_ref().unwrap_or(placeholder),
+                        self.uploads[block_b][3].as_ref().unwrap_or(placeholder),
+                    ];
+
+                    let tile_a = crate::gpu::identifiability_compile_kernel::TILE_A;
+                    let tile_b = crate::gpu::identifiability_compile_kernel::TILE_B;
+                    let grid_x = a_cols_u32.div_ceil(tile_a).max(1);
+                    let grid_y = b_cols_u32.div_ceil(tile_b).max(1);
+                    let cfg = cudarc::driver::LaunchConfig {
+                        grid_dim: (grid_x, grid_y, 1),
+                        block_dim: (tile_a, tile_b, 1),
+                        shared_mem_bytes: 0,
+                    };
+
+                    use cudarc::driver::PushKernelArg;
+                    let mut builder = self.stream.launch_builder(&func);
+                    builder
+                        .arg(xa[0])
+                        .arg(xa[1])
+                        .arg(xa[2])
+                        .arg(xa[3])
+                        .arg(xb[0])
+                        .arg(xb[1])
+                        .arg(xb[2])
+                        .arg(xb[3])
+                        .arg(&h_packed_dev)
+                        .arg(&mut gram_h_tile_dev)
+                        .arg(&mut gram_s_tile_dev)
+                        .arg(&n_rows_u32)
+                        .arg(&a_cols_u32)
+                        .arg(&b_cols_u32)
+                        .arg(&a_present_mask)
+                        .arg(&b_present_mask);
+                    // SAFETY: every argument is a typed device pointer or
+                    // scalar whose layout matches the kernel signature
+                    // declared in identifiability_compile_kernel::KERNEL_SRC.
+                    // The grid covers (a_cols, b_cols) and out-of-tile
+                    // threads early-return via the in_range guard.
+                    unsafe { builder.launch(cfg) }.ok()?;
+
+                    let host_h = self.stream.clone_dtoh(&gram_h_tile_dev).ok()?;
+                    let host_s = self.stream.clone_dtoh(&gram_s_tile_dev).ok()?;
+                    let contrib_h = from_col_major(&host_h, a_cols, b_cols)?;
+                    let contrib_s = from_col_major(&host_s, a_cols, b_cols)?;
+                    assign_block(&mut gram_h, range_a.start, range_b.start, &contrib_h);
+                    assign_block(&mut gram_struct, range_a.start, range_b.start, &contrib_s);
+                }
+            }
+            self.stream.synchronize().ok()?;
+
+            symmetrise(&mut gram_h);
+            symmetrise(&mut gram_struct);
+            Some(GramBundle {
+                gram_h,
+                gram_struct,
+                raw_block_ranges: self.raw_block_ranges.clone(),
+            })
+        }
+
+        /// Force the cuBLAS DDGMM+DGEMM path, bypassing the fused
+        /// kernel. Used by parity tests so the fused and cuBLAS bundles
+        /// can be cross-checked element-wise.
+        pub(super) fn compute_grams_cublas_only(
+            &self,
+            h_packed: &Array2<f64>,
+        ) -> Option<GramBundle> {
+            self.compute_grams_cublas(h_packed)
+        }
+
+        fn compute_grams_cublas(&self, h_packed: &Array2<f64>) -> Option<GramBundle> {
+            let (n_rows, packed_cols) = h_packed.dim();
+            if packed_cols != PACKED_LEN || n_rows != self.n_rows {
+                return None;
+            }
+
+            // Upload only the columns actually used by the topology.
+            let mut h_columns: [Option<CudaSlice<f64>>; PACKED_LEN] =
+                [None, None, None, None, None, None, None, None, None, None];
+            for idx in 0..PACKED_LEN {
+                if !self.needed[idx] {
+                    continue;
+                }
+                let col = h_packed.column(idx);
+                let host: Vec<f64> = col.iter().copied().collect();
+                h_columns[idx] = Some(self.stream.clone_htod(&host).ok()?);
+            }
+
+            let total_cols = self.total_cols;
+            let mut gram_h = Array2::<f64>::zeros((total_cols, total_cols));
+            let mut gram_struct = Array2::<f64>::zeros((total_cols, total_cols));
+
+            let mut scaled = self.scaled_dev.borrow_mut();
+            let num_blocks = self.uploads.len();
+            for block_a in 0..num_blocks {
+                let range_a = &self.raw_block_ranges[block_a];
+                for block_b in 0..num_blocks {
+                    let range_b = &self.raw_block_ranges[block_b];
+                    let mut contrib_h = Array2::<f64>::zeros((range_a.len(), range_b.len()));
+                    let mut contrib_s = Array2::<f64>::zeros((range_a.len(), range_b.len()));
+                    for c in 0..CHANNELS {
+                        let Some(x_a) = self.uploads[block_a][c].as_ref() else {
                             continue;
                         };
-                        let h_dev = h_columns[packed_index(c, d)].as_ref()?;
-                        let weighted_block = weighted_gemm(
-                            &blas,
-                            &stream,
-                            x_a,
-                            h_dev,
-                            x_b,
-                            &mut scaled_dev,
-                            n_rows,
-                            range_a.len(),
-                            range_b.len(),
-                        )?;
-                        contrib_h = contrib_h + &weighted_block;
-                        let struct_block = plain_gemm(
-                            &blas,
-                            &stream,
-                            x_a,
-                            x_b,
-                            n_rows,
-                            range_a.len(),
-                            range_b.len(),
-                        )?;
-                        contrib_s = contrib_s + &struct_block;
+                        for d in 0..CHANNELS {
+                            let Some(x_b) = self.uploads[block_b][d].as_ref() else {
+                                continue;
+                            };
+                            let h_dev = h_columns[packed_index(c, d)].as_ref()?;
+                            let weighted_block = weighted_gemm(
+                                &self.blas,
+                                &self.stream,
+                                x_a,
+                                h_dev,
+                                x_b,
+                                &mut *scaled,
+                                self.n_rows,
+                                range_a.len(),
+                                range_b.len(),
+                            )?;
+                            contrib_h = contrib_h + &weighted_block;
+                            let struct_block = plain_gemm(
+                                &self.blas,
+                                &self.stream,
+                                x_a,
+                                x_b,
+                                self.n_rows,
+                                range_a.len(),
+                                range_b.len(),
+                            )?;
+                            contrib_s = contrib_s + &struct_block;
+                        }
                     }
+                    assign_block(&mut gram_h, range_a.start, range_b.start, &contrib_h);
+                    assign_block(&mut gram_struct, range_a.start, range_b.start, &contrib_s);
                 }
-                assign_block(&mut gram_h, range_a.start, range_b.start, &contrib_h);
-                assign_block(&mut gram_struct, range_a.start, range_b.start, &contrib_s);
             }
+
+            symmetrise(&mut gram_h);
+            symmetrise(&mut gram_struct);
+
+            Some(GramBundle {
+                gram_h,
+                gram_struct,
+                raw_block_ranges: self.raw_block_ranges.clone(),
+            })
         }
-
-        symmetrise(&mut gram_h);
-        symmetrise(&mut gram_struct);
-
-        Some(GramBundle {
-            gram_h,
-            gram_struct,
-            raw_block_ranges: raw_block_ranges.to_vec(),
-        })
     }
 
     /// Compute `Xa^T · diag(w) · Xb` for column-major device matrices.
@@ -543,6 +880,79 @@ mod tests {
                 );
             }
             assert_eq!(bundle.raw_block_ranges, ranges);
+        }
+    }
+
+    /// Parity test for the fused NVRTC kernel against the cuBLAS DDGMM+DGEMM
+    /// path. Skipped silently on hosts without a usable CUDA runtime, and
+    /// also when either path independently reports unavailable (CI infra
+    /// outage). On V100 with the fused kernel compiling, both bundles must
+    /// agree to 1e-10 elementwise.
+    #[test]
+    fn fused_kernel_matches_cublas_path() {
+        let (channel_blocks, h_packed, ranges) = make_fixture();
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert!(
+                try_primary_state_gram_fused_cuda(&channel_blocks, &h_packed, &ranges).is_none(),
+                "non-Linux build must report no CUDA for the fused entry point"
+            );
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if crate::gpu::runtime::GpuRuntime::global().is_none() {
+                eprintln!(
+                    "[identifiability_compile] no CUDA runtime — skipping fused/cuBLAS parity check"
+                );
+                return;
+            }
+            let Some(fused_bundle) =
+                try_primary_state_gram_fused_cuda(&channel_blocks, &h_packed, &ranges)
+            else {
+                eprintln!(
+                    "[identifiability_compile] fused kernel build returned None — \
+                     treating as CI infra outage, not a parity regression"
+                );
+                return;
+            };
+            let Some(workspace) =
+                GpuIdentifiabilityCompileWorkspace::try_new(&channel_blocks, &ranges)
+            else {
+                eprintln!(
+                    "[identifiability_compile] workspace build returned None — \
+                     treating as CI infra outage, not a parity regression"
+                );
+                return;
+            };
+            let Some(blas_bundle) = workspace.inner.compute_grams_cublas_only(&h_packed) else {
+                eprintln!(
+                    "[identifiability_compile] cuBLAS Gram build returned None — \
+                     treating as CI infra outage, not a parity regression"
+                );
+                return;
+            };
+            let tol = 1e-10_f64;
+            for ((idx, &f), &b) in fused_bundle
+                .gram_h
+                .indexed_iter()
+                .zip(blas_bundle.gram_h.iter())
+            {
+                assert!(
+                    (f - b).abs() <= tol,
+                    "gram_h fused-vs-cuBLAS drift at {idx:?}: fused={f} blas={b}"
+                );
+            }
+            for ((idx, &f), &b) in fused_bundle
+                .gram_struct
+                .indexed_iter()
+                .zip(blas_bundle.gram_struct.iter())
+            {
+                assert!(
+                    (f - b).abs() <= tol,
+                    "gram_struct fused-vs-cuBLAS drift at {idx:?}: fused={f} blas={b}"
+                );
+            }
+            assert_eq!(fused_bundle.raw_block_ranges, ranges);
         }
     }
 }

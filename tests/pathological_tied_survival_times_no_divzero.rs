@@ -2,7 +2,7 @@ use gam::estimate::{
     FitOptions, PenaltySpec, fit_gam, fit_gam_with_penalty_specs, fit_gamwith_heuristic_lambdas,
 };
 use gam::terms::smooth::BlockwisePenalty;
-use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily};
+use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, StandardLink, ResponseFamily};
 use ndarray::array;
 
 #[test]
@@ -14,7 +14,7 @@ fn tied_survival_times_do_not_trigger_division_by_zero() {
     let s_list: Vec<BlockwisePenalty> = vec![];
     let fam = LikelihoodSpec::new(
         ResponseFamily::RoystonParmar,
-        InverseLink::Standard(LinkFunction::Identity),
+        InverseLink::Standard(StandardLink::Identity),
     );
     let opts = FitOptions::default();
 

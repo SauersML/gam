@@ -18,6 +18,7 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 use super::error::GpuError;
+use crate::gpu_err;
 
 pub type CuResult = i32;
 // SAFETY: libcuda FFI fn-pointer alias matching the C ABI we dlsym
@@ -196,9 +197,7 @@ pub fn check_cuda(result: CuResult, name: &str) -> Result<(), GpuError> {
     if result == 0 {
         Ok(())
     } else {
-        Err(GpuError::DriverCallFailed {
-            reason: format!("{name} failed with CUDA driver error {result}"),
-        })
+        Err(gpu_err!("{name} failed with CUDA driver error {result}"))
     }
 }
 

@@ -4,7 +4,7 @@ use gam::construction::CanonicalPenalty;
 use gam::faer_ndarray::{FaerArrayView, FaerColView, factorize_symmetricwith_fallback, fast_ata};
 use gam::pirls::{self, PenaltyConfig, PirlsConfig, PirlsProblem};
 use gam::types::{
-    GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkFunction, LogSmoothingParamsView,
+    GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkFunction, StandardLink, LogSmoothingParamsView,
     ResponseFamily,
 };
 use ndarray::{Array1, Array2, Axis};
@@ -51,7 +51,7 @@ fn fit_unpenalized(
     let cfg = PirlsConfig {
         likelihood: GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
             ResponseFamily::Binomial,
-            InverseLink::Standard(LinkFunction::Logit),
+            InverseLink::Standard(StandardLink::Logit),
         )),
         link_kind: InverseLink::Standard(link),
         max_iterations: 100,
@@ -112,7 +112,7 @@ fn fit_identity_penalized(
     let cfg = PirlsConfig {
         likelihood: GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
             ResponseFamily::Binomial,
-            InverseLink::Standard(LinkFunction::Logit),
+            InverseLink::Standard(StandardLink::Logit),
         )),
         link_kind: InverseLink::Standard(link),
         max_iterations: 100,

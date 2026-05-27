@@ -1,6 +1,6 @@
 use gam::inference::probability::{normal_cdf, normal_pdf};
 use gam::solver::mixture_link::inverse_link_jet_for_inverse_link;
-use gam::types::{InverseLink, LatentCLogLogState, LinkComponent, LinkFunction, MixtureLinkState};
+use gam::types::{InverseLink, LatentCLogLogState, LinkComponent, LinkFunction, StandardLink, MixtureLinkState};
 use ndarray::array;
 
 fn central_diff(f: impl Fn(f64) -> f64, x: f64, h: f64) -> f64 {
@@ -10,7 +10,7 @@ fn central_diff(f: impl Fn(f64) -> f64, x: f64, h: f64) -> f64 {
 #[test]
 fn probit_derivative_identities_match_hermite_forms() {
     let eta = 0.37;
-    let link = InverseLink::Standard(LinkFunction::Probit);
+    let link = InverseLink::Standard(StandardLink::Probit);
     let jet = inverse_link_jet_for_inverse_link(&link, eta)
         .expect("probit inverse-link jet evaluation should succeed");
     let phi = normal_pdf(eta);
@@ -31,7 +31,7 @@ fn probit_derivative_identities_match_hermite_forms() {
 #[test]
 fn logit_derivative_identities_match_sigmoid_forms() {
     let eta = -0.81;
-    let link = InverseLink::Standard(LinkFunction::Logit);
+    let link = InverseLink::Standard(StandardLink::Logit);
     let jet = inverse_link_jet_for_inverse_link(&link, eta)
         .expect("logit inverse-link jet evaluation should succeed");
     let sigma = 1.0 / (1.0 + (-eta).exp());
@@ -52,7 +52,7 @@ fn logit_derivative_identities_match_sigmoid_forms() {
 #[test]
 fn cloglog_first_derivative_matches_closed_form() {
     let eta = 0.53;
-    let link = InverseLink::Standard(LinkFunction::CLogLog);
+    let link = InverseLink::Standard(StandardLink::CLogLog);
     let jet = inverse_link_jet_for_inverse_link(&link, eta)
         .expect("cloglog inverse-link jet evaluation should succeed");
     let expected_mu = 1.0 - (-eta.exp()).exp();
@@ -73,7 +73,7 @@ fn latent_cloglog_with_zero_sd_matches_standard_cloglog() {
     let latent = InverseLink::LatentCLogLog(
         LatentCLogLogState::new(0.0).expect("zero latent standard deviation should be allowed"),
     );
-    let standard = InverseLink::Standard(LinkFunction::CLogLog);
+    let standard = InverseLink::Standard(StandardLink::CLogLog);
     let latent_jet = inverse_link_jet_for_inverse_link(&latent, eta)
         .expect("latent cloglog inverse-link jet evaluation should succeed");
     let standard_jet = inverse_link_jet_for_inverse_link(&standard, eta)
@@ -95,10 +95,10 @@ fn mixture_inverse_link_mu_matches_weighted_component_sum_for_two_components() {
     let link = InverseLink::Mixture(state);
     let mix_jet = inverse_link_jet_for_inverse_link(&link, eta)
         .expect("mixture inverse-link jet evaluation should succeed");
-    let logit = inverse_link_jet_for_inverse_link(&InverseLink::Standard(LinkFunction::Logit), eta)
+    let logit = inverse_link_jet_for_inverse_link(&InverseLink::Standard(StandardLink::Logit), eta)
         .expect("logit jet should evaluate");
     let probit =
-        inverse_link_jet_for_inverse_link(&InverseLink::Standard(LinkFunction::Probit), eta)
+        inverse_link_jet_for_inverse_link(&InverseLink::Standard(StandardLink::Probit), eta)
             .expect("probit jet should evaluate");
     let expected = 0.598687660112452 * logit.mu + 0.401312339887548 * probit.mu;
     assert!(
