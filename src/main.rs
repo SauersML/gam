@@ -7348,15 +7348,15 @@ fn build_location_scale_saved_model(
 
 fn saved_anchored_deviation_runtime(runtime: &DeviationRuntime) -> SavedCompiledFlexBlock {
     use gam::families::bernoulli_marginal_slope::deviation_runtime::{
-        AnchorNullSpaceComponent, AnchorNullSpaceEvaluator,
+        AnchorComponentTag, AnchorNullSpaceEvaluator,
     };
     use gam::inference::model::{SavedAnchorComponent, SavedAnchorKind};
 
-    let mut anchor_residual_coefficients: Option<Vec<Vec<f64>>> = None;
-    let mut anchor_residual_components: Vec<SavedAnchorComponent> = Vec::new();
+    let mut anchor_correction: Option<Vec<Vec<f64>>> = None;
+    let mut anchor_components: Vec<SavedAnchorComponent> = Vec::new();
     let mut anchor_residual_rotation: Option<Vec<Vec<f64>>> = None;
-    if let Some(residual) = runtime.anchor_residual() {
-        anchor_residual_coefficients = Some(
+    if let Some(residual) = runtime.installed_flex_block() {
+        anchor_correction = Some(
             residual
                 .residual_coefficients
                 .rows()
@@ -7371,16 +7371,16 @@ fn saved_anchored_deviation_runtime(runtime: &DeviationRuntime) -> SavedCompiled
             } => {
                 for component in components {
                     match component {
-                        AnchorNullSpaceComponent::Parametric { block, ncols } => {
-                            anchor_residual_components.push(SavedAnchorComponent {
+                        AnchorComponentTag::Parametric { block, ncols } => {
+                            anchor_components.push(SavedAnchorComponent {
                                 kind: SavedAnchorKind::Parametric {
                                     block: *block,
                                     ncols: *ncols,
                                 },
                             });
                         }
-                        AnchorNullSpaceComponent::FlexEvaluation { ncols } => {
-                            anchor_residual_components.push(SavedAnchorComponent {
+                        AnchorComponentTag::FlexEvaluation { ncols } => {
+                            anchor_components.push(SavedAnchorComponent {
                                 kind: SavedAnchorKind::FlexEvaluation { ncols: *ncols },
                             });
                         }
@@ -7443,8 +7443,8 @@ fn saved_anchored_deviation_runtime(runtime: &DeviationRuntime) -> SavedCompiled
             .into_iter()
             .map(|row| row.to_vec())
             .collect(),
-        anchor_residual_coefficients,
-        anchor_residual_components,
+        anchor_correction,
+        anchor_components,
         anchor_residual_rotation,
     }
 }
@@ -11098,8 +11098,8 @@ mod tests {
             span_c1: vec![vec![0.0]],
             span_c2: vec![vec![0.0]],
             span_c3: vec![vec![0.0]],
-            anchor_residual_coefficients: None,
-            anchor_residual_components: Vec::new(),
+            anchor_correction: None,
+            anchor_components: Vec::new(),
             anchor_residual_rotation: None,
         };
         let fit_result = compact_saved_multiblock_fit_result(
@@ -13807,8 +13807,8 @@ mod tests {
             span_c1: vec![vec![0.0, 0.0]],
             span_c2: vec![vec![0.0, 0.0]],
             span_c3: vec![vec![0.0, 0.0]],
-            anchor_residual_coefficients: None,
-            anchor_residual_components: Vec::new(),
+            anchor_correction: None,
+            anchor_components: Vec::new(),
             anchor_residual_rotation: None,
         });
         let model = SavedModel::from_payload(payload);
@@ -13830,8 +13830,8 @@ mod tests {
             span_c1: vec![vec![0.0]],
             span_c2: vec![vec![0.0]],
             span_c3: vec![vec![0.0]],
-            anchor_residual_coefficients: None,
-            anchor_residual_components: Vec::new(),
+            anchor_correction: None,
+            anchor_components: Vec::new(),
             anchor_residual_rotation: None,
         };
         let zero_beta = Array1::zeros(saved_runtime.basis_dim);

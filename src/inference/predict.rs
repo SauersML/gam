@@ -1159,11 +1159,11 @@ impl BernoulliMarginalSlopePredictor {
         let needs_score = self
             .score_warp_runtime
             .as_ref()
-            .is_some_and(|r| r.anchor_residual_coefficients.is_some());
+            .is_some_and(|r| r.anchor_correction.is_some());
         let needs_link = self
             .link_deviation_runtime
             .as_ref()
-            .is_some_and(|r| r.anchor_residual_coefficients.is_some());
+            .is_some_and(|r| r.anchor_correction.is_some());
         if !needs_score && !needs_link {
             return Ok(BmsAnchorCorrections::default());
         }
@@ -1232,7 +1232,7 @@ impl BernoulliMarginalSlopePredictor {
             // at most one FlexEvaluation tail).
             let mut saw_flex_tail = false;
             let mut flex_tail_ncols: usize = 0;
-            for (idx, component) in runtime.anchor_residual_components.iter().enumerate() {
+            for (idx, component) in runtime.anchor_components.iter().enumerate() {
                 match &component.kind {
                     SavedAnchorKind::Parametric { .. } => {
                         if saw_flex_tail {
@@ -1269,7 +1269,7 @@ impl BernoulliMarginalSlopePredictor {
                 // through `design_with_anchor_rows` so the per-row
                 // subtraction is applied; otherwise the raw `design(z)`
                 // is the reparameterised basis.
-                let score_basis = if score_runtime.anchor_residual_coefficients.is_some() {
+                let score_basis = if score_runtime.anchor_correction.is_some() {
                     score_runtime
                         .design_with_anchor_rows(z, parametric_rows.view())
                         .map_err(EstimationError::from)?
@@ -1321,7 +1321,7 @@ impl BernoulliMarginalSlopePredictor {
         runtime_label: &str,
     ) -> Result<(), EstimationError> {
         use crate::inference::model::SavedAnchorKind;
-        for (idx, component) in runtime.anchor_residual_components.iter().enumerate() {
+        for (idx, component) in runtime.anchor_components.iter().enumerate() {
             match &component.kind {
                 SavedAnchorKind::Parametric { .. } => {}
                 SavedAnchorKind::FlexEvaluation { .. } => {
@@ -1619,7 +1619,7 @@ impl BernoulliMarginalSlopePredictor {
                 for v in value.iter_mut() {
                     *v -= offset;
                 }
-            } else if runtime.anchor_residual_coefficients.is_some() {
+            } else if runtime.anchor_correction.is_some() {
                 return Err(EstimationError::InvalidInput(
                     "bernoulli marginal-slope link-deviation runtime has an anchor residual but \
                      no per-row correction was supplied to link_terms_value_d1"
@@ -2383,7 +2383,7 @@ impl BernoulliMarginalSlopePredictor {
             .score_warp_runtime
             .as_ref()
             .map(|runtime| {
-                if runtime.anchor_residual_coefficients.is_some() {
+                if runtime.anchor_correction.is_some() {
                     let anchor_rows = anchor_corrections
                         .score_warp_anchor_rows_view()
                         .ok_or_else(|| {
@@ -2744,7 +2744,7 @@ impl BernoulliMarginalSlopePredictor {
             self.link_deviation_runtime.as_ref(),
             link_dev_beta_owned.as_ref(),
         ) {
-            let basis = if runtime.anchor_residual_coefficients.is_some() {
+            let basis = if runtime.anchor_correction.is_some() {
                 let anchor_rows = anchor_corrections
                     .link_dev_anchor_rows_view()
                     .ok_or_else(|| {
@@ -3090,7 +3090,7 @@ impl BernoulliMarginalSlopePredictor {
             self.score_warp_runtime.as_ref(),
             self.beta_score_warp.as_ref(),
         ) {
-            let design = if runtime.anchor_residual_coefficients.is_some() {
+            let design = if runtime.anchor_correction.is_some() {
                 let anchor_rows = anchor_corrections
                     .score_warp_anchor_rows_view()
                     .ok_or_else(|| {
@@ -3115,7 +3115,7 @@ impl BernoulliMarginalSlopePredictor {
             self.link_deviation_runtime.as_ref(),
             self.beta_link_dev.as_ref(),
         ) {
-            let basis = if runtime.anchor_residual_coefficients.is_some() {
+            let basis = if runtime.anchor_correction.is_some() {
                 let anchor_rows = anchor_corrections
                     .link_dev_anchor_rows_view()
                     .ok_or_else(|| {
@@ -5677,8 +5677,8 @@ mod tests {
                 .outer_iter()
                 .map(|row| row.to_vec())
                 .collect(),
-            anchor_residual_coefficients: None,
-            anchor_residual_components: Vec::new(),
+            anchor_correction: None,
+            anchor_components: Vec::new(),
             anchor_residual_rotation: None,
         }
     }
@@ -6012,8 +6012,8 @@ mod tests {
                     .collect()
             })
             .collect();
-        runtime.anchor_residual_coefficients = Some(m.clone());
-        runtime.anchor_residual_components = vec![SavedAnchorComponent {
+        runtime.anchor_correction = Some(m.clone());
+        runtime.anchor_components = vec![SavedAnchorComponent {
             kind: SavedAnchorKind::Parametric {
                 block: ParametricAnchorBlock::Marginal,
                 ncols: d,

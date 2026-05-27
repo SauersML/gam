@@ -833,17 +833,17 @@ pub struct SavedCompiledFlexBlock {
     /// `d × basis_dim`. When present, predict-time evaluation subtracts
     /// `n_row · M` from each cubic-span row (where `n_row` stacks the
     /// per-row parametric anchor values in the order given by
-    /// `anchor_residual_components`).
+    /// `anchor_components`).
     #[serde(default)]
-    pub anchor_residual_coefficients: Option<Vec<Vec<f64>>>,
+    pub anchor_correction: Option<Vec<Vec<f64>>>,
     /// Ordered list of parametric anchor components whose stacked row
     /// values combine into `n_row`. Empty unless
-    /// `anchor_residual_coefficients` is `Some`.
+    /// `anchor_correction` is `Some`.
     #[serde(default)]
-    pub anchor_residual_components: Vec<SavedAnchorComponent>,
+    pub anchor_components: Vec<SavedAnchorComponent>,
     /// Optional `d × d` orthonormalising rotation. The current
     /// construction bakes the rotation into
-    /// `anchor_residual_coefficients`, so this is always either `None`
+    /// `anchor_correction`, so this is always either `None`
     /// or the identity. Reserved for layouts that store the rotation
     /// separately from the coefficient matrix.
     #[serde(default)]
@@ -1314,20 +1314,20 @@ impl SavedCompiledFlexBlock {
     }
 
     fn validate_anchor_residual_shape(&self) -> Result<(), FittedModelError> {
-        let coeffs = match self.anchor_residual_coefficients.as_ref() {
+        let coeffs = match self.anchor_correction.as_ref() {
             Some(c) => c,
             None => {
-                if !self.anchor_residual_components.is_empty() {
+                if !self.anchor_components.is_empty() {
                     return Err(FittedModelError::SchemaMismatch {
                         reason:
-                            "saved anchored deviation runtime has anchor_residual_components but no anchor_residual_coefficients"
+                            "saved anchored deviation runtime has anchor_components but no anchor_correction"
                                 .to_string(),
                     });
                 }
                 if self.anchor_residual_rotation.is_some() {
                     return Err(FittedModelError::SchemaMismatch {
                         reason:
-                            "saved anchored deviation runtime has anchor_residual_rotation but no anchor_residual_coefficients"
+                            "saved anchored deviation runtime has anchor_residual_rotation but no anchor_correction"
                                 .to_string(),
                     });
                 }
@@ -1335,7 +1335,7 @@ impl SavedCompiledFlexBlock {
             }
         };
         let d: usize = self
-            .anchor_residual_components
+            .anchor_components
             .iter()
             .map(|c| match &c.kind {
                 SavedAnchorKind::Parametric { ncols, .. } => *ncols,
@@ -1345,7 +1345,7 @@ impl SavedCompiledFlexBlock {
         if coeffs.len() != d {
             return Err(FittedModelError::SchemaMismatch {
                 reason: format!(
-                    "saved anchored deviation runtime anchor_residual_coefficients has {} rows; expected {} (sum of component ncols)",
+                    "saved anchored deviation runtime anchor_correction has {} rows; expected {} (sum of component ncols)",
                     coeffs.len(),
                     d,
                 ),
@@ -1355,7 +1355,7 @@ impl SavedCompiledFlexBlock {
             if row.len() != self.basis_dim {
                 return Err(FittedModelError::SchemaMismatch {
                     reason: format!(
-                        "saved anchored deviation runtime anchor_residual_coefficients row {} has width {}, expected basis_dim {}",
+                        "saved anchored deviation runtime anchor_correction row {} has width {}, expected basis_dim {}",
                         i,
                         row.len(),
                         self.basis_dim,
@@ -1366,7 +1366,7 @@ impl SavedCompiledFlexBlock {
                 if !v.is_finite() {
                     return Err(FittedModelError::PayloadCorrupt {
                         reason: format!(
-                            "saved anchored deviation runtime anchor_residual_coefficients ({i},{j}) is non-finite"
+                            "saved anchored deviation runtime anchor_correction ({i},{j}) is non-finite"
                         ),
                     });
                 }
@@ -1840,7 +1840,7 @@ impl SavedCompiledFlexBlock {
     /// Evaluate the residual-corrected design at the supplied values.
     ///
     /// `anchor_rows` must be an `n × d` matrix where `n == values.len()`
-    /// and `d == sum of anchor_residual_components ncols`. Each row holds
+    /// and `d == sum of anchor_components ncols`. Each row holds
     /// the concatenated parametric anchor design at the same prediction
     /// row as the corresponding `values[i]`. When the runtime has no
     /// anchor residual, `anchor_rows` must have zero columns (or be
@@ -1852,7 +1852,7 @@ impl SavedCompiledFlexBlock {
     ) -> Result<Array2<f64>, FittedModelError> {
         let mut out =
             self.evaluate_span_polynomial_design(values, BasisOptions::value().derivative_order)?;
-        if let Some(m_rows) = self.anchor_residual_coefficients.as_ref() {
+        if let Some(m_rows) = self.anchor_correction.as_ref() {
             let d = m_rows.len();
             if anchor_rows.nrows() != values.len() {
                 return Err(FittedModelError::SchemaMismatch {
@@ -1878,7 +1878,7 @@ impl SavedCompiledFlexBlock {
                 if row.len() != self.basis_dim {
                     return Err(FittedModelError::SchemaMismatch {
                         reason: format!(
-                            "design_with_anchor_rows: anchor_residual_coefficients row {} has length {}, expected basis_dim {}",
+                            "design_with_anchor_rows: anchor_correction row {} has length {}, expected basis_dim {}",
                             i,
                             row.len(),
                             self.basis_dim,
@@ -1920,7 +1920,7 @@ impl SavedCompiledFlexBlock {
         &self,
         n_anchor_rows: ndarray::ArrayView2<f64>,
     ) -> Result<Option<Array2<f64>>, FittedModelError> {
-        let Some(m_rows) = self.anchor_residual_coefficients.as_ref() else {
+        let Some(m_rows) = self.anchor_correction.as_ref() else {
             return Ok(None);
         };
         let d = m_rows.len();
@@ -3643,8 +3643,8 @@ mod tests {
             span_c1: vec![vec![0.0; basis_dim]],
             span_c2: vec![vec![0.0; basis_dim]],
             span_c3: vec![vec![0.0; basis_dim]],
-            anchor_residual_coefficients: None,
-            anchor_residual_components: Vec::new(),
+            anchor_correction: None,
+            anchor_components: Vec::new(),
             anchor_residual_rotation: None,
         }
     }

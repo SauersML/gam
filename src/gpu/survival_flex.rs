@@ -2447,6 +2447,591 @@ pub fn try_device_layer_b_jet(
 }
 
 // ────────────────────────────────────────────────────────────────────────
+// Step 4 Layer C-α — second-order jet `(a_uv, eta_uv, chi_uv)` for the
+// dense Hessian via the second-order IFT solve.  Mirrors
+// CPU `compute_survival_timepoint_exact` (lines 6757-7013 of
+// `survival_marginal_slope.rs`) for the `need_d_uv == false` branch.
+//
+// Layered build:
+//   * Layer A → F, F', F''
+//   * Layer B → first-order jet (a_u, eta_u, chi_u, d_u)
+//   * Layer C-α → second-order jet (a_uv, eta_uv, chi_uv) — this section
+//   * Layer C-β → optional `d_uv` (degree-15 quadrature; future commit)
+//
+// Per-cell quadrature accumulators (CPU lines 6792-6843):
+//   f_aa          = ⟨-dc_da, -dc_da, -dc_daa⟩₂
+//   f_au[u]       = ⟨-dc_da, -coeff_u[u], -coeff_au[u]⟩₂
+//   f_uv[u,v]     = ⟨-coeff_u[u], -coeff_u[v], -second_coeff[u,v]⟩₂
+// where ⟨·,·,·⟩₂ ≡ `cell_second_derivative_from_moments(neg_cell, r, s, rs)`
+// and `second_coeff[u,v]` is `coeff_bu[v]` if `u == g_index`,
+// `coeff_bu[u]` if `v == g_index`, else `[0;4]`.
+//
+// Post-sum corrections (CPU lines 6861-6863):
+//   f_u[q_index]            += φ(q)
+//   f_uv[q_index, q_index]  += -q · φ(q)
+//
+// Second-order IFT (CPU lines 6923-6932):
+//   a_uv[u,v] = (f_uv[u,v]
+//                - d_u[u] · a_u[v] - d_u[v] · a_u[u]
+//                - f_aa · a_u[u] · a_u[v]) / D
+//
+// Closed-form observed-jet algebra (CPU lines 6989-7013):
+//   eta_uv[u,v] = chi · a_uv[u,v]
+//               + eta_aa · a_u[u] · a_u[v]
+//               + tau[u] · a_u[v] + tau[v] · a_u[u]
+//               + r_uv[u,v]
+//   chi_uv[u,v] = eta_aa · a_uv[u,v]
+//               + eta_aaa · a_u[u] · a_u[v]
+//               + tau_a[u] · a_u[v] + tau_a[v] · a_u[u]
+//               + chi_uv_fixed[u,v]
+//
+// `r_uv` and `chi_uv_fixed` are observed-row second partials (CPU
+// `observed_fixed_eta_second_partial` and `observed_fixed_chi_second_partial`)
+// that depend on the family's `primary` / `obs` row-state; they are
+// caller-supplied scalars per (u,v) pair, lower-triangle-packed.
+//
+// Substrate moment quadrature is shared with Layers A/B (max_degree 9 is
+// sufficient because second-derivative integrands top out at degree 9:
+// len(cubic)+len(coeff_u)+len(coeff_v)-3 = 4+4+4-3 = 9).  Optional Layer
+// C-β `d_uv` quadrature needs `max_degree 24` for the quintic-product
+// term (term5 = chi_poly · eta_poly² · eta_u · eta_v).
+// ────────────────────────────────────────────────────────────────────────
+
+/// Per-cell primary tables for Layer C-α: extends Layer B's
+/// `(coeff_u, coeff_au)` with `coeff_bu[u]` for the `f_uv` second-coeff
+/// branching on `g_index`.
+#[derive(Clone, Debug)]
+pub struct SurvivalFlexLayerCCellCoeffs {
+    /// `coeff_u[u]`: ∂c/∂β_u (length `p`).
+    pub coeff_u: Vec<[f64; 4]>,
+    /// `coeff_au[u]`: ∂²c/∂a∂β_u (length `p`).
+    pub coeff_au: Vec<[f64; 4]>,
+    /// `coeff_bu[u]`: ∂²c/∂b∂β_u (length `p`).  Only the entries
+    /// indexed against `g_index` are read by the f_uv assembly (per the
+    /// CPU branching at lines 6817-6822); the rest may be zero-padded.
+    pub coeff_bu: Vec<[f64; 4]>,
+}
+
+/// Per-row inputs for Layer C-α.
+#[derive(Clone, Debug)]
+pub struct SurvivalFlexLayerCRowInputs<'a> {
+    /// Per-row partition cells (geometry + spans).
+    pub partition_cells: &'a [SurvivalFlexCalibrationCell],
+    /// Per-cell primary tables (one per cell).
+    pub cell_coeffs: &'a [SurvivalFlexLayerCCellCoeffs],
+    /// Calibration denominator `D(a*)`, positive finite.
+    pub d_check: f64,
+    /// Index of the q-perturbation primary; `usize::MAX` to disable.
+    pub q_index: usize,
+    /// `g_index`: the primary index of the raw log-slope coordinate.
+    /// Used by the `second_coeff` branching in `f_uv`.
+    /// Set to `usize::MAX` to disable the branch (zero second-coeff for
+    /// every pair).
+    pub g_index: usize,
+    /// `φ(q)`: for the `f_u[q_index] += φ(q)` bump.
+    pub phi_q: f64,
+    /// `q`: for the `f_uv[q_index, q_index] += -q · φ(q)` bump.
+    pub q: f64,
+    /// Observed-row `chi`, `eta_aa`, `eta_aaa` scalars from
+    /// `observed_denested_cell_partials`.
+    pub chi: f64,
+    /// Observed-row `eta_aa` scalar.
+    pub eta_aa: f64,
+    /// Observed-row `eta_aaa` scalar (third partial in `a`).
+    pub eta_aaa: f64,
+    /// `rho[u]`, `tau[u]`, `tau_a[u]`: per-primary observed partials.
+    pub rho: &'a [f64],
+    /// `tau[u]`: per-primary observed `∂chi/∂β_u | a fixed`.
+    pub tau: &'a [f64],
+    /// `tau_a[u]`: per-primary observed `∂²chi/∂a∂β_u`.
+    pub tau_a: &'a [f64],
+    /// Per-(u,v) pair observed `r_uv[u,v]` second-eta partial,
+    /// upper-triangle row-major flat: length `p*(p+1)/2`, indexed by
+    /// the helper [`tri_index`] below.
+    pub r_uv_upper_packed: &'a [f64],
+    /// Per-(u,v) pair observed `chi_uv_fixed[u,v]`, same packing.
+    pub chi_uv_fixed_upper_packed: &'a [f64],
+    /// `probit_scale`.
+    pub probit_scale: f64,
+    /// Calibration root `a*`.
+    pub a: f64,
+    /// Slope `b`.
+    pub slope: f64,
+}
+
+/// Upper-triangle row-major flat index `(u, v)` with `u ≤ v`.
+/// `tri_index(u, v, p) = u·(2·p - u - 1) / 2 + v`.
+/// Inverse to a row-major upper triangle pack.
+#[inline]
+pub const fn tri_index(u: usize, v: usize, p: usize) -> usize {
+    debug_only_check_tri(u, v, p);
+    let u_idx = u * (2 * p - u - 1) / 2;
+    u_idx + v
+}
+
+#[inline]
+const fn debug_only_check_tri(_u: usize, _v: usize, _p: usize) {
+    // Intentional no-op: kept as a `pub const fn` sibling so that the
+    // index function compiles in const context.  In tests we exercise
+    // the index against the layout invariant directly.
+}
+
+/// Per-row Layer C-α outputs.
+#[derive(Clone, Debug)]
+pub struct SurvivalFlexLayerCRowOutputs {
+    /// `a_u[u]`, length `p`.
+    pub a_u: Vec<f64>,
+    /// `eta_u[u]`, length `p`.
+    pub eta_u: Vec<f64>,
+    /// `chi_u[u]`, length `p`.
+    pub chi_u: Vec<f64>,
+    /// `d_u[u]`, length `p`.
+    pub d_u: Vec<f64>,
+    /// `a_uv` dense row-major `p × p`, symmetric.
+    pub a_uv: Vec<f64>,
+    /// `eta_uv` dense row-major `p × p`, symmetric.
+    pub eta_uv: Vec<f64>,
+    /// `chi_uv` dense row-major `p × p`, symmetric.
+    pub chi_uv: Vec<f64>,
+}
+
+/// Substrate-backed Layer C-α fold.  Computes the second-order
+/// timepoint jet `(a_uv, eta_uv, chi_uv)` and the first-order outputs
+/// `(a_u, eta_u, chi_u, d_u)` for every input row.
+pub fn try_device_layer_c_jet(
+    rows: &[SurvivalFlexLayerCRowInputs<'_>],
+) -> Result<Option<Vec<SurvivalFlexLayerCRowOutputs>>, GpuError> {
+    use crate::families::cubic_cell_kernel::{
+        cell_first_derivative_from_moments, cell_polynomial_integral_from_moments,
+        cell_second_derivative_from_moments, denested_cell_coefficient_partials,
+        denested_cell_second_partials,
+    };
+
+    if rows.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+    let n_rows = rows.len();
+
+    // Validate shapes and collect totals.
+    let mut total_cells = 0usize;
+    let mut row_offsets = Vec::with_capacity(n_rows + 1);
+    row_offsets.push(0);
+    for (i, row) in rows.iter().enumerate() {
+        let p = row.rho.len();
+        if row.tau.len() != p || row.tau_a.len() != p {
+            return Err(GpuError::DriverCallFailed {
+                reason: format!(
+                    "layer_c row {i}: rho/tau/tau_a length mismatch ({}/{}/{})",
+                    p,
+                    row.tau.len(),
+                    row.tau_a.len()
+                ),
+            });
+        }
+        let expected_packed = p * (p + 1) / 2;
+        if row.r_uv_upper_packed.len() != expected_packed
+            || row.chi_uv_fixed_upper_packed.len() != expected_packed
+        {
+            return Err(GpuError::DriverCallFailed {
+                reason: format!(
+                    "layer_c row {i}: r_uv/chi_uv_fixed packed length must be p*(p+1)/2 = {expected_packed}, got {}/{}",
+                    row.r_uv_upper_packed.len(),
+                    row.chi_uv_fixed_upper_packed.len()
+                ),
+            });
+        }
+        if row.partition_cells.len() != row.cell_coeffs.len() {
+            return Err(GpuError::DriverCallFailed {
+                reason: format!(
+                    "layer_c row {i}: cells.len()={} != cell_coeffs.len()={}",
+                    row.partition_cells.len(),
+                    row.cell_coeffs.len()
+                ),
+            });
+        }
+        for (k, cc) in row.cell_coeffs.iter().enumerate() {
+            if cc.coeff_u.len() != p || cc.coeff_au.len() != p || cc.coeff_bu.len() != p {
+                return Err(GpuError::DriverCallFailed {
+                    reason: format!(
+                        "layer_c row {i} cell {k}: coeff_u/coeff_au/coeff_bu lengths {}/{}/{} expected {p}",
+                        cc.coeff_u.len(),
+                        cc.coeff_au.len(),
+                        cc.coeff_bu.len()
+                    ),
+                });
+            }
+        }
+        if !(row.d_check.is_finite() && row.d_check > 0.0) {
+            return Err(GpuError::DriverCallFailed {
+                reason: format!(
+                    "layer_c row {i}: d_check must be positive finite, got {}",
+                    row.d_check
+                ),
+            });
+        }
+        if !(row.probit_scale.is_finite() && row.probit_scale > 0.0) {
+            return Err(GpuError::DriverCallFailed {
+                reason: format!(
+                    "layer_c row {i}: probit_scale must be positive finite, got {}",
+                    row.probit_scale
+                ),
+            });
+        }
+        total_cells += row.partition_cells.len();
+        row_offsets.push(total_cells);
+    }
+
+    if total_cells == 0 {
+        let mut out = Vec::with_capacity(n_rows);
+        for row in rows {
+            let p = row.rho.len();
+            out.push(SurvivalFlexLayerCRowOutputs {
+                a_u: vec![0.0; p],
+                eta_u: row.rho.to_vec(),
+                chi_u: row.tau.to_vec(),
+                d_u: vec![0.0; p],
+                a_uv: vec![0.0; p * p],
+                eta_uv: vec![0.0; p * p],
+                chi_uv: vec![0.0; p * p],
+            });
+        }
+        return Ok(Some(out));
+    }
+
+    // Build the substrate batch (negated cubic, same shape as Layers A/B).
+    let mut left = Vec::with_capacity(total_cells);
+    let mut right = Vec::with_capacity(total_cells);
+    let mut c0 = Vec::with_capacity(total_cells);
+    let mut c1 = Vec::with_capacity(total_cells);
+    let mut c2 = Vec::with_capacity(total_cells);
+    let mut c3 = Vec::with_capacity(total_cells);
+    for row in rows {
+        for pc in row.partition_cells {
+            left.push(pc.cell.left);
+            right.push(pc.cell.right);
+            c0.push(-pc.cell.c0);
+            c1.push(-pc.cell.c1);
+            c2.push(-pc.cell.c2);
+            c3.push(-pc.cell.c3);
+        }
+    }
+    let batch = SurvivalFlexRowCellsBatch {
+        n_cells: total_cells,
+        n_rows,
+        max_degree: 9,
+        left: &left,
+        right: &right,
+        c0: &c0,
+        c1: &c1,
+        c2: &c2,
+        c3: &c3,
+        row_offsets: &row_offsets,
+    };
+    let mom = match try_row_batched_cell_moments(batch)? {
+        Some(m) => m,
+        None => return Ok(None),
+    };
+    let stride = mom.stride;
+    if stride < 10 {
+        return Err(GpuError::DriverCallFailed {
+            reason: format!("layer_c: substrate returned stride={stride} < 10"),
+        });
+    }
+    let ok_byte = super::cubic_cell::CubicCellMomentStatus::Ok as u8;
+    if mom.status.iter().any(|&s| s != ok_byte) {
+        return Ok(None);
+    }
+
+    let mut out = Vec::with_capacity(n_rows);
+    for (row_idx, row) in rows.iter().enumerate() {
+        let p = row.rho.len();
+        let row_start = row_offsets[row_idx];
+        let row_end = row_offsets[row_idx + 1];
+
+        // Per-cell scratch for second-deriv folds.
+        // Step 1: f_aa, f_u, f_au, f_uv from per-cell quadrature.
+        let mut f_u = vec![0.0_f64; p];
+        let mut f_au = vec![0.0_f64; p];
+        let mut f_uv = vec![0.0_f64; p * p];
+        let mut f_aa = 0.0_f64;
+
+        for cell_idx in row_start..row_end {
+            let local_idx = cell_idx - row_start;
+            let pc = &row.partition_cells[local_idx];
+            let cc = &row.cell_coeffs[local_idx];
+            let moments_row = &mom.moments[cell_idx * stride..cell_idx * stride + stride];
+
+            // Reproduce the family's `neg_cell` for the second-derivative helper.
+            let neg_cell = crate::families::cubic_cell_kernel::DenestedCubicCell {
+                left: pc.cell.left,
+                right: pc.cell.right,
+                c0: -pc.cell.c0,
+                c1: -pc.cell.c1,
+                c2: -pc.cell.c2,
+                c3: -pc.cell.c3,
+            };
+
+            // Per-cell analytic partials at this row's (a, slope).
+            let (dc_da_pos, _) =
+                denested_cell_coefficient_partials(pc.score_span, pc.link_span, row.a, row.slope);
+            let (dc_daa_pos, _, _) =
+                denested_cell_second_partials(pc.score_span, pc.link_span, row.a, row.slope);
+            // Sign convention matches `evaluate_denested_survival_calibration`:
+            // `-probit_scale` on every partial because the integrand is `-Φ(-η)`.
+            let neg_dc_da = [
+                -row.probit_scale * dc_da_pos[0],
+                -row.probit_scale * dc_da_pos[1],
+                -row.probit_scale * dc_da_pos[2],
+                -row.probit_scale * dc_da_pos[3],
+            ];
+            let neg_dc_daa = [
+                -row.probit_scale * dc_daa_pos[0],
+                -row.probit_scale * dc_daa_pos[1],
+                -row.probit_scale * dc_daa_pos[2],
+                -row.probit_scale * dc_daa_pos[3],
+            ];
+
+            // f_aa contribution.
+            let f_aa_cell = cell_second_derivative_from_moments(
+                neg_cell,
+                &neg_dc_da,
+                &neg_dc_da,
+                &neg_dc_daa,
+                moments_row,
+            )
+            .map_err(|e| GpuError::DriverCallFailed {
+                reason: format!("layer_c row {row_idx} cell {local_idx}: f_aa: {e}"),
+            })?;
+            f_aa += f_aa_cell;
+
+            // f_u and f_au per primary.
+            for u in 0..p {
+                let neg_coeff_u = [
+                    -cc.coeff_u[u][0],
+                    -cc.coeff_u[u][1],
+                    -cc.coeff_u[u][2],
+                    -cc.coeff_u[u][3],
+                ];
+                let neg_coeff_au = [
+                    -cc.coeff_au[u][0],
+                    -cc.coeff_au[u][1],
+                    -cc.coeff_au[u][2],
+                    -cc.coeff_au[u][3],
+                ];
+                let fu = cell_first_derivative_from_moments(&neg_coeff_u, moments_row)
+                    .map_err(|e| GpuError::DriverCallFailed {
+                        reason: format!("layer_c row {row_idx} cell {local_idx} u={u}: f_u: {e}"),
+                    })?;
+                f_u[u] += fu;
+                let fau = cell_second_derivative_from_moments(
+                    neg_cell,
+                    &neg_dc_da,
+                    &neg_coeff_u,
+                    &neg_coeff_au,
+                    moments_row,
+                )
+                .map_err(|e| GpuError::DriverCallFailed {
+                    reason: format!("layer_c row {row_idx} cell {local_idx} u={u}: f_au: {e}"),
+                })?;
+                f_au[u] += fau;
+            }
+
+            // f_uv: upper triangle, then mirror.  `second_coeff` branches
+            // on g_index per CPU lines 6817-6822.
+            for u in 0..p {
+                let neg_coeff_u = [
+                    -cc.coeff_u[u][0],
+                    -cc.coeff_u[u][1],
+                    -cc.coeff_u[u][2],
+                    -cc.coeff_u[u][3],
+                ];
+                for v in u..p {
+                    let second_coeff_pos: [f64; 4] = if u == row.g_index {
+                        cc.coeff_bu[v]
+                    } else if v == row.g_index {
+                        cc.coeff_bu[u]
+                    } else {
+                        [0.0; 4]
+                    };
+                    let neg_coeff_v = [
+                        -cc.coeff_u[v][0],
+                        -cc.coeff_u[v][1],
+                        -cc.coeff_u[v][2],
+                        -cc.coeff_u[v][3],
+                    ];
+                    let neg_second_coeff = [
+                        -second_coeff_pos[0],
+                        -second_coeff_pos[1],
+                        -second_coeff_pos[2],
+                        -second_coeff_pos[3],
+                    ];
+                    let value = cell_second_derivative_from_moments(
+                        neg_cell,
+                        &neg_coeff_u,
+                        &neg_coeff_v,
+                        &neg_second_coeff,
+                        moments_row,
+                    )
+                    .map_err(|e| GpuError::DriverCallFailed {
+                        reason: format!(
+                            "layer_c row {row_idx} cell {local_idx} u={u} v={v}: f_uv: {e}"
+                        ),
+                    })?;
+                    f_uv[u * p + v] += value;
+                    if v != u {
+                        f_uv[v * p + u] += value;
+                    }
+                }
+            }
+        }
+
+        // q-index bumps.
+        if row.q_index < p {
+            f_u[row.q_index] += row.phi_q;
+            let idx = row.q_index * p + row.q_index;
+            f_uv[idx] += -row.q * row.phi_q;
+        }
+
+        // a_u = f_u / D.
+        let mut a_u = vec![0.0_f64; p];
+        for u in 0..p {
+            a_u[u] = f_u[u] / row.d_check;
+        }
+
+        // d_u: same algebra as Layer B (Σ_cells of integrand_u, see Layer B notes).
+        let mut d_u = vec![0.0_f64; p];
+        for cell_idx in row_start..row_end {
+            let local_idx = cell_idx - row_start;
+            let pc = &row.partition_cells[local_idx];
+            let cc = &row.cell_coeffs[local_idx];
+            let moments_row = &mom.moments[cell_idx * stride..cell_idx * stride + stride];
+
+            let (dc_da_pos, _) =
+                denested_cell_coefficient_partials(pc.score_span, pc.link_span, row.a, row.slope);
+            let (dc_daa_pos, _, _) =
+                denested_cell_second_partials(pc.score_span, pc.link_span, row.a, row.slope);
+            let chi_poly = dc_da_pos;
+            let eta_aa_poly = dc_daa_pos;
+            let eta_poly = [pc.cell.c0, pc.cell.c1, pc.cell.c2, pc.cell.c3];
+
+            let mut chi_eta = [0.0_f64; 16];
+            for i in 0..4 {
+                for j in 0..4 {
+                    chi_eta[i + j] = chi_poly[i].mul_add(eta_poly[j], chi_eta[i + j]);
+                }
+            }
+            let chi_eta_len = 7usize;
+
+            for u in 0..p {
+                let eta_u_poly = [
+                    a_u[u] * chi_poly[0] + cc.coeff_u[u][0],
+                    a_u[u] * chi_poly[1] + cc.coeff_u[u][1],
+                    a_u[u] * chi_poly[2] + cc.coeff_u[u][2],
+                    a_u[u] * chi_poly[3] + cc.coeff_u[u][3],
+                ];
+                let chi_u_poly = [
+                    a_u[u] * eta_aa_poly[0] + cc.coeff_au[u][0],
+                    a_u[u] * eta_aa_poly[1] + cc.coeff_au[u][1],
+                    a_u[u] * eta_aa_poly[2] + cc.coeff_au[u][2],
+                    a_u[u] * eta_aa_poly[3] + cc.coeff_au[u][3],
+                ];
+                let mut chi_eta_etau = [0.0_f64; 16];
+                for i in 0..chi_eta_len {
+                    for j in 0..4 {
+                        chi_eta_etau[i + j] =
+                            chi_eta[i].mul_add(eta_u_poly[j], chi_eta_etau[i + j]);
+                    }
+                }
+                let triple_len = chi_eta_len + 4 - 1;
+                let mut integrand = [0.0_f64; 16];
+                for k in 0..4 {
+                    integrand[k] = chi_u_poly[k];
+                }
+                for k in 0..triple_len {
+                    integrand[k] -= chi_eta_etau[k];
+                }
+                let contrib = cell_polynomial_integral_from_moments(
+                    &integrand[..triple_len],
+                    moments_row,
+                    "survival_flex layer_c d_u",
+                )
+                .map_err(|e| GpuError::DriverCallFailed {
+                    reason: format!(
+                        "layer_c row {row_idx} cell {local_idx} u={u}: d_u fold: {e}"
+                    ),
+                })?;
+                d_u[u] += contrib;
+            }
+        }
+
+        // a_uv: upper triangle then mirror.
+        let mut a_uv = vec![0.0_f64; p * p];
+        for u in 0..p {
+            for v in u..p {
+                let value = (f_uv[u * p + v]
+                    - d_u[u] * a_u[v]
+                    - d_u[v] * a_u[u]
+                    - f_aa * a_u[u] * a_u[v])
+                    / row.d_check;
+                a_uv[u * p + v] = value;
+                if v != u {
+                    a_uv[v * p + u] = value;
+                }
+            }
+        }
+
+        // First-order closed-form algebra (Layer B's pattern).
+        let mut eta_u = vec![0.0_f64; p];
+        let mut chi_u = vec![0.0_f64; p];
+        for u in 0..p {
+            eta_u[u] = row.chi * a_u[u] + row.rho[u];
+            chi_u[u] = row.eta_aa * a_u[u] + row.tau[u];
+        }
+
+        // Second-order closed-form algebra (CPU lines 6989-7013).
+        let mut eta_uv = vec![0.0_f64; p * p];
+        let mut chi_uv = vec![0.0_f64; p * p];
+        for u in 0..p {
+            for v in u..p {
+                let packed = tri_index(u, v, p);
+                let r_uv_val = row.r_uv_upper_packed[packed];
+                let chi_uv_fixed_val = row.chi_uv_fixed_upper_packed[packed];
+                let eta_val = row.chi * a_uv[u * p + v]
+                    + row.eta_aa * a_u[u] * a_u[v]
+                    + row.tau[u] * a_u[v]
+                    + row.tau[v] * a_u[u]
+                    + r_uv_val;
+                eta_uv[u * p + v] = eta_val;
+                if v != u {
+                    eta_uv[v * p + u] = eta_val;
+                }
+                let chi_val = row.eta_aa * a_uv[u * p + v]
+                    + row.eta_aaa * a_u[u] * a_u[v]
+                    + row.tau_a[u] * a_u[v]
+                    + row.tau_a[v] * a_u[u]
+                    + chi_uv_fixed_val;
+                chi_uv[u * p + v] = chi_val;
+                if v != u {
+                    chi_uv[v * p + u] = chi_val;
+                }
+            }
+        }
+
+        out.push(SurvivalFlexLayerCRowOutputs {
+            a_u,
+            eta_u,
+            chi_u,
+            d_u,
+            a_uv,
+            eta_uv,
+            chi_uv,
+        });
+    }
+
+    Ok(Some(out))
+}
+
+// ────────────────────────────────────────────────────────────────────────
 // Three thin pullback entry points.  The bodies all currently return
 // `Ok(None)` (the unsupported sentinel) because Steps 2–5 still need to
 // land the flex / cubic-cell / intercept-solve infrastructure before
