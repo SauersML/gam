@@ -186,9 +186,9 @@ impl GaussianRemlNoAllocWorkspace {
             || self.projected_rhs_squared.dim() != (p, d)
             || self.scaled_projected_rhs.dim() != (p, d)
         {
-            return Err(EstimationError::InvalidInput(format!(
+            crate::bail_invalid_estim!(format!(
                 "Gaussian REML no-alloc workspace shape mismatch: expected p={p}, d={d}"
-            )));
+            ));
         }
         Ok::<(), _>(())
     }
@@ -394,33 +394,29 @@ pub fn gaussian_reml_multi_closed_form_with_cache_no_alloc(
     validate_gaussian_reml_design(x, penalty, weights)?;
     validate_gaussian_reml_eigen_cache(eigen_cache, p)?;
     if y.nrows() != n {
-        return Err(EstimationError::InvalidInput(format!(
+        crate::bail_invalid_estim!(format!(
             "Gaussian REML row mismatch: X has {n} rows but Y has {}",
             y.nrows()
-        )));
-    }
-    if y.iter().any(|value| !value.is_finite()) {
-        return Err(EstimationError::InvalidInput(
-            "Gaussian REML inputs must be finite".to_string(),
         ));
     }
+    if y.iter().any(|value| !value.is_finite()) {
+        crate::bail_invalid_estim!("Gaussian REML inputs must be finite".to_string(),);
+    }
     if n <= eigen_cache.nullity {
-        return Err(EstimationError::InvalidInput(format!(
+        crate::bail_invalid_estim!(format!(
             "Gaussian REML requires n > nullspace dimension; got n={n}, nullity={}",
             eigen_cache.nullity
-        )));
+        ));
     }
     let penalty_fingerprint = matrix_fingerprint(penalty);
     if eigen_cache.penalty_fingerprint != penalty_fingerprint {
-        return Err(EstimationError::InvalidInput(
-            "Gaussian REML eigen cache penalty mismatch".to_string(),
-        ));
+        crate::bail_invalid_estim!("Gaussian REML eigen cache penalty mismatch".to_string(),);
     }
     workspace.validate(p, d)?;
     if coefficients.dim() != (p, d) || fitted.dim() != (n, d) || sigma2.len() != d {
-        return Err(EstimationError::InvalidInput(format!(
+        crate::bail_invalid_estim!(format!(
             "Gaussian REML no-alloc output shape mismatch: expected coefficients=({p},{d}), fitted=({n},{d}), sigma2={d}"
-        )));
+        ));
     }
     if let Some(lambda) = init_lambda {
         validate_initial_lambda(lambda)?;
@@ -589,9 +585,9 @@ pub fn gaussian_reml_free_b_score(
     weights: Option<ArrayView1<'_, f64>>,
 ) -> Result<GaussianRemlFreeBScore, EstimationError> {
     if !log_lambda.is_finite() {
-        return Err(EstimationError::InvalidInput(format!(
+        crate::bail_invalid_estim!(format!(
             "Gaussian REML log_lambda must be finite; got {log_lambda}"
-        )));
+        ));
     }
     let lambda = log_lambda.exp();
     let penalty_owned = canonicalize_penalty(penalty);
@@ -601,32 +597,30 @@ pub fn gaussian_reml_free_b_score(
     let d = y.ncols();
     validate_gaussian_reml_design(x, penalty, weights)?;
     if y.nrows() != n {
-        return Err(EstimationError::InvalidInput(format!(
+        crate::bail_invalid_estim!(format!(
             "Gaussian REML row mismatch: X has {n} rows but Y has {}",
             y.nrows()
-        )));
+        ));
     }
     if coefficients.dim() != (p, d) {
-        return Err(EstimationError::InvalidInput(format!(
+        crate::bail_invalid_estim!(format!(
             "Gaussian REML coefficient shape mismatch: expected {p}x{d}, got {}x{}",
             coefficients.nrows(),
             coefficients.ncols()
-        )));
+        ));
     }
     if y.iter().chain(coefficients.iter()).any(|v| !v.is_finite()) {
-        return Err(EstimationError::InvalidInput(
-            "Gaussian REML inputs must be finite".to_string(),
-        ));
+        crate::bail_invalid_estim!("Gaussian REML inputs must be finite".to_string(),);
     }
 
     let weight = gaussian_reml_weights(n, weights)?;
     let cache =
         build_gaussian_reml_eigen_cache_with_nullspace_dim(x, penalty, None, Some(weight.view()))?;
     if n <= cache.nullity {
-        return Err(EstimationError::InvalidInput(format!(
+        crate::bail_invalid_estim!(format!(
             "Gaussian REML requires n > nullspace dimension; got n={n}, nullity={}",
             cache.nullity
-        )));
+        ));
     }
     let nu = n as f64 - cache.nullity as f64;
     let fitted = dense_ab(x, coefficients);
@@ -1023,40 +1017,34 @@ fn validate_gaussian_reml_backward_upstreams(
 ) -> Result<(), EstimationError> {
     if !(upstream_lambda.is_finite() && upstream_reml_score.is_finite() && upstream_edf.is_finite())
     {
-        return Err(EstimationError::InvalidInput(
-            "Gaussian REML backward upstream scalars must be finite".to_string(),
-        ));
+        crate::bail_invalid_estim!("Gaussian REML backward upstream scalars must be finite".to_string(),);
     }
     if let Some(upstream_coefficients) = upstream_coefficients {
         if upstream_coefficients.dim() != (x.ncols(), y.ncols()) {
-            return Err(EstimationError::InvalidInput(format!(
+            crate::bail_invalid_estim!(format!(
                 "Gaussian REML backward coefficient upstream shape mismatch: expected {}x{}, got {}x{}",
                 x.ncols(),
                 y.ncols(),
                 upstream_coefficients.nrows(),
                 upstream_coefficients.ncols()
-            )));
+            ));
         }
         if upstream_coefficients.iter().any(|value| !value.is_finite()) {
-            return Err(EstimationError::InvalidInput(
-                "Gaussian REML backward coefficient upstream must be finite".to_string(),
-            ));
+            crate::bail_invalid_estim!("Gaussian REML backward coefficient upstream must be finite".to_string(),);
         }
     }
     if let Some(upstream_fitted) = upstream_fitted {
         if upstream_fitted.dim() != y.dim() {
-            return Err(EstimationError::InvalidInput(format!(
+            crate::bail_invalid_estim!(format!(
                 "Gaussian REML backward fitted upstream shape mismatch: expected {}x{}, got {}x{}",
                 y.nrows(),
                 y.ncols(),
                 upstream_fitted.nrows(),
                 upstream_fitted.ncols()
-            )));
+            ));
         }
         if upstream_fitted.iter().any(|value| !value.is_finite()) {
-            return Err(EstimationError::InvalidInput(
-                "Gaussian REML backward fitted upstream must be finite".to_string(),
-            ));
+            crate::bail_invalid_estim!("Gaussian REML backward fitted upstream must be finite".to_string(),);
         }
     }
     validate_gaussian_reml_design(x, penalty, None)?;
@@ -1085,9 +1073,9 @@ fn validate_gaussian_reml_forward_fit(
         || fit.fitted.dim() != (n, d)
         || fit.sigma2.len() != d
     {
-        return Err(EstimationError::InvalidInput(format!(
+        crate::bail_invalid_estim!(format!(
             "Gaussian REML backward forward-state shape mismatch: expected coefficients=({p},{d}), fitted=({n},{d}), sigma2={d}"
-        )));
+        ));
     }
     if !(fit.lambda.is_finite()
         && fit.lambda > 0.0
@@ -1099,22 +1087,16 @@ fn validate_gaussian_reml_forward_fit(
         || fit.fitted.iter().any(|value| !value.is_finite())
         || fit.sigma2.iter().any(|value| !value.is_finite())
     {
-        return Err(EstimationError::InvalidInput(
-            "Gaussian REML backward forward state must be finite".to_string(),
-        ));
+        crate::bail_invalid_estim!("Gaussian REML backward forward state must be finite".to_string(),);
     }
     let penalty_fingerprint = matrix_fingerprint(penalty);
     if fit.cache.penalty_fingerprint != penalty_fingerprint {
-        return Err(EstimationError::InvalidInput(
-            "Gaussian REML backward forward-state penalty mismatch".to_string(),
-        ));
+        crate::bail_invalid_estim!("Gaussian REML backward forward-state penalty mismatch".to_string(),);
     }
     let weight = gaussian_reml_weights(n, weights)?;
     let xtwx = dense_xt_diag_x(x, weight.view());
     if fit.cache.xtwx_fingerprint != matrix_fingerprint(xtwx.view()) {
-        return Err(EstimationError::InvalidInput(
-            "Gaussian REML backward forward-state X'WX mismatch".to_string(),
-        ));
+        crate::bail_invalid_estim!("Gaussian REML backward forward-state X'WX mismatch".to_string(),);
     }
     Ok(())
 }
@@ -1124,9 +1106,9 @@ fn gaussian_reml_inverse_hessian_from_cache(
     lambda: f64,
 ) -> Result<Array2<f64>, EstimationError> {
     if !(lambda.is_finite() && lambda > 0.0) {
-        return Err(EstimationError::InvalidInput(format!(
+        crate::bail_invalid_estim!(format!(
             "Gaussian REML lambda must be finite and positive; got {lambda}"
-        )));
+        ));
     }
     let p = cache.penalty_eigenvalues.len();
     let mut scaled_basis = cache.coefficient_basis.clone();
@@ -1765,28 +1747,24 @@ fn validate_gaussian_reml_design(
     let n = x.nrows();
     let p = x.ncols();
     if penalty.nrows() != p || penalty.ncols() != p {
-        return Err(EstimationError::InvalidInput(format!(
+        crate::bail_invalid_estim!(format!(
             "Gaussian REML penalty shape mismatch: expected {p}x{p}, got {}x{}",
             penalty.nrows(),
             penalty.ncols()
-        )));
+        ));
     }
     if x.iter().chain(penalty.iter()).any(|v| !v.is_finite()) {
-        return Err(EstimationError::InvalidInput(
-            "Gaussian REML inputs must be finite".to_string(),
-        ));
+        crate::bail_invalid_estim!("Gaussian REML inputs must be finite".to_string(),);
     }
     if let Some(w) = weights {
         if w.len() != n {
-            return Err(EstimationError::InvalidInput(format!(
+            crate::bail_invalid_estim!(format!(
                 "Gaussian REML weights length mismatch: expected {n}, got {}",
                 w.len()
-            )));
+            ));
         }
         if w.iter().any(|value| !value.is_finite() || *value < 0.0) {
-            return Err(EstimationError::InvalidInput(
-                "Gaussian REML weights must be finite and non-negative".to_string(),
-            ));
+            crate::bail_invalid_estim!("Gaussian REML weights must be finite and non-negative".to_string(),);
         }
     }
     Ok(())
@@ -1799,15 +1777,13 @@ fn gaussian_reml_weights(
     match weights {
         Some(w) => {
             if w.len() != n {
-                return Err(EstimationError::InvalidInput(format!(
+                crate::bail_invalid_estim!(format!(
                     "Gaussian REML weights length mismatch: expected {n}, got {}",
                     w.len()
-                )));
+                ));
             }
             if w.iter().any(|value| !value.is_finite() || *value < 0.0) {
-                return Err(EstimationError::InvalidInput(
-                    "Gaussian REML weights must be finite and non-negative".to_string(),
-                ));
+                crate::bail_invalid_estim!("Gaussian REML weights must be finite and non-negative".to_string(),);
             }
             Ok(w.to_owned())
         }
@@ -1855,9 +1831,7 @@ fn gaussian_reml_eigen_cache_from_lower_with_transform(
 ) -> Result<GaussianRemlEigenCache, EstimationError> {
     let p = lower.nrows();
     if lower.ncols() != p {
-        return Err(EstimationError::InvalidInput(
-            "Gaussian REML Cholesky factor must be square".to_string(),
-        ));
+        crate::bail_invalid_estim!("Gaussian REML Cholesky factor must be square".to_string(),);
     }
     let penalty_fingerprint = matrix_fingerprint(penalty);
     let logdet_xtwx = 2.0 * lower.diag().iter().map(|v| v.ln()).sum::<f64>();
@@ -1893,9 +1867,9 @@ fn gaussian_reml_eigen_cache_from_lower_with_transform(
             *value = 0.0;
         }
         if *value < 0.0 {
-            return Err(EstimationError::InvalidInput(format!(
+            crate::bail_invalid_estim!(format!(
                 "Gaussian REML penalty is not positive semidefinite; eigenvalue={value:.3e}"
-            )));
+            ));
         }
     }
     let penalty_rank = penalty_eigenvalues
@@ -1906,9 +1880,9 @@ fn gaussian_reml_eigen_cache_from_lower_with_transform(
     if let Some(expected_nullity) = nullspace_dim
         && expected_nullity != nullity
     {
-        return Err(EstimationError::InvalidInput(format!(
+        crate::bail_invalid_estim!(format!(
             "Gaussian REML penalty nullspace mismatch: expected {expected_nullity}, inferred {nullity}"
-        )));
+        ));
     }
     let logdet_penalty_positive = gaussian_penalty_positive_logdet(penalty, penalty_rank)?;
     let coefficient_basis = solve_upper_triangular_matrix(&lower.t().to_owned(), &eigenvectors)?;
@@ -2019,20 +1993,18 @@ fn validate_gaussian_reml_eigen_cache(
         || cache.eigenvectors.dim() != (p, p)
         || cache.coefficient_basis.dim() != (p, p)
     {
-        return Err(EstimationError::InvalidInput(format!(
+        crate::bail_invalid_estim!(format!(
             "Gaussian REML eigen cache dimension mismatch: expected {p} coefficients"
-        )));
+        ));
     }
     if cache.penalty_rank > p || cache.nullity > p || cache.penalty_rank + cache.nullity != p {
-        return Err(EstimationError::InvalidInput(format!(
+        crate::bail_invalid_estim!(format!(
             "Gaussian REML eigen cache rank/nullity mismatch: rank={}, nullity={}, p={p}",
             cache.penalty_rank, cache.nullity
-        )));
+        ));
     }
     if !(cache.logdet_xtwx.is_finite() && cache.logdet_penalty_positive.is_finite()) {
-        return Err(EstimationError::InvalidInput(
-            "Gaussian REML eigen cache log-determinants must be finite".to_string(),
-        ));
+        crate::bail_invalid_estim!("Gaussian REML eigen cache log-determinants must be finite".to_string(),);
     }
     if cache
         .penalty_eigenvalues
@@ -2044,10 +2016,8 @@ fn validate_gaussian_reml_eigen_cache(
             .iter()
             .any(|value| !value.is_finite())
     {
-        return Err(EstimationError::InvalidInput(
-            "Gaussian REML eigen cache entries must be finite with non-negative eigenvalues"
-                .to_string(),
-        ));
+        crate::bail_invalid_estim!("Gaussian REML eigen cache entries must be finite with non-negative eigenvalues"
+                .to_string(),);
     }
     Ok::<(), _>(())
 }
@@ -2069,15 +2039,13 @@ fn prepare_gaussian_reml(
     let d = y.ncols();
     validate_gaussian_reml_design(x, penalty, weights)?;
     if y.nrows() != n {
-        return Err(EstimationError::InvalidInput(format!(
+        crate::bail_invalid_estim!(format!(
             "Gaussian REML row mismatch: X has {n} rows but Y has {}",
             y.nrows()
-        )));
+        ));
     }
     if y.iter().any(|v| !v.is_finite()) {
-        return Err(EstimationError::InvalidInput(
-            "Gaussian REML inputs must be finite".to_string(),
-        ));
+        crate::bail_invalid_estim!("Gaussian REML inputs must be finite".to_string(),);
     }
     let weight = gaussian_reml_weights(n, weights)?;
 
@@ -2095,29 +2063,25 @@ fn prepare_gaussian_reml(
         validate_gaussian_reml_eigen_cache(cache, p)?;
         let xtwx_fingerprint = matrix_fingerprint(xtwx.view());
         if cache.xtwx_fingerprint != xtwx_fingerprint {
-            return Err(EstimationError::InvalidInput(
-                "Gaussian REML eigen cache X'WX mismatch".to_string(),
-            ));
+            crate::bail_invalid_estim!("Gaussian REML eigen cache X'WX mismatch".to_string(),);
         }
         let penalty_fingerprint = matrix_fingerprint(penalty);
         if cache.penalty_fingerprint != penalty_fingerprint {
-            return Err(EstimationError::InvalidInput(
-                "Gaussian REML eigen cache penalty mismatch".to_string(),
-            ));
+            crate::bail_invalid_estim!("Gaussian REML eigen cache penalty mismatch".to_string(),);
         }
         if let Some(expected_nullity) = nullspace_dim
             && expected_nullity != cache.nullity
         {
-            return Err(EstimationError::InvalidInput(format!(
+            crate::bail_invalid_estim!(format!(
                 "Gaussian REML eigen cache nullspace mismatch: expected {expected_nullity}, got {}",
                 cache.nullity
-            )));
+            ));
         }
         if n <= cache.nullity {
-            return Err(EstimationError::InvalidInput(format!(
+            crate::bail_invalid_estim!(format!(
                 "Gaussian REML requires n > nullspace dimension; got n={n}, nullity={}",
                 cache.nullity
-            )));
+            ));
         }
         let projected_rhs = dense_atb(cache.coefficient_basis.view(), xtwy.view());
         let projected_rhs_squared = projected_rhs.mapv(|value| value * value);
@@ -2133,10 +2097,10 @@ fn prepare_gaussian_reml(
 
     let cache = gaussian_reml_eigen_cache_from_xtwx(xtwx, penalty, nullspace_dim)?;
     if n <= cache.nullity {
-        return Err(EstimationError::InvalidInput(format!(
+        crate::bail_invalid_estim!(format!(
             "Gaussian REML requires n > nullspace dimension; got n={n}, nullity={}",
             cache.nullity
-        )));
+        ));
     }
     let projected_rhs = dense_atb(cache.coefficient_basis.view(), xtwy.view());
     let projected_rhs_squared = projected_rhs.mapv(|value| value * value);
@@ -2266,9 +2230,7 @@ fn fill_weighted_rhs_no_alloc(
         .chain(workspace.ywy.iter())
         .any(|value| !value.is_finite())
     {
-        return Err(EstimationError::InvalidInput(
-            "Gaussian REML weighted cross-products must be finite".to_string(),
-        ));
+        crate::bail_invalid_estim!("Gaussian REML weighted cross-products must be finite".to_string(),);
     }
     Ok(())
 }
@@ -2615,9 +2577,7 @@ fn refine_stationary_rho(
 fn invert_lower_triangular(lower: &Array2<f64>) -> Result<Array2<f64>, EstimationError> {
     let n = lower.nrows();
     if lower.ncols() != n {
-        return Err(EstimationError::InvalidInput(
-            "lower-triangular solve requires a square matrix".to_string(),
-        ));
+        crate::bail_invalid_estim!("lower-triangular solve requires a square matrix".to_string(),);
     }
     let eye = Array2::eye(n);
     solve_lower_triangular_matrix(lower, &eye)
@@ -2629,9 +2589,7 @@ fn solve_lower_triangular_matrix(
 ) -> Result<Array2<f64>, EstimationError> {
     let n = lower.nrows();
     if lower.ncols() != n || rhs.nrows() != n {
-        return Err(EstimationError::InvalidInput(
-            "lower-triangular solve dimension mismatch".to_string(),
-        ));
+        crate::bail_invalid_estim!("lower-triangular solve dimension mismatch".to_string(),);
     }
     if let Some(out) = crate::gpu::try_solve_lower_triangular_matrix(lower.view(), rhs.view()) {
         return Ok(out);
@@ -2661,9 +2619,7 @@ fn solve_upper_triangular_matrix(
 ) -> Result<Array2<f64>, EstimationError> {
     let n = upper.nrows();
     if upper.ncols() != n || rhs.nrows() != n {
-        return Err(EstimationError::InvalidInput(
-            "upper-triangular solve dimension mismatch".to_string(),
-        ));
+        crate::bail_invalid_estim!("upper-triangular solve dimension mismatch".to_string(),);
     }
     if let Some(out) = crate::gpu::try_solve_upper_triangular_matrix(upper.view(), rhs.view()) {
         return Ok(out);

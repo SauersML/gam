@@ -361,11 +361,11 @@ impl SparsePenalizedSystemCache {
         precomputed_xtwx: Option<&SparseXtwxPrecomputed>,
     ) -> Result<SparseColMat<usize, f64>, EstimationError> {
         if weights.len() != self.xtwx_cache.nrows {
-            return Err(EstimationError::InvalidInput(format!(
+            crate::bail_invalid_estim!(format!(
                 "weights length {} does not match design rows {}",
                 weights.len(),
                 self.xtwx_cache.nrows
-            )));
+            ));
         }
         // Gaussian-Identity fast path: when the caller has pre-built the
         // `XᵀWX` numerical values (weights are constant across the outer
@@ -417,9 +417,7 @@ impl SparsePenalizedSystemCache {
                     if *cursor_idx >= self.h_upper_col_ptr[col + 1]
                         || self.h_upperrow_idx[*cursor_idx] != row
                     {
-                        return Err(EstimationError::InvalidInput(
-                            "penalized symbolic pattern missing XtWX entry".to_string(),
-                        ));
+                        crate::bail_invalid_estim!("penalized symbolic pattern missing XtWX entry".to_string(),);
                     }
                     self.h_uppervalues[*cursor_idx] += self.xtwx_cache.xtwxvalues[idx];
                 }
@@ -437,9 +435,7 @@ impl SparsePenalizedSystemCache {
             if *cursor_idx >= self.h_upper_col_ptr[col + 1]
                 || self.h_upperrow_idx[*cursor_idx] != row
             {
-                return Err(EstimationError::InvalidInput(
-                    "penalized symbolic pattern missing penalty entry".to_string(),
-                ));
+                crate::bail_invalid_estim!("penalized symbolic pattern missing penalty entry".to_string(),);
             }
             self.h_uppervalues[*cursor_idx] += value;
         }
@@ -456,9 +452,7 @@ impl SparsePenalizedSystemCache {
                 if *cursor_idx >= self.h_upper_col_ptr[col + 1]
                     || self.h_upperrow_idx[*cursor_idx] != col
                 {
-                    return Err(EstimationError::InvalidInput(
-                        "penalized symbolic pattern missing diagonal entry".to_string(),
-                    ));
+                    crate::bail_invalid_estim!("penalized symbolic pattern missing diagonal entry".to_string(),);
                 }
                 self.h_uppervalues[*cursor_idx] += ridge;
             }
@@ -490,9 +484,7 @@ fn build_penalized_symbolic(
     }
     for &(row, col, _) in penalty_triplets {
         if row > col || col >= p {
-            return Err(EstimationError::InvalidInput(
-                "penalty sparse pattern must be upper-triangular within bounds".to_string(),
-            ));
+            crate::bail_invalid_estim!("penalty sparse pattern must be upper-triangular within bounds".to_string(),);
         }
         cols[col].insert(row);
     }
@@ -740,10 +732,8 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
             }
             (ResponseFamily::Binomial, link, false) => {
                 if matches!(link, InverseLink::Mixture(_)) {
-                    return Err(EstimationError::InvalidInput(
-                        "BinomialMixture IRLS update requires explicit mixture link state"
-                            .to_string(),
-                    ));
+                    crate::bail_invalid_estim!("BinomialMixture IRLS update requires explicit mixture link state"
+                            .to_string(),);
                 }
                 update_glmvectors(
                     y,
@@ -779,10 +769,10 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
                 // the default profiled case.
                 if let Some(phi) = self.scale.fixed_phi() {
                     if !(phi.is_finite() && phi > 0.0) {
-                        return Err(EstimationError::InvalidInput(format!(
+                        crate::bail_invalid_estim!(format!(
                             "Gaussian fixed dispersion phi must be finite and positive (got {})",
                             phi
-                        )));
+                        ));
                     }
                     if phi != 1.0 {
                         let inv_phi = 1.0 / phi;
@@ -2083,9 +2073,7 @@ impl<'a> GamWorkingModel<'a> {
             )
         })?;
         let PirlsPenalty::Dense { s_transformed, .. } = &self.penalty else {
-            return Err(EstimationError::InvalidInput(
-                "sparse-native PIRLS requires a dense transformed penalty matrix".to_string(),
-            ));
+            crate::bail_invalid_estim!("sparse-native PIRLS requires a dense transformed penalty matrix".to_string(),);
         };
         self.workspace.assemble_sparse_penalized_hessian(
             x_sparse,
@@ -2740,11 +2728,11 @@ impl SparseXtWxCache {
         weights: &Array1<f64>,
     ) -> Result<(), EstimationError> {
         if weights.len() != self.nrows {
-            return Err(EstimationError::InvalidInput(format!(
+            crate::bail_invalid_estim!(format!(
                 "weights length {} does not match design rows {}",
                 weights.len(),
                 self.nrows
-            )));
+            ));
         }
 
         match &mut self.backend {
@@ -3003,9 +2991,7 @@ fn compute_jeffreys_pirls_diagnostics_sparse(
         let vals = xview.val_of_row(i);
         let cols = xview.col_idx_of_row_raw(i);
         if cols.len() != vals.len() {
-            return Err(EstimationError::InvalidInput(
-                "sparse row structure mismatch: column/value lengths differ".to_string(),
-            ));
+            crate::bail_invalid_estim!("sparse row structure mismatch: column/value lengths differ".to_string(),);
         }
         for (idx, &col) in cols.iter().enumerate() {
             x_dense[[i, col.unbound()]] = vals[idx];
@@ -3220,29 +3206,29 @@ where
 {
     let p = gradient.len();
     if xtwx_diag.len() != p {
-        return Err(EstimationError::InvalidInput(format!(
+        crate::bail_invalid_estim!(format!(
             "solve_newton_direction_implicit: xtwx_diag length {} != gradient length {}",
             xtwx_diag.len(),
             p
-        )));
+        ));
     }
     for (_, s) in dense_penalties.iter() {
         if s.nrows() != p || s.ncols() != p {
-            return Err(EstimationError::InvalidInput(format!(
+            crate::bail_invalid_estim!(format!(
                 "solve_newton_direction_implicit: dense penalty dim {}×{} != p={}",
                 s.nrows(),
                 s.ncols(),
                 p
-            )));
+            ));
         }
     }
     for (_, op) in op_penalties.iter() {
         if op.dim() != p {
-            return Err(EstimationError::InvalidInput(format!(
+            crate::bail_invalid_estim!(format!(
                 "solve_newton_direction_implicit: op penalty dim {} != p={}",
                 op.dim(),
                 p
-            )));
+            ));
         }
     }
     if direction_out.len() != p {
@@ -3968,12 +3954,12 @@ pub(crate) fn solve_newton_directionwith_lower_bounds(
     // strictly convex box QPs.
     let p = gradient.len();
     if lower_bounds.len() != p || beta.len() != p {
-        return Err(EstimationError::InvalidInput(format!(
+        crate::bail_invalid_estim!(format!(
             "lower-bound size mismatch: beta={}, gradient={}, bounds={}",
             beta.len(),
             gradient.len(),
             lower_bounds.len()
-        )));
+        ));
     }
     if direction_out.len() != p {
         *direction_out = Array1::zeros(p);
@@ -5109,10 +5095,10 @@ where
                                         ) {
                                             Ok(value) => value,
                                             Err(e) => {
-                                                return Err(EstimationError::InvalidInput(format!(
+                                                crate::bail_invalid_estim!(format!(
                                                     "arrow-Schur predicted reduction failed at iter {iter} \
                                                      (loop_lambda={loop_lambda:.3e}): {e}"
-                                                )));
+                                                ));
                                             }
                                         };
                                     // Apply the latent half of the joint
@@ -5179,9 +5165,9 @@ where
                     "PIRLS produced non-finite step direction"
                 };
                 restore_pending_arrow_latent_if_needed(options, &mut pending_arrow_latent_restore);
-                return Err(EstimationError::InvalidInput(format!(
+                crate::bail_invalid_estim!(format!(
                     "{detail} at iteration {iter} with damping λ={loop_lambda:.3e}"
-                )));
+                ));
             }
 
             // Transtrum-Sethna geodesic-acceleration second-order correction.
@@ -7838,9 +7824,7 @@ fn solve_penalized_least_squares_implicit(
         && let Some(x_sparse) = x_original.as_sparse()
     {
         let PirlsPenalty::Dense { s_transformed, .. } = penalty else {
-            return Err(EstimationError::InvalidInput(
-                "sparse-native PIRLS requires a dense transformed penalty matrix".to_string(),
-            ));
+            crate::bail_invalid_estim!("sparse-native PIRLS requires a dense transformed penalty matrix".to_string(),);
         };
         let weights_owned = weights.to_owned();
 
@@ -8563,9 +8547,9 @@ fn validate_count_responses(
 ) -> Result<(), EstimationError> {
     for (i, (&yi, &wi)) in y.iter().zip(priorweights.iter()).enumerate() {
         if wi > 0.0 && !valid_count_response(yi) {
-            return Err(EstimationError::InvalidInput(format!(
+            crate::bail_invalid_estim!(format!(
                 "{family} response must be a finite non-negative integer at positive-weight row {i}; got {yi}"
-            )));
+            ));
         }
     }
     Ok(())
@@ -8587,9 +8571,9 @@ fn validate_beta_responses(
 ) -> Result<(), EstimationError> {
     for (i, (&yi, &wi)) in y.iter().zip(priorweights.iter()).enumerate() {
         if wi > 0.0 && !valid_beta_response(yi) {
-            return Err(EstimationError::InvalidInput(format!(
+            crate::bail_invalid_estim!(format!(
                 "beta-regression response must be finite and strictly inside (0, 1) at positive-weight row {i}; got {yi}"
-            )));
+            ));
         }
     }
     Ok(())
@@ -8606,9 +8590,9 @@ fn validate_tweedie_responses(
 ) -> Result<(), EstimationError> {
     for (i, (&yi, &wi)) in y.iter().zip(priorweights.iter()).enumerate() {
         if wi > 0.0 && !valid_tweedie_response(yi) {
-            return Err(EstimationError::InvalidInput(format!(
+            crate::bail_invalid_estim!(format!(
                 "Tweedie response must be finite and non-negative at positive-weight row {i}; got {yi}"
-            )));
+            ));
         }
     }
     Ok(())
@@ -8717,14 +8701,14 @@ fn write_tweedie_log_working_state(
     const MIN_MU: f64 = 1e-10;
     const MIN_WEIGHT: f64 = 1e-12;
     if !is_valid_tweedie_power(p) {
-        return Err(EstimationError::InvalidInput(format!(
+        crate::bail_invalid_estim!(format!(
             "Tweedie variance power must be finite and strictly between 1 and 2; got {p}"
-        )));
+        ));
     }
     if !(phi.is_finite() && phi > 0.0) {
-        return Err(EstimationError::InvalidInput(format!(
+        crate::bail_invalid_estim!(format!(
             "Tweedie dispersion phi must be finite and > 0; got {phi}"
-        )));
+        ));
     }
     validate_tweedie_responses(&y, &priorweights)?;
     let exponent = 2.0 - p;
@@ -8838,9 +8822,9 @@ fn write_negative_binomial_log_working_state(
     const MIN_MU: f64 = 1e-10;
     const MIN_WEIGHT: f64 = 1e-12;
     if !valid_negbin_theta(theta) {
-        return Err(EstimationError::InvalidInput(format!(
+        crate::bail_invalid_estim!(format!(
             "negative-binomial theta must be finite and > 0; got {theta}"
-        )));
+        ));
     }
     validate_count_responses(&y, &priorweights, "negative-binomial")?;
     if let Some(derivs) = derivatives {
@@ -8945,9 +8929,9 @@ fn write_beta_logit_working_state(
 ) -> Result<(), EstimationError> {
     const MIN_WEIGHT: f64 = 1e-12;
     if !valid_beta_phi(phi) {
-        return Err(EstimationError::InvalidInput(format!(
+        crate::bail_invalid_estim!(format!(
             "beta-regression phi must be finite and > 0; got {phi}"
-        )));
+        ));
     }
     validate_beta_responses(&y, &priorweights)?;
     if let Some(derivs) = derivatives {
@@ -9422,10 +9406,10 @@ pub fn update_glmvectors_integrated_for_link(
             | InverseLink::BetaLogistic(_)
             | InverseLink::Mixture(_)
     ) {
-        return Err(EstimationError::InvalidInput(format!(
+        crate::bail_invalid_estim!(format!(
             "Integrated link-runtime update is not supported for inverse link {:?}",
             inverse_link
-        )));
+        ));
     }
     if let Some(derivs) = derivatives {
         let mu_s = mu.as_slice_mut().expect("mu must be contiguous");
@@ -9693,16 +9677,16 @@ pub(crate) fn computeworkingweight_derivatives_from_eta(
             let p = *p;
             const MIN_WEIGHT: f64 = 1e-12;
             if !is_valid_tweedie_power(p) {
-                return Err(EstimationError::InvalidInput(format!(
+                crate::bail_invalid_estim!(format!(
                     "Tweedie variance power must be finite and strictly between 1 and 2; got {p}"
-                )));
+                ));
             }
             let exponent = 2.0 - p;
             let phi = fixed_glm_dispersion(likelihood);
             if !(phi.is_finite() && phi > 0.0) {
-                return Err(EstimationError::InvalidInput(format!(
+                crate::bail_invalid_estim!(format!(
                     "Tweedie dispersion phi must be finite and > 0; got {phi}"
-                )));
+                ));
             }
             let c_s = c.as_slice_mut().expect("c must be contiguous");
             let d_s = d.as_slice_mut().expect("d must be contiguous");
@@ -9754,9 +9738,9 @@ pub(crate) fn computeworkingweight_derivatives_from_eta(
             let theta = *theta;
             const MIN_WEIGHT: f64 = 1e-12;
             if !valid_negbin_theta(theta) {
-                return Err(EstimationError::InvalidInput(format!(
+                crate::bail_invalid_estim!(format!(
                     "negative-binomial theta must be finite and > 0; got {theta}"
-                )));
+                ));
             }
             let c_s = c.as_slice_mut().expect("c must be contiguous");
             let d_s = d.as_slice_mut().expect("d must be contiguous");
@@ -9806,9 +9790,9 @@ pub(crate) fn computeworkingweight_derivatives_from_eta(
             let phi = *phi;
             const MIN_WEIGHT: f64 = 1e-12;
             if !valid_beta_phi(phi) {
-                return Err(EstimationError::InvalidInput(format!(
+                crate::bail_invalid_estim!(format!(
                     "beta-regression phi must be finite and > 0; got {phi}"
-                )));
+                ));
             }
             let c_s = c.as_slice_mut().expect("c must be contiguous");
             let d_s = d.as_slice_mut().expect("d must be contiguous");
@@ -9960,9 +9944,7 @@ pub(crate) fn computeworkingweight_derivatives_from_eta(
                 )?;
         }
         ResponseFamily::RoystonParmar => {
-            return Err(EstimationError::InvalidInput(
-                "RoystonParmar is survival-specific and not a GLM IRLS family".to_string(),
-            ));
+            crate::bail_invalid_estim!("RoystonParmar is survival-specific and not a GLM IRLS family".to_string(),);
         }
     }
     Ok((c, d, dmu_deta, d2mu_deta2, d3mu_deta3))
@@ -10389,14 +10371,14 @@ fn compute_observed_hessian_curvature_arrays_into(
             );
             let fisher_weight = fisher_weights[i].max(0.0);
             if !(w_obs.is_finite() && w_obs > 0.0) {
-                return Err(EstimationError::InvalidInput(format!(
+                crate::bail_invalid_estim!(format!(
                     "observed Hessian curvature is not positive finite at row {i}: observed={w_obs}, fisher={fisher_weight}"
-                )));
+                ));
             }
             if !c_obs.is_finite() || !d_obs.is_finite() {
-                return Err(EstimationError::InvalidInput(format!(
+                crate::bail_invalid_estim!(format!(
                     "observed Hessian curvature derivatives are non-finite at row {i}: c={c_obs}, d={d_obs}"
-                )));
+                ));
             }
             *w_out = w_obs;
             *c_out = c_obs;
@@ -11535,21 +11517,19 @@ pub fn dense_block_xtwx(
     let k = design.ncols();
     let shape = fisher_blocks.shape();
     if shape.len() != 3 || shape[0] != n || shape[1] != shape[2] {
-        return Err(EstimationError::InvalidInput(format!(
+        crate::bail_invalid_estim!(format!(
             "dense block Fisher shape mismatch: expected ({n}, p, p), got {shape:?}"
-        )));
+        ));
     }
     if let Some(w) = row_weights.as_ref() {
         if w.len() != n {
-            return Err(EstimationError::InvalidInput(format!(
+            crate::bail_invalid_estim!(format!(
                 "dense block row weight length mismatch: expected {n}, got {}",
                 w.len()
-            )));
+            ));
         }
         if w.iter().any(|v| !v.is_finite() || *v < 0.0) {
-            return Err(EstimationError::InvalidInput(
-                "dense block row weights must be finite and non-negative".to_string(),
-            ));
+            crate::bail_invalid_estim!("dense block row weights must be finite and non-negative".to_string(),);
         }
     }
     let p_out = shape[1];
@@ -11561,9 +11541,9 @@ pub fn dense_block_xtwx(
             for b in 0..p_out {
                 let wab = rw * fisher_blocks[[row, a, b]];
                 if !wab.is_finite() {
-                    return Err(EstimationError::InvalidInput(format!(
+                    crate::bail_invalid_estim!(format!(
                         "dense block Fisher entry ({row},{a},{b}) is not finite"
-                    )));
+                    ));
                 }
                 if wab == 0.0 {
                     continue;
@@ -11605,25 +11585,25 @@ pub fn dense_block_xtwy(
     let k = design.ncols();
     let shape = fisher_blocks.shape();
     if shape.len() != 3 || shape[0] != n || shape[1] != shape[2] {
-        return Err(EstimationError::InvalidInput(format!(
+        crate::bail_invalid_estim!(format!(
             "dense block Fisher shape mismatch: expected ({n}, p, p), got {shape:?}"
-        )));
+        ));
     }
     let p_out = shape[1];
     if response.dim() != (n, p_out) {
-        return Err(EstimationError::InvalidInput(format!(
+        crate::bail_invalid_estim!(format!(
             "dense block response shape mismatch: expected ({n}, {p_out}), got {}x{}",
             response.nrows(),
             response.ncols()
-        )));
+        ));
     }
     if let Some(w) = row_weights.as_ref()
         && w.len() != n
     {
-        return Err(EstimationError::InvalidInput(format!(
+        crate::bail_invalid_estim!(format!(
             "dense block row weight length mismatch: expected {n}, got {}",
             w.len()
-        )));
+        ));
     }
     let mut out = Array1::<f64>::zeros(k * p_out);
     for row in 0..n {
@@ -11633,9 +11613,9 @@ pub fn dense_block_xtwy(
             for b in 0..p_out {
                 let wab = rw * fisher_blocks[[row, a, b]];
                 if !wab.is_finite() {
-                    return Err(EstimationError::InvalidInput(format!(
+                    crate::bail_invalid_estim!(format!(
                         "dense block Fisher entry ({row},{a},{b}) is not finite"
-                    )));
+                    ));
                 }
                 wy += wab * response[[row, b]];
             }

@@ -1239,23 +1239,15 @@ impl TransformationNormalFamily {
     fn with_outer_subsample(&self, mask: &Array1<f64>) -> Result<Self, TransformationNormalError> {
         let n = self.weights.len();
         if mask.len() != n {
-            return Err(TransformationNormalError::InvalidInput {
-                reason: format!(
-                    "outer-score subsample mask length {} != n={}",
+            crate::bail_invalid_tnorm!("outer-score subsample mask length {} != n={}",
                     mask.len(),
-                    n
-                ),
-            });
+                    n);
         }
         let mut effective = Array1::<f64>::zeros(n);
         for i in 0..n {
             let m = mask[i];
             if !m.is_finite() || m < 0.0 {
-                return Err(TransformationNormalError::InvalidInput {
-                    reason: format!(
-                        "outer-score subsample mask[{i}] = {m} is invalid (must be finite and >= 0)"
-                    ),
-                });
+                crate::bail_invalid_tnorm!("outer-score subsample mask[{i}] = {m} is invalid (must be finite and >= 0)");
             }
             effective[i] = self.weights[i] * m;
         }

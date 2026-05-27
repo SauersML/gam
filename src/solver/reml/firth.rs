@@ -479,28 +479,28 @@ impl FirthDenseOperator {
         // the same η-derivatives of the family Fisher weights w(η), w'(η), ....
         let n = x_dense.nrows();
         if eta.len() != n {
-            return Err(EstimationError::InvalidInput(format!(
+            crate::bail_invalid_estim!(format!(
                 "Firth operator shape mismatch: nrows={}, eta_len={}",
                 n,
                 eta.len()
-            )));
+            ));
         }
         let observation_weight_sqrt = if let Some(weights) = observation_weights {
             if weights.len() != n {
-                return Err(EstimationError::InvalidInput(format!(
+                crate::bail_invalid_estim!(format!(
                     "Firth operator observation weight length {} != number of rows {}",
                     weights.len(),
                     n
-                )));
+                ));
             }
             let mut sqrt = Array1::<f64>::zeros(n);
             for i in 0..n {
                 let weight = weights[i];
                 if !weight.is_finite() || weight < 0.0 {
-                    return Err(EstimationError::InvalidInput(format!(
+                    crate::bail_invalid_estim!(format!(
                         "Firth operator requires finite nonnegative observation weights, got {} at row {}",
                         weight, i
-                    )));
+                    ));
                 }
                 sqrt[i] = weight.sqrt();
             }
