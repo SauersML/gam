@@ -90,7 +90,7 @@ use super::error::GpuError;
 use std::sync::Arc;
 
 #[cfg(target_os = "linux")]
-use cudarc::driver::{CudaContext, CudaModule, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
+use cudarc::driver::{CudaModule, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
 
 /// Hard ceiling on `r` (= 2 + p_h + p_w). Matches the shared-memory budget
 /// argument in the module docstring: with `MAX_R = 32` the per-block shared
@@ -850,7 +850,6 @@ pub(crate) fn s_f_diagnostic_finite(inputs: &BmsFlexRowKernelInputs<'_>) -> bool
 
 #[cfg(target_os = "linux")]
 struct RowKernelBackend {
-    ctx: Arc<CudaContext>,
     stream: Arc<CudaStream>,
     module: Arc<CudaModule>,
 }
@@ -889,11 +888,7 @@ impl RowKernelBackend {
                 // downstream HVP / diagonal launches without re-probing the
                 // runtime. cudarc's `Arc<CudaModule>` does not expose a
                 // public `ctx()` accessor.
-                Ok(RowKernelBackend {
-                    ctx,
-                    stream,
-                    module,
-                })
+                Ok(RowKernelBackend { stream, module })
             })
             .as_ref()
             .map_err(GpuError::clone)
@@ -1209,34 +1204,10 @@ pub(crate) const HVP_THREADS: u32 = 128;
 pub(crate) enum RowHessianLayout {
     /// Dense `[n, r, r]` row-major. Element `(u, v)` is `hess[i*r*r + u*r + v]`.
     FullRowMajor,
-    /// Per-row upper-triangle packed: per row `i`, the `r*(r+1)/2` distinct
-    /// entries `(u, v)` with `u <= v` are laid out row-major over `u`, then
-    /// `v` from `u` to `r - 1`. Index of `(u, v)` with `u <= v`:
-    ///     `i * r*(r+1)/2 + u*(2r - u - 1)/2 + (v - u)`.
-    /// For `v < u`, the reader swaps `u` and `v` (symmetry).
-    SymmetricPackedUpper,
 }
 
 #[cfg(target_os = "linux")]
-impl RowHessianLayout {
-    /// Per-row entry count for this layout. `FullRowMajor` lays out the full
-    /// `r × r` row Hessian (`r²` doubles); `SymmetricPackedUpper` packs only
-    /// the upper triangle (`r·(r+1)/2` doubles). Used by `repack_upper` and
-    /// the HVP / diagonal allocators to stay in sync with the kernel-side
-    /// indexing.
-    #[inline]
-    pub(crate) fn per_row_doubles(self, r: usize) -> usize {
-        match self {
-            RowHessianLayout::FullRowMajor => r * r,
-            RowHessianLayout::SymmetricPackedUpper => r * (r + 1) / 2,
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-pub(crate) struct DeviceResidentRowHess {
-    pub(crate) ctx: Arc<CudaContext>,
-    pub(crate) stream: Arc<CudaStream>,
+pub struct DeviceResidentRowHess {
     pub(crate) hess: CudaSlice<f64>,
     pub(crate) marginal_design: CudaSlice<f64>,
     pub(crate) logslope_design: CudaSlice<f64>,
@@ -1832,7 +1803,6 @@ extern "C" __global__ void bms_flex_row_diag_partial_packed(
 struct HvpKernelBackend {
     stream: Arc<CudaStream>,
     module: Arc<CudaModule>,
-    ctx: Arc<CudaContext>,
 }
 
 #[cfg(target_os = "linux")]
@@ -1864,11 +1834,7 @@ impl HvpKernelBackend {
                     .map_err(|err| GpuError::DriverCallFailed {
                         reason: format!("bms_flex_row hvp module load failed: {err}"),
                     })?;
-                Ok(HvpKernelBackend {
-                    stream,
-                    module,
-                    ctx,
-                })
+                Ok(HvpKernelBackend { stream, module })
             })
             .as_ref()
             .map_err(GpuError::clone)
@@ -2123,15 +2089,12 @@ pub(crate) fn launch_bms_flex_row_kernel_device_resident(
     drop(d_tau);
     drop(d_ruv);
 
-    let ctx = backend.ctx.clone();
     let bytes = ((n * r * r + marginal_design_row_major.len() + logslope_design_row_major.len())
         * std::mem::size_of::<f64>()) as u64;
     Ok((
         neglog,
         grad,
         DeviceResidentRowHess {
-            ctx,
-            stream,
             hess: d_hess,
             marginal_design: d_marginal,
             logslope_design: d_logslope,
@@ -2147,83 +2110,6 @@ pub(crate) fn launch_bms_flex_row_kernel_device_resident(
     ))
 }
 
-/// Convert `storage.hess` from `FullRowMajor` to `SymmetricPackedUpper` in
-/// place: allocates a fresh packed slab of `n * r*(r+1)/2` doubles, launches
-/// `bms_flex_row_pack_upper` to copy the upper-triangle entries, releases
-/// the old dense slab, and updates `storage.layout` + `storage.bytes`. The
-/// numerics are bit-equal (each upper-triangle entry is copied once with no
-/// arithmetic), so callers can swap and re-run HVPs without re-validating
-/// parity.
-///
-/// Returns `Ok(())` if `storage.layout` was already `SymmetricPackedUpper`
-/// — idempotent. Errors out cleanly on alloc / launch / sync failures.
-#[cfg(target_os = "linux")]
-fn repack_upper(storage: &mut DeviceResidentRowHess) -> Result<(), GpuError> {
-    if storage.layout == RowHessianLayout::SymmetricPackedUpper {
-        return Ok(());
-    }
-    let backend = HvpKernelBackend::probe()?;
-    let stream = backend.stream.clone();
-    let n = storage.n;
-    let r = storage.r;
-    let per_row_dense = RowHessianLayout::FullRowMajor.per_row_doubles(r);
-    let per_row_packed = RowHessianLayout::SymmetricPackedUpper.per_row_doubles(r);
-    let total_packed = n * per_row_packed;
-
-    let mut d_packed =
-        stream
-            .alloc_zeros::<f64>(total_packed)
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("bms_flex_row repack_upper alloc: {err}"),
-            })?;
-
-    let func = backend
-        .module
-        .load_function("bms_flex_row_pack_upper")
-        .map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("bms_flex_row repack_upper load_function: {err}"),
-        })?;
-    let n_i32 = i32::try_from(n).map_err(|_| GpuError::DriverCallFailed {
-        reason: format!("repack_upper: n_rows={n} exceeds i32 range"),
-    })?;
-    let r_i32 = i32::try_from(r).map_err(|_| GpuError::DriverCallFailed {
-        reason: format!("repack_upper: r={r} exceeds i32 range"),
-    })?;
-    // One CTA per row, blockDim.x = 32 (cap MAX_R).
-    let block_threads: u32 = 32;
-    let cfg = LaunchConfig {
-        grid_dim: (n as u32, 1, 1),
-        block_dim: (block_threads, 1, 1),
-        shared_mem_bytes: 0,
-    };
-    let mut builder = stream.launch_builder(&func);
-    builder
-        .arg(&n_i32)
-        .arg(&r_i32)
-        .arg(&storage.hess)
-        .arg(&mut d_packed);
-    // SAFETY: `storage.hess` capacity = n * r * r doubles (established at
-    // build time); `d_packed` was just allocated with n * r*(r+1)/2 doubles;
-    // both scalars fit i32; one CTA per row covers all n rows.
-    unsafe { builder.launch(cfg) }.map_err(|err| GpuError::DriverCallFailed {
-        reason: format!("bms_flex_row repack_upper launch: {err}"),
-    })?;
-    stream
-        .synchronize()
-        .map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("bms_flex_row repack_upper synchronize: {err}"),
-        })?;
-
-    // Swap in the packed slab; the old dense `storage.hess` is freed when
-    // it drops at the end of this function.
-    let old_dense = std::mem::replace(&mut storage.hess, d_packed);
-    drop(old_dense);
-    let bytes_delta = ((per_row_dense - per_row_packed) * n * std::mem::size_of::<f64>()) as i64;
-    let new_bytes = (storage.bytes as i64).saturating_sub(bytes_delta).max(0) as u64;
-    storage.bytes = new_bytes;
-    storage.layout = RowHessianLayout::SymmetricPackedUpper;
-    Ok(())
-}
 
 /// Device-output HVP. Runs `bms_flex_row_hvp_partial(_packed)` +
 /// `bms_flex_row_hvp_reduce` on the storage's stream against caller-supplied
@@ -2272,10 +2158,7 @@ pub(crate) fn launch_bms_flex_row_hvp_into_device(
             reason: format!("bms_flex_row hvp_into_device alloc partial: {err}"),
         })?;
 
-    let partial_kernel_name = match storage.layout {
-        RowHessianLayout::FullRowMajor => "bms_flex_row_hvp_partial",
-        RowHessianLayout::SymmetricPackedUpper => "bms_flex_row_hvp_partial_packed",
-    };
+    let partial_kernel_name = "bms_flex_row_hvp_partial";
     let part_func = backend
         .module
         .load_function(partial_kernel_name)
@@ -2427,10 +2310,7 @@ pub(crate) fn launch_bms_flex_row_hvp(
                 reason: format!("bms_flex_row hvp alloc out: {err}"),
             })?;
 
-    let partial_kernel_name = match storage.layout {
-        RowHessianLayout::FullRowMajor => "bms_flex_row_hvp_partial",
-        RowHessianLayout::SymmetricPackedUpper => "bms_flex_row_hvp_partial_packed",
-    };
+    let partial_kernel_name = "bms_flex_row_hvp_partial";
     let part_func = backend
         .module
         .load_function(partial_kernel_name)
@@ -2575,10 +2455,7 @@ pub(crate) fn launch_bms_flex_row_diagonal(
             .map_err(|err| GpuError::DriverCallFailed {
                 reason: format!("bms_flex_row diag alloc out: {err}"),
             })?;
-    let diag_kernel_name = match storage.layout {
-        RowHessianLayout::FullRowMajor => "bms_flex_row_diag_partial",
-        RowHessianLayout::SymmetricPackedUpper => "bms_flex_row_diag_partial_packed",
-    };
+    let diag_kernel_name = "bms_flex_row_diag_partial";
     let part_func = backend
         .module
         .load_function(diag_kernel_name)
@@ -4109,8 +3986,6 @@ mod tests {
                 }
             };
             let storage = DeviceResidentRowHess {
-                ctx: backend.ctx.clone(),
-                stream: stream.clone(),
                 hess: d_h,
                 marginal_design: d_m,
                 logslope_design: d_g,
@@ -4305,8 +4180,6 @@ mod tests {
                 }
             };
             let storage = DeviceResidentRowHess {
-                ctx: backend.ctx.clone(),
-                stream: stream.clone(),
                 hess: d_h,
                 marginal_design: d_m,
                 logslope_design: d_g,
@@ -4342,406 +4215,6 @@ mod tests {
         }
     }
 
-    /// Block 9 Phase 4 — `SymmetricPackedUpper` parity gate at the same
-    /// `n=64, r=20, p_total=44` shape as the Phase 2 charter gate. Verifies
-    /// that the packed-aware HVP + diag kernels produce bit-equal output
-    /// against the CPU oracle (same tolerance), proving the packed reads
-    /// reconstruct the symmetric `H_i` correctly.
-    #[test]
-    fn bms_flex_row_packed_hvp_kernel_matches_cpu_oracle_at_n64_r20_p44() {
-        #[cfg(not(target_os = "linux"))]
-        {
-            eprintln!(
-                "[bms_flex_row packed parity n64_r20_p44] non-Linux host — \
-                 skipping CUDA parity"
-            );
-        }
-        #[cfg(target_os = "linux")]
-        {
-            let Some(_runtime) = crate::gpu::runtime::GpuRuntime::global() else {
-                eprintln!(
-                    "[bms_flex_row packed parity n64_r20_p44] no CUDA runtime \
-                     — skipping device parity"
-                );
-                return;
-            };
-            let n = 64_usize;
-            let p_m = 14_usize;
-            let p_g = 12_usize;
-            let p_h_dim = 10_usize;
-            let p_w_dim = 8_usize;
-            let r = 2 + p_h_dim + p_w_dim;
-            let p_total = p_m + p_g + p_h_dim + p_w_dim;
-            assert_eq!(r, 20);
-            assert_eq!(p_total, 44);
-            let block = BmsFlexBlockLayout {
-                p_m,
-                p_g,
-                h: Some(p_m + p_g..p_m + p_g + p_h_dim),
-                w: Some(p_m + p_g + p_h_dim..p_m + p_g + p_h_dim + p_w_dim),
-                p_total,
-            };
-            let primary = BmsFlexPrimaryLayout {
-                h: Some(2..2 + p_h_dim),
-                w: Some(2 + p_h_dim..2 + p_h_dim + p_w_dim),
-                r,
-            };
-
-            // Same deterministic symmetric per-row Hessians + designs as the
-            // Phase-2 gate above — so any regression of the packed path shows
-            // up at the same fixture.
-            let mut row_hessians = vec![0.0_f64; n * r * r];
-            for row in 0..n {
-                let base = row * r * r;
-                for u in 0..r {
-                    for v in 0..r {
-                        let seed = (row as f64) * 0.137 + (u as f64) * 1.901 + (v as f64) * 0.317;
-                        let a = (seed.sin() * 1.7 + (seed * 0.5).cos() * 0.9) * 0.5;
-                        row_hessians[base + u * r + v] = a;
-                    }
-                }
-                for u in 0..r {
-                    for v in (u + 1)..r {
-                        let upper = row_hessians[base + u * r + v];
-                        let lower = row_hessians[base + v * r + u];
-                        let sym = 0.5 * (upper + lower);
-                        row_hessians[base + u * r + v] = sym;
-                        row_hessians[base + v * r + u] = sym;
-                    }
-                    row_hessians[base + u * r + u] += r as f64;
-                }
-            }
-            let mut marginal = vec![0.0_f64; n * p_m];
-            for row in 0..n {
-                for j in 0..p_m {
-                    let seed = (row as f64) * 0.073 + (j as f64) * 0.211 + 0.4;
-                    marginal[row * p_m + j] = seed.sin() * 0.8 - (seed * 0.7).cos() * 0.3;
-                }
-            }
-            let mut logslope = vec![0.0_f64; n * p_g];
-            for row in 0..n {
-                for j in 0..p_g {
-                    let seed = (row as f64) * 0.091 + (j as f64) * 0.179 - 0.2;
-                    logslope[row * p_g + j] = seed.cos() * 0.7 + (seed * 0.3).sin() * 0.25;
-                }
-            }
-            let v: Vec<f64> = (0..p_total)
-                .map(|i| {
-                    let seed = (i as f64) * 0.157 + 0.6;
-                    seed.sin() * 0.55 + (seed * 0.4).cos() * 0.35
-                })
-                .collect();
-
-            let cpu_hvp = cpu_oracle_bms_flex_row_hvp(
-                &row_hessians,
-                &marginal,
-                &logslope,
-                &block,
-                &primary,
-                n,
-                &v,
-            );
-            let cpu_diag = cpu_oracle_bms_flex_row_diagonal(
-                &row_hessians,
-                &marginal,
-                &logslope,
-                &block,
-                &primary,
-                n,
-            );
-
-            let backend = match HvpKernelBackend::probe() {
-                Ok(b) => b,
-                Err(err) => {
-                    eprintln!(
-                        "[bms_flex_row packed parity n64_r20_p44] backend probe \
-                         failed: {err}"
-                    );
-                    return;
-                }
-            };
-            let stream = backend.stream.clone();
-            let d_h = match stream.clone_htod(&row_hessians) {
-                Ok(s) => s,
-                Err(err) => {
-                    eprintln!(
-                        "[bms_flex_row packed parity n64_r20_p44] upload h \
-                         failed: {err}"
-                    );
-                    return;
-                }
-            };
-            let d_m = match stream.clone_htod(&marginal) {
-                Ok(s) => s,
-                Err(err) => {
-                    eprintln!(
-                        "[bms_flex_row packed parity n64_r20_p44] upload marg \
-                         failed: {err}"
-                    );
-                    return;
-                }
-            };
-            let d_g = match stream.clone_htod(&logslope) {
-                Ok(s) => s,
-                Err(err) => {
-                    eprintln!(
-                        "[bms_flex_row packed parity n64_r20_p44] upload logslope \
-                         failed: {err}"
-                    );
-                    return;
-                }
-            };
-            let mut storage = DeviceResidentRowHess {
-                ctx: backend.ctx.clone(),
-                stream: stream.clone(),
-                hess: d_h,
-                marginal_design: d_m,
-                logslope_design: d_g,
-                n,
-                r,
-                block: block.clone(),
-                primary: primary.clone(),
-                layout: RowHessianLayout::FullRowMajor,
-                bytes: ((n * r * r + n * p_m + n * p_g) * std::mem::size_of::<f64>()) as u64,
-            };
-            // Repack to the packed layout in place; this must be bit-equal,
-            // each upper-triangle entry is copied once with no arithmetic.
-            repack_upper(&mut storage).expect("repack_upper must succeed at n64/r20");
-            assert_eq!(storage.layout, RowHessianLayout::SymmetricPackedUpper);
-            assert_eq!(storage.hess.len(), n * r * (r + 1) / 2);
-
-            let gpu_hvp = launch_bms_flex_row_hvp(&storage, &v)
-                .expect("packed HVP kernel must launch on CUDA host at n64/r20/p44");
-            let gpu_diag = launch_bms_flex_row_diagonal(&storage)
-                .expect("packed diag kernel must launch on CUDA host at n64/r20/p44");
-            assert_eq!(gpu_hvp.len(), cpu_hvp.len());
-            assert_eq!(gpu_diag.len(), cpu_diag.len());
-            for i in 0..p_total {
-                let diff = (cpu_hvp[i] - gpu_hvp[i]).abs();
-                assert!(
-                    diff <= 1e-8,
-                    "n64_r20_p44 packed HVP[{i}]: cpu={} gpu={} |Δ|={diff:.3e}",
-                    cpu_hvp[i],
-                    gpu_hvp[i]
-                );
-                let ddiff = (cpu_diag[i] - gpu_diag[i]).abs();
-                assert!(
-                    ddiff <= 1e-8,
-                    "n64_r20_p44 packed diag[{i}]: cpu={} gpu={} |Δ|={ddiff:.3e}",
-                    cpu_diag[i],
-                    gpu_diag[i]
-                );
-            }
-        }
-    }
-
-    /// Block 9 Phase 4 — biobank-shape (n=195_000, r=20, p_total=44)
-    /// `SymmetricPackedUpper` vs `FullRowMajor` HVP benchmark on V100.
-    /// Charter rule: adopt packed-upper as the default only if the median
-    /// per-HVP wall-time wins by > 10% over the full row-major baseline.
-    ///
-    /// Emits one line to stderr summarising the median + ratio so the
-    /// hill-climb log is greppable from the V100 test runner.
-    ///
-    /// Skips on non-Linux / no-CUDA hosts the same way the Phase-2 parity
-    /// gate does.
-    #[test]
-    fn bms_flex_row_packed_vs_full_hvp_benchmark_at_biobank_shape() {
-        #[cfg(not(target_os = "linux"))]
-        {
-            eprintln!(
-                "[bms_flex_row packed-vs-full bench] non-Linux host — \
-                 skipping device benchmark"
-            );
-        }
-        #[cfg(target_os = "linux")]
-        {
-            let Some(_runtime) = crate::gpu::runtime::GpuRuntime::global() else {
-                eprintln!(
-                    "[bms_flex_row packed-vs-full bench] no CUDA runtime — \
-                     skipping device benchmark"
-                );
-                return;
-            };
-            let n = 195_000_usize;
-            let p_m = 14_usize;
-            let p_g = 12_usize;
-            let p_h_dim = 10_usize;
-            let p_w_dim = 8_usize;
-            let r = 2 + p_h_dim + p_w_dim;
-            let p_total = p_m + p_g + p_h_dim + p_w_dim;
-            let block = BmsFlexBlockLayout {
-                p_m,
-                p_g,
-                h: Some(p_m + p_g..p_m + p_g + p_h_dim),
-                w: Some(p_m + p_g + p_h_dim..p_m + p_g + p_h_dim + p_w_dim),
-                p_total,
-            };
-            let primary = BmsFlexPrimaryLayout {
-                h: Some(2..2 + p_h_dim),
-                w: Some(2 + p_h_dim..2 + p_h_dim + p_w_dim),
-                r,
-            };
-
-            // Build a synthetic but symmetric H + designs + v. Use the same
-            // deterministic recipe as the parity gates so the benchmark is
-            // reproducible.
-            let mut row_hessians = vec![0.0_f64; n * r * r];
-            for row in 0..n {
-                let base = row * r * r;
-                for u in 0..r {
-                    for vv in 0..r {
-                        let seed = (row as f64) * 0.137 + (u as f64) * 1.901 + (vv as f64) * 0.317;
-                        let a = (seed.sin() * 1.7 + (seed * 0.5).cos() * 0.9) * 0.5;
-                        row_hessians[base + u * r + vv] = a;
-                    }
-                }
-                for u in 0..r {
-                    for vv in (u + 1)..r {
-                        let upper = row_hessians[base + u * r + vv];
-                        let lower = row_hessians[base + vv * r + u];
-                        let sym = 0.5 * (upper + lower);
-                        row_hessians[base + u * r + vv] = sym;
-                        row_hessians[base + vv * r + u] = sym;
-                    }
-                    row_hessians[base + u * r + u] += r as f64;
-                }
-            }
-            let mut marginal = vec![0.0_f64; n * p_m];
-            for row in 0..n {
-                for j in 0..p_m {
-                    let seed = (row as f64) * 0.073 + (j as f64) * 0.211 + 0.4;
-                    marginal[row * p_m + j] = seed.sin() * 0.8 - (seed * 0.7).cos() * 0.3;
-                }
-            }
-            let mut logslope = vec![0.0_f64; n * p_g];
-            for row in 0..n {
-                for j in 0..p_g {
-                    let seed = (row as f64) * 0.091 + (j as f64) * 0.179 - 0.2;
-                    logslope[row * p_g + j] = seed.cos() * 0.7 + (seed * 0.3).sin() * 0.25;
-                }
-            }
-            let v: Vec<f64> = (0..p_total)
-                .map(|i| {
-                    let seed = (i as f64) * 0.157 + 0.6;
-                    seed.sin() * 0.55 + (seed * 0.4).cos() * 0.35
-                })
-                .collect();
-
-            let backend = match HvpKernelBackend::probe() {
-                Ok(b) => b,
-                Err(err) => {
-                    eprintln!(
-                        "[bms_flex_row packed-vs-full bench] backend probe \
-                         failed: {err}"
-                    );
-                    return;
-                }
-            };
-            let stream = backend.stream.clone();
-            let d_h_full = match stream.clone_htod(&row_hessians) {
-                Ok(s) => s,
-                Err(err) => {
-                    eprintln!(
-                        "[bms_flex_row packed-vs-full bench] upload h failed \
-                         (likely OOM at biobank shape): {err}"
-                    );
-                    return;
-                }
-            };
-            let d_m = match stream.clone_htod(&marginal) {
-                Ok(s) => s,
-                Err(err) => {
-                    eprintln!(
-                        "[bms_flex_row packed-vs-full bench] upload marg \
-                         failed: {err}"
-                    );
-                    return;
-                }
-            };
-            let d_g = match stream.clone_htod(&logslope) {
-                Ok(s) => s,
-                Err(err) => {
-                    eprintln!(
-                        "[bms_flex_row packed-vs-full bench] upload logslope \
-                         failed: {err}"
-                    );
-                    return;
-                }
-            };
-
-            // FullRowMajor storage: time `iters` HVPs, take the median.
-            let mut storage = DeviceResidentRowHess {
-                ctx: backend.ctx.clone(),
-                stream: stream.clone(),
-                hess: d_h_full,
-                marginal_design: d_m,
-                logslope_design: d_g,
-                n,
-                r,
-                block: block.clone(),
-                primary: primary.clone(),
-                layout: RowHessianLayout::FullRowMajor,
-                bytes: ((n * r * r + n * p_m + n * p_g) * std::mem::size_of::<f64>()) as u64,
-            };
-
-            let warmup: usize = 3;
-            let iters: usize = 20;
-            // Warm up: compile / cache kernels, populate L2. `assert_eq!` on
-            // the result length keeps the value live (so the optimizer cannot
-            // strip the launch) without a `let _` binding.
-            for _ in 0..warmup {
-                let out =
-                    launch_bms_flex_row_hvp(&storage, &v).expect("warmup full HVP must launch");
-                assert_eq!(out.len(), p_total);
-            }
-            let mut full_times_us: Vec<u128> = Vec::with_capacity(iters);
-            for _ in 0..iters {
-                let t0 = std::time::Instant::now();
-                let out = launch_bms_flex_row_hvp(&storage, &v).expect("full HVP must launch");
-                full_times_us.push(t0.elapsed().as_micros());
-                assert_eq!(out.len(), p_total);
-            }
-            full_times_us.sort_unstable();
-            let full_median_us = full_times_us[iters / 2];
-
-            // Repack to packed-upper in place and re-time the same kernel.
-            repack_upper(&mut storage).expect("repack_upper must succeed at biobank shape");
-            assert_eq!(storage.layout, RowHessianLayout::SymmetricPackedUpper);
-            for _ in 0..warmup {
-                let out =
-                    launch_bms_flex_row_hvp(&storage, &v).expect("warmup packed HVP must launch");
-                assert_eq!(out.len(), p_total);
-            }
-            let mut packed_times_us: Vec<u128> = Vec::with_capacity(iters);
-            for _ in 0..iters {
-                let t0 = std::time::Instant::now();
-                let out = launch_bms_flex_row_hvp(&storage, &v).expect("packed HVP must launch");
-                packed_times_us.push(t0.elapsed().as_micros());
-                assert_eq!(out.len(), p_total);
-            }
-            packed_times_us.sort_unstable();
-            let packed_median_us = packed_times_us[iters / 2];
-
-            let ratio = (packed_median_us as f64) / (full_median_us.max(1) as f64);
-            let speedup_pct = (1.0 - ratio) * 100.0;
-            eprintln!(
-                "[bms_flex_row packed-vs-full bench] biobank n={n} r={r} p={p_total}: \
-                 full_median={full_median_us}us packed_median={packed_median_us}us \
-                 packed/full={ratio:.3} packed_speedup={speedup_pct:+.1}% \
-                 (charter: adopt iff >+10%)"
-            );
-
-            // The benchmark itself is not a hard gate — it logs the
-            // measurement. The charter rule says "adopt only if >10% Hv
-            // win"; the production default flips when this number lands.
-            // We do require both paths to produce comparable HVP output so
-            // the comparison is meaningful.
-            let final_packed =
-                launch_bms_flex_row_hvp(&storage, &v).expect("post-bench packed HVP must launch");
-            assert_eq!(final_packed.len(), p_total);
-        }
-    }
 
     /// Block 9 Phase 6 — small-fixture parity for the dense-block kernel
     /// against the CPU pullback in `crate::gpu::bms_flex::accumulate_row_hessian_pullback`.
@@ -4897,8 +4370,6 @@ mod tests {
                 }
             };
             let storage = DeviceResidentRowHess {
-                ctx: backend.ctx.clone(),
-                stream: stream.clone(),
                 hess: d_h,
                 marginal_design: d_m,
                 logslope_design: d_g,
@@ -5065,8 +4536,6 @@ mod tests {
                 }
             };
             let storage = DeviceResidentRowHess {
-                ctx: backend.ctx.clone(),
-                stream: stream.clone(),
                 hess: d_h,
                 marginal_design: d_m,
                 logslope_design: d_g,
@@ -5283,8 +4752,6 @@ mod tests {
                 }
             };
             let storage = DeviceResidentRowHess {
-                ctx: backend.ctx.clone(),
-                stream: stream.clone(),
                 hess: d_h,
                 marginal_design: d_m,
                 logslope_design: d_g,

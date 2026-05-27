@@ -1526,13 +1526,12 @@ mod pcg_device {
     use super::PCG_KERNEL_SOURCE;
     use crate::gpu::bms_flex_row::launch_bms_flex_row_diagonal;
     use crate::gpu::bms_flex_row::launch_bms_flex_row_hvp_into_device;
-    use cudarc::driver::{CudaContext, CudaModule, CudaStream, LaunchConfig, PushKernelArg};
+    use cudarc::driver::{CudaModule, CudaStream, LaunchConfig, PushKernelArg};
     use std::sync::{Arc, OnceLock};
 
     struct PcgBackend {
         stream: Arc<CudaStream>,
         module: Arc<CudaModule>,
-        ctx: Arc<CudaContext>,
     }
 
     impl PcgBackend {
@@ -1556,11 +1555,7 @@ mod pcg_device {
                     let module = ctx
                         .load_module(ptx)
                         .map_err(|err| format!("pcg module load failed: {err}"))?;
-                    Ok(PcgBackend {
-                        stream,
-                        module,
-                        ctx,
-                    })
+                    Ok(PcgBackend { stream, module })
                 })
                 .as_ref()
                 .map_err(String::clone)
@@ -2626,8 +2621,6 @@ mod pcg_device_parity_tests {
             }
         };
         let storage = DeviceResidentRowHess {
-            ctx,
-            stream,
             hess: d_h,
             marginal_design: d_m,
             logslope_design: d_g,
