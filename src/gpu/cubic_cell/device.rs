@@ -26,6 +26,7 @@ use crate::gpu::cubic_cell::{
     CubicCellDerivativeMomentHostView, CubicCellDerivativeMomentOutput, CubicCellMomentStatus,
     GpuCellBranchTag, branch::classify_cell_for_gpu,
 };
+#[cfg(target_os = "linux")]
 use crate::gpu::error::GpuError;
 
 
@@ -74,8 +75,9 @@ pub(crate) fn try_device_moments_resident(
 /// Process-wide cubic-cell GPU backend. Mirrors the
 /// `BmsFlexGpuBackend` / `SurvivalFlexGpuBackend` shape so future
 /// device-residency residencies can swap in without churn. Linux-only:
-/// non-Linux builds compile a `try_device_moments` stub that never
-/// constructs this backend.
+/// non-Linux builds skip [`try_device_moments`] at the call site
+/// (`super::try_build_cubic_cell_derivative_moments`) via
+/// `#[cfg(target_os = "linux")]`, so this backend is never referenced.
 #[cfg(target_os = "linux")]
 #[must_use]
 pub(crate) struct CubicCellGpuBackend {
