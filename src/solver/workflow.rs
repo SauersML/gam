@@ -385,16 +385,16 @@ pub trait FamilyFitRequest {
     /// so cross-validation folds / hyperparameter sweeps share a prefix.
     fn write_seed_hash(&self, h: &mut crate::solver::persistent_warm_start::StableHasher);
 
-    /// Attach the primary persistent warm-start session. Default no-op for
-    /// variants like `Standard` that open their own session inside the
-    /// outer optimizer (see `solver/estimate.rs:2701`) and would otherwise
-    /// double-checkpoint.
-    fn attach_cache_session(&mut self, _: std::sync::Arc<crate::cache::Session>) {}
+    /// Attach the primary persistent warm-start session. Variants like
+    /// `Standard` that open their own session inside the outer optimizer
+    /// (see `solver/estimate.rs:2701`) implement this as a `drop(session)`
+    /// no-op to avoid double-checkpointing on the same fingerprint.
+    fn attach_cache_session(&mut self, session: std::sync::Arc<crate::cache::Session>);
 
     /// Attach a mirror session that receives a broadcast copy of the final
-    /// `finalize` write under the seed-prefix keyspace. Default no-op for
-    /// variants without a mirror channel.
-    fn attach_cache_mirror(&mut self, _: std::sync::Arc<crate::cache::Session>) {}
+    /// `finalize` write under the seed-prefix keyspace. Variants without
+    /// a mirror channel implement this as a `drop(mirror)` no-op.
+    fn attach_cache_mirror(&mut self, mirror: std::sync::Arc<crate::cache::Session>);
 }
 
 /// Enumerates every `FitRequest` variant in **one** place. Use as
@@ -434,12 +434,17 @@ impl<'a> FamilyFitRequest for StandardFitRequest<'a> {
         h.write_str(&format!("{:?}", self.family));
         h.write_usize(self.data.ncols());
     }
-    // attach_cache_session: default no-op — the standard REML path opens
-    // its own session inside the outer optimizer via
-    // `reml_state.outer_cache_session()` (see `solver/estimate.rs:2701`),
-    // so the dispatcher-level session here would be a duplicate keyed on
-    // the same fingerprint.
-    // attach_cache_mirror: default no-op for the same reason.
+    fn attach_cache_session(&mut self, session: std::sync::Arc<crate::cache::Session>) {
+        // The standard REML path opens its own session inside the outer
+        // optimizer via `reml_state.outer_cache_session()` (see
+        // `solver/estimate.rs:2701`). Accepting another one here would
+        // double-checkpoint the same fingerprint — drop the redundant arc.
+        drop(session);
+    }
+    fn attach_cache_mirror(&mut self, mirror: std::sync::Arc<crate::cache::Session>) {
+        // Same reasoning: the outer optimizer handles its own finalize.
+        drop(mirror);
+    }
 }
 
 impl<'a> FamilyFitRequest for GaussianLocationScaleFitRequest<'a> {
@@ -542,9 +547,12 @@ impl<'a> FamilyFitRequest for SurvivalTransformationFitRequest<'a> {
         // that path's own exact-match warm-start fires independently.
         self.cache_session.get_or_insert(session);
     }
-    // attach_cache_mirror: default no-op — the path's own
-    // `persistent_survival_transformation_key` mechanism handles
-    // exact-match warm-start; mirror finalize would be a duplicate.
+    fn attach_cache_mirror(&mut self, mirror: std::sync::Arc<crate::cache::Session>) {
+        // The path's own `persistent_survival_transformation_key`
+        // mechanism handles exact-match warm-start; mirror finalize would
+        // be a duplicate — drop the unused arc.
+        drop(mirror);
+    }
 }
 
 impl<'a> FamilyFitRequest for BernoulliMarginalSlopeFitRequest<'a> {
