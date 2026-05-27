@@ -8729,4 +8729,129 @@ mod tests {
         let out = EmbeddedColumnBlock::new(&local, 2..5, 7).materialize();
         assert_eq!(out.dim(), (0, 7));
     }
+
+    /// Identity case: with V_b = I and a zero r_block, the residualised
+    /// operator must emit the raw inner block unchanged. Anchored by an
+    /// arbitrary 3×2 anchor whose contribution is zeroed out by the all-zero
+    /// r_block — verifies the subtraction path is wired but contributes
+    /// nothing when the reparam happens to be identity-with-no-residual.
+    #[test]
+    fn residualised_design_operator_identity_passthrough() {
+        let inner = array![[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]];
+        let transform = Array2::<f64>::eye(2);
+        let anchor_raw = array![[7.0, -1.0], [0.5, 2.0], [-3.0, 1.5]];
+        let r_block = Arc::new(Array2::<f64>::zeros((anchor_raw.ncols(), transform.ncols())));
+        let anchor_design = DesignMatrix::from(anchor_raw);
+
+        let op = ResidualisedDesignOperator::new(
+            DenseDesignMatrix::from(inner.clone()),
+            transform,
+            vec![(anchor_design, r_block)],
+        )
+        .expect("residualised operator constructs");
+
+        // Row-chunk path (cold — exercises the streaming branch before the
+        // materialisation cache is warmed).
+        let mut chunk = Array2::<f64>::zeros((3, 2));
+        op.row_chunk_into(0..3, chunk.view_mut())
+            .expect("row chunk");
+        for ((r, c), v) in inner.indexed_iter() {
+            assert!(
+                (chunk[[r, c]] - v).abs() < 1e-12,
+                "identity row_chunk mismatch at ({r},{c}): got {} expected {v}",
+                chunk[[r, c]]
+            );
+        }
+
+        // Through the DenseDesignMatrix wrapper — confirms the
+        // generic `From<Arc<T: DenseDesignOperator>>` integration carries
+        // shape and row-access semantics into the rest of the design stack.
+        let dense_design = DenseDesignMatrix::from(Arc::new(op));
+        assert_eq!(dense_design.nrows(), 3);
+        assert_eq!(dense_design.ncols(), 2);
+        let probe = ndarray::Array1::from_vec(vec![1.0, -2.0]);
+        let got = dense_design.apply(&probe);
+        let expected = inner.dot(&probe);
+        for i in 0..3 {
+            assert!((got[i] - expected[i]).abs() < 1e-12);
+        }
+    }
+
+    /// Two-block case with a shared column: build raw A and B that overlap
+    /// on one direction, hand-construct V_b and R_b so that
+    /// `out_full = A·γ_A + (C_b·V_b − A·R_b)·θ_b` recovers the raw row
+    /// prediction `A·γ_A + B·β_b` exactly. Anchors the contract that
+    /// `R_b = M_b · V_b` projects out the anchor-overlapping direction so
+    /// the emitted compiled column is orthogonal-to-the-anchor at the
+    /// design-matrix level.
+    #[test]
+    fn residualised_design_operator_two_block_reconstruction() {
+        // Anchor A (n × 2) and raw block B (n × 2); they share their first
+        // column up to scale, so the "kept" direction of B is its second
+        // column residualised against A's column space.
+        let anchor = array![[1.0, 0.0], [1.0, 1.0], [1.0, 2.0], [1.0, 3.0]];
+        let b_raw = array![[1.0, 2.0], [1.0, 1.5], [1.0, 0.5], [1.0, -1.0]];
+
+        // Choose V_b that picks the second raw direction of B (kept dim = 1).
+        // V_b is (p_b_raw=2) × (p_b_kept=1) selecting column 1 of B.
+        let v_b = array![[0.0], [1.0]];
+
+        // Solve M_b = (A'A)^{-1} A'B · V_b → here A'A is diag-ish so do
+        // it via least squares directly. The contract is:
+        //   R_b = M_b · V_b  where M_b ≈ (A'A)^{-1} A'B (size p_a × p_b_raw)
+        // We can just compute the projection coefficients of B·V_b onto A.
+        let bv = b_raw.dot(&v_b); // n × 1
+        let ata = anchor.t().dot(&anchor); // 2x2
+        let atbv = anchor.t().dot(&bv); // 2x1
+        let ata_inv = {
+            let det = ata[[0, 0]] * ata[[1, 1]] - ata[[0, 1]] * ata[[1, 0]];
+            array![
+                [ata[[1, 1]] / det, -ata[[0, 1]] / det],
+                [-ata[[1, 0]] / det, ata[[0, 0]] / det],
+            ]
+        };
+        let r_b: Array2<f64> = ata_inv.dot(&atbv); // 2 × 1  — already R_b
+
+        let op = ResidualisedDesignOperator::new(
+            DenseDesignMatrix::from(b_raw.clone()),
+            v_b.clone(),
+            vec![(DesignMatrix::from(anchor.clone()), Arc::new(r_b.clone()))],
+        )
+        .expect("residualised operator constructs");
+
+        // Choose anchor coefficients γ_A and kept block coefficient θ_b.
+        let gamma_a = ndarray::Array1::from_vec(vec![0.5, -1.25]);
+        let theta_b = ndarray::Array1::from_vec(vec![2.5]);
+
+        // Expected via the explicit emitted row: A·γ_A + (C_b·V_b − A·R_b)·θ_b.
+        let cv = b_raw.dot(&v_b); // C_b · V_b
+        let ar = anchor.dot(&r_b); // A · R_b
+        let emitted_b_chunk = &cv - &ar;
+        let expected = anchor.dot(&gamma_a) + emitted_b_chunk.dot(&theta_b);
+
+        // Pull a streaming chunk through the operator and verify the
+        // contribution matches the hand-computed (C_b·V_b − A·R_b)·θ_b row
+        // by row.
+        let mut got_chunk = Array2::<f64>::zeros((4, 1));
+        op.row_chunk_into(0..4, got_chunk.view_mut())
+            .expect("row chunk");
+        let got = anchor.dot(&gamma_a) + got_chunk.dot(&theta_b);
+        for i in 0..4 {
+            assert!(
+                (got[i] - expected[i]).abs() < 1e-10,
+                "two-block reconstruction mismatch at row {i}: got {} expected {}",
+                got[i],
+                expected[i]
+            );
+        }
+
+        // Cross-check via the LinearOperator::apply path (vector-valued v_b
+        // matmul against the compiled width). This goes through the
+        // streaming inner.apply / fast_av routes, distinct from the
+        // row_chunk_into path covered above.
+        let applied = op.apply(&theta_b);
+        for i in 0..4 {
+            assert!((applied[i] - emitted_b_chunk[[i, 0]] * theta_b[0]).abs() < 1e-10);
+        }
+    }
 }
