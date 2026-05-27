@@ -234,6 +234,21 @@ impl SaeAtomBasisKind {
 
 pub trait SaeBasisEvaluator: Send + Sync + std::fmt::Debug {
     fn evaluate(&self, coords: ArrayView2<'_, f64>) -> Result<(Array2<f64>, Array3<f64>), String>;
+
+    /// Object-safe forwarder to [`SaeBasisSecondJet::second_jet`] for callers
+    /// holding `&dyn SaeBasisEvaluator` / `Arc<dyn SaeBasisEvaluator>`.
+    ///
+    /// Default returns `None`, meaning "this evaluator has no analytic second
+    /// jet". Evaluators that also implement [`SaeBasisSecondJet`] override
+    /// this to wrap the typed call in `Some(...)`. This sidesteps the lack of
+    /// dyn-downcasting for non-`Any` traits while keeping `SaeBasisSecondJet`
+    /// as the strongly-typed compile-time bound for tests / generics.
+    fn second_jet_dyn(
+        &self,
+        _coords: ArrayView2<'_, f64>,
+    ) -> Option<Result<Array4<f64>, String>> {
+        None
+    }
 }
 
 /// Bases that expose an analytic second jet
@@ -274,6 +289,13 @@ impl PeriodicHarmonicEvaluator {
 }
 
 impl SaeBasisEvaluator for PeriodicHarmonicEvaluator {
+    fn second_jet_dyn(
+        &self,
+        coords: ArrayView2<'_, f64>,
+    ) -> Option<Result<Array4<f64>, String>> {
+        Some(<Self as SaeBasisSecondJet>::second_jet(self, coords))
+    }
+
     fn evaluate(&self, coords: ArrayView2<'_, f64>) -> Result<(Array2<f64>, Array3<f64>), String> {
         let n = coords.nrows();
         let d = coords.ncols();
@@ -390,6 +412,13 @@ impl SaeBasisEvaluator for RawPeriodicCircleEvaluator {
 pub struct SphereChartEvaluator;
 
 impl SaeBasisEvaluator for SphereChartEvaluator {
+    fn second_jet_dyn(
+        &self,
+        coords: ArrayView2<'_, f64>,
+    ) -> Option<Result<Array4<f64>, String>> {
+        Some(<Self as SaeBasisSecondJet>::second_jet(self, coords))
+    }
+
     fn evaluate(&self, coords: ArrayView2<'_, f64>) -> Result<(Array2<f64>, Array3<f64>), String> {
         if coords.ncols() != 2 {
             return Err(format!(
@@ -582,6 +611,13 @@ impl TorusHarmonicEvaluator {
 }
 
 impl SaeBasisEvaluator for TorusHarmonicEvaluator {
+    fn second_jet_dyn(
+        &self,
+        coords: ArrayView2<'_, f64>,
+    ) -> Option<Result<Array4<f64>, String>> {
+        Some(<Self as SaeBasisSecondJet>::second_jet(self, coords))
+    }
+
     fn evaluate(&self, coords: ArrayView2<'_, f64>) -> Result<(Array2<f64>, Array3<f64>), String> {
         let d = self.latent_dim;
         if coords.ncols() != d {
