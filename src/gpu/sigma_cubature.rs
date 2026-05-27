@@ -56,6 +56,7 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 use super::error::GpuError;
 use super::pirls_row::{CurvatureMode, PirlsRowFamily};
+use crate::gpu_err;
 
 /// Per-sigma-point IRLS input bundle handed to the device path.
 ///
