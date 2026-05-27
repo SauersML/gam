@@ -389,12 +389,12 @@ pub trait FamilyFitRequest {
     /// variants like `Standard` that open their own session inside the
     /// outer optimizer (see `solver/estimate.rs:2701`) and would otherwise
     /// double-checkpoint.
-    fn attach_cache_session(&mut self, _session: std::sync::Arc<crate::cache::Session>) {}
+    fn attach_cache_session(&mut self, _: std::sync::Arc<crate::cache::Session>) {}
 
     /// Attach a mirror session that receives a broadcast copy of the final
     /// `finalize` write under the seed-prefix keyspace. Default no-op for
     /// variants without a mirror channel.
-    fn attach_cache_mirror(&mut self, _mirror: std::sync::Arc<crate::cache::Session>) {}
+    fn attach_cache_mirror(&mut self, _: std::sync::Arc<crate::cache::Session>) {}
 }
 
 /// Enumerates every `FitRequest` variant in **one** place. Use as
