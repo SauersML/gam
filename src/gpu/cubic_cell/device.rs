@@ -651,22 +651,10 @@ impl CubicCellGpuBackend {
                 status_host[i] = kernel_status[i];
             }
         }
-        // Re-upload merged statuses so device and host views agree.
-        let merged_status = status_host.clone();
-        d_status = stream
-            .clone_htod(&merged_status)
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("cubic_cell device-resident HtoD merged status: {err}"),
-            })?;
-        stream
-            .synchronize()
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("cubic_cell device-resident synchronize: {err}"),
-            })?;
+        drop(d_status);
 
         Ok(CubicCellDerivativeMomentOutput::Device {
             d_moments,
-            d_status,
             status: status_host,
             stride,
             n_cells,
@@ -945,7 +933,6 @@ mod tests {
             let (d_moments, status, stride, n_cells) = match out {
                 CubicCellDerivativeMomentOutput::Device {
                     d_moments,
-                    d_status: _,
                     status,
                     stride,
                     n_cells,

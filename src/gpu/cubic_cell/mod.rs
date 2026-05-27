@@ -139,14 +139,12 @@ pub(crate) enum CubicCellDerivativeMomentOutput {
     /// Device-resident moments + status on the cubic-cell backend's shared
     /// CUDA context. Linux-only — non-Linux callers see the `Host` variant
     /// even when they request `Device` residency. Layout matches `Host` so
-    /// `d_moments` is a row-major `[n_cells, stride]` `CudaSlice<f64>` and
-    /// `d_status` is a `CudaSlice<u8>` of length `n_cells`. The host-side
-    /// `status` vector mirrors `d_status` for branching decisions the caller
-    /// would otherwise have to round-trip from the device.
+    /// `d_moments` is a row-major `[n_cells, stride]` `CudaSlice<f64>`; the
+    /// host-side `status` vector lets the caller branch on per-cell
+    /// outcomes without a DtoH round-trip.
     #[cfg(target_os = "linux")]
     Device {
         d_moments: cudarc::driver::CudaSlice<f64>,
-        d_status: cudarc::driver::CudaSlice<u8>,
         status: Vec<u8>,
         stride: usize,
         n_cells: usize,
