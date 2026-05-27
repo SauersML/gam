@@ -6572,7 +6572,7 @@ mod tests {
             covariance_conditional: Some(covariance),
             covariance_corrected: None,
             inference: Some(inf),
-            fitted_link: FittedLinkState::Standard(Some(LinkFunction::Identity)),
+            fitted_link: FittedLinkState::Standard(Some(StandardLink::Identity)),
             geometry: None,
             block_states: Vec::new(),
             pirls_status: PirlsStatus::Converged,

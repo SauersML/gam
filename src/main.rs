@@ -11975,7 +11975,7 @@ mod tests {
                 covariance_is_diagonal_only: false,
                 bias_correction_beta: None,
             }),
-            fitted_link: FittedLinkState::Standard(Some(LinkFunction::Logit)),
+            fitted_link: FittedLinkState::Standard(Some(StandardLink::Logit)),
             geometry: Some(FitGeometry {
                 penalized_hessian: hessian.into(),
                 working_weights,
