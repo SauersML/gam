@@ -827,6 +827,15 @@ pub struct SaeManifoldAtom {
     pub decoder_coefficients: Array2<f64>,
     pub smooth_penalty: Array2<f64>,
     pub basis_evaluator: Option<Arc<dyn SaeBasisEvaluator>>,
+    /// Same evaluator upcast to `dyn SaeBasisSecondJet` when the
+    /// implementation provides a closed-form Hessian. `None` for
+    /// evaluators that only implement the base [`SaeBasisEvaluator`]
+    /// trait. Installed via [`Self::with_basis_second_jet`]; the base
+    /// [`Self::with_basis_evaluator`] populates only the supertrait
+    /// slot. Used by [`refresh_isometry_caches_from_atom`] to install
+    /// the `H` cache on isometry penalties when the second jet is
+    /// analytically available.
+    pub basis_second_jet: Option<Arc<dyn SaeBasisSecondJet>>,
 }
 
 impl SaeManifoldAtom {
@@ -873,11 +882,25 @@ impl SaeManifoldAtom {
             decoder_coefficients,
             smooth_penalty,
             basis_evaluator: None,
+            basis_second_jet: None,
         })
     }
 
     pub fn with_basis_evaluator(mut self, evaluator: Arc<dyn SaeBasisEvaluator>) -> Self {
         self.basis_evaluator = Some(evaluator);
+        self.basis_second_jet = None;
+        self
+    }
+
+    /// Install an evaluator that additionally exposes a closed-form
+    /// second jet. Populates both the base [`SaeBasisEvaluator`] slot
+    /// (used by [`Self::refresh_basis`] and the standard evaluate path)
+    /// and the [`SaeBasisSecondJet`] slot (consumed by
+    /// [`refresh_isometry_caches_from_atom`] for the `H` cache).
+    pub fn with_basis_second_jet(mut self, evaluator: Arc<dyn SaeBasisSecondJet>) -> Self {
+        let base: Arc<dyn SaeBasisEvaluator> = evaluator.clone();
+        self.basis_evaluator = Some(base);
+        self.basis_second_jet = Some(evaluator);
         self
     }
 
@@ -2658,13 +2681,16 @@ pub fn term_from_padded_blocks_with_mode(
 /// * `H ∈ ℝ^{n_obs × (p · d · d)}`, flattened as `H[n, (i*d + a)*d + c]` —
 ///   `H[n, i, a, c] = ∂J[n, i, a] / ∂t_{n, c} = Σ_m d²Phi[n, m, a, c] · B[m, i]`.
 ///
-/// Returns `Ok(true)` when both caches were installed (i.e. the atom's basis
-/// evaluator implemented [`SaeBasisEvaluator::second_jet`]). Returns
-/// `Ok(false)` when the evaluator returned `None` for `second_jet` — in that
-/// case only the first-jet `jacobian_cache` is installed and the penalty's
-/// `has_jacobian_second_source` check still has a chance to succeed via a
-/// pre-supplied `duchon_radial_source`. Returns `Err` only on shape
-/// mismatches (which would indicate a buggy evaluator).
+/// Returns `Ok(true)` when both caches were installed (i.e. the atom was
+/// built via [`SaeManifoldAtom::with_basis_second_jet`], so its
+/// `basis_second_jet` slot holds a [`SaeBasisSecondJet`] implementation
+/// that supplies the analytic Hessian). Returns `Ok(false)` when only the
+/// base [`SaeBasisEvaluator`] is installed (no second jet available) — in
+/// that case only the first-jet `jacobian_cache` is installed and the
+/// penalty's `has_jacobian_second_source` check still has a chance to
+/// succeed via a pre-supplied `duchon_radial_source`. Returns `Err` on
+/// shape mismatches (which would indicate a buggy evaluator) or when the
+/// second-jet implementation itself fails (e.g. wrong latent dimension).
 ///
 /// This entry point takes `&IsometryPenalty` rather than `&mut` because the
 /// caches are interior-mutable (see [`IsometryPenalty::refresh_caches`]).
@@ -2680,7 +2706,6 @@ pub fn refresh_isometry_caches_from_atom(
         )
     })?;
     let (_phi, jet) = evaluator.evaluate(coords)?;
-    let second = evaluator.second_jet(coords);
 
     let n_obs = coords.nrows();
     let d = atom.latent_dim;
@@ -2714,31 +2739,39 @@ pub fn refresh_isometry_caches_from_atom(
         }
     }
 
-    let jac2_opt = match second {
-        Some(hess) => {
-            if hess.dim() != (n_obs, m, d, d) {
-                return Err(format!(
-                    "refresh_isometry_caches_from_atom: evaluator second jet has shape {:?}, expected ({n_obs}, {m}, {d}, {d})",
-                    hess.dim()
-                ));
-            }
-            let mut jac2 = Array2::<f64>::zeros((n_obs, p * d * d));
-            for n in 0..n_obs {
-                for i in 0..p {
-                    for a in 0..d {
-                        for c in 0..d {
-                            let mut acc = 0.0;
-                            for mm in 0..m {
-                                acc += hess[[n, mm, a, c]] * b[[mm, i]];
-                            }
-                            jac2[[n, (i * d + a) * d + c]] = acc;
+    // The second jet is sourced from the optional `basis_second_jet`
+    // slot. The trait split (`SaeBasisEvaluator` vs `SaeBasisSecondJet`)
+    // encodes "no closed-form Hessian" as trait absence: when the atom
+    // was built with `with_basis_evaluator` (base trait only) the slot
+    // is `None` and the `H` cache is not installed. When the atom was
+    // built with `with_basis_second_jet` the slot holds the same Arc
+    // upcast to the supertrait, and `second_jet` returns the analytic
+    // Hessian here.
+    let jac2_opt = if let Some(second_eval) = atom.basis_second_jet.as_ref() {
+        let hess = second_eval.second_jet(coords)?;
+        if hess.dim() != (n_obs, m, d, d) {
+            return Err(format!(
+                "refresh_isometry_caches_from_atom: evaluator second jet has shape {:?}, expected ({n_obs}, {m}, {d}, {d})",
+                hess.dim()
+            ));
+        }
+        let mut jac2 = Array2::<f64>::zeros((n_obs, p * d * d));
+        for n in 0..n_obs {
+            for i in 0..p {
+                for a in 0..d {
+                    for c in 0..d {
+                        let mut acc = 0.0;
+                        for mm in 0..m {
+                            acc += hess[[n, mm, a, c]] * b[[mm, i]];
                         }
+                        jac2[[n, (i * d + a) * d + c]] = acc;
                     }
                 }
             }
-            Some(Arc::new(jac2))
         }
-        None => None,
+        Some(Arc::new(jac2))
+    } else {
+        None
     };
 
     let installed = jac2_opt.is_some();
@@ -2757,7 +2790,8 @@ pub fn refresh_isometry_caches_from_atom(
 /// matching atom for each.
 ///
 /// Returns the number of penalties that got both caches populated (i.e. the
-/// number of atoms whose basis evaluator implements [`SaeBasisEvaluator::second_jet`]).
+/// number of atoms whose `basis_second_jet` slot holds a
+/// [`SaeBasisSecondJet`] implementation supplying the analytic Hessian).
 pub fn refresh_isometry_caches_from_term(
     registry: &AnalyticPenaltyRegistry,
     term: &SaeManifoldTerm,
@@ -3944,7 +3978,7 @@ mod tests {
     /// mismatch between `J`/`H` would show up as a tolerance failure rather
     /// than a silently zero gradient.
     fn assert_isometry_wiring_matches_fd(
-        evaluator: Arc<dyn SaeBasisEvaluator>,
+        evaluator: Arc<dyn SaeBasisSecondJet>,
         coords: Array2<f64>,
     ) {
         let n_obs = coords.nrows();
@@ -3972,7 +4006,7 @@ mod tests {
             smooth,
         )
         .unwrap()
-        .with_basis_evaluator(evaluator);
+        .with_basis_second_jet(evaluator);
 
         let target_slice = PsiSlice::full(n_obs * latent_dim, Some(latent_dim));
         let penalty = IsometryPenalty::new_euclidean(target_slice, p);
