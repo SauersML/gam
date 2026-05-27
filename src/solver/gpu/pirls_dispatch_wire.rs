@@ -30,7 +30,8 @@ mod linux_impl {
     use crate::solver::pirls::{
         ExportedLaplaceCurvature, FirthDiagnostics, HessianCurvatureKind, PirlsCoordinateFrame,
         PirlsResult, PirlsStatus, WorkingModelPirlsResult, WorkingState,
-        compute_observed_hessian_curvature_arrays, computeworkingweight_derivatives_from_eta,
+        calculate_loglikelihood_omitting_constants, compute_observed_hessian_curvature_arrays,
+        computeworkingweight_derivatives_from_eta,
     };
     use crate::types::{
         Coefficients, DesignMatrix, GlmLikelihoodSpec, InverseLink, LinearPredictor,
@@ -409,7 +410,12 @@ mod linux_impl {
             eta: LinearPredictor::new(final_eta.clone()),
             gradient: gradient_total.clone(),
             hessian: penalized_hessian_sym.clone(),
-            log_likelihood: f64::NAN, // not produced by the GPU loop; downstream callers do not require it for REML/LAML evaluation.
+            log_likelihood: calculate_loglikelihood_omitting_constants(
+                input.y,
+                &final_mu,
+                input.likelihood,
+                input.priorweights,
+            ),
             deviance,
             penalty_term,
             firth: firth.clone(),

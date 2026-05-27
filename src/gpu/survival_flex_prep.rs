@@ -489,7 +489,9 @@ mod device_dispatch {
                 "cell_primary_fixed_partials_baseline: n_cells={n_cells_total} exceeds u32"
             )
         })?;
-        let (ctx, stream) = context_and_stream()?;
+        let (ctx, stream) = context_and_stream().map_err(|reason| {
+            crate::gpu::error::GpuError::DriverCallFailed { reason }
+        })?;
         let module = FP_PTX_CACHE.get_or_compile(
             &ctx,
             "survival_flex_prep::cell_primary_fixed_partials",
@@ -549,18 +551,29 @@ mod device_dispatch {
     use crate::gpu::error::GpuError;
 
     pub(super) fn partition_cells_baseline(
-        _rows: &[PartitionCellsRowInputs<'_>],
-        _scale: f64,
+        rows: &[PartitionCellsRowInputs<'_>],
+        scale: f64,
     ) -> Result<Option<PartitionCellsOutput>, GpuError> {
+        // CUDA only supported on linux; the caller falls back to CPU.
+        // The scalar inputs are surfaced in the diagnostic-but-not-error
+        // log so callers can still see what shape would have launched.
+        log::trace!(
+            "survival_flex_prep::partition_cells_baseline declined on non-linux \
+             (n_rows={}, scale={scale})",
+            rows.len()
+        );
         Ok(None)
     }
 
     pub(super) fn cell_primary_fixed_partials_baseline(
-        _layout: super::FlexPrimaryLayout,
-        _n_cells_total: usize,
+        layout: super::FlexPrimaryLayout,
+        n_cells_total: usize,
     ) -> Result<Vec<f64>, GpuError> {
         Err(crate::gpu_err!(
-            "survival_flex_prep::cell_primary_fixed_partials_baseline: CUDA only supported on linux"
+            "survival_flex_prep::cell_primary_fixed_partials_baseline: CUDA only supported on linux \
+             (would have launched n_cells={n_cells_total}, r={}, g_slot={})",
+            layout.r,
+            layout.g_slot
         ))
     }
 }

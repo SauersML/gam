@@ -158,171 +158,222 @@ mod cuda_impl {
     use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
     use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
     use ndarray::Array2;
+    use std::cell::RefCell;
     use std::ops::Range;
     use std::sync::Arc;
 
-    pub(super) fn try_primary_state_gram_cuda_impl(
-        channel_blocks: &[Vec<Option<Array2<f64>>>],
-        h_packed: &Array2<f64>,
-        raw_block_ranges: &[Range<usize>],
-    ) -> Option<GramBundle> {
-        let runtime = GpuRuntime::global()?;
-        let num_blocks = channel_blocks.len();
-        if num_blocks == 0 || raw_block_ranges.len() != num_blocks {
-            return None;
-        }
-        let (n_rows, packed_cols) = h_packed.dim();
-        if packed_cols != PACKED_LEN {
-            return None;
-        }
+    /// Device-resident cache of channel-block designs plus a reusable
+    /// row-scale scratch buffer. Built once per identifiability compile;
+    /// each `compute_grams` call only re-uploads the per-row packed
+    /// Hessian columns it actually needs.
+    pub(super) struct WorkspaceInner {
+        stream: Arc<CudaStream>,
+        blas: CudaBlas,
+        /// `uploads[block][channel]` — column-major device copy of each
+        /// raw design slice. `None` slots mean "channel inactive on this
+        /// block", consistent with the host-side `Option<Array2>` layout.
+        uploads: Vec<Vec<Option<CudaSlice<f64>>>>,
+        /// `needed[packed_index(c,d)]` — true iff some `(block_a,
+        /// block_b)` pair will request that channel-pair Hessian column.
+        needed: [bool; PACKED_LEN],
+        /// Reusable device scratch for the DGMM row-scaled right
+        /// operand. Sized at the largest `(block, channel)` right matrix
+        /// across the topology, so it fits every `(a,b,c,d)` step. Wrapped
+        /// in `RefCell` so `compute_grams` can mutate it through `&self`.
+        scaled_dev: RefCell<CudaSlice<f64>>,
+        raw_block_ranges: Vec<Range<usize>>,
+        n_rows: usize,
+        total_cols: usize,
+    }
 
-        for (b, channels) in channel_blocks.iter().enumerate() {
-            if channels.len() != CHANNELS {
+    impl WorkspaceInner {
+        pub(super) fn try_new(
+            channel_blocks: &[Vec<Option<Array2<f64>>>],
+            raw_block_ranges: &[Range<usize>],
+        ) -> Option<Self> {
+            let runtime = GpuRuntime::global()?;
+            let num_blocks = channel_blocks.len();
+            if num_blocks == 0 || raw_block_ranges.len() != num_blocks {
                 return None;
             }
-            let want_cols = raw_block_ranges[b].len();
-            for ch in channels.iter().flatten() {
-                if ch.nrows() != n_rows || ch.ncols() != want_cols {
+
+            // Establish a consistent n_rows across all uploaded blocks.
+            let mut n_rows: Option<usize> = None;
+            for (block_idx, channels) in channel_blocks.iter().enumerate() {
+                if channels.len() != CHANNELS {
                     return None;
                 }
-            }
-        }
-
-        let total_cols = raw_block_ranges
-            .iter()
-            .map(|r| r.len())
-            .fold(0usize, |a, l| a.saturating_add(l));
-        if total_cols == 0 {
-            return None;
-        }
-
-        let stream = cuda_context_for(runtime.device.ordinal)?
-            .new_stream()
-            .ok()?;
-        let blas = CudaBlas::new(stream.clone()).ok()?;
-
-        // Upload each (block, channel) raw design once, column-major.
-        let mut uploads: Vec<Vec<Option<CudaSlice<f64>>>> = Vec::with_capacity(num_blocks);
-        for channels in channel_blocks.iter() {
-            let mut row: Vec<Option<CudaSlice<f64>>> = Vec::with_capacity(CHANNELS);
-            for slot in channels.iter() {
-                let dev = match slot.as_ref() {
-                    Some(mat) => {
-                        let col = to_col_major(mat);
-                        Some(stream.clone_htod(&*col).ok()?)
+                let want_cols = raw_block_ranges[block_idx].len();
+                for ch in channels.iter().flatten() {
+                    if ch.ncols() != want_cols {
+                        return None;
                     }
-                    None => None,
-                };
-                row.push(dev);
-            }
-            uploads.push(row);
-        }
-
-        // Upload each channel-pair weight column (10 in total). We only
-        // upload the columns we will actually consume.
-        let mut h_columns: [Option<CudaSlice<f64>>; PACKED_LEN] =
-            [None, None, None, None, None, None, None, None, None, None];
-        let mut needed: [bool; PACKED_LEN] = [false; PACKED_LEN];
-        for a in 0..num_blocks {
-            for b in 0..num_blocks {
-                for c in 0..CHANNELS {
-                    if uploads[a][c].is_none() {
-                        continue;
+                    match n_rows {
+                        Some(expected) if expected != ch.nrows() => return None,
+                        Some(_) => {}
+                        None => n_rows = Some(ch.nrows()),
                     }
-                    for d in 0..CHANNELS {
-                        if uploads[b][d].is_none() {
+                }
+            }
+            let n_rows = n_rows?;
+
+            let total_cols = raw_block_ranges
+                .iter()
+                .map(|r| r.len())
+                .fold(0usize, |a, l| a.saturating_add(l));
+            if total_cols == 0 {
+                return None;
+            }
+
+            let stream = cuda_context_for(runtime.device.ordinal)?
+                .new_stream()
+                .ok()?;
+            let blas = CudaBlas::new(stream.clone()).ok()?;
+
+            // Upload each (block, channel) raw design once, column-major.
+            let mut uploads: Vec<Vec<Option<CudaSlice<f64>>>> = Vec::with_capacity(num_blocks);
+            for channels in channel_blocks.iter() {
+                let mut row: Vec<Option<CudaSlice<f64>>> = Vec::with_capacity(CHANNELS);
+                for slot in channels.iter() {
+                    let dev = match slot.as_ref() {
+                        Some(mat) => {
+                            let col = to_col_major(mat);
+                            Some(stream.clone_htod(&*col).ok()?)
+                        }
+                        None => None,
+                    };
+                    row.push(dev);
+                }
+                uploads.push(row);
+            }
+
+            // Pre-compute which packed-H columns the topology requires.
+            let mut needed: [bool; PACKED_LEN] = [false; PACKED_LEN];
+            for a in 0..num_blocks {
+                for b in 0..num_blocks {
+                    for c in 0..CHANNELS {
+                        if uploads[a][c].is_none() {
                             continue;
                         }
-                        needed[packed_index(c, d)] = true;
+                        for d in 0..CHANNELS {
+                            if uploads[b][d].is_none() {
+                                continue;
+                            }
+                            needed[packed_index(c, d)] = true;
+                        }
                     }
                 }
             }
-        }
-        for idx in 0..PACKED_LEN {
-            if !needed[idx] {
-                continue;
-            }
-            let col = h_packed.column(idx);
-            let host: Vec<f64> = col.iter().copied().collect();
-            h_columns[idx] = Some(stream.clone_htod(&host).ok()?);
-        }
 
-        let mut gram_h = Array2::<f64>::zeros((total_cols, total_cols));
-        let mut gram_struct = Array2::<f64>::zeros((total_cols, total_cols));
-
-        // Scratch buffer reused across (a,b,c,d) pairs to hold the
-        // row-scaled right operand. Sized at the largest right matrix.
-        let max_right_len = channel_blocks
-            .iter()
-            .zip(raw_block_ranges.iter())
-            .flat_map(|(channels, range)| {
-                channels.iter().map(move |slot| {
-                    if slot.is_some() {
-                        n_rows.checked_mul(range.len()).unwrap_or(0)
-                    } else {
-                        0
-                    }
+            // Scratch sized at the largest right matrix across the topology.
+            let max_right_len = channel_blocks
+                .iter()
+                .zip(raw_block_ranges.iter())
+                .flat_map(|(channels, range)| {
+                    channels.iter().map(move |slot| {
+                        if slot.is_some() {
+                            n_rows.checked_mul(range.len()).unwrap_or(0)
+                        } else {
+                            0
+                        }
+                    })
                 })
-            })
-            .max()
-            .unwrap_or(0);
-        if max_right_len == 0 {
-            return None;
-        }
-        let mut scaled_dev = stream.alloc_zeros::<f64>(max_right_len).ok()?;
+                .max()
+                .unwrap_or(0);
+            if max_right_len == 0 {
+                return None;
+            }
+            let scaled_dev = stream.alloc_zeros::<f64>(max_right_len).ok()?;
 
-        for block_a in 0..num_blocks {
-            let range_a = &raw_block_ranges[block_a];
-            for block_b in 0..num_blocks {
-                let range_b = &raw_block_ranges[block_b];
-                let mut contrib_h = Array2::<f64>::zeros((range_a.len(), range_b.len()));
-                let mut contrib_s = Array2::<f64>::zeros((range_a.len(), range_b.len()));
-                for c in 0..CHANNELS {
-                    let Some(x_a) = uploads[block_a][c].as_ref() else {
-                        continue;
-                    };
-                    for d in 0..CHANNELS {
-                        let Some(x_b) = uploads[block_b][d].as_ref() else {
+            Some(Self {
+                stream,
+                blas,
+                uploads,
+                needed,
+                scaled_dev: RefCell::new(scaled_dev),
+                raw_block_ranges: raw_block_ranges.to_vec(),
+                n_rows,
+                total_cols,
+            })
+        }
+
+        pub(super) fn compute_grams(&self, h_packed: &Array2<f64>) -> Option<GramBundle> {
+            let (n_rows, packed_cols) = h_packed.dim();
+            if packed_cols != PACKED_LEN || n_rows != self.n_rows {
+                return None;
+            }
+
+            // Upload only the columns actually used by the topology.
+            let mut h_columns: [Option<CudaSlice<f64>>; PACKED_LEN] =
+                [None, None, None, None, None, None, None, None, None, None];
+            for idx in 0..PACKED_LEN {
+                if !self.needed[idx] {
+                    continue;
+                }
+                let col = h_packed.column(idx);
+                let host: Vec<f64> = col.iter().copied().collect();
+                h_columns[idx] = Some(self.stream.clone_htod(&host).ok()?);
+            }
+
+            let total_cols = self.total_cols;
+            let mut gram_h = Array2::<f64>::zeros((total_cols, total_cols));
+            let mut gram_struct = Array2::<f64>::zeros((total_cols, total_cols));
+
+            let mut scaled = self.scaled_dev.borrow_mut();
+            let num_blocks = self.uploads.len();
+            for block_a in 0..num_blocks {
+                let range_a = &self.raw_block_ranges[block_a];
+                for block_b in 0..num_blocks {
+                    let range_b = &self.raw_block_ranges[block_b];
+                    let mut contrib_h = Array2::<f64>::zeros((range_a.len(), range_b.len()));
+                    let mut contrib_s = Array2::<f64>::zeros((range_a.len(), range_b.len()));
+                    for c in 0..CHANNELS {
+                        let Some(x_a) = self.uploads[block_a][c].as_ref() else {
                             continue;
                         };
-                        let h_dev = h_columns[packed_index(c, d)].as_ref()?;
-                        let weighted_block = weighted_gemm(
-                            &blas,
-                            &stream,
-                            x_a,
-                            h_dev,
-                            x_b,
-                            &mut scaled_dev,
-                            n_rows,
-                            range_a.len(),
-                            range_b.len(),
-                        )?;
-                        contrib_h = contrib_h + &weighted_block;
-                        let struct_block = plain_gemm(
-                            &blas,
-                            &stream,
-                            x_a,
-                            x_b,
-                            n_rows,
-                            range_a.len(),
-                            range_b.len(),
-                        )?;
-                        contrib_s = contrib_s + &struct_block;
+                        for d in 0..CHANNELS {
+                            let Some(x_b) = self.uploads[block_b][d].as_ref() else {
+                                continue;
+                            };
+                            let h_dev = h_columns[packed_index(c, d)].as_ref()?;
+                            let weighted_block = weighted_gemm(
+                                &self.blas,
+                                &self.stream,
+                                x_a,
+                                h_dev,
+                                x_b,
+                                &mut *scaled,
+                                self.n_rows,
+                                range_a.len(),
+                                range_b.len(),
+                            )?;
+                            contrib_h = contrib_h + &weighted_block;
+                            let struct_block = plain_gemm(
+                                &self.blas,
+                                &self.stream,
+                                x_a,
+                                x_b,
+                                self.n_rows,
+                                range_a.len(),
+                                range_b.len(),
+                            )?;
+                            contrib_s = contrib_s + &struct_block;
+                        }
                     }
+                    assign_block(&mut gram_h, range_a.start, range_b.start, &contrib_h);
+                    assign_block(&mut gram_struct, range_a.start, range_b.start, &contrib_s);
                 }
-                assign_block(&mut gram_h, range_a.start, range_b.start, &contrib_h);
-                assign_block(&mut gram_struct, range_a.start, range_b.start, &contrib_s);
             }
+
+            symmetrise(&mut gram_h);
+            symmetrise(&mut gram_struct);
+
+            Some(GramBundle {
+                gram_h,
+                gram_struct,
+                raw_block_ranges: self.raw_block_ranges.clone(),
+            })
         }
-
-        symmetrise(&mut gram_h);
-        symmetrise(&mut gram_struct);
-
-        Some(GramBundle {
-            gram_h,
-            gram_struct,
-            raw_block_ranges: raw_block_ranges.to_vec(),
-        })
     }
 
     /// Compute `Xa^T · diag(w) · Xb` for column-major device matrices.
