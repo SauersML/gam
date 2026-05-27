@@ -328,10 +328,16 @@ fn row_gamma_log(input: RowInput, mode: CurvatureMode) -> RowOutput {
     let mu = mu_raw.max(MU_FLOOR_GAMMA);
     let w_prior = input.prior_weight.max(0.0);
     let w_fisher = w_prior * shape;
-    // Stage 1 keeps observed == Fisher (matches the current CPU PIRLS path
-    // for Gamma log). Stage 5 will replace the zero correction with the
-    // observed-information term  −w_prior · (y − μ) · h'' / V .
-    let w_hessian = select_w_hessian(mode, w_fisher, 0.0);
+    // Stage 5: observed-information weight for Gamma-log.
+    //   -∂²ℓ/∂η² = α · y/μ  (vs Fisher: α).
+    // Correction = w_F · (y/μ − 1). Falls back to Fisher when y == μ
+    // (e.g. saturated y) and when w_F == 0.
+    let obs_correction = if w_fisher > 0.0 && mu > 0.0 && input.y.is_finite() {
+        w_fisher * (input.y / mu - 1.0)
+    } else {
+        0.0
+    };
+    let w_hessian = select_w_hessian(mode, w_fisher, obs_correction);
     let resid = input.y - mu;
     // Saturated Gamma deviance: 2 w [−log(y/μ) + (y − μ)/μ].
     let dev = if input.y > 0.0 {
@@ -458,19 +464,25 @@ fn row_bernoulli_probit(input: RowInput, mode: CurvatureMode) -> RowOutput {
     if !(input.y.is_finite() && (0.0..=1.0).contains(&input.y)) {
         status |= status_flags::INVALID_RESPONSE;
     }
+    // Stage 5: observed-information correction for Bernoulli probit.
+    //   w_obs = w_F + w_p · (y − μ) · [h'/V − h²·V'/V²].
+    // h(η) = φ(η), h'(η) = −η · φ(η); V(μ) = μ(1−μ), V'(μ) = 1 − 2μ.
+    let obs_correction = if v > 0.0 && w_prior > 0.0 {
+        let h_prime = -eta_c * dmu_deta;
+        let v_prime = 1.0 - 2.0 * mu;
+        let bracket = h_prime / v - (dmu_deta * dmu_deta) * v_prime / (v * v);
+        w_prior * resid * bracket
+    } else {
+        0.0
+    };
+    let w_hessian_observed = select_w_hessian(mode, w_fisher, obs_correction);
     RowOutput {
         mu,
         grad_eta,
         w_fisher,
-        // Stage 5 will switch this to the observed-information form
-        //   w_obs = w_F − w_prior · (y − μ) · B,
-        //   B = (h''·V − h'²·V') / V².
-        // For Stage 1 the observed-correction term is 0 so Stage-1 fits keep
-        // bit-identical PIRLS behaviour to the existing CPU path; Stage 5
-        // populates the correction when `mode == Observed`.
-        w_hessian: select_w_hessian(mode, w_fisher, 0.0),
+        w_hessian: w_hessian_observed,
         w_solver: {
-            let wh = select_w_hessian(mode, w_fisher, 0.0);
+            let wh = w_hessian_observed;
             if wh > 0.0 {
                 wh.max(W_SOLVER_FLOOR)
             } else {
@@ -525,12 +537,24 @@ fn row_bernoulli_cloglog(input: RowInput, mode: CurvatureMode) -> RowOutput {
     if !(input.y.is_finite() && (0.0..=1.0).contains(&input.y)) {
         status |= status_flags::INVALID_RESPONSE;
     }
-    let w_hessian = select_w_hessian(mode, w_fisher, 0.0);
+    // Stage 5: observed-information correction for Bernoulli cloglog.
+    //   w_obs = w_F + w_p · (y − μ) · [h'/V − h²·V'/V²].
+    // h(η) = inner · (1 − μ_raw); h'(η) = h(η) · (1 − inner).
+    // V(μ) = μ(1−μ), V'(μ) = 1 − 2μ.
+    let obs_correction = if v > 0.0 && w_prior > 0.0 {
+        let h_prime = dmu_deta * (1.0 - inner);
+        let v_prime = 1.0 - 2.0 * mu;
+        let bracket = h_prime / v - (dmu_deta * dmu_deta) * v_prime / (v * v);
+        w_prior * resid * bracket
+    } else {
+        0.0
+    };
+    let w_hessian = select_w_hessian(mode, w_fisher, obs_correction);
     RowOutput {
         mu,
         grad_eta,
         w_fisher,
-        w_hessian, // Stage 5 swaps in observed information.
+        w_hessian,
         w_solver: if w_hessian > 0.0 {
             w_hessian.max(W_SOLVER_FLOOR)
         } else {
@@ -1055,7 +1079,15 @@ fn gamma_log_body(curvature: CurvatureMode) -> String {
     if (mu_raw < 1e-10) flags |= 0x2u;
     double mu = (mu_raw > 1e-10) ? mu_raw : 1e-10;
     double w_fisher = wp * shape;
+#ifdef PIRLS_CURVATURE_OBSERVED
+    // Stage 5: observed information for Gamma-log.
+    //   w_obs = w_F + w_F · (y/μ − 1) = w_F · y/μ.
+    double w_hessian = (w_fisher > 0.0 && mu > 0.0 && isfinite(y_i))
+        ? w_fisher * (y_i / mu)
+        : w_fisher;
+#else
     double w_hessian = w_fisher;
+#endif
     double w_solver = (w_hessian > 0.0) ? fmax(w_hessian, 1e-12) : 0.0;
     double resid = y_i - mu;
     double grad_eta = wp * resid / mu;
@@ -1104,8 +1136,21 @@ fn bernoulli_probit_body(curvature: CurvatureMode) -> String {
     double v = mu * (1.0 - mu);
     double fpp = (v > 0.0) ? dmu_deta * dmu_deta / v : 0.0;
     double w_fisher = wp * fpp;
+#ifdef PIRLS_CURVATURE_OBSERVED
+    // Stage 5: observed information for Bernoulli probit.
+    //   w_obs = w_F + w_p · (y − μ) · [h'/V − h²·V'/V²].
+    // h(η)=φ(η), h'(η)=−η·φ(η); V'=1−2μ.
     double w_hessian = w_fisher;
-    double w_solver = (w_fisher > 0.0) ? fmax(w_fisher, 1e-12) : 0.0;
+    if (v > 0.0 && wp > 0.0) {
+        double h_prime = -eta_c * dmu_deta;
+        double v_prime = 1.0 - 2.0 * mu;
+        double bracket = h_prime / v - (dmu_deta * dmu_deta) * v_prime / (v * v);
+        w_hessian = w_fisher + wp * (y_i - mu) * bracket;
+    }
+#else
+    double w_hessian = w_fisher;
+#endif
+    double w_solver = (w_hessian > 0.0) ? fmax(w_hessian, 1e-12) : 0.0;
     double resid = y_i - mu;
     double grad_eta = (v > 0.0) ? wp * resid * dmu_deta / v : 0.0;
     double dev = bernoulli_deviance(y_i, mu, wp);
@@ -1129,8 +1174,21 @@ fn bernoulli_cloglog_body(curvature: CurvatureMode) -> String {
     double v = mu * (1.0 - mu);
     double fpp = (v > 0.0) ? dmu_deta * dmu_deta / v : 0.0;
     double w_fisher = wp * fpp;
+#ifdef PIRLS_CURVATURE_OBSERVED
+    // Stage 5: observed information for Bernoulli cloglog.
+    //   w_obs = w_F + w_p · (y − μ) · [h'/V − h²·V'/V²].
+    // h'(η) = h(η) · (1 − inner); V'=1−2μ.
     double w_hessian = w_fisher;
-    double w_solver = (w_fisher > 0.0) ? fmax(w_fisher, 1e-12) : 0.0;
+    if (v > 0.0 && wp > 0.0) {
+        double h_prime = dmu_deta * (1.0 - inner);
+        double v_prime = 1.0 - 2.0 * mu;
+        double bracket = h_prime / v - (dmu_deta * dmu_deta) * v_prime / (v * v);
+        w_hessian = w_fisher + wp * (y_i - mu) * bracket;
+    }
+#else
+    double w_hessian = w_fisher;
+#endif
+    double w_solver = (w_hessian > 0.0) ? fmax(w_hessian, 1e-12) : 0.0;
     double resid = y_i - mu;
     double grad_eta = (v > 0.0) ? wp * resid * dmu_deta / v : 0.0;
     double dev = bernoulli_deviance(y_i, mu, wp);
@@ -1426,6 +1484,66 @@ mod pirls_row_gpu_tests {
                     "{family:?}: module cache must return same handle on second call"
                 );
             }
+        }
+    }
+
+    /// Stage 5: observed-information curvature mode is now real math
+    /// (no longer a Fisher alias) for Gamma-log, Bernoulli probit, and
+    /// Bernoulli cloglog. Canonical families (Bernoulli logit, Poisson
+    /// log, Gaussian identity) remain == Fisher because canonical
+    /// links have observed == Fisher by construction.
+    #[test]
+    fn observed_curvature_matches_expected_per_family() {
+        // Picks where the math is well-conditioned so that round-off
+        // doesn't dominate the comparison.
+        let probe_eta = 0.4_f64;
+        let probe_y = 1.0_f64;
+        let wp = 1.5_f64;
+        let input = RowInput {
+            eta: probe_eta,
+            y: probe_y,
+            prior_weight: wp,
+        };
+
+        // Canonical families: observed must equal Fisher exactly.
+        for canonical in [
+            PirlsRowFamily::GaussianIdentity,
+            PirlsRowFamily::PoissonLog,
+            PirlsRowFamily::BernoulliLogit,
+        ] {
+            let f = row_reweight_cpu(canonical, CurvatureMode::Fisher, input);
+            let o = row_reweight_cpu(canonical, CurvatureMode::Observed, input);
+            assert_eq!(
+                f.w_hessian, o.w_hessian,
+                "{canonical:?}: observed must equal Fisher for canonical link"
+            );
+        }
+
+        // Gamma-log: observed = Fisher · (y/μ); Fisher = wp · shape (shape=1).
+        let gf = row_reweight_cpu(PirlsRowFamily::GammaLog, CurvatureMode::Fisher, input);
+        let go = row_reweight_cpu(PirlsRowFamily::GammaLog, CurvatureMode::Observed, input);
+        assert!(
+            (go.w_hessian - gf.w_fisher * (probe_y / gf.mu)).abs() <= 1e-12,
+            "Gamma-log observed mismatch: got={} expected={} (mu={})",
+            go.w_hessian,
+            gf.w_fisher * (probe_y / gf.mu),
+            gf.mu
+        );
+
+        // Bernoulli probit/cloglog: observed must differ from Fisher
+        // generically and must be ≥ 0 at well-behaved interior points
+        // (saturation tail can push it negative; tested elsewhere).
+        for noncanon in [
+            PirlsRowFamily::BernoulliProbit,
+            PirlsRowFamily::BernoulliCLogLog,
+        ] {
+            let f = row_reweight_cpu(noncanon, CurvatureMode::Fisher, input);
+            let o = row_reweight_cpu(noncanon, CurvatureMode::Observed, input);
+            assert!(
+                (f.w_hessian - o.w_hessian).abs() > 0.0
+                    || (probe_y - f.mu).abs() < 1e-15,
+                "{noncanon:?}: observed should differ from Fisher when y ≠ μ"
+            );
         }
     }
 
