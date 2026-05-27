@@ -1865,8 +1865,8 @@ pub(crate) fn install_compiled_flex_block_into_runtime(
     }
 
     // Stack the anchor dense blocks horizontally into N_train (n × d_total)
-    // for both the install-side cache (`set_anchor_rows_at_training`) and the
-    // compiler-input operator stack below.
+    // for both the install-side anchor row cache and the compiler-input
+    // operator stack below.
     let d_total = total_anchor_cols;
     let mut n_train = Array2::<f64>::zeros((n, d_total));
     {
@@ -1925,9 +1925,9 @@ pub(crate) fn install_compiled_flex_block_into_runtime(
         return Ok(FlexCompileOutcome::FullyAliased { reason });
     }
     // Shape contract: compile() must emit (d_total × k_kept) anchor_correction
-    // for the trailing candidate block. install_compiled_flex_block re-validates
-    // via compose_anchor_orthogonalisation but emits a less specific error;
-    // catch it here with the d_total / k_kept context.
+    // for the trailing candidate block. The install path re-validates but
+    // emits a less specific error; catch it here with the d_total/k_kept
+    // context.
     {
         let m = candidate_compiled.anchor_correction.as_ref().ok_or_else(|| {
             "cross-block identifiability: compile returned no anchor_correction for the \

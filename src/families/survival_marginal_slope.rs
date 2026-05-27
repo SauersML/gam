@@ -528,10 +528,10 @@ fn score_warp_component_beta(
 /// to produce the direct-sum block `Φ_total = [Φ(z_1) | Φ(z_2) | ... | Φ(z_K)]`.
 ///
 /// Caller is responsible for any cross-block reparameterisation on
-/// `base.runtime` BEFORE calling this — `compose_anchor_orthogonalisation`
-/// has already updated `base.runtime.basis_dim()` to the kept dimension
-/// `p_kept`, and `base.block.design / penalties / nullspace_dims` reflect
-/// that reparam. Each per-z stripe then evaluates `runtime.design_at_training_with_residual`
+/// `base.runtime` BEFORE calling this — the install path has already
+/// updated `base.runtime.basis_dim()` to the kept dimension `p_kept`,
+/// and `base.block.design / penalties / nullspace_dims` reflect that
+/// reparam. Each per-z stripe then evaluates `runtime.design_at_training_with_residual`
 /// at `z[:, k]` so the cached parametric anchor rows are folded into every
 /// stripe, giving a striped design that is jointly orthogonal (in the W-
 /// metric used during reparam) to span(anchors) at training rows.
