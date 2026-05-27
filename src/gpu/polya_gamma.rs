@@ -53,6 +53,7 @@
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
+#[cfg(target_os = "linux")]
 use super::error::GpuError;
 
 // ────────────────────────────────────────────────────────────────────────

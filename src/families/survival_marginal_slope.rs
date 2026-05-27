@@ -957,16 +957,16 @@ struct CachedCellEntry {
     fixed: DenestedCellPrimaryFixedPartials,
 }
 
-struct SurvivalFlexTimepointExact {
-    eta: f64,
-    chi: f64,
-    d: f64,
-    eta_u: Array1<f64>,
-    eta_uv: Array2<f64>,
-    chi_u: Array1<f64>,
-    chi_uv: Array2<f64>,
-    d_u: Array1<f64>,
-    d_uv: Array2<f64>,
+pub(crate) struct SurvivalFlexTimepointExact {
+    pub(crate) eta: f64,
+    pub(crate) chi: f64,
+    pub(crate) d: f64,
+    pub(crate) eta_u: Array1<f64>,
+    pub(crate) eta_uv: Array2<f64>,
+    pub(crate) chi_u: Array1<f64>,
+    pub(crate) chi_uv: Array2<f64>,
+    pub(crate) d_u: Array1<f64>,
+    pub(crate) d_uv: Array2<f64>,
 }
 
 struct SurvivalFlexTimepointFirstOrderExact {
@@ -981,17 +981,17 @@ struct SurvivalFlexTimepointFirstOrderExact {
 /// Directional extensions of a timepoint's exact quantities, contracted with
 /// a single direction.  These are the pieces needed to compose the third-order
 /// NLL contraction.
-struct SurvivalFlexTimepointDirectionalExact {
-    eta_uv_dir: Array2<f64>,
-    chi_uv_dir: Array2<f64>,
-    d_u_dir: Array1<f64>,
-    d_uv_dir: Array2<f64>,
+pub(crate) struct SurvivalFlexTimepointDirectionalExact {
+    pub(crate) eta_uv_dir: Array2<f64>,
+    pub(crate) chi_uv_dir: Array2<f64>,
+    pub(crate) d_u_dir: Array1<f64>,
+    pub(crate) d_uv_dir: Array2<f64>,
 }
 
-struct SurvivalFlexTimepointBiDirectionalExact {
-    eta_uv_uv: Array2<f64>,
-    chi_uv_uv: Array2<f64>,
-    d_uv_uv: Array2<f64>,
+pub(crate) struct SurvivalFlexTimepointBiDirectionalExact {
+    pub(crate) eta_uv_uv: Array2<f64>,
+    pub(crate) chi_uv_uv: Array2<f64>,
+    pub(crate) d_uv_uv: Array2<f64>,
 }
 
 #[derive(Clone)]
@@ -10787,7 +10787,7 @@ impl SurvivalMarginalSlopeFamily {
 
     /// Exact third-order directional contraction for the flexible survival
     /// path.  Returns D_dir H[u,v] where H is the primary-space NLL Hessian.
-    fn row_flex_primary_third_contracted_exact(
+    pub(crate) fn row_flex_primary_third_contracted_exact(
         &self,
         row: usize,
         block_states: &[ParameterBlockState],
@@ -10962,7 +10962,7 @@ impl SurvivalMarginalSlopeFamily {
     /// The mixed second-directional timepoint transport is carried exactly
     /// through the implicit intercept solve, the observed-point eta/chi jets,
     /// and the cellwise density-normalization integrand.
-    fn row_flex_primary_fourth_contracted_exact(
+    pub(crate) fn row_flex_primary_fourth_contracted_exact(
         &self,
         row: usize,
         block_states: &[ParameterBlockState],
@@ -11095,6 +11095,108 @@ impl SurvivalMarginalSlopeFamily {
             }
         }
         Ok(out)
+    }
+
+    /// Test-only accessor that materialises the per-row timepoint jets
+    /// (entry/exit base + per-direction extensions + bidirectional) used
+    /// to assemble the third- and fourth-order contractions.  Exposed so
+    /// parity tests in `src/gpu/survival_flex.rs` can drive the Block 10
+    /// CPU oracle (which is a pure assembler over these jets) against
+    /// `row_flex_primary_third_contracted_exact` /
+    /// `row_flex_primary_fourth_contracted_exact`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn flex_primary_timepoint_jets_for_test(
+        &self,
+        row: usize,
+        block_states: &[ParameterBlockState],
+        dir1: &Array1<f64>,
+        dir2: Option<&Array1<f64>>,
+    ) -> Result<
+        (
+            SurvivalFlexTimepointExact,
+            SurvivalFlexTimepointExact,
+            SurvivalFlexTimepointDirectionalExact,
+            SurvivalFlexTimepointDirectionalExact,
+            Option<SurvivalFlexTimepointDirectionalExact>,
+            Option<SurvivalFlexTimepointDirectionalExact>,
+            Option<SurvivalFlexTimepointBiDirectionalExact>,
+            Option<SurvivalFlexTimepointBiDirectionalExact>,
+            f64,
+            usize,
+            usize,
+        ),
+        String,
+    > {
+        self.ensure_scalar_flex_exact_score_geometry("flex_primary_timepoint_jets_for_test")?;
+        let primary = flex_primary_slices(self);
+        let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
+        let q0 = q_geom.q0;
+        let q1 = q_geom.q1;
+        let qd1 = q_geom.qd1;
+        let g = block_states[2].eta[row];
+        let beta_h = self.flex_score_beta(block_states)?;
+        let beta_w = self.flex_link_beta(block_states)?;
+
+        let (a0, d0) = self.solve_row_survival_intercept_with_slot(
+            q0,
+            g,
+            beta_h,
+            beta_w,
+            Some((row, SurvivalInterceptSlotKind::Entry)),
+        )?;
+        let (a1, d1) = self.solve_row_survival_intercept_with_slot(
+            q1,
+            g,
+            beta_h,
+            beta_w,
+            Some((row, SurvivalInterceptSlotKind::Exit)),
+        )?;
+
+        let entry_base = self.compute_survival_timepoint_exact(
+            row, &primary, q0, primary.q0, a0, g, d0, beta_h, beta_w, false,
+        )?;
+        let exit_base = self.compute_survival_timepoint_exact(
+            row, &primary, q1, primary.q1, a1, g, d1, beta_h, beta_w, true,
+        )?;
+
+        let entry_ext1 = self.compute_survival_timepoint_directional_exact(
+            row, &primary, q0, primary.q0, a0, g, beta_h, beta_w, dir1, false,
+        )?;
+        let exit_ext1 = self.compute_survival_timepoint_directional_exact(
+            row, &primary, q1, primary.q1, a1, g, beta_h, beta_w, dir1, true,
+        )?;
+
+        let (entry_ext2, exit_ext2, entry_bi, exit_bi) = if let Some(dir2_arr) = dir2 {
+            let entry_ext2 = self.compute_survival_timepoint_directional_exact(
+                row, &primary, q0, primary.q0, a0, g, beta_h, beta_w, dir2_arr, false,
+            )?;
+            let exit_ext2 = self.compute_survival_timepoint_directional_exact(
+                row, &primary, q1, primary.q1, a1, g, beta_h, beta_w, dir2_arr, true,
+            )?;
+            let entry_bi = self.compute_survival_timepoint_bidirectional_exact(
+                row, &primary, q0, primary.q0, a0, g, beta_h, beta_w, dir1, dir2_arr,
+            )?;
+            let exit_bi = self.compute_survival_timepoint_bidirectional_exact(
+                row, &primary, q1, primary.q1, a1, g, beta_h, beta_w, dir1, dir2_arr,
+            )?;
+            (Some(entry_ext2), Some(exit_ext2), Some(entry_bi), Some(exit_bi))
+        } else {
+            (None, None, None, None)
+        };
+
+        Ok((
+            entry_base,
+            exit_base,
+            entry_ext1,
+            exit_ext1,
+            entry_ext2,
+            exit_ext2,
+            entry_bi,
+            exit_bi,
+            qd1,
+            primary.qd1,
+            primary.total,
+        ))
     }
 
     /// Compute the ordered fourth contracted D_{dir2}(D_{dir1}(H[a,b])).

@@ -52,6 +52,7 @@
 //! in this module are deliberately distinct (`cubic_bspline_cell_moments`,
 //! `tensor_bspline_moment_table`) to avoid any collision or confusion.
 
+#[cfg(target_os = "linux")]
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};

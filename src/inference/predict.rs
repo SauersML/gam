@@ -5679,7 +5679,6 @@ mod tests {
                 .collect(),
             anchor_correction: None,
             anchor_components: Vec::new(),
-            anchor_residual_rotation: None,
         }
     }
 
@@ -6019,7 +6018,6 @@ mod tests {
                 ncols: d,
             },
         }];
-        runtime.anchor_residual_rotation = None;
 
         let values = array![-1.0, 0.0, 0.5, 2.0];
         let n = values.len();
