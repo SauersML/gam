@@ -24951,6 +24951,7 @@ mod tests {
             early_exit_threshold: None,
             outer_score_subsample: None,
             auto_outer_subsample: false,
+            outer_eval_context: None,
             cache_session: None,
             cache_mirror_sessions: Vec::new(),
         };
@@ -24998,6 +24999,7 @@ mod tests {
             early_exit_threshold: None,
             outer_score_subsample: None,
             auto_outer_subsample: false,
+            outer_eval_context: None,
             cache_session: None,
             cache_mirror_sessions: Vec::new(),
         };
@@ -25048,6 +25050,7 @@ mod tests {
             early_exit_threshold: None,
             outer_score_subsample: None,
             auto_outer_subsample: false,
+            outer_eval_context: None,
             cache_session: None,
             cache_mirror_sessions: Vec::new(),
         };

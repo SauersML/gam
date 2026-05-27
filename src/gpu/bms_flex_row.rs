@@ -1200,14 +1200,10 @@ pub(crate) const HVP_THREADS: u32 = 128;
 /// symmetric scratch-write loop in `bms_flex_row_kernel`'s shared-memory
 /// finaliser).
 #[cfg(target_os = "linux")]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum RowHessianLayout {
-    /// Dense `[n, r, r]` row-major. Element `(u, v)` is `hess[i*r*r + u*r + v]`.
-    FullRowMajor,
-}
-
-#[cfg(target_os = "linux")]
 pub struct DeviceResidentRowHess {
+    /// Per-row dense `[n, r, r]` row-major Hessian. Element `(u, v)` of row
+    /// `i` is `hess[i*r*r + u*r + v]`. This is the only on-device storage
+    /// layout supported by the current HVP / diag kernels.
     pub(crate) hess: CudaSlice<f64>,
     pub(crate) marginal_design: CudaSlice<f64>,
     pub(crate) logslope_design: CudaSlice<f64>,
@@ -1215,9 +1211,6 @@ pub struct DeviceResidentRowHess {
     pub(crate) r: usize,
     pub(crate) block: BmsFlexBlockLayout,
     pub(crate) primary: BmsFlexPrimaryLayout,
-    /// On-device storage layout of `hess`. The Hv / diag kernels dispatch on
-    /// this value to pick the right indexing.
-    pub(crate) layout: RowHessianLayout,
     /// Estimated bytes resident on device (for accounting).
     pub(crate) bytes: u64,
 }
@@ -2102,14 +2095,11 @@ pub(crate) fn launch_bms_flex_row_kernel_device_resident(
             r,
             block,
             primary,
-            // Build kernel emits dense `[n, r, r]` row-major; conversion to
-            // `SymmetricPackedUpper` is opt-in via `repack_upper`.
-            layout: RowHessianLayout::FullRowMajor,
+
             bytes,
         },
     ))
 }
-
 
 /// Device-output HVP. Runs `bms_flex_row_hvp_partial(_packed)` +
 /// `bms_flex_row_hvp_reduce` on the storage's stream against caller-supplied
@@ -2621,18 +2611,6 @@ pub fn launch_bms_flex_row_dense_block(
             reason: format!(
                 "bms_flex_row dense_block: p_total={p_total} exceeds DENSE_BLOCK_MAX_P={DENSE_BLOCK_MAX_P} \
                  (per-CTA shmem accumulator p²*8 bytes would exceed V100's 48 KiB/block)"
-            ),
-        });
-    }
-    if storage.layout != RowHessianLayout::FullRowMajor {
-        // The dense-block kernel reads H_i row-major; extending to packed
-        // upper would require a second kernel variant. Adopt only if the
-        // packed path is selected as the default and exact-REML/dense
-        // requests still need to land — Phase 4 benchmark decides.
-        return Err(GpuError::DriverCallFailed {
-            reason: format!(
-                "bms_flex_row dense_block: only FullRowMajor storage is supported (got {:?})",
-                storage.layout
             ),
         });
     }
@@ -3785,8 +3763,11 @@ mod tests {
             row_dir[3] = v[p_m + p_g + p_h_dim];
             let h_slice = &row_hessians[row * r * r..(row + 1) * r * r];
             let mut action0 = 0.0_f64;
+            // h_slice is the row-major r×r Hessian for this row; we want
+            // row 0, i.e. entries (0, vv) for vv in 0..r, which lives at
+            // `vv` in the flat layout.
             for vv in 0..r {
-                action0 += h_slice[0 * r + vv] * row_dir[vv];
+                action0 += h_slice[vv] * row_dir[vv];
             }
             expect_out_0 += action0 * mrow[0];
         }
@@ -3993,7 +3974,7 @@ mod tests {
                 r,
                 block: block.clone(),
                 primary: primary.clone(),
-                layout: RowHessianLayout::FullRowMajor,
+
                 bytes: ((n * r * r + n * p_m + n * p_g) * std::mem::size_of::<f64>()) as u64,
             };
             let gpu_hvp =
@@ -4187,7 +4168,7 @@ mod tests {
                 r,
                 block: block.clone(),
                 primary: primary.clone(),
-                layout: RowHessianLayout::FullRowMajor,
+
                 bytes: ((n * r * r + n * p_m + n * p_g) * std::mem::size_of::<f64>()) as u64,
             };
             let gpu_hvp = launch_bms_flex_row_hvp(&storage, &v)
@@ -4214,7 +4195,6 @@ mod tests {
             }
         }
     }
-
 
     /// Block 9 Phase 6 — small-fixture parity for the dense-block kernel
     /// against the CPU pullback in `crate::gpu::bms_flex::accumulate_row_hessian_pullback`.
@@ -4274,7 +4254,7 @@ mod tests {
                         row_hessians[base + u * r + v] = sym;
                         row_hessians[base + v * r + u] = sym;
                     }
-                    row_hessians[base + u * r + u] += (r as f64);
+                    row_hessians[base + u * r + u] += r as f64;
                 }
             }
             let mut marginal = vec![0.0_f64; n * p_m];
@@ -4377,7 +4357,7 @@ mod tests {
                 r,
                 block: block.clone(),
                 primary: primary.clone(),
-                layout: RowHessianLayout::FullRowMajor,
+
                 bytes: ((n * r * r + n * p_m + n * p_g) * std::mem::size_of::<f64>()) as u64,
             };
             let h_gpu = launch_bms_flex_row_dense_block(&storage)
@@ -4543,7 +4523,7 @@ mod tests {
                 r,
                 block: block.clone(),
                 primary: primary.clone(),
-                layout: RowHessianLayout::FullRowMajor,
+
                 bytes: ((n * r * r + n * p_m + n * p_g) * std::mem::size_of::<f64>()) as u64,
             };
             let warmup: usize = 3;
@@ -4759,7 +4739,7 @@ mod tests {
                 r,
                 block: block.clone(),
                 primary: primary.clone(),
-                layout: RowHessianLayout::FullRowMajor,
+
                 bytes: ((n * r * r + n * p_m + n * p_g) * std::mem::size_of::<f64>()) as u64,
             };
             // Warmup + 5-iter median (dense build is heavier than HVP).

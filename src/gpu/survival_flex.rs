@@ -4698,7 +4698,7 @@ mod survival_flex_gpu_tests {
             cpu_cell, max_degree,
         )
         .expect("cpu cell-derivative-moments reference");
-        state.moments
+        state.moments.to_vec()
     }
 
     #[test]

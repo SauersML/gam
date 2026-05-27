@@ -25,7 +25,7 @@
 //! dispatch decision is consistent with `GpuRuntime::is_available()`.
 
 use csv::StringRecord;
-use gam::gpu::{self, GpuKernel};
+use gam::gpu::{self, GpuEligibility, GpuKernel};
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::{
@@ -91,8 +91,10 @@ fn predict_after_load_on_cpu_only_host_does_not_panic_with_cudarc() {
         GpuKernel::DenseTransposeMatvec,
         GpuKernel::DenseXtWX,
     ] {
-        let decision = std::panic::catch_unwind(|| gpu::decide(kernel, true, true))
-            .expect("gpu::decide must not panic on a CPU-only host");
+        let decision = std::panic::catch_unwind(|| {
+            gpu::decide(kernel, GpuEligibility::from_flags(true, true))
+        })
+        .expect("gpu::decide must not panic on a CPU-only host");
         if !probe {
             assert!(
                 !decision.use_gpu,

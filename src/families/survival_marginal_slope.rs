@@ -11131,113 +11131,6 @@ impl SurvivalMarginalSlopeFamily {
         Ok(out)
     }
 
-    /// Test-only accessor that materialises the per-row timepoint jets
-    /// (entry/exit base + per-direction extensions + bidirectional) used
-    /// to assemble the third- and fourth-order contractions.  Drives the
-    /// Block 10 CPU oracle parity tests below against
-    /// `row_flex_primary_third_contracted_exact` /
-    /// `row_flex_primary_fourth_contracted_exact`.
-    #[cfg(test)]
-    #[allow(clippy::too_many_arguments)]
-    fn flex_primary_timepoint_jets_for_test(
-        &self,
-        row: usize,
-        block_states: &[ParameterBlockState],
-        dir1: &Array1<f64>,
-        dir2: Option<&Array1<f64>>,
-    ) -> Result<
-        (
-            SurvivalFlexTimepointExact,
-            SurvivalFlexTimepointExact,
-            SurvivalFlexTimepointDirectionalExact,
-            SurvivalFlexTimepointDirectionalExact,
-            Option<SurvivalFlexTimepointDirectionalExact>,
-            Option<SurvivalFlexTimepointDirectionalExact>,
-            Option<SurvivalFlexTimepointBiDirectionalExact>,
-            Option<SurvivalFlexTimepointBiDirectionalExact>,
-            f64,
-            usize,
-            usize,
-        ),
-        String,
-    > {
-        self.ensure_scalar_flex_exact_score_geometry("flex_primary_timepoint_jets_for_test")?;
-        let primary = flex_primary_slices(self);
-        let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
-        let q0 = q_geom.q0;
-        let q1 = q_geom.q1;
-        let qd1 = q_geom.qd1;
-        let g = block_states[2].eta[row];
-        let beta_h = self.flex_score_beta(block_states)?;
-        let beta_w = self.flex_link_beta(block_states)?;
-
-        let (a0, d0) = self.solve_row_survival_intercept_with_slot(
-            q0,
-            g,
-            beta_h,
-            beta_w,
-            Some((row, SurvivalInterceptSlotKind::Entry)),
-        )?;
-        let (a1, d1) = self.solve_row_survival_intercept_with_slot(
-            q1,
-            g,
-            beta_h,
-            beta_w,
-            Some((row, SurvivalInterceptSlotKind::Exit)),
-        )?;
-
-        let entry_base = self.compute_survival_timepoint_exact(
-            row, &primary, q0, primary.q0, a0, g, d0, beta_h, beta_w, false,
-        )?;
-        let exit_base = self.compute_survival_timepoint_exact(
-            row, &primary, q1, primary.q1, a1, g, d1, beta_h, beta_w, true,
-        )?;
-
-        let entry_ext1 = self.compute_survival_timepoint_directional_exact(
-            row, &primary, q0, primary.q0, a0, g, beta_h, beta_w, dir1, false,
-        )?;
-        let exit_ext1 = self.compute_survival_timepoint_directional_exact(
-            row, &primary, q1, primary.q1, a1, g, beta_h, beta_w, dir1, true,
-        )?;
-
-        let (entry_ext2, exit_ext2, entry_bi, exit_bi) = if let Some(dir2_arr) = dir2 {
-            let entry_ext2 = self.compute_survival_timepoint_directional_exact(
-                row, &primary, q0, primary.q0, a0, g, beta_h, beta_w, dir2_arr, false,
-            )?;
-            let exit_ext2 = self.compute_survival_timepoint_directional_exact(
-                row, &primary, q1, primary.q1, a1, g, beta_h, beta_w, dir2_arr, true,
-            )?;
-            let entry_bi = self.compute_survival_timepoint_bidirectional_exact(
-                row, &primary, q0, primary.q0, a0, g, beta_h, beta_w, dir1, dir2_arr,
-            )?;
-            let exit_bi = self.compute_survival_timepoint_bidirectional_exact(
-                row, &primary, q1, primary.q1, a1, g, beta_h, beta_w, dir1, dir2_arr,
-            )?;
-            (
-                Some(entry_ext2),
-                Some(exit_ext2),
-                Some(entry_bi),
-                Some(exit_bi),
-            )
-        } else {
-            (None, None, None, None)
-        };
-
-        Ok((
-            entry_base,
-            exit_base,
-            entry_ext1,
-            exit_ext1,
-            entry_ext2,
-            exit_ext2,
-            entry_bi,
-            exit_bi,
-            qd1,
-            primary.qd1,
-            primary.total,
-        ))
-    }
-
     /// Compute the ordered fourth contracted D_{dir2}(D_{dir1}(H[a,b])).
     fn compute_survival_fourth_contracted_ordered(
         &self,
@@ -11807,45 +11700,6 @@ impl SurvivalMarginalSlopeFamily {
             }
             if let (Some(range), Some(score_w)) = (primary_layout.w.as_ref(), score_w) {
                 *score_w = &*score_w + &primary.slice(s![range.clone()]);
-            }
-        }
-    }
-
-    /// Hessian-side analog of [`accumulate_score_identity_blocks`].
-    /// Accumulates the diagonal `h_block × h_block` and `w_block × w_block`
-    /// sub-matrices of a primary-space Hessian directly into per-block
-    /// Hessian accumulators via identity mapping. The score-warp (`h`) and
-    /// link-deviation (`w`) primary slots pull back identity-style into
-    /// their own block-local Hessian targets — no design-row outer product
-    /// needed because those primaries already live in their own
-    /// coefficient space.
-    ///
-    /// Cross-block Hessian terms (rigid × identity, identity × identity,
-    /// h × w) remain the caller's responsibility and require design-row
-    /// outer products (`row_outer_into_view`) or block-to-block
-    /// rank-1 updates; this helper only covers the principal diagonal
-    /// identity blocks. Calling pattern mirrors
-    /// [`accumulate_score_identity_blocks`].
-    ///
-    /// Closes the family-side missing infrastructure that lets the GPU
-    /// dispatcher (Step 6) hand back per-row primary `(grad, hess)` and
-    /// have the caller fold the score-warp / link-deviation diagonal
-    /// blocks in one named call instead of inline slice arithmetic.
-    fn accumulate_hessian_identity_blocks(
-        &self,
-        primary_layout: Option<&FlexPrimarySlices>,
-        primary_hessian: &Array2<f64>,
-        hessian_h: Option<&mut Array2<f64>>,
-        hessian_w: Option<&mut Array2<f64>>,
-    ) {
-        if let Some(primary_layout) = primary_layout {
-            if let (Some(range), Some(hessian_h)) = (primary_layout.h.as_ref(), hessian_h) {
-                let block = primary_hessian.slice(s![range.clone(), range.clone()]);
-                *hessian_h = &*hessian_h + &block;
-            }
-            if let (Some(range), Some(hessian_w)) = (primary_layout.w.as_ref(), hessian_w) {
-                let block = primary_hessian.slice(s![range.clone(), range.clone()]);
-                *hessian_w = &*hessian_w + &block;
             }
         }
     }
@@ -19186,7 +19040,8 @@ pub fn fit_survival_marginal_slope_terms(
             // penalty list is over the full time β (one composite
             // smoothness penalty), so a single-term partition is
             // correct here.
-            let time_partition = vec![0..p_time];
+            let time_partition: Vec<std::ops::Range<usize>> =
+                std::iter::once(0..p_time).collect();
             let marg_penalty_ranges: Vec<_> = marginal_design
                 .penalties
                 .iter()
@@ -25244,6 +25099,114 @@ mod tests {
                     "{label}[{u},{v}]: got={got:.17e} want={want:.17e} abs={abs:.3e} rel={rel:.3e}",
                 );
             }
+        }
+    }
+
+    impl SurvivalMarginalSlopeFamily {
+        /// Test-only accessor that materialises the per-row timepoint jets
+        /// (entry/exit base + per-direction extensions + bidirectional) used
+        /// to assemble the third- and fourth-order contractions.  Drives the
+        /// Block 10 CPU oracle parity tests below against
+        /// `row_flex_primary_third_contracted_exact` /
+        /// `row_flex_primary_fourth_contracted_exact`.
+        #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+        fn flex_primary_timepoint_jets_for_test(
+            &self,
+            row: usize,
+            block_states: &[ParameterBlockState],
+            dir1: &Array1<f64>,
+            dir2: Option<&Array1<f64>>,
+        ) -> Result<
+            (
+                SurvivalFlexTimepointExact,
+                SurvivalFlexTimepointExact,
+                SurvivalFlexTimepointDirectionalExact,
+                SurvivalFlexTimepointDirectionalExact,
+                Option<SurvivalFlexTimepointDirectionalExact>,
+                Option<SurvivalFlexTimepointDirectionalExact>,
+                Option<SurvivalFlexTimepointBiDirectionalExact>,
+                Option<SurvivalFlexTimepointBiDirectionalExact>,
+                f64,
+                usize,
+                usize,
+            ),
+            String,
+        > {
+            self.ensure_scalar_flex_exact_score_geometry("flex_primary_timepoint_jets_for_test")?;
+            let primary = flex_primary_slices(self);
+            let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
+            let q0 = q_geom.q0;
+            let q1 = q_geom.q1;
+            let qd1 = q_geom.qd1;
+            let g = block_states[2].eta[row];
+            let beta_h = self.flex_score_beta(block_states)?;
+            let beta_w = self.flex_link_beta(block_states)?;
+
+            let (a0, d0) = self.solve_row_survival_intercept_with_slot(
+                q0,
+                g,
+                beta_h,
+                beta_w,
+                Some((row, SurvivalInterceptSlotKind::Entry)),
+            )?;
+            let (a1, d1) = self.solve_row_survival_intercept_with_slot(
+                q1,
+                g,
+                beta_h,
+                beta_w,
+                Some((row, SurvivalInterceptSlotKind::Exit)),
+            )?;
+
+            let entry_base = self.compute_survival_timepoint_exact(
+                row, &primary, q0, primary.q0, a0, g, d0, beta_h, beta_w, false,
+            )?;
+            let exit_base = self.compute_survival_timepoint_exact(
+                row, &primary, q1, primary.q1, a1, g, d1, beta_h, beta_w, true,
+            )?;
+
+            let entry_ext1 = self.compute_survival_timepoint_directional_exact(
+                row, &primary, q0, primary.q0, a0, g, beta_h, beta_w, dir1, false,
+            )?;
+            let exit_ext1 = self.compute_survival_timepoint_directional_exact(
+                row, &primary, q1, primary.q1, a1, g, beta_h, beta_w, dir1, true,
+            )?;
+
+            let (entry_ext2, exit_ext2, entry_bi, exit_bi) = if let Some(dir2_arr) = dir2 {
+                let entry_ext2 = self.compute_survival_timepoint_directional_exact(
+                    row, &primary, q0, primary.q0, a0, g, beta_h, beta_w, dir2_arr, false,
+                )?;
+                let exit_ext2 = self.compute_survival_timepoint_directional_exact(
+                    row, &primary, q1, primary.q1, a1, g, beta_h, beta_w, dir2_arr, true,
+                )?;
+                let entry_bi = self.compute_survival_timepoint_bidirectional_exact(
+                    row, &primary, q0, primary.q0, a0, g, beta_h, beta_w, dir1, dir2_arr,
+                )?;
+                let exit_bi = self.compute_survival_timepoint_bidirectional_exact(
+                    row, &primary, q1, primary.q1, a1, g, beta_h, beta_w, dir1, dir2_arr,
+                )?;
+                (
+                    Some(entry_ext2),
+                    Some(exit_ext2),
+                    Some(entry_bi),
+                    Some(exit_bi),
+                )
+            } else {
+                (None, None, None, None)
+            };
+
+            Ok((
+                entry_base,
+                exit_base,
+                entry_ext1,
+                exit_ext1,
+                entry_ext2,
+                exit_ext2,
+                entry_bi,
+                exit_bi,
+                qd1,
+                primary.qd1,
+                primary.total,
+            ))
         }
     }
 

@@ -32,8 +32,7 @@ use std::sync::Arc;
 use crate::solver::arrow_schur::{ArrowRowBlock, ArrowSchurError, ArrowSchurSystem};
 use crate::terms::analytic_penalties::{
     ARDPenalty, AnalyticPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry,
-    IBPAssignmentPenalty, MechanismSparsityPenalty, PenaltyTier, PsiSlice,
-    SoftmaxAssignmentSparsityPenalty,
+    IBPAssignmentPenalty, PenaltyTier, PsiSlice, SoftmaxAssignmentSparsityPenalty,
 };
 use crate::terms::latent_coord::{LatentCoordValues, LatentIdMode, LatentManifold};
 
@@ -234,16 +233,22 @@ impl SaeAtomBasisKind {
 
 pub trait SaeBasisEvaluator: Send + Sync + std::fmt::Debug {
     fn evaluate(&self, coords: ArrayView2<'_, f64>) -> Result<(Array2<f64>, Array3<f64>), String>;
+}
 
-    /// Second-jet `H[n, m, a, c] = ∂²Phi_k[n, m] / (∂t_{n,a} ∂t_{n,c})`,
-    /// shape `(n_rows, n_basis, latent_dim, latent_dim)`. Returning `None`
-    /// signals "not implemented for this basis"; callers (e.g. the SAE
-    /// Isometry penalty wiring) treat that as "no analytic ∂J/∂t available
-    /// from the basis" and fall back to whatever derivative-free or
-    /// Duchon-radial source they already use.
-    fn second_jet(&self, _coords: ArrayView2<'_, f64>) -> Option<Array4<f64>> {
-        None
-    }
+/// Bases that expose an analytic second jet
+/// `H[n, m, a, c] = ∂²Phi_k[n, m] / (∂t_{n,a} ∂t_{n,c})`,
+/// shape `(n_rows, n_basis, latent_dim, latent_dim)`.
+///
+/// Implemented only by evaluators with a closed-form Hessian (periodic
+/// harmonic, sphere chart, torus). Callers that need an analytic
+/// `∂J/∂t` require this bound; evaluators without it must use a
+/// derivative-free fallback. Replaces the previous `Option<Array4<f64>>`
+/// return on the base trait so the "no second jet" case is encoded by
+/// trait absence rather than a sentinel `None`, and shape mismatches
+/// surface as descriptive errors instead of silently collapsing to
+/// `None`.
+pub trait SaeBasisSecondJet: SaeBasisEvaluator {
+    fn second_jet(&self, coords: ArrayView2<'_, f64>) -> Result<Array4<f64>, String>;
 }
 
 /// Periodic harmonic basis evaluator for a single-dimensional circle latent.
@@ -298,17 +303,21 @@ impl SaeBasisEvaluator for PeriodicHarmonicEvaluator {
         }
         Ok((phi, jet))
     }
+}
 
+impl SaeBasisSecondJet for PeriodicHarmonicEvaluator {
     /// Second derivative of the 1D Fourier basis on the unit circle.
     ///
     /// For `Phi = [1, sin(2π h t), cos(2π h t), ...]` we have
     /// `Phi'' = [0, -(2π h)² sin(...), -(2π h)² cos(...), ...]`, i.e.
     /// the second derivative is `-(2π h)² · phi(t)` on each harmonic pair.
-    fn second_jet(&self, coords: ArrayView2<'_, f64>) -> Option<Array4<f64>> {
+    fn second_jet(&self, coords: ArrayView2<'_, f64>) -> Result<Array4<f64>, String> {
         let n = coords.nrows();
         let d = coords.ncols();
         if d != 1 {
-            return None;
+            return Err(format!(
+                "PeriodicHarmonicEvaluator::second_jet: expected latent_dim == 1, got {d}"
+            ));
         }
         let m = self.num_basis;
         let num_harmonics = (m - 1) / 2;
@@ -328,7 +337,7 @@ impl SaeBasisEvaluator for PeriodicHarmonicEvaluator {
                 h[[row, c_idx, 0, 0]] = -freq2 * c;
             }
         }
-        Some(h)
+        Ok(h)
     }
 }
 
@@ -438,7 +447,9 @@ impl SaeBasisEvaluator for SphereChartEvaluator {
         }
         Ok((phi, jet))
     }
+}
 
+impl SaeBasisSecondJet for SphereChartEvaluator {
     /// Analytic Hessian of the 7-column lat/lon sphere chart basis.
     ///
     /// With `x = cos(lat) cos(lon)`, `y = cos(lat) sin(lon)`, `z = sin(lat)`
@@ -456,9 +467,12 @@ impl SaeBasisEvaluator for SphereChartEvaluator {
     /// `(fg)_{αβ} = f_{αβ} g + f_α g_β + f_β g_α + f g_{αβ}`. The boundary
     /// chain factor `a` is idempotent (`a² = a`), so reapplying it on a
     /// double-lat derivative is a no-op.
-    fn second_jet(&self, coords: ArrayView2<'_, f64>) -> Option<Array4<f64>> {
+    fn second_jet(&self, coords: ArrayView2<'_, f64>) -> Result<Array4<f64>, String> {
         if coords.ncols() != 2 {
-            return None;
+            return Err(format!(
+                "SphereChartEvaluator::second_jet expects latent_dim == 2, got {}",
+                coords.ncols()
+            ));
         }
         let n = coords.nrows();
         let mut h = Array4::<f64>::zeros((n, 7, 2, 2));
@@ -518,7 +532,7 @@ impl SaeBasisEvaluator for SphereChartEvaluator {
                 }
             }
         }
-        Some(h)
+        Ok(h)
     }
 }
 
@@ -637,7 +651,9 @@ impl SaeBasisEvaluator for TorusHarmonicEvaluator {
         }
         Ok((phi, jet))
     }
+}
 
+impl SaeBasisSecondJet for TorusHarmonicEvaluator {
     /// Hessian of the tensor-product torus basis.
     ///
     /// Each basis function factors as `Φ_flat = Π_axis f_axis(t_axis)`, so
@@ -649,10 +665,13 @@ impl SaeBasisEvaluator for TorusHarmonicEvaluator {
     /// Per-axis the basis is `[1, sin(2π h t), cos(2π h t), …]`, so
     /// `f_axis''(t) = -(2π h)² · f_axis(t)` on the harmonic columns and 0 on
     /// the constant column.
-    fn second_jet(&self, coords: ArrayView2<'_, f64>) -> Option<Array4<f64>> {
+    fn second_jet(&self, coords: ArrayView2<'_, f64>) -> Result<Array4<f64>, String> {
         let d = self.latent_dim;
         if coords.ncols() != d {
-            return None;
+            return Err(format!(
+                "TorusHarmonicEvaluator::second_jet expects latent_dim == {d}, got {}",
+                coords.ncols()
+            ));
         }
         let n = coords.nrows();
         let axis_m = self.axis_basis_size();
@@ -712,7 +731,7 @@ impl SaeBasisEvaluator for TorusHarmonicEvaluator {
                 }
             }
         }
-        Some(hess)
+        Ok(hess)
     }
 }
 
@@ -2629,6 +2648,7 @@ pub fn term_from_padded_blocks_with_mode(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terms::analytic_penalties::MechanismSparsityPenalty;
     use approx::assert_abs_diff_eq;
     use ndarray::array;
 
@@ -3092,16 +3112,14 @@ mod tests {
     /// Tolerance is `1e-5` per the charter; the FD step is 1e-4 (the sweet
     /// spot before f64 cancellation dominates a centered difference of an
     /// `O(1)` Jacobian).
-    fn assert_second_jet_matches_central_difference<E: SaeBasisEvaluator>(
+    fn assert_second_jet_matches_central_difference<E: SaeBasisSecondJet>(
         evaluator: &E,
         coords: Array2<f64>,
         tolerance: f64,
-    ) {
+    ) -> Result<(), String> {
         let epsilon = 1.0e-4;
-        let second = evaluator
-            .second_jet(coords.view())
-            .expect("second_jet returned None for a basis that should implement it");
-        let (_phi, jet) = evaluator.evaluate(coords.view()).unwrap();
+        let second = evaluator.second_jet(coords.view())?;
+        let (_phi, jet) = evaluator.evaluate(coords.view())?;
         let (n_rows, n_basis, latent_dim, latent_dim_b) = second.dim();
         assert_eq!(latent_dim, latent_dim_b);
         assert_eq!((n_rows, n_basis, latent_dim), jet.dim());
@@ -3145,33 +3163,37 @@ mod tests {
                 }
             }
         }
+        Ok(())
     }
 
     #[test]
-    fn isometry_periodic_second_jet_matches_fd() {
+    fn isometry_periodic_second_jet_matches_fd() -> Result<(), String> {
         assert_second_jet_matches_central_difference(
             &PeriodicHarmonicEvaluator::new(7).unwrap(),
             array![[-0.37], [0.0], [0.125], [0.41]],
             1.0e-5,
-        );
+        )?;
+        Ok(())
     }
 
     #[test]
-    fn isometry_sphere_second_jet_matches_fd() {
+    fn isometry_sphere_second_jet_matches_fd() -> Result<(), String> {
         // Stay inside the interior `(-π/2, π/2)` for lat so the chain factor
         // is active — that is where the Hessian carries information.
         let sphere_coords = array![[-0.7, -1.2], [-0.25, 0.0], [0.35, 0.9], [0.8, 2.1]];
-        assert_second_jet_matches_central_difference(&SphereChartEvaluator, sphere_coords, 1.0e-5);
+        assert_second_jet_matches_central_difference(&SphereChartEvaluator, sphere_coords, 1.0e-5)?;
+        Ok(())
     }
 
     #[test]
-    fn isometry_torus_second_jet_matches_fd() {
+    fn isometry_torus_second_jet_matches_fd() -> Result<(), String> {
         let torus_coords = array![[0.1, 0.7], [0.42, 0.0], [0.95, 0.33], [0.5, 0.5]];
         assert_second_jet_matches_central_difference(
             &TorusHarmonicEvaluator::new(2, 3).unwrap(),
             torus_coords,
             1.0e-5,
-        );
+        )?;
+        Ok(())
     }
 
     /// Torus T^2 fit on synthetic data with a known two-frequency signal.

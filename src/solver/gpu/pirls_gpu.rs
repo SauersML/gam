@@ -2415,7 +2415,7 @@ mod stream_device_parity_tests {
 mod pcg_device_parity_tests {
     use super::*;
     use crate::gpu::bms_flex_row::{
-        BmsFlexBlockLayout, BmsFlexPrimaryLayout, DeviceResidentRowHess, RowHessianLayout,
+        BmsFlexBlockLayout, BmsFlexPrimaryLayout, DeviceResidentRowHess,
     };
     use ndarray::Array2;
 
@@ -2628,7 +2628,7 @@ mod pcg_device_parity_tests {
             r,
             block,
             primary,
-            layout: RowHessianLayout::FullRowMajor,
+
             bytes: ((n * r * r + n * p_m + n * p_g) * std::mem::size_of::<f64>()) as u64,
         };
 

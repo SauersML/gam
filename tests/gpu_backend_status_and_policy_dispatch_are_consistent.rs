@@ -1,4 +1,4 @@
-use gam::gpu::{self, GpuKernel, GpuPolicy};
+use gam::gpu::{self, GpuEligibility, GpuKernel, GpuPolicy};
 
 #[test]
 fn backend_status_and_policy_dispatch_are_consistent() {
@@ -34,14 +34,20 @@ fn backend_status_and_policy_dispatch_are_consistent() {
     }
 
     gpu::configure_global_policy(GpuPolicy::Off);
-    let off = gpu::decide(GpuKernel::DenseMatvec, true, true);
+    let off = gpu::decide(
+        GpuKernel::DenseMatvec,
+        GpuEligibility::from_flags(true, true),
+    );
     assert!(
         !off.use_gpu,
         "GPU policy Off should always select CPU execution."
     );
 
     let global = gpu::global_policy();
-    let forced = gpu::decide(GpuKernel::DenseMatvec, true, true);
+    let forced = gpu::decide(
+        GpuKernel::DenseMatvec,
+        GpuEligibility::from_flags(true, true),
+    );
     if global == GpuPolicy::Off {
         assert!(
             !forced.use_gpu,

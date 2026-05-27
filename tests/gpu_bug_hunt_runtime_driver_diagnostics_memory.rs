@@ -1,4 +1,6 @@
-use gam::gpu::{self, DeviceCsrMatrix, DeviceMatrix, DeviceVector, GpuKernel, GpuRuntime};
+use gam::gpu::{
+    self, DeviceCsrMatrix, DeviceMatrix, DeviceVector, GpuEligibility, GpuKernel, GpuRuntime,
+};
 use ndarray::{Array2, array};
 use std::thread;
 
@@ -13,7 +15,10 @@ fn gpu_runtime_probe_reports_no_device_or_driver_as_structured_error_instead_of_
 
 #[test]
 fn gpu_policy_auto_falls_back_to_cpu_when_runtime_is_unavailable_and_sets_cpu_reason() {
-    let decision = gpu::decide(GpuKernel::DenseMatvec, true, true);
+    let decision = gpu::decide(
+        GpuKernel::DenseMatvec,
+        GpuEligibility::from_flags(true, true),
+    );
     assert!(
         !decision.use_gpu,
         "gpu=auto should fall back to CPU when runtime has no usable device even if kernel support is compiled"

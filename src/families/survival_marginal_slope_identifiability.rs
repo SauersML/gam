@@ -1756,7 +1756,7 @@ pub fn apply_per_term_vm_exact(
         for g in 0..n_total {
             let inner_dense = DenseDesignMatrix::from(raw_slices[g].clone());
             let v_b = v_per_block[g].clone();
-            let mut anchors: Vec<(DesignMatrix, Array2<f64>)> = Vec::new();
+            let mut anchors: Vec<(DesignMatrix, Arc<Array2<f64>>)> = Vec::new();
             if g > 0 {
                 let r_full = compiled
                     .r_lw_per_term
@@ -1786,7 +1786,7 @@ pub fn apply_per_term_vm_exact(
                             })?;
                         DesignMatrix::Dense(DenseDesignMatrix::from(Arc::new(op)))
                     };
-                    anchors.push((kept_anchor_design, r_a_g));
+                    anchors.push((kept_anchor_design, Arc::new(r_a_g)));
                     row_off += kept_a;
                 }
             }
@@ -2192,6 +2192,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::single_range_in_vec_init)]
     fn extract_term_partition_simple_cases() {
         // No penalties: whole block is one term.
         let part = extract_term_partition_from_penalty_ranges(5, &[]);
@@ -2232,6 +2233,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::single_range_in_vec_init)]
     fn pull_back_blockwise_penalty_per_term_full_term_identity_v() {
         use crate::terms::smooth::BlockwisePenalty;
         // Single-term partition, identity V → pullback returns input.
@@ -2251,6 +2253,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::single_range_in_vec_init)]
     fn pull_back_blockwise_penalty_per_term_drops_one_column() {
         use crate::terms::smooth::BlockwisePenalty;
         // 3-column term, V drops one column (3 → 2): V is the 3×2
@@ -2525,6 +2528,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::single_range_in_vec_init)]
     fn validate_partition_rejects_bad_partitions() {
         // Doesn't start at 0.
         assert!(validate_partition(&[1..5], 5, "test").is_err());
@@ -3030,8 +3034,8 @@ mod tests {
         let p_time = 2usize;
         let p_marg = 2usize;
         let p_log = 0usize;
-        let time_partition: Vec<Range<usize>> = vec![0..p_time];
-        let marg_partition: Vec<Range<usize>> = vec![0..p_marg];
+        let time_partition: Vec<Range<usize>> = std::iter::once(0..p_time).collect();
+        let marg_partition: Vec<Range<usize>> = std::iter::once(0..p_marg).collect();
         let log_partition: Vec<Range<usize>> = Vec::new();
 
         // V_time = identity (2×2); V_marginal = drops one column (2×1).
