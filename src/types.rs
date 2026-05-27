@@ -1275,6 +1275,69 @@ impl std::fmt::Display for BasisIdx {
     }
 }
 
+/// Index into the user-facing design matrix `data: Array2<f64>` — i.e. the
+/// position of a covariate column in the raw input frame, *before* any
+/// per-family basis expansion or intercept/parametric layout is applied.
+///
+/// Distinct from:
+///   * [`BasisIdx`] — term-local basis-function ordinal `k` of `B_k(x)`.
+///   * [`SmoothTermIdx`] — position in `TermCollectionSpec::smooth_terms`.
+///   * A coefficient-vector offset `β[i]` — spans the combined design after
+///     expansion, which is much wider than the user-facing data matrix.
+///
+/// Keeping this as its own `#[repr(transparent)]` newtype rules out the easy
+/// confusion of indexing the raw data frame with an expanded-column offset.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ColIdx(usize);
+
+impl ColIdx {
+    #[inline]
+    pub const fn new(idx: usize) -> Self {
+        Self(idx)
+    }
+
+    #[inline]
+    pub const fn get(self) -> usize {
+        self.0
+    }
+}
+
+impl std::fmt::Display for ColIdx {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Index of an observation (row) in the user-facing data frame / design
+/// matrix — i.e. the `i` in "the i-th observation".
+///
+/// Distinct from every column-type index in this module ([`ColIdx`],
+/// [`BasisIdx`], [`SmoothTermIdx`], [`PenaltyIdx`]) and from coefficient
+/// offsets. Keeping rows behind their own `#[repr(transparent)]` newtype
+/// makes the classic `data[[col, row]]` transposition a compile error.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct RowIdx(usize);
+
+impl RowIdx {
+    #[inline]
+    pub const fn new(idx: usize) -> Self {
+        Self(idx)
+    }
+
+    #[inline]
+    pub const fn get(self) -> usize {
+        self.0
+    }
+}
+
+impl std::fmt::Display for RowIdx {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug)]
 pub struct LogSmoothingParamsView<'a>(pub ArrayView1<'a, f64>);
