@@ -1070,6 +1070,37 @@ extern "C" __global__ void linf_norm(
         /// Effective degrees of freedom. Echoed from `extra.edf`;
         /// `f64::NAN` when not supplied.
         pub edf: f64,
+        /// `prev_deviance − accepted_deviance` at the accepted step
+        /// that terminated the loop. Matches the CPU oracle's
+        /// `WorkingModelPirlsResult::last_deviance_change`.
+        pub last_deviance_change: f64,
+        /// Number of line-search halvings consumed on the accepted
+        /// step (`k` when α = `0.5^k`; `0` when α = 1). When the
+        /// loop took the no-descent α=1 fallback, this is `0` with
+        /// `last_step_accept_kind = LineSearchAccept::Fallback`.
+        /// Mirrors `WorkingModelPirlsResult::last_step_halving`.
+        pub last_step_halving: usize,
+        /// Step size α that was accepted at the final iteration.
+        /// Mirrors `WorkingModelPirlsResult::last_step_size`.
+        pub last_step_size: f64,
+        /// Levenberg-Marquardt damping coefficient in effect at the
+        /// last accepted iter. The GPU loop has no on-device ridge
+        /// escalation (it is a constant per call), so this echoes
+        /// the input `lm_ridge`. Maps to
+        /// `PirlsResult::final_lm_lambda`.
+        pub final_lm_lambda: f64,
+        /// Running minimum of the data-side deviance observed across
+        /// all accepted Newton steps. The GPU loop only knows the
+        /// data deviance device-side; the dispatch wirer can add
+        /// `βᵀ·penalty_hessian·β` at the converged β to obtain the
+        /// fully penalised running minimum when needed for
+        /// `PirlsResult::min_penalized_deviance`.
+        pub min_deviance: f64,
+        /// `max_i |η_i|` at the accepted final step — the saturation
+        /// diagnostic the CPU oracle stamps on
+        /// `PirlsResult::max_abs_eta`. Used by REML's
+        /// perfect-separation detection.
+        pub max_abs_eta: f64,
     }
 
     /// Full device-resident PIRLS loop. Only three scalar (1 f64)

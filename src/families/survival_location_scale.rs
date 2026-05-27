@@ -639,11 +639,11 @@ impl ResidualDistributionOps for ResidualDistribution {
 }
 
 #[inline]
-fn residual_distribution_link(distribution: ResidualDistribution) -> LinkFunction {
+fn residual_distribution_link(distribution: ResidualDistribution) -> StandardLink {
     match distribution {
-        ResidualDistribution::Gaussian => LinkFunction::Probit,
-        ResidualDistribution::Gumbel => LinkFunction::CLogLog,
-        ResidualDistribution::Logistic => LinkFunction::Logit,
+        ResidualDistribution::Gaussian => StandardLink::Probit,
+        ResidualDistribution::Gumbel => StandardLink::CLogLog,
+        ResidualDistribution::Logistic => StandardLink::Logit,
     }
 }
 

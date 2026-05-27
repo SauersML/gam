@@ -884,7 +884,7 @@ pub fn inverse_link_mu_d1_for_inverse_link(
     eta: f64,
 ) -> Result<(f64, f64), EstimationError> {
     match link {
-        InverseLink::Standard(link_fn) => Ok(link_function_mu_d1(*link_fn, eta)?),
+        InverseLink::Standard(link_fn) => Ok(link_function_mu_d1(link_fn.as_link_function(), eta)?),
         InverseLink::LatentCLogLog(state) => {
             let jet = latent_cloglog_point_jet(state, eta)?;
             Ok((jet.mu, jet.d1))
