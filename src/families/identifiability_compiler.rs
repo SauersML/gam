@@ -69,12 +69,13 @@ pub trait AnchorRowEvaluator: Send + Sync {
 pub struct CompiledBlock {
     /// Orthogonal-complement reparam matrix `V ∈ R^{p × p'}` (right-selector).
     pub t_lw: Array2<f64>,
-    /// Anchor correction `M ∈ R^{d × p'}` so the row contribution is
-    /// `(C(x)·V − A(x)·M)·β`. `None` for the first block in the ordering.
+    /// Residualised anchor correction `M·V ∈ R^{d × p'}` at the compiled
+    /// width: the row contribution is `(C(x)·V − A(x)·(M·V))·β`. `None`
+    /// for the first block in the ordering. Synonymous with `r_lw`.
     pub anchor_correction: Option<Array2<f64>>,
     /// Residualised reparam `R_b = M_b · V_b` — what the residualised row
     /// evaluator uses to subtract the anchor portion. `None` for the first
-    /// block in the ordering (no anchor).
+    /// block in the ordering (no anchor). Equal to `anchor_correction`.
     pub r_lw: Option<Array2<f64>>,
     /// Predict-time anchor row evaluator. `None` for purely-parametric
     /// blocks that downstream stages do not consume as an anchor.
@@ -221,16 +222,22 @@ pub fn compile(
             });
         }
 
-        // 3. Append B·V to the cumulative anchor design (still in the
-        //    sqrt(H) metric).
-        let w_b_v = fast_ab(w_b, &v);
-        w_anchor = concat_cols(&w_anchor, &w_b_v);
+        // 3. Append (W_b − A·M)·V to the cumulative anchor design (still
+        //    in the sqrt(H) metric). This is the H-orthogonal residual
+        //    times V — the right design for downstream blocks to
+        //    residualise against, and numerically better conditioned than
+        //    `W_b·V` when `V` compresses columns.
+        let residual_v = fast_ab(&residual_scaled, &v);
+        w_anchor = concat_cols(&w_anchor, &residual_v);
 
-        let r_lw = m_opt.as_ref().map(|m| fast_ab(m, &v));
+        // Store M at compiled width: the residualised correction is M·V,
+        // so consumers can directly evaluate `(C(x)·V − A(x)·(M·V))·β`.
+        // `r_lw` is the same matrix; both fields are kept synonymous.
+        let m_compiled = m_opt.as_ref().map(|m| fast_ab(m, &v));
         compiled.push(CompiledBlock {
             t_lw: v,
-            anchor_correction: m_opt,
-            r_lw,
+            anchor_correction: m_compiled.clone(),
+            r_lw: m_compiled,
             anchor_evaluator: None,
         });
     }
