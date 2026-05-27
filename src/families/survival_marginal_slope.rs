@@ -19450,19 +19450,27 @@ pub fn fit_survival_marginal_slope_terms(
             }
             let row_hess = SurvivalRowHessian::from_full(h_full);
 
-            // Closed-form Gram probe: assemble the SMGS K=4 channel-block
+            // Closed-form Gram path: assemble the SMGS K=4 channel-block
             // view (time → q0/q1/qd1; marginal → q0/q1; logslope → g),
-            // build (K^H, K^S) via the GPU-or-CPU dispatcher, and run
-            // `compile_from_raw_grams`. The result is logged for parity
-            // tracking; the per-term V/R path below remains load-bearing
-            // until the result-time lift can consume a `CompiledMap` T
-            // directly. On any probe failure we log and continue.
+            // build (K^H, K^S) via the GPU-or-CPU dispatcher, run
+            // `compile_from_raw_grams`, and — when the build succeeds —
+            // route the resulting `CompiledMap` T through
+            // `apply_compiled_map_to_designs` so the compiled designs +
+            // pulled-back penalties + result-time lift come from the
+            // closed-form path. On any failure we log and fall through
+            // to the per-term V/R path below.
             {
                 use crate::families::identifiability_compiler::{
                     BlockOrder as IdBlockOrder, PrimaryChannelBlocks, build_primary_grams_gpu_or_cpu,
                     compile_from_raw_grams,
                 };
-                let probe = (|| -> Result<(usize, usize, usize), String> {
+                let closed_form = (|| -> Result<
+                    Option<(
+                        crate::families::identifiability_compiler::CompiledMap,
+                        (usize, usize, usize),
+                    )>,
+                    String,
+                > {
                     let time_slots: Vec<Option<ndarray::Array2<f64>>> = vec![
                         Some(dq0.clone()),
                         Some(dq1.clone()),
@@ -19520,20 +19528,89 @@ pub fn fit_survival_marginal_slope_terms(
                     let w_time = map.compiled_block_ranges[0].len();
                     let w_marg = map.compiled_block_ranges[1].len();
                     let w_log = map.compiled_block_ranges[2].len();
-                    Ok((w_time, w_marg, w_log))
+                    Ok(Some((map, (w_time, w_marg, w_log))))
                 })();
-                match probe {
-                    Ok((wt, wm, wl)) => {
-                        log::info!(
-                            "[smgs phase-4b gram-probe] compile_from_raw_grams ok: \
-                             time {p_time}→{wt}, marginal {p_marg}→{wm}, logslope {p_log}→{wl}; \
-                             production path = per_term_vm_exact"
+                match closed_form {
+                    Ok(Some((map, (wt, wm, wl)))) => {
+                        let drops = (
+                            p_time.saturating_sub(wt),
+                            p_marg.saturating_sub(wm),
+                            p_log.saturating_sub(wl),
                         );
+                        // Populate the post-accept recompile context the
+                        // same way the per-term path does. The recompile
+                        // hook rebuilds from the densified matrices at
+                        // converged β; the initial drops field is purely
+                        // diagnostic.
+                        recompile_ctx = Some(SmgsRecompileAfterAcceptContext {
+                            dq0: dq0.clone(),
+                            dq1: dq1.clone(),
+                            dqd1: dqd1.clone(),
+                            m_dq: m_dq.clone(),
+                            m_dqd1: m_dqd1.clone(),
+                            g_dg: g_dg.clone(),
+                            time_partition: time_partition.clone(),
+                            marginal_partition: marginal_partition.clone(),
+                            logslope_partition: logslope_partition.clone(),
+                            offset_entry: spec.time_block.offset_entry.clone(),
+                            offset_exit: spec.time_block.offset_exit.clone(),
+                            derivative_offset_exit: spec.time_block.derivative_offset_exit.clone(),
+                            marginal_offset: spec.marginal_offset.clone(),
+                            logslope_offset: spec.logslope_offset.clone(),
+                            z_primary: z_primary.clone(),
+                            weights: spec.weights.clone(),
+                            event: spec.event_target.clone(),
+                            derivative_guard,
+                            probit_scale,
+                            drops_by_block_initial: drops,
+                        });
+                        if drops.0 + drops.1 + drops.2 == 0 {
+                            log::info!(
+                                "[smgs phase-4b compiled-map] compile_from_raw_grams ok with no drops \
+                                 (time {p_time}→{wt}, marginal {p_marg}→{wm}, logslope {p_log}→{wl}); \
+                                 production path = compiled_map, skipping apply"
+                            );
+                            return Ok(None);
+                        }
+                        log::info!(
+                            "[smgs phase-4b compiled-map] applying CompiledMap T: \
+                             time {p_time}→{wt}, marginal {p_marg}→{wm}, logslope {p_log}→{wl} \
+                             (drops time={}, marginal={}, logslope={}); \
+                             production path = compiled_map",
+                            drops.0,
+                            drops.1,
+                            drops.2,
+                        );
+                        let time_pens_bw: Vec<crate::terms::smooth::BlockwisePenalty> = spec
+                            .time_block
+                            .penalties
+                            .iter()
+                            .map(|p| crate::terms::smooth::BlockwisePenalty::new(0..p_time, p.clone()))
+                            .collect();
+                        let applied: CompiledSurvivalDesignsVMExact = apply_compiled_map_to_designs(
+                            &map,
+                            spec.time_block.design_entry.clone(),
+                            spec.time_block.design_exit.clone(),
+                            spec.time_block.design_derivative_exit.clone(),
+                            marginal_design.design.clone(),
+                            logslope_design.design.clone(),
+                            &time_pens_bw,
+                            &marginal_design.penalties,
+                            &logslope_design.penalties,
+                        )?;
+                        let ordering = [
+                            IdBlockOrder::Time,
+                            IdBlockOrder::Marginal,
+                            IdBlockOrder::Logslope,
+                        ];
+                        let lift = SmgsLiftViaT::from_compiled_map(&map, &ordering);
+                        return Ok(Some((applied, lift)));
                     }
+                    Ok(None) => {}
                     Err(reason) => {
                         log::info!(
-                            "[smgs phase-4b gram-probe] closed-form path unavailable ({reason}); \
-                             production path = per_term_vm_exact"
+                            "[smgs phase-4b compiled-map] closed-form path unavailable ({reason}); \
+                             falling back to per_term_vm_exact"
                         );
                     }
                 }
@@ -19612,7 +19689,16 @@ pub fn fit_survival_marginal_slope_terms(
                 &marginal_design.penalties,
                 &logslope_design.penalties,
             )?;
-            Ok(Some((applied, compiled)))
+            // Flatten per-term V's in global compile order: time,
+            // then marginal, then logslope. Matches the ordering
+            // `apply_per_term_vm_exact` used to build `t_full` and
+            // `compiled.r_lw_per_term`.
+            let mut v_per_block: Vec<ndarray::Array2<f64>> = Vec::new();
+            v_per_block.extend(compiled.v_time_per_term.iter().cloned());
+            v_per_block.extend(compiled.v_marginal_per_term.iter().cloned());
+            v_per_block.extend(compiled.v_logslope_per_term.iter().cloned());
+            let lift = SmgsLiftViaT::from_v_and_r(&v_per_block, &compiled.r_lw_per_term);
+            Ok(Some((applied, lift)))
         })();
         match attempt {
             Ok(Some((applied, compiled))) => {

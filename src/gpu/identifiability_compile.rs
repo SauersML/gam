@@ -193,6 +193,12 @@ mod cuda_impl {
     use std::ops::Range;
     use std::sync::Arc;
 
+    /// Process-wide PTX cache for the fused primary-state Gram kernel.
+    /// NVRTC-compiled on the first `compute_grams_fused` call that
+    /// reaches a CUDA context; reused on every subsequent call.
+    pub(super) static FUSED_GRAM_PTX_CACHE: crate::gpu::common::PtxModuleCache =
+        crate::gpu::common::PtxModuleCache::new();
+
     /// Device-resident cache of channel-block designs plus a reusable
     /// row-scale scratch buffer. Built once per identifiability compile;
     /// each `compute_grams` call only re-uploads the per-row packed
@@ -864,6 +870,72 @@ mod tests {
                 );
             }
             assert_eq!(bundle.raw_block_ranges, ranges);
+        }
+    }
+
+    /// Parity test for the fused NVRTC kernel against the cuBLAS DDGMM+DGEMM
+    /// path. Skipped silently on hosts without a usable CUDA runtime, and
+    /// also when either path independently reports unavailable (CI infra
+    /// outage). On V100 with the fused kernel compiling, both bundles must
+    /// agree to 1e-10 elementwise.
+    #[test]
+    fn fused_kernel_matches_cublas_path() {
+        let (channel_blocks, h_packed, ranges) = make_fixture();
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert!(
+                try_primary_state_gram_fused_cuda(&channel_blocks, &h_packed, &ranges).is_none(),
+                "non-Linux build must report no CUDA for the fused entry point"
+            );
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if crate::gpu::runtime::GpuRuntime::global().is_none() {
+                eprintln!(
+                    "[identifiability_compile] no CUDA runtime — skipping fused/cuBLAS parity check"
+                );
+                return;
+            }
+            let Some(fused_bundle) =
+                try_primary_state_gram_fused_cuda(&channel_blocks, &h_packed, &ranges)
+            else {
+                eprintln!(
+                    "[identifiability_compile] fused kernel build returned None — \
+                     treating as CI infra outage, not a parity regression"
+                );
+                return;
+            };
+            let Some(blas_bundle) =
+                try_primary_state_gram_cuda(&channel_blocks, &h_packed, &ranges)
+            else {
+                eprintln!(
+                    "[identifiability_compile] cuBLAS Gram build returned None — \
+                     treating as CI infra outage, not a parity regression"
+                );
+                return;
+            };
+            let tol = 1e-10_f64;
+            for ((idx, &f), &b) in fused_bundle
+                .gram_h
+                .indexed_iter()
+                .zip(blas_bundle.gram_h.iter())
+            {
+                assert!(
+                    (f - b).abs() <= tol,
+                    "gram_h fused-vs-cuBLAS drift at {idx:?}: fused={f} blas={b}"
+                );
+            }
+            for ((idx, &f), &b) in fused_bundle
+                .gram_struct
+                .indexed_iter()
+                .zip(blas_bundle.gram_struct.iter())
+            {
+                assert!(
+                    (f - b).abs() <= tol,
+                    "gram_struct fused-vs-cuBLAS drift at {idx:?}: fused={f} blas={b}"
+                );
+            }
+            assert_eq!(fused_bundle.raw_block_ranges, ranges);
         }
     }
 }
