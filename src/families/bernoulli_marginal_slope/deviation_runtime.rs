@@ -131,9 +131,9 @@ pub struct DeviationRuntime {
     /// Used for constant-tail continuation outside support: the deviation
     /// saturates at this value for all z > right endpoint.
     right_boundary_value_row: Array1<f64>,
-    /// Cross-block anchor residualisation state. `None` until
-    /// `compose_anchor_orthogonalisation` is called.
-    anchor_residual: Option<AnchorResidual>,
+    /// Cross-block installed flex block. `None` until
+    /// `install_compiled_flex_block` is called.
+    installed_flex_block: Option<InstalledFlexBlock>,
     /// Stacked parametric-anchor rows at training rows (n × d). Used by
     /// `design_at_training_with_residual` to rebuild `block.design` after
     /// orthogonalisation. Dropped before serialisation; predict-time
@@ -508,7 +508,7 @@ impl DeviationRuntime {
             span_c3,
             monotonicity_constraint_rows,
             right_boundary_value_row,
-            anchor_residual: None,
+            installed_flex_block: None,
             anchor_rows_at_training: None,
         })
     }
@@ -572,7 +572,7 @@ impl DeviationRuntime {
     pub(crate) fn compose_anchor_orthogonalisation(
         &mut self,
         right_selector: &Array2<f64>,
-        residual: Option<AnchorResidual>,
+        installed_flex_block: Option<InstalledFlexBlock>,
     ) -> Result<(), String> {
         let old_dim = self.basis_dim;
         if right_selector.nrows() != old_dim {
@@ -605,51 +605,30 @@ impl DeviationRuntime {
             }
             .into());
         }
-        if let Some(ref res) = residual {
-            let d_expected: usize = match &res.null_basis_evaluator {
-                AnchorNullSpaceEvaluator::Stacked {
-                    components,
-                    orthonormalising_rotation,
-                } => {
-                    let sum: usize = components
-                        .iter()
-                        .map(|c| match c {
-                            AnchorNullSpaceComponent::Parametric { ncols, .. } => *ncols,
-                            AnchorNullSpaceComponent::FlexEvaluation { ncols } => *ncols,
-                        })
-                        .sum();
-                    if orthonormalising_rotation.nrows() != sum
-                        || orthonormalising_rotation.ncols() != sum
-                    {
-                        return Err(DeviationRuntimeError::DimensionMismatch {
-                            reason: format!(
-                                "DeviationRuntime anchor residual: rotation must be {}×{}, got {}×{}",
-                                sum,
-                                sum,
-                                orthonormalising_rotation.nrows(),
-                                orthonormalising_rotation.ncols(),
-                            ),
-                        }
-                        .into());
-                    }
-                    sum
-                }
-            };
-            if res.residual_coefficients.nrows() != d_expected {
+        if let Some(ref installed) = installed_flex_block {
+            let d_expected: usize = installed
+                .anchor_components
+                .iter()
+                .map(|c| match c {
+                    AnchorComponentTag::Parametric { ncols, .. } => *ncols,
+                    AnchorComponentTag::FlexEvaluation { ncols } => *ncols,
+                })
+                .sum();
+            if installed.anchor_correction.nrows() != d_expected {
                 return Err(DeviationRuntimeError::DimensionMismatch {
                     reason: format!(
-                        "DeviationRuntime anchor residual: residual_coefficients rows={}, expected sum-of-component-ncols={}",
-                        res.residual_coefficients.nrows(),
+                        "DeviationRuntime installed flex block: anchor_correction rows={}, expected sum-of-component-ncols={}",
+                        installed.anchor_correction.nrows(),
                         d_expected,
                     ),
                 }
                 .into());
             }
-            if res.residual_coefficients.ncols() != new_dim {
+            if installed.anchor_correction.ncols() != new_dim {
                 return Err(DeviationRuntimeError::DimensionMismatch {
                     reason: format!(
-                        "DeviationRuntime anchor residual: residual_coefficients cols={}, expected new basis dim {}",
-                        res.residual_coefficients.ncols(),
+                        "DeviationRuntime installed flex block: anchor_correction cols={}, expected new basis dim {}",
+                        installed.anchor_correction.ncols(),
                         new_dim,
                     ),
                 }
@@ -670,32 +649,26 @@ impl DeviationRuntime {
         self.monotonicity_constraint_rows =
             fast_ab(&self.monotonicity_constraint_rows, right_selector);
         self.basis_dim = new_dim;
-        self.anchor_residual = residual;
+        self.installed_flex_block = installed_flex_block;
         Ok(())
     }
 
-    /// Accessor for the anchor-residual state set via
+    /// Accessor for the installed flex block set via
     /// `install_compiled_flex_block`. Save-time code uses this to snapshot
-    /// the residual into the saved model; predict-time code reconstructs
-    /// the per-row η correction `n_row · residual_coefficients · β`.
-    pub fn anchor_residual(&self) -> Option<&AnchorResidual> {
-        self.anchor_residual.as_ref()
+    /// the install state into the saved model; predict-time code reconstructs
+    /// the per-row η correction `n_row · anchor_correction · β`.
+    pub fn installed_flex_block(&self) -> Option<&InstalledFlexBlock> {
+        self.installed_flex_block.as_ref()
     }
 
     /// Single-step install of a compiled flex block from
-    /// `identifiability_compiler::compile`. Replaces the prior two-step
-    /// `set_anchor_rows_at_training` + `compose_anchor_orthogonalisation`
-    /// surface so the install path takes the canonical `CompiledBlock`
-    /// shape directly.
+    /// `identifiability_compiler::compile`.
     ///
     /// Semantics:
     /// - `compiled.t_lw` is the right-selector `V` applied to `span_c{0..3}`,
-    ///   `right_boundary_value_row`, and `monotonicity_constraint_rows` —
-    ///   identical to the legacy `compose_anchor_orthogonalisation` body.
+    ///   `right_boundary_value_row`, and `monotonicity_constraint_rows`.
     /// - `compiled.anchor_correction` (always `Some` for non-empty anchor
-    ///   unions) becomes `AnchorResidual.residual_coefficients`. The
-    ///   orthonormalising rotation is structurally identity because the
-    ///   compiler bakes `R · K_w · V` into `M` already.
+    ///   unions) is the d×k correction `M`.
     /// - `anchor_components` records the per-anchor predict-time tags so
     ///   the saved-model rebuild can replay the anchor row map.
     /// - `n_train_at_training` is cached for
@@ -703,7 +676,7 @@ impl DeviationRuntime {
     pub(crate) fn install_compiled_flex_block(
         &mut self,
         compiled: &crate::families::identifiability_compiler::CompiledBlock,
-        anchor_components: Vec<AnchorNullSpaceComponent>,
+        anchor_components: Vec<AnchorComponentTag>,
         n_train_at_training: Array2<f64>,
     ) -> Result<(), String> {
         let m = compiled.anchor_correction.as_ref().ok_or_else(|| {
@@ -711,22 +684,12 @@ impl DeviationRuntime {
              anchor_correction — install requires a non-empty anchor union"
                 .to_string()
         })?;
-        let d_total: usize = anchor_components
-            .iter()
-            .map(|c| match c {
-                AnchorNullSpaceComponent::Parametric { ncols, .. } => *ncols,
-                AnchorNullSpaceComponent::FlexEvaluation { ncols } => *ncols,
-            })
-            .sum();
-        let residual = AnchorResidual {
-            residual_coefficients: m.clone(),
-            null_basis_evaluator: AnchorNullSpaceEvaluator::Stacked {
-                components: anchor_components,
-                orthonormalising_rotation: Array2::<f64>::eye(d_total),
-            },
+        let installed = InstalledFlexBlock {
+            anchor_correction: m.clone(),
+            anchor_components,
         };
         self.anchor_rows_at_training = Some(n_train_at_training);
-        self.compose_anchor_orthogonalisation(&compiled.t_lw, Some(residual))
+        self.compose_anchor_orthogonalisation(&compiled.t_lw, Some(installed))
     }
 
     /// Cached parametric-anchor matrix at training rows, installed by

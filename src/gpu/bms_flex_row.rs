@@ -1122,19 +1122,15 @@ fn launch_linux(
 /// Joint-β block layout shared with the host (mirrors `BlockSlices` in
 /// `bernoulli_marginal_slope.rs`).
 ///
-/// Gated `#[cfg(any(target_os = "linux", test))]`: every production
-/// constructor and consumer lives under `target_os = "linux"` (the
-/// device-resident row-Hessian path is the only producer — see
-/// `launch_bms_flex_row_kernel_device_resident` — and the joint-β
-/// consumers `launch_bms_flex_row_hvp` / `_diagonal` / `_dense_block`
-/// are similarly Linux-only). The CPU-side oracle helpers + parity
-/// tests in this file's `mod tests` also construct it under `cfg(test)`
 /// Gating: Linux-only. The lone production constructor lives in
-/// `bernoulli_marginal_slope.rs:9189` behind `#[cfg(target_os = "linux")]`,
-/// so the struct is only used on Linux. Any non-Linux test referencing
-/// this type must guard itself with `#[cfg(target_os = "linux")]` too —
-/// the build.rs ban scanner explicitly rejects `#[cfg(any(..., test))]`
-/// as a dead-code escape hatch.
+/// `bernoulli_marginal_slope.rs:9189` behind `#[cfg(target_os = "linux")]`
+/// — the device-resident row-Hessian path is the only producer (see
+/// `launch_bms_flex_row_kernel_device_resident`), and the joint-β
+/// consumers `launch_bms_flex_row_hvp` / `_diagonal` / `_dense_block`
+/// are also Linux-only. Any non-Linux test referencing this type must
+/// guard itself with `#[cfg(target_os = "linux")]` too — the build.rs
+/// ban scanner explicitly rejects `#[cfg(any(..., test))]` on items as
+/// a dead-code escape hatch.
 #[cfg(target_os = "linux")]
 #[derive(Clone, Debug)]
 pub(crate) struct BmsFlexBlockLayout {
@@ -2705,7 +2701,14 @@ pub fn launch_bms_flex_row_dense_block(
         })
 }
 
-#[cfg(test)]
+// Block 9 / V100-build unblock (2026-05-27): every test below either
+// constructs `BmsFlexBlockLayout` / `BmsFlexPrimaryLayout` (Linux-only
+// types) or drives a CUDA-dependent fixture, so gate the whole module
+// `#[cfg(all(test, target_os = "linux"))]`. On macOS the structs are
+// absent and these tests do not compile — the build.rs ban scanner
+// explicitly rejects `#[cfg(any(..., test))]` on the struct definitions
+// themselves as a dead-code escape hatch.
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
 
