@@ -6,7 +6,7 @@ use crate::probability::{
 };
 use crate::types::{
     InverseLink, LatentCLogLogState, LikelihoodSpec, LinkComponent, LinkFunction, MixtureLinkSpec,
-    MixtureLinkState, ResponseFamily, SasLinkSpec, SasLinkState,
+    MixtureLinkState, ResponseFamily, SasLinkSpec, SasLinkState, StandardLink,
 };
 use ndarray::Array1;
 use statrs::function::beta::{beta_reg, ln_beta};

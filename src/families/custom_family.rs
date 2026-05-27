@@ -21201,15 +21201,43 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     );
     if !canonical.audit.aliased_pairs.is_empty() {
         log::info!("[identifiability audit] {}", canonical.audit.summary);
+        // Aggregate by (block_a, block_b) so the log stays bounded by the
+        // block-pair count rather than the quadratic direction-pair count
+        // — a few wide blocks alone produce 100+ pair-lines and bury the
+        // useful structural signal. INFO carries the cluster shape (count,
+        // overlap range, perfect-collinearity count); DEBUG prints the
+        // worst three sample pairs per cluster for forensic users.
+        let mut by_pair: BTreeMap<(&str, &str), Vec<&_>> = BTreeMap::new();
         for pair in &canonical.audit.aliased_pairs {
+            by_pair
+                .entry((pair.block_a.as_str(), pair.block_b.as_str()))
+                .or_default()
+                .push(pair);
+        }
+        for ((a, b), pairs) in &by_pair {
+            let count = pairs.len();
+            let max = pairs.iter().map(|p| p.overlap).fold(f64::NEG_INFINITY, f64::max);
+            let min = pairs.iter().map(|p| p.overlap).fold(f64::INFINITY, f64::min);
+            let near_one = pairs.iter().filter(|p| p.overlap >= 0.9999).count();
             log::info!(
-                "[identifiability audit] alias: {}[{}] ~ {}[{}] (overlap={:.4})",
-                pair.block_a,
-                pair.direction_a,
-                pair.block_b,
-                pair.direction_b,
-                pair.overlap,
+                "[identifiability audit] alias-cluster {a} ~ {b}: {count} direction-pair{plural} \
+                 (overlap {min:.4}..{max:.4}; {near_one} ≥0.9999)",
+                plural = if count == 1 { "" } else { "s" },
             );
+        }
+        if log::log_enabled!(log::Level::Debug) {
+            for ((a, b), pairs) in &by_pair {
+                let mut sorted = pairs.clone();
+                sorted.sort_by(|p, q| q.overlap.partial_cmp(&p.overlap).unwrap_or(std::cmp::Ordering::Equal));
+                for pair in sorted.iter().take(3) {
+                    log::debug!(
+                        "[identifiability audit]   sample {a}[{ai}] ~ {b}[{bi}] overlap={ov:.4}",
+                        ai = pair.direction_a,
+                        bi = pair.direction_b,
+                        ov = pair.overlap,
+                    );
+                }
+            }
         }
     }
     for drop in &canonical.audit.dropped_columns {
