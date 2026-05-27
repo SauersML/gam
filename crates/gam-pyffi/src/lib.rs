@@ -20769,6 +20769,12 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     // solver phases (including survival marginal-slope joint-Newton cycles)
     // are visible from Python without requiring a separate shell.
     gam::visualizer::init_logging();
+    // Background heartbeat thread: emits an `[heartbeat] elapsed=… rss=…`
+    // line every 60s for the life of the process, so silent stretches
+    // inside long PIRLS line-searches still surface a process-alive
+    // signal with current memory footprint. Unconditional — does not
+    // depend on any family pushing a `scope()` frame.
+    gam::heartbeat::ensure_started();
     module.add("__doc__", "PyO3 boundary for the gam Rust engine.")?;
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
     module.add_class::<EuclideanManifold>()?;

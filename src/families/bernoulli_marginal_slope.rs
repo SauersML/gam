@@ -19906,21 +19906,9 @@ mod tests {
             y: Arc::new(Array1::zeros(0)),
             weights: Arc::new(Array1::zeros(0)),
             z: Arc::new(Array1::zeros(0)),
-            latent_measure: LatentMeasureKind::StandardNormal,
-            gaussian_frailty_sd: None,
-            base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: empty_design.clone(),
             logslope_design: empty_design,
-            score_warp: None,
-            link_dev: None,
-            policy: crate::resource::ResourcePolicy::default_library(),
-            cell_moment_lru: new_cell_moment_lru_cache(
-                &crate::resource::ResourcePolicy::default_library(),
-            ),
-            cell_moment_cache_stats: new_cell_moment_cache_stats(),
-            intercept_warm_starts: None,
-            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            ..default_test_family()
         }
     }
 
@@ -19990,23 +19978,13 @@ mod tests {
             y: Arc::new(y),
             weights: Arc::new(weights),
             z: Arc::new(z.clone()),
-            latent_measure: LatentMeasureKind::StandardNormal,
-            gaussian_frailty_sd: None,
-            base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 design.clone(),
             )),
             logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(design)),
             score_warp: Some(score_prepared.runtime.clone()),
             link_dev: Some(link_prepared.runtime.clone()),
-            policy: crate::resource::ResourcePolicy::default_library(),
-            cell_moment_lru: new_cell_moment_lru_cache(
-                &crate::resource::ResourcePolicy::default_library(),
-            ),
-            cell_moment_cache_stats: new_cell_moment_cache_stats(),
-            intercept_warm_starts: None,
-            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            ..default_test_family()
         };
         let marginal_beta = array![0.05, 0.08];
         let logslope_beta = array![-0.15, 0.04];
@@ -20539,9 +20517,6 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
-                latent_measure: LatentMeasureKind::StandardNormal,
-                gaussian_frailty_sd: None,
-                base_link: bernoulli_marginal_slope_probit_link(),
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                     Array2::ones((n, 1)),
                 )),
@@ -20550,14 +20525,8 @@ mod tests {
                 )),
                 score_warp: Some(score_prepared.runtime.clone()),
                 link_dev: Some(link_prepared.runtime.clone()),
-                policy: crate::resource::ResourcePolicy::default_library(),
-                cell_moment_lru: new_cell_moment_lru_cache(
-                    &crate::resource::ResourcePolicy::default_library(),
-                ),
-                cell_moment_cache_stats: new_cell_moment_cache_stats(),
                 intercept_warm_starts: cache,
-                auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+                ..default_test_family()
             };
         let marginal_eta = Array1::from_iter((0..n).map(|i| 0.15 * ((i as f64) * 0.001).sin()));
         let slope_eta = Array1::from_iter((0..n).map(|i| 0.35 + 0.02 * ((i as f64) * 0.003).cos()));
@@ -20639,9 +20608,6 @@ mod tests {
             y: Arc::new(y),
             weights: Arc::new(weights),
             z: Arc::new(z),
-            latent_measure: LatentMeasureKind::StandardNormal,
-            gaussian_frailty_sd: None,
-            base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::ones((n, 1)),
             )),
@@ -20650,14 +20616,7 @@ mod tests {
             )),
             score_warp: Some(score_prepared.runtime.clone()),
             link_dev: Some(link_prepared.runtime.clone()),
-            policy: crate::resource::ResourcePolicy::default_library(),
-            cell_moment_lru: new_cell_moment_lru_cache(
-                &crate::resource::ResourcePolicy::default_library(),
-            ),
-            cell_moment_cache_stats: new_cell_moment_cache_stats(),
-            intercept_warm_starts: None,
-            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            ..default_test_family()
         };
         let states = vec![
             ParameterBlockState {
@@ -20709,25 +20668,13 @@ mod tests {
             y: Arc::new(array![1.0]),
             weights: Arc::new(array![1.0]),
             z: Arc::new(array![0.25]),
-            latent_measure: LatentMeasureKind::StandardNormal,
-            gaussian_frailty_sd: None,
-            base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((1, 0)),
             )),
             logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((1, 0)),
             )),
-            score_warp: None,
-            link_dev: None,
-            policy: crate::resource::ResourcePolicy::default_library(),
-            cell_moment_lru: new_cell_moment_lru_cache(
-                &crate::resource::ResourcePolicy::default_library(),
-            ),
-            cell_moment_cache_stats: new_cell_moment_cache_stats(),
-            intercept_warm_starts: None,
-            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            ..default_test_family()
         };
         let block_states = vec![
             ParameterBlockState {
@@ -20870,23 +20817,11 @@ mod tests {
             y: Arc::new(y),
             weights: Arc::new(weights),
             z: Arc::new(z),
-            latent_measure: LatentMeasureKind::StandardNormal,
-            gaussian_frailty_sd: None,
-            base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 ones_col.clone(),
             )),
             logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(ones_col)),
-            score_warp: None,
-            link_dev: None,
-            policy: crate::resource::ResourcePolicy::default_library(),
-            cell_moment_lru: new_cell_moment_lru_cache(
-                &crate::resource::ResourcePolicy::default_library(),
-            ),
-            cell_moment_cache_stats: new_cell_moment_cache_stats(),
-            intercept_warm_starts: None,
-            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            ..default_test_family()
         }
     }
 
@@ -21558,25 +21493,14 @@ mod tests {
             y: Arc::new(Array1::zeros(seed.len())),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
-            latent_measure: LatentMeasureKind::StandardNormal,
-            gaussian_frailty_sd: None,
-            base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
             logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
-            score_warp: None,
             link_dev: Some(prepared.runtime.clone()),
-            policy: crate::resource::ResourcePolicy::default_library(),
-            cell_moment_lru: new_cell_moment_lru_cache(
-                &crate::resource::ResourcePolicy::default_library(),
-            ),
-            cell_moment_cache_stats: new_cell_moment_cache_stats(),
-            intercept_warm_starts: None,
-            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            ..default_test_family()
         };
         let block_states = vec![
             dummy_block_state(array![0.0], seed.len()),
@@ -21681,9 +21605,7 @@ mod tests {
             y: Arc::new(Array1::zeros(n)),
             weights: Arc::new(Array1::ones(n)),
             z: Arc::new(seed.clone()),
-            latent_measure: LatentMeasureKind::StandardNormal,
             gaussian_frailty_sd: Some(0.65),
-            base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((n, 0)),
             )),
@@ -21692,14 +21614,8 @@ mod tests {
             )),
             score_warp: Some(score_prepared.runtime.clone()),
             link_dev: Some(link_prepared.runtime.clone()),
-            policy: crate::resource::ResourcePolicy::default_library(),
-            cell_moment_lru: new_cell_moment_lru_cache(
-                &crate::resource::ResourcePolicy::default_library(),
-            ),
-            cell_moment_cache_stats: new_cell_moment_cache_stats(),
             intercept_warm_starts: Some(new_intercept_warm_start_cache(n)),
-            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            ..default_test_family()
         };
         let marginal_eta = 0.35;
         let slope = -0.8;
@@ -21764,9 +21680,6 @@ mod tests {
             y: Arc::new(Array1::zeros(seed.len())),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
-            latent_measure: LatentMeasureKind::StandardNormal,
-            gaussian_frailty_sd: None,
-            base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
@@ -21775,14 +21688,7 @@ mod tests {
             )),
             score_warp: Some(score_prepared.runtime.clone()),
             link_dev: Some(link_prepared.runtime.clone()),
-            policy: crate::resource::ResourcePolicy::default_library(),
-            cell_moment_lru: new_cell_moment_lru_cache(
-                &crate::resource::ResourcePolicy::default_library(),
-            ),
-            cell_moment_cache_stats: new_cell_moment_cache_stats(),
-            intercept_warm_starts: None,
-            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            ..default_test_family()
         };
         let block_states = vec![
             dummy_block_state(array![0.0], seed.len()),
@@ -21838,9 +21744,6 @@ mod tests {
             y: Arc::new(Array1::zeros(seed.len())),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
-            latent_measure: LatentMeasureKind::StandardNormal,
-            gaussian_frailty_sd: None,
-            base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
@@ -21848,15 +21751,7 @@ mod tests {
                 Array2::zeros((seed.len(), 0)),
             )),
             score_warp: Some(prepared.runtime.clone()),
-            link_dev: None,
-            policy: crate::resource::ResourcePolicy::default_library(),
-            cell_moment_lru: new_cell_moment_lru_cache(
-                &crate::resource::ResourcePolicy::default_library(),
-            ),
-            cell_moment_cache_stats: new_cell_moment_cache_stats(),
-            intercept_warm_starts: None,
-            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            ..default_test_family()
         };
         let block_states = vec![
             dummy_block_state(array![0.0], seed.len()),
@@ -21900,9 +21795,6 @@ mod tests {
             y: Arc::new(Array1::zeros(seed.len())),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
-            latent_measure: LatentMeasureKind::StandardNormal,
-            gaussian_frailty_sd: None,
-            base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
@@ -21910,15 +21802,7 @@ mod tests {
                 Array2::zeros((seed.len(), 0)),
             )),
             score_warp: Some(prepared.runtime.clone()),
-            link_dev: None,
-            policy: crate::resource::ResourcePolicy::default_library(),
-            cell_moment_lru: new_cell_moment_lru_cache(
-                &crate::resource::ResourcePolicy::default_library(),
-            ),
-            cell_moment_cache_stats: new_cell_moment_cache_stats(),
-            intercept_warm_starts: None,
-            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            ..default_test_family()
         };
         let current = Array1::<f64>::zeros(score_dim);
         let mut proposed = current.clone();
@@ -22737,25 +22621,14 @@ mod tests {
                 y: Arc::new(array![0.0, 1.0, 1.0]),
                 weights: Arc::new(array![1.0, 0.7, 1.3]),
                 z: Arc::new(z.clone()),
-                latent_measure: LatentMeasureKind::StandardNormal,
-                gaussian_frailty_sd: None,
-                base_link: bernoulli_marginal_slope_probit_link(),
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                     array![[1.0], [1.0], [1.0]],
                 )),
                 logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                     array![[1.0], [1.0], [1.0]],
                 )),
-                score_warp: None,
                 link_dev: Some(link_prepared.runtime.clone()),
-                policy: crate::resource::ResourcePolicy::default_library(),
-                cell_moment_lru: new_cell_moment_lru_cache(
-                    &crate::resource::ResourcePolicy::default_library(),
-                ),
-                cell_moment_cache_stats: new_cell_moment_cache_stats(),
-                intercept_warm_starts: None,
-                auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+                ..default_test_family()
             };
 
         let a = 0.35;
@@ -22910,9 +22783,6 @@ mod tests {
                 y: Arc::new(array![0.0, 1.0, 0.0]),
                 weights: Arc::new(Array1::ones(3)),
                 z: Arc::new(seed.clone()),
-                latent_measure: LatentMeasureKind::StandardNormal,
-                gaussian_frailty_sd: None,
-                base_link: bernoulli_marginal_slope_probit_link(),
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                     array![[1.0], [1.0], [1.0]],
                 )),
@@ -22920,15 +22790,7 @@ mod tests {
                     array![[1.0], [1.0], [1.0]],
                 )),
                 score_warp: Some(score_prepared.runtime.clone()),
-                link_dev: None,
-                policy: crate::resource::ResourcePolicy::default_library(),
-                cell_moment_lru: new_cell_moment_lru_cache(
-                    &crate::resource::ResourcePolicy::default_library(),
-                ),
-                cell_moment_cache_stats: new_cell_moment_cache_stats(),
-                intercept_warm_starts: None,
-                auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+                ..default_test_family()
             };
         let specs = vec![
             dummy_blockspec(1, 3),
@@ -23121,21 +22983,9 @@ mod tests {
             y: Arc::new(Array1::zeros(n)),
             weights: Arc::new(Array1::from_elem(n, 1.0)),
             z: Arc::new(Array1::zeros(n)),
-            latent_measure: LatentMeasureKind::StandardNormal,
-            gaussian_frailty_sd: None,
-            base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: marg_design.clone(),
             logslope_design: log_design.clone(),
-            score_warp: None,
-            link_dev: None,
-            policy: crate::resource::ResourcePolicy::default_library(),
-            cell_moment_lru: new_cell_moment_lru_cache(
-                &crate::resource::ResourcePolicy::default_library(),
-            ),
-            cell_moment_cache_stats: new_cell_moment_cache_stats(),
-            intercept_warm_starts: None,
-            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            ..default_test_family()
         };
         let specs = vec![
             ParameterBlockSpec {
@@ -23181,25 +23031,13 @@ mod tests {
             y: Arc::new(array![1.0]),
             weights: Arc::new(array![1.2]),
             z: Arc::new(array![0.3]),
-            latent_measure: LatentMeasureKind::StandardNormal,
-            gaussian_frailty_sd: None,
-            base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[
                 1.0
             ]])),
             logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[
                 1.0
             ]])),
-            score_warp: None,
-            link_dev: None,
-            policy: crate::resource::ResourcePolicy::default_library(),
-            cell_moment_lru: new_cell_moment_lru_cache(
-                &crate::resource::ResourcePolicy::default_library(),
-            ),
-            cell_moment_cache_stats: new_cell_moment_cache_stats(),
-            intercept_warm_starts: None,
-            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            ..default_test_family()
         };
         let states_at = |q: f64, g: f64| {
             vec![
@@ -23320,25 +23158,14 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
-            latent_measure: LatentMeasureKind::StandardNormal,
-            gaussian_frailty_sd: None,
-            base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
             logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
-            score_warp: None,
             link_dev: Some(prepared.runtime.clone()),
-            policy: crate::resource::ResourcePolicy::default_library(),
-            cell_moment_lru: new_cell_moment_lru_cache(
-                &crate::resource::ResourcePolicy::default_library(),
-            ),
-            cell_moment_cache_stats: new_cell_moment_cache_stats(),
-            intercept_warm_starts: None,
-            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            ..default_test_family()
         };
 
         // Three blocks: marginal (dim 0), logslope (dim 0), link_dev.
@@ -23426,9 +23253,6 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
-            latent_measure: LatentMeasureKind::StandardNormal,
-            gaussian_frailty_sd: None,
-            base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
@@ -23436,15 +23260,7 @@ mod tests {
                 Array2::zeros((seed.len(), 0)),
             )),
             score_warp: Some(prepared.runtime.clone()),
-            link_dev: None,
-            policy: crate::resource::ResourcePolicy::default_library(),
-            cell_moment_lru: new_cell_moment_lru_cache(
-                &crate::resource::ResourcePolicy::default_library(),
-            ),
-            cell_moment_cache_stats: new_cell_moment_cache_stats(),
-            intercept_warm_starts: None,
-            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            ..default_test_family()
         };
 
         let block_states = vec![
@@ -23527,25 +23343,14 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
-            latent_measure: LatentMeasureKind::StandardNormal,
-            gaussian_frailty_sd: None,
-            base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
             logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
-            score_warp: None,
             link_dev: Some(prepared.runtime.clone()),
-            policy: crate::resource::ResourcePolicy::default_library(),
-            cell_moment_lru: new_cell_moment_lru_cache(
-                &crate::resource::ResourcePolicy::default_library(),
-            ),
-            cell_moment_cache_stats: new_cell_moment_cache_stats(),
-            intercept_warm_starts: None,
-            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            ..default_test_family()
         };
         let block_states = vec![
             dummy_block_state(array![0.0], seed.len()),
@@ -23675,21 +23480,10 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
-            latent_measure: LatentMeasureKind::StandardNormal,
-            gaussian_frailty_sd: None,
-            base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: scalar_design(),
             logslope_design: scalar_design(),
             score_warp: Some(prepared.runtime.clone()),
-            link_dev: None,
-            policy: crate::resource::ResourcePolicy::default_library(),
-            cell_moment_lru: new_cell_moment_lru_cache(
-                &crate::resource::ResourcePolicy::default_library(),
-            ),
-            cell_moment_cache_stats: new_cell_moment_cache_stats(),
-            intercept_warm_starts: None,
-            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            ..default_test_family()
         };
         let block_states = vec![
             ParameterBlockState {
@@ -23784,9 +23578,6 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
-            latent_measure: LatentMeasureKind::StandardNormal,
-            gaussian_frailty_sd: None,
-            base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
@@ -23794,15 +23585,7 @@ mod tests {
                 Array2::zeros((seed.len(), 0)),
             )),
             score_warp: Some(prepared.runtime.clone()),
-            link_dev: None,
-            policy: crate::resource::ResourcePolicy::default_library(),
-            cell_moment_lru: new_cell_moment_lru_cache(
-                &crate::resource::ResourcePolicy::default_library(),
-            ),
-            cell_moment_cache_stats: new_cell_moment_cache_stats(),
-            intercept_warm_starts: None,
-            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            ..default_test_family()
         };
 
         let block_states = vec![
@@ -23917,25 +23700,14 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
-            latent_measure: LatentMeasureKind::StandardNormal,
-            gaussian_frailty_sd: None,
-            base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
             logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
-            score_warp: None,
             link_dev: Some(prepared.runtime.clone()),
-            policy: crate::resource::ResourcePolicy::default_library(),
-            cell_moment_lru: new_cell_moment_lru_cache(
-                &crate::resource::ResourcePolicy::default_library(),
-            ),
-            cell_moment_cache_stats: new_cell_moment_cache_stats(),
-            intercept_warm_starts: None,
-            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            ..default_test_family()
         };
 
         let block_states = vec![
@@ -24054,9 +23826,6 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
-                latent_measure: LatentMeasureKind::StandardNormal,
-                gaussian_frailty_sd: None,
-                base_link: bernoulli_marginal_slope_probit_link(),
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                     array![[1.0], [1.0], [1.0]],
                 )),
@@ -24065,14 +23834,7 @@ mod tests {
                 )),
                 score_warp: Some(score_prepared.runtime.clone()),
                 link_dev: Some(link_prepared.runtime.clone()),
-                policy: crate::resource::ResourcePolicy::default_library(),
-                cell_moment_lru: new_cell_moment_lru_cache(
-                    &crate::resource::ResourcePolicy::default_library(),
-                ),
-                cell_moment_cache_stats: new_cell_moment_cache_stats(),
-                intercept_warm_starts: None,
-                auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+                ..default_test_family()
             };
         let block_states = vec![
             ParameterBlockState {
@@ -24210,9 +23972,6 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
-                latent_measure: LatentMeasureKind::StandardNormal,
-                gaussian_frailty_sd: None,
-                base_link: bernoulli_marginal_slope_probit_link(),
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                     array![[1.0], [1.0], [1.0]],
                 )),
@@ -24221,14 +23980,7 @@ mod tests {
                 )),
                 score_warp: Some(score_prepared.runtime.clone()),
                 link_dev: Some(link_prepared.runtime.clone()),
-                policy: crate::resource::ResourcePolicy::default_library(),
-                cell_moment_lru: new_cell_moment_lru_cache(
-                    &crate::resource::ResourcePolicy::default_library(),
-                ),
-                cell_moment_cache_stats: new_cell_moment_cache_stats(),
-                intercept_warm_starts: None,
-                auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+                ..default_test_family()
             };
         let block_states = vec![
             ParameterBlockState {
@@ -24319,9 +24071,6 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
-            latent_measure: LatentMeasureKind::StandardNormal,
-            gaussian_frailty_sd: None,
-            base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
@@ -24329,15 +24078,7 @@ mod tests {
                 Array2::zeros((seed.len(), 0)),
             )),
             score_warp: Some(prepared.runtime.clone()),
-            link_dev: None,
-            policy: crate::resource::ResourcePolicy::default_library(),
-            cell_moment_lru: new_cell_moment_lru_cache(
-                &crate::resource::ResourcePolicy::default_library(),
-            ),
-            cell_moment_cache_stats: new_cell_moment_cache_stats(),
-            intercept_warm_starts: None,
-            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            ..default_test_family()
         };
         let cache = family
             .build_exact_eval_cache(&block_states)
@@ -24405,25 +24146,14 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
-            latent_measure: LatentMeasureKind::StandardNormal,
-            gaussian_frailty_sd: None,
-            base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
             logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
-            score_warp: None,
             link_dev: Some(prepared.runtime.clone()),
-            policy: crate::resource::ResourcePolicy::default_library(),
-            cell_moment_lru: new_cell_moment_lru_cache(
-                &crate::resource::ResourcePolicy::default_library(),
-            ),
-            cell_moment_cache_stats: new_cell_moment_cache_stats(),
-            intercept_warm_starts: None,
-            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            ..default_test_family()
         };
         let cache = family
             .build_exact_eval_cache(&block_states)
@@ -24489,9 +24219,6 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
-                latent_measure: LatentMeasureKind::StandardNormal,
-                gaussian_frailty_sd: None,
-                base_link: bernoulli_marginal_slope_probit_link(),
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                     array![[1.0], [1.0], [1.0]],
                 )),
@@ -24500,14 +24227,7 @@ mod tests {
                 )),
                 score_warp: Some(score_prepared.runtime.clone()),
                 link_dev: Some(link_prepared.runtime.clone()),
-                policy: crate::resource::ResourcePolicy::default_library(),
-                cell_moment_lru: new_cell_moment_lru_cache(
-                    &crate::resource::ResourcePolicy::default_library(),
-                ),
-                cell_moment_cache_stats: new_cell_moment_cache_stats(),
-                intercept_warm_starts: None,
-                auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+                ..default_test_family()
             };
         let block_states = vec![
             ParameterBlockState {
@@ -24580,9 +24300,6 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
-                latent_measure: LatentMeasureKind::StandardNormal,
-                gaussian_frailty_sd: None,
-                base_link: bernoulli_marginal_slope_probit_link(),
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                     array![[1.0], [1.0], [1.0]],
                 )),
@@ -24591,14 +24308,7 @@ mod tests {
                 )),
                 score_warp: Some(score_prepared.runtime.clone()),
                 link_dev: Some(link_prepared.runtime.clone()),
-                policy: crate::resource::ResourcePolicy::default_library(),
-                cell_moment_lru: new_cell_moment_lru_cache(
-                    &crate::resource::ResourcePolicy::default_library(),
-                ),
-                cell_moment_cache_stats: new_cell_moment_cache_stats(),
-                intercept_warm_starts: None,
-                auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+                ..default_test_family()
             };
         let block_states = vec![
             ParameterBlockState {
@@ -24693,9 +24403,6 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
-                latent_measure: LatentMeasureKind::StandardNormal,
-                gaussian_frailty_sd: None,
-                base_link: bernoulli_marginal_slope_probit_link(),
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                     array![[1.0], [1.0], [1.0]],
                 )),
@@ -24704,14 +24411,7 @@ mod tests {
                 )),
                 score_warp: Some(score_prepared.runtime.clone()),
                 link_dev: Some(link_prepared.runtime.clone()),
-                policy: crate::resource::ResourcePolicy::default_library(),
-                cell_moment_lru: new_cell_moment_lru_cache(
-                    &crate::resource::ResourcePolicy::default_library(),
-                ),
-                cell_moment_cache_stats: new_cell_moment_cache_stats(),
-                intercept_warm_starts: None,
-                auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+                ..default_test_family()
             };
         let block_states = vec![
             ParameterBlockState {
@@ -24825,9 +24525,6 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
-                latent_measure: LatentMeasureKind::StandardNormal,
-                gaussian_frailty_sd: None,
-                base_link: bernoulli_marginal_slope_probit_link(),
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                     array![[1.0], [1.0], [1.0]],
                 )),
@@ -24836,14 +24533,7 @@ mod tests {
                 )),
                 score_warp: Some(score_prepared.runtime.clone()),
                 link_dev: Some(link_prepared.runtime.clone()),
-                policy: crate::resource::ResourcePolicy::default_library(),
-                cell_moment_lru: new_cell_moment_lru_cache(
-                    &crate::resource::ResourcePolicy::default_library(),
-                ),
-                cell_moment_cache_stats: new_cell_moment_cache_stats(),
-                intercept_warm_starts: None,
-                auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+                ..default_test_family()
             };
         let block_states = vec![
             ParameterBlockState {
@@ -24980,9 +24670,6 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
-            latent_measure: LatentMeasureKind::StandardNormal,
-            gaussian_frailty_sd: None,
-            base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
@@ -24990,15 +24677,7 @@ mod tests {
                 Array2::zeros((seed.len(), 0)),
             )),
             score_warp: Some(prepared.runtime.clone()),
-            link_dev: None,
-            policy: crate::resource::ResourcePolicy::default_library(),
-            cell_moment_lru: new_cell_moment_lru_cache(
-                &crate::resource::ResourcePolicy::default_library(),
-            ),
-            cell_moment_cache_stats: new_cell_moment_cache_stats(),
-            intercept_warm_starts: None,
-            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            ..default_test_family()
         };
         let cache = family
             .build_exact_eval_cache(&block_states)
@@ -25086,25 +24765,14 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
-            latent_measure: LatentMeasureKind::StandardNormal,
-            gaussian_frailty_sd: None,
-            base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
             logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
-            score_warp: None,
             link_dev: Some(prepared.runtime.clone()),
-            policy: crate::resource::ResourcePolicy::default_library(),
-            cell_moment_lru: new_cell_moment_lru_cache(
-                &crate::resource::ResourcePolicy::default_library(),
-            ),
-            cell_moment_cache_stats: new_cell_moment_cache_stats(),
-            intercept_warm_starts: None,
-            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            ..default_test_family()
         };
         let cache = family
             .build_exact_eval_cache(&block_states)
@@ -25192,9 +24860,6 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
-            latent_measure: LatentMeasureKind::StandardNormal,
-            gaussian_frailty_sd: None,
-            base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
@@ -25202,15 +24867,7 @@ mod tests {
                 Array2::zeros((seed.len(), 0)),
             )),
             score_warp: Some(prepared.runtime.clone()),
-            link_dev: None,
-            policy: crate::resource::ResourcePolicy::default_library(),
-            cell_moment_lru: new_cell_moment_lru_cache(
-                &crate::resource::ResourcePolicy::default_library(),
-            ),
-            cell_moment_cache_stats: new_cell_moment_cache_stats(),
-            intercept_warm_starts: None,
-            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            ..default_test_family()
         };
         let cache = family
             .build_exact_eval_cache(&block_states)
@@ -25309,25 +24966,14 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
-            latent_measure: LatentMeasureKind::StandardNormal,
-            gaussian_frailty_sd: None,
-            base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
             logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
-            score_warp: None,
             link_dev: Some(prepared.runtime.clone()),
-            policy: crate::resource::ResourcePolicy::default_library(),
-            cell_moment_lru: new_cell_moment_lru_cache(
-                &crate::resource::ResourcePolicy::default_library(),
-            ),
-            cell_moment_cache_stats: new_cell_moment_cache_stats(),
-            intercept_warm_starts: None,
-            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            ..default_test_family()
         };
         let cache = family
             .build_exact_eval_cache(&block_states)
@@ -25424,9 +25070,6 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
-                latent_measure: LatentMeasureKind::StandardNormal,
-                gaussian_frailty_sd: None,
-                base_link: bernoulli_marginal_slope_probit_link(),
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                     array![[1.0], [1.0], [1.0]],
                 )),
@@ -25435,14 +25078,7 @@ mod tests {
                 )),
                 score_warp: Some(score_prepared.runtime.clone()),
                 link_dev: Some(link_prepared.runtime.clone()),
-                policy: crate::resource::ResourcePolicy::default_library(),
-                cell_moment_lru: new_cell_moment_lru_cache(
-                    &crate::resource::ResourcePolicy::default_library(),
-                ),
-                cell_moment_cache_stats: new_cell_moment_cache_stats(),
-                intercept_warm_starts: None,
-                auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+                ..default_test_family()
             };
         let block_states = vec![
             ParameterBlockState {
@@ -25556,9 +25192,6 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
-                latent_measure: LatentMeasureKind::StandardNormal,
-                gaussian_frailty_sd: None,
-                base_link: bernoulli_marginal_slope_probit_link(),
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                     array![[1.0], [1.0], [1.0]],
                 )),
@@ -25567,14 +25200,7 @@ mod tests {
                 )),
                 score_warp: Some(score_prepared.runtime.clone()),
                 link_dev: Some(link_prepared.runtime.clone()),
-                policy: crate::resource::ResourcePolicy::default_library(),
-                cell_moment_lru: new_cell_moment_lru_cache(
-                    &crate::resource::ResourcePolicy::default_library(),
-                ),
-                cell_moment_cache_stats: new_cell_moment_cache_stats(),
-                intercept_warm_starts: None,
-                auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+                ..default_test_family()
             };
         let block_states = vec![
             ParameterBlockState {
@@ -25675,9 +25301,6 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
-                latent_measure: LatentMeasureKind::StandardNormal,
-                gaussian_frailty_sd: None,
-                base_link: bernoulli_marginal_slope_probit_link(),
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                     array![[1.0], [1.0], [1.0]],
                 )),
@@ -25686,14 +25309,7 @@ mod tests {
                 )),
                 score_warp: Some(score_prepared.runtime.clone()),
                 link_dev: Some(link_prepared.runtime.clone()),
-                policy: crate::resource::ResourcePolicy::default_library(),
-                cell_moment_lru: new_cell_moment_lru_cache(
-                    &crate::resource::ResourcePolicy::default_library(),
-                ),
-                cell_moment_cache_stats: new_cell_moment_cache_stats(),
-                intercept_warm_starts: None,
-                auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+                ..default_test_family()
             };
         let block_states = vec![
             ParameterBlockState {
@@ -25792,9 +25408,6 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
-                latent_measure: LatentMeasureKind::StandardNormal,
-                gaussian_frailty_sd: None,
-                base_link: bernoulli_marginal_slope_probit_link(),
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                     array![[1.0], [1.0], [1.0]],
                 )),
@@ -25803,14 +25416,7 @@ mod tests {
                 )),
                 score_warp: Some(score_prepared.runtime.clone()),
                 link_dev: Some(link_prepared.runtime.clone()),
-                policy: crate::resource::ResourcePolicy::default_library(),
-                cell_moment_lru: new_cell_moment_lru_cache(
-                    &crate::resource::ResourcePolicy::default_library(),
-                ),
-                cell_moment_cache_stats: new_cell_moment_cache_stats(),
-                intercept_warm_starts: None,
-                auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+                ..default_test_family()
             };
         let block_states = vec![
             ParameterBlockState {
@@ -25933,9 +25539,6 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
-            latent_measure: LatentMeasureKind::StandardNormal,
-            gaussian_frailty_sd: None,
-            base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
@@ -25943,15 +25546,7 @@ mod tests {
                 Array2::zeros((seed.len(), 0)),
             )),
             score_warp: Some(prepared.runtime.clone()),
-            link_dev: None,
-            policy: crate::resource::ResourcePolicy::default_library(),
-            cell_moment_lru: new_cell_moment_lru_cache(
-                &crate::resource::ResourcePolicy::default_library(),
-            ),
-            cell_moment_cache_stats: new_cell_moment_cache_stats(),
-            intercept_warm_starts: None,
-            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            ..default_test_family()
         };
         let cache = family
             .build_exact_eval_cache(&block_states)
@@ -26048,25 +25643,14 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
-            latent_measure: LatentMeasureKind::StandardNormal,
-            gaussian_frailty_sd: None,
-            base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
             logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
-            score_warp: None,
             link_dev: Some(prepared.runtime.clone()),
-            policy: crate::resource::ResourcePolicy::default_library(),
-            cell_moment_lru: new_cell_moment_lru_cache(
-                &crate::resource::ResourcePolicy::default_library(),
-            ),
-            cell_moment_cache_stats: new_cell_moment_cache_stats(),
-            intercept_warm_starts: None,
-            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            ..default_test_family()
         };
         let cache = family
             .build_exact_eval_cache(&block_states)
@@ -26161,9 +25745,6 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
-                latent_measure: LatentMeasureKind::StandardNormal,
-                gaussian_frailty_sd: None,
-                base_link: bernoulli_marginal_slope_probit_link(),
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                     array![[1.0], [1.0], [1.0]],
                 )),
@@ -26172,14 +25753,7 @@ mod tests {
                 )),
                 score_warp: Some(score_prepared.runtime.clone()),
                 link_dev: Some(link_prepared.runtime.clone()),
-                policy: crate::resource::ResourcePolicy::default_library(),
-                cell_moment_lru: new_cell_moment_lru_cache(
-                    &crate::resource::ResourcePolicy::default_library(),
-                ),
-                cell_moment_cache_stats: new_cell_moment_cache_stats(),
-                intercept_warm_starts: None,
-                auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+                ..default_test_family()
             };
         let block_states = vec![
             ParameterBlockState {
@@ -26290,9 +25864,6 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
-            latent_measure: LatentMeasureKind::StandardNormal,
-            gaussian_frailty_sd: None,
-            base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
@@ -26300,15 +25871,7 @@ mod tests {
                 Array2::zeros((seed.len(), 0)),
             )),
             score_warp: Some(prepared.runtime.clone()),
-            link_dev: None,
-            policy: crate::resource::ResourcePolicy::default_library(),
-            cell_moment_lru: new_cell_moment_lru_cache(
-                &crate::resource::ResourcePolicy::default_library(),
-            ),
-            cell_moment_cache_stats: new_cell_moment_cache_stats(),
-            intercept_warm_starts: None,
-            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            ..default_test_family()
         };
         let slices = block_slices(&family);
         let total = slices.total;
@@ -26379,25 +25942,14 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
-            latent_measure: LatentMeasureKind::StandardNormal,
-            gaussian_frailty_sd: None,
-            base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
             logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
-            score_warp: None,
             link_dev: Some(prepared.runtime.clone()),
-            policy: crate::resource::ResourcePolicy::default_library(),
-            cell_moment_lru: new_cell_moment_lru_cache(
-                &crate::resource::ResourcePolicy::default_library(),
-            ),
-            cell_moment_cache_stats: new_cell_moment_cache_stats(),
-            intercept_warm_starts: None,
-            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            ..default_test_family()
         };
         let slices = block_slices(&family);
         let total = slices.total;
@@ -26468,9 +26020,6 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
-            latent_measure: LatentMeasureKind::StandardNormal,
-            gaussian_frailty_sd: None,
-            base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
@@ -26478,15 +26027,7 @@ mod tests {
                 Array2::zeros((seed.len(), 0)),
             )),
             score_warp: Some(prepared.runtime.clone()),
-            link_dev: None,
-            policy: crate::resource::ResourcePolicy::default_library(),
-            cell_moment_lru: new_cell_moment_lru_cache(
-                &crate::resource::ResourcePolicy::default_library(),
-            ),
-            cell_moment_cache_stats: new_cell_moment_cache_stats(),
-            intercept_warm_starts: None,
-            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            ..default_test_family()
         };
         let slices = block_slices(&family);
         let total = slices.total;
@@ -26562,25 +26103,14 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
-            latent_measure: LatentMeasureKind::StandardNormal,
-            gaussian_frailty_sd: None,
-            base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
             logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
-            score_warp: None,
             link_dev: Some(prepared.runtime.clone()),
-            policy: crate::resource::ResourcePolicy::default_library(),
-            cell_moment_lru: new_cell_moment_lru_cache(
-                &crate::resource::ResourcePolicy::default_library(),
-            ),
-            cell_moment_cache_stats: new_cell_moment_cache_stats(),
-            intercept_warm_starts: None,
-            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            ..default_test_family()
         };
         let slices = block_slices(&family);
         let total = slices.total;
@@ -26656,9 +26186,6 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
-            latent_measure: LatentMeasureKind::StandardNormal,
-            gaussian_frailty_sd: None,
-            base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
@@ -26666,15 +26193,7 @@ mod tests {
                 Array2::zeros((seed.len(), 0)),
             )),
             score_warp: Some(prepared.runtime.clone()),
-            link_dev: None,
-            policy: crate::resource::ResourcePolicy::default_library(),
-            cell_moment_lru: new_cell_moment_lru_cache(
-                &crate::resource::ResourcePolicy::default_library(),
-            ),
-            cell_moment_cache_stats: new_cell_moment_cache_stats(),
-            intercept_warm_starts: None,
-            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            ..default_test_family()
         };
         let slices = block_slices(&family);
         let total = slices.total;
@@ -26739,25 +26258,14 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
-            latent_measure: LatentMeasureKind::StandardNormal,
-            gaussian_frailty_sd: None,
-            base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
             logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
-            score_warp: None,
             link_dev: Some(prepared.runtime.clone()),
-            policy: crate::resource::ResourcePolicy::default_library(),
-            cell_moment_lru: new_cell_moment_lru_cache(
-                &crate::resource::ResourcePolicy::default_library(),
-            ),
-            cell_moment_cache_stats: new_cell_moment_cache_stats(),
-            intercept_warm_starts: None,
-            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            ..default_test_family()
         };
         let slices = block_slices(&family);
         let total = slices.total;
@@ -26822,9 +26330,6 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
-            latent_measure: LatentMeasureKind::StandardNormal,
-            gaussian_frailty_sd: None,
-            base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
@@ -26832,15 +26337,7 @@ mod tests {
                 Array2::zeros((seed.len(), 0)),
             )),
             score_warp: Some(prepared.runtime.clone()),
-            link_dev: None,
-            policy: crate::resource::ResourcePolicy::default_library(),
-            cell_moment_lru: new_cell_moment_lru_cache(
-                &crate::resource::ResourcePolicy::default_library(),
-            ),
-            cell_moment_cache_stats: new_cell_moment_cache_stats(),
-            intercept_warm_starts: None,
-            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            ..default_test_family()
         };
         let slices = block_slices(&family);
         let zero = Array1::<f64>::zeros(slices.total);
@@ -26892,25 +26389,14 @@ mod tests {
             y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(seed.len())),
             z: Arc::new(seed.clone()),
-            latent_measure: LatentMeasureKind::StandardNormal,
-            gaussian_frailty_sd: None,
-            base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
             logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((seed.len(), 0)),
             )),
-            score_warp: None,
             link_dev: Some(prepared.runtime.clone()),
-            policy: crate::resource::ResourcePolicy::default_library(),
-            cell_moment_lru: new_cell_moment_lru_cache(
-                &crate::resource::ResourcePolicy::default_library(),
-            ),
-            cell_moment_cache_stats: new_cell_moment_cache_stats(),
-            intercept_warm_starts: None,
-            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            ..default_test_family()
         };
         let slices = block_slices(&family);
         let zero = Array1::<f64>::zeros(slices.total);
@@ -26952,25 +26438,14 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
-                latent_measure: LatentMeasureKind::StandardNormal,
-                gaussian_frailty_sd: None,
-                base_link: bernoulli_marginal_slope_probit_link(),
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                     array![[1.0], [1.0], [1.0]],
                 )),
                 logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                     array![[1.0], [1.0], [1.0]],
                 )),
-                score_warp: None,
                 link_dev: Some(link_prepared.runtime.clone()),
-                policy: crate::resource::ResourcePolicy::default_library(),
-                cell_moment_lru: new_cell_moment_lru_cache(
-                    &crate::resource::ResourcePolicy::default_library(),
-                ),
-                cell_moment_cache_stats: new_cell_moment_cache_stats(),
-                intercept_warm_starts: None,
-                auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+                ..default_test_family()
             };
         let beta_w = Array1::from_iter(
             (0..link_prepared.block.design.ncols()).map(|idx| 0.01 * (idx as f64 + 1.0)),
@@ -27068,9 +26543,6 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
-                latent_measure: LatentMeasureKind::StandardNormal,
-                gaussian_frailty_sd: None,
-                base_link: bernoulli_marginal_slope_probit_link(),
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                     array![[1.0], [1.0], [1.0]],
                 )),
@@ -27078,15 +26550,7 @@ mod tests {
                     array![[1.0], [1.0], [1.0]],
                 )),
                 score_warp: Some(score_prepared.runtime.clone()),
-                link_dev: None,
-                policy: crate::resource::ResourcePolicy::default_library(),
-                cell_moment_lru: new_cell_moment_lru_cache(
-                    &crate::resource::ResourcePolicy::default_library(),
-                ),
-                cell_moment_cache_stats: new_cell_moment_cache_stats(),
-                intercept_warm_starts: None,
-                auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+                ..default_test_family()
             };
         let beta_h = Array1::from_iter(
             (0..score_prepared.block.design.ncols()).map(|idx| 0.015 * (idx as f64 + 1.0)),
@@ -27193,9 +26657,6 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
-                latent_measure: LatentMeasureKind::StandardNormal,
-                gaussian_frailty_sd: None,
-                base_link: bernoulli_marginal_slope_probit_link(),
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                     array![[1.0], [1.0], [1.0]],
                 )),
@@ -27204,14 +26665,7 @@ mod tests {
                 )),
                 score_warp: Some(score_prepared.runtime.clone()),
                 link_dev: Some(link_prepared.runtime.clone()),
-                policy: crate::resource::ResourcePolicy::default_library(),
-                cell_moment_lru: new_cell_moment_lru_cache(
-                    &crate::resource::ResourcePolicy::default_library(),
-                ),
-                cell_moment_cache_stats: new_cell_moment_cache_stats(),
-                intercept_warm_starts: None,
-                auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+                ..default_test_family()
             };
         let beta_h = Array1::from_iter(
             (0..score_prepared.block.design.ncols()).map(|idx| 0.015 * (idx as f64 + 1.0)),
@@ -27343,9 +26797,6 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
-                latent_measure: LatentMeasureKind::StandardNormal,
-                gaussian_frailty_sd: None,
-                base_link: bernoulli_marginal_slope_probit_link(),
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                     array![[1.0], [1.0], [1.0]],
                 )),
@@ -27354,14 +26805,7 @@ mod tests {
                 )),
                 score_warp: Some(score_prepared.runtime.clone()),
                 link_dev: Some(link_prepared.runtime.clone()),
-                policy: crate::resource::ResourcePolicy::default_library(),
-                cell_moment_lru: new_cell_moment_lru_cache(
-                    &crate::resource::ResourcePolicy::default_library(),
-                ),
-                cell_moment_cache_stats: new_cell_moment_cache_stats(),
-                intercept_warm_starts: None,
-                auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+                ..default_test_family()
             };
         let beta_h = Array1::from_iter(
             (0..score_prepared.block.design.ncols()).map(|idx| 0.015 * (idx as f64 + 1.0)),
@@ -27480,9 +26924,6 @@ mod tests {
             y: Arc::new(y.clone()),
             weights: Arc::new(weights.clone()),
             z: Arc::new(z.clone()),
-            latent_measure: LatentMeasureKind::StandardNormal,
-            gaussian_frailty_sd: None,
-            base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 marginal_x.clone(),
             )),
@@ -27491,14 +26932,7 @@ mod tests {
             )),
             score_warp: Some(score_prepared.runtime.clone()),
             link_dev: Some(link_prepared.runtime.clone()),
-            policy: crate::resource::ResourcePolicy::default_library(),
-            cell_moment_lru: new_cell_moment_lru_cache(
-                &crate::resource::ResourcePolicy::default_library(),
-            ),
-            cell_moment_cache_stats: new_cell_moment_cache_stats(),
-            intercept_warm_starts: None,
-            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            ..default_test_family()
         };
         let beta_m = array![0.18, -0.07];
         let beta_g = array![0.42, 0.05];
@@ -27903,9 +27337,6 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
-                latent_measure: LatentMeasureKind::StandardNormal,
-                gaussian_frailty_sd: None,
-                base_link: bernoulli_marginal_slope_probit_link(),
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                     array![[1.0], [1.0], [1.0]],
                 )),
@@ -27914,14 +27345,7 @@ mod tests {
                 )),
                 score_warp: Some(score_prepared.runtime.clone()),
                 link_dev: Some(link_prepared.runtime.clone()),
-                policy: crate::resource::ResourcePolicy::default_library(),
-                cell_moment_lru: new_cell_moment_lru_cache(
-                    &crate::resource::ResourcePolicy::default_library(),
-                ),
-                cell_moment_cache_stats: new_cell_moment_cache_stats(),
-                intercept_warm_starts: None,
-                auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+                ..default_test_family()
             };
         let block_states = vec![
             ParameterBlockState {
@@ -27978,25 +27402,14 @@ mod tests {
                 y: Arc::new(y.clone()),
                 weights: Arc::new(weights.clone()),
                 z: Arc::new(z.clone()),
-                latent_measure: LatentMeasureKind::StandardNormal,
                 gaussian_frailty_sd: Some(sigma),
-                base_link: bernoulli_marginal_slope_probit_link(),
                 marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                     array![[1.0], [1.0], [1.0]],
                 )),
                 logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                     array![[1.0], [1.0], [1.0]],
                 )),
-                score_warp: None,
-                link_dev: None,
-                policy: crate::resource::ResourcePolicy::default_library(),
-                cell_moment_lru: new_cell_moment_lru_cache(
-                    &crate::resource::ResourcePolicy::default_library(),
-                ),
-                cell_moment_cache_stats: new_cell_moment_cache_stats(),
-                intercept_warm_starts: None,
-                auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+                ..default_test_family()
             };
         let family = make_family(sigma);
         let block_states = vec![
@@ -28076,25 +27489,13 @@ mod tests {
             y: Arc::new(y),
             weights: Arc::new(weights),
             z: Arc::new(z),
-            latent_measure: LatentMeasureKind::StandardNormal,
-            gaussian_frailty_sd: None,
-            base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 marginal_design,
             )),
             logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 logslope_design,
             )),
-            score_warp: None,
-            link_dev: None,
-            policy: crate::resource::ResourcePolicy::default_library(),
-            cell_moment_lru: new_cell_moment_lru_cache(
-                &crate::resource::ResourcePolicy::default_library(),
-            ),
-            cell_moment_cache_stats: new_cell_moment_cache_stats(),
-            intercept_warm_starts: None,
-            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            ..default_test_family()
         }
     }
 
@@ -28731,9 +28132,7 @@ mod tests {
             y: Arc::new(y),
             weights: Arc::new(weights),
             z: Arc::new(z.clone()),
-            latent_measure: LatentMeasureKind::StandardNormal,
             gaussian_frailty_sd: Some(0.15),
-            base_link: bernoulli_marginal_slope_probit_link(),
             marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 marginal_x.clone(),
             )),
@@ -28742,14 +28141,7 @@ mod tests {
             )),
             score_warp: Some(score_prepared.runtime.clone()),
             link_dev: Some(link_prepared.runtime.clone()),
-            policy: crate::resource::ResourcePolicy::default_library(),
-            cell_moment_lru: new_cell_moment_lru_cache(
-                &crate::resource::ResourcePolicy::default_library(),
-            ),
-            cell_moment_cache_stats: new_cell_moment_cache_stats(),
-            intercept_warm_starts: None,
-            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            ..default_test_family()
         };
         let beta_m = array![0.12, -0.04];
         let beta_g = array![0.35, 0.03];

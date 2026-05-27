@@ -879,6 +879,7 @@ const HARD_EXIT: fn(i32) -> ! = std::process::exit;
 
 fn main() {
     gam::init_parallelism();
+    gam::heartbeat::ensure_started();
     let result = run();
     if let Err(e) = result {
         cli_err!("error: {e}");
