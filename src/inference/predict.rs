@@ -4622,16 +4622,8 @@ pub fn enrich_posterior_mean_bounds(
             .map(|(&lo, &hi)| lo.max(hi)),
     );
 
-    // Clamp bounded-response families to [0, 1].
-    if matches!(
-        spec.response,
-        ResponseFamily::Binomial | ResponseFamily::Beta { .. } | ResponseFamily::RoystonParmar
-    ) {
-        let (lo, hi) = if matches!(spec.response, ResponseFamily::Beta { .. }) {
-            (1e-10, 1.0 - 1e-10)
-        } else {
-            (0.0, 1.0)
-        };
+    // Clamp bounded-response families to their support.
+    if let Some((lo, hi)) = spec.response.mean_clamp_bounds() {
         mean_lower.mapv_inplace(|v| v.clamp(lo, hi));
         mean_upper.mapv_inplace(|v| v.clamp(lo, hi));
     }
@@ -5451,15 +5443,7 @@ where
     };
 
     let spec = &likelihood;
-    if matches!(
-        &spec.response,
-        ResponseFamily::Binomial | ResponseFamily::Beta { .. } | ResponseFamily::RoystonParmar
-    ) {
-        let (lo, hi) = if matches!(&spec.response, ResponseFamily::Beta { .. }) {
-            (1e-10, 1.0 - 1e-10)
-        } else {
-            (0.0, 1.0)
-        };
+    if let Some((lo, hi)) = spec.response.mean_clamp_bounds() {
         mean_lower.mapv_inplace(|v| v.clamp(lo, hi));
         mean_upper.mapv_inplace(|v| v.clamp(lo, hi));
     }

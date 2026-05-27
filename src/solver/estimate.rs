@@ -1740,6 +1740,27 @@ impl core::fmt::Debug for EstimationError {
     }
 }
 
+impl EstimationError {
+    /// Classifies inner-solve failures that the outer REML loop should
+    /// treat as a soft retreat (return +inf cost / infeasible outer-eval)
+    /// rather than propagate as a hard error.
+    ///
+    /// Why: when the penalised Hessian becomes effectively singular at the
+    /// current ρ, when P-IRLS hits a perfect-separation diagnostic, or when
+    /// it exhausts its iteration budget, the outer optimiser's correct
+    /// response is to back away from this ρ — not to terminate the fit.
+    /// All three variants encode "the inner problem at this ρ is too hard
+    /// to evaluate, try a different ρ".
+    pub fn is_inner_solve_retreat(&self) -> bool {
+        matches!(
+            self,
+            EstimationError::ModelIsIllConditioned { .. }
+                | EstimationError::PerfectSeparationDetected { .. }
+                | EstimationError::PirlsDidNotConverge { .. }
+        )
+    }
+}
+
 //
 // This uses the joint model architecture where the base predictor and
 // flexible link are fitted together in one optimization with REML.

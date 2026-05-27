@@ -7587,9 +7587,7 @@ impl<'a> RemlState<'a> {
         // no KKT enforcement at partial fits).
         let bundle = match self.obtain_eval_bundle(p) {
             Ok(bundle) => bundle,
-            Err(EstimationError::ModelIsIllConditioned { .. })
-            | Err(EstimationError::PerfectSeparationDetected { .. })
-            | Err(EstimationError::PirlsDidNotConverge { .. }) => {
+            Err(err) if err.is_inner_solve_retreat() => {
                 self.cache_manager.invalidate_eval_bundle();
                 return Ok(f64::INFINITY);
             }
@@ -9266,18 +9264,11 @@ impl<'a> RemlState<'a> {
         let t_pirls = std::time::Instant::now();
         let bundle = match self.obtain_eval_bundle(p) {
             Ok(bundle) => bundle,
-            Err(EstimationError::ModelIsIllConditioned { .. }) => {
+            Err(err) if err.is_inner_solve_retreat() => {
                 self.cache_manager.invalidate_eval_bundle();
                 log::debug!(
-                    "P-IRLS flagged ill-conditioning for current rho; returning infeasible outer eval to retreat."
-                );
-                return Ok(OuterEval::infeasible(p.len()));
-            }
-            Err(EstimationError::PerfectSeparationDetected { .. })
-            | Err(EstimationError::PirlsDidNotConverge { .. }) => {
-                self.cache_manager.invalidate_eval_bundle();
-                log::debug!(
-                    "P-IRLS separation/non-convergence at current rho; returning infeasible outer eval to retreat."
+                    "P-IRLS inner-solve retreat at current rho ({}); returning infeasible outer eval.",
+                    err
                 );
                 return Ok(OuterEval::infeasible(p.len()));
             }
