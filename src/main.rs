@@ -8627,7 +8627,7 @@ fn resolve_family(
     let explicit_family = family_from_arg(arg, nb_theta);
     if let Some(choice) = link_choice.as_ref() {
         let from_link = if choice.mixture_components.is_some() {
-            LikelihoodSpec::binomial_link(LinkFunction::Logit)
+            LikelihoodSpec::binomial_logit()
         } else {
             match choice.link {
                 LinkFunction::Identity => LikelihoodSpec::gaussian_identity(),
@@ -8643,10 +8643,23 @@ fn resolve_family(
                 LinkFunction::Logit => LikelihoodSpec::binomial_logit(),
                 LinkFunction::Probit => LikelihoodSpec::binomial_probit(),
                 LinkFunction::CLogLog => LikelihoodSpec::binomial_cloglog(),
-                LinkFunction::Sas => LikelihoodSpec::binomial_link(LinkFunction::Sas),
-                LinkFunction::BetaLogistic => {
-                    LikelihoodSpec::binomial_link(LinkFunction::BetaLogistic)
-                }
+                // State-less placeholder: CLI-resolution here precedes
+                // link-state configuration. Downstream `state_from_sasspec`
+                // / `state_from_beta_logisticspec` paths recognize the
+                // `Standard(Sas)` / `Standard(BetaLogistic)` marker and
+                // upgrade to `InverseLink::Sas(state)` / `InverseLink::BetaLogistic(state)`
+                // once the spec is available (see src/main.rs:2308-2324
+                // and src/families/survival_location_scale.rs:4170-4180).
+                // The `from_link` value here only feeds the equality check
+                // against `--family` at line ~8665 below.
+                LinkFunction::Sas => LikelihoodSpec::new(
+                    ResponseFamily::Binomial,
+                    InverseLink::Standard(LinkFunction::Sas),
+                ),
+                LinkFunction::BetaLogistic => LikelihoodSpec::new(
+                    ResponseFamily::Binomial,
+                    InverseLink::Standard(LinkFunction::BetaLogistic),
+                ),
             }
         };
         if let Some(explicit) = explicit_family.as_ref() {
@@ -8678,7 +8691,7 @@ fn resolve_family(
         FamilyArg::BinomialLogit => LikelihoodSpec::binomial_logit(),
         FamilyArg::BinomialProbit => LikelihoodSpec::binomial_probit(),
         FamilyArg::BinomialCloglog => LikelihoodSpec::binomial_cloglog(),
-        FamilyArg::LatentCloglogBinomial => LikelihoodSpec::binomial_link(LinkFunction::CLogLog),
+        FamilyArg::LatentCloglogBinomial => LikelihoodSpec::binomial_cloglog(),
         FamilyArg::PoissonLog => LikelihoodSpec::poisson_log(),
         FamilyArg::NegativeBinomial => LikelihoodSpec::negative_binomial_log(nb_theta),
         FamilyArg::GammaLog => LikelihoodSpec::gamma_log(),
@@ -8701,9 +8714,7 @@ fn family_from_arg(arg: FamilyArg, negative_binomial_theta: f64) -> Option<Likel
         FamilyArg::BinomialLogit => Some(LikelihoodSpec::binomial_logit()),
         FamilyArg::BinomialProbit => Some(LikelihoodSpec::binomial_probit()),
         FamilyArg::BinomialCloglog => Some(LikelihoodSpec::binomial_cloglog()),
-        FamilyArg::LatentCloglogBinomial => {
-            Some(LikelihoodSpec::binomial_link(LinkFunction::CLogLog))
-        }
+        FamilyArg::LatentCloglogBinomial => Some(LikelihoodSpec::binomial_cloglog()),
         FamilyArg::PoissonLog => Some(LikelihoodSpec::poisson_log()),
         FamilyArg::NegativeBinomial => Some(LikelihoodSpec::negative_binomial_log(
             negative_binomial_theta,
