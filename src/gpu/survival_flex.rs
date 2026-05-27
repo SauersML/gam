@@ -887,7 +887,7 @@ impl SurvivalFlexGpuBackend {
 /// flatten the per-row `Vec<DenestedPartitionCell>` lists into this
 /// shape with a single pass.
 #[derive(Clone, Debug)]
-pub(crate) struct SurvivalFlexRowCellsBatch<'a> {
+pub struct SurvivalFlexRowCellsBatch<'a> {
     /// Total cell count = sum of per-row partition lengths.
     pub n_cells: usize,
     /// Number of rows (logical observations).
@@ -912,7 +912,7 @@ pub(crate) struct SurvivalFlexRowCellsBatch<'a> {
 /// `HostMomentBatch` plus an echoed `row_offsets` so Step 3/4 can drive
 /// per-row cumulative quadrature without re-flattening.
 #[derive(Clone, Debug)]
-pub(crate) struct SurvivalFlexRowMoments {
+pub struct SurvivalFlexRowMoments {
     /// Row-major `[n_cells, stride]` derivative moments, where
     /// `stride = max_degree + 1`.  Row for cell `k` is
     /// `moments[k * stride ..][..stride]`.
@@ -1010,7 +1010,7 @@ impl<'a> SurvivalFlexRowCellsBatch<'a> {
 /// platform: on Linux+CUDA the NonAffineFinite bucket runs on the
 /// device, on macOS / CPU-only Linux every cell falls through to the
 /// CPU evaluator that is the parity reference for the device kernel.
-pub(crate) fn try_row_batched_cell_moments(
+pub fn try_row_batched_cell_moments(
     batch: SurvivalFlexRowCellsBatch<'_>,
 ) -> Result<Option<SurvivalFlexRowMoments>, GpuError> {
     batch.validate()?;
@@ -1150,7 +1150,7 @@ pub(crate) fn try_row_batched_cell_moments(
 /// directly for closed-form parity against the CPU monotone-root
 /// solver.
 #[derive(Clone, Debug)]
-pub(crate) struct SurvivalFlexInterceptSolveInputs<'a> {
+pub struct SurvivalFlexInterceptSolveInputs<'a> {
     /// Number of rows.
     pub n: usize,
     /// Warm-start seed per row.  For the rigid (flex=false) fallback the
@@ -1174,7 +1174,7 @@ pub(crate) struct SurvivalFlexInterceptSolveInputs<'a> {
 
 /// Step 3 per-row output.
 #[derive(Clone, Debug)]
-pub(crate) struct SurvivalFlexInterceptSolveOutputs {
+pub struct SurvivalFlexInterceptSolveOutputs {
     /// Converged root `a*` per row.
     pub a_root: Vec<f64>,
     /// `|F'(a*)|` per row — Step 4 IFT uses this to invert through the
@@ -3912,6 +3912,545 @@ pub fn cpu_reference_rigid_row(
         + u1_ad1 * d2ad1_dg2;
 
     (nll, grad, hess, 0)
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Block 10 — third T_uv[r] and fourth Q_uv[r,s] directional contractions.
+//
+// Math reference: math block 10 §3.5 (third) and §3.6 (fourth).  The
+// per-row CPU implementations are
+// `SurvivalMarginalSlopeFamily::row_flex_primary_third_contracted_exact`
+// and `_fourth_contracted_exact` in `src/families/survival_marginal_slope.rs`.
+//
+// These oracles are pure assemblers over the timepoint-jet substrate
+// outputs (entry/exit base + per-direction extension + bidirectional).
+// They mirror the CPU assembly term-for-term.
+// ────────────────────────────────────────────────────────────────────────
+
+/// Per-timepoint exact-jet substrate input.  Mirrors the crate-private
+/// `SurvivalFlexTimepointExact` in `survival_marginal_slope.rs`.
+/// All arrays are row-major dense over the primary dimension `p`.
+#[derive(Clone, Debug)]
+pub struct SurvivalFlexBlock10TimepointBase {
+    pub eta: f64,
+    pub chi: f64,
+    pub d: f64,
+    pub eta_u: Vec<f64>,
+    pub eta_uv: Vec<f64>,
+    pub chi_u: Vec<f64>,
+    pub chi_uv: Vec<f64>,
+    pub d_u: Vec<f64>,
+    pub d_uv: Vec<f64>,
+}
+
+/// Directional extension of a timepoint jet contracted with a single
+/// direction `d ∈ ℝᵖ`.  Mirrors `SurvivalFlexTimepointDirectionalExact`.
+#[derive(Clone, Debug)]
+pub struct SurvivalFlexBlock10TimepointDirectional {
+    pub eta_uv_dir: Vec<f64>,
+    pub chi_uv_dir: Vec<f64>,
+    pub d_u_dir: Vec<f64>,
+    pub d_uv_dir: Vec<f64>,
+}
+
+/// Mixed second-directional extension `D_{d1} D_{d2}` of a timepoint jet.
+#[derive(Clone, Debug)]
+pub struct SurvivalFlexBlock10TimepointBiDirectional {
+    pub eta_uv_uv: Vec<f64>,
+    pub chi_uv_uv: Vec<f64>,
+    pub d_uv_uv: Vec<f64>,
+}
+
+/// Inputs to the Block 10 third-contraction CPU oracle.
+#[derive(Clone, Debug)]
+pub struct SurvivalFlexBlock10ThirdInputs<'a> {
+    pub p: usize,
+    /// Index of the `qd1` primary coordinate; `usize::MAX` to disable.
+    pub qd1_index: usize,
+    pub qd1: f64,
+    pub w: f64,
+    pub d: f64,
+    pub dir: &'a [f64],
+    pub entry_base: &'a SurvivalFlexBlock10TimepointBase,
+    pub exit_base: &'a SurvivalFlexBlock10TimepointBase,
+    pub entry_ext: &'a SurvivalFlexBlock10TimepointDirectional,
+    pub exit_ext: &'a SurvivalFlexBlock10TimepointDirectional,
+}
+
+/// Inputs to the Block 10 fourth-contraction CPU oracle.
+#[derive(Clone, Debug)]
+pub struct SurvivalFlexBlock10FourthInputs<'a> {
+    pub p: usize,
+    pub qd1_index: usize,
+    pub qd1: f64,
+    pub w: f64,
+    pub d: f64,
+    pub dir_u: &'a [f64],
+    pub dir_v: &'a [f64],
+    pub entry_base: &'a SurvivalFlexBlock10TimepointBase,
+    pub exit_base: &'a SurvivalFlexBlock10TimepointBase,
+    pub entry_ext_u: &'a SurvivalFlexBlock10TimepointDirectional,
+    pub entry_ext_v: &'a SurvivalFlexBlock10TimepointDirectional,
+    pub exit_ext_u: &'a SurvivalFlexBlock10TimepointDirectional,
+    pub exit_ext_v: &'a SurvivalFlexBlock10TimepointDirectional,
+    pub entry_bi: &'a SurvivalFlexBlock10TimepointBiDirectional,
+    pub exit_bi: &'a SurvivalFlexBlock10TimepointBiDirectional,
+}
+
+#[inline]
+fn b10_dot(a: &[f64], b: &[f64]) -> f64 {
+    debug_assert_eq!(a.len(), b.len());
+    let mut acc = 0.0_f64;
+    for i in 0..a.len() {
+        acc += a[i] * b[i];
+    }
+    acc
+}
+
+#[inline]
+fn b10_mat_dot(m: &[f64], v: &[f64], p: usize) -> Vec<f64> {
+    debug_assert_eq!(m.len(), p * p);
+    debug_assert_eq!(v.len(), p);
+    let mut out = vec![0.0_f64; p];
+    for u in 0..p {
+        let mut acc = 0.0_f64;
+        let row = &m[u * p..(u + 1) * p];
+        for k in 0..p {
+            acc += row[k] * v[k];
+        }
+        out[u] = acc;
+    }
+    out
+}
+
+#[inline]
+fn b10_at(m: &[f64], u: usize, v: usize, p: usize) -> f64 {
+    m[u * p + v]
+}
+
+/// CPU oracle for the third directional contraction `T_uv[r] :=
+/// (D_{dir} H)[u, v]` of the flexible survival path.  Pure assembler;
+/// mirrors `row_flex_primary_third_contracted_exact` term-for-term.
+pub fn cpu_oracle_third_contraction(
+    inputs: &SurvivalFlexBlock10ThirdInputs<'_>,
+) -> Result<Vec<f64>, String> {
+    let p = inputs.p;
+    if inputs.dir.len() != p {
+        return Err(format!(
+            "cpu_oracle_third_contraction: dir length {} != p {}",
+            inputs.dir.len(),
+            p
+        ));
+    }
+    if inputs.dir.iter().all(|v| v.abs() == 0.0) {
+        return Ok(vec![0.0_f64; p * p]);
+    }
+    let entry = inputs.entry_base;
+    let exit = inputs.exit_base;
+    let entry_ext = inputs.entry_ext;
+    let exit_ext = inputs.exit_ext;
+    let chi = exit.chi;
+    if !chi.is_finite() || chi <= 0.0 {
+        return Err(format!(
+            "cpu_oracle_third_contraction: non-positive chi={chi:.3e}"
+        ));
+    }
+    let d_val = exit.d;
+    if !d_val.is_finite() || d_val == 0.0 {
+        return Err(format!(
+            "cpu_oracle_third_contraction: non-finite/zero D={d_val:.3e}"
+        ));
+    }
+
+    let wi = inputs.w;
+    let di = inputs.d;
+
+    use crate::families::bernoulli_marginal_slope::signed_probit_neglog_derivatives_up_to_fourth;
+    let (entry_k1, entry_k2, entry_k3, _) =
+        signed_probit_neglog_derivatives_up_to_fourth(-entry.eta, -wi)?;
+    let (exit_k1, exit_k2, exit_k3, _) =
+        signed_probit_neglog_derivatives_up_to_fourth(-exit.eta, wi * (1.0 - di))?;
+
+    let entry_u1 = -entry_k1;
+    let entry_u2 = entry_k2;
+    let entry_u3 = -entry_k3;
+    let exit_u1 = -exit_k1;
+    let exit_u2 = exit_k2;
+    let exit_u3 = -exit_k3;
+
+    let entry_eta_dir = b10_dot(&entry.eta_u, inputs.dir);
+    let exit_eta_dir = b10_dot(&exit.eta_u, inputs.dir);
+    let exit_chi_dir = b10_dot(&exit.chi_u, inputs.dir);
+    let exit_d_dir = b10_dot(&exit.d_u, inputs.dir);
+    let qd1_dir = if inputs.qd1_index < p {
+        inputs.dir[inputs.qd1_index]
+    } else {
+        0.0
+    };
+
+    let entry_eta_u_dir = b10_mat_dot(&entry.eta_uv, inputs.dir, p);
+    let exit_eta_u_dir = b10_mat_dot(&exit.eta_uv, inputs.dir, p);
+    let exit_chi_u_dir = b10_mat_dot(&exit.chi_uv, inputs.dir, p);
+    let exit_d_u_dir = b10_mat_dot(&exit.d_uv, inputs.dir, p);
+
+    let chi_inv = 1.0 / chi;
+    let chi_inv2 = chi_inv * chi_inv;
+    let chi_inv3 = chi_inv2 * chi_inv;
+    let d_inv = 1.0 / d_val;
+    let d_inv2 = d_inv * d_inv;
+    let d_inv3 = d_inv2 * d_inv;
+
+    let mut out = vec![0.0_f64; p * p];
+    for u in 0..p {
+        for v in u..p {
+            let mut val = 0.0_f64;
+
+            // Entry probit
+            val += entry_u3 * entry_eta_dir * entry.eta_u[u] * entry.eta_u[v];
+            val += entry_u2
+                * (entry_eta_u_dir[u] * entry.eta_u[v]
+                    + entry.eta_u[u] * entry_eta_u_dir[v]);
+            val += entry_u2 * entry_eta_dir * b10_at(&entry.eta_uv, u, v, p);
+            val += entry_u1 * b10_at(&entry_ext.eta_uv_dir, u, v, p);
+
+            // Exit probit survival
+            val += exit_u3 * exit_eta_dir * exit.eta_u[u] * exit.eta_u[v];
+            val += exit_u2
+                * (exit_eta_u_dir[u] * exit.eta_u[v]
+                    + exit.eta_u[u] * exit_eta_u_dir[v]);
+            val += exit_u2 * exit_eta_dir * b10_at(&exit.eta_uv, u, v, p);
+            val += exit_u1 * b10_at(&exit_ext.eta_uv_dir, u, v, p);
+
+            // Event density
+            val += wi
+                * di
+                * (exit_eta_u_dir[u] * exit.eta_u[v]
+                    + exit.eta_u[u] * exit_eta_u_dir[v]
+                    + exit_eta_dir * b10_at(&exit.eta_uv, u, v, p)
+                    + exit.eta * b10_at(&exit_ext.eta_uv_dir, u, v, p));
+
+            // Event chi
+            let chi_uv_over_chi_dir = (b10_at(&exit_ext.chi_uv_dir, u, v, p) * chi
+                - b10_at(&exit.chi_uv, u, v, p) * exit_chi_dir)
+                * chi_inv2;
+            let chi_u_chi_v_over_chi2_dir = (exit_chi_u_dir[u] * exit.chi_u[v]
+                + exit.chi_u[u] * exit_chi_u_dir[v])
+                * chi_inv2
+                - 2.0 * exit.chi_u[u] * exit.chi_u[v] * exit_chi_dir * chi_inv3;
+            val -= wi * di * (chi_uv_over_chi_dir - chi_u_chi_v_over_chi2_dir);
+
+            // Event D
+            let d_uv_over_d_dir = (b10_at(&exit_ext.d_uv_dir, u, v, p) * d_val
+                - b10_at(&exit.d_uv, u, v, p) * exit_d_dir)
+                * d_inv2;
+            let d_u_d_v_over_d2_dir = (exit_d_u_dir[u] * exit.d_u[v]
+                + exit.d_u[u] * exit_d_u_dir[v])
+                * d_inv2
+                - 2.0 * exit.d_u[u] * exit.d_u[v] * exit_d_dir * d_inv3;
+            val += wi * di * (d_uv_over_d_dir - d_u_d_v_over_d2_dir);
+
+            // qd1 term
+            if inputs.qd1_index < p
+                && u == inputs.qd1_index
+                && v == inputs.qd1_index
+            {
+                val += wi * di * (-2.0 / (inputs.qd1 * inputs.qd1 * inputs.qd1)) * qd1_dir;
+            }
+
+            out[u * p + v] = val;
+            out[v * p + u] = val;
+        }
+    }
+    Ok(out)
+}
+
+/// One ordered fourth contracted matrix `D_{dir2}(D_{dir1} H)`; mirrors
+/// `compute_survival_fourth_contracted_ordered`.
+#[allow(clippy::too_many_arguments)]
+fn b10_fourth_ordered(
+    p: usize,
+    qd1_index: usize,
+    qd1: f64,
+    wi: f64,
+    di: f64,
+    dir1: &[f64],
+    dir2: &[f64],
+    entry_base: &SurvivalFlexBlock10TimepointBase,
+    exit_base: &SurvivalFlexBlock10TimepointBase,
+    entry_ext1: &SurvivalFlexBlock10TimepointDirectional,
+    entry_ext2: &SurvivalFlexBlock10TimepointDirectional,
+    exit_ext1: &SurvivalFlexBlock10TimepointDirectional,
+    exit_ext2: &SurvivalFlexBlock10TimepointDirectional,
+    entry_bi: &SurvivalFlexBlock10TimepointBiDirectional,
+    exit_bi: &SurvivalFlexBlock10TimepointBiDirectional,
+) -> Result<Vec<f64>, String> {
+    use crate::families::bernoulli_marginal_slope::signed_probit_neglog_derivatives_up_to_fourth;
+
+    let (entry_k1, entry_k2, entry_k3, entry_k4) =
+        signed_probit_neglog_derivatives_up_to_fourth(-entry_base.eta, -wi)?;
+    let (exit_k1, exit_k2, exit_k3, exit_k4) =
+        signed_probit_neglog_derivatives_up_to_fourth(-exit_base.eta, wi * (1.0 - di))?;
+
+    let entry_u1 = -entry_k1;
+    let entry_u2 = entry_k2;
+    let entry_u3 = -entry_k3;
+    let exit_u1 = -exit_k1;
+    let exit_u2 = exit_k2;
+    let exit_u3 = -exit_k3;
+
+    let entry_eta_d1 = b10_dot(&entry_base.eta_u, dir1);
+    let entry_eta_d2 = b10_dot(&entry_base.eta_u, dir2);
+    let exit_eta_d1 = b10_dot(&exit_base.eta_u, dir1);
+    let exit_eta_d2 = b10_dot(&exit_base.eta_u, dir2);
+    let exit_chi_d1 = b10_dot(&exit_base.chi_u, dir1);
+    let exit_chi_d2 = b10_dot(&exit_base.chi_u, dir2);
+    let exit_d_d1 = b10_dot(&exit_base.d_u, dir1);
+    let exit_d_d2 = b10_dot(&exit_base.d_u, dir2);
+    let qd1_d1 = if qd1_index < p { dir1[qd1_index] } else { 0.0 };
+    let qd1_d2 = if qd1_index < p { dir2[qd1_index] } else { 0.0 };
+
+    let entry_eta_u_d1 = b10_mat_dot(&entry_base.eta_uv, dir1, p);
+    let entry_eta_u_d2 = b10_mat_dot(&entry_base.eta_uv, dir2, p);
+    let exit_eta_u_d1 = b10_mat_dot(&exit_base.eta_uv, dir1, p);
+    let exit_eta_u_d2 = b10_mat_dot(&exit_base.eta_uv, dir2, p);
+    let exit_chi_u_d1 = b10_mat_dot(&exit_base.chi_uv, dir1, p);
+    let exit_chi_u_d2 = b10_mat_dot(&exit_base.chi_uv, dir2, p);
+    let exit_d_u_d2 = b10_mat_dot(&exit_base.d_uv, dir2, p);
+
+    let entry_eta_d12 = b10_dot(&entry_eta_u_d2, dir1);
+    let exit_eta_d12 = b10_dot(&exit_eta_u_d2, dir1);
+    let exit_chi_d12 = b10_dot(&exit_chi_u_d2, dir1);
+    let exit_d_d12 = b10_dot(&exit_d_u_d2, dir1);
+
+    let entry_eta_u_d12 = b10_mat_dot(&entry_ext2.eta_uv_dir, dir1, p);
+    let exit_eta_u_d12 = b10_mat_dot(&exit_ext2.eta_uv_dir, dir1, p);
+    let exit_chi_u_d12 = b10_mat_dot(&exit_ext2.chi_uv_dir, dir1, p);
+    let exit_d_u_d12 = b10_mat_dot(&exit_ext2.d_uv_dir, dir1, p);
+
+    let chi = exit_base.chi;
+    let chi_inv = 1.0 / chi;
+    let chi_inv2 = chi_inv * chi_inv;
+    let chi_inv3 = chi_inv2 * chi_inv;
+    let chi_inv4 = chi_inv3 * chi_inv;
+    let d_val = exit_base.d;
+    let d_inv = 1.0 / d_val;
+    let d_inv2 = d_inv * d_inv;
+    let d_inv3 = d_inv2 * d_inv;
+    let d_inv4 = d_inv3 * d_inv;
+
+    let mut out = vec![0.0_f64; p * p];
+    for u in 0..p {
+        for v in u..p {
+            let mut val = 0.0_f64;
+
+            // Entry probit
+            let eu = &entry_base.eta_u;
+            let euv_uv = b10_at(&entry_base.eta_uv, u, v, p);
+
+            let a_term = eu[u] * eu[v] * entry_eta_d1;
+            let a_term_d2 = entry_eta_u_d2[u] * eu[v] * entry_eta_d1
+                + eu[u] * entry_eta_u_d2[v] * entry_eta_d1
+                + eu[u] * eu[v] * entry_eta_d12;
+            let b_term = b10_at(&entry_ext1.eta_uv_dir, u, v, p);
+            let b_term_d2 = b10_at(&entry_bi.eta_uv_uv, u, v, p);
+            let c_term =
+                entry_eta_u_d1[u] * eu[v] + eu[u] * entry_eta_u_d1[v] + entry_eta_d1 * euv_uv;
+            let c_term_d2 = entry_eta_u_d12[u] * eu[v]
+                + entry_eta_u_d1[u] * entry_eta_u_d2[v]
+                + entry_eta_u_d2[u] * entry_eta_u_d1[v]
+                + eu[u] * entry_eta_u_d12[v]
+                + entry_eta_d12 * euv_uv
+                + entry_eta_d1 * b10_at(&entry_ext2.eta_uv_dir, u, v, p);
+
+            val += entry_k4 * entry_eta_d2 * a_term
+                + entry_u3 * a_term_d2
+                + entry_u3 * entry_eta_d2 * c_term
+                + entry_u2 * c_term_d2
+                + entry_u2 * entry_eta_d2 * b_term
+                + entry_u1 * b_term_d2;
+
+            // Exit probit
+            let xu = &exit_base.eta_u;
+            let xuv_uv = b10_at(&exit_base.eta_uv, u, v, p);
+
+            let xa = xu[u] * xu[v] * exit_eta_d1;
+            let xa_d2 = exit_eta_u_d2[u] * xu[v] * exit_eta_d1
+                + xu[u] * exit_eta_u_d2[v] * exit_eta_d1
+                + xu[u] * xu[v] * exit_eta_d12;
+            let xb = b10_at(&exit_ext1.eta_uv_dir, u, v, p);
+            let xb_d2 = b10_at(&exit_bi.eta_uv_uv, u, v, p);
+            let xc = exit_eta_u_d1[u] * xu[v] + xu[u] * exit_eta_u_d1[v] + exit_eta_d1 * xuv_uv;
+            let xc_d2 = exit_eta_u_d12[u] * xu[v]
+                + exit_eta_u_d1[u] * exit_eta_u_d2[v]
+                + exit_eta_u_d2[u] * exit_eta_u_d1[v]
+                + xu[u] * exit_eta_u_d12[v]
+                + exit_eta_d12 * xuv_uv
+                + exit_eta_d1 * b10_at(&exit_ext2.eta_uv_dir, u, v, p);
+
+            val += exit_k4 * exit_eta_d2 * xa
+                + exit_u3 * xa_d2
+                + exit_u3 * exit_eta_d2 * xc
+                + exit_u2 * xc_d2
+                + exit_u2 * exit_eta_d2 * xb
+                + exit_u1 * xb_d2;
+
+            // Event density
+            val += wi
+                * di
+                * (exit_eta_u_d12[u] * xu[v]
+                    + exit_eta_u_d1[u] * exit_eta_u_d2[v]
+                    + exit_eta_u_d2[u] * exit_eta_u_d1[v]
+                    + xu[u] * exit_eta_u_d12[v]
+                    + exit_eta_d12 * xuv_uv
+                    + exit_eta_d1 * b10_at(&exit_ext2.eta_uv_dir, u, v, p)
+                    + exit_eta_d2 * b10_at(&exit_ext1.eta_uv_dir, u, v, p)
+                    + exit_base.eta * b10_at(&exit_bi.eta_uv_uv, u, v, p));
+
+            // Event chi
+            let chi_uv_val = b10_at(&exit_base.chi_uv, u, v, p);
+            let chi_u_val = exit_base.chi_u[u];
+            let chi_v_val = exit_base.chi_u[v];
+            let chi_uv_d1 = b10_at(&exit_ext1.chi_uv_dir, u, v, p);
+            let chi_uv_d2 = b10_at(&exit_ext2.chi_uv_dir, u, v, p);
+            let chi_u_d1 = exit_chi_u_d1[u];
+            let chi_v_d1 = exit_chi_u_d1[v];
+            let chi_u_d2 = exit_chi_u_d2[u];
+            let chi_v_d2 = exit_chi_u_d2[v];
+            let chi_u_d12v = exit_chi_u_d12[u];
+            let chi_v_d12v = exit_chi_u_d12[v];
+
+            let chi_uv_d12_val = b10_at(&exit_bi.chi_uv_uv, u, v, p);
+            let d2_r_chi = chi_uv_d12_val * chi_inv
+                - chi_uv_d1 * exit_chi_d2 * chi_inv2
+                - chi_uv_d2 * exit_chi_d1 * chi_inv2
+                - chi_uv_val * exit_chi_d12 * chi_inv2
+                + 2.0 * chi_uv_val * exit_chi_d1 * exit_chi_d2 * chi_inv3;
+
+            let d2_s_chi = (chi_u_d12v * chi_v_val
+                + chi_u_d1 * chi_v_d2
+                + chi_u_d2 * chi_v_d1
+                + chi_u_val * chi_v_d12v)
+                * chi_inv2
+                - 2.0 * (chi_u_d1 * chi_v_val + chi_u_val * chi_v_d1) * exit_chi_d2 * chi_inv3
+                - 2.0 * (chi_u_d2 * chi_v_val + chi_u_val * chi_v_d2) * exit_chi_d1 * chi_inv3
+                - 2.0 * chi_u_val * chi_v_val * exit_chi_d12 * chi_inv3
+                + 6.0 * chi_u_val * chi_v_val * exit_chi_d1 * exit_chi_d2 * chi_inv4;
+            val -= wi * di * (d2_r_chi - d2_s_chi);
+
+            // Event D
+            let d_uv_val = b10_at(&exit_base.d_uv, u, v, p);
+            let d_u_val = exit_base.d_u[u];
+            let d_v_val = exit_base.d_u[v];
+            let d_uv_d1 = b10_at(&exit_ext1.d_uv_dir, u, v, p);
+            let d_uv_d2 = b10_at(&exit_ext2.d_uv_dir, u, v, p);
+            let d_u_d1 = exit_ext1.d_u_dir[u];
+            let d_v_d1 = exit_ext1.d_u_dir[v];
+            let d_u_d2 = exit_ext2.d_u_dir[u];
+            let d_v_d2 = exit_ext2.d_u_dir[v];
+            let d_u_d12v = exit_d_u_d12[u];
+            let d_v_d12v = exit_d_u_d12[v];
+
+            let d_uv_d12_val = b10_at(&exit_bi.d_uv_uv, u, v, p);
+            let d2_r_d = d_uv_d12_val * d_inv
+                - d_uv_d1 * exit_d_d2 * d_inv2
+                - d_uv_d2 * exit_d_d1 * d_inv2
+                - d_uv_val * exit_d_d12 * d_inv2
+                + 2.0 * d_uv_val * exit_d_d1 * exit_d_d2 * d_inv3;
+
+            let d2_s_d =
+                (d_u_d12v * d_v_val + d_u_d1 * d_v_d2 + d_u_d2 * d_v_d1 + d_u_val * d_v_d12v)
+                    * d_inv2
+                    - 2.0 * (d_u_d1 * d_v_val + d_u_val * d_v_d1) * exit_d_d2 * d_inv3
+                    - 2.0 * (d_u_d2 * d_v_val + d_u_val * d_v_d2) * exit_d_d1 * d_inv3
+                    - 2.0 * d_u_val * d_v_val * exit_d_d12 * d_inv3
+                    + 6.0 * d_u_val * d_v_val * exit_d_d1 * exit_d_d2 * d_inv4;
+            val += wi * di * (d2_r_d - d2_s_d);
+
+            // qd1 term
+            if qd1_index < p && u == qd1_index && v == qd1_index {
+                val += wi * di * (6.0 / (qd1 * qd1 * qd1 * qd1)) * qd1_d1 * qd1_d2;
+            }
+
+            out[u * p + v] = val;
+            out[v * p + u] = val;
+        }
+    }
+    Ok(out)
+}
+
+/// CPU oracle for the fourth directional contraction with averaged
+/// symmetrization `Q_sym = ½(Q_ordered[u, v] + Q_ordered[v, u])`.
+/// Mirrors `row_flex_primary_fourth_contracted_exact`.
+pub fn cpu_oracle_fourth_contraction(
+    inputs: &SurvivalFlexBlock10FourthInputs<'_>,
+) -> Result<Vec<f64>, String> {
+    let p = inputs.p;
+    if inputs.dir_u.len() != p || inputs.dir_v.len() != p {
+        return Err(format!(
+            "cpu_oracle_fourth_contraction: dir lengths ({},{}) != p {}",
+            inputs.dir_u.len(),
+            inputs.dir_v.len(),
+            p
+        ));
+    }
+    if inputs.dir_u.iter().all(|v| v.abs() == 0.0)
+        || inputs.dir_v.iter().all(|v| v.abs() == 0.0)
+    {
+        return Ok(vec![0.0_f64; p * p]);
+    }
+    let chi = inputs.exit_base.chi;
+    if !chi.is_finite() || chi <= 0.0 {
+        return Err(format!(
+            "cpu_oracle_fourth_contraction: non-positive chi={chi:.3e}"
+        ));
+    }
+    let d_val = inputs.exit_base.d;
+    if !d_val.is_finite() || d_val == 0.0 {
+        return Err(format!(
+            "cpu_oracle_fourth_contraction: non-finite/zero D={d_val:.3e}"
+        ));
+    }
+
+    let ordered_uv = b10_fourth_ordered(
+        p,
+        inputs.qd1_index,
+        inputs.qd1,
+        inputs.w,
+        inputs.d,
+        inputs.dir_u,
+        inputs.dir_v,
+        inputs.entry_base,
+        inputs.exit_base,
+        inputs.entry_ext_u,
+        inputs.entry_ext_v,
+        inputs.exit_ext_u,
+        inputs.exit_ext_v,
+        inputs.entry_bi,
+        inputs.exit_bi,
+    )?;
+    let ordered_vu = b10_fourth_ordered(
+        p,
+        inputs.qd1_index,
+        inputs.qd1,
+        inputs.w,
+        inputs.d,
+        inputs.dir_v,
+        inputs.dir_u,
+        inputs.entry_base,
+        inputs.exit_base,
+        inputs.entry_ext_v,
+        inputs.entry_ext_u,
+        inputs.exit_ext_v,
+        inputs.exit_ext_u,
+        inputs.entry_bi,
+        inputs.exit_bi,
+    )?;
+
+    let mut out = vec![0.0_f64; p * p];
+    for i in 0..(p * p) {
+        out[i] = 0.5 * (ordered_uv[i] + ordered_vu[i]);
+    }
+    Ok(out)
 }
 
 // ────────────────────────────────────────────────────────────────────────
