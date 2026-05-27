@@ -32,10 +32,12 @@ use std::sync::Arc;
 
 use ndarray::{Array1, Array2, Array3};
 
+use crate::families::custom_family::PenaltyMatrix;
 use crate::families::identifiability_compiler::{
     AnchorRowEvaluator, BlockOrder, RowHessian, RowJacobianOperator,
 };
 use crate::linalg::faer_ndarray::{FaerEigh, fast_ab};
+use crate::linalg::matrix::{CoefficientTransformOperator, DenseDesignMatrix, DesignMatrix};
 use faer::Side;
 
 const K_SURVIVAL: usize = 4;
@@ -432,6 +434,158 @@ pub struct SurvivalParametricCompiled {
     /// `(p_raw − v.ncols())` for each block. Useful for logging the
     /// gauge-attribution summary at the construction site.
     pub drops_by_block: (usize, usize, usize),
+}
+
+/// Survival parametric block designs and penalties after applying the
+/// per-block V reparameterisation matrices from
+/// [`compile_survival_parametric_designs`]. Each design is wrapped via
+/// [`CoefficientTransformOperator`] so the operator interface is
+/// preserved (sparse / lazy inner designs stay sparse / lazy; the V
+/// multiplication is applied lazily per row chunk with an Arc-cached
+/// dense materialisation when affordable).
+///
+/// **Time block**: three designs (entry, exit, derivative_exit) share a
+/// single β, so they each get the same `V_time` applied. Their
+/// penalties are pulled back jointly because the time penalty matrices
+/// are over the shared β coordinate.
+///
+/// **Marginal / logslope**: one design + their respective penalty list,
+/// each independently V-transformed and Vᵀ-S-V-pulled-back.
+///
+/// The construction site replaces the raw `marginal_design`,
+/// `logslope_design`, and time-block triplet with these compiled
+/// variants, and uses the pulled-back penalty matrices in the
+/// `ParameterBlockSpec` list. The family's captured
+/// `marginal_design` / `logslope_design` / time triplet then carry the
+/// compiled widths too — so `evaluate_blockwise_exact_newton`'s
+/// `syr_row_into_view` / `row_outer_into_view` assertions remain
+/// width-consistent without further family-level changes.
+pub struct CompiledSurvivalDesigns {
+    pub time_design_entry: DesignMatrix,
+    pub time_design_exit: DesignMatrix,
+    pub time_design_derivative_exit: DesignMatrix,
+    pub marginal_design: DesignMatrix,
+    pub logslope_design: DesignMatrix,
+    pub time_penalties: Vec<PenaltyMatrix>,
+    pub marginal_penalties: Vec<PenaltyMatrix>,
+    pub logslope_penalties: Vec<PenaltyMatrix>,
+}
+
+/// Apply `compiled.v_*` to the raw survival parametric designs and pull
+/// back the per-block penalties as `Vᵀ S V`. Returns
+/// [`CompiledSurvivalDesigns`] ready to thread through
+/// `make_family` / `build_blocks` at the SMGS construction site.
+///
+/// Sparse designs are wrapped through `CoefficientTransformOperator`,
+/// which composes lazily by default and materialises the `(n × p_kept)`
+/// dense block on first hot use (gated by
+/// `CoefficientTransformOperator::MATERIALIZE_MAX_BYTES = 1 GiB`).
+/// For biobank-scale survival shapes (`n ≈ 320 k`, `p_kept ≤ 50`) this
+/// is ≤ 130 MiB — well within budget and reused across PIRLS / outer
+/// iterations.
+///
+/// The penalty pullback `Vᵀ S V` is exact for selection-T (V is a
+/// column selector, so Vᵀ S V is just the slice of S to the kept
+/// rows / cols) and for rotation-V (V is a general orthogonal-
+/// complement basis from the compiler's eigendecomposition).
+pub fn apply_survival_parametric_compile_to_designs(
+    compiled: &SurvivalParametricCompiled,
+    time_design_entry: DesignMatrix,
+    time_design_exit: DesignMatrix,
+    time_design_derivative_exit: DesignMatrix,
+    marginal_design: DesignMatrix,
+    logslope_design: DesignMatrix,
+    time_penalties: &[PenaltyMatrix],
+    marginal_penalties: &[PenaltyMatrix],
+    logslope_penalties: &[PenaltyMatrix],
+) -> Result<CompiledSurvivalDesigns, String> {
+    Ok(CompiledSurvivalDesigns {
+        time_design_entry: wrap_design_with_transform(
+            time_design_entry,
+            &compiled.v_time,
+            "survival time block design_entry",
+        )?,
+        time_design_exit: wrap_design_with_transform(
+            time_design_exit,
+            &compiled.v_time,
+            "survival time block design_exit",
+        )?,
+        time_design_derivative_exit: wrap_design_with_transform(
+            time_design_derivative_exit,
+            &compiled.v_time,
+            "survival time block design_derivative_exit",
+        )?,
+        marginal_design: wrap_design_with_transform(
+            marginal_design,
+            &compiled.v_marginal,
+            "survival marginal block design",
+        )?,
+        logslope_design: wrap_design_with_transform(
+            logslope_design,
+            &compiled.v_logslope,
+            "survival logslope block design",
+        )?,
+        time_penalties: pull_back_penalties(time_penalties, &compiled.v_time),
+        marginal_penalties: pull_back_penalties(marginal_penalties, &compiled.v_marginal),
+        logslope_penalties: pull_back_penalties(logslope_penalties, &compiled.v_logslope),
+    })
+}
+
+fn wrap_design_with_transform(
+    raw: DesignMatrix,
+    v: &Array2<f64>,
+    context: &str,
+) -> Result<DesignMatrix, String> {
+    if raw.ncols() != v.nrows() {
+        return Err(format!(
+            "{context}: raw design has {} cols but V has {} rows (V is {}×{})",
+            raw.ncols(),
+            v.nrows(),
+            v.nrows(),
+            v.ncols(),
+        ));
+    }
+    let inner_dense = match raw {
+        DesignMatrix::Dense(d) => d,
+        DesignMatrix::Sparse(_) => {
+            let dense = raw
+                .try_to_dense_by_chunks(&format!("{context} sparse→dense for V apply"))
+                .map_err(|reason| format!("{context}: densify failed: {reason}"))?;
+            DenseDesignMatrix::from(dense)
+        }
+    };
+    let op = CoefficientTransformOperator::new(inner_dense, v.clone())
+        .map_err(|reason| format!("{context}: CoefficientTransformOperator::new: {reason}"))?;
+    Ok(DesignMatrix::Dense(DenseDesignMatrix::from(Arc::new(op))))
+}
+
+fn pull_back_penalties(penalties: &[PenaltyMatrix], v: &Array2<f64>) -> Vec<PenaltyMatrix> {
+    penalties
+        .iter()
+        .map(|p| {
+            let label = p.precision_label().map(|s| s.to_string());
+            let s_dense = p.as_dense_cow();
+            // Vᵀ S V. With V as a selection matrix this collapses to
+            // S[kept, kept]; with V as a rotation (general orthogonal
+            // complement) this is the full pullback. Either way the
+            // result is (p_kept × p_kept) symmetric (modulo numerical
+            // noise — symmetrise explicitly).
+            let s_view = s_dense.view();
+            let s_v = fast_ab(&s_view.to_owned(), v);
+            let vt_s_v = fast_ab(&v.t().to_owned(), &s_v);
+            let mut sym = Array2::<f64>::zeros(vt_s_v.dim());
+            for i in 0..sym.nrows() {
+                for j in 0..sym.ncols() {
+                    sym[[i, j]] = 0.5 * (vt_s_v[[i, j]] + vt_s_v[[j, i]]);
+                }
+            }
+            let base = PenaltyMatrix::Dense(sym);
+            match label {
+                Some(lbl) => base.with_precision_label(lbl),
+                None => base,
+            }
+        })
+        .collect()
 }
 
 /// Run the identifiability compiler on the three survival parametric
