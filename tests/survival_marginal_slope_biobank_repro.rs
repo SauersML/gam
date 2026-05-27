@@ -29,7 +29,12 @@ use gam::{
 use std::sync::{Arc, Mutex, Once, OnceLock};
 
 const N: usize = 400;
-const CENTERS: usize = 4;
+// Duchon order=1 in 3D has a 4-dimensional polynomial null space
+// (constant + 3 linear coords), so `centers` must exceed 4 for the
+// smooth's reproducing-kernel block to add any new directions on top
+// of the parametric nullspace. Picking 6 keeps p_total small for a
+// fast test while still letting V+M residualization see a real drop.
+const CENTERS: usize = 6;
 
 #[derive(Default)]
 struct CapturedLogs {
