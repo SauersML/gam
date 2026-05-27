@@ -18,7 +18,8 @@ use std::sync::Arc;
 use ndarray::{Array1, Array2, Array3, Axis, s};
 
 use crate::linalg::faer_ndarray::{
-    FaerEigh, default_rrqr_rank_alpha, fast_ab, fast_atb, rrqr_with_permutation,
+    FaerEigh, default_rrqr_rank_alpha, fast_ab, fast_ata, fast_atb, fast_xt_diag_y,
+    rrqr_with_permutation,
 };
 use faer::Side;
 
@@ -471,6 +472,207 @@ fn audit_and_drop_trailing_pivots(
     Ok(dropped_locals)
 }
 
+/// Channel-pair decomposition of every parameter block's row Jacobian.
+///
+/// For families with `K` primary-state channels (survival: K=4), each block
+/// `b` contributes a (n × p_b) channel matrix `X_b^(c)` per channel `c` that
+/// it touches. Blocks that do not contribute to a channel store `None` in
+/// that slot. The closed-form Gram compiler consumes this view directly to
+/// build the joint Gram `K^H` without ever materialising the full
+/// `(n·K) × p_total` weighted design `W = sqrt(H) · J`.
+pub struct PrimaryChannelBlocks {
+    /// Outer index: block. Inner index: channel `c ∈ 0..K`. `None` means the
+    /// block does not contribute to that channel.
+    pub blocks: Vec<Vec<Option<Array2<f64>>>>,
+}
+
+/// Closed-form Gram builder: `K^H[a, b] = Σ_{c,d} (X_a^(c))ᵀ · diag(h_{cd}) · X_b^(d)`.
+///
+/// Inputs:
+/// - `channel_blocks`: per-block channel decomposition of the row Jacobian.
+/// - `row_hess`: `(n × K × K)` per-row PSD Hessian (typically clamped to PSD
+///   by the family upstream).
+/// - `raw_block_ranges`: `[start, end)` column ranges of each block inside
+///   the full `p_total`-wide coefficient vector. Must be contiguous and
+///   non-overlapping; their union spans `0..p_total`.
+///
+/// Returns the symmetric `(p_total × p_total)` Gram matrix.
+pub fn build_raw_grams_from_channel_blocks(
+    channel_blocks: &PrimaryChannelBlocks,
+    row_hess: &dyn RowHessian,
+    raw_block_ranges: &[std::ops::Range<usize>],
+) -> Result<Array2<f64>, CompilerError> {
+    let num_blocks = channel_blocks.blocks.len();
+    if num_blocks != raw_block_ranges.len() {
+        return Err(CompilerError::DimensionMismatch(format!(
+            "channel_blocks ({num_blocks}) and raw_block_ranges ({}) length mismatch",
+            raw_block_ranges.len()
+        )));
+    }
+    if num_blocks == 0 {
+        return Ok(Array2::<f64>::zeros((0, 0)));
+    }
+    let k = row_hess.k();
+    let n = row_hess.nrows();
+    let p_total: usize = raw_block_ranges.iter().map(|r| r.end - r.start).sum();
+    let expected_total = raw_block_ranges
+        .last()
+        .map(|r| r.end)
+        .unwrap_or(0);
+    if expected_total != p_total {
+        return Err(CompilerError::DimensionMismatch(format!(
+            "raw_block_ranges must be contiguous from 0; got p_total={p_total} but last end={expected_total}"
+        )));
+    }
+    // Per-block channel-slot shape sanity.
+    for (b, slots) in channel_blocks.blocks.iter().enumerate() {
+        if slots.len() != k {
+            return Err(CompilerError::DimensionMismatch(format!(
+                "block {b}: expected {k} channel slots, got {}",
+                slots.len()
+            )));
+        }
+        let p_b = raw_block_ranges[b].end - raw_block_ranges[b].start;
+        for (c, mat) in slots.iter().enumerate() {
+            if let Some(x) = mat.as_ref() {
+                if x.nrows() != n {
+                    return Err(CompilerError::DimensionMismatch(format!(
+                        "block {b} channel {c}: nrows={} but row Hessian nrows={n}",
+                        x.nrows()
+                    )));
+                }
+                if x.ncols() != p_b {
+                    return Err(CompilerError::DimensionMismatch(format!(
+                        "block {b} channel {c}: ncols={} but block width={p_b}",
+                        x.ncols()
+                    )));
+                }
+            }
+        }
+    }
+
+    // Materialise H once and slice it into K·K length-n vectors h_{cd}.
+    let h_full = row_hess.evaluate_full();
+    if h_full.shape() != &[n, k, k] {
+        return Err(CompilerError::DimensionMismatch(format!(
+            "row Hessian evaluate_full shape {:?} != [n={n}, k={k}, k={k}]",
+            h_full.shape()
+        )));
+    }
+    // h_pairs[c * k + d] = length-n vector of H_i[c, d].
+    let mut h_pairs: Vec<Array1<f64>> = Vec::with_capacity(k * k);
+    for c in 0..k {
+        for d in 0..k {
+            let mut v = Array1::<f64>::zeros(n);
+            for i in 0..n {
+                v[i] = h_full[[i, c, d]];
+            }
+            h_pairs.push(v);
+        }
+    }
+
+    let mut gram = Array2::<f64>::zeros((p_total, p_total));
+    // Accumulate upper triangle (a ≤ b) then symmetrise.
+    for a in 0..num_blocks {
+        let range_a = raw_block_ranges[a].clone();
+        for b in a..num_blocks {
+            let range_b = raw_block_ranges[b].clone();
+            let mut block_acc = Array2::<f64>::zeros((range_a.end - range_a.start, range_b.end - range_b.start));
+            for c in 0..k {
+                let Some(x_a_c) = channel_blocks.blocks[a][c].as_ref() else {
+                    continue;
+                };
+                for d in 0..k {
+                    let Some(x_b_d) = channel_blocks.blocks[b][d].as_ref() else {
+                        continue;
+                    };
+                    let h_cd = &h_pairs[c * k + d];
+                    // (X_a^(c))ᵀ · diag(h_cd) · X_b^(d)  →  (p_a × p_b).
+                    let contrib = fast_xt_diag_y(x_a_c, h_cd, x_b_d);
+                    block_acc += &contrib;
+                }
+            }
+            // Write into upper triangle (and the diagonal block itself).
+            gram
+                .slice_mut(s![range_a.start..range_a.end, range_b.start..range_b.end])
+                .assign(&block_acc);
+        }
+    }
+    // Symmetrise: copy upper triangle to lower. Diagonal blocks are
+    // themselves p_a × p_a — symmetrise within them too.
+    for i in 0..p_total {
+        for j in 0..i {
+            let v = gram[[j, i]];
+            gram[[i, j]] = v;
+        }
+    }
+    Ok(gram)
+}
+
+/// Structural Gram `K^S`: same shape as [`build_raw_grams_from_channel_blocks`]
+/// but with the per-row Hessian replaced by the K×K identity. Used by the
+/// dual-metric compiler as the un-weighted reference geometry.
+///
+/// `K^S[a, b] = Σ_c (X_a^(c))ᵀ · X_b^(c)` (cross-channel terms vanish under
+/// `H_i = I_K`).
+pub fn build_raw_grams_structural(
+    channel_blocks: &PrimaryChannelBlocks,
+    raw_block_ranges: &[std::ops::Range<usize>],
+) -> Array2<f64> {
+    let num_blocks = channel_blocks.blocks.len();
+    assert_eq!(
+        num_blocks,
+        raw_block_ranges.len(),
+        "channel_blocks ({num_blocks}) and raw_block_ranges ({}) length mismatch",
+        raw_block_ranges.len()
+    );
+    if num_blocks == 0 {
+        return Array2::<f64>::zeros((0, 0));
+    }
+    let p_total = raw_block_ranges.last().map(|r| r.end).unwrap_or(0);
+    let mut gram = Array2::<f64>::zeros((p_total, p_total));
+    for a in 0..num_blocks {
+        let range_a = raw_block_ranges[a].clone();
+        for b in a..num_blocks {
+            let range_b = raw_block_ranges[b].clone();
+            let p_a = range_a.end - range_a.start;
+            let p_b = range_b.end - range_b.start;
+            let k_a = channel_blocks.blocks[a].len();
+            let k_b = channel_blocks.blocks[b].len();
+            assert_eq!(
+                k_a, k_b,
+                "structural Gram: block {a} has {k_a} channels but block {b} has {k_b}",
+            );
+            let mut block_acc = Array2::<f64>::zeros((p_a, p_b));
+            for c in 0..k_a {
+                let (Some(x_a_c), Some(x_b_c)) = (
+                    channel_blocks.blocks[a][c].as_ref(),
+                    channel_blocks.blocks[b][c].as_ref(),
+                ) else {
+                    continue;
+                };
+                let contrib = if a == b {
+                    // Diagonal block, same channel — symmetric XᵀX.
+                    fast_ata(x_a_c)
+                } else {
+                    fast_atb(x_a_c, x_b_c)
+                };
+                block_acc += &contrib;
+            }
+            gram
+                .slice_mut(s![range_a.start..range_a.end, range_b.start..range_b.end])
+                .assign(&block_acc);
+        }
+    }
+    for i in 0..p_total {
+        for j in 0..i {
+            let v = gram[[j, i]];
+            gram[[i, j]] = v;
+        }
+    }
+    gram
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -811,8 +1013,11 @@ mod tests {
         }
     }
 
-    /// `r_lw` is populated on every non-first block as `M_b · V_b`, with the
-    /// first block carrying `None`.
+    /// `r_lw` and `anchor_correction` are populated on every non-first
+    /// block as `M_b · V_b` at compiled width. The first block carries
+    /// `None`. Also verifies the H-orthogonality invariant that the
+    /// cumulative anchor for the next iteration is orthogonal (in the row
+    /// metric) to the prior block's design.
     #[test]
     fn compile_exposes_r_lw_equal_to_m_dot_v() {
         let n = 40;
@@ -826,19 +1031,15 @@ mod tests {
         let compiled = compile(&ops, &hess, &[BlockOrder::Marginal, BlockOrder::Logslope])
             .expect("compile should succeed");
 
-        // First block: no anchor → r_lw is None.
-        assert!(
-            compiled.blocks[0].r_lw.is_none(),
-            "first block must have r_lw = None"
-        );
-        assert!(
-            compiled.blocks[0].anchor_correction.is_none(),
-            "first block must have no anchor correction"
-        );
+        // First block: no anchor → both fields None.
+        assert!(compiled.blocks[0].r_lw.is_none());
+        assert!(compiled.blocks[0].anchor_correction.is_none());
 
-        // Second block: r_lw must equal M_b · V_b.
+        // Second block: r_lw and anchor_correction must both equal M·V at
+        // compiled width (p_a_kept × p_b_kept).
+        let v_a = &compiled.blocks[0].t_lw;
         let v_b = &compiled.blocks[1].t_lw;
-        let m_b = compiled.blocks[1]
+        let m_compiled = compiled.blocks[1]
             .anchor_correction
             .as_ref()
             .expect("second block must carry an anchor correction");
@@ -846,23 +1047,29 @@ mod tests {
             .r_lw
             .as_ref()
             .expect("second block must expose r_lw");
-
-        // Shape: (p_a_kept × p_b_kept).
-        let p_a_kept = compiled.blocks[0].t_lw.ncols();
+        let p_a_kept = v_a.ncols();
         let p_b_kept = v_b.ncols();
         assert_eq!(
-            r_lw.dim(),
+            m_compiled.dim(),
             (p_a_kept, p_b_kept),
-            "r_lw shape must be (p_a_kept × p_b_kept)"
+            "anchor_correction must be at compiled width"
         );
-        assert_eq!(m_b.nrows(), p_a_kept);
-        assert_eq!(m_b.ncols(), p_b_kept);
+        assert_eq!(r_lw.dim(), (p_a_kept, p_b_kept));
+        // r_lw and anchor_correction are synonymous.
+        let diff = r_lw - m_compiled;
+        let max_diff = diff.iter().fold(0.0_f64, |acc, &x| acc.max(x.abs()));
+        assert!(max_diff == 0.0, "r_lw and anchor_correction must be identical");
 
-        // Math: r_lw == m_b · v_b.
-        let expected = m_b.dot(v_b);
-        let max_err = (r_lw - &expected)
-            .iter()
-            .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
-        assert!(max_err < 1e-12, "r_lw mismatches M_b · V_b: {max_err:e}");
+        // H-orthogonality (identity row metric): the residualised
+        // compiled B-design `B·V − A·(M·V)` must be orthogonal to A in
+        // the column-inner-product sense. This validates that the
+        // cumulative anchor build uses `(W_b − A·M)·V` rather than `W_b·V`.
+        let b_compiled = b.dot(v_b) - a.dot(m_compiled);
+        let cross = a.t().dot(&b_compiled);
+        let max_cross = cross.iter().fold(0.0_f64, |acc, &x| acc.max(x.abs()));
+        assert!(
+            max_cross < 1e-10,
+            "compiled B-design must be H-orthogonal to A: max cross = {max_cross:e}"
+        );
     }
 }

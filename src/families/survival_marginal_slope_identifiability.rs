@@ -1869,6 +1869,80 @@ pub fn apply_per_term_vm_exact(
     })
 }
 
+/// Project a raw-space warm start β_raw into compiled coordinates θ via the
+/// Gram-aware least-squares formula
+///
+///     θ = (Tᵀ K^S T)^+ · Tᵀ K^S · β_raw
+///
+/// where K^S is the structural Gram on raw space. This is the correct
+/// projection whenever T's columns are not Euclidean-orthonormal (e.g. the
+/// V+M-exact compiled basis), because Vᵀ·β is only an orthogonal projector
+/// in the Euclidean inner product, not in the K^S-induced inner product
+/// the compiled coordinates live under.
+pub fn project_raw_beta_to_compiled(
+    t_full: &Array2<f64>,
+    k_struct: &Array2<f64>,
+    beta_raw: &Array1<f64>,
+) -> Result<Array1<f64>, String> {
+    let p_raw = t_full.nrows();
+    let p_comp = t_full.ncols();
+    if k_struct.nrows() != p_raw || k_struct.ncols() != p_raw {
+        return Err(format!(
+            "project_raw_beta_to_compiled: K^S shape {}x{} mismatches T rows {}",
+            k_struct.nrows(),
+            k_struct.ncols(),
+            p_raw,
+        ));
+    }
+    if beta_raw.len() != p_raw {
+        return Err(format!(
+            "project_raw_beta_to_compiled: beta_raw length {} mismatches T rows {}",
+            beta_raw.len(),
+            p_raw,
+        ));
+    }
+    if p_comp == 0 {
+        return Ok(Array1::<f64>::zeros(0));
+    }
+    if p_raw == 0 {
+        return Ok(Array1::<f64>::zeros(p_comp));
+    }
+
+    // K^S · T  (p_raw × p_comp)
+    let ks_t = fast_ab(k_struct, t_full);
+    // M = Tᵀ K^S T  (p_comp × p_comp); compute as Tᵀ · (K^S T).
+    let m = crate::linalg::faer_ndarray::fast_atb(t_full, &ks_t);
+    // Symmetrize M before eigendecomposition.
+    let mut m_sym = Array2::<f64>::zeros((p_comp, p_comp));
+    for i in 0..p_comp {
+        for j in 0..p_comp {
+            m_sym[[i, j]] = 0.5 * (m[[i, j]] + m[[j, i]]);
+        }
+    }
+
+    // Tᵀ K^S β_raw  (length p_comp): compute K^S β_raw, then Tᵀ · that.
+    let ks_beta = crate::linalg::faer_ndarray::fast_av(k_struct, beta_raw);
+    let rhs = crate::linalg::faer_ndarray::fast_atv(t_full, &ks_beta);
+
+    let (evals, evecs) = m_sym
+        .eigh(Side::Lower)
+        .map_err(|e| format!("project_raw_beta_to_compiled: eigh failed: {e:?}"))?;
+
+    let max_abs = evals.iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
+    let tol = (p_comp as f64) * f64::EPSILON * max_abs.max(1.0);
+
+    // Apply M^+ via spectral decomposition: M^+ = U · diag(1/λ_i for λ_i>tol) · Uᵀ.
+    let ut_rhs = crate::linalg::faer_ndarray::fast_atv(&evecs, &rhs);
+    let mut scaled = Array1::<f64>::zeros(p_comp);
+    for i in 0..p_comp {
+        if evals[i].abs() > tol {
+            scaled[i] = ut_rhs[i] / evals[i];
+        }
+    }
+    let theta = crate::linalg::faer_ndarray::fast_av(&evecs, &scaled);
+    Ok(theta)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
