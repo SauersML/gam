@@ -44,39 +44,32 @@ impl From<DeviationRuntimeError> for String {
     }
 }
 
-/// Cross-block anchor residual stored on the runtime.
+/// Installed cross-block flex block on the runtime.
 ///
-/// After cross-block orthogonalisation against parametric anchors, the
-/// candidate flex block's design at any row is
+/// Direct on-runtime image of `identifiability_compiler::CompiledBlock`:
+/// `anchor_correction` = `compiled.anchor_correction` (the d × k matrix M),
+/// `anchor_components` = the per-anchor predict-time tags (the parent
+/// predictor uses them to rebuild `n_row` at predict-time rows). The
+/// post-residualisation row evaluator is
 ///
 ///   design_row(x) = pure_span_row(x) − n_row · M
 ///
-/// where `n_row` is the per-row stacked vector of parametric anchor values
-/// (length `d` = sum of component ncols), and `M` is `residual_coefficients`
-/// (shape `d × basis_dim`). The orthonormalising rotation `R` constructed
-/// at training time has already been baked into `M = R · K_w · V`, so the
-/// runtime's evaluation path only needs `n_row · M` per row.
+/// The legacy `orthonormalising_rotation` (always identity by construction —
+/// the compiler bakes the orthonormalising rotation into M) is dropped.
 #[derive(Clone, Debug)]
-pub struct AnchorResidual {
-    /// d × k matrix; design row subtracts `n_row · residual_coefficients`.
-    pub residual_coefficients: Array2<f64>,
-    pub null_basis_evaluator: AnchorNullSpaceEvaluator,
+pub struct InstalledFlexBlock {
+    /// Anchor correction matrix `M ∈ R^{d × k}` from
+    /// `CompiledBlock::anchor_correction`. The design evaluator subtracts
+    /// `n_row · M` per row.
+    pub anchor_correction: Array2<f64>,
+    /// Per-anchor predict-time tags, in the order the anchors were stacked
+    /// (parametric before flex). `sum(ncols)` equals the row dimension of
+    /// `anchor_correction`.
+    pub anchor_components: Vec<AnchorComponentTag>,
 }
 
 #[derive(Clone, Debug)]
-pub enum AnchorNullSpaceEvaluator {
-    Stacked {
-        components: Vec<AnchorNullSpaceComponent>,
-        /// d × d rotation R such that Q-row(x) = N-row(x) · R. In the
-        /// current construction R is baked into `residual_coefficients`,
-        /// so this field is the identity matrix and the design evaluator
-        /// computes `subtract = n_row · residual_coefficients`.
-        orthonormalising_rotation: Array2<f64>,
-    },
-}
-
-#[derive(Clone, Debug)]
-pub enum AnchorNullSpaceComponent {
+pub enum AnchorComponentTag {
     /// Parametric anchor — at predict time the parent predictor reconstructs
     /// the per-row vector from the saved marginal/logslope blocks; the
     /// runtime only needs to know which block and how many columns. The
@@ -89,10 +82,7 @@ pub enum AnchorNullSpaceComponent {
     /// Flex-evaluation anchor — a sibling flex block's design at training
     /// rows (post-reparameterisation, in the same coordinate frame the
     /// predictor will use at predict time). The number of columns equals
-    /// the sibling block's reparameterised basis dimension. At predict
-    /// time the parent predictor evaluates the sibling runtime at the
-    /// predict-row argument and stacks those columns into `n_row` in the
-    /// same order they appear here.
+    /// the sibling block's reparameterised basis dimension.
     FlexEvaluation { ncols: usize },
 }
 
