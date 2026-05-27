@@ -23,8 +23,7 @@ use crate::families::cubic_cell_kernel::{
 };
 use crate::gpu::cubic_cell::branch::classify_cell_for_gpu;
 use crate::gpu::cubic_cell::{
-    CubicCellDerivativeMomentHostView, CubicCellMomentStatus,
-    GpuCellBranchTag,
+    CubicCellDerivativeMomentHostView, CubicCellMomentStatus, GpuCellBranchTag,
 };
 
 /// Output of [`build_host_moments`]: row-major moments, per-cell status
@@ -117,8 +116,8 @@ mod tests {
         DenestedCubicCell, evaluate_cell_derivative_moments_uncached,
     };
     use crate::gpu::cubic_cell::{
-        CubicCellDerivativeMomentHostView, CubicCellMomentResidency,
-        GpuCellBranchTag, GpuDenestedCubicCell,
+        CubicCellDerivativeMomentHostView, CubicCellMomentResidency, GpuCellBranchTag,
+        GpuDenestedCubicCell,
     };
 
     fn gpu_from_cpu(cpu: DenestedCubicCell) -> GpuDenestedCubicCell {
@@ -345,7 +344,7 @@ mod tests {
                 cells: &cells_gpu,
                 branches: &branches,
                 max_degree,
-                    residency: CubicCellMomentResidency::Host,
+                residency: CubicCellMomentResidency::Host,
             };
             let out = build_host_moments(&view).expect("host substrate");
             assert_eq!(out.stride, max_degree + 1);
@@ -389,5 +388,4 @@ mod tests {
         assert_eq!(out.status[0], CubicCellMomentStatus::InvalidInterval as u8);
         assert!(out.moments.iter().all(|&x| x == 0.0));
     }
-
 }

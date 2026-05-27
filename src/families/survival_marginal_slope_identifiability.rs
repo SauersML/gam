@@ -72,9 +72,16 @@ impl SurvivalRowHessian {
         probit_scale: f64,
     ) -> Result<Self, String> {
         let n = q0.len();
-        if [q1.len(), qd1.len(), g.len(), z.len(), weights.len(), event.len()]
-            .iter()
-            .any(|&l| l != n)
+        if [
+            q1.len(),
+            qd1.len(),
+            g.len(),
+            z.len(),
+            weights.len(),
+            event.len(),
+        ]
+        .iter()
+        .any(|&l| l != n)
         {
             return Err(format!(
                 "SurvivalRowHessian: length mismatch \
@@ -89,17 +96,18 @@ impl SurvivalRowHessian {
         }
         let mut h_full = Array3::<f64>::zeros((n, K_SURVIVAL, K_SURVIVAL));
         for i in 0..n {
-            let (_, _grad, hess) = crate::families::survival_marginal_slope::row_primary_for_compiler(
-                q0[i],
-                q1[i],
-                qd1[i],
-                g[i],
-                z[i],
-                weights[i],
-                event[i],
-                derivative_guard,
-                probit_scale,
-            )?;
+            let (_, _grad, hess) =
+                crate::families::survival_marginal_slope::row_primary_for_compiler(
+                    q0[i],
+                    q1[i],
+                    qd1[i],
+                    g[i],
+                    z[i],
+                    weights[i],
+                    event[i],
+                    derivative_guard,
+                    probit_scale,
+                )?;
             // PSD-clamp via eigendecomposition: project negative eigvals to 0.
             let mut h_i = Array2::<f64>::zeros((K_SURVIVAL, K_SURVIVAL));
             for a in 0..K_SURVIVAL {
@@ -701,7 +709,9 @@ pub fn compile_survival_parametric_designs_per_term(
     }
     for range in marginal_partition {
         let dq = marginal_dq.slice(ndarray::s![.., range.clone()]).to_owned();
-        let dqd1 = marginal_dqd1.slice(ndarray::s![.., range.clone()]).to_owned();
+        let dqd1 = marginal_dqd1
+            .slice(ndarray::s![.., range.clone()])
+            .to_owned();
         operators.push(Arc::new(QChannelBlockOperator::new(dq, dqd1)));
         ordering.push(BlockOrder::Marginal);
     }
@@ -749,8 +759,7 @@ pub fn compile_survival_parametric_designs_per_term(
         v_logslope_per_term.push(blk.t_lw);
         r_logslope_per_term.push(blk.r_lw);
     }
-    let mut r_lw_per_term: Vec<Option<Array2<f64>>> =
-        Vec::with_capacity(n_time + n_marg + n_log);
+    let mut r_lw_per_term: Vec<Option<Array2<f64>>> = Vec::with_capacity(n_time + n_marg + n_log);
     r_lw_per_term.extend(r_time_per_term);
     r_lw_per_term.extend(r_marginal_per_term);
     r_lw_per_term.extend(r_logslope_per_term);
@@ -818,9 +827,7 @@ fn validate_partition(
         }
     }
     if partition.last().unwrap().is_empty() {
-        return Err(format!(
-            "{label} partition's final range is empty",
-        ));
+        return Err(format!("{label} partition's final range is empty",));
     }
     Ok(())
 }
@@ -843,7 +850,9 @@ pub fn extract_term_partition_from_penalty_ranges(
         starts.insert(r.end.min(p_block));
     }
     let v: Vec<usize> = starts.into_iter().collect();
-    v.windows(2).filter_map(|w| if w[0] < w[1] { Some(w[0]..w[1]) } else { None }).collect()
+    v.windows(2)
+        .filter_map(|w| if w[0] < w[1] { Some(w[0]..w[1]) } else { None })
+        .collect()
 }
 
 /// Pull back a BlockwisePenalty under a block-diagonal V whose per-term
@@ -1106,14 +1115,14 @@ pub fn pull_back_penalty_through_t(
     assert!(
         embed_end <= raw_total,
         "pull_back_penalty_through_t: embed range {}..{} exceeds raw total {}",
-        embed_start, embed_end, raw_total,
+        embed_start,
+        embed_end,
+        raw_total,
     );
     let mut embedded = Array2::<f64>::zeros((raw_total, raw_total));
     if block_p > 0 {
-        let mut dst = embedded.slice_mut(ndarray::s![
-            embed_start..embed_end,
-            embed_start..embed_end
-        ]);
+        let mut dst =
+            embedded.slice_mut(ndarray::s![embed_start..embed_end, embed_start..embed_end]);
         for i in 0..block_p {
             for j in 0..block_p {
                 dst[[i, j]] = pen.local[[i, j]];
@@ -1307,10 +1316,7 @@ impl SmgsLiftViaT {
     ///
     /// `r_per_term[0]` is unused (the first block has no earlier
     /// blocks to residualise against) and should be `None`.
-    pub fn from_v_and_r(
-        v_per_term: &[Array2<f64>],
-        r_per_term: &[Option<Array2<f64>>],
-    ) -> Self {
+    pub fn from_v_and_r(v_per_term: &[Array2<f64>], r_per_term: &[Option<Array2<f64>>]) -> Self {
         let n_blocks = v_per_term.len();
         let mut block_starts_compiled = Vec::with_capacity(n_blocks + 1);
         let mut block_starts_raw = Vec::with_capacity(n_blocks + 1);
@@ -1334,11 +1340,7 @@ impl SmgsLiftViaT {
     /// per-block raw and compiled width partitions. Useful when the
     /// caller already has `T` from elsewhere (e.g. a dual-metric
     /// compile that emits the global T directly).
-    pub fn from_t(
-        t_full: Array2<f64>,
-        raw_widths: &[usize],
-        compiled_widths: &[usize],
-    ) -> Self {
+    pub fn from_t(t_full: Array2<f64>, raw_widths: &[usize], compiled_widths: &[usize]) -> Self {
         assert_eq!(
             raw_widths.len(),
             compiled_widths.len(),
@@ -1374,10 +1376,7 @@ impl SmgsLiftViaT {
     /// Apply the triangular lift to per-block compiled betas. Inputs
     /// are concatenated into θ_full, multiplied by `T_full` to give
     /// β_full, and split at `block_starts_raw` into per-block raw βs.
-    pub fn lift_block_betas_via_t(
-        &self,
-        compiled_block_betas: &[Array1<f64>],
-    ) -> Vec<Array1<f64>> {
+    pub fn lift_block_betas_via_t(&self, compiled_block_betas: &[Array1<f64>]) -> Vec<Array1<f64>> {
         let n_blocks = self.block_starts_compiled.len().saturating_sub(1);
         assert_eq!(
             compiled_block_betas.len(),
@@ -1714,12 +1713,8 @@ pub fn apply_per_term_vm_exact(
             VmChannel::TimeEntry | VmChannel::TimeExit | VmChannel::TimeDerivativeExit => {
                 time_partition[block_term_index_within_channel[i]].clone()
             }
-            VmChannel::Marginal => {
-                marginal_partition[block_term_index_within_channel[i]].clone()
-            }
-            VmChannel::Logslope => {
-                logslope_partition[block_term_index_within_channel[i]].clone()
-            }
+            VmChannel::Marginal => marginal_partition[block_term_index_within_channel[i]].clone(),
+            VmChannel::Logslope => logslope_partition[block_term_index_within_channel[i]].clone(),
         }
     };
 
@@ -1751,11 +1746,7 @@ pub fn apply_per_term_vm_exact(
                         dense_full.ncols(),
                     ));
                 }
-                raw_slices.push(
-                    dense_full
-                        .slice(ndarray::s![.., term_range])
-                        .to_owned(),
-                );
+                raw_slices.push(dense_full.slice(ndarray::s![.., term_range]).to_owned());
             } else {
                 raw_slices.push(Array2::<f64>::zeros((n_rows, raw_w)));
             }
@@ -1770,9 +1761,7 @@ pub fn apply_per_term_vm_exact(
                 let r_full = compiled
                     .r_lw_per_term
                     .get(g)
-                    .ok_or_else(|| {
-                        format!("{context}: missing r_lw entry for compiled-block {g}")
-                    })?
+                    .ok_or_else(|| format!("{context}: missing r_lw entry for compiled-block {g}"))?
                     .as_ref();
                 let mut row_off = 0usize;
                 for a in 0..g {
@@ -1789,8 +1778,8 @@ pub fn apply_per_term_vm_exact(
                     let inner_a = DenseDesignMatrix::from(raw_slices[a].clone());
                     let v_a = v_per_block[a].clone();
                     let kept_anchor_design = {
-                        let op = CoefficientTransformOperator::new(inner_a, v_a)
-                            .map_err(|e| {
+                        let op =
+                            CoefficientTransformOperator::new(inner_a, v_a).map_err(|e| {
                                 format!(
                                     "{context}: CoefficientTransformOperator anchor block {a}: {e}",
                                 )
@@ -1801,10 +1790,9 @@ pub fn apply_per_term_vm_exact(
                     row_off += kept_a;
                 }
             }
-            let op = ResidualisedDesignOperator::new(inner_dense, v_b, anchors)
-                .map_err(|e| {
-                    format!("{context}: ResidualisedDesignOperator::new (block {g}): {e}")
-                })?;
+            let op = ResidualisedDesignOperator::new(inner_dense, v_b, anchors).map_err(|e| {
+                format!("{context}: ResidualisedDesignOperator::new (block {g}): {e}")
+            })?;
             per_block_designs.push(DesignMatrix::Dense(DenseDesignMatrix::from(Arc::new(op))));
         }
 
@@ -1824,8 +1812,7 @@ pub fn apply_per_term_vm_exact(
                 "{context}: no compiled-blocks belong to this channel class",
             ));
         }
-        DesignMatrix::hstack(same_class_designs)
-            .map_err(|e| format!("{context}: hstack: {e}"))
+        DesignMatrix::hstack(same_class_designs).map_err(|e| format!("{context}: hstack: {e}"))
     };
 
     let time_entry_out = assemble_channel_design(
@@ -1833,26 +1820,17 @@ pub fn apply_per_term_vm_exact(
         VmChannel::TimeEntry,
         "vm-exact: time entry",
     )?;
-    let time_exit_out = assemble_channel_design(
-        time_design_exit,
-        VmChannel::TimeExit,
-        "vm-exact: time exit",
-    )?;
+    let time_exit_out =
+        assemble_channel_design(time_design_exit, VmChannel::TimeExit, "vm-exact: time exit")?;
     let time_deriv_out = assemble_channel_design(
         time_design_derivative_exit,
         VmChannel::TimeDerivativeExit,
         "vm-exact: time derivative_exit",
     )?;
-    let marginal_out = assemble_channel_design(
-        marginal_design,
-        VmChannel::Marginal,
-        "vm-exact: marginal",
-    )?;
-    let logslope_out = assemble_channel_design(
-        logslope_design,
-        VmChannel::Logslope,
-        "vm-exact: logslope",
-    )?;
+    let marginal_out =
+        assemble_channel_design(marginal_design, VmChannel::Marginal, "vm-exact: marginal")?;
+    let logslope_out =
+        assemble_channel_design(logslope_design, VmChannel::Logslope, "vm-exact: logslope")?;
 
     // Pull each per-term penalty back through the full triangular T.
     // The penalty's `col_range` is interpreted within the channel's
@@ -2343,7 +2321,8 @@ mod tests {
         v_a[[1, 0]] = 0.5;
         v_a[[2, 1]] = 1.0;
         let v_b = Array2::<f64>::eye(2);
-        let r_ab = Array2::<f64>::from_shape_fn((3, 2), |(i, j)| 1.0 + (i as f64) + 0.25 * (j as f64));
+        let r_ab =
+            Array2::<f64>::from_shape_fn((3, 2), |(i, j)| 1.0 + (i as f64) + 0.25 * (j as f64));
         let t = build_full_t_matrix(&[v_a.clone(), v_b.clone()], &[None, Some(r_ab.clone())]);
         assert_eq!(t.dim(), (5, 4));
         for i in 0..3 {
@@ -2505,11 +2484,17 @@ mod tests {
             ((i + 1) as f64).sin() + 0.3 * (j as f64)
         });
         let v_b = Array2::<f64>::from_shape_fn((2, 2), |(i, j)| 1.0 + 0.1 * ((i * 2 + j) as f64));
-        let r_ab = Array2::<f64>::from_shape_fn((3, 2), |(i, j)| 0.5 - 0.2 * (i as f64) + 0.1 * (j as f64));
-        let t = build_full_t_matrix(&[v_a.clone(), v_b.clone()], &[None, Some(r_ab.clone())]);
-        let raw_local = Array2::<f64>::from_shape_fn((2, 2), |(i, j)| {
-            if i == j { 2.5 + i as f64 } else { 0.4 }
+        let r_ab = Array2::<f64>::from_shape_fn((3, 2), |(i, j)| {
+            0.5 - 0.2 * (i as f64) + 0.1 * (j as f64)
         });
+        let t = build_full_t_matrix(&[v_a.clone(), v_b.clone()], &[None, Some(r_ab.clone())]);
+        let raw_local =
+            Array2::<f64>::from_shape_fn(
+                (2, 2),
+                |(i, j)| {
+                    if i == j { 2.5 + i as f64 } else { 0.4 }
+                },
+            );
         let pen = BlockwisePenalty::new(0..2, raw_local.clone());
         let anchor = 3usize;
         let out = pull_back_penalty_through_t(&pen, anchor, &t);
@@ -2574,7 +2559,9 @@ mod tests {
         let p_time = 3;
         let p_marginal = 3;
         let p_logslope = 2;
-        let x: Vec<f64> = (0..n).map(|i| -1.0 + 2.0 * (i as f64) / (n as f64 - 1.0)).collect();
+        let x: Vec<f64> = (0..n)
+            .map(|i| -1.0 + 2.0 * (i as f64) / (n as f64 - 1.0))
+            .collect();
         let mut time_dq0 = Array2::<f64>::zeros((n, p_time));
         let mut time_dq1 = Array2::<f64>::zeros((n, p_time));
         let mut time_dqd1 = Array2::<f64>::zeros((n, p_time));
@@ -2658,7 +2645,10 @@ mod tests {
         // drops on time block in this scenario).
         assert_eq!(out.time_design_entry.ncols(), compiled.v_time.ncols());
         assert_eq!(out.time_design_exit.ncols(), compiled.v_time.ncols());
-        assert_eq!(out.time_design_derivative_exit.ncols(), compiled.v_time.ncols());
+        assert_eq!(
+            out.time_design_derivative_exit.ncols(),
+            compiled.v_time.ncols()
+        );
 
         // Marginal / logslope: widths equal their V's column count.
         assert_eq!(out.marginal_design.ncols(), compiled.v_marginal.ncols());
@@ -2667,7 +2657,10 @@ mod tests {
         // Penalty pullbacks: each penalty matrix is (p_kept × p_kept).
         for s in &out.time_penalties {
             let dense = s.as_dense_cow();
-            assert_eq!(dense.dim(), (compiled.v_time.ncols(), compiled.v_time.ncols()));
+            assert_eq!(
+                dense.dim(),
+                (compiled.v_time.ncols(), compiled.v_time.ncols())
+            );
         }
         for s in &out.marginal_penalties {
             let dense = s.as_dense_cow();
@@ -2702,7 +2695,9 @@ mod tests {
         let p_time = 3;
         let p_marginal = 3;
         let p_logslope = 2;
-        let x: Vec<f64> = (0..n).map(|i| -1.0 + 2.0 * (i as f64) / (n as f64 - 1.0)).collect();
+        let x: Vec<f64> = (0..n)
+            .map(|i| -1.0 + 2.0 * (i as f64) / (n as f64 - 1.0))
+            .collect();
         let mut time_dq0 = Array2::<f64>::zeros((n, p_time));
         let mut time_dq1 = Array2::<f64>::zeros((n, p_time));
         let mut time_dqd1 = Array2::<f64>::zeros((n, p_time));
@@ -2789,7 +2784,9 @@ mod tests {
         // constant column is exactly zero (the gauge identity that
         // makes the constant a true null direction under (q0, q1, qd1)
         // joint).
-        let x: Vec<f64> = (0..n).map(|i| -1.0 + 2.0 * (i as f64) / (n as f64 - 1.0)).collect();
+        let x: Vec<f64> = (0..n)
+            .map(|i| -1.0 + 2.0 * (i as f64) / (n as f64 - 1.0))
+            .collect();
         let mut time_dq0 = Array2::<f64>::zeros((n, p_time));
         let mut time_dq1 = Array2::<f64>::zeros((n, p_time));
         let mut time_dqd1 = Array2::<f64>::zeros((n, p_time));
@@ -2829,14 +2826,7 @@ mod tests {
         }
 
         let inputs = build_survival_compiler_inputs(
-            time_dq0,
-            time_dq1,
-            time_dqd1,
-            marg_dq,
-            marg_dqd1,
-            log_dg,
-            None,
-            None,
+            time_dq0, time_dq1, time_dqd1, marg_dq, marg_dqd1, log_dg, None, None,
         );
 
         // Identity 4×4 row Hessian on every row. With H_i = I the
@@ -2957,10 +2947,8 @@ mod tests {
         r_b[[1, 1]] = 1.3;
         r_b[[2, 0]] = -0.2;
         r_b[[2, 1]] = 0.5;
-        let lift = SmgsLiftViaT::from_v_and_r(
-            &[v_a.clone(), v_b.clone()],
-            &[None, Some(r_b.clone())],
-        );
+        let lift =
+            SmgsLiftViaT::from_v_and_r(&[v_a.clone(), v_b.clone()], &[None, Some(r_b.clone())]);
         assert_eq!(lift.t_full.dim(), (6, 5));
         assert_eq!(lift.block_starts_compiled, vec![0, 3, 5]);
         assert_eq!(lift.block_starts_raw, vec![0, 3, 6]);
@@ -3011,7 +2999,9 @@ mod tests {
             assert!((g - w).abs() < 1e-12);
         }
 
-        let per_block = SmgsLiftPerBlockV { v_per_block: v_per_term };
+        let per_block = SmgsLiftPerBlockV {
+            v_per_block: v_per_term,
+        };
         let mut block_betas = vec![theta_a, theta_b];
         per_block.lift_block_betas(&mut block_betas);
         for (got, want) in via_t[0].iter().zip(block_betas[0].iter()) {
@@ -3141,7 +3131,11 @@ mod tests {
 
         // Penalty widths: each pulled-back penalty must be
         // p_compiled_total × p_compiled_total (full-width dense).
-        for pen in out.time_penalties.iter().chain(out.marginal_penalties.iter()) {
+        for pen in out
+            .time_penalties
+            .iter()
+            .chain(out.marginal_penalties.iter())
+        {
             match pen {
                 PenaltyMatrix::Dense(m) => {
                     assert_eq!(m.dim(), (p_compiled_total, p_compiled_total));
@@ -3271,9 +3265,8 @@ mod tests {
         g: Option<Array2<f64>>,
     ) -> RawPrimaryBlockDesign {
         let zero = || Array2::<f64>::zeros((n_rows, raw_w));
-        let wrap = |a: Array2<f64>| -> DesignMatrix {
-            DesignMatrix::Dense(DenseDesignMatrix::from(a))
-        };
+        let wrap =
+            |a: Array2<f64>| -> DesignMatrix { DesignMatrix::Dense(DenseDesignMatrix::from(a)) };
         RawPrimaryBlockDesign {
             name: name.to_string(),
             q0: wrap(q0.unwrap_or_else(zero)),

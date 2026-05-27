@@ -93,8 +93,10 @@ fn audit_exact_alias_pair_must_halt() {
         audit.summary,
     );
     assert!(
-        audit.summary.contains("reparam") || audit.summary.contains("sum-to-zero")
-            || audit.summary.contains("orthogonal") || audit.summary.contains("absorb"),
+        audit.summary.contains("reparam")
+            || audit.summary.contains("sum-to-zero")
+            || audit.summary.contains("orthogonal")
+            || audit.summary.contains("absorb"),
         "fatal summary must include a reparameterisation suggestion; got {:?}",
         audit.summary,
     );

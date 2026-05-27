@@ -415,4 +415,3 @@ fn adaptive_k_converges_and_returns_raw_traces() {
         );
     }
 }
-

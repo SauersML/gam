@@ -144,7 +144,10 @@ impl<'a> RowHessianDiagInputs<'a> {
         }
         if self.r > MAX_R {
             return Err(GpuError::DriverCallFailed {
-                reason: format!("row_hessian_diag inputs: r={} exceeds MAX_R={MAX_R}", self.r),
+                reason: format!(
+                    "row_hessian_diag inputs: r={} exceeds MAX_R={MAX_R}",
+                    self.r
+                ),
             });
         }
         if self.h_rows.len() != self.n_rows * self.r * self.r {
@@ -273,9 +276,11 @@ impl RowOpsBackend {
                         reason: format!("row_hessian_ops NVRTC compile failed: {err}"),
                     }
                 })?;
-                let module = ctx.load_module(ptx).map_err(|err| GpuError::DriverCallFailed {
-                    reason: format!("row_hessian_ops module load failed: {err}"),
-                })?;
+                let module = ctx
+                    .load_module(ptx)
+                    .map_err(|err| GpuError::DriverCallFailed {
+                        reason: format!("row_hessian_ops module load failed: {err}"),
+                    })?;
                 Ok(RowOpsBackend { stream, module })
             })
             .as_ref()
@@ -397,9 +402,7 @@ fn launch_matvec_linux(
 }
 
 #[cfg(target_os = "linux")]
-fn launch_diag_linux(
-    inputs: RowHessianDiagInputs<'_>,
-) -> Result<RowHessianDiagOutputs, GpuError> {
+fn launch_diag_linux(inputs: RowHessianDiagInputs<'_>) -> Result<RowHessianDiagOutputs, GpuError> {
     let backend = RowOpsBackend::probe()?;
     let stream = &backend.stream;
     let n = inputs.n_rows;
@@ -436,11 +439,7 @@ fn launch_diag_linux(
     })?;
 
     let mut builder = stream.launch_builder(&func);
-    builder
-        .arg(&n_i32)
-        .arg(&r_i32)
-        .arg(&d_h)
-        .arg(&mut d_d);
+    builder.arg(&n_i32).arg(&r_i32).arg(&d_h).arg(&mut d_d);
 
     // SAFETY: every kernel argument is either an `i32` (passed by value)
     // or a device pointer to a buffer whose length was validated above.
@@ -615,17 +614,13 @@ mod tests {
     fn row_hessian_kernels_match_cpu_oracle_when_cuda_available() {
         #[cfg(not(target_os = "linux"))]
         {
-            eprintln!(
-                "[row_hessian_ops parity] non-Linux host — skipping CUDA parity"
-            );
+            eprintln!("[row_hessian_ops parity] non-Linux host — skipping CUDA parity");
             return;
         }
         #[cfg(target_os = "linux")]
         {
             let Some(_runtime) = crate::gpu::runtime::GpuRuntime::global() else {
-                eprintln!(
-                    "[row_hessian_ops parity] no CUDA runtime — skipping CUDA parity"
-                );
+                eprintln!("[row_hessian_ops parity] no CUDA runtime — skipping CUDA parity");
                 return;
             };
             let n_rows = 4;
@@ -638,7 +633,9 @@ mod tests {
                 h_rows: &h_rows,
                 v_rows: &v_rows,
             };
-            matvec_inputs.validate().expect("matvec fixture must validate");
+            matvec_inputs
+                .validate()
+                .expect("matvec fixture must validate");
             let cpu_y = cpu_row_hessian_matvec(&matvec_inputs);
             let gpu_y = match launch_row_hessian_matvec(matvec_inputs) {
                 Ok(out) => out.y_rows,

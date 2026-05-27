@@ -985,7 +985,11 @@ fn rank_seeds_with_screening(
                         stage,
                         idx + 1,
                         seeds.len(),
-                        if cap == 0 { "uncapped".to_string() } else { cap.to_string() },
+                        if cap == 0 {
+                            "uncapped".to_string()
+                        } else {
+                            cap.to_string()
+                        },
                         seed_elapsed,
                         cost,
                     );
@@ -997,7 +1001,11 @@ fn rank_seeds_with_screening(
                         stage,
                         idx + 1,
                         seeds.len(),
-                        if cap == 0 { "uncapped".to_string() } else { cap.to_string() },
+                        if cap == 0 {
+                            "uncapped".to_string()
+                        } else {
+                            cap.to_string()
+                        },
                         seed_elapsed,
                         cost,
                     );
@@ -1009,7 +1017,11 @@ fn rank_seeds_with_screening(
                         stage,
                         idx + 1,
                         seeds.len(),
-                        if cap == 0 { "uncapped".to_string() } else { cap.to_string() },
+                        if cap == 0 {
+                            "uncapped".to_string()
+                        } else {
+                            cap.to_string()
+                        },
                         seed_elapsed,
                     );
                     rejected += 1;
@@ -1019,7 +1031,11 @@ fn rank_seeds_with_screening(
         log::info!(
             "[STAGE] {context}: seed-screen stage={} cap={} elapsed={:.3}s ranked={} rejected={}",
             stage,
-            if cap == 0 { "uncapped".to_string() } else { cap.to_string() },
+            if cap == 0 {
+                "uncapped".to_string()
+            } else {
+                cap.to_string()
+            },
             stage_started.elapsed().as_secs_f64(),
             ranked.len(),
             rejected,

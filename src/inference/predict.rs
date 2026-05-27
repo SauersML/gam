@@ -1248,7 +1248,8 @@ impl BernoulliMarginalSlopePredictor {
                             return Err(EstimationError::InvalidInput(
                                 "bernoulli marginal-slope link-deviation saved anchor components \
                                  carry more than one FlexEvaluation tail; fit-time stacking emits \
-                                 at most one (score-warp)".to_string(),
+                                 at most one (score-warp)"
+                                    .to_string(),
                             ));
                         }
                         saw_flex_tail = true;
@@ -1284,8 +1285,7 @@ impl BernoulliMarginalSlopePredictor {
                         score_basis.ncols()
                     )));
                 }
-                let mut combined =
-                    Array2::<f64>::zeros((n_rows, d_parametric + flex_tail_ncols));
+                let mut combined = Array2::<f64>::zeros((n_rows, d_parametric + flex_tail_ncols));
                 combined
                     .slice_mut(ndarray::s![.., 0..d_parametric])
                     .assign(&parametric_rows.view());
@@ -2745,15 +2745,16 @@ impl BernoulliMarginalSlopePredictor {
             link_dev_beta_owned.as_ref(),
         ) {
             let basis = if runtime.anchor_correction.is_some() {
-                let anchor_rows = anchor_corrections
-                    .link_dev_anchor_rows_view()
-                    .ok_or_else(|| {
-                        EstimationError::InvalidInput(
+                let anchor_rows =
+                    anchor_corrections
+                        .link_dev_anchor_rows_view()
+                        .ok_or_else(|| {
+                            EstimationError::InvalidInput(
                             "bernoulli marginal-slope link-deviation anchor residual present but \
                              anchor_corrections bundle is missing the parametric anchor rows"
                                 .to_string(),
                         )
-                    })?;
+                        })?;
                 runtime
                     .design_with_anchor_rows(&eta_base, anchor_rows)
                     .map_err(EstimationError::from)?
@@ -3116,15 +3117,16 @@ impl BernoulliMarginalSlopePredictor {
             self.beta_link_dev.as_ref(),
         ) {
             let basis = if runtime.anchor_correction.is_some() {
-                let anchor_rows = anchor_corrections
-                    .link_dev_anchor_rows_view()
-                    .ok_or_else(|| {
-                        EstimationError::InvalidInput(
+                let anchor_rows =
+                    anchor_corrections
+                        .link_dev_anchor_rows_view()
+                        .ok_or_else(|| {
+                            EstimationError::InvalidInput(
                             "bernoulli marginal-slope link-deviation anchor residual present but \
                              anchor_corrections bundle is missing the parametric anchor rows"
                                 .to_string(),
                         )
-                    })?;
+                        })?;
                 runtime
                     .design_with_anchor_rows(&eta_base, anchor_rows)
                     .map_err(EstimationError::from)?

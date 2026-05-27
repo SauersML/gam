@@ -985,10 +985,7 @@ pub struct RowOutputDevBuffers {
 #[cfg(target_os = "linux")]
 impl RowOutputDevBuffers {
     /// Allocate all nine per-row output buffers (length `n`) on `stream`.
-    pub fn allocate(
-        stream: &Arc<cudarc::driver::CudaStream>,
-        n: usize,
-    ) -> Result<Self, GpuError> {
+    pub fn allocate(stream: &Arc<cudarc::driver::CudaStream>, n: usize) -> Result<Self, GpuError> {
         let alloc_f64 = |label: &'static str| {
             stream
                 .alloc_zeros::<f64>(n)
@@ -1042,21 +1039,19 @@ pub fn launch_row_reweight_on_stream(
     use cudarc::driver::{LaunchConfig, PushKernelArg};
     if out.n != n {
         return Err(GpuError::DriverCallFailed {
-            reason: format!(
-                "row reweight buffers shape {} mismatches n={n}",
-                out.n
-            ),
+            reason: format!("row reweight buffers shape {} mismatches n={n}", out.n),
         });
     }
     let module = backend.module_for(family, curvature)?;
-    let func = module
-        .load_function(family.kernel_name())
-        .map_err(|err| GpuError::DriverCallFailed {
-            reason: format!(
-                "row reweight load_function({}): {err}",
-                family.kernel_name()
-            ),
-        })?;
+    let func =
+        module
+            .load_function(family.kernel_name())
+            .map_err(|err| GpuError::DriverCallFailed {
+                reason: format!(
+                    "row reweight load_function({}): {err}",
+                    family.kernel_name()
+                ),
+            })?;
     const THREADS_PER_BLOCK: u32 = 256;
     let n_u32 = u32::try_from(n).map_err(|_| GpuError::DriverCallFailed {
         reason: format!("n={n} exceeds u32 for row reweight grid sizing"),
@@ -1116,10 +1111,7 @@ pub fn launch_row_reweight_jit_on_stream(
     use cudarc::driver::{LaunchConfig, PushKernelArg};
     if out.n != n {
         return Err(GpuError::DriverCallFailed {
-            reason: format!(
-                "JIT row reweight buffers shape {} mismatches n={n}",
-                out.n
-            ),
+            reason: format!("JIT row reweight buffers shape {} mismatches n={n}", out.n),
         });
     }
     let module = backend.module_for_jit(spec, curvature)?;
@@ -1771,14 +1763,11 @@ mod pirls_row_gpu_tests {
             let n = etas.len();
             let family = PirlsRowFamily::BernoulliLogit;
             let curvature = CurvatureMode::Fisher;
-            let backend =
-                PirlsRowBackend::probe().expect("backend probe on CUDA host");
-            let runtime = super::super::runtime::GpuRuntime::global()
-                .expect("GPU runtime available");
-            let ctx = super::super::runtime::cuda_context_for(
-                runtime.selected_device().ordinal,
-            )
-            .expect("ctx");
+            let backend = PirlsRowBackend::probe().expect("backend probe on CUDA host");
+            let runtime =
+                super::super::runtime::GpuRuntime::global().expect("GPU runtime available");
+            let ctx = super::super::runtime::cuda_context_for(runtime.selected_device().ordinal)
+                .expect("ctx");
             let stream = ctx.default_stream();
 
             let mut eta_dev = stream.alloc_zeros::<f64>(n).expect("eta");
@@ -1786,11 +1775,12 @@ mod pirls_row_gpu_tests {
             let mut prior_dev = stream.alloc_zeros::<f64>(n).expect("prior");
             stream.memcpy_htod(&etas, &mut eta_dev).expect("up eta");
             stream.memcpy_htod(&ys, &mut y_dev).expect("up y");
-            stream.memcpy_htod(&priors, &mut prior_dev).expect("up prior");
+            stream
+                .memcpy_htod(&priors, &mut prior_dev)
+                .expect("up prior");
 
             // Built-in path.
-            let mut out_builtin =
-                RowOutputDevBuffers::allocate(&stream, n).expect("alloc builtin");
+            let mut out_builtin = RowOutputDevBuffers::allocate(&stream, n).expect("alloc builtin");
             launch_row_reweight_on_stream(
                 backend,
                 family,
@@ -1806,8 +1796,7 @@ mod pirls_row_gpu_tests {
 
             // JIT path through Level A spec (same body, distinct kernel symbol).
             let spec = JitFamilySpec::glm(0x424c_4c47u64, family, curvature);
-            let mut out_jit =
-                RowOutputDevBuffers::allocate(&stream, n).expect("alloc jit");
+            let mut out_jit = RowOutputDevBuffers::allocate(&stream, n).expect("alloc jit");
             launch_row_reweight_jit_on_stream(
                 backend,
                 &spec,
@@ -1885,14 +1874,11 @@ mod pirls_row_gpu_tests {
 
             let family = PirlsRowFamily::GaussianIdentity;
             let curvature = CurvatureMode::Fisher;
-            let backend =
-                PirlsRowBackend::probe().expect("backend probe on CUDA host");
-            let runtime = super::super::runtime::GpuRuntime::global()
-                .expect("GPU runtime available");
-            let ctx = super::super::runtime::cuda_context_for(
-                runtime.selected_device().ordinal,
-            )
-            .expect("ctx");
+            let backend = PirlsRowBackend::probe().expect("backend probe on CUDA host");
+            let runtime =
+                super::super::runtime::GpuRuntime::global().expect("GPU runtime available");
+            let ctx = super::super::runtime::cuda_context_for(runtime.selected_device().ordinal)
+                .expect("ctx");
             let stream = ctx.default_stream();
 
             let mut eta_dev = stream.alloc_zeros::<f64>(n).expect("eta");
@@ -1900,11 +1886,12 @@ mod pirls_row_gpu_tests {
             let mut prior_dev = stream.alloc_zeros::<f64>(n).expect("prior");
             stream.memcpy_htod(&etas, &mut eta_dev).expect("up eta");
             stream.memcpy_htod(&ys, &mut y_dev).expect("up y");
-            stream.memcpy_htod(&priors, &mut prior_dev).expect("up prior");
+            stream
+                .memcpy_htod(&priors, &mut prior_dev)
+                .expect("up prior");
 
             // Built-in Level A Gaussian-identity kernel (reference).
-            let mut out_builtin =
-                RowOutputDevBuffers::allocate(&stream, n).expect("alloc builtin");
+            let mut out_builtin = RowOutputDevBuffers::allocate(&stream, n).expect("alloc builtin");
             launch_row_reweight_on_stream(
                 backend,
                 family,
@@ -1944,8 +1931,7 @@ mod pirls_row_gpu_tests {
     double dev = wp * resid * resid;
 "#;
             let spec = JitFamilySpec::raw(0x5241_575f_4741_5553u64, raw_body);
-            let mut out_jit =
-                RowOutputDevBuffers::allocate(&stream, n).expect("alloc jit");
+            let mut out_jit = RowOutputDevBuffers::allocate(&stream, n).expect("alloc jit");
             launch_row_reweight_jit_on_stream(
                 backend,
                 &spec,
@@ -2038,8 +2024,7 @@ mod pirls_row_gpu_tests {
             let f = row_reweight_cpu(noncanon, CurvatureMode::Fisher, input);
             let o = row_reweight_cpu(noncanon, CurvatureMode::Observed, input);
             assert!(
-                (f.w_hessian - o.w_hessian).abs() > 0.0
-                    || (probe_y - f.mu).abs() < 1e-15,
+                (f.w_hessian - o.w_hessian).abs() > 0.0 || (probe_y - f.mu).abs() < 1e-15,
                 "{noncanon:?}: observed should differ from Fisher when y ≠ μ"
             );
         }
@@ -2066,14 +2051,11 @@ mod pirls_row_gpu_tests {
             // Gaussian). Build per-family input vectors.
             let etas = [-3.0_f64, -0.5, 0.0, 0.5, 3.0, 10.0, -10.0, 1.5];
             let n = etas.len();
-            let backend =
-                PirlsRowBackend::probe().expect("backend probe on CUDA host");
+            let backend = PirlsRowBackend::probe().expect("backend probe on CUDA host");
             let runtime = super::super::runtime::GpuRuntime::global()
                 .expect("GPU runtime available when probe succeeded");
-            let ctx = super::super::runtime::cuda_context_for(
-                runtime.selected_device().ordinal,
-            )
-            .expect("ctx for selected device");
+            let ctx = super::super::runtime::cuda_context_for(runtime.selected_device().ordinal)
+                .expect("ctx for selected device");
             let stream = ctx.default_stream();
 
             for &family in PirlsRowFamily::ALL.iter() {
@@ -2103,11 +2085,9 @@ mod pirls_row_gpu_tests {
                 }
 
                 // Upload inputs, allocate device outputs, launch, download.
-                let mut eta_dev =
-                    stream.alloc_zeros::<f64>(n).expect("alloc eta_dev");
+                let mut eta_dev = stream.alloc_zeros::<f64>(n).expect("alloc eta_dev");
                 let mut y_dev = stream.alloc_zeros::<f64>(n).expect("alloc y_dev");
-                let mut prior_dev =
-                    stream.alloc_zeros::<f64>(n).expect("alloc prior_dev");
+                let mut prior_dev = stream.alloc_zeros::<f64>(n).expect("alloc prior_dev");
                 stream
                     .memcpy_htod(etas.as_slice(), &mut eta_dev)
                     .expect("upload eta");
@@ -2117,8 +2097,7 @@ mod pirls_row_gpu_tests {
                 stream
                     .memcpy_htod(priors.as_slice(), &mut prior_dev)
                     .expect("upload prior");
-                let mut out =
-                    RowOutputDevBuffers::allocate(&stream, n).expect("alloc row buffers");
+                let mut out = RowOutputDevBuffers::allocate(&stream, n).expect("alloc row buffers");
                 launch_row_reweight_on_stream(
                     backend,
                     family,
@@ -2145,7 +2124,12 @@ mod pirls_row_gpu_tests {
                 for i in 0..n {
                     let r = cpu_out[i];
                     assert_close(&format!("{family:?}/row{i}/mu"), mu[i], r.mu, tol);
-                    assert_close(&format!("{family:?}/row{i}/grad_eta"), g[i], r.grad_eta, tol);
+                    assert_close(
+                        &format!("{family:?}/row{i}/grad_eta"),
+                        g[i],
+                        r.grad_eta,
+                        tol,
+                    );
                     assert_close(
                         &format!("{family:?}/row{i}/w_fisher"),
                         wf[i],
@@ -2176,7 +2160,12 @@ mod pirls_row_gpu_tests {
                         r.z_hessian,
                         tol,
                     );
-                    assert_close(&format!("{family:?}/row{i}/deviance"), dev[i], r.deviance, tol);
+                    assert_close(
+                        &format!("{family:?}/row{i}/deviance"),
+                        dev[i],
+                        r.deviance,
+                        tol,
+                    );
                 }
             }
         }
@@ -2211,24 +2200,17 @@ mod pirls_row_gpu_tests {
                 .map(|i| 0.5 + 1.5 * ((i as f64) / (N as f64)))
                 .collect();
 
-            let backend =
-                PirlsRowBackend::probe().expect("backend probe on CUDA host");
+            let backend = PirlsRowBackend::probe().expect("backend probe on CUDA host");
             let runtime = super::super::runtime::GpuRuntime::global()
                 .expect("GPU runtime available when probe succeeded");
-            let ctx = super::super::runtime::cuda_context_for(
-                runtime.selected_device().ordinal,
-            )
-            .expect("ctx for selected device");
+            let ctx = super::super::runtime::cuda_context_for(runtime.selected_device().ordinal)
+                .expect("ctx for selected device");
             let stream = ctx.default_stream();
 
             for &family in PirlsRowFamily::ALL.iter() {
                 let ys: Vec<f64> = match family {
-                    PirlsRowFamily::GammaLog => {
-                        (0..N).map(|i| 0.25 + 0.05 * (i as f64)).collect()
-                    }
-                    PirlsRowFamily::PoissonLog => {
-                        (0..N).map(|i| (i % 6) as f64).collect()
-                    }
+                    PirlsRowFamily::GammaLog => (0..N).map(|i| 0.25 + 0.05 * (i as f64)).collect(),
+                    PirlsRowFamily::PoissonLog => (0..N).map(|i| (i % 6) as f64).collect(),
                     PirlsRowFamily::GaussianIdentity => (0..N)
                         .map(|i| -2.0 + 4.0 * (i as f64) / ((N - 1) as f64))
                         .collect(),
@@ -2241,13 +2223,14 @@ mod pirls_row_gpu_tests {
                 stream
                     .memcpy_htod(etas.as_slice(), &mut eta_dev)
                     .expect("upload eta");
-                stream.memcpy_htod(ys.as_slice(), &mut y_dev).expect("upload y");
+                stream
+                    .memcpy_htod(ys.as_slice(), &mut y_dev)
+                    .expect("upload y");
                 stream
                     .memcpy_htod(priors.as_slice(), &mut prior_dev)
                     .expect("upload prior");
 
-                let mut out_obs =
-                    RowOutputDevBuffers::allocate(&stream, N).expect("alloc out_obs");
+                let mut out_obs = RowOutputDevBuffers::allocate(&stream, N).expect("alloc out_obs");
                 launch_row_reweight_on_stream(
                     backend,
                     family,

@@ -1211,12 +1211,7 @@ impl BernoulliInterceptWarmStartCache {
     /// was installed, `Err(prev_tag)` if some prior write already populated
     /// the slot (in which case the caller should keep the existing entry).
     #[inline]
-    fn compare_exchange_unseeded(
-        &self,
-        row: usize,
-        value: f64,
-        beta_tag: u64,
-    ) -> Result<(), u64> {
+    fn compare_exchange_unseeded(&self, row: usize, value: f64, beta_tag: u64) -> Result<(), u64> {
         let value_slot = self.intercept_value.get(row).ok_or(0u64)?;
         let tag_slot = self.intercept_tag.get(row).ok_or(0u64)?;
         match tag_slot.compare_exchange(0, beta_tag, Ordering::AcqRel, Ordering::Acquire) {
@@ -1777,7 +1772,10 @@ pub(crate) fn install_compiled_flex_block_into_runtime(
     candidate: &mut DeviationPrepared,
     candidate_arg_at_training_rows: &Array1<f64>,
     candidate_cfg: &DeviationBlockConfig,
-    parametric_anchors: &[(&DesignMatrix, crate::families::bernoulli_marginal_slope::deviation_runtime::ParametricAnchorBlock)],
+    parametric_anchors: &[(
+        &DesignMatrix,
+        crate::families::bernoulli_marginal_slope::deviation_runtime::ParametricAnchorBlock,
+    )],
     flex_anchors: &[&Array2<f64>],
     training_row_weights: &Array1<f64>,
 ) -> Result<FlexCompileOutcome, String> {
@@ -1787,9 +1785,7 @@ pub(crate) fn install_compiled_flex_block_into_runtime(
     use crate::families::bernoulli_marginal_slope_identifiability::{
         BernoulliDenseDesignOperator, BernoulliRowHessian,
     };
-    use crate::families::identifiability_compiler::{
-        BlockOrder, RowJacobianOperator, compile,
-    };
+    use crate::families::identifiability_compiler::{BlockOrder, RowJacobianOperator, compile};
 
     let candidate_design = candidate.runtime.design(candidate_arg_at_training_rows)?;
     let n = candidate_design.nrows();
@@ -1929,11 +1925,14 @@ pub(crate) fn install_compiled_flex_block_into_runtime(
     // emits a less specific error; catch it here with the d_total/k_kept
     // context.
     {
-        let m = candidate_compiled.anchor_correction.as_ref().ok_or_else(|| {
-            "cross-block identifiability: compile returned no anchor_correction for the \
+        let m = candidate_compiled
+            .anchor_correction
+            .as_ref()
+            .ok_or_else(|| {
+                "cross-block identifiability: compile returned no anchor_correction for the \
              candidate block (expected for trailing block with non-empty anchor union)"
-                .to_string()
-        })?;
+                    .to_string()
+            })?;
         if m.nrows() != d_total || m.ncols() != k_kept {
             return Err(format!(
                 "cross-block identifiability: anchor_correction shape {}×{} does not match \
@@ -1949,9 +1948,11 @@ pub(crate) fn install_compiled_flex_block_into_runtime(
     // right-selector V to span_c{0..3} + boundary/monotonicity rows, and
     // stores the anchor correction M alongside the per-anchor predict-time
     // tags so the saved model can replay the anchor row map.
-    candidate
-        .runtime
-        .install_compiled_flex_block(candidate_compiled, anchor_components, n_train)?;
+    candidate.runtime.install_compiled_flex_block(
+        candidate_compiled,
+        anchor_components,
+        n_train,
+    )?;
     let new_design = candidate
         .runtime
         .design_at_training_with_residual(candidate_arg_at_training_rows)?;
@@ -7610,8 +7611,7 @@ impl BernoulliMarginalSlopeFamily {
         beta_w: Option<&Array1<f64>>,
     ) {
         if let Some(cache) = self.intercept_warm_starts.as_ref() {
-            let beta_tag =
-                hash_intercept_warm_start_key_flex(marginal_eta, slope, beta_h, beta_w);
+            let beta_tag = hash_intercept_warm_start_key_flex(marginal_eta, slope, beta_h, beta_w);
             cache.store_tagged(row, a, beta_tag);
         }
     }
@@ -7756,8 +7756,7 @@ impl BernoulliMarginalSlopeFamily {
         // just `(marginal_eta, slope)`. Without the tag a TR trial at one β
         // can read back a converged value from a different trial at the same
         // row and poison the solve.
-        let flex_beta_tag =
-            hash_intercept_warm_start_key_flex(marginal_eta, slope, beta_h, beta_w);
+        let flex_beta_tag = hash_intercept_warm_start_key_flex(marginal_eta, slope, beta_h, beta_w);
         let cached_a = self
             .intercept_warm_starts
             .as_ref()
@@ -8355,9 +8354,8 @@ impl BernoulliMarginalSlopeFamily {
         #[cfg(debug_assertions)]
         {
             use crate::gpu::cubic_cell::{
-                CubicCellDerivativeMomentHostView,
-                CubicCellMomentResidency, GpuCellBranchTag, GpuDenestedCubicCell,
-                try_build_cubic_cell_derivative_moments,
+                CubicCellDerivativeMomentHostView, CubicCellMomentResidency, GpuCellBranchTag,
+                GpuDenestedCubicCell, try_build_cubic_cell_derivative_moments,
             };
             const PARITY_ROW_BUDGET: usize = 4;
             let mut sample_cells: Vec<GpuDenestedCubicCell> = Vec::new();
@@ -8557,8 +8555,7 @@ impl BernoulliMarginalSlopeFamily {
         //    upload. The host fill stays as the fallback on hosts without
         //    a runtime (and on every non-Linux build).
         #[cfg(target_os = "linux")]
-        let build_device_moments =
-            crate::gpu::runtime::GpuRuntime::global().is_some();
+        let build_device_moments = crate::gpu::runtime::GpuRuntime::global().is_some();
         #[cfg(not(target_os = "linux"))]
         let build_device_moments = false;
 
@@ -8675,13 +8672,12 @@ impl BernoulliMarginalSlopeFamily {
                 );
                 let dc_da = scale_coeff4(dc_da_raw, scale);
                 let dc_db = scale_coeff4(dc_db_raw, scale);
-                let (dc_daa_raw, dc_dab_raw, dc_dbb_raw) =
-                    exact::denested_cell_second_partials(
-                        entry.partition_cell.score_span,
-                        entry.partition_cell.link_span,
-                        a,
-                        b,
-                    );
+                let (dc_daa_raw, dc_dab_raw, dc_dbb_raw) = exact::denested_cell_second_partials(
+                    entry.partition_cell.score_span,
+                    entry.partition_cell.link_span,
+                    a,
+                    b,
+                );
                 let dc_daa = scale_coeff4(dc_daa_raw, scale);
                 let dc_dab = scale_coeff4(dc_dab_raw, scale);
                 let dc_dbb = scale_coeff4(dc_dbb_raw, scale);
@@ -8901,12 +8897,7 @@ impl BernoulliMarginalSlopeFamily {
             let row_ruv_base = row * r * r;
             for u in 0..r {
                 for v in u..r {
-                    let pair = g_jet.pair_from_b_family(
-                        g_jet.b_first,
-                        u,
-                        v,
-                        COEFF_SUPPORT_BHW,
-                    );
+                    let pair = g_jet.pair_from_b_family(g_jet.b_first, u, v, COEFF_SUPPORT_BHW);
                     let val = eval_coeff4_at(&pair, z_obs);
                     row_ruv[row_ruv_base + u * r + v] = val;
                     if u != v {
@@ -8934,7 +8925,9 @@ impl BernoulliMarginalSlopeFamily {
             if gpu_cells.len() != total_cells_us || gpu_branches.len() != total_cells_us {
                 return Err(format!(
                     "bms_flex_row pack: gpu_cells.len()={} branches.len()={} mismatch total_cells={}",
-                    gpu_cells.len(), gpu_branches.len(), total_cells_us
+                    gpu_cells.len(),
+                    gpu_branches.len(),
+                    total_cells_us
                 ));
             }
             let view = CubicCellDerivativeMomentHostView {
@@ -9024,40 +9017,42 @@ impl BernoulliMarginalSlopeFamily {
         drop(gpu_cells);
         drop(gpu_branches);
 
-        Ok(Some(crate::gpu::bms_flex_row::BmsFlexRowKernelInputsOwned {
-            n_rows: n,
-            r,
-            p_h,
-            p_w,
-            s_f: scale,
-            q: row_q,
-            b: row_b,
-            mu_1: row_mu1,
-            mu_2: row_mu2,
-            z_obs: row_zobs,
-            y: row_y,
-            w: row_w,
-            cell_offsets,
-            cell_c0,
-            cell_c1,
-            cell_c2,
-            cell_c3,
-            cell_a,
-            cell_aa,
-            cell_r: cell_r_buf,
-            cell_ar,
-            cell_sbb,
-            cell_sbh,
-            cell_sbw,
-            cell_moments,
-            #[cfg(target_os = "linux")]
-            cell_moments_device,
-            chi_obs: row_chi,
-            xi_obs: row_xi,
-            rho_u: row_rho,
-            tau_u: row_tau,
-            r_uv: row_ruv,
-        }))
+        Ok(Some(
+            crate::gpu::bms_flex_row::BmsFlexRowKernelInputsOwned {
+                n_rows: n,
+                r,
+                p_h,
+                p_w,
+                s_f: scale,
+                q: row_q,
+                b: row_b,
+                mu_1: row_mu1,
+                mu_2: row_mu2,
+                z_obs: row_zobs,
+                y: row_y,
+                w: row_w,
+                cell_offsets,
+                cell_c0,
+                cell_c1,
+                cell_c2,
+                cell_c3,
+                cell_a,
+                cell_aa,
+                cell_r: cell_r_buf,
+                cell_ar,
+                cell_sbb,
+                cell_sbh,
+                cell_sbw,
+                cell_moments,
+                #[cfg(target_os = "linux")]
+                cell_moments_device,
+                chi_obs: row_chi,
+                xi_obs: row_xi,
+                rho_u: row_rho,
+                tau_u: row_tau,
+                r_uv: row_ruv,
+            },
+        ))
     }
 
     fn build_row_primary_hessian_cache(
@@ -9236,32 +9231,31 @@ impl BernoulliMarginalSlopeFamily {
                             }
                         }
                     }
-                    match crate::gpu::bms_flex_row::launch_bms_flex_row_kernel(
-                    owned.as_borrowed(),
-                ) {
-                    Ok(outputs) => {
-                        if log_exact_work(n) {
+                    match crate::gpu::bms_flex_row::launch_bms_flex_row_kernel(owned.as_borrowed())
+                    {
+                        Ok(outputs) => {
+                            if log_exact_work(n) {
+                                log::info!(
+                                    "[BMS row-primary-hessian-cache] gpu_launch_ok rows={} r={} elapsed={:.3}s",
+                                    n,
+                                    r,
+                                    started.elapsed().as_secs_f64()
+                                );
+                            }
+                            let packed = Array2::<f64>::from_shape_vec((n, r * r), outputs.hess)
+                                .map_err(|err| format!("bms_flex_row output shape: {err}"))?;
+                            drop(heartbeat_guard);
+                            return Ok(RowPrimaryHessianCache::Host(RowPrimaryHessianPin::new(
+                                packed, plan.bytes,
+                            )));
+                        }
+                        Err(err) => {
                             log::info!(
-                                "[BMS row-primary-hessian-cache] gpu_launch_ok rows={} r={} elapsed={:.3}s",
-                                n,
-                                r,
-                                started.elapsed().as_secs_f64()
+                                "[BMS row-primary-hessian-cache] gpu_launch_failed: {err}; \
+                             falling back to CPU rows"
                             );
                         }
-                        let packed = Array2::<f64>::from_shape_vec((n, r * r), outputs.hess)
-                            .map_err(|err| format!("bms_flex_row output shape: {err}"))?;
-                        drop(heartbeat_guard);
-                        return Ok(RowPrimaryHessianCache::Host(RowPrimaryHessianPin::new(
-                            packed, plan.bytes,
-                        )));
                     }
-                    Err(err) => {
-                        log::info!(
-                            "[BMS row-primary-hessian-cache] gpu_launch_failed: {err}; \
-                             falling back to CPU rows"
-                        );
-                    }
-                }
                 }
                 None => {
                     if log_exact_work(n) {
@@ -14306,9 +14300,7 @@ impl BernoulliMarginalSlopeFamily {
             };
             let mut out = Array1::<f64>::zeros(slices.total);
             for row in 0..n {
-                let action = Array1::<f64>::from(
-                    y_rows[row * r_pr..(row + 1) * r_pr].to_vec(),
-                );
+                let action = Array1::<f64>::from(y_rows[row * r_pr..(row + 1) * r_pr].to_vec());
                 out += &self.pullback_primary_vector(row, slices, primary, &action)?;
             }
             return Ok(out);
@@ -14484,17 +14476,13 @@ impl BernoulliMarginalSlopeFamily {
                     self.logslope_design
                         .squared_axpy_row_into(row, h11, &mut logslope_diag)?;
                 }
-                if let (Some(primary_h), Some(block_h)) =
-                    (primary.h.as_ref(), slices.h.as_ref())
-                {
+                if let (Some(primary_h), Some(block_h)) = (primary.h.as_ref(), slices.h.as_ref()) {
                     for (local_idx, global_idx) in block_h.clone().enumerate() {
                         let ii = primary_h.start + local_idx;
                         diagonal[global_idx] += d_rows[d_row_base + ii];
                     }
                 }
-                if let (Some(primary_w), Some(block_w)) =
-                    (primary.w.as_ref(), slices.w.as_ref())
-                {
+                if let (Some(primary_w), Some(block_w)) = (primary.w.as_ref(), slices.w.as_ref()) {
                     for (local_idx, global_idx) in block_w.clone().enumerate() {
                         let ii = primary_w.start + local_idx;
                         diagonal[global_idx] += d_rows[d_row_base + ii];
@@ -17622,18 +17610,15 @@ impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJoint
             if let Some(device_state) = self.cache.row_primary_hessians.device() {
                 let p_total = self.cache.slices.total;
                 if p_total <= crate::gpu::bms_flex_row::DENSE_BLOCK_MAX_P {
-                    match crate::gpu::bms_flex_row::launch_bms_flex_row_dense_block(
-                        device_state,
-                    ) {
+                    match crate::gpu::bms_flex_row::launch_bms_flex_row_dense_block(device_state) {
                         Ok(flat) => {
                             let h_arr =
-                                Array2::from_shape_vec((p_total, p_total), flat)
-                                    .map_err(|e| {
-                                        format!(
-                                            "BMS hessian_dense_forced: dense_block reshape \
+                                Array2::from_shape_vec((p_total, p_total), flat).map_err(|e| {
+                                    format!(
+                                        "BMS hessian_dense_forced: dense_block reshape \
                                              {p_total}x{p_total} failed: {e}"
-                                        )
-                                    })?;
+                                    )
+                                })?;
                             return Ok(Some(h_arr));
                         }
                         Err(err) => {
@@ -22988,7 +22973,7 @@ mod tests {
                 nullspace_dims: vec![0; 2],
                 initial_log_lambdas: ndarray::Array1::zeros(2),
                 initial_beta: None,
-gauge_priority: 100,
+                gauge_priority: 100,
             })
             .collect();
         let small_cost = default_coefficient_hessian_cost(&small_specs);
@@ -23015,7 +23000,7 @@ gauge_priority: 100,
                 nullspace_dims: vec![0; 10],
                 initial_log_lambdas: ndarray::Array1::zeros(10),
                 initial_beta: None,
-gauge_priority: 100,
+                gauge_priority: 100,
             })
             .collect();
         let big_cost = default_coefficient_hessian_cost(&big_specs);
@@ -23045,7 +23030,7 @@ gauge_priority: 100,
             nullspace_dims: vec![0; 22],
             initial_log_lambdas: ndarray::Array1::zeros(22),
             initial_beta: None,
-gauge_priority: 100,
+            gauge_priority: 100,
         }];
         let ctn_cost: u64 = 400_000u64 * 300 * 300;
         assert_eq!(
@@ -23074,7 +23059,7 @@ gauge_priority: 100,
             nullspace_dims: vec![0; 5_000],
             initial_log_lambdas: ndarray::Array1::zeros(5_000),
             initial_beta: None,
-gauge_priority: 100,
+            gauge_priority: 100,
         }];
         assert_eq!(
             exact_outer_order_with_outer_hvp(&huge_k_specs, 0, true),
@@ -23133,7 +23118,7 @@ gauge_priority: 100,
                 nullspace_dims: vec![0],
                 initial_log_lambdas: Array1::zeros(1),
                 initial_beta: None,
-gauge_priority: 100,
+                gauge_priority: 100,
             },
             ParameterBlockSpec {
                 name: "logslope".to_string(),
@@ -23145,7 +23130,7 @@ gauge_priority: 100,
                 nullspace_dims: vec![0],
                 initial_log_lambdas: Array1::zeros(1),
                 initial_beta: None,
-gauge_priority: 100,
+                gauge_priority: 100,
             },
         ];
 

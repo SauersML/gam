@@ -4282,10 +4282,7 @@ impl DenseDesignOperator for ResidualisedDesignOperator {
 /// lives on [`RowwiseKroneckerOperator`]. Survival families that need a
 /// `DesignMatrix`-typed output still use the operator wrapper because the
 /// product would otherwise materialize an `n × (p_cov · p_time)` dense block.
-pub fn dense_rowwise_kronecker(
-    a: ArrayView2<'_, f64>,
-    b: ArrayView2<'_, f64>,
-) -> Array2<f64> {
+pub fn dense_rowwise_kronecker(a: ArrayView2<'_, f64>, b: ArrayView2<'_, f64>) -> Array2<f64> {
     assert_eq!(
         a.nrows(),
         b.nrows(),
@@ -8740,7 +8737,10 @@ mod tests {
         let inner = array![[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]];
         let transform = Array2::<f64>::eye(2);
         let anchor_raw = array![[7.0, -1.0], [0.5, 2.0], [-3.0, 1.5]];
-        let r_block = Arc::new(Array2::<f64>::zeros((anchor_raw.ncols(), transform.ncols())));
+        let r_block = Arc::new(Array2::<f64>::zeros((
+            anchor_raw.ncols(),
+            transform.ncols(),
+        )));
         let anchor_design = DesignMatrix::from(anchor_raw);
 
         let op = ResidualisedDesignOperator::new(

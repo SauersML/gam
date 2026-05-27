@@ -819,7 +819,8 @@ mod cuda {
     /// `(p_max, r_template)` pair selects the shared-memory layout baked into
     /// the kernel source.
     struct FusedModuleCache {
-        modules: Mutex<HashMap<crate::gpu::arrow_schur_nvrtc::FusedModuleCacheKey, Arc<CudaModule>>>,
+        modules:
+            Mutex<HashMap<crate::gpu::arrow_schur_nvrtc::FusedModuleCacheKey, Arc<CudaModule>>>,
     }
 
     fn fused_module_cache() -> &'static FusedModuleCache {
@@ -1000,8 +1001,7 @@ mod cuda {
             // SAFETY: all buffers were just allocated on `stream` with sizes
             // derived from `plan`; kernel parameter list matches the
             // FORWARD_KERNEL_SOURCE signature.
-            unsafe { builder.launch(cfg) }
-                .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+            unsafe { builder.launch(cfg) }.map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
         }
         stream
             .synchronize()
@@ -1107,8 +1107,7 @@ mod cuda {
             // SAFETY: kernel parameter list matches FORWARD_KERNEL_SOURCE
             // back-sub signature; `rhs_dev` holds δβ in the leading k entries
             // (R_TEMPLATE-strided indexing is column 0..k of the R-vector).
-            unsafe { builder.launch(back_cfg) }
-                .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+            unsafe { builder.launch(back_cfg) }.map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
         }
         stream
             .synchronize()

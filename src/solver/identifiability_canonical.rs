@@ -38,9 +38,7 @@ use std::sync::Arc;
 use ndarray::{Array1, Array2};
 
 use crate::families::custom_family::{CustomFamilyError, ParameterBlockSpec, PenaltyMatrix};
-use crate::linalg::matrix::{
-    CoefficientTransformOperator, DenseDesignMatrix, DesignMatrix,
-};
+use crate::linalg::matrix::{CoefficientTransformOperator, DenseDesignMatrix, DesignMatrix};
 use crate::solver::identifiability_audit::{IdentifiabilityAudit, audit_identifiability};
 
 /// Specs after pre-fit cross-block identifiability canonicalisation.
@@ -83,18 +81,12 @@ impl CanonicalSpecs {
 
     /// Raw block dimensions (rows of each `T_i`). Used to bound expansion.
     pub fn raw_block_dims(&self) -> Vec<usize> {
-        self.per_block_transform
-            .iter()
-            .map(|t| t.nrows())
-            .collect()
+        self.per_block_transform.iter().map(|t| t.nrows()).collect()
     }
 
     /// Reduced block dimensions (cols of each `T_i`).
     pub fn reduced_block_dims(&self) -> Vec<usize> {
-        self.per_block_transform
-            .iter()
-            .map(|t| t.ncols())
-            .collect()
+        self.per_block_transform.iter().map(|t| t.ncols()).collect()
     }
 
     /// Lift a reduced-space joint matrix `M_red` (total_r × total_r) to
@@ -171,11 +163,10 @@ impl CanonicalSpecs {
 pub fn canonicalize_for_identifiability(
     specs: &[ParameterBlockSpec],
 ) -> Result<CanonicalSpecs, CustomFamilyError> {
-    let audit = audit_identifiability(specs).map_err(|reason| {
-        CustomFamilyError::DimensionMismatch {
+    let audit =
+        audit_identifiability(specs).map_err(|reason| CustomFamilyError::DimensionMismatch {
             reason: format!("pre-fit identifiability audit failed: {reason}"),
-        }
-    })?;
+        })?;
 
     if audit.fatal {
         return Err(CustomFamilyError::IdentifiabilityFailure { audit });
@@ -264,7 +255,7 @@ pub fn canonicalize_for_identifiability(
             nullspace_dims: Vec::new(),
             initial_log_lambdas: spec.initial_log_lambdas.clone(),
             initial_beta: reduced_initial_beta,
-gauge_priority: 100,
+            gauge_priority: 100,
         });
         per_block_transform.push(t_i);
     }
@@ -303,9 +294,8 @@ fn build_reduced_design(
     // raw-width inner through every PIRLS iteration when many columns
     // were dropped.
     if let Some(arr) = inner_dense.as_dense_ref() {
-        let reduced = Array2::<f64>::from_shape_fn((arr.nrows(), kept.len()), |(i, j)| {
-            arr[[i, kept[j]]]
-        });
+        let reduced =
+            Array2::<f64>::from_shape_fn((arr.nrows(), kept.len()), |(i, j)| arr[[i, kept[j]]]);
         return Ok(DesignMatrix::Dense(DenseDesignMatrix::from(reduced)));
     }
     // Operator-backed inner (Lazy): preserve the operator structure
@@ -324,9 +314,8 @@ fn build_reduced_design(
 fn pull_back_penalty(penalty: &PenaltyMatrix, kept: &[usize]) -> PenaltyMatrix {
     let label = penalty.precision_label().map(|s| s.to_string());
     let dense = penalty.as_dense_cow();
-    let reduced = Array2::<f64>::from_shape_fn((kept.len(), kept.len()), |(i, j)| {
-        dense[[kept[i], kept[j]]]
-    });
+    let reduced =
+        Array2::<f64>::from_shape_fn((kept.len(), kept.len()), |(i, j)| dense[[kept[i], kept[j]]]);
     let base = PenaltyMatrix::Dense(reduced);
     match label {
         Some(lbl) => base.with_precision_label(lbl),
@@ -375,8 +364,7 @@ mod tests {
             s[[i, 1]] = x[i] * x[i] * x[i];
         }
         let specs = [spec_from_dense("p", p), spec_from_dense("s", s)];
-        let canon =
-            canonicalize_for_identifiability(&specs).expect("clean canonical must succeed");
+        let canon = canonicalize_for_identifiability(&specs).expect("clean canonical must succeed");
         assert_eq!(canon.reduced_specs.len(), 2);
         assert_eq!(canon.per_block_transform[0].dim(), (2, 2));
         assert_eq!(canon.per_block_transform[1].dim(), (2, 2));
@@ -503,10 +491,15 @@ mod tests {
         // construction of the attribution loop.
         let total_kept: usize = audit.blocks.iter().map(|b| b.effective_dim).sum();
         assert_eq!(
-            total_kept, 9,
+            total_kept,
+            9,
             "expected joint rank = 13 − 4 = 9 reported by audit; got {total_kept} \
              (per-block effective_dim {:?})",
-            audit.blocks.iter().map(|b| (b.block_name.clone(), b.effective_dim)).collect::<Vec<_>>(),
+            audit
+                .blocks
+                .iter()
+                .map(|b| (b.block_name.clone(), b.effective_dim))
+                .collect::<Vec<_>>(),
         );
         // Gauge-priority attribution: dropped_columns are the four
         // columns RRQR demoted past the joint rank threshold. With
@@ -551,10 +544,7 @@ mod tests {
         s[[1, 0]] = 1.5;
         smooth_spec.penalties = vec![PenaltyMatrix::Dense(s.clone())];
         smooth_spec.initial_log_lambdas = Array1::from(vec![0.0]);
-        let specs = [
-            spec_from_dense("intercept", parametric),
-            smooth_spec,
-        ];
+        let specs = [spec_from_dense("intercept", parametric), smooth_spec];
         let canon = canonicalize_for_identifiability(&specs)
             .expect("clean canonical must succeed with identity transforms");
         let smooth_reduced = &canon.reduced_specs[1];

@@ -3115,8 +3115,7 @@ mod tests {
                 let (_, jet_minus) = evaluator.evaluate(minus.view()).unwrap();
                 for basis in 0..n_basis {
                     for axis_a in 0..latent_dim {
-                        let fd = (jet_plus[[row, basis, axis_a]]
-                            - jet_minus[[row, basis, axis_a]])
+                        let fd = (jet_plus[[row, basis, axis_a]] - jet_minus[[row, basis, axis_a]])
                             / (2.0 * epsilon);
                         let analytic = second[[row, basis, axis_a, axis_c]];
                         let error = (analytic - fd).abs();
@@ -3162,11 +3161,7 @@ mod tests {
         // Stay inside the interior `(-π/2, π/2)` for lat so the chain factor
         // is active — that is where the Hessian carries information.
         let sphere_coords = array![[-0.7, -1.2], [-0.25, 0.0], [0.35, 0.9], [0.8, 2.1]];
-        assert_second_jet_matches_central_difference(
-            &SphereChartEvaluator,
-            sphere_coords,
-            1.0e-5,
-        );
+        assert_second_jet_matches_central_difference(&SphereChartEvaluator, sphere_coords, 1.0e-5);
     }
 
     #[test]

@@ -10315,7 +10315,10 @@ impl DenseDesignOperator for KroneckerDesign {
                 );
                 let left_chunk = left.slice(s![rows.clone(), ..]).to_owned();
                 let right_chunk = right.try_row_chunk(rows)?;
-                out.assign(&dense_rowwise_kronecker(left_chunk.view(), right_chunk.view()));
+                out.assign(&dense_rowwise_kronecker(
+                    left_chunk.view(),
+                    right_chunk.view(),
+                ));
             }
         }
         Ok(())

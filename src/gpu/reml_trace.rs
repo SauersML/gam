@@ -955,7 +955,8 @@ extern "C" __global__ void reduce_q_weighted_gram(
     const THREADS_PER_BLOCK: u32 = 256;
 
     fn module(ctx: &Arc<CudaContext>) -> Result<&'static Arc<CudaModule>, GpuError> {
-        static CACHE: crate::gpu::common::PtxModuleCache = crate::gpu::common::PtxModuleCache::new();
+        static CACHE: crate::gpu::common::PtxModuleCache =
+            crate::gpu::common::PtxModuleCache::new();
         CACHE.get_or_compile(ctx, "reml_trace", PTX_SOURCE)
     }
 
@@ -978,8 +979,8 @@ extern "C" __global__ void reduce_q_weighted_gram(
 
         // ── 1. Upload H, factor once.
         let h_col = to_col_major(&input.penalized_hessian);
-        let mut h_dev = pinned_htod(&stream, &h_col)
-            .map_err(|reason| GpuError::DriverCallFailed { reason })?;
+        let mut h_dev =
+            pinned_htod(&stream, &h_col).map_err(|reason| GpuError::DriverCallFailed { reason })?;
         potrf_in_place(&solver, &stream, p, &mut h_dev)
             .map_err(|reason| GpuError::DriverCallFailed { reason })?;
         let factor_col = stream
@@ -2105,8 +2106,8 @@ mod tests {
     fn block_2_8_hill_climb_adaptive_vs_exact_at_p2000_d8() {
         // Smaller dimensions on CPU CI to keep the test under a minute;
         // V100 runs the full p=2000, d=8 specified in the charter.
-        let on_v100 = cfg!(target_os = "linux")
-            && super::super::runtime::GpuRuntime::global().is_some();
+        let on_v100 =
+            cfg!(target_os = "linux") && super::super::runtime::GpuRuntime::global().is_some();
         let (p, d): (usize, usize) = if on_v100 { (2000, 8) } else { (256, 4) };
 
         let mut h = Array2::<f64>::zeros((p, p));
@@ -2119,8 +2120,9 @@ mod tests {
                 };
             }
         }
-        let derivs_owned: Vec<Array2<f64>> =
-            (0..d).map(|k| random_dense_sym(p, 0x1000 + k as u64)).collect();
+        let derivs_owned: Vec<Array2<f64>> = (0..d)
+            .map(|k| random_dense_sym(p, 0x1000 + k as u64))
+            .collect();
         let derivs: Vec<DerivativeHessian<'_>> = derivs_owned
             .iter()
             .map(|a| DerivativeHessian::Dense(a.view()))

@@ -228,7 +228,10 @@ mod tests {
     #[test]
     fn cross_block_dense_validates() {
         let result = cross_block_spec().validate();
-        assert!(result.is_ok(), "valid cross-block spec rejected: {result:?}");
+        assert!(
+            result.is_ok(),
+            "valid cross-block spec rejected: {result:?}"
+        );
     }
 
     #[test]

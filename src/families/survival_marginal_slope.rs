@@ -11,9 +11,8 @@ use crate::custom_family::{
 use crate::estimate::UnifiedFitResult;
 use crate::faer_ndarray::{FaerCholesky, fast_ab, fast_atv, fast_av, fast_xt_diag_x};
 use crate::families::bernoulli_marginal_slope::{
-    FlexCompileOutcome, CrossBlockIdentifiabilityWarning,
-    DeviationBlockConfig, DeviationRuntime, LatentZNormalization, LatentZPolicy,
-    MarginalSlopeCovariance, ParametricAnchorBlock,
+    CrossBlockIdentifiabilityWarning, DeviationBlockConfig, DeviationRuntime, FlexCompileOutcome,
+    LatentZNormalization, LatentZPolicy, MarginalSlopeCovariance, ParametricAnchorBlock,
     build_link_deviation_block_from_knots_design_seed_and_weights,
     build_score_warp_deviation_block_from_seed, install_compiled_flex_block_into_runtime,
     marginal_slope_covariance_from_scores, marginal_slope_preserving_scale,
@@ -23,9 +22,6 @@ use crate::families::bernoulli_marginal_slope::{
     unary_derivatives_neglog_phi, unary_derivatives_sqrt,
 };
 use crate::families::cubic_cell_kernel as exact_kernel;
-use crate::gpu::cubic_cell::partition_substrate::{
-    self as partition_substrate, SurvivalPartitionBatchView, SurvivalPartitionRowView,
-};
 use crate::families::gamlss::{ParameterBlockInput, monotone_wiggle_basis_with_derivative_order};
 use crate::families::lognormal_kernel::FrailtySpec;
 use crate::families::marginal_slope_shared::{
@@ -45,6 +41,9 @@ use crate::families::row_kernel::{
 use crate::families::survival::{OffsetChannelCurvatures, OffsetChannelResiduals};
 use crate::families::survival_location_scale::{
     TimeBlockInput, TimeWiggleBlockInput, project_onto_linear_constraints,
+};
+use crate::gpu::cubic_cell::partition_substrate::{
+    self as partition_substrate, SurvivalPartitionBatchView, SurvivalPartitionRowView,
 };
 use crate::matrix::{DesignMatrix, SymmetricMatrix};
 use crate::pirls::LinearInequalityConstraints;
@@ -373,12 +372,7 @@ impl SurvivalInterceptWarmStartCache {
     /// the caller's `beta_tag` and the stored value is finite. Otherwise
     /// returns `None` (cache miss — caller falls back to closed-form seed).
     #[inline]
-    fn load(
-        &self,
-        row: usize,
-        kind: SurvivalInterceptSlotKind,
-        beta_tag: u64,
-    ) -> Option<f64> {
+    fn load(&self, row: usize, kind: SurvivalInterceptSlotKind, beta_tag: u64) -> Option<f64> {
         let (values, tags) = self.slots_for(kind);
         let value_slot = values.get(row)?;
         let tag_slot = tags.get(row)?;
@@ -399,13 +393,7 @@ impl SurvivalInterceptWarmStartCache {
     /// writers from different trials race; the last writer wins, which is fine
     /// because every reader gates on its own tag and only accepts a match.
     #[inline]
-    fn store(
-        &self,
-        row: usize,
-        kind: SurvivalInterceptSlotKind,
-        a: f64,
-        beta_tag: u64,
-    ) {
+    fn store(&self, row: usize, kind: SurvivalInterceptSlotKind, a: f64, beta_tag: u64) {
         let (values, tags) = self.slots_for(kind);
         if let (Some(value_slot), Some(tag_slot)) = (values.get(row), tags.get(row)) {
             // Invalidate before writing the new value so an interleaved
@@ -3185,10 +3173,8 @@ fn survival_pilot_irls_row_metric_at_eta(
         let eta = eta_pilot[i];
         let d = event[i];
         let weight = sample_weights[i];
-        let (_, k2, _, _) = signed_probit_neglog_derivatives_up_to_fourth(
-            -eta,
-            weight * (1.0 - d),
-        )?;
+        let (_, k2, _, _) =
+            signed_probit_neglog_derivatives_up_to_fourth(-eta, weight * (1.0 - d))?;
         let phi_part = weight * d;
         w[i] = k2 + phi_part;
     }
@@ -3265,8 +3251,8 @@ fn survival_nonrigid_pilot_eta(
             event.len(),
         ));
     }
-    let loc_dense = location_anchor_design
-        .try_to_dense_arc("survival_nonrigid_pilot_eta: location anchor")?;
+    let loc_dense =
+        location_anchor_design.try_to_dense_arc("survival_nonrigid_pilot_eta: location anchor")?;
     let g_dense =
         logslope_design.try_to_dense_arc("survival_nonrigid_pilot_eta: logslope design")?;
     let p_loc = loc_dense.ncols();
@@ -4441,10 +4427,7 @@ impl SurvivalMarginalSlopeFamily {
         options: &BlockwiseFitOptions,
     ) -> Option<BlockwiseFitOptions> {
         let ctx = options.outer_eval_context.as_ref()?;
-        if !matches!(
-            ctx.scope,
-            crate::custom_family::EvalScope::OuterDerivative
-        ) {
+        if !matches!(ctx.scope, crate::custom_family::EvalScope::OuterDerivative) {
             return None;
         }
         let event_secondary: Vec<u8> = self
@@ -5757,15 +5740,14 @@ impl SurvivalMarginalSlopeFamily {
                     beta_h: beta_h_slice,
                     beta_w: beta_w_slice,
                 };
-                let batch = partition_substrate::build_host_partition_cells(
-                    &SurvivalPartitionBatchView {
+                let batch =
+                    partition_substrate::build_host_partition_cells(&SurvivalPartitionBatchView {
                         rows: std::slice::from_ref(&row),
                         score_warp: score_view,
                         link_dev: link_view,
                         score_dim: self.score_dim().max(1),
                         probit_frailty_scale: self.probit_frailty_scale(),
-                    },
-                );
+                    });
                 if batch.status.first().copied() == Some(0) {
                     return Ok(partition_substrate::row_cells_as_partition_vec(&batch, 0));
                 }
@@ -11231,7 +11213,12 @@ impl SurvivalMarginalSlopeFamily {
             let exit_bi = self.compute_survival_timepoint_bidirectional_exact(
                 row, &primary, q1, primary.q1, a1, g, beta_h, beta_w, dir1, dir2_arr,
             )?;
-            (Some(entry_ext2), Some(exit_ext2), Some(entry_bi), Some(exit_bi))
+            (
+                Some(entry_ext2),
+                Some(exit_ext2),
+                Some(entry_bi),
+                Some(exit_bi),
+            )
         } else {
             (None, None, None, None)
         };
@@ -13391,15 +13378,7 @@ impl SurvivalMarginalSlopeFamily {
         &self,
         block_states: &[ParameterBlockState],
         options: &BlockwiseFitOptions,
-    ) -> Result<
-        (
-            Arc<dyn HyperOperator>,
-            Array1<f64>,
-            f64,
-            Array1<f64>,
-        ),
-        String,
-    > {
+    ) -> Result<(Arc<dyn HyperOperator>, Array1<f64>, f64, Array1<f64>), String> {
         let slices = block_slices(self, block_states);
         let p_t = slices.time.len();
         let p_m = slices.marginal.len();
@@ -16910,14 +16889,14 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         options: &BlockwiseFitOptions,
     ) -> Result<f64, String> {
         let owned;
-        let options: &BlockwiseFitOptions =
-            match self.install_auto_outer_subsample_options(options) {
-                Some(cloned) => {
-                    owned = cloned;
-                    &owned
-                }
-                None => options,
-            };
+        let options: &BlockwiseFitOptions = match self.install_auto_outer_subsample_options(options)
+        {
+            Some(cloned) => {
+                owned = cloned;
+                &owned
+            }
+            None => options,
+        };
         SurvivalMarginalSlopeFamily::log_likelihood_only_with_options(self, block_states, options)
     }
 
@@ -17270,14 +17249,14 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         options: &BlockwiseFitOptions,
     ) -> Result<Option<Arc<dyn ExactNewtonJointPsiWorkspace>>, String> {
         let owned;
-        let options: &BlockwiseFitOptions =
-            match self.install_auto_outer_subsample_options(options) {
-                Some(cloned) => {
-                    owned = cloned;
-                    &owned
-                }
-                None => options,
-            };
+        let options: &BlockwiseFitOptions = match self.install_auto_outer_subsample_options(options)
+        {
+            Some(cloned) => {
+                owned = cloned;
+                &owned
+            }
+            None => options,
+        };
         Ok(Some(Arc::new(SurvivalMarginalSlopePsiWorkspace::new(
             self.clone(),
             block_states.to_vec(),
@@ -18413,9 +18392,7 @@ pub(crate) fn joint_training_design_preflight(
     for (i, &w) in weights.iter().enumerate() {
         if !w.is_finite() || w < 0.0 {
             return Err(SurvivalMarginalSlopeError::InvalidInput {
-                reason: format!(
-                    "joint preflight: weights[{i}] = {w} is not finite/non-negative",
-                ),
+                reason: format!("joint preflight: weights[{i}] = {w} is not finite/non-negative",),
             });
         }
         sqrt_w[i] = w.sqrt();
@@ -18685,17 +18662,15 @@ pub fn fit_survival_marginal_slope_terms(
             // structural pass already catches every column-level cross-
             // block alias (the only failure mode the biobank repro
             // surfaced).
-            let mut h_full =
-                ndarray::Array3::<f64>::zeros((n_rows, 4, 4));
+            let mut h_full = ndarray::Array3::<f64>::zeros((n_rows, 4, 4));
             for i in 0..n_rows {
                 for k in 0..4 {
                     h_full[[i, k, k]] = 1.0;
                 }
             }
             let row_hess = SurvivalRowHessian::from_full(h_full);
-            let compiled = compile_survival_parametric_designs(
-                dq0, dq1, dqd1, m_dq, m_dqd1, g_dg, &row_hess,
-            )?;
+            let compiled =
+                compile_survival_parametric_designs(dq0, dq1, dqd1, m_dq, m_dqd1, g_dg, &row_hess)?;
             let (dt, dm, dg) = compiled.drops_by_block;
             if dt + dm + dg > 0 {
                 log::info!(
@@ -18732,9 +18707,7 @@ pub fn fit_survival_marginal_slope_terms(
             // (e.g. densification budget exceeded) does NOT abort the
             // fit — the downstream audit / fail-closed gate remains
             // the source of truth.
-            log::warn!(
-                "[smgs phase-4b preflight] skipped: {reason}",
-            );
+            log::warn!("[smgs phase-4b preflight] skipped: {reason}",);
         }
     }
 
@@ -18847,9 +18820,11 @@ pub fn fit_survival_marginal_slope_terms(
             &cross_block_pilot_w,
         )?;
         match outcome {
-            FlexCompileOutcome::Reparameterised => Some(
-                stripe_score_warp_across_z_coords(base.block, base.runtime, &spec.z)?,
-            ),
+            FlexCompileOutcome::Reparameterised => Some(stripe_score_warp_across_z_coords(
+                base.block,
+                base.runtime,
+                &spec.z,
+            )?),
             FlexCompileOutcome::FullyAliased { reason } => {
                 log::warn!(
                     "[survival-marginal-slope cross-block identifiability] score-warp block fully aliased \
@@ -18984,7 +18959,10 @@ pub fn fit_survival_marginal_slope_terms(
             .transpose()?;
         let link_dev_dense = link_dev_prepared
             .as_ref()
-            .map(|ld| ld.runtime.design_at_training_with_residual(&cross_block_pilot_eta))
+            .map(|ld| {
+                ld.runtime
+                    .design_at_training_with_residual(&cross_block_pilot_eta)
+            })
             .transpose()?;
         let mut total_cols = time_dense.ncols() + marginal_dense.ncols() + logslope_dense.ncols();
         if let Some(ref m) = score_warp_dense {
@@ -19027,9 +19005,7 @@ pub fn fit_survival_marginal_slope_terms(
             &joint,
             crate::linalg::faer_ndarray::default_rrqr_rank_alpha(),
         )
-        .map_err(|e| {
-            format!("survival-marginal-slope joint rank diagnostic QR failed: {e}")
-        })?;
+        .map_err(|e| format!("survival-marginal-slope joint rank diagnostic QR failed: {e}"))?;
         if rank < total_cols {
             log::info!(
                 "[survival-marginal-slope joint rank diagnostic] rank={rank} < ncols={total_cols} \
@@ -19598,9 +19574,7 @@ pub fn fit_survival_marginal_slope_terms(
         // Sizing must match build_blocks(... OffForRigidPilot) or the cursor
         // walk inside the closure would slice past the end of the array.
         let rigid_rho = Array1::<f64>::zeros(
-            time_penalties_len
-                + marginal_design.penalties.len()
-                + logslope_design.penalties.len(),
+            time_penalties_len + marginal_design.penalties.len() + logslope_design.penalties.len(),
         );
         let rigid_blocks = build_blocks(
             &rigid_rho,
@@ -19937,12 +19911,11 @@ pub fn fit_survival_marginal_slope_terms(
             outer_eval_counter.set(eval_id.wrapping_add(1));
             let mut outer_options =
                 joint_hyper_options_for_outer_tolerance(options, exact_spatial_outer_tol);
-            outer_options.outer_eval_context =
-                Some(crate::custom_family::OuterEvalContext {
-                    rho: std::sync::Arc::new(rho.clone()),
-                    eval_id,
-                    scope: crate::custom_family::EvalScope::OuterDerivative,
-                });
+            outer_options.outer_eval_context = Some(crate::custom_family::OuterEvalContext {
+                rho: std::sync::Arc::new(rho.clone()),
+                eval_id,
+                scope: crate::custom_family::EvalScope::OuterDerivative,
+            });
             let eval = evaluate_custom_family_joint_hyper_shared(
                 &family,
                 &blocks,
@@ -20004,12 +19977,11 @@ pub fn fit_survival_marginal_slope_terms(
             outer_eval_counter.set(eval_id.wrapping_add(1));
             let mut outer_options =
                 joint_hyper_options_for_outer_tolerance(options, exact_spatial_outer_tol);
-            outer_options.outer_eval_context =
-                Some(crate::custom_family::OuterEvalContext {
-                    rho: std::sync::Arc::new(rho.clone()),
-                    eval_id,
-                    scope: crate::custom_family::EvalScope::OuterDerivative,
-                });
+            outer_options.outer_eval_context = Some(crate::custom_family::OuterEvalContext {
+                rho: std::sync::Arc::new(rho.clone()),
+                eval_id,
+                scope: crate::custom_family::EvalScope::OuterDerivative,
+            });
             let eval = evaluate_custom_family_joint_hyper_efs_shared(
                 &family,
                 &blocks,
@@ -20146,11 +20118,9 @@ mod tests {
             let d = event[i];
             let w = weights[i];
             let e = eta[i];
-            let (_, k2, _, _) = super::signed_probit_neglog_derivatives_up_to_fourth(
-                -e,
-                w * (1.0 - d),
-            )
-            .expect("probit k2");
+            let (_, k2, _, _) =
+                super::signed_probit_neglog_derivatives_up_to_fourth(-e, w * (1.0 - d))
+                    .expect("probit k2");
             let expected = k2 + w * d;
             approx::assert_relative_eq!(computed[i], expected, max_relative = 1e-12);
         }
@@ -23031,7 +23001,7 @@ mod tests {
             nullspace_dims: Vec::new(),
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
-gauge_priority: 100,
+            gauge_priority: 100,
         };
         let constraints = family
             .block_linear_constraints(&[], 0, &spec)
@@ -23100,7 +23070,7 @@ gauge_priority: 100,
             nullspace_dims: Vec::new(),
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
-gauge_priority: 100,
+            gauge_priority: 100,
         };
 
         let constraints = family
@@ -23351,7 +23321,7 @@ gauge_priority: 100,
             nullspace_dims: Vec::new(),
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
-gauge_priority: 100,
+            gauge_priority: 100,
         };
         let err = family
             .post_update_block_beta(
@@ -23422,7 +23392,7 @@ gauge_priority: 100,
             nullspace_dims: Vec::new(),
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
-gauge_priority: 100,
+            gauge_priority: 100,
         };
         let current = array![0.4, 7.0];
         // qd1 at current = 1.0·0.4 + 0.0·7.0 + 1e-6 ≈ 0.4 (feasible)
@@ -23497,7 +23467,7 @@ gauge_priority: 100,
             nullspace_dims: Vec::new(),
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
-gauge_priority: 100,
+            gauge_priority: 100,
         };
         // current qd1 = -1.0 + 1e-6 < guard → infeasible.
         let err = family
@@ -25292,10 +25262,21 @@ gauge_priority: 100,
             .row_flex_primary_third_contracted_exact(0, &block_states, &dir)
             .expect("cpu third contraction");
 
-        let (entry_base, exit_base, entry_ext, exit_ext, _e2, _x2, _eb, _xb, _qd1, qd1_idx, p_total) =
-            family
-                .flex_primary_timepoint_jets_for_test(0, &block_states, &dir, None)
-                .expect("jets");
+        let (
+            entry_base,
+            exit_base,
+            entry_ext,
+            exit_ext,
+            _e2,
+            _x2,
+            _eb,
+            _xb,
+            _qd1,
+            qd1_idx,
+            p_total,
+        ) = family
+            .flex_primary_timepoint_jets_for_test(0, &block_states, &dir, None)
+            .expect("jets");
 
         let entry_b = b10_pack_base(&entry_base);
         let exit_b = b10_pack_base(&exit_base);
@@ -25317,8 +25298,8 @@ gauge_priority: 100,
             entry_ext: &entry_d,
             exit_ext: &exit_d,
         };
-        let actual = crate::gpu::survival_flex::cpu_oracle_third_contraction(&inputs)
-            .expect("oracle third");
+        let actual =
+            crate::gpu::survival_flex::cpu_oracle_third_contraction(&inputs).expect("oracle third");
         assert_eq!(actual.len(), expected.nrows() * expected.ncols());
         b10_assert_parity(&actual, &expected, "block10_third");
     }

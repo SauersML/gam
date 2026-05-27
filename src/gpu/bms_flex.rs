@@ -787,7 +787,13 @@ mod bms_flex_gpu_tests {
         g_design: Vec<f64>,
     }
 
-    fn zero_buffers(n: usize, q_dim: usize, g_dim: usize, p_h: usize, p_w: usize) -> ScratchBuffers {
+    fn zero_buffers(
+        n: usize,
+        q_dim: usize,
+        g_dim: usize,
+        p_h: usize,
+        p_w: usize,
+    ) -> ScratchBuffers {
         let r = 2 + p_h + p_w;
         let p = q_dim + g_dim + p_h + p_w;
         // Trivial cell partition: one cell per row, zero coefficients.

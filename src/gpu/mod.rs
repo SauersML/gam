@@ -215,9 +215,7 @@ pub fn decide(kernel: GpuKernel, eligibility: GpuEligibility) -> GpuDecision {
         (GpuPolicy::Force, GpuEligibility::BackendNotCompiled) => {
             (false, "cpu-gpu-force-unsupported")
         }
-        (GpuPolicy::Force, _) if !runtime_available => {
-            (false, "cpu-gpu-force-runtime-unavailable")
-        }
+        (GpuPolicy::Force, _) if !runtime_available => (false, "cpu-gpu-force-runtime-unavailable"),
         // Under `force`, the workload-threshold gate is intentionally bypassed:
         // the user explicitly asked for GPU regardless of size.
         (GpuPolicy::Force, GpuEligibility::WorkloadBelowThreshold)
@@ -344,9 +342,7 @@ mod policy_tests {
 
     #[test]
     fn pirls_loop_admission_requires_runtime_size_and_known_family() {
-        use crate::gpu::policy::{
-            PirlsLoopAdmission, PirlsLoopCurvatureKind, PirlsLoopFamilyKind,
-        };
+        use crate::gpu::policy::{PirlsLoopAdmission, PirlsLoopCurvatureKind, PirlsLoopFamilyKind};
         let pol = GpuDispatchPolicy::default();
         let base = PirlsLoopAdmission {
             n: 80_000,

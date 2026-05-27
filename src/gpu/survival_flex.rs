@@ -1062,13 +1062,15 @@ pub fn try_row_batched_cell_moments(
         max_degree: batch.max_degree,
         residency: super::cubic_cell::CubicCellMomentResidency::Host,
     };
-    let out = super::cubic_cell::try_build_cubic_cell_derivative_moments(view)?
-        .ok_or_else(|| GpuError::DriverCallFailed {
-            reason: format!(
-                "survival_flex row-cells batch: substrate returned None for n_cells={} > 0 \
+    let out =
+        super::cubic_cell::try_build_cubic_cell_derivative_moments(view)?.ok_or_else(|| {
+            GpuError::DriverCallFailed {
+                reason: format!(
+                    "survival_flex row-cells batch: substrate returned None for n_cells={} > 0 \
                  (unexpected)",
-                batch.n_cells
-            ),
+                    batch.n_cells
+                ),
+            }
         })?;
 
     let (moments, mut status, stride) = match out {
@@ -1247,9 +1249,7 @@ impl<'a> SurvivalFlexInterceptSolveInputs<'a> {
 pub fn cpu_oracle_intercept_solve(
     inputs: &SurvivalFlexInterceptSolveInputs<'_>,
 ) -> SurvivalFlexInterceptSolveOutputs {
-    use crate::families::monotone_root::{
-        MonotoneRootError, solve_monotone_root_detailed,
-    };
+    use crate::families::monotone_root::{MonotoneRootError, solve_monotone_root_detailed};
     let mut a_root = vec![0.0_f64; inputs.n];
     let mut abs_deriv = vec![0.0_f64; inputs.n];
     let mut residual = vec![0.0_f64; inputs.n];
@@ -1577,11 +1577,11 @@ impl SurvivalFlexGpuBackend {
     ) -> Result<SurvivalFlexInterceptSolveOutputs, GpuError> {
         use cudarc::driver::{LaunchConfig, PushKernelArg};
         let module = self.compile_intercept_solve_module()?;
-        let func = module.load_function("survival_flex_intercept_solve").map_err(
-            |err| GpuError::DriverCallFailed {
+        let func = module
+            .load_function("survival_flex_intercept_solve")
+            .map_err(|err| GpuError::DriverCallFailed {
                 reason: format!("survival_flex intercept-solve load_function: {err}"),
-            },
-        )?;
+            })?;
 
         let n = inputs.n;
         let stream = &self.inner.stream;
@@ -1660,22 +1660,23 @@ impl SurvivalFlexGpuBackend {
             .map_err(|err| GpuError::DriverCallFailed {
                 reason: format!("survival_flex intercept-solve memcpy_dtoh a_root: {err}"),
             })?;
-        let abs_deriv = stream
-            .clone_dtoh(&d_abs_deriv)
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("survival_flex intercept-solve memcpy_dtoh abs_deriv: {err}"),
-            })?;
-        let residual = stream
-            .clone_dtoh(&d_residual)
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("survival_flex intercept-solve memcpy_dtoh residual: {err}"),
-            })?;
-        let status =
+        let abs_deriv =
             stream
-                .clone_dtoh(&d_status)
+                .clone_dtoh(&d_abs_deriv)
                 .map_err(|err| GpuError::DriverCallFailed {
-                    reason: format!("survival_flex intercept-solve memcpy_dtoh status: {err}"),
+                    reason: format!("survival_flex intercept-solve memcpy_dtoh abs_deriv: {err}"),
                 })?;
+        let residual =
+            stream
+                .clone_dtoh(&d_residual)
+                .map_err(|err| GpuError::DriverCallFailed {
+                    reason: format!("survival_flex intercept-solve memcpy_dtoh residual: {err}"),
+                })?;
+        let status = stream
+            .clone_dtoh(&d_status)
+            .map_err(|err| GpuError::DriverCallFailed {
+                reason: format!("survival_flex intercept-solve memcpy_dtoh status: {err}"),
+            })?;
         stream
             .synchronize()
             .map_err(|err| GpuError::DriverCallFailed {
@@ -1784,9 +1785,8 @@ pub fn cpu_oracle_evaluate_calibration(
     probit_scale: f64,
 ) -> Result<SurvivalFlexCalibrationFAndDerivs, String> {
     use crate::families::cubic_cell_kernel::{
-        DenestedCubicCell, cell_first_derivative_from_moments,
-        cell_second_derivative_from_moments, denested_cell_coefficient_partials,
-        denested_cell_second_partials, evaluate_cell_moments,
+        DenestedCubicCell, cell_first_derivative_from_moments, cell_second_derivative_from_moments,
+        denested_cell_coefficient_partials, denested_cell_second_partials, evaluate_cell_moments,
     };
 
     // `scale_coeff4(coef, scale) = [coef[0]*scale, coef[1]*scale, coef[2]*scale, coef[3]*scale]`.
@@ -1835,13 +1835,8 @@ pub fn cpu_oracle_evaluate_calibration(
         let dc_daa = scale_coeff4(dc_daa_pos, -probit_scale);
 
         f_a += cell_first_derivative_from_moments(&dc_da, &state.moments)?;
-        f_aa += cell_second_derivative_from_moments(
-            neg_cell,
-            &dc_da,
-            &dc_da,
-            &dc_daa,
-            &state.moments,
-        )?;
+        f_aa +=
+            cell_second_derivative_from_moments(neg_cell, &dc_da, &dc_da, &dc_daa, &state.moments)?;
     }
 
     Ok(SurvivalFlexCalibrationFAndDerivs {
@@ -1902,10 +1897,7 @@ pub fn try_device_evaluate_calibration(
     };
 
     let n_rows = partition_by_row.len();
-    if a_per_row.len() != n_rows
-        || q_per_row.len() != n_rows
-        || slope_per_row.len() != n_rows
-    {
+    if a_per_row.len() != n_rows || q_per_row.len() != n_rows || slope_per_row.len() != n_rows {
         return Err(GpuError::DriverCallFailed {
             reason: format!(
                 "try_device_evaluate_calibration: row-array length mismatch \
@@ -2304,9 +2296,7 @@ pub fn try_device_layer_b_jet(
     let stride = mom.stride;
     if stride < 10 {
         return Err(GpuError::DriverCallFailed {
-            reason: format!(
-                "layer_b: substrate returned stride={stride} < 10"
-            ),
+            reason: format!("layer_b: substrate returned stride={stride} < 10"),
         });
     }
     let ok_byte = super::cubic_cell::CubicCellMomentStatus::Ok as u8;
@@ -2418,9 +2408,7 @@ pub fn try_device_layer_b_jet(
                     "survival_flex layer_b d_u",
                 )
                 .map_err(|e| GpuError::DriverCallFailed {
-                    reason: format!(
-                        "layer_b row {row_idx} cell {local_idx} u={u}: d_u fold: {e}"
-                    ),
+                    reason: format!("layer_b row {row_idx} cell {local_idx} u={u}: d_u fold: {e}"),
                 })?;
                 d_u[u] += contrib;
             }
@@ -2809,9 +2797,13 @@ pub fn try_device_layer_c_jet(
                     -cc.coeff_au[u][2],
                     -cc.coeff_au[u][3],
                 ];
-                let fu = cell_first_derivative_from_moments(&neg_coeff_u, moments_row)
-                    .map_err(|e| GpuError::DriverCallFailed {
-                        reason: format!("layer_c row {row_idx} cell {local_idx} u={u}: f_u: {e}"),
+                let fu =
+                    cell_first_derivative_from_moments(&neg_coeff_u, moments_row).map_err(|e| {
+                        GpuError::DriverCallFailed {
+                            reason: format!(
+                                "layer_c row {row_idx} cell {local_idx} u={u}: f_u: {e}"
+                            ),
+                        }
                     })?;
                 f_u[u] += fu;
                 let fau = cell_second_derivative_from_moments(
@@ -2947,9 +2939,7 @@ pub fn try_device_layer_c_jet(
                     "survival_flex layer_c d_u",
                 )
                 .map_err(|e| GpuError::DriverCallFailed {
-                    reason: format!(
-                        "layer_c row {row_idx} cell {local_idx} u={u}: d_u fold: {e}"
-                    ),
+                    reason: format!("layer_c row {row_idx} cell {local_idx} u={u}: d_u fold: {e}"),
                 })?;
                 d_u[u] += contrib;
             }
@@ -2959,11 +2949,9 @@ pub fn try_device_layer_c_jet(
         let mut a_uv = vec![0.0_f64; p * p];
         for u in 0..p {
             for v in u..p {
-                let value = (f_uv[u * p + v]
-                    - d_u[u] * a_u[v]
-                    - d_u[v] * a_u[u]
-                    - f_aa * a_u[u] * a_u[v])
-                    / row.d_check;
+                let value =
+                    (f_uv[u * p + v] - d_u[u] * a_u[v] - d_u[v] * a_u[u] - f_aa * a_u[u] * a_u[v])
+                        / row.d_check;
                 a_uv[u * p + v] = value;
                 if v != u {
                     a_uv[v * p + u] = value;
@@ -3297,8 +3285,7 @@ pub fn try_device_layer_c_beta_d_uv(
             let mut eta_sq = [0.0_f64; POLY_CAP];
             let eta_sq_len = poly_mul_into(&eta_poly, &eta_poly, &mut eta_sq);
             let mut chi_eta_sq = [0.0_f64; POLY_CAP];
-            let chi_eta_sq_len =
-                poly_mul_into(&chi_poly, &eta_sq[..eta_sq_len], &mut chi_eta_sq);
+            let chi_eta_sq_len = poly_mul_into(&chi_poly, &eta_sq[..eta_sq_len], &mut chi_eta_sq);
 
             // Pre-compute eta_u_poly[u] and chi_u_poly[u] per primary.
             let mut eta_u_poly: Vec<[f64; 4]> = Vec::with_capacity(p);
@@ -3362,11 +3349,8 @@ pub fn try_device_layer_c_beta_d_uv(
                     let mut chi_u_v_eta = [0.0_f64; POLY_CAP];
                     let len_a = poly_mul_into(&chi_u_poly[v], &eta_poly, &mut chi_u_v_eta);
                     let mut term2 = [0.0_f64; POLY_CAP];
-                    let term2_len = poly_mul_into(
-                        &chi_u_v_eta[..len_a],
-                        &eta_u_poly[u],
-                        &mut term2,
-                    );
+                    let term2_len =
+                        poly_mul_into(&chi_u_v_eta[..len_a], &eta_u_poly[u], &mut term2);
                     for k in 0..term2_len {
                         term2[k] = -term2[k];
                     }
@@ -3375,11 +3359,8 @@ pub fn try_device_layer_c_beta_d_uv(
                     let mut chi_u_u_eta = [0.0_f64; POLY_CAP];
                     let len_b = poly_mul_into(&chi_u_poly[u], &eta_poly, &mut chi_u_u_eta);
                     let mut term3 = [0.0_f64; POLY_CAP];
-                    let term3_len = poly_mul_into(
-                        &chi_u_u_eta[..len_b],
-                        &eta_u_poly[v],
-                        &mut term3,
-                    );
+                    let term3_len =
+                        poly_mul_into(&chi_u_u_eta[..len_b], &eta_u_poly[v], &mut term3);
                     for k in 0..term3_len {
                         term3[k] = -term3[k];
                     }
@@ -3407,11 +3388,8 @@ pub fn try_device_layer_c_beta_d_uv(
                     // term5 = chi · eta² · eta_u[u] · eta_u[v]
                     //       = chi_eta_sq · eta_u[u] · eta_u[v]
                     let mut t5_a = [0.0_f64; POLY_CAP];
-                    let len_e = poly_mul_into(
-                        &chi_eta_sq[..chi_eta_sq_len],
-                        &eta_u_poly[u],
-                        &mut t5_a,
-                    );
+                    let len_e =
+                        poly_mul_into(&chi_eta_sq[..chi_eta_sq_len], &eta_u_poly[u], &mut t5_a);
                     let mut term5 = [0.0_f64; POLY_CAP];
                     let term5_len = poly_mul_into(&t5_a[..len_e], &eta_u_poly[v], &mut term5);
 
@@ -3544,9 +3522,7 @@ pub fn try_device_step5_primary_assembly(
         let check = |label: &str, len: usize, expected: usize| -> Result<(), GpuError> {
             if len != expected {
                 return Err(GpuError::DriverCallFailed {
-                    reason: format!(
-                        "step5 row {i}: {label}.len()={len} expected {expected}"
-                    ),
+                    reason: format!("step5 row {i}: {label}.len()={len} expected {expected}"),
                 });
             }
             Ok(())
@@ -3625,8 +3601,7 @@ pub fn try_device_step5_primary_assembly(
                     + exit_surv_u1 * r.exit.eta_uv[u * p + v];
                 val += r.wi
                     * r.di
-                    * (r.exit.eta_u[u] * r.exit.eta_u[v]
-                        + r.exit.eta * r.exit.eta_uv[u * p + v]);
+                    * (r.exit.eta_u[u] * r.exit.eta_u[v] + r.exit.eta * r.exit.eta_uv[u * p + v]);
                 val -= r.wi
                     * r.di
                     * (r.exit.chi_uv[u * p + v] / r.exit.chi
@@ -3636,8 +3611,7 @@ pub fn try_device_step5_primary_assembly(
                 }
                 val += r.wi
                     * r.di
-                    * (r.exit.d_uv[u * p + v] / r.exit.d
-                        - (r.exit.d_u[u] * r.exit.d_u[v]) / d_sq);
+                    * (r.exit.d_uv[u * p + v] / r.exit.d - (r.exit.d_u[u] * r.exit.d_u[v]) / d_sq);
                 if u == r.qd1_index && v == r.qd1_index {
                     val += r.wi * r.di / (r.qd1 * r.qd1);
                 }
@@ -4099,16 +4073,14 @@ pub fn cpu_oracle_third_contraction(
             // Entry probit
             val += entry_u3 * entry_eta_dir * entry.eta_u[u] * entry.eta_u[v];
             val += entry_u2
-                * (entry_eta_u_dir[u] * entry.eta_u[v]
-                    + entry.eta_u[u] * entry_eta_u_dir[v]);
+                * (entry_eta_u_dir[u] * entry.eta_u[v] + entry.eta_u[u] * entry_eta_u_dir[v]);
             val += entry_u2 * entry_eta_dir * b10_at(&entry.eta_uv, u, v, p);
             val += entry_u1 * b10_at(&entry_ext.eta_uv_dir, u, v, p);
 
             // Exit probit survival
             val += exit_u3 * exit_eta_dir * exit.eta_u[u] * exit.eta_u[v];
-            val += exit_u2
-                * (exit_eta_u_dir[u] * exit.eta_u[v]
-                    + exit.eta_u[u] * exit_eta_u_dir[v]);
+            val +=
+                exit_u2 * (exit_eta_u_dir[u] * exit.eta_u[v] + exit.eta_u[u] * exit_eta_u_dir[v]);
             val += exit_u2 * exit_eta_dir * b10_at(&exit.eta_uv, u, v, p);
             val += exit_u1 * b10_at(&exit_ext.eta_uv_dir, u, v, p);
 
@@ -4124,27 +4096,22 @@ pub fn cpu_oracle_third_contraction(
             let chi_uv_over_chi_dir = (b10_at(&exit_ext.chi_uv_dir, u, v, p) * chi
                 - b10_at(&exit.chi_uv, u, v, p) * exit_chi_dir)
                 * chi_inv2;
-            let chi_u_chi_v_over_chi2_dir = (exit_chi_u_dir[u] * exit.chi_u[v]
-                + exit.chi_u[u] * exit_chi_u_dir[v])
-                * chi_inv2
-                - 2.0 * exit.chi_u[u] * exit.chi_u[v] * exit_chi_dir * chi_inv3;
+            let chi_u_chi_v_over_chi2_dir =
+                (exit_chi_u_dir[u] * exit.chi_u[v] + exit.chi_u[u] * exit_chi_u_dir[v]) * chi_inv2
+                    - 2.0 * exit.chi_u[u] * exit.chi_u[v] * exit_chi_dir * chi_inv3;
             val -= wi * di * (chi_uv_over_chi_dir - chi_u_chi_v_over_chi2_dir);
 
             // Event D
             let d_uv_over_d_dir = (b10_at(&exit_ext.d_uv_dir, u, v, p) * d_val
                 - b10_at(&exit.d_uv, u, v, p) * exit_d_dir)
                 * d_inv2;
-            let d_u_d_v_over_d2_dir = (exit_d_u_dir[u] * exit.d_u[v]
-                + exit.d_u[u] * exit_d_u_dir[v])
-                * d_inv2
-                - 2.0 * exit.d_u[u] * exit.d_u[v] * exit_d_dir * d_inv3;
+            let d_u_d_v_over_d2_dir =
+                (exit_d_u_dir[u] * exit.d_u[v] + exit.d_u[u] * exit_d_u_dir[v]) * d_inv2
+                    - 2.0 * exit.d_u[u] * exit.d_u[v] * exit_d_dir * d_inv3;
             val += wi * di * (d_uv_over_d_dir - d_u_d_v_over_d2_dir);
 
             // qd1 term
-            if inputs.qd1_index < p
-                && u == inputs.qd1_index
-                && v == inputs.qd1_index
-            {
+            if inputs.qd1_index < p && u == inputs.qd1_index && v == inputs.qd1_index {
                 val += wi * di * (-2.0 / (inputs.qd1 * inputs.qd1 * inputs.qd1)) * qd1_dir;
             }
 
@@ -4384,9 +4351,7 @@ pub fn cpu_oracle_fourth_contraction(
             p
         ));
     }
-    if inputs.dir_u.iter().all(|v| v.abs() == 0.0)
-        || inputs.dir_v.iter().all(|v| v.abs() == 0.0)
-    {
+    if inputs.dir_u.iter().all(|v| v.abs() == 0.0) || inputs.dir_v.iter().all(|v| v.abs() == 0.0) {
         return Ok(vec![0.0_f64; p * p]);
     }
     let chi = inputs.exit_base.chi;
@@ -4801,12 +4766,12 @@ mod survival_flex_gpu_tests {
         // Row 2: a whole-line affine tail (c2 = c3 = 0).
         // Together: 1 + 2 + 1 = 4 cells covering Affine / NonAffineFinite
         // (both subbranches) / AffineTail.
-        let left   = [-1.5_f64, -0.8, 0.3, f64::NEG_INFINITY];
-        let right  = [ 0.0_f64,  0.3, 1.4, f64::INFINITY    ];
-        let c0     = [ 0.15_f64,-0.20, 0.10, 0.05];
-        let c1     = [-0.30_f64, 0.45,-0.20,-0.10];
-        let c2     = [ 0.00_f64, 0.35, 0.25, 0.00];
-        let c3     = [ 0.00_f64, 0.00, 0.18, 0.00];
+        let left = [-1.5_f64, -0.8, 0.3, f64::NEG_INFINITY];
+        let right = [0.0_f64, 0.3, 1.4, f64::INFINITY];
+        let c0 = [0.15_f64, -0.20, 0.10, 0.05];
+        let c1 = [-0.30_f64, 0.45, -0.20, -0.10];
+        let c2 = [0.00_f64, 0.35, 0.25, 0.00];
+        let c3 = [0.00_f64, 0.00, 0.18, 0.00];
         let row_offsets = [0usize, 1, 3, 4];
         let max_degree = 24;
         let batch = SurvivalFlexRowCellsBatch {
@@ -4924,7 +4889,9 @@ mod survival_flex_gpu_tests {
             assert!(
                 rel <= 1e-9,
                 "row {row}: oracle a={} vs analytic={} rel={}",
-                oracle.a_root[row], want, rel
+                oracle.a_root[row],
+                want,
+                rel
             );
             assert!(
                 oracle.residual[row].abs() <= 1e-9,
@@ -4938,9 +4905,9 @@ mod survival_flex_gpu_tests {
     fn survival_flex_intercept_solve_device_matches_oracle() {
         // Mix tight + loose warm-starts to exercise Newton-probe and
         // bracket-expand paths.
-        let alpha = [ 1.0,  2.0, -1.0,  0.5,  1.0,  3.0];
-        let beta  = [ 1.0,  0.5,  1.5,  2.0,  0.8,  1.2];
-        let gamma = [-2.0, -3.0,  4.0, -1.5, -0.5, -4.5];
+        let alpha = [1.0, 2.0, -1.0, 0.5, 1.0, 3.0];
+        let beta = [1.0, 0.5, 1.5, 2.0, 0.8, 1.2];
+        let gamma = [-2.0, -3.0, 4.0, -1.5, -0.5, -4.5];
         // Warm-starts: rows 0-1 already near the root, rows 2-5 far away.
         let truth: Vec<f64> = (0..6)
             .map(|i| analytic_root(alpha[i], beta[i], gamma[i]))
@@ -4985,14 +4952,18 @@ mod survival_flex_gpu_tests {
                     assert!(
                         rel <= 1e-9,
                         "row {row}: device a={} vs analytic={} rel={}",
-                        dev.a_root[row], want, rel
+                        dev.a_root[row],
+                        want,
+                        rel
                     );
                     let pair_rel = (dev.a_root[row] - oracle.a_root[row]).abs()
                         / (1.0 + oracle.a_root[row].abs());
                     assert!(
                         pair_rel <= 1e-9,
                         "row {row}: device/oracle a_root mismatch dev={} oracle={} rel={}",
-                        dev.a_root[row], oracle.a_root[row], pair_rel
+                        dev.a_root[row],
+                        oracle.a_root[row],
+                        pair_rel
                     );
                     let resid_ok = dev.residual[row].abs() <= 1e-9
                         || (dev.residual[row] - oracle.residual[row]).abs()
@@ -5084,13 +5055,17 @@ mod survival_flex_gpu_tests {
             // 4-point central FD of F(a):
             //   F'(a) ≈ (-F(a+2h) + 8 F(a+h) - 8 F(a-h) + F(a-2h)) / (12 h)
             let f_p2 = cpu_oracle_evaluate_calibration(&cells, a + 2.0 * h, q, slope, probit_scale)
-                .expect("oracle +2h").f;
+                .expect("oracle +2h")
+                .f;
             let f_p1 = cpu_oracle_evaluate_calibration(&cells, a + h, q, slope, probit_scale)
-                .expect("oracle +h").f;
+                .expect("oracle +h")
+                .f;
             let f_m1 = cpu_oracle_evaluate_calibration(&cells, a - h, q, slope, probit_scale)
-                .expect("oracle -h").f;
+                .expect("oracle -h")
+                .f;
             let f_m2 = cpu_oracle_evaluate_calibration(&cells, a - 2.0 * h, q, slope, probit_scale)
-                .expect("oracle -2h").f;
+                .expect("oracle -2h")
+                .f;
             let fd = (-f_p2 + 8.0 * f_p1 - 8.0 * f_m1 + f_m2) / (12.0 * h);
 
             let abs = (out.f_prime - fd).abs();
@@ -5098,7 +5073,10 @@ mod survival_flex_gpu_tests {
             assert!(
                 abs <= 5e-9 || rel <= 5e-7,
                 "F' parity at a={a}: oracle={} fd={} abs_err={} rel_err={}",
-                out.f_prime, fd, abs, rel
+                out.f_prime,
+                fd,
+                abs,
+                rel
             );
         }
     }
@@ -5116,14 +5094,20 @@ mod survival_flex_gpu_tests {
                 .expect("oracle must succeed on the fixture");
             // 4-point central FD of F'(a) (using the analytic F' the oracle
             // already returns — keeps the FD inner sample to one quantity).
-            let fp_p2 = cpu_oracle_evaluate_calibration(&cells, a + 2.0 * h, q, slope, probit_scale)
-                .expect("oracle +2h").f_prime;
+            let fp_p2 =
+                cpu_oracle_evaluate_calibration(&cells, a + 2.0 * h, q, slope, probit_scale)
+                    .expect("oracle +2h")
+                    .f_prime;
             let fp_p1 = cpu_oracle_evaluate_calibration(&cells, a + h, q, slope, probit_scale)
-                .expect("oracle +h").f_prime;
+                .expect("oracle +h")
+                .f_prime;
             let fp_m1 = cpu_oracle_evaluate_calibration(&cells, a - h, q, slope, probit_scale)
-                .expect("oracle -h").f_prime;
-            let fp_m2 = cpu_oracle_evaluate_calibration(&cells, a - 2.0 * h, q, slope, probit_scale)
-                .expect("oracle -2h").f_prime;
+                .expect("oracle -h")
+                .f_prime;
+            let fp_m2 =
+                cpu_oracle_evaluate_calibration(&cells, a - 2.0 * h, q, slope, probit_scale)
+                    .expect("oracle -2h")
+                    .f_prime;
             let fd = (-fp_p2 + 8.0 * fp_p1 - 8.0 * fp_m1 + fp_m2) / (12.0 * h);
 
             let abs = (out.f_double_prime - fd).abs();
@@ -5135,7 +5119,10 @@ mod survival_flex_gpu_tests {
             assert!(
                 abs <= 5e-6 || rel <= 5e-5,
                 "F'' parity at a={a}: oracle={} fd={} abs_err={} rel_err={}",
-                out.f_double_prime, fd, abs, rel
+                out.f_double_prime,
+                fd,
+                abs,
+                rel
             );
         }
     }
@@ -5261,9 +5248,7 @@ mod survival_flex_gpu_tests {
                 // Substrate non-OK status — skip; oracle remains the
                 // authoritative reference.  Print so CI can flag the
                 // skip on the substrate side.
-                eprintln!(
-                    "[step4a parity] substrate returned None; skipping parity check"
-                );
+                eprintln!("[step4a parity] substrate returned None; skipping parity check");
                 return;
             }
             Err(err) => panic!("device evaluator failed: {err:?}"),
@@ -5276,14 +5261,9 @@ mod survival_flex_gpu_tests {
             .map(|((a, q), s)| (*a, *q, *s))
             .enumerate()
         {
-            let oracle = cpu_oracle_evaluate_calibration(
-                &partition_by_row[row],
-                a,
-                q,
-                slope,
-                probit_scale,
-            )
-            .expect("oracle must succeed on fixture");
+            let oracle =
+                cpu_oracle_evaluate_calibration(&partition_by_row[row], a, q, slope, probit_scale)
+                    .expect("oracle must succeed on fixture");
             let dev = device_out[row];
             let chk = |label: &str, d: f64, o: f64| {
                 let abs = (d - o).abs();
@@ -5385,9 +5365,7 @@ mod survival_flex_gpu_tests {
         let out = match try_device_layer_b_jet(std::slice::from_ref(&row)) {
             Ok(Some(o)) => o,
             Ok(None) => {
-                eprintln!(
-                    "[step4b q_index] substrate non-OK or empty; skipping"
-                );
+                eprintln!("[step4b q_index] substrate non-OK or empty; skipping");
                 return;
             }
             Err(err) => panic!("layer b q_index test failed: {err:?}"),
@@ -5598,11 +5576,7 @@ mod survival_flex_gpu_tests {
                 [0.015, -0.005, 0.0, 0.0],
                 [-0.01, 0.008, 0.0, 0.0],
             ],
-            coeff_bu: vec![
-                [0.0; 4],
-                [0.03, 0.01, 0.0, 0.0],
-                [0.0; 4],
-            ],
+            coeff_bu: vec![[0.0; 4], [0.03, 0.01, 0.0, 0.0], [0.0; 4]],
         };
         let rho = vec![0.11_f64, 0.23, -0.05];
         let tau = vec![-0.04_f64, 0.07, 0.02];
@@ -5736,29 +5710,17 @@ mod survival_flex_gpu_tests {
                 [0.015, -0.005, 0.0, 0.0],
                 [-0.01, 0.008, 0.0, 0.0],
             ],
-            coeff_bu: vec![
-                [0.0; 4],
-                [0.03, 0.01, 0.0, 0.0],
-                [0.0; 4],
-            ],
+            coeff_bu: vec![[0.0; 4], [0.03, 0.01, 0.0, 0.0], [0.0; 4]],
             coeff_aau: vec![
                 [0.005, 0.002, 0.0, 0.0],
                 [0.003, -0.001, 0.0, 0.0],
                 [-0.002, 0.001, 0.0, 0.0],
             ],
-            coeff_abu: vec![
-                [0.0; 4],
-                [0.008, 0.002, 0.0, 0.0],
-                [0.0; 4],
-            ],
+            coeff_abu: vec![[0.0; 4], [0.008, 0.002, 0.0, 0.0], [0.0; 4]],
         };
         let a_u = vec![0.21_f64, -0.13, 0.07];
         // Symmetric a_uv.
-        let a_uv = vec![
-            0.04, -0.03, 0.02,
-            -0.03, 0.11, -0.01,
-            0.02, -0.01, 0.06_f64,
-        ];
+        let a_uv = vec![0.04, -0.03, 0.02, -0.03, 0.11, -0.01, 0.02, -0.01, 0.06_f64];
 
         let row = SurvivalFlexLayerCBetaRowInputs {
             partition_cells: std::slice::from_ref(&cell),
@@ -5892,28 +5854,16 @@ mod survival_flex_gpu_tests {
         // symmetrically.
         let p = 3usize;
         let entry_eta_u = vec![0.3_f64, -0.2, 0.1];
-        let entry_eta_uv = vec![
-            0.05, -0.02, 0.01,
-            -0.02, 0.08, -0.03,
-            0.01, -0.03, 0.04_f64,
-        ];
+        let entry_eta_uv = vec![0.05, -0.02, 0.01, -0.02, 0.08, -0.03, 0.01, -0.03, 0.04_f64];
         let exit_eta_u = vec![0.4_f64, 0.1, -0.2];
-        let exit_eta_uv = vec![
-            0.1, 0.03, -0.02,
-            0.03, -0.04, 0.05,
-            -0.02, 0.05, 0.06_f64,
-        ];
+        let exit_eta_uv = vec![0.1, 0.03, -0.02, 0.03, -0.04, 0.05, -0.02, 0.05, 0.06_f64];
         let exit_chi_u = vec![0.07_f64, -0.04, 0.02];
         let exit_chi_uv = vec![
-            0.01, -0.005, 0.002,
-            -0.005, 0.015, -0.003,
-            0.002, -0.003, 0.008_f64,
+            0.01, -0.005, 0.002, -0.005, 0.015, -0.003, 0.002, -0.003, 0.008_f64,
         ];
         let exit_d_u = vec![0.06_f64, 0.02, -0.01];
         let exit_d_uv = vec![
-            0.012, 0.004, -0.002,
-            0.004, 0.01, 0.003,
-            -0.002, 0.003, 0.007_f64,
+            0.012, 0.004, -0.002, 0.004, 0.01, 0.003, -0.002, 0.003, 0.007_f64,
         ];
         let zero_p = vec![0.0_f64; p];
         let zero_pp = vec![0.0_f64; p * p];

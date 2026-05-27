@@ -12374,11 +12374,14 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             .into());
         };
         if block_log_lambda.len() != spec.penalties.len() {
-            return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-                "block {b} log-smoothing parameter length {} does not match penalties {}",
-                block_log_lambda.len(),
-                spec.penalties.len()
-            ) }.into());
+            return Err(CustomFamilyError::DimensionMismatch {
+                reason: format!(
+                    "block {b} log-smoothing parameter length {} does not match penalties {}",
+                    block_log_lambda.len(),
+                    spec.penalties.len()
+                ),
+            }
+            .into());
         }
 
         let p = spec.design.ncols();
@@ -22141,7 +22144,7 @@ mod tests {
             nullspace_dims: vec![1],
             initial_log_lambdas: rho.clone(),
             initial_beta: Some(beta.clone()),
-gauge_priority: 100,
+            gauge_priority: 100,
         };
         let specs = vec![spec];
         let inner = BlockwiseInnerResult {
@@ -22320,7 +22323,7 @@ gauge_priority: 100,
                 nullspace_dims: vec![1],
                 initial_log_lambdas: rho.clone(),
                 initial_beta: Some(beta.clone()),
-gauge_priority: 100,
+                gauge_priority: 100,
             };
             let specs = vec![spec];
             let inner = BlockwiseInnerResult {
@@ -22975,7 +22978,7 @@ gauge_priority: 100,
             nullspace_dims: wiggle_block.nullspace_dims.clone(),
             initial_log_lambdas: array![0.1],
             initial_beta: Some(Array1::from_elem(wiggle_block.design.ncols(), 0.03)),
-gauge_priority: 100,
+            gauge_priority: 100,
         };
         let family = BinomialLocationScaleWiggleFamily {
             y: base.y,
@@ -23021,7 +23024,7 @@ gauge_priority: 100,
             nullspace_dims: Vec::new(),
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
-gauge_priority: 100,
+            gauge_priority: 100,
         };
         let specs = vec![mk_spec(12), mk_spec(20), mk_spec(8)];
         assert_eq!(
@@ -23055,7 +23058,7 @@ gauge_priority: 100,
             nullspace_dims: vec![0; retained_rho_dim],
             initial_log_lambdas: Array1::zeros(retained_rho_dim),
             initial_beta: None,
-gauge_priority: 100,
+            gauge_priority: 100,
         };
         let coefficient_hessian_cost = n_train * (p as u64) * (p as u64);
 
@@ -23178,7 +23181,7 @@ gauge_priority: 100,
             nullspace_dims: Vec::new(),
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
-gauge_priority: 100,
+            gauge_priority: 100,
         };
         let specs = vec![mk_spec(500, 10), mk_spec(500, 14)];
         let h_cost = default_coefficient_hessian_cost(&specs);
@@ -23256,7 +23259,7 @@ gauge_priority: 100,
             nullspace_dims: Vec::new(),
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
-gauge_priority: 100,
+            gauge_priority: 100,
         };
         let specs = vec![mk_spec("a", 2), mk_spec("b", 3)];
 
@@ -23291,7 +23294,7 @@ gauge_priority: 100,
             nullspace_dims: Vec::new(),
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
-gauge_priority: 100,
+            gauge_priority: 100,
         };
 
         let err = match constrained_warm_start_from_cached_beta(1, &[spec], &array![1.0, f64::NAN])
@@ -23318,7 +23321,7 @@ gauge_priority: 100,
             nullspace_dims: Vec::new(),
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
-gauge_priority: 100,
+            gauge_priority: 100,
         };
         let mut state = CustomOuterState::new(None);
         state
@@ -23489,7 +23492,7 @@ gauge_priority: 100,
             nullspace_dims: vec![],
             initial_log_lambdas: array![0.0],
             initial_beta: None,
-gauge_priority: 100,
+            gauge_priority: 100,
         }];
         let (gradient, hessian) = custom_family_outer_derivatives(
             &OneBlockFirstOrderOnlyFamily,
@@ -23743,7 +23746,7 @@ gauge_priority: 100,
             nullspace_dims: vec![],
             initial_log_lambdas: array![0.0],
             initial_beta: None,
-gauge_priority: 100,
+            gauge_priority: 100,
         }];
         let options = BlockwiseFitOptions {
             use_remlobjective: true,
@@ -23795,7 +23798,7 @@ gauge_priority: 100,
             nullspace_dims: vec![],
             initial_log_lambdas: array![0.0],
             initial_beta: None,
-gauge_priority: 100,
+            gauge_priority: 100,
         }];
         let options = BlockwiseFitOptions {
             use_remlobjective: true,
@@ -23882,7 +23885,7 @@ gauge_priority: 100,
             nullspace_dims: vec![],
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![0.75]),
-gauge_priority: 100,
+            gauge_priority: 100,
         };
         let options = BlockwiseFitOptions {
             inner_tol: 1e-11,
@@ -23983,7 +23986,7 @@ gauge_priority: 100,
             nullspace_dims: vec![],
             initial_log_lambdas: array![0.0],
             initial_beta: None,
-gauge_priority: 100,
+            gauge_priority: 100,
         }];
         let options = BlockwiseFitOptions {
             use_remlobjective: true,
@@ -24929,7 +24932,7 @@ gauge_priority: 100,
             nullspace_dims: vec![],
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(array![0.0]),
-gauge_priority: 100,
+            gauge_priority: 100,
         };
         let options = BlockwiseFitOptions {
             inner_max_cycles: 1,
@@ -24976,7 +24979,7 @@ gauge_priority: 100,
             nullspace_dims: vec![],
             initial_log_lambdas: array![10.0_f64.ln()],
             initial_beta: Some(array![1.0]),
-gauge_priority: 100,
+            gauge_priority: 100,
         };
         let options = BlockwiseFitOptions {
             inner_max_cycles: 20,
@@ -25026,7 +25029,7 @@ gauge_priority: 100,
             nullspace_dims: vec![],
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(array![1.0]),
-gauge_priority: 100,
+            gauge_priority: 100,
         };
         let options = BlockwiseFitOptions {
             inner_max_cycles: 1,
@@ -25080,7 +25083,7 @@ gauge_priority: 100,
             nullspace_dims: vec![],
             initial_log_lambdas: array![0.2],
             initial_beta: None,
-gauge_priority: 100,
+            gauge_priority: 100,
         };
         let options = BlockwiseFitOptions {
             use_remlobjective: true,
@@ -25150,7 +25153,7 @@ gauge_priority: 100,
             nullspace_dims: vec![],
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![0.0]),
-gauge_priority: 100,
+            gauge_priority: 100,
         };
         let options = BlockwiseFitOptions {
             use_remlobjective: true,
@@ -25185,7 +25188,7 @@ gauge_priority: 100,
             nullspace_dims: vec![],
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(array![0.0]),
-gauge_priority: 100,
+            gauge_priority: 100,
         };
         let spec1 = ParameterBlockSpec {
             name: "block1".to_string(),
@@ -25195,7 +25198,7 @@ gauge_priority: 100,
             nullspace_dims: vec![],
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(array![0.0]),
-gauge_priority: 100,
+            gauge_priority: 100,
         };
         let options = BlockwiseFitOptions {
             inner_max_cycles: 1,
@@ -25475,7 +25478,7 @@ gauge_priority: 100,
             nullspace_dims: vec![],
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![0.0]),
-gauge_priority: 100,
+            gauge_priority: 100,
         };
         let spec1 = ParameterBlockSpec {
             name: "block1".to_string(),
@@ -25488,7 +25491,7 @@ gauge_priority: 100,
             nullspace_dims: vec![],
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![0.0]),
-gauge_priority: 100,
+            gauge_priority: 100,
         };
         let options = BlockwiseFitOptions {
             use_remlobjective: true,
@@ -25524,7 +25527,7 @@ gauge_priority: 100,
             nullspace_dims: vec![],
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(array![0.0]),
-gauge_priority: 100,
+            gauge_priority: 100,
         };
         let options = BlockwiseFitOptions {
             use_remlobjective: true,
@@ -25557,7 +25560,7 @@ gauge_priority: 100,
             nullspace_dims: vec![],
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(array![0.0]),
-gauge_priority: 100,
+            gauge_priority: 100,
         };
         let deriv = CustomFamilyBlockPsiDerivative {
             penalty_index: None,
@@ -25618,7 +25621,7 @@ gauge_priority: 100,
             nullspace_dims: vec![],
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(array![0.0]),
-gauge_priority: 100,
+            gauge_priority: 100,
         };
         let result = fit_custom_family(
             &OneBlockIndefinitePseudoLaplaceFamily,
@@ -25745,7 +25748,7 @@ gauge_priority: 100,
             nullspace_dims: vec![],
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(array![0.0, 0.0]),
-gauge_priority: 100,
+            gauge_priority: 100,
         };
         let fit = fit_custom_family(
             &OneBlockNearlySymmetricPseudoLaplaceFamily,
@@ -25949,7 +25952,7 @@ gauge_priority: 100,
             nullspace_dims: vec![],
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![0.0]),
-gauge_priority: 100,
+            gauge_priority: 100,
         };
         let log_sigmaspec = ParameterBlockSpec {
             name: "log_sigma".to_string(),
@@ -25962,7 +25965,7 @@ gauge_priority: 100,
             nullspace_dims: vec![],
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![0.0]),
-gauge_priority: 100,
+            gauge_priority: 100,
         };
         let threshold_design = thresholdspec.design.clone();
         let log_sigma_design = log_sigmaspec.design.clone();
@@ -26055,7 +26058,7 @@ gauge_priority: 100,
             nullspace_dims: vec![],
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![0.2]),
-gauge_priority: 100,
+            gauge_priority: 100,
         };
         let log_sigmaspec = ParameterBlockSpec {
             name: "log_sigma".to_string(),
@@ -26068,7 +26071,7 @@ gauge_priority: 100,
             nullspace_dims: vec![],
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![-0.1]),
-gauge_priority: 100,
+            gauge_priority: 100,
         };
         let threshold_design = thresholdspec.design.clone();
         let log_sigma_design = log_sigmaspec.design.clone();
@@ -26169,7 +26172,7 @@ gauge_priority: 100,
             nullspace_dims: vec![],
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![0.15]),
-gauge_priority: 100,
+            gauge_priority: 100,
         };
         let log_sigmaspec = ParameterBlockSpec {
             name: "log_sigma".to_string(),
@@ -26182,7 +26185,7 @@ gauge_priority: 100,
             nullspace_dims: vec![],
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![-0.05]),
-gauge_priority: 100,
+            gauge_priority: 100,
         };
         let threshold_design = thresholdspec.design.clone();
         let log_sigma_design = log_sigmaspec.design.clone();
@@ -26351,7 +26354,7 @@ gauge_priority: 100,
             nullspace_dims: vec![],
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![0.2]),
-gauge_priority: 100,
+            gauge_priority: 100,
         };
         let log_sigmaspec = ParameterBlockSpec {
             name: "log_sigma".to_string(),
@@ -26364,7 +26367,7 @@ gauge_priority: 100,
             nullspace_dims: vec![],
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![-0.1]),
-gauge_priority: 100,
+            gauge_priority: 100,
         };
         let threshold_design = thresholdspec.design.clone();
         let log_sigma_design = log_sigmaspec.design.clone();
@@ -26490,7 +26493,7 @@ gauge_priority: 100,
             nullspace_dims: vec![],
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(array![1.5]),
-gauge_priority: 100,
+            gauge_priority: 100,
         };
         let family = OneBlockConstrainedExactFamily {
             target: 0.0,
@@ -26543,7 +26546,7 @@ gauge_priority: 100,
             nullspace_dims: vec![],
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(array![1.5]),
-gauge_priority: 100,
+            gauge_priority: 100,
         };
         let states = vec![ParameterBlockState {
             beta: array![1.5],
@@ -26867,7 +26870,7 @@ gauge_priority: 100,
             nullspace_dims: vec![],
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(array![0.0]),
-gauge_priority: 100,
+            gauge_priority: 100,
         };
         let states = vec![ParameterBlockState {
             beta: array![0.0],
@@ -26914,7 +26917,7 @@ gauge_priority: 100,
             nullspace_dims: vec![],
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![0.0]),
-gauge_priority: 100,
+            gauge_priority: 100,
         };
         let options = BlockwiseFitOptions {
             outer_max_iter: 3,
@@ -26945,7 +26948,7 @@ gauge_priority: 100,
             nullspace_dims: vec![],
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(array![0.0]),
-gauge_priority: 100,
+            gauge_priority: 100,
         };
         let options = BlockwiseFitOptions {
             use_remlobjective: false,
@@ -27060,7 +27063,7 @@ gauge_priority: 100,
                 nullspace_dims: vec![],
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: Some(array![0.0]),
-gauge_priority: 100,
+                gauge_priority: 100,
             },
             ParameterBlockSpec {
                 name: "log_sigma".to_string(),
@@ -27072,7 +27075,7 @@ gauge_priority: 100,
                 nullspace_dims: vec![],
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: Some(array![0.0, 0.0]),
-gauge_priority: 100,
+                gauge_priority: 100,
             },
         ]
     }
@@ -27198,7 +27201,7 @@ gauge_priority: 100,
             nullspace_dims: vec![],
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(array![0.0]),
-gauge_priority: 100,
+            gauge_priority: 100,
         }];
         let states = vec![ParameterBlockState {
             beta: array![0.0],
@@ -27486,7 +27489,7 @@ gauge_priority: 100,
                 nullspace_dims: vec![],
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: Some(Array1::from_elem(p0, 1.0)),
-gauge_priority: 100,
+                gauge_priority: 100,
             },
             ParameterBlockSpec {
                 name: "small_block".to_string(),
@@ -27499,7 +27502,7 @@ gauge_priority: 100,
                 nullspace_dims: vec![],
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: Some(Array1::from_elem(p1, 1.0)),
-gauge_priority: 100,
+                gauge_priority: 100,
             },
         ]
     }
@@ -27548,7 +27551,7 @@ gauge_priority: 100,
                 nullspace_dims: vec![],
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: Some(Array1::from_elem(2, 1.0)),
-gauge_priority: 100,
+                gauge_priority: 100,
             },
             ParameterBlockSpec {
                 name: "block_b".to_string(),
@@ -27560,7 +27563,7 @@ gauge_priority: 100,
                 nullspace_dims: vec![],
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: Some(Array1::from_elem(2, 1.0)),
-gauge_priority: 100,
+                gauge_priority: 100,
             },
         ];
         let per_block = vec![Array1::zeros(0), Array1::zeros(0)];
@@ -28074,7 +28077,7 @@ gauge_priority: 100,
             nullspace_dims: Vec::new(),
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
-gauge_priority: 100,
+            gauge_priority: 100,
         };
         let state = ParameterBlockState {
             beta: array![0.25, 0.75],
@@ -28149,7 +28152,7 @@ gauge_priority: 100,
             nullspace_dims: Vec::new(),
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
-gauge_priority: 100,
+            gauge_priority: 100,
         };
         let state = ParameterBlockState {
             beta: array![2.0, -1.0],
@@ -28197,7 +28200,7 @@ gauge_priority: 100,
             nullspace_dims: Vec::new(),
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
-gauge_priority: 100,
+            gauge_priority: 100,
         };
         let state = ParameterBlockState {
             beta: array![10.0, -4.0],
@@ -28725,7 +28728,7 @@ gauge_priority: 100,
             nullspace_dims: vec![],
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
-gauge_priority: 100,
+            gauge_priority: 100,
         };
         let h: Array2<f64> = array![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0e-10]];
         let work = BlockWorkingSet::ExactNewton {
@@ -28780,7 +28783,7 @@ gauge_priority: 100,
             nullspace_dims: vec![],
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
-gauge_priority: 100,
+            gauge_priority: 100,
         };
         let h: Array2<f64> = array![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, -1.0e-8]];
         let work = BlockWorkingSet::ExactNewton {
@@ -28889,7 +28892,7 @@ gauge_priority: 100,
                 nullspace_dims: vec![],
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
-gauge_priority: 100,
+                gauge_priority: 100,
             });
             states.push(ParameterBlockState {
                 beta: Array1::zeros(width),
@@ -29061,7 +29064,7 @@ gauge_priority: 100,
                 nullspace_dims: vec![],
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
-gauge_priority: 100,
+                gauge_priority: 100,
             });
             states.push(ParameterBlockState {
                 beta: Array1::zeros(width),
@@ -29185,7 +29188,7 @@ gauge_priority: 100,
                 nullspace_dims: vec![],
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
-gauge_priority: 100,
+                gauge_priority: 100,
             });
             states.push(ParameterBlockState {
                 beta: Array1::zeros(width),

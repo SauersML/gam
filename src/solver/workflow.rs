@@ -421,8 +421,12 @@ macro_rules! family_dispatch {
 
 impl<'a> FamilyFitRequest for StandardFitRequest<'a> {
     const TAG: &'static str = "standard";
-    fn n_obs(&self) -> usize { self.y.len() }
-    fn n_cols(&self) -> usize { self.data.ncols() }
+    fn n_obs(&self) -> usize {
+        self.y.len()
+    }
+    fn n_cols(&self) -> usize {
+        self.data.ncols()
+    }
     fn write_shape_hash(&self, h: &mut crate::solver::persistent_warm_start::StableHasher) {
         h.write_str("standard");
         h.write_str(&format!("{:?}", self.family));
@@ -449,8 +453,12 @@ impl<'a> FamilyFitRequest for StandardFitRequest<'a> {
 
 impl<'a> FamilyFitRequest for GaussianLocationScaleFitRequest<'a> {
     const TAG: &'static str = "gaussian-location-scale";
-    fn n_obs(&self) -> usize { self.spec.y.len() }
-    fn n_cols(&self) -> usize { self.data.ncols() }
+    fn n_obs(&self) -> usize {
+        self.spec.y.len()
+    }
+    fn n_cols(&self) -> usize {
+        self.data.ncols()
+    }
     fn write_shape_hash(&self, h: &mut crate::solver::persistent_warm_start::StableHasher) {
         h.write_str("gauss-ls");
         h.write_usize(self.spec.y.len());
@@ -470,8 +478,12 @@ impl<'a> FamilyFitRequest for GaussianLocationScaleFitRequest<'a> {
 
 impl<'a> FamilyFitRequest for BinomialLocationScaleFitRequest<'a> {
     const TAG: &'static str = "binomial-location-scale";
-    fn n_obs(&self) -> usize { self.spec.y.len() }
-    fn n_cols(&self) -> usize { self.data.ncols() }
+    fn n_obs(&self) -> usize {
+        self.spec.y.len()
+    }
+    fn n_cols(&self) -> usize {
+        self.data.ncols()
+    }
     fn write_shape_hash(&self, h: &mut crate::solver::persistent_warm_start::StableHasher) {
         h.write_str("binom-ls");
         h.write_usize(self.spec.y.len());
@@ -493,8 +505,12 @@ impl<'a> FamilyFitRequest for BinomialLocationScaleFitRequest<'a> {
 
 impl<'a> FamilyFitRequest for SurvivalLocationScaleFitRequest<'a> {
     const TAG: &'static str = "survival-location-scale";
-    fn n_obs(&self) -> usize { self.spec.age_entry.len() }
-    fn n_cols(&self) -> usize { self.data.ncols() }
+    fn n_obs(&self) -> usize {
+        self.spec.age_entry.len()
+    }
+    fn n_cols(&self) -> usize {
+        self.data.ncols()
+    }
     fn write_shape_hash(&self, h: &mut crate::solver::persistent_warm_start::StableHasher) {
         h.write_str("surv-ls");
         h.write_usize(self.spec.age_entry.len());
@@ -524,8 +540,12 @@ impl<'a> FamilyFitRequest for SurvivalLocationScaleFitRequest<'a> {
 
 impl<'a> FamilyFitRequest for SurvivalTransformationFitRequest<'a> {
     const TAG: &'static str = "survival-transformation";
-    fn n_obs(&self) -> usize { self.spec.age_entry.len() }
-    fn n_cols(&self) -> usize { self.data.ncols() }
+    fn n_obs(&self) -> usize {
+        self.spec.age_entry.len()
+    }
+    fn n_cols(&self) -> usize {
+        self.data.ncols()
+    }
     fn write_shape_hash(&self, h: &mut crate::solver::persistent_warm_start::StableHasher) {
         h.write_str("surv-tn");
         h.write_usize(self.spec.age_entry.len());
@@ -557,8 +577,12 @@ impl<'a> FamilyFitRequest for SurvivalTransformationFitRequest<'a> {
 
 impl<'a> FamilyFitRequest for BernoulliMarginalSlopeFitRequest<'a> {
     const TAG: &'static str = "bernoulli-marginal-slope";
-    fn n_obs(&self) -> usize { self.spec.y.len() }
-    fn n_cols(&self) -> usize { self.data.ncols() }
+    fn n_obs(&self) -> usize {
+        self.spec.y.len()
+    }
+    fn n_cols(&self) -> usize {
+        self.data.ncols()
+    }
     fn write_shape_hash(&self, h: &mut crate::solver::persistent_warm_start::StableHasher) {
         h.write_str("bern-ms");
         h.write_usize(self.spec.y.len());
@@ -580,8 +604,12 @@ impl<'a> FamilyFitRequest for BernoulliMarginalSlopeFitRequest<'a> {
 
 impl<'a> FamilyFitRequest for SurvivalMarginalSlopeFitRequest<'a> {
     const TAG: &'static str = "survival-marginal-slope";
-    fn n_obs(&self) -> usize { self.spec.age_entry.len() }
-    fn n_cols(&self) -> usize { self.data.ncols() }
+    fn n_obs(&self) -> usize {
+        self.spec.age_entry.len()
+    }
+    fn n_cols(&self) -> usize {
+        self.data.ncols()
+    }
     fn write_shape_hash(&self, h: &mut crate::solver::persistent_warm_start::StableHasher) {
         h.write_str("surv-ms");
         h.write_usize(self.spec.age_entry.len());
@@ -605,8 +633,12 @@ impl<'a> FamilyFitRequest for SurvivalMarginalSlopeFitRequest<'a> {
 
 impl<'a> FamilyFitRequest for LatentSurvivalFitRequest<'a> {
     const TAG: &'static str = "latent-survival";
-    fn n_obs(&self) -> usize { self.spec.age_entry.len() }
-    fn n_cols(&self) -> usize { self.data.ncols() }
+    fn n_obs(&self) -> usize {
+        self.spec.age_entry.len()
+    }
+    fn n_cols(&self) -> usize {
+        self.data.ncols()
+    }
     fn write_shape_hash(&self, h: &mut crate::solver::persistent_warm_start::StableHasher) {
         h.write_str("lat-surv");
         h.write_usize(self.spec.age_entry.len());
@@ -628,8 +660,12 @@ impl<'a> FamilyFitRequest for LatentSurvivalFitRequest<'a> {
 
 impl<'a> FamilyFitRequest for LatentBinaryFitRequest<'a> {
     const TAG: &'static str = "latent-binary";
-    fn n_obs(&self) -> usize { self.spec.age_entry.len() }
-    fn n_cols(&self) -> usize { self.data.ncols() }
+    fn n_obs(&self) -> usize {
+        self.spec.age_entry.len()
+    }
+    fn n_cols(&self) -> usize {
+        self.data.ncols()
+    }
     fn write_shape_hash(&self, h: &mut crate::solver::persistent_warm_start::StableHasher) {
         h.write_str("lat-bin");
         h.write_usize(self.spec.age_entry.len());
@@ -651,8 +687,12 @@ impl<'a> FamilyFitRequest for LatentBinaryFitRequest<'a> {
 
 impl<'a> FamilyFitRequest for TransformationNormalFitRequest<'a> {
     const TAG: &'static str = "transformation-normal";
-    fn n_obs(&self) -> usize { self.response.len() }
-    fn n_cols(&self) -> usize { self.data.ncols() }
+    fn n_obs(&self) -> usize {
+        self.response.len()
+    }
+    fn n_cols(&self) -> usize {
+        self.data.ncols()
+    }
     fn write_shape_hash(&self, h: &mut crate::solver::persistent_warm_start::StableHasher) {
         h.write_str("tn");
         h.write_usize(self.response.len());
@@ -1334,7 +1374,7 @@ fn fit_cause_specific_survival_transformation_custom(
             nullspace_dims,
             initial_log_lambdas,
             initial_beta: Some(beta_start),
-gauge_priority: 100,
+            gauge_priority: 100,
         });
     }
 
