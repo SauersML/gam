@@ -249,6 +249,35 @@ class RunSuiteMappingTests(unittest.TestCase):
         self.assertTrue(any("family = fit_family" in script for script in seen_scripts))
         self.assertTrue(any("BI()" in script for script in seen_scripts))
 
+    def test_validate_scenario_schema_accepts_every_canonical_scenario(self) -> None:
+        # Pure-Python schema dispatch must accept every scenario in the
+        # committed bench/scenarios.json. CI runs this preflight in the
+        # benchmark-prepare job, which does not build the Rust extension and
+        # does not download the CSV fixtures — so the validator must never
+        # touch the data-generation path. A regression where a new scenario
+        # name pattern lands in scenarios.json without a matching dispatch
+        # branch in `_resolve_scenario_loader` will fail here, but the
+        # validator itself must NOT raise `gamfit Rust extension is not built`
+        # for any registered name.
+        scenarios_path = _REPO_ROOT / "bench" / "scenarios.json"
+        cfg = json.loads(scenarios_path.read_text())
+        scenarios = cfg.get("scenarios", [])
+        self.assertGreater(len(scenarios), 0)
+        for s in scenarios:
+            _RUN_SUITE.validate_scenario_schema(s)
+
+    def test_validate_scenario_schema_rejects_unknown_name(self) -> None:
+        with self.assertRaises(RuntimeError):
+            _RUN_SUITE.validate_scenario_schema({"name": "does_not_exist_xyz"})
+
+    def test_validate_scenario_schema_rejects_missing_name(self) -> None:
+        with self.assertRaises(RuntimeError):
+            _RUN_SUITE.validate_scenario_schema({})
+
+    def test_validate_scenario_schema_rejects_non_dict(self) -> None:
+        with self.assertRaises(RuntimeError):
+            _RUN_SUITE.validate_scenario_schema("not a dict")  # type: ignore[arg-type]
+
     def test_required_benchmark_datasets_exist(self) -> None:
         missing = sorted(
             dataset_name

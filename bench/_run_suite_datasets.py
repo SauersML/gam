@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import math
 import importlib.util
 import re
@@ -1625,25 +1626,48 @@ def _validate_dataset_schema(ds: typing.Any, scenario_name: typing.Any) -> None:
             raise RuntimeError(f"{scenario_name}: column '{col}' is not fully numeric/coercible: {e}") from e
 
 
-def _dataset_for_scenario_unvalidated(s: typing.Any) -> typing.Any:
+def _resolve_scenario_loader(s: typing.Any) -> typing.Callable[[], typing.Any]:
+    """Dispatch a scenario spec to a zero-arg loader callable, without invoking it.
+
+    Each branch binds the spec-derived arguments via ``functools.partial`` so the
+    returned callable can be invoked later (during data generation) OR discarded
+    (during pure-Python schema validation). Raises ``RuntimeError`` if the
+    scenario name does not match any registered loader. This is the single
+    source of truth for the name → loader mapping; ``validate_scenario_schema``
+    and ``_dataset_for_scenario_unvalidated`` both go through here.
+    """
     name = s["name"]
     if name in {"small_dense", "medium", "pathological_ill_conditioned"}:
         cfg = _CANONICAL_SYNTHETIC_BINOMIAL_SCENARIOS[name]
-        return _synthetic_binomial_dataset(
+        return functools.partial(
+            _synthetic_binomial_dataset,
             s.get("n", cfg["n"]),
             s.get("p", cfg["p"]),
             s.get("seed", cfg["seed"]),
         )
     if name.startswith("geo_disease_eas3_"):
-        return _synthetic_geo_disease_eas_dataset(s.get("n", 6000), s.get("seed", 20260301), n_pcs=3)
+        return functools.partial(
+            _synthetic_geo_disease_eas_dataset,
+            s.get("n", 6000), s.get("seed", 20260301), n_pcs=3,
+        )
     if name.startswith("geo_disease_eas_"):
-        return _synthetic_geo_disease_eas_dataset(s.get("n", 6000), s.get("seed", 20260301))
+        return functools.partial(
+            _synthetic_geo_disease_eas_dataset,
+            s.get("n", 6000), s.get("seed", 20260301),
+        )
     if name.startswith("papuan_oce4_"):
-        return _synthetic_papuan_oce_dataset(s.get("n", 6000), s.get("seed", 20260315), n_pcs=4)
+        return functools.partial(
+            _synthetic_papuan_oce_dataset,
+            s.get("n", 6000), s.get("seed", 20260315), n_pcs=4,
+        )
     if name.startswith("papuan_oce_"):
-        return _synthetic_papuan_oce_dataset(s.get("n", 6000), s.get("seed", 20260315), n_pcs=16)
+        return functools.partial(
+            _synthetic_papuan_oce_dataset,
+            s.get("n", 6000), s.get("seed", 20260315), n_pcs=16,
+        )
     if name == "geo_subpop16_randomprev_randomscale_duchonfull_k50":
-        return _geo_subpop16_randomprev_randomscale_dataset(
+        return functools.partial(
+            _geo_subpop16_randomprev_randomscale_dataset,
             seed=s.get("seed", 20260701),
             prevalence_min=s.get("prevalence_min", 0.02),
             prevalence_max=s.get("prevalence_max", 0.40),
@@ -1651,7 +1675,8 @@ def _dataset_for_scenario_unvalidated(s: typing.Any) -> typing.Any:
             noise_scale_max=s.get("noise_scale_max", 0.85),
         )
     if name.startswith("geo_subpop16_margslope_aniso_duchon16d_"):
-        return _geo_subpop16_randomprev_randomscale_dataset(
+        return functools.partial(
+            _geo_subpop16_randomprev_randomscale_dataset,
             seed=s.get("seed", 20260702),
             prevalence_min=s.get("prevalence_min", 0.02),
             prevalence_max=s.get("prevalence_max", 0.40),
@@ -1659,23 +1684,29 @@ def _dataset_for_scenario_unvalidated(s: typing.Any) -> typing.Any:
             noise_scale_max=s.get("noise_scale_max", 0.85),
         )
     if name.startswith("geo_subpop16_"):
-        return _geo_subpop16_dataset(
+        return functools.partial(
+            _geo_subpop16_dataset,
             seed=s.get("seed", 20260330),
             prevalence_min=s.get("prevalence_min", 0.02),
             prevalence_max=s.get("prevalence_max", 0.40),
         )
     geo_latlon_cfg = _geo_latlon_scenario_cfg(name)
     if geo_latlon_cfg is not None:
-        return _geo_latlon_dataset(
+        return functools.partial(
+            _geo_latlon_dataset,
             mode_code=geo_latlon_cfg["mode_code"],
             seed=s.get("seed", 20260401),
             prevalence_min=s.get("prevalence_min", 0.01),
             prevalence_max=s.get("prevalence_max", 0.10),
         )
     if name.startswith("geo_disease_"):
-        return _synthetic_geo_disease_dataset(s.get("n", 4000), s.get("seed", 20260226))
+        return functools.partial(
+            _synthetic_geo_disease_dataset,
+            s.get("n", 4000), s.get("seed", 20260226),
+        )
     if name == "continuous_order_fractional_spde_nu18":
-        return _synthetic_continuous_order_dataset(
+        return functools.partial(
+            _synthetic_continuous_order_dataset,
             mode="fractional",
             n=s.get("n", 512),
             seed=s.get("seed", 20260501),
@@ -1683,51 +1714,75 @@ def _dataset_for_scenario_unvalidated(s: typing.Any) -> typing.Any:
             true_kappa2=s.get("true_kappa2", 0.7),
         )
     if name == "continuous_order_boundary_rough":
-        return _synthetic_continuous_order_dataset(
+        return functools.partial(
+            _synthetic_continuous_order_dataset,
             mode="rough",
             n=s.get("n", 512),
             seed=s.get("seed", 20260502),
         )
     if name == "continuous_order_boundary_smooth":
-        return _synthetic_continuous_order_dataset(
+        return functools.partial(
+            _synthetic_continuous_order_dataset,
             mode="smooth",
             n=s.get("n", 512),
             seed=s.get("seed", 20260503),
         )
     if name == "thread3_admixture_cliff":
-        return _synthetic_thread3_admixture_cliff_dataset(
+        return functools.partial(
+            _synthetic_thread3_admixture_cliff_dataset,
             n=s.get("n", 6000),
             seed=s.get("seed", 20260601),
         )
     if name == "lidar_semipar":
-        return _load_lidar_dataset()
+        return _load_lidar_dataset
     if name == "bone_gamair":
-        return _load_bone_dataset()
+        return _load_bone_dataset
     if name == "prostate_gamair":
-        return _load_prostate_dataset()
+        return _load_prostate_dataset
     if name == "wine_gamair":
-        return _load_wine_dataset()
+        return _load_wine_dataset
     if name == "wine_temp_vs_year":
-        return _load_wine_temp_vs_year_dataset()
+        return _load_wine_temp_vs_year_dataset
     if name == "wine_price_vs_temp":
-        return _load_wine_price_vs_temp_dataset()
+        return _load_wine_price_vs_temp_dataset
     if name == "horse_colic":
-        return _load_horse_dataset()
+        return _load_horse_dataset
     if name == "us48_demand_5day":
-        return _load_us48_demand_dataset("five_day.csv")
+        return functools.partial(_load_us48_demand_dataset, "five_day.csv")
     if name == "us48_demand_31day":
-        return _load_us48_demand_dataset("31_day.csv")
+        return functools.partial(_load_us48_demand_dataset, "31_day.csv")
     if name == "haberman_5yr":
-        return _load_haberman_dataset()
+        return _load_haberman_dataset
     if name == "icu_survival_death":
-        return _load_icu_survival_death_dataset()
+        return _load_icu_survival_death_dataset
     if name == "icu_survival_los":
-        return _load_icu_survival_los_dataset()
+        return _load_icu_survival_los_dataset
     if name == "heart_failure_survival":
-        return _load_heart_failure_survival_dataset()
+        return _load_heart_failure_survival_dataset
     if name == "cirrhosis_survival":
-        return _load_cirrhosis_survival_dataset()
+        return _load_cirrhosis_survival_dataset
     raise RuntimeError(f"No scenario-specific dataset loader configured for '{name}'")
+
+
+def _dataset_for_scenario_unvalidated(s: typing.Any) -> typing.Any:
+    return _resolve_scenario_loader(s)()
+
+
+def validate_scenario_schema(s: typing.Any) -> None:
+    """Verify that scenario spec ``s`` is well-formed and dispatches to a known loader.
+
+    This is the lightweight preflight used by CI before spinning up the benchmark
+    matrix: it executes only Python-level dispatch logic, does NOT generate any
+    synthetic data, and does NOT require the Rust extension or external CSV
+    fixtures to be present. If the spec is missing required fields or the name
+    is unknown, this raises ``RuntimeError`` with a scenario-identifying message.
+    """
+    if not isinstance(s, dict):
+        raise RuntimeError(f"scenario spec must be a dict, got {type(s).__name__}")
+    name = s.get("name")
+    if not isinstance(name, str) or not name:
+        raise RuntimeError(f"scenario spec missing required 'name' string: {s!r}")
+    _resolve_scenario_loader(s)
 
 
 def _downsample_binomial_dataset(
