@@ -1656,30 +1656,12 @@ fn append_deviation_function_penalty(
 // residualisation theorem is `span(C) ⊆ span(A) ⇔ (I − P_A) C = 0`, and
 // that is what this code actually tests.
 //
-// `enforce_cross_block_identifiability_for_flex_block` is the entry point;
-// `CrossBlockAnchor` distinguishes parametric anchors (any `DesignMatrix`,
-// reduced via column-by-column transpose-matvec so sparse/lazy designs
-// never densify) from already-evaluated flex anchors (dense `Array2`).
-/// Anchor source for cross-block identifiability orthogonalisation.
-///
-/// `enforce_cross_block_identifiability_for_flex_block` reparameterises a
-/// candidate flex block so its column span at the n training rows is
-/// orthogonal to the column spans of every supplied anchor. Each anchor
-/// contributes additively to the cross-Gram normal matrix `MᵀM`, which
-/// keeps the contraction at `O(n · p_anchor · p_candidate)` per anchor
-/// without ever stacking the anchors into a single matrix.
-pub(crate) enum CrossBlockAnchor<'a> {
-    /// Parametric design (location/logslope) at the n training rows. The
-    /// transpose-matvec API computes `Aᵀ · candidate_design` column-by-
-    /// column so sparse / lazy / operator-backed designs never have to
-    /// materialise.
-    Parametric(&'a DesignMatrix),
-    /// Flex block already evaluated at the training rows (`n × p_a`).
-    /// Used when reparameterising a *later* flex block against an
-    /// *earlier* flex block (e.g. link-deviation against the now-
-    /// identifiable score-warp basis).
-    FlexEvaluation(&'a Array2<f64>),
-}
+// `enforce_cross_block_identifiability_for_flex_block` takes two slices —
+// `parametric_anchors: &[(&DesignMatrix, ParametricAnchorBlock)]` and
+// `flex_anchors: &[&Array2<f64>]` — preserving the parametric-before-flex
+// invariant by construction. The K=1 row-Jacobian math runs through
+// `identifiability_compiler::compile`, so there is exactly one cross-block
+// residualisation math implementation in the codebase.
 
 /// Outcome of [`enforce_cross_block_identifiability_for_flex_block`].
 ///
@@ -1795,10 +1777,8 @@ pub(crate) fn enforce_cross_block_identifiability_for_flex_block(
     candidate: &mut DeviationPrepared,
     candidate_arg_at_training_rows: &Array1<f64>,
     candidate_cfg: &DeviationBlockConfig,
-    anchors: &[CrossBlockAnchor<'_>],
-    parametric_anchor_blocks: &[Option<
-        crate::families::bernoulli_marginal_slope::deviation_runtime::ParametricAnchorBlock,
-    >],
+    parametric_anchors: &[(&DesignMatrix, crate::families::bernoulli_marginal_slope::deviation_runtime::ParametricAnchorBlock)],
+    flex_anchors: &[&Array2<f64>],
     training_row_weights: &Array1<f64>,
 ) -> Result<CrossBlockIdentifiabilityOutcome, String> {
     use crate::families::bernoulli_marginal_slope::deviation_runtime::{
@@ -1810,14 +1790,6 @@ pub(crate) fn enforce_cross_block_identifiability_for_flex_block(
     use crate::families::identifiability_compiler::{
         BlockOrder, RowJacobianOperator, compile,
     };
-
-    if parametric_anchor_blocks.len() != anchors.len() {
-        return Err(format!(
-            "cross-block identifiability: parametric_anchor_blocks length {} does not match anchors length {}",
-            parametric_anchor_blocks.len(),
-            anchors.len(),
-        ));
-    }
 
     let candidate_design = candidate.runtime.design(candidate_arg_at_training_rows)?;
     let n = candidate_design.nrows();
@@ -1840,76 +1812,51 @@ pub(crate) fn enforce_cross_block_identifiability_for_flex_block(
         }
     }
 
-    // Materialise each anchor to a dense design, preserving the caller's
-    // order (the predict-side reconstruction depends on it). Track the
-    // per-anchor `AnchorNullSpaceComponent` so the install path can replay
-    // the anchor row map at predict time.
+    // Stack the anchor designs in the canonical parametric-before-flex
+    // order required by the predict-side reconstruction. Densify each
+    // parametric anchor once into a contiguous `n × p_a` block; flex anchor
+    // matrices are already dense and used as-is.
     let mut anchor_dense_blocks: Vec<Array2<f64>> = Vec::new();
     let mut anchor_components: Vec<AnchorNullSpaceComponent> = Vec::new();
     let mut total_anchor_cols = 0usize;
-    let mut saw_flex = false;
-    for (anchor_idx, anchor) in anchors.iter().enumerate() {
-        match anchor {
-            CrossBlockAnchor::Parametric(d) => {
-                if d.nrows() != n {
-                    return Err(format!(
-                        "cross-block identifiability: parametric anchor has {} rows, candidate has {}",
-                        d.nrows(),
-                        n,
-                    ));
-                }
-                if saw_flex {
-                    return Err(
-                        "cross-block identifiability: anchor order invariant violated — \
-                         a Parametric anchor follows a FlexEvaluation anchor. Predict-time \
-                         reconstruction requires every Parametric component before any \
-                         FlexEvaluation component."
-                            .to_string(),
-                    );
-                }
-                let p_a = d.ncols();
-                if p_a == 0 {
-                    continue;
-                }
-                let block_tag = parametric_anchor_blocks[anchor_idx].ok_or_else(|| {
-                    format!(
-                        "cross-block identifiability: anchor {anchor_idx} is Parametric but parametric_anchor_blocks tag is None",
-                    )
-                })?;
-                let dense = d
-                    .try_to_dense_arc("cross-block anchor")?
-                    .as_ref()
-                    .clone();
-                anchor_dense_blocks.push(dense);
-                anchor_components.push(AnchorNullSpaceComponent::Parametric {
-                    block: block_tag,
-                    ncols: p_a,
-                });
-                total_anchor_cols += p_a;
-            }
-            CrossBlockAnchor::FlexEvaluation(a) => {
-                if a.nrows() != n {
-                    return Err(format!(
-                        "cross-block identifiability: flex anchor has {} rows, candidate has {}",
-                        a.nrows(),
-                        n,
-                    ));
-                }
-                if parametric_anchor_blocks[anchor_idx].is_some() {
-                    return Err(format!(
-                        "cross-block identifiability: anchor {anchor_idx} is FlexEvaluation but parametric_anchor_blocks tag is Some (flex anchors carry no parametric block tag)",
-                    ));
-                }
-                let p_a = a.ncols();
-                if p_a == 0 {
-                    continue;
-                }
-                anchor_dense_blocks.push((*a).clone());
-                anchor_components.push(AnchorNullSpaceComponent::FlexEvaluation { ncols: p_a });
-                total_anchor_cols += p_a;
-                saw_flex = true;
-            }
+    for (d, block_tag) in parametric_anchors {
+        if d.nrows() != n {
+            return Err(format!(
+                "cross-block identifiability: parametric anchor has {} rows, candidate has {}",
+                d.nrows(),
+                n,
+            ));
         }
+        let p_a = d.ncols();
+        if p_a == 0 {
+            continue;
+        }
+        let dense = d
+            .try_to_dense_arc("cross-block parametric anchor")?
+            .as_ref()
+            .clone();
+        anchor_dense_blocks.push(dense);
+        anchor_components.push(AnchorNullSpaceComponent::Parametric {
+            block: *block_tag,
+            ncols: p_a,
+        });
+        total_anchor_cols += p_a;
+    }
+    for a in flex_anchors {
+        if a.nrows() != n {
+            return Err(format!(
+                "cross-block identifiability: flex anchor has {} rows, candidate has {}",
+                a.nrows(),
+                n,
+            ));
+        }
+        let p_a = a.ncols();
+        if p_a == 0 {
+            continue;
+        }
+        anchor_dense_blocks.push((*a).clone());
+        anchor_components.push(AnchorNullSpaceComponent::FlexEvaluation { ncols: p_a });
+        total_anchor_cols += p_a;
     }
     if total_anchor_cols == 0 {
         // No anchors to residualise against — the candidate's own per-block
@@ -1936,14 +1883,11 @@ pub(crate) fn enforce_cross_block_identifiability_for_flex_block(
     // Delegate the W-metric Gram + eigendecomposition + V/M extraction to
     // the family-agnostic identifiability compiler. The compiler runs at K=1
     // here (BMS row primary state = scalar η) using `BernoulliRowHessian` as
-    // the row metric — algebraically identical to the legacy
-    // `sqrt(W)` scaling + Gram solve this function used to perform inline,
-    // but routed through the canonical implementation so there is exactly
-    // ONE math implementation of the cross-block residualisation in the
-    // codebase. Per-anchor designs each become a single-block
-    // `BernoulliDenseDesignOperator`; the candidate is the trailing block
-    // whose `t_lw` and `anchor_correction` the compiler emits as
-    // `CompiledBlock { t_lw: V, anchor_correction: Some(M) }`.
+    // the row metric — there is now exactly ONE math implementation of the
+    // cross-block residualisation in the codebase. Per-anchor designs each
+    // become a single-block `BernoulliDenseDesignOperator`; the candidate is
+    // the trailing block whose `t_lw` and `anchor_correction` the compiler
+    // emits as `CompiledBlock { t_lw: V, anchor_correction: Some(M) }`.
     let mut operators: Vec<std::sync::Arc<dyn RowJacobianOperator>> =
         Vec::with_capacity(anchor_dense_blocks.len() + 1);
     let mut ordering: Vec<BlockOrder> = Vec::with_capacity(anchor_dense_blocks.len() + 1);
@@ -1951,10 +1895,6 @@ pub(crate) fn enforce_cross_block_identifiability_for_flex_block(
         operators.push(std::sync::Arc::new(BernoulliDenseDesignOperator::new(
             dense.clone(),
         )));
-        // The compiler treats `ordering` as caller metadata only; relative
-        // position in `operators` is the residualisation order. Anchor
-        // blocks are tagged generically as `Marginal` (semantic owner of
-        // location directions in the order they appear).
         ordering.push(BlockOrder::Marginal);
     }
     operators.push(std::sync::Arc::new(BernoulliDenseDesignOperator::new(
@@ -19328,13 +19268,10 @@ pub fn fit_bernoulli_marginal_slope_terms(
             z_train,
             cfg,
             &[
-                CrossBlockAnchor::Parametric(&marginal_design.design),
-                CrossBlockAnchor::Parametric(&logslope_design.design),
+                (&marginal_design.design, ParametricAnchorBlock::Marginal),
+                (&logslope_design.design, ParametricAnchorBlock::Logslope),
             ],
-            &[
-                Some(ParametricAnchorBlock::Marginal),
-                Some(ParametricAnchorBlock::Logslope),
-            ],
+            &[],
             &cross_block_pilot_w_score_warp,
         )?;
         match outcome {
@@ -19440,37 +19377,24 @@ pub fn fit_bernoulli_marginal_slope_terms(
             .map(|sw| sw.runtime.design_at_training_with_residual(z_train))
             .transpose()?;
         use crate::families::bernoulli_marginal_slope::deviation_runtime::ParametricAnchorBlock;
-        let mut anchors = vec![
-            CrossBlockAnchor::Parametric(&marginal_design.design),
-            CrossBlockAnchor::Parametric(&logslope_design.design),
+        let parametric_anchors: [(&DesignMatrix, ParametricAnchorBlock); 2] = [
+            (&marginal_design.design, ParametricAnchorBlock::Marginal),
+            (&logslope_design.design, ParametricAnchorBlock::Logslope),
         ];
-        let mut anchor_tags: Vec<Option<ParametricAnchorBlock>> = vec![
-            Some(ParametricAnchorBlock::Marginal),
-            Some(ParametricAnchorBlock::Logslope),
-        ];
-        if let Some(ref a) = score_warp_anchor_design {
-            anchors.push(CrossBlockAnchor::FlexEvaluation(a));
-            anchor_tags.push(None);
-        }
+        let flex_anchor_slot: Option<&Array2<f64>> = score_warp_anchor_design.as_ref();
+        let flex_anchors: Vec<&Array2<f64>> = flex_anchor_slot.into_iter().collect();
         // W-metric for link-deviation orthogonalisation: same IRLS-style
         // probit Hessian row weight as the score-warp path, but evaluated at
         // `eta_pilot` (the one-GN-stepped pilot at which the link-dev basis
-        // itself is anchored) so the orthogonalisation metric matches the
-        // basis evaluation point exactly. See the
-        // `cross_block_pilot_w_score_warp` comment above for why W must be
-        // the Hessian row metric rather than `spec.weights`.
+        // itself is anchored).
         let cross_block_pilot_w_link_dev =
             pilot_irls_hessian_row_metric_at_eta(&eta_pilot, &spec.weights);
-        // `enforce_cross_block_identifiability_for_flex_block` now delegates
-        // its math body to `identifiability_compiler::compile` (commit
-        // 4e20b8dc8); the prior Phase-4a shadow compile here was a
-        // duplicate of that internal call and has been removed.
         let outcome = enforce_cross_block_identifiability_for_flex_block(
             &mut prepared,
             &eta_pilot,
             cfg,
-            &anchors,
-            &anchor_tags,
+            &parametric_anchors,
+            &flex_anchors,
             &cross_block_pilot_w_link_dev,
         )?;
         match outcome {
@@ -20108,8 +20032,8 @@ mod tests {
             &mut link_prepared,
             &q0_seed,
             &link_cfg,
-            &[CrossBlockAnchor::Parametric(&anchor_design)],
-            &[Some(ParametricAnchorBlock::Marginal)],
+            &[(&anchor_design, ParametricAnchorBlock::Marginal)],
+            &[],
             &weights,
         )
         .expect("wider anchor should not false-positive full alias");
@@ -20188,8 +20112,8 @@ mod tests {
             &mut link_prepared,
             &q0_seed,
             &link_cfg,
-            &[CrossBlockAnchor::Parametric(&anchor_design)],
-            &[Some(ParametricAnchorBlock::Marginal)],
+            &[(&anchor_design, ParametricAnchorBlock::Marginal)],
+            &[],
             &weights,
         )
         .expect("minimal counterexample must keep p_before - 1 directions, not collapse to 0");
@@ -20257,8 +20181,8 @@ mod tests {
             &mut link_prepared,
             &q0_seed,
             &link_cfg,
-            &[CrossBlockAnchor::Parametric(&anchor_design)],
-            &[Some(ParametricAnchorBlock::Marginal)],
+            &[(&anchor_design, ParametricAnchorBlock::Marginal)],
+            &[],
             &weights,
         )
         .expect("true alias must produce a structured FullyAliased outcome");
@@ -20310,8 +20234,8 @@ mod tests {
             &mut link_prepared,
             &q0_seed,
             &link_cfg,
-            &[CrossBlockAnchor::FlexEvaluation(&flex_anchor_design)],
-            &[None],
+            &[],
+            &[&flex_anchor_design],
             &weights,
         )
         .expect("flex-anchor true alias must produce a structured FullyAliased outcome");
@@ -20419,8 +20343,8 @@ mod tests {
             &mut link_prepared,
             &q0_seed,
             &link_cfg,
-            &[CrossBlockAnchor::Parametric(&anchor_design)],
-            &[Some(ParametricAnchorBlock::Marginal)],
+            &[(&anchor_design, ParametricAnchorBlock::Marginal)],
+            &[],
             &weights,
         )
         .expect("partial alias must keep the surviving rank");

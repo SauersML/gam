@@ -11,7 +11,7 @@ use crate::custom_family::{
 use crate::estimate::UnifiedFitResult;
 use crate::faer_ndarray::{FaerCholesky, fast_ab, fast_atv, fast_av, fast_xt_diag_x};
 use crate::families::bernoulli_marginal_slope::{
-    CrossBlockAnchor, CrossBlockIdentifiabilityOutcome, CrossBlockIdentifiabilityWarning,
+    CrossBlockIdentifiabilityOutcome, CrossBlockIdentifiabilityWarning,
     DeviationBlockConfig, DeviationRuntime, LatentZNormalization, LatentZPolicy,
     MarginalSlopeCovariance, ParametricAnchorBlock,
     build_link_deviation_block_from_knots_design_seed_and_weights,
@@ -18524,29 +18524,16 @@ pub fn fit_survival_marginal_slope_terms(
             .into());
         }
         let mut base = build_score_warp_deviation_block_from_seed(&z_primary, cfg)?;
-        let anchors = vec![
-            CrossBlockAnchor::Parametric(&location_anchor_design),
-            CrossBlockAnchor::Parametric(&logslope_design.design),
+        let parametric_anchors: [(&DesignMatrix, ParametricAnchorBlock); 2] = [
+            (&location_anchor_design, ParametricAnchorBlock::Marginal),
+            (&logslope_design.design, ParametricAnchorBlock::Logslope),
         ];
-        let anchor_tags: Vec<Option<ParametricAnchorBlock>> = vec![
-            Some(ParametricAnchorBlock::Marginal),
-            Some(ParametricAnchorBlock::Logslope),
-        ];
-        // Phase 4a shadow call to the family-agnostic identifiability
-        // compiler. The K=1 cross-block residualisation now routes through
-        // `identifiability_compiler::compile` via the
-        // `enforce_cross_block_identifiability_for_flex_block` delegation
-        // (commit 4e20b8dc8); the K=4 family-Jacobian compile path remains
-        // available via `survival_marginal_slope_identifiability` for the
-        // post-Newton non-rigid pilot work, which is now in place via
-        // `survival_nonrigid_pilot_eta` (commit 0b40b93b9). The dead-gated
-        // 4a shadow has been removed.
         let outcome = enforce_cross_block_identifiability_for_flex_block(
             &mut base,
             &z_primary,
             cfg,
-            &anchors,
-            &anchor_tags,
+            &parametric_anchors,
+            &[],
             &cross_block_pilot_w,
         )?;
         match outcome {
@@ -18618,24 +18605,18 @@ pub fn fit_survival_marginal_slope_terms(
             .as_ref()
             .map(|sw| sw.runtime.design_at_training_with_residual(&z_primary))
             .transpose()?;
-        let mut anchors = vec![
-            CrossBlockAnchor::Parametric(&location_anchor_design),
-            CrossBlockAnchor::Parametric(&logslope_design.design),
+        let parametric_anchors: [(&DesignMatrix, ParametricAnchorBlock); 2] = [
+            (&location_anchor_design, ParametricAnchorBlock::Marginal),
+            (&logslope_design.design, ParametricAnchorBlock::Logslope),
         ];
-        let mut anchor_tags: Vec<Option<ParametricAnchorBlock>> = vec![
-            Some(ParametricAnchorBlock::Marginal),
-            Some(ParametricAnchorBlock::Logslope),
-        ];
-        if let Some(ref a) = score_warp_anchor_design {
-            anchors.push(CrossBlockAnchor::FlexEvaluation(a));
-            anchor_tags.push(None);
-        }
+        let flex_anchor_slot: Option<&Array2<f64>> = score_warp_anchor_design.as_ref();
+        let flex_anchors: Vec<&Array2<f64>> = flex_anchor_slot.into_iter().collect();
         let outcome = enforce_cross_block_identifiability_for_flex_block(
             &mut prepared,
             &q0_seed,
             cfg,
-            &anchors,
-            &anchor_tags,
+            &parametric_anchors,
+            &flex_anchors,
             &cross_block_pilot_w,
         )?;
         match outcome {
