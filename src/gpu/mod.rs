@@ -28,6 +28,7 @@ pub mod profile;
 pub mod reml_trace;
 pub mod row_hessian_ops;
 pub mod runtime;
+pub mod sigma_cubature;
 pub mod solver;
 pub mod sphere;
 pub mod survival_flex;

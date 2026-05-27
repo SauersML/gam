@@ -1157,6 +1157,849 @@ pub fn build_hex_tensor_moments_device(
 }
 
 // ────────────────────────────────────────────────────────────────────────
+// CM-P3 — Tetrahedral two-stage moment kernel.
+//
+// The hex path (above) is restricted to axis-aligned tensor-product cells:
+// per-axis cubic-B-spline closed forms compose into the cell moment as a
+// product of 1D integrals. For non-axis-aligned partitions (e.g. cells
+// emitted by an unstructured Delaunay/Lloyd mesher, or any setting where
+// the basis Gram is not separable into a per-axis tensor) we need a path
+// that integrates over an arbitrary affine simplex.
+//
+// Math contract — geometric monomial moments on a tetrahedron T with
+// vertices v0,…,v3 ∈ R^D and a per-cell reference point c0:
+//
+//   G_β(T)  =  ∫_T (x − c0)^β dx,        β ∈ N^D, |β| ≤ AMAX_GEOM.
+//
+// Map the reference simplex T_ref = {u ∈ R^3 : u_i ≥ 0, u1+u2+u3 ≤ 1}
+// affinely onto T via x(u) = v0 + B·u with B = [v1−v0 | v2−v0 | v3−v0]
+// (column-major). The Jacobian is constant: |det B| = 6·Vol(T). With
+// q_r = v0,r − c0,r and e_{i,r} = v_{i+1},r − v0,r,
+//
+//   (x_r − c0,r)^{β_r}
+//      = Σ_{κ_0+…+κ_3 = β_r} (β_r! / (κ_0! κ_1! κ_2! κ_3!))
+//                              · q_r^{κ_0}
+//                              · Π_{i=1..3} (e_{i,r} u_i)^{κ_i}.
+//
+// Taking the product over r=0..D−1 expands (x − c0)^β into a polynomial
+// in (u_1, u_2, u_3) with coefficients that are products of (q_r, e_{i,r}).
+// Each monomial u_1^{n_1} u_2^{n_2} u_3^{n_3} integrates over T_ref to
+//
+//   ∫_{T_ref} u_1^{n_1} u_2^{n_2} u_3^{n_3} du  =  n_1! n_2! n_3! / (n_1+n_2+n_3+3)!
+//
+// (the Dirichlet / Lasserre–Avrachenkov closed form), and contributes a
+// factor of |det B| to the world-space integral. To express the inner
+// per-axis lift compactly we use an "affine T_n recurrence" mirroring the
+// 1D moment table: define T_{β_r}(q_r; e_{·,r}) as the polynomial in
+// (u_1,u_2,u_3) given by (q_r + e_{1,r} u_1 + e_{2,r} u_2 + e_{3,r} u_3)^{β_r};
+// then T_{β_r} = T_{β_r − 1} · (q_r + Σ_i e_{i,r} u_i). The kernel walks
+// β_r from 1..=AMAX_GEOM_AXIS and accumulates products across axes
+// directly into the geom-moment slot.
+//
+// Stage 2 — basis-Gram contraction:
+//
+//   M_α^{ij}(c) = Σ_{T ∈ c} Σ_β  W_{α,β}^{ij}(c) · G_β(T),
+//
+// where W is the caller-supplied basis-Gram weight tensor (depends only on
+// the cell — same value for every tetrahedron in the cell). The kernel
+// reads the per-tet G_β table emitted by stage 1, the per-cell weight
+// tensor uploaded once, and emits the same alpha-major output shape as
+// the hex kernel so the two paths are drop-in interchangeable downstream.
+// ────────────────────────────────────────────────────────────────────────
+
+/// One tetrahedron in R^D. Vertices are stored as a flat 4·D-vector in
+/// vertex-major order (v0_0..v0_{D-1}, v1_0..v1_{D-1}, ...). `cell_index`
+/// links the tetrahedron back to the logical cell whose moment slot the
+/// contraction kernel will accumulate into; multiple tetrahedra may share
+/// the same `cell_index`. `cell_center_offset` provides the per-cell
+/// expansion point c0 used by the geometric moment integrand (x − c0)^β;
+/// the kernel reads `cell_centers` at this offset (in elements: D doubles).
+#[derive(Clone, Debug)]
+pub struct TetrahedralCellTable {
+    /// `vertices[tet * 4 * D + v * D + r]` — coordinate r of vertex v in tet.
+    pub vertices: Vec<f64>,
+    /// `cell_index[tet]` — logical cell this tet contributes to (0..n_cells).
+    pub cell_index: Vec<i32>,
+    /// `cell_centers[cell * D + r]` — expansion point c0 for cell `cell`.
+    pub cell_centers: Vec<f64>,
+    pub n_tets: usize,
+    pub n_cells: usize,
+    pub d: usize,
+}
+
+impl TetrahedralCellTable {
+    pub fn validate(&self) -> Result<(), GpuError> {
+        let want_v = self.n_tets * 4 * self.d;
+        if self.vertices.len() != want_v {
+            gpu_bail!(
+                "TetrahedralCellTable: expected vertices len {want_v} (n_tets*4*d), got {}",
+                self.vertices.len()
+            );
+        }
+        if self.cell_index.len() != self.n_tets {
+            gpu_bail!(
+                "TetrahedralCellTable: cell_index len {} != n_tets {}",
+                self.cell_index.len(),
+                self.n_tets
+            );
+        }
+        if self.cell_centers.len() != self.n_cells * self.d {
+            gpu_bail!(
+                "TetrahedralCellTable: cell_centers len {} != n_cells*d {}",
+                self.cell_centers.len(),
+                self.n_cells * self.d
+            );
+        }
+        for (i, &c) in self.cell_index.iter().enumerate() {
+            if c < 0 || (c as usize) >= self.n_cells {
+                gpu_bail!(
+                    "TetrahedralCellTable: cell_index[{i}] = {c} out of range [0, {})",
+                    self.n_cells
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Public spec for the tetrahedral two-stage moment table.
+///
+/// `geom_betas[g][r]` is the multi-index β ∈ N^D for geometric-moment slot g
+/// (|β| ≤ AMAX_GEOM). `alphas` and `layout` match the hex spec — the
+/// contraction kernel emits the same alpha-major `[NALPHA, n_cells]` output.
+/// `pairs_per_cell` is the number of (i, j) basis-pair slots the consumer
+/// expects per cell (typically `PAIRS_PER_SPAN^D` for tensor-product bases,
+/// but the kernel only consumes it as a stride and accepts any value).
+#[derive(Clone, Debug)]
+pub struct TetrahedralMomentSpec {
+    pub geom_betas: Vec<Vec<u8>>,
+    pub alphas: Vec<Vec<u8>>,
+    pub pairs_per_cell: usize,
+    pub layout: MomentLayout,
+}
+
+impl TetrahedralMomentSpec {
+    pub fn d(&self) -> usize {
+        self.alphas
+            .first()
+            .map(|v| v.len())
+            .or_else(|| self.geom_betas.first().map(|v| v.len()))
+            .unwrap_or(0)
+    }
+
+    pub fn n_alpha(&self) -> usize {
+        self.alphas.len()
+    }
+
+    pub fn n_beta(&self) -> usize {
+        self.geom_betas.len()
+    }
+}
+
+/// 64-bit FNV-style hash of the β multi-index table for the NVRTC module
+/// cache key.
+fn hash_beta_table(betas: &[Vec<u8>]) -> u64 {
+    let mut h = DefaultHasher::new();
+    (betas.len() as u64).hash(&mut h);
+    for row in betas {
+        (row.len() as u64).hash(&mut h);
+        for &v in row {
+            v.hash(&mut h);
+        }
+    }
+    h.finish()
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct TetMomentModuleKey {
+    cc_major: i32,
+    cc_minor: i32,
+    kind: u8, // 0 = geom, 1 = contract
+    d: u32,
+    nbeta: u32,
+    nalpha: u32,
+    pairs: u32,
+    beta_hash: u64,
+    alpha_hash: u64,
+    layout_tag: u8,
+}
+
+/// Closed-form factorial for the Dirichlet integral on T_ref. Up to 20! is
+/// representable exactly in f64; we cap at 12 (geometric moment exponents
+/// only ever reach AMAX_GEOM ≈ 6 in production specs, so n_1+n_2+n_3+3 ≤ 9).
+#[inline]
+fn fact_f64(n: u32) -> f64 {
+    let mut acc = 1.0f64;
+    for k in 2..=n {
+        acc *= k as f64;
+    }
+    acc
+}
+
+/// Dirichlet integral over the reference 3-simplex.
+///
+///   ∫_{T_ref} u_1^{n1} u_2^{n2} u_3^{n3} du = n1!·n2!·n3! / (n1+n2+n3+3)!
+#[inline]
+fn dirichlet_ref_simplex(n1: u32, n2: u32, n3: u32) -> f64 {
+    fact_f64(n1) * fact_f64(n2) * fact_f64(n3) / fact_f64(n1 + n2 + n3 + 3)
+}
+
+/// CPU reference: geometric moment G_β(T) = ∫_T (x − c0)^β dx for one
+/// tetrahedron via the expansion described at the top of this section.
+/// Used by the parity test and as the canonical reference if a non-Linux
+/// host wants to evaluate the same quantity without a GPU.
+pub fn tetrahedral_geom_moment_cpu(
+    vertices: &[f64], // 4*D
+    cell_center: &[f64],
+    beta: &[u8],
+    d: usize,
+) -> f64 {
+    assert_eq!(vertices.len(), 4 * d);
+    assert_eq!(cell_center.len(), d);
+    assert_eq!(beta.len(), d);
+
+    // q[r] = v0[r] − c0[r], e[i][r] = v_{i+1}[r] − v0[r]
+    let mut q = vec![0.0f64; d];
+    let mut e = [vec![0.0f64; d], vec![0.0f64; d], vec![0.0f64; d]];
+    for r in 0..d {
+        q[r] = vertices[r] - cell_center[r];
+        for i in 0..3 {
+            e[i][r] = vertices[(i + 1) * d + r] - vertices[r];
+        }
+    }
+
+    // |det B| with B = [e1 | e2 | e3] (D×3). Only the D = 3 case has a
+    // unique determinant. For D > 3 we use the 3D Gram-determinant
+    // sqrt(det(BᵀB)) interpretation (i.e. 6·Vol of the 3-simplex embedded
+    // in R^D). For D = 2 we treat the third edge as zero-extended and
+    // fall back to a planar |det| with e3 ignored — but the entry point
+    // refuses D < 3 to keep the geometry well-posed.
+    assert!(d >= 3, "tetrahedral path requires D ≥ 3");
+    let det_b = if d == 3 {
+        let m = [
+            [e[0][0], e[1][0], e[2][0]],
+            [e[0][1], e[1][1], e[2][1]],
+            [e[0][2], e[1][2], e[2][2]],
+        ];
+        (m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+            - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+            + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]))
+            .abs()
+    } else {
+        // sqrt(det(BᵀB))
+        let mut g = [[0.0f64; 3]; 3];
+        for i in 0..3 {
+            for j in 0..3 {
+                let mut acc = 0.0;
+                for r in 0..d {
+                    acc += e[i][r] * e[j][r];
+                }
+                g[i][j] = acc;
+            }
+        }
+        let det_g = g[0][0] * (g[1][1] * g[2][2] - g[1][2] * g[2][1])
+            - g[0][1] * (g[1][0] * g[2][2] - g[1][2] * g[2][0])
+            + g[0][2] * (g[1][0] * g[2][1] - g[1][1] * g[2][0]);
+        det_g.max(0.0).sqrt()
+    };
+
+    // For each axis r build the polynomial in (u_1, u_2, u_3) representing
+    // (q_r + e_{1,r} u_1 + e_{2,r} u_2 + e_{3,r} u_3)^{β_r} using the
+    // affine T_n recurrence T_β = T_{β-1} · (q + Σ_i e_i u_i). The
+    // polynomial is stored as a dense [n_max+1; 3] tensor over u_1, u_2, u_3
+    // exponents, capped at β_r along each axis.
+    //
+    // Per-axis polynomial size: (β_r + 1)^3 doubles. Then we multiply
+    // across axes into a global polynomial in (u_1, u_2, u_3) capped at
+    // (|β|, |β|, |β|) (loose but safe). Total: (|β|+1)^3 doubles, summed
+    // term-by-term via the Dirichlet integral.
+    let beta_total: u32 = beta.iter().map(|&v| v as u32).sum();
+    let n_max = beta_total as usize;
+    let stride = n_max + 1;
+    let size = stride * stride * stride;
+    // `poly[i + stride*(j + stride*k)] = coefficient of u_1^i u_2^j u_3^k`.
+    // Start with the unit polynomial 1.
+    let mut poly = vec![0.0f64; size];
+    poly[0] = 1.0;
+
+    for r in 0..d {
+        let br = beta[r] as u32;
+        if br == 0 {
+            continue;
+        }
+        let qr = q[r];
+        let e1 = e[0][r];
+        let e2 = e[1][r];
+        let e3 = e[2][r];
+        for _ in 0..br {
+            // poly := poly · (qr + e1·u_1 + e2·u_2 + e3·u_3). Shift-add
+            // pattern; we accumulate into a fresh buffer to avoid
+            // aliasing. Bounds: indices stay ≤ n_max by construction
+            // because total degree at most |β|.
+            let mut next = vec![0.0f64; size];
+            for k in 0..stride {
+                for j in 0..stride {
+                    for i in 0..stride {
+                        let v = poly[i + stride * (j + stride * k)];
+                        if v == 0.0 {
+                            continue;
+                        }
+                        next[i + stride * (j + stride * k)] += qr * v;
+                        if i + 1 < stride {
+                            next[(i + 1) + stride * (j + stride * k)] += e1 * v;
+                        }
+                        if j + 1 < stride {
+                            next[i + stride * ((j + 1) + stride * k)] += e2 * v;
+                        }
+                        if k + 1 < stride {
+                            next[i + stride * (j + stride * (k + 1))] += e3 * v;
+                        }
+                    }
+                }
+            }
+            poly = next;
+        }
+    }
+
+    // Integrate term-by-term against the Dirichlet kernel and scale by
+    // |det B| (the constant Jacobian).
+    let mut acc = 0.0f64;
+    for k in 0..stride {
+        for j in 0..stride {
+            for i in 0..stride {
+                let coeff = poly[i + stride * (j + stride * k)];
+                if coeff == 0.0 {
+                    continue;
+                }
+                acc += coeff * dirichlet_ref_simplex(i as u32, j as u32, k as u32);
+            }
+        }
+    }
+    acc * det_b
+}
+
+/// Generate NVRTC C++ source for the geometric-moment kernel. One thread =
+/// one (tet, β-slot). The β multi-index table is baked in as a
+/// `__constant__` array so the per-axis loop unrolls.
+fn build_tet_geom_kernel_source(d: usize, betas: &[Vec<u8>]) -> String {
+    let nbeta = betas.len();
+    let beta_total_max: u32 = betas
+        .iter()
+        .map(|row| row.iter().map(|&v| v as u32).sum::<u32>())
+        .max()
+        .unwrap_or(0);
+    let stride = (beta_total_max + 1) as usize;
+    // We allocate the dense (stride)^3 polynomial buffer in registers /
+    // local memory. Total doubles = stride^3 — keep it bounded.
+    let poly_len = stride * stride * stride;
+
+    let mut beta_decl = String::new();
+    beta_decl.push_str("__constant__ unsigned char BETA_TABLE[NBETA][D] = {\n");
+    for row in betas {
+        beta_decl.push_str("    { ");
+        for (k, v) in row.iter().enumerate() {
+            if k > 0 {
+                beta_decl.push_str(", ");
+            }
+            beta_decl.push_str(&v.to_string());
+        }
+        beta_decl.push_str(" },\n");
+    }
+    beta_decl.push_str("};\n");
+
+    format!(
+        r#"
+#define D       {d}
+#define NBETA   {nbeta}
+#define STRIDE  {stride}
+#define POLYLEN {poly_len}
+
+{beta_decl}
+
+// Dense polynomial in (u_1, u_2, u_3) with per-axis degree cap STRIDE-1.
+// Coefficient of u_1^i u_2^j u_3^k stored at poly[i + STRIDE*(j + STRIDE*k)].
+
+// Factorials up to 12 (covers any β-sum we ever ship).
+__constant__ double FACT_LUT[13] = {{
+    1.0, 1.0, 2.0, 6.0, 24.0, 120.0, 720.0, 5040.0, 40320.0, 362880.0,
+    3628800.0, 39916800.0, 479001600.0
+}};
+
+__device__ __forceinline__ double dirichlet_3(int n1, int n2, int n3) {{
+    int s = n1 + n2 + n3 + 3;
+    return FACT_LUT[n1] * FACT_LUT[n2] * FACT_LUT[n3] / FACT_LUT[s];
+}}
+
+// Inputs (all device-resident):
+//   vertices_flat: f64[n_tets * 4 * D] — tet vertex coordinates.
+//   cell_index:    i32[n_tets]         — logical cell per tet (only used by
+//                                          stage 2; the geom kernel forwards
+//                                          it through unmodified output).
+//   cell_centers:  f64[n_cells * D]    — per-cell expansion point c0.
+// Output:
+//   out: f64[NBETA * out_stride], β-major; thread (tet, β) writes
+//        out[β * out_stride + tet].
+extern "C" __global__ void tetrahedral_geom_moments_kernel(
+    const double *vertices_flat,
+    const int    *cell_index,
+    const double *cell_centers,
+    int           n_tets,
+    long long     out_stride,
+    double       *out
+) {{
+    const int tet  = blockIdx.x * blockDim.x + threadIdx.x;
+    const int bidx = blockIdx.y * blockDim.y + threadIdx.y;
+    if (tet >= n_tets || bidx >= NBETA) return;
+
+    const int cell = cell_index[tet];
+    const double *vptr  = vertices_flat + (long long)tet * 4LL * (long long)D;
+    const double *c0ptr = cell_centers  + (long long)cell * (long long)D;
+
+    // Per-axis q[r] and e[i][r] (i = 0..2 → edges v1−v0, v2−v0, v3−v0).
+    double q[D];
+    double e[3][D];
+    #pragma unroll
+    for (int r = 0; r < D; ++r) {{
+        const double v0r = vptr[r];
+        q[r]    = v0r - c0ptr[r];
+        e[0][r] = vptr[1*D + r] - v0r;
+        e[1][r] = vptr[2*D + r] - v0r;
+        e[2][r] = vptr[3*D + r] - v0r;
+    }}
+
+    // |det B| (D >= 3). For D > 3 fall back to sqrt(det(BᵀB)). Compile-time
+    // branched so the D = 3 fast path stays a single 3×3 cofactor expansion.
+    double det_b;
+#if D == 3
+    det_b = fabs(
+        e[0][0] * (e[1][1] * e[2][2] - e[1][2] * e[2][1])
+      - e[1][0] * (e[0][1] * e[2][2] - e[0][2] * e[2][1])
+      + e[2][0] * (e[0][1] * e[1][2] - e[0][2] * e[1][1])
+    );
+#else
+    double g[3][3];
+    #pragma unroll
+    for (int i = 0; i < 3; ++i) {{
+        #pragma unroll
+        for (int j = 0; j < 3; ++j) {{
+            double acc = 0.0;
+            #pragma unroll
+            for (int r = 0; r < D; ++r) acc += e[i][r] * e[j][r];
+            g[i][j] = acc;
+        }}
+    }}
+    double det_g =
+        g[0][0] * (g[1][1] * g[2][2] - g[1][2] * g[2][1])
+      - g[0][1] * (g[1][0] * g[2][2] - g[1][2] * g[2][0])
+      + g[0][2] * (g[1][0] * g[2][1] - g[1][1] * g[2][0]);
+    det_b = sqrt(det_g > 0.0 ? det_g : 0.0);
+#endif
+
+    // Dense polynomial buffer in (u_1, u_2, u_3). Starts as the constant
+    // polynomial 1, then iteratively multiplied by (q_r + Σ_i e_{{i,r}} u_i)
+    // for each axis r, β_r times. We use two ping-pong buffers in local
+    // memory; the compiler keeps them in registers when POLYLEN is small.
+    double poly_a[POLYLEN];
+    double poly_b[POLYLEN];
+    #pragma unroll
+    for (int t = 0; t < POLYLEN; ++t) {{ poly_a[t] = 0.0; poly_b[t] = 0.0; }}
+    poly_a[0] = 1.0;
+    bool a_is_src = true;
+
+    #pragma unroll
+    for (int r = 0; r < D; ++r) {{
+        const unsigned int br = (unsigned int)BETA_TABLE[bidx][r];
+        const double qr = q[r];
+        const double e1 = e[0][r];
+        const double e2 = e[1][r];
+        const double e3 = e[2][r];
+        for (unsigned int rep = 0; rep < br; ++rep) {{
+            double *src = a_is_src ? poly_a : poly_b;
+            double *dst = a_is_src ? poly_b : poly_a;
+            #pragma unroll
+            for (int t = 0; t < POLYLEN; ++t) dst[t] = 0.0;
+            // Shift-add: dst = qr*src + e1*shift_i(src) + e2*shift_j(src) + e3*shift_k(src)
+            for (int k = 0; k < STRIDE; ++k) {{
+                for (int j = 0; j < STRIDE; ++j) {{
+                    for (int i = 0; i < STRIDE; ++i) {{
+                        const int idx = i + STRIDE * (j + STRIDE * k);
+                        const double v = src[idx];
+                        if (v == 0.0) continue;
+                        dst[idx] += qr * v;
+                        if (i + 1 < STRIDE) dst[(i+1) + STRIDE*(j + STRIDE*k)] += e1 * v;
+                        if (j + 1 < STRIDE) dst[i + STRIDE*((j+1) + STRIDE*k)] += e2 * v;
+                        if (k + 1 < STRIDE) dst[i + STRIDE*(j + STRIDE*(k+1))] += e3 * v;
+                    }}
+                }}
+            }}
+            a_is_src = !a_is_src;
+        }}
+    }}
+
+    const double *final_poly = a_is_src ? poly_a : poly_b;
+    double acc = 0.0;
+    for (int k = 0; k < STRIDE; ++k) {{
+        for (int j = 0; j < STRIDE; ++j) {{
+            for (int i = 0; i < STRIDE; ++i) {{
+                const double coeff = final_poly[i + STRIDE * (j + STRIDE * k)];
+                if (coeff == 0.0) continue;
+                acc = fma(coeff, dirichlet_3(i, j, k), acc);
+            }}
+        }}
+    }}
+
+    out[(long long)bidx * out_stride + (long long)tet] = acc * det_b;
+}}
+"#,
+        d = d,
+        nbeta = nbeta,
+        stride = stride,
+        poly_len = poly_len,
+        beta_decl = beta_decl,
+    )
+}
+
+/// Generate NVRTC C++ source for the basis-Gram contraction kernel. One
+/// thread = one (cell, α-slot, pair-slot). Reads the per-tet geometric
+/// moment table emitted by stage 1 plus the per-cell weight tensor and
+/// accumulates the basis-pair moment for the cell.
+fn build_tet_contract_kernel_source(nalpha: usize, nbeta: usize, pairs: usize) -> String {
+    format!(
+        r#"
+#define NALPHA  {nalpha}
+#define NBETA   {nbeta}
+#define PAIRS   {pairs}
+
+// Inputs:
+//   geom: f64[NBETA * geom_stride] β-major; geom[β*geom_stride + tet] = G_β(tet).
+//   weights: f64[n_cells * NALPHA * NBETA * PAIRS]
+//       row-major (cell, α, β, pair). Caller supplies the basis-Gram tensor
+//       per cell — for tensor-product cubics this is the same coefficient
+//       array used by the hex kernel, expressed as a coefficient on the
+//       geometric monomial basis (see the math contract block above).
+//   tet_to_cell: i32[n_tets] — same array as the stage-1 cell_index input.
+//   tet_offsets: i32[n_cells + 1] — CSR-style segment offsets so the kernel
+//       walks all tets of cell `c` in tet_to_cell[tet_offsets[c]..tet_offsets[c+1]].
+//
+// Output:
+//   out: f64[NALPHA * PAIRS * out_stride], α-major along outermost, then
+//        pair, then cell; thread (cell, α, pair) writes
+//        out[(α * PAIRS + pair) * out_stride + cell].
+extern "C" __global__ void tetrahedral_contract_kernel(
+    const double *geom,
+    long long     geom_stride,
+    const double *weights,
+    const int    *tet_offsets,
+    const int    *tet_index_in_segment,
+    int           n_cells,
+    long long     out_stride,
+    double       *out
+) {{
+    const int cell  = blockIdx.x * blockDim.x + threadIdx.x;
+    const int alpha = blockIdx.y * blockDim.y + threadIdx.y;
+    const int pair  = blockIdx.z * blockDim.z + threadIdx.z;
+    if (cell >= n_cells || alpha >= NALPHA || pair >= PAIRS) return;
+
+    const int beg = tet_offsets[cell];
+    const int end = tet_offsets[cell + 1];
+
+    // Per-cell weight base: weights[cell, α, β, pair] flattened.
+    const long long w_base = ((long long)cell * (long long)NALPHA + (long long)alpha)
+                                * (long long)NBETA * (long long)PAIRS
+                              + (long long)pair;
+
+    double acc = 0.0;
+    for (int t = beg; t < end; ++t) {{
+        const int tet = tet_index_in_segment[t];
+        #pragma unroll
+        for (int b = 0; b < NBETA; ++b) {{
+            const double g_b = geom[(long long)b * geom_stride + (long long)tet];
+            const double w   = weights[w_base + (long long)b * (long long)PAIRS];
+            acc = fma(w, g_b, acc);
+        }}
+    }}
+
+    out[((long long)alpha * (long long)PAIRS + (long long)pair) * out_stride
+        + (long long)cell] = acc;
+}}
+"#,
+        nalpha = nalpha,
+        nbeta = nbeta,
+        pairs = pairs,
+    )
+}
+
+/// Inputs to the tetrahedral two-stage path. The caller assembles the
+/// per-cell basis-Gram weight tensor on the CPU once per fit (it depends
+/// only on the cell geometry and the chosen basis, not on PIRLS state)
+/// and hands it in along with the CSR-style tet→cell index.
+#[derive(Clone, Debug)]
+pub struct TetrahedralMomentInputs<'a> {
+    pub spec: &'a TetrahedralMomentSpec,
+    pub cells: &'a TetrahedralCellTable,
+    /// `tet_offsets[cell + 1] − tet_offsets[cell]` = number of tets in cell.
+    /// Length = n_cells + 1. Caller is responsible for emitting this in the
+    /// same order as `cell_index` is partitioned (i.e. sort tets by
+    /// `cell_index`, then `tet_index_in_segment[t] = original_tet_index`).
+    pub tet_offsets: &'a [i32],
+    pub tet_index_in_segment: &'a [i32],
+    /// `weights[cell, α, β, pair]` flattened row-major. Length
+    /// = n_cells · NALPHA · NBETA · PAIRS_PER_CELL.
+    pub weights: &'a [f64],
+}
+
+/// Device-side dispatcher for the CM-P3 tetrahedral path. Mirrors the
+/// `Ok(None)` fallback pattern used by `try_device_moments` in
+/// `src/gpu/cubic_cell/device.rs`: returns `Ok(None)` when there is no
+/// usable CUDA runtime (caller should fall back to a CPU evaluator or the
+/// hex path), `Ok(Some(_))` on a successful launch, and `Err(_)` on a
+/// genuine driver / NVRTC / shape failure.
+#[cfg(target_os = "linux")]
+pub fn try_device_tetrahedral_moments(
+    inputs: &TetrahedralMomentInputs<'_>,
+) -> Result<Option<DeviceCubicMomentTable>, GpuError> {
+    let backend = match CubicMomentBackend::probe() {
+        Ok(b) => b,
+        Err(GpuError::DriverLibraryUnavailable { .. }) => return Ok(None),
+        Err(other) => return Err(other),
+    };
+    build_tetrahedral_moments_device(backend, inputs).map(Some)
+}
+
+/// Non-Linux stub for the dispatcher. Always returns `Ok(None)`; the
+/// caller must have a CPU evaluator already since the hex path's
+/// `build_hex_tensor_moments_device` returns `Err(DriverLibraryUnavailable)`
+/// here. The asymmetry is intentional: the hex path is the historic API
+/// and changing its return shape would ripple into every existing call
+/// site; the tetrahedral path is new and adopts the modern Ok(None) shape
+/// from the start (matching task #21's explicit charter language).
+#[cfg(not(target_os = "linux"))]
+pub fn try_device_tetrahedral_moments(
+    inputs: &TetrahedralMomentInputs<'_>,
+) -> Result<Option<DeviceCubicMomentTable>, GpuError> {
+    // Surface the inputs in the error path so non-Linux builds do not
+    // silently strip them (the lib must not contain `_`-prefixed silencers).
+    if inputs.cells.n_tets == 0 {
+        gpu_bail!(
+            "try_device_tetrahedral_moments: empty tet list (n_cells={})",
+            inputs.cells.n_cells
+        );
+    }
+    Ok(None)
+}
+
+#[cfg(target_os = "linux")]
+fn build_tetrahedral_moments_device(
+    backend: &CubicMomentBackend,
+    inputs: &TetrahedralMomentInputs<'_>,
+) -> Result<DeviceCubicMomentTable, GpuError> {
+    use cudarc::driver::{LaunchConfig, PushKernelArg};
+
+    inputs.cells.validate()?;
+    let spec = inputs.spec;
+    let cells = inputs.cells;
+    if spec.d() != cells.d {
+        gpu_bail!(
+            "build_tetrahedral_moments_device: spec.d()={} != cells.d={}",
+            spec.d(),
+            cells.d
+        );
+    }
+    if cells.d < 3 {
+        gpu_bail!(
+            "build_tetrahedral_moments_device: tetrahedral path requires D >= 3 (got {})",
+            cells.d
+        );
+    }
+    let nalpha = spec.n_alpha();
+    let nbeta = spec.n_beta();
+    let pairs = spec.pairs_per_cell;
+    if nalpha == 0 || nbeta == 0 || pairs == 0 || cells.n_tets == 0 || cells.n_cells == 0 {
+        gpu_bail!(
+            "build_tetrahedral_moments_device: empty spec or cell list \
+             (nalpha={nalpha}, nbeta={nbeta}, pairs={pairs}, n_tets={}, n_cells={})",
+            cells.n_tets,
+            cells.n_cells
+        );
+    }
+    let want_off = cells.n_cells + 1;
+    if inputs.tet_offsets.len() != want_off {
+        gpu_bail!(
+            "build_tetrahedral_moments_device: tet_offsets len {} != n_cells+1 {}",
+            inputs.tet_offsets.len(),
+            want_off
+        );
+    }
+    if inputs.tet_index_in_segment.len() != cells.n_tets {
+        gpu_bail!(
+            "build_tetrahedral_moments_device: tet_index_in_segment len {} != n_tets {}",
+            inputs.tet_index_in_segment.len(),
+            cells.n_tets
+        );
+    }
+    let want_w = cells.n_cells * nalpha * nbeta * pairs;
+    if inputs.weights.len() != want_w {
+        gpu_bail!(
+            "build_tetrahedral_moments_device: weights len {} != n_cells*nalpha*nbeta*pairs {}",
+            inputs.weights.len(),
+            want_w
+        );
+    }
+
+    let stream = backend.inner.stream.clone();
+
+    // ───── Stage 1: geometric moments ─────
+    let geom_key = TetMomentModuleKey {
+        cc_major: backend.inner.cc_major,
+        cc_minor: backend.inner.cc_minor,
+        kind: 0,
+        d: cells.d as u32,
+        nbeta: nbeta as u32,
+        nalpha: 0,
+        pairs: 0,
+        beta_hash: hash_beta_table(&spec.geom_betas),
+        alpha_hash: 0,
+        layout_tag: layout_tag(spec.layout),
+    };
+    let d_for_geom = cells.d;
+    let betas_for_geom = spec.geom_betas.clone();
+    let geom_module = backend.tet_module_for(geom_key, move || {
+        build_tet_geom_kernel_source(d_for_geom, &betas_for_geom)
+    })?;
+    let geom_func = geom_module
+        .load_function("tetrahedral_geom_moments_kernel")
+        .gpu_ctx("tetrahedral_moments load_function geom")?;
+
+    let vertices_dev = stream
+        .clone_htod(cells.vertices.as_slice())
+        .gpu_ctx("tetrahedral_moments htod vertices")?;
+    let cell_index_dev = stream
+        .clone_htod(cells.cell_index.as_slice())
+        .gpu_ctx("tetrahedral_moments htod cell_index")?;
+    let cell_centers_dev = stream
+        .clone_htod(cells.cell_centers.as_slice())
+        .gpu_ctx("tetrahedral_moments htod cell_centers")?;
+
+    let geom_stride = ((cells.n_tets + 31) / 32) * 32;
+    let mut geom_dev = stream
+        .alloc_zeros::<f64>(geom_stride * nbeta)
+        .gpu_ctx_with(|err| format!(
+            "tetrahedral_moments alloc geom (stride={geom_stride}, nbeta={nbeta}): {err}"
+        ))?;
+
+    let block_x: u32 = 32;
+    let block_y: u32 = 8;
+    let grid_x: u32 = ((cells.n_tets as u32) + block_x - 1) / block_x;
+    let grid_y: u32 = ((nbeta as u32) + block_y - 1) / block_y;
+    let cfg_geom = LaunchConfig {
+        grid_dim: (grid_x, grid_y, 1),
+        block_dim: (block_x, block_y, 1),
+        shared_mem_bytes: 0,
+    };
+    let n_tets_i32: i32 = i32::try_from(cells.n_tets).map_err(|_| gpu_err!(
+        "tetrahedral_moments n_tets={} overflows i32",
+        cells.n_tets
+    ))?;
+    let geom_stride_i64: i64 = geom_stride as i64;
+
+    let mut builder = stream.launch_builder(&geom_func);
+    builder
+        .arg(&vertices_dev)
+        .arg(&cell_index_dev)
+        .arg(&cell_centers_dev)
+        .arg(&n_tets_i32)
+        .arg(&geom_stride_i64)
+        .arg(&mut geom_dev);
+    // SAFETY: pointers come from cudarc-checked allocations on `stream`;
+    // kernel reads inputs of declared sizes and writes within
+    // geom[0 .. geom_stride * nbeta]. Launch dims are non-zero, bounded
+    // by the i32 cap above.
+    unsafe { builder.launch(cfg_geom) }
+        .gpu_ctx("tetrahedral_moments geom kernel launch")?;
+
+    // ───── Stage 2: basis-Gram contraction ─────
+    let con_key = TetMomentModuleKey {
+        cc_major: backend.inner.cc_major,
+        cc_minor: backend.inner.cc_minor,
+        kind: 1,
+        d: cells.d as u32,
+        nbeta: nbeta as u32,
+        nalpha: nalpha as u32,
+        pairs: pairs as u32,
+        beta_hash: hash_beta_table(&spec.geom_betas),
+        alpha_hash: hash_alpha_table(&spec.alphas),
+        layout_tag: layout_tag(spec.layout),
+    };
+    let con_module = backend.tet_module_for(con_key, move || {
+        build_tet_contract_kernel_source(nalpha, nbeta, pairs)
+    })?;
+    let con_func = con_module
+        .load_function("tetrahedral_contract_kernel")
+        .gpu_ctx("tetrahedral_moments load_function contract")?;
+
+    let weights_dev = stream
+        .clone_htod(inputs.weights)
+        .gpu_ctx("tetrahedral_moments htod weights")?;
+    let offsets_dev = stream
+        .clone_htod(inputs.tet_offsets)
+        .gpu_ctx("tetrahedral_moments htod offsets")?;
+    let segidx_dev = stream
+        .clone_htod(inputs.tet_index_in_segment)
+        .gpu_ctx("tetrahedral_moments htod segidx")?;
+
+    let out_stride = ((cells.n_cells + 31) / 32) * 32;
+    let mut out_dev = stream
+        .alloc_zeros::<f64>(out_stride * nalpha * pairs)
+        .gpu_ctx_with(|err| format!(
+            "tetrahedral_moments alloc out (stride={out_stride}, nalpha={nalpha}, pairs={pairs}): {err}"
+        ))?;
+
+    let block_cx: u32 = 16;
+    let block_cy: u32 = 4;
+    let block_cz: u32 = 4;
+    let grid_cx: u32 = ((cells.n_cells as u32) + block_cx - 1) / block_cx;
+    let grid_cy: u32 = ((nalpha as u32) + block_cy - 1) / block_cy;
+    let grid_cz: u32 = ((pairs as u32) + block_cz - 1) / block_cz;
+    let cfg_con = LaunchConfig {
+        grid_dim: (grid_cx, grid_cy, grid_cz),
+        block_dim: (block_cx, block_cy, block_cz),
+        shared_mem_bytes: 0,
+    };
+    let n_cells_i32: i32 = i32::try_from(cells.n_cells).map_err(|_| gpu_err!(
+        "tetrahedral_moments n_cells={} overflows i32",
+        cells.n_cells
+    ))?;
+    let out_stride_i64: i64 = out_stride as i64;
+
+    let mut builder = stream.launch_builder(&con_func);
+    builder
+        .arg(&geom_dev)
+        .arg(&geom_stride_i64)
+        .arg(&weights_dev)
+        .arg(&offsets_dev)
+        .arg(&segidx_dev)
+        .arg(&n_cells_i32)
+        .arg(&out_stride_i64)
+        .arg(&mut out_dev);
+    // SAFETY: pointers come from cudarc-checked allocations on `stream`;
+    // kernel reads inputs of declared sizes and writes within
+    // out[0 .. out_stride * nalpha * pairs]. Launch dims are non-zero.
+    unsafe { builder.launch(cfg_con) }
+        .gpu_ctx("tetrahedral_moments contract kernel launch")?;
+    stream
+        .synchronize()
+        .gpu_ctx("tetrahedral_moments synchronize")?;
+
+    Ok(DeviceCubicMomentTable {
+        n_cells: cells.n_cells,
+        pair_tuple_count: pairs,
+        n_alpha: nalpha,
+        layout: spec.layout,
+        values: out_dev,
+    })
+}
+
+// ────────────────────────────────────────────────────────────────────────
 // Tests (Phase 1 validation)
 // ────────────────────────────────────────────────────────────────────────
 
