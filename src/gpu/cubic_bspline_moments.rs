@@ -51,6 +51,14 @@
 //! by the denested-cubic-transport row jet (`nvrtc-bms-flex`'s territory). Names
 //! in this module are deliberately distinct (`cubic_bspline_cell_moments`,
 //! `tensor_bspline_moment_table`) to avoid any collision or confusion.
+//!
+//! ## Task ledger (cubic-moments charter)
+//!
+//! - CM-P1 — hex CPU reference + Phase-1 host substrate. **DONE**.
+//! - CM-P2 — hex NVRTC kernel + V100 parity bench. **DONE** (commit cd27ff0cf).
+//! - CM-P3 — tetrahedral two-stage moment kernel (`tetrahedral_geom_moments_kernel`
+//!   + `tetrahedral_contract_kernel`, host dispatcher
+//!   `try_device_tetrahedral_moments`). **DONE** — see the CM-P3 section below.
 
 #[cfg(target_os = "linux")]
 use std::collections::HashMap;
