@@ -286,6 +286,123 @@ pub struct LikelihoodSpec {
     pub link: InverseLink,
 }
 
+/// Legal-only enumeration of the `(ResponseFamily, InverseLink)` cells the
+/// engine recognises. `LikelihoodSpec` is the product type with ~40 nominal
+/// cells (8 response variants × 5 inverse-link variants), but only the cells
+/// listed here are honoured by the family math; the rest are silently masked
+/// by fallback arms. `FamilySpecKind` is the canonical projection used by
+/// naming, predicates, and dispatch.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum FamilySpecKind {
+    GaussianIdentity,
+    PoissonLog,
+    GammaLog,
+    TweedieLog { p: f64 },
+    NegativeBinomialLog { theta: f64 },
+    BetaLogit { phi: f64 },
+    RoystonParmar,
+    BinomialLogit,
+    BinomialProbit,
+    BinomialCLogLog,
+    BinomialLatentCLogLog(LatentCLogLogState),
+    BinomialSas(SasLinkState),
+    BinomialBetaLogistic(SasLinkState),
+    BinomialMixture(MixtureLinkState),
+}
+
+impl FamilySpecKind {
+    /// Short identifier matching the legacy `LikelihoodSpec::name()` strings.
+    #[inline]
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Self::GaussianIdentity => "gaussian",
+            Self::PoissonLog => "poisson-log",
+            Self::TweedieLog { .. } => "tweedie-log",
+            Self::NegativeBinomialLog { .. } => "negative-binomial-log",
+            Self::BetaLogit { .. } => "beta-regression-logit",
+            Self::GammaLog => "gamma-log",
+            Self::RoystonParmar => "royston-parmar",
+            Self::BinomialLogit => "binomial-logit",
+            Self::BinomialProbit => "binomial-probit",
+            Self::BinomialCLogLog => "binomial-cloglog",
+            Self::BinomialLatentCLogLog(_) => "latent-cloglog-binomial",
+            Self::BinomialSas(_) => "binomial-sas",
+            Self::BinomialBetaLogistic(_) => "binomial-beta-logistic",
+            Self::BinomialMixture(_) => "binomial-blended-inverse-link",
+        }
+    }
+
+    /// Human-readable label matching the legacy `LikelihoodSpec::pretty_name()` strings.
+    #[inline]
+    pub const fn pretty_name(&self) -> &'static str {
+        match self {
+            Self::GaussianIdentity => "Gaussian Identity",
+            Self::PoissonLog => "Poisson Log",
+            Self::TweedieLog { .. } => "Tweedie Log",
+            Self::NegativeBinomialLog { .. } => "Negative-Binomial Log",
+            Self::BetaLogit { .. } => "Beta Regression Logit",
+            Self::GammaLog => "Gamma Log",
+            Self::RoystonParmar => "Royston Parmar",
+            Self::BinomialLogit => "Binomial Logit",
+            Self::BinomialProbit => "Binomial Probit",
+            Self::BinomialCLogLog => "Binomial CLogLog",
+            Self::BinomialLatentCLogLog(_) => "Latent CLogLog Binomial",
+            Self::BinomialSas(_) => "Binomial SAS",
+            Self::BinomialBetaLogistic(_) => "Binomial Beta-Logistic",
+            Self::BinomialMixture(_) => "Binomial Blended Inverse-Link",
+        }
+    }
+
+    #[inline]
+    pub const fn is_binomial(&self) -> bool {
+        matches!(
+            self,
+            Self::BinomialLogit
+                | Self::BinomialProbit
+                | Self::BinomialCLogLog
+                | Self::BinomialLatentCLogLog(_)
+                | Self::BinomialSas(_)
+                | Self::BinomialBetaLogistic(_)
+                | Self::BinomialMixture(_)
+        )
+    }
+
+    #[inline]
+    pub const fn is_gaussian_identity(&self) -> bool {
+        matches!(self, Self::GaussianIdentity)
+    }
+
+    #[inline]
+    pub const fn is_royston_parmar(&self) -> bool {
+        matches!(self, Self::RoystonParmar)
+    }
+
+    #[inline]
+    pub const fn is_latent_cloglog(&self) -> bool {
+        matches!(self, Self::BinomialLatentCLogLog(_))
+    }
+
+    #[inline]
+    pub const fn is_binomial_mixture(&self) -> bool {
+        matches!(self, Self::BinomialMixture(_))
+    }
+
+    #[inline]
+    pub const fn is_binomial_sas(&self) -> bool {
+        matches!(self, Self::BinomialSas(_))
+    }
+
+    #[inline]
+    pub const fn is_binomial_beta_logistic(&self) -> bool {
+        matches!(self, Self::BinomialBetaLogistic(_))
+    }
+
+    #[inline]
+    pub const fn supports_firth(&self) -> bool {
+        matches!(self, Self::BinomialLogit)
+    }
+}
+
 impl LikelihoodSpec {
     #[inline]
     pub const fn new(response: ResponseFamily, link: InverseLink) -> Self {
@@ -402,44 +519,87 @@ impl LikelihoodSpec {
         self.link.link_function()
     }
 
-    #[inline]
-    pub const fn is_binomial(&self) -> bool {
-        matches!(self.response, ResponseFamily::Binomial)
+    /// Once-and-for-all classification into the legal-only `FamilySpecKind`.
+    ///
+    /// `(ResponseFamily, InverseLink)` is a 40-cell product; only the cells
+    /// listed here are recognised by the family math. Cells that fall outside
+    /// the legal enumeration are coerced to the nearest legal cell that the
+    /// historical `pretty_name`/`name` fallback arms exposed (currently
+    /// `BinomialLogit` for any `Binomial + Standard(_)` cell that is not
+    /// already Logit/Probit/CLogLog).
+    pub fn kind(&self) -> FamilySpecKind {
+        match (&self.response, &self.link) {
+            (ResponseFamily::Gaussian, _) => FamilySpecKind::GaussianIdentity,
+            (ResponseFamily::Poisson, _) => FamilySpecKind::PoissonLog,
+            (ResponseFamily::Tweedie { p }, _) => FamilySpecKind::TweedieLog { p: *p },
+            (ResponseFamily::NegativeBinomial { theta }, _) => {
+                FamilySpecKind::NegativeBinomialLog { theta: *theta }
+            }
+            (ResponseFamily::Beta { phi }, _) => FamilySpecKind::BetaLogit { phi: *phi },
+            (ResponseFamily::Gamma, _) => FamilySpecKind::GammaLog,
+            (ResponseFamily::RoystonParmar, _) => FamilySpecKind::RoystonParmar,
+            (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Probit)) => {
+                FamilySpecKind::BinomialProbit
+            }
+            (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::CLogLog)) => {
+                FamilySpecKind::BinomialCLogLog
+            }
+            (ResponseFamily::Binomial, InverseLink::LatentCLogLog(state)) => {
+                FamilySpecKind::BinomialLatentCLogLog(*state)
+            }
+            (ResponseFamily::Binomial, InverseLink::Sas(state)) => {
+                FamilySpecKind::BinomialSas(*state)
+            }
+            (ResponseFamily::Binomial, InverseLink::BetaLogistic(state)) => {
+                FamilySpecKind::BinomialBetaLogistic(*state)
+            }
+            (ResponseFamily::Binomial, InverseLink::Mixture(state)) => {
+                FamilySpecKind::BinomialMixture(state.clone())
+            }
+            // Legacy fallback: `Binomial + Standard(Logit | Identity | Log | Sas |
+            // BetaLogistic)` all historically named "binomial-logit". The
+            // `binomial_link(LinkFunction::Sas | BetaLogistic)` constructor
+            // produces `Binomial + Standard(Sas | BetaLogistic)` — these are
+            // illegal cells (Sas/BetaLogistic must travel via their own
+            // `InverseLink` variants), but routing them to `BinomialLogit`
+            // preserves the historical fallback behaviour.
+            (ResponseFamily::Binomial, InverseLink::Standard(_)) => FamilySpecKind::BinomialLogit,
+        }
     }
 
     #[inline]
-    pub const fn is_gaussian_identity(&self) -> bool {
-        matches!(self.response, ResponseFamily::Gaussian)
-            && matches!(self.link, InverseLink::Standard(LinkFunction::Identity))
+    pub fn is_binomial(&self) -> bool {
+        self.kind().is_binomial()
     }
 
     #[inline]
-    pub const fn is_royston_parmar(&self) -> bool {
-        matches!(self.response, ResponseFamily::RoystonParmar)
+    pub fn is_gaussian_identity(&self) -> bool {
+        self.kind().is_gaussian_identity()
     }
 
     #[inline]
-    pub const fn is_latent_cloglog(&self) -> bool {
-        matches!(self.response, ResponseFamily::Binomial)
-            && matches!(self.link, InverseLink::LatentCLogLog(_))
+    pub fn is_royston_parmar(&self) -> bool {
+        self.kind().is_royston_parmar()
     }
 
     #[inline]
-    pub const fn is_binomial_mixture(&self) -> bool {
-        matches!(self.response, ResponseFamily::Binomial)
-            && matches!(self.link, InverseLink::Mixture(_))
+    pub fn is_latent_cloglog(&self) -> bool {
+        self.kind().is_latent_cloglog()
     }
 
     #[inline]
-    pub const fn is_binomial_sas(&self) -> bool {
-        matches!(self.response, ResponseFamily::Binomial)
-            && matches!(self.link, InverseLink::Sas(_))
+    pub fn is_binomial_mixture(&self) -> bool {
+        self.kind().is_binomial_mixture()
     }
 
     #[inline]
-    pub const fn is_binomial_beta_logistic(&self) -> bool {
-        matches!(self.response, ResponseFamily::Binomial)
-            && matches!(self.link, InverseLink::BetaLogistic(_))
+    pub fn is_binomial_sas(&self) -> bool {
+        self.kind().is_binomial_sas()
+    }
+
+    #[inline]
+    pub fn is_binomial_beta_logistic(&self) -> bool {
+        self.kind().is_binomial_beta_logistic()
     }
 
     /// Default scale metadata for this (response, link).
@@ -459,66 +619,21 @@ impl LikelihoodSpec {
         }
     }
 
-    /// Human-readable label derived directly from the `(response, link)` pair.
+    /// Human-readable label, routed through `FamilySpecKind`.
     #[inline]
     pub fn pretty_name(&self) -> &'static str {
-        match (&self.response, &self.link) {
-            (ResponseFamily::Gaussian, _) => "Gaussian Identity",
-            (ResponseFamily::Poisson, _) => "Poisson Log",
-            (ResponseFamily::Tweedie { .. }, _) => "Tweedie Log",
-            (ResponseFamily::NegativeBinomial { .. }, _) => "Negative-Binomial Log",
-            (ResponseFamily::Beta { .. }, _) => "Beta Regression Logit",
-            (ResponseFamily::Gamma, _) => "Gamma Log",
-            (ResponseFamily::RoystonParmar, _) => "Royston Parmar",
-            (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Logit)) => {
-                "Binomial Logit"
-            }
-            (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Probit)) => {
-                "Binomial Probit"
-            }
-            (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::CLogLog)) => {
-                "Binomial CLogLog"
-            }
-            (ResponseFamily::Binomial, InverseLink::LatentCLogLog(_)) => "Latent CLogLog Binomial",
-            (ResponseFamily::Binomial, InverseLink::Sas(_)) => "Binomial SAS",
-            (ResponseFamily::Binomial, InverseLink::BetaLogistic(_)) => "Binomial Beta-Logistic",
-            (ResponseFamily::Binomial, InverseLink::Mixture(_)) => "Binomial Blended Inverse-Link",
-            (ResponseFamily::Binomial, InverseLink::Standard(_)) => "Binomial Logit",
-        }
+        self.kind().pretty_name()
     }
 
-    /// Short identifier derived directly from the `(response, link)` pair.
+    /// Short identifier, routed through `FamilySpecKind`.
     #[inline]
     pub fn name(&self) -> &'static str {
-        match (&self.response, &self.link) {
-            (ResponseFamily::Gaussian, _) => "gaussian",
-            (ResponseFamily::Poisson, _) => "poisson-log",
-            (ResponseFamily::Tweedie { .. }, _) => "tweedie-log",
-            (ResponseFamily::NegativeBinomial { .. }, _) => "negative-binomial-log",
-            (ResponseFamily::Beta { .. }, _) => "beta-regression-logit",
-            (ResponseFamily::Gamma, _) => "gamma-log",
-            (ResponseFamily::RoystonParmar, _) => "royston-parmar",
-            (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Logit)) => {
-                "binomial-logit"
-            }
-            (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Probit)) => {
-                "binomial-probit"
-            }
-            (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::CLogLog)) => {
-                "binomial-cloglog"
-            }
-            (ResponseFamily::Binomial, InverseLink::LatentCLogLog(_)) => "latent-cloglog-binomial",
-            (ResponseFamily::Binomial, InverseLink::Sas(_)) => "binomial-sas",
-            (ResponseFamily::Binomial, InverseLink::BetaLogistic(_)) => "binomial-beta-logistic",
-            (ResponseFamily::Binomial, InverseLink::Mixture(_)) => "binomial-blended-inverse-link",
-            (ResponseFamily::Binomial, InverseLink::Standard(_)) => "binomial-logit",
-        }
+        self.kind().name()
     }
 
     #[inline]
-    pub const fn supports_firth(&self) -> bool {
-        matches!(self.response, ResponseFamily::Binomial)
-            && matches!(self.link, InverseLink::Standard(LinkFunction::Logit))
+    pub fn supports_firth(&self) -> bool {
+        self.kind().supports_firth()
     }
 
     /// Family-level fixed-dispersion contract. Returns the dispersion parameter

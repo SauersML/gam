@@ -11771,7 +11771,7 @@ fn compute_kkt_refusal_report(
         } else {
             0.0
         };
-        add_joint_penalty_to_matrix(&mut h_joint, ranges, s_lambdas, model_diagonal_ridge);
+        add_joint_penalty_to_matrix(&mut h_joint, ranges, s_lambdas, model_diagonal_ridge, None);
         symmetrize_dense_in_place(&mut h_joint);
         if let Ok((evals, evecs)) = FaerEigh::eigh(&h_joint, Side::Lower) {
             let mut sorted: Vec<f64> = evals.iter().copied().collect();
@@ -13275,6 +13275,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 &s_lambdas,
                 &beta_joint,
                 joint_mode_diagonal_ridge,
+                joint_bundle,
             );
             let rhs = &grad_joint - &penalty_beta;
             let beta_inf = states
@@ -13411,6 +13412,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     joint_mode_diagonal_ridge,
                     &trial_delta,
                     &mut hpen_delta,
+                    joint_bundle,
                 )
                 .is_err()
                 {
@@ -13441,6 +13443,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                             &s_lambdas,
                             joint_solver_diagonal_ridge,
                             &rhs,
+                            joint_bundle,
                         ) {
                             Ok(descent_delta) => {
                                 search_delta = descent_delta;
@@ -15353,6 +15356,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 &ranges_joint,
                 &s_lambdas,
                 trace_diagonal_ridge,
+                joint_bundle,
             );
 
             let mut beta_joint = Array1::<f64>::zeros(total_p_joint);
@@ -15367,6 +15371,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 &s_lambdas,
                 &beta_joint,
                 joint_mode_diagonal_ridge,
+                joint_bundle,
             );
             let rhs = &grad_full - &penalty_beta;
 
@@ -16615,7 +16620,7 @@ fn joint_penalty_subspace_trace_parts(
     }
 
     let mut s_lambda = Array2::<f64>::zeros((total, total));
-    add_joint_penalty_to_matrix(&mut s_lambda, ranges, s_lambdas, 0.0);
+    add_joint_penalty_to_matrix(&mut s_lambda, ranges, s_lambdas, 0.0, None);
     let (s_evals, s_evecs) = s_lambda
         .eigh(Side::Lower)
         .map_err(|e| format!("joint penalty subspace eigendecomposition failed: {e}"))?;
@@ -16640,14 +16645,14 @@ fn joint_penalty_subspace_trace_parts(
             JointHessianSource::Dense(h_joint) => {
                 let mut out = fast_av(h_joint, &basis);
                 let penalty =
-                    apply_joint_block_penalty(ranges, s_lambdas, &basis, hessian_diagonal_ridge);
+                    apply_joint_block_penalty(ranges, s_lambdas, &basis, hessian_diagonal_ridge, None);
                 out += &penalty;
                 out
             }
             JointHessianSource::Operator { apply, .. } => {
                 let mut out = apply(&basis)?;
                 let penalty =
-                    apply_joint_block_penalty(ranges, s_lambdas, &basis, hessian_diagonal_ridge);
+                    apply_joint_block_penalty(ranges, s_lambdas, &basis, hessian_diagonal_ridge, None);
                 out += &penalty;
                 out
             }
@@ -16806,6 +16811,7 @@ fn joint_outer_evaluate(
                                 apply_s.as_ref(),
                                 v,
                                 trace_diagonal_ridge,
+                                None,
                             );
                             out += &penalty;
                             out
@@ -16834,6 +16840,7 @@ fn joint_outer_evaluate(
                                 apply_s.as_ref(),
                                 v,
                                 trace_diagonal_ridge,
+                                None,
                             );
                             out += &penalty;
                             out
@@ -16853,6 +16860,7 @@ fn joint_outer_evaluate(
                 ranges,
                 &scaled_s_lambdas,
                 scaled_joint_trace_diagonal_ridge,
+                None,
             );
             Arc::new(
                 BlockCoupledOperator::from_joint_hessian_with_mode(
@@ -17129,6 +17137,7 @@ fn joint_outer_evaluate_efs(
                                 apply_s.as_ref(),
                                 v,
                                 trace_diagonal_ridge,
+                                None,
                             );
                             out += &penalty;
                             out
@@ -17157,6 +17166,7 @@ fn joint_outer_evaluate_efs(
                                 apply_s.as_ref(),
                                 v,
                                 trace_diagonal_ridge,
+                                None,
                             );
                             out += &penalty;
                             out
@@ -17176,6 +17186,7 @@ fn joint_outer_evaluate_efs(
                 ranges,
                 &scaled_s_lambdas,
                 scaled_joint_trace_diagonal_ridge,
+                None,
             );
             Arc::new(
                 BlockCoupledOperator::from_joint_hessian_with_mode(
@@ -25428,7 +25439,7 @@ mod tests {
         // simulate that branch by computing the shift directly via
         // `exact_newton_stabilizing_shift`.
         let mut lhs = h_nll.clone();
-        add_joint_penalty_to_matrix(&mut lhs, &ranges, &s_lambdas, base);
+        add_joint_penalty_to_matrix(&mut lhs, &ranges, &s_lambdas, base, None);
         let shift = exact_newton_stabilizing_shift(&lhs, ridge_floor)
             .expect("indefinite Hessian must yield a positive stabilizing shift");
         assert!(
@@ -25461,6 +25472,7 @@ mod tests {
             joint_solver_diagonal_ridge,
             &delta,
             &mut hpen_delta,
+            None,
         )
         .expect("apply joint penalized hessian must succeed");
 
@@ -25480,6 +25492,7 @@ mod tests {
             joint_mode_diagonal_ridge,
             &delta,
             &mut h_true_delta,
+            None,
         )
         .expect("apply true (un-stabilized) hessian must succeed");
         let actual = rhs.dot(&delta) - 0.5 * delta.dot(&h_true_delta);
@@ -25520,6 +25533,7 @@ mod tests {
                 joint_solver_diagonal_ridge,
                 &scaled_delta,
                 &mut scaled_hpen,
+                None,
             )
             .expect("apply scaled");
             let scaled_predicted =
@@ -25532,6 +25546,7 @@ mod tests {
                 joint_mode_diagonal_ridge,
                 &scaled_delta,
                 &mut scaled_h_true_delta,
+                None,
             )
             .expect("apply scaled true");
             let scaled_actual =
@@ -25557,6 +25572,7 @@ mod tests {
             &s_lambdas,
             JOINT_TRACE_STABILITY_RIDGE,
             1e-12,
+            None,
         );
 
         assert!(
@@ -25569,7 +25585,7 @@ mod tests {
                 panic!("dense joint solver fixture must use a dense Hessian source")
             }
         };
-        add_joint_penalty_to_matrix(&mut stabilized, &ranges, &s_lambdas, ridge);
+        add_joint_penalty_to_matrix(&mut stabilized, &ranges, &s_lambdas, ridge, None);
         let min_eval = 0.5
             * (stabilized[[0, 0]] + stabilized[[1, 1]]
                 - ((stabilized[[0, 0]] - stabilized[[1, 1]]).powi(2)
