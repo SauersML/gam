@@ -685,18 +685,58 @@ impl DeviationRuntime {
     }
 
     /// Accessor for the anchor-residual state set via
-    /// `compose_anchor_orthogonalisation`. Save-time code uses this to
-    /// snapshot the residual into the saved model; predict-time code
-    /// reconstructs the per-row η correction `n_row · residual_coefficients · β`.
+    /// `install_compiled_flex_block`. Save-time code uses this to snapshot
+    /// the residual into the saved model; predict-time code reconstructs
+    /// the per-row η correction `n_row · residual_coefficients · β`.
     pub fn anchor_residual(&self) -> Option<&AnchorResidual> {
         self.anchor_residual.as_ref()
     }
 
-    /// Set / replace the cached parametric-anchor rows at training rows.
-    /// Stored only at training time; predict-time reconstruction does not
-    /// use this cache (it evaluates anchor rows fresh).
-    pub(crate) fn set_anchor_rows_at_training(&mut self, rows: Array2<f64>) {
-        self.anchor_rows_at_training = Some(rows);
+    /// Single-step install of a compiled flex block from
+    /// `identifiability_compiler::compile`. Replaces the prior two-step
+    /// `set_anchor_rows_at_training` + `compose_anchor_orthogonalisation`
+    /// surface so the install path takes the canonical `CompiledBlock`
+    /// shape directly.
+    ///
+    /// Semantics:
+    /// - `compiled.t_lw` is the right-selector `V` applied to `span_c{0..3}`,
+    ///   `right_boundary_value_row`, and `monotonicity_constraint_rows` —
+    ///   identical to the legacy `compose_anchor_orthogonalisation` body.
+    /// - `compiled.anchor_correction` (always `Some` for non-empty anchor
+    ///   unions) becomes `AnchorResidual.residual_coefficients`. The
+    ///   orthonormalising rotation is structurally identity because the
+    ///   compiler bakes `R · K_w · V` into `M` already.
+    /// - `anchor_components` records the per-anchor predict-time tags so
+    ///   the saved-model rebuild can replay the anchor row map.
+    /// - `n_train_at_training` is cached for
+    ///   `design_at_training_with_residual`.
+    pub(crate) fn install_compiled_flex_block(
+        &mut self,
+        compiled: &crate::families::identifiability_compiler::CompiledBlock,
+        anchor_components: Vec<AnchorNullSpaceComponent>,
+        n_train_at_training: Array2<f64>,
+    ) -> Result<(), String> {
+        let m = compiled.anchor_correction.as_ref().ok_or_else(|| {
+            "DeviationRuntime::install_compiled_flex_block: compiled block has no \
+             anchor_correction — install requires a non-empty anchor union"
+                .to_string()
+        })?;
+        let d_total: usize = anchor_components
+            .iter()
+            .map(|c| match c {
+                AnchorNullSpaceComponent::Parametric { ncols, .. } => *ncols,
+                AnchorNullSpaceComponent::FlexEvaluation { ncols } => *ncols,
+            })
+            .sum();
+        let residual = AnchorResidual {
+            residual_coefficients: m.clone(),
+            null_basis_evaluator: AnchorNullSpaceEvaluator::Stacked {
+                components: anchor_components,
+                orthonormalising_rotation: Array2::<f64>::eye(d_total),
+            },
+        };
+        self.anchor_rows_at_training = Some(n_train_at_training);
+        self.compose_anchor_orthogonalisation(&compiled.t_lw, Some(residual))
     }
 
     /// Cached parametric-anchor matrix at training rows, installed by
