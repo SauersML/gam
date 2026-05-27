@@ -342,6 +342,36 @@ mod policy_tests {
     }
 
     #[test]
+    fn pirls_loop_admission_requires_runtime_size_and_known_family() {
+        use crate::gpu::policy::{
+            PirlsLoopAdmission, PirlsLoopCurvatureKind, PirlsLoopFamilyKind,
+        };
+        let pol = GpuDispatchPolicy::default();
+        let base = PirlsLoopAdmission {
+            n: 80_000,
+            p: 44,
+            family: Some(PirlsLoopFamilyKind::BernoulliLogit),
+            curvature: PirlsLoopCurvatureKind::Fisher,
+            gpu_available: true,
+        };
+        assert!(pol.should_use_gpu_pirls_loop(base));
+        // No runtime → never dispatch.
+        assert!(!pol.should_use_gpu_pirls_loop(PirlsLoopAdmission {
+            gpu_available: false,
+            ..base
+        }));
+        // Below row floor.
+        assert!(!pol.should_use_gpu_pirls_loop(PirlsLoopAdmission { n: 1_000, ..base }));
+        // Below column floor.
+        assert!(!pol.should_use_gpu_pirls_loop(PirlsLoopAdmission { p: 8, ..base }));
+        // Custom family (not in 6 JIT-cached set) declines.
+        assert!(!pol.should_use_gpu_pirls_loop(PirlsLoopAdmission {
+            family: None,
+            ..base
+        }));
+    }
+
+    #[test]
     fn force_policy_reports_unsupported_kernel() {
         let decision = GpuDecision {
             policy: GpuPolicy::Force,

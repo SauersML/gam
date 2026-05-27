@@ -8593,7 +8593,27 @@ fn sae_manifold_fit_inner<'py>(
             basis_sizes.len()
         )));
     }
-    let latent_payload = serde_json::json!({"t": {"name": "t", "n": n_obs, "d": atom_dim.iter().copied().max().unwrap_or(1)}});
+    // The "t" block addresses the per-row latent coordinates (n_obs × d_max,
+    // tier=Psi) — ARD, Isometry, BlockOrthogonality, etc. target this. The
+    // "beta" block addresses the decoder coefficient matrix; for k_atoms=1
+    // its shape matches a single atom's (M, p_out) block, which is exactly
+    // the layout MechanismSparsityPenalty group-lassoes over (rows = basis
+    // functions, columns = output features). Multi-atom fits omit "beta"
+    // because flatten_beta concatenates per-atom (M_k, p_out) blocks with
+    // different M_k, and the single-(latent_dim, p_features) target view
+    // assumed by MechanismSparsityPenalty cannot represent that.
+    let mut latent_blocks = serde_json::Map::new();
+    latent_blocks.insert(
+        "t".into(),
+        serde_json::json!({"name": "t", "n": n_obs, "d": atom_dim.iter().copied().max().unwrap_or(1)}),
+    );
+    if basis_sizes.len() == 1 {
+        latent_blocks.insert(
+            "beta".into(),
+            serde_json::json!({"name": "beta", "n": p_out, "d": basis_sizes[0]}),
+        );
+    }
+    let latent_payload = serde_json::Value::Object(latent_blocks);
     let registry = build_analytic_penalty_registry_from_json(
         Some(&latent_payload),
         analytic_penalties.as_ref(),
