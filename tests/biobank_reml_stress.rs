@@ -33,7 +33,7 @@ use gam::smooth::{
     ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, TermCollectionSpec,
     build_term_collection_design, fit_term_collection_forspec, freeze_term_collection_from_design,
 };
-use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily};
+use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, StandardLink, ResponseFamily};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -68,7 +68,7 @@ const NORMAL_95_TWO_SIDED_Z: f64 = 1.959_963_984_540_054;
 fn gaussian_identity_likelihood() -> LikelihoodSpec {
     LikelihoodSpec::new(
         ResponseFamily::Gaussian,
-        InverseLink::Standard(LinkFunction::Identity),
+        InverseLink::Standard(StandardLink::Identity),
     )
 }
 

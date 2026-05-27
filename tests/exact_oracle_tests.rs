@@ -4,7 +4,7 @@ use gam::estimate::{
     ExternalOptimOptions, evaluate_externalcost_andridge, evaluate_externalgradient,
 };
 use gam::smooth::BlockwisePenalty;
-use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily};
+use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, StandardLink, ResponseFamily};
 
 // LAML-vs-quadrature-oracle gradient comparisons were removed: the impl
 // returns dV_LAML/dρ for the standard mgcv Bayesian Laplace ML score
@@ -42,7 +42,7 @@ fn logit_opts(firth: bool) -> ExternalOptimOptions {
         optimize_sas: false,
         family: LikelihoodSpec::new(
             ResponseFamily::Binomial,
-            InverseLink::Standard(LinkFunction::Logit),
+            InverseLink::Standard(StandardLink::Logit),
         ),
         compute_inference: true,
         max_iter: 200,

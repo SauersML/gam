@@ -4,7 +4,7 @@ use gam::generative::{
 use gam::hmc::NutsResult;
 use gam::polya_gamma::PolyaGamma;
 use gam::predict::PredictResult;
-use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily};
+use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, StandardLink, ResponseFamily};
 use ndarray::{Array1, Array2, Axis};
 use rand::{SeedableRng, rngs::StdRng};
 
@@ -77,7 +77,7 @@ fn bug_generativespec_from_predict_roundtrip_recovers_response_distribution() {
     };
     let like = LikelihoodSpec::new(
         ResponseFamily::Gaussian,
-        InverseLink::Standard(LinkFunction::Identity),
+        InverseLink::Standard(StandardLink::Identity),
     );
     let spec =
         generativespec_from_predict(pred, like, Some(0.5)).expect("spec generation should succeed");

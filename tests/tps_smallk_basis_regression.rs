@@ -33,7 +33,7 @@ use gam::smooth::{
     ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, TermCollectionSpec,
     build_term_collection_design,
 };
-use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily};
+use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, StandardLink, ResponseFamily};
 use ndarray::{Array1, Array2, s};
 use rand::RngExt;
 use rand::SeedableRng;
@@ -455,7 +455,7 @@ fn tps_reml_fit_must_not_oversmooth_seed118_style_additive_signal() {
         &marginal_tps_spec(18),
         LikelihoodSpec::new(
             ResponseFamily::Gaussian,
-            InverseLink::Standard(LinkFunction::Identity),
+            InverseLink::Standard(StandardLink::Identity),
         ),
         &standard_fit_options(80),
     )

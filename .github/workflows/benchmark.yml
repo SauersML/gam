@@ -40,11 +40,22 @@ jobs:
           python-version: "3.11"
 
       - name: Install Python deps for preflight
+        # The two preflight steps below load bench/run_suite.py via
+        # importlib, which top-level imports numpy and pandas (and pulls in
+        # bench/_run_suite_*.py helpers that import the same two). Neither
+        # scikit-learn nor lifelines is referenced anywhere on the
+        # preflight code path now that 29a56c5 routed validation through
+        # the pure-Python validate_scenario_schema dispatcher instead of
+        # invoking the dataset loaders. lifelines drags in autograd-gamma,
+        # an sdist-only package whose build is fragile across pip/
+        # setuptools versions — installing it here just to immediately not
+        # use it widens the failure surface of the matrix-prepare job for
+        # no benefit.
         shell: bash
         run: |
           set -euo pipefail
           python3 -m pip install --upgrade pip setuptools wheel
-          python3 -m pip install numpy pandas scikit-learn lifelines
+          python3 -m pip install numpy pandas
 
       - name: Preflight scenario schemas
         shell: bash

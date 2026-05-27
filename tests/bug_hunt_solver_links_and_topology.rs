@@ -5,7 +5,7 @@ use gam::topology_selector::{
     AutoTopologyKind, TopologyAutoFitEvidence, TopologyAutoSelector, select_topology_with_fit,
 };
 use gam::types::{
-    InverseLink, LikelihoodSpec, LinkComponent, LinkFunction, MixtureLinkSpec, ResponseFamily,
+    InverseLink, LikelihoodSpec, LinkComponent, LinkFunction, StandardLink, MixtureLinkSpec, ResponseFamily,
     SasLinkSpec,
 };
 use ndarray::array;
@@ -94,7 +94,7 @@ fn inverse_link_jet_for_family_uses_parameterized_state_for_mixture_and_sas_link
     let sas_spec = LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Sas(sas_state));
     let logit_spec = LikelihoodSpec::new(
         ResponseFamily::Binomial,
-        InverseLink::Standard(LinkFunction::Logit),
+        InverseLink::Standard(StandardLink::Logit),
     );
 
     let mix_jet = inverse_link_jet_for_family(&mix_spec, eta)

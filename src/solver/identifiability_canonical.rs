@@ -188,13 +188,9 @@ pub fn canonicalize_for_identifiability(
         dropped_sorted.dedup();
         for &col in &dropped_sorted {
             if col >= p_raw {
-                return Err(CustomFamilyError::DimensionMismatch {
-                    reason: format!(
-                        "canonicalize_for_identifiability: audit reported dropped column \
+                crate::bail_dim_custom!("canonicalize_for_identifiability: audit reported dropped column \
                          {col} for block '{}' which has only {} columns",
-                        spec.name, p_raw,
-                    ),
-                });
+                        spec.name, p_raw,);
             }
         }
         let kept: Vec<usize> = (0..p_raw)
@@ -222,15 +218,11 @@ pub fn canonicalize_for_identifiability(
         let reduced_initial_beta = match &spec.initial_beta {
             Some(beta_raw) => {
                 if beta_raw.len() != p_raw {
-                    return Err(CustomFamilyError::DimensionMismatch {
-                        reason: format!(
-                            "canonicalize_for_identifiability: block '{}' initial_beta \
+                    crate::bail_dim_custom!("canonicalize_for_identifiability: block '{}' initial_beta \
                              length {} != design ncols {}",
                             spec.name,
                             beta_raw.len(),
-                            p_raw,
-                        ),
-                    });
+                            p_raw,);
                 }
                 let mut theta = Array1::<f64>::zeros(r_block);
                 for (out_idx, &raw_col) in kept.iter().enumerate() {

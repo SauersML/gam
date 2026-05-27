@@ -3,7 +3,7 @@ use crate::families::bernoulli_marginal_slope::{
     LatentZNormalizationMode, LatentZPolicy,
 };
 use crate::families::survival_construction::SurvivalBaselineTarget;
-use crate::types::{InverseLink, LinkFunction};
+use crate::types::{InverseLink, StandardLink};
 
 /// Calibration semantics for the latent score `z` consumed by marginal-slope
 /// families. Every variant is fully effective — there are no silently-ignored
@@ -80,7 +80,7 @@ impl MarginalSlopeCalibrationProtocol {
         latent_score: LatentScoreSemantics,
     ) -> Self {
         Self {
-            base_link: InverseLink::Standard(LinkFunction::Probit),
+            base_link: InverseLink::Standard(StandardLink::Probit),
             score_warp,
             link_deviation,
             latent_score,

@@ -8,7 +8,7 @@ use gam::smooth::{
     FittedTermCollectionWithSpec, ShapeConstraint, SmoothBasisSpec, SmoothTermSpec,
     TermCollectionSpec,
 };
-use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily};
+use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, StandardLink, ResponseFamily};
 use ndarray::{Array1, Array2};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -17,14 +17,14 @@ use rand_distr::{Distribution, Normal};
 fn gaussian_identity_likelihood() -> LikelihoodSpec {
     LikelihoodSpec::new(
         ResponseFamily::Gaussian,
-        InverseLink::Standard(LinkFunction::Identity),
+        InverseLink::Standard(StandardLink::Identity),
     )
 }
 
 fn binomial_logit_likelihood() -> LikelihoodSpec {
     LikelihoodSpec::new(
         ResponseFamily::Binomial,
-        InverseLink::Standard(LinkFunction::Logit),
+        InverseLink::Standard(StandardLink::Logit),
     )
 }
 

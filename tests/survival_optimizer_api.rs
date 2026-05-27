@@ -1,5 +1,5 @@
 use gam::estimate::{FitOptions, fit_gam};
-use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily};
+use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, StandardLink, ResponseFamily};
 use ndarray::array;
 
 #[test]
@@ -36,7 +36,7 @@ fn fit_gam_rejects_royston_parmar_and_points_to_survival_api() {
         &s_list,
         LikelihoodSpec::new(
             ResponseFamily::RoystonParmar,
-            InverseLink::Standard(LinkFunction::Identity),
+            InverseLink::Standard(StandardLink::Identity),
         ),
         &opts,
     ) {

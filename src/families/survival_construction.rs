@@ -27,7 +27,7 @@ use crate::families::survival_marginal_slope::DEFAULT_SURVIVAL_MARGINAL_SLOPE_DE
 use crate::inference::formula_dsl::LinkWiggleFormulaSpec;
 use crate::matrix::{DenseDesignMatrix, DesignMatrix, SparseDesignMatrix};
 use crate::probability::{normal_pdf, standard_normal_quantile};
-use crate::types::{InverseLink, LinkFunction};
+use crate::types::{InverseLink, StandardLink};
 use ndarray::{Array1, Array2, array, s};
 use rayon::prelude::*;
 
@@ -137,6 +137,43 @@ pub enum SurvivalTimeBasisConfig {
         knots: Array1<f64>,
         smooth_lambda: f64,
     },
+    /// I-spline value rows on the `log(t)` axis with non-negative
+    /// coefficients (`γ ≥ 0`) enforcing structural monotonicity of
+    /// `q(t) = I_basis(log t) · γ`. This replaces the row-wise
+    /// `D β + o ≥ guard` derivative-guard constraints the marginal-slope
+    /// family previously relied on.
+    ///
+    /// The design builder lives below at `_build_time_block`'s
+    /// `SurvivalTimeBasisConfig::ISpline` arm and exposes:
+    ///
+    /// * `x_entry_time` / `x_exit_time` — I-spline value rows on the
+    ///   `log(t)` axis. Non-negative entries plus `γ ≥ 0` give a
+    ///   monotone-non-decreasing `q(t)`, the structural property the
+    ///   marginal-slope family needs.
+    /// * `x_derivative_time` — right-cumulative B-spline-derivative on
+    ///   `log(t)` scaled by `1/t`, again non-negative with `γ ≥ 0`, so
+    ///   `q'(t) ≥ 0` pointwise. The `derivative_guard` constant is added
+    ///   externally by [`add_survival_time_derivative_guard_offset`],
+    ///   leaving the derivative guarantee `q'(t) ≥ guard` exact.
+    /// * 2nd-difference penalty on the underlying degree-`(k+1)` B-spline
+    ///   coefficients, filtered through `keep_cols` for identifiability.
+    ///
+    /// `TimeBlockInput::time_monotonicity` declares to the consuming
+    /// family how monotonicity is enforced. The marginal-slope
+    /// construction site sets it to
+    /// [`crate::families::survival_location_scale::TimeBlockMonotonicity::StructuralISpline`]
+    /// so the family skips row-wise `D β + o ≥ guard` constraint
+    /// generation and treats `γ ≥ 0` as the sole derivative-guard
+    /// mechanism. The universal `validate_time_qd1_feasible` safety net
+    /// runs regardless.
+    ///
+    /// An earlier iteration proposed a separate C-spline antiderivative
+    /// parameterization that put `q'(t)` in the I-spline space and `q(t)`
+    /// in the integral-of-I-spline space. That was mathematically
+    /// equivalent but a strictly worse fit for the codebase (extra basis
+    /// degree, an extra antiderivative builder, an extra identifiability
+    /// path, an extra penalty); it was removed in favor of the canonical
+    /// I-spline-value path here.
     ISpline {
         degree: usize,
         knots: Array1<f64>,
@@ -2826,7 +2863,7 @@ pub fn location_scale_uses_probit_survival_baseline(inverse_link: Option<&Invers
     matches!(
         inverse_link,
         Some(
-            InverseLink::Standard(LinkFunction::Probit)
+            InverseLink::Standard(StandardLink::Probit)
                 | InverseLink::LatentCLogLog(_)
                 | InverseLink::Sas(_)
                 | InverseLink::BetaLogistic(_)

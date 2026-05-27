@@ -14,7 +14,7 @@
 //! reach the mapper directly without standing up a full fit.
 
 use crate::gpu::policy::{PirlsLoopAdmission, PirlsLoopCurvatureKind, PirlsLoopFamilyKind};
-use crate::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily};
+use crate::types::{InverseLink, LikelihoodSpec, StandardLink, ResponseFamily};
 
 /// Result of mapping the engine-level `(ResponseFamily, InverseLink)` pair
 /// to the six built-in JIT-cached families the Stage 3.3 PIRLS loop can
@@ -35,20 +35,20 @@ pub fn pirls_loop_family_for(spec: &LikelihoodSpec) -> Option<PirlsLoopFamilyKin
         _ => return None,
     };
     match (&spec.response, link) {
-        (ResponseFamily::Binomial, LinkFunction::Logit) => {
+        (ResponseFamily::Binomial, StandardLink::Logit) => {
             Some(PirlsLoopFamilyKind::BernoulliLogit)
         }
-        (ResponseFamily::Binomial, LinkFunction::Probit) => {
+        (ResponseFamily::Binomial, StandardLink::Probit) => {
             Some(PirlsLoopFamilyKind::BernoulliProbit)
         }
-        (ResponseFamily::Binomial, LinkFunction::CLogLog) => {
+        (ResponseFamily::Binomial, StandardLink::CLogLog) => {
             Some(PirlsLoopFamilyKind::BernoulliCLogLog)
         }
-        (ResponseFamily::Poisson, LinkFunction::Log) => Some(PirlsLoopFamilyKind::PoissonLog),
-        (ResponseFamily::Gaussian, LinkFunction::Identity) => {
+        (ResponseFamily::Poisson, StandardLink::Log) => Some(PirlsLoopFamilyKind::PoissonLog),
+        (ResponseFamily::Gaussian, StandardLink::Identity) => {
             Some(PirlsLoopFamilyKind::GaussianIdentity)
         }
-        (ResponseFamily::Gamma, LinkFunction::Log) => Some(PirlsLoopFamilyKind::GammaLog),
+        (ResponseFamily::Gamma, StandardLink::Log) => Some(PirlsLoopFamilyKind::GammaLog),
         // Every other pairing is either not in the JIT-cache set or is a
         // canonical-pair the row kernels do not currently support.
         _ => None,
@@ -120,28 +120,28 @@ mod tests {
             (
                 LikelihoodSpec::new(
                     ResponseFamily::Binomial,
-                    InverseLink::Standard(LinkFunction::Logit),
+                    InverseLink::Standard(StandardLink::Logit),
                 ),
                 PirlsLoopFamilyKind::BernoulliLogit,
             ),
             (
                 LikelihoodSpec::new(
                     ResponseFamily::Binomial,
-                    InverseLink::Standard(LinkFunction::Probit),
+                    InverseLink::Standard(StandardLink::Probit),
                 ),
                 PirlsLoopFamilyKind::BernoulliProbit,
             ),
             (
                 LikelihoodSpec::new(
                     ResponseFamily::Binomial,
-                    InverseLink::Standard(LinkFunction::CLogLog),
+                    InverseLink::Standard(StandardLink::CLogLog),
                 ),
                 PirlsLoopFamilyKind::BernoulliCLogLog,
             ),
             (
                 LikelihoodSpec::new(
                     ResponseFamily::Poisson,
-                    InverseLink::Standard(LinkFunction::Log),
+                    InverseLink::Standard(StandardLink::Log),
                 ),
                 PirlsLoopFamilyKind::PoissonLog,
             ),
@@ -152,7 +152,7 @@ mod tests {
             (
                 LikelihoodSpec::new(
                     ResponseFamily::Gamma,
-                    InverseLink::Standard(LinkFunction::Log),
+                    InverseLink::Standard(StandardLink::Log),
                 ),
                 PirlsLoopFamilyKind::GammaLog,
             ),
@@ -176,7 +176,7 @@ mod tests {
         assert_eq!(
             pirls_loop_family_for(&LikelihoodSpec::new(
                 ResponseFamily::Poisson,
-                InverseLink::Standard(LinkFunction::Identity),
+                InverseLink::Standard(StandardLink::Identity),
             )),
             None
         );
@@ -184,7 +184,7 @@ mod tests {
         assert_eq!(
             pirls_loop_family_for(&LikelihoodSpec::new(
                 ResponseFamily::Tweedie { p: 1.5 },
-                InverseLink::Standard(LinkFunction::Log),
+                InverseLink::Standard(StandardLink::Log),
             )),
             None
         );

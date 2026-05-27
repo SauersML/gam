@@ -1966,7 +1966,7 @@ impl BernoulliMarginalSlopePredictor {
         };
         if !matches!(
             base_link,
-            InverseLink::Standard(crate::types::LinkFunction::Probit)
+            InverseLink::Standard(crate::types::StandardLink::Probit)
         ) {
             return Err(
                 "bernoulli marginal-slope predictor requires link(type=probit); saved non-probit marginal-slope models must be refit"
@@ -4075,7 +4075,7 @@ fn survival_tail_value_from_failure_jet(
     failure_jet: &InverseLinkJet,
 ) -> f64 {
     match inverse_link {
-        InverseLink::Standard(crate::types::LinkFunction::Probit) => {
+        InverseLink::Standard(crate::types::StandardLink::Probit) => {
             if eta.is_nan() {
                 f64::NAN
             } else if eta == f64::INFINITY {
@@ -4086,8 +4086,8 @@ fn survival_tail_value_from_failure_jet(
                 0.5 * statrs::function::erf::erfc(eta / std::f64::consts::SQRT_2)
             }
         }
-        InverseLink::Standard(crate::types::LinkFunction::Logit) => 1.0 / (1.0 + eta.exp()),
-        InverseLink::Standard(crate::types::LinkFunction::CLogLog) => (-(eta.exp())).exp(),
+        InverseLink::Standard(crate::types::StandardLink::Logit) => 1.0 / (1.0 + eta.exp()),
+        InverseLink::Standard(crate::types::StandardLink::CLogLog) => (-(eta.exp())).exp(),
         _ => (1.0 - failure_jet.mu).clamp(0.0, 1.0),
     }
 }
@@ -5880,7 +5880,7 @@ mod tests {
             beta_logslope: array![1.6],
             beta_score_warp: Some(array![0.7, -0.4]),
             beta_link_dev: None,
-            base_link: InverseLink::Standard(crate::types::LinkFunction::Probit),
+            base_link: InverseLink::Standard(crate::types::StandardLink::Probit),
             z_column: "z".to_string(),
             latent_z_normalization: SavedLatentZNormalization { mean: 0.0, sd: 1.0 },
             latent_measure: LatentMeasureKind::StandardNormal,
@@ -6062,7 +6062,7 @@ mod tests {
             beta_logslope: array![-0.4],
             beta_score_warp: None,
             beta_link_dev: None,
-            base_link: InverseLink::Standard(crate::types::LinkFunction::Probit),
+            base_link: InverseLink::Standard(crate::types::StandardLink::Probit),
             z_column: "z".to_string(),
             latent_z_normalization: SavedLatentZNormalization { mean: 0.0, sd: 1.0 },
             latent_measure: LatentMeasureKind::StandardNormal,
@@ -6123,7 +6123,7 @@ mod tests {
             beta_logslope: array![0.9],
             beta_score_warp: None,
             beta_link_dev: None,
-            base_link: InverseLink::Standard(crate::types::LinkFunction::Probit),
+            base_link: InverseLink::Standard(crate::types::StandardLink::Probit),
             z_column: "z".to_string(),
             latent_z_normalization: SavedLatentZNormalization { mean: 0.0, sd: 1.0 },
             latent_measure: LatentMeasureKind::LocalEmpirical {
@@ -6183,7 +6183,7 @@ mod tests {
             beta_logslope: array![-0.4],
             beta_score_warp: None,
             beta_link_dev: None,
-            base_link: InverseLink::Standard(crate::types::LinkFunction::Logit),
+            base_link: InverseLink::Standard(crate::types::StandardLink::Logit),
             z_column: "z".to_string(),
             latent_z_normalization: SavedLatentZNormalization { mean: 0.0, sd: 1.0 },
             latent_measure: LatentMeasureKind::StandardNormal,
@@ -6416,7 +6416,7 @@ mod tests {
         let predictor = SurvivalPredictor {
             beta_threshold: array![0.5],
             beta_log_sigma: array![0.0],
-            inverse_link: InverseLink::Standard(LinkFunction::Probit),
+            inverse_link: InverseLink::Standard(StandardLink::Probit),
             covariance: Some(array![[9.0, 0.0], [0.0, 16.0]]),
         };
         let input = PredictInput {
@@ -6440,7 +6440,7 @@ mod tests {
         let predictor = SurvivalPredictor {
             beta_threshold: array![-1.0],
             beta_log_sigma: array![0.0],
-            inverse_link: InverseLink::Standard(LinkFunction::CLogLog),
+            inverse_link: InverseLink::Standard(StandardLink::CLogLog),
             covariance: Some(array![[4.0, 0.0], [0.0, 0.0]]),
         };
         let input = PredictInput {
@@ -6470,7 +6470,7 @@ mod tests {
         let predictor = SurvivalPredictor {
             beta_threshold: array![-1.0],
             beta_log_sigma: array![0.0],
-            inverse_link: InverseLink::Standard(LinkFunction::CLogLog),
+            inverse_link: InverseLink::Standard(StandardLink::CLogLog),
             covariance: Some(Array2::zeros((2, 2))),
         };
         let fit = survival_fit_with_covariance(array![-1.0], array![0.0], Array2::zeros((2, 2)));
@@ -6498,7 +6498,7 @@ mod tests {
         let predictor = SurvivalPredictor {
             beta_threshold: array![0.0],
             beta_log_sigma: array![0.0],
-            inverse_link: InverseLink::Standard(LinkFunction::CLogLog),
+            inverse_link: InverseLink::Standard(StandardLink::CLogLog),
             covariance: None,
         };
         let input = PredictInput {
@@ -6572,7 +6572,7 @@ mod tests {
             covariance_conditional: Some(covariance),
             covariance_corrected: None,
             inference: Some(inf),
-            fitted_link: FittedLinkState::Standard(Some(LinkFunction::Identity)),
+            fitted_link: FittedLinkState::Standard(Some(StandardLink::Identity)),
             geometry: None,
             block_states: Vec::new(),
             pirls_status: PirlsStatus::Converged,

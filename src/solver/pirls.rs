@@ -16,7 +16,7 @@ use crate::probability::standard_normal_quantile;
 use crate::solver::active_set;
 use crate::types::{Coefficients, LinearPredictor, LogSmoothingParamsView};
 use crate::types::{
-    GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkFunction, MixtureLinkState, ResponseFamily,
+    GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkFunction, StandardLink, MixtureLinkState, ResponseFamily,
     RidgePassport, RidgePolicy, SasLinkState, is_valid_tweedie_power,
 };
 use dyn_stack::{MemBuffer, MemStack};
@@ -361,11 +361,11 @@ impl SparsePenalizedSystemCache {
         precomputed_xtwx: Option<&SparseXtwxPrecomputed>,
     ) -> Result<SparseColMat<usize, f64>, EstimationError> {
         if weights.len() != self.xtwx_cache.nrows {
-            return Err(EstimationError::InvalidInput(format!(
+            crate::bail_invalid_estim!(
                 "weights length {} does not match design rows {}",
                 weights.len(),
                 self.xtwx_cache.nrows
-            )));
+            );
         }
         // Gaussian-Identity fast path: when the caller has pre-built the
         // `XᵀWX` numerical values (weights are constant across the outer
@@ -417,9 +417,7 @@ impl SparsePenalizedSystemCache {
                     if *cursor_idx >= self.h_upper_col_ptr[col + 1]
                         || self.h_upperrow_idx[*cursor_idx] != row
                     {
-                        return Err(EstimationError::InvalidInput(
-                            "penalized symbolic pattern missing XtWX entry".to_string(),
-                        ));
+                        crate::bail_invalid_estim!("penalized symbolic pattern missing XtWX entry");
                     }
                     self.h_uppervalues[*cursor_idx] += self.xtwx_cache.xtwxvalues[idx];
                 }
@@ -437,9 +435,7 @@ impl SparsePenalizedSystemCache {
             if *cursor_idx >= self.h_upper_col_ptr[col + 1]
                 || self.h_upperrow_idx[*cursor_idx] != row
             {
-                return Err(EstimationError::InvalidInput(
-                    "penalized symbolic pattern missing penalty entry".to_string(),
-                ));
+                crate::bail_invalid_estim!("penalized symbolic pattern missing penalty entry");
             }
             self.h_uppervalues[*cursor_idx] += value;
         }
@@ -456,9 +452,7 @@ impl SparsePenalizedSystemCache {
                 if *cursor_idx >= self.h_upper_col_ptr[col + 1]
                     || self.h_upperrow_idx[*cursor_idx] != col
                 {
-                    return Err(EstimationError::InvalidInput(
-                        "penalized symbolic pattern missing diagonal entry".to_string(),
-                    ));
+                    crate::bail_invalid_estim!("penalized symbolic pattern missing diagonal entry");
                 }
                 self.h_uppervalues[*cursor_idx] += ridge;
             }
@@ -490,9 +484,7 @@ fn build_penalized_symbolic(
     }
     for &(row, col, _) in penalty_triplets {
         if row > col || col >= p {
-            return Err(EstimationError::InvalidInput(
-                "penalty sparse pattern must be upper-triangular within bounds".to_string(),
-            ));
+            crate::bail_invalid_estim!("penalty sparse pattern must be upper-triangular within bounds");
         }
         cols[col].insert(row);
     }
@@ -740,15 +732,13 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
             }
             (ResponseFamily::Binomial, link, false) => {
                 if matches!(link, InverseLink::Mixture(_)) {
-                    return Err(EstimationError::InvalidInput(
-                        "BinomialMixture IRLS update requires explicit mixture link state"
-                            .to_string(),
-                    ));
+                    crate::bail_invalid_estim!("BinomialMixture IRLS update requires explicit mixture link state"
+                            .to_string(),);
                 }
                 update_glmvectors(
                     y,
                     eta,
-                    &InverseLink::Standard(self.link_function()),
+                    &self.spec.link,
                     priorweights,
                     mu,
                     weights,
@@ -761,7 +751,7 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
                 update_glmvectors(
                     y,
                     eta,
-                    &InverseLink::Standard(LinkFunction::Identity),
+                    &InverseLink::Standard(StandardLink::Identity),
                     priorweights,
                     mu,
                     weights,
@@ -779,10 +769,10 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
                 // the default profiled case.
                 if let Some(phi) = self.scale.fixed_phi() {
                     if !(phi.is_finite() && phi > 0.0) {
-                        return Err(EstimationError::InvalidInput(format!(
+                        crate::bail_invalid_estim!(
                             "Gaussian fixed dispersion phi must be finite and positive (got {})",
                             phi
-                        )));
+                        );
                     }
                     if phi != 1.0 {
                         let inv_phi = 1.0 / phi;
@@ -2083,9 +2073,7 @@ impl<'a> GamWorkingModel<'a> {
             )
         })?;
         let PirlsPenalty::Dense { s_transformed, .. } = &self.penalty else {
-            return Err(EstimationError::InvalidInput(
-                "sparse-native PIRLS requires a dense transformed penalty matrix".to_string(),
-            ));
+            crate::bail_invalid_estim!("sparse-native PIRLS requires a dense transformed penalty matrix");
         };
         self.workspace.assemble_sparse_penalized_hessian(
             x_sparse,
@@ -2740,11 +2728,11 @@ impl SparseXtWxCache {
         weights: &Array1<f64>,
     ) -> Result<(), EstimationError> {
         if weights.len() != self.nrows {
-            return Err(EstimationError::InvalidInput(format!(
+            crate::bail_invalid_estim!(
                 "weights length {} does not match design rows {}",
                 weights.len(),
                 self.nrows
-            )));
+            );
         }
 
         match &mut self.backend {
@@ -3003,9 +2991,7 @@ fn compute_jeffreys_pirls_diagnostics_sparse(
         let vals = xview.val_of_row(i);
         let cols = xview.col_idx_of_row_raw(i);
         if cols.len() != vals.len() {
-            return Err(EstimationError::InvalidInput(
-                "sparse row structure mismatch: column/value lengths differ".to_string(),
-            ));
+            crate::bail_invalid_estim!("sparse row structure mismatch: column/value lengths differ");
         }
         for (idx, &col) in cols.iter().enumerate() {
             x_dense[[i, col.unbound()]] = vals[idx];
@@ -3220,29 +3206,29 @@ where
 {
     let p = gradient.len();
     if xtwx_diag.len() != p {
-        return Err(EstimationError::InvalidInput(format!(
+        crate::bail_invalid_estim!(
             "solve_newton_direction_implicit: xtwx_diag length {} != gradient length {}",
             xtwx_diag.len(),
             p
-        )));
+        );
     }
     for (_, s) in dense_penalties.iter() {
         if s.nrows() != p || s.ncols() != p {
-            return Err(EstimationError::InvalidInput(format!(
+            crate::bail_invalid_estim!(
                 "solve_newton_direction_implicit: dense penalty dim {}×{} != p={}",
                 s.nrows(),
                 s.ncols(),
                 p
-            )));
+            );
         }
     }
     for (_, op) in op_penalties.iter() {
         if op.dim() != p {
-            return Err(EstimationError::InvalidInput(format!(
+            crate::bail_invalid_estim!(
                 "solve_newton_direction_implicit: op penalty dim {} != p={}",
                 op.dim(),
                 p
-            )));
+            );
         }
     }
     if direction_out.len() != p {
@@ -3968,12 +3954,12 @@ pub(crate) fn solve_newton_directionwith_lower_bounds(
     // strictly convex box QPs.
     let p = gradient.len();
     if lower_bounds.len() != p || beta.len() != p {
-        return Err(EstimationError::InvalidInput(format!(
+        crate::bail_invalid_estim!(
             "lower-bound size mismatch: beta={}, gradient={}, bounds={}",
             beta.len(),
             gradient.len(),
             lower_bounds.len()
-        )));
+        );
     }
     if direction_out.len() != p {
         *direction_out = Array1::zeros(p);
@@ -4309,7 +4295,14 @@ fn solve_intercept_for_prevalence(
                 _ => InverseLink::Sas(*state),
             }
         } else {
-            InverseLink::Standard(link_function)
+            // SAFETY: when `sas_link_state` is None, `solve_intercept_for_prevalence`
+            // is only invoked with the five legal `StandardLink` variants (the
+            // dispatch site at pirls.rs:4203 routes Sas/BetaLogistic into the
+            // Some branch above with state).
+            InverseLink::Standard(
+                StandardLink::try_from(link_function)
+                    .expect("state-bearing link reached state-less arm in solve_intercept_for_prevalence"),
+            )
         };
         standard_inverse_link_jet(&inverse_link, eta)
             .map(|jet| jet.mu - prevalence)
@@ -5109,10 +5102,10 @@ where
                                         ) {
                                             Ok(value) => value,
                                             Err(e) => {
-                                                return Err(EstimationError::InvalidInput(format!(
+                                                crate::bail_invalid_estim!(
                                                     "arrow-Schur predicted reduction failed at iter {iter} \
                                                      (loop_lambda={loop_lambda:.3e}): {e}"
-                                                )));
+                                                );
                                             }
                                         };
                                     // Apply the latent half of the joint
@@ -5179,9 +5172,9 @@ where
                     "PIRLS produced non-finite step direction"
                 };
                 restore_pending_arrow_latent_if_needed(options, &mut pending_arrow_latent_restore);
-                return Err(EstimationError::InvalidInput(format!(
+                crate::bail_invalid_estim!(
                     "{detail} at iteration {iter} with damping λ={loop_lambda:.3e}"
-                )));
+                );
             }
 
             // Transtrum-Sethna geodesic-acceleration second-order correction.
@@ -7527,7 +7520,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         config.firth_bias_reduction
             && matches!(
                 &config.link_kind,
-                InverseLink::Standard(LinkFunction::Logit)
+                InverseLink::Standard(StandardLink::Logit)
             ),
         transform_active.clone(),
         quadctx,
@@ -7612,6 +7605,114 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
             info.step_halving
         );
     };
+
+    // ──────────────────────────────────────────────────────────────────
+    // Stage 3.3 GPU PIRLS-loop dispatch.
+    //
+    // Before paying for the host LM loop, ask
+    // `try_gpu_pirls_loop_dispatch` whether this fit's shape, family,
+    // and runtime device admit the device-resident loop. When `Some`,
+    // the GPU loop has already produced a CPU-oracle-equivalent
+    // `(PirlsResult, WorkingModelPirlsResult)` and we return immediately;
+    // when `None`, dispatch was denied (admission policy, custom
+    // family, sparse-native / Kronecker shape, Firth, constraints, or
+    // no CUDA runtime) and we fall through to the CPU LM loop below.
+    //
+    // The CPU path executes unchanged when the GPU branch returns
+    // `None`, preserving bit-for-bit behaviour on every workload the
+    // device-resident loop does not yet cover.
+    #[cfg(target_os = "linux")]
+    {
+        use crate::solver::gpu::pirls_dispatch_wire::{
+            GpuPirlsDispatchInput, try_gpu_pirls_loop_dispatch,
+        };
+        // Conservative scope: dispatch only when every assumption the
+        // GPU loop wires up is satisfied. Anything outside this surface
+        // stays on the CPU LM loop until the wire is extended.
+        let dense_x = x_original.as_dense().map(|d| d.view());
+        let dense_penalty = matches!(&penalty_active, PirlsPenalty::Dense { .. });
+        let no_kronecker = kronecker_runtime.is_none();
+        let no_sparse_native = !use_sparse_native;
+        let no_firth = !config.firth_bias_reduction;
+        let no_constraints = linear_constraints.is_none();
+        if let (true, true, true, true, true, Some(x_dense)) = (
+            dense_penalty,
+            no_kronecker,
+            no_sparse_native,
+            no_firth,
+            no_constraints,
+            dense_x,
+        ) {
+            // Build the transformed dense design X·Qs once (column-major
+            // friendly because `upload_shared_pirls_gpu` repacks
+            // internally). When `transform_active` is `None` (identity),
+            // X is already in transformed coordinates.
+            let qs_view = qs_arc.as_ref().map(|qs| qs.view());
+            let x_transformed_owned: Option<Array2<f64>> = match transform_active.as_ref() {
+                Some(_) => qs_view.map(|qs| crate::faer_ndarray::fast_ab(&x_dense, &qs)),
+                None => None,
+            };
+            let x_t_view = match x_transformed_owned.as_ref() {
+                Some(xt) => xt.view(),
+                None => x_dense,
+            };
+            let s_transformed_view = match &penalty_active {
+                PirlsPenalty::Dense { s_transformed, .. } => s_transformed.view(),
+                PirlsPenalty::Diagonal { .. } => unreachable!(
+                    "GPU PIRLS dispatch gated on PirlsPenalty::Dense above"
+                ),
+            };
+            // Dense-design materialization for `PirlsResult.x_transformed`.
+            let qs_arc_for_design = qs_arc
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| Arc::new(Array2::<f64>::eye(penalty.p)));
+            let x_transformed_design = make_reparam_operator(
+                &x_original_for_result,
+                &qs_arc_for_design,
+                use_sparse_native,
+            );
+            let reparam_for_dispatch = materialize_final_reparam_result()?;
+            // Owned clone of the initial-β so the GPU dispatch input can
+            // borrow it without conflicting with the CPU fallback which
+            // moves `initial_beta` into `Coefficients::new` below.
+            let initial_beta_owned = initial_beta.clone();
+            let exported_curvature_kind = match link_function {
+                LinkFunction::Probit | LinkFunction::CLogLog => HessianCurvatureKind::Observed,
+                _ => HessianCurvatureKind::Fisher,
+            };
+            let dispatch = GpuPirlsDispatchInput {
+                likelihood: &config.likelihood,
+                inverse_link: &config.link_kind,
+                x_transformed: x_t_view,
+                s_transformed: s_transformed_view,
+                y,
+                priorweights,
+                offset,
+                initial_beta: initial_beta_owned.view(),
+                initial_lm_lambda: config.initial_lm_lambda,
+                max_iterations: options.max_iterations,
+                convergence_tolerance: options.convergence_tolerance,
+                linear_constraints: None,
+                qs: qs_view,
+                reparam_result: reparam_for_dispatch,
+                x_transformed_design,
+                coordinate_frame,
+                edf: None,
+                exported_curvature: exported_curvature_kind,
+            };
+            if let Some(result) = try_gpu_pirls_loop_dispatch(dispatch) {
+                match result {
+                    Ok(pair) => return Ok(pair),
+                    Err(err) => {
+                        log::warn!(
+                            "[PIRLS GPU dispatch] device loop returned error, falling back to CPU: {err}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     let mut working_summary = runworking_model_pirls(
         &mut working_model,
@@ -7838,9 +7939,7 @@ fn solve_penalized_least_squares_implicit(
         && let Some(x_sparse) = x_original.as_sparse()
     {
         let PirlsPenalty::Dense { s_transformed, .. } = penalty else {
-            return Err(EstimationError::InvalidInput(
-                "sparse-native PIRLS requires a dense transformed penalty matrix".to_string(),
-            ));
+            crate::bail_invalid_estim!("sparse-native PIRLS requires a dense transformed penalty matrix");
         };
         let weights_owned = weights.to_owned();
 
@@ -8563,9 +8662,9 @@ fn validate_count_responses(
 ) -> Result<(), EstimationError> {
     for (i, (&yi, &wi)) in y.iter().zip(priorweights.iter()).enumerate() {
         if wi > 0.0 && !valid_count_response(yi) {
-            return Err(EstimationError::InvalidInput(format!(
+            crate::bail_invalid_estim!(
                 "{family} response must be a finite non-negative integer at positive-weight row {i}; got {yi}"
-            )));
+            );
         }
     }
     Ok(())
@@ -8587,9 +8686,9 @@ fn validate_beta_responses(
 ) -> Result<(), EstimationError> {
     for (i, (&yi, &wi)) in y.iter().zip(priorweights.iter()).enumerate() {
         if wi > 0.0 && !valid_beta_response(yi) {
-            return Err(EstimationError::InvalidInput(format!(
+            crate::bail_invalid_estim!(
                 "beta-regression response must be finite and strictly inside (0, 1) at positive-weight row {i}; got {yi}"
-            )));
+            );
         }
     }
     Ok(())
@@ -8606,9 +8705,9 @@ fn validate_tweedie_responses(
 ) -> Result<(), EstimationError> {
     for (i, (&yi, &wi)) in y.iter().zip(priorweights.iter()).enumerate() {
         if wi > 0.0 && !valid_tweedie_response(yi) {
-            return Err(EstimationError::InvalidInput(format!(
+            crate::bail_invalid_estim!(
                 "Tweedie response must be finite and non-negative at positive-weight row {i}; got {yi}"
-            )));
+            );
         }
     }
     Ok(())
@@ -8717,14 +8816,14 @@ fn write_tweedie_log_working_state(
     const MIN_MU: f64 = 1e-10;
     const MIN_WEIGHT: f64 = 1e-12;
     if !is_valid_tweedie_power(p) {
-        return Err(EstimationError::InvalidInput(format!(
+        crate::bail_invalid_estim!(
             "Tweedie variance power must be finite and strictly between 1 and 2; got {p}"
-        )));
+        );
     }
     if !(phi.is_finite() && phi > 0.0) {
-        return Err(EstimationError::InvalidInput(format!(
+        crate::bail_invalid_estim!(
             "Tweedie dispersion phi must be finite and > 0; got {phi}"
-        )));
+        );
     }
     validate_tweedie_responses(&y, &priorweights)?;
     let exponent = 2.0 - p;
@@ -8838,9 +8937,9 @@ fn write_negative_binomial_log_working_state(
     const MIN_MU: f64 = 1e-10;
     const MIN_WEIGHT: f64 = 1e-12;
     if !valid_negbin_theta(theta) {
-        return Err(EstimationError::InvalidInput(format!(
+        crate::bail_invalid_estim!(
             "negative-binomial theta must be finite and > 0; got {theta}"
-        )));
+        );
     }
     validate_count_responses(&y, &priorweights, "negative-binomial")?;
     if let Some(derivs) = derivatives {
@@ -8945,9 +9044,9 @@ fn write_beta_logit_working_state(
 ) -> Result<(), EstimationError> {
     const MIN_WEIGHT: f64 = 1e-12;
     if !valid_beta_phi(phi) {
-        return Err(EstimationError::InvalidInput(format!(
+        crate::bail_invalid_estim!(
             "beta-regression phi must be finite and > 0; got {phi}"
-        )));
+        );
     }
     validate_beta_responses(&y, &priorweights)?;
     if let Some(derivs) = derivatives {
@@ -9305,10 +9404,10 @@ fn integrated_inverse_link_from_family(
     sas_link_state: Option<&SasLinkState>,
 ) -> Result<InverseLink, EstimationError> {
     match (&spec.response, &spec.link) {
-        (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Logit))
-        | (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Probit))
-        | (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::CLogLog)) => {
-            Ok(InverseLink::Standard(spec.link_function()))
+        (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::Logit))
+        | (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::Probit))
+        | (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::CLogLog)) => {
+            Ok(spec.link.clone())
         }
         (ResponseFamily::Binomial, InverseLink::Sas(_)) => {
             let state = sas_link_state.ok_or_else(|| {
@@ -9414,18 +9513,18 @@ pub fn update_glmvectors_integrated_for_link(
     let link = inverse_link.link_function();
     if !matches!(
         inverse_link,
-        InverseLink::Standard(LinkFunction::Logit)
-            | InverseLink::Standard(LinkFunction::Probit)
-            | InverseLink::Standard(LinkFunction::CLogLog)
+        InverseLink::Standard(StandardLink::Logit)
+            | InverseLink::Standard(StandardLink::Probit)
+            | InverseLink::Standard(StandardLink::CLogLog)
             | InverseLink::LatentCLogLog(_)
             | InverseLink::Sas(_)
             | InverseLink::BetaLogistic(_)
             | InverseLink::Mixture(_)
     ) {
-        return Err(EstimationError::InvalidInput(format!(
+        crate::bail_invalid_estim!(
             "Integrated link-runtime update is not supported for inverse link {:?}",
             inverse_link
-        )));
+        );
     }
     if let Some(derivs) = derivatives {
         let mu_s = mu.as_slice_mut().expect("mu must be contiguous");
@@ -9463,7 +9562,7 @@ pub fn update_glmvectors_integrated_for_link(
                             eta[i],
                             se[i].hypot(state.latent_sd),
                         )?
-                    } else if matches!(inverse_link, InverseLink::Standard(LinkFunction::Logit)) {
+                    } else if matches!(inverse_link, InverseLink::Standard(StandardLink::Logit)) {
                         crate::quadrature::integrated_logit_inverse_link_jet_pirls(
                             quadctx, eta[i], se[i],
                         )?
@@ -9517,7 +9616,7 @@ pub fn update_glmvectors_integrated_for_link(
                         eta[i],
                         se[i].hypot(state.latent_sd),
                     )?
-                } else if matches!(inverse_link, InverseLink::Standard(LinkFunction::Logit)) {
+                } else if matches!(inverse_link, InverseLink::Standard(StandardLink::Logit)) {
                     crate::quadrature::integrated_logit_inverse_link_jet_pirls(
                         quadctx, eta[i], se[i],
                     )?
@@ -9621,7 +9720,7 @@ pub fn update_glmvectors_integrated_by_family(
 /// - When hard clamps activate, the update map is piecewise and no longer C².
 ///   Setting c_i=d_i=0 is a practical subgradient-like choice to avoid unstable
 ///   explosive derivatives at the kink.
-fn computeworkingweight_derivatives_from_eta(
+pub(crate) fn computeworkingweight_derivatives_from_eta(
     likelihood: &GlmLikelihoodSpec,
     inverse_link: &InverseLink,
     eta: &Array1<f64>,
@@ -9693,16 +9792,16 @@ fn computeworkingweight_derivatives_from_eta(
             let p = *p;
             const MIN_WEIGHT: f64 = 1e-12;
             if !is_valid_tweedie_power(p) {
-                return Err(EstimationError::InvalidInput(format!(
+                crate::bail_invalid_estim!(
                     "Tweedie variance power must be finite and strictly between 1 and 2; got {p}"
-                )));
+                );
             }
             let exponent = 2.0 - p;
             let phi = fixed_glm_dispersion(likelihood);
             if !(phi.is_finite() && phi > 0.0) {
-                return Err(EstimationError::InvalidInput(format!(
+                crate::bail_invalid_estim!(
                     "Tweedie dispersion phi must be finite and > 0; got {phi}"
-                )));
+                );
             }
             let c_s = c.as_slice_mut().expect("c must be contiguous");
             let d_s = d.as_slice_mut().expect("d must be contiguous");
@@ -9754,9 +9853,9 @@ fn computeworkingweight_derivatives_from_eta(
             let theta = *theta;
             const MIN_WEIGHT: f64 = 1e-12;
             if !valid_negbin_theta(theta) {
-                return Err(EstimationError::InvalidInput(format!(
+                crate::bail_invalid_estim!(
                     "negative-binomial theta must be finite and > 0; got {theta}"
-                )));
+                );
             }
             let c_s = c.as_slice_mut().expect("c must be contiguous");
             let d_s = d.as_slice_mut().expect("d must be contiguous");
@@ -9806,9 +9905,9 @@ fn computeworkingweight_derivatives_from_eta(
             let phi = *phi;
             const MIN_WEIGHT: f64 = 1e-12;
             if !valid_beta_phi(phi) {
-                return Err(EstimationError::InvalidInput(format!(
+                crate::bail_invalid_estim!(
                     "beta-regression phi must be finite and > 0; got {phi}"
-                )));
+                );
             }
             let c_s = c.as_slice_mut().expect("c must be contiguous");
             let d_s = d.as_slice_mut().expect("d must be contiguous");
@@ -9960,9 +10059,7 @@ fn computeworkingweight_derivatives_from_eta(
                 )?;
         }
         ResponseFamily::RoystonParmar => {
-            return Err(EstimationError::InvalidInput(
-                "RoystonParmar is survival-specific and not a GLM IRLS family".to_string(),
-            ));
+            crate::bail_invalid_estim!("RoystonParmar is survival-specific and not a GLM IRLS family");
         }
     }
     Ok((c, d, dmu_deta, d2mu_deta2, d3mu_deta3))
@@ -10207,13 +10304,11 @@ pub fn weight_family_for_glm_likelihood(likelihood: &GlmLikelihoodSpec) -> Weigh
 #[inline]
 fn weight_link_for_inverse_link(inverse_link: &InverseLink) -> WeightLink {
     match inverse_link {
-        InverseLink::Standard(LinkFunction::Identity) => WeightLink::Identity,
-        InverseLink::Standard(LinkFunction::Log) => WeightLink::Log,
-        InverseLink::Standard(LinkFunction::Logit) => WeightLink::Logit,
-        InverseLink::Standard(LinkFunction::Probit)
-        | InverseLink::Standard(LinkFunction::CLogLog)
-        | InverseLink::Standard(LinkFunction::Sas)
-        | InverseLink::Standard(LinkFunction::BetaLogistic)
+        InverseLink::Standard(StandardLink::Identity) => WeightLink::Identity,
+        InverseLink::Standard(StandardLink::Log) => WeightLink::Log,
+        InverseLink::Standard(StandardLink::Logit) => WeightLink::Logit,
+        InverseLink::Standard(StandardLink::Probit)
+        | InverseLink::Standard(StandardLink::CLogLog)
         | InverseLink::LatentCLogLog(_)
         | InverseLink::Sas(_)
         | InverseLink::BetaLogistic(_)
@@ -10228,7 +10323,7 @@ fn supports_observed_hessian_curvature_for_likelihood(
 ) -> bool {
     let spec = &likelihood.spec;
     if matches!(spec.response, ResponseFamily::NegativeBinomial { .. }) {
-        return matches!(inverse_link, InverseLink::Standard(LinkFunction::Log));
+        return matches!(inverse_link, InverseLink::Standard(StandardLink::Log));
     }
     if matches!(spec.response, ResponseFamily::Gamma) {
         return true;
@@ -10238,8 +10333,8 @@ fn supports_observed_hessian_curvature_for_likelihood(
     }
     matches!(
         spec.link,
-        InverseLink::Standard(LinkFunction::Probit)
-            | InverseLink::Standard(LinkFunction::CLogLog)
+        InverseLink::Standard(StandardLink::Probit)
+            | InverseLink::Standard(StandardLink::CLogLog)
             | InverseLink::Sas(_)
             | InverseLink::BetaLogistic(_)
             | InverseLink::Mixture(_)
@@ -10250,19 +10345,18 @@ fn supports_observed_hessian_curvature_for_likelihood(
 fn eta_for_observed_hessian_jet(inverse_link: &InverseLink, eta: f64) -> f64 {
     match inverse_link {
         // Why: canonical links keep V(mu) representable across the full f64 eta range; only guard against inf.
-        InverseLink::Standard(LinkFunction::Logit | LinkFunction::Log) => eta.clamp(-700.0, 700.0),
-        InverseLink::Standard(LinkFunction::Identity) => eta,
+        InverseLink::Standard(StandardLink::Logit | StandardLink::Log) => eta.clamp(-700.0, 700.0),
+        InverseLink::Standard(StandardLink::Identity) => eta,
         // Why: probit mu=Phi(eta) saturates to 1.0 in f64 by |eta|~8.3; +/-6 keeps V=mu(1-mu) ~ 1e-9 representable.
-        InverseLink::Standard(LinkFunction::Probit) => eta.clamp(-6.0, 6.0),
+        InverseLink::Standard(StandardLink::Probit) => eta.clamp(-6.0, 6.0),
         // Why: cloglog has mu~exp(eta) for eta<<0 (underflows below ~-23) and 1-mu~exp(-exp(eta)) collapses by eta=3.
-        InverseLink::Standard(LinkFunction::CLogLog) | InverseLink::LatentCLogLog(_) => {
+        InverseLink::Standard(StandardLink::CLogLog) | InverseLink::LatentCLogLog(_) => {
             eta.clamp(-23.0, 3.0)
         }
         // Why: SAS / beta-logistic / mixture compose logistic-like sigmoids that saturate by |eta|~20 (logistic(20)~1-2e-9).
-        InverseLink::Standard(LinkFunction::Sas | LinkFunction::BetaLogistic)
-        | InverseLink::Sas(_)
-        | InverseLink::BetaLogistic(_)
-        | InverseLink::Mixture(_) => eta.clamp(-20.0, 20.0),
+        InverseLink::Sas(_) | InverseLink::BetaLogistic(_) | InverseLink::Mixture(_) => {
+            eta.clamp(-20.0, 20.0)
+        }
     }
 }
 
@@ -10392,14 +10486,14 @@ fn compute_observed_hessian_curvature_arrays_into(
             );
             let fisher_weight = fisher_weights[i].max(0.0);
             if !(w_obs.is_finite() && w_obs > 0.0) {
-                return Err(EstimationError::InvalidInput(format!(
+                crate::bail_invalid_estim!(
                     "observed Hessian curvature is not positive finite at row {i}: observed={w_obs}, fisher={fisher_weight}"
-                )));
+                );
             }
             if !c_obs.is_finite() || !d_obs.is_finite() {
-                return Err(EstimationError::InvalidInput(format!(
+                crate::bail_invalid_estim!(
                     "observed Hessian curvature derivatives are non-finite at row {i}: c={c_obs}, d={d_obs}"
-                )));
+                );
             }
             *w_out = w_obs;
             *c_out = c_obs;
@@ -10408,7 +10502,7 @@ fn compute_observed_hessian_curvature_arrays_into(
         })
 }
 
-fn compute_observed_hessian_curvature_arrays(
+pub(crate) fn compute_observed_hessian_curvature_arrays(
     likelihood: &GlmLikelihoodSpec,
     inverse_link: &InverseLink,
     eta: &Array1<f64>,
@@ -11538,21 +11632,19 @@ pub fn dense_block_xtwx(
     let k = design.ncols();
     let shape = fisher_blocks.shape();
     if shape.len() != 3 || shape[0] != n || shape[1] != shape[2] {
-        return Err(EstimationError::InvalidInput(format!(
+        crate::bail_invalid_estim!(
             "dense block Fisher shape mismatch: expected ({n}, p, p), got {shape:?}"
-        )));
+        );
     }
     if let Some(w) = row_weights.as_ref() {
         if w.len() != n {
-            return Err(EstimationError::InvalidInput(format!(
+            crate::bail_invalid_estim!(
                 "dense block row weight length mismatch: expected {n}, got {}",
                 w.len()
-            )));
+            );
         }
         if w.iter().any(|v| !v.is_finite() || *v < 0.0) {
-            return Err(EstimationError::InvalidInput(
-                "dense block row weights must be finite and non-negative".to_string(),
-            ));
+            crate::bail_invalid_estim!("dense block row weights must be finite and non-negative");
         }
     }
     let p_out = shape[1];
@@ -11564,9 +11656,9 @@ pub fn dense_block_xtwx(
             for b in 0..p_out {
                 let wab = rw * fisher_blocks[[row, a, b]];
                 if !wab.is_finite() {
-                    return Err(EstimationError::InvalidInput(format!(
+                    crate::bail_invalid_estim!(
                         "dense block Fisher entry ({row},{a},{b}) is not finite"
-                    )));
+                    );
                 }
                 if wab == 0.0 {
                     continue;
@@ -11608,25 +11700,25 @@ pub fn dense_block_xtwy(
     let k = design.ncols();
     let shape = fisher_blocks.shape();
     if shape.len() != 3 || shape[0] != n || shape[1] != shape[2] {
-        return Err(EstimationError::InvalidInput(format!(
+        crate::bail_invalid_estim!(
             "dense block Fisher shape mismatch: expected ({n}, p, p), got {shape:?}"
-        )));
+        );
     }
     let p_out = shape[1];
     if response.dim() != (n, p_out) {
-        return Err(EstimationError::InvalidInput(format!(
+        crate::bail_invalid_estim!(
             "dense block response shape mismatch: expected ({n}, {p_out}), got {}x{}",
             response.nrows(),
             response.ncols()
-        )));
+        );
     }
     if let Some(w) = row_weights.as_ref()
         && w.len() != n
     {
-        return Err(EstimationError::InvalidInput(format!(
+        crate::bail_invalid_estim!(
             "dense block row weight length mismatch: expected {n}, got {}",
             w.len()
-        )));
+        );
     }
     let mut out = Array1::<f64>::zeros(k * p_out);
     for row in 0..n {
@@ -11636,9 +11728,9 @@ pub fn dense_block_xtwy(
             for b in 0..p_out {
                 let wab = rw * fisher_blocks[[row, a, b]];
                 if !wab.is_finite() {
-                    return Err(EstimationError::InvalidInput(format!(
+                    crate::bail_invalid_estim!(
                         "dense block Fisher entry ({row},{a},{b}) is not finite"
-                    )));
+                    );
                 }
                 wy += wab * response[[row, b]];
             }
@@ -12142,9 +12234,9 @@ mod tests {
         let config = PirlsConfig {
             likelihood: GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
                 ResponseFamily::Gaussian,
-                InverseLink::Standard(LinkFunction::Identity),
+                InverseLink::Standard(StandardLink::Identity),
             )),
-            link_kind: InverseLink::Standard(LinkFunction::Identity),
+            link_kind: InverseLink::Standard(StandardLink::Identity),
             max_iterations: 20,
             convergence_tolerance: 1e-12,
             firth_bias_reduction: false,
@@ -12361,9 +12453,9 @@ mod tests {
         let config = PirlsConfig {
             likelihood: GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
                 ResponseFamily::Binomial,
-                InverseLink::Standard(LinkFunction::Logit),
+                InverseLink::Standard(StandardLink::Logit),
             )),
-            link_kind: InverseLink::Standard(LinkFunction::Logit),
+            link_kind: InverseLink::Standard(StandardLink::Logit),
             max_iterations: 100,
             convergence_tolerance: 1e-8,
             firth_bias_reduction: false,
@@ -12456,7 +12548,7 @@ mod tests {
         let y = array![1.0];
         let eta = array![50.0];
         let priorweights = array![1.0];
-        let inverse_link = InverseLink::Standard(LinkFunction::Logit);
+        let inverse_link = InverseLink::Standard(StandardLink::Logit);
         let mut mu = Array1::zeros(1);
         let mut weights = Array1::zeros(1);
         let mut z = Array1::zeros(1);
@@ -12558,7 +12650,7 @@ mod tests {
             &mu,
             &GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
                 ResponseFamily::Gamma,
-                InverseLink::Standard(LinkFunction::Log),
+                InverseLink::Standard(StandardLink::Log),
             )),
             w.view(),
         );
@@ -12580,9 +12672,9 @@ mod tests {
         let (w_obs, c_obs, d_obs) = compute_observed_hessian_curvature_arrays(
             &GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
                 ResponseFamily::Gamma,
-                InverseLink::Standard(LinkFunction::Log),
+                InverseLink::Standard(StandardLink::Log),
             )),
-            &InverseLink::Standard(LinkFunction::Log),
+            &InverseLink::Standard(StandardLink::Log),
             &eta,
             y.view(),
             &fisher,
@@ -12614,7 +12706,7 @@ mod tests {
 
         let (w_obs, c_obs, d_obs) = compute_observed_hessian_curvature_arrays(
             &GlmLikelihoodSpec::canonical(LikelihoodSpec::negative_binomial_log(theta)),
-            &InverseLink::Standard(LinkFunction::Log),
+            &InverseLink::Standard(StandardLink::Log),
             &eta,
             y.view(),
             &fisher,
@@ -12662,9 +12754,9 @@ mod tests {
         let config = PirlsConfig {
             likelihood: GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
                 ResponseFamily::Gamma,
-                InverseLink::Standard(LinkFunction::Log),
+                InverseLink::Standard(StandardLink::Log),
             )),
-            link_kind: InverseLink::Standard(LinkFunction::Log),
+            link_kind: InverseLink::Standard(StandardLink::Log),
             max_iterations: 100,
             convergence_tolerance: 1e-8,
             firth_bias_reduction: false,
@@ -12741,9 +12833,9 @@ mod tests {
         let config = PirlsConfig {
             likelihood: GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
                 ResponseFamily::Poisson,
-                InverseLink::Standard(LinkFunction::Log),
+                InverseLink::Standard(StandardLink::Log),
             )),
-            link_kind: InverseLink::Standard(LinkFunction::Log),
+            link_kind: InverseLink::Standard(StandardLink::Log),
             max_iterations: 100,
             convergence_tolerance: 1e-8,
             firth_bias_reduction: false,
@@ -12784,7 +12876,7 @@ mod tests {
                 y.view(),
                 w.view(),
                 offset.view(),
-                &InverseLink::Standard(LinkFunction::Log),
+                &InverseLink::Standard(StandardLink::Log),
             )
             .expect("rehydration should succeed");
 
@@ -13970,9 +14062,9 @@ mod root_cause_tests {
         let config = PirlsConfig {
             likelihood: GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
                 ResponseFamily::Gaussian,
-                InverseLink::Standard(LinkFunction::Identity),
+                InverseLink::Standard(StandardLink::Identity),
             )),
-            link_kind: InverseLink::Standard(LinkFunction::Identity),
+            link_kind: InverseLink::Standard(StandardLink::Identity),
             max_iterations: 100,
             convergence_tolerance: 1e-8,
             firth_bias_reduction: false,
@@ -14056,9 +14148,9 @@ mod root_cause_tests {
         let config = PirlsConfig {
             likelihood: GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
                 ResponseFamily::Binomial,
-                InverseLink::Standard(LinkFunction::Logit),
+                InverseLink::Standard(StandardLink::Logit),
             )),
-            link_kind: InverseLink::Standard(LinkFunction::Logit),
+            link_kind: InverseLink::Standard(StandardLink::Logit),
             max_iterations: 100,
             convergence_tolerance: 1e-8,
             firth_bias_reduction: false,
@@ -14161,9 +14253,9 @@ mod root_cause_tests {
             let config = PirlsConfig {
                 likelihood: GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
                     ResponseFamily::Binomial,
-                    InverseLink::Standard(LinkFunction::Logit),
+                    InverseLink::Standard(StandardLink::Logit),
                 )),
-                link_kind: InverseLink::Standard(LinkFunction::Logit),
+                link_kind: InverseLink::Standard(StandardLink::Logit),
                 max_iterations: 100,
                 convergence_tolerance: 1e-8,
                 firth_bias_reduction: false,

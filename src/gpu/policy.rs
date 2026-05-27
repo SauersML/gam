@@ -107,6 +107,34 @@ pub enum PirlsLoopCurvatureKind {
     Observed,
 }
 
+/// Inputs to [`should_run_reml_outer_on_device`]. The admission predicate
+/// for routing the *outer* REML BFGS-over-ρ loop onto a fully device-resident
+/// driver (rather than the host orchestrator that hops out per step).
+///
+/// Fields are intentionally lifted from data the CPU REML entry has on hand
+/// before it touches the seed generator or the inner P-IRLS loop, so the
+/// admission check is allocation-free and can short-circuit before any
+/// device call.
+#[derive(Clone, Copy, Debug)]
+pub struct RemlOuterAdmission {
+    /// Active design rows (post-transform).
+    pub n: usize,
+    /// Active design columns / penalised-Hessian dimension.
+    pub p: usize,
+    /// Number of smoothing parameters ρ the outer BFGS optimises over.
+    pub num_rho: usize,
+    /// Inner family / link pair the device-resident PIRLS loop can evaluate.
+    /// `None` means the family does not map onto the six JIT-cached row
+    /// kernels — the outer loop must stay on the host orchestrator because
+    /// the inner step would already hop out anyway.
+    pub family: Option<PirlsLoopFamilyKind>,
+    /// Curvature surface the inner loop will use; tied to `family` via
+    /// `pirls_loop_curvature_for`.
+    pub curvature: PirlsLoopCurvatureKind,
+    /// True when the CUDA runtime is initialised on this host.
+    pub gpu_available: bool,
+}
+
 /// Inputs to [`should_use_gpu_pirls_loop`]. Each field comes from data the
 /// CPU PIRLS entry has on hand before it touches the eigendecomposition
 /// engine, so the admission check itself is allocation-free and can short-
@@ -148,6 +176,38 @@ impl GpuDispatchPolicy {
             return false;
         }
         if adm.p < 32 {
+            return false;
+        }
+        match adm.family {
+            Some(_) => true,
+            None => false,
+        }
+    }
+
+    /// Admission predicate for routing the outer REML BFGS-over-ρ loop onto
+    /// a device-resident driver that keeps the BFGS state (ρ, gradient,
+    /// Hessian approx) on-device and only downloads the per-step scalar
+    /// metrics (objective value, gradient norm, convergence flag).
+    ///
+    /// The thresholds piggyback on the existing inner-PIRLS admission floor
+    /// (`n ≥ row_kernel_min_n`, `p ≥ 32`) because the device-resident outer
+    /// loop calls `pirls_loop_on_stream` per step and must not pay the host
+    /// hop for small fits the inner loop would have rejected anyway. The
+    /// `num_rho ≥ 2` floor rules out the trivial single-smoother case where
+    /// host orchestration is already negligible and the device BFGS state
+    /// (one length-`num_rho` gradient + a `num_rho × num_rho` Hessian
+    /// approx) collapses to a couple of scalars not worth keeping on device.
+    pub const fn should_run_reml_outer_on_device(&self, adm: RemlOuterAdmission) -> bool {
+        if !adm.gpu_available {
+            return false;
+        }
+        if adm.n < self.row_kernel_min_n {
+            return false;
+        }
+        if adm.p < 32 {
+            return false;
+        }
+        if adm.num_rho < 2 {
             return false;
         }
         match adm.family {

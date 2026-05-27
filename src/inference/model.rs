@@ -20,7 +20,7 @@ use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec};
 use crate::smooth::{AdaptiveRegularizationDiagnostics, TermCollectionSpec};
 use crate::span::span_index_for_breakpoints;
 use crate::types::{
-    InverseLink, LatentCLogLogState, LikelihoodSpec, LinkFunction, MixtureLinkState, SasLinkSpec,
+    InverseLink, LatentCLogLogState, LikelihoodSpec, LinkFunction, StandardLink, MixtureLinkState, SasLinkSpec,
     SasLinkState,
 };
 use ndarray::{Array1, Array2};
@@ -2689,7 +2689,7 @@ impl FittedModel {
                     .resolved_inverse_link()
                     .ok()
                     .flatten()
-                    .unwrap_or(InverseLink::Standard(LinkFunction::Probit));
+                    .unwrap_or(InverseLink::Standard(StandardLink::Probit));
                 SurvivalPredictor::from_unified(unified, inverse_link)
                     .ok()
                     .map(|p| Box::new(p) as Box<dyn PredictableModel>)
@@ -2699,7 +2699,7 @@ impl FittedModel {
                     .resolved_inverse_link()
                     .ok()
                     .flatten()
-                    .unwrap_or(InverseLink::Standard(LinkFunction::Probit));
+                    .unwrap_or(InverseLink::Standard(StandardLink::Probit));
                 let fit = self.fit_result.as_ref()?;
                 let beta_threshold = binomial_location_scale_threshold_beta(fit)?;
                 let beta_noise = location_scale_noise_beta(fit)
@@ -2725,7 +2725,7 @@ impl FittedModel {
                     payload.logslope_baseline?,
                     self.resolved_inverse_link()
                         .ok()?
-                        .unwrap_or(InverseLink::Standard(LinkFunction::Probit)),
+                        .unwrap_or(InverseLink::Standard(StandardLink::Probit)),
                     self.family_state.frailty()?.clone(),
                     runtime.score_warp,
                     runtime.link_deviation,
@@ -3604,7 +3604,7 @@ mod tests {
             ModelKind::MarginalSlope,
             FittedFamily::MarginalSlope {
                 likelihood: LikelihoodSpec::binomial_probit(),
-                base_link: Some(InverseLink::Standard(LinkFunction::Probit)),
+                base_link: Some(InverseLink::Standard(StandardLink::Probit)),
                 frailty: FrailtySpec::None,
             },
             "bernoulli-marginal-slope".to_string(),
@@ -3627,7 +3627,7 @@ mod tests {
         payload.latent_measure = Some(LatentMeasureKind::StandardNormal);
         payload.marginal_baseline = Some(0.0);
         payload.logslope_baseline = Some(0.0);
-        payload.link = Some(InverseLink::Standard(LinkFunction::Probit));
+        payload.link = Some(InverseLink::Standard(StandardLink::Probit));
         payload
     }
 
@@ -3663,7 +3663,7 @@ mod tests {
         payload.z_column = Some("z".to_string());
         payload.latent_z_normalization = Some(SavedLatentZNormalization { mean: 0.0, sd: 1.0 });
         payload.logslope_baseline = Some(0.0);
-        payload.link = Some(InverseLink::Standard(LinkFunction::Probit));
+        payload.link = Some(InverseLink::Standard(StandardLink::Probit));
         payload
     }
 

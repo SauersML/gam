@@ -1411,6 +1411,182 @@ impl SmgsLiftViaT {
         }
         out
     }
+
+    /// Build directly from a [`CompiledMap`] emitted by
+    /// [`crate::families::identifiability_compiler::compile_from_raw_grams`].
+    ///
+    /// `map.raw_from_compiled` IS the global triangular T (raw_total ×
+    /// compiled_total); `map.raw_block_ranges` and
+    /// `map.compiled_block_ranges` give the per-block partitions in raw
+    /// and compiled coordinates respectively. The `ordering` argument is
+    /// accepted purely as a length sanity check — the block partitions
+    /// already encode the ordering.
+    pub fn from_compiled_map(
+        map: &crate::families::identifiability_compiler::CompiledMap,
+        ordering: &[crate::families::identifiability_compiler::BlockOrder],
+    ) -> Self {
+        assert_eq!(
+            map.raw_block_ranges.len(),
+            map.compiled_block_ranges.len(),
+            "SmgsLiftViaT::from_compiled_map: CompiledMap raw_block_ranges len {} != \
+             compiled_block_ranges len {}",
+            map.raw_block_ranges.len(),
+            map.compiled_block_ranges.len(),
+        );
+        assert_eq!(
+            map.raw_block_ranges.len(),
+            ordering.len(),
+            "SmgsLiftViaT::from_compiled_map: ordering len {} != block count {}",
+            ordering.len(),
+            map.raw_block_ranges.len(),
+        );
+        let mut block_starts_raw = Vec::with_capacity(map.raw_block_ranges.len() + 1);
+        block_starts_raw.push(0);
+        for r in &map.raw_block_ranges {
+            block_starts_raw.push(r.end);
+        }
+        let mut block_starts_compiled = Vec::with_capacity(map.compiled_block_ranges.len() + 1);
+        block_starts_compiled.push(0);
+        for r in &map.compiled_block_ranges {
+            block_starts_compiled.push(r.end);
+        }
+        Self {
+            t_full: map.raw_from_compiled.clone(),
+            block_starts_compiled,
+            block_starts_raw,
+        }
+    }
+}
+
+/// Apply a global [`CompiledMap`] T directly to the three survival
+/// parametric block designs (time/marginal/logslope). Slices the
+/// per-block diagonal of T into `V_b = T[raw_range_b, compiled_range_b]`
+/// (shape `p_b_raw × w_b_compiled`), wraps each channel's raw design via
+/// [`wrap_design_with_transform`], and pulls each per-term penalty back
+/// through the FULL triangular T via [`pull_back_penalty_through_t`] so
+/// cross-block coupling stored in T's off-diagonal slots feeds into the
+/// joint compiled-coord penalty (same contract as
+/// [`apply_per_term_vm_exact`]).
+///
+/// The `*_partition` arguments describe the per-term sub-partition of
+/// each channel's raw column range (e.g. multiple marginal smooth terms
+/// each owning a contiguous slice of the marginal block's raw cols).
+/// They are used only to embed each input [`BlockwisePenalty`] into the
+/// joint raw width at the correct offset before pullback.
+///
+/// `map.raw_block_ranges` must equal three contiguous ranges in the
+/// order Time → Marginal → Logslope (matching the input designs).
+/// `map.compiled_block_ranges` runs in the same order.
+///
+/// Penalties supplied to this function:
+/// - `time_penalties` are `BlockwisePenalty`s whose `col_range` is in
+///   the time block's local raw coords (e.g. `0..p_time`).
+/// - `marginal_penalties` / `logslope_penalties` likewise — local to
+///   their own channel's raw width.
+///
+/// The pullback adds the channel's raw offset to each penalty's
+/// `col_range.start` before embedding into the joint raw width, so a
+/// marginal penalty with `col_range = 0..p_marg` is embedded at rows
+/// `p_time..(p_time + p_marg)` of the (raw_total × raw_total) embedded
+/// matrix, then pulled back through T to give a joint-width
+/// `(compiled_total × compiled_total)` Dense PenaltyMatrix.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_compiled_map_to_designs(
+    map: &crate::families::identifiability_compiler::CompiledMap,
+    time_design_entry: DesignMatrix,
+    time_design_exit: DesignMatrix,
+    time_design_derivative_exit: DesignMatrix,
+    marginal_design: DesignMatrix,
+    logslope_design: DesignMatrix,
+    time_penalties: &[crate::terms::smooth::BlockwisePenalty],
+    marginal_penalties: &[crate::terms::smooth::BlockwisePenalty],
+    logslope_penalties: &[crate::terms::smooth::BlockwisePenalty],
+) -> Result<CompiledSurvivalDesignsVMExact, String> {
+    if map.raw_block_ranges.len() != 3 || map.compiled_block_ranges.len() != 3 {
+        return Err(format!(
+            "apply_compiled_map_to_designs: expected exactly 3 blocks (time, marginal, logslope), \
+             got {} raw / {} compiled",
+            map.raw_block_ranges.len(),
+            map.compiled_block_ranges.len(),
+        ));
+    }
+    let time_raw = map.raw_block_ranges[0].clone();
+    let marg_raw = map.raw_block_ranges[1].clone();
+    let log_raw = map.raw_block_ranges[2].clone();
+    let time_compiled = map.compiled_block_ranges[0].clone();
+    let marg_compiled = map.compiled_block_ranges[1].clone();
+    let log_compiled = map.compiled_block_ranges[2].clone();
+
+    let t = &map.raw_from_compiled;
+    let raw_total = t.nrows();
+    let compiled_total = t.ncols();
+    let expected_raw_total = log_raw.end;
+    if raw_total != expected_raw_total {
+        return Err(format!(
+            "apply_compiled_map_to_designs: T has {raw_total} raw rows but block ranges sum to \
+             {expected_raw_total}"
+        ));
+    }
+    let expected_compiled_total = log_compiled.end;
+    if compiled_total != expected_compiled_total {
+        return Err(format!(
+            "apply_compiled_map_to_designs: T has {compiled_total} compiled cols but block ranges \
+             sum to {expected_compiled_total}"
+        ));
+    }
+
+    let v_time = t
+        .slice(ndarray::s![time_raw.clone(), time_compiled.clone()])
+        .to_owned();
+    let v_marg = t
+        .slice(ndarray::s![marg_raw.clone(), marg_compiled.clone()])
+        .to_owned();
+    let v_log = t
+        .slice(ndarray::s![log_raw.clone(), log_compiled.clone()])
+        .to_owned();
+
+    let time_entry_out = wrap_design_with_transform(
+        time_design_entry,
+        &v_time,
+        "compiled-map: time entry",
+    )?;
+    let time_exit_out = wrap_design_with_transform(
+        time_design_exit,
+        &v_time,
+        "compiled-map: time exit",
+    )?;
+    let time_deriv_out = wrap_design_with_transform(
+        time_design_derivative_exit,
+        &v_time,
+        "compiled-map: time derivative_exit",
+    )?;
+    let marg_out =
+        wrap_design_with_transform(marginal_design, &v_marg, "compiled-map: marginal")?;
+    let log_out = wrap_design_with_transform(logslope_design, &v_log, "compiled-map: logslope")?;
+
+    let time_offset = time_raw.start;
+    let marg_offset = marg_raw.start;
+    let log_offset = log_raw.start;
+
+    let pull_set =
+        |pens: &[crate::terms::smooth::BlockwisePenalty], anchor_offset: usize|
+         -> Vec<PenaltyMatrix> {
+            pens.iter()
+                .map(|p| pull_back_penalty_through_t(p, anchor_offset, t))
+                .collect()
+        };
+
+    Ok(CompiledSurvivalDesignsVMExact {
+        time_design_entry: time_entry_out,
+        time_design_exit: time_exit_out,
+        time_design_derivative_exit: time_deriv_out,
+        marginal_design: marg_out,
+        logslope_design: log_out,
+        time_penalties: pull_set(time_penalties, time_offset),
+        marginal_penalties: pull_set(marginal_penalties, marg_offset),
+        logslope_penalties: pull_set(logslope_penalties, log_offset),
+        t_full: t.clone(),
+    })
 }
 
 /// Run the identifiability compiler on the three survival parametric
@@ -3440,5 +3616,107 @@ mod tests {
                 assert!((comp_log_g[[i, j]] - x_log_g[[i, j]]).abs() < 1e-12);
             }
         }
+    }
+
+    /// Recompile-after-first-PIRLS-accept refinement: under a structural
+    /// (identity) row Hessian, a direction that is *only* identifiable
+    /// through the q1 channel survives the per-term compile; under a
+    /// data-adaptive row Hessian that happens to zero out the q1/qd1/g
+    /// metric weight (everything except q0), the same direction collapses.
+    /// This pins the diagnostic the production hook in
+    /// `fit_survival_marginal_slope_terms` watches for: the two row
+    /// Hessians produce different `drops_by_block` on identical raw
+    /// designs.
+    #[test]
+    fn recompile_after_accept_diff_detection_pilot_curvature_trap() {
+        let n = 6usize;
+        // Time block: a single column that only contributes through q0
+        // (entry-time channel). Both row Hessians see it identically on
+        // the q0 axis.
+        let time_dq0 = Array2::<f64>::from_elem((n, 1), 1.0);
+        let time_dq1 = Array2::<f64>::zeros((n, 1));
+        let time_dqd1 = Array2::<f64>::zeros((n, 1));
+        // Marginal block: a single column whose q0 part is colinear with
+        // the time block's q0 (both are ones-vectors). Its q-channel maps
+        // into BOTH q0 and q1 under QChannelBlockOperator, so under a
+        // metric that weighs q1 it carries a non-colinear component.
+        let marg_dq = Array2::<f64>::from_elem((n, 1), 1.0);
+        let marg_dqd1 = Array2::<f64>::zeros((n, 1));
+        // No logslope columns.
+        let log_dg = Array2::<f64>::zeros((n, 0));
+        let time_partition = vec![0..1usize];
+        let marg_partition = vec![0..1usize];
+        let log_partition: Vec<std::ops::Range<usize>> = Vec::new();
+
+        // Pass 1: structural identity row Hessian. q0/q1/qd1/g all weighted
+        // equally → marg's q1 component is visible, so marg is identifiable
+        // after residualising against the time block (drops_marg = 0).
+        let mut h_ident = Array3::<f64>::zeros((n, K_SURVIVAL, K_SURVIVAL));
+        for i in 0..n {
+            for k in 0..K_SURVIVAL {
+                h_ident[[i, k, k]] = 1.0;
+            }
+        }
+        let row_hess_ident = SurvivalRowHessian::from_full(h_ident);
+        let compiled_ident = compile_survival_parametric_designs_per_term(
+            time_dq0.clone(),
+            time_dq1.clone(),
+            time_dqd1.clone(),
+            &time_partition,
+            marg_dq.clone(),
+            marg_dqd1.clone(),
+            &marg_partition,
+            log_dg.clone(),
+            &log_partition,
+            &row_hess_ident,
+        )
+        .expect("identity-H compile must succeed");
+
+        // Pass 2: data-adaptive row Hessian that only weighs q0 (all
+        // other channel diagonals zero). Marg's q1 contribution is now
+        // invisible → marg fully aliases with time on q0 → drops_marg = 1.
+        let mut h_q0_only = Array3::<f64>::zeros((n, K_SURVIVAL, K_SURVIVAL));
+        for i in 0..n {
+            h_q0_only[[i, 0, 0]] = 1.0;
+        }
+        let row_hess_q0 = SurvivalRowHessian::from_full(h_q0_only);
+        let compiled_q0 = compile_survival_parametric_designs_per_term(
+            time_dq0,
+            time_dq1,
+            time_dqd1,
+            &time_partition,
+            marg_dq,
+            marg_dqd1,
+            &marg_partition,
+            log_dg,
+            &log_partition,
+            &row_hess_q0,
+        )
+        .expect("q0-only-H compile must succeed");
+
+        // The two drops_by_block tuples disagree on the marginal block —
+        // this is exactly the "pilot-curvature trap" the recompile-after-
+        // accept hook is designed to surface.
+        assert_ne!(
+            compiled_ident.drops_by_block,
+            compiled_q0.drops_by_block,
+            "structural-H and data-adaptive-H compiles must produce different \
+             drops_by_block on the constructed pilot-curvature-trap design; \
+             identity={:?} q0-only={:?}",
+            compiled_ident.drops_by_block,
+            compiled_q0.drops_by_block,
+        );
+        // Under identity H, marg survives (no drop).
+        assert_eq!(
+            compiled_ident.drops_by_block.1, 0,
+            "identity-H marg drops expected 0, got {:?}",
+            compiled_ident.drops_by_block,
+        );
+        // Under q0-only H, marg fully aliases with time on q0.
+        assert_eq!(
+            compiled_q0.drops_by_block.1, 1,
+            "q0-only-H marg drops expected 1, got {:?}",
+            compiled_q0.drops_by_block,
+        );
     }
 }

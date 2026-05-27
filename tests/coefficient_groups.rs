@@ -9,7 +9,7 @@ use gam::smooth::{
     CoefficientGroupPrior, CoefficientGroupSpec, CoefficientSelector, LinearTermSpec,
     TermCollectionSpec, build_term_collection_design, fit_term_collection_with_coefficient_groups,
 };
-use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily, RhoPrior};
+use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, StandardLink, ResponseFamily, RhoPrior};
 use ndarray::{Array1, Array2, array};
 use std::sync::Arc;
 
@@ -37,7 +37,7 @@ fn fit_options(rho_prior: RhoPrior) -> FitOptions {
 fn gaussian_identity_spec() -> LikelihoodSpec {
     LikelihoodSpec::new(
         ResponseFamily::Gaussian,
-        InverseLink::Standard(LinkFunction::Identity),
+        InverseLink::Standard(StandardLink::Identity),
     )
 }
 

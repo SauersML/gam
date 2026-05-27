@@ -58,3 +58,69 @@ impl From<GpuError> for String {
         err.to_string()
     }
 }
+
+/// Build a `GpuError::DriverCallFailed { reason: format!(...) }` value.
+///
+/// Collapses the ubiquitous
+/// `GpuError::DriverCallFailed { reason: format!("...: {err}") }`
+/// struct literal into a single call. The macro forwards every argument
+/// to `format!`, so callers retain full control over the message body,
+/// including positional / named captures and interpolation of the
+/// per-site `err` binding.
+#[macro_export]
+macro_rules! gpu_err {
+    ($($arg:tt)*) => {
+        $crate::gpu::error::GpuError::DriverCallFailed { reason: ::std::format!($($arg)*) }
+    };
+}
+
+/// `return Err(GpuError::DriverCallFailed { reason: format!(...) })`.
+///
+/// Collapses every early-return driver-call failure into a single
+/// statement. Use inside functions that return `Result<_, GpuError>`.
+#[macro_export]
+macro_rules! gpu_bail {
+    ($($arg:tt)*) => {
+        return ::std::result::Result::Err($crate::gpu_err!($($arg)*))
+    };
+}
+
+/// Extension trait that attaches GPU-call context to any `Result<T, E>`
+/// whose error implements `Display`.
+///
+/// The two methods mirror the common shapes:
+/// * [`gpu_ctx`](GpuResultExt::gpu_ctx) appends `": {err}"` to a
+///   caller-supplied prefix. This is the vastly dominant shape across
+///   the GPU layer (~235 sites in the original audit).
+/// * [`gpu_ctx_with`](GpuResultExt::gpu_ctx_with) takes a closure that
+///   receives the underlying error by `&dyn Display` and returns the
+///   full reason string. Use it when the reason is not a simple
+///   `prefix: err` concatenation (e.g. multi-line, or with the error
+///   embedded mid-message).
+pub trait GpuResultExt<T> {
+    /// Map the error to `GpuError::DriverCallFailed { reason: format!("{prefix}: {err}") }`.
+    fn gpu_ctx(self, prefix: &str) -> Result<T, GpuError>;
+
+    /// Map the error using a closure that takes the underlying error
+    /// (as `&dyn Display`) and returns the reason string.
+    fn gpu_ctx_with<F>(self, f: F) -> Result<T, GpuError>
+    where
+        F: FnOnce(&dyn std::fmt::Display) -> String;
+}
+
+impl<T, E: std::fmt::Display> GpuResultExt<T> for Result<T, E> {
+    #[inline]
+    fn gpu_ctx(self, prefix: &str) -> Result<T, GpuError> {
+        self.map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("{prefix}: {err}"),
+        })
+    }
+
+    #[inline]
+    fn gpu_ctx_with<F>(self, f: F) -> Result<T, GpuError>
+    where
+        F: FnOnce(&dyn std::fmt::Display) -> String,
+    {
+        self.map_err(|err| GpuError::DriverCallFailed { reason: f(&err) })
+    }
+}

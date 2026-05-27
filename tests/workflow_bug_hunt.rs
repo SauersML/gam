@@ -1,7 +1,7 @@
 use gam::inference::data::EncodedDataset;
 use gam::inference::formula_dsl::parse_link_choice;
 use gam::inference::model::{ColumnKindTag, DataSchema, SchemaColumn};
-use gam::types::{InverseLink, LinkFunction, ResponseFamily};
+use gam::types::{InverseLink, LinkFunction, StandardLink, ResponseFamily};
 use gam::{FitConfig, FitRequest, materialize, resolve_family};
 use ndarray::{Array2, array};
 
@@ -40,7 +40,7 @@ fn resolve_family_accepts_binomial_logit_with_underscore_alias() {
     );
     assert_eq!(
         resolved.link,
-        InverseLink::Standard(LinkFunction::Logit),
+        InverseLink::Standard(StandardLink::Logit),
         "binomial_logit should map to the standard logit inverse-link"
     );
 }
@@ -82,7 +82,7 @@ fn resolve_family_accepts_tweedie() {
         }
         other => panic!("expected Tweedie response family, got {other:?}"),
     }
-    assert_eq!(resolved.link, InverseLink::Standard(LinkFunction::Log));
+    assert_eq!(resolved.link, InverseLink::Standard(StandardLink::Log));
 }
 
 #[test]

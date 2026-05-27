@@ -48,27 +48,27 @@ impl VectorNoise {
         match self {
             Self::Isotropic(sigma) => {
                 if !sigma.is_finite() || *sigma <= 0.0 {
-                    return Err(EstimationError::InvalidInput(format!(
+                    crate::bail_invalid_estim!(
                         "VectorNoise::Isotropic: σ must be > 0 and finite (got {sigma})",
-                    )));
+                    );
                 }
                 let p = 1.0 / (sigma * sigma);
                 Ok(Array1::from_elem(m, p))
             }
             Self::Diagonal(sigma) => {
                 if sigma.len() != m {
-                    return Err(EstimationError::InvalidInput(format!(
+                    crate::bail_invalid_estim!(
                         "VectorNoise::Diagonal: σ length {} ≠ M={m}",
                         sigma.len()
-                    )));
+                    );
                 }
                 let mut out = Array1::<f64>::zeros(m);
                 for j in 0..m {
                     let s = sigma[j];
                     if !s.is_finite() || s <= 0.0 {
-                        return Err(EstimationError::InvalidInput(format!(
+                        crate::bail_invalid_estim!(
                             "VectorNoise::Diagonal: σ[{j}] must be > 0 and finite (got {s})",
-                        )));
+                        );
                     }
                     out[j] = 1.0 / (s * s);
                 }
@@ -76,18 +76,18 @@ impl VectorNoise {
             }
             Self::LowRank { diag, .. } => {
                 if diag.len() != m {
-                    return Err(EstimationError::InvalidInput(format!(
+                    crate::bail_invalid_estim!(
                         "VectorNoise::LowRank: diag length {} ≠ M={m}",
                         diag.len()
-                    )));
+                    );
                 }
                 let mut out = Array1::<f64>::zeros(m);
                 for j in 0..m {
                     let d = diag[j];
                     if !d.is_finite() || d <= 0.0 {
-                        return Err(EstimationError::InvalidInput(format!(
+                        crate::bail_invalid_estim!(
                             "VectorNoise::LowRank: diag[{j}] must be > 0 (got {d})",
-                        )));
+                        );
                     }
                     // `diag` is the PRECISION diagonal (W = diag(d) + F·Fᵀ).
                     // Pass it through unchanged.
@@ -139,16 +139,16 @@ impl VectorResponseTarget {
 
 fn validate_row_weights(weights: &Array1<f64>, n: usize) -> Result<(), EstimationError> {
     if weights.len() != n {
-        return Err(EstimationError::InvalidInput(format!(
+        crate::bail_invalid_estim!(
             "row_weights length {} ≠ N={n}",
             weights.len()
-        )));
+        );
     }
     for (idx, weight) in weights.iter().copied().enumerate() {
         if !(weight.is_finite() && weight >= 0.0) {
-            return Err(EstimationError::InvalidInput(format!(
+            crate::bail_invalid_estim!(
                 "row_weights[{idx}] must be finite and non-negative (got {weight})"
-            )));
+            );
         }
     }
     Ok(())
@@ -205,17 +205,17 @@ impl GaussianVectorLikelihood {
         let factor = match &target.noise {
             VectorNoise::LowRank { factor, .. } => {
                 if factor.nrows() != target.m() {
-                    return Err(EstimationError::InvalidInput(format!(
+                    crate::bail_invalid_estim!(
                         "VectorNoise::LowRank: factor has {} rows but M={}",
                         factor.nrows(),
                         target.m()
-                    )));
+                    );
                 }
                 for ((row, col), value) in factor.indexed_iter() {
                     if !value.is_finite() {
-                        return Err(EstimationError::InvalidInput(format!(
+                        crate::bail_invalid_estim!(
                             "VectorNoise::LowRank: factor[{row},{col}] must be finite (got {value})"
-                        )));
+                        );
                     }
                 }
                 Some(factor.clone())

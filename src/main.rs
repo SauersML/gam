@@ -17,7 +17,7 @@ use gam::families::bernoulli_marginal_slope::{
     LatentZPolicy,
 };
 use gam::families::cubic_cell_kernel as exact_kernel;
-use gam::families::family_meta::inverse_link_to_binomial_spec;
+use gam::types::inverse_link_to_binomial_spec;
 use gam::families::latent_survival::latent_hazard_loading;
 use gam::families::scale_design::{
     ScaleDeviationTransform, build_scale_deviation_operator,
@@ -879,6 +879,7 @@ const HARD_EXIT: fn(i32) -> ! = std::process::exit;
 
 fn main() {
     gam::init_parallelism();
+    gam::heartbeat::ensure_started();
     let result = run();
     if let Err(e) = result {
         cli_err!("error: {e}");
@@ -1232,6 +1233,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         args.family,
         args.negative_binomial_theta,
         link_choice.clone(),
+        sas_linkspec.as_ref(),
         y.view(),
     )?;
     if link_choice.is_none() {
@@ -1433,7 +1435,6 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             family.clone(),
             effective_link,
             mixture_linkspec.as_ref(),
-            sas_linkspec.as_ref(),
             "binomial mean-only link wiggle",
         )?;
         Some(StandardBinomialWiggleConfig {
@@ -2293,8 +2294,8 @@ fn run_fitwith_predict_noise(
     }
     // family is already gated as binomial by is_binomial() above, so we
     // only need to discriminate on the link.
-    let location_scale_link_kind = match family.link {
-        InverseLink::Standard(LinkFunction::Logit) => {
+    let location_scale_link_kind = match &family.link {
+        InverseLink::Standard(StandardLink::Logit) => {
             let spec = mixture_linkspec
                 .ok_or_else(|| {
                     "binomial blended-inverse-link location-scale fitting requires link(type=blended(...))"
@@ -2305,24 +2306,14 @@ fn run_fitwith_predict_noise(
                 .map_err(|e| format!("invalid blended link configuration: {e}"))?;
             InverseLink::Mixture(state)
         }
-        InverseLink::Standard(LinkFunction::Sas) => {
-            let spec = *sas_linkspec.ok_or_else(|| {
-                "binomial SAS location-scale fitting requires link(type=sas)".to_string()
-            })?;
-            let state = state_from_sasspec(spec)
-                .map_err(|e| format!("invalid SAS link configuration: {e}"))?;
-            InverseLink::Sas(state)
-        }
-        InverseLink::Standard(LinkFunction::BetaLogistic) => {
-            let spec = *sas_linkspec.ok_or_else(|| {
-                "binomial beta-logistic location-scale fitting requires link(type=beta-logistic)"
-                    .to_string()
-            })?;
-            let state = state_from_beta_logisticspec(spec)
-                .map_err(|e| format!("invalid Beta-Logistic link configuration: {e}"))?;
-            InverseLink::BetaLogistic(state)
-        }
-        _ => InverseLink::Standard(effective_link),
+        // `resolve_family` already upgrades `LinkFunction::Sas` /
+        // `LinkFunction::BetaLogistic` to their state-bearing variants,
+        // so the family arrives here fully typed.
+        InverseLink::Sas(state) => InverseLink::Sas(*state),
+        InverseLink::BetaLogistic(state) => InverseLink::BetaLogistic(*state),
+        InverseLink::Mixture(state) => InverseLink::Mixture(state.clone()),
+        InverseLink::LatentCLogLog(state) => InverseLink::LatentCLogLog(*state),
+        InverseLink::Standard(link) => InverseLink::Standard(*link),
     };
     if formula_linkwiggle.is_some() {
         require_inverse_link_supports_joint_wiggle(&location_scale_link_kind, "linkwiggle(...)")?;
@@ -4838,7 +4829,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 FittedFamily::Survival {
                     likelihood: LikelihoodSpec::new(
                         ResponseFamily::RoystonParmar,
-                        InverseLink::Standard(LinkFunction::Identity),
+                        InverseLink::Standard(StandardLink::Identity),
                     ),
                     survival_likelihood: Some(
                         survival_likelihood_modename(likelihood_mode).to_string(),
@@ -5241,7 +5232,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 FittedFamily::Survival {
                     likelihood: LikelihoodSpec::new(
                         ResponseFamily::RoystonParmar,
-                        InverseLink::Standard(LinkFunction::Identity),
+                        InverseLink::Standard(StandardLink::Identity),
                     ),
                     survival_likelihood: Some(
                         survival_likelihood_modename(likelihood_mode).to_string(),
@@ -5706,7 +5697,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 FittedFamily::Survival {
                     likelihood: LikelihoodSpec::new(
                         ResponseFamily::RoystonParmar,
-                        InverseLink::Standard(LinkFunction::Identity),
+                        InverseLink::Standard(StandardLink::Identity),
                     ),
                     survival_likelihood: Some(
                         survival_likelihood_modename(likelihood_mode).to_string(),
@@ -6142,7 +6133,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             FittedFamily::Survival {
                 likelihood: LikelihoodSpec::new(
                     ResponseFamily::RoystonParmar,
-                    InverseLink::Standard(LinkFunction::Identity),
+                    InverseLink::Standard(StandardLink::Identity),
                 ),
                 survival_likelihood: Some(
                     survival_likelihood_modename(likelihood_mode).to_string(),
@@ -7690,11 +7681,11 @@ fn resolve_bernoulli_marginal_slope_base_link(
     context: &str,
 ) -> Result<InverseLink, String> {
     let Some(linkspec) = linkspec else {
-        return Ok(InverseLink::Standard(LinkFunction::Probit));
+        return Ok(InverseLink::Standard(StandardLink::Probit));
     };
     let choice = parse_link_choice(Some(&linkspec.link), false)?;
     let Some(choice) = choice else {
-        return Ok(InverseLink::Standard(LinkFunction::Probit));
+        return Ok(InverseLink::Standard(StandardLink::Probit));
     };
     if matches!(choice.mode, LinkMode::Flexible) {
         return Err(format!(
@@ -7718,7 +7709,7 @@ fn resolve_bernoulli_marginal_slope_base_link(
     if linkspec.mixture_rho.is_some() {
         return Err("link(rho=...) requires link(type=blended(...)/mixture(...)), which marginal-slope does not support".to_string());
     }
-    Ok(InverseLink::Standard(LinkFunction::Probit))
+    Ok(InverseLink::Standard(StandardLink::Probit))
 }
 
 fn build_transformation_normal_saved_model(
@@ -7738,7 +7729,7 @@ fn build_transformation_normal_saved_model(
         FittedFamily::TransformationNormal {
             likelihood: LikelihoodSpec::new(
                 ResponseFamily::Gaussian,
-                InverseLink::Standard(LinkFunction::Identity),
+                InverseLink::Standard(StandardLink::Identity),
             ),
         },
         FAMILY_TRANSFORMATION_NORMAL.to_string(),
@@ -7935,7 +7926,7 @@ impl SavedFitSummary {
         Self {
             likelihood_family: Some(LikelihoodSpec::new(
                 ResponseFamily::RoystonParmar,
-                InverseLink::Standard(LinkFunction::Identity),
+                InverseLink::Standard(StandardLink::Identity),
             )),
             likelihood_scale: LikelihoodScaleMetadata::Unspecified,
             log_likelihood_normalization: LogLikelihoodNormalization::UserProvided,
@@ -8613,6 +8604,7 @@ fn resolve_family(
     arg: FamilyArg,
     negative_binomial_theta: Option<f64>,
     link_choice: Option<LinkChoice>,
+    sas_linkspec: Option<&SasLinkSpec>,
     y: ArrayView1<'_, f64>,
 ) -> Result<LikelihoodSpec, String> {
     let nb_theta = negative_binomial_theta.unwrap_or(1.0);
@@ -8643,14 +8635,27 @@ fn resolve_family(
                 LinkFunction::Logit => LikelihoodSpec::binomial_logit(),
                 LinkFunction::Probit => LikelihoodSpec::binomial_probit(),
                 LinkFunction::CLogLog => LikelihoodSpec::binomial_cloglog(),
-                LinkFunction::Sas => LikelihoodSpec::new(
-                    ResponseFamily::Binomial,
-                    InverseLink::Standard(LinkFunction::Sas),
-                ),
-                LinkFunction::BetaLogistic => LikelihoodSpec::new(
-                    ResponseFamily::Binomial,
-                    InverseLink::Standard(LinkFunction::BetaLogistic),
-                ),
+                // Sas / BetaLogistic resolve to their state-bearing `InverseLink`
+                // variants directly: the `sas_linkspec` parsed above carries the
+                // initial state, so there is no need for the historical
+                // "state-less `Standard(Sas)` placeholder" pattern (the type
+                // system no longer permits it).
+                LinkFunction::Sas => {
+                    let spec = *sas_linkspec.ok_or_else(|| {
+                        "--link sas requires link(type=sas, sas_init=...) so the SAS state is available at family resolution".to_string()
+                    })?;
+                    let state = state_from_sasspec(spec)
+                        .map_err(|e| format!("invalid SAS link configuration: {e}"))?;
+                    LikelihoodSpec::binomial_sas(state)
+                }
+                LinkFunction::BetaLogistic => {
+                    let spec = *sas_linkspec.ok_or_else(|| {
+                        "--link beta-logistic requires link(type=beta-logistic, beta_logistic_init=...) so the link state is available at family resolution".to_string()
+                    })?;
+                    let state = state_from_beta_logisticspec(spec)
+                        .map_err(|e| format!("invalid Beta-Logistic link configuration: {e}"))?;
+                    LikelihoodSpec::binomial_beta_logistic(state)
+                }
             }
         };
         if let Some(explicit) = explicit_family.as_ref() {
@@ -8764,7 +8769,6 @@ fn resolve_binomial_inverse_link_for_fit(
     family: LikelihoodSpec,
     effective_link: LinkFunction,
     mixture_linkspec: Option<&MixtureLinkSpec>,
-    sas_linkspec: Option<&SasLinkSpec>,
     context: &str,
 ) -> Result<InverseLink, String> {
     if !family.is_binomial() {
@@ -8773,32 +8777,50 @@ fn resolve_binomial_inverse_link_for_fit(
             family.name()
         ));
     }
-    match family.link {
-        InverseLink::Standard(LinkFunction::Logit) => {
+    match &family.link {
+        InverseLink::Standard(StandardLink::Logit) => {
             let spec = mixture_linkspec
                 .ok_or_else(|| format!("{context} requires link(type=blended(...))"))?;
             let state = state_fromspec(spec)
                 .map_err(|e| format!("invalid blended link configuration: {e}"))?;
             Ok(InverseLink::Mixture(state))
         }
-        InverseLink::Standard(LinkFunction::Sas) => {
-            let spec = *sas_linkspec.ok_or_else(|| format!("{context} requires link(type=sas)"))?;
-            let state = state_from_sasspec(spec)
-                .map_err(|e| format!("invalid SAS link configuration: {e}"))?;
-            Ok(InverseLink::Sas(state))
-        }
-        InverseLink::Standard(LinkFunction::BetaLogistic) => {
-            let spec = *sas_linkspec
-                .ok_or_else(|| format!("{context} requires link(type=beta-logistic)"))?;
-            let state = state_from_beta_logisticspec(spec)
-                .map_err(|e| format!("invalid Beta-Logistic link configuration: {e}"))?;
-            Ok(InverseLink::BetaLogistic(state))
-        }
-        InverseLink::Standard(LinkFunction::CLogLog) => Err(format!(
+        // `resolve_family` already upgrades Sas / BetaLogistic to their
+        // state-bearing variants; we only need to forward them here.
+        InverseLink::Sas(state) => Ok(InverseLink::Sas(*state)),
+        InverseLink::BetaLogistic(state) => Ok(InverseLink::BetaLogistic(*state)),
+        InverseLink::Standard(StandardLink::CLogLog) => Err(format!(
             "{context} does not construct latent-cloglog links directly; use the latent-cloglog family path with explicit frailty"
         )),
-        InverseLink::Standard(LinkFunction::Probit) => Ok(InverseLink::Standard(effective_link)),
-        _ => Ok(InverseLink::Standard(effective_link)),
+        InverseLink::Standard(StandardLink::Probit)
+        | InverseLink::Standard(StandardLink::Identity)
+        | InverseLink::Standard(StandardLink::Log)
+        | InverseLink::LatentCLogLog(_)
+        | InverseLink::Mixture(_) => {
+            Ok(InverseLink::Standard(effective_link_to_standard(effective_link, context)?))
+        }
+    }
+}
+
+/// Narrow a wide `LinkFunction` into the legal-only `StandardLink` carried by
+/// `InverseLink::Standard`. Sas / BetaLogistic are state-bearing and have
+/// already been routed to their own `InverseLink` variants by the time this
+/// fallback runs; reaching it with one of those wide variants is a contract
+/// violation by the caller.
+fn effective_link_to_standard(
+    link: LinkFunction,
+    context: &str,
+) -> Result<StandardLink, String> {
+    match link {
+        LinkFunction::Logit => Ok(StandardLink::Logit),
+        LinkFunction::Probit => Ok(StandardLink::Probit),
+        LinkFunction::CLogLog => Ok(StandardLink::CLogLog),
+        LinkFunction::Identity => Ok(StandardLink::Identity),
+        LinkFunction::Log => Ok(StandardLink::Log),
+        LinkFunction::Sas | LinkFunction::BetaLogistic => Err(format!(
+            "{context}: state-bearing link `{}` must be routed through `InverseLink::Sas` / `InverseLink::BetaLogistic`, not `Standard(_)`",
+            link.name()
+        )),
     }
 }
 
@@ -8809,9 +8831,9 @@ fn binomial_mean_linkwiggle_supports_family(
     let standard_binomial = family.is_binomial()
         && matches!(
             &family.link,
-            InverseLink::Standard(LinkFunction::Logit)
-                | InverseLink::Standard(LinkFunction::Probit)
-                | InverseLink::Standard(LinkFunction::CLogLog)
+            InverseLink::Standard(StandardLink::Logit)
+                | InverseLink::Standard(StandardLink::Probit)
+                | InverseLink::Standard(StandardLink::CLogLog)
         );
     standard_binomial
         && !link_choice.is_some_and(|choice| matches!(choice.mode, LinkMode::Flexible))
@@ -9067,7 +9089,7 @@ fn build_model_summary(
         let null_likelihood = if family.is_royston_parmar() {
             gam::types::GlmLikelihoodSpec::canonical(gam::types::LikelihoodSpec::new(
                 gam::types::ResponseFamily::Gaussian,
-                gam::types::InverseLink::Standard(gam::types::LinkFunction::Identity),
+                gam::types::InverseLink::Standard(gam::types::StandardLink::Identity),
             ))
         } else {
             gam::types::GlmLikelihoodSpec::canonical(family.clone())
@@ -10024,7 +10046,7 @@ mod tests {
         SavedFitSummary {
             likelihood_family: Some(LikelihoodSpec::new(
                 ResponseFamily::Gaussian,
-                InverseLink::Standard(LinkFunction::Identity),
+                InverseLink::Standard(StandardLink::Identity),
             )),
             likelihood_scale: LikelihoodScaleMetadata::ProfiledGaussian,
             log_likelihood_normalization: LogLikelihoodNormalization::Full,
@@ -10075,7 +10097,7 @@ mod tests {
             lambdas: Array1::zeros(0),
             likelihood_family: LikelihoodSpec::new(
                 ResponseFamily::Gaussian,
-                InverseLink::Standard(LinkFunction::Identity),
+                InverseLink::Standard(StandardLink::Identity),
             ),
             likelihood_scale: LikelihoodScaleMetadata::ProfiledGaussian,
             log_likelihood_normalization: LogLikelihoodNormalization::Full,
@@ -10580,7 +10602,7 @@ mod tests {
         assert!(file!().ends_with(".rs"));
         let y = array![0.0, 1.0, 1.0, 0.0];
 
-        let family = resolve_family(FamilyArg::Auto, None, None, y.view()).expect("resolve family");
+        let family = resolve_family(FamilyArg::Auto, None, None, None, y.view()).expect("resolve family");
 
         assert_eq!(family, LikelihoodSpec::binomial_logit());
     }
@@ -10641,7 +10663,7 @@ mod tests {
         let saved = SavedModel::load_from_path(&model_path).expect("load fitted model");
         assert_eq!(
             saved.link.as_ref(),
-            Some(&InverseLink::Standard(LinkFunction::Logit))
+            Some(&InverseLink::Standard(StandardLink::Logit))
         );
         match &saved.family_state {
             FittedFamily::LocationScale {
@@ -10651,7 +10673,7 @@ mod tests {
                 assert_eq!(*likelihood, LikelihoodSpec::binomial_logit());
                 assert!(matches!(
                     base_link.as_ref(),
-                    Some(InverseLink::Standard(LinkFunction::Logit))
+                    Some(InverseLink::Standard(StandardLink::Logit))
                 ));
             }
             other => panic!("expected location-scale family state, got {other:?}"),
@@ -10807,7 +10829,7 @@ mod tests {
             FittedFamily::Survival {
                 likelihood: LikelihoodSpec::new(
                     ResponseFamily::RoystonParmar,
-                    InverseLink::Standard(LinkFunction::Identity),
+                    InverseLink::Standard(StandardLink::Identity),
                 ),
                 survival_likelihood: Some("location-scale".to_string()),
                 survival_distribution: Some(ResidualDistribution::Gaussian),
@@ -10850,7 +10872,7 @@ mod tests {
         let saved = SavedModel::load_from_path(&model_path).expect("load fitted model");
         assert_eq!(
             saved.link.as_ref(),
-            Some(&InverseLink::Standard(LinkFunction::Probit))
+            Some(&InverseLink::Standard(StandardLink::Probit))
         );
         match &saved.family_state {
             FittedFamily::LocationScale {
@@ -10860,7 +10882,7 @@ mod tests {
                 assert_eq!(*likelihood, LikelihoodSpec::binomial_probit());
                 assert!(matches!(
                     base_link.as_ref(),
-                    Some(InverseLink::Standard(LinkFunction::Probit))
+                    Some(InverseLink::Standard(StandardLink::Probit))
                 ));
             }
             other => panic!("expected location-scale family state, got {other:?}"),
@@ -11097,7 +11119,7 @@ mod tests {
             SavedFitSummary {
                 likelihood_family: Some(LikelihoodSpec::new(
                     ResponseFamily::Binomial,
-                    InverseLink::Standard(LinkFunction::Probit),
+                    InverseLink::Standard(StandardLink::Probit),
                 )),
                 likelihood_scale: LikelihoodScaleMetadata::Unspecified,
                 log_likelihood_normalization: LogLikelihoodNormalization::UserProvided,
@@ -11110,8 +11132,8 @@ mod tests {
                 .to_string(),
             ModelKind::MarginalSlope,
             FittedFamily::MarginalSlope {
-                likelihood: LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Probit)),
-                base_link: Some(InverseLink::Standard(LinkFunction::Probit)),
+                likelihood: LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Standard(StandardLink::Probit)),
+                base_link: Some(InverseLink::Standard(StandardLink::Probit)),
                 frailty: gam::families::lognormal_kernel::FrailtySpec::None,
             },
             "bernoulli-marginal-slope".to_string(),
@@ -11128,7 +11150,7 @@ mod tests {
         payload.latent_z_normalization = Some(SavedLatentZNormalization { mean: 0.0, sd: 1.0 });
         payload.marginal_baseline = Some(0.0);
         payload.logslope_baseline = Some(0.0);
-        payload.link = Some(InverseLink::Standard(LinkFunction::Probit));
+        payload.link = Some(InverseLink::Standard(StandardLink::Probit));
         payload.score_warp_runtime = Some(saved_runtime());
         payload.link_deviation_runtime = Some(saved_runtime());
 
@@ -11148,7 +11170,7 @@ mod tests {
             saved
                 .resolved_inverse_link()
                 .expect("resolved inverse link"),
-            Some(InverseLink::Standard(LinkFunction::Probit))
+            Some(InverseLink::Standard(StandardLink::Probit))
         );
     }
 
@@ -11167,7 +11189,7 @@ mod tests {
             lambdas: Array1::zeros(0),
             likelihood_family: Some(LikelihoodSpec::new(
                 ResponseFamily::Binomial,
-                InverseLink::Standard(LinkFunction::Logit),
+                InverseLink::Standard(StandardLink::Logit),
             )),
             likelihood_scale: LikelihoodScaleMetadata::Unspecified,
             log_likelihood_normalization: LogLikelihoodNormalization::UserProvided,
@@ -11205,7 +11227,7 @@ mod tests {
             FittedFamily::Standard {
                 likelihood: LikelihoodSpec::new(
                     ResponseFamily::Binomial,
-                    InverseLink::Standard(LinkFunction::Logit),
+                    InverseLink::Standard(StandardLink::Logit),
                 ),
                 link: Some(LinkFunction::Logit),
                 latent_cloglog_state: None,
@@ -11479,7 +11501,7 @@ mod tests {
             FittedFamily::LocationScale {
                 likelihood: LikelihoodSpec::new(
                     ResponseFamily::Gaussian,
-                    InverseLink::Standard(LinkFunction::Identity),
+                    InverseLink::Standard(StandardLink::Identity),
                 ),
                 base_link: None,
             },
@@ -11540,14 +11562,14 @@ mod tests {
             FittedFamily::LocationScale {
                 likelihood: LikelihoodSpec::new(
                     ResponseFamily::Binomial,
-                    InverseLink::Standard(LinkFunction::Probit),
+                    InverseLink::Standard(StandardLink::Probit),
                 ),
-                base_link: Some(InverseLink::Standard(LinkFunction::Probit)),
+                base_link: Some(InverseLink::Standard(StandardLink::Probit)),
             },
             "binomial-location-scale",
         );
         payload.fit_result = Some(fit_result);
-        payload.link = Some(InverseLink::Standard(LinkFunction::Probit));
+        payload.link = Some(InverseLink::Standard(StandardLink::Probit));
         payload.formula_noise = Some("1".to_string());
         payload.beta_noise = Some(vec![beta_ls]);
         payload.linkwiggle_knots = wiggle_knots;
@@ -11920,7 +11942,7 @@ mod tests {
             lambdas,
             likelihood_family: Some(LikelihoodSpec::new(
                 ResponseFamily::Binomial,
-                InverseLink::Standard(LinkFunction::Logit),
+                InverseLink::Standard(StandardLink::Logit),
             )),
             likelihood_scale: LikelihoodScaleMetadata::Unspecified,
             log_likelihood_normalization: LogLikelihoodNormalization::UserProvided,
@@ -11953,7 +11975,7 @@ mod tests {
                 covariance_is_diagonal_only: false,
                 bias_correction_beta: None,
             }),
-            fitted_link: FittedLinkState::Standard(Some(LinkFunction::Logit)),
+            fitted_link: FittedLinkState::Standard(Some(StandardLink::Logit)),
             geometry: Some(FitGeometry {
                 penalized_hessian: hessian.into(),
                 working_weights,
@@ -11992,7 +12014,7 @@ mod tests {
             SavedFitSummary {
                 likelihood_family: Some(LikelihoodSpec::new(
                     ResponseFamily::Gaussian,
-                    InverseLink::Standard(LinkFunction::Identity),
+                    InverseLink::Standard(StandardLink::Identity),
                 )),
                 likelihood_scale: LikelihoodScaleMetadata::ProfiledGaussian,
                 log_likelihood_normalization: LogLikelihoodNormalization::Full,
@@ -12610,7 +12632,7 @@ mod tests {
             "bernoulli marginal-slope",
         )
         .expect("explicit probit base link");
-        assert_eq!(resolved, InverseLink::Standard(LinkFunction::Probit));
+        assert_eq!(resolved, InverseLink::Standard(StandardLink::Probit));
 
         for formula in [
             "y ~ x + link(type=logit)",
@@ -12698,7 +12720,7 @@ mod tests {
             None,
             None,
             None,
-            InverseLink::Standard(LinkFunction::Probit),
+            InverseLink::Standard(StandardLink::Probit),
             gam::families::lognormal_kernel::FrailtySpec::None,
         )
         .expect("build bernoulli marginal-slope saved model");
@@ -12710,13 +12732,13 @@ mod tests {
         assert_eq!(model.payload().logslope_baseline, Some(0.0));
         assert_eq!(
             model.payload().link.as_ref(),
-            Some(&InverseLink::Standard(LinkFunction::Probit))
+            Some(&InverseLink::Standard(StandardLink::Probit))
         );
         assert_eq!(
             model
                 .resolved_inverse_link()
                 .expect("resolved inverse link"),
-            Some(InverseLink::Standard(LinkFunction::Probit))
+            Some(InverseLink::Standard(StandardLink::Probit))
         );
     }
 
@@ -12753,7 +12775,7 @@ mod tests {
             SavedFitSummary {
                 likelihood_family: Some(LikelihoodSpec::new(
                     ResponseFamily::Binomial,
-                    InverseLink::Standard(LinkFunction::Probit),
+                    InverseLink::Standard(StandardLink::Probit),
                 )),
                 likelihood_scale: LikelihoodScaleMetadata::Unspecified,
                 log_likelihood_normalization: LogLikelihoodNormalization::UserProvided,
@@ -12783,7 +12805,7 @@ mod tests {
             None,
             None,
             None,
-            InverseLink::Standard(LinkFunction::Probit),
+            InverseLink::Standard(StandardLink::Probit),
             gam::families::lognormal_kernel::FrailtySpec::None,
         )
         .expect("build bernoulli marginal-slope saved model");
@@ -12839,7 +12861,7 @@ mod tests {
             None,
             None,
             None,
-            InverseLink::Standard(LinkFunction::Probit),
+            InverseLink::Standard(StandardLink::Probit),
             gam::families::lognormal_kernel::FrailtySpec::None,
         )
         .expect("build bernoulli marginal-slope saved model")
@@ -12857,7 +12879,7 @@ mod tests {
             FittedFamily::Survival {
                 likelihood: LikelihoodSpec::new(
                     ResponseFamily::RoystonParmar,
-                    InverseLink::Standard(LinkFunction::Identity),
+                    InverseLink::Standard(StandardLink::Identity),
                 ),
                 survival_likelihood: Some("marginal-slope".to_string()),
                 survival_distribution: Some(ResidualDistribution::Gaussian),
@@ -13690,7 +13712,7 @@ mod tests {
             FittedFamily::Survival {
                 likelihood: LikelihoodSpec::new(
                     ResponseFamily::RoystonParmar,
-                    InverseLink::Standard(LinkFunction::Identity),
+                    InverseLink::Standard(StandardLink::Identity),
                 ),
                 survival_likelihood: Some("transformation".to_string()),
                 survival_distribution: Some(ResidualDistribution::Gaussian),
@@ -13751,7 +13773,7 @@ mod tests {
             FittedFamily::Survival {
                 likelihood: LikelihoodSpec::new(
                     ResponseFamily::RoystonParmar,
-                    InverseLink::Standard(LinkFunction::Identity),
+                    InverseLink::Standard(StandardLink::Identity),
                 ),
                 survival_likelihood: Some("marginal-slope".to_string()),
                 survival_distribution: Some(ResidualDistribution::Gaussian),
@@ -13971,7 +13993,7 @@ mod tests {
             FittedFamily::Survival {
                 likelihood: LikelihoodSpec::new(
                     ResponseFamily::RoystonParmar,
-                    InverseLink::Standard(LinkFunction::Identity),
+                    InverseLink::Standard(StandardLink::Identity),
                 ),
                 survival_likelihood: Some("marginal-slope".to_string()),
                 survival_distribution: Some(ResidualDistribution::Gaussian),
@@ -13997,7 +14019,7 @@ mod tests {
         // latent-z policy.
         payload.latent_measure = Some(LatentMeasureKind::StandardNormal);
         payload.logslope_baseline = Some(0.0);
-        payload.link = Some(InverseLink::Standard(LinkFunction::Probit));
+        payload.link = Some(InverseLink::Standard(StandardLink::Probit));
         let model = SavedModel::from_payload(payload);
 
         let cov_design = nondensify_design(cov_dense.clone());
@@ -14117,7 +14139,7 @@ mod tests {
             FittedFamily::Survival {
                 likelihood: LikelihoodSpec::new(
                     ResponseFamily::RoystonParmar,
-                    InverseLink::Standard(LinkFunction::Identity),
+                    InverseLink::Standard(StandardLink::Identity),
                 ),
                 survival_likelihood: Some("marginal-slope".to_string()),
                 survival_distribution: Some(ResidualDistribution::Gaussian),
@@ -14180,7 +14202,7 @@ mod tests {
         // measure (the frozen default) is correct.
         payload.latent_measure = Some(LatentMeasureKind::StandardNormal);
         payload.logslope_baseline = Some(0.0);
-        payload.link = Some(InverseLink::Standard(LinkFunction::Probit));
+        payload.link = Some(InverseLink::Standard(StandardLink::Probit));
         let model = SavedModel::from_payload(payload);
         model
             .validate_for_persistence()
@@ -14253,7 +14275,7 @@ mod tests {
             FittedFamily::Survival {
                 likelihood: LikelihoodSpec::new(
                     ResponseFamily::RoystonParmar,
-                    InverseLink::Standard(LinkFunction::Identity),
+                    InverseLink::Standard(StandardLink::Identity),
                 ),
                 survival_likelihood: Some("transformation".to_string()),
                 survival_distribution: Some(ResidualDistribution::Gaussian),
@@ -14326,7 +14348,7 @@ mod tests {
             FittedFamily::Survival {
                 likelihood: LikelihoodSpec::new(
                     ResponseFamily::RoystonParmar,
-                    InverseLink::Standard(LinkFunction::Identity),
+                    InverseLink::Standard(StandardLink::Identity),
                 ),
                 survival_likelihood: Some("transformation".to_string()),
                 survival_distribution: Some(ResidualDistribution::Gaussian),
@@ -14630,7 +14652,7 @@ mod tests {
             FittedFamily::Survival {
                 likelihood: LikelihoodSpec::new(
                     ResponseFamily::RoystonParmar,
-                    InverseLink::Standard(LinkFunction::Identity),
+                    InverseLink::Standard(StandardLink::Identity),
                 ),
                 survival_likelihood: Some("transformation".to_string()),
                 survival_distribution: Some(ResidualDistribution::Gaussian),
@@ -15137,7 +15159,7 @@ mod tests {
         };
         args.link = Some("flexible(logit)".to_string());
         let link = parse_survival_inverse_link(&args).expect("flexible survival link");
-        assert!(matches!(link, InverseLink::Standard(LinkFunction::Logit)));
+        assert!(matches!(link, InverseLink::Standard(StandardLink::Logit)));
     }
 
     #[test]
@@ -16172,13 +16194,13 @@ mod tests {
             FittedFamily::LocationScale {
                 likelihood: LikelihoodSpec::new(
                     ResponseFamily::Binomial,
-                    InverseLink::Standard(LinkFunction::Probit),
+                    InverseLink::Standard(StandardLink::Probit),
                 ),
-                base_link: Some(InverseLink::Standard(LinkFunction::Probit)),
+                base_link: Some(InverseLink::Standard(StandardLink::Probit)),
             },
             "binomial-location-scale",
         );
-        payload.link = Some(InverseLink::Standard(LinkFunction::Probit));
+        payload.link = Some(InverseLink::Standard(StandardLink::Probit));
         payload.linkwiggle_knots = Some(knots);
         payload.linkwiggle_degree = Some(3);
         payload.beta_link_wiggle = Some(beta_link_wiggle.clone());
@@ -16373,13 +16395,13 @@ mod tests {
             FittedFamily::LocationScale {
                 likelihood: LikelihoodSpec::new(
                     ResponseFamily::Binomial,
-                    InverseLink::Standard(LinkFunction::Probit),
+                    InverseLink::Standard(StandardLink::Probit),
                 ),
-                base_link: Some(InverseLink::Standard(LinkFunction::Probit)),
+                base_link: Some(InverseLink::Standard(StandardLink::Probit)),
             },
             "binomial-location-scale",
         );
-        payload.link = Some(InverseLink::Standard(LinkFunction::Probit));
+        payload.link = Some(InverseLink::Standard(StandardLink::Probit));
         let model = SavedModel::from_payload(payload);
         let design = test_saved_linkwiggle_design(&q0, &model).expect("wiggle design");
         assert!(design.is_none());
@@ -16393,13 +16415,13 @@ mod tests {
             FittedFamily::LocationScale {
                 likelihood: LikelihoodSpec::new(
                     ResponseFamily::Binomial,
-                    InverseLink::Standard(LinkFunction::Probit),
+                    InverseLink::Standard(StandardLink::Probit),
                 ),
-                base_link: Some(InverseLink::Standard(LinkFunction::Probit)),
+                base_link: Some(InverseLink::Standard(StandardLink::Probit)),
             },
             "binomial-location-scale",
         );
-        payload.link = Some(InverseLink::Standard(LinkFunction::Probit));
+        payload.link = Some(InverseLink::Standard(StandardLink::Probit));
         payload.linkwiggle_knots = Some(vec![-1.0, -1.0, -1.0, 1.0, 1.0, 1.0]);
         payload.linkwiggle_degree = Some(2);
         let model = SavedModel::from_payload(payload);

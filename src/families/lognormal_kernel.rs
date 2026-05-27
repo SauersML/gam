@@ -235,14 +235,14 @@ fn worst_mode(
 #[inline]
 fn validate_kernel_inputs(m: f64, mu: f64, sigma: f64) -> Result<(), EstimationError> {
     if !m.is_finite() || m < 0.0 {
-        return Err(EstimationError::InvalidInput(format!(
+        crate::bail_invalid_estim!(
             "lognormal kernel requires finite m >= 0, got {m}"
-        )));
+        );
     }
     if !mu.is_finite() || !sigma.is_finite() || sigma < 0.0 {
-        return Err(EstimationError::InvalidInput(format!(
+        crate::bail_invalid_estim!(
             "lognormal kernel requires finite mu and sigma >= 0, got mu={mu}, sigma={sigma}"
-        )));
+        );
     }
     Ok::<(), _>(())
 }
@@ -259,15 +259,15 @@ pub fn log_kernel_term(
     let kf = k as f64;
     let sigma2 = sigma * sigma;
     if !sigma2.is_finite() {
-        return Err(EstimationError::InvalidInput(format!(
+        crate::bail_invalid_estim!(
             "lognormal kernel sigma is outside the finite exact-derivative range: sigma={sigma}"
-        )));
+        );
     }
     let prefix_bound = kf * mu.abs() + 0.5 * kf * kf * sigma2;
     if !prefix_bound.is_finite() {
-        return Err(EstimationError::InvalidInput(format!(
+        crate::bail_invalid_estim!(
             "lognormal kernel prefix is outside the finite exact-derivative range: k={k}, mu={mu}, sigma={sigma}"
-        )));
+        );
     }
     let prefix = kf * mu + 0.5 * kf * kf * sigma2;
     if m == 0.0 {
@@ -276,9 +276,9 @@ pub fn log_kernel_term(
     let log_m = m.ln();
     let shifted_bound = mu.abs() + kf * sigma2 + log_m.abs();
     if !shifted_bound.is_finite() {
-        return Err(EstimationError::InvalidInput(format!(
+        crate::bail_invalid_estim!(
             "lognormal kernel shifted location is outside the finite exact-derivative range: k={k}, m={m}, mu={mu}, sigma={sigma}"
-        )));
+        );
     }
     let shifted_mu = mu + kf * sigma2 + log_m;
     let (laplace, mode) = lognormal_laplace_unit_term_shared(quadctx, shifted_mu, sigma);
@@ -320,16 +320,16 @@ pub fn log_kernel_bundle(
     let mut log_values = Vec::with_capacity(max_k + 1);
     let sigma2 = sigma * sigma;
     if !sigma2.is_finite() {
-        return Err(EstimationError::InvalidInput(format!(
+        crate::bail_invalid_estim!(
             "lognormal kernel sigma is outside the finite exact-derivative range: sigma={sigma}"
-        )));
+        );
     }
     let max_kf = max_k as f64;
     let prefix_bound = max_kf * mu.abs() + 0.5 * max_kf * max_kf * sigma2;
     if !prefix_bound.is_finite() {
-        return Err(EstimationError::InvalidInput(format!(
+        crate::bail_invalid_estim!(
             "lognormal kernel bundle prefix is outside the finite exact-derivative range: max_k={max_k}, mu={mu}, sigma={sigma}"
-        )));
+        );
     }
     if m == 0.0 {
         let mut prefix = 0.0;
@@ -346,9 +346,9 @@ pub fn log_kernel_bundle(
     let log_m = m.ln();
     let shifted_bound = mu.abs() + max_kf * sigma2 + log_m.abs();
     if !shifted_bound.is_finite() {
-        return Err(EstimationError::InvalidInput(format!(
+        crate::bail_invalid_estim!(
             "lognormal kernel bundle shifted location is outside the finite exact-derivative range: max_k={max_k}, m={m}, mu={mu}, sigma={sigma}"
-        )));
+        );
     }
     let mut shifted_mu = mu + log_m;
     let mut prefix = 0.0;
@@ -655,9 +655,7 @@ impl LogKernelSumJet {
         if terms.is_empty() {
             // Empty sums are a caller-contract violation, not a degenerate row.
             // Return an input error so callers can report the malformed kernel sum.
-            return Err(EstimationError::InvalidInput(
-                "KernelSumJet requires at least one term".to_string(),
-            ));
+            crate::bail_invalid_estim!("KernelSumJet requires at least one term");
         }
 
         // Fast path for single term.
@@ -907,25 +905,25 @@ impl LatentSurvivalRow {
         ];
         for (name, value) in fields {
             if !value.is_finite() || value < 0.0 {
-                return Err(EstimationError::InvalidInput(format!(
+                crate::bail_invalid_estim!(
                     "latent survival row has invalid {name}={value}; expected a finite non-negative value"
-                )));
+                );
             }
         }
 
         match self.event_type {
             LatentSurvivalEventType::RightCensored => {
                 if self.mass_exit < self.mass_entry {
-                    return Err(EstimationError::InvalidInput(format!(
+                    crate::bail_invalid_estim!(
                         "latent survival right-censored row requires mass_exit >= mass_entry, got {} < {}",
                         self.mass_exit, self.mass_entry
-                    )));
+                    );
                 }
                 if self.mass_unloaded_exit < self.mass_unloaded_entry {
-                    return Err(EstimationError::InvalidInput(format!(
+                    crate::bail_invalid_estim!(
                         "latent survival right-censored row requires unloaded exit mass >= unloaded entry mass, got {} < {}",
                         self.mass_unloaded_exit, self.mass_unloaded_entry
-                    )));
+                    );
                 }
                 if self.mass_left > 0.0
                     || self.mass_right > 0.0
@@ -934,65 +932,57 @@ impl LatentSurvivalRow {
                     || self.hazard_loaded > 0.0
                     || self.hazard_unloaded > 0.0
                 {
-                    return Err(EstimationError::InvalidInput(
-                        "latent survival right-censored row cannot carry interval masses or event hazards"
-                            .to_string(),
-                    ));
+                    crate::bail_invalid_estim!("latent survival right-censored row cannot carry interval masses or event hazards"
+                            .to_string(),);
                 }
             }
             LatentSurvivalEventType::ExactEvent => {
                 if self.mass_exit < self.mass_entry {
-                    return Err(EstimationError::InvalidInput(format!(
+                    crate::bail_invalid_estim!(
                         "latent survival exact-event row requires mass_exit >= mass_entry, got {} < {}",
                         self.mass_exit, self.mass_entry
-                    )));
+                    );
                 }
                 if self.mass_unloaded_exit < self.mass_unloaded_entry {
-                    return Err(EstimationError::InvalidInput(format!(
+                    crate::bail_invalid_estim!(
                         "latent survival exact-event row requires unloaded exit mass >= unloaded entry mass, got {} < {}",
                         self.mass_unloaded_exit, self.mass_unloaded_entry
-                    )));
+                    );
                 }
                 if self.mass_left > 0.0
                     || self.mass_right > 0.0
                     || self.mass_unloaded_left > 0.0
                     || self.mass_unloaded_right > 0.0
                 {
-                    return Err(EstimationError::InvalidInput(
-                        "latent survival exact-event row cannot carry interval masses".to_string(),
-                    ));
+                    crate::bail_invalid_estim!("latent survival exact-event row cannot carry interval masses");
                 }
                 if self.hazard_loaded == 0.0 && self.hazard_unloaded == 0.0 {
-                    return Err(EstimationError::InvalidInput(
-                        "latent survival exact-event row requires a positive loaded or unloaded hazard"
-                            .to_string(),
-                    ));
+                    crate::bail_invalid_estim!("latent survival exact-event row requires a positive loaded or unloaded hazard"
+                            .to_string(),);
                 }
             }
             LatentSurvivalEventType::IntervalCensored => {
                 if self.mass_left < self.mass_entry || self.mass_right < self.mass_left {
-                    return Err(EstimationError::InvalidInput(format!(
+                    crate::bail_invalid_estim!(
                         "latent survival interval row requires mass_entry <= mass_left <= mass_right, got entry={}, left={}, right={}",
                         self.mass_entry, self.mass_left, self.mass_right
-                    )));
+                    );
                 }
                 if self.mass_unloaded_left < self.mass_unloaded_entry
                     || self.mass_unloaded_right < self.mass_unloaded_left
                 {
-                    return Err(EstimationError::InvalidInput(format!(
+                    crate::bail_invalid_estim!(
                         "latent survival interval row requires unloaded_entry <= unloaded_left <= unloaded_right, got entry={}, left={}, right={}",
                         self.mass_unloaded_entry, self.mass_unloaded_left, self.mass_unloaded_right
-                    )));
+                    );
                 }
                 if self.mass_exit > 0.0
                     || self.mass_unloaded_exit > 0.0
                     || self.hazard_loaded > 0.0
                     || self.hazard_unloaded > 0.0
                 {
-                    return Err(EstimationError::InvalidInput(
-                        "latent survival interval row cannot carry exit masses or event hazards"
-                            .to_string(),
-                    ));
+                    crate::bail_invalid_estim!("latent survival interval row cannot carry exit masses or event hazards"
+                            .to_string(),);
                 }
             }
         }
@@ -1008,10 +998,10 @@ fn exact_event_kernel_jet(
     sigma: f64,
 ) -> Result<LogKernelSumJet, EstimationError> {
     if row.hazard_loaded < 0.0 || row.hazard_unloaded < 0.0 {
-        return Err(EstimationError::InvalidInput(format!(
+        crate::bail_invalid_estim!(
             "latent survival exact-event hazards must be non-negative, got loaded={} unloaded={}",
             row.hazard_loaded, row.hazard_unloaded
-        )));
+        );
     }
     match (row.hazard_unloaded > 0.0, row.hazard_loaded > 0.0) {
         (true, true) => {

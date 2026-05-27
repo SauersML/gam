@@ -20,7 +20,7 @@ use gam::estimate::{
     evaluate_externalcost_andridge, evaluate_externalgradient,
 };
 use gam::smooth::BlockwisePenalty;
-use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily};
+use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, StandardLink, ResponseFamily};
 use ndarray::{Array1, Array2};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -40,7 +40,7 @@ const INNER_MAX_ITER: usize = 500;
 fn gaussian_identity_spec() -> LikelihoodSpec {
     LikelihoodSpec::new(
         ResponseFamily::Gaussian,
-        InverseLink::Standard(LinkFunction::Identity),
+        InverseLink::Standard(StandardLink::Identity),
     )
 }
 

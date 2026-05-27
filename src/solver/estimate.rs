@@ -44,7 +44,7 @@ use crate::terms::smooth::BlockwisePenalty;
 use crate::types::{
     Coefficients, GlmLikelihoodSpec, InverseLink, LatentCLogLogState, LikelihoodScaleMetadata,
     LikelihoodSpec, LinkFunction, LogLikelihoodNormalization, LogSmoothingParamsView,
-    MixtureLinkState, ResponseFamily, RidgePassport, SasLinkState,
+    MixtureLinkState, ResponseFamily, RidgePassport, SasLinkState, StandardLink,
 };
 use crate::types::{MixtureLinkSpec, SasLinkSpec};
 
@@ -159,9 +159,9 @@ impl CoefficientPriorMean {
             Self::Zero => Array1::zeros(block_dim),
             Self::Scalar(value) => {
                 if !value.is_finite() {
-                    return Err(EstimationError::InvalidInput(format!(
+                    crate::bail_invalid_estim!(
                         "{context}: coefficient prior mean scalar must be finite, got {value}"
-                    )));
+                    );
                 }
                 Array1::from_elem(block_dim, *value)
             }
@@ -176,9 +176,9 @@ impl CoefficientPriorMean {
                 kernel,
             } => {
                 if !amplitude.is_finite() {
-                    return Err(EstimationError::InvalidInput(format!(
+                    crate::bail_invalid_estim!(
                         "{context}: coefficient prior mean amplitude must be finite, got {amplitude}"
-                    )));
+                    );
                 }
                 let mut values = kernel(covariates);
                 values *= *amplitude;
@@ -186,15 +186,15 @@ impl CoefficientPriorMean {
             }
         };
         if values.len() != block_dim {
-            return Err(EstimationError::InvalidInput(format!(
+            crate::bail_invalid_estim!(
                 "{context}: coefficient prior mean length must be {block_dim}, got {}",
                 values.len()
-            )));
+            );
         }
         if values.iter().any(|&value| !value.is_finite()) {
-            return Err(EstimationError::InvalidInput(format!(
+            crate::bail_invalid_estim!(
                 "{context}: coefficient prior mean contains non-finite values"
-            )));
+            );
         }
         Ok(values)
     }
@@ -768,7 +768,7 @@ impl RemlConfig {
         // the outer also tightens the inner), but never coarser than the
         // floor — a coarse outer must not silently pollute the inner mode.
         let pirls_tol = reml_tol.min(PIRLS_INNER_TOLERANCE_FLOOR);
-        let link_kind = InverseLink::Standard(likelihood.link_function());
+        let link_kind = likelihood.spec.link.clone();
         Self {
             likelihood,
             link_kind,
@@ -1842,39 +1842,33 @@ fn resolve_external_family(
     firth_override: Option<bool>,
 ) -> Result<(GlmLikelihoodSpec, bool), EstimationError> {
     if family.is_royston_parmar() {
-        return Err(EstimationError::InvalidInput(
-            "optimize_external_design does not support RoystonParmar; use survival training APIs"
-                .to_string(),
-        ));
+        crate::bail_invalid_estim!("optimize_external_design does not support RoystonParmar; use survival training APIs"
+                .to_string(),);
     }
 
     let supports_firth = matches!(
         (&family.response, &family.link),
         (
             ResponseFamily::Binomial,
-            InverseLink::Standard(LinkFunction::Logit),
+            InverseLink::Standard(StandardLink::Logit),
         ),
     );
     if firth_override == Some(true) && !supports_firth {
-        return Err(EstimationError::InvalidInput(format!(
+        crate::bail_invalid_estim!(
             "firth_bias_reduction is currently implemented only for Binomial Logit; {} does not support it",
             family.pretty_name(),
-        )));
+        );
     }
 
     if let ResponseFamily::Tweedie { p } = &family.response {
         if !crate::types::is_valid_tweedie_power(*p) {
-            return Err(EstimationError::InvalidInput(
-                "optimize_external_design requires a GLM family; Tweedie variance power must be finite and strictly between 1 and 2; use PoissonLog or GammaLog for boundary cases"
-                    .to_string(),
-            ));
+            crate::bail_invalid_estim!("optimize_external_design requires a GLM family; Tweedie variance power must be finite and strictly between 1 and 2; use PoissonLog or GammaLog for boundary cases"
+                    .to_string(),);
         }
     }
     if matches!(family.response, ResponseFamily::RoystonParmar) {
-        return Err(EstimationError::InvalidInput(
-            "optimize_external_design requires a GLM family; RoystonParmar is survival-specific and not a GLM likelihood"
-                .to_string(),
-        ));
+        crate::bail_invalid_estim!("optimize_external_design requires a GLM family; RoystonParmar is survival-specific and not a GLM likelihood"
+                .to_string(),);
     }
     Ok((
         GlmLikelihoodSpec::canonical(family.clone()),
@@ -1925,7 +1919,11 @@ fn resolved_external_inverse_link(
             ),
         });
     }
-    Ok(InverseLink::Standard(link))
+    Ok(InverseLink::Standard(StandardLink::try_from(link).map_err(|e| {
+        EstimationError::InvalidInput(format!(
+            "inverse link resolution: {e}; supply `sas_link` or `latent_cloglog` configuration for state-bearing links"
+        ))
+    })?))
 }
 
 #[inline]
@@ -1933,24 +1931,16 @@ fn resolved_external_config(
     opts: &ExternalOptimOptions,
 ) -> Result<(RemlConfig, Option<SasLinkSpec>), EstimationError> {
     if opts.latent_cloglog.is_some() && (opts.mixture_link.is_some() || opts.sas_link.is_some()) {
-        return Err(EstimationError::InvalidInput(
-            "latent_cloglog cannot be combined with mixture_link or sas_link".to_string(),
-        ));
+        crate::bail_invalid_estim!("latent_cloglog cannot be combined with mixture_link or sas_link");
     }
     if opts.mixture_link.is_some() && opts.sas_link.is_some() {
-        return Err(EstimationError::InvalidInput(
-            "mixture_link and sas_link are mutually exclusive".to_string(),
-        ));
+        crate::bail_invalid_estim!("mixture_link and sas_link are mutually exclusive");
     }
     if opts.family.is_latent_cloglog() && opts.latent_cloglog.is_none() {
-        return Err(EstimationError::InvalidInput(
-            "BinomialLatentCLogLog requires latent_cloglog state".to_string(),
-        ));
+        crate::bail_invalid_estim!("BinomialLatentCLogLog requires latent_cloglog state");
     }
     if opts.latent_cloglog.is_some() && !opts.family.is_latent_cloglog() {
-        return Err(EstimationError::InvalidInput(
-            "latent_cloglog is only supported with BinomialLatentCLogLog".to_string(),
-        ));
+        crate::bail_invalid_estim!("latent_cloglog is only supported with BinomialLatentCLogLog");
     }
     let effective_sas_link = effective_sas_link_for_family(&opts.family, opts.sas_link);
     let (likelihood, firth_active) =
@@ -1978,35 +1968,35 @@ fn validate_penalty_specs(
             } => {
                 let bd = col_range.len();
                 if local.nrows() != bd || local.ncols() != bd {
-                    return Err(EstimationError::InvalidInput(format!(
+                    crate::bail_invalid_estim!(
                         "{context}: block penalty {idx} local matrix must be {bd}x{bd}, got {}x{}",
                         local.nrows(),
                         local.ncols()
-                    )));
+                    );
                 }
                 if col_range.end > p {
-                    return Err(EstimationError::InvalidInput(format!(
+                    crate::bail_invalid_estim!(
                         "{context}: block penalty {idx} col_range {}..{} exceeds p={p}",
                         col_range.start, col_range.end
-                    )));
+                    );
                 }
             }
             PenaltySpec::Dense(m) => {
                 if m.nrows() != p || m.ncols() != p {
-                    return Err(EstimationError::InvalidInput(format!(
+                    crate::bail_invalid_estim!(
                         "{context}: dense penalty {idx} must be {p}x{p}, got {}x{}",
                         m.nrows(),
                         m.ncols()
-                    )));
+                    );
                 }
             }
             PenaltySpec::DenseWithMean { matrix, .. } => {
                 if matrix.nrows() != p || matrix.ncols() != p {
-                    return Err(EstimationError::InvalidInput(format!(
+                    crate::bail_invalid_estim!(
                         "{context}: dense penalty {idx} must be {p}x{p}, got {}x{}",
                         matrix.nrows(),
                         matrix.ncols()
-                    )));
+                    );
                 }
             }
         }
@@ -2022,40 +2012,40 @@ fn validate_joint_hyper_direction_shapes(
     hyper_dirs: &[DirectionalHyperParam],
 ) -> Result<(), EstimationError> {
     if rho_dim > theta.len() {
-        return Err(EstimationError::InvalidInput(format!(
+        crate::bail_invalid_estim!(
             "rho_dim {} exceeds theta dimension {}",
             rho_dim,
             theta.len()
-        )));
+        );
     }
 
     let p = x.ncols();
     let psi_dim = theta.len() - rho_dim;
     if hyper_dirs.len() != psi_dim {
-        return Err(EstimationError::InvalidInput(format!(
+        crate::bail_invalid_estim!(
             "joint hyper-gradient derivative count mismatch: psi_dim={}, hyper_dirs={}",
             psi_dim,
             hyper_dirs.len()
-        )));
+        );
     }
 
     for (idx, hyper_dir) in hyper_dirs.iter().enumerate() {
         for component in hyper_dir.penalty_first_components() {
             if component.penalty_index >= canonical_len {
-                return Err(EstimationError::InvalidInput(format!(
+                crate::bail_invalid_estim!(
                     "penalty_index for dir {idx} out of bounds: {} >= {}",
                     component.penalty_index, canonical_len
-                )));
+                );
             }
         }
         if hyper_dir.x_tau_original.nrows() != x.nrows() || hyper_dir.x_tau_original.ncols() != p {
-            return Err(EstimationError::InvalidInput(format!(
+            crate::bail_invalid_estim!(
                 "X_tau[{idx}] must be {}x{}, got {}x{}",
                 x.nrows(),
                 p,
                 hyper_dir.x_tau_original.nrows(),
                 hyper_dir.x_tau_original.ncols()
-            )));
+            );
         }
         RemlState::validate_penalty_component_shapes(
             hyper_dir.penalty_first_components(),
@@ -2064,34 +2054,34 @@ fn validate_joint_hyper_direction_shapes(
         )?;
         if let Some(x2) = hyper_dir.x_tau_tau_original.as_ref() {
             if x2.len() != psi_dim {
-                return Err(EstimationError::InvalidInput(format!(
+                crate::bail_invalid_estim!(
                     "X_tau_tau[{idx}] length mismatch: expected {}, got {}",
                     psi_dim,
                     x2.len()
-                )));
+                );
             }
             for (j, x_ij) in x2.iter().enumerate() {
                 let Some(x_ij) = x_ij.as_ref() else {
                     continue;
                 };
                 if x_ij.nrows() != x.nrows() || x_ij.ncols() != p {
-                    return Err(EstimationError::InvalidInput(format!(
+                    crate::bail_invalid_estim!(
                         "X_tau_tau[{idx}][{j}] must be {}x{}, got {}x{}",
                         x.nrows(),
                         p,
                         x_ij.nrows(),
                         x_ij.ncols()
-                    )));
+                    );
                 }
             }
         }
         if let Some(s2) = hyper_dir.penaltysecond_componentrows() {
             if s2.len() != psi_dim {
-                return Err(EstimationError::InvalidInput(format!(
+                crate::bail_invalid_estim!(
                     "S_tau_tau[{idx}] length mismatch: expected {}, got {}",
                     psi_dim,
                     s2.len()
-                )));
+                );
             }
             for (j, components) in s2.iter().enumerate() {
                 let Some(components) = components.as_ref() else {
@@ -2138,7 +2128,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         context: &str,
     ) -> Result<Self, EstimationError> {
         if let Some(message) = row_mismatch_message(y.len(), w.len(), x.nrows(), offset.len()) {
-            return Err(EstimationError::InvalidInput(message));
+            crate::bail_invalid_estim!("{}", message);
         }
 
         let p = x.ncols();
@@ -2526,11 +2516,11 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         design_revision: Option<u64>,
     ) -> Result<f64, EstimationError> {
         if rho_dim > theta.len() {
-            return Err(EstimationError::InvalidInput(format!(
+            crate::bail_invalid_estim!(
                 "rho_dim {} exceeds theta dimension {}",
                 rho_dim,
                 theta.len()
-            )));
+            );
         }
         self.prepare_eval_state_cost_only(
             x,
@@ -2567,11 +2557,11 @@ mod tests_diagnostics {
             context: &str,
         ) -> Result<Array2<f64>, EstimationError> {
             if rho_dim > theta.len() {
-                return Err(EstimationError::InvalidInput(format!(
+                crate::bail_invalid_estim!(
                     "rho_dim {} exceeds theta dimension {}",
                     rho_dim,
                     theta.len()
-                )));
+                );
             }
             self.prepare_eval_state_cost_only(
                 x,
@@ -2606,11 +2596,11 @@ mod tests_diagnostics {
             context: &str,
         ) -> Result<f64, EstimationError> {
             if rho_dim > theta.len() {
-                return Err(EstimationError::InvalidInput(format!(
+                crate::bail_invalid_estim!(
                     "rho_dim {} exceeds theta dimension {}",
                     rho_dim,
                     theta.len()
-                )));
+                );
             }
             self.prepare_eval_state_cost_only(
                 x,
@@ -2744,13 +2734,11 @@ where
     X: Into<DesignMatrix>,
 {
     if opts.family.is_binomial_mixture() && opts.mixture_link.is_none() {
-        return Err(EstimationError::InvalidInput(
-            "BinomialMixture requires mixture_link specification".to_string(),
-        ));
+        crate::bail_invalid_estim!("BinomialMixture requires mixture_link specification");
     }
     let x = x.into();
     if let Some(message) = row_mismatch_message(y.len(), w.len(), x.nrows(), offset.len()) {
-        return Err(EstimationError::InvalidInput(message));
+        crate::bail_invalid_estim!("{}", message);
     }
 
     let p = x.ncols();
@@ -2767,10 +2755,10 @@ where
         conditioning.transform_linear_constraints_to_internal(opts.linear_constraints.clone());
     let k = canonical.len();
     if active_nullspace_dims.len() != k {
-        return Err(EstimationError::InvalidInput(format!(
+        crate::bail_invalid_estim!(
             "nullspace_dims length mismatch: expected {k} entries for active penalties, got {}",
             active_nullspace_dims.len()
-        )));
+        );
     }
     let (cfg, effective_sas_link) = resolved_external_config(opts)?;
 
@@ -2851,9 +2839,7 @@ where
         final_sas_param_covariance,
         outer_result,
     ) = if mixture_dim > 0 && sas_dim > 0 {
-        return Err(EstimationError::InvalidInput(
-            "simultaneous mixture and SAS optimization is not supported".to_string(),
-        ));
+        crate::bail_invalid_estim!("simultaneous mixture and SAS optimization is not supported");
     } else if mixture_dim == 0 && sas_dim == 0 {
         use crate::solver::outer_strategy::{
             DeclaredHessianForm, Derivative, InnerProgressFeedback, OuterEvalOrder, OuterProblem,
@@ -4109,7 +4095,7 @@ pub struct FitInference {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum FittedLinkState {
-    Standard(Option<LinkFunction>),
+    Standard(Option<StandardLink>),
     LatentCLogLog {
         state: LatentCLogLogState,
     },
@@ -4433,9 +4419,9 @@ where
 {
     for (idx, value) in values.into_iter().enumerate() {
         if !value.is_finite() {
-            return Err(EstimationError::InvalidInput(format!(
+            crate::bail_invalid_estim!(
                 "{label}[{idx}] must be finite, got {value}"
-            )));
+            );
         }
     }
     Ok(())
@@ -4560,22 +4546,22 @@ pub fn validate_dense_hessian_export(
     expected_dim: usize,
 ) -> Result<(), EstimationError> {
     if hessian.nrows() != expected_dim || hessian.ncols() != expected_dim {
-        return Err(EstimationError::InvalidInput(format!(
+        crate::bail_invalid_estim!(
             "{label} shape mismatch: got {}x{}, expected {}x{}",
             hessian.nrows(),
             hessian.ncols(),
             expected_dim,
             expected_dim
-        )));
+        );
     }
     if expected_dim == 0 {
         return Ok(());
     }
     validate_all_finite_estimation(label, hessian.iter().copied())?;
     if !hessian.iter().any(|value| value.abs() > 0.0) {
-        return Err(EstimationError::InvalidInput(format!(
+        crate::bail_invalid_estim!(
             "{label} must be an explicit dense Hessian; zero placeholders are not allowed at fit export"
-        )));
+        );
     }
     let symmetry_tol = 1e-10;
     for i in 0..expected_dim {
@@ -4584,9 +4570,9 @@ pub fn validate_dense_hessian_export(
             let b = hessian[[j, i]];
             let scale = 1.0_f64.max(a.abs()).max(b.abs());
             if (a - b).abs() > symmetry_tol * scale {
-                return Err(EstimationError::InvalidInput(format!(
+                crate::bail_invalid_estim!(
                     "{label} must be symmetric at fit export; entries ({i},{j})={a} and ({j},{i})={b} differ"
-                )));
+                );
             }
         }
     }
@@ -4706,16 +4692,14 @@ impl UnifiedFitResult {
         } = parts;
 
         if blocks.is_empty() {
-            return Err(EstimationError::InvalidInput(
-                "UnifiedFitResult requires at least one coefficient block".to_string(),
-            ));
+            crate::bail_invalid_estim!("UnifiedFitResult requires at least one coefficient block");
         }
         if log_lambdas.len() != lambdas.len() {
-            return Err(EstimationError::InvalidInput(format!(
+            crate::bail_invalid_estim!(
                 "UnifiedFitResult lambda mismatch: log_lambdas={}, lambdas={}",
                 log_lambdas.len(),
                 lambdas.len()
-            )));
+            );
         }
         for (idx, block) in blocks.iter().enumerate() {
             validate_all_finite_estimation(
@@ -4731,17 +4715,13 @@ impl UnifiedFitResult {
         let beta = flatten_block_betas(&blocks);
         let block_lambdas = flatten_block_lambdas(&blocks);
         if !array1_values_equal(&block_lambdas, &lambdas) {
-            return Err(EstimationError::InvalidInput(
-                "UnifiedFitResult top-level lambdas must match block lambdas concatenated in block order"
-                    .to_string(),
-            ));
+            crate::bail_invalid_estim!("UnifiedFitResult top-level lambdas must match block lambdas concatenated in block order"
+                    .to_string(),);
         }
         validate_all_finite_estimation("fit_result.log_lambdas", log_lambdas.iter().copied())?;
         validate_all_finite_estimation("fit_result.lambdas", lambdas.iter().copied())?;
         if !log_lambdas_match_lambdas(&log_lambdas, &lambdas) {
-            return Err(EstimationError::InvalidInput(
-                "UnifiedFitResult log_lambdas must equal ln(lambdas) elementwise".to_string(),
-            ));
+            crate::bail_invalid_estim!("UnifiedFitResult log_lambdas must equal ln(lambdas) elementwise");
         }
         validate_likelihood_scale_estimation(likelihood_scale)?;
         ensure_finite_scalar_estimation("fit_result.log_likelihood", log_likelihood)?;
@@ -4784,48 +4764,48 @@ impl UnifiedFitResult {
         if let Some(cov) = covariance_conditional.as_ref()
             && (cov.nrows() != p || cov.ncols() != p)
         {
-            return Err(EstimationError::InvalidInput(format!(
+            crate::bail_invalid_estim!(
                 "UnifiedFitResult conditional covariance shape mismatch: got {}x{}, expected {}x{}",
                 cov.nrows(),
                 cov.ncols(),
                 p,
                 p
-            )));
+            );
         }
         if let Some(cov) = covariance_corrected.as_ref()
             && (cov.nrows() != p || cov.ncols() != p)
         {
-            return Err(EstimationError::InvalidInput(format!(
+            crate::bail_invalid_estim!(
                 "UnifiedFitResult corrected covariance shape mismatch: got {}x{}, expected {}x{}",
                 cov.nrows(),
                 cov.ncols(),
                 p,
                 p
-            )));
+            );
         }
         if let Some(inf) = inference.as_ref() {
             if !inf.edf_by_block.is_empty() && inf.edf_by_block.len() != lambdas.len() {
-                return Err(EstimationError::InvalidInput(format!(
+                crate::bail_invalid_estim!(
                     "UnifiedFitResult EDF smoothing-parameter count mismatch: edf_by_block={}, lambdas={}",
                     inf.edf_by_block.len(),
                     lambdas.len()
-                )));
+                );
             }
             if inf.working_weights.len() != inf.working_response.len() {
-                return Err(EstimationError::InvalidInput(format!(
+                crate::bail_invalid_estim!(
                     "UnifiedFitResult working vector length mismatch: working_weights={}, working_response={}",
                     inf.working_weights.len(),
                     inf.working_response.len()
-                )));
+                );
             }
             if inf.penalized_hessian.nrows() != p || inf.penalized_hessian.ncols() != p {
-                return Err(EstimationError::InvalidInput(format!(
+                crate::bail_invalid_estim!(
                     "UnifiedFitResult penalized Hessian shape mismatch: got {}x{}, expected {}x{}",
                     inf.penalized_hessian.nrows(),
                     inf.penalized_hessian.ncols(),
                     p,
                     p
-                )));
+                );
             }
             validate_dense_hessian_export(
                 "UnifiedFitResult inference penalized Hessian",
@@ -4834,128 +4814,120 @@ impl UnifiedFitResult {
             )?;
             if let Some(cov) = inf.beta_covariance.as_ref() {
                 if cov.nrows() != p || cov.ncols() != p {
-                    return Err(EstimationError::InvalidInput(format!(
+                    crate::bail_invalid_estim!(
                         "UnifiedFitResult inference conditional covariance shape mismatch: got {}x{}, expected {}x{}",
                         cov.nrows(),
                         cov.ncols(),
                         p,
                         p
-                    )));
+                    );
                 }
                 match covariance_conditional.as_ref() {
                     Some(top) if array2_values_equal(cov, top) => {}
                     Some(_) => {
-                        return Err(EstimationError::InvalidInput(
-                            "UnifiedFitResult inference conditional covariance must match top-level covariance_conditional"
-                                .to_string(),
-                        ));
+                        crate::bail_invalid_estim!("UnifiedFitResult inference conditional covariance must match top-level covariance_conditional"
+                                .to_string(),);
                     }
                     None => {
-                        return Err(EstimationError::InvalidInput(
-                            "UnifiedFitResult inference conditional covariance requires top-level covariance_conditional"
-                                .to_string(),
-                        ));
+                        crate::bail_invalid_estim!("UnifiedFitResult inference conditional covariance requires top-level covariance_conditional"
+                                .to_string(),);
                     }
                 }
             }
             if let Some(se) = inf.beta_standard_errors.as_ref()
                 && se.len() != p
             {
-                return Err(EstimationError::InvalidInput(format!(
+                crate::bail_invalid_estim!(
                     "UnifiedFitResult beta standard error length mismatch: got {}, expected {}",
                     se.len(),
                     p
-                )));
+                );
             }
             if let Some(cov) = inf.beta_covariance_corrected.as_ref() {
                 if cov.nrows() != p || cov.ncols() != p {
-                    return Err(EstimationError::InvalidInput(format!(
+                    crate::bail_invalid_estim!(
                         "UnifiedFitResult inference corrected covariance shape mismatch: got {}x{}, expected {}x{}",
                         cov.nrows(),
                         cov.ncols(),
                         p,
                         p
-                    )));
+                    );
                 }
                 match covariance_corrected.as_ref() {
                     Some(top) if array2_values_equal(cov, top) => {}
                     Some(_) => {
-                        return Err(EstimationError::InvalidInput(
-                            "UnifiedFitResult inference corrected covariance must match top-level covariance_corrected"
-                                .to_string(),
-                        ));
+                        crate::bail_invalid_estim!("UnifiedFitResult inference corrected covariance must match top-level covariance_corrected"
+                                .to_string(),);
                     }
                     None => {
-                        return Err(EstimationError::InvalidInput(
-                            "UnifiedFitResult inference corrected covariance requires top-level covariance_corrected"
-                                .to_string(),
-                        ));
+                        crate::bail_invalid_estim!("UnifiedFitResult inference corrected covariance requires top-level covariance_corrected"
+                                .to_string(),);
                     }
                 }
             }
             if let Some(se) = inf.beta_standard_errors_corrected.as_ref()
                 && se.len() != p
             {
-                return Err(EstimationError::InvalidInput(format!(
+                crate::bail_invalid_estim!(
                     "UnifiedFitResult corrected beta standard error length mismatch: got {}, expected {}",
                     se.len(),
                     p
-                )));
+                );
             }
             if let Some(cov) = inf.beta_covariance_frequentist.as_ref()
                 && (cov.nrows() != p || cov.ncols() != p)
             {
-                return Err(EstimationError::InvalidInput(format!(
+                crate::bail_invalid_estim!(
                     "UnifiedFitResult frequentist covariance shape mismatch: got {}x{}, expected {}x{}",
                     cov.nrows(),
                     cov.ncols(),
                     p,
                     p
-                )));
+                );
             }
             if let Some(f_mat) = inf.coefficient_influence.as_ref()
                 && (f_mat.nrows() != p || f_mat.ncols() != p)
             {
-                return Err(EstimationError::InvalidInput(format!(
+                crate::bail_invalid_estim!(
                     "UnifiedFitResult coefficient influence shape mismatch: got {}x{}, expected {}x{}",
                     f_mat.nrows(),
                     f_mat.ncols(),
                     p,
                     p
-                )));
+                );
             }
             if let Some(corr) = inf.smoothing_correction.as_ref()
                 && (corr.nrows() != p || corr.ncols() != p)
             {
-                return Err(EstimationError::InvalidInput(format!(
+                crate::bail_invalid_estim!(
                     "UnifiedFitResult smoothing correction shape mismatch: got {}x{}, expected {}x{}",
                     corr.nrows(),
                     corr.ncols(),
                     p,
                     p
-                )));
+                );
             }
             if let Some(qs) = inf.reparam_qs.as_ref()
                 && (qs.nrows() != p || qs.ncols() != p)
             {
-                return Err(EstimationError::InvalidInput(format!(
+                crate::bail_invalid_estim!(
                     "UnifiedFitResult reparam_qs shape mismatch: got {}x{}, expected {}x{}",
                     qs.nrows(),
                     qs.ncols(),
                     p,
                     p
-                )));
+                );
             }
         }
         if let Some(geom) = geometry.as_ref() {
             if geom.penalized_hessian.nrows() != p || geom.penalized_hessian.ncols() != p {
-                return Err(EstimationError::InvalidInput(format!(
+                crate::bail_invalid_estim!(
                     "UnifiedFitResult geometry penalized Hessian shape mismatch: got {}x{}, expected {}x{}",
                     geom.penalized_hessian.nrows(),
                     geom.penalized_hessian.ncols(),
                     p,
                     p
-                )));
+                );
             }
             validate_dense_hessian_export(
                 "UnifiedFitResult geometry penalized Hessian",
@@ -4963,39 +4935,33 @@ impl UnifiedFitResult {
                 p,
             )?;
             if geom.working_weights.len() != geom.working_response.len() {
-                return Err(EstimationError::InvalidInput(format!(
+                crate::bail_invalid_estim!(
                     "UnifiedFitResult geometry working vector length mismatch: working_weights={}, working_response={}",
                     geom.working_weights.len(),
                     geom.working_response.len()
-                )));
+                );
             }
             if let Some(inf) = inference.as_ref() {
                 if !array2_values_equal(&geom.penalized_hessian, &inf.penalized_hessian) {
-                    return Err(EstimationError::InvalidInput(
-                        "UnifiedFitResult geometry penalized Hessian must match inference.penalized_hessian"
-                            .to_string(),
-                    ));
+                    crate::bail_invalid_estim!("UnifiedFitResult geometry penalized Hessian must match inference.penalized_hessian"
+                            .to_string(),);
                 }
                 if !array1_values_equal(&geom.working_weights, &inf.working_weights) {
-                    return Err(EstimationError::InvalidInput(
-                        "UnifiedFitResult geometry working_weights must match inference.working_weights"
-                            .to_string(),
-                    ));
+                    crate::bail_invalid_estim!("UnifiedFitResult geometry working_weights must match inference.working_weights"
+                            .to_string(),);
                 }
                 if !array1_values_equal(&geom.working_response, &inf.working_response) {
-                    return Err(EstimationError::InvalidInput(
-                        "UnifiedFitResult geometry working_response must match inference.working_response"
-                            .to_string(),
-                    ));
+                    crate::bail_invalid_estim!("UnifiedFitResult geometry working_response must match inference.working_response"
+                            .to_string(),);
                 }
             }
         }
         if !block_states.is_empty() && block_states.len() != blocks.len() {
-            return Err(EstimationError::InvalidInput(format!(
+            crate::bail_invalid_estim!(
                 "UnifiedFitResult block state count mismatch: blocks={}, block_states={}",
                 blocks.len(),
                 block_states.len()
-            )));
+            );
         }
 
         Ok(Self {
@@ -5031,10 +4997,8 @@ impl UnifiedFitResult {
     pub fn validate_numeric_finiteness(&self) -> Result<(), EstimationError> {
         let expected_beta = flatten_block_betas(&self.blocks);
         if !array1_values_equal(&self.beta, &expected_beta) {
-            return Err(EstimationError::InvalidInput(
-                "UnifiedFitResult decoded beta must match coefficient blocks concatenated in block order"
-                    .to_string(),
-            ));
+            crate::bail_invalid_estim!("UnifiedFitResult decoded beta must match coefficient blocks concatenated in block order"
+                    .to_string(),);
         }
         Self::try_from_parts(UnifiedFitResultParts {
             blocks: self.blocks.clone(),
@@ -5366,13 +5330,13 @@ impl UnifiedFitResult {
     ) -> Result<FittedLinkState, EstimationError> {
         match (&family.response, &family.link) {
             (ResponseFamily::Gaussian, _) => Ok(FittedLinkState::Standard(None)),
-            (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Logit)) => {
+            (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::Logit)) => {
                 Ok(FittedLinkState::Standard(None))
             }
-            (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Probit)) => {
+            (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::Probit)) => {
                 Ok(FittedLinkState::Standard(None))
             }
-            (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::CLogLog)) => {
+            (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::CLogLog)) => {
                 Ok(FittedLinkState::Standard(None))
             }
             (ResponseFamily::Binomial, InverseLink::LatentCLogLog(_)) => match &self.fitted_link {
@@ -6046,15 +6010,11 @@ where
 {
     let x = x.into();
     if family.is_binomial_mixture() && opts.mixture_link.is_none() {
-        return Err(EstimationError::InvalidInput(
-            "BinomialMixture requires mixture_link specification".to_string(),
-        ));
+        crate::bail_invalid_estim!("BinomialMixture requires mixture_link specification");
     }
     let effective_sas_link = effective_sas_link_for_family(&family, opts.sas_link);
     if opts.mixture_link.is_some() && opts.sas_link.is_some() {
-        return Err(EstimationError::InvalidInput(
-            "mixture_link and sas_link cannot both be set".to_string(),
-        ));
+        crate::bail_invalid_estim!("mixture_link and sas_link cannot both be set");
     }
     // sas_link only makes sense when the family already declares an adaptive
     // SAS-style link (BinomialSas / BinomialBetaLogistic).  Reject any attempt
@@ -6069,26 +6029,24 @@ where
             InverseLink::Sas(_) | InverseLink::BetaLogistic(_)
         );
         if !link_supports_sas {
-            return Err(EstimationError::InvalidInput(format!(
+            crate::bail_invalid_estim!(
                 "sas_link options are only valid for adaptive SAS link families \
                  (BinomialSas / BinomialBetaLogistic); family '{}' uses a fixed link \
                  and cannot accept sas_link parameters",
                 family.pretty_name(),
-            )));
+            );
         }
     }
     let resolved_family: crate::types::LikelihoodSpec = if let Some(mix_spec) =
         opts.mixture_link.as_ref()
     {
         if !family.is_binomial() {
-            return Err(EstimationError::InvalidInput(
-                "mixture_link is only supported for binomial families".to_string(),
-            ));
+            crate::bail_invalid_estim!("mixture_link is only supported for binomial families");
         }
         match &family.link {
-            InverseLink::Standard(LinkFunction::Logit)
-            | InverseLink::Standard(LinkFunction::Probit)
-            | InverseLink::Standard(LinkFunction::CLogLog)
+            InverseLink::Standard(StandardLink::Logit)
+            | InverseLink::Standard(StandardLink::Probit)
+            | InverseLink::Standard(StandardLink::CLogLog)
             | InverseLink::Mixture(_) => {
                 let mixture_state = crate::mixture_link::state_fromspec(mix_spec).map_err(|e| {
                     EstimationError::InvalidInput(format!("invalid mixture link: {e}"))
@@ -6099,9 +6057,7 @@ where
                 )
             }
             _ => {
-                return Err(EstimationError::InvalidInput(
-                    "mixture_link is only supported for binomial families".to_string(),
-                ));
+                crate::bail_invalid_estim!("mixture_link is only supported for binomial families");
             }
         }
     } else if let Some(latent_state) = opts.latent_cloglog.as_ref() {
@@ -6111,28 +6067,22 @@ where
         // is carried through into ExternalOptimResult.likelihood_family and
         // any downstream consumer (predict, save/load, summary).
         if !family.is_binomial() {
-            return Err(EstimationError::InvalidInput(
-                "latent_cloglog is only supported for Binomial families".to_string(),
-            ));
+            crate::bail_invalid_estim!("latent_cloglog is only supported for Binomial families");
         }
         match &family.link {
-            InverseLink::Standard(LinkFunction::CLogLog) | InverseLink::LatentCLogLog(_) => {
+            InverseLink::Standard(StandardLink::CLogLog) | InverseLink::LatentCLogLog(_) => {
                 LikelihoodSpec::new(
                     ResponseFamily::Binomial,
                     InverseLink::LatentCLogLog(*latent_state),
                 )
             }
             _ => {
-                return Err(EstimationError::InvalidInput(
-                    "latent_cloglog is only supported with the Binomial CLogLog / LatentCLogLog link".to_string(),
-                ));
+                crate::bail_invalid_estim!("latent_cloglog is only supported with the Binomial CLogLog / LatentCLogLog link");
             }
         }
     } else if let Some(sas_spec) = effective_sas_link {
         if !family.is_binomial() {
-            return Err(EstimationError::InvalidInput(
-                "sas_link is only supported for binomial families".to_string(),
-            ));
+            crate::bail_invalid_estim!("sas_link is only supported for binomial families");
         }
         let use_beta_logistic = family.is_binomial_beta_logistic();
         match &family.link {
@@ -6154,18 +6104,14 @@ where
                 }
             }
             _ => {
-                return Err(EstimationError::InvalidInput(
-                    "sas_link options are only valid for adaptive SAS link families".to_string(),
-                ));
+                crate::bail_invalid_estim!("sas_link options are only valid for adaptive SAS link families");
             }
         }
     } else {
         family.clone()
     };
     if resolved_family.is_royston_parmar() {
-        return Err(EstimationError::InvalidInput(
-            "fit_gam external design path does not support RoystonParmar; use survival training APIs".to_string(),
-        ));
+        crate::bail_invalid_estim!("fit_gam external design path does not support RoystonParmar; use survival training APIs");
     }
     // Validate Beta-regression response domain upfront on the external-design
     // GLM path so callers get a clear error before PIRLS is even constructed.
@@ -6175,11 +6121,11 @@ where
     if matches!(resolved_family.response, ResponseFamily::Beta { .. }) {
         for (i, (&yi, &wi)) in y.iter().zip(weights.iter()).enumerate() {
             if wi > 0.0 && (!yi.is_finite() || yi <= 0.0 || yi >= 1.0) {
-                return Err(EstimationError::InvalidInput(format!(
+                crate::bail_invalid_estim!(
                     "GLM Beta-regression family rejects response y[{i}]={yi}: \
                      fit_gam external GLM routing requires y strictly in the open interval (0, 1); \
                      boundary values 0 or 1 are not in the Beta sample space"
-                )));
+                );
             }
         }
     }
@@ -6368,12 +6314,12 @@ fn materialize_link_outer_hessian(
     match hessian.materialize_dense() {
         Ok(Some(h)) => {
             if h.nrows() != theta_dim || h.ncols() != theta_dim {
-                return Err(EstimationError::InvalidInput(format!(
+                crate::bail_invalid_estim!(
                     "unified evaluator Hessian shape {}x{} != theta_dim {}",
                     h.nrows(),
                     h.ncols(),
                     theta_dim
-                )));
+                );
             }
             Ok(h)
         }
@@ -6403,7 +6349,7 @@ where
     let specs: Vec<PenaltySpec> = s_list.iter().map(PenaltySpec::from_blockwise_ref).collect();
     let x = x.into();
     if let Some(message) = row_mismatch_message(y.len(), w.len(), x.nrows(), offset.len()) {
-        return Err(EstimationError::InvalidInput(message));
+        crate::bail_invalid_estim!("{}", message);
     }
 
     let p = x.ncols();
@@ -6415,11 +6361,11 @@ where
         "evaluate_externalgradient",
     )?;
     if rho.len() != active_nullspace_dims.len() {
-        return Err(EstimationError::InvalidInput(format!(
+        crate::bail_invalid_estim!(
             "rho dimension mismatch: rho_dim={}, active_penalties={}",
             rho.len(),
             active_nullspace_dims.len()
-        )));
+        );
     }
 
     let (cfg, _) = resolved_external_config(opts)?;
@@ -6464,18 +6410,18 @@ fn gaussian_identity_inner_residual_norm(
     beta: &Array1<f64>,
 ) -> Result<f64, EstimationError> {
     if beta.len() != x.ncols() {
-        return Err(EstimationError::InvalidInput(format!(
+        crate::bail_invalid_estim!(
             "beta dimension mismatch: beta_dim={}, x_cols={}",
             beta.len(),
             x.ncols()
-        )));
+        );
     }
     if rho.len() != canonical_penalties.len() {
-        return Err(EstimationError::InvalidInput(format!(
+        crate::bail_invalid_estim!(
             "rho dimension mismatch: rho_dim={}, active_penalties={}",
             rho.len(),
             canonical_penalties.len()
-        )));
+        );
     }
 
     let mut residual = x.apply(beta);
@@ -6561,22 +6507,18 @@ where
     X: Into<DesignMatrix>,
 {
     if !opts.family.is_gaussian_identity() {
-        return Err(EstimationError::InvalidInput(
-            "evaluate_external_ift_residual_at_perturbed_rho currently supports GaussianIdentity"
-                .to_string(),
-        ));
+        crate::bail_invalid_estim!("evaluate_external_ift_residual_at_perturbed_rho currently supports GaussianIdentity"
+                .to_string(),);
     }
     if opts.linear_constraints.is_some() {
-        return Err(EstimationError::InvalidInput(
-            "evaluate_external_ift_residual_at_perturbed_rho does not support constrained fits"
-                .to_string(),
-        ));
+        crate::bail_invalid_estim!("evaluate_external_ift_residual_at_perturbed_rho does not support constrained fits"
+                .to_string(),);
     }
 
     let specs: Vec<PenaltySpec> = s_list.iter().map(PenaltySpec::from_blockwise_ref).collect();
     let x = x.into();
     if let Some(message) = row_mismatch_message(y.len(), w.len(), x.nrows(), offset.len()) {
-        return Err(EstimationError::InvalidInput(message));
+        crate::bail_invalid_estim!("{}", message);
     }
 
     let p = x.ncols();
@@ -6588,18 +6530,18 @@ where
         "evaluate_external_ift_residual_at_perturbed_rho",
     )?;
     if rho.len() != active_nullspace_dims.len() {
-        return Err(EstimationError::InvalidInput(format!(
+        crate::bail_invalid_estim!(
             "rho dimension mismatch: rho_dim={}, active_penalties={}",
             rho.len(),
             active_nullspace_dims.len()
-        )));
+        );
     }
     if delta_rho.len() != rho.len() {
-        return Err(EstimationError::InvalidInput(format!(
+        crate::bail_invalid_estim!(
             "delta_rho dimension mismatch: delta_dim={}, rho_dim={}",
             delta_rho.len(),
             rho.len()
-        )));
+        );
     }
 
     let mut tight_opts = opts.clone();
@@ -6695,7 +6637,7 @@ where
     let specs: Vec<PenaltySpec> = s_list.iter().map(PenaltySpec::from_blockwise_ref).collect();
     let x = x.into();
     if let Some(message) = row_mismatch_message(y.len(), w.len(), x.nrows(), offset.len()) {
-        return Err(EstimationError::InvalidInput(message));
+        crate::bail_invalid_estim!("{}", message);
     }
 
     let p = x.ncols();
@@ -6707,11 +6649,11 @@ where
         "evaluate_externalcost_andridge",
     )?;
     if rho.len() != active_nullspace_dims.len() {
-        return Err(EstimationError::InvalidInput(format!(
+        crate::bail_invalid_estim!(
             "rho dimension mismatch: rho_dim={}, active_penalties={}",
             rho.len(),
             active_nullspace_dims.len()
-        )));
+        );
     }
 
     let (cfg, _) = resolved_external_config(opts)?;
@@ -6754,7 +6696,7 @@ mod estimate_policy_tests {
     use super::*;
     use crate::linalg::utils::{StableSolver, max_abs_diag};
     use crate::mixture_link::{sas_inverse_link_jet, sas_inverse_link_jetwith_param_partials};
-    use crate::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily};
+    use crate::types::{InverseLink, LikelihoodSpec, LinkFunction, StandardLink, ResponseFamily};
     use ndarray::{Array1, Array2, array};
     use rand::rngs::StdRng;
     use rand::{RngExt, SeedableRng};
@@ -6829,7 +6771,7 @@ mod estimate_policy_tests {
             lambdas: array![0.2, 0.8],
             likelihood_family: Some(LikelihoodSpec::new(
                 ResponseFamily::Gaussian,
-                InverseLink::Standard(LinkFunction::Identity),
+                InverseLink::Standard(StandardLink::Identity),
             )),
             likelihood_scale: LikelihoodScaleMetadata::ProfiledGaussian,
             log_likelihood_normalization: LogLikelihoodNormalization::Full,
@@ -6883,7 +6825,7 @@ mod estimate_policy_tests {
         let err = resolve_external_family(
             &LikelihoodSpec::new(
                 ResponseFamily::Poisson,
-                InverseLink::Standard(LinkFunction::Log),
+                InverseLink::Standard(StandardLink::Log),
             ),
             Some(true),
         )

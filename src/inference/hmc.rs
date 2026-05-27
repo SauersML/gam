@@ -37,7 +37,7 @@ use crate::solver::mixture_link::{
     InverseLinkKernel, LinkParamPartials, inverse_link_jet_for_inverse_link, softmax_last_fixedzero,
 };
 use crate::types::{
-    InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily, RhoPrior, is_valid_tweedie_power,
+    InverseLink, LikelihoodSpec, LinkFunction, StandardLink, ResponseFamily, RhoPrior, is_valid_tweedie_power,
 };
 use crate::visualizer::VisualizerSession;
 use faer::Side;
@@ -58,7 +58,7 @@ fn likelihood_spec_supports_firth(spec: &LikelihoodSpec) -> bool {
         (&spec.response, &spec.link),
         (
             ResponseFamily::Binomial,
-            InverseLink::Standard(LinkFunction::Logit),
+            InverseLink::Standard(StandardLink::Logit),
         )
     )
 }
@@ -496,35 +496,35 @@ impl NutsFamily {
         match self {
             Self::Gaussian => LikelihoodSpec {
                 response: ResponseFamily::Gaussian,
-                link: InverseLink::Standard(LinkFunction::Identity),
+                link: InverseLink::Standard(StandardLink::Identity),
             },
             Self::BinomialLogit => LikelihoodSpec {
                 response: ResponseFamily::Binomial,
-                link: InverseLink::Standard(LinkFunction::Logit),
+                link: InverseLink::Standard(StandardLink::Logit),
             },
             Self::BinomialProbit => LikelihoodSpec {
                 response: ResponseFamily::Binomial,
-                link: InverseLink::Standard(LinkFunction::Probit),
+                link: InverseLink::Standard(StandardLink::Probit),
             },
             Self::BinomialCLogLog => LikelihoodSpec {
                 response: ResponseFamily::Binomial,
-                link: InverseLink::Standard(LinkFunction::CLogLog),
+                link: InverseLink::Standard(StandardLink::CLogLog),
             },
             Self::PoissonLog => LikelihoodSpec {
                 response: ResponseFamily::Poisson,
-                link: InverseLink::Standard(LinkFunction::Log),
+                link: InverseLink::Standard(StandardLink::Log),
             },
             Self::TweedieLog => LikelihoodSpec {
                 response: ResponseFamily::Tweedie { p: 1.5 },
-                link: InverseLink::Standard(LinkFunction::Log),
+                link: InverseLink::Standard(StandardLink::Log),
             },
             Self::NegativeBinomialLog => LikelihoodSpec {
                 response: ResponseFamily::NegativeBinomial { theta: 1.0 },
-                link: InverseLink::Standard(LinkFunction::Log),
+                link: InverseLink::Standard(StandardLink::Log),
             },
             Self::GammaLog => LikelihoodSpec {
                 response: ResponseFamily::Gamma,
-                link: InverseLink::Standard(LinkFunction::Log),
+                link: InverseLink::Standard(StandardLink::Log),
             },
         }
     }
@@ -820,7 +820,7 @@ fn validate_firth_support(family: NutsFamily, firth_enabled: bool) -> Result<(),
     if firth_enabled && !likelihood_spec_supports_firth(&spec) {
         let binomial_logit = LikelihoodSpec {
             response: ResponseFamily::Binomial,
-            link: InverseLink::Standard(LinkFunction::Logit),
+            link: InverseLink::Standard(StandardLink::Logit),
         };
         return Err(HmcError::FirthUnsupported {
             reason: format!(
@@ -841,7 +841,7 @@ fn validate_firth_likelihood_support(
     if firth_enabled && !likelihood_spec_supports_firth(likelihood) {
         let binomial_logit = LikelihoodSpec {
             response: ResponseFamily::Binomial,
-            link: InverseLink::Standard(LinkFunction::Logit),
+            link: InverseLink::Standard(StandardLink::Logit),
         };
         return Err(HmcError::FirthUnsupported {
             reason: format!(
@@ -1139,9 +1139,9 @@ fn joint_binomial_logp_and_grad(
         .into());
     }
     match &likelihood.link {
-        InverseLink::Standard(LinkFunction::Logit) => Ok(logit_logp_and_grad(data, eta)),
-        InverseLink::Standard(LinkFunction::Probit) => Ok(probit_logp_and_grad(data, eta)),
-        InverseLink::Standard(LinkFunction::CLogLog) => Ok(cloglog_logp_and_grad(data, eta)),
+        InverseLink::Standard(StandardLink::Logit) => Ok(logit_logp_and_grad(data, eta)),
+        InverseLink::Standard(StandardLink::Probit) => Ok(probit_logp_and_grad(data, eta)),
+        InverseLink::Standard(StandardLink::CLogLog) => Ok(cloglog_logp_and_grad(data, eta)),
         InverseLink::LatentCLogLog(_)
         | InverseLink::Sas(_)
         | InverseLink::BetaLogistic(_)
@@ -1167,15 +1167,15 @@ fn joint_family_logp_grad_and_link_grad(
     n_link_params: usize,
 ) -> Result<(f64, Array1<f64>, Array1<f64>), String> {
     match (&likelihood.response, &likelihood.link) {
-        (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Logit)) => {
+        (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::Logit)) => {
             let (ll, grad) = logit_logp_and_grad(data, eta);
             Ok((ll, grad, Array1::zeros(n_link_params)))
         }
-        (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Probit)) => {
+        (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::Probit)) => {
             let (ll, grad) = probit_logp_and_grad(data, eta);
             Ok((ll, grad, Array1::zeros(n_link_params)))
         }
-        (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::CLogLog)) => {
+        (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::CLogLog)) => {
             let (ll, grad) = cloglog_logp_and_grad(data, eta);
             Ok((ll, grad, Array1::zeros(n_link_params)))
         }
@@ -1322,9 +1322,9 @@ fn probit_logp_and_grad_into(
 #[inline]
 fn cloglog_bernoulli_logp_and_residual(eta: f64, y: f64) -> Result<(f64, f64), EstimationError> {
     if !(eta.is_finite() && (-700.0..=700.0).contains(&eta)) {
-        return Err(EstimationError::InvalidInput(format!(
+        crate::bail_invalid_estim!(
             "cloglog eta must be finite and within [-700, 700]; got {eta}"
-        )));
+        );
     }
     let exp_eta = eta.exp();
     let log_mu = if exp_eta <= std::f64::consts::LN_2 {
@@ -1656,7 +1656,7 @@ mod tests {
             lambdas,
             likelihood_family: Some(LikelihoodSpec::new(
                 ResponseFamily::Gaussian,
-                InverseLink::Standard(LinkFunction::Identity),
+                InverseLink::Standard(StandardLink::Identity),
             )),
             likelihood_scale: LikelihoodScaleMetadata::ProfiledGaussian,
             log_likelihood_normalization: LogLikelihoodNormalization::Full,
@@ -1782,7 +1782,7 @@ mod tests {
             lambdas: Array1::zeros(0),
             likelihood_family: Some(LikelihoodSpec::new(
                 ResponseFamily::Gaussian,
-                InverseLink::Standard(LinkFunction::Identity),
+                InverseLink::Standard(StandardLink::Identity),
             )),
             likelihood_scale: LikelihoodScaleMetadata::ProfiledGaussian,
             log_likelihood_normalization: LogLikelihoodNormalization::Full,
@@ -2157,7 +2157,7 @@ mod tests {
         let out = run_nuts_sampling_flattened_family(
             LikelihoodSpec {
                 response: ResponseFamily::Binomial,
-                link: InverseLink::Standard(LinkFunction::Logit),
+                link: InverseLink::Standard(StandardLink::Logit),
             },
             FamilyNutsInputs::Glm(GlmFlatInputs {
                 x: x.view(),
@@ -2196,7 +2196,7 @@ mod tests {
         let err = match run_nuts_sampling_flattened_family(
             LikelihoodSpec {
                 response: ResponseFamily::Binomial,
-                link: InverseLink::Standard(LinkFunction::Probit),
+                link: InverseLink::Standard(StandardLink::Probit),
             },
             FamilyNutsInputs::Glm(GlmFlatInputs {
                 x: x.view(),
@@ -2240,7 +2240,7 @@ mod tests {
         let err = match run_nuts_sampling_flattened_family(
             LikelihoodSpec {
                 response: ResponseFamily::Poisson,
-                link: InverseLink::Standard(LinkFunction::Log),
+                link: InverseLink::Standard(StandardLink::Log),
             },
             FamilyNutsInputs::Glm(GlmFlatInputs {
                 x: x.view(),
@@ -2325,7 +2325,7 @@ mod tests {
             weights: w.view(),
             likelihood: LikelihoodSpec {
                 response: ResponseFamily::Poisson,
-                link: InverseLink::Standard(LinkFunction::Log),
+                link: InverseLink::Standard(StandardLink::Log),
             },
             gamma_shape: None,
             mode: mode.view(),
@@ -2374,7 +2374,7 @@ mod tests {
             rho_mode.view(),
             LikelihoodSpec {
                 response: ResponseFamily::Gaussian,
-                link: InverseLink::Standard(LinkFunction::Identity),
+                link: InverseLink::Standard(StandardLink::Identity),
             },
             None,
             RhoPrior::Flat,
@@ -2419,7 +2419,7 @@ mod tests {
             array![0.0].view(),
             LikelihoodSpec {
                 response: ResponseFamily::Gaussian,
-                link: InverseLink::Standard(LinkFunction::Identity),
+                link: InverseLink::Standard(StandardLink::Identity),
             },
             None,
             prior.clone(),
@@ -2436,7 +2436,7 @@ mod tests {
             array![2.5].view(),
             LikelihoodSpec {
                 response: ResponseFamily::Gaussian,
-                link: InverseLink::Standard(LinkFunction::Identity),
+                link: InverseLink::Standard(StandardLink::Identity),
             },
             None,
             prior,
@@ -2493,7 +2493,7 @@ mod tests {
         let (ll_logit, _) = joint_family_logp_and_grad(
             &LikelihoodSpec {
                 response: ResponseFamily::Binomial,
-                link: InverseLink::Standard(LinkFunction::Logit),
+                link: InverseLink::Standard(StandardLink::Logit),
             },
             &data,
             &eta,
@@ -2586,7 +2586,7 @@ mod tests {
             rho.view(),
             LikelihoodSpec {
                 response: ResponseFamily::Gaussian,
-                link: InverseLink::Standard(LinkFunction::Identity),
+                link: InverseLink::Standard(StandardLink::Identity),
             },
             None,
             RhoPrior::Flat,
@@ -2651,27 +2651,27 @@ mod tests {
         let accepted = [
             LikelihoodSpec {
                 response: ResponseFamily::Binomial,
-                link: InverseLink::Standard(LinkFunction::Logit),
+                link: InverseLink::Standard(StandardLink::Logit),
             },
             LikelihoodSpec {
                 response: ResponseFamily::Binomial,
-                link: InverseLink::Standard(LinkFunction::Probit),
+                link: InverseLink::Standard(StandardLink::Probit),
             },
             LikelihoodSpec {
                 response: ResponseFamily::Binomial,
-                link: InverseLink::Standard(LinkFunction::CLogLog),
+                link: InverseLink::Standard(StandardLink::CLogLog),
             },
             LikelihoodSpec {
                 response: ResponseFamily::Gaussian,
-                link: InverseLink::Standard(LinkFunction::Identity),
+                link: InverseLink::Standard(StandardLink::Identity),
             },
             LikelihoodSpec {
                 response: ResponseFamily::Poisson,
-                link: InverseLink::Standard(LinkFunction::Log),
+                link: InverseLink::Standard(StandardLink::Log),
             },
             LikelihoodSpec {
                 response: ResponseFamily::Gamma,
-                link: InverseLink::Standard(LinkFunction::Log),
+                link: InverseLink::Standard(StandardLink::Log),
             },
         ];
         for spec in &accepted {
@@ -2720,7 +2720,7 @@ mod tests {
         let rp_result = joint_family_logp_and_grad(
             &LikelihoodSpec {
                 response: ResponseFamily::RoystonParmar,
-                link: InverseLink::Standard(LinkFunction::Logit),
+                link: InverseLink::Standard(StandardLink::Logit),
             },
             &data,
             &eta,
@@ -3982,7 +3982,7 @@ pub fn run_nuts_sampling_flattened_family(
     {
         let binomial_logit = LikelihoodSpec {
             response: ResponseFamily::Binomial,
-            link: InverseLink::Standard(LinkFunction::Logit),
+            link: InverseLink::Standard(StandardLink::Logit),
         };
         return Err(HmcError::FirthUnsupported {
             reason: format!(
@@ -3997,7 +3997,7 @@ pub fn run_nuts_sampling_flattened_family(
     match (likelihood.response.clone(), likelihood.link.clone(), inputs) {
         (
             ResponseFamily::Gaussian,
-            InverseLink::Standard(LinkFunction::Identity),
+            InverseLink::Standard(StandardLink::Identity),
             FamilyNutsInputs::Glm(glm),
         ) => run_nuts_sampling(
             glm.x,
@@ -4014,7 +4014,7 @@ pub fn run_nuts_sampling_flattened_family(
         ),
         (
             ResponseFamily::Binomial,
-            InverseLink::Standard(LinkFunction::Logit),
+            InverseLink::Standard(StandardLink::Logit),
             FamilyNutsInputs::Glm(glm),
         ) => {
             // Auto-select PG Gibbs when assumptions hold; otherwise fall back to NUTS.
@@ -4046,7 +4046,7 @@ pub fn run_nuts_sampling_flattened_family(
         }
         (
             ResponseFamily::Binomial,
-            InverseLink::Standard(LinkFunction::Probit),
+            InverseLink::Standard(StandardLink::Probit),
             FamilyNutsInputs::Glm(glm),
         ) => run_nuts_sampling(
             glm.x,
@@ -4063,7 +4063,7 @@ pub fn run_nuts_sampling_flattened_family(
         ),
         (
             ResponseFamily::Binomial,
-            InverseLink::Standard(LinkFunction::CLogLog),
+            InverseLink::Standard(StandardLink::CLogLog),
             FamilyNutsInputs::Glm(glm),
         ) => run_nuts_sampling(
             glm.x,
@@ -5216,9 +5216,9 @@ impl JointBetaRhoPosterior {
         }
 
         match (&likelihood.response, &likelihood.link) {
-            (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Logit)) => {}
-            (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Probit)) => {}
-            (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::CLogLog)) => {}
+            (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::Logit)) => {}
+            (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::Probit)) => {}
+            (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::CLogLog)) => {}
             (ResponseFamily::Binomial, InverseLink::LatentCLogLog(_)) => {}
             (ResponseFamily::Binomial, InverseLink::Sas(_)) => {}
             (ResponseFamily::Binomial, InverseLink::BetaLogistic(_)) => {}
@@ -5232,7 +5232,7 @@ impl JointBetaRhoPosterior {
                 }
                 .into());
             }
-            (ResponseFamily::Gaussian, InverseLink::Standard(LinkFunction::Identity)) => {}
+            (ResponseFamily::Gaussian, InverseLink::Standard(StandardLink::Identity)) => {}
             (ResponseFamily::Gaussian, _) => {
                 return Err(HmcError::LinkMismatch {
                     reason: "Joint HMC Gaussian requires an identity inverse link".to_string(),
@@ -5244,7 +5244,7 @@ impl JointBetaRhoPosterior {
                 | ResponseFamily::Tweedie { .. }
                 | ResponseFamily::NegativeBinomial { .. }
                 | ResponseFamily::Gamma,
-                InverseLink::Standard(LinkFunction::Log),
+                InverseLink::Standard(StandardLink::Log),
             ) => {}
             (
                 ResponseFamily::Poisson
@@ -5258,7 +5258,7 @@ impl JointBetaRhoPosterior {
                 }
                 .into());
             }
-            (ResponseFamily::Beta { .. }, InverseLink::Standard(LinkFunction::Logit)) => {}
+            (ResponseFamily::Beta { .. }, InverseLink::Standard(StandardLink::Logit)) => {}
             (ResponseFamily::Beta { .. }, _) => {
                 return Err(HmcError::LinkMismatch {
                     reason: "Joint HMC Beta requires a logit inverse link".to_string(),
@@ -6098,7 +6098,7 @@ pub fn run_survival_nuts_sampling_flattened<'a>(
     run_nuts_sampling_flattened_family(
         LikelihoodSpec {
             response: ResponseFamily::RoystonParmar,
-            link: InverseLink::Standard(LinkFunction::Identity),
+            link: InverseLink::Standard(StandardLink::Identity),
         },
         FamilyNutsInputs::Survival(Box::new(SurvivalNutsInputs {
             flat,

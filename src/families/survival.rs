@@ -234,9 +234,7 @@ fn validate_cause_specific_block(
     let n = block.event_target.len();
     let p = block.x_exit.ncols();
     if n == 0 || p == 0 {
-        return Err(SurvivalError::InvalidInput {
-            reason: "empty event vector or coefficient block".to_string(),
-        });
+        crate::bail_invalid_surv!("empty event vector or coefficient block");
     }
     if block.age_entry.len() != n
         || block.age_exit.len() != n
@@ -270,9 +268,7 @@ fn validate_cause_specific_block(
         || !block.derivative_floor.is_finite()
         || block.derivative_floor < 0.0
     {
-        return Err(SurvivalError::InvalidInput {
-            reason: "non-finite input".to_string(),
-        });
+        crate::bail_invalid_surv!("non-finite input");
     }
     Ok(())
 }
@@ -304,9 +300,7 @@ fn evaluate_cause_specific_block(
             continue;
         }
         if block.age_exit[i] < block.age_entry[i] {
-            return Err(SurvivalError::InvalidInput {
-                reason: format!("age_exit < age_entry at row {i}"),
-            });
+            crate::bail_invalid_surv!("age_exit < age_entry at row {i}");
         }
         let has_entry = block.age_entry[i] > 1e-8;
         let h_exit = eta_exit[i].exp();
@@ -1009,14 +1003,12 @@ impl WorkingModelSurvival {
         }
         let log_abs = log_scale + base.abs().ln();
         if !log_abs.is_finite() {
-            return Err(EstimationError::InvalidInput(
-                "survival interval term produced non-finite log-magnitude".to_string(),
-            ));
+            crate::bail_invalid_estim!("survival interval term produced non-finite log-magnitude");
         }
         if log_abs > Self::LOG_F64_MAX {
-            return Err(EstimationError::InvalidInput(format!(
+            crate::bail_invalid_estim!(
                 "survival interval term exceeds f64 range (log-magnitude={log_abs:.3e})"
-            )));
+            );
         }
         Ok(base.signum() * log_abs.exp())
     }
@@ -1640,23 +1632,21 @@ impl WorkingModelSurvival {
     ) -> Result<(), EstimationError> {
         let p = self.coefficient_dim();
         if time_columns > p {
-            return Err(EstimationError::InvalidInput(format!(
+            crate::bail_invalid_estim!(
                 "structural time columns {} exceed coefficient dimension {}",
                 time_columns, p
-            )));
+            );
         }
         if enabled && time_columns == 0 {
-            return Err(EstimationError::InvalidInput(
-                "structural monotonicity requires at least one time column".to_string(),
-            ));
+            crate::bail_invalid_estim!("structural monotonicity requires at least one time column");
         }
         if enabled {
             const STRUCTURAL_DERIV_TOL: f64 = 1e-12;
             for (i, &offset) in self.offset_derivative_exit.iter().enumerate() {
                 if offset < -STRUCTURAL_DERIV_TOL {
-                    return Err(EstimationError::InvalidInput(format!(
+                    crate::bail_invalid_estim!(
                         "structural monotonicity requires nonnegative derivative offsets; found offset_derivative_exit[{i}]={offset:.3e}"
-                    )));
+                    );
                 }
             }
             let mut derivative_row = vec![0.0_f64; p];
@@ -1665,17 +1655,17 @@ impl WorkingModelSurvival {
                 for j in 0..time_columns {
                     let v = derivative_row[j];
                     if v < -STRUCTURAL_DERIV_TOL {
-                        return Err(EstimationError::InvalidInput(format!(
+                        crate::bail_invalid_estim!(
                             "structural monotonicity requires nonnegative time-derivative basis entries; found x_derivative[{i},{j}]={v:.3e}"
-                        )));
+                        );
                     }
                 }
                 for j in time_columns..p {
                     let v = derivative_row[j];
                     if v.abs() > STRUCTURAL_DERIV_TOL {
-                        return Err(EstimationError::InvalidInput(format!(
+                        crate::bail_invalid_estim!(
                             "structural monotonicity requires zero derivative contribution outside the time block; found x_derivative[{i},{j}]={v:.3e}"
-                        )));
+                        );
                     }
                 }
             }
@@ -1685,26 +1675,26 @@ impl WorkingModelSurvival {
             ) {
                 for (i, &offset) in offsets.iter().enumerate() {
                     if offset < -STRUCTURAL_DERIV_TOL {
-                        return Err(EstimationError::InvalidInput(format!(
+                        crate::bail_invalid_estim!(
                             "structural monotonicity requires nonnegative collocation derivative offsets; found monotonicity_constraint_offsets[{i}]={offset:.3e}"
-                        )));
+                        );
                     }
                 }
                 for i in 0..rows.nrows() {
                     for j in 0..time_columns {
                         let v = rows[[i, j]];
                         if v < -STRUCTURAL_DERIV_TOL {
-                            return Err(EstimationError::InvalidInput(format!(
+                            crate::bail_invalid_estim!(
                                 "structural monotonicity requires nonnegative collocation derivative basis entries; found monotonicity_constraint_rows[{i},{j}]={v:.3e}"
-                            )));
+                            );
                         }
                     }
                     for j in time_columns..p {
                         let v = rows[[i, j]];
                         if v.abs() > STRUCTURAL_DERIV_TOL {
-                            return Err(EstimationError::InvalidInput(format!(
+                            crate::bail_invalid_estim!(
                                 "structural monotonicity requires zero collocation derivative contribution outside the time block; found monotonicity_constraint_rows[{i},{j}]={v:.3e}"
-                            )));
+                            );
                         }
                     }
                 }
@@ -1717,9 +1707,7 @@ impl WorkingModelSurvival {
 
     pub fn update_state(&self, beta: &Array1<f64>) -> Result<WorkingState, EstimationError> {
         if beta.len() != self.coefficient_dim() {
-            return Err(EstimationError::InvalidInput(
-                "survival beta dimension mismatch".to_string(),
-            ));
+            crate::bail_invalid_estim!("survival beta dimension mismatch");
         }
 
         let n = self.nrows();
@@ -1776,9 +1764,7 @@ impl WorkingModelSurvival {
             let entry_age = self.age_entry[i];
             let exit_age = self.age_exit[i];
             if !entry_age.is_finite() || !exit_age.is_finite() || exit_age < entry_age {
-                return Err(EstimationError::InvalidInput(
-                    "survival ages must be finite with age_exit >= age_entry".to_string(),
-                ));
+                crate::bail_invalid_estim!("survival ages must be finite with age_exit >= age_entry");
             }
             let d = f64::from(self.event_target[i]);
 
@@ -1832,9 +1818,9 @@ impl WorkingModelSurvival {
                 0.0
             };
             if !w_exit_i.is_finite() {
-                return Err(EstimationError::InvalidInput(format!(
+                crate::bail_invalid_estim!(
                     "survival interval term exceeds f64 range at row {i} (w*exp(eta_exit)={w_exit_i:.3e})"
-                )));
+                );
             }
             w_hess_exit[i] = w_exit_i;
             w_hess_entry[i] = w_entry_i;
@@ -2093,9 +2079,7 @@ impl WorkingModelSurvival {
         beta: &Array1<f64>,
     ) -> Result<OffsetChannelResiduals, EstimationError> {
         if beta.len() != self.coefficient_dim() {
-            return Err(EstimationError::InvalidInput(
-                "survival beta dimension mismatch in offset_channel_residuals".to_string(),
-            ));
+            crate::bail_invalid_estim!("survival beta dimension mismatch in offset_channel_residuals");
         }
         let n = self.nrows();
         let eta_entry = self.entry_dot(beta) + &self.offset_eta_entry;
@@ -2115,9 +2099,7 @@ impl WorkingModelSurvival {
             let entry_age = self.age_entry[i];
             let exit_age = self.age_exit[i];
             if !entry_age.is_finite() || !exit_age.is_finite() || exit_age < entry_age {
-                return Err(EstimationError::InvalidInput(
-                    "survival ages must be finite with age_exit >= age_entry".to_string(),
-                ));
+                crate::bail_invalid_estim!("survival ages must be finite with age_exit >= age_entry");
             }
             let has_entry_interval = !self.entry_at_origin[i];
             let d = f64::from(self.event_target[i]);
@@ -2131,9 +2113,9 @@ impl WorkingModelSurvival {
                 0.0
             };
             if !w_exit_i.is_finite() {
-                return Err(EstimationError::InvalidInput(format!(
+                crate::bail_invalid_estim!(
                     "offset_channel_residuals: w*exp(eta_exit)={w_exit_i:.3e} non-finite at row {i}"
-                )));
+                );
             }
             r_exit[i] = w_exit_i - d * w;
             r_entry[i] = -w_entry_i;
@@ -2185,11 +2167,11 @@ impl WorkingModelSurvival {
             .filter(|b| b.lambda > 0.0)
             .collect();
         if rho.len() != active_penalty_blocks.len() {
-            return Err(EstimationError::InvalidInput(format!(
+            crate::bail_invalid_estim!(
                 "survival LAML rho dimension {} does not match active penalty block count {}",
                 rho.len(),
                 active_penalty_blocks.len()
-            )));
+            );
         }
         let k_count = active_penalty_blocks.len();
 

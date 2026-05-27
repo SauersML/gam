@@ -116,12 +116,10 @@ impl DerivativeHessian<'_> {
         match self {
             DerivativeHessian::Dense(matrix) => {
                 if matrix.nrows() != expected_p || matrix.ncols() != expected_p {
-                    return Err(GpuError::DriverCallFailed {
-                        reason: format!(
+                    gpu_bail!(
                             "reml_trace dense H_j: shape {:?} != ({expected_p}, {expected_p})",
                             matrix.dim()
-                        ),
-                    });
+                        );
                 }
             }
             DerivativeHessian::WeightedGram {
@@ -129,22 +127,18 @@ impl DerivativeHessian<'_> {
                 penalty_extra,
             } => {
                 if row_weights.len() != expected_n {
-                    return Err(GpuError::DriverCallFailed {
-                        reason: format!(
+                    gpu_bail!(
                             "reml_trace structural H_j: row_weights.len()={} != n={expected_n}",
                             row_weights.len()
-                        ),
-                    });
+                        );
                 }
                 if let Some(p_extra) = penalty_extra
                     && (p_extra.nrows() != expected_p || p_extra.ncols() != expected_p)
                 {
-                    return Err(GpuError::DriverCallFailed {
-                        reason: format!(
+                    gpu_bail!(
                             "reml_trace structural H_j penalty_extra: shape {:?} != ({expected_p}, {expected_p})",
                             p_extra.dim()
-                        ),
-                    });
+                        );
                 }
             }
         }
@@ -968,12 +962,8 @@ extern "C" __global__ void reduce_q_weighted_gram(
         let k = input.probe_count;
         let (ctx, stream) =
             context_and_stream().map_err(|reason| GpuError::DriverCallFailed { reason })?;
-        let solver = DnHandle::new(stream.clone()).map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("reml_trace cusolver init: {err}"),
-        })?;
-        let blas = CudaBlas::new(stream.clone()).map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("reml_trace cublas init: {err}"),
-        })?;
+        let solver = DnHandle::new(stream.clone()).gpu_ctx("reml_trace cusolver init")?;
+        let blas = CudaBlas::new(stream.clone()).gpu_ctx("reml_trace cublas init")?;
         let compiled = module(&ctx)?;
         let module_handle: &Arc<CudaModule> = compiled;
 
@@ -985,21 +975,15 @@ extern "C" __global__ void reduce_q_weighted_gram(
             .map_err(|reason| GpuError::DriverCallFailed { reason })?;
         let factor_col = stream
             .clone_dtoh(&h_dev)
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("reml_trace download factor: {err}"),
-            })?;
+            .gpu_ctx("reml_trace download factor")?;
         let logdet_hessian = cholesky_logdet_from_col_major(&factor_col, p);
 
         // ── 2. Allocate Z (p, K) and fill with Rademacher entries on device.
-        let total_z = p.checked_mul(k).ok_or_else(|| GpuError::DriverCallFailed {
-            reason: format!("reml_trace Z size overflow: p={p}, K={k}"),
-        })?;
+        let total_z = p.checked_mul(k).ok_or_else(|| gpu_err!("reml_trace Z size overflow: p={p}, K={k}"))?;
         let mut z_dev =
             stream
                 .alloc_zeros::<f64>(total_z)
-                .map_err(|err| GpuError::DriverCallFailed {
-                    reason: format!("reml_trace alloc Z: {err}"),
-                })?;
+                .gpu_ctx("reml_trace alloc Z")?;
         launch_fill_rademacher(&stream, module_handle, input.seed, p, k, &mut z_dev)?;
 
         // ── 3. Solve H W = Z in a single batched potrs call (nrhs = K).
@@ -1007,9 +991,7 @@ extern "C" __global__ void reduce_q_weighted_gram(
         let mut w_dev =
             stream
                 .alloc_zeros::<f64>(total_z)
-                .map_err(|err| GpuError::DriverCallFailed {
-                    reason: format!("reml_trace alloc W: {err}"),
-                })?;
+                .gpu_ctx("reml_trace alloc W")?;
         copy_device_slice(&stream, &z_dev, &mut w_dev)?;
         potrs_in_place(&solver, &stream, p, k, &h_dev, &mut w_dev)
             .map_err(|reason| GpuError::DriverCallFailed { reason })?;
@@ -1049,9 +1031,7 @@ extern "C" __global__ void reduce_q_weighted_gram(
                 let hj_dev = pinned_htod(&stream, &hj_col)
                     .map_err(|reason| GpuError::DriverCallFailed { reason })?;
                 let mut y_dev = stream.alloc_zeros::<f64>(total_z).map_err(|err| {
-                    GpuError::DriverCallFailed {
-                        reason: format!("reml_trace alloc Y_j (j={j}): {err}"),
-                    }
+                    gpu_err!("reml_trace alloc Y_j (j={j}): {err}")
                 })?;
                 gemm_nn(
                     &blas,
@@ -1070,9 +1050,7 @@ extern "C" __global__ void reduce_q_weighted_gram(
                 let mut q_j_dev =
                     stream
                         .alloc_zeros::<f64>(k)
-                        .map_err(|err| GpuError::DriverCallFailed {
-                            reason: format!("reml_trace alloc Q_j (j={j}): {err}"),
-                        })?;
+                        .gpu_ctx("reml_trace alloc Q_j (j={j})")?;
                 launch_reduce_q_dense(
                     &stream,
                     module_handle,
@@ -1086,9 +1064,7 @@ extern "C" __global__ void reduce_q_weighted_gram(
                 let q_host_j =
                     stream
                         .clone_dtoh(&q_j_dev)
-                        .map_err(|err| GpuError::DriverCallFailed {
-                            reason: format!("reml_trace download Q_j (j={j}): {err}"),
-                        })?;
+                        .gpu_ctx("reml_trace download Q_j (j={j})")?;
                 q_host[j * k..(j + 1) * k].copy_from_slice(&q_host_j);
             }
         }
@@ -1107,18 +1083,12 @@ extern "C" __global__ void reduce_q_weighted_gram(
             let x_dev = pinned_htod(&stream, &design_col)
                 .map_err(|reason| GpuError::DriverCallFailed { reason })?;
             let mut rz_dev = stream
-                .alloc_zeros::<f64>(n.checked_mul(k).ok_or_else(|| GpuError::DriverCallFailed {
-                    reason: format!("reml_trace RZ overflow: n={n}, K={k}"),
-                })?)
-                .map_err(|err| GpuError::DriverCallFailed {
-                    reason: format!("reml_trace alloc RZ: {err}"),
-                })?;
+                .alloc_zeros::<f64>(n.checked_mul(k).ok_or_else(|| gpu_err!("reml_trace RZ overflow: n={n}, K={k}"))?)
+                .gpu_ctx("reml_trace alloc RZ")?;
             let mut rw_dev =
                 stream
                     .alloc_zeros::<f64>(n * k)
-                    .map_err(|err| GpuError::DriverCallFailed {
-                        reason: format!("reml_trace alloc RW: {err}"),
-                    })?;
+                    .gpu_ctx("reml_trace alloc RW")?;
             // R_Z = X Z   (n × p) · (p × K) -> (n × K)
             gemm_nn(
                 &blas,
@@ -1169,17 +1139,13 @@ extern "C" __global__ void reduce_q_weighted_gram(
                 };
                 let slice = row_weights
                     .as_slice()
-                    .ok_or_else(|| GpuError::DriverCallFailed {
-                        reason: format!("reml_trace structural H_j={j} row_weights not contiguous"),
-                    })?;
+                    .ok_or_else(|| gpu_err!("reml_trace structural H_j={j} row_weights not contiguous"))?;
                 a_stack.extend_from_slice(slice);
             }
             let a_dev = pinned_htod(&stream, &a_stack)
                 .map_err(|reason| GpuError::DriverCallFailed { reason })?;
             let mut q_dev = stream.alloc_zeros::<f64>(d_gram * k).map_err(|err| {
-                GpuError::DriverCallFailed {
-                    reason: format!("reml_trace alloc Q_gram: {err}"),
-                }
+                gpu_err!("reml_trace alloc Q_gram: {err}")
             })?;
             launch_reduce_q_weighted_gram(
                 &stream,
@@ -1195,9 +1161,7 @@ extern "C" __global__ void reduce_q_weighted_gram(
             let q_host_gram =
                 stream
                     .clone_dtoh(&q_dev)
-                    .map_err(|err| GpuError::DriverCallFailed {
-                        reason: format!("reml_trace download Q_gram: {err}"),
-                    })?;
+                    .gpu_ctx("reml_trace download Q_gram")?;
             for (slot, &j) in gram_indices.iter().enumerate() {
                 q_host[j * k..(j + 1) * k].copy_from_slice(&q_host_gram[slot * k..(slot + 1) * k]);
             }
@@ -1224,15 +1188,11 @@ extern "C" __global__ void reduce_q_weighted_gram(
                     let z_host =
                         stream
                             .clone_dtoh(&z_dev)
-                            .map_err(|err| GpuError::DriverCallFailed {
-                                reason: format!("reml_trace download Z for penalty_extra: {err}"),
-                            })?;
+                            .gpu_ctx("reml_trace download Z for penalty_extra")?;
                     let w_host =
                         stream
                             .clone_dtoh(&w_dev)
-                            .map_err(|err| GpuError::DriverCallFailed {
-                                reason: format!("reml_trace download W for penalty_extra: {err}"),
-                            })?;
+                            .gpu_ctx("reml_trace download W for penalty_extra")?;
                     for col in 0..k {
                         let z_col = &z_host[col * p..(col + 1) * p];
                         let w_col = &w_host[col * p..(col + 1) * p];
@@ -1278,9 +1238,7 @@ extern "C" __global__ void reduce_q_weighted_gram(
     ) -> Result<(), GpuError> {
         let func = module
             .load_function("fill_rademacher_splitmix")
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("reml_trace load fill_rademacher: {err}"),
-            })?;
+            .gpu_ctx("reml_trace load fill_rademacher")?;
         let grid_x = ((p as u32) + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
         let cfg = LaunchConfig {
             grid_dim: (grid_x, k as u32, 1),
@@ -1302,9 +1260,7 @@ extern "C" __global__ void reduce_q_weighted_gram(
                 .launch(cfg)
         }
         .map(|_| ())
-        .map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("reml_trace launch fill_rademacher: {err}"),
-        })
+        .gpu_ctx("reml_trace launch fill_rademacher")
     }
 
     fn launch_reduce_q_dense(
@@ -1320,9 +1276,7 @@ extern "C" __global__ void reduce_q_weighted_gram(
         let func =
             module
                 .load_function("reduce_q_dense")
-                .map_err(|err| GpuError::DriverCallFailed {
-                    reason: format!("reml_trace load reduce_q_dense: {err}"),
-                })?;
+                .gpu_ctx("reml_trace load reduce_q_dense")?;
         let cfg = LaunchConfig {
             grid_dim: (k as u32, d as u32, 1),
             block_dim: (THREADS_PER_BLOCK, 1, 1),
@@ -1345,9 +1299,7 @@ extern "C" __global__ void reduce_q_weighted_gram(
                 .launch(cfg)
         }
         .map(|_| ())
-        .map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("reml_trace launch reduce_q_dense: {err}"),
-        })
+        .gpu_ctx("reml_trace launch reduce_q_dense")
     }
 
     fn launch_reduce_q_weighted_gram(
@@ -1363,9 +1315,7 @@ extern "C" __global__ void reduce_q_weighted_gram(
     ) -> Result<(), GpuError> {
         let func = module
             .load_function("reduce_q_weighted_gram")
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("reml_trace load reduce_q_weighted_gram: {err}"),
-            })?;
+            .gpu_ctx("reml_trace load reduce_q_weighted_gram")?;
         let cfg = LaunchConfig {
             grid_dim: (k as u32, d as u32, 1),
             block_dim: (THREADS_PER_BLOCK, 1, 1),
@@ -1388,9 +1338,7 @@ extern "C" __global__ void reduce_q_weighted_gram(
                 .launch(cfg)
         }
         .map(|_| ())
-        .map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("reml_trace launch reduce_q_weighted_gram: {err}"),
-        })
+        .gpu_ctx("reml_trace launch reduce_q_weighted_gram")
     }
 
     fn copy_device_slice(
@@ -1400,9 +1348,7 @@ extern "C" __global__ void reduce_q_weighted_gram(
     ) -> Result<(), GpuError> {
         stream
             .memcpy_dtod(src, dst)
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("reml_trace dtod copy: {err}"),
-            })
+            .gpu_ctx("reml_trace dtod copy")
     }
 
     struct GemmShape {
@@ -1443,9 +1389,7 @@ extern "C" __global__ void reduce_q_weighted_gram(
         };
         // SAFETY: dgemm with column-major leading dims documented above;
         // buffers a, b, c sized lda*k_inner, ldb*n, ldc*n.
-        unsafe { blas.gemm(cfg, a, b, c) }.map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("reml_trace cublas dgemm: {err}"),
-        })
+        unsafe { blas.gemm(cfg, a, b, c) }.gpu_ctx("reml_trace cublas dgemm")
     }
 }
 
@@ -1572,6 +1516,9 @@ fn solve_cholesky(l: &Array2<f64>, rhs: &[f64]) -> Vec<f64> {
 mod tests {
     use super::*;
     use ndarray::{Array2, ArrayView2};
+use crate::gpu_err;
+use crate::gpu_bail;
+use crate::gpu::error::GpuResultExt;
 
     fn make_spd(p: usize, jitter: f64) -> Array2<f64> {
         let mut h = Array2::<f64>::zeros((p, p));

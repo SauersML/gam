@@ -65,7 +65,7 @@ use crate::terms::{
     TotalVariationPenalty,
 };
 use crate::types::{
-    InverseLink, LatentCLogLogState, LikelihoodSpec, LinkFunction, MixtureLinkSpec, ResponseFamily,
+    InverseLink, LatentCLogLogState, LikelihoodSpec, LinkFunction, StandardLink, MixtureLinkSpec, ResponseFamily,
     SasLinkSpec, WigglePenaltyConfig,
 };
 
@@ -2761,35 +2761,35 @@ pub fn resolve_family(
                 "gaussian" => (
                     LikelihoodSpec::new(
                         ResponseFamily::Gaussian,
-                        InverseLink::Standard(LinkFunction::Identity),
+                        InverseLink::Standard(StandardLink::Identity),
                     ),
                     false,
                 ),
                 "binomial" => (
                     LikelihoodSpec::new(
                         ResponseFamily::Binomial,
-                        InverseLink::Standard(LinkFunction::Logit),
+                        InverseLink::Standard(StandardLink::Logit),
                     ),
                     false,
                 ),
                 "binomial-logit" => (
                     LikelihoodSpec::new(
                         ResponseFamily::Binomial,
-                        InverseLink::Standard(LinkFunction::Logit),
+                        InverseLink::Standard(StandardLink::Logit),
                     ),
                     true,
                 ),
                 "binomial-probit" => (
                     LikelihoodSpec::new(
                         ResponseFamily::Binomial,
-                        InverseLink::Standard(LinkFunction::Probit),
+                        InverseLink::Standard(StandardLink::Probit),
                     ),
                     true,
                 ),
                 "binomial-cloglog" => (
                     LikelihoodSpec::new(
                         ResponseFamily::Binomial,
-                        InverseLink::Standard(LinkFunction::CLogLog),
+                        InverseLink::Standard(StandardLink::CLogLog),
                     ),
                     true,
                 ),
@@ -2806,42 +2806,42 @@ pub fn resolve_family(
                 "poisson" => (
                     LikelihoodSpec::new(
                         ResponseFamily::Poisson,
-                        InverseLink::Standard(LinkFunction::Log),
+                        InverseLink::Standard(StandardLink::Log),
                     ),
                     false,
                 ),
                 "nb" | "negbin" | "negative-binomial" => (
                     LikelihoodSpec::new(
                         ResponseFamily::NegativeBinomial { theta: nb_theta },
-                        InverseLink::Standard(LinkFunction::Log),
+                        InverseLink::Standard(StandardLink::Log),
                     ),
                     false,
                 ),
                 "negative-binomial-log" => (
                     LikelihoodSpec::new(
                         ResponseFamily::NegativeBinomial { theta: nb_theta },
-                        InverseLink::Standard(LinkFunction::Log),
+                        InverseLink::Standard(StandardLink::Log),
                     ),
                     true,
                 ),
                 "beta" | "beta-regression" => (
                     LikelihoodSpec::new(
                         ResponseFamily::Beta { phi: 1.0 },
-                        InverseLink::Standard(LinkFunction::Logit),
+                        InverseLink::Standard(StandardLink::Logit),
                     ),
                     false,
                 ),
                 "beta-logit" | "beta-regression-logit" => (
                     LikelihoodSpec::new(
                         ResponseFamily::Beta { phi: 1.0 },
-                        InverseLink::Standard(LinkFunction::Logit),
+                        InverseLink::Standard(StandardLink::Logit),
                     ),
                     true,
                 ),
                 "gamma" => (
                     LikelihoodSpec::new(
                         ResponseFamily::Gamma,
-                        InverseLink::Standard(LinkFunction::Log),
+                        InverseLink::Standard(StandardLink::Log),
                     ),
                     false,
                 ),
@@ -2853,14 +2853,14 @@ pub fn resolve_family(
                 "tweedie" | "tw" => (
                     LikelihoodSpec::new(
                         ResponseFamily::Tweedie { p: 1.5 },
-                        InverseLink::Standard(LinkFunction::Log),
+                        InverseLink::Standard(StandardLink::Log),
                     ),
                     false,
                 ),
                 "tweedie-log" => (
                     LikelihoodSpec::new(
                         ResponseFamily::Tweedie { p: 1.5 },
-                        InverseLink::Standard(LinkFunction::Log),
+                        InverseLink::Standard(StandardLink::Log),
                     ),
                     true,
                 ),
@@ -2901,7 +2901,7 @@ pub fn resolve_family(
             match choice.link {
                 LinkFunction::Identity => LikelihoodSpec::new(
                     ResponseFamily::Gaussian,
-                    InverseLink::Standard(LinkFunction::Identity),
+                    InverseLink::Standard(StandardLink::Identity),
                 ),
                 LinkFunction::Log => {
                     if y.iter()
@@ -2909,26 +2909,26 @@ pub fn resolve_family(
                     {
                         LikelihoodSpec::new(
                             ResponseFamily::Poisson,
-                            InverseLink::Standard(LinkFunction::Log),
+                            InverseLink::Standard(StandardLink::Log),
                         )
                     } else {
                         LikelihoodSpec::new(
                             ResponseFamily::Gamma,
-                            InverseLink::Standard(LinkFunction::Log),
+                            InverseLink::Standard(StandardLink::Log),
                         )
                     }
                 }
                 LinkFunction::Logit => LikelihoodSpec::new(
                     ResponseFamily::Binomial,
-                    InverseLink::Standard(LinkFunction::Logit),
+                    InverseLink::Standard(StandardLink::Logit),
                 ),
                 LinkFunction::Probit => LikelihoodSpec::new(
                     ResponseFamily::Binomial,
-                    InverseLink::Standard(LinkFunction::Probit),
+                    InverseLink::Standard(StandardLink::Probit),
                 ),
                 LinkFunction::CLogLog => LikelihoodSpec::new(
                     ResponseFamily::Binomial,
-                    InverseLink::Standard(LinkFunction::CLogLog),
+                    InverseLink::Standard(StandardLink::CLogLog),
                 ),
                 LinkFunction::Sas => {
                     let state = state_from_sasspec(SasLinkSpec {
@@ -2993,12 +2993,12 @@ pub fn resolve_family(
     if is_binary_response(y) {
         Ok(LikelihoodSpec::new(
             ResponseFamily::Binomial,
-            InverseLink::Standard(LinkFunction::Logit),
+            InverseLink::Standard(StandardLink::Logit),
         ))
     } else {
         Ok(LikelihoodSpec::new(
             ResponseFamily::Gaussian,
-            InverseLink::Standard(LinkFunction::Identity),
+            InverseLink::Standard(StandardLink::Identity),
         ))
     }
 }
@@ -3036,7 +3036,7 @@ fn resolve_survival_marginal_slope_base_link(
     linkspec: Option<&crate::inference::formula_dsl::LinkFormulaSpec>,
 ) -> Result<InverseLink, String> {
     let Some(linkspec) = linkspec else {
-        return Ok(InverseLink::Standard(LinkFunction::Probit));
+        return Ok(InverseLink::Standard(StandardLink::Probit));
     };
     let choice = parse_link_choice(Some(&linkspec.link), false)?
         .ok_or_else(|| "invalid survival marginal-slope link".to_string())?;
@@ -3047,7 +3047,7 @@ fn resolve_survival_marginal_slope_base_link(
         .into());
     }
     match choice.link {
-        LinkFunction::Probit => Ok(InverseLink::Standard(LinkFunction::Probit)),
+        LinkFunction::Probit => Ok(InverseLink::Standard(StandardLink::Probit)),
         other => Err(WorkflowError::InvalidConfig {
             reason: format!(
                 "survival marginal-slope currently supports only link(type=probit), got {other:?}"
@@ -5091,16 +5091,22 @@ fn materialize_standard<'a>(
         if !family.is_binomial() {
             return None;
         }
-        let link_kind = link_choice
-            .as_ref()
-            .map(|c| InverseLink::Standard(c.link))
-            .unwrap_or_else(|| {
+        let link_kind = match link_choice.as_ref() {
+            Some(c) => match StandardLink::try_from(c.link) {
+                Ok(std_link) => InverseLink::Standard(std_link),
+                // linkwiggle is gated by `linkname_supports_joint_wiggle` which
+                // rejects Sas / BetaLogistic upstream, so reaching this arm
+                // means the gate was bypassed.
+                Err(_) => return None,
+            },
+            None => {
                 if let Some(state) = latent_cloglog {
                     InverseLink::LatentCLogLog(state)
                 } else {
-                    InverseLink::Standard(LinkFunction::Logit)
+                    InverseLink::Standard(StandardLink::Logit)
                 }
-            });
+            }
+        };
         Some(StandardBinomialWiggleConfig {
             link_kind,
             wiggle: LinkWiggleConfig {
@@ -5221,7 +5227,7 @@ fn materialize_bernoulli_marginal_slope<'a>(
         y,
         weights,
         z,
-        base_link: InverseLink::Standard(LinkFunction::Probit),
+        base_link: InverseLink::Standard(StandardLink::Probit),
         marginalspec,
         logslopespec,
         marginal_offset,
@@ -6328,10 +6334,21 @@ fn materialize_location_scale<'a>(
     }
 
     if family.is_binomial() {
-        let link_kind = link_choice
-            .as_ref()
-            .map(|c| InverseLink::Standard(c.link))
-            .unwrap_or(InverseLink::Standard(LinkFunction::Logit));
+        let link_kind = match link_choice.as_ref() {
+            Some(c) => match StandardLink::try_from(c.link) {
+                Ok(std_link) => InverseLink::Standard(std_link),
+                Err(e) => {
+                    return Err(WorkflowError::InvalidConfig {
+                        reason: format!(
+                            "binomial location-scale fitting cannot route link `{}` through `InverseLink::Standard`: {e}",
+                            c.link.name()
+                        ),
+                    }
+                    .into());
+                }
+            },
+            None => InverseLink::Standard(StandardLink::Logit),
+        };
         Ok(MaterializedModel {
             request: FitRequest::BinomialLocationScale(BinomialLocationScaleFitRequest {
                 data: data.values.view(),
@@ -6833,7 +6850,7 @@ mod tests {
         let err = recover_converged_survival_inverse_link(
             workflow_test_outer_result(false, Array1::from_vec(vec![0.1, -0.2])),
             "survival inverse-link optimization (SAS, dim=2)",
-            |_| Some(InverseLink::Standard(LinkFunction::Logit)),
+            |_| Some(InverseLink::Standard(StandardLink::Logit)),
         )
         .expect_err("non-converged inverse-link search should fail");
 

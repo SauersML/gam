@@ -712,12 +712,10 @@ impl PirlsRowBackend {
             }
         })?;
         let ctx = super::runtime::cuda_context_for(runtime.selected_device().ordinal).ok_or_else(
-            || GpuError::DriverCallFailed {
-                reason: format!(
+            || gpu_err!(
                     "pirls_row backend: failed to create CUDA context for device {}",
                     runtime.selected_device().ordinal
                 ),
-            },
         )?;
         Ok(Self {
             inner: PirlsRowBackendLinux {
@@ -740,34 +738,26 @@ impl PirlsRowBackend {
             .inner
             .modules
             .lock()
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("pirls_row module cache mutex poisoned: {err}"),
-            })?
+            .gpu_ctx("pirls_row module cache mutex poisoned")?
             .get(&key)
         {
             return Ok(existing.clone());
         }
         let source = cuda_source_for(family, curvature);
-        let ptx = cudarc::nvrtc::compile_ptx(source).map_err(|err| GpuError::DriverCallFailed {
-            reason: format!(
+        let ptx = cudarc::nvrtc::compile_ptx(source).gpu_ctx_with(|err| format!(
                 "pirls_row NVRTC compile failed for {family}/{curv}: {err}",
                 family = family.as_str(),
                 curv = curvature.as_str(),
-            ),
-        })?;
+            ))?;
         let module = self
             .inner
             .ctx
             .load_module(ptx)
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("pirls_row module load failed: {err}"),
-            })?;
+            .gpu_ctx("pirls_row module load failed")?;
         self.inner
             .modules
             .lock()
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("pirls_row module cache mutex poisoned: {err}"),
-            })?
+            .gpu_ctx("pirls_row module cache mutex poisoned")?
             .insert(key, module.clone());
         Ok(module)
     }
@@ -803,34 +793,26 @@ impl PirlsRowBackend {
             .inner
             .jit_modules
             .lock()
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("pirls_row jit cache poisoned: {err}"),
-            })?
+            .gpu_ctx("pirls_row jit cache poisoned")?
             .get(&key)
         {
             return Ok(existing.clone());
         }
         let source = spec.cuda_source(curvature);
-        let ptx = cudarc::nvrtc::compile_ptx(source).map_err(|err| GpuError::DriverCallFailed {
-            reason: format!(
+        let ptx = cudarc::nvrtc::compile_ptx(source).gpu_ctx_with(|err| format!(
                 "pirls_row JIT NVRTC compile failed for spec_id={} curvature={}: {err}",
                 spec.spec_id,
                 curvature.as_str(),
-            ),
-        })?;
+            ))?;
         let module = self
             .inner
             .ctx
             .load_module(ptx)
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("pirls_row JIT module load failed: {err}"),
-            })?;
+            .gpu_ctx("pirls_row JIT module load failed")?;
         self.inner
             .jit_modules
             .lock()
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("pirls_row jit cache poisoned (insert): {err}"),
-            })?
+            .gpu_ctx("pirls_row jit cache poisoned (insert)")?
             .insert(key, module.clone());
         Ok(module)
     }
@@ -989,16 +971,12 @@ impl RowOutputDevBuffers {
         let alloc_f64 = |label: &'static str| {
             stream
                 .alloc_zeros::<f64>(n)
-                .map_err(|err| GpuError::DriverCallFailed {
-                    reason: format!("pirls_row alloc {label}: {err}"),
-                })
+                .gpu_ctx("pirls_row alloc {label}")
         };
         let alloc_u32 = |label: &'static str| {
             stream
                 .alloc_zeros::<u32>(n)
-                .map_err(|err| GpuError::DriverCallFailed {
-                    reason: format!("pirls_row alloc {label}: {err}"),
-                })
+                .gpu_ctx("pirls_row alloc {label}")
         };
         Ok(Self {
             mu: alloc_f64("mu")?,
@@ -1038,28 +1016,20 @@ pub fn launch_row_reweight_on_stream(
 ) -> Result<(), GpuError> {
     use cudarc::driver::{LaunchConfig, PushKernelArg};
     if out.n != n {
-        return Err(GpuError::DriverCallFailed {
-            reason: format!("row reweight buffers shape {} mismatches n={n}", out.n),
-        });
+        gpu_bail!("row reweight buffers shape {} mismatches n={n}", out.n);
     }
     let module = backend.module_for(family, curvature)?;
     let func =
         module
             .load_function(family.kernel_name())
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!(
+            .gpu_ctx_with(|err| format!(
                     "row reweight load_function({}): {err}",
                     family.kernel_name()
-                ),
-            })?;
+                ))?;
     const THREADS_PER_BLOCK: u32 = 256;
-    let n_u32 = u32::try_from(n).map_err(|_| GpuError::DriverCallFailed {
-        reason: format!("n={n} exceeds u32 for row reweight grid sizing"),
-    })?;
+    let n_u32 = u32::try_from(n).map_err(|_| gpu_err!("n={n} exceeds u32 for row reweight grid sizing"))?;
     let grid_x = n_u32.div_ceil(THREADS_PER_BLOCK).max(1);
-    let n_i32 = i32::try_from(n).map_err(|_| GpuError::DriverCallFailed {
-        reason: format!("n={n} exceeds i32 for row reweight kernel argument"),
-    })?;
+    let n_i32 = i32::try_from(n).map_err(|_| gpu_err!("n={n} exceeds i32 for row reweight kernel argument"))?;
     let cfg = LaunchConfig {
         grid_dim: (grid_x, 1, 1),
         block_dim: (THREADS_PER_BLOCK, 1, 1),
@@ -1086,9 +1056,7 @@ pub fn launch_row_reweight_on_stream(
     // Grid covers all n rows; threads guard `if (i >= n) return`.
     unsafe { builder.launch(cfg) }
         .map(|_event_pair| ())
-        .map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("row reweight launch({}): {err}", family.kernel_name()),
-        })
+        .gpu_ctx_with(|err| format!("row reweight launch({}): {err}", family.kernel_name()))
 }
 
 /// Stage 6: device-side row reweight launcher for JIT-compiled
@@ -1110,25 +1078,17 @@ pub fn launch_row_reweight_jit_on_stream(
 ) -> Result<(), GpuError> {
     use cudarc::driver::{LaunchConfig, PushKernelArg};
     if out.n != n {
-        return Err(GpuError::DriverCallFailed {
-            reason: format!("JIT row reweight buffers shape {} mismatches n={n}", out.n),
-        });
+        gpu_bail!("JIT row reweight buffers shape {} mismatches n={n}", out.n);
     }
     let module = backend.module_for_jit(spec, curvature)?;
     let kernel_name = spec.kernel_name();
     let func = module
         .load_function(&kernel_name)
-        .map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("JIT row reweight load_function({kernel_name}): {err}"),
-        })?;
+        .gpu_ctx("JIT row reweight load_function({kernel_name})")?;
     const THREADS_PER_BLOCK: u32 = 256;
-    let n_u32 = u32::try_from(n).map_err(|_| GpuError::DriverCallFailed {
-        reason: format!("n={n} exceeds u32 for JIT row reweight grid sizing"),
-    })?;
+    let n_u32 = u32::try_from(n).map_err(|_| gpu_err!("n={n} exceeds u32 for JIT row reweight grid sizing"))?;
     let grid_x = n_u32.div_ceil(THREADS_PER_BLOCK).max(1);
-    let n_i32 = i32::try_from(n).map_err(|_| GpuError::DriverCallFailed {
-        reason: format!("n={n} exceeds i32 for JIT row reweight kernel argument"),
-    })?;
+    let n_i32 = i32::try_from(n).map_err(|_| gpu_err!("n={n} exceeds i32 for JIT row reweight kernel argument"))?;
     let cfg = LaunchConfig {
         grid_dim: (grid_x, 1, 1),
         block_dim: (THREADS_PER_BLOCK, 1, 1),
@@ -1152,9 +1112,7 @@ pub fn launch_row_reweight_jit_on_stream(
     // signature as `cuda_source_for`; arg order/types match one-for-one.
     unsafe { builder.launch(cfg) }
         .map(|_event_pair| ())
-        .map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("JIT row reweight launch({kernel_name}): {err}"),
-        })
+        .gpu_ctx("JIT row reweight launch({kernel_name})")
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -1462,6 +1420,9 @@ fn bernoulli_cloglog_body(curvature: CurvatureMode) -> String {
 #[cfg(test)]
 mod pirls_row_gpu_tests {
     use super::*;
+use crate::gpu_err;
+use crate::gpu_bail;
+use crate::gpu::error::GpuResultExt;
 
     fn assert_close(label: &str, got: f64, expected: f64, tol: f64) {
         if !(got.is_finite() && expected.is_finite()) {
@@ -2329,6 +2290,482 @@ mod pirls_row_gpu_tests {
                             abs_err <= 1.0e-12 || rel_err <= 1.0e-11,
                             "{family:?} row {i} (eta={}, y={}, wp={}): \
                              device w_hessian={} vs CPU observed={} (abs={}, rel={})",
+                            etas[i],
+                            ys[i],
+                            priors[i],
+                            got,
+                            exp,
+                            abs_err,
+                            rel_err,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Task #50 — Stage 5 GPU end-to-end observed-curvature parity at
+    /// n=1000 across **all six** supported families, validating BOTH
+    /// `w_hessian` (Hessian diagonal) AND `grad_eta` (score) against the
+    /// CPU observed-curvature oracle to abs/rel ≤ 1e-9. This is the
+    /// full end-to-end companion to `gpu_observed_parity` (which only
+    /// covered n=256 and only checked `w_hessian` for noncanonical
+    /// families). Gated on a live CUDA runtime; marked `#[ignore]` so
+    /// the v100-bench-runner explicitly opts in via `--ignored`.
+    #[test]
+    #[ignore = "requires CUDA"]
+    fn gpu_observed_parity_end_to_end_n1000() {
+        if super::super::runtime::GpuRuntime::global().is_none() {
+            eprintln!("[gpu_observed_parity_end_to_end_n1000] no CUDA runtime — skipping");
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            const N: usize = 1000;
+            // Deterministic η grid spanning the saturated tails plus
+            // the near-zero regime where the observed-information
+            // correction term is most active.
+            let etas: Vec<f64> = (0..N)
+                .map(|i| -8.0 + 16.0 * (i as f64) / ((N - 1) as f64))
+                .collect();
+            let priors: Vec<f64> = (0..N)
+                .map(|i| 0.25 + 1.75 * ((i as f64) / (N as f64)))
+                .collect();
+
+            let backend = PirlsRowBackend::probe().expect("backend probe on CUDA host");
+            let runtime = super::super::runtime::GpuRuntime::global()
+                .expect("GPU runtime available when probe succeeded");
+            let ctx = super::super::runtime::cuda_context_for(runtime.selected_device().ordinal)
+                .expect("ctx for selected device");
+            let stream = ctx.default_stream();
+
+            const TOL: f64 = 1.0e-9;
+
+            for &family in PirlsRowFamily::ALL.iter() {
+                // Family-specific response vectors stay in domain so the
+                // CPU oracle is well-defined for every row.
+                let ys: Vec<f64> = match family {
+                    PirlsRowFamily::GammaLog => (0..N)
+                        .map(|i| 0.10 + 0.05 * ((i % 97) as f64))
+                        .collect(),
+                    PirlsRowFamily::PoissonLog => (0..N).map(|i| (i % 11) as f64).collect(),
+                    PirlsRowFamily::GaussianIdentity => (0..N)
+                        .map(|i| -3.0 + 6.0 * (i as f64) / ((N - 1) as f64))
+                        .collect(),
+                    PirlsRowFamily::BernoulliLogit
+                    | PirlsRowFamily::BernoulliProbit
+                    | PirlsRowFamily::BernoulliCLogLog => (0..N)
+                        .map(|i| if i % 2 == 0 { 0.0 } else { 1.0 })
+                        .collect(),
+                };
+
+                let mut eta_dev = stream.alloc_zeros::<f64>(N).expect("alloc eta_dev");
+                let mut y_dev = stream.alloc_zeros::<f64>(N).expect("alloc y_dev");
+                let mut prior_dev = stream.alloc_zeros::<f64>(N).expect("alloc prior_dev");
+                stream
+                    .memcpy_htod(etas.as_slice(), &mut eta_dev)
+                    .expect("upload eta");
+                stream
+                    .memcpy_htod(ys.as_slice(), &mut y_dev)
+                    .expect("upload y");
+                stream
+                    .memcpy_htod(priors.as_slice(), &mut prior_dev)
+                    .expect("upload prior");
+
+                let mut out_obs =
+                    RowOutputDevBuffers::allocate(&stream, N).expect("alloc out_obs");
+                launch_row_reweight_on_stream(
+                    backend,
+                    family,
+                    CurvatureMode::Observed,
+                    &stream,
+                    N,
+                    &eta_dev,
+                    &y_dev,
+                    &prior_dev,
+                    &mut out_obs,
+                )
+                .unwrap_or_else(|err| panic!("observed launch {family:?}: {err}"));
+                stream.synchronize().expect("stream sync (observed)");
+
+                let wh_obs = stream
+                    .clone_dtoh(&out_obs.w_hessian)
+                    .expect("dl w_hessian (observed)");
+                let ge_obs = stream
+                    .clone_dtoh(&out_obs.grad_eta)
+                    .expect("dl grad_eta (observed)");
+
+                for i in 0..N {
+                    let cpu = row_reweight_cpu(
+                        family,
+                        CurvatureMode::Observed,
+                        RowInput {
+                            eta: etas[i],
+                            y: ys[i],
+                            prior_weight: priors[i],
+                        },
+                    );
+
+                    // H diagonal (w_hessian) parity.
+                    let h_got = wh_obs[i];
+                    let h_exp = cpu.w_hessian;
+                    let h_abs = (h_got - h_exp).abs();
+                    let h_rel = if h_exp.abs() > 0.0 {
+                        h_abs / h_exp.abs()
+                    } else {
+                        h_abs
+                    };
+                    assert!(
+                        h_abs <= TOL || h_rel <= TOL,
+                        "{family:?} row {i} (eta={}, y={}, wp={}): \
+                         observed w_hessian GPU={} vs CPU={} (abs={}, rel={})",
+                        etas[i],
+                        ys[i],
+                        priors[i],
+                        h_got,
+                        h_exp,
+                        h_abs,
+                        h_rel,
+                    );
+
+                    // Gradient (grad_eta) parity — the score does not
+                    // depend on curvature mode, but the CPU oracle here
+                    // is exercised under `Observed` for full
+                    // end-to-end coverage.
+                    let g_got = ge_obs[i];
+                    let g_exp = cpu.grad_eta;
+                    let g_abs = (g_got - g_exp).abs();
+                    let g_rel = if g_exp.abs() > 0.0 {
+                        g_abs / g_exp.abs()
+                    } else {
+                        g_abs
+                    };
+                    assert!(
+                        g_abs <= TOL || g_rel <= TOL,
+                        "{family:?} row {i} (eta={}, y={}, wp={}): \
+                         observed grad_eta GPU={} vs CPU={} (abs={}, rel={})",
+                        etas[i],
+                        ys[i],
+                        priors[i],
+                        g_got,
+                        g_exp,
+                        g_abs,
+                        g_rel,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Task #51 — Stage 6 Level B end-to-end NVRTC JIT parity. For
+    /// each of the 6 supported families we hand-author a raw CUDA
+    /// body that re-derives the family math from scratch (distinct
+    /// variable names + restructured statement order from the
+    /// built-in `*_body` strings), JIT-compile via `JitFamilySpec::raw`
+    /// through the full `launch_row_reweight_jit_on_stream` pipeline,
+    /// and assert all 8 outputs match the CPU `row_reweight_cpu`
+    /// oracle to ≤ 1e-10 on n=1000 rows. Skipped if no CUDA runtime;
+    /// `#[ignore]` so v100-bench-runner picks it up via `--ignored`.
+    #[test]
+    #[ignore = "requires CUDA"]
+    fn gpu_jit_level_b_raw_body_end_to_end_all_families_n1000() {
+        if super::super::runtime::GpuRuntime::global().is_none() {
+            eprintln!(
+                "[gpu_jit_level_b_raw_body_end_to_end_all_families_n1000] no CUDA runtime — skipping"
+            );
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            const N: usize = 1000;
+            const TOL: f64 = 1.0e-10;
+            let curvature = CurvatureMode::Fisher;
+
+            let backend = PirlsRowBackend::probe().expect("backend probe on CUDA host");
+            let runtime =
+                super::super::runtime::GpuRuntime::global().expect("GPU runtime available");
+            let ctx = super::super::runtime::cuda_context_for(runtime.selected_device().ordinal)
+                .expect("ctx");
+            let stream = ctx.default_stream();
+
+            // η grid + per-family in-domain response vectors. Mirrors
+            // `gpu_observed_parity_end_to_end_n1000` so the two tests
+            // exercise the same numerical regime through different code
+            // paths (built-in module vs JIT raw body).
+            let etas: Vec<f64> = (0..N)
+                .map(|i| -6.0 + 12.0 * (i as f64) / ((N - 1) as f64))
+                .collect();
+            let priors: Vec<f64> = (0..N)
+                .map(|i| 0.25 + 1.75 * ((i as f64) / (N as f64)))
+                .collect();
+
+            // Hand-authored raw bodies — re-derived from the math, not
+            // copy-pasted from `*_body()`. Helpers (`clamp_eta`,
+            // `std_norm_cdf`, `std_norm_pdf`, `bernoulli_deviance`,
+            // `bernoulli_z`) are provided by `COMMON_DEVICE_PROLOG`.
+            let raw_gaussian = r#"    // raw-body gaussian identity (independent re-derivation)
+    double resp = y_i;
+    double pred = eta_i;
+    double mu = pred;
+    double w_p = wp;
+    double e_resid = resp - pred;
+    double grad_eta = w_p * e_resid;
+    double w_fisher = w_p;
+    double w_hessian = w_p;
+    double w_solver = (w_p > 0.0) ? fmax(w_p, 1e-12) : 0.0;
+    double z_f = resp;
+    double z_h = resp;
+    double dev = w_p * e_resid * e_resid;
+"#;
+
+            let raw_poisson = r#"    // raw-body poisson log (independent re-derivation)
+    double eta_c = clamp_eta(eta_i, &flags);
+    double mu_pre = exp(eta_c);
+    if (mu_pre < 1e-10) flags |= 0x2u;
+    double mu = (mu_pre > 1e-10) ? mu_pre : 1e-10;
+    double wrate = wp * mu;
+    double w_fisher = (wrate > 0.0) ? fmax(wrate, 1e-12) : 0.0;
+    double w_hessian = w_fisher;
+    double w_solver = w_fisher;
+    double pres = y_i - mu;
+    double grad_eta = wp * pres;
+    double z_lin = eta_c + pres / mu;
+    double z_f = z_lin;
+    double z_h = z_lin;
+    double dterm;
+    if (y_i > 0.0) {
+        dterm = y_i * log(y_i / mu) - pres;
+    } else {
+        dterm = -pres;
+    }
+    double dev = 2.0 * wp * dterm;
+    if (!(isfinite(y_i) && y_i >= 0.0)) flags |= 0x8u;
+"#;
+
+            let raw_gamma = r#"    // raw-body gamma log (independent re-derivation; unit shape)
+    double k_shape = 1.0;
+    double eta_c = clamp_eta(eta_i, &flags);
+    double mu_pre = exp(eta_c);
+    if (mu_pre < 1e-10) flags |= 0x2u;
+    double mu = (mu_pre > 1e-10) ? mu_pre : 1e-10;
+    double w_fisher = wp * k_shape;
+    double w_hessian = w_fisher;
+    double w_solver = (w_hessian > 0.0) ? fmax(w_hessian, 1e-12) : 0.0;
+    double pres = y_i - mu;
+    double grad_eta = wp * pres / mu;
+    double z_lin = eta_c + pres / mu;
+    double z_f = z_lin;
+    double z_h = z_lin;
+    double dev;
+    if (y_i > 0.0) {
+        dev = 2.0 * wp * (-log(y_i / mu) + pres / mu);
+    } else {
+        dev = 1.0 / 0.0;
+    }
+    if (!(isfinite(y_i) && y_i > 0.0)) flags |= 0x8u;
+"#;
+
+            let raw_logit = r#"    // raw-body bernoulli logit (independent re-derivation)
+    double eta_c = clamp_eta(eta_i, &flags);
+    double te = tanh(0.5 * eta_c);
+    double mu_pre = 0.5 * (1.0 + te);
+    if (mu_pre < 1e-12 || mu_pre > 1.0 - 1e-12) flags |= 0x2u;
+    double mu = fmin(fmax(mu_pre, 1e-12), 1.0 - 1e-12);
+    double dmu_deta = mu * (1.0 - mu);
+    double w_fisher = wp * dmu_deta;
+    double w_hessian = w_fisher;
+    double w_solver = (w_fisher > 0.0) ? fmax(w_fisher, 1e-12) : 0.0;
+    double bres = y_i - mu;
+    double grad_eta = wp * bres;
+    double dev = bernoulli_deviance(y_i, mu, wp);
+    double z_lin = bernoulli_z(eta_c, y_i, mu, dmu_deta);
+    double z_f = z_lin;
+    double z_h = z_lin;
+    if (!(isfinite(y_i) && y_i >= 0.0 && y_i <= 1.0)) flags |= 0x8u;
+"#;
+
+            let raw_probit = r#"    // raw-body bernoulli probit (independent re-derivation; Fisher mode)
+    double eta_c = clamp_eta(eta_i, &flags);
+    double mu_pre = std_norm_cdf(eta_c);
+    if (mu_pre < 1e-12 || mu_pre > 1.0 - 1e-12) flags |= 0x2u;
+    double mu = fmin(fmax(mu_pre, 1e-12), 1.0 - 1e-12);
+    double phi = std_norm_pdf(eta_c);
+    double dmu_deta = phi;
+    double vmu = mu * (1.0 - mu);
+    double w_pp = (vmu > 0.0) ? (phi * phi) / vmu : 0.0;
+    double w_fisher = wp * w_pp;
+    double w_hessian = w_fisher;
+    double w_solver = (w_hessian > 0.0) ? fmax(w_hessian, 1e-12) : 0.0;
+    double bres = y_i - mu;
+    double grad_eta = (vmu > 0.0) ? wp * bres * phi / vmu : 0.0;
+    double dev = bernoulli_deviance(y_i, mu, wp);
+    double z_lin = bernoulli_z(eta_c, y_i, mu, dmu_deta);
+    double z_f = z_lin;
+    double z_h = z_lin;
+    if (!(isfinite(y_i) && y_i >= 0.0 && y_i <= 1.0)) flags |= 0x8u;
+"#;
+
+            let raw_cloglog = r#"    // raw-body bernoulli cloglog (independent re-derivation; Fisher mode)
+    double eta_c = clamp_eta(eta_i, &flags);
+    double a = exp(eta_c);
+    double mu_pre = 1.0 - exp(-a);
+    if (mu_pre < 1e-12 || mu_pre > 1.0 - 1e-12) flags |= 0x2u;
+    double mu = fmin(fmax(mu_pre, 1e-12), 1.0 - 1e-12);
+    double dmu_deta = a * (1.0 - mu_pre);
+    double vmu = mu * (1.0 - mu);
+    double w_pp = (vmu > 0.0) ? (dmu_deta * dmu_deta) / vmu : 0.0;
+    double w_fisher = wp * w_pp;
+    double w_hessian = w_fisher;
+    double w_solver = (w_hessian > 0.0) ? fmax(w_hessian, 1e-12) : 0.0;
+    double bres = y_i - mu;
+    double grad_eta = (vmu > 0.0) ? wp * bres * dmu_deta / vmu : 0.0;
+    double dev = bernoulli_deviance(y_i, mu, wp);
+    double z_lin = bernoulli_z(eta_c, y_i, mu, dmu_deta);
+    double z_f = z_lin;
+    double z_h = z_lin;
+    if (!(isfinite(y_i) && y_i >= 0.0 && y_i <= 1.0)) flags |= 0x8u;
+"#;
+
+            // (family, raw_body, distinct spec_id, y vector builder).
+            // spec_ids are disjoint 64-bit tags so the JIT module cache
+            // creates one fresh module per family.
+            let cases: [(
+                PirlsRowFamily,
+                &str,
+                u64,
+                fn(usize) -> Vec<f64>,
+            ); 6] = [
+                (
+                    PirlsRowFamily::GaussianIdentity,
+                    raw_gaussian,
+                    0x5242_3031_4741_5553u64,
+                    |n| {
+                        (0..n)
+                            .map(|i| -3.0 + 6.0 * (i as f64) / ((n - 1) as f64))
+                            .collect()
+                    },
+                ),
+                (
+                    PirlsRowFamily::PoissonLog,
+                    raw_poisson,
+                    0x5242_3032_504f_4953u64,
+                    |n| (0..n).map(|i| (i % 11) as f64).collect(),
+                ),
+                (
+                    PirlsRowFamily::GammaLog,
+                    raw_gamma,
+                    0x5242_3033_474d_414cu64,
+                    |n| {
+                        (0..n)
+                            .map(|i| 0.10 + 0.05 * ((i % 97) as f64))
+                            .collect()
+                    },
+                ),
+                (
+                    PirlsRowFamily::BernoulliLogit,
+                    raw_logit,
+                    0x5242_3034_4c47_4954u64,
+                    |n| {
+                        (0..n)
+                            .map(|i| if i % 2 == 0 { 0.0 } else { 1.0 })
+                            .collect()
+                    },
+                ),
+                (
+                    PirlsRowFamily::BernoulliProbit,
+                    raw_probit,
+                    0x5242_3035_5052_4254u64,
+                    |n| {
+                        (0..n)
+                            .map(|i| if i % 2 == 0 { 0.0 } else { 1.0 })
+                            .collect()
+                    },
+                ),
+                (
+                    PirlsRowFamily::BernoulliCLogLog,
+                    raw_cloglog,
+                    0x5242_3036_434c_4f47u64,
+                    |n| {
+                        (0..n)
+                            .map(|i| if i % 2 == 0 { 0.0 } else { 1.0 })
+                            .collect()
+                    },
+                ),
+            ];
+
+            for (family, raw_body, spec_id, build_y) in cases {
+                let ys: Vec<f64> = build_y(N);
+
+                let mut eta_dev = stream.alloc_zeros::<f64>(N).expect("eta");
+                let mut y_dev = stream.alloc_zeros::<f64>(N).expect("y");
+                let mut prior_dev = stream.alloc_zeros::<f64>(N).expect("prior");
+                stream.memcpy_htod(&etas, &mut eta_dev).expect("up eta");
+                stream.memcpy_htod(&ys, &mut y_dev).expect("up y");
+                stream
+                    .memcpy_htod(&priors, &mut prior_dev)
+                    .expect("up prior");
+
+                let spec = JitFamilySpec::raw(spec_id, raw_body);
+                let mut out_jit =
+                    RowOutputDevBuffers::allocate(&stream, N).expect("alloc jit out");
+                launch_row_reweight_jit_on_stream(
+                    backend,
+                    &spec,
+                    curvature,
+                    &stream,
+                    N,
+                    &eta_dev,
+                    &y_dev,
+                    &prior_dev,
+                    &mut out_jit,
+                )
+                .unwrap_or_else(|err| panic!("jit raw-body launch {family:?}: {err}"));
+                stream.synchronize().expect("sync");
+
+                let mu_j = stream.clone_dtoh(&out_jit.mu).expect("dl mu");
+                let ge_j = stream.clone_dtoh(&out_jit.grad_eta).expect("dl g");
+                let wf_j = stream.clone_dtoh(&out_jit.w_fisher).expect("dl wf");
+                let wh_j = stream.clone_dtoh(&out_jit.w_hessian).expect("dl wh");
+                let ws_j = stream.clone_dtoh(&out_jit.w_solver).expect("dl ws");
+                let zf_j = stream.clone_dtoh(&out_jit.z_fisher).expect("dl zf");
+                let zh_j = stream.clone_dtoh(&out_jit.z_hessian).expect("dl zh");
+                let dv_j = stream.clone_dtoh(&out_jit.deviance).expect("dl dv");
+
+                for i in 0..N {
+                    let cpu = row_reweight_cpu(
+                        family,
+                        curvature,
+                        RowInput {
+                            eta: etas[i],
+                            y: ys[i],
+                            prior_weight: priors[i],
+                        },
+                    );
+                    for (label, got, exp) in [
+                        ("mu", mu_j[i], cpu.mu),
+                        ("grad_eta", ge_j[i], cpu.grad_eta),
+                        ("w_fisher", wf_j[i], cpu.w_fisher),
+                        ("w_hessian", wh_j[i], cpu.w_hessian),
+                        ("w_solver", ws_j[i], cpu.w_solver),
+                        ("z_fisher", zf_j[i], cpu.z_fisher),
+                        ("z_hessian", zh_j[i], cpu.z_hessian),
+                        ("deviance", dv_j[i], cpu.deviance),
+                    ] {
+                        if !got.is_finite() && !exp.is_finite() {
+                            // Both NaN/inf is a parity match for the
+                            // gamma y=0 → +inf deviance branch.
+                            continue;
+                        }
+                        let abs_err = (got - exp).abs();
+                        let rel_err = if exp.abs() > 0.0 {
+                            abs_err / exp.abs()
+                        } else {
+                            abs_err
+                        };
+                        assert!(
+                            abs_err <= TOL || rel_err <= TOL,
+                            "{family:?} {label}[{i}] (eta={}, y={}, wp={}): \
+                             JIT raw-body={} vs CPU={} (abs={}, rel={})",
                             etas[i],
                             ys[i],
                             priors[i],

@@ -6,7 +6,7 @@ use crate::probability::{
 };
 use crate::types::{
     InverseLink, LatentCLogLogState, LikelihoodSpec, LinkComponent, LinkFunction, MixtureLinkSpec,
-    MixtureLinkState, ResponseFamily, SasLinkSpec, SasLinkState,
+    MixtureLinkState, ResponseFamily, SasLinkSpec, SasLinkState, StandardLink,
 };
 use ndarray::Array1;
 use statrs::function::beta::{beta_reg, ln_beta};
@@ -833,7 +833,7 @@ impl InverseLinkKernel for MixtureLinkState {
 impl InverseLinkKernel for InverseLink {
     fn jet(&self, eta: f64) -> Result<InverseLinkJet, EstimationError> {
         match self {
-            InverseLink::Standard(link_fn) => link_fn.jet(eta),
+            InverseLink::Standard(link_fn) => link_fn.as_link_function().jet(eta),
             InverseLink::LatentCLogLog(state) => latent_cloglog_point_jet(state, eta),
             InverseLink::Sas(state) => state.jet(eta),
             InverseLink::BetaLogistic(state) => BetaLogisticKernel {
@@ -884,7 +884,7 @@ pub fn inverse_link_mu_d1_for_inverse_link(
     eta: f64,
 ) -> Result<(f64, f64), EstimationError> {
     match link {
-        InverseLink::Standard(link_fn) => Ok(link_function_mu_d1(*link_fn, eta)?),
+        InverseLink::Standard(link_fn) => Ok(link_function_mu_d1(link_fn.as_link_function(), eta)?),
         InverseLink::LatentCLogLog(state) => {
             let jet = latent_cloglog_point_jet(state, eta)?;
             Ok((jet.mu, jet.d1))
@@ -1085,19 +1085,17 @@ fn inverse_link_pdf_derivative_for_inverse_link(
     order: PdfDerivativeOrder,
 ) -> Result<f64, EstimationError> {
     match link {
-        InverseLink::Standard(LinkFunction::Identity) => Ok(0.0),
-        InverseLink::Standard(LinkFunction::Log) => Ok(eta.clamp(-700.0, 700.0).exp()),
-        InverseLink::Standard(LinkFunction::Probit) => Ok(order.probit(eta)),
-        InverseLink::Standard(LinkFunction::Logit) => {
+        InverseLink::Standard(StandardLink::Identity) => Ok(0.0),
+        InverseLink::Standard(StandardLink::Log) => Ok(eta.clamp(-700.0, 700.0).exp()),
+        InverseLink::Standard(StandardLink::Probit) => Ok(order.probit(eta)),
+        InverseLink::Standard(StandardLink::Logit) => {
             Ok(order.component(LinkComponent::Logit, eta))
         }
-        InverseLink::Standard(LinkFunction::CLogLog) => {
+        InverseLink::Standard(StandardLink::CLogLog) => {
             Ok(order.component(LinkComponent::CLogLog, eta))
         }
         InverseLink::LatentCLogLog(state) => order.latent_cloglog(eta, state.latent_sd),
-        InverseLink::Standard(LinkFunction::Sas) => Ok(order.sas(eta, 0.0, 0.0)),
         InverseLink::Sas(state) => Ok(order.sas(eta, state.epsilon, state.log_delta)),
-        InverseLink::Standard(LinkFunction::BetaLogistic) => Ok(order.beta_logistic(eta, 0.0, 0.0)),
         InverseLink::BetaLogistic(state) => {
             Ok(order.beta_logistic(eta, state.log_delta, state.epsilon))
         }
@@ -1991,7 +1989,7 @@ pub fn sas_inverse_link_jetwith_param_partials(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{InverseLink, LinkComponent, LinkFunction, MixtureLinkSpec, SasLinkState};
+    use crate::types::{InverseLink, LinkComponent, LinkFunction, StandardLink, MixtureLinkSpec, SasLinkState};
 
     #[test]
     fn softmax_jacobian_matchesfd() {
@@ -2492,9 +2490,9 @@ mod tests {
             .expect("mixture state"),
         );
         let links = [
-            InverseLink::Standard(LinkFunction::Probit),
-            InverseLink::Standard(LinkFunction::Logit),
-            InverseLink::Standard(LinkFunction::CLogLog),
+            InverseLink::Standard(StandardLink::Probit),
+            InverseLink::Standard(StandardLink::Logit),
+            InverseLink::Standard(StandardLink::CLogLog),
             sas,
             beta_logistic,
             mixture,
@@ -2550,7 +2548,7 @@ mod tests {
         );
 
         let d4 = inverse_link_pdfthird_derivative_for_inverse_link(
-            &InverseLink::Standard(LinkFunction::CLogLog),
+            &InverseLink::Standard(StandardLink::CLogLog),
             eta,
         )
         .expect("cloglog d4");
@@ -2637,7 +2635,7 @@ mod tests {
         );
 
         let d4 = inverse_link_pdfthird_derivative_for_inverse_link(
-            &InverseLink::Standard(LinkFunction::Logit),
+            &InverseLink::Standard(StandardLink::Logit),
             eta,
         )
         .expect("logit d4");
@@ -2649,7 +2647,7 @@ mod tests {
         );
 
         let d5 = inverse_link_pdffourth_derivative_for_inverse_link(
-            &InverseLink::Standard(LinkFunction::Logit),
+            &InverseLink::Standard(StandardLink::Logit),
             eta,
         )
         .expect("logit d5");

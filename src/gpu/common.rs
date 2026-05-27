@@ -24,6 +24,7 @@ mod linux {
     use cudarc::driver::{CudaContext, CudaModule, CudaSlice, CudaStream};
     use std::collections::HashMap;
     use std::sync::Arc;
+use crate::gpu::error::GpuResultExt;
 
     /// Power-of-two bucketed free list of f64 device slices.
     ///
@@ -64,9 +65,7 @@ mod linux {
             let fresh =
                 stream
                     .alloc_zeros::<f64>(bucket)
-                    .map_err(|err| GpuError::DriverCallFailed {
-                        reason: format!("{label} arena alloc_zeros<{bucket}>: {err}"),
-                    })?;
+                    .gpu_ctx("{label} arena alloc_zeros<{bucket}>")?;
             Ok((bucket, fresh))
         }
 
@@ -114,14 +113,10 @@ mod linux {
                 return Ok(existing);
             }
             let ptx =
-                cudarc::nvrtc::compile_ptx(source).map_err(|err| GpuError::DriverCallFailed {
-                    reason: format!("{label} NVRTC compile failed: {err}"),
-                })?;
+                cudarc::nvrtc::compile_ptx(source).gpu_ctx("{label} NVRTC compile failed")?;
             let module = ctx
                 .load_module(ptx)
-                .map_err(|err| GpuError::DriverCallFailed {
-                    reason: format!("{label} module load failed: {err}"),
-                })?;
+                .gpu_ctx("{label} module load failed")?;
             self.module.set(module).ok();
             Ok(self
                 .module

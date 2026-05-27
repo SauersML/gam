@@ -920,11 +920,11 @@ impl LatentCoordValues {
         let d = self.latent_dim;
         let n_centers = centers.nrows();
         if centers.ncols() != d {
-            return Err(BasisError::DimensionMismatch(format!(
+            crate::bail_dim_basis!(
                 "LatentCoordValues::design_gradient_wrt_t center dimension mismatch: centers have {} cols but latent_dim is {}",
                 centers.ncols(),
                 d
-            )));
+            );
         }
         let mut jet = Array3::<f64>::zeros((n_obs, n_centers, d));
         for n in 0..n_obs {
@@ -974,13 +974,13 @@ impl LatentCoordValues {
             } => self.design_gradient_wrt_t(centers, radial_kind),
             InputLocationDerivative::Jet(jet) => {
                 if jet.shape() != [self.n_obs, jet.shape()[1], self.latent_dim] {
-                    return Err(BasisError::DimensionMismatch(format!(
+                    crate::bail_dim_basis!(
                         "LatentCoordValues::design_gradient_wrt_t_dispatch jet shape {:?} does not match latent shape ({}, {}, {})",
                         jet.shape(),
                         self.n_obs,
                         jet.shape()[1],
                         self.latent_dim
-                    )));
+                    );
                 }
                 // The non-radial helpers already produce a (N, K, d) tensor
                 // in the layout downstream contraction consumes. Return a copy

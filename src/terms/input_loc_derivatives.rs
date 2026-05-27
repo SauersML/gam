@@ -122,11 +122,11 @@ pub fn contract_input_loc_gradient(
     let n_centers = jet.shape()[1];
     let d = jet.shape()[2];
     if grad_phi.shape() != [n_obs, n_centers] {
-        return Err(BasisError::DimensionMismatch(format!(
+        crate::bail_dim_basis!(
             "contract_input_loc_gradient: grad_phi shape {:?} != expected {:?}",
             grad_phi.shape(),
             [n_obs, n_centers]
-        )));
+        );
     }
     let mut grad_t = Array1::<f64>::zeros(n_obs * d);
     for n in 0..n_obs {

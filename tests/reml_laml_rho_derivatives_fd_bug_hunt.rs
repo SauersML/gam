@@ -2,7 +2,7 @@ use gam::estimate::{
     ExternalOptimOptions, evaluate_externalcost_andridge, evaluate_externalgradient,
 };
 use gam::smooth::BlockwisePenalty;
-use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily};
+use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, StandardLink, ResponseFamily};
 use ndarray::{Array1, Array2};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -16,7 +16,7 @@ fn opts(nullspace_dims: Vec<usize>) -> ExternalOptimOptions {
         optimize_sas: false,
         family: LikelihoodSpec::new(
             ResponseFamily::Gaussian,
-            InverseLink::Standard(LinkFunction::Identity),
+            InverseLink::Standard(StandardLink::Identity),
         ),
         compute_inference: true,
         max_iter: 500,
