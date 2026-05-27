@@ -44,8 +44,7 @@ fn main() {
             }
         }
         Err(err) => {
-            eprintln!("[BENCH-FAIL phase4] {err}");
-            std::process::exit(1);
+            panic!("[BENCH-FAIL phase4] {err}");
         }
     }
 }
