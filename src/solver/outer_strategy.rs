@@ -1786,9 +1786,7 @@ pub trait OuterObjective {
     /// keep the host BFGS branch unconditionally — only the concrete
     /// REML-state objectives override this to consult
     /// [`crate::solver::estimate::reml::runtime::outer_reml_device_admission`].
-    fn outer_device_admission(
-        &self,
-    ) -> Option<crate::gpu::policy::RemlOuterAdmission> {
+    fn outer_device_admission(&self) -> Option<crate::gpu::policy::RemlOuterAdmission> {
         None
     }
 }
@@ -5754,18 +5752,17 @@ fn run_outer_with_plan(
                     };
                     started_seeds += 1;
                     seed_slot = started_seeds;
-                    let device_input =
-                        crate::solver::gpu::reml_outer::RemlOuterGpuInput {
-                            seed_rho: seed.clone(),
-                            bounds: bounds_dev,
-                            gradient_tolerance: grad_tol_dev.abs,
-                            max_iterations: config.max_iter,
-                            axis_step_caps: axis_caps_dev,
-                            admission,
-                            seed_penalised_hessian: ndarray::Array2::<f64>::zeros((0, 0)),
-                            seed_derivative_hessians: Vec::new(),
-                            seed_objective: seed_eval_dev.cost,
-                        };
+                    let device_input = crate::solver::gpu::reml_outer::RemlOuterGpuInput {
+                        seed_rho: seed.clone(),
+                        bounds: bounds_dev,
+                        gradient_tolerance: grad_tol_dev.abs,
+                        max_iterations: config.max_iter,
+                        axis_step_caps: axis_caps_dev,
+                        admission,
+                        seed_penalised_hessian: ndarray::Array2::<f64>::zeros((0, 0)),
+                        seed_derivative_hessians: Vec::new(),
+                        seed_objective: seed_eval_dev.cost,
+                    };
                     // The per-step evaluator routes the on-device
                     // (cost, gradient) assembly through the same
                     // `OuterObjective::eval_with_order` hook the host
@@ -5779,8 +5776,7 @@ fn run_outer_with_plan(
                         let evaluator = |rho_trial: &Array1<f64>| {
                             let mut obj_ref = obj_cell.borrow_mut();
                             let eval = obj_ref
-                                .eval_with_order(rho_trial, OuterEvalOrder::ValueAndGradient)
-                                ?;
+                                .eval_with_order(rho_trial, OuterEvalOrder::ValueAndGradient)?;
                             Ok(crate::solver::gpu::reml_outer::RemlOuterDeviceEval {
                                 objective: eval.cost,
                                 gradient: eval.gradient,
@@ -5853,183 +5849,179 @@ fn run_outer_with_plan(
                             }) {
                                 Ok(_) => Err(err),
                                 Err(e) => {
-                                    rejection_reasons.push((
-                                        seed_idx,
-                                        "validation",
-                                        e.to_string(),
-                                    ));
+                                    rejection_reasons.push((seed_idx, "validation", e.to_string()));
                                     continue 'seed_attempts;
                                 }
                             }
                         }
                     }
                 } else {
-                let seed_eval = obj
-                    .eval_with_order(seed, OuterEvalOrder::ValueAndGradient)
-                    .map_err(|err| into_objective_error("outer eval failed", err));
-                let seed_eval = match seed_eval {
-                    Ok(seed_eval) => seed_eval,
-                    Err(err) => {
-                        let err = match err {
-                            ObjectiveEvalError::Recoverable { message }
-                            | ObjectiveEvalError::Fatal { message } => {
-                                EstimationError::RemlOptimizationFailed(message)
-                            }
-                        };
-                        log::warn!(
-                            "[OUTER] {context}: rejecting seed {seed_idx} before solver start: {err}"
-                        );
-                        rejection_reasons.push((seed_idx, "validation", err.to_string()));
-                        continue 'seed_attempts;
-                    }
-                };
-                let seed_eval = match finite_outer_first_order_eval_or_error(
-                    "outer eval failed",
-                    layout,
-                    seed_eval,
-                )
-                .map_err(|err| match err {
-                    ObjectiveEvalError::Recoverable { message }
-                    | ObjectiveEvalError::Fatal { message } => {
-                        EstimationError::RemlOptimizationFailed(message)
-                    }
-                }) {
-                    Ok(eval) => eval,
-                    Err(err) => {
-                        log::warn!(
-                            "[OUTER] {context}: rejecting seed {seed_idx} before solver start: {err}"
-                        );
-                        rejection_reasons.push((seed_idx, "validation", err.to_string()));
-                        continue 'seed_attempts;
-                    }
-                };
-                started_seeds += 1;
-                seed_slot = started_seeds;
-                let (lo, hi) = &bounds_template;
-                let bounds = outer_bounds(lo, hi)?;
-                let grad_tol = outer_gradient_tolerance(config);
-                let max_iter = outer_max_iterations(config.max_iter)?;
-                let objective = OuterFirstOrderBridge {
-                    obj,
-                    layout,
-                    outer_inner_cap: config.outer_inner_cap.clone(),
-                    iter_count: 0,
-                    g_norm_initial: None,
-                    last_g_norm: None,
-                };
-                // Hand the precomputed (cost, gradient) seed eval to
-                // `opt::Bfgs` so its first internal `eval_grad` call is
-                // served from cache instead of re-running the outer
-                // objective. Inner P-IRLS solves dominate outer cost
-                // at biobank scale; skipping one re-eval at the seed
-                // is one of the cheapest wins available. (opt 0.3.0
-                // API; before that this was implemented via a
-                // gam-side cache on the bridge.)
-                let initial_sample = FirstOrderSample {
-                    value: seed_eval.cost,
-                    gradient: seed_eval.gradient.clone(),
-                };
-                let mut optimizer = Bfgs::new(seed.clone(), objective)
-                    .with_initial_sample(seed.clone(), initial_sample)
-                    .with_bounds(bounds)
-                    .with_gradient_tolerance(grad_tol)
-                    .with_max_iterations(max_iter);
-                if let Some(caps) = bfgs_axis_step_caps(config, layout) {
-                    optimizer = optimizer.with_axis_step_caps(caps);
-                }
-                if let Some(feedback) = config.outer_inner_cap.as_ref() {
-                    optimizer = optimizer.with_observer(OuterAcceptObserver {
-                        feedback: feedback.clone(),
-                    });
-                }
-                let bfgs_start = std::time::Instant::now();
-                let outcome = optimizer.run();
-                let bfgs_elapsed = bfgs_start.elapsed().as_secs_f64();
-                match &outcome {
-                    Ok(sol) => log::info!(
-                        "[OUTER summary] BFGS converged in {} iters elapsed={:.3}s final_value={:.6e}",
-                        sol.iterations,
-                        bfgs_elapsed,
-                        sol.final_value
-                    ),
-                    Err(BfgsError::MaxIterationsReached { last_solution }) => log::warn!(
-                        // Include `in N iters` for symmetry with the
-                        // converged log line — the runner aggregator
-                        // (commit afd66d6a) reads the optional iters
-                        // group to build `bfgs_iters_p50/_max` across
-                        // both successful and cap-hit runs. Without
-                        // this, the iter-count distribution would be
-                        // biased toward fast-converged runs.
-                        "[OUTER summary] BFGS hit max_iter in {} iters elapsed={:.3}s final_value={:.6e}",
-                        last_solution.iterations,
-                        bfgs_elapsed,
-                        last_solution.final_value
-                    ),
-                    Err(BfgsError::LineSearchFailed {
-                        last_solution,
-                        max_attempts,
-                        failure_reason,
-                    }) => log::info!(
-                        // Same rationale as the MaxIterationsReached
-                        // arm: surface `in N iters` so the runner can
-                        // include line-search-failed runs in the
-                        // iter-count distribution. A line-search
-                        // failure at iter 1 (cold start collapses
-                        // immediately) is a different signal from
-                        // failure at iter 50 (the optimizer made
-                        // substantial progress before stalling).
-                        "[OUTER summary] BFGS line-search failed in {} iters elapsed={:.3}s final_value={:.6e} reason={:?} max_attempts={} |g|={:.3e}",
-                        last_solution.iterations,
-                        bfgs_elapsed,
-                        last_solution.final_value,
-                        failure_reason,
-                        max_attempts,
-                        last_solution.final_gradient_norm.unwrap_or(f64::NAN),
-                    ),
-                    Err(e) => log::info!(
-                        "[OUTER summary] BFGS failed elapsed={:.3}s err={:?}",
-                        bfgs_elapsed,
-                        e
-                    ),
-                }
-                match outcome {
-                    Ok(sol) => Ok(solution_into_outer_result(sol, true, *the_plan)),
-                    Err(BfgsError::MaxIterationsReached { last_solution }) => {
-                        Ok(solution_into_outer_result(*last_solution, false, *the_plan))
-                    }
-                    Err(BfgsError::LineSearchFailed {
-                        last_solution,
-                        max_attempts,
-                        failure_reason,
-                    }) => {
-                        if last_solution.final_value.is_finite()
-                            && last_solution.final_point.iter().all(|v| v.is_finite())
-                            && last_solution
-                                .final_gradient
-                                .as_ref()
-                                .is_none_or(|g| g.iter().all(|v| v.is_finite()))
-                        {
-                            Ok(solution_into_outer_result(*last_solution, false, *the_plan))
-                        } else {
-                            Err(EstimationError::RemlOptimizationFailed(
-                                bfgs_line_search_failure_message(
-                                    context,
-                                    &last_solution,
-                                    max_attempts,
-                                    failure_reason,
-                                ),
-                            ))
+                    let seed_eval = obj
+                        .eval_with_order(seed, OuterEvalOrder::ValueAndGradient)
+                        .map_err(|err| into_objective_error("outer eval failed", err));
+                    let seed_eval = match seed_eval {
+                        Ok(seed_eval) => seed_eval,
+                        Err(err) => {
+                            let err = match err {
+                                ObjectiveEvalError::Recoverable { message }
+                                | ObjectiveEvalError::Fatal { message } => {
+                                    EstimationError::RemlOptimizationFailed(message)
+                                }
+                            };
+                            log::warn!(
+                                "[OUTER] {context}: rejecting seed {seed_idx} before solver start: {err}"
+                            );
+                            rejection_reasons.push((seed_idx, "validation", err.to_string()));
+                            continue 'seed_attempts;
                         }
+                    };
+                    let seed_eval = match finite_outer_first_order_eval_or_error(
+                        "outer eval failed",
+                        layout,
+                        seed_eval,
+                    )
+                    .map_err(|err| match err {
+                        ObjectiveEvalError::Recoverable { message }
+                        | ObjectiveEvalError::Fatal { message } => {
+                            EstimationError::RemlOptimizationFailed(message)
+                        }
+                    }) {
+                        Ok(eval) => eval,
+                        Err(err) => {
+                            log::warn!(
+                                "[OUTER] {context}: rejecting seed {seed_idx} before solver start: {err}"
+                            );
+                            rejection_reasons.push((seed_idx, "validation", err.to_string()));
+                            continue 'seed_attempts;
+                        }
+                    };
+                    started_seeds += 1;
+                    seed_slot = started_seeds;
+                    let (lo, hi) = &bounds_template;
+                    let bounds = outer_bounds(lo, hi)?;
+                    let grad_tol = outer_gradient_tolerance(config);
+                    let max_iter = outer_max_iterations(config.max_iter)?;
+                    let objective = OuterFirstOrderBridge {
+                        obj,
+                        layout,
+                        outer_inner_cap: config.outer_inner_cap.clone(),
+                        iter_count: 0,
+                        g_norm_initial: None,
+                        last_g_norm: None,
+                    };
+                    // Hand the precomputed (cost, gradient) seed eval to
+                    // `opt::Bfgs` so its first internal `eval_grad` call is
+                    // served from cache instead of re-running the outer
+                    // objective. Inner P-IRLS solves dominate outer cost
+                    // at biobank scale; skipping one re-eval at the seed
+                    // is one of the cheapest wins available. (opt 0.3.0
+                    // API; before that this was implemented via a
+                    // gam-side cache on the bridge.)
+                    let initial_sample = FirstOrderSample {
+                        value: seed_eval.cost,
+                        gradient: seed_eval.gradient.clone(),
+                    };
+                    let mut optimizer = Bfgs::new(seed.clone(), objective)
+                        .with_initial_sample(seed.clone(), initial_sample)
+                        .with_bounds(bounds)
+                        .with_gradient_tolerance(grad_tol)
+                        .with_max_iterations(max_iter);
+                    if let Some(caps) = bfgs_axis_step_caps(config, layout) {
+                        optimizer = optimizer.with_axis_step_caps(caps);
                     }
-                    Err(BfgsError::ObjectiveFailed { message }) => {
-                        Err(EstimationError::RemlOptimizationFailed(format!(
-                            "BFGS solver failed: ObjectiveFailed {{ message: {message:?} }}"
-                        )))
+                    if let Some(feedback) = config.outer_inner_cap.as_ref() {
+                        optimizer = optimizer.with_observer(OuterAcceptObserver {
+                            feedback: feedback.clone(),
+                        });
                     }
-                    Err(e) => Err(EstimationError::RemlOptimizationFailed(format!(
-                        "BFGS solver failed: {e:?}"
-                    ))),
-                }
+                    let bfgs_start = std::time::Instant::now();
+                    let outcome = optimizer.run();
+                    let bfgs_elapsed = bfgs_start.elapsed().as_secs_f64();
+                    match &outcome {
+                        Ok(sol) => log::info!(
+                            "[OUTER summary] BFGS converged in {} iters elapsed={:.3}s final_value={:.6e}",
+                            sol.iterations,
+                            bfgs_elapsed,
+                            sol.final_value
+                        ),
+                        Err(BfgsError::MaxIterationsReached { last_solution }) => log::warn!(
+                            // Include `in N iters` for symmetry with the
+                            // converged log line — the runner aggregator
+                            // (commit afd66d6a) reads the optional iters
+                            // group to build `bfgs_iters_p50/_max` across
+                            // both successful and cap-hit runs. Without
+                            // this, the iter-count distribution would be
+                            // biased toward fast-converged runs.
+                            "[OUTER summary] BFGS hit max_iter in {} iters elapsed={:.3}s final_value={:.6e}",
+                            last_solution.iterations,
+                            bfgs_elapsed,
+                            last_solution.final_value
+                        ),
+                        Err(BfgsError::LineSearchFailed {
+                            last_solution,
+                            max_attempts,
+                            failure_reason,
+                        }) => log::info!(
+                            // Same rationale as the MaxIterationsReached
+                            // arm: surface `in N iters` so the runner can
+                            // include line-search-failed runs in the
+                            // iter-count distribution. A line-search
+                            // failure at iter 1 (cold start collapses
+                            // immediately) is a different signal from
+                            // failure at iter 50 (the optimizer made
+                            // substantial progress before stalling).
+                            "[OUTER summary] BFGS line-search failed in {} iters elapsed={:.3}s final_value={:.6e} reason={:?} max_attempts={} |g|={:.3e}",
+                            last_solution.iterations,
+                            bfgs_elapsed,
+                            last_solution.final_value,
+                            failure_reason,
+                            max_attempts,
+                            last_solution.final_gradient_norm.unwrap_or(f64::NAN),
+                        ),
+                        Err(e) => log::info!(
+                            "[OUTER summary] BFGS failed elapsed={:.3}s err={:?}",
+                            bfgs_elapsed,
+                            e
+                        ),
+                    }
+                    match outcome {
+                        Ok(sol) => Ok(solution_into_outer_result(sol, true, *the_plan)),
+                        Err(BfgsError::MaxIterationsReached { last_solution }) => {
+                            Ok(solution_into_outer_result(*last_solution, false, *the_plan))
+                        }
+                        Err(BfgsError::LineSearchFailed {
+                            last_solution,
+                            max_attempts,
+                            failure_reason,
+                        }) => {
+                            if last_solution.final_value.is_finite()
+                                && last_solution.final_point.iter().all(|v| v.is_finite())
+                                && last_solution
+                                    .final_gradient
+                                    .as_ref()
+                                    .is_none_or(|g| g.iter().all(|v| v.is_finite()))
+                            {
+                                Ok(solution_into_outer_result(*last_solution, false, *the_plan))
+                            } else {
+                                Err(EstimationError::RemlOptimizationFailed(
+                                    bfgs_line_search_failure_message(
+                                        context,
+                                        &last_solution,
+                                        max_attempts,
+                                        failure_reason,
+                                    ),
+                                ))
+                            }
+                        }
+                        Err(BfgsError::ObjectiveFailed { message }) => {
+                            Err(EstimationError::RemlOptimizationFailed(format!(
+                                "BFGS solver failed: ObjectiveFailed {{ message: {message:?} }}"
+                            )))
+                        }
+                        Err(e) => Err(EstimationError::RemlOptimizationFailed(format!(
+                            "BFGS solver failed: {e:?}"
+                        ))),
+                    }
                 }
             }
             Solver::Efs => {

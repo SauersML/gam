@@ -10,7 +10,7 @@ use crate::quadrature::{
     probit_posterior_meanvariance, survival_posterior_mean, survival_posterior_meanvariance,
 };
 use crate::types::{
-    InverseLink, LikelihoodSpec, LinkFunction, StandardLink, ResponseFamily, is_valid_tweedie_power,
+    InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily, StandardLink, is_valid_tweedie_power,
 };
 use ndarray::{Array1, ArrayView1};
 

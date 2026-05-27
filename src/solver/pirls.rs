@@ -14,8 +14,8 @@ use crate::matrix::{DesignMatrix, LinearOperator, ReparamOperator, SymmetricMatr
 use crate::mixture_link::{InverseLinkJet as MixtureInverseLinkJet, logit_inverse_link_jet5};
 use crate::probability::standard_normal_quantile;
 use crate::solver::active_set;
-use crate::types::{StandardLink, Coefficients, LinearPredictor, LogSmoothingParamsView};
-use crate::types::{ 
+use crate::types::{Coefficients, LinearPredictor, LogSmoothingParamsView, StandardLink};
+use crate::types::{
     GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkFunction, MixtureLinkState, ResponseFamily,
     RidgePassport, RidgePolicy, SasLinkState, is_valid_tweedie_power,
 };
@@ -484,7 +484,9 @@ fn build_penalized_symbolic(
     }
     for &(row, col, _) in penalty_triplets {
         if row > col || col >= p {
-            crate::bail_invalid_estim!("penalty sparse pattern must be upper-triangular within bounds");
+            crate::bail_invalid_estim!(
+                "penalty sparse pattern must be upper-triangular within bounds"
+            );
         }
         cols[col].insert(row);
     }
@@ -732,8 +734,10 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
             }
             (ResponseFamily::Binomial, link, false) => {
                 if matches!(link, InverseLink::Mixture(_)) {
-                    crate::bail_invalid_estim!("BinomialMixture IRLS update requires explicit mixture link state"
-                            .to_string(),);
+                    crate::bail_invalid_estim!(
+                        "BinomialMixture IRLS update requires explicit mixture link state"
+                            .to_string(),
+                    );
                 }
                 update_glmvectors(
                     y,
@@ -2073,7 +2077,9 @@ impl<'a> GamWorkingModel<'a> {
             )
         })?;
         let PirlsPenalty::Dense { s_transformed, .. } = &self.penalty else {
-            crate::bail_invalid_estim!("sparse-native PIRLS requires a dense transformed penalty matrix");
+            crate::bail_invalid_estim!(
+                "sparse-native PIRLS requires a dense transformed penalty matrix"
+            );
         };
         self.workspace.assemble_sparse_penalized_hessian(
             x_sparse,
@@ -2991,7 +2997,9 @@ fn compute_jeffreys_pirls_diagnostics_sparse(
         let vals = xview.val_of_row(i);
         let cols = xview.col_idx_of_row_raw(i);
         if cols.len() != vals.len() {
-            crate::bail_invalid_estim!("sparse row structure mismatch: column/value lengths differ");
+            crate::bail_invalid_estim!(
+                "sparse row structure mismatch: column/value lengths differ"
+            );
         }
         for (idx, &col) in cols.iter().enumerate() {
             x_dense[[i, col.unbound()]] = vals[idx];
@@ -4299,10 +4307,9 @@ fn solve_intercept_for_prevalence(
             // is only invoked with the five legal `StandardLink` variants (the
             // dispatch site at pirls.rs:4203 routes Sas/BetaLogistic into the
             // Some branch above with state).
-            InverseLink::Standard(
-                StandardLink::try_from(link_function)
-                    .expect("state-bearing link reached state-less arm in solve_intercept_for_prevalence"),
-            )
+            InverseLink::Standard(StandardLink::try_from(link_function).expect(
+                "state-bearing link reached state-less arm in solve_intercept_for_prevalence",
+            ))
         };
         standard_inverse_link_jet(&inverse_link, eta)
             .map(|jet| jet.mu - prevalence)
@@ -7665,9 +7672,9 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
                 // at runtime. We panic rather than `unreachable!` per the
                 // build.rs ban on the latter macro; the comment-anchored
                 // contract is the same.
-                PirlsPenalty::Diagonal { .. } => panic!(
-                    "GPU PIRLS dispatch gated on PirlsPenalty::Dense above"
-                ),
+                PirlsPenalty::Diagonal { .. } => {
+                    panic!("GPU PIRLS dispatch gated on PirlsPenalty::Dense above")
+                }
             };
             // Dense-design materialization for `PirlsResult.x_transformed`.
             let qs_arc_for_design = qs_arc
@@ -7946,7 +7953,9 @@ fn solve_penalized_least_squares_implicit(
         && let Some(x_sparse) = x_original.as_sparse()
     {
         let PirlsPenalty::Dense { s_transformed, .. } = penalty else {
-            crate::bail_invalid_estim!("sparse-native PIRLS requires a dense transformed penalty matrix");
+            crate::bail_invalid_estim!(
+                "sparse-native PIRLS requires a dense transformed penalty matrix"
+            );
         };
         let weights_owned = weights.to_owned();
 
@@ -8828,9 +8837,7 @@ fn write_tweedie_log_working_state(
         );
     }
     if !(phi.is_finite() && phi > 0.0) {
-        crate::bail_invalid_estim!(
-            "Tweedie dispersion phi must be finite and > 0; got {phi}"
-        );
+        crate::bail_invalid_estim!("Tweedie dispersion phi must be finite and > 0; got {phi}");
     }
     validate_tweedie_responses(&y, &priorweights)?;
     let exponent = 2.0 - p;
@@ -8944,9 +8951,7 @@ fn write_negative_binomial_log_working_state(
     const MIN_MU: f64 = 1e-10;
     const MIN_WEIGHT: f64 = 1e-12;
     if !valid_negbin_theta(theta) {
-        crate::bail_invalid_estim!(
-            "negative-binomial theta must be finite and > 0; got {theta}"
-        );
+        crate::bail_invalid_estim!("negative-binomial theta must be finite and > 0; got {theta}");
     }
     validate_count_responses(&y, &priorweights, "negative-binomial")?;
     if let Some(derivs) = derivatives {
@@ -9051,9 +9056,7 @@ fn write_beta_logit_working_state(
 ) -> Result<(), EstimationError> {
     const MIN_WEIGHT: f64 = 1e-12;
     if !valid_beta_phi(phi) {
-        crate::bail_invalid_estim!(
-            "beta-regression phi must be finite and > 0; got {phi}"
-        );
+        crate::bail_invalid_estim!("beta-regression phi must be finite and > 0; got {phi}");
     }
     validate_beta_responses(&y, &priorweights)?;
     if let Some(derivs) = derivatives {
@@ -9912,9 +9915,7 @@ pub(crate) fn computeworkingweight_derivatives_from_eta(
             let phi = *phi;
             const MIN_WEIGHT: f64 = 1e-12;
             if !valid_beta_phi(phi) {
-                crate::bail_invalid_estim!(
-                    "beta-regression phi must be finite and > 0; got {phi}"
-                );
+                crate::bail_invalid_estim!("beta-regression phi must be finite and > 0; got {phi}");
             }
             let c_s = c.as_slice_mut().expect("c must be contiguous");
             let d_s = d.as_slice_mut().expect("d must be contiguous");
@@ -10066,7 +10067,9 @@ pub(crate) fn computeworkingweight_derivatives_from_eta(
                 )?;
         }
         ResponseFamily::RoystonParmar => {
-            crate::bail_invalid_estim!("RoystonParmar is survival-specific and not a GLM IRLS family");
+            crate::bail_invalid_estim!(
+                "RoystonParmar is survival-specific and not a GLM IRLS family"
+            );
         }
     }
     Ok((c, d, dmu_deta, d2mu_deta2, d3mu_deta3))
@@ -11862,9 +11865,9 @@ mod tests {
     use crate::mixture_link::InverseLinkJet as MixtureInverseLinkJet;
     use crate::probability::standard_normal_quantile;
     use crate::solver::active_set;
-    use crate::types::{StandardLink, 
+    use crate::types::{
         Coefficients, GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkFunction,
-        LogSmoothingParamsView, ResponseFamily,
+        LogSmoothingParamsView, ResponseFamily, StandardLink,
     };
     use approx::assert_relative_eq;
     use faer::sparse::{SparseColMat, Triplet};

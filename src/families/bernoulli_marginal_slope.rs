@@ -19898,8 +19898,9 @@ mod tests {
     /// caches, intercept-warm-start, auto-subsample counters) so each test
     /// fixture stops re-listing them.
     fn default_test_family() -> BernoulliMarginalSlopeFamily {
-        let empty_design =
-            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((0, 0))));
+        let empty_design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+            Array2::zeros((0, 0)),
+        ));
         BernoulliMarginalSlopeFamily {
             y: Arc::new(Array1::zeros(0)),
             weights: Arc::new(Array1::zeros(0)),
@@ -19917,7 +19918,6 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(std::sync::Mutex::new(None)),
-
         }
     }
 

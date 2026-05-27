@@ -35,8 +35,8 @@
 use ndarray::Array1;
 
 use crate::families::custom_family::KktRefusalDiagnosis;
-use crate::solver::inner_status::{InnerFailure, classify_inner_error};
 use crate::solver::estimate::EstimationError;
+use crate::solver::inner_status::{InnerFailure, classify_inner_error};
 use crate::solver::outer_strategy::{OuterEval, OuterEvalOrder, OuterObjective};
 
 /// Hard ceiling on the number of ρ steps along a single continuation

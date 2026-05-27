@@ -181,8 +181,8 @@ use crate::probability::{
     erfcx_nonnegative, stable_polynomial_times_exp_neg as cloglog_stable_poly_times_exp_neg,
 };
 use crate::types::{
-    InverseLink, LikelihoodSpec, LinkComponent, LinkFunction, StandardLink, MixtureLinkState, ResponseFamily,
-    SasLinkState,
+    InverseLink, LikelihoodSpec, LinkComponent, LinkFunction, MixtureLinkState, ResponseFamily,
+    SasLinkState, StandardLink,
 };
 use statrs::function::erf::erfc;
 
@@ -525,8 +525,10 @@ fn compute_clenshaw_curtis_n(n: usize) -> ClenshawCurtisRule {
 
 fn cloglog_cc_required_nodes(mu: f64, sigma: f64, tol: f64) -> Result<usize, EstimationError> {
     if !(mu.is_finite() && sigma.is_finite() && sigma > 0.0 && tol.is_finite() && tol > 0.0) {
-        crate::bail_invalid_estim!("CC cloglog backend requires finite mu, positive sigma, and positive tolerance"
-                .to_string(),);
+        crate::bail_invalid_estim!(
+            "CC cloglog backend requires finite mu, positive sigma, and positive tolerance"
+                .to_string(),
+        );
     }
 
     // This mirrors the node-count logic used by the actual CC evaluator, but
@@ -1130,8 +1132,10 @@ fn logit_posterior_meanwith_deriv_exact_erfcx(
     if max_k >= LOGIT_MAX_TERMS
         && tail_bound_exceeds_accuracy(mu, sigma, LOGIT_MAX_TERMS, LOGIT_ERFCX_ACCURACY_TARGET)
     {
-        crate::bail_invalid_estim!("logit erfcx series truncation bound exceeds LOGIT_MAX_TERMS at the required accuracy"
-                .to_string(),);
+        crate::bail_invalid_estim!(
+            "logit erfcx series truncation bound exceeds LOGIT_MAX_TERMS at the required accuracy"
+                .to_string(),
+        );
     }
 
     let mut sum = 0.0_f64;
@@ -1994,8 +1998,10 @@ fn cloglog_survival_cc(
     tol: f64,
 ) -> Result<f64, EstimationError> {
     if !(mu.is_finite() && sigma.is_finite() && sigma > 0.0 && tol.is_finite() && tol > 0.0) {
-        crate::bail_invalid_estim!("CC cloglog backend requires finite mu, positive sigma, and positive tolerance"
-                .to_string(),);
+        crate::bail_invalid_estim!(
+            "CC cloglog backend requires finite mu, positive sigma, and positive tolerance"
+                .to_string(),
+        );
     }
 
     // Real-line representation of the shared survival term
@@ -2215,7 +2221,9 @@ fn complex_log_gamma_lanczos(z: Complex) -> Complex {
 
 fn cloglog_survival_gamma_reference(mu: f64, sigma: f64) -> Result<f64, EstimationError> {
     if !(mu.is_finite() && sigma.is_finite()) || sigma <= 0.0 {
-        crate::bail_invalid_estim!("Gamma cloglog reference backend requires finite mu and positive sigma");
+        crate::bail_invalid_estim!(
+            "Gamma cloglog reference backend requires finite mu and positive sigma"
+        );
     }
 
     // Exact Mellin-Barnes / Bromwich representation for the lognormal Laplace
@@ -2687,10 +2695,14 @@ fn integrated_mixture_jet(
     // derivatives for the probit component are therefore not threaded here
     // because the integrated PIRLS callers do not consume them.
     if mixture_state.components.is_empty() {
-        crate::bail_invalid_estim!("integrated mixture-link jet requires at least one blended component");
+        crate::bail_invalid_estim!(
+            "integrated mixture-link jet requires at least one blended component"
+        );
     }
     if mixture_state.components.len() != mixture_state.pi.len() {
-        crate::bail_invalid_estim!("integrated mixture-link jet requires matching component and weight counts");
+        crate::bail_invalid_estim!(
+            "integrated mixture-link jet requires matching component and weight counts"
+        );
     }
 
     // Validation note: compare against a 128-point direct GHQ reference for
@@ -2720,8 +2732,10 @@ fn integrated_mixture_jet(
     }
 
     if !saw_positive_weight {
-        crate::bail_invalid_estim!("integrated mixture-link jet requires at least one positive component weight"
-                .to_string(),);
+        crate::bail_invalid_estim!(
+            "integrated mixture-link jet requires at least one positive component weight"
+                .to_string(),
+        );
     }
 
     Ok(IntegratedInverseLinkJet {
@@ -4210,7 +4224,9 @@ mod tests {
         let mean = cloglog_mean_from_survival(survival);
         let dmean = cloglog_shift_identity_derivative(mu, sigma, shifted_survival);
         if !(mean.is_finite() && dmean.is_finite()) {
-            crate::bail_invalid_estim!("Gamma cloglog reference backend produced non-finite values");
+            crate::bail_invalid_estim!(
+                "Gamma cloglog reference backend produced non-finite values"
+            );
         }
         Ok(IntegratedMeanDerivative {
             mean,

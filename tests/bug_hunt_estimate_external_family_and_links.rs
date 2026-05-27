@@ -1,8 +1,8 @@
 use gam::estimate::{FitOptions, FittedLinkState, fit_gam, fit_gamwith_heuristic_lambdas};
 use gam::smooth::BlockwisePenalty;
 use gam::types::{
-    InverseLink, LatentCLogLogState, LikelihoodSpec, LinkComponent, StandardLink, MixtureLinkSpec,
-    ResponseFamily, SasLinkSpec,
+    InverseLink, LatentCLogLogState, LikelihoodSpec, LinkComponent, MixtureLinkSpec,
+    ResponseFamily, SasLinkSpec, StandardLink,
 };
 use ndarray::{Array1, Array2, array};
 

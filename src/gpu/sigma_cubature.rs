@@ -56,6 +56,7 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 use super::error::GpuError;
 use super::pirls_row::{CurvatureMode, PirlsRowFamily};
+use crate::gpu::error::GpuResultExt;
 use crate::gpu_err;
 
 /// Per-sigma-point IRLS input bundle handed to the device path.
@@ -106,10 +107,7 @@ impl<'a> SigmaCubatureBatch<'a> {
             .ok_or_else(|| crate::gpu_err!("sigma_cubature batch is empty"))?;
         let n = first.y.len();
         let p = first.beta.len();
-        if first.eta.len() != n
-            || first.prior_w.len() != n
-            || first.hessian_inv.shape() != [p, p]
-        {
+        if first.eta.len() != n || first.prior_w.len() != n || first.hessian_inv.shape() != [p, p] {
             return Err(crate::gpu_err!(
                 "sigma_cubature batch[0] shape mismatch: n={}, p={}, eta={}, prior_w={}, hessian_inv={:?}",
                 n,
@@ -408,22 +406,25 @@ extern "C" __global__ void sigma_second_beta(int M, int p, const double* __restr
         p: usize,
     ) -> Result<Array2<f64>, GpuError> {
         let runtime = crate::gpu::runtime::GpuRuntime::global().ok_or_else(|| {
-            crate::gpu_err!(
-                "try_device_moment_reduce: GpuRuntime unavailable after probe accepted"
-            )
+            crate::gpu_err!("try_device_moment_reduce: GpuRuntime unavailable after probe accepted")
         })?;
         let ctx = crate::gpu::runtime::cuda_context_for(runtime.selected_device().ordinal)
-            .ok_or_else(|| crate::gpu_err!(
-                "try_device_moment_reduce: CUDA context for ordinal {} unavailable",
-                runtime.selected_device().ordinal
-            ))?;
+            .ok_or_else(|| {
+                crate::gpu_err!(
+                    "try_device_moment_reduce: CUDA context for ordinal {} unavailable",
+                    runtime.selected_device().ordinal
+                )
+            })?;
         ctx.bind_to_thread()
             .gpu_ctx("try_device_moment_reduce bind_to_thread")?;
         let stream = ctx.default_stream();
 
         let m = points.len();
-        let module =
-            MOMENT_REDUCE_PTX.get_or_compile(&ctx, "sigma_cubature_moment_reduce", MOMENT_REDUCE_SRC)?;
+        let module = MOMENT_REDUCE_PTX.get_or_compile(
+            &ctx,
+            "sigma_cubature_moment_reduce",
+            MOMENT_REDUCE_SRC,
+        )?;
 
         // Pack A and b on host then upload once. `m * p * p` is bounded
         // by the sigma-point cap × p² (e.g. 12 * 64² = 49 152 doubles ≈
@@ -458,10 +459,10 @@ extern "C" __global__ void sigma_second_beta(int M, int p, const double* __restr
             .gpu_ctx("sigma_cubature alloc second_beta")?;
 
         const THREADS: u32 = 128;
-        let m_i32 = i32::try_from(m)
-            .map_err(|_| crate::gpu_err!("sigma_cubature M={m} overflows i32"))?;
-        let p_i32 = i32::try_from(p)
-            .map_err(|_| crate::gpu_err!("sigma_cubature p={p} overflows i32"))?;
+        let m_i32 =
+            i32::try_from(m).map_err(|_| crate::gpu_err!("sigma_cubature M={m} overflows i32"))?;
+        let p_i32 =
+            i32::try_from(p).map_err(|_| crate::gpu_err!("sigma_cubature p={p} overflows i32"))?;
 
         // Kernel 1: mean_hinv (p*p threads).
         {
@@ -544,30 +545,24 @@ extern "C" __global__ void sigma_second_beta(int M, int p, const double* __restr
         // p² doubles — far below the launch breakeven and avoids
         // shipping a fourth kernel.
         let mean_hinv_host = stream
-            .memcpy_dtov(&mean_hinv_dev)
+            .clone_dtoh(&mean_hinv_dev)
             .gpu_ctx("sigma_cubature dtoh mean_hinv")?;
         let mean_beta_host = stream
-            .memcpy_dtov(&mean_beta_dev)
+            .clone_dtoh(&mean_beta_dev)
             .gpu_ctx("sigma_cubature dtoh mean_beta")?;
         let second_beta_host = stream
-            .memcpy_dtov(&second_beta_dev)
+            .clone_dtoh(&second_beta_dev)
             .gpu_ctx("sigma_cubature dtoh second_beta")?;
         stream
             .synchronize()
             .gpu_ctx("sigma_cubature synchronize after dtoh")?;
 
-        let mean_hinv =
-            Array2::from_shape_vec((p, p), mean_hinv_host).map_err(|err| {
-                crate::gpu_err!(
-                    "sigma_cubature mean_hinv reshape failed (p={p}): {err}"
-                )
-            })?;
-        let second_beta =
-            Array2::from_shape_vec((p, p), second_beta_host).map_err(|err| {
-                crate::gpu_err!(
-                    "sigma_cubature second_beta reshape failed (p={p}): {err}"
-                )
-            })?;
+        let mean_hinv = Array2::from_shape_vec((p, p), mean_hinv_host).map_err(|err| {
+            crate::gpu_err!("sigma_cubature mean_hinv reshape failed (p={p}): {err}")
+        })?;
+        let second_beta = Array2::from_shape_vec((p, p), second_beta_host).map_err(|err| {
+            crate::gpu_err!("sigma_cubature second_beta reshape failed (p={p}): {err}")
+        })?;
         // mean_beta · mean_betaᵀ (host outer product, p² doubles).
         let mut mean_outer = Array2::<f64>::zeros((p, p));
         for i in 0..p {
@@ -651,7 +646,10 @@ mod tests {
             points: &pts,
         };
         let outcome = try_device_sigma_eval_batched(&batch).expect("preflight succeeds");
-        assert!(outcome.is_none(), "below-breakeven batch must decline cleanly");
+        assert!(
+            outcome.is_none(),
+            "below-breakeven batch must decline cleanly"
+        );
     }
 
     #[test]

@@ -32,8 +32,7 @@ use std::sync::Arc;
 use crate::solver::arrow_schur::{ArrowRowBlock, ArrowSchurError, ArrowSchurSystem};
 use crate::terms::analytic_penalties::{
     ARDPenalty, AnalyticPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry,
-    IBPAssignmentPenalty, IsometryPenalty, PenaltyTier, PsiSlice,
-    SoftmaxAssignmentSparsityPenalty,
+    IBPAssignmentPenalty, IsometryPenalty, PenaltyTier, PsiSlice, SoftmaxAssignmentSparsityPenalty,
 };
 use crate::terms::latent_coord::{LatentCoordValues, LatentIdMode, LatentManifold};
 
@@ -243,10 +242,7 @@ pub trait SaeBasisEvaluator: Send + Sync + std::fmt::Debug {
     /// this to wrap the typed call in `Some(...)`. This sidesteps the lack of
     /// dyn-downcasting for non-`Any` traits while keeping `SaeBasisSecondJet`
     /// as the strongly-typed compile-time bound for tests / generics.
-    fn second_jet_dyn(
-        &self,
-        _coords: ArrayView2<'_, f64>,
-    ) -> Option<Result<Array4<f64>, String>> {
+    fn second_jet_dyn(&self, _coords: ArrayView2<'_, f64>) -> Option<Result<Array4<f64>, String>> {
         None
     }
 }
@@ -289,10 +285,7 @@ impl PeriodicHarmonicEvaluator {
 }
 
 impl SaeBasisEvaluator for PeriodicHarmonicEvaluator {
-    fn second_jet_dyn(
-        &self,
-        coords: ArrayView2<'_, f64>,
-    ) -> Option<Result<Array4<f64>, String>> {
+    fn second_jet_dyn(&self, coords: ArrayView2<'_, f64>) -> Option<Result<Array4<f64>, String>> {
         Some(<Self as SaeBasisSecondJet>::second_jet(self, coords))
     }
 
@@ -412,10 +405,7 @@ impl SaeBasisEvaluator for RawPeriodicCircleEvaluator {
 pub struct SphereChartEvaluator;
 
 impl SaeBasisEvaluator for SphereChartEvaluator {
-    fn second_jet_dyn(
-        &self,
-        coords: ArrayView2<'_, f64>,
-    ) -> Option<Result<Array4<f64>, String>> {
+    fn second_jet_dyn(&self, coords: ArrayView2<'_, f64>) -> Option<Result<Array4<f64>, String>> {
         Some(<Self as SaeBasisSecondJet>::second_jet(self, coords))
     }
 
@@ -611,10 +601,7 @@ impl TorusHarmonicEvaluator {
 }
 
 impl SaeBasisEvaluator for TorusHarmonicEvaluator {
-    fn second_jet_dyn(
-        &self,
-        coords: ArrayView2<'_, f64>,
-    ) -> Option<Result<Array4<f64>, String>> {
+    fn second_jet_dyn(&self, coords: ArrayView2<'_, f64>) -> Option<Result<Array4<f64>, String>> {
         Some(<Self as SaeBasisSecondJet>::second_jet(self, coords))
     }
 
@@ -2848,16 +2835,11 @@ pub fn refresh_isometry_caches_from_term(
         let Some(p_latent_dim) = p.target.latent_dim else {
             continue;
         };
-        let Some((atom_idx, atom)) = term
-            .atoms
-            .iter()
-            .enumerate()
-            .find(|(_, atom)| {
-                atom.latent_dim == p_latent_dim
-                    && atom.decoder_coefficients.ncols() == p.p_out
-                    && atom.basis_evaluator.is_some()
-            })
-        else {
+        let Some((atom_idx, atom)) = term.atoms.iter().enumerate().find(|(_, atom)| {
+            atom.latent_dim == p_latent_dim
+                && atom.decoder_coefficients.ncols() == p.p_out
+                && atom.basis_evaluator.is_some()
+        }) else {
             continue;
         };
         let coords = coords_per_atom[atom_idx].view();
@@ -3413,11 +3395,7 @@ mod tests {
         let torus_coords = array![[0.1, 0.7], [0.42, 0.0], [0.95, 0.33], [0.5, 0.5]];
         let evaluator = TorusHarmonicEvaluator::new(2, 3).unwrap();
         assert!(evaluator.basis_size() > 0);
-        assert_second_jet_matches_central_difference(
-            &evaluator,
-            torus_coords,
-            1.0e-5,
-        )?;
+        assert_second_jet_matches_central_difference(&evaluator, torus_coords, 1.0e-5)?;
         Ok(())
     }
 

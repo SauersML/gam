@@ -10,6 +10,8 @@ use super::device::GpuDeviceInfo;
 use super::error::GpuError;
 use super::policy::GpuDispatchPolicy;
 #[cfg(target_os = "linux")]
+use crate::gpu_err;
+#[cfg(target_os = "linux")]
 use cudarc::driver::{CudaContext, result, sys};
 
 #[path = "diagnostics.rs"]
@@ -133,12 +135,14 @@ impl GpuRuntime {
             }
 
             let mut devices = Vec::new();
-            for ordinal in 0..usize::try_from(device_count).map_err(|_| {
-                GpuError::DriverCallFailed {
+            for ordinal in
+                0..usize::try_from(device_count).map_err(|_| GpuError::DriverCallFailed {
                     reason: "negative CUDA device count".into(),
-                }
-            })? {
-                let ctx = cuda_context_for(ordinal).ok_or_else(|| gpu_err!("failed to create CUDA context for device {ordinal}"))?;
+                })?
+            {
+                let ctx = cuda_context_for(ordinal).ok_or_else(|| {
+                    gpu_err!("failed to create CUDA context for device {ordinal}")
+                })?;
                 catch_unwind(AssertUnwindSafe(|| ctx.bind_to_thread()))
                     .map_err(|_| GpuError::DriverLibraryUnavailable {
                         reason: "libcuda unavailable".to_string(),
@@ -239,14 +243,15 @@ fn cuda_device_info(ordinal: usize, ctx: &CudaContext) -> Result<GpuDeviceInfo, 
     result::init().map_err(|err| GpuError::DriverCallFailed {
         reason: err.to_string(),
     })?;
-    let device = result::device::get(i32::try_from(ordinal).map_err(|_| {
-        GpuError::DriverCallFailed {
-            reason: "device ordinal overflow".into(),
-        }
-    })?)
-    .map_err(|err| GpuError::DriverCallFailed {
-        reason: err.to_string(),
-    })?;
+    let device =
+        result::device::get(
+            i32::try_from(ordinal).map_err(|_| GpuError::DriverCallFailed {
+                reason: "device ordinal overflow".into(),
+            })?,
+        )
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: err.to_string(),
+        })?;
     let attr = |attribute| -> Result<i32, GpuError> {
         // SAFETY: device comes from cudarc's validated device::get.
         unsafe { result::device::get_attribute(device, attribute) }.map_err(|err| {
@@ -256,9 +261,10 @@ fn cuda_device_info(ordinal: usize, ctx: &CudaContext) -> Result<GpuDeviceInfo, 
         })
     };
     let (free_mem_bytes, total_mem_bytes) =
-        ctx.mem_get_info().map_err(|err| GpuError::DriverCallFailed {
-            reason: err.to_string(),
-        })?;
+        ctx.mem_get_info()
+            .map_err(|err| GpuError::DriverCallFailed {
+                reason: err.to_string(),
+            })?;
     let major = attr(sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)?;
     let minor = attr(sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)?;
     Ok(GpuDeviceInfo {
@@ -322,7 +328,6 @@ mod tests {
         // *does* have a GPU still passes (workload below dispatch threshold
         // → returns None / Err / CPU fallback the same way).
         use ndarray::{Array1, Array2};
-use crate::gpu_err;
         let a = Array2::<f64>::zeros((4, 3));
         let b = Array2::<f64>::zeros((3, 2));
         let v = Array1::<f64>::zeros(3);

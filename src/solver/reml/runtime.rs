@@ -1,4 +1,5 @@
 use super::*;
+use crate::cache::Fingerprinter;
 use crate::construction::{
     create_balanced_penalty_root_from_canonical, precompute_reparam_invariant_from_canonical,
 };
@@ -9,13 +10,10 @@ use crate::linalg::utils::{
 use crate::pirls::PirlsWorkspace;
 use crate::solver::estimate::reml::inner_strategy::HessianEvalStrategyKind;
 use crate::solver::outer_strategy::{HessianResult, OuterEval};
-use crate::cache::Fingerprinter;
-use crate::solver::persistent_warm_start::{
-    PersistentWarmStartRecord, load_record, store_record,
-};
+use crate::solver::persistent_warm_start::{PersistentWarmStartRecord, load_record, store_record};
 use crate::types::{
-    GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkFunction, StandardLink, ResponseFamily, RhoPrior,
-    SasLinkState,
+    GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily, RhoPrior,
+    SasLinkState, StandardLink,
 };
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -2297,7 +2295,9 @@ impl<'a> RemlState<'a> {
 
         for g in gradient.iter_mut() {
             if !g.is_finite() {
-                crate::bail_invalid_estim!("Tierney-Kadane correction produced a non-finite gradient entry");
+                crate::bail_invalid_estim!(
+                    "Tierney-Kadane correction produced a non-finite gradient entry"
+                );
             }
         }
         Ok(gradient)
@@ -2566,7 +2566,9 @@ impl<'a> RemlState<'a> {
             return Ok(Array2::zeros((0, 0)));
         }
         if c_array.len() != n || d_array.len() != n || e_array.len() != n || f_array.len() != n {
-            crate::bail_invalid_estim!("Tierney-Kadane Hessian derivative arrays have inconsistent lengths");
+            crate::bail_invalid_estim!(
+                "Tierney-Kadane Hessian derivative arrays have inconsistent lengths"
+            );
         }
 
         let mut k_mat = Array2::<f64>::zeros((p, p));
@@ -2795,7 +2797,9 @@ impl<'a> RemlState<'a> {
             }
         }
         if total.h.iter().any(|v| !v.is_finite()) {
-            crate::bail_invalid_estim!("Tierney-Kadane analytic Hessian produced a non-finite entry");
+            crate::bail_invalid_estim!(
+                "Tierney-Kadane analytic Hessian produced a non-finite entry"
+            );
         }
         Ok(total.h)
     }
@@ -3088,7 +3092,9 @@ impl<'a> RemlState<'a> {
             }
             HFactor::Eigh { evals, evecs }
         } else {
-            crate::bail_invalid_estim!("Tierney-Kadane correction could not factor the effective Hessian");
+            crate::bail_invalid_estim!(
+                "Tierney-Kadane correction could not factor the effective Hessian"
+            );
         };
 
         let z_mat = match &h_factor {
@@ -3863,7 +3869,9 @@ impl<'a> RemlState<'a> {
                 && matches!(spec.link, InverseLink::Standard(StandardLink::Logit))
         } && self.runtime_mixture_link_state.is_none();
         if !canonical_logit {
-            crate::bail_invalid_estim!("Tierney-Kadane outer Hessian is implemented for canonical Binomial Logit Firth fits only");
+            crate::bail_invalid_estim!(
+                "Tierney-Kadane outer Hessian is implemented for canonical Binomial Logit Firth fits only"
+            );
         }
         let mut f_array = Array1::<f64>::zeros(e_array.len());
         use rayon::prelude::*;
@@ -6014,7 +6022,9 @@ impl<'a> RemlState<'a> {
             pirls_result.coordinate_frame,
             pirls::PirlsCoordinateFrame::OriginalSparseNative
         ) {
-            crate::bail_invalid_estim!("sparse exact geometry requires sparse-native PIRLS coordinates");
+            crate::bail_invalid_estim!(
+                "sparse exact geometry requires sparse-native PIRLS coordinates"
+            );
         }
         let ridge_passport = pirls_result.ridge_passport;
         let x_sparse = self.x().as_sparse().ok_or_else(|| {
@@ -6163,7 +6173,10 @@ impl<'a> RemlState<'a> {
                             InverseLink::Sas(state)
                         }
                     } else {
-                        InverseLink::Standard(StandardLink::try_from(self.config.link_function()).expect("state-bearing link without runtime state"))
+                        InverseLink::Standard(
+                            StandardLink::try_from(self.config.link_function())
+                                .expect("state-bearing link without runtime state"),
+                        )
                     };
                 return Ok(Arc::new(cached.rehydrate_after_reml_cache(
                     self.x(),
@@ -6258,7 +6271,10 @@ impl<'a> RemlState<'a> {
                     InverseLink::Sas(state)
                 }
             } else {
-                InverseLink::Standard(StandardLink::try_from(self.config.link_function()).expect("state-bearing link without runtime state"))
+                InverseLink::Standard(
+                    StandardLink::try_from(self.config.link_function())
+                        .expect("state-bearing link without runtime state"),
+                )
             };
             // Levenberg-Marquardt damping warm-start. Read the cached
             // λ from the previous successful PIRLS solve at this
@@ -6672,7 +6688,10 @@ impl<'a> RemlState<'a> {
                 InverseLink::Sas(state)
             }
         } else {
-            InverseLink::Standard(StandardLink::try_from(self.config.link_function()).expect("state-bearing link without runtime state"))
+            InverseLink::Standard(
+                StandardLink::try_from(self.config.link_function())
+                    .expect("state-bearing link without runtime state"),
+            )
         };
 
         // Gaussian + Identity outer REML reuses a precomputed XᵀWX and
@@ -8326,7 +8345,9 @@ impl<'a> RemlState<'a> {
             if matches!(hessian_mode, PseudoLogdetMode::Smooth) && c_nontrivial {
                 use super::unified::HessianOperator;
                 let Some(penalty_subspace) = penalty_subspace.as_ref() else {
-                    crate::bail_invalid_estim!("projected Hessian logdet requires penalty subspace");
+                    crate::bail_invalid_estim!(
+                        "projected Hessian logdet requires penalty subspace"
+                    );
                 };
                 let (log_det_h_proj, kernel) =
                     self.fixed_subspace_hessian_projected_parts(&h_for_operator, penalty_subspace)?;
@@ -8644,7 +8665,9 @@ impl<'a> RemlState<'a> {
             if matches!(hessian_mode, PseudoLogdetMode::Smooth) && c_nontrivial {
                 use super::unified::HessianOperator;
                 let Some(penalty_subspace) = penalty_subspace.as_ref() else {
-                    crate::bail_invalid_estim!("projected Hessian logdet requires penalty subspace");
+                    crate::bail_invalid_estim!(
+                        "projected Hessian logdet requires penalty subspace"
+                    );
                 };
                 let qs = &pirls_result.reparam_result.qs;
                 let h_transformed = crate::faer_ndarray::fast_ab(
@@ -9394,9 +9417,11 @@ impl<'a> RemlState<'a> {
     /// Check that Firth is not active (incompatible with link ext_coords).
     fn reject_firth_link_ext(&self) -> Result<(), EstimationError> {
         if self.config.firth_bias_reduction {
-            crate::bail_invalid_estim!("link-parameter ext_coord optimization is incompatible with \
+            crate::bail_invalid_estim!(
+                "link-parameter ext_coord optimization is incompatible with \
                  Firth-adjusted outer gradients"
-                    .to_string(),);
+                    .to_string(),
+            );
         }
         Ok(())
     }

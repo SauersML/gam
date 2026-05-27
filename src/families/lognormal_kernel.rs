@@ -235,9 +235,7 @@ fn worst_mode(
 #[inline]
 fn validate_kernel_inputs(m: f64, mu: f64, sigma: f64) -> Result<(), EstimationError> {
     if !m.is_finite() || m < 0.0 {
-        crate::bail_invalid_estim!(
-            "lognormal kernel requires finite m >= 0, got {m}"
-        );
+        crate::bail_invalid_estim!("lognormal kernel requires finite m >= 0, got {m}");
     }
     if !mu.is_finite() || !sigma.is_finite() || sigma < 0.0 {
         crate::bail_invalid_estim!(
@@ -916,13 +914,15 @@ impl LatentSurvivalRow {
                 if self.mass_exit < self.mass_entry {
                     crate::bail_invalid_estim!(
                         "latent survival right-censored row requires mass_exit >= mass_entry, got {} < {}",
-                        self.mass_exit, self.mass_entry
+                        self.mass_exit,
+                        self.mass_entry
                     );
                 }
                 if self.mass_unloaded_exit < self.mass_unloaded_entry {
                     crate::bail_invalid_estim!(
                         "latent survival right-censored row requires unloaded exit mass >= unloaded entry mass, got {} < {}",
-                        self.mass_unloaded_exit, self.mass_unloaded_entry
+                        self.mass_unloaded_exit,
+                        self.mass_unloaded_entry
                     );
                 }
                 if self.mass_left > 0.0
@@ -940,13 +940,15 @@ impl LatentSurvivalRow {
                 if self.mass_exit < self.mass_entry {
                     crate::bail_invalid_estim!(
                         "latent survival exact-event row requires mass_exit >= mass_entry, got {} < {}",
-                        self.mass_exit, self.mass_entry
+                        self.mass_exit,
+                        self.mass_entry
                     );
                 }
                 if self.mass_unloaded_exit < self.mass_unloaded_entry {
                     crate::bail_invalid_estim!(
                         "latent survival exact-event row requires unloaded exit mass >= unloaded entry mass, got {} < {}",
-                        self.mass_unloaded_exit, self.mass_unloaded_entry
+                        self.mass_unloaded_exit,
+                        self.mass_unloaded_entry
                     );
                 }
                 if self.mass_left > 0.0
@@ -954,7 +956,9 @@ impl LatentSurvivalRow {
                     || self.mass_unloaded_left > 0.0
                     || self.mass_unloaded_right > 0.0
                 {
-                    crate::bail_invalid_estim!("latent survival exact-event row cannot carry interval masses");
+                    crate::bail_invalid_estim!(
+                        "latent survival exact-event row cannot carry interval masses"
+                    );
                 }
                 if self.hazard_loaded == 0.0 && self.hazard_unloaded == 0.0 {
                     crate::bail_invalid_estim!("latent survival exact-event row requires a positive loaded or unloaded hazard"
@@ -965,7 +969,9 @@ impl LatentSurvivalRow {
                 if self.mass_left < self.mass_entry || self.mass_right < self.mass_left {
                     crate::bail_invalid_estim!(
                         "latent survival interval row requires mass_entry <= mass_left <= mass_right, got entry={}, left={}, right={}",
-                        self.mass_entry, self.mass_left, self.mass_right
+                        self.mass_entry,
+                        self.mass_left,
+                        self.mass_right
                     );
                 }
                 if self.mass_unloaded_left < self.mass_unloaded_entry
@@ -973,7 +979,9 @@ impl LatentSurvivalRow {
                 {
                     crate::bail_invalid_estim!(
                         "latent survival interval row requires unloaded_entry <= unloaded_left <= unloaded_right, got entry={}, left={}, right={}",
-                        self.mass_unloaded_entry, self.mass_unloaded_left, self.mass_unloaded_right
+                        self.mass_unloaded_entry,
+                        self.mass_unloaded_left,
+                        self.mass_unloaded_right
                     );
                 }
                 if self.mass_exit > 0.0
@@ -981,8 +989,10 @@ impl LatentSurvivalRow {
                     || self.hazard_loaded > 0.0
                     || self.hazard_unloaded > 0.0
                 {
-                    crate::bail_invalid_estim!("latent survival interval row cannot carry exit masses or event hazards"
-                            .to_string(),);
+                    crate::bail_invalid_estim!(
+                        "latent survival interval row cannot carry exit masses or event hazards"
+                            .to_string(),
+                    );
                 }
             }
         }
@@ -1000,7 +1010,8 @@ fn exact_event_kernel_jet(
     if row.hazard_loaded < 0.0 || row.hazard_unloaded < 0.0 {
         crate::bail_invalid_estim!(
             "latent survival exact-event hazards must be non-negative, got loaded={} unloaded={}",
-            row.hazard_loaded, row.hazard_unloaded
+            row.hazard_loaded,
+            row.hazard_unloaded
         );
     }
     match (row.hazard_unloaded > 0.0, row.hazard_loaded > 0.0) {

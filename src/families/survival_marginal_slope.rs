@@ -1032,9 +1032,8 @@ impl DenestedCellPrimaryFixedPartials {
                 flat.len()
             ));
         }
-        let read4 = |off: usize| -> [f64; 4] {
-            [flat[off], flat[off + 1], flat[off + 2], flat[off + 3]]
-        };
+        let read4 =
+            |off: usize| -> [f64; 4] { [flat[off], flat[off + 1], flat[off + 2], flat[off + 3]] };
         let dc_da = read4(0);
         let dc_daa = read4(4);
         let dc_daaa = read4(8);
@@ -6770,13 +6769,12 @@ impl SurvivalMarginalSlopeFamily {
                 )
             })?,
         };
-        let row_fp_input =
-            crate::gpu::survival_flex_prep::CellPrimaryFixedPartialsRowInputs {
-                a,
-                b,
-                cells: &fp_inputs,
-                layout,
-            };
+        let row_fp_input = crate::gpu::survival_flex_prep::CellPrimaryFixedPartialsRowInputs {
+            a,
+            b,
+            cells: &fp_inputs,
+            layout,
+        };
         let dev_fixed = crate::gpu::survival_flex_prep::try_device_cell_primary_fixed_partials(
             std::slice::from_ref(&row_fp_input),
         )
@@ -7612,7 +7610,12 @@ impl SurvivalMarginalSlopeFamily {
             && exit_chi_uv.is_some()
             && exit_d_u.is_some()
             && exit_d_uv.is_some();
-        if all_contiguous && exit.chi.is_finite() && exit.chi > 0.0 && exit.d.is_finite() && exit.d > 0.0 {
+        if all_contiguous
+            && exit.chi.is_finite()
+            && exit.chi > 0.0
+            && exit.d.is_finite()
+            && exit.d > 0.0
+        {
             let row_inputs = [crate::gpu::survival_flex::SurvivalFlexStep5RowInputs {
                 entry: crate::gpu::survival_flex::SurvivalFlexTimepointJet {
                     eta: entry.eta,
@@ -7658,15 +7661,15 @@ impl SurvivalMarginalSlopeFamily {
             // inline CPU loop on `Err` so any device-side validation failure
             // surfaces as a row-level CPU re-evaluation rather than a hard
             // panic.
-            if let Ok(mut out) = crate::gpu::survival_flex::try_device_step5_primary_assembly(
-                &row_inputs,
-            ) && out.len() == 1
+            if let Ok(mut out) =
+                crate::gpu::survival_flex::try_device_step5_primary_assembly(&row_inputs)
+                && out.len() == 1
             {
                 let row = out.remove(0);
                 if row.grad.len() == p && row.hess.len() == p * p {
                     let grad = Array1::from_vec(row.grad);
-                    let hess = Array2::from_shape_vec((p, p), row.hess)
-                        .map_err(|e| e.to_string())?;
+                    let hess =
+                        Array2::from_shape_vec((p, p), row.hess).map_err(|e| e.to_string())?;
                     return Ok((row.row_nll, grad, hess));
                 }
             }
@@ -13630,11 +13633,10 @@ impl ExactNewtonJointHessianWorkspace for SurvivalMarginalSlopeExactNewtonJointH
             && !self.family.flex_timewiggle_active()
         {
             let slices = block_slices(&self.family, &self.block_states);
-            if let Some(hv) = self.family.try_survival_flex_joint_dispatch_hvp(
-                &self.block_states,
-                &slices,
-                v,
-            )? {
+            if let Some(hv) =
+                self.family
+                    .try_survival_flex_joint_dispatch_hvp(&self.block_states, &slices, v)?
+            {
                 if hv.len() == out.len() {
                     out.assign(&hv);
                     return Ok(true);
@@ -14224,10 +14226,7 @@ impl SurvivalMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         slices: &BlockSlices,
     ) -> Result<Option<(f64, Array1<f64>)>, String> {
-        let decision = crate::gpu::survival_flex::row_primary_hessian_decision(
-            self.n,
-            N_PRIMARY,
-        );
+        let decision = crate::gpu::survival_flex::row_primary_hessian_decision(self.n, N_PRIMARY);
         decision.clone().log();
         if !decision.use_gpu {
             decision.require_supported()?;
@@ -14270,10 +14269,7 @@ impl SurvivalMarginalSlopeFamily {
         slices: &BlockSlices,
         v: &Array1<f64>,
     ) -> Result<Option<Array1<f64>>, String> {
-        let decision = crate::gpu::survival_flex::row_primary_hessian_decision(
-            self.n,
-            N_PRIMARY,
-        );
+        let decision = crate::gpu::survival_flex::row_primary_hessian_decision(self.n, N_PRIMARY);
         decision.clone().log();
         if !decision.use_gpu {
             decision.require_supported()?;
@@ -14321,10 +14317,7 @@ impl SurvivalMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         slices: &BlockSlices,
     ) -> Result<Option<Array2<f64>>, String> {
-        let decision = crate::gpu::survival_flex::row_primary_hessian_decision(
-            self.n,
-            N_PRIMARY,
-        );
+        let decision = crate::gpu::survival_flex::row_primary_hessian_decision(self.n, N_PRIMARY);
         decision.clone().log();
         if !decision.use_gpu {
             decision.require_supported()?;
@@ -14385,18 +14378,17 @@ impl SurvivalMarginalSlopeFamily {
             if let Some(h) =
                 self.try_survival_flex_joint_dispatch_dense_hessian(block_states, &slices)?
             {
-                let (nll, grad) = match self
-                    .try_survival_flex_joint_dispatch_gradient(block_states, &slices)?
-                {
-                    Some(pair) => pair,
-                    None => {
-                        return Err(
-                            "survival-flex GPU dense H succeeded but gradient declined; \
+                let (nll, grad) =
+                    match self.try_survival_flex_joint_dispatch_gradient(block_states, &slices)? {
+                        Some(pair) => pair,
+                        None => {
+                            return Err(
+                                "survival-flex GPU dense H succeeded but gradient declined; \
                              prep dispatchers must compose consistently"
-                                .to_string(),
-                        );
-                    }
-                };
+                                    .to_string(),
+                            );
+                        }
+                    };
                 return Ok((nll, grad, h));
             }
         }
@@ -19389,82 +19381,80 @@ pub fn fit_survival_marginal_slope_terms(
         // compile error) falls back to raw — observability preflight
         // and downstream canonicalize_for_identifiability still gate
         // on the audit.
-        let attempt = (|| -> Result<
-            Option<(CompiledSurvivalDesignsVMExact, SmgsLiftViaT)>,
-            String,
-        > {
-            let n_rows = spec.time_block.design_entry.nrows();
-            let p_time = spec.time_block.design_entry.ncols();
-            let p_marg = marginal_design.design.ncols();
-            let p_log = logslope_design.design.ncols();
-            // Single-term partition for the time block: SMGS's time
-            // penalty list is over the full time β (one composite
-            // smoothness penalty), so a single-term partition is
-            // correct here.
-            let time_partition: Vec<std::ops::Range<usize>> =
-                std::iter::once(0..p_time).collect();
-            let marg_penalty_ranges: Vec<_> = marginal_design
-                .penalties
-                .iter()
-                .map(|p| p.col_range.clone())
-                .collect();
-            let log_penalty_ranges: Vec<_> = logslope_design
-                .penalties
-                .iter()
-                .map(|p| p.col_range.clone())
-                .collect();
-            let marginal_partition =
-                extract_term_partition_from_penalty_ranges(p_marg, &marg_penalty_ranges);
-            let logslope_partition =
-                extract_term_partition_from_penalty_ranges(p_log, &log_penalty_ranges);
-            // Densify the operator-side designs once.
-            let dq0 = spec
-                .time_block
-                .design_entry
-                .try_to_dense_by_chunks("smgs phase-4b active: time_entry")?;
-            let dq1 = spec
-                .time_block
-                .design_exit
-                .try_to_dense_by_chunks("smgs phase-4b active: time_exit")?;
-            let dqd1 = spec
-                .time_block
-                .design_derivative_exit
-                .try_to_dense_by_chunks("smgs phase-4b active: time_deriv")?;
-            let m_dq = marginal_design
-                .design
-                .try_to_dense_by_chunks("smgs phase-4b active: marginal")?;
-            let m_dqd1 = ndarray::Array2::<f64>::zeros(m_dq.dim());
-            let g_dg = logslope_design
-                .design
-                .try_to_dense_by_chunks("smgs phase-4b active: logslope")?;
-            // Structural identity row Hessian: catches every column-
-            // level cross-block alias (the only failure mode the
-            // biobank repro surfaces). Data-adaptive H at the pilot β
-            // is a follow-up refinement noted in the math agent's
-            // review.
-            let mut h_full = ndarray::Array3::<f64>::zeros((n_rows, 4, 4));
-            for i in 0..n_rows {
-                for k in 0..4 {
-                    h_full[[i, k, k]] = 1.0;
+        let attempt =
+            (|| -> Result<Option<(CompiledSurvivalDesignsVMExact, SmgsLiftViaT)>, String> {
+                let n_rows = spec.time_block.design_entry.nrows();
+                let p_time = spec.time_block.design_entry.ncols();
+                let p_marg = marginal_design.design.ncols();
+                let p_log = logslope_design.design.ncols();
+                // Single-term partition for the time block: SMGS's time
+                // penalty list is over the full time β (one composite
+                // smoothness penalty), so a single-term partition is
+                // correct here.
+                let time_partition: Vec<std::ops::Range<usize>> =
+                    std::iter::once(0..p_time).collect();
+                let marg_penalty_ranges: Vec<_> = marginal_design
+                    .penalties
+                    .iter()
+                    .map(|p| p.col_range.clone())
+                    .collect();
+                let log_penalty_ranges: Vec<_> = logslope_design
+                    .penalties
+                    .iter()
+                    .map(|p| p.col_range.clone())
+                    .collect();
+                let marginal_partition =
+                    extract_term_partition_from_penalty_ranges(p_marg, &marg_penalty_ranges);
+                let logslope_partition =
+                    extract_term_partition_from_penalty_ranges(p_log, &log_penalty_ranges);
+                // Densify the operator-side designs once.
+                let dq0 = spec
+                    .time_block
+                    .design_entry
+                    .try_to_dense_by_chunks("smgs phase-4b active: time_entry")?;
+                let dq1 = spec
+                    .time_block
+                    .design_exit
+                    .try_to_dense_by_chunks("smgs phase-4b active: time_exit")?;
+                let dqd1 = spec
+                    .time_block
+                    .design_derivative_exit
+                    .try_to_dense_by_chunks("smgs phase-4b active: time_deriv")?;
+                let m_dq = marginal_design
+                    .design
+                    .try_to_dense_by_chunks("smgs phase-4b active: marginal")?;
+                let m_dqd1 = ndarray::Array2::<f64>::zeros(m_dq.dim());
+                let g_dg = logslope_design
+                    .design
+                    .try_to_dense_by_chunks("smgs phase-4b active: logslope")?;
+                // Structural identity row Hessian: catches every column-
+                // level cross-block alias (the only failure mode the
+                // biobank repro surfaces). Data-adaptive H at the pilot β
+                // is a follow-up refinement noted in the math agent's
+                // review.
+                let mut h_full = ndarray::Array3::<f64>::zeros((n_rows, 4, 4));
+                for i in 0..n_rows {
+                    for k in 0..4 {
+                        h_full[[i, k, k]] = 1.0;
+                    }
                 }
-            }
-            let row_hess = SurvivalRowHessian::from_full(h_full);
+                let row_hess = SurvivalRowHessian::from_full(h_full);
 
-            // Closed-form Gram path: assemble the SMGS K=4 channel-block
-            // view (time → q0/q1/qd1; marginal → q0/q1; logslope → g),
-            // build (K^H, K^S) via the GPU-or-CPU dispatcher, run
-            // `compile_from_raw_grams`, and — when the build succeeds —
-            // route the resulting `CompiledMap` T through
-            // `apply_compiled_map_to_designs` so the compiled designs +
-            // pulled-back penalties + result-time lift come from the
-            // closed-form path. On any failure we log and fall through
-            // to the per-term V/R path below.
-            {
-                use crate::families::identifiability_compiler::{
-                    BlockOrder as IdBlockOrder, PrimaryChannelBlocks, build_primary_grams_gpu_or_cpu,
-                    compile_from_raw_grams,
-                };
-                let closed_form = (|| -> Result<
+                // Closed-form Gram path: assemble the SMGS K=4 channel-block
+                // view (time → q0/q1/qd1; marginal → q0/q1; logslope → g),
+                // build (K^H, K^S) via the GPU-or-CPU dispatcher, run
+                // `compile_from_raw_grams`, and — when the build succeeds —
+                // route the resulting `CompiledMap` T through
+                // `apply_compiled_map_to_designs` so the compiled designs +
+                // pulled-back penalties + result-time lift come from the
+                // closed-form path. On any failure we log and fall through
+                // to the per-term V/R path below.
+                {
+                    use crate::families::identifiability_compiler::{
+                        BlockOrder as IdBlockOrder, PrimaryChannelBlocks,
+                        build_primary_grams_gpu_or_cpu, compile_from_raw_grams,
+                    };
+                    let closed_form = (|| -> Result<
                     Option<(
                         crate::families::identifiability_compiler::CompiledMap,
                         (usize, usize, usize),
@@ -19530,176 +19520,185 @@ pub fn fit_survival_marginal_slope_terms(
                     let w_log = map.compiled_block_ranges[2].len();
                     Ok(Some((map, (w_time, w_marg, w_log))))
                 })();
-                match closed_form {
-                    Ok(Some((map, (wt, wm, wl)))) => {
-                        let drops = (
-                            p_time.saturating_sub(wt),
-                            p_marg.saturating_sub(wm),
-                            p_log.saturating_sub(wl),
-                        );
-                        // Populate the post-accept recompile context the
-                        // same way the per-term path does. The recompile
-                        // hook rebuilds from the densified matrices at
-                        // converged β; the initial drops field is purely
-                        // diagnostic.
-                        recompile_ctx = Some(SmgsRecompileAfterAcceptContext {
-                            dq0: dq0.clone(),
-                            dq1: dq1.clone(),
-                            dqd1: dqd1.clone(),
-                            m_dq: m_dq.clone(),
-                            m_dqd1: m_dqd1.clone(),
-                            g_dg: g_dg.clone(),
-                            time_partition: time_partition.clone(),
-                            marginal_partition: marginal_partition.clone(),
-                            logslope_partition: logslope_partition.clone(),
-                            offset_entry: spec.time_block.offset_entry.clone(),
-                            offset_exit: spec.time_block.offset_exit.clone(),
-                            derivative_offset_exit: spec.time_block.derivative_offset_exit.clone(),
-                            marginal_offset: spec.marginal_offset.clone(),
-                            logslope_offset: spec.logslope_offset.clone(),
-                            z_primary: z_primary.clone(),
-                            weights: spec.weights.clone(),
-                            event: spec.event_target.clone(),
-                            derivative_guard,
-                            probit_scale,
-                            drops_by_block_initial: drops,
-                        });
-                        if drops.0 + drops.1 + drops.2 == 0 {
-                            log::info!(
-                                "[smgs phase-4b compiled-map] compile_from_raw_grams ok with no drops \
+                    match closed_form {
+                        Ok(Some((map, (wt, wm, wl)))) => {
+                            let drops = (
+                                p_time.saturating_sub(wt),
+                                p_marg.saturating_sub(wm),
+                                p_log.saturating_sub(wl),
+                            );
+                            // Populate the post-accept recompile context the
+                            // same way the per-term path does. The recompile
+                            // hook rebuilds from the densified matrices at
+                            // converged β; the initial drops field is purely
+                            // diagnostic.
+                            recompile_ctx = Some(SmgsRecompileAfterAcceptContext {
+                                dq0: dq0.clone(),
+                                dq1: dq1.clone(),
+                                dqd1: dqd1.clone(),
+                                m_dq: m_dq.clone(),
+                                m_dqd1: m_dqd1.clone(),
+                                g_dg: g_dg.clone(),
+                                time_partition: time_partition.clone(),
+                                marginal_partition: marginal_partition.clone(),
+                                logslope_partition: logslope_partition.clone(),
+                                offset_entry: spec.time_block.offset_entry.clone(),
+                                offset_exit: spec.time_block.offset_exit.clone(),
+                                derivative_offset_exit: spec
+                                    .time_block
+                                    .derivative_offset_exit
+                                    .clone(),
+                                marginal_offset: spec.marginal_offset.clone(),
+                                logslope_offset: spec.logslope_offset.clone(),
+                                z_primary: z_primary.clone(),
+                                weights: spec.weights.clone(),
+                                event: spec.event_target.clone(),
+                                derivative_guard,
+                                probit_scale,
+                                drops_by_block_initial: drops,
+                            });
+                            if drops.0 + drops.1 + drops.2 == 0 {
+                                log::info!(
+                                    "[smgs phase-4b compiled-map] compile_from_raw_grams ok with no drops \
                                  (time {p_time}→{wt}, marginal {p_marg}→{wm}, logslope {p_log}→{wl}); \
                                  production path = compiled_map, skipping apply"
-                            );
-                            return Ok(None);
-                        }
-                        log::info!(
-                            "[smgs phase-4b compiled-map] applying CompiledMap T: \
+                                );
+                                return Ok(None);
+                            }
+                            log::info!(
+                                "[smgs phase-4b compiled-map] applying CompiledMap T: \
                              time {p_time}→{wt}, marginal {p_marg}→{wm}, logslope {p_log}→{wl} \
                              (drops time={}, marginal={}, logslope={}); \
                              production path = compiled_map",
-                            drops.0,
-                            drops.1,
-                            drops.2,
-                        );
-                        let time_pens_bw: Vec<crate::terms::smooth::BlockwisePenalty> = spec
-                            .time_block
-                            .penalties
-                            .iter()
-                            .map(|p| crate::terms::smooth::BlockwisePenalty::new(0..p_time, p.clone()))
-                            .collect();
-                        let applied: CompiledSurvivalDesignsVMExact = apply_compiled_map_to_designs(
-                            &map,
-                            spec.time_block.design_entry.clone(),
-                            spec.time_block.design_exit.clone(),
-                            spec.time_block.design_derivative_exit.clone(),
-                            marginal_design.design.clone(),
-                            logslope_design.design.clone(),
-                            &time_pens_bw,
-                            &marginal_design.penalties,
-                            &logslope_design.penalties,
-                        )?;
-                        let ordering = [
-                            IdBlockOrder::Time,
-                            IdBlockOrder::Marginal,
-                            IdBlockOrder::Logslope,
-                        ];
-                        let lift = SmgsLiftViaT::from_compiled_map(&map, &ordering);
-                        return Ok(Some((applied, lift)));
-                    }
-                    Ok(None) => {}
-                    Err(reason) => {
-                        log::info!(
-                            "[smgs phase-4b compiled-map] closed-form path unavailable ({reason}); \
+                                drops.0,
+                                drops.1,
+                                drops.2,
+                            );
+                            let time_pens_bw: Vec<crate::terms::smooth::BlockwisePenalty> = spec
+                                .time_block
+                                .penalties
+                                .iter()
+                                .map(|p| {
+                                    crate::terms::smooth::BlockwisePenalty::new(
+                                        0..p_time,
+                                        p.clone(),
+                                    )
+                                })
+                                .collect();
+                            let applied: CompiledSurvivalDesignsVMExact =
+                                apply_compiled_map_to_designs(
+                                    &map,
+                                    spec.time_block.design_entry.clone(),
+                                    spec.time_block.design_exit.clone(),
+                                    spec.time_block.design_derivative_exit.clone(),
+                                    marginal_design.design.clone(),
+                                    logslope_design.design.clone(),
+                                    &time_pens_bw,
+                                    &marginal_design.penalties,
+                                    &logslope_design.penalties,
+                                )?;
+                            let ordering = [
+                                IdBlockOrder::Time,
+                                IdBlockOrder::Marginal,
+                                IdBlockOrder::Logslope,
+                            ];
+                            let lift = SmgsLiftViaT::from_compiled_map(&map, &ordering);
+                            return Ok(Some((applied, lift)));
+                        }
+                        Ok(None) => {}
+                        Err(reason) => {
+                            log::info!(
+                                "[smgs phase-4b compiled-map] closed-form path unavailable ({reason}); \
                              falling back to per_term_vm_exact"
-                        );
+                            );
+                        }
                     }
                 }
-            }
 
-            let compiled = compile_survival_parametric_designs_per_term(
-                dq0.clone(),
-                dq1.clone(),
-                dqd1.clone(),
-                &time_partition,
-                m_dq.clone(),
-                m_dqd1.clone(),
-                &marginal_partition,
-                g_dg.clone(),
-                &logslope_partition,
-                &row_hess,
-            )?;
-            let drops_by_block_initial = compiled.drops_by_block;
-            recompile_ctx = Some(SmgsRecompileAfterAcceptContext {
-                dq0,
-                dq1,
-                dqd1,
-                m_dq,
-                m_dqd1,
-                g_dg,
-                time_partition: time_partition.clone(),
-                marginal_partition: marginal_partition.clone(),
-                logslope_partition: logslope_partition.clone(),
-                offset_entry: spec.time_block.offset_entry.clone(),
-                offset_exit: spec.time_block.offset_exit.clone(),
-                derivative_offset_exit: spec.time_block.derivative_offset_exit.clone(),
-                marginal_offset: spec.marginal_offset.clone(),
-                logslope_offset: spec.logslope_offset.clone(),
-                z_primary: z_primary.clone(),
-                weights: spec.weights.clone(),
-                event: spec.event_target.clone(),
-                derivative_guard,
-                probit_scale,
-                drops_by_block_initial,
-            });
-            let (dt, dm, dg) = drops_by_block_initial;
-            if dt + dm + dg == 0 {
-                // No aliasing → no reduction needed. Skip the apply.
-                return Ok(None);
-            }
-            log::info!(
-                "[smgs phase-4b active] applying per-term V: \
+                let compiled = compile_survival_parametric_designs_per_term(
+                    dq0.clone(),
+                    dq1.clone(),
+                    dqd1.clone(),
+                    &time_partition,
+                    m_dq.clone(),
+                    m_dqd1.clone(),
+                    &marginal_partition,
+                    g_dg.clone(),
+                    &logslope_partition,
+                    &row_hess,
+                )?;
+                let drops_by_block_initial = compiled.drops_by_block;
+                recompile_ctx = Some(SmgsRecompileAfterAcceptContext {
+                    dq0,
+                    dq1,
+                    dqd1,
+                    m_dq,
+                    m_dqd1,
+                    g_dg,
+                    time_partition: time_partition.clone(),
+                    marginal_partition: marginal_partition.clone(),
+                    logslope_partition: logslope_partition.clone(),
+                    offset_entry: spec.time_block.offset_entry.clone(),
+                    offset_exit: spec.time_block.offset_exit.clone(),
+                    derivative_offset_exit: spec.time_block.derivative_offset_exit.clone(),
+                    marginal_offset: spec.marginal_offset.clone(),
+                    logslope_offset: spec.logslope_offset.clone(),
+                    z_primary: z_primary.clone(),
+                    weights: spec.weights.clone(),
+                    event: spec.event_target.clone(),
+                    derivative_guard,
+                    probit_scale,
+                    drops_by_block_initial,
+                });
+                let (dt, dm, dg) = drops_by_block_initial;
+                if dt + dm + dg == 0 {
+                    // No aliasing → no reduction needed. Skip the apply.
+                    return Ok(None);
+                }
+                log::info!(
+                    "[smgs phase-4b active] applying per-term V: \
                  time {}→{}, marginal {}→{}, logslope {}→{} \
                  (drops time={}, marginal={}, logslope={})",
-                p_time,
-                p_time.saturating_sub(dt),
-                p_marg,
-                p_marg.saturating_sub(dm),
-                p_log,
-                p_log.saturating_sub(dg),
-                dt,
-                dm,
-                dg,
-            );
-            let applied: CompiledSurvivalDesignsVMExact = apply_per_term_vm_exact(
-                &compiled,
-                &time_partition,
-                &marginal_partition,
-                &logslope_partition,
-                spec.time_block.design_entry.clone(),
-                spec.time_block.design_exit.clone(),
-                spec.time_block.design_derivative_exit.clone(),
-                marginal_design.design.clone(),
-                logslope_design.design.clone(),
-                &spec
-                    .time_block
-                    .penalties
-                    .iter()
-                    .map(|p| crate::terms::smooth::BlockwisePenalty::new(0..p_time, p.clone()))
-                    .collect::<Vec<_>>(),
-                &marginal_design.penalties,
-                &logslope_design.penalties,
-            )?;
-            // Flatten per-term V's in global compile order: time,
-            // then marginal, then logslope. Matches the ordering
-            // `apply_per_term_vm_exact` used to build `t_full` and
-            // `compiled.r_lw_per_term`.
-            let mut v_per_block: Vec<ndarray::Array2<f64>> = Vec::new();
-            v_per_block.extend(compiled.v_time_per_term.iter().cloned());
-            v_per_block.extend(compiled.v_marginal_per_term.iter().cloned());
-            v_per_block.extend(compiled.v_logslope_per_term.iter().cloned());
-            let lift = SmgsLiftViaT::from_v_and_r(&v_per_block, &compiled.r_lw_per_term);
-            Ok(Some((applied, lift)))
-        })();
+                    p_time,
+                    p_time.saturating_sub(dt),
+                    p_marg,
+                    p_marg.saturating_sub(dm),
+                    p_log,
+                    p_log.saturating_sub(dg),
+                    dt,
+                    dm,
+                    dg,
+                );
+                let applied: CompiledSurvivalDesignsVMExact = apply_per_term_vm_exact(
+                    &compiled,
+                    &time_partition,
+                    &marginal_partition,
+                    &logslope_partition,
+                    spec.time_block.design_entry.clone(),
+                    spec.time_block.design_exit.clone(),
+                    spec.time_block.design_derivative_exit.clone(),
+                    marginal_design.design.clone(),
+                    logslope_design.design.clone(),
+                    &spec
+                        .time_block
+                        .penalties
+                        .iter()
+                        .map(|p| crate::terms::smooth::BlockwisePenalty::new(0..p_time, p.clone()))
+                        .collect::<Vec<_>>(),
+                    &marginal_design.penalties,
+                    &logslope_design.penalties,
+                )?;
+                // Flatten per-term V's in global compile order: time,
+                // then marginal, then logslope. Matches the ordering
+                // `apply_per_term_vm_exact` used to build `t_full` and
+                // `compiled.r_lw_per_term`.
+                let mut v_per_block: Vec<ndarray::Array2<f64>> = Vec::new();
+                v_per_block.extend(compiled.v_time_per_term.iter().cloned());
+                v_per_block.extend(compiled.v_marginal_per_term.iter().cloned());
+                v_per_block.extend(compiled.v_logslope_per_term.iter().cloned());
+                let lift = SmgsLiftViaT::from_v_and_r(&v_per_block, &compiled.r_lw_per_term);
+                Ok(Some((applied, lift)))
+            })();
         match attempt {
             Ok(Some((applied, lift))) => {
                 // V+M-exact compiled .design swapped into clones of the
@@ -20641,7 +20640,8 @@ pub fn fit_survival_marginal_slope_terms(
         let mut flat = Array1::<f64>::zeros(total);
         for block in &solved.fit.blocks {
             let p = block.beta.len();
-            flat.slice_mut(ndarray::s![off..off + p]).assign(&block.beta);
+            flat.slice_mut(ndarray::s![off..off + p])
+                .assign(&block.beta);
             off += p;
         }
         solved.fit.beta = flat;

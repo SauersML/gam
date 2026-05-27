@@ -48,6 +48,7 @@
 use std::sync::OnceLock;
 
 use super::error::GpuError;
+use crate::gpu::error::GpuResultExt;
 use crate::gpu_err;
 
 #[cfg(target_os = "linux")]
@@ -713,10 +714,12 @@ impl PirlsRowBackend {
             }
         })?;
         let ctx = super::runtime::cuda_context_for(runtime.selected_device().ordinal).ok_or_else(
-            || gpu_err!(
+            || {
+                gpu_err!(
                     "pirls_row backend: failed to create CUDA context for device {}",
                     runtime.selected_device().ordinal
-                ),
+                )
+            },
         )?;
         Ok(Self {
             inner: PirlsRowBackendLinux {
@@ -745,11 +748,13 @@ impl PirlsRowBackend {
             return Ok(existing.clone());
         }
         let source = cuda_source_for(family, curvature);
-        let ptx = cudarc::nvrtc::compile_ptx(source).gpu_ctx_with(|err| format!(
+        let ptx = cudarc::nvrtc::compile_ptx(source).gpu_ctx_with(|err| {
+            format!(
                 "pirls_row NVRTC compile failed for {family}/{curv}: {err}",
                 family = family.as_str(),
                 curv = curvature.as_str(),
-            ))?;
+            )
+        })?;
         let module = self
             .inner
             .ctx
@@ -800,11 +805,13 @@ impl PirlsRowBackend {
             return Ok(existing.clone());
         }
         let source = spec.cuda_source(curvature);
-        let ptx = cudarc::nvrtc::compile_ptx(source).gpu_ctx_with(|err| format!(
+        let ptx = cudarc::nvrtc::compile_ptx(source).gpu_ctx_with(|err| {
+            format!(
                 "pirls_row JIT NVRTC compile failed for spec_id={} curvature={}: {err}",
                 spec.spec_id,
                 curvature.as_str(),
-            ))?;
+            )
+        })?;
         let module = self
             .inner
             .ctx
@@ -1020,17 +1027,20 @@ pub fn launch_row_reweight_on_stream(
         crate::gpu_bail!("row reweight buffers shape {} mismatches n={n}", out.n);
     }
     let module = backend.module_for(family, curvature)?;
-    let func =
-        module
-            .load_function(family.kernel_name())
-            .gpu_ctx_with(|err| format!(
-                    "row reweight load_function({}): {err}",
-                    family.kernel_name()
-                ))?;
+    let func = module
+        .load_function(family.kernel_name())
+        .gpu_ctx_with(|err| {
+            format!(
+                "row reweight load_function({}): {err}",
+                family.kernel_name()
+            )
+        })?;
     const THREADS_PER_BLOCK: u32 = 256;
-    let n_u32 = u32::try_from(n).map_err(|_| gpu_err!("n={n} exceeds u32 for row reweight grid sizing"))?;
+    let n_u32 =
+        u32::try_from(n).map_err(|_| gpu_err!("n={n} exceeds u32 for row reweight grid sizing"))?;
     let grid_x = n_u32.div_ceil(THREADS_PER_BLOCK).max(1);
-    let n_i32 = i32::try_from(n).map_err(|_| gpu_err!("n={n} exceeds i32 for row reweight kernel argument"))?;
+    let n_i32 = i32::try_from(n)
+        .map_err(|_| gpu_err!("n={n} exceeds i32 for row reweight kernel argument"))?;
     let cfg = LaunchConfig {
         grid_dim: (grid_x, 1, 1),
         block_dim: (THREADS_PER_BLOCK, 1, 1),
@@ -1087,9 +1097,11 @@ pub fn launch_row_reweight_jit_on_stream(
         .load_function(&kernel_name)
         .gpu_ctx_with(|err| format!("JIT row reweight load_function({kernel_name}): {err}"))?;
     const THREADS_PER_BLOCK: u32 = 256;
-    let n_u32 = u32::try_from(n).map_err(|_| gpu_err!("n={n} exceeds u32 for JIT row reweight grid sizing"))?;
+    let n_u32 = u32::try_from(n)
+        .map_err(|_| gpu_err!("n={n} exceeds u32 for JIT row reweight grid sizing"))?;
     let grid_x = n_u32.div_ceil(THREADS_PER_BLOCK).max(1);
-    let n_i32 = i32::try_from(n).map_err(|_| gpu_err!("n={n} exceeds i32 for JIT row reweight kernel argument"))?;
+    let n_i32 = i32::try_from(n)
+        .map_err(|_| gpu_err!("n={n} exceeds i32 for JIT row reweight kernel argument"))?;
     let cfg = LaunchConfig {
         grid_dim: (grid_x, 1, 1),
         block_dim: (THREADS_PER_BLOCK, 1, 1),
@@ -1421,7 +1433,7 @@ fn bernoulli_cloglog_body(curvature: CurvatureMode) -> String {
 #[cfg(test)]
 mod pirls_row_gpu_tests {
     use super::*;
-use crate::gpu::error::GpuResultExt;
+    use crate::gpu::error::GpuResultExt;
 
     fn assert_close(label: &str, got: f64, expected: f64, tol: f64) {
         if !(got.is_finite() && expected.is_finite()) {
@@ -2343,18 +2355,18 @@ use crate::gpu::error::GpuResultExt;
                 // Family-specific response vectors stay in domain so the
                 // CPU oracle is well-defined for every row.
                 let ys: Vec<f64> = match family {
-                    PirlsRowFamily::GammaLog => (0..N)
-                        .map(|i| 0.10 + 0.05 * ((i % 97) as f64))
-                        .collect(),
+                    PirlsRowFamily::GammaLog => {
+                        (0..N).map(|i| 0.10 + 0.05 * ((i % 97) as f64)).collect()
+                    }
                     PirlsRowFamily::PoissonLog => (0..N).map(|i| (i % 11) as f64).collect(),
                     PirlsRowFamily::GaussianIdentity => (0..N)
                         .map(|i| -3.0 + 6.0 * (i as f64) / ((N - 1) as f64))
                         .collect(),
                     PirlsRowFamily::BernoulliLogit
                     | PirlsRowFamily::BernoulliProbit
-                    | PirlsRowFamily::BernoulliCLogLog => (0..N)
-                        .map(|i| if i % 2 == 0 { 0.0 } else { 1.0 })
-                        .collect(),
+                    | PirlsRowFamily::BernoulliCLogLog => {
+                        (0..N).map(|i| if i % 2 == 0 { 0.0 } else { 1.0 }).collect()
+                    }
                 };
 
                 let mut eta_dev = stream.alloc_zeros::<f64>(N).expect("alloc eta_dev");
@@ -2370,8 +2382,7 @@ use crate::gpu::error::GpuResultExt;
                     .memcpy_htod(priors.as_slice(), &mut prior_dev)
                     .expect("upload prior");
 
-                let mut out_obs =
-                    RowOutputDevBuffers::allocate(&stream, N).expect("alloc out_obs");
+                let mut out_obs = RowOutputDevBuffers::allocate(&stream, N).expect("alloc out_obs");
                 launch_row_reweight_on_stream(
                     backend,
                     family,
@@ -2626,12 +2637,7 @@ use crate::gpu::error::GpuResultExt;
             // (family, raw_body, distinct spec_id, y vector builder).
             // spec_ids are disjoint 64-bit tags so the JIT module cache
             // creates one fresh module per family.
-            let cases: [(
-                PirlsRowFamily,
-                &str,
-                u64,
-                fn(usize) -> Vec<f64>,
-            ); 6] = [
+            let cases: [(PirlsRowFamily, &str, u64, fn(usize) -> Vec<f64>); 6] = [
                 (
                     PirlsRowFamily::GaussianIdentity,
                     raw_gaussian,
@@ -2652,41 +2658,25 @@ use crate::gpu::error::GpuResultExt;
                     PirlsRowFamily::GammaLog,
                     raw_gamma,
                     0x5242_3033_474d_414cu64,
-                    |n| {
-                        (0..n)
-                            .map(|i| 0.10 + 0.05 * ((i % 97) as f64))
-                            .collect()
-                    },
+                    |n| (0..n).map(|i| 0.10 + 0.05 * ((i % 97) as f64)).collect(),
                 ),
                 (
                     PirlsRowFamily::BernoulliLogit,
                     raw_logit,
                     0x5242_3034_4c47_4954u64,
-                    |n| {
-                        (0..n)
-                            .map(|i| if i % 2 == 0 { 0.0 } else { 1.0 })
-                            .collect()
-                    },
+                    |n| (0..n).map(|i| if i % 2 == 0 { 0.0 } else { 1.0 }).collect(),
                 ),
                 (
                     PirlsRowFamily::BernoulliProbit,
                     raw_probit,
                     0x5242_3035_5052_4254u64,
-                    |n| {
-                        (0..n)
-                            .map(|i| if i % 2 == 0 { 0.0 } else { 1.0 })
-                            .collect()
-                    },
+                    |n| (0..n).map(|i| if i % 2 == 0 { 0.0 } else { 1.0 }).collect(),
                 ),
                 (
                     PirlsRowFamily::BernoulliCLogLog,
                     raw_cloglog,
                     0x5242_3036_434c_4f47u64,
-                    |n| {
-                        (0..n)
-                            .map(|i| if i % 2 == 0 { 0.0 } else { 1.0 })
-                            .collect()
-                    },
+                    |n| (0..n).map(|i| if i % 2 == 0 { 0.0 } else { 1.0 }).collect(),
                 ),
             ];
 
@@ -2703,8 +2693,7 @@ use crate::gpu::error::GpuResultExt;
                     .expect("up prior");
 
                 let spec = JitFamilySpec::raw(spec_id, raw_body);
-                let mut out_jit =
-                    RowOutputDevBuffers::allocate(&stream, N).expect("alloc jit out");
+                let mut out_jit = RowOutputDevBuffers::allocate(&stream, N).expect("alloc jit out");
                 launch_row_reweight_jit_on_stream(
                     backend,
                     &spec,

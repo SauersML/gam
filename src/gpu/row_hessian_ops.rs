@@ -34,6 +34,10 @@ use std::sync::OnceLock;
 use cudarc::driver::{CudaModule, CudaStream, LaunchConfig, PushKernelArg};
 
 use super::error::GpuError;
+#[cfg(target_os = "linux")]
+use crate::gpu::error::GpuResultExt;
+#[cfg(target_os = "linux")]
+use crate::gpu_err;
 
 /// Hard ceiling on `r` (primary local dimension). Matches the BMS-FLEX row
 /// kernel's [`super::bms_flex_row::MAX_R`] so the same cached Hessian
@@ -102,27 +106,27 @@ impl<'a> RowHessianMatvecInputs<'a> {
         }
         if self.r > MAX_R {
             crate::gpu_bail!(
-                    "row_hessian_matvec inputs: r={} exceeds MAX_R={MAX_R}",
-                    self.r
-                );
+                "row_hessian_matvec inputs: r={} exceeds MAX_R={MAX_R}",
+                self.r
+            );
         }
         if self.h_rows.len() != self.n_rows * self.r * self.r {
             crate::gpu_bail!(
-                    "row_hessian_matvec inputs: h_rows.len()={} != n_rows({})*r({})*r = {}",
-                    self.h_rows.len(),
-                    self.n_rows,
-                    self.r,
-                    self.n_rows * self.r * self.r
-                );
+                "row_hessian_matvec inputs: h_rows.len()={} != n_rows({})*r({})*r = {}",
+                self.h_rows.len(),
+                self.n_rows,
+                self.r,
+                self.n_rows * self.r * self.r
+            );
         }
         if self.v_rows.len() != self.n_rows * self.r {
             crate::gpu_bail!(
-                    "row_hessian_matvec inputs: v_rows.len()={} != n_rows({})*r({}) = {}",
-                    self.v_rows.len(),
-                    self.n_rows,
-                    self.r,
-                    self.n_rows * self.r
-                );
+                "row_hessian_matvec inputs: v_rows.len()={} != n_rows({})*r({}) = {}",
+                self.v_rows.len(),
+                self.n_rows,
+                self.r,
+                self.n_rows * self.r
+            );
         }
         Ok(())
     }
@@ -138,18 +142,18 @@ impl<'a> RowHessianDiagInputs<'a> {
         }
         if self.r > MAX_R {
             crate::gpu_bail!(
-                    "row_hessian_diag inputs: r={} exceeds MAX_R={MAX_R}",
-                    self.r
-                );
+                "row_hessian_diag inputs: r={} exceeds MAX_R={MAX_R}",
+                self.r
+            );
         }
         if self.h_rows.len() != self.n_rows * self.r * self.r {
             crate::gpu_bail!(
-                    "row_hessian_diag inputs: h_rows.len()={} != n_rows({})*r({})*r = {}",
-                    self.h_rows.len(),
-                    self.n_rows,
-                    self.r,
-                    self.n_rows * self.r * self.r
-                );
+                "row_hessian_diag inputs: h_rows.len()={} != n_rows({})*r({})*r = {}",
+                self.h_rows.len(),
+                self.n_rows,
+                self.r,
+                self.n_rows * self.r * self.r
+            );
         }
         Ok(())
     }
@@ -254,14 +258,15 @@ impl RowOpsBackend {
                     }
                 })?;
                 let ctx = super::runtime::cuda_context_for(runtime.selected_device().ordinal)
-                    .ok_or_else(|| gpu_err!(
+                    .ok_or_else(|| {
+                        gpu_err!(
                             "row_hessian_ops backend: failed to create CUDA context for device {}",
                             runtime.selected_device().ordinal
-                        ))?;
+                        )
+                    })?;
                 let stream = ctx.default_stream();
-                let ptx = cudarc::nvrtc::compile_ptx(ROW_KERNEL_SOURCE).map_err(|err| {
-                    gpu_err!("row_hessian_ops NVRTC compile failed: {err}")
-                })?;
+                let ptx = cudarc::nvrtc::compile_ptx(ROW_KERNEL_SOURCE)
+                    .map_err(|err| gpu_err!("row_hessian_ops NVRTC compile failed: {err}"))?;
                 let module = ctx
                     .load_module(ptx)
                     .gpu_ctx("row_hessian_ops module load failed")?;
@@ -341,8 +346,10 @@ fn launch_matvec_linux(
         block_dim: (ROW_HV_THREADS, 1, 1),
         shared_mem_bytes: 0,
     };
-    let n_i32 = i32::try_from(n).map_err(|_| gpu_err!("row_hessian_matvec: n_rows={n} exceeds i32 range"))?;
-    let r_i32 = i32::try_from(r).map_err(|_| gpu_err!("row_hessian_matvec: r={r} exceeds i32 range"))?;
+    let n_i32 = i32::try_from(n)
+        .map_err(|_| gpu_err!("row_hessian_matvec: n_rows={n} exceeds i32 range"))?;
+    let r_i32 =
+        i32::try_from(r).map_err(|_| gpu_err!("row_hessian_matvec: r={r} exceeds i32 range"))?;
 
     let mut builder = stream.launch_builder(&func);
     builder
@@ -391,8 +398,10 @@ fn launch_diag_linux(inputs: RowHessianDiagInputs<'_>) -> Result<RowHessianDiagO
         block_dim: (ROW_HV_THREADS, 1, 1),
         shared_mem_bytes: 0,
     };
-    let n_i32 = i32::try_from(n).map_err(|_| gpu_err!("row_hessian_diag: n_rows={n} exceeds i32 range"))?;
-    let r_i32 = i32::try_from(r).map_err(|_| gpu_err!("row_hessian_diag: r={r} exceeds i32 range"))?;
+    let n_i32 =
+        i32::try_from(n).map_err(|_| gpu_err!("row_hessian_diag: n_rows={n} exceeds i32 range"))?;
+    let r_i32 =
+        i32::try_from(r).map_err(|_| gpu_err!("row_hessian_diag: r={r} exceeds i32 range"))?;
 
     let mut builder = stream.launch_builder(&func);
     builder.arg(&n_i32).arg(&r_i32).arg(&d_h).arg(&mut d_d);
@@ -454,9 +463,9 @@ pub(crate) fn cpu_row_hessian_diag(inputs: &RowHessianDiagInputs<'_>) -> Vec<f64
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::gpu_err;
-use crate::gpu_bail;
-use crate::gpu::error::GpuResultExt;
+    use crate::gpu::error::GpuResultExt;
+    use crate::gpu_bail;
+    use crate::gpu_err;
 
     /// Deterministic non-trivial Hessian fixture. Generates per-row
     /// symmetric `r×r` blocks via `H_i = A_i + A_iᵀ + r·I` for a

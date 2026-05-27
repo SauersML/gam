@@ -370,7 +370,9 @@ pub fn create_basis<O: BasisOutputFormat>(
         }
         BasisFamily::ISpline => {
             if O::LAYOUT.is_sparse() {
-                crate::bail_invalid_basis!("BasisFamily::ISpline does not support sparse output; use Dense");
+                crate::bail_invalid_basis!(
+                    "BasisFamily::ISpline does not support sparse output; use Dense"
+                );
             }
             let dense = create_ispline_dense(data, knotvec.view(), degree)?;
             Ok((O::from_dense(dense)?, knotvec))
@@ -1416,9 +1418,7 @@ fn bspline_raw_row_chunk(
     let chunk = data.slice(s![start..end]);
     if let Some((domain_start, period, num_basis)) = periodic {
         if period <= 0.0 {
-            crate::bail_invalid_basis!(
-                "periodic B-spline period must be positive, got {period}"
-            );
+            crate::bail_invalid_basis!("periodic B-spline period must be positive, got {period}");
         }
         let wrapped = chunk.mapv(|x| wrap_to_period(x, domain_start, period));
         let (extended, _) = create_basis::<Dense>(
@@ -4925,9 +4925,11 @@ impl LatentCoordDesignDerivative {
                 ..
             } => (centers, radial_kind),
             LatentCoordDesignDerivativeBasis::Jet { .. } => {
-                crate::bail_invalid_basis!("LatentCoordDesignDerivative::kernel_axis_scalar called on Jet basis; \
+                crate::bail_invalid_basis!(
+                    "LatentCoordDesignDerivative::kernel_axis_scalar called on Jet basis; \
                      this helper is radial-only"
-                        .to_string(),);
+                        .to_string(),
+                );
             }
         };
         let t_row = self.latent.row(row);
@@ -5482,8 +5484,10 @@ impl ImplicitDesignPsiDerivative {
                 })
                 .collect();
             if err_flag.load(std::sync::atomic::Ordering::Relaxed) {
-                crate::bail_invalid_basis!("radial scalar evaluation failed during streaming accumulate_knot_vector"
-                        .into(),);
+                crate::bail_invalid_basis!(
+                    "radial scalar evaluation failed during streaming accumulate_knot_vector"
+                        .into(),
+                );
             }
             let mut tot = Array1::<f64>::zeros(k);
             for p in ps {
@@ -5548,7 +5552,9 @@ impl ImplicitDesignPsiDerivative {
                 })
                 .collect();
             if err_flag.load(std::sync::atomic::Ordering::Relaxed) {
-                crate::bail_invalid_basis!("radial scalar evaluation failed during streaming forward_mul".into(),);
+                crate::bail_invalid_basis!(
+                    "radial scalar evaluation failed during streaming forward_mul".into(),
+                );
             }
             let mut res = Array1::<f64>::zeros(n);
             for (s, vs) in cr {
@@ -5612,7 +5618,9 @@ impl ImplicitDesignPsiDerivative {
             });
         }
         if err_flag.load(std::sync::atomic::Ordering::Relaxed) {
-            crate::bail_invalid_basis!("radial scalar evaluation failed during streaming materialize".into(),);
+            crate::bail_invalid_basis!(
+                "radial scalar evaluation failed during streaming materialize".into(),
+            );
         }
         Ok(self.project_matrix(raw))
     }
@@ -7101,7 +7109,9 @@ fn build_aniso_design_psi_derivatives_shared(
         });
     }
     if err_flag.load(std::sync::atomic::Ordering::Relaxed) {
-        crate::bail_invalid_basis!("radial scalar evaluation failed during aniso derivative construction".into(),);
+        crate::bail_invalid_basis!(
+            "radial scalar evaluation failed during aniso derivative construction".into(),
+        );
     }
 
     let op = ImplicitDesignPsiDerivative::new(
@@ -7270,7 +7280,9 @@ fn build_scalar_design_psi_derivatives_shared(
         });
     }
     if err_flag.load(std::sync::atomic::Ordering::Relaxed) {
-        crate::bail_invalid_basis!("radial scalar evaluation failed during scalar derivative construction".into(),);
+        crate::bail_invalid_basis!(
+            "radial scalar evaluation failed during scalar derivative construction".into(),
+        );
     }
 
     let op = ImplicitDesignPsiDerivative::new(
@@ -7505,8 +7517,10 @@ fn select_equal_mass_covar_representative_centers(
         );
     }
     if d == 0 {
-        crate::bail_invalid_basis!("equal-mass covariate-representative center selection requires at least one column"
-                .to_string(),);
+        crate::bail_invalid_basis!(
+            "equal-mass covariate-representative center selection requires at least one column"
+                .to_string(),
+        );
     }
 
     let mut split_dim = 0usize;
@@ -7556,9 +7570,7 @@ fn select_kmeans_centers(
     let n = data.nrows();
     let d = data.ncols();
     if num_centers > n {
-        crate::bail_invalid_basis!(
-            "kmeans requested {num_centers} centers but data has {n} rows"
-        );
+        crate::bail_invalid_basis!("kmeans requested {num_centers} centers but data has {n} rows");
     }
     const KMEANS_PILOT_MAX_ROWS: usize = 20_000;
     if n > KMEANS_PILOT_MAX_ROWS {
@@ -7754,7 +7766,10 @@ pub fn build_bspline_basis_1d(
                 {
                     crate::bail_invalid_basis!(
                         "periodic B-spline knot range ({}, {}) conflicts with cyclic boundary ({}, {})",
-                        data_range.0, data_range.1, boundary_start, boundary_end
+                        data_range.0,
+                        data_range.1,
+                        boundary_start,
+                        boundary_end
                     );
                 }
             }
@@ -7798,7 +7813,9 @@ pub fn build_bspline_basis_1d(
             );
         }
         if !spec.boundary_conditions.is_free() {
-            crate::bail_invalid_basis!("periodic B-splines cannot also declare endpoint boundary conditions");
+            crate::bail_invalid_basis!(
+                "periodic B-splines cannot also declare endpoint boundary conditions"
+            );
         }
         let knots = cyclic_uniform_knot_vector(start, end, spec.degree, num_basis);
         let s_bend_raw = create_cyclic_difference_penalty_matrix(num_basis, spec.penalty_order)?;
@@ -8044,9 +8061,11 @@ pub fn build_bspline_basis_1d(
                 (Some(basis), None, knots)
             }
             BSplineKnotSpec::PeriodicUniform { .. } => {
-                crate::bail_invalid_basis!("periodic B-spline must be handled before storage selection; \
+                crate::bail_invalid_basis!(
+                    "periodic B-spline must be handled before storage selection; \
                      this branch is reserved for non-periodic knot specs"
-                        .to_string(),);
+                        .to_string(),
+                );
             }
             BSplineKnotSpec::Automatic {
                 num_internal_knots,
@@ -8100,9 +8119,11 @@ pub fn build_bspline_basis_1d(
                 (None, Some((*basis).clone()), knots)
             }
             BSplineKnotSpec::PeriodicUniform { .. } => {
-                crate::bail_invalid_basis!("periodic B-spline must be handled before storage selection; \
+                crate::bail_invalid_basis!(
+                    "periodic B-spline must be handled before storage selection; \
                      this branch is reserved for non-periodic knot specs"
-                        .to_string(),);
+                        .to_string(),
+                );
             }
             BSplineKnotSpec::Automatic {
                 num_internal_knots,
@@ -8227,11 +8248,13 @@ pub fn build_bspline_basis_1d(
             BSplineIdentifiability::RemoveLinearTrend
             | BSplineIdentifiability::OrthogonalToDesignColumns { .. }
             | BSplineIdentifiability::FrozenTransform { .. } => {
-                crate::bail_invalid_basis!("sparse B-spline identifiability only supports None or \
+                crate::bail_invalid_basis!(
+                    "sparse B-spline identifiability only supports None or \
                      WeightedSumToZero; RemoveLinearTrend, \
                      OrthogonalToDesignColumns, and FrozenTransform require \
                      the dense path"
-                        .to_string(),);
+                        .to_string(),
+                );
             }
         }
     } else {
@@ -8897,9 +8920,7 @@ fn validate_psd_penalty(
     guidance: &str,
 ) -> Result<PsdSpectralSummary, BasisError> {
     if penalty.nrows() != penalty.ncols() {
-        crate::bail_dim_basis!(
-            "{context}: penalty matrix must be square for PSD validation"
-        );
+        crate::bail_dim_basis!("{context}: penalty matrix must be square for PSD validation");
     }
     if penalty.nrows() == 0 {
         return Ok(PsdSpectralSummary {
@@ -9241,7 +9262,9 @@ fn build_nullspace_shrinkage_penalty(
     penalty: &Array2<f64>,
 ) -> Result<Option<CanonicalPenaltyBlock>, BasisError> {
     if penalty.nrows() != penalty.ncols() {
-        crate::bail_dim_basis!("penalty matrix must be square when building nullspace shrinkage penalty");
+        crate::bail_dim_basis!(
+            "penalty matrix must be square when building nullspace shrinkage penalty"
+        );
     }
     if penalty.nrows() == 0 {
         return Ok(None);
@@ -9844,7 +9867,9 @@ fn matern_aniso_extended_radial_scalars(
     nu: MaternNu,
 ) -> Result<(f64, f64, f64, f64, f64), BasisError> {
     if !r.is_finite() || r < 0.0 {
-        crate::bail_invalid_basis!("Matérn extended radial scalar distance must be finite and non-negative");
+        crate::bail_invalid_basis!(
+            "Matérn extended radial scalar distance must be finite and non-negative"
+        );
     }
     if !length_scale.is_finite() || length_scale <= 0.0 {
         crate::bail_invalid_basis!("Matérn length_scale must be finite and positive");
@@ -11562,7 +11587,9 @@ fn duchon_kernel_radial_triplet(
         }
         Some(length_scale) => {
             if !length_scale.is_finite() || length_scale <= 0.0 {
-                crate::bail_invalid_basis!("Duchon hybrid length_scale must be finite and positive");
+                crate::bail_invalid_basis!(
+                    "Duchon hybrid length_scale must be finite and positive"
+                );
             }
             let kappa = 1.0 / length_scale.max(1e-300);
             let coeffs_local;
@@ -13226,7 +13253,9 @@ pub fn build_matern_collocation_operator_matrices(
                     stable_euclidean_norm((0..d).map(|c| centers[[k, c]] - centers[[j, c]]))
                 };
                 if matches!(nu, MaternNu::Half) && r <= R_EPS && d > 1 {
-                    crate::bail_invalid_basis!("Matérn nu=1/2 has singular Laplacian at center collisions for d>1; choose nu>=3/2 or avoid collocation at centers");
+                    crate::bail_invalid_basis!(
+                        "Matérn nu=1/2 has singular Laplacian at center collisions for d>1; choose nu>=3/2 or avoid collocation at centers"
+                    );
                 }
                 let (phi, _, phi_rr, phi_r_over_r) =
                     if matches!(nu, MaternNu::Half) && r <= R_EPS && d == 1 {
@@ -14334,9 +14363,7 @@ fn validate_duchon_kernel_orders(
     //     iff `2(p+s) > d`. Below that threshold the radial kernel value
     //     diverges and there is nothing to evaluate.
     if !s_order.is_finite() || s_order < 0.0 {
-        crate::bail_invalid_basis!(
-            "Duchon spectral power must be finite and ≥ 0; got s={s_order}"
-        );
+        crate::bail_invalid_basis!("Duchon spectral power must be finite and ≥ 0; got s={s_order}");
     }
     if length_scale.is_none() && 2.0 * s_order >= k_dim as f64 {
         crate::bail_invalid_basis!(
@@ -15464,9 +15491,7 @@ fn validate_lat_lon_matrix(
         );
     }
     if data.nrows() == 0 {
-        crate::bail_invalid_basis!(
-            "{context} requires at least one row"
-        );
+        crate::bail_invalid_basis!("{context} requires at least one row");
     }
     let (lat_lo, lat_hi, unit) = if radians {
         (
@@ -15913,7 +15938,9 @@ pub(crate) fn weighted_coefficient_sum_to_zero_transform(
         return Err(BasisError::InsufficientColumnsForConstraint { found: k });
     }
     if weights.iter().any(|w| !w.is_finite() || *w < 0.0) {
-        crate::bail_invalid_basis!("sphere coefficient constraint weights must be finite and non-negative");
+        crate::bail_invalid_basis!(
+            "sphere coefficient constraint weights must be finite and non-negative"
+        );
     }
     let norm = weights.iter().map(|w| w * w).sum::<f64>().sqrt();
     if norm <= 0.0 {
@@ -15978,7 +16005,8 @@ pub fn select_spherical_farthest_point_centers(
     if num_centers > n {
         crate::bail_invalid_basis!(
             "requested {} spherical centers but only {} rows are available",
-            num_centers, n
+            num_centers,
+            n
         );
     }
 
@@ -16400,9 +16428,7 @@ fn build_spherical_harmonic_basis(
         crate::bail_invalid_basis!("spherical-harmonic max_degree must be >= 1");
     }
     if l_max > 32 {
-        crate::bail_invalid_basis!(
-            "spherical-harmonic max_degree {l_max} too large; cap is 32"
-        );
+        crate::bail_invalid_basis!("spherical-harmonic max_degree {l_max} too large; cap is 32");
     }
     if !(1..=4).contains(&spec.penalty_order) {
         crate::bail_invalid_basis!(
@@ -17738,7 +17764,9 @@ fn prepare_periodic_duchon_centers_1d(
     centers: Array2<f64>,
 ) -> Result<(Array2<f64>, f64, f64), BasisError> {
     if centers.ncols() != 1 {
-        crate::bail_invalid_basis!("periodic Duchon smooths currently require exactly one covariate");
+        crate::bail_invalid_basis!(
+            "periodic Duchon smooths currently require exactly one covariate"
+        );
     }
     let left = centers
         .column(0)
@@ -17810,7 +17838,9 @@ fn build_periodic_duchon_basis_log_kappa_derivativeswithworkspace(
     workspace: &mut BasisWorkspace,
 ) -> Result<BasisPsiDerivativeBundle, BasisError> {
     if data.ncols() != 1 {
-        crate::bail_invalid_basis!("periodic Duchon log-kappa derivatives require exactly one covariate");
+        crate::bail_invalid_basis!(
+            "periodic Duchon log-kappa derivatives require exactly one covariate"
+        );
     }
     let length_scale = spec.length_scale.ok_or_else(|| {
         BasisError::InvalidInput(
@@ -20609,7 +20639,9 @@ pub fn duchon_radial_first_derivative_nd(
     let n_centers = centers.nrows();
     let dim = centers.ncols();
     if dim == 0 {
-        crate::bail_invalid_basis!("duchon_radial_first_derivative_nd: centers must have at least one column".into(),);
+        crate::bail_invalid_basis!(
+            "duchon_radial_first_derivative_nd: centers must have at least one column".into(),
+        );
     }
     if t.ncols() != dim {
         crate::bail_invalid_basis!(
@@ -20699,7 +20731,9 @@ pub fn duchon_radial_second_derivative_nd(
     let n_centers = centers.nrows();
     let dim = centers.ncols();
     if dim == 0 {
-        crate::bail_invalid_basis!("duchon_radial_second_derivative_nd: centers must have at least one column".into(),);
+        crate::bail_invalid_basis!(
+            "duchon_radial_second_derivative_nd: centers must have at least one column".into(),
+        );
     }
     if t.ncols() != dim {
         crate::bail_invalid_basis!(
@@ -20766,7 +20800,9 @@ pub fn duchon_radial_third_derivative_nd(
     let n_centers = centers.nrows();
     let dim = centers.ncols();
     if dim == 0 {
-        crate::bail_invalid_basis!("duchon_radial_third_derivative_nd: centers must have at least one column".into(),);
+        crate::bail_invalid_basis!(
+            "duchon_radial_third_derivative_nd: centers must have at least one column".into(),
+        );
     }
     if t.ncols() != dim {
         crate::bail_invalid_basis!(
@@ -20929,7 +20965,9 @@ pub fn matern_radial_first_derivative_nd(
     let n_centers = centers.nrows();
     let dim = centers.ncols();
     if dim == 0 {
-        crate::bail_invalid_basis!("matern_radial_first_derivative_nd: centers must have at least one column".into(),);
+        crate::bail_invalid_basis!(
+            "matern_radial_first_derivative_nd: centers must have at least one column".into(),
+        );
     }
     if t.ncols() != dim {
         crate::bail_invalid_basis!(
@@ -20976,7 +21014,9 @@ pub fn matern_radial_second_derivative_nd(
     let n_centers = centers.nrows();
     let dim = centers.ncols();
     if dim == 0 {
-        crate::bail_invalid_basis!("matern_radial_second_derivative_nd: centers must have at least one column".into(),);
+        crate::bail_invalid_basis!(
+            "matern_radial_second_derivative_nd: centers must have at least one column".into(),
+        );
     }
     if t.ncols() != dim {
         crate::bail_invalid_basis!(
@@ -21104,7 +21144,9 @@ pub fn sphere_first_derivative_nd(
         );
     }
     if dim == 0 {
-        crate::bail_invalid_basis!("sphere_first_derivative_nd: points must have at least one column".into(),);
+        crate::bail_invalid_basis!(
+            "sphere_first_derivative_nd: points must have at least one column".into(),
+        );
     }
     if centers.ncols() != dim {
         crate::bail_invalid_basis!(
@@ -21250,7 +21292,9 @@ pub fn bspline_tensor_first_derivative(
         );
     }
     if n_axes == 0 {
-        crate::bail_invalid_basis!("bspline_tensor_first_derivative: t must have at least one axis".into(),);
+        crate::bail_invalid_basis!(
+            "bspline_tensor_first_derivative: t must have at least one axis".into(),
+        );
     }
     let n_rows = t.nrows();
     // Per-axis basis sizes and total tensor size.
@@ -21485,7 +21529,9 @@ fn build_periodic_duchon_basis_1d(
     workspace: &mut BasisWorkspace,
 ) -> Result<BasisBuildResult, BasisError> {
     if data.ncols() != 1 {
-        crate::bail_invalid_basis!("periodic Duchon smooths currently require exactly one covariate");
+        crate::bail_invalid_basis!(
+            "periodic Duchon smooths currently require exactly one covariate"
+        );
     }
     // ``left + period`` is the same circle point as ``left``. If the user
     // supplied centers spanning ``[left, left+period]`` (the natural way to
@@ -21789,10 +21835,7 @@ fn build_duchon_basis_mixed_periodicity(
         );
     }
     if periods.len() != d {
-        crate::bail_invalid_basis!(
-            "periods must have length d={d}, got {}",
-            periods.len()
-        );
+        crate::bail_invalid_basis!("periods must have length d={d}, got {}", periods.len());
     }
     for (j, (&per, &period)) in periodic_per_axis.iter().zip(periods.iter()).enumerate() {
         if per && !(period.is_finite() && period > 0.0) {
@@ -21813,7 +21856,9 @@ fn build_duchon_basis_mixed_periodicity(
     // partial-fraction Matérn chain has not been validated for periodic
     // axes. Surface a clear error instead of silently producing nonsense.
     if spec.length_scale.is_some() {
-        crate::bail_invalid_basis!("mixed-periodicity Duchon basis currently only supports the pure polyharmonic spectrum (length_scale=None)");
+        crate::bail_invalid_basis!(
+            "mixed-periodicity Duchon basis currently only supports the pure polyharmonic spectrum (length_scale=None)"
+        );
     }
     // s_order > 0 (the Sobolev tail) is similarly unvalidated for periodic
     // axes — gate to s = 0 (pure polyharmonic).
@@ -21975,10 +22020,7 @@ pub fn build_duchon_basis_mixed_periodicity_auto(
     let resolved_periods: Vec<f64> = match periods {
         Some(p) => {
             if p.len() != d {
-                crate::bail_invalid_basis!(
-                    "periods must have length d={d}, got {}",
-                    p.len()
-                );
+                crate::bail_invalid_basis!("periods must have length d={d}, got {}", p.len());
             }
             p.to_vec()
         }
@@ -22439,7 +22481,8 @@ pub fn select_thin_plate_knots(
     if num_knots > n {
         crate::bail_invalid_basis!(
             "requested {} knots but only {} rows are available",
-            num_knots, n
+            num_knots,
+            n
         );
     }
 
@@ -23841,7 +23884,8 @@ pub(crate) mod internal {
             if support.is_empty() {
                 crate::bail_invalid_basis!(
                     "quantile knot placement requires distinct interior support between {:.6e} and {:.6e}",
-                    minval, maxval
+                    minval,
+                    maxval
                 );
             }
             let n = support.len();
@@ -24174,7 +24218,8 @@ fn validate_periodic_bspline_spec(spec: &PeriodicBSplineBasisSpec) -> Result<(),
     if spec.num_basis < spec.degree + 1 {
         crate::bail_invalid_basis!(
             "periodic B-spline basis requires num_basis >= degree + 1 (got num_basis={}, degree={})",
-            spec.num_basis, spec.degree
+            spec.num_basis,
+            spec.degree
         );
     }
     if !spec.period.is_finite() || spec.period <= 0.0 {
@@ -24417,7 +24462,9 @@ pub fn fit_periodic_bspline_curve(
         );
     }
     if y.ncols() == 0 {
-        crate::bail_invalid_basis!("periodic curve fit requires at least one ambient output column");
+        crate::bail_invalid_basis!(
+            "periodic curve fit requires at least one ambient output column"
+        );
     }
     if !smoothing_lambda.is_finite() || smoothing_lambda < 0.0 {
         crate::bail_invalid_basis!(

@@ -1833,8 +1833,10 @@ fn resolve_external_family(
     firth_override: Option<bool>,
 ) -> Result<(GlmLikelihoodSpec, bool), EstimationError> {
     if family.is_royston_parmar() {
-        crate::bail_invalid_estim!("optimize_external_design does not support RoystonParmar; use survival training APIs"
-                .to_string(),);
+        crate::bail_invalid_estim!(
+            "optimize_external_design does not support RoystonParmar; use survival training APIs"
+                .to_string(),
+        );
     }
 
     let supports_firth = matches!(
@@ -1922,7 +1924,9 @@ fn resolved_external_config(
     opts: &ExternalOptimOptions,
 ) -> Result<(RemlConfig, Option<SasLinkSpec>), EstimationError> {
     if opts.latent_cloglog.is_some() && (opts.mixture_link.is_some() || opts.sas_link.is_some()) {
-        crate::bail_invalid_estim!("latent_cloglog cannot be combined with mixture_link or sas_link");
+        crate::bail_invalid_estim!(
+            "latent_cloglog cannot be combined with mixture_link or sas_link"
+        );
     }
     if opts.mixture_link.is_some() && opts.sas_link.is_some() {
         crate::bail_invalid_estim!("mixture_link and sas_link are mutually exclusive");
@@ -1968,7 +1972,8 @@ fn validate_penalty_specs(
                 if col_range.end > p {
                     crate::bail_invalid_estim!(
                         "{context}: block penalty {idx} col_range {}..{} exceeds p={p}",
-                        col_range.start, col_range.end
+                        col_range.start,
+                        col_range.end
                     );
                 }
             }
@@ -2025,7 +2030,8 @@ fn validate_joint_hyper_direction_shapes(
             if component.penalty_index >= canonical_len {
                 crate::bail_invalid_estim!(
                     "penalty_index for dir {idx} out of bounds: {} >= {}",
-                    component.penalty_index, canonical_len
+                    component.penalty_index,
+                    canonical_len
                 );
             }
         }
@@ -4410,9 +4416,7 @@ where
 {
     for (idx, value) in values.into_iter().enumerate() {
         if !value.is_finite() {
-            crate::bail_invalid_estim!(
-                "{label}[{idx}] must be finite, got {value}"
-            );
+            crate::bail_invalid_estim!("{label}[{idx}] must be finite, got {value}");
         }
     }
     Ok(())
@@ -4712,7 +4716,9 @@ impl UnifiedFitResult {
         validate_all_finite_estimation("fit_result.log_lambdas", log_lambdas.iter().copied())?;
         validate_all_finite_estimation("fit_result.lambdas", lambdas.iter().copied())?;
         if !log_lambdas_match_lambdas(&log_lambdas, &lambdas) {
-            crate::bail_invalid_estim!("UnifiedFitResult log_lambdas must equal ln(lambdas) elementwise");
+            crate::bail_invalid_estim!(
+                "UnifiedFitResult log_lambdas must equal ln(lambdas) elementwise"
+            );
         }
         validate_likelihood_scale_estimation(likelihood_scale)?;
         ensure_finite_scalar_estimation("fit_result.log_likelihood", log_likelihood)?;
@@ -6068,7 +6074,9 @@ where
                 )
             }
             _ => {
-                crate::bail_invalid_estim!("latent_cloglog is only supported with the Binomial CLogLog / LatentCLogLog link");
+                crate::bail_invalid_estim!(
+                    "latent_cloglog is only supported with the Binomial CLogLog / LatentCLogLog link"
+                );
             }
         }
     } else if let Some(sas_spec) = effective_sas_link {
@@ -6095,14 +6103,18 @@ where
                 }
             }
             _ => {
-                crate::bail_invalid_estim!("sas_link options are only valid for adaptive SAS link families");
+                crate::bail_invalid_estim!(
+                    "sas_link options are only valid for adaptive SAS link families"
+                );
             }
         }
     } else {
         family.clone()
     };
     if resolved_family.is_royston_parmar() {
-        crate::bail_invalid_estim!("fit_gam external design path does not support RoystonParmar; use survival training APIs");
+        crate::bail_invalid_estim!(
+            "fit_gam external design path does not support RoystonParmar; use survival training APIs"
+        );
     }
     // Validate Beta-regression response domain upfront on the external-design
     // GLM path so callers get a clear error before PIRLS is even constructed.
@@ -6498,12 +6510,16 @@ where
     X: Into<DesignMatrix>,
 {
     if !opts.family.is_gaussian_identity() {
-        crate::bail_invalid_estim!("evaluate_external_ift_residual_at_perturbed_rho currently supports GaussianIdentity"
-                .to_string(),);
+        crate::bail_invalid_estim!(
+            "evaluate_external_ift_residual_at_perturbed_rho currently supports GaussianIdentity"
+                .to_string(),
+        );
     }
     if opts.linear_constraints.is_some() {
-        crate::bail_invalid_estim!("evaluate_external_ift_residual_at_perturbed_rho does not support constrained fits"
-                .to_string(),);
+        crate::bail_invalid_estim!(
+            "evaluate_external_ift_residual_at_perturbed_rho does not support constrained fits"
+                .to_string(),
+        );
     }
 
     let specs: Vec<PenaltySpec> = s_list.iter().map(PenaltySpec::from_blockwise_ref).collect();
@@ -6687,7 +6703,7 @@ mod estimate_policy_tests {
     use super::*;
     use crate::linalg::utils::{StableSolver, max_abs_diag};
     use crate::mixture_link::{sas_inverse_link_jet, sas_inverse_link_jetwith_param_partials};
-    use crate::types::{InverseLink, LikelihoodSpec, LinkFunction, StandardLink, ResponseFamily};
+    use crate::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily, StandardLink};
     use ndarray::{Array1, Array2, array};
     use rand::rngs::StdRng;
     use rand::{RngExt, SeedableRng};

@@ -82,7 +82,8 @@ pub fn try_primary_state_gram_cuda(
     }
     #[cfg(target_os = "linux")]
     {
-        let workspace = GpuIdentifiabilityCompileWorkspace::try_new(channel_blocks, raw_block_ranges)?;
+        let workspace =
+            GpuIdentifiabilityCompileWorkspace::try_new(channel_blocks, raw_block_ranges)?;
         workspace.compute_grams(h_packed)
     }
 }

@@ -26,7 +26,7 @@
 use gam::estimate::{FitOptions, fit_gam};
 use gam::pirls::PirlsStatus;
 use gam::smooth::BlockwisePenalty;
-use gam::types::{InverseLink, LikelihoodSpec, StandardLink, ResponseFamily};
+use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
 use ndarray::{Array1, Array2};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};

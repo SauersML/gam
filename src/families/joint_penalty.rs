@@ -207,8 +207,7 @@ impl JointPenaltySpec {
 /// [`crate::families::custom_family::BlockwiseFitOptions::joint_penalties`]
 /// and adds the full-width quadratic / matvec / preconditioner / Hessian
 /// contributions to the joint-Newton primitives.
-#[derive(Clone)]
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct JointPenaltyBundle {
     pub specs: std::sync::Arc<Vec<JointPenaltySpec>>,
     pub log_lambdas: Vec<f64>,
@@ -295,9 +294,7 @@ impl JointPenaltyBundle {
     ///   `∂/∂ρ_j [½ exp(ρ_j) βᵀ S_j β] = exp(ρ_j) · ½ βᵀ S_j β`.
     pub fn rho_objective_gradient(&self, beta: ArrayView1<'_, f64>, out: &mut [f64]) {
         assert_eq!(out.len(), self.specs.len());
-        for (i, (spec, &log_lambda)) in
-            self.specs.iter().zip(self.log_lambdas.iter()).enumerate()
-        {
+        for (i, (spec, &log_lambda)) in self.specs.iter().zip(self.log_lambdas.iter()).enumerate() {
             let lam = log_lambda.exp();
             out[i] = 0.5 * lam * spec.quadratic_form(beta);
         }
@@ -474,12 +471,8 @@ mod tests {
         };
         let log_lambda = -0.4_f64;
         let lam = log_lambda.exp();
-        let bundle = JointPenaltyBundle::new(
-            std::sync::Arc::new(vec![spec]),
-            vec![log_lambda],
-            2,
-        )
-        .expect("valid bundle");
+        let bundle = JointPenaltyBundle::new(std::sync::Arc::new(vec![spec]), vec![log_lambda], 2)
+            .expect("valid bundle");
 
         // Build LHS = I + λ S via add_to_matrix (the exact path the inner
         // Newton uses to assemble the penalised joint Hessian).

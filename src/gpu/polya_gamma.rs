@@ -54,9 +54,9 @@
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 #[cfg(target_os = "linux")]
-use crate::gpu::error::GpuResultExt;
-#[cfg(target_os = "linux")]
 use super::error::GpuError;
+#[cfg(target_os = "linux")]
+use crate::gpu::error::GpuResultExt;
 
 // ────────────────────────────────────────────────────────────────────────
 // Public types
@@ -1224,25 +1224,21 @@ extern "C" __global__ void normal_kernel(
             Some(s) => s.to_vec(),
             None => input.shapes.iter().copied().collect(),
         };
-        let tilts_dev =
-            stream
-                .clone_htod(&tilts_vec)
-                .gpu_ctx("polya_gamma upload tilts")?;
-        let shapes_dev =
-            stream
-                .clone_htod(&shapes_vec)
-                .gpu_ctx("polya_gamma upload shapes")?;
-        let mut out_dev =
-            stream
-                .alloc_zeros::<f64>(n)
-                .gpu_ctx("polya_gamma alloc out")?;
+        let tilts_dev = stream
+            .clone_htod(&tilts_vec)
+            .gpu_ctx("polya_gamma upload tilts")?;
+        let shapes_dev = stream
+            .clone_htod(&shapes_vec)
+            .gpu_ctx("polya_gamma upload shapes")?;
+        let mut out_dev = stream
+            .alloc_zeros::<f64>(n)
+            .gpu_ctx("polya_gamma alloc out")?;
 
         // ── Launch each regime kernel (skipping empty partitions).
         if !pg1_rows.is_empty() {
-            let rows_dev =
-                stream
-                    .clone_htod(&pg1_rows)
-                    .gpu_ctx("polya_gamma upload pg1 rows")?;
+            let rows_dev = stream
+                .clone_htod(&pg1_rows)
+                .gpu_ctx("polya_gamma upload pg1 rows")?;
             launch_pg1(
                 &stream,
                 module_handle,
@@ -1253,10 +1249,9 @@ extern "C" __global__ void normal_kernel(
             )?;
         }
         if !sp_rows.is_empty() {
-            let rows_dev =
-                stream
-                    .clone_htod(&sp_rows)
-                    .gpu_ctx("polya_gamma upload sp rows")?;
+            let rows_dev = stream
+                .clone_htod(&sp_rows)
+                .gpu_ctx("polya_gamma upload sp rows")?;
             launch_sp(
                 &stream,
                 module_handle,
@@ -1268,10 +1263,9 @@ extern "C" __global__ void normal_kernel(
             )?;
         }
         if !normal_rows.is_empty() {
-            let rows_dev =
-                stream
-                    .clone_htod(&normal_rows)
-                    .gpu_ctx("polya_gamma upload normal rows")?;
+            let rows_dev = stream
+                .clone_htod(&normal_rows)
+                .gpu_ctx("polya_gamma upload normal rows")?;
             launch_normal(
                 &stream,
                 module_handle,
@@ -1284,10 +1278,9 @@ extern "C" __global__ void normal_kernel(
         }
 
         // ── Pull results and patch the host-regime rows in place.
-        let mut out_host =
-            stream
-                .clone_dtoh(&out_dev)
-                .gpu_ctx("polya_gamma download out")?;
+        let mut out_host = stream
+            .clone_dtoh(&out_dev)
+            .gpu_ctx("polya_gamma download out")?;
         for &row in &host_rows {
             let i = row as usize;
             let mut st = XorwowState::new(input.seed.0, row as u64);
@@ -1312,10 +1305,9 @@ extern "C" __global__ void normal_kernel(
         tilts: &cudarc::driver::CudaSlice<f64>,
         out: &mut cudarc::driver::CudaSlice<f64>,
     ) -> Result<(), GpuError> {
-        let func =
-            module
-                .load_function("pg1_kernel")
-                .gpu_ctx("polya_gamma load pg1_kernel")?;
+        let func = module
+            .load_function("pg1_kernel")
+            .gpu_ctx("polya_gamma load pg1_kernel")?;
         let n = rows.len() as u32;
         let grid = (n + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
         let cfg = LaunchConfig {
@@ -1386,10 +1378,9 @@ extern "C" __global__ void normal_kernel(
         tilts: &cudarc::driver::CudaSlice<f64>,
         out: &mut cudarc::driver::CudaSlice<f64>,
     ) -> Result<(), GpuError> {
-        let func =
-            module
-                .load_function("normal_kernel")
-                .gpu_ctx("polya_gamma load normal_kernel")?;
+        let func = module
+            .load_function("normal_kernel")
+            .gpu_ctx("polya_gamma load normal_kernel")?;
         let n = rows.len() as u32;
         let grid = (n + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
         let cfg = LaunchConfig {

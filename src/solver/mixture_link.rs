@@ -1,17 +1,17 @@
-use std::ops::Neg;
 use crate::estimate::EstimationError;
 use crate::families::lognormal_kernel::latent_cloglog_jet5;
 use crate::probability::{
     normal_cdf, normal_pdf,
     stable_polynomial_times_exp_neg as stable_nonnegative_poly_times_exp_neg,
 };
-use crate::types::{StandardLink, 
+use crate::types::{
     InverseLink, LatentCLogLogState, LikelihoodSpec, LinkComponent, LinkFunction, MixtureLinkSpec,
-    MixtureLinkState, ResponseFamily, SasLinkSpec, SasLinkState, 
+    MixtureLinkState, ResponseFamily, SasLinkSpec, SasLinkState, StandardLink,
 };
 use ndarray::Array1;
 use statrs::function::beta::{beta_reg, ln_beta};
 use statrs::function::gamma::digamma;
+use std::ops::Neg;
 use std::sync::OnceLock;
 
 const SAS_U_CLAMP: f64 = 50.0;
@@ -1402,8 +1402,6 @@ impl std::ops::Div for ShapeDual {
         }
     }
 }
-
-
 
 impl std::ops::Neg for ShapeDual {
     type Output = Self;

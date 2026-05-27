@@ -139,10 +139,7 @@ impl VectorResponseTarget {
 
 fn validate_row_weights(weights: &Array1<f64>, n: usize) -> Result<(), EstimationError> {
     if weights.len() != n {
-        crate::bail_invalid_estim!(
-            "row_weights length {} ≠ N={n}",
-            weights.len()
-        );
+        crate::bail_invalid_estim!("row_weights length {} ≠ N={n}", weights.len());
     }
     for (idx, weight) in weights.iter().copied().enumerate() {
         if !(weight.is_finite() && weight >= 0.0) {

@@ -667,11 +667,7 @@ impl IsometryPenalty {
     /// dispatcher. Pass `None` for either argument to clear that cache (the
     /// dispatcher will then either fall back to the Duchon radial source if
     /// available, or return the zero safe default).
-    pub fn refresh_caches(
-        &self,
-        jac: Option<Arc<Array2<f64>>>,
-        jac2: Option<Arc<Array2<f64>>>,
-    ) {
+    pub fn refresh_caches(&self, jac: Option<Arc<Array2<f64>>>, jac2: Option<Arc<Array2<f64>>>) {
         *self
             .jacobian_cache_slot
             .write()
@@ -719,7 +715,6 @@ impl Clone for IsometryPenalty {
 }
 
 impl IsometryPenalty {
-
     /// Attach a cached third decoder derivative
     /// `K_n[i, a, c, d] = ∂²J_n[i, a] / ∂t_{n, c} ∂t_{n, d}`, flattened
     /// row-major as `(n_obs, p * d * d * d)`. The Hessian-vector product

@@ -69,6 +69,7 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 
 use super::error::GpuError;
+use crate::gpu::error::GpuResultExt;
 use crate::gpu_err;
 
 #[cfg(target_os = "linux")]
@@ -822,10 +823,7 @@ impl CubicMomentBackend {
     /// reaching past the backend's privacy boundary. On non-Linux hosts the
     /// `DeviceCubicMomentTable.values` field is already a `Vec<f64>` so the
     /// call is a copy; on Linux it issues one DtoH and a stream sync.
-    pub fn download_alpha_major(
-        &self,
-        dev: &DeviceCubicMomentTable,
-    ) -> Result<Vec<f64>, GpuError> {
+    pub fn download_alpha_major(&self, dev: &DeviceCubicMomentTable) -> Result<Vec<f64>, GpuError> {
         #[cfg(target_os = "linux")]
         {
             let stream = &self.inner.stream;
@@ -872,8 +870,8 @@ impl CubicMomentBackend {
         let ordinal = runtime.selected_device().ordinal;
         let ctx = super::runtime::cuda_context_for(ordinal).ok_or_else(|| {
             gpu_err!(
-                    "cubic_bspline_moments backend: failed to create CUDA context for device {ordinal}"
-                )
+                "cubic_bspline_moments backend: failed to create CUDA context for device {ordinal}"
+            )
         })?;
         let stream = ctx.default_stream();
         let cap = &runtime.selected_device().capability;
@@ -903,10 +901,12 @@ impl CubicMomentBackend {
             }
         }
         let src = src_factory();
-        let ptx = cudarc::nvrtc::compile_ptx(&src).gpu_ctx_with(|err| format!(
+        let ptx = cudarc::nvrtc::compile_ptx(&src).gpu_ctx_with(|err| {
+            format!(
                 "tetrahedral_moments NVRTC compile (D={}, NBETA={}, NALPHA={}): {err}",
                 key.d, key.nbeta, key.nalpha
-            ))?;
+            )
+        })?;
         let module = self
             .inner
             .ctx
@@ -930,10 +930,12 @@ impl CubicMomentBackend {
             }
         }
         let src = src_factory();
-        let ptx = cudarc::nvrtc::compile_ptx(&src).gpu_ctx_with(|err| format!(
+        let ptx = cudarc::nvrtc::compile_ptx(&src).gpu_ctx_with(|err| {
+            format!(
                 "cubic_bspline_moments NVRTC compile (D={}, AMAX={}, NALPHA={}): {err}",
                 key.d, key.amax, key.nalpha
-            ))?;
+            )
+        })?;
         let module = self
             .inner
             .ctx
@@ -974,11 +976,11 @@ impl HexCellTable {
             || self.width_per_axis.len() != want
         {
             crate::gpu_bail!(
-                    "HexCellTable: expected length {want} (n_cells*d), got span={}, pair={}, width={}",
-                    self.span_per_axis.len(),
-                    self.pair_per_axis.len(),
-                    self.width_per_axis.len(),
-                );
+                "HexCellTable: expected length {want} (n_cells*d), got span={}, pair={}, width={}",
+                self.span_per_axis.len(),
+                self.pair_per_axis.len(),
+                self.width_per_axis.len(),
+            );
         }
         Ok(())
     }
@@ -1007,17 +1009,17 @@ pub fn build_hex_tensor_moments_device(
     cells.validate()?;
     if spec.d() != cells.d {
         crate::gpu_bail!(
-                "build_hex_tensor_moments_device: spec.d()={} != cells.d={}",
-                spec.d(),
-                cells.d
-            );
+            "build_hex_tensor_moments_device: spec.d()={} != cells.d={}",
+            spec.d(),
+            cells.d
+        );
     }
     if axis_tables.len() != cells.d {
         crate::gpu_bail!(
-                "build_hex_tensor_moments_device: axis_tables.len()={} != d={}",
-                axis_tables.len(),
-                cells.d
-            );
+            "build_hex_tensor_moments_device: axis_tables.len()={} != d={}",
+            axis_tables.len(),
+            cells.d
+        );
     }
     // Single-bank requirement: exactly one derivative signature per axis.
     // Mixed-signature support is Phase 3.
@@ -1075,14 +1077,12 @@ pub fn build_hex_tensor_moments_device(
         flat.extend_from_slice(&banks[0].prod_coeff);
     }
 
-    let axis_flat_dev =
-        stream
-            .clone_htod(flat.as_slice())
-            .gpu_ctx("cubic_bspline_moments htod axis_flat")?;
-    let axis_off_dev =
-        stream
-            .clone_htod(axis_offsets.as_slice())
-            .gpu_ctx("cubic_bspline_moments htod axis_offsets")?;
+    let axis_flat_dev = stream
+        .clone_htod(flat.as_slice())
+        .gpu_ctx("cubic_bspline_moments htod axis_flat")?;
+    let axis_off_dev = stream
+        .clone_htod(axis_offsets.as_slice())
+        .gpu_ctx("cubic_bspline_moments htod axis_offsets")?;
     let span_dev = stream
         .clone_htod(cells.span_per_axis.as_slice())
         .gpu_ctx("cubic_bspline_moments htod span")?;
@@ -1096,7 +1096,9 @@ pub fn build_hex_tensor_moments_device(
     let out_stride = ((cells.n_cells + 31) / 32) * 32;
     let mut out_dev = stream
         .alloc_zeros::<f64>(out_stride * nalpha)
-        .gpu_ctx_with(|err| format!("cubic_bspline_moments alloc out (stride={out_stride}, nalpha={nalpha}): {err}"))?;
+        .gpu_ctx_with(|err| {
+            format!("cubic_bspline_moments alloc out (stride={out_stride}, nalpha={nalpha}): {err}")
+        })?;
 
     let block_x: u32 = 32;
     let block_y: u32 = 8;
@@ -1108,11 +1110,12 @@ pub fn build_hex_tensor_moments_device(
         shared_mem_bytes: 0,
     };
 
-    let n_cells_i32: i32 =
-        i32::try_from(cells.n_cells).map_err(|_| gpu_err!(
-                "cubic_bspline_moments n_cells={} overflows i32",
-                cells.n_cells
-            ))?;
+    let n_cells_i32: i32 = i32::try_from(cells.n_cells).map_err(|_| {
+        gpu_err!(
+            "cubic_bspline_moments n_cells={} overflows i32",
+            cells.n_cells
+        )
+    })?;
     let out_stride_i64: i64 = out_stride as i64;
 
     let mut builder = stream.launch_builder(&func);
@@ -1894,9 +1897,9 @@ fn build_tetrahedral_moments_device(
     let geom_stride = ((cells.n_tets + 31) / 32) * 32;
     let mut geom_dev = stream
         .alloc_zeros::<f64>(geom_stride * nbeta)
-        .gpu_ctx_with(|err| format!(
-            "tetrahedral_moments alloc geom (stride={geom_stride}, nbeta={nbeta}): {err}"
-        ))?;
+        .gpu_ctx_with(|err| {
+            format!("tetrahedral_moments alloc geom (stride={geom_stride}, nbeta={nbeta}): {err}")
+        })?;
 
     let block_x: u32 = 32;
     let block_y: u32 = 8;
@@ -1907,10 +1910,8 @@ fn build_tetrahedral_moments_device(
         block_dim: (block_x, block_y, 1),
         shared_mem_bytes: 0,
     };
-    let n_tets_i32: i32 = i32::try_from(cells.n_tets).map_err(|_| gpu_err!(
-        "tetrahedral_moments n_tets={} overflows i32",
-        cells.n_tets
-    ))?;
+    let n_tets_i32: i32 = i32::try_from(cells.n_tets)
+        .map_err(|_| gpu_err!("tetrahedral_moments n_tets={} overflows i32", cells.n_tets))?;
     let geom_stride_i64: i64 = geom_stride as i64;
 
     let mut builder = stream.launch_builder(&geom_func);
@@ -1925,8 +1926,7 @@ fn build_tetrahedral_moments_device(
     // kernel reads inputs of declared sizes and writes within
     // geom[0 .. geom_stride * nbeta]. Launch dims are non-zero, bounded
     // by the i32 cap above.
-    unsafe { builder.launch(cfg_geom) }
-        .gpu_ctx("tetrahedral_moments geom kernel launch")?;
+    unsafe { builder.launch(cfg_geom) }.gpu_ctx("tetrahedral_moments geom kernel launch")?;
 
     // ───── Stage 2: basis-Gram contraction ─────
     let con_key = TetMomentModuleKey {
@@ -1976,10 +1976,12 @@ fn build_tetrahedral_moments_device(
         block_dim: (block_cx, block_cy, block_cz),
         shared_mem_bytes: 0,
     };
-    let n_cells_i32: i32 = i32::try_from(cells.n_cells).map_err(|_| gpu_err!(
-        "tetrahedral_moments n_cells={} overflows i32",
-        cells.n_cells
-    ))?;
+    let n_cells_i32: i32 = i32::try_from(cells.n_cells).map_err(|_| {
+        gpu_err!(
+            "tetrahedral_moments n_cells={} overflows i32",
+            cells.n_cells
+        )
+    })?;
     let out_stride_i64: i64 = out_stride as i64;
 
     let mut builder = stream.launch_builder(&con_func);
@@ -1995,8 +1997,7 @@ fn build_tetrahedral_moments_device(
     // SAFETY: pointers come from cudarc-checked allocations on `stream`;
     // kernel reads inputs of declared sizes and writes within
     // out[0 .. out_stride * nalpha * pairs]. Launch dims are non-zero.
-    unsafe { builder.launch(cfg_con) }
-        .gpu_ctx("tetrahedral_moments contract kernel launch")?;
+    unsafe { builder.launch(cfg_con) }.gpu_ctx("tetrahedral_moments contract kernel launch")?;
     stream
         .synchronize()
         .gpu_ctx("tetrahedral_moments synchronize")?;
@@ -2017,9 +2018,9 @@ fn build_tetrahedral_moments_device(
 #[cfg(test)]
 mod cubic_bspline_moments_tests {
     use super::*;
-use crate::gpu_err;
-use crate::gpu_bail;
-use crate::gpu::error::GpuResultExt;
+    use crate::gpu::error::GpuResultExt;
+    use crate::gpu_bail;
+    use crate::gpu_err;
 
     fn open_uniform_knots(n_basis: usize) -> Vec<f64> {
         // Open uniform clamped knot vector for n_basis cubic B-splines on [0,1].
@@ -2555,18 +2556,8 @@ use crate::gpu::error::GpuResultExt;
             [2, 2, 1],
         ] {
             let got = super::tetrahedral_geom_moment_cpu(&verts, &c0, beta, 3);
-            let want = super::dirichlet_ref_simplex(
-                beta[0] as u32,
-                beta[1] as u32,
-                beta[2] as u32,
-            );
-            assert_close!(
-                &format!("dirichlet β={:?}", beta),
-                got,
-                want,
-                1e-14,
-                1e-15,
-            );
+            let want = super::dirichlet_ref_simplex(beta[0] as u32, beta[1] as u32, beta[2] as u32);
+            assert_close!(&format!("dirichlet β={:?}", beta), got, want, 1e-14, 1e-15,);
         }
     }
 
@@ -2669,13 +2660,7 @@ use crate::gpu::error::GpuResultExt;
                 + b[0][2] * (b[1][0] * b[2][1] - b[1][1] * b[2][0]))
                 .abs();
             let want = ref_acc * det;
-            assert_close!(
-                &format!("tet β={:?}", beta),
-                got,
-                want,
-                1e-12,
-                1e-13,
-            );
+            assert_close!(&format!("tet β={:?}", beta), got, want, 1e-12, 1e-13,);
         }
     }
 
@@ -2705,7 +2690,10 @@ use crate::gpu::error::GpuResultExt;
             cell_index: vec![3],
             ..good.clone()
         };
-        assert!(bad_idx.validate().is_err(), "out-of-range cell index rejected");
+        assert!(
+            bad_idx.validate().is_err(),
+            "out-of-range cell index rejected"
+        );
     }
 
     /// CM-P3 kernel source must contain the two entry-point symbols the

@@ -53,10 +53,8 @@
 
 use ndarray::{Array1, Array2, ArrayView2};
 
+use crate::gpu::policy::{PirlsLoopCurvatureKind, PirlsLoopFamilyKind, RemlOuterAdmission};
 use crate::solver::estimate::EstimationError;
-use crate::gpu::policy::{
-    PirlsLoopCurvatureKind, PirlsLoopFamilyKind, RemlOuterAdmission,
-};
 use crate::solver::gpu::reml_gpu::{RemlGpuEvidence, RemlGpuInput, evidence_derivatives_gpu};
 
 /// Input bundle handed to [`run_reml_outer_on_device`] by the host
@@ -353,8 +351,7 @@ where
                 Ok(e) => {
                     trial_eval = e;
                     if trial_eval.objective.is_finite()
-                        && trial_eval.objective
-                            <= objective + ARMIJO_C1 * alpha * g_dot_d
+                        && trial_eval.objective <= objective + ARMIJO_C1 * alpha * g_dot_d
                     {
                         break;
                     }
@@ -455,12 +452,7 @@ fn matvec_neg(h_inv: ArrayView2<'_, f64>, g: &Array1<f64>) -> Array1<f64> {
 
 /// Sherman–Morrison-style BFGS inverse-Hessian update:
 /// `H⁻¹ ← (I − sρyᵀ) H⁻¹ (I − yρsᵀ) + sρsᵀ` with `ρ = 1/(sᵀy)`.
-fn bfgs_inverse_hessian_update(
-    h_inv: &mut Array2<f64>,
-    s: &Array1<f64>,
-    y: &Array1<f64>,
-    sy: f64,
-) {
+fn bfgs_inverse_hessian_update(h_inv: &mut Array2<f64>, s: &Array1<f64>, y: &Array1<f64>, sy: f64) {
     let n = s.len();
     let rho = 1.0 / sy;
     // hy = H⁻¹ y
@@ -547,10 +539,7 @@ mod tests {
         let target_owned = target.clone();
         let input = RemlOuterGpuInput {
             seed_rho: Array1::from(vec![2.0, 2.0, 2.0, 2.0]),
-            bounds: (
-                Array1::from_elem(4, -10.0),
-                Array1::from_elem(4, 10.0),
-            ),
+            bounds: (Array1::from_elem(4, -10.0), Array1::from_elem(4, 10.0)),
             gradient_tolerance: 1.0e-8,
             max_iterations: 100,
             axis_step_caps: None,

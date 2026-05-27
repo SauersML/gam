@@ -93,11 +93,7 @@ enum Outcome {
     Failed(String),
 }
 
-fn time_path(
-    label: &str,
-    iters: usize,
-    mut op: impl FnMut() -> Result<(), String>,
-) -> Outcome {
+fn time_path(label: &str, iters: usize, mut op: impl FnMut() -> Result<(), String>) -> Outcome {
     let mut elapsed = Vec::with_capacity(iters);
     for it in 0..iters {
         let start = Instant::now();
@@ -113,10 +109,7 @@ fn time_path(
         elapsed.push(start.elapsed().as_secs_f64());
     }
     // Drop iter 0 (NVRTC compile + cuSOLVER warmup); take min of the rest.
-    let median_min = elapsed[1..]
-        .iter()
-        .copied()
-        .fold(f64::INFINITY, f64::min);
+    let median_min = elapsed[1..].iter().copied().fold(f64::INFINITY, f64::min);
     Outcome::Ok(median_min)
 }
 
@@ -140,13 +133,15 @@ fn main() -> ExitCode {
             Err(other) => Err(format!("{other:?}")),
         }
     });
-    let fused = time_path("layer_d_fused", ITERS, || {
-        match solve_arrow_newton_step_fused_force(&sys, RIDGE_T, RIDGE_BETA) {
+    let fused = time_path(
+        "layer_d_fused",
+        ITERS,
+        || match solve_arrow_newton_step_fused_force(&sys, RIDGE_T, RIDGE_BETA) {
             Ok(_) => Ok(()),
             Err(ArrowSchurGpuFailure::Unavailable) => Err("Unavailable".to_string()),
             Err(other) => Err(format!("{other:?}")),
-        }
-    });
+        },
+    );
 
     let cpu_secs = match cpu {
         Outcome::Ok(t) => t,

@@ -499,7 +499,8 @@ impl FirthDenseOperator {
                 if !weight.is_finite() || weight < 0.0 {
                     crate::bail_invalid_estim!(
                         "Firth operator requires finite nonnegative observation weights, got {} at row {}",
-                        weight, i
+                        weight,
+                        i
                     );
                 }
                 sqrt[i] = weight.sqrt();

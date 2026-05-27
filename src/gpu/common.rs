@@ -21,10 +21,10 @@ pub use linux::{DeviceArena, PtxModuleCache};
 #[cfg(target_os = "linux")]
 mod linux {
     use super::super::error::GpuError;
+    use crate::gpu::error::GpuResultExt;
     use cudarc::driver::{CudaContext, CudaModule, CudaSlice, CudaStream};
     use std::collections::HashMap;
     use std::sync::Arc;
-use crate::gpu::error::GpuResultExt;
 
     /// Power-of-two bucketed free list of f64 device slices.
     ///
@@ -62,10 +62,9 @@ use crate::gpu::error::GpuResultExt;
             {
                 return Ok((bucket, slot));
             }
-            let fresh =
-                stream
-                    .alloc_zeros::<f64>(bucket)
-                    .gpu_ctx_with(|err| format!("{label} arena alloc_zeros<{bucket}>: {err}"))?;
+            let fresh = stream
+                .alloc_zeros::<f64>(bucket)
+                .gpu_ctx_with(|err| format!("{label} arena alloc_zeros<{bucket}>: {err}"))?;
             Ok((bucket, fresh))
         }
 
@@ -112,8 +111,8 @@ use crate::gpu::error::GpuResultExt;
             if let Some(existing) = self.module.get() {
                 return Ok(existing);
             }
-            let ptx =
-                cudarc::nvrtc::compile_ptx(source).gpu_ctx_with(|err| format!("{label} NVRTC compile failed: {err}"))?;
+            let ptx = cudarc::nvrtc::compile_ptx(source)
+                .gpu_ctx_with(|err| format!("{label} NVRTC compile failed: {err}"))?;
             let module = ctx
                 .load_module(ptx)
                 .gpu_ctx_with(|err| format!("{label} module load failed: {err}"))?;
