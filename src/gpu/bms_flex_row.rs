@@ -2494,6 +2494,182 @@ pub(crate) fn launch_bms_flex_row_diagonal(
         })
 }
 
+/// Block 9 Phase 6 — hard cap on `p_total` for the dense joint-Hessian
+/// device kernel. Per-CTA shared-memory accumulator is `p_total² * 8`
+/// bytes. V100 default per-block shared cap is 48 KiB, so the largest
+/// safe `p_total` here is `sqrt(48 KiB / 8) = 78`. We round down to a
+/// power-of-two-ish multiple of 8 for predictable launch geometry.
+#[cfg(target_os = "linux")]
+pub(crate) const DENSE_BLOCK_MAX_P: usize = 72;
+
+/// Number of rows each dense-block CTA processes. Smaller than the HVP
+/// `HVP_ROWS_PER_CTA = 256` because the per-row inner loop is `O(r² *
+/// (p_m + p_g + h_block_len + w_block_len))` rather than `O(r²)` — fewer
+/// rows per CTA keeps the per-CTA wall time short and lets us scale grid
+/// occupancy with `num_chunks = ceil(n / DENSE_BLOCK_ROWS_PER_CTA)`.
+#[cfg(target_os = "linux")]
+pub(crate) const DENSE_BLOCK_ROWS_PER_CTA: u32 = 32;
+
+/// Launch the Phase-6 dense joint-Hessian block kernel. Returns the
+/// host-side `[p_total, p_total]` row-major joint H as a `Vec<f64>`
+/// (length `p_total²`).
+///
+/// **Not the default Newton path.** Production Newton uses HVP (Phase 2)
+/// and never materialises the full dense Hessian. This entry exists for:
+///   * exact-REML logdet (`log|H|`) when the unified evaluator wants to
+///     factor H directly instead of going through the matrix-free path;
+///   * diagnostic dumps that compare the GPU dense build against the CPU
+///     `BernoulliMarginalSlopeFamily::fused_gradient_dense` reference;
+///   * small-`p` debug routes where it is cheaper to factor + solve dense
+///     than to run a PCG.
+///
+/// The kernel rejects `p_total > DENSE_BLOCK_MAX_P` cleanly because the
+/// per-CTA shared-memory accumulator (`p_total² * 8` bytes) would exceed
+/// the V100 48 KiB/block cap above that threshold.
+#[cfg(target_os = "linux")]
+pub(crate) fn launch_bms_flex_row_dense_block(
+    storage: &DeviceResidentRowHess,
+) -> Result<Vec<f64>, GpuError> {
+    let p_total = storage.block.p_total;
+    if p_total == 0 {
+        return Err(GpuError::DriverCallFailed {
+            reason: "bms_flex_row dense_block: p_total must be > 0".to_string(),
+        });
+    }
+    if p_total > DENSE_BLOCK_MAX_P {
+        return Err(GpuError::DriverCallFailed {
+            reason: format!(
+                "bms_flex_row dense_block: p_total={p_total} exceeds DENSE_BLOCK_MAX_P={DENSE_BLOCK_MAX_P} \
+                 (per-CTA shmem accumulator p²*8 bytes would exceed V100's 48 KiB/block)"
+            ),
+        });
+    }
+    if storage.layout != RowHessianLayout::FullRowMajor {
+        // The dense-block kernel reads H_i row-major; extending to packed
+        // upper would require a second kernel variant. Adopt only if the
+        // packed path is selected as the default and exact-REML/dense
+        // requests still need to land — Phase 4 benchmark decides.
+        return Err(GpuError::DriverCallFailed {
+            reason: format!(
+                "bms_flex_row dense_block: only FullRowMajor storage is supported (got {:?})",
+                storage.layout
+            ),
+        });
+    }
+    let backend = HvpKernelBackend::probe()?;
+    let stream = backend.stream.clone();
+    let n = storage.n;
+    let r = storage.r;
+    let rows_per_cta = DENSE_BLOCK_ROWS_PER_CTA as usize;
+    let num_chunks = n.div_ceil(rows_per_cta);
+    let pp = p_total * p_total;
+
+    let mut d_partial = stream
+        .alloc_zeros::<f64>(num_chunks * pp)
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("bms_flex_row dense_block alloc partial: {err}"),
+        })?;
+    let mut d_out = stream
+        .alloc_zeros::<f64>(pp)
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("bms_flex_row dense_block alloc out: {err}"),
+        })?;
+
+    let part_func = backend
+        .module
+        .load_function("bms_flex_row_dense_block_partial")
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("bms_flex_row dense_block load partial: {err}"),
+        })?;
+    let red_func = backend
+        .module
+        .load_function("bms_flex_row_dense_block_reduce")
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("bms_flex_row dense_block load reduce: {err}"),
+        })?;
+
+    let n_i32 = n as i32;
+    let r_i32 = r as i32;
+    let p_m_i32 = storage.block.p_m as i32;
+    let p_g_i32 = storage.block.p_g as i32;
+    let p_total_i32 = p_total as i32;
+    let h_block_start = storage.block.h.as_ref().map(|r| r.start as i32).unwrap_or(0);
+    let h_block_len = storage.block.h.as_ref().map(|r| r.len() as i32).unwrap_or(0);
+    let w_block_start = storage.block.w.as_ref().map(|r| r.start as i32).unwrap_or(0);
+    let w_block_len = storage.block.w.as_ref().map(|r| r.len() as i32).unwrap_or(0);
+    let h_primary_start = storage.primary.h.as_ref().map(|r| r.start as i32).unwrap_or(0);
+    let w_primary_start = storage.primary.w.as_ref().map(|r| r.start as i32).unwrap_or(0);
+    let rows_per_cta_i32 = DENSE_BLOCK_ROWS_PER_CTA as i32;
+    let num_chunks_u32 = num_chunks as u32;
+
+    // Per-CTA shmem accumulator: p_total² doubles.
+    let shmem_bytes: u32 = u32::try_from(pp * std::mem::size_of::<f64>())
+        .map_err(|_| GpuError::DriverCallFailed {
+            reason: format!(
+                "dense_block shmem bytes overflow u32 for p_total={p_total}"
+            ),
+        })?;
+
+    let cfg_part = LaunchConfig {
+        grid_dim: (num_chunks_u32, 1, 1),
+        block_dim: (HVP_THREADS, 1, 1),
+        shared_mem_bytes: shmem_bytes,
+    };
+    let mut builder = stream.launch_builder(&part_func);
+    builder
+        .arg(&n_i32)
+        .arg(&r_i32)
+        .arg(&p_m_i32)
+        .arg(&p_g_i32)
+        .arg(&p_total_i32)
+        .arg(&h_block_start)
+        .arg(&h_block_len)
+        .arg(&w_block_start)
+        .arg(&w_block_len)
+        .arg(&h_primary_start)
+        .arg(&w_primary_start)
+        .arg(&rows_per_cta_i32)
+        .arg(&storage.hess)
+        .arg(&storage.marginal_design)
+        .arg(&storage.logslope_design)
+        .arg(&mut d_partial);
+    // SAFETY: storage pointers have validated capacities; d_partial sized
+    // num_chunks * pp doubles; dynamic shmem matches the kernel's `extern
+    // __shared__` accumulator length.
+    unsafe { builder.launch(cfg_part) }.map_err(|err| GpuError::DriverCallFailed {
+        reason: format!("bms_flex_row dense_block partial launch: {err}"),
+    })?;
+
+    let red_threads: u32 = 256;
+    let red_blocks: u32 = ((pp as u32) + red_threads - 1) / red_threads;
+    let cfg_red = LaunchConfig {
+        grid_dim: (red_blocks, 1, 1),
+        block_dim: (red_threads, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let num_chunks_i32 = num_chunks as i32;
+    let mut builder = stream.launch_builder(&red_func);
+    builder
+        .arg(&num_chunks_i32)
+        .arg(&p_total_i32)
+        .arg(&d_partial)
+        .arg(&mut d_out);
+    // SAFETY: d_partial just populated, d_out is pp doubles.
+    unsafe { builder.launch(cfg_red) }.map_err(|err| GpuError::DriverCallFailed {
+        reason: format!("bms_flex_row dense_block reduce launch: {err}"),
+    })?;
+    stream
+        .synchronize()
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("bms_flex_row dense_block sync: {err}"),
+        })?;
+    stream
+        .clone_dtoh(&d_out)
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("bms_flex_row dense_block download: {err}"),
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4298,6 +4474,189 @@ mod tests {
             let final_packed = launch_bms_flex_row_hvp(&storage, &v)
                 .expect("post-bench packed HVP must launch");
             assert_eq!(final_packed.len(), p_total);
+        }
+    }
+
+    /// Block 9 Phase 6 — small-fixture parity for the dense-block kernel
+    /// against the CPU pullback in `crate::gpu::bms_flex::accumulate_row_hessian_pullback`.
+    /// Verifies bit-equality (modulo reduction-order f.p. noise) between
+    /// the device-resident dense build and the host accumulator over the
+    /// same per-row Hessian + designs + P_i pullback.
+    #[test]
+    fn bms_flex_row_dense_block_kernel_matches_cpu_pullback() {
+        #[cfg(not(target_os = "linux"))]
+        {
+            eprintln!(
+                "[bms_flex_row dense_block parity] non-Linux host — skipping CUDA parity"
+            );
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let Some(_runtime) = crate::gpu::runtime::GpuRuntime::global() else {
+                eprintln!(
+                    "[bms_flex_row dense_block parity] no CUDA runtime — skipping"
+                );
+                return;
+            };
+            // Small fixture: n=24, r=8 (2 + 3 + 3), p_total=18 (4+4+3+3).
+            // Keeps the CPU pullback fast while still exercising every
+            // primary slot (q, g, h, w).
+            let n = 24_usize;
+            let p_m = 4_usize;
+            let p_g = 4_usize;
+            let p_h_dim = 3_usize;
+            let p_w_dim = 3_usize;
+            let r = 2 + p_h_dim + p_w_dim;
+            let p_total = p_m + p_g + p_h_dim + p_w_dim;
+            let block = BmsFlexBlockLayout {
+                p_m,
+                p_g,
+                h: Some(p_m + p_g..p_m + p_g + p_h_dim),
+                w: Some(p_m + p_g + p_h_dim..p_m + p_g + p_h_dim + p_w_dim),
+                p_total,
+            };
+            let primary = BmsFlexPrimaryLayout {
+                h: Some(2..2 + p_h_dim),
+                w: Some(2 + p_h_dim..2 + p_h_dim + p_w_dim),
+                r,
+            };
+
+            let mut row_hessians = vec![0.0_f64; n * r * r];
+            for row in 0..n {
+                let base = row * r * r;
+                for u in 0..r {
+                    for v in 0..r {
+                        let seed = (row as f64) * 0.21 + (u as f64) * 1.13 + (v as f64) * 0.47;
+                        let a = (seed.sin() * 1.4 + (seed * 0.6).cos() * 0.7) * 0.5;
+                        row_hessians[base + u * r + v] = a;
+                    }
+                }
+                for u in 0..r {
+                    for v in (u + 1)..r {
+                        let upper = row_hessians[base + u * r + v];
+                        let lower = row_hessians[base + v * r + u];
+                        let sym = 0.5 * (upper + lower);
+                        row_hessians[base + u * r + v] = sym;
+                        row_hessians[base + v * r + u] = sym;
+                    }
+                    row_hessians[base + u * r + u] += (r as f64);
+                }
+            }
+            let mut marginal = vec![0.0_f64; n * p_m];
+            for row in 0..n {
+                for j in 0..p_m {
+                    let seed = (row as f64) * 0.083 + (j as f64) * 0.171 + 0.31;
+                    marginal[row * p_m + j] = seed.sin() * 0.7 - (seed * 0.5).cos() * 0.25;
+                }
+            }
+            let mut logslope = vec![0.0_f64; n * p_g];
+            for row in 0..n {
+                for j in 0..p_g {
+                    let seed = (row as f64) * 0.097 + (j as f64) * 0.143 - 0.15;
+                    logslope[row * p_g + j] = seed.cos() * 0.65 + (seed * 0.4).sin() * 0.2;
+                }
+            }
+
+            // CPU oracle — same pullback math the device kernel mirrors.
+            let h_block_start = block.h.as_ref().map(|r| r.start).unwrap_or(0);
+            let h_block_len = block.h.as_ref().map(|r| r.len()).unwrap_or(0);
+            let w_block_start = block.w.as_ref().map(|r| r.start).unwrap_or(0);
+            let w_block_len = block.w.as_ref().map(|r| r.len()).unwrap_or(0);
+            let h_primary_start = primary.h.as_ref().map(|r| r.start).unwrap_or(0);
+            let w_primary_start = primary.w.as_ref().map(|r| r.start).unwrap_or(0);
+            let mut h_cpu = vec![0.0_f64; p_total * p_total];
+            for row in 0..n {
+                let mrow = &marginal[row * p_m..(row + 1) * p_m];
+                let grow = &logslope[row * p_g..(row + 1) * p_g];
+                let hrow = &row_hessians[row * r * r..(row + 1) * r * r];
+                // Build per-row phi (r length-p_total vectors).
+                let mut phi = vec![vec![0.0_f64; p_total]; r];
+                for k in 0..p_m { phi[0][k] = mrow[k]; }
+                for k in 0..p_g { phi[1][p_m + k] = grow[k]; }
+                for k in 0..h_block_len { phi[h_primary_start + k][h_block_start + k] = 1.0; }
+                for k in 0..w_block_len { phi[w_primary_start + k][w_block_start + k] = 1.0; }
+                for u in 0..r {
+                    for v in 0..r {
+                        let huv = hrow[u * r + v];
+                        if huv == 0.0 { continue; }
+                        for m in 0..p_total {
+                            let pm = phi[u][m];
+                            if pm == 0.0 { continue; }
+                            let scaled = huv * pm;
+                            for nn in 0..p_total {
+                                h_cpu[m * p_total + nn] += scaled * phi[v][nn];
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Build a transient device-resident storage and launch the
+            // dense-block kernel.
+            let backend = match HvpKernelBackend::probe() {
+                Ok(b) => b,
+                Err(err) => {
+                    eprintln!("[bms_flex_row dense_block parity] backend probe failed: {err}");
+                    return;
+                }
+            };
+            let stream = backend.stream.clone();
+            let d_h = match stream.clone_htod(&row_hessians) {
+                Ok(s) => s,
+                Err(err) => {
+                    eprintln!("[bms_flex_row dense_block parity] upload h failed: {err}");
+                    return;
+                }
+            };
+            let d_m = match stream.clone_htod(&marginal) {
+                Ok(s) => s,
+                Err(err) => {
+                    eprintln!("[bms_flex_row dense_block parity] upload marg failed: {err}");
+                    return;
+                }
+            };
+            let d_g = match stream.clone_htod(&logslope) {
+                Ok(s) => s,
+                Err(err) => {
+                    eprintln!("[bms_flex_row dense_block parity] upload logslope failed: {err}");
+                    return;
+                }
+            };
+            let storage = DeviceResidentRowHess {
+                ctx: backend.ctx.clone(),
+                stream: stream.clone(),
+                hess: d_h,
+                marginal_design: d_m,
+                logslope_design: d_g,
+                n,
+                r,
+                block: block.clone(),
+                primary: primary.clone(),
+                layout: RowHessianLayout::FullRowMajor,
+                bytes: ((n * r * r + n * p_m + n * p_g) * std::mem::size_of::<f64>()) as u64,
+            };
+            let h_gpu = launch_bms_flex_row_dense_block(&storage)
+                .expect("dense_block kernel must launch on CUDA host");
+            assert_eq!(h_gpu.len(), p_total * p_total);
+
+            // Compare entry-by-entry with a tolerance that absorbs
+            // reduction-order f.p. noise from the CTA chunk sum.
+            let mut max_abs = 0.0_f64;
+            for i in 0..p_total {
+                for j in 0..p_total {
+                    let a = h_cpu[i * p_total + j];
+                    let b = h_gpu[i * p_total + j];
+                    let diff = (a - b).abs();
+                    if diff > max_abs { max_abs = diff; }
+                    assert!(
+                        diff <= 1e-9 * a.abs().max(b.abs()).max(1.0),
+                        "dense_block[{i},{j}]: cpu={a} gpu={b} |Δ|={diff:.3e}"
+                    );
+                }
+            }
+            eprintln!(
+                "[bms_flex_row dense_block parity] n={n} r={r} p={p_total}: max|Δ|={max_abs:.3e}"
+            );
         }
     }
 }
