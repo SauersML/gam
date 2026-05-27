@@ -652,8 +652,6 @@ impl CubicCellGpuBackend {
             }
         }
         drop(d_status);
-
-        drop(d_status);
         Ok(CubicCellDerivativeMomentOutput::Device {
             d_moments,
             status: status_host,
