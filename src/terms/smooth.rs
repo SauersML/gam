@@ -25677,22 +25677,9 @@ mod tests {
             &spec,
             LikelihoodSpec::gaussian_identity(),
             &FitOptions {
-                latent_cloglog: None,
-                mixture_link: None,
-                optimize_mixture: false,
-                sas_link: None,
-                optimize_sas: false,
-                compute_inference: true,
                 max_iter: 40,
-                tol: 1e-6,
-                nullspace_dims: vec![],
-                linear_constraints: None,
-                firth_bias_reduction: false,
-                adaptive_regularization: None,
                 penalty_shrinkage_floor: None,
-                rho_prior: Default::default(),
-                kronecker_penalty_system: None,
-                kronecker_factored: None,
+                ..FitOptions::default()
             },
             &SpatialLengthScaleOptimizationOptions {
                 enabled: false,
@@ -26180,17 +26167,8 @@ mod tests {
             &spec,
             LikelihoodSpec::gaussian_identity(),
             &FitOptions {
-                latent_cloglog: None,
-                mixture_link: None,
-                optimize_mixture: false,
-                sas_link: None,
-                optimize_sas: false,
-                compute_inference: true,
                 max_iter: 25,
                 tol: 1e-5,
-                nullspace_dims: vec![],
-                linear_constraints: None,
-                firth_bias_reduction: false,
                 adaptive_regularization: Some(AdaptiveRegularizationOptions {
                     enabled: true,
                     max_mm_iter: 4,
@@ -26202,9 +26180,7 @@ mod tests {
                     weight_ceiling: 1e8,
                 }),
                 penalty_shrinkage_floor: None,
-                rho_prior: Default::default(),
-                kronecker_penalty_system: None,
-                kronecker_factored: None,
+                ..FitOptions::default()
             },
         )
         .expect("exact adaptive spatial fit should succeed");
@@ -26267,11 +26243,6 @@ mod tests {
             &spec,
             LikelihoodSpec::gaussian_identity(),
             &FitOptions {
-                latent_cloglog: None,
-                mixture_link: None,
-                optimize_mixture: false,
-                sas_link: None,
-                optimize_sas: false,
                 compute_inference: false,
                 // The scale-free Duchon mass candidate is now the centered
                 // design Gram at data points (commit 718810d1), which has
@@ -26286,9 +26257,6 @@ mod tests {
                 // artefact.
                 max_iter: 28,
                 tol: 1e-5,
-                nullspace_dims: vec![],
-                linear_constraints: None,
-                firth_bias_reduction: false,
                 adaptive_regularization: Some(AdaptiveRegularizationOptions {
                     enabled: true,
                     max_mm_iter: 4,
@@ -26300,9 +26268,7 @@ mod tests {
                     weight_ceiling: 1e8,
                 }),
                 penalty_shrinkage_floor: None,
-                rho_prior: Default::default(),
-                kronecker_penalty_system: None,
-                kronecker_factored: None,
+                ..FitOptions::default()
             },
         )
         .expect("pure Duchon exact adaptive fit should succeed");
@@ -26367,20 +26333,12 @@ mod tests {
                 SasLinkState::new(0.1, -0.2).expect("valid SAS link state"),
             ),
             &FitOptions {
-                latent_cloglog: None,
-                mixture_link: None,
-                optimize_mixture: false,
                 sas_link: Some(crate::types::SasLinkSpec {
                     initial_epsilon: 0.1,
                     initial_log_delta: -0.2,
                 }),
-                optimize_sas: false,
-                compute_inference: true,
                 max_iter: 15,
                 tol: 1e-5,
-                nullspace_dims: vec![],
-                linear_constraints: None,
-                firth_bias_reduction: false,
                 adaptive_regularization: Some(AdaptiveRegularizationOptions {
                     enabled: true,
                     max_mm_iter: 4,
@@ -26392,9 +26350,7 @@ mod tests {
                     weight_ceiling: 1e8,
                 }),
                 penalty_shrinkage_floor: None,
-                rho_prior: Default::default(),
-                kronecker_penalty_system: None,
-                kronecker_factored: None,
+                ..FitOptions::default()
             },
         )
         .expect("exact adaptive SAS fit should succeed");
@@ -26454,22 +26410,9 @@ mod tests {
             &spec,
             LikelihoodSpec::gaussian_identity(),
             &FitOptions {
-                latent_cloglog: None,
-                mixture_link: None,
-                optimize_mixture: false,
-                sas_link: None,
-                optimize_sas: false,
-                compute_inference: true,
                 max_iter: 30,
-                tol: 1e-6,
-                nullspace_dims: vec![],
-                linear_constraints: None,
-                firth_bias_reduction: false,
-                adaptive_regularization: None,
                 penalty_shrinkage_floor: None,
-                rho_prior: Default::default(),
-                kronecker_penalty_system: None,
-                kronecker_factored: None,
+                ..FitOptions::default()
             },
         )
         .expect("baseline fit");
@@ -26679,22 +26622,9 @@ mod tests {
             &spec,
             LikelihoodSpec::gaussian_identity(),
             &FitOptions {
-                latent_cloglog: None,
-                mixture_link: None,
-                optimize_mixture: false,
-                sas_link: None,
-                optimize_sas: false,
-                compute_inference: true,
                 max_iter: 20,
-                tol: 1e-6,
-                nullspace_dims: vec![],
-                linear_constraints: None,
-                firth_bias_reduction: false,
-                adaptive_regularization: None,
                 penalty_shrinkage_floor: None,
-                rho_prior: Default::default(),
-                kronecker_penalty_system: None,
-                kronecker_factored: None,
+                ..FitOptions::default()
             },
         )
         .expect("baseline fit");
@@ -26861,17 +26791,7 @@ mod tests {
             &spec,
             LikelihoodSpec::gaussian_identity(),
             &FitOptions {
-                latent_cloglog: None,
-                mixture_link: None,
-                optimize_mixture: false,
-                sas_link: None,
-                optimize_sas: false,
-                compute_inference: true,
                 max_iter: 40,
-                tol: 1e-6,
-                nullspace_dims: vec![],
-                linear_constraints: None,
-                firth_bias_reduction: false,
                 adaptive_regularization: Some(AdaptiveRegularizationOptions {
                     enabled: true,
                     max_mm_iter: 10,
@@ -26883,9 +26803,7 @@ mod tests {
                     weight_ceiling: 1e8,
                 }),
                 penalty_shrinkage_floor: None,
-                rho_prior: Default::default(),
-                kronecker_penalty_system: None,
-                kronecker_factored: None,
+                ..FitOptions::default()
             },
         )
         .expect("high-center adaptive Duchon fit should not fail");
