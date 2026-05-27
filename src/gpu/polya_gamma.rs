@@ -1225,30 +1225,22 @@ extern "C" __global__ void normal_kernel(
         let tilts_dev =
             stream
                 .clone_htod(&tilts_vec)
-                .map_err(|err| GpuError::DriverCallFailed {
-                    reason: format!("polya_gamma upload tilts: {err}"),
-                })?;
+                .gpu_ctx("polya_gamma upload tilts")?;
         let shapes_dev =
             stream
                 .clone_htod(&shapes_vec)
-                .map_err(|err| GpuError::DriverCallFailed {
-                    reason: format!("polya_gamma upload shapes: {err}"),
-                })?;
+                .gpu_ctx("polya_gamma upload shapes")?;
         let mut out_dev =
             stream
                 .alloc_zeros::<f64>(n)
-                .map_err(|err| GpuError::DriverCallFailed {
-                    reason: format!("polya_gamma alloc out: {err}"),
-                })?;
+                .gpu_ctx("polya_gamma alloc out")?;
 
         // ── Launch each regime kernel (skipping empty partitions).
         if !pg1_rows.is_empty() {
             let rows_dev =
                 stream
                     .clone_htod(&pg1_rows)
-                    .map_err(|err| GpuError::DriverCallFailed {
-                        reason: format!("polya_gamma upload pg1 rows: {err}"),
-                    })?;
+                    .gpu_ctx("polya_gamma upload pg1 rows")?;
             launch_pg1(
                 &stream,
                 module_handle,
@@ -1262,9 +1254,7 @@ extern "C" __global__ void normal_kernel(
             let rows_dev =
                 stream
                     .clone_htod(&sp_rows)
-                    .map_err(|err| GpuError::DriverCallFailed {
-                        reason: format!("polya_gamma upload sp rows: {err}"),
-                    })?;
+                    .gpu_ctx("polya_gamma upload sp rows")?;
             launch_sp(
                 &stream,
                 module_handle,
@@ -1279,9 +1269,7 @@ extern "C" __global__ void normal_kernel(
             let rows_dev =
                 stream
                     .clone_htod(&normal_rows)
-                    .map_err(|err| GpuError::DriverCallFailed {
-                        reason: format!("polya_gamma upload normal rows: {err}"),
-                    })?;
+                    .gpu_ctx("polya_gamma upload normal rows")?;
             launch_normal(
                 &stream,
                 module_handle,
@@ -1297,9 +1285,7 @@ extern "C" __global__ void normal_kernel(
         let mut out_host =
             stream
                 .clone_dtoh(&out_dev)
-                .map_err(|err| GpuError::DriverCallFailed {
-                    reason: format!("polya_gamma download out: {err}"),
-                })?;
+                .gpu_ctx("polya_gamma download out")?;
         for &row in &host_rows {
             let i = row as usize;
             let mut st = XorwowState::new(input.seed.0, row as u64);
@@ -1327,9 +1313,7 @@ extern "C" __global__ void normal_kernel(
         let func =
             module
                 .load_function("pg1_kernel")
-                .map_err(|err| GpuError::DriverCallFailed {
-                    reason: format!("polya_gamma load pg1_kernel: {err}"),
-                })?;
+                .gpu_ctx("polya_gamma load pg1_kernel")?;
         let n = rows.len() as u32;
         let grid = (n + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
         let cfg = LaunchConfig {
@@ -1351,9 +1335,7 @@ extern "C" __global__ void normal_kernel(
                 .launch(cfg)
         }
         .map(|_| ())
-        .map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("polya_gamma launch pg1_kernel: {err}"),
-        })
+        .gpu_ctx("polya_gamma launch pg1_kernel")
     }
 
     fn launch_sp(
@@ -1367,9 +1349,7 @@ extern "C" __global__ void normal_kernel(
     ) -> Result<(), GpuError> {
         let func = module
             .load_function("sp_kernel")
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("polya_gamma load sp_kernel: {err}"),
-            })?;
+            .gpu_ctx("polya_gamma load sp_kernel")?;
         let n = rows.len() as u32;
         let grid = (n + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
         let cfg = LaunchConfig {
@@ -1392,9 +1372,7 @@ extern "C" __global__ void normal_kernel(
                 .launch(cfg)
         }
         .map(|_| ())
-        .map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("polya_gamma launch sp_kernel: {err}"),
-        })
+        .gpu_ctx("polya_gamma launch sp_kernel")
     }
 
     fn launch_normal(
@@ -1409,9 +1387,7 @@ extern "C" __global__ void normal_kernel(
         let func =
             module
                 .load_function("normal_kernel")
-                .map_err(|err| GpuError::DriverCallFailed {
-                    reason: format!("polya_gamma load normal_kernel: {err}"),
-                })?;
+                .gpu_ctx("polya_gamma load normal_kernel")?;
         let n = rows.len() as u32;
         let grid = (n + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
         let cfg = LaunchConfig {
@@ -1433,9 +1409,7 @@ extern "C" __global__ void normal_kernel(
                 .launch(cfg)
         }
         .map(|_| ())
-        .map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("polya_gamma launch normal_kernel: {err}"),
-        })
+        .gpu_ctx("polya_gamma launch normal_kernel")
     }
 }
 
@@ -1801,6 +1775,7 @@ mod tests {
         // β* = (1.5, -0.7, 0.3). Drop the first 50 as burn-in and check that
         // the posterior mean direction aligns with β* (cosine > 0.85).
         use rand::{RngExt, SeedableRng, rngs::StdRng};
+use crate::gpu::error::GpuResultExt;
         let n = 400;
         let p = 3;
         let beta_star = [1.5_f64, -0.7, 0.3];

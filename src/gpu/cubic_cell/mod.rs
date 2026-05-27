@@ -170,21 +170,17 @@ pub(crate) fn try_build_cubic_cell_derivative_moments(
     input: CubicCellDerivativeMomentHostView<'_>,
 ) -> Result<Option<CubicCellDerivativeMomentOutput>, GpuError> {
     if input.cells.len() != input.branches.len() {
-        return Err(GpuError::DriverCallFailed {
-            reason: format!(
+        gpu_bail!(
                 "gpu cubic-cell substrate: cells.len()={} != branches.len()={}",
                 input.cells.len(),
                 input.branches.len()
-            ),
-        });
+            );
     }
     if input.max_degree > MAX_SUPPORTED_DEGREE {
-        return Err(GpuError::DriverCallFailed {
-            reason: format!(
+        gpu_bail!(
                 "gpu cubic-cell substrate: max_degree={} exceeds MAX_SUPPORTED_DEGREE={}",
                 input.max_degree, MAX_SUPPORTED_DEGREE
-            ),
-        });
+            );
     }
     if input.cells.is_empty() {
         return Ok(None);
@@ -231,6 +227,7 @@ fn into_host_output(batch: HostMomentBatch) -> CubicCellDerivativeMomentOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+use crate::gpu_bail;
 
     fn affine_cell() -> GpuDenestedCubicCell {
         GpuDenestedCubicCell {

@@ -179,24 +179,18 @@ impl DeviceS2KernelMatrix {
     pub fn copy_to_host_col_major(&self, dst: &mut [f64]) -> Result<(), GpuError> {
         let needed = self.ld * self.cols;
         if dst.len() != needed {
-            return Err(GpuError::DriverCallFailed {
-                reason: format!(
+            gpu_bail!(
                     "DeviceS2KernelMatrix::copy_to_host_col_major: dst.len()={} expected {}",
                     dst.len(),
                     needed
-                ),
-            });
+                );
         }
         self.stream
             .memcpy_dtoh(&self.col_major_dev, dst)
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("DeviceS2KernelMatrix dtoh: {err}"),
-            })?;
+            .gpu_ctx("DeviceS2KernelMatrix dtoh")?;
         self.stream
             .synchronize()
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("DeviceS2KernelMatrix synchronize: {err}"),
-            })?;
+            .gpu_ctx("DeviceS2KernelMatrix synchronize")?;
         Ok(())
     }
 
@@ -204,13 +198,11 @@ impl DeviceS2KernelMatrix {
     pub fn copy_to_host_col_major(&self, dst: &mut [f64]) -> Result<(), GpuError> {
         let needed = self.ld * self.cols;
         if dst.len() != needed {
-            return Err(GpuError::DriverCallFailed {
-                reason: format!(
+            gpu_bail!(
                     "DeviceS2KernelMatrix::copy_to_host_col_major: dst.len()={} expected {}",
                     dst.len(),
                     needed
-                ),
-            });
+                );
         }
         dst.copy_from_slice(&self.col_major_dev);
         Ok(())
@@ -247,31 +239,25 @@ impl<'a> S2KernelBuildInputs<'a> {
             });
         }
         if self.data_xyz.len() != 3 * self.n {
-            return Err(GpuError::DriverCallFailed {
-                reason: format!(
+            gpu_bail!(
                     "S2KernelBuildInputs: data_xyz.len()={} != 3*n={}",
                     self.data_xyz.len(),
                     3 * self.n
-                ),
-            });
+                );
         }
         if self.centers_xyz.len() != 3 * self.m {
-            return Err(GpuError::DriverCallFailed {
-                reason: format!(
+            gpu_bail!(
                     "S2KernelBuildInputs: centers_xyz.len()={} != 3*m={}",
                     self.centers_xyz.len(),
                     3 * self.m
-                ),
-            });
+                );
         }
         if self.coeffs.len() != self.lmax + 1 {
-            return Err(GpuError::DriverCallFailed {
-                reason: format!(
+            gpu_bail!(
                     "S2KernelBuildInputs: coeffs.len()={} != lmax+1={}",
                     self.coeffs.len(),
                     self.lmax + 1
-                ),
-            });
+                );
         }
         if self.coeffs[0] != 0.0 {
             return Err(GpuError::DriverCallFailed {
@@ -524,11 +510,9 @@ impl SphereGpuBackend {
         })?;
         let ordinal = runtime.selected_device().ordinal;
         let ctx = super::runtime::cuda_context_for(ordinal).ok_or_else(|| {
-            GpuError::DriverCallFailed {
-                reason: format!(
+            gpu_err!(
                     "sphere backend: failed to create CUDA context for device {ordinal}"
-                ),
-            }
+                )
         })?;
         let stream = ctx.default_stream();
         let cap = &runtime.selected_device().capability;
@@ -561,20 +545,16 @@ impl SphereGpuBackend {
         // pattern. The kernel itself targets the device the driver
         // reports (Volta+).
         let src = format!("#define LMAX {}\n{}", key.lmax, KERNEL_TEMPLATE);
-        let ptx = cudarc::nvrtc::compile_ptx(&src).map_err(|err| GpuError::DriverCallFailed {
-            reason: format!(
+        let ptx = cudarc::nvrtc::compile_ptx(&src).gpu_ctx_with(|err| format!(
                 "sphere NVRTC compile (kind={}, lmax={}): {err}",
                 key.kind.tag(),
                 key.lmax
-            ),
-        })?;
+            ))?;
         let module = self
             .inner
             .ctx
             .load_module(ptx)
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("sphere module load: {err}"),
-            })?;
+            .gpu_ctx("sphere module load")?;
         if let Ok(mut guard) = self.inner.modules.lock() {
             guard.entry(key).or_insert_with(|| module.clone());
         }
@@ -613,29 +593,21 @@ pub fn build_kernel_matrix_device(
         let module = backend.module_for(key)?;
         let func = module
             .load_function("s2_wahba_legendre_colmajor")
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("sphere load_function raw: {err}"),
-            })?;
+            .gpu_ctx("sphere load_function raw")?;
         let stream = backend.inner.stream.clone();
 
         let data_dev =
             stream
                 .clone_htod(inputs.data_xyz)
-                .map_err(|err| GpuError::DriverCallFailed {
-                    reason: format!("sphere htod data_xyz: {err}"),
-                })?;
+                .gpu_ctx("sphere htod data_xyz")?;
         let centers_dev =
             stream
                 .clone_htod(inputs.centers_xyz)
-                .map_err(|err| GpuError::DriverCallFailed {
-                    reason: format!("sphere htod centers_xyz: {err}"),
-                })?;
+                .gpu_ctx("sphere htod centers_xyz")?;
         let coeffs_dev =
             stream
                 .clone_htod(inputs.coeffs)
-                .map_err(|err| GpuError::DriverCallFailed {
-                    reason: format!("sphere htod coeffs: {err}"),
-                })?;
+                .gpu_ctx("sphere htod coeffs")?;
 
         let n = inputs.n;
         let m = inputs.m;
@@ -643,9 +615,7 @@ pub fn build_kernel_matrix_device(
         let mut out_dev =
             stream
                 .alloc_zeros::<f64>(ld * m)
-                .map_err(|err| GpuError::DriverCallFailed {
-                    reason: format!("sphere alloc out (ld={ld}, m={m}): {err}"),
-                })?;
+                .gpu_ctx("sphere alloc out (ld={ld}, m={m})")?;
 
         // Block (32, 8, 1) — x over centers, y over rows.
         let block_x: u32 = 32;
@@ -657,12 +627,8 @@ pub fn build_kernel_matrix_device(
             block_dim: (block_x, block_y, 1),
             shared_mem_bytes: 0,
         };
-        let n_i32: i32 = i32::try_from(n).map_err(|_| GpuError::DriverCallFailed {
-            reason: format!("sphere n={n} overflows i32"),
-        })?;
-        let m_i32: i32 = i32::try_from(m).map_err(|_| GpuError::DriverCallFailed {
-            reason: format!("sphere m={m} overflows i32"),
-        })?;
+        let n_i32: i32 = i32::try_from(n).map_err(|_| gpu_err!("sphere n={n} overflows i32"))?;
+        let m_i32: i32 = i32::try_from(m).map_err(|_| gpu_err!("sphere m={m} overflows i32"))?;
         let ld_i64: i64 = ld as i64;
 
         let mut builder = stream.launch_builder(&func);
@@ -678,14 +644,10 @@ pub fn build_kernel_matrix_device(
         // pointers come from cudarc-checked allocations on the same
         // stream; the kernel only reads inputs and writes within
         // out[0 .. ld*m].
-        unsafe { builder.launch(cfg) }.map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("sphere raw kernel launch: {err}"),
-        })?;
+        unsafe { builder.launch(cfg) }.gpu_ctx("sphere raw kernel launch")?;
         stream
             .synchronize()
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("sphere raw kernel synchronize: {err}"),
-            })?;
+            .gpu_ctx("sphere raw kernel synchronize")?;
 
         Ok(DeviceS2KernelMatrix {
             rows: n,
@@ -714,28 +676,22 @@ pub fn build_householder_constrained_design_device(
 ) -> Result<DeviceS2KernelMatrix, GpuError> {
     inputs.validate()?;
     if v.len() != inputs.m {
-        return Err(GpuError::DriverCallFailed {
-            reason: format!(
+        gpu_bail!(
                 "build_householder_constrained_design_device: v.len()={} != m={}",
                 v.len(),
                 inputs.m
-            ),
-        });
+            );
     }
     if inputs.m < 2 {
-        return Err(GpuError::DriverCallFailed {
-            reason: format!(
+        gpu_bail!(
                 "build_householder_constrained_design_device: m must be >= 2 (got {})",
                 inputs.m
-            ),
-        });
+            );
     }
     if !beta.is_finite() {
-        return Err(GpuError::DriverCallFailed {
-            reason: format!(
+        gpu_bail!(
                 "build_householder_constrained_design_device: beta must be finite (got {beta})"
-            ),
-        });
+            );
     }
 
     #[cfg(target_os = "linux")]
@@ -753,34 +709,24 @@ pub fn build_householder_constrained_design_device(
         let module = backend.module_for(key)?;
         let func = module
             .load_function("s2_wahba_householder_constrained_colmajor")
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("sphere load_function householder: {err}"),
-            })?;
+            .gpu_ctx("sphere load_function householder")?;
         let stream = backend.inner.stream.clone();
 
         let data_dev =
             stream
                 .clone_htod(inputs.data_xyz)
-                .map_err(|err| GpuError::DriverCallFailed {
-                    reason: format!("sphere-hh htod data_xyz: {err}"),
-                })?;
+                .gpu_ctx("sphere-hh htod data_xyz")?;
         let centers_dev =
             stream
                 .clone_htod(inputs.centers_xyz)
-                .map_err(|err| GpuError::DriverCallFailed {
-                    reason: format!("sphere-hh htod centers_xyz: {err}"),
-                })?;
+                .gpu_ctx("sphere-hh htod centers_xyz")?;
         let coeffs_dev =
             stream
                 .clone_htod(inputs.coeffs)
-                .map_err(|err| GpuError::DriverCallFailed {
-                    reason: format!("sphere-hh htod coeffs: {err}"),
-                })?;
+                .gpu_ctx("sphere-hh htod coeffs")?;
         let v_dev = stream
             .clone_htod(v)
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("sphere-hh htod v: {err}"),
-            })?;
+            .gpu_ctx("sphere-hh htod v")?;
 
         let n = inputs.n;
         let m = inputs.m;
@@ -788,9 +734,7 @@ pub fn build_householder_constrained_design_device(
         let ld_out = ((n + 31) / 32) * 32;
         let mut out_dev = stream
             .alloc_zeros::<f64>(ld_out * cols_out)
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("sphere-hh alloc out (ld={ld_out}, cols={cols_out}): {err}"),
-            })?;
+            .gpu_ctx("sphere-hh alloc out (ld={ld_out}, cols={cols_out})")?;
 
         let block_x: u32 = 128;
         let grid_x: u32 = ((n as u32) + block_x - 1) / block_x;
@@ -799,12 +743,8 @@ pub fn build_householder_constrained_design_device(
             block_dim: (block_x, 1, 1),
             shared_mem_bytes: 0,
         };
-        let n_i32: i32 = i32::try_from(n).map_err(|_| GpuError::DriverCallFailed {
-            reason: format!("sphere-hh n={n} overflows i32"),
-        })?;
-        let m_i32: i32 = i32::try_from(m).map_err(|_| GpuError::DriverCallFailed {
-            reason: format!("sphere-hh m={m} overflows i32"),
-        })?;
+        let n_i32: i32 = i32::try_from(n).map_err(|_| gpu_err!("sphere-hh n={n} overflows i32"))?;
+        let m_i32: i32 = i32::try_from(m).map_err(|_| gpu_err!("sphere-hh m={m} overflows i32"))?;
         let ld_out_i64: i64 = ld_out as i64;
 
         let mut builder = stream.launch_builder(&func);
@@ -820,14 +760,10 @@ pub fn build_householder_constrained_design_device(
             .arg(&mut out_dev);
         // SAFETY: validated shapes above; the kernel writes exactly
         // (n × (m-1)) entries within `out[0 .. ld_out * (m-1)]`.
-        unsafe { builder.launch(cfg) }.map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("sphere-hh kernel launch: {err}"),
-        })?;
+        unsafe { builder.launch(cfg) }.gpu_ctx("sphere-hh kernel launch")?;
         stream
             .synchronize()
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("sphere-hh kernel synchronize: {err}"),
-            })?;
+            .gpu_ctx("sphere-hh kernel synchronize")?;
 
         Ok(DeviceS2KernelMatrix {
             rows: n,
@@ -937,20 +873,14 @@ pub fn constrained_penalty_host(
 ) -> Result<Array2<f64>, GpuError> {
     let (m1, m2) = c.dim();
     if m1 != m2 {
-        return Err(GpuError::DriverCallFailed {
-            reason: format!("constrained_penalty_host: C must be square, got {m1}x{m2}"),
-        });
+        gpu_bail!("constrained_penalty_host: C must be square, got {m1}x{m2}");
     }
     let m = m1;
     if w.len() != m {
-        return Err(GpuError::DriverCallFailed {
-            reason: format!("constrained_penalty_host: w.len()={} != m={}", w.len(), m),
-        });
+        gpu_bail!("constrained_penalty_host: w.len()={} != m={}", w.len(), m);
     }
     if m < 2 {
-        return Err(GpuError::DriverCallFailed {
-            reason: format!("constrained_penalty_host: m must be >= 2 (got {m})"),
-        });
+        gpu_bail!("constrained_penalty_host: m must be >= 2 (got {m})");
     }
     let (v, beta) = householder_reflector_from_weights(w);
 
@@ -1043,17 +973,13 @@ pub fn solve_penalised_ls_device(
     let n = x_s_device.rows;
     let p = x_s_device.cols;
     if wy.len() != n {
-        return Err(GpuError::DriverCallFailed {
-            reason: format!("solve_penalised_ls_device: wy.len()={} != n={n}", wy.len()),
-        });
+        gpu_bail!("solve_penalised_ls_device: wy.len()={} != n={n}", wy.len());
     }
     if r_s.dim() != (p, p) {
-        return Err(GpuError::DriverCallFailed {
-            reason: format!(
+        gpu_bail!(
                 "solve_penalised_ls_device: r_s.dim()={:?} != ({p}, {p})",
                 r_s.dim()
-            ),
-        });
+            );
     }
     if p == 0 {
         return Ok(PenalisedLsSolution {
@@ -1086,28 +1012,18 @@ pub fn solve_penalised_ls_device(
     }
     let mut a_dev = stream
         .clone_htod(&a_aug_host)
-        .map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("solve_penalised_ls_device htod A_aug: {err}"),
-        })?;
+        .gpu_ctx("solve_penalised_ls_device htod A_aug")?;
 
     // b_aug = [√W·y ; 0]
     let mut b_host = vec![0.0_f64; n_aug];
     b_host[..n].copy_from_slice(wy);
     let mut b_dev = stream
         .clone_htod(&b_host)
-        .map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("solve_penalised_ls_device htod b_aug: {err}"),
-        })?;
+        .gpu_ctx("solve_penalised_ls_device htod b_aug")?;
 
-    let solver = DnHandle::new(stream.clone()).map_err(|err| GpuError::DriverCallFailed {
-        reason: format!("solve_penalised_ls_device DnHandle: {err}"),
-    })?;
-    let n_aug_i: i32 = i32::try_from(n_aug).map_err(|_| GpuError::DriverCallFailed {
-        reason: format!("solve_penalised_ls_device: n_aug={n_aug} overflows i32"),
-    })?;
-    let p_i: i32 = i32::try_from(p).map_err(|_| GpuError::DriverCallFailed {
-        reason: format!("solve_penalised_ls_device: p={p} overflows i32"),
-    })?;
+    let solver = DnHandle::new(stream.clone()).gpu_ctx("solve_penalised_ls_device DnHandle")?;
+    let n_aug_i: i32 = i32::try_from(n_aug).map_err(|_| gpu_err!("solve_penalised_ls_device: n_aug={n_aug} overflows i32"))?;
+    let p_i: i32 = i32::try_from(p).map_err(|_| gpu_err!("solve_penalised_ls_device: p={p} overflows i32"))?;
 
     // 2) Workspace size for geqrf.
     let mut lwork: i32 = 0;
@@ -1126,30 +1042,20 @@ pub fn solve_penalised_ls_device(
             )
         };
         if status != cusolver_sys::cusolverStatus_t::CUSOLVER_STATUS_SUCCESS {
-            return Err(GpuError::DriverCallFailed {
-                reason: format!("cusolverDnDgeqrf_bufferSize status={status:?}"),
-            });
+            gpu_bail!("cusolverDnDgeqrf_bufferSize status={status:?}");
         }
     }
-    let lwork_us = usize::try_from(lwork).map_err(|_| GpuError::DriverCallFailed {
-        reason: format!("solve_penalised_ls_device: negative lwork={lwork}"),
-    })?;
+    let lwork_us = usize::try_from(lwork).map_err(|_| gpu_err!("solve_penalised_ls_device: negative lwork={lwork}"))?;
     let mut workspace =
         stream
             .alloc_zeros::<f64>(lwork_us.max(1))
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("solve_penalised_ls_device alloc workspace: {err}"),
-            })?;
+            .gpu_ctx("solve_penalised_ls_device alloc workspace")?;
     let mut tau = stream
         .alloc_zeros::<f64>(p)
-        .map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("solve_penalised_ls_device alloc tau: {err}"),
-        })?;
+        .gpu_ctx("solve_penalised_ls_device alloc tau")?;
     let mut info = stream
         .alloc_zeros::<i32>(1)
-        .map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("solve_penalised_ls_device alloc info: {err}"),
-        })?;
+        .gpu_ctx("solve_penalised_ls_device alloc info")?;
 
     // 3) cusolverDnDgeqrf — A := QR in place.
     {
@@ -1173,9 +1079,7 @@ pub fn solve_penalised_ls_device(
             )
         };
         if status != cusolver_sys::cusolverStatus_t::CUSOLVER_STATUS_SUCCESS {
-            return Err(GpuError::DriverCallFailed {
-                reason: format!("cusolverDnDgeqrf status={status:?}"),
-            });
+            gpu_bail!("cusolverDnDgeqrf status={status:?}");
         }
     }
 
@@ -1204,17 +1108,13 @@ pub fn solve_penalised_ls_device(
             )
         };
         if status != cusolver_sys::cusolverStatus_t::CUSOLVER_STATUS_SUCCESS {
-            return Err(GpuError::DriverCallFailed {
-                reason: format!("cusolverDnDormqr_bufferSize status={status:?}"),
-            });
+            gpu_bail!("cusolverDnDormqr_bufferSize status={status:?}");
         }
     }
     if ormqr_lwork > lwork {
         workspace = stream
             .alloc_zeros::<f64>(usize::try_from(ormqr_lwork).unwrap_or(1))
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("solve_penalised_ls_device realloc workspace ormqr: {err}"),
-            })?;
+            .gpu_ctx("solve_penalised_ls_device realloc workspace ormqr")?;
     }
     {
         let (a_ptr, _rec_a) = a_dev.device_ptr_mut(&stream);
@@ -1244,9 +1144,7 @@ pub fn solve_penalised_ls_device(
             )
         };
         if status != cusolver_sys::cusolverStatus_t::CUSOLVER_STATUS_SUCCESS {
-            return Err(GpuError::DriverCallFailed {
-                reason: format!("cusolverDnDormqr status={status:?}"),
-            });
+            gpu_bail!("cusolverDnDormqr status={status:?}");
         }
     }
 
@@ -1254,9 +1152,7 @@ pub fn solve_penalised_ls_device(
     //    of b_dev. We use a single-RHS upper-triangular non-unit solve.
     {
         use cudarc::cublas::CudaBlas;
-        let blas = CudaBlas::new(stream.clone()).map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("solve_penalised_ls_device CudaBlas: {err}"),
-        })?;
+        let blas = CudaBlas::new(stream.clone()).gpu_ctx("solve_penalised_ls_device CudaBlas")?;
         let alpha = 1.0_f64;
         let (a_ptr, _rec_a) = a_dev.device_ptr_mut(&stream);
         let (b_ptr, _rec_b) = b_dev.device_ptr_mut(&stream);
@@ -1282,9 +1178,7 @@ pub fn solve_penalised_ls_device(
             )
         };
         if status != cudarc::cublas::sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
-            return Err(GpuError::DriverCallFailed {
-                reason: format!("cublasDtrsm_v2 status={status:?}"),
-            });
+            gpu_bail!("cublasDtrsm_v2 status={status:?}");
         }
     }
 
@@ -1292,20 +1186,14 @@ pub fn solve_penalised_ls_device(
     let mut b_out = vec![0.0_f64; n_aug];
     stream
         .memcpy_dtoh(&b_dev, &mut b_out)
-        .map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("solve_penalised_ls_device dtoh b_out: {err}"),
-        })?;
+        .gpu_ctx("solve_penalised_ls_device dtoh b_out")?;
     let mut a_back = vec![0.0_f64; n_aug * p];
     stream
         .memcpy_dtoh(&a_dev, &mut a_back)
-        .map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("solve_penalised_ls_device dtoh A_back: {err}"),
-        })?;
+        .gpu_ctx("solve_penalised_ls_device dtoh A_back")?;
     stream
         .synchronize()
-        .map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("solve_penalised_ls_device synchronize: {err}"),
-        })?;
+        .gpu_ctx("solve_penalised_ls_device synchronize")?;
 
     let beta: Vec<f64> = b_out[..p].to_vec();
     // (Qᵀb)[p..n_aug] holds the residual in the rotated coordinates;
@@ -1362,6 +1250,9 @@ mod sphere_gpu_tests {
         spherical_wahba_kernel_matrix_with_kind,
     };
     use ndarray::Array2;
+use crate::gpu_err;
+use crate::gpu_bail;
+use crate::gpu::error::GpuResultExt;
 
     fn small_latlon_grid(n_lat: usize, n_lon: usize) -> Array2<f64> {
         // Latitude in (-85, 85), longitude in [-180, 180), degrees.

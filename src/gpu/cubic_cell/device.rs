@@ -113,12 +113,10 @@ impl CubicCellGpuBackend {
             }
         })?;
         let ctx = crate::gpu::runtime::cuda_context_for(runtime.selected_device().ordinal)
-            .ok_or_else(|| GpuError::DriverCallFailed {
-                reason: format!(
+            .ok_or_else(|| gpu_err!(
                     "cubic_cell backend: failed to create CUDA context for device {}",
                     runtime.selected_device().ordinal
-                ),
-            })?;
+                ))?;
         let stream = ctx.default_stream();
         Ok(CubicCellGpuBackend {
             inner: CubicCellGpuContextLinux {
@@ -139,9 +137,7 @@ impl CubicCellGpuBackend {
                 .inner
                 .modules
                 .lock()
-                .map_err(|err| GpuError::DriverCallFailed {
-                    reason: format!("cubic_cell module cache mutex poisoned: {err}"),
-                })?;
+                .gpu_ctx("cubic_cell module cache mutex poisoned")?;
             if let Some(module) = guard.get(&key) {
                 return Ok(Arc::clone(module));
             }
@@ -149,23 +145,17 @@ impl CubicCellGpuBackend {
         let source =
             crate::gpu::cubic_cell::kernel_src::build_cubic_deriv_moments_kernel_source(max_degree);
         let ptx =
-            cudarc::nvrtc::compile_ptx(&source).map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("cubic_cell NVRTC compile (degree={max_degree}) failed: {err}"),
-            })?;
+            cudarc::nvrtc::compile_ptx(&source).gpu_ctx("cubic_cell NVRTC compile (degree={max_degree}) failed")?;
         let module = self
             .inner
             .ctx
             .load_module(ptx)
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("cubic_cell module load (degree={max_degree}) failed: {err}"),
-            })?;
+            .gpu_ctx("cubic_cell module load (degree={max_degree}) failed")?;
         let mut guard = self
             .inner
             .modules
             .lock()
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("cubic_cell module cache mutex poisoned: {err}"),
-            })?;
+            .gpu_ctx("cubic_cell module cache mutex poisoned")?;
         let entry = guard.entry(key).or_insert(module);
         Ok(Arc::clone(entry))
     }
@@ -333,66 +323,44 @@ impl CubicCellGpuBackend {
         let func =
             module
                 .load_function(&kernel_name)
-                .map_err(|err| GpuError::DriverCallFailed {
-                    reason: format!("cubic_cell load_function {kernel_name}: {err}"),
-                })?;
+                .gpu_ctx("cubic_cell load_function {kernel_name}")?;
 
         let stream = &self.inner.stream;
         let d_left = stream
             .clone_htod(&left)
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("cubic_cell memcpy_stod left: {err}"),
-            })?;
+            .gpu_ctx("cubic_cell memcpy_stod left")?;
         let d_right = stream
             .clone_htod(&right)
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("cubic_cell memcpy_stod right: {err}"),
-            })?;
+            .gpu_ctx("cubic_cell memcpy_stod right")?;
         let d_c0 = stream
             .clone_htod(&c0)
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("cubic_cell memcpy_stod c0: {err}"),
-            })?;
+            .gpu_ctx("cubic_cell memcpy_stod c0")?;
         let d_c1 = stream
             .clone_htod(&c1)
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("cubic_cell memcpy_stod c1: {err}"),
-            })?;
+            .gpu_ctx("cubic_cell memcpy_stod c1")?;
         let d_c2 = stream
             .clone_htod(&c2)
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("cubic_cell memcpy_stod c2: {err}"),
-            })?;
+            .gpu_ctx("cubic_cell memcpy_stod c2")?;
         let d_c3 = stream
             .clone_htod(&c3)
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("cubic_cell memcpy_stod c3: {err}"),
-            })?;
+            .gpu_ctx("cubic_cell memcpy_stod c3")?;
         let d_branch =
             stream
                 .clone_htod(&branch_code)
-                .map_err(|err| GpuError::DriverCallFailed {
-                    reason: format!("cubic_cell memcpy_stod branch_code: {err}"),
-                })?;
+                .gpu_ctx("cubic_cell memcpy_stod branch_code")?;
         let mut d_moments =
             stream
                 .alloc_zeros::<f64>(m * stride)
-                .map_err(|err| GpuError::DriverCallFailed {
-                    reason: format!("cubic_cell alloc_zeros moments: {err}"),
-                })?;
+                .gpu_ctx("cubic_cell alloc_zeros moments")?;
         let mut d_status =
             stream
                 .alloc_zeros::<u8>(m)
-                .map_err(|err| GpuError::DriverCallFailed {
-                    reason: format!("cubic_cell alloc_zeros status: {err}"),
-                })?;
+                .gpu_ctx("cubic_cell alloc_zeros status")?;
 
         // One warp per cell.  Block = 4 warps (128 threads).
         let warps_per_block: u32 = 4;
         let block: u32 = 32 * warps_per_block;
-        let m_u32: u32 = u32::try_from(m).map_err(|_| GpuError::DriverCallFailed {
-            reason: format!("cubic_cell n_cells={m} overflows u32"),
-        })?;
+        let m_u32: u32 = u32::try_from(m).map_err(|_| gpu_err!("cubic_cell n_cells={m} overflows u32"))?;
         let grid: u32 = m_u32.div_ceil(warps_per_block).max(1);
         let cfg = LaunchConfig {
             grid_dim: (grid, 1, 1),
@@ -416,27 +384,19 @@ impl CubicCellGpuBackend {
         // SAFETY: every argument is a typed device pointer / scalar
         // matching the kernel signature above; grid covers exactly `m`
         // warps; out-of-range warps early-return.
-        unsafe { builder.launch(cfg) }.map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("cubic_cell kernel launch: {err}"),
-        })?;
+        unsafe { builder.launch(cfg) }.gpu_ctx("cubic_cell kernel launch")?;
 
         let host_moments =
             stream
                 .clone_dtoh(&d_moments)
-                .map_err(|err| GpuError::DriverCallFailed {
-                    reason: format!("cubic_cell memcpy_dtov moments: {err}"),
-                })?;
+                .gpu_ctx("cubic_cell memcpy_dtov moments")?;
         let host_status =
             stream
                 .clone_dtoh(&d_status)
-                .map_err(|err| GpuError::DriverCallFailed {
-                    reason: format!("cubic_cell memcpy_dtov status: {err}"),
-                })?;
+                .gpu_ctx("cubic_cell memcpy_dtov status")?;
         stream
             .synchronize()
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("cubic_cell synchronize: {err}"),
-            })?;
+            .gpu_ctx("cubic_cell synchronize")?;
 
         // Scatter the GPU bucket back into the output buffer at original
         // indices.
@@ -538,64 +498,42 @@ impl CubicCellGpuBackend {
         let func =
             module
                 .load_function(&kernel_name)
-                .map_err(|err| GpuError::DriverCallFailed {
-                    reason: format!("cubic_cell load_function {kernel_name}: {err}"),
-                })?;
+                .gpu_ctx("cubic_cell load_function {kernel_name}")?;
 
         let stream = &self.inner.stream;
         let d_left = stream
             .clone_htod(&left)
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("cubic_cell device-resident memcpy left: {err}"),
-            })?;
+            .gpu_ctx("cubic_cell device-resident memcpy left")?;
         let d_right = stream
             .clone_htod(&right)
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("cubic_cell device-resident memcpy right: {err}"),
-            })?;
+            .gpu_ctx("cubic_cell device-resident memcpy right")?;
         let d_c0 = stream
             .clone_htod(&c0)
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("cubic_cell device-resident memcpy c0: {err}"),
-            })?;
+            .gpu_ctx("cubic_cell device-resident memcpy c0")?;
         let d_c1 = stream
             .clone_htod(&c1)
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("cubic_cell device-resident memcpy c1: {err}"),
-            })?;
+            .gpu_ctx("cubic_cell device-resident memcpy c1")?;
         let d_c2 = stream
             .clone_htod(&c2)
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("cubic_cell device-resident memcpy c2: {err}"),
-            })?;
+            .gpu_ctx("cubic_cell device-resident memcpy c2")?;
         let d_c3 = stream
             .clone_htod(&c3)
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("cubic_cell device-resident memcpy c3: {err}"),
-            })?;
+            .gpu_ctx("cubic_cell device-resident memcpy c3")?;
         let d_branch =
             stream
                 .clone_htod(&branch_code)
-                .map_err(|err| GpuError::DriverCallFailed {
-                    reason: format!("cubic_cell device-resident memcpy branch: {err}"),
-                })?;
+                .gpu_ctx("cubic_cell device-resident memcpy branch")?;
         let mut d_moments = stream.alloc_zeros::<f64>(n_cells * stride).map_err(|err| {
-            GpuError::DriverCallFailed {
-                reason: format!("cubic_cell device-resident alloc moments: {err}"),
-            }
+            gpu_err!("cubic_cell device-resident alloc moments: {err}")
         })?;
         let mut d_status =
             stream
                 .alloc_zeros::<u8>(n_cells)
-                .map_err(|err| GpuError::DriverCallFailed {
-                    reason: format!("cubic_cell device-resident alloc status: {err}"),
-                })?;
+                .gpu_ctx("cubic_cell device-resident alloc status")?;
 
         let warps_per_block: u32 = 4;
         let block: u32 = 32 * warps_per_block;
-        let n_u32: u32 = u32::try_from(n_cells).map_err(|_| GpuError::DriverCallFailed {
-            reason: format!("cubic_cell n_cells={n_cells} overflows u32"),
-        })?;
+        let n_u32: u32 = u32::try_from(n_cells).map_err(|_| gpu_err!("cubic_cell n_cells={n_cells} overflows u32"))?;
         let grid: u32 = n_u32.div_ceil(warps_per_block).max(1);
         let cfg = LaunchConfig {
             grid_dim: (grid, 1, 1),
@@ -620,9 +558,7 @@ impl CubicCellGpuBackend {
         // and the kernel's lane-0 validator rejects unrecognized branch
         // codes (255 sentinel) by zeroing the row and writing
         // STATUS_INVALID, so classifier-rejected slots are safe.
-        unsafe { builder.launch(cfg) }.map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("cubic_cell device-resident kernel launch: {err}"),
-        })?;
+        unsafe { builder.launch(cfg) }.gpu_ctx("cubic_cell device-resident kernel launch")?;
 
         // Read back per-cell statuses so the host can:
         //   (a) merge with classifier-rejected entries it already knows
@@ -633,14 +569,10 @@ impl CubicCellGpuBackend {
         let kernel_status =
             stream
                 .clone_dtoh(&d_status)
-                .map_err(|err| GpuError::DriverCallFailed {
-                    reason: format!("cubic_cell device-resident DtoH status: {err}"),
-                })?;
+                .gpu_ctx("cubic_cell device-resident DtoH status")?;
         stream
             .synchronize()
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("cubic_cell device-resident sync after kernel: {err}"),
-            })?;
+            .gpu_ctx("cubic_cell device-resident sync after kernel")?;
 
         // Merge: if the classifier already rejected a cell, its specific
         // code wins (the kernel's row for that cell was zeroed by the
@@ -671,6 +603,8 @@ mod tests {
     };
     use crate::gpu::error::GpuError;
     use crate::gpu::runtime::GpuRuntime;
+use crate::gpu_err;
+use crate::gpu::error::GpuResultExt;
 
     /// Test-only DtoH helper for cubic-cell device residency parity tests.
     fn download_moments(
@@ -680,14 +614,10 @@ mod tests {
         let stream = &backend.inner.stream;
         let host = stream
             .clone_dtoh(d_moments)
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("cubic_cell tests::download_moments DtoH: {err}"),
-            })?;
+            .gpu_ctx("cubic_cell tests::download_moments DtoH")?;
         stream
             .synchronize()
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("cubic_cell tests::download_moments sync: {err}"),
-            })?;
+            .gpu_ctx("cubic_cell tests::download_moments sync")?;
         Ok(host)
     }
 
