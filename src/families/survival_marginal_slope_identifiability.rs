@@ -1038,6 +1038,48 @@ pub fn build_full_t_matrix(
     t
 }
 
+/// A single global-T block specification: the V matrix and the
+/// optional residualisation against earlier blocks for one block in
+/// the global block ordering. `r_against_earlier` is `Some(R)` where
+/// `R.nrows() == Σ_{a<b} raw_p_a` and `R.ncols() == kept_p_b`; or
+/// `None` for the very first block.
+pub struct GlobalTBlock {
+    pub v: Array2<f64>,
+    pub r_against_earlier: Option<Array2<f64>>,
+}
+
+/// Per-block global-T spec: for each top-level block (e.g. time,
+/// marginal, logslope) we carry an ordered list of `GlobalTBlock`s
+/// describing that block's per-term sub-partition. The global T is
+/// the block-upper-triangular reparameterisation across ALL terms in
+/// the order `blocks[0][0], blocks[0][1], …, blocks[1][0], …`.
+pub struct GlobalTSpec {
+    pub blocks: Vec<Vec<GlobalTBlock>>,
+}
+
+/// Assemble the global T across every (block, term) in the natural
+/// nested order encoded in `spec`. The output is shape
+/// `(Σ raw_p) × (Σ kept_p)` where the sums run over every leaf term
+/// in every top-level block, in nested order.
+///
+/// This delegates to `build_full_t_matrix` after flattening
+/// `spec.blocks` — the block-upper-triangular structure is the same
+/// regardless of how the leaf terms group into top-level blocks; the
+/// only thing the top-level grouping affects is the call-site
+/// indexing convention for things like β lift slices.
+pub fn build_global_t_matrix(spec: &GlobalTSpec) -> Array2<f64> {
+    let total_terms: usize = spec.blocks.iter().map(|b| b.len()).sum();
+    let mut v_flat: Vec<Array2<f64>> = Vec::with_capacity(total_terms);
+    let mut r_flat: Vec<Option<Array2<f64>>> = Vec::with_capacity(total_terms);
+    for block in &spec.blocks {
+        for term in block {
+            v_flat.push(term.v.clone());
+            r_flat.push(term.r_against_earlier.clone());
+        }
+    }
+    build_full_t_matrix(&v_flat, &r_flat)
+}
+
 /// Pull a single raw per-term penalty back through the full-width
 /// reparameterisation T. The penalty's `local` is `block_p × block_p`
 /// where `block_p == pen.col_range.len()`; `anchor_offset` is the start
@@ -2322,6 +2364,65 @@ mod tests {
         for i in 0..2 {
             for j in 0..2 {
                 assert_eq!(t[[3 + i, j]], 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn build_global_t_matrix_identity_when_all_v_eye_and_all_r_none() {
+        // Three top-level blocks (time / marginal / logslope) with two
+        // terms each, every V = I_2 and every R = None → global T = I.
+        let mk_block = || GlobalTBlock {
+            v: Array2::<f64>::eye(2),
+            r_against_earlier: None,
+        };
+        let spec = GlobalTSpec {
+            blocks: vec![
+                vec![mk_block(), mk_block()],
+                vec![mk_block(), mk_block()],
+                vec![mk_block(), mk_block()],
+            ],
+        };
+        let t = build_global_t_matrix(&spec);
+        let total: usize = 2 * 6;
+        assert_eq!(t.dim(), (total, total));
+        let eye = Array2::<f64>::eye(total);
+        for i in 0..total {
+            for j in 0..total {
+                assert!((t[[i, j]] - eye[[i, j]]).abs() < 1e-14);
+            }
+        }
+    }
+
+    #[test]
+    fn build_global_t_matrix_block_upper_triangular_with_cross_block_r() {
+        // Two top-level blocks, each with one term. Block 0: V_a = I_2,
+        // R = None. Block 1: V_b = I_2, R_against_earlier is a 2x2 dense
+        // block. Global T should have V_a on (0..2, 0..2), V_b on
+        // (2..4, 2..4), and -R on (0..2, 2..4).
+        let r_block = Array2::<f64>::from_shape_fn((2, 2), |(i, j)| 1.0 + (i + 2 * j) as f64);
+        let spec = GlobalTSpec {
+            blocks: vec![
+                vec![GlobalTBlock {
+                    v: Array2::<f64>::eye(2),
+                    r_against_earlier: None,
+                }],
+                vec![GlobalTBlock {
+                    v: Array2::<f64>::eye(2),
+                    r_against_earlier: Some(r_block.clone()),
+                }],
+            ],
+        };
+        let t = build_global_t_matrix(&spec);
+        assert_eq!(t.dim(), (4, 4));
+        for i in 0..2 {
+            for j in 0..2 {
+                let want_diag_a = if i == j { 1.0 } else { 0.0 };
+                let want_diag_b = if i == j { 1.0 } else { 0.0 };
+                assert!((t[[i, j]] - want_diag_a).abs() < 1e-14);
+                assert!((t[[2 + i, 2 + j]] - want_diag_b).abs() < 1e-14);
+                assert!((t[[i, 2 + j]] + r_block[[i, j]]).abs() < 1e-14);
+                assert_eq!(t[[2 + i, j]], 0.0);
             }
         }
     }
