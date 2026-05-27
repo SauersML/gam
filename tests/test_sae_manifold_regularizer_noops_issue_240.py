@@ -29,7 +29,8 @@ def _baseline(**overrides):
     ``src/terms/sae_manifold.rs::add_sae_analytic_penalty_contributions``.
     Holding ``atom_dim=2`` gives enough latent axes for
     ``block_orthogonality_weight`` to find a non-trivial 2-group partition,
-    and for ``mechanism_sparsity_groups=[[0],[1]]`` to address real features.
+    and for ``decoder_feature_sparsity_groups=[[0,1],[2,3]]`` to partition
+    the four-feature output into two basis-aligned decoder groups.
     """
     # `sphere` keeps `latent_dim == 2` (periodic atoms force it to 1
     # regardless of `atom_dim`). Block-orthogonality requires ≥2 axes.
@@ -100,11 +101,36 @@ def test_block_orthogonality_weight_is_not_a_silent_noop():
     _fit_must_react("block_orthogonality_weight", on_value=100.0, off_value=0.0)
 
 
-def test_mechanism_sparsity_groups_is_not_a_silent_noop():
+def test_decoder_feature_sparsity_groups_is_not_a_silent_noop():
+    # The four-feature output (n=32, d=4) must be partitioned end-to-end;
+    # MechanismSparsityPenalty requires every feature index in
+    # [0, p_out) to appear in exactly one group.
     _fit_must_react(
-        "mechanism_sparsity_groups",
-        on_value=[[0], [1]],
+        "decoder_feature_sparsity_groups",
+        on_value=[[0, 1], [2, 3]],
         off_value=None,
+    )
+
+
+def test_decoder_feature_sparsity_groups_produces_nontrivial_gradient():
+    """The previous ``mechanism_sparsity_groups`` kwarg silently raised
+    ``NotImplementedError`` — accepted by ``_fit_must_react`` as a principled
+    rejection. The stride-aware "beta" target view now wires
+    MechanismSparsityPenalty into the SAE decoder block. Fitting with the
+    new ``decoder_feature_sparsity_groups`` kwarg must actually return,
+    and the fit must visibly differ from the no-penalty baseline."""
+    X = _data(seed=4, n=32)
+    base = _baseline()
+    fit_off = gamfit.sae_manifold_fit(Z=X, **base)
+    fit_on = gamfit.sae_manifold_fit(
+        Z=X, **base, decoder_feature_sparsity_groups=[[0, 1], [2, 3]]
+    )
+    # Must not silently raise — the rename is a wiring change, not a deferral.
+    assert _differs(fit_on.fitted, fit_off.fitted) or _differs(
+        fit_on.assignments, fit_off.assignments
+    ), (
+        "decoder_feature_sparsity_groups failed to alter the fit; the SAE "
+        "'beta' target view dispatch is silent."
     )
 
 
