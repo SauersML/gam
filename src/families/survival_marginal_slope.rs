@@ -18980,18 +18980,41 @@ pub fn fit_survival_marginal_slope_terms(
             }
 
             let compiled = compile_survival_parametric_designs_per_term(
-                dq0,
-                dq1,
-                dqd1,
+                dq0.clone(),
+                dq1.clone(),
+                dqd1.clone(),
                 &time_partition,
-                m_dq,
-                m_dqd1,
+                m_dq.clone(),
+                m_dqd1.clone(),
                 &marginal_partition,
-                g_dg,
+                g_dg.clone(),
                 &logslope_partition,
                 &row_hess,
             )?;
-            let (dt, dm, dg) = compiled.drops_by_block;
+            let drops_by_block_initial = compiled.drops_by_block;
+            recompile_ctx = Some(SmgsRecompileAfterAcceptContext {
+                dq0,
+                dq1,
+                dqd1,
+                m_dq,
+                m_dqd1,
+                g_dg,
+                time_partition: time_partition.clone(),
+                marginal_partition: marginal_partition.clone(),
+                logslope_partition: logslope_partition.clone(),
+                offset_entry: spec.time_block.offset_entry.clone(),
+                offset_exit: spec.time_block.offset_exit.clone(),
+                derivative_offset_exit: spec.time_block.derivative_offset_exit.clone(),
+                marginal_offset: spec.marginal_offset.clone(),
+                logslope_offset: spec.logslope_offset.clone(),
+                z_primary: z_primary.clone(),
+                weights: spec.weights.clone(),
+                event: spec.event_target.clone(),
+                derivative_guard,
+                probit_scale,
+                drops_by_block_initial,
+            });
+            let (dt, dm, dg) = drops_by_block_initial;
             if dt + dm + dg == 0 {
                 // No aliasing → no reduction needed. Skip the apply.
                 return Ok(None);
@@ -19067,6 +19090,7 @@ pub fn fit_survival_marginal_slope_terms(
                     Some(applied.time_penalties),
                     Some(applied.marginal_penalties),
                     Some(applied.logslope_penalties),
+                    recompile_ctx,
                 )
             }
             Ok(None) => (
@@ -19079,6 +19103,7 @@ pub fn fit_survival_marginal_slope_terms(
                 None,
                 None,
                 None,
+                recompile_ctx,
             ),
             Err(reason) => {
                 log::warn!("[smgs phase-4b active] skipped: {reason}");
@@ -19088,6 +19113,7 @@ pub fn fit_survival_marginal_slope_terms(
                     spec.time_block.design_derivative_exit.clone(),
                     marginal_design.clone(),
                     logslope_design.clone(),
+                    None,
                     None,
                     None,
                     None,
