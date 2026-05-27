@@ -1879,6 +1879,82 @@ fn compute_trait_impl_mask(content: &str) -> Vec<bool> {
     mask
 }
 
+/// Build a per-line bitmap of "is this line inside the body of a `trait
+/// <Name> { ... }` definition?". Used to suppress the stub-function-body
+/// check on trait default-method bodies: a default body of `None` /
+/// `Ok(())` / `Default::default()` is the canonical Rust spelling of
+/// "implementor may override; the trait itself has nothing useful to do"
+/// and is not a stub in the "make the compile error vanish" sense the
+/// ban exists to catch. Mirrors the `compute_trait_impl_mask` shape:
+/// brace tracking uses the stripped-strings/comments rendering so braces
+/// inside literals or `//` comments do not perturb depth. Only the FIRST
+/// `{` following a top-level `trait ` header is matched as the trait body
+/// — subsequent braces inside (fn bodies, match arms, blocks) are pushed
+/// as non-trait-def scopes so we balance correctly on `}`.
+fn compute_trait_def_mask(content: &str) -> Vec<bool> {
+    let lines: Vec<&str> = content.lines().collect();
+    let n = lines.len();
+    let mut mask = vec![false; n];
+    let stripped_lines: Vec<String> = strip_file_lines(content);
+
+    let mut stack: Vec<(i32, bool)> = Vec::new();
+    let mut depth: i32 = 0;
+    let mut pending_trait = false;
+
+    for (idx, stripped) in stripped_lines.iter().enumerate() {
+        let inside_trait_def = stack.iter().any(|(_, t)| *t);
+        mask[idx] = inside_trait_def;
+
+        let trimmed = stripped.trim_start();
+        // Accept item-position `trait` header. Tolerate visibility / safety
+        // prefixes (`pub`, `pub(crate)`, `pub(super)`, `unsafe`). Exclude
+        // `impl ... for Trait` and `dyn Trait` shapes; those are handled by
+        // `compute_trait_impl_mask` (and don't open a trait *definition*).
+        let starts_trait = trimmed.starts_with("trait ")
+            || trimmed.starts_with("trait<")
+            || trimmed.starts_with("pub trait ")
+            || trimmed.starts_with("pub trait<")
+            || trimmed.starts_with("pub(crate) trait ")
+            || trimmed.starts_with("pub(crate) trait<")
+            || trimmed.starts_with("pub(super) trait ")
+            || trimmed.starts_with("pub(super) trait<")
+            || trimmed.starts_with("unsafe trait ")
+            || trimmed.starts_with("unsafe trait<")
+            || trimmed.starts_with("pub unsafe trait ")
+            || trimmed.starts_with("pub unsafe trait<")
+            || trimmed.starts_with("pub(crate) unsafe trait ")
+            || trimmed.starts_with("pub(crate) unsafe trait<")
+            || trimmed.starts_with("pub(super) unsafe trait ")
+            || trimmed.starts_with("pub(super) unsafe trait<");
+        if starts_trait && depth == 0 {
+            pending_trait = true;
+        }
+
+        let bytes = stripped.as_bytes();
+        for &b in bytes {
+            if b == b'{' {
+                let opened_at_depth = depth;
+                depth += 1;
+                if pending_trait && opened_at_depth == 0 {
+                    stack.push((opened_at_depth, true));
+                    pending_trait = false;
+                } else {
+                    stack.push((opened_at_depth, false));
+                }
+            } else if b == b'}' {
+                if let Some(&(entry, _)) = stack.last()
+                    && depth - 1 == entry
+                {
+                    stack.pop();
+                }
+                depth -= 1;
+            }
+        }
+    }
+
+    mask
+}
+
 /// True if `stripped` contains a `const <ident>: bool = <true|false>;`
 /// item-style declaration (visibility prefix tolerated; whitespace flexible
 /// throughout). Operates on the stripped line.
@@ -3060,6 +3136,7 @@ fn scan_for_useless_tests(root: &Path, dir: &Path, offenders: &mut Vec<(PathBuf,
                     || line_s.contains("todo!(")
                     || line_contains_propagating_question(line_s)
                     || line_contains_assertion_helper_macro(line_s)
+                    || line_contains_assertion_helper_call(line_s)
                 {
                     found = true;
                     break;
@@ -3112,6 +3189,56 @@ fn line_contains_assertion_helper_macro(stripped: &str) -> bool {
             continue;
         }
         // Walk back from `!` collecting ASCII ident bytes.
+        let mut start = i;
+        while start > 0 {
+            let b = bytes[start - 1];
+            if b == b'_' || b.is_ascii_alphanumeric() {
+                start -= 1;
+            } else {
+                break;
+            }
+        }
+        if start == i {
+            i += 1;
+            continue;
+        }
+        let name = &stripped[start..i];
+        if name.starts_with("assert_")
+            || name.starts_with("expect_")
+            || name.starts_with("require_")
+            || name.starts_with("ensure_")
+        {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// True when `stripped` contains a bare function call (`<ident>(...)` —
+/// no trailing `!`) whose name matches the same `assert_*` / `expect_*` /
+/// `require_*` / `ensure_*` convention as the helper-macro detector. Lets
+/// test bodies delegate to local helper *functions* (e.g.
+/// `assert_second_jet_matches_central_difference(&evaluator, coords, tol)`)
+/// without losing the "this test has assertions" recognition. The macro
+/// shape is already covered by `line_contains_assertion_helper_macro`; this
+/// extension matches the function-call shape with the same naming policy.
+fn line_contains_assertion_helper_call(stripped: &str) -> bool {
+    let bytes = stripped.as_bytes();
+    let n = bytes.len();
+    let mut i = 0usize;
+    while i < n {
+        if bytes[i] != b'(' {
+            i += 1;
+            continue;
+        }
+        // Skip the macro-call shape `<ident>!(` — handled by the helper-macro
+        // detector. We only want the bare-call shape here.
+        if i > 0 && bytes[i - 1] == b'!' {
+            i += 1;
+            continue;
+        }
+        // Walk back from `(` collecting ASCII ident bytes.
         let mut start = i;
         while start > 0 {
             let b = bytes[start - 1];
@@ -3890,6 +4017,7 @@ fn scan_for_stub_function_bodies(
             return;
         }
         let mask = compute_test_mask(content, rel);
+        let trait_def_mask = compute_trait_def_mask(content);
         let lines: Vec<&str> = content.lines().collect();
         let stripped_lines = strip_file_lines(content);
         let n = lines.len();
@@ -3904,6 +4032,16 @@ fn scan_for_stub_function_bodies(
                 continue;
             }
             if mask.get(i).copied().unwrap_or(false) {
+                i += 1;
+                continue;
+            }
+            // A `fn` inside the body of a `trait <Name> { ... }` definition
+            // is a default-method declaration. A sentinel body (`None`,
+            // `Ok(())`, `Default::default()`) there is the idiomatic "opt-in
+            // override" spelling, not a stub in the make-the-compile-error-
+            // vanish sense the ban targets — implementors that need real
+            // behaviour override the default. Skip these.
+            if trait_def_mask.get(i).copied().unwrap_or(false) {
                 i += 1;
                 continue;
             }
