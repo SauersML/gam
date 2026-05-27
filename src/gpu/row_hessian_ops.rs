@@ -27,6 +27,7 @@
 
 #[cfg(target_os = "linux")]
 use std::sync::Arc;
+#[cfg(target_os = "linux")]
 use std::sync::OnceLock;
 
 #[cfg(target_os = "linux")]

@@ -5312,11 +5312,11 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             payload.score_warp_runtime = fit
                 .score_warp_runtime
                 .as_ref()
-                .map(saved_anchored_deviation_runtime);
+                .map(saved_compiled_flex_block);
             payload.link_deviation_runtime = fit
                 .link_dev_runtime
                 .as_ref()
-                .map(saved_anchored_deviation_runtime);
+                .map(saved_compiled_flex_block);
             write_payload_json(&out, payload)?;
             progress.advance_workflow(survival_total_steps);
         }
@@ -7346,73 +7346,35 @@ fn build_location_scale_saved_model(
     SavedModel::from_payload(payload)
 }
 
-fn saved_anchored_deviation_runtime(runtime: &DeviationRuntime) -> SavedCompiledFlexBlock {
-    use gam::families::bernoulli_marginal_slope::deviation_runtime::{
-        AnchorComponentTag, AnchorNullSpaceEvaluator,
-    };
+fn saved_compiled_flex_block(runtime: &DeviationRuntime) -> SavedCompiledFlexBlock {
+    use gam::families::bernoulli_marginal_slope::deviation_runtime::AnchorComponentTag;
     use gam::inference::model::{SavedAnchorComponent, SavedAnchorKind};
 
     let mut anchor_correction: Option<Vec<Vec<f64>>> = None;
     let mut anchor_components: Vec<SavedAnchorComponent> = Vec::new();
-    let mut anchor_residual_rotation: Option<Vec<Vec<f64>>> = None;
-    if let Some(residual) = runtime.installed_flex_block() {
+    if let Some(installed) = runtime.installed_flex_block() {
         anchor_correction = Some(
-            residual
-                .residual_coefficients
+            installed
+                .anchor_correction
                 .rows()
                 .into_iter()
                 .map(|row| row.to_vec())
                 .collect::<Vec<Vec<f64>>>(),
         );
-        match &residual.null_basis_evaluator {
-            AnchorNullSpaceEvaluator::Stacked {
-                components,
-                orthonormalising_rotation,
-            } => {
-                for component in components {
-                    match component {
-                        AnchorComponentTag::Parametric { block, ncols } => {
-                            anchor_components.push(SavedAnchorComponent {
-                                kind: SavedAnchorKind::Parametric {
-                                    block: *block,
-                                    ncols: *ncols,
-                                },
-                            });
-                        }
-                        AnchorComponentTag::FlexEvaluation { ncols } => {
-                            anchor_components.push(SavedAnchorComponent {
-                                kind: SavedAnchorKind::FlexEvaluation { ncols: *ncols },
-                            });
+        for component in &installed.anchor_components {
+            anchor_components.push(SavedAnchorComponent {
+                kind: match component {
+                    AnchorComponentTag::Parametric { block, ncols } => {
+                        SavedAnchorKind::Parametric {
+                            block: *block,
+                            ncols: *ncols,
                         }
                     }
-                }
-                // Persist the rotation only if it is non-identity. The
-                // current construction bakes R into the coefficients, so
-                // the matrix is the identity and we save space/time by
-                // omitting it.
-                let d = orthonormalising_rotation.nrows();
-                let mut is_identity = orthonormalising_rotation.ncols() == d;
-                if is_identity {
-                    'outer: for i in 0..d {
-                        for j in 0..d {
-                            let expected = if i == j { 1.0 } else { 0.0 };
-                            if (orthonormalising_rotation[[i, j]] - expected).abs() > 1e-12 {
-                                is_identity = false;
-                                break 'outer;
-                            }
-                        }
+                    AnchorComponentTag::FlexEvaluation { ncols } => {
+                        SavedAnchorKind::FlexEvaluation { ncols: *ncols }
                     }
-                }
-                if !is_identity {
-                    anchor_residual_rotation = Some(
-                        orthonormalising_rotation
-                            .rows()
-                            .into_iter()
-                            .map(|row| row.to_vec())
-                            .collect::<Vec<Vec<f64>>>(),
-                    );
-                }
-            }
+                },
+            });
         }
     }
     SavedCompiledFlexBlock {
@@ -7445,7 +7407,6 @@ fn saved_anchored_deviation_runtime(runtime: &DeviationRuntime) -> SavedCompiled
             .collect(),
         anchor_correction,
         anchor_components,
-        anchor_residual_rotation,
     }
 }
 
@@ -7721,8 +7682,8 @@ fn build_bernoulli_marginal_slope_saved_model(
         .resolved_termspec_logslope
         .as_ref()
         .map(|spec| vec![spec.clone()]);
-    payload.score_warp_runtime = score_warp_runtime.map(saved_anchored_deviation_runtime);
-    payload.link_deviation_runtime = link_dev_runtime.map(saved_anchored_deviation_runtime);
+    payload.score_warp_runtime = score_warp_runtime.map(saved_compiled_flex_block);
+    payload.link_deviation_runtime = link_dev_runtime.map(saved_compiled_flex_block);
     Ok(SavedModel::from_payload(payload))
 }
 
@@ -11100,7 +11061,6 @@ mod tests {
             span_c3: vec![vec![0.0]],
             anchor_correction: None,
             anchor_components: Vec::new(),
-            anchor_residual_rotation: None,
         };
         let fit_result = compact_saved_multiblock_fit_result(
             vec![
@@ -13809,7 +13769,6 @@ mod tests {
             span_c3: vec![vec![0.0, 0.0]],
             anchor_correction: None,
             anchor_components: Vec::new(),
-            anchor_residual_rotation: None,
         });
         let model = SavedModel::from_payload(payload);
 
@@ -13832,7 +13791,6 @@ mod tests {
             span_c3: vec![vec![0.0]],
             anchor_correction: None,
             anchor_components: Vec::new(),
-            anchor_residual_rotation: None,
         };
         let zero_beta = Array1::zeros(saved_runtime.basis_dim);
 

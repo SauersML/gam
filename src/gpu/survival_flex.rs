@@ -3032,6 +3032,446 @@ pub fn try_device_layer_c_jet(
 }
 
 // ────────────────────────────────────────────────────────────────────────
+// Step 4 Layer C-β — optional `d_uv` second-derivative quadrature.
+//
+// Per CPU `compute_survival_timepoint_exact` lines 7017-7122 (the
+// `need_d_uv == true` branch):
+//
+//   eta_u_poly[u]   = chi_poly · a_u[u] + coeff_u[u]
+//   chi_u_poly[u]   = eta_aa_poly · a_u[u] + coeff_au[u]
+//   eta_uv_poly[u,v] = chi_poly · a_uv[u,v] + eta_aa_poly · a_u[u]·a_u[v]
+//                    + coeff_au[u] · a_u[v] + coeff_au[v] · a_u[u]
+//                    + r_uv_fixed_poly[u,v]
+//   chi_uv_poly[u,v] = eta_aa_poly · a_uv[u,v] + eta_aaa_poly · a_u[u]·a_u[v]
+//                    + coeff_aau[u] · a_u[v] + coeff_aau[v] · a_u[u]
+//                    + chi_uv_fixed_poly[u,v]
+//   r_uv_fixed_poly  = coeff_bu[g_idx_other]  if u or v == g_index else 0
+//   chi_uv_fixed_poly = coeff_abu[g_idx_other] if u or v == g_index else 0
+//
+//   integrand[u,v] = chi_uv_poly
+//                  - chi_u_poly[v] · eta_poly · eta_u_poly[u]
+//                  - chi_u_poly[u] · eta_poly · eta_u_poly[v]
+//                  - chi_poly · (eta_u_poly[u] · eta_u_poly[v]
+//                                + eta_poly · eta_uv_poly)
+//                  + chi_poly · eta_poly² · eta_u_poly[u] · eta_u_poly[v]
+//
+//   d_uv[u,v] = Σ_cells INV_TWO_PI · ⟨integrand[u,v], moments⟩
+//
+// Term degrees: term5 (chi · eta² · eta_u · eta_v) peaks at length
+// 4 + 4 + 4 + 4 + 4 - 4 = 16 → max moment index 16 → max_degree 16
+// (substrate supports 24).
+//
+// `eta_aaa_poly` comes from `cubic_cell_kernel::denested_cell_third_partials`
+// (first slot, `dc_daaa`).  Per-cell `coeff_aau[u]` and `coeff_abu[u]`
+// extensions of the Layer-C tables; callers compute them via the family's
+// `denested_cell_primary_fixed_partials` (lines 6235-6341).
+// ────────────────────────────────────────────────────────────────────────
+
+/// Extended per-cell coefficient tables for Layer C-β.  Extends
+/// [`SurvivalFlexLayerCCellCoeffs`] with `coeff_aau[u]` and `coeff_abu[u]`
+/// for the `chi_uv_poly` assembly and the `g_index`-branched
+/// `chi_uv_fixed_poly`.
+#[derive(Clone, Debug)]
+pub struct SurvivalFlexLayerCBetaCellCoeffs {
+    /// `coeff_u[u]`.
+    pub coeff_u: Vec<[f64; 4]>,
+    /// `coeff_au[u]`.
+    pub coeff_au: Vec<[f64; 4]>,
+    /// `coeff_bu[u]`.  Used for `r_uv_fixed_poly` (eta_uv assembly).
+    pub coeff_bu: Vec<[f64; 4]>,
+    /// `coeff_aau[u]`.  Used for `chi_uv_poly` mixed terms (CPU line 7070).
+    pub coeff_aau: Vec<[f64; 4]>,
+    /// `coeff_abu[u]`.  Used for `chi_uv_fixed_poly` (CPU line 7048).
+    pub coeff_abu: Vec<[f64; 4]>,
+}
+
+/// Per-row inputs for Layer C-β `d_uv` quadrature.
+#[derive(Clone, Debug)]
+pub struct SurvivalFlexLayerCBetaRowInputs<'a> {
+    /// Per-row partition cells (same as Layer A/B/C-α).
+    pub partition_cells: &'a [SurvivalFlexCalibrationCell],
+    /// Extended per-cell coefficient tables.
+    pub cell_coeffs: &'a [SurvivalFlexLayerCBetaCellCoeffs],
+    /// `g_index` for the second-coeff branching; `usize::MAX` to disable.
+    pub g_index: usize,
+    /// Pre-computed first-order `a_u[u]` (length `p`) from Layer C-α.
+    pub a_u: &'a [f64],
+    /// Pre-computed second-order `a_uv[u,v]` (dense row-major `p × p`)
+    /// from Layer C-α.
+    pub a_uv: &'a [f64],
+    /// Calibration root `a*`.
+    pub a: f64,
+    /// Slope `b`.
+    pub slope: f64,
+    /// `probit_scale`.
+    pub probit_scale: f64,
+}
+
+/// Per-row Layer C-β outputs: dense `d_uv` (row-major `p × p`, symmetric).
+#[derive(Clone, Debug)]
+pub struct SurvivalFlexLayerCBetaRowOutputs {
+    pub d_uv: Vec<f64>,
+}
+
+/// Substrate-backed Layer C-β `d_uv` fold.  Builds the substrate moment
+/// batch at `max_degree = 16` (sufficient for the degree-16 quintic
+/// term5), then performs the per-(u,v) polynomial-product chain on host.
+pub fn try_device_layer_c_beta_d_uv(
+    rows: &[SurvivalFlexLayerCBetaRowInputs<'_>],
+) -> Result<Option<Vec<SurvivalFlexLayerCBetaRowOutputs>>, GpuError> {
+    use crate::families::cubic_cell_kernel::{
+        cell_polynomial_integral_from_moments, denested_cell_coefficient_partials,
+        denested_cell_second_partials, denested_cell_third_partials,
+    };
+
+    if rows.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+    let n_rows = rows.len();
+
+    let mut total_cells = 0usize;
+    let mut row_offsets = Vec::with_capacity(n_rows + 1);
+    row_offsets.push(0);
+    for (i, row) in rows.iter().enumerate() {
+        let p = row.a_u.len();
+        if row.a_uv.len() != p * p {
+            return Err(GpuError::DriverCallFailed {
+                reason: format!(
+                    "layer_c_beta row {i}: a_uv.len()={} != p*p = {}",
+                    row.a_uv.len(),
+                    p * p
+                ),
+            });
+        }
+        if row.partition_cells.len() != row.cell_coeffs.len() {
+            return Err(GpuError::DriverCallFailed {
+                reason: format!(
+                    "layer_c_beta row {i}: cells.len()={} != cell_coeffs.len()={}",
+                    row.partition_cells.len(),
+                    row.cell_coeffs.len()
+                ),
+            });
+        }
+        for (k, cc) in row.cell_coeffs.iter().enumerate() {
+            for (name, len) in [
+                ("coeff_u", cc.coeff_u.len()),
+                ("coeff_au", cc.coeff_au.len()),
+                ("coeff_bu", cc.coeff_bu.len()),
+                ("coeff_aau", cc.coeff_aau.len()),
+                ("coeff_abu", cc.coeff_abu.len()),
+            ] {
+                if len != p {
+                    return Err(GpuError::DriverCallFailed {
+                        reason: format!(
+                            "layer_c_beta row {i} cell {k}: {name}.len()={len} expected {p}"
+                        ),
+                    });
+                }
+            }
+        }
+        if !(row.probit_scale.is_finite() && row.probit_scale > 0.0) {
+            return Err(GpuError::DriverCallFailed {
+                reason: format!(
+                    "layer_c_beta row {i}: probit_scale must be positive finite, got {}",
+                    row.probit_scale
+                ),
+            });
+        }
+        total_cells += row.partition_cells.len();
+        row_offsets.push(total_cells);
+    }
+
+    if total_cells == 0 {
+        let mut out = Vec::with_capacity(n_rows);
+        for row in rows {
+            let p = row.a_u.len();
+            out.push(SurvivalFlexLayerCBetaRowOutputs {
+                d_uv: vec![0.0; p * p],
+            });
+        }
+        return Ok(Some(out));
+    }
+
+    // Substrate batch at max_degree 16 (covers term5's degree-16 monomial).
+    let mut left = Vec::with_capacity(total_cells);
+    let mut right = Vec::with_capacity(total_cells);
+    let mut c0 = Vec::with_capacity(total_cells);
+    let mut c1 = Vec::with_capacity(total_cells);
+    let mut c2 = Vec::with_capacity(total_cells);
+    let mut c3 = Vec::with_capacity(total_cells);
+    for row in rows {
+        for pc in row.partition_cells {
+            left.push(pc.cell.left);
+            right.push(pc.cell.right);
+            c0.push(-pc.cell.c0);
+            c1.push(-pc.cell.c1);
+            c2.push(-pc.cell.c2);
+            c3.push(-pc.cell.c3);
+        }
+    }
+    let batch = SurvivalFlexRowCellsBatch {
+        n_cells: total_cells,
+        n_rows,
+        max_degree: 16,
+        left: &left,
+        right: &right,
+        c0: &c0,
+        c1: &c1,
+        c2: &c2,
+        c3: &c3,
+        row_offsets: &row_offsets,
+    };
+    let mom = match try_row_batched_cell_moments(batch)? {
+        Some(m) => m,
+        None => return Ok(None),
+    };
+    let stride = mom.stride;
+    if stride < 17 {
+        return Err(GpuError::DriverCallFailed {
+            reason: format!("layer_c_beta: substrate returned stride={stride} < 17"),
+        });
+    }
+    let ok_byte = super::cubic_cell::CubicCellMomentStatus::Ok as u8;
+    if mom.status.iter().any(|&s| s != ok_byte) {
+        return Ok(None);
+    }
+
+    // Helpers: poly_add_into / poly_mul_into operating on fixed-capacity
+    // [f64; N] buffers.  All intermediate degrees ≤ 16, so N = 20 covers
+    // every accumulator without dynamic allocation.
+    const POLY_CAP: usize = 20;
+    #[inline]
+    fn poly_add_4(a: &[f64; 4], b: &[f64; 4]) -> [f64; 4] {
+        [a[0] + b[0], a[1] + b[1], a[2] + b[2], a[3] + b[3]]
+    }
+    #[inline]
+    fn poly_scale_4(p: &[f64; 4], s: f64) -> [f64; 4] {
+        [s * p[0], s * p[1], s * p[2], s * p[3]]
+    }
+    /// `out[k] = Σ_{i+j=k} a[i] · b[j]`.  Returns `out_len = a_len + b_len - 1`.
+    #[inline]
+    fn poly_mul_into(a: &[f64], b: &[f64], out: &mut [f64; POLY_CAP]) -> usize {
+        out.iter_mut().for_each(|v| *v = 0.0);
+        for i in 0..a.len() {
+            for j in 0..b.len() {
+                out[i + j] = a[i].mul_add(b[j], out[i + j]);
+            }
+        }
+        a.len() + b.len() - 1
+    }
+
+    let mut out = Vec::with_capacity(n_rows);
+    for (row_idx, row) in rows.iter().enumerate() {
+        let p = row.a_u.len();
+        let row_start = row_offsets[row_idx];
+        let row_end = row_offsets[row_idx + 1];
+        let mut d_uv = vec![0.0_f64; p * p];
+
+        for cell_idx in row_start..row_end {
+            let local_idx = cell_idx - row_start;
+            let pc = &row.partition_cells[local_idx];
+            let cc = &row.cell_coeffs[local_idx];
+            let moments_row = &mom.moments[cell_idx * stride..cell_idx * stride + stride];
+
+            // Per-cell polynomial seeds at this row's (a, slope).
+            let (dc_da_pos, _) =
+                denested_cell_coefficient_partials(pc.score_span, pc.link_span, row.a, row.slope);
+            let (dc_daa_pos, _, _) =
+                denested_cell_second_partials(pc.score_span, pc.link_span, row.a, row.slope);
+            let (dc_daaa_pos, _, _, _) = denested_cell_third_partials(pc.link_span);
+            // Sign convention: integrand wraps `-Φ(-η)` so every cell
+            // polynomial seed is `-probit_scale` (Layer A/B/C-α convention).
+            let chi_poly: [f64; 4] = [
+                -row.probit_scale * dc_da_pos[0],
+                -row.probit_scale * dc_da_pos[1],
+                -row.probit_scale * dc_da_pos[2],
+                -row.probit_scale * dc_da_pos[3],
+            ];
+            let eta_aa_poly: [f64; 4] = [
+                -row.probit_scale * dc_daa_pos[0],
+                -row.probit_scale * dc_daa_pos[1],
+                -row.probit_scale * dc_daa_pos[2],
+                -row.probit_scale * dc_daa_pos[3],
+            ];
+            let eta_aaa_poly: [f64; 4] = [
+                -row.probit_scale * dc_daaa_pos[0],
+                -row.probit_scale * dc_daaa_pos[1],
+                -row.probit_scale * dc_daaa_pos[2],
+                -row.probit_scale * dc_daaa_pos[3],
+            ];
+            let eta_poly: [f64; 4] = [pc.cell.c0, pc.cell.c1, pc.cell.c2, pc.cell.c3];
+
+            // Pre-compute eta_poly² (length 7) and chi · eta² (length 10);
+            // reused across every (u, v) pair.
+            let mut eta_sq = [0.0_f64; POLY_CAP];
+            let eta_sq_len = poly_mul_into(&eta_poly, &eta_poly, &mut eta_sq);
+            let mut chi_eta_sq = [0.0_f64; POLY_CAP];
+            let chi_eta_sq_len =
+                poly_mul_into(&chi_poly, &eta_sq[..eta_sq_len], &mut chi_eta_sq);
+
+            // Pre-compute eta_u_poly[u] and chi_u_poly[u] per primary.
+            let mut eta_u_poly: Vec<[f64; 4]> = Vec::with_capacity(p);
+            let mut chi_u_poly: Vec<[f64; 4]> = Vec::with_capacity(p);
+            for u in 0..p {
+                eta_u_poly.push(poly_add_4(
+                    &poly_scale_4(&chi_poly, row.a_u[u]),
+                    &cc.coeff_u[u],
+                ));
+                chi_u_poly.push(poly_add_4(
+                    &poly_scale_4(&eta_aa_poly, row.a_u[u]),
+                    &cc.coeff_au[u],
+                ));
+            }
+
+            for u in 0..p {
+                for v in u..p {
+                    let r_uv_fixed: [f64; 4] = if u == row.g_index {
+                        cc.coeff_bu[v]
+                    } else if v == row.g_index {
+                        cc.coeff_bu[u]
+                    } else {
+                        [0.0; 4]
+                    };
+                    let chi_uv_fixed: [f64; 4] = if u == row.g_index {
+                        cc.coeff_abu[v]
+                    } else if v == row.g_index {
+                        cc.coeff_abu[u]
+                    } else {
+                        [0.0; 4]
+                    };
+
+                    let auv = row.a_uv[u * p + v];
+                    let au = row.a_u[u];
+                    let av = row.a_u[v];
+
+                    // eta_uv_poly = chi·a_uv + eta_aa·a_u·a_v + coeff_au[u]·a_v + coeff_au[v]·a_u + r_uv_fixed
+                    let eta_uv_poly: [f64; 4] = {
+                        let a = poly_scale_4(&chi_poly, auv);
+                        let b = poly_scale_4(&eta_aa_poly, au * av);
+                        let c = poly_scale_4(&cc.coeff_au[u], av);
+                        let d = poly_scale_4(&cc.coeff_au[v], au);
+                        let mut s = poly_add_4(&a, &b);
+                        s = poly_add_4(&s, &c);
+                        s = poly_add_4(&s, &d);
+                        poly_add_4(&s, &r_uv_fixed)
+                    };
+                    // chi_uv_poly = eta_aa·a_uv + eta_aaa·a_u·a_v + coeff_aau[u]·a_v + coeff_aau[v]·a_u + chi_uv_fixed
+                    let chi_uv_poly: [f64; 4] = {
+                        let a = poly_scale_4(&eta_aa_poly, auv);
+                        let b = poly_scale_4(&eta_aaa_poly, au * av);
+                        let c = poly_scale_4(&cc.coeff_aau[u], av);
+                        let d = poly_scale_4(&cc.coeff_aau[v], au);
+                        let mut s = poly_add_4(&a, &b);
+                        s = poly_add_4(&s, &c);
+                        s = poly_add_4(&s, &d);
+                        poly_add_4(&s, &chi_uv_fixed)
+                    };
+
+                    // term2 = -chi_u[v] · eta · eta_u[u], length 4+4+4-2 = 10
+                    let mut chi_u_v_eta = [0.0_f64; POLY_CAP];
+                    let len_a = poly_mul_into(&chi_u_poly[v], &eta_poly, &mut chi_u_v_eta);
+                    let mut term2 = [0.0_f64; POLY_CAP];
+                    let term2_len = poly_mul_into(
+                        &chi_u_v_eta[..len_a],
+                        &eta_u_poly[u],
+                        &mut term2,
+                    );
+                    for k in 0..term2_len {
+                        term2[k] = -term2[k];
+                    }
+
+                    // term3 = -chi_u[u] · eta · eta_u[v], length 10
+                    let mut chi_u_u_eta = [0.0_f64; POLY_CAP];
+                    let len_b = poly_mul_into(&chi_u_poly[u], &eta_poly, &mut chi_u_u_eta);
+                    let mut term3 = [0.0_f64; POLY_CAP];
+                    let term3_len = poly_mul_into(
+                        &chi_u_u_eta[..len_b],
+                        &eta_u_poly[v],
+                        &mut term3,
+                    );
+                    for k in 0..term3_len {
+                        term3[k] = -term3[k];
+                    }
+
+                    // term4 = -chi · (eta_u[u] · eta_u[v] + eta · eta_uv)
+                    // First the inner sum.
+                    let mut eu_u_eu_v = [0.0_f64; POLY_CAP];
+                    let len_c = poly_mul_into(&eta_u_poly[u], &eta_u_poly[v], &mut eu_u_eu_v);
+                    let mut eta_eta_uv = [0.0_f64; POLY_CAP];
+                    let len_d = poly_mul_into(&eta_poly, &eta_uv_poly, &mut eta_eta_uv);
+                    let inner_len = len_c.max(len_d);
+                    let mut inner = [0.0_f64; POLY_CAP];
+                    for k in 0..len_c {
+                        inner[k] = eu_u_eu_v[k];
+                    }
+                    for k in 0..len_d {
+                        inner[k] += eta_eta_uv[k];
+                    }
+                    let mut term4 = [0.0_f64; POLY_CAP];
+                    let term4_len = poly_mul_into(&chi_poly, &inner[..inner_len], &mut term4);
+                    for k in 0..term4_len {
+                        term4[k] = -term4[k];
+                    }
+
+                    // term5 = chi · eta² · eta_u[u] · eta_u[v]
+                    //       = chi_eta_sq · eta_u[u] · eta_u[v]
+                    let mut t5_a = [0.0_f64; POLY_CAP];
+                    let len_e = poly_mul_into(
+                        &chi_eta_sq[..chi_eta_sq_len],
+                        &eta_u_poly[u],
+                        &mut t5_a,
+                    );
+                    let mut term5 = [0.0_f64; POLY_CAP];
+                    let term5_len = poly_mul_into(&t5_a[..len_e], &eta_u_poly[v], &mut term5);
+
+                    // integrand = chi_uv_poly + term2 + term3 + term4 + term5
+                    let total_len = term5_len
+                        .max(term4_len)
+                        .max(term3_len)
+                        .max(term2_len)
+                        .max(4);
+                    let mut integrand = [0.0_f64; POLY_CAP];
+                    for k in 0..4 {
+                        integrand[k] = chi_uv_poly[k];
+                    }
+                    for k in 0..term2_len {
+                        integrand[k] += term2[k];
+                    }
+                    for k in 0..term3_len {
+                        integrand[k] += term3[k];
+                    }
+                    for k in 0..term4_len {
+                        integrand[k] += term4[k];
+                    }
+                    for k in 0..term5_len {
+                        integrand[k] += term5[k];
+                    }
+
+                    let value = cell_polynomial_integral_from_moments(
+                        &integrand[..total_len],
+                        moments_row,
+                        "survival_flex layer_c_beta d_uv",
+                    )
+                    .map_err(|e| GpuError::DriverCallFailed {
+                        reason: format!(
+                            "layer_c_beta row {row_idx} cell {local_idx} u={u} v={v}: d_uv: {e}"
+                        ),
+                    })?;
+                    d_uv[u * p + v] += value;
+                    if v != u {
+                        d_uv[v * p + u] += value;
+                    }
+                }
+            }
+        }
+
+        out.push(SurvivalFlexLayerCBetaRowOutputs { d_uv });
+    }
+
+    Ok(Some(out))
+}
+
+// ────────────────────────────────────────────────────────────────────────
 // Three thin pullback entry points.  The bodies all currently return
 // `Ok(None)` (the unsupported sentinel) because Steps 2–5 still need to
 // land the flex / cubic-cell / intercept-solve infrastructure before
@@ -4480,6 +4920,134 @@ mod survival_flex_gpu_tests {
                     (cuv - cvu).abs() <= 1e-12 * (1.0 + cuv.abs().max(cvu.abs())),
                     "chi_uv symmetry: ({u},{v})={cuv} vs ({v},{u})={cvu}"
                 );
+            }
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Step 4 Layer C-β — `try_device_layer_c_beta_d_uv` algebraic identity tests.
+    //
+    // Two identity bars:
+    //   1. With zero coefficient tables and zero a_u / a_uv inputs, every
+    //      integrand term vanishes term-by-term → d_uv == 0.
+    //   2. Non-trivial fixture asserts d_uv symmetric under (u ↔ v) and
+    //      finite.
+    // ────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn step4c_beta_zero_inputs_yield_zero_d_uv() {
+        let cell = step4b_fixture_cell();
+        let p = 2usize;
+        let zero4 = [0.0_f64; 4];
+        let cc = SurvivalFlexLayerCBetaCellCoeffs {
+            coeff_u: vec![zero4; p],
+            coeff_au: vec![zero4; p],
+            coeff_bu: vec![zero4; p],
+            coeff_aau: vec![zero4; p],
+            coeff_abu: vec![zero4; p],
+        };
+        let a_u = vec![0.0_f64; p];
+        let a_uv = vec![0.0_f64; p * p];
+
+        let row = SurvivalFlexLayerCBetaRowInputs {
+            partition_cells: std::slice::from_ref(&cell),
+            cell_coeffs: std::slice::from_ref(&cc),
+            g_index: usize::MAX,
+            a_u: &a_u,
+            a_uv: &a_uv,
+            a: 0.07,
+            slope: 0.55,
+            probit_scale: 1.0,
+        };
+        let out = match try_device_layer_c_beta_d_uv(std::slice::from_ref(&row)) {
+            Ok(Some(o)) => o,
+            Ok(None) => {
+                eprintln!("[step4c_beta zero] substrate non-OK or empty; skipping");
+                return;
+            }
+            Err(err) => panic!("layer_c_beta zero-inputs test failed: {err:?}"),
+        };
+        assert_eq!(out.len(), 1);
+        let r = &out[0];
+        for u in 0..p {
+            for v in 0..p {
+                assert!(
+                    r.d_uv[u * p + v].abs() <= 5e-15,
+                    "d_uv[{u},{v}] should be 0 (all-zero inputs), got {}",
+                    r.d_uv[u * p + v]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn step4c_beta_d_uv_symmetric() {
+        let cell = step4b_fixture_cell();
+        let p = 3usize;
+        let cc = SurvivalFlexLayerCBetaCellCoeffs {
+            coeff_u: vec![
+                [0.12, 0.05, -0.03, 0.01],
+                [0.07, -0.04, 0.02, 0.0],
+                [-0.06, 0.03, 0.01, -0.005],
+            ],
+            coeff_au: vec![
+                [0.02, 0.01, 0.0, 0.0],
+                [0.015, -0.005, 0.0, 0.0],
+                [-0.01, 0.008, 0.0, 0.0],
+            ],
+            coeff_bu: vec![
+                [0.0; 4],
+                [0.03, 0.01, 0.0, 0.0],
+                [0.0; 4],
+            ],
+            coeff_aau: vec![
+                [0.005, 0.002, 0.0, 0.0],
+                [0.003, -0.001, 0.0, 0.0],
+                [-0.002, 0.001, 0.0, 0.0],
+            ],
+            coeff_abu: vec![
+                [0.0; 4],
+                [0.008, 0.002, 0.0, 0.0],
+                [0.0; 4],
+            ],
+        };
+        let a_u = vec![0.21_f64, -0.13, 0.07];
+        // Symmetric a_uv.
+        let a_uv = vec![
+            0.04, -0.03, 0.02,
+            -0.03, 0.11, -0.01,
+            0.02, -0.01, 0.06_f64,
+        ];
+
+        let row = SurvivalFlexLayerCBetaRowInputs {
+            partition_cells: std::slice::from_ref(&cell),
+            cell_coeffs: std::slice::from_ref(&cc),
+            g_index: 1,
+            a_u: &a_u,
+            a_uv: &a_uv,
+            a: 0.07,
+            slope: 0.55,
+            probit_scale: 1.0,
+        };
+        let out = match try_device_layer_c_beta_d_uv(std::slice::from_ref(&row)) {
+            Ok(Some(o)) => o,
+            Ok(None) => {
+                eprintln!("[step4c_beta sym] substrate non-OK or empty; skipping");
+                return;
+            }
+            Err(err) => panic!("layer_c_beta symmetry test failed: {err:?}"),
+        };
+        assert_eq!(out.len(), 1);
+        let r = &out[0];
+        for u in 0..p {
+            for v in (u + 1)..p {
+                let uv = r.d_uv[u * p + v];
+                let vu = r.d_uv[v * p + u];
+                assert!(
+                    (uv - vu).abs() <= 1e-12 * (1.0 + uv.abs().max(vu.abs())),
+                    "d_uv symmetry: ({u},{v})={uv} vs ({v},{u})={vu}"
+                );
+                assert!(uv.is_finite(), "d_uv[{u},{v}] non-finite: {uv}");
             }
         }
     }

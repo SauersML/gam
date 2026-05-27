@@ -3551,7 +3551,6 @@ mod tests {
             span_c3: vec![vec![0.0; basis_dim]],
             anchor_correction: None,
             anchor_components: Vec::new(),
-            anchor_residual_rotation: None,
         }
     }
 
