@@ -1,12 +1,13 @@
+use std::ops::Neg;
 use crate::estimate::EstimationError;
 use crate::families::lognormal_kernel::latent_cloglog_jet5;
 use crate::probability::{
     normal_cdf, normal_pdf,
     stable_polynomial_times_exp_neg as stable_nonnegative_poly_times_exp_neg,
 };
-use crate::types::{
+use crate::types::{StandardLink, 
     InverseLink, LatentCLogLogState, LikelihoodSpec, LinkComponent, LinkFunction, MixtureLinkSpec,
-    MixtureLinkState, ResponseFamily, SasLinkSpec, SasLinkState, StandardLink,
+    MixtureLinkState, ResponseFamily, SasLinkSpec, SasLinkState, 
 };
 use ndarray::Array1;
 use statrs::function::beta::{beta_reg, ln_beta};
@@ -1402,12 +1403,14 @@ impl std::ops::Div for ShapeDual {
     }
 }
 
+
+
 impl std::ops::Neg for ShapeDual {
     type Output = Self;
 
     #[inline]
     fn neg(self) -> Self {
-        Self {
+        ShapeDual {
             v: -self.v,
             da: -self.da,
             db: -self.db,
@@ -1485,7 +1488,7 @@ fn beta_reg_with_shape_partials(a0: f64, b0: f64, x0: f64) -> (f64, f64, f64) {
         d = one / d;
         h = h * d * c;
 
-        aa = -(a + md) * (qab + md) * shape_dual(x) / ((a + m2d) * (qap + m2d));
+        aa = (a + md).neg() * (qab + md) * shape_dual(x) / ((a + m2d) * (qap + m2d));
         d = (one + aa * d).clamp_small(fpmin);
         c = (one + aa / c).clamp_small(fpmin);
         d = one / d;
@@ -1989,7 +1992,7 @@ pub fn sas_inverse_link_jetwith_param_partials(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{InverseLink, LinkComponent, LinkFunction, StandardLink, MixtureLinkSpec, SasLinkState};
+    use crate::types::{InverseLink, LinkComponent, MixtureLinkSpec, SasLinkState};
 
     #[test]
     fn softmax_jacobian_matchesfd() {

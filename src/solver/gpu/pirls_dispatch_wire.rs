@@ -146,8 +146,8 @@ mod linux_impl {
         n: usize,
         p: usize,
     ) -> Result<(PirlsResult, WorkingModelPirlsResult), String> {
-        debug_assert_eq!(admission.n, n);
-        debug_assert_eq!(admission.p, p);
+        assert_eq!(admission.n, n);
+        assert_eq!(admission.p, p);
         // --- Device upload + workspace allocation -----------------------
         let shared = pirls_gpu::upload_shared_pirls_gpu(input.x_transformed)?;
         let mut ws = pirls_gpu::allocate_sigma_pirls_workspace(&shared)?;
@@ -159,7 +159,7 @@ mod linux_impl {
         // Sanity-check that the host-side enum maps round-trip; if a future
         // change to PirlsLoopCurvatureKind / HessianCurvatureKind drops a
         // case this assertion will catch the gap at the dispatch boundary.
-        debug_assert!(matches!(
+        assert!(matches!(
             exported_to_loop(input.exported_curvature),
             PirlsLoopCurvatureKind::Fisher | PirlsLoopCurvatureKind::Observed
         ));
@@ -243,7 +243,7 @@ mod linux_impl {
         // MaxIterationsReached); make the relationship explicit so a future
         // refactor that breaks the invariant trips here rather than silently
         // mis-stamping `PirlsResult.status`.
-        debug_assert_eq!(
+        assert_eq!(
             converged,
             matches!(status, PirlsStatus::Converged | PirlsStatus::StalledAtValidMinimum),
             "GPU outcome converged flag inconsistent with status",
@@ -505,8 +505,8 @@ mod linux_impl {
         // outer LM consumers; if the loop did not stamp a separate
         // `finalweights`, fall back to `final_w_hessian` so REML's
         // `H = XᵀW_HX + S_λ` reconstruction has the curvature it expects.
-        debug_assert_eq!(final_w_hessian.len(), n);
-        debug_assert_eq!(final_grad_eta.len(), n);
+        assert_eq!(final_w_hessian.len(), n);
+        assert_eq!(final_grad_eta.len(), n);
 
         Ok((pirls_result, working_summary))
     }

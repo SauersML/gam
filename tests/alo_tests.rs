@@ -4,8 +4,8 @@ use gam::construction::CanonicalPenalty;
 use gam::faer_ndarray::{FaerArrayView, FaerColView, factorize_symmetricwith_fallback, fast_ata};
 use gam::pirls::{self, PenaltyConfig, PirlsConfig, PirlsProblem};
 use gam::types::{
-    GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkFunction, StandardLink, LogSmoothingParamsView,
-    ResponseFamily,
+    GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkFunction, LogSmoothingParamsView,
+    ResponseFamily, StandardLink,
 };
 use ndarray::{Array1, Array2, Axis};
 use rand::SeedableRng;
@@ -48,12 +48,14 @@ fn fit_unpenalized(
     let rho = Array1::<f64>::zeros(0);
     let offset = Array1::<f64>::zeros(x.nrows());
     let canonical: Vec<gam::construction::CanonicalPenalty> = Vec::new();
+    let standard_link = StandardLink::try_from(link)
+        .expect("ALO PIRLS tests only pass stateless standard links into these helpers");
     let cfg = PirlsConfig {
         likelihood: GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
             ResponseFamily::Binomial,
             InverseLink::Standard(StandardLink::Logit),
         )),
-        link_kind: InverseLink::Standard(link),
+        link_kind: InverseLink::Standard(standard_link),
         max_iterations: 100,
         convergence_tolerance: 1e-10,
         firth_bias_reduction: matches!(link, LinkFunction::Logit),
@@ -97,6 +99,8 @@ fn fit_identity_penalized(
 ) -> pirls::PirlsResult {
     let rho = Array1::from_vec(vec![lambda.ln()]);
     let offset = Array1::<f64>::zeros(x.nrows());
+    let standard_link = StandardLink::try_from(link)
+        .expect("ALO PIRLS tests only pass stateless standard links into these helpers");
     let root = Array2::<f64>::eye(x.ncols());
     let local = root.t().dot(&root);
     let canonical = vec![CanonicalPenalty {
@@ -114,7 +118,7 @@ fn fit_identity_penalized(
             ResponseFamily::Binomial,
             InverseLink::Standard(StandardLink::Logit),
         )),
-        link_kind: InverseLink::Standard(link),
+        link_kind: InverseLink::Standard(standard_link),
         max_iterations: 100,
         convergence_tolerance: 1e-10,
         firth_bias_reduction: false,

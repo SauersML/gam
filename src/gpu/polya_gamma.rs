@@ -1775,7 +1775,6 @@ mod tests {
         // β* = (1.5, -0.7, 0.3). Drop the first 50 as burn-in and check that
         // the posterior mean direction aligns with β* (cosine > 0.85).
         use rand::{RngExt, SeedableRng, rngs::StdRng};
-use crate::gpu::error::GpuResultExt;
         let n = 400;
         let p = 3;
         let beta_star = [1.5_f64, -0.7, 0.3];

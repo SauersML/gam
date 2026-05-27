@@ -1,10 +1,11 @@
+use crate::solver::pirls::PIRLS_CACHE_BYTE_BUDGET;
 use self::inner_strategy::GeometryBackendKind;
 use super::*;
 use crate::linalg::sparse_exact::{
     SparseExactFactor, SparsePenaltyBlock, assemble_and_factor_sparse_penalized_system,
 };
 use crate::solver::outer_strategy::OuterEval;
-use crate::types::SasLinkState;
+use crate::types::{StandardLink, SasLinkState};
 use ndarray::{Array2, s};
 use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
@@ -331,8 +332,8 @@ mod tests {
     use crate::pirls::PirlsCoordinateFrame;
     use crate::solver::outer_strategy::{HessianResult, OuterEval};
     use crate::terms::basis::{ImplicitDesignPsiDerivative, RadialScalarKind};
-    use crate::types::{
-        GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkFunction, StandardLink, ResponseFamily,
+    use crate::types::{StandardLink, 
+        GlmLikelihoodSpec, InverseLink, LikelihoodSpec, ResponseFamily,
     };
     use faer::Side;
     use ndarray::{Array1, Array2, array, s};

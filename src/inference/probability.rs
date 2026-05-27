@@ -1,6 +1,6 @@
 use crate::estimate::EstimationError;
 use crate::mixture_link::inverse_link_jet_for_family;
-use crate::types::LikelihoodSpec;
+use crate::types::{StandardLink, LikelihoodSpec};
 use ndarray::{Array1, ArrayView1};
 use statrs::function::erf::erfc;
 
@@ -334,8 +334,8 @@ pub fn try_inverse_link_array(
 mod tests {
     use super::*;
     use crate::mixture_link::{state_from_sasspec, state_fromspec};
-    use crate::types::{
-        InverseLink, LinkComponent, LinkFunction, StandardLink, MixtureLinkSpec, ResponseFamily, SasLinkSpec,
+    use crate::types::{StandardLink, 
+        InverseLink, LinkComponent, LinkFunction, MixtureLinkSpec, ResponseFamily, SasLinkSpec,
     };
     use ndarray::array;
 

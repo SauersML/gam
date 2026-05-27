@@ -53,7 +53,7 @@
 
 use ndarray::{Array1, Array2, ArrayView2};
 
-use crate::EstimationError;
+use crate::solver::estimate::EstimationError;
 use crate::gpu::policy::{
     PirlsLoopCurvatureKind, PirlsLoopFamilyKind, RemlOuterAdmission,
 };
@@ -69,7 +69,7 @@ use crate::solver::gpu::reml_gpu::{RemlGpuEvidence, RemlGpuInput, evidence_deriv
 /// arrays are only consulted for the seed evaluation and the post-loop
 /// `OuterResult` payload.
 #[derive(Clone, Debug)]
-pub struct RemlOuterGpuInput<'a> {
+pub struct RemlOuterGpuInput {
     /// Initial ρ to start BFGS from. Same convention as the host BFGS branch
     /// in `outer_strategy::run_outer_with_plan` — already projected onto the
     /// bounds box at the dispatch site.
@@ -316,7 +316,7 @@ where
     // we keep it for the device-resident driver's local invariants.
     let mut rho = input.seed_rho.clone();
     project_onto_bounds(&mut rho, &bounds);
-    let mut eval = evaluator(&rho)?;
+    let eval = evaluator(&rho)?;
     let mut objective = eval.objective;
     let mut gradient = eval.gradient;
 
@@ -570,7 +570,7 @@ mod tests {
         let out = run_reml_outer_on_device(input, evaluator).expect("quadratic path");
         assert!(out.converged, "BFGS should converge on a quadratic");
         for (got, want) in out.rho.iter().zip(target.iter()) {
-            assert!((got - want).abs() < 1.0e-4, "got {got} want {want}");
+            assert!((*got - *want).abs() < 1.0e-4_f64, "got {got} want {want}");
         }
     }
 

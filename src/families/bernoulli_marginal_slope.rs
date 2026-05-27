@@ -19906,7 +19906,18 @@ mod tests {
             z: Arc::new(Array1::zeros(0)),
             marginal_design: empty_design.clone(),
             logslope_design: empty_design,
-            ..default_test_family()
+            latent_measure: LatentMeasureKind::StandardNormal,
+            gaussian_frailty_sd: None,
+            base_link: InverseLink::Standard(crate::types::StandardLink::Logit),
+            score_warp: None,
+            link_dev: None,
+            policy: crate::resource::ResourcePolicy::default_library(),
+            cell_moment_lru: Arc::new(exact_kernel::CellMomentLruCache::new(1024)),
+            cell_moment_cache_stats: Arc::new(exact_kernel::CellMomentCacheStats::default()),
+            intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(std::sync::Mutex::new(None)),
+
         }
     }
 

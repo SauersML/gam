@@ -738,7 +738,7 @@ pub enum FittedFamily {
     Standard {
         likelihood: LikelihoodSpec,
         #[serde(default)]
-        link: Option<LinkFunction>,
+        link: Option<StandardLink>,
         #[serde(default)]
         latent_cloglog_state: Option<LatentCLogLogState>,
         #[serde(default)]

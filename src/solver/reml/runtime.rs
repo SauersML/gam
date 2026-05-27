@@ -111,48 +111,6 @@ fn store_ift_residual_energy_for_outer_theta(theta: &Array1<f64>, energy: Option
     }
 }
 
-/// Admission + dispatch helper for the device-resident outer REML BFGS
-/// driver.
-///
-/// Builds the [`crate::gpu::policy::RemlOuterAdmission`] descriptor from the
-/// host-side `(spec, n, p, num_rho)` quadruple and consults
-/// `GpuDispatchPolicy::should_run_reml_outer_on_device`. Returns `Some(adm)`
-/// when the outer BFGS-over-ρ loop should be routed onto the device-resident
-/// driver in [`crate::solver::gpu::reml_outer`] — and `None` when the host
-/// orchestrator should keep its existing behaviour (small fit, custom
-/// inverse-link family, fewer than two smoothing parameters, or no GPU
-/// runtime initialised).
-///
-/// This is the *only* coupling between the host outer-strategy and the
-/// device-resident driver: keeping the predicate behind a single helper
-/// means the dispatch site at the outer BFGS boundary stays a yes/no
-/// decision and the device path can grow new admission rules without
-/// touching the call site.
-pub(crate) fn outer_reml_device_admission(
-    spec: &crate::types::LikelihoodSpec,
-    n: usize,
-    p: usize,
-    num_rho: usize,
-) -> Option<crate::gpu::policy::RemlOuterAdmission> {
-    let family = crate::solver::gpu::pirls_dispatch::pirls_loop_family_for(spec)?;
-    let curvature = crate::solver::gpu::pirls_dispatch::pirls_loop_curvature_for(family);
-    let gpu_available = crate::solver::gpu::pirls_dispatch::gpu_runtime_available();
-    let admission = crate::gpu::policy::RemlOuterAdmission {
-        n,
-        p,
-        num_rho,
-        family: Some(family),
-        curvature,
-        gpu_available,
-    };
-    let policy = crate::gpu::policy::GpuDispatchPolicy::default();
-    if policy.should_run_reml_outer_on_device(admission) {
-        Some(admission)
-    } else {
-        None
-    }
-}
-
 pub(super) struct PenaltySubspace {
     evals: Array1<f64>,
     evecs: Array2<f64>,

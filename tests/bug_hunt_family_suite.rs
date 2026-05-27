@@ -9,7 +9,7 @@ use gam::families::scale_design::{
 };
 use gam::families::strategy::{FamilyStrategy, strategy_for_spec};
 use gam::families::vector_response::{GaussianVectorLikelihood, VectorNoise, VectorResponseTarget};
-use gam::types::{InverseLink, LatentCLogLogState, LikelihoodSpec, LinkFunction, StandardLink, ResponseFamily};
+use gam::types::{InverseLink, LatentCLogLogState, LikelihoodSpec, StandardLink, ResponseFamily};
 use ndarray::{Array1, Array2, array};
 
 #[test]

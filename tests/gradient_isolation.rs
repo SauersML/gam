@@ -4,7 +4,7 @@ use gam::estimate::{
 };
 use gam::mixture_link::state_from_sasspec;
 use gam::smooth::BlockwisePenalty;
-use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, StandardLink, ResponseFamily, SasLinkSpec};
+use gam::types::{InverseLink, LikelihoodSpec, StandardLink, ResponseFamily, SasLinkSpec};
 use ndarray::{Array1, Array2, array};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};

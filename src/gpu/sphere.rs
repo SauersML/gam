@@ -179,7 +179,7 @@ impl DeviceS2KernelMatrix {
     pub fn copy_to_host_col_major(&self, dst: &mut [f64]) -> Result<(), GpuError> {
         let needed = self.ld * self.cols;
         if dst.len() != needed {
-            gpu_bail!(
+            crate::gpu_bail!(
                     "DeviceS2KernelMatrix::copy_to_host_col_major: dst.len()={} expected {}",
                     dst.len(),
                     needed
@@ -198,7 +198,7 @@ impl DeviceS2KernelMatrix {
     pub fn copy_to_host_col_major(&self, dst: &mut [f64]) -> Result<(), GpuError> {
         let needed = self.ld * self.cols;
         if dst.len() != needed {
-            gpu_bail!(
+            crate::gpu_bail!(
                     "DeviceS2KernelMatrix::copy_to_host_col_major: dst.len()={} expected {}",
                     dst.len(),
                     needed
@@ -239,21 +239,21 @@ impl<'a> S2KernelBuildInputs<'a> {
             });
         }
         if self.data_xyz.len() != 3 * self.n {
-            gpu_bail!(
+            crate::gpu_bail!(
                     "S2KernelBuildInputs: data_xyz.len()={} != 3*n={}",
                     self.data_xyz.len(),
                     3 * self.n
                 );
         }
         if self.centers_xyz.len() != 3 * self.m {
-            gpu_bail!(
+            crate::gpu_bail!(
                     "S2KernelBuildInputs: centers_xyz.len()={} != 3*m={}",
                     self.centers_xyz.len(),
                     3 * self.m
                 );
         }
         if self.coeffs.len() != self.lmax + 1 {
-            gpu_bail!(
+            crate::gpu_bail!(
                     "S2KernelBuildInputs: coeffs.len()={} != lmax+1={}",
                     self.coeffs.len(),
                     self.lmax + 1
@@ -676,20 +676,20 @@ pub fn build_householder_constrained_design_device(
 ) -> Result<DeviceS2KernelMatrix, GpuError> {
     inputs.validate()?;
     if v.len() != inputs.m {
-        gpu_bail!(
+        crate::gpu_bail!(
                 "build_householder_constrained_design_device: v.len()={} != m={}",
                 v.len(),
                 inputs.m
             );
     }
     if inputs.m < 2 {
-        gpu_bail!(
+        crate::gpu_bail!(
                 "build_householder_constrained_design_device: m must be >= 2 (got {})",
                 inputs.m
             );
     }
     if !beta.is_finite() {
-        gpu_bail!(
+        crate::gpu_bail!(
                 "build_householder_constrained_design_device: beta must be finite (got {beta})"
             );
     }
@@ -873,14 +873,14 @@ pub fn constrained_penalty_host(
 ) -> Result<Array2<f64>, GpuError> {
     let (m1, m2) = c.dim();
     if m1 != m2 {
-        gpu_bail!("constrained_penalty_host: C must be square, got {m1}x{m2}");
+        crate::gpu_bail!("constrained_penalty_host: C must be square, got {m1}x{m2}");
     }
     let m = m1;
     if w.len() != m {
-        gpu_bail!("constrained_penalty_host: w.len()={} != m={}", w.len(), m);
+        crate::gpu_bail!("constrained_penalty_host: w.len()={} != m={}", w.len(), m);
     }
     if m < 2 {
-        gpu_bail!("constrained_penalty_host: m must be >= 2 (got {m})");
+        crate::gpu_bail!("constrained_penalty_host: m must be >= 2 (got {m})");
     }
     let (v, beta) = householder_reflector_from_weights(w);
 
@@ -973,10 +973,10 @@ pub fn solve_penalised_ls_device(
     let n = x_s_device.rows;
     let p = x_s_device.cols;
     if wy.len() != n {
-        gpu_bail!("solve_penalised_ls_device: wy.len()={} != n={n}", wy.len());
+        crate::gpu_bail!("solve_penalised_ls_device: wy.len()={} != n={n}", wy.len());
     }
     if r_s.dim() != (p, p) {
-        gpu_bail!(
+        crate::gpu_bail!(
                 "solve_penalised_ls_device: r_s.dim()={:?} != ({p}, {p})",
                 r_s.dim()
             );
@@ -1042,7 +1042,7 @@ pub fn solve_penalised_ls_device(
             )
         };
         if status != cusolver_sys::cusolverStatus_t::CUSOLVER_STATUS_SUCCESS {
-            gpu_bail!("cusolverDnDgeqrf_bufferSize status={status:?}");
+            crate::gpu_bail!("cusolverDnDgeqrf_bufferSize status={status:?}");
         }
     }
     let lwork_us = usize::try_from(lwork).map_err(|_| gpu_err!("solve_penalised_ls_device: negative lwork={lwork}"))?;
@@ -1079,7 +1079,7 @@ pub fn solve_penalised_ls_device(
             )
         };
         if status != cusolver_sys::cusolverStatus_t::CUSOLVER_STATUS_SUCCESS {
-            gpu_bail!("cusolverDnDgeqrf status={status:?}");
+            crate::gpu_bail!("cusolverDnDgeqrf status={status:?}");
         }
     }
 
@@ -1108,7 +1108,7 @@ pub fn solve_penalised_ls_device(
             )
         };
         if status != cusolver_sys::cusolverStatus_t::CUSOLVER_STATUS_SUCCESS {
-            gpu_bail!("cusolverDnDormqr_bufferSize status={status:?}");
+            crate::gpu_bail!("cusolverDnDormqr_bufferSize status={status:?}");
         }
     }
     if ormqr_lwork > lwork {
@@ -1144,7 +1144,7 @@ pub fn solve_penalised_ls_device(
             )
         };
         if status != cusolver_sys::cusolverStatus_t::CUSOLVER_STATUS_SUCCESS {
-            gpu_bail!("cusolverDnDormqr status={status:?}");
+            crate::gpu_bail!("cusolverDnDormqr status={status:?}");
         }
     }
 
@@ -1178,7 +1178,7 @@ pub fn solve_penalised_ls_device(
             )
         };
         if status != cudarc::cublas::sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
-            gpu_bail!("cublasDtrsm_v2 status={status:?}");
+            crate::gpu_bail!("cublasDtrsm_v2 status={status:?}");
         }
     }
 
@@ -1878,7 +1878,6 @@ use crate::gpu::error::GpuResultExt;
     /// fitted-value delta ≤ 1e-9. `#[ignore = "requires CUDA"]` so the
     /// V100 bench runner unignores in their harness.
     #[test]
-    #[ignore = "requires CUDA"]
     fn sphere_gpu_end_to_end_fit_parity_vs_cpu_truncated() {
         use crate::basis::{
             select_spherical_farthest_point_centers, sphere_area_weights,

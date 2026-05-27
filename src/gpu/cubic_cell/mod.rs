@@ -170,14 +170,14 @@ pub(crate) fn try_build_cubic_cell_derivative_moments(
     input: CubicCellDerivativeMomentHostView<'_>,
 ) -> Result<Option<CubicCellDerivativeMomentOutput>, GpuError> {
     if input.cells.len() != input.branches.len() {
-        gpu_bail!(
+        crate::gpu_bail!(
                 "gpu cubic-cell substrate: cells.len()={} != branches.len()={}",
                 input.cells.len(),
                 input.branches.len()
             );
     }
     if input.max_degree > MAX_SUPPORTED_DEGREE {
-        gpu_bail!(
+        crate::gpu_bail!(
                 "gpu cubic-cell substrate: max_degree={} exceeds MAX_SUPPORTED_DEGREE={}",
                 input.max_degree, MAX_SUPPORTED_DEGREE
             );

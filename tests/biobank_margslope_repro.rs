@@ -17,7 +17,7 @@ use gam::smooth::{
     LinearCoefficientGeometry, LinearTermSpec, ShapeConstraint, SmoothBasisSpec, SmoothTermSpec,
     SpatialLengthScaleOptimizationOptions, TermCollectionSpec,
 };
-use gam::types::{InverseLink, LinkFunction, StandardLink, WigglePenaltyConfig};
+use gam::types::{InverseLink, StandardLink, WigglePenaltyConfig};
 use gam::{BernoulliMarginalSlopeFitRequest, FitRequest, FitResult, ResourcePolicy, fit_model};
 use ndarray::{Array1, Array2};
 use rand::rngs::StdRng;

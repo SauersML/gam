@@ -1,5 +1,5 @@
 use gam::mixture_link::inverse_link_jet_for_family;
-use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily};
+use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
 
 fn first_fd<F: Fn(f64) -> f64>(f: F, x: f64, h: f64) -> f64 {
     (f(x + h) - f(x - h)) / (2.0 * h)
@@ -14,15 +14,15 @@ fn third_fd<F: Fn(f64) -> f64>(f: F, x: f64, h: f64) -> f64 {
 #[test]
 fn inverse_link_standard_jet_matches_finite_difference() {
     let etas = [-1.2, -0.3, 0.2, 0.9];
-    // `LinkFunction::Sas` / `LinkFunction::BetaLogistic` deliberately error out
-    // of the `Standard(LinkFunction)` slot because they need explicit link
-    // state; the dedicated SAS / Beta-Logistic tests exercise those branches.
+    // `Sas` / `BetaLogistic` deliberately cannot live in the stateless
+    // `InverseLink::Standard` slot because they need explicit link state;
+    // the dedicated SAS / Beta-Logistic tests exercise those branches.
     let links = [
-        LinkFunction::Logit,
-        LinkFunction::Probit,
-        LinkFunction::CLogLog,
-        LinkFunction::Identity,
-        LinkFunction::Log,
+        StandardLink::Logit,
+        StandardLink::Probit,
+        StandardLink::CLogLog,
+        StandardLink::Identity,
+        StandardLink::Log,
     ];
 
     // Centered finite differences in f64 are roundoff-limited: the optimal step

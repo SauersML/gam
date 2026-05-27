@@ -3,8 +3,8 @@ use gam::inference::model::{
     FittedFamily, FittedModel, FittedModelPayload, MODEL_PAYLOAD_VERSION, ModelKind,
 };
 use gam::types::{
-    InverseLink, LatentCLogLogState, LikelihoodSpec, LinkComponent, LinkFunction, StandardLink, MixtureLinkState,
-    ResponseFamily, SasLinkState,
+    InverseLink, LatentCLogLogState, LikelihoodSpec, LinkComponent, MixtureLinkState,
+    ResponseFamily, SasLinkState, StandardLink,
 };
 use ndarray::array;
 
@@ -16,7 +16,7 @@ fn fitted_family_all_variants_round_trip_to_identical_json_bytes() {
                 ResponseFamily::Binomial,
                 InverseLink::Standard(StandardLink::Logit),
             ),
-            link: Some(LinkFunction::Logit),
+            link: Some(StandardLink::Logit),
             latent_cloglog_state: Some(LatentCLogLogState { latent_sd: 1.25 }),
             mixture_state: Some(MixtureLinkState {
                 components: vec![LinkComponent::Probit, LinkComponent::Logit],
@@ -126,7 +126,7 @@ fn fitted_family_likelihood_returns_variant_specific_likelihood() {
 fn standard_family_parameterized_link_states_survive_serde_round_trip() {
     let original = FittedFamily::Standard {
         likelihood: LikelihoodSpec::binomial_logit(),
-        link: Some(LinkFunction::Logit),
+        link: Some(StandardLink::Logit),
         latent_cloglog_state: Some(LatentCLogLogState { latent_sd: 2.0 }),
         mixture_state: Some(MixtureLinkState {
             components: vec![LinkComponent::Logit, LinkComponent::CLogLog],
@@ -158,7 +158,7 @@ fn payload_with_older_version_is_rejected_with_version_mismatch() {
         ModelKind::Standard,
         FittedFamily::Standard {
             likelihood: LikelihoodSpec::gaussian_identity(),
-            link: Some(LinkFunction::Identity),
+            link: Some(StandardLink::Identity),
             latent_cloglog_state: None,
             mixture_state: None,
             sas_state: None,
@@ -189,7 +189,7 @@ fn from_payload_model_kind_maps_to_expected_fitted_model_variant() {
         let family_state = match kind {
             ModelKind::Standard => FittedFamily::Standard {
                 likelihood: LikelihoodSpec::gaussian_identity(),
-                link: Some(LinkFunction::Identity),
+                link: Some(StandardLink::Identity),
                 latent_cloglog_state: None,
                 mixture_state: None,
                 sas_state: None,

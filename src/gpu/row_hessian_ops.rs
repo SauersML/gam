@@ -101,13 +101,13 @@ impl<'a> RowHessianMatvecInputs<'a> {
             });
         }
         if self.r > MAX_R {
-            gpu_bail!(
+            crate::gpu_bail!(
                     "row_hessian_matvec inputs: r={} exceeds MAX_R={MAX_R}",
                     self.r
                 );
         }
         if self.h_rows.len() != self.n_rows * self.r * self.r {
-            gpu_bail!(
+            crate::gpu_bail!(
                     "row_hessian_matvec inputs: h_rows.len()={} != n_rows({})*r({})*r = {}",
                     self.h_rows.len(),
                     self.n_rows,
@@ -116,7 +116,7 @@ impl<'a> RowHessianMatvecInputs<'a> {
                 );
         }
         if self.v_rows.len() != self.n_rows * self.r {
-            gpu_bail!(
+            crate::gpu_bail!(
                     "row_hessian_matvec inputs: v_rows.len()={} != n_rows({})*r({}) = {}",
                     self.v_rows.len(),
                     self.n_rows,
@@ -137,13 +137,13 @@ impl<'a> RowHessianDiagInputs<'a> {
             });
         }
         if self.r > MAX_R {
-            gpu_bail!(
+            crate::gpu_bail!(
                     "row_hessian_diag inputs: r={} exceeds MAX_R={MAX_R}",
                     self.r
                 );
         }
         if self.h_rows.len() != self.n_rows * self.r * self.r {
-            gpu_bail!(
+            crate::gpu_bail!(
                     "row_hessian_diag inputs: h_rows.len()={} != n_rows({})*r({})*r = {}",
                     self.h_rows.len(),
                     self.n_rows,

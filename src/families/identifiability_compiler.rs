@@ -883,6 +883,7 @@ fn pack_row_hessian_symmetric(row_hess: &dyn RowHessian) -> Option<Array2<f64>> 
 /// `compiled_block_ranges[b]` gives the column range inside `T` (and inside
 /// the compiled-width coefficient vector) attributable to raw block `b`.
 /// `raw_block_ranges[b]` gives the corresponding raw-width column range.
+#[derive(Debug)]
 pub struct CompiledMap {
     /// `(p_raw × p_compiled)` raw-from-compiled reparam matrix.
     pub raw_from_compiled: Array2<f64>,

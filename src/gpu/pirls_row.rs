@@ -1016,7 +1016,7 @@ pub fn launch_row_reweight_on_stream(
 ) -> Result<(), GpuError> {
     use cudarc::driver::{LaunchConfig, PushKernelArg};
     if out.n != n {
-        gpu_bail!("row reweight buffers shape {} mismatches n={n}", out.n);
+        crate::gpu_bail!("row reweight buffers shape {} mismatches n={n}", out.n);
     }
     let module = backend.module_for(family, curvature)?;
     let func =
@@ -1078,7 +1078,7 @@ pub fn launch_row_reweight_jit_on_stream(
 ) -> Result<(), GpuError> {
     use cudarc::driver::{LaunchConfig, PushKernelArg};
     if out.n != n {
-        gpu_bail!("JIT row reweight buffers shape {} mismatches n={n}", out.n);
+        crate::gpu_bail!("JIT row reweight buffers shape {} mismatches n={n}", out.n);
     }
     let module = backend.module_for_jit(spec, curvature)?;
     let kernel_name = spec.kernel_name();
@@ -1420,8 +1420,6 @@ fn bernoulli_cloglog_body(curvature: CurvatureMode) -> String {
 #[cfg(test)]
 mod pirls_row_gpu_tests {
     use super::*;
-use crate::gpu_err;
-use crate::gpu_bail;
 use crate::gpu::error::GpuResultExt;
 
     fn assert_close(label: &str, got: f64, expected: f64, tol: f64) {
@@ -2313,7 +2311,6 @@ use crate::gpu::error::GpuResultExt;
     /// families). Gated on a live CUDA runtime; marked `#[ignore]` so
     /// the v100-bench-runner explicitly opts in via `--ignored`.
     #[test]
-    #[ignore = "requires CUDA"]
     fn gpu_observed_parity_end_to_end_n1000() {
         if super::super::runtime::GpuRuntime::global().is_none() {
             eprintln!("[gpu_observed_parity_end_to_end_n1000] no CUDA runtime — skipping");
@@ -2467,7 +2464,6 @@ use crate::gpu::error::GpuResultExt;
     /// oracle to ≤ 1e-10 on n=1000 rows. Skipped if no CUDA runtime;
     /// `#[ignore]` so v100-bench-runner picks it up via `--ignored`.
     #[test]
-    #[ignore = "requires CUDA"]
     fn gpu_jit_level_b_raw_body_end_to_end_all_families_n1000() {
         if super::super::runtime::GpuRuntime::global().is_none() {
             eprintln!(

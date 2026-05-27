@@ -501,16 +501,6 @@ mod cuda_impl {
             })
         }
 
-        /// Force the cuBLAS DDGMM+DGEMM path, bypassing the fused
-        /// kernel. Used by parity tests so the fused and cuBLAS bundles
-        /// can be cross-checked element-wise.
-        pub(super) fn compute_grams_cublas_only(
-            &self,
-            h_packed: &Array2<f64>,
-        ) -> Option<GramBundle> {
-            self.compute_grams_cublas(h_packed)
-        }
-
         fn compute_grams_cublas(&self, h_packed: &Array2<f64>) -> Option<GramBundle> {
             let (n_rows, packed_cols) = h_packed.dim();
             if packed_cols != PACKED_LEN || n_rows != self.n_rows {

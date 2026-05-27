@@ -33,7 +33,7 @@ use gam::smooth::{
     ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, TermCollectionSpec,
     build_term_collection_design,
 };
-use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, StandardLink, ResponseFamily};
+use gam::types::{InverseLink, LikelihoodSpec, StandardLink, ResponseFamily};
 use ndarray::{Array1, Array2, s};
 use rand::RngExt;
 use rand::SeedableRng;

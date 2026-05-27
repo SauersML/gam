@@ -20,7 +20,7 @@ use gam::pirls::{
     GaussianFixedCache, PenaltyConfig, PirlsConfig, PirlsProblem, fit_model_for_fixed_rho,
 };
 use gam::types::{
-    GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkFunction, StandardLink, LogSmoothingParamsView,
+    GlmLikelihoodSpec, InverseLink, LikelihoodSpec, StandardLink, LogSmoothingParamsView,
     ResponseFamily,
 };
 use ndarray::{Array1, Array2, array};
