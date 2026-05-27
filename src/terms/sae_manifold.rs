@@ -3087,6 +3087,98 @@ mod tests {
         }
     }
 
+    /// Central-difference oracle for `second_jet`: differentiate the analytic
+    /// first jet (which is FD-validated by the test above) coordinate-wise.
+    /// Tolerance is `1e-5` per the charter; the FD step is 1e-4 (the sweet
+    /// spot before f64 cancellation dominates a centered difference of an
+    /// `O(1)` Jacobian).
+    fn assert_second_jet_matches_central_difference<E: SaeBasisEvaluator>(
+        evaluator: &E,
+        coords: Array2<f64>,
+        tolerance: f64,
+    ) {
+        let epsilon = 1.0e-4;
+        let second = evaluator
+            .second_jet(coords.view())
+            .expect("second_jet returned None for a basis that should implement it");
+        let (_phi, jet) = evaluator.evaluate(coords.view()).unwrap();
+        let (n_rows, n_basis, latent_dim, latent_dim_b) = second.dim();
+        assert_eq!(latent_dim, latent_dim_b);
+        assert_eq!((n_rows, n_basis, latent_dim), jet.dim());
+        for row in 0..n_rows {
+            for axis_c in 0..latent_dim {
+                let mut plus = coords.clone();
+                let mut minus = coords.clone();
+                plus[[row, axis_c]] += epsilon;
+                minus[[row, axis_c]] -= epsilon;
+                let (_, jet_plus) = evaluator.evaluate(plus.view()).unwrap();
+                let (_, jet_minus) = evaluator.evaluate(minus.view()).unwrap();
+                for basis in 0..n_basis {
+                    for axis_a in 0..latent_dim {
+                        let fd = (jet_plus[[row, basis, axis_a]]
+                            - jet_minus[[row, basis, axis_a]])
+                            / (2.0 * epsilon);
+                        let analytic = second[[row, basis, axis_a, axis_c]];
+                        let error = (analytic - fd).abs();
+                        assert!(
+                            error <= tolerance,
+                            "row={row} basis={basis} axis_a={axis_a} axis_c={axis_c}: \
+                             analytic={analytic:.12e}, fd={fd:.12e}, error={error:.12e}, \
+                             tol={tolerance:.12e}"
+                        );
+                    }
+                }
+            }
+        }
+        // Hessian symmetry in (axis_a, axis_c).
+        for row in 0..n_rows {
+            for basis in 0..n_basis {
+                for axis_a in 0..latent_dim {
+                    for axis_b in 0..latent_dim {
+                        let h_ab = second[[row, basis, axis_a, axis_b]];
+                        let h_ba = second[[row, basis, axis_b, axis_a]];
+                        assert!(
+                            (h_ab - h_ba).abs() <= 1.0e-12,
+                            "second_jet not symmetric: row={row} basis={basis} \
+                             ({axis_a},{axis_b})={h_ab:.6e} vs ({axis_b},{axis_a})={h_ba:.6e}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn isometry_periodic_second_jet_matches_fd() {
+        assert_second_jet_matches_central_difference(
+            &PeriodicHarmonicEvaluator::new(7).unwrap(),
+            array![[-0.37], [0.0], [0.125], [0.41]],
+            1.0e-5,
+        );
+    }
+
+    #[test]
+    fn isometry_sphere_second_jet_matches_fd() {
+        // Stay inside the interior `(-π/2, π/2)` for lat so the chain factor
+        // is active — that is where the Hessian carries information.
+        let sphere_coords = array![[-0.7, -1.2], [-0.25, 0.0], [0.35, 0.9], [0.8, 2.1]];
+        assert_second_jet_matches_central_difference(
+            &SphereChartEvaluator,
+            sphere_coords,
+            1.0e-5,
+        );
+    }
+
+    #[test]
+    fn isometry_torus_second_jet_matches_fd() {
+        let torus_coords = array![[0.1, 0.7], [0.42, 0.0], [0.95, 0.33], [0.5, 0.5]];
+        assert_second_jet_matches_central_difference(
+            &TorusHarmonicEvaluator::new(2, 3).unwrap(),
+            torus_coords,
+            1.0e-5,
+        );
+    }
+
     /// Torus T^2 fit on synthetic data with a known two-frequency signal.
     /// Drives a single torus atom through the [`SaeManifoldTerm`] Newton loop
     /// and checks that the in-sample reconstruction R² clears 0.5.

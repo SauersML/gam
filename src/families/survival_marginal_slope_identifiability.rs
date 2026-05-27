@@ -904,6 +904,164 @@ pub fn pull_back_blockwise_penalty_per_term(
     Ok(BlockwisePenalty::new(compiled_start..compiled_end, sym))
 }
 
+/// Assemble the block-upper-triangular reparameterisation T that maps a
+/// compiled coefficient vector θ (concatenation of per-term θ_b in
+/// `kept_p_b` widths) to the raw coefficient vector γ (concatenation of
+/// per-term γ_a in `raw_p_a` widths) under the V+M-exact residualised
+/// emitted design `L_b = C_b V_b − A_{<b} R_b`.
+///
+/// On the diagonal: block (b, b) = `V_b` of shape `raw_p_b × kept_p_b`.
+/// In the strictly upper triangle: block (a, b) for `a < b` =
+/// `−R_{a→b}` of shape `raw_p_a × kept_p_b`. Each `r_per_term[b]` is
+/// `Some(R_b)` where the rows of `R_b` are the vertical stack of the
+/// `R_{a→b}` over `a = 0..b` (so `R_b.nrows() == Σ_{a<b} raw_p_a`).
+/// `r_per_term[0]` should be `None` (or a zero-row matrix) since no
+/// earlier blocks exist.
+///
+/// Returns T of shape `(Σ raw_p_b) × (Σ kept_p_b)`.
+pub fn build_full_t_matrix(
+    v_per_term: &[Array2<f64>],
+    r_per_term: &[Option<Array2<f64>>],
+) -> Array2<f64> {
+    assert_eq!(
+        v_per_term.len(),
+        r_per_term.len(),
+        "build_full_t_matrix: v_per_term len {} != r_per_term len {}",
+        v_per_term.len(),
+        r_per_term.len(),
+    );
+    let raw_widths: Vec<usize> = v_per_term.iter().map(|v| v.nrows()).collect();
+    let kept_widths: Vec<usize> = v_per_term.iter().map(|v| v.ncols()).collect();
+    let row_offsets: Vec<usize> = {
+        let mut o = Vec::with_capacity(raw_widths.len() + 1);
+        o.push(0);
+        for w in &raw_widths {
+            o.push(o.last().copied().unwrap_or(0) + w);
+        }
+        o
+    };
+    let col_offsets: Vec<usize> = {
+        let mut o = Vec::with_capacity(kept_widths.len() + 1);
+        o.push(0);
+        for w in &kept_widths {
+            o.push(o.last().copied().unwrap_or(0) + w);
+        }
+        o
+    };
+    let total_rows = row_offsets.last().copied().unwrap_or(0);
+    let total_cols = col_offsets.last().copied().unwrap_or(0);
+    let mut t = Array2::<f64>::zeros((total_rows, total_cols));
+    // Diagonal: place V_b on (b, b).
+    for (b, v) in v_per_term.iter().enumerate() {
+        let r = v.nrows();
+        let c = v.ncols();
+        if r > 0 && c > 0 {
+            t.slice_mut(ndarray::s![
+                row_offsets[b]..row_offsets[b] + r,
+                col_offsets[b]..col_offsets[b] + c
+            ])
+            .assign(v);
+        }
+    }
+    // Upper triangle: for each b ≥ 1, place −R_{a→b} at (a, b) for a < b.
+    // `r_per_term[b]` stacks the R_{a→b} blocks row-wise in order
+    // a = 0, 1, …, b-1; each block has `raw_widths[a]` rows and
+    // `kept_widths[b]` cols.
+    for b in 1..v_per_term.len() {
+        let Some(r_stack) = r_per_term[b].as_ref() else {
+            continue;
+        };
+        let kept_b = kept_widths[b];
+        assert_eq!(
+            r_stack.ncols(),
+            kept_b,
+            "build_full_t_matrix: r_per_term[{b}] has {} cols, expected {}",
+            r_stack.ncols(),
+            kept_b,
+        );
+        let expected_rows: usize = raw_widths.iter().take(b).sum();
+        assert_eq!(
+            r_stack.nrows(),
+            expected_rows,
+            "build_full_t_matrix: r_per_term[{b}] has {} rows, expected {} (sum of raw_widths[0..{}])",
+            r_stack.nrows(),
+            expected_rows,
+            b,
+        );
+        let mut local_row = 0usize;
+        for a in 0..b {
+            let r_a = raw_widths[a];
+            if r_a == 0 || kept_b == 0 {
+                local_row += r_a;
+                continue;
+            }
+            let block = r_stack.slice(ndarray::s![local_row..local_row + r_a, ..]);
+            let mut dst = t.slice_mut(ndarray::s![
+                row_offsets[a]..row_offsets[a] + r_a,
+                col_offsets[b]..col_offsets[b] + kept_b
+            ]);
+            for i in 0..r_a {
+                for j in 0..kept_b {
+                    dst[[i, j]] = -block[[i, j]];
+                }
+            }
+            local_row += r_a;
+        }
+    }
+    t
+}
+
+/// Pull a single raw per-term penalty back through the full-width
+/// reparameterisation T. The penalty's `local` is `block_p × block_p`
+/// where `block_p == pen.col_range.len()`; `anchor_offset` is the start
+/// (in the joint raw coordinate) of the term whose partition contains
+/// `pen.col_range`, so the penalty is embedded into the joint raw
+/// matrix at rows/cols `anchor_offset + pen.col_range`. The returned
+/// matrix is the full-width compiled penalty `T^T · embed(S) · T`,
+/// stored as `PenaltyMatrix::Dense`.
+///
+/// Unlike `pull_back_blockwise_penalty_per_term`, the result is NOT a
+/// `BlockwisePenalty`: residualisation off-diagonal couples θ_b through
+/// every earlier block's θ_a, so the pulled-back penalty is generally
+/// dense across the full compiled width.
+pub fn pull_back_penalty_through_t(
+    pen: &crate::terms::smooth::BlockwisePenalty,
+    anchor_offset: usize,
+    t: &Array2<f64>,
+) -> PenaltyMatrix {
+    let raw_total = t.nrows();
+    let compiled_total = t.ncols();
+    let block_p = pen.col_range.len();
+    let embed_start = anchor_offset + pen.col_range.start;
+    let embed_end = embed_start + block_p;
+    assert!(
+        embed_end <= raw_total,
+        "pull_back_penalty_through_t: embed range {}..{} exceeds raw total {}",
+        embed_start, embed_end, raw_total,
+    );
+    let mut embedded = Array2::<f64>::zeros((raw_total, raw_total));
+    if block_p > 0 {
+        let mut dst = embedded.slice_mut(ndarray::s![
+            embed_start..embed_end,
+            embed_start..embed_end
+        ]);
+        for i in 0..block_p {
+            for j in 0..block_p {
+                dst[[i, j]] = pen.local[[i, j]];
+            }
+        }
+    }
+    let temp = embedded.dot(t);
+    let pulled = t.t().dot(&temp);
+    let mut sym = Array2::<f64>::zeros((compiled_total, compiled_total));
+    for i in 0..compiled_total {
+        for j in 0..compiled_total {
+            sym[[i, j]] = 0.5 * (pulled[[i, j]] + pulled[[j, i]]);
+        }
+    }
+    PenaltyMatrix::Dense(sym)
+}
+
 /// Per-term-aware compiled designs + penalties + block-diagonal V
 /// matrices for the result-time β lift. The construction site swaps
 /// raw designs/penalties for these compiled versions before building

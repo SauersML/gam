@@ -803,4 +803,59 @@ mod tests {
             assert!(val.is_finite(), "predict design produced non-finite entry");
         }
     }
+
+    /// `r_lw` is populated on every non-first block as `M_b · V_b`, with the
+    /// first block carrying `None`.
+    #[test]
+    fn compile_exposes_r_lw_equal_to_m_dot_v() {
+        let n = 40;
+        let a = Array2::from_shape_fn((n, 2), |(i, j)| (i as f64 * 0.17 + j as f64).sin());
+        // B partially aliases A's first column, so anchor correction is non-trivial.
+        let b = Array2::from_shape_fn((n, 2), |(i, j)| {
+            0.6 * a[[i, 0]] + ((i as f64) * 0.11 + j as f64).cos()
+        });
+        let hess = IdentityRowHessian::new(n, 1);
+        let ops = vec![op(a.clone()), op(b.clone())];
+        let compiled = compile(&ops, &hess, &[BlockOrder::Marginal, BlockOrder::Logslope])
+            .expect("compile should succeed");
+
+        // First block: no anchor → r_lw is None.
+        assert!(
+            compiled.blocks[0].r_lw.is_none(),
+            "first block must have r_lw = None"
+        );
+        assert!(
+            compiled.blocks[0].anchor_correction.is_none(),
+            "first block must have no anchor correction"
+        );
+
+        // Second block: r_lw must equal M_b · V_b.
+        let v_b = &compiled.blocks[1].t_lw;
+        let m_b = compiled.blocks[1]
+            .anchor_correction
+            .as_ref()
+            .expect("second block must carry an anchor correction");
+        let r_lw = compiled.blocks[1]
+            .r_lw
+            .as_ref()
+            .expect("second block must expose r_lw");
+
+        // Shape: (p_a_kept × p_b_kept).
+        let p_a_kept = compiled.blocks[0].t_lw.ncols();
+        let p_b_kept = v_b.ncols();
+        assert_eq!(
+            r_lw.dim(),
+            (p_a_kept, p_b_kept),
+            "r_lw shape must be (p_a_kept × p_b_kept)"
+        );
+        assert_eq!(m_b.nrows(), p_a_kept);
+        assert_eq!(m_b.ncols(), p_b_kept);
+
+        // Math: r_lw == m_b · v_b.
+        let expected = m_b.dot(v_b);
+        let max_err = (r_lw - &expected)
+            .iter()
+            .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+        assert!(max_err < 1e-12, "r_lw mismatches M_b · V_b: {max_err:e}");
+    }
 }
