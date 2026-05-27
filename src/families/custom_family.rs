@@ -24954,6 +24954,7 @@ mod tests {
             outer_eval_context: None,
             cache_session: None,
             cache_mirror_sessions: Vec::new(),
+            outer_eval_context: None,
         };
 
         let result = fit_custom_family(&OneBlockIdentityFamily, &[spec], &options)
@@ -25002,6 +25003,7 @@ mod tests {
             outer_eval_context: None,
             cache_session: None,
             cache_mirror_sessions: Vec::new(),
+            outer_eval_context: None,
         };
         let per_block_log_lambdas = vec![array![10.0_f64.ln()]];
         let inner = inner_blockwise_fit(&family, &[spec], &per_block_log_lambdas, &options, None)
@@ -25053,6 +25055,7 @@ mod tests {
             outer_eval_context: None,
             cache_session: None,
             cache_mirror_sessions: Vec::new(),
+            outer_eval_context: None,
         };
         let inner = inner_blockwise_fit(&family, &[spec], &[Array1::zeros(0)], &options, None)
             .expect("inner blockwise fit should succeed");
