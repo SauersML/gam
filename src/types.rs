@@ -770,7 +770,10 @@ impl RidgePassport {
 // every other call site (RidgePlanner, matrix_inverse_with_regularization,
 // LAML rho-Hessian inversion, survival stabilization, custom-family
 // `ridge_floor`) routes through, so a downstream consumer can ask
-// `ledger.included_in_quadratic()` rather than rediscovering the policy.
+// `ledger.quadratic_delta()` rather than rediscovering the policy. The three
+// inclusion bits were lifted into the `StabilizationKind` discriminant so the
+// (kind, inclusion-flags) invariant is enforced statically — heterogeneous
+// combinations like "ExplicitPrior with quadratic excluded" no longer typecheck.
 // ============================================================================
 
 /// Inertia of a symmetric matrix (count of positive / zero / negative
