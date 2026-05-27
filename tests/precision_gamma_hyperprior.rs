@@ -67,7 +67,7 @@ fn flat_gamma_precision_prior_matches_uninformed_fit_bitwise() {
     let opts = fit_options();
     let likelihood = LikelihoodSpec::new(
         ResponseFamily::Gaussian,
-        InverseLink::Standard(LinkFunction::Identity),
+        InverseLink::Standard(StandardLink::Identity),
     );
     let base = fit_term_collection_forspec(
         data.view(),
@@ -102,7 +102,7 @@ fn informative_gamma_precision_prior_shrinks_by_map_update() {
     let opts = fit_options();
     let likelihood = LikelihoodSpec::new(
         ResponseFamily::Gaussian,
-        InverseLink::Standard(LinkFunction::Identity),
+        InverseLink::Standard(StandardLink::Identity),
     );
     let fit = fit_term_collection_with_penalty_block_gamma_priors(
         data.view(),
@@ -143,7 +143,7 @@ fn gamma_precision_prior_callback_is_invoked_once_per_penalty_block() {
     let opts = fit_options();
     let likelihood = LikelihoodSpec::new(
         ResponseFamily::Gaussian,
-        InverseLink::Standard(LinkFunction::Identity),
+        InverseLink::Standard(StandardLink::Identity),
     );
     let mut seen = Vec::new();
     let callback_fit = fit_term_collection_with_penalty_block_gamma_prior_callback(

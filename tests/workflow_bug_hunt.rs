@@ -40,7 +40,7 @@ fn resolve_family_accepts_binomial_logit_with_underscore_alias() {
     );
     assert_eq!(
         resolved.link,
-        InverseLink::Standard(LinkFunction::Logit),
+        InverseLink::Standard(StandardLink::Logit),
         "binomial_logit should map to the standard logit inverse-link"
     );
 }
@@ -82,7 +82,7 @@ fn resolve_family_accepts_tweedie() {
         }
         other => panic!("expected Tweedie response family, got {other:?}"),
     }
-    assert_eq!(resolved.link, InverseLink::Standard(LinkFunction::Log));
+    assert_eq!(resolved.link, InverseLink::Standard(StandardLink::Log));
 }
 
 #[test]

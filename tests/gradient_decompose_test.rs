@@ -510,7 +510,7 @@ fn test_single_penalty_logit_gradient() {
         optimize_sas: false,
         family: LikelihoodSpec::new(
             ResponseFamily::Binomial,
-            InverseLink::Standard(LinkFunction::Logit),
+            InverseLink::Standard(StandardLink::Logit),
         ),
         compute_inference: true,
         max_iter: 200,
@@ -582,7 +582,7 @@ fn test_two_overlapping_penalties_logit_gradient() {
         optimize_sas: false,
         family: LikelihoodSpec::new(
             ResponseFamily::Binomial,
-            InverseLink::Standard(LinkFunction::Logit),
+            InverseLink::Standard(StandardLink::Logit),
         ),
         compute_inference: true,
         max_iter: 200,
@@ -650,7 +650,7 @@ fn test_two_nonoverlapping_penalties_logit_gradient() {
         optimize_sas: false,
         family: LikelihoodSpec::new(
             ResponseFamily::Binomial,
-            InverseLink::Standard(LinkFunction::Logit),
+            InverseLink::Standard(StandardLink::Logit),
         ),
         compute_inference: true,
         max_iter: 200,
@@ -734,7 +734,7 @@ fn test_gaussian_gradient_vs_fd() {
         optimize_sas: false,
         family: LikelihoodSpec::new(
             ResponseFamily::Gaussian,
-            InverseLink::Standard(LinkFunction::Identity),
+            InverseLink::Standard(StandardLink::Identity),
         ),
         compute_inference: true,
         max_iter: 120,
@@ -791,7 +791,7 @@ fn test_probit_single_penalty_gradient() {
         optimize_sas: false,
         family: LikelihoodSpec::new(
             ResponseFamily::Binomial,
-            InverseLink::Standard(LinkFunction::Probit),
+            InverseLink::Standard(StandardLink::Probit),
         ),
         compute_inference: true,
         max_iter: 200,
@@ -848,7 +848,7 @@ fn test_probit_overlapping_penalties_gradient() {
         optimize_sas: false,
         family: LikelihoodSpec::new(
             ResponseFamily::Binomial,
-            InverseLink::Standard(LinkFunction::Probit),
+            InverseLink::Standard(StandardLink::Probit),
         ),
         compute_inference: true,
         max_iter: 200,

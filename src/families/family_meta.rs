@@ -1,4 +1,4 @@
-use crate::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily};
+use crate::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
 
 /// Error returned when an `InverseLink` cannot be paired with a particular
 /// response family because the link is structurally unsupported for that
@@ -55,20 +55,21 @@ pub const fn likelihood_spec(response: ResponseFamily, link: InverseLink) -> Lik
 
 /// Resolve a binomial-flavoured `LikelihoodSpec` from an `InverseLink`.
 ///
-/// The match is exhaustive over `LinkFunction` so that every future addition
-/// to the link enum forces the author to declare whether it pairs with the
-/// binomial family. Variants that are structurally not binomial (e.g.
-/// `LinkFunction::Log`, which is the Poisson/Gamma log link, and
-/// `LinkFunction::Identity`, which has no canonical binomial meaning)
-/// return `UnsupportedLinkError` rather than being silently coerced.
+/// `StandardLink::Logit | Probit | CLogLog` and the state-bearing
+/// `LatentCLogLog / Sas / BetaLogistic / Mixture` variants are accepted as
+/// binomial-compatible. `StandardLink::Log | Identity` have no canonical
+/// binomial meaning and return `UnsupportedLinkError`. Since
+/// `InverseLink::Standard` carries `StandardLink` (not `LinkFunction`), the
+/// previously-required `Standard(LinkFunction::Sas | BetaLogistic)` arm is
+/// structurally impossible and has been removed.
 #[inline]
 pub fn inverse_link_to_binomial_spec(
     link: &InverseLink,
 ) -> Result<LikelihoodSpec, UnsupportedLinkError> {
     match link {
-        InverseLink::Standard(LinkFunction::Logit)
-        | InverseLink::Standard(LinkFunction::Probit)
-        | InverseLink::Standard(LinkFunction::CLogLog) => {
+        InverseLink::Standard(StandardLink::Logit)
+        | InverseLink::Standard(StandardLink::Probit)
+        | InverseLink::Standard(StandardLink::CLogLog) => {
             Ok(LikelihoodSpec::new(ResponseFamily::Binomial, link.clone()))
         }
         InverseLink::LatentCLogLog(_)
@@ -77,10 +78,8 @@ pub fn inverse_link_to_binomial_spec(
         | InverseLink::Mixture(_) => {
             Ok(LikelihoodSpec::new(ResponseFamily::Binomial, link.clone()))
         }
-        InverseLink::Standard(LinkFunction::Log)
-        | InverseLink::Standard(LinkFunction::Identity)
-        | InverseLink::Standard(LinkFunction::Sas)
-        | InverseLink::Standard(LinkFunction::BetaLogistic) => {
+        InverseLink::Standard(StandardLink::Log)
+        | InverseLink::Standard(StandardLink::Identity) => {
             Err(UnsupportedLinkError::new("binomial", link))
         }
     }

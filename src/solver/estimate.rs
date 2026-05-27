@@ -1852,7 +1852,7 @@ fn resolve_external_family(
         (&family.response, &family.link),
         (
             ResponseFamily::Binomial,
-            InverseLink::Standard(LinkFunction::Logit),
+            InverseLink::Standard(StandardLink::Logit),
         ),
     );
     if firth_override == Some(true) && !supports_firth {
@@ -5366,13 +5366,13 @@ impl UnifiedFitResult {
     ) -> Result<FittedLinkState, EstimationError> {
         match (&family.response, &family.link) {
             (ResponseFamily::Gaussian, _) => Ok(FittedLinkState::Standard(None)),
-            (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Logit)) => {
+            (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::Logit)) => {
                 Ok(FittedLinkState::Standard(None))
             }
-            (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Probit)) => {
+            (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::Probit)) => {
                 Ok(FittedLinkState::Standard(None))
             }
-            (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::CLogLog)) => {
+            (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::CLogLog)) => {
                 Ok(FittedLinkState::Standard(None))
             }
             (ResponseFamily::Binomial, InverseLink::LatentCLogLog(_)) => match &self.fitted_link {
@@ -6086,9 +6086,9 @@ where
             ));
         }
         match &family.link {
-            InverseLink::Standard(LinkFunction::Logit)
-            | InverseLink::Standard(LinkFunction::Probit)
-            | InverseLink::Standard(LinkFunction::CLogLog)
+            InverseLink::Standard(StandardLink::Logit)
+            | InverseLink::Standard(StandardLink::Probit)
+            | InverseLink::Standard(StandardLink::CLogLog)
             | InverseLink::Mixture(_) => {
                 let mixture_state = crate::mixture_link::state_fromspec(mix_spec).map_err(|e| {
                     EstimationError::InvalidInput(format!("invalid mixture link: {e}"))
@@ -6116,7 +6116,7 @@ where
             ));
         }
         match &family.link {
-            InverseLink::Standard(LinkFunction::CLogLog) | InverseLink::LatentCLogLog(_) => {
+            InverseLink::Standard(StandardLink::CLogLog) | InverseLink::LatentCLogLog(_) => {
                 LikelihoodSpec::new(
                     ResponseFamily::Binomial,
                     InverseLink::LatentCLogLog(*latent_state),
@@ -6829,7 +6829,7 @@ mod estimate_policy_tests {
             lambdas: array![0.2, 0.8],
             likelihood_family: Some(LikelihoodSpec::new(
                 ResponseFamily::Gaussian,
-                InverseLink::Standard(LinkFunction::Identity),
+                InverseLink::Standard(StandardLink::Identity),
             )),
             likelihood_scale: LikelihoodScaleMetadata::ProfiledGaussian,
             log_likelihood_normalization: LogLikelihoodNormalization::Full,
@@ -6883,7 +6883,7 @@ mod estimate_policy_tests {
         let err = resolve_external_family(
             &LikelihoodSpec::new(
                 ResponseFamily::Poisson,
-                InverseLink::Standard(LinkFunction::Log),
+                InverseLink::Standard(StandardLink::Log),
             ),
             Some(true),
         )

@@ -42,7 +42,7 @@ fn logit_opts(firth: bool) -> ExternalOptimOptions {
         optimize_sas: false,
         family: LikelihoodSpec::new(
             ResponseFamily::Binomial,
-            InverseLink::Standard(LinkFunction::Logit),
+            InverseLink::Standard(StandardLink::Logit),
         ),
         compute_inference: true,
         max_iter: 200,

@@ -120,28 +120,28 @@ mod tests {
             (
                 LikelihoodSpec::new(
                     ResponseFamily::Binomial,
-                    InverseLink::Standard(LinkFunction::Logit),
+                    InverseLink::Standard(StandardLink::Logit),
                 ),
                 PirlsLoopFamilyKind::BernoulliLogit,
             ),
             (
                 LikelihoodSpec::new(
                     ResponseFamily::Binomial,
-                    InverseLink::Standard(LinkFunction::Probit),
+                    InverseLink::Standard(StandardLink::Probit),
                 ),
                 PirlsLoopFamilyKind::BernoulliProbit,
             ),
             (
                 LikelihoodSpec::new(
                     ResponseFamily::Binomial,
-                    InverseLink::Standard(LinkFunction::CLogLog),
+                    InverseLink::Standard(StandardLink::CLogLog),
                 ),
                 PirlsLoopFamilyKind::BernoulliCLogLog,
             ),
             (
                 LikelihoodSpec::new(
                     ResponseFamily::Poisson,
-                    InverseLink::Standard(LinkFunction::Log),
+                    InverseLink::Standard(StandardLink::Log),
                 ),
                 PirlsLoopFamilyKind::PoissonLog,
             ),
@@ -152,7 +152,7 @@ mod tests {
             (
                 LikelihoodSpec::new(
                     ResponseFamily::Gamma,
-                    InverseLink::Standard(LinkFunction::Log),
+                    InverseLink::Standard(StandardLink::Log),
                 ),
                 PirlsLoopFamilyKind::GammaLog,
             ),
@@ -176,7 +176,7 @@ mod tests {
         assert_eq!(
             pirls_loop_family_for(&LikelihoodSpec::new(
                 ResponseFamily::Poisson,
-                InverseLink::Standard(LinkFunction::Identity),
+                InverseLink::Standard(StandardLink::Identity),
             )),
             None
         );
@@ -184,7 +184,7 @@ mod tests {
         assert_eq!(
             pirls_loop_family_for(&LikelihoodSpec::new(
                 ResponseFamily::Tweedie { p: 1.5 },
-                InverseLink::Standard(LinkFunction::Log),
+                InverseLink::Standard(StandardLink::Log),
             )),
             None
         );

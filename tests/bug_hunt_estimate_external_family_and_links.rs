@@ -53,7 +53,7 @@ fn fit_gam_preserves_parameterized_mixture_state_in_reported_family() {
     opts.optimize_mixture = false;
     let family = LikelihoodSpec::new(
         ResponseFamily::Binomial,
-        InverseLink::Standard(LinkFunction::Logit),
+        InverseLink::Standard(StandardLink::Logit),
     );
     let fit = fit_gam(
         x.view(),
@@ -82,7 +82,7 @@ fn fit_gam_preserves_parameterized_latent_cloglog_state_in_reported_family() {
     opts.latent_cloglog = Some(LatentCLogLogState::new(0.7).expect("valid latent sd"));
     let family = LikelihoodSpec::new(
         ResponseFamily::Binomial,
-        InverseLink::Standard(LinkFunction::CLogLog),
+        InverseLink::Standard(StandardLink::CLogLog),
     );
     let fit = fit_gam(
         x.view(),
@@ -107,7 +107,7 @@ fn resolve_external_family_rejects_beta_response_with_clear_error() {
     let opts = base_opts();
     let family = LikelihoodSpec::new(
         ResponseFamily::Beta { phi: 5.0 },
-        InverseLink::Standard(LinkFunction::Logit),
+        InverseLink::Standard(StandardLink::Logit),
     );
     let err = fit_gam(
         x.view(),
@@ -131,7 +131,7 @@ fn heuristic_lambdas_are_used_as_initial_rho_for_reml() {
     let opts = base_opts();
     let family = LikelihoodSpec::new(
         ResponseFamily::Binomial,
-        InverseLink::Standard(LinkFunction::Logit),
+        InverseLink::Standard(StandardLink::Logit),
     );
     let fit = fit_gamwith_heuristic_lambdas(
         x.view(),
@@ -157,7 +157,7 @@ fn fitted_link_state_returns_none_for_standard_links() {
     let opts = base_opts();
     let family = LikelihoodSpec::new(
         ResponseFamily::Binomial,
-        InverseLink::Standard(LinkFunction::Logit),
+        InverseLink::Standard(StandardLink::Logit),
     );
     let fit = fit_gam(
         x.view(),
@@ -189,7 +189,7 @@ fn sas_link_options_only_apply_to_sas_families() {
     });
     let family = LikelihoodSpec::new(
         ResponseFamily::Binomial,
-        InverseLink::Standard(LinkFunction::Logit),
+        InverseLink::Standard(StandardLink::Logit),
     );
     let err = fit_gam(
         x.view(),

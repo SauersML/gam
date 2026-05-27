@@ -2870,7 +2870,7 @@ pub fn integrated_family_moments_jet(
     let sas_link_state: Option<&SasLinkState> = likelihood.link.sas_state();
     match &likelihood.response {
         ResponseFamily::Binomial => match &likelihood.link {
-            InverseLink::Standard(LinkFunction::Logit) => {
+            InverseLink::Standard(StandardLink::Logit) => {
                 let jet = integrated_inverse_link_jet(quadctx, LinkFunction::Logit, e, se)?;
                 let mean = jet.mean;
                 Ok(IntegratedMomentsJet {
@@ -2882,7 +2882,7 @@ pub fn integrated_family_moments_jet(
                     mode: jet.mode,
                 })
             }
-            InverseLink::Standard(LinkFunction::Probit) => {
+            InverseLink::Standard(StandardLink::Probit) => {
                 let jet = integrated_inverse_link_jet(quadctx, LinkFunction::Probit, e, se)?;
                 let mean = jet.mean;
                 Ok(IntegratedMomentsJet {
@@ -2894,7 +2894,7 @@ pub fn integrated_family_moments_jet(
                     mode: jet.mode,
                 })
             }
-            InverseLink::Standard(LinkFunction::CLogLog) => {
+            InverseLink::Standard(StandardLink::CLogLog) => {
                 let jet = integrated_inverse_link_jet(quadctx, LinkFunction::CLogLog, e, se)?;
                 let mean = jet.mean;
                 Ok(IntegratedMomentsJet {

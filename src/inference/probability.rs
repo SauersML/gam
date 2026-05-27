@@ -344,7 +344,7 @@ mod tests {
         let eta = array![0.1, -0.2, 0.3];
         let likelihood = LikelihoodSpec::new(
             ResponseFamily::Binomial,
-            InverseLink::Standard(LinkFunction::Logit),
+            InverseLink::Standard(StandardLink::Logit),
         );
         let mu = try_inverse_link_array(&likelihood, eta.view()).expect("standard logit spec");
         assert_eq!(mu.len(), eta.len());

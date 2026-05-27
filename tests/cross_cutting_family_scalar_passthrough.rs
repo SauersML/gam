@@ -53,14 +53,14 @@ fn cross_cutting_tweedie_negbin_beta_scalars_passthrough() {
         tweedie_y.clone(),
         LikelihoodSpec::new(
             ResponseFamily::Tweedie { p: 1.5 },
-            InverseLink::Standard(LinkFunction::Log),
+            InverseLink::Standard(StandardLink::Log),
         ),
     );
     let tw_17 = fit_small(
         tweedie_y,
         LikelihoodSpec::new(
             ResponseFamily::Tweedie { p: 1.7 },
-            InverseLink::Standard(LinkFunction::Log),
+            InverseLink::Standard(StandardLink::Log),
         ),
     );
 
@@ -83,14 +83,14 @@ fn cross_cutting_tweedie_negbin_beta_scalars_passthrough() {
         nb_y.clone(),
         LikelihoodSpec::new(
             ResponseFamily::NegativeBinomial { theta: 2.0 },
-            InverseLink::Standard(LinkFunction::Log),
+            InverseLink::Standard(StandardLink::Log),
         ),
     );
     let nb_80 = fit_small(
         nb_y,
         LikelihoodSpec::new(
             ResponseFamily::NegativeBinomial { theta: 8.0 },
-            InverseLink::Standard(LinkFunction::Log),
+            InverseLink::Standard(StandardLink::Log),
         ),
     );
     assert!(
@@ -107,14 +107,14 @@ fn cross_cutting_tweedie_negbin_beta_scalars_passthrough() {
         beta_y.clone(),
         LikelihoodSpec::new(
             ResponseFamily::Beta { phi: 10.0 },
-            InverseLink::Standard(LinkFunction::Logit),
+            InverseLink::Standard(StandardLink::Logit),
         ),
     );
     let be_30 = fit_small(
         beta_y,
         LikelihoodSpec::new(
             ResponseFamily::Beta { phi: 30.0 },
-            InverseLink::Standard(LinkFunction::Logit),
+            InverseLink::Standard(StandardLink::Logit),
         ),
     );
     assert!(

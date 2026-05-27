@@ -332,13 +332,13 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
     ) -> Result<(f64, f64), EstimationError> {
         match (&self.spec.response, &self.spec.link) {
             (ResponseFamily::Gaussian, _) => Ok((eta, (se_eta * se_eta).max(0.0))),
-            (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Logit)) => {
+            (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::Logit)) => {
                 Ok(logit_posterior_meanvariance(quadctx, eta, se_eta))
             }
-            (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Probit)) => {
+            (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::Probit)) => {
                 Ok(probit_posterior_meanvariance(quadctx, eta, se_eta))
             }
-            (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::CLogLog)) => {
+            (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::CLogLog)) => {
                 Ok(cloglog_posterior_meanvariance(quadctx, eta, se_eta))
             }
             (ResponseFamily::Binomial, InverseLink::Standard(_)) => {

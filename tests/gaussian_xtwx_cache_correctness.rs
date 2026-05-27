@@ -126,9 +126,9 @@ fn fit_at_rho(
     let cfg = PirlsConfig {
         likelihood: GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
             ResponseFamily::Gaussian,
-            InverseLink::Standard(LinkFunction::Identity),
+            InverseLink::Standard(StandardLink::Identity),
         )),
-        link_kind: InverseLink::Standard(LinkFunction::Identity),
+        link_kind: InverseLink::Standard(StandardLink::Identity),
         max_iterations: 200,
         convergence_tolerance: 1e-12,
         firth_bias_reduction: false,

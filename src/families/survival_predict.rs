@@ -1330,7 +1330,7 @@ fn evaluate_rp_row_with_beta(
     let offset_view = Array1::from_elem(1, eta_time_offset_row + primary_offset_row);
     let likelihood = LikelihoodSpec::new(
         ResponseFamily::RoystonParmar,
-        InverseLink::Standard(LinkFunction::Identity),
+        InverseLink::Standard(StandardLink::Identity),
     );
     let eta =
         predict_royston_parmar_eta(x_exit.view(), beta.view(), offset_view.view(), &likelihood)?[0];
@@ -1350,7 +1350,7 @@ where
     if !matches!(likelihood.response, ResponseFamily::RoystonParmar)
         || !matches!(
             likelihood.link,
-            InverseLink::Standard(LinkFunction::Identity)
+            InverseLink::Standard(StandardLink::Identity)
         )
     {
         return Err(SurvivalPredictError::UnsupportedConfiguration {
@@ -1910,15 +1910,15 @@ fn location_scale_hazard_component(
         ));
     }
     match inverse_link {
-        InverseLink::Standard(LinkFunction::Probit) => {
+        InverseLink::Standard(StandardLink::Probit) => {
             let (_, hazard) = probit_survival_hazard_components(eta, eta_derivative)?;
             Ok(hazard)
         }
-        InverseLink::Standard(LinkFunction::CLogLog) => {
+        InverseLink::Standard(StandardLink::CLogLog) => {
             let (_, hazard) = royston_parmar_survival_hazard_components(eta, eta_derivative)?;
             Ok(hazard)
         }
-        InverseLink::Standard(LinkFunction::Logit) => {
+        InverseLink::Standard(StandardLink::Logit) => {
             let failure = if eta >= 0.0 {
                 1.0 / (1.0 + (-eta).exp())
             } else {
@@ -1927,7 +1927,7 @@ fn location_scale_hazard_component(
             };
             Ok(failure * eta_derivative)
         }
-        InverseLink::Standard(LinkFunction::Identity) => {
+        InverseLink::Standard(StandardLink::Identity) => {
             let survival = 1.0 - eta;
             if !(survival.is_finite() && survival > 0.0) {
                 return Err(format!(
@@ -2484,7 +2484,7 @@ pub fn build_saved_survival_marginal_slope_predictor(
         })?,
         model
             .resolved_inverse_link()?
-            .unwrap_or(InverseLink::Standard(LinkFunction::Probit)),
+            .unwrap_or(InverseLink::Standard(StandardLink::Probit)),
         model
             .family_state
             .frailty()
@@ -2707,7 +2707,7 @@ mod tests {
         let hazard = location_scale_hazard_component(
             eta,
             eta_t,
-            &InverseLink::Standard(LinkFunction::Logit),
+            &InverseLink::Standard(StandardLink::Logit),
         )
         .expect("valid logit hazard");
 
@@ -2723,7 +2723,7 @@ mod tests {
         let hazard = location_scale_hazard_component(
             eta,
             eta_t,
-            &InverseLink::Standard(LinkFunction::CLogLog),
+            &InverseLink::Standard(StandardLink::CLogLog),
         )
         .expect("valid cloglog hazard");
 

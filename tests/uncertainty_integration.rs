@@ -20,7 +20,7 @@ fn dense_penalty(local: Array2<f64>) -> BlockwisePenalty {
 fn gaussian_identity_likelihood() -> LikelihoodSpec {
     LikelihoodSpec::new(
         ResponseFamily::Gaussian,
-        InverseLink::Standard(LinkFunction::Identity),
+        InverseLink::Standard(StandardLink::Identity),
     )
 }
 

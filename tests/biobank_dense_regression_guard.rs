@@ -134,7 +134,7 @@ fn biobank_dense_logit_regression_guard() {
         &s_list,
         LikelihoodSpec::new(
             ResponseFamily::Binomial,
-            InverseLink::Standard(LinkFunction::Logit),
+            InverseLink::Standard(StandardLink::Logit),
         ),
         &FitOptions {
             latent_cloglog: None,

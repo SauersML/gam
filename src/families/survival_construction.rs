@@ -2863,7 +2863,7 @@ pub fn location_scale_uses_probit_survival_baseline(inverse_link: Option<&Invers
     matches!(
         inverse_link,
         Some(
-            InverseLink::Standard(LinkFunction::Probit)
+            InverseLink::Standard(StandardLink::Probit)
                 | InverseLink::LatentCLogLog(_)
                 | InverseLink::Sas(_)
                 | InverseLink::BetaLogistic(_)

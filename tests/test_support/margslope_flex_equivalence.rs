@@ -171,7 +171,7 @@ pub fn build_biobank_shape_problem(n: usize) -> BiobankShapeProblem {
             y,
             weights: Array1::ones(n),
             z,
-            base_link: InverseLink::Standard(LinkFunction::Probit),
+            base_link: InverseLink::Standard(StandardLink::Probit),
             marginalspec,
             logslopespec,
             marginal_offset: Array1::zeros(n),

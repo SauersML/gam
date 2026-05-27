@@ -51,7 +51,7 @@ fn fit_unpenalized(
     let cfg = PirlsConfig {
         likelihood: GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
             ResponseFamily::Binomial,
-            InverseLink::Standard(LinkFunction::Logit),
+            InverseLink::Standard(StandardLink::Logit),
         )),
         link_kind: InverseLink::Standard(link),
         max_iterations: 100,
@@ -112,7 +112,7 @@ fn fit_identity_penalized(
     let cfg = PirlsConfig {
         likelihood: GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
             ResponseFamily::Binomial,
-            InverseLink::Standard(LinkFunction::Logit),
+            InverseLink::Standard(StandardLink::Logit),
         )),
         link_kind: InverseLink::Standard(link),
         max_iterations: 100,

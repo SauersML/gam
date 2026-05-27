@@ -7424,6 +7424,109 @@ impl SurvivalMarginalSlopeFamily {
             signed_probit_neglog_derivatives_up_to_fourth(-entry.eta, -wi)?;
         let (exit_k1, exit_k2, _, _) =
             signed_probit_neglog_derivatives_up_to_fourth(-exit.eta, wi * (1.0 - di))?;
+
+        // ── Step-6 dispatcher: try GPU Step-5 assembly first ──────────────
+        //
+        // The per-row primary G/H assembly is pure scalar/vector algebra over
+        // the jets; the prep dispatchers (`try_device_partition_cells` +
+        // `try_device_cell_primary_fixed_partials`) already produced these
+        // jets via `compute_survival_timepoint_exact` →
+        // `build_cached_partition_with_moment_order`, so the only remaining
+        // family-side hop is the Step-5 G/H pullback in
+        // [`crate::gpu::survival_flex::try_device_step5_primary_assembly`].
+        //
+        // The GPU entry takes flat `&[f64]` views; both `Array1` and `Array2`
+        // returned by the timepoint-exact pass live in standard contiguous
+        // layout (built via `Array1::zeros` / `Array2::zeros` above), so the
+        // `as_slice()` extractions below are infallible in practice; we
+        // route through the CPU fallback when any of them happens not to be
+        // contiguous, preserving the legacy code path as the source of
+        // truth.
+        let p = primary.total;
+        let entry_eta_u = entry.eta_u.as_slice();
+        let entry_eta_uv = entry.eta_uv.as_slice();
+        let entry_chi_u = entry.chi_u.as_slice();
+        let entry_chi_uv = entry.chi_uv.as_slice();
+        let entry_d_u = entry.d_u.as_slice();
+        let entry_d_uv = entry.d_uv.as_slice();
+        let exit_eta_u = exit.eta_u.as_slice();
+        let exit_eta_uv = exit.eta_uv.as_slice();
+        let exit_chi_u = exit.chi_u.as_slice();
+        let exit_chi_uv = exit.chi_uv.as_slice();
+        let exit_d_u = exit.d_u.as_slice();
+        let exit_d_uv = exit.d_uv.as_slice();
+        let all_contiguous = entry_eta_u.is_some()
+            && entry_eta_uv.is_some()
+            && entry_chi_u.is_some()
+            && entry_chi_uv.is_some()
+            && entry_d_u.is_some()
+            && entry_d_uv.is_some()
+            && exit_eta_u.is_some()
+            && exit_eta_uv.is_some()
+            && exit_chi_u.is_some()
+            && exit_chi_uv.is_some()
+            && exit_d_u.is_some()
+            && exit_d_uv.is_some();
+        if all_contiguous && exit.chi.is_finite() && exit.chi > 0.0 && exit.d.is_finite() && exit.d > 0.0 {
+            let row_inputs = [crate::gpu::survival_flex::SurvivalFlexStep5RowInputs {
+                entry: crate::gpu::survival_flex::SurvivalFlexTimepointJet {
+                    eta: entry.eta,
+                    chi: entry.chi,
+                    d: entry.d,
+                    eta_u: entry_eta_u.unwrap(),
+                    eta_uv: entry_eta_uv.unwrap(),
+                    chi_u: entry_chi_u.unwrap(),
+                    chi_uv: entry_chi_uv.unwrap(),
+                    d_u: entry_d_u.unwrap(),
+                    d_uv: entry_d_uv.unwrap(),
+                },
+                exit: crate::gpu::survival_flex::SurvivalFlexTimepointJet {
+                    eta: exit.eta,
+                    chi: exit.chi,
+                    d: exit.d,
+                    eta_u: exit_eta_u.unwrap(),
+                    eta_uv: exit_eta_uv.unwrap(),
+                    chi_u: exit_chi_u.unwrap(),
+                    chi_uv: exit_chi_uv.unwrap(),
+                    d_u: exit_d_u.unwrap(),
+                    d_uv: exit_d_uv.unwrap(),
+                },
+                wi,
+                di,
+                q1,
+                qd1,
+                q1_index: primary.q1,
+                qd1_index: primary.qd1,
+                entry_k1,
+                entry_k2,
+                exit_k1,
+                exit_k2,
+                log_surv0,
+                log_surv1,
+            }];
+            // `try_device_step5_primary_assembly` is the device-shape Step-5
+            // pullback (`src/gpu/survival_flex.rs:3513`).  Its current body
+            // is CPU-resident scalar algebra producing the same `(row_nll,
+            // grad, hess)` the inline CPU loop below builds; when the NVRTC
+            // kernel lands, this call site becomes the device-dispatch seam
+            // without further family-side rework.  We fall back to the
+            // inline CPU loop on `Err` so any device-side validation failure
+            // surfaces as a row-level CPU re-evaluation rather than a hard
+            // panic.
+            if let Ok(mut out) = crate::gpu::survival_flex::try_device_step5_primary_assembly(
+                &row_inputs,
+            ) && out.len() == 1
+            {
+                let row = out.remove(0);
+                if row.grad.len() == p && row.hess.len() == p * p {
+                    let grad = Array1::from_vec(row.grad);
+                    let hess = Array2::from_shape_vec((p, p), row.hess)
+                        .map_err(|e| e.to_string())?;
+                    return Ok((row.row_nll, grad, hess));
+                }
+            }
+        }
+
         let log_phi_eta1 = -0.5 * (exit.eta * exit.eta + std::f64::consts::TAU.ln());
         let log_phi_q1 = -0.5 * (q1 * q1 + std::f64::consts::TAU.ln());
         let row_nll = wi
@@ -7435,7 +7538,6 @@ impl SurvivalMarginalSlopeFamily {
                 + di * exit.d.ln()
                 - di * qd1.ln());
 
-        let p = primary.total;
         let mut grad = Array1::<f64>::zeros(p);
         let mut hess = Array2::<f64>::zeros((p, p));
         let entry_u1 = -entry_k1;
@@ -18149,7 +18251,7 @@ pub fn fit_survival_marginal_slope_terms(
     let fit_started = std::time::Instant::now();
     let mut spec = spec;
     validate_spec(&spec)?;
-    if spec.base_link != InverseLink::Standard(LinkFunction::Probit) {
+    if spec.base_link != InverseLink::Standard(StandardLink::Probit) {
         return Err(SurvivalMarginalSlopeError::UnsupportedConfiguration {
             reason: format!(
                 "survival-marginal-slope currently supports only probit base_link, got {:?}",
@@ -20578,7 +20680,7 @@ mod tests {
             event_target: array![0.0, 1.0],
             weights: array![1.0, 1.0],
             z: array![-1.0, 1.0].insert_axis(Axis(1)),
-            base_link: InverseLink::Standard(LinkFunction::Probit),
+            base_link: InverseLink::Standard(StandardLink::Probit),
             marginalspec: empty_termspec(),
             marginal_offset: Array1::zeros(2),
             frailty: FrailtySpec::None,
@@ -20617,7 +20719,7 @@ mod tests {
             event_target: array![0.0, 1.0],
             weights: array![1.0, 1.0],
             z: array![-1.0, 1.0].insert_axis(Axis(1)),
-            base_link: InverseLink::Standard(LinkFunction::Probit),
+            base_link: InverseLink::Standard(StandardLink::Probit),
             marginalspec: empty_termspec(),
             marginal_offset: Array1::zeros(2),
             frailty: FrailtySpec::GaussianShift { sigma_fixed: None },

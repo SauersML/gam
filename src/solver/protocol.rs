@@ -80,7 +80,7 @@ impl MarginalSlopeCalibrationProtocol {
         latent_score: LatentScoreSemantics,
     ) -> Self {
         Self {
-            base_link: InverseLink::Standard(LinkFunction::Probit),
+            base_link: InverseLink::Standard(StandardLink::Probit),
             score_warp,
             link_deviation,
             latent_score,

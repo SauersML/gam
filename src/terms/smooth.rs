@@ -10203,7 +10203,7 @@ fn evaluate_standard_familyobservations(
                 neghessian_eta_derivative[i] = 0.0;
                 log_likelihood += -0.5 * w * resid * resid;
             }
-            (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Logit)) => {
+            (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::Logit)) => {
                 let jet = logit_inverse_link_jet5(eta_i);
                 mu[i] = jet.mu;
                 score[i] = w * (yi - jet.mu);
@@ -21808,7 +21808,7 @@ mod tests {
             &spec,
             LikelihoodSpec::new(
                 ResponseFamily::Gaussian,
-                InverseLink::Standard(LinkFunction::Identity),
+                InverseLink::Standard(StandardLink::Identity),
             ),
             &fit_opts,
         )
@@ -21823,7 +21823,7 @@ mod tests {
             &spec,
             LikelihoodSpec::new(
                 ResponseFamily::Gaussian,
-                InverseLink::Standard(LinkFunction::Identity),
+                InverseLink::Standard(StandardLink::Identity),
             ),
             &fit_opts,
             &SpatialLengthScaleOptimizationOptions {
@@ -22028,14 +22028,14 @@ mod tests {
         assert!(exact_joint_spatial_outer_hessian_available(
             &LikelihoodSpec::new(
                 ResponseFamily::Binomial,
-                InverseLink::Standard(LinkFunction::Logit),
+                InverseLink::Standard(StandardLink::Logit),
             ),
             &design,
         ));
         assert!(exact_joint_spatial_outer_hessian_available(
             &LikelihoodSpec::new(
                 ResponseFamily::Gaussian,
-                InverseLink::Standard(LinkFunction::Identity),
+                InverseLink::Standard(StandardLink::Identity),
             ),
             &design,
         ));
@@ -22118,7 +22118,7 @@ mod tests {
         let external_opts = external_opts_for_design(
             &LikelihoodSpec::new(
                 ResponseFamily::Gaussian,
-                InverseLink::Standard(LinkFunction::Identity),
+                InverseLink::Standard(StandardLink::Identity),
             ),
             &design,
             &fit_opts,
@@ -22280,7 +22280,7 @@ mod tests {
         let external_opts = external_opts_for_design(
             &LikelihoodSpec::new(
                 ResponseFamily::Binomial,
-                InverseLink::Standard(LinkFunction::Probit),
+                InverseLink::Standard(StandardLink::Probit),
             ),
             &frozen_design,
             &fit_opts,
@@ -22686,7 +22686,7 @@ mod tests {
             80,
             LikelihoodSpec::new(
                 ResponseFamily::Gaussian,
-                InverseLink::Standard(LinkFunction::Identity),
+                InverseLink::Standard(StandardLink::Identity),
             ),
             false,
             false,
@@ -22705,7 +22705,7 @@ mod tests {
             80,
             LikelihoodSpec::new(
                 ResponseFamily::Binomial,
-                InverseLink::Standard(LinkFunction::Logit),
+                InverseLink::Standard(StandardLink::Logit),
             ),
             false,
             false,
@@ -22724,7 +22724,7 @@ mod tests {
             80,
             LikelihoodSpec::new(
                 ResponseFamily::Binomial,
-                InverseLink::Standard(LinkFunction::Probit),
+                InverseLink::Standard(StandardLink::Probit),
             ),
             true,
             false,
@@ -22743,7 +22743,7 @@ mod tests {
             20,
             LikelihoodSpec::new(
                 ResponseFamily::Binomial,
-                InverseLink::Standard(LinkFunction::Probit),
+                InverseLink::Standard(StandardLink::Probit),
             ),
             false,
             false,
@@ -22762,7 +22762,7 @@ mod tests {
             80,
             LikelihoodSpec::new(
                 ResponseFamily::Binomial,
-                InverseLink::Standard(LinkFunction::Probit),
+                InverseLink::Standard(StandardLink::Probit),
             ),
             false,
             true,
@@ -22859,7 +22859,7 @@ mod tests {
         let external_opts = external_opts_for_design(
             &LikelihoodSpec::new(
                 ResponseFamily::Binomial,
-                InverseLink::Standard(LinkFunction::Probit),
+                InverseLink::Standard(StandardLink::Probit),
             ),
             &frozen_design,
             &fit_opts,
@@ -23091,7 +23091,7 @@ mod tests {
         let external_opts = external_opts_for_design(
             &LikelihoodSpec::new(
                 ResponseFamily::Binomial,
-                InverseLink::Standard(LinkFunction::Probit),
+                InverseLink::Standard(StandardLink::Probit),
             ),
             &frozen_design,
             &fit_opts,
@@ -23347,7 +23347,7 @@ mod tests {
         let external_opts = external_opts_for_design(
             &LikelihoodSpec::new(
                 ResponseFamily::Binomial,
-                InverseLink::Standard(LinkFunction::Probit),
+                InverseLink::Standard(StandardLink::Probit),
             ),
             &frozen_design,
             &fit_opts,
@@ -23465,7 +23465,7 @@ mod tests {
         assert!(exact_joint_spatial_outer_hessian_available(
             &LikelihoodSpec::new(
                 ResponseFamily::Binomial,
-                InverseLink::Standard(LinkFunction::Logit),
+                InverseLink::Standard(StandardLink::Logit),
             ),
             &design,
         ));
@@ -24424,7 +24424,7 @@ mod tests {
         let external_opts = external_opts_for_design(
             &LikelihoodSpec::new(
                 ResponseFamily::Gaussian,
-                InverseLink::Standard(LinkFunction::Identity),
+                InverseLink::Standard(StandardLink::Identity),
             ),
             &design,
             &fit_opts,
@@ -24481,7 +24481,7 @@ mod tests {
                 let fresh_opts = external_opts_for_design(
                     &LikelihoodSpec::new(
                         ResponseFamily::Gaussian,
-                        InverseLink::Standard(LinkFunction::Identity),
+                        InverseLink::Standard(StandardLink::Identity),
                     ),
                     cache.design(),
                     &fit_opts,
@@ -24935,7 +24935,7 @@ mod tests {
             &spec,
             LikelihoodSpec::new(
                 ResponseFamily::Gaussian,
-                InverseLink::Standard(LinkFunction::Identity),
+                InverseLink::Standard(StandardLink::Identity),
             ),
             &fit_opts,
         )
@@ -24950,7 +24950,7 @@ mod tests {
             &spec,
             LikelihoodSpec::new(
                 ResponseFamily::Gaussian,
-                InverseLink::Standard(LinkFunction::Identity),
+                InverseLink::Standard(StandardLink::Identity),
             ),
             &fit_opts,
             &SpatialLengthScaleOptimizationOptions {
@@ -25058,7 +25058,7 @@ mod tests {
             &spec,
             LikelihoodSpec::new(
                 ResponseFamily::Binomial,
-                InverseLink::Standard(LinkFunction::Logit),
+                InverseLink::Standard(StandardLink::Logit),
             ),
             &fit_opts,
             &SpatialLengthScaleOptimizationOptions {
@@ -25190,7 +25190,7 @@ mod tests {
             &spec,
             LikelihoodSpec::new(
                 ResponseFamily::Gaussian,
-                InverseLink::Standard(LinkFunction::Identity),
+                InverseLink::Standard(StandardLink::Identity),
             ),
             &fit_opts,
             &SpatialLengthScaleOptimizationOptions::default(),
@@ -25560,7 +25560,7 @@ mod tests {
             &spec,
             LikelihoodSpec::new(
                 ResponseFamily::Gaussian,
-                InverseLink::Standard(LinkFunction::Identity),
+                InverseLink::Standard(StandardLink::Identity),
             ),
             &fit_opts,
             &SpatialLengthScaleOptimizationOptions::default(),
@@ -25835,7 +25835,7 @@ mod tests {
             &spec,
             LikelihoodSpec::new(
                 ResponseFamily::Gaussian,
-                InverseLink::Standard(LinkFunction::Identity),
+                InverseLink::Standard(StandardLink::Identity),
             ),
             &fit_opts,
             &SpatialLengthScaleOptimizationOptions::default(),
@@ -26205,7 +26205,7 @@ mod tests {
             &spec,
             LikelihoodSpec::new(
                 ResponseFamily::Gaussian,
-                InverseLink::Standard(LinkFunction::Identity),
+                InverseLink::Standard(StandardLink::Identity),
             ),
             &FitOptions {
                 latent_cloglog: None,
@@ -26369,7 +26369,7 @@ mod tests {
         let family = BoundedLinearFamily {
             family: LikelihoodSpec::new(
                 ResponseFamily::Gaussian,
-                InverseLink::Standard(LinkFunction::Identity),
+                InverseLink::Standard(StandardLink::Identity),
             ),
             latent_cloglog_state: None,
             mixture_link_state: None,
@@ -26478,7 +26478,7 @@ mod tests {
         let family = SpatialAdaptiveExactFamily {
             family: LikelihoodSpec::new(
                 ResponseFamily::Gaussian,
-                InverseLink::Standard(LinkFunction::Identity),
+                InverseLink::Standard(StandardLink::Identity),
             ),
             latent_cloglog_state: None,
             mixture_link_state: None,
@@ -26717,7 +26717,7 @@ mod tests {
             &spec,
             LikelihoodSpec::new(
                 ResponseFamily::Gaussian,
-                InverseLink::Standard(LinkFunction::Identity),
+                InverseLink::Standard(StandardLink::Identity),
             ),
             &FitOptions {
                 latent_cloglog: None,
@@ -26807,7 +26807,7 @@ mod tests {
             &spec,
             LikelihoodSpec::new(
                 ResponseFamily::Gaussian,
-                InverseLink::Standard(LinkFunction::Identity),
+                InverseLink::Standard(StandardLink::Identity),
             ),
             &FitOptions {
                 latent_cloglog: None,
@@ -26998,7 +26998,7 @@ mod tests {
             &spec,
             LikelihoodSpec::new(
                 ResponseFamily::Gaussian,
-                InverseLink::Standard(LinkFunction::Identity),
+                InverseLink::Standard(StandardLink::Identity),
             ),
             &FitOptions {
                 latent_cloglog: None,
@@ -27060,7 +27060,7 @@ mod tests {
         let base_family = SpatialAdaptiveExactFamily {
             family: LikelihoodSpec::new(
                 ResponseFamily::Gaussian,
-                InverseLink::Standard(LinkFunction::Identity),
+                InverseLink::Standard(StandardLink::Identity),
             ),
             latent_cloglog_state: None,
             mixture_link_state: None,
@@ -27229,7 +27229,7 @@ mod tests {
             &spec,
             LikelihoodSpec::new(
                 ResponseFamily::Gaussian,
-                InverseLink::Standard(LinkFunction::Identity),
+                InverseLink::Standard(StandardLink::Identity),
             ),
             &FitOptions {
                 latent_cloglog: None,
@@ -27286,7 +27286,7 @@ mod tests {
         let base_family = SpatialAdaptiveExactFamily {
             family: LikelihoodSpec::new(
                 ResponseFamily::Gaussian,
-                InverseLink::Standard(LinkFunction::Identity),
+                InverseLink::Standard(StandardLink::Identity),
             ),
             latent_cloglog_state: None,
             mixture_link_state: None,
@@ -27417,7 +27417,7 @@ mod tests {
             &spec,
             LikelihoodSpec::new(
                 ResponseFamily::Gaussian,
-                InverseLink::Standard(LinkFunction::Identity),
+                InverseLink::Standard(StandardLink::Identity),
             ),
             &FitOptions {
                 latent_cloglog: None,
@@ -27469,7 +27469,7 @@ mod tests {
         let obs = evaluate_standard_familyobservations(
             LikelihoodSpec::new(
                 ResponseFamily::Binomial,
-                InverseLink::Standard(LinkFunction::Logit),
+                InverseLink::Standard(StandardLink::Logit),
             ),
             None,
             None,
@@ -27517,11 +27517,11 @@ mod tests {
         for family in [
             LikelihoodSpec::new(
                 ResponseFamily::Binomial,
-                InverseLink::Standard(LinkFunction::Probit),
+                InverseLink::Standard(StandardLink::Probit),
             ),
             LikelihoodSpec::new(
                 ResponseFamily::Binomial,
-                InverseLink::Standard(LinkFunction::CLogLog),
+                InverseLink::Standard(StandardLink::CLogLog),
             ),
         ] {
             let obs = evaluate_standard_familyobservations(

@@ -14,7 +14,7 @@ fn integrated_family_moments_jet_matches_lognormal_mean_for_poisson_log_link() {
     let ctx = QuadratureContext::new();
     let spec = LikelihoodSpec::new(
         ResponseFamily::Poisson,
-        InverseLink::Standard(LinkFunction::Log),
+        InverseLink::Standard(StandardLink::Log),
     );
 
     for _ in 0..32 {

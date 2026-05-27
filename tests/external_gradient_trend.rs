@@ -53,7 +53,7 @@ fn analytic_gradient_matchescost_trend() {
         optimize_sas: false,
         family: LikelihoodSpec::new(
             ResponseFamily::Binomial,
-            InverseLink::Standard(LinkFunction::Logit),
+            InverseLink::Standard(StandardLink::Logit),
         ),
         compute_inference: true,
         tol: 1e-10,
@@ -144,7 +144,7 @@ fn hypothesis_analytic_gradient_matchescost_trend() {
         optimize_sas: false,
         family: LikelihoodSpec::new(
             ResponseFamily::Binomial,
-            InverseLink::Standard(LinkFunction::Logit),
+            InverseLink::Standard(StandardLink::Logit),
         ),
         compute_inference: true,
         tol: 1e-10,

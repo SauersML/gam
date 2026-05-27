@@ -68,7 +68,7 @@ const NORMAL_95_TWO_SIDED_Z: f64 = 1.959_963_984_540_054;
 fn gaussian_identity_likelihood() -> LikelihoodSpec {
     LikelihoodSpec::new(
         ResponseFamily::Gaussian,
-        InverseLink::Standard(LinkFunction::Identity),
+        InverseLink::Standard(StandardLink::Identity),
     )
 }
 
