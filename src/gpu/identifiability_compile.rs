@@ -204,7 +204,7 @@ mod cuda_impl {
     /// row-scale scratch buffer. Built once per identifiability compile;
     /// each `compute_grams` call only re-uploads the per-row packed
     /// Hessian columns it actually needs.
-    pub(super) struct WorkspaceInner {
+    pub(crate) struct WorkspaceInner {
         stream: Arc<CudaStream>,
         blas: CudaBlas,
         /// `uploads[block][channel]` — column-major device copy of each
