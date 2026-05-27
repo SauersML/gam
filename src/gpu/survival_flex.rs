@@ -4272,4 +4272,215 @@ mod survival_flex_gpu_tests {
             other => panic!("expected validation error, got {other:?}"),
         }
     }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Step 4 Layer C-α — `try_device_layer_c_jet` algebraic identity tests.
+    // ────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn step4c_tri_index_layout_invariant() {
+        // Verify `tri_index` matches the canonical "u·(2p-u-1)/2 + v"
+        // upper-triangle row-major pack for every (u,v) with u ≤ v ≤ p-1.
+        // Counter-check: tri_index(0,0) = 0, tri_index(p-1, p-1) = p(p+1)/2 - 1.
+        for p in 1usize..=6 {
+            let mut seen = std::collections::HashSet::new();
+            for u in 0..p {
+                for v in u..p {
+                    let idx = tri_index(u, v, p);
+                    assert!(
+                        idx < p * (p + 1) / 2,
+                        "tri_index({u},{v},{p})={idx} out of bounds"
+                    );
+                    assert!(seen.insert(idx), "duplicate tri_index({u},{v},{p})={idx}");
+                }
+            }
+            assert_eq!(seen.len(), p * (p + 1) / 2);
+        }
+    }
+
+    #[test]
+    fn step4c_layer_c_zero_coeffs_collapses_to_observed_jet() {
+        // With all coeff_u = coeff_au = coeff_bu = 0 and q_index = MAX
+        // (disabled), the per-cell f_aa contribution is the only
+        // moment-driven quantity that survives.  We still get f_u = 0,
+        // f_au = 0, f_uv = 0, so a_u = 0, a_uv = 0, and the observed-jet
+        // closed forms collapse to:
+        //   eta_u[u]   == rho[u]
+        //   chi_u[u]   == tau[u]
+        //   eta_uv[u,v] == r_uv_upper_packed[(u,v)]
+        //   chi_uv[u,v] == chi_uv_fixed_upper_packed[(u,v)]
+        // (and d_u = the same integrand as Layer B with a_u = 0, which
+        //  is integrand = -coeff_u[u] = 0 → 0.)
+        let cell = step4b_fixture_cell();
+        let p = 2usize;
+        let zero4 = [0.0_f64; 4];
+        let cc = SurvivalFlexLayerCCellCoeffs {
+            coeff_u: vec![zero4; p],
+            coeff_au: vec![zero4; p],
+            coeff_bu: vec![zero4; p],
+        };
+        let rho = vec![0.11_f64, 0.23];
+        let tau = vec![-0.04_f64, 0.07];
+        let tau_a = vec![0.03_f64, -0.02];
+        let r_uv = vec![0.31_f64, -0.17, 0.22]; // (0,0), (0,1), (1,1)
+        let chi_uv_fixed = vec![0.08_f64, 0.04, -0.05];
+
+        let row = SurvivalFlexLayerCRowInputs {
+            partition_cells: std::slice::from_ref(&cell),
+            cell_coeffs: std::slice::from_ref(&cc),
+            d_check: 0.83,
+            q_index: usize::MAX,
+            g_index: usize::MAX,
+            phi_q: 0.0,
+            q: 0.0,
+            chi: 0.65,
+            eta_aa: -0.12,
+            eta_aaa: 0.07,
+            rho: &rho,
+            tau: &tau,
+            tau_a: &tau_a,
+            r_uv_upper_packed: &r_uv,
+            chi_uv_fixed_upper_packed: &chi_uv_fixed,
+            probit_scale: 1.0,
+            a: 0.07,
+            slope: 0.55,
+        };
+        let out = match try_device_layer_c_jet(std::slice::from_ref(&row)) {
+            Ok(Some(o)) => o,
+            Ok(None) => {
+                eprintln!("[step4c zero] substrate non-OK or empty; skipping");
+                return;
+            }
+            Err(err) => panic!("layer_c zero-coeffs test failed: {err:?}"),
+        };
+        assert_eq!(out.len(), 1);
+        let r = &out[0];
+        // a_u = 0 (no perturbation since q_index disabled and coeff_u = 0).
+        for u in 0..p {
+            assert!(
+                r.a_u[u].abs() <= 5e-15,
+                "a_u[{u}] should be 0, got {}",
+                r.a_u[u]
+            );
+        }
+        // eta_u[u] = chi * 0 + rho[u] = rho[u].
+        // chi_u[u] = eta_aa * 0 + tau[u] = tau[u].
+        for u in 0..p {
+            assert!((r.eta_u[u] - rho[u]).abs() <= 5e-15);
+            assert!((r.chi_u[u] - tau[u]).abs() <= 5e-15);
+        }
+        // a_uv: f_uv = 0 (zero coeffs) and a_u = 0, so a_uv = 0 / D = 0.
+        for u in 0..p {
+            for v in 0..p {
+                assert!(
+                    r.a_uv[u * p + v].abs() <= 5e-15,
+                    "a_uv[{u},{v}] should be 0, got {}",
+                    r.a_uv[u * p + v]
+                );
+            }
+        }
+        // eta_uv: every cross term vanishes (a_uv = 0, a_u = 0), only
+        // r_uv survives.
+        for u in 0..p {
+            for v in u..p {
+                let packed = tri_index(u, v, p);
+                let expected = r_uv[packed];
+                assert!((r.eta_uv[u * p + v] - expected).abs() <= 5e-15);
+                assert!((r.eta_uv[v * p + u] - expected).abs() <= 5e-15);
+            }
+        }
+        // chi_uv: only chi_uv_fixed survives.
+        for u in 0..p {
+            for v in u..p {
+                let packed = tri_index(u, v, p);
+                let expected = chi_uv_fixed[packed];
+                assert!((r.chi_uv[u * p + v] - expected).abs() <= 5e-15);
+                assert!((r.chi_uv[v * p + u] - expected).abs() <= 5e-15);
+            }
+        }
+    }
+
+    #[test]
+    fn step4c_layer_c_outputs_symmetric() {
+        // Non-trivial coeffs, q_index enabled — assert a_uv, eta_uv,
+        // chi_uv are symmetric under (u ↔ v).
+        let cell = step4b_fixture_cell();
+        let p = 3usize;
+        let cc = SurvivalFlexLayerCCellCoeffs {
+            coeff_u: vec![
+                [0.12, 0.05, -0.03, 0.01],
+                [0.07, -0.04, 0.02, 0.0],
+                [-0.06, 0.03, 0.01, -0.005],
+            ],
+            coeff_au: vec![
+                [0.02, 0.01, 0.0, 0.0],
+                [0.015, -0.005, 0.0, 0.0],
+                [-0.01, 0.008, 0.0, 0.0],
+            ],
+            coeff_bu: vec![
+                [0.0; 4],
+                [0.03, 0.01, 0.0, 0.0],
+                [0.0; 4],
+            ],
+        };
+        let rho = vec![0.11_f64, 0.23, -0.05];
+        let tau = vec![-0.04_f64, 0.07, 0.02];
+        let tau_a = vec![0.03_f64, -0.02, 0.01];
+        // p=3 → 6 packed entries.
+        let r_uv = vec![0.31_f64, -0.17, 0.05, 0.22, 0.03, -0.08];
+        let chi_uv_fixed = vec![0.08_f64, 0.04, -0.02, -0.05, 0.06, 0.01];
+
+        let row = SurvivalFlexLayerCRowInputs {
+            partition_cells: std::slice::from_ref(&cell),
+            cell_coeffs: std::slice::from_ref(&cc),
+            d_check: 0.83,
+            q_index: 0,
+            g_index: 1,
+            phi_q: 0.42,
+            q: 0.4,
+            chi: 0.65,
+            eta_aa: -0.12,
+            eta_aaa: 0.07,
+            rho: &rho,
+            tau: &tau,
+            tau_a: &tau_a,
+            r_uv_upper_packed: &r_uv,
+            chi_uv_fixed_upper_packed: &chi_uv_fixed,
+            probit_scale: 1.0,
+            a: 0.07,
+            slope: 0.55,
+        };
+        let out = match try_device_layer_c_jet(std::slice::from_ref(&row)) {
+            Ok(Some(o)) => o,
+            Ok(None) => {
+                eprintln!("[step4c sym] substrate non-OK or empty; skipping");
+                return;
+            }
+            Err(err) => panic!("layer_c symmetry test failed: {err:?}"),
+        };
+        assert_eq!(out.len(), 1);
+        let r = &out[0];
+        for u in 0..p {
+            for v in (u + 1)..p {
+                let uv = r.a_uv[u * p + v];
+                let vu = r.a_uv[v * p + u];
+                assert!(
+                    (uv - vu).abs() <= 1e-12 * (1.0 + uv.abs().max(vu.abs())),
+                    "a_uv symmetry: ({u},{v})={uv} vs ({v},{u})={vu}"
+                );
+                let euv = r.eta_uv[u * p + v];
+                let evu = r.eta_uv[v * p + u];
+                assert!(
+                    (euv - evu).abs() <= 1e-12 * (1.0 + euv.abs().max(evu.abs())),
+                    "eta_uv symmetry: ({u},{v})={euv} vs ({v},{u})={evu}"
+                );
+                let cuv = r.chi_uv[u * p + v];
+                let cvu = r.chi_uv[v * p + u];
+                assert!(
+                    (cuv - cvu).abs() <= 1e-12 * (1.0 + cuv.abs().max(cvu.abs())),
+                    "chi_uv symmetry: ({u},{v})={cuv} vs ({v},{u})={cvu}"
+                );
+            }
+        }
+    }
 }
