@@ -833,13 +833,11 @@ pub fn build_primary_grams_gpu_or_cpu(
             .map(|slots| slots.iter().cloned().collect())
             .collect();
         if let Some(h_packed) = pack_row_hessian_symmetric(row_hess) {
-            if let Some(bundle) =
-                crate::gpu::identifiability_compile::try_primary_state_gram_cuda(
-                    &gpu_blocks,
-                    &h_packed,
-                    raw_block_ranges,
-                )
-            {
+            if let Some(bundle) = crate::gpu::identifiability_compile::try_primary_state_gram_cuda(
+                &gpu_blocks,
+                &h_packed,
+                raw_block_ranges,
+            ) {
                 log::info!("[identifiability_compile] gram path = gpu");
                 return Ok((bundle.gram_h, bundle.gram_struct));
             }
@@ -2127,7 +2125,9 @@ mod tests {
     #[test]
     fn compile_from_raw_grams_three_block_ordering_matters() {
         let n = 30;
-        let a = Array2::from_shape_fn((n, 2), |(i, j)| ((i + 1) as f64 * (j + 2) as f64 * 0.2).sin());
+        let a = Array2::from_shape_fn((n, 2), |(i, j)| {
+            ((i + 1) as f64 * (j + 2) as f64 * 0.2).sin()
+        });
         // B has 2 cols: col 0 independent, col 1 = a[:, 0]
         let mut b = Array2::<f64>::zeros((n, 2));
         for i in 0..n {
@@ -2169,7 +2169,11 @@ mod tests {
             &gh,
             &gs,
             &rr,
-            &[BlockOrder::Marginal, BlockOrder::Logslope, BlockOrder::LinkDev],
+            &[
+                BlockOrder::Marginal,
+                BlockOrder::Logslope,
+                BlockOrder::LinkDev,
+            ],
         )
         .expect("ABC compile");
         assert_eq!(order_abc.compiled_block_ranges[0].len(), 2);
@@ -2183,7 +2187,11 @@ mod tests {
             &gh2,
             &gs2,
             &rr2,
-            &[BlockOrder::Marginal, BlockOrder::Logslope, BlockOrder::LinkDev],
+            &[
+                BlockOrder::Marginal,
+                BlockOrder::Logslope,
+                BlockOrder::LinkDev,
+            ],
         )
         .expect("BAC compile");
         assert_eq!(order_bac.compiled_block_ranges[0].len(), 2);

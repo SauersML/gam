@@ -34,11 +34,15 @@ impl StreamingMaternBasisGradientEvaluator {
         chunk_size: Option<usize>,
     ) -> Result<Self, BasisError> {
         if centers.ncols() == 0 {
-            crate::bail_invalid_basis!("StreamingMaternBasisGradientEvaluator requires centers with at least one column"
-                    .to_string(),);
+            crate::bail_invalid_basis!(
+                "StreamingMaternBasisGradientEvaluator requires centers with at least one column"
+                    .to_string(),
+            );
         }
         if centers.iter().any(|v| !v.is_finite()) {
-            crate::bail_invalid_basis!("StreamingMaternBasisGradientEvaluator centers must be finite");
+            crate::bail_invalid_basis!(
+                "StreamingMaternBasisGradientEvaluator centers must be finite"
+            );
         }
         if !(length_scale.is_finite() && length_scale > 0.0) {
             crate::bail_invalid_basis!(

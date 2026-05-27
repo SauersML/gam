@@ -65,8 +65,8 @@ use crate::terms::{
     TotalVariationPenalty,
 };
 use crate::types::{
-    InverseLink, LatentCLogLogState, LikelihoodSpec, LinkFunction, StandardLink, MixtureLinkSpec, ResponseFamily,
-    SasLinkSpec, WigglePenaltyConfig,
+    InverseLink, LatentCLogLogState, LikelihoodSpec, LinkFunction, MixtureLinkSpec, ResponseFamily,
+    SasLinkSpec, StandardLink, WigglePenaltyConfig,
 };
 
 use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, Axis, s};
@@ -1477,30 +1477,21 @@ fn cause_specific_survival_rho_prior(
     Ok(crate::types::RhoPrior::Independent(priors))
 }
 
-fn hash_workflow_array_view(
-    hasher: &mut crate::cache::Fingerprinter,
-    array: ArrayView1<'_, f64>,
-) {
+fn hash_workflow_array_view(hasher: &mut crate::cache::Fingerprinter, array: ArrayView1<'_, f64>) {
     hasher.write_usize(array.len());
     for &value in array {
         hasher.write_f64(value);
     }
 }
 
-fn hash_workflow_u8_array(
-    hasher: &mut crate::cache::Fingerprinter,
-    array: ArrayView1<'_, u8>,
-) {
+fn hash_workflow_u8_array(hasher: &mut crate::cache::Fingerprinter, array: ArrayView1<'_, u8>) {
     hasher.write_usize(array.len());
     for &value in array {
         hasher.write_usize(usize::from(value));
     }
 }
 
-fn hash_workflow_array2(
-    hasher: &mut crate::cache::Fingerprinter,
-    array: ArrayView2<'_, f64>,
-) {
+fn hash_workflow_array2(hasher: &mut crate::cache::Fingerprinter, array: ArrayView2<'_, f64>) {
     hasher.write_usize(array.nrows());
     hasher.write_usize(array.ncols());
     for row in array.rows() {

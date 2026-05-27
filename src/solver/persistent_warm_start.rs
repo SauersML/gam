@@ -216,13 +216,7 @@ fn store_json_record<T: Serialize>(key: &str, record: &T) -> Result<(), String> 
     let mut fp = Fingerprinter::new();
     fp.absorb_str(b"warm-start-key", key);
     store
-        .save(
-            &fp.finalize(),
-            &bytes,
-            None,
-            None,
-            EntryKind::Checkpoint,
-        )
+        .save(&fp.finalize(), &bytes, None, None, EntryKind::Checkpoint)
         .map(|_| ())
         .map_err(|e| format!("failed to persist warm-start cache record: {e}"))
 }

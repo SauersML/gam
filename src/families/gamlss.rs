@@ -47,7 +47,7 @@ use crate::smooth::{
     spatial_length_scale_term_indices,
 };
 use crate::solver::estimate::validate_all_finite_estimation;
-use crate::types::{InverseLink, StandardLink, RidgePolicy};
+use crate::types::{InverseLink, RidgePolicy, StandardLink};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut2, Axis, s};
 use rayon::prelude::*;
 use std::borrow::Cow;
@@ -3896,7 +3896,9 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
             .map_err(EstimationError::InvalidInput)?;
         if !eval.inner_converged {
             state.warm_cache = Some(eval.warm_start);
-            crate::bail_invalid_estim!("binomial mean-wiggle exact spatial inner solve did not converge");
+            crate::bail_invalid_estim!(
+                "binomial mean-wiggle exact spatial inner solve did not converge"
+            );
         }
         let hessian_result = eval.outer_hessian.clone();
         state.last_eval = Some((
@@ -3931,8 +3933,10 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                 .map_err(EstimationError::InvalidInput)?;
             if !eval.inner_converged {
                 state.warm_cache = Some(eval.warm_start);
-                crate::bail_invalid_estim!("binomial mean-wiggle exact spatial cost inner solve did not converge"
-                        .to_string(),);
+                crate::bail_invalid_estim!(
+                    "binomial mean-wiggle exact spatial cost inner solve did not converge"
+                        .to_string(),
+                );
             }
             state.warm_cache = Some(eval.warm_start);
             Ok(eval.objective)
@@ -3960,8 +3964,10 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                 .map_err(EstimationError::InvalidInput)?;
             if !eval.inner_converged {
                 state.warm_cache = Some(eval.warm_start);
-                crate::bail_invalid_estim!("binomial mean-wiggle exact spatial EFS inner solve did not converge"
-                        .to_string(),);
+                crate::bail_invalid_estim!(
+                    "binomial mean-wiggle exact spatial EFS inner solve did not converge"
+                        .to_string(),
+                );
             }
             state.warm_cache = Some(eval.warm_start);
             Ok(eval.efs_eval)

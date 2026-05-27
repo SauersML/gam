@@ -1259,10 +1259,9 @@ extern "C" __global__ void linf_norm(
             let mut alpha = 0.0_f64;
             let mut accepted_dev = prev_deviance;
             let mut halving_count: usize = 0;
-            for (ladder_idx, &a) in
-                [1.0_f64, 0.5, 0.25, 0.125, 0.0625, 0.03125, 0.015625]
-                    .iter()
-                    .enumerate()
+            for (ladder_idx, &a) in [1.0_f64, 0.5, 0.25, 0.125, 0.0625, 0.03125, 0.015625]
+                .iter()
+                .enumerate()
             {
                 ws.stream
                     .memcpy_dtod(&loop_ws.eta_dev, &mut loop_ws.eta_cand_dev)
@@ -1468,9 +1467,7 @@ extern "C" __global__ void linf_norm(
             crate::types::RidgePolicy::explicit_stabilization_full(),
         );
 
-        let max_abs_eta = final_eta
-            .iter()
-            .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+        let max_abs_eta = final_eta.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
 
         match extra {
             Some(ext) => {
@@ -1529,9 +1526,11 @@ extern "C" __global__ void linf_norm(
                             *gi += lm_ridge * bi;
                         }
                     }
-                    Some(crate::solver::active_set::compute_constraint_kkt_diagnostics(
-                        &beta, &grad, lin,
-                    ))
+                    Some(
+                        crate::solver::active_set::compute_constraint_kkt_diagnostics(
+                            &beta, &grad, lin,
+                        ),
+                    )
                 });
 
                 let ridge_passport = ext.ridge_passport.unwrap_or(default_ridge);

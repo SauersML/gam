@@ -1,11 +1,11 @@
-use crate::solver::pirls::PIRLS_CACHE_BYTE_BUDGET;
 use self::inner_strategy::GeometryBackendKind;
 use super::*;
 use crate::linalg::sparse_exact::{
     SparseExactFactor, SparsePenaltyBlock, assemble_and_factor_sparse_penalized_system,
 };
 use crate::solver::outer_strategy::OuterEval;
-use crate::types::{StandardLink, SasLinkState};
+use crate::solver::pirls::PIRLS_CACHE_BYTE_BUDGET;
+use crate::types::{SasLinkState, StandardLink};
 use ndarray::{Array2, s};
 use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
@@ -332,8 +332,8 @@ mod tests {
     use crate::pirls::PirlsCoordinateFrame;
     use crate::solver::outer_strategy::{HessianResult, OuterEval};
     use crate::terms::basis::{ImplicitDesignPsiDerivative, RadialScalarKind};
-    use crate::types::{StandardLink, 
-        GlmLikelihoodSpec, InverseLink, LikelihoodSpec, ResponseFamily,
+    use crate::types::{
+        GlmLikelihoodSpec, InverseLink, LikelihoodSpec, ResponseFamily, StandardLink,
     };
     use faer::Side;
     use ndarray::{Array1, Array2, array, s};
@@ -2608,10 +2608,7 @@ trait DerivativeStorageBackend {
         usize,
     )>;
     fn implicit_axis_count_hint(&self) -> Option<usize>;
-    fn design_forward_mul_original(
-        &self,
-        u: &Array1<f64>,
-    ) -> Result<Array1<f64>, EstimationError>;
+    fn design_forward_mul_original(&self, u: &Array1<f64>) -> Result<Array1<f64>, EstimationError>;
     fn design_transpose_mul_original(
         &self,
         v: &Array1<f64>,
@@ -2853,24 +2850,37 @@ impl DerivativeStorageBackend for Array2<f64> {
     fn resident_byte_count(&self) -> usize {
         self.len().saturating_mul(std::mem::size_of::<f64>())
     }
-    fn design_nrows(&self) -> usize { Array2::nrows(self) }
-    fn design_ncols(&self) -> usize { Array2::ncols(self) }
-    fn penalty_dim(&self) -> usize { Array2::nrows(self) }
-    fn uses_implicit_storage(&self) -> bool { false }
-    fn any_nonzero(&self) -> bool { self.iter().any(|v| *v != 0.0) }
-    fn materialize(&self) -> Array2<f64> { self.clone() }
+    fn design_nrows(&self) -> usize {
+        Array2::nrows(self)
+    }
+    fn design_ncols(&self) -> usize {
+        Array2::ncols(self)
+    }
+    fn penalty_dim(&self) -> usize {
+        Array2::nrows(self)
+    }
+    fn uses_implicit_storage(&self) -> bool {
+        false
+    }
+    fn any_nonzero(&self) -> bool {
+        self.iter().any(|v| *v != 0.0)
+    }
+    fn materialize(&self) -> Array2<f64> {
+        self.clone()
+    }
     fn implicit_first_axis_info(
         &self,
     ) -> Option<(
         std::sync::Arc<crate::terms::basis::ImplicitDesignPsiDerivative>,
         usize,
-    )> { None }
-    fn implicit_axis_count_hint(&self) -> Option<usize> { None }
+    )> {
+        None
+    }
+    fn implicit_axis_count_hint(&self) -> Option<usize> {
+        None
+    }
 
-    fn design_forward_mul_original(
-        &self,
-        u: &Array1<f64>,
-    ) -> Result<Array1<f64>, EstimationError> {
+    fn design_forward_mul_original(&self, u: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
         if Array2::ncols(self) != u.len() {
             crate::bail_invalid_estim!(
                 "dense hyper design derivative forward_mul_original width mismatch: matrix={}x{}, vector={}",
@@ -2943,11 +2953,21 @@ impl DerivativeStorageBackend for EmbeddedDerivativeMatrix {
     fn resident_byte_count(&self) -> usize {
         self.local.len().saturating_mul(std::mem::size_of::<f64>())
     }
-    fn design_nrows(&self) -> usize { self.local.nrows() }
-    fn design_ncols(&self) -> usize { self.total_dim }
-    fn penalty_dim(&self) -> usize { self.total_dim }
-    fn uses_implicit_storage(&self) -> bool { false }
-    fn any_nonzero(&self) -> bool { self.local.iter().any(|v| *v != 0.0) }
+    fn design_nrows(&self) -> usize {
+        self.local.nrows()
+    }
+    fn design_ncols(&self) -> usize {
+        self.total_dim
+    }
+    fn penalty_dim(&self) -> usize {
+        self.total_dim
+    }
+    fn uses_implicit_storage(&self) -> bool {
+        false
+    }
+    fn any_nonzero(&self) -> bool {
+        self.local.iter().any(|v| *v != 0.0)
+    }
     fn materialize(&self) -> Array2<f64> {
         let mut dense = Array2::<f64>::zeros((self.local.nrows(), self.total_dim));
         dense
@@ -2960,13 +2980,14 @@ impl DerivativeStorageBackend for EmbeddedDerivativeMatrix {
     ) -> Option<(
         std::sync::Arc<crate::terms::basis::ImplicitDesignPsiDerivative>,
         usize,
-    )> { None }
-    fn implicit_axis_count_hint(&self) -> Option<usize> { None }
+    )> {
+        None
+    }
+    fn implicit_axis_count_hint(&self) -> Option<usize> {
+        None
+    }
 
-    fn design_forward_mul_original(
-        &self,
-        u: &Array1<f64>,
-    ) -> Result<Array1<f64>, EstimationError> {
+    fn design_forward_mul_original(&self, u: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
         if self.total_dim != u.len() {
             crate::bail_invalid_estim!(
                 "embedded hyper design derivative forward_mul_original width mismatch: total_dim={}, vector={}",
@@ -3057,13 +3078,27 @@ impl DerivativeStorageBackend for EmbeddedDerivativeMatrix {
 }
 
 impl DerivativeStorageBackend for ImplicitDerivativeOp {
-    fn resident_byte_count(&self) -> usize { 0 }
-    fn design_nrows(&self) -> usize { self.nrows() }
-    fn design_ncols(&self) -> usize { self.ncols() }
-    fn penalty_dim(&self) -> usize { self.nrows() }
-    fn uses_implicit_storage(&self) -> bool { true }
-    fn any_nonzero(&self) -> bool { true }
-    fn materialize(&self) -> Array2<f64> { self.materialize_dense().clone() }
+    fn resident_byte_count(&self) -> usize {
+        0
+    }
+    fn design_nrows(&self) -> usize {
+        self.nrows()
+    }
+    fn design_ncols(&self) -> usize {
+        self.ncols()
+    }
+    fn penalty_dim(&self) -> usize {
+        self.nrows()
+    }
+    fn uses_implicit_storage(&self) -> bool {
+        true
+    }
+    fn any_nonzero(&self) -> bool {
+        true
+    }
+    fn materialize(&self) -> Array2<f64> {
+        self.materialize_dense().clone()
+    }
     fn implicit_first_axis_info(
         &self,
     ) -> Option<(
@@ -3075,12 +3110,11 @@ impl DerivativeStorageBackend for ImplicitDerivativeOp {
             _ => None,
         }
     }
-    fn implicit_axis_count_hint(&self) -> Option<usize> { Some(self.operator.n_axes()) }
+    fn implicit_axis_count_hint(&self) -> Option<usize> {
+        Some(self.operator.n_axes())
+    }
 
-    fn design_forward_mul_original(
-        &self,
-        u: &Array1<f64>,
-    ) -> Result<Array1<f64>, EstimationError> {
+    fn design_forward_mul_original(&self, u: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
         if self.ncols() != u.len() {
             crate::bail_invalid_estim!(
                 "implicit hyper design derivative forward_mul_original width mismatch: operator_cols={}, vector={}",
@@ -3123,7 +3157,11 @@ impl DerivativeStorageBackend for ImplicitDerivativeOp {
         free_basis_opt: Option<&Array2<f64>>,
         u: &Array1<f64>,
     ) -> Result<Array1<f64>, EstimationError> {
-        let mut right = if let Some(z) = free_basis_opt { z.dot(u) } else { u.clone() };
+        let mut right = if let Some(z) = free_basis_opt {
+            z.dot(u)
+        } else {
+            u.clone()
+        };
         right = qs.dot(&right);
         Ok(self.forward_mul(&right))
     }
@@ -3175,25 +3213,40 @@ impl DerivativeStorageBackend for ImplicitDerivativeOp {
 }
 
 impl DerivativeStorageBackend for LatentCoordDerivativeOp {
-    fn resident_byte_count(&self) -> usize { 0 }
-    fn design_nrows(&self) -> usize { self.nrows() }
-    fn design_ncols(&self) -> usize { self.ncols() }
-    fn penalty_dim(&self) -> usize { self.nrows() }
-    fn uses_implicit_storage(&self) -> bool { true }
-    fn any_nonzero(&self) -> bool { true }
-    fn materialize(&self) -> Array2<f64> { self.materialize_dense().clone() }
+    fn resident_byte_count(&self) -> usize {
+        0
+    }
+    fn design_nrows(&self) -> usize {
+        self.nrows()
+    }
+    fn design_ncols(&self) -> usize {
+        self.ncols()
+    }
+    fn penalty_dim(&self) -> usize {
+        self.nrows()
+    }
+    fn uses_implicit_storage(&self) -> bool {
+        true
+    }
+    fn any_nonzero(&self) -> bool {
+        true
+    }
+    fn materialize(&self) -> Array2<f64> {
+        self.materialize_dense().clone()
+    }
     fn implicit_first_axis_info(
         &self,
     ) -> Option<(
         std::sync::Arc<crate::terms::basis::ImplicitDesignPsiDerivative>,
         usize,
-    )> { None }
-    fn implicit_axis_count_hint(&self) -> Option<usize> { Some(self.operator.n_axes()) }
+    )> {
+        None
+    }
+    fn implicit_axis_count_hint(&self) -> Option<usize> {
+        Some(self.operator.n_axes())
+    }
 
-    fn design_forward_mul_original(
-        &self,
-        u: &Array1<f64>,
-    ) -> Result<Array1<f64>, EstimationError> {
+    fn design_forward_mul_original(&self, u: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
         if self.ncols() != u.len() {
             crate::bail_invalid_estim!(
                 "latent-coordinate hyper design derivative forward_mul_original width mismatch: operator_cols={}, vector={}",
@@ -3236,7 +3289,11 @@ impl DerivativeStorageBackend for LatentCoordDerivativeOp {
         free_basis_opt: Option<&Array2<f64>>,
         u: &Array1<f64>,
     ) -> Result<Array1<f64>, EstimationError> {
-        let mut right = if let Some(z) = free_basis_opt { z.dot(u) } else { u.clone() };
+        let mut right = if let Some(z) = free_basis_opt {
+            z.dot(u)
+        } else {
+            u.clone()
+        };
         right = qs.dot(&right);
         Ok(self.forward_mul(&right))
     }

@@ -38,10 +38,10 @@ pub mod survival_flex_prep;
 
 pub use cpu_traits::{ExecutionTarget, MatrixLocation};
 pub use device::GpuDeviceInfo;
+pub use error::GpuError;
 pub use memory::{DeviceBuffer, DeviceCsrMatrix, DeviceMatrix, DeviceVector};
 pub use policy::{GpuDispatchPolicy, MixedPrecisionPolicy};
 pub use profile::{KernelStat, KernelStatsSnapshot};
-pub use error::GpuError;
 pub use runtime::GpuRuntime;
 
 // ---------------------------------------------------------------------------

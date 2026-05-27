@@ -1,6 +1,6 @@
 use gam::types::{
     GlmLikelihoodSpec, InverseLink, LatentCLogLogState, LikelihoodSpec, LinkComponent,
-    StandardLink, MixtureLinkState, ResponseFamily, SasLinkState,
+    MixtureLinkState, ResponseFamily, SasLinkState, StandardLink,
 };
 use ndarray::{Array1, array};
 

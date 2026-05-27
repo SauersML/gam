@@ -45,8 +45,8 @@ use crate::mixture_link::{
 use crate::pirls::LinearInequalityConstraints;
 use crate::resource::MatrixMaterializationError;
 use crate::types::{
-    InverseLink, LatentCLogLogState, LikelihoodSpec, StandardLink, MixtureLinkState,
-    ResponseFamily, SasLinkState,
+    InverseLink, LatentCLogLogState, LikelihoodSpec, MixtureLinkState, ResponseFamily,
+    SasLinkState, StandardLink,
 };
 use crate::util::quantile::quantile_from_sorted;
 use faer::sparse::{SparseColMat, Triplet};
@@ -1639,7 +1639,8 @@ fn insert_range(
     if range.end > p {
         crate::bail_dim_basis!(
             "{context} coefficient range {}..{} exceeds design width {p}",
-            range.start, range.end
+            range.start,
+            range.end
         );
     }
     cols.extend(range);
@@ -1788,16 +1789,10 @@ fn realize_coefficient_groups(
             crate::bail_invalid_basis!("coefficient group name must not be empty");
         }
         if !names.insert(group.name.clone()) {
-            crate::bail_invalid_basis!(
-                "duplicate coefficient group '{}'",
-                group.name
-            );
+            crate::bail_invalid_basis!("duplicate coefficient group '{}'", group.name);
         }
         if group.selectors.is_empty() {
-            crate::bail_invalid_basis!(
-                "coefficient group '{}' contains no selectors",
-                group.name
-            );
+            crate::bail_invalid_basis!("coefficient group '{}' contains no selectors", group.name);
         }
         if let Some(prior) = group.prior.as_ref() {
             prior.validate(&format!("coefficient group '{}'", group.name))?;
@@ -2743,9 +2738,7 @@ fn set_spatial_aniso_log_scales(
 ) -> Result<(), EstimationError> {
     let eta = center_aniso_log_scales(&eta);
     let Some(term) = spec.smooth_terms.get_mut(term_idx) else {
-        crate::bail_invalid_estim!(
-            "spatial aniso_log_scales term index {term_idx} out of range"
-        );
+        crate::bail_invalid_estim!("spatial aniso_log_scales term index {term_idx} out of range");
     };
     match &mut term.basis {
         SmoothBasisSpec::Matern { spec, .. } => {
@@ -3104,9 +3097,7 @@ fn select_columns(data: ArrayView2<'_, f64>, cols: &[usize]) -> Result<Array2<f6
     let p = data.ncols();
     for &c in cols {
         if c >= p {
-            crate::bail_dim_basis!(
-                "feature column {c} is out of bounds for data with {p} columns"
-            );
+            crate::bail_dim_basis!("feature column {c} is out of bounds for data with {p} columns");
         }
     }
     let mut out = Array2::<f64>::zeros((n, cols.len()));
@@ -3294,10 +3285,7 @@ fn standardized_spatial_term_data(
             ..
         } => (feature_cols, input_scales.as_ref()),
         _ => {
-            crate::bail_invalid_basis!(
-                "term '{}' is not a spatial smooth",
-                term.name
-            );
+            crate::bail_invalid_basis!("term '{}' is not a spatial smooth", term.name);
         }
     };
     let mut x = select_columns(data, feature_cols)?;
@@ -3935,7 +3923,9 @@ fn build_shape_constraint_grid_1d(x: ArrayView1<'_, f64>) -> Result<Array1<f64>,
         }
     }
     if x_unique.len() < 2 {
-        crate::bail_invalid_basis!("shape-constrained smooth requires at least two unique covariate values");
+        crate::bail_invalid_basis!(
+            "shape-constrained smooth requires at least two unique covariate values"
+        );
     }
 
     let min_x = x_unique[0];
@@ -3943,7 +3933,9 @@ fn build_shape_constraint_grid_1d(x: ArrayView1<'_, f64>) -> Result<Array1<f64>,
         .last()
         .expect("x_unique has at least two elements by construction");
     if (max_x - min_x).abs() <= 1e-12 {
-        crate::bail_invalid_basis!("shape-constrained smooth requires non-degenerate covariate range");
+        crate::bail_invalid_basis!(
+            "shape-constrained smooth requires non-degenerate covariate range"
+        );
     }
 
     let target_points = x_unique.len().clamp(96, 320);
@@ -4580,7 +4572,9 @@ fn build_tensor_bspline_basis(
         TensorBSplineIdentifiability::None => None,
         TensorBSplineIdentifiability::SumToZero => {
             if total_cols < 2 {
-                crate::bail_invalid_basis!("TensorBSpline requires at least 2 basis coefficients to enforce sum-to-zero identifiability");
+                crate::bail_invalid_basis!(
+                    "TensorBSpline requires at least 2 basis coefficients to enforce sum-to-zero identifiability"
+                );
             }
             let dense_design_ref = dense_design.as_ref().ok_or_else(|| {
                 BasisError::InvalidInput(
@@ -4778,7 +4772,9 @@ fn build_random_effect_block(
     if spec.feature_col >= p {
         crate::bail_dim_basis!(
             "random-effect term '{}' feature column {} out of bounds for {} columns",
-            spec.name, spec.feature_col, p
+            spec.name,
+            spec.feature_col,
+            p
         );
     }
 
@@ -4804,10 +4800,7 @@ fn build_random_effect_block(
             levels_set.insert(v.to_bits());
         }
         if levels_set.is_empty() {
-            crate::bail_invalid_basis!(
-                "random-effect term '{}' has no observed levels",
-                spec.name
-            );
+            crate::bail_invalid_basis!("random-effect term '{}' has no observed levels", spec.name);
         }
         let levels: Vec<u64> = levels_set.into_iter().collect();
         let start_idx = if spec.drop_first_level && levels.len() > 1 {
@@ -5293,10 +5286,7 @@ fn parse_f64_2d_npy_header(
     path: &PathBuf,
 ) -> Result<(usize, usize, usize), BasisError> {
     if bytes.len() < 10 || &bytes[0..6] != b"\x93NUMPY" {
-        crate::bail_invalid_basis!(
-            "lazy Pca scores '{}' is not a .npy file",
-            path.display()
-        );
+        crate::bail_invalid_basis!("lazy Pca scores '{}' is not a .npy file", path.display());
     }
     let major = bytes[6];
     let header_len = match major {
@@ -5573,7 +5563,8 @@ fn build_single_local_smooth_term(
     if term.shape != ShapeConstraint::None && !shape_supports_basis(term) {
         crate::bail_invalid_basis!(
             "ShapeConstraint::{:?} is unsupported for term '{}'",
-            term.shape, term.name
+            term.shape,
+            term.name
         );
     }
     if let SmoothBasisSpec::ByVariable {
@@ -5618,7 +5609,8 @@ fn build_single_local_smooth_term(
             if term.shape != ShapeConstraint::None {
                 crate::bail_invalid_basis!(
                     "ShapeConstraint::{:?} is unsupported for sum-to-zero factor smooth term '{}'",
-                    term.shape, term.name
+                    term.shape,
+                    term.name
                 );
             }
             let inner_term = SmoothTermSpec {
@@ -5797,7 +5789,8 @@ fn build_single_local_smooth_term(
             if term.shape != ShapeConstraint::None {
                 crate::bail_invalid_basis!(
                     "ShapeConstraint::{:?} for term '{}' is not supported on spherical splines",
-                    term.shape, term.name
+                    term.shape,
+                    term.name
                 );
             }
             let x = select_columns(data, feature_cols)?;
@@ -5934,7 +5927,8 @@ fn build_single_local_smooth_term(
             if term.shape != ShapeConstraint::None {
                 crate::bail_invalid_basis!(
                     "ShapeConstraint::{:?} for term '{}' is not supported on Pca basis",
-                    term.shape, term.name
+                    term.shape,
+                    term.name
                 );
             }
             build_pca_smooth_basis(
@@ -5952,15 +5946,19 @@ fn build_single_local_smooth_term(
             build_tensor_bspline_basis(data, feature_cols, spec)?
         }
         SmoothBasisSpec::ByVariable { .. } => {
-            crate::bail_invalid_basis!("internal: ByVariable smooths must return before inner basis dispatch");
+            crate::bail_invalid_basis!(
+                "internal: ByVariable smooths must return before inner basis dispatch"
+            );
         }
         SmoothBasisSpec::BySmooth { .. } => {
             crate::bail_invalid_basis!("internal: BySmooth smooths must be lowered to ByVariable before inner basis dispatch"
                     .to_string(),);
         }
         SmoothBasisSpec::FactorSmooth { .. } => {
-            crate::bail_invalid_basis!("internal: FactorSmooth smooths must be expanded before inner basis dispatch"
-                    .to_string(),);
+            crate::bail_invalid_basis!(
+                "internal: FactorSmooth smooths must be expanded before inner basis dispatch"
+                    .to_string(),
+            );
         }
     };
 
@@ -7196,7 +7194,9 @@ fn apply_global_smooth_identifiability(
             if rel > tol {
                 crate::bail_invalid_basis!(
                     "smooth orthogonality residual too large for term '{}': {:.3e} > {:.1e}",
-                    term.name, rel, tol
+                    term.name,
+                    rel,
+                    tol
                 );
             }
         }
@@ -7430,7 +7430,9 @@ fn build_parametric_constraint_block_for_term(
         if linear.feature_col >= p_data {
             crate::bail_dim_basis!(
                 "linear term '{}' feature column {} out of bounds for {} columns",
-                linear.name, linear.feature_col, p_data
+                linear.name,
+                linear.feature_col,
+                p_data
             );
         }
         if !parametric_cols.contains(&linear.feature_col) {
@@ -7745,7 +7747,9 @@ fn with_identifiability_transform(
             // themselves), so the caller cannot meaningfully attach a
             // post-hoc Z transform here.
             if transform.is_some() {
-                crate::bail_invalid_basis!("PCA bases do not expose a composable identifiability transform");
+                crate::bail_invalid_basis!(
+                    "PCA bases do not expose a composable identifiability transform"
+                );
             }
             Ok(BasisMetadata::Pca {
                 feature_cols: feature_cols.clone(),
@@ -10213,22 +10217,34 @@ fn evaluate_standard_familyobservations(
                 log_likelihood += w * (yi * mu_i.ln() + (1.0 - yi) * (1.0 - mu_i).ln());
             }
             (ResponseFamily::Poisson, _) => {
-                crate::bail_invalid_estim!("bounded linear terms are not supported for PoissonLog fits");
+                crate::bail_invalid_estim!(
+                    "bounded linear terms are not supported for PoissonLog fits"
+                );
             }
             (ResponseFamily::Tweedie { .. }, _) => {
-                crate::bail_invalid_estim!("bounded linear terms are not supported for Tweedie fits");
+                crate::bail_invalid_estim!(
+                    "bounded linear terms are not supported for Tweedie fits"
+                );
             }
             (ResponseFamily::NegativeBinomial { .. }, _) => {
-                crate::bail_invalid_estim!("bounded linear terms are not supported for NegativeBinomial fits");
+                crate::bail_invalid_estim!(
+                    "bounded linear terms are not supported for NegativeBinomial fits"
+                );
             }
             (ResponseFamily::Beta { .. }, _) => {
-                crate::bail_invalid_estim!("bounded linear terms are not supported for BetaLogit fits");
+                crate::bail_invalid_estim!(
+                    "bounded linear terms are not supported for BetaLogit fits"
+                );
             }
             (ResponseFamily::Gamma, _) => {
-                crate::bail_invalid_estim!("bounded linear terms are not supported for GammaLog fits");
+                crate::bail_invalid_estim!(
+                    "bounded linear terms are not supported for GammaLog fits"
+                );
             }
             (ResponseFamily::RoystonParmar, _) => {
-                crate::bail_invalid_estim!("bounded linear terms are not supported for survival model fits");
+                crate::bail_invalid_estim!(
+                    "bounded linear terms are not supported for survival model fits"
+                );
             }
         }
     }
@@ -12119,7 +12135,9 @@ fn fit_bounded_term_collection_with_design(
     let fit_penalties = conditioning
         .transform_blockwise_penalties_to_internal(&design.penalties, design.design.ncols());
     if design.linear_constraints.is_some() {
-        crate::bail_invalid_estim!("bounded() terms are not yet compatible with explicit linear constraints");
+        crate::bail_invalid_estim!(
+            "bounded() terms are not yet compatible with explicit linear constraints"
+        );
     }
     let mut bounded_terms = Vec::<BoundedLinearTermMeta>::new();
     for (j, term) in spec.linear_terms.iter().enumerate() {
@@ -13479,8 +13497,10 @@ pub(crate) fn try_build_latent_coord_hyper_dirs(
         return Ok(None);
     }
     if latent_terms.len() != 1 {
-        crate::bail_invalid_estim!("LatentCoord standard-fit hyper_dirs currently require exactly one latent smooth term"
-                .to_string(),);
+        crate::bail_invalid_estim!(
+            "LatentCoord standard-fit hyper_dirs currently require exactly one latent smooth term"
+                .to_string(),
+        );
     }
     let term_idx = latent_terms[0];
     let smooth_term = design.smooth.terms.get(term_idx.get()).ok_or_else(|| {
@@ -15803,9 +15823,7 @@ fn set_spatial_length_scale(
     length_scale: f64,
 ) -> Result<(), EstimationError> {
     let Some(term) = spec.smooth_terms.get_mut(term_idx) else {
-        crate::bail_invalid_estim!(
-            "spatial length-scale term index {term_idx} out of range"
-        );
+        crate::bail_invalid_estim!("spatial length-scale term index {term_idx} out of range");
     };
     match &mut term.basis {
         SmoothBasisSpec::ThinPlate { spec, .. } => {
@@ -15989,8 +16007,10 @@ pub fn freeze_term_collection_from_design(
                     feature_cols, spec, ..
                 } => (feature_cols.clone(), spec.identifiability.clone()),
                 _ => {
-                    crate::bail_invalid_estim!("internal: TPS-to-Duchon rewrite guard saw non-ThinPlate basis variant"
-                            .to_string(),);
+                    crate::bail_invalid_estim!(
+                        "internal: TPS-to-Duchon rewrite guard saw non-ThinPlate basis variant"
+                            .to_string(),
+                    );
                 }
             };
             term.basis = SmoothBasisSpec::Duchon {
@@ -18376,7 +18396,9 @@ fn try_exact_joint_latent_coord_optimization(
     let rho_dim = best.fit.lambdas.len();
     let latent_flat_dim = latent.values.len();
     if latent_flat_dim == 0 {
-        crate::bail_invalid_estim!("latent-coordinate optimization requires a non-empty latent block");
+        crate::bail_invalid_estim!(
+            "latent-coordinate optimization requires a non-empty latent block"
+        );
     }
     let direct_hypers =
         latent_coord_initial_direct_hypers(latent.values.id_mode(), latent.values.latent_dim())?;
@@ -18851,7 +18873,9 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
         && kappa_options.min_length_scale > 0.0
         && kappa_options.max_length_scale >= kappa_options.min_length_scale)
     {
-        crate::bail_invalid_estim!("spatial kappa optimization requires valid positive length_scale bounds");
+        crate::bail_invalid_estim!(
+            "spatial kappa optimization requires valid positive length_scale bounds"
+        );
     }
 
     let pilot_threshold = kappa_options.pilot_subsample_threshold;
@@ -22000,11 +22024,8 @@ mod tests {
         }
         theta.slice_mut(s![rho_dim..]).assign(log_kappa0.as_array());
 
-        let external_opts = external_opts_for_design(
-            &LikelihoodSpec::gaussian_identity(),
-            &design,
-            &fit_opts,
-        );
+        let external_opts =
+            external_opts_for_design(&LikelihoodSpec::gaussian_identity(), &design, &fit_opts);
         let mut cache = SingleBlockExactJointDesignCache::new(
             data.view(),
             frozen,
@@ -22103,7 +22124,6 @@ mod tests {
             violations.join("\n  ")
         );
     }
-
 
     /// Shared driver for iso-κ joint REML gradient FD variants. Returns the
     /// worst psi rel_err across the four theta probes (zero / psi_only / base /
@@ -23996,11 +24016,8 @@ mod tests {
         let mut theta1 = theta0.clone();
         theta1[rho_dim] += 0.3;
 
-        let external_opts = external_opts_for_design(
-            &LikelihoodSpec::gaussian_identity(),
-            &design,
-            &fit_opts,
-        );
+        let external_opts =
+            external_opts_for_design(&LikelihoodSpec::gaussian_identity(), &design, &fit_opts);
         let mut cache = SingleBlockExactJointDesignCache::new(
             data.view(),
             frozen,

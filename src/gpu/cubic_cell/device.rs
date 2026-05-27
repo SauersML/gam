@@ -20,8 +20,6 @@
 //! substrate.
 
 #[cfg(target_os = "linux")]
-use crate::gpu_err;
-#[cfg(target_os = "linux")]
 use crate::gpu::cubic_cell::host_substrate::HostMomentBatch;
 #[cfg(target_os = "linux")]
 use crate::gpu::cubic_cell::{
@@ -30,6 +28,10 @@ use crate::gpu::cubic_cell::{
 };
 #[cfg(target_os = "linux")]
 use crate::gpu::error::GpuError;
+#[cfg(target_os = "linux")]
+use crate::gpu::error::GpuResultExt;
+#[cfg(target_os = "linux")]
+use crate::gpu_err;
 
 #[cfg(target_os = "linux")]
 use std::sync::{Arc, Mutex, OnceLock};
@@ -115,10 +117,12 @@ impl CubicCellGpuBackend {
             }
         })?;
         let ctx = crate::gpu::runtime::cuda_context_for(runtime.selected_device().ordinal)
-            .ok_or_else(|| gpu_err!(
+            .ok_or_else(|| {
+                gpu_err!(
                     "cubic_cell backend: failed to create CUDA context for device {}",
                     runtime.selected_device().ordinal
-                ))?;
+                )
+            })?;
         let stream = ctx.default_stream();
         Ok(CubicCellGpuBackend {
             inner: CubicCellGpuContextLinux {
@@ -146,13 +150,12 @@ impl CubicCellGpuBackend {
         }
         let source =
             crate::gpu::cubic_cell::kernel_src::build_cubic_deriv_moments_kernel_source(max_degree);
-        let ptx =
-            cudarc::nvrtc::compile_ptx(&source).gpu_ctx_with(|err| format!("cubic_cell NVRTC compile (degree={max_degree}) failed: {err}"))?;
-        let module = self
-            .inner
-            .ctx
-            .load_module(ptx)
-            .gpu_ctx_with(|err| format!("cubic_cell module load (degree={max_degree}) failed: {err}"))?;
+        let ptx = cudarc::nvrtc::compile_ptx(&source).gpu_ctx_with(|err| {
+            format!("cubic_cell NVRTC compile (degree={max_degree}) failed: {err}")
+        })?;
+        let module = self.inner.ctx.load_module(ptx).gpu_ctx_with(|err| {
+            format!("cubic_cell module load (degree={max_degree}) failed: {err}")
+        })?;
         let mut guard = self
             .inner
             .modules
@@ -322,10 +325,9 @@ impl CubicCellGpuBackend {
         let max_degree = view.max_degree;
         let module = self.module_for_degree(max_degree)?;
         let kernel_name = format!("cubic_deriv_moments_d{max_degree}");
-        let func =
-            module
-                .load_function(&kernel_name)
-                .gpu_ctx_with(|err| format!("cubic_cell load_function {kernel_name}: {err}"))?;
+        let func = module
+            .load_function(&kernel_name)
+            .gpu_ctx_with(|err| format!("cubic_cell load_function {kernel_name}: {err}"))?;
 
         let stream = &self.inner.stream;
         let d_left = stream
@@ -346,23 +348,21 @@ impl CubicCellGpuBackend {
         let d_c3 = stream
             .clone_htod(&c3)
             .gpu_ctx("cubic_cell memcpy_stod c3")?;
-        let d_branch =
-            stream
-                .clone_htod(&branch_code)
-                .gpu_ctx("cubic_cell memcpy_stod branch_code")?;
-        let mut d_moments =
-            stream
-                .alloc_zeros::<f64>(m * stride)
-                .gpu_ctx("cubic_cell alloc_zeros moments")?;
-        let mut d_status =
-            stream
-                .alloc_zeros::<u8>(m)
-                .gpu_ctx("cubic_cell alloc_zeros status")?;
+        let d_branch = stream
+            .clone_htod(&branch_code)
+            .gpu_ctx("cubic_cell memcpy_stod branch_code")?;
+        let mut d_moments = stream
+            .alloc_zeros::<f64>(m * stride)
+            .gpu_ctx("cubic_cell alloc_zeros moments")?;
+        let mut d_status = stream
+            .alloc_zeros::<u8>(m)
+            .gpu_ctx("cubic_cell alloc_zeros status")?;
 
         // One warp per cell.  Block = 4 warps (128 threads).
         let warps_per_block: u32 = 4;
         let block: u32 = 32 * warps_per_block;
-        let m_u32: u32 = u32::try_from(m).map_err(|_| gpu_err!("cubic_cell n_cells={m} overflows u32"))?;
+        let m_u32: u32 =
+            u32::try_from(m).map_err(|_| gpu_err!("cubic_cell n_cells={m} overflows u32"))?;
         let grid: u32 = m_u32.div_ceil(warps_per_block).max(1);
         let cfg = LaunchConfig {
             grid_dim: (grid, 1, 1),
@@ -388,17 +388,13 @@ impl CubicCellGpuBackend {
         // warps; out-of-range warps early-return.
         unsafe { builder.launch(cfg) }.gpu_ctx("cubic_cell kernel launch")?;
 
-        let host_moments =
-            stream
-                .clone_dtoh(&d_moments)
-                .gpu_ctx("cubic_cell memcpy_dtov moments")?;
-        let host_status =
-            stream
-                .clone_dtoh(&d_status)
-                .gpu_ctx("cubic_cell memcpy_dtov status")?;
-        stream
-            .synchronize()
-            .gpu_ctx("cubic_cell synchronize")?;
+        let host_moments = stream
+            .clone_dtoh(&d_moments)
+            .gpu_ctx("cubic_cell memcpy_dtov moments")?;
+        let host_status = stream
+            .clone_dtoh(&d_status)
+            .gpu_ctx("cubic_cell memcpy_dtov status")?;
+        stream.synchronize().gpu_ctx("cubic_cell synchronize")?;
 
         // Scatter the GPU bucket back into the output buffer at original
         // indices.
@@ -497,10 +493,9 @@ impl CubicCellGpuBackend {
         let max_degree = view.max_degree;
         let module = self.module_for_degree(max_degree)?;
         let kernel_name = format!("cubic_deriv_moments_d{max_degree}");
-        let func =
-            module
-                .load_function(&kernel_name)
-                .gpu_ctx_with(|err| format!("cubic_cell load_function {kernel_name}: {err}"))?;
+        let func = module
+            .load_function(&kernel_name)
+            .gpu_ctx_with(|err| format!("cubic_cell load_function {kernel_name}: {err}"))?;
 
         let stream = &self.inner.stream;
         let d_left = stream
@@ -521,21 +516,20 @@ impl CubicCellGpuBackend {
         let d_c3 = stream
             .clone_htod(&c3)
             .gpu_ctx("cubic_cell device-resident memcpy c3")?;
-        let d_branch =
-            stream
-                .clone_htod(&branch_code)
-                .gpu_ctx("cubic_cell device-resident memcpy branch")?;
-        let mut d_moments = stream.alloc_zeros::<f64>(n_cells * stride).map_err(|err| {
-            gpu_err!("cubic_cell device-resident alloc moments: {err}")
-        })?;
-        let mut d_status =
-            stream
-                .alloc_zeros::<u8>(n_cells)
-                .gpu_ctx("cubic_cell device-resident alloc status")?;
+        let d_branch = stream
+            .clone_htod(&branch_code)
+            .gpu_ctx("cubic_cell device-resident memcpy branch")?;
+        let mut d_moments = stream
+            .alloc_zeros::<f64>(n_cells * stride)
+            .map_err(|err| gpu_err!("cubic_cell device-resident alloc moments: {err}"))?;
+        let mut d_status = stream
+            .alloc_zeros::<u8>(n_cells)
+            .gpu_ctx("cubic_cell device-resident alloc status")?;
 
         let warps_per_block: u32 = 4;
         let block: u32 = 32 * warps_per_block;
-        let n_u32: u32 = u32::try_from(n_cells).map_err(|_| gpu_err!("cubic_cell n_cells={n_cells} overflows u32"))?;
+        let n_u32: u32 = u32::try_from(n_cells)
+            .map_err(|_| gpu_err!("cubic_cell n_cells={n_cells} overflows u32"))?;
         let grid: u32 = n_u32.div_ceil(warps_per_block).max(1);
         let cfg = LaunchConfig {
             grid_dim: (grid, 1, 1),
@@ -568,10 +562,9 @@ impl CubicCellGpuBackend {
         //        the kernel's catch-all STATUS_INVALID),
         //   (b) hand callers a ready-made `status: Vec<u8>` they can
         //       branch on without a second DtoH.
-        let kernel_status =
-            stream
-                .clone_dtoh(&d_status)
-                .gpu_ctx("cubic_cell device-resident DtoH status")?;
+        let kernel_status = stream
+            .clone_dtoh(&d_status)
+            .gpu_ctx("cubic_cell device-resident DtoH status")?;
         stream
             .synchronize()
             .gpu_ctx("cubic_cell device-resident sync after kernel")?;
@@ -604,9 +597,9 @@ mod tests {
         try_build_cubic_cell_derivative_moments,
     };
     use crate::gpu::error::GpuError;
+    use crate::gpu::error::GpuResultExt;
     use crate::gpu::runtime::GpuRuntime;
-use crate::gpu_err;
-use crate::gpu::error::GpuResultExt;
+    use crate::gpu_err;
 
     /// Test-only DtoH helper for cubic-cell device residency parity tests.
     fn download_moments(

@@ -43,6 +43,7 @@ use ndarray::{Array2, ArrayView2};
 use super::error::GpuError;
 use super::{GpuDecision, GpuKernel, decide};
 use crate::gpu::error::GpuResultExt;
+use crate::gpu_err;
 
 #[cfg(target_os = "linux")]
 use std::collections::HashMap;
@@ -181,10 +182,10 @@ impl DeviceS2KernelMatrix {
         let needed = self.ld * self.cols;
         if dst.len() != needed {
             crate::gpu_bail!(
-                    "DeviceS2KernelMatrix::copy_to_host_col_major: dst.len()={} expected {}",
-                    dst.len(),
-                    needed
-                );
+                "DeviceS2KernelMatrix::copy_to_host_col_major: dst.len()={} expected {}",
+                dst.len(),
+                needed
+            );
         }
         self.stream
             .memcpy_dtoh(&self.col_major_dev, dst)
@@ -200,10 +201,10 @@ impl DeviceS2KernelMatrix {
         let needed = self.ld * self.cols;
         if dst.len() != needed {
             crate::gpu_bail!(
-                    "DeviceS2KernelMatrix::copy_to_host_col_major: dst.len()={} expected {}",
-                    dst.len(),
-                    needed
-                );
+                "DeviceS2KernelMatrix::copy_to_host_col_major: dst.len()={} expected {}",
+                dst.len(),
+                needed
+            );
         }
         dst.copy_from_slice(&self.col_major_dev);
         Ok(())
@@ -241,24 +242,24 @@ impl<'a> S2KernelBuildInputs<'a> {
         }
         if self.data_xyz.len() != 3 * self.n {
             crate::gpu_bail!(
-                    "S2KernelBuildInputs: data_xyz.len()={} != 3*n={}",
-                    self.data_xyz.len(),
-                    3 * self.n
-                );
+                "S2KernelBuildInputs: data_xyz.len()={} != 3*n={}",
+                self.data_xyz.len(),
+                3 * self.n
+            );
         }
         if self.centers_xyz.len() != 3 * self.m {
             crate::gpu_bail!(
-                    "S2KernelBuildInputs: centers_xyz.len()={} != 3*m={}",
-                    self.centers_xyz.len(),
-                    3 * self.m
-                );
+                "S2KernelBuildInputs: centers_xyz.len()={} != 3*m={}",
+                self.centers_xyz.len(),
+                3 * self.m
+            );
         }
         if self.coeffs.len() != self.lmax + 1 {
             crate::gpu_bail!(
-                    "S2KernelBuildInputs: coeffs.len()={} != lmax+1={}",
-                    self.coeffs.len(),
-                    self.lmax + 1
-                );
+                "S2KernelBuildInputs: coeffs.len()={} != lmax+1={}",
+                self.coeffs.len(),
+                self.lmax + 1
+            );
         }
         if self.coeffs[0] != 0.0 {
             return Err(GpuError::DriverCallFailed {
@@ -511,9 +512,7 @@ impl SphereGpuBackend {
         })?;
         let ordinal = runtime.selected_device().ordinal;
         let ctx = super::runtime::cuda_context_for(ordinal).ok_or_else(|| {
-            gpu_err!(
-                    "sphere backend: failed to create CUDA context for device {ordinal}"
-                )
+            gpu_err!("sphere backend: failed to create CUDA context for device {ordinal}")
         })?;
         let stream = ctx.default_stream();
         let cap = &runtime.selected_device().capability;
@@ -546,11 +545,13 @@ impl SphereGpuBackend {
         // pattern. The kernel itself targets the device the driver
         // reports (Volta+).
         let src = format!("#define LMAX {}\n{}", key.lmax, KERNEL_TEMPLATE);
-        let ptx = cudarc::nvrtc::compile_ptx(&src).gpu_ctx_with(|err| format!(
+        let ptx = cudarc::nvrtc::compile_ptx(&src).gpu_ctx_with(|err| {
+            format!(
                 "sphere NVRTC compile (kind={}, lmax={}): {err}",
                 key.kind.tag(),
                 key.lmax
-            ))?;
+            )
+        })?;
         let module = self
             .inner
             .ctx
@@ -597,26 +598,22 @@ pub fn build_kernel_matrix_device(
             .gpu_ctx("sphere load_function raw")?;
         let stream = backend.inner.stream.clone();
 
-        let data_dev =
-            stream
-                .clone_htod(inputs.data_xyz)
-                .gpu_ctx("sphere htod data_xyz")?;
-        let centers_dev =
-            stream
-                .clone_htod(inputs.centers_xyz)
-                .gpu_ctx("sphere htod centers_xyz")?;
-        let coeffs_dev =
-            stream
-                .clone_htod(inputs.coeffs)
-                .gpu_ctx("sphere htod coeffs")?;
+        let data_dev = stream
+            .clone_htod(inputs.data_xyz)
+            .gpu_ctx("sphere htod data_xyz")?;
+        let centers_dev = stream
+            .clone_htod(inputs.centers_xyz)
+            .gpu_ctx("sphere htod centers_xyz")?;
+        let coeffs_dev = stream
+            .clone_htod(inputs.coeffs)
+            .gpu_ctx("sphere htod coeffs")?;
 
         let n = inputs.n;
         let m = inputs.m;
         let ld = ((n + 31) / 32) * 32;
-        let mut out_dev =
-            stream
-                .alloc_zeros::<f64>(ld * m)
-                .gpu_ctx_with(|err| format!("sphere alloc out (ld={ld}, m={m}): {err}"))?;
+        let mut out_dev = stream
+            .alloc_zeros::<f64>(ld * m)
+            .gpu_ctx_with(|err| format!("sphere alloc out (ld={ld}, m={m}): {err}"))?;
 
         // Block (32, 8, 1) — x over centers, y over rows.
         let block_x: u32 = 32;
@@ -678,21 +675,21 @@ pub fn build_householder_constrained_design_device(
     inputs.validate()?;
     if v.len() != inputs.m {
         crate::gpu_bail!(
-                "build_householder_constrained_design_device: v.len()={} != m={}",
-                v.len(),
-                inputs.m
-            );
+            "build_householder_constrained_design_device: v.len()={} != m={}",
+            v.len(),
+            inputs.m
+        );
     }
     if inputs.m < 2 {
         crate::gpu_bail!(
-                "build_householder_constrained_design_device: m must be >= 2 (got {})",
-                inputs.m
-            );
+            "build_householder_constrained_design_device: m must be >= 2 (got {})",
+            inputs.m
+        );
     }
     if !beta.is_finite() {
         crate::gpu_bail!(
-                "build_householder_constrained_design_device: beta must be finite (got {beta})"
-            );
+            "build_householder_constrained_design_device: beta must be finite (got {beta})"
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -713,21 +710,16 @@ pub fn build_householder_constrained_design_device(
             .gpu_ctx("sphere load_function householder")?;
         let stream = backend.inner.stream.clone();
 
-        let data_dev =
-            stream
-                .clone_htod(inputs.data_xyz)
-                .gpu_ctx("sphere-hh htod data_xyz")?;
-        let centers_dev =
-            stream
-                .clone_htod(inputs.centers_xyz)
-                .gpu_ctx("sphere-hh htod centers_xyz")?;
-        let coeffs_dev =
-            stream
-                .clone_htod(inputs.coeffs)
-                .gpu_ctx("sphere-hh htod coeffs")?;
-        let v_dev = stream
-            .clone_htod(v)
-            .gpu_ctx("sphere-hh htod v")?;
+        let data_dev = stream
+            .clone_htod(inputs.data_xyz)
+            .gpu_ctx("sphere-hh htod data_xyz")?;
+        let centers_dev = stream
+            .clone_htod(inputs.centers_xyz)
+            .gpu_ctx("sphere-hh htod centers_xyz")?;
+        let coeffs_dev = stream
+            .clone_htod(inputs.coeffs)
+            .gpu_ctx("sphere-hh htod coeffs")?;
+        let v_dev = stream.clone_htod(v).gpu_ctx("sphere-hh htod v")?;
 
         let n = inputs.n;
         let m = inputs.m;
@@ -735,7 +727,9 @@ pub fn build_householder_constrained_design_device(
         let ld_out = ((n + 31) / 32) * 32;
         let mut out_dev = stream
             .alloc_zeros::<f64>(ld_out * cols_out)
-            .gpu_ctx_with(|err| format!("sphere-hh alloc out (ld={ld_out}, cols={cols_out}): {err}"))?;
+            .gpu_ctx_with(|err| {
+                format!("sphere-hh alloc out (ld={ld_out}, cols={cols_out}): {err}")
+            })?;
 
         let block_x: u32 = 128;
         let grid_x: u32 = ((n as u32) + block_x - 1) / block_x;
@@ -978,9 +972,9 @@ pub fn solve_penalised_ls_device(
     }
     if r_s.dim() != (p, p) {
         crate::gpu_bail!(
-                "solve_penalised_ls_device: r_s.dim()={:?} != ({p}, {p})",
-                r_s.dim()
-            );
+            "solve_penalised_ls_device: r_s.dim()={:?} != ({p}, {p})",
+            r_s.dim()
+        );
     }
     if p == 0 {
         return Ok(PenalisedLsSolution {
@@ -1023,8 +1017,10 @@ pub fn solve_penalised_ls_device(
         .gpu_ctx("solve_penalised_ls_device htod b_aug")?;
 
     let solver = DnHandle::new(stream.clone()).gpu_ctx("solve_penalised_ls_device DnHandle")?;
-    let n_aug_i: i32 = i32::try_from(n_aug).map_err(|_| gpu_err!("solve_penalised_ls_device: n_aug={n_aug} overflows i32"))?;
-    let p_i: i32 = i32::try_from(p).map_err(|_| gpu_err!("solve_penalised_ls_device: p={p} overflows i32"))?;
+    let n_aug_i: i32 = i32::try_from(n_aug)
+        .map_err(|_| gpu_err!("solve_penalised_ls_device: n_aug={n_aug} overflows i32"))?;
+    let p_i: i32 =
+        i32::try_from(p).map_err(|_| gpu_err!("solve_penalised_ls_device: p={p} overflows i32"))?;
 
     // 2) Workspace size for geqrf.
     let mut lwork: i32 = 0;
@@ -1046,11 +1042,11 @@ pub fn solve_penalised_ls_device(
             crate::gpu_bail!("cusolverDnDgeqrf_bufferSize status={status:?}");
         }
     }
-    let lwork_us = usize::try_from(lwork).map_err(|_| gpu_err!("solve_penalised_ls_device: negative lwork={lwork}"))?;
-    let mut workspace =
-        stream
-            .alloc_zeros::<f64>(lwork_us.max(1))
-            .gpu_ctx("solve_penalised_ls_device alloc workspace")?;
+    let lwork_us = usize::try_from(lwork)
+        .map_err(|_| gpu_err!("solve_penalised_ls_device: negative lwork={lwork}"))?;
+    let mut workspace = stream
+        .alloc_zeros::<f64>(lwork_us.max(1))
+        .gpu_ctx("solve_penalised_ls_device alloc workspace")?;
     let mut tau = stream
         .alloc_zeros::<f64>(p)
         .gpu_ctx("solve_penalised_ls_device alloc tau")?;
@@ -1250,10 +1246,10 @@ mod sphere_gpu_tests {
         SphereWahbaKernel, sobolev_s2_truncated_coefficients, sphere_truncated_spectral_eval,
         spherical_wahba_kernel_matrix_with_kind,
     };
+    use crate::gpu::error::GpuResultExt;
+    use crate::gpu_bail;
+    use crate::gpu_err;
     use ndarray::Array2;
-use crate::gpu_err;
-use crate::gpu_bail;
-use crate::gpu::error::GpuResultExt;
 
     fn small_latlon_grid(n_lat: usize, n_lon: usize) -> Array2<f64> {
         // Latitude in (-85, 85), longitude in [-180, 180), degrees.

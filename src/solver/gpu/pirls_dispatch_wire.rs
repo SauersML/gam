@@ -18,13 +18,15 @@
 mod linux_impl {
     use ndarray::{Array1, ArrayView1, ArrayView2};
 
+    use crate::construction::ReparamResult;
     use crate::gpu::pirls_row::{CurvatureMode, PirlsRowFamily};
-    use crate::gpu::policy::{
-        PirlsLoopAdmission, PirlsLoopCurvatureKind, PirlsLoopFamilyKind,
-    };
+    use crate::gpu::policy::{PirlsLoopAdmission, PirlsLoopCurvatureKind, PirlsLoopFamilyKind};
     use crate::gpu::runtime::GpuRuntime;
     use crate::linalg::matrix::SymmetricMatrix;
-    use crate::solver::active_set::{LinearInequalityConstraints, compute_constraint_kkt_diagnostics};
+    use crate::matrix::DesignMatrix;
+    use crate::solver::active_set::{
+        LinearInequalityConstraints, compute_constraint_kkt_diagnostics,
+    };
     use crate::solver::gpu::pirls_dispatch::admission_for;
     use crate::solver::gpu::pirls_gpu::{self, cuda};
     use crate::solver::pirls::{
@@ -33,8 +35,6 @@ mod linux_impl {
         calculate_loglikelihood_omitting_constants, compute_observed_hessian_curvature_arrays,
         computeworkingweight_derivatives_from_eta,
     };
-    use crate::construction::ReparamResult;
-    use crate::matrix::DesignMatrix;
     use crate::types::{Coefficients, GlmLikelihoodSpec, InverseLink, LinearPredictor};
 
     /// All inputs needed for the GPU PIRLS loop end-to-end. Built by the
@@ -134,7 +134,9 @@ mod linux_impl {
         let family = family_to_row(admission.family?);
         let curvature = curvature_to_row(admission.curvature);
 
-        Some(run_gpu_pirls_loop(input, admission, family, curvature, n, p))
+        Some(run_gpu_pirls_loop(
+            input, admission, family, curvature, n, p,
+        ))
     }
 
     fn run_gpu_pirls_loop(
@@ -244,7 +246,10 @@ mod linux_impl {
         // mis-stamping `PirlsResult.status`.
         assert_eq!(
             converged,
-            matches!(status, PirlsStatus::Converged | PirlsStatus::StalledAtValidMinimum),
+            matches!(
+                status,
+                PirlsStatus::Converged | PirlsStatus::StalledAtValidMinimum
+            ),
             "GPU outcome converged flag inconsistent with status",
         );
 
@@ -289,23 +294,22 @@ mod linux_impl {
 
         // Observed-curvature finalisation if the outer caller requested
         // it and the GPU loop did not already promote (i.e. ran Fisher).
-        let (finalweights_arr, final_c_arr, final_d_arr) = if matches!(
-            input.exported_curvature,
-            HessianCurvatureKind::Observed
-        ) && curvature == CurvatureMode::Fisher
-        {
-            compute_observed_hessian_curvature_arrays(
-                input.likelihood,
-                input.inverse_link,
-                &final_eta,
-                input.y,
-                &final_w_solver,
-                input.priorweights,
-            )
-            .map_err(|e| format!("observed-curvature finalisation failed: {e:?}"))?
-        } else {
-            (finalweights.clone(), final_c.clone(), final_d.clone())
-        };
+        let (finalweights_arr, final_c_arr, final_d_arr) =
+            if matches!(input.exported_curvature, HessianCurvatureKind::Observed)
+                && curvature == CurvatureMode::Fisher
+            {
+                compute_observed_hessian_curvature_arrays(
+                    input.likelihood,
+                    input.inverse_link,
+                    &final_eta,
+                    input.y,
+                    &final_w_solver,
+                    input.priorweights,
+                )
+                .map_err(|e| format!("observed-curvature finalisation failed: {e:?}"))?
+            } else {
+                (finalweights.clone(), final_c.clone(), final_d.clone())
+            };
         // Echo through whichever finalweights array we ended with for use below.
         let finalweights_for_state = if finalweights_arr.is_empty() {
             final_w_hessian.clone()

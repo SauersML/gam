@@ -585,9 +585,7 @@ pub fn gaussian_reml_free_b_score(
     weights: Option<ArrayView1<'_, f64>>,
 ) -> Result<GaussianRemlFreeBScore, EstimationError> {
     if !log_lambda.is_finite() {
-        crate::bail_invalid_estim!(
-            "Gaussian REML log_lambda must be finite; got {log_lambda}"
-        );
+        crate::bail_invalid_estim!("Gaussian REML log_lambda must be finite; got {log_lambda}");
     }
     let lambda = log_lambda.exp();
     let penalty_owned = canonicalize_penalty(penalty);
@@ -1030,7 +1028,9 @@ fn validate_gaussian_reml_backward_upstreams(
             );
         }
         if upstream_coefficients.iter().any(|value| !value.is_finite()) {
-            crate::bail_invalid_estim!("Gaussian REML backward coefficient upstream must be finite");
+            crate::bail_invalid_estim!(
+                "Gaussian REML backward coefficient upstream must be finite"
+            );
         }
     }
     if let Some(upstream_fitted) = upstream_fitted {
@@ -2000,7 +2000,8 @@ fn validate_gaussian_reml_eigen_cache(
     if cache.penalty_rank > p || cache.nullity > p || cache.penalty_rank + cache.nullity != p {
         crate::bail_invalid_estim!(
             "Gaussian REML eigen cache rank/nullity mismatch: rank={}, nullity={}, p={p}",
-            cache.penalty_rank, cache.nullity
+            cache.penalty_rank,
+            cache.nullity
         );
     }
     if !(cache.logdet_xtwx.is_finite() && cache.logdet_penalty_positive.is_finite()) {
@@ -2016,8 +2017,10 @@ fn validate_gaussian_reml_eigen_cache(
             .iter()
             .any(|value| !value.is_finite())
     {
-        crate::bail_invalid_estim!("Gaussian REML eigen cache entries must be finite with non-negative eigenvalues"
-                .to_string(),);
+        crate::bail_invalid_estim!(
+            "Gaussian REML eigen cache entries must be finite with non-negative eigenvalues"
+                .to_string(),
+        );
     }
     Ok::<(), _>(())
 }

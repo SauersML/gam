@@ -5,7 +5,9 @@ use pest::iterators::Pair;
 use pest_derive::Parser;
 
 use crate::smooth::BoundedCoefficientPriorSpec;
-use crate::types::{InverseLink, LikelihoodSpec, LinkComponent, LinkFunction, StandardLink, WigglePenaltyConfig};
+use crate::types::{
+    InverseLink, LikelihoodSpec, LinkComponent, LinkFunction, StandardLink, WigglePenaltyConfig,
+};
 
 #[derive(Parser)]
 #[grammar_inline = r#"

@@ -13,7 +13,6 @@ use gam::faer_ndarray::{
     FaerCholesky, FaerEigh, FaerSvd, array2_to_matmut, factorize_symmetricwith_fallback, fast_ata,
     fast_atb, fast_xt_diag_x,
 };
-use gam::types::inverse_link_to_binomial_spec;
 use gam::families::inverse_link::apply_inverse_link_vec;
 use gam::families::scale_design::{build_scale_deviation_transform, infer_non_intercept_start};
 use gam::families::survival_construction::{SavedSurvivalTimeBasis, survival_likelihood_modename};
@@ -52,8 +51,8 @@ use gam::inference::data::{
 use gam::inference::formula_dsl::{ParsedTerm, parse_formula, parse_surv_response};
 use gam::inference::model::{
     ColumnKindTag, DataSchema, FittedFamily, FittedModel, FittedModelPayload, GroupMetadata,
-    MODEL_PAYLOAD_VERSION, ModelKind, PredictModelClass, SavedAnchoredDeviationRuntime,
-    SavedDeploymentExtension, SavedLatentZNormalization, SchemaColumn,
+    MODEL_PAYLOAD_VERSION, ModelKind, PredictModelClass, SavedAnchorComponent, SavedAnchorKind,
+    SavedCompiledFlexBlock, SavedDeploymentExtension, SavedLatentZNormalization, SchemaColumn,
     append_deployment_extension_columns,
 };
 use gam::inference::posterior_bands::{self, PosteriorPredictBandsPayload};
@@ -123,7 +122,10 @@ use gam::terms::{
     TopKActivationPenalty, TotalVariationPenalty as CoreTotalVariationPenalty,
 };
 use gam::transformation_normal::TransformationNormalFitResult;
-use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, StandardLink, ResponseFamily, RhoPrior};
+use gam::types::inverse_link_to_binomial_spec;
+use gam::types::{
+    InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily, RhoPrior, StandardLink,
+};
 use gam::{FitConfig, FitRequest, FitResult, fit_model, materialize, resolve_offset_column};
 use ndarray::{
     Array1, Array2, Array3, Array4, ArrayD, ArrayView1, ArrayView2, ArrayView3, ArrayView4,
@@ -27147,6 +27149,9 @@ fn add_formula_term_columns(required: &mut BTreeSet<String>, terms: &[ParsedTerm
             ParsedTerm::Smooth { vars, .. } => {
                 required.extend(vars.iter().cloned());
             }
+            ParsedTerm::Interaction { vars } => {
+                required.extend(vars.iter().cloned());
+            }
             ParsedTerm::LinkWiggle { .. }
             | ParsedTerm::TimeWiggle { .. }
             | ParsedTerm::LinkConfig { .. }
@@ -28169,6 +28174,7 @@ fn build_standard_payload(
             saved_latent_cloglog_state_from_fit(&saved_fit)
         };
     let family_link = family.link_function();
+    let family_inverse_link = family.link.clone();
     let family_name = family.name().to_string();
     let mut payload = FittedModelPayload::new(
         MODEL_VERSION,
@@ -28176,7 +28182,7 @@ fn build_standard_payload(
         ModelKind::Standard,
         FittedFamily::Standard {
             likelihood: family,
-            link: Some(family_link),
+            link: StandardLink::try_from(family_link).ok(),
             latent_cloglog_state,
             mixture_state: saved_mixture_state_from_fit(&saved_fit),
             sas_state: saved_sas_state_from_fit(&saved_fit),
@@ -28186,7 +28192,7 @@ fn build_standard_payload(
     payload.unified = Some(saved_fit.clone());
     payload.fit_result = Some(saved_fit);
     payload.data_schema = Some(dataset.schema.clone());
-    payload.link = Some(InverseLink::Standard(family_link));
+    payload.link = Some(family_inverse_link);
     payload.linkwiggle_knots = wiggle_knots;
     payload.linkwiggle_degree = wiggle_degree;
     payload.set_training_feature_metadata(dataset.headers.clone(), dataset.feature_ranges());
@@ -29157,8 +29163,37 @@ fn build_latent_window_ffi_payload(
     Ok(payload)
 }
 
-fn saved_anchored_deviation_runtime(runtime: &DeviationRuntime) -> SavedAnchoredDeviationRuntime {
-    SavedAnchoredDeviationRuntime {
+fn saved_anchored_deviation_runtime(runtime: &DeviationRuntime) -> SavedCompiledFlexBlock {
+    use gam::families::bernoulli_marginal_slope::deviation_runtime::AnchorComponentTag;
+
+    let mut anchor_correction: Option<Vec<Vec<f64>>> = None;
+    let mut anchor_components: Vec<SavedAnchorComponent> = Vec::new();
+    if let Some(installed) = runtime.installed_flex_block() {
+        anchor_correction = Some(
+            installed
+                .anchor_correction
+                .rows()
+                .into_iter()
+                .map(|row| row.to_vec())
+                .collect::<Vec<Vec<f64>>>(),
+        );
+        for component in &installed.anchor_components {
+            anchor_components.push(SavedAnchorComponent {
+                kind: match component {
+                    AnchorComponentTag::Parametric { block, ncols } => {
+                        SavedAnchorKind::Parametric {
+                            block: *block,
+                            ncols: *ncols,
+                        }
+                    }
+                    AnchorComponentTag::FlexEvaluation { ncols } => {
+                        SavedAnchorKind::FlexEvaluation { ncols: *ncols }
+                    }
+                },
+            });
+        }
+    }
+    SavedCompiledFlexBlock {
         kernel: gam::families::cubic_cell_kernel::ANCHORED_DEVIATION_KERNEL.to_string(),
         breakpoints: runtime.breakpoints().to_vec(),
         basis_dim: runtime.basis_dim(),
@@ -29186,9 +29221,8 @@ fn saved_anchored_deviation_runtime(runtime: &DeviationRuntime) -> SavedAnchored
             .into_iter()
             .map(|row| row.to_vec())
             .collect(),
-        anchor_residual_coefficients: None,
-        anchor_residual_components: Vec::new(),
-        anchor_residual_rotation: None,
+        anchor_correction,
+        anchor_components,
     }
 }
 

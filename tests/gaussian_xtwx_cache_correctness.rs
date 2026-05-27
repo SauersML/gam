@@ -20,8 +20,8 @@ use gam::pirls::{
     GaussianFixedCache, PenaltyConfig, PirlsConfig, PirlsProblem, fit_model_for_fixed_rho,
 };
 use gam::types::{
-    GlmLikelihoodSpec, InverseLink, LikelihoodSpec, StandardLink, LogSmoothingParamsView,
-    ResponseFamily,
+    GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LogSmoothingParamsView, ResponseFamily,
+    StandardLink,
 };
 use ndarray::{Array1, Array2, array};
 use rand::rngs::StdRng;

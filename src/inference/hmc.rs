@@ -36,8 +36,9 @@ use crate::matrix::DesignMatrix;
 use crate::solver::mixture_link::{
     InverseLinkKernel, LinkParamPartials, inverse_link_jet_for_inverse_link, softmax_last_fixedzero,
 };
-use crate::types::{StandardLink, 
-    InverseLink, LikelihoodSpec, LinkFunction,  ResponseFamily, RhoPrior, is_valid_tweedie_power,
+use crate::types::{
+    InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily, RhoPrior, StandardLink,
+    is_valid_tweedie_power,
 };
 use crate::visualizer::VisualizerSession;
 use faer::Side;
@@ -1322,9 +1323,7 @@ fn probit_logp_and_grad_into(
 #[inline]
 fn cloglog_bernoulli_logp_and_residual(eta: f64, y: f64) -> Result<(f64, f64), EstimationError> {
     if !(eta.is_finite() && (-700.0..=700.0).contains(&eta)) {
-        crate::bail_invalid_estim!(
-            "cloglog eta must be finite and within [-700, 700]; got {eta}"
-        );
+        crate::bail_invalid_estim!("cloglog eta must be finite and within [-700, 700]; got {eta}");
     }
     let exp_eta = eta.exp();
     let log_mu = if exp_eta <= std::f64::consts::LN_2 {
@@ -1603,9 +1602,9 @@ mod tests {
     };
     use crate::matrix::DesignMatrix;
     use crate::survival::{MonotonicityPenalty, PenaltyBlocks, SurvivalSpec};
-    use crate::types::{StandardLink, 
+    use crate::types::{
         InverseLink, LikelihoodScaleMetadata, LikelihoodSpec, LinkFunction,
-        LogLikelihoodNormalization, ResponseFamily, RhoPrior,
+        LogLikelihoodNormalization, ResponseFamily, RhoPrior, StandardLink,
     };
     use general_mcmc::generic_hmc::HamiltonianTarget;
     use ndarray::{Array1, Array2, array};

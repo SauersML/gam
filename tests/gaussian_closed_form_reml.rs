@@ -6,7 +6,7 @@ use gam::gaussian_reml::{
     gaussian_reml_multi_closed_form, gaussian_reml_multi_closed_form_batch,
 };
 use gam::smooth::BlockwisePenalty;
-use gam::types::{InverseLink, LikelihoodSpec, StandardLink, ResponseFamily};
+use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
 use ndarray::{Array1, Array2};
 
 fn fit_options() -> FitOptions {

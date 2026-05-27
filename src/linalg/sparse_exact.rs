@@ -95,11 +95,15 @@ fn embed_dense_block_to_sparse_symmetric_upper(
 ) -> Result<SparseColMat<usize, f64>, EstimationError> {
     let block_n = local.nrows();
     if local.ncols() != block_n {
-        crate::bail_invalid_estim!("embed_dense_block_to_sparse_symmetric_upper requires a square block");
+        crate::bail_invalid_estim!(
+            "embed_dense_block_to_sparse_symmetric_upper requires a square block"
+        );
     }
     if offset + block_n > total_dim {
-        crate::bail_invalid_estim!("embed_dense_block_to_sparse_symmetric_upper offset+block exceeds total_dim"
-                .to_string(),);
+        crate::bail_invalid_estim!(
+            "embed_dense_block_to_sparse_symmetric_upper offset+block exceeds total_dim"
+                .to_string(),
+        );
     }
     // Direct CSC build over the upper triangle of `local`, embedded at
     // `(offset, offset)` in a `total_dim x total_dim` matrix.  Columns
@@ -653,7 +657,9 @@ where
     if row_start > row_end || row_end > factor.n {
         crate::bail_invalid_estim!(
             "sparse SPD selected rows out of bounds: row_start={}, row_end={}, factor={}",
-            row_start, row_end, factor.n
+            row_start,
+            row_end,
+            factor.n
         );
     }
     let indices = (row_start..row_end).flat_map(|i| (0..rhs.ncols()).map(move |j| (i, j)));
@@ -1043,8 +1049,10 @@ impl SimplicialFactor {
                 }
                 let value = h_permuted[[pi, pj]];
                 if !value.is_finite() {
-                    crate::bail_invalid_estim!("dense reconstruction from sparse Cholesky produced non-finite values"
-                            .to_string(),);
+                    crate::bail_invalid_estim!(
+                        "dense reconstruction from sparse Cholesky produced non-finite values"
+                            .to_string(),
+                    );
                 }
                 h_original[[i, j]] = value;
             }

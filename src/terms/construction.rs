@@ -472,7 +472,8 @@ pub(crate) fn robust_eigh_faer(
                         let max_abs = mat_max_abs_element(mat.as_ref());
                         crate::bail_invalid_estim!(
                             "{} contains non-finite entries (max finite magnitude {:.3e})",
-                            ctx, max_abs
+                            ctx,
+                            max_abs
                         );
                     }
                 }
@@ -1153,7 +1154,8 @@ pub fn canonicalize_penalty_spec(
             if col_range.end > p {
                 crate::bail_invalid_estim!(
                     "{context}: block penalty {idx} col_range {}..{} exceeds p={p}",
-                    col_range.start, col_range.end
+                    col_range.start,
+                    col_range.end
                 );
             }
             (

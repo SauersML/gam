@@ -26,6 +26,7 @@ use std::sync::OnceLock;
 
 use ndarray::Array2;
 
+use crate::gpu::error::GpuResultExt;
 use crate::gpu_err;
 
 use super::error::GpuError;
@@ -186,53 +187,58 @@ impl<'a> BmsFlexGpuRowInputs<'a> {
         let want_p = self.q_dim + self.g_dim + self.p_h + self.p_w;
         if self.p != want_p {
             crate::gpu_bail!(
-                    "bms_flex inputs: p={} != q_dim({}) + g_dim({}) + p_h({}) + p_w({}) = {}",
-                    self.p, self.q_dim, self.g_dim, self.p_h, self.p_w, want_p
-                );
+                "bms_flex inputs: p={} != q_dim({}) + g_dim({}) + p_h({}) + p_w({}) = {}",
+                self.p,
+                self.q_dim,
+                self.g_dim,
+                self.p_h,
+                self.p_w,
+                want_p
+            );
         }
         if self.r != 2 + self.p_h + self.p_w {
             crate::gpu_bail!(
-                    "bms_flex inputs: r={} != 2 + p_h({}) + p_w({}) = {}",
-                    self.r,
-                    self.p_h,
-                    self.p_w,
-                    2 + self.p_h + self.p_w
-                );
+                "bms_flex inputs: r={} != 2 + p_h({}) + p_w({}) = {}",
+                self.r,
+                self.p_h,
+                self.p_w,
+                2 + self.p_h + self.p_w
+            );
         }
         if self.beta.len() != self.p {
             crate::gpu_bail!(
-                    "bms_flex inputs: beta.len()={} != p={}",
-                    self.beta.len(),
-                    self.p
-                );
+                "bms_flex inputs: beta.len()={} != p={}",
+                self.beta.len(),
+                self.p
+            );
         }
         if self.y.len() != self.n {
             crate::gpu_bail!("bms_flex inputs: y.len()={} != n={}", self.y.len(), self.n);
         }
         if self.weights.len() != self.n {
             crate::gpu_bail!(
-                    "bms_flex inputs: weights.len()={} != n={}",
-                    self.weights.len(),
-                    self.n
-                );
+                "bms_flex inputs: weights.len()={} != n={}",
+                self.weights.len(),
+                self.n
+            );
         }
         if self.x_design.len() != self.n * self.q_dim {
             crate::gpu_bail!(
-                    "bms_flex inputs: x_design.len()={} != n({})*q_dim({}) = {}",
-                    self.x_design.len(),
-                    self.n,
-                    self.q_dim,
-                    self.n * self.q_dim
-                );
+                "bms_flex inputs: x_design.len()={} != n({})*q_dim({}) = {}",
+                self.x_design.len(),
+                self.n,
+                self.q_dim,
+                self.n * self.q_dim
+            );
         }
         if self.g_design.len() != self.n * self.g_dim {
             crate::gpu_bail!(
-                    "bms_flex inputs: g_design.len()={} != n({})*g_dim({}) = {}",
-                    self.g_design.len(),
-                    self.n,
-                    self.g_dim,
-                    self.n * self.g_dim
-                );
+                "bms_flex inputs: g_design.len()={} != n({})*g_dim({}) = {}",
+                self.g_design.len(),
+                self.n,
+                self.g_dim,
+                self.n * self.g_dim
+            );
         }
         Ok(())
     }
@@ -353,10 +359,12 @@ impl BmsFlexGpuBackend {
             }
         })?;
         let ctx = super::runtime::cuda_context_for(runtime.selected_device().ordinal).ok_or_else(
-            || gpu_err!(
+            || {
+                gpu_err!(
                     "bms_flex backend: failed to create CUDA context for device {}",
                     runtime.selected_device().ordinal
-                ),
+                )
+            },
         )?;
         let stream = ctx.default_stream();
         let backend = BmsFlexGpuBackend {
@@ -388,10 +396,9 @@ impl BmsFlexGpuBackend {
     pub fn launch_probe(&self) -> Result<(), GpuError> {
         use cudarc::driver::LaunchConfig;
         let module = self.compile_probe_module()?;
-        let func =
-            module
-                .load_function("bms_flex_probe")
-                .gpu_ctx("bms_flex probe load_function")?;
+        let func = module
+            .load_function("bms_flex_probe")
+            .gpu_ctx("bms_flex probe load_function")?;
         let cfg = LaunchConfig {
             grid_dim: (1, 1, 1),
             block_dim: (1, 1, 1),
@@ -655,10 +662,10 @@ pub fn gpu_hessian_matvec(
     inputs.validate()?;
     if v.len() != inputs.p {
         crate::gpu_bail!(
-                "bms_flex gpu_hessian_matvec: v.len()={} != p={}",
-                v.len(),
-                inputs.p
-            );
+            "bms_flex gpu_hessian_matvec: v.len()={} != p={}",
+            v.len(),
+            inputs.p
+        );
     }
     BmsFlexGpuBackend::probe()?;
     let outputs = launch_bms_flex_row_kernel(inputs.as_row_kernel_inputs())?;
@@ -729,9 +736,9 @@ pub fn gpu_hessian_dense(inputs: BmsFlexGpuRowInputs<'_>) -> Result<Array2<f64>,
 #[cfg(test)]
 mod bms_flex_gpu_tests {
     use super::*;
-use crate::gpu_err;
-use crate::gpu_bail;
-use crate::gpu::error::GpuResultExt;
+    use crate::gpu::error::GpuResultExt;
+    use crate::gpu_bail;
+    use crate::gpu_err;
 
     /// Allocate zero-filled row + cell buffers for a small rigid (no
     /// flex blocks) test problem.

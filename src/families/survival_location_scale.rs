@@ -249,9 +249,11 @@ fn safe_hadamard_product(
     rhs: &Array1<f64>,
 ) -> Result<Array1<f64>, SurvivalLocationScaleError> {
     if lhs.len() != rhs.len() {
-        crate::bail_dim_sls!("safe_hadamard_product length mismatch: lhs has {}, rhs has {}",
-                lhs.len(),
-                rhs.len());
+        crate::bail_dim_sls!(
+            "safe_hadamard_product length mismatch: lhs has {}, rhs has {}",
+            lhs.len(),
+            rhs.len()
+        );
     }
     let out = Array1::from_shape_fn(lhs.len(), |i| safe_product(lhs[i], rhs[i]));
     if out.iter().any(|value| value.is_nan()) {
@@ -269,11 +271,13 @@ fn safe_linear_combo2_arrays(
     d: &Array1<f64>,
 ) -> Result<Array1<f64>, SurvivalLocationScaleError> {
     if a.len() != b.len() || a.len() != c.len() || a.len() != d.len() {
-        crate::bail_dim_sls!("safe_linear_combo2_arrays length mismatch: a={}, b={}, c={}, d={}",
-                a.len(),
-                b.len(),
-                c.len(),
-                d.len());
+        crate::bail_dim_sls!(
+            "safe_linear_combo2_arrays length mismatch: a={}, b={}, c={}, d={}",
+            a.len(),
+            b.len(),
+            c.len(),
+            d.len()
+        );
     }
     let out = Array1::from_shape_fn(a.len(), |i| {
         safe_sum2(safe_product(a[i], b[i]), safe_product(c[i], d[i]))
@@ -3136,26 +3140,34 @@ fn validate_cov_block(
     b: &CovariateBlockInput,
 ) -> Result<(), SurvivalLocationScaleError> {
     if b.design.nrows() != n {
-        crate::bail_dim_sls!("{name} design row mismatch: got {}, expected {n}",
-                b.design.nrows());
+        crate::bail_dim_sls!(
+            "{name} design row mismatch: got {}, expected {n}",
+            b.design.nrows()
+        );
     }
     if b.offset.len() != n {
-        crate::bail_dim_sls!("{name} offset length mismatch: got {}, expected {n}",
-                b.offset.len());
+        crate::bail_dim_sls!(
+            "{name} offset length mismatch: got {}, expected {n}",
+            b.offset.len()
+        );
     }
     let p = b.design.ncols();
     if let Some(beta0) = &b.initial_beta
         && beta0.len() != p
     {
-        crate::bail_dim_sls!("{name} initial_beta length mismatch: got {}, expected {p}",
-                beta0.len());
+        crate::bail_dim_sls!(
+            "{name} initial_beta length mismatch: got {}, expected {p}",
+            beta0.len()
+        );
     }
     let k = b.penalties.len();
     if let Some(rho0) = &b.initial_log_lambdas
         && rho0.len() != k
     {
-        crate::bail_dim_sls!("{name} initial_log_lambdas length mismatch: got {}, expected {k}",
-                rho0.len());
+        crate::bail_dim_sls!(
+            "{name} initial_log_lambdas length mismatch: got {}, expected {k}",
+            rho0.len()
+        );
     }
     for (idx, s) in b.penalties.iter().enumerate() {
         match s {
@@ -3166,11 +3178,13 @@ fn validate_cov_block(
                     || local.nrows() != col_range.len()
                     || local.ncols() != col_range.len()
                 {
-                    crate::bail_dim_sls!("{name} penalty {idx} block shape mismatch: col_range={}..{}, local={}x{}, total_dim={p}",
-                            col_range.start,
-                            col_range.end,
-                            local.nrows(),
-                            local.ncols());
+                    crate::bail_dim_sls!(
+                        "{name} penalty {idx} block shape mismatch: col_range={}..{}, local={}x{}, total_dim={p}",
+                        col_range.start,
+                        col_range.end,
+                        local.nrows(),
+                        local.ncols()
+                    );
                 }
             }
             crate::solver::estimate::PenaltySpec::Dense(m)
@@ -3194,52 +3208,70 @@ fn validate_cov_block_kind(
         CovariateBlockKind::Static(b) => validate_cov_block(name, n, b),
         CovariateBlockKind::TimeVarying(tv) => {
             if tv.design_covariates.nrows() != n {
-                crate::bail_dim_sls!("{name} time-varying covariate design row mismatch: got {}, expected {n}",
-                        tv.design_covariates.nrows());
+                crate::bail_dim_sls!(
+                    "{name} time-varying covariate design row mismatch: got {}, expected {n}",
+                    tv.design_covariates.nrows()
+                );
             }
             if tv.time_basis_entry.nrows() != n || tv.time_basis_exit.nrows() != n {
-                crate::bail_dim_sls!("{name} time-varying time basis row mismatch: entry={}, exit={}, expected {n}",
-                        tv.time_basis_entry.nrows(),
-                        tv.time_basis_exit.nrows());
+                crate::bail_dim_sls!(
+                    "{name} time-varying time basis row mismatch: entry={}, exit={}, expected {n}",
+                    tv.time_basis_entry.nrows(),
+                    tv.time_basis_exit.nrows()
+                );
             }
             if tv.time_basis_derivative_exit.nrows() != n {
-                crate::bail_dim_sls!("{name} time-varying derivative basis row mismatch: got {}, expected {n}",
-                        tv.time_basis_derivative_exit.nrows());
+                crate::bail_dim_sls!(
+                    "{name} time-varying derivative basis row mismatch: got {}, expected {n}",
+                    tv.time_basis_derivative_exit.nrows()
+                );
             }
             if tv.offset.len() != n {
-                crate::bail_dim_sls!("{name} time-varying offset length mismatch: got {}, expected {n}",
-                        tv.offset.len());
+                crate::bail_dim_sls!(
+                    "{name} time-varying offset length mismatch: got {}, expected {n}",
+                    tv.offset.len()
+                );
             }
             let p_cov = tv.design_covariates.ncols();
             let p_time = tv.time_basis_exit.ncols();
             if tv.time_basis_entry.ncols() != p_time {
-                crate::bail_dim_sls!("{name} time-varying time basis column mismatch: entry={}, exit={}",
-                        tv.time_basis_entry.ncols(),
-                        p_time);
+                crate::bail_dim_sls!(
+                    "{name} time-varying time basis column mismatch: entry={}, exit={}",
+                    tv.time_basis_entry.ncols(),
+                    p_time
+                );
             }
             if tv.time_basis_derivative_exit.ncols() != p_time {
-                crate::bail_dim_sls!("{name} time-varying derivative basis column mismatch: derivative={}, exit={}",
-                        tv.time_basis_derivative_exit.ncols(),
-                        p_time);
+                crate::bail_dim_sls!(
+                    "{name} time-varying derivative basis column mismatch: derivative={}, exit={}",
+                    tv.time_basis_derivative_exit.ncols(),
+                    p_time
+                );
             }
             let p_tensor = p_cov * p_time;
             let k = tv.penalties.len();
             if let Some(beta0) = &tv.initial_beta
                 && beta0.len() != p_tensor
             {
-                crate::bail_dim_sls!("{name} time-varying initial_beta length mismatch: got {}, expected {p_tensor}",
-                        beta0.len());
+                crate::bail_dim_sls!(
+                    "{name} time-varying initial_beta length mismatch: got {}, expected {p_tensor}",
+                    beta0.len()
+                );
             }
             if let Some(rho0) = &tv.initial_log_lambdas
                 && rho0.len() != k
             {
-                crate::bail_dim_sls!("{name} time-varying initial_log_lambdas length mismatch: got {}, expected {k}",
-                        rho0.len());
+                crate::bail_dim_sls!(
+                    "{name} time-varying initial_log_lambdas length mismatch: got {}, expected {k}",
+                    rho0.len()
+                );
             }
             for (idx, s) in tv.penalties.iter().enumerate() {
                 let (r, c) = s.shape();
                 if r != p_tensor || c != p_tensor {
-                    crate::bail_dim_sls!("{name} time-varying penalty {idx} must be {p_tensor}x{p_tensor}, got {r}x{c}");
+                    crate::bail_dim_sls!(
+                        "{name} time-varying penalty {idx} must be {p_tensor}x{p_tensor}, got {r}x{c}"
+                    );
                 }
             }
             Ok(())
@@ -4670,8 +4702,10 @@ fn validatewiggle_block(
     b: &LinkWiggleBlockInput,
 ) -> Result<(), SurvivalLocationScaleError> {
     if b.design.nrows() != n {
-        crate::bail_dim_sls!("linkwiggle_block design row mismatch: got {}, expected {n}",
-                b.design.nrows());
+        crate::bail_dim_sls!(
+            "linkwiggle_block design row mismatch: got {}, expected {n}",
+            b.design.nrows()
+        );
     }
     let p = b.design.ncols();
     if b.knots.len() < b.degree + 2 {
@@ -4686,8 +4720,10 @@ fn validatewiggle_block(
     if let Some(beta0) = &b.initial_beta
         && beta0.len() != p
     {
-        crate::bail_dim_sls!("linkwiggle_block initial_beta length mismatch: got {}, expected {p}",
-                beta0.len());
+        crate::bail_dim_sls!(
+            "linkwiggle_block initial_beta length mismatch: got {}, expected {p}",
+            beta0.len()
+        );
     }
     if let Some(beta0) = &b.initial_beta {
         if let Some(beta0_slice) = beta0.as_slice() {
@@ -4707,8 +4743,10 @@ fn validatewiggle_block(
     if let Some(rho0) = &b.initial_log_lambdas
         && rho0.len() != k
     {
-        crate::bail_dim_sls!("linkwiggle_block initial_log_lambdas length mismatch: got {}, expected {k}",
-                rho0.len());
+        crate::bail_dim_sls!(
+            "linkwiggle_block initial_log_lambdas length mismatch: got {}, expected {k}",
+            rho0.len()
+        );
     }
     for (idx, s) in b.penalties.iter().enumerate() {
         match s {
@@ -4719,18 +4757,22 @@ fn validatewiggle_block(
                     || local.nrows() != col_range.len()
                     || local.ncols() != col_range.len()
                 {
-                    crate::bail_dim_sls!("linkwiggle_block penalty {idx} block shape mismatch: col_range={}..{}, local={}x{}, total_dim={p}",
-                            col_range.start,
-                            col_range.end,
-                            local.nrows(),
-                            local.ncols());
+                    crate::bail_dim_sls!(
+                        "linkwiggle_block penalty {idx} block shape mismatch: col_range={}..{}, local={}x{}, total_dim={p}",
+                        col_range.start,
+                        col_range.end,
+                        local.nrows(),
+                        local.ncols()
+                    );
                 }
             }
             crate::solver::estimate::PenaltySpec::Dense(m)
             | crate::solver::estimate::PenaltySpec::DenseWithMean { matrix: m, .. } => {
                 let (r, c) = m.dim();
                 if r != p || c != p {
-                    crate::bail_dim_sls!("linkwiggle_block penalty {idx} must be {p}x{p}, got {r}x{c}");
+                    crate::bail_dim_sls!(
+                        "linkwiggle_block penalty {idx} must be {p}x{p}, got {r}x{c}"
+                    );
                 }
             }
         }
@@ -4774,15 +4816,19 @@ fn validate_time_block(
     if let Some(beta0) = &b.initial_beta
         && beta0.len() != p
     {
-        crate::bail_dim_sls!("time_block initial_beta length mismatch: got {}, expected {p}",
-                beta0.len());
+        crate::bail_dim_sls!(
+            "time_block initial_beta length mismatch: got {}, expected {p}",
+            beta0.len()
+        );
     }
     let k = b.penalties.len();
     if let Some(rho0) = &b.initial_log_lambdas
         && rho0.len() != k
     {
-        crate::bail_dim_sls!("time_block initial_log_lambdas length mismatch: got {}, expected {k}",
-                rho0.len());
+        crate::bail_dim_sls!(
+            "time_block initial_log_lambdas length mismatch: got {}, expected {k}",
+            rho0.len()
+        );
     }
     for (idx, s) in b.penalties.iter().enumerate() {
         let (r, c) = s.dim();
@@ -5474,9 +5520,11 @@ fn scale_dense_rows(
     coeffs: &Array1<f64>,
 ) -> Result<Array2<f64>, SurvivalLocationScaleError> {
     if mat.nrows() != coeffs.len() {
-        crate::bail_dim_sls!("row scaling dimension mismatch: matrix has {} rows but coeffs have {} entries",
-                mat.nrows(),
-                coeffs.len());
+        crate::bail_dim_sls!(
+            "row scaling dimension mismatch: matrix has {} rows but coeffs have {} entries",
+            mat.nrows(),
+            coeffs.len()
+        );
     }
     let sanitized_coeffs = sanitize_survival_weight_vector(coeffs);
     let work = mat.nrows().saturating_mul(mat.ncols());
@@ -5562,7 +5610,11 @@ fn validate_predict_inverse_link(
     inverse_link: &InverseLink,
 ) -> Result<(), SurvivalLocationScaleError> {
     match inverse_link {
-        InverseLink::Standard(StandardLink::Log) => Err(SurvivalLocationScaleError::InvalidConfiguration { reason: "prediction does not support Standard(Log) for survival models".to_string(), }),
+        InverseLink::Standard(StandardLink::Log) => {
+            Err(SurvivalLocationScaleError::InvalidConfiguration {
+                reason: "prediction does not support Standard(Log) for survival models".to_string(),
+            })
+        }
         InverseLink::Standard(StandardLink::Logit)
         | InverseLink::Standard(StandardLink::Probit)
         | InverseLink::Standard(StandardLink::CLogLog)

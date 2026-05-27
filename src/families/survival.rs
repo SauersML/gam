@@ -1634,7 +1634,8 @@ impl WorkingModelSurvival {
         if time_columns > p {
             crate::bail_invalid_estim!(
                 "structural time columns {} exceed coefficient dimension {}",
-                time_columns, p
+                time_columns,
+                p
             );
         }
         if enabled && time_columns == 0 {
@@ -1764,7 +1765,9 @@ impl WorkingModelSurvival {
             let entry_age = self.age_entry[i];
             let exit_age = self.age_exit[i];
             if !entry_age.is_finite() || !exit_age.is_finite() || exit_age < entry_age {
-                crate::bail_invalid_estim!("survival ages must be finite with age_exit >= age_entry");
+                crate::bail_invalid_estim!(
+                    "survival ages must be finite with age_exit >= age_entry"
+                );
             }
             let d = f64::from(self.event_target[i]);
 
@@ -2079,7 +2082,9 @@ impl WorkingModelSurvival {
         beta: &Array1<f64>,
     ) -> Result<OffsetChannelResiduals, EstimationError> {
         if beta.len() != self.coefficient_dim() {
-            crate::bail_invalid_estim!("survival beta dimension mismatch in offset_channel_residuals");
+            crate::bail_invalid_estim!(
+                "survival beta dimension mismatch in offset_channel_residuals"
+            );
         }
         let n = self.nrows();
         let eta_entry = self.entry_dot(beta) + &self.offset_eta_entry;
@@ -2099,7 +2104,9 @@ impl WorkingModelSurvival {
             let entry_age = self.age_entry[i];
             let exit_age = self.age_exit[i];
             if !entry_age.is_finite() || !exit_age.is_finite() || exit_age < entry_age {
-                crate::bail_invalid_estim!("survival ages must be finite with age_exit >= age_entry");
+                crate::bail_invalid_estim!(
+                    "survival ages must be finite with age_exit >= age_entry"
+                );
             }
             let has_entry_interval = !self.entry_at_origin[i];
             let d = f64::from(self.event_target[i]);

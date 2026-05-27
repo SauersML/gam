@@ -1545,36 +1545,29 @@ pub fn apply_compiled_map_to_designs(
         .slice(ndarray::s![log_raw.clone(), log_compiled.clone()])
         .to_owned();
 
-    let time_entry_out = wrap_design_with_transform(
-        time_design_entry,
-        &v_time,
-        "compiled-map: time entry",
-    )?;
-    let time_exit_out = wrap_design_with_transform(
-        time_design_exit,
-        &v_time,
-        "compiled-map: time exit",
-    )?;
+    let time_entry_out =
+        wrap_design_with_transform(time_design_entry, &v_time, "compiled-map: time entry")?;
+    let time_exit_out =
+        wrap_design_with_transform(time_design_exit, &v_time, "compiled-map: time exit")?;
     let time_deriv_out = wrap_design_with_transform(
         time_design_derivative_exit,
         &v_time,
         "compiled-map: time derivative_exit",
     )?;
-    let marg_out =
-        wrap_design_with_transform(marginal_design, &v_marg, "compiled-map: marginal")?;
+    let marg_out = wrap_design_with_transform(marginal_design, &v_marg, "compiled-map: marginal")?;
     let log_out = wrap_design_with_transform(logslope_design, &v_log, "compiled-map: logslope")?;
 
     let time_offset = time_raw.start;
     let marg_offset = marg_raw.start;
     let log_offset = log_raw.start;
 
-    let pull_set =
-        |pens: &[crate::terms::smooth::BlockwisePenalty], anchor_offset: usize|
-         -> Vec<PenaltyMatrix> {
-            pens.iter()
-                .map(|p| pull_back_penalty_through_t(p, anchor_offset, t))
-                .collect()
-        };
+    let pull_set = |pens: &[crate::terms::smooth::BlockwisePenalty],
+                    anchor_offset: usize|
+     -> Vec<PenaltyMatrix> {
+        pens.iter()
+            .map(|p| pull_back_penalty_through_t(p, anchor_offset, t))
+            .collect()
+    };
 
     Ok(CompiledSurvivalDesignsVMExact {
         time_design_entry: time_entry_out,
@@ -3698,13 +3691,11 @@ mod tests {
         // this is exactly the "pilot-curvature trap" the recompile-after-
         // accept hook is designed to surface.
         assert_ne!(
-            compiled_ident.drops_by_block,
-            compiled_q0.drops_by_block,
+            compiled_ident.drops_by_block, compiled_q0.drops_by_block,
             "structural-H and data-adaptive-H compiles must produce different \
              drops_by_block on the constructed pilot-curvature-trap design; \
              identity={:?} q0-only={:?}",
-            compiled_ident.drops_by_block,
-            compiled_q0.drops_by_block,
+            compiled_ident.drops_by_block, compiled_q0.drops_by_block,
         );
         // Under identity H, marg survives (no drop).
         assert_eq!(

@@ -4,7 +4,7 @@ use gam::smooth::{
     FittedTermCollectionWithSpec, ShapeConstraint, SmoothBasisSpec, SmoothTermSpec,
     SpatialLengthScaleOptimizationOptions, TermCollectionSpec,
 };
-use gam::types::{InverseLink, LikelihoodSpec, StandardLink, ResponseFamily};
+use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
 use ndarray::{Array1, Array2};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};

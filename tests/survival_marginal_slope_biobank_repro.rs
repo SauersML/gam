@@ -131,12 +131,18 @@ fn build_dataset() -> gam::inference::data::EncodedDataset {
         let pc2 = next_gauss(&mut state) * 0.5;
         let pc3 = next_gauss(&mut state) * 0.5;
         let prs = next_gauss(&mut state);
-        let sex = if next_unit(&mut state) < 0.5 { 1.0 } else { 0.0 };
+        let sex = if next_unit(&mut state) < 0.5 {
+            1.0
+        } else {
+            0.0
+        };
         let entry = 40.0 + 5.0 * next_unit(&mut state);
         let followup = 0.5 + 8.0 * next_unit(&mut state);
         let exit = entry + followup;
-        let score =
-            0.3 * prs + 0.4 * pc1 - 0.3 * pc2 + 0.2 * pc3 + 0.15 * sex + 0.2 * next_gauss(&mut state);
+        let score = 0.3 * prs + 0.4 * pc1 - 0.3 * pc2
+            + 0.2 * pc3
+            + 0.15 * sex
+            + 0.2 * next_gauss(&mut state);
         let event = if score > 0.0 { 1 } else { 0 };
         rows.push(StringRecord::from(vec![
             entry.to_string(),
@@ -167,10 +173,7 @@ fn survival_marginal_slope_biobank_repro_vm_exact_engages_and_converges() {
     // a parametric `sex` term and a `linkwiggle()` deviation block,
     // recreates the original biobank failure shape that overwhelmed the
     // V-only canonicalize path. centers=CENTERS keeps p_total small.
-    let duchon = format!(
-        "duchon(PC1, PC2, PC3, centers={}, order=1)",
-        CENTERS
-    );
+    let duchon = format!("duchon(PC1, PC2, PC3, centers={}, order=1)", CENTERS);
     let formula = format!(
         "Surv(entry_age, exit_age, event) ~ {} + sex + linkwiggle()",
         duchon

@@ -41,13 +41,7 @@ fn nonuniform_knots() -> Vec<f64> {
 }
 
 fn alpha_shapes() -> Vec<Vec<u8>> {
-    vec![
-        vec![0, 0],
-        vec![1, 0],
-        vec![0, 1],
-        vec![2, 1],
-        vec![3, 3],
-    ]
+    vec![vec![0, 0], vec![1, 0], vec![0, 1], vec![2, 1], vec![3, 3]]
 }
 
 struct Workload {
@@ -113,14 +107,12 @@ fn parity_gate(w: &Workload) -> Option<&'static CubicMomentBackend> {
     let dev = match build_hex_tensor_moments_device(&w.spec, &axes_for_build, &w.cells) {
         Ok(d) => d,
         Err(err) => {
-            eprintln!(
-                "[cubic_hex_tensor_gpu_parity] no CUDA runtime — skipping ({err})"
-            );
+            eprintln!("[cubic_hex_tensor_gpu_parity] no CUDA runtime — skipping ({err})");
             return None;
         }
     };
-    let backend = CubicMomentBackend::probe()
-        .expect("backend probe must succeed once a build returned Ok");
+    let backend =
+        CubicMomentBackend::probe().expect("backend probe must succeed once a build returned Ok");
     let host_vals = backend
         .download_alpha_major(&dev)
         .expect("download_alpha_major after successful build");

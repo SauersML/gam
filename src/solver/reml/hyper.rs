@@ -678,7 +678,8 @@ impl<'a> RemlState<'a> {
                         if component.penalty_index >= k_count {
                             crate::bail_invalid_estim!(
                                 "penalty_index {} out of bounds for rho dimension {}",
-                                component.penalty_index, k_count
+                                component.penalty_index,
+                                k_count
                             );
                         }
                         component
@@ -717,7 +718,8 @@ impl<'a> RemlState<'a> {
                         if component.penalty_index >= k_count {
                             crate::bail_invalid_estim!(
                                 "penalty_index {} out of bounds for rho dimension {}",
-                                component.penalty_index, k_count
+                                component.penalty_index,
+                                k_count
                             );
                         }
                         component

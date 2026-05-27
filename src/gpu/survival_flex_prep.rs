@@ -40,7 +40,9 @@
 //! plumbing, and DtoH re-pack stay device-shaped so the eventual general
 //! body lands behind the same call boundary.
 
-use crate::families::cubic_cell_kernel::{DenestedCubicCell, DenestedPartitionCell, LocalSpanCubic};
+use crate::families::cubic_cell_kernel::{
+    DenestedCubicCell, DenestedPartitionCell, LocalSpanCubic,
+};
 use crate::gpu::error::GpuError;
 use crate::gpu_err;
 
@@ -267,9 +269,9 @@ pub fn try_device_cell_primary_fixed_partials(
     // zero-span (no-runtime) baseline, because the trivial kernel doesn't
     // carry the knot tables needed for a non-trivial basis traversal.
     let trivial_spans = rows.iter().all(|row| {
-        row.cells.iter().all(|cell| {
-            span_is_zero(cell.score_span) && span_is_zero(cell.link_span)
-        })
+        row.cells
+            .iter()
+            .all(|cell| span_is_zero(cell.score_span) && span_is_zero(cell.link_span))
     });
     if !trivial_spans {
         return Ok(None);
@@ -354,9 +356,7 @@ pub fn trivial_partition_cell(a: f64, b: f64, scale: f64) -> DenestedPartitionCe
 #[cfg(target_os = "linux")]
 mod device_dispatch {
     use super::kernel_src::DENESTED_PARTITION_CELLS_KERNEL_SRC;
-    use super::{
-        trivial_partition_cell, PartitionCellsOutput, PartitionCellsRowInputs,
-    };
+    use super::{PartitionCellsOutput, PartitionCellsRowInputs, trivial_partition_cell};
     use crate::gpu::common::PtxModuleCache;
     use crate::gpu::error::{GpuError, GpuResultExt};
     use crate::gpu::solver::context_and_stream;
@@ -372,12 +372,10 @@ mod device_dispatch {
         scale: f64,
     ) -> Result<Option<PartitionCellsOutput>, GpuError> {
         let n = rows.len();
-        let n_u32 = u32::try_from(n).map_err(|_| {
-            crate::gpu_err!("partition_cells_baseline: n_rows={n} exceeds u32")
-        })?;
-        let n_i32 = i32::try_from(n).map_err(|_| {
-            crate::gpu_err!("partition_cells_baseline: n_rows={n} exceeds i32")
-        })?;
+        let n_u32 = u32::try_from(n)
+            .map_err(|_| crate::gpu_err!("partition_cells_baseline: n_rows={n} exceeds u32"))?;
+        let n_i32 = i32::try_from(n)
+            .map_err(|_| crate::gpu_err!("partition_cells_baseline: n_rows={n} exceeds i32"))?;
         let (ctx, stream) = match context_and_stream() {
             Ok(pair) => pair,
             Err(_) => return Ok(None),
@@ -492,9 +490,8 @@ mod device_dispatch {
                 "cell_primary_fixed_partials_baseline: n_cells={n_cells_total} exceeds u32"
             )
         })?;
-        let (ctx, stream) = context_and_stream().map_err(|reason| {
-            crate::gpu::error::GpuError::DriverCallFailed { reason }
-        })?;
+        let (ctx, stream) = context_and_stream()
+            .map_err(|reason| crate::gpu::error::GpuError::DriverCallFailed { reason })?;
         let module = FP_PTX_CACHE.get_or_compile(
             &ctx,
             "survival_flex_prep::cell_primary_fixed_partials",

@@ -1,3 +1,4 @@
+use crate::cache::Fingerprinter;
 use crate::faer_ndarray::FaerEigh;
 use crate::faer_ndarray::{FaerCholesky, fast_atb, fast_av};
 use crate::linalg::utils::StableSolver;
@@ -26,7 +27,6 @@ use crate::solver::estimate::reml::unified::{
 use crate::solver::estimate::{
     EstimationError, FitGeometry, ensure_finite_scalar_estimation, validate_all_finite_estimation,
 };
-use crate::cache::Fingerprinter;
 use crate::solver::persistent_warm_start::{
     PersistentBlockInnerSummary, PersistentBlockWarmStartRecord, load_block_record,
     store_block_record,
@@ -12576,8 +12576,14 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         );
     }
     let penalty_started = std::time::Instant::now();
-    let mut current_penalty =
-        total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy, joint_bundle, Some(specs));
+    let mut current_penalty = total_quadratic_penalty(
+        &states,
+        &s_lambdas,
+        ridge,
+        options.ridge_policy,
+        joint_bundle,
+        Some(specs),
+    );
     if prelude_log {
         log::info!(
             "[STAGE] PIRLS/inner step=total_quadratic_penalty elapsed={:.3}s penalty={:.6e} (prelude_total={:.3}s)",
@@ -13480,8 +13486,14 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     states[b].beta.assign(&projected);
                 }
                 refresh_all_block_etas(family, specs, &mut states)?;
-                let trial_penalty =
-                    total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy, joint_bundle, Some(specs));
+                let trial_penalty = total_quadratic_penalty(
+                    &states,
+                    &s_lambdas,
+                    ridge,
+                    options.ridge_policy,
+                    joint_bundle,
+                    Some(specs),
+                );
                 // Cheap-LL line-search path: rejected backtracking attempts
                 // discard the exact-Newton workspace they build, so by default
                 // we evaluate just the scalar full-data log-likelihood for the
@@ -13896,8 +13908,14 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             cached_joint_gradient = gradient;
             cached_eval = eval;
             cached_joint_workspace = workspace;
-            current_penalty =
-                total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy, joint_bundle, Some(specs));
+            current_penalty = total_quadratic_penalty(
+                &states,
+                &s_lambdas,
+                ridge,
+                options.ridge_policy,
+                joint_bundle,
+                Some(specs),
+            );
             lastobjective = -current_log_likelihood + current_penalty;
             let accepted_step_inf = states
                 .iter()
@@ -14498,8 +14516,14 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
 
         // If joint Newton converged, skip the blockwise loop entirely.
         if converged {
-            let penalty_value =
-                total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy, joint_bundle, Some(specs));
+            let penalty_value = total_quadratic_penalty(
+                &states,
+                &s_lambdas,
+                ridge,
+                options.ridge_policy,
+                joint_bundle,
+                Some(specs),
+            );
             let (block_logdet_h, block_logdet_s) = blockwise_logdet_terms_with_workspace(
                 family,
                 specs,
@@ -14563,8 +14587,14 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             });
         }
         if cycles_done >= inner_max_cycles {
-            let penalty_value =
-                total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy, joint_bundle, Some(specs));
+            let penalty_value = total_quadratic_penalty(
+                &states,
+                &s_lambdas,
+                ridge,
+                options.ridge_policy,
+                joint_bundle,
+                Some(specs),
+            );
             let (block_logdet_h, block_logdet_s) = blockwise_logdet_terms_with_workspace(
                 family,
                 specs,
@@ -14687,8 +14717,14 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     last_math_summary,
                 );
             }
-            let penalty_value =
-                total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy, joint_bundle, Some(specs));
+            let penalty_value = total_quadratic_penalty(
+                &states,
+                &s_lambdas,
+                ridge,
+                options.ridge_policy,
+                joint_bundle,
+                Some(specs),
+            );
             let (block_logdet_h, block_logdet_s) = blockwise_logdet_terms_with_workspace(
                 family,
                 specs,
@@ -15190,7 +15226,14 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             refresh_all_block_etas(family, specs, &mut states)?;
         }
         cached_eval = family.evaluate(&states)?;
-        current_penalty = total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy, joint_bundle, Some(specs));
+        current_penalty = total_quadratic_penalty(
+            &states,
+            &s_lambdas,
+            ridge,
+            options.ridge_policy,
+            joint_bundle,
+            Some(specs),
+        );
         let objective = -cached_eval.log_likelihood + current_penalty;
         let objective_change = (objective - lastobjective).abs();
         lastobjective = objective;
@@ -15500,8 +15543,14 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         continue;
                     }
                 };
-                let trial_penalty =
-                    total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy, joint_bundle, Some(specs));
+                let trial_penalty = total_quadratic_penalty(
+                    &states,
+                    &s_lambdas,
+                    ridge,
+                    options.ridge_policy,
+                    joint_bundle,
+                    Some(specs),
+                );
                 let trial_obj = -trial_ll + trial_penalty;
                 if trial_obj.is_finite() && trial_obj <= old_obj + 1e-12 {
                     current_penalty = trial_penalty;
@@ -15522,7 +15571,14 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
     }
 
     // Reuse cached evaluation from the last cycle's end (or the initial eval if 0 cycles ran).
-    let penalty_value = total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy, joint_bundle, Some(specs));
+    let penalty_value = total_quadratic_penalty(
+        &states,
+        &s_lambdas,
+        ridge,
+        options.ridge_policy,
+        joint_bundle,
+        Some(specs),
+    );
 
     let (block_logdet_h, block_logdet_s) =
         blockwise_logdet_terms(family, specs, &mut states, block_log_lambdas, options)?;
@@ -16641,15 +16697,25 @@ fn joint_penalty_subspace_trace_parts(
         let h_col = match h_joint_unpen {
             JointHessianSource::Dense(h_joint) => {
                 let mut out = fast_av(h_joint, &basis);
-                let penalty =
-                    apply_joint_block_penalty(ranges, s_lambdas, &basis, hessian_diagonal_ridge, None);
+                let penalty = apply_joint_block_penalty(
+                    ranges,
+                    s_lambdas,
+                    &basis,
+                    hessian_diagonal_ridge,
+                    None,
+                );
                 out += &penalty;
                 out
             }
             JointHessianSource::Operator { apply, .. } => {
                 let mut out = apply(&basis)?;
-                let penalty =
-                    apply_joint_block_penalty(ranges, s_lambdas, &basis, hessian_diagonal_ridge, None);
+                let penalty = apply_joint_block_penalty(
+                    ranges,
+                    s_lambdas,
+                    &basis,
+                    hessian_diagonal_ridge,
+                    None,
+                );
                 out += &penalty;
                 out
             }
@@ -18449,23 +18515,29 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
     eval_mode: EvalMode,
 ) -> Result<OuterObjectiveEvalResult, CustomFamilyError> {
     if derivative_blocks.len() != specs.len() {
-        crate::bail_dim_custom!("joint hyper derivative block count mismatch: got {}, expected {}",
-                derivative_blocks.len(),
-                specs.len());
+        crate::bail_dim_custom!(
+            "joint hyper derivative block count mismatch: got {}, expected {}",
+            derivative_blocks.len(),
+            specs.len()
+        );
     }
 
     if penalty_counts.len() != specs.len() {
-        crate::bail_dim_custom!("joint hyper penalty-count block mismatch: got {}, expected {}",
-                penalty_counts.len(),
-                specs.len());
+        crate::bail_dim_custom!(
+            "joint hyper penalty-count block mismatch: got {}, expected {}",
+            penalty_counts.len(),
+            specs.len()
+        );
     }
     let rho_dim = penalty_counts.iter().sum::<usize>();
     let psi_dim = derivative_blocks.iter().map(Vec::len).sum::<usize>();
     if rho_current.len() != rho_dim {
-        crate::bail_dim_custom!("joint hyper rho dimension mismatch: got {}, expected {} (psi={})",
-                rho_current.len(),
-                rho_dim,
-                psi_dim);
+        crate::bail_dim_custom!(
+            "joint hyper rho dimension mismatch: got {}, expected {} (psi={})",
+            rho_current.len(),
+            rho_dim,
+            psi_dim
+        );
     }
 
     // ── Common setup: inner solve, ridge, refresh, ranges ──
@@ -19090,11 +19162,13 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
             hessian,
         } => {
             if hessian.nrows() != p || hessian.ncols() != p {
-                crate::bail_dim_custom!("block {b} exact-newton Hessian shape mismatch in outer gradient: got {}x{}, expected {}x{}",
-                        hessian.nrows(),
-                        hessian.ncols(),
-                        p,
-                        p);
+                crate::bail_dim_custom!(
+                    "block {b} exact-newton Hessian shape mismatch in outer gradient: got {}x{}, expected {}x{}",
+                    hessian.nrows(),
+                    hessian.ncols(),
+                    p,
+                    p
+                );
             }
             hessian.to_dense()
         }
@@ -19517,14 +19591,18 @@ fn evaluate_custom_family_joint_hyper_efs_internal_shared<
     CustomFamilyError,
 > {
     if derivative_blocks.len() != specs.len() {
-        crate::bail_dim_custom!("joint hyper derivative block count mismatch: got {}, expected {}",
-                derivative_blocks.len(),
-                specs.len());
+        crate::bail_dim_custom!(
+            "joint hyper derivative block count mismatch: got {}, expected {}",
+            derivative_blocks.len(),
+            specs.len()
+        );
     }
     if penalty_counts.len() != specs.len() {
-        crate::bail_dim_custom!("joint hyper penalty-count block mismatch: got {}, expected {}",
-                penalty_counts.len(),
-                specs.len());
+        crate::bail_dim_custom!(
+            "joint hyper penalty-count block mismatch: got {}, expected {}",
+            penalty_counts.len(),
+            specs.len()
+        );
     }
 
     let rho_dim = penalty_counts.iter().sum::<usize>();
@@ -19536,10 +19614,12 @@ fn evaluate_custom_family_joint_hyper_efs_internal_shared<
         });
     }
     if rho_current.len() != rho_dim {
-        crate::bail_dim_custom!("joint hyper rho dimension mismatch: got {}, expected {} (psi={})",
-                rho_current.len(),
-                rho_dim,
-                psi_dim);
+        crate::bail_dim_custom!(
+            "joint hyper rho dimension mismatch: got {}, expected {} (psi={})",
+            rho_current.len(),
+            rho_dim,
+            psi_dim
+        );
     }
 
     let include_logdet_h = include_exact_newton_logdet_h(family, options);
@@ -19861,9 +19941,11 @@ pub fn evaluate_custom_family_joint_hyper_efs<F: CustomFamily + Clone + Send + S
 ) -> Result<CustomFamilyJointHyperEfsResult, CustomFamilyError> {
     let penalty_counts = validate_blockspecs(specs)?;
     if derivative_blocks.len() != specs.len() {
-        crate::bail_dim_custom!("joint hyper derivative block count mismatch: got {}, expected {}",
-                derivative_blocks.len(),
-                specs.len());
+        crate::bail_dim_custom!(
+            "joint hyper derivative block count mismatch: got {}, expected {}",
+            derivative_blocks.len(),
+            specs.len()
+        );
     }
     let (efs_eval, warm_start, inner_converged) = if derivative_blocks.iter().all(Vec::is_empty) {
         outerobjectiveefs(
@@ -19906,9 +19988,11 @@ pub(crate) fn evaluate_custom_family_joint_hyper_efs_shared<
 ) -> Result<CustomFamilyJointHyperEfsResult, CustomFamilyError> {
     let penalty_counts = validate_blockspecs(specs)?;
     if derivative_blocks.len() != specs.len() {
-        crate::bail_dim_custom!("joint hyper derivative block count mismatch: got {}, expected {}",
-                derivative_blocks.len(),
-                specs.len());
+        crate::bail_dim_custom!(
+            "joint hyper derivative block count mismatch: got {}, expected {}",
+            derivative_blocks.len(),
+            specs.len()
+        );
     }
     let (efs_eval, warm_start, inner_converged) = if derivative_blocks.iter().all(Vec::is_empty) {
         outerobjectiveefs(
@@ -21216,8 +21300,14 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         }
         for ((a, b), pairs) in &by_pair {
             let count = pairs.len();
-            let max = pairs.iter().map(|p| p.overlap).fold(f64::NEG_INFINITY, f64::max);
-            let min = pairs.iter().map(|p| p.overlap).fold(f64::INFINITY, f64::min);
+            let max = pairs
+                .iter()
+                .map(|p| p.overlap)
+                .fold(f64::NEG_INFINITY, f64::max);
+            let min = pairs
+                .iter()
+                .map(|p| p.overlap)
+                .fold(f64::INFINITY, f64::min);
             let near_one = pairs.iter().filter(|p| p.overlap >= 0.9999).count();
             log::info!(
                 "[identifiability audit] alias-cluster {a} ~ {b}: {count} direction-pair{plural} \
@@ -21228,7 +21318,11 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         if log::log_enabled!(log::Level::Debug) {
             for ((a, b), pairs) in &by_pair {
                 let mut sorted = pairs.clone();
-                sorted.sort_by(|p, q| q.overlap.partial_cmp(&p.overlap).unwrap_or(std::cmp::Ordering::Equal));
+                sorted.sort_by(|p, q| {
+                    q.overlap
+                        .partial_cmp(&p.overlap)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
                 for pair in sorted.iter().take(3) {
                     log::debug!(
                         "[identifiability audit]   sample {a}[{ai}] ~ {b}[{bi}] overlap={ov:.4}",

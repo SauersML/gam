@@ -140,9 +140,7 @@ fn noise_model_for_likelihood(
         ResponseFamily::Beta { phi } => {
             let phi = *phi;
             if !(phi.is_finite() && phi > 0.0) {
-                crate::bail_invalid_estim!(
-                    "beta-regression phi must be finite and > 0; got {phi}"
-                );
+                crate::bail_invalid_estim!("beta-regression phi must be finite and > 0; got {phi}");
             }
             Ok(NoiseModel::Beta { phi })
         }
@@ -199,14 +197,10 @@ pub fn sampleobservations<R: rand::Rng + ?Sized>(
         }
         NoiseModel::Tweedie { p, phi } => {
             if !(p.is_finite() && *p >= 1.0 && *p <= 2.0) {
-                crate::bail_invalid_estim!(
-                    "invalid Tweedie power p: {p}"
-                );
+                crate::bail_invalid_estim!("invalid Tweedie power p: {p}");
             }
             if !(phi.is_finite() && *phi > 0.0) {
-                crate::bail_invalid_estim!(
-                    "invalid Tweedie dispersion phi: {phi}"
-                );
+                crate::bail_invalid_estim!("invalid Tweedie dispersion phi: {phi}");
             }
             let mut y = Array1::<f64>::zeros(spec.mean.len());
             if (*p - 1.0).abs() <= 1.0e-12 {
@@ -262,9 +256,7 @@ pub fn sampleobservations<R: rand::Rng + ?Sized>(
         }
         NoiseModel::NegativeBinomial { theta } => {
             if !(theta.is_finite() && *theta > 0.0) {
-                crate::bail_invalid_estim!(
-                    "invalid negative-binomial theta: {theta}"
-                );
+                crate::bail_invalid_estim!("invalid negative-binomial theta: {theta}");
             }
             let mut y = Array1::<f64>::zeros(spec.mean.len());
             for i in 0..y.len() {
@@ -288,9 +280,7 @@ pub fn sampleobservations<R: rand::Rng + ?Sized>(
         }
         NoiseModel::Beta { phi } => {
             if !(phi.is_finite() && *phi > 0.0) {
-                crate::bail_invalid_estim!(
-                    "invalid beta-regression phi: {phi}"
-                );
+                crate::bail_invalid_estim!("invalid beta-regression phi: {phi}");
             }
             let mut y = Array1::<f64>::zeros(spec.mean.len());
             for i in 0..y.len() {
@@ -308,9 +298,7 @@ pub fn sampleobservations<R: rand::Rng + ?Sized>(
         }
         NoiseModel::Gamma { shape } => {
             if !shape.is_finite() || *shape <= 0.0 {
-                crate::bail_invalid_estim!(
-                    "invalid Gamma shape: {shape}"
-                );
+                crate::bail_invalid_estim!("invalid Gamma shape: {shape}");
             }
             let mut y = Array1::<f64>::zeros(spec.mean.len());
             for i in 0..y.len() {
