@@ -319,7 +319,11 @@ pub fn compile_with_dual_metric(
         // structural anchor; eigendecompose the structural residual Gram
         // and keep only directions with non-zero structural mass → D
         // (raw-block selector).
-        let (residual_s, _m_s_opt) = residualise_in_metric(&anchor_s, w_s)?;
+        // Only the structural residual is consumed downstream; the
+        // structural-metric correction M^S is intentionally discarded —
+        // predict-time subtraction uses the curvature metric correction
+        // (`M^H_inner` below), not the structural one.
+        let (residual_s, _) = residualise_in_metric(&anchor_s, w_s)?;
         let g_s = fast_atb(&residual_s, &residual_s);
         let g_s_trace: f64 = (0..p_b).map(|i| g_s[[i, i]].max(0.0)).sum();
         let d = keep_positive_eigenspace(&g_s, n, k, g_s_trace)?;
