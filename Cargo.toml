@@ -188,6 +188,19 @@ harness = false
 lto = "thin"
 codegen-units = 1
 
+# Test profile — strip full DWARF and only keep line tables. With ~300
+# integration test targets under `tests/`, the default `debug = true` profile
+# emits ~150–500 MB of DWARF per linked test binary; on a vanilla ubuntu-latest
+# runner the link stage exhausts the ~30 GB the workflow frees after wiping
+# preinstalled toolchains, surfacing as `linking with cc failed: exit status:
+# 1` / `No space left on device`. `line-tables-only` keeps backtraces
+# resolvable to file:line and panic locations intact while cutting each test
+# binary by roughly 5–10×, which is what drives the disk back below the
+# ceiling and makes the link reliable rather than relying on whatever the
+# preinstalled-toolchain wipe yields on a given runner image.
+[profile.test]
+debug = "line-tables-only"
+
 # Iteration profile — drops `lto=thin` and uses 16 codegen units to cut
 # rebuild time from ~5 min to ~90 s while keeping `opt-level = 3`. Use via
 # `cargo build --profile release-dev --bin gam`. Runtime perf is typically
