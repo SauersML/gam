@@ -446,4 +446,131 @@ mod tests {
             Err(JointPenaltyError::NonFiniteInitialLogLambda { .. })
         ));
     }
+
+    /// 2-block toy with one full-width SPD joint penalty:
+    ///
+    /// Two scalar blocks (`p = 1 + 1 = 2`). The unpenalised "log-likelihood"
+    /// is a quadratic with optimum at `b`:
+    ///     ℓ(β) = −½ (β − b)ᵀ I (β − b)
+    /// so `−∇ℓ = (β − b)` and `−∇²ℓ = I`. We add ONE joint penalty
+    /// `S = [[2, 1], [1, 2]]` (SPD, full rank, cross-block coupling
+    /// off-diagonal). With `λ = exp(ρ)` the penalised objective is
+    ///     F(β) = ½ (β − b)ᵀ (β − b) + ½ λ βᵀ S β
+    /// whose minimiser solves `(I + λ S) β̂ = b`. We verify the bundle's
+    /// `add_to_matrix` builds the right LHS and the `add_apply_into` /
+    /// `quadratic` helpers agree with the analytic gradient / objective at
+    /// `β̂`.
+    #[test]
+    fn bundle_two_block_minimiser_matches_analytic_solution() {
+        use crate::faer_ndarray::FaerCholesky;
+        use ndarray::Array2;
+
+        let spec = JointPenaltySpec {
+            label: Some("toy_cross_block".to_string()),
+            matrix: array![[2.0_f64, 1.0], [1.0, 2.0]],
+            initial_log_lambda: 0.0,
+            nullspace_dim: 0,
+        };
+        let log_lambda = -0.4;
+        let lam = log_lambda.exp();
+        let bundle = JointPenaltyBundle::new(
+            std::sync::Arc::new(vec![spec]),
+            vec![log_lambda],
+            2,
+        )
+        .expect("valid bundle");
+
+        // Build LHS = I + λ S via add_to_matrix (the exact path the inner
+        // Newton uses to assemble the penalised joint Hessian).
+        let mut lhs = Array2::<f64>::eye(2);
+        bundle.add_to_matrix(&mut lhs);
+        // Verify add_to_matrix produced I + λ S.
+        let expected_lhs = array![[1.0 + lam * 2.0, lam], [lam, 1.0 + lam * 2.0]];
+        for r in 0..2 {
+            for c in 0..2 {
+                assert!(
+                    (lhs[[r, c]] - expected_lhs[[r, c]]).abs() < 1e-12,
+                    "lhs[{r}, {c}] = {} expected {}",
+                    lhs[[r, c]],
+                    expected_lhs[[r, c]]
+                );
+            }
+        }
+
+        // Solve (I + λ S) β̂ = b for b = [1.0, -0.5].
+        let b: Array1<f64> = array![1.0, -0.5];
+        let chol = lhs.cholesky(faer::Side::Lower).expect("SPD");
+        let mut rhs_mat = Array2::<f64>::zeros((2, 1));
+        rhs_mat[[0, 0]] = b[0];
+        rhs_mat[[1, 0]] = b[1];
+        let beta_mat = chol.solve(&rhs_mat);
+        let beta_hat: Array1<f64> = array![beta_mat[[0, 0]], beta_mat[[1, 0]]];
+
+        // Gradient at β̂: (β̂ − b) + λ S β̂ should be ~0.
+        let mut grad = &beta_hat - &b;
+        bundle.add_apply_into(beta_hat.view(), &mut grad);
+        let grad_inf = grad.iter().map(|v: &f64| v.abs()).fold(0.0_f64, f64::max);
+        assert!(
+            grad_inf < 1e-12,
+            "penalised gradient at analytic minimiser must vanish: {grad_inf:.3e}"
+        );
+
+        // Objective ½(β̂−b)·(β̂−b) + bundle.quadratic(β̂) reproduces the
+        // closed-form minimum value F(β̂) = ½(β̂−b)ᵀ(β̂−b) + ½λ β̂ᵀ S β̂.
+        let resid = &beta_hat - &b;
+        let unpen = 0.5 * resid.dot(&resid);
+        let pen = bundle.quadratic(beta_hat.view());
+        let expected_obj = 0.5 * resid.dot(&resid)
+            + 0.5 * lam * beta_hat.dot(&array![[2.0, 1.0], [1.0, 2.0]].dot(&beta_hat));
+        assert!(
+            (unpen + pen - expected_obj).abs() < 1e-12,
+            "objective sum {} mismatched expected {}",
+            unpen + pen,
+            expected_obj
+        );
+
+        // Preconditioner diag accumulator: diag(I) + λ diag(S) = [1+2λ, 1+2λ].
+        let mut diag = ndarray::Array1::<f64>::from_elem(2, 1.0);
+        bundle.add_diag(&mut diag);
+        assert!((diag[0] - (1.0 + lam * 2.0)).abs() < 1e-12);
+        assert!((diag[1] - (1.0 + lam * 2.0)).abs() < 1e-12);
+
+        // rho-objective-gradient: ½ λ β̂ᵀ S β̂.
+        let mut rho_grad = vec![0.0_f64];
+        bundle.rho_objective_gradient(beta_hat.view(), &mut rho_grad);
+        let expected_rho_grad =
+            0.5 * lam * beta_hat.dot(&array![[2.0, 1.0], [1.0, 2.0]].dot(&beta_hat));
+        assert!(
+            (rho_grad[0] - expected_rho_grad).abs() < 1e-12,
+            "rho-grad {} expected {}",
+            rho_grad[0],
+            expected_rho_grad
+        );
+    }
+
+    #[test]
+    fn bundle_rejects_dim_mismatch() {
+        let spec = JointPenaltySpec {
+            label: None,
+            matrix: Array2::<f64>::eye(3),
+            initial_log_lambda: 0.0,
+            nullspace_dim: 0,
+        };
+        let err = JointPenaltyBundle::new(std::sync::Arc::new(vec![spec]), vec![0.0], 4)
+            .expect_err("dim mismatch must reject");
+        assert!(err.contains("total_compiled"));
+    }
+
+    #[test]
+    fn bundle_rejects_lambda_count_mismatch() {
+        let spec = JointPenaltySpec {
+            label: None,
+            matrix: Array2::<f64>::eye(2),
+            initial_log_lambda: 0.0,
+            nullspace_dim: 0,
+        };
+        let err = JointPenaltyBundle::new(std::sync::Arc::new(vec![spec]), vec![], 2)
+            .expect_err("count mismatch must reject");
+        assert!(err.contains("specs vs"));
+    }
 }
