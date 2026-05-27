@@ -44,7 +44,7 @@ use gam::inference::formula_dsl::{
 };
 use gam::inference::model::{
     ColumnKindTag, DataSchema, FittedFamily, FittedModel as SavedModel, FittedModelPayload,
-    MODEL_PAYLOAD_VERSION, ModelKind, PredictModelClass, SavedAnchoredDeviationRuntime,
+    MODEL_PAYLOAD_VERSION, ModelKind, PredictModelClass, SavedCompiledFlexBlock,
     SavedLatentZNormalization, load_survival_time_basis_config_from_model,
 };
 use gam::inference::predict_input::build_predict_input_for_model;
@@ -7346,7 +7346,7 @@ fn build_location_scale_saved_model(
     SavedModel::from_payload(payload)
 }
 
-fn saved_anchored_deviation_runtime(runtime: &DeviationRuntime) -> SavedAnchoredDeviationRuntime {
+fn saved_anchored_deviation_runtime(runtime: &DeviationRuntime) -> SavedCompiledFlexBlock {
     use gam::families::bernoulli_marginal_slope::deviation_runtime::{
         AnchorNullSpaceComponent, AnchorNullSpaceEvaluator,
     };
@@ -7415,7 +7415,7 @@ fn saved_anchored_deviation_runtime(runtime: &DeviationRuntime) -> SavedAnchored
             }
         }
     }
-    SavedAnchoredDeviationRuntime {
+    SavedCompiledFlexBlock {
         kernel: exact_kernel::ANCHORED_DEVIATION_KERNEL.to_string(),
         breakpoints: runtime.breakpoints().to_vec(),
         basis_dim: runtime.basis_dim(),
@@ -9983,7 +9983,7 @@ mod tests {
     };
     use gam::inference::formula_dsl::{ParsedTerm, parse_linkwiggle_formulaspec};
     use gam::inference::model::{
-        ColumnKindTag, FittedModelPayload, SavedAnchoredDeviationRuntime,
+        ColumnKindTag, FittedModelPayload, SavedCompiledFlexBlock,
         SavedLatentZNormalization, SchemaColumn,
     };
     use gam::matrix::{DenseDesignMatrix, DenseDesignOperator, DesignMatrix, LinearOperator};
@@ -10147,7 +10147,7 @@ mod tests {
 
     mod saved_survival_marginal_slope_test_support {
         use super::super::exact_kernel;
-        use super::{Array1, SavedAnchoredDeviationRuntime};
+        use super::{Array1, SavedCompiledFlexBlock};
         use gam::families::marginal_slope_shared::{probit_frailty_scale, scale_coeff4};
         use gam::probability::normal_cdf;
 
@@ -10177,9 +10177,9 @@ mod tests {
             a: f64,
             b: f64,
             gaussian_frailty_sd: Option<f64>,
-            score_runtime: Option<&SavedAnchoredDeviationRuntime>,
+            score_runtime: Option<&SavedCompiledFlexBlock>,
             score_beta: Option<&Array1<f64>>,
-            link_runtime: Option<&SavedAnchoredDeviationRuntime>,
+            link_runtime: Option<&SavedCompiledFlexBlock>,
             link_beta: Option<&Array1<f64>>,
         ) -> Result<Vec<exact_kernel::DenestedPartitionCell>, String> {
             let score_breaks = if let Some(runtime) = score_runtime {
@@ -10229,9 +10229,9 @@ mod tests {
             q: f64,
             slope: f64,
             gaussian_frailty_sd: Option<f64>,
-            score_runtime: Option<&SavedAnchoredDeviationRuntime>,
+            score_runtime: Option<&SavedCompiledFlexBlock>,
             score_beta: Option<&Array1<f64>>,
-            link_runtime: Option<&SavedAnchoredDeviationRuntime>,
+            link_runtime: Option<&SavedCompiledFlexBlock>,
             link_beta: Option<&Array1<f64>>,
         ) -> Result<(f64, f64), String> {
             let cells = saved_survival_denested_partition_cells(
@@ -10274,9 +10274,9 @@ mod tests {
             q: f64,
             slope: f64,
             gaussian_frailty_sd: Option<f64>,
-            score_runtime: Option<&SavedAnchoredDeviationRuntime>,
+            score_runtime: Option<&SavedCompiledFlexBlock>,
             score_beta: Option<&Array1<f64>>,
-            link_runtime: Option<&SavedAnchoredDeviationRuntime>,
+            link_runtime: Option<&SavedCompiledFlexBlock>,
             link_beta: Option<&Array1<f64>>,
         ) -> Result<f64, String> {
             let eval = |a: f64| -> Result<(f64, f64, f64), String> {
@@ -10341,9 +10341,9 @@ mod tests {
             slope: &Array1<f64>,
             z: &Array1<f64>,
             gaussian_frailty_sd: Option<f64>,
-            score_runtime: Option<&SavedAnchoredDeviationRuntime>,
+            score_runtime: Option<&SavedCompiledFlexBlock>,
             score_beta: Option<&Array1<f64>>,
-            link_runtime: Option<&SavedAnchoredDeviationRuntime>,
+            link_runtime: Option<&SavedCompiledFlexBlock>,
             link_beta: Option<&Array1<f64>>,
         ) -> Result<SavedSurvivalMarginalSlopeEtaTransport, String> {
             let n = q_exit.len();
@@ -10426,9 +10426,9 @@ mod tests {
             slope: &Array1<f64>,
             z: &Array1<f64>,
             gaussian_frailty_sd: Option<f64>,
-            score_runtime: Option<&SavedAnchoredDeviationRuntime>,
+            score_runtime: Option<&SavedCompiledFlexBlock>,
             score_beta: Option<&Array1<f64>>,
-            link_runtime: Option<&SavedAnchoredDeviationRuntime>,
+            link_runtime: Option<&SavedCompiledFlexBlock>,
             link_beta: Option<&Array1<f64>>,
         ) -> Result<(Array1<f64>, Array1<f64>), String> {
             let transport = saved_survival_marginal_slope_eta_transport(
@@ -11090,7 +11090,7 @@ mod tests {
 
     #[test]
     fn saved_bernoulli_marginal_slope_replays_main_and_logslope_deviation_runtimes() {
-        let saved_runtime = || SavedAnchoredDeviationRuntime {
+        let saved_runtime = || SavedCompiledFlexBlock {
             kernel: exact_kernel::ANCHORED_DEVIATION_KERNEL.to_string(),
             breakpoints: vec![-1.0, 1.0],
             basis_dim: 1,
@@ -13799,7 +13799,7 @@ mod tests {
             },
             "survival",
         );
-        payload.score_warp_runtime = Some(SavedAnchoredDeviationRuntime {
+        payload.score_warp_runtime = Some(SavedCompiledFlexBlock {
             kernel: "BadKernel".to_string(),
             breakpoints: vec![-1.0, 1.0],
             basis_dim: 2,
@@ -13822,7 +13822,7 @@ mod tests {
 
     #[test]
     fn saved_survival_flex_exit_helper_with_zero_scorewarp_matches_rigid() {
-        let saved_runtime = SavedAnchoredDeviationRuntime {
+        let saved_runtime = SavedCompiledFlexBlock {
             kernel: gam::families::cubic_cell_kernel::ANCHORED_DEVIATION_KERNEL.to_string(),
             breakpoints: vec![-1.0, 1.0],
             basis_dim: 1,

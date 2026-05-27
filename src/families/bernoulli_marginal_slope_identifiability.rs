@@ -11,7 +11,7 @@
 //!
 //! Phase 4a delivery: trait impls + an input-builder. Phase 4b migrates the
 //! BMS fit driver onto the compiler; Phase 4c deletes the legacy
-//! `enforce_cross_block_identifiability_for_flex_block` path.
+//! `install_compiled_flex_block_into_runtime` path.
 
 use std::sync::Arc;
 

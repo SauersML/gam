@@ -11,11 +11,11 @@ use crate::custom_family::{
 use crate::estimate::UnifiedFitResult;
 use crate::faer_ndarray::{FaerCholesky, fast_ab, fast_atv, fast_av, fast_xt_diag_x};
 use crate::families::bernoulli_marginal_slope::{
-    CrossBlockIdentifiabilityOutcome, CrossBlockIdentifiabilityWarning,
+    FlexCompileOutcome, CrossBlockIdentifiabilityWarning,
     DeviationBlockConfig, DeviationRuntime, LatentZNormalization, LatentZPolicy,
     MarginalSlopeCovariance, ParametricAnchorBlock,
     build_link_deviation_block_from_knots_design_seed_and_weights,
-    build_score_warp_deviation_block_from_seed, enforce_cross_block_identifiability_for_flex_block,
+    build_score_warp_deviation_block_from_seed, install_compiled_flex_block_into_runtime,
     marginal_slope_covariance_from_scores, marginal_slope_preserving_scale,
     marginal_slope_probit_eta, padded_deviation_seed, project_monotone_feasible_beta,
     push_deviation_aux_blockspecs, signed_probit_neglog_derivatives_up_to_fourth,
@@ -3198,7 +3198,7 @@ fn survival_pilot_irls_row_metric_at_eta(
 /// is intentionally β-independent so the resulting W metric depends only on
 /// data + spec offsets and the cross-block orthogonalisation remains a one-
 /// shot construction-time step. Used to weight the W-metric inner product
-/// in `enforce_cross_block_identifiability_for_flex_block` (both flex paths).
+/// in `install_compiled_flex_block_into_runtime` (both flex paths).
 fn survival_rigid_pilot_eta(
     n: usize,
     z_primary: &Array1<f64>,
@@ -18528,7 +18528,7 @@ pub fn fit_survival_marginal_slope_terms(
             (&location_anchor_design, ParametricAnchorBlock::Marginal),
             (&logslope_design.design, ParametricAnchorBlock::Logslope),
         ];
-        let outcome = enforce_cross_block_identifiability_for_flex_block(
+        let outcome = install_compiled_flex_block_into_runtime(
             &mut base,
             &z_primary,
             cfg,
@@ -18537,10 +18537,10 @@ pub fn fit_survival_marginal_slope_terms(
             &cross_block_pilot_w,
         )?;
         match outcome {
-            CrossBlockIdentifiabilityOutcome::Reparameterised => Some(
+            FlexCompileOutcome::Reparameterised => Some(
                 stripe_score_warp_across_z_coords(base.block, base.runtime, &spec.z)?,
             ),
-            CrossBlockIdentifiabilityOutcome::FullyAliased { reason } => {
+            FlexCompileOutcome::FullyAliased { reason } => {
                 log::warn!(
                     "[survival-marginal-slope cross-block identifiability] score-warp block fully aliased \
                      by marginal+logslope anchors; dropping the block. {reason}"
@@ -18611,7 +18611,7 @@ pub fn fit_survival_marginal_slope_terms(
         ];
         let flex_anchor_slot: Option<&Array2<f64>> = score_warp_anchor_design.as_ref();
         let flex_anchors: Vec<&Array2<f64>> = flex_anchor_slot.into_iter().collect();
-        let outcome = enforce_cross_block_identifiability_for_flex_block(
+        let outcome = install_compiled_flex_block_into_runtime(
             &mut prepared,
             &q0_seed,
             cfg,
@@ -18620,8 +18620,8 @@ pub fn fit_survival_marginal_slope_terms(
             &cross_block_pilot_w,
         )?;
         match outcome {
-            CrossBlockIdentifiabilityOutcome::Reparameterised => Some(prepared),
-            CrossBlockIdentifiabilityOutcome::FullyAliased { reason } => {
+            FlexCompileOutcome::Reparameterised => Some(prepared),
+            FlexCompileOutcome::FullyAliased { reason } => {
                 log::warn!(
                     "[survival-marginal-slope cross-block identifiability] link-deviation block fully aliased \
                      by marginal+logslope anchors; dropping the block. {reason}"

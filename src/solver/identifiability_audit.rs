@@ -4,7 +4,7 @@
 //
 // # Where the existing dedupe lives
 //
-// `crate::families::bernoulli_marginal_slope::enforce_cross_block_identifiability_for_flex_block`
+// `crate::families::bernoulli_marginal_slope::install_compiled_flex_block_into_runtime`
 // (`src/families/bernoulli_marginal_slope.rs:1641-1951`) is the only
 // cross-block identifiability path in the tree today. It runs at BMS
 // construction sites (`src/families/bernoulli_marginal_slope.rs:17045`,
@@ -108,7 +108,7 @@
 //
 // Stage 3 wires this into the entry points listed in
 // `src/solver/workflow.rs`. Stage 4 collapses
-// `enforce_cross_block_identifiability_for_flex_block` into a thin
+// `install_compiled_flex_block_into_runtime` into a thin
 // wrapper that builds the spec list (with the BMS-specific W-metric
 // PIRLS row weights), delegates to `audit_identifiability`, then
 // installs the resulting reparameterisation back into

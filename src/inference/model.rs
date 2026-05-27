@@ -323,9 +323,9 @@ pub struct FittedModelPayload {
     #[serde(default)]
     pub logslope_baselines: Option<Vec<f64>>,
     #[serde(default)]
-    pub score_warp_runtime: Option<SavedAnchoredDeviationRuntime>,
+    pub score_warp_runtime: Option<SavedCompiledFlexBlock>,
     #[serde(default)]
-    pub link_deviation_runtime: Option<SavedAnchoredDeviationRuntime>,
+    pub link_deviation_runtime: Option<SavedCompiledFlexBlock>,
     #[serde(default)]
     pub survival_entry: Option<String>,
     #[serde(default)]
@@ -821,7 +821,7 @@ pub struct SavedBaselineTimeWiggleRuntime {
 pub use crate::families::bernoulli_marginal_slope::deviation_runtime::ParametricAnchorBlock;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SavedAnchoredDeviationRuntime {
+pub struct SavedCompiledFlexBlock {
     pub kernel: String,
     pub breakpoints: Vec<f64>,
     pub basis_dim: usize,
@@ -877,8 +877,8 @@ pub struct SavedPredictionRuntime {
     pub inverse_link: Option<InverseLink>,
     pub link_wiggle: Option<SavedLinkWiggleRuntime>,
     pub baseline_time_wiggle: Option<SavedBaselineTimeWiggleRuntime>,
-    pub score_warp: Option<SavedAnchoredDeviationRuntime>,
-    pub link_deviation: Option<SavedAnchoredDeviationRuntime>,
+    pub score_warp: Option<SavedCompiledFlexBlock>,
+    pub link_deviation: Option<SavedCompiledFlexBlock>,
     /// Rank-INT latent-z calibration carried into the predictor build.
     /// `None` for non-BMS models and for BMS fits whose latent measure
     /// did not require rank-INT calibration.
@@ -1073,8 +1073,8 @@ fn validate_survival_location_scale_saved_fit(
 
 fn validate_marginal_slope_saved_fit(
     fit: &UnifiedFitResult,
-    score_warp: Option<&SavedAnchoredDeviationRuntime>,
-    link_deviation: Option<&SavedAnchoredDeviationRuntime>,
+    score_warp: Option<&SavedCompiledFlexBlock>,
+    link_deviation: Option<&SavedCompiledFlexBlock>,
     fit_label: &str,
 ) -> Result<(), FittedModelError> {
     validate_marginal_slope_saved_fit_impl(
@@ -1090,8 +1090,8 @@ fn validate_marginal_slope_saved_fit(
 
 fn validate_survival_marginal_slope_saved_fit(
     fit: &UnifiedFitResult,
-    score_warp: Option<&SavedAnchoredDeviationRuntime>,
-    link_deviation: Option<&SavedAnchoredDeviationRuntime>,
+    score_warp: Option<&SavedCompiledFlexBlock>,
+    link_deviation: Option<&SavedCompiledFlexBlock>,
     fit_label: &str,
 ) -> Result<(), FittedModelError> {
     validate_marginal_slope_saved_fit_impl(
@@ -1114,8 +1114,8 @@ fn validate_survival_marginal_slope_saved_fit(
 /// / link-deviation tail follows the same shape in both families.
 fn validate_marginal_slope_saved_fit_impl(
     fit: &UnifiedFitResult,
-    score_warp: Option<&SavedAnchoredDeviationRuntime>,
-    link_deviation: Option<&SavedAnchoredDeviationRuntime>,
+    score_warp: Option<&SavedCompiledFlexBlock>,
+    link_deviation: Option<&SavedCompiledFlexBlock>,
     fit_label: &str,
     family_kind: &str,
     base_block_count: usize,
@@ -1257,7 +1257,7 @@ impl SavedBaselineTimeWiggleRuntime {
     }
 }
 
-impl SavedAnchoredDeviationRuntime {
+impl SavedCompiledFlexBlock {
     pub(crate) fn validate_exact_replay_contract(&self) -> Result<(), FittedModelError> {
         if self.kernel.is_empty() {
             return Err(FittedModelError::SchemaMismatch {
@@ -3634,8 +3634,8 @@ mod tests {
         }
     }
 
-    fn anchored_runtime(basis_dim: usize) -> SavedAnchoredDeviationRuntime {
-        SavedAnchoredDeviationRuntime {
+    fn anchored_runtime(basis_dim: usize) -> SavedCompiledFlexBlock {
+        SavedCompiledFlexBlock {
             kernel: ANCHORED_DEVIATION_KERNEL.to_string(),
             breakpoints: vec![-1.0, 1.0],
             basis_dim,
