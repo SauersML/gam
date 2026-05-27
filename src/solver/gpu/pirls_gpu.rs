@@ -1872,20 +1872,24 @@ mod pcg_device_parity_tests {
             &primary,
             n,
         );
-        let x_oracle = cpu_dense_solve(&h_dense, &b);
+        let x_oracle = cpu_pcg_oracle(&h_dense, &b, 1e-12);
 
-        // Build a transient device-resident storage by directly uploading
-        // the dense per-row Hessian + designs (same path as the HVP parity
-        // test). Imports the backend probe to grab the default stream.
-        let backend = match crate::gpu::bms_flex_row::HvpKernelBackend_for_tests::probe() {
-            Ok(b) => b,
-            Err(err) => {
-                eprintln!("[pcg_device parity] backend probe failed: {err}");
+        // Grab the same CUDA context + default stream that the bms_flex_row
+        // kernels will use when `run_pcg_against_row_hessian_device` probes
+        // its own backend. Going through the public runtime APIs keeps the
+        // test independent of any private kernel-backend symbols.
+        let runtime = crate::gpu::runtime::GpuRuntime::global()
+            .expect("runtime must exist when probe succeeded above");
+        let ctx = match crate::gpu::runtime::cuda_context_for(
+            runtime.selected_device().ordinal,
+        ) {
+            Some(c) => c,
+            None => {
+                eprintln!("[pcg_device parity] cuda_context_for failed; skipping");
                 return;
             }
         };
-        let stream = backend.stream.clone();
-        let ctx = backend.ctx.clone();
+        let stream = ctx.default_stream();
         let d_h = match stream.clone_htod(&row_hessians) {
             Ok(s) => s,
             Err(err) => {
