@@ -563,7 +563,7 @@ impl DeviationRuntime {
     // exactly the surviving rank.
     /// Compose a rank-reveal right-selector and an optional anchor-residual.
     /// After this call, `design(x)` returns
-    ///   design_row(x) = span_eval(x) · V  −  n_row(x) · residual.residual_coefficients
+    ///   design_row(x) = span_eval(x) · V  −  n_row(x) · installed.anchor_correction
     /// where V is `right_selector` (applied via right-multiplication into
     /// `span_c{0..3}`). Only the `design()` path (derivative_order=0) subtracts
     /// the residual: the anchor argument is a different scalar variable than
@@ -704,16 +704,16 @@ impl DeviationRuntime {
 
     /// Evaluate `design(values) - anchor_rows · M` where `anchor_rows` is
     /// the n × d parametric-anchor matrix at the same rows as `values`.
-    /// Mandatory when `anchor_residual` is set; for runtimes without a
-    /// residual this is equivalent to `design(values)` and the
-    /// `anchor_rows` shape must be `n × 0`.
+    /// Mandatory when an installed flex block is present; for runtimes
+    /// without one this is equivalent to `design(values)` and `anchor_rows`
+    /// must be `n × 0`.
     pub fn design_with_anchor_rows(
         &self,
         values: &Array1<f64>,
         anchor_rows: ArrayView2<f64>,
     ) -> Result<Array2<f64>, String> {
         let mut out = self.evaluate_span_polynomial_design_raw(values, 0)?;
-        if let Some(residual) = &self.anchor_residual {
+        if let Some(installed) = &self.installed_flex_block {
             if anchor_rows.nrows() != values.len() {
                 return Err(DeviationRuntimeError::DimensionMismatch {
                     reason: format!(
@@ -724,24 +724,24 @@ impl DeviationRuntime {
                 }
                 .into());
             }
-            if anchor_rows.ncols() != residual.residual_coefficients.nrows() {
+            if anchor_rows.ncols() != installed.anchor_correction.nrows() {
                 return Err(DeviationRuntimeError::DimensionMismatch {
                     reason: format!(
                         "design_with_anchor_rows: anchor_rows has {} cols, expected {} (sum of component ncols)",
                         anchor_rows.ncols(),
-                        residual.residual_coefficients.nrows(),
+                        installed.anchor_correction.nrows(),
                     ),
                 }
                 .into());
             }
-            let subtract = anchor_rows.dot(&residual.residual_coefficients);
+            let subtract = anchor_rows.dot(&installed.anchor_correction);
             out = out - subtract;
         } else if anchor_rows.ncols() != 0 {
             // Permit empty 0-col anchor rows without complaint; otherwise
             // hard-error so callers don't silently pass mismatched rows.
             return Err(DeviationRuntimeError::DimensionMismatch {
                 reason: format!(
-                    "design_with_anchor_rows: runtime has no anchor residual but anchor_rows has {} cols",
+                    "design_with_anchor_rows: runtime has no installed flex block but anchor_rows has {} cols",
                     anchor_rows.ncols(),
                 ),
             }
@@ -751,16 +751,16 @@ impl DeviationRuntime {
     }
 
     /// Rebuild the training-row design after orthogonalisation, using
-    /// `anchor_rows_at_training` set via `set_anchor_rows_at_training`.
+    /// `anchor_rows_at_training` cached at `install_compiled_flex_block` time.
     pub(crate) fn design_at_training_with_residual(
         &self,
         values: &Array1<f64>,
     ) -> Result<Array2<f64>, String> {
         if let Some(rows) = self.anchor_rows_at_training.as_ref() {
             self.design_with_anchor_rows(values, rows.view())
-        } else if self.anchor_residual.is_some() {
+        } else if self.installed_flex_block.is_some() {
             Err(
-                "design_at_training_with_residual: runtime has anchor_residual but no cached training anchor rows"
+                "design_at_training_with_residual: runtime has installed_flex_block but no cached training anchor rows"
                     .to_string(),
             )
         } else {
@@ -886,8 +886,8 @@ impl DeviationRuntime {
     /// argument, so its derivatives are identically zero.
     pub fn design(&self, values: &Array1<f64>) -> Result<Array2<f64>, String> {
         assert!(
-            self.anchor_residual.is_none(),
-            "DeviationRuntime::design called on a runtime with an anchor residual; \
+            self.installed_flex_block.is_none(),
+            "DeviationRuntime::design called on a runtime with an installed flex block; \
              use design_with_anchor_rows or design_at_training_with_residual instead"
         );
         self.evaluate_span_polynomial_design_raw(values, 0)
