@@ -87,6 +87,37 @@ pub fn try_primary_state_gram_cuda(
     }
 }
 
+/// Try the fused NVRTC primary-state Gram kernel. Returns `None` on any
+/// failure (no runtime, NVRTC compile failure, launch error, malformed
+/// inputs) so the caller can fall back. The default
+/// [`try_primary_state_gram_cuda`] entry point already attempts this path
+/// first and transparently falls back to the cuBLAS DDGMM+DGEMM kernel;
+/// this entry point is exported so parity tests can pin behavior to the
+/// fused path alone.
+pub fn try_primary_state_gram_fused_cuda(
+    channel_blocks: &[Vec<Option<Array2<f64>>>],
+    h_packed: &Array2<f64>,
+    raw_block_ranges: &[Range<usize>],
+) -> Option<GramBundle> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        if channel_blocks.is_empty()
+            || h_packed.is_empty()
+            || raw_block_ranges.is_empty()
+            || channel_blocks.len() != raw_block_ranges.len()
+        {
+            return None;
+        }
+        None
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let workspace =
+            GpuIdentifiabilityCompileWorkspace::try_new(channel_blocks, raw_block_ranges)?;
+        workspace.inner.compute_grams_fused(h_packed)
+    }
+}
+
 /// Device-resident workspace that caches uploaded channel-block designs
 /// across multiple Gram builds for the same `(channel_blocks,
 /// raw_block_ranges)` topology. Only the per-row packed Hessian `H` is
