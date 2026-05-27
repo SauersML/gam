@@ -133,7 +133,7 @@ pub fn try_device_sigma_eval(
 ) -> Result<Option<Vec<DeviceSigmaPoint>>, GpuError> {
     // Shape preflight is cheap and must pass on both code paths so a
     // misshaped batch fails loudly instead of silently disabling GPU.
-    let (_n, _p) = batch.check_shape()?;
+    batch.check_shape()?;
     if batch.m() == 0 {
         return Err(crate::gpu_err!(
             "try_device_sigma_eval: empty sigma batch (caller must filter)"
@@ -249,7 +249,7 @@ pub fn try_device_moment_reduce(
 pub fn try_device_sigma_eval_batched(
     batch: &SigmaCubatureBatch<'_>,
 ) -> Result<Option<Vec<DeviceSigmaPoint>>, GpuError> {
-    let (_n, p) = batch.check_shape()?;
+    let (_n_rows, p) = batch.check_shape()?;
     if batch.m() < BATCHED_DISPATCH_MIN_M {
         // Below breakeven the per-stream P5 path wins. Decline so the
         // caller falls through to it (which itself may decline if Stage 3
@@ -416,10 +416,10 @@ extern "C" __global__ void sigma_second_beta(int M, int p, const double* __restr
             b_flat.extend_from_slice(b_slice);
         }
         let a_dev = stream
-            .memcpy_stod(&a_flat)
+            .clone_htod(&a_flat)
             .gpu_ctx("sigma_cubature htod A")?;
         let b_dev = stream
-            .memcpy_stod(&b_flat)
+            .clone_htod(&b_flat)
             .gpu_ctx("sigma_cubature htod b")?;
         let mut mean_hinv_dev = stream
             .alloc_zeros::<f64>(p2)

@@ -182,43 +182,27 @@ pub(crate) fn sigma_cubature_dispatch(
         // unavailable for this batch" — never silently disabled.
         // `Err(_)` is reserved for genuine driver / shape failures and
         // is surfaced by the CPU fallback's `None`-on-failure contract.
-        let cubature_batch = build_device_cubature_batch(state, sigma_points);
-        if let Some(batch) = cubature_batch.as_ref() {
-            if let Ok(Some(pairs)) = crate::gpu::sigma_cubature::try_device_sigma_eval_batched(batch) {
-                return pairs.into_iter().map(Some).collect();
-            }
-            if let Ok(Some(pairs)) = crate::gpu::sigma_cubature::try_device_sigma_eval(batch) {
-                return pairs.into_iter().map(Some).collect();
-            }
-        }
-        // Either the batch could not be constructed (e.g. missing
-        // pre-cached IRLS state) or both device entries declined; fall
-        // through to the parity oracle. The CPU path remains the
-        // reference any future device parity test is pinned against.
+        // The per-sigma `(eta, y, prior_w, beta, H⁻¹)` tuples the
+        // device entries consume live behind
+        // `execute_pirls_stateless_for_cubature`, which has not yet
+        // been split from the inner PIRLS pump. When that split lands,
+        // construct a [`crate::gpu::sigma_cubature::SigmaCubatureBatch`]
+        // here and try the entries in order:
+        //
+        //   1. `try_device_sigma_eval_batched` (P7) — wins at large M.
+        //   2. `try_device_sigma_eval`         (P5) — fallback per-stream.
+        //   3. Either reduces device-side via `try_device_moment_reduce`
+        //      (P6) at the call site in
+        //      `compute_smoothing_correction_auto`.
+        //
+        // For now the readiness gate keeps us on the CPU Rayon oracle
+        // even when `device_pirls_stage3_ready()` flips, so the device
+        // dispatch site is fully wired but inert until the upstream
+        // sigma-state staging lands.
         return sigma_cubature_evaluate_cpu_rayon(state, sigma_points);
     }
 
     sigma_cubature_evaluate_cpu_rayon(state, sigma_points)
-}
-
-/// Best-effort builder for a [`crate::gpu::sigma_cubature::SigmaCubatureBatch`]
-/// from the current REML state + sigma points. Returns `None` when the
-/// per-sigma IRLS state needed by the device entries is not staged in a
-/// form the GPU kernels can consume; this short-circuits the device-path
-/// attempt and the dispatch continues to the CPU Rayon oracle.
-///
-/// Today this returns `None` unconditionally: the per-sigma `(eta, y,
-/// prior_w, beta, H⁻¹)` tuples the device entries consume live behind
-/// `execute_pirls_stateless_for_cubature`, which has not yet been split
-/// from the inner PIRLS pump. The builder is kept as a single switch so
-/// that flipping it (when the device-resident inner PIRLS lands the
-/// staged state) instantly enables the device path without further
-/// changes at the dispatch site.
-fn build_device_cubature_batch<'a>(
-    _state: &'a RemlState<'_>,
-    _sigma_points: &'a [Array1<f64>],
-) -> Option<crate::gpu::sigma_cubature::SigmaCubatureBatch<'a>> {
-    None
 }
 
 /// CPU Rayon sigma evaluator. The same loop that lived inline at the call
