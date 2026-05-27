@@ -48,6 +48,7 @@
 use std::sync::OnceLock;
 
 use super::error::GpuError;
+use crate::gpu_err;
 
 #[cfg(target_os = "linux")]
 use std::sync::{Arc, Mutex};
