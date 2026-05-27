@@ -66,12 +66,12 @@ mod linux_cuda {
     pub(super) fn evidence_derivatives(input: RemlGpuInput<'_>) -> Result<RemlGpuEvidence, String> {
         let p = input.penalized_hessian.nrows();
         let d = input.derivative_hessians.len();
-        let (ctx, stream) = context_and_stream()?;
+        let (_, stream) = context_and_stream()?;
         let solver = DnHandle::new(stream.clone()).map_err(|e| format!("cusolver init: {e}"))?;
 
         // Upload H once and factor in-place.
         let h_col = to_col_major(&input.penalized_hessian);
-        let mut h_dev = pinned_htod(&ctx, &stream, &h_col)?;
+        let mut h_dev = pinned_htod(&stream, &h_col)?;
         potrf_in_place(&solver, &stream, p, &mut h_dev)?;
         let factor_col = stream
             .clone_dtoh(&h_dev)
@@ -98,7 +98,7 @@ mod linux_cuda {
             let col = to_col_major(derivative);
             rhs_col.extend_from_slice(&col);
         }
-        let mut rhs_dev = pinned_htod(&ctx, &stream, &rhs_col)?;
+        let mut rhs_dev = pinned_htod(&stream, &rhs_col)?;
         potrs_in_place(&solver, &stream, p, total_cols, &h_dev, &mut rhs_dev)?;
         let solved_col = stream
             .clone_dtoh(&rhs_dev)

@@ -19,13 +19,13 @@
 //! corresponding [`super::CubicCellMomentStatus`] code, exactly like the host
 //! substrate.
 
+#[cfg(target_os = "linux")]
 use crate::gpu::cubic_cell::host_substrate::HostMomentBatch;
 #[cfg(target_os = "linux")]
 use crate::gpu::cubic_cell::{
-    CubicCellDerivativeMomentOutput, CubicCellMomentStatus, GpuCellBranchTag,
-    branch::classify_cell_for_gpu,
+    CubicCellDerivativeMomentHostView, CubicCellDerivativeMomentOutput, CubicCellMomentStatus,
+    GpuCellBranchTag, branch::classify_cell_for_gpu,
 };
-use crate::gpu::cubic_cell::CubicCellDerivativeMomentHostView;
 use crate::gpu::error::GpuError;
 
 
@@ -52,13 +52,6 @@ pub(crate) fn try_device_moments(
         Err(other) => return Err(other),
     };
     backend.dispatch(view).map(Some)
-}
-
-#[cfg(not(target_os = "linux"))]
-pub(crate) fn try_device_moments(
-    _view: &CubicCellDerivativeMomentHostView<'_>,
-) -> Result<Option<HostMomentBatch>, GpuError> {
-    Ok(None)
 }
 
 /// Linux-only: launch the same Stage-1 dispatcher but return the moments
