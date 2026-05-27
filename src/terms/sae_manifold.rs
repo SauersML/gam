@@ -32,7 +32,8 @@ use std::sync::Arc;
 use crate::solver::arrow_schur::{ArrowRowBlock, ArrowSchurError, ArrowSchurSystem};
 use crate::terms::analytic_penalties::{
     ARDPenalty, AnalyticPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry,
-    IBPAssignmentPenalty, PenaltyTier, PsiSlice, SoftmaxAssignmentSparsityPenalty,
+    IBPAssignmentPenalty, MechanismSparsityPenalty, PenaltyTier, PsiSlice,
+    SoftmaxAssignmentSparsityPenalty,
 };
 use crate::terms::latent_coord::{LatentCoordValues, LatentIdMode, LatentManifold};
 

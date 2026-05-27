@@ -501,35 +501,48 @@ def _build_analytic_penalties_payload(
     *,
     isometry_weight: float,
     ard_per_atom: bool,
-    mechanism_sparsity_groups: list[list[int]] | None,
+    decoder_feature_sparsity_groups: list[list[int]] | None,
     block_orthogonality_weight: float,
     d_max: int,
     p_out: int,
+    k_atoms: int,
 ) -> str | None:
     """Translate the SAE regularizer knobs into the analytic-penalty JSON
     payload consumed by ``sae_manifold_fit_auto``.
 
-    ``ard_per_atom`` and ``block_orthogonality_weight`` route through the
-    row-block driver in ``src/terms/sae_manifold.rs``. ``isometry_weight``
-    and ``mechanism_sparsity_groups`` are deferred — Isometry needs a
-    pullback-metric provider hook on ``SaeManifoldAtom`` and
-    MechanismSparsity needs a stride-aware target view onto SAE's per-atom
-    decoder beta. Activating either raises ``NotImplementedError``.
+    ``ard_per_atom``, ``block_orthogonality_weight`` and
+    ``decoder_feature_sparsity_groups`` all route through
+    ``src/terms/sae_manifold.rs``. The first two target the row-block
+    driver ("t" latent block); ``decoder_feature_sparsity_groups`` targets
+    the decoder coefficient block ("beta" latent block, shape
+    ``(M, p_out)`` for ``k_atoms == 1``) and group-lassoes ``p_out``
+    features in rows of the per-basis-function decoder matrix.
+    ``isometry_weight`` is still deferred — Isometry needs a pullback-metric
+    provider hook on ``SaeManifoldAtom``.
     """
     unsupported: list[str] = []
     if isometry_weight is not None and float(isometry_weight) > 0.0:
         unsupported.append("isometry_weight")
-    if mechanism_sparsity_groups is not None:
-        unsupported.append("mechanism_sparsity_groups")
+    if decoder_feature_sparsity_groups is not None and int(k_atoms) != 1:
+        # The "beta" latent block in `sae_manifold_fit_inner` (FFI) only
+        # exists for k_atoms == 1, because `flatten_beta` concatenates
+        # per-atom (M_k, p_out) blocks with possibly distinct M_k and no
+        # single (latent_dim, p_features) reshape covers all of them.
+        raise NotImplementedError(
+            "sae_manifold_fit: decoder_feature_sparsity_groups is currently "
+            f"only supported for k_atoms == 1; got k_atoms={int(k_atoms)}. "
+            "Multi-atom decoder group-lasso requires a stride-aware "
+            "per-atom target view in `src/terms/sae_manifold.rs`."
+        )
     if unsupported:
         names = ", ".join(unsupported)
         raise NotImplementedError(
             f"sae_manifold_fit: {names} cannot be applied yet — the Rust "
-            "SAE row-block driver needs pullback-metric / stride-aware "
-            "target-layout work in `src/terms/sae_manifold.rs`. Pass only "
-            "`ard_per_atom` and/or `block_orthogonality_weight` for now."
+            "SAE row-block driver needs pullback-metric work in "
+            "`src/terms/sae_manifold.rs`. Pass only `ard_per_atom`, "
+            "`block_orthogonality_weight`, and/or "
+            "`decoder_feature_sparsity_groups` for now."
         )
-    del p_out
     items: list[dict[str, Any]] = []
     if bool(ard_per_atom):
         items.append({"kind": "ard", "target": "t"})
@@ -553,6 +566,38 @@ def _build_analytic_penalties_payload(
             "target": "t",
             "groups": groups,
             "weight": float(block_orthogonality_weight),
+        })
+    if decoder_feature_sparsity_groups is not None:
+        # Validate group payload eagerly so the error surfaces in Python
+        # with the user-facing kwarg name rather than as a Rust descriptor
+        # error referring to "feature_groups".
+        groups = [list(int(f) for f in g) for g in decoder_feature_sparsity_groups]
+        if not groups or any(len(g) == 0 for g in groups):
+            raise ValueError(
+                "decoder_feature_sparsity_groups must be a non-empty list of "
+                "non-empty index lists; got "
+                f"{decoder_feature_sparsity_groups!r}"
+            )
+        flat = [int(f) for g in groups for f in g]
+        if any(f < 0 or f >= int(p_out) for f in flat):
+            raise ValueError(
+                "decoder_feature_sparsity_groups indices must be in "
+                f"[0, p_out={int(p_out)}); got {decoder_feature_sparsity_groups!r}"
+            )
+        if len(set(flat)) != len(flat):
+            raise ValueError(
+                "decoder_feature_sparsity_groups must form a disjoint "
+                f"partition of feature indices; got {decoder_feature_sparsity_groups!r}"
+            )
+        if sorted(flat) != list(range(int(p_out))):
+            raise ValueError(
+                "decoder_feature_sparsity_groups must cover every feature "
+                f"index in [0, p_out={int(p_out)}); got {decoder_feature_sparsity_groups!r}"
+            )
+        items.append({
+            "kind": "mechanism_sparsity",
+            "target": "beta",
+            "feature_groups": groups,
         })
     if not items:
         return None
