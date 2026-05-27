@@ -49,6 +49,7 @@ use crate::solver::identifiability_audit::{IdentifiabilityAudit, audit_identifia
 /// `p_i`-column design via `CoefficientTransformOperator`. Penalties
 /// are pulled back as `T_iᵀ S_k T_i`. `per_block_transform[i]` is the
 /// raw-to-reduced selection matrix `T_i` of shape `(p_i_raw, r_i)`.
+#[derive(Debug)]
 pub struct CanonicalSpecs {
     pub reduced_specs: Vec<ParameterBlockSpec>,
     pub per_block_transform: Vec<Array2<f64>>,

@@ -1111,13 +1111,14 @@ pub fn maybe_install_auto_outer_subsample(
     let n_full = mask.n_full;
     let k = mask.len();
     log::info!(
-        "[{family_label} auto-subsample] phase=1 eval={}/{} n={} K={} fraction={:.3} expected_grad_noise={:.2}%",
+        "[{family_label} auto-subsample] phase=1 eval={}/{} n={} K={} fraction={:.3} expected_grad_noise={:.2}% work_per_k_unit={}",
         phase_idx + 1,
         phase1_budget,
         n_full,
         k,
         k as f64 / n_full.max(1) as f64,
-        100.0 * (1.0 / (k as f64).sqrt()) * (1.0 - k as f64 / n_full.max(1) as f64).sqrt()
+        100.0 * (1.0 / (k as f64).sqrt()) * (1.0 - k as f64 / n_full.max(1) as f64).sqrt(),
+        outer_work_per_k_unit,
     );
     let mut cloned = options.clone();
     cloned.outer_score_subsample = Some(Arc::new(mask));

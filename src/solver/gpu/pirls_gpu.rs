@@ -1241,8 +1241,10 @@ extern "C" __global__ void linf_norm(
         let mut builder = stream.launch_builder(func);
         builder.arg(src);
         builder.arg(&len_i);
-        builder.arg(scalar_dev);
-        // SAFETY: kernel signature (const double*, int, double*).
+        builder.arg(&mut *scalar_dev);
+        // SAFETY: kernel signature (const double*, int, double*). The
+        // `&mut *scalar_dev` reborrow keeps `scalar_dev` available for the
+        // download below.
         unsafe { builder.launch(cfg) }
             .map_err(|e| format!("{label} reduce launch: {e}"))?;
         let host = stream
