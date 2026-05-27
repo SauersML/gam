@@ -1322,9 +1322,9 @@ fn probit_logp_and_grad_into(
 #[inline]
 fn cloglog_bernoulli_logp_and_residual(eta: f64, y: f64) -> Result<(f64, f64), EstimationError> {
     if !(eta.is_finite() && (-700.0..=700.0).contains(&eta)) {
-        crate::bail_invalid_estim!(format!(
+        crate::bail_invalid_estim!(
             "cloglog eta must be finite and within [-700, 700]; got {eta}"
-        ));
+        );
     }
     let exp_eta = eta.exp();
     let log_mu = if exp_eta <= std::f64::consts::LN_2 {

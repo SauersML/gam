@@ -3068,14 +3068,14 @@ fn constrained_warm_start_from_cached_beta(
 ) -> Result<ConstrainedWarmStart, EstimationError> {
     let expected = specs.iter().map(|spec| spec.design.ncols()).sum::<usize>();
     if beta.len() != expected {
-        crate::bail_invalid_estim!(format!(
+        crate::bail_invalid_estim!(
             "cached inner beta has length {}, but custom-family blocks require length {}",
             beta.len(),
             expected
-        ));
+        );
     }
     if beta.iter().any(|value| !value.is_finite()) {
-        crate::bail_invalid_estim!("cached inner beta contains non-finite entries".to_string(),);
+        crate::bail_invalid_estim!("cached inner beta contains non-finite entries");
     }
 
     let mut offset = 0usize;
@@ -6498,14 +6498,14 @@ impl CustomFamilyWarmStart {
     ) -> Result<Self, EstimationError> {
         let expected: usize = block_col_counts.iter().copied().sum();
         if beta.len() != expected {
-            crate::bail_invalid_estim!(format!(
+            crate::bail_invalid_estim!(
                 "cached inner beta has length {}, but spatial-joint blocks require length {}",
                 beta.len(),
                 expected
-            ));
+            );
         }
         if beta.iter().any(|value| !value.is_finite()) {
-            crate::bail_invalid_estim!("cached inner beta contains non-finite entries".to_string(),);
+            crate::bail_invalid_estim!("cached inner beta contains non-finite entries");
         }
         let mut offset = 0usize;
         let mut block_beta = Vec::with_capacity(block_col_counts.len());

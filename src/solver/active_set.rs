@@ -122,14 +122,14 @@ fn solve_dense_system_via_pseudoinverse(
     out: &mut Array1<f64>,
 ) -> Result<(), EstimationError> {
     if matrix.nrows() != matrix.ncols() || rhs.len() != matrix.nrows() {
-        crate::bail_invalid_estim!("dense pseudoinverse solve dimension mismatch".to_string(),);
+        crate::bail_invalid_estim!("dense pseudoinverse solve dimension mismatch");
     }
 
     let (u_opt, singular, vt_opt) = matrix.svd(true, true).map_err(|_| {
         EstimationError::InvalidInput("dense pseudoinverse solve SVD failed".to_string())
     })?;
     let (Some(u), Some(vt)) = (u_opt, vt_opt) else {
-        crate::bail_invalid_estim!("dense pseudoinverse solve missing singular vectors".to_string(),);
+        crate::bail_invalid_estim!("dense pseudoinverse solve missing singular vectors");
     };
 
     let max_singular = singular.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
@@ -148,7 +148,7 @@ fn solve_dense_system_via_pseudoinverse(
     }
     let solution = vt.t().dot(&coeff);
     if !array_is_finite(&solution) {
-        crate::bail_invalid_estim!("dense pseudoinverse solve produced non-finite values".to_string(),);
+        crate::bail_invalid_estim!("dense pseudoinverse solve produced non-finite values");
     }
     if out.len() != solution.len() {
         *out = Array1::zeros(solution.len());
@@ -395,16 +395,16 @@ pub(crate) fn solve_kkt_direction(
     let p = hessian.nrows();
     let m = active_a.nrows();
     if hessian.ncols() != p || gradient.len() != p || active_a.ncols() != p {
-        crate::bail_invalid_estim!("KKT solve dimension mismatch".to_string(),);
+        crate::bail_invalid_estim!("KKT solve dimension mismatch");
     }
     if let Some(residual) = active_residual
         && residual.len() != m
     {
-        crate::bail_invalid_estim!(format!(
+        crate::bail_invalid_estim!(
             "KKT active residual length mismatch: got {}, expected {}",
             residual.len(),
             m
-        ));
+        );
     }
     if m == 0 {
         let mut d = Array1::<f64>::zeros(p);
@@ -482,7 +482,7 @@ pub(crate) fn compress_active_working_set(
 ) -> Result<CompressedActiveWorkingSet, EstimationError> {
     let p = constraints.a.ncols();
     if x.len() != p {
-        crate::bail_invalid_estim!("active working-set compression dimension mismatch".to_string(),);
+        crate::bail_invalid_estim!("active working-set compression dimension mismatch");
     }
 
     let mut a_out = Array2::<f64>::zeros((active.len(), p));
@@ -490,11 +490,11 @@ pub(crate) fn compress_active_working_set(
     let mut groups_out: Vec<Vec<usize>> = Vec::with_capacity(active.len());
     for (pos, &idx) in active.iter().enumerate() {
         if idx >= constraints.a.nrows() {
-            crate::bail_invalid_estim!(format!(
+            crate::bail_invalid_estim!(
                 "active working-set index {} out of bounds for {} constraints",
                 idx,
                 constraints.a.nrows()
-            ));
+            );
         }
         a_out.row_mut(pos).assign(&constraints.a.row(idx));
         b_out[pos] = constraints.b[idx];
@@ -699,14 +699,14 @@ pub(crate) fn working_set_kkt_diagnostics_from_multipliers(
 ) -> Result<ConstraintKktDiagnostics, EstimationError> {
     let p = working_constraints.a.ncols();
     if x.len() != p || gradient.len() != p {
-        crate::bail_invalid_estim!("working-set KKT diagnostic dimension mismatch".to_string(),);
+        crate::bail_invalid_estim!("working-set KKT diagnostic dimension mismatch");
     }
     if lambda_active_true.len() != working_constraints.a.nrows() {
-        crate::bail_invalid_estim!(format!(
+        crate::bail_invalid_estim!(
             "working-set KKT multiplier length mismatch: got {}, expected {}",
             lambda_active_true.len(),
             working_constraints.a.nrows()
-        ));
+        );
     }
     let m = working_constraints.a.nrows();
     let mut slack = Array1::<f64>::zeros(m);
@@ -769,7 +769,7 @@ fn fallback_projected_gradient_direction(
 ) -> Result<Option<(Array1<f64>, Vec<usize>)>, EstimationError> {
     let p = gradient.len();
     if x.len() != p || d_total.len() != p || constraints.a.ncols() != p {
-        crate::bail_invalid_estim!("projected-gradient fallback dimension mismatch".to_string(),);
+        crate::bail_invalid_estim!("projected-gradient fallback dimension mismatch");
     }
 
     let tangent_direction = if working_constraints.a.nrows() == 0 {
@@ -872,13 +872,13 @@ fn solve_newton_direction_with_linear_constraints_impl(
     }
     let m = constraints.a.nrows();
     if constraints.a.ncols() != p || constraints.b.len() != m || beta.len() != p {
-        crate::bail_invalid_estim!(format!(
+        crate::bail_invalid_estim!(
             "linear constraint shape mismatch: A={}x{}, b={}, p={}",
             constraints.a.nrows(),
             constraints.a.ncols(),
             constraints.b.len(),
             p
-        ));
+        );
     }
 
     let tol_active = 1e-10;
@@ -1141,7 +1141,7 @@ pub(crate) fn solve_quadratic_with_linear_constraints(
         || beta_start.len() != hessian.nrows()
         || constraints.a.ncols() != hessian.nrows()
     {
-        crate::bail_invalid_estim!("constrained quadratic solve: system dimension mismatch".to_string(),);
+        crate::bail_invalid_estim!("constrained quadratic solve: system dimension mismatch");
     }
     let gradient = hessian.dot(beta_start) - rhs;
     let mut delta = Array1::<f64>::zeros(beta_start.len());

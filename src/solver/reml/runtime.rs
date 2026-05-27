@@ -1959,9 +1959,9 @@ impl<'a> RemlState<'a> {
             .map(|i| {
                 let val = x_dense.row(i).dot(&z.column(i));
                 if !val.is_finite() {
-                    crate::bail_invalid_estim!(format!(
+                    crate::bail_invalid_estim!(
                         "{context} produced non-finite leverage at row {i}: {val}"
-                    ));
+                    );
                 }
                 Ok(val)
             })
@@ -2014,9 +2014,9 @@ impl<'a> RemlState<'a> {
 
         let value = q_term + t1_sum / 12.0 + t2_term;
         if !value.is_finite() {
-            crate::bail_invalid_estim!(format!(
+            crate::bail_invalid_estim!(
                 "Tierney-Kadane correction produced non-finite value: {value}"
-            ));
+            );
         }
         Ok(value)
     }
@@ -2118,18 +2118,18 @@ impl<'a> RemlState<'a> {
         let k = tk_penalties.len();
         let total_k = k + ext_drifts.len();
         if x_vks.len() != total_k {
-            crate::bail_invalid_estim!(format!(
+            crate::bail_invalid_estim!(
                 "Tierney-Kadane correction internal gradient arity mismatch: {} response modes for {} coordinates",
                 x_vks.len(),
                 total_k
-            ));
+            );
         }
         if beta_dirs.len() != total_k {
-            crate::bail_invalid_estim!(format!(
+            crate::bail_invalid_estim!(
                 "Tierney-Kadane correction internal beta-direction arity mismatch: {} beta directions for {} coordinates",
                 beta_dirs.len(),
                 total_k
-            ));
+            );
         }
         let x_y = crate::faer_ndarray::fast_av(x_dense, &shared.y);
 
@@ -2273,13 +2273,13 @@ impl<'a> RemlState<'a> {
             .map(|extra_idx| -> Result<(usize, f64), EstimationError> {
                 let drift = &ext_drifts[extra_idx];
                 if drift.raw_dim() != p_total.raw_dim() {
-                    crate::bail_invalid_estim!(format!(
+                    crate::bail_invalid_estim!(
                         "Tierney-Kadane ext penalty drift shape mismatch: expected {}x{}, got {}x{}",
                         p,
                         p,
                         drift.nrows(),
                         drift.ncols()
-                    ));
+                    );
                 }
                 let mut trace_ak_p = 0.0;
                 for row in 0..p {
@@ -2298,24 +2298,24 @@ impl<'a> RemlState<'a> {
                     .and_then(|value| value.as_ref())
                 {
                     if eta_fixed.len() != n {
-                        crate::bail_invalid_estim!(format!(
+                        crate::bail_invalid_estim!(
                             "Tierney-Kadane ext fixed eta length mismatch: expected {}, got {}",
                             n,
                             eta_fixed.len()
-                        ));
+                        );
                     }
                     eta_total += eta_fixed;
                 }
                 let x_fixed = ext_x_fixed.get(extra_idx).and_then(|value| value.as_ref());
                 if let Some(x_fixed) = x_fixed
                     && x_fixed.raw_dim() != x_dense.raw_dim() {
-                        crate::bail_invalid_estim!(format!(
+                        crate::bail_invalid_estim!(
                             "Tierney-Kadane ext fixed design shape mismatch: expected {}x{}, got {}x{}",
                             x_dense.nrows(),
                             x_dense.ncols(),
                             x_fixed.nrows(),
                             x_fixed.ncols()
-                        ));
+                        );
                     }
                 let mut local_gram = Array2::<f64>::zeros((TK_BLOCK_SIZE, TK_BLOCK_SIZE));
                 let direct = Self::tk_direct_gradient_from_cd_and_design(
@@ -2339,7 +2339,7 @@ impl<'a> RemlState<'a> {
 
         for g in gradient.iter_mut() {
             if !g.is_finite() {
-                crate::bail_invalid_estim!("Tierney-Kadane correction produced a non-finite gradient entry".to_string(),);
+                crate::bail_invalid_estim!("Tierney-Kadane correction produced a non-finite gradient entry");
             }
         }
         Ok(gradient)
@@ -2354,23 +2354,23 @@ impl<'a> RemlState<'a> {
             return Ok(0.0);
         };
         if beta_dir.len() != p_total.nrows() {
-            crate::bail_invalid_estim!(format!(
+            crate::bail_invalid_estim!(
                 "Tierney-Kadane Firth beta-direction length mismatch: expected {}, got {}",
                 p_total.nrows(),
                 beta_dir.len()
-            ));
+            );
         }
         let deta = crate::faer_ndarray::fast_av(&firth_op.x_dense, beta_dir);
         let dir = firth_op.direction_from_deta(deta);
         let hphi = firth_op.hphi_direction(&dir);
         if hphi.raw_dim() != p_total.raw_dim() {
-            crate::bail_invalid_estim!(format!(
+            crate::bail_invalid_estim!(
                 "Tierney-Kadane Firth Hessian derivative shape mismatch: expected {}x{}, got {}x{}",
                 p_total.nrows(),
                 p_total.ncols(),
                 hphi.nrows(),
                 hphi.ncols()
-            ));
+            );
         }
 
         let mut trace = 0.0;
@@ -2409,12 +2409,12 @@ impl<'a> RemlState<'a> {
     ) -> Result<f64, EstimationError> {
         let n = x_dense.nrows();
         if eta_total.len() != n || e_array.len() != n {
-            crate::bail_invalid_estim!(format!(
+            crate::bail_invalid_estim!(
                 "Tierney-Kadane direct derivative length mismatch: n={}, eta={}, e={}",
                 n,
                 eta_total.len(),
                 e_array.len()
-            ));
+            );
         }
 
         let mut c_prime = Array1::<f64>::zeros(n);
@@ -2529,9 +2529,9 @@ impl<'a> RemlState<'a> {
 
         let value = d_term_prime + c_term_prime + q_term_prime;
         if !value.is_finite() {
-            crate::bail_invalid_estim!(format!(
+            crate::bail_invalid_estim!(
                 "Tierney-Kadane direct c/d derivative produced non-finite value: {value}"
-            ));
+            );
         }
         Ok(value)
     }
@@ -2608,7 +2608,7 @@ impl<'a> RemlState<'a> {
             return Ok(Array2::zeros((0, 0)));
         }
         if c_array.len() != n || d_array.len() != n || e_array.len() != n || f_array.len() != n {
-            crate::bail_invalid_estim!("Tierney-Kadane Hessian derivative arrays have inconsistent lengths".to_string(),);
+            crate::bail_invalid_estim!("Tierney-Kadane Hessian derivative arrays have inconsistent lengths");
         }
 
         let mut k_mat = Array2::<f64>::zeros((p, p));
@@ -2837,7 +2837,7 @@ impl<'a> RemlState<'a> {
             }
         }
         if total.h.iter().any(|v| !v.is_finite()) {
-            crate::bail_invalid_estim!("Tierney-Kadane analytic Hessian produced a non-finite entry".to_string(),);
+            crate::bail_invalid_estim!("Tierney-Kadane analytic Hessian produced a non-finite entry");
         }
         Ok(total.h)
     }
@@ -2907,20 +2907,20 @@ impl<'a> RemlState<'a> {
         for coord in ext_coords {
             let drift = coord.drift.materialize();
             if drift.ncols() != beta.len() || drift.nrows() != beta.len() {
-                crate::bail_invalid_estim!(format!(
+                crate::bail_invalid_estim!(
                     "Tierney-Kadane ext drift shape mismatch: expected {}x{}, got {}x{}",
                     beta.len(),
                     beta.len(),
                     drift.nrows(),
                     drift.ncols()
-                ));
+                );
             }
             if coord.g.len() != beta.len() {
-                crate::bail_invalid_estim!(format!(
+                crate::bail_invalid_estim!(
                     "Tierney-Kadane ext mode RHS length mismatch: expected {}, got {}",
                     beta.len(),
                     coord.g.len()
-                ));
+                );
             }
             let beta_theta = h_inv_solve(&coord.g)?;
             x_vks.push(crate::faer_ndarray::fast_av(x_dense, &beta_theta));
@@ -2995,16 +2995,16 @@ impl<'a> RemlState<'a> {
         let pirls_result = bundle.pirls_result.as_ref();
         let (c_array, d_array, e_array, f_array) = self.hessian_cdef_arrays(pirls_result)?;
         if let Some(idx) = c_array.iter().position(|v| !v.is_finite()) {
-            crate::bail_invalid_estim!(format!(
+            crate::bail_invalid_estim!(
                 "Tierney-Kadane correction received non-finite c derivative at row {idx}: {}",
                 c_array[idx]
-            ));
+            );
         }
         if let Some(idx) = d_array.iter().position(|v| !v.is_finite()) {
-            crate::bail_invalid_estim!(format!(
+            crate::bail_invalid_estim!(
                 "Tierney-Kadane correction received non-finite d derivative at row {idx}: {}",
                 d_array[idx]
-            ));
+            );
         }
         let compute_gradient = compute_gradient_for_tk(mode);
         if c_array.is_empty() || d_array.is_empty() {
@@ -3031,9 +3031,9 @@ impl<'a> RemlState<'a> {
         let dense_work = n_x.saturating_mul(p_x);
         if n_x > TK_MAX_OBSERVATIONS || p_x > TK_MAX_COEFFICIENTS || dense_work > TK_MAX_DENSE_WORK
         {
-            crate::bail_invalid_estim!(format!(
+            crate::bail_invalid_estim!(
                 "Tierney-Kadane correction requires dense small-model calculus; refusing to silently disable it for n={n_x}, p={p_x}, n*p={dense_work}"
-            ));
+            );
         }
 
         if let Some(sparse) = bundle.sparse_exact.as_ref() {
@@ -3124,13 +3124,13 @@ impl<'a> RemlState<'a> {
             HFactor::Cholesky(chol)
         } else if let Ok((evals, evecs)) = h_tk_eval.eigh(Side::Lower) {
             if let Some((idx, ev)) = evals.iter().enumerate().find(|(_, ev)| **ev <= 1e-12) {
-                crate::bail_invalid_estim!(format!(
+                crate::bail_invalid_estim!(
                     "Tierney-Kadane correction requires a positive definite Hessian; eigenvalue {idx} is {ev}"
-                ));
+                );
             }
             HFactor::Eigh { evals, evecs }
         } else {
-            crate::bail_invalid_estim!("Tierney-Kadane correction could not factor the effective Hessian".to_string(),);
+            crate::bail_invalid_estim!("Tierney-Kadane correction could not factor the effective Hessian");
         };
 
         let z_mat = match &h_factor {
@@ -3238,9 +3238,9 @@ impl<'a> RemlState<'a> {
         }
         for (idx, coord) in ext_coords.iter().enumerate() {
             if coord.tk_eta_fixed.is_none() || coord.tk_x_fixed.is_none() {
-                crate::bail_invalid_estim!(format!(
+                crate::bail_invalid_estim!(
                     "Tierney-Kadane external gradient coordinate {idx} is missing analytic fixed-beta design/eta derivative carriers"
-                ));
+                );
             }
         }
         Ok(())
@@ -3271,11 +3271,11 @@ impl<'a> RemlState<'a> {
                 // which would yield a structurally inconsistent total
                 // gradient and is therefore rejected outright instead of
                 // silently zero-padding or truncating.
-                crate::bail_invalid_estim!(format!(
+                crate::bail_invalid_estim!(
                     "Tierney-Kadane gradient coordinate count mismatch: evaluator produced {} entries, analytic c/d propagation produced {}; this indicates the TK term and the unified evaluator were assembled against different coordinate sets",
                     grad.len(),
                     tk_grad.len()
-                ));
+                );
             }
         }
         Ok(result)
@@ -3823,21 +3823,21 @@ impl<'a> RemlState<'a> {
         let d2mu_deta2 = &pirls_result.solve_d2mu_deta2;
         let d3mu_deta3 = &pirls_result.solve_d3mu_deta3;
         if dmu_deta.len() != n || d2mu_deta2.len() != n || d3mu_deta3.len() != n {
-            crate::bail_invalid_estim!(format!(
+            crate::bail_invalid_estim!(
                 "Tierney-Kadane e_obs requires populated solve_*mu_deta arrays (n={}, dmu={}, d2mu={}, d3mu={}); ensure PIRLS rehydration ran",
                 n,
                 dmu_deta.len(),
                 d2mu_deta2.len(),
                 d3mu_deta3.len(),
-            ));
+            );
         }
         let mu = &pirls_result.solvemu;
         if mu.len() != n {
-            crate::bail_invalid_estim!(format!(
+            crate::bail_invalid_estim!(
                 "Tierney-Kadane e_obs requires solvemu populated (n={}, len={})",
                 n,
                 mu.len(),
-            ));
+            );
         }
         // Noncanonical / GammaLog observed-information path: each row's
         // e_i depends only on (eta[i], mu[i], priorweights[i], y[i], dmu/d2/d3
@@ -3905,7 +3905,7 @@ impl<'a> RemlState<'a> {
                 && matches!(spec.link, InverseLink::Standard(StandardLink::Logit))
         } && self.runtime_mixture_link_state.is_none();
         if !canonical_logit {
-            crate::bail_invalid_estim!("Tierney-Kadane outer Hessian is implemented for canonical Binomial Logit Firth fits only".to_string(),);
+            crate::bail_invalid_estim!("Tierney-Kadane outer Hessian is implemented for canonical Binomial Logit Firth fits only");
         }
         let mut f_array = Array1::<f64>::zeros(e_array.len());
         use rayon::prelude::*;
@@ -4288,11 +4288,11 @@ impl<'a> RemlState<'a> {
         let nullspace_dims = match nullspace_dims {
             Some(dims) => {
                 if dims.len() != expected_len {
-                    crate::bail_invalid_estim!(format!(
+                    crate::bail_invalid_estim!(
                         "nullspace_dims length {} does not match penalties {}",
                         dims.len(),
                         expected_len
-                    ));
+                    );
                 }
                 dims
             }
@@ -4373,11 +4373,11 @@ impl<'a> RemlState<'a> {
     {
         let expected_len = canonical_penalties.len();
         if nullspace_dims.len() != expected_len {
-            crate::bail_invalid_estim!(format!(
+            crate::bail_invalid_estim!(
                 "nullspace_dims length {} does not match penalties {}",
                 nullspace_dims.len(),
                 expected_len
-            ));
+            );
         }
 
         let balanced_penalty_root =
@@ -4830,19 +4830,19 @@ impl<'a> RemlState<'a> {
             return Ok((0.0, None));
         }
         if h_total.nrows() != p {
-            crate::bail_invalid_estim!(format!(
+            crate::bail_invalid_estim!(
                 "fixed_subspace_hessian_projected_parts: H must be square, got {}x{}",
                 h_total.nrows(),
                 p
-            ));
+            );
         }
         if penalty_subspace.evecs.nrows() != p || penalty_subspace.evecs.ncols() != p {
-            crate::bail_invalid_estim!(format!(
+            crate::bail_invalid_estim!(
                 "fixed_subspace_hessian_projected_parts: penalty eigenspace dim {}x{} does not match H dim {}",
                 penalty_subspace.evecs.nrows(),
                 penalty_subspace.evecs.ncols(),
                 p
-            ));
+            );
         }
 
         let r = penalty_subspace.rank;
@@ -4916,13 +4916,13 @@ impl<'a> RemlState<'a> {
             return Ok(0.0);
         }
         if s_direction.nrows() != p_dim || s_direction.ncols() != p_dim {
-            crate::bail_invalid_estim!(format!(
+            crate::bail_invalid_estim!(
                 "fixed_subspace_penalty_trace_from_subspace: S_direction must be {}x{}, got {}x{}",
                 p_dim,
                 p_dim,
                 s_direction.nrows(),
                 s_direction.ncols()
-            ));
+            );
         }
 
         // Exact pseudoinverse trace: tr(S⁺ S_direction) on the positive eigenspace.
@@ -6056,7 +6056,7 @@ impl<'a> RemlState<'a> {
             pirls_result.coordinate_frame,
             pirls::PirlsCoordinateFrame::OriginalSparseNative
         ) {
-            crate::bail_invalid_estim!("sparse exact geometry requires sparse-native PIRLS coordinates".to_string(),);
+            crate::bail_invalid_estim!("sparse exact geometry requires sparse-native PIRLS coordinates");
         }
         let ridge_passport = pirls_result.ridge_passport;
         let x_sparse = self.x().as_sparse().ok_or_else(|| {
@@ -8368,7 +8368,7 @@ impl<'a> RemlState<'a> {
             if matches!(hessian_mode, PseudoLogdetMode::Smooth) && c_nontrivial {
                 use super::unified::HessianOperator;
                 let Some(penalty_subspace) = penalty_subspace.as_ref() else {
-                    crate::bail_invalid_estim!("projected Hessian logdet requires penalty subspace".to_string(),);
+                    crate::bail_invalid_estim!("projected Hessian logdet requires penalty subspace");
                 };
                 let (log_det_h_proj, kernel) =
                     self.fixed_subspace_hessian_projected_parts(&h_for_operator, penalty_subspace)?;
@@ -8686,7 +8686,7 @@ impl<'a> RemlState<'a> {
             if matches!(hessian_mode, PseudoLogdetMode::Smooth) && c_nontrivial {
                 use super::unified::HessianOperator;
                 let Some(penalty_subspace) = penalty_subspace.as_ref() else {
-                    crate::bail_invalid_estim!("projected Hessian logdet requires penalty subspace".to_string(),);
+                    crate::bail_invalid_estim!("projected Hessian logdet requires penalty subspace");
                 };
                 let qs = &pirls_result.reparam_result.qs;
                 let h_transformed = crate::faer_ndarray::fast_ab(
@@ -9517,7 +9517,7 @@ impl<'a> RemlState<'a> {
             // refuses rather than silently running a partial rotation
             // that regresses SAS/mixture optimisation.
             if coord.drift.block_local.is_some() || coord.drift.operator.is_some() {
-                crate::bail_invalid_estim!(format!(
+                crate::bail_invalid_estim!(
                     "link-ext HyperCoord[{coord_idx}] carries a non-dense drift \
                      variant (block_local={} operator={}); the coord-frame rotation \
                      helper only handles `HyperCoordDrift::from_dense`.  Update the \
@@ -9525,7 +9525,7 @@ impl<'a> RemlState<'a> {
                      before attaching non-dense drifts to original-basis assemblies.",
                     coord.drift.block_local.is_some(),
                     coord.drift.operator.is_some(),
-                ));
+                );
             }
             if let Some(b) = coord.drift.dense.as_mut()
                 && b.nrows() == qs.nrows()

@@ -10535,7 +10535,7 @@ pub(crate) fn fit_survival_location_scale_terms(
         },
         |beta: &Array1<f64>| {
             if beta.iter().any(|v| !v.is_finite()) {
-                crate::bail_invalid_estim!("cached inner beta contains non-finite entries".to_string(),);
+                crate::bail_invalid_estim!("cached inner beta contains non-finite entries");
             }
             pending_beta_seed.replace(Some(beta.clone()));
             Ok(())

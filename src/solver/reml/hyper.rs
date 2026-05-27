@@ -439,7 +439,7 @@ impl<'a> RemlState<'a> {
     ) -> Result<(), EstimationError> {
         for component in components {
             if component.matrix.nrows() != p || component.matrix.ncols() != p {
-                crate::bail_invalid_estim!(format!(
+                crate::bail_invalid_estim!(
                     "{} shape mismatch for penalty {}: expected {}x{}, got {}x{}",
                     label,
                     component.penalty_index,
@@ -447,7 +447,7 @@ impl<'a> RemlState<'a> {
                     p,
                     component.matrix.nrows(),
                     component.matrix.ncols()
-                ));
+                );
             }
         }
         Ok(())
@@ -490,12 +490,12 @@ impl<'a> RemlState<'a> {
         match term {
             TauDesignTerm::Dense(dense) => {
                 if dense.ncols() != u.len() {
-                    crate::bail_invalid_estim!(format!(
+                    crate::bail_invalid_estim!(
                         "dense tau design forward_mul width mismatch: matrix={}x{}, vector={}",
                         dense.nrows(),
                         dense.ncols(),
                         u.len()
-                    ));
+                    );
                 }
                 Ok(dense.dot(u))
             }
@@ -523,12 +523,12 @@ impl<'a> RemlState<'a> {
         match term {
             TauDesignTerm::Dense(dense) => {
                 if dense.ncols() != u.len() {
-                    crate::bail_invalid_estim!(format!(
+                    crate::bail_invalid_estim!(
                         "dense tau design original forward_mul width mismatch: matrix={}x{}, vector={}",
                         dense.nrows(),
                         dense.ncols(),
                         u.len()
-                    ));
+                    );
                 }
                 Ok(dense.dot(u))
             }
@@ -545,12 +545,12 @@ impl<'a> RemlState<'a> {
         match term {
             TauDesignTerm::Dense(dense) => {
                 if dense.nrows() != v.len() {
-                    crate::bail_invalid_estim!(format!(
+                    crate::bail_invalid_estim!(
                         "dense tau design transpose_mul height mismatch: matrix={}x{}, vector={}",
                         dense.nrows(),
                         dense.ncols(),
                         v.len()
-                    ));
+                    );
                 }
                 Ok(crate::faer_ndarray::fast_atv(dense, v))
             }
@@ -583,12 +583,12 @@ impl<'a> RemlState<'a> {
         match term {
             TauDesignTerm::Dense(dense) => {
                 if dense.nrows() != v.len() {
-                    crate::bail_invalid_estim!(format!(
+                    crate::bail_invalid_estim!(
                         "dense tau design original transpose_mul height mismatch: matrix={}x{}, vector={}",
                         dense.nrows(),
                         dense.ncols(),
                         v.len()
-                    ));
+                    );
                 }
                 Ok(crate::faer_ndarray::fast_atv(dense, v))
             }
@@ -604,12 +604,12 @@ impl<'a> RemlState<'a> {
         match term {
             TauTauDesignTerm::Dense(dense) => {
                 if dense.ncols() != u.len() {
-                    crate::bail_invalid_estim!(format!(
+                    crate::bail_invalid_estim!(
                         "dense tau-tau design forward_mul width mismatch: matrix={}x{}, vector={}",
                         dense.nrows(),
                         dense.ncols(),
                         u.len()
-                    ));
+                    );
                 }
                 Ok(dense.dot(u))
             }
@@ -630,12 +630,12 @@ impl<'a> RemlState<'a> {
         match term {
             TauTauDesignTerm::Dense(dense) => {
                 if dense.nrows() != v.len() {
-                    crate::bail_invalid_estim!(format!(
+                    crate::bail_invalid_estim!(
                         "dense tau-tau design transpose_mul height mismatch: matrix={}x{}, vector={}",
                         dense.nrows(),
                         dense.ncols(),
                         v.len()
-                    ));
+                    );
                 }
                 Ok(crate::faer_ndarray::fast_atv(dense, v))
             }
@@ -676,10 +676,10 @@ impl<'a> RemlState<'a> {
                     Array2::<f64>::zeros((p_dim, p_dim)),
                     |mut acc, component| {
                         if component.penalty_index >= k_count {
-                            crate::bail_invalid_estim!(format!(
+                            crate::bail_invalid_estim!(
                                 "penalty_index {} out of bounds for rho dimension {}",
                                 component.penalty_index, k_count
-                            ));
+                            );
                         }
                         component
                             .matrix
@@ -715,10 +715,10 @@ impl<'a> RemlState<'a> {
                     Array2::<f64>::zeros((p_dim, p_dim)),
                     |mut acc, component| {
                         if component.penalty_index >= k_count {
-                            crate::bail_invalid_estim!(format!(
+                            crate::bail_invalid_estim!(
                                 "penalty_index {} out of bounds for rho dimension {}",
                                 component.penalty_index, k_count
-                            ));
+                            );
                         }
                         component
                             .matrix
@@ -1425,11 +1425,11 @@ impl<'a> RemlState<'a> {
                 Array2::<f64>::zeros((p_dim, p_dim)),
                 |mut acc, component| {
                     if component.penalty_index >= rho.len() {
-                        crate::bail_invalid_estim!(format!(
+                        crate::bail_invalid_estim!(
                             "penalty_index {} out of bounds for rho dimension {}",
                             component.penalty_index,
                             rho.len()
-                        ));
+                        );
                     }
                     component
                         .matrix
@@ -1856,14 +1856,14 @@ impl<'a> RemlState<'a> {
 
         for (j, dir) in hyper_dirs.iter().enumerate() {
             if dir.x_tau_original.nrows() != n_obs || dir.x_tau_original.ncols() != p_dim {
-                crate::bail_invalid_estim!(format!(
+                crate::bail_invalid_estim!(
                     "X_tau shape mismatch for sparse exact tau coord {}: expected {}x{}, got {}x{}",
                     j,
                     n_obs,
                     p_dim,
                     dir.x_tau_original.nrows(),
                     dir.x_tau_original.ncols()
-                ));
+                );
             }
             Self::validate_penalty_component_shapes(
                 dir.penalty_first_components(),
@@ -2056,7 +2056,7 @@ impl<'a> RemlState<'a> {
         hyper_dirs: &[DirectionalHyperParam],
     ) -> Result<Vec<super::unified::HyperCoord>, EstimationError> {
         if bundle.sparse_exact.is_none() {
-            crate::bail_invalid_estim!("missing sparse exact evaluation payload".to_string(),);
+            crate::bail_invalid_estim!("missing sparse exact evaluation payload");
         }
         self.build_tau_hyper_coords_original_basis(rho, bundle, hyper_dirs)
     }

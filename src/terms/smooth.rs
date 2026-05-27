@@ -432,14 +432,14 @@ impl SmoothTerm {
         };
         let p_local = rot.rotation.nrows();
         if x_new_raw.ncols() != p_local {
-            crate::bail_dim_basis!(format!(
+            crate::bail_dim_basis!(
                 "joint-null rotation replay for term '{}': raw design has {} columns, \
                  rotation expects {} (the raw basis builder must emit the same column \
                  count as at fit time)",
                 self.name,
                 x_new_raw.ncols(),
                 p_local,
-            ));
+            );
         }
         Ok(crate::linalg::faer_ndarray::fast_ab(
             &x_new_raw,
@@ -1138,11 +1138,11 @@ impl KroneckerPenaltySystem {
         has_double_penalty: bool,
     ) -> Result<Self, BasisError> {
         if marginal_penalties.len() != marginal_dims.len() {
-            crate::bail_dim_basis!(format!(
+            crate::bail_dim_basis!(
                 "KroneckerPenaltySystem: {} penalties vs {} dims",
                 marginal_penalties.len(),
                 marginal_dims.len()
-            ));
+            );
         }
         let eigensystems =
             kronecker_marginal_eigensystems(&marginal_penalties, "KroneckerPenaltySystem")
@@ -1389,14 +1389,14 @@ impl CoefficientGroupPrior {
             Self::Flat => Ok(()),
             Self::NormalLogPrecision { mean, sd } => {
                 if !mean.is_finite() {
-                    crate::bail_invalid_basis!(format!(
+                    crate::bail_invalid_basis!(
                         "{context} Normal log-precision prior requires finite mean, got {mean}"
-                    ));
+                    );
                 }
                 if !sd.is_finite() || sd <= 0.0 {
-                    crate::bail_invalid_basis!(format!(
+                    crate::bail_invalid_basis!(
                         "{context} Normal log-precision prior requires sd > 0, got {sd}"
-                    ));
+                    );
                 }
                 Ok(())
             }
@@ -1468,14 +1468,14 @@ fn penalty_block_metadata(info: &PenaltyBlockInfo) -> PenaltyBlockGammaPriorMeta
 
 fn validate_gamma_precision_prior(label: &str, shape: f64, rate: f64) -> Result<(), BasisError> {
     if !shape.is_finite() || shape <= 0.0 {
-        crate::bail_invalid_basis!(format!(
+        crate::bail_invalid_basis!(
             "Gamma precision hyperprior for penalty block '{label}' requires shape > 0, got {shape}"
-        ));
+        );
     }
     if !rate.is_finite() || rate < 0.0 {
-        crate::bail_invalid_basis!(format!(
+        crate::bail_invalid_basis!(
             "Gamma precision hyperprior for penalty block '{label}' requires rate >= 0, got {rate}"
-        ));
+        );
     }
     Ok::<(), _>(())
 }
@@ -1507,9 +1507,9 @@ fn realize_keyed_penalty_block_gamma_priors(
     let mut keyed = BTreeMap::<String, (f64, f64)>::new();
     for (label, shape, rate) in priors {
         if keyed.insert(label.clone(), (*shape, *rate)).is_some() {
-            crate::bail_invalid_basis!(format!(
+            crate::bail_invalid_basis!(
                 "duplicate Gamma precision hyperprior for penalty block label '{label}'"
-            ));
+            );
         }
     }
     let mut consumed = BTreeSet::<String>::new();
@@ -1541,10 +1541,10 @@ fn realize_keyed_penalty_block_gamma_priors(
             .into_iter()
             .collect::<Vec<_>>()
             .join(", ");
-        crate::bail_invalid_basis!(format!(
+        crate::bail_invalid_basis!(
             "unknown Gamma precision hyperprior penalty block label(s): {}; available labels: {available}",
             unknown.join(", ")
-        ));
+        );
     }
     Ok(prior)
 }
@@ -1557,14 +1557,14 @@ fn validate_rho_prior_coordinate(
         crate::types::RhoPrior::Flat => Ok(()),
         crate::types::RhoPrior::Normal { mean, sd } => {
             if !mean.is_finite() {
-                crate::bail_invalid_basis!(format!(
+                crate::bail_invalid_basis!(
                     "{context} Normal log-precision prior requires finite mean, got {mean}"
-                ));
+                );
             }
             if !sd.is_finite() || *sd <= 0.0 {
-                crate::bail_invalid_basis!(format!(
+                crate::bail_invalid_basis!(
                     "{context} Normal log-precision prior requires sd > 0, got {sd}"
-                ));
+                );
             }
             Ok(())
         }
@@ -1585,10 +1585,10 @@ fn expand_base_rho_prior(
     match base_prior {
         crate::types::RhoPrior::Independent(priors) => {
             if priors.len() != base_count {
-                crate::bail_invalid_basis!(format!(
+                crate::bail_invalid_basis!(
                     "{context} base Independent rho prior length mismatch: got {}, expected {base_count}",
                     priors.len()
-                ));
+                );
             }
             for (idx, prior) in priors.iter().enumerate() {
                 validate_rho_prior_coordinate(prior, &format!("{context} base prior {idx}"))?;
@@ -1637,10 +1637,10 @@ fn insert_range(
     context: &str,
 ) -> Result<(), BasisError> {
     if range.end > p {
-        crate::bail_dim_basis!(format!(
+        crate::bail_dim_basis!(
             "{context} coefficient range {}..{} exceeds design width {p}",
             range.start, range.end
-        ));
+        );
     }
     cols.extend(range);
     Ok(())
@@ -1657,10 +1657,10 @@ fn resolve_group_columns(
             CoefficientSelector::GlobalColumns(indices) => {
                 for &idx in indices {
                     if idx >= p {
-                        crate::bail_dim_basis!(format!(
+                        crate::bail_dim_basis!(
                             "coefficient group '{}' references global column {idx}, but design width is {p}",
                             group.name
-                        ));
+                        );
                     }
                     cols.insert(idx);
                 }
@@ -1732,11 +1732,11 @@ fn resolve_group_columns(
                 let smooth_start = p - design.smooth.total_smooth_cols();
                 for &local_col in columns {
                     if local_col >= smooth_term.coeff_range.len() {
-                        crate::bail_dim_basis!(format!(
+                        crate::bail_dim_basis!(
                             "coefficient group '{}' references smooth term '{term}' local column {local_col}, but the term has {} columns",
                             group.name,
                             smooth_term.coeff_range.len()
-                        ));
+                        );
                     }
                     cols.insert(smooth_start + smooth_term.coeff_range.start + local_col);
                 }
@@ -1744,10 +1744,10 @@ fn resolve_group_columns(
         }
     }
     if cols.is_empty() {
-        crate::bail_invalid_basis!(format!(
+        crate::bail_invalid_basis!(
             "coefficient group '{}' contains no coefficients",
             group.name
-        ));
+        );
     }
     Ok(cols)
 }
@@ -1785,19 +1785,19 @@ fn realize_coefficient_groups(
     let mut names = BTreeSet::<String>::new();
     for group in groups {
         if group.name.trim().is_empty() {
-            crate::bail_invalid_basis!("coefficient group name must not be empty".to_string(),);
+            crate::bail_invalid_basis!("coefficient group name must not be empty");
         }
         if !names.insert(group.name.clone()) {
-            crate::bail_invalid_basis!(format!(
+            crate::bail_invalid_basis!(
                 "duplicate coefficient group '{}'",
                 group.name
-            ));
+            );
         }
         if group.selectors.is_empty() {
-            crate::bail_invalid_basis!(format!(
+            crate::bail_invalid_basis!(
                 "coefficient group '{}' contains no selectors",
                 group.name
-            ));
+            );
         }
         if let Some(prior) = group.prior.as_ref() {
             prior.validate(&format!("coefficient group '{}'", group.name))?;
@@ -1826,9 +1826,9 @@ fn realize_coefficient_groups(
         let mut cursor = Some(group.name.as_str());
         while let Some(name) = cursor {
             if !path.insert(name.to_string()) {
-                crate::bail_invalid_basis!(format!(
+                crate::bail_invalid_basis!(
                     "coefficient group hierarchy contains a cycle involving '{name}'"
-                ));
+                );
             }
             cursor = parent_by_name
                 .get(name)
@@ -1848,10 +1848,10 @@ fn realize_coefficient_groups(
             })?;
             let child_cols = resolved.get(&group.name).expect("group was resolved above");
             if !child_cols.is_subset(parent_cols) {
-                crate::bail_invalid_basis!(format!(
+                crate::bail_invalid_basis!(
                     "coefficient group '{}' is not a subset of parent group '{parent}'",
                     group.name
-                ));
+                );
             }
         }
         if let Some(children) = children_by_parent.get(&group.name) {
@@ -1866,10 +1866,10 @@ fn realize_coefficient_groups(
                 .get(&group.name)
                 .expect("parent group columns should exist after resolution");
             if &child_union != parent_cols {
-                crate::bail_invalid_basis!(format!(
+                crate::bail_invalid_basis!(
                     "coefficient group '{}' has children but its coefficients are not exactly the union of its child groups; nested supergroups concatenate child coefficients",
                     group.name
-                ));
+                );
             }
         }
     }
@@ -2453,12 +2453,12 @@ impl SpatialLogKappaCoords {
         term_indices: &[usize],
     ) -> Result<TermCollectionSpec, EstimationError> {
         if term_indices.len() != self.dims_per_term.len() {
-            crate::bail_invalid_estim!(format!(
+            crate::bail_invalid_estim!(
                 "SpatialLogKappaCoords::apply_tospec: term count mismatch: \
                  term_indices={} dims_per_term={}",
                 term_indices.len(),
                 self.dims_per_term.len()
-            ));
+            );
         }
         let mut updated = spec.clone();
         for (slot, &term_idx) in term_indices.iter().enumerate() {
@@ -2743,9 +2743,9 @@ fn set_spatial_aniso_log_scales(
 ) -> Result<(), EstimationError> {
     let eta = center_aniso_log_scales(&eta);
     let Some(term) = spec.smooth_terms.get_mut(term_idx) else {
-        crate::bail_invalid_estim!(format!(
+        crate::bail_invalid_estim!(
             "spatial aniso_log_scales term index {term_idx} out of range"
-        ));
+        );
     };
     match &mut term.basis {
         SmoothBasisSpec::Matern { spec, .. } => {
@@ -3104,9 +3104,9 @@ fn select_columns(data: ArrayView2<'_, f64>, cols: &[usize]) -> Result<Array2<f6
     let p = data.ncols();
     for &c in cols {
         if c >= p {
-            crate::bail_dim_basis!(format!(
+            crate::bail_dim_basis!(
                 "feature column {c} is out of bounds for data with {p} columns"
-            ));
+            );
         }
     }
     let mut out = Array2::<f64>::zeros((n, cols.len()));
@@ -3134,16 +3134,16 @@ fn validate_term_feature_column_finite(
 ) -> Result<(), BasisError> {
     let p = data.ncols();
     if feature_col >= p {
-        crate::bail_dim_basis!(format!(
+        crate::bail_dim_basis!(
             "{term_kind} term '{term_name}' feature column {feature_col} out of bounds for {p} columns"
-        ));
+        );
     }
     for (row, &value) in data.column(feature_col).iter().enumerate() {
         if !value.is_finite() {
-            crate::bail_invalid_basis!(format!(
+            crate::bail_invalid_basis!(
                 "{term_kind} term '{term_name}' feature column {feature_col} row {row} contains non-finite value {}",
                 nonfinite_value_label(value)
-            ));
+            );
         }
     }
     Ok(())
@@ -3294,10 +3294,10 @@ fn standardized_spatial_term_data(
             ..
         } => (feature_cols, input_scales.as_ref()),
         _ => {
-            crate::bail_invalid_basis!(format!(
+            crate::bail_invalid_basis!(
                 "term '{}' is not a spatial smooth",
                 term.name
-            ));
+            );
         }
     };
     let mut x = select_columns(data, feature_cols)?;
@@ -3876,7 +3876,7 @@ fn matern_operator_penalty_triplet_from_metadata(
         ..
     } = metadata
     else {
-        crate::bail_invalid_basis!("Matérn operator penalties require Matérn metadata".to_string(),);
+        crate::bail_invalid_basis!("Matérn operator penalties require Matérn metadata");
     };
     let penalty_centers = crate::basis::expand_periodic_centers(centers, periodic.as_deref())?;
     let ops = build_matern_collocation_operator_matrices(
@@ -3914,10 +3914,10 @@ fn shape_uses_box_reparameterization(basis: &SmoothBasisSpec) -> bool {
 
 fn build_shape_constraint_grid_1d(x: ArrayView1<'_, f64>) -> Result<Array1<f64>, BasisError> {
     if x.is_empty() {
-        crate::bail_invalid_basis!("shape-constrained smooth requires non-empty covariate values".to_string(),);
+        crate::bail_invalid_basis!("shape-constrained smooth requires non-empty covariate values");
     }
     if x.iter().any(|v| !v.is_finite()) {
-        crate::bail_invalid_basis!("shape-constrained smooth requires finite covariate values".to_string(),);
+        crate::bail_invalid_basis!("shape-constrained smooth requires finite covariate values");
     }
 
     let mut x_sorted: Vec<f64> = x.iter().copied().collect();
@@ -3935,7 +3935,7 @@ fn build_shape_constraint_grid_1d(x: ArrayView1<'_, f64>) -> Result<Array1<f64>,
         }
     }
     if x_unique.len() < 2 {
-        crate::bail_invalid_basis!("shape-constrained smooth requires at least two unique covariate values".to_string(),);
+        crate::bail_invalid_basis!("shape-constrained smooth requires at least two unique covariate values");
     }
 
     let min_x = x_unique[0];
@@ -3943,7 +3943,7 @@ fn build_shape_constraint_grid_1d(x: ArrayView1<'_, f64>) -> Result<Array1<f64>,
         .last()
         .expect("x_unique has at least two elements by construction");
     if (max_x - min_x).abs() <= 1e-12 {
-        crate::bail_invalid_basis!("shape-constrained smooth requires non-degenerate covariate range".to_string(),);
+        crate::bail_invalid_basis!("shape-constrained smooth requires non-degenerate covariate range");
     }
 
     let target_points = x_unique.len().clamp(96, 320);
@@ -4100,10 +4100,10 @@ fn build_shape_constraint_design_1d(
                 .to_dense()
         }
         _ => {
-            crate::bail_invalid_basis!(format!(
+            crate::bail_invalid_basis!(
                 "shape-constraint grid reconstruction metadata mismatch for term '{}'",
                 term.name
-            ));
+            );
         }
     };
 
@@ -4124,7 +4124,7 @@ fn build_shape_linear_constraints_1d(
         return Ok(None);
     }
     if x.iter().any(|v| !v.is_finite()) {
-        crate::bail_invalid_basis!("shape-constrained smooth requires finite covariate values".to_string(),);
+        crate::bail_invalid_basis!("shape-constrained smooth requires finite covariate values");
     }
 
     let mut idx: Vec<usize> = (0..n).collect();
@@ -4159,11 +4159,11 @@ fn build_shape_linear_constraints_1d(
 
     let m = collapsedrows.len();
     if m <= order {
-        crate::bail_invalid_basis!(format!(
+        crate::bail_invalid_basis!(
             "shape-constrained smooth requires at least {} unique covariate locations; found {}",
             order + 1,
             m
-        ));
+        );
     }
 
     let q_raw = m - order;
@@ -4249,9 +4249,9 @@ fn build_periodic_fourier_margin(
     penalty_order: usize,
 ) -> Result<(Array2<f64>, Array2<f64>, Array1<f64>), BasisError> {
     if !period.is_finite() || period <= 0.0 {
-        crate::bail_invalid_basis!(format!(
+        crate::bail_invalid_basis!(
             "periodic tensor margin requires finite positive period, got {period}"
-        ));
+        );
     }
     let q = requested_cols.max(3);
     let harmonics = q / 2;
@@ -4302,15 +4302,15 @@ fn tensor_product_design_from_sparse_marginals(
     marginal_sparse: &[&SparseColMat<usize, f64>],
 ) -> Result<SparseColMat<usize, f64>, BasisError> {
     if marginal_sparse.is_empty() {
-        crate::bail_invalid_basis!("TensorBSpline requires at least one marginal basis".to_string(),);
+        crate::bail_invalid_basis!("TensorBSpline requires at least one marginal basis");
     }
     let n = marginal_sparse[0].nrows();
     for (i, m) in marginal_sparse.iter().enumerate().skip(1) {
         if m.nrows() != n {
-            crate::bail_dim_basis!(format!(
+            crate::bail_dim_basis!(
                 "tensor sparse marginal row mismatch at dim {i}: expected {n}, got {}",
                 m.nrows()
-            ));
+            );
         }
     }
     let dims: Vec<usize> = marginal_sparse.iter().map(|m| m.ncols()).collect();
@@ -4411,28 +4411,28 @@ fn build_tensor_bspline_basis(
     spec: &TensorBSplineSpec,
 ) -> Result<BasisBuildResult, BasisError> {
     if feature_cols.is_empty() {
-        crate::bail_invalid_basis!("TensorBSpline requires at least one feature column".to_string(),);
+        crate::bail_invalid_basis!("TensorBSpline requires at least one feature column");
     }
     if feature_cols.len() != spec.marginalspecs.len() {
-        crate::bail_dim_basis!(format!(
+        crate::bail_dim_basis!(
             "TensorBSpline feature/spec mismatch: feature_cols={}, marginalspecs={}",
             feature_cols.len(),
             spec.marginalspecs.len()
-        ));
+        );
     }
     if !spec.periods.is_empty() && spec.periods.len() != feature_cols.len() {
-        crate::bail_dim_basis!(format!(
+        crate::bail_dim_basis!(
             "TensorBSpline periods length {} does not match feature count {}",
             spec.periods.len(),
             feature_cols.len()
-        ));
+        );
     }
     let p = data.ncols();
     for &c in feature_cols {
         if c >= p {
-            crate::bail_dim_basis!(format!(
+            crate::bail_dim_basis!(
                 "tensor feature column {c} is out of bounds for data with {p} columns"
-            ));
+            );
         }
     }
 
@@ -4496,9 +4496,9 @@ fn build_tensor_bspline_basis(
             let knots = match built.metadata {
                 BasisMetadata::BSpline1D { knots, .. } => knots,
                 _ => {
-                    crate::bail_invalid_basis!(format!(
+                    crate::bail_invalid_basis!(
                         "internal TensorBSpline error at dim {dim}: expected BSpline1D metadata"
-                    ));
+                    );
                 }
             };
             marginal_knots.push(knots);
@@ -4580,7 +4580,7 @@ fn build_tensor_bspline_basis(
         TensorBSplineIdentifiability::None => None,
         TensorBSplineIdentifiability::SumToZero => {
             if total_cols < 2 {
-                crate::bail_invalid_basis!("TensorBSpline requires at least 2 basis coefficients to enforce sum-to-zero identifiability".to_string(),);
+                crate::bail_invalid_basis!("TensorBSpline requires at least 2 basis coefficients to enforce sum-to-zero identifiability");
             }
             let dense_design_ref = dense_design.as_ref().ok_or_else(|| {
                 BasisError::InvalidInput(
@@ -4592,11 +4592,11 @@ fn build_tensor_bspline_basis(
         }
         TensorBSplineIdentifiability::FrozenTransform { transform } => {
             if transform.nrows() != total_cols {
-                crate::bail_dim_basis!(format!(
+                crate::bail_dim_basis!(
                     "frozen tensor identifiability transform mismatch: design has {} columns but transform has {} rows",
                     total_cols,
                     transform.nrows()
-                ));
+                );
             }
             Some(transform.clone())
         }
@@ -4700,15 +4700,15 @@ fn tensor_product_design_from_marginals(
     marginal_designs: &[Array2<f64>],
 ) -> Result<Array2<f64>, BasisError> {
     if marginal_designs.is_empty() {
-        crate::bail_invalid_basis!("TensorBSpline requires at least one marginal basis".to_string(),);
+        crate::bail_invalid_basis!("TensorBSpline requires at least one marginal basis");
     }
     let n = marginal_designs[0].nrows();
     for (i, b) in marginal_designs.iter().enumerate().skip(1) {
         if b.nrows() != n {
-            crate::bail_dim_basis!(format!(
+            crate::bail_dim_basis!(
                 "tensor marginal row mismatch at dim {i}: expected {n}, got {}",
                 b.nrows()
-            ));
+            );
         }
     }
     let total_cols = marginal_designs.iter().try_fold(1usize, |acc, b| {
@@ -4776,26 +4776,26 @@ fn build_random_effect_block(
     let n = data.nrows();
     let p = data.ncols();
     if spec.feature_col >= p {
-        crate::bail_dim_basis!(format!(
+        crate::bail_dim_basis!(
             "random-effect term '{}' feature column {} out of bounds for {} columns",
             spec.name, spec.feature_col, p
-        ));
+        );
     }
 
     let col = data.column(spec.feature_col);
     if col.iter().any(|v| !v.is_finite()) {
-        crate::bail_invalid_basis!(format!(
+        crate::bail_invalid_basis!(
             "random-effect term '{}' contains non-finite group values",
             spec.name
-        ));
+        );
     }
 
     let kept_levels: Vec<u64> = if let Some(levels) = spec.frozen_levels.as_ref() {
         if levels.is_empty() {
-            crate::bail_invalid_basis!(format!(
+            crate::bail_invalid_basis!(
                 "random-effect term '{}' has empty frozen_levels",
                 spec.name
-            ));
+            );
         }
         levels.clone()
     } else {
@@ -4804,10 +4804,10 @@ fn build_random_effect_block(
             levels_set.insert(v.to_bits());
         }
         if levels_set.is_empty() {
-            crate::bail_invalid_basis!(format!(
+            crate::bail_invalid_basis!(
                 "random-effect term '{}' has no observed levels",
                 spec.name
-            ));
+            );
         }
         let levels: Vec<u64> = levels_set.into_iter().collect();
         let start_idx = if spec.drop_first_level && levels.len() > 1 {
@@ -4819,20 +4819,20 @@ fn build_random_effect_block(
     };
 
     if kept_levels.is_empty() {
-        crate::bail_invalid_basis!(format!(
+        crate::bail_invalid_basis!(
             "random-effect term '{}' drops all levels; keep at least one level",
             spec.name
-        ));
+        );
     }
 
     let q = kept_levels.len();
     let mut level_to_col = BTreeMap::<u64, usize>::new();
     for (idx, &bits) in kept_levels.iter().enumerate() {
         if level_to_col.insert(bits, idx).is_some() {
-            crate::bail_invalid_basis!(format!(
+            crate::bail_invalid_basis!(
                 "random-effect term '{}' has duplicate frozen level bits {bits}",
                 spec.name
-            ));
+            );
         }
     }
     let mut group_ids = Vec::with_capacity(n);
@@ -4857,7 +4857,7 @@ impl SmoothDesign {
         shape: ShapeConstraint,
     ) -> Result<Array1<f64>, BasisError> {
         if unconstrained.is_empty() {
-            crate::bail_invalid_basis!("unconstrained coefficient vector cannot be empty".to_string(),);
+            crate::bail_invalid_basis!("unconstrained coefficient vector cannot be empty");
         }
         let mapped = match shape {
             ShapeConstraint::None => unconstrained.clone(),
@@ -4876,7 +4876,7 @@ fn bspline_boundary_endpoint(
     right: bool,
 ) -> Result<f64, BasisError> {
     if knots.len() <= degree + 1 {
-        crate::bail_invalid_basis!("B-spline boundary condition requires a valid knot vector".to_string(),);
+        crate::bail_invalid_basis!("B-spline boundary condition requires a valid knot vector");
     }
     let n_basis = knots.len() - degree - 1;
     Ok(if right { knots[n_basis] } else { knots[degree] })
@@ -4900,7 +4900,7 @@ fn bspline_endpoint_row(
         BSplineEndpointBoundaryCondition::Anchored { value } => value,
     };
     if !target.is_finite() {
-        crate::bail_invalid_basis!("anchored B-spline boundary value must be finite".to_string(),);
+        crate::bail_invalid_basis!("anchored B-spline boundary value must be finite");
     }
     let endpoint = bspline_boundary_endpoint(knots, degree, right)?;
     let point = Array1::from_vec(vec![endpoint]);
@@ -4918,21 +4918,21 @@ fn bspline_endpoint_row(
     let mut row = raw.row(0).to_owned();
     if let Some(z) = identifiability_transform {
         if row.len() != z.nrows() {
-            crate::bail_dim_basis!(format!(
+            crate::bail_dim_basis!(
                 "B-spline boundary constraint transform mismatch: row has {} columns but transform has {} rows",
                 row.len(),
                 z.nrows()
-            ));
+            );
         }
         row = row.dot(z);
     }
     if let Some(t) = coefficient_transform {
         if row.len() != t.nrows() {
-            crate::bail_dim_basis!(format!(
+            crate::bail_dim_basis!(
                 "B-spline boundary constraint coefficient transform mismatch: row has {} columns but transform has {} rows",
                 row.len(),
                 t.nrows()
-            ));
+            );
         }
         row = row.dot(t);
     }
@@ -4955,7 +4955,7 @@ fn bspline_boundary_linear_constraints(
         ..
     } = metadata
     else {
-        crate::bail_invalid_basis!("B-spline boundary constraints require B-spline metadata".to_string(),);
+        crate::bail_invalid_basis!("B-spline boundary constraints require B-spline metadata");
     };
 
     let mut eq_rows = Vec::<Array1<f64>>::new();
@@ -4975,9 +4975,9 @@ fn bspline_boundary_linear_constraints(
             let norm = row.dot(&row).sqrt();
             if norm <= 1e-12 {
                 if target.abs() > 1e-12 {
-                    crate::bail_invalid_basis!(format!(
+                    crate::bail_invalid_basis!(
                         "anchored B-spline boundary value {target} is infeasible because the endpoint row is zero"
-                    ));
+                    );
                 }
                 continue;
             }
@@ -5069,12 +5069,12 @@ impl PcaScoresMemmapDesignOperator {
                 ))
             })?;
         if mmap.len() < expected {
-            crate::bail_invalid_basis!(format!(
+            crate::bail_invalid_basis!(
                 "lazy Pca .npy scores '{}' is truncated: header expects {} bytes, file has {}",
                 path.display(),
                 expected,
                 mmap.len()
-            ));
+            );
         }
         Ok(Self {
             mmap: Arc::new(mmap),
@@ -5293,38 +5293,38 @@ fn parse_f64_2d_npy_header(
     path: &PathBuf,
 ) -> Result<(usize, usize, usize), BasisError> {
     if bytes.len() < 10 || &bytes[0..6] != b"\x93NUMPY" {
-        crate::bail_invalid_basis!(format!(
+        crate::bail_invalid_basis!(
             "lazy Pca scores '{}' is not a .npy file",
             path.display()
-        ));
+        );
     }
     let major = bytes[6];
     let header_len = match major {
         1 => u16::from_le_bytes([bytes[8], bytes[9]]) as usize,
         2 | 3 => {
             if bytes.len() < 12 {
-                crate::bail_invalid_basis!(format!(
+                crate::bail_invalid_basis!(
                     "lazy Pca scores '{}' has a truncated .npy header",
                     path.display()
-                ));
+                );
             }
             u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize
         }
         other => {
-            crate::bail_invalid_basis!(format!(
+            crate::bail_invalid_basis!(
                 "lazy Pca scores '{}' uses unsupported .npy version {}",
                 path.display(),
                 other
-            ));
+            );
         }
     };
     let header_start = if major == 1 { 10 } else { 12 };
     let data_offset = header_start + header_len;
     if bytes.len() < data_offset {
-        crate::bail_invalid_basis!(format!(
+        crate::bail_invalid_basis!(
             "lazy Pca scores '{}' has a truncated .npy header",
             path.display()
-        ));
+        );
     }
     let header = std::str::from_utf8(&bytes[header_start..data_offset]).map_err(|err| {
         BasisError::InvalidInput(format!(
@@ -5337,16 +5337,16 @@ fn parse_f64_2d_npy_header(
         || header.contains("'descr': '|f8'")
         || header.contains("\"descr\": \"|f8\""))
     {
-        crate::bail_invalid_basis!(format!(
+        crate::bail_invalid_basis!(
             "lazy Pca scores '{}' must be float64 little-endian .npy",
             path.display()
-        ));
+        );
     }
     if header.contains("True") {
-        crate::bail_invalid_basis!(format!(
+        crate::bail_invalid_basis!(
             "lazy Pca scores '{}' must be C-contiguous, not Fortran-ordered",
             path.display()
-        ));
+        );
     }
     let shape_pos = header.find("shape").ok_or_else(|| {
         BasisError::InvalidInput(format!(
@@ -5379,18 +5379,18 @@ fn parse_f64_2d_npy_header(
             ))
         })?;
     if dims.len() != 2 {
-        crate::bail_invalid_basis!(format!(
+        crate::bail_invalid_basis!(
             "lazy Pca scores '{}' must have shape (N, K), got {:?}",
             path.display(),
             dims
-        ));
+        );
     }
     Ok((data_offset, dims[0], dims[1]))
 }
 
 fn pca_center_mean(x: ArrayView2<'_, f64>) -> Result<Array1<f64>, BasisError> {
     if x.nrows() == 0 {
-        crate::bail_invalid_basis!("Pca basis requires at least one row to compute center mean".to_string(),);
+        crate::bail_invalid_basis!("Pca basis requires at least one row to compute center mean");
     }
     let mut mean = Array1::<f64>::zeros(x.ncols());
     for row in x.rows() {
@@ -5413,11 +5413,11 @@ fn build_pca_smooth_basis(
     if let Some(path) = pca_basis_path {
         let op = PcaScoresMemmapDesignOperator::open(path.clone(), chunk_size)?;
         if op.nrows != data.nrows() {
-            crate::bail_dim_basis!(format!(
+            crate::bail_dim_basis!(
                 "lazy Pca scores row mismatch: .npy has {}, data has {}",
                 op.nrows,
                 data.nrows()
-            ));
+            );
         }
         let k = op.ncols;
         let mut penalty = Array2::<f64>::eye(k);
@@ -5452,11 +5452,11 @@ fn build_pca_smooth_basis(
         });
     }
     if basis_matrix.nrows() != feature_cols.len() {
-        crate::bail_dim_basis!(format!(
+        crate::bail_dim_basis!(
             "Pca basis row mismatch: basis rows={}, feature columns={}",
             basis_matrix.nrows(),
             feature_cols.len()
-        ));
+        );
     }
     let mut x = select_columns(data, feature_cols)?;
     let mean = if centered {
@@ -5514,10 +5514,10 @@ fn apply_by_variable_to_local_build(
     term_name: &str,
 ) -> Result<LocalSmoothTermBuild, BasisError> {
     if by_col >= data.ncols() {
-        crate::bail_dim_basis!(format!(
+        crate::bail_dim_basis!(
             "by-variable smooth term '{term_name}' references column {by_col}, but data has {} columns",
             data.ncols()
-        ));
+        );
     }
     let weights = match by {
         ByVariableSpec::Numeric => data.column(by_col).to_owned(),
@@ -5530,9 +5530,9 @@ fn apply_by_variable_to_local_build(
         }),
     };
     if weights.iter().any(|value| !value.is_finite()) {
-        crate::bail_invalid_basis!(format!(
+        crate::bail_invalid_basis!(
             "by-variable smooth term '{term_name}' has non-finite by-column values"
-        ));
+        );
     }
 
     let mut dense = built
@@ -5571,10 +5571,10 @@ fn build_single_local_smooth_term(
     workspace: &mut crate::basis::BasisWorkspace,
 ) -> Result<LocalSmoothTermBuild, BasisError> {
     if term.shape != ShapeConstraint::None && !shape_supports_basis(term) {
-        crate::bail_invalid_basis!(format!(
+        crate::bail_invalid_basis!(
             "ShapeConstraint::{:?} is unsupported for term '{}'",
             term.shape, term.name
-        ));
+        );
     }
     if let SmoothBasisSpec::ByVariable {
         inner,
@@ -5602,24 +5602,24 @@ fn build_single_local_smooth_term(
             levels,
         } => {
             if *by_col >= data.ncols() {
-                crate::bail_dim_basis!(format!(
+                crate::bail_dim_basis!(
                     "term '{}' by column {} out of bounds for {} columns",
                     term.name,
                     by_col,
                     data.ncols()
-                ));
+                );
             }
             if levels.len() < 2 {
-                crate::bail_invalid_basis!(format!(
+                crate::bail_invalid_basis!(
                     "sum-to-zero factor smooth term '{}' requires at least two levels",
                     term.name
-                ));
+                );
             }
             if term.shape != ShapeConstraint::None {
-                crate::bail_invalid_basis!(format!(
+                crate::bail_invalid_basis!(
                     "ShapeConstraint::{:?} is unsupported for sum-to-zero factor smooth term '{}'",
                     term.shape, term.name
-                ));
+                );
             }
             let inner_term = SmoothTermSpec {
                 name: format!("{}::inner", term.name),
@@ -5695,12 +5695,12 @@ fn build_single_local_smooth_term(
         }
         SmoothBasisSpec::BSpline1D { feature_col, spec } => {
             if *feature_col >= data.ncols() {
-                crate::bail_dim_basis!(format!(
+                crate::bail_dim_basis!(
                     "term '{}' feature column {} out of bounds for {} columns",
                     term.name,
                     feature_col,
                     data.ncols()
-                ));
+                );
             }
             let mut spec_local = spec.clone();
             if term.shape != ShapeConstraint::None {
@@ -5717,12 +5717,12 @@ fn build_single_local_smooth_term(
         } => {
             if term.shape != ShapeConstraint::None {
                 if feature_cols.len() != 1 {
-                    crate::bail_invalid_basis!(format!(
+                    crate::bail_invalid_basis!(
                         "ShapeConstraint::{:?} for term '{}' on ThinPlate basis requires exactly 1 feature axis; found {}",
                         term.shape,
                         term.name,
                         feature_cols.len()
-                    ));
+                    );
                 }
                 shape_axis_col = Some(feature_cols[0]);
             }
@@ -5795,10 +5795,10 @@ fn build_single_local_smooth_term(
         }
         SmoothBasisSpec::Sphere { feature_cols, spec } => {
             if term.shape != ShapeConstraint::None {
-                crate::bail_invalid_basis!(format!(
+                crate::bail_invalid_basis!(
                     "ShapeConstraint::{:?} for term '{}' is not supported on spherical splines",
                     term.shape, term.name
-                ));
+                );
             }
             let x = select_columns(data, feature_cols)?;
             build_spherical_spline_basis(x.view(), spec)?
@@ -5810,12 +5810,12 @@ fn build_single_local_smooth_term(
         } => {
             if term.shape != ShapeConstraint::None {
                 if feature_cols.len() != 1 {
-                    crate::bail_invalid_basis!(format!(
+                    crate::bail_invalid_basis!(
                         "ShapeConstraint::{:?} for term '{}' on Matern basis requires exactly 1 feature axis; found {}",
                         term.shape,
                         term.name,
                         feature_cols.len()
-                    ));
+                    );
                 }
                 shape_axis_col = Some(feature_cols[0]);
             }
@@ -5868,12 +5868,12 @@ fn build_single_local_smooth_term(
         } => {
             if term.shape != ShapeConstraint::None {
                 if feature_cols.len() != 1 {
-                    crate::bail_invalid_basis!(format!(
+                    crate::bail_invalid_basis!(
                         "ShapeConstraint::{:?} for term '{}' on Duchon basis requires exactly 1 feature axis; found {}",
                         term.shape,
                         term.name,
                         feature_cols.len()
-                    ));
+                    );
                 }
                 shape_axis_col = Some(feature_cols[0]);
             }
@@ -5932,10 +5932,10 @@ fn build_single_local_smooth_term(
             chunk_size,
         } => {
             if term.shape != ShapeConstraint::None {
-                crate::bail_invalid_basis!(format!(
+                crate::bail_invalid_basis!(
                     "ShapeConstraint::{:?} for term '{}' is not supported on Pca basis",
                     term.shape, term.name
-                ));
+                );
             }
             build_pca_smooth_basis(
                 data,
@@ -5952,7 +5952,7 @@ fn build_single_local_smooth_term(
             build_tensor_bspline_basis(data, feature_cols, spec)?
         }
         SmoothBasisSpec::ByVariable { .. } => {
-            crate::bail_invalid_basis!("internal: ByVariable smooths must return before inner basis dispatch".to_string(),);
+            crate::bail_invalid_basis!("internal: ByVariable smooths must return before inner basis dispatch");
         }
         SmoothBasisSpec::BySmooth { .. } => {
             crate::bail_invalid_basis!("internal: BySmooth smooths must be lowered to ByVariable before inner basis dispatch"
@@ -6041,12 +6041,12 @@ fn build_single_local_smooth_term(
         ops_t = vec![None; penalties_t.len()];
     }
     if penalties_t.len() != active_penaltyinfo_t.len() {
-        crate::bail_invalid_basis!(format!(
+        crate::bail_invalid_basis!(
             "internal penalty metadata mismatch for term '{}': active penalties={}, active infos={}",
             term.name,
             penalties_t.len(),
             active_penaltyinfo_t.len()
-        ));
+        );
     }
     if ops_t.len() != penalties_t.len() {
         ops_t = vec![None; penalties_t.len()];
@@ -6284,12 +6284,12 @@ fn build_smooth_design_withworkspace_unvalidated(
             .filter(|info| info.active)
             .collect::<Vec<_>>();
         if activeinfos.len() != built.penalties.len() {
-            crate::bail_invalid_basis!(format!(
+            crate::bail_invalid_basis!(
                 "internal penalty info mismatch for term '{}': activeinfos={}, penalties={}",
                 term.name,
                 activeinfos.len(),
                 built.penalties.len()
-            ));
+            );
         }
         for (((s_local, &ns), info), op_local) in built
             .penalties
@@ -6434,10 +6434,10 @@ fn build_term_collection_design_inner(
                         .map(|j| {
                             let linear = &spec.linear_terms[j];
                             if linear.feature_col >= p_data {
-                                crate::bail_dim_basis!(format!(
+                                crate::bail_dim_basis!(
                                     "linear term '{}' feature column {} out of bounds for {} columns",
                                     linear.name, linear.feature_col, p_data
-                                ));
+                                );
                             }
                             Ok(data.column(linear.feature_col).to_owned())
                         })
@@ -6643,11 +6643,11 @@ fn build_term_collection_design_inner(
     }
 
     if smooth.penaltyinfo.len() != smooth.penalties.len() {
-        crate::bail_invalid_basis!(format!(
+        crate::bail_invalid_basis!(
             "smooth penalty metadata mismatch: penalties={}, metadata={}",
             smooth.penalties.len(),
             smooth.penaltyinfo.len()
-        ));
+        );
     }
     let smooth_start = p_intercept + p_lin + p_rand;
     for ((bp_smooth, &ns), localinfo) in smooth
@@ -7067,11 +7067,11 @@ fn apply_global_smooth_identifiability(
     // This yields a deterministic hierarchical decomposition: lower-order smooths
     // own their subspaces, and broader smooths fit only the residual structure.
     if smoothspecs.len() != smooth.terms.len() {
-        crate::bail_dim_basis!(format!(
+        crate::bail_dim_basis!(
             "smooth spec count ({}) does not match built term count ({})",
             smoothspecs.len(),
             smooth.terms.len()
-        ));
+        );
     }
 
     if smooth.terms.is_empty() {
@@ -7194,10 +7194,10 @@ fn apply_global_smooth_identifiability(
                 orthogonality_relative_residual_for_design(&design_constrained, c_ref.view())?;
             let tol = 1e-8;
             if rel > tol {
-                crate::bail_invalid_basis!(format!(
+                crate::bail_invalid_basis!(
                     "smooth orthogonality residual too large for term '{}': {:.3e} > {:.1e}",
                     term.name, rel, tol
-                ));
+                );
             }
         }
 
@@ -7208,12 +7208,12 @@ fn apply_global_smooth_identifiability(
             .cloned()
             .collect::<Vec<_>>();
         if active_penaltyinfo.len() != term.penalties_local.len() {
-            crate::bail_invalid_basis!(format!(
+            crate::bail_invalid_basis!(
                 "internal penalty metadata mismatch for term '{}': activeinfos={}, penalties={}",
                 term.name,
                 active_penaltyinfo.len(),
                 term.penalties_local.len()
-            ));
+            );
         }
         let penalties_constrained: Vec<Array2<f64>> = term
             .penalties_local
@@ -7292,12 +7292,12 @@ fn apply_global_smooth_identifiability(
             .filter(|info| info.active)
             .collect::<Vec<_>>();
         if activeinfos.len() != local_penalties[idx].len() {
-            crate::bail_invalid_basis!(format!(
+            crate::bail_invalid_basis!(
                 "internal penalty info mismatch for term '{}': activeinfos={}, penalties={}",
                 smooth.terms[idx].name,
                 activeinfos.len(),
                 local_penalties[idx].len()
-            ));
+            );
         }
         for ((s_local, &ns), info) in local_penalties[idx]
             .iter()
@@ -7418,9 +7418,9 @@ fn build_parametric_constraint_block_for_term(
     let mut parametric_cols = smooth_intrinsic_parametric_feature_cols(linear_terms, termspec);
     for &feature_col in &parametric_cols {
         if feature_col >= p_data {
-            crate::bail_dim_basis!(format!(
+            crate::bail_dim_basis!(
                 "smooth term feature column {feature_col} out of bounds for {p_data} columns"
-            ));
+            );
         }
     }
     for linear in linear_terms
@@ -7428,10 +7428,10 @@ fn build_parametric_constraint_block_for_term(
         .filter(|linear| feature_cols.contains(&linear.feature_col))
     {
         if linear.feature_col >= p_data {
-            crate::bail_dim_basis!(format!(
+            crate::bail_dim_basis!(
                 "linear term '{}' feature column {} out of bounds for {} columns",
                 linear.name, linear.feature_col, p_data
-            ));
+            );
         }
         if !parametric_cols.contains(&linear.feature_col) {
             parametric_cols.push(linear.feature_col);
@@ -7522,11 +7522,11 @@ fn maybe_smooth_identifiability_transform(
         spatial_identifiability_policy(termspec)
     {
         if design_local.ncols() != transform.nrows() {
-            crate::bail_dim_basis!(format!(
+            crate::bail_dim_basis!(
                 "frozen spatial identifiability transform mismatch: design has {} columns but transform has {} rows",
                 design_local.ncols(),
                 transform.nrows()
-            ));
+            );
         }
         return Ok(Some(transform.clone()));
     }
@@ -7745,7 +7745,7 @@ fn with_identifiability_transform(
             // themselves), so the caller cannot meaningfully attach a
             // post-hoc Z transform here.
             if transform.is_some() {
-                crate::bail_invalid_basis!("PCA bases do not expose a composable identifiability transform".to_string(),);
+                crate::bail_invalid_basis!("PCA bases do not expose a composable identifiability transform");
             }
             Ok(BasisMetadata::Pca {
                 feature_cols: feature_cols.clone(),
@@ -8530,17 +8530,17 @@ fn grouped_operatorgradient(
     blocks: &Array2<f64>,
 ) -> Result<Array1<f64>, EstimationError> {
     if blocks.ncols() != dimension {
-        crate::bail_invalid_estim!(format!(
+        crate::bail_invalid_estim!(
             "grouped gradient block dimension mismatch: got {}, expected {dimension}",
             blocks.ncols()
-        ));
+        );
     }
     if d1.nrows() != blocks.nrows() * dimension {
-        crate::bail_invalid_estim!(format!(
+        crate::bail_invalid_estim!(
             "grouped gradient row mismatch: D1 has {} rows, blocks imply {}",
             d1.nrows(),
             blocks.nrows() * dimension
-        ));
+        );
     }
     let mut out = Array1::<f64>::zeros(d1.ncols());
     for k in 0..blocks.nrows() {
@@ -8558,23 +8558,23 @@ fn grouped_operatorhessian(
     blocks: &[Array2<f64>],
 ) -> Result<Array2<f64>, EstimationError> {
     if d1.nrows() != blocks.len() * dimension {
-        crate::bail_invalid_estim!(format!(
+        crate::bail_invalid_estim!(
             "grouped Hessian row mismatch: D1 has {} rows, blocks imply {}",
             d1.nrows(),
             blocks.len() * dimension
-        ));
+        );
     }
     let p = d1.ncols();
     let mut out = Array2::<f64>::zeros((p, p));
     for (k, block) in blocks.iter().enumerate() {
         if block.nrows() != dimension || block.ncols() != dimension {
-            crate::bail_invalid_estim!(format!(
+            crate::bail_invalid_estim!(
                 "grouped Hessian block {k} has shape {}x{}, expected {}x{}",
                 block.nrows(),
                 block.ncols(),
                 dimension,
                 dimension
-            ));
+            );
         }
         let gk = d1
             .slice(s![k * dimension..(k + 1) * dimension, ..])
@@ -8596,10 +8596,10 @@ fn collocationgradient_blocks(
     dimension: usize,
 ) -> Result<Array2<f64>, EstimationError> {
     if dimension == 0 || !gradrows.len().is_multiple_of(dimension) {
-        crate::bail_invalid_estim!(format!(
+        crate::bail_invalid_estim!(
             "invalid collocation gradient layout: rows={}, dimension={dimension}",
             gradrows.len()
-        ));
+        );
     }
     let p = gradrows.len() / dimension;
     let mut out = Array2::<f64>::zeros((p, dimension));
@@ -8619,10 +8619,10 @@ fn collocationhessian_blocks(
         EstimationError::InvalidInput("invalid collocation Hessian dimension overflow".to_string())
     })?;
     if block_dim == 0 || !hessianrows.len().is_multiple_of(block_dim) {
-        crate::bail_invalid_estim!(format!(
+        crate::bail_invalid_estim!(
             "invalid collocation Hessian layout: rows={}, dimension={dimension}",
             hessianrows.len()
-        ));
+        );
     }
     let p = hessianrows.len() / block_dim;
     let mut out = Array2::<f64>::zeros((p, block_dim));
@@ -8922,14 +8922,14 @@ fn extract_spatial_operator_runtime_caches(
             || d1.ncols() != coeff_global_range.len()
             || d2.ncols() != coeff_global_range.len()
         {
-            crate::bail_invalid_estim!(format!(
+            crate::bail_invalid_estim!(
                 "spatial operator dimension mismatch for term '{}': D0 cols={}, D1 cols={}, D2 cols={}, coeffs={}",
                 term_fit.name,
                 d0.ncols(),
                 d1.ncols(),
                 d2.ncols(),
                 coeff_global_range.len()
-            ));
+            );
         }
         out.push(SpatialOperatorRuntimeCache {
             termname: term_fit.name.clone(),
@@ -9690,12 +9690,12 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                 outer_result.final_value.abs(),
             );
         } else {
-            crate::bail_invalid_estim!(format!(
+            crate::bail_invalid_estim!(
                 "exact spatial adaptive outer optimization did not converge after {} iterations (final_objective={:.6e}, final_grad_norm={})",
                 outer_result.iterations,
                 outer_result.final_value,
                 outer_result.final_grad_norm_report(),
-            ));
+            );
         }
     }
     let outer_iterations = outer_result.iterations;
@@ -10137,7 +10137,7 @@ fn evaluate_standard_familyobservations(
     const MU_DERIV_EPS: f64 = 1e-12;
     let n = y.len();
     if weights.len() != n || eta.len() != n {
-        crate::bail_invalid_estim!("bounded family observation size mismatch".to_string(),);
+        crate::bail_invalid_estim!("bounded family observation size mismatch");
     }
 
     let mut mu = Array1::<f64>::zeros(n);
@@ -10213,22 +10213,22 @@ fn evaluate_standard_familyobservations(
                 log_likelihood += w * (yi * mu_i.ln() + (1.0 - yi) * (1.0 - mu_i).ln());
             }
             (ResponseFamily::Poisson, _) => {
-                crate::bail_invalid_estim!("bounded linear terms are not supported for PoissonLog fits".to_string(),);
+                crate::bail_invalid_estim!("bounded linear terms are not supported for PoissonLog fits");
             }
             (ResponseFamily::Tweedie { .. }, _) => {
-                crate::bail_invalid_estim!("bounded linear terms are not supported for Tweedie fits".to_string(),);
+                crate::bail_invalid_estim!("bounded linear terms are not supported for Tweedie fits");
             }
             (ResponseFamily::NegativeBinomial { .. }, _) => {
-                crate::bail_invalid_estim!("bounded linear terms are not supported for NegativeBinomial fits".to_string(),);
+                crate::bail_invalid_estim!("bounded linear terms are not supported for NegativeBinomial fits");
             }
             (ResponseFamily::Beta { .. }, _) => {
-                crate::bail_invalid_estim!("bounded linear terms are not supported for BetaLogit fits".to_string(),);
+                crate::bail_invalid_estim!("bounded linear terms are not supported for BetaLogit fits");
             }
             (ResponseFamily::Gamma, _) => {
-                crate::bail_invalid_estim!("bounded linear terms are not supported for GammaLog fits".to_string(),);
+                crate::bail_invalid_estim!("bounded linear terms are not supported for GammaLog fits");
             }
             (ResponseFamily::RoystonParmar, _) => {
-                crate::bail_invalid_estim!("bounded linear terms are not supported for survival model fits".to_string(),);
+                crate::bail_invalid_estim!("bounded linear terms are not supported for survival model fits");
             }
         }
     }
@@ -12033,14 +12033,14 @@ fn exact_bounded_edf(
     latent_cov: &Array2<f64>,
 ) -> Result<(Vec<f64>, f64), EstimationError> {
     if penalties.len() != lambdas.len() {
-        crate::bail_invalid_estim!(format!(
+        crate::bail_invalid_estim!(
             "bounded EDF penalty/lambda mismatch: {} penalties vs {} lambdas",
             penalties.len(),
             lambdas.len()
-        ));
+        );
     }
     if latent_cov.nrows() != latent_cov.ncols() {
-        crate::bail_invalid_estim!("bounded EDF covariance must be square".to_string(),);
+        crate::bail_invalid_estim!("bounded EDF covariance must be square");
     }
 
     let p = latent_cov.nrows();
@@ -12119,7 +12119,7 @@ fn fit_bounded_term_collection_with_design(
     let fit_penalties = conditioning
         .transform_blockwise_penalties_to_internal(&design.penalties, design.design.ncols());
     if design.linear_constraints.is_some() {
-        crate::bail_invalid_estim!("bounded() terms are not yet compatible with explicit linear constraints".to_string(),);
+        crate::bail_invalid_estim!("bounded() terms are not yet compatible with explicit linear constraints");
     }
     let mut bounded_terms = Vec::<BoundedLinearTermMeta>::new();
     for (j, term) in spec.linear_terms.iter().enumerate() {
@@ -12129,10 +12129,10 @@ fn fit_bounded_term_collection_with_design(
                 LinearCoefficientGeometry::Bounded { .. }
             )
         {
-            crate::bail_invalid_estim!(format!(
+            crate::bail_invalid_estim!(
                 "bounded linear term '{}' cannot also use double_penalty",
                 term.name
-            ));
+            );
         }
         if let LinearCoefficientGeometry::Bounded { min, max, prior } =
             term.coefficient_geometry.clone()
@@ -12148,7 +12148,7 @@ fn fit_bounded_term_collection_with_design(
         }
     }
     if bounded_terms.is_empty() {
-        crate::bail_invalid_estim!("internal bounded fit path called with no bounded terms".to_string(),);
+        crate::bail_invalid_estim!("internal bounded fit path called with no bounded terms");
     }
 
     let mut designzeroed = fit_design.clone();
@@ -12162,11 +12162,11 @@ fn fit_bounded_term_collection_with_design(
         .map(|vals| Array1::from_vec(vals.to_vec()))
         .unwrap_or_else(|| Array1::zeros(fit_penalties.len()));
     if initial_log_lambdas.len() != fit_penalties.len() {
-        crate::bail_invalid_estim!(format!(
+        crate::bail_invalid_estim!(
             "heuristic lambda length mismatch for bounded model: got {}, expected {}",
             initial_log_lambdas.len(),
             fit_penalties.len()
-        ));
+        );
     }
 
     let is_beta_logistic = family.is_binomial_beta_logistic();
@@ -13615,12 +13615,12 @@ pub(crate) fn try_build_latent_coord_hyper_dirs(
         _ => return Ok(None),
     };
     if operator.p_out() != global_range.len() {
-        crate::bail_invalid_estim!(format!(
+        crate::bail_invalid_estim!(
             "LatentCoord derivative width mismatch for term '{}': operator p={}, coeff range={}",
             smooth_term.name,
             operator.p_out(),
             global_range.len()
-        ));
+        );
     }
     let operator = std::sync::Arc::new(operator);
     let mut hyper_dirs = Vec::with_capacity(operator.n_axes());
@@ -13720,11 +13720,11 @@ fn append_latent_ard_seed(
 ) -> Result<(), EstimationError> {
     if let Some(init) = init {
         if init.len() != latent_dim {
-            crate::bail_invalid_estim!(format!(
+            crate::bail_invalid_estim!(
                 "latent dim_selection init_log_precision length mismatch: got {}, expected {}",
                 init.len(),
                 latent_dim
-            ));
+            );
         }
         values.extend(init.iter().copied());
     } else {
@@ -13752,11 +13752,11 @@ fn latent_id_objective_contribution(
     let t_start = rho_dim;
     let direct_start = t_start + flat_len + analytic_rho_count;
     if theta.len() < direct_start {
-        crate::bail_invalid_estim!(format!(
+        crate::bail_invalid_estim!(
             "latent-coordinate theta too short for id objective: got {}, need at least {}",
             theta.len(),
             direct_start
-        ));
+        );
     }
     let t = latent.as_matrix();
     let mut cost = 0.0;
@@ -13824,11 +13824,11 @@ fn latent_id_objective_contribution(
     }
 
     if cursor != theta.len() {
-        crate::bail_invalid_estim!(format!(
+        crate::bail_invalid_estim!(
             "latent-coordinate direct hyperparameter length mismatch: consumed {}, theta len {}",
             cursor,
             theta.len()
-        ));
+        );
     }
     Ok(LatentIdObjectiveContribution { cost, gradient })
 }
@@ -13848,11 +13848,11 @@ fn add_latent_id_objective_to_eval(
         latent_id_objective_contribution(theta, rho_dim, analytic_rho_count, latent)?;
     eval.0 += contribution.cost;
     if eval.1.len() != contribution.gradient.len() {
-        crate::bail_invalid_estim!(format!(
+        crate::bail_invalid_estim!(
             "latent-coordinate REML gradient length mismatch: base={}, id={}",
             eval.1.len(),
             contribution.gradient.len()
-        ));
+        );
     }
     eval.1 += &contribution.gradient;
     if eval.2.is_analytic() {
@@ -13873,11 +13873,11 @@ fn analytic_penalty_objective_contribution(
     let rho_start = t_end;
     let rho_end = rho_start + registry.total_rho_count();
     if theta.len() < rho_end {
-        crate::bail_invalid_estim!(format!(
+        crate::bail_invalid_estim!(
             "latent-coordinate theta too short for analytic penalties: got {}, need at least {}",
             theta.len(),
             rho_end
-        ));
+        );
     }
     let target_t = theta.slice(s![t_start..t_end]);
     let rho = theta.slice(s![rho_start..rho_end]);
@@ -13890,22 +13890,22 @@ fn analytic_penalty_objective_contribution(
                 cost += penalty.value(target_t.view(), rho_local);
                 let grad = penalty.grad_target(target_t.view(), rho_local);
                 if grad.len() != flat_len {
-                    crate::bail_invalid_estim!(format!(
+                    crate::bail_invalid_estim!(
                         "analytic penalty {name:?} gradient length mismatch: got {}, expected {}",
                         grad.len(),
                         flat_len
-                    ));
+                    );
                 }
                 for i in 0..flat_len {
                     gradient[t_start + i] += grad[i];
                 }
                 let grad_rho_local = penalty.grad_rho(target_t.view(), rho_local);
                 if grad_rho_local.len() != rho_slice.len() {
-                    crate::bail_invalid_estim!(format!(
+                    crate::bail_invalid_estim!(
                         "analytic penalty {name:?} rho-gradient length mismatch: got {}, expected {}",
                         grad_rho_local.len(),
                         rho_slice.len()
-                    ));
+                    );
                 }
                 for local_idx in 0..grad_rho_local.len() {
                     gradient[rho_start + rho_slice.start + local_idx] += grad_rho_local[local_idx];
@@ -13935,11 +13935,11 @@ fn add_analytic_penalty_hessian_to_eval(
     let rho_start = t_end;
     let rho_end = rho_start + registry.total_rho_count();
     if theta.len() < rho_end {
-        crate::bail_invalid_estim!(format!(
+        crate::bail_invalid_estim!(
             "latent-coordinate theta too short for analytic penalty Hessian: got {}, need at least {}",
             theta.len(),
             rho_end
-        ));
+        );
     }
     let crate::solver::outer_strategy::HessianResult::Analytic(hessian) = &mut eval.2 else {
         if eval.2.is_analytic() {
@@ -13948,13 +13948,13 @@ fn add_analytic_penalty_hessian_to_eval(
         return Ok(());
     };
     if hessian.dim() != (theta.len(), theta.len()) {
-        crate::bail_invalid_estim!(format!(
+        crate::bail_invalid_estim!(
             "analytic penalty Hessian target shape mismatch: got {}x{}, expected {}x{}",
             hessian.nrows(),
             hessian.ncols(),
             theta.len(),
             theta.len()
-        ));
+        );
     }
     let target_t = theta.slice(s![t_start..t_end]);
     let rho = theta.slice(s![rho_start..rho_end]);
@@ -13966,11 +13966,11 @@ fn add_analytic_penalty_hessian_to_eval(
         }
         if let Some(diag) = penalty.hessian_diag(target_t.view(), rho_local) {
             if diag.len() != flat_len {
-                crate::bail_invalid_estim!(format!(
+                crate::bail_invalid_estim!(
                     "analytic penalty Hessian diagonal length mismatch: got {}, expected {}",
                     diag.len(),
                     flat_len
-                ));
+                );
             }
             for i in 0..flat_len {
                 hessian[[t_start + i, t_start + i]] += diag[i];
@@ -13982,11 +13982,11 @@ fn add_analytic_penalty_hessian_to_eval(
             probe[col] = 1.0;
             let hv = penalty.hvp(target_t.view(), rho_local, probe.view());
             if hv.len() != flat_len {
-                crate::bail_invalid_estim!(format!(
+                crate::bail_invalid_estim!(
                     "analytic penalty Hessian-vector length mismatch: got {}, expected {}",
                     hv.len(),
                     flat_len
-                ));
+                );
             }
             for row in 0..flat_len {
                 hessian[[t_start + row, t_start + col]] += hv[row];
@@ -14011,11 +14011,11 @@ fn add_analytic_penalty_objective_to_eval(
     let contribution = analytic_penalty_objective_contribution(theta, rho_dim, latent, registry)?;
     eval.0 += contribution.cost;
     if eval.1.len() != contribution.gradient.len() {
-        crate::bail_invalid_estim!(format!(
+        crate::bail_invalid_estim!(
             "latent-coordinate REML gradient length mismatch: base={}, analytic_penalty={}",
             eval.1.len(),
             contribution.gradient.len()
-        ));
+        );
     }
     eval.1 += &contribution.gradient;
     add_analytic_penalty_hessian_to_eval(theta, rho_dim, latent, registry, eval)?;
@@ -14767,11 +14767,11 @@ impl SingleBlockLatentCoordDesignCache {
                     ))
                 })?;
                 if rebuilt.design.ncols() != rebuilt_width {
-                    crate::bail_invalid_estim!(format!(
+                    crate::bail_invalid_estim!(
                         "latent-coordinate design topology changed: rebuilt p={}, cached p={}",
                         rebuilt.design.ncols(),
                         rebuilt_width
-                    ));
+                    );
                 }
                 let hyper_dirs = try_build_latent_coord_hyper_dirs(
                     latent.clone(),
@@ -15427,12 +15427,12 @@ fn try_exact_joint_spatial_aniso_optimization(
                 result.final_value.abs(),
             );
         } else {
-            crate::bail_invalid_estim!(format!(
+            crate::bail_invalid_estim!(
                 "anisotropic analytic optimization did not converge after {} iterations (final_objective={:.6e}, final_grad_norm={})",
                 result.iterations,
                 result.final_value,
                 result.final_grad_norm_report(),
-            ));
+            );
         }
     }
     log::trace!(
@@ -15780,12 +15780,12 @@ fn try_exact_joint_spatial_isotropic_optimization(
                 result.final_value.abs(),
             );
         } else {
-            crate::bail_invalid_estim!(format!(
+            crate::bail_invalid_estim!(
                 "isotropic analytic optimization did not converge after {} iterations (final_objective={:.6e}, final_grad_norm={})",
                 result.iterations,
                 result.final_value,
                 result.final_grad_norm_report(),
-            ));
+            );
         }
     }
     log::trace!(
@@ -15803,9 +15803,9 @@ fn set_spatial_length_scale(
     length_scale: f64,
 ) -> Result<(), EstimationError> {
     let Some(term) = spec.smooth_terms.get_mut(term_idx) else {
-        crate::bail_invalid_estim!(format!(
+        crate::bail_invalid_estim!(
             "spatial length-scale term index {term_idx} out of range"
-        ));
+        );
     };
     match &mut term.basis {
         SmoothBasisSpec::ThinPlate { spec, .. } => {
@@ -15940,18 +15940,18 @@ pub fn freeze_term_collection_from_design(
     design: &TermCollectionDesign,
 ) -> Result<TermCollectionSpec, EstimationError> {
     if spec.smooth_terms.len() != design.smooth.terms.len() {
-        crate::bail_invalid_estim!(format!(
+        crate::bail_invalid_estim!(
             "freeze mismatch: smooth spec count {} != design smooth term count {}",
             spec.smooth_terms.len(),
             design.smooth.terms.len()
-        ));
+        );
     }
     if spec.random_effect_terms.len() != design.random_effect_levels.len() {
-        crate::bail_invalid_estim!(format!(
+        crate::bail_invalid_estim!(
             "freeze mismatch: random-effect spec count {} != design random-effect term count {}",
             spec.random_effect_terms.len(),
             design.random_effect_levels.len()
-        ));
+        );
     }
 
     let mut frozen = spec.clone();
@@ -16230,13 +16230,13 @@ pub fn freeze_term_collection_from_design(
                 },
             ) => {
                 if s.marginalspecs.len() != knots.len() || s.marginalspecs.len() != degrees.len() {
-                    crate::bail_invalid_estim!(format!(
+                    crate::bail_invalid_estim!(
                         "tensor freeze mismatch for '{}': marginalspecs={}, knots={}, degrees={}",
                         term.name,
                         s.marginalspecs.len(),
                         knots.len(),
                         degrees.len()
-                    ));
+                    );
                 }
                 *feature_cols = fitted_cols.clone();
                 for i in 0..s.marginalspecs.len() {
@@ -16333,10 +16333,10 @@ pub fn freeze_term_collection_from_design(
                 }
             }
             _ => {
-                crate::bail_invalid_estim!(format!(
+                crate::bail_invalid_estim!(
                     "smooth metadata/spec type mismatch while freezing term '{}'",
                     term.name
-                ));
+                );
             }
         }
     }
@@ -17259,12 +17259,12 @@ fn build_term_collection_fixed_blocks(
         for linear in &spec.linear_terms {
             for &col in &linear.effective_feature_cols() {
                 if col >= data.ncols() {
-                    crate::bail_dim_basis!(format!(
+                    crate::bail_dim_basis!(
                         "linear term '{}' feature column {} out of bounds for {} columns",
                         linear.name,
                         col,
                         data.ncols()
-                    ));
+                    );
                 }
             }
         }
@@ -18376,7 +18376,7 @@ fn try_exact_joint_latent_coord_optimization(
     let rho_dim = best.fit.lambdas.len();
     let latent_flat_dim = latent.values.len();
     if latent_flat_dim == 0 {
-        crate::bail_invalid_estim!("latent-coordinate optimization requires a non-empty latent block".to_string(),);
+        crate::bail_invalid_estim!("latent-coordinate optimization requires a non-empty latent block");
     }
     let direct_hypers =
         latent_coord_initial_direct_hypers(latent.values.id_mode(), latent.values.latent_dim())?;
@@ -18521,11 +18521,11 @@ fn try_exact_joint_latent_coord_optimization(
                     (efs.psi_gradient.as_mut(), efs.psi_indices.as_ref())
                 {
                     if psi_gradient.len() != psi_indices.len() {
-                        crate::bail_invalid_estim!(format!(
+                        crate::bail_invalid_estim!(
                             "latent-coordinate analytic penalty EFS psi gradient length mismatch: gradient={}, indices={}",
                             psi_gradient.len(),
                             psi_indices.len()
-                        ));
+                        );
                     }
                     for (local_idx, &theta_idx) in psi_indices.iter().enumerate() {
                         psi_gradient[local_idx] += contribution.gradient[theta_idx];
@@ -18696,12 +18696,12 @@ fn try_exact_joint_latent_coord_optimization(
             })?
     };
     if !result.converged {
-        crate::bail_invalid_estim!(format!(
+        crate::bail_invalid_estim!(
             "latent-coordinate joint optimization did not converge after {} iterations (final_objective={:.6e}, final_grad_norm={})",
             result.iterations,
             result.final_value,
             result.final_grad_norm_report(),
-        ));
+        );
     }
 
     let theta_star = result.rho;
@@ -18754,13 +18754,13 @@ pub fn fit_term_collectionwith_latent_coord_optimization(
 ) -> Result<FittedTermCollectionWithSpec, EstimationError> {
     let n = data.nrows();
     if !(y.len() == n && weights.len() == n && offset.len() == n) {
-        crate::bail_invalid_estim!(format!(
+        crate::bail_invalid_estim!(
             "fit_term_collectionwith_latent_coord_optimization row mismatch: n={}, y={}, weights={}, offset={}",
             n,
             y.len(),
             weights.len(),
             offset.len()
-        ));
+        );
     }
     let best = fit_term_collection_forspec(
         data,
@@ -18814,13 +18814,13 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
     let spatial_terms = spatial_length_scale_term_indices(&resolvedspec);
     let n = data.nrows();
     if !(y.len() == n && weights.len() == n && offset.len() == n) {
-        crate::bail_invalid_estim!(format!(
+        crate::bail_invalid_estim!(
             "fit_term_collectionwith_spatial_length_scale_optimization row mismatch: n={}, y={}, weights={}, offset={}",
             n,
             y.len(),
             weights.len(),
             offset.len()
-        ));
+        );
     }
     if !kappa_options.enabled || spatial_terms.is_empty() {
         let out = fit_term_collection_forspec(
@@ -18841,17 +18841,17 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
         });
     }
     if kappa_options.max_outer_iter == 0 {
-        crate::bail_invalid_estim!("spatial kappa optimization requires max_outer_iter >= 1".to_string(),);
+        crate::bail_invalid_estim!("spatial kappa optimization requires max_outer_iter >= 1");
     }
     if !(kappa_options.log_step.is_finite() && kappa_options.log_step > 0.0) {
-        crate::bail_invalid_estim!("spatial kappa optimization requires log_step > 0".to_string(),);
+        crate::bail_invalid_estim!("spatial kappa optimization requires log_step > 0");
     }
     if !(kappa_options.min_length_scale.is_finite()
         && kappa_options.max_length_scale.is_finite()
         && kappa_options.min_length_scale > 0.0
         && kappa_options.max_length_scale >= kappa_options.min_length_scale)
     {
-        crate::bail_invalid_estim!("spatial kappa optimization requires valid positive length_scale bounds".to_string(),);
+        crate::bail_invalid_estim!("spatial kappa optimization requires valid positive length_scale bounds");
     }
 
     let pilot_threshold = kappa_options.pilot_subsample_threshold;
