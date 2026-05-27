@@ -26,6 +26,31 @@
 //! the caller falls through to the CPU Rayon parity oracle), `Ok(Some(...))`
 //! on a real device success, and `Err(_)` on a driver / shape failure the
 //! caller should surface rather than swallow.
+//!
+//! ## Task ledger (sigma-cubature charter)
+//!
+//! - P3 (#28) — stream-pool executor scaffold + `sigma_cubature_dispatch`
+//!   swap site in [`crate::solver::reml::eval`]. **DONE** (prior commit).
+//! - P5 (#30) — per-row family-derivative device evaluation via
+//!   [`try_device_sigma_eval`], wired through the cached `pirls_row`
+//!   per-`(family, curvature)` kernels and the [`crate::gpu::common`]
+//!   `PtxModuleCache` + `DeviceArena` substrate. **DONE**.
+//! - P6 (#31) — device-side moment accumulation in
+//!   [`try_device_moment_reduce`] (three NVRTC reductions sharing one
+//!   PTX cache slot: `sigma_mean_hinv` + `sigma_mean_beta` +
+//!   `sigma_second_beta`). Only the reduced `p×p` block crosses PCIe.
+//!   **DONE**.
+//! - P7 (#32) — batched dispatch in [`try_device_sigma_eval_batched`],
+//!   fusing M sigma-points × N rows into a single 2-D grid launch per
+//!   family. Auto-selected above [`BATCHED_DISPATCH_MIN_M`] and below
+//!   [`BATCHED_DISPATCH_MAX_P`]. **DONE**.
+//!
+//! The dispatch site in [`crate::solver::reml::eval::sigma_cubature_dispatch`]
+//! exercises all three entries in order (batched → per-stream → CPU
+//! oracle) and is gated on the upstream
+//! `eval::device_pirls_stage3_ready` readiness signal; flipping that
+//! signal is the only remaining step to enable the device path in
+//! production fits.
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 

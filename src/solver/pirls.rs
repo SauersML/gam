@@ -7663,12 +7663,13 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
                 PirlsPenalty::Diagonal { .. } => x_t_view, // shape mismatch — would fail admission
             };
             // Dense-design materialization for `PirlsResult.x_transformed`.
+            let qs_arc_for_design = qs_arc
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| Arc::new(Array2::<f64>::eye(penalty.p)));
             let x_transformed_design = make_reparam_operator(
                 &x_original_for_result,
-                qs_arc
-                    .as_ref()
-                    .cloned()
-                    .unwrap_or_else(|| Arc::new(Array2::<f64>::eye(penalty.p))),
+                &qs_arc_for_design,
                 use_sparse_native,
             );
             let reparam_for_dispatch = materialize_final_reparam_result()?;
