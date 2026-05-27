@@ -199,6 +199,110 @@ impl JointPenaltySpec {
     }
 }
 
+/// Per-evaluation bundle of cross-block penalties paired with their current
+/// log-smoothing parameters.
+///
+/// The outer optimizer concatenates joint penalty `log λ` values onto the
+/// per-block ρ vector; the inner solver receives this bundle via
+/// [`crate::families::custom_family::BlockwiseFitOptions::joint_penalties`]
+/// and adds the full-width quadratic / matvec / preconditioner / Hessian
+/// contributions to the joint-Newton primitives.
+#[derive(Clone)]
+pub struct JointPenaltyBundle {
+    pub specs: std::sync::Arc<Vec<JointPenaltySpec>>,
+    pub log_lambdas: Vec<f64>,
+}
+
+impl JointPenaltyBundle {
+    /// Build a bundle, validating the per-penalty `log λ` count and dimension
+    /// agreement against `total_compiled`.
+    pub fn new(
+        specs: std::sync::Arc<Vec<JointPenaltySpec>>,
+        log_lambdas: Vec<f64>,
+        total_compiled: usize,
+    ) -> Result<Self, String> {
+        if specs.len() != log_lambdas.len() {
+            return Err(format!(
+                "joint penalty bundle: {} specs vs {} log_lambdas",
+                specs.len(),
+                log_lambdas.len(),
+            ));
+        }
+        for (i, spec) in specs.iter().enumerate() {
+            if spec.dim() != total_compiled {
+                return Err(format!(
+                    "joint penalty {i}: dim {} != total_compiled {}",
+                    spec.dim(),
+                    total_compiled,
+                ));
+            }
+        }
+        Ok(Self { specs, log_lambdas })
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.specs.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.specs.is_empty()
+    }
+
+    /// Total joint-penalty contribution to the objective:
+    ///   `½ Σ_j exp(ρ_j) · βᵀ S_j β`.
+    pub fn quadratic(&self, beta: ArrayView1<'_, f64>) -> f64 {
+        let mut total = 0.0;
+        for (spec, &log_lambda) in self.specs.iter().zip(self.log_lambdas.iter()) {
+            let lam = log_lambda.exp();
+            total += 0.5 * lam * spec.quadratic_form(beta);
+        }
+        total
+    }
+
+    /// Accumulate `Σ_j exp(ρ_j) · S_j · v` into `out` (additive).
+    pub fn add_apply_into(&self, vector: ArrayView1<'_, f64>, out: &mut ndarray::Array1<f64>) {
+        assert_eq!(out.len(), vector.len());
+        for (spec, &log_lambda) in self.specs.iter().zip(self.log_lambdas.iter()) {
+            let lam = log_lambda.exp();
+            let sv = spec.matrix.dot(&vector);
+            out.scaled_add(lam, &sv);
+        }
+    }
+
+    /// Accumulate `Σ_j exp(ρ_j) · diag(S_j)` into `diag` (additive).
+    pub fn add_diag(&self, diag: &mut ndarray::Array1<f64>) {
+        for (spec, &log_lambda) in self.specs.iter().zip(self.log_lambdas.iter()) {
+            let lam = log_lambda.exp();
+            for (i, value) in spec.matrix.diag().iter().enumerate() {
+                diag[i] += lam * *value;
+            }
+        }
+    }
+
+    /// Accumulate `Σ_j exp(ρ_j) · S_j` into the full `matrix` (additive).
+    pub fn add_to_matrix(&self, matrix: &mut Array2<f64>) {
+        assert_eq!(matrix.nrows(), matrix.ncols());
+        for (spec, &log_lambda) in self.specs.iter().zip(self.log_lambdas.iter()) {
+            let lam = log_lambda.exp();
+            matrix.scaled_add(lam, &spec.matrix);
+        }
+    }
+
+    /// Per-penalty ρ-gradient contribution to the outer objective term:
+    ///   `∂/∂ρ_j [½ exp(ρ_j) βᵀ S_j β] = exp(ρ_j) · ½ βᵀ S_j β`.
+    pub fn rho_objective_gradient(&self, beta: ArrayView1<'_, f64>, out: &mut [f64]) {
+        assert_eq!(out.len(), self.specs.len());
+        for (i, (spec, &log_lambda)) in
+            self.specs.iter().zip(self.log_lambdas.iter()).enumerate()
+        {
+            let lam = log_lambda.exp();
+            out[i] = 0.5 * lam * spec.quadratic_form(beta);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
