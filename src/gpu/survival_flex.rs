@@ -3998,7 +3998,7 @@ pub struct SurvivalFlexBlock10FourthInputs<'a> {
 
 #[inline]
 fn b10_dot(a: &[f64], b: &[f64]) -> f64 {
-    debug_assert_eq!(a.len(), b.len());
+    assert_eq!(a.len(), b.len(), "b10_dot: length mismatch");
     let mut acc = 0.0_f64;
     for i in 0..a.len() {
         acc += a[i] * b[i];
@@ -4008,8 +4008,8 @@ fn b10_dot(a: &[f64], b: &[f64]) -> f64 {
 
 #[inline]
 fn b10_mat_dot(m: &[f64], v: &[f64], p: usize) -> Vec<f64> {
-    debug_assert_eq!(m.len(), p * p);
-    debug_assert_eq!(v.len(), p);
+    assert_eq!(m.len(), p * p, "b10_mat_dot: matrix shape mismatch");
+    assert_eq!(v.len(), p, "b10_mat_dot: vector length mismatch");
     let mut out = vec![0.0_f64; p];
     for u in 0..p {
         let mut acc = 0.0_f64;

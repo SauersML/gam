@@ -986,6 +986,35 @@ impl DeviationRuntime {
         &self.endpoint_points
     }
 
+    /// Borrowed row-major snapshot of the per-span constant coefficient table
+    /// `[n_spans, basis_dim]`. Returns `None` when the underlying `Array2`'s
+    /// memory layout is not the standard contiguous row-major layout (the
+    /// constructor invariant always holds, so this is a defensive fallback).
+    pub fn span_c0_slice(&self) -> Option<&[f64]> {
+        self.span_c0.as_slice()
+    }
+
+    /// See [`Self::span_c0_slice`].
+    pub fn span_c1_slice(&self) -> Option<&[f64]> {
+        self.span_c1.as_slice()
+    }
+
+    /// See [`Self::span_c0_slice`].
+    pub fn span_c2_slice(&self) -> Option<&[f64]> {
+        self.span_c2.as_slice()
+    }
+
+    /// See [`Self::span_c0_slice`].
+    pub fn span_c3_slice(&self) -> Option<&[f64]> {
+        self.span_c3.as_slice()
+    }
+
+    /// Borrowed snapshot of the per-basis right-boundary saturated value
+    /// vector (length `basis_dim`).
+    pub fn right_boundary_value_row_slice(&self) -> Option<&[f64]> {
+        self.right_boundary_value_row.as_slice()
+    }
+
     fn span_interval(&self, span_idx: usize) -> Result<(f64, f64), String> {
         if span_idx >= self.span_count() {
             return Err(DeviationRuntimeError::InvalidInput {
