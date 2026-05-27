@@ -21720,10 +21720,7 @@ mod tests {
             weights.view(),
             offset.view(),
             &spec,
-            LikelihoodSpec::new(
-                ResponseFamily::Gaussian,
-                InverseLink::Standard(StandardLink::Identity),
-            ),
+            LikelihoodSpec::gaussian_identity(),
             &fit_opts,
         )
         .expect("baseline fit should succeed");
@@ -21735,10 +21732,7 @@ mod tests {
             weights.clone(),
             offset.clone(),
             &spec,
-            LikelihoodSpec::new(
-                ResponseFamily::Gaussian,
-                InverseLink::Standard(StandardLink::Identity),
-            ),
+            LikelihoodSpec::gaussian_identity(),
             &fit_opts,
             &SpatialLengthScaleOptimizationOptions {
                 max_outer_iter: 2,
@@ -21934,17 +21928,11 @@ mod tests {
         // non-Gaussian dense-lazy designs through `build_outer_hessian_operator`
         // at biobank scale and through `compute_outer_hessian` otherwise.
         assert!(exact_joint_spatial_outer_hessian_available(
-            &LikelihoodSpec::new(
-                ResponseFamily::Binomial,
-                InverseLink::Standard(StandardLink::Logit),
-            ),
+            &LikelihoodSpec::binomial_logit(),
             &design,
         ));
         assert!(exact_joint_spatial_outer_hessian_available(
-            &LikelihoodSpec::new(
-                ResponseFamily::Gaussian,
-                InverseLink::Standard(StandardLink::Identity),
-            ),
+            &LikelihoodSpec::gaussian_identity(),
             &design,
         ));
     }
@@ -22013,10 +22001,7 @@ mod tests {
         theta.slice_mut(s![rho_dim..]).assign(log_kappa0.as_array());
 
         let external_opts = external_opts_for_design(
-            &LikelihoodSpec::new(
-                ResponseFamily::Gaussian,
-                InverseLink::Standard(StandardLink::Identity),
-            ),
+            &LikelihoodSpec::gaussian_identity(),
             &design,
             &fit_opts,
         );
@@ -22108,10 +22093,7 @@ mod tests {
         let (pass, worst, violations) = iso_kappa_fd_variant_driver(
             "duchon_probit_n80",
             80,
-            LikelihoodSpec::new(
-                ResponseFamily::Binomial,
-                InverseLink::Standard(StandardLink::Probit),
-            ),
+            LikelihoodSpec::binomial_probit(),
             false,
             false,
         );
@@ -22354,10 +22336,7 @@ mod tests {
         let (pass, worst, violations) = iso_kappa_fd_variant_driver(
             "duchon_gaussian",
             80,
-            LikelihoodSpec::new(
-                ResponseFamily::Gaussian,
-                InverseLink::Standard(StandardLink::Identity),
-            ),
+            LikelihoodSpec::gaussian_identity(),
             false,
             false,
         );
@@ -22373,10 +22352,7 @@ mod tests {
         let (pass, worst, violations) = iso_kappa_fd_variant_driver(
             "duchon_logit",
             80,
-            LikelihoodSpec::new(
-                ResponseFamily::Binomial,
-                InverseLink::Standard(StandardLink::Logit),
-            ),
+            LikelihoodSpec::binomial_logit(),
             false,
             false,
         );
@@ -22392,10 +22368,7 @@ mod tests {
         let (pass, worst, violations) = iso_kappa_fd_variant_driver(
             "tps_probit",
             80,
-            LikelihoodSpec::new(
-                ResponseFamily::Binomial,
-                InverseLink::Standard(StandardLink::Probit),
-            ),
+            LikelihoodSpec::binomial_probit(),
             true,
             false,
         );
@@ -22411,10 +22384,7 @@ mod tests {
         let (pass, worst, violations) = iso_kappa_fd_variant_driver(
             "duchon_probit_n20",
             20,
-            LikelihoodSpec::new(
-                ResponseFamily::Binomial,
-                InverseLink::Standard(StandardLink::Probit),
-            ),
+            LikelihoodSpec::binomial_probit(),
             false,
             false,
         );
@@ -22430,10 +22400,7 @@ mod tests {
         let (pass, _worst, violations) = iso_kappa_fd_variant_driver(
             "duchon_probit_rho_only",
             80,
-            LikelihoodSpec::new(
-                ResponseFamily::Binomial,
-                InverseLink::Standard(StandardLink::Probit),
-            ),
+            LikelihoodSpec::binomial_probit(),
             false,
             true,
         );
@@ -22516,10 +22483,7 @@ mod tests {
         let psi_dim: usize = dims_per_term.iter().sum();
 
         let external_opts = external_opts_for_design(
-            &LikelihoodSpec::new(
-                ResponseFamily::Binomial,
-                InverseLink::Standard(StandardLink::Probit),
-            ),
+            &LikelihoodSpec::binomial_probit(),
             &frozen_design,
             &fit_opts,
         );
@@ -22737,10 +22701,7 @@ mod tests {
         let psi_dim: usize = dims_per_term.iter().sum();
 
         let external_opts = external_opts_for_design(
-            &LikelihoodSpec::new(
-                ResponseFamily::Binomial,
-                InverseLink::Standard(StandardLink::Probit),
-            ),
+            &LikelihoodSpec::binomial_probit(),
             &frozen_design,
             &fit_opts,
         );
@@ -22982,10 +22943,7 @@ mod tests {
         let psi_dim: usize = dims_per_term.iter().sum();
 
         let external_opts = external_opts_for_design(
-            &LikelihoodSpec::new(
-                ResponseFamily::Binomial,
-                InverseLink::Standard(StandardLink::Probit),
-            ),
+            &LikelihoodSpec::binomial_probit(),
             &frozen_design,
             &fit_opts,
         );
@@ -23100,10 +23058,7 @@ mod tests {
 
         assert!(matches!(design.design, DesignMatrix::Sparse(_)));
         assert!(exact_joint_spatial_outer_hessian_available(
-            &LikelihoodSpec::new(
-                ResponseFamily::Binomial,
-                InverseLink::Standard(StandardLink::Logit),
-            ),
+            &LikelihoodSpec::binomial_logit(),
             &design,
         ));
     }
@@ -24042,10 +23997,7 @@ mod tests {
         theta1[rho_dim] += 0.3;
 
         let external_opts = external_opts_for_design(
-            &LikelihoodSpec::new(
-                ResponseFamily::Gaussian,
-                InverseLink::Standard(StandardLink::Identity),
-            ),
+            &LikelihoodSpec::gaussian_identity(),
             &design,
             &fit_opts,
         );
@@ -24099,10 +24051,7 @@ mod tests {
                 .expect("reused eval");
 
                 let fresh_opts = external_opts_for_design(
-                    &LikelihoodSpec::new(
-                        ResponseFamily::Gaussian,
-                        InverseLink::Standard(StandardLink::Identity),
-                    ),
+                    &LikelihoodSpec::gaussian_identity(),
                     cache.design(),
                     &fit_opts,
                 );
@@ -24540,10 +24489,7 @@ mod tests {
             weights.view(),
             offset.view(),
             &spec,
-            LikelihoodSpec::new(
-                ResponseFamily::Gaussian,
-                InverseLink::Standard(StandardLink::Identity),
-            ),
+            LikelihoodSpec::gaussian_identity(),
             &fit_opts,
         )
         .expect("baseline fit should succeed");
@@ -24555,10 +24501,7 @@ mod tests {
             weights.clone(),
             offset.clone(),
             &spec,
-            LikelihoodSpec::new(
-                ResponseFamily::Gaussian,
-                InverseLink::Standard(StandardLink::Identity),
-            ),
+            LikelihoodSpec::gaussian_identity(),
             &fit_opts,
             &SpatialLengthScaleOptimizationOptions {
                 max_outer_iter: 2,
@@ -24646,10 +24589,7 @@ mod tests {
             weights,
             offset,
             &spec,
-            LikelihoodSpec::new(
-                ResponseFamily::Binomial,
-                InverseLink::Standard(StandardLink::Logit),
-            ),
+            LikelihoodSpec::binomial_logit(),
             &fit_opts,
             &SpatialLengthScaleOptimizationOptions {
                 max_outer_iter: 2,
@@ -24762,10 +24702,7 @@ mod tests {
             weights,
             offset,
             &spec,
-            LikelihoodSpec::new(
-                ResponseFamily::Gaussian,
-                InverseLink::Standard(StandardLink::Identity),
-            ),
+            LikelihoodSpec::gaussian_identity(),
             &fit_opts,
             &SpatialLengthScaleOptimizationOptions::default(),
         )
@@ -25118,10 +25055,7 @@ mod tests {
             Array1::ones(data.nrows()),
             Array1::zeros(data.nrows()),
             &spec,
-            LikelihoodSpec::new(
-                ResponseFamily::Gaussian,
-                InverseLink::Standard(StandardLink::Identity),
-            ),
+            LikelihoodSpec::gaussian_identity(),
             &fit_opts,
             &SpatialLengthScaleOptimizationOptions::default(),
         )
@@ -25380,10 +25314,7 @@ mod tests {
             Array1::ones(n),
             Array1::zeros(n),
             &spec,
-            LikelihoodSpec::new(
-                ResponseFamily::Gaussian,
-                InverseLink::Standard(StandardLink::Identity),
-            ),
+            LikelihoodSpec::gaussian_identity(),
             &fit_opts,
             &SpatialLengthScaleOptimizationOptions::default(),
         )
@@ -25744,10 +25675,7 @@ mod tests {
             Array1::ones(n),
             Array1::zeros(n),
             &spec,
-            LikelihoodSpec::new(
-                ResponseFamily::Gaussian,
-                InverseLink::Standard(StandardLink::Identity),
-            ),
+            LikelihoodSpec::gaussian_identity(),
             &FitOptions {
                 latent_cloglog: None,
                 mixture_link: None,
@@ -25908,10 +25836,7 @@ mod tests {
         let y = array![0.4, 1.0, 1.7, 2.2];
         let weights = Array1::ones(y.len());
         let family = BoundedLinearFamily {
-            family: LikelihoodSpec::new(
-                ResponseFamily::Gaussian,
-                InverseLink::Standard(StandardLink::Identity),
-            ),
+            family: LikelihoodSpec::gaussian_identity(),
             latent_cloglog_state: None,
             mixture_link_state: None,
             sas_link_state: None,
@@ -26017,10 +25942,7 @@ mod tests {
     #[test]
     fn adaptive_exact_psigradient_symmetrizes_nearly_symmetrichessian() {
         let family = SpatialAdaptiveExactFamily {
-            family: LikelihoodSpec::new(
-                ResponseFamily::Gaussian,
-                InverseLink::Standard(StandardLink::Identity),
-            ),
+            family: LikelihoodSpec::gaussian_identity(),
             latent_cloglog_state: None,
             mixture_link_state: None,
             sas_link_state: None,
@@ -26256,10 +26178,7 @@ mod tests {
             Array1::ones(n).view(),
             Array1::zeros(n).view(),
             &spec,
-            LikelihoodSpec::new(
-                ResponseFamily::Gaussian,
-                InverseLink::Standard(StandardLink::Identity),
-            ),
+            LikelihoodSpec::gaussian_identity(),
             &FitOptions {
                 latent_cloglog: None,
                 mixture_link: None,
@@ -26346,10 +26265,7 @@ mod tests {
             Array1::ones(n).view(),
             Array1::zeros(n).view(),
             &spec,
-            LikelihoodSpec::new(
-                ResponseFamily::Gaussian,
-                InverseLink::Standard(StandardLink::Identity),
-            ),
+            LikelihoodSpec::gaussian_identity(),
             &FitOptions {
                 latent_cloglog: None,
                 mixture_link: None,
@@ -26447,9 +26363,8 @@ mod tests {
             Array1::ones(n).view(),
             Array1::zeros(n).view(),
             &spec,
-            LikelihoodSpec::new(
-                ResponseFamily::Binomial,
-                InverseLink::Sas(SasLinkState::new(0.1, -0.2).expect("valid SAS link state")),
+            LikelihoodSpec::binomial_sas(
+                SasLinkState::new(0.1, -0.2).expect("valid SAS link state"),
             ),
             &FitOptions {
                 latent_cloglog: None,
@@ -26537,10 +26452,7 @@ mod tests {
             Array1::ones(n).view(),
             Array1::zeros(n).view(),
             &spec,
-            LikelihoodSpec::new(
-                ResponseFamily::Gaussian,
-                InverseLink::Standard(StandardLink::Identity),
-            ),
+            LikelihoodSpec::gaussian_identity(),
             &FitOptions {
                 latent_cloglog: None,
                 mixture_link: None,
@@ -26599,10 +26511,7 @@ mod tests {
                 .collect::<Vec<_>>(),
         ];
         let base_family = SpatialAdaptiveExactFamily {
-            family: LikelihoodSpec::new(
-                ResponseFamily::Gaussian,
-                InverseLink::Standard(StandardLink::Identity),
-            ),
+            family: LikelihoodSpec::gaussian_identity(),
             latent_cloglog_state: None,
             mixture_link_state: None,
             sas_link_state: None,
@@ -26768,10 +26677,7 @@ mod tests {
             Array1::ones(n).view(),
             Array1::zeros(n).view(),
             &spec,
-            LikelihoodSpec::new(
-                ResponseFamily::Gaussian,
-                InverseLink::Standard(StandardLink::Identity),
-            ),
+            LikelihoodSpec::gaussian_identity(),
             &FitOptions {
                 latent_cloglog: None,
                 mixture_link: None,
@@ -26825,10 +26731,7 @@ mod tests {
                 .collect::<Vec<_>>(),
         ];
         let base_family = SpatialAdaptiveExactFamily {
-            family: LikelihoodSpec::new(
-                ResponseFamily::Gaussian,
-                InverseLink::Standard(StandardLink::Identity),
-            ),
+            family: LikelihoodSpec::gaussian_identity(),
             latent_cloglog_state: None,
             mixture_link_state: None,
             sas_link_state: None,
@@ -26956,10 +26859,7 @@ mod tests {
             Array1::ones(n).view(),
             Array1::zeros(n).view(),
             &spec,
-            LikelihoodSpec::new(
-                ResponseFamily::Gaussian,
-                InverseLink::Standard(StandardLink::Identity),
-            ),
+            LikelihoodSpec::gaussian_identity(),
             &FitOptions {
                 latent_cloglog: None,
                 mixture_link: None,
@@ -27008,10 +26908,7 @@ mod tests {
         let y = array![0.0, 1.0, 0.0, 1.0, 0.0, 1.0];
         let weights = Array1::ones(eta.len());
         let obs = evaluate_standard_familyobservations(
-            LikelihoodSpec::new(
-                ResponseFamily::Binomial,
-                InverseLink::Standard(StandardLink::Logit),
-            ),
+            LikelihoodSpec::binomial_logit(),
             None,
             None,
             None,
@@ -27056,14 +26953,8 @@ mod tests {
         let y = array![0.0, 1.0, 1.0, 0.0];
         let weights = Array1::ones(eta.len());
         for family in [
-            LikelihoodSpec::new(
-                ResponseFamily::Binomial,
-                InverseLink::Standard(StandardLink::Probit),
-            ),
-            LikelihoodSpec::new(
-                ResponseFamily::Binomial,
-                InverseLink::Standard(StandardLink::CLogLog),
-            ),
+            LikelihoodSpec::binomial_probit(),
+            LikelihoodSpec::binomial_cloglog(),
         ] {
             let obs = evaluate_standard_familyobservations(
                 family.clone(),
