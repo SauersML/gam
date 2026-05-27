@@ -8913,12 +8913,12 @@ impl BernoulliMarginalSlopeFamily {
         //    without any cross-context copying.
         #[cfg(target_os = "linux")]
         let cell_moments_device: Option<cudarc::driver::CudaSlice<f64>> = if build_device_moments {
+            #[cfg(debug_assertions)]
+            use crate::gpu::cubic_cell::CubicCellMomentStatus;
             use crate::gpu::cubic_cell::{
                 CubicCellDerivativeMomentHostView, CubicCellDerivativeMomentOutput,
                 CubicCellMomentResidency, try_build_cubic_cell_derivative_moments,
             };
-            #[cfg(debug_assertions)]
-            use crate::gpu::cubic_cell::CubicCellMomentStatus;
             // Sanity: the per-row loop must have produced exactly one
             // entry per cell index.
             if gpu_cells.len() != total_cells_us || gpu_branches.len() != total_cells_us {
@@ -20553,7 +20553,7 @@ mod tests {
             .build_exact_eval_cache(&states)
             .expect("first warm eval cache");
         let nan_bits = f64::NAN.to_bits();
-        for slot in cache.iter() {
+        for slot in cache.intercept_value.iter() {
             let bits = slot.load(Ordering::Relaxed);
             let v = f64::from_bits(bits);
             assert!(

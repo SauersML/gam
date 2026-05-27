@@ -217,8 +217,8 @@ fn survival_marginal_slope_v_plus_m_exact_engages_and_lifts_beta_to_raw_width() 
     // (i.e. `marginal_design.ncols()` / `logslope_design.ncols()`), not
     // the compiled (post-drop) widths. If lift were skipped, block β
     // would still be at compiled width.
-    let raw_marginal_width = result.marginal_design.ncols();
-    let raw_logslope_width = result.logslope_design.ncols();
+    let raw_marginal_width = result.marginal_design.design.ncols();
+    let raw_logslope_width = result.logslope_design.design.ncols();
 
     // Find the marginal block and the logslope block in the fitted
     // result. Survival marginal-slope concatenates blocks in order
@@ -265,7 +265,10 @@ fn survival_marginal_slope_v_plus_m_exact_engages_and_lifts_beta_to_raw_width() 
         .iter()
         .find(|b| b.beta.len() == raw_marginal_width)
         .expect("locate marginal β block");
-    let pred_marginal = result.marginal_design.apply(&marginal_beta_block.beta);
+    let pred_marginal = result
+        .marginal_design
+        .design
+        .apply(&marginal_beta_block.beta);
     for (i, &v) in pred_marginal.iter().enumerate() {
         assert!(v.is_finite(), "marginal η[{i}] non-finite: {v}");
     }

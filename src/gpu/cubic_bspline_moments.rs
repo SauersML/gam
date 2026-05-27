@@ -1482,7 +1482,7 @@ mod cubic_bspline_moments_tests {
             .stream
             .clone();
         let host_vals = stream
-            .memcpy_dtov(&dev.values)
+            .clone_dtoh(&dev.values)
             .expect("dtov of device moments");
         let out_stride = host_vals.len() / spec.n_alpha();
         assert!(

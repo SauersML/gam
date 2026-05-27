@@ -136,7 +136,7 @@ mod cuda_impl {
             for slot in channels.iter() {
                 let dev = match slot.as_ref() {
                     Some(mat) => {
-                        let col = to_col_major(&mat.view());
+                        let col = to_col_major(mat);
                         Some(stream.clone_htod(&*col).ok()?)
                     }
                     None => None,
@@ -268,27 +268,35 @@ mod cuda_impl {
         let rows_i = to_i32(rows)?;
         let b_cols_i = to_i32(b_cols)?;
         let handle = *blas.handle();
-        let (x_b_ptr, _x_b_record) = x_b.device_ptr(stream);
-        let (w_ptr, _w_record) = weights.device_ptr(stream);
-        let (scaled_ptr, _scaled_record) = scaled_dev.device_ptr_mut(stream);
-        // SAFETY: x_b is rows×b_cols column-major (lda = rows), w is rows
-        // contiguous, scaled_dev has at least rows*b_cols entries.
-        let status = unsafe {
-            cudarc::cublas::sys::cublasDdgmm(
-                handle,
-                cublasSideMode_t::CUBLAS_SIDE_LEFT,
-                rows_i,
-                b_cols_i,
-                x_b_ptr as *const f64,
-                rows_i,
-                w_ptr as *const f64,
-                1,
-                scaled_ptr as *mut f64,
-                rows_i,
-            )
-        };
-        if status != cublasStatus_t::CUBLAS_STATUS_SUCCESS {
-            return None;
+        // Scope the mutable device-pointer record for the DDGMM row-scale so
+        // the borrow is released before the subsequent immutable use of
+        // `scaled_dev` in the GEMM call below. cudarc's `device_ptr_mut`
+        // returns a `SyncOnDrop` guard whose lifetime is tied to the
+        // mutable borrow; dropping it via this block ends the mutable
+        // borrow exactly at the DDGMM completion point.
+        {
+            let (x_b_ptr, _x_b_record) = x_b.device_ptr(stream);
+            let (w_ptr, _w_record) = weights.device_ptr(stream);
+            let (scaled_ptr, _scaled_record) = scaled_dev.device_ptr_mut(stream);
+            // SAFETY: x_b is rows×b_cols column-major (lda = rows), w is rows
+            // contiguous, scaled_dev has at least rows*b_cols entries.
+            let status = unsafe {
+                cudarc::cublas::sys::cublasDdgmm(
+                    handle,
+                    cublasSideMode_t::CUBLAS_SIDE_LEFT,
+                    rows_i,
+                    b_cols_i,
+                    x_b_ptr as *const f64,
+                    rows_i,
+                    w_ptr as *const f64,
+                    1,
+                    scaled_ptr as *mut f64,
+                    rows_i,
+                )
+            };
+            if status != cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+                return None;
+            }
         }
 
         let mut out_dev = stream

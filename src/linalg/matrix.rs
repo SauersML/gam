@@ -4168,10 +4168,7 @@ impl LinearOperator for ResidualisedDesignOperator {
         let mut out = self.inner.apply(&tv);
         for (anchor, r_block) in &self.anchors {
             let rv = fast_av(r_block.as_ref(), vector);
-            let contrib = match anchor {
-                DesignMatrix::Dense(d) => d.apply(&rv),
-                DesignMatrix::Sparse(s) => s.apply(&rv),
-            };
+            let contrib = anchor.apply(&rv);
             out -= &contrib;
         }
         out
@@ -4183,10 +4180,7 @@ impl LinearOperator for ResidualisedDesignOperator {
         let xtv = self.inner.apply_transpose(vector);
         let mut out = fast_atv(&self.transform, &xtv);
         for (anchor, r_block) in &self.anchors {
-            let atv = match anchor {
-                DesignMatrix::Dense(d) => d.apply_transpose(vector),
-                DesignMatrix::Sparse(s) => s.apply_transpose(vector),
-            };
+            let atv = anchor.apply_transpose(vector);
             let contrib = fast_atv(r_block.as_ref(), &atv);
             out -= &contrib;
         }

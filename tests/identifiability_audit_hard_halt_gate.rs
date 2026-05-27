@@ -25,6 +25,7 @@
 //! `src/solver/identifiability_audit.rs`.
 
 use gam::solver::identifiability_audit::audit_identifiability;
+use ndarray::Array2;
 
 mod common {
     use gam::families::custom_family::ParameterBlockSpec;
