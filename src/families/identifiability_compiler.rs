@@ -56,6 +56,56 @@ pub trait RowHessian: Send + Sync {
     fn evaluate_full(&self) -> Array3<f64>;
 }
 
+/// Identity row metric: `K^S_i = I_K` for every row. Default structural
+/// metric for [`compile_with_dual_metric`]. Decoupling the
+/// "which directions are real structural columns" decision from a
+/// possibly rank-deficient pilot curvature `H` prevents the compiler from
+/// wrongly dropping columns whose curvature happens to be zero at the
+/// pilot β but which would be kept at the optimum.
+pub struct IdentityRowHessian {
+    n: usize,
+    k: usize,
+}
+
+impl IdentityRowHessian {
+    /// Construct an identity row metric with `n` rows and `K`-channel
+    /// row primary state.
+    pub fn new(n: usize, k: usize) -> Self {
+        Self { n, k }
+    }
+}
+
+impl RowHessian for IdentityRowHessian {
+    fn k(&self) -> usize {
+        self.k
+    }
+    fn nrows(&self) -> usize {
+        self.n
+    }
+    fn fill_row(&self, row: usize, out: &mut [f64]) {
+        assert!(
+            row < self.n,
+            "IdentityRowHessian::fill_row row {row} out of range {n}",
+            n = self.n
+        );
+        assert_eq!(out.len(), self.k * self.k);
+        for i in 0..self.k {
+            for j in 0..self.k {
+                out[i * self.k + j] = if i == j { 1.0 } else { 0.0 };
+            }
+        }
+    }
+    fn evaluate_full(&self) -> Array3<f64> {
+        let mut out = Array3::<f64>::zeros((self.n, self.k, self.k));
+        for i in 0..self.n {
+            for c in 0..self.k {
+                out[[i, c, c]] = 1.0;
+            }
+        }
+        out
+    }
+}
+
 /// Predict-time anchor row evaluator. For parametric blocks this is the
 /// block's design at `predict_arg`. For compiled flex blocks it is the
 /// residualised row operator `C(x)·V − A(x)·M`.
@@ -722,44 +772,9 @@ mod tests {
         }
     }
 
-    /// Identity row Hessian (`H_i = I_K`) used by tests.
-    struct IdentityRowHessian {
-        n: usize,
-        k: usize,
-    }
-
-    impl IdentityRowHessian {
-        fn new(n: usize, k: usize) -> Self {
-            Self { n, k }
-        }
-    }
-
-    impl RowHessian for IdentityRowHessian {
-        fn k(&self) -> usize {
-            self.k
-        }
-        fn nrows(&self) -> usize {
-            self.n
-        }
-        fn fill_row(&self, row: usize, out: &mut [f64]) {
-            assert!(row < self.n, "IdentityRowHessian::fill_row row {row} out of range {n}", n = self.n);
-            assert_eq!(out.len(), self.k * self.k);
-            for i in 0..self.k {
-                for j in 0..self.k {
-                    out[i * self.k + j] = if i == j { 1.0 } else { 0.0 };
-                }
-            }
-        }
-        fn evaluate_full(&self) -> Array3<f64> {
-            let mut out = Array3::<f64>::zeros((self.n, self.k, self.k));
-            for i in 0..self.n {
-                for c in 0..self.k {
-                    out[[i, c, c]] = 1.0;
-                }
-            }
-            out
-        }
-    }
+    // `IdentityRowHessian` is re-exported from the parent module's `use
+    // super::*;` above (now a public struct so the dual-metric API can
+    // share the default structural metric with callers).
 
     /// Diagonal row Hessian with per-row scalar weights (K=1 case).
     struct DiagonalScalarRowHessian {
