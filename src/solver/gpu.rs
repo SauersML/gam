@@ -11,6 +11,7 @@ use std::sync::Once;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 pub mod arrow_schur_gpu;
+pub mod pirls_dispatch;
 pub mod pirls_gpu;
 pub mod reml_gpu;
 

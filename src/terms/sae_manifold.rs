@@ -298,6 +298,38 @@ impl SaeBasisEvaluator for PeriodicHarmonicEvaluator {
         }
         Ok((phi, jet))
     }
+
+    /// Second derivative of the 1D Fourier basis on the unit circle.
+    ///
+    /// For `Phi = [1, sin(2π h t), cos(2π h t), ...]` we have
+    /// `Phi'' = [0, -(2π h)² sin(...), -(2π h)² cos(...), ...]`, i.e.
+    /// the second derivative is `-(2π h)² · phi(t)` on each harmonic pair.
+    fn second_jet(&self, coords: ArrayView2<'_, f64>) -> Option<Array4<f64>> {
+        let n = coords.nrows();
+        let d = coords.ncols();
+        if d != 1 {
+            return None;
+        }
+        let m = self.num_basis;
+        let num_harmonics = (m - 1) / 2;
+        let two_pi = 2.0 * std::f64::consts::PI;
+        let mut h = Array4::<f64>::zeros((n, m, 1, 1));
+        for row in 0..n {
+            let t = coords[[row, 0]];
+            for k in 1..=num_harmonics {
+                let freq = two_pi * (k as f64);
+                let freq2 = freq * freq;
+                let angle = freq * t;
+                let s = angle.sin();
+                let c = angle.cos();
+                let s_idx = 2 * k - 1;
+                let c_idx = 2 * k;
+                h[[row, s_idx, 0, 0]] = -freq2 * s;
+                h[[row, c_idx, 0, 0]] = -freq2 * c;
+            }
+        }
+        Some(h)
+    }
 }
 
 /// Raw-angle periodic evaluator for the minimal SAE-manifold front-end.
@@ -405,6 +437,88 @@ impl SaeBasisEvaluator for SphereChartEvaluator {
             jet[[row, 6, 1]] = dx_dlon * z;
         }
         Ok((phi, jet))
+    }
+
+    /// Analytic Hessian of the 7-column lat/lon sphere chart basis.
+    ///
+    /// With `x = cos(lat) cos(lon)`, `y = cos(lat) sin(lon)`, `z = sin(lat)`
+    /// and `a = 1{lat ∈ (−π/2, π/2)}` (the clamp's chain factor; outside the
+    /// interior every lat-partial is zero, including in the Hessian), the
+    /// non-trivial second derivatives are
+    ///
+    /// ```text
+    /// x_{lat,lat} = -x · a,     x_{lon,lon} = -x,     x_{lat,lon} =  y · a
+    /// y_{lat,lat} = -y · a,     y_{lon,lon} = -y,     y_{lat,lon} = -x · a
+    /// z_{lat,lat} = -z · a,     z_{lon,lon} =  0,     z_{lat,lon} =  0
+    /// ```
+    ///
+    /// Bilinear basis entries `xy, yz, xz` follow the product rule
+    /// `(fg)_{αβ} = f_{αβ} g + f_α g_β + f_β g_α + f g_{αβ}`. The boundary
+    /// chain factor `a` is idempotent (`a² = a`), so reapplying it on a
+    /// double-lat derivative is a no-op.
+    fn second_jet(&self, coords: ArrayView2<'_, f64>) -> Option<Array4<f64>> {
+        if coords.ncols() != 2 {
+            return None;
+        }
+        let n = coords.nrows();
+        let mut h = Array4::<f64>::zeros((n, 7, 2, 2));
+        for row in 0..n {
+            let raw_lat = coords[[row, 0]];
+            let lat = raw_lat.clamp(-std::f64::consts::FRAC_PI_2, std::f64::consts::FRAC_PI_2);
+            let lat_active =
+                raw_lat > -std::f64::consts::FRAC_PI_2 && raw_lat < std::f64::consts::FRAC_PI_2;
+            let a = if lat_active { 1.0 } else { 0.0 };
+            let lon = coords[[row, 1]];
+            let clat = lat.cos();
+            let slat = lat.sin();
+            let clon = lon.cos();
+            let slon = lon.sin();
+            let x = clat * clon;
+            let y = clat * slon;
+            let z = slat;
+            let dx = [-slat * clon * a, -clat * slon];
+            let dy = [-slat * slon * a, clat * clon];
+            let dz = [clat * a, 0.0];
+            let hx = [[-x * a, y * a], [y * a, -x]];
+            let hy = [[-y * a, -x * a], [-x * a, -y]];
+            let hz = [[-z * a, 0.0], [0.0, 0.0]];
+            for axis_a in 0..2 {
+                for axis_b in 0..2 {
+                    h[[row, 1, axis_a, axis_b]] = hx[axis_a][axis_b];
+                    h[[row, 2, axis_a, axis_b]] = hy[axis_a][axis_b];
+                    h[[row, 3, axis_a, axis_b]] = hz[axis_a][axis_b];
+                }
+            }
+            let pair = |hf: [[f64; 2]; 2],
+                        df: [f64; 2],
+                        f: f64,
+                        hg: [[f64; 2]; 2],
+                        dg: [f64; 2],
+                        g: f64|
+             -> [[f64; 2]; 2] {
+                let mut out = [[0.0; 2]; 2];
+                for axis_a in 0..2 {
+                    for axis_b in 0..2 {
+                        out[axis_a][axis_b] = hf[axis_a][axis_b] * g
+                            + df[axis_a] * dg[axis_b]
+                            + df[axis_b] * dg[axis_a]
+                            + f * hg[axis_a][axis_b];
+                    }
+                }
+                out
+            };
+            let hxy = pair(hx, dx, x, hy, dy, y);
+            let hyz = pair(hy, dy, y, hz, dz, z);
+            let hxz = pair(hx, dx, x, hz, dz, z);
+            for axis_a in 0..2 {
+                for axis_b in 0..2 {
+                    h[[row, 4, axis_a, axis_b]] = hxy[axis_a][axis_b];
+                    h[[row, 5, axis_a, axis_b]] = hyz[axis_a][axis_b];
+                    h[[row, 6, axis_a, axis_b]] = hxz[axis_a][axis_b];
+                }
+            }
+        }
+        Some(h)
     }
 }
 
@@ -522,6 +636,83 @@ impl SaeBasisEvaluator for TorusHarmonicEvaluator {
             }
         }
         Ok((phi, jet))
+    }
+
+    /// Hessian of the tensor-product torus basis.
+    ///
+    /// Each basis function factors as `Φ_flat = Π_axis f_axis(t_axis)`, so
+    ///
+    /// * `∂² Φ / ∂t_a ∂t_b = (Π_{k ∉ {a, b}} f_k) · f_a'(t_a) · f_b'(t_b)`
+    ///   when `a ≠ b`,
+    /// * `∂² Φ / ∂t_a²    = (Π_{k ≠ a} f_k) · f_a''(t_a)` on the diagonal.
+    ///
+    /// Per-axis the basis is `[1, sin(2π h t), cos(2π h t), …]`, so
+    /// `f_axis''(t) = -(2π h)² · f_axis(t)` on the harmonic columns and 0 on
+    /// the constant column.
+    fn second_jet(&self, coords: ArrayView2<'_, f64>) -> Option<Array4<f64>> {
+        let d = self.latent_dim;
+        if coords.ncols() != d {
+            return None;
+        }
+        let n = coords.nrows();
+        let axis_m = self.axis_basis_size();
+        let m = self.basis_size();
+        let h_max = self.num_harmonics;
+        let two_pi = 2.0 * std::f64::consts::PI;
+        let mut hess = Array4::<f64>::zeros((n, m, d, d));
+        let mut phi_axis = vec![vec![0.0_f64; axis_m]; d];
+        let mut dphi_axis = vec![vec![0.0_f64; axis_m]; d];
+        let mut d2phi_axis = vec![vec![0.0_f64; axis_m]; d];
+        for row in 0..n {
+            for axis in 0..d {
+                let t = coords[[row, axis]];
+                phi_axis[axis][0] = 1.0;
+                dphi_axis[axis][0] = 0.0;
+                d2phi_axis[axis][0] = 0.0;
+                for k in 1..=h_max {
+                    let freq = two_pi * (k as f64);
+                    let freq2 = freq * freq;
+                    let angle = freq * t;
+                    let s = angle.sin();
+                    let c = angle.cos();
+                    let s_idx = 2 * k - 1;
+                    let c_idx = 2 * k;
+                    phi_axis[axis][s_idx] = s;
+                    phi_axis[axis][c_idx] = c;
+                    dphi_axis[axis][s_idx] = freq * c;
+                    dphi_axis[axis][c_idx] = -freq * s;
+                    d2phi_axis[axis][s_idx] = -freq2 * s;
+                    d2phi_axis[axis][c_idx] = -freq2 * c;
+                }
+            }
+            let mut idx = vec![0usize; d];
+            for flat in 0..m {
+                for axis_a in 0..d {
+                    for axis_b in 0..d {
+                        let mut prod = 1.0_f64;
+                        for axis in 0..d {
+                            let factor = if axis == axis_a && axis == axis_b {
+                                d2phi_axis[axis][idx[axis]]
+                            } else if axis == axis_a || axis == axis_b {
+                                dphi_axis[axis][idx[axis]]
+                            } else {
+                                phi_axis[axis][idx[axis]]
+                            };
+                            prod *= factor;
+                        }
+                        hess[[row, flat, axis_a, axis_b]] = prod;
+                    }
+                }
+                for axis in (0..d).rev() {
+                    idx[axis] += 1;
+                    if idx[axis] < axis_m {
+                        break;
+                    }
+                    idx[axis] = 0;
+                }
+            }
+        }
+        Some(hess)
     }
 }
 
@@ -2681,6 +2872,103 @@ mod tests {
         assert!(
             error <= 1.0e-4,
             "actual={actual:.12e}, predicted={predicted:.12e}, error={error:.12e}"
+        );
+    }
+
+    /// MechanismSparsityPenalty must reach the SAE arrow-Schur system's
+    /// `gb` (beta-tier gradient) when its target slice is shaped to match a
+    /// single-atom decoder block (M, p_out). The group lasso over rows of
+    /// that (M, p_out) matrix translates to a non-zero gradient on every
+    /// (basis_row, feature) entry whose corresponding decoder coefficient
+    /// is non-zero, and the FFI-side `"beta"` latent block is what makes
+    /// the descriptor builder see exactly that target shape.
+    #[test]
+    fn sae_mechsparsity_beta_block_routes_through_arrow_schur_gb() {
+        let coords = array![[0.10], [0.35], [0.80]];
+        let (phi, jet) = periodic_basis(&coords);
+        // Decoder shape: (M=3 basis × p=4 features); flatten_beta lays out
+        // [basis_col * p + feature] which is exactly the (M, p) row-major
+        // shape MechSparsity targets.
+        let decoder = array![
+            [0.7, -0.2, 0.05, 0.4],
+            [-0.5, 0.6, -0.1, 0.3],
+            [0.2, 0.0, -0.4, -0.6],
+        ];
+        let atom = SaeManifoldAtom::new(
+            "periodic",
+            SaeAtomBasisKind::Periodic,
+            1,
+            phi,
+            jet,
+            decoder.clone(),
+            Array2::<f64>::eye(3),
+        )
+        .unwrap();
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            Array2::<f64>::zeros((3, 1)),
+            vec![coords],
+            vec![LatentManifold::Circle { period: 1.0 }],
+            AssignmentMode::softmax(0.7),
+        )
+        .unwrap();
+        let term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
+
+        // Two groups partition the 4 features: {0,1} and {2,3}. Each row
+        // of the decoder block has non-zero entries in both groups, so the
+        // group-norm denominator is finite and every column-feature in a
+        // non-trivially-loaded group sees a positive penalty gradient.
+        let m = 3usize;
+        let p = 4usize;
+        let slice = PsiSlice::full(m * p, Some(m));
+        let penalty = MechanismSparsityPenalty::new(
+            slice,
+            vec![vec![0, 1], vec![2, 3]],
+            1.0,
+            1.0e-6,
+            (term.n_obs()) as f64,
+            false,
+        )
+        .unwrap();
+        let mut registry = AnalyticPenaltyRegistry::new();
+        registry.push(AnalyticPenaltyKind::MechanismSparsity(Arc::new(penalty)));
+
+        let target = array![
+            [0.20, 0.10, -0.05, 0.25],
+            [-0.10, 0.30, 0.15, -0.20],
+            [0.45, -0.05, 0.10, 0.30],
+        ];
+        let rho = SaeManifoldRho::new(0.0, -6.0, vec![Array1::<f64>::zeros(1)]);
+        let sys = term
+            .assemble_arrow_schur(target.view(), &rho, Some(&registry))
+            .unwrap();
+
+        assert_eq!(sys.gb.len(), m * p, "gb should match flatten_beta length");
+        let mut absmax = 0.0_f64;
+        for v in sys.gb.iter().copied() {
+            assert!(v.is_finite());
+            if v.abs() > absmax {
+                absmax = v.abs();
+            }
+        }
+        assert!(
+            absmax > 1.0e-6,
+            "MechSparsity must inject a non-trivial gradient into the SAE arrow-Schur gb; absmax={absmax:.3e}"
+        );
+        // Closed-form check: the row=1 column=0 entry of grad is
+        //   w / sqrt(|G|) * b[1,0] / ||b[1, group={0,1}]||
+        // where group {0,1} has size 2 → factor sqrt(2). With unit weight
+        // and tiny eps, the expected magnitude matches Penalty::grad_target.
+        let beta = term.flatten_beta();
+        let expected = {
+            // ||b[1, {0,1}]|| ≈ sqrt(0.5² + 0.6²) = sqrt(0.61)
+            let s = (0.5_f64.powi(2) + 0.6_f64.powi(2) + 1.0e-12).sqrt();
+            (2.0_f64).sqrt() * (-0.5_f64) / s
+        };
+        let observed = sys.gb[1 * p + 0];
+        assert!(
+            (observed - expected).abs() <= 1.0e-6,
+            "expected MechSparsity gb entry at (basis=1, feat=0) ≈ {expected:.6e}, got {observed:.6e} (beta entry = {})",
+            beta[1 * p + 0]
         );
     }
 

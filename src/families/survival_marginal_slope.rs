@@ -23,6 +23,9 @@ use crate::families::bernoulli_marginal_slope::{
     unary_derivatives_neglog_phi, unary_derivatives_sqrt,
 };
 use crate::families::cubic_cell_kernel as exact_kernel;
+use crate::gpu::cubic_cell::partition_substrate::{
+    self as partition_substrate, SurvivalPartitionBatchView, SurvivalPartitionRowView,
+};
 use crate::families::gamlss::{ParameterBlockInput, monotone_wiggle_basis_with_derivative_order};
 use crate::families::lognormal_kernel::FrailtySpec;
 use crate::families::marginal_slope_shared::{
@@ -5722,6 +5725,55 @@ impl SurvivalMarginalSlopeFamily {
         beta_h: Option<&Array1<f64>>,
         beta_w: Option<&Array1<f64>>,
     ) -> Result<Vec<exact_kernel::DenestedPartitionCell>, String> {
+        // Route through the shared GPU partition substrate. When both deviation
+        // runtimes expose contiguous slices (the constructor invariant), the
+        // substrate's host path produces byte-identical output to the legacy
+        // direct-kernel call below and is the seam where the future
+        // `denested_partition_cells_kernel` NVRTC kernel slots in.  When the
+        // contiguous-slice precondition fails (defensive fallback), or for the
+        // single-coord `shared_denested_partition_cells` fast-path with a
+        // missing score-warp runtime, we keep the legacy CPU path.
+        let score_view = self
+            .score_warp
+            .as_ref()
+            .and_then(partition_substrate::deviation_runtime_view);
+        let link_view = self
+            .link_dev
+            .as_ref()
+            .and_then(partition_substrate::deviation_runtime_view);
+        let score_runtime_present = self.score_warp.is_some();
+        let link_runtime_present = self.link_dev.is_some();
+        let score_view_ok = !score_runtime_present || score_view.is_some();
+        let link_view_ok = !link_runtime_present || link_view.is_some();
+        if score_view_ok && link_view_ok {
+            let beta_h_slice = beta_h.and_then(|b| b.as_slice());
+            let beta_w_slice = beta_w.and_then(|b| b.as_slice());
+            let beta_h_ok = beta_h.map_or(true, |_| beta_h_slice.is_some());
+            let beta_w_ok = beta_w.map_or(true, |_| beta_w_slice.is_some());
+            if beta_h_ok && beta_w_ok {
+                let row = SurvivalPartitionRowView {
+                    a,
+                    b,
+                    beta_h: beta_h_slice,
+                    beta_w: beta_w_slice,
+                };
+                let batch = partition_substrate::build_host_partition_cells(
+                    &SurvivalPartitionBatchView {
+                        rows: std::slice::from_ref(&row),
+                        score_warp: score_view,
+                        link_dev: link_view,
+                        score_dim: self.score_dim().max(1),
+                        probit_frailty_scale: self.probit_frailty_scale(),
+                    },
+                );
+                if batch.status.first().copied() == Some(0) {
+                    return Ok(partition_substrate::row_cells_as_partition_vec(&batch, 0));
+                }
+                // Fall through to legacy CPU path on any per-row substrate
+                // error so we preserve the existing error-reporting behavior.
+            }
+        }
+
         if self.score_dim() == 1 {
             return shared_denested_partition_cells(
                 a,
