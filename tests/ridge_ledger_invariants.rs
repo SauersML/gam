@@ -13,6 +13,12 @@
 //! pirls_curvature, covariance_strict, resource_serialize, custom_family)
 //! coordinate by reading these invariants, so the asserts here are the
 //! stable contract the rest of the codebase keys off.
+//!
+//! The "kind matches inclusion flags" invariant that used to live as a
+//! runtime check (`invariants_hold`) is now enforced statically: the
+//! inclusion flags were lifted into the [`StabilizationKind`] discriminant,
+//! so the delta accessors derive from `kind` alone. Heterogeneous /
+//! inconsistent (kind, flags) combinations are unrepresentable.
 
 use gam::types::{
     RidgeMatrixForm, RidgePassport, RidgePolicy, StabilizationKind, StabilizationLedger,
@@ -25,11 +31,7 @@ const DELTA: f64 = 7.5e-3;
 #[test]
 fn solver_damping_excludes_every_accounting_term() {
     let ledger = StabilizationLedger::solver_damping(DELTA, StabilizationRule::FixedConstant);
-    assert!(ledger.invariants_hold());
     assert_eq!(ledger.delta, DELTA);
-    assert!(!ledger.included_in_quadratic);
-    assert!(!ledger.included_in_laplace_hessian);
-    assert!(!ledger.included_in_penalty_logdet);
     assert_eq!(ledger.quadratic_delta(), 0.0);
     assert_eq!(ledger.laplace_hessian_delta(), 0.0);
     assert_eq!(ledger.penalty_logdet_delta(), 0.0);
@@ -43,10 +45,6 @@ fn numerical_perturbation_excludes_every_accounting_term() {
         StabilizationRule::InertiaTarget { spd_floor: 1e-10 },
         Some(1e-12),
     );
-    assert!(ledger.invariants_hold());
-    assert!(!ledger.included_in_quadratic);
-    assert!(!ledger.included_in_laplace_hessian);
-    assert!(!ledger.included_in_penalty_logdet);
     assert_eq!(ledger.quadratic_delta(), 0.0);
     assert_eq!(ledger.laplace_hessian_delta(), 0.0);
     assert_eq!(ledger.penalty_logdet_delta(), 0.0);
@@ -63,10 +61,6 @@ fn numerical_perturbation_excludes_every_accounting_term() {
 #[test]
 fn explicit_prior_includes_every_accounting_term() {
     let ledger = StabilizationLedger::explicit_prior(DELTA, RidgeMatrixForm::ScaledIdentity);
-    assert!(ledger.invariants_hold());
-    assert!(ledger.included_in_quadratic);
-    assert!(ledger.included_in_laplace_hessian);
-    assert!(ledger.included_in_penalty_logdet);
     assert_eq!(ledger.quadratic_delta(), DELTA);
     assert_eq!(ledger.laplace_hessian_delta(), DELTA);
     assert_eq!(ledger.penalty_logdet_delta(), DELTA);
@@ -127,12 +121,12 @@ fn from_passport_round_trip_preserves_classification() {
     let prior_passport =
         RidgePassport::scaled_identity(DELTA, RidgePolicy::explicit_stabilization_full());
     let prior_ledger = StabilizationLedger::from_passport(prior_passport);
-    assert!(prior_ledger.invariants_hold());
     assert!(matches!(
         prior_ledger.kind,
         StabilizationKind::ExplicitPrior
     ));
     assert_eq!(prior_ledger.delta, DELTA);
+    assert_eq!(prior_ledger.quadratic_delta(), DELTA);
 
     // A policy with every flag false: morally a numerical perturbation.
     let np_policy = RidgePolicy {
@@ -144,21 +138,21 @@ fn from_passport_round_trip_preserves_classification() {
     };
     let np_passport = RidgePassport::scaled_identity(DELTA, np_policy);
     let np_ledger = StabilizationLedger::from_passport(np_passport);
-    assert!(np_ledger.invariants_hold());
     assert!(matches!(
         np_ledger.kind,
         StabilizationKind::NumericalPerturbation { .. }
     ));
+    assert_eq!(np_ledger.quadratic_delta(), 0.0);
 }
 
 /// `StabilizationLedger::none()` must satisfy every invariant trivially:
-/// δ = 0, all flags off, kind = None. Any future call site that wants a
-/// "no-stabilization" sentinel pulls this rather than constructing an
-/// inconsistent zero-delta-with-some-flag-on record by hand.
+/// δ = 0, kind = None, every accounting term contributes 0.
 #[test]
 fn none_sentinel_holds_invariants() {
     let ledger = StabilizationLedger::none();
-    assert!(ledger.invariants_hold());
     assert_eq!(ledger.delta, 0.0);
     assert!(matches!(ledger.kind, StabilizationKind::None));
+    assert_eq!(ledger.quadratic_delta(), 0.0);
+    assert_eq!(ledger.laplace_hessian_delta(), 0.0);
+    assert_eq!(ledger.penalty_logdet_delta(), 0.0);
 }

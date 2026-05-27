@@ -3,6 +3,7 @@ use crate::faer_ndarray::{FaerCholesky, fast_atb, fast_av};
 use crate::linalg::utils::StableSolver;
 use crate::matrix::{
     DesignMatrix, EmbeddedColumnBlock, EmbeddedSquareBlock, LinearOperator, SymmetricMatrix,
+    dense_rowwise_kronecker,
 };
 use crate::pirls::{LinearInequalityConstraints, solve_newton_directionwith_lower_bounds};
 use crate::resource::{DerivativeStorageMode, ResourcePolicy};
@@ -4388,38 +4389,6 @@ impl CustomFamilyPsiDerivativeOperator for ZeroPsiDerivativeOperator {
     }
 }
 
-fn rowwise_kronecker_dense(base: &Array2<f64>, time_basis: &Array2<f64>) -> Array2<f64> {
-    assert_eq!(base.nrows(), time_basis.nrows());
-    let n = base.nrows();
-    let p_base = base.ncols();
-    let p_time = time_basis.ncols();
-    use rayon::iter::{IntoParallelIterator, ParallelIterator};
-    // Row-wise Khatri-Rao of (base ⊗ time_basis) per observation:
-    // out[i, j*p_time + t] = base[i, j] * time_basis[i, t]. Independent
-    // across rows.
-    let row_data: Vec<f64> = (0..n)
-        .into_par_iter()
-        .flat_map_iter(|i| {
-            let base_row = base.row(i);
-            let time_row = time_basis.row(i);
-            let mut row_vec = vec![0.0f64; p_base * p_time];
-            for j in 0..p_base {
-                let base_ij = base_row[j];
-                if base_ij == 0.0 {
-                    continue;
-                }
-                let off = j * p_time;
-                for t in 0..p_time {
-                    row_vec[off + t] = base_ij * time_row[t];
-                }
-            }
-            row_vec.into_iter()
-        })
-        .collect();
-    Array2::<f64>::from_shape_vec((n, p_base * p_time), row_data)
-        .expect("row Khatri-Rao shape consistent")
-}
-
 fn stack_dense_row_blocks(blocks: &[Array2<f64>]) -> Array2<f64> {
     let total_rows = blocks.iter().map(Array2::nrows).sum();
     let p = blocks.first().map(Array2::ncols).unwrap_or(0);
@@ -4827,7 +4796,7 @@ impl RowwiseKroneckerPsiDerivativeOperator {
             let time = self.time_bases[block_idx]
                 .slice(ndarray::s![local_rows, ..])
                 .to_owned();
-            blocks.push(rowwise_kronecker_dense(&base, &time));
+            blocks.push(dense_rowwise_kronecker(base.view(), time.view()));
         }
         Ok(stack_dense_row_blocks(&blocks))
     }
@@ -5037,7 +5006,7 @@ impl MaterializablePsiDerivativeOperator for RowwiseKroneckerPsiDerivativeOperat
         let blocks: Vec<Array2<f64>> = self
             .time_bases
             .iter()
-            .map(|basis| rowwise_kronecker_dense(&base, basis))
+            .map(|basis| dense_rowwise_kronecker(base.view(), basis.view()))
             .collect();
         Ok(stack_dense_row_blocks(&blocks))
     }

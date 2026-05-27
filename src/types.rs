@@ -832,13 +832,6 @@ pub struct StabilizationLedger {
     pub chosen_by: StabilizationRule,
     pub inertia_before: Option<Inertia>,
     pub inertia_after: Option<Inertia>,
-    /// True iff δ contributes ½ δ ‖β‖² to the objective.
-    pub included_in_quadratic: bool,
-    /// True iff δ contributes δ I to the Laplace Hessian used for
-    /// covariance / smoothing-parameter inference.
-    pub included_in_laplace_hessian: bool,
-    /// True iff δ contributes log|S + δ I| to the penalty log-determinant.
-    pub included_in_penalty_logdet: bool,
 }
 
 impl StabilizationLedger {
@@ -851,9 +844,6 @@ impl StabilizationLedger {
             chosen_by: StabilizationRule::FixedConstant,
             inertia_before: None,
             inertia_after: None,
-            included_in_quadratic: false,
-            included_in_laplace_hessian: false,
-            included_in_penalty_logdet: false,
         }
     }
 
@@ -868,9 +858,6 @@ impl StabilizationLedger {
             chosen_by,
             inertia_before: None,
             inertia_after: None,
-            included_in_quadratic: false,
-            included_in_laplace_hessian: false,
-            included_in_penalty_logdet: false,
         }
     }
 
@@ -891,9 +878,6 @@ impl StabilizationLedger {
             chosen_by,
             inertia_before: None,
             inertia_after: None,
-            included_in_quadratic: false,
-            included_in_laplace_hessian: false,
-            included_in_penalty_logdet: false,
         }
     }
 
@@ -908,28 +892,30 @@ impl StabilizationLedger {
             chosen_by: StabilizationRule::UserSpecified,
             inertia_before: None,
             inertia_after: None,
-            included_in_quadratic: true,
-            included_in_laplace_hessian: true,
-            included_in_penalty_logdet: true,
         }
     }
 
     /// Bridge from the existing `RidgePassport` so PIRLS-side code (which
     /// already passes a `RidgePassport` through every call) can hand a
     /// ledger to anything that wants the new uniform view.
+    ///
+    /// `RidgePolicy` is homogeneous-by-construction: every constructor sets
+    /// the three inclusion flags identically. A passport whose policy
+    /// excludes every accounting term is morally a numerical perturbation
+    /// (the ridge is there to make the solve work but the objective ignores
+    /// it); a passport whose policy includes every accounting term is an
+    /// explicit prior. Heterogeneous flag combinations cannot be produced
+    /// by the public `RidgePolicy` API and have no inhabitants downstream.
     pub const fn from_passport(passport: RidgePassport) -> Self {
         let any_included = passport.policy.include_quadratic_penalty
             || passport.policy.include_laplacehessian
             || passport.policy.include_penalty_logdet;
-        let kind = if !any_included {
-            // A `RidgePassport` whose policy excludes every accounting term
-            // is morally a numerical perturbation: the ridge is there to
-            // make the solve work but the objective ignores it.
+        let kind = if any_included {
+            StabilizationKind::ExplicitPrior
+        } else {
             StabilizationKind::NumericalPerturbation {
                 backward_error_bound: None,
             }
-        } else {
-            StabilizationKind::ExplicitPrior
         };
         Self {
             kind,
@@ -938,64 +924,45 @@ impl StabilizationLedger {
             chosen_by: StabilizationRule::FixedConstant,
             inertia_before: None,
             inertia_after: None,
-            included_in_quadratic: passport.policy.include_quadratic_penalty,
-            included_in_laplace_hessian: passport.policy.include_laplacehessian,
-            included_in_penalty_logdet: passport.policy.include_penalty_logdet,
         }
     }
 
     /// δ value to fold into the quadratic penalty term, or 0.0 if this
-    /// ledger entry is not part of the model.
+    /// ledger entry is not part of the model. Derived from `kind`: only
+    /// [`StabilizationKind::ExplicitPrior`] contributes.
     #[inline]
     pub const fn quadratic_delta(&self) -> f64 {
-        if self.included_in_quadratic {
-            self.delta
-        } else {
-            0.0
+        match self.kind {
+            StabilizationKind::ExplicitPrior => self.delta,
+            StabilizationKind::None
+            | StabilizationKind::SolverDampingOnly
+            | StabilizationKind::NumericalPerturbation { .. } => 0.0,
         }
     }
 
     /// δ value to add to the Laplace Hessian, or 0.0 if not included.
+    /// Derived from `kind`: only [`StabilizationKind::ExplicitPrior`]
+    /// contributes.
     #[inline]
     pub const fn laplace_hessian_delta(&self) -> f64 {
-        if self.included_in_laplace_hessian {
-            self.delta
-        } else {
-            0.0
+        match self.kind {
+            StabilizationKind::ExplicitPrior => self.delta,
+            StabilizationKind::None
+            | StabilizationKind::SolverDampingOnly
+            | StabilizationKind::NumericalPerturbation { .. } => 0.0,
         }
     }
 
     /// δ value to add inside log|S + δ I|, or 0.0 if not included.
+    /// Derived from `kind`: only [`StabilizationKind::ExplicitPrior`]
+    /// contributes.
     #[inline]
     pub const fn penalty_logdet_delta(&self) -> f64 {
-        if self.included_in_penalty_logdet {
-            self.delta
-        } else {
-            0.0
-        }
-    }
-
-    /// Invariant check: kind must be consistent with the inclusion flags.
-    /// Used by the ledger-invariants test in `tests/ridge_ledger_invariants.rs`.
-    pub const fn invariants_hold(&self) -> bool {
         match self.kind {
-            StabilizationKind::None => {
-                self.delta == 0.0
-                    && !self.included_in_quadratic
-                    && !self.included_in_laplace_hessian
-                    && !self.included_in_penalty_logdet
-            }
-            StabilizationKind::SolverDampingOnly
-            | StabilizationKind::NumericalPerturbation { .. } => {
-                !self.included_in_quadratic
-                    && !self.included_in_laplace_hessian
-                    && !self.included_in_penalty_logdet
-            }
-            StabilizationKind::ExplicitPrior => {
-                self.included_in_quadratic
-                    && self.included_in_laplace_hessian
-                    && self.included_in_penalty_logdet
-            }
+            StabilizationKind::ExplicitPrior => self.delta,
+            StabilizationKind::None
+            | StabilizationKind::SolverDampingOnly
+            | StabilizationKind::NumericalPerturbation { .. } => 0.0,
         }
     }
 }

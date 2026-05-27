@@ -862,7 +862,6 @@ pub fn pull_back_blockwise_penalty_per_term(
     // emit a penalty over a sub-range of the term). We need a V slice
     // that lines up with pen.col_range relative to term_range.start.
     let local_off_start = pen.col_range.start - term_range.start;
-    let local_off_end = pen.col_range.end - term_range.start;
     // Per-term V is (term_p × term_p_kept). Slicing the rows of V along
     // pen.col_range's offset within the term gives the sub-block to use
     // for pullback. Equivalently: build an embedded V_full at term width
@@ -898,11 +897,10 @@ pub fn pull_back_blockwise_penalty_per_term(
         compiled_start += v.ncols();
     }
     let compiled_end = compiled_start + v_term.ncols();
-    // The pen.local previously covered local_off_start..local_off_end of
-    // the term; after pullback we drop that sub-region distinction and
-    // the new penalty covers the WHOLE compiled term (since the
-    // embedded-then-pulled-back form is over all term-kept cols).
-    let _ = local_off_end;
+    // The pen.local previously covered a sub-region of the term; after
+    // pullback we drop that sub-region distinction and the new penalty
+    // covers the WHOLE compiled term (since the embedded-then-pulled-back
+    // form is over all term-kept cols).
     Ok(BlockwisePenalty::new(compiled_start..compiled_end, sym))
 }
 
