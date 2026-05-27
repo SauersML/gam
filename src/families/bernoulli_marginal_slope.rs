@@ -8405,7 +8405,6 @@ impl BernoulliMarginalSlopeFamily {
                             } => (moments, status, stride),
                             #[cfg(target_os = "linux")]
                             CubicCellDerivativeMomentOutput::Device { .. } => {
-                                // SAFETY: this match arm is unreachable by construction.
                                 // The view above explicitly requested
                                 // `CubicCellMomentResidency::Host`, and the substrate's
                                 // contract (`try_build_cubic_cell_derivative_moments` in
@@ -8415,6 +8414,9 @@ impl BernoulliMarginalSlopeFamily {
                                 // a hard programming error in the GPU dispatcher, not a
                                 // runtime condition we can recover from. Panicking
                                 // surfaces it at the call site.
+                                // SAFETY: unreachable by substrate contract — Host
+                                // request must return Host residency; reaching this
+                                // arm is a programming error, not a runtime condition.
                                 panic!(
                                     "BMS row-cell-moments parity probe requested Host residency \
                                      but substrate returned device-resident output"
@@ -17608,6 +17610,41 @@ impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJoint
         // inner solver is designed to amortize across far fewer iterations.
         if self.cache.slices.total >= 512 {
             return Ok(None);
+        }
+        // Block 9 Phase 6 shortcut: when the row-primary Hessian is already
+        // pinned on the GPU and `p_total` fits the dense-block kernel's
+        // shared-memory cap, dispatch the device-resident dense build
+        // instead of round-tripping through the CPU fused gradient pass.
+        // Numerics match the CPU pullback to within reduction-order f.p.
+        // noise (see `bms_flex_row_dense_block_kernel_matches_cpu_pullback`).
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(device_state) = self.cache.row_primary_hessians.device() {
+                let p_total = self.cache.slices.total;
+                if p_total <= crate::gpu::bms_flex_row::DENSE_BLOCK_MAX_P {
+                    match crate::gpu::bms_flex_row::launch_bms_flex_row_dense_block(
+                        device_state,
+                    ) {
+                        Ok(flat) => {
+                            let h_arr =
+                                Array2::from_shape_vec((p_total, p_total), flat)
+                                    .map_err(|e| {
+                                        format!(
+                                            "BMS hessian_dense_forced: dense_block reshape \
+                                             {p_total}x{p_total} failed: {e}"
+                                        )
+                                    })?;
+                            return Ok(Some(h_arr));
+                        }
+                        Err(err) => {
+                            log::info!(
+                                "[BMS hessian_dense_forced] gpu_dense_block_failed: {err}; \
+                                 falling back to CPU fused-gradient dense build"
+                            );
+                        }
+                    }
+                }
+            }
         }
         self.fused_gradient_dense()
             .map(|fused| Some(fused.hessian.clone()))

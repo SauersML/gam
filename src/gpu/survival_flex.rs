@@ -1853,6 +1853,235 @@ pub fn cpu_oracle_evaluate_calibration(
 }
 
 // ────────────────────────────────────────────────────────────────────────
+// Step 4 Layer A — substrate-backed device F evaluator.
+//
+// Math identity: the calibration evaluator is
+//
+//     F(a)   = -Φ(-q) + Σ_cells INV_TWO_PI · moments_neg[0]
+//     F'(a)  = INV_TWO_PI · Σ_cells ⟨dc_da_neg, moments_neg[0..4]⟩
+//     F''(a) = INV_TWO_PI · Σ_cells (⟨dc_daa_neg, moments_neg[0..4]⟩
+//                                    - ⟨conv(neg_cubic, dc_da_neg, dc_da_neg), moments_neg[0..10]⟩)
+//
+// where `dc_da_neg = -probit_scale · dc_da_pos`, `dc_daa_neg = -probit_scale ·
+// dc_daa_pos`, and the partials `(dc_da_pos, dc_daa_pos)` are the closed-form
+// polynomial expressions in `(a, slope, score_span, link_span)` from
+// `cubic_cell_kernel::denested_cell_coefficient_partials` /
+// `denested_cell_second_partials`.  The heavy lifting — the per-cell value
+// and length-10 reduced moments of `exp(-q(z))` over the cell interior —
+// is exactly the work the Step-2 substrate already does on device via
+// `try_row_batched_cell_moments`.  Layer 4a's job is the trailing
+// O(n_cells) reduction; spinning up an extra NVRTC reduction kernel for
+// it would be theatre, not real perf (the substrate already moves the
+// 384-pt GL integrand work to device).
+//
+// Routing: this entry point calls the Step-2 substrate, then folds with
+// the analytic partials on host.  The result is the same `(F, F', F'')`
+// triple as [`cpu_oracle_evaluate_calibration`] above.  Parity is
+// asserted in the tests block (`step4a_device_evaluator_matches_cpu_oracle`).
+// ────────────────────────────────────────────────────────────────────────
+
+/// Substrate-backed device F evaluator.  Builds the Step-2 row-batched
+/// cell list from the supplied per-row partition cells, invokes
+/// [`try_row_batched_cell_moments`] (which routes through the substrate's
+/// CUDA 384-pt GL kernel on Linux+CUDA and the CPU evaluator everywhere
+/// else), then folds with the analytic `dc_da_neg` / `dc_daa_neg` partials
+/// per cell.  Returns one `SurvivalFlexCalibrationFAndDerivs` per row in
+/// the input `partition_by_row` slice.
+///
+/// Errors propagate the substrate / coefficient-partial failures verbatim;
+/// `Ok(None)` reflects "any per-cell substrate status was non-OK" so the
+/// caller falls back to the CPU oracle cleanly for the offending fit.
+pub fn try_device_evaluate_calibration(
+    partition_by_row: &[Vec<SurvivalFlexCalibrationCell>],
+    a_per_row: &[f64],
+    q_per_row: &[f64],
+    slope_per_row: &[f64],
+    probit_scale: f64,
+) -> Result<Option<Vec<SurvivalFlexCalibrationFAndDerivs>>, GpuError> {
+    use crate::families::cubic_cell_kernel::{
+        denested_cell_coefficient_partials, denested_cell_second_partials,
+    };
+
+    let n_rows = partition_by_row.len();
+    if a_per_row.len() != n_rows
+        || q_per_row.len() != n_rows
+        || slope_per_row.len() != n_rows
+    {
+        return Err(GpuError::DriverCallFailed {
+            reason: format!(
+                "try_device_evaluate_calibration: row-array length mismatch \
+                 (partition_by_row={n_rows}, a={}, q={}, slope={})",
+                a_per_row.len(),
+                q_per_row.len(),
+                slope_per_row.len()
+            ),
+        });
+    }
+    if !(probit_scale.is_finite() && probit_scale > 0.0) {
+        return Err(GpuError::DriverCallFailed {
+            reason: format!(
+                "try_device_evaluate_calibration: probit_scale must be positive finite, got {probit_scale}"
+            ),
+        });
+    }
+
+    // Build the substrate-flat SoA: concatenate per-row cells, build a
+    // row_offsets index, then call the substrate moment evaluator.  We
+    // negate the cubic up-front so the substrate sees the same input the
+    // CPU helper does (`evaluate_cell_moments(neg_cell, 9)`).
+    let mut total_cells = 0usize;
+    let mut row_offsets = Vec::with_capacity(n_rows + 1);
+    row_offsets.push(0);
+    for cells in partition_by_row {
+        total_cells += cells.len();
+        row_offsets.push(total_cells);
+    }
+    if total_cells == 0 {
+        let mut out = Vec::with_capacity(n_rows);
+        for &q in q_per_row {
+            out.push(SurvivalFlexCalibrationFAndDerivs {
+                f: -crate::probability::normal_cdf(-q),
+                f_prime: 0.0,
+                f_double_prime: 0.0,
+            });
+        }
+        return Ok(Some(out));
+    }
+    let mut left = Vec::with_capacity(total_cells);
+    let mut right = Vec::with_capacity(total_cells);
+    let mut c0 = Vec::with_capacity(total_cells);
+    let mut c1 = Vec::with_capacity(total_cells);
+    let mut c2 = Vec::with_capacity(total_cells);
+    let mut c3 = Vec::with_capacity(total_cells);
+    for cells in partition_by_row {
+        for pc in cells {
+            left.push(pc.cell.left);
+            right.push(pc.cell.right);
+            c0.push(-pc.cell.c0);
+            c1.push(-pc.cell.c1);
+            c2.push(-pc.cell.c2);
+            c3.push(-pc.cell.c3);
+        }
+    }
+
+    let batch = SurvivalFlexRowCellsBatch {
+        n_cells: total_cells,
+        n_rows,
+        max_degree: 9,
+        left: &left,
+        right: &right,
+        c0: &c0,
+        c1: &c1,
+        c2: &c2,
+        c3: &c3,
+        row_offsets: &row_offsets,
+    };
+    let mom = match try_row_batched_cell_moments(batch)? {
+        Some(m) => m,
+        None => return Ok(None),
+    };
+    let stride = mom.stride;
+    // Substrate must give us at least degree 9 (10 moments) per cell —
+    // `cell_second_derivative_from_moments` needs degree
+    // `len(eta)+len(r)+len(s)-3 = 4+4+4-3 = 9`.
+    if stride < 10 {
+        return Err(GpuError::DriverCallFailed {
+            reason: format!(
+                "try_device_evaluate_calibration: substrate returned stride={stride} < 10"
+            ),
+        });
+    }
+    let ok_byte = super::cubic_cell::CubicCellMomentStatus::Ok as u8;
+    if mom.status.iter().any(|&s| s != ok_byte) {
+        return Ok(None);
+    }
+
+    let inv_two_pi = 1.0_f64 / std::f64::consts::TAU;
+
+    let mut out = Vec::with_capacity(n_rows);
+    for row in 0..n_rows {
+        let a = a_per_row[row];
+        let q = q_per_row[row];
+        let slope = slope_per_row[row];
+        let mut f = -crate::probability::normal_cdf(-q);
+        let mut f_a = 0.0_f64;
+        let mut f_aa = 0.0_f64;
+
+        let start = row_offsets[row];
+        let end = row_offsets[row + 1];
+        for cell_idx in start..end {
+            let pc = &partition_by_row[row][cell_idx - start];
+            let moments_row = &mom.moments[cell_idx * stride..cell_idx * stride + stride];
+            // Cell value contribution: `INV_TWO_PI * moments[0]` (matches
+            // `cell_polynomial_integral_from_moments` for `[1.0]`).
+            f += moments_row[0] * inv_two_pi;
+
+            let (dc_da_pos, _) =
+                denested_cell_coefficient_partials(pc.score_span, pc.link_span, a, slope);
+            let (dc_daa_pos, _, _) =
+                denested_cell_second_partials(pc.score_span, pc.link_span, a, slope);
+            let dc_da = [
+                -probit_scale * dc_da_pos[0],
+                -probit_scale * dc_da_pos[1],
+                -probit_scale * dc_da_pos[2],
+                -probit_scale * dc_da_pos[3],
+            ];
+            let dc_daa = [
+                -probit_scale * dc_daa_pos[0],
+                -probit_scale * dc_daa_pos[1],
+                -probit_scale * dc_daa_pos[2],
+                -probit_scale * dc_daa_pos[3],
+            ];
+
+            // F' contribution: dot(dc_da, moments[0..4]) * INV_TWO_PI.
+            let mut first = 0.0_f64;
+            for k in 0..4 {
+                first = dc_da[k].mul_add(moments_row[k], first);
+            }
+            f_a += first * inv_two_pi;
+
+            // F'' contribution: (second_term - conv_term) * INV_TWO_PI.
+            // second_term = dot(dc_daa, moments[0..4]).
+            let mut second_term = 0.0_f64;
+            for k in 0..4 {
+                second_term = dc_daa[k].mul_add(moments_row[k], second_term);
+            }
+            // conv_term = conv(neg_cubic, dc_da, dc_da) · moments[0..10].
+            // The CPU helper passes `neg_cell` cubic into the convolution;
+            // we mirror that with the negated coefficients here.
+            let neg_cubic = [-pc.cell.c0, -pc.cell.c1, -pc.cell.c2, -pc.cell.c3];
+            let mut eta_r = [0.0_f64; 16];
+            for i in 0..4 {
+                for j in 0..4 {
+                    eta_r[i + j] = neg_cubic[i].mul_add(dc_da[j], eta_r[i + j]);
+                }
+            }
+            let er_len = 4 + 4 - 1;
+            let mut eta_rs = [0.0_f64; 16];
+            for i in 0..er_len {
+                for j in 0..4 {
+                    eta_rs[i + j] = eta_r[i].mul_add(dc_da[j], eta_rs[i + j]);
+                }
+            }
+            let ers_len = er_len + 4 - 1;
+            let mut conv_term = 0.0_f64;
+            for k in 0..ers_len {
+                conv_term = eta_rs[k].mul_add(moments_row[k], conv_term);
+            }
+            f_aa += (second_term - conv_term) * inv_two_pi;
+        }
+
+        out.push(SurvivalFlexCalibrationFAndDerivs {
+            f,
+            f_prime: f_a,
+            f_double_prime: f_aa,
+        });
+    }
+
+    Ok(Some(out))
+}
+
+// ────────────────────────────────────────────────────────────────────────
 // Three thin pullback entry points.  The bodies all currently return
 // `Ok(None)` (the unsupported sentinel) because Steps 2–5 still need to
 // land the flex / cubic-cell / intercept-solve infrastructure before
@@ -2818,5 +3047,128 @@ mod survival_flex_gpu_tests {
         assert!(out.f.is_finite(), "F(a=0) must be finite");
         // At q > 0, `-Φ(-q) ∈ (-0.5, 0)`, strictly negative.
         assert!(target < 0.0, "target survival sign convention check");
+    }
+
+    /// Layer 4a — `try_device_evaluate_calibration` ↔ `cpu_oracle_evaluate_calibration`
+    /// parity.  Both code paths are the same identity, only the moment
+    /// quadrature differs (analytic in the oracle, substrate-evaluated in
+    /// the device entry).  Tolerance abs ≤ 5e-10 mirrors the substrate's
+    /// own GL kernel parity bar vs the CPU evaluator.
+    ///
+    /// Runs on every host: the substrate falls back to CPU on non-Linux /
+    /// no-CUDA builds, so the parity assertion is identity-vs-identity in
+    /// that case (still useful as a regression check on the fold algebra).
+    #[test]
+    fn step4a_device_evaluator_matches_cpu_oracle() {
+        // Two rows × two cells per row — exercises the row_offsets index
+        // and the per-cell partial recomputation per (row, cell) pair.
+        use crate::families::cubic_cell_kernel::{DenestedCubicCell, LocalSpanCubic};
+
+        fn cells_for_row(seed: f64) -> Vec<SurvivalFlexCalibrationCell> {
+            vec![
+                SurvivalFlexCalibrationCell {
+                    cell: DenestedCubicCell {
+                        left: -0.5,
+                        right: 0.0,
+                        c0: 0.31 + seed * 0.01,
+                        c1: 0.27,
+                        c2: -0.11,
+                        c3: 0.07,
+                    },
+                    score_span: LocalSpanCubic {
+                        left: -0.5,
+                        c1: 0.13,
+                        c2: -0.05,
+                        c3: 0.02,
+                    },
+                    link_span: LocalSpanCubic {
+                        left: -0.5,
+                        c1: 0.09,
+                        c2: 0.04,
+                        c3: -0.01,
+                    },
+                },
+                SurvivalFlexCalibrationCell {
+                    cell: DenestedCubicCell {
+                        left: 0.0,
+                        right: 0.5,
+                        c0: -0.18 + seed * 0.01,
+                        c1: 0.12,
+                        c2: 0.06,
+                        c3: -0.04,
+                    },
+                    score_span: LocalSpanCubic {
+                        left: 0.0,
+                        c1: 0.11,
+                        c2: 0.03,
+                        c3: -0.02,
+                    },
+                    link_span: LocalSpanCubic {
+                        left: 0.0,
+                        c1: 0.08,
+                        c2: -0.04,
+                        c3: 0.015,
+                    },
+                },
+            ]
+        }
+
+        let row0 = cells_for_row(0.0);
+        let row1 = cells_for_row(1.0);
+        let partition_by_row: Vec<Vec<SurvivalFlexCalibrationCell>> =
+            vec![row0.clone(), row1.clone()];
+        let a_per_row = vec![0.07_f64, -0.05];
+        let q_per_row = vec![0.4_f64, 0.55];
+        let slope_per_row = vec![0.55_f64, 0.42];
+        let probit_scale = 1.0_f64;
+
+        let device_out = match try_device_evaluate_calibration(
+            &partition_by_row,
+            &a_per_row,
+            &q_per_row,
+            &slope_per_row,
+            probit_scale,
+        ) {
+            Ok(Some(out)) => out,
+            Ok(None) => {
+                // Substrate non-OK status — skip; oracle remains the
+                // authoritative reference.  Print so CI can flag the
+                // skip on the substrate side.
+                eprintln!(
+                    "[step4a parity] substrate returned None; skipping parity check"
+                );
+                return;
+            }
+            Err(err) => panic!("device evaluator failed: {err:?}"),
+        };
+        assert_eq!(device_out.len(), 2);
+        for (row, (a, q, slope)) in a_per_row
+            .iter()
+            .zip(q_per_row.iter())
+            .zip(slope_per_row.iter())
+            .map(|((a, q), s)| (*a, *q, *s))
+            .enumerate()
+        {
+            let oracle = cpu_oracle_evaluate_calibration(
+                &partition_by_row[row],
+                a,
+                q,
+                slope,
+                probit_scale,
+            )
+            .expect("oracle must succeed on fixture");
+            let dev = device_out[row];
+            let chk = |label: &str, d: f64, o: f64| {
+                let abs = (d - o).abs();
+                let rel = abs / (1.0 + o.abs());
+                assert!(
+                    abs <= 5e-10 || rel <= 5e-9,
+                    "[row {row}] {label} parity: device={d} oracle={o} abs={abs} rel={rel}"
+                );
+            };
+            chk("F", dev.f, oracle.f);
+            chk("F'", dev.f_prime, oracle.f_prime);
+            chk("F''", dev.f_double_prime, oracle.f_double_prime);
+        }
     }
 }
