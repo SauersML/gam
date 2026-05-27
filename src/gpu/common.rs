@@ -65,7 +65,7 @@ use crate::gpu::error::GpuResultExt;
             let fresh =
                 stream
                     .alloc_zeros::<f64>(bucket)
-                    .gpu_ctx("{label} arena alloc_zeros<{bucket}>")?;
+                    .gpu_ctx_with(|err| format!("{label} arena alloc_zeros<{bucket}>: {err}"))?;
             Ok((bucket, fresh))
         }
 
@@ -113,10 +113,10 @@ use crate::gpu::error::GpuResultExt;
                 return Ok(existing);
             }
             let ptx =
-                cudarc::nvrtc::compile_ptx(source).gpu_ctx("{label} NVRTC compile failed")?;
+                cudarc::nvrtc::compile_ptx(source).gpu_ctx_with(|err| format!("{label} NVRTC compile failed: {err}"))?;
             let module = ctx
                 .load_module(ptx)
-                .gpu_ctx("{label} module load failed")?;
+                .gpu_ctx_with(|err| format!("{label} module load failed: {err}"))?;
             self.module.set(module).ok();
             Ok(self
                 .module

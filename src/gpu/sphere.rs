@@ -615,7 +615,7 @@ pub fn build_kernel_matrix_device(
         let mut out_dev =
             stream
                 .alloc_zeros::<f64>(ld * m)
-                .gpu_ctx("sphere alloc out (ld={ld}, m={m})")?;
+                .gpu_ctx_with(|err| format!("sphere alloc out (ld={ld}, m={m}): {err}"))?;
 
         // Block (32, 8, 1) — x over centers, y over rows.
         let block_x: u32 = 32;
@@ -734,7 +734,7 @@ pub fn build_householder_constrained_design_device(
         let ld_out = ((n + 31) / 32) * 32;
         let mut out_dev = stream
             .alloc_zeros::<f64>(ld_out * cols_out)
-            .gpu_ctx("sphere-hh alloc out (ld={ld_out}, cols={cols_out})")?;
+            .gpu_ctx_with(|err| format!("sphere-hh alloc out (ld={ld_out}, cols={cols_out}): {err}"))?;
 
         let block_x: u32 = 128;
         let grid_x: u32 = ((n as u32) + block_x - 1) / block_x;
