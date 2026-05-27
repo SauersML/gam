@@ -12600,7 +12600,7 @@ mod tests {
 
     #[test]
     fn noncanonical_binomial_working_state_clamps_saturating_standard_links() {
-        for link in [LinkFunction::Probit, LinkFunction::CLogLog] {
+        for link in [StandardLink::Probit, StandardLink::CLogLog] {
             let y = array![1.0];
             let eta = array![30.0];
             let priorweights = array![1.0];
