@@ -105,7 +105,10 @@ mod tests {
     fn dummy_mixture_state() -> MixtureLinkState {
         // K=2 components with the free logit at 0 — softmax weights are uniform.
         MixtureLinkState {
-            components: vec![crate::types::LinkComponent::Logit, crate::types::LinkComponent::Probit],
+            components: vec![
+                crate::types::LinkComponent::Logit,
+                crate::types::LinkComponent::Probit,
+            ],
             rho: Array1::from(vec![0.0_f64]),
             pi: Array1::from(vec![0.5_f64, 0.5_f64]),
         }
@@ -142,7 +145,10 @@ mod tests {
                 ),
                 PirlsLoopFamilyKind::PoissonLog,
             ),
-            (LikelihoodSpec::gaussian_identity(), PirlsLoopFamilyKind::GaussianIdentity),
+            (
+                LikelihoodSpec::gaussian_identity(),
+                PirlsLoopFamilyKind::GaussianIdentity,
+            ),
             (
                 LikelihoodSpec::new(
                     ResponseFamily::Gamma,
@@ -203,7 +209,10 @@ mod tests {
     #[test]
     fn admission_is_none_for_unmapped_family() {
         let mixture_state = dummy_mixture_state();
-        let spec = LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Mixture(mixture_state));
+        let spec = LikelihoodSpec::new(
+            ResponseFamily::Binomial,
+            InverseLink::Mixture(mixture_state),
+        );
         assert!(admission_for(&spec, 80_000, 44).is_none());
     }
 }

@@ -1461,9 +1461,7 @@ mod sphere_gpu_tests {
                     centers.view(),
                     m_penalty,
                     false,
-                    SphereWahbaKernel::SobolevTruncated {
-                        lmax: lmax as u16,
-                    },
+                    SphereWahbaKernel::SobolevTruncated { lmax: lmax as u16 },
                 )
                 .expect("kernel matrix");
                 let n = centers.nrows();
@@ -1672,9 +1670,7 @@ mod sphere_gpu_tests {
     #[test]
     fn sphere_gpu_end_to_end_dispatch_parity_vs_cpu_truncated() {
         let Some(_runtime) = super::super::runtime::GpuRuntime::global() else {
-            eprintln!(
-                "[sphere_gpu test] no CUDA runtime — skipping end-to-end dispatch parity"
-            );
+            eprintln!("[sphere_gpu test] no CUDA runtime — skipping end-to-end dispatch parity");
             return;
         };
         if SphereGpuBackend::probe().is_err() {
@@ -1710,12 +1706,9 @@ mod sphere_gpu_tests {
         // centers that the GPU build chose. The centers are deterministic
         // (farthest-point with the same seed = leftmost-lowest lat/lon),
         // so we can rebuild them.
-        let centers = crate::basis::select_spherical_farthest_point_centers(
-            data.view(),
-            200,
-            false,
-        )
-        .expect("centers");
+        let centers =
+            crate::basis::select_spherical_farthest_point_centers(data.view(), 200, false)
+                .expect("centers");
         let raw_cpu = spherical_wahba_kernel_matrix_with_kind(
             data.view(),
             centers.view(),
@@ -1728,15 +1721,11 @@ mod sphere_gpu_tests {
         // The build wraps raw · Z into the final design; rebuild Z from
         // the same weighted sum-to-zero transform.
         let weights = crate::basis::sphere_area_weights(centers.view(), false);
-        let z = crate::basis::weighted_coefficient_sum_to_zero_transform(weights.view())
-            .expect("z");
+        let z =
+            crate::basis::weighted_coefficient_sum_to_zero_transform(weights.view()).expect("z");
         let cpu_design = raw_cpu.dot(&z);
 
-        let gpu_design = result_gpu
-            .design
-            .as_dense()
-            .expect("dense design")
-            .clone();
+        let gpu_design = result_gpu.design.as_dense().expect("dense design").clone();
 
         assert_eq!(gpu_design.dim(), cpu_design.dim());
         let mut max_abs = 0.0_f64;
@@ -1873,8 +1862,7 @@ mod sphere_gpu_tests {
 
         // Measure GPU.
         let t0 = std::time::Instant::now();
-        let dev =
-            build_kernel_matrix_device(inputs_warm.clone()).expect("gpu kernel matrix");
+        let dev = build_kernel_matrix_device(inputs_warm.clone()).expect("gpu kernel matrix");
         let _host_gpu = dev.to_host_array().expect("dtoh");
         let gpu_secs = t0.elapsed().as_secs_f64();
 
@@ -1885,9 +1873,7 @@ mod sphere_gpu_tests {
             centers_ll.view(),
             penalty_order,
             false,
-            SphereWahbaKernel::SobolevTruncated {
-                lmax: lmax as u16,
-            },
+            SphereWahbaKernel::SobolevTruncated { lmax: lmax as u16 },
         )
         .expect("cpu kernel matrix");
         let cpu_secs = t1.elapsed().as_secs_f64();
@@ -1937,12 +1923,10 @@ mod sphere_gpu_tests {
         };
 
         // Warm-up GPU build.
-        let _ = build_spherical_spline_basis(data_ll.view(), &spec_gpu)
-            .expect("warmup build");
+        let _ = build_spherical_spline_basis(data_ll.view(), &spec_gpu).expect("warmup build");
 
         let t0 = std::time::Instant::now();
-        let _ = build_spherical_spline_basis(data_ll.view(), &spec_gpu)
-            .expect("gpu build");
+        let _ = build_spherical_spline_basis(data_ll.view(), &spec_gpu).expect("gpu build");
         let gpu_secs = t0.elapsed().as_secs_f64();
 
         // CPU comparison: directly invoke the CPU helper and apply the
@@ -1951,16 +1935,12 @@ mod sphere_gpu_tests {
         // helper isolates the GPU-vs-CPU kernel cost without re-doing
         // farthest-point center selection (which is identical for both
         // paths).
-        let centers = crate::basis::select_spherical_farthest_point_centers(
-            data_ll.view(),
-            m,
-            false,
-        )
-        .expect("centers");
+        let centers =
+            crate::basis::select_spherical_farthest_point_centers(data_ll.view(), m, false)
+                .expect("centers");
         let weights = crate::basis::sphere_area_weights(centers.view(), false);
         let z =
-            crate::basis::weighted_coefficient_sum_to_zero_transform(weights.view())
-                .expect("z");
+            crate::basis::weighted_coefficient_sum_to_zero_transform(weights.view()).expect("z");
         let t1 = std::time::Instant::now();
         let raw_cpu = spherical_wahba_kernel_matrix_with_kind(
             data_ll.view(),

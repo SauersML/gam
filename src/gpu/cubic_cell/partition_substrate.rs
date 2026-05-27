@@ -58,9 +58,7 @@ impl<'a> DeviationRuntimeView<'a> {
     #[inline]
     fn support_interval(&self) -> Result<(f64, f64), String> {
         if self.endpoint_points.len() < 2 {
-            return Err(
-                "deviation runtime view: need at least two endpoint points".to_string(),
-            );
+            return Err("deviation runtime view: need at least two endpoint points".to_string());
         }
         Ok((
             self.endpoint_points[0],
@@ -312,8 +310,7 @@ pub(crate) fn build_host_partition_cells(
             }
             let mut sum = zero_span;
             for coord in 0..score_dim {
-                let local_beta =
-                    &beta[coord * basis_dim..(coord + 1) * basis_dim];
+                let local_beta = &beta[coord * basis_dim..(coord + 1) * basis_dim];
                 let span = runtime.local_cubic_at(local_beta, z)?;
                 if coord == 0 {
                     sum.left = span.left;
@@ -446,15 +443,7 @@ mod tests {
 
     #[test]
     fn local_cubic_at_matches_left_tail_saturation() {
-        let view = make_view(
-            &[0.0, 1.0],
-            &[1.0],
-            &[0.0],
-            &[0.0],
-            &[0.0],
-            &[1.0],
-            1,
-        );
+        let view = make_view(&[0.0, 1.0], &[1.0], &[0.0], &[0.0], &[0.0], &[1.0], 1);
         let beta = [0.5_f64];
         let span = view.local_cubic_at(&beta, -0.25).unwrap();
         assert_eq!(span.left, 0.0);
@@ -466,15 +455,7 @@ mod tests {
 
     #[test]
     fn local_cubic_at_matches_right_tail_saturation() {
-        let view = make_view(
-            &[0.0, 1.0],
-            &[1.0],
-            &[0.0],
-            &[0.0],
-            &[0.0],
-            &[2.0],
-            1,
-        );
+        let view = make_view(&[0.0, 1.0], &[1.0], &[0.0], &[0.0], &[0.0], &[2.0], 1);
         let beta = [0.5_f64];
         let span = view.local_cubic_at(&beta, 2.5).unwrap();
         assert_eq!(span.c0, 1.0);

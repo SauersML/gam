@@ -1005,18 +1005,12 @@ mod sigma_cubature_accumulation_tests {
         // Pick b_0 with all components non-zero and J with mixed sign
         // entries so the cancellation isn't trivially zero in one row.
         let b0: Array1<f64> = ndarray::array![2.5, -1.25, 4.0];
-        let j: Array2<f64> = ndarray::array![
-            [1.0, -2.0, 0.5],
-            [0.0, 1.5, -1.0],
-            [-0.75, 0.25, 2.0],
-        ];
+        let j: Array2<f64> =
+            ndarray::array![[1.0, -2.0, 0.5], [0.0, 1.5, -1.0], [-0.75, 0.25, 2.0],];
         // A_0 chosen as a non-trivial SPD so the A-side has structure
         // that would mask drift if the variance formula were buggy.
-        let a0: Array2<f64> = ndarray::array![
-            [3.0, 0.5, -0.25],
-            [0.5, 2.0, 0.10],
-            [-0.25, 0.10, 1.5],
-        ];
+        let a0: Array2<f64> =
+            ndarray::array![[3.0, 0.5, -0.25], [0.5, 2.0, 0.10], [-0.25, 0.10, 1.5],];
 
         let points: Vec<(Array2<f64>, Array1<f64>)> = displacements
             .iter()
@@ -1085,9 +1079,8 @@ mod sigma_cubature_accumulation_tests {
 
         // Sweep M to make sure the result doesn't depend on the count.
         for m in [1usize, 2, 4, 6, 8, 16] {
-            let points: Vec<(Array2<f64>, Array1<f64>)> = (0..m)
-                .map(|_| (a0.clone(), zero_b.clone()))
-                .collect();
+            let points: Vec<(Array2<f64>, Array1<f64>)> =
+                (0..m).map(|_| (a0.clone(), zero_b.clone())).collect();
             let actual = accumulate_sigma_cubature_total_covariance(&points, p);
             for i in 0..p {
                 for j in 0..p {
@@ -1142,8 +1135,7 @@ mod sigma_cubature_accumulation_tests {
         };
         let scales = [0.7_f64, 1.3, 0.4];
 
-        let mut interleaved: Vec<(Array2<f64>, Array1<f64>)> =
-            Vec::with_capacity(2 * r);
+        let mut interleaved: Vec<(Array2<f64>, Array1<f64>)> = Vec::with_capacity(2 * r);
         for k in 0..r {
             for sign in [1.0_f64, -1.0_f64] {
                 let mut d = Array1::<f64>::zeros(r);
@@ -1156,8 +1148,7 @@ mod sigma_cubature_accumulation_tests {
         // Note: we deliberately preserve the *(A_m, b_m)* binding of
         // each point — the permutation reorders the (A_m, b_m) pairs as
         // units, it does not swap A_m with a different point's b_m.
-        let mut permuted: Vec<(Array2<f64>, Array1<f64>)> =
-            Vec::with_capacity(2 * r);
+        let mut permuted: Vec<(Array2<f64>, Array1<f64>)> = Vec::with_capacity(2 * r);
         for k in 0..r {
             permuted.push(interleaved[2 * k].clone()); // + axis k
         }
@@ -1165,10 +1156,8 @@ mod sigma_cubature_accumulation_tests {
             permuted.push(interleaved[2 * k + 1].clone()); // − axis k
         }
 
-        let v_interleaved =
-            accumulate_sigma_cubature_total_covariance(&interleaved, p);
-        let v_permuted =
-            accumulate_sigma_cubature_total_covariance(&permuted, p);
+        let v_interleaved = accumulate_sigma_cubature_total_covariance(&interleaved, p);
+        let v_permuted = accumulate_sigma_cubature_total_covariance(&permuted, p);
 
         let mut max_abs_dev = 0.0_f64;
         for i in 0..p {
@@ -1235,11 +1224,8 @@ mod sigma_cubature_accumulation_tests {
         // delegate to the same evaluator, this collapses to identity
         // and the assertion is on the accumulator's determinism.
         let p = 3;
-        let a: Array2<f64> = ndarray::array![
-            [1.5, 0.20, 0.10],
-            [0.20, 1.20, 0.05],
-            [0.10, 0.05, 0.90],
-        ];
+        let a: Array2<f64> =
+            ndarray::array![[1.5, 0.20, 0.10], [0.20, 1.20, 0.05], [0.10, 0.05, 0.90],];
         let b0: Array1<f64> = ndarray::array![0.30, -0.40, 0.10];
         let mut points: Vec<(Array2<f64>, Array1<f64>)> = Vec::new();
         for k in 0..3 {
@@ -1316,7 +1302,8 @@ mod sigma_cubature_accumulation_tests {
         mean_b.scaled_add(w, &b1);
         mean_b.scaled_add(w, &b2);
         let outer = |v: &Array1<f64>| -> Array2<f64> {
-            v.view().insert_axis(ndarray::Axis(1))
+            v.view()
+                .insert_axis(ndarray::Axis(1))
                 .dot(&v.view().insert_axis(ndarray::Axis(0)))
         };
         let mut second = Array2::<f64>::zeros((p, p));
@@ -1348,11 +1335,7 @@ mod sigma_cubature_accumulation_tests {
     #[test]
     fn cubature_beta_scaling_propagates_quadratically() {
         let p = 3;
-        let a0: Array2<f64> = ndarray::array![
-            [2.0, 0.1, 0.0],
-            [0.1, 1.5, 0.05],
-            [0.0, 0.05, 1.0],
-        ];
+        let a0: Array2<f64> = ndarray::array![[2.0, 0.1, 0.0], [0.1, 1.5, 0.05], [0.0, 0.05, 1.0],];
         let raw_betas: Vec<Array1<f64>> = vec![
             ndarray::array![1.0, -0.5, 0.3],
             ndarray::array![-1.0, 0.5, -0.3],
@@ -1360,10 +1343,8 @@ mod sigma_cubature_accumulation_tests {
             ndarray::array![-0.7, -0.2, 0.1],
         ];
 
-        let unscaled: Vec<(Array2<f64>, Array1<f64>)> = raw_betas
-            .iter()
-            .map(|b| (a0.clone(), b.clone()))
-            .collect();
+        let unscaled: Vec<(Array2<f64>, Array1<f64>)> =
+            raw_betas.iter().map(|b| (a0.clone(), b.clone())).collect();
         let v_unscaled = accumulate_sigma_cubature_total_covariance(&unscaled, p);
 
         let alpha = 2.5_f64;
@@ -1378,8 +1359,7 @@ mod sigma_cubature_accumulation_tests {
         let mut max_rel = 0.0_f64;
         for i in 0..p {
             for j in 0..p {
-                let expected =
-                    a0[[i, j]] + alpha * alpha * (v_unscaled[[i, j]] - a0[[i, j]]);
+                let expected = a0[[i, j]] + alpha * alpha * (v_unscaled[[i, j]] - a0[[i, j]]);
                 let diff = (v_scaled[[i, j]] - expected).abs();
                 let denom = expected.abs().max(1.0);
                 max_rel = max_rel.max(diff / denom);
@@ -1412,8 +1392,7 @@ mod sigma_cubature_accumulation_tests {
                 .collect();
             points.push((a, b));
         }
-        let reversed: Vec<(Array2<f64>, Array1<f64>)> =
-            points.iter().rev().cloned().collect();
+        let reversed: Vec<(Array2<f64>, Array1<f64>)> = points.iter().rev().cloned().collect();
 
         let v_forward = accumulate_sigma_cubature_total_covariance(&points, p);
         let v_reverse = accumulate_sigma_cubature_total_covariance(&reversed, p);
@@ -1455,8 +1434,7 @@ mod sigma_cubature_accumulation_tests {
                 (a_mk(s), b)
             })
             .collect();
-        let mut doubled: Vec<(Array2<f64>, Array1<f64>)> =
-            Vec::with_capacity(2 * original.len());
+        let mut doubled: Vec<(Array2<f64>, Array1<f64>)> = Vec::with_capacity(2 * original.len());
         for pt in &original {
             doubled.push(pt.clone());
             doubled.push(pt.clone());
@@ -1566,8 +1544,7 @@ mod sigma_cubature_accumulation_tests {
                 let mut lower = Array2::<f64>::zeros((p, p));
                 for i in 0..p {
                     for j in 0..=i {
-                        let off = (i as f64 + 1.0) * (j as f64 + 1.0)
-                            + 0.1 * (idx as f64);
+                        let off = (i as f64 + 1.0) * (j as f64 + 1.0) + 0.1 * (idx as f64);
                         lower[[i, j]] = (off.sin()) * 0.05 + if i == j { 1.0 } else { 0.0 };
                     }
                 }
@@ -1735,19 +1712,18 @@ mod sigma_cubature_accumulation_tests {
     #[test]
     fn cubature_b_translation_leaves_output_unchanged() {
         let p = 3;
-        let a_const: Array2<f64> = ndarray::array![
-            [1.5, 0.2, 0.0],
-            [0.2, 1.2, 0.1],
-            [0.0, 0.1, 1.0],
-        ];
+        let a_const: Array2<f64> =
+            ndarray::array![[1.5, 0.2, 0.0], [0.2, 1.2, 0.1], [0.0, 0.1, 1.0],];
         let raw_bs: Vec<Array1<f64>> = vec![
             ndarray::array![0.4, -0.3, 0.2],
             ndarray::array![-0.4, 0.3, -0.2],
             ndarray::array![0.1, 0.5, -0.4],
             ndarray::array![-0.1, -0.5, 0.4],
         ];
-        let pts_raw: Vec<(Array2<f64>, Array1<f64>)> =
-            raw_bs.iter().map(|b| (a_const.clone(), b.clone())).collect();
+        let pts_raw: Vec<(Array2<f64>, Array1<f64>)> = raw_bs
+            .iter()
+            .map(|b| (a_const.clone(), b.clone()))
+            .collect();
         let shift: Array1<f64> = ndarray::array![10.0, -5.0, 3.0];
         let pts_shifted: Vec<(Array2<f64>, Array1<f64>)> = raw_bs
             .iter()
@@ -1864,8 +1840,7 @@ mod sigma_cubature_accumulation_tests {
                 // the diagonal.
                 for i in 0..p {
                     for j in 0..i {
-                        let v = 0.05 + 0.03 * (i as f64 + j as f64)
-                            + 0.02 * (idx as f64);
+                        let v = 0.05 + 0.03 * (i as f64 + j as f64) + 0.02 * (idx as f64);
                         a[[i, j]] = v;
                         a[[j, i]] = v;
                     }
@@ -1919,10 +1894,8 @@ mod sigma_cubature_accumulation_tests {
         // permutation-invariant. So output of original == output of
         // permuted-A == mean(A_m).
         let b_const: Array1<f64> = ndarray::array![0.2, -0.1, 0.3];
-        let original: Vec<(Array2<f64>, Array1<f64>)> = a_set
-            .iter()
-            .map(|a| (a.clone(), b_const.clone()))
-            .collect();
+        let original: Vec<(Array2<f64>, Array1<f64>)> =
+            a_set.iter().map(|a| (a.clone(), b_const.clone())).collect();
         // Build a non-trivial permutation of A's.
         let perm: [usize; 6] = [3, 0, 5, 1, 4, 2];
         let permuted_a: Vec<(Array2<f64>, Array1<f64>)> = perm
@@ -1941,10 +1914,8 @@ mod sigma_cubature_accumulation_tests {
         let mut max_abs_perm = 0.0_f64;
         for i in 0..p {
             for j in 0..p {
-                max_abs_orig =
-                    max_abs_orig.max((v_orig[[i, j]] - mean_a[[i, j]]).abs());
-                max_abs_perm =
-                    max_abs_perm.max((v_perm[[i, j]] - mean_a[[i, j]]).abs());
+                max_abs_orig = max_abs_orig.max((v_orig[[i, j]] - mean_a[[i, j]]).abs());
+                max_abs_perm = max_abs_perm.max((v_perm[[i, j]] - mean_a[[i, j]]).abs());
             }
         }
         assert!(

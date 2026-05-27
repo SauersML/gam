@@ -436,7 +436,10 @@ mod tests {
         assert!(oversize.is_none(), "P exceeding ceiling must not plan");
 
         let bad_r = plan_fused_launch(4, 8, 33);
-        assert!(bad_r.is_none(), "R exceeding template ceiling must not plan");
+        assert!(
+            bad_r.is_none(),
+            "R exceeding template ceiling must not plan"
+        );
     }
 
     #[cfg(target_os = "linux")]

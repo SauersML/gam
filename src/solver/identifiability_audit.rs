@@ -367,8 +367,10 @@ pub fn audit_identifiability(specs: &[ParameterBlockSpec]) -> Result<Identifiabi
         let pb = specs[col_block_idx[b]].gauge_priority;
         pb.cmp(&pa).then_with(|| a.cmp(&b))
     });
-    let priority_perm_is_identity =
-        priority_perm.iter().enumerate().all(|(new_j, &old_j)| new_j == old_j);
+    let priority_perm_is_identity = priority_perm
+        .iter()
+        .enumerate()
+        .all(|(new_j, &old_j)| new_j == old_j);
 
     // Column-pivoted RRQR on the joint design. The pivot permutation
     // names which original columns were demoted past the rank
@@ -390,12 +392,11 @@ pub fn audit_identifiability(specs: &[ParameterBlockSpec]) -> Result<Identifiabi
     } else {
         let mut x_priority = Array2::<f64>::zeros((n, p_total));
         for (new_j, &old_j) in priority_perm.iter().enumerate() {
-            x_priority
-                .column_mut(new_j)
-                .assign(&x_joint.column(old_j));
+            x_priority.column_mut(new_j).assign(&x_joint.column(old_j));
         }
-        rrqr_with_permutation(&x_priority, default_rrqr_rank_alpha())
-            .map_err(|e| format!("identifiability audit joint RRQR (priority-ordered) failed: {e:?}"))?
+        rrqr_with_permutation(&x_priority, default_rrqr_rank_alpha()).map_err(|e| {
+            format!("identifiability audit joint RRQR (priority-ordered) failed: {e:?}")
+        })?
     };
     log::info!(
         "[STAGE] identifiability audit: joint RRQR end rank={}/{} elapsed={:.3}s",
@@ -556,7 +557,11 @@ pub fn audit_identifiability(specs: &[ParameterBlockSpec]) -> Result<Identifiabi
     // conditions are kept independent: either one is sufficient to halt.
     let hard_alias_pair = aliased_pairs
         .iter()
-        .max_by(|a, b| a.overlap.partial_cmp(&b.overlap).unwrap_or(std::cmp::Ordering::Equal))
+        .max_by(|a, b| {
+            a.overlap
+                .partial_cmp(&b.overlap)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
         .filter(|p| p.overlap >= HARD_HALT_OVERLAP_THRESHOLD)
         .cloned();
     let fatal = joint_rank_deficient || hard_alias_pair.is_some();
@@ -810,8 +815,10 @@ mod tests {
             audit.summary,
         );
         assert!(
-            audit.summary.contains("reparam") || audit.summary.contains("sum-to-zero")
-                || audit.summary.contains("orthogonal") || audit.summary.contains("absorb"),
+            audit.summary.contains("reparam")
+                || audit.summary.contains("sum-to-zero")
+                || audit.summary.contains("orthogonal")
+                || audit.summary.contains("absorb"),
             "fatal summary must include a reparameterisation suggestion; got {:?}",
             audit.summary,
         );

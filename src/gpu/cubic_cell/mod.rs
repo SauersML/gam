@@ -292,8 +292,8 @@ mod tests {
     fn rejects_mismatched_lengths() {
         let cells = [affine_cell()];
         let branches: [GpuCellBranchTag; 0] = [];
-        let err = try_build_cubic_cell_derivative_moments(host_view(&cells, &branches, 9))
-            .unwrap_err();
+        let err =
+            try_build_cubic_cell_derivative_moments(host_view(&cells, &branches, 9)).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("cells.len()"), "got: {msg}");
         assert!(msg.contains("branches.len()"), "got: {msg}");

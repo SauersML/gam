@@ -405,10 +405,8 @@ fn arrow_schur_gpu_ridge_bump_required_on_non_pd_row_recovers_after_bump() {
     for attempt in 0..10 {
         match solve_arrow_newton_step(&sys, ridge, ridge_beta) {
             Ok(got) => {
-                let expected =
-                    solve_arrow_newton_step_dense_reference(&sys, ridge, ridge_beta).expect(
-                        "dense reference Cholesky must succeed at sufficiently large ridge",
-                    );
+                let expected = solve_arrow_newton_step_dense_reference(&sys, ridge, ridge_beta)
+                    .expect("dense reference Cholesky must succeed at sufficiently large ridge");
                 assert_solution_matches(
                     "arrow_schur_gpu_v100/ridge_bump_required/recovered",
                     sys.rows.len(),
@@ -420,7 +418,9 @@ fn arrow_schur_gpu_ridge_bump_required_on_non_pd_row_recovers_after_bump() {
                 );
                 return;
             }
-            Err(ArrowSchurGpuFailure::RidgeBumpRequired { bump: next_bump, .. }) => {
+            Err(ArrowSchurGpuFailure::RidgeBumpRequired {
+                bump: next_bump, ..
+            }) => {
                 ridge = (ridge + next_bump).max(ridge * 2.0);
             }
             Err(ArrowSchurGpuFailure::Unavailable) => {
@@ -482,10 +482,7 @@ fn arrow_schur_gpu_v100_hill_climb_speedup_over_cpu_host_loop() {
             elapsed.push(start.elapsed().as_secs_f64());
         }
         // Drop the warmup, take the min of the remaining samples.
-        elapsed[1..]
-            .iter()
-            .copied()
-            .fold(f64::INFINITY, f64::min)
+        elapsed[1..].iter().copied().fold(f64::INFINITY, f64::min)
     };
 
     let cpu_secs = time_op(
@@ -498,11 +495,13 @@ fn arrow_schur_gpu_v100_hill_climb_speedup_over_cpu_host_loop() {
     );
     let abc_secs = time_op(
         "layer_abc",
-        Box::new(|| match solve_arrow_newton_step(&sys, ridge_t, ridge_beta) {
-            Ok(_) => Ok(()),
-            Err(ArrowSchurGpuFailure::Unavailable) => Err("device unavailable".to_string()),
-            Err(other) => Err(format!("{other:?}")),
-        }),
+        Box::new(
+            || match solve_arrow_newton_step(&sys, ridge_t, ridge_beta) {
+                Ok(_) => Ok(()),
+                Err(ArrowSchurGpuFailure::Unavailable) => Err("device unavailable".to_string()),
+                Err(other) => Err(format!("{other:?}")),
+            },
+        ),
     );
     let fused_secs = time_op(
         "layer_d_fused",

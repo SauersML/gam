@@ -9373,7 +9373,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         nullspace_dims: retained_nullspace_dims.clone(),
         initial_log_lambdas: Array1::from_vec(retained_log_lambdas.clone()),
         initial_beta: Some(baseline.fit.beta.clone()),
-gauge_priority: 100,
+        gauge_priority: 100,
     };
     let screening_cap = Arc::new(AtomicUsize::new(0));
     let outer_opts = BlockwiseFitOptions {
@@ -9772,7 +9772,7 @@ gauge_priority: 100,
         nullspace_dims: vec![],
         initial_log_lambdas: Array1::zeros(0),
         initial_beta: Some(baseline.fit.beta.clone()),
-gauge_priority: 100,
+        gauge_priority: 100,
     };
     let final_fit = fit_custom_family(
         &final_family,
@@ -12272,7 +12272,7 @@ fn fit_bounded_term_collection_with_design(
         nullspace_dims: design.nullspace_dims.clone(),
         initial_log_lambdas,
         initial_beta: Some(initial_beta),
-gauge_priority: 100,
+        gauge_priority: 100,
     };
     let fit = fit_custom_family(
         &family_adapter,
@@ -13542,11 +13542,14 @@ pub(crate) fn try_build_latent_coord_hyper_dirs(
             "LatentCoord term index {term_idx} out of bounds for realized smooth design"
         ))
     })?;
-    let termspec = resolvedspec.smooth_terms.get(term_idx.get()).ok_or_else(|| {
-        EstimationError::InvalidInput(format!(
-            "LatentCoord term index {term_idx} out of bounds for resolved smooth spec"
-        ))
-    })?;
+    let termspec = resolvedspec
+        .smooth_terms
+        .get(term_idx.get())
+        .ok_or_else(|| {
+            EstimationError::InvalidInput(format!(
+                "LatentCoord term index {term_idx} out of bounds for resolved smooth spec"
+            ))
+        })?;
     let p_total = design.design.ncols();
     let smooth_start = p_total.saturating_sub(design.smooth.total_smooth_cols());
     let global_range = (smooth_start + smooth_term.coeff_range.start)
@@ -14586,12 +14589,16 @@ impl SingleBlockLatentCoordDesignCache {
                     self.term_index
                 ))
             })?;
-        let termspec = self.spec.smooth_terms.get(self.term_index.get()).ok_or_else(|| {
-            SmoothError::dimension_mismatch(format!(
-                "LatentCoord term index {} out of bounds for resolved smooth spec",
-                self.term_index
-            ))
-        })?;
+        let termspec = self
+            .spec
+            .smooth_terms
+            .get(self.term_index.get())
+            .ok_or_else(|| {
+                SmoothError::dimension_mismatch(format!(
+                    "LatentCoord term index {} out of bounds for resolved smooth spec",
+                    self.term_index
+                ))
+            })?;
         match (&termspec.basis, &smooth_term.metadata) {
             (
                 SmoothBasisSpec::Matern { .. },
@@ -26505,7 +26512,7 @@ mod tests {
             nullspace_dims: vec![],
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(array![0.0, 0.0]),
-gauge_priority: 100,
+            gauge_priority: 100,
         };
         let deriv = CustomFamilyBlockPsiDerivative {
             penalty_index: None,
@@ -27072,7 +27079,7 @@ gauge_priority: 100,
             nullspace_dims: vec![],
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(baseline.fit.beta.clone()),
-gauge_priority: 100,
+            gauge_priority: 100,
         };
         let outer_opts = BlockwiseFitOptions {
             inner_max_cycles: 30,
@@ -27298,7 +27305,7 @@ gauge_priority: 100,
             nullspace_dims: vec![],
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(baseline.fit.beta.clone()),
-gauge_priority: 100,
+            gauge_priority: 100,
         };
         let outer_opts = BlockwiseFitOptions {
             inner_max_cycles: 20,

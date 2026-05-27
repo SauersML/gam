@@ -10,9 +10,7 @@
 //! decide cell branch, so a future kernel landing cannot drift on tolerance.
 
 use crate::families::cubic_cell_kernel::{DenestedCubicCell, ExactCellBranch, branch_cell};
-use crate::gpu::cubic_cell::{
-    CubicCellMomentStatus, GpuCellBranchTag, GpuDenestedCubicCell,
-};
+use crate::gpu::cubic_cell::{CubicCellMomentStatus, GpuCellBranchTag, GpuDenestedCubicCell};
 
 /// Result of classifying a single cell for GPU dispatch.
 ///
@@ -78,14 +76,7 @@ fn is_affine_quadcubic_zero(cell: GpuDenestedCubicCell) -> bool {
 mod tests {
     use super::*;
 
-    fn cell(
-        left: f64,
-        right: f64,
-        c0: f64,
-        c1: f64,
-        c2: f64,
-        c3: f64,
-    ) -> GpuDenestedCubicCell {
+    fn cell(left: f64, right: f64, c0: f64, c1: f64, c2: f64, c3: f64) -> GpuDenestedCubicCell {
         GpuDenestedCubicCell {
             left,
             right,
@@ -153,5 +144,4 @@ mod tests {
             Err(CubicCellMomentStatus::NonFiniteCoefficient)
         );
     }
-
 }

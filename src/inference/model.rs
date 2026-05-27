@@ -858,9 +858,7 @@ pub enum SavedAnchorKind {
     /// evaluated at training rows at fit time and at predict rows at
     /// predict time). The predictor stacks `ncols` columns from the
     /// sibling runtime's `design(arg)` into `n_row`.
-    FlexEvaluation {
-        ncols: usize,
-    },
+    FlexEvaluation { ncols: usize },
 }
 
 #[derive(Clone, Debug)]

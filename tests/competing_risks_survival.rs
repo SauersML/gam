@@ -71,7 +71,7 @@ fn fit_constant_exposure_cause_specific(event_counts: &[usize], n: usize) -> Arr
             initial_beta: Some(Array1::from_vec(vec![
                 ((event_counts[cause] as f64 + 0.5) / n as f64).ln(),
             ])),
-gauge_priority: 100,
+            gauge_priority: 100,
         });
     }
     let family = CauseSpecificRoystonParmarFamily::new(blocks)

@@ -1026,7 +1026,9 @@ extern "C" __global__ void linf_norm(
             last_logdet = step.logdet;
             ws.stream
                 .memcpy_htod(
-                    step.direction.as_slice().ok_or("direction not contiguous")?,
+                    step.direction
+                        .as_slice()
+                        .ok_or("direction not contiguous")?,
                     &mut loop_ws.direction_dev,
                 )
                 .map_err(|e| format!("upload direction: {e}"))?;
@@ -1051,9 +1053,7 @@ extern "C" __global__ void linf_norm(
 
             let mut alpha = 0.0_f64;
             let mut accepted_dev = prev_deviance;
-            for &a in &[
-                1.0_f64, 0.5, 0.25, 0.125, 0.0625, 0.03125, 0.015625,
-            ] {
+            for &a in &[1.0_f64, 0.5, 0.25, 0.125, 0.0625, 0.03125, 0.015625] {
                 ws.stream
                     .memcpy_dtod(&loop_ws.eta_dev, &mut loop_ws.eta_cand_dev)
                     .map_err(|e| format!("copy eta→cand: {e}"))?;
@@ -1144,9 +1144,7 @@ extern "C" __global__ void linf_norm(
             let dev_delta = (prev_deviance - accepted_dev).abs();
             prev_deviance = accepted_dev;
 
-            if dir_linf <= tol
-                && step_norm <= tol
-                && dev_delta <= tol * (1.0 + prev_deviance.abs())
+            if dir_linf <= tol && step_norm <= tol && dev_delta <= tol * (1.0 + prev_deviance.abs())
             {
                 converged = true;
                 return Ok(PirlsLoopOutcome {
@@ -1191,8 +1189,7 @@ extern "C" __global__ void linf_norm(
             incy: 1,
         };
         // SAFETY: a is n×p col-major lda=n; x length p incx=1; y length n incy=1.
-        unsafe { blas.gemv(cfg, a_dev, x_dev, y_dev) }
-            .map_err(|e| format!("dgemv no-trans: {e}"))
+        unsafe { blas.gemv(cfg, a_dev, x_dev, y_dev) }.map_err(|e| format!("dgemv no-trans: {e}"))
     }
 
     fn axpy(
@@ -1246,8 +1243,7 @@ extern "C" __global__ void linf_norm(
         // SAFETY: kernel signature (const double*, int, double*). The
         // `&mut *scalar_dev` reborrow keeps `scalar_dev` available for the
         // download below.
-        unsafe { builder.launch(cfg) }
-            .map_err(|e| format!("{label} reduce launch: {e}"))?;
+        unsafe { builder.launch(cfg) }.map_err(|e| format!("{label} reduce launch: {e}"))?;
         let host = stream
             .clone_dtoh(scalar_dev)
             .map_err(|e| format!("download {label}: {e}"))?;
@@ -1546,22 +1542,25 @@ mod pcg_device {
                 .get_or_init(|| {
                     let runtime = crate::gpu::runtime::GpuRuntime::global()
                         .ok_or_else(|| "pcg backend: no CUDA runtime available".to_string())?;
-                    let ctx = crate::gpu::runtime::cuda_context_for(
-                        runtime.selected_device().ordinal,
-                    )
-                    .ok_or_else(|| {
-                        format!(
-                            "pcg backend: failed to create CUDA context for device {}",
-                            runtime.selected_device().ordinal
-                        )
-                    })?;
+                    let ctx =
+                        crate::gpu::runtime::cuda_context_for(runtime.selected_device().ordinal)
+                            .ok_or_else(|| {
+                                format!(
+                                    "pcg backend: failed to create CUDA context for device {}",
+                                    runtime.selected_device().ordinal
+                                )
+                            })?;
                     let stream = ctx.default_stream();
                     let ptx = cudarc::nvrtc::compile_ptx(PCG_KERNEL_SOURCE)
                         .map_err(|err| format!("pcg NVRTC compile failed: {err}"))?;
                     let module = ctx
                         .load_module(ptx)
                         .map_err(|err| format!("pcg module load failed: {err}"))?;
-                    Ok(PcgBackend { stream, module, ctx })
+                    Ok(PcgBackend {
+                        stream,
+                        module,
+                        ctx,
+                    })
                 })
                 .as_ref()
                 .map_err(String::clone)
@@ -1661,8 +1660,7 @@ mod pcg_device {
             .map_err(|e| format!("pcg upload diag: {e}"))?;
 
         // ── Convergence baseline: ‖b‖₂ via one in-stream dot ─────────────
-        let n_i32 = i32::try_from(p)
-            .map_err(|_| format!("pcg: p_total={p} exceeds i32 range"))?;
+        let n_i32 = i32::try_from(p).map_err(|_| format!("pcg: p_total={p} exceeds i32 range"))?;
         let vec_threads: u32 = 64;
         let vec_blocks = launch_blocks(p, vec_threads);
         let dot_threads: u32 = match p {
@@ -2140,12 +2138,9 @@ mod stream_device_parity_tests {
         let penalty = arr2(&[[0.4, 0.0, 0.0], [0.0, 0.9, 0.0], [0.0, 0.0, 1.2]]);
         let lm_ridge = 0.1;
 
-        let shared = upload_shared_pirls_gpu(x.view())
-            .expect("upload shared design");
-        let mut ws_host = allocate_sigma_pirls_workspace(&shared)
-            .expect("alloc host-input ws");
-        let mut ws_dev = allocate_sigma_pirls_workspace(&shared)
-            .expect("alloc device-input ws");
+        let shared = upload_shared_pirls_gpu(x.view()).expect("upload shared design");
+        let mut ws_host = allocate_sigma_pirls_workspace(&shared).expect("alloc host-input ws");
+        let mut ws_dev = allocate_sigma_pirls_workspace(&shared).expect("alloc device-input ws");
 
         let host_step = solve_pirls_step_on_stream(
             &shared,
@@ -2160,14 +2155,8 @@ mod stream_device_parity_tests {
         .expect("host-input step");
 
         let n = x.nrows();
-        let mut w_dev = ws_dev
-            .stream
-            .alloc_zeros::<f64>(n)
-            .expect("alloc w_dev");
-        let mut g_dev = ws_dev
-            .stream
-            .alloc_zeros::<f64>(n)
-            .expect("alloc g_dev");
+        let mut w_dev = ws_dev.stream.alloc_zeros::<f64>(n).expect("alloc w_dev");
+        let mut g_dev = ws_dev.stream.alloc_zeros::<f64>(n).expect("alloc g_dev");
         ws_dev
             .stream
             .memcpy_htod(weights.as_slice().unwrap(), &mut w_dev)
@@ -2193,9 +2182,9 @@ mod stream_device_parity_tests {
         // add, same potrf).
         for i in 0..3 {
             for j in 0..3 {
-                let diff =
-                    (host_step.penalized_hessian[[i, j]] - dev_step.penalized_hessian[[i, j]])
-                        .abs();
+                let diff = (host_step.penalized_hessian[[i, j]]
+                    - dev_step.penalized_hessian[[i, j]])
+                .abs();
                 assert!(diff <= 1e-10, "H[{i},{j}] mismatch: {diff}");
             }
         }
@@ -2223,9 +2212,7 @@ mod stream_device_parity_tests {
     /// 13k-line state machine.
     #[test]
     fn hill_climb_loop_beats_cpu_10x_on_biobank_logit() {
-        use crate::gpu::pirls_row::{
-            row_reweight_cpu, CurvatureMode, PirlsRowFamily, RowInput,
-        };
+        use crate::gpu::pirls_row::{CurvatureMode, PirlsRowFamily, RowInput, row_reweight_cpu};
         use std::time::Instant;
         if crate::gpu::runtime::GpuRuntime::global().is_none() {
             eprintln!("[hill_climb] no CUDA runtime — skipping");
@@ -2249,7 +2236,11 @@ mod stream_device_parity_tests {
             .enumerate()
             .map(|(i, &e)| {
                 let mu = 0.5 * (1.0 + (0.5 * e).tanh());
-                if (i as f64 * 1.31).fract() < mu { 1.0 } else { 0.0 }
+                if (i as f64 * 1.31).fract() < mu {
+                    1.0
+                } else {
+                    0.0
+                }
             })
             .collect();
         let prior_w = ndarray::Array1::<f64>::ones(n);
@@ -2257,12 +2248,9 @@ mod stream_device_parity_tests {
         let beta0 = ndarray::Array1::<f64>::zeros(p);
 
         // GPU timing.
-        let shared = upload_shared_pirls_gpu(x.view())
-            .expect("upload shared design");
-        let mut ws = allocate_sigma_pirls_workspace(&shared)
-            .expect("alloc ws");
-        let mut loop_ws = allocate_pirls_loop_workspace(&shared, &ws)
-            .expect("alloc loop_ws");
+        let shared = upload_shared_pirls_gpu(x.view()).expect("upload shared design");
+        let mut ws = allocate_sigma_pirls_workspace(&shared).expect("alloc ws");
+        let mut loop_ws = allocate_pirls_loop_workspace(&shared, &ws).expect("alloc loop_ws");
         let t0 = Instant::now();
         let _ = pirls_loop_on_stream(
             &shared,
@@ -2361,12 +2349,9 @@ mod stream_device_parity_tests {
         let penalty = ndarray::Array2::<f64>::eye(p) * 1e-4; // tiny ridge
         let beta0 = ndarray::Array1::<f64>::zeros(p);
 
-        let shared = upload_shared_pirls_gpu(x.view())
-            .expect("upload shared design");
-        let mut ws = allocate_sigma_pirls_workspace(&shared)
-            .expect("alloc ws");
-        let mut loop_ws = allocate_pirls_loop_workspace(&shared, &ws)
-            .expect("alloc loop_ws");
+        let shared = upload_shared_pirls_gpu(x.view()).expect("upload shared design");
+        let mut ws = allocate_sigma_pirls_workspace(&shared).expect("alloc ws");
+        let mut loop_ws = allocate_pirls_loop_workspace(&shared, &ws).expect("alloc loop_ws");
 
         let outcome = pirls_loop_on_stream(
             &shared,
@@ -2515,10 +2500,9 @@ mod pcg_device_parity_tests {
         let rhs = ndarray::Array1::from_vec(b.to_vec());
         let h_owned = h.clone();
         let apply = move |v: &ndarray::Array1<f64>| h_owned.dot(v);
-        let (x, info) = crate::linalg::utils::solve_spd_pcg_with_info(
-            apply, &rhs, &diag, rel_tol, 4 * p,
-        )
-        .expect("host PCG oracle must converge on SPD fixture");
+        let (x, info) =
+            crate::linalg::utils::solve_spd_pcg_with_info(apply, &rhs, &diag, rel_tol, 4 * p)
+                .expect("host PCG oracle must converge on SPD fixture");
         assert!(
             info.converged,
             "host PCG oracle failed to converge: iters={} rel_res={}",
@@ -2560,9 +2544,7 @@ mod pcg_device_parity_tests {
             let base = row * r * r;
             for u in 0..r {
                 for v in 0..r {
-                    let seed = (row as f64) * 0.137
-                        + (u as f64) * 1.901
-                        + (v as f64) * 0.317;
+                    let seed = (row as f64) * 0.137 + (u as f64) * 1.901 + (v as f64) * 0.317;
                     let a = (seed.sin() * 1.7 + (seed * 0.5).cos() * 0.9) * 0.5;
                     row_hessians[base + u * r + v] = a;
                 }
@@ -2604,14 +2586,8 @@ mod pcg_device_parity_tests {
             })
             .collect();
 
-        let h_dense = cpu_dense_joint_hessian(
-            &row_hessians,
-            &marginal,
-            &logslope,
-            &block,
-            &primary,
-            n,
-        );
+        let h_dense =
+            cpu_dense_joint_hessian(&row_hessians, &marginal, &logslope, &block, &primary, n);
         let x_oracle = cpu_pcg_oracle(&h_dense, &b, 1e-12);
 
         // Grab the same CUDA context + default stream that the bms_flex_row
@@ -2620,9 +2596,7 @@ mod pcg_device_parity_tests {
         // test independent of any private kernel-backend symbols.
         let runtime = crate::gpu::runtime::GpuRuntime::global()
             .expect("runtime must exist when probe succeeded above");
-        let ctx = match crate::gpu::runtime::cuda_context_for(
-            runtime.selected_device().ordinal,
-        ) {
+        let ctx = match crate::gpu::runtime::cuda_context_for(runtime.selected_device().ordinal) {
             Some(c) => c,
             None => {
                 eprintln!("[pcg_device parity] cuda_context_for failed; skipping");

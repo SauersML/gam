@@ -16217,14 +16217,12 @@ fn try_build_truncated_sphere_design_gpu(
     radians: bool,
 ) -> Option<Array2<f64>> {
     let (lmax_u16, kind) = match kernel {
-        SphereWahbaKernel::SobolevTruncated { lmax } => (
-            lmax,
-            crate::gpu::sphere::SphereSpectralKernelKind::Sobolev,
-        ),
-        SphereWahbaKernel::PseudoTruncated { lmax } => (
-            lmax,
-            crate::gpu::sphere::SphereSpectralKernelKind::Pseudo,
-        ),
+        SphereWahbaKernel::SobolevTruncated { lmax } => {
+            (lmax, crate::gpu::sphere::SphereSpectralKernelKind::Sobolev)
+        }
+        SphereWahbaKernel::PseudoTruncated { lmax } => {
+            (lmax, crate::gpu::sphere::SphereSpectralKernelKind::Pseudo)
+        }
         SphereWahbaKernel::Sobolev | SphereWahbaKernel::Pseudo => return None,
     };
     let lmax = lmax_u16 as usize;
@@ -16268,9 +16266,7 @@ fn try_build_truncated_sphere_design_gpu(
             Some(arr)
         }
         Err(err) => {
-            log::warn!(
-                "sphere GPU dtoh fell back to CPU (n={n}, m={m}, lmax={lmax}): {err}"
-            );
+            log::warn!("sphere GPU dtoh fell back to CPU (n={n}, m={m}, lmax={lmax}): {err}");
             None
         }
     }

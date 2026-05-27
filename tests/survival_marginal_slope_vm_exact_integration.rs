@@ -170,10 +170,7 @@ fn survival_marginal_slope_v_plus_m_exact_engages_and_lifts_beta_to_raw_width() 
     // and log-slope forces the V+M parametric compile to drop at least
     // one column, which engages phase-4b.
     let duchon = "duchon(x1, x2, x3, centers=6, order=1)".to_string();
-    let formula = format!(
-        "Surv(entry_age, exit_age, event) ~ {} + 1",
-        duchon
-    );
+    let formula = format!("Surv(entry_age, exit_age, event) ~ {} + 1", duchon);
 
     let config = FitConfig {
         survival_likelihood: "marginal-slope".to_string(),

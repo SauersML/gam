@@ -5313,10 +5313,8 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 .score_warp_runtime
                 .as_ref()
                 .map(saved_compiled_flex_block);
-            payload.link_deviation_runtime = fit
-                .link_dev_runtime
-                .as_ref()
-                .map(saved_compiled_flex_block);
+            payload.link_deviation_runtime =
+                fit.link_dev_runtime.as_ref().map(saved_compiled_flex_block);
             write_payload_json(&out, payload)?;
             progress.advance_workflow(survival_total_steps);
         }
@@ -9944,8 +9942,8 @@ mod tests {
     };
     use gam::inference::formula_dsl::{ParsedTerm, parse_linkwiggle_formulaspec};
     use gam::inference::model::{
-        ColumnKindTag, FittedModelPayload, SavedCompiledFlexBlock,
-        SavedLatentZNormalization, SchemaColumn,
+        ColumnKindTag, FittedModelPayload, SavedCompiledFlexBlock, SavedLatentZNormalization,
+        SchemaColumn,
     };
     use gam::matrix::{DenseDesignMatrix, DenseDesignOperator, DesignMatrix, LinearOperator};
     use gam::predict::PredictableModel;

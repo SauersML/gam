@@ -8146,7 +8146,11 @@ mod tests {
             let gm = pen.grad_target(tm.view(), rho.view())[i];
             let fd = (gp - gm) / (2.0 * eps);
             assert_abs_diff_eq!(diag[i], fd, epsilon = 1e-5);
-            assert!(diag[i] >= 0.0, "hessian_diag entry must be PSD; got {}", diag[i]);
+            assert!(
+                diag[i] >= 0.0,
+                "hessian_diag entry must be PSD; got {}",
+                diag[i]
+            );
         }
     }
 

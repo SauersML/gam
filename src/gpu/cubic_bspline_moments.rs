@@ -683,11 +683,7 @@ fn layout_tag(layout: MomentLayout) -> u8 {
 /// `alpha_table[NALPHA][D]` carries the exponent multi-indices for the spec.
 /// Output is alpha-major with stride `((n_cells+31)/32)*32` so consecutive
 /// threads write coalesced f64s on Volta+.
-fn build_hex_tensor_kernel_source(
-    d: usize,
-    amax: usize,
-    alphas: &[Vec<u8>],
-) -> String {
+fn build_hex_tensor_kernel_source(d: usize, amax: usize, alphas: &[Vec<u8>]) -> String {
     let nalpha = alphas.len();
     let mut alpha_decl = String::new();
     alpha_decl.push_str("__constant__ unsigned char ALPHA_TABLE[NALPHA][D] = {\n");
@@ -1027,16 +1023,18 @@ pub fn build_hex_tensor_moments_device(
         flat.extend_from_slice(&banks[0].prod_coeff);
     }
 
-    let axis_flat_dev = stream
-        .clone_htod(flat.as_slice())
-        .map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("cubic_bspline_moments htod axis_flat: {err}"),
-        })?;
-    let axis_off_dev = stream
-        .clone_htod(axis_offsets.as_slice())
-        .map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("cubic_bspline_moments htod axis_offsets: {err}"),
-        })?;
+    let axis_flat_dev =
+        stream
+            .clone_htod(flat.as_slice())
+            .map_err(|err| GpuError::DriverCallFailed {
+                reason: format!("cubic_bspline_moments htod axis_flat: {err}"),
+            })?;
+    let axis_off_dev =
+        stream
+            .clone_htod(axis_offsets.as_slice())
+            .map_err(|err| GpuError::DriverCallFailed {
+                reason: format!("cubic_bspline_moments htod axis_offsets: {err}"),
+            })?;
     let span_dev = stream
         .clone_htod(cells.span_per_axis.as_slice())
         .map_err(|err| GpuError::DriverCallFailed {
@@ -1072,9 +1070,13 @@ pub fn build_hex_tensor_moments_device(
         shared_mem_bytes: 0,
     };
 
-    let n_cells_i32: i32 = i32::try_from(cells.n_cells).map_err(|_| GpuError::DriverCallFailed {
-        reason: format!("cubic_bspline_moments n_cells={} overflows i32", cells.n_cells),
-    })?;
+    let n_cells_i32: i32 =
+        i32::try_from(cells.n_cells).map_err(|_| GpuError::DriverCallFailed {
+            reason: format!(
+                "cubic_bspline_moments n_cells={} overflows i32",
+                cells.n_cells
+            ),
+        })?;
     let out_stride_i64: i64 = out_stride as i64;
 
     let mut builder = stream.launch_builder(&func);
@@ -1418,13 +1420,7 @@ mod cubic_bspline_moments_tests {
         let axes_for_build: Vec<Vec<AxisCubicMomentTables>> =
             vec![vec![table.clone()], vec![table.clone()]];
 
-        let alphas: Vec<Vec<u8>> = vec![
-            vec![0, 0],
-            vec![1, 0],
-            vec![0, 1],
-            vec![2, 1],
-            vec![3, 3],
-        ];
+        let alphas: Vec<Vec<u8>> = vec![vec![0, 0], vec![1, 0], vec![0, 1], vec![2, 1], vec![3, 3]];
         let deriv = vec![vec![0u8, 0u8]; alphas.len()];
         let spec = CubicMomentSpec {
             alphas: alphas.clone(),
@@ -1496,8 +1492,7 @@ mod cubic_bspline_moments_tests {
 
         for (a_idx, alpha) in alphas.iter().enumerate() {
             for (cell, &(sx, sy, pa, pb)) in cell_meta.iter().enumerate() {
-                let expected =
-                    tensor_hex_moment_cpu(&axes_cpu, &[sx, sy], alpha, &[pa, pb]);
+                let expected = tensor_hex_moment_cpu(&axes_cpu, &[sx, sy], alpha, &[pa, pb]);
                 let got = host_vals[a_idx * out_stride + cell];
                 assert_close!(
                     &format!("gpu cell={cell} alpha={alpha:?}"),
@@ -1522,7 +1517,6 @@ mod cubic_bspline_moments_tests {
             out_stride * spec.n_alpha(),
             "alpha-major total = stride * n_alpha"
         );
-
     }
 
     /// Module-cache hit on re-fit with the same spec. The NVRTC compile is
@@ -1609,7 +1603,10 @@ mod cubic_bspline_moments_tests {
     fn hex_tensor_kernel_source_contains_required_symbols() {
         let alphas = vec![vec![0u8, 0u8], vec![1, 0], vec![0, 1], vec![2, 1]];
         let src = super::build_hex_tensor_kernel_source(2, 2, &alphas);
-        assert!(src.contains("#define D       2"), "D macro missing in:\n{src}");
+        assert!(
+            src.contains("#define D       2"),
+            "D macro missing in:\n{src}"
+        );
         assert!(
             src.contains("#define AMAX    2"),
             "AMAX macro missing in:\n{src}"

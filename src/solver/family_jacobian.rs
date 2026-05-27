@@ -149,9 +149,8 @@ impl BlockPrimaryJacobian for SurvivalPrimaryJacobian {
     }
 
     fn channel_contributions(&self, block: BlockTag) -> Vec<Option<DesignMatrix>> {
-        let mut out: Vec<Option<DesignMatrix>> = (0..SurvivalPrimaryChannel::COUNT)
-            .map(|_| None)
-            .collect();
+        let mut out: Vec<Option<DesignMatrix>> =
+            (0..SurvivalPrimaryChannel::COUNT).map(|_| None).collect();
         match block {
             t if t == SurvivalBlock::Time.tag() => {
                 out[SurvivalPrimaryChannel::EntryLocation.index()] =
@@ -168,8 +167,7 @@ impl BlockPrimaryJacobian for SurvivalPrimaryJacobian {
                     Some(self.marginal_design.clone());
             }
             t if t == SurvivalBlock::Logslope.tag() => {
-                out[SurvivalPrimaryChannel::Logslope.index()] =
-                    Some(self.logslope_design.clone());
+                out[SurvivalPrimaryChannel::Logslope.index()] = Some(self.logslope_design.clone());
             }
             t if t == SurvivalBlock::ScoreWarp.tag() => {
                 if let Some(d) = self.score_warp_design.as_ref() {
@@ -258,9 +256,8 @@ impl BlockPrimaryJacobian for BernoulliPrimaryJacobian {
     }
 
     fn channel_contributions(&self, block: BlockTag) -> Vec<Option<DesignMatrix>> {
-        let mut out: Vec<Option<DesignMatrix>> = (0..BernoulliPrimaryChannel::COUNT)
-            .map(|_| None)
-            .collect();
+        let mut out: Vec<Option<DesignMatrix>> =
+            (0..BernoulliPrimaryChannel::COUNT).map(|_| None).collect();
         match block {
             t if t == BernoulliBlock::Marginal.tag() => {
                 out[BernoulliPrimaryChannel::EtaScalar.index()] =
@@ -341,7 +338,11 @@ mod tests {
         let pm = 2;
         let pg = 2;
         let mk = |p: usize| DesignMatrix::from(ndarray::Array2::<f64>::zeros((n, p)));
-        let row_metric = Array3::<f64>::zeros((n, SurvivalPrimaryChannel::COUNT, SurvivalPrimaryChannel::COUNT));
+        let row_metric = Array3::<f64>::zeros((
+            n,
+            SurvivalPrimaryChannel::COUNT,
+            SurvivalPrimaryChannel::COUNT,
+        ));
         let sj = SurvivalPrimaryJacobian {
             n_rows: n,
             time_design_entry: mk(pt),

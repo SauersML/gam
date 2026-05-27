@@ -939,7 +939,7 @@ fn build_time_blockspec(
             .clone()
             .unwrap_or_else(|| Array1::zeros(prepared.penalties.len())),
         initial_beta: prepared.initial_beta.clone(),
-            gauge_priority: 100,
+        gauge_priority: 100,
     }
 }
 
@@ -4049,7 +4049,7 @@ mod tests {
                 nullspace_dims: Vec::new(),
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
-gauge_priority: 100,
+                gauge_priority: 100,
             })
             .collect()
     }
@@ -4129,7 +4129,7 @@ gauge_priority: 100,
                 nullspace_dims: Vec::new(),
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
-gauge_priority: 100,
+                gauge_priority: 100,
             },
             ParameterBlockSpec {
                 name: "mean".to_string(),
@@ -4142,7 +4142,7 @@ gauge_priority: 100,
                 nullspace_dims: Vec::new(),
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
-gauge_priority: 100,
+                gauge_priority: 100,
             },
             ParameterBlockSpec {
                 name: "log_sigma".to_string(),
@@ -4155,7 +4155,7 @@ gauge_priority: 100,
                 nullspace_dims: Vec::new(),
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
-gauge_priority: 100,
+                gauge_priority: 100,
             },
         ];
         let p_total = p_time + p_mean + p_log_sigma;

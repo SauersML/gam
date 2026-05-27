@@ -151,10 +151,7 @@ pub enum CompilerError {
     DimensionMismatch(String),
     /// A block degenerated to zero residual span — fully aliased by the
     /// cumulative anchor in the row metric.
-    FullyAliased {
-        block_idx: usize,
-        reason: String,
-    },
+    FullyAliased { block_idx: usize, reason: String },
     /// A linear-algebra step failed (Gram solve, eigendecomposition, QR).
     LinalgFailure(String),
 }
@@ -537,9 +534,9 @@ fn keep_positive_eigenspace(
     if p == 0 {
         return Ok(Array2::zeros((0, 0)));
     }
-    let (evals, evecs) = g_tilde
-        .eigh(Side::Lower)
-        .map_err(|err| CompilerError::LinalgFailure(format!("residual Gram eigh failed: {err:?}")))?;
+    let (evals, evecs) = g_tilde.eigh(Side::Lower).map_err(|err| {
+        CompilerError::LinalgFailure(format!("residual Gram eigh failed: {err:?}"))
+    })?;
     let lambda_max = evals.iter().cloned().fold(0.0_f64, f64::max).max(0.0);
     let scale = lambda_max.max(g_bb_trace);
     let nk = (n.saturating_mul(k)).max(p).max(1) as f64;
@@ -547,7 +544,11 @@ fn keep_positive_eigenspace(
     // Collect kept column indices.
     let mut kept: Vec<usize> = (0..p).filter(|&i| evals[i] > tau).collect();
     // Sort kept indices by descending eigenvalue for a stable column order.
-    kept.sort_by(|&a, &b| evals[b].partial_cmp(&evals[a]).unwrap_or(std::cmp::Ordering::Equal));
+    kept.sort_by(|&a, &b| {
+        evals[b]
+            .partial_cmp(&evals[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     let mut v = Array2::<f64>::zeros((p, kept.len()));
     for (out_col, &src_col) in kept.iter().enumerate() {
         for row in 0..p {
@@ -653,10 +654,7 @@ pub fn build_raw_grams_from_channel_blocks(
     let k = row_hess.k();
     let n = row_hess.nrows();
     let p_total: usize = raw_block_ranges.iter().map(|r| r.end - r.start).sum();
-    let expected_total = raw_block_ranges
-        .last()
-        .map(|r| r.end)
-        .unwrap_or(0);
+    let expected_total = raw_block_ranges.last().map(|r| r.end).unwrap_or(0);
     if expected_total != p_total {
         return Err(CompilerError::DimensionMismatch(format!(
             "raw_block_ranges must be contiguous from 0; got p_total={p_total} but last end={expected_total}"
@@ -715,7 +713,8 @@ pub fn build_raw_grams_from_channel_blocks(
         let range_a = raw_block_ranges[a].clone();
         for b in a..num_blocks {
             let range_b = raw_block_ranges[b].clone();
-            let mut block_acc = Array2::<f64>::zeros((range_a.end - range_a.start, range_b.end - range_b.start));
+            let mut block_acc =
+                Array2::<f64>::zeros((range_a.end - range_a.start, range_b.end - range_b.start));
             for c in 0..k {
                 let Some(x_a_c) = channel_blocks.blocks[a][c].as_ref() else {
                     continue;
@@ -731,8 +730,7 @@ pub fn build_raw_grams_from_channel_blocks(
                 }
             }
             // Write into upper triangle (and the diagonal block itself).
-            gram
-                .slice_mut(s![range_a.start..range_a.end, range_b.start..range_b.end])
+            gram.slice_mut(s![range_a.start..range_a.end, range_b.start..range_b.end])
                 .assign(&block_acc);
         }
     }
@@ -797,8 +795,7 @@ pub fn build_raw_grams_structural(
                 };
                 block_acc += &contrib;
             }
-            gram
-                .slice_mut(s![range_a.start..range_a.end, range_b.start..range_b.end])
+            gram.slice_mut(s![range_a.start..range_a.end, range_b.start..range_b.end])
                 .assign(&block_acc);
         }
     }
@@ -927,7 +924,10 @@ mod tests {
         // <A, B_compiled>_I = Aᵀ · B_compiled should be ≈ 0.
         let cross = a.t().dot(&b_compiled);
         let max_err = cross.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
-        assert!(max_err < 1e-10, "orthogonality residual too large: {max_err:e}");
+        assert!(
+            max_err < 1e-10,
+            "orthogonality residual too large: {max_err:e}"
+        );
     }
 
     /// §10 test #2: three-block chain with sequential aliases.
@@ -935,7 +935,9 @@ mod tests {
     fn compile_three_block_chain() {
         let n = 80;
         let a = Array2::from_shape_fn((n, 2), |(i, j)| (i as f64 * 0.1 + j as f64).sin());
-        let b = Array2::from_shape_fn((n, 2), |(i, j)| 0.3 * a[[i, 0]] + (j as f64) * (i as f64).cos());
+        let b = Array2::from_shape_fn((n, 2), |(i, j)| {
+            0.3 * a[[i, 0]] + (j as f64) * (i as f64).cos()
+        });
         let c = Array2::from_shape_fn((n, 2), |(i, j)| {
             0.2 * a[[i, 1]] + 0.4 * b[[i, 0]] + ((i + j) as f64).tan().min(5.0).max(-5.0)
         });
@@ -944,11 +946,18 @@ mod tests {
         let compiled = compile(
             &ops,
             &hess,
-            &[BlockOrder::Marginal, BlockOrder::Logslope, BlockOrder::LinkDev],
+            &[
+                BlockOrder::Marginal,
+                BlockOrder::Logslope,
+                BlockOrder::LinkDev,
+            ],
         )
         .expect("compile should succeed");
         let total: usize = compiled.blocks.iter().map(|b| b.t_lw.ncols()).sum();
-        assert_eq!(compiled.joint_rank, total, "audit must report full rank on synthetic full-rank design");
+        assert_eq!(
+            compiled.joint_rank, total,
+            "audit must report full rank on synthetic full-rank design"
+        );
     }
 
     /// §10 test #3: non-identity row Hessian. With K=1 and weights `w`,
@@ -958,7 +967,8 @@ mod tests {
     fn compile_weighted_metric_nontrivial() {
         let n = 32;
         let a: Array2<f64> = Array2::from_shape_fn((n, 1), |(i, _)| (i as f64 + 1.0).sqrt());
-        let b: Array2<f64> = Array2::from_shape_fn((n, 1), |(i, _)| 0.7 * a[[i, 0]] + (i as f64 * 0.05).cos());
+        let b: Array2<f64> =
+            Array2::from_shape_fn((n, 1), |(i, _)| 0.7 * a[[i, 0]] + (i as f64 * 0.05).cos());
         let w = Array1::from_shape_fn(n, |i| 0.5 + (i as f64 * 0.2).sin().abs());
         let hess = DiagonalScalarRowHessian::new(w.clone());
         let ops = vec![op(a.clone()), op(b.clone())];
@@ -989,7 +999,13 @@ mod tests {
         // the residual span is zero in that direction, but a non-zero
         // independent column also exists. Add an extra exact-alias column
         // to force trailing-pivot drop at the audit stage.
-        let c = Array2::from_shape_fn((n, 2), |(i, j)| if j == 0 { a[[i, 0]] } else { (i as f64 * 0.1).cos() });
+        let c = Array2::from_shape_fn((n, 2), |(i, j)| {
+            if j == 0 {
+                a[[i, 0]]
+            } else {
+                (i as f64 * 0.1).cos()
+            }
+        });
         let hess = IdentityRowHessian::new(n, 1);
         let ops = vec![op(a), op(c)];
         // Manually inject a known alias: pass a second block whose
@@ -1009,7 +1025,10 @@ mod tests {
             dropped = compiled.dropped
         );
         for (block_idx, _) in &compiled.dropped {
-            assert_eq!(*block_idx, 1, "audit drops must come from the latest block only");
+            assert_eq!(
+                *block_idx, 1,
+                "audit drops must come from the latest block only"
+            );
         }
     }
 
@@ -1047,20 +1066,31 @@ mod tests {
         // produce identical compiled blocks B (residualised against A)
         // because the compiler treats every input as a `RowJacobianOperator`.
         let a = Array2::from_shape_fn((n, 2), |(i, j)| (i as f64 * 0.07 + j as f64).sin());
-        let b = Array2::from_shape_fn((n, 2), |(i, j)| 0.4 * a[[i, 0]] + (j as f64) * (i as f64 + 1.0).ln());
+        let b = Array2::from_shape_fn((n, 2), |(i, j)| {
+            0.4 * a[[i, 0]] + (j as f64) * (i as f64 + 1.0).ln()
+        });
         let hess = IdentityRowHessian::new(n, 1);
 
         let ops_param = vec![op(a.clone()), op(b.clone())];
-        let compiled_param = compile(&ops_param, &hess, &[BlockOrder::Marginal, BlockOrder::Logslope])
-            .expect("compile should succeed");
+        let compiled_param = compile(
+            &ops_param,
+            &hess,
+            &[BlockOrder::Marginal, BlockOrder::Logslope],
+        )
+        .expect("compile should succeed");
 
         // Now wrap A's design behind a mock anchor evaluator and feed it
         // to the compiler as a `DenseScalarOperator` with the same span.
         // The B-block result must match the parametric reference.
-        let _flex_eval: Arc<dyn AnchorRowEvaluator> = Arc::new(MockAnchorEvaluator { rows: a.clone() });
+        let _flex_eval: Arc<dyn AnchorRowEvaluator> =
+            Arc::new(MockAnchorEvaluator { rows: a.clone() });
         let ops_flex = vec![op(a.clone()), op(b.clone())];
-        let compiled_flex = compile(&ops_flex, &hess, &[BlockOrder::ScoreWarp, BlockOrder::LinkDev])
-            .expect("compile should succeed");
+        let compiled_flex = compile(
+            &ops_flex,
+            &hess,
+            &[BlockOrder::ScoreWarp, BlockOrder::LinkDev],
+        )
+        .expect("compile should succeed");
 
         let m_param = compiled_param.blocks[1].anchor_correction.as_ref().unwrap();
         let m_flex = compiled_flex.blocks[1].anchor_correction.as_ref().unwrap();
@@ -1068,7 +1098,10 @@ mod tests {
         let max_diff = (m_param - m_flex)
             .iter()
             .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
-        assert!(max_diff < 1e-12, "flex vs parametric anchor correction mismatch: {max_diff:e}");
+        assert!(
+            max_diff < 1e-12,
+            "flex vs parametric anchor correction mismatch: {max_diff:e}"
+        );
     }
 
     /// §10 test #7: Bernoulli row Hessian = IRLS weight. Verified at the
@@ -1095,7 +1128,9 @@ mod tests {
     fn compiler_predict_path_roundtrip() {
         let n = 24;
         let a = Array2::from_shape_fn((n, 2), |(i, j)| (i as f64 * 0.21).cos() + j as f64);
-        let b = Array2::from_shape_fn((n, 2), |(i, j)| 0.3 * a[[i, 0]] + (i as f64 + j as f64).sqrt());
+        let b = Array2::from_shape_fn((n, 2), |(i, j)| {
+            0.3 * a[[i, 0]] + (i as f64 + j as f64).sqrt()
+        });
         let hess = IdentityRowHessian::new(n, 1);
         let ops = vec![op(a.clone()), op(b.clone())];
         let compiled = compile(&ops, &hess, &[BlockOrder::Marginal, BlockOrder::Logslope])
@@ -1161,7 +1196,10 @@ mod tests {
         // r_lw and anchor_correction are synonymous.
         let diff = r_lw - m_compiled;
         let max_diff = diff.iter().fold(0.0_f64, |acc, &x| acc.max(x.abs()));
-        assert!(max_diff == 0.0, "r_lw and anchor_correction must be identical");
+        assert!(
+            max_diff == 0.0,
+            "r_lw and anchor_correction must be identical"
+        );
 
         // H-orthogonality (identity row metric): the residualised
         // compiled B-design `B·V − A·(M·V)` must be orthogonal to A in
@@ -1305,7 +1343,9 @@ mod tests {
         let p_b = 2;
 
         let xa = Array2::from_shape_fn((n, p_a), |(i, j)| ((i + 1) as f64 * 0.21 + j as f64).cos());
-        let xb = Array2::from_shape_fn((n, p_b), |(i, j)| ((i + 1) as f64 * 0.17 + j as f64).sin() + 0.5);
+        let xb = Array2::from_shape_fn((n, p_b), |(i, j)| {
+            ((i + 1) as f64 * 0.17 + j as f64).sin() + 0.5
+        });
 
         let block_a: Vec<Option<Array2<f64>>> = vec![Some(xa.clone()), None, None, None];
         let block_b: Vec<Option<Array2<f64>>> = vec![None, None, None, Some(xb.clone())];
@@ -1347,8 +1387,9 @@ mod tests {
         // Case 2: zero out h_{03} → cross-block must be zero.
         let h_zero = Array3::from_shape_fn((n, k, k), |(_, c, d)| if c == d { 2.0 } else { 0.0 });
         let row_hess_zero = DenseRowHessian { h: h_zero };
-        let gram_zero = build_raw_grams_from_channel_blocks(&channel_blocks, &row_hess_zero, &raw_ranges)
-            .expect("closed-form Gram should succeed");
+        let gram_zero =
+            build_raw_grams_from_channel_blocks(&channel_blocks, &row_hess_zero, &raw_ranges)
+                .expect("closed-form Gram should succeed");
         let cross_zero = gram_zero.slice(s![0..p_a, p_a..(p_a + p_b)]);
         let max_zero = cross_zero.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
         assert!(
@@ -1447,11 +1488,7 @@ mod tests {
 
         assert_eq!(single.blocks.len(), dual.blocks.len());
         for (idx, (sb, db)) in single.blocks.iter().zip(dual.blocks.iter()).enumerate() {
-            assert_eq!(
-                sb.t_lw.dim(),
-                db.t_lw.dim(),
-                "block {idx}: V dims differ"
-            );
+            assert_eq!(sb.t_lw.dim(), db.t_lw.dim(), "block {idx}: V dims differ");
             let max_v = (&sb.t_lw - &db.t_lw)
                 .iter()
                 .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
@@ -1460,9 +1497,7 @@ mod tests {
                 (None, None) => {}
                 (Some(s), Some(d)) => {
                     assert_eq!(s.dim(), d.dim());
-                    let max_m = (s - d)
-                        .iter()
-                        .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+                    let max_m = (s - d).iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
                     assert!(max_m < 1e-10, "block {idx}: M mismatch {max_m:e}");
                 }
                 _ => panic!("block {idx}: one side has anchor correction, the other does not"),
@@ -1526,12 +1561,7 @@ mod tests {
         // everything" trap). On the curvature-only rows, B ≡ 2A, so
         // structural pass sees zero residual span and rejects the block.
         let ops_h_only = vec![op(a.clone()), op(b.clone())];
-        let h_only = compile_with_dual_metric(
-            &ops_h_only,
-            &curvature,
-            &curvature,
-            &ordering,
-        );
+        let h_only = compile_with_dual_metric(&ops_h_only, &curvature, &curvature, &ordering);
 
         // The H-only path must fail (FullyAliased) or strip B's column.
         // The dual (identity-structural) path must keep B.
@@ -1554,7 +1584,8 @@ mod tests {
             Err(other) => panic!("unexpected H-only error: {other:?}"),
         }
 
-        let dual = dual.expect("dual-metric must succeed: identity-structural sees B as independent");
+        let dual =
+            dual.expect("dual-metric must succeed: identity-structural sees B as independent");
         // The dual path may still drop B's column at the joint audit step
         // because the joint H-scaled design is rank-1 (only the first
         // block contributes non-zero rows under the curvature weights).

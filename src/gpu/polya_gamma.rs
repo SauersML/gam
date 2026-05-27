@@ -151,9 +151,8 @@ impl XorwowState {
     pub fn new(seed: u64, row: u64) -> Self {
         let mut words = [0u32; 6];
         for (word_idx, slot) in words.iter_mut().enumerate() {
-            let composite = seed
-                ^ row.wrapping_mul(ROW_ZETA)
-                ^ (word_idx as u64).wrapping_mul(WORD_GAMMA);
+            let composite =
+                seed ^ row.wrapping_mul(ROW_ZETA) ^ (word_idx as u64).wrapping_mul(WORD_GAMMA);
             let h = splitmix64_mix(composite);
             *slot = (h >> 32) as u32;
         }
@@ -657,7 +656,10 @@ pub fn logistic_gibbs_step(
 ) -> Result<Array1<f64>, String> {
     let (n, p) = design.dim();
     if targets.len() != n {
-        return Err(format!("logistic_gibbs_step: y.len()={} != n={n}", targets.len()));
+        return Err(format!(
+            "logistic_gibbs_step: y.len()={} != n={n}",
+            targets.len()
+        ));
     }
     if prior_precision.dim() != (p, p) {
         return Err(format!(
@@ -666,7 +668,10 @@ pub fn logistic_gibbs_step(
         ));
     }
     if beta.len() != p {
-        return Err(format!("logistic_gibbs_step: beta.len()={} != p={p}", beta.len()));
+        return Err(format!(
+            "logistic_gibbs_step: beta.len()={} != p={p}",
+            beta.len()
+        ));
     }
 
     // Step 1: ψ = X β  (host matvec — n×p × p).
@@ -795,8 +800,8 @@ fn solve_upper_transpose(l: &Array2<f64>, rhs: &Array1<f64>) -> Array1<f64> {
 #[cfg(target_os = "linux")]
 mod linux_cuda {
     use super::{
-        PG1_MAX_B, PgSeed, PolyaGammaBatchInput, SADDLE_MAX_B, SADDLE_MIN_B,
-        pg_convolution_cpu_oracle, pg_normal_cpu_oracle, XorwowState,
+        PG1_MAX_B, PgSeed, PolyaGammaBatchInput, SADDLE_MAX_B, SADDLE_MIN_B, XorwowState,
+        pg_convolution_cpu_oracle, pg_normal_cpu_oracle,
     };
     use crate::gpu::error::GpuError;
     use crate::gpu::solver::context_and_stream;
@@ -1124,7 +1129,8 @@ extern "C" __global__ void normal_kernel(
     const THREADS_PER_BLOCK: u32 = 128;
 
     fn module(ctx: &Arc<CudaContext>) -> Result<&'static Arc<CudaModule>, GpuError> {
-        static CACHE: crate::gpu::common::PtxModuleCache = crate::gpu::common::PtxModuleCache::new();
+        static CACHE: crate::gpu::common::PtxModuleCache =
+            crate::gpu::common::PtxModuleCache::new();
         CACHE.get_or_compile(ctx, "polya_gamma", PTX_SOURCE)
     }
 
@@ -1172,52 +1178,84 @@ extern "C" __global__ void normal_kernel(
             Some(s) => s.to_vec(),
             None => input.shapes.iter().copied().collect(),
         };
-        let tilts_dev = stream
-            .clone_htod(&tilts_vec)
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("polya_gamma upload tilts: {err}"),
-            })?;
-        let shapes_dev = stream
-            .clone_htod(&shapes_vec)
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("polya_gamma upload shapes: {err}"),
-            })?;
-        let mut out_dev = stream.alloc_zeros::<f64>(n).map_err(|err| {
-            GpuError::DriverCallFailed { reason: format!("polya_gamma alloc out: {err}") }
-        })?;
+        let tilts_dev =
+            stream
+                .clone_htod(&tilts_vec)
+                .map_err(|err| GpuError::DriverCallFailed {
+                    reason: format!("polya_gamma upload tilts: {err}"),
+                })?;
+        let shapes_dev =
+            stream
+                .clone_htod(&shapes_vec)
+                .map_err(|err| GpuError::DriverCallFailed {
+                    reason: format!("polya_gamma upload shapes: {err}"),
+                })?;
+        let mut out_dev =
+            stream
+                .alloc_zeros::<f64>(n)
+                .map_err(|err| GpuError::DriverCallFailed {
+                    reason: format!("polya_gamma alloc out: {err}"),
+                })?;
 
         // ── Launch each regime kernel (skipping empty partitions).
         if !pg1_rows.is_empty() {
-            let rows_dev = stream.clone_htod(&pg1_rows).map_err(|err| {
-                GpuError::DriverCallFailed { reason: format!("polya_gamma upload pg1 rows: {err}") }
-            })?;
-            launch_pg1(&stream, module_handle, input.seed, &rows_dev, &tilts_dev, &mut out_dev)?;
+            let rows_dev =
+                stream
+                    .clone_htod(&pg1_rows)
+                    .map_err(|err| GpuError::DriverCallFailed {
+                        reason: format!("polya_gamma upload pg1 rows: {err}"),
+                    })?;
+            launch_pg1(
+                &stream,
+                module_handle,
+                input.seed,
+                &rows_dev,
+                &tilts_dev,
+                &mut out_dev,
+            )?;
         }
         if !sp_rows.is_empty() {
-            let rows_dev = stream.clone_htod(&sp_rows).map_err(|err| {
-                GpuError::DriverCallFailed { reason: format!("polya_gamma upload sp rows: {err}") }
-            })?;
+            let rows_dev =
+                stream
+                    .clone_htod(&sp_rows)
+                    .map_err(|err| GpuError::DriverCallFailed {
+                        reason: format!("polya_gamma upload sp rows: {err}"),
+                    })?;
             launch_sp(
-                &stream, module_handle, input.seed, &rows_dev, &shapes_dev, &tilts_dev,
+                &stream,
+                module_handle,
+                input.seed,
+                &rows_dev,
+                &shapes_dev,
+                &tilts_dev,
                 &mut out_dev,
             )?;
         }
         if !normal_rows.is_empty() {
-            let rows_dev = stream.clone_htod(&normal_rows).map_err(|err| {
-                GpuError::DriverCallFailed {
-                    reason: format!("polya_gamma upload normal rows: {err}"),
-                }
-            })?;
+            let rows_dev =
+                stream
+                    .clone_htod(&normal_rows)
+                    .map_err(|err| GpuError::DriverCallFailed {
+                        reason: format!("polya_gamma upload normal rows: {err}"),
+                    })?;
             launch_normal(
-                &stream, module_handle, input.seed, &rows_dev, &shapes_dev, &tilts_dev,
+                &stream,
+                module_handle,
+                input.seed,
+                &rows_dev,
+                &shapes_dev,
+                &tilts_dev,
                 &mut out_dev,
             )?;
         }
 
         // ── Pull results and patch the host-regime rows in place.
-        let mut out_host = stream.clone_dtoh(&out_dev).map_err(|err| {
-            GpuError::DriverCallFailed { reason: format!("polya_gamma download out: {err}") }
-        })?;
+        let mut out_host =
+            stream
+                .clone_dtoh(&out_dev)
+                .map_err(|err| GpuError::DriverCallFailed {
+                    reason: format!("polya_gamma download out: {err}"),
+                })?;
         for &row in &host_rows {
             let i = row as usize;
             let mut st = XorwowState::new(input.seed.0, row as u64);
@@ -1242,9 +1280,12 @@ extern "C" __global__ void normal_kernel(
         tilts: &cudarc::driver::CudaSlice<f64>,
         out: &mut cudarc::driver::CudaSlice<f64>,
     ) -> Result<(), GpuError> {
-        let func = module.load_function("pg1_kernel").map_err(|err| {
-            GpuError::DriverCallFailed { reason: format!("polya_gamma load pg1_kernel: {err}") }
-        })?;
+        let func =
+            module
+                .load_function("pg1_kernel")
+                .map_err(|err| GpuError::DriverCallFailed {
+                    reason: format!("polya_gamma load pg1_kernel: {err}"),
+                })?;
         let n = rows.len() as u32;
         let grid = (n + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
         let cfg = LaunchConfig {
@@ -1280,9 +1321,11 @@ extern "C" __global__ void normal_kernel(
         tilts: &cudarc::driver::CudaSlice<f64>,
         out: &mut cudarc::driver::CudaSlice<f64>,
     ) -> Result<(), GpuError> {
-        let func = module.load_function("sp_kernel").map_err(|err| {
-            GpuError::DriverCallFailed { reason: format!("polya_gamma load sp_kernel: {err}") }
-        })?;
+        let func = module
+            .load_function("sp_kernel")
+            .map_err(|err| GpuError::DriverCallFailed {
+                reason: format!("polya_gamma load sp_kernel: {err}"),
+            })?;
         let n = rows.len() as u32;
         let grid = (n + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
         let cfg = LaunchConfig {
@@ -1319,9 +1362,12 @@ extern "C" __global__ void normal_kernel(
         tilts: &cudarc::driver::CudaSlice<f64>,
         out: &mut cudarc::driver::CudaSlice<f64>,
     ) -> Result<(), GpuError> {
-        let func = module.load_function("normal_kernel").map_err(|err| {
-            GpuError::DriverCallFailed { reason: format!("polya_gamma load normal_kernel: {err}") }
-        })?;
+        let func =
+            module
+                .load_function("normal_kernel")
+                .map_err(|err| GpuError::DriverCallFailed {
+                    reason: format!("polya_gamma load normal_kernel: {err}"),
+                })?;
         let n = rows.len() as u32;
         let grid = (n + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
         let cfg = LaunchConfig {
@@ -1403,7 +1449,10 @@ mod tests {
             let var = sum_sq / n as f64 - mean * mean;
             let th_var = theoretical_variance(1.0, c);
             let rel = (var - th_var).abs() / th_var.max(1e-12);
-            assert!(rel < 0.05, "PG(1,{c}) var: emp {var}, theory {th_var}, rel {rel}");
+            assert!(
+                rel < 0.05,
+                "PG(1,{c}) var: emp {var}, theory {th_var}, rel {rel}"
+            );
         }
     }
 
@@ -1444,7 +1493,10 @@ mod tests {
                 v.tan() / v
             };
             let rel = (kp - x).abs() / x.max(1e-12);
-            assert!(rel < 1e-6, "saddlepoint_solve(x={x}) → t={t}; K'(t)={kp}, rel={rel}");
+            assert!(
+                rel < 1e-6,
+                "saddlepoint_solve(x={x}) → t={t}; K'(t)={kp}, rel={rel}"
+            );
         }
     }
 
@@ -1478,8 +1530,14 @@ mod tests {
         let th_var = theoretical_variance(b as f64, c);
         let m_rel = (mean - th_mean).abs() / th_mean;
         let v_rel = (var - th_var).abs() / th_var;
-        assert!(m_rel < 0.02, "normal oracle mean: emp {mean}, theory {th_mean}, rel {m_rel}");
-        assert!(v_rel < 0.05, "normal oracle var: emp {var}, theory {th_var}, rel {v_rel}");
+        assert!(
+            m_rel < 0.02,
+            "normal oracle mean: emp {mean}, theory {th_mean}, rel {m_rel}"
+        );
+        assert!(
+            v_rel < 0.05,
+            "normal oracle var: emp {var}, theory {th_var}, rel {v_rel}"
+        );
     }
 
     #[test]
@@ -1495,7 +1553,10 @@ mod tests {
         let out = draw_batch_cpu(&input).expect("CPU dispatch");
         assert_eq!(out.len(), 4);
         for v in out.iter() {
-            assert!(v.is_finite() && *v > 0.0, "PG draw must be positive finite: {v}");
+            assert!(
+                v.is_finite() && *v > 0.0,
+                "PG draw must be positive finite: {v}"
+            );
         }
     }
 
@@ -1525,9 +1586,15 @@ mod tests {
         }
         let q0 = Array2::<f64>::eye(p) * 0.1;
         let beta = Array1::<f64>::zeros(p);
-        let new_beta =
-            logistic_gibbs_step(design.view(), targets.view(), q0.view(), beta.view(), PgSeed(1), 9)
-                .expect("Gibbs step");
+        let new_beta = logistic_gibbs_step(
+            design.view(),
+            targets.view(),
+            q0.view(),
+            beta.view(),
+            PgSeed(1),
+            9,
+        )
+        .expect("Gibbs step");
         assert_eq!(new_beta.len(), p);
         let disp: f64 = new_beta.iter().map(|b| b * b).sum::<f64>().sqrt();
         assert!(
@@ -1673,8 +1740,14 @@ mod tests {
         let th_var = pg_variance(b as f64, c);
         let m_rel = (mean - th_mean).abs() / th_mean;
         let v_rel = (var - th_var).abs() / th_var;
-        assert!(m_rel < 0.02, "normal kernel mean: emp {mean}, theory {th_mean}, rel {m_rel}");
-        assert!(v_rel < 0.05, "normal kernel var: emp {var}, theory {th_var}, rel {v_rel}");
+        assert!(
+            m_rel < 0.02,
+            "normal kernel mean: emp {mean}, theory {th_mean}, rel {m_rel}"
+        );
+        assert!(
+            v_rel < 0.05,
+            "normal kernel var: emp {var}, theory {th_var}, rel {v_rel}"
+        );
     }
 
     #[test]
@@ -1751,9 +1824,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn polya_gamma_hill_climb_pg1_50x() {
         if super::super::runtime::GpuRuntime::global().is_none() {
-            eprintln!(
-                "[polya_gamma_hill_climb_pg1_50x] no CUDA runtime on host — skipping"
-            );
+            eprintln!("[polya_gamma_hill_climb_pg1_50x] no CUDA runtime on host — skipping");
             return;
         }
         let n = 200_000usize;
@@ -1814,9 +1885,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn polya_gamma_hill_climb_mixed_nb_20x() {
         if super::super::runtime::GpuRuntime::global().is_none() {
-            eprintln!(
-                "[polya_gamma_hill_climb_mixed_nb_20x] no CUDA runtime on host — skipping"
-            );
+            eprintln!("[polya_gamma_hill_climb_mixed_nb_20x] no CUDA runtime on host — skipping");
             return;
         }
         let n = 200_000usize;

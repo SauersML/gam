@@ -124,7 +124,9 @@ mod cuda_impl {
             return None;
         }
 
-        let stream = cuda_context_for(runtime.device.ordinal)?.new_stream().ok()?;
+        let stream = cuda_context_for(runtime.device.ordinal)?
+            .new_stream()
+            .ok()?;
         let blas = CudaBlas::new(stream.clone()).ok()?;
 
         // Upload each (block, channel) raw design once, column-major.
@@ -356,7 +358,12 @@ mod cuda_impl {
         Some(out)
     }
 
-    fn assign_block(out: &mut Array2<f64>, row_offset: usize, col_offset: usize, block: &Array2<f64>) {
+    fn assign_block(
+        out: &mut Array2<f64>,
+        row_offset: usize,
+        col_offset: usize,
+        block: &Array2<f64>,
+    ) {
         let (rows, cols) = block.dim();
         for col in 0..cols {
             for row in 0..rows {
@@ -375,7 +382,6 @@ mod cuda_impl {
             }
         }
     }
-
 }
 
 #[cfg(test)]
@@ -440,7 +446,11 @@ mod tests {
         }
     }
 
-    fn make_fixture() -> (Vec<Vec<Option<Array2<f64>>>>, Array2<f64>, Vec<Range<usize>>) {
+    fn make_fixture() -> (
+        Vec<Vec<Option<Array2<f64>>>>,
+        Array2<f64>,
+        Vec<Range<usize>>,
+    ) {
         let n = 6;
         let block_0 = Array2::<f64>::from_shape_fn((n, 2), |(i, j)| ((i + 1) * (j + 1)) as f64);
         let block_1 = Array2::<f64>::from_shape_fn((n, 3), |(i, j)| (i as f64) - (j as f64) * 0.25);
@@ -496,13 +506,10 @@ mod tests {
         #[cfg(target_os = "linux")]
         {
             if crate::gpu::runtime::GpuRuntime::global().is_none() {
-                eprintln!(
-                    "[identifiability_compile] no CUDA runtime — skipping parity check"
-                );
+                eprintln!("[identifiability_compile] no CUDA runtime — skipping parity check");
                 return;
             }
-            let Some(bundle) =
-                try_primary_state_gram_cuda(&channel_blocks, &h_packed, &ranges)
+            let Some(bundle) = try_primary_state_gram_cuda(&channel_blocks, &h_packed, &ranges)
             else {
                 eprintln!(
                     "[identifiability_compile] GPU Gram build returned None — \

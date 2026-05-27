@@ -135,13 +135,13 @@ impl CubicCellGpuBackend {
     fn module_for_degree(&self, max_degree: usize) -> Result<Arc<CudaModule>, GpuError> {
         let key = max_degree;
         {
-            let guard =
-                self.inner
-                    .modules
-                    .lock()
-                    .map_err(|err| GpuError::DriverCallFailed {
-                        reason: format!("cubic_cell module cache mutex poisoned: {err}"),
-                    })?;
+            let guard = self
+                .inner
+                .modules
+                .lock()
+                .map_err(|err| GpuError::DriverCallFailed {
+                    reason: format!("cubic_cell module cache mutex poisoned: {err}"),
+                })?;
             if let Some(module) = guard.get(&key) {
                 return Ok(Arc::clone(module));
             }
@@ -152,15 +152,13 @@ impl CubicCellGpuBackend {
             cudarc::nvrtc::compile_ptx(&source).map_err(|err| GpuError::DriverCallFailed {
                 reason: format!("cubic_cell NVRTC compile (degree={max_degree}) failed: {err}"),
             })?;
-        let module =
-            self.inner
-                .ctx
-                .load_module(ptx)
-                .map_err(|err| GpuError::DriverCallFailed {
-                    reason: format!(
-                        "cubic_cell module load (degree={max_degree}) failed: {err}"
-                    ),
-                })?;
+        let module = self
+            .inner
+            .ctx
+            .load_module(ptx)
+            .map_err(|err| GpuError::DriverCallFailed {
+                reason: format!("cubic_cell module load (degree={max_degree}) failed: {err}"),
+            })?;
         let mut guard = self
             .inner
             .modules
@@ -370,21 +368,24 @@ impl CubicCellGpuBackend {
             .map_err(|err| GpuError::DriverCallFailed {
                 reason: format!("cubic_cell memcpy_stod c3: {err}"),
             })?;
-        let d_branch = stream
-            .clone_htod(&branch_code)
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("cubic_cell memcpy_stod branch_code: {err}"),
-            })?;
-        let mut d_moments = stream.alloc_zeros::<f64>(m * stride).map_err(|err| {
-            GpuError::DriverCallFailed {
-                reason: format!("cubic_cell alloc_zeros moments: {err}"),
-            }
-        })?;
-        let mut d_status = stream
-            .alloc_zeros::<u8>(m)
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("cubic_cell alloc_zeros status: {err}"),
-            })?;
+        let d_branch =
+            stream
+                .clone_htod(&branch_code)
+                .map_err(|err| GpuError::DriverCallFailed {
+                    reason: format!("cubic_cell memcpy_stod branch_code: {err}"),
+                })?;
+        let mut d_moments =
+            stream
+                .alloc_zeros::<f64>(m * stride)
+                .map_err(|err| GpuError::DriverCallFailed {
+                    reason: format!("cubic_cell alloc_zeros moments: {err}"),
+                })?;
+        let mut d_status =
+            stream
+                .alloc_zeros::<u8>(m)
+                .map_err(|err| GpuError::DriverCallFailed {
+                    reason: format!("cubic_cell alloc_zeros status: {err}"),
+                })?;
 
         // One warp per cell.  Block = 4 warps (128 threads).
         let warps_per_block: u32 = 4;
@@ -419,16 +420,18 @@ impl CubicCellGpuBackend {
             reason: format!("cubic_cell kernel launch: {err}"),
         })?;
 
-        let host_moments = stream
-            .clone_dtoh(&d_moments)
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("cubic_cell memcpy_dtov moments: {err}"),
-            })?;
-        let host_status = stream
-            .clone_dtoh(&d_status)
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("cubic_cell memcpy_dtov status: {err}"),
-            })?;
+        let host_moments =
+            stream
+                .clone_dtoh(&d_moments)
+                .map_err(|err| GpuError::DriverCallFailed {
+                    reason: format!("cubic_cell memcpy_dtov moments: {err}"),
+                })?;
+        let host_status =
+            stream
+                .clone_dtoh(&d_status)
+                .map_err(|err| GpuError::DriverCallFailed {
+                    reason: format!("cubic_cell memcpy_dtov status: {err}"),
+                })?;
         stream
             .synchronize()
             .map_err(|err| GpuError::DriverCallFailed {
@@ -570,21 +573,23 @@ impl CubicCellGpuBackend {
             .map_err(|err| GpuError::DriverCallFailed {
                 reason: format!("cubic_cell device-resident memcpy c3: {err}"),
             })?;
-        let d_branch = stream
-            .clone_htod(&branch_code)
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("cubic_cell device-resident memcpy branch: {err}"),
-            })?;
+        let d_branch =
+            stream
+                .clone_htod(&branch_code)
+                .map_err(|err| GpuError::DriverCallFailed {
+                    reason: format!("cubic_cell device-resident memcpy branch: {err}"),
+                })?;
         let mut d_moments = stream.alloc_zeros::<f64>(n_cells * stride).map_err(|err| {
             GpuError::DriverCallFailed {
                 reason: format!("cubic_cell device-resident alloc moments: {err}"),
             }
         })?;
-        let mut d_status = stream
-            .alloc_zeros::<u8>(n_cells)
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("cubic_cell device-resident alloc status: {err}"),
-            })?;
+        let mut d_status =
+            stream
+                .alloc_zeros::<u8>(n_cells)
+                .map_err(|err| GpuError::DriverCallFailed {
+                    reason: format!("cubic_cell device-resident alloc status: {err}"),
+                })?;
 
         let warps_per_block: u32 = 4;
         let block: u32 = 32 * warps_per_block;
@@ -667,7 +672,6 @@ impl CubicCellGpuBackend {
             n_cells,
         })
     }
-
 }
 
 #[cfg(test)]
@@ -675,8 +679,8 @@ mod tests {
     use super::*;
     use crate::gpu::cubic_cell::{
         CubicCellDerivativeMomentHostView, CubicCellDerivativeMomentOutput,
-        CubicCellMomentResidency, CubicCellMomentStatus, GpuCellBranchTag,
-        GpuDenestedCubicCell, try_build_cubic_cell_derivative_moments,
+        CubicCellMomentResidency, CubicCellMomentStatus, GpuCellBranchTag, GpuDenestedCubicCell,
+        try_build_cubic_cell_derivative_moments,
     };
     use crate::gpu::error::GpuError;
     use crate::gpu::runtime::GpuRuntime;
@@ -844,9 +848,7 @@ mod tests {
             DenestedCubicCell, evaluate_cell_derivative_moments_uncached,
         };
         if GpuRuntime::global().is_none() {
-            eprintln!(
-                "[cubic_cell device-residency parity] no CUDA runtime — skipping"
-            );
+            eprintln!("[cubic_cell device-residency parity] no CUDA runtime — skipping");
             return;
         }
         // One cell per branch, plus a sextic NonAffineFinite stressor.
@@ -957,8 +959,8 @@ mod tests {
             assert_eq!(status.len(), cpu_cells.len());
             // Download for verification using the in-mod helper.
             let backend = CubicCellGpuBackend::probe().expect("backend probe");
-            let host_moments = download_moments(backend, &d_moments)
-                .expect("DtoH download for parity check");
+            let host_moments =
+                download_moments(backend, &d_moments).expect("DtoH download for parity check");
             for (i, &cpu_cell) in cpu_cells.iter().enumerate() {
                 assert_eq!(
                     status[i],
@@ -967,9 +969,8 @@ mod tests {
                     status[i]
                 );
                 let row = &host_moments[i * stride..(i + 1) * stride];
-                let cpu_state =
-                    evaluate_cell_derivative_moments_uncached(cpu_cell, max_degree)
-                        .expect("cpu reference");
+                let cpu_state = evaluate_cell_derivative_moments_uncached(cpu_cell, max_degree)
+                    .expect("cpu reference");
                 for (k, (&got, &want)) in row.iter().zip(cpu_state.moments.iter()).enumerate() {
                     let abs = (got - want).abs();
                     let denom = want.abs().max(1.0);

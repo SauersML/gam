@@ -1235,10 +1235,7 @@ fn tangent_space_projector(
         .map(f64::abs)
         .fold(0.0_f64, f64::max);
     let cutoff = rank_tol * sigma_max;
-    let k_eff = sigma_row
-        .iter()
-        .take_while(|&&s| s > cutoff)
-        .count();
+    let k_eff = sigma_row.iter().take_while(|&&s| s > cutoff).count();
     if k_eff == 0 {
         return Ok(None);
     }

@@ -4344,7 +4344,7 @@ fn prepare_survival_location_scale_model(
             spec.time_block.initial_log_lambdas.clone(),
         )?,
         initial_beta: time_prepared.initial_beta.clone(),
-gauge_priority: 100,
+        gauge_priority: 100,
     };
 
     let threshold_prep = prepare_cov_block_kind(&spec.threshold_block)?;
@@ -4425,7 +4425,7 @@ gauge_priority: 100,
         nullspace_dims: threshold_nullspace_dims.clone(),
         initial_log_lambdas: threshold_initial_log_lambdas,
         initial_beta: threshold_initial_beta,
-gauge_priority: 100,
+        gauge_priority: 100,
     };
 
     let survival_primary_design = DesignMatrix::Dense(DenseDesignMatrix::from(Arc::new(
@@ -4531,7 +4531,7 @@ gauge_priority: 100,
         nullspace_dims: log_sigma_nullspace_dims.clone(),
         initial_log_lambdas: log_sigma_initial_log_lambdas,
         initial_beta: log_sigma_initial_beta,
-gauge_priority: 100,
+        gauge_priority: 100,
     };
     let wigglespec = if let Some(w) = spec.linkwiggle_block.as_ref() {
         Some(ParameterBlockSpec {
@@ -4560,7 +4560,7 @@ gauge_priority: 100,
             nullspace_dims: w.nullspace_dims.clone(),
             initial_log_lambdas: initial_log_lambdas(&w.penalties, w.initial_log_lambdas.clone())?,
             initial_beta: w.initial_beta.clone(),
-gauge_priority: 100,
+            gauge_priority: 100,
         })
     } else {
         None
@@ -11132,7 +11132,7 @@ mod tests {
             nullspace_dims: Vec::new(),
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
-gauge_priority: 100,
+            gauge_priority: 100,
         };
         let specs = vec![
             mk_spec("time", p_time),
@@ -11162,7 +11162,7 @@ gauge_priority: 100,
             nullspace_dims: Vec::new(),
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
-gauge_priority: 100,
+            gauge_priority: 100,
         };
         let specs = vec![
             mk_spec("time", 200),
@@ -11194,7 +11194,7 @@ gauge_priority: 100,
             nullspace_dims: Vec::new(),
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
-gauge_priority: 100,
+            gauge_priority: 100,
         };
         let specs = vec![
             mk_spec("time", 200),
@@ -11230,7 +11230,7 @@ gauge_priority: 100,
             nullspace_dims: Vec::new(),
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
-gauge_priority: 100,
+            gauge_priority: 100,
         };
 
         let feasible = family
@@ -11371,7 +11371,7 @@ gauge_priority: 100,
             nullspace_dims: Vec::new(),
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
-gauge_priority: 100,
+            gauge_priority: 100,
         };
         let returned = family
             .post_update_block_beta(
@@ -11613,7 +11613,7 @@ gauge_priority: 100,
                 nullspace_dims: vec![],
                 initial_log_lambdas: array![0.0],
                 initial_beta: Some(array![0.2]),
-gauge_priority: 100,
+                gauge_priority: 100,
             },
             ParameterBlockSpec {
                 name: "threshold".to_string(),
@@ -11627,7 +11627,7 @@ gauge_priority: 100,
                 nullspace_dims: vec![],
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: Some(array![0.35]),
-gauge_priority: 100,
+                gauge_priority: 100,
             },
             ParameterBlockSpec {
                 name: "log_sigma".to_string(),
@@ -11641,7 +11641,7 @@ gauge_priority: 100,
                 nullspace_dims: vec![],
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: Some(array![-0.15]),
-gauge_priority: 100,
+                gauge_priority: 100,
             },
         ]
     }
