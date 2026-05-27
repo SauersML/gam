@@ -19799,6 +19799,162 @@ pub fn fit_survival_marginal_slope_terms(
         .into());
     }
 
+    // Recompile-after-first-PIRLS-accept refinement (math-agent review).
+    //
+    // The initial cutover compile used a structural identity row Hessian,
+    // which catches column-level cross-block aliases but misses the
+    // "pilot-curvature trap": directions that look identifiable under
+    // identity H but collapse under the actual β-converged H (or, less
+    // commonly, the reverse). Now that the outer/PIRLS has accepted a
+    // non-trivial β, rebuild the row Hessian from the row primary state
+    // at the converged β, re-run `compile_survival_parametric_designs_per_term`,
+    // and compare drops_by_block. If the two compiles disagree, log a
+    // warning surfacing the diff — the structural compile is still load-
+    // bearing for predict-time consumers (it owns the T-lift the inner
+    // Newton actually used), so we don't silently re-fit; the warning is
+    // the actionable diagnostic the math agent asked for. Re-fitting once
+    // with the new compile would require rebuilding all of the captured
+    // post-cutover bindings (designs, make_family, build_blocks, the
+    // outer solve closures), which is outside the surgical scope of this
+    // hook; the diagnostic is the principled stop here.
+    if let Some(ref ctx) = recompile_after_accept {
+        let recompile_started = std::time::Instant::now();
+        // Lift compiled β → raw β when the cutover fired. Otherwise the
+        // block_states already carry raw-width β.
+        let n_lift = smgs_lift_v
+            .as_ref()
+            .map(|l| l.block_starts_compiled.len().saturating_sub(1))
+            .unwrap_or(0);
+        let raw_time_beta = if let Some(ref lift) = smgs_lift_v {
+            let compiled_betas: Vec<Array1<f64>> = solved
+                .fit
+                .block_states
+                .iter()
+                .take(n_lift)
+                .map(|s| s.beta.clone())
+                .collect();
+            let lifted = lift.lift_block_betas_via_t(&compiled_betas);
+            lifted.into_iter().next()
+        } else {
+            solved.fit.block_states.first().map(|s| s.beta.clone())
+        };
+        let recompile_result = (|| -> Result<(usize, usize, usize), String> {
+            use crate::families::survival_marginal_slope_identifiability::{
+                SurvivalRowHessian, compile_survival_parametric_designs_per_term,
+            };
+            let beta_time = raw_time_beta
+                .as_ref()
+                .ok_or_else(|| "no time block β available".to_string())?;
+            if beta_time.len() != ctx.dq0.ncols() {
+                return Err(format!(
+                    "raw time β width {} != raw design width {}",
+                    beta_time.len(),
+                    ctx.dq0.ncols()
+                ));
+            }
+            let n_rows = ctx.dq0.nrows();
+            // Marginal and logslope η are lift-invariant: block_states[i].eta
+            // are the per-row η values at convergence regardless of which
+            // β-coord system they were computed in.
+            let marginal_eta = solved
+                .fit
+                .block_states
+                .get(1)
+                .map(|s| s.eta.clone())
+                .ok_or_else(|| "no marginal block_state".to_string())?;
+            let logslope_eta = solved
+                .fit
+                .block_states
+                .get(2)
+                .map(|s| s.eta.clone())
+                .ok_or_else(|| "no logslope block_state".to_string())?;
+            if marginal_eta.len() != n_rows || logslope_eta.len() != n_rows {
+                return Err(format!(
+                    "block_state eta length mismatch: marginal={}, logslope={}, n_rows={}",
+                    marginal_eta.len(),
+                    logslope_eta.len(),
+                    n_rows
+                ));
+            }
+            let time_q0 = ctx.dq0.dot(beta_time);
+            let time_q1 = ctx.dq1.dot(beta_time);
+            let time_qd1 = ctx.dqd1.dot(beta_time);
+            let mut q0 = Array1::<f64>::zeros(n_rows);
+            let mut q1 = Array1::<f64>::zeros(n_rows);
+            let mut qd1 = Array1::<f64>::zeros(n_rows);
+            for i in 0..n_rows {
+                q0[i] = time_q0[i] + ctx.offset_entry[i] + marginal_eta[i];
+                q1[i] = time_q1[i] + ctx.offset_exit[i] + marginal_eta[i];
+                qd1[i] = time_qd1[i] + ctx.derivative_offset_exit[i];
+            }
+            let g = logslope_eta;
+            let row_hess = SurvivalRowHessian::from_pilot_primary_state(
+                &q0,
+                &q1,
+                &qd1,
+                &g,
+                &ctx.z_primary,
+                &ctx.weights,
+                &ctx.event,
+                ctx.derivative_guard,
+                ctx.probit_scale,
+            )?;
+            let compiled = compile_survival_parametric_designs_per_term(
+                ctx.dq0.clone(),
+                ctx.dq1.clone(),
+                ctx.dqd1.clone(),
+                &ctx.time_partition,
+                ctx.m_dq.clone(),
+                ctx.m_dqd1.clone(),
+                &ctx.marginal_partition,
+                ctx.g_dg.clone(),
+                &ctx.logslope_partition,
+                &row_hess,
+            )?;
+            Ok(compiled.drops_by_block)
+        })();
+        match recompile_result {
+            Ok(drops_post) => {
+                if drops_post == ctx.drops_by_block_initial {
+                    log::debug!(
+                        "[smgs phase-4b recompile-after-accept] drops match structural pass \
+                         (time={}, marginal={}, logslope={}); elapsed={:.3}s",
+                        drops_post.0,
+                        drops_post.1,
+                        drops_post.2,
+                        recompile_started.elapsed().as_secs_f64(),
+                    );
+                } else {
+                    // Re-fit ONCE would consume the new compile here. The
+                    // surgical scope of this hook stops at the diagnostic;
+                    // surface the diff at WARN so it cannot be missed.
+                    log::warn!(
+                        "[smgs phase-4b recompile-after-accept] drops_by_block differs at \
+                         converged β: structural=(time={}, marginal={}, logslope={}) vs \
+                         data-adaptive=(time={}, marginal={}, logslope={}); pilot-curvature \
+                         trap detected — current fit reflects the structural compile. A \
+                         single re-fit with the data-adaptive compile is the next step; \
+                         file an issue with this log line if observed in production. \
+                         elapsed={:.3}s",
+                        ctx.drops_by_block_initial.0,
+                        ctx.drops_by_block_initial.1,
+                        ctx.drops_by_block_initial.2,
+                        drops_post.0,
+                        drops_post.1,
+                        drops_post.2,
+                        recompile_started.elapsed().as_secs_f64(),
+                    );
+                }
+            }
+            Err(reason) => {
+                log::warn!(
+                    "[smgs phase-4b recompile-after-accept] skipped: {reason}; elapsed={:.3}s",
+                    recompile_started.elapsed().as_secs_f64(),
+                );
+            }
+        }
+    }
+
     let (baseline_offset_residuals, baseline_offset_curvatures) = {
         let final_family = make_family(
             &solved.designs[0],
