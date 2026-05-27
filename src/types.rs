@@ -462,11 +462,6 @@ impl LikelihoodSpec {
     }
 
     #[inline]
-    pub const fn binomial_link(link: LinkFunction) -> Self {
-        Self::new(ResponseFamily::Binomial, InverseLink::Standard(link))
-    }
-
-    #[inline]
     pub const fn poisson_log() -> Self {
         Self::new(
             ResponseFamily::Poisson,
