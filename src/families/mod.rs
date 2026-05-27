@@ -5,7 +5,6 @@ pub mod custom_family;
 pub mod family_meta;
 pub mod gamlss;
 pub mod identifiability_compiler;
-pub mod inner_status;
 pub mod inverse_link;
 pub mod ispline_base_time;
 pub mod jet_partitions;
