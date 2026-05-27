@@ -4677,4 +4677,482 @@ mod tests {
             );
         }
     }
+
+    /// Block 9 final hill-climb gate — GPU HVP must be at least 5× faster
+    /// than a Rayon-parallel CPU HVP at biobank shape (n=195_000, r=20,
+    /// p_total=44). This is the charter pass/fail metric for whether the
+    /// device-resident row-Hessian path is a real perf win for the
+    /// production marginal-slope fit.
+    ///
+    /// Methodology:
+    ///   * Build the same deterministic fixture as the parity tests.
+    ///   * GPU: median of `iters` `launch_bms_flex_row_hvp` wall-times
+    ///     after `warmup` warm-up launches (kernel compile + L2 prime).
+    ///   * CPU: median of `iters` `cpu_oracle_bms_flex_row_hvp` wall-times,
+    ///     parallelised over rows via Rayon — this mirrors the actual
+    ///     production CPU path in
+    ///     `exact_newton_joint_hessian_matvec_from_cache` (which uses
+    ///     `ROW_CHUNK_SIZE` chunked `into_par_iter()` for the same
+    ///     contraction).
+    ///   * Ratio = cpu_median / gpu_median; assert ratio >= 5.
+    ///
+    /// Skips on non-Linux / no-CUDA hosts.
+    #[test]
+    fn bms_flex_row_hvp_v100_hill_climb_5x_vs_cpu_at_biobank() {
+        #[cfg(not(target_os = "linux"))]
+        {
+            eprintln!(
+                "[bms_flex_row hvp hill-climb] non-Linux host — skipping V100 perf gate"
+            );
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use rayon::prelude::*;
+
+            let Some(_runtime) = crate::gpu::runtime::GpuRuntime::global() else {
+                eprintln!(
+                    "[bms_flex_row hvp hill-climb] no CUDA runtime — skipping V100 perf gate"
+                );
+                return;
+            };
+            let n = 195_000_usize;
+            let p_m = 14_usize;
+            let p_g = 12_usize;
+            let p_h_dim = 10_usize;
+            let p_w_dim = 8_usize;
+            let r = 2 + p_h_dim + p_w_dim;
+            let p_total = p_m + p_g + p_h_dim + p_w_dim;
+            let block = BmsFlexBlockLayout {
+                p_m,
+                p_g,
+                h: Some(p_m + p_g..p_m + p_g + p_h_dim),
+                w: Some(p_m + p_g + p_h_dim..p_m + p_g + p_h_dim + p_w_dim),
+                p_total,
+            };
+            let primary = BmsFlexPrimaryLayout {
+                h: Some(2..2 + p_h_dim),
+                w: Some(2 + p_h_dim..2 + p_h_dim + p_w_dim),
+                r,
+            };
+
+            // Same deterministic fixture as the Phase 4 biobank benchmark.
+            let mut row_hessians = vec![0.0_f64; n * r * r];
+            for row in 0..n {
+                let base = row * r * r;
+                for u in 0..r {
+                    for vv in 0..r {
+                        let seed = (row as f64) * 0.137
+                            + (u as f64) * 1.901
+                            + (vv as f64) * 0.317;
+                        let a = (seed.sin() * 1.7 + (seed * 0.5).cos() * 0.9) * 0.5;
+                        row_hessians[base + u * r + vv] = a;
+                    }
+                }
+                for u in 0..r {
+                    for vv in (u + 1)..r {
+                        let upper = row_hessians[base + u * r + vv];
+                        let lower = row_hessians[base + vv * r + u];
+                        let sym = 0.5 * (upper + lower);
+                        row_hessians[base + u * r + vv] = sym;
+                        row_hessians[base + vv * r + u] = sym;
+                    }
+                    row_hessians[base + u * r + u] += r as f64;
+                }
+            }
+            let mut marginal = vec![0.0_f64; n * p_m];
+            for row in 0..n {
+                for j in 0..p_m {
+                    let seed = (row as f64) * 0.073 + (j as f64) * 0.211 + 0.4;
+                    marginal[row * p_m + j] = seed.sin() * 0.8 - (seed * 0.7).cos() * 0.3;
+                }
+            }
+            let mut logslope = vec![0.0_f64; n * p_g];
+            for row in 0..n {
+                for j in 0..p_g {
+                    let seed = (row as f64) * 0.091 + (j as f64) * 0.179 - 0.2;
+                    logslope[row * p_g + j] = seed.cos() * 0.7 + (seed * 0.3).sin() * 0.25;
+                }
+            }
+            let v: Vec<f64> = (0..p_total)
+                .map(|i| {
+                    let seed = (i as f64) * 0.157 + 0.6;
+                    seed.sin() * 0.55 + (seed * 0.4).cos() * 0.35
+                })
+                .collect();
+
+            // ── GPU side: upload once, time HVP launches ─────────────
+            let backend = match HvpKernelBackend::probe() {
+                Ok(b) => b,
+                Err(err) => {
+                    eprintln!("[bms_flex_row hvp hill-climb] backend probe failed: {err}");
+                    return;
+                }
+            };
+            let stream = backend.stream.clone();
+            let d_h = match stream.clone_htod(&row_hessians) {
+                Ok(s) => s,
+                Err(err) => {
+                    eprintln!(
+                        "[bms_flex_row hvp hill-climb] upload h failed (likely OOM): {err}"
+                    );
+                    return;
+                }
+            };
+            let d_m = match stream.clone_htod(&marginal) {
+                Ok(s) => s,
+                Err(err) => {
+                    eprintln!("[bms_flex_row hvp hill-climb] upload marg failed: {err}");
+                    return;
+                }
+            };
+            let d_g = match stream.clone_htod(&logslope) {
+                Ok(s) => s,
+                Err(err) => {
+                    eprintln!("[bms_flex_row hvp hill-climb] upload logslope failed: {err}");
+                    return;
+                }
+            };
+            let storage = DeviceResidentRowHess {
+                ctx: backend.ctx.clone(),
+                stream: stream.clone(),
+                hess: d_h,
+                marginal_design: d_m,
+                logslope_design: d_g,
+                n,
+                r,
+                block: block.clone(),
+                primary: primary.clone(),
+                layout: RowHessianLayout::FullRowMajor,
+                bytes: ((n * r * r + n * p_m + n * p_g) * std::mem::size_of::<f64>()) as u64,
+            };
+            let warmup: usize = 3;
+            let iters: usize = 15;
+            for _ in 0..warmup {
+                let out = launch_bms_flex_row_hvp(&storage, &v)
+                    .expect("warmup GPU HVP must launch");
+                assert_eq!(out.len(), p_total);
+            }
+            let mut gpu_us: Vec<u128> = Vec::with_capacity(iters);
+            for _ in 0..iters {
+                let t0 = std::time::Instant::now();
+                let out = launch_bms_flex_row_hvp(&storage, &v)
+                    .expect("GPU HVP must launch");
+                gpu_us.push(t0.elapsed().as_micros());
+                assert_eq!(out.len(), p_total);
+            }
+            gpu_us.sort_unstable();
+            let gpu_median = gpu_us[iters / 2];
+
+            // ── CPU side: chunked Rayon HVP over rows, mirroring the
+            //    production `exact_newton_joint_hessian_matvec_from_cache`
+            //    parallelisation pattern (ROW_CHUNK_SIZE-row chunks,
+            //    try_fold + try_reduce). The per-chunk worker calls the
+            //    single-threaded oracle on its row slice.
+            const CHUNK_ROWS: usize = 4096;
+            let cpu_hvp_parallel = || -> Vec<f64> {
+                let nchunks = n.div_ceil(CHUNK_ROWS);
+                (0..nchunks)
+                    .into_par_iter()
+                    .fold(
+                        || vec![0.0_f64; p_total],
+                        |mut acc, ci| {
+                            let lo = ci * CHUNK_ROWS;
+                            let hi = (lo + CHUNK_ROWS).min(n);
+                            let m = hi - lo;
+                            let partial = cpu_oracle_bms_flex_row_hvp(
+                                &row_hessians[lo * r * r..hi * r * r],
+                                &marginal[lo * p_m..hi * p_m],
+                                &logslope[lo * p_g..hi * p_g],
+                                &block,
+                                &primary,
+                                m,
+                                &v,
+                            );
+                            for (a, &p) in acc.iter_mut().zip(partial.iter()) {
+                                *a += p;
+                            }
+                            acc
+                        },
+                    )
+                    .reduce(
+                        || vec![0.0_f64; p_total],
+                        |mut a, b| {
+                            for (ax, bx) in a.iter_mut().zip(b.iter()) {
+                                *ax += *bx;
+                            }
+                            a
+                        },
+                    )
+            };
+            // Warmup once to populate L3 / steady-state Rayon thread pool.
+            let warm = cpu_hvp_parallel();
+            assert_eq!(warm.len(), p_total);
+            let mut cpu_us: Vec<u128> = Vec::with_capacity(iters);
+            for _ in 0..iters {
+                let t0 = std::time::Instant::now();
+                let out = cpu_hvp_parallel();
+                cpu_us.push(t0.elapsed().as_micros());
+                assert_eq!(out.len(), p_total);
+            }
+            cpu_us.sort_unstable();
+            let cpu_median = cpu_us[iters / 2];
+
+            let speedup = (cpu_median as f64) / (gpu_median.max(1) as f64);
+            eprintln!(
+                "[bms_flex_row hvp hill-climb] biobank n={n} r={r} p={p_total}: \
+                 cpu_median={cpu_median}us gpu_median={gpu_median}us \
+                 speedup={speedup:.2}× (charter target ≥ 5×)"
+            );
+            assert!(
+                speedup >= 5.0,
+                "biobank HVP perf gate: GPU only {speedup:.2}× faster than CPU; \
+                 need ≥ 5× per Block 9 charter (cpu_median={cpu_median}us, \
+                 gpu_median={gpu_median}us). Hill-climb the kernel until met or \
+                 prove the kernel is at hardware roofline."
+            );
+        }
+    }
+
+    /// Companion to the HVP hill-climb: GPU dense-block build must be at
+    /// least 10× faster than a Rayon-parallel CPU dense build at biobank
+    /// shape. The dense build is `O(n * r² * p_total)` work for both
+    /// paths so the ratio is well-defined.
+    #[test]
+    fn bms_flex_row_dense_block_v100_hill_climb_10x_vs_cpu_at_biobank() {
+        #[cfg(not(target_os = "linux"))]
+        {
+            eprintln!(
+                "[bms_flex_row dense_block hill-climb] non-Linux host — skipping V100 perf gate"
+            );
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use rayon::prelude::*;
+
+            let Some(_runtime) = crate::gpu::runtime::GpuRuntime::global() else {
+                eprintln!(
+                    "[bms_flex_row dense_block hill-climb] no CUDA runtime — skipping V100 perf gate"
+                );
+                return;
+            };
+            let n = 195_000_usize;
+            let p_m = 14_usize;
+            let p_g = 12_usize;
+            let p_h_dim = 10_usize;
+            let p_w_dim = 8_usize;
+            let r = 2 + p_h_dim + p_w_dim;
+            let p_total = p_m + p_g + p_h_dim + p_w_dim;
+            let block = BmsFlexBlockLayout {
+                p_m,
+                p_g,
+                h: Some(p_m + p_g..p_m + p_g + p_h_dim),
+                w: Some(p_m + p_g + p_h_dim..p_m + p_g + p_h_dim + p_w_dim),
+                p_total,
+            };
+            let primary = BmsFlexPrimaryLayout {
+                h: Some(2..2 + p_h_dim),
+                w: Some(2 + p_h_dim..2 + p_h_dim + p_w_dim),
+                r,
+            };
+
+            // Reuse the same biobank fixture recipe.
+            let mut row_hessians = vec![0.0_f64; n * r * r];
+            for row in 0..n {
+                let base = row * r * r;
+                for u in 0..r {
+                    for vv in 0..r {
+                        let seed = (row as f64) * 0.137
+                            + (u as f64) * 1.901
+                            + (vv as f64) * 0.317;
+                        let a = (seed.sin() * 1.7 + (seed * 0.5).cos() * 0.9) * 0.5;
+                        row_hessians[base + u * r + vv] = a;
+                    }
+                }
+                for u in 0..r {
+                    for vv in (u + 1)..r {
+                        let upper = row_hessians[base + u * r + vv];
+                        let lower = row_hessians[base + vv * r + u];
+                        let sym = 0.5 * (upper + lower);
+                        row_hessians[base + u * r + vv] = sym;
+                        row_hessians[base + vv * r + u] = sym;
+                    }
+                    row_hessians[base + u * r + u] += r as f64;
+                }
+            }
+            let mut marginal = vec![0.0_f64; n * p_m];
+            for row in 0..n {
+                for j in 0..p_m {
+                    let seed = (row as f64) * 0.073 + (j as f64) * 0.211 + 0.4;
+                    marginal[row * p_m + j] = seed.sin() * 0.8 - (seed * 0.7).cos() * 0.3;
+                }
+            }
+            let mut logslope = vec![0.0_f64; n * p_g];
+            for row in 0..n {
+                for j in 0..p_g {
+                    let seed = (row as f64) * 0.091 + (j as f64) * 0.179 - 0.2;
+                    logslope[row * p_g + j] = seed.cos() * 0.7 + (seed * 0.3).sin() * 0.25;
+                }
+            }
+
+            // GPU dense_block kernel rejects p_total > DENSE_BLOCK_MAX_P
+            // (72 at V100 48 KiB/block). Biobank's p_total = 44 fits.
+            if p_total > DENSE_BLOCK_MAX_P {
+                eprintln!(
+                    "[bms_flex_row dense_block hill-climb] p_total={p_total} > MAX={DENSE_BLOCK_MAX_P}, skipping"
+                );
+                return;
+            }
+            let backend = match HvpKernelBackend::probe() {
+                Ok(b) => b,
+                Err(err) => {
+                    eprintln!("[bms_flex_row dense_block hill-climb] backend probe failed: {err}");
+                    return;
+                }
+            };
+            let stream = backend.stream.clone();
+            let d_h = match stream.clone_htod(&row_hessians) {
+                Ok(s) => s,
+                Err(err) => {
+                    eprintln!("[bms_flex_row dense_block hill-climb] upload h failed: {err}");
+                    return;
+                }
+            };
+            let d_m = match stream.clone_htod(&marginal) {
+                Ok(s) => s,
+                Err(err) => {
+                    eprintln!("[bms_flex_row dense_block hill-climb] upload marg failed: {err}");
+                    return;
+                }
+            };
+            let d_g = match stream.clone_htod(&logslope) {
+                Ok(s) => s,
+                Err(err) => {
+                    eprintln!(
+                        "[bms_flex_row dense_block hill-climb] upload logslope failed: {err}"
+                    );
+                    return;
+                }
+            };
+            let storage = DeviceResidentRowHess {
+                ctx: backend.ctx.clone(),
+                stream: stream.clone(),
+                hess: d_h,
+                marginal_design: d_m,
+                logslope_design: d_g,
+                n,
+                r,
+                block: block.clone(),
+                primary: primary.clone(),
+                layout: RowHessianLayout::FullRowMajor,
+                bytes: ((n * r * r + n * p_m + n * p_g) * std::mem::size_of::<f64>()) as u64,
+            };
+            // Warmup + 5-iter median (dense build is heavier than HVP).
+            let warmup: usize = 2;
+            let iters: usize = 5;
+            for _ in 0..warmup {
+                let out = launch_bms_flex_row_dense_block(&storage)
+                    .expect("warmup GPU dense_block must launch");
+                assert_eq!(out.len(), p_total * p_total);
+            }
+            let mut gpu_us: Vec<u128> = Vec::with_capacity(iters);
+            for _ in 0..iters {
+                let t0 = std::time::Instant::now();
+                let out = launch_bms_flex_row_dense_block(&storage)
+                    .expect("GPU dense_block must launch");
+                gpu_us.push(t0.elapsed().as_micros());
+                assert_eq!(out.len(), p_total * p_total);
+            }
+            gpu_us.sort_unstable();
+            let gpu_median = gpu_us[iters / 2];
+
+            // CPU side: chunked Rayon dense build over rows. Each chunk
+            // builds a `[p_total, p_total]` partial then we reduce-add.
+            const CHUNK_ROWS: usize = 2048;
+            let h_block_start = block.h.as_ref().map(|r| r.start).unwrap_or(0);
+            let h_block_len = block.h.as_ref().map(|r| r.len()).unwrap_or(0);
+            let w_block_start = block.w.as_ref().map(|r| r.start).unwrap_or(0);
+            let w_block_len = block.w.as_ref().map(|r| r.len()).unwrap_or(0);
+            let h_primary_start = primary.h.as_ref().map(|r| r.start).unwrap_or(0);
+            let w_primary_start = primary.w.as_ref().map(|r| r.start).unwrap_or(0);
+            let cpu_build_parallel = || -> Vec<f64> {
+                let nchunks = n.div_ceil(CHUNK_ROWS);
+                (0..nchunks)
+                    .into_par_iter()
+                    .fold(
+                        || vec![0.0_f64; p_total * p_total],
+                        |mut acc, ci| {
+                            let lo = ci * CHUNK_ROWS;
+                            let hi = (lo + CHUNK_ROWS).min(n);
+                            let mut phi: Vec<Vec<f64>> = vec![vec![0.0_f64; p_total]; r];
+                            for row in lo..hi {
+                                for col in phi.iter_mut() {
+                                    col.iter_mut().for_each(|v| *v = 0.0);
+                                }
+                                let mrow = &marginal[row * p_m..(row + 1) * p_m];
+                                let grow = &logslope[row * p_g..(row + 1) * p_g];
+                                for k in 0..p_m { phi[0][k] = mrow[k]; }
+                                for k in 0..p_g { phi[1][p_m + k] = grow[k]; }
+                                for k in 0..h_block_len {
+                                    phi[h_primary_start + k][h_block_start + k] = 1.0;
+                                }
+                                for k in 0..w_block_len {
+                                    phi[w_primary_start + k][w_block_start + k] = 1.0;
+                                }
+                                let hrow = &row_hessians[row * r * r..(row + 1) * r * r];
+                                for u in 0..r {
+                                    for v_idx in 0..r {
+                                        let huv = hrow[u * r + v_idx];
+                                        if huv == 0.0 { continue; }
+                                        for m in 0..p_total {
+                                            let pm = phi[u][m];
+                                            if pm == 0.0 { continue; }
+                                            let scaled = huv * pm;
+                                            for nn in 0..p_total {
+                                                acc[m * p_total + nn] += scaled * phi[v_idx][nn];
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            acc
+                        },
+                    )
+                    .reduce(
+                        || vec![0.0_f64; p_total * p_total],
+                        |mut a, b| {
+                            for (ax, bx) in a.iter_mut().zip(b.iter()) {
+                                *ax += *bx;
+                            }
+                            a
+                        },
+                    )
+            };
+            let warm_cpu = cpu_build_parallel();
+            assert_eq!(warm_cpu.len(), p_total * p_total);
+            let mut cpu_us: Vec<u128> = Vec::with_capacity(iters);
+            for _ in 0..iters {
+                let t0 = std::time::Instant::now();
+                let out = cpu_build_parallel();
+                cpu_us.push(t0.elapsed().as_micros());
+                assert_eq!(out.len(), p_total * p_total);
+            }
+            cpu_us.sort_unstable();
+            let cpu_median = cpu_us[iters / 2];
+
+            let speedup = (cpu_median as f64) / (gpu_median.max(1) as f64);
+            eprintln!(
+                "[bms_flex_row dense_block hill-climb] biobank n={n} r={r} p={p_total}: \
+                 cpu_median={cpu_median}us gpu_median={gpu_median}us \
+                 speedup={speedup:.2}× (charter target ≥ 10×)"
+            );
+            assert!(
+                speedup >= 10.0,
+                "biobank dense-H perf gate: GPU only {speedup:.2}× faster than CPU; \
+                 need ≥ 10× per Block 9 charter (cpu_median={cpu_median}us, \
+                 gpu_median={gpu_median}us). Hill-climb the dense_block kernel \
+                 (warp-stripe the u-v-m-n loop, vectorise loads, etc.) until met \
+                 or prove the kernel is at hardware roofline."
+            );
+        }
+    }
 }
