@@ -486,53 +486,43 @@ mod tests {
         l_spec.gauge_priority = 60;
         let specs = [t_spec, m_spec, g_spec, w_spec, l_spec];
 
-        let canon = canonicalize_for_identifiability(&specs)
-            .expect("five-block aliased canonical must reduce, not refuse");
-
-        // Joint rank check: each block has p_i columns with one shared
-        // constant direction across all five blocks. Raw p_total =
-        // 3+3+3+2+2 = 13; only one of the five constants is independent;
-        // expected rank = 13 − 4 = 9.
-        let total_kept: usize = canon.reduced_block_dims().iter().sum();
+        let err = canonicalize_for_identifiability(&specs)
+            .expect_err("five-block aliased joint must refuse-not-reduce under fail-closed gate");
+        let audit = match err {
+            CustomFamilyError::IdentifiabilityFailure { audit } => audit,
+            other => panic!("expected IdentifiabilityFailure, got {other:?}"),
+        };
+        assert!(
+            audit.fatal,
+            "audit must be fatal on a joint-rank-deficient five-block design; got {}",
+            audit.summary,
+        );
+        // Raw p_total = 3+3+3+2+2 = 13; expected rank = 13 − 4 = 9.
+        // Audit's per-block effective_dim sum equals joint_rank by
+        // construction of the attribution loop.
+        let total_kept: usize = audit.blocks.iter().map(|b| b.effective_dim).sum();
         assert_eq!(
             total_kept, 9,
-            "expected joint rank = 13 − 4 shared constants = 9; got {total_kept} (raw dims {:?}, kept dims {:?})",
-            canon.raw_block_dims(),
-            canon.reduced_block_dims(),
+            "expected joint rank = 13 − 4 = 9 reported by audit; got {total_kept} \
+             (per-block effective_dim {:?})",
+            audit.blocks.iter().map(|b| (b.block_name.clone(), b.effective_dim)).collect::<Vec<_>>(),
         );
-
-        // Gauge-ownership contract: time_surface (highest priority) must
-        // keep all 3 of its raw columns including its constant.
-        let time_kept = canon.reduced_block_dims()[0];
-        assert_eq!(
-            time_kept, 3,
-            "highest-priority block must retain all its columns under canonical gauge; \
-             time kept {time_kept}/3"
-        );
-
-        // Lift round-trip: a reduced β supplied per block lifts to a
-        // raw β where dropped raw indices receive exactly zero (the
-        // canonical-gauge contract — dropped directions get no
-        // contribution from the lifted coefficient vector).
-        let theta: Vec<Array1<f64>> = canon
-            .reduced_block_dims()
-            .iter()
-            .map(|&r| Array1::from_iter((1..=r).map(|j| j as f64)))
-            .collect();
-        let raw_betas = canon.lift_block_betas_to_raw(&theta);
-        assert_eq!(raw_betas.len(), 5);
-        let total_zeros: usize = raw_betas
-            .iter()
-            .map(|b| b.iter().filter(|&&v| v == 0.0).count())
-            .sum();
-        let total_raw: usize = canon.raw_block_dims().iter().sum();
-        assert_eq!(
-            total_zeros, total_raw - total_kept,
-            "lifted β must have exactly (raw_total − kept_total) zeros for dropped \
-             indices; got {total_zeros} zeros, expected {} \
-             (raw_total={total_raw}, kept_total={total_kept})",
-            total_raw - total_kept,
-        );
+        // Gauge-priority attribution: dropped_columns are the four
+        // columns RRQR demoted past the joint rank threshold. With
+        // priority-descending column ordering, the time_surface block
+        // (highest priority) must NOT appear among the attributed
+        // drops — every attributed drop belongs to one of the four
+        // lower-priority blocks. This is the ownership contract the
+        // audit enforces independent of whether canonicalisation
+        // applies a reduction.
+        for drop in &audit.dropped_columns {
+            assert_ne!(
+                drop.block, "time_surface",
+                "highest-priority block must never be the attributed drop \
+                 origin under priority-aware RRQR; got drop on time_surface \
+                 ({drop:?})",
+            );
+        }
     }
 
     #[test]
