@@ -152,7 +152,8 @@ mod cuda_impl {
 
         // Upload each channel-pair weight column (10 in total). We only
         // upload the columns we will actually consume.
-        let mut h_columns: [Option<CudaSlice<f64>>; PACKED_LEN] = Default::default();
+        let mut h_columns: [Option<CudaSlice<f64>>; PACKED_LEN] =
+            [None, None, None, None, None, None, None, None, None, None];
         let mut needed: [bool; PACKED_LEN] = [false; PACKED_LEN];
         for a in 0..num_blocks {
             for b in 0..num_blocks {

@@ -19288,50 +19288,53 @@ pub fn fit_survival_marginal_slope_terms(
                 dm,
                 dg,
             );
-            let applied: CompiledSurvivalDesignsPerTerm =
-                apply_per_term_survival_parametric_compile_to_designs(
-                    &compiled,
-                    &time_partition,
-                    &marginal_partition,
-                    &logslope_partition,
-                    spec.time_block.design_entry.clone(),
-                    spec.time_block.design_exit.clone(),
-                    spec.time_block.design_derivative_exit.clone(),
-                    marginal_design.design.clone(),
-                    logslope_design.design.clone(),
-                    &spec
-                        .time_block
-                        .penalties
-                        .iter()
-                        .enumerate()
-                        .map(|(_, p)| {
-                            crate::terms::smooth::BlockwisePenalty::new(0..p_time, p.clone())
-                        })
-                        .collect::<Vec<_>>(),
-                    &marginal_design.penalties,
-                    &logslope_design.penalties,
-                )?;
-            Ok(Some(applied))
+            let applied: CompiledSurvivalDesignsVMExact = apply_per_term_vm_exact(
+                &compiled,
+                &time_partition,
+                &marginal_partition,
+                &logslope_partition,
+                spec.time_block.design_entry.clone(),
+                spec.time_block.design_exit.clone(),
+                spec.time_block.design_derivative_exit.clone(),
+                marginal_design.design.clone(),
+                logslope_design.design.clone(),
+                &spec
+                    .time_block
+                    .penalties
+                    .iter()
+                    .map(|p| crate::terms::smooth::BlockwisePenalty::new(0..p_time, p.clone()))
+                    .collect::<Vec<_>>(),
+                &marginal_design.penalties,
+                &logslope_design.penalties,
+            )?;
+            Ok(Some((applied, compiled)))
         })();
         match attempt {
-            Ok(Some(applied)) => {
-                // Compiled .design + per-term pulled-back .penalties
-                // swapped into clones of the raw TermCollectionDesigns.
-                // Other metadata fields stay at raw width — they are
-                // consumed post-fit, and at that point β has been
-                // lifted back to raw via SmgsLiftPerBlockV.
+            Ok(Some((applied, compiled))) => {
+                // V+M-exact compiled .design swapped into clones of the
+                // raw TermCollectionDesigns. The TermCollectionDesign's
+                // .penalties field stays raw (Vec<BlockwisePenalty>) for
+                // predict-time consumers; the V+M-exact full-width
+                // pulled-back penalties travel via the side bindings
+                // `*_penalties_vm` and are wired into the per-block
+                // `ParameterBlockSpec.penalties` inside `build_blocks`.
+                //
+                // Other TermCollectionDesign metadata stays at raw width
+                // — it's consumed post-fit, by which point β has been
+                // lifted back to raw via `T · θ`.
                 let mut marg_out = marginal_design.clone();
                 marg_out.design = applied.marginal_design;
-                marg_out.penalties = applied.marginal_penalties;
                 let mut log_out = logslope_design.clone();
                 log_out.design = applied.logslope_design;
-                log_out.penalties = applied.logslope_penalties;
-                let lift = SmgsLiftPerBlockV {
-                    // Order: time (0), marginal (1), logslope (2). Flex
-                    // blocks (score_warp_dev, link_dev) appear at
-                    // higher indices and need no parametric V lift.
-                    v_per_block: vec![applied.v_time, applied.v_marginal, applied.v_logslope],
-                };
+                // Flatten per-term V's in global compile order: time,
+                // then marginal, then logslope. Matches the ordering
+                // `apply_per_term_vm_exact` used to build `t_full` and
+                // `compiled.r_lw_per_term`.
+                let mut v_per_block: Vec<ndarray::Array2<f64>> = Vec::new();
+                v_per_block.extend(compiled.v_time_per_term.iter().cloned());
+                v_per_block.extend(compiled.v_marginal_per_term.iter().cloned());
+                v_per_block.extend(compiled.v_logslope_per_term.iter().cloned());
+                let lift = SmgsLiftViaT::from_v_and_r(&v_per_block, &compiled.r_lw_per_term);
                 (
                     applied.time_design_entry,
                     applied.time_design_exit,
@@ -19339,6 +19342,9 @@ pub fn fit_survival_marginal_slope_terms(
                     marg_out,
                     log_out,
                     Some(lift),
+                    Some(applied.time_penalties),
+                    Some(applied.marginal_penalties),
+                    Some(applied.logslope_penalties),
                 )
             }
             Ok(None) => (
@@ -19347,6 +19353,9 @@ pub fn fit_survival_marginal_slope_terms(
                 spec.time_block.design_derivative_exit.clone(),
                 marginal_design.clone(),
                 logslope_design.clone(),
+                None,
+                None,
+                None,
                 None,
             ),
             Err(reason) => {
@@ -19357,6 +19366,9 @@ pub fn fit_survival_marginal_slope_terms(
                     spec.time_block.design_derivative_exit.clone(),
                     marginal_design.clone(),
                     logslope_design.clone(),
+                    None,
+                    None,
+                    None,
                     None,
                 )
             }
@@ -19503,6 +19515,23 @@ pub fn fit_survival_marginal_slope_terms(
                 hints.logslope_beta.clone(),
             ),
         ];
+        // V+M-exact cutover: when the active cutover fired, the
+        // `*_penalties_vm` side bindings carry the full-width Dense
+        // penalty matrices pulled back through the triangular T (T^T S
+        // T). Substitute them in for each block's per-block-converted
+        // Blockwise penalties so the inner solver sees the exact
+        // compiled-coord penalties. The penalty count is invariant
+        // under the pullback so cursor accounting based on
+        // `design.penalties.len()` (raw widths) still matches.
+        if let Some(ref pens) = time_penalties_vm {
+            blocks[0].penalties = pens.clone();
+        }
+        if let Some(ref pens) = marginal_penalties_vm {
+            blocks[1].penalties = pens.clone();
+        }
+        if let Some(ref pens) = logslope_penalties_vm {
+            blocks[2].penalties = pens.clone();
+        }
         if let Some(prepared) = score_warp_active {
             let rho_h = rho
                 .slice(s![cursor..cursor + prepared.block.penalties.len()])
@@ -20036,24 +20065,36 @@ pub fn fit_survival_marginal_slope_terms(
         final_family.offset_channel_geometry(&solved.fit.block_states)?
     };
 
-    // Phase-4b result-time β lift. When the active cutover applied
-    // per-block V to the time/marginal/logslope designs, the inner
-    // Newton produced β at *compiled* width. Predict-time consumers
-    // expect β at the original raw width: serialise lifts each block's
-    // β via `β_raw = V_block · β_compiled`. The corresponding η is
+    // Phase-4b V+M-exact result-time β lift. When the active cutover
+    // fired, the inner Newton produced θ at *compiled* width across the
+    // time/marginal/logslope blocks. Predict-time consumers expect β at
+    // the original raw width: `lift_block_betas_via_t` concatenates the
+    // per-block compiled θs, multiplies by the full triangular T
+    // (V's on the diagonal, `−R_{a→b}` off-diagonals), and splits the
+    // result at raw-block boundaries. The corresponding η is
     // numerically invariant under the lift (η = X_raw · β_raw =
-    // X_raw · V · β_compiled = X_compiled · β_compiled) so we leave
-    // it alone. When the cutover did NOT fire (smgs_lift_v is None),
-    // β is already at raw width and the lift is a no-op.
+    // X_raw · T · θ = X_compiled · θ) so we leave it alone. When the
+    // cutover did NOT fire (smgs_lift_v is None), β is already at raw
+    // width and the lift is a no-op. Flex blocks (score_warp_dev,
+    // link_dev) at indices ≥ 3 are not part of the parametric T and
+    // pass through unchanged.
     if let Some(ref lift) = smgs_lift_v {
-        let mut betas: Vec<Array1<f64>> = solved
+        let n_lift = lift.block_starts_compiled.len().saturating_sub(1);
+        let compiled_betas: Vec<Array1<f64>> = solved
             .fit
             .block_states
             .iter()
+            .take(n_lift)
             .map(|s| s.beta.clone())
             .collect();
-        lift.lift_block_betas(&mut betas);
-        for (state, beta) in solved.fit.block_states.iter_mut().zip(betas.into_iter()) {
+        let lifted = lift.lift_block_betas_via_t(&compiled_betas);
+        for (state, beta) in solved
+            .fit
+            .block_states
+            .iter_mut()
+            .take(n_lift)
+            .zip(lifted.into_iter())
+        {
             state.beta = beta;
         }
     }

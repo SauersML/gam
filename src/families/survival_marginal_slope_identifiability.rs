@@ -3173,4 +3173,188 @@ mod tests {
             );
         }
     }
+
+    fn make_raw_block(
+        name: &str,
+        n_rows: usize,
+        raw_w: usize,
+        q0: Option<Array2<f64>>,
+        q1: Option<Array2<f64>>,
+        qd1: Option<Array2<f64>>,
+        g: Option<Array2<f64>>,
+    ) -> RawPrimaryBlockDesign {
+        let zero = || Array2::<f64>::zeros((n_rows, raw_w));
+        let wrap = |a: Array2<f64>| -> DesignMatrix {
+            DesignMatrix::Dense(DenseDesignMatrix::from(a))
+        };
+        RawPrimaryBlockDesign {
+            name: name.to_string(),
+            q0: wrap(q0.unwrap_or_else(zero)),
+            q1: wrap(q1.unwrap_or_else(zero)),
+            qd1: wrap(qd1.unwrap_or_else(zero)),
+            g: wrap(g.unwrap_or_else(zero)),
+        }
+    }
+
+    fn dense_of(dm: &DesignMatrix) -> Array2<f64> {
+        match dm {
+            DesignMatrix::Dense(d) => d.to_dense(),
+            DesignMatrix::Sparse(_) => panic!("expected Dense"),
+        }
+    }
+
+    #[test]
+    fn materialise_compiled_primary_blocks_block_diagonal_t_no_cross_block() {
+        // 3 raw blocks: time (raw_w=2), marginal (raw_w=2), logslope (raw_w=2).
+        // T is block-diagonal (identity) — no off-diag anchor subtraction.
+        // Compiled q0 for block_marg should equal raw marg q0 directly.
+        let n = 5;
+        let raw_ranges: Vec<std::ops::Range<usize>> = vec![0..2, 2..4, 4..6];
+        let compiled_ranges: Vec<std::ops::Range<usize>> = vec![0..2, 2..4, 4..6];
+
+        let x_time_q0 = Array2::from_shape_fn((n, 2), |(i, j)| (i + j) as f64 + 1.0);
+        let x_time_q1 = Array2::from_shape_fn((n, 2), |(i, j)| 2.0 * (i as f64) + j as f64);
+        let x_time_qd1 = Array2::from_shape_fn((n, 2), |(i, j)| 0.5 * (i as f64) - j as f64);
+        let x_marg_q0 = Array2::from_shape_fn((n, 2), |(i, j)| 0.3 + (i * 3 + j) as f64);
+        let x_marg_q1 = x_marg_q0.clone();
+        let x_log_g = Array2::from_shape_fn((n, 2), |(i, j)| 7.0 - (i as f64) + 0.1 * (j as f64));
+
+        let raw_blocks = vec![
+            make_raw_block(
+                "time",
+                n,
+                2,
+                Some(x_time_q0.clone()),
+                Some(x_time_q1.clone()),
+                Some(x_time_qd1.clone()),
+                None,
+            ),
+            make_raw_block(
+                "marginal",
+                n,
+                2,
+                Some(x_marg_q0.clone()),
+                Some(x_marg_q1.clone()),
+                None,
+                None,
+            ),
+            make_raw_block("logslope", n, 2, None, None, None, Some(x_log_g.clone())),
+        ];
+
+        let mut t_full = Array2::<f64>::zeros((6, 6));
+        for i in 0..6 {
+            t_full[[i, i]] = 1.0;
+        }
+
+        let out = materialise_compiled_primary_blocks(
+            n,
+            &raw_blocks,
+            &compiled_ranges,
+            &raw_ranges,
+            &t_full,
+        )
+        .expect("materialise should succeed on block-diagonal T");
+        assert_eq!(out.len(), 3);
+
+        let comp_marg_q0 = dense_of(&out[1].q0);
+        assert_eq!(comp_marg_q0.shape(), &[n, 2]);
+        for i in 0..n {
+            for j in 0..2 {
+                assert!(
+                    (comp_marg_q0[[i, j]] - x_marg_q0[[i, j]]).abs() < 1e-12,
+                    "block-diag T: compiled marg q0 mismatch at ({i},{j}): got {} want {}",
+                    comp_marg_q0[[i, j]],
+                    x_marg_q0[[i, j]],
+                );
+            }
+        }
+        // No cross-block bleed: compiled time q0 equals raw time q0.
+        let comp_time_q0 = dense_of(&out[0].q0);
+        for i in 0..n {
+            for j in 0..2 {
+                assert!((comp_time_q0[[i, j]] - x_time_q0[[i, j]]).abs() < 1e-12);
+            }
+        }
+        // Compiled logslope q0 is all zero.
+        let comp_log_q0 = dense_of(&out[2].q0);
+        for i in 0..n {
+            for j in 0..2 {
+                assert!(comp_log_q0[[i, j]].abs() < 1e-14);
+            }
+        }
+    }
+
+    #[test]
+    fn materialise_compiled_primary_blocks_with_anchor_subtraction_pulls_q0_into_logslope() {
+        // 3 raw blocks. T has identity on the diagonal and a nonzero −R
+        // at T[time_range, logslope_range]. Raw logslope contributes nothing
+        // to q0 directly, but compiled logslope's q0 design must equal
+        // raw time q0 · (−R).
+        let n = 4;
+        let raw_ranges: Vec<std::ops::Range<usize>> = vec![0..2, 2..4, 4..6];
+        let compiled_ranges: Vec<std::ops::Range<usize>> = vec![0..2, 2..4, 4..6];
+
+        let x_time_q0 = Array2::from_shape_fn((n, 2), |(i, j)| (i + 2 * j + 1) as f64);
+        let x_marg_q0 = Array2::from_shape_fn((n, 2), |(i, j)| 0.5 + (i as f64) - (j as f64));
+        let x_log_g = Array2::from_shape_fn((n, 2), |(i, j)| 1.0 + 0.25 * (i + j) as f64);
+
+        let raw_blocks = vec![
+            make_raw_block("time", n, 2, Some(x_time_q0.clone()), None, None, None),
+            make_raw_block("marginal", n, 2, Some(x_marg_q0.clone()), None, None, None),
+            make_raw_block("logslope", n, 2, None, None, None, Some(x_log_g.clone())),
+        ];
+
+        let r_time_log = Array2::from_shape_vec((2, 2), vec![0.7, -0.3, 0.1, 0.9]).unwrap();
+        let mut t_full = Array2::<f64>::zeros((6, 6));
+        for i in 0..6 {
+            t_full[[i, i]] = 1.0;
+        }
+        for i in 0..2 {
+            for j in 0..2 {
+                t_full[[i, 4 + j]] = -r_time_log[[i, j]];
+            }
+        }
+
+        let out = materialise_compiled_primary_blocks(
+            n,
+            &raw_blocks,
+            &compiled_ranges,
+            &raw_ranges,
+            &t_full,
+        )
+        .expect("materialise should succeed with anchor subtraction");
+
+        let comp_log_q0 = dense_of(&out[2].q0);
+        assert_eq!(comp_log_q0.shape(), &[n, 2]);
+        let neg_r = -&r_time_log;
+        let expected = fast_ab(&x_time_q0, &neg_r);
+        let mut max_abs = 0.0_f64;
+        for i in 0..n {
+            for j in 0..2 {
+                max_abs = max_abs.max(expected[[i, j]].abs());
+            }
+        }
+        assert!(
+            max_abs > 1e-6,
+            "test construction error: expected compiled logslope q0 to be nonzero",
+        );
+        for i in 0..n {
+            for j in 0..2 {
+                assert!(
+                    (comp_log_q0[[i, j]] - expected[[i, j]]).abs() < 1e-12,
+                    "compiled logslope q0 mismatch at ({i},{j}): got {} want {}",
+                    comp_log_q0[[i, j]],
+                    expected[[i, j]],
+                );
+            }
+        }
+
+        // Compiled logslope g equals raw logslope g (no off-diag in g-affecting cols).
+        let comp_log_g = dense_of(&out[2].g);
+        for i in 0..n {
+            for j in 0..2 {
+                assert!((comp_log_g[[i, j]] - x_log_g[[i, j]]).abs() < 1e-12);
+            }
+        }
+    }
 }
