@@ -236,6 +236,168 @@ mod cuda {
         }
     }
 
+    /// Query the cuSOLVER POTRF workspace size for a p×p matrix.
+    ///
+    /// Called once at workspace construction to size the persistent workspace
+    /// buffer. Returns the number of f64 elements required.
+    pub(crate) fn potrf_query_lwork(
+        solver: &DnHandle,
+        stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+        p: usize,
+    ) -> Result<usize, String> {
+        let p_i = to_i32(p)?;
+        let uplo = cusolver_sys::cublasFillMode_t::CUBLAS_FILL_MODE_LOWER;
+        let mut lwork = 0_i32;
+        // We need a dummy p*p device buffer for the buffer-size query. Allocate
+        // a temporary one since we only call this once at construction time.
+        let mut dummy = stream
+            .alloc_zeros::<f64>(p.checked_mul(p).ok_or("p² overflow in lwork query")?)
+            .map_err(|e| format!("cuda alloc dummy for lwork query: {e}"))?;
+        {
+            let (h_ptr, _h_record) = dummy.device_ptr_mut(stream);
+            // SAFETY: buffer-size query with a valid p*p dummy buffer; lwork is a host i32.
+            let status = unsafe {
+                cusolver_sys::cusolverDnDpotrf_bufferSize(
+                    solver.cu(),
+                    uplo,
+                    p_i,
+                    h_ptr as *mut f64,
+                    p_i,
+                    &mut lwork,
+                )
+            };
+            check_cusolver(status, "cusolverDnDpotrf_bufferSize (lwork query)")?;
+        }
+        usize::try_from(lwork).map_err(|_| "negative potrf lwork".to_string())
+    }
+
+    /// POTRF factorization using pre-allocated workspace and info buffers.
+    ///
+    /// Does not allocate, does not download `info`. The caller is responsible
+    /// for calling [`check_deferred_potrf_info`] at end-of-fit to confirm no
+    /// factorization failed.
+    ///
+    /// `workspace` must have been allocated with at least `lwork` elements
+    /// (as reported by [`potrf_query_lwork`] at workspace construction).
+    /// `info_dev` is a 1-element device i32 buffer; after a failed
+    /// factorization it holds a positive integer but stays device-resident.
+    pub(crate) fn potrf_in_place_reuse(
+        solver: &DnHandle,
+        stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+        p: usize,
+        lwork: i32,
+        h: &mut CudaSlice<f64>,
+        workspace: &mut CudaSlice<f64>,
+        info_dev: &mut CudaSlice<i32>,
+    ) -> Result<(), String> {
+        let p_i = to_i32(p)?;
+        let uplo = cusolver_sys::cublasFillMode_t::CUBLAS_FILL_MODE_LOWER;
+        {
+            let (h_ptr, _h_record) = h.device_ptr_mut(stream);
+            let (work_ptr, _work_record) = workspace.device_ptr_mut(stream);
+            let (info_ptr, _info_record) = info_dev.device_ptr_mut(stream);
+            // SAFETY: cuSOLVER potrf; h is p*p col-major, workspace was sized
+            // by potrf_query_lwork, info_dev is a pre-allocated 1-element i32
+            // device buffer. All buffers are live on the same stream.
+            let status = unsafe {
+                cusolver_sys::cusolverDnDpotrf(
+                    solver.cu(),
+                    uplo,
+                    p_i,
+                    h_ptr as *mut f64,
+                    p_i,
+                    work_ptr as *mut f64,
+                    lwork,
+                    info_ptr as *mut i32,
+                )
+            };
+            check_cusolver(status, "cusolverDnDpotrf")?;
+        }
+        Ok(())
+    }
+
+    /// POTRS triangular solve using a pre-allocated info buffer.
+    ///
+    /// Does not allocate, does not download `info`. The caller is responsible
+    /// for calling [`check_deferred_potrs_info`] at end-of-fit.
+    pub(crate) fn potrs_in_place_reuse(
+        solver: &DnHandle,
+        stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+        p: usize,
+        nrhs: usize,
+        h: &CudaSlice<f64>,
+        rhs: &mut CudaSlice<f64>,
+        info_dev: &mut CudaSlice<i32>,
+    ) -> Result<(), String> {
+        let p_i = to_i32(p)?;
+        let nrhs_i = to_i32(nrhs)?;
+        let uplo = cusolver_sys::cublasFillMode_t::CUBLAS_FILL_MODE_LOWER;
+        {
+            let (h_ptr, _h_record) = h.device_ptr(stream);
+            let (rhs_ptr, _rhs_record) = rhs.device_ptr_mut(stream);
+            let (info_ptr, _info_record) = info_dev.device_ptr_mut(stream);
+            // SAFETY: cuSOLVER potrs; h is a p*p Cholesky factor, rhs is p*nrhs,
+            // info_dev is a pre-allocated 1-element i32 device buffer.
+            let status = unsafe {
+                cusolver_sys::cusolverDnDpotrs(
+                    solver.cu(),
+                    uplo,
+                    p_i,
+                    nrhs_i,
+                    h_ptr as *const f64,
+                    p_i,
+                    rhs_ptr as *mut f64,
+                    p_i,
+                    info_ptr as *mut i32,
+                )
+            };
+            check_cusolver(status, "cusolverDnDpotrs")?;
+        }
+        Ok(())
+    }
+
+    /// Download the POTRF deferred info scalar and return an error if non-zero.
+    ///
+    /// Called once at end-of-fit (or whenever the convergence loop exits) to
+    /// surface any factorization failure that was deferred device-side by
+    /// [`potrf_in_place_reuse`].
+    pub(crate) fn check_deferred_potrf_info(
+        stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+        info_dev: &CudaSlice<i32>,
+    ) -> Result<(), String> {
+        let info_host = stream
+            .clone_dtoh(info_dev)
+            .map_err(|e| format!("download deferred potrf info: {e}"))?;
+        if info_host[0] == 0 {
+            Ok(())
+        } else {
+            Err(format!(
+                "cusolverDnDpotrf returned info={} (detected at end-of-fit)",
+                info_host[0]
+            ))
+        }
+    }
+
+    /// Download the POTRS deferred info scalar and return an error if non-zero.
+    ///
+    /// Mirrors [`check_deferred_potrf_info`] for the triangular-solve step.
+    pub(crate) fn check_deferred_potrs_info(
+        stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+        info_dev: &CudaSlice<i32>,
+    ) -> Result<(), String> {
+        let info_host = stream
+            .clone_dtoh(info_dev)
+            .map_err(|e| format!("download deferred potrs info: {e}"))?;
+        if info_host[0] == 0 {
+            Ok(())
+        } else {
+            Err(format!(
+                "cusolverDnDpotrs returned info={} (detected at end-of-fit)",
+                info_host[0]
+            ))
+        }
+    }
+
     pub(crate) fn cholesky_logdet_from_col_major(factor: &[f64], p: usize) -> f64 {
         let factor = MatRef::from_column_major_slice(factor, p, p);
         cholesky_factor_logdet(factor)
@@ -259,7 +421,9 @@ mod cuda {
 
 #[cfg(target_os = "linux")]
 pub(crate) use cuda::{
-    cholesky_logdet_from_col_major, context_and_stream, pinned_htod, potrf_in_place, potrs_in_place,
+    check_deferred_potrf_info, check_deferred_potrs_info, cholesky_logdet_from_col_major,
+    context_and_stream, pinned_htod, potrf_in_place, potrf_in_place_reuse, potrf_query_lwork,
+    potrs_in_place, potrs_in_place_reuse,
 };
 
 pub fn cholesky_solve_gpu(

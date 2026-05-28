@@ -1673,6 +1673,11 @@ pub struct ArrowFactorCache {
     /// Row-system tag for the cached per-row factors, cross-blocks, and
     /// shared-block diagonal used to build the Schur factor.
     pub row_hessian_fingerprint: u64,
+    /// PCG instrumentation from the solve that produced this cache.
+    ///
+    /// Zero-valued (default) when the selected mode did not use PCG
+    /// (i.e. `Direct` or `SqrtBA`).
+    pub pcg_diagnostics: PcgDiagnostics,
 }
 
 impl ArrowFactorCache {
@@ -1918,6 +1923,7 @@ pub fn solve_arrow_newton_step_with_options(
         k: sys.k,
         manifold_mode_fingerprint: sys.manifold_mode_fingerprint,
         row_hessian_fingerprint: sys.current_row_hessian_fingerprint(),
+        pcg_diagnostics: step.pcg_diagnostics,
     };
     Ok((step.delta_t, step.delta_beta, cache))
 }
@@ -1971,12 +1977,16 @@ pub fn solve_with_lm_escalation_inner(
     options: &ArrowSolveOptions,
 ) -> Result<(Array1<f64>, Array1<f64>), ArrowSchurError> {
     let mut proximal_ridge = 0.0_f64;
+    let mut escalations: usize = 0;
     let mut last_err: Option<ArrowSchurError> = None;
     for attempt in 0..=DEFAULT_PROXIMAL_MAX_ATTEMPTS {
         let damped_ridge_t = ridge_t + proximal_ridge;
         let damped_ridge_beta = ridge_beta + proximal_ridge;
-        match solve_arrow_newton_step_core(sys, damped_ridge_t, damped_ridge_beta, options) {
-            Ok(pair) => return Ok(pair),
+        match solve_arrow_newton_step_artifacts(sys, damped_ridge_t, damped_ridge_beta, options) {
+            Ok(mut step) => {
+                step.pcg_diagnostics.ridge_escalations = escalations;
+                return Ok((step.delta_t, step.delta_beta));
+            }
             Err(err) => {
                 let recoverable = matches!(
                     err,
@@ -1996,6 +2006,7 @@ pub fn solve_with_lm_escalation_inner(
                 } else {
                     proximal_ridge * DEFAULT_PROXIMAL_RIDGE_GROWTH
                 };
+                escalations += 1;
             }
         }
     }
@@ -2249,6 +2260,7 @@ struct ArrowNewtonStepArtifacts {
     delta_beta: Array1<f64>,
     htt_factors: Vec<Array2<f64>>,
     schur_factor: Option<Array2<f64>>,
+    pcg_diagnostics: PcgDiagnostics,
 }
 
 fn solve_arrow_newton_step_artifacts(
@@ -2265,6 +2277,7 @@ fn solve_arrow_newton_step_artifacts(
             delta_beta,
             htt_factors: Vec::new(),
             schur_factor,
+            pcg_diagnostics: PcgDiagnostics::default(),
         });
     }
     let n = sys.rows.len();
@@ -2284,19 +2297,21 @@ fn solve_arrow_newton_step_artifacts(
     let trust_metric_weights = None;
 
     // 3. Solve reduced shared system using the selected BA mode.
-    let (delta_beta, schur_factor) = match options.mode {
+    let (delta_beta, schur_factor, pcg_diagnostics) = match options.mode {
         ArrowSolverMode::Direct => {
             let schur = build_dense_schur_direct(sys, &htt_factors, ridge_beta, &backend)?;
-            solve_dense_reduced_system(&schur, &rhs_beta, options, trust_metric_weights)?
+            let (db, sf, diag) = solve_dense_reduced_system(&schur, &rhs_beta, options, trust_metric_weights)?;
+            (db, sf, diag)
         }
         ArrowSolverMode::SqrtBA => {
             let schur = build_dense_schur_sqrt_ba(sys, &htt_factors, ridge_beta, &backend)?;
-            solve_dense_reduced_system(&schur, &rhs_beta, options, trust_metric_weights)?
+            let (db, sf, diag) = solve_dense_reduced_system(&schur, &rhs_beta, options, trust_metric_weights)?;
+            (db, sf, diag)
         }
         ArrowSolverMode::InexactPCG => {
             let preconditioner =
                 JacobiPreconditioner::from_arrow_schur(sys, &htt_factors, ridge_beta, &backend)?;
-            let delta = steihaug_pcg_reduced_system(
+            let (delta, diag) = steihaug_pcg_reduced_system(
                 sys,
                 &htt_factors,
                 ridge_beta,
@@ -2307,7 +2322,7 @@ fn solve_arrow_newton_step_artifacts(
                 &backend,
                 trust_metric_weights,
             )?;
-            (delta, None)
+            (delta, None, diag)
         }
     };
 
@@ -2341,6 +2356,7 @@ fn solve_arrow_newton_step_artifacts(
         delta_beta,
         htt_factors,
         schur_factor,
+        pcg_diagnostics,
     })
 }
 
@@ -2432,19 +2448,19 @@ fn solve_dense_reduced_system(
     rhs_beta: &Array1<f64>,
     options: &ArrowSolveOptions,
     metric_weights: Option<&MetricWeights>,
-) -> Result<(Array1<f64>, Option<Array2<f64>>), ArrowSchurError> {
+) -> Result<(Array1<f64>, Option<Array2<f64>>, PcgDiagnostics), ArrowSchurError> {
     let factor =
         cholesky_lower(schur).map_err(|e| ArrowSchurError::SchurFactorFailed { reason: e })?;
     let direct = chol_solve_vector(&factor, rhs_beta);
     if step_inside_trust_region(direct.view(), options.trust_region.radius, metric_weights) {
-        return Ok((direct, Some(factor)));
+        return Ok((direct, Some(factor), PcgDiagnostics::default()));
     }
 
     // Ceres-style trust-region correction: once the dense BA solve proposes a
     // step outside the trust ball, Steihaug-CG returns the boundary point
     // without requiring a second dense factorization.
     let identity = IdentityPreconditioner;
-    let delta = steihaug_dense_system(
+    let (delta, diag) = steihaug_dense_system(
         schur,
         rhs_beta,
         &identity,
@@ -2455,7 +2471,7 @@ fn solve_dense_reduced_system(
         &options.trust_region,
         metric_weights,
     )?;
-    Ok((delta, Some(factor)))
+    Ok((delta, Some(factor), diag))
 }
 
 fn step_inside_trust_region(
@@ -2643,7 +2659,7 @@ fn steihaug_cg<MatVec, ApplyPrec>(
     relative_tolerance: f64,
     trust_radius: f64,
     metric_weights: Option<&MetricWeights>,
-) -> Result<Array1<f64>, ArrowSchurError>
+) -> Result<(Array1<f64>, PcgDiagnostics), ArrowSchurError>
 where
     MatVec: FnMut(&Array1<f64>, &mut Array1<f64>),
     ApplyPrec: FnMut(&Array1<f64>) -> Array1<f64>,
@@ -2663,35 +2679,52 @@ where
     };
     let rhs_norm = metric_norm(rhs.view(), metric_weights);
     if rhs_norm == 0.0 {
-        return Ok(Array1::<f64>::zeros(n));
+        return Ok((Array1::<f64>::zeros(n), PcgDiagnostics::default()));
     }
     let tol = relative_tolerance.max(0.0) * rhs_norm;
     let mut x = Array1::<f64>::zeros(n);
     let mut r = rhs.clone();
     let mut z = apply_preconditioner(&r);
+    let mut diag = PcgDiagnostics {
+        precond_apply_calls: 1,
+        ..PcgDiagnostics::default()
+    };
     let mut p = z.clone();
     let mut rz = metric_dot(&r, &z, metric_weights);
     if rz <= 0.0 || !rz.is_finite() {
         if radius.is_finite() {
-            return Ok(step_to_trust_boundary(&x, &r, radius, metric_weights));
+            diag.final_relative_residual =
+                metric_norm(r.view(), metric_weights) / rhs_norm;
+            diag.stopping_reason = PcgStopReason::TrustRegion;
+            return Ok((step_to_trust_boundary(&x, &r, radius, metric_weights), diag));
         }
         return Err(ArrowSchurError::PcgFailed {
             reason: "non-positive preconditioned residual in Schur PCG".to_string(),
         });
     }
     if metric_norm(r.view(), metric_weights) <= tol {
-        return Ok(x);
+        diag.final_relative_residual = 0.0;
+        diag.stopping_reason = PcgStopReason::Converged;
+        return Ok((x, diag));
     }
     let mut ap = Array1::<f64>::zeros(n);
     // Reused candidate scratch — avoid per-iteration clone of x.
     let mut candidate = Array1::<f64>::zeros(n);
     for _ in 0..max_iterations {
         matvec(&p, &mut ap);
+        diag.matvec_calls += 1;
+        diag.iterations += 1;
         let pap = metric_dot(&p, &ap, metric_weights);
         if pap <= 0.0 || !pap.is_finite() {
             if radius.is_finite() {
-                return Ok(step_to_trust_boundary(&x, &p, radius, metric_weights));
+                diag.final_relative_residual =
+                    metric_norm(r.view(), metric_weights) / rhs_norm;
+                diag.stopping_reason = PcgStopReason::TrustRegion;
+                return Ok((step_to_trust_boundary(&x, &p, radius, metric_weights), diag));
             }
+            diag.final_relative_residual =
+                metric_norm(r.view(), metric_weights) / rhs_norm;
+            diag.stopping_reason = PcgStopReason::Indefinite;
             return Err(ArrowSchurError::PcgFailed {
                 reason: "negative curvature in unbounded Schur PCG".to_string(),
             });
@@ -2701,18 +2734,28 @@ where
             candidate[i] = x[i] + alpha * p[i];
         }
         if radius.is_finite() && metric_norm(candidate.view(), metric_weights) >= radius {
-            return Ok(step_to_trust_boundary(&x, &p, radius, metric_weights));
+            diag.final_relative_residual =
+                metric_norm(r.view(), metric_weights) / rhs_norm;
+            diag.stopping_reason = PcgStopReason::TrustRegion;
+            return Ok((step_to_trust_boundary(&x, &p, radius, metric_weights), diag));
         }
         x.assign(&candidate);
         for i in 0..n {
             r[i] -= alpha * ap[i];
         }
         if metric_norm(r.view(), metric_weights) <= tol {
-            return Ok(x);
+            diag.final_relative_residual =
+                metric_norm(r.view(), metric_weights) / rhs_norm;
+            diag.stopping_reason = PcgStopReason::Converged;
+            return Ok((x, diag));
         }
         z = apply_preconditioner(&r);
+        diag.precond_apply_calls += 1;
         let rz_next = metric_dot(&r, &z, metric_weights);
         if rz_next <= 0.0 || !rz_next.is_finite() {
+            diag.final_relative_residual =
+                metric_norm(r.view(), metric_weights) / rhs_norm;
+            diag.stopping_reason = PcgStopReason::Stagnation;
             return Err(ArrowSchurError::PcgFailed {
                 reason: "non-positive or non-finite PCG residual".to_string(),
             });
@@ -2723,7 +2766,9 @@ where
         }
         rz = rz_next;
     }
-    Ok(x)
+    diag.final_relative_residual = metric_norm(r.view(), metric_weights) / rhs_norm;
+    diag.stopping_reason = PcgStopReason::MaxIter;
+    Ok((x, diag))
 }
 
 fn step_to_trust_boundary(

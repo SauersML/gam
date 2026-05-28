@@ -36,7 +36,7 @@ use crate::linalg::utils::{
     KahanSum, add_relative_diag_ridge, enforce_symmetry, matrix_inversewith_regularization,
     row_mismatch_message,
 };
-use crate::matrix::{DesignMatrix, LinearOperator};
+use crate::matrix::{DesignMatrix, FactorizedSystem, LinearOperator};
 use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
 use crate::pirls::{self, PirlsResult};
 use crate::seeding::{SeedConfig, SeedRiskProfile};
@@ -3513,7 +3513,9 @@ where
     let mut beta_standard_errors_corrected = None;
     let mut beta_covariance_frequentist = None;
     let mut coefficient_influence = None;
-    let mut covariance_is_diagonal_only = false;
+    // Factorization of stabilized Hessian in transformed basis, reused for
+    // SE computation via solve-on-demand after dispersion is determined.
+    let mut edf_factor: Option<Box<dyn FactorizedSystem>> = None;
     let mut bias_correction_beta = None;
 
     if opts.compute_inference {
@@ -3632,6 +3634,9 @@ where
                 log::warn!("bias-correction solve failed: {e}");
             }
         }
+        // Preserve the factorization for solve-on-demand SE and covariance
+        // computation below, after dispersion has been determined.
+        edf_factor = Some(factor);
     }
 
     // Persist residual-based scale for Gaussian identity models.
@@ -3694,51 +3699,53 @@ where
 
     if opts.compute_inference {
         penalized_hessian = map_hessian_to_original_basis(&pirls_res)?;
-        // Guard: full p×p covariance inversion is O(p³) and only viable for
-        // small-to-medium models. For large models, fall back to diagonal-only
-        // standard errors from the Hessian diagonal.
-        const COV_MAX_P: usize = 5_000;
         let p_cov = penalized_hessian.nrows();
-        let diag_fallback = || {
-            let mut diag_inv = Array2::<f64>::zeros(penalized_hessian.dim());
-            for i in 0..p_cov {
-                let d = penalized_hessian[[i, i]];
-                if d > 0.0 {
-                    diag_inv[[i, i]] = 1.0 / d;
-                }
-            }
-            diag_inv
-        };
-        let beta_covariance_unscaled = if p_cov > COV_MAX_P {
-            log::warn!(
-                "skipping full posterior covariance inversion (p={p_cov} > {COV_MAX_P}): \
-                 using diagonal-only standard errors"
-            );
-            covariance_is_diagonal_only = true;
-            Some(diag_fallback())
-        } else {
+        let qs = &pirls_res.reparam_result.qs;
+
+        // Auto-select covariance strategy based on model size.
+        //
+        // For small-to-medium models (p ≤ COV_FULL_INVERSE_MAX_P) we can afford
+        // the full p×p inverse: O(p³) compute, O(p²) memory. The full matrix is
+        // needed for the frequentist covariance Ve = H⁻¹ X'WX H⁻¹ φ, the
+        // influence matrix F = H⁻¹ X'WX, and the smoothing-parameter correction.
+        //
+        // For large models we use solve-on-demand against the Cholesky factor
+        // already computed for EDF traces above. We solve H_t Z_t = Qs^T in
+        // column chunks of size COV_SE_CHUNK, then extract the diagonal of
+        // Qs · Z_t = H_orig⁻¹ to get exact posterior SEs without ever
+        // materialising the p×p inverse. Prediction bands continue to work via
+        // the factorised-Hessian path in PredictionCovarianceBackend::Factorized.
+        const COV_FULL_INVERSE_MAX_P: usize = 10_000;
+        const COV_SE_CHUNK: usize = 512;
+
+        // Attempt the full inverse when the model is small enough.
+        let beta_covariance_unscaled: Option<Array2<f64>> = if p_cov <= COV_FULL_INVERSE_MAX_P {
             match matrix_inversewith_regularization(&penalized_hessian, "posterior covariance") {
-                Some(cov_unscaled) => Some(cov_unscaled),
+                Some(h_inv) => Some(h_inv),
                 None => {
                     log::warn!(
-                        "full posterior covariance inversion failed (p={p_cov}): \
-                         falling back to diagonal-only standard errors"
+                        "posterior covariance inversion failed (p={p_cov}): \
+                         falling back to solve-on-demand standard errors"
                     );
-                    covariance_is_diagonal_only = true;
-                    Some(diag_fallback())
+                    None
                 }
             }
+        } else {
+            None
         };
-        beta_covariance = beta_covariance_unscaled.as_ref().map(|cov| {
-            crate::inference::dispersion_cov::PhiScaledCovariance::wrap(scaled_covariance(
-                cov.clone(),
-                dispersion_phi,
-            ))
-        });
 
-        if let Some(h_inv) = beta_covariance_unscaled.as_ref()
-            && !covariance_is_diagonal_only
-        {
+        if let Some(ref h_inv) = beta_covariance_unscaled {
+            // Full inverse available: wrap as phi-scaled covariance, compute
+            // frequentist quantities, and pass to smoothing-correction cubature.
+            beta_covariance = Some(
+                crate::inference::dispersion_cov::PhiScaledCovariance::wrap(scaled_covariance(
+                    h_inv.clone(),
+                    dispersion_phi,
+                )),
+            );
+
+            // Frequentist covariance Ve = F H⁻¹ φ and influence matrix F = H⁻¹ X'WX.
+            // Both require the full unscaled inverse; computed in original basis.
             let mut s_mat = Array2::<f64>::zeros((p_cov, p_cov));
             for (kk, cp) in pirls_res
                 .reparam_result
@@ -3768,6 +3775,9 @@ where
             beta_covariance_frequentist = Some(ve);
         }
 
+        // Smoothing-parameter correction (first-order delta + optional cubature).
+        // Passes None for large models; compute_smoothing_correction_auto falls
+        // back to first-order correction when no base covariance is supplied.
         let smoothing_outcome = reml_state.compute_smoothing_correction_auto(
             &final_rho,
             &pirls_res,
@@ -3775,9 +3785,64 @@ where
             finalgrad_norm,
         );
         smoothing_correction = smoothing_outcome.into_correction();
-        beta_standard_errors = beta_covariance
-            .as_ref()
-            .map(|c| se_from_covariance(c.as_array()));
+
+        // Standard errors: prefer the diagonal of the full inverse when
+        // available; otherwise use the factorised Hessian from the EDF pass
+        // (in transformed basis) to compute exact diagonal of H_orig⁻¹ =
+        // Qs H_t⁻¹ Qs' via chunked solve-on-demand. Memory per chunk:
+        // 2 × p × COV_SE_CHUNK × 8 bytes.
+        beta_standard_errors = if let Some(ref h_inv) = beta_covariance_unscaled {
+            // Fast path: SE from stored full inverse (already phi-scaled via
+            // beta_covariance, but we need the unscaled diagonal here).
+            let raw_se = Array1::from_iter(
+                h_inv.diag().iter().map(|&v| (dispersion_phi * v.max(0.0)).sqrt()),
+            );
+            Some(raw_se)
+        } else if let Some(ref factor_t) = edf_factor {
+            // Solve-on-demand: process columns of Qs in chunks.
+            // (H_orig⁻¹)_{ii} = Qs[i,:] · H_t⁻¹ · Qs[:,i]
+            // Batch: solve H_t Z_chunk = Qs[:,col..col+chunk], extract dot.
+            let p_t = qs.ncols();
+            let mut diag_inv = Array1::<f64>::zeros(p_cov);
+            let mut col_start = 0usize;
+            while col_start < p_cov {
+                let col_end = (col_start + COV_SE_CHUNK).min(p_cov);
+                let chunk = col_end - col_start;
+                // RHS: p_t rows × chunk cols (columns col_start..col_end of Qs^T)
+                let rhs = qs.t().slice(ndarray::s![.., col_start..col_end]).to_owned();
+                debug_assert_eq!(rhs.nrows(), p_t);
+                debug_assert_eq!(rhs.ncols(), chunk);
+                match factor_t.solvemulti(&rhs) {
+                    Ok(z_chunk) => {
+                        // z_chunk is p_t × chunk; (H_orig⁻¹)_{i,i} = Qs[i,:] · z_chunk[:,i-col_start]
+                        for local_i in 0..chunk {
+                            let global_i = col_start + local_i;
+                            let qs_row = qs.row(global_i);
+                            let z_col = z_chunk.column(local_i);
+                            diag_inv[global_i] = qs_row.dot(&z_col);
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "SE solve-on-demand failed at chunk {col_start}..{col_end}: {e}"
+                        );
+                        // Leave remaining entries as 0 (no SE).
+                        break;
+                    }
+                }
+                col_start = col_end;
+            }
+            let se = diag_inv.mapv(|v| (dispersion_phi * v.max(0.0)).sqrt());
+            if se.iter().all(|v| v.is_finite()) {
+                Some(se)
+            } else {
+                log::warn!("SE solve-on-demand produced non-finite entries; discarding");
+                None
+            }
+        } else {
+            None
+        };
+
         beta_covariance_corrected = match (&beta_covariance, &smoothing_correction) {
             (Some(base_cov), Some(corr)) if base_cov.as_array().dim() == corr.dim() => {
                 let mut corrected = base_cov.as_array().clone();
@@ -3812,7 +3877,6 @@ where
         beta_standard_errors_corrected,
         beta_covariance_frequentist,
         coefficient_influence,
-        covariance_is_diagonal_only,
         bias_correction_beta,
     });
 
@@ -4080,9 +4144,6 @@ pub struct FitInference {
     /// Coefficient-space influence matrix F = H⁻¹ X'WX. Its trace is the total EDF.
     #[serde(default)]
     pub coefficient_influence: Option<Array2<f64>>,
-    /// True when covariance was forced to diagonal-only because dense inversion was unavailable.
-    #[serde(default)]
-    pub covariance_is_diagonal_only: bool,
     /// O(n⁻¹) frequentist bias-correction vector b̂ = H⁻¹ S(λ̂) β̂ in the
     /// original (untransformed) coefficient basis. Predictions apply
     /// η̂_BC(x) = η̂(x) + s_*(x)^T b̂ to remove first-order shrinkage bias.
@@ -5100,14 +5161,6 @@ impl UnifiedFitResult {
     /// Dispersion used to scale covariance matrices.
     pub fn dispersion(&self) -> Option<Dispersion> {
         self.inference.as_ref().map(|inf| inf.dispersion)
-    }
-
-    /// True when covariance matrices were reduced to a diagonal-only fallback.
-    pub fn covariance_is_diagonal_only(&self) -> bool {
-        self.inference
-            .as_ref()
-            .map(|inf| inf.covariance_is_diagonal_only)
-            .unwrap_or(false)
     }
 
     /// Get the smoothing-parameter-corrected beta covariance if available.
@@ -6808,7 +6861,6 @@ mod estimate_policy_tests {
                 beta_standard_errors_corrected: Some(array![1.2_f64.sqrt(), 2.2_f64.sqrt()]),
                 beta_covariance_frequentist: None,
                 coefficient_influence: None,
-                covariance_is_diagonal_only: false,
                 bias_correction_beta: None,
             }),
             fitted_link: FittedLinkState::Standard(None),

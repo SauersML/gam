@@ -8200,7 +8200,7 @@ impl<'a> RemlState<'a> {
         bundle: &EvalShared,
         mode: super::unified::EvalMode,
     ) -> Result<super::assembly::InnerAssembly<'static>, EstimationError> {
-        use super::unified::{DenseSpectralOperator, PseudoLogdetMode};
+        use super::unified::{DenseCholeskyValueOnlyOperator, DenseSpectralOperator, PseudoLogdetMode};
         use std::borrow::Cow;
 
         let pirls_result = bundle.pirls_result.as_ref();
@@ -8242,14 +8242,47 @@ impl<'a> RemlState<'a> {
             PseudoLogdetMode::Smooth
         };
 
-        let hessian_op = std::sync::Arc::new(
-            DenseSpectralOperator::from_symmetric_with_mode(h_for_operator.as_ref(), hessian_mode)
-                .map_err(|e| {
-                    EstimationError::InvalidInput(format!(
-                        "DenseSpectralOperator from PIRLS Hessian: {e}"
-                    ))
-                })?,
-        );
+        // For ValueOnly evaluations on the SPD fast path (no Firth, no hard
+        // linear constraints), use a Cholesky-backed operator.  LLT costs
+        // O(p³/3) versus the O(9·p³) full eigendecomposition, giving a
+        // multi-× speedup per line-search probe.  ValueOnly returns before
+        // any gradient trace call, so the operator only needs to serve
+        // `logdet()` and `solve()`/`solve_multi()` — both provided by LLT.
+        //
+        // If LLT fails (near-singular Hessian), fall through to the spectral
+        // operator so the soft-floor regularization can handle it.
+        let hessian_op: std::sync::Arc<dyn super::unified::HessianOperator> =
+            if mode == super::unified::EvalMode::ValueOnly
+                && matches!(hessian_mode, PseudoLogdetMode::Smooth)
+                && free_basis_opt.is_none()
+            {
+                match DenseCholeskyValueOnlyOperator::from_spd(h_for_operator.as_ref()) {
+                    Ok(chol_op) => std::sync::Arc::new(chol_op),
+                    Err(_) => std::sync::Arc::new(
+                        DenseSpectralOperator::from_symmetric_with_mode(
+                            h_for_operator.as_ref(),
+                            hessian_mode,
+                        )
+                        .map_err(|e| {
+                            EstimationError::InvalidInput(format!(
+                                "DenseSpectralOperator from PIRLS Hessian: {e}"
+                            ))
+                        })?,
+                    ),
+                }
+            } else {
+                std::sync::Arc::new(
+                    DenseSpectralOperator::from_symmetric_with_mode(
+                        h_for_operator.as_ref(),
+                        hessian_mode,
+                    )
+                    .map_err(|e| {
+                        EstimationError::InvalidInput(format!(
+                            "DenseSpectralOperator from PIRLS Hessian: {e}"
+                        ))
+                    })?,
+                )
+            };
 
         let c_nontrivial = pirls_result.solve_c_array.iter().any(|&c| c != 0.0);
         let uses_kron_penalty_logdet = self.kronecker_penalty_system.as_ref().is_some_and(|kron| {

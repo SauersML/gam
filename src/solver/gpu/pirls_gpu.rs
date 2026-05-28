@@ -113,6 +113,18 @@ pub struct SigmaPirlsGpuWorkspace {
     pub(crate) h_dev: cudarc::driver::CudaSlice<f64>,
     pub(crate) rhs_dev: cudarc::driver::CudaSlice<f64>,
     pub(crate) penalty_dev: cudarc::driver::CudaSlice<f64>,
+    /// Pre-allocated cuSOLVER POTRF workspace buffer. Sized once at
+    /// construction via `potrf_query_lwork`; reused every Newton step.
+    pub(crate) potrf_work_dev: cudarc::driver::CudaSlice<f64>,
+    /// Number of f64 elements in `potrf_work_dev`, stored as i32 to match
+    /// the cuSOLVER API signature for cusolverDnDpotrf.
+    pub(crate) potrf_lwork: i32,
+    /// Deferred POTRF info scalar. Stays device-resident across all PIRLS
+    /// Newton steps; downloaded once at end-of-fit via
+    /// `check_deferred_potrf_info`.
+    pub(crate) potrf_info_dev: cudarc::driver::CudaSlice<i32>,
+    /// Deferred POTRS info scalar. Mirrors the POTRF discipline.
+    pub(crate) potrs_info_dev: cudarc::driver::CudaSlice<i32>,
     pub(crate) n: usize,
     pub(crate) p: usize,
 }
@@ -125,7 +137,11 @@ pub(crate) mod cuda {
     };
     use crate::gpu::common::PtxModuleCache;
     use crate::gpu::driver::{from_col_major, to_col_major};
-    use crate::gpu::solver::{context_and_stream, pinned_htod, potrf_in_place, potrs_in_place};
+    use crate::gpu::solver::{
+        check_deferred_potrf_info, check_deferred_potrs_info, context_and_stream, pinned_htod,
+        potrf_in_place, potrf_in_place_reuse, potrf_query_lwork, potrs_in_place,
+        potrs_in_place_reuse,
+    };
     use cudarc::cublas::sys::{
         cublasDdgmm, cublasDgeam, cublasOperation_t, cublasSideMode_t, cublasStatus_t,
     };

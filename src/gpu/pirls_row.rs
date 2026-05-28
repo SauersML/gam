@@ -109,13 +109,21 @@ impl PirlsRowFamily {
         }
     }
 
-    /// True for `(response, canonical-link)` pairs: w_hessian == w_fisher.
+    /// True for `(response, canonical-link)` pairs where observed information
+    /// equals Fisher information exactly, so `w_hessian == w_fisher` for both
+    /// curvature modes.
+    ///
+    /// Gamma-LOG is **non-canonical**: the canonical Gamma link is the
+    /// reciprocal 1/μ, not log. Under a log link the observed Hessian weight
+    /// is `w_F · y/μ` (shape-independent; the shape cancels), which differs
+    /// from the Fisher weight `w_F` whenever `y ≠ μ`. Consequently
+    /// `CurvatureMode::Observed` produces a different `w_hessian` for
+    /// Gamma-log, and it must not be short-circuited via a canonical-family
+    /// check.
     pub const fn is_canonical(self) -> bool {
         match self {
-            Self::BernoulliLogit | Self::PoissonLog | Self::GaussianIdentity | Self::GammaLog => {
-                true
-            }
-            Self::BernoulliProbit | Self::BernoulliCLogLog => false,
+            Self::BernoulliLogit | Self::PoissonLog | Self::GaussianIdentity => true,
+            Self::GammaLog | Self::BernoulliProbit | Self::BernoulliCLogLog => false,
         }
     }
 }
@@ -206,17 +214,19 @@ fn clamp_eta(eta: f64) -> (f64, bool) {
 
 /// Reference CPU evaluator for one row. `mode` selects `w_hessian` curvature.
 ///
-/// Stage 1 keeps `CurvatureMode::Fisher` and `CurvatureMode::Observed` numerically
-/// identical for every family; Stage 5 introduces the observed-information
-/// branch for Gamma-log + non-canonical Bernoulli. The `mode` argument flows
-/// through every family helper today so the dispatch path is in place when
-/// Stage 5 lands the math, and so the kernel module cache key already keys on
-/// the curvature surface.
-pub fn row_reweight_cpu(family: PirlsRowFamily, mode: CurvatureMode, input: RowInput) -> RowOutput {
+/// `gamma_shape` is the Gamma dispersion shape parameter (α > 0). It is only
+/// used when `family == GammaLog`; all other families ignore it. Pass `1.0`
+/// for non-Gamma fits.
+pub fn row_reweight_cpu(
+    family: PirlsRowFamily,
+    mode: CurvatureMode,
+    input: RowInput,
+    gamma_shape: f64,
+) -> RowOutput {
     match family {
         PirlsRowFamily::GaussianIdentity => row_gaussian_identity(input, mode),
         PirlsRowFamily::PoissonLog => row_poisson_log(input, mode),
-        PirlsRowFamily::GammaLog => row_gamma_log(input, mode),
+        PirlsRowFamily::GammaLog => row_gamma_log(input, mode, gamma_shape),
         PirlsRowFamily::BernoulliLogit => row_bernoulli_logit(input, mode),
         PirlsRowFamily::BernoulliProbit => row_bernoulli_probit(input, mode),
         PirlsRowFamily::BernoulliCLogLog => row_bernoulli_cloglog(input, mode),
@@ -318,12 +328,7 @@ fn row_poisson_log(input: RowInput, mode: CurvatureMode) -> RowOutput {
 }
 
 #[inline]
-fn row_gamma_log(input: RowInput, mode: CurvatureMode) -> RowOutput {
-    // Shape is a per-fit scalar held outside the row contract (Gamma shape
-    // is dispatched via family metadata at iteration setup, not per row).
-    // The Stage-1 reference uses shape = 1 (unit dispersion); Stage 2 ties
-    // the host wrapper to the actual `gamma_shape()` field on the spec.
-    let shape = 1.0;
+fn row_gamma_log(input: RowInput, mode: CurvatureMode, shape: f64) -> RowOutput {
     let (eta_c, clamped) = clamp_eta(input.eta);
     let mu_raw = eta_c.exp();
     let mu_floored = mu_raw < MU_FLOOR_GAMMA;

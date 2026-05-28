@@ -29,6 +29,7 @@ mod linux_impl {
     };
     use crate::solver::gpu::pirls_dispatch::admission_for;
     use crate::solver::gpu::pirls_gpu::{self, cuda};
+    use crate::solver::gpu::cuda_selected;
     use crate::solver::pirls::{
         ExportedLaplaceCurvature, FirthDiagnostics, HessianCurvatureKind, PirlsCoordinateFrame,
         PirlsResult, PirlsStatus, WorkingModelPirlsResult, WorkingState,
@@ -117,12 +118,47 @@ mod linux_impl {
         }
     }
 
+    /// Cheap pre-materialization admission gate. Returns `true` only when
+    /// all of the following hold without touching any O(N·p) work:
+    ///
+    /// - The active solver `Device` is `Cuda` (`cuda_selected()`).
+    /// - A live `GpuRuntime` is present.
+    /// - The (family, curvature) pair is in the JIT-cached set
+    ///   (`admission_for` succeeds).
+    /// - The runtime policy accepts the (n, p) shape
+    ///   (`should_use_gpu_pirls_loop`).
+    ///
+    /// The caller should test this **before** materializing `X·Qs` or any
+    /// other transformed design so that CPU-default / no-runtime /
+    /// policy-rejected paths pay zero `fast_ab` cost.
+    pub fn try_gpu_pirls_loop_admit(
+        likelihood: &crate::types::GlmLikelihoodSpec,
+        n: usize,
+        p: usize,
+    ) -> bool {
+        if !cuda_selected() {
+            return false;
+        }
+        let Some(admission) = admission_for(&likelihood.spec, n, p) else {
+            return false;
+        };
+        let Some(runtime) = GpuRuntime::global() else {
+            return false;
+        };
+        runtime.policy().should_use_gpu_pirls_loop(admission)
+    }
+
     /// Attempt to run the Stage 3.3 device-resident PIRLS loop for the
     /// dispatch input. Returns `Some` only when the loop ran end-to-end
     /// and the full CPU-oracle surface was assembled.
     pub fn try_gpu_pirls_loop_dispatch(
         input: GpuPirlsDispatchInput<'_>,
     ) -> Option<Result<(PirlsResult, WorkingModelPirlsResult), String>> {
+        // Honor the documented Device::Cpu selection — never route to the
+        // GPU loop when the caller has explicitly selected the CPU device.
+        if !cuda_selected() {
+            return None;
+        }
         let n = input.x_transformed.nrows();
         let p = input.x_transformed.ncols();
         // Engine-level admission: shape + family + curvature + runtime probe.
@@ -516,4 +552,4 @@ mod linux_impl {
 }
 
 #[cfg(target_os = "linux")]
-pub use linux_impl::{GpuPirlsDispatchInput, try_gpu_pirls_loop_dispatch};
+pub use linux_impl::{GpuPirlsDispatchInput, try_gpu_pirls_loop_admit, try_gpu_pirls_loop_dispatch};

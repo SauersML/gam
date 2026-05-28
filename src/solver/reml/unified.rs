@@ -14804,6 +14804,98 @@ impl HessianOperator for SparseCholeskyOperator {
 // sensitivity, and basis sensitivity.
 
 // ═══════════════════════════════════════════════════════════════════════════
+//  Cholesky-backed value-only HessianOperator (logdet + solve, no traces)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Dense Cholesky-backed [`HessianOperator`] for `EvalMode::ValueOnly` paths.
+///
+/// When the penalized Hessian is known to be SPD (no Firth bias reduction, no
+/// hard linear constraints, no `HardPseudo` mode), the REML/LAML cost needs
+/// only two Hessian services:
+///
+/// - `logdet()` — used directly in the `½ log|H|` cost term.
+/// - `solve(rhs)` / `solve_multi(rhs)` — used for the optional IFT
+///   cost correction `−½ rᵀ H⁻¹ r`.
+///
+/// An LLT Cholesky factorization delivers both in `O(p³/3)` flops versus
+/// the `O(9·p³)` full eigendecomposition of [`DenseSpectralOperator`], giving
+/// a multi-× speedup per outer REML line-search probe.
+///
+/// Gradient traces (`trace_hinv_product`) are satisfied via column-by-column
+/// forward/back solves so that the operator remains valid if the evaluator
+/// ever reaches a gradient path unexpectedly. Under normal use
+/// `EvalMode::ValueOnly` returns before any trace call.
+pub struct DenseCholeskyValueOnlyOperator {
+    /// LLT Cholesky factor.
+    chol: crate::faer_ndarray::FaerCholeskyFactor,
+    /// `2 · Σ ln(diag L)` — cached at construction time.
+    cached_logdet: f64,
+    /// Full parameter dimension.
+    n_dim: usize,
+}
+
+impl DenseCholeskyValueOnlyOperator {
+    /// Factorize `h` (assumed SPD) via LLT and cache the log-determinant.
+    ///
+    /// Returns `Err` if `h` is not square, not SPD, or contains non-finite
+    /// entries. Callers should fall back to [`DenseSpectralOperator`] on
+    /// failure (e.g. near-singular Hessians that need soft regularization).
+    pub fn from_spd(h: &Array2<f64>) -> Result<Self, String> {
+        use crate::faer_ndarray::FaerCholesky;
+        use faer::Side;
+
+        let n = h.nrows();
+        if n != h.ncols() {
+            return Err(format!(
+                "DenseCholeskyValueOnlyOperator: expected square matrix, got {}×{}",
+                n,
+                h.ncols()
+            ));
+        }
+        let chol = h
+            .cholesky(Side::Lower)
+            .map_err(|e| format!("DenseCholeskyValueOnlyOperator LLT failed: {e}"))?;
+        let diag = chol.diag();
+        let cached_logdet = 2.0 * diag.iter().map(|&d| d.ln()).sum::<f64>();
+        Ok(Self {
+            chol,
+            cached_logdet,
+            n_dim: n,
+        })
+    }
+}
+
+impl HessianOperator for DenseCholeskyValueOnlyOperator {
+    fn logdet(&self) -> f64 {
+        self.cached_logdet
+    }
+
+    fn trace_hinv_product(&self, a: &Array2<f64>) -> f64 {
+        // tr(H⁻¹ A) = Σ_j [H⁻¹ A]_jj.
+        // Compute H⁻¹ A via multi-column solve and sum the diagonal.
+        let hinv_a = self.chol.solve_mat(a);
+        hinv_a.diag().iter().sum()
+    }
+
+    fn solve(&self, rhs: &Array1<f64>) -> Array1<f64> {
+        self.chol.solvevec(rhs)
+    }
+
+    fn solve_multi(&self, rhs: &Array2<f64>) -> Array2<f64> {
+        self.chol.solve_mat(rhs)
+    }
+
+    fn active_rank(&self) -> usize {
+        // LLT succeeded ⟹ all pivots are positive ⟹ full rank.
+        self.n_dim
+    }
+
+    fn dim(&self) -> usize {
+        self.n_dim
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 //  Block-coupled HessianOperator for joint multi-block models
 // ═══════════════════════════════════════════════════════════════════════════
 

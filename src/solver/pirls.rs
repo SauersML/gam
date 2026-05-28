@@ -3716,13 +3716,17 @@ where
     })
 }
 
-fn add_diagonal_to_upper_sparse(
+/// Add `lambda * d2[col]` to every diagonal entry of a sparse upper-triangular
+/// CSC matrix. `d2` must have length `matrix.ncols()`.
+///
+/// Fast path: when all diagonal entries already exist in the sparsity pattern,
+/// the value buffer is cloned and mutated without symbolic reconstruction.
+/// Slow path: triplet rebuild that inserts any missing diagonal entries.
+fn add_scaled_diagonal_to_upper_sparse(
     matrix: &SparseColMat<usize, f64>,
-    diagonal: f64,
+    lambda: f64,
+    d2: &[f64],
 ) -> Result<SparseColMat<usize, f64>, EstimationError> {
-    if diagonal == 0.0 {
-        return Ok(matrix.clone());
-    }
     let (symbolic, values) = matrix.parts();
     let col_ptr = symbolic.col_ptr();
     let row_idx = symbolic.row_idx();
@@ -3740,7 +3744,7 @@ fn add_diagonal_to_upper_sparse(
         for col in 0..matrix.ncols() {
             for idx in col_ptr[col]..col_ptr[col + 1] {
                 if row_idx[idx] == col {
-                    new_values[idx] += diagonal;
+                    new_values[idx] += lambda * d2[col];
                     break;
                 }
             }
@@ -3770,13 +3774,13 @@ fn add_diagonal_to_upper_sparse(
             let row = row_idx[idx];
             let mut value = values[idx];
             if row == col {
-                value += diagonal;
+                value += lambda * d2[col];
                 saw_diag = true;
             }
             triplets.push(Triplet::new(row, col, value));
         }
         if !saw_diag {
-            triplets.push(Triplet::new(col, col, diagonal));
+            triplets.push(Triplet::new(col, col, lambda * d2[col]));
         }
     }
     SparseColMat::try_new_from_triplets(matrix.nrows(), matrix.ncols(), &triplets).map_err(|_| {
@@ -3784,14 +3788,15 @@ fn add_diagonal_to_upper_sparse(
     })
 }
 
-/// Add `delta` to every diagonal entry of an already-built sparse CSC matrix,
-/// mutating its value buffer in place. The symbolic structure is reused — no
-/// reallocation occurs. Errors if any diagonal entry is missing from the
-/// sparsity pattern (which would indicate a real bug, not a fallback case;
-/// callers must materialize diagonals before the first call).
-fn update_sparse_diagonal_in_place(
+/// Add `delta * d2[col]` to every diagonal entry of an already-built sparse
+/// CSC matrix, mutating its value buffer in place. The symbolic structure is
+/// reused — no reallocation occurs. Errors if any diagonal entry is missing
+/// from the sparsity pattern (which would indicate a real bug, not a fallback
+/// case; callers must materialize diagonals before the first call).
+fn update_scaled_diagonal_in_place(
     m: &mut SparseColMat<usize, f64>,
     delta: f64,
+    d2: &[f64],
 ) -> Result<(), String> {
     if delta == 0.0 {
         return Ok(());
@@ -3806,18 +3811,59 @@ fn update_sparse_diagonal_in_place(
         let mut found = false;
         for idx in start..end {
             if row_idx[idx] == col {
-                values[idx] += delta;
+                values[idx] += delta * d2[col];
                 found = true;
                 break;
             }
         }
         if !found {
             return Err(format!(
-                "update_sparse_diagonal_in_place: diagonal entry missing for column {col}"
+                "update_scaled_diagonal_in_place: diagonal entry missing for column {col}"
             ));
         }
     }
     Ok(())
+}
+
+/// Compute the per-coordinate LM damping scale D²[i] from the penalized
+/// Hessian diagonal. Uses `max(H_diag[i], ε)` clamped to `[D2_MIN, D2_MAX]`
+/// so that D² stays in a numerically safe range and is strictly positive.
+///
+/// Using the full penalized-Hessian diagonal (X'WX + Sρ)_ii means D² reflects
+/// the actual curvature in each coordinate and is invariant to the choice of
+/// whether curvature comes from Fisher or observed information — we always
+/// clamp to the Fisher-curvature floor via `max(·, ε)`.
+fn compute_lm_d2(h: &crate::linalg::matrix::SymmetricMatrix) -> Array1<f64> {
+    const D2_EPS: f64 = 1e-8;
+    const D2_MIN: f64 = 1e-8;
+    const D2_MAX: f64 = 1e8;
+    let p = h.nrows();
+    let mut d2 = Array1::<f64>::zeros(p);
+    match h {
+        crate::linalg::matrix::SymmetricMatrix::Dense(mat) => {
+            for i in 0..p {
+                d2[i] = mat[[i, i]].max(D2_EPS).clamp(D2_MIN, D2_MAX);
+            }
+        }
+        crate::linalg::matrix::SymmetricMatrix::Sparse(mat) => {
+            let (symbolic, values) = mat.parts();
+            let col_ptr = symbolic.col_ptr();
+            let row_idx = symbolic.row_idx();
+            for col in 0..p {
+                let start = col_ptr[col];
+                let end = col_ptr[col + 1];
+                let mut diag_val = 0.0_f64;
+                for idx in start..end {
+                    if row_idx[idx] == col {
+                        diag_val = values[idx];
+                        break;
+                    }
+                }
+                d2[col] = diag_val.max(D2_EPS).clamp(D2_MIN, D2_MAX);
+            }
+        }
+    }
+    d2
 }
 
 fn solve_subsystem_direction(
@@ -4966,6 +5012,13 @@ where
         // diagonal so we can apply a delta update (loop_lambda - sparse_applied_lambda)
         // rather than rebuilding the regularized matrix each attempt.
         let mut sparse_applied_lambda = 0.0_f64;
+        // Per-coordinate LM damping scale: D²[i] = clamp(max(H_diag[i], ε),
+        // D2_MIN, D2_MAX). Held constant within an LM rejection cluster (only λ
+        // varies); recomputed whenever state.hessian changes (Fisher fallback).
+        // Using the full penalized-Hessian diagonal avoids the artificial
+        // anisotropy that scalar λI introduces across basis/penalty/latent blocks
+        // with very different column scales.
+        let mut lm_d2 = compute_lm_d2(&state.hessian);
         loop {
             restore_pending_arrow_latent_if_needed(options, &mut pending_arrow_latent_restore);
             pending_arrow_predicted_reduction = None;
@@ -4973,13 +5026,15 @@ where
             lm_attempts_done += 1;
             let attempt_solve_start = std::time::Instant::now();
 
-            // 1. Solve (H + λI)δ = -g
-            // Update diagonal in-place: add (loop_lambda - applied_lambda) to diagonal
+            // 1. Solve (H + λD²)δ = -g
+            // Update diagonal in-place: add (loop_lambda - applied_lambda)*D²[i]
+            // per coordinate instead of a scalar shift. This makes LM damping
+            // invariant to column-scale anisotropy across basis/penalty blocks.
             if let crate::linalg::matrix::SymmetricMatrix::Dense(ref mut dense) = regularized {
                 let delta_lambda = loop_lambda - applied_lambda;
                 let dim = dense.nrows();
                 for i in 0..dim {
-                    dense[[i, i]] += delta_lambda;
+                    dense[[i, i]] += delta_lambda * lm_d2[i];
                 }
                 applied_lambda = loop_lambda;
             }
@@ -4999,14 +5054,23 @@ where
                     // diagonal in place — symbolic structure (col_ptr/row_idx)
                     // is identical, only diagonal values change.
                     if cached_sparse_regularized.is_none() {
-                        let sparse_reg = add_diagonal_to_upper_sparse(h_sparse, loop_lambda)?;
+                        let sparse_reg = add_scaled_diagonal_to_upper_sparse(
+                            h_sparse,
+                            loop_lambda,
+                            lm_d2.as_slice().unwrap(),
+                        )?;
                         cached_sparse_regularized = Some(sparse_reg);
                         sparse_applied_lambda = loop_lambda;
                     } else {
                         let delta = loop_lambda - sparse_applied_lambda;
                         if delta != 0.0 {
                             let cached = cached_sparse_regularized.as_mut().unwrap();
-                            update_sparse_diagonal_in_place(cached, delta).map_err(|e| {
+                            update_scaled_diagonal_in_place(
+                                cached,
+                                delta,
+                                lm_d2.as_slice().unwrap(),
+                            )
+                            .map_err(|e| {
                                 EstimationError::InvalidInput(format!(
                                     "sparse diagonal in-place update failed: {e}"
                                 ))
@@ -5271,18 +5335,16 @@ where
             //     Reduction = m(0) − m(δ) = -(g'δ + 0.5 δ'Hδ)
             // The cached `regularized` / `cached_sparse_regularized` matrices
             // are H + loop_lambda·I (built for the LM step solve), so
-            //     δ'(H+λI)δ = δ'Hδ + λ‖δ‖²    ⇒    δ'Hδ = δ'(H+λI)δ − λ‖δ‖².
-            // Subtracting `0.5·λ·‖δ‖²` from the regularized-matrix quadratic
-            // recovers the bare-H quadratic without re-doing the matvec on
-            // `state.hessian`. (Equivalently, the Madsen-Nielsen-Tingleff
-            // closed form when (H+λI)δ = −g gives Reduction = ½(λ‖δ‖² − g'δ);
-            // for the geodesic-corrected direction that identity no longer
-            // holds, so we keep the explicit matvec form.) Previously the
-            // damped matrix was used directly, which under-predicted the
-            // reduction by exactly ½λ‖δ‖² and biased the LM gain ratio
-            // downward — increasingly so as loop_lambda grew during
-            // rejection-driven damping escalation, causing avoidable
-            // step rejections in the damped regime.
+            //     δ'(H+λD²)δ = δ'Hδ + λ·Σᵢ D²[i]·δᵢ²
+            //               ⇒  δ'Hδ = δ'(H+λD²)δ − λ·Σᵢ D²[i]·δᵢ².
+            // Subtracting `0.5·λ·Σᵢ D²[i]·δᵢ²` from the regularized-matrix
+            // quadratic recovers the bare-H quadratic without re-doing the
+            // matvec on `state.hessian`. With diagonal damping (H + λD²) the
+            // correction term generalises the scalar `λ‖δ‖²` to a D²-weighted
+            // norm; this keeps the gain-ratio numerator calibrated regardless
+            // of the column-scale anisotropy that exists across
+            // basis/penalty/latent/tensor blocks. Cross-coordinate issue #295
+            // (Arrow-Schur predicted reduction) needs the same generalisation.
             let predred_start = std::time::Instant::now();
             let lin = state.gradient.dot(direction);
             let predicted_reduction =
@@ -5294,9 +5356,14 @@ where
                     } else {
                         regularized.dot(direction)
                     };
-                    let dir_sq_norm = direction.dot(direction);
-                    // δ'(H+λI)δ − λ‖δ‖² = δ'Hδ
-                    let quad = 0.5 * (direction.dot(&q_term) - loop_lambda * dir_sq_norm);
+                    // Σᵢ D²[i]·δᵢ²  (D²-weighted squared norm of the step)
+                    let d2_weighted_sq: f64 = direction
+                        .iter()
+                        .zip(lm_d2.iter())
+                        .map(|(di, d2i)| d2i * di * di)
+                        .sum();
+                    // δ'(H+λD²)δ − λ·Σᵢ D²[i]·δᵢ² = δ'Hδ
+                    let quad = 0.5 * (direction.dot(&q_term) - loop_lambda * d2_weighted_sq);
                     -(lin + quad)
                 };
             lm_predred_total += predred_start.elapsed();
@@ -5723,6 +5790,7 @@ where
                             cached_sparse_regularized = None;
                             sparse_applied_lambda = 0.0;
                             loop_lambda = lambda;
+                            lm_d2 = compute_lm_d2(&state.hessian);
                             // Different problem (Hessian curvature changed):
                             // restart the Madsen rejection-factor trajectory.
                             madsen_reject_factor = 2.0;
@@ -5880,6 +5948,7 @@ where
                         cached_sparse_regularized = None;
                         sparse_applied_lambda = 0.0;
                         loop_lambda = lambda;
+                        lm_d2 = compute_lm_d2(&state.hessian);
                         // Different problem (Hessian curvature changed):
                         // restart the Madsen rejection-factor trajectory.
                         madsen_reject_factor = 2.0;
@@ -8063,9 +8132,10 @@ fn solve_penalized_least_squares_implicit(
         // 3. Sparse Cholesky solve (factor reused from step 1)
         let betavec = solve_sparse_spd(&factor, &rhs)?;
 
-        // 4. EDF via sparse factorization
+        // 4. EDF — reuse the sparse Cholesky factor from step 1 to avoid a
+        // second O(nnz·…) factorization of the identical penalized Hessian.
         let h_sym = SymmetricMatrix::Sparse(h_sparse);
-        let edf = calculate_edf_with_penalty(&h_sym, penalty)?;
+        let edf = calculate_edf_from_sparse_factor(&factor, penalty)?;
 
         // 5. Fitted values and scale
         let fitted_vals = {
@@ -8117,32 +8187,49 @@ fn solve_penalized_least_squares_implicit(
     // caller supplied a `GaussianFixedCache` we skip the O(N·p²) dense
     // assembly here and adopt the cached matrix as-is.
     let weights_owned = weights.to_owned();
-    let xtwx_orig = match x_original {
-        // Only materialized dense designs can use the shared dense assembly path.
-        // Lazy operator-backed dense designs route to diag_xtw_x like sparse.
-        DesignMatrix::Dense(x_dense) if x_dense.is_materialized_dense() => {
-            let p = x_dense.ncols();
-            let x_dense = x_dense.to_dense_arc();
-            if workspace.hessian_buf.nrows() != p || workspace.hessian_buf.ncols() != p {
-                workspace.hessian_buf = Array2::zeros((p, p).f());
-            } else {
-                workspace.hessian_buf.fill(0.0);
+    let xtwx_orig = if let Some(cache) = gaussian_fixed_cache {
+        // Cache hit: weights and design are invariant for Gaussian-Identity
+        // across the outer REML loop, so adopt the precomputed XᵀWX directly
+        // and avoid the O(N·p²) dense assembly entirely.
+        debug_assert_eq!(
+            cache.xtwx_orig.nrows(),
+            x_original.ncols(),
+            "GaussianFixedCache XᵀWX rows must match design p"
+        );
+        debug_assert_eq!(
+            cache.xtwx_orig.ncols(),
+            x_original.ncols(),
+            "GaussianFixedCache XᵀWX cols must match design p"
+        );
+        cache.xtwx_orig.clone()
+    } else {
+        match x_original {
+            // Only materialized dense designs can use the shared dense assembly path.
+            // Lazy operator-backed dense designs route to diag_xtw_x like sparse.
+            DesignMatrix::Dense(x_dense) if x_dense.is_materialized_dense() => {
+                let p = x_dense.ncols();
+                let x_dense = x_dense.to_dense_arc();
+                if workspace.hessian_buf.nrows() != p || workspace.hessian_buf.ncols() != p {
+                    workspace.hessian_buf = Array2::zeros((p, p).f());
+                } else {
+                    workspace.hessian_buf.fill(0.0);
+                }
+                PirlsWorkspace::add_dense_xtwx_signed(
+                    &weights_owned,
+                    &mut workspace.weighted_x_chunk,
+                    x_dense.as_ref(),
+                    &mut workspace.hessian_buf,
+                );
+                std::mem::take(&mut workspace.hessian_buf)
             }
-            PirlsWorkspace::add_dense_xtwx_signed(
-                &weights_owned,
-                &mut workspace.weighted_x_chunk,
-                x_dense.as_ref(),
-                &mut workspace.hessian_buf,
-            );
-            std::mem::take(&mut workspace.hessian_buf)
-        }
-        _ => {
-            // Operator-form fallback: sparse designs and lazy operator-backed
-            // dense designs cannot be densified, so route through the signed
-            // XᵀWX operator.
-            crate::matrix::xt_diag_x_signed(x_original, &weights_owned)
-                .map(|h| h.to_dense())
-                .map_err(EstimationError::InvalidInput)?
+            _ => {
+                // Operator-form fallback: sparse designs and lazy operator-backed
+                // dense designs cannot be densified, so route through the signed
+                // XᵀWX operator.
+                crate::matrix::xt_diag_x_signed(x_original, &weights_owned)
+                    .map(|h| h.to_dense())
+                    .map_err(EstimationError::InvalidInput)?
+            }
         }
     };
     let xtwx_orig_asym = max_symmetric_asymmetry(&xtwx_orig);
@@ -8234,8 +8321,9 @@ fn solve_penalized_least_squares_implicit(
     }
     let betavec = workspace.rhs_full.clone();
 
-    // 6. EDF
-    let edf = calculate_edfwithworkspace_with_penalty(&regularizedhessian, penalty, workspace)?;
+    // 6. EDF — reuse the factor already produced in step 5 to avoid a second
+    // O(p³) factorization of the identical regularized Hessian.
+    let edf = calculate_edfwithworkspace_from_factor(&factor, penalty, workspace)?;
 
     // 7. Scale (composed: eta = offset + X Qs beta)
     let qbeta = if let Some(transform) = transform {
