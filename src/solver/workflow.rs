@@ -127,6 +127,19 @@ pub enum WorkflowError {
         context: &'static str,
         source: crate::inference::formula_dsl::FormulaDslError,
     },
+    /// A formula referenced a column that does not exist in the input data.
+    /// Carries the structured payload through to the FFI boundary so the
+    /// Python side can raise `gamfit.ColumnNotFoundError` with `column`,
+    /// `role`, `available`, `similar`, and `tsv_hint` attributes — issue
+    /// #305 / #343 (typed-dispatch migration; no string classification at
+    /// the boundary).
+    ColumnNotFound {
+        name: String,
+        role: Option<String>,
+        available: Vec<String>,
+        similar: Vec<String>,
+        tsv_hint: bool,
+    },
 }
 
 impl std::fmt::Display for WorkflowError {
@@ -137,6 +150,42 @@ impl std::fmt::Display for WorkflowError {
             | WorkflowError::MissingDependency { reason }
             | WorkflowError::IntegrationFailed { reason } => f.write_str(reason),
             WorkflowError::FormulaDsl { context, source } => write!(f, "{context}: {source}"),
+            // Reconstruct the display text from the structured payload so
+            // CLI / `to_string()` consumers see the same prose the legacy
+            // `missing_column_message` produced. The text is a function of
+            // the typed fields — not parsed back out anywhere.
+            WorkflowError::ColumnNotFound {
+                name,
+                role,
+                available,
+                similar,
+                tsv_hint,
+            } => {
+                let label = match role {
+                    Some(r) => format!("{r} column '{name}'"),
+                    None => format!("column '{name}'"),
+                };
+                let tsv_suffix = if *tsv_hint {
+                    " — your file appears to be tab-separated; gam expects comma-separated CSV. \
+         Replace tabs with commas, or pre-convert with `tr '\\t' ',' < file.tsv > file.csv`."
+                } else {
+                    ""
+                };
+                if similar.is_empty() {
+                    write!(
+                        f,
+                        "{label} not found in data. Available columns: [{}]{tsv_suffix}",
+                        available.join(", ")
+                    )
+                } else {
+                    write!(
+                        f,
+                        "{label} not found in data. Did you mean one of [{}]? Full list: [{}]{tsv_suffix}",
+                        similar.join(", "),
+                        available.join(", ")
+                    )
+                }
+            }
         }
     }
 }
@@ -148,7 +197,8 @@ impl std::error::Error for WorkflowError {
             WorkflowError::InvalidConfig { .. }
             | WorkflowError::SchemaMismatch { .. }
             | WorkflowError::MissingDependency { .. }
-            | WorkflowError::IntegrationFailed { .. } => None,
+            | WorkflowError::IntegrationFailed { .. }
+            | WorkflowError::ColumnNotFound { .. } => None,
         }
     }
 }
@@ -168,6 +218,39 @@ impl From<crate::inference::formula_dsl::FormulaDslError> for WorkflowError {
         Self::FormulaDsl {
             context: "workflow formula materialization",
             source: err,
+        }
+    }
+}
+
+/// Typed lift from leaf data-layer errors. `DataError::ColumnNotFound` is
+/// the variant of immediate interest — it preserves the structured fields
+/// so `gam-pyffi` can dispatch to `ColumnNotFoundError` without parsing
+/// human text. Other `DataError` variants degrade to the appropriate
+/// workflow bucket (`SchemaMismatch` for row/column shape problems,
+/// `InvalidConfig` for parse / encoding / empty / invalid-value sources)
+/// since they don't have a dedicated structured destination yet.
+impl From<crate::inference::data::DataError> for WorkflowError {
+    fn from(err: crate::inference::data::DataError) -> Self {
+        use crate::inference::data::DataError;
+        match err {
+            DataError::ColumnNotFound {
+                name,
+                role,
+                available,
+                similar,
+                tsv_hint,
+            } => Self::ColumnNotFound {
+                name,
+                role,
+                available,
+                similar,
+                tsv_hint,
+            },
+            DataError::SchemaMismatch { reason } => Self::SchemaMismatch { reason },
+            DataError::ParseError { reason }
+            | DataError::EncodingFailure { reason }
+            | DataError::EmptyInput { reason }
+            | DataError::InvalidValue { reason } => Self::InvalidConfig { reason },
         }
     }
 }
@@ -2735,147 +2818,49 @@ pub fn is_binary_response(y: ArrayView1<'_, f64>) -> bool {
         .all(|v| (*v - 0.0).abs() < 1e-12 || (*v - 1.0).abs() < 1e-12)
 }
 
-/// Minimum standard-deviation tolerated for a Gaussian response.
+/// Verify that the dataset has at least as many rows as the smooth terms in
+/// `spec` need for their bases to be well-posed.
 ///
-/// Below this the marginal Gaussian REML objective `-n/2·log σ²` blows up
-/// (the saturated MLE σ → 0 sends `log σ²` → -∞ and the REML score → +∞),
-/// surfacing as the cryptic `fit_result.reml_score must be finite, got inf`
-/// downstream (issue #332). The threshold is generous (≈ machine ε scaled by
-/// √n) so well-conditioned scientific data never trips it; only data that is
-/// effectively constant in f64 arithmetic gets rejected pre-fit.
-const GAUSSIAN_RESPONSE_MIN_SD: f64 = 1.0e-10;
-
-/// Pre-flight degeneracy checks on `(y, family, n)` that would otherwise
-/// blow up deep inside REML with an opaque "reml_score must be finite, got
-/// inf" / "cached inner beta has length …" message. Returns a clear,
-/// actionable `WorkflowError::InvalidConfig` instead.
+/// Each [`SmoothBasisSpec`] owns its own `min_sample_rows` lower bound — the
+/// B-spline knot count, the tensor-product column product, the PCA matrix
+/// width — so this helper is a thin sum-and-compare: the workflow has no
+/// per-basis-kind knowledge. Adding a new smooth kind extends the basis
+/// `match` in `min_sample_rows`, not this gate.
 ///
-/// Catches:
-/// * **All-zero / all-one Bernoulli** response (#331): the saturated logit
-///   MLE is ±∞ and the deviance vanishes, sending the Laplace/REML score
-///   to infinity.
-/// * **Near-constant Gaussian** response (#332): the marginal `-n/2·log σ²`
-///   diverges to +∞ when the sample variance is ≤ machine precision.
-/// * **Sample size too small for the formula** (#309): with even one smooth
-///   term we need enough rows to fit the basis; a tiny n with smooths
-///   produces an opaque inner-solver length mismatch instead of a useful
-///   error.
-fn validate_response_degeneracy_and_size(
-    response_family: &ResponseFamily,
+/// Catches the README-quickstart failure mode (#309) where `n=4` against
+/// `y ~ s(x)` would otherwise surface as an opaque `cached inner beta has
+/// length 8` message from the inner-state seeding hook.
+fn check_smooth_capacity(
+    spec: &crate::terms::smooth::TermCollectionSpec,
+    n_rows: usize,
     response_name: &str,
-    y: ArrayView1<'_, f64>,
-    parsed_terms: &[ParsedTerm],
 ) -> Result<(), WorkflowError> {
-    let n = y.len();
-
-    // Sample-size floor — must precede the per-family analysis because n = 0
-    // makes the variance/binary checks meaningless.
-    if n == 0 {
-        return Err(WorkflowError::InvalidConfig {
-            reason: format!(
-                "response column '{response_name}' has zero rows; cannot fit a model on an empty dataset"
-            ),
-        });
+    // Intercept + 1 dof for the smoothing-parameter optimizer.
+    let mut required: usize = 2;
+    let mut per_term: Vec<(String, usize)> = Vec::new();
+    for term in &spec.smooth_terms {
+        let need = term.basis.min_sample_rows();
+        required = required.saturating_add(need);
+        per_term.push((term.name.clone(), need));
     }
-
-    // Per-family degeneracy.
-    match response_family {
-        ResponseFamily::Binomial => {
-            // Detect a fully one-sided binary response. The Bernoulli log-likelihood
-            // is ±∞ at the saturated boundary (π̂ = 0 or 1), so REML returns +∞
-            // and we surface a cryptic finite-value check downstream. Uses the
-            // codebase's existing 1e-12 binarity tolerance.
-            let mut saw_zero = false;
-            let mut saw_one = false;
-            for &yi in y.iter() {
-                if (yi - 0.0).abs() < 1e-12 {
-                    saw_zero = true;
-                } else if (yi - 1.0).abs() < 1e-12 {
-                    saw_one = true;
-                }
-                if saw_zero && saw_one {
-                    break;
-                }
-            }
-            if !(saw_zero && saw_one) {
-                let observed = if saw_one {
-                    "all values are 1 (no non-events)"
-                } else if saw_zero {
-                    "all values are 0 (no events)"
-                } else {
-                    "no rows are exactly 0 or 1"
-                };
-                return Err(WorkflowError::InvalidConfig {
-                    reason: format!(
-                        "Binomial / Bernoulli response '{response_name}' is degenerate: \
-                         {observed}. The maximum-likelihood logit is ±∞ at this boundary, \
-                         so the REML score is not finite. Fix: ensure the response contains \
-                         at least one 0 and at least one 1 (e.g. drop the offending subgroup, \
-                         or refit on a pooled sample that includes both classes)."
-                    ),
-                });
-            }
-        }
-        ResponseFamily::Gaussian => {
-            // Sample standard deviation, two-pass (subtract the mean before
-            // squaring) so the threshold is not perturbed by a large response
-            // offset.
-            let mean: f64 = y.iter().copied().sum::<f64>() / (n as f64);
-            let ssq: f64 = y.iter().map(|&v| (v - mean) * (v - mean)).sum::<f64>();
-            let var = if n > 1 {
-                ssq / ((n - 1) as f64)
-            } else {
-                ssq
-            };
-            let sd = var.sqrt();
-            if !sd.is_finite() || sd <= GAUSSIAN_RESPONSE_MIN_SD {
-                return Err(WorkflowError::InvalidConfig {
-                    reason: format!(
-                        "Gaussian response '{response_name}' is effectively constant \
-                         (sample sd ≈ {sd:.3e} ≤ {GAUSSIAN_RESPONSE_MIN_SD:.0e}); the marginal \
-                         REML log-likelihood −n/2·log σ² diverges to +∞ as σ → 0. \
-                         Fix: check the response column units (is it being read in the right \
-                         scale?), centre/rescale the response, or drop the column if it \
-                         carries no signal."
-                    ),
-                });
-            }
-        }
-        _ => {}
+    if per_term.is_empty() || n_rows >= required {
+        return Ok(());
     }
-
-    // Sample size vs formula complexity. Each `s(...)` smooth contributes a
-    // basis with several columns (heuristic k ≥ 4 even for tiny n, plus the
-    // intercept), so n < 5 cannot fit any smooth model — and the README
-    // quickstart hits exactly this with n=4. We surface a clear hint instead
-    // of the inner-solver's "cached inner beta has length …" message (#309).
-    let smooth_count = parsed_terms
+    let breakdown = per_term
         .iter()
-        .filter(|t| matches!(t, ParsedTerm::Smooth { .. }))
-        .count();
-    if smooth_count > 0 {
-        // Conservative lower bound: each smooth needs ~k_min basis columns,
-        // plus the intercept and one degree of freedom for the smoothing-
-        // parameter optimizer. 4 rows per smooth is comfortably below mgcv's
-        // default k=10 yet still well above what the basis construction
-        // collapses to under tiny-n heuristics.
-        let min_rows = 1 + 4 * smooth_count;
-        if n < min_rows {
-            return Err(WorkflowError::InvalidConfig {
-                reason: format!(
-                    "not enough observations to fit the requested formula: \
-                     dataset has n={n} rows but the formula declares \
-                     {smooth_count} smooth term(s), which need at least \
-                     {min_rows} rows (≈ 4 rows per smooth + intercept) before \
-                     REML smoothing-parameter estimation is well-posed. \
-                     Fix: add more training rows, or replace `s(x)` with a \
-                     linear term `x`, or pass a smaller basis via `s(x, k=3)`."
-                ),
-            });
-        }
-    }
-
-    Ok(())
+        .map(|(name, k)| format!("{name}≥{k}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(WorkflowError::InvalidConfig {
+        reason: format!(
+            "not enough observations to fit the requested formula: dataset has n={n_rows} \
+             rows but the smooth terms on response '{response_name}' need at least \
+             {required} rows total ({breakdown}, plus intercept + smoothing-parameter dof) \
+             before REML estimation is well-posed. \
+             Fix: add more training rows, replace `s(x)` with a linear term, or pass a \
+             smaller basis via `s(x, k=3)`."
+        ),
+    })
 }
 
 /// Project an ingest-layer [`ColumnKindTag`] (plus the column's level table)
@@ -5159,18 +5144,14 @@ fn materialize_standard<'a>(
         .validate_response_support(y.view())
         .map_err(|violation| violation.message_for(&parsed.response))?;
 
-    // Pre-flight degeneracy / sample-size gate (#309, #331, #332). Catches
-    // all-zero or all-one Bernoulli responses, near-constant Gaussian
-    // responses, and formulas whose total smooth complexity exceeds the row
-    // count — all of which would otherwise surface as the opaque
-    // `fit_result.reml_score must be finite, got inf` assertion.
-    validate_response_degeneracy_and_size(
-        &family.response,
-        &parsed.response,
-        y.view(),
-        &parsed.terms,
-    )
-    .map_err(String::from)?;
+    // Per-family response-distribution degeneracy (#331 all-0/all-1 Bernoulli,
+    // #332 near-constant Gaussian). Symmetric to validate_response_support —
+    // each `ResponseFamily` variant owns its own degeneracy classifier, the
+    // workflow only forwards the column name.
+    family
+        .response
+        .validate_response_degeneracy(y.view())
+        .map_err(|deg| deg.message_for(&parsed.response))?;
 
     let effective_linkwiggle =
         effectivelinkwiggle_formulaspec(parsed.linkwiggle.as_ref(), link_choice.as_ref());
@@ -5194,6 +5175,13 @@ fn materialize_standard<'a>(
         config.scale_dimensions,
         &policy,
     )?;
+
+    // Sample size vs basis-rank gate (#309). Each smooth basis answers
+    // `min_sample_rows()` for itself; this helper just sums and compares.
+    // Runs *after* `build_termspec_with_geometry` so the lower bound is
+    // computed on the fully resolved basis spec (e.g. tensor-product columns,
+    // knot counts inferred at materialization time).
+    check_smooth_capacity(&spec, y.len(), &parsed.response).map_err(String::from)?;
     if let Some(coord) = latent_coord.as_mut() {
         let resolved_idx = spec
             .smooth_terms
@@ -6521,6 +6509,15 @@ fn materialize_location_scale<'a>(
         .validate_response_support(y.view())
         .map_err(|violation| violation.message_for(&parsed.response))?;
 
+    // Per-family response-distribution degeneracy (#331, #332). The
+    // location-scale path has its own σ-model so a near-constant Gaussian
+    // mean response is even more pathological here than in the standard
+    // path; same typed check, same family-owned classifier.
+    family
+        .response
+        .validate_response_degeneracy(y.view())
+        .map_err(|deg| deg.message_for(&parsed.response))?;
+
     let effective_linkwiggle =
         effectivelinkwiggle_formulaspec(parsed.linkwiggle.as_ref(), link_choice.as_ref());
 
@@ -6533,6 +6530,10 @@ fn materialize_location_scale<'a>(
         &mut inference_notes,
         &policy,
     )?;
+    // Sample size vs basis rank, summed across the mean and log-σ smooths
+    // (#309). Both designs share the same n_rows.
+    check_smooth_capacity(&meanspec, y.len(), &parsed.response).map_err(String::from)?;
+    check_smooth_capacity(&log_sigmaspec, y.len(), &parsed.response).map_err(String::from)?;
     if config.scale_dimensions {
         enable_scale_dimensions(&mut meanspec);
         enable_scale_dimensions(&mut log_sigmaspec);

@@ -714,48 +714,32 @@ impl PenaltyPseudologdet {
         Self::from_assembled_with_nullity(s_total, ridge_hint, structural_nullity)
     }
 
-    /// Build from a pre-assembled penalty matrix S (already = Σ λ_k S_k + ridge·I).
-    pub fn from_assembled(s_total: Array2<f64>) -> Result<Self, String> {
-        Self::from_assembled_inner(s_total, None, None)
-    }
-
-    /// Build from a pre-assembled penalty matrix with a known structural nullity.
+    /// Build from a pre-assembled penalty matrix.
     ///
-    /// `s_total` must be `Σ_k λ_k S_k` plus, if `ridge` is `Some(r)`, an additive
-    /// `r·I` already applied to the diagonal. The caller is expected to have
-    /// assembled the matrix in exactly that form.
+    /// `s_total` must be `Σ_k λ_k S_k` plus, if `ridge` is `Some(r)`, an
+    /// additive `r·I` already applied to the diagonal. The caller is expected
+    /// to have assembled the matrix in exactly that form.
     ///
-    /// When `structural_nullity` is `Some(m0)`, the function identifies the
-    /// `m0`-dimensional structural nullspace and excludes it from `log|S|₊`.
-    /// The detection rule depends on whether `ridge` is supplied:
+    /// The positive/null eigenspace split is determined entirely from the
+    /// eigenspectrum of `s_total`, with no auxiliary structural-nullity hint:
     ///
-    /// * If `ridge` is `Some(r)`, a direction is "structurally null" iff its
-    ///   eigenvalue is within tolerance of `r` — concretely
-    ///   `eval ≤ r · (1 + √ε · max(p_dim, 1))`. The function checks that this
-    ///   eigenvalue-based criterion identifies exactly `m0` directions and
-    ///   returns an error otherwise; this protects against the positional
-    ///   misclassification where a barely-active eigenvalue
-    ///   `λ_k σ_k(S_k) < r` would otherwise sort below a ridge-inflated null
-    ///   (see issue #192).
-    /// * If `ridge` is `None`, the function falls back to the legacy positional
-    ///   rule: the bottom `m0` eigenvalues are treated as the nullspace.
+    /// * When `ridge` is `Some(r)`, a direction is structurally null iff its
+    ///   eigenvalue is within machine-precision tolerance of `r` (i.e. the
+    ///   unridged `Σ λ_k S_k` has a zero eigenvalue along that direction).
+    /// * When `ridge` is `None`, a direction is null iff its eigenvalue is at
+    ///   or below the relative noise floor `positive_eigenvalue_threshold`
+    ///   (`100 · p · ε · max|e|`).
     ///
-    /// Callers that assemble the ridged matrix `Σ_k λ_k S_k + r·I` SHOULD pass
-    /// `Some(r)` so that eigenvalue-based detection runs; this is the only
-    /// principled rule when active eigenvalues can dip below `r`.
-    pub fn from_assembled_with_nullity(
-        s_total: Array2<f64>,
-        ridge: Option<f64>,
-        structural_nullity: Option<usize>,
-    ) -> Result<Self, String> {
-        Self::from_assembled_inner(s_total, ridge, structural_nullity)
-    }
-
-    fn from_assembled_inner(
-        s_total: Array2<f64>,
-        ridge: Option<f64>,
-        structural_nullity: Option<usize>,
-    ) -> Result<Self, String> {
+    /// In both regimes the tolerance band is the only authority — there is no
+    /// supplementary `m0` parameter, no metadata cross-check, and no error
+    /// path for nullity mismatches.  When a "barely-active" eigenvalue
+    /// `λ_k σ_k < band` sits within the band, the contribution to `log|S|₊`
+    /// would be `log(r + λ_k σ_k) ≈ log r` and is dominated by the ridge
+    /// term; dropping such directions is consistent with the regularizer.
+    /// This makes the pseudo-logdet a C∞ function of ρ over the positive
+    /// eigenspace and removes the redundant metadata invariant that issues
+    /// #192 and #318 both stemmed from.
+    pub fn from_assembled(s_total: Array2<f64>, ridge: Option<f64>) -> Result<Self, String> {
         let p_dim = s_total.nrows();
         if p_dim == 0 {
             return Ok(Self {
@@ -773,72 +757,32 @@ impl PenaltyPseudologdet {
             .eigh(Side::Lower)
             .map_err(|e| format!("PenaltyPseudologdet eigendecomposition failed: {e}"))?;
 
-        let threshold = super::unified::positive_eigenvalue_threshold(evals.as_slice().unwrap());
-        let structural_nullity = structural_nullity.map(|m0| m0.min(p_dim));
+        // Compute the null-vs-active boundary purely from the spectrum.
+        //
+        //   ridge = None:  boundary = positive_eigenvalue_threshold(evals)
+        //                  (= 100 · p · ε · max|e|; eigenvalues at or below
+        //                  this are noise around 0).
+        //
+        //   ridge = r > 0: boundary = r + delta, where delta is the same
+        //                  100 · p · ε · max|e| noise band.  Directions in
+        //                  the structural null of the unridged S have
+        //                  eigenvalue exactly r in the ridged S; the
+        //                  eigendecomposition introduces at most O(p · ε · ‖S‖)
+        //                  perturbation, so any eigenvalue ≤ r + delta is
+        //                  indistinguishable from ridge-only within FP noise.
+        let noise_band =
+            super::unified::positive_eigenvalue_threshold(evals.as_slice().unwrap());
+        let boundary = match ridge {
+            Some(r) if r > 0.0 => r + noise_band,
+            _ => noise_band,
+        };
         let mut positive_indices = Vec::with_capacity(p_dim);
         let mut null_indices = Vec::with_capacity(p_dim);
-
-        // Eigenvalue-based null-direction detection (issue #192). The assembled
-        // matrix is Σ_k λ_k S_k + r·I, so structurally-null directions have
-        // eigenvalue exactly `r`, while every active direction has eigenvalue
-        // `r + λ_k σ_k > r`. We classify by proximity to `r` rather than by
-        // sort position so that a barely-active eigenvalue `λ_k σ_k < r` is
-        // not confused with a ridge-inflated structural null.
-        let ridged_null_threshold = match (ridge, structural_nullity) {
-            (Some(r), Some(m0)) if r > 0.0 && m0 > 0 => {
-                let scale = 1.0 + (f64::EPSILON.sqrt() * (p_dim.max(1) as f64));
-                Some(r * scale)
-            }
-            _ => None,
-        };
-        if let (Some(m0), Some(null_threshold)) = (structural_nullity, ridged_null_threshold) {
-            // Count eigenvalues that look like ridge-only directions.
-            let null_like_count = evals.iter().filter(|&&e| e <= null_threshold).count();
-            // Two failure modes are possible (see issue #192 and issue #318):
-            //
-            //   null_like_count > m0  — the assembled matrix has more
-            //     eigenvalues at-or-below the ridge level than the metadata
-            //     accounts for.  This is the original #192 concern: an active
-            //     penalty contributes λ_k σ_k < r, so a positional rule would
-            //     conflate an active direction with a structural null.  We
-            //     genuinely cannot disambiguate here, so error out.
-            //
-            //   null_like_count < m0  — the metadata claims more structural
-            //     nulls than the assembled spectrum actually exhibits at this
-            //     λ (issue #318).  This happens when a "structural" eigenvalue
-            //     classified by `analyze_penalty_block`'s relative tolerance
-            //     is in truth a tiny positive σ that, once amplified by a
-            //     large λ, sits well above the ridge.  In that regime the
-            //     metadata nullity is a soft upper bound: the eigenvalue
-            //     spectrum is authoritative and identifies fewer nulls than
-            //     the metadata predicted.  Treat the eigenvalue split as
-            //     truth and proceed — the would-be structural-null direction
-            //     is genuinely active in `Σ λ_k S_k + r·I` at this λ.
-            if null_like_count > m0 {
-                return Err(format!(
-                    "PenaltyPseudologdet: structural nullity invariant violated — expected {m0} \
-                     eigenvalue(s) at or below ridge threshold {null_threshold:.6e}, but found \
-                     {null_like_count}. This usually means an active penalty contributes an \
-                     eigenvalue λ_k σ_k below the ridge, so positional null detection would \
-                     misclassify directions (issue #192). Eigenvalues (ascending): {:?}",
-                    evals.as_slice().unwrap()
-                ));
-            }
-            for (idx, &eval) in evals.iter().enumerate() {
-                if eval <= null_threshold {
-                    null_indices.push(idx);
-                } else {
-                    positive_indices.push(idx);
-                }
-            }
-        } else {
-            for (idx, &eval) in evals.iter().enumerate() {
-                let structurally_null = structural_nullity.is_some_and(|m0| idx < m0);
-                if !structurally_null && eval > threshold {
-                    positive_indices.push(idx);
-                } else {
-                    null_indices.push(idx);
-                }
+        for (idx, &eval) in evals.iter().enumerate() {
+            if eval > boundary {
+                positive_indices.push(idx);
+            } else {
+                null_indices.push(idx);
             }
         }
         let rank = positive_indices.len();
