@@ -614,7 +614,7 @@ impl BetaPenaltyOp for MatvecDiagPenaltyOp {
 ///   `solver/gpu/arrow_schur_gpu.rs` routes those to CPU InexactPCG
 ///   automatically. At K ≥ 5000 the GPU PCG path will supersede the CPU path
 ///   once the row-procedural H_tβ kernel and boxed GPU matvec backend in
-///   `steihaug_pcg_reduced_system` are wired.
+///   `run_pcg_with_preconditioner` are wired.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArrowSolverMode {
     Direct,
@@ -745,7 +745,7 @@ pub struct ArrowSolveOptions {
     pub riemannian_trust_region: bool,
     /// Optional GPU-backed Schur matvec for CPU-driven `InexactPCG` at K ≥ 5000.
     ///
-    /// When set, `steihaug_pcg_reduced_system` delegates each `S·p` call to
+    /// When set, `run_pcg_with_preconditioner` delegates each `S·p` call to
     /// this closure instead of the CPU `schur_matvec`. Constructed by
     /// `crate::gpu::arrow_schur::gpu_schur_matvec_backend` when `cuda_selected()`
     /// and the system has dense per-row H_tβ slabs. `None` means CPU-only PCG.
@@ -4343,53 +4343,6 @@ struct IdentityPreconditioner;
 impl IdentityPreconditioner {
     fn apply(&self, r: &Array1<f64>) -> Array1<f64> {
         r.clone()
-    }
-}
-
-/// Steihaug-CG on the reduced BA Schur system.
-///
-/// When `gpu_matvec` is `Some`, each iteration delegates the full `S·p` product
-/// to the GPU-backed closure instead of the CPU `schur_matvec`; this is the
-/// Part-B (issue #288) hook that lets the CPU PCG outer loop call into a GPU
-/// kernel for the dominant `Σ_i Y_i^T Y_i · p` accumulation at K ≥ 5000.
-/// The closure is responsible for the complete `(H_ββ + ρ·I − Σ Y_i^T Y_i)·p`
-/// product; constructors in `crate::gpu::arrow_schur` pre-compute the `Y_i`
-/// factors on device and add the CPU-side `H_ββ` term inside the closure.
-fn steihaug_pcg_reduced_system<B: BatchedBlockSolver>(
-    sys: &ArrowSchurSystem,
-    htt_factors: &[Array2<f64>],
-    ridge_beta: f64,
-    rhs: &Array1<f64>,
-    preconditioner: &JacobiPreconditioner,
-    pcg: &ArrowPcgOptions,
-    trust: &ArrowTrustRegionOptions,
-    backend: &B,
-    gpu_matvec: Option<&GpuSchurMatvec>,
-    metric_weights: Option<&MetricWeights>,
-) -> Result<(Array1<f64>, PcgDiagnostics), ArrowSchurError> {
-    if let Some(gpu_mv) = gpu_matvec {
-        let gpu_mv = Arc::clone(gpu_mv);
-        steihaug_cg(
-            rhs,
-            move |p, out| gpu_mv(p, out),
-            |r| preconditioner.apply(r),
-            pcg.max_iterations.min(trust.max_iterations),
-            pcg.relative_tolerance
-                .max(trust.steihaug_relative_tolerance),
-            trust.radius,
-            metric_weights,
-        )
-    } else {
-        steihaug_cg(
-            rhs,
-            |p, out| schur_matvec(sys, htt_factors, ridge_beta, p, out, backend),
-            |r| preconditioner.apply(r),
-            pcg.max_iterations.min(trust.max_iterations),
-            pcg.relative_tolerance
-                .max(trust.steihaug_relative_tolerance),
-            trust.radius,
-            metric_weights,
-        )
     }
 }
 

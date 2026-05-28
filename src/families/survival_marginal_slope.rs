@@ -1,5 +1,5 @@
 use crate::custom_family::{
-    BlockEffectiveJacobian, BlockWorkingSet, BlockwiseFitOptions, CustomFamily,
+    BlockWorkingSet, BlockwiseFitOptions, CustomFamily,
     CustomFamilyWarmStart,
     ExactNewtonJointGradientEvaluation, ExactNewtonJointHessianWorkspace,
     ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace,
@@ -20804,6 +20804,12 @@ pub fn fit_survival_marginal_slope_terms(
     // compare drops_by_block against the structural-H pass. If they differ,
     // the structural compile mis-classified at least one direction (the
     // "pilot-curvature trap") and the user is warned with the diff.
+    // The recompile uses `block_states[i].eta` (the converged η for the
+    // marginal / logslope blocks) when rebuilding q0/q1/qd1/g at the
+    // accepted β. Since η already absorbs the per-row offset
+    // (η = Xβ + offset), the recompile does not separately consume
+    // `marginal_offset` / `logslope_offset` — they are not carried in
+    // this context.
     struct SmgsRecompileAfterAcceptContext {
         dq0: ndarray::Array2<f64>,
         dq1: ndarray::Array2<f64>,
@@ -20817,8 +20823,6 @@ pub fn fit_survival_marginal_slope_terms(
         offset_entry: Array1<f64>,
         offset_exit: Array1<f64>,
         derivative_offset_exit: Array1<f64>,
-        marginal_offset: Array1<f64>,
-        logslope_offset: Array1<f64>,
         z_primary: Array1<f64>,
         weights: Array1<f64>,
         event: Array1<f64>,
@@ -21049,8 +21053,6 @@ pub fn fit_survival_marginal_slope_terms(
                                     .time_block
                                     .derivative_offset_exit
                                     .clone(),
-                                marginal_offset: spec.marginal_offset.clone(),
-                                logslope_offset: spec.logslope_offset.clone(),
                                 z_primary: z_primary.clone(),
                                 weights: spec.weights.clone(),
                                 event: spec.event_target.clone(),
@@ -22193,7 +22195,7 @@ pub fn fit_survival_marginal_slope_terms(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::custom_family::{CustomFamily, ExactOuterDerivativeOrder};
+    use crate::custom_family::{BlockEffectiveJacobian, CustomFamily, ExactOuterDerivativeOrder};
     use crate::matrix::{DenseDesignMatrix, SymmetricMatrix};
     use approx::assert_relative_eq;
     use faer::sparse::{SparseColMat, Triplet};

@@ -452,31 +452,6 @@ impl FamilyChannelHessian for TensorChannelHessian {
     }
 }
 
-/// Adapter that turns a [`FamilyChannelHessian`] into a
-/// [`crate::families::identifiability_compiler::RowHessian`] for use inside
-/// the identifiability compiler.
-///
-/// This is the bridge between the family-facing public API
-/// (`FamilyChannelHessian`) and the compiler-internal API (`RowHessian`).
-pub(crate) struct ChannelHessianAdapter {
-    pub(crate) inner: Arc<dyn FamilyChannelHessian>,
-}
-
-impl crate::families::identifiability_compiler::RowHessian for ChannelHessianAdapter {
-    fn k(&self) -> usize {
-        self.inner.n_outputs()
-    }
-    fn nrows(&self) -> usize {
-        self.inner.n_subjects()
-    }
-    fn fill_row(&self, row: usize, out: &mut [f64]) {
-        self.inner.fill_subject(row, out);
-    }
-    fn evaluate_full(&self) -> ndarray::Array3<f64> {
-        self.inner.evaluate_full()
-    }
-}
-
 /// β-linearization state passed to [`BlockEffectiveJacobian::effective_jacobian_at`].
 ///
 /// At pre-fit initialization, pass `beta = &[]` / zeros and `family_scalars = None`.

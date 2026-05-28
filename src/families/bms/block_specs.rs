@@ -1,7 +1,6 @@
 use super::*;
 use super::family::*;
 use super::gradient_paths::*;
-use super::hessian_paths::*;
 use super::install_flex::validate_spec;
 use super::hessian_paths::{new_cell_moment_lru_cache, new_cell_moment_cache_stats};
 
@@ -282,27 +281,6 @@ impl BlockEffectiveJacobian for BmsLogslopeJacobian {
 
     fn n_outputs(&self) -> usize {
         1
-    }
-}
-
-fn build_blockspec(
-    name: &str,
-    design: &TermCollectionDesign,
-    baseline: f64,
-    offset: &Array1<f64>,
-    rho: Array1<f64>,
-    beta_hint: Option<Array1<f64>>,
-) -> ParameterBlockSpec {
-    ParameterBlockSpec {
-        name: name.to_string(),
-        design: design.design.clone(),
-        offset: offset + baseline,
-        penalties: design.penalties_as_penalty_matrix(),
-        nullspace_dims: design.nullspace_dims.clone(),
-        initial_log_lambdas: rho,
-        initial_beta: beta_hint,
-        gauge_priority: 100,
-        jacobian_callback: None,
     }
 }
 

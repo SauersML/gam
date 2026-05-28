@@ -5767,7 +5767,11 @@ fn run_outer_with_plan(
                     let (lo_dev, hi_dev) = &bounds_template;
                     let bounds_dev = (lo_dev.clone(), hi_dev.clone());
                     let grad_tol_dev = outer_gradient_tolerance(config);
-                    let max_iter_dev = outer_max_iterations(config.max_iter)?;
+                    // Validate the iteration count via the same `MaxIterations`
+                    // wrapper the host BFGS / ARC / matrix-free TR branches use;
+                    // the device input below carries it as a raw `usize`, so we
+                    // only need the wrapper for its bail-on-invalid behaviour.
+                    outer_max_iterations(config.max_iter)?;
                     let axis_caps_dev = bfgs_axis_step_caps(config, layout);
                     let seed_eval_dev = match obj
                         .eval_with_order(seed, OuterEvalOrder::ValueAndGradient)

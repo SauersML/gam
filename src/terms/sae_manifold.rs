@@ -30,7 +30,7 @@ use ndarray::{Array1, Array2, Array3, Array4, ArrayView1, ArrayView2, ArrayView3
 use std::sync::Arc;
 
 use crate::solver::arrow_schur::{
-    ArrowRowBlock, ArrowSchurError, ArrowSchurSystem, BetaPenaltyOp, BlockPenaltyOp,
+    ArrowRowBlock, ArrowSchurError, ArrowSchurSystem, BetaPenaltyOp,
     CompositePenaltyOp, DensePenaltyOp, KroneckerPenaltyOp,
 };
 use crate::terms::analytic_penalties::{
@@ -1452,8 +1452,6 @@ pub trait SaeKroneckerRow {
 /// `O(q · K · p)`.
 #[derive(Debug, Clone)]
 pub struct SaeKroneckerRows {
-    /// Number of observations.
-    n: usize,
     /// Decoder output dimension `p`.
     p: usize,
     /// Per-row sparse support: `a_phi[i]` is a `Vec<(beta_base_idx, weight)>`.
@@ -1467,15 +1465,18 @@ pub struct SaeKroneckerRows {
 }
 
 impl SaeKroneckerRows {
-    /// Build from per-row data collected during `assemble_arrow_schur`.
-    pub fn new(
-        n: usize,
-        p: usize,
-        a_phi: Vec<Vec<(usize, f64)>>,
-        local_jac: Vec<Vec<f64>>,
-    ) -> Self {
+    /// Build from per-row data collected during `assemble_arrow_schur`. The
+    /// row count is implicit in `a_phi.len()` and `local_jac.len()`; the
+    /// constructor asserts they agree so callers cannot pass mismatched rows.
+    pub fn new(p: usize, a_phi: Vec<Vec<(usize, f64)>>, local_jac: Vec<Vec<f64>>) -> Self {
+        assert_eq!(
+            a_phi.len(),
+            local_jac.len(),
+            "SaeKroneckerRows: a_phi rows ({}) != local_jac rows ({})",
+            a_phi.len(),
+            local_jac.len(),
+        );
         Self {
-            n,
             p,
             a_phi,
             local_jac,
@@ -2317,7 +2318,7 @@ impl SaeManifoldTerm {
         // materializing the `(q × K·p)` block.  The closure is Arc-wrapped so
         // the Arrow-Schur solver can use it via `sys.htbeta_matvec`.
         {
-            let kron = Arc::new(SaeKroneckerRows::new(n, p, kron_a_phi, kron_jac));
+            let kron = Arc::new(SaeKroneckerRows::new(p, kron_a_phi, kron_jac));
             sys.set_row_htbeta_operator(move |row_idx, x, out| {
                 // Apply J_β^(row_idx) · x → out using the Kronecker form.
                 // x may or may not be contiguous; collect into a plain Vec
