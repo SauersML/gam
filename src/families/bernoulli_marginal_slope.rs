@@ -14480,13 +14480,35 @@ impl BernoulliMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         cache: &BernoulliMarginalSlopeExactEvalCache,
     ) -> Result<Array1<f64>, String> {
+        let mut out = Array1::<f64>::zeros(cache.slices.total);
+        self.exact_newton_joint_hessian_matvec_from_cache_into(
+            direction,
+            block_states,
+            cache,
+            &mut out,
+        )?;
+        Ok(out)
+    }
+
+    /// Allocation-free HVP entry point.  Fills `out` (length
+    /// `cache.slices.total`) with `H·direction`.  `out` is zeroed on entry
+    /// and fully overwritten on success.
+    pub(crate) fn exact_newton_joint_hessian_matvec_from_cache_into(
+        &self,
+        direction: &Array1<f64>,
+        block_states: &[ParameterBlockState],
+        cache: &BernoulliMarginalSlopeExactEvalCache,
+        out: &mut Array1<f64>,
+    ) -> Result<(), String> {
         let slices = &cache.slices;
         let primary = &cache.primary;
         let n = self.y.len();
 
+        out.fill(0.0);
+
         // ── Rigid closed-form: scalar kernel + design row ops ────────
         if !self.effective_flex_active(block_states)? {
-            let out = (0..n.div_ceil(ROW_CHUNK_SIZE))
+            let partial = (0..n.div_ceil(ROW_CHUNK_SIZE))
                 .into_par_iter()
                 .try_fold(
                     || Array1::<f64>::zeros(slices.total),
@@ -14526,7 +14548,8 @@ impl BernoulliMarginalSlopeFamily {
                         Ok(left)
                     },
                 )?;
-            return Ok(out);
+            *out += &partial;
+            return Ok(());
         }
 
         // Phase-3 device-resident shortcut: when the row Hessian + designs
@@ -14541,7 +14564,15 @@ impl BernoulliMarginalSlopeFamily {
                     direction.as_slice().expect("direction is contiguous"),
                 ) {
                     Ok(host) => {
-                        return Ok(Array1::<f64>::from_vec(host));
+                        if host.len() != out.len() {
+                            return Err(format!(
+                                "BMS GPU HVP length mismatch: got {}, expected {}",
+                                host.len(),
+                                out.len()
+                            ));
+                        }
+                        out.iter_mut().zip(host.iter()).for_each(|(o, &v)| *o = v);
+                        return Ok(());
                     }
                     Err(err) => {
                         log::info!(
@@ -14561,23 +14592,28 @@ impl BernoulliMarginalSlopeFamily {
         // can be GPU-accelerated by `launch_row_hessian_matvec`; on every
         // host the CPU oracle `cpu_row_hessian_matvec` is the in-process
         // fallback so the call sites stay consistent. The design pullback
-        // (`pullback_primary_vector`) stays on host because the designs are
-        // not necessarily resident on the device in this branch.
+        // (`pullback_primary_vector_add_into`) stays on host because the
+        // designs are not necessarily resident on the device in this branch.
         if let Some(host_pin) = cache.row_primary_hessians.host_pin() {
             let r_pr = primary.total;
+            // Single scratch buffer reused across rows — no per-row Array1.
+            let mut row_dir_scratch = Array1::<f64>::zeros(r_pr);
             let mut v_rows = vec![0.0_f64; n * r_pr];
             for row in 0..n {
-                let row_dir =
-                    self.row_primary_direction_from_flat(row, slices, primary, direction)?;
-                let row_dir_slice = row_dir
-                    .as_slice()
-                    .expect("row_primary_direction is contiguous");
-                v_rows[row * r_pr..(row + 1) * r_pr].copy_from_slice(row_dir_slice);
+                self.row_primary_direction_from_flat_into(
+                    row,
+                    slices,
+                    primary,
+                    direction,
+                    &mut row_dir_scratch,
+                )?;
+                v_rows[row * r_pr..(row + 1) * r_pr]
+                    .copy_from_slice(row_dir_scratch.as_slice().expect("contiguous"));
             }
-            let h_rows_arr = host_pin.hess();
+            let h_rows_arr = host_pin.rows();
             let h_rows_slice = h_rows_arr
                 .as_slice()
-                .expect("row_primary_hessians.hess() is row-major contiguous");
+                .expect("row_primary_hessians.rows() is row-major contiguous");
             let inputs = crate::gpu::row_hessian_ops::RowHessianMatvecInputs {
                 n_rows: n,
                 r: r_pr,
@@ -14595,7 +14631,7 @@ impl BernoulliMarginalSlopeFamily {
                             v_rows: &v_rows,
                         },
                     ) {
-                        Ok(out) => out.y_rows,
+                        Ok(result) => result.y_rows,
                         Err(err) => {
                             log::info!(
                                 "[BMS exact-newton HVP] host-pin GPU matvec failed: {err}; \
@@ -14610,15 +14646,26 @@ impl BernoulliMarginalSlopeFamily {
                     crate::gpu::row_hessian_ops::cpu_row_hessian_matvec(&inputs)
                 }
             };
-            let mut out = Array1::<f64>::zeros(slices.total);
+            // Reuse `row_dir_scratch` as the per-row action buffer (same
+            // length r_pr) to avoid per-row allocation in the pullback loop.
             for row in 0..n {
-                let action = Array1::<f64>::from(y_rows[row * r_pr..(row + 1) * r_pr].to_vec());
-                out += &self.pullback_primary_vector(row, slices, primary, &action)?;
+                let action_slice = &y_rows[row * r_pr..(row + 1) * r_pr];
+                row_dir_scratch
+                    .iter_mut()
+                    .zip(action_slice.iter())
+                    .for_each(|(dst, &src)| *dst = src);
+                self.pullback_primary_vector_add_into(
+                    row,
+                    slices,
+                    primary,
+                    &row_dir_scratch,
+                    out,
+                )?;
             }
-            return Ok(out);
+            return Ok(());
         }
 
-        let out = (0..n.div_ceil(ROW_CHUNK_SIZE))
+        let partial = (0..n.div_ceil(ROW_CHUNK_SIZE))
             .into_par_iter()
             .try_fold(
                 || Array1::<f64>::zeros(slices.total),
@@ -14626,10 +14673,18 @@ impl BernoulliMarginalSlopeFamily {
                     let start = chunk_idx * ROW_CHUNK_SIZE;
                     let end = (start + ROW_CHUNK_SIZE).min(n);
                     let mut scratch = BernoulliMarginalSlopeFlexRowScratch::new(primary.total);
+                    // Per-thread scratch for row direction — allocated once per
+                    // chunk thread rather than once per row.
+                    let mut row_dir = Array1::<f64>::zeros(primary.total);
                     for row in start..end {
                         let row_ctx = Self::row_ctx(cache, row);
-                        let row_dir =
-                            self.row_primary_direction_from_flat(row, slices, primary, direction)?;
+                        self.row_primary_direction_from_flat_into(
+                            row,
+                            slices,
+                            primary,
+                            direction,
+                            &mut row_dir,
+                        )?;
                         let row_action =
                             if let Some(row_hess) = Self::cached_row_primary_hessian(cache, row) {
                                 row_hess.dot(&row_dir)
@@ -14649,8 +14704,13 @@ impl BernoulliMarginalSlopeFamily {
                                 )?;
                                 scratch.hess.dot(&row_dir)
                             };
-                        chunk_out +=
-                            &self.pullback_primary_vector(row, slices, primary, &row_action)?;
+                        self.pullback_primary_vector_add_into(
+                            row,
+                            slices,
+                            primary,
+                            &row_action,
+                            &mut chunk_out,
+                        )?;
                     }
                     Ok(chunk_out)
                 },
@@ -14662,7 +14722,8 @@ impl BernoulliMarginalSlopeFamily {
                     Ok(left)
                 },
             )?;
-        Ok(out)
+        *out += &partial;
+        Ok(())
     }
     fn exact_newton_joint_hessian_diagonal_from_cache(
         &self,

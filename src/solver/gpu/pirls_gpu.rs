@@ -121,10 +121,23 @@ pub struct SigmaPirlsGpuWorkspace {
     /// large-p fallback where the `ddgmm + dgemm` route is faster.
     pub(crate) wx_dev: Option<cudarc::driver::CudaSlice<f64>>,
     pub(crate) w_dev: cudarc::driver::CudaSlice<f64>,
+    /// `X_originalᵀ W X_original` (p×p) — intermediate before Qs projection.
     pub(crate) xtwx_dev: cudarc::driver::CudaSlice<f64>,
     pub(crate) h_dev: cudarc::driver::CudaSlice<f64>,
     pub(crate) rhs_dev: cudarc::driver::CudaSlice<f64>,
     pub(crate) penalty_dev: cudarc::driver::CudaSlice<f64>,
+    /// Reparameterisation matrix `Qs` (p×p, column-major), uploaded once per
+    /// ρ / σ point. Identity when no reparameterisation is active. Used to
+    /// project `A = X_originalᵀ W X_original` into the transformed frame:
+    /// `H_step = Qsᵀ A Qs + S + λI`.
+    pub(crate) qs_dev: cudarc::driver::CudaSlice<f64>,
+    /// Scratch p×p buffer for the two-step `Qsᵀ A Qs` accumulation:
+    /// first `tmp = A Qs`, then `H = Qsᵀ tmp`.
+    pub(crate) qs_tmp_dev: cudarc::driver::CudaSlice<f64>,
+    /// p-vector: `beta_orig = Qs · β` computed before each `eta = X · beta_orig`.
+    pub(crate) beta_orig_dev: cudarc::driver::CudaSlice<f64>,
+    /// p-vector scratch used for `Qs · direction` when forming `xd = X · (Qs · δ)`.
+    pub(crate) dir_orig_dev: cudarc::driver::CudaSlice<f64>,
     /// Pre-allocated cuSOLVER POTRF workspace buffer. Sized once at
     /// construction via `potrf_query_lwork`; reused every Newton step.
     pub(crate) potrf_work_dev: cudarc::driver::CudaSlice<f64>,

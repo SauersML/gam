@@ -255,20 +255,18 @@ pub fn gpu_schur_matvec_backend(
 ) -> Result<crate::solver::arrow_schur::GpuSchurMatvec, ArrowSchurGpuFailure> {
     // Matrix-free H_tβ operators cannot be consumed by the dense forward kernel.
     // Return GpuRequiresDenseSystem so the caller knows to stay on CPU PCG.
-    let had_hbb_matvec = sys.hbb_matvec.is_some();
-    let had_htbeta_matvec = sys.htbeta_matvec.is_some();
-    if had_htbeta_matvec {
+    if sys.htbeta_matvec.is_some() {
         return Err(ArrowSchurGpuFailure::GpuRequiresDenseSystem {
-            had_hbb_matvec,
-            had_htbeta_matvec,
+            had_hbb_matvec: sys.hbb_matvec.is_some(),
+            had_htbeta_matvec: true,
         });
     }
 
     #[cfg(not(target_os = "linux"))]
     {
-        // On non-Linux there is no CUDA runtime; all three params are valid
-        // inputs but there is no device to dispatch to.
-        if ridge_t.is_nan() || ridge_beta.is_nan() || had_hbb_matvec {
+        // No CUDA runtime on non-Linux. NaN ridges are validated to ensure the
+        // same contract as the Linux path.
+        if ridge_t.is_nan() || ridge_beta.is_nan() {
             return Err(ArrowSchurGpuFailure::Unavailable);
         }
         Err(ArrowSchurGpuFailure::Unavailable)
