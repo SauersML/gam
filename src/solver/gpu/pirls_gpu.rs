@@ -637,7 +637,8 @@ extern "C" __global__ void chol_logdet_col_major(
                 weights: input.weights,
                 penalty_hessian: input.penalty_hessian,
                 gradient: input.gradient,
-                lm_ridge: input.lm_ridge,
+                step_lm_lambda: input.step_lm_lambda,
+                objective_ridge: input.objective_ridge,
             },
         )
     }

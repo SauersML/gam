@@ -1669,6 +1669,7 @@ mod pirls_row_gpu_tests {
                 y: 4.0,
                 prior_weight: 1.0,
             },
+            1.0,
         );
         let expected_mu = (1.5_f64).exp();
         assert!(expected_mu.is_finite() && out.mu.is_finite());

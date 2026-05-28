@@ -9544,21 +9544,8 @@ fn exact_newton_joint_hessian_source_from_workspace(
         .into());
     }
 
-    let zero = Array1::<f64>::zeros(total);
-    let Some(zero_image) = workspace.hessian_matvec(&zero)? else {
+    if !workspace.hessian_matvec_available() {
         return Ok(None);
-    };
-    if zero_image.len() != total {
-        return Err(format!(
-            "{context}: operator matvec length mismatch: got {}, expected {}",
-            zero_image.len(),
-            total
-        ));
-    }
-    if zero_image.iter().any(|value| !value.is_finite()) {
-        return Err(format!(
-            "{context}: operator matvec returned non-finite values"
-        ));
     }
 
     let workspace_apply = Arc::clone(workspace);
