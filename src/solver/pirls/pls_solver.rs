@@ -18,10 +18,10 @@ use super::{
 use crate::estimate::EstimationError;
 use crate::faer_ndarray::{FaerLinalgError, array1_to_col_matmut};
 use crate::linalg::utils::{StableSolver, array_is_finite};
-use crate::matrix::{DesignMatrix, SymmetricMatrix};
+use crate::matrix::{DesignMatrix, LinearOperator, SymmetricMatrix};
 use crate::types::{Coefficients, LinkFunction};
 use faer::sparse::SparseColMat;
-use ndarray::{Array1, Array2, ArrayView1};
+use ndarray::{Array1, Array2, ArrayView1, ShapeBuilder};
 use std::sync::Arc;
 
 /// Reusable `XᵀWX` and `XᵀW(y − offset)` for Gaussian + Identity REML fits.

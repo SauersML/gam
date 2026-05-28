@@ -24,8 +24,15 @@ use super::{
     ExportedLaplaceCurvature, HessianCurvatureKind, PirlsStatus,
     WorkingModelIterationInfo, WorkingModelPirlsResult, WorkingState,
     LinearInequalityConstraints, array1_l2_norm,
+    restore_pending_arrow_latent_if_needed, commit_pending_arrow_latent,
+    solve_newton_direction_dense, solve_newton_direction_dense_with_factor,
+    solve_direction_with_dense_factor,
 };
 use crate::estimate::EstimationError;
+use crate::faer_ndarray::FaerSymmetricFactor;
+use crate::linalg::sparse_exact::{factorize_sparse_spd, solve_sparse_spd_into,
+    sparse_symmetric_upper_matvec_public};
+use crate::linalg::utils::{array_is_finite, inf_norm};
 use crate::solver::active_set;
 use crate::types::Coefficients;
 use faer::sparse::SparseColMat;

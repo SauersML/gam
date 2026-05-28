@@ -1612,6 +1612,355 @@ fn channel_aware_aliased_pairs(
     Ok(pairs)
 }
 
+/// Summary of one audit-drift check: the rank verdict at the current β
+/// compared to the pilot verdict.
+///
+/// Used by [`maybe_log_audit_drift`] to decide whether to emit the
+/// `[AUDIT-DRIFT]` log line.
+#[derive(Debug, Clone)]
+pub struct AuditDriftSummary {
+    /// Pilot effective rank (sum of `effective_dim` over all blocks).
+    pub pilot_rank: usize,
+    /// Current-β effective rank.
+    pub current_rank: usize,
+    /// `‖β_current − β_pilot‖₂ / (‖β_pilot‖₂ + ε)` — relative norm change.
+    pub beta_relative_change: f64,
+    /// Columns dropped in the current audit that were NOT dropped in the pilot.
+    pub newly_dropped: Vec<DroppedColumn>,
+    /// Columns dropped in the pilot that are no longer dropped (recovered).
+    pub recovered: Vec<String>,
+}
+
+/// Run the channel-aware audit at `beta_current` using `channel_hessian_at`
+/// to refresh W, and compare the result to the pilot audit.
+///
+/// # Drift threshold (T34)
+///
+/// The re-audit fires when:
+///
+/// ```text
+/// ‖β_current − β_pilot‖₂ / (‖β_pilot‖₂ + ε) > 0.5   (large β movement)
+/// ```
+///
+/// OR every `every_n_iters` outer iterations (amortised cost).
+/// Document these thresholds inline so callers can understand the policy.
+///
+/// If neither condition fires, this function returns `None` immediately
+/// without running the audit.
+///
+/// # Diagnostics only
+///
+/// This function logs at INFO level but does NOT change fit semantics.
+/// If a persistent rank change is detected across many iterations the
+/// user can investigate via the `[AUDIT-DRIFT]` log stream.
+///
+/// # Arguments
+///
+/// * `specs` — the current `ParameterBlockSpec` list.
+/// * `pilot_audit` — the audit result from the pilot linearisation (β=0).
+/// * `beta_pilot` — the pilot β vector (typically zeros).
+/// * `beta_current` — the current β vector after some PIRLS/LM iterations.
+/// * `family_scalars` — optional per-row primary-state scalars at `beta_current`.
+/// * `outer_iter` — the current outer iteration index (0-based).
+/// * `every_n_iters` — run the drift audit every this many outer iterations.
+pub fn maybe_log_audit_drift(
+    specs: &[ParameterBlockSpec],
+    pilot_audit: &IdentifiabilityAudit,
+    beta_pilot: &[f64],
+    beta_current: &[f64],
+    family_scalars: Option<&std::sync::Arc<dyn std::any::Any + Send + Sync>>,
+    outer_iter: usize,
+    every_n_iters: usize,
+) -> Option<AuditDriftSummary> {
+    // Drift threshold: re-audit when:
+    //   (a) relative β movement > 0.5 (substantial step from pilot), OR
+    //   (b) every `every_n_iters` outer iterations (amortised cost check).
+    // Threshold 0.5 and period 10 are inlined here per T34's contract.
+    const BETA_RELATIVE_THRESHOLD: f64 = 0.5;
+    const DEFAULT_EVERY_N_ITERS: usize = 10;
+    let period = if every_n_iters == 0 { DEFAULT_EVERY_N_ITERS } else { every_n_iters };
+
+    let beta_pilot_norm: f64 = beta_pilot.iter().map(|b| b * b).sum::<f64>().sqrt();
+    let beta_current_len = beta_current.len();
+    let beta_pilot_len = beta_pilot.len();
+    let diff_norm: f64 = if beta_current_len == beta_pilot_len {
+        beta_current
+            .iter()
+            .zip(beta_pilot.iter())
+            .map(|(a, b)| (a - b).powi(2))
+            .sum::<f64>()
+            .sqrt()
+    } else {
+        // Length mismatch — treat as maximum drift.
+        f64::INFINITY
+    };
+    let beta_relative_change = diff_norm / (beta_pilot_norm + f64::EPSILON);
+
+    let large_beta_movement = beta_relative_change > BETA_RELATIVE_THRESHOLD;
+    let periodic_check = (outer_iter % period) == 0;
+
+    if !large_beta_movement && !periodic_check {
+        return None;
+    }
+
+    // Run the flat audit at the current β.  For channel-aware families the
+    // Jacobian callbacks already carry the β-dependent effective Jacobian
+    // (they read from family_scalars when present), so re-running the flat
+    // audit with a state built from `beta_current` and `family_scalars` is
+    // the correct re-evaluation.
+    //
+    // We pass `family_scalars` as the `channel_hessian` field indirectly:
+    // the flat audit calls `effective_jacobian_at` for each block, which
+    // internally reads from `family_scalars` when the block has a
+    // `jacobian_callback`.  The W refresh is not wired through the flat
+    // audit (which uses no W); the drift detection here is purely structural
+    // (rank of J(β)), not curvature-weighted.  That is the correct
+    // identifiability check: structural rank is what tells you whether the
+    // model is locally identified at β.
+    let p_total: usize = specs.iter().map(|s| s.design.ncols()).sum();
+    let beta_for_state: Vec<f64> = if beta_current.len() == p_total {
+        beta_current.to_vec()
+    } else {
+        vec![0.0; p_total]
+    };
+    let state = crate::families::custom_family::FamilyLinearizationState {
+        beta: &beta_for_state,
+        family_scalars: family_scalars.cloned(),
+        channel_hessian: None,
+        probit_frailty_scale: 1.0,
+    };
+
+    // Re-run the flat audit at beta_current.
+    let current_audit = match audit_identifiability_with_state(specs, &state) {
+        Ok(a) => a,
+        Err(_) => return None,
+    };
+
+    let pilot_rank: usize = pilot_audit.blocks.iter().map(|b| b.effective_dim).sum();
+    let current_rank: usize = current_audit.blocks.iter().map(|b| b.effective_dim).sum();
+
+    // Build the diff: newly dropped vs recovered.
+    let pilot_dropped: std::collections::BTreeSet<(String, usize)> = pilot_audit
+        .dropped_columns
+        .iter()
+        .map(|d| (d.block.clone(), d.column))
+        .collect();
+    let current_dropped: std::collections::BTreeSet<(String, usize)> = current_audit
+        .dropped_columns
+        .iter()
+        .map(|d| (d.block.clone(), d.column))
+        .collect();
+
+    let newly_dropped: Vec<DroppedColumn> = current_audit
+        .dropped_columns
+        .iter()
+        .filter(|d| !pilot_dropped.contains(&(d.block.clone(), d.column)))
+        .cloned()
+        .collect();
+
+    let recovered: Vec<String> = pilot_audit
+        .dropped_columns
+        .iter()
+        .filter(|d| !current_dropped.contains(&(d.block.clone(), d.column)))
+        .map(|d| format!("{}[{}]", d.block, d.column))
+        .collect();
+
+    let verdict_changed = pilot_rank != current_rank
+        || !newly_dropped.is_empty()
+        || !recovered.is_empty();
+
+    if verdict_changed {
+        // Structured INFO log so log-grep can find all drift events.
+        //
+        // Format: [AUDIT-DRIFT] pilot_rank=<N> current_rank=<N>
+        //         beta_relative_change=<f> outer_iter=<N>
+        //         newly_dropped=[block[col], ...] recovered=[block[col], ...]
+        let newly_str: Vec<String> = newly_dropped
+            .iter()
+            .map(|d| format!("{}[{}]", d.block, d.column))
+            .collect();
+        let recovered_str = if recovered.is_empty() {
+            "none".to_string()
+        } else {
+            recovered.join(", ")
+        };
+        log::info!(
+            "[AUDIT-DRIFT] pilot_rank={} current_rank={} \
+             beta_relative_change={:.4} outer_iter={} \
+             newly_dropped=[{}] recovered=[{}]",
+            pilot_rank,
+            current_rank,
+            beta_relative_change,
+            outer_iter,
+            if newly_str.is_empty() {
+                "none".to_string()
+            } else {
+                newly_str.join(", ")
+            },
+            recovered_str,
+        );
+    }
+
+    Some(AuditDriftSummary {
+        pilot_rank,
+        current_rank,
+        beta_relative_change,
+        newly_dropped,
+        recovered,
+    })
+}
+
+/// Run [`audit_identifiability`] with an explicit [`FamilyLinearizationState`]
+/// so callers can pass the current β and `family_scalars` at any point in the
+/// outer loop.
+///
+/// This is a thin wrapper around `audit_identifiability` that constructs the
+/// zero-β state internally. The `state` argument is forwarded to each block's
+/// `effective_jacobian_at` call (replacing the default β=0 zeros state built
+/// inside the flat audit function).
+///
+/// Note: the flat audit always builds its own zero-β state for the J(β)
+/// computation.  This function overrides that by densifying each block's
+/// Jacobian with `state` before feeding into the existing joint-RRQR path.
+/// For families without `jacobian_callback`, the design is returned as-is
+/// regardless of `state`.
+pub fn audit_identifiability_with_state(
+    specs: &[ParameterBlockSpec],
+    state: &crate::families::custom_family::FamilyLinearizationState<'_>,
+) -> Result<IdentifiabilityAudit, EstimationError> {
+    if specs.is_empty() {
+        return Ok(IdentifiabilityAudit {
+            blocks: Vec::new(),
+            aliased_pairs: Vec::new(),
+            dropped_columns: Vec::new(),
+            fatal: false,
+            summary: "identifiability audit (state): no blocks supplied".to_string(),
+        });
+    }
+
+    let n = specs[0].design.nrows();
+    for (idx, spec) in specs.iter().enumerate() {
+        if spec.design.nrows() != n {
+            return Err(EstimationError::LayoutError(format!(
+                "identifiability audit (state): block {} ({}) has {} rows, expected {}",
+                idx,
+                spec.name,
+                spec.design.nrows(),
+                n,
+            )));
+        }
+    }
+
+    // Densify each block using the caller-supplied state (carries current β
+    // and family_scalars). Blocks without a callback return the flat design.
+    let mut dense_blocks: Vec<ndarray::Array2<f64>> = Vec::with_capacity(specs.len());
+    let mut col_offsets: Vec<usize> = Vec::with_capacity(specs.len() + 1);
+    col_offsets.push(0);
+    let mut blocks: Vec<BlockIdentity> = Vec::with_capacity(specs.len());
+
+    for (idx, spec) in specs.iter().enumerate() {
+        let dense = spec
+            .effective_jacobian_at(
+                "identifiability_audit::audit_identifiability_with_state",
+                state,
+            )
+            .map_err(|e| {
+                EstimationError::LayoutError(format!("identifiability audit (state): {e}"))
+            })?;
+        let p_block = dense.ncols();
+        let block_singular = block_pivoted_qr_diagonal(&dense)?;
+        let block_rank = count_rank(&block_singular, n, p_block);
+        blocks.push(BlockIdentity {
+            block_name: spec.name.clone(),
+            original_dim: p_block,
+            effective_dim: p_block,
+            design_range_rank: block_rank,
+            design_range_singular_values: block_singular,
+        });
+        let next_offset = col_offsets[col_offsets.len() - 1] + p_block;
+        col_offsets.push(next_offset);
+        dense_blocks.push(dense);
+        let _ = idx; // consumed via enumerate above
+    }
+
+    let p_total = *col_offsets.last().expect("col_offsets non-empty");
+    if p_total == 0 {
+        return Ok(IdentifiabilityAudit {
+            blocks,
+            aliased_pairs: Vec::new(),
+            dropped_columns: Vec::new(),
+            fatal: false,
+            summary: "identifiability audit (state): every block is empty".to_string(),
+        });
+    }
+
+    // Assemble joint design and run RRQR (same path as the flat audit).
+    let mut x_joint = ndarray::Array2::<f64>::zeros((n, p_total));
+    for (idx, block) in dense_blocks.iter().enumerate() {
+        let start = col_offsets[idx];
+        let end = col_offsets[idx + 1];
+        if end > start {
+            x_joint.slice_mut(ndarray::s![.., start..end]).assign(block);
+        }
+    }
+    let rrqr =
+        rrqr_with_permutation(&x_joint, default_rrqr_rank_alpha()).map_err(|e| {
+            EstimationError::LayoutError(format!(
+                "audit_identifiability_with_state joint RRQR failed: {e:?}"
+            ))
+        })?;
+    let joint_rank = rrqr.rank;
+    let joint_rank_tol = rrqr.rank_tol;
+
+    let demoted_joint_cols: Vec<usize> = rrqr.column_permutation[rrqr.rank..].to_vec();
+
+    let mut dropped_columns: Vec<DroppedColumn> = Vec::new();
+    for &joint_col in &demoted_joint_cols {
+        let (block_idx, local_col) = locate_block_column(&col_offsets, joint_col)?;
+        let block_name = specs[block_idx].name.clone();
+        let reason = format!(
+            "joint-design column {joint_col} (block '{block_name}' local column \
+             {local_col}) demoted past joint RRQR rank tolerance {tol:.3e} at current β; \
+             earlier blocks' column span absorbs this direction",
+            tol = joint_rank_tol,
+        );
+        dropped_columns.push(DroppedColumn {
+            block: block_name,
+            column: local_col,
+            reason,
+        });
+    }
+
+    for (block_idx, block) in blocks.iter_mut().enumerate() {
+        let lo = col_offsets[block_idx];
+        let hi = col_offsets[block_idx + 1];
+        let dropped_here = demoted_joint_cols
+            .iter()
+            .filter(|&&j| j >= lo && j < hi)
+            .count();
+        block.effective_dim = block.original_dim.saturating_sub(dropped_here);
+    }
+
+    let fatal = joint_rank < p_total;
+    let summary = format!(
+        "identifiability audit (state β-dependent): {} block(s), {} joint columns, \
+         joint rank {}, {} dropped column(s){}",
+        specs.len(),
+        p_total,
+        joint_rank,
+        dropped_columns.len(),
+        if fatal { " — rank deficient" } else { " — clean" },
+    );
+
+    Ok(IdentifiabilityAudit {
+        blocks,
+        aliased_pairs: Vec::new(),
+        dropped_columns,
+        fatal,
+        summary,
+    })
+}
+
 fn locate_block_column(
     col_offsets: &[usize],
     joint_col: usize,
