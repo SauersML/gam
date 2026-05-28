@@ -2080,11 +2080,12 @@ extern "C" __global__ void status_or(
                     penalty_hessian,
                     step_lm_lambda: lm_ridge,
                     objective_ridge,
+                    beta_dev: &loop_ws.beta_dev,
+                    linear_shift,
                 },
-                &negate_func,
             )
             .map_err(|e| format!("inner step it={it}: {e}"))?;
-            // Direction is already in ws.rhs_dev (negated on device).
+            // ws.rhs_dev holds the Newton descent direction δ = H⁻¹·rhs (#257).
             // Copy device-to-device: no host round-trip.
             ws.stream
                 .memcpy_dtod(&ws.rhs_dev, &mut loop_ws.direction_dev)
