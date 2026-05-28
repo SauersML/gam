@@ -1,6 +1,5 @@
 use super::*;
 use super::hessian_paths::{BlockSlices, PrimarySlices, BernoulliMarginalSlopeRowExactContext, RowCellMomentsBundle};
-use super::family::BernoulliMarginalSlopeFamily;
 
 
 #[inline]
@@ -167,20 +166,19 @@ impl Drop for RowPrimaryEvalPin {
 ///   the fused gradient+dense-H path via
 ///   [`BernoulliMarginalSlopeFamily::cached_row_primary_hessian`] and
 ///   [`BernoulliMarginalSlopeFamily::cached_row_primary_eval`].
-/// - `Device` (Linux/CUDA only): Hessian + designs live on the GPU; neglog and
-///   gradient are kept as host `Arc<[f64]>` slices for the fused gradient pass.
+/// - `Device` (Linux/CUDA only): row Hessian + designs live on the GPU.
+///   HVP / diagonal / dense-block consumers route through the device-aware
+///   GPU entry points; the fused CPU gradient pass is the rare fallback (only
+///   when `p_total` exceeds the dense-block kernel's shared-memory cap) and
+///   recomputes the row kernel on the fly in that case, so the GPU output
+///   for `(neglog, grad)` is not mirrored on the host.
 pub enum RowPrimaryEvalCache {
     Empty,
     Host(RowPrimaryEvalPin),
-    /// Device-resident row Hessian + designs, plus host-side neglog/grad.
-    /// HVP / diagonal consumers route through the device-aware GPU entry
-    /// points; the fused gradient pass reads neglog/grad from the host slices.
+    /// Device-resident row Hessian + designs. HVP / diagonal / dense-block
+    /// consumers route through the device-aware GPU entry points.
     #[cfg(target_os = "linux")]
-    Device {
-        neglog: std::sync::Arc<[f64]>,
-        grad: std::sync::Arc<[f64]>,
-        hess: crate::gpu::bms_flex_row::DeviceResidentRowHess,
-    },
+    Device(crate::gpu::bms_flex_row::DeviceResidentRowHess),
 }
 
 impl RowPrimaryEvalCache {
@@ -201,7 +199,7 @@ impl RowPrimaryEvalCache {
             Self::Host(pin) => Some(pin),
             Self::Empty => None,
             #[cfg(target_os = "linux")]
-            Self::Device { .. } => None,
+            Self::Device(_) => None,
         }
     }
 
@@ -211,7 +209,7 @@ impl RowPrimaryEvalCache {
     #[inline]
     pub(crate) fn device(&self) -> Option<&crate::gpu::bms_flex_row::DeviceResidentRowHess> {
         match self {
-            Self::Device { hess, .. } => Some(hess),
+            Self::Device(hess) => Some(hess),
             _ => None,
         }
     }
