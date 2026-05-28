@@ -9236,6 +9236,7 @@ fn build_model_summary(
             chi_sq: chi_sq_opt,
             pvalue,
             continuous_order: None,
+            basis_note: None,
         });
     }
     for term in &design.smooth.terms {
@@ -9311,6 +9312,12 @@ fn build_model_summary(
         } else {
             None
         };
+        let basis_note = match &term.metadata {
+            gam::basis::BasisMetadata::BSpline1D {
+                auto_shrink_note, ..
+            } => auto_shrink_note.clone(),
+            _ => None,
+        };
         smooth_terms.push(SmoothTermSummary {
             name: term.name.clone(),
             edf,
@@ -9318,6 +9325,7 @@ fn build_model_summary(
             chi_sq: chi_sq_opt,
             pvalue,
             continuous_order,
+            basis_note,
         });
     }
 
