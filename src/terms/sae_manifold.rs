@@ -2710,13 +2710,7 @@ impl SaeManifoldTerm {
         }
         let n = self.n_obs();
         let q = self.assignment.row_block_dim();
-        if delta_ext_coord.len() != n * q {
-            return Err(format!(
-                "SaeManifoldTerm::apply_newton_step: delta_ext_coord length {} != expected {}",
-                delta_ext_coord.len(),
-                n * q
-            ));
-        }
+        let k_atoms = self.k_atoms();
         if delta_beta.len() != self.beta_dim() {
             return Err(format!(
                 "SaeManifoldTerm::apply_newton_step: delta_beta length {} != expected {}",
@@ -2725,29 +2719,104 @@ impl SaeManifoldTerm {
             ));
         }
 
-        let k_atoms = self.k_atoms();
-        let coord_offsets = self.assignment.coord_offsets();
-        for row in 0..n {
-            let row_base = row * q;
-            for atom_idx in 0..k_atoms {
-                self.assignment.logits[[row, atom_idx]] +=
-                    step_size * delta_ext_coord[row_base + atom_idx];
+        // When last_row_layout is set (JumpReLU compact mode), delta_ext_coord
+        // uses a variable-stride layout: row_offsets[i]..row_offsets[i+1].
+        // Expand each row back to full-q before applying.
+        if let Some(ref layout) = self.last_row_layout.clone() {
+            // Compute expected total length from active sets.
+            let total_len: usize = (0..n).map(|row| layout.row_q_active(row)).sum();
+            if delta_ext_coord.len() != total_len {
+                return Err(format!(
+                    "SaeManifoldTerm::apply_newton_step: delta_ext_coord length {} != expected compact {}",
+                    delta_ext_coord.len(), total_len
+                ));
             }
-        }
-
-        for atom_idx in 0..k_atoms {
-            let d = self.assignment.coords[atom_idx].latent_dim();
-            let mut delta_coord = Array1::<f64>::zeros(n * d);
+            // Expand to full-q and apply.
+            let mut full_delta = vec![0.0_f64; n * q];
+            let mut compact_off = 0usize;
             for row in 0..n {
-                let row_base = row * q + coord_offsets[atom_idx];
-                for axis in 0..d {
-                    delta_coord[row * d + axis] = step_size * delta_ext_coord[row_base + axis];
+                let q_active = layout.row_q_active(row);
+                let compact_row = delta_ext_coord.slice(ndarray::s![compact_off..compact_off + q_active]);
+                let out_slice = &mut full_delta[row * q..(row + 1) * q];
+                layout.expand_row(row, compact_row.as_slice().unwrap_or({
+                    // If not contiguous, collect.
+                    let v: Vec<f64> = compact_row.iter().copied().collect();
+                    // Can't use a temporary here - expand via collected.
+                    let mut tmp = vec![0.0_f64; q];
+                    layout.expand_row(row, &v, &mut tmp);
+                    let coord_offsets = self.assignment.coord_offsets();
+                    for atom_idx in 0..k_atoms {
+                        self.assignment.logits[[row, atom_idx]] +=
+                            step_size * tmp[atom_idx];
+                    }
+                    for atom_idx in 0..k_atoms {
+                        let d = self.assignment.coords[atom_idx].latent_dim();
+                        let off = coord_offsets[atom_idx];
+                        for axis in 0..d {
+                            out_slice[off + axis] = step_size * tmp[off + axis];
+                        }
+                    }
+                    compact_off += q_active;
+                    continue;
+                }), out_slice);
+                compact_off += q_active;
+            }
+            // Apply logits.
+            for row in 0..n {
+                let row_base = row * q;
+                for atom_idx in 0..k_atoms {
+                    self.assignment.logits[[row, atom_idx]] +=
+                        step_size * full_delta[row_base + atom_idx];
                 }
             }
-            self.assignment.coords[atom_idx].retract_flat_delta(delta_coord.view());
-            if refresh_basis {
-                let coords = self.assignment.coords[atom_idx].as_matrix();
-                self.atoms[atom_idx].refresh_basis(coords.view())?;
+            // Apply coords.
+            let coord_offsets = self.assignment.coord_offsets();
+            for atom_idx in 0..k_atoms {
+                let d = self.assignment.coords[atom_idx].latent_dim();
+                let mut delta_coord = Array1::<f64>::zeros(n * d);
+                for row in 0..n {
+                    let row_base = row * q + coord_offsets[atom_idx];
+                    for axis in 0..d {
+                        delta_coord[row * d + axis] = full_delta[row_base + axis];
+                    }
+                }
+                self.assignment.coords[atom_idx].retract_flat_delta(delta_coord.view());
+                if refresh_basis {
+                    let coords = self.assignment.coords[atom_idx].as_matrix();
+                    self.atoms[atom_idx].refresh_basis(coords.view())?;
+                }
+            }
+        } else {
+            // Dense layout: uniform q per row.
+            if delta_ext_coord.len() != n * q {
+                return Err(format!(
+                    "SaeManifoldTerm::apply_newton_step: delta_ext_coord length {} != expected {}",
+                    delta_ext_coord.len(),
+                    n * q
+                ));
+            }
+            let coord_offsets = self.assignment.coord_offsets();
+            for row in 0..n {
+                let row_base = row * q;
+                for atom_idx in 0..k_atoms {
+                    self.assignment.logits[[row, atom_idx]] +=
+                        step_size * delta_ext_coord[row_base + atom_idx];
+                }
+            }
+            for atom_idx in 0..k_atoms {
+                let d = self.assignment.coords[atom_idx].latent_dim();
+                let mut delta_coord = Array1::<f64>::zeros(n * d);
+                for row in 0..n {
+                    let row_base = row * q + coord_offsets[atom_idx];
+                    for axis in 0..d {
+                        delta_coord[row * d + axis] = step_size * delta_ext_coord[row_base + axis];
+                    }
+                }
+                self.assignment.coords[atom_idx].retract_flat_delta(delta_coord.view());
+                if refresh_basis {
+                    let coords = self.assignment.coords[atom_idx].as_matrix();
+                    self.atoms[atom_idx].refresh_basis(coords.view())?;
+                }
             }
         }
 
