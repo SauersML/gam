@@ -16,7 +16,6 @@ fn make_spec(name: &str) -> ParameterBlockSpec {
         initial_log_lambdas: Array1::zeros(0),
         initial_beta: None,
         gauge_priority: 100,
-        eta_row_scaling: None,
         jacobian_callback: None,
     }
 }

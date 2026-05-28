@@ -22,29 +22,29 @@ use super::family::{
 /// [`install_compiled_flex_block_into_runtime`].
 struct BmsFlexBlockContext {
     /// Densified anchor blocks in parametric-before-flex order.
-    anchor_dense_blocks: Vec<Array2<f64>>,
+    pub(super) anchor_dense_blocks: Vec<Array2<f64>>,
     /// Per-anchor predict-time tags (same order as `anchor_dense_blocks`).
-    anchor_components:
+    pub(super) anchor_components:
         Vec<super::deviation_runtime::AnchorComponentTag>,
     /// Horizontally stacked anchor matrix N_train (n × d_total).
-    n_train: Array2<f64>,
+    pub(super) n_train: Array2<f64>,
     /// `BernoulliDenseDesignOperator` per anchor, then one for the candidate
     /// (trailing). Indices align with `ordering`.
-    operators:
+    pub(super) operators:
         Vec<std::sync::Arc<dyn crate::families::identifiability_compiler::RowJacobianOperator>>,
     /// Block-order tags parallel to `operators`.
-    ordering: Vec<crate::families::identifiability_compiler::BlockOrder>,
+    pub(super) ordering: Vec<crate::families::identifiability_compiler::BlockOrder>,
     /// W-metric row Hessian built from the validated `training_row_weights`.
-    row_hess: crate::families::bernoulli_marginal_slope_identifiability::BernoulliRowHessian,
+    pub(super) row_hess: crate::families::bernoulli_marginal_slope_identifiability::BernoulliRowHessian,
     /// Dense candidate basis at training rows (n × p_candidate), cached to
     /// avoid a second `design()` call after context construction.
-    candidate_design_dense: Array2<f64>,
+    pub(super) candidate_design_dense: Array2<f64>,
     /// Number of training rows.
-    n: usize,
+    pub(super) n: usize,
     /// Raw column count of the candidate block (= `candidate_design_dense.ncols()`).
-    p_candidate: usize,
+    pub(super) p_candidate: usize,
     /// Total anchor columns (= `n_train.ncols()`).
-    d_total: usize,
+    pub(super) d_total: usize,
 }
 
 /// Validate inputs, densify anchors, stack N_train, and assemble the
@@ -367,7 +367,6 @@ pub(crate) fn install_compiled_flex_block_into_runtime(
                     initial_log_lambdas: Array1::<f64>::zeros(0),
                     initial_beta: None,
                     gauge_priority: 200,
-                    eta_row_scaling: None,
                     jacobian_callback: None,
                 });
             }
@@ -382,7 +381,6 @@ pub(crate) fn install_compiled_flex_block_into_runtime(
                 initial_log_lambdas: Array1::<f64>::zeros(0),
                 initial_beta: None,
                 gauge_priority: 100,
-                eta_row_scaling: None,
                 jacobian_callback: None,
             });
             specs

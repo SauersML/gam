@@ -135,7 +135,7 @@ pub struct AliasedPair {
     pub overlap: f64,
     /// Bias shift applied to the null-distribution mean for this pair,
     /// equal to `bias_shift_for_pair(z_a, z_b, s2_a, s2_b)`.
-    /// Non-zero when exactly one block carries an `eta_row_scaling`
+    /// Non-zero when exactly one block carries a `RowScaledJacobian` callback
     /// (or the two scalings differ) and the row-scaling vector is skewed.
     /// Stored so that the halt-threshold check can apply the same
     /// directional correction as the report-threshold check.
@@ -199,13 +199,13 @@ fn compute_leverage_s2(col: &ndarray::ArrayView1<f64>) -> f64 {
 }
 
 /// Compute the standardised (unit-variance) third central moment μ_3 of a
-/// row-scaling vector z = `eta_row_scaling`, applying the finite-sample
-/// unbiased correction factor n / ((n-1)(n-2)).
+/// row-scaling vector z from a `RowScaledJacobian` callback, applying the
+/// finite-sample unbiased correction factor n / ((n-1)(n-2)).
 ///
 /// # Derivation of the null-mean bias term
 ///
 /// When one of the two blocks in a cross-block cosine comparison carries
-/// `eta_row_scaling = Some(z)`, the effective Jacobian column is `z ⊙ φ`
+/// a `RowScaledJacobian` with scaling `z`, the effective Jacobian column is `z ⊙ φ`
 /// instead of `φ`.  The population cosine between `φ` (from the other block)
 /// and `z ⊙ φ` (from the scaled block) is, under independence of z and φ,
 ///
@@ -296,7 +296,7 @@ pub fn compute_skewness_mu3(z: &[f64]) -> f64 {
 ///
 /// * Both blocks carry the SAME row-scaling vector → the scaled and unscaled
 ///   columns are from the same distribution; the shift cancels exactly (shift = 0).
-/// * Block A has `eta_row_scaling = Some(z)`, block B has `None` (or vice versa):
+/// * Block A carries a `RowScaledJacobian` with scaling `z`, block B has none (or vice versa):
 ///   shift = −(μ_3(z) / 2) · S2_k.
 /// * Both have `None`: shift = 0 (T11's symmetric form, μ_3 = 0).
 /// * Both have DIFFERENT row-scaling vectors z_a ≠ z_b: shift is derived from
@@ -509,7 +509,7 @@ pub fn audit_identifiability(
         // Use spec.effective_jacobian_at() so the audit operates on the β-dependent
         // effective design. At initialization (β = 0, family_scalars = None), callbacks
         // return the linearization at β = 0.  For blocks with no callback and
-        // eta_row_scaling = None this is a no-op (J = design).
+        // For blocks with no callback this is a no-op (J = design).
         let dense = spec
             .effective_jacobian_at("identifiability_audit::audit_identifiability", &init_state)
             .map_err(|e| EstimationError::LayoutError(format!("identifiability audit: {e}")))?;
@@ -590,6 +590,35 @@ pub fn audit_identifiability(
     // default = 100) `priority_perm` is the identity (stable sort
     // preserves spec order), so legacy callers see no behaviour
     // change.
+    //
+    // LOAD-BEARING: this reorder is NOT dead code even though every
+    // built-in family happens to assemble specs in descending priority
+    // order.  Three active use cases require the non-identity path:
+    //
+    //   1. Custom families via the Python API — Python callers build
+    //      `ParameterBlockSpec` lists and pass them to
+    //      `audit_identifiability` without any pre-sort guarantee.
+    //      Priority ownership (which block loses the shared direction)
+    //      must be honoured regardless of the list order.
+    //
+    //   2. `bms/install_flex.rs` drives RRQR through this function
+    //      for the cross-block identifiability check during BMS flex
+    //      installation.  The anchor blocks (priority=200) are pushed
+    //      before the candidate (priority=100), which is descending,
+    //      but callers that add flex blocks interleaved with anchors
+    //      could arrive in non-descending order.
+    //
+    //   3. The `audit_priority_perm_invariance` integration tests
+    //      explicitly pass scrambled spec lists (e.g. [low=80,
+    //      high=200, mid=150]) to verify the rank verdict and drop
+    //      attribution are invariant under spec-list permutation.
+    //      Those tests would fail if this branch were removed, because
+    //      RRQR on natural column order of [low, high, mid] would
+    //      offer the alias to "low" first — which is the WRONG block.
+    //
+    // The identity fast-path (`priority_perm_is_identity`) is kept so
+    // that the common case (all specs already in descending order)
+    // avoids an O(p_total) copy of `x_joint`.
     let mut priority_perm: Vec<usize> = (0..p_total).collect();
     let col_block_idx: Vec<usize> = (0..specs.len())
         .flat_map(|i| std::iter::repeat(i).take(col_offsets[i + 1] - col_offsets[i]))
@@ -636,11 +665,8 @@ pub fn audit_identifiability(
         );
     }
     let rrqr = if priority_perm_is_identity {
-        rrqr_with_permutation(&x_joint, default_rrqr_rank_alpha()).map_err(|e| {
-            EstimationError::LayoutError(format!(
-                "identifiability audit joint RRQR failed: {e:?}"
-            ))
-        })?
+        rrqr_with_permutation(&x_joint, default_rrqr_rank_alpha())
+            .map_err(|e| EstimationError::LayoutError(format!("identifiability audit joint RRQR failed: {e:?}")))?
     } else {
         let mut x_priority = Array2::<f64>::zeros((n, p_total));
         for (new_j, &old_j) in priority_perm.iter().enumerate() {
@@ -686,7 +712,7 @@ pub fn audit_identifiability(
     // doc-comments on `compute_leverage_s2`, `pair_report_threshold`,
     // and `pair_halt_threshold` for the underlying finite-sample identity.
     //
-    // Bias correction: when one block carries `eta_row_scaling = Some(z)`,
+    // Bias correction: when one block carries a RowScaledJacobian with scaling z,
     // the null distribution of the cross-block cosine is no longer centred
     // at 0.  The null mean is approximately shift_k = −(μ_3/2)·S2_k where
     // μ_3 is the standardised third moment of z (skewness).  We test
@@ -729,18 +755,21 @@ pub fn audit_identifiability(
         let a_start = col_offsets[a_block_idx];
         let a_end = col_offsets[a_block_idx + 1];
         // Extract the row-scaling vector for block A (used for the bias shift).
-        let z_a = specs[a_block_idx]
-            .eta_row_scaling
+        // Only RowScaledJacobian callbacks expose this; all other callbacks return None.
+        let z_a_arc = specs[a_block_idx]
+            .jacobian_callback
             .as_ref()
-            .map(|arc| arc.as_ref());
+            .and_then(|cb| cb.eta_row_scaling_for_skewness());
+        let z_a: Option<&[f64]> = z_a_arc.as_deref();
         for b_block_idx in (a_block_idx + 1)..specs.len() {
             let b_start = col_offsets[b_block_idx];
             let b_end = col_offsets[b_block_idx + 1];
             // Extract the row-scaling vector for block B.
-            let z_b = specs[b_block_idx]
-                .eta_row_scaling
+            let z_b_arc = specs[b_block_idx]
+                .jacobian_callback
                 .as_ref()
-                .map(|arc| arc.as_ref());
+                .and_then(|cb| cb.eta_row_scaling_for_skewness());
+            let z_b: Option<&[f64]> = z_b_arc.as_deref();
             for ja in a_start..a_end {
                 let na = col_norms[ja];
                 if na == 0.0 {
@@ -1219,11 +1248,7 @@ pub fn audit_identifiability_channel_aware(
             .take(operators.len())
             .collect();
     let compiled = compile_with_dual_metric(operators, row_hess, &id_struct, &ordering)
-        .map_err(|e| {
-            EstimationError::LayoutError(format!(
-                "audit_identifiability_channel_aware compile failed: {e:?}"
-            ))
-        })?;
+        .map_err(|e| EstimationError::LayoutError(format!("audit_identifiability_channel_aware compile failed: {e:?}")))?;
 
     // Build per-block identity entries from the compiled output.
     let mut blocks: Vec<BlockIdentity> = Vec::with_capacity(specs.len());
@@ -1578,7 +1603,7 @@ fn channel_aware_aliased_pairs(
                     // Channel-aware path: no row-scaling bias correction;
                     // the channel weighting already accounts for per-block
                     // structure, and the row Jacobian operators are not
-                    // parameterised through eta_row_scaling here.
+                    // parameterised through RowScaledJacobian here.
                     bias_shift: 0.0,
                 });
             }
@@ -1858,7 +1883,6 @@ mod tests {
             initial_log_lambdas: Array1::<f64>::zeros(0),
             initial_beta: None,
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         }
     }

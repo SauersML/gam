@@ -76,7 +76,6 @@ mod tests {
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(Array1::zeros(p)),
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         }
     }
@@ -3012,7 +3011,6 @@ mod tests {
                 initial_log_lambdas: ndarray::Array1::zeros(2),
                 initial_beta: None,
                 gauge_priority: 100,
-                eta_row_scaling: None,
                 jacobian_callback: None,
             })
             .collect();
@@ -3041,7 +3039,6 @@ mod tests {
                 initial_log_lambdas: ndarray::Array1::zeros(10),
                 initial_beta: None,
                 gauge_priority: 100,
-                eta_row_scaling: None,
                 jacobian_callback: None,
             })
             .collect();
@@ -3073,7 +3070,6 @@ mod tests {
             initial_log_lambdas: ndarray::Array1::zeros(22),
             initial_beta: None,
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         }];
         let ctn_cost: u64 = 400_000u64 * 300 * 300;
@@ -3104,7 +3100,6 @@ mod tests {
             initial_log_lambdas: ndarray::Array1::zeros(5_000),
             initial_beta: None,
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         }];
         assert_eq!(
@@ -3153,7 +3148,6 @@ mod tests {
                 initial_log_lambdas: Array1::zeros(1),
                 initial_beta: None,
                 gauge_priority: 100,
-                eta_row_scaling: None,
                 jacobian_callback: None,
             },
             ParameterBlockSpec {
@@ -3167,7 +3161,6 @@ mod tests {
                 initial_log_lambdas: Array1::zeros(1),
                 initial_beta: None,
                 gauge_priority: 100,
-                eta_row_scaling: None,
                 jacobian_callback: None,
             },
         ];
