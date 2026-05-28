@@ -5145,7 +5145,6 @@ fn make_reparam_operator(
 // solve_penalized_least_squares_implicit lives in pls_solver (imported above).
 
 fn build_transformed_lower_bound_constraints(
-fn build_transformed_lower_bound_constraints(
     qs: &Array2<f64>,
     coefficient_lower_bounds: Option<&Array1<f64>>,
 ) -> Option<LinearInequalityConstraints> {

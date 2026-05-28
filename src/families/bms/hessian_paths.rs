@@ -1,4 +1,5 @@
 use super::*;
+use super::family::BernoulliMarginalSlopeFamily;
 
 /// Block-local psi derivative row: avoids allocating a full p-vector
 /// when the psi derivative lives in a single channel (marginal or logslope).
