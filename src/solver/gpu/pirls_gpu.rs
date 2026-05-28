@@ -1641,12 +1641,12 @@ extern "C" __global__ void status_or(
     pub struct PirlsLoopWorkspace {
         pub beta_dev: CudaSlice<f64>,
         pub eta_dev: CudaSlice<f64>,
-        /// Candidate eta for line search (`eta + α·xd`).
-        pub eta_cand_dev: CudaSlice<f64>,
-        /// Row-output buffers for the accepted iterate.
-        pub row_out: crate::gpu::pirls_row::RowOutputDevBuffers,
-        /// Row-output buffers for the candidate iterate (line search).
-        pub row_out_cand: crate::gpu::pirls_row::RowOutputDevBuffers,
+        /// Solve-row buffers: `grad_eta`, `w_solver`, `deviance`, `status`.
+        pub row_solve: crate::gpu::pirls_row::SolveRowBuffers,
+        /// Alpha-ladder buffers: `objective[7]`, `status[7]`.
+        pub alpha_ladder: crate::gpu::pirls_row::AlphaLadderDevBuffers,
+        /// Full final-row buffers: all 9 fields, written once at convergence.
+        pub row_final: crate::gpu::pirls_row::RowOutputDevBuffers,
         pub direction_dev: CudaSlice<f64>,
         pub xd_dev: CudaSlice<f64>,
         pub scalar_dev: CudaSlice<f64>,
@@ -1671,11 +1671,12 @@ extern "C" __global__ void status_or(
             Ok(Self {
                 beta_dev: alloc_f64("beta", p)?,
                 eta_dev: alloc_f64("eta", n)?,
-                eta_cand_dev: alloc_f64("eta_cand", n)?,
-                row_out: crate::gpu::pirls_row::RowOutputDevBuffers::allocate(stream, n)
-                    .map_err(|e| format!("pirls loop alloc row_out: {e}"))?,
-                row_out_cand: crate::gpu::pirls_row::RowOutputDevBuffers::allocate(stream, n)
-                    .map_err(|e| format!("pirls loop alloc row_out_cand: {e}"))?,
+                row_solve: crate::gpu::pirls_row::SolveRowBuffers::allocate(stream, n)
+                    .map_err(|e| format!("pirls loop alloc row_solve: {e}"))?,
+                alpha_ladder: crate::gpu::pirls_row::AlphaLadderDevBuffers::allocate(stream)
+                    .map_err(|e| format!("pirls loop alloc alpha_ladder: {e}"))?,
+                row_final: crate::gpu::pirls_row::RowOutputDevBuffers::allocate(stream, n)
+                    .map_err(|e| format!("pirls loop alloc row_final: {e}"))?,
                 direction_dev: alloc_f64("direction", p)?,
                 xd_dev: alloc_f64("xd", n)?,
                 scalar_dev: alloc_f64("scalar", 1)?,
@@ -2005,9 +2006,6 @@ extern "C" __global__ void status_or(
         let status_or_func = loop_module
             .load_function("status_or")
             .map_err(|e| format!("load status_or: {e}"))?;
-        let negate_func = loop_module
-            .load_function("negate_n")
-            .map_err(|e| format!("load negate_n: {e}"))?;
 
         gemv_no_trans(
             &ws.blas,
@@ -2974,6 +2972,32 @@ pub fn allocate_pirls_loop_workspace(
     ws: &SigmaPirlsGpuWorkspace,
 ) -> Result<cuda::PirlsLoopWorkspace, String> {
     cuda::PirlsLoopWorkspace::allocate(shared, &ws.stream)
+}
+
+/// GPU exact penalised least-squares for Gaussian-identity models.
+///
+/// Public wrapper around [`cuda::solve_gaussian_pls_on_stream`].  Delegates
+/// immediately if the CUDA runtime is initialised; returns an error otherwise
+/// so the caller can fall back to the CPU path.
+#[cfg(target_os = "linux")]
+pub fn solve_gaussian_pls_gpu(
+    a_orig: ndarray::ArrayView2<'_, f64>,
+    b_orig: ndarray::ArrayView1<'_, f64>,
+    s_transformed: ndarray::ArrayView2<'_, f64>,
+    linear_shift: ndarray::ArrayView1<'_, f64>,
+    prior_mean_target: ndarray::ArrayView1<'_, f64>,
+    ridge: f64,
+    qs: Option<ndarray::ArrayView2<'_, f64>>,
+) -> Result<cuda::GaussianPlsResult, String> {
+    cuda::solve_gaussian_pls_on_stream(
+        a_orig,
+        b_orig,
+        s_transformed,
+        linear_shift,
+        prior_mean_target,
+        ridge,
+        qs,
+    )
 }
 
 // ────────────────────────────────────────────────────────────────────────
