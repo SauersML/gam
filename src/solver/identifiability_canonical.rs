@@ -647,6 +647,7 @@ pub fn canonicalize_for_identifiability(
                 beta: &zeros,
                 family_scalars: None,
                 channel_hessian: None,
+                probit_frailty_scale: 1.0,
             };
             match spec.effective_jacobian_at("canonicalize_rank_check", &state) {
                 Ok(j_b) => {

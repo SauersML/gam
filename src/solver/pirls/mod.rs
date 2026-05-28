@@ -46,6 +46,33 @@ pub use crate::solver::active_set::{ConstraintKktDiagnostics, LinearInequalityCo
 
 use crate::linalg::utils::{array_is_finite, inf_norm};
 
+// ── Submodule split ─────────────────────────────────────────────────────────
+mod convergence;
+mod damping;
+mod edf;
+mod penalty;
+mod state;
+
+// Re-export public API that lived in the original flat file
+pub use state::{
+    AdaptiveKktTolerance, ExportedLaplaceCurvature, FirthDiagnostics, HessianCurvatureKind,
+    PirlsCoordinateFrame, PirlsLinearSolvePath, PirlsResult, PirlsStatus,
+    WorkingModelIterationInfo, WorkingModelPirlsResult, WorkingState,
+};
+pub(crate) use state::array1_l2_norm;
+pub use edf::StablePLSResult;
+use edf::{
+    calculate_edf, calculate_edf_from_diagonal_penalty, calculate_edf_from_sparse_factor,
+    calculate_edf_with_penalty, calculate_edfwithworkspace, calculate_edfwithworkspace_from_diagonal_penalty,
+    calculate_edfwithworkspace_from_factor, calculate_edfwithworkspace_with_penalty, edf_from_solution,
+};
+use damping::{add_scaled_diagonal_to_upper_sparse, compute_lm_d2, update_scaled_diagonal_in_place};
+use penalty::{
+    KroneckerQsTransform, PirlsPenalty, WorkingCoordinateDesign, WorkingReparamTransform,
+    attach_penalty_shift, symmetrize_dense_matrix,
+};
+use convergence::effective_kkt_tolerance;
+
 const GAMMA_SHAPE_MIN: f64 = 1e-8;
 const GAMMA_SHAPE_MAX: f64 = 1e12;
 const GAMMA_SHAPE_TARGET_TOL: f64 = 1e-12;

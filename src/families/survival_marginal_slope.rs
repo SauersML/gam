@@ -19774,18 +19774,37 @@ pub fn fit_survival_marginal_slope_terms(
                 let g_dg = logslope_design
                     .design
                     .try_to_dense_by_chunks("smgs phase-4b active: logslope")?;
-                // Structural identity row Hessian: catches every column-
-                // level cross-block alias (the only failure mode the
-                // biobank repro surfaces). Data-adaptive H at the pilot β
-                // is a follow-up refinement noted in the math agent's
-                // review.
-                let mut h_full = ndarray::Array3::<f64>::zeros((n_rows, 4, 4));
+                // Channel-aware per-subject Fisher Gram (T8). Build the
+                // pilot primary state at β=0: q0 = offset_entry,
+                // q1 = offset_exit + marginal_offset, qd1 =
+                // derivative_offset_exit, g = logslope_offset.  The
+                // resulting 4×4 per-row H couples the logslope g channel
+                // to the q0/q1 channels through the off-diagonal Fisher
+                // entries (∂²(−ℓ)/∂q1∂g ≠ 0), which prevents the
+                // logslope block from appearing fully aliased by the
+                // time+marginal anchor in the structural-residual Gram.
+                // Under the identity H those cross-channel couplings were
+                // zero, causing false "fully aliased" reports for the
+                // logslope block on biobank designs where g_dg and dq1
+                // share column span in raw design space.
+                let q0_pilot = spec.time_block.offset_entry.clone();
+                let mut q1_pilot = spec.time_block.offset_exit.clone();
                 for i in 0..n_rows {
-                    for k in 0..4 {
-                        h_full[[i, k, k]] = 1.0;
-                    }
+                    q1_pilot[i] += spec.marginal_offset[i];
                 }
-                let row_hess = SurvivalRowHessian::from_full(h_full);
+                let qd1_pilot = spec.time_block.derivative_offset_exit.clone();
+                let g_pilot = spec.logslope_offset.clone();
+                let row_hess = SurvivalRowHessian::from_pilot_primary_state(
+                    &q0_pilot,
+                    &q1_pilot,
+                    &qd1_pilot,
+                    &g_pilot,
+                    &z_primary,
+                    &spec.weights,
+                    &spec.event_target,
+                    derivative_guard,
+                    probit_scale,
+                )?;
 
                 // Closed-form Gram path: assemble the SMGS K=4 channel-block
                 // view (time → q0/q1/qd1; marginal → q0/q1; logslope → g),
