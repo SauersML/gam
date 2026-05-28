@@ -1091,6 +1091,7 @@ pub(crate) mod install_flex;
 pub(crate) mod row_kernel;
 #[cfg(test)]
 mod tests_inline;
+pub(crate) mod workspace;
 
 // ---------------------------------------------------------------------------
 // Public re-exports — preserve the original module path's public surface.
