@@ -43,6 +43,9 @@
 //! the per-row block or the Schur complement at the current ridge
 //! escalates `ridge_t` / `ridge_beta` by `lm_grow` and retries.
 
+use std::ops::Range;
+use std::sync::Arc;
+
 use ndarray::{Array1, ArrayView1};
 
 use crate::solver::arrow_schur::{
@@ -74,6 +77,21 @@ pub struct LatentInnerOptions {
     /// Reduced-system trust-region radius for Steihaug-CG. This is the
     /// Ceres/BA trust-region bound layered on top of the existing LM ridges.
     pub trust_region_radius: f64,
+    /// Optional β-block column ranges for the block-Jacobi Schur preconditioner.
+    ///
+    /// When `Some`, the solver calls
+    /// [`crate::solver::arrow_schur::ArrowSchurSystem::set_block_offsets`] on
+    /// every assembled system, engaging the block-Jacobi PCG preconditioner
+    /// (one dense Schur sub-block per term, max size 256 columns) instead of
+    /// the scalar-diagonal fallback.
+    ///
+    /// Derive from `ParameterBlockSpec` slices via
+    /// [`crate::families::custom_family::block_offsets_from_specs`], or from
+    /// `EngineLayout.terms[*].col_range` for standard multi-term GAMs.
+    /// When `None`, the preconditioner falls back to scalar-diagonal Jacobi
+    /// (the pre-block-Jacobi behaviour); when `Some([])` (empty slice), the
+    /// same fallback applies.
+    pub block_offsets: Option<Arc<[Range<usize>]>>,
 }
 
 impl Default for LatentInnerOptions {
@@ -88,6 +106,7 @@ impl Default for LatentInnerOptions {
             max_ridge: 1e12,
             solver_mode: None,
             trust_region_radius: 1.0,
+            block_offsets: None,
         }
     }
 }
@@ -216,6 +235,18 @@ impl<'a, A: ArrowSystemAssembler> LatentInnerSolver<'a, A> {
                 .assemble(self.beta.view(), self.latent)
                 .map_err(|e| format!("LatentInnerSolver: assembler failed at iter {iter}: {e}"))?;
             system.apply_riemannian_latent_geometry(self.latent);
+            // Wire per-term β-block ranges so block-Jacobi engages in the PCG
+            // preconditioner. Mirrors the PIRLS-driver wiring at
+            // `pirls::runworking_model_pirls` line 5169–5171: the driver calls
+            // `set_block_offsets` from `ArrowSchurInnerConfig.block_offsets` on
+            // every system returned by the `build` closure. Here the assembler
+            // owns the system, so the LatentInnerSolver is the natural place to
+            // inject the offsets — one call per assembled system covers all
+            // families that supply block ranges via `LatentInnerOptions` rather
+            // than baking the call into each assembler impl.
+            if let Some(offsets) = opts.block_offsets.as_ref() {
+                system.set_block_offsets(offsets.clone());
+            }
 
             // Convergence test: relative joint gradient norm.
             let g_norm_sq = system_gradient_norm_sq(&system);

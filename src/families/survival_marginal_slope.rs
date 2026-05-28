@@ -17579,6 +17579,279 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
     }
 }
 
+// ── β-dependent Jacobian callbacks for the three primary blocks ──────────
+//
+// Three n_outputs=3 stacked Jacobians (one per primary output: η0, η1, ad1).
+// Row ordering: all n rows for η0, then all n rows for η1, then all n rows ad1.
+//
+// Family scalars struct: passed through FamilyLinearizationState when the
+// family has evaluated β and needs the β-dependent per-row values.
+// At initialization (β=0, family_scalars=None) callbacks fall back to the
+// β=0 linearization: c=1, g=0, q0=0, q1=0, qd1=0.
+
+/// Per-row scalars for survival marginal-slope Jacobian evaluation at a given β.
+///
+/// Fields:
+/// - `q0_i`: entry-time probit argument (per-row, length n)
+/// - `q1_i`: exit-time probit argument (per-row, length n)
+/// - `qd1_i`: derivative probit argument (per-row, length n)
+/// - `g_i`: per-row log-slope value `g = logslope_design · β_logslope`
+/// - `c_i`: `sqrt(1 + (s·g_i)²)` (per-row, length n)
+/// - `s`: probit scale (scalar, = `probit_frailty_scale()`)
+/// - `z_i`: per-row covariate score (length n)
+/// - `observed_g_i`: per-row observed baseline g (length n, pre-β contribution)
+pub struct SurvivalMarginalSlopeFamilyScalars {
+    pub q0_i: Vec<f64>,
+    pub q1_i: Vec<f64>,
+    pub qd1_i: Vec<f64>,
+    pub g_i: Vec<f64>,
+    pub c_i: Vec<f64>,
+    pub s: f64,
+    pub z_i: Vec<f64>,
+    pub observed_g_i: Vec<f64>,
+}
+
+impl SurvivalMarginalSlopeFamilyScalars {
+    /// Construct with c_i computed from g_i and s.
+    pub fn new(
+        q0_i: Vec<f64>,
+        q1_i: Vec<f64>,
+        qd1_i: Vec<f64>,
+        g_i: Vec<f64>,
+        s: f64,
+        z_i: Vec<f64>,
+        observed_g_i: Vec<f64>,
+    ) -> Self {
+        let c_i: Vec<f64> = g_i.iter().map(|&g| (1.0 + (s * g).powi(2)).sqrt()).collect();
+        Self {
+            q0_i,
+            q1_i,
+            qd1_i,
+            g_i,
+            c_i,
+            s,
+            z_i,
+            observed_g_i,
+        }
+    }
+}
+
+/// n_outputs=3 stacked Jacobian for the logslope block.
+///
+/// The logslope block contributes `g_i = logslope_design[i] · β` to each row.
+/// The three stacked output rows for row i are:
+///
+/// ```text
+/// ∂η0[i]/∂β = (q0[i] · s²·g[i]/c[i] + s·z[i]) · G[i,:]
+/// ∂η1[i]/∂β = (q1[i] · s²·g[i]/c[i] + s·z[i]) · G[i,:]
+/// ∂ad1[i]/∂β = qd1[i] · s²·g[i]/c[i] · G[i,:]
+/// ```
+///
+/// At g=0 (β=0 init): c=1, s²·g/c=0, so:
+/// ```text
+/// ∂η0[i]/∂β = s·z[i] · G[i,:]
+/// ∂η1[i]/∂β = s·z[i] · G[i,:]
+/// ∂ad1[i]/∂β = 0
+/// ```
+pub struct LogslopeBlockJacobian {
+    /// The logslope basis design (n × p_logslope).
+    design: Array2<f64>,
+    /// Per-row covariate score z_i (length n).
+    z: Vec<f64>,
+    /// Probit scale s.
+    s: f64,
+}
+
+impl LogslopeBlockJacobian {
+    pub fn new(design: Array2<f64>, z: Vec<f64>, s: f64) -> Self {
+        Self { design, z, s }
+    }
+}
+
+impl crate::custom_family::BlockEffectiveJacobian for LogslopeBlockJacobian {
+    fn effective_jacobian_at(
+        &self,
+        state: &crate::custom_family::FamilyLinearizationState<'_>,
+    ) -> Result<Array2<f64>, String> {
+        let n = self.design.nrows();
+        let p = self.design.ncols();
+        let s = self.s;
+
+        // Try to get per-row scalars from family_scalars.
+        let scalars: Option<&SurvivalMarginalSlopeFamilyScalars> = state
+            .family_scalars
+            .as_ref()
+            .and_then(|a| a.downcast_ref::<SurvivalMarginalSlopeFamilyScalars>());
+
+        let mut jac = Array2::<f64>::zeros((3 * n, p));
+
+        for i in 0..n {
+            let (q0, q1, qd1, g, c) = match scalars {
+                Some(sc) => (sc.q0_i[i], sc.q1_i[i], sc.qd1_i[i], sc.g_i[i], sc.c_i[i]),
+                None => (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64, 1.0_f64),
+            };
+            let z_i = self.z[i];
+            let sg_over_c = if g == 0.0 { 0.0 } else { s * s * g / c };
+            let coeff_eta0 = q0 * sg_over_c + s * z_i;
+            let coeff_eta1 = q1 * sg_over_c + s * z_i;
+            let coeff_ad1 = qd1 * sg_over_c;
+
+            for j in 0..p {
+                let g_ij = self.design[[i, j]];
+                jac[[i, j]] = coeff_eta0 * g_ij;
+                jac[[n + i, j]] = coeff_eta1 * g_ij;
+                jac[[2 * n + i, j]] = coeff_ad1 * g_ij;
+            }
+        }
+        Ok(jac)
+    }
+
+    fn n_outputs(&self) -> usize {
+        3
+    }
+}
+
+/// n_outputs=3 stacked Jacobian for the marginal block.
+///
+/// The marginal block contributes identically to q0 and q1 (both entry and
+/// exit probit arguments) but not to ad1 (the derivative). The stacked Jacobian is:
+///
+/// ```text
+/// ∂η0[i]/∂β = c[i] · M[i,:]
+/// ∂η1[i]/∂β = c[i] · M[i,:]
+/// ∂ad1[i]/∂β = 0
+/// ```
+///
+/// At g=0 (β=0 init): c=1, so each row is just M[i,:].
+pub struct MarginalBlockJacobian {
+    /// The marginal basis design (n × p_marginal).
+    design: Array2<f64>,
+}
+
+impl MarginalBlockJacobian {
+    pub fn new(design: Array2<f64>) -> Self {
+        Self { design }
+    }
+}
+
+impl crate::custom_family::BlockEffectiveJacobian for MarginalBlockJacobian {
+    fn effective_jacobian_at(
+        &self,
+        state: &crate::custom_family::FamilyLinearizationState<'_>,
+    ) -> Result<Array2<f64>, String> {
+        let n = self.design.nrows();
+        let p = self.design.ncols();
+
+        let scalars: Option<&SurvivalMarginalSlopeFamilyScalars> = state
+            .family_scalars
+            .as_ref()
+            .and_then(|a| a.downcast_ref::<SurvivalMarginalSlopeFamilyScalars>());
+
+        let mut jac = Array2::<f64>::zeros((3 * n, p));
+
+        for i in 0..n {
+            let c = match scalars {
+                Some(sc) => sc.c_i[i],
+                None => 1.0_f64,
+            };
+            for j in 0..p {
+                let m_ij = c * self.design[[i, j]];
+                jac[[i, j]] = m_ij;
+                jac[[n + i, j]] = m_ij;
+                // jac[[2*n + i, j]] = 0 — ad1 row stays zero
+            }
+        }
+        Ok(jac)
+    }
+
+    fn n_outputs(&self) -> usize {
+        3
+    }
+}
+
+/// n_outputs=3 stacked Jacobian for the time block.
+///
+/// The time block contributes separately to η0 (entry), η1 (exit), and ad1
+/// (derivative) via three distinct design matrices. The stacked Jacobian is:
+///
+/// ```text
+/// ∂η0[i]/∂β = c[i] · T_entry[i,:]
+/// ∂η1[i]/∂β = c[i] · T_exit[i,:]
+/// ∂ad1[i]/∂β = c[i] · T_deriv[i,:]
+/// ```
+///
+/// At g=0 (β=0 init): c=1.
+pub struct TimeBlockJacobian {
+    design_entry: Array2<f64>,
+    design_exit: Array2<f64>,
+    design_deriv: Array2<f64>,
+}
+
+impl TimeBlockJacobian {
+    pub fn new(
+        design_entry: Array2<f64>,
+        design_exit: Array2<f64>,
+        design_deriv: Array2<f64>,
+    ) -> Self {
+        Self {
+            design_entry,
+            design_exit,
+            design_deriv,
+        }
+    }
+}
+
+impl crate::custom_family::BlockEffectiveJacobian for TimeBlockJacobian {
+    fn effective_jacobian_at(
+        &self,
+        state: &crate::custom_family::FamilyLinearizationState<'_>,
+    ) -> Result<Array2<f64>, String> {
+        let n = self.design_entry.nrows();
+        let p = self.design_entry.ncols();
+
+        if self.design_exit.nrows() != n || self.design_deriv.nrows() != n {
+            return Err(format!(
+                "TimeBlockJacobian: design row count mismatch \
+                 entry={n} exit={} deriv={}",
+                self.design_exit.nrows(),
+                self.design_deriv.nrows(),
+            ));
+        }
+        if self.design_exit.ncols() != p || self.design_deriv.ncols() != p {
+            return Err(format!(
+                "TimeBlockJacobian: design col count mismatch \
+                 entry={p} exit={} deriv={}",
+                self.design_exit.ncols(),
+                self.design_deriv.ncols(),
+            ));
+        }
+
+        let scalars: Option<&SurvivalMarginalSlopeFamilyScalars> = state
+            .family_scalars
+            .as_ref()
+            .and_then(|a| a.downcast_ref::<SurvivalMarginalSlopeFamilyScalars>());
+
+        let mut jac = Array2::<f64>::zeros((3 * n, p));
+
+        for i in 0..n {
+            let c = match scalars {
+                Some(sc) => sc.c_i[i],
+                None => 1.0_f64,
+            };
+            for j in 0..p {
+                jac[[i, j]] = c * self.design_entry[[i, j]];
+                jac[[n + i, j]] = c * self.design_exit[[i, j]];
+                jac[[2 * n + i, j]] = c * self.design_deriv[[i, j]];
+            }
+        }
+        Ok(jac)
+    }
+
+    fn n_outputs(&self) -> usize {
+        3
+    }
+}
+
 // ── Building block specs ──────────────────────────────────────────────
 
 fn build_time_blockspec(
@@ -20106,6 +20379,31 @@ pub fn fit_survival_marginal_slope_terms(
                 );
             }
             Err(err) => {
+                // Pilot audit policy: warn-and-proceed (exploratory).
+                //
+                // The pilot is a pure warm-start coefficient initialiser — it
+                // runs at ρ=0 (no smoothing penalty) with a capped inner-cycle
+                // budget solely to seed β hints for the first real inner solve.
+                // Rank-deficiency at the pilot stage is a known hazard: the
+                // zero-penalty rigid design can expose directions that become
+                // identifiable once the outer optimizer selects a non-zero ρ.
+                // Raising here would abort the entire fit for a transient
+                // structural artifact of the exploration point, not a property
+                // of the actual penalised model.
+                //
+                // Contrast with the outer-inner-fit audit policy (fail-fatal):
+                // `fit_custom_family` routes through
+                // `canonicalize_for_identifiability`, which returns
+                // `CustomFamilyError::IdentifiabilityFailure` on a fatal audit.
+                // At the outer fit the full penalty is in play; rank-deficiency
+                // there is a genuine model-specification problem that must be
+                // surfaced to the caller rather than silently absorbed.
+                //
+                // In short: pilot tolerates rank-deficiency because it is
+                // exploring ρ=0 (a singularity the outer optimizer will never
+                // actually accept); outer-inner-fit does not because it operates
+                // at the penalised optimum where identifiability is a hard
+                // contract.
                 log::warn!(
                     "[survival-marginal-slope/pilot] end status=ignored-error elapsed={:.3}s error={}",
                     pilot_started.elapsed().as_secs_f64(),

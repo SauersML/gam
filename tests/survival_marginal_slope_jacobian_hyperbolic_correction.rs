@@ -55,7 +55,7 @@ use gam::custom_family::{
 use gam::families::identifiability_compiler::{IdentityRowHessian, RowJacobianOperator};
 use gam::linalg::matrix::{DenseDesignMatrix, DesignMatrix};
 use gam::solver::identifiability_audit::audit_identifiability_channel_aware;
-use ndarray::{Array1, Array2, Array3, s};
+use ndarray::{Array1, Array2, Array3};
 use std::any::Any;
 use std::sync::Arc;
 
@@ -881,9 +881,6 @@ fn channel_aware_audit_overlap_below_one_at_moderate_beta() {
     // At β_marg = 0 (no marginal predictor shift), g_marg = 0, c_i = 1 for all i.
     let c_marginal = Array1::<f64>::ones(N);
 
-    // Logslope scalars at moderate beta_logslope.
-    let scalars = compute_row_scalars(&data.phi, &beta_logslope, s_f);
-
     // Build RowJacobianOperator instances.
     let logslope_op = Arc::new(LogslopeOperator {
         phi: data.phi.clone(),
@@ -949,8 +946,6 @@ fn channel_aware_audit_overlap_below_one_at_moderate_beta() {
         audit.summary,
     );
 
-    // Document scalars for observability.
-    let _ = scalars;
 }
 
 /// The time block contributes `c * design` to both η0 and η1. At β_time = 0
