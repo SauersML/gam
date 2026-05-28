@@ -720,23 +720,23 @@ impl ParameterBlockSpec {
             initial_beta: None,
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
         }
     }
 
-    /// Returns the identifiability-audit view of this block.
+    /// Returns the eta-producing operator used by the solver.
     ///
     /// Resolution order:
-    ///   1. `audit_design = Some(d)` → return `d` (explicit override).
-    ///   2. otherwise → return `&self.design` (the eta-producing operator
-    ///      is also the audit view, which is correct whenever
-    ///      `design.nrows() == n_obs`).
+    ///   1. `stacked_design = Some(d)` → return `d` (multi-channel
+    ///      operator, e.g. `(3n × p)` for survival time-varying blocks).
+    ///   2. otherwise → return `&self.design` (the single-channel default).
     ///
-    /// Callers in the identifiability audit must use this accessor instead
-    /// of `&self.design` so multi-channel blocks (whose `design.nrows() > n_obs`)
-    /// can supply a dedicated `n_obs × p` audit view.
-    pub fn audit_design(&self) -> &DesignMatrix {
-        self.audit_design.as_ref().unwrap_or(&self.design)
+    /// Solver code that needs `eta = D · β` MUST call this accessor;
+    /// reading `&self.design` directly silently breaks multi-channel
+    /// (survival LS time-varying) blocks because `self.design.nrows()`
+    /// always equals `n_obs`, never `3·n_obs`.
+    pub fn solver_design(&self) -> &DesignMatrix {
+        self.stacked_design.as_ref().unwrap_or(&self.design)
     }
 
     /// Returns the effective design `D_eff` for this block at β = 0 with no

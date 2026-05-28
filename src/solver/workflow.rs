@@ -2717,6 +2717,19 @@ pub struct FitConfig {
     /// fits candidates through the ordinary workflow; this slot lets callers
     /// request and validate that path from the same config registry.
     pub topology_auto_selector: Option<crate::solver::topology_selector::TopologyAutoSelector>,
+    /// `gamfit.fit(..., smooths={...})` Python kwarg routed through the FFI
+    /// bridge. JSON object keyed by formula symbol (single column name or
+    /// comma-joined tuple) → smooth descriptor (`{"kind": "duchon",
+    /// "centers": [[...], ...], ...}`). Applied as a post-processing step on
+    /// the [`TermCollectionSpec`] produced by the formula DSL: each smooth
+    /// term whose `feature_cols` match a registry key has its kind-specific
+    /// tunables (centers, knots, kernel hyperparameters) overridden with the
+    /// user-supplied values. The single canonical lowering path guarantees
+    /// `smooths={"x": Duchon(centers=K)}` (integer) produces a bit-identical
+    /// block spec to writing `duchon(x, centers=K)` in the formula; only
+    /// explicit array-valued `centers=` differs, routing through
+    /// `CenterStrategy::UserProvided` instead of `FarthestPoint`/`EqualMass`.
+    pub smooth_overrides: Option<JsonValue>,
 }
 
 impl Default for FitConfig {
@@ -2762,6 +2775,7 @@ impl Default for FitConfig {
             latents: None,
             analytic_penalties: None,
             topology_auto_selector: None,
+            smooth_overrides: None,
         }
     }
 }
@@ -3268,9 +3282,50 @@ pub(crate) fn build_termspec_with_geometry(
     scale_dimensions: bool,
     policy: &crate::resource::ResourcePolicy,
 ) -> Result<TermCollectionSpec, WorkflowError> {
+    build_termspec_with_geometry_and_overrides(
+        terms,
+        data,
+        col_map,
+        inference_notes,
+        scale_dimensions,
+        policy,
+        None,
+    )
+}
+
+/// Variant of [`build_termspec_with_geometry`] that also applies the
+/// `gamfit.fit(..., smooths={...})` Python override registry, threading
+/// caller-supplied basis configuration (explicit center coordinate
+/// matrices, knot vectors, kernel hyperparameters) onto the
+/// `TermCollectionSpec` the formula DSL produced.
+///
+/// This is the single canonical lowering path: the formula DSL always builds
+/// the initial `SmoothBasisSpec`, then any registry entry whose
+/// `feature_cols` match the term's column set replaces the spec's
+/// kind-specific tunables in place. When all descriptor fields default to
+/// the same values the DSL would auto-pick, the override is a no-op and the
+/// spec is bit-identical to the formula-only path.
+pub(crate) fn build_termspec_with_geometry_and_overrides(
+    terms: &[ParsedTerm],
+    data: &Dataset,
+    col_map: &HashMap<String, usize>,
+    inference_notes: &mut Vec<String>,
+    scale_dimensions: bool,
+    policy: &crate::resource::ResourcePolicy,
+    smooth_overrides: Option<&JsonValue>,
+) -> Result<TermCollectionSpec, WorkflowError> {
     let mut spec = build_termspec(terms, data, col_map, inference_notes, policy)?;
     if scale_dimensions {
         enable_scale_dimensions(&mut spec);
+    }
+    if let Some(overrides) = smooth_overrides {
+        crate::terms::smooth_overrides::apply_smooth_overrides(
+            &mut spec,
+            overrides,
+            data,
+            inference_notes,
+        )
+        .map_err(|reason| WorkflowError::InvalidConfig { reason })?;
     }
     Ok(spec)
 }
