@@ -4289,7 +4289,8 @@ fn prepare_survival_location_scale_model(
     // `solver_design()` / `solver_offset()`.  The audit and shape policy
     // only read `spec.design`, so every block's audit-visible row count
     // is `n`.
-    let time_canonical_design: DesignMatrix = time_prepared.design_exit.clone();
+    let time_canonical_design: DesignMatrix =
+        DesignMatrix::Dense(DenseDesignMatrix::from(time_prepared.design_exit.clone()));
     let timespec = ParameterBlockSpec {
         name: "time_transform".to_string(),
         design: time_canonical_design,
