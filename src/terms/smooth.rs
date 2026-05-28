@@ -9346,7 +9346,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         initial_log_lambdas: Array1::from_vec(retained_log_lambdas.clone()),
         initial_beta: Some(baseline.fit.beta.clone()),
         gauge_priority: 100,
-        row_scaling: None,
+        eta_row_scaling: None,
         jacobian_callback: None,
     };
     let screening_cap = Arc::new(AtomicUsize::new(0));
@@ -9747,7 +9747,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         initial_log_lambdas: Array1::zeros(0),
         initial_beta: Some(baseline.fit.beta.clone()),
         gauge_priority: 100,
-        row_scaling: None,
+        eta_row_scaling: None,
         jacobian_callback: None,
     };
     let final_fit = fit_custom_family(
@@ -12242,7 +12242,7 @@ fn fit_bounded_term_collection_with_design(
         initial_log_lambdas,
         initial_beta: Some(initial_beta),
         gauge_priority: 100,
-        row_scaling: None,
+        eta_row_scaling: None,
         jacobian_callback: None,
     };
     let fit = fit_custom_family(
@@ -25992,7 +25992,7 @@ mod tests {
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(array![0.0, 0.0]),
             gauge_priority: 100,
-            row_scaling: None,
+            eta_row_scaling: None,
             jacobian_callback: None,
         };
         let deriv = CustomFamilyBlockPsiDerivative {
@@ -26498,7 +26498,7 @@ mod tests {
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(baseline.fit.beta.clone()),
             gauge_priority: 100,
-            row_scaling: None,
+            eta_row_scaling: None,
             jacobian_callback: None,
         };
         let outer_opts = BlockwiseFitOptions {
@@ -26707,7 +26707,7 @@ mod tests {
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(baseline.fit.beta.clone()),
             gauge_priority: 100,
-            row_scaling: None,
+            eta_row_scaling: None,
             jacobian_callback: None,
         };
         let outer_opts = BlockwiseFitOptions {

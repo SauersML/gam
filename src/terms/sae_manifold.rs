@@ -2962,6 +2962,98 @@ impl SaeManifoldTerm {
         }
         (assignment, ard)
     }
+
+    /// Build one [`crate::families::custom_family::ParameterBlockSpec`] per
+    /// decoder atom, wiring in [`SaeDecoderBlockJacobian`] so that
+    /// `effective_jacobian_at` returns the correct `(n·p, M_k·p)` Jacobian.
+    ///
+    /// # η decomposition
+    ///
+    /// The SAE linear predictor is
+    ///
+    /// ```text
+    /// η_i = Σ_k  a_ik · Φ_k(t_ik) · B_k   ∈ ℝ^p
+    /// ```
+    ///
+    /// For decoder block k (parameters `B_k ∈ ℝ^{M_k × p}`), the
+    /// contribution to `∂η_i / ∂B_k` is block-diagonal in the output
+    /// dimension:
+    ///
+    /// ```text
+    /// ∂η_i[out] / ∂B_k[m, out]  =  a_ik · Φ_k[i, m]
+    /// ∂η_i[out] / ∂B_k[m, out'] =  0     (out' ≠ out)
+    /// ```
+    ///
+    /// With `β_k` flattened row-major as `β_k[m·p + out] = B_k[m, out]`
+    /// the full Jacobian has shape `(n·p, M_k·p)` and entry
+    ///
+    /// ```text
+    /// J_k [ i·p + out,  m·p + out ]  =  a_ik · Φ_k[i, m]
+    /// ```
+    ///
+    /// (all other entries zero).  This is the `n_outputs = p` multi-output
+    /// structure that triggers `audit_identifiability_channel_aware` routing
+    /// when these specs are passed to the pre-fit audit.
+    ///
+    /// # n_outputs verdict
+    ///
+    /// `n_outputs = p` (the decoder output dimension, identical across all
+    /// atoms).  Each output dimension of η_i receives an independent
+    /// contribution from each decoder column, so the row Jacobian lives in
+    /// `ℝ^{p × M_k·p}` — i.e. K = p channels.  The flat `audit_identifiability`
+    /// incorrectly treats each `n×(M_k·p)` block as living in a common
+    /// `n`-dimensional row space and can produce false cross-atom aliases when
+    /// two atoms share similar basis evaluations at the same rows (a normal
+    /// occurrence in mixture models).  The channel-aware audit, operating on
+    /// the `(n·p) × (M_k·p)` weighted joint design, correctly sees that
+    /// atom contributions are separately identifiable through orthogonal
+    /// output channels.
+    ///
+    /// # Assignment weights
+    ///
+    /// The Jacobian at a fixed assignment state uses `a_ik` from the current
+    /// `self.assignment` (softmax / IBP-MAP / JumpReLU of the logits at the
+    /// provided β).  For the pre-fit audit (β = 0) these are the initial
+    /// assignment weights; for a mid-fit audit the caller should update the
+    /// assignment before calling this method.
+    pub fn decoder_parameter_block_specs(
+        &self,
+    ) -> Vec<crate::families::custom_family::ParameterBlockSpec> {
+        use crate::families::custom_family::ParameterBlockSpec;
+        use crate::linalg::matrix::{DenseDesignMatrix, DesignMatrix};
+
+        let n = self.n_obs();
+        let p = self.output_dim();
+        let assignments = self.assignment.assignments();
+        let mut specs = Vec::with_capacity(self.k_atoms());
+        for (atom_idx, atom) in self.atoms.iter().enumerate() {
+            let m = atom.basis_size();
+            // Flat design placeholder (n × M_k·p); not used directly by the
+            // audit when jacobian_callback is set, but required for shape
+            // consistency checks. Fill with zeros — the callback is authoritative.
+            let placeholder = Array2::<f64>::zeros((n, m * p));
+            let cb = Arc::new(SaeDecoderBlockJacobian {
+                atom_idx,
+                basis_values: atom.basis_values.clone(),
+                assignments_col: assignments.column(atom_idx).to_owned(),
+                n_outputs: p,
+                n_beta_cols: m * p,
+            });
+            specs.push(ParameterBlockSpec {
+                name: format!("sae_decoder_atom_{}", atom.name),
+                design: DesignMatrix::Dense(DenseDesignMatrix::from(placeholder)),
+                offset: Array1::<f64>::zeros(n),
+                penalties: Vec::new(),
+                nullspace_dims: Vec::new(),
+                initial_log_lambdas: Array1::<f64>::zeros(0),
+                initial_beta: None,
+                gauge_priority: 100,
+                row_scaling: None,
+                jacobian_callback: Some(cb),
+            });
+        }
+        specs
+    }
 }
 
 fn sae_manifold_newton_directional_decrease(

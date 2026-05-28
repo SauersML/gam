@@ -17860,6 +17860,34 @@ fn build_time_blockspec(
     rho: Array1<f64>,
     beta_hint: Option<Array1<f64>>,
 ) -> ParameterBlockSpec {
+    // Build the three dense design matrices for the multi-output Jacobian.
+    // Densification is cheap here (done once at construction, not per PIRLS
+    // iteration). Falls back to no callback if densification fails.
+    let jac_cb: Option<Arc<dyn crate::custom_family::BlockEffectiveJacobian>> = (|| {
+        let d_entry = time_block
+            .design_entry
+            .try_to_dense_arc("build_time_blockspec::entry")
+            .ok()?
+            .as_ref()
+            .clone();
+        let d_exit = design_exit
+            .try_to_dense_arc("build_time_blockspec::exit")
+            .ok()?
+            .as_ref()
+            .clone();
+        let d_deriv = time_block
+            .design_derivative_exit
+            .try_to_dense_arc("build_time_blockspec::deriv")
+            .ok()?
+            .as_ref()
+            .clone();
+        if d_entry.dim() != d_exit.dim() || d_entry.dim() != d_deriv.dim() {
+            return None;
+        }
+        Some(Arc::new(TimeBlockJacobian::new(d_entry, d_exit, d_deriv))
+            as Arc<dyn crate::custom_family::BlockEffectiveJacobian>)
+    })();
+
     ParameterBlockSpec {
         name: "time_surface".to_string(),
         design: design_exit.clone(),
@@ -17873,14 +17901,9 @@ fn build_time_blockspec(
         nullspace_dims: time_block.nullspace_dims.clone(),
         initial_log_lambdas: rho,
         initial_beta: beta_hint,
-        // Survival marginal-slope gauge-ownership policy: the baseline
-        // time surface owns the global intercept and the time-axis
-        // polynomial null space. Any direction aliased between
-        // time_surface and another block must be dropped from the
-        // OTHER block, so time_surface receives the highest priority.
         gauge_priority: 200,
         row_scaling: None,
-        jacobian_callback: None,
+        jacobian_callback: jac_cb,
     }
 }
 
@@ -17890,8 +17913,22 @@ fn build_logslope_blockspec(
     offset: &Array1<f64>,
     rho: Array1<f64>,
     beta_hint: Option<Array1<f64>>,
-    z_scaling: std::sync::Arc<[f64]>,
+    z_scaling: Arc<[f64]>,
+    probit_scale: f64,
 ) -> ParameterBlockSpec {
+    let z_vec = z_scaling.to_vec();
+    let jac_cb: Option<Arc<dyn crate::custom_family::BlockEffectiveJacobian>> = design
+        .design
+        .try_to_dense_arc("build_logslope_blockspec")
+        .ok()
+        .map(|d| {
+            Arc::new(LogslopeBlockJacobian::new(
+                d.as_ref().clone(),
+                z_vec,
+                probit_scale,
+            )) as Arc<dyn crate::custom_family::BlockEffectiveJacobian>
+        });
+
     ParameterBlockSpec {
         name: "logslope_surface".to_string(),
         design: design.design.clone(),
@@ -17900,21 +17937,11 @@ fn build_logslope_blockspec(
         nullspace_dims: design.nullspace_dims.clone(),
         initial_log_lambdas: rho,
         initial_beta: beta_hint,
-        // Gauge ownership: logslope_surface owns z-by-PC slope
-        // variation; if it shares an affine direction with the time
-        // baseline or the marginal-PC main effect, the canonical-gauge
-        // selector drops it from logslope_surface (lower priority than
-        // time/marginal) before the inner solver sees the joint design.
         gauge_priority: 120,
-        // The logslope block's effective design for identifiability
-        // purposes is diag(z) · basis: the per-row z value scales each
-        // basis row, making the logslope contribution linearly
-        // independent of the marginal contribution despite sharing the
-        // same raw basis columns.  Without this scaling the flat RRQR
-        // audit sees two copies of the raw basis and flags them as a
-        // fatal alias.
+        // row_scaling kept as syntactic sugar for the β=0 flat single-output
+        // audit path. The callback takes precedence when set.
         row_scaling: Some(z_scaling),
-        jacobian_callback: None,
+        jacobian_callback: jac_cb,
     }
 }
 
@@ -17924,6 +17951,15 @@ fn build_marginal_blockspec(
     rho: Array1<f64>,
     beta_hint: Option<Array1<f64>>,
 ) -> ParameterBlockSpec {
+    let jac_cb: Option<Arc<dyn crate::custom_family::BlockEffectiveJacobian>> = design
+        .design
+        .try_to_dense_arc("build_marginal_blockspec")
+        .ok()
+        .map(|d| {
+            Arc::new(MarginalBlockJacobian::new(d.as_ref().clone()))
+                as Arc<dyn crate::custom_family::BlockEffectiveJacobian>
+        });
+
     ParameterBlockSpec {
         name: "marginal_surface".to_string(),
         design: design.design.clone(),
@@ -17932,15 +17968,9 @@ fn build_marginal_blockspec(
         nullspace_dims: design.nullspace_dims.clone(),
         initial_log_lambdas: rho,
         initial_beta: beta_hint,
-        // Gauge ownership: marginal_surface sits between time_surface
-        // (which owns the baseline) and logslope_surface (which owns
-        // z-slope variation). Shared affine directions with the time
-        // block are dropped from marginal_surface; shared affine
-        // directions with logslope_surface are dropped from
-        // logslope_surface.
         gauge_priority: 150,
         row_scaling: None,
-        jacobian_callback: None,
+        jacobian_callback: jac_cb,
     }
 }
 
