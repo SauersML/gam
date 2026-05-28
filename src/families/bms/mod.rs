@@ -1117,6 +1117,7 @@ pub(crate) use gradient_paths::{
 };
 pub(crate) use install_flex::{
     install_compiled_flex_block_into_runtime, project_monotone_feasible_beta,
-    standardize_latent_z_with_policy, validate_monotone_structural_feasible,
+    validate_monotone_structural_feasible,
 };
+pub(crate) use gradient_paths::standardize_latent_z_with_policy;
 pub(crate) use block_specs::{build_deviation_aux_blockspec, push_deviation_aux_blockspecs};
