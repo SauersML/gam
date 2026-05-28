@@ -4698,6 +4698,11 @@ where
     // Pre-allocated buffer for the regularized hessian to avoid O(p²) clone
     // per PIRLS iteration. Reused across iterations when dimensions match.
     let mut regularized_buf: Option<crate::linalg::matrix::SymmetricMatrix> = None;
+    // EMA of per-iter wall-clock for the timing-driven adaptive early-exit.
+    // α = 0.3 gives a short memory (~3 iters) so the EMA tracks the recent
+    // cost trend without over-reacting to a single cheap iteration.
+    // None until the first iter completes.
+    let mut ema_iter_elapsed_secs: Option<f64> = None;
 
     let penalizedobjective = |state: &WorkingState| {
         let mut value = state.deviance + state.penalty_term;
@@ -4881,9 +4886,9 @@ where
 
         // Capture the initial gradient norm at iter 1 (the first iter
         // where `state.gradient` has been computed by `update_with_curvature`).
-        // Used by the [PIRLS solve-end] summary log to report the
-        // geometric reduction factor.
-        if log::log_enabled!(log::Level::Info) && initial_gradient_norm.is_none() {
+        // Used by both the [PIRLS solve-end] summary log and the
+        // timing-driven adaptive early-exit predicate.
+        if initial_gradient_norm.is_none() {
             let g0_sq: f64 = state
                 .gradient
                 .iter()
@@ -5100,7 +5105,7 @@ where
                             match arrow_solve_result {
                                 Ok((delta_t, delta_beta)) => {
                                     let arrow_predicted_reduction =
-                                        match crate::solver::arrow_schur::arrow_quadratic_model_reduction(
+                                        match crate::solver::arrow_schur::arrow_bare_quadratic_model_reduction(
                                             &arrow_system,
                                             delta_t.view(),
                                             delta_beta.view(),

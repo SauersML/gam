@@ -47,7 +47,7 @@ use ndarray::{Array1, ArrayView1};
 
 use crate::solver::arrow_schur::{
     ArrowFactorCache, ArrowSchurError, ArrowSchurSystem, ArrowSolveOptions, ArrowSolverMode,
-    arrow_quadratic_model_reduction, solve_arrow_newton_step_with_options,
+    arrow_bare_quadratic_model_reduction, solve_arrow_newton_step_with_options,
 };
 use crate::terms::latent_coord::LatentCoordValues;
 
@@ -262,7 +262,7 @@ impl<'a, A: ArrowSystemAssembler> LatentInnerSolver<'a, A> {
                         solve_options.riemannian_trust_region,
                         solve_options.trust_region.radius,
                     );
-                    let predicted_reduction = arrow_quadratic_model_reduction(
+                    let predicted_reduction = arrow_bare_quadratic_model_reduction(
                         &system,
                         delta_t.view(),
                         delta_beta.view(),

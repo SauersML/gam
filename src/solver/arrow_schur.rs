@@ -94,9 +94,11 @@
 //! §7 and `proposals/composition_engine.md` §7 first.
 
 use ndarray::{Array1, Array2, ArrayView1};
+use std::ops::Range;
 use std::sync::Arc;
 
 use crate::cache::Fingerprinter;
+use crate::linalg::faer_ndarray::{FaerArrayView, FaerLlt};
 use crate::terms::analytic_penalties::{AnalyticPenaltyKind, AnalyticPenaltyRegistry, PenaltyTier};
 use crate::terms::latent_coord::{LatentCoordValues, LatentManifold};
 
@@ -831,6 +833,17 @@ pub struct ArrowSchurSystem {
     /// Combined with the materialized row blocks in
     /// [`Self::current_row_hessian_fingerprint`].
     pub analytic_row_hessian_fingerprint: u64,
+    /// Term-block column ranges for the block-Jacobi Schur preconditioner.
+    ///
+    /// Each entry `r` means that indices `r.start..r.end` belong to one
+    /// coefficient block (a GAM term or a custom parameter family from
+    /// `ParameterBlockSpec`). When populated via
+    /// [`Self::set_block_offsets`], the Jacobi preconditioner inverts the
+    /// full `b × b` Schur block for each term instead of only its diagonal.
+    ///
+    /// The default (empty slice) causes `JacobiPreconditioner` to fall back
+    /// to pure scalar diagonal inversion, preserving the pre-#283 behaviour.
+    pub block_offsets: Arc<[Range<usize>]>,
 }
 
 impl ArrowSchurSystem {
@@ -850,6 +863,7 @@ impl ArrowSchurSystem {
             manifold_mode_fingerprint: EUCLIDEAN_MANIFOLD_MODE_FINGERPRINT,
             row_hessian_fingerprint: 0,
             analytic_row_hessian_fingerprint: 0,
+            block_offsets: Arc::from([] as [Range<usize>; 0]),
         };
         sys.refresh_row_hessian_fingerprint();
         sys
@@ -886,6 +900,7 @@ impl ArrowSchurSystem {
             manifold_mode_fingerprint: EUCLIDEAN_MANIFOLD_MODE_FINGERPRINT,
             row_hessian_fingerprint: 0,
             analytic_row_hessian_fingerprint: 0,
+            block_offsets: Arc::from([] as [Range<usize>; 0]),
         };
         sys.refresh_row_hessian_fingerprint();
         sys
@@ -2034,13 +2049,17 @@ where
     })
 }
 
-/// Predicted reduction of the damped joint Arrow-Schur quadratic model.
+/// Predicted reduction of the *damped* joint Arrow-Schur quadratic model.
 ///
-/// The cross term deliberately uses the same stored `H_tβ` block sign as the
-/// Schur reduction and back-substitution:
+/// Includes the LM ridge terms in the quadratic:
 ///
-/// `m(δ) - m(0) = gᵀδ + 0.5 δᵀ(H + ridge)δ`.
-pub fn arrow_quadratic_model_reduction(
+/// `m(δ) - m(0) = gᵀδ + 0.5 δᵀ(H + ridge)δ`
+///
+/// Use this only for internal LM rejection logic that needs the damped model
+/// (e.g. checking whether a candidate step satisfies a trust-region condition
+/// against the augmented quadratic). For gain-ratio computations against the
+/// bare penalized objective, use [`arrow_bare_quadratic_model_reduction`].
+pub fn arrow_damped_quadratic_model_reduction(
     sys: &ArrowSchurSystem,
     delta_t: ArrayView1<'_, f64>,
     delta_beta: ArrayView1<'_, f64>,
@@ -2080,6 +2099,54 @@ pub fn arrow_quadratic_model_reduction(
     }
 
     Ok(-(lin + 0.5 * quad))
+}
+
+/// Predicted reduction of the *bare* joint Arrow-Schur quadratic model.
+///
+/// Drops the LM ridge contributions from the quadratic so the predicted
+/// reduction is measured against the same bare penalized objective that the
+/// actual reduction is measured against:
+///
+/// `m_bare(δ) - m_bare(0) = gᵀδ + 0.5 δᵀH δ`
+///
+/// Implemented as:
+///   damped_quad − 0.5·(ridge_beta·‖δβ‖² + ridge_t·‖δt‖²)
+///
+/// When #282 lands and damping becomes diagonal (`λD²` instead of scalar `λI`),
+/// replace the scalar `ridge_beta` / `ridge_t` correction with
+/// `0.5 · δβᵀ(D_beta²)δβ` and `0.5 · δtᵀ(D_t²)δt` respectively — the
+/// structure of this function already accepts per-scalar corrections; passing
+/// a per-coordinate D² diagonal merely requires looping over coordinates
+/// instead of multiplying by the squared norm.
+///
+/// Use this for PIRLS gain-ratio computations and any other place where the
+/// accept/reject criterion compares against the bare (non-augmented) objective.
+pub fn arrow_bare_quadratic_model_reduction(
+    sys: &ArrowSchurSystem,
+    delta_t: ArrayView1<'_, f64>,
+    delta_beta: ArrayView1<'_, f64>,
+    ridge_t: f64,
+    ridge_beta: f64,
+) -> Result<f64, ArrowSchurError> {
+    // Compute the damped version first, then subtract the ridge contributions
+    // to recover the bare-H quadratic.  This mirrors the beta-only PIRLS path:
+    //     δ'(H+λI)δ − λ‖δ‖² = δ'Hδ
+    let damped = arrow_damped_quadratic_model_reduction(
+        sys, delta_t, delta_beta, ridge_t, ridge_beta,
+    )?;
+    // Subtract 0.5 * (ridge_beta * ‖δβ‖² + ridge_t * ‖δt‖²).
+    // The sign convention: arrow_damped returns -(lin + 0.5*quad), so the
+    // ridge terms enter with a negative sign there.  To remove them we add
+    // back 0.5 * (ridge_beta * ‖δβ‖² + ridge_t * ‖δt‖²).
+    let ridge_beta_contrib = 0.5 * ridge_beta * delta_beta.dot(&delta_beta);
+    let ridge_t_contrib = {
+        let mut acc = 0.0_f64;
+        for v in delta_t.iter() {
+            acc += v * v;
+        }
+        0.5 * ridge_t * acc
+    };
+    Ok(damped + ridge_beta_contrib + ridge_t_contrib)
 }
 
 fn next_proximal_ridge(current: f64, growth: f64) -> f64 {
