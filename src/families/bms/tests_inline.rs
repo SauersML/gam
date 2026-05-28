@@ -3011,7 +3011,6 @@ mod tests {
                 initial_log_lambdas: ndarray::Array1::zeros(2),
                 initial_beta: None,
                 gauge_priority: 100,
-                eta_row_scaling: None,
                 jacobian_callback: None,
             })
             .collect();
@@ -3040,7 +3039,6 @@ mod tests {
                 initial_log_lambdas: ndarray::Array1::zeros(10),
                 initial_beta: None,
                 gauge_priority: 100,
-                eta_row_scaling: None,
                 jacobian_callback: None,
             })
             .collect();
@@ -3150,7 +3148,6 @@ mod tests {
                 initial_log_lambdas: Array1::zeros(1),
                 initial_beta: None,
                 gauge_priority: 100,
-                eta_row_scaling: None,
                 jacobian_callback: None,
             },
             ParameterBlockSpec {
@@ -3164,7 +3161,6 @@ mod tests {
                 initial_log_lambdas: Array1::zeros(1),
                 initial_beta: None,
                 gauge_priority: 100,
-                eta_row_scaling: None,
                 jacobian_callback: None,
             },
         ];

@@ -11349,7 +11349,7 @@ impl BernoulliMarginalSlopeFamily {
 }
 
 impl CustomFamily for BernoulliMarginalSlopeFamily {
-    pub(super) fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
+    fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
         true
     }
 
@@ -11374,11 +11374,11 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
     // genuine null space and remains correct if a residual one ever
     // re-appears (defense in depth, mirroring
     // BinomialLocationScaleWiggleFamily).
-    pub(super) fn pseudo_logdet_mode(&self) -> crate::custom_family::PseudoLogdetMode {
+    fn pseudo_logdet_mode(&self) -> crate::custom_family::PseudoLogdetMode {
         crate::custom_family::PseudoLogdetMode::HardPseudo
     }
 
-    pub(super) fn coefficient_hessian_cost(&self, specs: &[ParameterBlockSpec]) -> u64 {
+    fn coefficient_hessian_cost(&self, specs: &[ParameterBlockSpec]) -> u64 {
         // Operator-aware: rigid Bernoulli marginal-slope wires the K=2
         // RowKernel through a matrix-free workspace that applies joint Hv at
         // O(n · (p_marginal + p_logslope + p_flex)) per call. Only fall back
@@ -11396,7 +11396,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         }
     }
 
-    pub(super) fn exact_outer_derivative_order(
+    fn exact_outer_derivative_order(
         &self,
         specs: &[ParameterBlockSpec],
         options: &BlockwiseFitOptions,
@@ -11461,7 +11461,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         order
     }
 
-    pub(super) fn outer_seed_config(&self, n_params: usize) -> crate::seeding::SeedConfig {
+    fn outer_seed_config(&self, n_params: usize) -> crate::seeding::SeedConfig {
         let mut config = crate::seeding::SeedConfig::default();
         if n_params == 0 {
             return config;
@@ -11472,11 +11472,11 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         config
     }
 
-    pub(super) fn exact_newton_joint_psi_workspace_for_first_order_terms(&self) -> bool {
+    fn exact_newton_joint_psi_workspace_for_first_order_terms(&self) -> bool {
         true
     }
 
-    pub(super) fn batched_outer_gradient_terms(
+    fn batched_outer_gradient_terms(
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
@@ -11786,19 +11786,19 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         }))
     }
 
-    pub(super) fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+    fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         self.validate_exact_monotonicity(block_states)?;
         self.evaluate_blockwise_exact_newton(block_states)
     }
 
-    pub(super) fn log_likelihood_only(&self, block_states: &[ParameterBlockState]) -> Result<f64, String> {
+    fn log_likelihood_only(&self, block_states: &[ParameterBlockState]) -> Result<f64, String> {
         Self::log_likelihood_only_with_options(self, block_states, &BlockwiseFitOptions::default())
     }
 
     /// Options-aware override: outer hyper-derivative callers may pass a row
     /// subsample, while coefficient inner line searches clear that option and
     /// evaluate the exact full-data objective.
-    pub(super) fn log_likelihood_only_with_options(
+    fn log_likelihood_only_with_options(
         &self,
         block_states: &[ParameterBlockState],
         options: &BlockwiseFitOptions,
@@ -11806,11 +11806,11 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         Self::log_likelihood_only_with_options(self, block_states, options)
     }
 
-    pub(super) fn supports_log_likelihood_early_exit(&self) -> bool {
+    fn supports_log_likelihood_early_exit(&self) -> bool {
         true
     }
 
-    pub(super) fn joint_line_search_log_likelihood_workspace(
+    fn joint_line_search_log_likelihood_workspace(
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
@@ -11828,11 +11828,11 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         Ok(Some((log_likelihood, workspace)))
     }
 
-    pub(super) fn has_explicit_joint_hessian(&self) -> bool {
+    fn has_explicit_joint_hessian(&self) -> bool {
         true
     }
 
-    pub(super) fn exact_newton_joint_hessian(
+    fn exact_newton_joint_hessian(
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<Option<Array2<f64>>, String> {
@@ -11873,7 +11873,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
             .map(Some)
     }
 
-    pub(super) fn exact_newton_joint_gradient_evaluation(
+    fn exact_newton_joint_gradient_evaluation(
         &self,
         block_states: &[ParameterBlockState],
         block_specs: &[ParameterBlockSpec],
@@ -11901,11 +11901,11 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
             .map(Some)
     }
 
-    pub(super) fn requires_joint_outer_hyper_path(&self) -> bool {
+    fn requires_joint_outer_hyper_path(&self) -> bool {
         true
     }
 
-    pub(super) fn exact_newton_joint_hessian_workspace(
+    fn exact_newton_joint_hessian_workspace(
         &self,
         block_states: &[ParameterBlockState],
         block_specs: &[ParameterBlockSpec],
@@ -11927,7 +11927,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         }
     }
 
-    pub(super) fn exact_newton_joint_hessian_workspace_with_options(
+    fn exact_newton_joint_hessian_workspace_with_options(
         &self,
         block_states: &[ParameterBlockState],
         block_specs: &[ParameterBlockSpec],
@@ -11960,7 +11960,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         }
     }
 
-    pub(super) fn inner_coefficient_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
+    fn inner_coefficient_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
         // The workspace impl above unconditionally returns `Some(workspace)`
         // — the rigid path produces a `RowKernelHessianWorkspace` and the
         // flex path produces a
@@ -11971,11 +11971,11 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         parameter_block_specs_match_rows(specs, self.y.len())
     }
 
-    pub(super) fn inner_joint_workspace_gradient_available(&self, specs: &[ParameterBlockSpec]) -> bool {
+    fn inner_joint_workspace_gradient_available(&self, specs: &[ParameterBlockSpec]) -> bool {
         parameter_block_specs_match_rows(specs, self.y.len())
     }
 
-    pub(super) fn inner_joint_workspace_log_likelihood_available(&self, specs: &[ParameterBlockSpec]) -> bool {
+    fn inner_joint_workspace_log_likelihood_available(&self, specs: &[ParameterBlockSpec]) -> bool {
         parameter_block_specs_match_rows(specs, self.y.len())
     }
 
@@ -11990,7 +11990,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
     /// converges in a handful of iters. The generic gate only fires for
     /// `p >= 128`, but BMS-flex per-row work is heavy enough that the matrix-
     /// free path wins well below that — drop the `p` floor for this family.
-    pub(super) fn prefers_matrix_free_inner_joint(
+    fn prefers_matrix_free_inner_joint(
         &self,
         specs: &[ParameterBlockSpec],
         states: &[ParameterBlockState],
@@ -12002,7 +12002,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         self.effective_flex_active(states).unwrap_or(false)
     }
 
-    pub(super) fn exact_newton_joint_hessian_directional_derivative(
+    fn exact_newton_joint_hessian_directional_derivative(
         &self,
         block_states: &[ParameterBlockState],
         d_beta_flat: &Array1<f64>,
@@ -12026,7 +12026,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         }
     }
 
-    pub(super) fn exact_newton_joint_hessiansecond_directional_derivative(
+    fn exact_newton_joint_hessiansecond_directional_derivative(
         &self,
         block_states: &[ParameterBlockState],
         d_beta_u_flat: &Array1<f64>,
@@ -12054,7 +12054,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         }
     }
 
-    pub(super) fn exact_newton_joint_psi_terms(
+    fn exact_newton_joint_psi_terms(
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
@@ -12073,7 +12073,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         )
     }
 
-    pub(super) fn exact_newton_joint_psisecond_order_terms(
+    fn exact_newton_joint_psisecond_order_terms(
         &self,
         block_states: &[ParameterBlockState],
         block_specs: &[ParameterBlockSpec],
@@ -12103,7 +12103,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         )
     }
 
-    pub(super) fn exact_newton_joint_psihessian_directional_derivative(
+    fn exact_newton_joint_psihessian_directional_derivative(
         &self,
         block_states: &[ParameterBlockState],
         block_specs: &[ParameterBlockSpec],
@@ -12126,7 +12126,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         )
     }
 
-    pub(super) fn exact_newton_joint_psi_workspace(
+    fn exact_newton_joint_psi_workspace(
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
@@ -12143,7 +12143,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         )))
     }
 
-    pub(super) fn exact_newton_joint_psi_workspace_with_options(
+    fn exact_newton_joint_psi_workspace_with_options(
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
@@ -12161,7 +12161,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         )))
     }
 
-    pub(super) fn block_linear_constraints(
+    fn block_linear_constraints(
         &self,
         block_states: &[ParameterBlockState],
         block_idx: usize,
@@ -12188,7 +12188,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         Ok(None)
     }
 
-    pub(super) fn post_update_block_beta(
+    fn post_update_block_beta(
         &self,
         block_states: &[ParameterBlockState],
         block_idx: usize,
@@ -12344,7 +12344,7 @@ impl BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
 }
 
 impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
-    pub(super) fn hessian_dense(&self) -> Result<Option<Array2<f64>>, String> {
+    fn hessian_dense(&self) -> Result<Option<Array2<f64>>, String> {
         if self.cache.slices.total >= 512 {
             return Ok(None);
         }
@@ -12403,7 +12403,7 @@ impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJoint
             .map(|fused| Some(fused.hessian.clone()))
     }
 
-    pub(super) fn hessian_dense_forced(&self) -> Result<Option<Array2<f64>>, String> {
+    fn hessian_dense_forced(&self) -> Result<Option<Array2<f64>>, String> {
         // Callers that genuinely require a dense joint Hessian (e.g. outer
         // batched-gradient assembly that pulls back the dense `H_β`) bypass
         // the matrix-free route gate above. The fused row pass is still the
@@ -12449,13 +12449,13 @@ impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJoint
             .map(|fused| Some(fused.hessian.clone()))
     }
 
-    pub(super) fn joint_log_likelihood_evaluation(&self) -> Result<Option<f64>, String> {
+    fn joint_log_likelihood_evaluation(&self) -> Result<Option<f64>, String> {
         self.family
             .log_likelihood_from_exact_cache(&self.block_states, &self.cache)
             .map(Some)
     }
 
-    pub(super) fn joint_gradient_evaluation(
+    fn joint_gradient_evaluation(
         &self,
     ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
         if self.cache.slices.total < 512 && !self.matrix_free_inner_route() {
@@ -12478,11 +12478,11 @@ impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJoint
             .map(Some)
     }
 
-    pub(super) fn hessian_matvec_available(&self) -> bool {
+    fn hessian_matvec_available(&self) -> bool {
         true
     }
 
-    pub(super) fn hessian_matvec(&self, beta_flat: &Array1<f64>) -> Result<Option<Array1<f64>>, String> {
+    fn hessian_matvec(&self, beta_flat: &Array1<f64>) -> Result<Option<Array1<f64>>, String> {
         // Hv-action against the full coefficient Hessian is consumed by inner
         // PCG / inner-Newton paths (not outer-only score), so the row mask
         // does not apply here — keep full-data semantics.
@@ -12515,7 +12515,7 @@ impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJoint
         result
     }
 
-    pub(super) fn hessian_matvec_into(&self, v: &Array1<f64>, out: &mut Array1<f64>) -> Result<bool, String> {
+    fn hessian_matvec_into(&self, v: &Array1<f64>, out: &mut Array1<f64>) -> Result<bool, String> {
         let call = self.matvec_calls.fetch_add(1, Ordering::Relaxed) + 1;
         let started = std::time::Instant::now();
         let heartbeat_guard = crate::heartbeat::scope(format!(
@@ -12544,7 +12544,7 @@ impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJoint
         Ok(true)
     }
 
-    pub(super) fn hessian_diagonal(&self) -> Result<Option<Array1<f64>>, String> {
+    fn hessian_diagonal(&self) -> Result<Option<Array1<f64>>, String> {
         // Diagonal is consumed by inner preconditioners; full-data semantics
         // preserved (see `hessian_matvec`).
         self.family
@@ -12552,7 +12552,7 @@ impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJoint
             .map(Some)
     }
 
-    pub(super) fn projected_directional_derivative_traces(
+    fn projected_directional_derivative_traces(
         &self,
         factor: &Array2<f64>,
         directions: &Array2<f64>,
@@ -12577,7 +12577,7 @@ impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJoint
         Ok(Some(traces))
     }
 
-    pub(super) fn directional_derivative_operator(
+    fn directional_derivative_operator(
         &self,
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Arc<dyn HyperOperator>>, String> {
@@ -12590,7 +12590,7 @@ impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJoint
             )
     }
 
-    pub(super) fn directional_derivative_operators(
+    fn directional_derivative_operators(
         &self,
         d_beta_flats: &[Array1<f64>],
     ) -> Result<Vec<Option<Arc<dyn HyperOperator>>>, String> {
@@ -12603,7 +12603,7 @@ impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJoint
             )
     }
 
-    pub(super) fn directional_derivative(
+    fn directional_derivative(
         &self,
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
@@ -12616,7 +12616,7 @@ impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJoint
             )
     }
 
-    pub(super) fn second_directional_derivative_operator(
+    fn second_directional_derivative_operator(
         &self,
         d_beta_u_flat: &Array1<f64>,
         d_beta_v_flat: &Array1<f64>,
@@ -12631,7 +12631,7 @@ impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJoint
             )
     }
 
-    pub(super) fn second_directional_derivative(
+    fn second_directional_derivative(
         &self,
         d_beta_u_flat: &Array1<f64>,
         d_beta_v_flat: &Array1<f64>,
@@ -13728,7 +13728,7 @@ impl BernoulliMarginalSlopeExactNewtonJointPsiWorkspace {
 }
 
 impl ExactNewtonJointPsiWorkspace for BernoulliMarginalSlopeExactNewtonJointPsiWorkspace {
-    pub(super) fn first_order_terms(
+    fn first_order_terms(
         &self,
         psi_index: usize,
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
@@ -13752,7 +13752,7 @@ impl ExactNewtonJointPsiWorkspace for BernoulliMarginalSlopeExactNewtonJointPsiW
             )
     }
 
-    pub(super) fn first_order_terms_all(&self) -> Result<Option<Vec<ExactNewtonJointPsiTerms>>, String> {
+    fn first_order_terms_all(&self) -> Result<Option<Vec<ExactNewtonJointPsiTerms>>, String> {
         let total: usize = self.derivative_blocks.iter().map(Vec::len).sum();
         if total == 0 {
             return Ok(Some(Vec::new()));
@@ -13787,7 +13787,7 @@ impl ExactNewtonJointPsiWorkspace for BernoulliMarginalSlopeExactNewtonJointPsiW
         Ok(Some(results))
     }
 
-    pub(super) fn second_order_terms(
+    fn second_order_terms(
         &self,
         psi_i: usize,
         psi_j: usize,
@@ -13827,7 +13827,7 @@ impl ExactNewtonJointPsiWorkspace for BernoulliMarginalSlopeExactNewtonJointPsiW
             )
     }
 
-    pub(super) fn hessian_directional_derivative(
+    fn hessian_directional_derivative(
         &self,
         psi_index: usize,
         d_beta_flat: &Array1<f64>,

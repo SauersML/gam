@@ -1,4 +1,6 @@
 use super::*;
+use super::hessian_paths::{BlockSlices, PrimarySlices, BernoulliMarginalSlopeRowExactContext, RowCellMomentsBundle};
+use super::family::BernoulliMarginalSlopeFamily;
 
 
 #[inline]
@@ -149,7 +151,7 @@ impl RowPrimaryEvalPin {
 }
 
 impl Drop for RowPrimaryEvalPin {
-    pub(super) fn drop(&mut self) {
+    fn drop(&mut self) {
         bms_row_primary_hessian_pinned_bytes().fetch_sub(self.bytes, Ordering::AcqRel);
     }
 }

@@ -367,7 +367,6 @@ pub(crate) fn install_compiled_flex_block_into_runtime(
                     initial_log_lambdas: Array1::<f64>::zeros(0),
                     initial_beta: None,
                     gauge_priority: 200,
-                    eta_row_scaling: None,
                     jacobian_callback: None,
                 });
             }
@@ -382,7 +381,6 @@ pub(crate) fn install_compiled_flex_block_into_runtime(
                 initial_log_lambdas: Array1::<f64>::zeros(0),
                 initial_beta: None,
                 gauge_priority: 100,
-                eta_row_scaling: None,
                 jacobian_callback: None,
             });
             specs

@@ -43,7 +43,6 @@ mod common {
             initial_log_lambdas: Array1::<f64>::zeros(0),
             initial_beta: None,
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         }
     }
@@ -227,7 +226,7 @@ fn audit_partial_overlap_below_threshold_does_not_halt() {
 ///   - survive both the pilot path AND the outer-inner-fit path.
 #[test]
 fn cross_block_alias_with_distinct_priorities_is_not_fatal() {
-    use gam::families::custom_family::ParameterBlockSpec;
+    use gam::families::custom_family::{ParameterBlockSpec, RowScaledJacobian};
     use gam::linalg::matrix::{DenseDesignMatrix, DesignMatrix};
     use ndarray::Array1;
 
@@ -281,7 +280,6 @@ fn cross_block_alias_with_distinct_priorities_is_not_fatal() {
             initial_log_lambdas: Array1::<f64>::zeros(0),
             initial_beta: None,
             gauge_priority: priority,
-            eta_row_scaling: None,
             jacobian_callback: None,
         }
     };
@@ -350,6 +348,9 @@ fn cross_block_alias_with_distinct_priorities_is_not_fatal() {
     // independent of the unscaled marginal rows (z varies row-by-row), so
     // the joint rank is full and no drops are needed.
     {
+        let z_scaling: std::sync::Arc<[f64]> = std::sync::Arc::from(
+            z_primary.as_slice().expect("z_primary must be C-contiguous"),
+        );
         let logslope_scaled_spec = ParameterBlockSpec {
             name: "logslope_surface".to_string(),
             design: DesignMatrix::Dense(DenseDesignMatrix::from(logslope.clone())),
@@ -359,10 +360,10 @@ fn cross_block_alias_with_distinct_priorities_is_not_fatal() {
             initial_log_lambdas: Array1::<f64>::zeros(0),
             initial_beta: None,
             gauge_priority: 120,
-            eta_row_scaling: Some(std::sync::Arc::from(
-                z_primary.as_slice().expect("z_primary must be C-contiguous"),
-            )),
-            jacobian_callback: None,
+            jacobian_callback: Some(std::sync::Arc::new(RowScaledJacobian {
+                design: std::sync::Arc::new(logslope.clone()),
+                eta_scaling: z_scaling,
+            })),
         };
         let specs_with_z_scaling = [
             make_spec("time_surface", time, 200),

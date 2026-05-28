@@ -135,7 +135,7 @@ pub struct AliasedPair {
     pub overlap: f64,
     /// Bias shift applied to the null-distribution mean for this pair,
     /// equal to `bias_shift_for_pair(z_a, z_b, s2_a, s2_b)`.
-    /// Non-zero when exactly one block carries an `eta_row_scaling`
+    /// Non-zero when exactly one block carries a `RowScaledJacobian` callback
     /// (or the two scalings differ) and the row-scaling vector is skewed.
     /// Stored so that the halt-threshold check can apply the same
     /// directional correction as the report-threshold check.
@@ -199,13 +199,13 @@ fn compute_leverage_s2(col: &ndarray::ArrayView1<f64>) -> f64 {
 }
 
 /// Compute the standardised (unit-variance) third central moment μ_3 of a
-/// row-scaling vector z = `eta_row_scaling`, applying the finite-sample
-/// unbiased correction factor n / ((n-1)(n-2)).
+/// row-scaling vector z from a `RowScaledJacobian` callback, applying the
+/// finite-sample unbiased correction factor n / ((n-1)(n-2)).
 ///
 /// # Derivation of the null-mean bias term
 ///
 /// When one of the two blocks in a cross-block cosine comparison carries
-/// `eta_row_scaling = Some(z)`, the effective Jacobian column is `z ⊙ φ`
+/// a `RowScaledJacobian` with scaling `z`, the effective Jacobian column is `z ⊙ φ`
 /// instead of `φ`.  The population cosine between `φ` (from the other block)
 /// and `z ⊙ φ` (from the scaled block) is, under independence of z and φ,
 ///
@@ -296,7 +296,7 @@ pub fn compute_skewness_mu3(z: &[f64]) -> f64 {
 ///
 /// * Both blocks carry the SAME row-scaling vector → the scaled and unscaled
 ///   columns are from the same distribution; the shift cancels exactly (shift = 0).
-/// * Block A has `eta_row_scaling = Some(z)`, block B has `None` (or vice versa):
+/// * Block A carries a `RowScaledJacobian` with scaling `z`, block B has none (or vice versa):
 ///   shift = −(μ_3(z) / 2) · S2_k.
 /// * Both have `None`: shift = 0 (T11's symmetric form, μ_3 = 0).
 /// * Both have DIFFERENT row-scaling vectors z_a ≠ z_b: shift is derived from
@@ -509,7 +509,7 @@ pub fn audit_identifiability(
         // Use spec.effective_jacobian_at() so the audit operates on the β-dependent
         // effective design. At initialization (β = 0, family_scalars = None), callbacks
         // return the linearization at β = 0.  For blocks with no callback and
-        // eta_row_scaling = None this is a no-op (J = design).
+        // For blocks with no callback this is a no-op (J = design).
         let dense = spec
             .effective_jacobian_at("identifiability_audit::audit_identifiability", &init_state)
             .map_err(|e| EstimationError::LayoutError(format!("identifiability audit: {e}")))?;
@@ -683,7 +683,7 @@ pub fn audit_identifiability(
     // doc-comments on `compute_leverage_s2`, `pair_report_threshold`,
     // and `pair_halt_threshold` for the underlying finite-sample identity.
     //
-    // Bias correction: when one block carries `eta_row_scaling = Some(z)`,
+    // Bias correction: when one block carries a RowScaledJacobian with scaling z,
     // the null distribution of the cross-block cosine is no longer centred
     // at 0.  The null mean is approximately shift_k = −(μ_3/2)·S2_k where
     // μ_3 is the standardised third moment of z (skewness).  We test
@@ -1574,7 +1574,7 @@ fn channel_aware_aliased_pairs(
                     // Channel-aware path: no row-scaling bias correction;
                     // the channel weighting already accounts for per-block
                     // structure, and the row Jacobian operators are not
-                    // parameterised through eta_row_scaling here.
+                    // parameterised through RowScaledJacobian here.
                     bias_shift: 0.0,
                 });
             }
