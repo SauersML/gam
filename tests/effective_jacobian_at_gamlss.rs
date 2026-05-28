@@ -101,58 +101,50 @@ where
     jac
 }
 
+/// Verify stacked Jacobian for one block.
+///
+/// `own_output` is `Some(r)` when this block linearly drives output `r`,
+/// or `None` when the block has a zero Jacobian for all outputs (e.g. wiggle).
+///
+/// For each output channel `r`:
+///   - `r == own_output`: rows must match the FD of `X_block · β`.
+///   - `r != own_output` (or `own_output` is `None`): rows must be exactly 0.
 fn check_jac(
     name: &str,
     block_idx: usize,
     specs: &[ParameterBlockSpec],
     jac_full: &Array2<f64>,
     n_outputs: usize,
-    output_spec_idx: Option<usize>, // which spec index owns this output (None = zero output)
+    own_output: Option<usize>,
 ) {
     let p = specs[block_idx].design.ncols();
     let beta0 = Array1::zeros(p);
+    let fd = fd_jacobian(|b| compute_eta(&specs[block_idx], b), &beta0, p);
+
     for r in 0..n_outputs {
         let row_start = r * N;
         let jac_r = jac_full.slice(ndarray::s![row_start..row_start + N, ..]);
-        if let Some(spec_idx) = output_spec_idx {
-            if spec_idx == block_idx {
-                // This block owns output r: Jacobian should be design_r
-                let fd = fd_jacobian(
-                    |b| compute_eta(&specs[block_idx], b),
-                    &beta0,
-                    p,
-                );
-                for i in 0..N {
-                    for j in 0..p {
-                        let analytic = jac_r[[i, j]];
-                        let finite_diff = fd[[i, j]];
-                        let scale = finite_diff.abs().max(1e-10);
-                        let rel_err = (analytic - finite_diff).abs() / scale;
-                        assert!(
-                            rel_err < TOL_REL,
-                            "{name} block{block_idx} output{r} row{i} col{j}: analytic={analytic:.2e} fd={finite_diff:.2e} rel_err={rel_err:.2e}"
-                        );
-                    }
-                }
-            } else {
-                // Different block owns this output: Jacobian should be zero
-                for i in 0..N {
-                    for j in 0..p {
-                        assert!(
-                            jac_r[[i, j]].abs() < 1e-14,
-                            "{name} block{block_idx} output{r} row{i} col{j}: expected 0, got {}",
-                            jac_r[[i, j]]
-                        );
-                    }
+        if own_output == Some(r) {
+            // Owned output: Jacobian rows must equal finite-diff of X_block·β
+            for i in 0..N {
+                for j in 0..p {
+                    let analytic = jac_r[[i, j]];
+                    let finite_diff = fd[[i, j]];
+                    let scale = finite_diff.abs().max(1e-10);
+                    let rel_err = (analytic - finite_diff).abs() / scale;
+                    assert!(
+                        rel_err < TOL_REL,
+                        "{name} block{block_idx} output{r} [{i},{j}]: analytic={analytic:.3e} fd={finite_diff:.3e} rel={rel_err:.2e}"
+                    );
                 }
             }
         } else {
-            // Zero Jacobian expected for all outputs
+            // Not-owned output: Jacobian rows must be exactly zero
             for i in 0..N {
                 for j in 0..p {
                     assert!(
                         jac_r[[i, j]].abs() < 1e-14,
-                        "{name} block{block_idx} output{r} row{i} col{j}: expected 0, got {}",
+                        "{name} block{block_idx} output{r} [{i},{j}]: expected 0, got {}",
                         jac_r[[i, j]]
                     );
                 }

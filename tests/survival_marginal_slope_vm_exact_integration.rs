@@ -94,30 +94,6 @@ fn install_logger() {
     });
 }
 
-#[inline]
-fn splitmix64(state: &mut u64) -> u64 {
-    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    let mut z = *state;
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
-}
-
-#[inline]
-fn next_unit(state: &mut u64) -> f64 {
-    let bits = splitmix64(state) >> 11;
-    (bits as f64) * (1.0_f64 / ((1u64 << 53) as f64))
-}
-
-#[inline]
-fn next_gauss(state: &mut u64) -> f64 {
-    let u1 = next_unit(state).max(f64::MIN_POSITIVE);
-    let u2 = next_unit(state);
-    let r = (-2.0 * u1.ln()).sqrt();
-    let theta = std::f64::consts::TAU * u2;
-    r * theta.cos()
-}
-
 fn build_dataset() -> gam::inference::data::EncodedDataset {
     let headers = vec![
         "entry_age".to_string(),
@@ -129,19 +105,19 @@ fn build_dataset() -> gam::inference::data::EncodedDataset {
         "x3".to_string(),
     ];
 
-    let mut state = 0xC0DE_C0DE_u64;
+    let mut rng = Splitmix64::new(0xC0DE_C0DE_u64);
     let mut rows: Vec<StringRecord> = Vec::with_capacity(N);
 
     for _ in 0..N {
-        let x1 = next_gauss(&mut state) * 0.5;
-        let x2 = next_gauss(&mut state) * 0.5;
-        let x3 = next_gauss(&mut state) * 0.5;
-        let prs = next_gauss(&mut state);
-        let entry = 40.0 + 5.0 * next_unit(&mut state);
-        let followup = 0.5 + 8.0 * next_unit(&mut state);
+        let x1 = rng.next_gauss() * 0.5;
+        let x2 = rng.next_gauss() * 0.5;
+        let x3 = rng.next_gauss() * 0.5;
+        let prs = rng.next_gauss();
+        let entry = 40.0 + 5.0 * rng.next_unit();
+        let followup = 0.5 + 8.0 * rng.next_unit();
         let exit = entry + followup;
         // mild signal so events are non-degenerate
-        let score = 0.3 * prs + 0.4 * x1 - 0.3 * x2 + 0.2 * x3 + 0.2 * next_gauss(&mut state);
+        let score = 0.3 * prs + 0.4 * x1 - 0.3 * x2 + 0.2 * x3 + 0.2 * rng.next_gauss();
         let event = if score > 0.0 { 1 } else { 0 };
         rows.push(StringRecord::from(vec![
             entry.to_string(),
