@@ -19657,7 +19657,11 @@ impl ExactNewtonJointPsiWorkspace for BernoulliMarginalSlopeExactNewtonJointPsiW
 /// ∂η_i/∂β_m = c_i · M[i,:]
 /// where c_i = sqrt(1 + (s · g_i)²),
 ///       g_i = G[i,:] · β_s + offset_s[i],
-///       s   = probit_frailty_scale.
+///       s   = state.probit_frailty_scale.
+///
+/// `probit_frailty_scale` is read from the evaluation state at call time (not
+/// captured at construction) so the callback remains correct across outer-loop
+/// σ updates without rebuilding the block spec.
 ///
 /// Designs are pre-densified at construction to avoid repeated materialisation.
 struct BmsMarginalJacobian {
@@ -19669,7 +19673,6 @@ struct BmsMarginalJacobian {
     offset_s: Array1<f64>,
     /// Number of marginal columns (= size of β_m slice in the full β vector).
     p_marginal: usize,
-    probit_scale: f64,
 }
 
 impl BlockEffectiveJacobian for BmsMarginalJacobian {
@@ -19678,6 +19681,7 @@ impl BlockEffectiveJacobian for BmsMarginalJacobian {
         state: &FamilyLinearizationState<'_>,
     ) -> Result<Array2<f64>, String> {
         let beta = state.beta;
+        let s = state.probit_frailty_scale;
         let p_m = self.p_marginal;
         let p_s_block = self.logslope_dense.ncols();
         let beta_s_raw = if beta.len() > p_m { &beta[p_m..] } else { &[][..] };
@@ -19685,7 +19689,6 @@ impl BlockEffectiveJacobian for BmsMarginalJacobian {
         let beta_s = &beta_s_raw[..p_s_use];
         let n = self.marginal_dense.nrows();
         let p_block = self.marginal_dense.ncols();
-        let s = self.probit_scale;
         let mut out = Array2::<f64>::zeros((n, p_block));
         for i in 0..n {
             // g_i = G[i, :p_s_use] · β_s + offset_s[i]
@@ -19714,7 +19717,10 @@ impl BlockEffectiveJacobian for BmsMarginalJacobian {
 /// ∂η_i/∂β_s = (q_i · s²·g_i / c_i + s·z_i) · G[i,:]
 /// where q_i = M[i,:] · β_m + offset_m[i],
 ///       g_i = G[i,:] · β_s + offset_s[i],
-///       c_i = sqrt(1 + (s·g_i)²).
+///       c_i = sqrt(1 + (s·g_i)²),
+///       s   = state.probit_frailty_scale.
+///
+/// `probit_frailty_scale` is read from the evaluation state at call time.
 ///
 /// Designs are pre-densified at construction to avoid repeated materialisation.
 struct BmsLogslopeJacobian {
@@ -19727,7 +19733,6 @@ struct BmsLogslopeJacobian {
     z: Arc<[f64]>,
     /// Number of marginal columns (= start of β_s in the full β vector).
     p_marginal: usize,
-    probit_scale: f64,
 }
 
 impl BlockEffectiveJacobian for BmsLogslopeJacobian {
@@ -19736,6 +19741,7 @@ impl BlockEffectiveJacobian for BmsLogslopeJacobian {
         state: &FamilyLinearizationState<'_>,
     ) -> Result<Array2<f64>, String> {
         let beta = state.beta;
+        let s = state.probit_frailty_scale;
         let p_m = self.p_marginal;
         let p_m_use = p_m.min(beta.len());
         let beta_m = &beta[..p_m_use];
@@ -19744,7 +19750,6 @@ impl BlockEffectiveJacobian for BmsLogslopeJacobian {
         let p_s_use = p_s_block.min(beta_s_raw.len());
         let beta_s = &beta_s_raw[..p_s_use];
         let n = self.logslope_dense.nrows();
-        let s = self.probit_scale;
         let mut out = Array2::<f64>::zeros((n, p_s_block));
         for i in 0..n {
             // q_i = M[i, :p_m_use] · β_m + offset_m[i]
