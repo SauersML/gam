@@ -88,11 +88,16 @@ jobs:
             many more will after you. Before picking what to investigate,
             look at what's already been hunted: `gh issue list --label
             claude-bug-hunt --state all --limit 100`, `ls tests/bug_hunt_*
-            gamfit/tests/test_bug_hunt_* 2>/dev/null`, skim recent commits.
-            Then deliberately pick a subsystem, family, data shape, failure
-            mode, or mathematical primitive that is **under-represented**
-            in that history. Repeating yesterday's angle on a fresh dataset
-            is still collapse. Surprise the maintainer.
+            gamfit/tests/test_bug_hunt_* 2>/dev/null`. Then deliberately
+            pick a subsystem, family, data shape, failure mode, or
+            mathematical primitive that is **under-represented** in that
+            history. Repeating yesterday's angle on a fresh dataset is
+            still collapse. Surprise the maintainer.
+
+            Recent commits (`git log --since=...`) are a separate signal —
+            if a lot has changed recently in one area, freshly-touched
+            code is often where new bugs hide. Use that to *target*, not
+            to avoid.
 
             If you genuinely can't find anything real this run, that's a
             fine outcome. Say so in the workflow log and exit. Don't ship
