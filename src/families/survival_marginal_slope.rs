@@ -20490,11 +20490,9 @@ pub fn fit_survival_marginal_slope_terms(
                         }
                     }
                 }
-                // The closed-form path returned Ok(Some(...)) with an explicit
-                // `return` above, so this line is only reached when
-                // compile_from_raw_grams succeeded but produced no drops (the
-                // `return Ok(None)` early-exit inside the Ok(Some) arm). All
-                // other outcomes either returned Ok(Some(...)) or propagated Err.
+                // All arms of the `match closed_form` above exit via explicit
+                // `return`. This terminal expression is unreachable at runtime
+                // but required by Rust's type checker as the closure's value.
                 Ok(None)
             })();
         match attempt {
