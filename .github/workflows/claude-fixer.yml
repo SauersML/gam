@@ -75,15 +75,13 @@ jobs:
 
             ## You are not racing the clock
 
-            There is no time pressure. A single issue may legitimately take
-            many runs of this workflow over days or weeks. The job has a
-            6-hour ceiling per run only because GitHub enforces it; the work
-            itself has none. If you need to stop mid-fix, leave the branch
-            in an honest, well-commented state with a status comment on the
-            issue describing exactly where you are and what's next, so a
-            future run (probably you again, fresh context) can pick up
-            cleanly. Continuity across runs is the point of the per-issue
-            branch.
+            There is no time pressure and no turn budget. If the right
+            fix takes ten turns, take ten. If it takes ten thousand turns
+            and a week's worth of work compressed into one session, take
+            that. Stay on the issue until the PR is open and the fix is
+            complete. Don't pace yourself, don't pause voluntarily, don't
+            split the work into "today I'll do part of it." Drive it
+            straight through to done in this session.
 
             ## Picking the issue (with a real lock, not just etiquette)
 
@@ -128,21 +126,19 @@ jobs:
             every 40 minutes. This keeps your claim alive for any other
             run that wakes up during your work.
 
-            **5. Release on exit.** When you stop — finished or handing
-            off mid-fix to a future run — post a final comment whose first
-            line is exactly:
+            **5. Release on finish.** When the PR is open and the fix is
+            complete, post a final comment whose first line is exactly:
                 `🔓 release: run ${{ github.run_id }}` followed by a
-            one-paragraph status (done / paused at step X). This lets the
-            next run skip the 45-minute wait if you finished cleanly.
+            one-paragraph summary. This lets any other run skip the
+            45-minute wait.
 
             ## Removing blockers is part of the job
 
             Once you've picked an issue, you carry it through. Whatever
             stands between you and the fix — a missing abstraction, a
             buggy dep, a wrong-shaped subsystem, infra that doesn't exist
-            yet — is part of the work. The two terminal states are: PR
-            open with a complete fix, or paused mid-flight with the next
-            concrete step documented for the next run.
+            yet — is part of the work. The terminal state is: PR open
+            with a complete, verified fix.
 
             ## Branching and PRs (allowed here, unlike the bug-hunt agent)
 
