@@ -77,10 +77,12 @@ jobs:
                  Reference the committed test by path and SHA.
 
             Everything stays on `main`. No new branches, no PRs, no
-            worktrees, no destructive git. The maintainer wants failing
-            tests + issues piling up faster than they can be fixed —
-            resist the temptation to patch; the failing test IS the
-            deliverable.
+            worktrees, no destructive git. No new `.md` files anywhere —
+            all narrative (writeup, notes, hypothesis, repro steps) goes
+            in the GitHub issue body, not into the repo. The maintainer
+            wants failing tests + issues piling up faster than they can
+            be fixed — resist the temptation to patch; the failing test
+            IS the deliverable.
 
             ## Diversity matters — you are one of many runs
 

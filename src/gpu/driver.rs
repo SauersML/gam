@@ -248,6 +248,79 @@ pub fn preload_cuda_driver() -> Result<(), String> {
         .clone()
 }
 
+/// Returns whether the platform loader can open the named CUDA compute
+/// library (`cublas`, `cusolver`, `cusparse`).
+///
+/// cudarc 0.19 attempts to lazy-load these via its own generated
+/// `panic_no_lib_found` helpers the first time `CudaBlas::new` /
+/// `DnHandle::new` / cuSPARSE handle creation is invoked. On a host that
+/// has only the CUDA *driver* (e.g. AoU workbench images expose
+/// `libcuda.so.1` but no cuBLAS at all), those calls panic out of the
+/// PyO3 FFI boundary instead of returning a typed error.
+///
+/// `GpuRuntime::probe()` calls this for every compute library it depends
+/// on; failure to load any of them downgrades the runtime to CPU with a
+/// `DriverLibraryUnavailable { reason: "lib<name> unavailable" }`, which
+/// keeps the panic completely off the call path.
+#[must_use]
+pub fn cuda_compute_library_present(stem: &str) -> bool {
+    load_library_names(&cuda_compute_library_candidate_names(stem)).is_ok()
+}
+
+fn cuda_compute_library_candidate_names(stem: &str) -> Vec<String> {
+    let base = format!("lib{stem}");
+    let mut out: Vec<String> = Vec::new();
+    // Bare soname forms — exercised by the platform loader against
+    // LD_LIBRARY_PATH and the default search dirs.
+    out.push(format!("{base}.so"));
+    out.push(format!("{base}.so.1"));
+    // Major-version walk mirroring cudarc's own candidate list so the
+    // preflight agrees with whatever cudarc would have tried next.
+    for major in (9..=13).rev() {
+        out.push(format!("{base}.so.{major}"));
+    }
+    if cfg!(target_os = "linux") {
+        for dir in [
+            "/usr/local/cuda/lib64",
+            "/usr/local/cuda/targets/x86_64-linux/lib",
+            "/usr/lib/x86_64-linux-gnu",
+            "/usr/lib64",
+            "/opt/cuda/lib64",
+        ] {
+            out.push(format!("{dir}/{base}.so"));
+            for major in (9..=13).rev() {
+                out.push(format!("{dir}/{base}.so.{major}"));
+            }
+            append_versioned_linux_so_candidates(&mut out, Path::new(dir), &base);
+        }
+    }
+    out
+}
+
+fn append_versioned_linux_so_candidates(out: &mut Vec<String>, dir: &Path, base: &str) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let prefix = format!("{base}.so.");
+    let mut versioned = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if name.starts_with(&prefix) {
+            versioned.push(path);
+        }
+    }
+    versioned.sort();
+    for path in versioned {
+        let candidate = path.to_string_lossy().into_owned();
+        if !out.iter().any(|existing| existing == &candidate) {
+            out.push(candidate);
+        }
+    }
+}
+
 fn cuda_library_candidate_names() -> Vec<String> {
     let mut out: Vec<String> = cuda_library_candidates()
         .iter()

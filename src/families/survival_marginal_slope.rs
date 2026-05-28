@@ -19114,7 +19114,7 @@ pub fn fit_survival_marginal_slope_terms(
     // level diagnostic with the (block, ncols, rank) tuple so the rank-deficit
     // is visible in the log without being fatal.
     {
-        use crate::linalg::faer_ndarray::rrqr_nullspace_basis;
+        use crate::linalg::faer_ndarray::rrqr_with_permutation;
         let time_dense = spec
             .time_block
             .design_exit
@@ -19170,14 +19170,20 @@ pub fn fit_survival_marginal_slope_terms(
             cursor += m.ncols();
         }
         assert_eq!(cursor, total_cols);
-        // `rrqr_nullspace_basis` returns `(nullspace_of_Aᵀ, rank(A))` for a
-        // tall input. Joint is n × p_total with `n ≫ p_total` at biobank
-        // scale; we only consume the rank.
-        let (_null_basis, rank) = rrqr_nullspace_basis(
+        // Joint is n × p_total with `n ≫ p_total` at biobank scale, so the
+        // left null space of the *transpose* has dimension `n - rank` and a
+        // basis for it would be n × (n - rank). Materializing that basis is
+        // catastrophic: at n=195780, p_total≈33 the f64 buffer is ≈286 GiB
+        // and faer aborts with `AllocError` deep inside the FFI boundary.
+        // The diagnostic only consumes `rank`, so use `rrqr_with_permutation`
+        // which runs the same column-pivoted QR + diagonal-threshold count
+        // and never builds the null basis.
+        let rank = rrqr_with_permutation(
             &joint,
             crate::linalg::faer_ndarray::default_rrqr_rank_alpha(),
         )
-        .map_err(|e| format!("survival-marginal-slope joint rank diagnostic QR failed: {e}"))?;
+        .map_err(|e| format!("survival-marginal-slope joint rank diagnostic QR failed: {e}"))?
+        .rank;
         if rank < total_cols {
             log::info!(
                 "[survival-marginal-slope joint rank diagnostic] rank={rank} < ncols={total_cols} \

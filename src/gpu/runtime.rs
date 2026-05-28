@@ -106,6 +106,28 @@ impl GpuRuntime {
                 });
             }
 
+            // Driver-only environments (e.g. AoU workbench images that expose
+            // `libcuda.so.1` but ship no cuBLAS/cuSOLVER/cuSPARSE) used to slip
+            // past the libcuda preflight, enable the runtime, and then panic
+            // out of cudarc's `panic_no_lib_found` on the first `CudaBlas::new`
+            // — the panic crossed the PyO3 FFI boundary as a
+            // `ValueError: fit_table panicked inside Rust boundary: Unable to
+            // dynamically load the "cublas" shared library`. The compute
+            // libraries are dispatch-critical (every cuBLAS / cuSOLVER /
+            // cuSPARSE site under `src/gpu/` calls `CudaBlas::new` /
+            // `DnHandle::new` / cusparse handle creation eagerly during
+            // workspace allocation), so we refuse to advertise GPU unless all
+            // three load cleanly here.
+            for stem in ["cublas", "cusolver", "cusparse"] {
+                if !crate::gpu::driver::cuda_compute_library_present(stem) {
+                    let reason = format!("lib{stem} unavailable");
+                    Self::record_cpu_reason(reason.clone());
+                    log::info!("[GPU] CUDA acceleration disabled: {reason}");
+                    diagnostics::log_cuda_disabled(&reason);
+                    return Err(GpuError::DriverLibraryUnavailable { reason });
+                }
+            }
+
             // cudarc 0.19's `culib()` panics via `panic_no_lib_found` when its
             // own (separate from gam's) dynamic-loader candidate list cannot
             // find libcuda — this can happen even after our `preload_cuda_driver`

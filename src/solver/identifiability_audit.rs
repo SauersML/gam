@@ -532,68 +532,79 @@ pub fn audit_identifiability(specs: &[ParameterBlockSpec]) -> Result<Identifiabi
     }
 
     let joint_rank_deficient = joint_rank < p_total;
-    // Hard-halt cases (the audit-gate from task #5 — the safety net that
-    // would have prevented the biobank `eval=1/12` hours-long hang):
+    // Hard-halt logic — fatal only when the audit's own attributed
+    // drops do NOT clear the offending structure. The downstream
+    // `canonicalize_for_identifiability` builds a reduced design that
+    // excludes `dropped_columns` and runs the fit on that reduced
+    // spec list, so a deficiency RRQR has already pinned to specific
+    // (block, local_col) entries is fittable in the reduced space.
     //
-    //   (a) `joint_rank < p_total` — the joint design is structurally
-    //       rank-deficient. Whether RRQR attributed the deficiency via
-    //       `dropped_columns` does NOT change the fact that the inner
-    //       penalised-Newton KKT system has a non-trivial null space
-    //       inherited by the outer Hessian: the outer optimiser will
-    //       silently spin on the unattributed direction. The previous
-    //       gate (`deficient && pairs.empty() && drops.empty()`) only
-    //       fired when attribution was IMPOSSIBLE; that's the wrong
-    //       boundary because "attributed" does not imply "fittable".
+    // Two residual cases survive as fatal:
     //
-    //   (b) Any pairwise overlap `>= HARD_HALT_OVERLAP_THRESHOLD` (0.99)
-    //       between two named blocks. Two distinct blocks contributing
-    //       the same direction to within 1% noise floor is structurally
-    //       unfittable regardless of penalty values, regardless of
-    //       whether the joint rank happens to be full at this n.
+    //   (a) Joint rank deficiency that RRQR could not attribute to
+    //       individual columns (`dropped_columns.is_empty()` while
+    //       `joint_rank < p_total`). This is the >2-way structural
+    //       alias case: the deficit lives in a direction the pivot
+    //       walk could not localise to a single demoted column, so
+    //       canonicalisation cannot remove it.
     //
-    // RRQR's tolerance can disagree with the column-norm pairwise scan
-    // on edge cases (e.g. a high-overlap pair that RRQR keeps because
-    // its residual is just above the rank threshold), so the two
-    // conditions are kept independent: either one is sufficient to halt.
+    //   (b) A pairwise overlap `>= HARD_HALT_OVERLAP_THRESHOLD` (0.99)
+    //       between two named blocks where NEITHER side appears in
+    //       `dropped_columns`. Two distinct blocks contributing the
+    //       same direction to within 1% noise are structurally
+    //       unfittable only if the alias survives the audit's drop
+    //       attribution. If one side IS dropped, the surviving column
+    //       owns the direction unambiguously and the inner KKT system
+    //       is identifiable in the reduced coordinates.
+    //
+    // The earlier formulation (`joint_rank_deficient || any_pair >= 0.99`)
+    // over-halted: it refused multi-channel families like survival
+    // marginal-slope, where two raw-X columns from marginal and
+    // logslope blocks are identical at training rows (both formulas
+    // reuse the same smooth) yet contribute to orthogonal K-channels
+    // of the row Jacobian and ARE separately identifiable through the
+    // likelihood. The audit's RRQR with priority-reorder cleanly
+    // demotes the lower-priority block's copy of the shared direction,
+    // and the reduced fit proceeds without the spinning failure mode.
+    use std::collections::HashSet;
+    let dropped_block_col: HashSet<(String, usize)> = dropped_columns
+        .iter()
+        .map(|d| (d.block.clone(), d.column))
+        .collect();
     let hard_alias_pair = aliased_pairs
         .iter()
+        .filter(|p| p.overlap >= HARD_HALT_OVERLAP_THRESHOLD)
+        .filter(|p| {
+            // Pair is "unresolved" only when NEITHER demoted column
+            // covers it. The audit's drops are always attributed to
+            // the latest-priority side of each pivot decision, so the
+            // typical resolution is for one of (block_a, direction_a)
+            // / (block_b, direction_b) to appear here.
+            !dropped_block_col.contains(&(p.block_a.clone(), p.direction_a))
+                && !dropped_block_col.contains(&(p.block_b.clone(), p.direction_b))
+        })
         .max_by(|a, b| {
             a.overlap
                 .partial_cmp(&b.overlap)
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
-        .filter(|p| p.overlap >= HARD_HALT_OVERLAP_THRESHOLD)
         .cloned();
-    let fatal = joint_rank_deficient || hard_alias_pair.is_some();
+    let unattributed_rank_deficiency = joint_rank_deficient && dropped_columns.is_empty();
+    let fatal = unattributed_rank_deficiency || hard_alias_pair.is_some();
 
     let fatal_detail = if fatal {
         let mut parts: Vec<String> = Vec::new();
-        if joint_rank_deficient {
-            // Name the worst-attributed dropped column (if any) so the
-            // caller sees which (block, local_col) to reparameterise
-            // first. When attribution is empty, surface that fact —
-            // it indicates a >2-way structural alias that the pairwise
-            // scan didn't catch and is the hardest case to fix.
-            let attribution = if let Some(first_drop) = dropped_columns.first() {
-                format!(
-                    "first attributed drop: block '{}' local column {} \
-                     (reparam: replace this column with a sum-to-zero or \
-                     orthogonal-complement projection against earlier blocks, \
-                     or remove the redundant term entirely)",
-                    first_drop.block, first_drop.column,
-                )
-            } else {
-                "no per-column attribution (>2-way structural alias); \
-                 audit the joint design by eye and absorb the shared null \
-                 subspace into a single parametric block"
-                    .to_string()
-            };
+        if unattributed_rank_deficiency {
+            // Only the >2-way unattributed case appears here as a
+            // fatal cause — the audit's attributed drops are
+            // resolvable downstream via the reduced design, so a
+            // rank deficiency WITH attribution is not fatal on its
+            // own (still recoverable by canonicalisation).
             parts.push(format!(
-                "joint rank {} < joint columns {} ({} dropped column(s); {})",
-                joint_rank,
-                p_total,
-                dropped_columns.len(),
-                attribution,
+                "joint rank {} < joint columns {} (no per-column attribution: \
+                 >2-way structural alias; audit the joint design by eye and \
+                 absorb the shared null subspace into a single parametric block)",
+                joint_rank, p_total,
             ));
         }
         if let Some(pair) = hard_alias_pair.as_ref() {
