@@ -2809,6 +2809,149 @@ pub fn is_binary_response(y: ArrayView1<'_, f64>) -> bool {
         .all(|v| (*v - 0.0).abs() < 1e-12 || (*v - 1.0).abs() < 1e-12)
 }
 
+/// Minimum standard-deviation tolerated for a Gaussian response.
+///
+/// Below this the marginal Gaussian REML objective `-n/2·log σ²` blows up
+/// (the saturated MLE σ → 0 sends `log σ²` → -∞ and the REML score → +∞),
+/// surfacing as the cryptic `fit_result.reml_score must be finite, got inf`
+/// downstream (issue #332). The threshold is generous (≈ machine ε scaled by
+/// √n) so well-conditioned scientific data never trips it; only data that is
+/// effectively constant in f64 arithmetic gets rejected pre-fit.
+const GAUSSIAN_RESPONSE_MIN_SD: f64 = 1.0e-10;
+
+/// Pre-flight degeneracy checks on `(y, family, n)` that would otherwise
+/// blow up deep inside REML with an opaque "reml_score must be finite, got
+/// inf" / "cached inner beta has length …" message. Returns a clear,
+/// actionable `WorkflowError::InvalidConfig` instead.
+///
+/// Catches:
+/// * **All-zero / all-one Bernoulli** response (#331): the saturated logit
+///   MLE is ±∞ and the deviance vanishes, sending the Laplace/REML score
+///   to infinity.
+/// * **Near-constant Gaussian** response (#332): the marginal `-n/2·log σ²`
+///   diverges to +∞ when the sample variance is ≤ machine precision.
+/// * **Sample size too small for the formula** (#309): with even one smooth
+///   term we need enough rows to fit the basis; a tiny n with smooths
+///   produces an opaque inner-solver length mismatch instead of a useful
+///   error.
+fn validate_response_degeneracy_and_size(
+    response_family: &ResponseFamily,
+    response_name: &str,
+    y: ArrayView1<'_, f64>,
+    parsed_terms: &[ParsedTerm],
+) -> Result<(), WorkflowError> {
+    let n = y.len();
+
+    // Sample-size floor — must precede the per-family analysis because n = 0
+    // makes the variance/binary checks meaningless.
+    if n == 0 {
+        return Err(WorkflowError::InvalidConfig {
+            reason: format!(
+                "response column '{response_name}' has zero rows; cannot fit a model on an empty dataset"
+            ),
+        });
+    }
+
+    // Per-family degeneracy.
+    match response_family {
+        ResponseFamily::Binomial => {
+            // Detect a fully one-sided binary response. The Bernoulli log-likelihood
+            // is ±∞ at the saturated boundary (π̂ = 0 or 1), so REML returns +∞
+            // and we surface a cryptic finite-value check downstream. Uses the
+            // codebase's existing 1e-12 binarity tolerance.
+            let mut saw_zero = false;
+            let mut saw_one = false;
+            for &yi in y.iter() {
+                if (yi - 0.0).abs() < 1e-12 {
+                    saw_zero = true;
+                } else if (yi - 1.0).abs() < 1e-12 {
+                    saw_one = true;
+                }
+                if saw_zero && saw_one {
+                    break;
+                }
+            }
+            if !(saw_zero && saw_one) {
+                let observed = if saw_one {
+                    "all values are 1 (no non-events)"
+                } else if saw_zero {
+                    "all values are 0 (no events)"
+                } else {
+                    "no rows are exactly 0 or 1"
+                };
+                return Err(WorkflowError::InvalidConfig {
+                    reason: format!(
+                        "Binomial / Bernoulli response '{response_name}' is degenerate: \
+                         {observed}. The maximum-likelihood logit is ±∞ at this boundary, \
+                         so the REML score is not finite. Fix: ensure the response contains \
+                         at least one 0 and at least one 1 (e.g. drop the offending subgroup, \
+                         or refit on a pooled sample that includes both classes)."
+                    ),
+                });
+            }
+        }
+        ResponseFamily::Gaussian => {
+            // Sample standard deviation, two-pass (subtract the mean before
+            // squaring) so the threshold is not perturbed by a large response
+            // offset.
+            let mean: f64 = y.iter().copied().sum::<f64>() / (n as f64);
+            let ssq: f64 = y.iter().map(|&v| (v - mean) * (v - mean)).sum::<f64>();
+            let var = if n > 1 {
+                ssq / ((n - 1) as f64)
+            } else {
+                ssq
+            };
+            let sd = var.sqrt();
+            if !sd.is_finite() || sd <= GAUSSIAN_RESPONSE_MIN_SD {
+                return Err(WorkflowError::InvalidConfig {
+                    reason: format!(
+                        "Gaussian response '{response_name}' is effectively constant \
+                         (sample sd ≈ {sd:.3e} ≤ {GAUSSIAN_RESPONSE_MIN_SD:.0e}); the marginal \
+                         REML log-likelihood −n/2·log σ² diverges to +∞ as σ → 0. \
+                         Fix: check the response column units (is it being read in the right \
+                         scale?), centre/rescale the response, or drop the column if it \
+                         carries no signal."
+                    ),
+                });
+            }
+        }
+        _ => {}
+    }
+
+    // Sample size vs formula complexity. Each `s(...)` smooth contributes a
+    // basis with several columns (heuristic k ≥ 4 even for tiny n, plus the
+    // intercept), so n < 5 cannot fit any smooth model — and the README
+    // quickstart hits exactly this with n=4. We surface a clear hint instead
+    // of the inner-solver's "cached inner beta has length …" message (#309).
+    let smooth_count = parsed_terms
+        .iter()
+        .filter(|t| matches!(t, ParsedTerm::Smooth { .. }))
+        .count();
+    if smooth_count > 0 {
+        // Conservative lower bound: each smooth needs ~k_min basis columns,
+        // plus the intercept and one degree of freedom for the smoothing-
+        // parameter optimizer. 4 rows per smooth is comfortably below mgcv's
+        // default k=10 yet still well above what the basis construction
+        // collapses to under tiny-n heuristics.
+        let min_rows = 1 + 4 * smooth_count;
+        if n < min_rows {
+            return Err(WorkflowError::InvalidConfig {
+                reason: format!(
+                    "not enough observations to fit the requested formula: \
+                     dataset has n={n} rows but the formula declares \
+                     {smooth_count} smooth term(s), which need at least \
+                     {min_rows} rows (≈ 4 rows per smooth + intercept) before \
+                     REML smoothing-parameter estimation is well-posed. \
+                     Fix: add more training rows, or replace `s(x)` with a \
+                     linear term `x`, or pass a smaller basis via `s(x, k=3)`."
+                ),
+            });
+        }
+    }
+
+    Ok(())
+}
+
 /// Resolve a family from an optional name, optional link choice, and response data.
 pub fn resolve_family(
     family: Option<&str>,
@@ -5083,6 +5226,19 @@ fn materialize_standard<'a>(
     // offending row indices so the user can locate the bad data.
     validate_response_support_for_family(&family.response, &parsed.response, y.view())
         .map_err(String::from)?;
+
+    // Pre-flight degeneracy / sample-size gate (#309, #331, #332). Catches
+    // all-zero or all-one Bernoulli responses, near-constant Gaussian
+    // responses, and formulas whose total smooth complexity exceeds the row
+    // count — all of which would otherwise surface as the opaque
+    // `fit_result.reml_score must be finite, got inf` assertion.
+    validate_response_degeneracy_and_size(
+        &family.response,
+        &parsed.response,
+        y.view(),
+        &parsed.terms,
+    )
+    .map_err(String::from)?;
 
     let effective_linkwiggle =
         effectivelinkwiggle_formulaspec(parsed.linkwiggle.as_ref(), link_choice.as_ref());

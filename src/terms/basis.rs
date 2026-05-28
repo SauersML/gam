@@ -23959,6 +23959,33 @@ pub(crate) mod internal {
             crate::bail_invalid_basis!("quantile knot placement requires finite data");
         }
 
+        // Up-front minimum-n check (issue #340): auto-knot quantile placement
+        // requires enough evaluation points to span both clamped boundaries and
+        // every requested interior knot.  The interior support is everything
+        // strictly between min(t) and max(t), which is `len(t) - 2` points in
+        // the best case (one minimum, one maximum, the rest interior).  With
+        // `num_internal_knots` knots we need at least `num_internal_knots`
+        // distinct interior values; we also need `len(t) >= degree + 1` so the
+        // clamped knot vector defines a non-degenerate basis.  When either
+        // bound is violated, emit a user-correctable diagnostic rather than
+        // the cryptic "non-interior knot" / "distinct interior support"
+        // messages from deeper in the algorithm.
+        let min_required_for_interior = num_internal_knots.saturating_add(2);
+        let min_required_for_degree = degree.saturating_add(1);
+        let min_required = min_required_for_interior.max(min_required_for_degree);
+        if data.len() < min_required {
+            crate::bail_invalid_basis!(
+                "auto-knot placement requires at least {min} evaluation point(s) for \
+                 degree={deg} with {ki} interior knot(s) (got n={n}). Either provide \
+                 more points, reduce the requested interior-knot count, or supply an \
+                 explicit clamped knot vector.",
+                min = min_required,
+                deg = degree,
+                ki = num_internal_knots,
+                n = data.len(),
+            );
+        }
+
         let mut sorted: Vec<f64> = data.iter().copied().collect();
         sorted.sort_by(f64::total_cmp);
         let minval = sorted[0];

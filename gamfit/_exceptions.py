@@ -99,6 +99,15 @@ def map_exception(exc: BaseException) -> BaseException:
     # Python-native contract violations (shape/dtype mismatch, missing key,
     # division-by-zero) that are not gamfit engine errors, so they pass
     # through untouched.
+    #
+    # ARCHITECTURAL NOTE: this regex-classifier-plus-catch-all pattern is
+    # tactical, not the long-term design. The principled approach is
+    # variant-dispatch at the engine→FFI boundary — every ``EstimateError``
+    # (and every other engine-error enum) maps to a concrete ``GamError``
+    # subclass on the Rust side, with no string-regex bridge and no
+    # catch-all. Tracked in issue #343. Do not extend the message-regex
+    # classifier in ``crates/gam-pyffi/src/lib.rs::classify_exception_message``
+    # for new variants; extend the typed mapping instead.
     if isinstance(exc, ValueError):
         return GamError(message)
     if isinstance(exc, (TypeError, LookupError, ArithmeticError)):

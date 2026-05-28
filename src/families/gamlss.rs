@@ -2855,43 +2855,45 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
                 noisespec.initial_beta = Some(beta_ls0);
             }
         }
-        Ok(vec![
-            meanspec,
-            noisespec,
-            ParameterBlockSpec {
-                name: "wiggle".to_string(),
-                design: self.wiggle_block.design.clone(),
-                offset: self.wiggle_block.offset.clone(),
-                penalties: {
-                    let p_wiggle = self.wiggle_block.design.ncols();
-                    self.wiggle_block
-                        .penalties
-                        .iter()
-                        .map(|spec| match spec {
-                            crate::solver::estimate::PenaltySpec::Block {
-                                local,
-                                col_range,
-                                ..
-                            } => PenaltyMatrix::Blockwise {
-                                local: local.clone(),
-                                col_range: col_range.clone(),
-                                total_dim: p_wiggle,
-                            },
-                            crate::solver::estimate::PenaltySpec::Dense(m)
-                            | crate::solver::estimate::PenaltySpec::DenseWithMean {
-                                matrix: m,
-                                ..
-                            } => PenaltyMatrix::Dense(m.clone()),
-                        })
-                        .collect()
-                },
-                nullspace_dims: self.wiggle_block.nullspace_dims.clone(),
-                initial_log_lambdas: layout.wiggle_from(theta),
-                initial_beta: self.wiggle_block.initial_beta.clone(),
-                gauge_priority: 100,
-            jacobian_callback: None,
+        let mut wigglespec = ParameterBlockSpec {
+            name: "wiggle".to_string(),
+            design: self.wiggle_block.design.clone(),
+            offset: self.wiggle_block.offset.clone(),
+            penalties: {
+                let p_wiggle = self.wiggle_block.design.ncols();
+                self.wiggle_block
+                    .penalties
+                    .iter()
+                    .map(|spec| match spec {
+                        crate::solver::estimate::PenaltySpec::Block {
+                            local,
+                            col_range,
+                            ..
+                        } => PenaltyMatrix::Blockwise {
+                            local: local.clone(),
+                            col_range: col_range.clone(),
+                            total_dim: p_wiggle,
+                        },
+                        crate::solver::estimate::PenaltySpec::Dense(m)
+                        | crate::solver::estimate::PenaltySpec::DenseWithMean {
+                            matrix: m,
+                            ..
+                        } => PenaltyMatrix::Dense(m.clone()),
+                    })
+                    .collect()
             },
-        ])
+            nullspace_dims: self.wiggle_block.nullspace_dims.clone(),
+            initial_log_lambdas: layout.wiggle_from(theta),
+            initial_beta: self.wiggle_block.initial_beta.clone(),
+            gauge_priority: 100,
+            jacobian_callback: None,
+        };
+        install_additive_callbacks_two_block_with_wiggle(
+            &mut meanspec,
+            &mut noisespec,
+            &mut wigglespec,
+        )?;
+        Ok(vec![meanspec, noisespec, wigglespec])
     }
 
     fn build_family(
@@ -3046,6 +3048,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleTermBuilder {
                 log_sigmaspec.initial_beta = Some(beta_ls0);
             }
         }
+        install_additive_callbacks_two_block(&mut thresholdspec, &mut log_sigmaspec)?;
         Ok(vec![thresholdspec, log_sigmaspec])
     }
 
