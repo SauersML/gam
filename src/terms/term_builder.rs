@@ -44,9 +44,25 @@ use crate::types::ColIdx;
 /// their boundary to stay compatible with callers in protected modules.
 #[derive(Clone, Debug)]
 pub enum TermBuilderError {
-    /// Column-resolution / column-kind lookup failures, including "column does
-    /// not exist" diagnostics produced via `missing_column_message`.
+    /// Column-resolution / column-kind lookup failures whose context is purely
+    /// internal (column-kind table out-of-sync, alias map missing an entry,
+    /// etc.). User-facing "this formula references a column that doesn't
+    /// exist" diagnostics use the dedicated `ColumnNotFound` variant so the
+    /// FFI boundary can lift the structured payload into a Python
+    /// `ColumnNotFoundError` without parsing prose.
     MissingColumn { reason: String },
+    /// A formula referenced a column that is not present in the input data.
+    /// Mirrors `DataError::ColumnNotFound` field-for-field so the conversion
+    /// across module boundaries is a pure data move (no re-derivation, no
+    /// string re-parsing). Public callers see byte-identical `Display`
+    /// output to the legacy `missing_column_message` text.
+    ColumnNotFound {
+        name: String,
+        role: Option<String>,
+        available: Vec<String>,
+        similar: Vec<String>,
+        tsv_hint: bool,
+    },
     /// User-specified configuration is internally inconsistent (e.g. too few
     /// variables for a smooth type, conflicting size options, requested basis
     /// dimension below the polynomial nullspace).
@@ -75,6 +91,27 @@ impl std::fmt::Display for TermBuilderError {
             | TermBuilderError::UnsupportedFeature { reason }
             | TermBuilderError::DegenerateData { reason }
             | TermBuilderError::MalformedFormula { reason } => f.write_str(reason),
+            // Delegate to the canonical `DataError::ColumnNotFound` formatter
+            // so a single source of truth defines the human text. The
+            // intermediate `DataError` constructed here owns its strings only
+            // for the duration of the Display call — no allocation cost
+            // beyond the original payload that this variant already holds.
+            TermBuilderError::ColumnNotFound {
+                name,
+                role,
+                available,
+                similar,
+                tsv_hint,
+            } => {
+                let canonical = DataError::ColumnNotFound {
+                    name: name.clone(),
+                    role: role.clone(),
+                    available: available.clone(),
+                    similar: similar.clone(),
+                    tsv_hint: *tsv_hint,
+                };
+                std::fmt::Display::fmt(&canonical, f)
+            }
         }
     }
 }
@@ -82,6 +119,37 @@ impl std::fmt::Display for TermBuilderError {
 impl From<TermBuilderError> for String {
     fn from(err: TermBuilderError) -> String {
         err.to_string()
+    }
+}
+
+/// Typed lift from data-layer errors. `DataError::ColumnNotFound` becomes
+/// `TermBuilderError::ColumnNotFound` field-for-field — no stringification,
+/// no information loss — so the FFI boundary downstream can dispatch on
+/// the typed variant. Other `DataError` variants degrade into
+/// `MissingColumn` since they describe column-resolution-time failures
+/// without a dedicated structured destination.
+impl From<DataError> for TermBuilderError {
+    fn from(err: DataError) -> Self {
+        match err {
+            DataError::ColumnNotFound {
+                name,
+                role,
+                available,
+                similar,
+                tsv_hint,
+            } => Self::ColumnNotFound {
+                name,
+                role,
+                available,
+                similar,
+                tsv_hint,
+            },
+            DataError::SchemaMismatch { reason }
+            | DataError::ParseError { reason }
+            | DataError::EncodingFailure { reason }
+            | DataError::EmptyInput { reason }
+            | DataError::InvalidValue { reason } => Self::MissingColumn { reason },
+        }
     }
 }
 

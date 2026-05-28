@@ -21109,6 +21109,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<StiefelManifold>()?;
     module.add_class::<SpdManifold>()?;
     module.add_class::<ProductManifold>()?;
+    module.add_function(wrap_pyfunction!(fit_penalized_multinomial_pyfunc, module)?)?;
     module.add_function(wrap_pyfunction!(classify_exception_message, module)?)?;
     module.add_function(wrap_pyfunction!(sklearn_fit_metadata, module)?)?;
     module.add_function(wrap_pyfunction!(build_info, module)?)?;

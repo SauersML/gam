@@ -1011,7 +1011,7 @@ mod tests {
     #[test]
     fn test_no_nullspace_correction_full_rank() {
         let s = array![[3.0, 1.0], [1.0, 2.0]];
-        let pld = PenaltyPseudologdet::from_assembled(s).unwrap();
+        let pld = PenaltyPseudologdet::from_assembled(s, None).unwrap();
         assert_eq!(pld.rank(), 2);
         assert!(pld.u_null.is_none());
     }
