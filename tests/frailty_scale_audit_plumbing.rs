@@ -66,8 +66,6 @@ fn make_z(seed: u64) -> Vec<f64> {
 
 /// Build a `LogslopeBlockJacobian` spec with the given s_f.
 fn make_logslope_spec(design: &Array2<f64>, z: &[f64], s_f: f64) -> ParameterBlockSpec {
-    use gam::custom_family::BlockEffectiveJacobian;
-    let z_arc: Arc<[f64]> = Arc::from(z);
     let sf_z: Arc<[f64]> = z.iter().map(|&zi| s_f * zi).collect::<Vec<f64>>().into();
     let jac_cb: Arc<dyn BlockEffectiveJacobian> = Arc::new(
         LogslopeBlockJacobian::new(design.clone(), z.to_vec(), s_f),

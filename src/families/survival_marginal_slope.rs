@@ -20325,8 +20325,8 @@ pub fn fit_survival_marginal_slope_terms(
                 // route the resulting `CompiledMap` T through
                 // `apply_compiled_map_to_designs` so the compiled designs +
                 // pulled-back penalties + result-time lift come from the
-                // closed-form path. On any failure we log and fall through
-                // to the per-term V/R path below.
+                // closed-form path. On any failure propagate Err to skip
+                // phase-4b entirely.
                 {
                     use crate::families::identifiability_compiler::{
                         BlockOrder as IdBlockOrder, PrimaryChannelBlocks,
@@ -20405,11 +20405,10 @@ pub fn fit_survival_marginal_slope_terms(
                                 p_marg.saturating_sub(wm),
                                 p_log.saturating_sub(wl),
                             );
-                            // Populate the post-accept recompile context the
-                            // same way the per-term path does. The recompile
-                            // hook rebuilds from the densified matrices at
-                            // converged β; the initial drops field is purely
-                            // diagnostic.
+                            // Populate the post-accept recompile context.
+                            // The recompile hook rebuilds from the densified
+                            // matrices at converged β; the initial drops field
+                            // is purely diagnostic.
                             recompile_ctx = Some(SmgsRecompileAfterAcceptContext {
                                 dq0: dq0.clone(),
                                 dq1: dq1.clone(),
