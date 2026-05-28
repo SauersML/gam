@@ -4281,6 +4281,23 @@ fn prepare_survival_location_scale_model(
         &spec.time_block.offset_exit,
         &spec.time_block.derivative_offset_exit,
     ]);
+    // Audit-facing single-channel Jacobian for the time block: the solver's
+    // `design` field stacks [entry; exit; derivative_exit] for a row count of
+    // `3*n`, but for the identifiability audit only the n-row exit design is
+    // the relevant linear-predictor channel. Exposing this n-row view via the
+    // callback keeps every block's audit-visible row count equal to n while
+    // leaving the solver's stacked operator untouched.
+    let time_exit_dense = time_prepared
+        .design_exit
+        .try_to_dense_arc("survival_location_scale time block audit Jacobian")?
+        .as_ref()
+        .clone();
+    let time_audit_jacobian: Arc<dyn BlockEffectiveJacobian> =
+        Arc::new(AdditiveBlockJacobian {
+            design: time_exit_dense,
+            own_output: 0,
+            n_family_outputs: 1,
+        });
     let timespec = ParameterBlockSpec {
         name: "time_transform".to_string(),
         design: time_solver_design,

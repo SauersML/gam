@@ -37,8 +37,6 @@ use cudarc::driver::{CudaModule, CudaStream, LaunchConfig, PushKernelArg};
 use super::error::GpuError;
 #[cfg(target_os = "linux")]
 use crate::gpu::error::GpuResultExt;
-#[cfg(target_os = "linux")]
-use crate::gpu_err;
 
 /// Hard ceiling on `r` (primary local dimension). Matches the BMS-FLEX row
 /// kernel's [`super::bms_flex_row::MAX_R`] so the same cached Hessian

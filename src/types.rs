@@ -379,9 +379,11 @@ impl ResponseFamily {
     }
 
     /// Predicate that returns `true` iff `yi` lies in this family's response
-    /// support (used to detect domain violations before fit). Families with no
-    /// distribution-level domain constraint at this layer return `true` for
-    /// every finite value.
+    /// support. Only meaningful for families with a non-trivial domain
+    /// constraint at the validation layer; `validate_response_support` calls
+    /// this only after `response_support_requirement` returns `Some`, so the
+    /// "unconstrained" families (Gaussian / Binomial / RoystonParmar) never
+    /// hit this code path.
     #[inline]
     fn response_support_contains(&self, yi: f64) -> bool {
         match self {
@@ -390,7 +392,7 @@ impl ResponseFamily {
                 yi.is_finite() && yi >= 0.0
             }
             Self::Beta { .. } => yi.is_finite() && yi > 0.0 && yi < 1.0,
-            Self::Gaussian | Self::Binomial | Self::RoystonParmar => yi.is_finite() || yi.is_nan(),
+            Self::Gaussian | Self::Binomial | Self::RoystonParmar => true,
         }
     }
 
