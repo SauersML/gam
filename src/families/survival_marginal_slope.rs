@@ -17938,6 +17938,19 @@ fn build_logslope_blockspec(
                 probit_scale,
             )) as Arc<dyn crate::custom_family::BlockEffectiveJacobian>
         });
+    // eta_row_scaling carries s_f·z — the correct β=0 logslope row-weight.
+    // The jacobian_callback embeds s_f via LogslopeBlockJacobian (takes
+    // precedence); this fallback scaling keeps flat-audit paths consistent
+    // when the callback cannot be built (e.g. sparse design densification fails).
+    let sf_z: Arc<[f64]> = if (probit_scale - 1.0).abs() < f64::EPSILON {
+        z_scaling
+    } else {
+        z_scaling
+            .iter()
+            .map(|&z_i| probit_scale * z_i)
+            .collect::<Vec<f64>>()
+            .into()
+    };
 
     ParameterBlockSpec {
         name: "logslope_surface".to_string(),
@@ -17948,9 +17961,9 @@ fn build_logslope_blockspec(
         initial_log_lambdas: rho,
         initial_beta: beta_hint,
         gauge_priority: 120,
-        // eta_row_scaling kept as syntactic sugar for the β=0 flat single-output
-        // audit path. The callback takes precedence when set.
-        eta_row_scaling: Some(z_scaling),
+        // eta_row_scaling is s_f·z (the β=0 flat single-output fallback).
+        // The jacobian_callback takes precedence when set.
+        eta_row_scaling: Some(sf_z),
         jacobian_callback: jac_cb,
     }
 }

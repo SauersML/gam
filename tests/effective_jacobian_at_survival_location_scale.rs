@@ -239,7 +239,7 @@ fn survival_ls_jacobian_beta_independent() {
         let beta_zero = vec![0.0f64; p];
         let beta_nonzero: Vec<f64> = (0..p).map(|j| (j as f64 + 1.0) * 0.25).collect();
 
-        let jac_box = SurvivalLocationScaleFamily::block_effective_jacobian(&specs, block_idx)
+        let jac_box = survival_location_scale_block_effective_jacobian(&specs, block_idx)
             .expect("block_effective_jacobian");
 
         let jac0 = jac_box
@@ -268,7 +268,7 @@ fn survival_ls_n_outputs_is_three() {
         make_spec("log_sigma", design_p3()),
     ];
     for block_idx in 0..3 {
-        let jac_box = SurvivalLocationScaleFamily::block_effective_jacobian(&specs, block_idx)
+        let jac_box = survival_location_scale_block_effective_jacobian(&specs, block_idx)
             .expect("block_effective_jacobian");
         assert_eq!(
             jac_box.n_outputs(),
@@ -285,7 +285,7 @@ fn survival_ls_out_of_range_returns_err() {
         make_spec("threshold", design_p2()),
         make_spec("log_sigma", design_p3()),
     ];
-    let result = SurvivalLocationScaleFamily::block_effective_jacobian(&specs, 10);
+    let result = survival_location_scale_block_effective_jacobian(&specs, 10);
     assert!(result.is_err(), "expected Err for block_idx=10");
 }
 
@@ -306,7 +306,7 @@ fn survival_ls_jacobian_equals_design_exactly() {
         let p = specs[block_idx].design.ncols();
         let beta0 = vec![0.0f64; p];
         let state = make_state(&beta0);
-        let jac_box = SurvivalLocationScaleFamily::block_effective_jacobian(&specs, block_idx)
+        let jac_box = survival_location_scale_block_effective_jacobian(&specs, block_idx)
             .expect("block_effective_jacobian");
         let jac = jac_box
             .effective_jacobian_at(&state)
@@ -337,7 +337,7 @@ fn survival_ls_jacobian_box_is_send_sync() {
         make_spec("threshold", design_p2()),
         make_spec("log_sigma", design_p3()),
     ];
-    let jac = SurvivalLocationScaleFamily::block_effective_jacobian(&specs, 0)
+    let jac = survival_location_scale_block_effective_jacobian(&specs, 0)
         .expect("block_effective_jacobian");
     let _arc: Arc<dyn gam::custom_family::BlockEffectiveJacobian> = Arc::from(jac);
 }
