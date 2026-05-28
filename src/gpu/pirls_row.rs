@@ -1005,6 +1005,99 @@ impl RowOutputDevBuffers {
     }
 }
 
+/// Device-resident per-row output buffers for the **solve-row** mode.
+///
+/// Allocates only the four fields the PIRLS solver reads on every Newton
+/// iteration: `grad_eta` (score for Xᵀg RHS), `w_solver` (working weight
+/// for XᵀWX assembly), `deviance` (per-row deviance for convergence check),
+/// and `status` (diagnostic flags OR-reduced to a single host u32). Written
+/// by [`launch_solve_row_on_stream`]; used instead of [`RowOutputDevBuffers`]
+/// during the hot inner loop to reduce device memory and kernel store traffic.
+#[cfg(target_os = "linux")]
+pub struct SolveRowBuffers {
+    /// ∂ℓ/∂η_i — score for Xᵀg RHS formation.
+    pub grad_eta: cudarc::driver::CudaSlice<f64>,
+    /// Stabilised Hessian weight — fed to XᵀWX assembly.
+    pub w_solver: cudarc::driver::CudaSlice<f64>,
+    /// Per-row deviance contribution — summed for convergence check.
+    pub deviance: cudarc::driver::CudaSlice<f64>,
+    /// Bitmask flags OR-reduced to detect numerical issues.
+    pub status: cudarc::driver::CudaSlice<u32>,
+    pub n: usize,
+}
+
+#[cfg(target_os = "linux")]
+impl SolveRowBuffers {
+    /// Allocate the four solve-row output buffers (length `n`) on `stream`.
+    pub fn allocate(stream: &Arc<cudarc::driver::CudaStream>, n: usize) -> Result<Self, GpuError> {
+        let alloc_f64 = |label: &'static str| {
+            stream
+                .alloc_zeros::<f64>(n)
+                .gpu_ctx_with(|err| format!("pirls_row solve alloc {label}: {err}"))
+        };
+        let alloc_u32 = |label: &'static str| {
+            stream
+                .alloc_zeros::<u32>(n)
+                .gpu_ctx_with(|err| format!("pirls_row solve alloc {label}: {err}"))
+        };
+        Ok(Self {
+            grad_eta: alloc_f64("grad_eta")?,
+            w_solver: alloc_f64("w_solver")?,
+            deviance: alloc_f64("deviance")?,
+            status: alloc_u32("status")?,
+            n,
+        })
+    }
+}
+
+/// Number of alpha step sizes in the fused alpha ladder.
+pub const ALPHA_LADDER_LEN: usize = 7;
+
+/// The fixed alpha step-size ladder: `[1, 0.5, 0.25, 0.125, 0.0625, 0.03125, 0.015625]`.
+pub const ALPHA_LADDER: [f64; ALPHA_LADDER_LEN] =
+    [1.0, 0.5, 0.25, 0.125, 0.0625, 0.03125, 0.015625];
+
+/// Device buffers for the fused alpha-ladder candidate-objective kernel.
+///
+/// **candidate-objective mode**: for each of the [`ALPHA_LADDER_LEN`] step
+/// sizes α_k the kernel evaluates `η_trial_i = η_i + α_k · xδ_i`, computes
+/// the per-row deviance, and atomically accumulates the sum into
+/// `objective_dev[k]`. Status flags are OR-accumulated into `status_dev[k]`.
+/// After a single `memcpy_dtoh` the host picks the first α that achieves
+/// deviance descent — no per-α kernel launch, no full row-output write.
+#[cfg(target_os = "linux")]
+pub struct AlphaLadderDevBuffers {
+    /// Device: summed deviance for each alpha step, length [`ALPHA_LADDER_LEN`].
+    pub objective_dev: cudarc::driver::CudaSlice<f64>,
+    /// Device: OR-reduced status flags for each alpha step, length [`ALPHA_LADDER_LEN`].
+    pub status_dev: cudarc::driver::CudaSlice<u32>,
+}
+
+#[cfg(target_os = "linux")]
+impl AlphaLadderDevBuffers {
+    /// Allocate the ladder device buffers on `stream`.
+    pub fn allocate(stream: &Arc<cudarc::driver::CudaStream>) -> Result<Self, GpuError> {
+        Ok(Self {
+            objective_dev: stream
+                .alloc_zeros::<f64>(ALPHA_LADDER_LEN)
+                .gpu_ctx_with(|err| format!("pirls_row ladder alloc objective: {err}"))?,
+            status_dev: stream
+                .alloc_zeros::<u32>(ALPHA_LADDER_LEN)
+                .gpu_ctx_with(|err| format!("pirls_row ladder alloc status: {err}"))?,
+        })
+    }
+
+    /// Zero all per-alpha accumulators in-place (call before each ladder launch).
+    pub fn zero(&mut self, stream: &Arc<cudarc::driver::CudaStream>) -> Result<(), GpuError> {
+        stream
+            .memset_zeros(&mut self.objective_dev)
+            .gpu_ctx_with(|err| format!("pirls_row ladder zero objective: {err}"))?;
+        stream
+            .memset_zeros(&mut self.status_dev)
+            .gpu_ctx_with(|err| format!("pirls_row ladder zero status: {err}"))
+    }
+}
+
 /// Device-side row reweight launcher.
 ///
 /// Resolves the cached per-family kernel from [`PirlsRowBackend::module_for`],

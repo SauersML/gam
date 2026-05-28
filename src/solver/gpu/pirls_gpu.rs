@@ -422,6 +422,11 @@ extern "C" __global__ void chol_logdet_col_major(
             .stream
             .clone_dtoh(&ws.rhs_dev)
             .map_err(|e| format!("download direction: {e}"))?;
+        // Check deferred POTRF/POTRS info after the direction download
+        // (which already syncs the stream). Single host round-trip for both
+        // info scalars at end-of-step rather than one per cuSOLVER call.
+        check_deferred_potrf_info(&ws.stream, &ws.potrf_info_dev)?;
+        check_deferred_potrs_info(&ws.stream, &ws.potrs_info_dev)?;
         let mut direction = Array1::from_vec(direction_raw);
         direction.mapv_inplace(|v| -v);
 
@@ -590,6 +595,11 @@ extern "C" __global__ void chol_logdet_col_major(
             .stream
             .clone_dtoh(&ws.rhs_dev)
             .map_err(|e| format!("download direction (device-input): {e}"))?;
+        // Check deferred POTRF/POTRS info after the direction download
+        // (which already syncs the stream). Single host round-trip for both
+        // info scalars at end-of-step rather than one per cuSOLVER call.
+        check_deferred_potrf_info(&ws.stream, &ws.potrf_info_dev)?;
+        check_deferred_potrs_info(&ws.stream, &ws.potrs_info_dev)?;
         let mut direction = Array1::from_vec(direction_raw);
         direction.mapv_inplace(|v| -v);
 

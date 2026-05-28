@@ -17804,6 +17804,10 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleHessianWorkspace 
         Ok(Some(h))
     }
 
+    fn hessian_matvec_available(&self) -> bool {
+        true
+    }
+
     fn hessian_matvec(&self, v: &Array1<f64>) -> Result<Option<Array1<f64>>, String> {
         let pt = self.x_t.ncols();
         let pls = self.x_ls.ncols();
@@ -22347,6 +22351,10 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleWiggleHessianWork
             .pieces
             .assemble_dense(self.x_t.as_ref(), self.x_ls.as_ref())?;
         Ok(Some(dense))
+    }
+
+    fn hessian_matvec_available(&self) -> bool {
+        true
     }
 
     fn hessian_matvec(&self, v: &Array1<f64>) -> Result<Option<Array1<f64>>, String> {
