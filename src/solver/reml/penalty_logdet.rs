@@ -988,7 +988,7 @@ mod tests {
         let s_tau = array![[1.0, 0.0], [0.0, 0.0]];
         let s_tau_tau = Array2::<f64>::zeros((2, 2));
 
-        let pld = PenaltyPseudologdet::from_assembled(s0).unwrap();
+        let pld = PenaltyPseudologdet::from_assembled(s0, None).unwrap();
 
         // Gradient: exact = 2 / det.
         let exact_grad = 2.0 / det;
