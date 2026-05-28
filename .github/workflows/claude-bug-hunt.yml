@@ -1,0 +1,129 @@
+name: Claude Bug Hunt (real + synthetic data)
+
+on:
+  schedule:
+    - cron: "0 */2 * * *"
+
+concurrency:
+  group: claude-bug-hunt
+  cancel-in-progress: false
+
+jobs:
+  hunt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+      id-token: write
+      actions: read
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install gam CLI
+        run: |
+          set -euxo pipefail
+          curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | bash
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Install gamfit
+        run: |
+          set -euxo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install gamfit numpy pandas scipy scikit-learn pyarrow requests
+          python -c "import gamfit; print(gamfit.__version__)"
+
+      - name: Run Claude bug-hunt agent
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          additional_permissions: |
+            actions: read
+          claude_args: >-
+            --max-turns 120
+            --allowed-tools "Bash,Edit,Write,Read,Grep,Glob,WebSearch,WebFetch"
+          prompt: |
+            You are an autonomous QA agent for the `gam` Rust crate and its
+            Python wrapper `gamfit`. Each run you find ONE real bug, file a
+            GitHub issue, and open a PR adding exactly one NEW currently-
+            failing test that reproduces it. No production code changes.
+
+            ## Hard rules
+            1. The only source-tree change permitted is ONE new test file.
+               No edits to `src/`, `pyffi/`, `gamfit/` source, or any existing
+               test. No edits to build files.
+            2. Do not fix the bug. Diagnose only.
+            3. The test must currently FAIL on `main` because of the bug — a
+               real assertion failure, panic, wrong value, OOM, hang. Not a
+               compile error, not a missing dependency, not an artificial
+               timeout. Verify locally and paste the failure output into the
+               PR body.
+            4. The test must be non-trivial: it exercises a real code path
+               and asserts a meaningful property (correctness, calibration,
+               invariance, recovery vs ground truth, monotonicity, gamfit-vs-
+               gam parity, REML/LAML monotonicity, etc.). No `assert!(false)`,
+               no tautologies, no "this number changed" snapshot tests.
+            5. If no real bug is found, exit cleanly. Do not fabricate. No
+               issue, no PR.
+            6. Budget: ≤120 turns. One scenario per run.
+
+            ## Targets — pick ONE per run
+            Real data (fetch via curl/requests, pin SHA-256):
+              UCI bike sharing, UCI Beijing PM2.5, NYC TLC trip parquet,
+              CDC NCHS births, OpenML curated tabular, GWAS Catalog
+              summary stats, 1000 Genomes chromosome slice, SUPPORT2,
+              Rossmann store sales.
+
+            Large synthetic (generate in-process):
+              N≥1e6 smooth + tensor-product recovery with known truth;
+              survival Weibull/Gompertz baseline w/ time-varying covariates;
+              periodic / cylinder / torus / S² geometric smooths with
+              symmetry-recovery checks; nested-penalty + ARD identifiability
+              w/ analytic-vs-finite-difference gradients.
+
+            ## Workflow
+            1. `git fetch && git checkout -b claude/bug-hunt-<short-slug>`.
+            2. Pick one scenario. Write a minimal repro using `gamfit`
+               (Python) or the `gam` CLI at `$HOME/.local/bin/gam`.
+            3. Look for: NaN/Inf leaks, shape recovery failures, broken
+               invariance, CI miscoverage, panics, perf cliffs vs
+               documented complexity, gamfit-vs-gam divergence on identical
+               input, equivalent-formula divergence, REML/LAML monotonicity
+               violations, gradient mismatches.
+            4. If a real bug surfaces, reduce to the smallest deterministic
+               repro (fixed seed, pinned data SHA). Write the failing test:
+                 - Rust: `tests/bug_hunt_<slug>.rs`
+                 - Python: `gamfit/tests/test_bug_hunt_<slug>.py`
+               Run it, confirm it fails for the right reason, capture output.
+            5. Open the issue with `gh issue create`:
+                 Title: `[bug] <one-line symptom> in <subsystem>`
+                 Sections: Summary · Environment (gamfit + gam versions,
+                 runner) · Reproduction (commands, dataset URL + SHA) ·
+                 Observed vs Expected (numbers) · Hypothesis (point at
+                 files/lines; no patch) · Failing test (PR link).
+                 Labels: `bug`, `claude-bug-hunt`.
+            6. Commit on the branch:
+                 `test(bug-hunt): failing repro for #<issue> — <symptom>`
+               Push.
+            7. `gh pr create`:
+                 Title: `test(bug-hunt): failing repro for #<issue>`
+                 Body: `Reproduces #<issue> — intentionally fails CI until
+                 the bug is fixed. Test only; no production code changed.`
+                 Plus the captured failure output in a fenced block.
+                 Labels: `bug-repro`, `do-not-merge`.
+            8. Comment the PR URL on the issue to cross-link.
+
+            Be precise, terse, mathematically literate. No fluff.
+
+            Begin.
