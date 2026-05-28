@@ -17687,18 +17687,50 @@ impl crate::custom_family::BlockEffectiveJacobian for LogslopeBlockJacobian {
             self.s
         };
 
-        // Try to get per-row scalars from family_scalars.
+        // Compute per-row g_i = logslope_design[i,:] · β directly from state.beta.
+        // This block owns the logslope design so g is always self-computable without
+        // family_scalars.  Truncate to min(p, beta.len()) to handle the pre-fit
+        // initialisation call where beta may be shorter or empty.
+        let beta = state.beta;
+        let p_use = p.min(beta.len());
+        let mut g_rows = vec![0.0_f64; n];
+        for i in 0..n {
+            for j in 0..p_use {
+                g_rows[i] += self.design[[i, j]] * beta[j];
+            }
+        }
+
+        // Hard contract: when any g_i is nonzero the per-row primary scalars
+        // (q0, q1, qd1) from the time/marginal blocks are required for the correct
+        // hyperbolic formula (q·s²g/c + s·z).  Those scalars live in family_scalars.
+        // A caller operating at non-init β must populate them.
         let scalars: Option<&SurvivalMarginalSlopeFamilyScalars> = state
             .family_scalars
             .as_ref()
             .and_then(|a| a.downcast_ref::<SurvivalMarginalSlopeFamilyScalars>());
 
+        let any_nonzero_g = g_rows.iter().any(|&gi| gi != 0.0);
+        if any_nonzero_g && scalars.is_none() {
+            return Err(
+                "survival marginal-slope logslope block requires                  SurvivalMarginalSlopeFamilyScalars when beta != 0 (g_i != 0 for at                  least one row); got family_scalars: None. The caller must compute                  per-row (q0, q1, qd1) at the current beta and pass them via                  FamilyLinearizationState::family_scalars."
+                    .to_string(),
+            );
+        }
+
         let mut jac = Array2::<f64>::zeros((3 * n, p));
 
         for i in 0..n {
-            let (q0, q1, qd1, g, c) = match scalars {
-                Some(sc) => (sc.q0_i[i], sc.q1_i[i], sc.qd1_i[i], sc.g_i[i], sc.c_i[i]),
-                None => (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64, 1.0_f64),
+            // g_i computed from beta above; c_i from family_scalars when present,
+            // otherwise computed from g_i.  q0/q1/qd1 from family_scalars -
+            // guaranteed present by the contract check whenever g_i != 0.
+            let g = g_rows[i];
+            let (q0, q1, qd1, c) = match scalars {
+                Some(sc) => (sc.q0_i[i], sc.q1_i[i], sc.qd1_i[i], sc.c_i[i]),
+                None => {
+                    // g == 0.0 here (enforced by contract above), so c = 1.
+                    // The q terms vanish: q * s^2 * 0 / 1 = 0.
+                    (0.0_f64, 0.0_f64, 0.0_f64, 1.0_f64)
+                }
             };
             let z_i = self.z[i];
             let sg_over_c = if g == 0.0 { 0.0 } else { s * s * g / c };
