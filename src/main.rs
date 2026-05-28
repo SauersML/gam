@@ -1443,6 +1443,12 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                 penalty_orders: wiggle_cfg.penalty_orders.clone(),
                 double_penalty: wiggle_cfg.double_penalty,
             },
+            // CLI path: keep `blockwise_options_from_fit_args()` as the
+            // option source (it currently returns defaults but is the hook
+            // for future fit-arg overrides). Bound together with the pilot
+            // config inside `StandardBinomialWiggleConfig` so the two can
+            // never disagree (#320).
+            refit_options: blockwise_options_from_fit_args()?,
         })
     } else {
         None
@@ -1520,14 +1526,6 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             options: base_fit_options,
             kappa_options: kappa_options.clone(),
             wiggle: standard_wiggle,
-            wiggle_options: if learn_linkwiggle
-                && args.predict_noise.is_none()
-                && (!mean_only_flexible_linkwiggle || route_flexible_through_standard)
-            {
-                Some(blockwise_options_from_fit_args()?)
-            } else {
-                None
-            },
             coefficient_groups: Vec::new(),
             // Gamma precision hyperpriors on penalty blocks are only reachable via the
             // Python FFI (`PyFitConfig.precision_hyperpriors`). The CLI exposes no flag,
