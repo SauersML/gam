@@ -2064,7 +2064,7 @@ impl SaeManifoldTerm {
                                 }
                             }
                             let corrected_kind =
-                                AnalyticPenaltyKind::Isometry(std::sync::Arc::new(corrected));
+                                AnalyticPenaltyKind::Isometry(Arc::new(corrected));
                             self.add_sae_coord_penalty(
                                 sys,
                                 off,

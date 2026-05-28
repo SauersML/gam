@@ -9447,11 +9447,17 @@ impl BernoulliMarginalSlopeFamily {
                                     started.elapsed().as_secs_f64()
                                 );
                             }
-                            let packed = Array2::<f64>::from_shape_vec((n, r * r), outputs.hess)
-                                .map_err(|err| format!("bms_flex_row output shape: {err}"))?;
+                            let packed_neglog =
+                                Array1::<f64>::from_vec(outputs.neglog);
+                            let packed_grad =
+                                Array2::<f64>::from_shape_vec((n, r), outputs.grad)
+                                    .map_err(|err| format!("bms_flex_row grad shape: {err}"))?;
+                            let packed_hess =
+                                Array2::<f64>::from_shape_vec((n, r * r), outputs.hess)
+                                    .map_err(|err| format!("bms_flex_row hess shape: {err}"))?;
                             drop(heartbeat_guard);
-                            return Ok(RowPrimaryHessianCache::Host(RowPrimaryHessianPin::new(
-                                packed, plan.bytes,
+                            return Ok(RowPrimaryEvalCache::Host(RowPrimaryEvalPin::new(
+                                packed_neglog, packed_grad, packed_hess, plan.bytes,
                             )));
                         }
                         Err(err) => {

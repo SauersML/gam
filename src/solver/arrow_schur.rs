@@ -868,8 +868,26 @@ pub struct ArrowSchurSystem {
     pub hbb_diag: Option<Array1<f64>>,
     /// `g_β`, shape `(K,)`.
     pub gb: Array1<f64>,
-    /// Latent dimensionality `d`.
+    /// Maximum per-row latent dimensionality across all rows.
+    ///
+    /// For homogeneous systems (all rows have the same dim) this equals the
+    /// common per-row `d`.  For heterogeneous systems (e.g. sparse SAE rows
+    /// where JumpReLU / TopK / sparsemax active sets vary per observation)
+    /// this is `max_i row_dims[i]`.  Per-row code should use
+    /// `row.htt.nrows()` or `row_dims[i]`; `d` is an upper bound for
+    /// scratch-buffer sizing.
     pub d: usize,
+    /// Per-row latent dimensionality: `row_dims[i] == rows[i].htt.nrows()`.
+    ///
+    /// For homogeneous systems `row_dims[i] == d` for all `i`.
+    pub row_dims: Arc<[usize]>,
+    /// Flat-buffer row offsets for the `delta_t` vector produced by
+    /// [`Self::solve`] / [`solve_arrow_newton_step_core`].
+    ///
+    /// `row_offsets[i]` is the start index for row `i`'s slice in `delta_t`;
+    /// `row_offsets[n]` is the total `delta_t` length.  For homogeneous
+    /// systems `row_offsets[i] == i * d`.
+    pub row_offsets: Arc<[usize]>,
     /// β dimensionality `K`.
     pub k: usize,
     /// Geometry tag for the row-local latent blocks after optional

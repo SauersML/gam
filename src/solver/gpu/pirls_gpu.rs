@@ -619,6 +619,250 @@ extern "C" __global__ void chol_logdet_col_major(
         })
     }
 
+    /// In-place variant of [`solve_step_on_stream_device`] for the PIRLS loop.
+    ///
+    /// Assembles `H = XᵀWX + S + step_lm_lambda·I`, factors with POTRF,
+    /// solves `H·d = g` with POTRS — but skips both the XᵀWX download and
+    /// the post-solve direction download. On return:
+    ///
+    /// - `ws.h_dev` holds the Cholesky factor (overwritten by POTRF).
+    ///   Do not read it as a Hessian until rebuilt via `rebuild_h_final`.
+    /// - `ws.rhs_dev` holds `−H⁻¹·g` (the Newton direction), negated on
+    ///   device. The loop copies it to `direction_dev` via `memcpy_dtod`.
+    ///
+    /// Returns `logdet = log|H|` computed device-side.
+    pub(super) fn solve_step_on_stream_device_inplace(
+        shared: &PirlsGpuSharedData,
+        ws: &mut SigmaPirlsGpuWorkspace,
+        input: PirlsStepStreamDeviceInput<'_, '_>,
+        negate_func: &cudarc::driver::CudaFunction,
+    ) -> Result<f64, String> {
+        let n = shared.n;
+        let p = shared.p;
+        if ws.n != n || ws.p != p {
+            return Err(format!(
+                "workspace shape ({}, {}) does not match shared design ({n}, {p})",
+                ws.n, ws.p
+            ));
+        }
+        if input.w_solver_dev.len() != n {
+            return Err(format!(
+                "w_solver_dev length {} does not match n={n}",
+                input.w_solver_dev.len()
+            ));
+        }
+        if input.grad_eta_dev.len() != n {
+            return Err(format!(
+                "grad_eta_dev length {} does not match n={n}",
+                input.grad_eta_dev.len()
+            ));
+        }
+        if input.penalty_hessian.dim() != (p, p) {
+            return Err(format!(
+                "penalty Hessian shape {:?} does not match p={p}",
+                input.penalty_hessian.dim()
+            ));
+        }
+
+        // WX = diag(w_solver_dev) · X — no host round-trip for weights.
+        left_scale_rows_borrowed(
+            &ws.blas,
+            &ws.stream,
+            n,
+            p,
+            &shared.x_dev,
+            input.w_solver_dev,
+            &mut ws.wx_dev,
+        )?;
+
+        // XtWX = Xᵀ · WX → ws.xtwx_dev.
+        let n_i = to_i32(n)?;
+        let p_i = to_i32(p)?;
+        let gemm_cfg = GemmConfig::<f64> {
+            transa: cublasOperation_t::CUBLAS_OP_T,
+            transb: cublasOperation_t::CUBLAS_OP_N,
+            m: p_i,
+            n: p_i,
+            k: n_i,
+            alpha: 1.0,
+            lda: n_i,
+            ldb: n_i,
+            beta: 0.0,
+            ldc: p_i,
+        };
+        // SAFETY: validated i32 dims; shared.x_dev and ws.wx_dev are n*p
+        // f64 col-major buffers; ws.xtwx_dev is p*p; bound to ws.stream.
+        unsafe {
+            ws.blas
+                .gemm(gemm_cfg, &shared.x_dev, &ws.wx_dev, &mut ws.xtwx_dev)
+        }
+        .map_err(|e| format!("cublas dgemm XtWX (inplace): {e}"))?;
+
+        // Upload S + step_lm_lambda·I for the Newton solve only.
+        let penalty_step = penalty_with_ridge(input.penalty_hessian, input.step_lm_lambda);
+        let penalty_step_view = penalty_step.view();
+        let penalty_step_col = to_col_major(&penalty_step_view);
+        ws.stream
+            .memcpy_htod(penalty_step_col.as_ref(), &mut ws.penalty_dev)
+            .map_err(|e| format!("upload penalty (inplace): {e}"))?;
+
+        // H_step = XtWX + (S + step_lm_lambda·I).  POTRF overwrites next.
+        geam_add(
+            &ws.blas,
+            &ws.stream,
+            p,
+            &ws.xtwx_dev,
+            &ws.penalty_dev,
+            &mut ws.h_dev,
+        )?;
+
+        // RHS = Xᵀ · grad_eta_dev → ws.rhs_dev.  No host upload.
+        let gemv_cfg = GemvConfig::<f64> {
+            trans: cublasOperation_t::CUBLAS_OP_T,
+            m: n_i,
+            n: p_i,
+            alpha: 1.0,
+            lda: n_i,
+            incx: 1,
+            beta: 0.0,
+            incy: 1,
+        };
+        // SAFETY: shared.x_dev is n*p col-major; input.grad_eta_dev is
+        // length n; ws.rhs_dev is length p; cuBLAS contract satisfied.
+        unsafe {
+            ws.blas
+                .gemv(gemv_cfg, &shared.x_dev, input.grad_eta_dev, &mut ws.rhs_dev)
+        }
+        .map_err(|e| format!("cublas dgemv Xtg (inplace): {e}"))?;
+
+        // Factor H_step in-place (ws.h_dev <- Cholesky factor).
+        potrf_in_place_reuse(
+            &ws.solver,
+            &ws.stream,
+            p,
+            ws.potrf_lwork,
+            &mut ws.h_dev,
+            &mut ws.potrf_work_dev,
+            &mut ws.potrf_info_dev,
+        )?;
+
+        // Solve H·d = g in-place (ws.rhs_dev <- H^-1·g).
+        potrs_in_place_reuse(
+            &ws.solver,
+            &ws.stream,
+            p,
+            1,
+            &ws.h_dev,
+            &mut ws.rhs_dev,
+            &mut ws.potrs_info_dev,
+        )?;
+
+        // log|H| via the device-side diagonal kernel — one scalar download.
+        let logdet = cholesky_logdet_device(&ws.stream, &shared.ctx, p, &ws.h_dev)?;
+
+        // Check deferred POTRF/POTRS info after logdet (which syncs).
+        check_deferred_potrf_info(&ws.stream, &ws.potrf_info_dev)?;
+        check_deferred_potrs_info(&ws.stream, &ws.potrs_info_dev)?;
+
+        // Negate ws.rhs_dev in-place on device: direction <- -H^-1·g.
+        const NEG_THREADS: u32 = 256;
+        let p_i_neg = to_i32(p)?;
+        let p_u = u32::try_from(p).map_err(|_| format!("negate p={p} > u32"))?;
+        let grid = p_u.div_ceil(NEG_THREADS).max(1);
+        let cfg_neg = LaunchConfig {
+            grid_dim: (grid, 1, 1),
+            block_dim: (NEG_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut builder = ws.stream.launch_builder(negate_func);
+        builder.arg(&mut ws.rhs_dev);
+        builder.arg(&p_i_neg);
+        // SAFETY: negate_n signature is (double*, int); ws.rhs_dev has length p.
+        unsafe { builder.launch(cfg_neg) }
+            .map(|_event| ())
+            .map_err(|e| format!("negate_n launch (inplace): {e}"))?;
+
+        Ok(logdet)
+    }
+
+    /// Rebuild the penalised Hessian `H = XᵀW_hessianX + S + objective_ridge·I`
+    /// on device using the accepted `w_hessian` weights and download it once.
+    /// Called once after PIRLS convergence so the exported Hessian reflects
+    /// the accepted eta, not a stale mid-loop snapshot.
+    ///
+    /// Uses `ws.wx_dev`, `ws.xtwx_dev`, `ws.h_dev`, `ws.penalty_dev` as
+    /// scratch — all are fair game post-loop.
+    pub(super) fn rebuild_h_final(
+        shared: &PirlsGpuSharedData,
+        ws: &mut SigmaPirlsGpuWorkspace,
+        w_hessian_dev: &CudaSlice<f64>,
+        penalty_hessian: ArrayView2<'_, f64>,
+        objective_ridge: f64,
+    ) -> Result<Array2<f64>, String> {
+        let n = shared.n;
+        let p = shared.p;
+
+        // WX = diag(w_hessian) · X.
+        left_scale_rows_borrowed(
+            &ws.blas,
+            &ws.stream,
+            n,
+            p,
+            &shared.x_dev,
+            w_hessian_dev,
+            &mut ws.wx_dev,
+        )?;
+
+        // XtWX = Xᵀ · WX.
+        let n_i = to_i32(n)?;
+        let p_i = to_i32(p)?;
+        let gemm_cfg = GemmConfig::<f64> {
+            transa: cublasOperation_t::CUBLAS_OP_T,
+            transb: cublasOperation_t::CUBLAS_OP_N,
+            m: p_i,
+            n: p_i,
+            k: n_i,
+            alpha: 1.0,
+            lda: n_i,
+            ldb: n_i,
+            beta: 0.0,
+            ldc: p_i,
+        };
+        // SAFETY: validated dims; shared.x_dev and ws.wx_dev are n*p col-major;
+        // ws.xtwx_dev is p*p; all bound to ws.stream.
+        unsafe {
+            ws.blas
+                .gemm(gemm_cfg, &shared.x_dev, &ws.wx_dev, &mut ws.xtwx_dev)
+        }
+        .map_err(|e| format!("cublas dgemm XtWX (final H rebuild): {e}"))?;
+
+        // Upload S + objective_ridge·I.
+        let penalty = penalty_with_ridge(penalty_hessian, objective_ridge);
+        let penalty_view = penalty.view();
+        let penalty_col = to_col_major(&penalty_view);
+        ws.stream
+            .memcpy_htod(penalty_col.as_ref(), &mut ws.penalty_dev)
+            .map_err(|e| format!("upload penalty (final H rebuild): {e}"))?;
+
+        // H_final = XtWX + (S + objective_ridge·I) -> ws.h_dev.
+        geam_add(
+            &ws.blas,
+            &ws.stream,
+            p,
+            &ws.xtwx_dev,
+            &ws.penalty_dev,
+            &mut ws.h_dev,
+        )?;
+
+        // One download — the only H transfer in the entire PIRLS loop.
+        let h_col = ws
+            .stream
+            .clone_dtoh(&ws.h_dev)
+            .map_err(|e| format!("download H_final: {e}"))?;
+        from_col_major(&h_col, p, p)
+            .ok_or_else(|| "H_final layout conversion failed".to_string())
+    }
+
     pub(super) fn weighted_crossprod(
         x: ArrayView2<'_, f64>,
         weights: ArrayView1<'_, f64>,
@@ -1302,7 +1546,7 @@ extern "C" __global__ void status_or(
         /// Ridge passport carrying the stabilization δ and policy.
         /// When `extra.ridge_passport` is `Some`, this is the supplied
         /// value verbatim. Otherwise a default `scaled_identity(
-        /// lm_ridge, explicit_stabilization_full())` passport.
+        /// objective_ridge, explicit_stabilization_full())` passport.
         pub ridge_passport: crate::types::RidgePassport,
         /// Firth diagnostics. `Inactive` unless the caller passes an
         /// `Active` value through `extra.firth`.
@@ -1997,6 +2241,37 @@ extern "C" __global__ void status_or(
         unsafe { builder.launch(cfg) }.map_err(|e| format!("{label} reduce launch: {e}"))?;
         let host = stream
             .clone_dtoh(scalar_dev)
+            .map_err(|e| format!("download {label}: {e}"))?;
+        Ok(host[0])
+    }
+
+    /// OR-reduce a device-resident `u32` status array into a single `u32`.
+    /// Mirrors [`reduce_scalar`] for `f64` deviance reductions: single-block,
+    /// 1024-thread launch, one scalar DtoH download.
+    fn reduce_status_or(
+        stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+        func: &cudarc::driver::CudaFunction,
+        src: &CudaSlice<u32>,
+        len: usize,
+        status_dev: &mut CudaSlice<u32>,
+        label: &'static str,
+    ) -> Result<u32, String> {
+        const THREADS: u32 = 1024;
+        let len_i = to_i32(len)?;
+        let cfg = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut builder = stream.launch_builder(func);
+        builder.arg(src);
+        builder.arg(&len_i);
+        builder.arg(&mut *status_dev);
+        // SAFETY: status_or kernel signature (const unsigned int*, int,
+        // unsigned int*). The reborrow keeps `status_dev` available.
+        unsafe { builder.launch(cfg) }.map_err(|e| format!("{label} or reduce launch: {e}"))?;
+        let host = stream
+            .clone_dtoh(status_dev)
             .map_err(|e| format!("download {label}: {e}"))?;
         Ok(host[0])
     }
