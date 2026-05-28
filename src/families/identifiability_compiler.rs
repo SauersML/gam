@@ -606,8 +606,21 @@ fn audit_and_drop_trailing_pivots(
     let dropped_locals: Vec<(usize, usize)> = (kept_local..latest.t_lw.ncols())
         .map(|c| (latest_idx, c))
         .collect();
-    let truncated = latest.t_lw.slice(s![.., ..kept_local]).to_owned();
-    latest.t_lw = truncated;
+    // Truncate ALL kept-direction-indexed matrices in lockstep so the
+    // shape contract (`anchor_correction: d_total × k_kept`, `r_lw:
+    // d_total × k_kept`, `t_lw: p_raw × k_kept`) holds after the audit
+    // drops trailing pivots. Forgetting these two left
+    // `anchor_correction.ncols() == pre_truncation_k_kept` while
+    // `t_lw.ncols() == post_truncation_k_kept`, surfaced downstream as
+    // `cross-block identifiability: anchor_correction shape D×P does
+    // not match expected d_total=D × k_kept=K`.
+    latest.t_lw = latest.t_lw.slice(s![.., ..kept_local]).to_owned();
+    if let Some(m) = latest.anchor_correction.as_ref() {
+        latest.anchor_correction = Some(m.slice(s![.., ..kept_local]).to_owned());
+    }
+    if let Some(r) = latest.r_lw.as_ref() {
+        latest.r_lw = Some(r.slice(s![.., ..kept_local]).to_owned());
+    }
     Ok(dropped_locals)
 }
 
@@ -1306,6 +1319,55 @@ mod tests {
                 *block_idx, 1,
                 "audit drops must come from the latest block only"
             );
+        }
+    }
+
+    /// Regression: when `audit_and_drop_trailing_pivots` truncates the
+    /// latest block's `t_lw`, the sibling `anchor_correction` and `r_lw`
+    /// matrices must be truncated to the same `k_kept` so the trailing-
+    /// block install path sees a coherent
+    /// `t_lw.ncols() == anchor_correction.ncols() == r_lw.ncols()` shape.
+    ///
+    /// Pre-fix bug: only `t_lw` got truncated. Downstream callers
+    /// asserting `anchor_correction.ncols() == k_kept` then failed with
+    /// `cross-block identifiability: anchor_correction shape D×P does
+    /// not match expected d_total=D × k_kept=K` — surfaced via the
+    /// biobank V+M repro test.
+    #[test]
+    fn audit_truncation_keeps_t_lw_and_anchor_correction_in_lockstep() {
+        let n = 40;
+        let a = Array2::from_shape_fn((n, 2), |(i, j)| (i as f64 + 1.0).ln() * (j as f64 + 1.0));
+        let c = Array2::from_shape_fn((n, 2), |(i, j)| {
+            if j == 0 {
+                a[[i, 0]]
+            } else {
+                (i as f64 * 0.1).cos()
+            }
+        });
+        let hess = IdentityRowHessian::new(n, 1);
+        let ops = vec![op(a), op(c)];
+        let compiled = compile(&ops, &hess, &[BlockOrder::Marginal, BlockOrder::Logslope])
+            .expect("compile should succeed");
+        for (idx, block) in compiled.blocks.iter().enumerate() {
+            let k_kept = block.t_lw.ncols();
+            if let Some(m) = block.anchor_correction.as_ref() {
+                assert_eq!(
+                    m.ncols(),
+                    k_kept,
+                    "block {idx}: anchor_correction.ncols()={ac} must equal t_lw.ncols()={k_kept} \
+                     after audit truncation",
+                    ac = m.ncols(),
+                );
+            }
+            if let Some(r) = block.r_lw.as_ref() {
+                assert_eq!(
+                    r.ncols(),
+                    k_kept,
+                    "block {idx}: r_lw.ncols()={r_cols} must equal t_lw.ncols()={k_kept} \
+                     after audit truncation",
+                    r_cols = r.ncols(),
+                );
+            }
         }
     }
 
