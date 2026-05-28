@@ -1,15 +1,12 @@
-use super::*;
+use super::exact_eval_cache::*;
 use super::family::*;
 use super::gradient_paths::*;
 use super::hessian_paths::*;
-use super::exact_eval_cache::*;
 use super::install_flex::validate_spec;
-
+use super::*;
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::custom_family::{CustomFamily, ExactOuterDerivativeOrder};
     use super::exact_kernel::{
         DenestedCubicCell as ExactDenestedCubicCell, ExactCellBranch as ExactCellBranchShared,
         LocalSpanCubic, branch_cell as branch_exact_cell, build_denested_partition_cells,
@@ -17,6 +14,8 @@ mod tests {
         global_cubic_from_local as exact_global_cubic_from_local,
         transformed_link_cubic as exact_transformed_link_cubic,
     };
+    use super::*;
+    use crate::custom_family::{CustomFamily, ExactOuterDerivativeOrder};
     use ndarray::array;
 
     #[inline]

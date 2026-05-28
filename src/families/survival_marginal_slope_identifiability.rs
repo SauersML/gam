@@ -216,8 +216,8 @@ impl FamilyChannelHessian for SurvivalRowHessian {
     ) -> Result<Arc<dyn FamilyChannelHessian>, String> {
         use crate::families::survival_marginal_slope::SurvivalMarginalSlopeFamilyScalars;
 
-        let scalars_opt = family_scalars
-            .and_then(|a| a.downcast_ref::<SurvivalMarginalSlopeFamilyScalars>());
+        let scalars_opt =
+            family_scalars.and_then(|a| a.downcast_ref::<SurvivalMarginalSlopeFamilyScalars>());
 
         // Determine whether beta is non-trivial (any |β_j| > ε).
         // Threshold: 1e-12 (well below any meaningful coefficient).
@@ -237,9 +237,9 @@ impl FamilyChannelHessian for SurvivalRowHessian {
             }
             None => {
                 // β ≈ 0: return the frozen pilot W unchanged.
-                Ok(Arc::new(crate::families::custom_family::TensorChannelHessian {
-                    h: self.h.clone(),
-                }))
+                Ok(Arc::new(
+                    crate::families::custom_family::TensorChannelHessian { h: self.h.clone() },
+                ))
             }
             Some(sc) => {
                 let n = self.h.shape()[0];
@@ -285,9 +285,8 @@ impl FamilyChannelHessian for SurvivalRowHessian {
                     // Use unit weight and d=1 (event indicator 1) for the audit path.
                     // The derivative_guard is small but non-zero; use 1e-6.
                     match crate::families::survival_marginal_slope::row_primary_for_compiler(
-                        q0, q1, qd1, g, z,
-                        1.0, // w = unit weight
-                        1.0, // d = event
+                        q0, q1, qd1, g, z, 1.0,  // w = unit weight
+                        1.0,  // d = event
                         1e-6, // derivative_guard
                         sc.s, // probit_scale from scalars
                     ) {
@@ -372,7 +371,15 @@ pub fn survival_row_nll_grad_hess(
     probit_scale: f64,
 ) -> Result<(f64, [f64; 4], [[f64; 4]; 4]), String> {
     crate::families::survival_marginal_slope::row_primary_for_compiler(
-        q0, q1, qd1, g, z, w, d, derivative_guard, probit_scale,
+        q0,
+        q1,
+        qd1,
+        g,
+        z,
+        w,
+        d,
+        derivative_guard,
+        probit_scale,
     )
 }
 

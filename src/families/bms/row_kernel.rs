@@ -1,9 +1,8 @@
-use super::*;
+use super::exact_eval_cache::*;
 use super::family::*;
 use super::gradient_paths::*;
 use super::hessian_paths::*;
-use super::exact_eval_cache::*;
-
+use super::*;
 
 // ── RowKernel<2> implementation (rigid path only) ────────────────────
 
@@ -29,7 +28,10 @@ pub(super) struct BernoulliRigidRowKernel {
 }
 
 impl BernoulliRigidRowKernel {
-    pub(super) fn new(family: BernoulliMarginalSlopeFamily, block_states: Vec<ParameterBlockState>) -> Self {
+    pub(super) fn new(
+        family: BernoulliMarginalSlopeFamily,
+        block_states: Vec<ParameterBlockState>,
+    ) -> Self {
         let slices = block_slices(&family);
         Self {
             family,
@@ -364,7 +366,8 @@ pub(super) struct BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
     pub(super) block_states: Vec<ParameterBlockState>,
     pub(super) cache: Arc<BernoulliMarginalSlopeExactEvalCache>,
     pub(super) matvec_calls: AtomicUsize,
-    pub(super) fused_gradient_dense: OnceLock<Result<Arc<ExactNewtonJointFusedDenseEvaluation>, String>>,
+    pub(super) fused_gradient_dense:
+        OnceLock<Result<Arc<ExactNewtonJointFusedDenseEvaluation>, String>>,
     /// Outer-only joint-Hessian directional-derivative options. The
     /// `outer_score_subsample` field is the row mask threaded through the
     /// `_with_options` directional-derivative helpers so the cached joint
@@ -391,7 +394,6 @@ pub(super) struct BernoulliMarginalSlopeExactNewtonJointPsiWorkspace {
     /// ψ calculus subsample-aware.
     pub(super) options: BlockwiseFitOptions,
 }
-
 
 pub(super) fn bernoulli_margslope_line_search_ll_with_early_exit<F>(
     weighted_rows: &[WeightedOuterRow],

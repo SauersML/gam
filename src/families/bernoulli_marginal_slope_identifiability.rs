@@ -126,7 +126,11 @@ impl FamilyChannelHessian for BernoulliRowHessian {
     }
 
     fn fill_subject(&self, i: usize, out: &mut [f64]) {
-        assert_eq!(out.len(), 1, "BernoulliRowHessian::fill_subject expects K=1");
+        assert_eq!(
+            out.len(),
+            1,
+            "BernoulliRowHessian::fill_subject expects K=1"
+        );
         out[0] = self.w[i];
     }
 

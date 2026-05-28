@@ -1,8 +1,8 @@
-use super::*;
 use super::family::{
     append_deviation_function_penalty, require_probit_marginal_slope_link,
     resolve_deviation_operator_orders,
 };
+use super::*;
 
 //      needed for both the audit gate and the compile step.
 //   2. `audit_identifiability_channel_aware` — structural rank gate using
@@ -24,8 +24,7 @@ struct BmsFlexBlockContext {
     /// Densified anchor blocks in parametric-before-flex order.
     pub(super) anchor_dense_blocks: Vec<Array2<f64>>,
     /// Per-anchor predict-time tags (same order as `anchor_dense_blocks`).
-    pub(super) anchor_components:
-        Vec<super::deviation_runtime::AnchorComponentTag>,
+    pub(super) anchor_components: Vec<super::deviation_runtime::AnchorComponentTag>,
     /// Horizontally stacked anchor matrix N_train (n × d_total).
     pub(super) n_train: Array2<f64>,
     /// `BernoulliDenseDesignOperator` per anchor, then one for the candidate
@@ -35,7 +34,8 @@ struct BmsFlexBlockContext {
     /// Block-order tags parallel to `operators`.
     pub(super) ordering: Vec<crate::families::identifiability_compiler::BlockOrder>,
     /// W-metric row Hessian built from the validated `training_row_weights`.
-    pub(super) row_hess: crate::families::bernoulli_marginal_slope_identifiability::BernoulliRowHessian,
+    pub(super) row_hess:
+        crate::families::bernoulli_marginal_slope_identifiability::BernoulliRowHessian,
     /// Dense candidate basis at training rows (n × p_candidate), cached to
     /// avoid a second `design()` call after context construction.
     pub(super) candidate_design_dense: Array2<f64>,

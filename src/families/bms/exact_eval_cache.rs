@@ -1,6 +1,7 @@
+use super::hessian_paths::{
+    BernoulliMarginalSlopeRowExactContext, BlockSlices, PrimarySlices, RowCellMomentsBundle,
+};
 use super::*;
-use super::hessian_paths::{BlockSlices, PrimarySlices, BernoulliMarginalSlopeRowExactContext, RowCellMomentsBundle};
-
 
 #[inline]
 pub(super) fn log_exact_work(n: usize) -> bool {
@@ -126,7 +127,12 @@ pub struct RowPrimaryEvalPin {
 }
 
 impl RowPrimaryEvalPin {
-    pub(super) fn new(neglog: Array1<f64>, grad: Array2<f64>, hess: Array2<f64>, bytes: u64) -> Self {
+    pub(super) fn new(
+        neglog: Array1<f64>,
+        grad: Array2<f64>,
+        hess: Array2<f64>,
+        bytes: u64,
+    ) -> Self {
         bms_row_primary_hessian_pinned_bytes().fetch_add(bytes, Ordering::AcqRel);
         Self {
             neglog,
@@ -262,7 +268,8 @@ pub(super) struct BernoulliMarginalSlopeExactEvalCache {
     /// surface a non-finite value). `RayonSafeOnce` keeps lazy initialization
     /// safe when the first caller is already inside a Rayon row pass; failure
     /// is sticky and propagated identically to every caller.
-    pub(super) rigid_third_full: crate::resource::RayonSafeOnce<Result<Vec<[[[f64; 2]; 2]; 2]>, String>>,
+    pub(super) rigid_third_full:
+        crate::resource::RayonSafeOnce<Result<Vec<[[[f64; 2]; 2]; 2]>, String>>,
 
     /// Per-row uncontracted fourth-derivative tensor in the rigid path —
     /// the second-order analogue of `rigid_third_full`. The outer-Hessian
@@ -271,5 +278,6 @@ pub(super) struct BernoulliMarginalSlopeExactEvalCache {
     /// rank=32. Per-row, the five distinct components are axis-invariant,
     /// so caching them lets every pair contraction be a 16-multiply 2×2
     /// bilinear instead of a fresh 8-direction empirical jet.
-    pub(super) rigid_fourth_full: crate::resource::RayonSafeOnce<Result<Vec<[[[[f64; 2]; 2]; 2]; 2]>, String>>,
+    pub(super) rigid_fourth_full:
+        crate::resource::RayonSafeOnce<Result<Vec<[[[[f64; 2]; 2]; 2]; 2]>, String>>,
 }

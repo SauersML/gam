@@ -1,5 +1,5 @@
-use super::*;
 use super::family::clamp_bernoulli_link_probability;
+use super::*;
 
 pub(crate) fn standardize_latent_z_with_policy(
     z: &Array1<f64>,
@@ -573,7 +573,11 @@ pub(super) fn rigid_observed_scale(logslope: f64, probit_scale: f64) -> f64 {
 }
 
 #[inline]
-pub(super) fn rigid_intercept_from_marginal(marginal_eta: f64, logslope: f64, probit_scale: f64) -> f64 {
+pub(super) fn rigid_intercept_from_marginal(
+    marginal_eta: f64,
+    logslope: f64,
+    probit_scale: f64,
+) -> f64 {
     marginal_eta * rigid_observed_scale(logslope, probit_scale)
 }
 
@@ -597,12 +601,22 @@ pub(super) fn rigid_prescale_intercept_derivative_abs(
 }
 
 #[inline]
-pub(super) fn rigid_observed_eta(marginal_eta: f64, logslope: f64, z: f64, probit_scale: f64) -> f64 {
+pub(super) fn rigid_observed_eta(
+    marginal_eta: f64,
+    logslope: f64,
+    z: f64,
+    probit_scale: f64,
+) -> f64 {
     marginal_slope_standard_normal_scalar_eta(marginal_eta, logslope, z, probit_scale)
 }
 
 #[inline]
-pub(super) fn marginal_slope_standard_normal_scalar_eta(q: f64, slope: f64, z: f64, probit_scale: f64) -> f64 {
+pub(super) fn marginal_slope_standard_normal_scalar_eta(
+    q: f64,
+    slope: f64,
+    z: f64,
+    probit_scale: f64,
+) -> f64 {
     let observed_slope = rigid_observed_logslope(slope, probit_scale);
     q * (1.0 + observed_slope * observed_slope).sqrt() + observed_slope * z
 }
@@ -1271,7 +1285,14 @@ pub(super) struct RigidProbitKernel {
 
 impl RigidProbitKernel {
     #[inline]
-    pub(super) fn new(q: f64, g: f64, z: f64, y: f64, w: f64, probit_scale: f64) -> Result<Self, String> {
+    pub(super) fn new(
+        q: f64,
+        g: f64,
+        z: f64,
+        y: f64,
+        w: f64,
+        probit_scale: f64,
+    ) -> Result<Self, String> {
         let s = 2.0 * y - 1.0;
         let observed_logslope = rigid_observed_logslope(g, probit_scale);
         let g2 = observed_logslope * observed_logslope;
@@ -1360,7 +1381,14 @@ impl RigidProbitKernel {
     }
 
     #[inline]
-    pub(super) fn fourth_contracted(&self, q: f64, uq: f64, ug: f64, vq: f64, vg: f64) -> [[f64; 2]; 2] {
+    pub(super) fn fourth_contracted(
+        &self,
+        q: f64,
+        uq: f64,
+        ug: f64,
+        vq: f64,
+        vg: f64,
+    ) -> [[f64; 2]; 2] {
         let du = self.eta_q * uq + self.eta_g * ug;
         let dv = self.eta_q * vq + self.eta_g * vg;
         let du_a = [self.c1 * ug, self.c1 * uq + q * self.c2 * ug];
@@ -1615,7 +1643,10 @@ pub(super) fn contract_fourth_full(
     out
 }
 
-pub(super) fn ensure_finite_third_full_cache_row(t: &[[[f64; 2]; 2]; 2], context: &str) -> Result<(), String> {
+pub(super) fn ensure_finite_third_full_cache_row(
+    t: &[[[f64; 2]; 2]; 2],
+    context: &str,
+) -> Result<(), String> {
     if t.iter().flatten().flatten().all(|value| value.is_finite()) {
         Ok(())
     } else {

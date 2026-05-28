@@ -127,8 +127,7 @@ use gam::types::{
     InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily, RhoPrior, StandardLink,
 };
 use gam::{
-    FitConfig, FitRequest, FitResult, WorkflowError, fit_model, materialize,
-    resolve_offset_column,
+    FitConfig, FitRequest, FitResult, WorkflowError, fit_model, materialize, resolve_offset_column,
 };
 use ndarray::{
     Array1, Array2, Array3, Array4, ArrayD, ArrayView1, ArrayView2, ArrayView3, ArrayView4,
@@ -564,18 +563,29 @@ fn sklearn_fit_metadata(
 
 use pyo3::create_exception;
 
-create_exception!(_rust, GamError, PyValueError,
+create_exception!(
+    _rust,
+    GamError,
+    PyValueError,
     "Base class for Python-facing gamfit engine errors.\n\
      \n\
      All gamfit-specific exceptions raised by the Rust extension inherit\n\
      from `GamError`, which itself inherits from `ValueError` to preserve\n\
-     the historical `except ValueError` contract.");
+     the historical `except ValueError` contract."
+);
 
-create_exception!(_rust, FormulaError, GamError,
+create_exception!(
+    _rust,
+    FormulaError,
+    GamError,
     "The Wilkinson-style formula could not be parsed or references columns \
-     missing from the input table.");
+     missing from the input table."
+);
 
-create_exception!(_rust, ColumnNotFoundError, FormulaError,
+create_exception!(
+    _rust,
+    ColumnNotFoundError,
+    FormulaError,
     "A formula referenced a column that does not exist in the input data.\n\
      \n\
      Instances carry structured attributes — `column` (str), `role` \
@@ -587,13 +597,22 @@ create_exception!(_rust, ColumnNotFoundError, FormulaError,
      and `tsv_hint` is True when the file is almost certainly a TSV mis-\
      extensioned as CSV (sole header contains literal tab characters). \
      Subclass of `FormulaError` so `except gamfit.FormulaError` still \
-     catches it.");
+     catches it."
+);
 
-create_exception!(_rust, SchemaMismatchError, GamError,
-    "Prediction input does not match the training schema.");
+create_exception!(
+    _rust,
+    SchemaMismatchError,
+    GamError,
+    "Prediction input does not match the training schema."
+);
 
-create_exception!(_rust, PredictionError, GamError,
-    "Prediction failed for a reason that is not a pure schema mismatch.");
+create_exception!(
+    _rust,
+    PredictionError,
+    GamError,
+    "Prediction failed for a reason that is not a pure schema mismatch."
+);
 
 // EstimationError variant subclasses.
 //
@@ -603,56 +622,124 @@ create_exception!(_rust, PredictionError, GamError,
 // tolerances on `RemlConvergenceError`, suggest more data on
 // `ModelOverparameterizedError`).
 
-create_exception!(_rust, BasisError, GamError,
-    "Underlying basis function generation failed.");
+create_exception!(
+    _rust,
+    BasisError,
+    GamError,
+    "Underlying basis function generation failed."
+);
 
-create_exception!(_rust, LinearSystemSolveError, GamError,
-    "A linear system solve failed; the penalized Hessian may be singular.");
+create_exception!(
+    _rust,
+    LinearSystemSolveError,
+    GamError,
+    "A linear system solve failed; the penalized Hessian may be singular."
+);
 
-create_exception!(_rust, EigendecompositionError, GamError,
-    "Eigendecomposition failed.");
+create_exception!(
+    _rust,
+    EigendecompositionError,
+    GamError,
+    "Eigendecomposition failed."
+);
 
-create_exception!(_rust, PenaltySpectrumError, GamError,
-    "Penalty spectrum check failed (non-finite or indefinite eigenvalue).");
+create_exception!(
+    _rust,
+    PenaltySpectrumError,
+    GamError,
+    "Penalty spectrum check failed (non-finite or indefinite eigenvalue)."
+);
 
-create_exception!(_rust, ParameterConstraintError, GamError,
-    "Parameter constraint violation.");
+create_exception!(
+    _rust,
+    ParameterConstraintError,
+    GamError,
+    "Parameter constraint violation."
+);
 
-create_exception!(_rust, PirlsConvergenceError, GamError,
-    "The P-IRLS inner loop did not converge within its iteration budget.");
+create_exception!(
+    _rust,
+    PirlsConvergenceError,
+    GamError,
+    "The P-IRLS inner loop did not converge within its iteration budget."
+);
 
-create_exception!(_rust, PerfectSeparationError, GamError,
-    "Perfect or quasi-perfect separation detected during model fitting.");
+create_exception!(
+    _rust,
+    PerfectSeparationError,
+    GamError,
+    "Perfect or quasi-perfect separation detected during model fitting."
+);
 
-create_exception!(_rust, HessianNotPositiveDefiniteError, GamError,
-    "Hessian matrix is not positive definite at the converged iterate.");
+create_exception!(
+    _rust,
+    HessianNotPositiveDefiniteError,
+    GamError,
+    "Hessian matrix is not positive definite at the converged iterate."
+);
 
-create_exception!(_rust, RemlConvergenceError, GamError,
-    "REML smoothing optimization failed to converge.");
+create_exception!(
+    _rust,
+    RemlConvergenceError,
+    GamError,
+    "REML smoothing optimization failed to converge."
+);
 
-create_exception!(_rust, GradientUnavailableError, GamError,
-    "The unified evaluator returned no gradient in the requested mode.");
+create_exception!(
+    _rust,
+    GradientUnavailableError,
+    GamError,
+    "The unified evaluator returned no gradient in the requested mode."
+);
 
-create_exception!(_rust, LayoutError, GamError,
-    "An internal error occurred during model layout or coefficient mapping.");
+create_exception!(
+    _rust,
+    LayoutError,
+    GamError,
+    "An internal error occurred during model layout or coefficient mapping."
+);
 
-create_exception!(_rust, ModelOverparameterizedError, GamError,
-    "Model is over-parameterized: more coefficients than samples.");
+create_exception!(
+    _rust,
+    ModelOverparameterizedError,
+    GamError,
+    "Model is over-parameterized: more coefficients than samples."
+);
 
-create_exception!(_rust, IllConditionedError, GamError,
-    "Model is ill-conditioned (large condition number).");
+create_exception!(
+    _rust,
+    IllConditionedError,
+    GamError,
+    "Model is ill-conditioned (large condition number)."
+);
 
-create_exception!(_rust, InvalidInputError, GamError,
-    "Invalid input to the engine (shape/dtype/range violation).");
+create_exception!(
+    _rust,
+    InvalidInputError,
+    GamError,
+    "Invalid input to the engine (shape/dtype/range violation)."
+);
 
-create_exception!(_rust, MonotoneRootError, GamError,
-    "Monotone-root solve failed.");
+create_exception!(
+    _rust,
+    MonotoneRootError,
+    GamError,
+    "Monotone-root solve failed."
+);
 
-create_exception!(_rust, CalibratorError, GamError,
-    "Calibrator training failed.");
+create_exception!(
+    _rust,
+    CalibratorError,
+    GamError,
+    "Calibrator training failed."
+);
 
-create_exception!(_rust, InvalidSpecificationError, GamError,
-    "Invalid specification supplied to the engine.");
+create_exception!(
+    _rust,
+    InvalidSpecificationError,
+    GamError,
+    "Invalid specification supplied to the engine."
+);
 
 // -------------------------------------------------------------------------
 // Remaining engine error enum subclasses (issue #343 follow-up).
@@ -666,160 +753,304 @@ create_exception!(_rust, InvalidSpecificationError, GamError,
 // `PredictionError`; everything else inherits from `GamError`.
 // -------------------------------------------------------------------------
 
-create_exception!(_rust, GeometryError, GamError,
+create_exception!(
+    _rust,
+    GeometryError,
+    GamError,
     "Riemannian-geometry / manifold-primitive operation failed \
-     (dimension mismatch, invalid point, singular tangent space).");
+     (dimension mismatch, invalid point, singular tangent space)."
+);
 
-create_exception!(_rust, MatrixMaterializationError, GamError,
+create_exception!(
+    _rust,
+    MatrixMaterializationError,
+    GamError,
     "Lazy design-matrix materialization failed (size cap exceeded, \
-     forbidden by policy, or row-block evaluation failure).");
+     forbidden by policy, or row-block evaluation failure)."
+);
 
-create_exception!(_rust, GpuError, GamError,
+create_exception!(
+    _rust,
+    GpuError,
+    GamError,
     "GPU offload path failed (driver unavailable, kernel launch error, \
-     calibration failure, or feature not yet implemented on this device).");
+     calibration failure, or feature not yet implemented on this device)."
+);
 
-create_exception!(_rust, LinearAlgebraError, GamError,
+create_exception!(
+    _rust,
+    LinearAlgebraError,
+    GamError,
     "Dense linear-algebra primitive failed (factorization, SVD, or \
-     eigendecomposition reported non-convergence or non-finite input).");
+     eigendecomposition reported non-convergence or non-finite input)."
+);
 
-create_exception!(_rust, MatrixError, GamError,
+create_exception!(
+    _rust,
+    MatrixError,
+    GamError,
     "Matrix-level invariant violated (dimension mismatch, refused \
-     densification, or related shape contract failure).");
+     densification, or related shape contract failure)."
+);
 
-create_exception!(_rust, CacheStoreError, GamError,
-    "Persistent on-disk model cache I/O or serialization failure.");
+create_exception!(
+    _rust,
+    CacheStoreError,
+    GamError,
+    "Persistent on-disk model cache I/O or serialization failure."
+);
 
-create_exception!(_rust, SmoothError, GamError,
+create_exception!(
+    _rust,
+    SmoothError,
+    GamError,
     "Smooth-term construction failed (invalid configuration for the \
-     requested basis or penalty).");
+     requested basis or penalty)."
+);
 
-create_exception!(_rust, ArrowSchurError, GamError,
+create_exception!(
+    _rust,
+    ArrowSchurError,
+    GamError,
     "Arrow-Schur block solver failed (per-row factor failure, ill-\
-     conditioning, PCG non-convergence, or adaptive-correction failure).");
+     conditioning, PCG non-convergence, or adaptive-correction failure)."
+);
 
-create_exception!(_rust, OuterStrategyError, GamError,
+create_exception!(
+    _rust,
+    OuterStrategyError,
+    GamError,
     "Outer smoothing-strategy contract violated (operator-shape \
-     mismatch, non-finite Hessian, or rho-block shape error).");
+     mismatch, non-finite Hessian, or rho-block shape error)."
+);
 
-create_exception!(_rust, TermBuilderError, FormulaError,
+create_exception!(
+    _rust,
+    TermBuilderError,
+    FormulaError,
     "A formula term could not be built from the input data \
      (missing column, incompatible options, degenerate data, etc.). \
      Subclass of `FormulaError` so existing `except FormulaError` \
-     handlers still catch it.");
+     handlers still catch it."
+);
 
-create_exception!(_rust, CorrectedCovarianceError, GamError,
+create_exception!(
+    _rust,
+    CorrectedCovarianceError,
+    GamError,
     "Corrected posterior covariance construction failed \
      (shape mismatch, eigendecomposition failure, or indefinite outer \
-     Hessian).");
+     Hessian)."
+);
 
-create_exception!(_rust, PredictInputError, PredictionError,
+create_exception!(
+    _rust,
+    PredictInputError,
+    PredictionError,
     "Prediction input is invalid or incompatible with the fitted model \
      (shape mismatch, missing metadata, or malformed payload). \
-     Subclass of `PredictionError`.");
+     Subclass of `PredictionError`."
+);
 
-create_exception!(_rust, HmcError, GamError,
+create_exception!(
+    _rust,
+    HmcError,
+    GamError,
     "Hamiltonian Monte Carlo sampler failed (non-finite state, invalid \
-     configuration, unsupported family / link, or sampling divergence).");
+     configuration, unsupported family / link, or sampling divergence)."
+);
 
-create_exception!(_rust, AloError, GamError,
+create_exception!(
+    _rust,
+    AloError,
+    GamError,
     "Approximate leave-one-out computation failed (invalid input, \
-     degenerate design, or influence-matrix factorization failure).");
+     degenerate design, or influence-matrix factorization failure)."
+);
 
-create_exception!(_rust, SurvivalError, GamError,
+create_exception!(
+    _rust,
+    SurvivalError,
+    GamError,
     "Survival kernel invariant violated (dimension mismatch, non-finite \
-     input, invalid time grid, non-monotone cumulative hazard, etc.).");
+     input, invalid time grid, non-monotone cumulative hazard, etc.)."
+);
 
-create_exception!(_rust, CubicCellKernelError, GamError,
+create_exception!(
+    _rust,
+    CubicCellKernelError,
+    GamError,
     "Cubic-cell-moment kernel rejected an input (degenerate interval, \
      invalid cell shape, insufficient moments, or out-of-domain \
-     bivariate-normal evaluation).");
+     bivariate-normal evaluation)."
+);
 
-create_exception!(_rust, SurvivalConstructionError, GamError,
+create_exception!(
+    _rust,
+    SurvivalConstructionError,
+    GamError,
     "Survival model construction failed (invalid config, missing column, \
-     dimension mismatch, data validation, or unsupported distribution).");
+     dimension mismatch, data validation, or unsupported distribution)."
+);
 
-create_exception!(_rust, TransformationNormalError, GamError,
+create_exception!(
+    _rust,
+    TransformationNormalError,
+    GamError,
     "Transformation-normal family rejected the design / response \
-     (degenerate design, non-finite input, or monotonicity violation).");
+     (degenerate design, non-finite input, or monotonicity violation)."
+);
 
-create_exception!(_rust, CustomFamilyError, GamError,
+create_exception!(
+    _rust,
+    CustomFamilyError,
+    GamError,
     "Custom family contract violated (invalid input, optimization \
-     failure, numerical failure, or identifiability violation).");
+     failure, numerical failure, or identifiability violation)."
+);
 
-create_exception!(_rust, GamlssError, GamError,
+create_exception!(
+    _rust,
+    GamlssError,
+    GamError,
     "GAMLSS location-scale family rejected the input (dimension \
      mismatch, non-finite, unsupported configuration, or constraint \
-     violation).");
+     violation)."
+);
 
-create_exception!(_rust, SurvivalMarginalSlopeError, GamError,
+create_exception!(
+    _rust,
+    SurvivalMarginalSlopeError,
+    GamError,
     "Survival marginal-slope family failed (invalid input, \
      monotonicity violation, integration failure, or unsupported \
-     configuration).");
+     configuration)."
+);
 
-create_exception!(_rust, LatentSurvivalError, GamError,
+create_exception!(
+    _rust,
+    LatentSurvivalError,
+    GamError,
     "Latent-survival family rejected the dataset (invalid frailty, \
-     invalid dataset, block mismatch, or numerical failure).");
+     invalid dataset, block mismatch, or numerical failure)."
+);
 
-create_exception!(_rust, SurvivalPredictError, PredictionError,
+create_exception!(
+    _rust,
+    SurvivalPredictError,
+    PredictionError,
     "Survival prediction failed (invalid input, missing fit metadata, \
      incompatible schema, or numerical failure). Subclass of \
-     `PredictionError`.");
+     `PredictionError`."
+);
 
-create_exception!(_rust, DeviationRuntimeError, GamError,
+create_exception!(
+    _rust,
+    DeviationRuntimeError,
+    GamError,
     "Marginal-slope deviation runtime rejected the input (invalid \
-     input, dimension mismatch, or numerical failure).");
+     input, dimension mismatch, or numerical failure)."
+);
 
-create_exception!(_rust, DataError, GamError,
+create_exception!(
+    _rust,
+    DataError,
+    GamError,
     "Input dataset failed schema / encoding validation (parse error, \
-     empty input, invalid value, missing column).");
+     empty input, invalid value, missing column)."
+);
 
-create_exception!(_rust, FittedModelError, GamError,
+create_exception!(
+    _rust,
+    FittedModelError,
+    GamError,
     "Saved fitted-model payload is incompatible (schema mismatch, \
-     corrupt payload, missing field, or incompatible config).");
+     corrupt payload, missing field, or incompatible config)."
+);
 
-create_exception!(_rust, LognormalKernelError, GamError,
-    "Lognormal kernel configuration is invalid.");
+create_exception!(
+    _rust,
+    LognormalKernelError,
+    GamError,
+    "Lognormal kernel configuration is invalid."
+);
 
-create_exception!(_rust, ScaleDesignError, GamError,
+create_exception!(
+    _rust,
+    ScaleDesignError,
+    GamError,
     "Scale-design construction failed (invalid weights, dimension \
-     mismatch, non-finite input, degenerate design, or SVD failure).");
+     mismatch, non-finite input, degenerate design, or SVD failure)."
+);
 
-create_exception!(_rust, IdentifiabilityCompilerError, GamError,
+create_exception!(
+    _rust,
+    IdentifiabilityCompilerError,
+    GamError,
     "Identifiability compiler rejected the block layout (dimension \
-     mismatch, fully aliased block, or linear-algebra failure).");
+     mismatch, fully aliased block, or linear-algebra failure)."
+);
 
-create_exception!(_rust, JointPenaltyError, GamError,
+create_exception!(
+    _rust,
+    JointPenaltyError,
+    GamError,
     "Joint penalty matrix rejected (not square, not symmetric, \
-     non-finite entry, or nullspace too large).");
+     non-finite entry, or nullspace too large)."
+);
 
-create_exception!(_rust, SurvivalLocationScaleError, GamError,
+create_exception!(
+    _rust,
+    SurvivalLocationScaleError,
+    GamError,
     "Survival location-scale family rejected the input (dimension \
      mismatch, invalid configuration, constraint violation, or \
-     numerical failure).");
+     numerical failure)."
+);
 
-create_exception!(_rust, MapUniquenessError, GamError,
+create_exception!(
+    _rust,
+    MapUniquenessError,
+    GamError,
     "MAP-uniqueness identifiability audit detected duplicate or \
-     overlapping posterior modes.");
+     overlapping posterior modes."
+);
 
-create_exception!(_rust, UnsupportedLinkError, InvalidSpecificationError,
+create_exception!(
+    _rust,
+    UnsupportedLinkError,
+    InvalidSpecificationError,
     "An inverse-link / link transform was requested that the engine \
      does not support for the chosen family. Subclass of \
-     `InvalidSpecificationError`.");
+     `InvalidSpecificationError`."
+);
 
-create_exception!(_rust, InvalidConfigurationError, InvalidSpecificationError,
+create_exception!(
+    _rust,
+    InvalidConfigurationError,
+    InvalidSpecificationError,
     "Fit configuration is internally inconsistent or selects an \
      unsupported combination (conflicting family/link, unsupported \
      link placement, frailty for an incompatible family, duplicate or \
-     out-of-range hyperpriors). Subclass of `InvalidSpecificationError`.");
+     out-of-range hyperpriors). Subclass of `InvalidSpecificationError`."
+);
 
-create_exception!(_rust, MissingDependencyError, GamError,
+create_exception!(
+    _rust,
+    MissingDependencyError,
+    GamError,
     "A required input column, frailty parameter, baseline target, or \
-     cause count is missing for the requested fit mode.");
+     cause count is missing for the requested fit mode."
+);
 
-create_exception!(_rust, IntegrationError, GamError,
+create_exception!(
+    _rust,
+    IntegrationError,
+    GamError,
     "An underlying numerical step (PIRLS / smoothing-parameter \
      optimizer / profile-cost evaluation) failed to converge or \
-     produced a non-finite value.");
+     produced a non-finite value."
+);
 
 /// Variant-dispatch: convert a typed engine error into the matching
 /// Python exception subclass. This is the single chokepoint where
@@ -4219,8 +4450,13 @@ fn assemble_candidate_formula(
     .map_err(PyValueError::new_err)
 }
 
-const PREFERRED_PREDICTION_COLUMNS: &[&str] =
-    &["linear_predictor", "mean", "std_error", "mean_lower", "mean_upper"];
+const PREFERRED_PREDICTION_COLUMNS: &[&str] = &[
+    "linear_predictor",
+    "mean",
+    "std_error",
+    "mean_lower",
+    "mean_upper",
+];
 
 struct OrderedPredictionColumnEntries(Vec<(String, serde_json::Value)>);
 
@@ -8303,7 +8539,11 @@ fn fit_penalized_multinomial_pyfunc<'py>(
     let out = PyDict::new(py);
     out.set_item(
         "status",
-        if outputs.converged { "ok" } else { "not_converged" },
+        if outputs.converged {
+            "ok"
+        } else {
+            "not_converged"
+        },
     )?;
     out.set_item("iterations", outputs.iterations)?;
     out.set_item(
@@ -21226,8 +21466,14 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     // Rust side is exactly the same object.
     module.add("GamError", module.py().get_type::<GamError>())?;
     module.add("FormulaError", module.py().get_type::<FormulaError>())?;
-    module.add("ColumnNotFoundError", module.py().get_type::<ColumnNotFoundError>())?;
-    module.add("SchemaMismatchError", module.py().get_type::<SchemaMismatchError>())?;
+    module.add(
+        "ColumnNotFoundError",
+        module.py().get_type::<ColumnNotFoundError>(),
+    )?;
+    module.add(
+        "SchemaMismatchError",
+        module.py().get_type::<SchemaMismatchError>(),
+    )?;
     module.add("PredictionError", module.py().get_type::<PredictionError>())?;
     module.add("BasisError", module.py().get_type::<BasisError>())?;
     module.add(
@@ -21238,7 +21484,10 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
         "EigendecompositionError",
         module.py().get_type::<EigendecompositionError>(),
     )?;
-    module.add("PenaltySpectrumError", module.py().get_type::<PenaltySpectrumError>())?;
+    module.add(
+        "PenaltySpectrumError",
+        module.py().get_type::<PenaltySpectrumError>(),
+    )?;
     module.add(
         "ParameterConstraintError",
         module.py().get_type::<ParameterConstraintError>(),
@@ -21268,9 +21517,18 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
         "ModelOverparameterizedError",
         module.py().get_type::<ModelOverparameterizedError>(),
     )?;
-    module.add("IllConditionedError", module.py().get_type::<IllConditionedError>())?;
-    module.add("InvalidInputError", module.py().get_type::<InvalidInputError>())?;
-    module.add("MonotoneRootError", module.py().get_type::<MonotoneRootError>())?;
+    module.add(
+        "IllConditionedError",
+        module.py().get_type::<IllConditionedError>(),
+    )?;
+    module.add(
+        "InvalidInputError",
+        module.py().get_type::<InvalidInputError>(),
+    )?;
+    module.add(
+        "MonotoneRootError",
+        module.py().get_type::<MonotoneRootError>(),
+    )?;
     module.add("CalibratorError", module.py().get_type::<CalibratorError>())?;
     module.add(
         "InvalidSpecificationError",
@@ -21295,7 +21553,10 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
         "OuterStrategyError",
         module.py().get_type::<OuterStrategyError>(),
     )?;
-    module.add("TermBuilderError", module.py().get_type::<TermBuilderError>())?;
+    module.add(
+        "TermBuilderError",
+        module.py().get_type::<TermBuilderError>(),
+    )?;
     module.add(
         "CorrectedCovarianceError",
         module.py().get_type::<CorrectedCovarianceError>(),

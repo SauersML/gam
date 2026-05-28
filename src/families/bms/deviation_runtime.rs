@@ -804,7 +804,11 @@ impl DeviationRuntime {
 
     // ── design evaluation ──
 
-    pub(super) fn validate_beta_shape(&self, beta: &Array1<f64>, label: &str) -> Result<(), String> {
+    pub(super) fn validate_beta_shape(
+        &self,
+        beta: &Array1<f64>,
+        label: &str,
+    ) -> Result<(), String> {
         if beta.len() != self.basis_dim {
             return Err(DeviationRuntimeError::DimensionMismatch {
                 reason: format!(

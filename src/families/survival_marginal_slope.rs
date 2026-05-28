@@ -1,6 +1,5 @@
 use crate::custom_family::{
-    BlockWorkingSet, BlockwiseFitOptions, CustomFamily,
-    CustomFamilyWarmStart,
+    BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyWarmStart,
     ExactNewtonJointGradientEvaluation, ExactNewtonJointHessianWorkspace,
     ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace,
     FamilyEvaluation, ParameterBlockSpec, ParameterBlockState, PenaltyMatrix,
@@ -12,8 +11,8 @@ use crate::custom_family::{
 use crate::estimate::UnifiedFitResult;
 use crate::faer_ndarray::{FaerCholesky, fast_ab, fast_atv, fast_av, fast_xt_diag_x};
 use crate::families::bernoulli_marginal_slope::{
-    CrossBlockIdentifiabilityWarning, DeviationBlockConfig, DeviationRuntime,
-    LatentZNormalization, LatentZPolicy, MarginalSlopeCovariance, ParametricAnchorBlock,
+    CrossBlockIdentifiabilityWarning, DeviationBlockConfig, DeviationRuntime, LatentZNormalization,
+    LatentZPolicy, MarginalSlopeCovariance, ParametricAnchorBlock,
     marginal_slope_covariance_from_scores, marginal_slope_preserving_scale,
     marginal_slope_probit_eta, padded_deviation_seed,
 };
@@ -17626,7 +17625,10 @@ impl SurvivalMarginalSlopeFamilyScalars {
         z_i: Vec<f64>,
         observed_g_i: Vec<f64>,
     ) -> Self {
-        let c_i: Vec<f64> = g_i.iter().map(|&g| (1.0 + (s * g).powi(2)).sqrt()).collect();
+        let c_i: Vec<f64> = g_i
+            .iter()
+            .map(|&g| (1.0 + (s * g).powi(2)).sqrt())
+            .collect();
         Self {
             q0_i,
             q1_i,
@@ -17715,14 +17717,12 @@ impl crate::custom_family::BlockEffectiveJacobian for LogslopeBlockJacobian {
 
         let any_nonzero_g = g_rows.iter().any(|&gi| gi != 0.0);
         if any_nonzero_g && scalars.is_none() {
-            return Err(
-                "survival marginal-slope logslope block requires \
+            return Err("survival marginal-slope logslope block requires \
                  SurvivalMarginalSlopeFamilyScalars when beta != 0 \
                  (g_i != 0 for at least one row); got family_scalars: None. \
                  The caller must compute per-row (q0, q1, qd1) at the current \
                  beta and pass them via FamilyLinearizationState::family_scalars."
-                    .to_string(),
-            );
+                .to_string());
         }
 
         let mut jac = Array2::<f64>::zeros((3 * n, p));
@@ -17805,13 +17805,11 @@ impl crate::custom_family::BlockEffectiveJacobian for MarginalBlockJacobian {
 
         let beta_nonzero = state.beta.iter().any(|&b| b != 0.0);
         if beta_nonzero && scalars.is_none() {
-            return Err(
-                "survival marginal-slope marginal block requires \
+            return Err("survival marginal-slope marginal block requires \
                  SurvivalMarginalSlopeFamilyScalars when beta != 0 (c_i != 1 in general); \
                  got family_scalars: None. The caller must populate per-row c_i via \
                  FamilyLinearizationState::family_scalars."
-                    .to_string(),
-            );
+                .to_string());
         }
 
         let mut jac = Array2::<f64>::zeros((3 * n, p));
@@ -17905,13 +17903,11 @@ impl crate::custom_family::BlockEffectiveJacobian for TimeBlockJacobian {
 
         let beta_nonzero = state.beta.iter().any(|&b| b != 0.0);
         if beta_nonzero && scalars.is_none() {
-            return Err(
-                "survival marginal-slope time block requires \
+            return Err("survival marginal-slope time block requires \
                  SurvivalMarginalSlopeFamilyScalars when beta != 0 (c_i != 1 in general); \
                  got family_scalars: None. The caller must populate per-row c_i via \
                  FamilyLinearizationState::family_scalars."
-                    .to_string(),
-            );
+                .to_string());
         }
 
         let mut jac = Array2::<f64>::zeros((3 * n, p));
@@ -18094,9 +18090,7 @@ pub fn chain_primary_to_joint_row(
 
     // Marginal block: same with marginal maps
     for (k, dst) in out[slices.marginal.clone()].iter_mut().enumerate() {
-        *dst = cu_q0 * q.dq0_marginal[k]
-            + cu_q1 * q.dq1_marginal[k]
-            + cu_qd1 * q.dqd1_marginal[k];
+        *dst = cu_q0 * q.dq0_marginal[k] + cu_q1 * q.dq1_marginal[k] + cu_qd1 * q.dqd1_marginal[k];
     }
 
     // Logslope block: cu_g * logslope_row[k]
@@ -18689,7 +18683,11 @@ impl crate::custom_family::BlockEffectiveJacobian for SmsTimewiggleTimeJacobian 
         // β_t = joint β[0 .. p_time]
         let beta_t = if beta.len() >= p { &beta[..p] } else { beta };
         let beta_t_base = &beta_t[..p_base.min(beta_t.len())];
-        let beta_tw = if beta_t.len() > p_base { &beta_t[p_base..] } else { &[][..] };
+        let beta_tw = if beta_t.len() > p_base {
+            &beta_t[p_base..]
+        } else {
+            &[][..]
+        };
         // β_m = joint β[p_time .. p_time + p_m]
         let beta_m = {
             let s = p;
@@ -18774,20 +18772,20 @@ impl crate::custom_family::BlockEffectiveJacobian for SmsTimewiggleTimeJacobian 
                 let xe = self.design_entry[[i, j]];
                 let xx = self.design_exit[[i, j]];
                 let xd = self.design_deriv[[i, j]];
-                jac[[i,       j]] = c_i * entry_dq * xe;
-                jac[[n + i,   j]] = c_i * exit_dq * xx;
-                jac[[2*n + i, j]] = c_i * (exit_d2q * d_raw * xx + exit_dq * xd);
+                jac[[i, j]] = c_i * entry_dq * xe;
+                jac[[n + i, j]] = c_i * exit_dq * xx;
+                jac[[2 * n + i, j]] = c_i * (exit_d2q * d_raw * xx + exit_dq * xd);
             }
 
             // Wiggle tail columns.
             for local_idx in 0..self.p_tw {
                 let col = p_base + local_idx;
-                let b0  = entry_basis.as_ref().map_or(0.0, |b| b[[0, local_idx]]);
-                let b1  = exit_basis.as_ref().map_or(0.0, |b| b[[0, local_idx]]);
+                let b0 = entry_basis.as_ref().map_or(0.0, |b| b[[0, local_idx]]);
+                let b1 = exit_basis.as_ref().map_or(0.0, |b| b[[0, local_idx]]);
                 let bd1 = exit_basis_d1.as_ref().map_or(0.0, |b| b[[0, local_idx]]);
-                jac[[i,       col]] = c_i * b0;
-                jac[[n + i,   col]] = c_i * b1;
-                jac[[2*n + i, col]] = c_i * bd1 * d_raw;
+                jac[[i, col]] = c_i * b0;
+                jac[[n + i, col]] = c_i * b1;
+                jac[[2 * n + i, col]] = c_i * bd1 * d_raw;
             }
         }
         Ok(jac)
@@ -18866,9 +18864,17 @@ impl crate::custom_family::BlockEffectiveJacobian for SmsTimewiggleMarginalJacob
         let p_base = p_t.saturating_sub(self.p_tw);
 
         let beta = state.beta;
-        let beta_t = if beta.len() >= p_t { &beta[..p_t] } else { beta };
+        let beta_t = if beta.len() >= p_t {
+            &beta[..p_t]
+        } else {
+            beta
+        };
         let beta_t_base = &beta_t[..p_base.min(beta_t.len())];
-        let beta_tw = if beta_t.len() > p_base { &beta_t[p_base..] } else { &[][..] };
+        let beta_tw = if beta_t.len() > p_base {
+            &beta_t[p_base..]
+        } else {
+            &[][..]
+        };
         let beta_m = {
             let s = p_t;
             let e = (s + p_m).min(beta.len());
@@ -18938,9 +18944,9 @@ impl crate::custom_family::BlockEffectiveJacobian for SmsTimewiggleMarginalJacob
 
             for j in 0..p_m {
                 let m_ij = self.design_marginal[[i, j]];
-                jac[[i,       j]] = c_i * entry_dq * m_ij;
-                jac[[n + i,   j]] = c_i * exit_dq * m_ij;
-                jac[[2*n + i, j]] = c_i * exit_d2q * d_raw * m_ij;
+                jac[[i, j]] = c_i * entry_dq * m_ij;
+                jac[[n + i, j]] = c_i * exit_dq * m_ij;
+                jac[[2 * n + i, j]] = c_i * exit_d2q * d_raw * m_ij;
             }
         }
         Ok(jac)
@@ -18966,7 +18972,7 @@ fn sms_tw_first_order_geom(
     if beta_tw.is_empty() {
         return Ok(None);
     }
-    let basis   = monotone_wiggle_basis_with_derivative_order(h0, knots, degree, 0)?;
+    let basis = monotone_wiggle_basis_with_derivative_order(h0, knots, degree, 0)?;
     let basis_d1 = monotone_wiggle_basis_with_derivative_order(h0, knots, degree, 1)?;
     let basis_d2 = monotone_wiggle_basis_with_derivative_order(h0, knots, degree, 2)?;
     if basis.ncols() != beta_tw.len()
@@ -18982,7 +18988,7 @@ fn sms_tw_first_order_geom(
             beta_tw.len(),
         ));
     }
-    let dq_dq0   = fast_av(&basis_d1, &beta_tw) + 1.0;
+    let dq_dq0 = fast_av(&basis_d1, &beta_tw) + 1.0;
     let d2q_dq02 = fast_av(&basis_d2, &beta_tw);
     Ok(Some(SurvivalTimeWiggleFirstOrderGeometry {
         basis,
@@ -20859,8 +20865,7 @@ pub fn fit_survival_marginal_slope_terms(
     ): SmgsCutoverTuple = {
         use crate::families::survival_marginal_slope_identifiability::{
             CompiledSurvivalDesignsVMExact, SmgsLiftViaT, SurvivalRowHessian,
-            apply_compiled_map_to_designs,
-            extract_term_partition_from_penalty_ranges,
+            apply_compiled_map_to_designs, extract_term_partition_from_penalty_ranges,
         };
         // Recompile context, populated when the closed-form compile
         // succeeds. The post-solve recompile-after-accept hook consumes
@@ -21115,9 +21120,7 @@ pub fn fit_survival_marginal_slope_terms(
                             return Ok(None);
                         }
                         Err(reason) => {
-                            return Err(format!(
-                                "closed-form path unavailable: {reason}"
-                            ));
+                            return Err(format!("closed-form path unavailable: {reason}"));
                         }
                     }
                 }
@@ -21415,7 +21418,8 @@ pub fn fit_survival_marginal_slope_terms(
                         p_m,
                         p_g,
                         probit_scale,
-                    )) as Arc<dyn crate::custom_family::BlockEffectiveJacobian>;
+                    ))
+                        as Arc<dyn crate::custom_family::BlockEffectiveJacobian>;
                     let marginal_jac = Arc::new(SmsTimewiggleMarginalJacobian::new(
                         d_entry,
                         d_exit,
@@ -21431,7 +21435,8 @@ pub fn fit_survival_marginal_slope_terms(
                         p_tw,
                         p_g,
                         probit_scale,
-                    )) as Arc<dyn crate::custom_family::BlockEffectiveJacobian>;
+                    ))
+                        as Arc<dyn crate::custom_family::BlockEffectiveJacobian>;
                     Some((time_jac, marginal_jac))
                 })();
                 if let Some((time_jac, marginal_jac)) = maybe_tw_jac {
@@ -27650,20 +27655,10 @@ mod tests {
             family.row_dynamic_q_geometry_into(row, block_states, &mut q_geom)?;
             let g = block_states[2].eta[row];
 
-            let (a0, d0) = family.solve_row_survival_intercept_with_slot(
-                q_geom.q0,
-                g,
-                beta_h,
-                beta_w,
-                None,
-            )?;
-            let (a1, d1) = family.solve_row_survival_intercept_with_slot(
-                q_geom.q1,
-                g,
-                beta_h,
-                beta_w,
-                None,
-            )?;
+            let (a0, d0) = family
+                .solve_row_survival_intercept_with_slot(q_geom.q0, g, beta_h, beta_w, None)?;
+            let (a1, d1) = family
+                .solve_row_survival_intercept_with_slot(q_geom.q1, g, beta_h, beta_w, None)?;
             let entry_tp = family.compute_survival_timepoint_exact(
                 row, &primary, q_geom.q0, primary.q0, a0, g, d0, beta_h, beta_w, false,
             )?;
@@ -27785,8 +27780,8 @@ mod tests {
             };
         }
 
-        let flex_scalars = build_flex_family_scalars(&family, &block_states)
-            .expect("build_flex_family_scalars");
+        let flex_scalars =
+            build_flex_family_scalars(&family, &block_states).expect("build_flex_family_scalars");
         let p_g = block_states[2].beta.len();
         let logslope_design = family.logslope_design.to_dense().to_owned();
 
@@ -27853,13 +27848,7 @@ mod tests {
             out
         };
 
-        assert_flex_jac_fd(
-            "logslope_flex",
-            &jac,
-            &beta_g,
-            1e-7,
-            nll_fn,
-        );
+        assert_flex_jac_fd("logslope_flex", &jac, &beta_g, 1e-7, nll_fn);
     }
 
     #[test]
@@ -27868,8 +27857,8 @@ mod tests {
         let family = make_flex_no_wiggle_test_family(n);
         let block_states = flex_no_wiggle_test_block_states(&family);
 
-        let flex_scalars = build_flex_family_scalars(&family, &block_states)
-            .expect("build_flex_family_scalars");
+        let flex_scalars =
+            build_flex_family_scalars(&family, &block_states).expect("build_flex_family_scalars");
         let p_m = block_states[1].beta.len();
         let beta_m = block_states[1].beta.to_vec();
 
