@@ -1578,7 +1578,19 @@ extern "C" __global__ void chol_logdet_col_major(
                 input.gradient.len()
             ));
         }
-        let shared = PirlsGpuSharedData::upload_impl(input.x)?;
+        // The legacy single-step API has no GLM data — `solve_step_on_stream`
+        // (which this dispatches to) only reads `shared.x_original_dev`.
+        // The shared upload requires y/prior_w/offset for the loop paths, so
+        // pass zero placeholders sized to the design's row count; they are
+        // never read by the one-shot Newton step path.
+        let n_rows = input.x.nrows();
+        let zero_n = ndarray::Array1::<f64>::zeros(n_rows);
+        let shared = PirlsGpuSharedData::upload_impl(
+            input.x,
+            zero_n.view(),
+            zero_n.view(),
+            zero_n.view(),
+        )?;
         let mut ws = SigmaPirlsGpuWorkspace::allocate_impl(&shared)?;
         solve_step_on_stream(
             &shared,
@@ -1778,7 +1790,9 @@ extern "C" __global__ void chol_logdet_col_major(
         builder.arg(&p_i);
         // SAFETY: x_dev is n*p col-major f64; w_dev is length n; a_dev is p*p;
         // num_pairs threads each write one lower-tri entry A[j + k*p].
-        unsafe { builder.launch(cfg) }.map_err(|e| format!("xtwx_lower launch: {e}"))
+        unsafe { builder.launch(cfg) }
+            .map_err(|e| format!("xtwx_lower launch: {e}"))
+            .map(|_| ())
     }
 
     /// Launch the `xtscore` kernel: one thread per output index `j`,
@@ -1816,7 +1830,9 @@ extern "C" __global__ void chol_logdet_col_major(
         builder.arg(&p_i);
         // SAFETY: x_dev is n*p col-major f64; score_dev is length n; s_dev is length p;
         // p threads each write one output entry s[j].
-        unsafe { builder.launch(cfg) }.map_err(|e| format!("xtscore launch: {e}"))
+        unsafe { builder.launch(cfg) }
+            .map_err(|e| format!("xtscore launch: {e}"))
+            .map(|_| ())
     }
 
     /// Launch the `symmetrize_lower` kernel: one thread per strict lower-tri
@@ -1853,7 +1869,9 @@ extern "C" __global__ void chol_logdet_col_major(
         builder.arg(&p_i);
         // SAFETY: a_dev is p*p col-major f64; each of the num_strict threads
         // writes one upper-triangle entry mirrored from the lower triangle.
-        unsafe { builder.launch(cfg) }.map_err(|e| format!("symmetrize_lower launch: {e}"))
+        unsafe { builder.launch(cfg) }
+            .map_err(|e| format!("symmetrize_lower launch: {e}"))
+            .map(|_| ())
     }
 
     /// Launch the device-side Cholesky-factor logdet kernel and download
@@ -2547,11 +2565,11 @@ extern "C" __global__ void status_or(
             // The quadratic in alpha expands as:
             //   penalty(beta) + alpha * [2 d^T (S beta - linear_shift)]
             //                  + alpha^2 * d^T S d
-            let sd = penalty_hessian.dot(ndarray::aview1(&direction_host));
+            let dir_view = ndarray::aview1(&direction_host);
+            let sd = penalty_hessian.dot(&dir_view);
             let s_beta = penalty_hessian.dot(&beta_host);
-            let dtsd = ndarray::aview1(&direction_host).dot(&sd);
-            let linear_coeff =
-                2.0 * ndarray::aview1(&direction_host).dot(&(&s_beta - linear_shift));
+            let dtsd = dir_view.dot(&sd);
+            let linear_coeff = 2.0 * dir_view.dot(&(&s_beta - &linear_shift));
             let penalty_beta =
                 beta_host.dot(&s_beta) - 2.0 * beta_host.dot(&linear_shift) + constant_shift;
 
