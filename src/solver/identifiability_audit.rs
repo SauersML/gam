@@ -187,6 +187,158 @@ fn compute_leverage_s2(col: &ndarray::ArrayView1<f64>) -> f64 {
     col.iter().map(|v| (v * v / sq_norm).powi(2)).sum()
 }
 
+/// Compute the standardised (unit-variance) third central moment μ_3 of a
+/// row-scaling vector z = `eta_row_scaling`, applying the finite-sample
+/// unbiased correction factor n / ((n-1)(n-2)).
+///
+/// # Derivation of the null-mean bias term
+///
+/// When one of the two blocks in a cross-block cosine comparison carries
+/// `eta_row_scaling = Some(z)`, the effective Jacobian column is `z ⊙ φ`
+/// instead of `φ`.  The population cosine between `φ` (from the other block)
+/// and `z ⊙ φ` (from the scaled block) is, under independence of z and φ,
+///
+///   E[cos(φ, z⊙φ)] = E_p[z] / √(E_p[z²])
+///
+/// where E_p[·] = Σ_i p_i(·) with p_i = φ_i² / Σ_j φ_j² (leverage weights).
+///
+/// For sample-standardised z (zero sample mean, unit sample variance),
+/// E_p[z] = Σ_i p_i z_i and E_p[z²] = Σ_i p_i z_i².  At small leverage
+/// concentrations (S2_k ≈ 1/n, i.e. uniform φ) the leading-order expansion
+/// of the cosine about E_p[z] = 0 gives:
+///
+///   E[cos] ≈ −(μ_3 / 2) · S2_k
+///
+/// where μ_3 = E[(z − z̄)³] / σ_z³ is the standardised third moment
+/// (skewness) of z, and the negative sign comes from the sign of the
+/// second-order term in the Taylor expansion of 1/√(E_p[z²]) around the
+/// point E_p[z] = 0, E_p[z²] = 1.
+///
+/// Derivation sketch:
+///   Let δ_i = z_i − z̄ (centred residuals, σ_z = 1 after standardisation).
+///   cos = Σ_i p_i z_i / √(Σ_i p_i z_i²)
+///       = Σ_i p_i δ_i / √(Σ_i p_i(1 + δ_i² + 2δ_i z̄ − z̄²))
+///   Under independence and after isolating the O(S2_k) term, the mean
+///   of Σ_i p_i δ_i vanishes (zero mean of z) but the covariance of the
+///   numerator with the denominator's expansion produces a shift
+///   proportional to E[δ_i³] = μ_3 and Σ_i p_i² = S2_k.
+///
+/// When BOTH blocks carry the same z, the shift cancels.  When NEITHER
+/// carries a row-scaling, μ_3 = 0 (the raw-cosine case), and the formula
+/// reduces to T11's symmetric form with shift = 0.
+///
+/// # Finite-sample correction
+///
+/// The raw (biased) third central moment estimator m_3 = Σ(z_i−z̄)³/n has
+/// expectation μ_3 · σ³ · n(n−1)/n² + O(1/n²) under iid sampling.
+/// The standard unbiased estimator uses the correction factor
+///   n / ((n−1)(n−2))
+/// (the G1 formula, identical to `scipy.stats.skew(bias=False)`).
+/// For n ≥ 3, this gives a less biased estimator of μ_3.  For n < 3 we
+/// return 0 (conservative — no correction applied, shift defaults to 0).
+///
+/// Returns μ_3 (dimensionless).  Returns 0.0 when σ_z ≤ 0 (constant z).
+pub fn compute_skewness_mu3(z: &[f64]) -> f64 {
+    let n = z.len();
+    if n < 3 {
+        return 0.0;
+    }
+    let mean = z.iter().sum::<f64>() / n as f64;
+    let mut m2 = 0.0_f64;
+    let mut m3 = 0.0_f64;
+    for &zi in z {
+        let d = zi - mean;
+        m2 += d * d;
+        m3 += d * d * d;
+    }
+    m2 /= n as f64;
+    m3 /= n as f64;
+    let sigma = m2.sqrt();
+    if sigma <= 0.0 {
+        return 0.0;
+    }
+    // Raw skewness: m3 / σ³
+    let raw_skew = m3 / (sigma * sigma * sigma);
+    // Finite-sample unbiased correction (G1 / Fisher-adjusted):
+    //   μ_3_unbiased = (n / ((n−1)(n−2))) * n * raw_skew
+    //   simplified to: raw_skew * n² / ((n−1)(n−2))
+    let nf = n as f64;
+    let correction = nf / ((nf - 1.0) * (nf - 2.0));
+    correction * nf * raw_skew
+}
+
+/// Bias shift of the null cosine distribution for a pair of columns where
+/// at most one of the two blocks carries a row-scaling vector z.
+///
+/// # Formula
+///
+/// Under independence of z and φ, and for standardised z, the null mean
+/// of cos(φ_a, φ_b) when φ_b = z⊙φ_a is (to leading order in S2_k):
+///
+///   shift_k = −(μ_3 / 2) · S2_k
+///
+/// where S2_k = max(S2_a, S2_b) is the leverage concentration of the
+/// more-concentrated column (the wider-null column controls the threshold
+/// width; it also controls the shift magnitude via S2_k).
+///
+/// # When the shift is applied
+///
+/// * Both blocks carry the SAME row-scaling vector → the scaled and unscaled
+///   columns are from the same distribution; the shift cancels exactly (shift = 0).
+/// * Block A has `eta_row_scaling = Some(z)`, block B has `None` (or vice versa):
+///   shift = −(μ_3(z) / 2) · S2_k.
+/// * Both have `None`: shift = 0 (T11's symmetric form, μ_3 = 0).
+/// * Both have DIFFERENT row-scaling vectors z_a ≠ z_b: shift is derived from
+///   whichever of z_a or z_b produced the column with larger S2 (the dominant
+///   concentration), as a conservative approximation.
+///
+/// The shift is clamped to ±0.5 to prevent a degenerate skewed z from
+/// placing the null band entirely outside [−1, 1].
+pub fn bias_shift_for_pair(
+    z_a: Option<&[f64]>,
+    z_b: Option<&[f64]>,
+    s2_a: f64,
+    s2_b: f64,
+) -> f64 {
+    // Both blocks have the same row scaling → shift cancels.
+    match (z_a, z_b) {
+        (Some(za), Some(zb)) if za.len() == zb.len() => {
+            // Pointwise equality check: if the vectors are identical, shift = 0.
+            let same = za.iter().zip(zb.iter()).all(|(a, b)| a == b);
+            if same {
+                return 0.0;
+            }
+        }
+        (None, None) => return 0.0,
+        _ => {}
+    }
+    // Identify which block's scaling to use for μ_3.
+    // Use the block whose column has the LARGER S2 (dominates the null width)
+    // because the shift formula is shift = −(μ_3/2)·S2_k and S2_k = max(S2_a, S2_b).
+    let s2_dominant = s2_a.max(s2_b);
+    let mu3 = if s2_a >= s2_b {
+        match z_a {
+            Some(z) => compute_skewness_mu3(z),
+            None => match z_b {
+                Some(z) => compute_skewness_mu3(z),
+                None => 0.0,
+            },
+        }
+    } else {
+        match z_b {
+            Some(z) => compute_skewness_mu3(z),
+            None => match z_a {
+                Some(z) => compute_skewness_mu3(z),
+                None => 0.0,
+            },
+        }
+    };
+    // shift_k = −(μ_3 / 2) · S2_k
+    let shift = -(mu3 / 2.0) * s2_dominant;
+    // Clamp to ±0.5 to keep the band inside [−1, 1].
+    shift.clamp(-0.5, 0.5)
+}
+
 /// Per-pair null cosine concentration scale.
 ///
 /// σ = √(max(0, S2_max − 1/n)) where S2_max = max(S2_a, S2_b).
@@ -253,6 +405,32 @@ fn pair_halt_threshold(s2_a: f64, s2_b: f64, n: usize) -> f64 {
         return 0.999_f64;
     }
     (10.0_f64 * sigma).clamp(0.05, 0.999)
+}
+
+/// Decide whether a cosine (signed) falls outside the bias-corrected null band.
+///
+/// The null distribution for cos(φ_a, φ_b) is approximately
+///   N(shift, σ²)
+/// where σ = pair_null_sigma(s2_a, s2_b, n) and
+/// shift = bias_shift_for_pair(...).
+///
+/// A cosine is flagged when |cosine − shift| ≥ half_width.
+///
+/// Returns `(flag, |cosine − shift|)` so the caller can record which
+/// direction was used.  The `half_width` argument is the K·σ half-band
+/// (either the report or halt multiplied sigma).
+fn cosine_outside_null_band(cosine: f64, shift: f64, half_width: f64) -> (bool, f64) {
+    let deviation = (cosine - shift).abs();
+    (deviation >= half_width, deviation)
+}
+
+/// Compute the signed cosine between two normalised column vectors.
+///
+/// Returns `dot / (norm_a * norm_b)`.  The caller guarantees both norms
+/// are positive.  `dot` is the raw inner product (may be negative).
+fn signed_cosine(dot: f64, norm_a: f64, norm_b: f64) -> f64 {
+    // Clamp to [-1, 1] to guard against floating-point rounding.
+    (dot / (norm_a * norm_b)).clamp(-1.0, 1.0)
 }
 
 /// Run the pre-fit cross-block identifiability audit on a finalised
