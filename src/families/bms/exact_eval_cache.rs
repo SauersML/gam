@@ -1,4 +1,9 @@
 use super::*;
+use super::family::*;
+use super::gradient_paths::*;
+use super::hessian_paths::*;
+use super::row_kernel::*;
+use crate::families::jet_partitions::MultiDirJet;
 
 
 #[inline]
@@ -3136,7 +3141,7 @@ impl BernoulliMarginalSlopeFamily {
             }
         }
 
-        let mut solve_result = super::monotone_root::solve_monotone_root_detailed(
+        let mut solve_result = crate::families::monotone_root::solve_monotone_root_detailed(
             eval,
             a_init,
             "bernoulli intercept",
@@ -3151,7 +3156,7 @@ impl BernoulliMarginalSlopeFamily {
         // search exhausts; the closed-form seed always sits in the correct
         // basin.
         if (predictor_a.is_some() || cached_a.is_some()) && solve_result.is_err() {
-            solve_result = super::monotone_root::solve_monotone_root_detailed(
+            solve_result = crate::families::monotone_root::solve_monotone_root_detailed(
                 eval,
                 a_closed_form,
                 "bernoulli intercept",

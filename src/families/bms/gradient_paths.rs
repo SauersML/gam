@@ -1210,7 +1210,7 @@ pub(crate) fn empirical_intercept_from_marginal(
     // μ★ approaches 1 (where log Σ Φᵢ approaches 0).
     let abs_tol = 1e-13_f64.max(4.0 * f64::EPSILON);
     let solve_from = |s: f64| {
-        super::monotone_root::solve_monotone_root(
+        crate::families::monotone_root::solve_monotone_root(
             eval,
             s,
             "empirical latent intercept",
