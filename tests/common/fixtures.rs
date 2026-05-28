@@ -66,6 +66,11 @@ impl Splitmix64 {
         let theta = std::f64::consts::TAU * u2;
         r * theta.cos()
     }
+
+    /// Uniform sample in `[lo, hi)`.
+    pub fn uniform(&mut self, lo: f64, hi: f64) -> f64 {
+        lo + (hi - lo) * self.next_unit()
+    }
 }
 
 // ── Survival-marginal-slope synthetic dataset ─────────────────────────────

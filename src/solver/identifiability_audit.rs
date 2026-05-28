@@ -759,6 +759,8 @@ pub fn audit_identifiability(specs: &[ParameterBlockSpec]) -> Result<Identifiabi
                     let (report_flag, _) = cosine_outside_null_band(cosine, shift, report_half_width);
                     // Store the unsigned |cosine| in AliasedPair.overlap for
                     // backwards compatibility and human-readable diagnostics.
+                    // Also store `shift` so the halt-threshold check can apply
+                    // the same directional correction.
                     let overlap = cosine.abs();
                     if report_flag {
                         aliased_pairs.push(AliasedPair {
@@ -767,6 +769,7 @@ pub fn audit_identifiability(specs: &[ParameterBlockSpec]) -> Result<Identifiabi
                             direction_a: ja - a_start,
                             direction_b: jb - b_start,
                             overlap,
+                            bias_shift: shift,
                         });
                     }
                 }
