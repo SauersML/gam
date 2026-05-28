@@ -42,6 +42,7 @@ use gam::geometry::poincare::{
     tangent_decode_forward as poincare_tangent_decode_forward_impl,
     to_lorentz as poincare_to_lorentz_impl,
 };
+use gam::geometry::manifold::GeometryError as EngineGeometryError;
 use gam::geometry::simplex::simplex_frechet_mean;
 use gam::hmc::{NutsConfig, NutsResult};
 use gam::inference::data::{
