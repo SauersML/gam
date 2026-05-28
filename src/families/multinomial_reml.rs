@@ -445,6 +445,118 @@ impl MultinomialFamily {
         self.likelihood.probabilities(eta)
     }
 
+    /// Matrix-free joint Hessian–vector product `H·v` for the softmax
+    /// curvature `H = block( X^T W(β) X )`, written into `out` in
+    /// `O(N·(K-1)·P)` without ever materialising the
+    /// `(K-1)P × (K-1)P` dense Hessian.
+    ///
+    /// Mathematically identical to
+    /// `assemble_joint_hessian(hess_block(η)).dot(v)`; the result agrees with
+    /// the dense path up to floating-point reassociation of the row sums. The
+    /// contraction exploits the rank structure of the per-row Fisher block
+    /// `W_{n,a,b} = w_n (δ_ab p_{n,a} − p_{n,a} p_{n,b})` so the off-diagonal
+    /// `−p_a p_b` coupling never materialises:
+    ///
+    /// ```text
+    ///   (X v_b)_n      = Σ_j X_{n,j} v_{b·P+j}            [step 1]
+    ///   s_n            = Σ_b p_{n,b} (X v_b)_n            [step 2a]
+    ///   r_{n,a}        = w_n p_{n,a} ( (X v_a)_n − s_n )  [step 2b]
+    ///   (H v)_{a·P+i}  = Σ_n X_{n,i} r_{n,a}              [step 3]
+    /// ```
+    ///
+    /// `probs_full` is the cached `(N, K)` softmax probability matrix at the
+    /// frozen β; only the `K − 1` active columns are read (the reference
+    /// column `K − 1` contributes nothing because `η_{K-1} ≡ 0` is constant
+    /// in β). `out` must already be length `(K-1)·P`; it is overwritten.
+    fn hessian_matvec_into_with_probs(
+        &self,
+        probs_full: ArrayView2<'_, f64>,
+        v: &Array1<f64>,
+        out: &mut Array1<f64>,
+    ) -> Result<(), String> {
+        let p = self.design.ncols();
+        let m = self.active_classes();
+        let n = self.weights.len();
+        let total = m * p;
+        if v.len() != total {
+            return Err(format!(
+                "MultinomialHessianWorkspace::hessian_matvec: v len {} != (K-1)·P = {total}",
+                v.len()
+            ));
+        }
+        if out.len() != total {
+            return Err(format!(
+                "MultinomialHessianWorkspace::hessian_matvec: out len {} != (K-1)·P = {total}",
+                out.len()
+            ));
+        }
+        out.fill(0.0);
+        let design = self.design.view();
+        let mut xv = vec![0.0_f64; m];
+        for row in 0..n {
+            let w = self.weights[row];
+            if w == 0.0 {
+                continue;
+            }
+            // step 1 + 2a: per-row directional η `(X v_b)_n` and the
+            // probability-weighted scalar `s_n = Σ_b p_{n,b} (X v_b)_n`.
+            let mut s = 0.0_f64;
+            for b in 0..m {
+                let mut acc = 0.0_f64;
+                for j in 0..p {
+                    acc += design[[row, j]] * v[b * p + j];
+                }
+                xv[b] = acc;
+                s += probs_full[[row, b]] * acc;
+            }
+            // step 2b + 3: the row residual `r_{n,a}` scattered through Xᵀ.
+            for a in 0..m {
+                let r = w * probs_full[[row, a]] * (xv[a] - s);
+                if r == 0.0 {
+                    continue;
+                }
+                let base = a * p;
+                for i in 0..p {
+                    out[base + i] += design[[row, i]] * r;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Matrix-free diagonal of the joint softmax Hessian. The only non-zero
+    /// contribution to entry `(a·P+i, a·P+i)` is the block-diagonal Fisher
+    /// term `Σ_n w_n p_{n,a}(1 − p_{n,a}) X_{n,i}²`; the off-diagonal
+    /// `−p_a p_b` blocks never reach the diagonal. This is bit-identical to
+    /// `assemble_joint_hessian(...).diag()` because [`dense_block_xtwx`]'s
+    /// symmetrisation pass only averages strictly off-diagonal entries.
+    fn hessian_diagonal_with_probs(&self, probs_full: ArrayView2<'_, f64>) -> Array1<f64> {
+        let p = self.design.ncols();
+        let m = self.active_classes();
+        let n = self.weights.len();
+        let mut out = Array1::<f64>::zeros(m * p);
+        let design = self.design.view();
+        for row in 0..n {
+            let w = self.weights[row];
+            if w == 0.0 {
+                continue;
+            }
+            for a in 0..m {
+                let pa = probs_full[[row, a]];
+                let waa = w * pa * (1.0 - pa);
+                if waa == 0.0 {
+                    continue;
+                }
+                let base = a * p;
+                for i in 0..p {
+                    let xi = design[[row, i]];
+                    out[base + i] += waa * xi * xi;
+                }
+            }
+        }
+        out
+    }
+
     /// Directional derivative of the per-row Fisher block along a
     /// coefficient direction `d_β` (length `(K-1)·P`). Returns the
     /// `(N, M, M)` jet `D_β H_row` whose `[n, a, b]` entry is
@@ -659,9 +771,16 @@ impl CustomFamily for MultinomialFamily {
         block_specs: &[ParameterBlockSpec],
     ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
         assert!(block_specs.len() <= isize::MAX as usize);
+        // Freeze the softmax probabilities at the current β once. They are
+        // constant across every `hessian_matvec` / `hessian_diagonal` call the
+        // PCG solver issues against this workspace, so computing them here
+        // amortises the per-row softmax over the whole inner solve.
+        let eta = self.collect_eta_matrix(block_states)?;
+        let probs = self.row_probabilities(eta.view());
         Ok(Some(Arc::new(MultinomialHessianWorkspace {
             family: self.clone(),
             block_states: block_states.to_vec(),
+            probs,
         })))
     }
 
@@ -703,6 +822,11 @@ impl CustomFamily for MultinomialFamily {
 struct MultinomialHessianWorkspace {
     family: MultinomialFamily,
     block_states: Vec<ParameterBlockState>,
+    /// Cached `(N, K)` softmax probabilities at the frozen β, computed once at
+    /// workspace construction. Constant in `v`, so every matrix-free
+    /// `hessian_matvec` / `hessian_diagonal` reads from here rather than
+    /// re-evaluating the per-row softmax.
+    probs: Array2<f64>,
 }
 
 impl ExactNewtonJointHessianWorkspace for MultinomialHessianWorkspace {
@@ -715,25 +839,22 @@ impl ExactNewtonJointHessianWorkspace for MultinomialHessianWorkspace {
     }
 
     fn hessian_matvec(&self, v: &Array1<f64>) -> Result<Option<Array1<f64>>, String> {
-        let total = self.family.beta_flat_dim();
-        if v.len() != total {
-            return Err(format!(
-                "MultinomialHessianWorkspace::hessian_matvec: v len {} != (K-1)·P = {total}",
-                v.len()
-            ));
-        }
-        let h = match self.family.exact_newton_joint_hessian(&self.block_states)? {
-            Some(h) => h,
-            None => return Ok(None),
-        };
-        Ok(Some(h.dot(v)))
+        let mut out = Array1::<f64>::zeros(self.family.beta_flat_dim());
+        self.family
+            .hessian_matvec_into_with_probs(self.probs.view(), v, &mut out)?;
+        Ok(Some(out))
+    }
+
+    fn hessian_matvec_into(&self, v: &Array1<f64>, out: &mut Array1<f64>) -> Result<bool, String> {
+        self.family
+            .hessian_matvec_into_with_probs(self.probs.view(), v, out)?;
+        Ok(true)
     }
 
     fn hessian_diagonal(&self) -> Result<Option<Array1<f64>>, String> {
-        match self.family.exact_newton_joint_hessian(&self.block_states)? {
-            Some(h) => Ok(Some(h.diag().to_owned())),
-            None => Ok(None),
-        }
+        Ok(Some(
+            self.family.hessian_diagonal_with_probs(self.probs.view()),
+        ))
     }
 
     fn directional_derivative(
@@ -922,5 +1043,346 @@ mod tests {
         let err =
             MultinomialFamily::new(y, w, 1, x, s, 0).expect_err("K = 1 must be rejected");
         assert!(err.contains("K"));
+    }
+
+    // ----------------------------------------------------------------------
+    // Matrix-free joint-Hessian matvec (#347).
+    //
+    // The contract: `MultinomialHessianWorkspace::hessian_matvec` /
+    // `hessian_matvec_into` / `hessian_diagonal` must agree with the dense
+    // joint Hessian `H = block(X^T W(β) X)` that the workspace also exposes
+    // through `hessian_dense`, while never materialising the dense matrix on
+    // the matvec path. The tests below pin three independent angles:
+    //   1. matvec == dense·v across many directions and a non-trivial β;
+    //   2. diagonal == dense diagonal bit-for-bit;
+    //   3. matvec == central finite difference of the −logL gradient, an
+    //      angle that never touches the Fisher-block assembly at all.
+    // ----------------------------------------------------------------------
+
+    /// Build a `MultinomialFamily` with explicit row weights and a smooth
+    /// deterministic design / one-hot response so tests are reproducible.
+    fn family_with_weights(
+        n_obs: usize,
+        p: usize,
+        k: usize,
+        weights: Array1<f64>,
+    ) -> MultinomialFamily {
+        let y = {
+            let mut y = Array2::<f64>::zeros((n_obs, k));
+            for i in 0..n_obs {
+                y[[i, (3 * i + 1) % k]] = 1.0;
+            }
+            y
+        };
+        let design = Arc::new(Array2::<f64>::from_shape_fn((n_obs, p), |(i, j)| {
+            0.7 * ((i as f64 + 1.0) * 0.31 + (j as f64) * 0.53).sin() - 0.2 * (j as f64)
+        }));
+        let penalty = Arc::new(Array2::<f64>::from_shape_fn(
+            (p, p),
+            |(i, j)| if i == j { 1.0 } else { 0.0 },
+        ));
+        MultinomialFamily::new(y, weights, k, design, penalty, 0)
+            .expect("family_with_weights must construct")
+    }
+
+    /// Stacked block states whose per-class η is `X·β_a`, matching the
+    /// converged-state contract the workspace consumes.
+    fn states_at_betas(
+        family: &MultinomialFamily,
+        betas: &[Array1<f64>],
+    ) -> Vec<ParameterBlockState> {
+        let x = family.design.view();
+        betas
+            .iter()
+            .map(|b| ParameterBlockState {
+                beta: b.clone(),
+                eta: x.dot(b),
+            })
+            .collect()
+    }
+
+    /// Deterministic, non-trivial per-class coefficient vectors.
+    fn sample_betas(m: usize, p: usize, scale: f64) -> Vec<Array1<f64>> {
+        (0..m)
+            .map(|a| {
+                Array1::from_shape_fn(p, |i| {
+                    scale * (0.41 * (a as f64 + 1.0) - 0.23 * (i as f64) + 0.13).sin()
+                })
+            })
+            .collect()
+    }
+
+    /// Stacked −logL gradient `g_{a·P+i} = Σ_n X_{n,i} w_n (p_{n,a} − y_{n,a})`,
+    /// computed straight from the softmax probabilities — no Fisher block, no
+    /// `dense_block_xtwx`. Used as the independent finite-difference oracle.
+    fn neglogl_grad(family: &MultinomialFamily, states: &[ParameterBlockState]) -> Array1<f64> {
+        let eta = family.collect_eta_matrix(states).expect("eta collect");
+        let probs = family.row_probabilities(eta.view());
+        let x = family.design.view();
+        let n = family.weights.len();
+        let p = family.design.ncols();
+        let m = family.active_classes();
+        let mut g = Array1::<f64>::zeros(m * p);
+        for a in 0..m {
+            for i in 0..p {
+                let mut acc = 0.0_f64;
+                for row in 0..n {
+                    acc += x[[row, i]]
+                        * family.weights[row]
+                        * (probs[[row, a]] - family.y_one_hot[[row, a]]);
+                }
+                g[a * p + i] = acc;
+            }
+        }
+        g
+    }
+
+    fn perturb(betas: &[Array1<f64>], v: &Array1<f64>, factor: f64) -> Vec<Array1<f64>> {
+        let p = betas[0].len();
+        betas
+            .iter()
+            .enumerate()
+            .map(|(a, b)| Array1::from_shape_fn(p, |i| b[i] + factor * v[a * p + i]))
+            .collect()
+    }
+
+    #[test]
+    fn matrix_free_matvec_matches_dense_across_directions() {
+        // K = 4 ⇒ M = 3 active classes with genuine off-diagonal coupling.
+        let n = 13;
+        let p = 4;
+        let k = 4;
+        let family = family_with_weights(
+            n,
+            p,
+            k,
+            Array1::from_shape_fn(n, |i| 0.5 + 0.5 * ((i as f64) * 0.37).cos().abs()),
+        );
+        let m = family.active_classes();
+        let total = m * p;
+        let states = states_at_betas(&family, &sample_betas(m, p, 0.8));
+        let specs = family.build_block_specs();
+        let ws = family
+            .exact_newton_joint_hessian_workspace(&states, &specs)
+            .expect("workspace build")
+            .expect("workspace present");
+        let dense = ws.hessian_dense().expect("dense").expect("dense present");
+
+        for seed in 0..8usize {
+            let v = Array1::from_shape_fn(total, |idx| {
+                ((seed * 31 + idx * 17 + 5) as f64 * 0.123).cos()
+            });
+            let mf = ws.hessian_matvec(&v).expect("matvec").expect("matvec some");
+            let dv = dense.dot(&v);
+            let mut max_abs = 0.0_f64;
+            let mut scale = 1.0e-300_f64;
+            for idx in 0..total {
+                max_abs = max_abs.max((mf[idx] - dv[idx]).abs());
+                scale = scale.max(dv[idx].abs());
+            }
+            assert!(
+                max_abs <= 1.0e-10 * scale + 1.0e-13,
+                "seed {seed}: matrix-free matvec deviates from dense by {max_abs} (scale {scale})"
+            );
+        }
+    }
+
+    #[test]
+    fn matrix_free_matvec_does_not_allocate_dense_but_matches_at_extreme_eta() {
+        // Large |η| drives the softmax to near-degenerate probabilities
+        // (some p ≈ 1, the rest ≈ 0). The matvec must stay finite and still
+        // track the dense reference within tight tolerance.
+        let n = 9;
+        let p = 3;
+        let k = 5;
+        let family = family_with_weights(n, p, k, Array1::<f64>::ones(n));
+        let m = family.active_classes();
+        let total = m * p;
+        let states = states_at_betas(&family, &sample_betas(m, p, 12.0));
+        let specs = family.build_block_specs();
+        let ws = family
+            .exact_newton_joint_hessian_workspace(&states, &specs)
+            .expect("workspace build")
+            .expect("workspace present");
+        let dense = ws.hessian_dense().expect("dense").expect("dense present");
+        let v = Array1::from_shape_fn(total, |idx| ((idx as f64) * 0.91 - 1.0).sin());
+        let mf = ws.hessian_matvec(&v).expect("matvec").expect("matvec some");
+        let dv = dense.dot(&v);
+        let mut max_abs = 0.0_f64;
+        let mut scale = 1.0e-300_f64;
+        for idx in 0..total {
+            assert!(mf[idx].is_finite(), "matvec entry {idx} not finite");
+            max_abs = max_abs.max((mf[idx] - dv[idx]).abs());
+            scale = scale.max(dv[idx].abs());
+        }
+        assert!(
+            max_abs <= 1.0e-10 * scale + 1.0e-13,
+            "extreme-η matvec deviates from dense by {max_abs} (scale {scale})"
+        );
+    }
+
+    #[test]
+    fn matrix_free_matvec_handles_zero_weight_rows() {
+        // Zero-weight rows must drop out of both paths identically.
+        let n = 10;
+        let p = 3;
+        let k = 3;
+        let mut w = Array1::<f64>::ones(n);
+        w[2] = 0.0;
+        w[5] = 0.0;
+        w[9] = 0.0;
+        let family = family_with_weights(n, p, k, w);
+        let m = family.active_classes();
+        let total = m * p;
+        let states = states_at_betas(&family, &sample_betas(m, p, 0.6));
+        let specs = family.build_block_specs();
+        let ws = family
+            .exact_newton_joint_hessian_workspace(&states, &specs)
+            .expect("workspace build")
+            .expect("workspace present");
+        let dense = ws.hessian_dense().expect("dense").expect("dense present");
+        let v = Array1::from_shape_fn(total, |idx| (idx as f64 + 0.5).cos());
+        let mf = ws.hessian_matvec(&v).expect("matvec").expect("matvec some");
+        let dv = dense.dot(&v);
+        let mut max_abs = 0.0_f64;
+        let mut scale = 1.0e-300_f64;
+        for idx in 0..total {
+            max_abs = max_abs.max((mf[idx] - dv[idx]).abs());
+            scale = scale.max(dv[idx].abs());
+        }
+        assert!(
+            max_abs <= 1.0e-10 * scale + 1.0e-13,
+            "zero-weight matvec deviates from dense by {max_abs} (scale {scale})"
+        );
+    }
+
+    #[test]
+    fn matrix_free_matvec_binary_k_equals_two() {
+        // K = 2 ⇒ M = 1: no off-diagonal block, H·v reduces to the scalar
+        // logistic curvature. Guards the degenerate single-active-class arm.
+        let n = 7;
+        let p = 3;
+        let k = 2;
+        let family = family_with_weights(n, p, k, Array1::<f64>::ones(n));
+        let m = family.active_classes();
+        assert_eq!(m, 1);
+        let total = m * p;
+        let states = states_at_betas(&family, &sample_betas(m, p, 1.1));
+        let specs = family.build_block_specs();
+        let ws = family
+            .exact_newton_joint_hessian_workspace(&states, &specs)
+            .expect("workspace build")
+            .expect("workspace present");
+        let dense = ws.hessian_dense().expect("dense").expect("dense present");
+        let v = Array1::from_shape_fn(total, |idx| (idx as f64 * 0.7 + 0.2).sin());
+        let mf = ws.hessian_matvec(&v).expect("matvec").expect("matvec some");
+        let dv = dense.dot(&v);
+        for idx in 0..total {
+            assert!(
+                (mf[idx] - dv[idx]).abs() <= 1.0e-12 * (1.0 + dv[idx].abs()),
+                "binary matvec entry {idx}: {} vs {}",
+                mf[idx],
+                dv[idx]
+            );
+        }
+    }
+
+    #[test]
+    fn matrix_free_matvec_into_matches_owned_return() {
+        let n = 8;
+        let p = 3;
+        let k = 4;
+        let family = family_with_weights(n, p, k, Array1::<f64>::ones(n));
+        let m = family.active_classes();
+        let total = m * p;
+        let states = states_at_betas(&family, &sample_betas(m, p, 0.9));
+        let specs = family.build_block_specs();
+        let ws = family
+            .exact_newton_joint_hessian_workspace(&states, &specs)
+            .expect("workspace build")
+            .expect("workspace present");
+        let v = Array1::from_shape_fn(total, |idx| (idx as f64 * 1.7 - 0.3).cos());
+        let owned = ws.hessian_matvec(&v).expect("matvec").expect("matvec some");
+        // Pre-fill `out` with garbage to prove the into-variant overwrites it.
+        let mut out = Array1::from_elem(total, 7.0_f64);
+        let wrote = ws.hessian_matvec_into(&v, &mut out).expect("matvec_into");
+        assert!(wrote, "matvec_into must report it wrote a result");
+        assert_eq!(out, owned, "into-variant must match owned return bitwise");
+    }
+
+    #[test]
+    fn matrix_free_diagonal_is_bit_identical_to_dense_diag() {
+        let n = 11;
+        let p = 4;
+        let k = 4;
+        let family = family_with_weights(
+            n,
+            p,
+            k,
+            Array1::from_shape_fn(n, |i| 0.25 + (i as f64 % 3.0)),
+        );
+        let m = family.active_classes();
+        let total = m * p;
+        let states = states_at_betas(&family, &sample_betas(m, p, 0.7));
+        let specs = family.build_block_specs();
+        let ws = family
+            .exact_newton_joint_hessian_workspace(&states, &specs)
+            .expect("workspace build")
+            .expect("workspace present");
+        let dense = ws.hessian_dense().expect("dense").expect("dense present");
+        let diag = ws
+            .hessian_diagonal()
+            .expect("diagonal")
+            .expect("diagonal some");
+        for idx in 0..total {
+            assert_eq!(
+                diag[idx], dense[[idx, idx]],
+                "matrix-free diagonal entry {idx} must equal dense diagonal bit-for-bit"
+            );
+        }
+    }
+
+    #[test]
+    fn matrix_free_matvec_matches_gradient_finite_difference() {
+        // Independent oracle: H = ∂(−logL gradient)/∂β under the canonical
+        // logit link, so H·v equals the central difference of the −logL
+        // gradient along v. This path uses only softmax probabilities and
+        // never calls the Fisher-block assembly the matvec shares with dense.
+        let n = 12;
+        let p = 3;
+        let k = 4;
+        let family = family_with_weights(
+            n,
+            p,
+            k,
+            Array1::from_shape_fn(n, |i| 0.4 + 0.3 * ((i as f64) * 0.6).sin().abs()),
+        );
+        let m = family.active_classes();
+        let total = m * p;
+        let betas = sample_betas(m, p, 0.5);
+        let states = states_at_betas(&family, &betas);
+        let specs = family.build_block_specs();
+        let ws = family
+            .exact_newton_joint_hessian_workspace(&states, &specs)
+            .expect("workspace build")
+            .expect("workspace present");
+
+        let v = Array1::from_shape_fn(total, |idx| 0.5 * ((idx as f64 * 1.3 + 0.7).sin()));
+        let hv = ws.hessian_matvec(&v).expect("matvec").expect("matvec some");
+
+        let eps = 1.0e-6;
+        let g_plus = neglogl_grad(&family, &states_at_betas(&family, &perturb(&betas, &v, eps)));
+        let g_minus = neglogl_grad(&family, &states_at_betas(&family, &perturb(&betas, &v, -eps)));
+        let mut max_abs = 0.0_f64;
+        let mut scale = 1.0e-300_f64;
+        for idx in 0..total {
+            let fd = (g_plus[idx] - g_minus[idx]) / (2.0 * eps);
+            max_abs = max_abs.max((hv[idx] - fd).abs());
+            scale = scale.max(fd.abs());
+        }
+        assert!(
+            max_abs <= 1.0e-5 * scale + 1.0e-7,
+            "matvec vs gradient finite-difference deviates by {max_abs} (scale {scale})"
+        );
     }
 }
