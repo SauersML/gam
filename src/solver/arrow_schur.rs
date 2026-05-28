@@ -1552,6 +1552,33 @@ impl std::fmt::Debug for ArrowUndampedFactors {
     }
 }
 
+/// Probe each column of `H_tβ^(row)` by applying the operator to `e_a` and
+/// dotting the result with `v`.  Accumulates into `out[a]` for all `a in 0..k`.
+///
+/// `out[a] += (H_tβ^(row) e_a) · v = H_βt^(row)[a, :] · v`
+fn htbeta_probe_transpose(
+    row: usize,
+    op: &RowHtbetaMatvec,
+    v: ArrayView1<'_, f64>,
+    out: &mut Array1<f64>,
+    d: usize,
+    k: usize,
+) {
+    let mut e_a = Array1::<f64>::zeros(k);
+    let mut col_a = Array1::<f64>::zeros(d);
+    for a in 0..k {
+        e_a.fill(0.0);
+        e_a[a] = 1.0;
+        col_a.fill(0.0);
+        op(row, e_a.view(), &mut col_a);
+        let mut acc = 0.0_f64;
+        for c in 0..d {
+            acc += col_a[c] * v[c];
+        }
+        out[a] += acc;
+    }
+}
+
 #[derive(Clone)]
 pub enum ArrowHtbetaCache {
     Dense {
@@ -1628,10 +1655,12 @@ impl ArrowHtbetaCache {
         }
     }
 
-    /// Apply the transpose: `out[a] += H_tβ^(row)[c, a] · v[c]` for all a.
+    /// Apply the transpose: `out[a] += H_βt^(row)[a, c] · v[c]` for all `a`.
     ///
     /// `v` has length `d`; `out` has length `k`. Accumulates (does NOT zero
-    /// `out` first) so callers can sum across rows into a shared accumulator.
+    /// `out` first) so callers can sum contributions across rows into a shared
+    /// accumulator.  Returns `false` when the cache is `Disabled` and no
+    /// `fallback_op` is provided.
     fn apply_row_transpose_accumulate(
         &self,
         row: usize,
@@ -1639,7 +1668,7 @@ impl ArrowHtbetaCache {
         out: &mut Array1<f64>,
         d: usize,
         k: usize,
-        htbeta_matvec: Option<&RowHtbetaMatvec>,
+        fallback_op: Option<&RowHtbetaMatvec>,
     ) -> bool {
         match self {
             Self::Dense { blocks, .. } => {
@@ -1662,32 +1691,20 @@ impl ArrowHtbetaCache {
                 }
                 true
             }
-            Self::Matvec { .. } | Self::Disabled { .. } => {
-                // For the Matvec / Disabled cache variants the dense block is not
-                // retained.  Route through the system-level htbeta_matvec by probing
-                // each standard basis vector: apply H_tβ^(row) e_a → column a, then
-                // dot with v.  When no matvec is available and the cache is Disabled,
-                // return false.
-                let op = match htbeta_matvec {
-                    Some(op) => op,
-                    None => return matches!(self, Self::Disabled { .. }).then_some(false).unwrap_or(false),
-                };
-                // For each beta index a, get column a of H_tβ^(row) via matvec probe.
-                let mut e_a = Array1::<f64>::zeros(k);
-                let mut col_a = Array1::<f64>::zeros(d);
-                for a in 0..k {
-                    e_a.fill(0.0);
-                    e_a[a] = 1.0;
-                    col_a.fill(0.0);
-                    op(row, e_a.view(), &mut col_a);
-                    // dot(col_a, v) → contribution to out[a]
-                    let mut acc = 0.0_f64;
-                    for c in 0..d {
-                        acc += col_a[c] * v[c];
-                    }
-                    out[a] += acc;
-                }
+            Self::Matvec { op, .. } => {
+                // Probe column-by-column: H_tβ^(row) e_a is column a.  dot(col_a, v)
+                // is entry a of H_βt^(row) v.
+                htbeta_probe_transpose(row, op, v, out, d, k);
                 true
+            }
+            Self::Disabled { .. } => {
+                // No cached block.  Use the caller-supplied fallback op if present.
+                if let Some(op) = fallback_op {
+                    htbeta_probe_transpose(row, op, v, out, d, k);
+                    true
+                } else {
+                    false
+                }
             }
         }
     }

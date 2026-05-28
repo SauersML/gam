@@ -28453,6 +28453,8 @@ mod tests {
             primary: cached.primary.clone(),
             row_contexts: cached.row_contexts.clone(),
             row_cell_moments: None,
+            row_cell_moments_d15: crate::resource::RayonSafeOnce::new(),
+            row_cell_moments_d21: crate::resource::RayonSafeOnce::new(),
             row_primary_hessians: RowPrimaryHessianCache::Empty,
             rigid_third_full: crate::resource::RayonSafeOnce::new(),
             rigid_fourth_full: crate::resource::RayonSafeOnce::new(),
