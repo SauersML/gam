@@ -1993,18 +1993,23 @@ impl SaeManifoldTerm {
                 }
             }
 
-            // Beta gradient/Hessian and local-beta cross block.
+            // Beta gradient/Hessian — Kronecker form J_β = φᵀ ⊗ I_p.
             //
             // The per-row beta Jacobian is
             //   J_β[out_col, beta_idx] = a_k · phi_k[basis_col]   if out_col == out_col(beta_idx)
             //                            0                         otherwise
             // so the data-fit Gauss-Newton beta-Hessian factors as a rank-`p`
             // sum of outer products. We pre-compute the per-(atom, basis_col)
-            // scalar `a_k · phi_k` once and reuse it across the `out_col`,
-            // `local_col`, and inner `(atom_j, basis_col2)` loops. This keeps
-            // the asymptotic O((K·M)² · P) work but removes a P-factor of
-            // redundant scalar arithmetic and ndarray indexing in the hot
-            // inner Hessian assembly.
+            // scalar `a_k · phi_k` once and reuse it across the `out_col`
+            // and inner `(atom_j, basis_col2)` loops.
+            //
+            // The dense (q × K·p) htbeta block is NOT written here.  Instead,
+            // `a_phi` and `local_jac` are captured per-row into `SaeKroneckerRows`
+            // and installed as `sys.htbeta_matvec` after the row loop.  All
+            // Arrow-Schur inner paths (schur_matvec, reduced_rhs_beta,
+            // build_dense_schur_*, JacobiPreconditioner) route through
+            // `sys_htbeta_apply_row` / `sys_htbeta_accumulate_transpose` which
+            // already prefer `htbeta_matvec` over the dense slab.
             let mut a_phi: Vec<(usize, f64)> = Vec::with_capacity(k_atoms * 4);
             for atom_idx in 0..k_atoms {
                 let atom = &self.atoms[atom_idx];
@@ -2019,23 +2024,30 @@ impl SaeManifoldTerm {
             for &(beta_base_i, j_beta_i) in a_phi.iter() {
                 if j_beta_i == 0.0 {
                     // Skip rank-1 outer product whose left factor is zero;
-                    // saves a full (q + Σ M) · p pass for masked / inactive
-                    // atoms (e.g. assignment exactly zeroed by JumpReLU).
+                    // saves a full Σ M · p pass for masked / inactive atoms
+                    // (e.g. assignment exactly zeroed by JumpReLU).
                     continue;
                 }
                 for out_col in 0..p {
                     let beta_idx = beta_base_i + out_col;
                     sys.gb[beta_idx] += j_beta_i * error[out_col];
-                    for local_col in 0..q {
-                        block.htbeta[[local_col, beta_idx]] +=
-                            local_jac[[local_col, out_col]] * j_beta_i;
-                    }
+                    // No htbeta write — the Kronecker matvec handles this.
                     for &(beta_base_j, j_beta_j) in a_phi.iter() {
                         let beta_j = beta_base_j + out_col;
                         sys.hbb[[beta_idx, beta_j]] += j_beta_i * j_beta_j;
                     }
                 }
             }
+            // Save per-row Kronecker data for htbeta_matvec construction.
+            kron_a_phi.push(a_phi);
+            // Flatten local_jac row-major into a plain Vec<f64> (q * p entries).
+            let mut jac_flat = vec![0.0_f64; q * p];
+            for c in 0..q {
+                for j in 0..p {
+                    jac_flat[c * p + j] = local_jac[[c, j]];
+                }
+            }
+            kron_jac.push(jac_flat);
             sys.rows[row] = block;
         }
         if let Some(registry) = analytic_penalties {

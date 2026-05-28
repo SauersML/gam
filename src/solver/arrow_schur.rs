@@ -961,6 +961,8 @@ impl ArrowSchurSystem {
     /// `(N point/latent rows × d, K shared decoder parameters)`.
     pub fn new(n: usize, d: usize, k: usize) -> Self {
         let rows = (0..n).map(|_| ArrowRowBlock::new(d, k)).collect();
+        let row_dims: Arc<[usize]> = (0..n).map(|_| d).collect::<Vec<_>>().into();
+        let row_offsets: Arc<[usize]> = (0..=n).map(|i| i * d).collect::<Vec<_>>().into();
         let mut sys = Self {
             rows,
             hbb: Array2::<f64>::zeros((k, k)),
@@ -969,6 +971,8 @@ impl ArrowSchurSystem {
             hbb_diag: None,
             gb: Array1::<f64>::zeros(k),
             d,
+            row_dims,
+            row_offsets,
             k,
             manifold_mode_fingerprint: EUCLIDEAN_MANIFOLD_MODE_FINGERPRINT,
             row_hessian_fingerprint: 0,
@@ -2576,7 +2580,6 @@ fn solve_arrow_newton_step_artifacts(
     }
     let n = sys.rows.len();
     let d = sys.d;
-    let k = sys.k;
     let backend = CpuBatchedBlockSolver;
 
     // 1. BA point elimination: per-row Cholesky factors of
