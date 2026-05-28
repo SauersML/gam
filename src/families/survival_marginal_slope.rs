@@ -20737,6 +20737,81 @@ pub fn fit_survival_marginal_slope_terms(
             None,
             hints.link_dev_beta.clone(),
         )?;
+        // When timewiggle is active, replace the rigid time and marginal
+        // Jacobians with the timewiggle-aware versions.  These compute
+        // the full (∂q_r/∂β_t, ∂q_r/∂β_m) chain-rule corrections from
+        // the embedded designs + β, without needing a family reference.
+        let p_tw = derived_time_wiggle_ncols.unwrap_or(0);
+        if p_tw > 0 {
+            if let Some(timewiggle) = spec.timewiggle_block.as_ref() {
+                let p_m = marginal_design.design.ncols();
+                let p_g = logslope_design.design.ncols();
+                // Densify time designs (already densified earlier in the
+                // V+M-exact path; densify again cheaply here — or reuse
+                // if the earlier path failed and we are on the raw path).
+                let maybe_tw_jac: Option<(
+                    Arc<dyn crate::custom_family::BlockEffectiveJacobian>,
+                    Arc<dyn crate::custom_family::BlockEffectiveJacobian>,
+                )> = (|| {
+                    let d_entry = design_entry
+                        .try_to_dense_arc("build_blocks::tw_jac::entry")
+                        .ok()?;
+                    let d_exit = design_exit
+                        .try_to_dense_arc("build_blocks::tw_jac::exit")
+                        .ok()?;
+                    let d_deriv = design_derivative_exit
+                        .try_to_dense_arc("build_blocks::tw_jac::deriv")
+                        .ok()?;
+                    let d_marg = marginal_design
+                        .design
+                        .try_to_dense_arc("build_blocks::tw_jac::marginal")
+                        .ok()?;
+                    let d_log = logslope_design
+                        .design
+                        .try_to_dense_arc("build_blocks::tw_jac::logslope")
+                        .ok()?;
+                    let knots = timewiggle.knots.clone();
+                    let degree = timewiggle.degree;
+                    let time_jac = Arc::new(SmsTimewiggleTimeJacobian::new(
+                        Arc::clone(&d_entry),
+                        Arc::clone(&d_exit),
+                        Arc::clone(&d_deriv),
+                        Arc::clone(&d_marg),
+                        Arc::clone(&d_log),
+                        Arc::clone(&offset_entry),
+                        Arc::clone(&offset_exit),
+                        Arc::clone(&derivative_offset_exit),
+                        knots.clone(),
+                        degree,
+                        p_tw,
+                        p_m,
+                        p_g,
+                        probit_scale,
+                    )) as Arc<dyn crate::custom_family::BlockEffectiveJacobian>;
+                    let marginal_jac = Arc::new(SmsTimewiggleMarginalJacobian::new(
+                        d_entry,
+                        d_exit,
+                        d_deriv,
+                        d_marg,
+                        d_log,
+                        Arc::clone(&offset_entry),
+                        Arc::clone(&offset_exit),
+                        Arc::clone(&derivative_offset_exit),
+                        knots,
+                        degree,
+                        design_exit.ncols(),
+                        p_tw,
+                        p_g,
+                        probit_scale,
+                    )) as Arc<dyn crate::custom_family::BlockEffectiveJacobian>;
+                    Some((time_jac, marginal_jac))
+                })();
+                if let Some((time_jac, marginal_jac)) = maybe_tw_jac {
+                    blocks[0].jacobian_callback = Some(time_jac);
+                    blocks[1].jacobian_callback = Some(marginal_jac);
+                }
+            }
+        }
         Ok(blocks)
     };
 
