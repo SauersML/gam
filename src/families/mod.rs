@@ -23,6 +23,7 @@ pub mod latent_survival;
 pub mod lognormal_kernel;
 pub mod marginal_slope_shared;
 pub mod monotone_root;
+pub mod multinomial;
 pub mod row_kernel;
 pub mod royston_parmar;
 pub mod scale_design;

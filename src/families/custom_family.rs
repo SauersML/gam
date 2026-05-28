@@ -618,6 +618,24 @@ impl BlockEffectiveJacobian for RowScaledJacobian {
 }
 
 /// Static specification for one parameter block in a custom family.
+///
+/// `design` and `audit_design` are deliberately distinct concerns:
+///
+/// * `design` is the **eta-producing operator**: `design · beta` yields
+///   `block_state.eta`, and the row count `design.nrows()` therefore equals
+///   `len(eta)`.  For multi-channel blocks (e.g. survival time-varying
+///   blocks that stack `[exit; entry; deriv]`) this is `k · n_subjects`,
+///   not `n_subjects`.
+/// * `audit_design`, when `Some`, is the **identifiability audit's view** —
+///   an `n_obs × p` matrix whose rows are independent observations and whose
+///   columns are the predictors the audit checks for cross-block alias.
+///   When `None`, the audit uses `design` itself (the correct default
+///   whenever `design.nrows() == n_obs`, i.e. single-channel blocks).
+///
+/// The two views can disagree in row count when a block packs multiple
+/// channels into `design` for solver convenience.  Carrying them as
+/// separate fields makes that disagreement explicit and impossible for
+/// downstream code to misread.
 #[derive(Clone)]
 pub struct ParameterBlockSpec {
     pub name: String,
@@ -642,6 +660,30 @@ pub struct ParameterBlockSpec {
     /// authoritative source for `effective_jacobian_at`.  For simple
     /// single-output row-scaled blocks use [`RowScaledJacobian`].
     pub jacobian_callback: Option<Arc<dyn BlockEffectiveJacobian>>,
+    /// Optional audit-only design view.  When `Some`, the identifiability
+    /// audit uses this matrix instead of `design`; the solver always uses
+    /// `design` for eta evaluation.  Set this whenever `design.nrows()`
+    /// does not match the subject count (e.g. survival time-varying blocks
+    /// that stack `[exit; entry; deriv]` into `design`).
+    pub audit_design: Option<DesignMatrix>,
+    /// Optional channel-role declaration for the identifiability audit.
+    /// When `Some`, the spec carries enough structure for the audit to route
+    /// channel-aware automatically — no `jacobian_callback` wiring needed.
+    /// `(own_output, n_family_outputs)`: this block drives channel
+    /// `own_output` of an `n_family_outputs`-channel additive likelihood.
+    pub channel_role: Option<ChannelRole>,
+}
+
+/// Declared channel role for a parameter block in a multi-output additive
+/// family (e.g. GAMLSS location-scale, survival location-scale).  Set on
+/// `ParameterBlockSpec::channel_role` to drive channel-aware identifiability
+/// routing automatically.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChannelRole {
+    /// Zero-based output index this block drives.
+    pub own_output: usize,
+    /// Total number of channels in the family's additive likelihood.
+    pub n_family_outputs: usize,
 }
 
 impl std::fmt::Debug for ParameterBlockSpec {
@@ -683,7 +725,24 @@ impl ParameterBlockSpec {
             initial_beta: None,
             gauge_priority: 100,
             jacobian_callback: None,
+            audit_design: None,
+            channel_role: None,
         }
+    }
+
+    /// Returns the identifiability-audit view of this block.
+    ///
+    /// Resolution order:
+    ///   1. `audit_design = Some(d)` → return `d` (explicit override).
+    ///   2. otherwise → return `&self.design` (the eta-producing operator
+    ///      is also the audit view, which is correct whenever
+    ///      `design.nrows() == n_obs`).
+    ///
+    /// Callers in the identifiability audit must use this accessor instead
+    /// of `&self.design` so multi-channel blocks (whose `design.nrows() > n_obs`)
+    /// can supply a dedicated `n_obs × p` audit view.
+    pub fn audit_design(&self) -> &DesignMatrix {
+        self.audit_design.as_ref().unwrap_or(&self.design)
     }
 
     /// Returns the effective design `D_eff` for this block at β = 0 with no

@@ -39,15 +39,21 @@ silicon), and Windows. No Rust toolchain is required.
 ```python
 import gamfit
 
+# Smooth fits need enough rows for the basis to be identified; ~20 rows
+# is the minimum the default `s(x)` basis (cubic B-spline) is well-posed
+# on. Use more rows when the signal is noisier.
 train = [
-    {"y": 1.2, "x": 0.0},
-    {"y": 1.9, "x": 1.0},
-    {"y": 3.1, "x": 2.0},
-    {"y": 4.5, "x": 3.0},
+    {"y": 1.05, "x": 0.0}, {"y": 1.32, "x": 0.5}, {"y": 1.78, "x": 1.0},
+    {"y": 2.41, "x": 1.5}, {"y": 3.10, "x": 2.0}, {"y": 3.95, "x": 2.5},
+    {"y": 4.80, "x": 3.0}, {"y": 5.62, "x": 3.5}, {"y": 6.25, "x": 4.0},
+    {"y": 6.71, "x": 4.5}, {"y": 6.94, "x": 5.0}, {"y": 6.88, "x": 5.5},
+    {"y": 6.55, "x": 6.0}, {"y": 5.99, "x": 6.5}, {"y": 5.20, "x": 7.0},
+    {"y": 4.30, "x": 7.5}, {"y": 3.42, "x": 8.0}, {"y": 2.65, "x": 8.5},
+    {"y": 2.10, "x": 9.0}, {"y": 1.82, "x": 9.5},
 ]
 
 model = gamfit.fit(train, "y ~ s(x)")
-print(model.predict([{"x": 1.5}, {"x": 2.5}], interval=0.95))
+print(model.predict([{"x": 1.5}, {"x": 5.0}], interval=0.95))
 print(model.summary())
 model.save("model.gam")
 ```

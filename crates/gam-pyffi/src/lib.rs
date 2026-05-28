@@ -570,6 +570,20 @@ create_exception!(_rust, FormulaError, GamError,
     "The Wilkinson-style formula could not be parsed or references columns \
      missing from the input table.");
 
+create_exception!(_rust, ColumnNotFoundError, FormulaError,
+    "A formula referenced a column that does not exist in the input data.\n\
+     \n\
+     Instances carry structured attributes — `column` (str), `role` \
+     (Optional[str]), `available` (list[str]), `similar` (list[str]), \
+     and `tsv_hint` (bool) — set by the FFI boundary at raise time, so \
+     callers can inspect the failure without parsing the message text. \
+     `column` is the missing name as written, `available` is every header \
+     present in the input, `similar` is a cheap shortlist of close matches, \
+     and `tsv_hint` is True when the file is almost certainly a TSV mis-\
+     extensioned as CSV (sole header contains literal tab characters). \
+     Subclass of `FormulaError` so `except gamfit.FormulaError` still \
+     catches it.");
+
 create_exception!(_rust, SchemaMismatchError, GamError,
     "Prediction input does not match the training schema.");
 
@@ -1592,7 +1606,11 @@ fn marginal_slope_clip_probabilities(values: Vec<f64>) -> PyResult<Vec<f64>> {
 fn transformation_normal_z_from_columns(columns_json: &str) -> PyResult<Vec<f64>> {
     let columns: BTreeMap<String, Vec<f64>> = serde_json::from_str(columns_json)
         .map_err(|err| py_value_error(format!("invalid prediction columns json: {err}")))?;
-    for key in ["z", "z_score", "transformed", "eta", "mean"] {
+    // Fallback chain of column names that a transformation-normal payload
+    // may use for the per-row z-score. The first matching key wins. The
+    // legacy "eta" name was renamed to "linear_predictor" (issue #310);
+    // tracker on the renamed name only.
+    for key in ["z", "z_score", "transformed", "linear_predictor", "mean"] {
         if let Some(values) = columns.get(key) {
             return Ok(values.clone());
         }
@@ -3801,10 +3819,17 @@ fn gaussian_reml_score<'py>(
     let penalty_values = penalty.as_array().to_owned();
     let weight_values = weights.as_ref().map(|w| w.as_array().to_owned());
     let by_values = by.as_ref().map(|b| b.as_array().to_owned());
-    let score = detach_py_result(py, "gaussian_reml_score", move || {
+    // Use the typed detacher so any `EstimationError` raised by
+    // `gaussian_reml_free_b_score` reaches Python as its specific
+    // subclass (RemlConvergenceError, IllConditionedError, …) instead
+    // of being flattened to a generic ValueError. The `apply_by_gate`
+    // input-validation errors are wrapped into `EstimationError::InvalidInput`
+    // so the closure's error type stays uniform.
+    let score = detach_estimation_result(py, "gaussian_reml_score", move || {
         let gated_x;
         let fit_x = if let Some(by_arr) = by_values.as_ref() {
-            gated_x = apply_by_gate(x_values.view(), by_arr.view(), by_start_col)?;
+            gated_x = apply_by_gate(x_values.view(), by_arr.view(), by_start_col)
+                .map_err(EstimationError::InvalidInput)?;
             gated_x.view()
         } else {
             x_values.view()
@@ -3817,7 +3842,6 @@ fn gaussian_reml_score<'py>(
             penalty_values.view(),
             weight_values.as_ref().map(|w| w.view()),
         )
-        .map_err(|err| err.to_string())
     })?;
     let out = PyDict::new(py);
     out.set_item("reml_score", score.reml_score)?;
@@ -20949,6 +20973,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     // Rust side is exactly the same object.
     module.add("GamError", module.py().get_type::<GamError>())?;
     module.add("FormulaError", module.py().get_type::<FormulaError>())?;
+    module.add("ColumnNotFoundError", module.py().get_type::<ColumnNotFoundError>())?;
     module.add("SchemaMismatchError", module.py().get_type::<SchemaMismatchError>())?;
     module.add("PredictionError", module.py().get_type::<PredictionError>())?;
     module.add("BasisError", module.py().get_type::<BasisError>())?;
@@ -29622,7 +29647,10 @@ fn serialize_survival_prediction_payload(
     // probability is `1 - survival_prob`; an ambiguous `mean` column makes
     // fixed-time Brier/calibration scoring easy to invert.
     let mut columns = BTreeMap::<String, Vec<f64>>::new();
-    columns.insert("eta".to_string(), result.linear_predictor.to_vec());
+    columns.insert(
+        "linear_predictor".to_string(),
+        result.linear_predictor.to_vec(),
+    );
     let survival_col: Vec<f64> = (0..n)
         .map(|i| result.survival[[i, t.saturating_sub(1)]])
         .collect();

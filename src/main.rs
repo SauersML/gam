@@ -1230,13 +1230,24 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         None
     };
 
+    let y_kind = response_column_kind_for_dataset(&ds, y_col);
     let family = resolve_family(
         args.family,
         args.negative_binomial_theta,
         link_choice.clone(),
         sas_linkspec.as_ref(),
         y.view(),
+        y_kind,
+        &parsed.response,
     )?;
+
+    // Per-family response-support validation (Gamma `y > 0`, Poisson /
+    // NegBin / Tweedie `y ≥ 0`, Beta `y ∈ (0,1)`). Owned by `ResponseFamily`
+    // so the CLI, the formula API, and the external-design GLM path all
+    // produce identical messages.
+    if let Err(violation) = family.response.validate_response_support(y.view()) {
+        return Err(violation.message_for(&parsed.response));
+    }
     if link_choice.is_none() {
         if is_binary_response(y.view()) {
             inference_notes.push(format!(
@@ -8695,10 +8706,20 @@ fn resolve_family(
         FamilyArg::RoystonParmar => LikelihoodSpec::royston_parmar(),
         FamilyArg::TransformationNormal => LikelihoodSpec::gaussian_identity(),
         FamilyArg::Auto => {
-            if is_binary_response(y) {
-                LikelihoodSpec::binomial_logit()
-            } else {
-                LikelihoodSpec::gaussian_identity()
+            // Delegate to `ResponseFamily::infer_from_response` so the
+            // refusal policy for non-numeric response columns matches the
+            // formula API exactly.
+            let response = ResponseFamily::infer_from_response(y, y_kind)
+                .map_err(|refusal| refusal.message_for(response_name))?;
+            match response {
+                ResponseFamily::Binomial => LikelihoodSpec::binomial_logit(),
+                ResponseFamily::Gaussian => LikelihoodSpec::gaussian_identity(),
+                // `infer_from_response` only ever returns Binomial or
+                // Gaussian today; treat any future addition conservatively
+                // by routing through gaussian_identity rather than panicking,
+                // which preserves the CLI's user-facing behaviour while the
+                // formula API picks up the richer inference.
+                _ => LikelihoodSpec::gaussian_identity(),
             }
         }
     })
@@ -9000,6 +9021,26 @@ fn is_binary_response(y: ArrayView1<'_, f64>) -> bool {
     }
     y.iter()
         .all(|v| (*v - 0.0).abs() < 1e-12 || (*v - 1.0).abs() < 1e-12)
+}
+
+/// Project the CLI's `EncodedDataset` column-kind tag onto the
+/// [`ResponseColumnKind`] consumed by the family layer. Mirrors the helper
+/// of the same name in `workflow.rs` — having two tiny copies (one per
+/// crate-internal entry point) is cleaner than threading the ingest enum
+/// itself into the types layer.
+fn response_column_kind_for_dataset(ds: &Dataset, y_col: usize) -> ResponseColumnKind {
+    match ds.column_kinds.get(y_col) {
+        Some(ColumnKindTag::Categorical) => ResponseColumnKind::Categorical {
+            levels: ds
+                .schema
+                .columns
+                .get(y_col)
+                .map(|sc| sc.levels.clone())
+                .unwrap_or_default(),
+        },
+        Some(ColumnKindTag::Binary) => ResponseColumnKind::Binary,
+        Some(ColumnKindTag::Continuous) | None => ResponseColumnKind::Numeric,
+    }
 }
 
 fn build_model_summary(
@@ -9724,7 +9765,7 @@ fn write_prediction_csv(
     let eta_v: Vec<f64> = eta.to_vec();
     let mean_v: Vec<f64> = mean.to_vec();
 
-    let mut cols: Vec<(&str, &[f64])> = vec![("eta", &eta_v), ("mean", &mean_v)];
+    let mut cols: Vec<(&str, &[f64])> = vec![("linear_predictor", &eta_v), ("mean", &mean_v)];
 
     let se_v: Vec<f64>;
     let lo_v: Vec<f64>;
@@ -9733,15 +9774,15 @@ fn write_prediction_csv(
         se_v = se.to_vec();
         lo_v = mean_lower
             .ok_or_else(|| {
-                "internal error: mean_lower missing while effective_se is present".to_string()
+                "internal error: mean_lower missing while std_error is present".to_string()
             })?
             .to_vec();
         hi_v = mean_upper
             .ok_or_else(|| {
-                "internal error: mean_upper missing while effective_se is present".to_string()
+                "internal error: mean_upper missing while std_error is present".to_string()
             })?
             .to_vec();
-        cols.push(("effective_se", &se_v));
+        cols.push(("std_error", &se_v));
         cols.push(("mean_lower", &lo_v));
         cols.push(("mean_upper", &hi_v));
     } else if let (Some(lo), Some(hi)) = (mean_lower, mean_upper) {
@@ -9777,7 +9818,7 @@ fn write_gaussian_location_scale_prediction_csv(
     let sigma_v: Vec<f64> = sigma.to_vec();
 
     let mut cols: Vec<(&str, &[f64])> =
-        vec![("eta", &eta_v), ("mean", &mean_v), ("sigma", &sigma_v)];
+        vec![("linear_predictor", &eta_v), ("mean", &mean_v), ("sigma", &sigma_v)];
 
     let lo_v: Vec<f64>;
     let hi_v: Vec<f64>;
@@ -9817,7 +9858,7 @@ fn write_survival_prediction_csv(
     let fail_v: Vec<f64> = surv_v.iter().map(|&s| (1.0 - s).clamp(0.0, 1.0)).collect();
 
     let mut cols: Vec<(&str, &[f64])> = vec![
-        ("eta", &eta_v),
+        ("linear_predictor", &eta_v),
         ("survival_prob", &surv_v),
         ("failure_prob", &fail_v),
         ("risk_score", &risk_v),
@@ -9830,15 +9871,15 @@ fn write_survival_prediction_csv(
         se_v = se.to_vec();
         lo_v = survival_lower
             .ok_or_else(|| {
-                "internal error: survival_lower missing while effective_se is present".to_string()
+                "internal error: survival_lower missing while std_error is present".to_string()
             })?
             .to_vec();
         hi_v = survival_upper
             .ok_or_else(|| {
-                "internal error: survival_upper missing while effective_se is present".to_string()
+                "internal error: survival_upper missing while std_error is present".to_string()
             })?
             .to_vec();
-        cols.push(("effective_se", &se_v));
+        cols.push(("std_error", &se_v));
         cols.push(("mean_lower", &lo_v));
         cols.push(("mean_upper", &hi_v));
     } else if let (Some(lo), Some(hi)) = (survival_lower, survival_upper) {
@@ -9878,7 +9919,7 @@ fn write_survival_binary_prediction_csv(
     let survival_v: Vec<f64> = event_v.iter().map(|&p| (1.0 - p).clamp(0.0, 1.0)).collect();
 
     let mut cols: Vec<(&str, &[f64])> = vec![
-        ("eta", &eta_v),
+        ("linear_predictor", &eta_v),
         ("mean", &event_v),
         ("event_prob", &event_v),
         ("failure_prob", &event_v),
@@ -9893,17 +9934,17 @@ fn write_survival_binary_prediction_csv(
         se_v = se.to_vec();
         lo_v = event_lower
             .ok_or_else(|| CliError::Internal {
-                reason: "internal error: event_lower missing while effective_se is present"
+                reason: "internal error: event_lower missing while std_error is present"
                     .to_string(),
             })?
             .to_vec();
         hi_v = event_upper
             .ok_or_else(|| CliError::Internal {
-                reason: "internal error: event_upper missing while effective_se is present"
+                reason: "internal error: event_upper missing while std_error is present"
                     .to_string(),
             })?
             .to_vec();
-        cols.push(("effective_se", &se_v));
+        cols.push(("std_error", &se_v));
         cols.push(("mean_lower", &lo_v));
         cols.push(("mean_upper", &hi_v));
     } else if let (Some(lo), Some(hi)) = (event_lower, event_upper) {
@@ -10604,8 +10645,16 @@ mod tests {
         assert!(file!().ends_with(".rs"));
         let y = array![0.0, 1.0, 1.0, 0.0];
 
-        let family =
-            resolve_family(FamilyArg::Auto, None, None, None, y.view()).expect("resolve family");
+        let family = resolve_family(
+            FamilyArg::Auto,
+            None,
+            None,
+            None,
+            y.view(),
+            ResponseColumnKind::Numeric,
+            "y",
+        )
+        .expect("resolve family");
 
         assert_eq!(family, LikelihoodSpec::binomial_logit());
     }
@@ -10787,7 +10836,7 @@ mod tests {
 
         let pred_text = fs::read_to_string(&pred_path).expect("read survival prediction csv");
         let header = pred_text.lines().next().unwrap_or("");
-        for required in ["mean", "effective_se", "mean_lower", "mean_upper"] {
+        for required in ["mean", "std_error", "mean_lower", "mean_upper"] {
             assert!(
                 header.contains(required),
                 "posterior-mean survival prediction output missing {required} column: {header}"
@@ -10968,7 +11017,7 @@ mod tests {
 
         let pred_text = fs::read_to_string(&pred_path).expect("read prediction csv");
         let header = pred_text.lines().next().unwrap_or("");
-        for required in ["mean", "effective_se", "mean_lower", "mean_upper"] {
+        for required in ["mean", "std_error", "mean_lower", "mean_upper"] {
             assert!(
                 header.contains(required),
                 "posterior-mean marginal-slope prediction output missing {required} column: {header}"
@@ -11352,7 +11401,7 @@ mod tests {
 
         let pred_text = fs::read_to_string(&pred_path).expect("read prediction csv");
         let header = pred_text.lines().next().unwrap_or("");
-        for required in ["mean", "effective_se", "mean_lower", "mean_upper"] {
+        for required in ["mean", "std_error", "mean_lower", "mean_upper"] {
             assert!(
                 header.contains(required),
                 "posterior-mean prediction output missing {required} column: {header}"
@@ -11446,7 +11495,7 @@ mod tests {
 
         let pred_text = fs::read_to_string(&pred_path).expect("read prediction csv");
         let header = pred_text.lines().next().unwrap_or("");
-        for required in ["mean", "effective_se", "mean_lower", "mean_upper"] {
+        for required in ["mean", "std_error", "mean_lower", "mean_upper"] {
             assert!(
                 header.contains(required),
                 "posterior-mean prediction output missing {required} column: {header}"
@@ -13231,7 +13280,7 @@ mod tests {
     }
 
     #[test]
-    fn survival_prediction_csv_emits_bounds_without_effective_se() {
+    fn survival_prediction_csv_emits_bounds_without_std_error() {
         // Contract invariant: when a caller supplies interval bounds without
         // `eta_se` (e.g. latent-window survival predictions: see
         // SavedLatentWindowKind::Survival::write_predictions), the writer must
@@ -13262,7 +13311,7 @@ mod tests {
         let header = text.lines().next().unwrap_or("");
         assert_eq!(
             header, "eta,survival_prob,failure_prob,risk_score,mean_lower,mean_upper",
-            "survival output must include bounds when supplied without effective_se",
+            "survival output must include bounds when supplied without std_error",
         );
 
         fs::remove_file(&path).ok();
@@ -13320,9 +13369,9 @@ mod tests {
     }
 
     #[test]
-    fn survival_binary_prediction_csv_emits_bounds_without_effective_se() {
+    fn survival_binary_prediction_csv_emits_bounds_without_std_error() {
         // Parallel contract invariant to
-        // survival_prediction_csv_emits_bounds_without_effective_se: the binary
+        // survival_prediction_csv_emits_bounds_without_std_error: the binary
         // writer (used by SavedLatentWindowKind::EventProbability) must emit
         // mean_lower / mean_upper when the caller supplies bounds without
         // `eta_se`.
@@ -13352,7 +13401,7 @@ mod tests {
         assert_eq!(
             header,
             "eta,mean,event_prob,failure_prob,survival_prob,risk_score,mean_lower,mean_upper",
-            "survival binary output must include bounds when supplied without effective_se",
+            "survival binary output must include bounds when supplied without std_error",
         );
 
         fs::remove_file(&path).ok();
@@ -14453,7 +14502,9 @@ mod tests {
             .expect("parse prediction csv");
         assert_eq!(rows.len(), 2);
         for i in 0..rows.len() {
-            let eta = rows[i]["eta"].parse::<f64>().expect("eta should parse");
+            let eta = rows[i]["linear_predictor"]
+                .parse::<f64>()
+                .expect("linear_predictor should parse");
             let survival_prob = rows[i]["survival_prob"]
                 .parse::<f64>()
                 .expect("survival_prob should parse");

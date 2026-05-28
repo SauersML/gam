@@ -510,10 +510,22 @@ def survival_prediction_from_columns(
     id_column: str | None = None,
     row_ids: Sequence[str] | None = None,
 ) -> SurvivalPrediction:
+    # Strip the uncertainty / interval columns; what remains describes the
+    # per-row survival parameter vector. ``std_error`` is the (renamed)
+    # response-scale SE column (#310, formerly ``effective_se``); legacy
+    # ``effective_se`` is filtered too so payloads produced by older
+    # extensions during the migration window do not leak into the parameter
+    # matrix.
     parameter_names = [
         name
         for name in columns
-        if name not in {"mean_lower", "mean_upper", "effective_se"}
+        if name
+        not in {
+            "mean_lower",
+            "mean_upper",
+            "std_error",
+            "effective_se",
+        }
     ]
     if not parameter_names:
         raise KeyError(
