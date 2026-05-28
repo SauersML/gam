@@ -63,7 +63,9 @@ use crate::inference::model::ColumnKindTag;
 use crate::pirls::dense_block_xtwx;
 use crate::resource::ProblemHints;
 use crate::solver::estimate::EstimationError;
-use crate::solver::workflow::{FitConfig, build_termspec_with_geometry, resolved_resource_policy};
+use crate::solver::workflow::{
+    FitConfig, build_termspec_with_geometry_and_overrides, resolved_resource_policy,
+};
 use crate::terms::smooth::{
     TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
     weighted_blockwise_penalty_sum,
@@ -663,13 +665,14 @@ fn build_formula_design_for_multinomial(
     let y_kind = crate::solver::workflow::response_column_kind(data, y_col);
     let policy = resolved_resource_policy(config, data, ProblemHints::default());
     let mut inference_notes: Vec<String> = Vec::new();
-    let spec = build_termspec_with_geometry(
+    let spec = build_termspec_with_geometry_and_overrides(
         &parsed.terms,
         data,
         &col_map,
         &mut inference_notes,
         config.scale_dimensions,
         &policy,
+        config.smooth_overrides.as_ref(),
     )
     .map_err(|err| {
         EstimationError::InvalidInput(format!("multinomial fit: build termspec: {err}"))

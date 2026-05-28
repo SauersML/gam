@@ -5305,13 +5305,14 @@ fn materialize_standard<'a>(
 
     let policy =
         resolved_resource_policy(config, term_data, crate::resource::ProblemHints::default());
-    let spec = build_termspec_with_geometry(
+    let spec = build_termspec_with_geometry_and_overrides(
         &term_parsed.terms,
         term_data,
         &term_col_map,
         &mut inference_notes,
         config.scale_dimensions,
         &policy,
+        config.smooth_overrides.as_ref(),
     )?;
 
     // Sample size vs basis-rank gate (#309). Each smooth basis answers
@@ -5539,21 +5540,23 @@ fn materialize_bernoulli_marginal_slope<'a>(
         },
     );
     let aliased_col_map = column_map_with_alias(col_map, "z", z_column);
-    let marginalspec = build_termspec_with_geometry(
+    let marginalspec = build_termspec_with_geometry_and_overrides(
         &parsed.terms,
         data,
         &aliased_col_map,
         &mut inference_notes,
         config.scale_dimensions,
         &policy,
+        config.smooth_overrides.as_ref(),
     )?;
-    let logslopespec = build_termspec_with_geometry(
+    let logslopespec = build_termspec_with_geometry_and_overrides(
         &parsed_logslope.terms,
         data,
         &aliased_col_map,
         &mut inference_notes,
         config.scale_dimensions,
         &policy,
+        config.smooth_overrides.as_ref(),
     )?;
     let z_idx = resolve_role_col(col_map, z_column, "z")?;
     let z = data.values.column(z_idx).to_owned();
@@ -5782,13 +5785,14 @@ fn materialize_survival<'a>(
         None
     };
     let termspec_col_map = marginal_slope_aliased_col_map.as_ref().unwrap_or(col_map);
-    let termspec = build_termspec_with_geometry(
+    let termspec = build_termspec_with_geometry_and_overrides(
         &parsed.terms,
         data,
         termspec_col_map,
         &mut inference_notes,
         config.scale_dimensions,
         &policy,
+        config.smooth_overrides.as_ref(),
     )?;
 
     let residual_dist = parse_survival_distribution(&config.survival_distribution)?;
@@ -5834,13 +5838,14 @@ fn materialize_survival<'a>(
         // Use the same aliased col_map as the main termspec — survival
         // marginal-slope reserves `z` as a placeholder for `--z-column`,
         // and the logslope/noise formula may reference it too.
-        build_termspec_with_geometry(
+        build_termspec_with_geometry_and_overrides(
             &noise_parsed.terms,
             data,
             termspec_col_map,
             &mut inference_notes,
             config.scale_dimensions,
             &policy,
+            config.smooth_overrides.as_ref(),
         )?
     } else if survival_mode == SurvivalLikelihoodMode::LocationScale {
         termspec.clone()
@@ -5904,13 +5909,14 @@ fn materialize_survival<'a>(
                 let z_idx = resolve_role_col(col_map, &surface.z_column, "z")?;
                 z.column_mut(surface_idx).assign(&data.values.column(z_idx));
                 let aliased_col_map = column_map_with_alias(col_map, "z", &surface.z_column);
-                specs.push(build_termspec_with_geometry(
+                specs.push(build_termspec_with_geometry_and_overrides(
                     &surface.terms,
                     data,
                     &aliased_col_map,
                     &mut inference_notes,
                     config.scale_dimensions,
                     &policy,
+                    config.smooth_overrides.as_ref(),
                 )?);
             }
             (
