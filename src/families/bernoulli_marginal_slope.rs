@@ -2018,7 +2018,7 @@ pub(crate) fn install_compiled_flex_block_into_runtime(
                     initial_log_lambdas: Array1::<f64>::zeros(0),
                     initial_beta: None,
                     gauge_priority: 200,
-                    eta_row_scaling: None,
+                    row_scaling: None,
                 });
             }
             specs.push(crate::custom_family::ParameterBlockSpec {
@@ -2032,7 +2032,7 @@ pub(crate) fn install_compiled_flex_block_into_runtime(
                 initial_log_lambdas: Array1::<f64>::zeros(0),
                 initial_beta: None,
                 gauge_priority: 100,
-                eta_row_scaling: None,
+                row_scaling: None,
             });
             specs
         },
@@ -19640,7 +19640,7 @@ fn build_blockspec(
         initial_log_lambdas: rho,
         initial_beta: beta_hint,
         gauge_priority: 100,
-        eta_row_scaling: None,
+        row_scaling: None,
     }
 }
 
@@ -20551,7 +20551,7 @@ mod tests {
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(Array1::zeros(p)),
             gauge_priority: 100,
-            eta_row_scaling: None,
+            row_scaling: None,
         }
     }
 
@@ -23486,7 +23486,7 @@ mod tests {
                 initial_log_lambdas: ndarray::Array1::zeros(2),
                 initial_beta: None,
                 gauge_priority: 100,
-                eta_row_scaling: None,
+                row_scaling: None,
             })
             .collect();
         let small_cost = default_coefficient_hessian_cost(&small_specs);
@@ -23514,7 +23514,7 @@ mod tests {
                 initial_log_lambdas: ndarray::Array1::zeros(10),
                 initial_beta: None,
                 gauge_priority: 100,
-                eta_row_scaling: None,
+                row_scaling: None,
             })
             .collect();
         let big_cost = default_coefficient_hessian_cost(&big_specs);
@@ -23545,7 +23545,7 @@ mod tests {
             initial_log_lambdas: ndarray::Array1::zeros(22),
             initial_beta: None,
             gauge_priority: 100,
-            eta_row_scaling: None,
+            row_scaling: None,
         }];
         let ctn_cost: u64 = 400_000u64 * 300 * 300;
         assert_eq!(
@@ -23575,7 +23575,7 @@ mod tests {
             initial_log_lambdas: ndarray::Array1::zeros(5_000),
             initial_beta: None,
             gauge_priority: 100,
-            eta_row_scaling: None,
+            row_scaling: None,
         }];
         assert_eq!(
             exact_outer_order_with_outer_hvp(&huge_k_specs, 0, true),
@@ -23623,7 +23623,7 @@ mod tests {
                 initial_log_lambdas: Array1::zeros(1),
                 initial_beta: None,
                 gauge_priority: 100,
-                eta_row_scaling: None,
+                row_scaling: None,
             },
             ParameterBlockSpec {
                 name: "logslope".to_string(),
@@ -23636,7 +23636,7 @@ mod tests {
                 initial_log_lambdas: Array1::zeros(1),
                 initial_beta: None,
                 gauge_priority: 100,
-                eta_row_scaling: None,
+                row_scaling: None,
             },
         ];
 
