@@ -447,6 +447,42 @@ pub trait BlockEffectiveJacobian: Send + Sync {
     }
 }
 
+/// A [`BlockEffectiveJacobian`] for any block that contributes linearly to
+/// exactly one output of a multi-output family.
+///
+/// `own_output` is the zero-based output index that this block drives.
+/// `n_family_outputs` is the total number of outputs (e.g. 2 for location-scale).
+/// `design` is the block's effective design matrix (n × p_block).
+///
+/// The returned Jacobian has shape `(n_family_outputs * n, p_block)`:
+/// rows `own_output * n .. (own_output + 1) * n` contain `design`,
+/// all other rows are zero.
+pub struct AdditiveBlockJacobian {
+    pub design: Array2<f64>,
+    pub own_output: usize,
+    pub n_family_outputs: usize,
+}
+
+impl BlockEffectiveJacobian for AdditiveBlockJacobian {
+    fn effective_jacobian_at(
+        &self,
+        _state: &FamilyLinearizationState<'_>,
+    ) -> Result<Array2<f64>, String> {
+        let n = self.design.nrows();
+        let p = self.design.ncols();
+        let total_rows = self.n_family_outputs * n;
+        let mut jac = Array2::<f64>::zeros((total_rows, p));
+        let row_start = self.own_output * n;
+        jac.slice_mut(ndarray::s![row_start..row_start + n, ..])
+            .assign(&self.design);
+        Ok(jac)
+    }
+
+    fn n_outputs(&self) -> usize {
+        self.n_family_outputs
+    }
+}
+
 /// Static specification for one parameter block in a custom family.
 #[derive(Clone)]
 pub struct ParameterBlockSpec {
@@ -1648,79 +1684,6 @@ pub(crate) fn exact_newton_outer_geometry_supports_second_order_solver<F: Custom
 pub struct FamilyEvaluation {
     pub log_likelihood: f64,
     pub blockworking_sets: Vec<BlockWorkingSet>,
-}
-
-/// State passed to [`BlockEffectiveJacobian::effective_jacobian_at`].
-///
-/// `beta` is the current coefficient vector for this block.
-/// `family_scalars` carries any additional family-specific context needed to
-/// compute the Jacobian (e.g. evaluated design rows that depend nonlinearly on
-/// other blocks). Most location-scale blocks ignore it entirely.
-pub struct FamilyLinearizationState<'a> {
-    pub beta: &'a [f64],
-    pub family_scalars: Option<Arc<dyn Any + Send + Sync>>,
-}
-
-/// Linearization Jacobian ∂η_r[i] / ∂β_k[j] for a single parameter block.
-///
-/// For a family with `n_outputs` scalar outputs per observation row (e.g.
-/// location-scale has 2: μ and log σ), this trait lets each block advertise
-/// how its coefficients map into each output.
-///
-/// The returned matrix has shape `(n_outputs * n, p_block)` where `n` is the
-/// number of observations and `p_block` is the block's coefficient dimension.
-/// Row `r * n + i` holds `∂η_r[i] / ∂β[:p_block]` for output index `r` and
-/// observation `i`.
-///
-/// For purely additive blocks that contribute linearly to exactly one output
-/// `r_own`, the implementation is straightforward:
-/// - Rows `r_own * n .. (r_own + 1) * n`: the effective design matrix rows.
-/// - All other rows: zeros.
-pub trait BlockEffectiveJacobian: Send + Sync {
-    fn effective_jacobian_at(
-        &self,
-        state: &FamilyLinearizationState<'_>,
-    ) -> Result<Array2<f64>, String>;
-
-    fn n_outputs(&self) -> usize {
-        1
-    }
-}
-
-/// A [`BlockEffectiveJacobian`] for any block that contributes linearly to
-/// exactly one output of a multi-output family.
-///
-/// `own_output` is the zero-based output index that this block drives.
-/// `n_family_outputs` is the total number of outputs (e.g. 2 for location-scale).
-/// `design` is the block's effective design matrix (n × p_block).
-///
-/// The returned Jacobian has shape `(n_family_outputs * n, p_block)`:
-/// rows `own_output * n .. (own_output + 1) * n` contain `design`,
-/// all other rows are zero.
-pub struct AdditiveBlockJacobian {
-    pub design: Array2<f64>,
-    pub own_output: usize,
-    pub n_family_outputs: usize,
-}
-
-impl BlockEffectiveJacobian for AdditiveBlockJacobian {
-    fn effective_jacobian_at(
-        &self,
-        _state: &FamilyLinearizationState<'_>,
-    ) -> Result<Array2<f64>, String> {
-        let n = self.design.nrows();
-        let p = self.design.ncols();
-        let total_rows = self.n_family_outputs * n;
-        let mut jac = Array2::<f64>::zeros((total_rows, p));
-        let row_start = self.own_output * n;
-        jac.slice_mut(ndarray::s![row_start..row_start + n, ..])
-            .assign(&self.design);
-        Ok(jac)
-    }
-
-    fn n_outputs(&self) -> usize {
-        self.n_family_outputs
-    }
 }
 
 pub struct ExactNewtonJointGradientEvaluation {
