@@ -1576,7 +1576,10 @@ fn channel_aware_aliased_pairs(
     Ok(pairs)
 }
 
-fn locate_block_column(col_offsets: &[usize], joint_col: usize) -> Result<(usize, usize), String> {
+fn locate_block_column(
+    col_offsets: &[usize],
+    joint_col: usize,
+) -> Result<(usize, usize), EstimationError> {
     // col_offsets has length specs.len() + 1; col_offsets[i..i+1] is
     // the joint-column range for block i. Linear scan is fine — the
     // table is tiny (one entry per block).
@@ -1585,20 +1588,22 @@ fn locate_block_column(col_offsets: &[usize], joint_col: usize) -> Result<(usize
             return Ok((i, joint_col - col_offsets[i]));
         }
     }
-    Err(format!(
+    Err(EstimationError::LayoutError(format!(
         "identifiability_audit::locate_block_column: joint_col {joint_col} \
          outside col_offsets range (max = {})",
         col_offsets.last().copied().unwrap_or(0),
-    ))
+    )))
 }
 
-fn block_pivoted_qr_diagonal(block: &Array2<f64>) -> Result<Vec<f64>, String> {
+fn block_pivoted_qr_diagonal(block: &Array2<f64>) -> Result<Vec<f64>, EstimationError> {
     if block.ncols() == 0 {
         return Ok(Vec::new());
     }
-    let (_q, r) = block
-        .qr()
-        .map_err(|e| format!("identifiability audit per-block QR failed: {e:?}"))?;
+    let (_q, r) = block.qr().map_err(|e| {
+        EstimationError::EigendecompositionFailed(crate::linalg::faer_ndarray::FaerLinalgError {
+            message: format!("identifiability audit per-block QR failed: {e:?}"),
+        })
+    })?;
     let diag_len = r.nrows().min(r.ncols());
     let mut out: Vec<f64> = (0..diag_len).map(|i| r[[i, i]].abs()).collect();
     out.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));

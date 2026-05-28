@@ -7731,7 +7731,7 @@ impl GaussianLocationScaleChannelHessian {
             let h11 = wi * 2.0 * resid * resid * inv_sigma2;
             let h01 = wi * 2.0 * resid * inv_sigma2;
             // PSD clamp via eigendecomposition of 2×2 matrix.
-            let (e0, e1, v00, v01, v10, v11) = psd_clamp_2x2(h00, h01, h01, h11);
+            let (e0, e1, v00, v01, v10, v11) = psd_clamp_2x2(h00, h01, h11);
             h[[i, 0, 0]] = e0 * v00 * v00 + e1 * v01 * v01;
             h[[i, 0, 1]] = e0 * v00 * v10 + e1 * v01 * v11;
             h[[i, 1, 0]] = h[[i, 0, 1]];

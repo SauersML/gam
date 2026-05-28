@@ -1,4 +1,8 @@
 use super::*;
+use super::family::{
+    append_deviation_function_penalty, require_probit_marginal_slope_link,
+    resolve_deviation_operator_orders,
+};
 
 //      needed for both the audit gate and the compile step.
 //   2. `audit_identifiability_channel_aware` — structural rank gate using
