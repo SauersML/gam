@@ -32,6 +32,9 @@ use gam::{
 };
 use std::sync::{Arc, Mutex, Once, OnceLock};
 
+mod common;
+use common::fixtures::Splitmix64;
+
 const N: usize = 300;
 
 #[derive(Default)]

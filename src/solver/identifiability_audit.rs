@@ -941,12 +941,21 @@ pub fn audit_identifiability(specs: &[ParameterBlockSpec]) -> Result<Identifiabi
                 .get(p.block_b.as_str())
                 .map(|&bi| col_offsets[bi] + p.direction_b)
                 .unwrap_or(0);
-            let halt_thr = pair_halt_threshold(
+            let halt_half_width = pair_halt_threshold(
                 col_s2.get(ja).copied().unwrap_or(1.0),
                 col_s2.get(jb).copied().unwrap_or(1.0),
                 n,
             );
-            p.overlap >= halt_thr
+            // Bias-corrected halt check: we stored overlap = |cosine| and
+            // bias_shift = shift.  The exact test would be |cosine − shift| ≥
+            // halt_half_width, but we only have |cosine|.  Using a conservative
+            // lower bound |overlap − |shift|| ensures we only fire when the
+            // cosine is genuinely outside the null band regardless of sign.
+            // For exact aliases (overlap ≈ 1) this always fires; for moderate
+            // overlaps the shift must be large enough to displace the cosine
+            // inside the null band before we withhold the halt.
+            let conservative_deviation = (p.overlap - p.bias_shift.abs()).abs();
+            conservative_deviation >= halt_half_width
         })
         .max_by(|a, b| {
             a.overlap
@@ -1032,14 +1041,19 @@ pub fn audit_identifiability(specs: &[ParameterBlockSpec]) -> Result<Identifiabi
                 .get(pair.block_b.as_str())
                 .map(|&bi| col_offsets[bi] + pair.direction_b)
                 .unwrap_or(0);
-            let halt_thr = pair_halt_threshold(
+            let halt_half_width = pair_halt_threshold(
                 col_s2.get(ja).copied().unwrap_or(1.0),
                 col_s2.get(jb).copied().unwrap_or(1.0),
                 n,
             );
+            let shift_note = if pair.bias_shift.abs() > 1e-8 {
+                format!(" bias_shift={:.4}", pair.bias_shift)
+            } else {
+                String::new()
+            };
             parts.push(format!(
                 "alias pair: '{}'[{}] ~ '{}'[{}] overlap={:.4} >= leverage-based halt \
-                 threshold {:.4} (n_eff_a≈{:.0}, n_eff_b≈{:.0}; \
+                 half-width {:.4}{} (n_eff_a≈{:.0}, n_eff_b≈{:.0}; \
                  reparam: orthogonalise one block's column {} against the other \
                  via sum-to-zero, or absorb the shared direction into a single \
                  parametric block)",
@@ -1048,7 +1062,8 @@ pub fn audit_identifiability(specs: &[ParameterBlockSpec]) -> Result<Identifiabi
                 pair.block_b,
                 pair.direction_b,
                 pair.overlap,
-                halt_thr,
+                halt_half_width,
+                shift_note,
                 1.0 / col_s2.get(ja).copied().unwrap_or(1.0).max(f64::EPSILON),
                 1.0 / col_s2.get(jb).copied().unwrap_or(1.0).max(f64::EPSILON),
                 pair.direction_b,
