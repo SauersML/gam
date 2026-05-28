@@ -1032,10 +1032,15 @@ pub fn build_smooth_basis(
                     || boundary.to_ascii_lowercase().contains("cyclic")
             })
             .unwrap_or(false);
+    // Read the raw user-facing smooth selector (`type=`/`bs=`) and collapse
+    // mgcv-compatible aliases (`tp`, `gp`, `cr`, `cs`, `ps`, `sos`, ...) to
+    // their gamfit canonical names via the single source of truth in
+    // `canonicalize_smooth_type`. The match arms below see only canonical
+    // names — adding the next alias never requires touching the dispatch.
     let type_opt = options
         .get("type")
         .or_else(|| options.get("bs"))
-        .map(|s| s.to_ascii_lowercase())
+        .map(|s| canonicalize_smooth_type(&s.to_ascii_lowercase()).to_string())
         .unwrap_or_else(|| match kind {
             SmoothKind::Te => "tensor".to_string(),
             SmoothKind::S if cols.len() == 1 => "bspline".to_string(),
