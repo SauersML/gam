@@ -1560,12 +1560,89 @@ impl SaeManifoldLoss {
     }
 }
 
+/// Per-row active-set layout for sparse SAE assignment modes (JumpReLU).
+///
+/// When the assignment is sparse, only a subset of `K` atoms are active per
+/// observation.  The Arrow-Schur row block for observation `i` has dim
+/// `q_active_i = |active_atoms_i| + Σ_{k ∈ active_i} d_k` rather than
+/// `q = K + Σ_k d_k`.  This struct records which atoms are active per row
+/// and maps compressed block positions back to full-q positions so that
+/// `apply_newton_step` can unpack the compact `delta_t` from the solve.
+#[derive(Debug, Clone)]
+pub struct SaeRowLayout {
+    /// `active_atoms[row]` — sorted indices of active atoms for that row.
+    pub active_atoms: Vec<Vec<usize>>,
+    /// For row `i`, active atom `active_atoms[i][j]` has its coord block
+    /// starting at compressed position `coord_starts[i][j]`.
+    pub coord_starts: Vec<Vec<usize>>,
+    /// Full-q coordinate offset for atom `k` (length `k_atoms`).
+    pub coord_offsets_full: Vec<usize>,
+    /// Per-atom coordinate dimensions, indexed by atom index.
+    pub coord_dims: Vec<usize>,
+}
+
+impl SaeRowLayout {
+    fn new(
+        n: usize,
+        k_atoms: usize,
+        threshold: f64,
+        logits: &Array2<f64>,
+        coord_dims: Vec<usize>,
+        coord_offsets_full: Vec<usize>,
+    ) -> Self {
+        let mut active_atoms = Vec::with_capacity(n);
+        let mut coord_starts_all = Vec::with_capacity(n);
+        for row in 0..n {
+            let row_logits = logits.row(row);
+            let active: Vec<usize> = (0..k_atoms)
+                .filter(|&k| row_logits[k] > threshold)
+                .collect();
+            let mut starts = Vec::with_capacity(active.len());
+            let mut cursor = active.len();
+            for &k in &active {
+                starts.push(cursor);
+                cursor += coord_dims[k];
+            }
+            active_atoms.push(active);
+            coord_starts_all.push(starts);
+        }
+        Self { active_atoms, coord_starts: coord_starts_all, coord_offsets_full, coord_dims }
+    }
+
+    /// Per-row compressed dim.
+    pub fn row_q_active(&self, row: usize) -> usize {
+        let active = &self.active_atoms[row];
+        let coord_sum: usize = active.iter().map(|&k| self.coord_dims[k]).sum();
+        active.len() + coord_sum
+    }
+
+    /// Expand a compact `delta_t` row slice back into full-q, zeros for inactive.
+    pub fn expand_row(&self, row: usize, delta_t_row: &[f64], out: &mut [f64]) {
+        for v in out.iter_mut() {
+            *v = 0.0;
+        }
+        let active = &self.active_atoms[row];
+        let starts = &self.coord_starts[row];
+        for (j, &k) in active.iter().enumerate() {
+            out[k] = delta_t_row[j];
+            let d = self.coord_dims[k];
+            let full_off = self.coord_offsets_full[k];
+            for axis in 0..d {
+                out[full_off + axis] = delta_t_row[starts[j] + axis];
+            }
+        }
+    }
+}
+
 /// Full SAE-manifold term.
 #[derive(Debug, Clone)]
 pub struct SaeManifoldTerm {
     pub atoms: Vec<SaeManifoldAtom>,
     pub assignment: SaeAssignment,
     temperature_schedule: Option<GumbelTemperatureSchedule>,
+    /// Active-set row layout from the most recent `assemble_arrow_schur` call.
+    /// `None` for dense modes (Softmax / IBPMap) or when not yet assembled.
+    last_row_layout: Option<SaeRowLayout>,
 }
 
 impl SaeManifoldTerm {
