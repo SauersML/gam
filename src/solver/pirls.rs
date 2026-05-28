@@ -8038,7 +8038,14 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
     // H_eff = X'W_H X + S_λ + ridge I (if ridge_used > 0).
     let penalized_hessian_transformed = working_summary.state.hessian.clone();
     let stabilizedhessian_transformed = penalized_hessian_transformed.clone();
-    let mut edf = calculate_edf_with_penalty(&penalized_hessian_transformed, &penalty_active)?;
+    // Use the workspace-backed variant for the dense path to reuse the
+    // `final_aug_matrix` allocation; the sparse path still allocates
+    // internally because no pre-computed factor is available at this site.
+    let mut edf = if let Some(dense_h) = penalized_hessian_transformed.as_dense() {
+        calculate_edfwithworkspace_with_penalty(dense_h, &penalty_active, &mut workspace)?
+    } else {
+        calculate_edf_with_penalty(&penalized_hessian_transformed, &penalty_active)?
+    };
     if !edf.is_finite() || edf.is_nan() {
         let p = penalized_hessian_transformed.ncols() as f64;
         let r = penalty_active.rank() as f64;

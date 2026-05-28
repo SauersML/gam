@@ -1952,7 +1952,7 @@ impl ArrowSchurSystem {
         &self,
         ridge_t: f64,
         ridge_beta: f64,
-    ) -> Result<(Array1<f64>, Array1<f64>), ArrowSchurError> {
+    ) -> Result<(Array1<f64>, Array1<f64>, PcgDiagnostics), ArrowSchurError> {
         let options = ArrowSolveOptions::automatic(self.k);
         solve_arrow_newton_step_core(self, ridge_t, ridge_beta, &options)
     }
@@ -1975,7 +1975,7 @@ impl ArrowSchurSystem {
         &self,
         ridge_t: f64,
         ridge_beta: f64,
-    ) -> Result<(Array1<f64>, Array1<f64>), ArrowSchurError> {
+    ) -> Result<(Array1<f64>, Array1<f64>, PcgDiagnostics), ArrowSchurError> {
         let options = ArrowSolveOptions::automatic(self.k);
         solve_with_lm_escalation_inner(self, ridge_t, ridge_beta, &options)
     }
@@ -2941,23 +2941,26 @@ fn estimated_htbeta_bytes(n: usize, d: usize, k: usize) -> Option<usize> {
 }
 
 /// Schur-eliminate the per-row latent block and solve with explicit options,
-/// returning only `(Δt, Δβ)`.
+/// returning `(Δt, Δβ, PcgDiagnostics)`.
 ///
-/// Use this entry point when the IFT factor cache is not consumed.
+/// The diagnostics are zero-valued (default) when the selected mode is
+/// `Direct` or `SqrtBA` — use them to monitor `InexactPCG` iteration counts
+/// and preconditioner escalation in production solves. Callers that do not
+/// need diagnostics may pattern-match only the first two tuple elements.
 pub fn solve_arrow_newton_step_core(
     sys: &ArrowSchurSystem,
     ridge_t: f64,
     ridge_beta: f64,
     options: &ArrowSolveOptions,
-) -> Result<(Array1<f64>, Array1<f64>), ArrowSchurError> {
+) -> Result<(Array1<f64>, Array1<f64>, PcgDiagnostics), ArrowSchurError> {
     if let Some(chunk_size) = options.streaming_chunk_size {
         let mut streaming = StreamingArrowSchur::from_system(sys, chunk_size);
         return streaming
             .solve(ridge_t, ridge_beta, options)
-            .map(|(delta_t, delta_beta, _)| (delta_t, delta_beta));
+            .map(|(delta_t, delta_beta, _)| (delta_t, delta_beta, PcgDiagnostics::default()));
     }
     solve_arrow_newton_step_artifacts(sys, ridge_t, ridge_beta, options)
-        .map(|step| (step.delta_t, step.delta_beta))
+        .map(|step| (step.delta_t, step.delta_beta, step.pcg_diagnostics))
 }
 
 /// LM-style ridge escalation around `solve_arrow_newton_step_core`.
@@ -2974,14 +2977,15 @@ pub fn solve_arrow_newton_step_core(
 /// exhaustion) surface immediately because they are not recoverable by
 /// shifting the diagonal.
 ///
-/// Returns the same `(Δt, Δβ)` as `solve_arrow_newton_step_core`, computed
-/// with the smallest escalated ridge that produced a successful factor.
+/// Returns `(Δt, Δβ, PcgDiagnostics)` from `solve_arrow_newton_step_core`,
+/// computed with the smallest escalated ridge that produced a successful factor.
+/// `PcgDiagnostics::ridge_escalations` records how many ridge bumps were needed.
 pub fn solve_with_lm_escalation_inner(
     sys: &ArrowSchurSystem,
     ridge_t: f64,
     ridge_beta: f64,
     options: &ArrowSolveOptions,
-) -> Result<(Array1<f64>, Array1<f64>), ArrowSchurError> {
+) -> Result<(Array1<f64>, Array1<f64>, PcgDiagnostics), ArrowSchurError> {
     let mut proximal_ridge = 0.0_f64;
     let mut escalations: usize = 0;
     let mut last_err: Option<ArrowSchurError> = None;
@@ -2991,7 +2995,7 @@ pub fn solve_with_lm_escalation_inner(
         match solve_arrow_newton_step_artifacts(sys, damped_ridge_t, damped_ridge_beta, options) {
             Ok(mut step) => {
                 step.pcg_diagnostics.ridge_escalations = escalations;
-                return Ok((step.delta_t, step.delta_beta));
+                return Ok((step.delta_t, step.delta_beta, step.pcg_diagnostics));
             }
             Err(err) => {
                 let recoverable = matches!(
@@ -3080,7 +3084,7 @@ where
         let ridge_t = base_ridge_t + proximal_ridge;
         let ridge_beta = base_ridge_beta + proximal_ridge;
         match solve_arrow_newton_step_core(sys, ridge_t, ridge_beta, options) {
-            Ok((delta_t, delta_beta)) => {
+            Ok((delta_t, delta_beta, _diag)) => {
                 let g_dot_p = arrow_gradient_dot_step(sys, delta_t.view(), delta_beta.view());
                 if !(g_dot_p.is_finite() && g_dot_p < 0.0) {
                     last_reason =
@@ -4899,7 +4903,7 @@ mod tests {
 
         // But the LM-escalating wrapper must recover by lifting ridge_t.
         let options = ArrowSolveOptions::direct();
-        let (delta_t, delta_beta) = solve_with_lm_escalation_inner(&sys, 0.0, 0.0, &options)
+        let (delta_t, delta_beta, _diag) = solve_with_lm_escalation_inner(&sys, 0.0, 0.0, &options)
             .expect("LM escalation must recover from PerRowFactorIllConditioned");
         for v in delta_t.iter().chain(delta_beta.iter()) {
             assert!(v.is_finite(), "recovered step must be finite: {v}");

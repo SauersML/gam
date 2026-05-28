@@ -5,6 +5,9 @@ pub struct PirlsGpuInput<'a> {
     pub x: ArrayView2<'a, f64>,
     pub weights: ArrayView1<'a, f64>,
     pub penalty_hessian: ArrayView2<'a, f64>,
+    /// Full descent-direction RHS: `Xᵀ·score − S·β + linear_shift`. The
+    /// returned `PirlsGpuStep::direction = H⁻¹·gradient` (no negation, #257).
+    /// Callers must assemble the corrected RHS before passing it here.
     pub gradient: ArrayView1<'a, f64>,
     /// Temporary Levenberg–Marquardt damping; added to H for the solve
     /// only. Never enters the exported `penalized_hessian`, `RidgePassport`,
@@ -832,6 +835,30 @@ extern "C" __global__ void chol_logdet_col_major(
             geam_add(&ws.blas, &ws.stream, p, &ws.xtwx_dev, &ws.penalty_dev, &mut ws.h_dev)?;
         }
 
+        // Apply rhs correction BEFORE the solve: rhs = Xᵀ·score − S·β + linear_shift (#257, #260).
+        // Download the accumulated Xᵀ·score and β (both p-vectors; bounded-cost round-trip)
+        // and apply the penalty correction host-side, then re-upload the corrected RHS so
+        // POTRS solves H·δ = (Xᵀscore − Sβ + linear_shift) and δ is the descent direction.
+        {
+            let score_raw = ws.stream
+                .clone_dtoh(&ws.rhs_dev)
+                .map_err(|e| format!("download Xᵀscore (device-input): {e}"))?;
+            let beta_raw = ws.stream
+                .clone_dtoh(input.beta_dev)
+                .map_err(|e| format!("download beta (device-input): {e}"))?;
+            let mut rhs_host = Array1::from_vec(score_raw);
+            let beta_host = Array1::from_vec(beta_raw);
+            let s_beta = input.penalty_hessian.dot(&beta_host);
+            rhs_host -= &s_beta;
+            rhs_host += &input.linear_shift;
+            ws.stream
+                .memcpy_htod(
+                    rhs_host.as_slice().ok_or("rhs_host not contiguous (device-input correction)")?,
+                    &mut ws.rhs_dev,
+                )
+                .map_err(|e| format!("re-upload corrected rhs (device-input): {e}"))?;
+        }
+
         // Exported penalised Hessian: H_final = XᵀWX + S + objective_ridge·I.
         // Download XᵀWX and add the objective ridge on the host so LM damping
         // never contaminates exported EDF / REML curvature / RidgePassport.
@@ -864,29 +891,6 @@ extern "C" __global__ void chol_logdet_col_major(
             &mut ws.rhs_dev,
             &mut ws.potrs_info_dev,
         )?;
-
-        // Apply rhs correction: rhs = Xᵀ·score − S·β + linear_shift (#257, #260).
-        // Download rhs and β (both p-vectors; bounded-cost round-trip) and
-        // apply the correction host-side, matching solve_step_on_stream_device_inplace.
-        {
-            let rhs_raw = ws.stream
-                .clone_dtoh(&ws.rhs_dev)
-                .map_err(|e| format!("download rhs before correction (device-input): {e}"))?;
-            let beta_raw = ws.stream
-                .clone_dtoh(input.beta_dev)
-                .map_err(|e| format!("download beta (device-input): {e}"))?;
-            let mut rhs_host = Array1::from_vec(rhs_raw);
-            let beta_host = Array1::from_vec(beta_raw);
-            let s_beta = input.penalty_hessian.dot(&beta_host);
-            rhs_host -= &s_beta;
-            rhs_host += &input.linear_shift;
-            ws.stream
-                .memcpy_htod(
-                    rhs_host.as_slice().ok_or("rhs_host not contiguous (device-input correction)")?,
-                    &mut ws.rhs_dev,
-                )
-                .map_err(|e| format!("re-upload corrected rhs (device-input): {e}"))?;
-        }
 
         let logdet = cholesky_logdet_device(&ws.stream, &shared.ctx, p, &ws.h_dev)?;
 
