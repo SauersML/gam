@@ -121,10 +121,15 @@ jobs:
             lower run-id), you lost the race — drop the issue, pick
             another, repeat. If you won, proceed.
 
-            **4. Heartbeat while working.** Push to `fix/issue-<N>` (even
-            a tiny WIP commit) or post a brief progress comment at least
-            every 40 minutes. This keeps your claim alive for any other
-            run that wakes up during your work.
+            **4. Heartbeat while working.** Commit, push, and post a
+            progress comment on the issue often — at minimum every 40
+            minutes, ideally much more often. WIP commits are encouraged;
+            messy intermediate state is fine; thinking-out-loud comments
+            on the issue are fine. The point is that the branch and the
+            issue thread together show a live trail of where the work is
+            so anyone watching (humans, future-you, the lock protocol)
+            knows it's alive. Don't sit silently for an hour and dump
+            everything at the end.
 
             **5. Release on finish.** When the PR is open and the fix is
             complete, post a final comment whose first line is exactly:
