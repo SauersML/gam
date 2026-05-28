@@ -707,8 +707,9 @@ extern "C" __global__ void chol_logdet_col_major(
             lm_ridge_delta,
         )?;
 
-        let mut direction = Array1::from_vec(direction_raw);
-        direction.mapv_inplace(|v| -v);
+        // No negation: `input.gradient` is the full descent-direction RHS
+        // `Xᵀscore − S·β + linear_shift`; solving H·δ = rhs gives δ directly.
+        let direction = Array1::from_vec(direction_raw);
 
         Ok(PirlsGpuStep {
             penalized_hessian,
@@ -861,6 +862,29 @@ extern "C" __global__ void chol_logdet_col_major(
             &mut ws.potrs_info_dev,
         )?;
 
+        // Apply rhs correction: rhs = Xᵀ·score − S·β + linear_shift (#257, #260).
+        // Download rhs and β (both p-vectors; bounded-cost round-trip) and
+        // apply the correction host-side, matching solve_step_on_stream_device_inplace.
+        {
+            let rhs_raw = ws.stream
+                .clone_dtoh(&ws.rhs_dev)
+                .map_err(|e| format!("download rhs before correction (device-input): {e}"))?;
+            let beta_raw = ws.stream
+                .clone_dtoh(input.beta_dev)
+                .map_err(|e| format!("download beta (device-input): {e}"))?;
+            let mut rhs_host = Array1::from_vec(rhs_raw);
+            let beta_host = Array1::from_vec(beta_raw);
+            let s_beta = input.penalty_hessian.dot(&beta_host);
+            rhs_host -= &s_beta;
+            rhs_host += &input.linear_shift;
+            ws.stream
+                .memcpy_htod(
+                    rhs_host.as_slice().ok_or("rhs_host not contiguous (device-input correction)")?,
+                    &mut ws.rhs_dev,
+                )
+                .map_err(|e| format!("re-upload corrected rhs (device-input): {e}"))?;
+        }
+
         let logdet = cholesky_logdet_device(&ws.stream, &shared.ctx, p, &ws.h_dev)?;
 
         let direction_raw = ws
@@ -872,8 +896,9 @@ extern "C" __global__ void chol_logdet_col_major(
         // info scalars at end-of-step rather than one per cuSOLVER call.
         check_deferred_potrf_info(&ws.stream, &ws.potrf_info_dev)?;
         check_deferred_potrs_info(&ws.stream, &ws.potrs_info_dev)?;
-        let mut direction = Array1::from_vec(direction_raw);
-        direction.mapv_inplace(|v| -v);
+        // No negation: rhs = Xᵀscore − Sβ + linear_shift already gives the
+        // descent direction δ = H⁻¹·rhs directly (#257).
+        let direction = Array1::from_vec(direction_raw);
 
         Ok(PirlsGpuStep {
             penalized_hessian,
@@ -3728,8 +3753,9 @@ mod cpu_fallback {
             .cholesky(Side::Lower)
             .map_err(|e| format!("CPU Cholesky failed in PIRLS fallback: {e:?}"))?;
         let g = Array1::from_iter(input.gradient.iter().copied());
-        let mut direction = factor.solvevec(&g);
-        direction.mapv_inplace(|v| -v);
+        // No negation: `input.gradient` is the full descent-direction RHS
+        // `Xᵀscore − S·β + linear_shift`; solving H·δ = rhs gives δ directly (#257).
+        let direction = factor.solvevec(&g);
         // Logdet comes from H_step's Cholesky (the actual factored matrix).
         let logdet = 2.0 * factor.diag().iter().map(|v| v.ln()).sum::<f64>();
         Ok(PirlsGpuStep {

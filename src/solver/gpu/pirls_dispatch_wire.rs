@@ -301,7 +301,22 @@ mod linux_impl {
             final_lm_lambda,
             min_deviance,
             max_abs_eta,
+            per_row_status_or,
         } = outcome;
+        // per_row_status_or already drives `status` (Unstable when forbidden
+        // bits are set) via build_loop_outcome. Verify the invariant: if any
+        // forbidden bit is set then status must be Unstable so the outer REML
+        // loop does not trust this iterate.
+        const FORBIDDEN_ROW: u32 =
+            crate::gpu::pirls_row::status_flags::INVALID_RESPONSE
+            | crate::gpu::pirls_row::status_flags::ZERO_PRIOR_WEIGHT;
+        if (per_row_status_or & FORBIDDEN_ROW) != 0 {
+            assert_eq!(
+                status,
+                PirlsStatus::Unstable,
+                "per_row_status_or has forbidden bits but status is not Unstable",
+            );
+        }
 
         // `logdet` corresponds to log|H_penalized| at the converged β; it is
         // not on the CPU oracle's `PirlsResult` surface (REML recomputes it
