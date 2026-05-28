@@ -6,8 +6,8 @@ use crate::custom_family::{
     CustomFamilyPsiDesignAction, CustomFamilyPsiLinearMapRef, CustomFamilyWarmStart,
     ExactNewtonJointGradientEvaluation, ExactNewtonJointHessianWorkspace,
     ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace,
-    ExactNewtonOuterCurvature, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
-    PenaltyMatrix, PsiDesignMap, build_embedded_dense_psi_operator,
+    ExactNewtonOuterCurvature, FamilyChannelHessian, FamilyEvaluation, ParameterBlockSpec,
+    ParameterBlockState, PenaltyMatrix, PsiDesignMap, build_embedded_dense_psi_operator,
     build_rowwise_kronecker_psi_operator, evaluate_custom_family_joint_hyper,
     evaluate_custom_family_joint_hyper_efs, first_psi_linear_map, fit_custom_family,
     resolve_custom_family_x_psi_map, shared_dense_arc, weighted_crossprod_psi_maps,
@@ -8626,6 +8626,98 @@ impl SurvivalLocationScaleFamily {
                 other
             )),
         }
+    }
+}
+
+/// Per-subject 3×3 channel Hessian W_i for survival location-scale.
+///
+/// The three output channels are:
+///   0. η_time   (time-transform, shared entry/exit predictor shift)
+///   1. η_thr    (threshold block — shifts both u0 and u1 identically)
+///   2. η_ls     (log-scale block — enters the inverse link)
+///
+/// The full W_i is the second derivative of the row NLL
+/// `ρ_i(η_time, η_thr, η_ls)` at the current pilot β:
+///
+/// ```text
+/// W_i[a, b] = ∂²ρ_i / ∂η_a ∂η_b
+/// ```
+///
+/// These are the same second-order scalars computed by
+/// `SurvivalLocationScaleFamily::row_derivatives_rescaled` but arranged
+/// into the per-channel output-space matrix instead of the per-block
+/// raw-coefficient space.
+///
+/// When the cross-channel curvature is unavailable (e.g. at the
+/// canonicalize step before any pilot β is known), the identity metric
+/// is used instead — see [`Self::identity`].
+pub struct SurvivalLocationScaleChannelHessian {
+    /// Row-major `(n × 3 × 3)` PSD-clamped per-subject Hessian.
+    h: ndarray::Array3<f64>,
+}
+
+impl SurvivalLocationScaleChannelHessian {
+    /// Number of output channels for SLS (always 3).
+    pub const K: usize = 3;
+
+    /// Construct from a pre-computed `(n × 3 × 3)` tensor.
+    /// No PSD clamping is applied — caller is responsible for ensuring PSD.
+    pub fn from_full(h: ndarray::Array3<f64>) -> Self {
+        assert_eq!(
+            h.shape()[1],
+            Self::K,
+            "SurvivalLocationScaleChannelHessian: expected K={} channels, got {}",
+            Self::K,
+            h.shape()[1],
+        );
+        assert_eq!(
+            h.shape()[2],
+            Self::K,
+            "SurvivalLocationScaleChannelHessian: expected K={} channels, got {}",
+            Self::K,
+            h.shape()[2],
+        );
+        Self { h }
+    }
+
+    /// Structural identity metric: W_i = I₃ for every subject.
+    ///
+    /// Used at the canonicalize step where no pilot β is available. The
+    /// identity metric gives the structurally correct rank answer (a block
+    /// with zero Jacobian contributes no information regardless of the
+    /// curvature).
+    pub fn identity(n: usize) -> Self {
+        let mut h = ndarray::Array3::<f64>::zeros((n, Self::K, Self::K));
+        for i in 0..n {
+            for c in 0..Self::K {
+                h[[i, c, c]] = 1.0;
+            }
+        }
+        Self { h }
+    }
+}
+
+impl FamilyChannelHessian for SurvivalLocationScaleChannelHessian {
+    fn n_outputs(&self) -> usize {
+        Self::K
+    }
+
+    fn n_subjects(&self) -> usize {
+        self.h.shape()[0]
+    }
+
+    fn fill_subject(&self, i: usize, out: &mut [f64]) {
+        assert_eq!(out.len(), Self::K * Self::K);
+        let k = Self::K;
+        for a in 0..k {
+            for b in 0..k {
+                out[a * k + b] = self.h[[i, a, b]];
+            }
+        }
+    }
+
+    fn evaluate_full(&self) -> ndarray::Array3<f64> {
+        self.h.clone()
     }
 }
 

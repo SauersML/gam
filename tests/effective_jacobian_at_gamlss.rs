@@ -15,7 +15,6 @@ use gam::families::gamlss::{
 };
 use gam::matrix::DesignMatrix;
 use ndarray::{Array1, Array2};
-use std::sync::Arc;
 
 const N: usize = 6;
 const EPS: f64 = 1e-6;
@@ -452,14 +451,14 @@ fn out_of_range_block_idx_returns_err() {
     assert!(result.is_err(), "expected Err for out-of-range block_idx");
 }
 
-/// Arc usage: the returned Box<dyn BlockEffectiveJacobian> is Send + Sync
-/// and can be stored in Arc.
+/// Box<dyn BlockEffectiveJacobian> can be sent across threads (Send + Sync bound).
 #[test]
-fn jacobian_box_is_send_sync() {
+fn jacobian_box_is_send() {
+    fn assert_send<T: Send>(_t: T) {}
     let xa = design_a();
     let xb = design_b();
     let specs = vec![make_spec("mu", xa), make_spec("log_sigma", xb)];
     let jac = GaussianLocationScaleFamily::block_effective_jacobian(&specs, 0)
         .expect("block_effective_jacobian");
-    let _arc: Arc<dyn gam::custom_family::BlockEffectiveJacobian> = Arc::from(jac);
+    assert_send(jac);
 }

@@ -17784,23 +17784,38 @@ impl crate::custom_family::BlockEffectiveJacobian for MarginalBlockJacobian {
         let n = self.design.nrows();
         let p = self.design.ncols();
 
+        // c_i = sqrt(1 + (s * g_i)^2) depends on the logslope block's g at the
+        // current beta.  This block does not own the logslope design so it cannot
+        // compute c from beta alone.  Hard contract: when state.beta is non-empty
+        // (post-init), family_scalars must carry SurvivalMarginalSlopeFamilyScalars
+        // so the correct c_i is used.  At init (beta empty or all-zero), c_i = 1
+        // exactly and family_scalars may be omitted.
         let scalars: Option<&SurvivalMarginalSlopeFamilyScalars> = state
             .family_scalars
             .as_ref()
             .and_then(|a| a.downcast_ref::<SurvivalMarginalSlopeFamilyScalars>());
+
+        let beta_nonzero = state.beta.iter().any(|&b| b != 0.0);
+        if beta_nonzero && scalars.is_none() {
+            return Err(
+                "survival marginal-slope marginal block requires                  SurvivalMarginalSlopeFamilyScalars when beta != 0 (c_i != 1 in general);                  got family_scalars: None. The caller must populate per-row c_i via                  FamilyLinearizationState::family_scalars."
+                    .to_string(),
+            );
+        }
 
         let mut jac = Array2::<f64>::zeros((3 * n, p));
 
         for i in 0..n {
             let c = match scalars {
                 Some(sc) => sc.c_i[i],
+                // beta is all-zero here (enforced above), so g = 0 and c = 1.
                 None => 1.0_f64,
             };
             for j in 0..p {
                 let m_ij = c * self.design[[i, j]];
                 jac[[i, j]] = m_ij;
                 jac[[n + i, j]] = m_ij;
-                // jac[[2*n + i, j]] = 0 — ad1 row stays zero
+                // jac[[2*n + i, j]] = 0 -- ad1 row stays zero
             }
         }
         Ok(jac)
@@ -17868,16 +17883,29 @@ impl crate::custom_family::BlockEffectiveJacobian for TimeBlockJacobian {
             ));
         }
 
+        // c_i = sqrt(1 + (s * g_i)^2) depends on the logslope block's g.  This block
+        // does not own the logslope design.  Hard contract: when beta is non-empty/nonzero,
+        // family_scalars must carry SurvivalMarginalSlopeFamilyScalars with the correct c_i.
+        // At init (beta empty or all-zero), c_i = 1 exactly.
         let scalars: Option<&SurvivalMarginalSlopeFamilyScalars> = state
             .family_scalars
             .as_ref()
             .and_then(|a| a.downcast_ref::<SurvivalMarginalSlopeFamilyScalars>());
+
+        let beta_nonzero = state.beta.iter().any(|&b| b != 0.0);
+        if beta_nonzero && scalars.is_none() {
+            return Err(
+                "survival marginal-slope time block requires                  SurvivalMarginalSlopeFamilyScalars when beta != 0 (c_i != 1 in general);                  got family_scalars: None. The caller must populate per-row c_i via                  FamilyLinearizationState::family_scalars."
+                    .to_string(),
+            );
+        }
 
         let mut jac = Array2::<f64>::zeros((3 * n, p));
 
         for i in 0..n {
             let c = match scalars {
                 Some(sc) => sc.c_i[i],
+                // beta is all-zero here (enforced above), so g = 0 and c = 1.
                 None => 1.0_f64,
             };
             for j in 0..p {

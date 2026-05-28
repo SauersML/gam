@@ -1799,30 +1799,15 @@ pub struct CompiledSurvivalDesignsVMExact {
     pub t_full: Array2<f64>,
 }
 
-/// Channel for the V+M-exact apply path. Identifies which channel a
-/// given compiled-block's anchor design belongs to — earlier blocks
-/// from a different channel contribute zero anchor rows because the
-/// compiler's row-primary-state subspace they residualise against does
-/// not project to this channel's emitted-row column space.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum VmChannel {
-    TimeEntry,
-    TimeExit,
-    TimeDerivativeExit,
-    Marginal,
-    Logslope,
-}
-
 /// Per-term V+M-exact apply: produce compiled designs assembled via
 /// `ResidualisedDesignOperator`, per-term penalties pulled back through
 /// the full triangular T, and `t_full` for result-time lift.
 ///
-/// Cross-channel anchors (e.g., a time-term anchor when emitting the
-/// marginal design) contribute zero — the time block's row Jacobian has
-/// no marginal-channel component, so its anchor design at the marginal
-/// design's row coordinates is a zero matrix. We express this by
-/// passing a zero `DenseDesignMatrix` of the appropriate shape as the
-/// anchor design for cross-channel anchor entries.
+/// NOTE: this function is no longer called from the production SMGS
+/// cutover path (which uses `apply_compiled_map_to_designs` driven by
+/// the channel-aware `compile_from_raw_grams` since T13). It is
+/// retained only to support the unit test below; both will be deleted
+/// once the test is confirmed redundant.
 #[allow(clippy::too_many_arguments)]
 pub fn apply_per_term_vm_exact(
     compiled: &SurvivalParametricCompiledPerTerm,
