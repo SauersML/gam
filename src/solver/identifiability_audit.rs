@@ -424,14 +424,12 @@ fn pair_halt_threshold(s2_a: f64, s2_b: f64, n: usize) -> f64 {
 /// where σ = pair_null_sigma(s2_a, s2_b, n) and
 /// shift = bias_shift_for_pair(...).
 ///
-/// A cosine is flagged when |cosine − shift| ≥ half_width.
+/// Returns `true` when |cosine − shift| ≥ half_width.
 ///
-/// Returns `(flag, |cosine − shift|)` so the caller can record which
-/// direction was used.  The `half_width` argument is the K·σ half-band
-/// (either the report or halt multiplied sigma).
-fn cosine_outside_null_band(cosine: f64, shift: f64, half_width: f64) -> (bool, f64) {
-    let deviation = (cosine - shift).abs();
-    (deviation >= half_width, deviation)
+/// The `half_width` argument is the K·σ half-band (either the report or
+/// halt multiplied sigma).
+fn cosine_outside_null_band(cosine: f64, shift: f64, half_width: f64) -> bool {
+    (cosine - shift).abs() >= half_width
 }
 
 /// Compute the signed cosine between two normalised column vectors.
@@ -756,7 +754,7 @@ pub fn audit_identifiability(specs: &[ParameterBlockSpec]) -> Result<Identifiabi
                     // row-scaling (or the two scalings differ).
                     let shift = bias_shift_for_pair(z_a, z_b, s2_ja, s2_jb);
                     let report_half_width = pair_report_threshold(s2_ja, s2_jb, n, total_cross_pairs);
-                    let (report_flag, _) = cosine_outside_null_band(cosine, shift, report_half_width);
+                    let report_flag = cosine_outside_null_band(cosine, shift, report_half_width);
                     // Store the unsigned |cosine| in AliasedPair.overlap for
                     // backwards compatibility and human-readable diagnostics.
                     // Also store `shift` so the halt-threshold check can apply

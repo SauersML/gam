@@ -154,6 +154,7 @@ fn sae_decoder_jacobian_shape_matches_n_times_p_by_m_times_p() {
         beta: &[],
         family_scalars: None,
         channel_hessian: None,
+        probit_frailty_scale: 1.0,
     };
     for (idx, spec) in specs.iter().enumerate() {
         let jac = spec
@@ -183,6 +184,7 @@ fn sae_decoder_jacobian_matches_finite_difference() {
         beta: &[],
         family_scalars: None,
         channel_hessian: None,
+        probit_frailty_scale: 1.0,
     };
     let h = 1.0e-5;
     let tol_abs = 1.0e-7;
@@ -229,6 +231,7 @@ fn sae_decoder_jacobian_block_diagonal_in_output() {
         beta: &[],
         family_scalars: None,
         channel_hessian: None,
+        probit_frailty_scale: 1.0,
     };
     let specs = term.decoder_parameter_block_specs();
     for (atom_idx, spec) in specs.iter().enumerate() {
