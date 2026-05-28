@@ -29302,7 +29302,10 @@ fn predict_competing_risks_survival_result(
         primary_offset: &primary_offset,
         noise_offset: &noise_offset,
         time_grid: time_grid_slice,
-        with_uncertainty: options.with_uncertainty,
+        // Issue #342: uncertainty is requested iff the user passed
+        // `interval=`. The inner kernel keeps its own boolean knob — that
+        // is an internal cost-control, not a public API flag.
+        with_uncertainty: options.interval.is_some(),
     };
     Ok(predict_competing_risks_survival(request)?)
 }
@@ -29338,7 +29341,10 @@ fn predict_survival_result(
         primary_offset: &primary_offset,
         noise_offset: &noise_offset,
         time_grid: time_grid_slice,
-        with_uncertainty: options.with_uncertainty,
+        // Issue #342: uncertainty is requested iff the user passed
+        // `interval=`. The inner kernel keeps its own boolean knob — that
+        // is an internal cost-control, not a public API flag.
+        with_uncertainty: options.interval.is_some(),
     };
     Ok(predict_survival(request)?)
 }
