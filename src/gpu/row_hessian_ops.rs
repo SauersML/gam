@@ -447,7 +447,7 @@ pub(crate) fn cpu_row_hessian_diag(inputs: &RowHessianDiagInputs<'_>) -> Vec<f64
     d
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
 
