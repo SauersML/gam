@@ -962,6 +962,32 @@ def fit(
         Analytic penalty wrappers such as :class:`gamfit.OrthogonalityPenalty`
         or :class:`gamfit.ARDPenalty`, targeted at latent block names or
         indices declared in ``latents``.
+    smooths:
+        Optional mapping from formula symbol to :class:`gamfit.smooth.Smooth`
+        basis descriptor (``Duchon``, ``Matern``, ``Sphere``, ``BSpline``,
+        ``TensorBSpline``, ``Pca``, ``PeriodicSplineCurve``, ``Categorical``).
+        Keys are either a single column name (``"x"``) or a tuple of column
+        names for multivariate smooths (``("lat", "lon")``). The descriptor
+        threads explicit center coordinates / knot vectors / kernel
+        hyperparameters into the same internal ``SmoothBasisSpec`` the
+        formula DSL produces — when all descriptor fields default to the
+        same values the DSL would auto-pick, the resulting block spec is
+        bit-identical to writing ``duchon(x, centers=K)`` (or the analogous
+        DSL invocation) in the formula. The only delta is that an explicit
+        ``centers=<array>`` array routes through
+        ``CenterStrategy::UserProvided``, whereas the DSL integer
+        ``centers=K`` routes through ``FarthestPoint``/``EqualMass``. Used
+        when you need to pin the basis centers to a precomputed
+        farthest-point sample, lattice, or domain landmark set.
+
+        Example::
+
+            from gamfit.smooth import Duchon, Sphere
+            centers = my_farthest_point_sample(X[["x"]].values, 20)
+            gamfit.fit(df, "y ~ duchon(x)",
+                       smooths={"x": Duchon(centers=centers)})
+            gamfit.fit(df, "y ~ sphere(lat, lon)",
+                       smooths={("lat", "lon"): Sphere(centers=lattice)})
 
     Returns
     -------
@@ -1114,6 +1140,7 @@ def fit_array(
     precision_hyperpriors: Any | None = None,
     latents: Mapping[str, Any] | None = None,
     penalties: Sequence[Any] | None = None,
+    smooths: Mapping[Any, Any] | None = None,
     config: dict[str, Any] | None = None,
 ) -> Model:
     """Fit directly from numeric NumPy-compatible arrays.
@@ -1155,6 +1182,7 @@ def fit_array(
         precision_hyperpriors=resolved_precision_hyperpriors,
         latents=latents,
         penalties=penalties,
+        smooths=smooths,
         config=rust_config or None,
     )
     try:
@@ -1307,6 +1335,7 @@ def validate_formula(
         precision_hyperpriors=None,
         latents=None,
         penalties=None,
+        smooths=None,
         config=rust_config or None,
     )
     try:
