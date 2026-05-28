@@ -35,7 +35,10 @@ pub fn apply_inverse_link_vec(eta: &[f64], family_kind: &str) -> Result<Vec<f64>
         "cloglog" => {
             for &e in eta {
                 let clamped = e.clamp(-50.0, 50.0);
-                out.push(1.0 - (-clamped.exp()).exp());
+                // μ = 1 − exp(−exp(η)); use -expm1(-exp(η)) to preserve precision
+                // in the deep negative tail where exp(-exp(η)) rounds to 1.0 and
+                // the naive `1.0 - …` form collapses to 0 for η ≲ -36.
+                out.push(-(-clamped.exp()).exp_m1());
             }
         }
         "log" => {
