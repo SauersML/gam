@@ -21123,6 +21123,9 @@ pub fn fit_survival_marginal_slope_terms(
                             let lift = SmgsLiftViaT::from_compiled_map(&map, &ordering);
                             return Ok(Some((applied, lift)));
                         }
+                        Ok(None) => {
+                            return Ok(None);
+                        }
                         Err(reason) => {
                             return Err(format!(
                                 "closed-form path unavailable: {reason}"
@@ -21130,10 +21133,6 @@ pub fn fit_survival_marginal_slope_terms(
                         }
                     }
                 }
-                // All arms of the `match closed_form` above exit via explicit
-                // `return`. This terminal expression is unreachable at runtime
-                // but required by Rust's type checker as the closure's value.
-                Ok(None)
             })();
         match attempt {
             Ok(Some((applied, lift))) => {
