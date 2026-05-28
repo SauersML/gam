@@ -690,6 +690,10 @@ extern "C" __global__ void chol_logdet_col_major(
             .gradient
             .as_slice()
             .ok_or("gradient must be contiguous for refinement")?;
+        // penalized_hessian = XtWX + S + objective_ridge·I.
+        // The Newton solve used H_step = XtWX + S + step_lm_lambda·I.
+        // So H_step = penalized_hessian + (step_lm_lambda - objective_ridge)·I.
+        let lm_ridge_delta = input.step_lm_lambda - input.objective_ridge;
         let direction_raw = newton_step_refine_once(
             &ws.solver,
             &ws.stream,
@@ -700,7 +704,7 @@ extern "C" __global__ void chol_logdet_col_major(
             direction_raw,
             g_slice,
             &penalized_hessian,
-            input.step_lm_lambda,
+            lm_ridge_delta,
         )?;
 
         let mut direction = Array1::from_vec(direction_raw);
