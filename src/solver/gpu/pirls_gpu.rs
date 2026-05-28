@@ -67,6 +67,19 @@ pub struct PirlsStepStreamDeviceInput<'a, 'b> {
     /// Real model-objective ridge. Appears in the exported
     /// `penalized_hessian` that flows to EDF / REML curvature.
     pub objective_ridge: f64,
+    /// Current coefficient vector β (length p). Used to form S·β for the
+    /// Newton RHS correction: rhs = Xᵀ·score − S·β + linear_shift.
+    pub beta_dev: &'b cudarc::driver::CudaSlice<f64>,
+    /// Device-resident p×p penalty matrix S in column-major layout. Read
+    /// by the S·β gemv in the RHS correction.
+    pub s_dev: &'b cudarc::driver::CudaSlice<f64>,
+    /// Device-resident linear shift vector (length p). Added to Newton
+    /// RHS so the solve targets Xᵀ·score − S·β + linear_shift.
+    pub linear_shift_dev: &'b cudarc::driver::CudaSlice<f64>,
+    /// Scratch buffer for S·β (length p). Written by the p×p gemv and
+    /// subtracted from the RHS; caller owns the allocation, this borrow
+    /// is mutable only for the duration of the step call.
+    pub sb_dev: &'b mut cudarc::driver::CudaSlice<f64>,
 }
 
 /// Shared, batch-wide GPU state for stream-pool sigma-cubature PIRLS.
