@@ -907,13 +907,15 @@ pub fn evidence_grad_rho(
         // and take its diagonal sum.
         let mut row_trace_acc = 0.0_f64;
         for i in 0..n {
+            let di = cache.row_dims[i];
             let m_i = &huu_drho[i][a];
-            assert_eq!(m_i.shape(), &[d, d]);
-            for col in 0..d {
-                for r0 in 0..d {
-                    trace_rhs[r0] = m_i[[r0, col]];
+            assert_eq!(m_i.shape(), &[di, di]);
+            for col in 0..di {
+                let mut tr_rhs_i = trace_rhs.slice_mut(ndarray::s![..di]).to_owned();
+                for r0 in 0..di {
+                    tr_rhs_i[r0] = m_i[[r0, col]];
                 }
-                let v = chol_lower_solve_vector(cache.undamped_factor(i), &trace_rhs);
+                let v = chol_lower_solve_vector(cache.undamped_factor(i), &tr_rhs_i);
                 row_trace_acc += v[col];
             }
         }
@@ -929,13 +931,14 @@ pub fn evidence_grad_rho(
         let mut da = hbb_drho[a].clone();
         assert_eq!(da.shape(), &[k, k]);
         for i in 0..n {
-            let dhtb = &htbeta_drho[i][a]; // d × K
-            let yi = &y_blocks[i]; // d × K
+            let di = cache.row_dims[i];
+            let dhtb = &htbeta_drho[i][a]; // di × K
+            let yi = &y_blocks[i]; // di × K
             // - (∂H_uβ_i)ᵀ Y_i
             for r0 in 0..k {
                 for c0 in 0..k {
                     let mut acc = 0.0;
-                    for cc in 0..d {
+                    for cc in 0..di {
                         acc += dhtb[[cc, r0]] * yi[[cc, c0]];
                     }
                     da[[r0, c0]] -= acc;
@@ -945,7 +948,7 @@ pub fn evidence_grad_rho(
             for r0 in 0..k {
                 for c0 in 0..k {
                     let mut acc = 0.0;
-                    for cc in 0..d {
+                    for cc in 0..di {
                         acc += yi[[cc, r0]] * dhtb[[cc, c0]];
                     }
                     da[[r0, c0]] -= acc;
@@ -953,22 +956,23 @@ pub fn evidence_grad_rho(
             }
             // + Y_iᵀ (∂H_uu_i) Y_i
             let dhuu = &huu_drho[i][a];
-            // tmp = (∂H_uu_i) Y_i  (d × K) — reuse hoisted da_tmp buffer.
-            for r0 in 0..d {
+            // tmp = (∂H_uu_i) Y_i  (di × K) — use a slice of the hoisted buffer.
+            let mut da_tmp_i = da_tmp.slice_mut(ndarray::s![..di, ..]).to_owned();
+            for r0 in 0..di {
                 for c0 in 0..k {
                     let mut acc = 0.0;
-                    for cc in 0..d {
+                    for cc in 0..di {
                         acc += dhuu[[r0, cc]] * yi[[cc, c0]];
                     }
-                    da_tmp[[r0, c0]] = acc;
+                    da_tmp_i[[r0, c0]] = acc;
                 }
             }
             // da += Y_iᵀ tmp
             for r0 in 0..k {
                 for c0 in 0..k {
                     let mut acc = 0.0;
-                    for cc in 0..d {
-                        acc += yi[[cc, r0]] * da_tmp[[cc, c0]];
+                    for cc in 0..di {
+                        acc += yi[[cc, r0]] * da_tmp_i[[cc, c0]];
                     }
                     da[[r0, c0]] += acc;
                 }
