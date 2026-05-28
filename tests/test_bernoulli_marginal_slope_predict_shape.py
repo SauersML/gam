@@ -72,7 +72,7 @@ def test_bernoulli_marginal_slope_saved_kind_returns_1d_probabilities(
     raw = json.dumps(
         {
             "columns": {
-                "eta": [-1.0, 0.0, 1.0],
+                "linear_predictor": [-1.0, 0.0, 1.0],
                 "mean": [0.2, 0.5, 0.8],
             }
         }
@@ -96,15 +96,15 @@ def test_standard_gam_default_returns_1d_mean(monkeypatch: Any) -> None:
     This is the contract issue #329 codified: no ``interval`` /
     ``id_column`` / ``return_type`` means no DataFrame, regardless of
     what auxiliary columns the backend put in the payload. The presence
-    of ``effective_se`` here is a *data* artefact and must not flip the
+    of ``std_error`` here is a *data* artefact and must not flip the
     return shape — that decision is a caller-intent decision only.
     """
     raw = json.dumps(
         {
             "columns": {
-                "eta": [-1.0, 0.0, 1.0],
+                "linear_predictor": [-1.0, 0.0, 1.0],
                 "mean": [0.2, 0.5, 0.8],
-                "effective_se": [0.01, 0.02, 0.03],
+                "std_error": [0.01, 0.02, 0.03],
             }
         }
     )
@@ -129,7 +129,7 @@ def test_standard_gam_with_return_type_returns_table(monkeypatch: Any) -> None:
     raw = json.dumps(
         {
             "columns": {
-                "eta": [-1.0, 0.0, 1.0],
+                "linear_predictor": [-1.0, 0.0, 1.0],
                 "mean": [0.2, 0.5, 0.8],
             }
         }
@@ -144,7 +144,7 @@ def test_standard_gam_with_return_type_returns_table(monkeypatch: Any) -> None:
     )
 
     assert isinstance(out, dict)
-    assert list(out) == ["eta", "mean"]
+    assert list(out) == ["linear_predictor", "mean"]
 
 
 def test_standard_gam_with_id_column_returns_table(monkeypatch: Any) -> None:
@@ -153,7 +153,7 @@ def test_standard_gam_with_id_column_returns_table(monkeypatch: Any) -> None:
     raw = json.dumps(
         {
             "columns": {
-                "eta": [-1.0, 0.0, 1.0],
+                "linear_predictor": [-1.0, 0.0, 1.0],
                 "mean": [0.2, 0.5, 0.8],
             }
         }
@@ -174,7 +174,7 @@ def test_standard_gam_with_id_column_returns_table(monkeypatch: Any) -> None:
     import pandas as pd
 
     assert isinstance(out, pd.DataFrame)
-    assert list(out.columns) == ["person_id", "eta", "mean"]
+    assert list(out.columns) == ["person_id", "linear_predictor", "mean"]
     assert out["person_id"].tolist() == ["a", "b", "c"]
 
 
@@ -184,9 +184,9 @@ def test_standard_gam_with_interval_returns_table(monkeypatch: Any) -> None:
     raw = json.dumps(
         {
             "columns": {
-                "eta": [-1.0, 0.0, 1.0],
+                "linear_predictor": [-1.0, 0.0, 1.0],
                 "mean": [0.2, 0.5, 0.8],
-                "effective_se": [0.01, 0.02, 0.03],
+                "std_error": [0.01, 0.02, 0.03],
                 "mean_lower": [0.19, 0.48, 0.77],
                 "mean_upper": [0.21, 0.52, 0.83],
             }
@@ -205,9 +205,9 @@ def test_standard_gam_with_interval_returns_table(monkeypatch: Any) -> None:
 
     assert isinstance(out, pd.DataFrame)
     assert list(out.columns) == [
-        "eta",
+        "linear_predictor",
         "mean",
-        "effective_se",
+        "std_error",
         "mean_lower",
         "mean_upper",
     ]
@@ -224,7 +224,7 @@ def test_marginal_slope_non_bernoulli_falls_through_to_standard_shaper(
     raw = json.dumps(
         {
             "columns": {
-                "eta": [-1.0, 0.0, 1.0],
+                "linear_predictor": [-1.0, 0.0, 1.0],
                 "mean": [0.2, 0.5, 0.8],
             }
         }
