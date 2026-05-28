@@ -308,7 +308,12 @@ mod linux_impl {
                     // Map H_transformed → H_original, invert, map β_transformed
                     // → β_original. Mirrors the CPU path's post-processing.
                     let h_orig = hessian_to_original(&loop_out.penalized_hessian, &pt.qs);
-                    let cov = matrix_inversewith_regularization(&h_orig, "gpu sigma point")?;
+                    let cov = matrix_inversewith_regularization(&h_orig, "gpu sigma point")
+                        .ok_or_else(|| {
+                            crate::gpu_err!(
+                                "gpu sigma point: penalised Hessian inverse not well-defined"
+                            )
+                        })?;
                     let beta_orig = pt.qs.dot(&loop_out.beta);
                     Some((cov, beta_orig))
                 }
@@ -372,7 +377,12 @@ mod linux_impl {
             .map_err(|e| crate::gpu_err!("gaussian sigma pool: point[{idx}] pls failed: {e}"))?;
 
             let h_orig = hessian_to_original(&pls.penalized_hessian, &pt.qs);
-            let cov = matrix_inversewith_regularization(&h_orig, "gaussian sigma point")?;
+            let cov = matrix_inversewith_regularization(&h_orig, "gaussian sigma point")
+                .ok_or_else(|| {
+                    crate::gpu_err!(
+                        "gaussian sigma point: penalised Hessian inverse not well-defined"
+                    )
+                })?;
             let beta_orig = pt.qs.dot(&pls.beta);
             outcomes.push(Some((cov, beta_orig)));
         }
