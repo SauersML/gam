@@ -391,39 +391,49 @@ extern "C" __global__ void chol_logdet_col_major(
             .memcpy_htod(w_slice, &mut ws.w_dev)
             .map_err(|e| format!("upload W: {e}"))?;
 
-        // Form WX = diag(w) · X into ws.wx_dev (no reallocation).
-        left_scale_rows(
-            &ws.blas,
-            &ws.stream,
-            n,
-            p,
-            &shared.x_dev,
-            &mut ws.w_dev,
-            &mut ws.wx_dev,
-        )?;
-
-        // XtWX = Xᵀ · WX.
+        // Compute XᵀWX into ws.xtwx_dev.  Two paths:
+        // Fused (p < FUSED_XTWX_P_THRESHOLD): row-sweep kernels, no n*p temp.
+        // Fallback (p >= FUSED_XTWX_P_THRESHOLD): ddgmm + dgemm via wx_dev.
         let n_i = to_i32(n)?;
         let p_i = to_i32(p)?;
-        let cfg = GemmConfig::<f64> {
-            transa: cublasOperation_t::CUBLAS_OP_T,
-            transb: cublasOperation_t::CUBLAS_OP_N,
-            m: p_i,
-            n: p_i,
-            k: n_i,
-            alpha: 1.0,
-            lda: n_i,
-            ldb: n_i,
-            beta: 0.0,
-            ldc: p_i,
-        };
-        // SAFETY: cuBLAS dgemm with validated i32 dimensions; shared.x_dev and ws.wx_dev are n*p
-        // f64 device buffers, ws.xtwx_dev is the p*p output; all bound to ws.stream via blas.
-        unsafe {
-            ws.blas
-                .gemm(cfg, &shared.x_dev, &ws.wx_dev, &mut ws.xtwx_dev)
+        if let Some(ref mut wx_dev) = ws.wx_dev {
+            left_scale_rows(
+                &ws.blas,
+                &ws.stream,
+                n,
+                p,
+                &shared.x_dev,
+                &mut ws.w_dev,
+                wx_dev,
+            )?;
+            let cfg = GemmConfig::<f64> {
+                transa: cublasOperation_t::CUBLAS_OP_T,
+                transb: cublasOperation_t::CUBLAS_OP_N,
+                m: p_i,
+                n: p_i,
+                k: n_i,
+                alpha: 1.0,
+                lda: n_i,
+                ldb: n_i,
+                beta: 0.0,
+                ldc: p_i,
+            };
+            // SAFETY: validated i32 dims; shared.x_dev and wx_dev are n*p
+            // f64 col-major; ws.xtwx_dev is the p*p output.
+            unsafe { ws.blas.gemm(cfg, &shared.x_dev, wx_dev, &mut ws.xtwx_dev) }
+                .map_err(|e| format!("cublas dgemm XtWX: {e}"))?;
+        } else {
+            launch_xtwx_lower(
+                &ws.stream,
+                &shared.ctx,
+                n,
+                p,
+                &shared.x_dev,
+                &ws.w_dev,
+                &mut ws.xtwx_dev,
+            )?;
+            launch_symmetrize_lower(&ws.stream, &shared.ctx, p, &mut ws.xtwx_dev)?;
         }
-        .map_err(|e| format!("cublas dgemm XtWX: {e}"))?;
 
         // Upload S + step_lm_lambda·I for the Newton solve (LM damping only).
         let penalty_step = penalty_with_ridge(input.penalty_hessian, input.step_lm_lambda);
@@ -2484,6 +2494,8 @@ pub fn pirls_loop_on_stream(
     loop_ws: &mut cuda::PirlsLoopWorkspace,
     family: crate::gpu::pirls_row::PirlsRowFamily,
     curvature: crate::gpu::pirls_row::CurvatureMode,
+    /// Active Gamma dispersion shape (α > 0). Pass `1.0` for non-Gamma fits.
+    gamma_shape: f64,
     beta0: ndarray::ArrayView1<'_, f64>,
     y: ndarray::ArrayView1<'_, f64>,
     prior_w: ndarray::ArrayView1<'_, f64>,
@@ -2500,6 +2512,7 @@ pub fn pirls_loop_on_stream(
         loop_ws,
         family,
         curvature,
+        gamma_shape,
         beta0,
         y,
         prior_w,

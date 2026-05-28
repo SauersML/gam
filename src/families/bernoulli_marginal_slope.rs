@@ -17889,6 +17889,35 @@ impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJoint
             }
             return Ok(None);
         }
+        // Device dense-block shortcut: when the row-primary Hessian is pinned on
+        // the GPU and `p_total` fits the shared-memory cap, dispatch the
+        // device-resident dense build instead of the CPU fused gradient pass.
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(device_state) = self.cache.row_primary_hessians.device() {
+                let p_total = self.cache.slices.total;
+                if p_total <= crate::gpu::bms_flex_row::DENSE_BLOCK_MAX_P {
+                    match crate::gpu::bms_flex_row::launch_bms_flex_row_dense_block(device_state) {
+                        Ok(flat) => {
+                            let h_arr =
+                                Array2::from_shape_vec((p_total, p_total), flat).map_err(|e| {
+                                    format!(
+                                        "BMS hessian_dense: dense_block reshape \
+                                             {p_total}x{p_total} failed: {e}"
+                                    )
+                                })?;
+                            return Ok(Some(h_arr));
+                        }
+                        Err(err) => {
+                            log::info!(
+                                "[BMS hessian_dense] gpu_dense_block_failed: {err}; \
+                                 falling back to CPU fused-gradient dense build"
+                            );
+                        }
+                    }
+                }
+            }
+        }
         if log_exact_work(self.family.y.len()) {
             log::info!(
                 "[BMS inner] route=dense n={} p={} primary_hessian_cache={}",

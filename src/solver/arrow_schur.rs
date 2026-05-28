@@ -2604,6 +2604,7 @@ fn solve_arrow_newton_step_artifacts(
                 &options.pcg,
                 &options.trust_region,
                 &backend,
+                options.gpu_matvec.as_ref(),
                 trust_metric_weights,
             )?;
             (delta, None, diag)
