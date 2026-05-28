@@ -11656,14 +11656,9 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         };
         let per_block_penalty_refs: Vec<&[Array2<f64>]> =
             penalties_dense.iter().map(Vec::as_slice).collect();
-        let per_block_nullspace_dims: Vec<&[usize]> = specs
-            .iter()
-            .map(|spec| spec.nullspace_dims.as_slice())
-            .collect();
         let penalty_logdet = crate::estimate::reml::unified::compute_block_penalty_logdet_derivs(
             &per_block_rho,
             &per_block_penalty_refs,
-            &per_block_nullspace_dims,
             penalty_logdet_ridge,
         )?;
         trace_s_pinv_sdot.assign(&penalty_logdet.first);

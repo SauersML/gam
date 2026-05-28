@@ -4506,13 +4506,6 @@ pub(crate) struct RemlState<'a> {
     /// Used by P-IRLS for factored reparameterization.
     pub(crate) kronecker_factored: Option<crate::basis::KroneckerFactoredBasis>,
 
-    /// Structural nullities of exact block-factored penalty groups.
-    ///
-    /// These depend only on the canonical penalty matrices, not on `rho`, so
-    /// seed screening and outer iterations can share them across repeated
-    /// analytic penalty-logdet evaluations.
-    pub(crate) penalty_block_structural_nullities:
-        RwLock<Option<penalty_logdet::PenaltyBlockStructuralNullities>>,
 
     /// Precomputed `(XᵀWX, XᵀW(y − offset))` for the Gaussian + Identity
     /// outer REML loop, populated once before the outer optimizer when the
