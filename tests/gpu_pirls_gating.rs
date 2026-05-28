@@ -4,9 +4,10 @@
 //! must satisfy before it can be enabled on any user-facing default.
 //!
 //! Every test:
-//!   - Skips gracefully when CUDA is not present (`cuda_selected()` returns
-//!     false).  Uses `if !cuda_selected() { return; }` at the test top, NOT
-//!     `#[ignore]`, so the test always appears in `cargo test` output.
+//!   - Skips gracefully when CUDA is not present: calls `gpu_gate(name)` at
+//!     the test top, emitting a visible `SKIP` line to stderr and returning
+//!     early.  Does NOT use `#[ignore]`, so the test always appears in
+//!     `cargo test` output.
 //!   - Is deterministic via seeded RNG.
 //!   - Uses n ≤ 500, p ≤ 32 to stay CI-laptop safe.
 //!   - Compiles on Linux (the GPU dispatch surface is Linux-only; on other
