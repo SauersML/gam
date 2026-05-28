@@ -129,22 +129,32 @@ impl TermBuilderError {
 // Column resolution
 // ---------------------------------------------------------------------------
 
-pub fn resolve_col(col_map: &HashMap<String, usize>, name: &str) -> Result<usize, String> {
+/// Resolve a bare column name to its index, returning a typed
+/// `DataError::ColumnNotFound` on miss so the FFI boundary can surface a
+/// structured `gamfit.ColumnNotFoundError(column=…, available=…)` rather
+/// than rely on string-classification of human prose. Internal callers that
+/// still flow `Result<_, String>` get byte-identical text via
+/// `From<DataError> for String`.
+pub fn resolve_col(col_map: &HashMap<String, usize>, name: &str) -> Result<usize, DataError> {
     col_map
         .get(name)
         .copied()
-        .ok_or_else(|| missing_column_message(col_map, name, None))
+        .ok_or_else(|| DataError::column_not_found(col_map, name, None))
 }
 
+/// Like `resolve_col` but tags the missing-column payload with a role label
+/// (`"response"`, `"entry"`, `"exit"`, `"event"`, `"z"`, `"id"`, …) so the
+/// boundary-side Python exception can disambiguate which formula slot held
+/// the bad reference.
 pub fn resolve_role_col(
     col_map: &HashMap<String, usize>,
     name: &str,
     role: &str,
-) -> Result<usize, String> {
+) -> Result<usize, DataError> {
     col_map
         .get(name)
         .copied()
-        .ok_or_else(|| missing_column_message(col_map, name, Some(role)))
+        .ok_or_else(|| DataError::column_not_found(col_map, name, Some(role)))
 }
 
 fn encoded_levels_for_column(ds: &Dataset, col: ColIdx) -> Vec<(u64, String)> {
