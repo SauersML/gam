@@ -2594,6 +2594,11 @@ pub enum BasisMetadata {
         /// linear). When `None` the consumer should fall back to the
         /// upstream `BSplineBasisSpec.degree` (legacy / non-shrunk path).
         degree: Option<usize>,
+        /// Human-readable description of an automatic basis shrink (issue #340)
+        /// when the user's requested `(degree, num_internal_knots)` exceeded the
+        /// available evaluation count `n`. `Some(note)` records the before→after
+        /// configuration; `None` means no auto-shrink occurred for this basis.
+        auto_shrink_note: Option<String>,
     },
     ThinPlate {
         centers: Array2<f64>,
@@ -7802,7 +7807,7 @@ pub fn build_bspline_basis_1d(
     // touches the auto/data-driven knot specs — when the caller provides an
     // explicit clamped knot vector or periodic geometry, we respect it
     // verbatim (their knots already encode a deliberate degree choice).
-    let spec_owned = maybe_auto_shrink_bspline_spec(spec, data.len());
+    let (spec_owned, auto_shrink_note) = maybe_auto_shrink_bspline_spec(spec, data.len());
     let spec = &spec_owned;
 
     let periodic_build = match &spec.knotspec {
@@ -9418,7 +9423,10 @@ pub(crate) fn auto_shrink_bspline_config(
 ///
 /// When a shrink actually happens, an info-level log message is emitted so
 /// the decision is visible in fit logs and downstream model summaries.
-fn maybe_auto_shrink_bspline_spec(spec: &BSplineBasisSpec, n: usize) -> BSplineBasisSpec {
+fn maybe_auto_shrink_bspline_spec(
+    spec: &BSplineBasisSpec,
+    n: usize,
+) -> (BSplineBasisSpec, Option<String>) {
     match &spec.knotspec {
         BSplineKnotSpec::Generate {
             data_range,
@@ -9427,27 +9435,23 @@ fn maybe_auto_shrink_bspline_spec(spec: &BSplineBasisSpec, n: usize) -> BSplineB
             let Some((eff_interior, eff_degree, shrunk)) =
                 auto_shrink_bspline_config(n, *num_internal_knots, spec.degree)
             else {
-                return spec.clone();
+                return (spec.clone(), None);
             };
             if !shrunk {
-                return spec.clone();
+                return (spec.clone(), None);
             }
-            log::info!(
-                "B-spline auto-shrink (#340): n={} forced degree {}→{} and \
-                 interior knots {}→{} on Generate knotspec",
-                n,
-                spec.degree,
-                eff_degree,
-                num_internal_knots,
-                eff_interior,
+            let note = format!(
+                "auto-shrink (#340): n={} forced degree {}->{} and interior knots {}->{}",
+                n, spec.degree, eff_degree, num_internal_knots, eff_interior,
             );
+            log::info!("B-spline {note} on Generate knotspec");
             let mut shrunk_spec = spec.clone();
             shrunk_spec.degree = eff_degree;
             shrunk_spec.knotspec = BSplineKnotSpec::Generate {
                 data_range: *data_range,
                 num_internal_knots: eff_interior,
             };
-            shrunk_spec
+            (shrunk_spec, Some(note))
         }
         BSplineKnotSpec::Automatic {
             num_internal_knots,
@@ -9458,29 +9462,27 @@ fn maybe_auto_shrink_bspline_spec(spec: &BSplineBasisSpec, n: usize) -> BSplineB
             let Some((eff_interior, eff_degree, shrunk)) =
                 auto_shrink_bspline_config(n, requested_interior, spec.degree)
             else {
-                return spec.clone();
+                return (spec.clone(), None);
             };
             if !shrunk {
-                return spec.clone();
+                return (spec.clone(), None);
             }
-            log::info!(
-                "B-spline auto-shrink (#340): n={} forced degree {}→{} and \
-                 interior knots {}→{} on Automatic knotspec",
-                n,
-                spec.degree,
-                eff_degree,
-                requested_interior,
-                eff_interior,
+            let note = format!(
+                "auto-shrink (#340): n={} forced degree {}->{} and interior knots {}->{}",
+                n, spec.degree, eff_degree, requested_interior, eff_interior,
             );
+            log::info!("B-spline {note} on Automatic knotspec");
             let mut shrunk_spec = spec.clone();
             shrunk_spec.degree = eff_degree;
             shrunk_spec.knotspec = BSplineKnotSpec::Automatic {
                 num_internal_knots: Some(eff_interior),
                 placement: *placement,
             };
-            shrunk_spec
+            (shrunk_spec, Some(note))
         }
-        BSplineKnotSpec::Provided(_) | BSplineKnotSpec::PeriodicUniform { .. } => spec.clone(),
+        BSplineKnotSpec::Provided(_) | BSplineKnotSpec::PeriodicUniform { .. } => {
+            (spec.clone(), None)
+        }
     }
 }
 
