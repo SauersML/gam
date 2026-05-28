@@ -1022,15 +1022,18 @@ pub(super) fn add_weighted_chunk_gram(chunk: &Array2<f64>, weights: &[f64], targ
     *target += &crate::faer_ndarray::fast_xt_diag_x(chunk, &weights_view);
 }
 
-/// Chunk size for parallel row accumulation. Rows within a chunk are
-/// processed sequentially. Flexible exact-Newton caches keep only the
-/// pre-solved row context; primary jets are recomputed in chunk-local work
-/// to avoid retaining O(n * p_primary^2) Hessian storage.
-/// A single new row-primary Hessian cache may consume up to this fraction of
-/// currently-available RAM. Keeps a 4× safety margin against fragmentation,
-/// other workspace allocations, and the rayon parallel build's transient
-/// per-thread scratch.
-/// The summed bytes pinned across all live row-primary Hessian caches is
-/// capped at this fraction of available RAM at construction time. Independent
-/// of the per-cache cap so that two co-resident workspaces cannot together
-/// consume the whole budget.
+// Chunk-size and budget constants for row-primary Hessian caches live in
+// `super::*` (see BMS_ROW_PRIMARY_HESSIAN_* in `mod.rs`). The trailing
+// rationale comments below documented their derivation:
+//   * Rows within a chunk are processed sequentially. Flexible exact-Newton
+//     caches keep only the pre-solved row context; primary jets are recomputed
+//     in chunk-local work to avoid retaining O(n * p_primary^2) Hessian
+//     storage.
+//   * A single new row-primary Hessian cache may consume up to a fraction of
+//     currently-available RAM. The 4× safety margin guards against
+//     fragmentation, other workspace allocations, and the rayon parallel
+//     build's transient per-thread scratch.
+//   * The summed bytes pinned across all live row-primary Hessian caches is
+//     capped at a fraction of available RAM at construction time —
+//     independent of the per-cache cap so that two co-resident workspaces
+//     cannot together consume the whole budget.
