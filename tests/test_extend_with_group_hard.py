@@ -54,11 +54,11 @@ def _fit_simple(precision_hyperpriors: Any | None = None) -> "gamfit.Model":
 
 
 def _predict_eta(model: "gamfit.Model", rows: list[dict[str, Any]]) -> np.ndarray:
-    out = model.predict(rows)
-    # `predict` returns either a dict-of-lists or a DataFrame
-    if isinstance(out, dict):
-        return np.asarray(out["eta"], dtype=float)
-    return np.asarray(out["eta"].to_numpy(), dtype=float)
+    # Ask explicitly for the tabular payload so we can read the eta column.
+    # Default ``predict()`` returns a 1-D array of fitted means for standard
+    # GAMs and would not expose the linear predictor.
+    out = model.predict(rows, return_type="dict")
+    return np.asarray(out["eta"], dtype=float)
 
 
 # ---------------------------------------------------------------------------

@@ -2718,6 +2718,88 @@ pub fn materialize<'a>(
     }
 }
 
+/// Validate that the response column lies in the support of `response_family`.
+///
+/// Gamma is supported on `y > 0`; Poisson, NegativeBinomial, and Tweedie
+/// (compound-Poisson-Gamma) are supported on `y ≥ 0`. Beta requires
+/// `y ∈ (0, 1)` and is validated upstream on the external-design GLM path —
+/// we mirror it here for the formula path so the user gets the same error
+/// regardless of entry point. All other families either accept the real line
+/// (Gaussian) or have their own domain-specific validation (Binomial requires
+/// {0,1} which `is_binary_response` already guards downstream).
+///
+/// Reports up to `MAX_REPORTED` row indices so the message stays bounded on
+/// large datasets but still identifies the offending data.
+fn validate_response_support_for_family(
+    response_family: &ResponseFamily,
+    response_name: &str,
+    y: ArrayView1<'_, f64>,
+) -> Result<(), WorkflowError> {
+    const MAX_REPORTED: usize = 5;
+    let (family_label, requirement, predicate): (&str, &str, fn(f64) -> bool) = match response_family
+    {
+        ResponseFamily::Gamma => (
+            "Gamma",
+            "strictly positive response values (y > 0)",
+            |yi| yi.is_finite() && yi > 0.0,
+        ),
+        ResponseFamily::Poisson => (
+            "Poisson",
+            "non-negative response values (y ≥ 0)",
+            |yi| yi.is_finite() && yi >= 0.0,
+        ),
+        ResponseFamily::NegativeBinomial { .. } => (
+            "Negative-Binomial",
+            "non-negative response values (y ≥ 0)",
+            |yi| yi.is_finite() && yi >= 0.0,
+        ),
+        ResponseFamily::Tweedie { .. } => (
+            "Tweedie",
+            "non-negative response values (y ≥ 0)",
+            |yi| yi.is_finite() && yi >= 0.0,
+        ),
+        ResponseFamily::Beta { .. } => (
+            "Beta",
+            "response values strictly in the open interval (0, 1)",
+            |yi| yi.is_finite() && yi > 0.0 && yi < 1.0,
+        ),
+        // Gaussian accepts the entire real line; Binomial is enforced by
+        // is_binary_response and PIRLS at fit time; RoystonParmar uses the
+        // survival pathway, not the standard formula materializer.
+        ResponseFamily::Gaussian
+        | ResponseFamily::Binomial
+        | ResponseFamily::RoystonParmar => return Ok(()),
+    };
+
+    let mut bad: Vec<(usize, f64)> = Vec::new();
+    for (i, &yi) in y.iter().enumerate() {
+        if !predicate(yi) {
+            if bad.len() < MAX_REPORTED {
+                bad.push((i, yi));
+            } else {
+                bad.push((i, yi));
+                break;
+            }
+        }
+    }
+    if bad.is_empty() {
+        return Ok(());
+    }
+    let shown = bad
+        .iter()
+        .take(MAX_REPORTED)
+        .map(|(i, v)| format!("y[{i}]={v}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let more = if bad.len() > MAX_REPORTED { ", ..." } else { "" };
+    Err(WorkflowError::InvalidConfig {
+        reason: format!(
+            "{family_label} family requires {requirement}; response column '{response_name}' \
+             violates this constraint at row(s) [{shown}{more}]",
+        ),
+    })
+}
+
 /// Detect whether a response column is binary (0/1 only).
 pub fn is_binary_response(y: ArrayView1<'_, f64>) -> bool {
     if y.is_empty() {
@@ -4945,6 +5027,48 @@ fn materialize_standard<'a>(
     let y = data.values.column(y_col).to_owned();
     let mut inference_notes = Vec::new();
 
+    // String-valued response columns are encoded as Categorical level indices
+    // (e.g. "yes"/"no" → 0.0/1.0). When the user did not pin a family the
+    // auto-detector then sees a 0/1 column and silently infers Binomial,
+    // producing a probability model the user never asked for (see #304).
+    // Reject upfront with an explicit, actionable error.
+    if config.family.is_none()
+        && matches!(
+            data.column_kinds.get(y_col),
+            Some(ColumnKindTag::Categorical)
+        )
+    {
+        let levels = data
+            .schema
+            .columns
+            .get(y_col)
+            .map(|sc| sc.levels.clone())
+            .unwrap_or_default();
+        let preview = {
+            let n = levels.len().min(5);
+            let head = levels
+                .iter()
+                .take(n)
+                .map(|s| format!("'{s}'"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            if levels.len() > n {
+                format!("[{head}, ...]")
+            } else {
+                format!("[{head}]")
+            }
+        };
+        return Err(WorkflowError::InvalidConfig {
+            reason: format!(
+                "response column '{name}' contains non-numeric values {preview}. \
+                 Did you mean to use family='binomial' for a binary outcome, \
+                 or does '{name}' contain categorical labels that should be encoded first?",
+                name = parsed.response,
+            ),
+        }
+        .into());
+    }
+
     let link_choice = parse_link_choice(config.link.as_deref(), config.flexible_link)?;
     let family = resolve_family(
         config.family.as_deref(),
@@ -4952,6 +5076,13 @@ fn materialize_standard<'a>(
         link_choice.as_ref(),
         y.view(),
     )?;
+
+    // Validate response-domain support for families whose log-likelihood is
+    // undefined outside a restricted set (#335 Gamma requires y > 0;
+    // #337 Poisson/NegativeBinomial require y ≥ 0). We report at most a few
+    // offending row indices so the user can locate the bad data.
+    validate_response_support_for_family(&family.response, &parsed.response, y.view())
+        .map_err(String::from)?;
 
     let effective_linkwiggle =
         effectivelinkwiggle_formulaspec(parsed.linkwiggle.as_ref(), link_choice.as_ref());

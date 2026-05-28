@@ -18,8 +18,8 @@ use crate::faer_ndarray::FaerCholesky;
 use crate::families::royston_parmar::{self, RoystonParmarInputs};
 use crate::families::survival_predict::{
     fit_result_from_saved_model_for_prediction, require_saved_survival_likelihood_mode,
-    resolve_termspec_for_prediction, saved_baseline_timewiggle_components,
-    saved_survival_runtime_baseline_config,
+    resolve_saved_survival_time_columns, resolve_termspec_for_prediction,
+    saved_baseline_timewiggle_components, saved_survival_runtime_baseline_config,
 };
 use crate::gamlss::{
     append_selected_wiggle_penalty_orders, buildwiggle_block_input_from_knots,
@@ -650,21 +650,15 @@ fn sample_survival(
     // and posterior sampling must do the same so artifacts fit with
     // the shorthand are first-class through `gam sample` /
     // `model.sample` just like `gam predict` already handles them in
-    // `run_predict_survival`.
-    let entry_col: Option<usize> = model
-        .survival_entry
-        .as_deref()
-        .map(|name| resolve_role_col(col_map, name, "entry"))
-        .transpose()?;
-    let exitname = model
-        .survival_exit
-        .as_ref()
-        .ok_or_else(|| "survival model missing exit column metadata".to_string())?;
+    // `run_predict_survival`. The resolution flows through the shared
+    // `resolve_saved_survival_time_columns` helper so every consumer
+    // of saved survival metadata applies the same fallback contract.
+    let time_cols = resolve_saved_survival_time_columns(model, col_map)?;
+    let exit_col = time_cols.exit_col;
     let eventname = model
         .survival_event
         .as_ref()
         .ok_or_else(|| "survival model missing event column metadata".to_string())?;
-    let exit_col = resolve_role_col(col_map, exitname, "exit")?;
     let event_col = resolve_role_col(col_map, eventname, "event")?;
     let termspec = resolve_termspec_for_prediction(
         &model.resolved_termspec,
@@ -684,8 +678,11 @@ fn sample_survival(
     let event_competing = Array1::<u8>::zeros(n);
     let weights = Array1::<f64>::ones(n);
     for i in 0..n {
-        let entry_val = entry_col.map_or(0.0, |idx| data[[i, idx]]);
-        let (t0, t1) = normalize_survival_time_pair(entry_val, data[[i, exit_col]], i)?;
+        let (t0, t1) = normalize_survival_time_pair(
+            time_cols.row_entry_time(data, i),
+            data[[i, exit_col]],
+            i,
+        )?;
         age_entry[i] = t0;
         age_exit[i] = t1;
         event_target[i] = if data[[i, event_col]] >= 0.5 { 1 } else { 0 };
