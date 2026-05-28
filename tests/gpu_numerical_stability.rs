@@ -147,7 +147,7 @@ fn pirls_gpu_matches_cpu_across_stability_grid() {
                 assert_arrays_close(&step.penalized_hessian, &h_cpu, 1e-8);
                 assert!(close(step.logdet, logdet_cpu, 1e-8));
                 // direction = H⁻¹·g (no negation; gradient is the full descent RHS, #257)
-                assert_vec_close(&step.direction, &sol_cpu.column(0), 1e-8);
+                assert_vec_close(&step.direction, &sol_cpu.column(0).to_owned(), 1e-8);
                 cases += 1;
             }
         }
