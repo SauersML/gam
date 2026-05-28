@@ -333,7 +333,7 @@ fn transpose_design_times_dense(
 mod tests {
     use super::*;
     use crate::faer_ndarray::fast_ab;
-    use crate::matrix::DesignMatrix;
+    use crate::matrix::{DesignMatrix, LinearOperator, SignedWeightsView};
     use ndarray::array;
 
     /// Build a tiny dense design and a corresponding `DesignMatrix::Dense`.
@@ -400,7 +400,7 @@ mod tests {
         let v = array![[0.2, 0.1], [0.0, 0.4], [0.3, -0.2], [-0.1, 0.6], [0.5, 0.0]];
         let lr = LowRankWeight::new(d.view(), u.view(), v.view()).unwrap();
 
-        let mut xtwx = design.compute_xtwx(&d).unwrap();
+        let mut xtwx = design.xt_diag_x_signed_op(SignedWeightsView::from_array(&d)).unwrap();
         lr.add_low_rank_xtwx_correction(&design, &mut xtwx).unwrap();
 
         // Reference: Xᵀ W X with the full dense W.
@@ -461,7 +461,7 @@ mod tests {
         let lr = LowRankWeight::new(d.view(), u.view(), v.view()).unwrap();
         assert!(lr.is_rank_zero());
 
-        let mut xtwx = design.compute_xtwx(&d).unwrap();
+        let mut xtwx = design.xt_diag_x_signed_op(SignedWeightsView::from_array(&d)).unwrap();
         let baseline = xtwx.clone();
         lr.add_low_rank_xtwx_correction(&design, &mut xtwx).unwrap();
         // Correction must be the zero matrix when r=0.
@@ -540,7 +540,7 @@ mod tests {
         let v = array![[0.2, 0.1], [0.0, 0.4], [0.3, -0.2], [-0.1, 0.6], [0.5, 0.0]];
         let lr = LowRankWeight::new(d.view(), u.view(), v.view()).unwrap();
 
-        let a = design.compute_xtwx(&d).unwrap(); // p × p
+        let a = design.xt_diag_x_signed_op(SignedWeightsView::from_array(&d)).unwrap(); // p × p
         let a_inv = small_inverse(&a);
         let uhat = lr.project_u(&design).unwrap(); // p × r
         let vhat = lr.project_v(&design).unwrap(); // p × r

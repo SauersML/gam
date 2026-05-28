@@ -1,5 +1,6 @@
 use super::family::clamp_bernoulli_link_probability;
 use super::*;
+use crate::matrix::{LinearOperator, SignedWeightsView};
 
 pub(crate) fn standardize_latent_z_with_policy(
     z: &Array1<f64>,

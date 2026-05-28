@@ -8519,6 +8519,144 @@ fn fit_penalized_multinomial_pyfunc<'py>(
     Ok(out.unbind())
 }
 
+// ---------------------------------------------------------------------------
+// Formula-driven multinomial pipeline (Slice A of #328)
+// ---------------------------------------------------------------------------
+//
+// The high-level `gamfit.fit(data, formula, family='multinomial')` Python
+// entry routes through `fit_multinomial_formula_pyfunc` below. The Rust core
+// in `gam::families::multinomial::fit_penalized_multinomial_formula` parses
+// the formula, materialises the term-collection design + penalty blocks the
+// same way the standard workflow does, one-hot-encodes the categorical
+// response, and runs `fit_penalized_multinomial` at a uniform initial
+// smoothing parameter. REML / LAML λ selection is the next slice.
+//
+// Round-trip format: `serde_json::to_vec(&MultinomialModelEnvelope { ... })`
+// keyed by `model_class = "multinomial"` so the Python `_model.load` path
+// can dispatch by inspecting the JSON discriminator without deserialising
+// the whole `FittedModel` struct.
+
+/// Envelope used for both the fit and predict pyfunctions. The
+/// `model_class` discriminator is required so the Python load path can
+/// tell a `MultinomialSavedModel` apart from the scalar `FittedModel`
+/// payload that `fit_table` produces.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct MultinomialModelEnvelope {
+    model_class: String,
+    saved: gam::families::multinomial::MultinomialSavedModel,
+}
+
+/// Fit a penalized multinomial-logit GAM from a Wilkinson formula against
+/// a `headers + rows` table. Returns the bincode-free, serde-JSON model
+/// payload that `gamfit.MultinomialModel` deserialises and stores under
+/// `Model._model_bytes`.
+#[pyfunction(signature = (
+    headers,
+    rows,
+    formula,
+    init_lambda = 1.0,
+    max_iter = 50,
+    tol = 1.0e-7,
+))]
+fn fit_multinomial_formula_pyfunc<'py>(
+    py: Python<'py>,
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+    formula: String,
+    init_lambda: f64,
+    max_iter: usize,
+    tol: f64,
+) -> PyResult<Py<PyBytes>> {
+    let bytes = detach_py_result(py, "fit_multinomial_formula", move || {
+        let dataset = dataset_with_inferred_schema(headers, rows)
+            .map_err(|err| err.to_string())?;
+        let saved = gam::families::multinomial::fit_penalized_multinomial_formula(
+            &dataset,
+            &formula,
+            &gam::FitConfig::default(),
+            init_lambda,
+            max_iter,
+            tol,
+        )
+        .map_err(|err| err.to_string())?;
+        let envelope = MultinomialModelEnvelope {
+            model_class: "multinomial".to_string(),
+            saved,
+        };
+        serde_json::to_vec(&envelope)
+            .map_err(|err| format!("failed to serialize multinomial model: {err}"))
+    })?;
+    Ok(PyBytes::new(py, &bytes).unbind())
+}
+
+/// Predict class probabilities for a saved multinomial model. The returned
+/// `(N_new, K)` numpy array column-aligns with `MultinomialSavedModel.class_levels`.
+#[pyfunction(signature = (model_bytes, headers, rows))]
+fn predict_multinomial_formula_pyfunc<'py>(
+    py: Python<'py>,
+    model_bytes: Vec<u8>,
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+) -> PyResult<Py<PyAny>> {
+    let probs = detach_py_result(py, "predict_multinomial_formula", move || {
+        let envelope: MultinomialModelEnvelope = serde_json::from_slice(&model_bytes)
+            .map_err(|err| format!("failed to deserialize multinomial model: {err}"))?;
+        if envelope.model_class != "multinomial" {
+            return Err(format!(
+                "predict_multinomial_formula: model_class = {:?}, expected 'multinomial'",
+                envelope.model_class
+            ));
+        }
+        let dataset = dataset_with_inferred_schema(headers, rows)
+            .map_err(|err| err.to_string())?;
+        gam::families::multinomial::predict_multinomial_formula(&envelope.saved, &dataset)
+            .map_err(|err| err.to_string())
+    })?;
+    let array = probs.into_pyarray(py);
+    Ok(array.into_any().unbind())
+}
+
+/// Inspect a multinomial saved-model byte blob and return the class-level
+/// metadata needed by `MultinomialModel.summary()` and `.classes_`. Keeping
+/// this on the FFI side avoids re-encoding the serde envelope in Python.
+#[pyfunction(signature = (model_bytes))]
+fn multinomial_model_metadata_pyfunc(model_bytes: Vec<u8>) -> PyResult<Py<PyAny>> {
+    let envelope: MultinomialModelEnvelope =
+        serde_json::from_slice(&model_bytes).map_err(|err| {
+            py_value_error(format!(
+                "failed to deserialize multinomial model: {err}"
+            ))
+        })?;
+    if envelope.model_class != "multinomial" {
+        return Err(py_value_error(format!(
+            "multinomial_model_metadata: model_class = {:?}, expected 'multinomial'",
+            envelope.model_class
+        )));
+    }
+    Python::attach(|py| {
+        let out = PyDict::new(py);
+        out.set_item("formula", &envelope.saved.formula)?;
+        out.set_item("class_levels", envelope.saved.class_levels.clone())?;
+        out.set_item("reference_class_index", envelope.saved.reference_class_index)?;
+        out.set_item("p_per_class", envelope.saved.p_per_class)?;
+        out.set_item("n_active_classes", envelope.saved.n_active_classes)?;
+        out.set_item("training_headers", envelope.saved.training_headers.clone())?;
+        out.set_item("lambda", envelope.saved.lambda)?;
+        out.set_item("iterations", envelope.saved.iterations)?;
+        out.set_item("converged", envelope.saved.converged)?;
+        out.set_item(
+            "penalized_neg_log_likelihood",
+            envelope.saved.penalized_neg_log_likelihood,
+        )?;
+        out.set_item("deviance", envelope.saved.deviance)?;
+        out.set_item(
+            "coefficients_flat",
+            envelope.saved.coefficients_flat.clone(),
+        )?;
+        Ok(out.into_any().unbind())
+    })
+}
+
 fn latent_augmented_hessian_factor(
     design: ArrayView2<'_, f64>,
     penalty: ArrayView2<'_, f64>,
@@ -21609,6 +21747,9 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<SpdManifold>()?;
     module.add_class::<ProductManifold>()?;
     module.add_function(wrap_pyfunction!(fit_penalized_multinomial_pyfunc, module)?)?;
+    module.add_function(wrap_pyfunction!(fit_multinomial_formula_pyfunc, module)?)?;
+    module.add_function(wrap_pyfunction!(predict_multinomial_formula_pyfunc, module)?)?;
+    module.add_function(wrap_pyfunction!(multinomial_model_metadata_pyfunc, module)?)?;
     module.add_function(wrap_pyfunction!(sklearn_fit_metadata, module)?)?;
     module.add_function(wrap_pyfunction!(build_info, module)?)?;
     module.add_function(wrap_pyfunction!(identifiability_check_json, module)?)?;

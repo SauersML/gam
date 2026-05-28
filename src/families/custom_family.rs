@@ -3,8 +3,8 @@ use crate::faer_ndarray::FaerEigh;
 use crate::faer_ndarray::{FaerCholesky, fast_atb, fast_av};
 use crate::linalg::utils::StableSolver;
 use crate::matrix::{
-    DesignMatrix, EmbeddedColumnBlock, EmbeddedSquareBlock, LinearOperator, SymmetricMatrix,
-    dense_rowwise_kronecker,
+    DesignMatrix, EmbeddedColumnBlock, EmbeddedSquareBlock, LinearOperator, SignedWeightsView,
+    SymmetricMatrix, dense_rowwise_kronecker,
 };
 use crate::pirls::{LinearInequalityConstraints, solve_newton_directionwith_lower_bounds};
 use crate::resource::{DerivativeStorageMode, ResourcePolicy};
@@ -8227,7 +8227,7 @@ fn weighted_normal_equations(
         .into());
     }
 
-    let xtwx = x.compute_xtwx(w)?;
+    let xtwx = x.xt_diag_x_signed_op(SignedWeightsView::from_array(w))?;
     let xtwy = if let Some(y) = y_star {
         Some(x.compute_xtwy(w, y)?)
     } else {

@@ -30,7 +30,9 @@ use crate::families::sigma_link::{
 };
 use crate::generative::{CustomFamilyGenerative, GenerativeSpec, NoiseModel};
 use crate::matrix::SymmetricMatrix;
-use crate::matrix::{DenseDesignMatrix, DenseDesignOperator, DesignMatrix};
+use crate::matrix::{
+    DenseDesignMatrix, DenseDesignOperator, DesignMatrix, LinearOperator, SignedWeightsView,
+};
 use crate::mixture_link::{
     inverse_link_jet_for_inverse_link, inverse_link_mu_d1_for_inverse_link,
     inverse_link_pdffourth_derivative_for_inverse_link,
@@ -4699,7 +4701,7 @@ fn xt_diag_x_design(design: &DesignMatrix, diag: &Array1<f64>) -> Result<Array2<
             diag.len()
         ));
     }
-    design.compute_xtwx(diag)
+    design.xt_diag_x_signed_op(SignedWeightsView::from_array(diag))
 }
 
 fn xt_diag_y_design(
