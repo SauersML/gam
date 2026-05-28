@@ -36,6 +36,7 @@ pub fn solve_arrow_newton_step_gpu(
                 ridge_beta,
                 &ArrowSolveOptions::automatic(sys.k),
             )
+            .map(|(dt, db, _diag)| (dt, db))
         }
         Err(ArrowSchurGpuFailure::GpuRequiresDenseSystem { .. }) => {
             // Matrix-free H_ββ or H_tβ operators present — the dense GPU
@@ -46,6 +47,7 @@ pub fn solve_arrow_newton_step_gpu(
             let mut opts = ArrowSolveOptions::automatic(sys.k);
             opts.mode = ArrowSolverMode::InexactPCG;
             sys.solve_with_options(ridge_t, ridge_beta, &opts)
+                .map(|(dt, db, _diag)| (dt, db))
         }
         Err(ArrowSchurGpuFailure::RidgeBumpRequired { row, bump }) => {
             Err(ArrowSchurError::PerRowFactorFailed {

@@ -615,17 +615,33 @@ extern "C" __global__ void chol_logdet_col_major(
             .memcpy_htod(penalty_step_col.as_ref(), &mut ws.penalty_dev)
             .map_err(|e| format!("upload penalty: {e}"))?;
 
-        // H_step = XᵀWX + (S + step_lm_lambda·I) for the Newton solve only.
-        geam_add(
-            &ws.blas,
-            &ws.stream,
-            p,
-            &ws.xtwx_dev,
-            &ws.penalty_dev,
-            &mut ws.h_dev,
-        )?;
+        // Apply Qs rotation: H_xtx = Qsᵀ · XᵀWX · Qs (two p×p gemms).
+        // Matches solve_step_on_stream_device_inplace (#269 resident-X arch):
+        // X_original stays device-resident, Qs rotates into transformed frame.
+        {
+            let cfg_aq = GemmConfig::<f64> {
+                transa: cublasOperation_t::CUBLAS_OP_N, transb: cublasOperation_t::CUBLAS_OP_N,
+                m: p_i, n: p_i, k: p_i, alpha: 1.0, lda: p_i, ldb: p_i, beta: 0.0, ldc: p_i,
+            };
+            // SAFETY: xtwx_dev and qs_dev p*p col-major; qs_tmp_dev p*p output.
+            unsafe { ws.blas.gemm(cfg_aq, &ws.xtwx_dev, &ws.qs_dev, &mut ws.qs_tmp_dev) }
+                .map_err(|e| format!("dgemm A·Qs (host-input step): {e}"))?;
+        }
+        {
+            let cfg_qt = GemmConfig::<f64> {
+                transa: cublasOperation_t::CUBLAS_OP_T, transb: cublasOperation_t::CUBLAS_OP_N,
+                m: p_i, n: p_i, k: p_i, alpha: 1.0, lda: p_i, ldb: p_i, beta: 0.0, ldc: p_i,
+            };
+            // SAFETY: qs_dev p*p (transposed); qs_tmp_dev p*p; h_dev p*p output.
+            unsafe { ws.blas.gemm(cfg_qt, &ws.qs_dev, &ws.qs_tmp_dev, &mut ws.h_dev) }
+                .map_err(|e| format!("dgemm Qsᵀ·A·Qs (host-input step): {e}"))?;
+        }
+        // H_step = Qsᵀ·XᵀWX·Qs + (S + step_lm_lambda·I).
+        geam_add(&ws.blas, &ws.stream, p, &ws.h_dev, &ws.penalty_dev, &mut ws.h_dev)?;
 
         // Upload gradient into the persistent RHS buffer.
+        // `input.gradient` is already in transformed coordinates (Qsᵀ-projected
+        // by the caller), so no additional rotation is needed here.
         let g_slice = input
             .gradient
             .as_slice()
@@ -634,17 +650,25 @@ extern "C" __global__ void chol_logdet_col_major(
             .memcpy_htod(g_slice, &mut ws.rhs_dev)
             .map_err(|e| format!("upload gradient: {e}"))?;
 
-        // Exported penalised Hessian: H_final = XᵀWX + S + objective_ridge·I.
-        // Download XᵀWX and add the objective ridge on the host so LM damping
+        // Exported penalised Hessian: H_final = Qsᵀ·XᵀWX·Qs + S + objective_ridge·I.
+        // Apply Qs rotation host-side on the downloaded XᵀWX so LM damping
         // never contaminates exported EDF / REML curvature / RidgePassport.
         let xtwx_col = ws
             .stream
             .clone_dtoh(&ws.xtwx_dev)
-            .map_err(|e| format!("download XᵀWX: {e}"))?;
+            .map_err(|e| format!("download XᵀWX (host-input step): {e}"))?;
         let xtwx_host =
             from_col_major(&xtwx_col, p, p).ok_or("XᵀWX layout conversion failed")?;
+        let qs_col = ws
+            .stream
+            .clone_dtoh(&ws.qs_dev)
+            .map_err(|e| format!("download Qs (host-input step): {e}"))?;
+        let qs_host = from_col_major(&qs_col, p, p)
+            .ok_or("Qs layout conversion failed (host-input step)")?;
+        let tmp_aq = xtwx_host.dot(&qs_host);
+        let h_rotated = qs_host.t().dot(&tmp_aq);
         let penalty_export = penalty_with_ridge(input.penalty_hessian, input.objective_ridge);
-        let penalized_hessian = xtwx_host + &penalty_export;
+        let penalized_hessian = h_rotated + &penalty_export;
 
         // Factor + solve in place on the stream using pre-allocated workspace
         // and info buffers — no per-step allocation, no per-step info download.
@@ -683,21 +707,9 @@ extern "C" __global__ void chol_logdet_col_major(
         check_deferred_potrf_info(&ws.stream, &ws.potrf_info_dev)?;
         check_deferred_potrs_info(&ws.stream, &ws.potrs_info_dev)?;
 
-        // Iterative refinement: one fp64 residual-correction step driven by
-        // the measured solve residual ‖g − H·x‖ / ‖g‖.
-        //
-        // Operates entirely at fp64 using the Cholesky factor already resident
-        // in `h_dev`. The residual is computed on the host (only p-vector
-        // arithmetic; `xtwx_host` was already downloaded). The policy gates
-        // the attempt on `p ≥ REFINEMENT_MIN_P` so the extra POTRS cost is
-        // negligible relative to the factorisation for large systems.
-        let g_slice = input
-            .gradient
-            .as_slice()
-            .ok_or("gradient must be contiguous for refinement")?;
-        // penalized_hessian = XtWX + S + objective_ridge·I.
-        // The Newton solve used H_step = XtWX + S + step_lm_lambda·I.
-        // So H_step = penalized_hessian + (step_lm_lambda - objective_ridge)·I.
+        // Iterative refinement on the Qs-rotated system.
+        // penalized_hessian = Qsᵀ·XtWX·Qs + S + objective_ridge·I.
+        // H_step = penalized_hessian + (step_lm_lambda − objective_ridge)·I.
         let lm_ridge_delta = input.step_lm_lambda - input.objective_ridge;
         let direction_raw = newton_step_refine_once(
             &ws.solver,

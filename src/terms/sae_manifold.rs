@@ -2673,6 +2673,7 @@ impl SaeManifoldTerm {
         // (`ridge_ext_coord`, `ridge_beta`) as the base damping. No new
         // tuning knobs — just the existing proximal-correction schedule.
         sys.solve_with_lm_escalation(ridge_ext_coord, ridge_beta)
+            .map(|(delta_t, delta_beta, _diag)| (delta_t, delta_beta))
     }
 
     pub fn apply_newton_step(
@@ -2843,7 +2844,7 @@ impl SaeManifoldTerm {
             // factor-failure error variants so legitimate, non-recoverable
             // errors (PCG divergence with no factor failure, adaptive-step
             // exhaustion, …) still surface immediately.
-            let (delta_ext_coord, delta_beta) = sys
+            let (delta_ext_coord, delta_beta, _diag) = sys
                 .solve_with_lm_escalation(ridge_ext_coord, ridge_beta)
                 .map_err(|err| format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}"))?;
             let directional_decrease = sae_manifold_newton_directional_decrease(

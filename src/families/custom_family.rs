@@ -15489,6 +15489,41 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             break;
         }
 
+        // ── Timing-driven adaptive early-exit (#289) ────────────────────────
+        // Mirror the EMA predicate from the PIRLS LM loop: when iterations
+        // become trivially cheap AND the objective/step are near-stationary,
+        // accept convergence rather than spinning to inner_max_cycles.
+        // Only fires after ≥2 data points so the EMA is meaningful.
+        let cycle_secs = cycle_start.elapsed().as_secs_f64();
+        let ema = match ema_cycle_secs {
+            None => cycle_secs,
+            Some(prev) => 0.3 * cycle_secs + 0.7 * prev,
+        };
+        ema_cycle_secs = Some(ema);
+        if cycle >= 2 {
+            let cycle_cheap = ema > 0.0 && cycle_secs < 0.25 * ema;
+            let f_abs = lastobjective.abs().max(1.0);
+            let deviance_ok = (objective_change / f_abs) < inner_tol * 10.0;
+            let step_ok = if initial_objective.abs() > 0.0 && objective_change.is_finite() {
+                (objective_change / initial_objective.abs().max(1.0)) < inner_tol * 10.0
+            } else {
+                false
+            };
+            if cycle_cheap && deviance_ok && step_ok {
+                log::info!(
+                    "[PIRLS/blockwise] cycle {} timing-driven adaptive early-exit: \
+                     cycle={:.4}s ema={:.4}s obj_rel={:.3e}",
+                    cycle,
+                    cycle_secs,
+                    ema,
+                    objective_change / f_abs,
+                );
+                converged = true;
+                break;
+            }
+        }
+        // ── end timing-driven adaptive early-exit ────────────────────────────
+
         if max_accepted_beta_step <= step_tol && objective_change <= objective_tol {
             if exact_joint_stationarity_ok || max_proposed_beta_step <= step_tol {
                 converged = true;
