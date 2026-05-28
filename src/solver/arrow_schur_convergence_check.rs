@@ -184,13 +184,15 @@ fn min_shifted_row_eigenvalue(
 ) -> f64 {
     let mut min_eval = f64::INFINITY;
     for (row_idx, row) in sys.rows.iter().enumerate() {
-        if row.htt.dim() != (sys.d, sys.d)
-            || row.htbeta.dim() != (sys.d, sys.k)
-            || row.gt.len() != sys.d
+        let di = row.htt.nrows();
+        if row.htt.ncols() != di
+            || row.htbeta.nrows() != di
+            || row.htbeta.ncols() != sys.k
+            || row.gt.len() != di
         {
             issues.push(issue(
                 ArrowConvergenceIssueSeverity::Failure,
-                "arrow-Schur row dimensions do not match system dimensions",
+                "arrow-Schur row dimensions are inconsistent",
             ));
             return f64::NAN;
         }
@@ -205,7 +207,7 @@ fn min_shifted_row_eigenvalue(
             return f64::NAN;
         }
         let mut shifted = row.htt.clone();
-        for j in 0..sys.d {
+        for j in 0..di {
             shifted[[j, j]] += ridge;
         }
         let (lo, _) = symmetric_eigenvalue_bounds(&shifted);
@@ -279,13 +281,14 @@ fn schur_condition_number(
 fn build_shifted_schur(sys: &ArrowSchurSystem, ridge: f64) -> Option<Array2<f64>> {
     let mut schur = sys.hbb.clone();
     for row in sys.rows.iter() {
+        let di = row.htt.nrows();
         let mut htt = row.htt.clone();
-        for j in 0..sys.d {
+        for j in 0..di {
             htt[[j, j]] += ridge;
         }
         let factor = cholesky_lower_local(&htt)?;
         let solved = chol_solve_matrix_local(&factor, &row.htbeta);
-        for c in 0..sys.d {
+        for c in 0..di {
             for a in 0..sys.k {
                 let left = row.htbeta[[c, a]];
                 if left == 0.0 {

@@ -617,7 +617,6 @@ extern "C" __global__ void chol_logdet_col_major(
             &ws.solver,
             &ws.stream,
             p,
-            ws.potrf_lwork,
             &ws.h_dev,
             &mut ws.rhs_dev,
             &mut ws.potrs_info_dev,
@@ -981,13 +980,13 @@ extern "C" __global__ void chol_logdet_col_major(
         let p = shared.p;
 
         // XtWX via fused path (no n*p WX temp) or fallback ddgmm + dgemm.
-        let n_i = to_i32(n)?;
-        let p_i = to_i32(p)?;
         if let Some(ref mut wx_dev_rh) = ws.wx_dev {
             // Large-p fallback: WX = diag(w_hessian) · X.
             left_scale_rows_borrowed(
                 &ws.blas, &ws.stream, n, p, &shared.x_original_dev, w_hessian_dev, wx_dev_rh,
             )?;
+            let n_i = to_i32(n)?;
+            let p_i = to_i32(p)?;
             let gemm_cfg = GemmConfig::<f64> {
                 transa: cublasOperation_t::CUBLAS_OP_T,
                 transb: cublasOperation_t::CUBLAS_OP_N,

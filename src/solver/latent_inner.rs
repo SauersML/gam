@@ -421,8 +421,8 @@ fn system_gradient_norm_sq(sys: &ArrowSchurSystem) -> f64 {
         acc += sys.gb[j] * sys.gb[j];
     }
     for row in &sys.rows {
-        for c in 0..sys.d {
-            acc += row.gt[c] * row.gt[c];
+        for &v in row.gt.iter() {
+            acc += v * v;
         }
     }
     acc

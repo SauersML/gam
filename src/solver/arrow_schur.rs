@@ -2456,7 +2456,7 @@ where
     let grad_norm = arrow_gradient_norm(sys);
     if grad_norm <= correction.gradient_tolerance.max(0.0) {
         return Ok(ArrowAcceptedProximalStep {
-            delta_t: Array1::<f64>::zeros(sys.rows.len() * sys.d),
+            delta_t: Array1::<f64>::zeros(sys.row_offsets[sys.rows.len()]),
             delta_beta: Array1::<f64>::zeros(sys.k),
             ridge_t: base_ridge_t,
             ridge_beta: base_ridge_beta,
@@ -2532,7 +2532,8 @@ pub fn arrow_damped_quadratic_model_reduction(
     ridge_t: f64,
     ridge_beta: f64,
 ) -> Result<f64, ArrowSchurError> {
-    assert_eq!(delta_t.len(), sys.rows.len() * sys.d);
+    let total_len = sys.row_offsets[sys.rows.len()];
+    assert_eq!(delta_t.len(), total_len);
     assert_eq!(delta_beta.len(), sys.k);
     let mut lin = sys.gb.dot(&delta_beta);
     let mut quad = ridge_beta * delta_beta.dot(&delta_beta);
@@ -2549,20 +2550,23 @@ pub fn arrow_damped_quadratic_model_reduction(
     }
     quad += delta_beta.dot(&hbb_delta);
 
+    // Allocate scratch at max_d; per-row slice is ..di.
     let mut htbeta_x = Array1::<f64>::zeros(sys.d);
     for (i, row) in sys.rows.iter().enumerate() {
-        let base = i * sys.d;
+        let di = sys.row_dims[i];
+        let row_base = sys.row_offsets[i];
         // H_tβ^(i) · Δβ via helper (routes through htbeta_matvec when present).
-        htbeta_x.fill(0.0);
-        sys_htbeta_apply_row(sys, i, row, delta_beta, &mut htbeta_x);
-        for c in 0..sys.d {
-            let dt_c = delta_t[base + c];
+        let mut htbeta_x_i = htbeta_x.slice_mut(ndarray::s![..di]).to_owned();
+        htbeta_x_i.fill(0.0);
+        sys_htbeta_apply_row(sys, i, row, delta_beta, &mut htbeta_x_i);
+        for c in 0..di {
+            let dt_c = delta_t[row_base + c];
             lin += row.gt[c] * dt_c;
             quad += ridge_t * dt_c * dt_c;
-            for r in 0..sys.d {
-                quad += dt_c * row.htt[[c, r]] * delta_t[base + r];
+            for r in 0..di {
+                quad += dt_c * row.htt[[c, r]] * delta_t[row_base + r];
             }
-            quad += 2.0 * dt_c * htbeta_x[c];
+            quad += 2.0 * dt_c * htbeta_x_i[c];
         }
     }
 
