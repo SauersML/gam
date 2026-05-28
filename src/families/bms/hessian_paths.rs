@@ -4,26 +4,26 @@ use super::*;
 /// when the psi derivative lives in a single channel (marginal or logslope).
 pub(super) struct BlockPsiRow {
     /// Which parameter block (0 = marginal, 1 = logslope).
-    block_idx: usize,
+    pub(super) block_idx: usize,
     /// Coefficient range in global (flat) space for this block.
-    range: std::ops::Range<usize>,
+    pub(super) range: std::ops::Range<usize>,
     /// The p_block-length psi design derivative row.
-    local_vec: Array1<f64>,
+    pub(super) local_vec: Array1<f64>,
 }
 
 pub(super) struct PsiAxisSpec {
-    block_idx: usize,
-    idx_primary: usize,
-    psi_map: crate::families::custom_family::PsiDesignMap,
+    pub(super) block_idx: usize,
+    pub(super) idx_primary: usize,
+    pub(super) psi_map: crate::families::custom_family::PsiDesignMap,
 }
 
 #[derive(Clone)]
 pub(super) struct BlockSlices {
-    marginal: std::ops::Range<usize>,
-    logslope: std::ops::Range<usize>,
-    h: Option<std::ops::Range<usize>>,
-    w: Option<std::ops::Range<usize>>,
-    total: usize,
+    pub(super) marginal: std::ops::Range<usize>,
+    pub(super) logslope: std::ops::Range<usize>,
+    pub(super) h: Option<std::ops::Range<usize>>,
+    pub(super) w: Option<std::ops::Range<usize>>,
+    pub(super) total: usize,
 }
 
 pub(super) fn block_slices(family: &BernoulliMarginalSlopeFamily) -> BlockSlices {
@@ -53,11 +53,11 @@ pub(super) fn block_slices(family: &BernoulliMarginalSlopeFamily) -> BlockSlices
 
 #[derive(Clone)]
 pub(super) struct PrimarySlices {
-    q: usize,
-    logslope: usize,
-    h: Option<std::ops::Range<usize>>,
-    w: Option<std::ops::Range<usize>>,
-    total: usize,
+    pub(super) q: usize,
+    pub(super) logslope: usize,
+    pub(super) h: Option<std::ops::Range<usize>>,
+    pub(super) w: Option<std::ops::Range<usize>>,
+    pub(super) total: usize,
 }
 
 pub(super) fn primary_slices(slices: &BlockSlices) -> PrimarySlices {
@@ -90,10 +90,10 @@ pub(super) fn primary_slices(slices: &BlockSlices) -> PrimarySlices {
 // is avoiding O(n * (p_m^2 + p_g^2)) dense accumulation into a full p*p target.
 
 pub(super) struct BernoulliBlockHessianAccumulator {
-    h_mm: Array2<f64>,
-    h_gg: Array2<f64>,
-    h_mg: Array2<f64>,
-    dense_correction: Option<Array2<f64>>,
+    pub(super) h_mm: Array2<f64>,
+    pub(super) h_gg: Array2<f64>,
+    pub(super) h_mg: Array2<f64>,
+    pub(super) dense_correction: Option<Array2<f64>>,
 }
 
 impl BernoulliBlockHessianAccumulator {
@@ -616,13 +616,13 @@ impl BernoulliBlockHessianAccumulator {
 /// for h/w cross-blocks.  Matvec is O(p_m^2 + p_g^2 + p_m*p_g) for the block part,
 /// plus O(p_total^2) only if h/w blocks exist (which is rare and tiny).
 pub(super) struct BernoulliBlockHessianOperator {
-    h_mm: Array2<f64>,
-    h_gg: Array2<f64>,
-    h_mg: Array2<f64>,
-    dense_correction: Option<Array2<f64>>,
-    marginal: std::ops::Range<usize>,
-    logslope: std::ops::Range<usize>,
-    total: usize,
+    pub(super) h_mm: Array2<f64>,
+    pub(super) h_gg: Array2<f64>,
+    pub(super) h_mg: Array2<f64>,
+    pub(super) dense_correction: Option<Array2<f64>>,
+    pub(super) marginal: std::ops::Range<usize>,
+    pub(super) logslope: std::ops::Range<usize>,
+    pub(super) total: usize,
 }
 
 impl HyperOperator for BernoulliBlockHessianOperator {
@@ -708,12 +708,12 @@ impl HyperOperator for BernoulliBlockHessianOperator {
 
 #[derive(Clone)]
 pub(super) struct CachedDenestedCellMoments {
-    partition_cell: exact_kernel::DenestedPartitionCell,
+    pub(super) partition_cell: exact_kernel::DenestedPartitionCell,
     /// Cell-moment state evaluated at this row's converged intercept for the
     /// current PIRLS/Newton cycle. Stored at whatever `max_degree` the cache
     /// was built with (degree 9 for the per-row lazy fallback; up to degree
     /// 21 for the pre-built `RowCellMomentsBundle`).
-    state: exact_kernel::CellDerivativeMomentState,
+    pub(super) state: exact_kernel::CellDerivativeMomentState,
 }
 
 /// Pre-built per-row cell moments for the current β snapshot. Built once at
@@ -722,8 +722,8 @@ pub(super) struct CachedDenestedCellMoments {
 /// same β.
 #[derive(Clone)]
 pub(super) struct RowCellMomentsBundle {
-    max_degree: usize,
-    rows: Vec<Option<Vec<CachedDenestedCellMoments>>>,
+    pub(super) max_degree: usize,
+    pub(super) rows: Vec<Option<Vec<CachedDenestedCellMoments>>>,
 }
 
 impl RowCellMomentsBundle {
@@ -763,43 +763,43 @@ impl RowCellMomentsBundle {
 
 #[derive(Clone)]
 pub(super) struct BernoulliMarginalSlopeRowExactContext {
-    intercept: f64,
-    m_a: f64,
-    intercept_fast_path: bool,
+    pub(super) intercept: f64,
+    pub(super) m_a: f64,
+    pub(super) intercept_fast_path: bool,
     /// Degree-9 per-row cell moments at the converged row intercept. The
     /// top-of-cycle [`RowCellMomentsBundle`] (built at degree 9) is preferred
     /// when present; this field remains the per-row lazy fallback for callers
     /// without a bundle (e.g. legacy direct call sites).
-    degree9_cells: Option<Vec<CachedDenestedCellMoments>>,
+    pub(super) degree9_cells: Option<Vec<CachedDenestedCellMoments>>,
 }
 
 pub(super) struct BernoulliMarginalSlopeFlexRowScratch {
-    m_u: Array1<f64>,
-    m_au: Array1<f64>,
-    m_uv: Array2<f64>,
-    a_u: Array1<f64>,
-    a_uv: Array2<f64>,
-    rho: Array1<f64>,
-    tau: Array1<f64>,
-    du: Array1<f64>,
-    grad: Array1<f64>,
-    hess: Array2<f64>,
+    pub(super) m_u: Array1<f64>,
+    pub(super) m_au: Array1<f64>,
+    pub(super) m_uv: Array2<f64>,
+    pub(super) a_u: Array1<f64>,
+    pub(super) a_uv: Array2<f64>,
+    pub(super) rho: Array1<f64>,
+    pub(super) tau: Array1<f64>,
+    pub(super) du: Array1<f64>,
+    pub(super) grad: Array1<f64>,
+    pub(super) hess: Array2<f64>,
     // Per-row [f64; 4] coefficient buffers used by the flex analytic path. Owned
     // by the scratch so the hot path never allocates a fresh `Vec` per row.
-    coeff_u: Vec<[f64; 4]>,
-    coeff_au: Vec<[f64; 4]>,
-    coeff_bu: Vec<[f64; 4]>,
-    g_u_fixed: Vec<[f64; 4]>,
-    g_au_fixed: Vec<[f64; 4]>,
-    g_bu_fixed: Vec<[f64; 4]>,
+    pub(super) coeff_u: Vec<[f64; 4]>,
+    pub(super) coeff_au: Vec<[f64; 4]>,
+    pub(super) coeff_bu: Vec<[f64; 4]>,
+    pub(super) g_u_fixed: Vec<[f64; 4]>,
+    pub(super) g_au_fixed: Vec<[f64; 4]>,
+    pub(super) g_bu_fixed: Vec<[f64; 4]>,
     // Per-cell eta_u buffer for the empirical-grid branch; reused across cells
     // and rows. `Vec<f64>` rather than `Array1` because indexing as
     // `eta_u[idx]` after a `clear()`/`resize()` matches the previous code path.
-    eta_u_cell: Vec<f64>,
+    pub(super) eta_u_cell: Vec<f64>,
     // Constant zero coeff slice shared by every SparsePrimaryCoeffJetView call
     // that needs `aa_first..bbb_first`. Sized to `primary_dim` once and never
     // mutated thereafter.
-    zero_family: Vec<[f64; 4]>,
+    pub(super) zero_family: Vec<[f64; 4]>,
 }
 
 impl BernoulliMarginalSlopeFlexRowScratch {
@@ -899,15 +899,15 @@ pub(super) const COEFF_SUPPORT_W: CoeffSupport = CoeffSupport {
 };
 
 pub(super) struct BernoulliExactNewtonAccumulator {
-    ll: f64,
-    grad_marginal: Array1<f64>,
-    grad_logslope: Array1<f64>,
-    hess_marginal: Array2<f64>,
-    hess_logslope: Array2<f64>,
-    grad_h: Option<Array1<f64>>,
-    grad_w: Option<Array1<f64>>,
-    hess_h: Option<Array2<f64>>,
-    hess_w: Option<Array2<f64>>,
+    pub(super) ll: f64,
+    pub(super) grad_marginal: Array1<f64>,
+    pub(super) grad_logslope: Array1<f64>,
+    pub(super) hess_marginal: Array2<f64>,
+    pub(super) hess_logslope: Array2<f64>,
+    pub(super) grad_h: Option<Array1<f64>>,
+    pub(super) grad_w: Option<Array1<f64>>,
+    pub(super) hess_h: Option<Array2<f64>>,
+    pub(super) hess_w: Option<Array2<f64>>,
 }
 
 impl BernoulliExactNewtonAccumulator {

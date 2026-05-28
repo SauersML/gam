@@ -43,13 +43,13 @@ use super::install_flex::validate_spec;
 /// Designs are pre-densified at construction to avoid repeated materialisation.
 struct BmsMarginalJacobian {
     /// Dense marginal design: n × p_m.
-    marginal_dense: Arc<Array2<f64>>,
+    pub(super) marginal_dense: Arc<Array2<f64>>,
     /// Dense logslope design: n × p_s.
-    logslope_dense: Arc<Array2<f64>>,
-    offset_m: Array1<f64>,
-    offset_s: Array1<f64>,
+    pub(super) logslope_dense: Arc<Array2<f64>>,
+    pub(super) offset_m: Array1<f64>,
+    pub(super) offset_s: Array1<f64>,
     /// Number of marginal columns (= size of β_m slice in the full β vector).
-    p_marginal: usize,
+    pub(super) p_marginal: usize,
 }
 
 impl BlockEffectiveJacobian for BmsMarginalJacobian {
@@ -102,14 +102,14 @@ impl BlockEffectiveJacobian for BmsMarginalJacobian {
 /// Designs are pre-densified at construction to avoid repeated materialisation.
 struct BmsLogslopeJacobian {
     /// Dense marginal design: n × p_m.
-    marginal_dense: Arc<Array2<f64>>,
+    pub(super) marginal_dense: Arc<Array2<f64>>,
     /// Dense logslope design: n × p_s.
-    logslope_dense: Arc<Array2<f64>>,
-    offset_m: Array1<f64>,
-    offset_s: Array1<f64>,
-    z: Arc<[f64]>,
+    pub(super) logslope_dense: Arc<Array2<f64>>,
+    pub(super) offset_m: Array1<f64>,
+    pub(super) offset_s: Array1<f64>,
+    pub(super) z: Arc<[f64]>,
     /// Number of marginal columns (= start of β_s in the full β vector).
-    p_marginal: usize,
+    pub(super) p_marginal: usize,
 }
 
 impl BlockEffectiveJacobian for BmsLogslopeJacobian {

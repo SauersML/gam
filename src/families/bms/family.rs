@@ -3,28 +3,28 @@ use super::*;
 
 #[derive(Clone)]
 pub(super) struct BernoulliMarginalSlopeFamily {
-    y: Arc<Array1<f64>>,
-    weights: Arc<Array1<f64>>,
-    z: Arc<Array1<f64>>,
-    latent_measure: LatentMeasureKind,
-    gaussian_frailty_sd: Option<f64>,
-    base_link: InverseLink,
-    marginal_design: DesignMatrix,
-    logslope_design: DesignMatrix,
-    score_warp: Option<DeviationRuntime>,
-    link_dev: Option<DeviationRuntime>,
+    pub(super) y: Arc<Array1<f64>>,
+    pub(super) weights: Arc<Array1<f64>>,
+    pub(super) z: Arc<Array1<f64>>,
+    pub(super) latent_measure: LatentMeasureKind,
+    pub(super) gaussian_frailty_sd: Option<f64>,
+    pub(super) base_link: InverseLink,
+    pub(super) marginal_design: DesignMatrix,
+    pub(super) logslope_design: DesignMatrix,
+    pub(super) score_warp: Option<DeviationRuntime>,
+    pub(super) link_dev: Option<DeviationRuntime>,
     /// Resource policy controlling materialization decisions for psi design
     /// resolution and other size-sensitive helpers invoked during exact-Newton
     /// joint psi calculus. Threaded from the fit entry point so biobank-scale
     /// runs pick up the caller's analytic-operator preference instead of an
     /// inline default.
-    policy: crate::resource::ResourcePolicy,
+    pub(super) policy: crate::resource::ResourcePolicy,
     /// Fit-lifetime byte-limited LRU for de-nested cubic cell moments. The key
     /// is the exact bit pattern of `(c0, c1, c2, c3, left, right)`, so reuse
     /// across PIRLS cycles is safe only for byte-identical cells while LRU
     /// eviction never changes numerical results.
-    cell_moment_lru: Arc<exact_kernel::CellMomentLruCache>,
-    cell_moment_cache_stats: Arc<exact_kernel::CellMomentCacheStats>,
+    pub(super) cell_moment_lru: Arc<exact_kernel::CellMomentLruCache>,
+    pub(super) cell_moment_cache_stats: Arc<exact_kernel::CellMomentCacheStats>,
     /// Per-row warm-start cache for the scalar intercept root-finder
     /// (`solve_row_intercept_base`). The intercept `a` is solved per row at
     /// every inner PIRLS iteration; without a warm start, each call burns
@@ -40,7 +40,7 @@ pub(super) struct BernoulliMarginalSlopeFamily {
     /// `BernoulliMarginalSlopeFamily` directly without running the full fit
     /// pipeline; production paths go through `make_family` which initialises
     /// the cache to length-`n` NaN.
-    intercept_warm_starts: Option<Arc<BernoulliInterceptWarmStartCache>>,
+    pub(super) intercept_warm_starts: Option<Arc<BernoulliInterceptWarmStartCache>>,
     /// Per-fit counter of outer rho-gradient evaluations. Increments
     /// on every call to `batched_outer_gradient_terms`. Drives the
     /// two-phase auto-subsample schedule: while
@@ -54,7 +54,7 @@ pub(super) struct BernoulliMarginalSlopeFamily {
     /// Each new fit constructs a fresh family (the counter starts at
     /// zero), so the schedule resets per fit without any cross-fit
     /// leakage. Atomic so the field is safe to clone via Arc.
-    auto_subsample_phase_counter: Arc<std::sync::atomic::AtomicUsize>,
+    pub(super) auto_subsample_phase_counter: Arc<std::sync::atomic::AtomicUsize>,
     /// Last ρ vector at which the auto-subsample phase counter was
     /// bumped. BFGS line searches re-call `batched_outer_gradient_terms`
     /// at the same ρ during step-size retries; without this guard the
@@ -65,7 +65,7 @@ pub(super) struct BernoulliMarginalSlopeFamily {
     /// minimal coordination needed: the counter+last_rho pair must be
     /// updated atomically so two threads cannot both decide "new ρ" and
     /// double-bump.
-    auto_subsample_last_rho: Arc<Mutex<Option<Array1<f64>>>>,
+    pub(super) auto_subsample_last_rho: Arc<Mutex<Option<Array1<f64>>>>,
 }
 
 /// Number of outer-gradient evaluations the auto-subsample schedule
@@ -80,9 +80,9 @@ pub(super) struct BernoulliMarginalSlopeFamily {
 
 #[derive(Clone)]
 pub(super) struct BernoulliInterceptPredictorWarmStart {
-    intercept: f64,
-    primary_point: Vec<f64>,
-    intercept_primary_deriv: Vec<f64>,
+    pub(super) intercept: f64,
+    pub(super) primary_point: Vec<f64>,
+    pub(super) intercept_primary_deriv: Vec<f64>,
 }
 
 /// Per-row warm-start cache for the scalar intercept root-finder.
@@ -105,9 +105,9 @@ pub(super) struct BernoulliInterceptPredictorWarmStart {
 /// torn read where another thread interleaved a tag bump between the value
 /// read and the second tag load.
 pub(super) struct BernoulliInterceptWarmStartCache {
-    intercept_value: Vec<AtomicU64>,
-    intercept_tag: Vec<AtomicU64>,
-    predictors: Vec<Mutex<Option<BernoulliInterceptPredictorWarmStart>>>,
+    pub(super) intercept_value: Vec<AtomicU64>,
+    pub(super) intercept_tag: Vec<AtomicU64>,
+    pub(super) predictors: Vec<Mutex<Option<BernoulliInterceptPredictorWarmStart>>>,
 }
 
 impl BernoulliInterceptWarmStartCache {
@@ -302,10 +302,10 @@ pub(super) fn hash_intercept_warm_start_key_flex(
 
 #[derive(Clone, Default)]
 pub(super) struct ThetaHints {
-    marginal_beta: Option<Array1<f64>>,
-    logslope_beta: Option<Array1<f64>>,
-    score_warp_beta: Option<Array1<f64>>,
-    link_dev_beta: Option<Array1<f64>>,
+    pub(super) marginal_beta: Option<Array1<f64>>,
+    pub(super) logslope_beta: Option<Array1<f64>>,
+    pub(super) score_warp_beta: Option<Array1<f64>>,
+    pub(super) link_dev_beta: Option<Array1<f64>>,
 }
 
 pub(crate) fn build_score_warp_deviation_block_from_seed(

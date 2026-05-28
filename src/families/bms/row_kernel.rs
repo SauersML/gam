@@ -8,9 +8,9 @@ use super::exact_eval_cache::*;
 // ── RowKernel<2> implementation (rigid path only) ────────────────────
 
 pub(super) struct BernoulliRigidRowKernel {
-    family: BernoulliMarginalSlopeFamily,
-    block_states: Vec<ParameterBlockState>,
-    slices: BlockSlices,
+    pub(super) family: BernoulliMarginalSlopeFamily,
+    pub(super) block_states: Vec<ParameterBlockState>,
+    pub(super) slices: BlockSlices,
     /// Per-row uncontracted third-derivative tensor, lazily populated in a
     /// single parallel pass on first access. Every ψ-axis directional
     /// derivative operator that consults this kernel shares this cache via
@@ -18,14 +18,14 @@ pub(super) struct BernoulliRigidRowKernel {
     /// runs at most once per row across the full ext-dim sweep, instead of
     /// once per (row, ψ-axis) pair. Per-axis `row_third_contracted` becomes
     /// a 2×2 bilinear contraction against the cached tensor.
-    third_full_cache: crate::resource::RayonSafeOnce<Vec<[[[f64; 2]; 2]; 2]>>,
+    pub(super) third_full_cache: crate::resource::RayonSafeOnce<Vec<[[[f64; 2]; 2]; 2]>>,
     /// Per-row uncontracted fourth-derivative tensor — the outer-Hessian
     /// analogue of `third_full_cache`. The second-directional-derivative
     /// operator's trace path touches every row × (u, v) pair; with this
     /// cache the heavy 8-direction empirical jet (or closed-form 5-component
     /// build) runs at most once per row, leaving each pair with a cheap
     /// [`contract_fourth_full`] bilinear.
-    fourth_full_cache: crate::resource::RayonSafeOnce<Vec<[[[[f64; 2]; 2]; 2]; 2]>>,
+    pub(super) fourth_full_cache: crate::resource::RayonSafeOnce<Vec<[[[[f64; 2]; 2]; 2]; 2]>>,
 }
 
 impl BernoulliRigidRowKernel {
@@ -360,36 +360,36 @@ fn axis_jf_via_column_dot(
 }
 
 pub(super) struct BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
-    family: BernoulliMarginalSlopeFamily,
-    block_states: Vec<ParameterBlockState>,
-    cache: Arc<BernoulliMarginalSlopeExactEvalCache>,
-    matvec_calls: AtomicUsize,
-    fused_gradient_dense: OnceLock<Result<Arc<ExactNewtonJointFusedDenseEvaluation>, String>>,
+    pub(super) family: BernoulliMarginalSlopeFamily,
+    pub(super) block_states: Vec<ParameterBlockState>,
+    pub(super) cache: Arc<BernoulliMarginalSlopeExactEvalCache>,
+    pub(super) matvec_calls: AtomicUsize,
+    pub(super) fused_gradient_dense: OnceLock<Result<Arc<ExactNewtonJointFusedDenseEvaluation>, String>>,
     /// Outer-only joint-Hessian directional-derivative options. The
     /// `outer_score_subsample` field is the row mask threaded through the
     /// `_with_options` directional-derivative helpers so the cached joint
     /// Hessian Hv-action paths can downscale to the stratified subsample at
     /// biobank scale. When `None`, the row iteration is identical to the
     /// legacy full-data path.
-    options: BlockwiseFitOptions,
+    pub(super) options: BlockwiseFitOptions,
 }
 
 pub(super) struct ExactNewtonJointFusedDenseEvaluation {
-    gradient: ExactNewtonJointGradientEvaluation,
-    hessian: Array2<f64>,
+    pub(super) gradient: ExactNewtonJointGradientEvaluation,
+    pub(super) hessian: Array2<f64>,
 }
 
 pub(super) struct BernoulliMarginalSlopeExactNewtonJointPsiWorkspace {
-    family: BernoulliMarginalSlopeFamily,
-    block_states: Vec<ParameterBlockState>,
-    specs: Vec<ParameterBlockSpec>,
-    derivative_blocks: Vec<Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>>,
-    cache: Arc<BernoulliMarginalSlopeExactEvalCache>,
+    pub(super) family: BernoulliMarginalSlopeFamily,
+    pub(super) block_states: Vec<ParameterBlockState>,
+    pub(super) specs: Vec<ParameterBlockSpec>,
+    pub(super) derivative_blocks: Vec<Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>>,
+    pub(super) cache: Arc<BernoulliMarginalSlopeExactEvalCache>,
     /// Outer-only ψ-calculus options. The `outer_score_subsample` field is
     /// the row mask threaded through `sigma_exact_joint_psi_terms_with_options`
     /// and the second-order / Hessian-drift counterparts to make the cached
     /// ψ calculus subsample-aware.
-    options: BlockwiseFitOptions,
+    pub(super) options: BlockwiseFitOptions,
 }
 
 

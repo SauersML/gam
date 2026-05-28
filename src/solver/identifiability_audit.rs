@@ -512,7 +512,7 @@ pub fn audit_identifiability(
         // eta_row_scaling = None this is a no-op (J = design).
         let dense = spec
             .effective_jacobian_at("identifiability_audit::audit_identifiability", &init_state)
-            .map_err(|e| format!("identifiability audit: {e}"))?;
+            .map_err(|e| EstimationError::LayoutError(format!("identifiability audit: {e}")))?;
         let p_block = dense.ncols();
         let block_singular = block_pivoted_qr_diagonal(&dense)?;
         let block_rank = count_rank(&block_singular, n, p_block);
@@ -637,14 +637,16 @@ pub fn audit_identifiability(
     }
     let rrqr = if priority_perm_is_identity {
         rrqr_with_permutation(&x_joint, default_rrqr_rank_alpha())
-            .map_err(|e| format!("identifiability audit joint RRQR failed: {e:?}"))?
+            .map_err(|e| EstimationError::LayoutError(format!("identifiability audit joint RRQR failed: {e:?}")))?
     } else {
         let mut x_priority = Array2::<f64>::zeros((n, p_total));
         for (new_j, &old_j) in priority_perm.iter().enumerate() {
             x_priority.column_mut(new_j).assign(&x_joint.column(old_j));
         }
         rrqr_with_permutation(&x_priority, default_rrqr_rank_alpha()).map_err(|e| {
-            format!("identifiability audit joint RRQR (priority-ordered) failed: {e:?}")
+            EstimationError::LayoutError(format!(
+                "identifiability audit joint RRQR (priority-ordered) failed: {e:?}"
+            ))
         })?
     };
     log::info!(
@@ -1214,7 +1216,7 @@ pub fn audit_identifiability_channel_aware(
             .take(operators.len())
             .collect();
     let compiled = compile_with_dual_metric(operators, row_hess, &id_struct, &ordering)
-        .map_err(|e| format!("audit_identifiability_channel_aware compile failed: {e:?}"))?;
+        .map_err(|e| EstimationError::LayoutError(format!("audit_identifiability_channel_aware compile failed: {e:?}")))?;
 
     // Build per-block identity entries from the compiled output.
     let mut blocks: Vec<BlockIdentity> = Vec::with_capacity(specs.len());
@@ -1760,7 +1762,7 @@ pub fn check_map_uniqueness(
     let mut null_dirs: Vec<(f64, usize)> = evals
         .iter()
         .enumerate()
-        .filter(|(_, &lam)| lam < null_tol)
+        .filter(|&(_, &lam)| lam < null_tol)
         .map(|(idx, &lam)| (lam, idx))
         .collect();
     null_dirs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
