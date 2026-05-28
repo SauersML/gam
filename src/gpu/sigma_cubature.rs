@@ -126,7 +126,7 @@ pub fn try_gpu_sigma_stream_pool_eval(
     gamma_shape: f64,
     convergence_tol: f64,
     max_iter: usize,
-) -> Result<Option<Vec<crate::solver::estimate::reml::eval::SigmaPointResult>>, GpuError> {
+) -> Result<Option<Vec<Option<(ndarray::Array2<f64>, ndarray::Array1<f64>)>>>, GpuError> {
     if per_sigma.is_empty() {
         return Ok(Some(Vec::new()));
     }
@@ -174,8 +174,8 @@ mod linux_impl {
     use crate::gpu::policy::{PirlsLoopCurvatureKind, PirlsLoopFamilyKind};
     use crate::gpu::sigma_cubature::SigmaPointGpuInput;
     use crate::linalg::utils::matrix_inversewith_regularization;
-    use crate::solver::estimate::reml::eval::SigmaPointResult;
-    use ndarray::{Array1, ArrayView1};
+    use ndarray::{Array1, Array2, ArrayView1};
+    type SigmaPointResult = Option<(Array2<f64>, Array1<f64>)>;
 
     pub(super) fn family_kind_to_row(f: PirlsLoopFamilyKind) -> Option<PirlsRowFamily> {
         match f {

@@ -252,7 +252,12 @@ pub fn canonicalize_for_identifiability(
             nullspace_dims: Vec::new(),
             initial_log_lambdas: spec.initial_log_lambdas.clone(),
             initial_beta: reduced_initial_beta,
-            gauge_priority: 100,
+            gauge_priority: spec.gauge_priority,
+            // The reduction operates on raw-column selection; the
+            // effective linear-predictor scaling is unchanged after
+            // column selection (the surviving columns still carry the
+            // same per-row scaling as in the original spec).
+            eta_row_scaling: spec.eta_row_scaling.clone(),
         });
         per_block_transform.push(t_i);
     }
@@ -337,6 +342,7 @@ mod tests {
             initial_log_lambdas: Array1::<f64>::zeros(0),
             initial_beta: None,
             gauge_priority: 100,
+            eta_row_scaling: None,
         }
     }
 
@@ -419,18 +425,16 @@ mod tests {
     /// > logslope=120 > score_warp=80 > link_dev=60). The joint design
     /// has a 4-D null space among the five constants.
     ///
-    /// Under the fail-closed contract, canonicalisation must refuse this
-    /// configuration with `IdentifiabilityFailure` — naming the
-    /// offending alias and giving the caller a millisecond diagnostic
-    /// instead of a downstream singular-Hessian panic. The
-    /// gauge_priority field still influences which alias pair the audit
-    /// flags first (lowest-priority block's column is the one named in
-    /// the dropped_columns attribution), but the canonicalise step does
-    /// not act on that attribution until Phase 4b of the
-    /// identifiability_compiler threads compiled designs through the
-    /// family construction sites.
+    /// Under the gauge-aware contract the canonicalisation must SUCCEED
+    /// (not refuse) because the distinct `gauge_priority` values provide
+    /// an unambiguous ordering for which columns to drop. The
+    /// priority-ordered RRQR demotes the lowest-priority participants;
+    /// the canonical-gauge pipeline applies the column-selection matrices
+    /// and proceeds with reduced specs.  `time_surface` (highest priority)
+    /// must retain all its columns; every attributed drop must belong to
+    /// one of the four lower-priority blocks.
     #[test]
-    fn canonical_five_block_gauge_ownership_refuses_with_attribution() {
+    fn canonical_five_block_gauge_ownership_succeeds_with_attribution() {
         let n = 96;
         let x = linspace(n);
         // Each block carries `ones(n)` in column 0 (the shared-constant
@@ -472,41 +476,41 @@ mod tests {
         l_spec.gauge_priority = 60;
         let specs = [t_spec, m_spec, g_spec, w_spec, l_spec];
 
-        let err = canonicalize_for_identifiability(&specs)
-            .expect_err("five-block aliased joint must refuse-not-reduce under fail-closed gate");
-        let audit = match err {
-            CustomFamilyError::IdentifiabilityFailure { audit } => audit,
-            other => panic!("expected IdentifiabilityFailure, got {other:?}"),
-        };
+        // With distinct gauge_priority values, the audit recognises that
+        // the rank deficiency is gauge-resolvable and returns Ok (non-fatal).
+        // The canonical-gauge pipeline proceeds with the column reductions.
+        let canon = canonicalize_for_identifiability(&specs)
+            .expect("five-block aliased joint with distinct gauge_priority must succeed (gauge-resolved)");
+
+        // The audit stored in canon.audit must be non-fatal.
         assert!(
-            audit.fatal,
-            "audit must be fatal on a joint-rank-deficient five-block design; got {}",
-            audit.summary,
+            !canon.audit.fatal,
+            "audit must be non-fatal when gauge_priority is non-trivial and \
+             all drops are attributed to lower-priority blocks; got {}",
+            canon.audit.summary,
         );
+
         // Raw p_total = 3+3+3+2+2 = 13; expected rank = 13 − 4 = 9.
-        // Audit's per-block effective_dim sum equals joint_rank by
-        // construction of the attribution loop.
-        let total_kept: usize = audit.blocks.iter().map(|b| b.effective_dim).sum();
+        // Audit's per-block effective_dim sum equals joint_rank.
+        let total_kept: usize = canon.audit.blocks.iter().map(|b| b.effective_dim).sum();
         assert_eq!(
             total_kept,
             9,
             "expected joint rank = 13 − 4 = 9 reported by audit; got {total_kept} \
              (per-block effective_dim {:?})",
-            audit
+            canon
+                .audit
                 .blocks
                 .iter()
                 .map(|b| (b.block_name.clone(), b.effective_dim))
                 .collect::<Vec<_>>(),
         );
-        // Gauge-priority attribution: dropped_columns are the four
-        // columns RRQR demoted past the joint rank threshold. With
-        // priority-descending column ordering, the time_surface block
-        // (highest priority) must NOT appear among the attributed
-        // drops — every attributed drop belongs to one of the four
-        // lower-priority blocks. This is the ownership contract the
-        // audit enforces independent of whether canonicalisation
-        // applies a reduction.
-        for drop in &audit.dropped_columns {
+
+        // Gauge-priority attribution: with priority-descending column ordering,
+        // the time_surface block (highest priority = 200) must NOT appear among
+        // the attributed drops — every attributed drop belongs to one of the
+        // four lower-priority blocks.
+        for drop in &canon.audit.dropped_columns {
             assert_ne!(
                 drop.block, "time_surface",
                 "highest-priority block must never be the attributed drop \
@@ -514,6 +518,21 @@ mod tests {
                  ({drop:?})",
             );
         }
+
+        // The reduced specs must have 9 total columns (rank = 9).
+        let reduced_total: usize = canon.reduced_specs.iter().map(|s| s.design.ncols()).sum();
+        assert_eq!(
+            reduced_total,
+            9,
+            "reduced specs must have joint rank = 9 total columns; got {reduced_total}",
+        );
+
+        // time_surface retains all 3 of its columns (highest priority, never dropped).
+        assert_eq!(
+            canon.reduced_specs[0].design.ncols(),
+            3,
+            "time_surface must retain all 3 columns after gauge canonicalisation",
+        );
     }
 
     /// On a clean (non-fatal) configuration with a non-trivial penalty,

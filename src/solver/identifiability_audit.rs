@@ -57,9 +57,10 @@
 //
 // | Condition | `fatal` | Action |
 // |-----------|---------|--------|
-// | Joint rank < joint columns AND attributed drops exist | true | `IdentifiabilityFailure` |
-// | Joint rank < joint columns, no attribution (>2-way alias) | true | `IdentifiabilityFailure` |
-// | Any pairwise overlap ≥ `HARD_HALT_OVERLAP_THRESHOLD` (0.99) | true | `IdentifiabilityFailure` |
+// | Joint rank deficient, gauge cannot resolve (same priority or no attribution) | true | `IdentifiabilityFailure` |
+// | Joint rank deficient, gauge resolves (distinct priorities, full attribution to lower-priority blocks) | false | gauge-attributed drops message |
+// | Cross-block overlap ≥ `HARD_HALT_OVERLAP_THRESHOLD` (0.99), same-priority blocks | true | `IdentifiabilityFailure` |
+// | Cross-block overlap ≥ `HARD_HALT_OVERLAP_THRESHOLD` (0.99), distinct-priority blocks | false | gauge-attributed drops message |
 // | Any pairwise overlap in `[ALIAS_OVERLAP_REPORTING_THRESHOLD, 0.99)` | false | INFO log |
 // | All blocks clean | false | silent pass |
 //
@@ -233,7 +234,7 @@ pub fn audit_identifiability(specs: &[ParameterBlockSpec]) -> Result<Identifiabi
     let block_heartbeat = (n.saturating_mul(specs.len()) >= 1_000_000)
         .then(crate::util::heartbeat::Heartbeat::default_interval);
     for (idx, spec) in specs.iter().enumerate() {
-        let dense = spec
+        let dense_raw = spec
             .design
             .try_to_dense_arc(&format!(
                 "identifiability_audit::audit_identifiability block '{}'",
@@ -241,6 +242,34 @@ pub fn audit_identifiability(specs: &[ParameterBlockSpec]) -> Result<Identifiabi
             ))?
             .as_ref()
             .clone();
+        // Apply per-row eta scaling when the block specifies it.  For
+        // blocks whose linear-predictor contribution is
+        // `scaling_i · basis_row_i · β` (e.g. the logslope block in
+        // survival marginal-slope where `scaling_i = z_i`), the raw
+        // basis rows look identical to the marginal block's rows and the
+        // flat RRQR flags them as aliases.  Using the scaled rows gives
+        // the correct independence picture.
+        let dense = if let Some(ref scaling) = spec.eta_row_scaling {
+            if scaling.len() != n {
+                return Err(format!(
+                    "identifiability audit: block '{}' eta_row_scaling length {} \
+                     != design nrows {}",
+                    spec.name,
+                    scaling.len(),
+                    n,
+                ));
+            }
+            let mut scaled = dense_raw.clone();
+            for i in 0..n {
+                let s = scaling[i];
+                for j in 0..dense_raw.ncols() {
+                    scaled[[i, j]] *= s;
+                }
+            }
+            scaled
+        } else {
+            dense_raw
+        };
         let p_block = dense.ncols();
         let block_singular = block_pivoted_qr_diagonal(&dense)?;
         let block_rank = count_rank(&block_singular, n, p_block);
@@ -1149,6 +1178,7 @@ mod tests {
             initial_log_lambdas: Array1::<f64>::zeros(0),
             initial_beta: None,
             gauge_priority: 100,
+            eta_row_scaling: None,
         }
     }
 
