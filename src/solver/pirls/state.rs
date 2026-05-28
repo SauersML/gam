@@ -11,6 +11,15 @@ use super::{
     compute_observed_hessian_curvature_arrays, computeworkingweight_derivatives_from_eta,
 };
 
+/// Which curvature operator was used to assemble the Hessian: Fisher
+/// information (expected curvature) vs Observed information (raw
+/// second derivative of the negative log-likelihood at the current β).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HessianCurvatureKind {
+    Fisher,
+    Observed,
+}
+
 /// Whether the solve operates in sparse-native or dense-transformed coordinates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PirlsLinearSolvePath {

@@ -29,7 +29,7 @@ pub(super) struct BernoulliRigidRowKernel {
 }
 
 impl BernoulliRigidRowKernel {
-    fn new(family: BernoulliMarginalSlopeFamily, block_states: Vec<ParameterBlockState>) -> Self {
+    pub(super) fn new(family: BernoulliMarginalSlopeFamily, block_states: Vec<ParameterBlockState>) -> Self {
         let slices = block_slices(&family);
         Self {
             family,
@@ -48,7 +48,7 @@ impl BernoulliRigidRowKernel {
     /// likelihood is non-finite at the converged β snapshot — propagate via
     /// panic, mirroring how every other kernel-level numerical contract in
     /// this module surfaces post-PIRLS invariant violations.
-    fn third_full_cache(&self) -> &[[[[f64; 2]; 2]; 2]] {
+    pub(super) fn third_full_cache(&self) -> &[[[[f64; 2]; 2]; 2]] {
         self.third_full_cache
             .get_or_compute(|| {
                 (0..self.family.y.len())
@@ -76,7 +76,7 @@ impl BernoulliRigidRowKernel {
     /// `row_fourth_contracted` so each (u, v) ψ-axis pair finishes in a
     /// 16-multiply [`contract_fourth_full`] bilinear instead of triggering
     /// a fresh empirical-grid 8-direction jet.
-    fn fourth_full_cache(&self) -> &[[[[[f64; 2]; 2]; 2]; 2]] {
+    pub(super) fn fourth_full_cache(&self) -> &[[[[[f64; 2]; 2]; 2]; 2]] {
         self.fourth_full_cache
             .get_or_compute(|| {
                 (0..self.family.y.len())
@@ -99,14 +99,14 @@ impl BernoulliRigidRowKernel {
 }
 
 impl RowKernel<2> for BernoulliRigidRowKernel {
-    fn n_rows(&self) -> usize {
+    pub(super) fn n_rows(&self) -> usize {
         self.family.y.len()
     }
-    fn n_coefficients(&self) -> usize {
+    pub(super) fn n_coefficients(&self) -> usize {
         self.slices.total
     }
 
-    fn row_kernel(&self, row: usize) -> Result<(f64, [f64; 2], [[f64; 2]; 2]), String> {
+    pub(super) fn row_kernel(&self, row: usize) -> Result<(f64, [f64; 2], [[f64; 2]; 2]), String> {
         let marginal_eta = self.block_states[0].eta[row];
         let marginal = self.family.marginal_link_map(marginal_eta)?;
         let g = self.block_states[1].eta[row];
@@ -114,7 +114,7 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
             .rigid_row_kernel_eval(row, marginal_eta, marginal, g)
     }
 
-    fn jacobian_action(&self, row: usize, d_beta: &[f64]) -> [f64; 2] {
+    pub(super) fn jacobian_action(&self, row: usize, d_beta: &[f64]) -> [f64; 2] {
         let d_beta = ndarray::ArrayView1::from(d_beta);
         [
             self.family
@@ -126,7 +126,7 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
         ]
     }
 
-    fn jacobian_transpose_action(&self, row: usize, v: &[f64; 2], out: &mut [f64]) {
+    pub(super) fn jacobian_transpose_action(&self, row: usize, v: &[f64; 2], out: &mut [f64]) {
         {
             let mut m = ndarray::ArrayViewMut1::from(&mut out[self.slices.marginal.clone()]);
             self.family
@@ -143,7 +143,7 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
         }
     }
 
-    fn add_pullback_hessian(&self, row: usize, h: &[[f64; 2]; 2], target: &mut Array2<f64>) {
+    pub(super) fn add_pullback_hessian(&self, row: usize, h: &[[f64; 2]; 2], target: &mut Array2<f64>) {
         self.family
             .marginal_design
             .syr_row_into_view(
@@ -194,7 +194,7 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
             .expect("logslope syr dim mismatch");
     }
 
-    fn add_diagonal_quadratic(&self, row: usize, h: &[[f64; 2]; 2], diag: &mut [f64]) {
+    pub(super) fn add_diagonal_quadratic(&self, row: usize, h: &[[f64; 2]; 2], diag: &mut [f64]) {
         {
             let mut md = ndarray::ArrayViewMut1::from(&mut diag[self.slices.marginal.clone()]);
             self.family
@@ -211,7 +211,7 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
         }
     }
 
-    fn row_third_contracted(&self, row: usize, dir: &[f64; 2]) -> Result<[[f64; 2]; 2], String> {
+    pub(super) fn row_third_contracted(&self, row: usize, dir: &[f64; 2]) -> Result<[[f64; 2]; 2], String> {
         let cache = self.third_full_cache();
         Ok(contract_third_full(&cache[row], dir[0], dir[1]))
     }
@@ -221,7 +221,7 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
     /// before any outer `par_iter` enters; subsequent
     /// `row_third_contracted` calls inside the parallel ext-idx sweep then
     /// hit a populated cache and skip straight to a 2×2 contraction.
-    fn warm_up_directional_caches(&self) -> Result<(), String> {
+    pub(super) fn warm_up_directional_caches(&self) -> Result<(), String> {
         // Touch both caches so their parallel builds run here, not later
         // (nested inside the outer ext-idx par_iter where the lock-holder
         // thread would have to do each row pass alone).
@@ -236,7 +236,7 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
         Ok(())
     }
 
-    fn row_fourth_contracted(
+    pub(super) fn row_fourth_contracted(
         &self,
         row: usize,
         dir_u: &[f64; 2],
@@ -276,7 +276,7 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
     /// `jf[r, k * rank + c] = jacobian_action(r, F[:, c])[k]` exactly
     /// (it's the same arithmetic in a different order — BLAS-3
     /// summation reduces in-row).
-    fn jacobian_action_matrix(&self, factor: ArrayView2<'_, f64>) -> Option<Array2<f64>> {
+    pub(super) fn jacobian_action_matrix(&self, factor: ArrayView2<'_, f64>) -> Option<Array2<f64>> {
         let p_total = self.slices.total;
         if factor.nrows() != p_total {
             return None;

@@ -40,7 +40,7 @@ pub(super) enum RowPrimaryHessianCacheReason {
 }
 
 impl RowPrimaryHessianCacheReason {
-    const fn as_str(self) -> &'static str {
+    pub(super) const fn as_str(self) -> &'static str {
         match self {
             Self::ReuseTooLow => "reuse_too_low",
             Self::SingleCacheExceedsRamFraction => "single_cache_exceeds_ram_fraction",
@@ -125,7 +125,7 @@ pub(crate) struct RowPrimaryEvalPin {
 }
 
 impl RowPrimaryEvalPin {
-    fn new(neglog: Array1<f64>, grad: Array2<f64>, hess: Array2<f64>, bytes: u64) -> Self {
+    pub(super) fn new(neglog: Array1<f64>, grad: Array2<f64>, hess: Array2<f64>, bytes: u64) -> Self {
         bms_row_primary_hessian_pinned_bytes().fetch_add(bytes, Ordering::AcqRel);
         Self {
             neglog,
@@ -135,21 +135,21 @@ impl RowPrimaryEvalPin {
         }
     }
 
-    fn neglog(&self) -> &Array1<f64> {
+    pub(super) fn neglog(&self) -> &Array1<f64> {
         &self.neglog
     }
 
-    fn grad(&self) -> &Array2<f64> {
+    pub(super) fn grad(&self) -> &Array2<f64> {
         &self.grad
     }
 
-    fn hess(&self) -> &Array2<f64> {
+    pub(super) fn hess(&self) -> &Array2<f64> {
         &self.hess
     }
 }
 
 impl Drop for RowPrimaryEvalPin {
-    fn drop(&mut self) {
+    pub(super) fn drop(&mut self) {
         bms_row_primary_hessian_pinned_bytes().fetch_sub(self.bytes, Ordering::AcqRel);
     }
 }
