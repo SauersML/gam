@@ -97,7 +97,7 @@ impl PirlsRowFamily {
         }
     }
 
-    /// CUDA `extern "C"` entry symbol for this family's row kernel.
+    /// CUDA `extern "C"` entry symbol for this family's full (final-row) kernel.
     pub const fn kernel_name(self) -> &'static str {
         match self {
             Self::BernoulliLogit => "pirls_row_bernoulli_logit",
@@ -106,6 +106,33 @@ impl PirlsRowFamily {
             Self::PoissonLog => "pirls_row_poisson_log",
             Self::GaussianIdentity => "pirls_row_gaussian_identity",
             Self::GammaLog => "pirls_row_gamma_log",
+        }
+    }
+
+    /// CUDA `extern "C"` entry symbol for this family's solve-row kernel
+    /// (writes only `grad_eta`, `w_solver`, `deviance`, `status`).
+    pub const fn solve_kernel_name(self) -> &'static str {
+        match self {
+            Self::BernoulliLogit => "pirls_solve_bernoulli_logit",
+            Self::BernoulliProbit => "pirls_solve_bernoulli_probit",
+            Self::BernoulliCLogLog => "pirls_solve_bernoulli_cloglog",
+            Self::PoissonLog => "pirls_solve_poisson_log",
+            Self::GaussianIdentity => "pirls_solve_gaussian_identity",
+            Self::GammaLog => "pirls_solve_gamma_log",
+        }
+    }
+
+    /// CUDA `extern "C"` entry symbol for this family's alpha-ladder kernel
+    /// (evaluates all step sizes in a single launch, outputs `objective[]` and
+    /// `status[]` per alpha slot).
+    pub const fn ladder_kernel_name(self) -> &'static str {
+        match self {
+            Self::BernoulliLogit => "pirls_ladder_bernoulli_logit",
+            Self::BernoulliProbit => "pirls_ladder_bernoulli_probit",
+            Self::BernoulliCLogLog => "pirls_ladder_bernoulli_cloglog",
+            Self::PoissonLog => "pirls_ladder_poisson_log",
+            Self::GaussianIdentity => "pirls_ladder_gaussian_identity",
+            Self::GammaLog => "pirls_ladder_gamma_log",
         }
     }
 
@@ -680,11 +707,25 @@ struct PirlsRowBackendLinux {
     jit_modules: Mutex<std::collections::HashMap<JitKey, Arc<CudaModule>>>,
 }
 
+/// Distinguishes the three kernel modes in the per-process module cache.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum KernelMode {
+    /// Full final-row kernel (9 outputs: mu, grad_eta, w_fisher, w_hessian,
+    /// w_solver, z_fisher, z_hessian, deviance, status).
+    FinalRow,
+    /// Solve-row kernel (4 outputs: grad_eta, w_solver, deviance, status).
+    SolveRow,
+    /// Alpha-ladder kernel (2 per-alpha outputs: objective[], status[]).
+    AlphaLadder,
+}
+
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct ModuleKey {
     family: PirlsRowFamily,
     curvature: CurvatureMode,
+    mode: KernelMode,
 }
 
 impl PirlsRowBackend {
@@ -735,14 +776,19 @@ impl PirlsRowBackend {
         })
     }
 
-    /// Compile (or fetch from cache) the kernel module for `(family, curvature)`.
+    /// Compile (or fetch from cache) the **final-row** kernel module for
+    /// `(family, curvature)`. Writes all 9 output fields.
     #[cfg(target_os = "linux")]
     pub fn module_for(
         &self,
         family: PirlsRowFamily,
         curvature: CurvatureMode,
     ) -> Result<Arc<CudaModule>, GpuError> {
-        let key = ModuleKey { family, curvature };
+        let key = ModuleKey {
+            family,
+            curvature,
+            mode: KernelMode::FinalRow,
+        };
         if let Some(existing) = self
             .inner
             .modules
@@ -769,6 +815,94 @@ impl PirlsRowBackend {
             .modules
             .lock()
             .gpu_ctx("pirls_row module cache mutex poisoned")?
+            .insert(key, module.clone());
+        Ok(module)
+    }
+
+    /// Compile (or fetch from cache) the **solve-row** kernel module for
+    /// `(family, curvature)`. Writes only `grad_eta`, `w_solver`, `deviance`,
+    /// `status` — used on every hot Newton iteration.
+    #[cfg(target_os = "linux")]
+    pub fn module_for_solve(
+        &self,
+        family: PirlsRowFamily,
+        curvature: CurvatureMode,
+    ) -> Result<Arc<CudaModule>, GpuError> {
+        let key = ModuleKey {
+            family,
+            curvature,
+            mode: KernelMode::SolveRow,
+        };
+        if let Some(existing) = self
+            .inner
+            .modules
+            .lock()
+            .gpu_ctx("pirls_row solve module cache mutex poisoned")?
+            .get(&key)
+        {
+            return Ok(existing.clone());
+        }
+        let source = solve_row_source_for(family, curvature);
+        let ptx = cudarc::nvrtc::compile_ptx(source).gpu_ctx_with(|err| {
+            format!(
+                "pirls_row solve NVRTC compile failed for {family}/{curv}: {err}",
+                family = family.as_str(),
+                curv = curvature.as_str(),
+            )
+        })?;
+        let module = self
+            .inner
+            .ctx
+            .load_module(ptx)
+            .gpu_ctx("pirls_row solve module load failed")?;
+        self.inner
+            .modules
+            .lock()
+            .gpu_ctx("pirls_row solve module cache mutex poisoned")?
+            .insert(key, module.clone());
+        Ok(module)
+    }
+
+    /// Compile (or fetch from cache) the **alpha-ladder** kernel module for
+    /// `(family, curvature)`. Evaluates all [`ALPHA_LADDER_LEN`] step sizes in
+    /// a single launch, accumulating `objective[]` and `status[]` per alpha slot.
+    #[cfg(target_os = "linux")]
+    pub fn module_for_ladder(
+        &self,
+        family: PirlsRowFamily,
+        curvature: CurvatureMode,
+    ) -> Result<Arc<CudaModule>, GpuError> {
+        let key = ModuleKey {
+            family,
+            curvature,
+            mode: KernelMode::AlphaLadder,
+        };
+        if let Some(existing) = self
+            .inner
+            .modules
+            .lock()
+            .gpu_ctx("pirls_row ladder module cache mutex poisoned")?
+            .get(&key)
+        {
+            return Ok(existing.clone());
+        }
+        let source = ladder_source_for(family, curvature);
+        let ptx = cudarc::nvrtc::compile_ptx(source).gpu_ctx_with(|err| {
+            format!(
+                "pirls_row ladder NVRTC compile failed for {family}/{curv}: {err}",
+                family = family.as_str(),
+                curv = curvature.as_str(),
+            )
+        })?;
+        let module = self
+            .inner
+            .ctx
+            .load_module(ptx)
+            .gpu_ctx("pirls_row ladder module load failed")?;
+        self.inner
+            .modules
+            .lock()
+            .gpu_ctx("pirls_row ladder module cache mutex poisoned")?
             .insert(key, module.clone());
         Ok(module)
     }
@@ -1666,6 +1800,147 @@ fn bernoulli_cloglog_body(curvature: CurvatureMode) -> String {
     double z_h = z_f;
     if (!(isfinite(y_i) && y_i >= 0.0 && y_i <= 1.0)) flags |= 0x8u;
 "#
+    )
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// solve-row CUDA source (4-output variant)
+// ────────────────────────────────────────────────────────────────────────
+
+/// Build the solve-row CUDA source for `(family, curvature)`.
+///
+/// The kernel has a reduced signature:
+///   `(int n, const f64* eta, const f64* y, const f64* prior_w,
+///     f64* grad_eta_out, f64* w_solver_out, f64* deviance_out, u32* status_out)`
+///
+/// It executes the same per-family math as `cuda_source_for` but skips the
+/// `mu`, `w_fisher`, `w_hessian`, `z_fisher`, `z_hessian` stores, reducing
+/// both bandwidth and L1/register pressure in the hot Newton iteration.
+#[cfg(target_os = "linux")]
+fn solve_row_source_for(family: PirlsRowFamily, curvature: CurvatureMode) -> String {
+    let body = match family {
+        PirlsRowFamily::GaussianIdentity => gaussian_identity_body(curvature),
+        PirlsRowFamily::PoissonLog => poisson_log_body(curvature),
+        PirlsRowFamily::GammaLog => gamma_log_body(curvature),
+        PirlsRowFamily::BernoulliLogit => bernoulli_logit_body(curvature),
+        PirlsRowFamily::BernoulliProbit => bernoulli_probit_body(curvature),
+        PirlsRowFamily::BernoulliCLogLog => bernoulli_cloglog_body(curvature),
+    };
+    let kernel_name = family.solve_kernel_name();
+    let curvature_define = match curvature {
+        CurvatureMode::Fisher => "#define PIRLS_CURVATURE_FISHER 1",
+        CurvatureMode::Observed => "#define PIRLS_CURVATURE_OBSERVED 1",
+    };
+    format!(
+        r#"
+{curvature_define}
+{prolog}
+
+extern "C" __global__ void {kernel_name}(
+    int            n,
+    const double* __restrict__ eta,
+    const double* __restrict__ y,
+    const double* __restrict__ prior_w,
+    double* __restrict__ grad_eta_out,
+    double* __restrict__ w_solver_out,
+    double* __restrict__ deviance_out,
+    unsigned int* __restrict__ status_out
+) {{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    unsigned int flags = 0u;
+    double eta_i = eta[i];
+    double y_i = y[i];
+    double wp = prior_w[i] > 0.0 ? prior_w[i] : 0.0;
+    if (prior_w[i] <= 0.0) flags |= 0x10u;
+{body}
+    grad_eta_out[i] = grad_eta;
+    w_solver_out[i] = w_solver;
+    deviance_out[i] = dev;
+    status_out[i] = flags;
+}}
+"#,
+        prolog = COMMON_DEVICE_PROLOG,
+    )
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// alpha-ladder CUDA source (fused all-alpha candidate-objective kernel)
+// ────────────────────────────────────────────────────────────────────────
+
+/// The alpha constants embedded into the ladder kernel source as a
+/// `__constant__` array. Must stay in sync with [`ALPHA_LADDER`].
+#[cfg(target_os = "linux")]
+const ALPHA_LADDER_CUDA_ARRAY: &str =
+    "__constant__ double PIRLS_ALPHAS[7] = {1.0, 0.5, 0.25, 0.125, 0.0625, 0.03125, 0.015625};";
+
+/// Build the fused alpha-ladder CUDA source for `(family, curvature)`.
+///
+/// Grid layout: `grid = (row_blocks, ALPHA_LADDER_LEN, 1)`.
+///   - `blockIdx.y` selects the alpha slot `k`.
+///   - `blockIdx.x * blockDim.x + threadIdx.x` selects row `i`.
+///
+/// Each thread evaluates `eta_trial = eta[i] + PIRLS_ALPHAS[k] * xd[i]`,
+/// runs the per-family deviance math, and atomically adds to
+/// `objective_out[k]` (double-precision atomic add) and OR-accumulates into
+/// `status_out[k]` (atomic OR on u32).
+///
+/// The kernel signature is:
+///   `(int n, const f64* eta, const f64* xd, const f64* y, const f64* prior_w,
+///     f64* objective_out, u32* status_out)`
+#[cfg(target_os = "linux")]
+fn ladder_source_for(family: PirlsRowFamily, curvature: CurvatureMode) -> String {
+    let body = match family {
+        PirlsRowFamily::GaussianIdentity => gaussian_identity_body(curvature),
+        PirlsRowFamily::PoissonLog => poisson_log_body(curvature),
+        PirlsRowFamily::GammaLog => gamma_log_body(curvature),
+        PirlsRowFamily::BernoulliLogit => bernoulli_logit_body(curvature),
+        PirlsRowFamily::BernoulliProbit => bernoulli_probit_body(curvature),
+        PirlsRowFamily::BernoulliCLogLog => bernoulli_cloglog_body(curvature),
+    };
+    let kernel_name = family.ladder_kernel_name();
+    let curvature_define = match curvature {
+        CurvatureMode::Fisher => "#define PIRLS_CURVATURE_FISHER 1",
+        CurvatureMode::Observed => "#define PIRLS_CURVATURE_OBSERVED 1",
+    };
+    // The body uses the name `eta_i` for the (possibly clamped) linear predictor.
+    // For the ladder we substitute `eta[i] + alpha * xd[i]` as the trial eta,
+    // so we define `eta_i` before the body runs. The body's own local variable
+    // of the same name overwrites it in families that clamp eta (e.g. Poisson,
+    // Bernoulli), which is correct — the per-family body reassigns `eta_c` from
+    // the (now trial-eta-valued) `eta_i`. For GaussianIdentity the body reads
+    // `eta_i` directly as `mu`, which is also correct after the substitution.
+    format!(
+        r#"
+{curvature_define}
+{prolog}
+{alphas}
+
+extern "C" __global__ void {kernel_name}(
+    int            n,
+    const double* __restrict__ eta,
+    const double* __restrict__ xd,
+    const double* __restrict__ y,
+    const double* __restrict__ prior_w,
+    double* __restrict__ objective_out,
+    unsigned int* __restrict__ status_out
+) {{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int k = (int)blockIdx.y;
+    if (i >= n) return;
+    unsigned int flags = 0u;
+    double alpha = PIRLS_ALPHAS[k];
+    double eta_i = eta[i] + alpha * xd[i];
+    double y_i = y[i];
+    double wp = prior_w[i] > 0.0 ? prior_w[i] : 0.0;
+    if (prior_w[i] <= 0.0) flags |= 0x10u;
+{body}
+    atomicAdd(&objective_out[k], dev);
+    atomicOr(&status_out[k], flags);
+}}
+"#,
+        prolog = COMMON_DEVICE_PROLOG,
+        alphas = ALPHA_LADDER_CUDA_ARRAY,
     )
 }
 

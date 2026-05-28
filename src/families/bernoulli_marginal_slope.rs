@@ -6185,6 +6185,44 @@ impl BernoulliMarginalSlopeFamily {
         Ok(&table[row])
     }
 
+    /// Return the lazily-built row-cell-moments bundle at `required_degree`
+    /// (15 or 21) for outer dH/d²H trace paths.
+    ///
+    /// On the first call the full-`n` bundle is built at `required_degree` and
+    /// stored in the appropriate `RayonSafeOnce` slot.  Subsequent calls — even
+    /// from concurrent Rayon workers — return the already-built bundle.  If the
+    /// FLEX path is inactive or the memory budget is exceeded the slot stores
+    /// `Ok(None)` and callers must use their per-row on-demand fallback.
+    ///
+    /// Returns `Ok(None)` for any `required_degree` outside {15, 21}; callers
+    /// handle that the same way as a missing bundle.
+    fn bundle_for_degree<'a>(
+        &self,
+        block_states: &[ParameterBlockState],
+        cache: &'a BernoulliMarginalSlopeExactEvalCache,
+        required_degree: usize,
+    ) -> Result<Option<&'a RowCellMomentsBundle>, String> {
+        let slot = match required_degree {
+            15 => &cache.row_cell_moments_d15,
+            21 => &cache.row_cell_moments_d21,
+            _ => return Ok(None),
+        };
+        // `get_or_compute` stores a `Result<Option<...>, String>` directly;
+        // the closure returns that same type (it IS T).  The outer `?` then
+        // unwraps the stored Result on every access.
+        let stored = slot.get_or_compute(|| {
+            // No subsample mask for the outer-derivative trace bundles: they
+            // must cover all rows so that every row lookup succeeds.
+            self.build_row_cell_moments_bundle(
+                block_states,
+                &cache.row_contexts,
+                required_degree,
+                None,
+            )
+        });
+        Ok(stored.as_ref().map_err(|e| e.clone())?.as_ref())
+    }
+
     /// Per-row uncontracted third-derivative tensor in the rigid path.
     ///
     /// Empirical-grid rows pay the heavy `empirical_rigid_neglog_jet` once
@@ -10522,9 +10560,8 @@ impl BernoulliMarginalSlopeFamily {
         let mut f_uv_dir = Array2::<f64>::zeros((r, r));
 
         let owned_cells;
-        let cells: &[CachedDenestedCellMoments] = if let Some(cached) = cache
-            .row_cell_moments
-            .as_ref()
+        let cells: &[CachedDenestedCellMoments] = if let Some(cached) = self
+            .bundle_for_degree(block_states, cache, 15)?
             .and_then(|bundle| bundle.row(row, 15))
         {
             cached

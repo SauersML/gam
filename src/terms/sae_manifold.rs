@@ -1966,7 +1966,66 @@ impl SaeManifoldTerm {
                     } else if self.k_atoms() == 1 && sae_penalty_is_row_block_supported(penalty) {
                         let off = self.assignment.coord_offsets()[0];
                         let coord = &self.assignment.coords[0];
-                        self.add_sae_coord_penalty(sys, off, coord, penalty, rho_local);
+                        // Isometry requires per-step cache refresh from the
+                        // atom's second jet before grad_target / hvp are live.
+                        // The registry-held IsometryPenalty was constructed
+                        // with p_out equal to the latent dim (the "t" block's
+                        // `d` in the JSON latent spec) rather than the true
+                        // decoder output dimension; we build a corrected copy
+                        // here with the right p_out and populated caches.
+                        if let AnalyticPenaltyKind::Isometry(iso) = penalty {
+                            let atom = &self.atoms[0];
+                            // Verify the atom exposes an analytic second jet.
+                            // Without it, refresh_isometry_caches_from_atom
+                            // leaves has_jacobian_second_source false and
+                            // grad_target silently returns zero — the exact
+                            // silent-no-op this issue was opened to fix.
+                            let coords_mat = coord.as_matrix();
+                            let has_second_jet = atom.basis_second_jet.is_some()
+                                || atom
+                                    .basis_evaluator
+                                    .as_ref()
+                                    .map(|e| {
+                                        e.second_jet_dyn(coords_mat.view()).is_some()
+                                    })
+                                    .unwrap_or(false);
+                            if !has_second_jet {
+                                return Err(ArrowSchurError::SchurFactorFailed {
+                                    reason: format!(
+                                        "IsometryPenalty requested for SAE atom '{}' (basis \
+                                         kind {:?}) but this evaluator does not expose an \
+                                         analytic second jet; use AffineCoordinateEvaluator, \
+                                         SphereChartEvaluator, PeriodicHarmonicEvaluator, or \
+                                         TorusHarmonicEvaluator for SAE-Isometry",
+                                        atom.name, atom.basis_kind
+                                    ),
+                                });
+                            }
+                            // The registry penalty was built with p_out equal
+                            // to the latent dim (the "t" JSON block's `d`),
+                            // but IsometryPenalty.p_out must match the atom's
+                            // decoder output dim. Clone and fix p_out.
+                            let p = atom.decoder_coefficients.ncols();
+                            let mut corrected: IsometryPenalty = (**iso).clone();
+                            corrected.p_out = p;
+                            refresh_isometry_caches_from_atom(
+                                &corrected,
+                                atom,
+                                coords_mat.view(),
+                            )
+                            .map_err(|reason| ArrowSchurError::SchurFactorFailed { reason })?;
+                            let corrected_kind =
+                                AnalyticPenaltyKind::Isometry(std::sync::Arc::new(corrected));
+                            self.add_sae_coord_penalty(
+                                sys,
+                                off,
+                                coord,
+                                &corrected_kind,
+                                rho_local,
+                            );
+                        } else {
+                            self.add_sae_coord_penalty(sys, off, coord, penalty, rho_local);
+                        }
                     } else {
                         return Err(ArrowSchurError::SchurFactorFailed {
                             reason: format!(
@@ -2637,6 +2696,7 @@ fn sae_penalty_is_row_block_supported(penalty: &AnalyticPenaltyKind) -> bool {
             | AnalyticPenaltyKind::ParametricRowPrecisionPrior(_)
             | AnalyticPenaltyKind::ScadMcp(_)
             | AnalyticPenaltyKind::BlockOrthogonality(_)
+            | AnalyticPenaltyKind::Isometry(_)
     )
 }
 

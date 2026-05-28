@@ -67,19 +67,13 @@ pub struct PirlsStepStreamDeviceInput<'a, 'b> {
     /// Real model-objective ridge. Appears in the exported
     /// `penalized_hessian` that flows to EDF / REML curvature.
     pub objective_ridge: f64,
-    /// Current coefficient vector β (length p). Used to form S·β for the
-    /// Newton RHS correction: rhs = Xᵀ·score − S·β + linear_shift.
+    /// Current coefficient vector β (length p). Downloaded to the host to
+    /// form the Newton RHS correction S·β. Only p f64 values cross the
+    /// boundary (β is small), so the round-trip cost is negligible.
     pub beta_dev: &'b cudarc::driver::CudaSlice<f64>,
-    /// Device-resident p×p penalty matrix S in column-major layout. Read
-    /// by the S·β gemv in the RHS correction.
-    pub s_dev: &'b cudarc::driver::CudaSlice<f64>,
-    /// Device-resident linear shift vector (length p). Added to Newton
-    /// RHS so the solve targets Xᵀ·score − S·β + linear_shift.
-    pub linear_shift_dev: &'b cudarc::driver::CudaSlice<f64>,
-    /// Scratch buffer for S·β (length p). Written by the p×p gemv and
-    /// subtracted from the RHS; caller owns the allocation, this borrow
-    /// is mutable only for the duration of the step call.
-    pub sb_dev: &'b mut cudarc::driver::CudaSlice<f64>,
+    /// Linear shift vector (length p) in transformed coordinates, on host.
+    /// Added to Newton RHS so the solve targets Xᵀ·score − S·β + linear_shift.
+    pub linear_shift: ArrayView1<'b, f64>,
 }
 
 /// Shared, batch-wide GPU state for stream-pool sigma-cubature PIRLS.
@@ -1094,6 +1088,11 @@ extern "C" __global__ void status_or(
         pub direction_dev: CudaSlice<f64>,
         pub xd_dev: CudaSlice<f64>,
         pub scalar_dev: CudaSlice<f64>,
+        /// Single-element u32 output buffer for the `status_or`
+        /// OR-reduction kernel.  Reused for candidate-accept checks on
+        /// every line-search step and for the post-convergence final OR
+        /// over `row_out.status`.
+        pub status_u32_dev: CudaSlice<u32>,
         pub n: usize,
         pub p: usize,
     }
@@ -1123,6 +1122,9 @@ extern "C" __global__ void status_or(
                 direction_dev: alloc_f64("direction", p)?,
                 xd_dev: alloc_f64("xd", n)?,
                 scalar_dev: alloc_f64("scalar", 1)?,
+                status_u32_dev: stream
+                    .alloc_zeros::<u32>(1)
+                    .map_err(|e| format!("pirls loop alloc status_u32: {e}"))?,
                 n,
                 p,
             })
@@ -1611,6 +1613,7 @@ extern "C" __global__ void status_or(
                     it + 1,
                     converged,
                     lm_ridge,
+                    objective_ridge,
                     extra,
                     LoopDiagnostics {
                         last_deviance_change: last_dev_delta,
@@ -1631,6 +1634,7 @@ extern "C" __global__ void status_or(
             max_iter,
             converged,
             lm_ridge,
+            objective_ridge,
             extra,
             LoopDiagnostics {
                 last_deviance_change: last_dev_delta,
@@ -2042,6 +2046,11 @@ pub fn solve_pirls_step_on_stream_device(
 /// [`cuda::pirls_loop`] for the full per-iter contract. Only a few
 /// 1-f64 scalars cross the host boundary per Newton iteration; β and
 /// the final penalised Hessian are downloaded once at loop exit.
+///
+/// `step_lm_lambda` is the Levenberg–Marquardt damping applied to each
+/// Newton solve only; it never enters the exported `penalized_hessian`,
+/// `RidgePassport`, EDF, or penalty term.  `objective_ridge` is the
+/// real model ridge that enters all of those.
 #[cfg(target_os = "linux")]
 pub fn pirls_loop_on_stream(
     shared: &PirlsGpuSharedData,
@@ -2053,7 +2062,8 @@ pub fn pirls_loop_on_stream(
     y: ndarray::ArrayView1<'_, f64>,
     prior_w: ndarray::ArrayView1<'_, f64>,
     penalty_hessian: ndarray::ArrayView2<'_, f64>,
-    lm_ridge: f64,
+    step_lm_lambda: f64,
+    objective_ridge: f64,
     max_iter: usize,
     tol: f64,
     extra: Option<&cuda::PirlsLoopExtra<'_>>,
@@ -2068,7 +2078,8 @@ pub fn pirls_loop_on_stream(
         y,
         prior_w,
         penalty_hessian,
-        lm_ridge,
+        step_lm_lambda,
+        objective_ridge,
         max_iter,
         tol,
         extra,
@@ -2746,20 +2757,30 @@ mod cpu_fallback {
                 input.gradient.len()
             ));
         }
-        let mut penalized_hessian = weighted_crossprod_cpu(input.x, input.weights)?;
+        let xtwx = weighted_crossprod_cpu(input.x, input.weights)?;
+        // Exported H_final = XᵀWX + S + objective_ridge·I.
+        let mut penalized_hessian = xtwx.clone();
         penalized_hessian += &input.penalty_hessian;
-        if input.lm_ridge != 0.0 {
+        if input.objective_ridge != 0.0 {
             for i in 0..p {
-                penalized_hessian[[i, i]] += input.lm_ridge;
+                penalized_hessian[[i, i]] += input.objective_ridge;
             }
         }
-        let factor = penalized_hessian
+        // H_step = XᵀWX + S + step_lm_lambda·I for the Newton solve only.
+        let mut h_step = xtwx;
+        h_step += &input.penalty_hessian;
+        if input.step_lm_lambda != 0.0 {
+            for i in 0..p {
+                h_step[[i, i]] += input.step_lm_lambda;
+            }
+        }
+        let factor = h_step
             .cholesky(Side::Lower)
             .map_err(|e| format!("CPU Cholesky failed in PIRLS fallback: {e:?}"))?;
         let g = Array1::from_iter(input.gradient.iter().copied());
         let mut direction = factor.solvevec(&g);
         direction.mapv_inplace(|v| -v);
-        // Penalized-Hessian Cholesky logdet = 2 * sum(log(diag(L))).
+        // Logdet comes from H_step's Cholesky (the actual factored matrix).
         let logdet = 2.0 * factor.diag().iter().map(|v| v.ln()).sum::<f64>();
         Ok(PirlsGpuStep {
             penalized_hessian,

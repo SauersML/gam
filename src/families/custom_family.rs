@@ -6642,6 +6642,39 @@ impl crate::solver::outer_strategy::OuterHessianOperator for OwnedDenseOuterHess
         Ok(self.matrix.dot(v))
     }
 
+    /// Zero-alloc override: write `matrix · v` directly into `out` using a
+    /// row-dot loop, avoiding the `matrix.dot(v)` allocation.
+    fn apply_into(
+        &self,
+        v: &Array1<f64>,
+        out: &mut Array1<f64>,
+    ) -> Result<(), String> {
+        if v.len() != self.matrix.ncols() {
+            return Err(CustomFamilyError::DimensionMismatch {
+                reason: format!(
+                    "batched dense outer Hessian apply_into input length mismatch: got {}, expected {}",
+                    v.len(),
+                    self.matrix.ncols()
+                ),
+            }
+            .into());
+        }
+        if out.len() != self.matrix.nrows() {
+            return Err(CustomFamilyError::DimensionMismatch {
+                reason: format!(
+                    "batched dense outer Hessian apply_into output length mismatch: got {}, expected {}",
+                    out.len(),
+                    self.matrix.nrows()
+                ),
+            }
+            .into());
+        }
+        for (row, cell) in self.matrix.rows().into_iter().zip(out.iter_mut()) {
+            *cell = row.dot(v);
+        }
+        Ok(())
+    }
+
     fn is_cheap_to_materialize(&self) -> bool {
         true
     }
@@ -6651,6 +6684,10 @@ struct LabeledOuterHessianOperator {
     base: Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>,
     physical_to_outer: Vec<usize>,
     outer_dim: usize,
+    /// Scratch buffers reused across `apply_into` calls to avoid
+    /// per-call allocation of the permuted input and output vectors.
+    /// `(physical_in, physical_out)`, each of length `physical_to_outer.len()`.
+    scratch: std::sync::Mutex<(ndarray::Array1<f64>, ndarray::Array1<f64>)>,
 }
 
 impl LabeledOuterHessianOperator {
@@ -6658,10 +6695,15 @@ impl LabeledOuterHessianOperator {
         base: Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>,
         layout: &PenaltyLabelLayout,
     ) -> Self {
+        let n_physical = layout.physical_to_outer.len();
         Self {
             base,
             physical_to_outer: layout.physical_to_outer.clone(),
             outer_dim: layout.initial_rho.len(),
+            scratch: std::sync::Mutex::new((
+                ndarray::Array1::zeros(n_physical),
+                ndarray::Array1::zeros(n_physical),
+            )),
         }
     }
 }
@@ -6696,6 +6738,50 @@ impl crate::solver::outer_strategy::OuterHessianOperator for LabeledOuterHessian
             out[outer_idx] += physical_out[physical_idx];
         }
         Ok(out)
+    }
+
+    /// Zero-alloc override: reuses hoisted scratch buffers to avoid the
+    /// per-call `physical` and `out` allocations in `matvec`.
+    fn apply_into(
+        &self,
+        v: &ndarray::Array1<f64>,
+        out: &mut ndarray::Array1<f64>,
+    ) -> Result<(), String> {
+        if v.len() != self.outer_dim {
+            return Err(format!(
+                "labeled outer Hessian apply_into input length mismatch: got {}, expected {}",
+                v.len(),
+                self.outer_dim
+            ));
+        }
+        if out.len() != self.outer_dim {
+            return Err(format!(
+                "labeled outer Hessian apply_into output length mismatch: got {}, expected {}",
+                out.len(),
+                self.outer_dim
+            ));
+        }
+        let mut guard = self
+            .scratch
+            .lock()
+            .map_err(|_| "labeled outer Hessian scratch lock poisoned".to_string())?;
+        let (physical_in, physical_out) = &mut *guard;
+        for (physical_idx, &outer_idx) in self.physical_to_outer.iter().enumerate() {
+            physical_in[physical_idx] = v[outer_idx];
+        }
+        self.base.apply_into(physical_in, physical_out)?;
+        if physical_out.len() != self.physical_to_outer.len() {
+            return Err(format!(
+                "labeled outer Hessian physical apply_into length mismatch: got {}, expected {}",
+                physical_out.len(),
+                self.physical_to_outer.len()
+            ));
+        }
+        out.fill(0.0);
+        for (physical_idx, &outer_idx) in self.physical_to_outer.iter().enumerate() {
+            out[outer_idx] += physical_out[physical_idx];
+        }
+        Ok(())
     }
 
     fn mul_mat(&self, factor: ndarray::ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {

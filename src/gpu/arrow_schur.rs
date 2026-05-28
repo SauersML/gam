@@ -44,6 +44,15 @@ pub enum ArrowSchurGpuFailure {
     /// Shared Schur factor failed; bordered system is rank-deficient at the
     /// requested ridges and the CPU path should handle escalation.
     SchurFactorFailed { reason: String },
+    /// The system carries matrix-free `H_ββ` or per-row `H_tβ` operators that
+    /// the dense GPU Schur path cannot consume. The caller should route to CPU
+    /// `InexactPCG` (or supply dense buffers) rather than treating this as a
+    /// numerical failure. See `gpu/arrow_schur.rs` Part B for the planned GPU
+    /// PCG path that will lift this restriction at K ≥ 5000.
+    GpuRequiresDenseSystem {
+        had_hbb_matvec: bool,
+        had_htbeta_matvec: bool,
+    },
 }
 
 /// Entry point: attempt the fully device-resident Arrow-Schur Newton solve.
@@ -57,6 +66,20 @@ pub fn solve_arrow_newton_step(
     let n = sys.rows.len();
     let d = sys.d;
     let k = sys.k;
+
+    // Detect matrix-free operators before any dim() checks so callers get a
+    // clear, actionable error instead of a generic SchurFactorFailed. The GPU
+    // dense-Schur path requires materialised H_ββ and per-row H_tβ slabs;
+    // CPU InexactPCG is the correct fallback when either operator is abstract.
+    let had_hbb_matvec = sys.hbb_matvec.is_some();
+    let had_htbeta_matvec = sys.htbeta_matvec.is_some();
+    if had_hbb_matvec || had_htbeta_matvec {
+        return Err(ArrowSchurGpuFailure::GpuRequiresDenseSystem {
+            had_hbb_matvec,
+            had_htbeta_matvec,
+        });
+    }
+
     if sys.hbb.dim() != (k, k) {
         return Err(ArrowSchurGpuFailure::SchurFactorFailed {
             reason: "CUDA arrow-Schur requires a dense shared beta block".to_string(),

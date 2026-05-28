@@ -99,6 +99,7 @@ use std::sync::Arc;
 
 use crate::cache::Fingerprinter;
 use crate::linalg::faer_ndarray::{FaerArrayView, FaerLlt};
+use crate::solver::arrow_schur_beta_graph::BetaCouplingGraph;
 use crate::terms::analytic_penalties::{AnalyticPenaltyKind, AnalyticPenaltyRegistry, PenaltyTier};
 use crate::terms::latent_coord::{LatentCoordValues, LatentManifold};
 
@@ -1552,6 +1553,100 @@ impl std::fmt::Debug for ArrowUndampedFactors {
     }
 }
 
+/// Apply `H_tβ^(row) · x` for one row, writing into `out` (length `d`).
+///
+/// Routes through `sys.htbeta_matvec` when present; otherwise indexes the dense
+/// `row.htbeta` slab.  Panics when neither is available (zero-sized block and no
+/// matvec) — callers must not invoke this when no cross-block is wired.
+fn sys_htbeta_apply_row(
+    sys: &ArrowSchurSystem,
+    row_idx: usize,
+    row: &ArrowRowBlock,
+    x: ArrayView1<'_, f64>,
+    out: &mut Array1<f64>,
+) {
+    if let Some(op) = sys.htbeta_matvec.as_ref() {
+        op(row_idx, x, out);
+    } else {
+        let d = sys.d;
+        let k = sys.k;
+        for c in 0..d {
+            let mut acc = 0.0_f64;
+            for a in 0..k {
+                acc += row.htbeta[[c, a]] * x[a];
+            }
+            out[c] = acc;
+        }
+    }
+}
+
+/// Accumulate `H_βt^(row) · v` into `out` (length `k`).
+///
+/// `out[a] += Σ_c H_tβ^(row)[c, a] · v[c]`
+///
+/// Routes through `sys.htbeta_matvec` (column-probe) when present; otherwise
+/// indexes the dense `row.htbeta` slab directly.
+fn sys_htbeta_accumulate_transpose(
+    sys: &ArrowSchurSystem,
+    row_idx: usize,
+    row: &ArrowRowBlock,
+    v: ArrayView1<'_, f64>,
+    out: &mut Array1<f64>,
+) {
+    if let Some(op) = sys.htbeta_matvec.as_ref() {
+        htbeta_probe_transpose(row_idx, op, v, out, sys.d, sys.k);
+    } else {
+        let d = sys.d;
+        let k = sys.k;
+        for c in 0..d {
+            let vc = v[c];
+            if vc == 0.0 {
+                continue;
+            }
+            for a in 0..k {
+                out[a] += row.htbeta[[c, a]] * vc;
+            }
+        }
+    }
+}
+
+/// Materialize the dense `(d, k)` cross-block for one row.
+///
+/// When `sys.htbeta_matvec` is set and `row.htbeta` is zero-sized, probes each
+/// of the `k` standard basis vectors to reconstruct the matrix.  When the dense
+/// block is already present (`(d, k)` shape), clones it.
+fn sys_htbeta_materialize_row(
+    sys: &ArrowSchurSystem,
+    row_idx: usize,
+    row: &ArrowRowBlock,
+) -> Array2<f64> {
+    let d = sys.d;
+    let k = sys.k;
+    if row.htbeta.dim() == (d, k) {
+        return row.htbeta.clone();
+    }
+    // Zero-sized or mismatched dense block: materialize via the matvec.
+    let op = sys.htbeta_matvec.as_ref().unwrap_or_else(|| {
+        panic!(
+            "row {row_idx}: htbeta shape {:?} != ({d}, {k}) and no htbeta_matvec installed",
+            row.htbeta.dim()
+        )
+    });
+    let mut mat = Array2::<f64>::zeros((d, k));
+    let mut e_a = Array1::<f64>::zeros(k);
+    let mut col = Array1::<f64>::zeros(d);
+    for a in 0..k {
+        e_a.fill(0.0);
+        e_a[a] = 1.0;
+        col.fill(0.0);
+        op(row_idx, e_a.view(), &mut col);
+        for c in 0..d {
+            mat[[c, a]] = col[c];
+        }
+    }
+    mat
+}
+
 /// Probe each column of `H_tβ^(row)` by applying the operator to `e_a` and
 /// dotting the result with `v`.  Accumulates into `out[a]` for all `a in 0..k`.
 ///
@@ -2429,22 +2524,17 @@ fn solve_arrow_newton_step_artifacts(
 
     // 4. Back-substitute Δt_i = -(H_tt^(i))⁻¹ (g_t^(i) + H_tβ^(i) Δβ).
     //
-    // Reuse a single d-length scratch buffer across rows; the per-row
-    // factor `htt_factors[i]` and cross block `htbeta` are reused as
-    // read-only inputs. The row-major (d, k) layout of `htbeta` makes
-    // `htbeta[[c, a]]` unit-strided over `a`, which is exactly the
-    // inner-loop order used here.
+    // H_tβ^(i) · Δβ is routed through sys.htbeta_matvec when the dense slab
+    // is absent; otherwise indexed directly from row.htbeta.
     let mut delta_t = Array1::<f64>::zeros(n * d);
     let mut rhs = Array1::<f64>::zeros(d);
+    let mut htbeta_delta = Array1::<f64>::zeros(d);
     for i in 0..n {
         assert_eq!(sys.rows[i].gt.len(), d);
-        assert_eq!(sys.rows[i].htbeta.dim(), (d, k));
+        htbeta_delta.fill(0.0);
+        sys_htbeta_apply_row(sys, i, &sys.rows[i], delta_beta.view(), &mut htbeta_delta);
         for c in 0..d {
-            let mut acc = sys.rows[i].gt[c];
-            for a in 0..k {
-                acc += sys.rows[i].htbeta[[c, a]] * delta_beta[a];
-            }
-            rhs[c] = acc;
+            rhs[c] = sys.rows[i].gt[c] + htbeta_delta[c];
         }
         let dt_i = backend.solve_block_vector(&htt_factors[i], &rhs);
         for c in 0..d {
@@ -2469,23 +2559,12 @@ fn reduced_rhs_beta<B: BatchedBlockSolver>(
     // Numerical invariant: each per-row `H_tt^(i)` factor must be PD
     // (already enforced by the adaptive-ridge `factor_blocks`).
     let k = sys.k;
-    let d = sys.d;
     let mut rhs_beta = Array1::<f64>::zeros(k);
     for (i, row) in sys.rows.iter().enumerate() {
-        assert_eq!(row.htbeta.dim(), (d, k));
         let v = backend.solve_block_vector(&htt_factors[i], &row.gt);
-        // Reorder to (c, a): outer-loop on c hoists `v[c]` out of the
-        // inner-`a` loop and lets that loop walk `row.htbeta[[c, a]]`
-        // contiguously in the row-major Array2.
-        for c in 0..d {
-            let vc = v[c];
-            if vc == 0.0 {
-                continue;
-            }
-            for a in 0..k {
-                rhs_beta[a] += row.htbeta[[c, a]] * vc;
-            }
-        }
+        // H_βt^(i) · v accumulates into rhs_beta.  Routes through
+        // sys.htbeta_matvec when the dense block is absent.
+        sys_htbeta_accumulate_transpose(sys, i, row, v.view(), &mut rhs_beta);
     }
     for j in 0..k {
         rhs_beta[j] -= sys.gb[j];
@@ -2510,8 +2589,11 @@ fn build_dense_schur_direct<B: BatchedBlockSolver>(
         schur[[j, j]] += ridge_beta;
     }
     for (i, row) in sys.rows.iter().enumerate() {
-        let solved = backend.solve_block_matrix(&htt_factors[i], &row.htbeta);
-        backend.block_gemm_subtract(&mut schur, &row.htbeta, &solved);
+        // Materialize the (d, k) cross-block, probing via the matvec when
+        // the dense slab is absent.
+        let htbeta = sys_htbeta_materialize_row(sys, i, row);
+        let solved = backend.solve_block_matrix(&htt_factors[i], &htbeta);
+        backend.block_gemm_subtract(&mut schur, &htbeta, &solved);
     }
     symmetrize_upper_from_lower(&mut schur);
     Ok(schur)
@@ -2537,7 +2619,10 @@ fn build_dense_schur_sqrt_ba<B: BatchedBlockSolver>(
     for (i, row) in sys.rows.iter().enumerate() {
         // Square-Root BA: H_tβ^T H_tt^-1 H_tβ =
         // (L^-1 H_tβ)^T (L^-1 H_tβ), where H_tt = L L^T.
-        let whitened = backend.sqrt_solve_block_matrix(&htt_factors[i], &row.htbeta);
+        // Materialize the (d, k) cross-block, probing via the matvec when
+        // the dense slab is absent.
+        let htbeta = sys_htbeta_materialize_row(sys, i, row);
+        let whitened = backend.sqrt_solve_block_matrix(&htt_factors[i], &htbeta);
         backend.block_gemm_subtract(&mut schur, &whitened, &whitened);
     }
     symmetrize_upper_from_lower(&mut schur);
@@ -2608,27 +2693,19 @@ fn schur_matvec<B: BatchedBlockSolver>(
         }
     }
     let mut local = Array1::<f64>::zeros(d);
+    let mut neg_contrib = Array1::<f64>::zeros(k);
     for (i, row) in sys.rows.iter().enumerate() {
-        assert_eq!(row.htbeta.dim(), (d, k));
-        // H_tβ^(i) · x : row-major (d, k) is unit-strided in the inner k-loop.
-        for c in 0..d {
-            let mut acc = 0.0;
-            for a in 0..k {
-                acc += row.htbeta[[c, a]] * x[a];
-            }
-            local[c] = acc;
-        }
+        // H_tβ^(i) · x → local (length d), routed through sys.htbeta_matvec
+        // when the dense block is absent.
+        local.fill(0.0);
+        sys_htbeta_apply_row(sys, i, row, x.view(), &mut local);
         let solved = backend.solve_block_vector(&htt_factors[i], &local);
-        // H_βt^(i) · solved : iterate c outer to keep htbeta access
-        // contiguous in the inner a-loop.
-        for c in 0..d {
-            let sc = solved[c];
-            if sc == 0.0 {
-                continue;
-            }
-            for a in 0..k {
-                out[a] -= row.htbeta[[c, a]] * sc;
-            }
+        // H_βt^(i) · solved accumulates into neg_contrib (length k), then
+        // subtracted from out.  Routed through sys.htbeta_matvec when needed.
+        neg_contrib.fill(0.0);
+        sys_htbeta_accumulate_transpose(sys, i, row, solved.view(), &mut neg_contrib);
+        for a in 0..k {
+            out[a] -= neg_contrib[a];
         }
     }
 }
