@@ -1621,6 +1621,9 @@ pub enum EstimationError {
     #[error("Underlying basis function generation failed: {0}")]
     BasisError(#[from] crate::basis::BasisError),
 
+    #[error("Custom-family fit failed: {0}")]
+    CustomFamily(#[from] crate::families::custom_family::CustomFamilyError),
+
     #[error("A linear system solve failed. The penalized Hessian may be singular. Error: {0}")]
     LinearSystemSolveFailed(FaerLinalgError),
 

@@ -9864,7 +9864,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             ..BlockwiseFitOptions::default()
         },
     )
-    .map_err(|e| EstimationError::InvalidInput(e.to_string()))?;
+    .map_err(EstimationError::CustomFamily)?;
     let beta = final_fit.block_states[0].beta.clone();
     let final_eval = final_family
         .exact_evaluation(&beta)
@@ -12359,7 +12359,7 @@ fn fit_bounded_term_collection_with_design(
             ..BlockwiseFitOptions::default()
         },
     )
-    .map_err(|e| EstimationError::InvalidInput(e.to_string()))?;
+    .map_err(EstimationError::CustomFamily)?;
 
     let latent_beta = fit.block_states[0].beta.clone();
     let (beta_user_internal, jac_diag) = family_adapter.user_beta_and_jacobian(&latent_beta);
