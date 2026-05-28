@@ -45,6 +45,7 @@ def _dispatch(
     interval: float | None = None,
     return_type: str | None = None,
     id_column: str | None = None,
+    row_ids: list[str] | None = None,
 ) -> Any:
     rust = _FakeRust()
     monkeypatch.setattr(_predict_shape, "rust_module", lambda: rust)
@@ -59,7 +60,7 @@ def _dispatch(
         interval=interval,
         return_type=return_type,
         id_column=id_column,
-        row_ids=None,
+        row_ids=row_ids,
         restore=restore_output_table,
     )
 

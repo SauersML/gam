@@ -2878,6 +2878,29 @@ fn validate_response_degeneracy_and_size(
     Ok(())
 }
 
+/// Project an ingest-layer [`ColumnKindTag`] (plus the column's level table)
+/// onto the [`ResponseColumnKind`] consumed by the family layer.
+///
+/// `Categorical` carries the source-string levels through so the
+/// auto-inference refusal can echo them; `Binary` short-circuits the
+/// numeric scan inside [`ResponseFamily::infer_from_response`]; `Continuous`
+/// maps to `Numeric` and the family layer scans `y` itself to decide
+/// Gaussian vs. Binomial.
+fn response_column_kind(data: &Dataset, y_col: usize) -> ResponseColumnKind {
+    match data.column_kinds.get(y_col) {
+        Some(ColumnKindTag::Categorical) => ResponseColumnKind::Categorical {
+            levels: data
+                .schema
+                .columns
+                .get(y_col)
+                .map(|sc| sc.levels.clone())
+                .unwrap_or_default(),
+        },
+        Some(ColumnKindTag::Binary) => ResponseColumnKind::Binary,
+        Some(ColumnKindTag::Continuous) | None => ResponseColumnKind::Numeric,
+    }
+}
+
 /// Resolve a family from an optional name, optional link choice, and response data.
 ///
 /// `y_kind` describes the *source* representation of the response column

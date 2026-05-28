@@ -40,7 +40,7 @@ for i in range(n):
     rows.append({'x':x,'y':y})
 m=gamfit.fit('y ~ x', rows, family='gaussian')
 s=m.summary()
-p=m.predict(rows, with_uncertainty=True)
+p=m.predict(rows, interval=0.95)
 out={
  'beta': [c['estimate'] for c in s['coefficients']],
  'll': float(s['deviance']) if 'deviance' in s else float('nan'),

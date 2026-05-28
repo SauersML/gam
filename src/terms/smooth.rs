@@ -276,6 +276,97 @@ pub enum SmoothBasisSpec {
     },
 }
 
+impl SmoothBasisSpec {
+    /// Conservative lower bound on the number of sample rows needed for this
+    /// smooth basis to have a well-posed REML fit.
+    ///
+    /// Each basis kind answers the question for itself, so the workflow does
+    /// not have to know how many columns a B-spline, tensor product, PCA
+    /// projection, or spatial kernel emits. The contract is a *lower bound*:
+    /// returning too small a number is permitted (the inner solver will catch
+    /// any genuine n-vs-rank failure that slips past); returning too large a
+    /// number is a regression because it rejects legitimate fits.
+    ///
+    /// Rationale: B-spline / tensor / PCA bases have a closed-form column
+    /// count, so we use the exact dimension. Radial bases (TPS, Matern,
+    /// Duchon, Sphere) and factor smooths choose their column count from the
+    /// data (`heuristic_centers`, `unique_count`); we fall back to a small
+    /// constant floor because a fit on fewer than five rows cannot stabilise
+    /// any radial smooth regardless of the configured kernel scale.
+    pub fn min_sample_rows(&self) -> usize {
+        // Floor used for data-driven bases whose column count is not known
+        // from the spec alone. Five rows is the minimum at which the inner
+        // pivot/QR + REML smoothing-parameter search has any chance of being
+        // well-posed for a non-parametric smooth.
+        const RADIAL_FLOOR: usize = 5;
+
+        match self {
+            Self::ByVariable { inner, .. } => inner.min_sample_rows(),
+            Self::FactorSumToZero { inner, levels, .. } => {
+                // L-1 independent deviation blocks each carrying the inner
+                // basis dimension. Skip the levels-multiplier if it doesn't
+                // bring more rows; we want the *lower bound* not the rank.
+                let inner_min = inner.min_sample_rows();
+                let lvls = levels.len().saturating_sub(1).max(1);
+                inner_min.saturating_mul(lvls)
+            }
+            Self::BSpline1D { spec, .. } => bspline_basis_min_rows(spec),
+            Self::BySmooth { smooth, .. } => smooth.min_sample_rows(),
+            Self::FactorSmooth { spec } => {
+                // Replicates the marginal once per level; without a known
+                // level count we conservatively require at least the marginal
+                // basis dimension.
+                bspline_basis_min_rows(&spec.marginal)
+            }
+            Self::ThinPlate { .. }
+            | Self::Sphere { .. }
+            | Self::Matern { .. }
+            | Self::Duchon { .. } => RADIAL_FLOOR,
+            Self::Pca { basis_matrix, .. } => basis_matrix.ncols().max(1),
+            Self::TensorBSpline { spec, .. } => {
+                // Tensor-product column count is the product of per-marginal
+                // column counts; a TensorMarginalSpec::Categorical without a
+                // frozen level list cannot be sized from the spec alone, so
+                // we fall back to the radial floor for that margin.
+                let mut total: usize = 1;
+                for marginal in &spec.marginalspecs {
+                    let m = bspline_basis_min_rows(marginal);
+                    total = total.saturating_mul(m.max(1));
+                }
+                total.max(RADIAL_FLOOR)
+            }
+        }
+    }
+}
+
+/// Lower bound on the number of basis columns produced by a 1D B-spline
+/// configuration. Used as the per-smooth row floor in
+/// [`SmoothBasisSpec::min_sample_rows`].
+fn bspline_basis_min_rows(spec: &crate::terms::basis::BSplineBasisSpec) -> usize {
+    use crate::terms::basis::BSplineKnotSpec;
+    let from_knots = match &spec.knotspec {
+        BSplineKnotSpec::Generate {
+            num_internal_knots, ..
+        } => *num_internal_knots + spec.degree + 1,
+        BSplineKnotSpec::Automatic {
+            num_internal_knots: Some(k),
+            ..
+        } => *k + spec.degree + 1,
+        BSplineKnotSpec::Automatic {
+            num_internal_knots: None,
+            ..
+        } => {
+            // Knot count is data-derived (`default_internal_knot_count_for_data`).
+            // A minimal cubic basis is `degree + 2` columns; below that the
+            // basis cannot represent a non-parametric smooth.
+            spec.degree + 2
+        }
+        BSplineKnotSpec::Provided(knots) => knots.len().saturating_sub(spec.degree + 1).max(1),
+        BSplineKnotSpec::PeriodicUniform { num_basis, .. } => *num_basis,
+    };
+    from_knots.max(spec.degree + 2)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ByVariableSpec {
     Numeric,
