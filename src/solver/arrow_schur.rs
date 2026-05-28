@@ -4725,9 +4725,9 @@ mod tests {
         sys.hbb = array![[4.0_f64, 0.2, 0.0], [0.2, 5.0, 0.1], [0.0, 0.1, 6.0],];
         sys.gb = array![0.5_f64, -0.3, 0.2];
 
-        let (delta_t, delta_beta) = sys.solve(0.0, 0.0).expect("arrow-schur solve");
+        let (delta_t, delta_beta, _diag) = sys.solve(0.0, 0.0).expect("arrow-schur solve");
         let streaming_options = ArrowSolveOptions::direct().with_streaming_chunk_size(Some(1));
-        let (delta_t_stream, delta_beta_stream) = sys
+        let (delta_t_stream, delta_beta_stream, _diag_stream) = sys
             .solve_with_options(0.0, 0.0, &streaming_options)
             .expect("streaming arrow-schur solve");
         assert_eq!(delta_beta, delta_beta_stream);
