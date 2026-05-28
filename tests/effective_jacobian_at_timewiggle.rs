@@ -11,7 +11,7 @@
 //! zero so c_i = 1 and the ground-truth per-row (η0, η1, ad1) can be
 //! computed directly from the q-values.
 
-use gam::families::custom_family::FamilyLinearizationState;
+use gam::families::custom_family::{BlockEffectiveJacobian, FamilyLinearizationState};
 use gam::survival_marginal_slope::{SmsTimewiggleMarginalJacobian, SmsTimewiggleTimeJacobian};
 use ndarray::{Array1, Array2};
 use std::sync::Arc;
@@ -297,6 +297,7 @@ fn time_jacobian_at_zero_beta_matches_rigid() {
         beta: &zeros,
         family_scalars: None,
         channel_hessian: None,
+        probit_frailty_scale: 1.0,
     };
     let jac = jac_cb.effective_jacobian_at(&state).expect("time jacobian at zero");
     assert_eq!(
@@ -325,6 +326,7 @@ fn marginal_jacobian_at_zero_beta_matches_rigid() {
         beta: &zeros,
         family_scalars: None,
         channel_hessian: None,
+        probit_frailty_scale: 1.0,
     };
     let jac = jac_cb.effective_jacobian_at(&state).expect("marginal jacobian at zero");
     assert_eq!(jac.dim(), (3 * N, P_M), "marginal Jacobian shape mismatch at β=0");
@@ -347,6 +349,7 @@ fn time_jacobian_matches_finite_difference_at_nonzero_beta() {
         beta: beta.as_slice().unwrap(),
         family_scalars: None,
         channel_hessian: None,
+        probit_frailty_scale: 1.0,
     };
     let analytic = jac_cb
         .effective_jacobian_at(&state)
@@ -385,6 +388,7 @@ fn marginal_jacobian_matches_finite_difference_at_nonzero_beta() {
         beta: beta.as_slice().unwrap(),
         family_scalars: None,
         channel_hessian: None,
+        probit_frailty_scale: 1.0,
     };
     let analytic = jac_cb
         .effective_jacobian_at(&state)

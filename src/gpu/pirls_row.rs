@@ -1978,7 +1978,6 @@ extern "C" __global__ void {kernel_name}(
 #[cfg(test)]
 mod pirls_row_gpu_tests {
     use super::*;
-    use crate::gpu::error::GpuResultExt;
 
     fn assert_close(label: &str, got: f64, expected: f64, tol: f64) {
         if !(got.is_finite() && expected.is_finite()) {

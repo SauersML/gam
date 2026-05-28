@@ -158,7 +158,12 @@ fn build_dataset() -> gam::inference::data::EncodedDataset {
     .map(|s| s.to_string())
     .collect::<Vec<_>>();
 
-    let mut state: u64 = 0xC1A55_1F1ED_B10B_A11C_u64;
+    // 64-bit splitmix64 seed.  The previous literal
+    // `0xC1A55_1F1ED_B10B_A11C` (21 hex digits → 84 bits) silently truncated
+    // under `cargo build` and now fails the `literal out of range for u64`
+    // lint under `-D warnings`; pin a deterministic 16-hex-digit value that
+    // preserves the high-entropy character of the original.
+    let mut state: u64 = 0xC1A5_51F1_EDB1_0BA1_u64;
     let mut rows: Vec<StringRecord> = Vec::with_capacity(N);
 
     // Accumulate PRS values to standardize them post-hoc.

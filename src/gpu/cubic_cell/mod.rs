@@ -228,7 +228,6 @@ fn into_host_output(batch: HostMomentBatch) -> CubicCellDerivativeMomentOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gpu_bail;
 
     fn affine_cell() -> GpuDenestedCubicCell {
         GpuDenestedCubicCell {

@@ -91,7 +91,7 @@ fn flat_audit_flags_fatal_on_shared_raw_columns() {
     let p = 4;
     let m = duchon_basis(&x, p);
     // z: standardised normal (reproducible).
-    let z: Array1<f64> = Array1::from_iter((0..N).map(|i| ((i as f64 * 0.73 + 1.23).sin())));
+    let z: Array1<f64> = Array1::from_iter((0..N).map(|i| (i as f64 * 0.73 + 1.23).sin()));
 
     let time_design = m.clone();
     let marginal_design = m.clone(); // identical raw columns — flat sees alias
@@ -133,7 +133,7 @@ fn channel_aware_routing_chosen_for_multi_output_blocks() {
     let x = linspace(N);
     let p = 4;
     let m = duchon_basis(&x, p);
-    let z: Array1<f64> = Array1::from_iter((0..N).map(|i| ((i as f64 * 0.73 + 1.23).sin())));
+    let z: Array1<f64> = Array1::from_iter((0..N).map(|i| (i as f64 * 0.73 + 1.23).sin()));
     let logslope_design = Array2::from_shape_fn((N, p), |(i, j)| m[[i, j]] * z[i]);
 
     let specs = [
@@ -160,7 +160,7 @@ fn channel_aware_audit_passes_with_full_rank_for_orthogonal_channel_blocks() {
     let x = linspace(N);
     let p = 4;
     let m = duchon_basis(&x, p);
-    let z: Array1<f64> = Array1::from_iter((0..N).map(|i| ((i as f64 * 0.73 + 1.23).sin())));
+    let z: Array1<f64> = Array1::from_iter((0..N).map(|i| (i as f64 * 0.73 + 1.23).sin()));
     let logslope_design = Array2::from_shape_fn((N, p), |(i, j)| m[[i, j]] * z[i]);
 
     let specs = [
@@ -205,7 +205,7 @@ fn post_canonicalize_t_is_identity_for_full_rank_3_block_case() {
     let x = linspace(N);
     let p = 4;
     let m = duchon_basis(&x, p);
-    let z: Array1<f64> = Array1::from_iter((0..N).map(|i| ((i as f64 * 0.73 + 1.23).sin())));
+    let z: Array1<f64> = Array1::from_iter((0..N).map(|i| (i as f64 * 0.73 + 1.23).sin()));
     let logslope_design = Array2::from_shape_fn((N, p), |(i, j)| m[[i, j]] * z[i]);
 
     let specs = [
