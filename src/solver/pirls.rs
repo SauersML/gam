@@ -5182,12 +5182,56 @@ where
                             solve_options.streaming_chunk_size = arrow_cfg.streaming_chunk_size;
                             solve_options.trust_region.radius = arrow_cfg.trust_region_radius;
                             let latent_snapshot = arrow_cfg.snapshot_t.as_ref()();
+                            // GPU dispatch.  Two sub-cases:
+                            //
+                            // (a) Dense system (no matrix-free hooks) → GPU
+                            //     dense-Schur path unchanged.
+                            //
+                            // (b) Matrix-free system at K ≥ 5000 + CUDA →
+                            //     build GPU Y_i matvec once (forward kernel),
+                            //     then run CPU-driven InexactPCG with the GPU
+                            //     closure as the matvec backend (issue #288
+                            //     Part B).  On Unavailable/RidgeBump the
+                            //     closure is dropped and the CPU-only path
+                            //     takes over.
                             let arrow_solve_result = if crate::solver::gpu::cuda_selected() {
-                                crate::solver::gpu::arrow_schur_gpu::solve_arrow_newton_step_gpu(
-                                    &arrow_system,
-                                    0.0,
-                                    loop_lambda,
-                                )
+                                let has_matvec = arrow_system.hbb_matvec.is_some()
+                                    || arrow_system.htbeta_matvec.is_some();
+                                if has_matvec
+                                    && arrow_system.k >= 5000
+                                    && solve_options.mode
+                                        == crate::solver::arrow_schur::ArrowSolverMode::InexactPCG
+                                {
+                                    match crate::gpu::arrow_schur::gpu_schur_matvec_backend(
+                                        &arrow_system,
+                                        0.0,
+                                        loop_lambda,
+                                    ) {
+                                        Ok(gpu_mv) => {
+                                            solve_options.gpu_matvec = Some(gpu_mv);
+                                            arrow_system
+                                                .solve_with_options(0.0, loop_lambda, &solve_options)
+                                        }
+                                        Err(crate::gpu::arrow_schur::ArrowSchurGpuFailure::RidgeBumpRequired { row, bump: _ }) => {
+                                            Err(crate::solver::arrow_schur::ArrowSchurError::PerRowFactorFailed {
+                                                row,
+                                                reason: "GPU forward kernel Cholesky failed during matvec setup".to_string(),
+                                            })
+                                        }
+                                        Err(_) => {
+                                            // Unavailable or GpuRequiresDenseSystem:
+                                            // fall back to CPU InexactPCG without GPU matvec.
+                                            arrow_system
+                                                .solve_with_options(0.0, loop_lambda, &solve_options)
+                                        }
+                                    }
+                                } else {
+                                    crate::solver::gpu::arrow_schur_gpu::solve_arrow_newton_step_gpu(
+                                        &arrow_system,
+                                        0.0,
+                                        loop_lambda,
+                                    )
+                                }
                             } else {
                                 arrow_system.solve_with_options(0.0, loop_lambda, &solve_options)
                             };

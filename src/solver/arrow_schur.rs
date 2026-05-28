@@ -2008,8 +2008,14 @@ pub struct ArrowFactorCache {
     /// Large caches retain a row matvec callback or disable β-coupled IFT
     /// prediction instead of cloning every dense `d × K` slab.
     pub htbeta: ArrowHtbetaCache,
-    /// Latent dimensionality `d`.
+    /// Maximum per-row latent dim (upper bound; matches `sys.d` at creation).
     pub d: usize,
+    /// Per-row latent dims: `row_dims[i]` is the active dim for row `i`.
+    pub row_dims: Arc<[usize]>,
+    /// Flat-buffer row offsets for `delta_t` / IFT output vectors.
+    /// `row_offsets[i]` is the start of row `i`; `row_offsets[n]` is the
+    /// total length.
+    pub row_offsets: Arc<[usize]>,
     /// β dimensionality `K`.
     pub k: usize,
     /// Geometry tag for the row-local factors and cross-blocks.

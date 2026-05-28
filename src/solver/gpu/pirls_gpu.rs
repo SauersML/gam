@@ -334,6 +334,29 @@ extern "C" __global__ void chol_logdet_col_major(
             let penalty_dev = stream
                 .alloc_zeros::<f64>(pp)
                 .map_err(|e| format!("cuda alloc penalty: {e}"))?;
+            // Qs and scratch: p×p identity-initialized and p-vector zeros.
+            let mut qs_dev = stream
+                .alloc_zeros::<f64>(pp)
+                .map_err(|e| format!("cuda alloc Qs: {e}"))?;
+            // Initialize Qs to identity: diagonal = 1.0.
+            {
+                let mut qs_host = vec![0.0_f64; pp];
+                for i in 0..p {
+                    qs_host[i * p + i] = 1.0;
+                }
+                stream
+                    .memcpy_htod(&qs_host, &mut qs_dev)
+                    .map_err(|e| format!("init Qs identity: {e}"))?;
+            }
+            let qs_tmp_dev = stream
+                .alloc_zeros::<f64>(pp)
+                .map_err(|e| format!("cuda alloc Qs tmp: {e}"))?;
+            let beta_orig_dev = stream
+                .alloc_zeros::<f64>(p)
+                .map_err(|e| format!("cuda alloc beta_orig: {e}"))?;
+            let dir_orig_dev = stream
+                .alloc_zeros::<f64>(p)
+                .map_err(|e| format!("cuda alloc dir_orig: {e}"))?;
             // Query the POTRF workspace size once using the actual p so we
             // can size the persistent buffer. This is the only buffer-size
             // query in the hot path — every Newton step reuses it.
@@ -362,6 +385,10 @@ extern "C" __global__ void chol_logdet_col_major(
                 h_dev,
                 rhs_dev,
                 penalty_dev,
+                qs_dev,
+                qs_tmp_dev,
+                beta_orig_dev,
+                dir_orig_dev,
                 potrf_work_dev,
                 potrf_lwork,
                 potrf_info_dev,
