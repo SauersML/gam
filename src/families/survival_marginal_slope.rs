@@ -1,5 +1,6 @@
 use crate::custom_family::{
-    BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyWarmStart,
+    BlockEffectiveJacobian, BlockWorkingSet, BlockwiseFitOptions, CustomFamily,
+    CustomFamilyWarmStart,
     ExactNewtonJointGradientEvaluation, ExactNewtonJointHessianWorkspace,
     ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace,
     FamilyEvaluation, ParameterBlockSpec, ParameterBlockState, PenaltyMatrix,
