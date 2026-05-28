@@ -13690,14 +13690,19 @@ pub(crate) fn try_build_latent_coord_hyper_dirs(
                 knots,
                 identifiability_transform,
                 periodic,
+                degree: meta_degree,
                 ..
             },
         ) => {
+            // Issue #340: use the metadata-recorded effective degree so the
+            // latent-design Jacobian matches what `build_bspline_basis_1d`
+            // actually built at fit time after auto-shrink.
+            let effective_degree = meta_degree.unwrap_or(spec.degree);
             if let Some((domain_start, period, num_basis)) = periodic {
                 crate::terms::basis::LatentCoordDesignDerivative::new_periodic_bspline(
                     latent.clone(),
                     (*domain_start, *domain_start + *period),
-                    spec.degree,
+                    effective_degree,
                     *num_basis,
                     identifiability_transform.clone(),
                 )
@@ -13706,7 +13711,7 @@ pub(crate) fn try_build_latent_coord_hyper_dirs(
                 crate::terms::basis::LatentCoordDesignDerivative::new_tensor_bspline(
                     latent.clone(),
                     vec![knots.clone()],
-                    vec![spec.degree],
+                    vec![effective_degree],
                     identifiability_transform.clone(),
                 )
                 .map_err(EstimationError::from)?
@@ -16034,9 +16039,19 @@ fn freeze_inner_smooth_basis_from_metadata(
                 knots,
                 identifiability_transform,
                 periodic,
+                degree: meta_degree,
                 ..
             },
         ) => {
+            // Issue #340: when fit-time auto-shrink lowered the effective
+            // degree, persist it into the frozen spec so reload / predict
+            // sees the same `(degree, knots)` geometry that was actually
+            // fitted. Without this, a serialized cubic-spec + linear-knots
+            // pair would mismatch and downstream Cox-de Boor would index
+            // off the end of the clamped knot vector.
+            if let Some(d) = meta_degree {
+                s.degree = *d;
+            }
             s.knotspec = periodic
                 .map(
                     |(domain_start, period, num_basis)| BSplineKnotSpec::PeriodicUniform {
@@ -16154,9 +16169,16 @@ pub fn freeze_term_collection_from_design(
                     knots,
                     identifiability_transform,
                     periodic,
+                    degree: meta_degree,
                     ..
                 },
             ) => {
+                // Issue #340: bake the fit-time effective degree into the
+                // frozen spec so reload sees a self-consistent
+                // (degree, knots) pair.
+                if let Some(d) = meta_degree {
+                    s.degree = *d;
+                }
                 s.knotspec = periodic
                     .map(
                         |(domain_start, period, num_basis)| BSplineKnotSpec::PeriodicUniform {

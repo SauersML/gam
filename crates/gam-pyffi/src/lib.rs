@@ -17817,9 +17817,8 @@ fn poincare_tangent_decode_forward<'py>(
 )> {
     let atoms_owned = atoms.as_array().to_owned();
     let gates_owned = gates.as_array().to_owned();
-    let (x_hat, cache) = detach_py_result(py, "poincare_tangent_decode_forward", move || {
+    let (x_hat, cache) = detach_geometry_result(py, "poincare_tangent_decode_forward", move || {
         poincare_tangent_decode_forward_impl(atoms_owned.view(), gates_owned.view(), curvature)
-            .map_err(|e| e.to_string())
     })?;
     Ok((
         x_hat.into_pyarray(py).unbind(),
@@ -17847,7 +17846,7 @@ fn poincare_tangent_decode_backward<'py>(
     let v_owned = v.as_array().to_owned();
     let tangents_owned = tangents.as_array().to_owned();
     let grad_owned = grad_x_hat.as_array().to_owned();
-    let (gg, ga) = detach_py_result(py, "poincare_tangent_decode_backward", move || {
+    let (gg, ga) = detach_geometry_result(py, "poincare_tangent_decode_backward", move || {
         let cache = gam::geometry::poincare::TangentDecodeCache {
             atoms_projected: atoms_p,
             gates: gates_owned,
@@ -17855,7 +17854,7 @@ fn poincare_tangent_decode_backward<'py>(
             tangents: tangents_owned,
             curvature,
         };
-        poincare_tangent_decode_backward_impl(&cache, grad_owned.view()).map_err(|e| e.to_string())
+        poincare_tangent_decode_backward_impl(&cache, grad_owned.view())
     })?;
     Ok((gg.into_pyarray(py).unbind(), ga.into_pyarray(py).unbind()))
 }
@@ -17869,9 +17868,8 @@ fn poincare_lorentz_decode_forward<'py>(
 ) -> PyResult<Py<PyArray2<f64>>> {
     let atoms_owned = atoms.as_array().to_owned();
     let gates_owned = gates.as_array().to_owned();
-    let out = detach_py_result(py, "poincare_lorentz_decode_forward", move || {
+    let out = detach_geometry_result(py, "poincare_lorentz_decode_forward", move || {
         poincare_lorentz_decode_forward_impl(atoms_owned.view(), gates_owned.view(), curvature)
-            .map_err(|e| e.to_string())
     })?;
     Ok(out.into_pyarray(py).unbind())
 }
@@ -17896,7 +17894,7 @@ fn poincare_lorentz_decode_backward<'py>(
     let v_owned = v.as_array().to_owned();
     let tangents_owned = tangents.as_array().to_owned();
     let grad_owned = grad_x_hat.as_array().to_owned();
-    let (gg, ga) = detach_py_result(py, "poincare_lorentz_decode_backward", move || {
+    let (gg, ga) = detach_geometry_result(py, "poincare_lorentz_decode_backward", move || {
         let cache = gam::geometry::poincare::TangentDecodeCache {
             atoms_projected: atoms_p,
             gates: gates_owned,
@@ -17904,7 +17902,7 @@ fn poincare_lorentz_decode_backward<'py>(
             tangents: tangents_owned,
             curvature,
         };
-        poincare_lorentz_decode_backward_impl(&cache, grad_owned.view()).map_err(|e| e.to_string())
+        poincare_lorentz_decode_backward_impl(&cache, grad_owned.view())
     })?;
     Ok((gg.into_pyarray(py).unbind(), ga.into_pyarray(py).unbind()))
 }
