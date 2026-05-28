@@ -342,7 +342,8 @@ fn build_marginal_blockspec_bms(
         // (marginal=150, logslope=120).
         gauge_priority: 150,
         jacobian_callback: Some(callback),
-        audit_design: None,
+        stacked_design: None,
+        stacked_offset: None,
     })
 }
 
@@ -393,7 +394,8 @@ fn build_logslope_blockspec_bms(
         // resolves.
         gauge_priority: 120,
         jacobian_callback: Some(callback),
-        audit_design: None,
+        stacked_design: None,
+        stacked_offset: None,
     })
 }
 

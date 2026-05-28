@@ -35,7 +35,8 @@ pub fn binomial_location_scale_base_fixture() -> BinomialLocationScaleBaseFixtur
         initial_beta: Some(array![0.2]),
         gauge_priority: 100,
         jacobian_callback: None,
-        audit_design: None,
+        stacked_design: None,
+        stacked_offset: None,
     };
     let log_sigma_spec = ParameterBlockSpec {
         name: "log_sigma".to_string(),
@@ -47,7 +48,8 @@ pub fn binomial_location_scale_base_fixture() -> BinomialLocationScaleBaseFixtur
         initial_beta: Some(array![-0.1]),
         gauge_priority: 100,
         jacobian_callback: None,
-        audit_design: None,
+        stacked_design: None,
+        stacked_offset: None,
     };
     BinomialLocationScaleBaseFixture {
         n,

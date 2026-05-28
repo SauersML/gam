@@ -19050,7 +19050,8 @@ fn build_time_blockspec(
         initial_beta: beta_hint,
         gauge_priority: 200,
         jacobian_callback: jac_cb,
-        audit_design: None,
+        stacked_design: None,
+        stacked_offset: None,
     }
 }
 
@@ -19086,7 +19087,8 @@ fn build_logslope_blockspec(
         initial_beta: beta_hint,
         gauge_priority: 120,
         jacobian_callback: jac_cb,
-        audit_design: None,
+        stacked_design: None,
+        stacked_offset: None,
     }
 }
 
@@ -19115,7 +19117,8 @@ fn build_marginal_blockspec(
         initial_beta: beta_hint,
         gauge_priority: 150,
         jacobian_callback: jac_cb,
-        audit_design: None,
+        stacked_design: None,
+        stacked_offset: None,
     }
 }
 
@@ -22542,7 +22545,8 @@ mod tests {
             initial_beta: Some(Array1::zeros(cols)),
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         }
     }
 
@@ -25115,7 +25119,8 @@ mod tests {
             initial_beta: None,
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         };
         let constraints = family
             .block_linear_constraints(&[], 0, &spec)
@@ -25186,7 +25191,8 @@ mod tests {
             initial_beta: None,
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         };
 
         let constraints = family
@@ -25439,7 +25445,8 @@ mod tests {
             initial_beta: None,
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         };
         let err = family
             .post_update_block_beta(
@@ -25512,7 +25519,8 @@ mod tests {
             initial_beta: None,
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         };
         let current = array![0.4, 7.0];
         // qd1 at current = 1.0·0.4 + 0.0·7.0 + 1e-6 ≈ 0.4 (feasible)
@@ -25589,7 +25597,8 @@ mod tests {
             initial_beta: None,
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         };
         // current qd1 = -1.0 + 1e-6 < guard → infeasible.
         let err = family

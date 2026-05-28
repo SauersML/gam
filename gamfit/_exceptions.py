@@ -113,15 +113,12 @@ def map_exception(exc: BaseException) -> BaseException:
 
     Typed errors raised by the Rust extension (any subclass of
     :class:`GamError`) pass through unchanged — the FFI boundary already
-    selected the correct subclass via variant dispatch, so there is
-    nothing to reclassify.
-
-    For error paths that still flow as ``Result<_, String>`` through the
-    FFI (formula / schema-mismatch / prediction routes that have not
-    yet been migrated to typed dispatch, see issue #343), the legacy
-    message-regex classifier picks the matching subclass. Once every
-    engine error enum is variant-typed, this fallback collapses to a
-    no-op identity function and the classifier disappears.
+    selected the correct subclass via variant dispatch
+    (``estimation_error_to_pyerr``, ``workflow_error_to_pyerr``,
+    ``geometry_error_to_pyerr``, etc. in ``crates/gam-pyffi/src/lib.rs``),
+    so there is nothing to reclassify. The legacy message-regex
+    classifier is gone (issue #343); structured engine errors no longer
+    round-trip through stringly-typed text.
 
     ``TypeError`` / ``LookupError`` / ``ArithmeticError`` describe
     Python-native contract violations rather than gamfit engine errors,
@@ -135,16 +132,8 @@ def map_exception(exc: BaseException) -> BaseException:
         return exc
     if isinstance(exc, GamError):
         return exc
-    message = str(exc)
-    kind = _rust.classify_exception_message(message)
-    if kind == "formula":
-        return FormulaError(message)
-    if kind == "schema_mismatch":
-        return SchemaMismatchError(message)
-    if kind == "prediction":
-        return PredictionError(message)
-    if isinstance(exc, ValueError):
-        return GamError(message)
     if isinstance(exc, (TypeError, LookupError, ArithmeticError)):
         return exc
-    return GamError(message)
+    if isinstance(exc, ValueError):
+        return GamError(str(exc))
+    return exc
