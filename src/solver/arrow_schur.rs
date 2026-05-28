@@ -3590,6 +3590,458 @@ impl JacobiPreconditioner {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Preconditioner ladder: SchurPreconditionerKind, ClusterJacobi,
+// AdditiveSchwarz  (issue #299)
+// ---------------------------------------------------------------------------
+
+/// Which Schur preconditioner to use in the inexact-PCG path.
+///
+/// Ladder ordered by cost / effectiveness:
+/// - `Diagonal`: scalar Jacobi (pre-#283 behaviour).
+/// - `BetaBlockJacobi`: block-Jacobi per `block_offsets` term (#287).
+/// - `ClusterJacobi`: one dense block per beta-graph connected component.
+/// - `AdditiveSchwarz { overlap }`: component + `overlap`-hop expansion,
+///   overlapping columns averaged by partition-of-unity weights.
+///
+/// ```text
+/// Future variants (not yet wired, see #299):
+///   DiagAssembledSchwarz { overlap: usize },
+///   SparseIncompleteCholesky,
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchurPreconditionerKind {
+    Diagonal,
+    BetaBlockJacobi,
+    ClusterJacobi,
+    AdditiveSchwarz { overlap: usize },
+}
+
+/// Escalate beyond BetaBlockJacobi only when K exceeds this value and PCG
+/// exhausted `max_iterations`.
+const PRECOND_ESCALATE_K_THRESHOLD: usize = 100;
+
+/// Cholesky or scalar factor for one cluster of the beta-coefficient graph.
+#[derive(Clone)]
+enum ClusterFactor {
+    Chol { cols: Vec<usize>, factor: FaerLlt<f64> },
+    Scalar { cols: Vec<usize>, inv: Vec<f64> },
+}
+
+impl std::fmt::Debug for ClusterFactor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ClusterFactor::Chol { cols, .. } => {
+                write!(f, "ClusterFactor::Chol {{ cols.len: {} }}", cols.len())
+            }
+            ClusterFactor::Scalar { cols, inv } => write!(
+                f,
+                "ClusterFactor::Scalar {{ cols.len: {}, inv.len: {} }}",
+                cols.len(),
+                inv.len()
+            ),
+        }
+    }
+}
+
+/// Maximum columns per cluster before scalar fallback.
+const CLUSTER_JACOBI_MAX_CLUSTER: usize = 512;
+
+/// Dense Schur block per connected component of the beta-coupling graph.
+///
+/// Nodes = beta blocks (`block_offsets`); edges = rows where two blocks
+/// co-occur with nonzero `H_t_beta` entries. One Cholesky factor per
+/// connected component; applied as a triangular solve.
+#[derive(Debug, Clone)]
+pub struct ClusterJacobiPreconditioner {
+    clusters: Vec<ClusterFactor>,
+}
+
+impl ClusterJacobiPreconditioner {
+    pub fn from_arrow_schur<B: BatchedBlockSolver>(
+        sys: &ArrowSchurSystem,
+        htt_factors: &[Array2<f64>],
+        ridge_beta: f64,
+        backend: &B,
+    ) -> Result<Self, ArrowSchurError> {
+        if sys.block_offsets.is_empty() {
+            let cols: Vec<usize> = (0..sys.k).collect();
+            return Self::build_from_column_groups(
+                sys, htt_factors, ridge_beta, backend, &[cols],
+            );
+        }
+        let graph = BetaCouplingGraph::build(
+            &sys.block_offsets,
+            &sys.rows.iter().map(|r| r.htbeta.clone()).collect::<Vec<_>>(),
+        );
+        let col_groups: Vec<Vec<usize>> = graph
+            .component_partition()
+            .iter()
+            .map(|comp_blocks| {
+                let mut cols: Vec<usize> = comp_blocks
+                    .iter()
+                    .flat_map(|&b| sys.block_offsets[b].clone())
+                    .collect();
+                cols.sort_unstable();
+                cols
+            })
+            .collect();
+        Self::build_from_column_groups(sys, htt_factors, ridge_beta, backend, &col_groups)
+    }
+
+    fn build_from_column_groups<B: BatchedBlockSolver>(
+        sys: &ArrowSchurSystem,
+        htt_factors: &[Array2<f64>],
+        ridge_beta: f64,
+        backend: &B,
+        col_groups: &[Vec<usize>],
+    ) -> Result<Self, ArrowSchurError> {
+        let d = sys.d;
+        let mut clusters = Vec::with_capacity(col_groups.len());
+        for cols in col_groups {
+            let b = cols.len();
+            if b == 0 {
+                continue;
+            }
+            if b > CLUSTER_JACOBI_MAX_CLUSTER {
+                let inv = build_schur_scalar_inv(sys, htt_factors, ridge_beta, backend, cols)?;
+                clusters.push(ClusterFactor::Scalar { cols: cols.clone(), inv });
+                continue;
+            }
+            let mut s_block = Array2::<f64>::zeros((b, b));
+            for bi in 0..b {
+                for bj in 0..b {
+                    let gi = cols[bi];
+                    let gj = cols[bj];
+                    let base = if sys.hbb.dim() == (sys.k, sys.k) {
+                        sys.hbb[[gi, gj]]
+                    } else if bi == bj {
+                        sys.hbb_diag.as_ref().map(|hd| hd[gi]).unwrap_or(0.0)
+                    } else {
+                        0.0
+                    };
+                    s_block[[bi, bj]] = base + if bi == bj { ridge_beta } else { 0.0 };
+                }
+            }
+            let mut col_vec = Array1::<f64>::zeros(d);
+            let mut solved_cols = Array2::<f64>::zeros((d, b));
+            for (row_idx, row) in sys.rows.iter().enumerate() {
+                for bj in 0..b {
+                    let gj = cols[bj];
+                    for c in 0..d {
+                        col_vec[c] = row.htbeta[[c, gj]];
+                    }
+                    let solved = backend.solve_block_vector(&htt_factors[row_idx], &col_vec);
+                    for c in 0..d {
+                        solved_cols[[c, bj]] = solved[c];
+                    }
+                }
+                for bi in 0..b {
+                    let gi = cols[bi];
+                    for bj in 0..b {
+                        let mut acc = 0.0;
+                        for c in 0..d {
+                            acc += row.htbeta[[c, gi]] * solved_cols[[c, bj]];
+                        }
+                        s_block[[bi, bj]] -= acc;
+                    }
+                }
+            }
+            symmetrize_upper_from_lower(&mut s_block);
+            let factor_opt = {
+                use faer::Side;
+                let view = FaerArrayView::new(&s_block);
+                FaerLlt::new(view.as_ref(), Side::Lower).ok()
+            };
+            if let Some(llt) = factor_opt {
+                clusters.push(ClusterFactor::Chol { cols: cols.clone(), factor: llt });
+            } else {
+                let inv = build_schur_scalar_inv(sys, htt_factors, ridge_beta, backend, cols)?;
+                clusters.push(ClusterFactor::Scalar { cols: cols.clone(), inv });
+            }
+        }
+        Ok(Self { clusters })
+    }
+
+    fn apply(&self, r: &Array1<f64>) -> Array1<f64> {
+        let mut out = Array1::<f64>::zeros(r.len());
+        for cluster in &self.clusters {
+            apply_cluster_non_overlapping(cluster, r, &mut out);
+        }
+        out
+    }
+}
+
+/// Additive Schwarz: base components expanded by `overlap` graph-hops;
+/// overlapping columns averaged by partition-of-unity weights.
+#[derive(Debug, Clone)]
+pub struct AdditiveSchwarzPreconditioner {
+    clusters: Vec<ClusterFactor>,
+    weights: Vec<f64>,
+}
+
+impl AdditiveSchwarzPreconditioner {
+    pub fn from_arrow_schur<B: BatchedBlockSolver>(
+        sys: &ArrowSchurSystem,
+        htt_factors: &[Array2<f64>],
+        ridge_beta: f64,
+        backend: &B,
+        overlap: usize,
+    ) -> Result<Self, ArrowSchurError> {
+        if sys.block_offsets.is_empty() {
+            let cols: Vec<usize> = (0..sys.k).collect();
+            let inner = ClusterJacobiPreconditioner::build_from_column_groups(
+                sys, htt_factors, ridge_beta, backend, &[cols],
+            )?;
+            return Ok(Self { clusters: inner.clusters, weights: vec![1.0f64; sys.k] });
+        }
+        let graph = BetaCouplingGraph::build(
+            &sys.block_offsets,
+            &sys.rows.iter().map(|r| r.htbeta.clone()).collect::<Vec<_>>(),
+        );
+        let col_groups: Vec<Vec<usize>> = graph
+            .component_partition()
+            .iter()
+            .map(|seed| {
+                let mut current = seed.clone();
+                for _ in 0..overlap {
+                    current = graph.expand_one_hop(&current);
+                }
+                let mut cols: Vec<usize> = current
+                    .iter()
+                    .flat_map(|&b| sys.block_offsets[b].clone())
+                    .collect();
+                cols.sort_unstable();
+                cols.dedup();
+                cols
+            })
+            .collect();
+        let mut counts = vec![0u32; sys.k];
+        for cols in &col_groups {
+            for &gi in cols {
+                counts[gi] += 1;
+            }
+        }
+        let weights: Vec<f64> =
+            counts.iter().map(|&c| if c == 0 { 1.0 } else { 1.0 / c as f64 }).collect();
+        let inner = ClusterJacobiPreconditioner::build_from_column_groups(
+            sys, htt_factors, ridge_beta, backend, &col_groups,
+        )?;
+        Ok(Self { clusters: inner.clusters, weights })
+    }
+
+    fn apply(&self, r: &Array1<f64>) -> Array1<f64> {
+        let mut out = Array1::<f64>::zeros(r.len());
+        for cluster in &self.clusters {
+            apply_cluster_overlapping(cluster, r, &mut out, &self.weights);
+        }
+        out
+    }
+}
+
+/// Apply a cluster factor (overwrite) for non-overlapping clusters.
+fn apply_cluster_non_overlapping(
+    cluster: &ClusterFactor,
+    r: &Array1<f64>,
+    out: &mut Array1<f64>,
+) {
+    match cluster {
+        ClusterFactor::Scalar { cols, inv } => {
+            for (local, &gi) in cols.iter().enumerate() {
+                out[gi] = inv[local] * r[gi];
+            }
+        }
+        ClusterFactor::Chol { cols, factor } => {
+            let b = cols.len();
+            let mut rhs = Array1::<f64>::zeros(b);
+            for (local, &gi) in cols.iter().enumerate() {
+                rhs[local] = r[gi];
+            }
+            use faer::linalg::solvers::Solve;
+            let stride = rhs.strides()[0];
+            let len = rhs.len();
+            // SAFETY: rhs is uniquely-borrowed contiguous Array1 with positive stride.
+            let rhs_mat =
+                unsafe { faer::MatRef::from_raw_parts(rhs.as_ptr(), len, 1, stride, 0) };
+            let solved = factor.solve(rhs_mat);
+            for (local, &gi) in cols.iter().enumerate() {
+                out[gi] = solved[(local, 0)];
+            }
+        }
+    }
+}
+
+/// Apply a cluster factor (accumulate with partition-of-unity weights)
+/// for overlapping Schwarz clusters.
+fn apply_cluster_overlapping(
+    cluster: &ClusterFactor,
+    r: &Array1<f64>,
+    out: &mut Array1<f64>,
+    weights: &[f64],
+) {
+    match cluster {
+        ClusterFactor::Scalar { cols, inv } => {
+            for (local, &gi) in cols.iter().enumerate() {
+                out[gi] += weights[gi] * inv[local] * r[gi];
+            }
+        }
+        ClusterFactor::Chol { cols, factor } => {
+            let b = cols.len();
+            let mut rhs = Array1::<f64>::zeros(b);
+            for (local, &gi) in cols.iter().enumerate() {
+                rhs[local] = r[gi];
+            }
+            use faer::linalg::solvers::Solve;
+            let stride = rhs.strides()[0];
+            let len = rhs.len();
+            // SAFETY: rhs is uniquely-borrowed contiguous Array1 with positive stride.
+            let rhs_mat =
+                unsafe { faer::MatRef::from_raw_parts(rhs.as_ptr(), len, 1, stride, 0) };
+            let solved = factor.solve(rhs_mat);
+            for (local, &gi) in cols.iter().enumerate() {
+                out[gi] += weights[gi] * solved[(local, 0)];
+            }
+        }
+    }
+}
+
+/// Build scalar diagonal inverses for a set of global column indices.
+///
+/// Used when a cluster is non-PD or exceeds `CLUSTER_JACOBI_MAX_CLUSTER`.
+fn build_schur_scalar_inv<B: BatchedBlockSolver>(
+    sys: &ArrowSchurSystem,
+    htt_factors: &[Array2<f64>],
+    ridge_beta: f64,
+    backend: &B,
+    cols: &[usize],
+) -> Result<Vec<f64>, ArrowSchurError> {
+    let d = sys.d;
+    let mut result = Vec::with_capacity(cols.len());
+    let mut col_vec = Array1::<f64>::zeros(d);
+    for &gi in cols {
+        let base = match sys.hbb_diag.as_ref() {
+            Some(hd) => hd[gi],
+            None => {
+                if sys.hbb.dim() == (sys.k, sys.k) {
+                    sys.hbb[[gi, gi]]
+                } else {
+                    0.0
+                }
+            }
+        };
+        let mut s = base + ridge_beta;
+        for (row_idx, row) in sys.rows.iter().enumerate() {
+            for c in 0..d {
+                col_vec[c] = row.htbeta[[c, gi]];
+            }
+            let solved = backend.solve_block_vector(&htt_factors[row_idx], &col_vec);
+            let mut acc = 0.0;
+            for c in 0..d {
+                acc += col_vec[c] * solved[c];
+            }
+            s -= acc;
+        }
+        if !s.is_finite() || s <= 1e-18 {
+            return Err(ArrowSchurError::PcgFailed {
+                reason: format!(
+                    "cluster Schur scalar fallback: non-PD diagonal at index {gi}: {s}"
+                ),
+            });
+        }
+        result.push(1.0 / s);
+    }
+    Ok(result)
+}
+
+/// Inexact PCG with automatic preconditioner-ladder escalation.
+///
+/// Starts with `JacobiPreconditioner` (Diagonal or BetaBlockJacobi).
+/// If PCG hits `MaxIter` and `k > PRECOND_ESCALATE_K_THRESHOLD`,
+/// escalates to `ClusterJacobi`; if still `MaxIter`, escalates to
+/// `AdditiveSchwarz { overlap: 1 }`.
+fn steihaug_pcg_auto<B: BatchedBlockSolver>(
+    sys: &ArrowSchurSystem,
+    htt_factors: &[Array2<f64>],
+    ridge_beta: f64,
+    rhs: &Array1<f64>,
+    pcg: &ArrowPcgOptions,
+    trust: &ArrowTrustRegionOptions,
+    backend: &B,
+    gpu_matvec: Option<&GpuSchurMatvec>,
+    metric_weights: Option<&MetricWeights>,
+) -> Result<(Array1<f64>, PcgDiagnostics), ArrowSchurError> {
+    let jacobi =
+        JacobiPreconditioner::from_arrow_schur(sys, htt_factors, ridge_beta, backend)?;
+    let (x0, diag0) = run_pcg_with_preconditioner(
+        sys, htt_factors, ridge_beta, rhs, |r| jacobi.apply(r),
+        pcg, trust, backend, gpu_matvec, metric_weights,
+    )?;
+    if sys.k <= PRECOND_ESCALATE_K_THRESHOLD
+        || diag0.stopping_reason != PcgStopReason::MaxIter
+    {
+        return Ok((x0, diag0));
+    }
+    let cluster =
+        ClusterJacobiPreconditioner::from_arrow_schur(sys, htt_factors, ridge_beta, backend)?;
+    let (x1, diag1) = run_pcg_with_preconditioner(
+        sys, htt_factors, ridge_beta, rhs, |r| cluster.apply(r),
+        pcg, trust, backend, gpu_matvec, metric_weights,
+    )?;
+    if diag1.stopping_reason != PcgStopReason::MaxIter {
+        return Ok((x1, diag1));
+    }
+    let schwarz = AdditiveSchwarzPreconditioner::from_arrow_schur(
+        sys, htt_factors, ridge_beta, backend, 1,
+    )?;
+    run_pcg_with_preconditioner(
+        sys, htt_factors, ridge_beta, rhs, |r| schwarz.apply(r),
+        pcg, trust, backend, gpu_matvec, metric_weights,
+    )
+}
+
+/// Run Steihaug-CG with a generic preconditioner closure.
+/// Routes matvec through GPU when `gpu_matvec` is set.
+fn run_pcg_with_preconditioner<ApplyPrec, B: BatchedBlockSolver>(
+    sys: &ArrowSchurSystem,
+    htt_factors: &[Array2<f64>],
+    ridge_beta: f64,
+    rhs: &Array1<f64>,
+    apply_prec: ApplyPrec,
+    pcg: &ArrowPcgOptions,
+    trust: &ArrowTrustRegionOptions,
+    backend: &B,
+    gpu_matvec: Option<&GpuSchurMatvec>,
+    metric_weights: Option<&MetricWeights>,
+) -> Result<(Array1<f64>, PcgDiagnostics), ArrowSchurError>
+where
+    ApplyPrec: FnMut(&Array1<f64>) -> Array1<f64>,
+{
+    let max_iters = pcg.max_iterations.min(trust.max_iterations);
+    let tol = pcg.relative_tolerance.max(trust.steihaug_relative_tolerance);
+    if let Some(gpu_mv) = gpu_matvec {
+        let gpu_mv = Arc::clone(gpu_mv);
+        steihaug_cg(
+            rhs,
+            move |p, out| gpu_mv(p, out),
+            apply_prec,
+            max_iters,
+            tol,
+            trust.radius,
+            metric_weights,
+        )
+    } else {
+        steihaug_cg(
+            rhs,
+            |p, out| schur_matvec(sys, htt_factors, ridge_beta, p, out, backend),
+            apply_prec,
+            max_iters,
+            tol,
+            trust.radius,
+            metric_weights,
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct IdentityPreconditioner;
 
