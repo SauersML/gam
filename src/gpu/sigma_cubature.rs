@@ -55,6 +55,8 @@
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 use super::error::GpuError;
+#[cfg(target_os = "linux")]
+use super::error::GpuResultExt;
 use super::pirls_row::{CurvatureMode, PirlsRowFamily};
 
 /// Per-sigma-point GPU PIRLS input: penalty, reparameterisation transform,
