@@ -710,9 +710,7 @@ mod linux_impl {
         // gradient_data = QsᵀXᵀ W (mu - y) in transformed coordinates.
         let mut weighted_residual = finalmu.clone();
         weighted_residual -= &finalz;
-        for i in 0..n {
-            weighted_residual[i] *= input.priorweights[i];
-        }
+        weighted_residual *= &input.priorweights;
         // Xᵀ W r (in original coords) via DesignMatrix::transpose_vector_multiply.
         let xt_wr_orig = input.x_original.transpose_vector_multiply(&weighted_residual);
         // Rotate to transformed coords: QsᵀXᵀWr.
