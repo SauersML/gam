@@ -619,23 +619,27 @@ impl BlockEffectiveJacobian for RowScaledJacobian {
 
 /// Static specification for one parameter block in a custom family.
 ///
-/// `design` and `audit_design` are deliberately distinct concerns:
+/// `design` and `stacked_design` are two structurally distinct operators:
 ///
-/// * `design` is the **eta-producing operator**: `design · beta` yields
-///   `block_state.eta`, and the row count `design.nrows()` therefore equals
-///   `len(eta)`.  For multi-channel blocks (e.g. survival time-varying
-///   blocks that stack `[exit; entry; deriv]`) this is `k · n_subjects`,
-///   not `n_subjects`.
-/// * `audit_design`, when `Some`, is the **identifiability audit's view** —
-///   an `n_obs × p` matrix whose rows are independent observations and whose
-///   columns are the predictors the audit checks for cross-block alias.
-///   When `None`, the audit uses `design` itself (the correct default
-///   whenever `design.nrows() == n_obs`, i.e. single-channel blocks).
+/// * `design` is the **canonical, single-channel, n-observation operator**.
+///   `design.nrows()` ALWAYS equals `n_obs` (one row per training
+///   observation).  This is the matrix the identifiability audit, the
+///   shape policy, and every "what shape is this block?" reader inspect.
+///   For most blocks `design` is also the eta-producing operator used by
+///   the solver — see [`Self::solver_design`].
+/// * `stacked_design`, when `Some`, is the **multi-channel eta-producing
+///   operator** used by the solver.  Survival time-varying blocks stack
+///   `[exit; entry; deriv]` into a `(3·n × p)` operator here so the
+///   solver can produce a `3·n`-long `eta` in one mat-vec; the audit
+///   never sees this matrix.  When `None`, the solver uses `design` (the
+///   single-channel default).
 ///
-/// The two views can disagree in row count when a block packs multiple
-/// channels into `design` for solver convenience.  Carrying them as
-/// separate fields makes that disagreement explicit and impossible for
-/// downstream code to misread.
+/// The single contract that downstream code can rely on:
+/// `design.nrows() == n_obs`.  No more dual semantics on `design`.
+///
+/// Read access:
+/// * Audit / canonicalize / "n_obs is the row count" code → `&spec.design`.
+/// * Eta-producing solver code → [`Self::solver_design`].
 #[derive(Clone)]
 pub struct ParameterBlockSpec {
     pub name: String,
@@ -660,12 +664,20 @@ pub struct ParameterBlockSpec {
     /// authoritative source for `effective_jacobian_at`.  For simple
     /// single-output row-scaled blocks use [`RowScaledJacobian`].
     pub jacobian_callback: Option<Arc<dyn BlockEffectiveJacobian>>,
-    /// Optional audit-only design view.  When `Some`, the identifiability
-    /// audit uses this matrix instead of `design`; the solver always uses
-    /// `design` for eta evaluation.  Set this whenever `design.nrows()`
-    /// does not match the subject count (e.g. survival time-varying blocks
-    /// that stack `[exit; entry; deriv]` into `design`).
-    pub audit_design: Option<DesignMatrix>,
+    /// Optional multi-channel eta-producing operator used by the solver.
+    ///
+    /// When `Some`, the solver consumes this matrix (typically
+    /// `(k·n × p)` for `k` stacked channels — e.g. survival
+    /// `[exit; entry; deriv]` with `k = 3`) to evaluate `eta = stacked · β`.
+    /// The audit and shape policy NEVER read this field; they only ever
+    /// inspect `design` (which always has `n_obs` rows).
+    ///
+    /// When `None`, the solver falls back to `design` — the correct
+    /// behavior for every single-channel block (i.e. all non-survival
+    /// time-varying blocks).
+    ///
+    /// Read this field via [`Self::solver_design`], never directly.
+    pub stacked_design: Option<DesignMatrix>,
 }
 
 impl std::fmt::Debug for ParameterBlockSpec {
