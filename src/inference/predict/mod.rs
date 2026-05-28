@@ -2,10 +2,8 @@ pub mod input;
 pub mod linalg;
 
 use crate::estimate::{BlockRole, EstimationError, FittedLinkState, UnifiedFitResult};
-use crate::families::bernoulli_marginal_slope::{
-    EmpiricalZGrid, LatentMeasureKind, bernoulli_marginal_link_map,
-    empirical_intercept_from_marginal,
-};
+use crate::families::bernoulli_marginal_slope::{EmpiricalZGrid, LatentMeasureKind};
+use crate::families::bms::{bernoulli_marginal_link_map, empirical_intercept_from_marginal};
 use crate::families::lognormal_kernel::FrailtySpec;
 use crate::families::marginal_slope_shared::{
     ObservedDenestedCellPartials, eval_coeff4_at,

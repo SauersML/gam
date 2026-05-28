@@ -18,12 +18,8 @@
 //!   * β block widths after lift equal RAW widths (not compiled widths),
 //!     proving `SmgsLiftViaT::lift_block_betas_via_t` ran,
 //!   * predictions are finite,
-//!   * the active V log line is emitted at least once.
-//!
-//! NOTE: this test is written *ahead* of the sibling V+M cutover
-//! landing. Until those land it will fail (or refuse to compile against
-//! a sibling-renamed API). Do not run with `cargo test`; sibling work
-//! will run it once the cutover is in.
+//!   * the compiled-map log line is emitted at least once (proves the
+//!     channel-aware closed-form path ran, not the old per-term fallback).
 
 use csv::StringRecord;
 use gam::matrix::LinearOperator;

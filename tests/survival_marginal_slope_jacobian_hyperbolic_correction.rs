@@ -1070,7 +1070,7 @@ fn production_logslope_block_requires_scalars_at_nonzero_beta() {
         let result = cb.effective_jacobian_at(&state);
         assert!(
             result.is_err(),
-            "production LogslopeBlockJacobian must return Err when family_scalars=None              and beta is nonzero (g_i != 0); got Ok"
+            "production LogslopeBlockJacobian must return Err when family_scalars=None and beta is nonzero (g_i != 0); got Ok"
         );
         let msg = result.unwrap_err();
         assert!(
@@ -1119,7 +1119,7 @@ fn production_logslope_block_requires_scalars_at_nonzero_beta() {
         let rel_err = max_col_rel_error(&jac, &fd);
         assert!(
             rel_err < 1e-5,
-            "production LogslopeBlockJacobian with family_scalars: rel-error vs FD =              {rel_err:.3e} (expected < 1e-5). The hyperbolic correction formula is wrong."
+            "production LogslopeBlockJacobian with family_scalars: rel-error vs FD = {rel_err:.3e} (expected < 1e-5). The hyperbolic correction formula is wrong."
         );
     }
 
