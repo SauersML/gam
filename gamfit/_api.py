@@ -1323,17 +1323,41 @@ def explain_error(exc: BaseException) -> str:
     """
     if isinstance(exc, RustExtensionUnavailableError):
         return "Build the extension with maturin before calling Rust-backed APIs."
-    from ._exceptions import FormulaError, GamError, PredictionError, SchemaMismatchError
+    from ._exceptions import (
+        ColumnNotFoundError,
+        FormulaError,
+        GamError,
+        PredictionError,
+        SchemaMismatchError,
+    )
 
-    message = str(exc)
-    # Column-not-found errors carry actionable context (which column was
-    # referenced, which columns exist) in the message itself. Surface a hint
-    # that names the offending column and the available alternatives,
-    # regardless of whether the exception is the typed FormulaError or a
-    # bare ValueError (e.g. raised before the binding layer re-typed it).
-    column_hint = _column_not_found_hint(message)
-    if column_hint is not None:
-        return column_hint
+    # Column-not-found is a *typed* error: the Rust FFI boundary raises
+    # `ColumnNotFoundError` (a `FormulaError` subclass) with structured
+    # attributes attached by `workflow_error_to_pyerr` — `column`, `role`,
+    # `available`, `similar`, `tsv_hint`. Read them directly instead of
+    # parsing the formatted message text (the prior `_column_not_found_hint`
+    # regex was the wrong shape; see issue #305 / #343).
+    if isinstance(exc, ColumnNotFoundError):
+        column = getattr(exc, "column", None)
+        available = getattr(exc, "available", None)
+        if column is not None and available is not None:
+            return (
+                f"Column {column!r} is referenced by the formula but is not "
+                f"in the input table. Available columns: "
+                f"[{', '.join(available)}]. Fix the formula or add the "
+                f"column to the data."
+            )
+        if column is not None:
+            return (
+                f"Column {column!r} referenced by the formula is not "
+                f"present in the input table. Fix the formula or add the "
+                f"column to the data."
+            )
+        # The exception class itself encodes the failure mode even when
+        # the per-instance enrichment is unavailable (e.g. a future PyO3
+        # tightening prevented attribute attachment — see the unraisable
+        # warning emitted from the boundary). Fall back to the typed
+        # FormulaError hint rather than the unhelpful generic message.
 
     if isinstance(exc, FormulaError):
         return "Check the formula syntax and confirm every referenced column exists."
@@ -1344,43 +1368,6 @@ def explain_error(exc: BaseException) -> str:
     if isinstance(exc, GamError):
         return "The Rust engine returned an error. Inspect the exception message for the underlying failure detail."
     return "Unexpected error. Inspect the full traceback and the original exception message."
-
-
-def _column_not_found_hint(message: str) -> str | None:
-    """Detect a column-not-found message and return a column-specific hint.
-
-    The Rust data layer emits messages of the form::
-
-        column 'z' not found in data. Available columns: [x, y]
-        response column 'z' not found in data. Available columns: [x, y]
-
-    Returns a hint that names the missing column and the available
-    columns when the pattern matches; otherwise ``None``.
-    """
-    import re
-
-    lower = message.lower()
-    if "not found in data" not in lower and "available columns:" not in lower:
-        return None
-    name_match = re.search(r"column ['\"]([^'\"]+)['\"]", message)
-    avail_match = re.search(r"Available columns:\s*\[([^\]]*)\]", message)
-    missing = name_match.group(1) if name_match else None
-    available = avail_match.group(1).strip() if avail_match else None
-    if missing is not None and available is not None:
-        return (
-            f"Column {missing!r} is referenced by the formula but is not in "
-            f"the input table. Available columns: [{available}]. Fix the "
-            f"formula or add the column to the data."
-        )
-    if missing is not None:
-        return (
-            f"Column {missing!r} referenced by the formula is not present in "
-            f"the input table. Fix the formula or add the column to the data."
-        )
-    return (
-        "A formula-referenced column is missing from the input table. "
-        "Check the formula and confirm every referenced column exists."
-    )
 
 
 def bspline_basis(

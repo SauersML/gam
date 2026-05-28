@@ -729,16 +729,15 @@ impl PythonExceptionKind {
 
 #[pyfunction]
 fn classify_exception_message(message: String) -> &'static str {
+    // Column-not-found used to be routed here via substring matching
+    // (`"not found in data"` / `"available columns:"`). It now flows
+    // through the typed `WorkflowError::ColumnNotFound` →
+    // `gamfit.ColumnNotFoundError` dispatch in `workflow_error_to_pyerr`
+    // (issues #305 / #343), so the substring branch was removed: every
+    // column-not-found error reaches Python as the typed exception class
+    // before `map_exception` ever consults this fallback.
     let lower = message.to_lowercase();
-    // Column-not-found from formula evaluation surfaces from the Rust data
-    // layer as `column 'z' not found in data. Available columns: [...]`.
-    // That's a formula authoring error (referenced a column that doesn't
-    // exist), so route it to FormulaError so callers can catch it via
-    // `except gamfit.FormulaError` and `explain_error` returns the
-    // formula-specific hint instead of the generic fallback.
-    let is_column_not_found = lower.contains("not found in data")
-        || lower.contains("available columns:");
-    let kind = if lower.contains("formula") || lower.contains("parse") || is_column_not_found {
+    let kind = if lower.contains("formula") || lower.contains("parse") {
         PythonExceptionKind::Formula
     } else if lower.contains("schema")
         || lower.contains("missing required column")
