@@ -1286,7 +1286,7 @@ pub fn build_smooth_basis(
                 },
             })
         }
-        "tps" | "thinplate" | "thin-plate" => {
+        "tps" | "tp" | "thinplate" | "thin-plate" => {
             validate_known_options(
                 "thinplate",
                 options,
@@ -1447,7 +1447,7 @@ pub fn build_smooth_basis(
                 },
             })
         }
-        "matern" => {
+        "matern" | "gp" => {
             // Catch typos like `lengt_scale=` / `nyu=` / `centerz=` before
             // they get silently ignored and the user wonders why their
             // option had no effect. The matern() term accepts exactly
