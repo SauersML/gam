@@ -1749,22 +1749,6 @@ impl BernoulliMarginalSlopePredictor {
         let mut f_aa = 0.0;
         for partition_cell in cells {
             let cell = partition_cell.cell;
-            // `cell_second_derivative_from_moments` below contracts the
-            // outer-product of two cubic first-coefficient slices (length 4)
-            // with the inner cubic eta (length 4), yielding a product
-            // polynomial of degree 9 -> 10 moments. Requesting only 7 produced
-            // 8 moments and tripped the "insufficient reduced moments for
-            // second derivative: need 10, have 8" error at predict time.
-            // The matching call sites in `evaluate_cell_moments_observed_*`
-            // (and every other production caller of
-            // `cell_second_derivative_from_moments` across BMS / survival)
-            // already use max_degree = 9; align with them here.
-            let state =
-                crate::families::bernoulli_marginal_slope::exact_kernel::evaluate_cell_moments(
-                    cell, 9,
-                )
-                .map_err(EstimationError::InvalidInput)?;
-            f += state.value;
             let (dc_da_raw, _) = crate::families::bernoulli_marginal_slope::exact_kernel::denested_cell_coefficient_partials(
                 partition_cell.score_span,
                 partition_cell.link_span,
@@ -1779,6 +1763,22 @@ impl BernoulliMarginalSlopePredictor {
             );
             let dc_da = scale_coeff4(dc_da_raw, scale);
             let d2c_da2 = scale_coeff4(d2c_da2_raw, scale);
+            // Derive the moment `max_degree` from the contractions consumed
+            // below, instead of hardcoding a magic constant. The second-
+            // derivative contraction dominates the first-derivative one, so
+            // its required degree is the binding bound. Hardcoding 7 here
+            // produced 8 moments while the contraction needs 10 (#321).
+            let max_degree = crate::families::bernoulli_marginal_slope::exact_kernel::cell_second_derivative_required_max_degree(
+                &dc_da,
+                &dc_da,
+                &d2c_da2,
+            );
+            let state =
+                crate::families::bernoulli_marginal_slope::exact_kernel::evaluate_cell_moments(
+                    cell, max_degree,
+                )
+                .map_err(EstimationError::InvalidInput)?;
+            f += state.value;
             f_a += crate::families::bernoulli_marginal_slope::exact_kernel::cell_first_derivative_from_moments(
                 &dc_da,
                 &state.moments,

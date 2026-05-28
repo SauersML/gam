@@ -65,8 +65,8 @@ use crate::terms::{
     TotalVariationPenalty,
 };
 use crate::types::{
-    InverseLink, LatentCLogLogState, LikelihoodSpec, LinkFunction, MixtureLinkSpec, ResponseFamily,
-    SasLinkSpec, StandardLink, WigglePenaltyConfig,
+    InverseLink, LatentCLogLogState, LikelihoodSpec, LinkFunction, MixtureLinkSpec,
+    ResponseColumnKind, ResponseFamily, SasLinkSpec, StandardLink, WigglePenaltyConfig,
 };
 
 use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, Axis, s};
@@ -3144,18 +3144,24 @@ pub fn resolve_family(
         return Ok(spec);
     }
 
-    // Auto-detect
-    if is_binary_response(y) {
-        Ok(LikelihoodSpec::new(
-            ResponseFamily::Binomial,
-            InverseLink::Standard(StandardLink::Logit),
-        ))
-    } else {
-        Ok(LikelihoodSpec::new(
-            ResponseFamily::Gaussian,
-            InverseLink::Standard(StandardLink::Identity),
-        ))
-    }
+    // Auto-detect: delegate to `ResponseFamily::infer_from_response` so the
+    // refusal policy for non-numeric response columns lives in one place
+    // (the family layer), not duplicated across every entry point. The link
+    // is derived from the inferred response: Binomial → Logit, Gaussian →
+    // Identity. The link_choice branch above already covered the case where
+    // the user pinned a link without a family.
+    let response = ResponseFamily::infer_from_response(y, y_kind).map_err(|refusal| {
+        let err: String = WorkflowError::InvalidConfig {
+            reason: refusal.message_for(response_name),
+        }
+        .into();
+        err
+    })?;
+    let link = match response {
+        ResponseFamily::Binomial => InverseLink::Standard(StandardLink::Logit),
+        _ => InverseLink::Standard(StandardLink::Identity),
+    };
+    Ok(LikelihoodSpec::new(response, link))
 }
 
 // ---------------------------------------------------------------------------

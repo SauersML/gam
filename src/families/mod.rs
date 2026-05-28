@@ -42,5 +42,6 @@ pub use identifiability_compiler::{
     RowJacobianOperator, compile,
 };
 pub use vector_response::{
-    GaussianVectorLikelihood, VectorLikelihood, VectorNoise, VectorResponseTarget,
+    GaussianVectorLikelihood, MultinomialLogitLikelihood, VectorLikelihood, VectorNoise,
+    VectorResponseTarget,
 };

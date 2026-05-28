@@ -371,6 +371,250 @@ impl VectorLikelihood for GaussianVectorLikelihood {
 // Piece 5 / Piece 1 row-block support
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Multinomial-logit (softmax) likelihood with explicit reference class.
+///
+/// Conventions:
+/// - `K` is the total number of classes; the linear predictor has `M = K - 1`
+///   columns corresponding to the *active* classes. Class `K - 1` is the
+///   reference class with η_{K-1} ≡ 0 (so the gauge is fixed by construction
+///   and no additional sum-to-zero projection is required at the η level).
+/// - `y` is the one-hot encoded response with shape `(N, K)`. Rows must sum to
+///   row weights (typically 1.0); each row puts mass on exactly one class for
+///   hard-label classification.
+/// - `eta` is the active linear predictor with shape `(N, M = K - 1)`.
+///
+/// Softmax with baseline:
+/// ```text
+///     p_a   = exp(η_a) / (1 + Σ_b exp(η_b))           for a ∈ [0, K-1)
+///     p_{K-1} = 1 / (1 + Σ_b exp(η_b))
+/// ```
+///
+/// Log-likelihood (rows with weight `w_n`, default 1.0):
+/// ```text
+///     log L = Σ_n w_n · ( Σ_{a < K-1} y_{n,a} · η_{n,a} − log(1 + Σ_b exp(η_{n,b})) )
+///           = Σ_n w_n · Σ_{c ∈ [0, K)} y_{n,c} · log p_{n,c}
+/// ```
+///
+/// Per-row gradient w.r.t. the active η is the canonical Bernoulli/softmax
+/// residual:
+/// ```text
+///     ∂ log L / ∂η_{n,a} = w_n · (y_{n,a} − p_{n,a})       for a ∈ [0, K-1)
+/// ```
+///
+/// Per-row Fisher (= observed, since logit is canonical for the multinomial)
+/// information block, shape `(M, M)`:
+/// ```text
+///     H_{n,a,b} = w_n · ( p_{n,a} · δ_{ab} − p_{n,a} · p_{n,b} )
+/// ```
+///
+/// This is the standard reference-coded multinomial-logit GLM. The dense
+/// per-row block flows through [`VectorLikelihood::hess_block`] into
+/// [`crate::solver::pirls::dense_block_xtwx`], which builds the stacked
+/// `XᵀWX` in output-major coefficient ordering `β = [β_0; β_1; …; β_{K-2}]`
+/// with each per-class block of size `(P, P)`.
+#[derive(Clone, Debug)]
+pub struct MultinomialLogitLikelihood {
+    /// Number of active classes `M = K − 1`. Cached for shape checks.
+    pub active_classes: usize,
+    /// Optional row weights (length N), or `None` for uniform 1.0.
+    pub row_weights: Option<Array1<f64>>,
+}
+
+impl MultinomialLogitLikelihood {
+    /// Construct from the total number of classes `K ≥ 2`.
+    pub fn with_classes(total_classes: usize) -> Result<Self, EstimationError> {
+        if total_classes < 2 {
+            crate::bail_invalid_estim!(
+                "MultinomialLogitLikelihood requires K ≥ 2 classes (got {total_classes})"
+            );
+        }
+        Ok(Self {
+            active_classes: total_classes - 1,
+            row_weights: None,
+        })
+    }
+
+    /// Attach per-row weights (length N, finite and non-negative).
+    pub fn with_row_weights(mut self, w: Array1<f64>) -> Result<Self, EstimationError> {
+        validate_row_weights(&w, w.len())?;
+        self.row_weights = Some(w);
+        Ok(self)
+    }
+
+    /// Total class count `K = M + 1`.
+    #[inline]
+    pub fn total_classes(&self) -> usize {
+        self.active_classes + 1
+    }
+
+    #[inline]
+    fn row_weight(&self, n: usize) -> f64 {
+        self.row_weights.as_ref().map_or(1.0, |w| w[n])
+    }
+
+    /// Numerically-stable softmax with implicit reference column (η_{K-1} = 0).
+    ///
+    /// Writes `K` probabilities into `out` (length `M + 1`). The shift uses
+    /// `max(0, max(eta_active))` so the reference class is included in the
+    /// max and the denominator stays bounded.
+    fn softmax_with_baseline(eta_active: &[f64], out: &mut [f64]) {
+        debug_assert_eq!(out.len(), eta_active.len() + 1);
+        let mut max_eta = 0.0_f64;
+        for &v in eta_active {
+            if v > max_eta {
+                max_eta = v;
+            }
+        }
+        let baseline = (-max_eta).exp();
+        let mut denom = baseline;
+        for (idx, &v) in eta_active.iter().enumerate() {
+            let e = (v - max_eta).exp();
+            out[idx] = e;
+            denom += e;
+        }
+        for v in out.iter_mut().take(eta_active.len()) {
+            *v /= denom;
+        }
+        out[eta_active.len()] = baseline / denom;
+    }
+
+    /// Convenience: compute the full (N, K) probability matrix from
+    /// (N, K-1) active linear predictor. This is the multinomial inverse
+    /// link used by prediction.
+    pub fn probabilities(&self, eta: ArrayView2<f64>) -> Array2<f64> {
+        let n = eta.nrows();
+        let m = self.active_classes;
+        assert_eq!(eta.ncols(), m, "η must have K-1 columns");
+        let k = self.total_classes();
+        let mut probs = Array2::<f64>::zeros((n, k));
+        let mut eta_row = vec![0.0_f64; m];
+        let mut probs_row = vec![0.0_f64; k];
+        for row in 0..n {
+            for j in 0..m {
+                eta_row[j] = eta[[row, j]];
+            }
+            Self::softmax_with_baseline(&eta_row, &mut probs_row);
+            for j in 0..k {
+                probs[[row, j]] = probs_row[j];
+            }
+        }
+        probs
+    }
+}
+
+impl VectorLikelihood for MultinomialLogitLikelihood {
+    fn log_lik(&self, eta: ArrayView2<f64>, y: ArrayView2<f64>) -> f64 {
+        let n = eta.nrows();
+        let m = self.active_classes;
+        let k = self.total_classes();
+        assert_eq!(eta.ncols(), m, "η must have K-1 columns");
+        assert_eq!(y.dim(), (n, k), "y must be (N, K) one-hot encoded");
+        let mut acc = 0.0_f64;
+        let mut eta_row = vec![0.0_f64; m];
+        let mut probs_row = vec![0.0_f64; k];
+        for row in 0..n {
+            let w = self.row_weight(row);
+            for j in 0..m {
+                eta_row[j] = eta[[row, j]];
+            }
+            Self::softmax_with_baseline(&eta_row, &mut probs_row);
+            let mut row_acc = 0.0_f64;
+            for c in 0..k {
+                let yc = y[[row, c]];
+                if yc != 0.0 {
+                    // Guard against log(0) when p underflows; clamp the
+                    // probability away from zero by 1e-300 — outside the
+                    // representable range, the residual still drives the
+                    // gradient correctly.
+                    let p = probs_row[c].max(1.0e-300);
+                    row_acc += yc * p.ln();
+                }
+            }
+            acc += w * row_acc;
+        }
+        acc
+    }
+
+    fn grad_eta(&self, eta: ArrayView2<f64>, y: ArrayView2<f64>) -> Array2<f64> {
+        let n = eta.nrows();
+        let m = self.active_classes;
+        let k = self.total_classes();
+        assert_eq!(eta.ncols(), m, "η must have K-1 columns");
+        assert_eq!(y.dim(), (n, k), "y must be (N, K) one-hot encoded");
+        let mut out = Array2::<f64>::zeros((n, m));
+        let mut eta_row = vec![0.0_f64; m];
+        let mut probs_row = vec![0.0_f64; k];
+        for row in 0..n {
+            let w = self.row_weight(row);
+            for j in 0..m {
+                eta_row[j] = eta[[row, j]];
+            }
+            Self::softmax_with_baseline(&eta_row, &mut probs_row);
+            for j in 0..m {
+                out[[row, j]] = w * (y[[row, j]] - probs_row[j]);
+            }
+        }
+        out
+    }
+
+    fn hess_diag(&self, eta: ArrayView2<f64>, y: ArrayView2<f64>) -> Array2<f64> {
+        // Per-row diagonal of the (M, M) Fisher block:
+        //     H_{n,a,a} = w_n · p_{n,a} · (1 − p_{n,a})
+        // Provided for callers that explicitly want the diagonal-only
+        // preconditioner; the joint dense block ships through `hess_block`.
+        let n = eta.nrows();
+        let m = self.active_classes;
+        let k = self.total_classes();
+        assert_eq!(eta.ncols(), m, "η must have K-1 columns");
+        assert_eq!(y.dim(), (n, k), "y must be (N, K) one-hot encoded");
+        let mut out = Array2::<f64>::zeros((n, m));
+        let mut eta_row = vec![0.0_f64; m];
+        let mut probs_row = vec![0.0_f64; k];
+        for row in 0..n {
+            let w = self.row_weight(row);
+            for j in 0..m {
+                eta_row[j] = eta[[row, j]];
+            }
+            Self::softmax_with_baseline(&eta_row, &mut probs_row);
+            for j in 0..m {
+                let p = probs_row[j];
+                out[[row, j]] = w * p * (1.0 - p);
+            }
+        }
+        out
+    }
+
+    fn hess_block(&self, eta: ArrayView2<f64>, y: ArrayView2<f64>) -> Array3<f64> {
+        // Per-row dense (M, M) Fisher / observed-information block:
+        //     H_{n,a,b} = w_n · ( p_{n,a} · δ_{ab} − p_{n,a} · p_{n,b} )
+        let n = eta.nrows();
+        let m = self.active_classes;
+        let k = self.total_classes();
+        assert_eq!(eta.ncols(), m, "η must have K-1 columns");
+        assert_eq!(y.dim(), (n, k), "y must be (N, K) one-hot encoded");
+        let mut out = Array3::<f64>::zeros((n, m, m));
+        let mut eta_row = vec![0.0_f64; m];
+        let mut probs_row = vec![0.0_f64; k];
+        for row in 0..n {
+            let w = self.row_weight(row);
+            for j in 0..m {
+                eta_row[j] = eta[[row, j]];
+            }
+            Self::softmax_with_baseline(&eta_row, &mut probs_row);
+            for a in 0..m {
+                let pa = probs_row[a];
+                out[[row, a, a]] = w * pa * (1.0 - pa);
+                for b in (a + 1)..m {
+                    let off = -w * pa * probs_row[b];
+                    out[[row, a, b]] = off;
+                    out[[row, b, a]] = off;
+                }
+            }
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

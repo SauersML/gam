@@ -107,8 +107,18 @@ class Model:
         """
         headers, rows, table_kind = normalize_table(data)
         row_ids = extract_row_ids(headers, rows, id_column)
+        # ``with_uncertainty=True`` is documented to imply a credible-interval
+        # request when no explicit level was given; resolve that implication
+        # here at the API boundary so the rest of the pipeline (Rust opts +
+        # the shape policy in ``_predict_shape``) only ever sees a single
+        # ``interval`` signal. After this normalisation, ``with_uncertainty``
+        # is purely a Rust-side opts flag controlling which uncertainty
+        # decomposition is computed; shape policy is driven by ``interval``.
+        effective_interval = interval
+        if effective_interval is None and with_uncertainty:
+            effective_interval = 0.95
         opts_json = rust_module().build_model_predict_payload_json(
-            self._model_bytes, headers, rows, interval, with_uncertainty
+            self._model_bytes, headers, rows, effective_interval, with_uncertainty
         )
         try:
             raw = rust_module().predict_table(
@@ -124,10 +134,9 @@ class Model:
             training_table_kind=self._training_table_kind,
             fallback_model_class=self._model_class_from_payload(),
             fallback_family=self._family_from_payload(),
-            interval=interval,
+            interval=effective_interval,
             return_type=return_type,
             id_column=id_column,
-            with_uncertainty=with_uncertainty,
             row_ids=row_ids,
             restore=restore_output_table,
         )
