@@ -2073,11 +2073,11 @@ extern "C" __global__ void status_or(
             // The quadratic in alpha expands as:
             //   penalty(beta) + alpha * [2 d^T (S beta - linear_shift)]
             //                  + alpha^2 * d^T S d
-            let sd = penalty_hessian.dot(ndarray::ArrayView1::from(&direction_host));
+            let sd = penalty_hessian.dot(ndarray::aview1(&direction_host));
             let s_beta = penalty_hessian.dot(&beta_host);
-            let dtsd = ndarray::ArrayView1::from(&direction_host).dot(&sd);
+            let dtsd = ndarray::aview1(&direction_host).dot(&sd);
             let linear_coeff = 2.0
-                * ndarray::ArrayView1::from(&direction_host)
+                * ndarray::aview1(&direction_host)
                     .dot(&(&s_beta - linear_shift));
             let penalty_beta = beta_host.dot(&s_beta)
                 - 2.0 * beta_host.dot(&linear_shift)
