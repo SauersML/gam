@@ -75,12 +75,13 @@ predictor, and `effective_variance` is its square. `mean_lower` /
 `interval`.
 
 For survival location-scale, predictions return a
-[`SurvivalPrediction`](predictions.md#survivalprediction). Pass
-`with_uncertainty=True` to get delta-method standard errors on the
-survival surface and linear predictor:
+[`SurvivalPrediction`](predictions.md#survivalprediction). Pass any
+`interval=...` to get delta-method standard errors on the survival
+surface and linear predictor (issue #342 — the single `interval` knob
+replaces the previous `with_uncertainty` boolean):
 
 ```python
-pred = model.predict(test_df, with_uncertainty=True)
+pred = model.predict(test_df, interval=0.95)
 S    = pred.survival_at([1, 5, 10])
 se_S = pred.survival_se_at([1, 5, 10])
 ```
