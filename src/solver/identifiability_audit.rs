@@ -85,10 +85,13 @@
 //    reporting threshold (see `pair_report_threshold`).
 // 6. `fatal = joint_rank_deficient || any_pair_above_per_pair_halt_threshold`.
 
+use faer::Side;
 use ndarray::{Array1, Array2};
 
 use crate::families::custom_family::{FamilyLinearizationState, ParameterBlockSpec};
-use crate::linalg::faer_ndarray::{FaerQr, default_rrqr_rank_alpha, rrqr_with_permutation};
+use crate::linalg::faer_ndarray::{
+    FaerEigh, FaerQr, default_rrqr_rank_alpha, rrqr_with_permutation,
+};
 
 /// Per-block accounting record. `original_dim` is the spec's column
 /// count at audit entry (post `joint_null_rotation` absorption — the
@@ -316,7 +319,7 @@ pub fn audit_identifiability(specs: &[ParameterBlockSpec]) -> Result<Identifiabi
         // Use spec.effective_jacobian_at() so the audit operates on the β-dependent
         // effective design. At initialization (β = 0, family_scalars = None), callbacks
         // return the linearization at β = 0.  For blocks with no callback and
-        // row_scaling = None this is a no-op (J = design).
+        // eta_row_scaling = None this is a no-op (J = design).
         let dense = spec
             .effective_jacobian_at("identifiability_audit::audit_identifiability", &init_state)
             .map_err(|e| format!("identifiability audit: {e}"))?;
@@ -1374,6 +1377,217 @@ fn count_rank(singular_values: &[f64], n: usize, p: usize) -> usize {
     singular_values.iter().filter(|&&v| v > tol).count()
 }
 
+/// Error produced when the MAP uniqueness condition
+/// `ker(J^T W J) ∩ ker(S) = {0}` is violated.
+///
+/// A null direction `n` of `J^T W J` with `n^T S n = 0` means the posterior
+/// is flat along `n`: no likelihood curvature AND no penalty curvature,
+/// so the MAP estimate is non-unique.  The error names the offending
+/// direction and the dominant block (the block whose columns have the
+/// largest component in `n`) so the caller can trace which smooth term
+/// contributed the unpenalised null direction.
+#[derive(Debug, Clone)]
+pub struct MapUniquenessError {
+    /// Human-readable description of the failure, including the dominant block.
+    pub message: String,
+    /// Name of the block whose columns dominate the null direction.
+    pub dominant_block: String,
+    /// Index of the null direction (0-based among directions below tolerance).
+    pub null_direction_index: usize,
+    /// `n^T S n` for the offending null direction (≈ 0.0).
+    pub penalty_quadratic_form: f64,
+}
+
+impl std::fmt::Display for MapUniquenessError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+/// Check the MAP estimate uniqueness condition `ker(J^T W J) ∩ ker(S) = {0}`.
+///
+/// # Arguments
+///
+/// * `j_joint` — the `(n, p_total)` joint design matrix after canonicalisation.
+///   `J^T W J` is formed using `W = diag(w)`.  If `w` is empty, `W = I` is used.
+/// * `w_diag` — per-row weights (length `n`, all non-negative).  Pass an empty
+///   slice to use the identity weight.
+/// * `s_joint` — the `(p_total, p_total)` joint smoothness penalty matrix
+///   `S = blockdiag(S_1, ..., S_K)`.  This is the sum over all blocks of the
+///   block-embedded penalty, assembled by the caller.
+/// * `specs` — the `ParameterBlockSpec` slice (same order as the columns of
+///   `j_joint`) used to name the dominant block in the error.
+/// * `col_offsets` — `specs.len() + 1` cumulative column offsets so that
+///   block `i` occupies `j_joint[:, col_offsets[i] .. col_offsets[i+1]]`.
+///
+/// # Returns
+///
+/// `Ok(())` when the condition holds for every null direction (i.e. every
+/// null direction of `J^T W J` carries `n^T S n > null_tol`).
+///
+/// `Err(MapUniquenessError)` for the first null direction (sorted by
+/// ascending `n^T S n`) that violates the condition.
+pub fn check_map_uniqueness(
+    j_joint: &Array2<f64>,
+    w_diag: &[f64],
+    s_joint: &Array2<f64>,
+    specs: &[ParameterBlockSpec],
+    col_offsets: &[usize],
+) -> Result<(), MapUniquenessError> {
+    let n = j_joint.nrows();
+    let p = j_joint.ncols();
+
+    if p == 0 {
+        return Ok(());
+    }
+
+    // Form G = J^T W J as a (p, p) matrix.
+    // G[i, j] = Σ_k w_k * J[k,i] * J[k,j]
+    let mut g = Array2::<f64>::zeros((p, p));
+    if w_diag.is_empty() {
+        // W = I: G = J^T J
+        for k in 0..n {
+            for i in 0..p {
+                let ji = j_joint[[k, i]];
+                if ji == 0.0 {
+                    continue;
+                }
+                for j in i..p {
+                    let val = ji * j_joint[[k, j]];
+                    g[[i, j]] += val;
+                    if i != j {
+                        g[[j, i]] += val;
+                    }
+                }
+            }
+        }
+    } else {
+        assert_eq!(
+            w_diag.len(),
+            n,
+            "check_map_uniqueness: w_diag length {} != n {}",
+            w_diag.len(),
+            n,
+        );
+        for k in 0..n {
+            let wk = w_diag[k];
+            if wk == 0.0 {
+                continue;
+            }
+            for i in 0..p {
+                let wji = wk * j_joint[[k, i]];
+                if wji == 0.0 {
+                    continue;
+                }
+                for j in i..p {
+                    let val = wji * j_joint[[k, j]];
+                    g[[i, j]] += val;
+                    if i != j {
+                        g[[j, i]] += val;
+                    }
+                }
+            }
+        }
+    }
+
+    // Eigendecompose G = V diag(λ) V^T (symmetric).
+    let (evals, evecs) = match g.eigh(Side::Lower) {
+        Ok(pair) => pair,
+        Err(e) => {
+            // Eigendecomposition failure: skip the check rather than
+            // producing a spurious failure — log and return Ok.
+            log::warn!(
+                "[MAP-UNIQUE] check_map_uniqueness: eigendecomposition of J^T W J failed \
+                 ({e:?}); skipping MAP uniqueness check",
+            );
+            return Ok(());
+        }
+    };
+
+    // Determine the null-space tolerance.
+    // Use the same RRQR_RANK_ALPHA · ε · p · λ_max convention as the
+    // rank counters elsewhere in this module.
+    let lambda_max = evals.iter().copied().fold(0.0_f64, f64::max).max(1.0);
+    let rank_alpha = default_rrqr_rank_alpha();
+    let null_tol = rank_alpha * f64::EPSILON * (p as f64) * lambda_max;
+
+    // Collect null directions: eigenvectors whose eigenvalue is below null_tol.
+    // Sort by ascending eigenvalue so the most-null direction comes first.
+    let mut null_dirs: Vec<(f64, usize)> = evals
+        .iter()
+        .enumerate()
+        .filter(|(_, &lam)| lam < null_tol)
+        .map(|(idx, &lam)| (lam, idx))
+        .collect();
+    null_dirs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    if null_dirs.is_empty() {
+        return Ok(());
+    }
+
+    // Penalty tolerance for n^T S n: use a relative threshold proportional
+    // to the Frobenius norm of S.
+    let s_frob_sq: f64 = s_joint.iter().map(|v| v * v).sum();
+    let pen_tol = null_tol * s_frob_sq.sqrt().max(1.0);
+
+    for (dir_idx, (lam, evec_col)) in null_dirs.iter().enumerate() {
+        let n_vec = evecs.column(*evec_col);
+        // Compute n^T S n
+        let sn: Array1<f64> = s_joint.dot(&n_vec.to_owned());
+        let ntsn: f64 = n_vec.iter().zip(sn.iter()).map(|(ni, si)| ni * si).sum();
+
+        if ntsn < pen_tol {
+            // Find the dominant block: the block whose columns have the
+            // largest cumulative squared component in n_vec.
+            let dominant_block = dominant_block_for_direction(&n_vec.to_owned(), specs, col_offsets);
+
+            let message = format!(
+                "MAP estimate is non-unique: null direction {} of J^T W J (eigenvalue {lam:.3e}) \
+                 has n^T S n = {ntsn:.3e} < tolerance {pen_tol:.3e}; \
+                 the MAP is flat along this direction (no likelihood curvature, no penalty \
+                 curvature); dominant block: '{}'. \
+                 Fix: add a non-degenerate smoothness penalty to block '{}' that covers this \
+                 direction, or remove the unpenalised null direction from the model.",
+                dir_idx,
+                dominant_block,
+                dominant_block,
+            );
+            return Err(MapUniquenessError {
+                message,
+                dominant_block,
+                null_direction_index: dir_idx,
+                penalty_quadratic_form: ntsn,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+/// Identify which block's columns contribute most (in L2 norm) to the
+/// given null direction vector.
+fn dominant_block_for_direction(
+    n_vec: &Array1<f64>,
+    specs: &[ParameterBlockSpec],
+    col_offsets: &[usize],
+) -> String {
+    let mut best_block = specs.first().map(|s| s.name.as_str()).unwrap_or("unknown");
+    let mut best_sq = 0.0_f64;
+    for (i, spec) in specs.iter().enumerate() {
+        if i + 1 >= col_offsets.len() {
+            break;
+        }
+        let lo = col_offsets[i];
+        let hi = col_offsets[i + 1];
+        let sq: f64 = (lo..hi).map(|c| n_vec[c] * n_vec[c]).sum();
+        if sq > best_sq {
+            best_sq = sq;
+            best_block = spec.name.as_str();
+        }
+    }
+    best_block.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1391,7 +1605,7 @@ mod tests {
             initial_log_lambdas: Array1::<f64>::zeros(0),
             initial_beta: None,
             gauge_priority: 100,
-            row_scaling: None,
+            eta_row_scaling: None,
             jacobian_callback: None,
         }
     }

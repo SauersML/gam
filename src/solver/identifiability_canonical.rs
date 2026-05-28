@@ -611,7 +611,7 @@ pub fn canonicalize_for_identifiability(
             // jacobian_callback (if any) is also forwarded: the callback
             // internally uses the raw design width, which the column-
             // selection T_i accounts for by selecting surviving columns.
-            row_scaling: spec.row_scaling.clone(),
+            eta_row_scaling: spec.eta_row_scaling.clone(),
             jacobian_callback: spec.jacobian_callback.clone(),
         });
         per_block_transform.push(t_i);
@@ -814,7 +814,7 @@ mod tests {
             initial_log_lambdas: Array1::<f64>::zeros(0),
             initial_beta: None,
             gauge_priority: 100,
-            row_scaling: None,
+            eta_row_scaling: None,
             jacobian_callback: None,
         }
     }

@@ -1,3 +1,5 @@
+pub mod gpu_gate;
+
 #[macro_export]
 macro_rules! assert_manual_ad_band {
     ($case:expr, $x:expr, $quantity:expr, $manual:expr, $( $name:expr => $value:expr ),+ $(,)?) => {{
