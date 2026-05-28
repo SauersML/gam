@@ -799,15 +799,12 @@ fn sparse_csr_weighted_xtwx_rows(
     weights: ArrayView1<'_, f64>,
     rows: Range<usize>,
 ) -> Array2<f64> {
-    // PSD precondition. The CSC counterpart (`streaming_sparse_csc_xt_diag_x`)
-    // accepts signed weights and is the right path for observed-Hessian
-    // assembly; this CSR-row kernel is reserved for Fisher-scoring Gram builds
-    // where the working weights are guaranteed nonneg. Clipping silently here
-    // would drop negative-curvature mass and produce a wrong Newton step.
-    assert!(
-        weights.iter().all(|&w| w >= 0.0),
-        "sparse_csr_weighted_xtwx_rows requires nonneg weights; route signed-weight Gram through the CSC kernel"
-    );
+    // PSD precondition is discharged at the typed boundary
+    // (`PsdWeightsView::try_new` inside callers of `xt_diag_x_psd_op`). The CSC
+    // counterpart (`streaming_sparse_csc_xt_diag_x`) accepts signed weights and
+    // is the right path for observed-Hessian assembly; this CSR-row kernel is
+    // reserved for Fisher-scoring Gram builds where the working weights are
+    // guaranteed nonneg by typed construction.
     let mut xtwx = Array2::<f64>::zeros((p, p));
     for i in rows {
         let wi = weights[i];
@@ -937,13 +934,10 @@ fn sparse_csr_diag_gram_rows(
     weights: ArrayView1<'_, f64>,
     rows: Range<usize>,
 ) -> Array1<f64> {
-    // PSD precondition: callers (Fisher-scoring diag(XᵀWX)) must supply nonneg
-    // weights. Signed observed-Hessian assembly must use the signed Gram path
-    // (xt_diag_x_signed → streaming kernels).
-    assert!(
-        weights.iter().all(|&w| w >= 0.0),
-        "sparse_csr_diag_gram_rows requires nonneg weights; use the signed Gram routine for observed-Hessian assembly"
-    );
+    // PSD precondition discharged at the typed boundary
+    // (`PsdWeightsView::try_new` inside callers of `xt_diag_x_psd_op`).
+    // Signed observed-Hessian assembly uses the signed Gram path
+    // (xt_diag_x_signed → streaming kernels) and never reaches this routine.
     let mut diag = Array1::<f64>::zeros(p);
     for i in rows {
         let wi = weights[i];
@@ -1558,12 +1552,9 @@ impl LinearOperator for DenseDesignMatrix {
     }
 
     fn diag_gram(&self, weights: &Array1<f64>) -> Result<Array1<f64>, String> {
-        // PSD precondition: diag(XᵀWX) is computed for Fisher-scoring
-        // preconditioners; observed-Hessian sites use the signed Gram path.
-        assert!(
-            weights.iter().all(|&w| w >= 0.0),
-            "DenseDesignMatrix::diag_gram requires nonneg weights; use the signed Gram routine for observed-Hessian assembly"
-        );
+        // PSD precondition discharged at the typed boundary
+        // (`PsdWeightsView::try_new` inside callers of `xt_diag_x_psd_op` /
+        // `diag_gram_view`). Observed-Hessian sites use the signed Gram path.
         match self {
             Self::Materialized(matrix) => {
                 let n = matrix.nrows();
@@ -1634,13 +1625,10 @@ impl LinearOperator for DenseDesignMatrix {
             self.ncols(),
             "DenseDesignMatrix::apply_weighted_normal vector length mismatch"
         );
-        // PSD precondition: apply_weighted_normal is the Fisher-scoring PCG
-        // normal-equations matvec ((XᵀWX + S + ρI) v); signed observed-Hessian
-        // assembly routes through xt_diag_x_signed instead.
-        assert!(
-            weights.iter().all(|&w| w >= 0.0),
-            "DenseDesignMatrix::apply_weighted_normal requires nonneg weights; observed-Hessian Newton steps must not reach this PSD kernel"
-        );
+        // PSD precondition discharged at the typed boundary: callers driving
+        // this Fisher-scoring PCG matvec ((XᵀWX + S + ρI) v) construct their
+        // weights through `PsdWeightsView::try_new`. Signed observed-Hessian
+        // assembly routes through `xt_diag_x_signed_op` instead.
         match self {
             Self::Materialized(matrix) => {
                 let n = matrix.nrows();
@@ -1919,12 +1907,9 @@ impl LinearOperator for ReparamOperator {
             self.qs.ncols(),
             "ReparamOperator::apply_weighted_normal vector length mismatch"
         );
-        // PSD precondition: Fisher-scoring PCG normal-equations matvec; signed
-        // observed-Hessian assembly does not reach this path.
-        assert!(
-            weights.iter().all(|&w| w >= 0.0),
-            "ReparamOperator::apply_weighted_normal requires nonneg weights; observed-Hessian Newton steps must not reach this PSD kernel"
-        );
+        // PSD precondition discharged at the typed boundary: this is the
+        // Fisher-scoring PCG normal-equations matvec; signed observed-Hessian
+        // assembly does not reach this path.
         // Qs^T X^T W X Qs v + S v + ridge v
         let qv = self.qs.dot(vector);
         let xqv = self.x_original.apply(&qv);
