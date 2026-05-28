@@ -26085,7 +26085,6 @@ mod tests {
             gauge_priority: 100,
             jacobian_callback: None,
             audit_design: None,
-        audit_design: None,
         };
         let deriv = CustomFamilyBlockPsiDerivative {
             penalty_index: None,
@@ -26592,7 +26591,6 @@ mod tests {
             gauge_priority: 100,
             jacobian_callback: None,
             audit_design: None,
-        audit_design: None,
         };
         let outer_opts = BlockwiseFitOptions {
             inner_max_cycles: 30,
@@ -26802,7 +26800,6 @@ mod tests {
             gauge_priority: 100,
             jacobian_callback: None,
             audit_design: None,
-        audit_design: None,
         };
         let outer_opts = BlockwiseFitOptions {
             inner_max_cycles: 20,

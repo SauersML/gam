@@ -126,7 +126,10 @@ use gam::types::inverse_link_to_binomial_spec;
 use gam::types::{
     InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily, RhoPrior, StandardLink,
 };
-use gam::{FitConfig, FitRequest, FitResult, fit_model, materialize, resolve_offset_column};
+use gam::{
+    FitConfig, FitRequest, FitResult, WorkflowError, fit_model, materialize,
+    resolve_offset_column,
+};
 use ndarray::{
     Array1, Array2, Array3, Array4, ArrayD, ArrayView1, ArrayView2, ArrayView3, ArrayView4,
     ArrayViewD, Axis, IxDyn, s,
@@ -21857,7 +21860,7 @@ fn fit_table_impl(
     formula: String,
     config_json: Option<&str>,
     fisher_rao_w: Option<ArrayView3<'_, f64>>,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, WorkflowError> {
     let dataset = dataset_with_inferred_schema(headers, rows)?;
     fit_dataset_impl(dataset, formula, config_json, fisher_rao_w)
 }
@@ -21868,7 +21871,7 @@ fn fit_array_impl(
     formula: String,
     config_json: Option<&str>,
     fisher_rao_w: Option<ArrayView3<'_, f64>>,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, WorkflowError> {
     let dataset = dataset_from_xy_arrays(x, y, &formula)?;
     fit_dataset_impl(dataset, formula, config_json, fisher_rao_w)
 }
@@ -21936,7 +21939,7 @@ fn fit_dataset_impl(
     formula: String,
     config_json: Option<&str>,
     fisher_rao_w: Option<ArrayView3<'_, f64>>,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, WorkflowError> {
     // Always-on progress for the Python bindings: every gamfit fit call
     // installs a visualizer session so the [OUTER step] log stream is
     // accompanied by the `Workflow: Fit | step=N | objective=… (best=…,

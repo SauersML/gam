@@ -611,6 +611,7 @@ pub fn canonicalize_for_identifiability(
             // internally uses the raw design width, which the column-
             // selection T_i accounts for by selecting surviving columns.
             jacobian_callback: spec.jacobian_callback.clone(),
+            audit_design: spec.audit_design.clone(),
         });
         per_block_transform.push(t_i);
     }
@@ -881,6 +882,7 @@ mod tests {
             initial_beta: None,
             gauge_priority: 100,
             jacobian_callback: None,
+            audit_design: None,
         }
     }
 
