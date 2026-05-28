@@ -4017,7 +4017,7 @@ fn assemble_candidate_formula(
 }
 
 const PREFERRED_PREDICTION_COLUMNS: &[&str] =
-    &["eta", "mean", "effective_se", "mean_lower", "mean_upper"];
+    &["linear_predictor", "mean", "std_error", "mean_lower", "mean_upper"];
 
 struct OrderedPredictionColumnEntries(Vec<(String, serde_json::Value)>);
 
@@ -22791,10 +22791,9 @@ fn columns_to_array(columns: BTreeMap<String, Vec<f64>>) -> Result<Array2<f64>, 
 
 fn ordered_prediction_column_values(columns: &BTreeMap<String, Vec<f64>>) -> Vec<Vec<f64>> {
     let preferred = [
-        "eta",
+        "linear_predictor",
         "mean",
-        "effective_se",
-        "effective_variance",
+        "std_error",
         "mean_lower",
         "mean_upper",
     ];

@@ -103,7 +103,8 @@ use gam::transformation_normal::TransformationNormalConfig;
 use gam::types::inverse_link_to_binomial_spec;
 use gam::types::{
     InverseLink, LikelihoodScaleMetadata, LikelihoodSpec, LinkFunction, LogLikelihoodNormalization,
-    MixtureLinkSpec, ResponseFamily, SasLinkSpec, StandardLink, WigglePenaltyConfig,
+    MixtureLinkSpec, ResponseColumnKind, ResponseFamily, SasLinkSpec, StandardLink,
+    WigglePenaltyConfig,
 };
 use gam::{
     BernoulliMarginalSlopeFitRequest, BinomialLocationScaleFitRequest, FitRequest, FitResult,
@@ -8604,7 +8605,7 @@ fn resolve_family(
     link_choice: Option<LinkChoice>,
     sas_linkspec: Option<&SasLinkSpec>,
     y: ArrayView1<'_, f64>,
-    y_kind: gam::types::ResponseColumnKind,
+    y_kind: ResponseColumnKind,
     response_name: &str,
 ) -> Result<LikelihoodSpec, String> {
     let nb_theta = negative_binomial_theta.unwrap_or(1.0);
