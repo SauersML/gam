@@ -6601,11 +6601,15 @@ fn materialize_transformation_normal<'a>(
     let mut inference_notes = Vec::new();
 
     let policy = resolved_resource_policy(config, data, marginal_slope_hints(config));
-    let mut covariate_spec =
-        build_termspec(&parsed.terms, data, col_map, &mut inference_notes, &policy)?;
-    if config.scale_dimensions {
-        enable_scale_dimensions(&mut covariate_spec);
-    }
+    let covariate_spec = build_termspec_with_geometry_and_overrides(
+        &parsed.terms,
+        data,
+        col_map,
+        &mut inference_notes,
+        config.scale_dimensions,
+        &policy,
+        config.smooth_overrides.as_ref(),
+    )?;
 
     let weights = resolve_weight_column(data, col_map, config.weight_column.as_deref())?;
     let offset = resolve_offset_column(data, col_map, config.offset_column.as_deref())?;
@@ -6673,22 +6677,28 @@ fn materialize_location_scale<'a>(
         effectivelinkwiggle_formulaspec(parsed.linkwiggle.as_ref(), link_choice.as_ref());
 
     let policy = resolved_resource_policy(config, data, crate::resource::ProblemHints::default());
-    let mut meanspec = build_termspec(&parsed.terms, data, col_map, &mut inference_notes, &policy)?;
-    let mut log_sigmaspec = build_termspec(
+    let meanspec = build_termspec_with_geometry_and_overrides(
+        &parsed.terms,
+        data,
+        col_map,
+        &mut inference_notes,
+        config.scale_dimensions,
+        &policy,
+        config.smooth_overrides.as_ref(),
+    )?;
+    let log_sigmaspec = build_termspec_with_geometry_and_overrides(
         &noise_parsed.terms,
         data,
         col_map,
         &mut inference_notes,
+        config.scale_dimensions,
         &policy,
+        config.smooth_overrides.as_ref(),
     )?;
     // Sample size vs basis rank, summed across the mean and log-σ smooths
     // (#309). Both designs share the same n_rows.
     check_smooth_capacity(&meanspec, y.len(), &parsed.response)?;
     check_smooth_capacity(&log_sigmaspec, y.len(), &parsed.response)?;
-    if config.scale_dimensions {
-        enable_scale_dimensions(&mut meanspec);
-        enable_scale_dimensions(&mut log_sigmaspec);
-    }
 
     let weights = resolve_weight_column(data, col_map, config.weight_column.as_deref())?;
     let mean_offset = resolve_offset_column(data, col_map, config.offset_column.as_deref())?;
