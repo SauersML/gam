@@ -862,28 +862,11 @@ pub fn cholesky_solve_gpu(
     hessian: ArrayView2<'_, f64>,
     rhs: ArrayView2<'_, f64>,
 ) -> Result<(Array2<f64>, f64), String> {
-    #[cfg(not(target_os = "linux"))]
-    {
-        let (rows, cols) = hessian.dim();
-        return Err(format!(
-            "CUDA support not compiled for Cholesky solve; hessian={rows}x{cols}, rhs={}x{}",
-            rhs.nrows(),
-            rhs.ncols()
-        ));
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        if super::runtime::GpuRuntime::global().is_none() {
-            let (rows, cols) = hessian.dim();
-            return Err(format!(
-                "CUDA runtime unavailable for Cholesky solve; hessian={rows}x{cols}, rhs={}x{}",
-                rhs.nrows(),
-                rhs.ncols()
-            ));
-        }
-        cuda::cholesky_solve(hessian, rhs)
-    }
+    // Route through iterative refinement when the policy admits the attempt.
+    // The refinement entry point falls back to fp64 internally on failure, so
+    // we can call it unconditionally here and discard the outcome metadata.
+    let (sol, logdet, _outcome) = iterative_refinement_cholesky_solve(hessian, rhs)?;
+    Ok((sol, logdet))
 }
 
 pub fn cholesky_lower_gpu(hessian: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {

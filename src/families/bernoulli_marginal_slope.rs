@@ -14072,7 +14072,6 @@ impl BernoulliMarginalSlopeFamily {
                         // consume them directly — no second row kernel pass.
                         let cached_hessian;
                         let neglog;
-                        let grad_src: &dyn std::ops::Index<usize, Output = f64>;
                         // We need a stable place for the cached grad row.
                         let cached_grad_row_storage;
                         if let Some((cached_neglog, cached_grad_row)) =

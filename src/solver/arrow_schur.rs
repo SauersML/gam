@@ -298,6 +298,13 @@ pub struct ArrowSolveOptions {
     /// Use the Riemannian latent projection before the Schur reduction. The
     /// reduced Steihaug solve itself remains in Euclidean β coordinates.
     pub riemannian_trust_region: bool,
+    /// Optional GPU-backed Schur matvec for CPU-driven `InexactPCG` at K ≥ 5000.
+    ///
+    /// When set, `steihaug_pcg_reduced_system` delegates each `S·p` call to
+    /// this closure instead of the CPU `schur_matvec`. Constructed by
+    /// `crate::gpu::arrow_schur::gpu_schur_matvec_backend` when `cuda_selected()`
+    /// and the system has dense per-row H_tβ slabs. `None` means CPU-only PCG.
+    pub gpu_matvec: Option<GpuSchurMatvec>,
 }
 
 /// Globalization guard for non-convex arrow-Schur inner steps.
