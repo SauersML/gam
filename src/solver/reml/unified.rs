@@ -2511,7 +2511,7 @@ fn composite_trace_implicit_batched(
             if let Some(impl_j) = operators[j].as_implicit()
                 && Arc::ptr_eq(&impl_i.implicit_deriv, &impl_j.implicit_deriv)
                 && Arc::ptr_eq(&impl_i.x_design, &impl_j.x_design)
-                && Arc::ptr_eq(&impl_i.w_diag, &impl_j.w_diag)
+                && Arc::ptr_eq(impl_i.w_diag.as_arc(), impl_j.w_diag.as_arc())
                 && impl_i.p == impl_j.p
             {
                 group.push(j);
@@ -2590,7 +2590,7 @@ fn trace_projected_factors_batched(
             if let Some(impl_j) = operators[j].as_implicit()
                 && Arc::ptr_eq(&impl_i.implicit_deriv, &impl_j.implicit_deriv)
                 && Arc::ptr_eq(&impl_i.x_design, &impl_j.x_design)
-                && Arc::ptr_eq(&impl_i.w_diag, &impl_j.w_diag)
+                && Arc::ptr_eq(impl_i.w_diag.as_arc(), impl_j.w_diag.as_arc())
                 && impl_i.p == impl_j.p
             {
                 group.push(j);
@@ -2739,7 +2739,7 @@ fn trace_projected_operator_terms_batched(
             if let Some(impl_j) = terms[j].2.as_implicit()
                 && Arc::ptr_eq(&impl_i.implicit_deriv, &impl_j.implicit_deriv)
                 && Arc::ptr_eq(&impl_i.x_design, &impl_j.x_design)
-                && Arc::ptr_eq(&impl_i.w_diag, &impl_j.w_diag)
+                && Arc::ptr_eq(impl_i.w_diag.as_arc(), impl_j.w_diag.as_arc())
                 && impl_i.p == impl_j.p
             {
                 group.push(j);
@@ -3415,8 +3415,12 @@ pub struct ImplicitHyperOperator {
     pub axis: usize,
     /// The active-basis design matrix X. This may be lazy / operator-backed.
     pub(crate) x_design: std::sync::Arc<DesignMatrix>,
-    /// Working weights W (diagonal, length n). Shared reference.
-    pub(crate) w_diag: std::sync::Arc<Array1<f64>>,
+    /// Working weights W (diagonal, length n) — observed-information curvature,
+    /// signed for non-canonical links. Carried as the owned [`crate::matrix::SignedWeightsArc`]
+    /// newtype so the sign character is construction-enforced at the operator
+    /// struct boundary; the function-boundary contract from `linalg/matrix.rs`
+    /// is no longer reconstructable accidentally inside `mul_vec`.
+    pub(crate) w_diag: crate::matrix::SignedWeightsArc,
     /// Penalty derivative matrix S_{ψ_d} (p × p), dense.
     pub s_psi: Array2<f64>,
     /// Total basis dimension p.
@@ -4007,8 +4011,11 @@ pub struct SparseDirectionalHyperOperator {
     pub(crate) x_tau: super::HyperDesignDerivative,
     /// Design matrix X in the sparse-native basis.
     pub(crate) x_design: DesignMatrix,
-    /// Working weights W (diagonal).
-    pub(crate) w_diag: std::sync::Arc<Array1<f64>>,
+    /// Working weights W (diagonal) — observed-information curvature, signed
+    /// for non-canonical links.  Carried as the owned [`crate::matrix::SignedWeightsArc`]
+    /// newtype so the sign character is construction-enforced at the operator
+    /// struct boundary.
+    pub(crate) w_diag: crate::matrix::SignedWeightsArc,
     /// Penalty derivative S_τ.
     pub(crate) s_tau: Array2<f64>,
     /// Fixed-β non-Gaussian curvature term c ⊙ (X_τ β̂), if applicable.
@@ -21758,7 +21765,7 @@ mod tests {
                 implicit_deriv: Arc::clone(&implicit),
                 axis,
                 x_design: Arc::clone(&x_design),
-                w_diag: Arc::clone(&w_diag),
+                w_diag: crate::matrix::SignedWeightsArc::from_arc(Arc::clone(&w_diag)),
                 s_psi: Array2::<f64>::eye(p) * scale,
                 p,
                 c_x_psi_beta: Some(Arc::new(Array1::from_vec(
@@ -21854,7 +21861,7 @@ mod tests {
             implicit_deriv: Arc::clone(&implicit),
             axis: 0,
             x_design: Arc::clone(&x_design),
-            w_diag: Arc::clone(&w_diag),
+            w_diag: crate::matrix::SignedWeightsArc::from_arc(Arc::clone(&w_diag)),
             s_psi: s_psi.clone(),
             p,
             c_x_psi_beta,
@@ -21901,7 +21908,7 @@ mod tests {
             implicit_deriv: Arc::clone(&implicit),
             axis: 0,
             x_design,
-            w_diag: Arc::clone(&w_diag),
+            w_diag: crate::matrix::SignedWeightsArc::from_arc(Arc::clone(&w_diag)),
             s_psi: s_psi.clone(),
             p,
             c_x_psi_beta: None,
@@ -21988,7 +21995,7 @@ mod tests {
             implicit_deriv: Arc::clone(&implicit),
             axis: 0,
             x_design,
-            w_diag,
+            w_diag: crate::matrix::SignedWeightsArc::from_arc(w_diag),
             s_psi,
             p,
             c_x_psi_beta: Some(Arc::new(c_x_psi_beta_dense.clone())),
