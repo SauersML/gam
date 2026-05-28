@@ -3,28 +3,28 @@ use super::*;
 
 #[derive(Clone)]
 pub(super) struct BernoulliMarginalSlopeFamily {
-    y: Arc<Array1<f64>>,
-    weights: Arc<Array1<f64>>,
-    z: Arc<Array1<f64>>,
-    latent_measure: LatentMeasureKind,
-    gaussian_frailty_sd: Option<f64>,
-    base_link: InverseLink,
-    marginal_design: DesignMatrix,
-    logslope_design: DesignMatrix,
-    score_warp: Option<DeviationRuntime>,
-    link_dev: Option<DeviationRuntime>,
+    pub(super) y: Arc<Array1<f64>>,
+    pub(super) weights: Arc<Array1<f64>>,
+    pub(super) z: Arc<Array1<f64>>,
+    pub(super) latent_measure: LatentMeasureKind,
+    pub(super) gaussian_frailty_sd: Option<f64>,
+    pub(super) base_link: InverseLink,
+    pub(super) marginal_design: DesignMatrix,
+    pub(super) logslope_design: DesignMatrix,
+    pub(super) score_warp: Option<DeviationRuntime>,
+    pub(super) link_dev: Option<DeviationRuntime>,
     /// Resource policy controlling materialization decisions for psi design
     /// resolution and other size-sensitive helpers invoked during exact-Newton
     /// joint psi calculus. Threaded from the fit entry point so biobank-scale
     /// runs pick up the caller's analytic-operator preference instead of an
     /// inline default.
-    policy: crate::resource::ResourcePolicy,
+    pub(super) policy: crate::resource::ResourcePolicy,
     /// Fit-lifetime byte-limited LRU for de-nested cubic cell moments. The key
     /// is the exact bit pattern of `(c0, c1, c2, c3, left, right)`, so reuse
     /// across PIRLS cycles is safe only for byte-identical cells while LRU
     /// eviction never changes numerical results.
-    cell_moment_lru: Arc<exact_kernel::CellMomentLruCache>,
-    cell_moment_cache_stats: Arc<exact_kernel::CellMomentCacheStats>,
+    pub(super) cell_moment_lru: Arc<exact_kernel::CellMomentLruCache>,
+    pub(super) cell_moment_cache_stats: Arc<exact_kernel::CellMomentCacheStats>,
     /// Per-row warm-start cache for the scalar intercept root-finder
     /// (`solve_row_intercept_base`). The intercept `a` is solved per row at
     /// every inner PIRLS iteration; without a warm start, each call burns
@@ -40,7 +40,7 @@ pub(super) struct BernoulliMarginalSlopeFamily {
     /// `BernoulliMarginalSlopeFamily` directly without running the full fit
     /// pipeline; production paths go through `make_family` which initialises
     /// the cache to length-`n` NaN.
-    intercept_warm_starts: Option<Arc<BernoulliInterceptWarmStartCache>>,
+    pub(super) intercept_warm_starts: Option<Arc<BernoulliInterceptWarmStartCache>>,
     /// Per-fit counter of outer rho-gradient evaluations. Increments
     /// on every call to `batched_outer_gradient_terms`. Drives the
     /// two-phase auto-subsample schedule: while
@@ -54,7 +54,7 @@ pub(super) struct BernoulliMarginalSlopeFamily {
     /// Each new fit constructs a fresh family (the counter starts at
     /// zero), so the schedule resets per fit without any cross-fit
     /// leakage. Atomic so the field is safe to clone via Arc.
-    auto_subsample_phase_counter: Arc<std::sync::atomic::AtomicUsize>,
+    pub(super) auto_subsample_phase_counter: Arc<std::sync::atomic::AtomicUsize>,
     /// Last ρ vector at which the auto-subsample phase counter was
     /// bumped. BFGS line searches re-call `batched_outer_gradient_terms`
     /// at the same ρ during step-size retries; without this guard the
@@ -65,7 +65,7 @@ pub(super) struct BernoulliMarginalSlopeFamily {
     /// minimal coordination needed: the counter+last_rho pair must be
     /// updated atomically so two threads cannot both decide "new ρ" and
     /// double-bump.
-    auto_subsample_last_rho: Arc<Mutex<Option<Array1<f64>>>>,
+    pub(super) auto_subsample_last_rho: Arc<Mutex<Option<Array1<f64>>>>,
 }
 
 /// Number of outer-gradient evaluations the auto-subsample schedule
@@ -112,14 +112,14 @@ pub(super) struct BernoulliInterceptWarmStartCache {
 
 impl BernoulliInterceptWarmStartCache {
     #[inline]
-    fn len(&self) -> usize {
+    pub(super) fn len(&self) -> usize {
         self.intercept_value.len()
     }
 
     /// Return the cached intercept iff the slot's stored `beta_tag` matches
     /// the caller's `beta_tag` and the stored value is finite.
     #[inline]
-    fn load_tagged(&self, row: usize, beta_tag: u64) -> Option<f64> {
+    pub(super) fn load_tagged(&self, row: usize, beta_tag: u64) -> Option<f64> {
         let value_slot = self.intercept_value.get(row)?;
         let tag_slot = self.intercept_tag.get(row)?;
         let tag_before = tag_slot.load(Ordering::Acquire);
@@ -137,7 +137,7 @@ impl BernoulliInterceptWarmStartCache {
 
     /// Stamp the slot with the converged intercept under `beta_tag`.
     #[inline]
-    fn store_tagged(&self, row: usize, value: f64, beta_tag: u64) {
+    pub(super) fn store_tagged(&self, row: usize, value: f64, beta_tag: u64) {
         if let (Some(value_slot), Some(tag_slot)) =
             (self.intercept_value.get(row), self.intercept_tag.get(row))
         {
@@ -154,7 +154,7 @@ impl BernoulliInterceptWarmStartCache {
     /// was installed, `Err(prev_tag)` if some prior write already populated
     /// the slot (in which case the caller should keep the existing entry).
     #[inline]
-    fn compare_exchange_unseeded(&self, row: usize, value: f64, beta_tag: u64) -> Result<(), u64> {
+    pub(super) fn compare_exchange_unseeded(&self, row: usize, value: f64, beta_tag: u64) -> Result<(), u64> {
         let value_slot = self.intercept_value.get(row).ok_or(0u64)?;
         let tag_slot = self.intercept_tag.get(row).ok_or(0u64)?;
         match tag_slot.compare_exchange(0, beta_tag, Ordering::AcqRel, Ordering::Acquire) {
@@ -169,7 +169,7 @@ impl BernoulliInterceptWarmStartCache {
         }
     }
 
-    fn predictor_seed(&self, row: usize, current_point: &[f64]) -> Option<f64> {
+    pub(super) fn predictor_seed(&self, row: usize, current_point: &[f64]) -> Option<f64> {
         let warm = self.predictors.get(row)?.lock().ok()?.as_ref().cloned()?;
         if warm.primary_point.len() != current_point.len()
             || warm.intercept_primary_deriv.len() != current_point.len()
@@ -187,7 +187,7 @@ impl BernoulliInterceptWarmStartCache {
         seed.is_finite().then_some(seed)
     }
 
-    fn store_predictor(
+    pub(super) fn store_predictor(
         &self,
         row: usize,
         intercept: f64,
@@ -302,10 +302,10 @@ pub(super) fn hash_intercept_warm_start_key_flex(
 
 #[derive(Clone, Default)]
 pub(super) struct ThetaHints {
-    marginal_beta: Option<Array1<f64>>,
-    logslope_beta: Option<Array1<f64>>,
-    score_warp_beta: Option<Array1<f64>>,
-    link_dev_beta: Option<Array1<f64>>,
+    pub(super) marginal_beta: Option<Array1<f64>>,
+    pub(super) logslope_beta: Option<Array1<f64>>,
+    pub(super) score_warp_beta: Option<Array1<f64>>,
+    pub(super) link_dev_beta: Option<Array1<f64>>,
 }
 
 pub(crate) fn build_score_warp_deviation_block_from_seed(
