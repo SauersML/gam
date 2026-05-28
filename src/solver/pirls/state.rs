@@ -1,6 +1,8 @@
 use crate::construction::ReparamResult;
 use crate::estimate::EstimationError;
-use crate::matrix::{DesignMatrix, ReparamOperator, SymmetricMatrix};
+use crate::matrix::{
+    DesignMatrix, PsdWeightsView, ReparamOperator, SignedWeightsView, SymmetricMatrix,
+};
 use crate::solver::active_set::{ConstraintKktDiagnostics, LinearInequalityConstraints};
 use crate::types::{Coefficients, GlmLikelihoodSpec, InverseLink, LinearPredictor, RidgePassport};
 use ndarray::{Array1, Array2, ArrayView1};
@@ -455,6 +457,33 @@ impl PirlsResult {
     #[inline]
     pub fn jeffreys_logdet(&self) -> Option<f64> {
         self.firth.jeffreys_logdet()
+    }
+
+    /// Typed view of the Hessian-side working weight diagonal stored on this
+    /// result, sign-honest. `finalweights` carries the observed-information
+    /// diagonal whenever the model supports it (see `exported_laplace_curvature`),
+    /// and observed weights `W_obs = W_F - (y - μ) · B` can be negative for
+    /// non-canonical links. Consumers feeding this into the asymmetric
+    /// `X_iᵀ W X_j` path, `weighted_crossprod_dense_rows`, or
+    /// `xt_diag_x_signed_op` must use this typed view rather than borrowing
+    /// the raw `Array1<f64>` so the function-boundary type contract from
+    /// `linalg/matrix.rs` is construction-enforced.
+    #[inline]
+    pub fn final_weights_signed(&self) -> SignedWeightsView<'_> {
+        SignedWeightsView::from_array(&self.finalweights)
+    }
+
+    /// Typed view of the score-side Fisher weights `W_F = h'²/(φ V(μ)) ≥ 0`
+    /// stored on this result, PSD-by-construction. Used by PSD-Gram kernels
+    /// (`dense_xtwx_view`, `sparse_csr_weighted_xtwx_*`, `xt_diag_x_psd_op`)
+    /// without a runtime sign scan; the PSD obligation is discharged
+    /// algebraically by the Fisher formula at the construction site in
+    /// `solver/pirls/mod.rs`. New callers that need the same diagonal under
+    /// a sign-honest API should route through `as_signed()` on the returned
+    /// view rather than reconstructing from the raw array.
+    #[inline]
+    pub fn solve_weights_psd(&self) -> PsdWeightsView<'_> {
+        PsdWeightsView::from_view_unchecked(self.solveweights.view())
     }
 
     /// Scale-invariant relative gradient residual at the accepted PIRLS state.
