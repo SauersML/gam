@@ -135,13 +135,14 @@ jobs:
             one-paragraph status (done / paused at step X). This lets the
             next run skip the 45-minute wait if you finished cleanly.
 
-            ## Bailing is not on the table
+            ## Removing blockers is part of the job
 
-            Once you've picked an issue, you do not abandon it. Your job
-            is to remove blockers, not name them. The only acceptable
-            terminal states are: the PR is open and the fix is genuinely
-            complete, OR work is paused mid-flight with the next concrete
-            step documented for the next run. Not "I gave up."
+            Once you've picked an issue, you carry it through. Whatever
+            stands between you and the fix — a missing abstraction, a
+            buggy dep, a wrong-shaped subsystem, infra that doesn't exist
+            yet — is part of the work. The two terminal states are: PR
+            open with a complete fix, or paused mid-flight with the next
+            concrete step documented for the next run.
 
             ## Branching and PRs (allowed here, unlike the bug-hunt agent)
 
