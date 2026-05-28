@@ -533,9 +533,14 @@ fn row_bernoulli_probit(input: RowInput, mode: CurvatureMode) -> RowOutput {
 #[inline]
 fn row_bernoulli_cloglog(input: RowInput, mode: CurvatureMode) -> RowOutput {
     let (eta_c, clamped) = clamp_eta(input.eta);
-    // μ = 1 − exp(−exp(η)); numerically stable via expm1.
+    // μ = 1 − exp(−exp(η)); numerically stable via expm1. The naive
+    // `1.0 − exp(−exp(η))` form catastrophically cancels once
+    // exp(−exp(η)) rounds to 1.0 (η ≲ −36 in f64), producing exact
+    // zeros and breaking strict positivity and monotonicity of μ in
+    // η. `-expm1(−exp(η))` preserves digits all the way to the
+    // exp() underflow boundary (η ≈ −745). See issue #344.
     let inner = eta_c.exp();
-    let mu_raw = 1.0 - (-inner).exp();
+    let mu_raw = -((-inner).exp_m1());
     let mu_low = mu_raw < MU_FLOOR_BERNOULLI;
     let mu_high = mu_raw > 1.0 - MU_FLOOR_BERNOULLI;
     let mu = mu_raw.clamp(MU_FLOOR_BERNOULLI, 1.0 - MU_FLOOR_BERNOULLI);

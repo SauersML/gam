@@ -33,9 +33,20 @@ pub fn apply_inverse_link_vec(eta: &[f64], family_kind: &str) -> Result<Vec<f64>
             }
         }
         "cloglog" => {
+            // μ(η) = 1 − exp(−exp(η)). The naive `1.0 − exp(−exp(η))`
+            // form loses every digit in the deep negative tail: as soon
+            // as exp(−exp(η)) rounds to 1.0 (η ≲ −36 in f64), the
+            // subtraction collapses to exactly 0.0, breaking strict
+            // positivity and monotonicity of μ in η. `expm1` evaluates
+            // exp(x) − 1 without the cancellation, so
+            //   μ = 1 − exp(−exp(η)) = −expm1(−exp(η))
+            // is exact all the way down to the exp() underflow boundary
+            // (η ≈ −745). Matches `cloglog_negative_tail_mean` in
+            // `inference/quadrature.rs` and the `CLogLog` jet in
+            // `solver/mixture_link.rs`. See issue #344.
             for &e in eta {
                 let clamped = e.clamp(-50.0, 50.0);
-                out.push(1.0 - (-clamped.exp()).exp());
+                out.push(-((-clamped.exp()).exp_m1()));
             }
         }
         "log" => {
