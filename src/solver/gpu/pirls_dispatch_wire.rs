@@ -304,18 +304,22 @@ mod linux_impl {
             per_row_status_or,
         } = outcome;
         // per_row_status_or already drives `status` (Unstable when forbidden
-        // bits are set) via build_loop_outcome. Verify the invariant: if any
-        // forbidden bit is set then status must be Unstable so the outer REML
-        // loop does not trust this iterate.
-        const FORBIDDEN_ROW: u32 =
-            crate::gpu::pirls_row::status_flags::INVALID_RESPONSE
-            | crate::gpu::pirls_row::status_flags::ZERO_PRIOR_WEIGHT;
-        if (per_row_status_or & FORBIDDEN_ROW) != 0 {
-            assert_eq!(
-                status,
-                PirlsStatus::Unstable,
-                "per_row_status_or has forbidden bits but status is not Unstable",
-            );
+        // bits are set) via build_loop_outcome. Enforce the invariant here so
+        // a future regression that breaks the loop's classification is caught
+        // at the dispatch boundary rather than silently passing a corrupt
+        // iterate to the outer REML loop.
+        {
+            const FORBIDDEN_ROW: u32 =
+                crate::gpu::pirls_row::status_flags::INVALID_RESPONSE
+                | crate::gpu::pirls_row::status_flags::ZERO_PRIOR_WEIGHT;
+            if (per_row_status_or & FORBIDDEN_ROW) != 0
+                && !matches!(status, PirlsStatus::Unstable)
+            {
+                return Err(format!(
+                    "GPU PIRLS: per_row_status_or={per_row_status_or:#010x} has forbidden row \
+                     status bits but outcome status is {status:?} — expected Unstable"
+                ));
+            }
         }
 
         // `logdet` corresponds to log|H_penalized| at the converged β; it is

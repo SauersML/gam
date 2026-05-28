@@ -58,7 +58,8 @@ fn bench_pirls_gpu(c: &mut Criterion) {
                         weights: weights.view(),
                         penalty_hessian: penalty.view(),
                         gradient: gradient.view(),
-                        lm_ridge: 1e-8,
+                        step_lm_lambda: 1e-8,
+                        objective_ridge: 0.0,
                     },
                 );
                 let output = result.expect("CUDA PIRLS step benchmark must solve successfully");

@@ -8343,16 +8343,15 @@ fn solve_penalized_least_squares_implicit(
         // Cache hit: weights and design are invariant for Gaussian-Identity
         // across the outer REML loop, so adopt the precomputed XᵀWX directly
         // and avoid the O(N·p²) dense assembly entirely.
-        debug_assert_eq!(
-            cache.xtwx_orig.nrows(),
-            x_original.ncols(),
-            "GaussianFixedCache XᵀWX rows must match design p"
-        );
-        debug_assert_eq!(
-            cache.xtwx_orig.ncols(),
-            x_original.ncols(),
-            "GaussianFixedCache XᵀWX cols must match design p"
-        );
+        let p = x_original.ncols();
+        if cache.xtwx_orig.nrows() != p || cache.xtwx_orig.ncols() != p {
+            return Err(EstimationError::InvalidInput(format!(
+                "GaussianFixedCache XᵀWX shape {}×{} does not match design p={}",
+                cache.xtwx_orig.nrows(),
+                cache.xtwx_orig.ncols(),
+                p,
+            )));
+        }
         cache.xtwx_orig.clone()
     } else {
         match x_original {

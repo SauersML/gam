@@ -38,7 +38,7 @@ use crate::smooth::{
 };
 use crate::solver::estimate::EstimationError;
 use crate::types::{InverseLink, StandardLink, WigglePenaltyConfig};
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, Axis, s};
 use rayon::iter::{
     IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
 };
@@ -4640,9 +4640,31 @@ impl HyperOperator for BernoulliBlockHessianOperator {
     }
 
     fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
+        let mut out = Array1::zeros(self.total);
+        self.mul_vec_into(v.view(), out.view_mut());
+        out
+    }
+
+    fn mul_vec_view(&self, v: ArrayView1<'_, f64>) -> Array1<f64> {
+        let mut out = Array1::zeros(self.total);
+        self.mul_vec_into(v, out.view_mut());
+        out
+    }
+
+    /// Write the block-structured matrix-vector product directly into caller-
+    /// owned storage. Avoids the two intermediate `Array1` allocations that
+    /// the default `mul_vec_into → mul_vec_view → to_owned + mul_vec` chain
+    /// would incur. The psi-Hessian outer-eval path calls this once per
+    /// ψ-direction per trace sweep; at biobank scale (rank ≈ 32) the saving
+    /// is ~64 allocations per REML gradient step.
+    fn mul_vec_into(
+        &self,
+        v: ArrayView1<'_, f64>,
+        mut out: ArrayViewMut1<'_, f64>,
+    ) {
         let v_m = v.slice(s![self.marginal.clone()]);
         let v_g = v.slice(s![self.logslope.clone()]);
-        let mut out = Array1::zeros(self.total);
+        out.fill(0.0);
         {
             let mut o_m = out.slice_mut(s![self.marginal.clone()]);
             o_m += &self.h_mm.dot(&v_m);
@@ -4654,9 +4676,8 @@ impl HyperOperator for BernoulliBlockHessianOperator {
             o_g += &self.h_gg.dot(&v_g);
         }
         if let Some(ref dc) = self.dense_correction {
-            out += &dc.dot(v);
+            out += &dc.dot(&v.to_owned());
         }
-        out
     }
 
     fn bilinear(&self, v: &Array1<f64>, u: &Array1<f64>) -> f64 {

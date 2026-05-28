@@ -1992,7 +1992,7 @@ impl ArrowSchurSystem {
         ridge_t: f64,
         ridge_beta: f64,
         options: &ArrowSolveOptions,
-    ) -> Result<(Array1<f64>, Array1<f64>), ArrowSchurError> {
+    ) -> Result<(Array1<f64>, Array1<f64>, PcgDiagnostics), ArrowSchurError> {
         solve_arrow_newton_step_core(self, ridge_t, ridge_beta, options)
     }
 }

@@ -511,12 +511,14 @@ extern "C" __global__ void chol_logdet_col_major(
 
     /// Drive one PIRLS Newton step on the workspace's CUDA stream.
     ///
-    /// Math is identical to [`solve_step`]: build `H = XᵀWX + S + λI`,
-    /// Cholesky-factor it, solve `H·d = g`, return `(H, −d, log|H|)`. The
-    /// difference is purely the execution model: no context creation, no
-    /// handle creation, no design-matrix upload, no per-step buffer
-    /// allocations — only the small per-step `weights`, `penalty`, and
-    /// `gradient` cross the host boundary.
+    /// Build `H = XᵀWX + S + λI`, Cholesky-factor it, solve `H·d = g`,
+    /// return `(H, d, log|H|)`. `input.gradient` is the full descent-direction
+    /// RHS `Xᵀscore − S·β + linear_shift` — the caller is responsible for
+    /// assembling the corrected RHS before calling this function. No negation
+    /// is applied; the returned `direction = H⁻¹·g` is the descent step δ
+    /// directly (#257). The difference vs the one-shot [`solve_step`] is
+    /// purely the execution model: no context creation, no handle creation,
+    /// no design-matrix upload, no per-step buffer allocations.
     pub(super) fn solve_step_on_stream(
         shared: &PirlsGpuSharedData,
         ws: &mut SigmaPirlsGpuWorkspace,
@@ -729,8 +731,9 @@ extern "C" __global__ void chol_logdet_col_major(
     /// n, so for biobank-scale n it is a negligible transfer.
     ///
     /// Outputs match `solve_step_on_stream`: returns the assembled
-    /// penalised Hessian, the Newton direction `−H⁻¹·g`, and the
-    /// log-determinant computed via the device-side
+    /// penalised Hessian, the Newton descent direction `δ = H⁻¹·rhs`
+    /// where `rhs = Xᵀ·score − S·β + linear_shift` (no negation, #257),
+    /// and the log-determinant computed via the device-side
     /// `chol_logdet_col_major` kernel.
     pub(super) fn solve_step_on_stream_device(
         shared: &PirlsGpuSharedData,

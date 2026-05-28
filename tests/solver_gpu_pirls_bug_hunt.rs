@@ -23,7 +23,8 @@ fn gpu_pirls_step_falls_back_to_cpu_and_matches_beta_update_when_cuda_unavailabl
         weights: w.view(),
         penalty_hessian: penalty.view(),
         gradient: gradient.view(),
-        lm_ridge: 0.0,
+        step_lm_lambda: 0.0,
+        objective_ridge: 0.0,
     })
     .expect("PIRLS GPU path should fall back to CPU and produce the same beta update when CUDA is unavailable");
     assert_eq!(
@@ -80,7 +81,8 @@ fn gpu_hessian_assembly_matches_cpu_hessian_within_1e8_under_fallback() {
         weights: w.view(),
         penalty_hessian: penalty.view(),
         gradient: gradient.view(),
-        lm_ridge: 0.3,
+        step_lm_lambda: 0.3,
+        objective_ridge: 0.0,
     })
     .expect("GPU PIRLS solve should fall back to CPU and assemble the same penalized Hessian");
 
