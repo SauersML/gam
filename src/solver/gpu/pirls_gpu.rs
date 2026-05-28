@@ -78,23 +78,25 @@ pub struct PirlsStepStreamDeviceInput<'a, 'b> {
 
 /// Shared, batch-wide GPU state for stream-pool sigma-cubature PIRLS.
 ///
-/// Construct once per cubature batch via [`PirlsGpuSharedData::upload`] and
-/// hand a shared reference (`&PirlsGpuSharedData`) to many
-/// [`SigmaPirlsGpuWorkspace`]s — one per CUDA stream. The design matrix is
-/// uploaded a single time and reused by every sigma fit.
-///
-/// Only `x` is device-resident on this struct (the immediate Block 6 P2
-/// scope). Later priorities (per the math spec) add device-resident
-/// `y`, `offset`, `prior_weights`, and per-family kernel handles here so
-/// the row reweight and gradient-formation kernels can read them on-stream
-/// without any host roundtrip.
+/// Construct once per model via [`upload_shared_pirls_gpu`] and hand a
+/// shared reference to many [`SigmaPirlsGpuWorkspace`]s. X_original, y,
+/// prior_w, and offset are uploaded once and reused across all ρ / σ
+/// points. Per ρ / σ point, only the small `Qs` reparam matrix is
+/// re-uploaded into the workspace.
 #[cfg(target_os = "linux")]
 pub struct PirlsGpuSharedData {
     pub(crate) ctx: std::sync::Arc<cudarc::driver::CudaContext>,
     pub(crate) n: usize,
     pub(crate) p: usize,
-    /// `n*p` f64 column-major design matrix, device-resident.
-    pub(crate) x_dev: cudarc::driver::CudaSlice<f64>,
+    /// `n*p` f64 column-major **original** design matrix `X_original`,
+    /// device-resident. Never the pre-multiplied `X·Qs` form.
+    pub(crate) x_original_dev: cudarc::driver::CudaSlice<f64>,
+    /// Response vector `y`, length `n`, device-resident.
+    pub(crate) y_dev: cudarc::driver::CudaSlice<f64>,
+    /// Prior weights, length `n`, device-resident.
+    pub(crate) prior_w_dev: cudarc::driver::CudaSlice<f64>,
+    /// Observation offset, length `n`, device-resident.
+    pub(crate) offset_dev: cudarc::driver::CudaSlice<f64>,
 }
 
 /// Per-stream workspace for [`solve_pirls_step_on_stream`].
