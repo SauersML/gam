@@ -6436,31 +6436,6 @@ fn canonical_prior_mean_aggregate(
     mean
 }
 
-fn attach_penalty_shift(
-    penalty: &mut PirlsPenalty,
-    linear_shift: Array1<f64>,
-    constant_shift: f64,
-    prior_mean_target: Array1<f64>,
-) {
-    match penalty {
-        PirlsPenalty::Dense {
-            linear_shift: target,
-            constant_shift: constant,
-            prior_mean_target: mean_target,
-            ..
-        }
-        | PirlsPenalty::Diagonal {
-            linear_shift: target,
-            constant_shift: constant,
-            prior_mean_target: mean_target,
-            ..
-        } => {
-            *target = linear_shift;
-            *constant = constant_shift;
-            *mean_target = prior_mean_target;
-        }
-    }
-}
 
 pub struct PirlsProblem<'a, X> {
     pub x: X,

@@ -43,7 +43,7 @@ mod common {
             initial_log_lambdas: Array1::<f64>::zeros(0),
             initial_beta: None,
             gauge_priority: 100,
-            row_scaling: None,
+            eta_row_scaling: None,
             jacobian_callback: None,
         }
     }
@@ -281,7 +281,7 @@ fn cross_block_alias_with_distinct_priorities_is_not_fatal() {
             initial_log_lambdas: Array1::<f64>::zeros(0),
             initial_beta: None,
             gauge_priority: priority,
-            row_scaling: None,
+            eta_row_scaling: None,
             jacobian_callback: None,
         }
     };
