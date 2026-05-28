@@ -300,7 +300,6 @@ fn build_blockspec(
         initial_log_lambdas: rho,
         initial_beta: beta_hint,
         gauge_priority: 100,
-        eta_row_scaling: None,
         jacobian_callback: None,
     }
 }
@@ -342,7 +341,6 @@ fn build_marginal_blockspec_bms(
         initial_log_lambdas: rho,
         initial_beta: beta_hint,
         gauge_priority: 100,
-        eta_row_scaling: None,
         jacobian_callback: Some(callback),
     })
 }
@@ -386,7 +384,6 @@ fn build_logslope_blockspec_bms(
         initial_log_lambdas: rho,
         initial_beta: beta_hint,
         gauge_priority: 100,
-        eta_row_scaling: None,
         jacobian_callback: Some(callback),
     })
 }
