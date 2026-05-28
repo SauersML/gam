@@ -2289,7 +2289,7 @@ fn fit_table(
     // runs without the GIL, so Python signal handling (KeyboardInterrupt,
     // SIGALRM handlers, etc.) can run while the Rust solver is in progress.
     let fisher_values = fisher_rao_w.as_ref().map(|w| w.as_array().to_owned());
-    let model_bytes = detach_py_result(py, "fit_table", move || {
+    let model_bytes = detach_workflow_result(py, "fit_table", move || {
         fit_table_impl(
             headers,
             rows,
@@ -2313,7 +2313,7 @@ fn fit_array(
     let x_values = x.as_array().to_owned();
     let y_values = y.as_array().to_owned();
     let fisher_values = fisher_rao_w.as_ref().map(|w| w.as_array().to_owned());
-    let model_bytes = detach_py_result(py, "fit_array", move || {
+    let model_bytes = detach_workflow_result(py, "fit_array", move || {
         fit_array_impl(
             x_values.view(),
             y_values.view(),
