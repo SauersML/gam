@@ -55,7 +55,7 @@
 //! convergence test is the relative coefficient step norm
 //! `‖δ‖ / (1 + ‖β‖) ≤ tol`, matching the existing pyffi reference path.
 
-use crate::estimate::EstimationError;
+use crate::solver::estimate::EstimationError;
 use crate::families::vector_response::{MultinomialLogitLikelihood, VectorLikelihood};
 use crate::faer_ndarray::{FaerArrayView, array2_to_matmut, factorize_symmetricwith_fallback};
 use crate::pirls::dense_block_xtwx;

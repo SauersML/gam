@@ -209,6 +209,27 @@ impl From<WorkflowError> for String {
     }
 }
 
+/// Catchall lift for legacy `Result<_, String>` chains that flow into a
+/// `WorkflowError`-returning function via `?`. Maps to `InvalidConfig` since
+/// the upstream call sites that still hand out bare strings are
+/// configuration / setup helpers (FitConfig parsing, payload assembly, etc.)
+/// that pre-date the typed-error migration. Specific leaves that carry
+/// structured payload (`DataError`, `FormulaDslError`, `EstimationError`,
+/// …) have their own dedicated `From` impls and bypass this fallback.
+impl From<String> for WorkflowError {
+    fn from(reason: String) -> Self {
+        Self::InvalidConfig { reason }
+    }
+}
+
+impl From<&str> for WorkflowError {
+    fn from(reason: &str) -> Self {
+        Self::InvalidConfig {
+            reason: reason.to_string(),
+        }
+    }
+}
+
 /// Cross-module cascade: a `FormulaDslError` raised inside `materialize` /
 /// `fit_from_formula` (via `parse_formula`, `parse_surv_response`, etc.) flows
 /// up with its parser-layer source attached instead of stringifying into a
