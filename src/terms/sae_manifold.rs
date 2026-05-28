@@ -2855,7 +2855,7 @@ impl SaeManifoldTerm {
                     &specs,
                 )
                 .map_err(|e| {
-                    format!("SaeManifoldTerm::run_joint_fit_arrow_schur: pre-fit identifiability audit: {e:?}")
+                    format!("SaeManifoldTerm::run_joint_fit_arrow_schur: pre-fit identifiability audit: {e}")
                 })?;
             if !audit.audit.dropped_columns.is_empty() {
                 log::info!(
