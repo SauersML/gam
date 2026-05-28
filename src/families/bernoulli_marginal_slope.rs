@@ -14574,10 +14574,10 @@ impl BernoulliMarginalSlopeFamily {
                     .expect("row_primary_direction is contiguous");
                 v_rows[row * r_pr..(row + 1) * r_pr].copy_from_slice(row_dir_slice);
             }
-            let h_rows_arr = host_pin.rows();
+            let h_rows_arr = host_pin.hess();
             let h_rows_slice = h_rows_arr
                 .as_slice()
-                .expect("row_primary_hessians.rows() is row-major contiguous");
+                .expect("row_primary_hessians.hess() is row-major contiguous");
             let inputs = crate::gpu::row_hessian_ops::RowHessianMatvecInputs {
                 n_rows: n,
                 r: r_pr,

@@ -1053,12 +1053,17 @@ impl ArrowSchurSystem {
         self.refresh_row_hessian_fingerprint();
     }
 
-    /// Install a matrix-free per-row cross-block operator for cache consumers.
+    /// Install a matrix-free per-row cross-block operator.
     ///
     /// The closure must write `out = H_tβ^(row) x` for `out.len() == d` and
-    /// `x.len() == K`. It is used only after the Newton solve, by IFT/evidence
-    /// predictors that need row cross-block products without retaining the
-    /// full `N · d · K` dense slab in the factor cache.
+    /// `x.len() == K`.
+    ///
+    /// When installed, the operator is used both during the Newton solve
+    /// (inside `reduced_rhs_beta`, `schur_matvec`, back-substitution, and
+    /// `JacobiPreconditioner` construction) and afterwards by IFT/evidence
+    /// predictors.  Per-row `htbeta` slabs in `ArrowRowBlock` may be left
+    /// zero-sized when this operator is installed — all inner-Schur paths route
+    /// through the matvec instead of indexing the dense block.
     pub fn set_row_htbeta_operator<F>(&mut self, matvec: F)
     where
         F: for<'a> Fn(usize, ArrayView1<'a, f64>, &mut Array1<f64>) + Send + Sync + 'static,

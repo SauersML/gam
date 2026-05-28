@@ -3409,6 +3409,7 @@ mod stream_device_parity_tests {
                 &mut loop_ws,
                 PirlsRowFamily::BernoulliLogit,
                 CurvatureMode::Fisher,
+                1.0,
                 beta0.view(),
                 y.view(),
                 prior_w.view(),

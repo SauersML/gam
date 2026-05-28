@@ -4,7 +4,7 @@
 //! algebra dispatch and higher-level solver code. CPU solves do not live behind
 //! these entry points: unavailable CUDA support is reported as an error.
 
-use ndarray::{Array2, ArrayView2};
+use ndarray::{Array1, Array2, ArrayView2};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BackendStatus {
