@@ -7586,7 +7586,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
                             Ok(pair) => return Ok(pair),
                             Err(err) => {
                                 log::warn!(
-                                    "[PIRLS GPU Gaussian PLS] device solve error,                                      falling back to CPU: {err}"
+                                    "[PIRLS GPU Gaussian PLS] device solve error, falling back to CPU: {err}"
                                 );
                             }
                         }

@@ -2659,7 +2659,7 @@ impl SaeManifoldTerm {
     }
 
     pub fn solve_newton_step(
-        &self,
+        &mut self,
         target: ArrayView2<'_, f64>,
         rho: &SaeManifoldRho,
         analytic_penalties: Option<&AnalyticPenaltyRegistry>,
