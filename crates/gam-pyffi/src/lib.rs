@@ -27325,6 +27325,7 @@ fn parse_fit_config(config_json: Option<&str>) -> Result<FitConfig, String> {
     )?;
     fit_config.latents = py_config.latents;
     fit_config.analytic_penalties = analytic_penalties;
+    fit_config.smooth_overrides = py_config.smooths;
     fit_config.topology_auto_selector = py_config
         .topology_auto_selector
         .as_ref()
