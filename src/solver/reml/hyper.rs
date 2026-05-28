@@ -84,19 +84,12 @@ struct TauTauPairHyperOperator {
     x_tau_tau: Option<TauTauDesignTerm>,
     x_design: std::sync::Arc<DesignMatrix>,
     basis: TauPairBasis,
-    // Observed-Hessian working weights (signed for non-canonical links).
-    // Function-boundary typing happens at each kernel call inside `mul_vec`
-    // via the surrounding ndarray arithmetic; the cached Arc here is the
-    // long-lived shared backing buffer. Sibling `ImplicitHyperOperator` and
-    // `SparseDirectionalHyperOperator` in `reml/unified.rs` carry the same
-    // diagonal under the same untyped Arc — migrating all three to
-    // [`crate::matrix::SignedWeightsArc`] requires also retyping
-    // `ImplicitHyperOperator::w_diag` (constructed in 6 sites across this
-    // file, `unified.rs`, and 4 test sites) plus the `Arc::ptr_eq`-based
-    // operator-equivalence checks in `unified.rs` that fingerprint pair
-    // operators by `(implicit_deriv, x_design, w_diag)` for the shared-XZ
-    // trace path; deferred to a follow-up.
-    w_diag: std::sync::Arc<Array1<f64>>,
+    // Observed-Hessian working weights (signed for non-canonical links),
+    // carried as the owned [`crate::matrix::SignedWeightsArc`] newtype so the
+    // sign character is construction-enforced at the operator struct boundary.
+    // Sibling `ImplicitHyperOperator` and `SparseDirectionalHyperOperator` in
+    // `reml/unified.rs` carry the same diagonal under the same typed Arc.
+    w_diag: crate::matrix::SignedWeightsArc,
     c_x_tau_i_beta: Option<Array1<f64>>,
     c_x_tau_j_beta: Option<Array1<f64>>,
     d_cross: Option<Array1<f64>>,
@@ -938,7 +931,9 @@ impl<'a> RemlState<'a> {
                         x_tau_tau: x_tau_tau[i][j].clone(),
                         x_design: std::sync::Arc::clone(&x_design),
                         basis: basis.clone(),
-                        w_diag: std::sync::Arc::clone(&w_diag),
+                        w_diag: crate::matrix::SignedWeightsArc::from_arc(
+                            std::sync::Arc::clone(&w_diag),
+                        ),
                         c_x_tau_i_beta: (!is_gaussian_identity).then_some(c_x_tau_i_beta.clone()),
                         c_x_tau_j_beta,
                         d_cross,
@@ -1565,7 +1560,9 @@ impl<'a> RemlState<'a> {
                                 implicit_deriv,
                                 axis,
                                 x_design: x_design_shared.clone().unwrap(),
-                                w_diag: w_diag_shared.clone().unwrap(),
+                                w_diag: crate::matrix::SignedWeightsArc::from_arc(
+                                    w_diag_shared.clone().unwrap(),
+                                ),
                                 s_psi: s_tau_j.clone(),
                                 p: p_dim,
                                 c_x_psi_beta,
@@ -1888,7 +1885,8 @@ impl<'a> RemlState<'a> {
 
         let u = &pirls_result.solveweights
             * &(&pirls_result.solveworking_response - &pirls_result.final_eta);
-        let w_diag = std::sync::Arc::new(pirls_result.finalweights.clone());
+        let w_diag =
+            crate::matrix::SignedWeightsArc::from_array(pirls_result.finalweights.clone());
         let x_design = self.x().clone();
 
         let is_gaussian_identity = matches!(self.config.link_function(), LinkFunction::Identity);
