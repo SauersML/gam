@@ -1414,14 +1414,14 @@ pub fn audit_identifiability_channel_aware(
                 .get(pair.block_b.as_str())
                 .map(|&bi| col_offsets[bi] + pair.direction_b)
                 .unwrap_or(0);
-            let halt_thr = pair_halt_threshold(
+            let halt_half_width_ca = pair_halt_threshold(
                 ca_col_s2.get(ja).copied().unwrap_or(1.0),
                 ca_col_s2.get(jb).copied().unwrap_or(1.0),
                 n * k,
             );
             parts.push(format!(
                 "alias pair: '{}'[{}] ~ '{}'[{}] overlap={:.4} >= leverage-based halt \
-                 threshold {:.4} in channel-aware row-Jacobian view \
+                 half-width {:.4} in channel-aware row-Jacobian view \
                  (reparam: orthogonalise one block's column {} against the other \
                  or absorb the shared direction)",
                 pair.block_a,
@@ -1429,7 +1429,7 @@ pub fn audit_identifiability_channel_aware(
                 pair.block_b,
                 pair.direction_b,
                 pair.overlap,
-                halt_thr,
+                halt_half_width_ca,
                 pair.direction_b,
             ));
         }
