@@ -3193,6 +3193,7 @@ impl SaeManifoldTerm {
                 initial_beta: None,
                 gauge_priority: 100,
                 jacobian_callback: Some(cb),
+                audit_design: None,
             });
         }
         specs

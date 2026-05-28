@@ -243,6 +243,40 @@ impl From<crate::inference::formula_dsl::FormulaDslError> for WorkflowError {
     }
 }
 
+/// Typed lift from term-builder errors. `TermBuilderError::ColumnNotFound`
+/// preserves the structured fields (name, role, available, similar,
+/// tsv_hint) through to the FFI boundary so `gam-pyffi` can raise a
+/// `gamfit.ColumnNotFoundError` with attributes set from the payload —
+/// not from re-parsed prose. Other variants degrade into the closest
+/// generic workflow bucket; the dedicated typed channels for those
+/// failure classes can be added incrementally as their dispatch arrives.
+impl From<crate::terms::term_builder::TermBuilderError> for WorkflowError {
+    fn from(err: crate::terms::term_builder::TermBuilderError) -> Self {
+        use crate::terms::term_builder::TermBuilderError;
+        match err {
+            TermBuilderError::ColumnNotFound {
+                name,
+                role,
+                available,
+                similar,
+                tsv_hint,
+            } => Self::ColumnNotFound {
+                name,
+                role,
+                available,
+                similar,
+                tsv_hint,
+            },
+            TermBuilderError::MissingColumn { reason }
+            | TermBuilderError::MalformedFormula { reason } => Self::SchemaMismatch { reason },
+            TermBuilderError::IncompatibleConfig { reason }
+            | TermBuilderError::InvalidOption { reason }
+            | TermBuilderError::UnsupportedFeature { reason }
+            | TermBuilderError::DegenerateData { reason } => Self::InvalidConfig { reason },
+        }
+    }
+}
+
 /// Typed lift from leaf data-layer errors. `DataError::ColumnNotFound` is
 /// the variant of immediate interest — it preserves the structured fields
 /// so `gam-pyffi` can dispatch to `ColumnNotFoundError` without parsing
@@ -1489,6 +1523,7 @@ fn fit_cause_specific_survival_transformation_custom(
             initial_beta: Some(beta_start),
             gauge_priority: 100,
             jacobian_callback: None,
+            audit_design: None,
         });
     }
 
@@ -2800,6 +2835,10 @@ pub fn materialize<'a>(
                     .to_string(),
             });
         }
+        // `materialize_*` now return `WorkflowError` directly so the typed
+        // `ColumnNotFound` payload (and any future variant-typed leaf
+        // errors) survive the dispatcher hop instead of being flattened
+        // into `IntegrationFailed { reason: String }`.
         materialize_survival(
             &parsed,
             data,
@@ -2809,7 +2848,6 @@ pub fn materialize<'a>(
             &exit_col,
             &event_col,
         )
-        .map_err(|reason| WorkflowError::IntegrationFailed { reason })
     } else if config.transformation_normal {
         if config.noise_formula.is_some() {
             return Err(WorkflowError::InvalidConfig {
@@ -2817,16 +2855,12 @@ pub fn materialize<'a>(
             });
         }
         materialize_transformation_normal(&parsed, data, &col_map, config)
-            .map_err(|reason| WorkflowError::IntegrationFailed { reason })
     } else if config.logslope_formula.is_some() || config.z_column.is_some() {
         materialize_bernoulli_marginal_slope(&parsed, data, &col_map, config)
-            .map_err(|reason| WorkflowError::IntegrationFailed { reason })
     } else if config.noise_formula.is_some() {
         materialize_location_scale(&parsed, data, &col_map, config)
-            .map_err(|reason| WorkflowError::IntegrationFailed { reason })
     } else {
         materialize_standard(&parsed, data, &col_map, config)
-            .map_err(|reason| WorkflowError::IntegrationFailed { reason })
     }
 }
 
@@ -3233,7 +3267,7 @@ fn build_termspec_with_geometry(
     inference_notes: &mut Vec<String>,
     scale_dimensions: bool,
     policy: &crate::resource::ResourcePolicy,
-) -> Result<TermCollectionSpec, String> {
+) -> Result<TermCollectionSpec, WorkflowError> {
     let mut spec = build_termspec(terms, data, col_map, inference_notes, policy)?;
     if scale_dimensions {
         enable_scale_dimensions(&mut spec);
@@ -5162,7 +5196,7 @@ fn materialize_standard<'a>(
     data: &'a Dataset,
     col_map: &HashMap<String, usize>,
     config: &FitConfig,
-) -> Result<MaterializedModel<'a>, String> {
+) -> Result<MaterializedModel<'a>, WorkflowError> {
     if config.noise_offset_column.is_some() {
         return Err(
             "noise_offset_column requires a location-scale model with noise_formula".to_string(),
@@ -5231,7 +5265,7 @@ fn materialize_standard<'a>(
     // Runs *after* `build_termspec_with_geometry` so the lower bound is
     // computed on the fully resolved basis spec (e.g. tensor-product columns,
     // knot counts inferred at materialization time).
-    check_smooth_capacity(&spec, y.len(), &parsed.response).map_err(String::from)?;
+    check_smooth_capacity(&spec, y.len(), &parsed.response)?;
     if let Some(coord) = latent_coord.as_mut() {
         let resolved_idx = spec
             .smooth_terms
@@ -5398,7 +5432,7 @@ fn materialize_bernoulli_marginal_slope<'a>(
     data: &'a Dataset,
     col_map: &HashMap<String, usize>,
     config: &FitConfig,
-) -> Result<MaterializedModel<'a>, String> {
+) -> Result<MaterializedModel<'a>, WorkflowError> {
     let y_col = resolve_role_col(col_map, &parsed.response, "response")?;
     let y = data.values.column(y_col).to_owned();
 
@@ -5515,7 +5549,7 @@ fn materialize_survival<'a>(
     entry_col: Option<&str>,
     exit_col: &str,
     event_col: &str,
-) -> Result<MaterializedModel<'a>, String> {
+) -> Result<MaterializedModel<'a>, WorkflowError> {
     let mut inference_notes = Vec::new();
 
     // Extract columns. `entry_col == None` is the right-censored shorthand
@@ -6467,7 +6501,7 @@ fn materialize_transformation_normal<'a>(
     data: &'a Dataset,
     col_map: &HashMap<String, usize>,
     config: &FitConfig,
-) -> Result<MaterializedModel<'a>, String> {
+) -> Result<MaterializedModel<'a>, WorkflowError> {
     if parsed.linkspec.is_some() {
         return Err(WorkflowError::InvalidConfig {
             reason: "link(...) is not supported for the transformation-normal family".to_string(),
@@ -6530,7 +6564,7 @@ fn materialize_location_scale<'a>(
     data: &'a Dataset,
     col_map: &HashMap<String, usize>,
     config: &FitConfig,
-) -> Result<MaterializedModel<'a>, String> {
+) -> Result<MaterializedModel<'a>, WorkflowError> {
     let y_col = resolve_role_col(col_map, &parsed.response, "response")?;
     let y = data.values.column(y_col).to_owned();
     let y_kind = response_column_kind(data, y_col);
@@ -6582,8 +6616,8 @@ fn materialize_location_scale<'a>(
     )?;
     // Sample size vs basis rank, summed across the mean and log-σ smooths
     // (#309). Both designs share the same n_rows.
-    check_smooth_capacity(&meanspec, y.len(), &parsed.response).map_err(String::from)?;
-    check_smooth_capacity(&log_sigmaspec, y.len(), &parsed.response).map_err(String::from)?;
+    check_smooth_capacity(&meanspec, y.len(), &parsed.response)?;
+    check_smooth_capacity(&log_sigmaspec, y.len(), &parsed.response)?;
     if config.scale_dimensions {
         enable_scale_dimensions(&mut meanspec);
         enable_scale_dimensions(&mut log_sigmaspec);
