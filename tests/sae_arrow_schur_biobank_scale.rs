@@ -263,7 +263,7 @@ fn k32_softmax_pcg_solve_is_finite() {
 
 #[test]
 fn k16_full_newton_step_is_finite() {
-    let mut f = build_fixture(16, 4, 1, 500, 2, AssignmentMode::softmax(1.0));
+    let f = build_fixture(16, 4, 1, 500, 2, AssignmentMode::softmax(1.0));
     let mut term = f.term;
     let mut rho = f.rho;
     let target = f.target;
