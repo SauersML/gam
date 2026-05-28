@@ -3065,6 +3065,15 @@ impl IdentityPreconditioner {
     }
 }
 
+/// Steihaug-CG on the reduced BA Schur system.
+///
+/// When `gpu_matvec` is `Some`, each iteration delegates the full `S·p` product
+/// to the GPU-backed closure instead of the CPU `schur_matvec`; this is the
+/// Part-B (issue #288) hook that lets the CPU PCG outer loop call into a GPU
+/// kernel for the dominant `Σ_i Y_i^T Y_i · p` accumulation at K ≥ 5000.
+/// The closure is responsible for the complete `(H_ββ + ρ·I − Σ Y_i^T Y_i)·p`
+/// product; constructors in `crate::gpu::arrow_schur` pre-compute the `Y_i`
+/// factors on device and add the CPU-side `H_ββ` term inside the closure.
 fn steihaug_pcg_reduced_system<B: BatchedBlockSolver>(
     sys: &ArrowSchurSystem,
     htt_factors: &[Array2<f64>],
@@ -3074,18 +3083,33 @@ fn steihaug_pcg_reduced_system<B: BatchedBlockSolver>(
     pcg: &ArrowPcgOptions,
     trust: &ArrowTrustRegionOptions,
     backend: &B,
+    gpu_matvec: Option<&GpuSchurMatvec>,
     metric_weights: Option<&MetricWeights>,
 ) -> Result<(Array1<f64>, PcgDiagnostics), ArrowSchurError> {
-    steihaug_cg(
-        rhs,
-        |p, out| schur_matvec(sys, htt_factors, ridge_beta, p, out, backend),
-        |r| preconditioner.apply(r),
-        pcg.max_iterations.min(trust.max_iterations),
-        pcg.relative_tolerance
-            .max(trust.steihaug_relative_tolerance),
-        trust.radius,
-        metric_weights,
-    )
+    if let Some(gpu_mv) = gpu_matvec {
+        let gpu_mv = Arc::clone(gpu_mv);
+        steihaug_cg(
+            rhs,
+            move |p, out| gpu_mv(p, out),
+            |r| preconditioner.apply(r),
+            pcg.max_iterations.min(trust.max_iterations),
+            pcg.relative_tolerance
+                .max(trust.steihaug_relative_tolerance),
+            trust.radius,
+            metric_weights,
+        )
+    } else {
+        steihaug_cg(
+            rhs,
+            |p, out| schur_matvec(sys, htt_factors, ridge_beta, p, out, backend),
+            |r| preconditioner.apply(r),
+            pcg.max_iterations.min(trust.max_iterations),
+            pcg.relative_tolerance
+                .max(trust.steihaug_relative_tolerance),
+            trust.radius,
+            metric_weights,
+        )
+    }
 }
 
 fn steihaug_dense_system(

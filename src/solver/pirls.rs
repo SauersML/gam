@@ -1261,6 +1261,19 @@ pub struct ArrowSchurInnerConfig {
     /// Steihaug trust-region radius for the reduced shared step. This ports
     /// the Ceres/BA trust-region guard while retaining PIRLS's LM damping.
     pub trust_region_radius: f64,
+    /// Optional β-block column ranges for the block-Jacobi Schur preconditioner.
+    ///
+    /// When `Some`, the PIRLS driver calls
+    /// [`crate::solver::arrow_schur::ArrowSchurSystem::set_block_offsets`] on
+    /// every system returned by the `build` closure, wiring the block-Jacobi
+    /// path without requiring each family's closure to call it manually.
+    ///
+    /// Derive from `ParameterBlockSpec` slices via
+    /// [`crate::families::custom_family::block_offsets_from_specs`].  When
+    /// `None`, the preconditioner falls back to scalar-diagonal Jacobi (the
+    /// pre-#287 behaviour); when `Some([])` (empty slice), the same fallback
+    /// applies.
+    pub block_offsets: Option<Arc<[std::ops::Range<usize>]>>,
     /// Callback that the inner solver invokes after each LM-attempted
     /// joint step to write the latent tangent increment back into the
     /// driver's `LatentCoordValues` via that latent's update rule
@@ -5143,7 +5156,15 @@ where
                                 &mut newton_direction,
                             )
                         }
-                        Some(arrow_system) => {
+                        Some(mut arrow_system) => {
+                            // Apply spec-derived block offsets for block-Jacobi
+                            // preconditioner — a single call here covers every
+                            // family that supplies block_offsets via the config
+                            // rather than baking the call into each `build`
+                            // closure (issue #287).
+                            if let Some(offsets) = arrow_cfg.block_offsets.as_ref() {
+                                arrow_system.set_block_offsets(offsets.clone());
+                            }
                             let mut solve_options =
                                 crate::solver::arrow_schur::ArrowSolveOptions::automatic(
                                     arrow_system.k,
