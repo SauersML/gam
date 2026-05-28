@@ -325,7 +325,7 @@ pub struct LinkWiggleConfig {
 /// is `None`. The previous shape had two sibling `Option` fields on
 /// `StandardFitRequest`, which allowed the materialize path to construct an
 /// inconsistent state (#320: linkwiggle config without blockwise options).
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct StandardBinomialWiggleConfig {
     pub link_kind: InverseLink,
     pub wiggle: LinkWiggleConfig,

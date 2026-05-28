@@ -5702,6 +5702,31 @@ pub trait LinearOperator {
     fn apply(&self, vector: &Array1<f64>) -> Array1<f64>;
     fn apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64>;
     fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String>;
+
+    /// Observed-Hessian / non-canonical-link Gram: `XᵀWX` with sign-honest
+    /// weights. Returns a dense `Array2<f64>` because the result is symmetric
+    /// but not guaranteed PSD (so consumers cannot assume the `SymmetricMatrix`
+    /// PSD contract). Default impl delegates to `diag_xtw_x` for legacy
+    /// operators; overriding impls may take a sign-aware fast path.
+    fn xt_diag_x_signed_op(
+        &self,
+        weights: SignedWeightsView<'_>,
+    ) -> Result<Array2<f64>, String> {
+        self.diag_xtw_x(&weights.view().to_owned())
+    }
+
+    /// PSD-precondition Gram: `XᵀWX` with `w ≥ 0` discharged at the
+    /// `PsdWeightsView` constructor. Returns a typed `SymmetricMatrix` so
+    /// downstream consumers can route through PSD-only solvers (Cholesky).
+    /// Default impl wraps the signed path's `Array2` in `SymmetricMatrix::Dense`.
+    fn xt_diag_x_psd_op(
+        &self,
+        weights: PsdWeightsView<'_>,
+    ) -> Result<SymmetricMatrix, String> {
+        let xtwx = self.diag_xtw_x(&weights.view().to_owned())?;
+        Ok(SymmetricMatrix::Dense(xtwx))
+    }
+
     fn diag_gram(&self, weights: &Array1<f64>) -> Result<Array1<f64>, String> {
         let xtwx = self.diag_xtw_x(weights)?;
         Ok(Array1::from_iter((0..self.ncols()).map(|j| xtwx[[j, j]])))

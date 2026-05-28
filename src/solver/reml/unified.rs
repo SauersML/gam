@@ -107,7 +107,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::{Arc, Condvar, Mutex};
 
 use crate::faer_ndarray::FaerEigh;
-use crate::linalg::matrix::DesignMatrix;
+use crate::linalg::matrix::{DesignMatrix, LinearOperator, SignedWeightsView};
 
 fn reml_contract_panic(message: impl Into<String>) -> ! {
     std::panic::panic_any(message.into())
@@ -1093,7 +1093,7 @@ impl HessianDerivativeProvider for SinglePredictorGlmDerivatives {
         // −Xᵀ diag(c ⊙ Xvₖ) X via the design's matrix-free weighted gram.
         let result = self
             .x_transformed
-            .compute_xtwx(&neg_c_xv)
+            .xt_diag_x_signed_op(SignedWeightsView::from_array(&neg_c_xv))
             .map_err(|e| format!("hessian_derivative_correction xtwx: {e}"))?;
 
         Ok(Some(result))
@@ -1147,7 +1147,7 @@ impl HessianDerivativeProvider for SinglePredictorGlmDerivatives {
         // Xᵀ diag(weights) X via the design's matrix-free weighted gram.
         let result = self
             .x_transformed
-            .compute_xtwx(&weights)
+            .xt_diag_x_signed_op(SignedWeightsView::from_array(&weights))
             .map_err(|e| format!("hessian_second_derivative_correction xtwx: {e}"))?;
 
         Ok(Some(result))
