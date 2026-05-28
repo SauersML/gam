@@ -812,7 +812,26 @@ extern "C" __global__ void chol_logdet_col_major(
             ws.stream
                 .memcpy_htod(penalty_step_col.as_ref(), &mut ws.penalty_dev)
                 .map_err(|e| format!("upload penalty (device-input): {e}"))?;
-            geam_add(&ws.blas, &ws.stream, p, &ws.xtwx_dev, &ws.penalty_dev, &mut ws.h_dev)?;
+            // Qs rotation on H: tmp = XᵀWX · Qs, then h_dev = Qsᵀ · tmp.
+            {
+                let cfg_aq = GemmConfig::<f64> {
+                    transa: cublasOperation_t::CUBLAS_OP_N, transb: cublasOperation_t::CUBLAS_OP_N,
+                    m: p_i, n: p_i, k: p_i, alpha: 1.0, lda: p_i, ldb: p_i, beta: 0.0, ldc: p_i,
+                };
+                // SAFETY: xtwx_dev and qs_dev p*p col-major; qs_tmp_dev p*p output.
+                unsafe { ws.blas.gemm(cfg_aq, &ws.xtwx_dev, &ws.qs_dev, &mut ws.qs_tmp_dev) }
+                    .map_err(|e| format!("dgemm A·Qs (device-input large-p): {e}"))?;
+            }
+            {
+                let cfg_qt = GemmConfig::<f64> {
+                    transa: cublasOperation_t::CUBLAS_OP_T, transb: cublasOperation_t::CUBLAS_OP_N,
+                    m: p_i, n: p_i, k: p_i, alpha: 1.0, lda: p_i, ldb: p_i, beta: 0.0, ldc: p_i,
+                };
+                // SAFETY: qs_dev p*p (transposed); qs_tmp_dev p*p; h_dev p*p output.
+                unsafe { ws.blas.gemm(cfg_qt, &ws.qs_dev, &ws.qs_tmp_dev, &mut ws.h_dev) }
+                    .map_err(|e| format!("dgemm Qsᵀ·A·Qs (device-input large-p): {e}"))?;
+            }
+            geam_add(&ws.blas, &ws.stream, p, &ws.h_dev, &ws.penalty_dev, &mut ws.h_dev)?;
             let gemv_cfg = GemvConfig::<f64> {
                 trans: cublasOperation_t::CUBLAS_OP_T,
                 m: n_i,
@@ -839,26 +858,58 @@ extern "C" __global__ void chol_logdet_col_major(
                 &ws.stream, &shared.ctx, n, p,
                 &shared.x_original_dev, input.grad_eta_dev, &mut ws.rhs_dev,
             )?;
+            // Qs rotation on H: tmp = XᵀWX · Qs, then h_dev = Qsᵀ · tmp.
+            {
+                let cfg_aq = GemmConfig::<f64> {
+                    transa: cublasOperation_t::CUBLAS_OP_N, transb: cublasOperation_t::CUBLAS_OP_N,
+                    m: p_i, n: p_i, k: p_i, alpha: 1.0, lda: p_i, ldb: p_i, beta: 0.0, ldc: p_i,
+                };
+                // SAFETY: xtwx_dev and qs_dev p*p col-major; qs_tmp_dev p*p output.
+                unsafe { ws.blas.gemm(cfg_aq, &ws.xtwx_dev, &ws.qs_dev, &mut ws.qs_tmp_dev) }
+                    .map_err(|e| format!("dgemm A·Qs (device-input fused): {e}"))?;
+            }
+            {
+                let cfg_qt = GemmConfig::<f64> {
+                    transa: cublasOperation_t::CUBLAS_OP_T, transb: cublasOperation_t::CUBLAS_OP_N,
+                    m: p_i, n: p_i, k: p_i, alpha: 1.0, lda: p_i, ldb: p_i, beta: 0.0, ldc: p_i,
+                };
+                // SAFETY: qs_dev p*p (transposed); qs_tmp_dev p*p; h_dev p*p output.
+                unsafe { ws.blas.gemm(cfg_qt, &ws.qs_dev, &ws.qs_tmp_dev, &mut ws.h_dev) }
+                    .map_err(|e| format!("dgemm Qsᵀ·A·Qs (device-input fused): {e}"))?;
+            }
             let penalty_step = penalty_with_ridge(input.penalty_hessian, input.step_lm_lambda);
             let penalty_step_col = to_col_major(&penalty_step.view());
             ws.stream
                 .memcpy_htod(penalty_step_col.as_ref(), &mut ws.penalty_dev)
                 .map_err(|e| format!("upload penalty (fused device-input): {e}"))?;
-            geam_add(&ws.blas, &ws.stream, p, &ws.xtwx_dev, &ws.penalty_dev, &mut ws.h_dev)?;
+            geam_add(&ws.blas, &ws.stream, p, &ws.h_dev, &ws.penalty_dev, &mut ws.h_dev)?;
         }
 
-        // Apply rhs correction BEFORE the solve: rhs = Xᵀ·score − S·β + linear_shift (#257, #260).
-        // Download the accumulated Xᵀ·score and β (both p-vectors; bounded-cost round-trip)
-        // and apply the penalty correction host-side, then re-upload the corrected RHS so
-        // POTRS solves H·δ = (Xᵀscore − Sβ + linear_shift) and δ is the descent direction.
+        // Apply rhs correction BEFORE the solve:
+        //   rhs = Qsᵀ·(Xᵀ·score) − S·β + linear_shift  (#257, #260, #269).
+        // First project X_origᵀ·score through Qsᵀ (p×p gemv on device), then
+        // apply the S·β correction host-side and re-upload.
         {
-            let score_raw = ws.stream
+            // Qsᵀ · rhs_dev (= Xᵀ·score) → beta_orig_dev (scratch p-vector).
+            let cfg_qts = GemvConfig::<f64> {
+                trans: cublasOperation_t::CUBLAS_OP_T, m: p_i, n: p_i, alpha: 1.0,
+                lda: p_i, incx: 1, beta: 0.0, incy: 1,
+            };
+            // SAFETY: qs_dev p*p (transposed); rhs_dev length p; beta_orig_dev length p.
+            unsafe { ws.blas.gemv(cfg_qts, &ws.qs_dev, &ws.rhs_dev, &mut ws.beta_orig_dev) }
+                .map_err(|e| format!("dgemv Qsᵀ·score (device-input): {e}"))?;
+            // Swap: rhs_dev ← beta_orig_dev (now holds Qsᵀ·Xᵀ·score).
+            ws.stream
+                .memcpy_dtod(&ws.beta_orig_dev, &mut ws.rhs_dev)
+                .map_err(|e| format!("d2d Qsᵀ·score→rhs (device-input): {e}"))?;
+            // Download rhs and β; apply penalty correction host-side.
+            let rhs_raw = ws.stream
                 .clone_dtoh(&ws.rhs_dev)
-                .map_err(|e| format!("download Xᵀscore (device-input): {e}"))?;
+                .map_err(|e| format!("download Qsᵀscore (device-input): {e}"))?;
             let beta_raw = ws.stream
                 .clone_dtoh(input.beta_dev)
                 .map_err(|e| format!("download beta (device-input): {e}"))?;
-            let mut rhs_host = Array1::from_vec(score_raw);
+            let mut rhs_host = Array1::from_vec(rhs_raw);
             let beta_host = Array1::from_vec(beta_raw);
             let s_beta = input.penalty_hessian.dot(&beta_host);
             rhs_host -= &s_beta;
@@ -871,8 +922,8 @@ extern "C" __global__ void chol_logdet_col_major(
                 .map_err(|e| format!("re-upload corrected rhs (device-input): {e}"))?;
         }
 
-        // Exported penalised Hessian: H_final = XᵀWX + S + objective_ridge·I.
-        // Download XᵀWX and add the objective ridge on the host so LM damping
+        // Exported penalised Hessian: H_final = Qsᵀ·XᵀWX·Qs + S + objective_ridge·I.
+        // Apply Qs rotation host-side on the downloaded XᵀWX so LM damping
         // never contaminates exported EDF / REML curvature / RidgePassport.
         let xtwx_col = ws
             .stream
@@ -880,8 +931,16 @@ extern "C" __global__ void chol_logdet_col_major(
             .map_err(|e| format!("download XᵀWX (device-input): {e}"))?;
         let xtwx_host = from_col_major(&xtwx_col, p, p)
             .ok_or("XᵀWX layout conversion failed (device-input)")?;
+        let qs_col = ws
+            .stream
+            .clone_dtoh(&ws.qs_dev)
+            .map_err(|e| format!("download Qs (device-input): {e}"))?;
+        let qs_host = from_col_major(&qs_col, p, p)
+            .ok_or("Qs layout conversion failed (device-input)")?;
+        let tmp_aq = xtwx_host.dot(&qs_host);
+        let h_rotated = qs_host.t().dot(&tmp_aq);
         let penalty_export = penalty_with_ridge(input.penalty_hessian, input.objective_ridge);
-        let penalized_hessian = xtwx_host + &penalty_export;
+        let penalized_hessian = h_rotated + &penalty_export;
 
         // Factor + solve in place on the stream using pre-allocated workspace
         // and info buffers — no per-step allocation, no per-step info download.
@@ -1911,8 +1970,8 @@ extern "C" __global__ void status_or(
         pub last_deviance_change: f64,
         /// Number of line-search halvings consumed on the accepted
         /// step (`k` when α = `0.5^k`; `0` when α = 1). When the
-        /// loop took the no-descent α=1 fallback, this is `0` with
-        /// `last_step_accept_kind = LineSearchAccept::Fallback`.
+        /// ladder was fully exhausted (`step_search_exhausted`), this
+        /// is `0` and `last_step_size = 0.0` — no step was committed.
         /// Mirrors `WorkingModelPirlsResult::last_step_halving`.
         pub last_step_halving: usize,
         /// Step size α that was accepted at the final iteration.
