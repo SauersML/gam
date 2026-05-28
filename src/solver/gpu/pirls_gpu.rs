@@ -1571,10 +1571,10 @@ extern "C" __global__ void status_or(
         /// Step size α that was accepted at the final iteration.
         /// Mirrors `WorkingModelPirlsResult::last_step_size`.
         pub last_step_size: f64,
-        /// Levenberg-Marquardt damping coefficient in effect at the
-        /// last accepted iter. The GPU loop has no on-device ridge
-        /// escalation (it is a constant per call), so this echoes
-        /// the input `lm_ridge`. Maps to
+        /// Levenberg-Marquardt damping coefficient (step_lm_lambda) in
+        /// effect at the last accepted iter. The GPU loop has no
+        /// on-device ridge escalation (it is a constant per call), so
+        /// this echoes the input `step_lm_lambda`. Maps to
         /// `PirlsResult::final_lm_lambda`.
         pub final_lm_lambda: f64,
         /// Running minimum of the data-side deviance observed across

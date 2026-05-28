@@ -9480,19 +9480,19 @@ impl BernoulliMarginalSlopeFamily {
         }
         let completed_rows = AtomicUsize::new(0);
         let progress_step = (n / 10).max(1);
-        let mut packed = Array2::<f64>::zeros((n, r * r));
-        packed
-            .axis_iter_mut(Axis(0))
+        // Collect (neglog, grad_flat, hess_flat) per row in parallel, then
+        // assemble into the three packed arrays. Using par_iter collect avoids
+        // unsafe pointer aliasing while writing disjoint row slices.
+        let row_evals: Vec<(f64, Vec<f64>, Vec<f64>)> = (0..n)
             .into_par_iter()
-            .enumerate()
-            .try_for_each(|(row, mut packed_row)| -> Result<(), String> {
+            .map(|row| -> Result<(f64, Vec<f64>, Vec<f64>), String> {
                 let row_ctx = Self::row_ctx(cache, row);
                 let mut scratch = BernoulliMarginalSlopeFlexRowScratch::new(r);
                 let row_moments = cache
                     .row_cell_moments
                     .as_ref()
                     .and_then(|bundle| bundle.row(row, 9));
-                self.compute_row_analytic_flex_into_with_moments(
+                let neglog = self.compute_row_analytic_flex_into_with_moments(
                     row,
                     block_states,
                     primary,
@@ -9501,9 +9501,6 @@ impl BernoulliMarginalSlopeFamily {
                     true,
                     &mut scratch,
                 )?;
-                for (dst, src) in packed_row.iter_mut().zip(scratch.hess.iter()) {
-                    *dst = *src;
-                }
                 if log_exact_work(n) {
                     let done = completed_rows.fetch_add(1, Ordering::Relaxed) + 1;
                     if done == n || done % progress_step == 0 {
@@ -9515,8 +9512,29 @@ impl BernoulliMarginalSlopeFamily {
                         );
                     }
                 }
-                Ok(())
-            })?;
+                Ok((
+                    neglog,
+                    scratch.grad.to_vec(),
+                    scratch.hess.as_slice().expect("hess is contiguous").to_vec(),
+                ))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let mut packed_neglog = Array1::<f64>::zeros(n);
+        let mut packed_grad = Array2::<f64>::zeros((n, r));
+        let mut packed_hess = Array2::<f64>::zeros((n, r * r));
+        for (row, (neglog, grad_flat, hess_flat)) in row_evals.into_iter().enumerate() {
+            packed_neglog[row] = neglog;
+            packed_grad
+                .row_mut(row)
+                .iter_mut()
+                .zip(grad_flat.iter())
+                .for_each(|(d, s)| *d = *s);
+            packed_hess
+                .row_mut(row)
+                .iter_mut()
+                .zip(hess_flat.iter())
+                .for_each(|(d, s)| *d = *s);
+        }
         if log_exact_work(n) {
             log::info!(
                 "[BMS row-primary-hessian-cache] build done n={} r={} elapsed={:.3}s",
@@ -9526,8 +9544,8 @@ impl BernoulliMarginalSlopeFamily {
             );
         }
         drop(heartbeat_guard);
-        Ok(RowPrimaryHessianCache::Host(RowPrimaryHessianPin::new(
-            packed, plan.bytes,
+        Ok(RowPrimaryEvalCache::Host(RowPrimaryEvalPin::new(
+            packed_neglog, packed_grad, packed_hess, plan.bytes,
         )))
     }
 
@@ -9536,20 +9554,47 @@ impl BernoulliMarginalSlopeFamily {
     /// Returns `None` when the cache is absent or the row index is out of
     /// range, in which case the caller must fall back to the live row
     /// kernel.
+    /// Returns the cached row-primary Hessian (`r × r`) for host-resident
+    /// caches. Returns `None` when the cache is absent, device-resident, or
+    /// the row is out of range.
     #[inline]
     fn cached_row_primary_hessian<'a>(
         cache: &'a BernoulliMarginalSlopeExactEvalCache,
         row: usize,
     ) -> Option<ArrayView2<'a, f64>> {
-        let rows = cache.row_primary_hessians.host_pin()?.rows();
+        let hess = cache.row_primary_hessians.host_pin()?.hess();
         let r = cache.primary.total;
-        if row >= rows.nrows() {
+        if row >= hess.nrows() {
             return None;
         }
         let width = r.checked_mul(r)?;
         let start = row.checked_mul(width)?;
         let end = start.checked_add(width)?;
-        ArrayView2::from_shape((r, r), rows.as_slice()?.get(start..end)?).ok()
+        ArrayView2::from_shape((r, r), hess.as_slice()?.get(start..end)?).ok()
+    }
+
+    /// Returns the cached row-primary (neglog, grad_row) for host-resident
+    /// caches. Returns `None` when the cache is absent, device-resident, or
+    /// the row is out of range.
+    #[inline]
+    fn cached_row_primary_eval<'a>(
+        cache: &'a BernoulliMarginalSlopeExactEvalCache,
+        row: usize,
+    ) -> Option<(f64, ArrayView1<'a, f64>)> {
+        let pin = cache.row_primary_hessians.host_pin()?;
+        let neglog = pin.neglog();
+        let grad = pin.grad();
+        let r = cache.primary.total;
+        if row >= neglog.len() || row >= grad.nrows() {
+            return None;
+        }
+        let neglog_val = neglog[row];
+        let grad_row = grad.row(row);
+        // Sanity: grad row must have exactly r elements.
+        if grad_row.len() != r {
+            return None;
+        }
+        Some((neglog_val, grad_row))
     }
 
     fn build_exact_eval_cache(

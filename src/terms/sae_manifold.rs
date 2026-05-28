@@ -1506,6 +1506,27 @@ impl SaeManifoldTerm {
         out
     }
 
+    /// Per-atom β column ranges for the block-Jacobi Schur preconditioner.
+    ///
+    /// Returns one `Range<usize>` per atom, covering that atom's decoder
+    /// coefficients in the flat β vector:
+    ///   `[beta_offsets[k] .. beta_offsets[k] + basis_size[k] * p_out]`.
+    ///
+    /// Pass to [`ArrowSchurSystem::set_block_offsets`] so that
+    /// [`crate::solver::arrow_schur::JacobiPreconditioner`] builds one dense
+    /// Schur sub-block per atom instead of scalar-diagonal inversion.
+    pub fn beta_block_offsets(&self) -> Arc<[std::ops::Range<usize>]> {
+        let p = self.output_dim();
+        let mut ranges: Vec<std::ops::Range<usize>> = Vec::with_capacity(self.k_atoms());
+        let mut cursor = 0usize;
+        for atom in &self.atoms {
+            let width = atom.basis_size() * p;
+            ranges.push(cursor..cursor + width);
+            cursor += width;
+        }
+        Arc::from(ranges.into_boxed_slice())
+    }
+
     pub fn flatten_beta(&self) -> Array1<f64> {
         let p = self.output_dim();
         let offsets = self.beta_offsets();
@@ -1864,6 +1885,11 @@ impl SaeManifoldTerm {
                 .map_err(|err| format!("SaeManifoldTerm::assemble_arrow_schur: {err}"))?;
         }
         self.apply_sae_riemannian_geometry(&mut sys);
+        // Wire per-atom β block ranges so the Jacobi preconditioner builds one
+        // dense Schur sub-block per atom (block-Jacobi) instead of scalar-diagonal
+        // inversion.  Each atom's decoder coefficients form a natural block:
+        // `[beta_offsets[k] .. beta_offsets[k] + basis_size[k] * p_out]`.
+        sys.set_block_offsets(self.beta_block_offsets());
         Ok(sys)
     }
 

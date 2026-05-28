@@ -126,6 +126,20 @@ pub type RowHtbetaMatvec =
     Arc<dyn for<'a> Fn(usize, ArrayView1<'a, f64>, &mut Array1<f64>) + Send + Sync>;
 pub type StreamingArrowRowBuilder =
     Arc<dyn Fn(usize) -> Result<ArrowRowBlock, ArrowSchurError> + Send + Sync>;
+
+/// GPU-backed Schur matvec for CPU-driven PCG at K ≥ 5000.
+///
+/// The closure writes `out = S·x` where `S = H_ββ + ρ·I − Σ_i Y_i^T Y_i`
+/// is the reduced shared system, with `Y_i = L_i^{-1} H_tβ^(i)` pre-computed
+/// on device from the same forward kernel that Layer D uses for the dense Schur
+/// build. The CPU-driven Steihaug-CG outer loop uploads `x` (K doubles),
+/// receives `out` (K doubles), and handles the H_ββ contribution on the CPU side.
+///
+/// Constructed by `crate::gpu::arrow_schur::gpu_schur_matvec_backend` when
+/// `cuda_selected()` and K ≥ 5000. The closure is `Send + Sync` so PCG callers
+/// can hold it in an `Arc`.
+pub type GpuSchurMatvec = Arc<dyn Fn(&Array1<f64>, &mut Array1<f64>) + Send + Sync>;
+
 type MetricWeights = [f64];
 
 /// BA Schur solve variant for the reduced shared `β` system.
