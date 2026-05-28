@@ -3103,30 +3103,30 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleTermBuilder {
         let mut log_sigma_penalty_matrices: Vec<PenaltyMatrix> =
             noise_design.penalties_as_penalty_matrix();
         log_sigma_penalty_matrices.push(PenaltyMatrix::Dense(identity_penalty(p_noise)));
-        let mut thresholdspec = ParameterBlockSpec {
-            name: "threshold".to_string(),
-            design: mean_design.design.clone(),
-            offset: self.mean_offset.clone(),
-            penalties: mean_design.penalties_as_penalty_matrix(),
-            nullspace_dims: vec![],
-            initial_log_lambdas: layout.mean_from(theta),
-            initial_beta: mean_beta_hint,
-            gauge_priority: 100,
-            jacobian_callback: None,
-            audit_design: None,
-        };
-        let mut log_sigmaspec = ParameterBlockSpec {
-            name: "log_sigma".to_string(),
-            design: identifiednoise_design,
-            offset: self.noise_offset.clone(),
-            penalties: log_sigma_penalty_matrices,
-            nullspace_dims: vec![],
-            initial_log_lambdas: layout.noise_from(theta),
-            initial_beta: noise_beta_hint,
-            gauge_priority: 100,
-            jacobian_callback: None,
-            audit_design: None,
-        };
+        let mut thresholdspec = build_location_scale_block(
+            "threshold",
+            mean_design.design.clone(),
+            self.mean_offset.clone(),
+            mean_design.penalties_as_penalty_matrix(),
+            vec![],
+            layout.mean_from(theta),
+            mean_beta_hint,
+            0,
+            LOCATION_SCALE_N_OUTPUTS,
+            "BinomialLocationScale::build_blocks: threshold",
+        )?;
+        let mut log_sigmaspec = build_location_scale_block(
+            "log_sigma",
+            identifiednoise_design,
+            self.noise_offset.clone(),
+            log_sigma_penalty_matrices,
+            vec![],
+            layout.noise_from(theta),
+            noise_beta_hint,
+            1,
+            LOCATION_SCALE_N_OUTPUTS,
+            "BinomialLocationScale::build_blocks: log_sigma",
+        )?;
         if thresholdspec.initial_beta.is_none() || log_sigmaspec.initial_beta.is_none() {
             let (beta_t0, beta_ls0) = binomial_location_scalewarm_start(
                 &self.y,
@@ -3144,7 +3144,6 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleTermBuilder {
                 log_sigmaspec.initial_beta = Some(beta_ls0);
             }
         }
-        install_additive_callbacks_two_block(&mut thresholdspec, &mut log_sigmaspec)?;
         Ok(vec![thresholdspec, log_sigmaspec])
     }
 

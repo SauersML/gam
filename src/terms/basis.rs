@@ -8374,6 +8374,7 @@ pub fn build_bspline_basis_1d(
             knots,
             identifiability_transform,
             periodic: None,
+            degree: Some(spec.degree),
         },
         kronecker_factored: None,
         ops,

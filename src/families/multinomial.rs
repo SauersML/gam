@@ -58,9 +58,23 @@
 use crate::solver::estimate::EstimationError;
 use crate::families::vector_response::{MultinomialLogitLikelihood, VectorLikelihood};
 use crate::faer_ndarray::{FaerArrayView, array2_to_matmut, factorize_symmetricwith_fallback};
+use crate::inference::data::EncodedDataset;
+use crate::inference::formula_dsl::parse_formula;
+use crate::inference::model::ColumnKindTag;
 use crate::pirls::dense_block_xtwx;
+use crate::resource::ProblemHints;
+use crate::solver::workflow::{
+    FitConfig, build_termspec_with_geometry, resolved_resource_policy,
+};
+use crate::terms::smooth::{
+    TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
+    weighted_blockwise_penalty_sum,
+};
+use crate::terms::term_builder::resolve_role_col;
+use crate::types::ResponseColumnKind;
 use faer::Side;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
+use serde::{Deserialize, Serialize};
 
 /// Inputs to [`fit_penalized_multinomial`].
 ///
