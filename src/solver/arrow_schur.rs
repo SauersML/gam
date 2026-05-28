@@ -134,16 +134,28 @@ type MetricWeights = [f64];
 ///   eliminate the per-point/per-row blocks, form the reduced system, and
 ///   Cholesky factor it. This is the Ceres/g2o default for modest camera
 ///   counts and is appropriate here for `K <= 2000`.
+///   **GPU support: ✓** — requires dense H_ββ and dense per-row H_tβ slabs.
+///
 /// * [`ArrowSolverMode::SqrtBA`] ports Square-Root BA (Demmel/Gao/Gu et al.,
 ///   CVPR 2021): Schur terms are formed as `(L_i^-1 H_tβ_i)^T
 ///   (L_i^-1 H_tβ_i)` from the per-row square-root factor `L_i`, avoiding
 ///   explicit `H_tt^-1 H_tβ` products. It is the preferred direct path when
 ///   single-precision assembly is introduced or when row blocks are poorly
 ///   conditioned.
+///   **GPU support: ✓** — requires dense H_ββ and dense per-row H_tβ slabs.
+///
 /// * [`ArrowSolverMode::InexactPCG`] ports "Bundle Adjustment in the Large"
 ///   (Agarwal et al.): the Schur system is solved inexactly by PCG with a
 ///   Jacobi Schur preconditioner, avoiding dense `K × K` factorization for
 ///   SAE-manifold scale shared systems.
+///   **GPU support: CPU only** until the row-procedural H_tβ GPU PCG path
+///   (issue #288 Part B) is wired. The topology selector must not request
+///   `InexactPCG` via the GPU entry point; `solve_arrow_newton_step` returns
+///   `GpuRequiresDenseSystem` for matrix-free systems, and the wrapper in
+///   `solver/gpu/arrow_schur_gpu.rs` routes those to CPU InexactPCG
+///   automatically. At K ≥ 5000 the GPU PCG path will supersede the CPU path
+///   once the row-procedural H_tβ kernel and boxed GPU matvec backend in
+///   `steihaug_pcg_reduced_system` are wired.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArrowSolverMode {
     Direct,
@@ -1318,7 +1330,26 @@ impl StreamingArrowSchur {
 
     #[must_use]
     pub fn from_system(sys: &ArrowSchurSystem, chunk_size: usize) -> Self {
-        let rows = Arc::new(sys.rows.clone());
+        // When a Kronecker / matrix-free htbeta_matvec is installed, the dense
+        // row.htbeta slabs may be zero-sized.  Materialize them now so the
+        // streaming accumulator's validate_row + direct arithmetic can work.
+        let rows: Vec<ArrowRowBlock> = if sys.htbeta_matvec.is_some() {
+            sys.rows
+                .iter()
+                .enumerate()
+                .map(|(row_idx, row)| {
+                    let htbeta = sys_htbeta_materialize_row(sys, row_idx, row);
+                    ArrowRowBlock {
+                        htt: row.htt.clone(),
+                        htbeta,
+                        gt: row.gt.clone(),
+                    }
+                })
+                .collect()
+        } else {
+            sys.rows.clone()
+        };
+        let rows = Arc::new(rows);
         let row_builder: StreamingArrowRowBuilder = Arc::new(move |row| {
             rows.get(row)
                 .cloned()
@@ -2345,8 +2376,12 @@ pub fn arrow_damped_quadratic_model_reduction(
     }
     quad += delta_beta.dot(&hbb_delta);
 
+    let mut htbeta_x = Array1::<f64>::zeros(sys.d);
     for (i, row) in sys.rows.iter().enumerate() {
         let base = i * sys.d;
+        // H_tβ^(i) · Δβ via helper (routes through htbeta_matvec when present).
+        htbeta_x.fill(0.0);
+        sys_htbeta_apply_row(sys, i, row, delta_beta, &mut htbeta_x);
         for c in 0..sys.d {
             let dt_c = delta_t[base + c];
             lin += row.gt[c] * dt_c;
@@ -2354,9 +2389,7 @@ pub fn arrow_damped_quadratic_model_reduction(
             for r in 0..sys.d {
                 quad += dt_c * row.htt[[c, r]] * delta_t[base + r];
             }
-            for b in 0..sys.k {
-                quad += 2.0 * dt_c * row.htbeta[[c, b]] * delta_beta[b];
-            }
+            quad += 2.0 * dt_c * htbeta_x[c];
         }
     }
 
@@ -2795,6 +2828,9 @@ impl JacobiPreconditioner {
 
     /// Build scalar-diagonal Jacobi: one `BlockFactor::Scalar` of length 1
     /// per column.  Matches pre-#283 semantics.
+    ///
+    /// When `sys.htbeta_matvec` is set and per-row `htbeta` slabs are absent,
+    /// each column is probed via the matvec (one call per column per row).
     fn build_scalar_jacobi<B: BatchedBlockSolver>(
         sys: &ArrowSchurSystem,
         htt_factors: &[Array2<f64>],
@@ -2811,11 +2847,22 @@ impl JacobiPreconditioner {
             };
             diag[a] = base + ridge_beta;
         }
+        // For each column a, extract H_tβ^(i) e_a via matvec probe when
+        // dense slab is absent, then compute the scalar Schur diagonal.
         let mut col = Array1::<f64>::zeros(d);
+        let mut e_a = Array1::<f64>::zeros(k);
         for (i, row) in sys.rows.iter().enumerate() {
             for a in 0..k {
-                for c in 0..d {
-                    col[c] = row.htbeta[[c, a]];
+                if sys.htbeta_matvec.is_some() || row.htbeta.dim() != (d, k) {
+                    // Kronecker / matrix-free path: probe column a.
+                    e_a.fill(0.0);
+                    e_a[a] = 1.0;
+                    col.fill(0.0);
+                    sys_htbeta_apply_row(sys, i, row, e_a.view(), &mut col);
+                } else {
+                    for c in 0..d {
+                        col[c] = row.htbeta[[c, a]];
+                    }
                 }
                 let solved = backend.solve_block_vector(&htt_factors[i], &col);
                 let mut acc = 0.0;
@@ -2879,15 +2926,19 @@ impl JacobiPreconditioner {
             }
             // Subtract Schur contributions:
             // S_kk -= H_βt_k^(i) (H_tt^(i))^{-1} H_tβ_k^(i)
-            let mut col = Array1::<f64>::zeros(d);
+            //
+            // Materialize the per-row (d, k) cross-block once and slice out
+            // the b-column submatrix.  sys_htbeta_materialize_row handles the
+            // Kronecker / htbeta_matvec path transparently.
             let mut solved_cols = Array2::<f64>::zeros((d, b));
             for (i, row) in sys.rows.iter().enumerate() {
+                let htbeta_full = sys_htbeta_materialize_row(sys, i, row);
                 for bj in 0..b {
                     let gj = range.start + bj;
-                    for c in 0..d {
-                        col[c] = row.htbeta[[c, gj]];
-                    }
-                    let solved = backend.solve_block_vector(&htt_factors[i], &col);
+                    let solved = backend.solve_block_vector(
+                        &htt_factors[i],
+                        &htbeta_full.column(gj).to_owned(),
+                    );
                     for c in 0..d {
                         solved_cols[[c, bj]] = solved[c];
                     }
@@ -2897,7 +2948,7 @@ impl JacobiPreconditioner {
                     for bj in 0..b {
                         let mut acc = 0.0;
                         for c in 0..d {
-                            acc += row.htbeta[[c, gi]] * solved_cols[[c, bj]];
+                            acc += htbeta_full[[c, gi]] * solved_cols[[c, bj]];
                         }
                         schur_block[[bi, bj]] -= acc;
                     }

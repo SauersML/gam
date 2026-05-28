@@ -90,7 +90,19 @@ def _fit_must_react(param_name: str, on_value, off_value=None, *, n: int = 32):
 
 
 def test_isometry_weight_is_not_a_silent_noop():
-    _fit_must_react("isometry_weight", on_value=100.0, off_value=0.0)
+    """isometry_weight=100.0 must produce a fit that visibly differs from
+    isometry_weight=0.0.  NotImplementedError is no longer an accepted outcome
+    — the SAE Isometry path is fully wired as of issue #250."""
+    X = _data(seed=1, n=32)
+    base_kwargs = _baseline()
+    fit_off = gamfit.sae_manifold_fit(Z=X, **{**base_kwargs, "isometry_weight": 0.0})
+    fit_on = gamfit.sae_manifold_fit(Z=X, **{**base_kwargs, "isometry_weight": 100.0})
+    assert _differs(fit_on.fitted, fit_off.fitted) or _differs(
+        fit_on.assignments, fit_off.assignments
+    ), (
+        "isometry_weight=100.0 produced an identical fit to isometry_weight=0.0; "
+        "the SAE Isometry penalty is a silent no-op."
+    )
 
 
 def test_ard_per_atom_is_not_a_silent_noop():

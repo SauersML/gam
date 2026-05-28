@@ -214,6 +214,10 @@ mod linux_impl {
             qs: qs_view,
             edf: input.edf,
         };
+        // step_lm_lambda = lm_ridge (temporary Newton stabilization only).
+        // objective_ridge = 0.0: the model's ridge is already baked into
+        // s_transformed by the outer REML loop; no separate identity ridge
+        // enters the exported Hessian / EDF / RidgePassport here.
         let outcome = pirls_gpu::pirls_loop_on_stream(
             &shared,
             &mut ws,
@@ -225,6 +229,7 @@ mod linux_impl {
             input.priorweights,
             input.s_transformed,
             lm_ridge,
+            0.0,
             input.max_iterations,
             input.convergence_tolerance,
             Some(&extra),

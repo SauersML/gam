@@ -518,19 +518,14 @@ def _build_analytic_penalties_payload(
     """Translate the SAE regularizer knobs into the analytic-penalty JSON
     payload consumed by ``sae_manifold_fit_auto``.
 
-    ``ard_per_atom``, ``block_orthogonality_weight`` and
-    ``decoder_feature_sparsity_groups`` all route through
-    ``src/terms/sae_manifold.rs``. The first two target the row-block
-    driver ("t" latent block); ``decoder_feature_sparsity_groups`` targets
-    the decoder coefficient block ("beta" latent block, shape
-    ``(M, p_out)`` for ``k_atoms == 1``) and group-lassoes ``p_out``
-    features in rows of the per-basis-function decoder matrix.
-    ``isometry_weight`` is still deferred — Isometry needs a pullback-metric
-    provider hook on ``SaeManifoldAtom``.
+    All five knobs now route through ``src/terms/sae_manifold.rs``.
+    ``ard_per_atom``, ``isometry_weight``, and ``block_orthogonality_weight``
+    target the row-block driver ("t" latent block).
+    ``decoder_feature_sparsity_groups`` targets the decoder coefficient
+    block ("beta" latent block, shape ``(M, p_out)`` for ``k_atoms == 1``)
+    and group-lassoes ``p_out`` features in rows of the per-basis-function
+    decoder matrix.
     """
-    unsupported: list[str] = []
-    if isometry_weight is not None and float(isometry_weight) > 0.0:
-        unsupported.append("isometry_weight")
     if decoder_feature_sparsity_groups is not None and int(k_atoms) != 1:
         # The "beta" latent block in `sae_manifold_fit_inner` (FFI) only
         # exists for k_atoms == 1, because `flatten_beta` concatenates
@@ -542,18 +537,11 @@ def _build_analytic_penalties_payload(
             "Multi-atom decoder group-lasso requires a stride-aware "
             "per-atom target view in `src/terms/sae_manifold.rs`."
         )
-    if unsupported:
-        names = ", ".join(unsupported)
-        raise NotImplementedError(
-            f"sae_manifold_fit: {names} cannot be applied yet — the Rust "
-            "SAE row-block driver needs pullback-metric work in "
-            "`src/terms/sae_manifold.rs`. Pass only `ard_per_atom`, "
-            "`block_orthogonality_weight`, and/or "
-            "`decoder_feature_sparsity_groups` for now."
-        )
     items: list[dict[str, Any]] = []
     if bool(ard_per_atom):
         items.append({"kind": "ard", "target": "t"})
+    if isometry_weight is not None and float(isometry_weight) > 0.0:
+        items.append({"kind": "isometry", "target": "t"})
     if (
         block_orthogonality_weight is not None
         and float(block_orthogonality_weight) > 0.0

@@ -2537,24 +2537,34 @@ mod pirls_row_gpu_tests {
             PirlsRowFamily::PoissonLog,
             PirlsRowFamily::BernoulliLogit,
         ] {
-            let f = row_reweight_cpu(canonical, CurvatureMode::Fisher, input);
-            let o = row_reweight_cpu(canonical, CurvatureMode::Observed, input);
+            let f = row_reweight_cpu(canonical, CurvatureMode::Fisher, input, 1.0);
+            let o = row_reweight_cpu(canonical, CurvatureMode::Observed, input, 1.0);
             assert_eq!(
                 f.w_hessian, o.w_hessian,
                 "{canonical:?}: observed must equal Fisher for canonical link"
             );
         }
 
-        // Gamma-log: observed = Fisher · (y/μ); Fisher = wp · shape (shape=1).
-        let gf = row_reweight_cpu(PirlsRowFamily::GammaLog, CurvatureMode::Fisher, input);
-        let go = row_reweight_cpu(PirlsRowFamily::GammaLog, CurvatureMode::Observed, input);
-        assert!(
-            (go.w_hessian - gf.w_fisher * (probe_y / gf.mu)).abs() <= 1e-12,
-            "Gamma-log observed mismatch: got={} expected={} (mu={})",
-            go.w_hessian,
-            gf.w_fisher * (probe_y / gf.mu),
-            gf.mu
-        );
+        // Gamma-log (non-canonical): observed = Fisher · (y/μ). Exercise
+        // with shape=1 and shape=2.5 to confirm the plumbing.
+        for &shape in &[1.0_f64, 2.5] {
+            let gf =
+                row_reweight_cpu(PirlsRowFamily::GammaLog, CurvatureMode::Fisher, input, shape);
+            let go =
+                row_reweight_cpu(PirlsRowFamily::GammaLog, CurvatureMode::Observed, input, shape);
+            assert!(
+                (go.w_hessian - gf.w_fisher * (probe_y / gf.mu)).abs() <= 1e-12,
+                "Gamma-log observed mismatch (shape={shape}): got={} expected={} (mu={})",
+                go.w_hessian,
+                gf.w_fisher * (probe_y / gf.mu),
+                gf.mu
+            );
+            assert_ne!(
+                gf.w_hessian,
+                go.w_hessian,
+                "Gamma-log: observed must differ from Fisher when y ≠ μ (shape={shape})"
+            );
+        }
 
         // Bernoulli probit/cloglog: observed must differ from Fisher
         // generically and must be ≥ 0 at well-behaved interior points
@@ -2563,11 +2573,43 @@ mod pirls_row_gpu_tests {
             PirlsRowFamily::BernoulliProbit,
             PirlsRowFamily::BernoulliCLogLog,
         ] {
-            let f = row_reweight_cpu(noncanon, CurvatureMode::Fisher, input);
-            let o = row_reweight_cpu(noncanon, CurvatureMode::Observed, input);
+            let f = row_reweight_cpu(noncanon, CurvatureMode::Fisher, input, 1.0);
+            let o = row_reweight_cpu(noncanon, CurvatureMode::Observed, input, 1.0);
             assert!(
                 (f.w_hessian - o.w_hessian).abs() > 0.0 || (probe_y - f.mu).abs() < 1e-15,
                 "{noncanon:?}: observed should differ from Fisher when y ≠ μ"
+            );
+        }
+    }
+
+    /// Gamma-log CPU reference: `w_fisher` scales linearly with shape;
+    /// observed `w_hessian = w_fisher · y/μ` holds for any positive shape.
+    #[test]
+    fn gamma_log_shape_scaling() {
+        let input = RowInput {
+            eta: 0.5,
+            y: 2.0,
+            prior_weight: 1.0,
+        };
+        let base = row_reweight_cpu(PirlsRowFamily::GammaLog, CurvatureMode::Fisher, input, 1.0);
+        for &shape in &[0.5_f64, 1.5, 3.0, 10.0] {
+            let r =
+                row_reweight_cpu(PirlsRowFamily::GammaLog, CurvatureMode::Fisher, input, shape);
+            assert!(
+                (r.w_fisher - shape * base.w_fisher).abs() <= 1e-14,
+                "w_fisher should scale with shape: got {} expected {} (shape={shape})",
+                r.w_fisher,
+                shape * base.w_fisher,
+            );
+            assert_eq!(r.mu.to_bits(), base.mu.to_bits(), "mu must not depend on shape");
+            let ro =
+                row_reweight_cpu(PirlsRowFamily::GammaLog, CurvatureMode::Observed, input, shape);
+            let expected_obs = r.w_fisher * (input.y / r.mu);
+            assert!(
+                (ro.w_hessian - expected_obs).abs() <= 1e-13,
+                "observed w_hessian mismatch (shape={shape}): got={} expected={}",
+                ro.w_hessian,
+                expected_obs,
             );
         }
     }
@@ -2623,6 +2665,7 @@ mod pirls_row_gpu_tests {
                             y: ys[i],
                             prior_weight: priors[i],
                         },
+                        1.0,
                     ));
                 }
 
@@ -2644,6 +2687,7 @@ mod pirls_row_gpu_tests {
                     backend,
                     family,
                     CurvatureMode::Fisher,
+                    1.0,
                     &stream,
                     n,
                     &eta_dev,
@@ -2777,6 +2821,7 @@ mod pirls_row_gpu_tests {
                     backend,
                     family,
                     CurvatureMode::Observed,
+                    1.0,
                     &stream,
                     N,
                     &eta_dev,
@@ -2814,6 +2859,7 @@ mod pirls_row_gpu_tests {
                                 y: ys[i],
                                 prior_weight: priors[i],
                             },
+                            1.0,
                         );
                         let got = wh_obs[i];
                         let exp = cpu.w_hessian;
@@ -2913,6 +2959,7 @@ mod pirls_row_gpu_tests {
                     backend,
                     family,
                     CurvatureMode::Observed,
+                    1.0,
                     &stream,
                     N,
                     &eta_dev,
@@ -2939,6 +2986,7 @@ mod pirls_row_gpu_tests {
                             y: ys[i],
                             prior_weight: priors[i],
                         },
+                        1.0,
                     );
 
                     // H diagonal (w_hessian) parity.
@@ -3252,6 +3300,7 @@ mod pirls_row_gpu_tests {
                             y: ys[i],
                             prior_weight: priors[i],
                         },
+                        1.0,
                     );
                     for (label, got, exp) in [
                         ("mu", mu_j[i], cpu.mu),

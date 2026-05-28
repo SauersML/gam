@@ -1975,45 +1975,94 @@ impl SaeManifoldTerm {
                         // here with the right p_out and populated caches.
                         if let AnalyticPenaltyKind::Isometry(iso) = penalty {
                             let atom = &self.atoms[0];
-                            // Verify the atom exposes an analytic second jet.
-                            // Without it, refresh_isometry_caches_from_atom
-                            // leaves has_jacobian_second_source false and
-                            // grad_target silently returns zero — the exact
-                            // silent-no-op this issue was opened to fix.
-                            let coords_mat = coord.as_matrix();
-                            let has_second_jet = atom.basis_second_jet.is_some()
-                                || atom
-                                    .basis_evaluator
-                                    .as_ref()
-                                    .map(|e| {
-                                        e.second_jet_dyn(coords_mat.view()).is_some()
-                                    })
-                                    .unwrap_or(false);
-                            if !has_second_jet {
-                                return Err(ArrowSchurError::SchurFactorFailed {
-                                    reason: format!(
-                                        "IsometryPenalty requested for SAE atom '{}' (basis \
-                                         kind {:?}) but this evaluator does not expose an \
-                                         analytic second jet; use AffineCoordinateEvaluator, \
-                                         SphereChartEvaluator, PeriodicHarmonicEvaluator, or \
-                                         TorusHarmonicEvaluator for SAE-Isometry",
-                                        atom.name, atom.basis_kind
-                                    ),
-                                });
-                            }
                             // The registry penalty was built with p_out equal
                             // to the latent dim (the "t" JSON block's `d`),
                             // but IsometryPenalty.p_out must match the atom's
-                            // decoder output dim. Clone and fix p_out.
+                            // decoder output dim. Clone and fix p_out before
+                            // calling refresh_isometry_caches_from_atom.
                             let p = atom.decoder_coefficients.ncols();
                             let mut corrected: IsometryPenalty = (**iso).clone();
                             corrected.p_out = p;
-                            refresh_isometry_caches_from_atom(
+                            let coords_mat = coord.as_matrix();
+                            let second_jet_installed = refresh_isometry_caches_from_atom(
                                 &corrected,
                                 atom,
                                 coords_mat.view(),
                             )
                             .map_err(|reason| ArrowSchurError::SchurFactorFailed { reason })?;
+                            if !second_jet_installed {
+                                // refresh_isometry_caches_from_atom returns
+                                // false when the atom's basis_second_jet slot
+                                // is None (atom was registered via
+                                // with_basis_evaluator, not with_basis_second_jet).
+                                // Fall back to second_jet_dyn, which evaluators
+                                // like AffineCoordinateEvaluator override even
+                                // when the SaeBasisSecondJet supertrait Arc is
+                                // not in the slot.
+                                match atom
+                                    .basis_evaluator
+                                    .as_ref()
+                                    .and_then(|e| e.second_jet_dyn(coords_mat.view()))
+                                {
+                                    Some(Ok(hess)) => {
+                                        let n_obs = coords_mat.nrows();
+                                        let d = atom.latent_dim;
+                                        let m = atom.basis_size();
+                                        if hess.dim() != (n_obs, m, d, d) {
+                                            return Err(ArrowSchurError::SchurFactorFailed {
+                                                reason: format!(
+                                                    "SAE Isometry atom '{}': second_jet_dyn \
+                                                     returned shape {:?}, expected \
+                                                     ({n_obs}, {m}, {d}, {d})",
+                                                    atom.name,
+                                                    hess.dim()
+                                                ),
+                                            });
+                                        }
+                                        let b = &atom.decoder_coefficients;
+                                        let mut jac2 = Array2::<f64>::zeros(
+                                            (n_obs, p * d * d),
+                                        );
+                                        for n in 0..n_obs {
+                                            for i in 0..p {
+                                                for a in 0..d {
+                                                    for c in 0..d {
+                                                        let mut acc = 0.0;
+                                                        for mm in 0..m {
+                                                            acc += hess[[n, mm, a, c]]
+                                                                * b[[mm, i]];
+                                                        }
+                                                        jac2[[n, (i * d + a) * d + c]] =
+                                                            acc;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        corrected.set_jacobian_second_cache(Some(
+                                            Arc::new(jac2),
+                                        ));
+                                    }
+                                    Some(Err(reason)) => {
+                                        return Err(ArrowSchurError::SchurFactorFailed {
+                                            reason,
+                                        });
+                                    }
+                                    None => {
+                                        return Err(ArrowSchurError::SchurFactorFailed {
+                                            reason: format!(
+                                                "IsometryPenalty requested for SAE atom \
+                                                 '{}' (basis kind {:?}) but this evaluator \
+                                                 does not expose an analytic second jet; \
+                                                 use AffineCoordinateEvaluator, \
+                                                 SphereChartEvaluator, \
+                                                 PeriodicHarmonicEvaluator, or \
+                                                 TorusHarmonicEvaluator for SAE-Isometry",
+                                                atom.name, atom.basis_kind
+                                            ),
+                                        });
+                                    }
+                                }
+                            }
                             let corrected_kind =
                                 AnalyticPenaltyKind::Isometry(std::sync::Arc::new(corrected));
                             self.add_sae_coord_penalty(

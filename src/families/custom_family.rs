@@ -1292,6 +1292,35 @@ pub fn default_coefficient_gradient_cost(specs: &[ParameterBlockSpec]) -> u64 {
     default_coefficient_hessian_cost(specs) / 2
 }
 
+/// Compute β-block column ranges from a slice of `ParameterBlockSpec`s.
+///
+/// Returns one `Range<usize>` per spec, covering the spec's columns in the
+/// concatenated β vector (i.e. `offset .. offset + p_block` where `p_block =
+/// spec.design.ncols()`). The ranges are non-overlapping, sorted, and their
+/// union covers `0..Σ p_block`.
+///
+/// This is the canonical source of `block_offsets` for every
+/// [`crate::solver::arrow_schur::ArrowSchurSystem`] built for a custom family
+/// (survival, GAMLSS, transformation-normal, latent-survival, marginal-slope,
+/// …). Pass the result to
+/// [`crate::solver::arrow_schur::ArrowSchurSystem::set_block_offsets`] before
+/// calling `solve` or `solve_with_options` whenever the system will use
+/// [`crate::solver::arrow_schur::ArrowSolverMode::InexactPCG`].
+///
+/// Specs with zero columns produce a zero-width range; callers that want to
+/// skip trivial blocks may filter on `r.start < r.end` after calling this
+/// function.
+pub fn block_offsets_from_specs(specs: &[ParameterBlockSpec]) -> Arc<[Range<usize>]> {
+    let mut ranges: Vec<Range<usize>> = Vec::with_capacity(specs.len());
+    let mut cursor = 0usize;
+    for spec in specs {
+        let p = spec.design.ncols();
+        ranges.push(cursor..cursor + p);
+        cursor += p;
+    }
+    Arc::from(ranges.into_boxed_slice())
+}
+
 /// Bound first-order outer iterations when each analytic-gradient evaluation is
 /// already biobank-scale work. This is only applied after the planner has
 /// selected a gradient-only route; second-order/ARC plans keep their requested

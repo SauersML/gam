@@ -106,15 +106,18 @@ pub struct PirlsGpuSharedData {
 /// one [`PirlsGpuSharedData`] are the substrate the stream-pool cubature
 /// executor (Block 6 P3) composes.
 ///
-/// Row-chunked WX assembly (Block 6 P4) replaces the full `n*p` `wx_dev`
-/// with a `chunk*p` buffer reused across row chunks; until that lands the
-/// workspace allocates the full matrix.
+/// When `p < FUSED_XTWX_P_THRESHOLD`, the workspace skips the `n×p` `wx_dev`
+/// temporary entirely and routes through the fused `xtwx_lower` + `xtscore`
+/// kernels instead. `wx_dev` is `Some` only for the large-p fallback path
+/// where `ddgmm + gemm` beats the fused kernel.
 #[cfg(target_os = "linux")]
 pub struct SigmaPirlsGpuWorkspace {
     pub(crate) stream: std::sync::Arc<cudarc::driver::CudaStream>,
     pub(crate) blas: cudarc::cublas::CudaBlas,
     pub(crate) solver: cudarc::cusolver::DnHandle,
-    pub(crate) wx_dev: cudarc::driver::CudaSlice<f64>,
+    /// `None` when `p < FUSED_XTWX_P_THRESHOLD` (fused path). `Some` for the
+    /// large-p fallback where the `ddgmm + dgemm` route is faster.
+    pub(crate) wx_dev: Option<cudarc::driver::CudaSlice<f64>>,
     pub(crate) w_dev: cudarc::driver::CudaSlice<f64>,
     pub(crate) xtwx_dev: cudarc::driver::CudaSlice<f64>,
     pub(crate) h_dev: cudarc::driver::CudaSlice<f64>,
@@ -895,7 +898,7 @@ extern "C" __global__ void chol_logdet_col_major(
                 .gemm(gemm_cfg, &shared.x_dev, &ws.wx_dev, &mut ws.xtwx_dev)
         }
         .map_err(|e| format!("assemble_export_hessian dgemm XtWX: {e}"))?;
-        // Upload S (penalty only, no lm_ridge) to ws.penalty_dev.
+        // Upload S (penalty only, no ridge) to ws.penalty_dev.
         let penalty_col = to_col_major(&penalty_hessian);
         ws.stream
             .memcpy_htod(penalty_col.as_ref(), &mut ws.penalty_dev)
@@ -1077,21 +1080,26 @@ extern "C" __global__ void status_or(
     static PIRLS_LOOP_CACHE: PtxModuleCache = PtxModuleCache::new();
 
     /// Per-fit device workspace for the Stage 3.3 PIRLS loop driver.
+    ///
+    /// Three row-kernel modes occupy separate device buffers:
+    /// - `row_solve`: solve-row (4 fields), refreshed each Newton iteration.
+    /// - `alpha_ladder`: candidate-objective (objective[7] + status[7]).
+    /// - `row_final`: final-row (9 fields), written once at convergence.
     pub struct PirlsLoopWorkspace {
         pub beta_dev: CudaSlice<f64>,
         pub eta_dev: CudaSlice<f64>,
-        pub eta_cand_dev: CudaSlice<f64>,
         pub y_dev: CudaSlice<f64>,
         pub prior_w_dev: CudaSlice<f64>,
-        pub row_out: crate::gpu::pirls_row::RowOutputDevBuffers,
-        pub row_out_cand: crate::gpu::pirls_row::RowOutputDevBuffers,
+        /// Solve-row buffers: `grad_eta`, `w_solver`, `deviance`, `status`.
+        pub row_solve: crate::gpu::pirls_row::SolveRowBuffers,
+        /// Alpha-ladder buffers: `objective[7]`, `status[7]`.
+        pub alpha_ladder: crate::gpu::pirls_row::AlphaLadderDevBuffers,
+        /// Full final-row buffers: all 9 fields, written once at convergence.
+        pub row_final: crate::gpu::pirls_row::RowOutputDevBuffers,
         pub direction_dev: CudaSlice<f64>,
         pub xd_dev: CudaSlice<f64>,
         pub scalar_dev: CudaSlice<f64>,
-        /// Single-element u32 output buffer for the `status_or`
-        /// OR-reduction kernel.  Reused for candidate-accept checks on
-        /// every line-search step and for the post-convergence final OR
-        /// over `row_out.status`.
+        /// Single-element u32 for the `status_or` OR-reduction kernel.
         pub status_u32_dev: CudaSlice<u32>,
         pub n: usize,
         pub p: usize,
@@ -1112,13 +1120,14 @@ extern "C" __global__ void status_or(
             Ok(Self {
                 beta_dev: alloc_f64("beta", p)?,
                 eta_dev: alloc_f64("eta", n)?,
-                eta_cand_dev: alloc_f64("eta_cand", n)?,
                 y_dev: alloc_f64("y", n)?,
                 prior_w_dev: alloc_f64("prior_w", n)?,
-                row_out: crate::gpu::pirls_row::RowOutputDevBuffers::allocate(stream, n)
-                    .map_err(|e| format!("pirls loop alloc row_out: {e}"))?,
-                row_out_cand: crate::gpu::pirls_row::RowOutputDevBuffers::allocate(stream, n)
-                    .map_err(|e| format!("pirls loop alloc row_out_cand: {e}"))?,
+                row_solve: crate::gpu::pirls_row::SolveRowBuffers::allocate(stream, n)
+                    .map_err(|e| format!("pirls loop alloc row_solve: {e}"))?,
+                alpha_ladder: crate::gpu::pirls_row::AlphaLadderDevBuffers::allocate(stream)
+                    .map_err(|e| format!("pirls loop alloc alpha_ladder: {e}"))?,
+                row_final: crate::gpu::pirls_row::RowOutputDevBuffers::allocate(stream, n)
+                    .map_err(|e| format!("pirls loop alloc row_final: {e}"))?,
                 direction_dev: alloc_f64("direction", p)?,
                 xd_dev: alloc_f64("xd", n)?,
                 scalar_dev: alloc_f64("scalar", 1)?,
@@ -1149,7 +1158,7 @@ extern "C" __global__ void status_or(
     /// `firth`, `edf`, `beta_transformed`, `derivatives_unsupported`)
     /// take safe defaults: empty arrays, `PirlsStatus::Converged` or
     /// `MaxIterationsReached` reflecting `converged`, no KKT
-    /// diagnostics, identity ridge with `lm_ridge` magnitude,
+    /// diagnostics, identity ridge with `objective_ridge` magnitude,
     /// `FirthDiagnostics::Inactive`, `edf = NaN`,
     /// `beta_transformed = beta`, `derivatives_unsupported = true`.
     /// Existing callers that do not need the CPU oracle surface can
@@ -1193,7 +1202,7 @@ extern "C" __global__ void status_or(
         /// Pre-built ridge passport carrying the stabilization
         /// magnitude + policy that the dispatch wirer wants stamped on
         /// `PirlsResult::ridge_passport`. When `None`, the postpass
-        /// uses `RidgePassport::scaled_identity(lm_ridge,
+        /// uses `RidgePassport::scaled_identity(objective_ridge,
         /// RidgePolicy::explicit_stabilization_full())`, which mirrors
         /// the CPU oracle's default for a no-escalation fit.
         pub ridge_passport: Option<crate::types::RidgePassport>,
@@ -1413,6 +1422,9 @@ extern "C" __global__ void status_or(
         let linf_func = loop_module
             .load_function("linf_norm")
             .map_err(|e| format!("load linf_norm: {e}"))?;
+        let status_or_func = loop_module
+            .load_function("status_or")
+            .map_err(|e| format!("load status_or: {e}"))?;
 
         gemv_no_trans(
             &ws.blas,
@@ -1535,7 +1547,27 @@ extern "C" __global__ void status_or(
                     &mut loop_ws.scalar_dev,
                     "cand_dev",
                 )?;
-                if cand.is_finite() && cand < prev_deviance {
+                // Forbidden status bits: INVALID_RESPONSE means y is
+                // outside the family's support (produces NaN deviance
+                // that can be masked by floating-point cancellation).
+                // ZERO_PRIOR_WEIGHT means a row is structurally invalid.
+                // Either bit means the candidate's arithmetic is bad even
+                // if the summed deviance happens to look finite/lower.
+                let cand_status = reduce_status_or(
+                    &ws.stream,
+                    &status_or_func,
+                    &loop_ws.row_out_cand.status,
+                    n,
+                    &mut loop_ws.status_u32_dev,
+                    "cand_status",
+                )?;
+                const FORBIDDEN_LINESEARCH: u32 =
+                    crate::gpu::pirls_row::status_flags::INVALID_RESPONSE
+                    | crate::gpu::pirls_row::status_flags::ZERO_PRIOR_WEIGHT;
+                if cand.is_finite()
+                    && cand < prev_deviance
+                    && (cand_status & FORBIDDEN_LINESEARCH) == 0
+                {
                     alpha = a;
                     accepted_dev = cand;
                     halving_count = ladder_idx;
@@ -1621,6 +1653,7 @@ extern "C" __global__ void status_or(
                         last_step_size,
                         min_deviance: min_dev,
                     },
+                    &status_or_func,
                 );
             }
         }
@@ -1642,6 +1675,7 @@ extern "C" __global__ void status_or(
                 last_step_size,
                 min_deviance: min_dev,
             },
+            &status_or_func,
         )
     }
 
@@ -1682,6 +1716,7 @@ extern "C" __global__ void status_or(
         objective_ridge: f64,
         extra: Option<&PirlsLoopExtra<'_>>,
         diagnostics: LoopDiagnostics,
+        status_or_func: &cudarc::driver::CudaFunction,
     ) -> Result<PirlsLoopOutcome, String> {
         let beta = download_vec(&ws.stream, &loop_ws.beta_dev)?;
         let final_eta = download_vec(&ws.stream, &loop_ws.eta_dev)?;
@@ -1690,14 +1725,35 @@ extern "C" __global__ void status_or(
         let final_w_hessian = download_vec(&ws.stream, &loop_ws.row_out.w_hessian)?;
         let final_w_solver = download_vec(&ws.stream, &loop_ws.row_out.w_solver)?;
 
+        // OR-reduce the per-row status flags of the final accepted step.
+        // Any INVALID_RESPONSE or ZERO_PRIOR_WEIGHT bit that survived to
+        // the accepted iterate means the line-search fallback swallowed a
+        // structurally bad candidate; classify as Unstable.
+        let n_rows = loop_ws.n;
+        let final_row_status = reduce_status_or(
+            &ws.stream,
+            status_or_func,
+            &loop_ws.row_out.status,
+            n_rows,
+            &mut loop_ws.status_u32_dev,
+            "final_row_status",
+        )?;
+        const FORBIDDEN_FINAL: u32 =
+            crate::gpu::pirls_row::status_flags::INVALID_RESPONSE
+            | crate::gpu::pirls_row::status_flags::ZERO_PRIOR_WEIGHT;
+
         // Stability classification — Unstable supersedes both
         // converged and MaxIterationsReached because a non-finite η /
         // μ at the accepted step means the line search swallowed a
         // divergence (saturated likelihood / perfect separation).
+        // Also Unstable when forbidden row-status bits are set.
         let eta_finite = final_eta.iter().all(|v| v.is_finite());
         let mu_finite = final_mu.iter().all(|v| v.is_finite());
         let beta_finite = beta.iter().all(|v| v.is_finite());
-        let stability_ok = eta_finite && mu_finite && beta_finite;
+        let stability_ok = eta_finite
+            && mu_finite
+            && beta_finite
+            && (final_row_status & FORBIDDEN_FINAL) == 0;
         let status = if !stability_ok {
             crate::solver::pirls::PirlsStatus::Unstable
         } else if converged {
@@ -2858,7 +2914,8 @@ mod stream_device_parity_tests {
                 weights: weights.view(),
                 penalty_hessian: penalty.view(),
                 gradient: gradient.view(),
-                lm_ridge,
+                step_lm_lambda: lm_ridge,
+                objective_ridge: 0.0,
             },
         )
         .expect("host-input step");
@@ -2882,7 +2939,8 @@ mod stream_device_parity_tests {
                 w_solver_dev: &w_dev,
                 grad_eta_dev: &g_dev,
                 penalty_hessian: penalty.view(),
-                lm_ridge,
+                step_lm_lambda: lm_ridge,
+                objective_ridge: 0.0,
             },
         )
         .expect("device-input step");
@@ -2972,6 +3030,7 @@ mod stream_device_parity_tests {
                 y.view(),
                 prior_w.view(),
                 penalty.view(),
+                0.0,
                 0.0,
                 30,
                 1e-6,
@@ -3075,6 +3134,7 @@ mod stream_device_parity_tests {
             y.view(),
             prior_w.view(),
             penalty.view(),
+            0.0,
             0.0,
             20,
             1e-9,

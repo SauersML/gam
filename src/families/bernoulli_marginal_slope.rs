@@ -4904,7 +4904,7 @@ fn runtime_available_memory_bytes() -> u64 {
 }
 
 /// Process-global counter of bytes currently pinned by live BMS row-primary
-/// Hessian caches. Incremented by [`RowPrimaryHessianPin::new`] when a cache
+/// evaluation caches. Incremented by [`RowPrimaryEvalPin::new`] when a cache
 /// is materialized and decremented on `Drop`, so two co-resident workspaces
 /// cannot together pin more than `available_ram * GLOBAL_FRACTION`.
 fn bms_row_primary_hessian_pinned_bytes() -> &'static AtomicU64 {
@@ -4992,84 +4992,119 @@ fn decide_row_primary_hessian_cache(
     }
 }
 
-/// RAII handle around a materialized row-primary Hessian cache that
-/// decrements the process-global pinned-bytes counter on drop.
-pub(crate) struct RowPrimaryHessianPin {
-    rows: Array2<f64>,
+/// RAII handle around a materialized row-primary evaluation cache
+/// (neglog + gradient + Hessian) that decrements the process-global
+/// pinned-bytes counter on drop.
+pub(crate) struct RowPrimaryEvalPin {
+    /// Per-row negative log-likelihood, length `n`.
+    neglog: Array1<f64>,
+    /// Per-row gradient, shape `(n, r)`.
+    grad: Array2<f64>,
+    /// Per-row Hessian, shape `(n, r*r)`.
+    hess: Array2<f64>,
     bytes: u64,
 }
 
-impl RowPrimaryHessianPin {
-    fn new(rows: Array2<f64>, bytes: u64) -> Self {
+impl RowPrimaryEvalPin {
+    fn new(neglog: Array1<f64>, grad: Array2<f64>, hess: Array2<f64>, bytes: u64) -> Self {
         bms_row_primary_hessian_pinned_bytes().fetch_add(bytes, Ordering::AcqRel);
-        Self { rows, bytes }
+        Self {
+            neglog,
+            grad,
+            hess,
+            bytes,
+        }
     }
 
-    fn rows(&self) -> &Array2<f64> {
-        &self.rows
+    fn neglog(&self) -> &Array1<f64> {
+        &self.neglog
+    }
+
+    fn grad(&self) -> &Array2<f64> {
+        &self.grad
+    }
+
+    fn hess(&self) -> &Array2<f64> {
+        &self.hess
     }
 }
 
-impl Drop for RowPrimaryHessianPin {
+impl Drop for RowPrimaryEvalPin {
     fn drop(&mut self) {
         bms_row_primary_hessian_pinned_bytes().fetch_sub(self.bytes, Ordering::AcqRel);
     }
 }
 
-/// Per-fit row-primary Hessian cache state. Replaces the prior
-/// `Option<RowPrimaryHessianPin>` so the GPU dispatch can carry a device
-/// handle without losing the host-pinned RAII path.
+/// Per-fit row-primary evaluation cache: stores neglog + gradient + Hessian
+/// for every row so that downstream passes (fused gradient+dense-H, HVP,
+/// diagonal) never recompute the row kernel.
 ///
 /// Variants:
 /// - `Empty`: cache not materialized (rigid path or caller opted out).
-/// - `Host`: f64 cache lives in host RAM as a flattened `(n, r*r)` Array2.
-///   Consumed by the CPU per-row Hv / diagonal / direct-product loops via
-///   [`BernoulliMarginalSlopeFamily::cached_row_primary_hessian`].
-pub(crate) enum RowPrimaryHessianCache {
+/// - `Host`: all three arrays live in host RAM.
+///   Consumed by the CPU per-row Hv / diagonal / direct-product loops and by
+///   the fused gradient+dense-H path via
+///   [`BernoulliMarginalSlopeFamily::cached_row_primary_hessian`] and
+///   [`BernoulliMarginalSlopeFamily::cached_row_primary_eval`].
+/// - `Device` (Linux/CUDA only): Hessian + designs live on the GPU; neglog and
+///   gradient are kept as host `Arc<[f64]>` slices for the fused gradient pass.
+pub(crate) enum RowPrimaryEvalCache {
     Empty,
-    Host(RowPrimaryHessianPin),
-    /// Device-resident row-Hessian cache, produced on Linux + CUDA by the
-    /// Phase-3 `launch_bms_flex_row_kernel_device_resident` entry point.
-    /// HVP / diagonal consumers route through
-    /// [`crate::gpu::bms_flex_row::launch_bms_flex_row_hvp`] /
-    /// [`crate::gpu::bms_flex_row::launch_bms_flex_row_diagonal`] which read
-    /// the row Hessians + uploaded designs directly from device memory.
+    Host(RowPrimaryEvalPin),
+    /// Device-resident row Hessian + designs, plus host-side neglog/grad.
+    /// HVP / diagonal consumers route through the device-aware GPU entry
+    /// points; the fused gradient pass reads neglog/grad from the host slices.
     #[cfg(target_os = "linux")]
-    Device(crate::gpu::bms_flex_row::DeviceResidentRowHess),
+    Device {
+        neglog: std::sync::Arc<[f64]>,
+        grad: std::sync::Arc<[f64]>,
+        hess: crate::gpu::bms_flex_row::DeviceResidentRowHess,
+    },
 }
 
-impl RowPrimaryHessianCache {
-    /// Mirrors `Option::is_some` on the prior field type. CPU dispatcher
-    /// branches that gate on "is the per-row Hessian materialized at all"
-    /// answer yes for both host- and device-resident caches.
+impl RowPrimaryEvalCache {
+    /// Returns `true` when the cache is materialized (host or device).
     #[inline]
     pub(crate) fn is_some(&self) -> bool {
         !matches!(self, Self::Empty)
     }
 
-    /// Returns the host-resident pin when the cache is materialized as a
+    /// Returns the host-resident pin when the cache is materialised as a
     /// host pin. Returns `None` for the device-resident variant — callers
-    /// that need to read the full `r × r` Hessian per row must either
+    /// that need to read the full `r x r` Hessian per row must either
     /// route through the device-aware HVP / diagonal entry points or fall
     /// back to recomputing the row Hessian on the fly.
     #[inline]
-    pub(crate) fn host_pin(&self) -> Option<&RowPrimaryHessianPin> {
+    pub(crate) fn host_pin(&self) -> Option<&RowPrimaryEvalPin> {
         match self {
             Self::Host(pin) => Some(pin),
             Self::Empty => None,
             #[cfg(target_os = "linux")]
-            Self::Device(_) => None,
+            Self::Device { .. } => None,
         }
     }
 
-    /// Returns the device-resident state when the cache lives on the GPU.
-    /// `None` on every other variant (and on non-Linux builds where the
-    /// device variant does not exist).
+    /// Returns the device-resident Hessian state when the cache lives on the
+    /// GPU. `None` on every other variant (and on non-Linux builds).
     #[cfg(target_os = "linux")]
     #[inline]
     pub(crate) fn device(&self) -> Option<&crate::gpu::bms_flex_row::DeviceResidentRowHess> {
         match self {
-            Self::Device(state) => Some(state),
+            Self::Device { hess, .. } => Some(hess),
+            _ => None,
+        }
+    }
+
+    /// Returns the host-side neglog and grad slices when the cache is in the
+    /// Device variant. Used by the fused gradient pass to avoid a second row
+    /// kernel pass even when the Hessian lives on the GPU.
+    #[cfg(target_os = "linux")]
+    #[inline]
+    pub(crate) fn device_neglog_grad(
+        &self,
+    ) -> Option<(&std::sync::Arc<[f64]>, &std::sync::Arc<[f64]>)> {
+        match self {
+            Self::Device { neglog, grad, .. } => Some((neglog, grad)),
             _ => None,
         }
     }
@@ -5107,7 +5142,7 @@ struct BernoulliMarginalSlopeExactEvalCache {
     /// avoids rebuilding cell moments + reduced flex jets on every Hv product.
     /// `None` whenever the flex path is inactive (rigid kernel) or the
     /// caller did not opt in to materialization.
-    row_primary_hessians: RowPrimaryHessianCache,
+    row_primary_hessians: RowPrimaryEvalCache,
     /// Per-row uncontracted third-derivative tensor in the rigid path,
     /// lazily built on first access. The `build_psi_hyper_coords` row pass
     /// hits `rigid_row_third_contracted` once per (row, ψ-axis) — 32× per
@@ -8379,7 +8414,7 @@ impl BernoulliMarginalSlopeFamily {
             row_cell_moments,
             row_cell_moments_d15: crate::resource::RayonSafeOnce::new(),
             row_cell_moments_d21: crate::resource::RayonSafeOnce::new(),
-            row_primary_hessians: RowPrimaryHessianCache::Empty,
+            row_primary_hessians: RowPrimaryEvalCache::Empty,
             rigid_third_full: crate::resource::RayonSafeOnce::new(),
             rigid_fourth_full: crate::resource::RayonSafeOnce::new(),
         })
@@ -9225,9 +9260,9 @@ impl BernoulliMarginalSlopeFamily {
         &self,
         block_states: &[ParameterBlockState],
         cache: &BernoulliMarginalSlopeExactEvalCache,
-    ) -> Result<RowPrimaryHessianCache, String> {
+    ) -> Result<RowPrimaryEvalCache, String> {
         if !self.effective_flex_active(block_states)? {
-            return Ok(RowPrimaryHessianCache::Empty);
+            return Ok(RowPrimaryEvalCache::Empty);
         }
         let n = self.y.len();
         let primary = &cache.primary;
@@ -9292,7 +9327,7 @@ impl BernoulliMarginalSlopeFamily {
                     gpu_decision.reason,
                 );
             }
-            return Ok(RowPrimaryHessianCache::Empty);
+            return Ok(RowPrimaryEvalCache::Empty);
         }
         let started = std::time::Instant::now();
         let heartbeat_guard = crate::heartbeat::scope(format!(
@@ -9375,7 +9410,7 @@ impl BernoulliMarginalSlopeFamily {
                                     block_layout,
                                     primary_layout,
                                 ) {
-                                    Ok((_, _, device_state)) => {
+                                    Ok((neglog_vec, grad_vec, device_state)) => {
                                         if log_exact_work(n) {
                                             log::info!(
                                                 "[BMS row-primary-hessian-cache] gpu_device_resident_ok rows={} r={} elapsed={:.3}s",
@@ -9385,7 +9420,11 @@ impl BernoulliMarginalSlopeFamily {
                                             );
                                         }
                                         drop(heartbeat_guard);
-                                        return Ok(RowPrimaryHessianCache::Device(device_state));
+                                        return Ok(RowPrimaryEvalCache::Device {
+                                            neglog: neglog_vec.into(),
+                                            grad: grad_vec.into(),
+                                            hess: device_state,
+                                        });
                                     }
                                     Err(err) => {
                                         log::info!(
@@ -11292,9 +11331,8 @@ impl BernoulliMarginalSlopeFamily {
         let mut f_uv = Array2::<f64>::zeros((r, r));
 
         let owned_cells;
-        let cells: &[CachedDenestedCellMoments] = if let Some(cached) = cache
-            .row_cell_moments
-            .as_ref()
+        let cells: &[CachedDenestedCellMoments] = if let Some(cached) = self
+            .bundle_for_degree(block_states, cache, 15)?
             .and_then(|bundle| bundle.row(row, 15))
         {
             cached
@@ -12065,9 +12103,8 @@ impl BernoulliMarginalSlopeFamily {
         let mut f_uv_dir = vec![0.0; n_dirs * r * r];
 
         let owned_cells;
-        let cells: &[CachedDenestedCellMoments] = if let Some(cached) = cache
-            .row_cell_moments
-            .as_ref()
+        let cells: &[CachedDenestedCellMoments] = if let Some(cached) = self
+            .bundle_for_degree(block_states, cache, 15)?
             .and_then(|bundle| bundle.row(row, 15))
         {
             cached
@@ -12630,9 +12667,8 @@ impl BernoulliMarginalSlopeFamily {
         let mut f_uv_uv = Array2::<f64>::zeros((r, r));
 
         let owned_cells;
-        let cells: &[CachedDenestedCellMoments] = if let Some(cached) = cache
-            .row_cell_moments
-            .as_ref()
+        let cells: &[CachedDenestedCellMoments] = if let Some(cached) = self
+            .bundle_for_degree(block_states, cache, 21)?
             .and_then(|bundle| bundle.row(row, 21))
         {
             cached
@@ -18252,9 +18288,8 @@ impl BernoulliMarginalSlopeFamily {
         let mut f_uv_dir = vec![0.0; n_dirs * r * r];
 
         let owned_cells;
-        let cells: &[CachedDenestedCellMoments] = if let Some(cached) = cache
-            .row_cell_moments
-            .as_ref()
+        let cells: &[CachedDenestedCellMoments] = if let Some(cached) = self
+            .bundle_for_degree(block_states, cache, 15)?
             .and_then(|bundle| bundle.row(row, 15))
         {
             cached
@@ -28506,7 +28541,7 @@ mod tests {
             row_cell_moments: None,
             row_cell_moments_d15: crate::resource::RayonSafeOnce::new(),
             row_cell_moments_d21: crate::resource::RayonSafeOnce::new(),
-            row_primary_hessians: RowPrimaryHessianCache::Empty,
+            row_primary_hessians: RowPrimaryEvalCache::Empty,
             rigid_third_full: crate::resource::RayonSafeOnce::new(),
             rigid_fourth_full: crate::resource::RayonSafeOnce::new(),
         };
@@ -28567,7 +28602,7 @@ mod tests {
             row_cell_moments: None,
             row_cell_moments_d15: crate::resource::RayonSafeOnce::new(),
             row_cell_moments_d21: crate::resource::RayonSafeOnce::new(),
-            row_primary_hessians: RowPrimaryHessianCache::Empty,
+            row_primary_hessians: RowPrimaryEvalCache::Empty,
             rigid_third_full: crate::resource::RayonSafeOnce::new(),
             rigid_fourth_full: crate::resource::RayonSafeOnce::new(),
         };

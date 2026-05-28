@@ -1,7 +1,16 @@
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MixedPrecisionPolicy {
+    /// Always use fp64 factorization; no refinement attempted.
     Off,
-    Screening,
+    /// Attempt fp32 Cholesky factorization followed by up to
+    /// `REFINEMENT_MAX_STEPS` fp64-residual refinement steps. Policy admits
+    /// the attempt only when `p ≥ REFINEMENT_MIN_P` (so that the fp64 GEMV
+    /// overhead is amortized) and the measured residual drops monotonically.
+    /// Falls back to fp64 factorization automatically when the residual does
+    /// not decrease (κ(A)·u ≥ 1 regime) or when the fp32 POTRF itself fails.
+    Refinement,
+    /// Always use fp64 factorization; equivalent to `Off` but signals that
+    /// an explicit policy decision was taken.
     Never,
 }
 
@@ -54,12 +63,56 @@ impl Default for GpuDispatchPolicy {
             keep_design_resident_min_bytes: 32 * 1024 * 1024,
             prefer_gpu_factorization_min_p: 512,
             row_kernel_min_n: 50_000,
-            mixed_precision: MixedPrecisionPolicy::Off,
+            mixed_precision: MixedPrecisionPolicy::Refinement,
         }
     }
 }
 
 impl GpuDispatchPolicy {
+    /// Minimum problem dimension for the fp32+refinement path.
+    ///
+    /// Below this threshold the fp64 GEMV needed for the residual check costs
+    /// more than the savings from fp32 factorization. The threshold is set so
+    /// that a single `p × p` DGEMV (2p² flops) is at least 10× cheaper than
+    /// the `p³/3` POTRF (i.e. p ≥ 64) while still leaving margin for the
+    /// POTRF/POTRS launches. In practice `p ≥ 64` matches the existing
+    /// `potrf_min_p = 512` floor for GPU dispatch, so the refinement path only
+    /// activates when the GPU factorization path is already chosen.
+    pub const REFINEMENT_MIN_P: usize = 64;
+
+    /// Maximum number of fp32-correction steps per solve.
+    ///
+    /// Two steps suffice for κ(A) ≤ 10⁵ at fp32 (u ≈ 6 × 10⁻⁸): after step
+    /// 1 the error is O(κ u)² ≈ 10⁻⁶, after step 2 it is O(κ u)⁴ ≈ 10⁻¹²,
+    /// which is well within the fp64 unit roundoff of 10⁻¹⁶ × κ. A cap of 3
+    /// is used defensively.
+    pub const REFINEMENT_MAX_STEPS: usize = 3;
+
+    /// Relative residual tolerance for declaring convergence.
+    ///
+    /// `‖r‖ / ‖b‖ ≤ tol` is considered a converged solve. 10⁻¹² is two
+    /// orders of magnitude above the fp64 machine epsilon times a moderate
+    /// condition number, leaving the policy conservative.
+    pub const REFINEMENT_TOL: f64 = 1e-12;
+
+    /// Return `true` when the policy and problem size together suggest that
+    /// attempting fp32 factorization + iterative refinement will be profitable.
+    ///
+    /// The predicate is conservative:
+    ///   * `MixedPrecisionPolicy::Off` or `Never` → always `false`.
+    ///   * `Refinement` with `p < REFINEMENT_MIN_P` → `false` (GEMV overhead
+    ///     not amortised by fp32 POTRF savings below this threshold).
+    ///   * Otherwise `true`; the caller still falls back to fp64 factorization
+    ///     when the runtime fp32 POTRF fails or when the measured residual is
+    ///     non-monotone.
+    #[inline]
+    pub const fn iterative_refinement_should_attempt(&self, p: usize) -> bool {
+        match self.mixed_precision {
+            MixedPrecisionPolicy::Off | MixedPrecisionPolicy::Never => false,
+            MixedPrecisionPolicy::Refinement => p >= Self::REFINEMENT_MIN_P,
+        }
+    }
+
     pub const fn dense_gemv_target_is_gpu(&self, n: usize, p: usize, resident: bool) -> bool {
         resident || n.saturating_mul(p).saturating_mul(2) >= self.gemm_min_flops
     }

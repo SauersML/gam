@@ -21,10 +21,26 @@ pub fn backend_status() -> BackendStatus {
     }
 }
 
+/// Outcome reported by [`iterative_refinement_cholesky_solve`].
+#[derive(Clone, Debug)]
+pub struct RefinementOutcome {
+    /// Solution vector `x` satisfying `A x ≈ b`.
+    pub solution: ndarray::Array1<f64>,
+    /// `‖r‖ / ‖b‖` where `r = b − A x` after the last refinement step
+    /// (or after the initial fp32 solve when no steps were taken).
+    pub relative_residual: f64,
+    /// Precision path used for the factorization.
+    pub used_fp32_factor: bool,
+    /// Number of refinement steps taken (0 means only the initial solve ran).
+    pub refinement_steps: usize,
+}
+
 #[cfg(target_os = "linux")]
 mod cuda {
     use crate::gpu::driver::{from_col_major, to_col_major};
     use crate::linalg::faer_ndarray::cholesky_factor_logdet;
+    use cudarc::cublas::{CudaBlas, Gemv, GemvConfig};
+    use cudarc::cublas::sys as cublas_sys;
     use cudarc::cusolver::{DnHandle, sys as cusolver_sys};
     use cudarc::driver::{CudaContext, CudaSlice, DevicePtr, DevicePtrMut};
     use faer::MatRef;
