@@ -666,24 +666,6 @@ pub struct ParameterBlockSpec {
     /// does not match the subject count (e.g. survival time-varying blocks
     /// that stack `[exit; entry; deriv]` into `design`).
     pub audit_design: Option<DesignMatrix>,
-    /// Optional channel-role declaration for the identifiability audit.
-    /// When `Some`, the spec carries enough structure for the audit to route
-    /// channel-aware automatically — no `jacobian_callback` wiring needed.
-    /// `(own_output, n_family_outputs)`: this block drives channel
-    /// `own_output` of an `n_family_outputs`-channel additive likelihood.
-    pub channel_role: Option<ChannelRole>,
-}
-
-/// Declared channel role for a parameter block in a multi-output additive
-/// family (e.g. GAMLSS location-scale, survival location-scale).  Set on
-/// `ParameterBlockSpec::channel_role` to drive channel-aware identifiability
-/// routing automatically.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ChannelRole {
-    /// Zero-based output index this block drives.
-    pub own_output: usize,
-    /// Total number of channels in the family's additive likelihood.
-    pub n_family_outputs: usize,
 }
 
 impl std::fmt::Debug for ParameterBlockSpec {
@@ -726,7 +708,6 @@ impl ParameterBlockSpec {
             gauge_priority: 100,
             jacobian_callback: None,
             audit_design: None,
-            channel_role: None,
         }
     }
 

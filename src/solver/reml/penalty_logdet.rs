@@ -60,21 +60,6 @@ use rayon::prelude::*;
 
 use crate::faer_ndarray::FaerEigh;
 
-const INACTIVE_LAMBDA_FLOOR: f64 = 1e-300;
-
-fn active_lambda_threshold(lambdas: &[f64]) -> f64 {
-    let max_lambda = lambdas
-        .iter()
-        .copied()
-        .filter(|lambda| lambda.is_finite() && *lambda > 0.0)
-        .fold(0.0, f64::max);
-    (max_lambda * f64::EPSILON).max(INACTIVE_LAMBDA_FLOOR)
-}
-
-fn lambda_is_active(lambda: f64, threshold: f64) -> bool {
-    lambda.is_finite() && lambda > threshold
-}
-
 /// Check whether penalty ranges decompose into independent exact blocks.
 ///
 /// Multiple smoothing components may share the same block (for example tensor
@@ -417,16 +402,11 @@ impl PenaltyPseudologdet {
                 .all(|m| m.nrows() == p_dim && m.ncols() == p_dim)
         );
 
-        // Build S = Σ λ_k S_k.
+        // Build S = Σ λ_k S_k (+ ridge·I).
         let mut s_total = Array2::<f64>::zeros((p_dim, p_dim));
         for (k, s_k) in s_k_matrices.iter().enumerate() {
             s_total.scaled_add(lambdas[k], s_k);
         }
-        let structural_nullity = if ridge > 0.0 {
-            Some(Self::structural_nullity_from_active_sum(&s_total)?)
-        } else {
-            None
-        };
         if ridge > 0.0 {
             for i in 0..p_dim {
                 s_total[[i, i]] += ridge;
@@ -434,63 +414,7 @@ impl PenaltyPseudologdet {
         }
 
         let ridge_hint = if ridge > 0.0 { Some(ridge) } else { None };
-        Self::from_assembled_with_nullity(s_total, ridge_hint, structural_nullity)
-    }
-
-    /// Build from unscaled penalty components with a known structural nullity.
-    ///
-    /// When the intersection nullity dim(∩_k N(S_k)) is known structurally,
-    /// pass it here to override eigenvalue-based rank detection. This is more
-    /// reliable when ridge regularization inflates near-zero eigenvalues.
-    pub fn from_components_with_nullity(
-        s_k_matrices: &[Array2<f64>],
-        lambdas: &[f64],
-        ridge: f64,
-        structural_nullity: Option<usize>,
-    ) -> Result<Self, String> {
-        if s_k_matrices.is_empty() {
-            return Ok(Self {
-                w_factor: Array2::zeros((0, 0)),
-                u_null: None,
-                inv_evals_sq: Array1::zeros(0),
-                rank: 0,
-                value: 0.0,
-                block_spans: Vec::new(),
-            });
-        }
-
-        let p_dim = s_k_matrices[0].nrows();
-        assert!(
-            s_k_matrices
-                .iter()
-                .all(|m| m.nrows() == p_dim && m.ncols() == p_dim)
-        );
-
-        let mut s_total = Array2::<f64>::zeros((p_dim, p_dim));
-        for (k, s_k) in s_k_matrices.iter().enumerate() {
-            s_total.scaled_add(lambdas[k], s_k);
-        }
-        let lambda_threshold = active_lambda_threshold(lambdas);
-        let all_lambdas_active = lambdas
-            .iter()
-            .all(|&lambda| lambda_is_active(lambda, lambda_threshold));
-        let structural_nullity = if ridge > 0.0 {
-            if all_lambdas_active {
-                structural_nullity.or(Some(Self::structural_nullity_from_active_sum(&s_total)?))
-            } else {
-                Some(Self::structural_nullity_from_active_sum(&s_total)?)
-            }
-        } else {
-            None
-        };
-        if ridge > 0.0 {
-            for i in 0..p_dim {
-                s_total[[i, i]] += ridge;
-            }
-        }
-
-        let ridge_hint = if ridge > 0.0 { Some(ridge) } else { None };
-        Self::from_assembled_with_nullity(s_total, ridge_hint, structural_nullity)
+        Self::from_assembled(s_total, ridge_hint)
     }
 
     /// Build from a pre-assembled penalty matrix.

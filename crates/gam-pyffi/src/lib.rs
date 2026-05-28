@@ -8070,6 +8070,83 @@ fn dense_fisher_glm_fit_to_pydict<'py>(
     Ok(out.unbind())
 }
 
+/// Penalized multinomial-logit GAM fit at fixed λ.
+///
+/// Reference-coded softmax with class `K - 1` as the implicit reference
+/// (`η_{K-1} ≡ 0`). The penalty matrix `S` is replicated per active class
+/// with per-class smoothing `lambdas[a]`; the joint penalized Hessian is
+/// `Xᵀ W X + diag_a(λ_a) ⊗ S` in output-major coefficient ordering
+/// `β = [β_0; β_1; …; β_{K-2}]`.
+///
+/// Routes through `gam::families::multinomial::fit_penalized_multinomial`,
+/// which uses `MultinomialLogitLikelihood: VectorLikelihood` (canonical
+/// observed = Fisher per-row dense `(K-1)×(K-1)` block
+/// `p_a δ_{ab} − p_a p_b`) and `gam::pirls::dense_block_xtwx` for the
+/// stacked Newton solve.
+///
+/// REML / LAML λ selection is a separate slice (the multinomial CustomFamily
+/// outer that lifts this driver into the ρ loop). Until that lands, callers
+/// pass an explicit `lambdas` vector (length `K - 1`).
+#[pyfunction(signature = (
+    design,
+    y_one_hot,
+    penalty,
+    lambdas,
+    row_weights = None,
+    max_iter = 50,
+    tol = 1.0e-7,
+))]
+fn fit_penalized_multinomial_pyfunc<'py>(
+    py: Python<'py>,
+    design: PyReadonlyArray2<'py, f64>,
+    y_one_hot: PyReadonlyArray2<'py, f64>,
+    penalty: PyReadonlyArray2<'py, f64>,
+    lambdas: PyReadonlyArray1<'py, f64>,
+    row_weights: Option<PyReadonlyArray1<'py, f64>>,
+    max_iter: usize,
+    tol: f64,
+) -> PyResult<Py<PyDict>> {
+    let design_view = design.as_array();
+    let y_view = y_one_hot.as_array();
+    let penalty_view = penalty.as_array();
+    let lambdas_view = lambdas.as_array();
+    let row_weights_view = row_weights.as_ref().map(|w| w.as_array());
+
+    let outputs = gam::families::multinomial::fit_penalized_multinomial(
+        gam::families::multinomial::MultinomialFitInputs {
+            design: design_view,
+            y_one_hot: y_view,
+            penalty: penalty_view,
+            lambdas: lambdas_view,
+            row_weights: row_weights_view,
+            max_iter,
+            tol,
+        },
+    )
+    .map_err(|err| py_value_error(err.to_string()))?;
+
+    let out = PyDict::new(py);
+    out.set_item(
+        "status",
+        if outputs.converged { "ok" } else { "not_converged" },
+    )?;
+    out.set_item("iterations", outputs.iterations)?;
+    out.set_item(
+        "coefficients_active",
+        outputs.coefficients_active.into_pyarray(py),
+    )?;
+    out.set_item(
+        "fitted_probabilities",
+        outputs.fitted_probabilities.into_pyarray(py),
+    )?;
+    out.set_item(
+        "penalized_neg_log_likelihood",
+        outputs.penalized_neg_log_likelihood,
+    )?;
+    out.set_item("deviance", outputs.deviance)?;
+    Ok(out.unbind())
+}
+
 fn latent_augmented_hessian_factor(
     design: ArrayView2<'_, f64>,
     penalty: ArrayView2<'_, f64>,
