@@ -67,8 +67,9 @@ pub(crate) use state::array1_l2_norm;
 pub use edf::StablePLSResult;
 use edf::{
     calculate_edf, calculate_edf_from_diagonal_penalty, calculate_edf_from_sparse_factor,
-    calculate_edf_with_penalty, calculate_edfwithworkspace, calculate_edfwithworkspace_from_diagonal_penalty,
-    calculate_edfwithworkspace_from_factor, calculate_edfwithworkspace_with_penalty, edf_from_solution,
+    calculate_edf_with_penalty, calculate_edfwithworkspace,
+    calculate_edfwithworkspace_from_diagonal_penalty, calculate_edfwithworkspace_from_factor,
+    calculate_edfwithworkspace_with_penalty, edf_from_solution,
 };
 use damping::{add_scaled_diagonal_to_upper_sparse, compute_lm_d2, update_scaled_diagonal_in_place};
 use penalty::{
@@ -964,7 +965,7 @@ impl PirlsWorkspace {
         }
     }
 
-    fn add_dense_xtwx_signed(
+    pub(super) fn add_dense_xtwx_signed(
         weights: &Array1<f64>,
         weighted_x_scratch: &mut Array2<f64>,
         x: &Array2<f64>,
@@ -1005,7 +1006,7 @@ impl PirlsWorkspace {
     }
 
     // Phase 2 hook: numeric sparse penalized-system assembly in original coordinates.
-    fn assemble_sparse_penalized_hessian(
+    pub(super) fn assemble_sparse_penalized_hessian(
         &mut self,
         x: &SparseColMat<usize, f64>,
         weights: &Array1<f64>,
@@ -1194,7 +1195,7 @@ fn commit_pending_arrow_latent(pending_snapshot: &mut Option<Array1<f64>>) {
 //   derivative surface. Using a fixed δ makes V(ρ) smooth and the standard
 //   envelope-theorem gradient valid:
 //     dV/dρ_k = 0.5 λ_k βᵀ S_k β + 0.5 λ_k tr(H^{-1} S_k) - 0.5 det1[k].
-const FIXED_STABILIZATION_RIDGE: f64 = 1e-8;
+pub(super) const FIXED_STABILIZATION_RIDGE: f64 = 1e-8;
 
 
 
@@ -3186,7 +3187,7 @@ pub(crate) fn sparse_reml_penalized_hessian(
 /// Returning the factor avoids the previous double-factorization where the SPD
 /// check would factor the matrix and discard the factor, then the caller would
 /// immediately call `factorize_sparse_spd` again on the same matrix to solve.
-fn ensure_sparse_positive_definitewithridge<F>(
+pub(super) fn ensure_sparse_positive_definitewithridge<F>(
     mut assemble: F,
 ) -> Result<
     (
@@ -7158,7 +7159,7 @@ impl PirlsConfig {
 }
 
 #[inline]
-fn max_symmetric_asymmetry(matrix: &Array2<f64>) -> f64 {
+pub(super) fn max_symmetric_asymmetry(matrix: &Array2<f64>) -> f64 {
     let n = matrix.nrows().min(matrix.ncols());
     let mut max_asym = 0.0_f64;
     for i in 0..n {

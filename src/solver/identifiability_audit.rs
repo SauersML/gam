@@ -726,18 +726,21 @@ pub fn audit_identifiability(
         let a_start = col_offsets[a_block_idx];
         let a_end = col_offsets[a_block_idx + 1];
         // Extract the row-scaling vector for block A (used for the bias shift).
-        let z_a = specs[a_block_idx]
-            .eta_row_scaling
+        // Only RowScaledJacobian callbacks expose this; all other callbacks return None.
+        let z_a_arc = specs[a_block_idx]
+            .jacobian_callback
             .as_ref()
-            .map(|arc| arc.as_ref());
+            .and_then(|cb| cb.eta_row_scaling_for_skewness());
+        let z_a: Option<&[f64]> = z_a_arc.as_deref();
         for b_block_idx in (a_block_idx + 1)..specs.len() {
             let b_start = col_offsets[b_block_idx];
             let b_end = col_offsets[b_block_idx + 1];
             // Extract the row-scaling vector for block B.
-            let z_b = specs[b_block_idx]
-                .eta_row_scaling
+            let z_b_arc = specs[b_block_idx]
+                .jacobian_callback
                 .as_ref()
-                .map(|arc| arc.as_ref());
+                .and_then(|cb| cb.eta_row_scaling_for_skewness());
+            let z_b: Option<&[f64]> = z_b_arc.as_deref();
             for ja in a_start..a_end {
                 let na = col_norms[ja];
                 if na == 0.0 {
@@ -1851,7 +1854,6 @@ mod tests {
             initial_log_lambdas: Array1::<f64>::zeros(0),
             initial_beta: None,
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         }
     }
