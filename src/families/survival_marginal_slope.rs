@@ -17902,7 +17902,7 @@ fn build_time_blockspec(
         initial_log_lambdas: rho,
         initial_beta: beta_hint,
         gauge_priority: 200,
-        row_scaling: None,
+        eta_row_scaling: None,
         jacobian_callback: jac_cb,
     }
 }
@@ -17938,9 +17938,9 @@ fn build_logslope_blockspec(
         initial_log_lambdas: rho,
         initial_beta: beta_hint,
         gauge_priority: 120,
-        // row_scaling kept as syntactic sugar for the β=0 flat single-output
+        // eta_row_scaling kept as syntactic sugar for the β=0 flat single-output
         // audit path. The callback takes precedence when set.
-        row_scaling: Some(z_scaling),
+        eta_row_scaling: Some(z_scaling),
         jacobian_callback: jac_cb,
     }
 }
@@ -17969,7 +17969,7 @@ fn build_marginal_blockspec(
         initial_log_lambdas: rho,
         initial_beta: beta_hint,
         gauge_priority: 150,
-        row_scaling: None,
+        eta_row_scaling: None,
         jacobian_callback: jac_cb,
     }
 }
@@ -21384,7 +21384,7 @@ mod tests {
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(Array1::zeros(cols)),
             gauge_priority: 100,
-            row_scaling: None,
+            eta_row_scaling: None,
             jacobian_callback: None,
         }
     }
@@ -23957,7 +23957,7 @@ mod tests {
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
             gauge_priority: 100,
-            row_scaling: None,
+            eta_row_scaling: None,
             jacobian_callback: None,
         };
         let constraints = family
@@ -24028,7 +24028,7 @@ mod tests {
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
             gauge_priority: 100,
-            row_scaling: None,
+            eta_row_scaling: None,
             jacobian_callback: None,
         };
 
@@ -24281,7 +24281,7 @@ mod tests {
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
             gauge_priority: 100,
-            row_scaling: None,
+            eta_row_scaling: None,
             jacobian_callback: None,
         };
         let err = family
@@ -24354,7 +24354,7 @@ mod tests {
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
             gauge_priority: 100,
-            row_scaling: None,
+            eta_row_scaling: None,
             jacobian_callback: None,
         };
         let current = array![0.4, 7.0];
@@ -24431,7 +24431,7 @@ mod tests {
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
             gauge_priority: 100,
-            row_scaling: None,
+            eta_row_scaling: None,
             jacobian_callback: None,
         };
         // current qd1 = -1.0 + 1e-6 < guard → infeasible.
